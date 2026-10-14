@@ -42,7 +42,9 @@ pub struct Selection {
     pub timing: Timing,
     /// DP link settings; unused (zero lanes) for HDMI.
     pub lanes: u8,
-    pub rate: LinkRate,
+    pub rate: DpRate,
+    /// The DP sink's usable links; `DpCaps::NONE` for HDMI.
+    pub caps: DpCaps,
     /// The sink's base EDID block, reported to DRM verbatim.
     pub edid: [u8; 128],
     /// A TMDS HDMI sink rather than DP SST.
@@ -295,8 +297,174 @@ fn max_link(dpcd: &[u8; 16], lttpr: Option<(u8, u8)>) -> Option<(u8, LinkRate)> 
 
 /// The frontend's 8b/10b payload ceiling for 8-bpc RGB.
 pub fn link_fits(timing: &Timing, lanes: u8, rate: LinkRate) -> bool {
-    u64::from(timing.pixel_clock_khz) * 3 * 8 <= rate as u64 * 27_000 * 8 * u64::from(lanes)
+    stream_kbps(timing, false) <= legacy_kbps(lanes, rate)
 }
+
+/// A DP main link's per-lane rate: 8b/10b through the DIO encoders, or
+/// 128b/132b (UHBR) through the HPO encoders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DpRate {
+    Legacy(LinkRate),
+    Uhbr(otg::UhbrRate),
+}
+
+/// A DP sink's usable links, as Linux's dp_get_max_link_cap bounds them:
+/// the repeater-bounded lane count and 8b/10b rate, and as a mask over
+/// `UhbrRate::ALL` the 128b/132b rates up to the lowest of the board's
+/// connector speed, the sink's best 0x2215 rate and a revision 1.4
+/// repeater chain's best, UHBR13.5 only where the sink and that chain
+/// list it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DpCaps {
+    pub lanes: u8,
+    pub rate: LinkRate,
+    pub uhbr: u8,
+}
+impl DpCaps {
+    /// No DP link: an HDMI selection's.
+    pub const NONE: Self = Self {
+        lanes: 0,
+        rate: LinkRate::Rbr,
+        uhbr: 0,
+    };
+    /// The usable UHBR rates, ascending.
+    pub fn uhbr_rates(self) -> impl Iterator<Item = otg::UhbrRate> {
+        otg::UhbrRate::ALL
+            .into_iter()
+            .enumerate()
+            .filter(move |&(i, _)| self.uhbr & 1 << i != 0)
+            .map(|(_, r)| r)
+    }
+}
+
+/// The board's 128b/132b ceiling: dcn401_link_encoder_construct's UHBR
+/// flags from the connector-speed record, the highest one set.
+fn board_uhbr(path: &inventory::Path) -> Option<otg::UhbrRate> {
+    use otg::UhbrRate::*;
+    match path.max_speed_mhz {
+        20_000.. => Some(Uhbr20),
+        13_500.. => Some(Uhbr13_5),
+        10_000.. => Some(Uhbr10),
+        _ => None,
+    }
+}
+
+/// The best rate in a 0x2215/0xF0007 mask.
+fn best_uhbr(bits: u8) -> Option<otg::UhbrRate> {
+    otg::UhbrRate::ALL
+        .into_iter()
+        .rev()
+        .find(|r| bits & r.dpcd_bit() != 0)
+}
+
+/// A DP sink's usable links on its board path.
+pub fn dp_caps(path: &inventory::Path, sink: &display::Sink) -> Option<DpCaps> {
+    let (lanes, rate) = max_link(sink.dpcd.as_ref()?, sink.lttpr)?;
+    let mut max = board_uhbr(path)
+        .zip(best_uhbr(sink.uhbr))
+        .map(|(a, b)| a.min(b));
+    if let Some(chain) = sink.lttpr_uhbr {
+        max = max.zip(best_uhbr(chain)).map(|(a, b)| a.min(b));
+    }
+    let uhbr13_5 = sink.uhbr & 4 != 0 && sink.lttpr_uhbr.is_none_or(|c| c & 4 != 0);
+    let uhbr = otg::UhbrRate::ALL
+        .into_iter()
+        .enumerate()
+        .filter(|&(_, r)| max.is_some_and(|m| r <= m))
+        .filter(|&(_, r)| r != otg::UhbrRate::Uhbr13_5 || uhbr13_5)
+        .fold(0, |bits, (i, _)| bits | 1 << i);
+    Some(DpCaps { lanes, rate, uhbr })
+}
+
+/// dp_link_bandwidth_kbps for 8b/10b without FEC.
+fn legacy_kbps(lanes: u8, rate: LinkRate) -> u64 {
+    rate as u64 * 27_000 * 8 * u64::from(lanes)
+}
+
+/// dp_link_bandwidth_kbps for 128b/132b: 96.71% coding efficiency less
+/// 0.3% downspread (DATA_EFFICIENCY_128b_132b_x10000, 9641).
+pub fn uhbr_kbps(lanes: u8, rate: otg::UhbrRate) -> u64 {
+    u64::from(rate.link_rate()) * 10_000 * u64::from(lanes) / 10_000 * 9641
+}
+
+/// dc_bandwidth_in_kbps_from_timing for 8-bpc RGB. On a link that can code
+/// 128b/132b (Linux's highest encoding format), the pixel-to-symbol padding
+/// of apply_128b_132b_stream_overhead: the active line's 24-bit pixels in
+/// 128-bit symbols, rounded up. Exact rational arithmetic where Linux uses
+/// 31.32 fixed point.
+pub fn stream_kbps(timing: &Timing, uhbr: bool) -> u64 {
+    let kbps = u64::from(timing.pixel_clock_khz) * 24;
+    let bits = u64::from(timing.h_active) * 24;
+    if !uhbr || bits == 0 {
+        return kbps;
+    }
+    (kbps * bits.div_ceil(128) * 128).div_ceil(bits)
+}
+
+/// Whether `lanes` at `rate` carries `timing` on a link with `caps`.
+pub fn dp_fits(timing: &Timing, caps: DpCaps, lanes: u8, rate: DpRate) -> bool {
+    let have = match rate {
+        DpRate::Legacy(r) => legacy_kbps(lanes, r),
+        DpRate::Uhbr(r) => uhbr_kbps(lanes, r),
+    };
+    stream_kbps(timing, caps.uhbr != 0) <= have
+}
+
+/// The link a DP mode lights on: the sink's maximum 8b/10b link when that
+/// carries it; otherwise 128b/132b only as Linux's decide_dp_link_settings
+/// reaches it, searching upward (lanes first, then rate) past every 8b/10b
+/// setting for the first UHBR setting that carries the mode.
+pub fn dp_link(timing: &Timing, caps: DpCaps) -> Option<(u8, DpRate)> {
+    let legacy = DpRate::Legacy(caps.rate);
+    if dp_fits(timing, caps, caps.lanes, legacy) {
+        return Some((caps.lanes, legacy));
+    }
+    caps.uhbr_rates()
+        .flat_map(|r| [1, 2, 4].map(|l| (l, DpRate::Uhbr(r))))
+        .find(|&(l, r)| l <= caps.lanes && dp_fits(timing, caps, l, r))
+}
+
+/// Whether a DP selection's sink can take `timing`. A link that trained as
+/// selected offers what its caps carry (Linux's verified link cap); one that
+/// fell back offers only what the trained link carries.
+fn dp_offer_fits(timing: &Timing, s: &Selection) -> bool {
+    if dp_link(&s.timing, s.caps) == Some((s.lanes, s.rate)) {
+        dp_link(timing, s.caps).is_some()
+    } else {
+        dp_fits(timing, s.caps, s.lanes, s.rate)
+    }
+}
+
+/// Linux's dp_lt_fallbacks, best bandwidth first, which its maximum
+/// bandwidth fallback policy walks once a link can code 128b/132b.
+const FALLBACKS: [(u8, DpRate); 21] = {
+    use otg::UhbrRate::*;
+    use DpRate::{Legacy as L, Uhbr as U};
+    use LinkRate::*;
+    [
+        (4, U(Uhbr20)),
+        (4, U(Uhbr13_5)),
+        (2, U(Uhbr20)),
+        (4, U(Uhbr10)),
+        (2, U(Uhbr13_5)),
+        (4, L(Hbr3)),
+        (1, U(Uhbr20)),
+        (2, U(Uhbr10)),
+        (4, L(Hbr2)),
+        (1, U(Uhbr13_5)),
+        (2, L(Hbr3)),
+        (1, U(Uhbr10)),
+        (2, L(Hbr2)),
+        (4, L(Hbr)),
+        (1, L(Hbr3)),
+        (4, L(Rbr)),
+        (1, L(Hbr2)),
+        (2, L(Hbr)),
+        (2, L(Rbr)),
+        (1, L(Hbr)),
+        (1, L(Rbr)),
+    ]
+};
 
 /// HDMI 2.0 SCDC registers (Linux dc_hdmi_types.h).
 pub mod scdc {
@@ -596,27 +764,30 @@ pub fn select_all(
             continue;
         }
         let Ok(sink) = &port.sink else { continue };
-        let Some((lanes, rate)) = sink.dpcd.as_ref().and_then(|d| max_link(d, sink.lttpr)) else {
+        let Some(caps) = dp_caps(&port.path, sink) else {
             continue;
         };
+        // The HPO (128b/132b) stream path is not yet lit: UHBR stays unused.
+        let caps = DpCaps { uhbr: 0, ..caps };
         let Some(index) = paths.iter().position(|p| *p == port.path) else {
             continue;
         };
-        let Some(timing) = pick(index, &sink.edid, &|t| link_fits(t, lanes, rate)) else {
+        let Some(timing) = pick(index, &sink.edid, &|t| dp_link(t, caps).is_some()) else {
             continue;
         };
         let Some(edid) = sink.edid.get(..128).and_then(|b| b.try_into().ok()) else {
             continue;
         };
-        if !link_fits(&timing, lanes, rate) {
+        let Some((lanes, rate)) = dp_link(&timing, caps) else {
             link_short = true;
             continue;
-        }
+        };
         out.push(Selection {
             port: index,
             timing,
             lanes,
             rate,
+            caps,
             edid,
             hdmi: false,
             scdc: false,
@@ -655,7 +826,8 @@ pub fn select_all(
             port: index,
             timing,
             lanes: 0,
-            rate: LinkRate::Rbr,
+            rate: DpRate::Legacy(LinkRate::Rbr),
+            caps: DpCaps::NONE,
             edid,
             hdmi: true,
             scdc: caps.scdc,
@@ -695,6 +867,35 @@ pub fn admit_displays(
             Err(_) => n -= 1,
         }
     }
+}
+
+/// Link settings to try for `timing` from (`lanes`, `rate`), best first. A
+/// 128b/132b link walks Linux's bandwidth-ordered fallback table from that
+/// setting, through 8b/10b settings too, as decide_fallback_link_setting's
+/// maximum bandwidth policy does; an 8b/10b one keeps narf's ladder
+/// (`link_candidates`). Settings beyond `caps` or that cannot carry the
+/// mode are never tried.
+pub fn dp_candidates(timing: &Timing, caps: DpCaps, lanes: u8, rate: DpRate) -> Vec<(u8, DpRate)> {
+    if let DpRate::Legacy(r) = rate {
+        return link_candidates(timing, lanes, r)
+            .into_iter()
+            .map(|(l, r)| (l, DpRate::Legacy(r)))
+            .filter(|&(l, r)| dp_fits(timing, caps, l, r))
+            .collect();
+    }
+    let usable = |(l, r): (u8, DpRate)| {
+        l <= caps.lanes
+            && match r {
+                DpRate::Legacy(r) => r as u8 <= caps.rate as u8,
+                DpRate::Uhbr(r) => caps.uhbr_rates().any(|u| u == r),
+            }
+            && dp_fits(timing, caps, l, r)
+    };
+    FALLBACKS
+        .into_iter()
+        .skip_while(|&setting| setting != (lanes, rate))
+        .filter(|&setting| usable(setting))
+        .collect()
 }
 
 /// Link settings to try, best first: drop the rate; below RBR halve the lanes
@@ -1107,7 +1308,7 @@ impl ColdBoot {
             let format = if s.hdmi {
                 hdmi_format(caps, &t, max_bpc()).map(|(_, ycbcr420)| ycbcr420)
             } else {
-                link_fits(&t, s.lanes, s.rate).then_some(false)
+                dp_offer_fits(&t, &s).then_some(false)
             };
             if t == s.timing {
                 modes[n] = Some(t);
@@ -1165,13 +1366,23 @@ impl ColdBoot {
             let mut refused = ModesetError::Link;
             let transmitter =
                 self.display_paths().map_err(|_| ModesetError::NoSink)?[port].transmitter;
-            for (lanes, rate) in link_candidates(&selection.timing, selection.lanes, selection.rate)
-            {
+            let candidates = dp_candidates(
+                &selection.timing,
+                selection.caps,
+                selection.lanes,
+                selection.rate,
+            );
+            for (lanes, link) in candidates {
+                // The HPO (128b/132b) path does not start yet.
+                let DpRate::Legacy(rate) = link else {
+                    refused = ModesetError::Display(otg::Error::Unsupported);
+                    continue;
+                };
                 self.enable_display_dp_phy(port, otg::DpPhySettings { lanes, rate })
                     .await?;
                 match self.train_display_dp_link(port, false).await {
                     Ok(_) => {
-                        (selection.lanes, selection.rate) = (lanes, rate);
+                        (selection.lanes, selection.rate) = (lanes, link);
                         trained = true;
                         break;
                     }

@@ -21,6 +21,7 @@ fn path(connector: inventory::Connector, transmitter: u8) -> inventory::Path {
         aux: Some(transmitter),
         hpd: transmitter + 1,
         device_tag: 0,
+        max_speed_mhz: 0,
     }
 }
 /// DPCD with MAX_LINK_RATE and MAX_LANE_COUNT (enhanced framing set).
@@ -36,6 +37,8 @@ fn port(path: inventory::Path, dpcd: Option<[u8; 16]>, edid: Vec<u8>) -> display
             dpcd,
             edid,
             lttpr: None,
+            uhbr: 0,
+            lttpr_uhbr: None,
         }),
     }
 }
@@ -57,7 +60,7 @@ fn navi48_modeset_selects_first_answering_dp_sink_by_board_path() -> TestResult 
     };
     let t = s.timing;
     if s.port != 3
-        || (s.lanes, s.rate) != (4, LinkRate::Hbr2)
+        || (s.lanes, s.rate) != (4, DpRate::Legacy(LinkRate::Hbr2))
         || (
             t.pixel_clock_khz,
             t.h_active,
@@ -664,7 +667,7 @@ fn navi48_modeset_bounds_the_link_by_a_repeater_chain() -> TestResult {
         sink.lttpr = Some((0x0a, 4)); // the repeater stops at HBR
     }
     match select(&paths, &[p], 8, None) {
-        Ok(s) if (s.lanes, s.rate) == (4, LinkRate::Hbr) => TestResult::Pass,
+        Ok(s) if (s.lanes, s.rate) == (4, DpRate::Legacy(LinkRate::Hbr)) => TestResult::Pass,
         _ => TestResult::Fail("LTTPR-bounded link"),
     }
 }
@@ -850,4 +853,113 @@ fn navi48_modeset_picks_ycbcr420_like_amdgpu() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_picks_ycbcr420_like_amdgpu
+);
+
+/// UHBR as Linux decides it: the board's connector speed, the sink's 0x2215
+/// rates and a revision 1.4 repeater chain's bound the rates (UHBR13.5 only
+/// where listed); 128b/132b bandwidth is 96.41% of the raw rate; streams
+/// carry pixel-to-symbol padding; UHBR is used only past every 8b/10b
+/// setting, upward; fallback walks the bandwidth-ordered table.
+fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
+    use otg::UhbrRate::{Uhbr10 as U10, Uhbr13_5 as U13, Uhbr20 as U20};
+    let caps_of = |speed: u32, uhbr: u8, lttpr_uhbr: Option<u8>| {
+        let mut p = path(inventory::Connector::DisplayPort, 0);
+        p.max_speed_mhz = speed;
+        let sink = display::Sink {
+            dpcd: dpcd(0x1e, 4),
+            edid: Vec::new(),
+            lttpr: None,
+            uhbr,
+            lttpr_uhbr,
+        };
+        dp_caps(&p, &sink).unwrap().uhbr
+    };
+    if caps_of(20_000, 7, None) != 0b111
+        || caps_of(20_000, 7, Some(1)) != 0b001
+        || caps_of(20_000, 7, Some(0)) != 0
+        || caps_of(20_000, 3, None) != 0b101
+        || caps_of(20_000, 7, Some(3)) != 0b101
+        || caps_of(13_500, 7, None) != 0b011
+        || caps_of(13_500, 3, None) != 0b001
+        || caps_of(8_100, 7, None) != 0
+        || caps_of(0, 7, None) != 0
+        || caps_of(20_000, 0, None) != 0
+    {
+        return TestResult::Fail("UHBR caps");
+    }
+    if uhbr_kbps(4, U10) != 38_564_000
+        || uhbr_kbps(4, U13) != 52_061_400
+        || uhbr_kbps(4, U20) != 77_128_000
+        || uhbr_kbps(1, U10) != 9_641_000
+    {
+        return TestResult::Fail("128b/132b bandwidth");
+    }
+    let timing = |khz: u32, h_active: u32| Timing {
+        pixel_clock_khz: khz,
+        h_active,
+        h_total: h_active + 560,
+        h_front_porch: 176,
+        h_sync_width: 88,
+        v_active: 2160,
+        v_total: 2250,
+        v_front_porch: 8,
+        v_sync_width: 10,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    };
+    // 3840 x 24 bits fill 720 symbols exactly; 1366 x 24 needs 256.125.
+    let uhd60 = timing(594_000, 3840);
+    let odd = timing(85_500, 1366);
+    if stream_kbps(&uhd60, true) != 14_256_000
+        || stream_kbps(&odd, false) != 2_052_000
+        || stream_kbps(&odd, true) != (2_052_000u64 * 257 * 128).div_ceil(1366 * 24)
+    {
+        return TestResult::Fail("stream bandwidth");
+    }
+    let caps = |uhbr: u8| DpCaps {
+        lanes: 4,
+        rate: LinkRate::Hbr3,
+        uhbr,
+    };
+    let uhd120 = timing(1_188_000, 3840);
+    let uhd8k = timing(2_376_000, 7680);
+    use DpRate::{Legacy, Uhbr};
+    if dp_link(&uhd60, caps(7)) != Some((4, Legacy(LinkRate::Hbr3)))
+        || dp_link(&uhd120, caps(7)) != Some((4, Uhbr(U10)))
+        || dp_link(&uhd8k, caps(7)) != Some((4, Uhbr(U20)))
+        || dp_link(&uhd8k, caps(3)).is_some()
+        || dp_link(&uhd120, caps(0)).is_some()
+    {
+        return TestResult::Fail("upward link decision");
+    }
+    // Two lanes: 2 x UHBR13.5 (26,030,700 kbps) falls short, 2 x UHBR20
+    // carries it; four lanes stop at 4 x UHBR10 first.
+    let two = DpCaps {
+        lanes: 2,
+        ..caps(7)
+    };
+    if dp_link(&uhd120, two) != Some((2, Uhbr(U20))) {
+        return TestResult::Fail("lanes before rate");
+    }
+    if dp_candidates(&uhd120, caps(7), 4, Uhbr(U10)) != [(4, Uhbr(U10))] {
+        return TestResult::Fail("fallback that cannot carry the mode");
+    }
+    let ladder = dp_candidates(&uhd60, caps(0b101), 4, Uhbr(U20));
+    let want = [
+        (4, Uhbr(U20)),
+        (2, Uhbr(U20)),
+        (4, Uhbr(U10)),
+        (4, Legacy(LinkRate::Hbr3)),
+        (1, Uhbr(U20)),
+        (2, Uhbr(U10)),
+        (4, Legacy(LinkRate::Hbr2)),
+    ];
+    if ladder != want {
+        return TestResult::Fail("bandwidth-ordered fallback");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_decides_uhbr_like_linux
 );

@@ -14,6 +14,7 @@ fn path(p: u8) -> inventory::Path {
         aux: Some((p + 2) % 4),
         hpd: (p + 1) % 4 + 1,
         device_tag: 8,
+        max_speed_mhz: 0,
     }
 }
 struct Firmware {

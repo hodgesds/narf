@@ -6,7 +6,7 @@ use crate::{
     amdgpu_dmub_navi48 as dmub,
 };
 use core::future::Future;
-pub use dmub::DpPhySettings;
+pub use dmub::{DpPhySettings, UhbrRate};
 #[path = "amdgpu_dcn401_dp_training.rs"]
 pub(super) mod training;
 pub use training::{

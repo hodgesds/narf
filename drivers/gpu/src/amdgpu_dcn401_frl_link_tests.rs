@@ -23,6 +23,7 @@ fn path(phy: u8) -> Path {
         aux: None,
         hpd: (phy + 1) % 4 + 1,
         device_tag: 1,
+        max_speed_mhz: 0,
     }
 }
 struct Model {

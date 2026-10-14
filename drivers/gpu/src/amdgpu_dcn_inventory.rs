@@ -51,6 +51,7 @@ const TYPE_CONNECTOR: u16 = 0x03;
 const RECORD_HEADER: usize = 2;
 const RECORD_I2C: u8 = 1;
 const RECORD_HPD_INT: u8 = 2;
+const RECORD_CONNECTOR_SPEED: u8 = 4;
 const RECORD_END: u8 = 0xff;
 /// A connector's record list is short; this only bounds a malformed one.
 const MAX_RECORDS: usize = 64;
@@ -197,6 +198,11 @@ pub struct Path {
     /// when the board declares none for this connector.
     pub hpd: u8,
     pub device_tag: u16,
+    /// ATOM_CONNECTOR_SPEED_UPTO's connector_max_speed in MHz, zero when the
+    /// board declares none: the source's DP rate ceiling (UHBR10 from 10000,
+    /// UHBR13.5 from 13500, UHBR20 from 20000; Linux's
+    /// bios_parser_get_connector_speed_cap_info).
+    pub max_speed_mhz: u32,
 }
 
 fn u16_at(bytes: &[u8], offset: usize) -> u16 {
@@ -279,6 +285,8 @@ fn connector(objid: u16) -> Result<(Connector, u8), Error> {
 struct Wiring {
     i2c: Option<u8>,
     hpd: Option<u8>,
+    /// The first connector-speed record's MHz (Linux takes the first).
+    speed: Option<u32>,
 }
 fn wiring(vbios: &[u8], base: usize, offset: u16, paths_end: usize) -> Result<Wiring, Error> {
     let mut result = Wiring::default();
@@ -301,6 +309,10 @@ fn wiring(vbios: &[u8], base: usize, offset: u16, paths_end: usize) -> Result<Wi
             return Err(Error::Invalid);
         }
         let record = vbios.get(at..at + size).ok_or(Error::Invalid)?;
+        // atom_connector_speed_record: header, u32 MHz, u16 reserved.
+        if head[0] == RECORD_CONNECTOR_SPEED && size >= 8 && result.speed.is_none() {
+            result.speed = Some(u32::from_le_bytes(record[2..6].try_into().unwrap()));
+        }
         let field = match head[0] {
             RECORD_I2C => Some(&mut result.i2c),
             RECORD_HPD_INT => Some(&mut result.hpd),
@@ -424,6 +436,7 @@ fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, 
             aux,
             hpd,
             device_tag: u16_at(entry, 12),
+            max_speed_mhz: pins.speed.unwrap_or(0),
         });
     }
     if paths.is_empty() {

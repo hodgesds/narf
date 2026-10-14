@@ -163,6 +163,7 @@ fn inventory_display_paths_decode_their_transmitters() -> TestResult {
             aux: Some(0),
             hpd: 1,
             device_tag: 1,
+            max_speed_mhz: 0,
         })
     {
         return TestResult::Fail("first path");
@@ -789,4 +790,27 @@ fn inventory_navi48_v15_routes_and_backend_stride() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn-inventory",
     inventory_navi48_v15_routes_and_backend_stride
+);
+
+/// ATOM_CONNECTOR_SPEED_UPTO (record 4): the first full record of a path's
+/// list gives its connector_max_speed; a short one is skipped and a path
+/// without one reports zero, as bios_parser2's lookup does.
+fn inventory_reads_the_connector_speed_record() -> TestResult {
+    let mut image = Image::new();
+    // The second path's list: HPD, I2C, then speed records before the end.
+    let at = RECORDS + 16 + 8;
+    image.0[at..at + 6].copy_from_slice(&[4, 6, 0x10, 0x27, 0, 0]); // short: skipped
+    image.0[at + 6..at + 14].copy_from_slice(&[4, 8, 0xbc, 0x34, 0, 0, 0, 0]); // 13500
+    image.0[at + 14..at + 22].copy_from_slice(&[4, 8, 0x20, 0x4e, 0, 0, 0, 0]); // 20000
+    image.0[at + 22..at + 24].copy_from_slice(&[0xff, 0]);
+    match display_paths(image.bytes()) {
+        Ok(paths) if paths[0].max_speed_mhz == 0 && paths[1].max_speed_mhz == 13_500 => {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("connector speed record"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-inventory",
+    inventory_reads_the_connector_speed_record
 );

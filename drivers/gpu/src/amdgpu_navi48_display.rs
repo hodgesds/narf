@@ -47,6 +47,14 @@ pub struct Sink {
     /// A DP repeater (LTTPR) chain's maximum link rate code and lane count,
     /// which bound the link like the sink's own (dp_is_lttpr_present).
     pub lttpr: Option<(u8, u8)>,
+    /// DP_128B132B_SUPPORTED_LINK_RATES (0x2215: bit 0 UHBR10, 1 UHBR20,
+    /// 2 UHBR13.5) of a sink whose channel coding caps (0x006 bit 1) offer
+    /// 128b/132b; zero otherwise.
+    pub uhbr: u8,
+    /// A repeater chain of revision 1.4 or later: its 128b/132b rates
+    /// (0xF0007, same bits), which bound the sink's as Linux's
+    /// get_lttpr_max_link_rate does. None when no such chain bounds them.
+    pub lttpr_uhbr: Option<u8>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Port {
@@ -179,6 +187,7 @@ async fn read_sink(io: &mut impl Aux, instance: u8) -> Result<Sink, Error> {
         Err(Error::Transport(dmub::Error::Aux(1))) => None,
         Err(e) => return Err(e),
     };
+    let lttpr_uhbr = (lttpr.is_some() && caps[0] >= 0x14).then_some(caps[7] & 7);
     let mut dpcd = [0; 16];
     transfer(io, instance, 0x90, 0, &mut dpcd).await?;
     if !valid_dpcd(&dpcd) {
@@ -195,10 +204,17 @@ async fn read_sink(io: &mut impl Aux, instance: u8) -> Result<Sink, Error> {
             dpcd = extended;
         }
     }
+    // retrieve_link_cap: 128b/132b rates only for a sink that codes it.
+    let mut uhbr = [0; 1];
+    if dpcd[6] & 2 != 0 {
+        transfer(io, instance, 0x90, 0x2215, &mut uhbr).await?;
+    }
     Ok(Sink {
         dpcd: Some(dpcd),
         edid: read_edid(io, instance).await?,
         lttpr,
+        uhbr: uhbr[0] & 7,
+        lttpr_uhbr,
     })
 }
 
@@ -285,6 +301,8 @@ impl Probe {
                                 dpcd: None,
                                 edid,
                                 lttpr: None,
+                                uhbr: 0,
+                                lttpr_uhbr: None,
                             })
                             .map_err(Error::Ddc)
                     }

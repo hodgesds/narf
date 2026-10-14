@@ -16,6 +16,7 @@ fn dp_path(phy: u8, hpd: u8) -> crate::amdgpu_dcn_inventory::Path {
         aux: Some((phy + 1) % 4),
         hpd,
         device_tag: 8,
+        max_speed_mhz: 0,
     }
 }
 fn dmub_navi48_dp_drive_preserves_native_v17_zero_signal_encoding() -> TestResult {

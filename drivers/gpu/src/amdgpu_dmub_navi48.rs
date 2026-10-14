@@ -51,6 +51,38 @@ impl DpPhySettings {
         Ok(())
     }
 }
+/// A DP 128b/132b (UHBR) per-lane rate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UhbrRate {
+    Uhbr10,
+    Uhbr13_5,
+    Uhbr20,
+}
+impl UhbrRate {
+    /// Ascending, as Linux's increase_link_rate walks them.
+    pub const ALL: [Self; 3] = [Self::Uhbr10, Self::Uhbr13_5, Self::Uhbr20];
+    /// DC's link_rate: units of 10 Mbps per lane (LINK_RATE_UHBR10 = 1000).
+    pub fn link_rate(self) -> u32 {
+        match self {
+            Self::Uhbr10 => 1000,
+            Self::Uhbr13_5 => 1350,
+            Self::Uhbr20 => 2000,
+        }
+    }
+    /// LINK_BW_SET (0x100) for 128b/132b: get_dpcd_link_rate.
+    pub fn dpcd_code(self) -> u8 {
+        match self {
+            Self::Uhbr10 => 0x01,
+            Self::Uhbr20 => 0x02,
+            Self::Uhbr13_5 => 0x04,
+        }
+    }
+    /// The rate's bit in DP_128B132B_SUPPORTED_LINK_RATES (0x2215) and an
+    /// LTTPR's 0xF0007, which share this layout.
+    pub fn dpcd_bit(self) -> u8 {
+        self.dpcd_code()
+    }
+}
 /// Common drive level for all active legacy DP lanes, as required by native DC.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DpDriveSettings {

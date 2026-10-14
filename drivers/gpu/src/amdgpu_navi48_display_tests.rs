@@ -18,6 +18,10 @@ struct Fake {
     delays: usize,
     fail: Option<dmub::Error>,
     stall: Option<usize>,
+    /// The repeater capability block, NACKed when absent.
+    lttpr: Option<[u8; 10]>,
+    /// DP_128B132B_SUPPORTED_LINK_RATES.
+    uhbr: u8,
 }
 fn checksum(block: &mut [u8]) {
     block[127] = 0u8.wrapping_sub(block[..127].iter().fold(0u8, |s, b| s.wrapping_add(*b)));
@@ -52,6 +56,8 @@ fn fake(blocks: usize) -> Fake {
         delays: 0,
         fail: None,
         stall: None,
+        lttpr: None,
+        uhbr: 0,
     }
 }
 impl Aux for Fake {
@@ -80,7 +86,11 @@ impl Aux for Fake {
         assert_eq!(instance, 1, "connector/transmitter mistaken for AUX");
         match (action, address, data.len()) {
             // No repeater: the LTTPR capability block is NACKed.
-            (0x90, 0xf0000, 10) => return Err(dmub::Error::Aux(1)),
+            (0x90, 0xf0000, 10) => match self.lttpr {
+                Some(caps) => data.copy_from_slice(&caps),
+                None => return Err(dmub::Error::Aux(1)),
+            },
+            (0x90, 0x2215, 1) => data[0] = self.uhbr,
             (0x90, 0, 16) => data.copy_from_slice(&self.dpcd),
             (0x90, 0x2200, 16) => data.copy_from_slice(&self.extended),
             (0, 0x30, 1) => {
@@ -115,6 +125,7 @@ fn path(aux: u8, transmitter: u8) -> inventory::Path {
         aux: Some(aux),
         hpd: 2,
         device_tag: 8,
+        max_speed_mhz: 0,
     }
 }
 fn probe() -> Probe {
@@ -336,6 +347,8 @@ fn navi48_display_scans_hdmi_with_native_ddc_and_dp_with_aux() -> TestResult {
                     dpcd: None,
                     edid,
                     lttpr: None,
+                    uhbr: 0,
+                    lttpr_uhbr: None,
                 })
                 .map_err(Error::Ddc)
         );
@@ -406,4 +419,45 @@ fn navi48_display_ddc_fatal_error_or_cancellation_blocks_aux_and_reuse() -> Test
 kernel_test_in!(
     "drivers/gpu/navi48-display",
     navi48_display_ddc_fatal_error_or_cancellation_blocks_aux_and_reuse
+);
+
+/// 128b/132b caps as retrieve_link_cap reads them: 0x2215 only from a sink
+/// whose channel coding caps (here the extended copy's 0x2206) offer
+/// 128b/132b, and a repeater chain's 0xF0007 rates only from revision 1.4.
+fn navi48_display_reads_128b_132b_rates() -> TestResult {
+    let scan = |io: &mut Fake| {
+        let mut p = probe();
+        let ports = run(p.scan_with(io, None::<&mut ddc::Ddc>)).unwrap();
+        ports[0].sink.clone().unwrap()
+    };
+    let mut io = fake(1);
+    io.uhbr = 0xff;
+    let sink = scan(&mut io);
+    if sink.uhbr != 0 || io.commands.iter().any(|c| c.2 == 0x2215) {
+        return TestResult::Fail("0x2215 read without 128b/132b coding");
+    }
+    let mut io = fake(1);
+    io.extended[6] = 3;
+    io.uhbr = 0x0d;
+    let mut caps = [0u8; 10];
+    caps[..8].copy_from_slice(&[0x14, 0x1e, 0x80, 0x55, 4, 0, 1, 0x01]);
+    io.lttpr = Some(caps);
+    let sink = scan(&mut io);
+    if sink.uhbr != 5 || sink.lttpr_uhbr != Some(1) || sink.lttpr != Some((0x1e, 4)) {
+        return TestResult::Fail("128b/132b rates");
+    }
+    // A revision 1.3 chain does not bound 128b/132b rates.
+    caps[0] = 0x13;
+    let mut io = fake(1);
+    io.extended[6] = 3;
+    io.uhbr = 7;
+    io.lttpr = Some(caps);
+    if scan(&mut io).lttpr_uhbr.is_some() {
+        return TestResult::Fail("old repeater bounds UHBR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-display",
+    navi48_display_reads_128b_132b_rates
 );

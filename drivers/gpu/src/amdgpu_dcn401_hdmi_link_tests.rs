@@ -26,6 +26,7 @@ pub(in crate::amdgpu_dcn401_otg::tests) fn path(p: u8) -> Path {
         aux: Some(p),
         hpd: (p + 1) % 4 + 1,
         device_tag: 2,
+        max_speed_mhz: 0,
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
