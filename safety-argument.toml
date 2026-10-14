@@ -1504,3 +1504,7 @@ argument = "The only frame/ change (bare_main.rs) registers the seccomp_smoke te
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The only frame/ change (bare_main.rs) registers the killstopped_smoke test binary in the embedded musl-demo table. Test registration data for verification kernels; no production path, authority, mapping, domain transition or capability changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The only frame/ change (bare_main.rs) registers the procstate_smoke test binary in the embedded musl-demo table. Test registration data for verification kernels; no production path, authority, mapping, domain transition or capability changes."

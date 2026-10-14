@@ -7522,6 +7522,33 @@ pub fn proc_thread_comm(tid: u64) -> Option<alloc::string::String> {
     proc_comm_of_task(task_of_visible_tid(tid)?)
 }
 
+/// The `task_state_array` letter of a live (not zombie) task, by Linux's
+/// precedence (`task_state_index`): 't' ptrace-stopped, 'T' job-control
+/// stopped, 'S' asleep in a syscall, 'R' running or runnable — including the
+/// task reading its own state, which is on a CPU doing exactly that.
+///
+/// 'S' is TASK_INTERRUPTIBLE: a task parked inside a syscall — poll, futex,
+/// read, wait4, nanosleep — is woken by a signal on NARF exactly as on Linux,
+/// so it is interruptible. Reporting 'R' for every one of them made `ps`,
+/// `top` and every process monitor show an idle desktop as hundreds of
+/// running tasks.
+fn live_task_state(task: u64) -> char {
+    if crate::ptrace::is_task_ptrace_stopped(task) {
+        't'
+    } else if is_task_stopped(task) {
+        'T'
+    } else if task != current_task_id()
+        && crate::user_task::with_user_task_ctx(task, |uc| {
+            uc.parked_in_syscall.load(Ordering::Acquire)
+        })
+        .unwrap_or(false)
+    {
+        'S'
+    } else {
+        'R'
+    }
+}
+
 /// `/proc/<pid>/task/<tid>/stat` hook — the thread's own name and CPU time.
 /// USER_HZ = 100, so one tick is 10 ms, matching `proc_task_info`.
 pub fn proc_thread_stat(tid: u64) -> Option<narf_filesystem::procfs::ThreadStat> {
@@ -7533,13 +7560,7 @@ pub fn proc_thread_stat(tid: u64) -> Option<narf_filesystem::procfs::ThreadStat>
         stime_ticks: kern_time_ns_of(task) / NS_PER_TICK,
         // Same precedence as the process-level report, minus 'Z': a zombie
         // thread has no row in `/proc/<pid>/task` to read.
-        state: if crate::ptrace::is_task_ptrace_stopped(task) {
-            't'
-        } else if is_task_stopped(task) {
-            'T'
-        } else {
-            'R'
-        },
+        state: live_task_state(task),
     })
 }
 
@@ -8114,15 +8135,7 @@ pub fn proc_task_info(
         // Reporting 'R' for a stopped task made `ps` and every monitor show a
         // ptrace-stopped or job-control-stopped process as running, and left a
         // tracer with no way to confirm from /proc that its tracee had stopped.
-        state: if zombie {
-            'Z'
-        } else if crate::ptrace::is_task_ptrace_stopped(tid) {
-            't'
-        } else if is_task_stopped(tid) {
-            'T'
-        } else {
-            'R'
-        },
+        state: if zombie { 'Z' } else { live_task_state(tid) },
         brk_top,
         stack_top,
         cmdline,
