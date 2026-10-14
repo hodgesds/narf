@@ -1139,6 +1139,19 @@ impl ColdBoot {
         let soc = self.display_soc()?;
         crate::amdgpu_dcn401_dml::admit(&soc, mode).map_err(otg::Error::Admission)
     }
+    /// DTBCLK's highest usable DPM level, which FRL streams hold
+    /// (dcn401_update_clocks).
+    pub fn top_dtb_khz(&self) -> Result<u32, otg::Error> {
+        Ok(self
+            .clocks
+            .as_ref()
+            .map_err(|e| otg::Error::Clocks(*e))?
+            .status()
+            .levels
+            .ok_or(otg::Error::Busy)?
+            .range(crate::amdgpu_dcn401_clk::Clock::Dtb)
+            .max_khz())
+    }
     /// The board inputs of display admission: the PMFW DPM levels the clock
     /// owner published, the DENTIST VCO and the DCHUB reference.
     pub fn display_soc(&mut self) -> Result<crate::amdgpu_dcn401_dml::Soc, otg::Error> {

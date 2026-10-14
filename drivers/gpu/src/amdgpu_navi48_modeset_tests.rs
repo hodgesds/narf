@@ -1093,6 +1093,25 @@ fn navi48_modeset_decides_frl_like_linux() -> TestResult {
     {
         return TestResult::Fail("FRL rate decision");
     }
+    // TMDS whenever it carries the mode; FRL only beyond it, RGB at the
+    // deepest declared depth that some rate carries.
+    let deep = HdmiCaps {
+        dc30: true,
+        dc36: false,
+        ..caps
+    };
+    let out = |t: &Timing, bpc, cap| {
+        hdmi_output(deep, t, bpc, cap).map(|(d, y, r)| (d, y, r.map(FrlRate::code)))
+    };
+    let uhd60 = t(594_000, 3840, 4400);
+    if out(&uhd60, 10, Some(cap)) != Some((otg::ColorDepth::Bpc8, false, None))
+        || out(&uhd120, 10, Some(cap)) != Some((otg::ColorDepth::Bpc10, false, Some(5)))
+        || out(&uhd120, 8, Some(cap)) != Some((otg::ColorDepth::Bpc8, false, Some(4)))
+        || out(&uhd120, 10, None).is_some()
+        || out(&uhd8k, 12, Some(cap)).is_some()
+    {
+        return TestResult::Fail("HDMI output choice");
+    }
     TestResult::Pass
 }
 kernel_test_in!(

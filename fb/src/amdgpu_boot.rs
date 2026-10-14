@@ -96,6 +96,19 @@ pub(super) fn start() -> InitResult {
     {
         navi48::set_max_bpc(bpc);
     }
+    // `amdgpu.dcfeaturemask`: bit 0x400 (Linux's DC_FRL_MASK)
+    // enables HDMI FRL when TMDS cannot carry a mode. Decimal or 0x hex.
+    if let Some(mask) = narf_boot::args()
+        .value("amdgpu.dcfeaturemask")
+        .and_then(
+            |v| match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                None => v.parse::<u32>().ok(),
+            },
+        )
+    {
+        navi48::set_frl(mask & 0x400 != 0);
+    }
     if ok && navi48 && narf_boot::args().has_flag("amdgpu.native_display") {
         native_display();
     }

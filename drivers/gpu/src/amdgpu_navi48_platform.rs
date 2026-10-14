@@ -1198,6 +1198,12 @@ pub fn set_max_bpc(bpc: u8) {
     crate::amdgpu_navi48_boot::set_max_bpc(bpc);
 }
 
+/// Let native modesets drive HDMI FRL when TMDS cannot carry a mode
+/// (Linux's dcfeaturemask DC_FRL_MASK; off by default).
+pub fn set_frl(enabled: bool) {
+    crate::amdgpu_navi48_boot::set_frl(enabled);
+}
+
 /// Poll period of the native display monitor. DCN HPD/HPD-RX vectors (and
 /// lost IH vectors) wake it early through the interrupt dispatcher: the
 /// monitor arms each lightable port's HPD interrupt and acknowledges raised

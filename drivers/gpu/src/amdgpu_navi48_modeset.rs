@@ -62,6 +62,8 @@ pub struct Selection {
     pub limited: bool,
     /// HDMI YCbCr 4:2:0 output (COLOR_SPACE_YCBCR709, 8 bpc).
     pub ycbcr420: bool,
+    /// HDMI over FRL at this rate rather than TMDS.
+    pub frl: Option<FrlRate>,
 }
 
 /// The sink's audio description as amdgpu_dm_fill_audio_info builds it from
@@ -898,6 +900,42 @@ pub fn hdmi_depth(caps: HdmiCaps, pixel_khz: u32, max_bpc: u8) -> Option<otg::Co
     .map(|(_, _, depth, _)| depth)
 }
 
+/// How an HDMI sink carries `t`: TMDS where `hdmi_format` finds a depth
+/// (Linux keeps TMDS whenever it suffices), else FRL at `frl_cap` (none
+/// when FRL is off or taken): RGB at the deepest declared depth up to
+/// `max_bpc` with a rate carrying it, the lowest such rate. FRL carries
+/// no audio here (the HPO FRL audio path is not implemented), so the
+/// capacity check runs without it.
+pub fn hdmi_output(
+    caps: HdmiCaps,
+    t: &Timing,
+    max_bpc: u8,
+    frl_cap: Option<FrlRate>,
+) -> Option<(otg::ColorDepth, bool, Option<FrlRate>)> {
+    if let Some((depth, ycbcr420)) = hdmi_format(caps, t, max_bpc) {
+        return Some((depth, ycbcr420, None));
+    }
+    let cap = frl_cap?;
+    let audio = frl_audio(None, t.v_active);
+    [
+        (12, caps.dc36, otg::ColorDepth::Bpc12),
+        (10, caps.dc30, otg::ColorDepth::Bpc10),
+        (8, true, otg::ColorDepth::Bpc8),
+    ]
+    .into_iter()
+    .filter(|&(bpc, declared, _)| bpc <= max_bpc && declared)
+    .find_map(|(bpc, _, depth)| frl_link(t, bpc, cap, audio).map(|r| (depth, false, Some(r))))
+}
+
+/// The bits per component of an output depth.
+fn depth_bpc(depth: otg::ColorDepth) -> u8 {
+    match depth {
+        otg::ColorDepth::Bpc8 => 8,
+        otg::ColorDepth::Bpc10 => 10,
+        otg::ColorDepth::Bpc12 => 12,
+    }
+}
+
 /// First routed DP port whose sink answered with DPCD and an EDID preferred
 /// mode the DCN timing model accepts, at the sink's maximum link; failing
 /// that, the first HDMI sink whose preferred mode fits TMDS, at the deepest
@@ -973,8 +1011,10 @@ pub fn select_all(
             avi: otg::Avi::default(),
             limited: false,
             ycbcr420: false,
+            frl: None,
         });
     }
+    let mut frl_free = true;
     for port in ports {
         if port.path.connector != inventory::Connector::HdmiTypeA {
             continue;
@@ -987,18 +1027,22 @@ pub fn select_all(
         let Some(index) = paths.iter().position(|p| *p == port.path) else {
             continue;
         };
+        // DCN401 has one HPO FRL encoder: one FRL display at most.
+        let frl_cap = frl_cap(caps).filter(|_| frl_free);
+        let audio = sink_audio_info(&sink.edid);
         let Some(timing) = pick(index, &sink.edid, &|t| {
-            hdmi_format(caps, t, max_bpc).is_some()
+            hdmi_output(caps, t, max_bpc, frl_cap).is_some()
         }) else {
             continue;
         };
         let Some(edid) = sink.edid.get(..128).and_then(|b| b.try_into().ok()) else {
             continue;
         };
-        let Some((depth, ycbcr420)) = hdmi_format(caps, &timing, max_bpc) else {
+        let Some((depth, ycbcr420, frl)) = hdmi_output(caps, &timing, max_bpc, frl_cap) else {
             link_short = true;
             continue;
         };
+        frl_free &= frl.is_none();
         out.push(Selection {
             port: index,
             timing,
@@ -1009,10 +1053,12 @@ pub fn select_all(
             hdmi: true,
             scdc: caps.scdc,
             depth,
-            audio: sink_audio_info(&sink.edid),
+            // The HPO FRL audio path (AFMT4/APG) is not implemented.
+            audio: if frl.is_some() { None } else { audio },
             avi: hdmi_avi(caps, &timing),
             limited: false,
             ycbcr420,
+            frl,
         });
     }
     out.truncate(MAX_DISPLAYS);
@@ -1134,12 +1180,16 @@ pub fn clock_request(plan: &dml::Plan) -> clocks::Request {
 
 /// DP's DPREF DTO, or for RGB TMDS the divide-by-four pixel rate (Linux's
 /// dcn401_calculate_dccg_tmds_div_value) from the PHY PLL.
-pub fn pipe_clock_request(pipe: u8, plan: &dml::Plan, hdmi: bool) -> dccg::Request {
+pub fn pipe_clock_request(pipe: u8, plan: &dml::Plan, selection: &Selection) -> dccg::Request {
+    let pixel_hz = u64::from(plan.mode.timing.pixel_clock_khz) * 1000;
     dccg::Request {
         pipe,
         dpp_khz: plan.clocks.dppclk_khz,
-        // dcn401_calculate_dccg_tmds_div_value: 4:2:0 divides by two.
-        pixel: if hdmi {
+        // dcn401_calculate_dccg_tmds_div_value: 4:2:0 divides by two. FRL
+        // runs the full pixel clock from DTBCLK through the DP DTO.
+        pixel: if selection.frl.is_some() {
+            dccg::PixelClock::HdmiFrl { pixel_hz }
+        } else if selection.hdmi {
             dccg::PixelClock::Tmds {
                 divider: if plan.mode.ycbcr420 {
                     dccg::TmdsDivider::By2
@@ -1162,7 +1212,9 @@ pub fn timing_request(pipe: u8, plan: &dml::Plan, selection: &Selection) -> otg:
         pipe,
         timing: plan.mode.timing,
         sync: plan.sync,
-        signal: if selection.hdmi {
+        signal: if selection.frl.is_some() {
+            otg::Signal::HdmiFrl
+        } else if selection.hdmi {
             otg::Signal::Tmds
         } else if selection.uhbr() {
             otg::Signal::HpoDisplayPort
@@ -1402,11 +1454,16 @@ impl ColdBoot {
     ) -> Result<(), ModesetError> {
         let mut request = clock_request(&plans[0]);
         request.displays = plans.len() as u8;
+        // dcn401_update_clocks: an FRL stream holds DTBCLK at its highest
+        // DPM level.
+        if selections.iter().any(|s| s.frl.is_some()) {
+            request.dtb_khz = self.top_dtb_khz()?;
+        }
         self.prepare_display_clocks(request)
             .await
             .map_err(ModesetError::Clocks)?;
         for ((s, plan), &pipe) in selections.iter().zip(plans).zip(pipes) {
-            self.prepare_display_pipe_clocks(pipe_clock_request(pipe, plan, s.hdmi))
+            self.prepare_display_pipe_clocks(pipe_clock_request(pipe, plan, s))
                 .await
                 .map_err(ModesetError::PipeClocks)?;
         }
@@ -1496,7 +1553,9 @@ impl ColdBoot {
             }
             // How the link would carry it: HDMI may need 4:2:0.
             let format = if s.hdmi {
-                hdmi_format(caps, &t, max_bpc()).map(|(_, ycbcr420)| ycbcr420)
+                // FRL only for the display holding the HPO FRL encoder.
+                let frl = s.frl.and_then(|_| frl_cap(caps));
+                hdmi_output(caps, &t, max_bpc(), frl).map(|(_, ycbcr420, _)| ycbcr420)
             } else {
                 dp_offer_fits(&t, &s).then_some(false)
             };
@@ -1535,6 +1594,9 @@ impl ColdBoot {
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
             let port = selection.port;
+            if let Some(rate) = selection.frl {
+                return self.start_frl_link(selection, rate, pipe).await;
+            }
             if selection.hdmi {
                 self.configure_scdc(&selection).await?;
                 let request = otg::HdmiLinkRequest {
@@ -1670,6 +1732,84 @@ impl ColdBoot {
             Ok((selection, scanout))
         }
     }
+    /// The FRL half of `start_link`: train (stepping down on the sink's
+    /// request), then FRL video with the borrow parameters Linux's capacity
+    /// check gives at the trained rate, then scanout. No audio: the HPO FRL
+    /// audio path is not implemented.
+    /// # Safety
+    /// As for `start_link`.
+    async unsafe fn start_frl_link(
+        &mut self,
+        selection: Selection,
+        rate: FrlRate,
+        pipe: u8,
+    ) -> Result<(Selection, otg::ScanoutRunning), ModesetError> {
+        use crate::amdgpu_frl_cap::{FrlBorrow, FrlCap};
+        let port = selection.port;
+        let bpc = depth_bpc(selection.depth);
+        let audio = frl_audio(None, selection.timing.v_active);
+        // SAFETY: the caller's obligations; each step checks its predecessor.
+        unsafe {
+            let trained = self
+                .start_frl(port, &selection.timing, bpc, rate, audio)
+                .await?;
+            let Some(FrlCap::Ok {
+                audio_packets_line,
+                borrow,
+            }) = frl_carries(&selection.timing, bpc, trained, audio)
+            else {
+                return Err(ModesetError::Link);
+            };
+            let request = otg::FrlVideoRequest {
+                pipe,
+                audio_packets_line: audio_packets_line as u8,
+                borrow_from_blank: borrow == FrlBorrow::FromBlank,
+                avi: selection.avi,
+            };
+            self.start_display_frl_video(port, request).await?;
+            let scanout = self.start_display_scanout(pipe).await?;
+            Ok((
+                Selection {
+                    frl: Some(trained),
+                    ..selection
+                },
+                scanout,
+            ))
+        }
+    }
+    /// Stop a running FRL display's video, return its sink to legacy
+    /// TMDS as Linux's write_scdc_data does on any HDMI stop (FRL rate and
+    /// update flag cleared, Source_Version, TMDS_Config 0; unchecked), then
+    /// stop the link. Scanout stopped first.
+    /// # Safety
+    /// As for `stop_modeset`.
+    async unsafe fn stop_frl(&mut self, port: usize) -> Result<(), ModesetError> {
+        use crate::amdgpu_frl_training::{CONFIG_1, SINK_VERSION, SOURCE_VERSION, UPDATE_0};
+        // SAFETY: the caller's obligations; each step checks its predecessor.
+        unsafe {
+            self.stop_display_frl_video(port).await?;
+            if self
+                .display_scdc_read(port, CONFIG_1)
+                .await
+                .is_ok_and(|v| v & 0xf != 0)
+            {
+                let _ = self.display_scdc_write(port, CONFIG_1, 0).await;
+            }
+            if self
+                .display_scdc_read(port, UPDATE_0)
+                .await
+                .is_ok_and(|v| v & 0x20 != 0)
+            {
+                let _ = self.display_scdc_write(port, UPDATE_0, 0x20).await;
+            }
+            if self.display_scdc_read(port, SINK_VERSION).await == Ok(1) {
+                let _ = self.display_scdc_write(port, SOURCE_VERSION, 1).await;
+            }
+            let _ = self.display_scdc_write(port, scdc::TMDS_CONFIG, 0).await;
+            self.stop_display_frl_link(port).await?;
+        }
+        Ok(())
+    }
     /// Stop a running 128b/132b display's video and link (scanout stopped).
     /// # Safety
     /// As for `stop_modeset`.
@@ -1795,11 +1935,13 @@ impl ColdBoot {
         let port = m.selection.port;
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
-            if m.selection.audio.is_some() && !m.selection.uhbr() {
+            if m.selection.audio.is_some() && !m.selection.uhbr() && m.selection.frl.is_none() {
                 self.stop_display_audio(port, m.selection.hdmi).await?;
             }
             self.stop_display_scanout(m.pipe).await?;
-            if m.selection.hdmi {
+            if m.selection.frl.is_some() {
+                self.stop_frl(port).await?;
+            } else if m.selection.hdmi {
                 self.stop_hdmi(port, m.selection.scdc).await?;
             } else if m.selection.uhbr() {
                 self.stop_uhbr(port, true).await?;
@@ -1823,11 +1965,13 @@ impl ColdBoot {
         let port = m.selection.port;
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
-            if m.selection.audio.is_some() && !m.selection.uhbr() {
+            if m.selection.audio.is_some() && !m.selection.uhbr() && m.selection.frl.is_none() {
                 self.stop_display_audio(port, m.selection.hdmi).await?;
             }
             self.stop_display_scanout(m.pipe).await?;
-            if m.selection.hdmi {
+            if m.selection.frl.is_some() {
+                self.stop_frl(port).await?;
+            } else if m.selection.hdmi {
                 self.stop_hdmi(port, m.selection.scdc).await?;
             } else if m.selection.uhbr() {
                 self.stop_uhbr(port, false).await?;
