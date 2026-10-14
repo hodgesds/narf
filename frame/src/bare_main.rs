@@ -5766,6 +5766,18 @@ fn boot_userspace_init() {
                     "unix_listen_wake_glibc",
                     narf_verification::NARF_UNIX_LISTEN_WAKE_SMOKE_GLIBC_ELF,
                 ),
+                // Firefox's wayland-proxy shape: recvmsg(4096 + 28 fds) →
+                // one non-blocking sendmsg between two AF_UNIX stream pairs,
+                // under a slow reader. A short send or merged rights batch
+                // desyncs the stream ("Message length N exceeds limit").
+                (
+                    "wlproxy_sockpair_smoke",
+                    narf_verification::NARF_WLPROXY_SOCKPAIR_SMOKE_ELF,
+                ),
+                (
+                    "wlproxy_sockpair_glibc",
+                    narf_verification::NARF_WLPROXY_SOCKPAIR_SMOKE_GLIBC_ELF,
+                ),
                 // A dup()'d socketpair end survives fork/vfork/posix_spawn +
                 // execve without FD_CLOEXEC: kwin's WAYLAND_SOCKET handoff to
                 // Xwayland.

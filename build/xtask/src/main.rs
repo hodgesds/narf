@@ -5117,6 +5117,8 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("pthread_sched_glibc", "pthread-sched-ok"),
         ("unix_listen_wake_smoke", "unix-listen-wake-ok"),
         ("unix_listen_wake_glibc", "unix-listen-wake-ok"),
+        ("wlproxy_sockpair_smoke", "wlproxy-ok"),
+        ("wlproxy_sockpair_glibc", "wlproxy-ok"),
         ("fd_inherit_exec_smoke", "fd-inherit-exec-ok"),
         ("fd_inherit_exec_glibc", "fd-inherit-exec-ok"),
         ("xserver_epoll_wake_smoke", "xserver-epoll-wake-ok"),
