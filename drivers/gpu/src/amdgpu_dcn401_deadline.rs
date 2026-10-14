@@ -262,7 +262,10 @@ pub(super) fn bound(
         && timing.pipe == a.pipe
         && timing.timing == t
         && timing.sync == plan.sync
-        && matches!(timing.signal, Signal::DisplayPort | Signal::Tmds)
+        && matches!(
+            timing.signal,
+            Signal::DisplayPort | Signal::HpoDisplayPort | Signal::Tmds
+        )
         && surface.request.width == t.h_active
         && surface.request.height == t.v_active
         && u64::from(surface.pitch_bytes) == u64::from(plan.mode.pitch) * 4

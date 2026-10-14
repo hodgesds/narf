@@ -14,7 +14,7 @@ mod link_status;
 pub use link_status::DpLinkStatus;
 #[path = "amdgpu_dcn401_uhbr_link.rs"]
 pub(in super::super) mod uhbr;
-pub use uhbr::{UhbrLinkTrained, UhbrSettings};
+pub use uhbr::{UhbrLinkTrained, UhbrPayload, UhbrSettings, UhbrVideoRunning};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DpTrainingError {

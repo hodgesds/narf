@@ -804,3 +804,54 @@ kernel_test_in!(
     "drivers/gpu/dcn401-dccg",
     dcn401_inherited_route_retirement_failure_stops_before_dto_writes
 );
+
+/// dcn401_enable_stream's 128b/132b stream clocks: DPSTREAMCLK from the
+/// pipe, then SYMCLK32_SE from the PHY, no gate-disable writes (root clock
+/// optimization is off); a route already on is refused; the disable order
+/// is SYMCLK32_SE (to REFCLK) then DPSTREAMCLK.
+fn dcn401_hpo_stream_clocks_follow_linux() -> TestResult {
+    let (pipe, stream, phy) = (2u8, 1u8, 3u8);
+    let mut e = engine();
+    run(e.prepare(request(pipe), clocks())).unwrap();
+    e.io.writes.clear();
+    e.route_hpo_stream(stream, pipe, phy, clocks()).unwrap();
+    let shift = 4 * u32::from(stream);
+    if e.io.writes
+        != [
+            (BASE + 0x4a * 4, (8 | u32::from(pipe)) << shift),
+            (BASE + 0x65 * 4, (8 | u32::from(phy)) << shift),
+        ]
+    {
+        return TestResult::Fail("stream clock writes");
+    }
+    assert_eq!(
+        e.route_hpo_stream(stream, pipe, phy, clocks()),
+        Err(Error::Busy)
+    );
+    e.io.writes.clear();
+    e.unroute_hpo_stream(stream).unwrap();
+    if e.io.writes
+        != [
+            (BASE + 0x65 * 4, 0),
+            (BASE + 0x4a * 4, u32::from(pipe) << shift),
+        ]
+    {
+        return TestResult::Fail("stream clock disable");
+    }
+    // A pipe without a DP pixel clock has no stream to clock.
+    let mut e = engine();
+    let mut req = request(pipe);
+    req.pixel = PixelClock::Tmds {
+        divider: TmdsDivider::By4,
+    };
+    run(e.prepare(req, clocks())).unwrap();
+    assert_eq!(
+        e.route_hpo_stream(stream, pipe, phy, clocks()),
+        Err(Error::Invalid)
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dccg",
+    dcn401_hpo_stream_clocks_follow_linux
+);

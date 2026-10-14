@@ -9,6 +9,7 @@ const DP_STREAM: u64 = 0x4a; // DCN bank 1
 const HDMI_STREAM: u64 = 0x59; // DCN bank 2
 const GATE3: u64 = 0x5a;
 const DENTIST: u64 = 0x64;
+const SYMCLK32_SE: u64 = 0x65;
 const DTB_P: u64 = 0x68;
 const GATE5: u64 = 0x69;
 const PIXEL_DIV: u64 = 0x6f;
@@ -462,6 +463,56 @@ impl<I: Io> Engine<I> {
         };
         result
     }
+    /// dcn401_enable_stream's 128b/132b clocks for HPO stream encoder
+    /// `stream`: DPSTREAMCLK from the pipe's DTBCLK_P (dccg401_enable_
+    /// dpstreamclk), then SYMCLK32_SE from the PHY's PHYD32CLK (dccg31_
+    /// enable_symclk32_se). Root-clock optimization is off on DCN401, so no
+    /// gate-disable writes. Both must be off first; the pipe's retained DP
+    /// clock is rechecked, never reprogrammed.
+    fn route_hpo_stream(
+        &mut self,
+        stream: u8,
+        pipe: u8,
+        phy: u8,
+        global: clocks::Applied,
+    ) -> Result<(), Error> {
+        if stream >= 4 || phy >= 5 {
+            return Err(Error::Invalid);
+        }
+        let plan = self.retained_pipe(pipe, global)?;
+        if !matches!(plan.request.pixel, PixelClock::DisplayPort { .. }) {
+            return Err(Error::Invalid);
+        }
+        let shift = 4 * u32::from(stream);
+        for index in [DP_STREAM, SYMCLK32_SE] {
+            if self.read(self.layout.reg(index))? >> shift & 8 != 0 {
+                return Err(Error::Busy);
+            }
+        }
+        self.update(DP_STREAM, 15 << shift, (8 | u32::from(pipe)) << shift)?;
+        self.update(SYMCLK32_SE, 15 << shift, (8 | u32::from(phy)) << shift)?;
+        self.status.routes[usize::from(stream)] = Some(StreamRoute {
+            stream: Stream::HpoDp(stream),
+            pipe: Some(pipe),
+        });
+        Ok(())
+    }
+    /// dce110_disable_stream's clock half: SYMCLK32_SE to REFCLK (source
+    /// 0, off; dccg31_disable_symclk32_se), then DPSTREAMCLK off
+    /// (dccg401_disable_dpstreamclk).
+    fn unroute_hpo_stream(&mut self, stream: u8) -> Result<(), Error> {
+        if stream >= 4 {
+            return Err(Error::Invalid);
+        }
+        let shift = 4 * u32::from(stream);
+        self.update(SYMCLK32_SE, 15 << shift, 0)?;
+        self.update(DP_STREAM, 8 << shift, 0)?;
+        self.status.routes[usize::from(stream)] = Some(StreamRoute {
+            stream: Stream::HpoDp(stream),
+            pipe: None,
+        });
+        Ok(())
+    }
     async fn tmds_divider(&mut self, pipe: u8, divider: TmdsDivider) -> Result<(), Error> {
         let mask = 1 << (5 * pipe);
         let value = if divider == TmdsDivider::By4 { mask } else { 0 };
@@ -637,6 +688,31 @@ impl Dccg {
     ) -> Result<Applied, Error> {
         let global = clocks.pipe_clocks(self.0.io.0).map_err(Error::Clocks)?;
         self.0.prepare(request, global).await
+    }
+    /// Clock HPO stream encoder `stream` for 128b/132b from `pipe`'s
+    /// retained DP pixel clock and PHY `phy`, while the display owner's
+    /// 128b/132b link runs (no idle requirement; nothing else is touched).
+    pub(crate) fn route_hpo_stream(
+        &mut self,
+        regs: MmioRegion,
+        clocks: &mut clocks::ClockManager,
+        stream: u8,
+        pipe: u8,
+        phy: u8,
+    ) -> Result<(), Error> {
+        if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
+            return Err(Error::Invalid);
+        }
+        let global = clocks.retained_pipe_clocks(regs).map_err(Error::Clocks)?;
+        self.0.route_hpo_stream(stream, pipe, phy, global)
+    }
+    /// Stop HPO stream encoder `stream`'s 128b/132b clocks once the stream
+    /// encoder is disabled.
+    pub(crate) fn unroute_hpo_stream(&mut self, regs: MmioRegion, stream: u8) -> Result<(), Error> {
+        if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
+            return Err(Error::Invalid);
+        }
+        self.0.unroute_hpo_stream(stream)
     }
     /// Route a prepared pixel clock to a retired HPO DP or FRL stream. Refuses
     /// stale global clocks, wrong signal types and changed divider readback.

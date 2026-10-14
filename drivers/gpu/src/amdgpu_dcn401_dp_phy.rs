@@ -11,7 +11,7 @@ pub use dmub::{DpPhySettings, UhbrRate};
 pub(super) mod training;
 pub use training::{
     DpDriveSettings, DpFrontendReady, DpFrontendRequest, DpLinkStatus, DpLinkTrained,
-    DpTrainingError, DpVideoRunning, UhbrLinkTrained, UhbrSettings,
+    DpTrainingError, DpVideoRunning, UhbrLinkTrained, UhbrPayload, UhbrSettings, UhbrVideoRunning,
 };
 
 const LANES_MASK: u32 = 0x3e3e3e3e;
@@ -89,16 +89,18 @@ impl<I: Io> Engine<I> {
         frontend: Option<u8>,
         timing: Option<u8>,
     ) -> Result<(), Error> {
-        self.dp_phy_consumers_hpo(phy, frontend, timing, None)
+        self.dp_phy_consumers_hpo(phy, frontend, timing, None, None)
     }
     /// As `dp_phy_consumers_owned`, with `hpo`'s own running HPO link
-    /// encoder (its DPHY, clock and SYMCLK32_LE route) exempt.
+    /// encoder (its DPHY, clock and SYMCLK32_LE route) and `stream`'s own
+    /// HPO stream encoder (its enables and SYMCLK32_SE route) exempt.
     fn dp_phy_consumers_hpo(
         &mut self,
         phy: u8,
         frontend: Option<u8>,
         timing: Option<u8>,
         hpo: Option<u8>,
+        stream: Option<u8>,
     ) -> Result<(), Error> {
         let l = self.layout;
         let s = self.displays.siblings;
@@ -132,6 +134,11 @@ impl<I: Io> Engine<I> {
                             .iter()
                             .any(|&r| reg == DpStream::Hpo(k).at(l, r))
                 })
+                || stream.is_some_and(|k| {
+                    [0x3623, 0x365d, 0x367b, 0x3685]
+                        .iter()
+                        .any(|&r| reg == DpStream::Hpo(k).at(l, r))
+                })
                 || self.sibling_register(reg)
             {
                 continue;
@@ -152,7 +159,8 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Busy);
             }
         }
-        if self.read(l.link_clock - 4)? & 0x8888 != 0
+        let own = stream.map_or(0, |k| 8 << (4 * k));
+        if self.read(l.link_clock - 4)? & 0x8888 & !own != 0
             || self.read(l.base + (0x52 + u64::from(phy)) * 4)? & 1 != 0
         {
             return Err(Error::Busy);
@@ -166,7 +174,9 @@ impl<I: Io> Engine<I> {
             if frontend != Some(p) && !other(siblings.streams) {
                 self.dp_encoder_quiet(DpStream::Dio(p))?;
             }
-            self.dp_encoder_quiet(DpStream::Hpo(p))?;
+            if stream != Some(p) {
+                self.dp_encoder_quiet(DpStream::Hpo(p))?;
+            }
             if (frontend != Some(p)
                 && !other(siblings.streams)
                 && self.read(l.dio_clock + u64::from(p) * 4)? & 0x10 != 0)

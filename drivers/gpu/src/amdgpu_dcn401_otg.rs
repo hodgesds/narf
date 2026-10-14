@@ -31,7 +31,8 @@ pub use link::DpSstDisabled;
 mod dp_phy;
 pub use dp_phy::{
     DpDriveSettings, DpFrontendReady, DpFrontendRequest, DpLinkStatus, DpLinkTrained, DpPhyReady,
-    DpPhySettings, DpTrainingError, DpVideoRunning, UhbrLinkTrained, UhbrRate, UhbrSettings,
+    DpPhySettings, DpTrainingError, DpVideoRunning, UhbrLinkTrained, UhbrPayload, UhbrRate,
+    UhbrSettings, UhbrVideoRunning,
 };
 #[path = "amdgpu_dcn401_hpo_link.rs"]
 mod hpo_link;
@@ -132,6 +133,10 @@ pub enum State {
     UhbrLinkTrained(u8),
     UhbrLinkRefused(u8),
     StoppingUhbrLink(u8),
+    /// 128b/132b video on HPO stream encoder n: starting, running, stopping.
+    StartingUhbrVideo(u8),
+    UhbrVideoRunning(u8),
+    StoppingUhbrVideo(u8),
     PreparingDpFrontend(u8),
     DpFrontendReady(u8),
     StoppingDpFrontend(u8),
@@ -227,7 +232,10 @@ impl State {
         self.reusable()
             || matches!(
                 self,
-                Self::ScanoutRunning(_) | Self::DpVideoRunning(_) | Self::HdmiVideoRunning(_)
+                Self::ScanoutRunning(_)
+                    | Self::DpVideoRunning(_)
+                    | Self::HdmiVideoRunning(_)
+                    | Self::UhbrVideoRunning(_)
             )
     }
 }
@@ -327,6 +335,9 @@ pub struct Status {
     pub dp_link_trained: Option<DpLinkTrained>,
     /// The 128b/132b link; current in UhbrLinkTrained/UhbrLinkRefused.
     pub uhbr_link: Option<UhbrLinkTrained>,
+    /// Black 128b/132b video; current only in UhbrVideoRunning (or beneath
+    /// a live scanout).
+    pub uhbr_video_running: Option<UhbrVideoRunning>,
     /// Historical blank frontend setup; current only in DpFrontendReady.
     /// Timing, video and scanout remain stopped.
     pub dp_frontend_ready: Option<DpFrontendReady>,
@@ -386,6 +397,7 @@ impl Status {
             dp_phy_ready: None,
             dp_link_trained: None,
             uhbr_link: None,
+            uhbr_video_running: None,
             dp_frontend_ready: None,
             dp_video_running: None,
             hpo_link_retired: None,

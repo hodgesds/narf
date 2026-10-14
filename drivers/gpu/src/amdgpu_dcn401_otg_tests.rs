@@ -196,6 +196,17 @@ impl Io for Fake {
                         ]
                         .iter()
                         .any(|r| at == BASE + (r + p * 0xd4) * 4)
+                        // HPO stream encoder attributes, packets, mux, CRC,
+                        // VPG power; the link encoder's VC rates.
+                        || [
+                            0x3624, 0x3656, 0x366c, 0x366e, 0x366f, 0x3671, 0x3687, 0x36b9,
+                            0x36ba, 0x36bb, 0x36bc,
+                        ]
+                        .iter()
+                        .any(|r| at == BASE + (r + p * 0xd4) * 4)
+                        || (BASE + (0x365f + p * 0xd4) * 4..=BASE + (0x366b + p * 0xd4) * 4)
+                            .contains(&at)
+                        || at == MPC_BASE + (0xe56 + p) * 4 // DP_STREAM_MAPPER_CONTROL
                 })
         );
         self.writes.push((at, value));
@@ -259,6 +270,7 @@ impl Io for Fake {
                 .iter()
                 .any(|r| at == BASE + (r + p * 0xd4) * 4)
                 && value & 1 == 0
+                && self.regs.get(&at).copied().unwrap_or(0) & 1 != 0
             {
                 assert_eq!(
                     self.regs

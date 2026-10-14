@@ -11,6 +11,9 @@
 //! scanout are separate owners.
 use super::*;
 pub use dmub::UhbrRate;
+#[path = "amdgpu_dcn401_uhbr_video.rs"]
+pub(in crate::amdgpu_dcn401_otg) mod video;
+pub use video::{UhbrPayload, UhbrVideoRunning};
 
 const LINK_CLOCK: u64 = 0x369f;
 const CONTROL: u64 = 0x36b4;
@@ -128,8 +131,18 @@ impl<I: Io> Engine<I> {
     }
     /// The running link's firmware-made state, and nothing else awake.
     fn uhbr_verify(&mut self, plan: &UhbrLinkTrained) -> Result<(), Error> {
+        self.uhbr_verify_owned(plan, None, None)
+    }
+    /// As `uhbr_verify`, with a stream encoder and timing the link's video
+    /// owner holds exempt.
+    pub(in super::super::super) fn uhbr_verify_owned(
+        &mut self,
+        plan: &UhbrLinkTrained,
+        stream: Option<u8>,
+        timing: Option<u8>,
+    ) -> Result<(), Error> {
         let phy = plan.path.transmitter;
-        self.dp_phy_consumers_hpo(phy, None, None, Some(plan.link))?;
+        self.dp_phy_consumers_hpo(phy, None, timing, Some(plan.link), stream)?;
         self.dp_phy_untrained(phy)?;
         self.uhbr_witnesses(plan)
     }

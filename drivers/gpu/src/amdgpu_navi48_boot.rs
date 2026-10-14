@@ -1663,6 +1663,51 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Start black 128b/132b video on the port's trained UHBR link through
+    /// HPO stream encoder `stream`, from `pipe`'s prepared timing.
+    /// # Safety
+    /// Fulfil `Otg::start_uhbr_video` obligations.
+    pub async unsafe fn start_display_uhbr_video(
+        &mut self,
+        port: usize,
+        stream: u8,
+        pipe: u8,
+    ) -> Result<otg::UhbrVideoRunning, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: retained matching owners; caller excludes external writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .start_uhbr_video(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    &mut self.sequence.backend.dmub,
+                    path,
+                    stream,
+                    pipe,
+                )
+                .await
+        }
+    }
+    /// Stop the port's 128b/132b video, retaining the trained link.
+    /// # Safety
+    /// Fulfil `Otg::stop_uhbr_video` obligations.
+    pub async unsafe fn stop_display_uhbr_video(&mut self, port: usize) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: retained matching owners; caller fulfils the lifetime contract.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .stop_uhbr_video(
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    &mut self.sequence.backend.dmub,
+                    path,
+                )
+                .await
+        }
+    }
     /// Blank video and stop timing, retaining the prepared frontend and link.
     /// # Safety
     /// Fulfil `Otg::stop_dp_video` writer/resource lifetime obligations.

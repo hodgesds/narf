@@ -201,8 +201,9 @@ fn dcn401_deadlines_bind_only_the_admitted_owners() -> TestResult {
         (other_mode, timing, requestor, clock, 50_000),
         (
             plan,
+            // FRL timing has no deadline owner yet (HPO DP now does).
             Request {
-                signal: Signal::HpoDisplayPort,
+                signal: Signal::HdmiFrl,
                 ycbcr420: false,
                 ..timing
             },

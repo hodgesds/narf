@@ -65,6 +65,22 @@ impl Io for UhbrIo {
         if at == hpo(LINK, 0x369f) && value & 1 == 0 {
             self.inner.regs.insert(hpo(LINK, 0x369f), 0);
         }
+        // HPO stream encoders: reset-done and video status follow their
+        // requests.
+        for s in 0..4 {
+            for (reg, from, to) in [
+                (0x365d, 0x10, 0x100),
+                (0x365e, 0x10, 0x100),
+                (0x3626, 0x10, 0x10_0000),
+                (0x3685, 1, 0x100),
+            ] {
+                if at == hpo(s, reg) {
+                    let v = self.inner.regs[&at];
+                    let done = if v & from != 0 { to } else { 0 };
+                    self.inner.regs.insert(at, (v & !to) | done);
+                }
+            }
+        }
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,6 +133,10 @@ impl Transport for Sink {
                 self.steps.push(Step::Write(address, data.to_vec(), mode));
                 for (i, b) in data.iter().enumerate() {
                     self.bytes.insert(address + i as u32, *b);
+                }
+                // A new VC payload allocation: table updated, ACT handled.
+                if address == 0x1c2 {
+                    self.bytes.insert(0x2c0, 3);
                 }
             }
             0x90 => {
@@ -428,4 +448,156 @@ fn dcn401_uhbr_link_checks_caps_before_the_phy() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_uhbr_link_checks_caps_before_the_phy
+);
+
+/// Linux's worked example: 3840x2160@60 RGB on 4 x UHBR10 averages
+/// 23.65896 slots per MTP: 24 slots, VC rate X 23 / Y 0x15162C1, and 105
+/// blanking symbols. 1366 pixels pad to whole symbols.
+fn dcn401_uhbr_payload_matches_linux_sst_allocation() -> TestResult {
+    use super::super::super::super::dp_phy::training::uhbr::video::uhbr_payload;
+    let mut t = request(0).timing;
+    (t.pixel_clock_khz, t.h_active, t.h_total) = (594_000, 3840, 4400);
+    let s = UhbrSettings {
+        lanes: 4,
+        rate: UhbrRate::Uhbr10,
+    };
+    match uhbr_payload(&t, 8, s) {
+        Some(p) if (p.slots, p.vc_rate, p.hblank_symbols) == (24, 0x2f51_62c1, 105) => {}
+        other => panic!("4K60 payload {other:?}"),
+    }
+    // 1080p60 on the same link: 5.91 slots, 52 blanking symbols.
+    let p = uhbr_payload(&request(0).timing, 8, s).unwrap();
+    if p.slots != 6 || p.vc_rate >> 25 != 5 || p.hblank_symbols != 52 {
+        return TestResult::Fail("1080p payload");
+    }
+    // Beyond 64 slots there is no allocation.
+    t.pixel_clock_khz = 1_700_000;
+    if uhbr_payload(&t, 8, s).is_some() {
+        return TestResult::Fail("over-subscribed link");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_uhbr_payload_matches_linux_sst_allocation
+);
+
+/// 128b/132b video as Linux brings it up on a trained link: stream
+/// attributes (pixel format, MSA), the stream encoder's reset handshake and
+/// enable, its mapping to the link encoder, the SDP path, the timing
+/// running, the sink's VC payload table then the encoder's allocation and
+/// ACT, VC rate and blanking width, then unblank from the OTG. Stop
+/// reverses it down to the trained link with the allocation empty.
+fn dcn401_uhbr_video_starts_and_stops_like_linux() -> TestResult {
+    let (p, stream, pipe) = (2, 1, 3);
+    let settings = UhbrSettings {
+        lanes: 4,
+        rate: UhbrRate::Uhbr10,
+    };
+    let (mut e, mut sink) = uhbr_fixture(p, settings);
+    let req = request(pipe);
+    let c = clock(req);
+    run(e.prepare(req, c)).unwrap();
+    e.io.inner.retiring = [false; 4];
+    run(e.prepare_blank(blank_request(pipe), c)).unwrap();
+    // The clock owner's live DP DTO (DPREFCLK) behind the prepared timing.
+    let bank1 = e.layout.dio_clock - 0xa0 * 4;
+    e.io.inner
+        .regs
+        .insert(bank1 + (0x80 + 4 * u64::from(pipe)) * 4, 0x1090);
+    e.io.inner.regs.insert(bank1 + 0x68 * 4, 4 << (pipe * 3));
+    // Every fetcher stopped.
+    for h in 0..4 {
+        e.io.inner.regs.insert(BASE + (0x5f4 + h * 0xdc) * 4, 3);
+    }
+    sink.status = VecDeque::from([status(7, 0xd, [0; 4])]);
+    run(e.train_uhbr_link(&mut sink, path(p), settings, LINK)).unwrap();
+    // Before the clock owner routes the stream clocks, video is refused.
+    assert_eq!(
+        run(e.start_uhbr_video(&mut sink, path(p), stream, pipe, c)),
+        Err(Error::Readback(LE_ROOT - (0x66 - 0x4a) * 4))
+    );
+    let shift = 4 * u32::from(stream);
+    e.io.inner
+        .regs
+        .insert(LE_ROOT - (0x66 - 0x4a) * 4, (8 | u32::from(pipe)) << shift);
+    e.io.inner
+        .regs
+        .insert(LE_ROOT - 4, (8 | u32::from(p)) << shift);
+    e.status.state = State::UhbrLinkTrained(p);
+    sink.steps.clear();
+    let v = match run(e.start_uhbr_video(&mut sink, path(p), stream, pipe, c)) {
+        Ok(v) => v,
+        Err(err) => panic!("UHBR video: {err:?}"),
+    };
+    let r =
+        |e: &Engine<UhbrIo>, reg: u64| e.io.inner.regs.get(&hpo(stream, reg)).copied().unwrap_or(0);
+    // 1920x1080, h total 2200 (start 192), v total 1125 (start 41),
+    // 148.5 MHz, +hsync -vsync, 8 bpc.
+    let msa = [
+        0,
+        0,
+        0x0800_0000,
+        0xd907_0008,
+        0xee80_c098,
+        0x2004_0004,
+        0x2038_2965,
+        0x8000,
+        0x052c,
+    ];
+    let msa_ok = (0..9).all(|i| r(&e, 0x3662 + i) == msa[i as usize]);
+    if r(&e, 0x3661) & 0x331 != 0x100 || !msa_ok {
+        let got: Vec<u32> = (0..9).map(|i| r(&e, 0x3662 + i)).collect();
+        panic!("MSA {got:x?}");
+    }
+    let payload = v.payload;
+    if (payload.slots, payload.hblank_symbols) != (6, 52)
+        || !v.acknowledged
+        || r(&e, 0x3623) & 1 != 1
+        || r(&e, 0x365d) & 0x111 != 1
+        || r(&e, 0x367b) & 1 != 1
+        || r(&e, 0x3685) & 0x101 != 0x101
+        || r(&e, 0x365e) & 0x111 != 1
+        || r(&e, 0x3626) & 0x10_0011 != 1
+        || r(&e, 0x3687) & 0x11 != 0x11
+        || r(&e, 0x3624) & 7 != u32::from(pipe)
+        || r(&e, 0x366b) != 52
+        || e.io.inner.regs[&(MPC_BASE + (0xe56 + u64::from(stream)) * 4)] & 7 != u32::from(LINK)
+        || e.io.inner.regs[&hpo(LINK, 0x36bf)] & 0x7f07 != u32::from(stream) | 6 << 8
+        || e.io.inner.regs[&hpo(LINK, 0x36b9 + u64::from(stream))] != payload.vc_rate
+        || e.status.state != State::UhbrVideoRunning(stream)
+    {
+        return TestResult::Fail("running HPO stream");
+    }
+    let w = writes(&sink);
+    if w[..4]
+        != [
+            (0x2c0, vec![1], 2),
+            (0x1c0, vec![1], 2),
+            (0x1c1, vec![0], 2),
+            (0x1c2, vec![6], 2),
+        ]
+    {
+        return TestResult::Fail("payload table");
+    }
+    sink.steps.clear();
+    run(e.stop_uhbr_video(&mut sink, path(p))).unwrap();
+    if r(&e, 0x3685) & 0x101 != 0
+        || r(&e, 0x365d) & 1 != 0
+        || r(&e, 0x3623) & 1 != 0
+        || r(&e, 0x367b) & 1 != 0
+        || r(&e, 0x366b) != 0
+        || e.io.inner.regs[&hpo(LINK, 0x36bf)] & 0x7f00 != 0
+        || e.io.inner.regs[&hpo(LINK, 0x36b9 + u64::from(stream))] != 0
+        || !writes(&sink).contains(&(0x1c2, vec![0], 2))
+        || e.status.state != State::UhbrLinkTrained(p)
+        || e.status.uhbr_video_running.is_some()
+    {
+        return TestResult::Fail("stopped HPO stream");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_uhbr_video_starts_and_stops_like_linux
 );
