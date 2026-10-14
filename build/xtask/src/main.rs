@@ -4766,7 +4766,16 @@ fn musl_case_group(cmd: &str) -> &'static str {
         "lsm",
     ]) {
         "fs"
-    } else if has(&["mremap", "mcore", "mem2", "mempolicy", "pkey", "pvm", "jitrwx"]) {
+    } else if has(&[
+        "mremap",
+        "mcore",
+        "mem2",
+        "mempolicy",
+        "pkey",
+        "pvm",
+        "jitrwx",
+        "uaccessfile",
+    ]) {
         "mem"
     } else if has(&[
         "hello",
@@ -4916,6 +4925,8 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // (multi-iovec, partial transfer, EFAULT/ESRCH/EPERM) and
         // /proc/<pid>/mem pread/pwrite/lseek. See remotevm_smoke_x86_64.c.
         ("remotevm_smoke", "remotevm-ok"),
+        // A kernel write into a read-only file mapping that first has to be read in is EFAULT, not a panic.
+        ("uaccessfile_smoke", "uaccessfile-ok"),
         // /proc/<tid> resolves a non-leader thread (Linux proc_pid_lookup).
         ("proctid_smoke", "proctid-ok"),
         // /proc state letters: S for a task asleep in a syscall, T stopped, R for the reader.

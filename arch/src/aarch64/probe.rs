@@ -91,6 +91,14 @@ pub fn is_armed() -> bool {
     this_probe().recovery.load(Ordering::Acquire) != 0
 }
 
+/// Lift this CPU's armed recovery off its cell without recording a catch,
+/// so an abort handler that has to sleep can carry it with the task (see
+/// `uaccess::suspend_guarded_copy`). Returns 0 when nothing was armed.
+#[inline]
+pub(crate) fn take() -> u64 {
+    this_probe().recovery.swap(0, Ordering::AcqRel)
+}
+
 /// Consume the probe from the data-abort-handler side.
 ///
 /// If a probe is armed, this atomically clears it, records that it fired

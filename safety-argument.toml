@@ -1512,3 +1512,11 @@ argument = "The only frame/ change (bare_main.rs) registers the procstate_smoke 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The only frame/ change (bare_main.rs) registers the proctid_smoke test binary in the embedded musl-demo table. Test registration data for verification kernels; no production path, authority, mapping, domain transition or capability changes. The /proc/<tid> lookup itself lives in filesystem/src/procfs."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "frame/src/{x86_64,aarch64}/trap.rs: a kernel-mode page fault inside a guarded user copy now lifts the copy's recovery (per-CPU probe recovery + armed marker) off the CPU before running the demand-paging heal, and re-arms it on whichever CPU the task is on afterwards, with IRQs masked, before the trap returns. The heal could already park the task (a file-backed page under read) and resume it elsewhere; the recovery used to stay armed on the old CPU, where another task's fault could consume it and redirect into this task's stack, while the copy's next fault found nothing armed and panicked. The recovery address is the same label the copy armed; nothing new is armed, no domain/PKRS state, capability, mapping or frame ownership changes, and the AC/IF state the copy resumes with still comes from its own saved trap frame. bare_main.rs registers the uaccessfile_smoke test binary (test data)."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L122"
+argument = "SMAP is unchanged: the user-access window of a guarded copy is still opened by its own STAC and closed by its own CLAC; across a parked heal the window lives only in the faulting context's saved RFLAGS.AC (restored by iretq), as before. resume_guarded_copy only executes CLI and re-arms the recovery; it never sets AC."

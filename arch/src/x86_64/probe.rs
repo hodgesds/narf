@@ -101,6 +101,14 @@ pub(super) fn disarm_for_cpu(cpu: usize) -> Caught {
     }
 }
 
+/// Lift an armed recovery off `cpu`'s cell without recording a catch, so a
+/// fault handler that has to sleep can carry it with the task (see
+/// `smap::suspend_guarded_copy`). Returns 0 when nothing was armed.
+#[inline]
+pub(super) fn take_for_cpu(cpu: usize) -> u64 {
+    probe_for(cpu).recovery.swap(0, Ordering::AcqRel)
+}
+
 /// Consume the probe from the trap-handler side.
 ///
 /// If a probe is armed, this atomically clears it, records the caught

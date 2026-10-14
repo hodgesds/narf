@@ -36,9 +36,10 @@ use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 use crate::aarch64::probe;
 
 /// Per-CPU marker for the interval where [`copy_user_guarded`] owns the
-/// recoverable-probe slot. A data abort in this interval may allocate a page
-/// synchronously, but may not park for reclaim without leaking the probe into
-/// another task (or another CPU after migration).
+/// recoverable-probe slot. A data abort in this interval does not park for
+/// reclaim, and a heal that can park for any other reason runs between
+/// [`suspend_guarded_copy`] and [`resume_guarded_copy`], which carry the slot
+/// with the task instead of leaving it on this CPU.
 #[repr(C, align(64))]
 struct GuardedCopyMarker {
     armed: AtomicBool,
@@ -70,6 +71,53 @@ fn guarded_copy_marker() -> &'static GuardedCopyMarker {
 #[inline]
 pub fn guarded_copy_armed() -> bool {
     guarded_copy_marker().armed.load(Ordering::Acquire)
+}
+
+/// A guarded copy's recovery, lifted off its CPU by
+/// [`suspend_guarded_copy`] while the abort handler may sleep.
+#[derive(Debug)]
+#[must_use = "a suspended guarded copy must be resumed before the abort returns"]
+pub struct SuspendedGuardedCopy {
+    recovery: u64,
+}
+
+/// Lift this CPU's guarded-copy state (the armed marker and the probe's
+/// recovery) off the CPU, for an EL1 abort handler about to run a heal that
+/// can park the task — a file-backed page whose read is still in flight.
+/// Returns `None` when no guarded copy is armed here.
+///
+/// Mirrors `x86_64::smap::suspend_guarded_copy`: the copy masks IRQs, but a
+/// heal inside it can context-switch and resume on another CPU, which would
+/// leave the recovery armed on the old CPU (for another task's fault to
+/// consume) and none on the new one (the copy's next abort is fatal).
+///
+/// Call with IRQs masked (the exception entry state), and pair every `Some`
+/// with [`resume_guarded_copy`] before the handler returns.
+#[doc(hidden)]
+pub fn suspend_guarded_copy() -> Option<SuspendedGuardedCopy> {
+    let marker = guarded_copy_marker();
+    if !marker.armed.load(Ordering::Acquire) {
+        return None;
+    }
+    let recovery = probe::take();
+    marker.armed.store(false, Ordering::Release);
+    Some(SuspendedGuardedCopy { recovery })
+}
+
+/// Re-arm a [`suspend_guarded_copy`] state on whichever CPU the task is on
+/// now, masking IRQs first so it cannot be separated from the task again
+/// before the `eret` restores the copy's own (masked) PSTATE.
+#[doc(hidden)]
+pub fn resume_guarded_copy(suspended: SuspendedGuardedCopy) {
+    // SAFETY: masking IRQs at EL1 is always legal; the copy being resumed
+    // runs masked and the `eret` restores SPSR's mask anyway.
+    unsafe {
+        crate::aarch64::asm::disable_interrupts();
+    }
+    set_guarded_copy_armed(true);
+    if suspended.recovery != 0 {
+        probe::arm(suspended.recovery);
+    }
 }
 
 #[inline]
