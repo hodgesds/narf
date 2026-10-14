@@ -201,7 +201,7 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
     // rw_verify_area(READ, file, &f_pos, count): f_pos + count past
     // LLONG_MAX is -EINVAL (streams pass ppos == NULL and skip this).
     if !endpoint.ops.is_stream() {
-        if let Err(errno) = rw_verify_area_pos(offset, requested) {
+        if let Err(errno) = rw_verify_area_file(endpoint.ops.as_ref(), offset, requested) {
             ctx.set_return(errno_ret(errno));
             return;
         }

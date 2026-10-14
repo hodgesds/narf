@@ -5016,10 +5016,37 @@ fn validate_rw_user_range(ptr: u64, len: usize) -> Result<(), u64> {
 ///
 /// So `pread(fd, buf, 10, INT64_MAX - 5)` is -EINVAL, not a 0-byte EOF.
 fn rw_verify_area_pos(pos: u64, count: usize) -> Result<(), i64> {
-    if count > isize::MAX as usize
-        || (pos as i64) < 0
-        || (pos as i64).checked_add(count as i64).is_none()
-    {
+    rw_verify_area_pos_mode(pos, count, false)
+}
+
+/// [`rw_verify_area_pos`] for a specific open file, honouring Linux's
+/// `unsigned_offsets(file)` (`FOP_UNSIGNED_OFFSET`, e.g. `/proc/<pid>/mem`):
+///
+/// ```text
+///   if (unlikely(pos < 0)) {
+///           if (!unsigned_offsets(file)) return -EINVAL;
+///           if (count >= -pos) return -EOVERFLOW;   /* both in 0..LLONG_MAX */
+///   } else if (unlikely((loff_t) (pos + count) < 0)) {
+///           if (!unsigned_offsets(file)) return -EINVAL;
+///   }
+/// ```
+fn rw_verify_area_file(ops: &dyn narf_filesystem::FileOps, pos: u64, count: usize) -> Result<(), i64> {
+    rw_verify_area_pos_mode(pos, count, ops.unsigned_offsets())
+}
+
+fn rw_verify_area_pos_mode(pos: u64, count: usize, unsigned_offsets: bool) -> Result<(), i64> {
+    if count > isize::MAX as usize {
+        return Err(EINVAL);
+    }
+    if unsigned_offsets {
+        // `-pos` of LLONG_MIN wraps to 2^63 under -fno-strict-overflow,
+        // which no admitted count reaches.
+        if (pos as i64) < 0 && count as u64 >= (pos as i64).wrapping_neg() as u64 {
+            return Err(EOVERFLOW);
+        }
+        return Ok(());
+    }
+    if (pos as i64) < 0 || (pos as i64).checked_add(count as i64).is_none() {
         return Err(EINVAL);
     }
     Ok(())
@@ -8615,16 +8642,9 @@ pub fn drop_address_space_pkeys(address_space_id: u64) {
     }
 }
 
-// ── process_vm_readv / process_vm_writev ─────────────────────────────
+// ── iovec / mm helpers shared by process_madvise and migrate_pages ───
 //
-// Bulk gather/scatter copy between the caller and a target process's
-// address space. NARF has no cross-address-space copy primitive yet, so
-// this supports transfers where the target resolves to the *same*
-// address space as the caller (pid == self, or a CLONE_VM thread) —
-// which still fully exercises the iovec machinery and is a valid Linux
-// self-copy. A different address space returns EPERM.
-
-const PROCESS_VM_MAX_BYTES: usize = 16 * 1024 * 1024;
+// process_vm_readv / process_vm_writev live in `remote_vm.rs`.
 
 /// Read `count` `struct iovec { void *base; size_t len; }` (16 B each).
 fn read_iovecs(arr_ptr: u64, count: usize) -> Option<alloc::vec::Vec<(u64, u64)>> {
@@ -8675,113 +8695,6 @@ pub(crate) fn resolve_mm_target(caller: u64, pid: i32) -> Result<(), i64> {
         return Err(EPERM);
     }
     Ok(())
-}
-
-/// Shared core for process_vm_readv / process_vm_writev. `is_write`
-/// selects the direction: false copies remote→local (readv), true
-/// copies local→remote (writev). Both sides live in the same AS here.
-fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
-    let a = *ctx.args();
-    let pid = a.arg0 as i32;
-    let local_ptr = a.arg1;
-    let liovcnt = a.arg2 as usize;
-    let remote_ptr = a.arg3;
-    let riovcnt = a.arg4 as usize;
-    let flags = a.arg5;
-    // `process_vm_rw` (mm/process_vm_access.c:269-284): flags, then the local
-    // iovec import (more than UIO_MAXIOV segments is -EINVAL, a fault
-    // -EFAULT), an empty local iovec returns 0, then the remote iovec array.
-    if flags != 0 || liovcnt > 1024 {
-        ctx.set_return(errno_ret(EINVAL));
-        return;
-    }
-    let Some(local) = read_iovecs(local_ptr, liovcnt) else {
-        ctx.set_return(errno_ret(EFAULT));
-        return;
-    };
-    if local.iter().all(|&(_, len)| len == 0) {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    if riovcnt > 1024 {
-        ctx.set_return(errno_ret(EINVAL));
-        return;
-    }
-    let Some(remote) = read_iovecs(remote_ptr, riovcnt) else {
-        ctx.set_return(errno_ret(EFAULT));
-        return;
-    };
-    // `process_vm_rw_core`: no remote pages → 0 before the task lookup.
-    if remote.iter().all(|&(_, len)| len == 0) {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    // `find_get_task_by_vpid(pid)` (:197): any thread in the caller's pid
-    // namespace, a non-leader's tid included; 0 names no task here (there is
-    // no `current` shortcut) — -ESRCH. Then `mm_access`: a task sharing the
-    // caller's mm needs no credential check; otherwise ptrace_may_access, and
-    // the -EACCES it yields is reported as -EPERM.
-    let caller = current_task_id();
-    let Some(target) = find_task_by_vpid(caller, pid) else {
-        ctx.set_return(errno_ret(ESRCH));
-        return;
-    };
-    // LINUX-GAP: both sides must live in the caller's address space; a
-    // foreign mm is refused with -EPERM even when ptrace_may_access allows it.
-    if !shares_mm(caller, target) {
-        ctx.set_return(errno_ret(EPERM));
-        return;
-    }
-    if current_address_space().is_none() {
-        ctx.set_return(errno_ret(EFAULT));
-        return;
-    }
-    let (src, dst) = if is_write {
-        (&local, &remote)
-    } else {
-        (&remote, &local)
-    };
-
-    let src_total: u64 = src.iter().map(|(_, l)| *l).sum();
-    let dst_total: u64 = dst.iter().map(|(_, l)| *l).sum();
-    let xfer = src_total.min(dst_total).min(PROCESS_VM_MAX_BYTES as u64) as usize;
-
-    // Gather `xfer` bytes from the source segments.
-    let mut buf = alloc::vec::Vec::with_capacity(xfer);
-    let mut remaining = xfer;
-    for &(base, len) in src {
-        if remaining == 0 {
-            break;
-        }
-        let take = (len as usize).min(remaining);
-        // SAFETY: `base` is a user address in the (current) AS; copy_from_user_vec
-        // range-validates and SMAP-brackets the read.
-        match unsafe { copy_from_user_vec(base, take) } {
-            Ok(chunk) => buf.extend_from_slice(&chunk),
-            Err(_) => {
-                ctx.set_return(errno_ret(EFAULT)); // EFAULT
-                return;
-            }
-        }
-        remaining -= take;
-    }
-
-    // Scatter into the destination segments.
-    let mut off = 0usize;
-    for &(base, len) in dst {
-        if off >= buf.len() {
-            break;
-        }
-        let take = (len as usize).min(buf.len() - off);
-        // SAFETY: `base` is a user address in the (current) AS; copy_to_user
-        // range-validates and SMAP-brackets the write.
-        if unsafe { copy_to_user(base, &buf[off..off + take]) }.is_err() {
-            ctx.set_return(errno_ret(EFAULT)); // EFAULT
-            return;
-        }
-        off += take;
-    }
-    ctx.set_return(SyscallReturn::ok(off as u64));
 }
 
 // ── NUMA memory policy: set_mempolicy / get_mempolicy / mbind ─────────
@@ -9917,7 +9830,7 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
         Some(pos)
     };
     if let Some(verify_pos) = verify_pos {
-        if let Err(errno) = rw_verify_area_pos(verify_pos, count) {
+        if let Err(errno) = rw_verify_area_file(endpoint.ops.as_ref(), verify_pos, count) {
             ctx.set_return(errno_ret(errno));
             return;
         }
@@ -16428,6 +16341,21 @@ pub(crate) const CAP_SYS_PTRACE: u32 = 19;
 /// can restore it, so treating it as the caller's peer would hand over a
 /// process that is one `setuid` away from being root.
 pub(crate) fn ptrace_may_access(caller: u64, target: u64) -> bool {
+    ptrace_may_access_mode(caller, target, PtraceCreds::Real)
+}
+
+/// Which of the caller's credentials `__ptrace_may_access` compares against
+/// the target's: `PTRACE_MODE_REALCREDS` (a syscall naming another process —
+/// ptrace, process_vm_*, kcmp) or `PTRACE_MODE_FSCREDS` (a filesystem access
+/// to procfs, e.g. `/proc/<pid>/mem`).
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) enum PtraceCreds {
+    Real,
+    Fs,
+}
+
+/// [`ptrace_may_access`] with an explicit credential mode.
+pub(crate) fn ptrace_may_access_mode(caller: u64, target: u64, creds: PtraceCreds) -> bool {
     // `kernel/ptrace.c:298`: `if (same_thread_group(task, current)) return 0;`
     // — a thread may always inspect its own process, sibling threads included.
     if same_thread_group(caller, target) {
@@ -16441,12 +16369,18 @@ pub(crate) fn ptrace_may_access(caller: u64, target: u64) -> bool {
 
     let c = read_uidgid(caller);
     let t = read_uidgid(target);
-    let same_user = c.uid == t.euid
-        && c.uid == t.suid
-        && c.uid == t.uid
-        && c.gid == t.egid
-        && c.gid == t.sgid
-        && c.gid == t.gid;
+    // `if (mode & PTRACE_MODE_FSCREDS) { caller_uid = cred->fsuid; ... }
+    //  else { caller_uid = cred->uid; ... }`
+    let (caller_uid, caller_gid) = match creds {
+        PtraceCreds::Real => (c.uid, c.gid),
+        PtraceCreds::Fs => (c.fsuid, c.fsgid),
+    };
+    let same_user = caller_uid == t.euid
+        && caller_uid == t.suid
+        && caller_uid == t.uid
+        && caller_gid == t.egid
+        && caller_gid == t.sgid
+        && caller_gid == t.gid;
     if !same_user && !privileged {
         return false;
     }

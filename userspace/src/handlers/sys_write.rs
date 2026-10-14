@@ -83,7 +83,7 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
     // It tests f_pos even for O_APPEND (i_size is only substituted later, in
     // generic_write_checks); streams pass ppos == NULL.
     if !endpoint.ops.is_stream() {
-        if let Err(errno) = rw_verify_area_pos(endpoint.description.offset(), requested) {
+        if let Err(errno) = rw_verify_area_file(endpoint.ops.as_ref(), endpoint.description.offset(), requested) {
             ctx.set_return(errno_ret(errno));
             return;
         }

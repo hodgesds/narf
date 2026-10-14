@@ -24,8 +24,11 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 #[path = "region_index.rs"]
 mod region_index;
+#[path = "remote_access.rs"]
+mod remote_access;
 use crate::region_backing::RegionBacking;
 use region_index::RegionIndex;
+pub use remote_access::{RemoteAccess, RemoteBuf};
 
 /// Serializes creation and replacement of externally-owned shared aliases.
 ///
@@ -8277,11 +8280,28 @@ impl AddressSpace {
         v: u64,
         repair_backed: impl FnOnce(PhysAddr, RegionPerms) -> Result<(), AddressSpaceError>,
     ) -> Result<DemandPageClaim, AddressSpaceError> {
+        self.claim_demand_page_mode(v, false, repair_backed)
+    }
+
+    /// [`Self::claim_demand_page`] with Linux's `FOLL_FORCE` admission:
+    /// `force` also claims a page of a `PROT_NONE` VMA, which GUP's
+    /// `check_vma_flags` admits for a forced access (`VM_MAYREAD`). Only the
+    /// remote-access path passes `true`; a hardware fault never does.
+    fn claim_demand_page_mode(
+        &self,
+        v: u64,
+        force: bool,
+        repair_backed: impl FnOnce(PhysAddr, RegionPerms) -> Result<(), AddressSpaceError>,
+    ) -> Result<DemandPageClaim, AddressSpaceError> {
         let mut regions = self.regions.lock();
         let (index, phys, perms) = {
             let region = regions.containing(v).ok_or(AddressSpaceError::Unmapped)?;
             let rb = region.base.as_u64();
-            if region.perms.prot_only().0 == 0 {
+            // A stack guard is never backed, forced or not: the remote path
+            // grows the stack instead (Linux `expand_stack`).
+            if region.perms.prot_only().0 == 0
+                && (!force || region.perms.contains(RegionPerms::STACK_GUARD))
+            {
                 return Err(AddressSpaceError::Unmapped);
             }
             // `handle_pte_marker` -> VM_FAULT_SIGSEGV. Checked before the
@@ -8751,6 +8771,25 @@ impl AddressSpace {
     /// - Frame allocator must be initialised.
     #[cfg(target_arch = "x86_64")]
     pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.demand_page_in(vaddr, false) }
+    }
+
+    /// The body of [`Self::demand_alloc_page`]. `force` is Linux's
+    /// `FOLL_FORCE` for a remote access (`access_remote_vm`): it also backs a
+    /// page of a `PROT_NONE` VMA. Such a page receives its frame but NO leaf
+    /// — a present user leaf would make it accessible to the owner, which
+    /// `PROT_NONE` forbids — exactly as `mprotect(PROT_NONE)` leaves resident
+    /// pages backed but unmapped.
+    ///
+    /// # Safety
+    /// As [`Self::demand_alloc_page`].
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) unsafe fn demand_page_in(
+        &self,
+        vaddr: VirtAddr,
+        force: bool,
+    ) -> Result<(), AddressSpaceError> {
         use crate::x86_64::paging::{map_4kb_demand, MapError};
         let v = vaddr.as_u64() & !0xFFFu64;
         // Swap faults are resolved before anonymous/file demand allocation.
@@ -8766,6 +8805,12 @@ impl AddressSpace {
                 Some(SwapPageState::Evicting(_)) | Some(SwapPageState::Loading) => return Ok(()),
                 Some(SwapPageState::Swapped) => {
                     let region = table.containing(v).ok_or(AddressSpaceError::Unmapped)?;
+                    // Swap-in publishes a leaf with the VMA's permissions,
+                    // which for PROT_NONE would be an accessible user leaf.
+                    // Only a forced remote access can reach here for one.
+                    if region.perms.prot_only().0 == 0 {
+                        return Err(AddressSpaceError::NotImplemented);
+                    }
                     let index = ((v - region.base.as_u64()) >> 12) as usize;
                     if region.phys.get(index).is_none_or(|phys| phys.raw() != 0) {
                         return Err(AddressSpaceError::NotImplemented);
@@ -8845,7 +8890,12 @@ impl AddressSpace {
                 _ => AddressSpaceError::OutOfRange,
             });
         }
-        let claim = self.claim_demand_page(v, |phys, perms| {
+        let claim = self.claim_demand_page_mode(v, force, |phys, perms| {
+            // A forced remote access to a backed PROT_NONE page needs the
+            // frame, never a leaf (see `demand_page_in`).
+            if perms.prot_only().0 == 0 {
+                return Ok(());
+            }
             // Already backed, yet this CPU took a not-present #PF for it.
             // There are two causes, distinguished by `map_4kb_demand`'s result
             // in a single root-locked walk:
@@ -8952,6 +9002,10 @@ impl AddressSpace {
         };
 
         let published = match self.finish_demand_page(v, ticket, phys, |phys, perms| {
+            if perms.prot_only().0 == 0 {
+                // Forced PROT_NONE backing: frame only (see `demand_page_in`).
+                return Ok(());
+            }
             let flags = user_leaf_flags(perms, user_page_writable(perms, phys));
             // SAFETY: finish_demand_page holds the authoritative region lock;
             // `phys` has just become this page's backing and the root is live.
@@ -8995,9 +9049,27 @@ impl AddressSpace {
     /// - The frame allocator must be initialised.
     #[cfg(target_arch = "aarch64")]
     pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.demand_page_in(vaddr, false) }
+    }
+
+    /// aarch64 twin of the x86_64 `demand_page_in`; see its documentation.
+    ///
+    /// # Safety
+    /// As [`Self::demand_alloc_page`].
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) unsafe fn demand_page_in(
+        &self,
+        vaddr: VirtAddr,
+        force: bool,
+    ) -> Result<(), AddressSpaceError> {
         use crate::aarch64::paging::{map_4kb, MapError};
         let v = vaddr.as_u64() & !0xFFFu64;
-        let claim = self.claim_demand_page(v, |phys, perms| {
+        let claim = self.claim_demand_page_mode(v, force, |phys, perms| {
+            // Forced PROT_NONE backing: frame only (see the x86_64 twin).
+            if perms.prot_only().0 == 0 {
+                return Ok(());
+            }
             // Already backed, yet this CPU faulted. Attempt the leaf install
             // directly so the common lazy-fork case takes one table walk.
             // AlreadyMapped means a peer installed it while this CPU's TLB /
@@ -9060,6 +9132,9 @@ impl AddressSpace {
         };
 
         let published = match self.finish_demand_page(v, ticket, phys, |phys, perms| {
+            if perms.prot_only().0 == 0 {
+                return Ok(());
+            }
             let flags = user_leaf_flags(perms, user_page_writable(perms, phys));
             // SAFETY: as on x86_64, publication and leaf installation are one
             // region-lock transaction against this live TTBR0 root.
@@ -9090,6 +9165,15 @@ impl AddressSpace {
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub unsafe fn demand_alloc_page(&self, _vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::NotImplemented)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) unsafe fn demand_page_in(
+        &self,
+        _vaddr: VirtAddr,
+        _force: bool,
+    ) -> Result<(), AddressSpaceError> {
         Err(AddressSpaceError::NotImplemented)
     }
 
@@ -11921,6 +12005,32 @@ impl AddressSpace {
     /// - The frame allocator + COW refcount table are
     ///   initialised.
     pub unsafe fn cow_split_on_write(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.cow_split_mode(vaddr, false) }
+    }
+
+    /// [`Self::cow_split_on_write`] with Linux's `FOLL_FORCE | FOLL_WRITE`
+    /// admission (`check_vma_flags`: a forced write to a `!VM_WRITE` VMA is
+    /// allowed when `is_cow_mapping`, i.e. any private mapping). `force`
+    /// therefore splits a shared frame in ANY non-`SHARED` region —
+    /// read-only text after fork, a `PROT_NONE` page — which is how a
+    /// debugger plants a breakpoint without writing through to the frame the
+    /// tracee's parent (or the vDSO master) still maps.
+    ///
+    /// # Safety
+    /// As [`Self::cow_split_on_write`].
+    pub(crate) unsafe fn cow_split_mode(
+        &self,
+        vaddr: VirtAddr,
+        force: bool,
+    ) -> Result<(), AddressSpaceError> {
+        let splittable = |perms: RegionPerms| {
+            if force {
+                !perms.contains(RegionPerms::SHARED)
+            } else {
+                perms.contains(RegionPerms::WRITE) && perms.contains(RegionPerms::COW)
+            }
+        };
         // Tickets are page-scoped: faults at different byte offsets in one
         // page must serialize behind the same copy operation.
         let v = vaddr.as_u64() & !0xFFFu64;
@@ -11932,9 +12042,7 @@ impl AddressSpace {
             // A present write fault is recoverable only when fork explicitly
             // made this logically-writable private mapping COW. In particular,
             // mprotect(PROT_READ) must fall through to SIGSEGV.
-            if !region.perms.contains(RegionPerms::WRITE)
-                || !region.perms.contains(RegionPerms::COW)
-            {
+            if !splittable(region.perms) {
                 return Err(AddressSpaceError::Unmapped);
             }
             let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
@@ -11996,9 +12104,7 @@ impl AddressSpace {
             let owns_ticket = regions.cow_pages.get(&v).copied() == Some(ticket);
             let current_matches = regions.containing(v).is_some_and(|region| {
                 let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
-                region.perms.contains(RegionPerms::WRITE)
-                    && region.perms.contains(RegionPerms::COW)
-                    && region.phys.get(page_idx).copied() == Some(old_phys)
+                splittable(region.perms) && region.phys.get(page_idx).copied() == Some(old_phys)
             });
             if owns_ticket && current_matches {
                 let region = regions

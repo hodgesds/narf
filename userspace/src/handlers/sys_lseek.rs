@@ -47,8 +47,21 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
     } else {
         None
     };
-    // `vfs_llseek` → `file->f_op->llseek`: a device with its own seek
-    // semantics (`/dev/kmsg`'s record cursor) answers entirely by itself.
+    // `vfs_llseek` → `file->f_op->llseek`. A file whose llseek owns f_pos
+    // (`/proc/<pid>/mem`'s `mem_lseek`) gets the current position and its
+    // answer becomes the new one.
+    if let Some(result) = ops.llseek_pos(offset, whence as u32, description.offset()) {
+        match result {
+            Ok(v) => {
+                description.set_offset(v);
+                ctx.set_return(SyscallReturn::ok(v));
+            }
+            Err(errno) => ctx.set_return(errno_ret(errno)),
+        }
+        return;
+    }
+    // A device with its own seek semantics (`/dev/kmsg`'s record cursor)
+    // answers entirely by itself.
     if let Some(result) = ops.llseek(offset, whence as u32) {
         match result {
             Ok(v) => ctx.set_return(SyscallReturn::ok(v)),

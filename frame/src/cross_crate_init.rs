@@ -131,6 +131,9 @@ fn install_proc_hooks() {
         narf_userspace::handlers::proc_list_pids,
         narf_userspace::handlers::proc_task_info,
     );
+    // `/proc/<pid>/mem` and `/proc/<pid>/task/<tid>/mem`: open binds the
+    // task's address space after `mm_access` (fs/proc/base.c::proc_mem_open).
+    narf_filesystem::procfs::install_proc_mem_hook(narf_userspace::handlers::proc_mem_open);
     // PID-namespace translation for /proc: resolve reader-namespace path
     // numbers to outer ProcessIds, the caller's outer pid for /proc/self, and
     // the calling thread's tid for /proc/thread-self. Identity in the root

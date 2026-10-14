@@ -4978,13 +4978,16 @@ fn smoke_process_ptrace_e2e() -> TestResult {
     // `PTRACE_PEEKDATA` operates on the stopped child, not the tracer's
     // current (parent) root. Its FOLL_FORCE-equivalent page-in must also be
     // word-safe across this page boundary.
+    // `generic_ptrace_peekdata` stores the word through `data` and returns
+    // 0; a lazy anonymous page reads as zero.
     LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut peek_word: u64 = u64::MAX;
     let mut peek_ctx = StubCtx {
         args: SyscallArgs {
             arg0: PTRACE_PEEKDATA,
             arg1: child_pid,
             arg2: PEEK_BASE + 0xffc,
-            arg3: 0,
+            arg3: &mut peek_word as *mut u64 as u64,
             arg4: 0,
             arg5: 0,
         },
@@ -4992,7 +4995,7 @@ fn smoke_process_ptrace_e2e() -> TestResult {
     };
     kernel_syscall_entry(Syscall::Ptrace.raw(), &mut peek_ctx);
     match peek_ctx.ret {
-        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 && peek_word == 0 => {}
         _ => {
             crate::task::release_task(child_task_raw);
             teardown_process_state();

@@ -1269,11 +1269,18 @@ impl DirOps for ProcTaskTidDir {
                 tid: self.tid,
                 ino: proc_pid_ino(self.ino, name),
             })),
+            // `tid_base_stuff`: `REG("mem", S_IRUSR|S_IWUSR,
+            // proc_mem_operations)`. Every thread shares the group's mm, so
+            // the open binds the same address space `/proc/<pid>/mem` does.
+            "mem" => Some(Arc::new(super::mem::ProcMemNode {
+                pid: self.pid,
+                ino: proc_pid_ino(self.ino, name),
+            })),
             _ => None,
         }
     }
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
-        Box::new(["comm", "stat"].into_iter().map(|name| DirEntry {
+        Box::new(["comm", "mem", "stat"].into_iter().map(|name| DirEntry {
             name: name.into(),
             file_type: FileType::File,
         }))

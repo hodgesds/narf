@@ -293,6 +293,8 @@ pub trait FileOps {
     fn mmap_cache_generation(&self) -> Option<u64>;
     fn open_instance(&self) -> Option<Arc<dyn FileOps>>;
     fn open_instance_checked(&self, write: bool) -> Result<Option<Arc<dyn FileOps>>, FsError>;
+    fn llseek_pos(&self, offset: i64, whence: u32, pos: u64) -> Option<Result<u64, i64>>;
+    fn unsigned_offsets(&self) -> bool;
     fn readiness(&self) -> Option<&narf_lib::readiness::Readiness>;
     fn arm_readiness(&self, task_id: u64, interest: u32, waker: &Waker)
         -> Option<Poll<u32>>;
@@ -376,6 +378,20 @@ for a non-zero offset, `EINVAL` otherwise). `/dev/kmsg` is record-based: one
 record per `read`, a per-open sequence cursor (readiness keys off it, never off
 the file offset), `EINVAL` for a too-small buffer, `EPIPE` after overrun, and
 `<N>`-prefixed injection on `write`.
+`llseek_pos(offset, whence, pos)` defaults to `None` and is consulted before
+`llseek`: a file whose `file_operations.llseek` owns `f_pos` receives the
+description's position and its `Some(Ok(v))` both becomes the new position
+and lseek's return value — `/proc/<pid>/mem`'s `mem_lseek` (SEEK_SET,
+wrapping SEEK_CUR, `EINVAL` otherwise). `unsigned_offsets()` (default
+`false`) is Linux `FOP_UNSIGNED_OFFSET`: `rw_verify_area` then admits a
+position at or past `LLONG_MAX` (`EOVERFLOW` only when the count would
+wrap), as `/proc/<pid>/mem` addresses kernel-half virtual addresses.
+`/proc/<pid>/mem` and `/proc/<pid>/task/<tid>/mem` are 0600 nodes whose
+`open_instance_checked` calls the hook installed by
+`procfs::install_proc_mem_hook(fn(pid) -> Result<Arc<dyn ProcMemAccess>, FsError>)`
+(`proc_mem_open`: `ESRCH` without an mm, `EACCES` from `mm_access`); the
+open file reads/writes through the bound `ProcMemAccess` (`read_at`/
+`write_at`: `Ok(0)` once the mm is gone, `EIO` when no byte is accessible).
 `poll_edge_token` defaults to `(0, 0)`; stateful readiness providers advance
 one component whenever an edge-relevant source changes so `EPOLLET` cannot
 lose a drain/refill transition between readiness scans.

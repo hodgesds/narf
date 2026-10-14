@@ -611,6 +611,19 @@ impl AddressSpace {
     /// holes, lazy pages, unreadable mappings and special/device mappings.
     /// The caller faults lazy pages through guarded user access first.
     pub fn pin_user_page(&self, vaddr: VirtAddr) -> Option<UserPagePin>;
+    /// Linux `access_remote_vm` / GUP-for-another-mm over the region table
+    /// (never the target's leaves): copies between `buf` (`RemoteBuf::Read`
+    /// or `Write`) and this AS, returning the bytes moved before the first
+    /// inaccessible page. `RemoteAccess { write, force, expand_stack }`
+    /// mirrors FOLL_WRITE, FOLL_FORCE (`check_vma_flags`: PROT_NONE and
+    /// read-only private VMAs admitted; shared non-VM_WRITE and
+    /// SHARED|LOCK_EXEMPT non-RAM (VM_IO/VM_PFNMAP) refused) and
+    /// `__access_remote_vm`'s `expand_stack` under the caller's limits.
+    /// Lazy, file and swapped pages fault in through the demand path (a
+    /// forced PROT_NONE page gets a frame but no leaf); a write breaks COW
+    /// in this AS only and repoints its leaf with a broadcast flush.
+    pub unsafe fn access_remote(&self, addr: u64, buf: RemoteBuf<'_>,
+        access: RemoteAccess) -> usize;
     /// Non-owning per-region resident-page counts grouped by SRAT node.
     pub fn numa_regions_snapshot(&self) -> Vec<NumaRegionSnapshot>;
     /// One mincore-shaped residency byte per rounded base page; holes fail.

@@ -54,7 +54,7 @@ pub(crate) fn sys_pread64(ctx: &mut dyn TrapContext) {
     // vfs_read: rw_verify_area (offset + count past LLONG_MAX -> -EINVAL,
     // on the uncapped count), then `f_op->read`, which is -EISDIR for a
     // directory even when count == 0.
-    if let Err(errno) = rw_verify_area_pos(offset, requested) {
+    if let Err(errno) = rw_verify_area_file(endpoint.ops.as_ref(), offset, requested) {
         ctx.set_return(errno_ret(errno));
         return;
     }

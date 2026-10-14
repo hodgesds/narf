@@ -96,7 +96,7 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
     // vfs_writev: rw_verify_area(WRITE, file, &f_pos, tot_len), on f_pos even
     // under O_APPEND (see sys_write).
     if !endpoint.ops.is_stream() {
-        if let Err(errno) = rw_verify_area_pos(endpoint.description.offset(), count) {
+        if let Err(errno) = rw_verify_area_file(endpoint.ops.as_ref(), endpoint.description.offset(), count) {
             ctx.set_return(errno_ret(errno));
             return;
         }

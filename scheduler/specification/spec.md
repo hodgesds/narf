@@ -71,6 +71,11 @@ pub fn set_task_affinity(task: TaskId, requested: CpuSet)
     -> Result<(), SetAffinityError>;
 /// Distinct live user address spaces, including currently-polled tasks.
 pub fn all_address_spaces() -> Vec<Arc<AddressSpace>>;
+// A task's AS while some CPU is polling it (popped off its ready queue):
+// read from the CPU's active-AS cell only when CURRENT_TASK names the task
+// under that cell's lock. `address_space_of_live` = queued, else running.
+pub fn address_space_of_running(id: TaskId) -> Option<Arc<AddressSpace>>;
+pub fn address_space_of_live(id: TaskId) -> Option<Arc<AddressSpace>>;
 pub fn set_user_perf_switch_hook(hook: fn(task: u64, running: bool));
 pub fn set_user_slice_account_hook(hook: fn(elapsed_ns: u64));
 pub fn set_user_kernel_preempt_hooks(pause: fn() -> bool, resume: fn());

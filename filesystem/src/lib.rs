@@ -1299,6 +1299,26 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// A file-specific `llseek` that, like Linux's `mem_lseek`
+    /// (`fs/proc/base.c`), owns `file->f_pos`: it receives the description's
+    /// current position and `Some(Ok(v))` both sets the position to `v` and
+    /// is lseek's return value. `Some(Err(e))` is a positive Linux errno and
+    /// leaves the position alone. `None` (the default) defers to
+    /// [`Self::llseek`] and then the generic path. `lseek` validates `whence`
+    /// against `SEEK_MAX` first.
+    fn llseek_pos(&self, _offset: i64, _whence: u32, _pos: u64) -> Option<Result<u64, i64>> {
+        None
+    }
+
+    /// Linux `FOP_UNSIGNED_OFFSET` (`unsigned_offsets()`): the file position
+    /// is an unsigned quantity — a virtual address for `/proc/<pid>/mem` —
+    /// so `rw_verify_area` admits a position at or past `LLONG_MAX` instead
+    /// of failing it with `-EINVAL` (and returns `-EOVERFLOW` only when the
+    /// transfer would wrap the 64-bit space).
+    fn unsigned_offsets(&self) -> bool {
+        false
+    }
+
     fn copy_file_range_to<'a>(
         &'a self,
         _off_in: u64,

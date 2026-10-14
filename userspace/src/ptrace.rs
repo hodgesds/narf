@@ -34,8 +34,7 @@ use crate::syscall::{SyscallReturn, TrapContext};
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_memory::{paging::translate, VirtAddr};
-use narf_scheduler::address_space_of;
+use narf_memory::RemoteBuf;
 
 // Ptrace requests
 pub const PTRACE_TRACEME: u64 = 0;
@@ -975,70 +974,6 @@ unsafe fn slice_from_ref_mut<T>(val: &mut T) -> &mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(val as *mut T as *mut u8, core::mem::size_of::<T>()) }
 }
 
-/// Resolve a byte in a stopped tracee's address space for the `PEEK`/`POKE`
-/// family. Linux's `ptrace_access_vm(..., FOLL_FORCE)` faults a valid lazy
-/// tracee page in on behalf of the tracer; merely walking its page tables
-/// turns a sparse ELF text mapping into a spurious `EIO` for Crashpad.
-///
-/// The caller has already passed [`ptrace_check_attach`], so the tracee cannot
-/// run while this installs a leaf in its inactive address space.  The byte
-/// interface deliberately handles a machine word crossing a page boundary.
-fn ptrace_target_byte(target_as: &narf_memory::AddressSpace, addr: u64) -> Result<u8, ()> {
-    let vaddr = VirtAddr::new(addr);
-    // SAFETY: `target_as` is a live stopped tracee root and page-table walking
-    // only reads tables through NARF's direct physical mapping.
-    let mut phys = unsafe { translate(target_as.root, vaddr) };
-    if phys.is_none() {
-        // SAFETY: ptrace_check_attach has established that this is a stopped
-        // tracee, so no CPU can concurrently execute or mutate its user root.
-        unsafe { target_as.demand_alloc_page(vaddr) }.map_err(|_| ())?;
-        // SAFETY: the successful demand allocation installed this leaf; a
-        // second translation obtains its physical byte address.
-        phys = unsafe { translate(target_as.root, vaddr) };
-    }
-    let Some(phys) = phys else {
-        return Err(());
-    };
-    // SAFETY: `phys` is a translated byte in a live user mapping and the
-    // direct physical map covers RAM frames backing user leaves.
-    Ok(unsafe { phys.kernel_ptr::<u8>().read() })
-}
-
-fn ptrace_read_word(target_as: &narf_memory::AddressSpace, addr: u64) -> Result<u64, ()> {
-    let mut bytes = [0u8; core::mem::size_of::<u64>()];
-    for (offset, byte) in bytes.iter_mut().enumerate() {
-        let byte_addr = addr.checked_add(offset as u64).ok_or(())?;
-        *byte = ptrace_target_byte(target_as, byte_addr)?;
-    }
-    Ok(u64::from_ne_bytes(bytes))
-}
-
-fn ptrace_write_word(
-    target_as: &narf_memory::AddressSpace,
-    addr: u64,
-    value: u64,
-) -> Result<(), ()> {
-    for (offset, byte) in value.to_ne_bytes().iter().copied().enumerate() {
-        let byte_addr = addr.checked_add(offset as u64).ok_or(())?;
-        let vaddr = VirtAddr::new(byte_addr);
-        // SAFETY: as in `ptrace_target_byte`.
-        let mut phys = unsafe { translate(target_as.root, vaddr) };
-        if phys.is_none() {
-            // SAFETY: the tracee is ptrace-stopped; see `ptrace_target_byte`.
-            unsafe { target_as.demand_alloc_page(vaddr) }.map_err(|_| ())?;
-            // SAFETY: as above.
-            phys = unsafe { translate(target_as.root, vaddr) };
-        }
-        let Some(phys) = phys else {
-            return Err(());
-        };
-        // SAFETY: ptrace's FOLL_FORCE semantics permit writes through the
-        // tracee mapping permissions; the direct map is writable for RAM.
-        unsafe { phys.kernel_mut_ptr::<u8>().write(byte) };
-    }
-    Ok(())
-}
-
 pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let request = args.arg0;
@@ -1224,70 +1159,62 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(0));
         }
         PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
+            // `kernel/ptrace.c::generic_ptrace_peekdata`:
+            //
+            //     copied = ptrace_access_vm(tsk, addr, &tmp,
+            //                               sizeof(tmp), FOLL_FORCE);
+            //     if (copied != sizeof(tmp))
+            //             return -EIO;
+            //     return put_user(tmp, (unsigned long __user *)data);
+            //
+            // The word goes to the TRACER's `*data` and the syscall itself
+            // returns 0 (libc's ptrace() wrapper passes `&ret` as `data` and
+            // returns that). An address the TRACEE has not mapped is EIO,
+            // not EFAULT — EFAULT would accuse the tracer of passing a bad
+            // pointer of its own; gdb's unwinder keys on EIO to mean "that
+            // address isn't there". Only the write-back to `data` is EFAULT.
+            //
+            // The bytes come from the tracee's region table through
+            // `access_remote` — never from a walk of its page-table leaves,
+            // which (a) named the 4 KiB frame without the in-page offset,
+            // so every byte of the word read the page's first byte, and (b)
+            // cannot see a PROT_NONE page's data at all.
             let tid = pid_to_tid(pid);
-            let target_as = match address_space_of(narf_scheduler::TaskId(tid)) {
-                Some(a) => a,
-                None => {
-                    ctx.set_return(errno_ret(ESRCH));
-                    return;
-                }
-            };
-            match ptrace_read_word(&target_as, addr) {
-                Ok(val) => {
-                    // The write-back target is the TRACER's own pointer, so
-                    // this one really is EFAULT: `generic_ptrace_peekdata`
-                    // ends with `return put_user(tmp, ...)`.
-                    // SAFETY: data is a user pointer, checked by copy_to_user.
-                    if data != 0 && unsafe { copy_to_user(data, &val.to_ne_bytes()) }.is_err() {
-                        ctx.set_return(errno_ret(EFAULT));
-                        return;
-                    }
-                    ctx.set_return(SyscallReturn::ok(val));
-                }
-                Err(()) => {
-                    // `kernel/ptrace.c::generic_ptrace_peekdata`:
-                    //
-                    //     copied = ptrace_access_vm(tsk, addr, &tmp,
-                    //                               sizeof(tmp), FOLL_FORCE);
-                    //     if (copied != sizeof(tmp))
-                    //             return -EIO;
-                    //
-                    // An address that is not mapped in the TRACEE is EIO,
-                    // not EFAULT — EFAULT would accuse the tracer of
-                    // passing a bad pointer of its own. gdb walks a
-                    // tracee's stack by peeking word after word until it
-                    // falls off the end of the mapping, and its unwinder
-                    // keys on EIO to mean "that address isn't there";
-                    // EFAULT reads as an internal error instead.
-                    ctx.set_return(errno_ret(EIO));
-                }
+            let mut word = [0u8; core::mem::size_of::<u64>()];
+            let copied =
+                crate::handlers::ptrace_access_vm(caller, tid, addr, RemoteBuf::Read(&mut word));
+            if copied != word.len() {
+                ctx.set_return(errno_ret(EIO));
+                return;
             }
+            // SAFETY: `data` is the tracer's user pointer; copy_to_user
+            // range-validates it and contains a fault.
+            if unsafe { copy_to_user(data, &word) }.is_err() {
+                ctx.set_return(errno_ret(EFAULT));
+                return;
+            }
+            ctx.set_return(SyscallReturn::ok(0));
         }
         PTRACE_POKETEXT | PTRACE_POKEDATA => {
+            // `kernel/ptrace.c::generic_ptrace_pokedata`:
+            //
+            //     copied = ptrace_access_vm(tsk, addr, &data, sizeof(data),
+            //                               FOLL_FORCE | FOLL_WRITE);
+            //     return (copied == sizeof(data)) ? 0 : -EIO;
+            //
+            // FOLL_FORCE lets a breakpoint land in read-only text; the write
+            // breaks COW in the tracee only, so neither a fork sibling still
+            // sharing the frame nor the file behind the mapping sees it. A
+            // word crossing into an unwritable page is written up to that
+            // page and still reports EIO, as Linux's short copy does.
             let tid = pid_to_tid(pid);
-            let target_as = match address_space_of(narf_scheduler::TaskId(tid)) {
-                Some(a) => a,
-                None => {
-                    ctx.set_return(errno_ret(ESRCH));
-                    return;
-                }
-            };
-            match ptrace_write_word(&target_as, addr, data) {
-                Ok(()) => {
-                    ctx.set_return(SyscallReturn::ok(0));
-                }
-                Err(()) => {
-                    // `kernel/ptrace.c::generic_ptrace_pokedata`:
-                    //
-                    //     return (copied == sizeof(data)) ? 0 : -EIO;
-                    //
-                    // Poking an address the tracee has not mapped is EIO.
-                    // A breakpoint-setter that gets EFAULT here blames its
-                    // own `data` argument; EIO correctly says the tracee
-                    // address is unwritable, which is how gdb decides a
-                    // software breakpoint cannot be planted there.
-                    ctx.set_return(errno_ret(EIO));
-                }
+            let bytes = data.to_ne_bytes();
+            let copied =
+                crate::handlers::ptrace_access_vm(caller, tid, addr, RemoteBuf::Write(&bytes));
+            if copied == bytes.len() {
+                ctx.set_return(SyscallReturn::ok(0));
+            } else {
+                ctx.set_return(errno_ret(EIO));
             }
         }
         PTRACE_GETREGS => {

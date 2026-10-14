@@ -41,7 +41,7 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
     }
     // vfs_write -> rw_verify_area: offset + count past LLONG_MAX is -EINVAL
     // (`pwrite(fd, buf, 1, INT64_MAX)`), checked on the uncapped count.
-    if let Err(errno) = rw_verify_area_pos(offset, requested) {
+    if let Err(errno) = rw_verify_area_file(endpoint.ops.as_ref(), offset, requested) {
         ctx.set_return(errno_ret(errno));
         return;
     }

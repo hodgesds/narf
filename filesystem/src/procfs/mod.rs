@@ -71,6 +71,8 @@ use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, 
 
 pub mod aggregate;
 pub mod bus;
+pub mod mem;
+pub use mem::{install_proc_mem_hook, ProcMemAccess, ProcMemOpenFn};
 pub mod net;
 pub mod pid_ext;
 pub mod pressure;
@@ -1908,6 +1910,13 @@ impl DirOps for ProcPidDir {
             }
             _ => {}
         }
+        // `REG("mem", S_IRUSR|S_IWUSR, proc_mem_operations)`.
+        if name == "mem" {
+            return Some(Arc::new(mem::ProcMemNode {
+                pid: self.pid,
+                ino: pid_entry_ino(self.pid, name),
+            }));
+        }
         // Core flat files.
         let field = match name {
             "stat" => PidField::Stat,
@@ -1958,6 +1967,10 @@ impl DirOps for ProcPidDir {
                 },
                 DirEntry {
                     name: "maps".into(),
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "mem".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
