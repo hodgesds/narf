@@ -59,6 +59,8 @@ pub enum IoctlCmd {
     ModeAddFb2 = 0xB8,
     ModeObjGetProperties = 0xB9,
     ModeGetProperty = 0xAA,
+    ModeConnectorSetProperty = 0xAB,
+    ModeObjSetProperty = 0xBA,
     ModeGetPropBlob = 0xAC,
     ModeGetPlaneRes = 0xB5,
     ModeGetPlane = 0xB6,
@@ -99,6 +101,8 @@ impl IoctlCmd {
             0xA8 => IoctlCmd::ModeRmFb,
             0xB9 => IoctlCmd::ModeObjGetProperties,
             0xAA => IoctlCmd::ModeGetProperty,
+            0xAB => IoctlCmd::ModeConnectorSetProperty,
+            0xBA => IoctlCmd::ModeObjSetProperty,
             0xAC => IoctlCmd::ModeGetPropBlob,
             0xB6 => IoctlCmd::ModeGetPlane,
             0xB0 => IoctlCmd::ModePageFlip,
@@ -420,6 +424,8 @@ pub fn dispatch(
         | IoctlCmd::SetClientCap
         | IoctlCmd::ModeObjGetProperties
         | IoctlCmd::ModeGetProperty
+        | IoctlCmd::ModeConnectorSetProperty
+        | IoctlCmd::ModeObjSetProperty
         | IoctlCmd::ModeGetPropBlob
         | IoctlCmd::ModeGetPlane
         | IoctlCmd::ModePageFlip

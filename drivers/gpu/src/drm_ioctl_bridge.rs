@@ -2024,6 +2024,12 @@ pub(crate) fn dispatch_card_for_file(
         IoctlCmd::ModeGetPlaneRes => handle_getplane_res(&mode_state, arg, &ctx),
         IoctlCmd::ModeGetPlane => handle_getplane(&mode_state, arg, &ctx),
         IoctlCmd::ModeGetProperty => handle_getproperty(arg),
+        IoctlCmd::ModeConnectorSetProperty => {
+            handle_set_property(card_index, &mode_state, arg, &ctx, false)
+        }
+        IoctlCmd::ModeObjSetProperty => {
+            handle_set_property(card_index, &mode_state, arg, &ctx, true)
+        }
         IoctlCmd::ModeGetPropBlob => handle_getpropblob(&mode_state, arg, &ctx),
         // SETGAMMA — accept + no-op. We scan out the framebuffer verbatim
         // (no hardware gamma LUT), so modetest's post-modeset gamma reset
@@ -2402,22 +2408,20 @@ fn handle_getconnector(
     // Connector properties: immutable EDID plus atomic CRTC_ID. libdrm runs the same
     // two-pass count protocol as modes/encoders, so fill the id (u32) + value
     // (u64 blob id) arrays only once the caller has sized them.
-    if props_ptr != 0 && prop_values_ptr != 0 && user_count_props >= 2 {
-        let crtc_id = {
-            let card = mode_state.lock();
-            card.encoder(info.encoder_id)
-                .ok()
-                .and_then(|encoder| encoder.crtc_id)
-                .unwrap_or(0)
-        };
-        let mut prop_ids = [0u8; 8];
-        prop_ids[0..4].copy_from_slice(&EDID_PROP_ID.to_le_bytes());
-        prop_ids[4..8].copy_from_slice(&CONNECTOR_CRTC_ID_PROP_ID.to_le_bytes());
-        let mut prop_values = [0u8; 16];
-        prop_values[0..8].copy_from_slice(&(edid_blob_id(info.connector_id) as u64).to_le_bytes());
-        prop_values[8..16].copy_from_slice(&(crtc_id as u64).to_le_bytes());
-        // SAFETY: both are user out-pointers the caller sized for >= 2 entries
-        // after the counting pass; the id array is u32, the value array u64.
+    let (props, values) = {
+        let card = mode_state.lock();
+        let crtc_id = card
+            .encoder(info.encoder_id)
+            .ok()
+            .and_then(|encoder| encoder.crtc_id)
+            .unwrap_or(0);
+        connector_properties(&card, info.connector_id, crtc_id)
+    };
+    if props_ptr != 0 && prop_values_ptr != 0 && user_count_props as usize >= props.len() {
+        let prop_ids: Vec<u8> = props.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let prop_values: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // SAFETY: both are user out-pointers the caller sized for every
+        // property after the counting pass; ids are u32, values u64.
         unsafe {
             copy_out(props_ptr as usize, &prop_ids)?;
             copy_out(prop_values_ptr as usize, &prop_values)?;
@@ -2428,7 +2432,7 @@ fn handle_getconnector(
     // bytes) and updating counts + connector fields (offsets 32..76).
     let mut out = in_bytes;
     out[32..36].copy_from_slice(&info.count_modes.to_le_bytes());
-    out[36..40].copy_from_slice(&2u32.to_le_bytes()); // EDID + CRTC_ID
+    out[36..40].copy_from_slice(&(props.len() as u32).to_le_bytes());
     out[40..44].copy_from_slice(&info.count_encoders.to_le_bytes());
     out[44..48].copy_from_slice(&info.encoder_id.to_le_bytes());
     out[48..52].copy_from_slice(&info.connector_id.to_le_bytes());
@@ -2604,6 +2608,11 @@ const CRTC_ACTIVE_PROP_ID: u32 = 0x52;
 /// `OUT_FENCE_PTR` on a CRTC: a userspace `s32*` filled with a sync_file
 /// fd whose fence signals at the commit's simulated vblank.
 const CRTC_OUT_FENCE_PTR_PROP_ID: u32 = 0x60;
+/// The connector "Broadcast RGB" enum (drm_connector_attach_broadcast_rgb_property).
+const BROADCAST_RGB_PROP_ID: u32 = 0x61;
+/// An enum property's (value, name) entries.
+type EnumEntries = [(u64, &'static [u8]); 3];
+const BROADCAST_RGB_ENUMS: EnumEntries = [(0, b"Automatic"), (1, b"Full"), (2, b"Limited 16:235")];
 /// `IN_FENCE_FD` on a plane: a sync_file fd (-1 = none) gating the flip.
 const PLANE_IN_FENCE_FD_PROP_ID: u32 = 0x5f;
 const CRTC_MODE_ID_PROP_ID: u32 = 0x53;
@@ -2897,19 +2906,23 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
         unsafe { copy_out(arg, &out)? };
         return Ok(0);
     }
-    if prop_id != PLANE_TYPE_PROP_ID {
-        return Err(FsError::InvalidData);
-    }
-    out[20..24].copy_from_slice(&(DRM_MODE_PROP_ENUM | DRM_MODE_PROP_IMMUTABLE).to_le_bytes());
+    let (name, flags, enums): (&[u8], u32, EnumEntries) = match prop_id {
+        PLANE_TYPE_PROP_ID => (
+            b"type",
+            DRM_MODE_PROP_ENUM | DRM_MODE_PROP_IMMUTABLE,
+            [(0, b"Overlay"), (1, b"Primary"), (2, b"Cursor")],
+        ),
+        BROADCAST_RGB_PROP_ID => (b"Broadcast RGB", DRM_MODE_PROP_ENUM, BROADCAST_RGB_ENUMS),
+        _ => return Err(FsError::InvalidData),
+    };
+    out[20..24].copy_from_slice(&flags.to_le_bytes());
     out[24..56].fill(0);
-    let name = b"type";
     out[24..24 + name.len()].copy_from_slice(name);
     // For an ENUM property the entries go to ENUM_BLOB_PTR (offset 8) and
     // are counted by count_enum_blobs (offset 60); values_ptr/count_values
     // (offsets 0 and 56) MUST ALSO be populated with the valid enum values.
     // `modetest` iterates over both and asserts they are present.
     // Each enum entry is `drm_mode_property_enum { __u64 value; char name[32]; }` = 40 bytes.
-    let enums: [(u64, &[u8]); 3] = [(0, b"Overlay"), (1, b"Primary"), (2, b"Cursor")];
 
     let values_ptr = u64::from_le_bytes(out[0..8].try_into().unwrap());
     let user_values_count = u32::from_le_bytes(out[56..60].try_into().unwrap());
@@ -2941,6 +2954,93 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
 
     // SAFETY: `arg` is the validated 64-byte out-pointer.
     unsafe { copy_out(arg, &out)? };
+    Ok(0)
+}
+
+/// A connector's properties and current values: the EDID blob, the atomic
+/// CRTC_ID, and "Broadcast RGB" where the connector has it.
+fn connector_properties(
+    card: &crate::drm::card::Card,
+    connector_id: u32,
+    crtc_id: u32,
+) -> (Vec<u32>, Vec<u64>) {
+    let mut props = alloc::vec![EDID_PROP_ID, CONNECTOR_CRTC_ID_PROP_ID];
+    let mut values = alloc::vec![edid_blob_id(connector_id) as u64, crtc_id as u64];
+    if let Some(value) = card
+        .native_output(connector_id)
+        .and_then(|n| n.broadcast_rgb)
+    {
+        props.push(BROADCAST_RGB_PROP_ID);
+        values.push(u64::from(value));
+    }
+    (props, values)
+}
+
+/// Validate a "Broadcast RGB" value for `connector`, as
+/// drm_property_change_valid_get does for an enum: EINVAL for a connector
+/// without the property or a value outside its enum.
+fn broadcast_rgb_value(
+    card: &crate::drm::card::Card,
+    connector: u32,
+    value: u64,
+) -> Result<u8, FsError> {
+    let has = card
+        .native_output(connector)
+        .is_some_and(|n| n.broadcast_rgb.is_some());
+    if !has || !BROADCAST_RGB_ENUMS.iter().any(|&(v, _)| v == value) {
+        return Err(FsError::InvalidData);
+    }
+    Ok(value as u8)
+}
+
+/// Commit a validated "Broadcast RGB" value: the connector reports it and
+/// the native display relights in the matching range.
+fn apply_broadcast_rgb(
+    card_index: u32,
+    card: &mut crate::drm::card::Card,
+    connector: u32,
+    value: u8,
+) {
+    if let Some(native) = card.native.iter_mut().find(|n| n.connector == connector) {
+        native.broadcast_rgb = Some(value);
+    }
+    if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
+        crate::amdgpu_navi48_platform::request_broadcast_rgb(value);
+    }
+}
+
+/// DRM_IOCTL_MODE_SETPROPERTY (`struct drm_mode_connector_set_property`:
+/// value@0, prop_id@8, connector_id@12) and DRM_IOCTL_MODE_OBJ_SETPROPERTY
+/// (`struct drm_mode_obj_set_property`: value@0, prop_id@8, obj_id@12,
+/// obj_type@16). Only a connector's "Broadcast RGB" is settable this way;
+/// like drm_mode_obj_set_property_ioctl, an unknown object is ENOENT and a
+/// property the object lacks is EINVAL. Master only.
+fn handle_set_property(
+    card_index: u32,
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    ctx: &DrmFileCtx,
+    object: bool,
+) -> Result<u64, FsError> {
+    if !ctx.is_master {
+        return Err(FsError::PermissionDenied);
+    }
+    // SAFETY: `arg` is the ioctl's fixed-size argument structure.
+    let bytes = unsafe { copy_in(arg, if object { 20 } else { 16 })? };
+    let value = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let prop_id = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let obj_id = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    if object && u32::from_le_bytes(bytes[16..20].try_into().unwrap()) != DRM_MODE_OBJECT_CONNECTOR
+    {
+        return Err(FsError::InvalidData);
+    }
+    let mut card = mode_state.lock();
+    card.connector(obj_id).map_err(|_| FsError::NotFound)?;
+    if prop_id != BROADCAST_RGB_PROP_ID {
+        return Err(FsError::InvalidData);
+    }
+    let value = broadcast_rgb_value(&card, obj_id, value)?;
+    apply_broadcast_rgb(card_index, &mut card, obj_id, value);
     Ok(0)
 }
 
@@ -3075,10 +3175,7 @@ fn handle_obj_getproperties(
                 .and_then(|id| card.encoder(id).ok())
                 .and_then(|encoder| encoder.crtc_id)
                 .unwrap_or(0);
-            (
-                vec![EDID_PROP_ID, CONNECTOR_CRTC_ID_PROP_ID],
-                vec![edid_blob_id(obj_id) as u64, crtc_id as u64],
-            )
+            connector_properties(&card, obj_id, crtc_id)
         } else {
             return Err(FsError::InvalidData);
         }
@@ -3408,6 +3505,8 @@ fn handle_atomic(
         // actually requested.
         let mut event_crtc_ids =
             (req.flags & PAGE_FLIP_EVENT != 0).then(|| Vec::with_capacity(card.crtcs.len()));
+        // Connector "Broadcast RGB" values, applied only with the commit.
+        let mut broadcast_rgb: Vec<(u32, u8)> = Vec::new();
         for (object_index, object_id) in objects.iter().copied().enumerate() {
             let object_prop_count = prop_counts[object_index] as usize;
             let end = prop_index
@@ -3573,6 +3672,8 @@ fn handle_atomic(
                         CONNECTOR_CRTC_ID_PROP_ID => {
                             connector_state.crtc_id = (value != 0).then_some(value as u32)
                         }
+                        BROADCAST_RGB_PROP_ID => broadcast_rgb
+                            .push((object_id, broadcast_rgb_value(&card, object_id, value)?)),
                         _ => return Err(FsError::InvalidData),
                     }
                 }
@@ -3623,6 +3724,9 @@ fn handle_atomic(
                     "  drm: ATOMIC commit failed: {error:?}"
                 );
                 return Err(FsError::InvalidData);
+            }
+            for &(connector, value) in &broadcast_rgb {
+                apply_broadcast_rgb(card_index, &mut card, connector, value);
             }
             if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
                 for crtc in state.crtcs.iter().filter(|c| c.active_changed) {

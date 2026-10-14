@@ -587,6 +587,9 @@ pub struct NativeOutput {
     pub edid: Option<[u8; 128]>,
     /// Exact timings, parallel to the connector's `modes`.
     pub timings: Vec<crate::drm::ioctl::DrmModeModeInfo>,
+    /// The connector's "Broadcast RGB" value (0 Automatic, 1 Full,
+    /// 2 Limited 16:235), when it has the property.
+    pub broadcast_rgb: Option<u8>,
 }
 
 /// System-wide vblank "slack" offset in nanoseconds. A flip-complete event is

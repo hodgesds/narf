@@ -482,6 +482,133 @@ kernel_test_in!(
     smoke_drm_ioctl_planes_synth_primary
 );
 
+// ── Connector "Broadcast RGB" ─────────────────────────────────────────
+//
+// drm_connector_attach_broadcast_rgb_property: an enum on native HDMI/DP
+// connectors, listed with the connector's properties and settable by the
+// master through SETPROPERTY / OBJ_SETPROPERTY (and atomic commits).
+fn smoke_drm_ioctl_broadcast_rgb_property() -> TestResult {
+    let idx = register_test_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    ms.lock().native.push(crate::drm::card::NativeOutput {
+        connector: 31,
+        edid: None,
+        timings: alloc::vec::Vec::new(),
+        broadcast_rgb: Some(0),
+    });
+    // GETPROPERTY: a settable enum with Linux's three names.
+    let mut values = [0u64; 3];
+    let mut enums = [0u8; 3 * 40];
+    let mut gp = [0u8; 64];
+    gp[0..8].copy_from_slice(&(values.as_mut_ptr() as u64).to_le_bytes());
+    gp[8..16].copy_from_slice(&(enums.as_mut_ptr() as u64).to_le_bytes());
+    gp[16..20].copy_from_slice(&0x61u32.to_le_bytes());
+    gp[56..60].copy_from_slice(&3u32.to_le_bytes());
+    gp[60..64].copy_from_slice(&3u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAA, 64),
+        gp.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("GETPROPERTY failed");
+    }
+    let name = |b: &[u8]| {
+        let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+        alloc::vec::Vec::from(&b[..end])
+    };
+    if name(&gp[24..56]) != b"Broadcast RGB"
+        || u32::from_le_bytes(gp[20..24].try_into().unwrap()) != 1 << 3
+        || values != [0, 1, 2]
+        || name(&enums[8..40]) != b"Automatic"
+        || name(&enums[48..80]) != b"Full"
+        || name(&enums[88..120]) != b"Limited 16:235"
+    {
+        return TestResult::Fail("Broadcast RGB metadata");
+    }
+    // OBJ_GETPROPERTIES(connector) lists it with its value.
+    let read = |idx: u32| -> Option<(u32, u64, u32)> {
+        let mut props = [0u32; 4];
+        let mut vals = [0u64; 4];
+        let mut og = [0u8; 32];
+        og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
+        og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+        og[16..20].copy_from_slice(&4u32.to_le_bytes());
+        og[20..24].copy_from_slice(&31u32.to_le_bytes());
+        og[24..28].copy_from_slice(&0xc0c0_c0c0u32.to_le_bytes());
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xB9, 32),
+            og.as_mut_ptr() as usize,
+            false,
+        )
+        .ok()?;
+        let count = u32::from_le_bytes(og[16..20].try_into().unwrap());
+        Some((props[2], vals[2], count))
+    };
+    if read(idx) != Some((0x61, 0, 3)) {
+        return TestResult::Fail("connector properties");
+    }
+    let obj_set = |value: u64, prop: u32, obj: u32| {
+        let mut b = [0u8; 24];
+        b[0..8].copy_from_slice(&value.to_le_bytes());
+        b[8..12].copy_from_slice(&prop.to_le_bytes());
+        b[12..16].copy_from_slice(&obj.to_le_bytes());
+        b[16..20].copy_from_slice(&0xc0c0_c0c0u32.to_le_bytes());
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xBA, 24),
+            b.as_mut_ptr() as usize,
+            false,
+        )
+    };
+    if obj_set(2, 0x61, 31) != Ok(0) || read(idx).map(|r| r.1) != Some(2) {
+        return TestResult::Fail("OBJ_SETPROPERTY Limited");
+    }
+    if obj_set(3, 0x61, 31) != Err(FsError::InvalidData)
+        || obj_set(0, 0x51, 31) != Err(FsError::InvalidData)
+        || obj_set(0, 0x61, 99) != Err(FsError::NotFound)
+        || read(idx).map(|r| r.1) != Some(2)
+    {
+        return TestResult::Fail("invalid set accepted");
+    }
+    // Legacy connector SETPROPERTY.
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&1u64.to_le_bytes());
+    b[8..12].copy_from_slice(&0x61u32.to_le_bytes());
+    b[12..16].copy_from_slice(&31u32.to_le_bytes());
+    let set = iowr(DRM_IOCTL_BASE, 0xAB, 16);
+    if dispatch_card(idx, set, b.as_mut_ptr() as usize, false) != Ok(0)
+        || read(idx).map(|r| r.1) != Some(1)
+    {
+        return TestResult::Fail("SETPROPERTY Full");
+    }
+    // Only the master may set it.
+    if crate::drm_ioctl_bridge::dispatch_card(
+        idx,
+        SMOKE_MASTER_ID + 1,
+        set,
+        b.as_mut_ptr() as usize,
+        false,
+    ) != Err(FsError::PermissionDenied)
+    {
+        return TestResult::Fail("non-master set");
+    }
+    // A connector without the property neither lists nor takes it.
+    ms.lock().native.clear();
+    if read(idx).map(|r| r.2) != Some(2) || obj_set(0, 0x61, 31) != Err(FsError::InvalidData) {
+        return TestResult::Fail("property on a plain connector");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_broadcast_rgb_property
+);
+
 // ── 6. Render-node fd rejects SETCRTC with PermissionDenied ────────────
 
 #[allow(dead_code)]

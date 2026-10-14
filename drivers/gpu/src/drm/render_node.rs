@@ -299,6 +299,8 @@ pub fn ioctl_flags(cmd: u32) -> Option<IoctlFlags> {
         0xBD | 0xBE => Some(IoctlFlags::auth_only()),
         // LIST_LESSEES is a DRM_MASTER operation.
         0xC7 => Some(IoctlFlags::master_only()),
+        // SETPROPERTY (connector) and OBJ_SETPROPERTY — DRM_MASTER.
+        0xAB | 0xBA => Some(IoctlFlags::master_only()),
         // CREATE_DUMB, MAP_DUMB, DESTROY_DUMB — RENDER_ALLOW per Linux.
         // Linux: DRM_RENDER_ALLOW in drm_ioctls[] (drm_ioctl.c).
         0xB2..=0xB4 => Some(IoctlFlags::render_allow()),

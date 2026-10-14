@@ -139,6 +139,9 @@ pub fn apply(card: &mut Card, lit: Option<(&[u8; 128], &Timing, &[Timing], Conne
         connector: CONNECTOR,
         edid: lit.map(|(edid, _, _, _)| *edid),
         timings,
+        // amdgpu_dm attaches it to HDMI and SST DP connectors, which is all
+        // this one ever is.
+        broadcast_rgb: Some(crate::amdgpu_navi48_boot::broadcast_rgb()),
     }];
 }
 
