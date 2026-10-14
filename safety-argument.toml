@@ -1456,3 +1456,11 @@ argument = "The explicit target identity makes the file-mapping owner lookup sel
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The frame change raises the #BP (vector 3) IDT gate from DPL=0 to DPL=3, matching Linux's SYSG(X86_TRAP_BP). It lets CPL 3 execute int3 to enter the same vector-3 stub a hardware #BP already uses; that stub and the common trap path already handle user-origin entry (swapgs, PKRS save, switch to DomainId::FRAME) for every user exception. The handler only delivers SIGTRAP to the current task through the existing sync-signal hook. No new TCB member, capability, domain transition, or authority is introduced, and every other exception gate stays DPL=0 (pinned by smoke_x86_64_idt_user_gates_match_linux)."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame changes for IPv4 fragmentation are boot-time wiring in cross_crate_init.rs: they install narf_filesystem::csprng::fill as narf-net's random source for the IPv4 identification generator (__ip_select_ident), and copy narf-net's per-namespace reassembly (IPSTATS_MIB_REASM*) and fragmentation (IPSTATS_MIB_FRAG*) counters into the /proc/net/snmp snapshot. No new TCB member, capability, domain transition or authority is introduced; the hook is a plain function pointer set once at init and the counters are read-only copies."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame change in bare_main.rs adds one entry (dmabuf_sync_smoke and its embedded ELF) to the boot-init musl-demo smoke table, the same registration every ring-3 smoke uses. It runs only when that command is requested and grants the smoke nothing beyond an ordinary user process. No TCB code path, capability, or domain transition changes."
