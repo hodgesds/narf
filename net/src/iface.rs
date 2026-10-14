@@ -438,6 +438,10 @@ fn lo_send_fn(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
 /// Idempotent: `register` replaces a same-named entry.
 pub fn register_loopback_iface() {
     register("lo", [0u8; 6], lo_send_fn);
+    // `loopback_setup`: `dev->mtu = 64 * 1024`. IPv4 output sizes datagrams
+    // to 127.0.0.0/8 by this (clamped to IP_MAX_MTU), so a 1500-byte lo
+    // would refuse an IP_PMTUDISC_DO datagram Linux delivers whole.
+    set_mtu("lo", 64 * 1024);
     set_iface_ipv4("lo", [127, 0, 0, 1], [0, 0, 0, 0]);
 }
 
