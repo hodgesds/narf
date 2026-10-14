@@ -1759,36 +1759,43 @@ impl ColdBoot {
                 .await
         }
     }
-    /// Start audio on the port's running HDMI video.
+    /// Start audio on the port's running HDMI or DP video.
     /// # Safety
-    /// Fulfil `Otg::start_hdmi_audio` obligations.
-    pub async unsafe fn start_display_hdmi_audio(
+    /// Fulfil `Otg::start_hdmi_audio` or `Otg::start_dp_audio` obligations.
+    pub async unsafe fn start_display_audio(
         &mut self,
         port: usize,
-        info: otg::HdmiAudioInfo,
-    ) -> Result<otg::HdmiAudio, otg::Error> {
+        hdmi: bool,
+        info: otg::AudioInfo,
+    ) -> Result<otg::DisplayAudio, otg::Error> {
         let path = self.dp_phy_path(port)?;
+        let otg = self.otg.as_mut().map_err(|e| *e)?;
         // SAFETY: matching retained board path/owners; caller's obligations.
         unsafe {
-            self.otg
-                .as_mut()
-                .map_err(|e| *e)?
-                .start_hdmi_audio(path, info)
-                .await
+            if hdmi {
+                otg.start_hdmi_audio(path, info).await
+            } else {
+                otg.start_dp_audio(path, info).await
+            }
         }
     }
-    /// Mute and stop the port's HDMI audio.
+    /// Mute and stop the port's HDMI or DP audio.
     /// # Safety
-    /// Fulfil `Otg::stop_hdmi_audio` obligations.
-    pub async unsafe fn stop_display_hdmi_audio(&mut self, port: usize) -> Result<(), otg::Error> {
+    /// Fulfil `Otg::stop_hdmi_audio` or `Otg::stop_dp_audio` obligations.
+    pub async unsafe fn stop_display_audio(
+        &mut self,
+        port: usize,
+        hdmi: bool,
+    ) -> Result<(), otg::Error> {
         let path = self.dp_phy_path(port)?;
+        let otg = self.otg.as_mut().map_err(|e| *e)?;
         // SAFETY: matching retained board path/owners; caller's obligations.
         unsafe {
-            self.otg
-                .as_mut()
-                .map_err(|e| *e)?
-                .stop_hdmi_audio(path)
-                .await
+            if hdmi {
+                otg.stop_hdmi_audio(path).await
+            } else {
+                otg.stop_dp_audio(path).await
+            }
         }
     }
     /// Read one SCDC register of an HDMI port's sink over native DDC.

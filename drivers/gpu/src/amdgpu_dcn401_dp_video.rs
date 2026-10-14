@@ -295,7 +295,10 @@ impl<I: Io> Engine<I> {
     ) -> Result<(), Error> {
         let running = self.status.dp_video_running.ok_or(Error::Invalid)?;
         let frontend = running.frontend;
-        if self.status.state != State::DpVideoRunning(frontend.request.stream) {
+        // Linux's link_set_dpms_off disables audio before the stream.
+        if self.status.state != State::DpVideoRunning(frontend.request.stream)
+            || self.status.dp_audio.is_some()
+        {
             return Err(Error::Busy);
         }
         if frontend.link.phy.path != path {

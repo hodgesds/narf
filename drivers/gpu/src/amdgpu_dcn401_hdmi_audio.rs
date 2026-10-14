@@ -1,12 +1,23 @@
-//! Native DCN401 HDMI audio on a running TMDS stream: the display half only
-//! (the HD-Audio controller and codec stream the samples). Linux order:
-//! dce_aud_wall_dto_setup (DTO0 from the pixel clock; DCN401 has no audio
-//! DTBCLK DTO), enc3_se_hdmi_audio_setup (AFMT clock, AFMT channel status, ACR
-//! N/CTS, audio source and channel enable), dce_aud_az_configure (the Azalia
-//! endpoint the codec reports as ELD), the Audio InfoFrame enable of
-//! enc401_stream_encoder_hdmi_set_stream_attribute, dce_aud_az_enable and
-//! enc3_audio_mute_control(false). Stopping reverses it: mute, AFMT clock off
-//! (enc1_se_hdmi_audio_disable), then dce_aud_az_disable.
+//! Native DCN401 audio on a running TMDS or DP SST stream: the display half
+//! only (the HD-Audio controller and codec stream the samples).
+//!
+//! HDMI, in Linux's order: dce_aud_wall_dto_setup (DTO0 from the pixel
+//! clock; DCN401 has no audio DTBCLK DTO), enc3_se_hdmi_audio_setup (AFMT
+//! clock, AFMT channel status, ACR N/CTS, audio source and channel enable),
+//! dce_aud_az_configure (the Azalia endpoint the codec reports as ELD), the
+//! Audio InfoFrame enable of enc401_stream_encoder_hdmi_set_stream_attribute,
+//! dce_aud_az_enable and enc3_audio_mute_control(false). Stopping reverses
+//! it: mute, AFMT clock off (enc1_se_hdmi_audio_disable), then
+//! dce_aud_az_disable.
+//!
+//! DP: the wall DTO (DTO1 from DPREFCLK unless an HDMI stream's audio holds
+//! DTO0), enc3_se_dp_audio_setup (audio source, channel enable),
+//! dce_aud_az_configure for a DP connection, dce_aud_az_enable, then
+//! enable_dio_audio_packet: enc3_se_dp_audio_enable (AFMT clock, audio N and
+//! timestamp mode, AFMT channel status, then the DP secondary audio stream,
+//! timestamp and InfoFrame packets) and unmute. Stopping is
+//! disable_dio_audio_packet (mute, packets off, AFMT clock off), then
+//! dce_aud_az_disable.
 use super::*;
 
 /// One CEA Short Audio Descriptor, as amdgpu_dm copies it from the EDID.
@@ -23,7 +34,7 @@ pub struct AudioMode {
 /// What the sink's EDID says about audio, as amdgpu_dm_fill_audio_info builds
 /// Linux's audio_info.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HdmiAudioInfo {
+pub struct AudioInfo {
     pub manufacturer_id: u16,
     pub product_id: u16,
     /// Monitor name, NUL-padded (AUDIO_INFO_DISPLAY_NAME_SIZE_IN_CHARS).
@@ -37,8 +48,10 @@ pub struct HdmiAudioInfo {
     pub audio_latency: u8,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HdmiAudio {
-    pub info: HdmiAudioInfo,
+pub struct DisplayAudio {
+    pub info: AudioInfo,
+    /// Carried by DP SST secondary packets rather than HDMI's AFMT packets.
+    pub dp: bool,
     /// Azalia endpoint (Linux's audio instance): the stream's own.
     pub endpoint: u8,
     /// AFMT_AUDIO_CHANNEL_ENABLE from the speaker allocation.
@@ -69,6 +82,19 @@ const AZ_LIPSYNC: u32 = 0x37;
 const AZ_HBR: u32 = 0x38;
 const AZ_SINK_INFO0: u32 = 0x3a;
 const AZ_HOT_PLUG: u32 = 0x54;
+// DP stream encoder secondary-data registers (DIG stride).
+const DP_SEC_CNTL: u64 = 0x2141;
+const DP_SEC_AUD_N: u64 = 0x2147;
+const DP_SEC_TIMESTAMP: u64 = 0x214b;
+/// DP_SEC_STREAM_ENABLE, ASP (audio stream), ATP (audio timestamp) and AIP
+/// (audio InfoFrame) packet enables: what DP audio owns of DP_SEC_CNTL.
+pub(in crate::amdgpu_dcn401_otg) const DP_SEC_AUDIO: u32 = 0x1111;
+// Global DCCG audio wall clock (DCN bank 1).
+const AUDIO_DTO_SOURCE: u64 = 0xab;
+const AUDIO_DTO0_PHASE: u64 = 0xac;
+const AUDIO_DTO0_MODULE: u64 = 0xad;
+const AUDIO_DTO1_PHASE: u64 = 0xae;
+const AUDIO_DTO1_MODULE: u64 = 0xaf;
 const CLOCK_GATING_DISABLE: u32 = 1;
 const AUDIO_ENABLED: u32 = 0x8000_0000;
 /// Linux's hard-coded audio_info.port_id when no container id exists.
@@ -187,11 +213,26 @@ pub(in crate::amdgpu_dcn401_otg) fn hdmi_rates(
     }
     r
 }
-/// dce_aud_az_configure's per-format descriptor words and HBR capability.
-pub(in crate::amdgpu_dcn401_otg) fn descriptors(
-    info: &HdmiAudioInfo,
+/// check_audio_bandwidth for a stream: HDMI's blanking limit, or every
+/// rate for DP SST over 8b/10b (Linux's check_audio_bandwidth_dp leaves
+/// that case unvalidated).
+fn stream_rates(
     t: &crate::amdgpu_dml::Timing,
-    depth: dmub::TmdsDepth,
+    depth: Option<dmub::TmdsDepth>,
+    channels: u8,
+    rates: u8,
+) -> u8 {
+    match depth {
+        Some(depth) => hdmi_rates(t, depth, channels, rates),
+        None => rates,
+    }
+}
+/// dce_aud_az_configure's per-format descriptor words and HBR capability,
+/// for an HDMI stream at `depth` or (None) a DP SST one.
+pub(in crate::amdgpu_dcn401_otg) fn descriptors(
+    info: &AudioInfo,
+    t: &crate::amdgpu_dml::Timing,
+    depth: Option<dmub::TmdsDepth>,
 ) -> ([u32; 14], bool, bool) {
     let modes = &info.modes[..usize::from(info.mode_count.min(16))];
     let mut words = [0u32; 14];
@@ -210,7 +251,7 @@ pub(in crate::amdgpu_dcn401_otg) fn descriptors(
         let mut rates = m.rates;
         let mut word = 0;
         if code == 1 {
-            rates = hdmi_rates(t, depth, m.channels, rates);
+            rates = stream_rates(t, depth, m.channels, rates);
             word |= u32::from(rates) << 24; // SUPPORTED_FREQUENCIES_STEREO
         }
         ac3 |= code == 2;
@@ -219,7 +260,7 @@ pub(in crate::amdgpu_dcn401_otg) fn descriptors(
         word |= u32::from(m.byte2) << 16;
         words[usize::from(code - 1)] = word;
     }
-    let hbr = hdmi_rates(t, depth, 8, 0x40) & 0x40 != 0;
+    let hbr = stream_rates(t, depth, 8, 0x40) & 0x40 != 0;
     (words, ac3, hbr)
 }
 impl<I: Io> Engine<I> {
@@ -246,13 +287,55 @@ impl<I: Io> Engine<I> {
         let old = self.az_read(endpoint, index)?;
         self.az_write(endpoint, index, (old & !mask) | (value & mask))
     }
-    fn hdmi_audio_dto(&mut self, link: &HdmiLinkReady) -> Result<(), Error> {
-        let bank1 = self.layout.dio_clock - 0xa0 * 4;
-        self.update(bank1 + 0xab * 4, 0x37, u32::from(link.request.pipe))?;
-        self.update(bank1 + 0xad * 4, u32::MAX, link.pixel_khz * 10)?;
-        self.update(bank1 + 0xac * 4, u32::MAX, 24 * 10_000)
+    /// Every display's records, the selected one's current. Borrowed: the
+    /// records are large.
+    fn display_records(&self) -> impl Iterator<Item = &Status> {
+        let selected = usize::from(self.displays.selected);
+        self.displays
+            .parked
+            .iter()
+            .enumerate()
+            .map(move |(k, s)| if k == selected { &*self.status } else { s })
     }
-    fn hdmi_audio_encoder(&mut self, link: &HdmiLinkReady, a: &HdmiAudio) -> Result<(), Error> {
+    /// dce110_setup_audio_dto: one audio wall clock serves every display.
+    /// The lowest pipe whose HDMI stream carries audio sets DTO0 from its
+    /// TMDS pixel clock (generating 128 Fs from 24 MHz; DP audio runs from
+    /// it too); with no HDMI audio, the lowest DP audio stream selects DTO1
+    /// from DPREFCLK (no GPU_PLL spread on atomfirmware v4 boards) with the
+    /// 512 Fs reference. No audio leaves the clock as it was.
+    fn audio_wall_dto(&mut self) -> Result<(), Error> {
+        let hdmi = self
+            .display_records()
+            .filter(|s| s.hdmi_audio.is_some())
+            .filter_map(|s| s.hdmi_video_running.map(|v| v.link))
+            .min_by_key(|l| l.request.pipe);
+        let dp = self
+            .display_records()
+            .filter(|s| s.dp_audio.is_some())
+            .filter_map(|s| s.dp_video_running.map(|v| v.frontend))
+            .min_by_key(|f| f.request.pipe);
+        let bank1 = self.layout.dio_clock - 0xa0 * 4;
+        let at = |r: u64| bank1 + r * 4;
+        if let Some(link) = hdmi {
+            // Source and DTO select before modulo and phase.
+            self.update(at(AUDIO_DTO_SOURCE), 0x37, u32::from(link.request.pipe))?;
+            self.update(at(AUDIO_DTO0_MODULE), u32::MAX, link.pixel_khz * 10)?;
+            self.update(at(AUDIO_DTO0_PHASE), u32::MAX, 24 * 10_000)
+        } else if let Some(frontend) = dp {
+            let dpref_khz = frontend.blank.timing.clock.reference_hz / 1000;
+            if dpref_khz == 0 {
+                return Err(Error::Invalid);
+            }
+            self.update(at(AUDIO_DTO_SOURCE), 0x30, 0x10)?;
+            self.update(at(AUDIO_DTO1_MODULE), u32::MAX, dpref_khz * 10)?;
+            self.update(at(AUDIO_DTO1_PHASE), u32::MAX, 24 * 10_000)?;
+            // DCCG_AUDIO_DTO2_USE_512FBR_DTO.
+            self.update(at(AUDIO_DTO_SOURCE), 0x10_0000, 0x10_0000)
+        } else {
+            Ok(())
+        }
+    }
+    fn hdmi_audio_encoder(&mut self, link: &HdmiLinkReady, a: &DisplayAudio) -> Result<(), Error> {
         let l = self.layout;
         let at = |r| DpStream::Dio(link.request.stream).at(l, r);
         self.update(at(AFMT_CNTL), 1, 1)?;
@@ -276,22 +359,29 @@ impl<I: Io> Engine<I> {
             self.update(at(base), 0xffff_f000, rate[1] << 12)?;
             self.update(at(base + 1), 0x000f_ffff, rate[0])?;
         }
-        // afmt3_se_audio_setup: endpoint -> DIG, channel enables, memory on.
+        self.audio_source(link.request.stream, a)
+    }
+    /// afmt3_se_audio_setup: endpoint -> DIG, channel enables, memory on.
+    fn audio_source(&mut self, stream: u8, a: &DisplayAudio) -> Result<(), Error> {
+        let l = self.layout;
+        let at = |r| DpStream::Dio(stream).at(l, r);
         self.update(at(AFMT_SRC), u32::MAX, u32::from(a.endpoint))?; // REG_SET
         self.update(at(AFMT_PACKET2), 0xff00, u32::from(a.channels) << 8)?;
         self.update(at(AFMT_MEM_PWR), 0x30, 0)
     }
-    fn hdmi_audio_endpoint(&mut self, a: &HdmiAudio, ac3: bool) -> Result<(), Error> {
+    fn hdmi_audio_endpoint(&mut self, a: &DisplayAudio, ac3: bool) -> Result<(), Error> {
         let e = a.endpoint;
         let info = &a.info;
         self.az_update(e, AZ_HOT_PLUG, CLOCK_GATING_DISABLE, CLOCK_GATING_DISABLE)?;
-        // Speakers, HDMI connection, LFE level 0, EXTRA_CONNECTION_INFO bit 0
-        // cleared, never DP.
+        // Speakers, the HDMI or DP connection (which the codec reports as
+        // the ELD's connection type), LFE level 0, EXTRA_CONNECTION_INFO bit
+        // 0 cleared.
+        let connection = if a.dp { 0x2_0000 } else { 0x1_0000 };
         self.az_update(
             e,
             AZ_SPEAKER,
             0x7f | 0x3_0000 | 0x4_0000 | 0x300_0000,
-            u32::from(info.speakers & 0x7f) | 0x1_0000,
+            u32::from(info.speakers & 0x7f) | connection,
         )?;
         self.az_update(e, AZ_ACP, 0x40, u32::from(info.speakers >> 7) << 6)?;
         for code in 1u32..=14 {
@@ -328,7 +418,7 @@ impl<I: Io> Engine<I> {
     pub(in crate::amdgpu_dcn401_otg) fn hdmi_audio_verify(
         &mut self,
         link: &HdmiLinkReady,
-        a: &HdmiAudio,
+        a: &DisplayAudio,
     ) -> Result<(), Error> {
         let l = self.layout;
         let at = |r| DpStream::Dio(link.request.stream).at(l, r);
@@ -371,12 +461,12 @@ impl<I: Io> Engine<I> {
     async fn hdmi_audio_start(
         &mut self,
         link: HdmiLinkReady,
-        a: HdmiAudio,
+        a: DisplayAudio,
         ac3: bool,
     ) -> Result<(), Error> {
         let l = self.layout;
         let at = |r| DpStream::Dio(link.request.stream).at(l, r);
-        self.hdmi_audio_dto(&link)?;
+        self.audio_wall_dto()?;
         self.hdmi_audio_encoder(&link, &a)?;
         self.hdmi_audio_endpoint(&a, ac3)?;
         // Audio InfoFrame on line 2; the hardware builds it from the codec's
@@ -402,8 +492,8 @@ impl<I: Io> Engine<I> {
     pub(in crate::amdgpu_dcn401_otg) async fn start_hdmi_audio(
         &mut self,
         path: Path,
-        info: HdmiAudioInfo,
-    ) -> Result<HdmiAudio, Error> {
+        info: AudioInfo,
+    ) -> Result<DisplayAudio, Error> {
         if self.status.hdmi_audio.is_some() || info.mode_count == 0 || info.mode_count > 16 {
             return Err(if self.status.hdmi_audio.is_some() {
                 Error::Busy
@@ -413,12 +503,13 @@ impl<I: Io> Engine<I> {
         }
         let link = self.hdmi_audio_link(path)?;
         let t = link.blank.timing.request.timing;
-        let (descriptors, ac3, hbr) = descriptors(&info, &t, link.depth);
+        let (descriptors, ac3, hbr) = descriptors(&info, &t, Some(link.depth));
         if descriptors[0] == 0 {
             return Err(Error::Unsupported); // no LPCM: nothing the codec can stream
         }
-        let a = HdmiAudio {
+        let a = DisplayAudio {
             info,
+            dp: false,
             endpoint: link.request.stream,
             channels: channels(info.speakers),
             descriptors,
@@ -435,12 +526,12 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Busy);
             }
         }
+        // Recorded first: the wall clock is chosen from every record.
+        self.status.hdmi_audio = Some(a);
         match self.hdmi_audio_start(link, a, ac3).await {
-            Ok(()) => {
-                self.status.hdmi_audio = Some(a);
-                Ok(a)
-            }
+            Ok(()) => Ok(a),
             Err(e) => {
+                self.status.hdmi_audio = None;
                 self.status.state = State::Failed(e);
                 Err(e)
             }
@@ -460,15 +551,193 @@ impl<I: Io> Engine<I> {
             self.update(at(AFMT_PACKET), 1, 0)?;
             self.update(at(AFMT_CNTL), 1, 0)?;
             self.update(at(INFOFRAME0), 0x30, 0)?;
-            // dce_aud_az_disable.
-            self.az_update(a.endpoint, AZ_HOT_PLUG, 1, 1)?;
-            self.az_update(a.endpoint, AZ_HOT_PLUG, AUDIO_ENABLED, 0)?;
-            self.az_update(a.endpoint, AZ_HOT_PLUG, 1, 0)
+            self.az_disable(a.endpoint)
         })();
         match result {
             Ok(()) => {
                 self.status.hdmi_audio = None;
-                Ok(())
+                // The next display's audio, if any, takes the wall clock.
+                self.audio_wall_dto()
+            }
+            Err(e) => {
+                self.status.state = State::Failed(e);
+                Err(e)
+            }
+        }
+    }
+}
+impl<I: Io> Engine<I> {
+    /// dce_aud_az_disable.
+    fn az_disable(&mut self, endpoint: u8) -> Result<(), Error> {
+        self.az_update(endpoint, AZ_HOT_PLUG, 1, 1)?;
+        self.az_update(endpoint, AZ_HOT_PLUG, AUDIO_ENABLED, 0)?;
+        self.az_update(endpoint, AZ_HOT_PLUG, 1, 0)
+    }
+    /// The DP frontend a running video carries, from video to live scanout.
+    fn dp_audio_frontend(&self, path: Path) -> Result<DpFrontendReady, Error> {
+        let running = self.status.dp_video_running.ok_or(Error::Busy)?;
+        let frontend = running.frontend;
+        let live = match self.status.state {
+            State::DpVideoRunning(s) => s == frontend.request.stream,
+            State::ScanoutRunning(p) => p == frontend.request.pipe,
+            _ => false,
+        };
+        if !live {
+            return Err(Error::Busy);
+        }
+        if frontend.link.phy.path != path {
+            return Err(Error::Invalid);
+        }
+        Ok(frontend)
+    }
+    /// The DP audio owner's live registers on top of the video's.
+    pub(in crate::amdgpu_dcn401_otg) fn dp_audio_verify(
+        &mut self,
+        frontend: &DpFrontendReady,
+        a: &DisplayAudio,
+    ) -> Result<(), Error> {
+        let l = self.layout;
+        let at = |r| DpStream::Dio(frontend.request.stream).at(l, r);
+        for (reg, mask, value) in [
+            (at(AFMT_CNTL), 1, 1),
+            (at(AFMT_PACKET), 1, 1),
+            (at(AFMT_SRC), 7, u32::from(a.endpoint)),
+            (at(AFMT_PACKET2), 0xff00, u32::from(a.channels) << 8),
+            (at(DP_SEC_CNTL), DP_SEC_AUDIO, DP_SEC_AUDIO),
+            (at(DP_SEC_TIMESTAMP), 1, 1),
+        ] {
+            if self.read(reg)? & mask != value {
+                return Err(Error::Readback(reg));
+            }
+        }
+        if self.az_read(a.endpoint, AZ_HOT_PLUG)? & (AUDIO_ENABLED | CLOCK_GATING_DISABLE)
+            != AUDIO_ENABLED
+        {
+            return Err(Error::Readback(self.az_at(a.endpoint)));
+        }
+        Ok(())
+    }
+    async fn dp_audio_start(
+        &mut self,
+        frontend: DpFrontendReady,
+        a: DisplayAudio,
+        ac3: bool,
+    ) -> Result<(), Error> {
+        let l = self.layout;
+        let stream = frontend.request.stream;
+        let at = |r| DpStream::Dio(stream).at(l, r);
+        self.audio_wall_dto()?;
+        self.audio_source(stream, &a)?;
+        self.hdmi_audio_endpoint(&a, ac3)?;
+        // dce_aud_az_enable.
+        self.az_update(
+            a.endpoint,
+            AZ_HOT_PLUG,
+            AUDIO_ENABLED | 1,
+            AUDIO_ENABLED | 1,
+        )?;
+        self.az_update(a.endpoint, AZ_HOT_PLUG, 1, 0)?;
+        // enc3_se_dp_audio_enable: AFMT audio clock, then the audio N
+        // default and auto-calculated timestamps (both REG_SET).
+        self.update(at(AFMT_CNTL), 1, 1)?;
+        self.update(at(DP_SEC_AUD_N), u32::MAX, 0x8000)?;
+        self.update(at(DP_SEC_TIMESTAMP), u32::MAX, 1)?;
+        // afmt3_setup_dp_audio: channel-status update request, no layout or
+        // OSF override, AUDIO_INFO latched now, clock accuracy level II.
+        self.access(|io| {
+            let v = checked(io.read(at(AFMT_PACKET)))?;
+            io.write(at(AFMT_PACKET), v | 0x0400_0000);
+            Ok(())
+        })?;
+        self.update(at(AFMT_PACKET2), 0x1000_0001, 0)?;
+        self.access(|io| {
+            let v = checked(io.read(at(AFMT_INFOFRAME0)))?;
+            io.write(at(AFMT_INFOFRAME0), v | 0x80);
+            Ok(())
+        })?;
+        self.update(at(AFMT_60958[0]), 0x3000_0000, 0)?;
+        // enc1_se_enable_dp_audio: audio stream packets, then timestamp and
+        // InfoFrame packets, then the secondary stream after the rest.
+        self.update(at(DP_SEC_CNTL), 0x10, 0x10)?;
+        self.update(at(DP_SEC_CNTL), 0x1100, 0x1100)?;
+        self.update(at(DP_SEC_CNTL), 1, 1)?;
+        // Unmute (AFMT_AUDIO_SAMPLE_SEND).
+        self.update(at(AFMT_PACKET), 1, 1)?;
+        self.dp_audio_verify(&frontend, &a)
+    }
+    pub(in crate::amdgpu_dcn401_otg) async fn start_dp_audio(
+        &mut self,
+        path: Path,
+        info: AudioInfo,
+    ) -> Result<DisplayAudio, Error> {
+        if self.status.dp_audio.is_some() {
+            return Err(Error::Busy);
+        }
+        if info.mode_count == 0 || info.mode_count > 16 {
+            return Err(Error::Invalid);
+        }
+        let frontend = self.dp_audio_frontend(path)?;
+        let t = frontend.blank.timing.request.timing;
+        let (descriptors, ac3, hbr) = descriptors(&info, &t, None);
+        if descriptors[0] == 0 {
+            return Err(Error::Unsupported); // no LPCM: nothing the codec can stream
+        }
+        let a = DisplayAudio {
+            info,
+            dp: true,
+            endpoint: frontend.request.stream,
+            channels: channels(info.speakers),
+            descriptors,
+            hbr,
+        };
+        // Quiet before the first write: no audio clock, samples or packets.
+        let at = |r| DpStream::Dio(frontend.request.stream).at(self.layout, r);
+        for (reg, mask) in [
+            (at(AFMT_CNTL), 1),
+            (at(AFMT_PACKET), 1),
+            (at(DP_SEC_CNTL), 0x1ff1_1111),
+        ] {
+            if self.read(reg)? & mask != 0 {
+                return Err(Error::Busy);
+            }
+        }
+        // Recorded first: the wall clock is chosen from every record, and
+        // the video owner's checks exempt the audio packet enables.
+        self.status.dp_audio = Some(a);
+        match self.dp_audio_start(frontend, a, ac3).await {
+            Ok(()) => Ok(a),
+            Err(e) => {
+                self.status.dp_audio = None;
+                self.status.state = State::Failed(e);
+                Err(e)
+            }
+        }
+    }
+    pub(in crate::amdgpu_dcn401_otg) async fn stop_dp_audio(
+        &mut self,
+        path: Path,
+    ) -> Result<(), Error> {
+        let a = self.status.dp_audio.ok_or(Error::Invalid)?;
+        let frontend = self.dp_audio_frontend(path)?;
+        self.dp_audio_verify(&frontend, &a)?;
+        let l = self.layout;
+        let at = |r| DpStream::Dio(frontend.request.stream).at(l, r);
+        let result = (|| {
+            // disable_dio_audio_packet: mute, then enc1_se_disable_dp_audio
+            // (packets and ACM off; no other secondary packet runs, so the
+            // stream enable stays off) and the AFMT audio clock.
+            self.update(at(AFMT_PACKET), 1, 0)?;
+            self.update(at(DP_SEC_CNTL), DP_SEC_AUDIO | 0x1_0000, 0)?;
+            if self.read(at(DP_SEC_CNTL))? != 0 {
+                self.update(at(DP_SEC_CNTL), 1, 1)?;
+            }
+            self.update(at(AFMT_CNTL), 1, 0)?;
+            self.az_disable(a.endpoint)
+        })();
+        match result {
+            Ok(()) => {
+                self.status.dp_audio = None;
+                self.audio_wall_dto()
             }
             Err(e) => {
                 self.status.state = State::Failed(e);
@@ -478,6 +747,26 @@ impl<I: Io> Engine<I> {
     }
 }
 impl Otg {
+    /// Start DP SST audio on this owner's running DP video (or live
+    /// scanout): the audio wall clock, audio source, the Azalia endpoint
+    /// the codec reports as ELD, then the secondary audio packets, unmuted.
+    /// # Safety
+    /// start_dp_video's obligations; no other agent may program this
+    /// stream's AFMT or secondary packets, the audio wall clock or this
+    /// Azalia endpoint. The HD-Audio controller and codec are separate owners.
+    pub(crate) async unsafe fn start_dp_audio(
+        &mut self,
+        path: Path,
+        info: AudioInfo,
+    ) -> Result<DisplayAudio, Error> {
+        self.0.start_dp_audio(path, info).await
+    }
+    /// Mute and stop this owner's DP audio, keeping video running.
+    /// # Safety
+    /// As for start_dp_audio.
+    pub(crate) async unsafe fn stop_dp_audio(&mut self, path: Path) -> Result<(), Error> {
+        self.0.stop_dp_audio(path).await
+    }
     /// Start HDMI audio on this owner's running HDMI video (or live scanout):
     /// program the audio DTO, encoder ACR/AFMT, the Azalia endpoint the codec
     /// reports as ELD, the Audio InfoFrame, then unmute.
@@ -488,8 +777,8 @@ impl Otg {
     pub(crate) async unsafe fn start_hdmi_audio(
         &mut self,
         path: Path,
-        info: HdmiAudioInfo,
-    ) -> Result<HdmiAudio, Error> {
+        info: AudioInfo,
+    ) -> Result<DisplayAudio, Error> {
         self.0.start_hdmi_audio(path, info).await
     }
     /// Mute and stop this owner's HDMI audio, keeping video running.

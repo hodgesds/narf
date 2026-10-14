@@ -20,7 +20,7 @@ mod video;
 pub use video::HdmiVideoRunning;
 #[path = "amdgpu_dcn401_hdmi_audio.rs"]
 pub(super) mod audio;
-pub use audio::{AudioMode, HdmiAudio, HdmiAudioInfo};
+pub use audio::{AudioInfo, AudioMode, DisplayAudio};
 
 /// Highest TMDS character rate without scrambling (HDMI 1.4). Above it the
 /// stream scrambles and the clock channel runs at 1/4 rate. Linux's encoder

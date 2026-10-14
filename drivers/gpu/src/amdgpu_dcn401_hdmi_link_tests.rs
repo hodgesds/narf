@@ -178,7 +178,11 @@ fn tmds_clock(pipe: u8, khz: u32, divider: dccg::TmdsDivider) -> (Request, dccg:
     c.request.pixel = dccg::PixelClock::Tmds { divider };
     (req, c)
 }
-fn fixture(p: u8, stream: u8, pipe: u8) -> (Engine<TmdsIo>, Firmware, dccg::Applied) {
+pub(in crate::amdgpu_dcn401_otg::tests) fn fixture(
+    p: u8,
+    stream: u8,
+    pipe: u8,
+) -> (Engine<TmdsIo>, Firmware, dccg::Applied) {
     fixture_with(
         p,
         stream,
@@ -259,7 +263,7 @@ fn fixture_req(
     };
     (engine, fw, c)
 }
-fn link(stream: u8, pipe: u8) -> HdmiLinkRequest {
+pub(in crate::amdgpu_dcn401_otg::tests) fn link(stream: u8, pipe: u8) -> HdmiLinkRequest {
     HdmiLinkRequest {
         stream,
         pipe,
@@ -761,8 +765,8 @@ kernel_test_in!(
     dcn401_hdmi_link_deep_colour_scales_the_character_clock
 );
 
-fn audio_info() -> HdmiAudioInfo {
-    let mut info = HdmiAudioInfo {
+pub(in crate::amdgpu_dcn401_otg::tests) fn audio_info() -> AudioInfo {
+    let mut info = AudioInfo {
         manufacturer_id: 0x4c2d,
         product_id: 0x0f99,
         name: [0; 18],

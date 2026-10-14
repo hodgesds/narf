@@ -493,7 +493,7 @@ kernel_test_in!(
     navi48_modeset_picks_the_deepest_hdmi_depth_that_fits
 );
 
-fn navi48_modeset_reads_hdmi_audio_like_amdgpu_dm() -> TestResult {
+fn navi48_modeset_reads_sink_audio_like_amdgpu_dm() -> TestResult {
     let mut base = edid_1080p();
     base[8..12].copy_from_slice(&[0x2d, 0x4c, 0x99, 0x0f]);
     // Monitor name descriptor "Living TV\n".
@@ -519,7 +519,7 @@ fn navi48_modeset_reads_hdmi_audio_like_amdgpu_dm() -> TestResult {
         20,
     ];
     let edid = with_blocks(base.clone(), &[AUDIO, SPEAKERS, VSDB_LAT]);
-    let Some(info) = hdmi_audio_info(&edid) else {
+    let Some(info) = sink_audio_info(&edid) else {
         return TestResult::Fail("no audio");
     };
     if info.manufacturer_id != 0x4c2d
@@ -546,15 +546,22 @@ fn navi48_modeset_reads_hdmi_audio_like_amdgpu_dm() -> TestResult {
         return TestResult::Fail("audio info");
     }
     // No speaker block: FL/FR + FC. No SADs: no audio endpoint at all.
-    let plain = hdmi_audio_info(&with_blocks(base.clone(), &[AUDIO])).unwrap();
-    if plain.speakers != 5 || hdmi_audio_info(&with_blocks(base, &[VSDB])).is_some() {
+    let plain = sink_audio_info(&with_blocks(base.clone(), &[AUDIO])).unwrap();
+    if plain.speakers != 5 || sink_audio_info(&with_blocks(base.clone(), &[VSDB])).is_some() {
         return TestResult::Fail("defaults");
+    }
+    // A DP SST sink's audio comes from the same EDID blocks.
+    let paths = [path(inventory::Connector::DisplayPort, 0)];
+    let dp = |edid: Vec<u8>| select(&paths, &[port(paths[0], dpcd(0x14, 4), edid)], 8, None);
+    match (dp(edid), dp(with_blocks(base, &[VSDB]))) {
+        (Ok(a), Ok(b)) if !a.hdmi && a.audio == Some(info) && b.audio.is_none() => {}
+        _ => return TestResult::Fail("DP sink audio"),
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
-    navi48_modeset_reads_hdmi_audio_like_amdgpu_dm
+    navi48_modeset_reads_sink_audio_like_amdgpu_dm
 );
 
 /// 1080p preferred, 2160p as the second base-block descriptor and 720p as a

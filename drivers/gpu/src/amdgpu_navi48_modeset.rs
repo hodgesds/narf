@@ -52,8 +52,8 @@ pub struct Selection {
     /// RGB output depth: 8 bpc for DP; for HDMI the deepest the sink, the
     /// TMDS rate and the requested maximum allow.
     pub depth: otg::ColorDepth,
-    /// The HDMI sink's audio, when it declares any.
-    pub audio: Option<otg::HdmiAudioInfo>,
+    /// The sink's audio, when it declares any (HDMI, or DP SST).
+    pub audio: Option<otg::AudioInfo>,
     /// The HDMI AVI InfoFrame's VIC, aspect and range for this timing.
     pub avi: otg::Avi,
     /// Limited-range RGB output (COLOR_SPACE_SRGB_LIMITED).
@@ -68,10 +68,10 @@ pub struct Selection {
 /// revision is at least 3, the first 3-byte Speaker Allocation block (else
 /// FL/FR + FC), and the HDMI VSDB progressive latencies. None when the sink
 /// declares no audio mode: Linux then assigns no audio endpoint.
-pub fn hdmi_audio_info(edid: &[u8]) -> Option<otg::HdmiAudioInfo> {
+pub fn sink_audio_info(edid: &[u8]) -> Option<otg::AudioInfo> {
     use narf_edid::cta861::{CtaExtension, DataBlock};
     let base = edid.get(..128)?;
-    let mut info = otg::HdmiAudioInfo {
+    let mut info = otg::AudioInfo {
         manufacturer_id: u16::from_le_bytes([base[8], base[9]]),
         product_id: u16::from_le_bytes([base[10], base[11]]),
         name: [0; 18],
@@ -621,7 +621,7 @@ pub fn select_all(
             hdmi: false,
             scdc: false,
             depth: otg::ColorDepth::Bpc8,
-            audio: None,
+            audio: sink_audio_info(&sink.edid),
             avi: otg::Avi::default(),
             limited: false,
             ycbcr420: false,
@@ -660,7 +660,7 @@ pub fn select_all(
             hdmi: true,
             scdc: caps.scdc,
             depth,
-            audio: hdmi_audio_info(&sink.edid),
+            audio: sink_audio_info(&sink.edid),
             avi: hdmi_avi(caps, &timing),
             limited: false,
             ycbcr420,
@@ -1156,7 +1156,7 @@ impl ColdBoot {
                 let scanout = self.start_display_scanout(pipe).await?;
                 // As Linux's post-enable: audio after the stream runs.
                 if let Some(info) = selection.audio {
-                    self.start_display_hdmi_audio(port, info).await?;
+                    self.start_display_audio(port, true, info).await?;
                 }
                 return Ok((selection, scanout));
             }
@@ -1196,6 +1196,9 @@ impl ColdBoot {
                 .await?;
             self.start_display_dp_video(port).await?;
             let scanout = self.start_display_scanout(pipe).await?;
+            if let Some(info) = selection.audio {
+                self.start_display_audio(port, false, info).await?;
+            }
             Ok((selection, scanout))
         }
     }
@@ -1236,6 +1239,9 @@ impl ColdBoot {
         }
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
+            if m.selection.audio.is_some() {
+                self.stop_display_audio(port, false).await?;
+            }
             self.stop_display_scanout(m.pipe).await?;
             self.stop_display_dp_video(port).await?;
             self.stop_display_dp_frontend(port).await?;
@@ -1254,8 +1260,8 @@ impl ColdBoot {
         let port = m.selection.port;
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
-            if m.selection.hdmi && m.selection.audio.is_some() {
-                self.stop_display_hdmi_audio(port).await?;
+            if m.selection.audio.is_some() {
+                self.stop_display_audio(port, m.selection.hdmi).await?;
             }
             self.stop_display_scanout(m.pipe).await?;
             if m.selection.hdmi {
@@ -1281,8 +1287,8 @@ impl ColdBoot {
         let port = m.selection.port;
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
-            if m.selection.hdmi && m.selection.audio.is_some() {
-                self.stop_display_hdmi_audio(port).await?;
+            if m.selection.audio.is_some() {
+                self.stop_display_audio(port, m.selection.hdmi).await?;
             }
             self.stop_display_scanout(m.pipe).await?;
             if m.selection.hdmi {

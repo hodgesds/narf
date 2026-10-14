@@ -107,8 +107,14 @@ impl<I: Io> Engine<I> {
         let at = |reg| DpStream::Dio(r.stream).at(l, reg);
         // Packet/audio/metadata, DSC/VBID overrides and double-buffered format
         // programming need separate owners. Never wake an inherited producer.
+        // The audio owner's packet enables are its own while it runs.
+        let audio = if self.status.dp_audio.is_some() {
+            super::hdmi_link::audio::DP_SEC_AUDIO
+        } else {
+            0
+        };
         for (reg, mask) in [
-            (0x2141, 0x1ff11111),
+            (0x2141, 0x1ff11111 & !audio),
             (0x2091, 0x1010),
             (0x213d, 0x11),
             (0x2170, 0x3010),

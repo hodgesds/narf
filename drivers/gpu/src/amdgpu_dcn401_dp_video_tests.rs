@@ -709,3 +709,258 @@ kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_dp_video_mn_interval_tracks_pixel_packing_not_component_depth
 );
+
+/// The DP video fixture with an Azalia endpoint window: an index register
+/// and the data port it addresses, written but never echoed.
+struct AudioIo {
+    inner: VideoIo,
+    az: alloc::collections::BTreeMap<(u8, u32), u32>,
+    index: [u32; 4],
+}
+fn az_at(e: u8) -> u64 {
+    BASE + (0x386 + 6 * u64::from(e)) * 4
+}
+impl Io for AudioIo {
+    fn read(&mut self, at: u64) -> u32 {
+        for e in 0..4u8 {
+            if at == az_at(e) + 4 {
+                let i = self.index[usize::from(e)];
+                return self.az.get(&(e, i)).copied().unwrap_or(0);
+            }
+        }
+        self.inner.read(at)
+    }
+    fn write(&mut self, at: u64, value: u32) {
+        for e in 0..4u8 {
+            if at == az_at(e) {
+                self.index[usize::from(e)] = value;
+                return;
+            }
+            if at == az_at(e) + 4 {
+                self.az.insert((e, self.index[usize::from(e)]), value);
+                return;
+            }
+        }
+        self.inner.write(at, value);
+    }
+}
+
+/// DP SST audio as Linux's DIO path programs it: DTO1 from DPREFCLK with
+/// the 512 Fs reference, the audio source and channel enables, an endpoint
+/// that reports a DP connection with every LPCM rate (8b/10b SST is not
+/// bandwidth-checked), then audio N, auto timestamps, channel status and
+/// the secondary audio packets. The video owner's checks leave those
+/// packets to audio; video cannot stop under it; stop clears it all.
+fn dcn401_dp_audio_programs_dto1_secondary_packets_and_endpoint_like_linux() -> TestResult {
+    let (p, stream, pipe) = (1, 2, 3);
+    let (mut e, mut io, c) = fixture(p, stream, pipe, ColorDepth::Bpc8);
+    start(&mut e, &mut io, c);
+    let mut e = Engine {
+        io: AudioIo {
+            inner: e.io,
+            az: alloc::collections::BTreeMap::new(),
+            index: [0; 4],
+        },
+        authority: e.authority,
+        layout: e.layout,
+        status: e.status,
+        displays: e.displays,
+    };
+    let info = super::super::hdmi_link::audio_info();
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let t = e
+        .status
+        .dp_video_running
+        .unwrap()
+        .frontend
+        .blank
+        .timing
+        .request
+        .timing;
+    let live = ScanoutRunning {
+        pipe,
+        stream,
+        plan: dml::admit(
+            &soc,
+            &dml::Mode {
+                timing: t,
+                pitch: (t.h_active + 63) & !63,
+                ycbcr420: false,
+            },
+        )
+        .unwrap(),
+        address: 0,
+        frame_before: 0,
+        frame_after: 0,
+    };
+    let before = e.dp_video_verify_scanout(live);
+    let a = run(e.start_dp_audio(path(p), info)).unwrap();
+    let r = |e: &mut Engine<AudioIo>, at| e.io.inner.fake().regs.get(&at).copied().unwrap_or(0);
+    let bank1 = |reg: u64| (0x16200 + reg) * 4;
+    // DTO1 = DPREFCLK (720 MHz) in 100 Hz, phase 24 MHz; DTO select 1.
+    if r(&mut e, bank1(0xab)) & 0x10_0030 != 0x10_0010
+        || r(&mut e, bank1(0xaf)) != 7_200_000
+        || r(&mut e, bank1(0xae)) != 240_000
+    {
+        return TestResult::Fail("DP audio DTO1");
+    }
+    for (reg, mask, value) in [
+        (0x2141, 0x1ff1_1111, 0x1111),         // ASP, ATP, AIP, stream enable
+        (0x2147, u32::MAX, 0x8000),            // audio N default
+        (0x214b, u32::MAX, 1),                 // auto-calculated timestamps
+        (0x20ba, 1, 1),                        // AFMT audio clock
+        (0x2085, u32::MAX, u32::from(stream)), // endpoint = stream
+        (0x2075, 0x1000_ff01, 0x3700),         // FL FR LFE RL RR enabled
+        (0x2078, 0x3000_0000, 0),              // clock accuracy level II
+        (0x2082, 0x0400_0001, 0x0400_0001),    // CS update, samples sent
+        (0x2083, 0x80, 0x80),                  // AUDIO_INFO latched
+        (0x2087, 0x30, 0),
+        (0x20a3, 0x30, 0),   // no HDMI Audio InfoFrame
+        (0x20a1, 0x1000, 0), // no HDMI ACR
+    ] {
+        if r(&mut e, dio(stream, reg)) & mask != value {
+            return TestResult::Fail("DP encoder audio");
+        }
+    }
+    let az = |e: &Engine<AudioIo>, i: u32| e.io.az.get(&(stream, i)).copied();
+    if az(&e, 0x54) != Some(0x8000_0000)
+        || az(&e, 0x25).map(|v| v & 0x37f7f) != Some(0x2_000b)
+        || az(&e, 0x28) != Some(1 | 0x700 | 0x7 << 16 | 0x07 << 24)
+        || az(&e, 0x38).map(|v| v & 1) != Some(1)
+        || az(&e, 0x3a) != Some(0x0f99_4c2d)
+        || !a.dp
+        || a.endpoint != stream
+    {
+        return TestResult::Fail("DP Azalia endpoint");
+    }
+    // The running video's checks are unchanged by the audio packets, which
+    // they would refuse from anyone but the audio owner.
+    if before == Err(Error::Busy) || e.dp_video_verify_scanout(live) != before {
+        return TestResult::Fail("audio packets refused by the video owner");
+    }
+    let owner = e.status.dp_audio.take();
+    if e.dp_video_verify_scanout(live) != Err(Error::Busy) {
+        return TestResult::Fail("foreign secondary packets accepted");
+    }
+    e.status.dp_audio = owner;
+    assert_eq!(run(e.start_dp_audio(path(p), info)), Err(Error::Busy));
+    if r(&mut e, dio(stream, 0x2141)) & 0x1111 != 0x1111 {
+        return TestResult::Fail("second start disturbed audio");
+    }
+    run(e.stop_dp_audio(path(p))).unwrap();
+    if r(&mut e, dio(stream, 0x2141)) != 0
+        || r(&mut e, dio(stream, 0x2082)) & 1 != 0
+        || r(&mut e, dio(stream, 0x20ba)) & 1 != 0
+        || az(&e, 0x54) != Some(0)
+        || e.status.dp_audio.is_some()
+    {
+        return TestResult::Fail("DP audio stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dp_audio_programs_dto1_secondary_packets_and_endpoint_like_linux
+);
+
+/// DP video cannot stop under its audio (Linux's link_set_dpms_off stops
+/// audio first), and audio needs running video.
+fn dcn401_dp_video_stops_only_after_its_audio() -> TestResult {
+    let (p, stream, pipe) = (0, 1, 2);
+    let (mut e, mut io, c) = fixture(p, stream, pipe, ColorDepth::Bpc8);
+    start(&mut e, &mut io, c);
+    let info = super::super::hdmi_link::audio_info();
+    let a = DisplayAudio {
+        info,
+        dp: true,
+        endpoint: stream,
+        channels: 3,
+        descriptors: [0; 14],
+        hbr: true,
+    };
+    e.status.dp_audio = Some(a);
+    assert_eq!(run(e.stop_dp_video(path(p))), Err(Error::Busy));
+    e.status.dp_audio = None;
+    run(e.stop_dp_video(path(p))).unwrap();
+    assert_eq!(run(e.start_dp_audio(path(p), info)), Err(Error::Busy));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dp_video_stops_only_after_its_audio
+);
+
+/// dce110_setup_audio_dto: an HDMI display's audio keeps the wall clock on
+/// its DTO0 while DP audio runs beside it, and DP takes DTO1 once that HDMI
+/// audio is gone.
+/// Another display's records: HDMI on pipe 0 with audio, as its owner left
+/// them. Built in its own frame, apart from the DP engine's.
+#[inline(never)]
+fn hdmi_audio_display() -> alloc::boxed::Box<Status> {
+    use super::super::hdmi_link as hdmi;
+    let (mut h, mut fw, hc) = hdmi::fixture(0, 0, 0);
+    run(h.prepare_hdmi_link(&mut fw, hdmi::path(0), hdmi::link(0, 0), hc)).unwrap();
+    run(h.start_hdmi_video(hdmi::path(0), hc)).unwrap();
+    run(h.start_hdmi_audio(hdmi::path(0), hdmi::audio_info())).unwrap();
+    alloc::boxed::Box::new(*h.status)
+}
+fn dcn401_dp_audio_leaves_the_wall_clock_to_hdmi_audio() -> TestResult {
+    use super::super::hdmi_link as hdmi;
+    let hdmi_display = hdmi_audio_display();
+    // The selected display: DP on pipe 3.
+    let (p, stream, pipe) = (2, 3, 3);
+    let (mut e, mut io, c) = fixture(p, stream, pipe, ColorDepth::Bpc8);
+    start(&mut e, &mut io, c);
+    let mut e = Engine {
+        io: AudioIo {
+            inner: e.io,
+            az: alloc::collections::BTreeMap::new(),
+            index: [0; 4],
+        },
+        authority: e.authority,
+        layout: e.layout,
+        status: e.status,
+        displays: e.displays,
+    };
+    e.displays.parked[1] = *hdmi_display;
+    let bank1 = |reg: u64| (0x16200 + reg) * 4;
+    for (reg, value) in [(0xab, 0x37), (0xac, 1), (0xad, 2), (0xae, 3), (0xaf, 4)] {
+        e.io.inner.fake().regs.insert(bank1(reg), value);
+    }
+    let r = |e: &mut Engine<AudioIo>, at| e.io.inner.fake().regs.get(&at).copied().unwrap_or(0);
+    run(e.start_dp_audio(path(p), hdmi::audio_info())).unwrap();
+    // DTO0 from the HDMI stream's 148.5 MHz, sourced by pipe 0; DTO1 untouched.
+    if r(&mut e, bank1(0xab)) & 0x10_0037 != 0
+        || r(&mut e, bank1(0xad)) != 1_485_000
+        || r(&mut e, bank1(0xac)) != 240_000
+        || r(&mut e, bank1(0xaf)) != 4
+    {
+        return TestResult::Fail("DP audio took the HDMI wall clock");
+    }
+    // The HDMI display's audio stops (its records, parked here).
+    e.displays.parked[1].hdmi_audio = None;
+    run(e.stop_dp_audio(path(p))).unwrap();
+    // With no audio left the clock stays as it was.
+    if r(&mut e, bank1(0xad)) != 1_485_000 {
+        return TestResult::Fail("idle wall clock reprogrammed");
+    }
+    run(e.start_dp_audio(path(p), hdmi::audio_info())).unwrap();
+    if r(&mut e, bank1(0xab)) & 0x10_0030 != 0x10_0010 || r(&mut e, bank1(0xaf)) != 7_200_000 {
+        return TestResult::Fail("DP audio alone uses DTO1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dp_audio_leaves_the_wall_clock_to_hdmi_audio
+);
