@@ -31,7 +31,7 @@ pub use link::DpSstDisabled;
 mod dp_phy;
 pub use dp_phy::{
     DpDriveSettings, DpFrontendReady, DpFrontendRequest, DpLinkStatus, DpLinkTrained, DpPhyReady,
-    DpPhySettings, DpTrainingError, DpVideoRunning, UhbrRate,
+    DpPhySettings, DpTrainingError, DpVideoRunning, UhbrLinkTrained, UhbrRate, UhbrSettings,
 };
 #[path = "amdgpu_dcn401_hpo_link.rs"]
 mod hpo_link;
@@ -125,6 +125,13 @@ pub enum State {
     /// only stop_dp_link may follow, before a fallback re-enables the PHY.
     DpLinkRefused(u8),
     StoppingDpLink(u8),
+    /// A 128b/132b link on this transmitter: being enabled and trained,
+    /// trained (link idle, no stream), refused by the sink after training
+    /// exited, or stopping.
+    TrainingUhbr(u8),
+    UhbrLinkTrained(u8),
+    UhbrLinkRefused(u8),
+    StoppingUhbrLink(u8),
     PreparingDpFrontend(u8),
     DpFrontendReady(u8),
     StoppingDpFrontend(u8),
@@ -318,6 +325,8 @@ pub struct Status {
     /// (or, for a refused link awaiting stop_dp_link, DpLinkRefused).
     /// Video, timing and scanout remain stopped.
     pub dp_link_trained: Option<DpLinkTrained>,
+    /// The 128b/132b link; current in UhbrLinkTrained/UhbrLinkRefused.
+    pub uhbr_link: Option<UhbrLinkTrained>,
     /// Historical blank frontend setup; current only in DpFrontendReady.
     /// Timing, video and scanout remain stopped.
     pub dp_frontend_ready: Option<DpFrontendReady>,
@@ -376,6 +385,7 @@ impl Status {
             dp_sst_disabled: None,
             dp_phy_ready: None,
             dp_link_trained: None,
+            uhbr_link: None,
             dp_frontend_ready: None,
             dp_video_running: None,
             hpo_link_retired: None,

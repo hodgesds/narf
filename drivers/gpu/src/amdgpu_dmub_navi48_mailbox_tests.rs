@@ -939,3 +939,50 @@ kernel_test_in!(
     "drivers/gpu/dmub-navi48",
     dmub_navi48_tmds_pixel_clock_scales_deep_colour_like_linux
 );
+
+/// UHBR enable and FFE as Linux's HPO link encoder sends them: DP_MST mode,
+/// the 128b/132b symbol clock, HPD and HPO instance on ENABLE; the preset
+/// in the lane-set byte with HPD1 and instance 244 on FFE.
+fn dmub_navi48_uhbr_enable_and_ffe_use_hpo_v17_fields() -> TestResult {
+    use crate::amdgpu_dmub_navi48::UhbrRate::{Uhbr10, Uhbr13_5, Uhbr20};
+    for (rate, symclk) in [(Uhbr10, 100_000u32), (Uhbr13_5, 135_000), (Uhbr20, 200_000)] {
+        for link in 0..4 {
+            let (_pool, mut e) = ready();
+            let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
+            run(e.enable_uhbr(dp_path(2, 3), 4, rate, link)).unwrap();
+            let mut golden = [0; 64];
+            golden[..4].copy_from_slice(&[128, 1, 0, 16]);
+            golden[4] = 2;
+            golden[5] = 1;
+            golden[6] = 5;
+            golden[7] = 4;
+            golden[8..12].copy_from_slice(&symclk.to_le_bytes());
+            golden[12] = 3;
+            golden[15] = link;
+            assert_eq!(e.io.slot(offset), golden);
+            run(e.set_uhbr_ffe(dp_path(2, 3), 2, rate, 9)).unwrap();
+            let mut ffe = golden;
+            (ffe[5], ffe[6], ffe[7], ffe[12], ffe[15]) = (11, 9, 2, 1, 244);
+            assert_eq!(e.io.slot(offset + 64), ffe);
+            assert_eq!(e.mailbox.state, MailboxState::Ready);
+        }
+    }
+    let (_pool, mut e) = ready();
+    assert_eq!(
+        run(e.enable_uhbr(dp_path(2, 3), 3, Uhbr10, 0)),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        run(e.enable_uhbr(dp_path(2, 3), 4, Uhbr10, 4)),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        run(e.set_uhbr_ffe(dp_path(2, 3), 4, Uhbr10, 16)),
+        Err(Error::Invalid)
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_uhbr_enable_and_ffe_use_hpo_v17_fields
+);

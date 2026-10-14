@@ -595,6 +595,24 @@ impl Dmub {
     ) -> Result<(), Error> {
         self.engine.disable_dp_sst(path).await
     }
+    pub(crate) async fn enable_uhbr(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        lanes: u8,
+        rate: UhbrRate,
+        link: u8,
+    ) -> Result<(), Error> {
+        self.engine.enable_uhbr(path, lanes, rate, link).await
+    }
+    pub(crate) async fn set_uhbr_ffe(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        lanes: u8,
+        rate: UhbrRate,
+        preset: u8,
+    ) -> Result<(), Error> {
+        self.engine.set_uhbr_ffe(path, lanes, rate, preset).await
+    }
     pub(crate) async fn disable_hpo_dp(
         &mut self,
         path: crate::amdgpu_dcn_inventory::Path,
@@ -772,6 +790,71 @@ impl<I: Io> Engine<I> {
         path: crate::amdgpu_dcn_inventory::Path,
     ) -> Result<(), Error> {
         self.disable_dp_transmitter(path, DpSignal::Sst, 19).await
+    }
+    /// dcn31_hpo_dp_link_enc_enable_dp_output -> transmitter_control_v1_7:
+    /// ENABLE as DP_MST (digmode 5, even for SST), the 128b/132b symbol
+    /// clock (link_rate x 1000 / 10 in 10 kHz), the port's HPD, the HPO link
+    /// encoder's instance. The firmware brings up the PHY, routes it to that
+    /// encoder and starts the encoder's DPHY and SYMCLK32_LE; DC writes none
+    /// of those.
+    async fn enable_uhbr(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        lanes: u8,
+        rate: UhbrRate,
+        link: u8,
+    ) -> Result<(), Error> {
+        if path.connector != crate::amdgpu_dcn_inventory::Connector::DisplayPort
+            || path.transmitter >= 4
+            || !(1..=4).contains(&path.hpd)
+            || !matches!(lanes, 1 | 2 | 4)
+            || link >= 4
+        {
+            return Err(Error::Invalid);
+        }
+        let mut request = [0; 64];
+        request[..4].copy_from_slice(&TRANSMITTER_CONTROL);
+        request[4] = path.transmitter;
+        request[5] = 1; // TRANSMITTER_CONTROL_ENABLE
+        request[6] = 5; // ATOM_TRANSMITTER_DIGMODE_V6_DP_MST
+        request[7] = lanes;
+        request[8..12].copy_from_slice(&(rate.link_rate() * 100).to_le_bytes());
+        request[12] = path.hpd;
+        request[15] = link;
+        self.begin_mailbox()?;
+        let result = self.command(request).await.map(|_| ());
+        self.finish_mailbox(result)
+    }
+    /// dcn31_hpo_dp_link_enc_set_ffe: SET_VOLTAGE_AND_PREEMPASIS as DP_MST
+    /// with the TX FFE preset in the lane-set byte. Linux leaves the HPD
+    /// source (HPD1, selector 1) and HPO engine (instance 0 - HPO_DP_0, 244)
+    /// unset here, unlike ENABLE.
+    async fn set_uhbr_ffe(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        lanes: u8,
+        rate: UhbrRate,
+        preset: u8,
+    ) -> Result<(), Error> {
+        if path.connector != crate::amdgpu_dcn_inventory::Connector::DisplayPort
+            || path.transmitter >= 4
+            || !matches!(lanes, 1 | 2 | 4)
+            || preset > 15
+        {
+            return Err(Error::Invalid);
+        }
+        let mut request = [0; 64];
+        request[..4].copy_from_slice(&TRANSMITTER_CONTROL);
+        request[4] = path.transmitter;
+        request[5] = 11; // SET_VOLTAGE_AND_PREEMPASIS
+        request[6] = preset;
+        request[7] = lanes;
+        request[8..12].copy_from_slice(&(rate.link_rate() * 100).to_le_bytes());
+        request[12] = 1;
+        request[15] = 244;
+        self.begin_mailbox()?;
+        let result = self.command(request).await.map(|_| ());
+        self.finish_mailbox(result)
     }
     async fn disable_hpo_dp(
         &mut self,

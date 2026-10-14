@@ -7,6 +7,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64};
 mod frontend;
 #[path = "amdgpu_dcn401_dp_link_status_tests.rs"]
 mod link_status;
+#[path = "amdgpu_dcn401_uhbr_link_tests.rs"]
+mod uhbr;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Event {

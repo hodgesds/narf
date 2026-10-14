@@ -12,6 +12,9 @@ pub use frontend::{DpFrontendReady, DpFrontendRequest, DpVideoRunning};
 #[path = "amdgpu_dcn401_dp_link_status.rs"]
 mod link_status;
 pub use link_status::DpLinkStatus;
+#[path = "amdgpu_dcn401_uhbr_link.rs"]
+pub(in super::super) mod uhbr;
+pub use uhbr::{UhbrLinkTrained, UhbrSettings};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DpTrainingError {
@@ -20,6 +23,9 @@ pub enum DpTrainingError {
     ClockRecovery,
     Equalization,
     LinkLost,
+    /// 128b/132b clock data switch: no CDS interlane alignment or symbol
+    /// lock in time, or the sink reported LT_FAILED during it.
+    ClockDataSwitch,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DpLinkTrained {

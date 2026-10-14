@@ -11,7 +11,7 @@ pub use dmub::{DpPhySettings, UhbrRate};
 pub(super) mod training;
 pub use training::{
     DpDriveSettings, DpFrontendReady, DpFrontendRequest, DpLinkStatus, DpLinkTrained,
-    DpTrainingError, DpVideoRunning,
+    DpTrainingError, DpVideoRunning, UhbrLinkTrained, UhbrSettings,
 };
 
 const LANES_MASK: u32 = 0x3e3e3e3e;
@@ -89,6 +89,17 @@ impl<I: Io> Engine<I> {
         frontend: Option<u8>,
         timing: Option<u8>,
     ) -> Result<(), Error> {
+        self.dp_phy_consumers_hpo(phy, frontend, timing, None)
+    }
+    /// As `dp_phy_consumers_owned`, with `hpo`'s own running HPO link
+    /// encoder (its DPHY, clock and SYMCLK32_LE route) exempt.
+    fn dp_phy_consumers_hpo(
+        &mut self,
+        phy: u8,
+        frontend: Option<u8>,
+        timing: Option<u8>,
+        hpo: Option<u8>,
+    ) -> Result<(), Error> {
         let l = self.layout;
         let s = self.displays.siblings;
         if s.transmitters & bit(phy) != 0
@@ -115,11 +126,24 @@ impl<I: Io> Engine<I> {
                         .any(|&r| reg == DpStream::Dio(f).at(l, r))
                 })
                 || timing.is_some_and(|p| reg == l.otg(p, CONTROL) || reg == l.otg(p, CLOCK))
+                || hpo.is_some_and(|k| {
+                    reg == l.link_clock
+                        || [0x369f, 0x36b4, 0x36b5]
+                            .iter()
+                            .any(|&r| reg == DpStream::Hpo(k).at(l, r))
+                })
                 || self.sibling_register(reg)
             {
                 continue;
             }
             if self.read(reg)? & mask != 0 {
+                return Err(Error::Busy);
+            }
+        }
+        // The other HPO link encoders' SYMCLK32_LE routes stay off.
+        if let Some(k) = hpo {
+            let routes = self.read(l.link_clock)?;
+            if (0..4u8).any(|i| i != k && routes >> (4 * i) & 8 != 0) {
                 return Err(Error::Busy);
             }
         }

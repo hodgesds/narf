@@ -1567,6 +1567,53 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Enable a 128b/132b link on HPO link encoder `link` and train the sink.
+    /// # Safety
+    /// Fulfil `Otg::train_uhbr_link` obligations.
+    pub async unsafe fn train_display_uhbr_link(
+        &mut self,
+        port: usize,
+        settings: otg::UhbrSettings,
+        link: u8,
+    ) -> Result<otg::UhbrLinkTrained, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: validated board route and matching retained owners; the
+        // caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .train_uhbr_link(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    &mut self.sequence.backend.dmub,
+                    path,
+                    settings,
+                    link,
+                )
+                .await
+        }
+    }
+    /// Stop the port's trained or refused 128b/132b link; `unplugged` skips
+    /// the sink and requires HPD low.
+    /// # Safety
+    /// Fulfil `Otg::stop_uhbr_link` obligations.
+    pub async unsafe fn stop_display_uhbr_link(
+        &mut self,
+        port: usize,
+        unplugged: bool,
+    ) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        let otg = self.otg.as_mut().map_err(|e| *e)?;
+        let dmub = &mut self.sequence.backend.dmub;
+        // SAFETY: matching retained board path/owners; caller's obligations.
+        unsafe {
+            if unplugged {
+                otg.stop_unplugged_uhbr_link(dmub, path).await
+            } else {
+                otg.stop_uhbr_link(dmub, path).await
+            }
+        }
+    }
     /// Prepare a blank frontend for the retained trained DP link and staged OPP.
     /// # Safety
     /// Fulfil `Otg::prepare_dp_frontend` direct-port, clock/timing ownership and
