@@ -6056,6 +6056,8 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     // Ports and every size/seed below must match netserve_smoke_x86_64.c.
     let download_port: u16 = 17780;
     let udp_client_port: u16 = 17781;
+    let parallel_port: u16 = 17782;
+    const PARALLEL_LEN: u64 = 16 << 20;
     const BULK_LEN: u64 = 4 << 20;
     const BULK_SEED: u8 = 0x5a;
     const DOWNLOAD_LEN: u64 = 8 << 20;
@@ -6155,6 +6157,39 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         }
         Ok(off)
     });
+    // The parallel-download server: every connection names its stream seed in
+    // one byte, then gets PARALLEL_LEN patterned bytes and a close. Each is
+    // served on its own thread so the streams genuinely run concurrently.
+    let parallel_listener = std::net::TcpListener::bind(("127.0.0.1", parallel_port))
+        .with_context(|| format!("xtask {smoke_name}: binding parallel server :{parallel_port}"))?;
+    let parallel_served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let served = parallel_served.clone();
+        std::thread::spawn(move || {
+            for conn in parallel_listener.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                let served = served.clone();
+                std::thread::spawn(move || {
+                    let mut seed = [0u8; 1];
+                    let _ = conn.set_read_timeout(Some(Duration::from_secs(20)));
+                    if conn.read_exact(&mut seed).is_err() {
+                        return;
+                    }
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut off = 0u64;
+                    while off < PARALLEL_LEN {
+                        let n = buf.len().min((PARALLEL_LEN - off) as usize);
+                        fill(&mut buf[..n], off, seed[0]);
+                        if conn.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                        off += n as u64;
+                    }
+                    served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+        });
+    }
     let udp_client_server = UdpSocket::bind(("127.0.0.1", udp_client_port))
         .with_context(|| format!("xtask {smoke_name}: binding UDP server :{udp_client_port}"))?;
     udp_client_server.set_read_timeout(Some(Duration::from_millis(200)))?;
@@ -6547,6 +6582,15 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         Ok(Err(e)) => abort!("xtask {smoke_name}: download server: {e}"),
         Err(_) => abort!("xtask {smoke_name}: download server panicked"),
     }
+
+    // 4c. Concurrent downloads: 8 then 16 streams, read by one epoll loop and
+    //     by one thread per socket, then a fresh connection. The guest checks
+    //     every byte, the EOFs and that no stream lags far behind the others.
+    if !wait_for(b"netserve-parallel-ok", timeout_secs) {
+        abort!("xtask {smoke_name}: guest parallel downloads did not all complete");
+    }
+    let par_streams = parallel_served.load(std::sync::atomic::Ordering::Relaxed);
+    println!("xtask {smoke_name}: served {par_streams} concurrent {PARALLEL_LEN}-byte streams");
 
     if !wait_for(b"netserve: udp listening", timeout_secs) {
         let _ = child.kill();

@@ -7,6 +7,8 @@
 //   3. as a CLIENT, non-blocking connect() to the host (10.0.2.2:17780) and
 //      download a large patterned stream to EOF through poll() — the browser
 //      shape (Firefox/Chromium sockets are non-blocking + poll/epoll);
+//      then 8 and 16 concurrent downloads from 10.0.2.2:17782, read through
+//      one epoll loop and through one blocking thread per socket;
 //   4. bind 0.0.0.0:7778 and echo host datagrams of many sizes, including
 //      ones above the MTU that arrive and leave as IPv4 fragments, then a
 //      back-to-back burst;
@@ -28,6 +30,8 @@
 //   * "netserve-tcp-ok"     — after the TCP echo round-trip.
 //   * "netserve: bulk listening" / "netserve-bulk-ok" — bulk echo (2).
 //   * "netserve-download-ok" — client download (3).
+//   * "netserve-parallel-ok" — 8 and 16 concurrent downloads, read through
+//     epoll and through per-socket threads, then a fresh connection (3b).
 //   * "netserve: udp listening" / "netserve-udp-ok" — UDP echo (4).
 //   * "netserve-udp-client-ok" — connected UDP client (5).
 //   * "netserve-udp-gso-ok" — UDP GSO send + UDP_GRO receive (5).
@@ -51,6 +55,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/uio.h>
+#include <sys/epoll.h>
+#include <pthread.h>
 
 // `include/uapi/linux/udp.h`; musl's <netinet/udp.h> may predate them.
 #ifndef SOL_UDP
@@ -80,11 +86,16 @@
 #define UDP_GSO_SEGS 5
 #define UDP_GSO_LEN 1200
 #define UDP_GSO_SEED 0x90
+// The parallel-download phase: PAR_LEN bytes per stream from the host's
+// PAR_PORT. The guest names each stream's seed in the one byte it sends first.
+#define PAR_PORT 17782
+#define PAR_LEN (16u << 20)
+#define PAR_MAX 16
 
 static void w(const char *m) { write(1, m, strlen(m)); }
 
 static int failf(const char *what, unsigned long a, unsigned long b) {
-    char buf[160];
+    char buf[320];
     snprintf(buf, sizeof buf, "netserve-fail: %s (%lu, %lu, errno %d)\n", what, a, b, errno);
     w(buf);
     return 1;
@@ -205,6 +216,184 @@ static int download(void) {
     close(c);
     if (got != DOWNLOAD_LEN) return failf("download length", got, DOWNLOAD_LEN);
     w("netserve-download-ok\n");
+    return 0;
+}
+
+// (3b) Many concurrent downloads, the browser shape (a page or a video player
+// opens many connections at once and reads all of them as data arrives). Each
+// stream is a PAR_LEN patterned stream whose seed the guest picks; every byte
+// and the EOF are verified. Run with one epoll loop over non-blocking sockets
+// and with one blocking reader thread per socket. Every stream must make
+// progress: the slowest one may not finish far behind the first.
+struct par_stream {
+    int fd;
+    uint8_t seed;
+    uint64_t got;
+    long done_ms; // completion time since the round began, -1 while open
+    const char *err;
+};
+
+static struct timespec par_t0;
+
+static long par_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (t.tv_sec - par_t0.tv_sec) * 1000L + (t.tv_nsec - par_t0.tv_nsec) / 1000000L;
+}
+
+// Blocking connect to the parallel server, then send the seed byte.
+static int par_connect(uint8_t seed, int nonblock) {
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    if (c < 0) return -1;
+    struct sockaddr_in a;
+    host_addr(&a, PAR_PORT);
+    if (connect(c, (struct sockaddr *)&a, sizeof a) < 0 || write(c, &seed, 1) != 1) {
+        close(c);
+        return -1;
+    }
+    if (nonblock) fcntl(c, F_SETFL, fcntl(c, F_GETFL) | O_NONBLOCK);
+    return c;
+}
+
+// Verify and account `buf[0..n]` for stream `st`; 0 = ok.
+static int par_take(struct par_stream *st, const uint8_t *buf, long n) {
+    if (st->got + (uint64_t)n > PAR_LEN) {
+        st->err = "overlong stream";
+        return -1;
+    }
+    if (first_mismatch(buf, (size_t)n, st->got, st->seed) >= 0) {
+        st->err = "byte mismatch";
+        return -1;
+    }
+    st->got += (uint64_t)n;
+    return 0;
+}
+
+static void *par_reader(void *arg) {
+    struct par_stream *st = arg;
+    static __thread uint8_t buf[65536];
+    struct timeval t = {.tv_sec = 20};
+    setsockopt(st->fd, SOL_SOCKET, SO_RCVTIMEO, &t, sizeof t);
+    for (;;) {
+        long n = read(st->fd, buf, sizeof buf);
+        if (n < 0) {
+            st->err = errno == EAGAIN ? "stalled (20 s without data)" : "read error";
+            return 0;
+        }
+        if (n == 0) break;
+        if (par_take(st, buf, n)) return 0;
+    }
+    st->done_ms = par_ms();
+    return 0;
+}
+
+static int par_epoll(struct par_stream *st, int n) {
+    int ep = epoll_create1(0);
+    if (ep < 0) return failf("parallel epoll_create1", 0, 0);
+    for (int i = 0; i < n; i++) {
+        struct epoll_event e = {.events = EPOLLIN, .data.u32 = (uint32_t)i};
+        if (epoll_ctl(ep, EPOLL_CTL_ADD, st[i].fd, &e) < 0)
+            return failf("parallel epoll_ctl", (unsigned long)i, 0);
+    }
+    static uint8_t buf[65536];
+    int open = n;
+    while (open > 0) {
+        struct epoll_event ev[PAR_MAX];
+        int k = epoll_wait(ep, ev, PAR_MAX, 20000);
+        if (k == 0) {
+            for (int i = 0; i < n; i++)
+                if (st[i].done_ms < 0 && !st[i].err) st[i].err = "stalled (20 s without data)";
+            break;
+        }
+        if (k < 0) {
+            if (errno == EINTR) continue;
+            return failf("parallel epoll_wait", 0, 0);
+        }
+        for (int j = 0; j < k && open > 0; j++) {
+            struct par_stream *s = &st[ev[j].data.u32];
+            // One read per wake per stream, the way an event loop round-robins
+            // its ready sockets; level-triggered epoll reports the rest again.
+            long m = read(s->fd, buf, sizeof buf);
+            if (m > 0) {
+                par_take(s, buf, m);
+            } else if (m == 0) {
+                s->done_ms = par_ms();
+            } else if (errno != EAGAIN) {
+                s->err = "read error";
+            }
+            if (s->err) open = 0;
+            else if (s->done_ms >= 0) {
+                epoll_ctl(ep, EPOLL_CTL_DEL, s->fd, 0);
+                open--;
+            }
+        }
+    }
+    close(ep);
+    return 0;
+}
+
+// One round: `n` concurrent streams read by epoll (`threads` == 0) or by one
+// blocking thread per stream. `round` keeps the seeds distinct across rounds.
+static int par_round(int n, int threads, int round) {
+    static struct par_stream st[PAR_MAX];
+    const char *how = threads ? "threads" : "epoll";
+    char m[192];
+    clock_gettime(CLOCK_MONOTONIC, &par_t0);
+    for (int i = 0; i < n; i++) {
+        st[i] = (struct par_stream){.seed = (uint8_t)(round * PAR_MAX + i), .done_ms = -1};
+        st[i].fd = par_connect(st[i].seed, !threads);
+        if (st[i].fd < 0) return failf("parallel connect", (unsigned long)n, (unsigned long)i);
+    }
+    if (threads) {
+        pthread_t th[PAR_MAX];
+        for (int i = 0; i < n; i++)
+            if (pthread_create(&th[i], 0, par_reader, &st[i]) != 0)
+                return failf("parallel pthread_create", (unsigned long)i, 0);
+        for (int i = 0; i < n; i++) pthread_join(th[i], 0);
+    } else if (par_epoll(st, n)) {
+        return 1;
+    }
+    long total = par_ms(), first = -1, last = 0;
+    int bad = -1;
+    for (int i = 0; i < n; i++) {
+        close(st[i].fd);
+        if (bad < 0 && (st[i].err || st[i].done_ms < 0 || st[i].got != PAR_LEN)) bad = i;
+        if (st[i].done_ms >= 0 && (first < 0 || st[i].done_ms < first)) first = st[i].done_ms;
+        if (st[i].done_ms > last) last = st[i].done_ms;
+    }
+    // Every stream's completion time (or KiB received if it never finished),
+    // so a stalled stream shows up beside the rest.
+    char line[512];
+    int o = snprintf(line, sizeof line, "netserve: parallel %d %s %ld ms; done ms:", n, how, total);
+    for (int i = 0; i < n && o < (int)sizeof line - 16; i++) {
+        if (st[i].done_ms >= 0) o += snprintf(line + o, sizeof line - o, " %ld", st[i].done_ms);
+        else o += snprintf(line + o, sizeof line - o, " [%luK]", (unsigned long)(st[i].got >> 10));
+    }
+    if (o < (int)sizeof line - 1) line[o++] = '\n';
+    write(1, line, (size_t)o);
+    if (bad >= 0) {
+        snprintf(m, sizeof m, "parallel %d %s stream %d %s; bytes, total", n, how, bad,
+                 st[bad].err ? st[bad].err : "ended short");
+        return failf(m, (unsigned long)st[bad].got, PAR_LEN);
+    }
+    // Fairness: the streams share one link and start together, so they end
+    // together. One that ends long after the first finisher was starved.
+    if (last > 2 * first + 2000) {
+        snprintf(m, sizeof m, "parallel %d %s stream starved; first and last done ms", n, how);
+        return failf(m, (unsigned long)first, (unsigned long)last);
+    }
+    return 0;
+}
+
+static int parallel_downloads(void) {
+    static const int sizes[] = {8, 16};
+    int round = 0;
+    for (unsigned k = 0; k < sizeof sizes / sizeof sizes[0]; k++)
+        for (int threads = 0; threads < 2; threads++)
+            if (par_round(sizes[k], threads, round++)) return 1;
+    // The network must still work afterwards: one fresh connection.
+    if (par_round(1, 0, round)) return 1;
+    w("netserve-parallel-ok\n");
     return 0;
 }
 
@@ -431,7 +620,7 @@ int main(void) {
     close(s);
     w("netserve-tcp-ok\n");
 
-    if (bulk_echo() || download()) return 1;
+    if (bulk_echo() || download() || parallel_downloads()) return 1;
 
     int u = socket(AF_INET, SOCK_DGRAM, 0);
     if (u < 0) {
