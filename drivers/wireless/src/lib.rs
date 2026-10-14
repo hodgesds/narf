@@ -8,12 +8,17 @@ pub mod ath9k;
 pub mod brcmfmac;
 pub mod cyw43439;
 pub mod iwlwifi;
-pub mod mt76;
-pub mod mt7921;
 pub mod rtl8xxxu;
 pub mod rtlwifi;
 pub mod rtw88;
 pub mod rtw89;
+
+// MediaTek CONNAC2 Wi-Fi (MT7921/MT7922/MT7961/MT7920). Promoted out of the
+// former `src/mt7921/` module into the standalone dual-build crate
+// `narf-drivers-wireless-mt76` (see drivers/wireless/mt76/). Re-exported here
+// as `mt76` so existing `wireless::mt76::…` references keep resolving; the
+// former dead MT7615 `mt76.rs` stub was deleted.
+pub use narf_drivers_wireless_mt76 as mt76;
 
 #[cfg(feature = "kernel-test")]
 mod e2e_tests;
@@ -26,8 +31,8 @@ pub fn register_initcalls() {
         iwlwifi::register();
         InitResult::Ok
     });
-    narf_init::register(Stage::Subsys, "mt7921", || {
-        mt7921::register();
+    narf_init::register(Stage::Subsys, "mt76", || {
+        mt76::register();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "cyw43439", || {
@@ -64,10 +69,6 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "ath9k", || {
         ath9k::register();
-        InitResult::Ok
-    });
-    narf_init::register(Stage::Subsys, "mt76", || {
-        mt76::register();
         InitResult::Ok
     });
 }

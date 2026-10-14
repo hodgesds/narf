@@ -61,7 +61,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 // ── Smoke 1 — mt7921 PCI probe match table covers 14c3:0608 ──────────
 
 fn smoke_e2e_mt7921_pci_probe_match_for_14c3_0608() -> TestResult {
-    use crate::mt7921::{register_pci_driver, MTK_DEV_MT7921, MTK_VENDOR};
+    use crate::mt76::mt7921::{register_pci_driver, MTK_DEV_MT7921, MTK_VENDOR};
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::{registered_pci_drivers, MatchKind};
 
@@ -88,7 +88,7 @@ kernel_test_in!(
 // ── Smoke 2 — mt7921 WFDMA0 9-ring allocation shape ──────────────────
 
 fn smoke_e2e_mt7921_wfdma0_nine_ring_allocation() -> TestResult {
-    use crate::mt7921::dma::{allocate_ring_set, RingSet};
+    use crate::mt76::mt7921::dma::{allocate_ring_set, RingSet};
     let rings: RingSet = match allocate_ring_set() {
         Ok(r) => r,
         Err(e) => {
@@ -118,8 +118,8 @@ kernel_test_in!(
 // ── Smoke 3 — mt7921 firmware blob name resolution (WM + patch) ─────
 
 fn smoke_e2e_mt7921_firmware_blob_names_for_mt7961() -> TestResult {
-    use crate::mt7921::pci::firmware_blobs_for;
-    use crate::mt7921::MTK_DEV_MT7961;
+    use crate::mt76::mt7921::pci::firmware_blobs_for;
+    use crate::mt76::mt7921::MTK_DEV_MT7961;
     let (patch, wm) = firmware_blobs_for(MTK_DEV_MT7961);
     if !patch.starts_with("mediatek/") {
         return TestResult::Fail("rom patch name not under mediatek/");
@@ -137,8 +137,8 @@ kernel_test_in!(
 // ── Smoke 4 — MCU init command sequence (3 cmds, expected sizes) ────
 
 fn smoke_e2e_mt7921_mcu_init_sequence_layout() -> TestResult {
-    use crate::mt7921::bringup::{build_mcu_init_sequence, BringUpConfig};
-    use crate::mt7921::cmd::{INIT_RA_CFG_SIZE, PM_STATE_CTRL_SIZE, UNI_DEV_INFO_BODY_SIZE};
+    use crate::mt76::mt7921::bringup::{build_mcu_init_sequence, BringUpConfig};
+    use crate::mt76::mt7921::cmd::{INIT_RA_CFG_SIZE, PM_STATE_CTRL_SIZE, UNI_DEV_INFO_BODY_SIZE};
 
     let cfg = BringUpConfig {
         own_mac: [0x02, 0x11, 0x22, 0x33, 0x44, 0x55],
@@ -170,8 +170,8 @@ kernel_test_in!(
 // ── Smoke 5 — MAC vif setup body shape (DEV+BSS+STA, 3 TLV bodies) ──
 
 fn smoke_e2e_mt7921_mac_vif_setup_three_bodies() -> TestResult {
-    use crate::mt7921::bringup::{build_mac_vif_setup_sequence, BringUpConfig};
-    use crate::mt7921::cmd::{
+    use crate::mt76::mt7921::bringup::{build_mac_vif_setup_sequence, BringUpConfig};
+    use crate::mt76::mt7921::cmd::{
         BSS_INFO_BASIC_TLV_SIZE, CONN_TYPE_STA_INFRA, DEV_INFO_UPDATE_SIZE, NETWORK_TYPE_INFRA,
         STA_REC_BASIC_TLV_SIZE,
     };
@@ -225,8 +225,8 @@ kernel_test_in!(
 // ── Smoke 6 — Channel switch to channel 36 / 5180 MHz ───────────────
 
 fn smoke_e2e_mt7921_channel_switch_ch36_5180mhz() -> TestResult {
-    use crate::mt7921::bringup::{build_channel_switch_body, BringUpConfig};
-    use crate::mt7921::cmd::{CHANNEL_SWITCH_SIZE, CH_BAND_5G, CH_BW_20};
+    use crate::mt76::mt7921::bringup::{build_channel_switch_body, BringUpConfig};
+    use crate::mt76::mt7921::cmd::{CHANNEL_SWITCH_SIZE, CH_BAND_5G, CH_BW_20};
 
     let cfg = BringUpConfig::default();
     if cfg.channel != 36 {
@@ -261,7 +261,7 @@ kernel_test_in!(
 // ── Smoke 7 — Open Auth MGMT frame matches IEEE 802.11 spec ─────────
 
 fn smoke_e2e_mt7921_open_auth_frame_layout() -> TestResult {
-    use crate::mt7921::cmd::{
+    use crate::mt76::mt7921::cmd::{
         encode_open_auth_frame, FC_MGMT_AUTH, IEEE80211_AUTH_FRAME_SIZE, IEEE80211_MAC_HDR_SIZE,
     };
     let sta = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
@@ -302,7 +302,7 @@ kernel_test_in!(
 // ── Smoke 8 — Association Request frame carries SSID IE ─────────────
 
 fn smoke_e2e_mt7921_assoc_req_frame_carries_ssid_ie() -> TestResult {
-    use crate::mt7921::cmd::{encode_assoc_req_frame, FC_MGMT_ASSOC_REQ, IEEE80211_MAC_HDR_SIZE};
+    use crate::mt76::mt7921::cmd::{encode_assoc_req_frame, FC_MGMT_ASSOC_REQ, IEEE80211_MAC_HDR_SIZE};
     let sta = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
     let bssid = [0x42u8; 6];
     let ssid = b"NARF-TEST";

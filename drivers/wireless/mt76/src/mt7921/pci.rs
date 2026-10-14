@@ -182,9 +182,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
-    // Register the iface stub so the kernel-side TCP stack can see
-    // the MAC. send_frame returns Err until the DMA-ring path lands.
-    narf_net::iface::register("wlan%d", mac, send_frame_unimpl);
+    // Register the control-plane iface: netdev identity (so the
+    // kernel-side TCP stack sees the MAC) + wiphy (so the nl80211
+    // control plane lists the radio). send_frame returns Err until the
+    // DMA-ring datapath lands. The wireless registry retains the Arc.
+    let _iface = crate::iface::register_iface(did, mac, send_frame_unimpl);
     Ok(())
 }
 
@@ -429,9 +431,9 @@ pub fn with_controller<R>(f: impl FnOnce(&Mt7921Device) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
 }
 
-/// Test-only reset of the bound slot. Gated under `kernel-test` so it
-/// drops out of production binaries.
-#[cfg(any(test, feature = "kernel-test"))]
+/// Test-only reset of the bound slot. Available in the built-in build (which
+/// carries the co-located smokes); dropped from the `.ko` build.
+#[cfg(any(test, feature = "builtin"))]
 pub fn __reset_for_test() {
     *CONTROLLER.lock() = None;
 }
