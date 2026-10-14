@@ -1250,8 +1250,11 @@ impl ColdBoot {
         }
         Ok(())
     }
-    /// Tear down a modeset whose sink left: as `stop_modeset`, but the link
-    /// stops without addressing the sink, and only while HPD stays low.
+    /// Tear down a modeset whose sink left: as `stop_modeset`, but a DP link
+    /// stops without addressing the sink, and only while HPD stays low. An
+    /// SCDC sink still gets the legacy TMDS_Config write, unchecked, as
+    /// Linux's link_set_dpms_off sends it whether or not a sink answers (a
+    /// sink back on the port before teardown is returned to legacy TMDS).
     /// # Safety
     /// As for `stop_modeset`.
     pub async unsafe fn unplug_modeset(&mut self, m: &Modeset) -> Result<(), ModesetError> {
@@ -1265,8 +1268,7 @@ impl ColdBoot {
             }
             self.stop_display_scanout(m.pipe).await?;
             if m.selection.hdmi {
-                // The departed sink's SCDC is not addressed.
-                self.stop_hdmi(port, false).await?;
+                self.stop_hdmi(port, m.selection.scdc).await?;
             } else {
                 self.stop_display_dp_video(port).await?;
                 self.stop_display_dp_frontend(port).await?;
