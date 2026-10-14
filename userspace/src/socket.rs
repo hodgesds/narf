@@ -899,6 +899,9 @@ pub struct SocketFile {
     /// Per-send handoff of an `IP_PKTINFO`/`IPV6_PKTINFO` source override from
     /// the `sendmsg` cmsg parser to the datagram send path (keyed by task).
     send_pktinfo: IrqSafeSpinLock<BTreeMap<u64, SendPktInfo>>,
+    /// Per-task `SOL_UDP` sendmsg cmsg outcome (`udp_cmsg_send`): the GSO
+    /// size a `UDP_SEGMENT` record sets, or its -EINVAL.
+    send_udp_gso: IrqSafeSpinLock<BTreeMap<u64, Result<u16, i64>>>,
     /// `sk_shutdown`: `RCV_SHUTDOWN` / `SEND_SHUTDOWN` bits set by
     /// shutdown(2). Read by the AF_INET datagram path.
     sk_shutdown: AtomicU8,
@@ -1655,6 +1658,11 @@ pub(crate) struct Inet4RxInfo {
     pub spec_dst: u32,
     pub ttl: u8,
     pub tos: u8,
+    /// Segment size of a coalesced UDP GSO datagram delivered whole to a
+    /// `UDP_GRO` socket (`skb_shinfo(skb)->gso_size` under
+    /// `SKB_GSO_UDP_L4`); 0 for an ordinary datagram. `udp_cmsg_recv`
+    /// reports it as the `UDP_GRO` control message.
+    pub gso_size: u16,
 }
 
 /// Which IPv4 receive control messages a socket asked for.
@@ -1700,6 +1708,9 @@ struct DgramPacket6 {
     hop_limit: i32,
     traffic_class: u8,
     payload: Vec<u8>,
+    /// `UDP_GRO` segment size of a coalesced loopback GSO datagram; 0
+    /// otherwise (see [`Inet4RxInfo::gso_size`]).
+    gso_size: u16,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1708,6 +1719,8 @@ pub(crate) struct Inet6RecvAncillary {
     pub ifindex: u32,
     pub hop_limit: i32,
     pub traffic_class: u8,
+    /// The `UDP_GRO` cmsg's segment size, or 0 for no cmsg.
+    pub gso_size: u16,
 }
 
 impl core::fmt::Debug for DgramPacket {
@@ -1923,6 +1936,7 @@ impl SocketFile {
             inet_err_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
             inet_id: core::sync::atomic::AtomicU16::new(0),
             send_pktinfo: IrqSafeSpinLock::new(BTreeMap::new()),
+            send_udp_gso: IrqSafeSpinLock::new(BTreeMap::new()),
             sk_shutdown: AtomicU8::new(0),
             net_ns_id: core::sync::atomic::AtomicU64::new(0),
             icmp_echo: IrqSafeSpinLock::new(IcmpEchoState::default()),
@@ -2788,6 +2802,11 @@ impl SocketFile {
         }
     }
 
+    /// `udp_test_bit(GRO_ENABLED, sk)`: whether recvmsg reports `UDP_GRO`.
+    pub(crate) fn udp_gro_enabled(&self) -> bool {
+        self.is_udp() && self.options.lock().ext.udp_gro
+    }
+
     pub(crate) fn inet6_ancillary_options(&self) -> (bool, bool, bool) {
         let options = self.options.lock();
         (
@@ -3022,6 +3041,32 @@ impl SocketFile {
         self.send_pktinfo
             .lock()
             .remove(&crate::handlers::current_task_id())
+    }
+
+    /// Stash this task's in-flight `sendmsg` `SOL_UDP` cmsg outcome for the
+    /// UDP send path (`udp_cmsg_send`).
+    pub(crate) fn stash_send_udp_gso(&self, gso: Result<u16, i64>) {
+        self.send_udp_gso
+            .lock()
+            .insert(crate::handlers::current_task_id(), gso);
+    }
+
+    /// Take this task's stashed `SOL_UDP` cmsg outcome.
+    pub(crate) fn take_send_udp_gso(&self) -> Option<Result<u16, i64>> {
+        self.send_udp_gso
+            .lock()
+            .remove(&crate::handlers::current_task_id())
+    }
+
+    /// The GSO size a UDP send uses: `ipc.gso_size = up->gso_size`, then
+    /// overridden by a `UDP_SEGMENT` cmsg; a malformed `SOL_UDP` cmsg is
+    /// -EINVAL (`udp_sendmsg` / `udpv6_sendmsg` → `udp_cmsg_send`).
+    pub(crate) fn udp_send_gso_size(&self) -> Result<u16, SockError> {
+        match self.take_send_udp_gso() {
+            Some(Ok(gso)) => Ok(gso),
+            Some(Err(_)) => Err(SockError::InvalidArg),
+            None => Ok(self.options.lock().ext.udp_gso_size),
+        }
     }
 
     /// The net-layer ICMP-error sink (registered via `install_udp_icmp_hook`).
@@ -6326,7 +6371,7 @@ impl SocketFile {
             && level != SOL_SOCKET
             && level != IPPROTO_IP
             && !(level == IPPROTO_TCP && self.kind == SOCK_STREAM)
-            && !(level == IPPROTO_UDP && self.kind == SOCK_DGRAM)
+            && !(level == IPPROTO_UDP && self.is_udp())
         {
             return SocketOpResult::Err(SockError::NotSupported);
         }
@@ -6338,7 +6383,7 @@ impl SocketFile {
             && level != IPPROTO_IPV6
             && !(level == IPPROTO_IP && self.kind != SOCK_RAW)
             && !(level == IPPROTO_TCP && self.kind == SOCK_STREAM)
-            && !(level == IPPROTO_UDP && self.kind == SOCK_DGRAM)
+            && !(level == IPPROTO_UDP && self.is_udp())
         {
             return SocketOpResult::Err(SockError::NoProtoOpt);
         }
@@ -11293,6 +11338,7 @@ fn smoke_ipv6_socket_options_and_ancillary_are_per_datagram() -> TestResult {
         ifindex: 9,
         hop_limit: 37,
         traffic_class: 0x2e,
+        gso_size: 0,
     };
     socket.stash_inet6_recv_ancillary(ancillary);
     if pktinfo

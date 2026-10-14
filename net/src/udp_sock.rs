@@ -92,6 +92,13 @@ pub struct UdpOptions {
     /// (`ipi_spec_dst`). `None` ⇒ use the egress interface's address. QUIC
     /// uses it to pin a reply's source to the address the peer saw.
     pub ip_src_override: Option<[u8; 4]>,
+    /// UDP GSO segment size for this send (`UDP_SEGMENT`, the socket default
+    /// or a per-`sendmsg` cmsg); 0 sends one datagram. See
+    /// [`crate::udp_gso`].
+    pub gso_size: u16,
+    /// `sk_no_check_tx` (`SO_NO_CHECK`): transmit with a zero UDP checksum
+    /// (`udp_send_skb`'s CHECKSUM_NONE branch). A GSO send refuses it.
+    pub no_check_tx: bool,
 }
 
 impl Default for UdpOptions {
@@ -108,6 +115,8 @@ impl Default for UdpOptions {
             ip_tos: 0,
             ip_pmtudisc: 1, // IP_PMTUDISC_WANT: DF set (NARF's prior default)
             ip_src_override: None,
+            gso_size: 0,
+            no_check_tx: false,
         }
     }
 }
@@ -365,6 +374,9 @@ pub enum UdpError {
     NetworkUnreachable,
     /// The bounded unresolved-neighbor transmit queue is full.
     QueueFull,
+    /// `udp_send_skb`'s -EINVAL for a GSO send: more than
+    /// `UDP_MAX_SEGMENTS` segments, or `SO_NO_CHECK` set.
+    GsoInvalid,
 }
 
 /// An IPv4 UDP frame retained while ARP resolves its next hop.
@@ -655,13 +667,37 @@ fn udp_send_inner(
     // queue, with the MTU carried here.
     let mtu = crate::ip_output::fragsize(ip_pmtudisc, iface.mtu);
     let udp_len = UDP_HDR_LEN + payload.len();
-    match crate::ip_output::append_check(ip_pmtudisc, mtu, udp_len) {
+    // A GSO send is appended against `IP_MAX_MTU`, not the path MTU
+    // (`__ip_append_data`: `mtu = cork->gso_size ? IP_MAX_MTU : fragsize`).
+    let appended = if options.gso_size != 0 {
+        crate::ip_output::append_check_gso(mtu, udp_len)
+    } else {
+        crate::ip_output::append_check(ip_pmtudisc, mtu, udp_len)
+    };
+    match appended {
         Ok(()) => {}
         Err(crate::ip_output::AppendError::NetUnreach) => return Err(UdpError::NoInterface),
         Err(crate::ip_output::AppendError::MsgSize { info }) => {
             return Err(UdpError::LocalMsgSize { info })
         }
     }
+    // `udp_send_skb`: the GSO checks run on the built skb, before
+    // `ip_send_skb` reaches the neighbour layer.
+    let segment = if options.gso_size != 0 {
+        match crate::udp_gso::gso_check(
+            IPV4_HDR_LEN,
+            payload.len(),
+            options.gso_size,
+            mtu,
+            options.no_check_tx,
+        ) {
+            Ok(split) => split,
+            Err(crate::udp_gso::GsoError::MsgSize) => return Err(UdpError::MsgTooLong),
+            Err(crate::udp_gso::GsoError::Invalid) => return Err(UdpError::GsoInvalid),
+        }
+    } else {
+        false
+    };
 
     // Resolve the route's NEXT HOP, not the destination. Linux's
     // `ip_neigh_for_gw()` (include/net/route.h) uses the route's gateway when
@@ -743,23 +779,18 @@ fn udp_send_inner(
     // Compute UDP checksum over pseudo-header + datagram — the whole
     // datagram, before any fragmentation (`udp_send_skb` checksums the
     // corked skb; fragments carry no transport checksum of their own).
-    let udp_segment = &frame[udp_off..udp_off + udp_len];
-    let mut pseudo = alloc::vec::Vec::with_capacity(12 + udp_len + 1);
-    pseudo.extend_from_slice(&src_ip);
-    pseudo.extend_from_slice(&dst_ip);
-    pseudo.push(0);
-    pseudo.push(IP_PROTO_UDP);
-    pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
-    pseudo.extend_from_slice(udp_segment);
-    let cs = {
-        let s = ip_checksum(&pseudo);
-        if s == 0 {
-            0xFFFF
-        } else {
-            s
-        }
-    };
-    frame[udp_off + 6..udp_off + 8].copy_from_slice(&cs.to_be_bytes());
+    // `sk_no_check_tx` sends a zero checksum (CHECKSUM_NONE). A segmented
+    // GSO payload is checksummed per segment by `udp_gso::segment_v4`.
+    if !segment && !options.no_check_tx {
+        let cs = crate::pkt_tcp::ipv4_pseudo_checksum_proto(
+            src_ip,
+            dst_ip,
+            IP_PROTO_UDP,
+            &frame[udp_off..udp_off + udp_len],
+        );
+        let cs = if cs == 0 { 0xFFFF } else { cs };
+        frame[udp_off + 6..udp_off + 8].copy_from_slice(&cs.to_be_bytes());
+    }
 
     // LOCAL_OUT / POST_ROUTING see the whole datagram; `ip_finish_output`
     // fragments after them.
@@ -769,25 +800,34 @@ fn udp_send_inner(
         return Ok(payload.len());
     }
     let ignore_df = crate::ip_output::ip_sk_ignore_df(ip_pmtudisc);
+    // LOCAL_OUT / POST_ROUTING saw the whole GSO datagram; the device path
+    // (`validate_xmit_skb` → `__udp_gso_segment`) splits it afterwards.
+    let out_frames = if segment {
+        crate::udp_gso::segment_v4(&frame, ETH_HDR_LEN, usize::from(options.gso_size))
+    } else {
+        alloc::vec![frame]
+    };
     if let Some(Err(neighbor)) = pending_neighbor {
-        // Every fragment goes to `neigh_output` on its own; an unresolved
-        // neighbour queues each of them, in order.
+        // Every fragment (or GSO segment) goes to `neigh_output` on its own;
+        // an unresolved neighbour queues each of them, in order.
         let mut frames = Vec::new();
-        if crate::ip_output::needs_fragment(&frame, ETH_HDR_LEN, mtu) {
-            crate::ip_output::ip_finish_output(
-                net_ns_id,
-                &frame,
-                ETH_HDR_LEN,
-                mtu,
-                ignore_df,
-                |f| {
-                    frames.push(f.to_vec());
-                    Ok(())
-                },
-            )
-            .map_err(|_| UdpError::MsgTooLong)?;
-        } else {
-            frames.push(frame);
+        for frame in out_frames {
+            if crate::ip_output::needs_fragment(&frame, ETH_HDR_LEN, mtu) {
+                crate::ip_output::ip_finish_output(
+                    net_ns_id,
+                    &frame,
+                    ETH_HDR_LEN,
+                    mtu,
+                    ignore_df,
+                    |f| {
+                        frames.push(f.to_vec());
+                        Ok(())
+                    },
+                )
+                .map_err(|_| UdpError::MsgTooLong)?;
+            } else {
+                frames.push(frame);
+            }
         }
         queue_udp4(
             frames
@@ -808,13 +848,21 @@ fn udp_send_inner(
         }
         return Ok(payload.len());
     }
-    match crate::ip_output::ip_finish_output(net_ns_id, &frame, ETH_HDR_LEN, mtu, ignore_df, |f| {
-        iface.xmit(f)
-    }) {
-        Ok(()) => Ok(payload.len()),
-        Err(crate::ip_output::OutputError::MsgSize) => Err(UdpError::MsgTooLong),
-        Err(crate::ip_output::OutputError::Output) => Err(UdpError::NoInterface),
+    for frame in &out_frames {
+        match crate::ip_output::ip_finish_output(
+            net_ns_id,
+            frame,
+            ETH_HDR_LEN,
+            mtu,
+            ignore_df,
+            |f| iface.xmit(f),
+        ) {
+            Ok(()) => {}
+            Err(crate::ip_output::OutputError::MsgSize) => return Err(UdpError::MsgTooLong),
+            Err(crate::ip_output::OutputError::Output) => return Err(UdpError::NoInterface),
+        }
     }
+    Ok(payload.len())
 }
 
 /// Pop the next received datagram from the socket. Returns

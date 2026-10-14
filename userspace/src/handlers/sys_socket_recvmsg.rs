@@ -204,7 +204,12 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                         errqueue = true;
                         install_ipv4_errqueue(msg_ptr, ext)
                     } else {
-                        install_ipv4_ancillary(msg_ptr, rx, sock.inet4_cmsg_options())
+                        install_ipv4_ancillary(
+                            msg_ptr,
+                            rx,
+                            sock.inet4_cmsg_options(),
+                            sock.udp_gro_enabled(),
+                        )
                     }
                 } else if sock.domain == crate::socket::AF_INET6 {
                     let (pktinfo, hoplimit, tclass) = sock.inet6_ancillary_options();
@@ -214,6 +219,7 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                         pktinfo,
                         hoplimit,
                         tclass,
+                        sock.udp_gro_enabled(),
                     )
                 } else {
                     install_recv_ancillary(

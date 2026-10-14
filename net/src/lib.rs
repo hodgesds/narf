@@ -123,6 +123,7 @@ pub mod stun;
 pub mod tcp;
 pub mod tcp_stack;
 pub mod tls;
+pub mod udp_gso;
 pub mod udp_sock;
 pub mod wireguard;
 pub mod ws;
@@ -153,6 +154,8 @@ mod tcp_e2e_tests;
 mod tcp_timer_e2e_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;
+#[cfg(any(test, feature = "kernel-test"))]
+mod udp_gso_tests;
 
 use alloc::boxed::Box;
 use alloc::string::String;

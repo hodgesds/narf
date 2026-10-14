@@ -12823,6 +12823,11 @@ struct ScmSendAncillary {
     cred: Option<crate::socket::Ucred>,
     /// Source-address override from an `IP_PKTINFO` / `IPV6_PKTINFO` cmsg.
     src_override: Option<crate::socket::SendPktInfo>,
+    /// What `udp_cmsg_send` makes of the `SOL_UDP` records: `None` when there
+    /// are none, `Ok(gso_size)` from the last `UDP_SEGMENT`, or the -EINVAL
+    /// of the first malformed one. A UDP send path applies it after its
+    /// address checks, where Linux parses it.
+    udp_gso: Option<Result<u16, i64>>,
 }
 
 /// Parse Linux `SOL_SOCKET` send control messages. `SCM_RIGHTS` descriptors
@@ -12836,11 +12841,13 @@ fn parse_scm_send_ancillary(
     const SCM_RIGHTS: i32 = 1;
     const SCM_CREDENTIALS: i32 = 2;
     const SCM_MAX_FD: usize = 253;
+    const SOL_UDP: i32 = 17;
     // struct cmsghdr { u64 cmsg_len; i32 cmsg_level; i32 cmsg_type; } = 16 B.
     let mut out = ScmSendAncillary {
         fds: alloc::vec::Vec::new(),
         cred: None,
         src_override: None,
+        udp_gso: None,
     };
     if ctrl_len == 0 {
         return Ok(out);
@@ -12913,6 +12920,19 @@ fn parse_scm_send_ancillary(
                 }
                 _ => return Err(EINVAL),
             }
+        } else if level == SOL_UDP {
+            // `udp_cmsg_send` → `__udp_cmsg_send`: UDP_SEGMENT must be exactly
+            // CMSG_LEN(sizeof(__u16)); any other SOL_UDP type is -EINVAL. The
+            // walk stops at the first error.
+            if !matches!(out.udp_gso, Some(Err(_))) {
+                out.udp_gso = Some(
+                    if ctype as u32 == narf_net::udp_gso::UDP_SEGMENT && cmsg_len == 16 + 2 {
+                        Ok(u16::from_ne_bytes([ctrl[off + 16], ctrl[off + 17]]))
+                    } else {
+                        Err(EINVAL)
+                    },
+                );
+            }
         } else if level == 0 && ctype == 8 {
             // SOL_IP / IP_PKTINFO: struct in_pktinfo { int ipi_ifindex;
             // in_addr ipi_spec_dst; in_addr ipi_addr; } = 12 bytes. The source
@@ -12979,12 +12999,32 @@ fn install_netlink_ancillary(
     put_cmsgs(msg_ptr, &records)
 }
 
+/// `udp_cmsg_recv`: on a `UDP_GRO` socket, a datagram delivered as a
+/// coalesced GSO skb (`SKB_GSO_UDP_L4`) carries `SOL_UDP` / `UDP_GRO` with
+/// its segment size as an `int`. `udp_recvmsg` / `udpv6_recvmsg` emit it
+/// after the socket-level records and before the IP-level ones.
+fn push_udp_gro_cmsg(
+    records: &mut alloc::vec::Vec<(i32, i32, alloc::vec::Vec<u8>)>,
+    gro_enabled: bool,
+    gso_size: u16,
+) {
+    const SOL_UDP: i32 = 17;
+    if gro_enabled && gso_size != 0 {
+        records.push((
+            SOL_UDP,
+            narf_net::udp_gso::UDP_GRO as i32,
+            i32::from(gso_size).to_ne_bytes().to_vec(),
+        ));
+    }
+}
+
 fn install_ipv6_ancillary(
     msg_ptr: u64,
     ancillary: Option<crate::socket::Inet6RecvAncillary>,
     pktinfo: bool,
     hoplimit: bool,
     tclass: bool,
+    udp_gro: bool,
 ) -> bool {
     const SOL_IPV6: i32 = 41;
     const IPV6_PKTINFO: i32 = 50;
@@ -12992,6 +13032,7 @@ fn install_ipv6_ancillary(
     const IPV6_TCLASS: i32 = 67;
     let mut records = alloc::vec::Vec::new();
     if let Some(ancillary) = ancillary {
+        push_udp_gro_cmsg(&mut records, udp_gro, ancillary.gso_size);
         // `ip6_datagram_recv_common_ctl` emits PKTINFO first, followed by
         // `ip6_datagram_recv_specific_ctl`'s HOPLIMIT and TCLASS records.
         if pktinfo {
@@ -13070,6 +13111,7 @@ fn install_ipv4_ancillary(
     msg_ptr: u64,
     rx: Option<crate::socket::Inet4RxInfo>,
     opts: crate::socket::Inet4CmsgOptions,
+    udp_gro: bool,
 ) -> bool {
     const SOL_IP: i32 = 0;
     const IP_TOS: i32 = 1;
@@ -13078,6 +13120,7 @@ fn install_ipv4_ancillary(
     const IP_ORIGDSTADDR: i32 = 20;
     let mut records = alloc::vec::Vec::new();
     if let Some(rx) = rx {
+        push_udp_gro_cmsg(&mut records, udp_gro, rx.gso_size);
         if opts.pktinfo {
             let mut info = alloc::vec::Vec::with_capacity(12);
             info.extend_from_slice(&(rx.ifindex as i32).to_ne_bytes());

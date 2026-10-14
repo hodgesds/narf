@@ -145,6 +145,21 @@ pub fn append_check(pmtudisc: i32, fragsize: u32, length: usize) -> Result<(), A
     Ok(())
 }
 
+/// [`append_check`] for a UDP GSO send. `ip_setup_cork` still validates the
+/// path MTU (`fragsize`), but `__ip_append_data` then sizes the datagram by
+/// `mtu = cork->gso_size ? IP_MAX_MTU : cork->fragsize`, whatever the
+/// IP_MTU_DISCOVER mode; `ip_local_error`'s `ee_info` is that `IP_MAX_MTU`.
+/// The per-segment MTU check is `udp_gso::gso_check`'s.
+pub fn append_check_gso(fragsize: u32, length: usize) -> Result<(), AppendError> {
+    if fragsize < IPV4_MIN_MTU {
+        return Err(AppendError::NetUnreach);
+    }
+    if length > (IP_MAX_MTU as usize) - IPV4_MIN_HDR {
+        return Err(AppendError::MsgSize { info: IP_MAX_MTU });
+    }
+    Ok(())
+}
+
 /// `__ip_make_skb`'s DF rule for a datagram of `ip_len` bytes (header
 /// included): DO and PROBE always; otherwise only a datagram that fits the
 /// path MTU and whose socket wants DF (`ip_dont_fragment`).

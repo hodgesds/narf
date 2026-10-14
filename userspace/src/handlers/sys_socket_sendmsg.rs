@@ -226,11 +226,25 @@ pub(super) fn sendmsg_on_socket(
         }
     }
 
-    match sock.dispatch_op(crate::socket::SocketOp::Send {
+    // `SOL_UDP` records (UDP_SEGMENT) are the UDP send path's to apply, at
+    // the point `udp_sendmsg` / `udpv6_sendmsg` call `udp_cmsg_send`. Clear
+    // the per-task slot afterwards whichever way the send ended, so it can
+    // never reach a later send(2)/sendto(2).
+    let udp_cmsg = sock.is_udp() && ancillary.udp_gso.is_some();
+    if udp_cmsg {
+        if let Some(gso) = ancillary.udp_gso {
+            sock.stash_send_udp_gso(gso);
+        }
+    }
+    let result = sock.dispatch_op(crate::socket::SocketOp::Send {
         buf: &total,
         flags,
         addr: dest,
-    }) {
+    });
+    if udp_cmsg {
+        let _ = sock.take_send_udp_gso();
+    }
+    match result {
         crate::socket::SocketOpResult::Ok(n) => SendMsgResult::Sent {
             written: n as usize,
             complete: n as usize >= total_len,

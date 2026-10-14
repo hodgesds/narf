@@ -289,6 +289,19 @@ pub enum Udp6SendError {
     NoSourceAddress,
     DeviceFailure,
     QueueFull,
+    /// `udp_v6_send_skb`'s -EINVAL for a GSO send: more than
+    /// `UDP_MAX_SEGMENTS` segments, or `UDP_NO_CHECK6_TX` set.
+    GsoInvalid,
+}
+
+/// Per-send UDP transmit options for [`send_udp`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Udp6TxOpts {
+    /// UDP GSO segment size (`UDP_SEGMENT`); 0 sends one datagram.
+    pub gso_size: u16,
+    /// `UDP_NO_CHECK6_TX`: send a zero UDP checksum (RFC 6935), which
+    /// `udp_v6_send_skb` permits only without GSO.
+    pub no_check6_tx: bool,
 }
 
 #[derive(Debug)]
@@ -430,6 +443,7 @@ pub fn send_udp(
     socket_mtu: Option<u32>,
     mtu_discover: u32,
     dontfrag: bool,
+    tx: Udp6TxOpts,
 ) -> Result<usize, Udp6SendError> {
     let scoped_iface = if bound_ifindex == 0 {
         None
@@ -464,7 +478,9 @@ pub fn send_udp(
             .map(|entry| entry.addr)
             .ok_or(Udp6SendError::NoSourceAddress)?,
     };
-    let udp = build_udp_segment(source, destination, source_port, destination_port, payload)?;
+    if payload.len() > u16::MAX as usize - 8 {
+        return Err(Udp6SendError::MessageTooLong);
+    }
     let path_mtu = PMTU
         .lock()
         .get(&(net_ns_id, destination))
@@ -473,9 +489,49 @@ pub fn send_udp(
         .min(iface.mtu)
         .min(socket_mtu.unwrap_or(u32::MAX).max(1280));
     let may_fragment = !dontfrag && (mtu_discover < 2 || mtu_discover == 5);
-    if IPV6_HDR_LEN + udp.len() > path_mtu as usize && !may_fragment {
-        return Err(Udp6SendError::MessageTooLong);
+    // A GSO send is appended against IP6_MAX_MTU (`__ip6_append_data`), then
+    // `udp_v6_send_skb` checks each segment against the cork's fragsize.
+    let segment = if tx.gso_size != 0 {
+        match crate::udp_gso::gso_check(
+            IPV6_HDR_LEN,
+            payload.len(),
+            tx.gso_size,
+            path_mtu,
+            tx.no_check6_tx,
+        ) {
+            Ok(split) => split,
+            Err(crate::udp_gso::GsoError::MsgSize) => return Err(Udp6SendError::MessageTooLong),
+            Err(crate::udp_gso::GsoError::Invalid) => return Err(Udp6SendError::GsoInvalid),
+        }
+    } else {
+        if IPV6_HDR_LEN + 8 + payload.len() > path_mtu as usize && !may_fragment {
+            return Err(Udp6SendError::MessageTooLong);
+        }
+        false
+    };
+    // `__udp_gso_segment`: every segment is a datagram with its own UDP
+    // header and full checksum.
+    let mut udps = Vec::new();
+    if segment {
+        for chunk in crate::udp_gso::segment_payload(payload, usize::from(tx.gso_size)) {
+            udps.push(build_udp_segment(
+                source,
+                destination,
+                source_port,
+                destination_port,
+                chunk,
+            )?);
+        }
+    } else {
+        let mut udp =
+            build_udp_segment(source, destination, source_port, destination_port, payload)?;
+        if tx.no_check6_tx {
+            // `udp_v6_send_skb`: CHECKSUM_NONE leaves `uh->check` zero.
+            udp[6..8].copy_from_slice(&[0, 0]);
+        }
+        udps.push(udp);
     }
+    let hop_limit = if hop_limit == 0 { 64 } else { hop_limit };
     let destination_mac = if destination[0] == 0xff {
         [
             0x33,
@@ -490,33 +546,37 @@ pub fn send_udp(
     {
         mac
     } else {
-        queue_udp6(PendingUdp6 {
-            net_ns_id,
-            iface: iface_name.clone(),
-            neighbor: neighbor_ip,
-            source,
-            destination,
-            hop_limit: if hop_limit == 0 { 64 } else { hop_limit },
-            traffic_class,
-            udp,
-            mtu: path_mtu,
-            may_fragment,
-        })?;
+        for udp in udps {
+            queue_udp6(PendingUdp6 {
+                net_ns_id,
+                iface: iface_name.clone(),
+                neighbor: neighbor_ip,
+                source,
+                destination,
+                hop_limit,
+                traffic_class,
+                udp,
+                mtu: path_mtu,
+                may_fragment,
+            })?;
+        }
         start_neighbor_resolution(net_ns_id, &iface_name, &iface, source, neighbor_ip);
         return Ok(payload.len());
     };
 
-    emit_udp6(
-        &iface,
-        destination_mac,
-        source,
-        destination,
-        if hop_limit == 0 { 64 } else { hop_limit },
-        traffic_class,
-        &udp,
-        path_mtu,
-        may_fragment,
-    )?;
+    for udp in &udps {
+        emit_udp6(
+            &iface,
+            destination_mac,
+            source,
+            destination,
+            hop_limit,
+            traffic_class,
+            udp,
+            path_mtu,
+            may_fragment,
+        )?;
+    }
     Ok(payload.len())
 }
 

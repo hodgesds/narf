@@ -146,8 +146,9 @@ impl SocketFile {
                 OK
             }
             SO_NO_CHECK => {
-                // LINUX-GAP: sk_setsockopt SO_NO_CHECK — stored; the UDP
-                // transmit path always checksums.
+                // `sk->sk_no_check_tx = valbool`: an IPv4 UDP datagram goes
+                // out with a zero checksum (`udp_send_skb`), and a GSO send
+                // is refused with EINVAL.
                 self.options.lock().ext.no_check = on;
                 OK
             }
