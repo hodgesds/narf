@@ -796,6 +796,7 @@ fn dcn401_dp_audio_programs_dto1_secondary_packets_and_endpoint_like_linux() -> 
                 timing: t,
                 pitch: (t.h_active + 63) & !63,
                 ycbcr420: false,
+                dsc: None,
             },
         )
         .unwrap(),

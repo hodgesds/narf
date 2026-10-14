@@ -5,7 +5,8 @@
  * Arguments: dcfclk_min dcfclk_max fclk_min fclk_max uclk dispclk_max
  * dppclk_max socclk umc_channels, then per stream: pclk hact htotal hfp hsync
  * vact vtotal vfp vsync pitch_px. Prints "PLAN <62 values>" per plane on one
- * line, planes separated by " |", or "REJECT". With FMT420 set in the
+ * line, planes separated by " |", or "REJECT". With DSC="<slices> <bpp_x16>"
+ * every stream is compressed as DC passes a DSC stream. With FMT420 set in the
  * environment every stream leaves as HDMI YCbCr 4:2:0 instead of DP RGB.
  *
  * Original single-stream notes follow.
@@ -121,6 +122,14 @@ int main(int argc, char **argv)
 		s->output.output_encoder = getenv("FMT420") ? dml2_hdmi : dml2_dp;
 		s->output.output_dp_lane_count = 4;
 		s->output.output_disabled = true;
+		/* dml21_translation_helper: a DSC stream's slices and bpp. */
+		if (getenv("DSC")) {
+			unsigned int slices = 0, bpp_x16 = 0;
+			sscanf(getenv("DSC"), "%u %u", &slices, &bpp_x16);
+			t->dsc.enable = dml2_dsc_enable;
+			t->dsc.overrides.num_slices = slices;
+			t->dsc.dsc_compressed_bpp_x16 = bpp_x16;
+		}
 		s->overrides.odm_mode = dml2_odm_mode_bypass;
 		s->overrides.disable_dynamic_odm = true;
 		s->overrides.disable_subvp = true;

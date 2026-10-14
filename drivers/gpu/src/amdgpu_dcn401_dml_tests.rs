@@ -39,6 +39,7 @@ fn inputs(f: &[u32]) -> (Soc, Mode) {
             timing,
             pitch: f[18],
             ycbcr420: false,
+            dsc: None,
         },
     )
 }
@@ -324,12 +325,23 @@ const YCBCR420_VECTORS: &str = include_str!("../tests/dcn401_dml21/ycbcr420_vect
 /// Check `vectors` (multi_vectors.txt format) with every stream's 4:2:0
 /// output set to `ycbcr420`; the plan and rejection counts seen.
 fn check_multi_vectors(vectors: &str, ycbcr420: bool) -> Result<(u32, u32), &'static str> {
+    check_vectors(vectors, ycbcr420, false)
+}
+
+/// As `check_multi_vectors`; with `dsc` each line starts with the slice
+/// count and compressed bpp every stream takes, and "! REJECT" asks only
+/// that the configuration is rejected.
+fn check_vectors(vectors: &str, ycbcr420: bool, dsc: bool) -> Result<(u32, u32), &'static str> {
     let (mut plans, mut rejects) = (0, 0);
     for line in vectors.lines() {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let mut words = line.split_whitespace();
+        let mut d = [0u32; 2];
+        if dsc && !parse(&mut words, &mut d) {
+            return Err("malformed DSC vector");
+        }
         let mut s = [0u32; 10];
         if !parse(&mut words, &mut s) || !(1..=4).contains(&s[9]) {
             return Err("malformed multi-stream SoC inputs");
@@ -347,6 +359,10 @@ fn check_multi_vectors(vectors: &str, ycbcr420: bool) -> Result<(u32, u32), &'st
             f[18] = t[9];
             let (_, mut mode) = inputs(&f);
             mode.ycbcr420 = ycbcr420;
+            mode.dsc = dsc.then_some(Dsc {
+                slices: d[0],
+                bpp_x16: d[1],
+            });
             modes.push(mode);
         }
         let mut f = [0u32; 19];
@@ -384,7 +400,7 @@ fn check_multi_vectors(vectors: &str, ycbcr420: bool) -> Result<(u32, u32), &'st
                 let (Some(name), Err(e)) = (words.next(), result) else {
                     return Err("rejected configuration admitted");
                 };
-                if error_name(e) != name {
+                if name != "REJECT" && error_name(e) != name {
                     return Err("configuration rejected for a different reason");
                 }
                 rejects += 1;
@@ -419,6 +435,24 @@ fn dcn401_dml_matches_linux_dml21_ycbcr420_vectors() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-dml",
     dcn401_dml_matches_linux_dml21_ycbcr420_vectors
+);
+
+/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, DSC).
+const DSC_VECTORS: &str = include_str!("../tests/dcn401_dml21/dsc_vectors.txt");
+
+/// DSC streams as DC passes them to DML21: one DSC in ODM bypass (at most
+/// four slices dividing at most 5760 pixels, DSCCLK a third of the pixel
+/// clock), and DSCDelayRequirement after the scaler.
+fn dcn401_dml_matches_linux_dml21_dsc_vectors() -> TestResult {
+    match check_vectors(DSC_VECTORS, false, true) {
+        Ok((plans, rejects)) if plans >= 200 && rejects >= 100 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("DSC vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_dsc_vectors
 );
 
 fn dcn401_dml_joint_plans_share_global_state() -> TestResult {

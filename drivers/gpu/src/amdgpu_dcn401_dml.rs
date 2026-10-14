@@ -7,7 +7,8 @@
 //! The admitted shape is up to four streams with progressive fixed timing,
 //! each with one unscaled, unrotated, full-frame linear XRGB/XBGR8888 plane
 //! in physical VRAM on its own pipe: GPUVM/HostVM, DCC, MALL/SubVP, cursor, tdlut, dynamic
-//! metadata, writeback, ODM/MPC combine, DSC and immediate flip are all off.
+//! metadata, writeback, ODM/MPC combine and immediate flip are all off; a
+//! 4:4:4 DP stream may use one DSC (ODM bypass).
 //! The default 320-KiB DET from the staged requestor is a fixed input for
 //! every pipe rather than DML's own allocation (four pipes fit the CRB). Anything else is rejected, not approximated.
 //!
@@ -83,6 +84,81 @@ pub struct Mode {
     /// The stream leaves as YCbCr 4:2:0 (HDMI): two pixels per OTG
     /// container, which adds a line of delay after the scaler.
     pub ycbcr420: bool,
+    /// Display Stream Compression of a 4:4:4 DP output, as DC passes it
+    /// (timing.dsc: enabled with the slice count and compressed bpp).
+    pub dsc: Option<Dsc>,
+}
+
+/// One stream's DSC as DML21 takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dsc {
+    /// Horizontal slices (dsc_cfg.num_slices_h).
+    pub slices: u32,
+    /// Compressed bits per pixel in 1/16 bpp.
+    pub bpp_x16: u32,
+}
+
+/// dml2_core_dcn4.c's ip caps: pixels per line one DSC takes, the DSC input
+/// depth DML assumes, and DML_MAX_NUM_OF_SLICES_PER_DSC.
+const MAX_PIXELS_PER_DSC: u32 = 5760;
+const DSC_INPUT_BPC: u32 = 12;
+const MAX_SLICES_PER_DSC: u32 = 4;
+/// dcn4_soc_bb.h's DSCCLK table; DC never overrides it for DCN401.
+const MAX_DSCCLK_KHZ: u32 = 666_667;
+
+/// DML's math_round: floor(x + 0.5) through an int.
+fn round_f64(v: f64) -> f64 {
+    (v + 0.5) as i32 as f64
+}
+/// DML's math_ceil2(x, 1): (int)(x + 0.99999).
+fn ceil_f64(v: f64) -> f64 {
+    (v + 0.99999) as i32 as f64
+}
+
+/// dscceComputeDelay for a 4:4:4 (dml2_444) DP output: the DSC encoder's
+/// bit-stream construction delay in pixels.
+fn dscce_delay(bpc: u32, bpp: f64, slice_width: u32, slices: u32) -> u32 {
+    let mut ixd = round_f64(8192.0 / 2.0 / bpp / 1.0) as u32;
+    // dml2_444 counts slice width in pixel pairs, as Linux does.
+    let swm = slice_width / 2;
+    let padding = if swm % 3 != 0 {
+        (3 - swm % 3) * (ixd / swm)
+    } else {
+        0
+    };
+    if 3.0 * bpp >= f64::from(ixd.div_ceil(3)) * 3.0 && (ixd + padding) % 3 == 1 {
+        ixd += 1;
+    }
+    let ssm_priming = match bpc {
+        8 => 83,
+        10 => 91,
+        12 => 115,
+        14 => 123,
+        _ => 128,
+    };
+    let groups = swm.div_ceil(3);
+    let padded = 3 * groups - swm;
+    let lines_ixd = ixd / swm;
+    let groups_ixd = (ixd + padded * lines_ixd).div_ceil(3) + ssm_priming;
+    let lines = groups_ixd.div_ceil(groups);
+    let additional = u32::from((ixd - lines_ixd * swm) % 3 == 0);
+    let group_delay = lines * groups * (slices - 1) + groups_ixd + additional;
+    // Six cycles per group for dml2_444; SSM and OBSM pipeline delays.
+    (group_delay - 1) * 6 + 3 + 3
+}
+
+/// dscComputeDelay for 4:4:4: the DSC wrapper's fixed delay.
+const DSC_WRAPPER_DELAY: u32 = 2 + 16 * 3 + 3 + (1 + 4 * 3) + (3 + 3) + (3 + 3 * 3) + 1;
+
+/// DSCDelayRequirement with one DSC (ODM bypass), in pixels.
+fn dsc_delay(t: &Timing, dsc: Dsc) -> u32 {
+    let bpp = f64::from(dsc.bpp_x16) / 16.0;
+    let slice_width = ceil_f64(f64::from(t.h_active) / f64::from(dsc.slices)) as u32;
+    let core = dscce_delay(DSC_INPUT_BPC, bpp, slice_width, dsc.slices) + DSC_WRAPPER_DELAY;
+    let blank = f64::from(t.h_total - t.h_active);
+    let v = (f64::from(core) + blank * ceil_f64(f64::from(core) / f64::from(t.h_active))) as u32;
+    let pclk = f64::from(t.pixel_clock_khz) / 1000.0;
+    (f64::from(v) * pclk / pclk) as u32
 }
 
 /// Clocks the plan was computed for. DISPCLK, DPPREFCLK and the pipe's DPPCLK
@@ -403,6 +479,8 @@ struct Shape {
     vactive_bw: Fx,
     vblank: u32,
     ycbcr420: bool,
+    /// DSCDelayRequirement in pixels (0 without DSC).
+    dsc_delay: u32,
 }
 
 /// DPPCLK, DISPCLK and deep-sleep DCFCLK one evaluation runs the pipe at.
@@ -479,6 +557,27 @@ impl Shape {
         if mode.ycbcr420 && (t.h_active % 2 != 0 || t.h_active > FMT_420_BUFFER_WIDTH) {
             return Err(Error::Unsupported);
         }
+        // With DSC, ValidateODMMode in bypass (one DSC: at most 5760 pixels
+        // and four slices, dividing the line), the DSC unit/slice checks, and
+        // DSCCLKRequiredMoreThanSupported (a third of the pixel clock).
+        if let Some(dsc) = mode.dsc {
+            if dsc.bpp_x16 == 0 {
+                return Err(Error::Invalid);
+            }
+            if mode.ycbcr420
+                || dsc.slices == 0
+                || dsc.slices > MAX_SLICES_PER_DSC
+                || t.h_active > MAX_PIXELS_PER_DSC
+                || t.h_active % dsc.slices != 0
+            {
+                return Err(Error::Unsupported);
+            }
+            if f64::from(t.pixel_clock_khz) / 1000.0 / 3.0 / 1.0
+                > f64::from(MAX_DSCCLK_KHZ) / 1000.0
+            {
+                return Err(Error::PixelClock);
+            }
+        }
         let w = u64::from(t.h_active);
         let r = u64::from(REQUEST_PIXELS);
         let swath_ub = ceil_to(w, r).min(ceil_to(w - 1, r) + r) as u32;
@@ -495,6 +594,7 @@ impl Shape {
             ),
             vblank: t.v_total - t.v_active,
             ycbcr420: mode.ycbcr420,
+            dsc_delay: mode.dsc.map_or(0, |d| dsc_delay(&t, d)),
         })
     }
     /// `CalculateSwathAndDETConfiguration` support and `PitchSupport`.
@@ -611,7 +711,8 @@ impl Shape {
             fx(DPP_DELAY_CYCLES)
                 .times(self.pclk)
                 .over(dppclk)
-                .plus(fx(DISPCLK_DELAY_CYCLES).times(self.pclk).over(dispclk)),
+                .plus(fx(DISPCLK_DELAY_CYCLES).times(self.pclk).over(dispclk))
+                .plus(fx(i64::from(self.dsc_delay))),
         ) as u32;
         // CalculatePrefetchSchedule: one line after the scaler for a 4:2:0
         // output, then the pixel delay folded into lines.

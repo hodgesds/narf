@@ -1160,6 +1160,7 @@ pub fn mode(timing: Timing) -> dml::Mode {
         timing,
         pitch: (timing.h_active + 63) & !63,
         ycbcr420: false,
+        dsc: None,
     }
 }
 

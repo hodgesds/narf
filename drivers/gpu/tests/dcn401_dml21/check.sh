@@ -17,8 +17,17 @@
 #                                    2.0, which the DENTIST cannot produce
 #   <19 inputs> ! <Error> range      Linux plans a DLG/TTU value outside the
 #                                    field width it asserts (asserts are off)
+# dsc_vectors.txt lines are "<slices> <bpp_x16>" then a multi_vectors.txt
+# line, every stream compressed so (harness_multi.c with DSC set); "! REJECT"
+# asks only that Linux rejects. --generate-dsc rewrites it from the single-
+# and multi-stream inputs.
 set -euo pipefail
 here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+generate_dsc=0
+if [ "${1:-}" = --generate-dsc ]; then
+	generate_dsc=1
+	shift
+fi
 linux=${1:-/usr/src/linux}
 dml=$linux/drivers/gpu/drm/amd/display/dc/dml2_0/dml21
 work=$(mktemp -d)
@@ -44,6 +53,37 @@ others=$(ls "$work"/obj/*.o | grep -v '/dml2_core_dcn4_calcs\.o$')
 cc -O1 -w "${inc[@]}" "$here/harness.c" "$work/obj/dml2_core_dcn4_calcs.o" $others -lm -o "$work/plain"
 cc -O1 -w "${inc[@]}" "$here/harness.c" "$work/strict_calcs.o" $others -lm -o "$work/strict"
 cc -O1 -w "${inc[@]}" "$here/harness_multi.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_multi"
+
+if [ $generate_dsc -eq 1 ]; then
+	echo "# Linux DML21 reference vectors for amdgpu_dcn401_dml.rs with DSC; see check.sh."
+	# Every single- and multi-stream input, as multi-stream lines, with a
+	# cycle of slice counts (including counts one DSC cannot take) and
+	# compressed bpps.
+	{
+		grep -v '^#' "$here/vectors.txt" | awk '{
+			printf "%s %s %s %s %s %s %s %s %s 1", $10, $11, $12, $13, $14, $15, $16, $17, $18
+			printf " %s %s %s %s %s %s %s %s %s %s\n", $1, $2, $3, $4, $5, $6, $7, $8, $9, $19 }'
+		grep -v '^#' "$here/multi_vectors.txt" | sed 's/ [=!].*//'
+	} | awk 'BEGIN { split("1 2 4 3 8 1 2 4", sl); split("128 192 256 160 96 200 144 120 240", bpp) }
+		{ print sl[NR % 8 + 1], bpp[NR % 9 + 1], $0 }' | while read -r sl bp line; do
+		read -ra a <<< "$line"
+		out=$(DSC="$sl $bp" "$work/strict_multi" "${a[@]:0:9}" "${a[@]:10}")
+		# A plan whose DLG/TTU/watermark value overflows its register field
+		# (Linux only asserts) is the port's Register rejection.
+		if [ "${out%% *}" = PLAN ] && echo "${out#PLAN }" | awk '
+			BEGIN { n = split("13 8192 14 32768 15 262144 16 2097152 17 8192 18 8 19 256 20 128 21 64 22 2097152 23 4194304 24 4194304 25 8192 26 8192 31 16384 32 16777216 33 16 34 8388608 35 8388608 36 16 38 16384 39 65536 40 65536 41 65536 42 65536 43 65536 44 16384 45 16384 46 16384 47 1024 48 1024 49 1024 55 4096 57 134217728", l)
+				for (i = 1; i < n; i += 2) lim[l[i]] = l[i + 1] }
+			{ gsub(/\|/, ""); for (i = 1; i <= NF; i++) if (((i - 1) % 62) in lim && $i + 0 >= lim[(i - 1) % 62] + 0) bad = 1 }
+			END { exit !bad }'; then
+			echo "$sl $bp $line ! Register"
+		elif [ "${out%% *}" = PLAN ]; then
+			echo "$sl $bp $line = ${out#PLAN }"
+		else
+			echo "$sl $bp $line ! REJECT"
+		fi
+	done
+	exit 0
+fi
 
 tolerated=" 3 47 48 49 "
 pass=0 fail=0
@@ -86,14 +126,21 @@ echo "dcn401 DML21 vectors: $pass passed, $fail failed"
 
 # check_multi <file> [env...]: multi-stream vectors with harness_multi.
 check_multi() {
-	local file=$1 pass=0 fail=0
+	local file=$1 pass=0 fail=0 dsc=
 	shift
 	while read -r line; do
 		case $line in ''|'#'*) continue ;; esac
 		read -ra f <<< "$line"
+		if [ "${1:-}" = DSC ]; then
+			dsc="${f[0]} ${f[1]}" f=("${f[@]:2}")
+		fi
 		n=${f[9]} count=$((10 + 10 * f[9]))
 		inputs=("${f[@]:0:count}") kind=${f[count]} rest=("${f[@]:count+1}")
-		strict=$(env "$@" "$work/strict_multi" "${inputs[@]:0:9}" "${inputs[@]:10}")
+		if [ -n "$dsc" ]; then
+			strict=$(DSC="$dsc" "$work/strict_multi" "${inputs[@]:0:9}" "${inputs[@]:10}")
+		else
+			strict=$(env "$@" "$work/strict_multi" "${inputs[@]:0:9}" "${inputs[@]:10}")
+		fi
 		ok=1
 		if [ "$kind" = "=" ]; then
 			read -ra got <<< "${strict#PLAN }"
@@ -109,6 +156,8 @@ check_multi() {
 					fi
 				done
 			fi
+		elif [ "${rest[0]:-}" = Register ]; then
+			[ "${strict%% *}" = PLAN ] || ok=0
 		else
 			[ "$strict" = REJECT ] || ok=0
 		fi
@@ -126,4 +175,5 @@ check_multi() {
 mfail=0
 check_multi "$here/multi_vectors.txt" || mfail=1
 check_multi "$here/ycbcr420_vectors.txt" FMT420=1 || mfail=1
+check_multi "$here/dsc_vectors.txt" DSC || mfail=1
 [ $fail -eq 0 ] && [ $mfail -eq 0 ]

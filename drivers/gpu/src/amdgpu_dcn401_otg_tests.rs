@@ -1168,6 +1168,7 @@ fn dcn401_admission_inputs_read_live_dchub_timer_and_capped_levels() -> TestResu
         },
         pitch: 1920,
         ycbcr420: false,
+        dsc: None,
     };
     if dml::admit(&soc, &mode).map(|p| p.clocks.dispclk_khz) != Ok(151_260) {
         return TestResult::Fail("live inputs do not reproduce the reference plan");
