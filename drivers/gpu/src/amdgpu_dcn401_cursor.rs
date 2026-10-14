@@ -338,6 +338,8 @@ impl Otg {
         image: (u32, u32, &[u32]),
         position: (i32, i32),
     ) -> Result<CursorApplied, Error> {
+        // Display k scans out on pipe k: address that display's records.
+        self.0.select_display(pipe)?;
         let config = gmc.display_context(self.0.io.0).map_err(Error::Memory)?;
         self.1
             .set_cursor(&mut self.0, pool, config, pipe, image, position)
@@ -350,6 +352,8 @@ impl Otg {
         pipe: u8,
         position: (i32, i32),
     ) -> Result<CursorApplied, Error> {
+        // Display k scans out on pipe k: address that display's records.
+        self.0.select_display(pipe)?;
         self.1.move_cursor(&mut self.0, pipe, position)
     }
 }

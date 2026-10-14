@@ -1136,6 +1136,12 @@ impl ColdBoot {
         &mut self,
         mode: &crate::amdgpu_dcn401_dml::Mode,
     ) -> Result<crate::amdgpu_dcn401_dml::Plan, otg::Error> {
+        let soc = self.display_soc()?;
+        crate::amdgpu_dcn401_dml::admit(&soc, mode).map_err(otg::Error::Admission)
+    }
+    /// The board inputs of display admission: the PMFW DPM levels the clock
+    /// owner published, the DENTIST VCO and the DCHUB reference.
+    pub fn display_soc(&mut self) -> Result<crate::amdgpu_dcn401_dml::Soc, otg::Error> {
         let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
         let levels = self
             .clocks
@@ -1150,12 +1156,10 @@ impl ColdBoot {
             .map_err(|e| otg::Error::PipeClocks(*e))?
             .dentist_vco_khz()
             .map_err(otg::Error::PipeClocks)?;
-        let soc = self
-            .otg
+        self.otg
             .as_mut()
             .map_err(|e| *e)?
-            .admission_soc(&levels, vco, crystal)?;
-        crate::amdgpu_dcn401_dml::admit(&soc, mode).map_err(otg::Error::Admission)
+            .admission_soc(&levels, vco, crystal)
     }
     /// Program an admitted plan's deadlines and watermarks for the staged pipe.
     /// The plan is re-admitted and bound to the current owners first.

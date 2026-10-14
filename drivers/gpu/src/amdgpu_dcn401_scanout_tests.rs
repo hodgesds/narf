@@ -347,7 +347,10 @@ kernel_test_in!(
 fn dcn401_scanout_framebuffer_requires_live_owned_scanout() -> TestResult {
     let e = staged(0);
     let surfaces = Surfaces::new();
-    if !matches!(surfaces.scanout_framebuffer(&e, 0), Err(Error::Invalid)) {
+    if !matches!(
+        surfaces.scanout_framebuffer(&e.status, 0),
+        Err(Error::Invalid)
+    ) {
         return TestResult::Fail("framebuffer without scanout");
     }
     TestResult::Pass

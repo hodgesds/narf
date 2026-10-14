@@ -122,7 +122,12 @@ impl<I: Io> Engine<I> {
         bit(pipe) | self.displays.siblings.det
     }
     fn verify_requestor_with(&mut self, pipe: u8, tolerated: u32) -> Result<(), Error> {
-        if self.crb_stable()? != allocation(self.det_pipes(pipe)) {
+        // This pipe's and every other display's DET must stand. A display
+        // that left while this one ran keeps its (unused) allocation until
+        // the next configuration repartitions, and compbuf is unused.
+        let sizes = self.crb_stable()?;
+        let want = allocation(self.det_pipes(pipe));
+        if (1..5).any(|i| want[i] != 0 && sizes[i] != want[i]) {
             return Err(Error::Busy);
         }
         let reserved = self.layout.base + 0x4c4 * 4;

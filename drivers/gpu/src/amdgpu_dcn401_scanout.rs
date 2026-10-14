@@ -714,13 +714,13 @@ impl<I: Io> Engine<I> {
 impl Surfaces {
     /// CPU view of the live scanout: bus-physical BAR address of the owned
     /// surface, its visible size and byte pitch, for console adoption.
-    pub(in crate::amdgpu_dcn401_otg) fn scanout_framebuffer<I: Io>(
+    pub(in crate::amdgpu_dcn401_otg) fn scanout_framebuffer(
         &self,
-        e: &Engine<I>,
+        status: &Status,
         pipe: u8,
     ) -> Result<GenericFb, Error> {
-        let running = e.status.scanout.ok_or(Error::Invalid)?;
-        if e.status.state != State::ScanoutRunning(pipe) || running.pipe != pipe {
+        let running = status.scanout.ok_or(Error::Invalid)?;
+        if status.state != State::ScanoutRunning(pipe) || running.pipe != pipe {
             return Err(Error::Busy);
         }
         let surface = self
@@ -759,6 +759,8 @@ impl Otg {
         pipe: u8,
         crystal_khz: u32,
     ) -> Result<ScanoutRunning, Error> {
+        // Display k scans out on pipe k: address that display's records.
+        self.0.select_display(pipe)?;
         let regs = self.0.io.0;
         self.1
             .start_scanout(&mut self.0, pipe, crystal_khz, || {
@@ -783,6 +785,8 @@ impl Otg {
         pipe: u8,
         crystal_khz: u32,
     ) -> Result<u32, Error> {
+        // Display k scans out on pipe k: address that display's records.
+        self.0.select_display(pipe)?;
         let regs = self.0.io.0;
         self.1
             .check_scanout(&mut self.0, pipe, crystal_khz, || {
@@ -796,12 +800,18 @@ impl Otg {
     }
     /// The live scanout as a CPU framebuffer for console adoption.
     pub fn scanout_framebuffer(&self, pipe: u8) -> Result<GenericFb, Error> {
-        self.1.scanout_framebuffer(&self.0, pipe)
+        // Display k scans out on pipe k: read that display's records.
+        let status = self.display_status(pipe).ok_or(Error::Invalid)?;
+        self.1.scanout_framebuffer(&status, pipe)
     }
     /// Make CPU writes to the live surface visible to display fetch: the
     /// native HDP flush used by staged uploads.
     pub fn flush_scanout_writes(&mut self) -> Result<(), Error> {
-        if !matches!(self.0.status.state, State::ScanoutRunning(_)) {
+        let live = (0..4).any(|d| {
+            self.display_status(d)
+                .is_some_and(|s| matches!(s.state, State::ScanoutRunning(_)))
+        });
+        if !live {
             return Err(Error::Busy);
         }
         self.0.flush_surface_writes()
@@ -819,6 +829,8 @@ impl Otg {
         pipe: u8,
         crystal_khz: u32,
     ) -> Result<(), Error> {
+        // Display k scans out on pipe k: address that display's records.
+        self.0.select_display(pipe)?;
         let regs = self.0.io.0;
         self.1
             .stop_scanout(&mut self.0, pipe, crystal_khz, || {

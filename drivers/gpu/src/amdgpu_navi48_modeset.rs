@@ -1,9 +1,12 @@
-//! Orchestrated native Navi48 modeset on one legacy DP SST or TMDS HDMI
-//! connector: choose the first answering DisplayPort sink (else the first HDMI
-//! sink) and its EDID preferred mode, admit it,
-//! then run the retained owners' preparations in their dependency order and
-//! make the uploaded surface visible. Inherited (GOP) consumers must already
-//! be retired; the clock owners refuse otherwise.
+//! Orchestrated native Navi48 modeset on legacy DP SST and TMDS HDMI
+//! connectors: one display (the first answering DisplayPort sink, else the
+//! first HDMI sink), or every lightable sink as one configuration of up to
+//! four displays, display k on pipe k. Each sink takes its EDID preferred
+//! (or a requested) mode; the configuration is admitted jointly, its clocks
+//! programmed once, then each display runs the retained owners' preparations
+//! in their dependency order in its own records and its uploaded surface is
+//! made visible. Inherited (GOP) consumers must already be retired; the
+//! clock owners refuse otherwise.
 use super::*;
 use crate::amdgpu_dcn401_dml as dml;
 use crate::amdgpu_dml::Timing;
@@ -174,6 +177,24 @@ pub struct Modeset {
 
 /// Modes offered per sink.
 pub const MAX_MODES: usize = 16;
+
+/// What `modeset_displays` lit: display k on pipe k, and the failure that
+/// stopped lighting early, if one did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Configuration {
+    pub displays: Vec<Modeset>,
+    pub failed: Option<ModesetError>,
+}
+
+/// A selected sink's whole scanned EDID (extensions included).
+fn edid_of(ports: &[display::Port], paths: &[inventory::Path], s: &Selection) -> Vec<u8> {
+    ports
+        .iter()
+        .find(|p| paths.get(s.port) == Some(&p.path))
+        .and_then(|p| p.sink.as_ref().ok())
+        .map(|sink| sink.edid.clone())
+        .unwrap_or_default()
+}
 
 /// The sink's modes the DCN timing model accepts, in Linux's
 /// drm_edid_connector_add_modes order without duplicates: detailed timings
@@ -472,13 +493,31 @@ pub fn select(
     max_bpc: u8,
     want: Option<Timing>,
 ) -> Result<Selection, ModesetError> {
+    Ok(select_all(paths, ports, max_bpc, &|_| want)?[0])
+}
+
+/// Displays one configuration lights at most: one per pipe.
+pub const MAX_DISPLAYS: usize = 4;
+
+/// Every lightable sink, as `select` judges each: the DP ports in board
+/// order, then the HDMI ports, at most `MAX_DISPLAYS`. `want(port)` is the
+/// timing asked of that port's sink, used where the sink lists and fits it.
+/// Empty is an error: `Link` when some sink's mode could not be carried.
+pub fn select_all(
+    paths: &[inventory::Path],
+    ports: &[display::Port],
+    max_bpc: u8,
+    want: &dyn Fn(usize) -> Option<Timing>,
+) -> Result<Vec<Selection>, ModesetError> {
     // The requested mode where the sink lists it and it fits, else the
     // preferred one.
-    let pick = |edid: &[u8], fits: &dyn Fn(&Timing) -> bool| {
-        want.filter(|w| edid_timings(edid).contains(w) && fits(w))
+    let pick = |index: usize, edid: &[u8], fits: &dyn Fn(&Timing) -> bool| {
+        want(index)
+            .filter(|w| edid_timings(edid).contains(w) && fits(w))
             .or_else(|| preferred(edid))
     };
     let mut link_short = false;
+    let mut out = Vec::new();
     for port in ports {
         if port.path.connector != inventory::Connector::DisplayPort {
             continue;
@@ -487,10 +526,10 @@ pub fn select(
         let Some((lanes, rate)) = sink.dpcd.as_ref().and_then(|d| max_link(d, sink.lttpr)) else {
             continue;
         };
-        let Some(timing) = pick(&sink.edid, &|t| link_fits(t, lanes, rate)) else {
+        let Some(index) = paths.iter().position(|p| *p == port.path) else {
             continue;
         };
-        let Some(index) = paths.iter().position(|p| *p == port.path) else {
+        let Some(timing) = pick(index, &sink.edid, &|t| link_fits(t, lanes, rate)) else {
             continue;
         };
         let Some(edid) = sink.edid.get(..128).and_then(|b| b.try_into().ok()) else {
@@ -500,7 +539,7 @@ pub fn select(
             link_short = true;
             continue;
         }
-        return Ok(Selection {
+        out.push(Selection {
             port: index,
             timing,
             lanes,
@@ -523,12 +562,12 @@ pub fn select(
         if !caps.hdmi {
             continue;
         }
-        let Some(timing) = pick(&sink.edid, &|t| {
-            hdmi_depth(caps, t.pixel_clock_khz, max_bpc).is_some()
-        }) else {
+        let Some(index) = paths.iter().position(|p| *p == port.path) else {
             continue;
         };
-        let Some(index) = paths.iter().position(|p| *p == port.path) else {
+        let Some(timing) = pick(index, &sink.edid, &|t| {
+            hdmi_depth(caps, t.pixel_clock_khz, max_bpc).is_some()
+        }) else {
             continue;
         };
         let Some(edid) = sink.edid.get(..128).and_then(|b| b.try_into().ok()) else {
@@ -538,7 +577,7 @@ pub fn select(
             link_short = true;
             continue;
         };
-        return Ok(Selection {
+        out.push(Selection {
             port: index,
             timing,
             lanes: 0,
@@ -552,11 +591,35 @@ pub fn select(
             limited: false,
         });
     }
-    Err(if link_short {
-        ModesetError::Link
-    } else {
-        ModesetError::NoSink
-    })
+    out.truncate(MAX_DISPLAYS);
+    if out.is_empty() {
+        return Err(if link_short {
+            ModesetError::Link
+        } else {
+            ModesetError::NoSink
+        });
+    }
+    Ok(out)
+}
+
+/// The largest leading run of `selections` the display pipeline can scan
+/// out together, with its plans: Linux refuses a commit DML rejects, but
+/// lighting a configuration as a whole, the displays that do not fit stay
+/// dark instead (the last ones, so the first display stays the one `select`
+/// picks). The error is the first display's alone.
+pub fn admit_displays(
+    soc: &dml::Soc,
+    selections: &[Selection],
+) -> Result<Vec<dml::Plan>, dml::Error> {
+    let modes: Vec<dml::Mode> = selections.iter().map(|s| mode(s.timing)).collect();
+    let mut n = modes.len().min(MAX_DISPLAYS);
+    loop {
+        match dml::admit_all(soc, &modes[..n]) {
+            Ok(plans) => return Ok(plans),
+            Err(e) if n <= 1 => return Err(e),
+            Err(_) => n -= 1,
+        }
+    }
 }
 
 /// Link settings to try, best first: drop the rate; below RBR halve the lanes
@@ -723,10 +786,11 @@ impl ColdBoot {
     /// Light the first answering DP SST sink at its preferred mode on `pipe`,
     /// with `fill(y, row)` supplying each visible row before fetch starts.
     /// # Safety
-    /// Inherited display consumers must be retired. Exclude firmware/FAMS and
-    /// concurrent display/hub/VM/IRQ/clock/reset/power/link writers; retain
-    /// every owner and allocation on every outcome, including cancellation.
-    /// A failure leaves the owners where they stopped; nothing is unwound.
+    /// Inherited display consumers must be retired and every display of
+    /// this owner stopped. Exclude firmware/FAMS and concurrent
+    /// display/hub/VM/IRQ/clock/reset/power/link writers; retain every owner
+    /// and allocation on every outcome, including cancellation. A failure
+    /// leaves the owners where they stopped; nothing is unwound.
     pub async unsafe fn modeset_display(
         &mut self,
         pipe: u8,
@@ -737,7 +801,7 @@ impl ColdBoot {
     }
     /// `modeset_display` in `want` when the selected sink lists that timing
     /// and it fits (one of a previous `Modeset::modes`), else the preferred
-    /// mode.
+    /// mode. One display only, on `pipe` (its display slot too).
     /// # Safety
     /// As for `modeset_display`.
     pub async unsafe fn modeset_display_mode(
@@ -750,20 +814,84 @@ impl ColdBoot {
             return Err(ModesetError::Display(otg::Error::Invalid));
         }
         let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
-        let paths = self.display_paths().map_err(|_| ModesetError::NoSink)?;
-        let mut selection = select(paths, &ports, max_bpc(), want)?;
+        let paths = self
+            .display_paths()
+            .map_err(|_| ModesetError::NoSink)?
+            .to_vec();
+        let mut selection = select(&paths, &ports, max_bpc(), want)?;
         selection.limited = limited_range(broadcast_rgb());
-        let full_edid = ports
-            .iter()
-            .find(|p| paths.get(selection.port) == Some(&p.path))
-            .and_then(|p| p.sink.as_ref().ok())
-            .map(|sink| sink.edid.clone())
-            .unwrap_or_default();
-        let mode = mode(selection.timing);
-        // The first clock request starts PMFW and publishes the DPM levels
-        // admission needs; requests are clamped up to each clock's minimum.
+        self.select_display(pipe)?;
+        let soc = self.prepare_configuration(&[selection]).await?;
+        let plans = admit_displays(&soc, &[selection]).map_err(otg::Error::Admission)?;
+        self.prepare_pipes(&[selection], &plans, pipe).await?;
+        // SAFETY: the caller's obligations.
+        let mut lit =
+            unsafe { self.light(pipe, selection, plans[0], &mut |_, y, row| fill(y, row)) }.await?;
+        lit.modes = self.offered_modes(&soc, &[lit], 0, &edid_of(&ports, &paths, &selection));
+        Ok(lit)
+    }
+    /// Light every lightable sink (`select_all`), display k on pipe k, as
+    /// one configuration: the largest leading set the pipeline admits
+    /// together (`admit_displays`), its clocks programmed once for all of
+    /// them, then each display through the same steps as one display alone,
+    /// next to the ones already lit. `fill(display, y, row)` supplies each
+    /// visible row before that display's fetch starts. Displays left over
+    /// stay dark. If a display fails to light, the ones before it stay lit
+    /// and are returned with the failure.
+    /// # Safety
+    /// As for `modeset_display`: every display of this owner stopped.
+    pub async unsafe fn modeset_displays(
+        &mut self,
+        mut fill: impl FnMut(u8, u32, &mut [u32]),
+        want: impl Fn(usize) -> Option<Timing>,
+    ) -> Result<Configuration, ModesetError> {
+        let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
+        let paths = self
+            .display_paths()
+            .map_err(|_| ModesetError::NoSink)?
+            .to_vec();
+        let mut selections = select_all(&paths, &ports, max_bpc(), &want)?;
+        let limited = limited_range(broadcast_rgb());
+        for s in &mut selections {
+            s.limited = limited;
+        }
+        self.select_display(0)?;
+        let soc = self.prepare_configuration(&selections).await?;
+        let plans = admit_displays(&soc, &selections).map_err(otg::Error::Admission)?;
+        selections.truncate(plans.len());
+        self.prepare_pipes(&selections, &plans, 0).await?;
+        let mut lit = Vec::with_capacity(selections.len());
+        let mut failed = None;
+        for (k, (selection, plan)) in selections.iter().zip(&plans).enumerate() {
+            // SAFETY: the caller's obligations; every earlier display is lit
+            // in its own slot and left to it by each step.
+            match unsafe { self.light(k as u8, *selection, *plan, &mut fill) }.await {
+                Ok(m) => lit.push(m),
+                Err(e) if lit.is_empty() => return Err(e),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        for k in 0..lit.len() {
+            let edid = edid_of(&ports, &paths, &lit[k].selection);
+            lit[k].modes = self.offered_modes(&soc, &lit, k, &edid);
+        }
+        Ok(Configuration {
+            displays: lit,
+            failed,
+        })
+    }
+    /// Start PMFW at the clock floor (which publishes the DPM levels
+    /// admission needs) and return the board's admission inputs.
+    async fn prepare_configuration(
+        &mut self,
+        selections: &[Selection],
+    ) -> Result<dml::Soc, ModesetError> {
+        // Requests are clamped up to each clock's minimum.
         let floor = clocks::Request {
-            displays: 1,
+            displays: selections.len().clamp(1, MAX_DISPLAYS) as u8,
             display_khz: 1,
             dpp_khz: 1,
             dtb_khz: 1,
@@ -771,13 +899,43 @@ impl ColdBoot {
         self.prepare_display_clocks(floor)
             .await
             .map_err(ModesetError::Clocks)?;
-        let plan = self.display_admission(&mode)?;
-        self.prepare_display_clocks(clock_request(&plan))
+        Ok(self.display_soc()?)
+    }
+    /// The configuration's global clocks (one DISPCLK/DPPREFCLK for every
+    /// plan), then each display's pipe clocks, display k on pipe `first + k`,
+    /// all while every display is stopped.
+    async fn prepare_pipes(
+        &mut self,
+        selections: &[Selection],
+        plans: &[dml::Plan],
+        first: u8,
+    ) -> Result<(), ModesetError> {
+        let mut request = clock_request(&plans[0]);
+        request.displays = plans.len() as u8;
+        self.prepare_display_clocks(request)
             .await
             .map_err(ModesetError::Clocks)?;
-        self.prepare_display_pipe_clocks(pipe_clock_request(pipe, &plan, selection.hdmi))
-            .await
-            .map_err(ModesetError::PipeClocks)?;
+        for (k, (s, plan)) in selections.iter().zip(plans).enumerate() {
+            self.prepare_display_pipe_clocks(pipe_clock_request(first + k as u8, plan, s.hdmi))
+                .await
+                .map_err(ModesetError::PipeClocks)?;
+        }
+        Ok(())
+    }
+    /// Light one admitted display on `pipe` (its display slot too), with its
+    /// clocks prepared: surface, timing, OPP, DPP, MPC, requestor and
+    /// deadlines, then its link, video and scanout.
+    /// # Safety
+    /// As for `modeset_display`, except that other displays of this owner
+    /// may be lit in their own slots.
+    async unsafe fn light(
+        &mut self,
+        pipe: u8,
+        selection: Selection,
+        plan: dml::Plan,
+        fill: &mut impl FnMut(u8, u32, &mut [u32]),
+    ) -> Result<Modeset, ModesetError> {
+        self.select_display(pipe)?;
         let (width, height) = (selection.timing.h_active, selection.timing.v_active);
         // SAFETY: the caller's exclusion and retention obligations cover each
         // retained owner below; every step validates its own preconditions.
@@ -793,7 +951,7 @@ impl ColdBoot {
             .await?;
             let mut row = alloc::vec![0u32; width as usize];
             for y in 0..height {
-                fill(y, &mut row);
+                fill(pipe, y, &mut row);
                 self.upload_display_surface(pipe, 0, y, &row)?;
             }
             self.prepare_display_memory(pipe).await?;
@@ -816,23 +974,31 @@ impl ColdBoot {
                 Err(e) => return Err(e.into()),
             }
             let (selection, scanout) = self.start_link(selection, pipe).await?;
-            let modes = self.offered_modes(&selection, &full_edid);
             Ok(Modeset {
                 selection,
                 pipe,
                 plan,
                 scanout,
-                modes,
+                modes: [None; MAX_MODES],
             })
         }
     }
-    /// The sink's timings a later modeset could switch to: they fit the link
-    /// the selection trained (DP) or a TMDS depth (HDMI) and DML admits them
-    /// at the current clock levels. The running timing is always included.
-    fn offered_modes(&mut self, s: &Selection, edid: &[u8]) -> [Option<Timing>; MAX_MODES] {
+    /// The timings of display `k`'s sink a later configuration could switch
+    /// it to: they fit the link it trained (DP) or a TMDS depth (HDMI) and
+    /// DML admits them together with the other lit displays' running modes.
+    /// The running timing is always included.
+    fn offered_modes(
+        &mut self,
+        soc: &dml::Soc,
+        lit: &[Modeset],
+        k: usize,
+        edid: &[u8],
+    ) -> [Option<Timing>; MAX_MODES] {
+        let s = lit[k].selection;
         let caps = hdmi_caps(edid);
         let mut modes = [None; MAX_MODES];
         let mut n = 0;
+        let mut joint: Vec<dml::Mode> = lit.iter().map(|m| mode(m.selection.timing)).collect();
         for t in edid_timings(edid) {
             if n == MAX_MODES {
                 break;
@@ -842,7 +1008,8 @@ impl ColdBoot {
             } else {
                 link_fits(&t, s.lanes, s.rate)
             };
-            if t == s.timing || (fits && self.display_admission(&mode(t)).is_ok()) {
+            joint[k] = mode(t);
+            if t == s.timing || (fits && dml::admit_all(soc, &joint).is_ok()) {
                 modes[n] = Some(t);
                 n += 1;
             }
@@ -925,6 +1092,8 @@ impl ColdBoot {
     /// # Safety
     /// As for `modeset_display`; exclude other AUX users of the port.
     pub async unsafe fn check_modeset(&mut self, m: &Modeset) -> Result<Health, ModesetError> {
+        // Display k runs on pipe k, in its own records.
+        self.select_display(m.pipe)?;
         let port = m.selection.port;
         if !self.display_hpd(port)? {
             return Ok(Health::Unplugged);
@@ -947,6 +1116,8 @@ impl ColdBoot {
     /// # Safety
     /// As for `modeset_display`; stop every CPU writer of the surface first.
     pub async unsafe fn retrain_modeset(&mut self, m: &mut Modeset) -> Result<(), ModesetError> {
+        // Display k runs on pipe k, in its own records.
+        self.select_display(m.pipe)?;
         let port = m.selection.port;
         if m.selection.hdmi {
             return Err(ModesetError::Display(otg::Error::Unsupported));
@@ -966,6 +1137,8 @@ impl ColdBoot {
     /// # Safety
     /// As for `stop_modeset`.
     pub async unsafe fn unplug_modeset(&mut self, m: &Modeset) -> Result<(), ModesetError> {
+        // Display k runs on pipe k, in its own records.
+        self.select_display(m.pipe)?;
         let port = m.selection.port;
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
@@ -991,6 +1164,8 @@ impl ColdBoot {
     /// # Safety
     /// As for `modeset_display`; stop every CPU writer of the surface first.
     pub async unsafe fn stop_modeset(&mut self, m: &Modeset) -> Result<(), ModesetError> {
+        // Display k runs on pipe k, in its own records.
+        self.select_display(m.pipe)?;
         let port = m.selection.port;
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {

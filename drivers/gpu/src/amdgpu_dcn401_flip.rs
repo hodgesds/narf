@@ -266,6 +266,8 @@ impl Otg {
         gmc: &mut Gmc,
         pipe: u8,
     ) -> Result<u64, Error> {
+        // Display k scans out on pipe k: address that display's records.
+        self.0.select_display(pipe)?;
         let config = gmc.display_context(self.0.io.0).map_err(Error::Memory)?;
         self.1.prepare_back(&mut self.0, pool, pipe, config).await
     }
@@ -284,6 +286,8 @@ impl Otg {
         y: u32,
         pixels: &[u32],
     ) -> Result<(), Error> {
+        // Display k scans out on pipe k: address that display's records.
+        self.0.select_display(pipe)?;
         self.1.upload_back(&mut self.0, pipe, x, y, pixels)
     }
     /// Flip a live scanout to its back buffer at the next VUPDATE.
@@ -299,6 +303,8 @@ impl Otg {
         pipe: u8,
         crystal_khz: u32,
     ) -> Result<FlipDone, Error> {
+        // Display k scans out on pipe k: address that display's records.
+        self.0.select_display(pipe)?;
         let regs = self.0.io.0;
         self.1
             .flip(&mut self.0, pipe, crystal_khz, || {

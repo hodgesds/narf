@@ -370,10 +370,18 @@ fn dcn401_requestor_shares_the_crb_with_other_displays() -> TestResult {
         if a.compbuf_bytes != u32::from(want[0]) * 65536 || e.verify_requestor(p).is_err() {
             return TestResult::Fail("compressed buffer record");
         }
-        // The partition is the displays' together: forgetting one is a mismatch.
+        // A display that left keeps its unused DET: this pipe still checks.
         e.displays.siblings.det = 0;
+        if e.verify_requestor(p).is_err() {
+            return TestResult::Fail("a departed display's DET blocks this pipe");
+        }
+        // Another display's DET taken away is a mismatch.
+        e.displays.siblings.det = 1 << 1;
+        let at = crb(2);
+        let v = e.io.fake().regs[&at];
+        e.io.fake().regs.insert(at, v & !0x1f1f);
         if e.verify_requestor(p) != Err(Error::Busy) {
-            return TestResult::Fail("partition verified without its displays");
+            return TestResult::Fail("missing DET of another display verified");
         }
     }
     TestResult::Pass

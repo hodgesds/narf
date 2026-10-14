@@ -654,3 +654,92 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_bounds_the_link_by_a_repeater_chain
 );
+
+/// Every lightable sink becomes a display: DP ports in board order, then
+/// HDMI, each with its own wanted mode, at most four; a configuration the
+/// pipeline cannot carry drops displays from the end.
+fn navi48_modeset_selects_every_sink_and_admits_what_fits() -> TestResult {
+    use inventory::Connector::{DisplayPort as Dp, HdmiTypeA as Hdmi};
+    let paths = [
+        path(Hdmi, 0),
+        path(Dp, 1),
+        path(Hdmi, 2),
+        path(Dp, 3),
+        path(Dp, 4),
+        path(Dp, 5),
+    ];
+    let ports = [
+        port(paths[0], None, edid_three_modes(true)),
+        port(paths[1], dpcd(0x14, 4), edid_1080p()),
+        // A DVI sink on an HDMI connector is not lit at all.
+        port(paths[2], None, with_cta(edid_1080p(), false)),
+        port(paths[3], dpcd(0x14, 4), edid_three_modes(false)),
+        display::Port {
+            path: paths[4],
+            sink: Err(display::Error::InvalidDpcd),
+        },
+        port(paths[5], dpcd(0x14, 4), edid_1080p()),
+    ];
+    let wanted = edid_timings(&edid_three_modes(false))[1];
+    let Ok(all) = select_all(&paths, &ports, 8, &|port| (port == 3).then_some(wanted)) else {
+        return TestResult::Fail("no selection");
+    };
+    let order: Vec<(usize, bool)> = all.iter().map(|s| (s.port, s.hdmi)).collect();
+    if order != [(1, false), (3, false), (5, false), (0, true)] {
+        return TestResult::Fail("display order");
+    }
+    // Only port 3 was asked for another mode; the others take their preferred.
+    if all[1].timing != wanted || all[0].timing.h_active != 1920 || all[3].timing == wanted {
+        return TestResult::Fail("per-port wanted mode");
+    }
+    if select(&paths, &ports, 8, None).map(|s| s.port) != Ok(1) {
+        return TestResult::Fail("one display is the first of all");
+    }
+    // A fifth sink stays dark.
+    let mut more = ports.to_vec();
+    more.push(port(path(Dp, 6), dpcd(0x14, 4), edid_1080p()));
+    let mut paths6 = paths.to_vec();
+    paths6.push(path(Dp, 6));
+    if select_all(&paths6, &more, 8, &|_| None).map(|a| a.len()) != Ok(MAX_DISPLAYS) {
+        return TestResult::Fail("more than four displays");
+    }
+    // A slow board carries 1080p60 but not 2160p120 beside it: the second
+    // display stays dark; alone, the 2160p120 one is refused outright.
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 456_000,
+        fclk_khz: [300_000, 800_000],
+        dcfclk_khz: [200_000, 600_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 1_000_000,
+        dppclk_max_khz: 1_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let mut fast = all[0];
+    fast.timing = Timing {
+        pixel_clock_khz: 1_188_000,
+        h_active: 3840,
+        h_total: 4400,
+        h_front_porch: 176,
+        h_sync_width: 88,
+        v_active: 2160,
+        v_total: 2250,
+        v_front_porch: 8,
+        v_sync_width: 10,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    };
+    match admit_displays(&soc, &[all[0], fast]) {
+        Ok(plans) if plans.len() == 1 && plans[0].mode == mode(all[0].timing) => {}
+        _ => return TestResult::Fail("configuration not cut to what fits"),
+    }
+    if admit_displays(&soc, &[fast, all[0]]).is_ok() {
+        return TestResult::Fail("first display beyond the board admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_selects_every_sink_and_admits_what_fits
+);
