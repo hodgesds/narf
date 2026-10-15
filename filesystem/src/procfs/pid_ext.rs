@@ -139,7 +139,7 @@ impl FileOps for PidExtFile {
             && readiness & (crate::POLL_PRI | crate::POLL_ERR) != 0
         {
             // `proc_mounts_poll()`'s namespace sequence is per open file.
-            // Only the epoll instance that returned this event advances its
+            // The poll or epoll instance that returns this event advances its
             // cursor; a parent epoll merely querying a nested monitor must
             // leave the edge available for the monitor to drain.
             self.mountinfo_generation

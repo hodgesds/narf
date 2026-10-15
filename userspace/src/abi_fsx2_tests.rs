@@ -158,6 +158,69 @@ kernel_test_in!(
     smoke_abi_fsx2_proc_mountinfo_pollpri_after_mount_change
 );
 
+// A GLib mount monitor uses ppoll(POLLPRI) rather than epoll. Linux retires
+// mountinfo's per-open namespace-change edge once that poll returns it; a
+// permanent edge makes GLib issue zero-timeout polls and rescan the table in a
+// tight loop.
+fn smoke_abi_fsx2_proc_mountinfo_ppoll_retires_change_edge() -> TestResult {
+    with_setup(|| {
+        let path = b"/proc/self/mountinfo\0";
+        let fstype = b"tmpfs\0";
+        let target = b"/abi-mountinfo-ppoll-edge\0";
+        let _mountinfo_hook = narf_filesystem::procfs::MountinfoHookGuard::install(
+            crate::handlers::proc_ns_mountinfo,
+        );
+        narf_filesystem::procfs::install_mountinfo_generation_hook(
+            crate::handlers::proc_ns_mountinfo_generation,
+        );
+
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3((-100i64) as u64, path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as i32,
+            _ => return Err("open /proc/self/mountinfo for ppoll failed"),
+        };
+        if mount_fstype(target, fstype) != Some(0) {
+            return Err("mount change setup failed");
+        }
+
+        let mut pollfd = [0u8; 8];
+        pollfd[..4].copy_from_slice(&fd.to_ne_bytes());
+        pollfd[4..6].copy_from_slice(&(narf_filesystem::POLL_PRI as u16).to_ne_bytes());
+        let timeout = [0u64; 2];
+        let first = call(
+            Syscall::Ppoll.raw(),
+            a4(pollfd.as_mut_ptr() as u64, 1, timeout.as_ptr() as u64, 0, 8),
+        );
+        let first_revents = u16::from_ne_bytes([pollfd[6], pollfd[7]]) as u32;
+        if first != Some(1)
+            || first_revents & (narf_filesystem::POLL_PRI | narf_filesystem::POLL_ERR)
+                != narf_filesystem::POLL_PRI | narf_filesystem::POLL_ERR
+        {
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            return Err("ppoll must receive the mountinfo POLLPRI|POLLERR edge once");
+        }
+
+        pollfd[6..].fill(0);
+        let second = call(
+            Syscall::Ppoll.raw(),
+            a4(pollfd.as_mut_ptr() as u64, 1, timeout.as_ptr() as u64, 0, 8),
+        );
+        let second_revents = u16::from_ne_bytes([pollfd[6], pollfd[7]]);
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        if second == Some(0) && second_revents == 0 {
+            Ok(())
+        } else {
+            Err("ppoll must retire a delivered mountinfo namespace-change edge")
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_proc_mountinfo_ppoll_retires_change_edge
+);
+
 // libmount registers the already-open mountinfo file for EPOLLIN|EPOLLET,
 // drains its initial readable event, then relies on Linux's unconditional
 // POLLERR mount-change edge to re-wake the monitor after a mount helper exits.
