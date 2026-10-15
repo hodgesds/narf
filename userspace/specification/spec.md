@@ -154,6 +154,11 @@ falls back to the `io_submit`/`io_getevents` syscall path. The input/output
 `aio_context_t` word must be zero on entry, is nonzero on success, and the
 context page is removed by `io_destroy(2)` or address-space teardown.
 
+`uname(2)` presents the Linux compatibility identity: `sysname` is `Linux`,
+while the NARF build identity remains visible in the release and version
+fields. This lets Linux services select their normal code paths without
+mistaking the kernel for an unrelated operating system.
+
 The loader publishes the finalized SysV auxiliary vector and environment to
 `/proc/<pid>/auxv` and `/proc/<pid>/environ` only after a successful image
 load. Thus procfs and the initial stack carry the same `AT_PHDR`, `AT_PHENT`,

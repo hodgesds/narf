@@ -1118,7 +1118,7 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_sethostname_neg);
 
 // ── uname ────────────────────────────────────────────────────────────
 // arg0 = buf (struct utsname, 6 × 65 = 390 bytes). buf==0 ⇒ Ok(-1);
-// success ⇒ Ok(0) with "NARF" in sysname.
+// success ⇒ Ok(0) with Linux's "Linux" sysname.
 fn smoke_abi_creds_uname_pos() -> TestResult {
     with_setup(|| {
         let mut buf = [0u8; 6 * 65];
@@ -1126,9 +1126,9 @@ fn smoke_abi_creds_uname_pos() -> TestResult {
         if r != 0 {
             return Err("uname(valid) expected 0");
         }
-        // sysname field (first 65 bytes) must be "NARF\0...".
-        if &buf[..4] != b"NARF" || buf[4] != 0 {
-            return Err("uname sysname is not NARF");
+        // sysname field (first 65 bytes) must be "Linux\0...".
+        if &buf[..5] != b"Linux" || buf[5] != 0 {
+            return Err("uname sysname is not Linux");
         }
         Ok(())
     })
