@@ -94,8 +94,21 @@ int main(void) {
     write(pipefd[1], "x", 1);
     pthread_join(t, 0);
     snprintf(path, sizeof path, "/proc/%d/stat", ttid);
-    errno = 0;
-    CHECK(open(path, O_RDONLY) < 0 && errno == ENOENT, "%s still opens after the thread exited", path);
+    // pthread_join returns at the CLONE_CHILD_CLEARTID wake, which Linux
+    // issues from mm_release, before release_task unhashes the thread's pid;
+    // the directory goes away shortly after, not at the join itself.
+    int gone = 0;
+    for (int i = 0; i < 200 && !gone; i++) {
+        errno = 0;
+        int fd = open(path, O_RDONLY);
+        if (fd < 0 && errno == ENOENT)
+            gone = 1;
+        else {
+            if (fd >= 0) close(fd);
+            usleep(10000);
+        }
+    }
+    CHECK(gone, "%s still opens 2s after the thread exited", path);
 
     if (fails == 0) printf("proctid-ok\n");
     return fails != 0;
