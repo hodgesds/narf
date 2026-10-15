@@ -5801,6 +5801,17 @@ fn boot_userspace_init() {
                     "wlproxy_sockpair_glibc",
                     narf_verification::NARF_WLPROXY_SOCKPAIR_SMOKE_GLIBC_ELF,
                 ),
+                // A blocking stream send larger than the send buffer waits
+                // for the reader and returns the whole length; signal,
+                // SO_SNDTIMEO and peer close return Linux's prefix / errno.
+                (
+                    "sockpair_block_smoke",
+                    narf_verification::NARF_SOCKPAIR_BLOCK_SMOKE_ELF,
+                ),
+                (
+                    "sockpair_block_glibc",
+                    narf_verification::NARF_SOCKPAIR_BLOCK_SMOKE_GLIBC_ELF,
+                ),
                 // A dup()'d socketpair end survives fork/vfork/posix_spawn +
                 // execve without FD_CLOEXEC: kwin's WAYLAND_SOCKET handoff to
                 // Xwayland.

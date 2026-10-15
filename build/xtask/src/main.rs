@@ -5171,6 +5171,10 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("unix_listen_wake_glibc", "unix-listen-wake-ok"),
         ("wlproxy_sockpair_smoke", "wlproxy-ok"),
         ("wlproxy_sockpair_glibc", "wlproxy-ok"),
+        // A blocking AF_UNIX stream send queues the whole payload; signal,
+        // SO_SNDTIMEO and peer close end it with Linux's prefix / errno.
+        ("sockpair_block_smoke", "sockpair-block-ok"),
+        ("sockpair_block_glibc", "sockpair-block-ok"),
         ("fd_inherit_exec_smoke", "fd-inherit-exec-ok"),
         ("fd_inherit_exec_glibc", "fd-inherit-exec-ok"),
         ("xserver_epoll_wake_smoke", "xserver-epoll-wake-ok"),
