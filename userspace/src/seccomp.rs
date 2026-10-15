@@ -1019,10 +1019,12 @@ fn get_action_avail(uargs: u64) -> SyscallReturn {
 /// seccomp_notif, seccomp_notif_resp, seccomp_data; }`.
 fn get_notif_sizes(uargs: u64) -> SyscallReturn {
     let mut b = [0u8; 6];
-    b[0..2].copy_from_slice(&80u16.to_ne_bytes()); // struct seccomp_notif
-    b[2..4].copy_from_slice(&24u16.to_ne_bytes()); // struct seccomp_notif_resp
-    b[4..6].copy_from_slice(&64u16.to_ne_bytes()); // struct seccomp_data
-                                                   // SAFETY: copy_to_user range-checks and fault-contains the destination.
+    // sizeof struct seccomp_notif, seccomp_notif_resp, seccomp_data.
+    b[0..2].copy_from_slice(&80u16.to_ne_bytes());
+    b[2..4].copy_from_slice(&24u16.to_ne_bytes());
+    b[4..6].copy_from_slice(&64u16.to_ne_bytes());
+
+    // SAFETY: copy_to_user range-checks and fault-contains the destination.
     if unsafe { copy_to_user(uargs, &b) }.is_err() {
         return err(EFAULT);
     }
