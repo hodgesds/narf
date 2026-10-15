@@ -1957,9 +1957,9 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
     // offset 12 (12-byte header headroom at offset 0), taking the
     // DmaBuffer BY VALUE. Channel-pushed Frames carry their payload
     // at an arbitrary `offset` (0 for Frame::new), so we relocate
-    // into a fresh headroom buffer here — the channel path is the
-    // slow path; the production TCP stack uses the synchronous
-    // `vnet0_send_fn` tap which already places the frame at offset 12.
+    // into a prepared recycler buffer with the required header room.
+    // This is an alternate production ingress, not an allocator-per-packet
+    // slow path: an empty TX pool is ordinary backpressure.
     // Stackful: TX forwarder.
     narf_scheduler::spawn_stackful(async move {
         while let Ok(frame) = tx_cons.recv().await {
@@ -1968,9 +1968,9 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
             if plen == 0 || plen > MAX_FRAME - 12 {
                 continue; // bad frame; drop it
             }
-            let mut buf = match alloc_coherent(4096, DomainId::DRIVER_0) {
-                Ok(b) => b,
-                Err(_) => continue, // out of DMA pages; drop (TCP retransmits)
+            let mut buf = match with_at(idx, |c| c.tx_buf_acquire()).flatten() {
+                Some(buf) => buf,
+                None => continue, // bounded TX pool empty; upper layers retry
             };
             {
                 let slice = buf.as_mut_slice();
