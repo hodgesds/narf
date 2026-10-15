@@ -173,19 +173,63 @@ pub const IP_PROTO_TCP: u8 = 6;
 
 /// Compute the ones-complement IP checksum (RFC 1071).
 pub fn ip_checksum(buf: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    let mut i = 0;
-    while i + 1 < buf.len() {
-        sum += u16::from_be_bytes([buf[i], buf[i + 1]]) as u32;
-        i += 2;
+    !ones_complement_sum(buf)
+}
+
+/// RFC 1071 one's-complement sum of `buf` taken as big-endian 16-bit words
+/// (an odd trailing byte is padded with a zero low byte), folded to 16 bits
+/// but **not** complemented. `ip_checksum(buf) == !ones_complement_sum(buf)`.
+///
+/// Partial sums of disjoint buffers combine with [`ones_complement_add`] as
+/// long as every buffer but the last has even length, which lets callers sum
+/// a pseudo-header and an L4 segment in place instead of first copying both
+/// into a scratch `Vec`.
+///
+/// Speed: the sum is accumulated 8 bytes per step into a `u64` (as two 32-bit
+/// halves, so it cannot overflow for any buffer under 16 GiB) rather than 2
+/// bytes per step into a `u32`. Two RFC 1071 properties make this exact: the sum is
+/// independent of word width (2^16 ≡ 1 mod 0xFFFF, so a 32-bit word sums to
+/// the same residue as its two 16-bit halves), and of byte order (summing
+/// native-endian words yields the byte-swapped sum, undone once at the end by
+/// `u16::from_be`). The kernel target has no SIMD, so this is plain scalar
+/// code; the win is 4x fewer loads, half the adds and no per-word byte swap.
+#[inline]
+pub fn ones_complement_sum(buf: &[u8]) -> u16 {
+    let mut acc: u64 = 0;
+    let mut words = buf.chunks_exact(8);
+    for w in &mut words {
+        let w = u64::from_ne_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]);
+        acc += (w & 0xFFFF_FFFF) + (w >> 32);
     }
-    if i < buf.len() {
-        sum += (buf[i] as u32) << 8;
+    // The remainder starts at an 8-byte (hence 2-byte) aligned offset, so its
+    // native-endian 32/16-bit words line up with the wire's 16-bit words.
+    let mut rem = words.remainder();
+    if rem.len() >= 4 {
+        acc += u64::from(u32::from_ne_bytes([rem[0], rem[1], rem[2], rem[3]]));
+        rem = &rem[4..];
     }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
+    if rem.len() >= 2 {
+        acc += u64::from(u16::from_ne_bytes([rem[0], rem[1]]));
+        rem = &rem[2..];
     }
-    !(sum as u16)
+    if let [last] = rem {
+        acc += u64::from(u16::from_ne_bytes([*last, 0]));
+    }
+    // Fold 64 -> 32 -> 16 bits with end-around carry.
+    let s = (acc & 0xFFFF_FFFF) + (acc >> 32);
+    let s = (s & 0xFFFF_FFFF) + (s >> 32);
+    let mut s = s as u32;
+    s = (s & 0xFFFF) + (s >> 16);
+    s = (s & 0xFFFF) + (s >> 16);
+    u16::from_be(s as u16)
+}
+
+/// One's-complement (end-around-carry) addition of two folded 16-bit sums
+/// from [`ones_complement_sum`].
+#[inline]
+pub const fn ones_complement_add(a: u16, b: u16) -> u16 {
+    let s = a as u32 + b as u32;
+    ((s & 0xFFFF) + (s >> 16)) as u16
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
