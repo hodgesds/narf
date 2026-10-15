@@ -454,8 +454,14 @@ impl<I: Io> Engine<I> {
         }
         // The sink's own caps refuse before any register write.
         Caps::parse(dpcd, interval, plan.phy.settings, plan.downspread, None)?;
-        if dpcd[0] >= 0x12 && read::<1>(io, path, 0x111).await?[0] & 7 != 0 {
-            return Err(Error::Busy); // active MST/up-request owner
+        // SST: no active MST/up-request owner. MST: the topology manager
+        // set MST_EN first (drm_dp_mst_topology_mgr_set_mst).
+        if plan.phy.settings.mst {
+            if dpcd[0] < 0x12 || read::<1>(io, path, 0x111).await?[0] & 1 == 0 {
+                return Err(Error::Invalid);
+            }
+        } else if dpcd[0] >= 0x12 && read::<1>(io, path, 0x111).await?[0] & 7 != 0 {
+            return Err(Error::Busy);
         }
         // retrieve_link_cap reads DP_FEC_CAPABILITY from DPCD 1.4 on;
         // dp_should_enable_fec then holds for every FEC-capable sink.

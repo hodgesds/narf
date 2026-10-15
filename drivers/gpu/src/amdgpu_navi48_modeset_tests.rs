@@ -1217,3 +1217,59 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_decides_dsc_like_linux
 );
+
+/// MST streams as amdgpu_dm's MST atomic check admits them on an HBR2 x4
+/// link (40 PBN per slot): each device takes the timing asked of it, or
+/// its first EDID timing whose payload fits the slots the earlier ones
+/// left of 63 and its port's available PBN; a device nothing fits stays
+/// dark.
+fn navi48_modeset_selects_mst_streams_like_amdgpu_dm() -> TestResult {
+    use crate::dp_mst_mgr::Sink;
+    let caps = DpCaps {
+        lanes: 4,
+        rate: LinkRate::Hbr2,
+        uhbr: 0,
+        fec: false,
+        dsc: None,
+    };
+    let sink = |port| Sink { branch: 0, port };
+    let devices = [
+        (sink(1), edid_2160p(), 0),
+        (sink(2), edid_three_modes(false), 0),
+        (sink(3), edid_2160p(), 0),
+    ];
+    let uhd = edid_timings(&edid_2160p())[0];
+    let want = |_| Some(uhd);
+    let s = super::super::select_mst(2, caps, &devices, &want);
+    let pbn_div = crate::dp_mst::pbn_div(17_280_000);
+    let shown: Vec<(u32, u8)> = s
+        .iter()
+        .map(|s| (s.timing.h_active, s.mst.map_or(0, |m| m.slots)))
+        .collect();
+    // 2160p takes 54 slots; neither 2160p nor 1080p (14) fits beside it,
+    // 720p (7) does; the third device's only mode does not.
+    if pbn_div != 40 << 12 || shown != [(3840, 54), (1280, 7)] {
+        panic!("MST streams {shown:?}");
+    }
+    let m = s[0].mst.unwrap();
+    if m.sink != sink(1)
+        || u32::from(m.pbn) != crate::dp_mst::calc_pbn_mode(594_000, 384)
+        || m.rate != otg::vc_rate(594_000 * 24, 17_280_000).unwrap()
+        || s[0].port != 2
+        || s[0].lanes != 4
+        || s[0].audio.is_some()
+    {
+        return TestResult::Fail("MST stream");
+    }
+    // A port's available PBN bounds its device: 1080p rather than 2160p.
+    let one = [(sink(1), edid_three_modes(false), 600)];
+    let s = super::super::select_mst(0, caps, &one, &want);
+    if s.len() != 1 || s[0].timing.h_active != 1920 {
+        return TestResult::Fail("available PBN");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_selects_mst_streams_like_amdgpu_dm
+);

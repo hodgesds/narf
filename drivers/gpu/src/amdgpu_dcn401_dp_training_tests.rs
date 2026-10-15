@@ -238,6 +238,10 @@ fn fixture_mode(
         step: 0,
         progress: Arc::new(AtomicU32::new(0)),
     };
+    if mst {
+        // MSTM_CTRL as the topology manager leaves it.
+        link.set(0x111, &[7]);
+    }
     link.set(
         0,
         &[
@@ -443,6 +447,15 @@ fn dcn401_dp_training_rejects_unsupported_topologies_caps_and_unacknowledged_sin
         assert_eq!(e.io.inner.inner.writes.len(), writes);
         assert!(!io.events.iter().any(|e| matches!(e, Event::Drive(_))));
     }
+    // An MST link trains only once the topology manager set MST_EN.
+    let (mut e, mut io) = fixture_mode(1, 2, LinkRate::Hbr2, TrainingPattern::Tps3, true);
+    io.set(0x111, &[0]);
+    let writes = e.io.inner.inner.writes.len();
+    assert_eq!(
+        run(e.train_dp_link(&mut io, path(1), true, false)),
+        Err(Error::Invalid)
+    );
+    assert_eq!(e.io.inner.inner.writes.len(), writes);
     let (mut e, mut io) = fixture(0, 4, LinkRate::Hbr3, TrainingPattern::Tps3);
     assert_eq!(
         run(e.train_dp_link(&mut io, path(0), false, false)),

@@ -27,6 +27,16 @@ pub enum ModesetError {
     Clocks(clocks::Error),
     PipeClocks(dccg::Error),
     Display(otg::Error),
+    /// The port's MST branch or a payload on its link failed.
+    Mst(super::MstFailure),
+}
+impl From<super::MstFailure> for ModesetError {
+    fn from(e: super::MstFailure) -> Self {
+        match e {
+            super::MstFailure::Display(e) => Self::Display(e),
+            e => Self::Mst(e),
+        }
+    }
 }
 impl From<otg::Error> for ModesetError {
     fn from(e: otg::Error) -> Self {
@@ -66,6 +76,19 @@ pub struct Selection {
     pub frl: Option<FrlRate>,
     /// DP compressed by the pipe's DSC on this link.
     pub dsc: Option<crate::amdgpu_dsc::DscConfig>,
+    /// A stream to a device behind the port's MST branch, on the port's
+    /// 8b/10b MST link.
+    pub mst: Option<MstStream>,
+}
+
+/// A selection's stream on an MST link: its end device and VC payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MstStream {
+    pub sink: crate::dp_mst_mgr::Sink,
+    pub pbn: u16,
+    pub slots: u8,
+    /// DP_MSE_RATE X.Y (`otg::vc_rate`).
+    pub rate: (u32, u32),
 }
 
 /// The sink's audio description as amdgpu_dm_fill_audio_info builds it from
@@ -561,7 +584,7 @@ pub fn dp_caps(path: &inventory::Path, sink: &display::Sink) -> Option<DpCaps> {
 
 /// dp_link_bandwidth_kbps for 8b/10b: 80% coding efficiency
 /// (DATA_EFFICIENCY_8b_10b_x10000), times 97% with FEC.
-fn legacy_kbps(lanes: u8, rate: LinkRate, fec: bool) -> u64 {
+pub(super) fn legacy_kbps(lanes: u8, rate: LinkRate, fec: bool) -> u64 {
     let efficiency = if fec { 8000 / 100 * 97 } else { 8000 };
     rate as u64 * 27_000 * 10 * u64::from(lanes) / 10_000 * efficiency
 }
@@ -1097,6 +1120,7 @@ pub fn select_all(
             ycbcr420: false,
             frl: None,
             dsc,
+            mst: None,
         });
     }
     let mut frl_free = true;
@@ -1145,6 +1169,7 @@ pub fn select_all(
             ycbcr420,
             frl,
             dsc: None,
+            mst: None,
         });
     }
     out.truncate(MAX_DISPLAYS);
@@ -1521,7 +1546,7 @@ impl ColdBoot {
     }
     /// Start PMFW at the clock floor (which publishes the DPM levels
     /// admission needs) and return the board's admission inputs.
-    async fn prepare_configuration(
+    pub(super) async fn prepare_configuration(
         &mut self,
         selections: &[Selection],
     ) -> Result<dml::Soc, ModesetError> {
@@ -1540,7 +1565,7 @@ impl ColdBoot {
     /// The configuration's global clocks (one DISPCLK/DPPREFCLK for every
     /// plan), then each display's pipe clocks on `pipes`, all while every
     /// display is stopped.
-    async fn prepare_pipes(
+    pub(super) async fn prepare_pipes(
         &mut self,
         selections: &[Selection],
         plans: &[dml::Plan],
@@ -1572,7 +1597,7 @@ impl ColdBoot {
     /// # Safety
     /// As for `modeset_display`, except that other displays of this owner
     /// may be lit in their own slots.
-    async unsafe fn light(
+    pub(super) async unsafe fn light(
         &mut self,
         pipe: u8,
         selection: Selection,
@@ -1632,7 +1657,7 @@ impl ColdBoot {
     /// it to: they fit the link it trained (DP) or a TMDS depth (HDMI) and
     /// DML admits them together with the other lit displays' running modes.
     /// The running timing is always included.
-    fn offered_modes(
+    pub(super) fn offered_modes(
         &mut self,
         soc: &dml::Soc,
         lit: &[Modeset],
@@ -1653,6 +1678,11 @@ impl ColdBoot {
                 // FRL only for the display holding the HPO FRL encoder.
                 let frl = s.frl.and_then(|_| frl_cap(caps));
                 hdmi_output(caps, &t, max_bpc(), frl).map(|(_, ycbcr420, _)| ycbcr420)
+            } else if let Some(m) = s.mst {
+                // Within the stream's own payload.
+                super::mst::mst_slots(&t, s.lanes, s.rate, s.caps.fec)
+                    .is_some_and(|(_, slots)| slots <= m.slots)
+                    .then_some(false)
             } else {
                 dp_offer_fits(&t, &s).then_some(false)
             };
@@ -1691,6 +1721,12 @@ impl ColdBoot {
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
             let port = selection.port;
+            if let Some(stream) = selection.mst {
+                let scanout = self
+                    .start_mst_stream(port, stream, &selection, pipe)
+                    .await?;
+                return Ok((selection, scanout));
+            }
             if let Some(rate) = selection.frl {
                 return self.start_frl_link(selection, rate, pipe).await;
             }
@@ -2009,7 +2045,7 @@ impl ColdBoot {
         // Display k runs on pipe k, in its own records.
         self.select_display(m.pipe)?;
         let port = m.selection.port;
-        if m.selection.hdmi {
+        if m.selection.hdmi || m.selection.mst.is_some() {
             return Err(ModesetError::Display(otg::Error::Unsupported));
         }
         // SAFETY: as documented above; each step checks its predecessor state.
@@ -2042,6 +2078,9 @@ impl ColdBoot {
         // Display k runs on pipe k, in its own records.
         self.select_display(m.pipe)?;
         let port = m.selection.port;
+        if m.selection.mst.is_some() {
+            self.mst_stop_allowed(port, m.pipe)?;
+        }
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
             if m.selection.audio.is_some() && !m.selection.uhbr() && m.selection.frl.is_none() {
@@ -2054,6 +2093,8 @@ impl ColdBoot {
                 self.stop_hdmi(port, m.selection.scdc).await?;
             } else if m.selection.uhbr() {
                 self.stop_uhbr(port, true).await?;
+            } else if m.selection.mst.is_some() {
+                self.stop_mst_stream(port, m.pipe, true).await?;
             } else {
                 self.stop_display_dp_video(port).await?;
                 self.stop_display_dp_frontend(port).await?;
@@ -2075,6 +2116,9 @@ impl ColdBoot {
         // Display k runs on pipe k, in its own records.
         self.select_display(m.pipe)?;
         let port = m.selection.port;
+        if m.selection.mst.is_some() {
+            self.mst_stop_allowed(port, m.pipe)?;
+        }
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
             if m.selection.audio.is_some() && !m.selection.uhbr() && m.selection.frl.is_none() {
@@ -2087,6 +2131,8 @@ impl ColdBoot {
                 self.stop_hdmi(port, m.selection.scdc).await?;
             } else if m.selection.uhbr() {
                 self.stop_uhbr(port, false).await?;
+            } else if m.selection.mst.is_some() {
+                self.stop_mst_stream(port, m.pipe, false).await?;
             } else {
                 self.stop_display_dp_video(port).await?;
                 self.stop_display_dp_frontend(port).await?;
