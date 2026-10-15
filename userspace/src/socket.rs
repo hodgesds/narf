@@ -1796,6 +1796,14 @@ impl SocketFile {
             narf_net::tcp_stack::TCP_CONGESTION,
             &opts.tcp_congestion,
         );
+        // A user-set SO_SNDBUF / SO_RCVBUF (SOCK_*BUF_LOCK) sizes the queues.
+        const SOCK_SNDBUF_LOCK: i32 = 1;
+        const SOCK_RCVBUF_LOCK: i32 = 2;
+        let snd = (opts.ext.buf_lock & SOCK_SNDBUF_LOCK != 0).then_some(opts.sndbuf);
+        let rcv = (opts.ext.buf_lock & SOCK_RCVBUF_LOCK != 0).then_some(opts.rcvbuf);
+        if snd.is_some() || rcv.is_some() {
+            let _ = narf_net::tcp::core::set_buffer_limits(id, snd, rcv);
+        }
     }
 
     pub fn new(domain: u16, kind: u32) -> Arc<Self> {
@@ -3383,7 +3391,13 @@ impl SocketFile {
                 self.inet6_dgram_unregister(port, port_locked);
             }
             Reg::Tcb(id) => {
-                let _ = narf_net::tcp_stack::close(id);
+                // `SO_LINGER {1, 0}` aborts with an RST (Linux `tcp_close` →
+                // `tcp_disconnect`).
+                let zero_linger = {
+                    let opts = self.options.lock();
+                    opts.linger_on && opts.linger_sec == 0
+                };
+                let _ = narf_net::tcp_stack::close_linger(id, zero_linger);
                 crate::handlers::clear_tcb_owner(id);
             }
             Reg::None => {}
@@ -3893,9 +3907,45 @@ impl FileOps for SocketFile {
         // send queue). Any other request is unknown → ENOTTY (Linux
         // `sock_ioctl` default). SIOCOUTQ MUST be answered: dbus-broker treats
         // an ENOTTY from it as fatal and tears the whole system bus down.
-        let value: i32 = match cmd {
-            SIOCINQ => self.inq_bytes() as i32,
-            SIOCOUTQ => 0,
+        // A kernel-TCP socket answers from its TCB (Linux `tcp_ioctl`):
+        // queued readable bytes, `write_seq - snd_una` (unacknowledged,
+        // sent or not) and `write_seq - snd_nxt` (unsent); EINVAL on a
+        // listener.
+        const SIOCOUTQNSD: u32 = 0x894B;
+        let tcp_listener = matches!(
+            &*self.state.lock(),
+            SocketState::InetListener {
+                listen_id: Some(_),
+                ..
+            } | SocketState::Inet6Listener {
+                listen_id: Some(_),
+                ..
+            }
+        );
+        let tcb = match &*self.state.lock() {
+            SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
+                Some(*tcb_id)
+            }
+            _ => None,
+        };
+        let value: i32 = match (cmd, tcb) {
+            (SIOCINQ | SIOCOUTQ | SIOCOUTQNSD, _) if tcp_listener => {
+                return Err(FsError::InvalidPath);
+            }
+            (SIOCINQ | SIOCOUTQ | SIOCOUTQNSD, Some(id)) => {
+                use narf_net::tcp::core::TcpQueueIoctl as Q;
+                let which = match cmd {
+                    SIOCINQ => Q::Inq,
+                    SIOCOUTQ => Q::Outq,
+                    _ => Q::OutqNsd,
+                };
+                match narf_net::tcp::core::queue_ioctl(id, which) {
+                    Ok(v) => v as i32,
+                    Err(_) => return Err(FsError::InvalidPath),
+                }
+            }
+            (SIOCINQ, None) => self.inq_bytes() as i32,
+            (SIOCOUTQ, None) => 0,
             _ => return Err(FsError::Unsupported),
         };
         let bytes = value.to_le_bytes();
@@ -4476,6 +4526,17 @@ impl SocketFile {
     /// it is the total buffered rx bytes. Every other state (fresh, listener,
     /// off-box kernel-TCP, bypass, uevent) yields 0 — no local byte count is
     /// tracked and a consumer reads 0 as "fall back to recv/MSG_PEEK".
+    /// The kernel-TCP connection behind a connected AF_INET/AF_INET6 stream
+    /// socket, if it is one.
+    pub(crate) fn kernel_tcb_id(&self) -> Option<u32> {
+        match &*self.state.lock() {
+            SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
+                Some(*tcb_id)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn inq_bytes(&self) -> usize {
         if self.is_inet_icmp_echo() {
             return self
@@ -7944,7 +8005,8 @@ impl SocketFile {
                 let id = *tcb_id;
                 *state = SocketState::Fresh;
                 drop(state);
-                let _ = narf_net::tcp_stack::close(id);
+                // `connect(AF_UNSPEC)` is `tcp_disconnect`: an abort (RST).
+                let _ = narf_net::tcp_stack::close_linger(id, true);
                 crate::handlers::clear_tcb_owner(id);
             }
             SocketState::InetListener {
@@ -9035,7 +9097,13 @@ impl SocketFile {
             // EAGAIN only when the connection is live with nothing queued.
             // Previously every empty read was EAGAIN, so a reader never saw
             // EOF, and a reset read as ENOTCONN instead of ECONNRESET.
-            let n = narf_net::tcp_stack::recv_errno(id, buf).map_err(SockError::from_stack)?;
+            // MSG_PEEK copies without consuming (Linux `tcp_recvmsg_locked`).
+            let n = if flags & MSG_PEEK != 0 {
+                narf_net::tcp_stack::recv_peek_errno(id, buf)
+            } else {
+                narf_net::tcp_stack::recv_errno(id, buf)
+            }
+            .map_err(SockError::from_stack)?;
             return Ok((n, None));
         }
         let rx = match &*state {

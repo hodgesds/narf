@@ -151,6 +151,8 @@ mod protocol_coverage_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tcp_e2e_tests;
 #[cfg(any(test, feature = "kernel-test"))]
+mod tcp_robust_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod tcp_timer_e2e_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;

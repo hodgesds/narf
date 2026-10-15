@@ -47,6 +47,23 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // A blocking write() to a kernel-TCP socket is `tcp_sendmsg` without
+    // flags: it returns only once the whole buffer is queued.
+    if !endpoint.nonblocking() {
+        if let Ok(sock) = current_socket_result(fd_num) {
+            if let Some(tcb) = sock
+                .kernel_tcb_id()
+                .filter(|_| !socket_listener_nonblock(task, fd_num, sock.as_ref()))
+            {
+                let resumed = handler_sys_socket_recv::sock_timeo_take(ctx, &sock);
+                handler_sys_socket_send::tcp_blocking_send(
+                    ctx, fd_num, 0, &sock, tcb, user_ptr, count, resumed,
+                );
+                return;
+            }
+        }
+    }
+
     if crate::pipe::is_pipe(endpoint.ops.as_ref()) {
         write_pipe_user(ctx, &endpoint, count, |offset, bytes| {
             // SAFETY: validated scalar range; copy commits one page at a time.

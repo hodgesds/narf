@@ -34,6 +34,7 @@ mod composition;
 mod crate_release;
 /// The `affected` subcommand: crate reverse-dependency closure → the set
 /// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
+mod net_robust;
 mod passthrough;
 mod relocs;
 
@@ -152,6 +153,10 @@ enum Cmd {
     /// IPv4 late initcall so igb is the sole NIC and owns the SLIRP lease,
     /// exercising the advanced one-buffer-descriptor datapath end to end.
     IgbNetSmoke(BuildArgs),
+    /// Internal: net-smoke's namespace TCP peer. Runs inside `unshare -rn`
+    /// (spawned by net-smoke), owns tap0 and serves the Linux-peer phases.
+    #[command(hide = true)]
+    NetPeer(NetPeerArgs),
     /// Off-box redis smoke. Boot with `qemu-net` + a QEMU `hostfwd`,
     /// wait for the auto-spawned unmodified `redis-server` to print
     /// `Ready to accept connections`, then open a real host TCP socket to
@@ -521,6 +526,20 @@ struct TestArgs {
     /// postflight. Local and primary CI runs retain the safer default.
     #[arg(long, default_value_t = false)]
     kernel_tests_only: bool,
+}
+
+/// Args for the hidden `xtask net-peer` (see `net_robust::net_peer_main`).
+#[derive(Parser, Clone)]
+struct NetPeerArgs {
+    /// Unix socket QEMU's `-netdev stream` connects to.
+    #[arg(long)]
+    sock: PathBuf,
+    /// Bitmask of namespace phases to serve.
+    #[arg(long, default_value_t = 0)]
+    mask: u64,
+    /// Long-run sizes.
+    #[arg(long)]
+    long: bool,
 }
 
 /// Wave-49 — args for `xtask run-interactive`. Inherits BuildArgs
@@ -2594,6 +2613,14 @@ fn legacy_qemu_netdev(profile: HwProfile) -> String {
     } else {
         None
     };
+    // net-smoke's namespace peer: a unix stream socket relayed to a tap in
+    // an unprivileged network namespace.
+    if let Some(path) = std::env::var("XTASK_QEMU_LEGACY_STREAM")
+        .ok()
+        .filter(|p| !p.is_empty())
+    {
+        return format!("stream,id=n1,server=off,addr.type=unix,addr.path={path}");
+    }
     let hostfwd = std::env::var("XTASK_QEMU_LEGACY_HOSTFWD")
         .ok()
         .filter(|fwd| !fwd.is_empty());
@@ -6158,10 +6185,54 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     // Set in THIS process's env: `qemu_args` (called below, in-process)
     // reads it to splice `hostfwd` into the user-mode netdev. Setting it
     // on the child Command would be too late — the arg list is built here.
-    let forwards = format!(
+    let mut forwards = format!(
         "tcp:127.0.0.1:{tcp_host_port}-:{tcp_guest_port},\
          hostfwd=udp:127.0.0.1:{udp_host_port}-:{udp_guest_port},\
          hostfwd=tcp:127.0.0.1:{bulk_host_port}-:{bulk_guest_port}"
+    );
+
+    // TCP robustness phases (net_robust.rs): SLIRP-side servers, plus the
+    // Linux peer in a network namespace on the second NIC (virtio run only;
+    // the e1000-module run owns that NIC).
+    let robust_cfg = net_robust::RobustConfig::from_env();
+    let robust_report = net_robust::Report::default();
+    let mut ns_peer = None;
+    if nic == NetSmokeNic::Virtio {
+        if robust_cfg.ns != 0 {
+            let sock = root.join("target").join("net-smoke-ns-peer.sock");
+            ns_peer = net_robust::spawn_ns_peer(&sock, robust_cfg);
+            if ns_peer.is_some() {
+                std::env::set_var("XTASK_QEMU_LEGACY_STREAM", &sock);
+            }
+        }
+        net_robust::start_slirp_servers(robust_cfg, ns_peer.is_some(), &robust_report)?;
+        forwards.push_str(&format!(
+            ",hostfwd=tcp:127.0.0.1:{}-:{}",
+            net_robust::CHURN_FWD_PORT,
+            net_robust::CHURN_GUEST_PORT
+        ));
+    } else {
+        net_robust::start_slirp_servers(
+            net_robust::RobustConfig {
+                long: false,
+                slirp: 0,
+                ns: 0,
+            },
+            false,
+            &robust_report,
+        )?;
+    }
+    let robust_tokens = net_robust::expected_tokens(
+        if nic == NetSmokeNic::Virtio {
+            robust_cfg
+        } else {
+            net_robust::RobustConfig {
+                long: false,
+                slirp: 0,
+                ns: 0,
+            }
+        },
+        ns_peer.is_some(),
     );
 
     // The servers the guest dials must exist before it boots. The download
@@ -6775,6 +6846,32 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         let _ = child.wait();
         bail!("xtask {smoke_name}: guest DNS query did not return a valid answer");
     }
+
+    // 6b. The TCP robustness phases, in the guest's order.
+    for (token, secs) in &robust_tokens {
+        if !wait_for(token.as_bytes(), *secs) {
+            let mut why = robust_report.failures();
+            if let Some(p) = ns_peer.as_ref() {
+                why.extend(p.failures());
+            }
+            abort!(
+                "xtask {smoke_name}: guest did not print `{token}` within {secs}s; host-side: {why:?}"
+            );
+        }
+        let mut why = robust_report.failures();
+        if let Some(p) = ns_peer.as_ref() {
+            why.extend(p.failures());
+        }
+        if !why.is_empty() {
+            abort!(
+                "xtask {smoke_name}: robustness phase failed host-side after `{token}`: {why:?}"
+            );
+        }
+    }
+    if let Some(mut p) = ns_peer.take() {
+        p.kill();
+    }
+    std::env::remove_var("XTASK_QEMU_LEGACY_STREAM");
 
     // 7. Require the aggregate guest verdict as well as each path token.
     if !wait_for(b"netserve-ok", timeout_secs) {
@@ -12160,6 +12257,7 @@ fn main() -> Result<()> {
         Cmd::NetSmoke(args) => net_smoke_cmd(&args),
         Cmd::E1000ModuleNetSmoke(args) => e1000_module_net_smoke_cmd(&args),
         Cmd::IgbNetSmoke(args) => igb_net_smoke_cmd(&args),
+        Cmd::NetPeer(args) => net_robust::net_peer_main(&args.sock, args.mask, args.long),
         Cmd::RedisSmoke(args) => redis_smoke_cmd(&args),
         Cmd::RedisBench(args) => redis_bench_cmd(&args),
         Cmd::StressBench(args) => stress_bench_cmd(&args),

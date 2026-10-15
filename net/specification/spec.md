@@ -611,9 +611,13 @@ pub fn connect6_errno_in(ns: u64, addr: [u8; 16], port: u16) -> Result<u32, i32>
 pub fn listen6_in(ns: u64, addr: [u8; 16], port: u16, backlog: usize) -> Result<u32, ()>;
 pub fn send_errno(id: u32, buf: &[u8]) -> Result<usize, i32>;
 pub fn recv_errno(id: u32, buf: &mut [u8]) -> Result<usize, i32>; // Ok(0) = EOF
+pub fn recv_peek_errno(id: u32, buf: &mut [u8]) -> Result<usize, i32>;
 pub fn readable(id: u32) -> bool; // recv would not return EAGAIN
 pub fn writable(id: u32) -> bool; // send would not return EAGAIN
 pub fn shutdown_errno(id: u32, how: Shutdown) -> Result<(), i32>;
+pub fn close_linger(id: u32, zero_linger: bool) -> Result<(), ()>;
+pub enum TcpQueueIoctl { Inq, Outq, OutqNsd }
+pub fn queue_ioctl(id: u32, which: TcpQueueIoctl) -> Result<u32, i32>;
 pub fn take_sock_error(id: u32) -> i32;  // getsockopt(SO_ERROR); 0 = none
 pub fn release(id: u32);                 // socket closed: forget the TCB id
 pub fn signal_icmp_error_in(ns, local, lport, remote, rport,
@@ -633,6 +637,27 @@ Successful `recv` / `recv_errno` calls track the last raw receive window sent
 on the connection. Once application reads cumulatively reopen at least one
 peer MSS, the stack emits an immediate pure ACK/window update; a sender is not
 left waiting for its persist timer after userspace has drained a full buffer.
+
+`recv_peek_errno` is `MSG_PEEK`: it copies the current in-order receive
+prefix without consuming it or sending a window update. `queue_ioctl` supplies
+the kernel-TCP values for `SIOCINQ`/`FIONREAD` (queued readable bytes),
+`SIOCOUTQ` (queued but unacknowledged bytes), and `SIOCOUTQNSD` (queued but
+not-yet-sent bytes); listeners receive `EINVAL`. User-set `SO_SNDBUF` and
+`SO_RCVBUF` constrain the respective TCB queue limits (the receive queue uses
+the advertised-window share of the doubled Linux-visible value).
+
+`close_linger(id, true)` is `SO_LINGER { .l_onoff = 1, .l_linger = 0 }` and
+aborts an active connection with an RST. A regular close with unread received
+data also resets, rather than presenting a clean FIN. A regular close marks a
+FIN-WAIT connection orphaned; FIN-WAIT-2 then expires after `tcp_fin_timeout`
+(60 seconds). TIME-WAIT keeps only tuple/sequence/timestamp state plus unread
+receive bytes; it releases its send/retransmit and SACK storage.
+
+The core functions remain non-blocking. The userspace socket layer implements
+blocking stream `send`/`write` and `MSG_WAITALL` as a re-executed wait loop:
+it preserves the partial byte count and the `SO_SNDTIMEO`/`SO_RCVTIMEO`
+deadline across each readiness park, returning a partial count after progress
+when a signal or timeout ends the loop.
 
 The opt-in software GRO path coalesces contiguous Ethernet/IPv4/TCP data up to
 65,000 payload bytes per flow and flushes at a driver's RX-poll completion.

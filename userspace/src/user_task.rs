@@ -389,6 +389,12 @@ pub struct UserTaskCtx {
     /// leaves a deadline behind for the next one.
     pub sock_timeo_deadline_ns: AtomicU64,
     pub sock_timeo_key: AtomicU64,
+    /// Bytes a blocking stream send (or an MSG_WAITALL receive) had already
+    /// moved when it parked, kept across its RIP-rewind re-executions so the
+    /// call resumes where it stopped and returns the full count, as Linux's
+    /// in-kernel wait loop does. Keyed like `sock_timeo_key`; taken on entry.
+    pub sock_progress_done: AtomicU64,
+    pub sock_progress_key: AtomicU64,
 
     /// Fd (+1) of a FIFO `open()` that has installed its per-open
     /// [`crate::fifo` handle] and is now BLOCKED waiting for the peer
@@ -744,6 +750,8 @@ impl UserTaskCtx {
             blocking_deadline_ns: AtomicU64::new(0),
             sock_timeo_deadline_ns: AtomicU64::new(0),
             sock_timeo_key: AtomicU64::new(0),
+            sock_progress_done: AtomicU64::new(0),
+            sock_progress_key: AtomicU64::new(0),
             fifo_open_pending_fd: AtomicU64::new(0),
             syscall_parked_restarting: AtomicBool::new(false),
             syscall_restart_kind: AtomicU32::new(SYSCALL_RESTART_SYS),

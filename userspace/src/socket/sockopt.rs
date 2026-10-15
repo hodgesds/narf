@@ -191,7 +191,10 @@ const IGMP_MAX_MEMBERSHIPS: usize = 20;
 /// `sizeof(struct group_req)` on LP64: u32 + pad + sockaddr_storage.
 const GROUP_REQ_LEN: usize = 136;
 /// `SOCK_BUF_LOCK_MASK` (`SOCK_SNDBUF_LOCK | SOCK_RCVBUF_LOCK`).
-const SOCK_BUF_LOCK_MASK: i32 = 3;
+const SOCK_BUF_LOCK_MASK: i32 = SOCK_SNDBUF_LOCK | SOCK_RCVBUF_LOCK;
+/// `sk_userlocks` bits a user-set SO_SNDBUF / SO_RCVBUF raise.
+const SOCK_SNDBUF_LOCK: i32 = 1;
+const SOCK_RCVBUF_LOCK: i32 = 2;
 /// `SKF_AD_MAX` (`include/uapi/linux/filter.h`) — `bpf_tell_extensions()`.
 const SKF_AD_MAX: i32 = 64;
 /// `SK_MEMINFO_VARS` (`include/uapi/linux/sock_diag.h`).

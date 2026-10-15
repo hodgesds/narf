@@ -16,6 +16,29 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
     // datagram sends).
     let addr_ptr = args.arg4;
     let addr_len = args.arg5;
+    // A blocking send on a kernel-TCP socket queues the WHOLE buffer before
+    // returning (Linux `tcp_sendmsg_locked` sleeps for send-buffer space),
+    // so it takes the progress-keeping path, which also never copies more
+    // of a multi-megabyte buffer than it is about to queue.
+    const MSG_DONTWAIT: u32 = 0x40;
+    const PLAIN_FLAGS: u32 = crate::socket::MSG_NOSIGNAL | 0x8000; // MSG_MORE
+    if addr_ptr == 0
+        && buf_len > 0
+        && flags & !PLAIN_FLAGS == 0
+        && validate_user_range(buf_ptr, buf_len).is_ok()
+    {
+        if let Ok(sock) = current_socket_result(fd) {
+            if let Some(tcb) = sock.kernel_tcb_id() {
+                if flags & MSG_DONTWAIT == 0
+                    && !socket_listener_nonblock(current_task_id(), fd, sock.as_ref())
+                {
+                    let resumed = handler_sys_socket_recv::sock_timeo_take(ctx, &sock);
+                    tcp_blocking_send(ctx, fd, flags, &sock, tcb, buf_ptr, buf_len, resumed);
+                    return;
+                }
+            }
+        }
+    }
     // Linux `__sys_sendto()` imports the payload iterator before looking up the
     // descriptor.  NARF eagerly copies that iterator into a kernel Vec, so an
     // unreadable non-empty payload must likewise win over EBADF/ENOTSOCK.
@@ -85,6 +108,37 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
         }
         // Send never yields Accepted/Received/Addr; keep the match total.
         _ => ctx.set_return(errno_ret(EINVAL)),
+    }
+}
+
+/// The blocking kernel-TCP send of `send`/`sendto`/`write`: see
+/// `tcp_send_all`. Errors before any byte was queued follow the ordinary
+/// send rules (EPIPE raises SIGPIPE unless MSG_NOSIGNAL).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn tcp_blocking_send(
+    ctx: &mut dyn TrapContext,
+    fd: u32,
+    flags: u32,
+    sock: &crate::socket::SocketFile,
+    tcb: u32,
+    buf_ptr: u64,
+    buf_len: usize,
+    resumed: Option<u64>,
+) {
+    use handler_sys_socket_recv::SendAll;
+    match handler_sys_socket_recv::tcp_send_all(ctx, sock, tcb, buf_ptr, buf_len, resumed) {
+        SendAll::Done(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+        SendAll::Parked => {}
+        SendAll::WouldBlock => socket_send_would_block(ctx, fd, flags, sock, resumed),
+        SendAll::Err(e) => {
+            if e == crate::socket::SockError::Pipe
+                && flags & crate::socket::MSG_NOSIGNAL == 0
+                && sock.epipe_raises_sigpipe()
+            {
+                raise_signal_pending(current_task_id(), 13); // SIGPIPE
+            }
+            ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
+        }
     }
 }
 

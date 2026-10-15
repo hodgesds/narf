@@ -122,8 +122,17 @@ impl SocketFile {
                     (val as u32).min(WMEM_MAX)
                 };
                 let v = requested.min((i32::MAX / 2) as u32);
+                // `__sock_set_sndbuf`: the doubled size, and SOCK_SNDBUF_LOCK
+                // in `sk_userlocks` (reported by SO_BUF_LOCK).
                 let sndbuf = (v * 2).max(SOCK_MIN_SNDBUF);
-                self.options.lock().sndbuf = sndbuf;
+                {
+                    let mut o = self.options.lock();
+                    o.sndbuf = sndbuf;
+                    o.ext.buf_lock |= SOCK_SNDBUF_LOCK;
+                }
+                if let Some(id) = self.kernel_tcb_id() {
+                    let _ = narf_net::tcp::core::set_buffer_limits(id, Some(sndbuf), None);
+                }
                 // `sk->sk_write_space(sk)`: a raised limit wakes writers.
                 self.unix_stream_sndbuf_changed(sndbuf as usize);
                 OK
@@ -139,7 +148,15 @@ impl SocketFile {
                 };
                 // `__sock_set_rcvbuf`.
                 let v = requested.min(i32::MAX / 2) as u32;
-                self.options.lock().rcvbuf = (v * 2).max(SOCK_MIN_RCVBUF);
+                let rcvbuf = (v * 2).max(SOCK_MIN_RCVBUF);
+                {
+                    let mut o = self.options.lock();
+                    o.rcvbuf = rcvbuf;
+                    o.ext.buf_lock |= SOCK_RCVBUF_LOCK;
+                }
+                if let Some(id) = self.kernel_tcb_id() {
+                    let _ = narf_net::tcp::core::set_buffer_limits(id, None, Some(rcvbuf));
+                }
                 OK
             }
             SO_OOBINLINE => {

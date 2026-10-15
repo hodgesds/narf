@@ -38,13 +38,14 @@ use crate::pkt::{
 };
 
 pub use crate::tcp::core::{
-    accept, close, connect, connect6_errno_in, connect6_errno_with_options_in, connect_errno_in,
-    connect_in, endpoints6, getsockopt_cong, getsockopt_int, listen, listen6_in,
-    listen_has_pending, listen_in, lookup_tcb, readable, recv, recv_errno, release, remove_tcb,
-    send, send_errno, setsockopt_int, setsockopt_str, shutdown, shutdown_errno, take_sock_error,
-    tick_retransmit, writable, Tcb, TCP_CONGESTION, TCP_CORK, TCP_DEFER_ACCEPT, TCP_KEEPALIVE,
-    TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_MAXSEG, TCP_NODELAY, TCP_NOTSENT_LOWAT,
-    TCP_QUICKACK, TCP_SYNCNT, TCP_THIN_DUPACK, TCP_THIN_LINEAR_TIMEOUTS, TCP_USER_TIMEOUT,
+    accept, close, close_linger, connect, connect6_errno_in, connect6_errno_with_options_in,
+    connect_errno_in, connect_in, endpoints6, getsockopt_cong, getsockopt_int, listen, listen6_in,
+    listen_has_pending, listen_in, lookup_tcb, readable, recv, recv_errno, recv_peek_errno,
+    release, remove_tcb, send, send_errno, setsockopt_int, setsockopt_str, shutdown,
+    shutdown_errno, take_sock_error, tick_retransmit, writable, Tcb, TCP_CONGESTION, TCP_CORK,
+    TCP_DEFER_ACCEPT, TCP_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_MAXSEG,
+    TCP_NODELAY, TCP_NOTSENT_LOWAT, TCP_QUICKACK, TCP_SYNCNT, TCP_THIN_DUPACK,
+    TCP_THIN_LINEAR_TIMEOUTS, TCP_USER_TIMEOUT,
 };
 pub use crate::tcp::state_machine::{DropCause, Shutdown, TcpState};
 

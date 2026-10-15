@@ -75,7 +75,8 @@ impl Default for SendBuf {
 impl SendBuf {
     pub fn new(limit: usize, isn: u32) -> Self {
         Self {
-            bytes: VecDeque::with_capacity(limit.min(64 * 1024)),
+            // Grown on demand: an idle or TIME-WAIT connection holds no buffer.
+            bytes: VecDeque::new(),
             unacked_head_seq: isn,
             sent_offset: 0,
             limit,
@@ -91,6 +92,11 @@ impl SendBuf {
             self.bytes.push_back(b);
         }
         n
+    }
+
+    /// Bytes of storage currently allocated.
+    pub fn capacity(&self) -> usize {
+        self.bytes.capacity()
     }
 
     /// Number of bytes queued (sent + unsent).
@@ -214,7 +220,7 @@ pub struct RecvBuf {
 impl RecvBuf {
     pub fn new(limit: usize) -> Self {
         Self {
-            in_order: VecDeque::with_capacity(limit.min(64 * 1024)),
+            in_order: VecDeque::new(),
             out_of_order: Vec::new(),
             limit,
         }
@@ -254,6 +260,32 @@ impl RecvBuf {
             *slot = self.in_order.pop_front().unwrap_or(0);
         }
         n
+    }
+
+    /// `MSG_PEEK`: copy up to `dst.len()` in-order bytes without consuming
+    /// them. Returns the byte count.
+    pub fn peek(&self, dst: &mut [u8]) -> usize {
+        let n = dst.len().min(self.in_order.len());
+        let (a, b) = self.in_order.as_slices();
+        let from_a = n.min(a.len());
+        dst[..from_a].copy_from_slice(&a[..from_a]);
+        dst[from_a..n].copy_from_slice(&b[..n - from_a]);
+        n
+    }
+
+    /// Bytes of storage currently allocated (in-order + out-of-order).
+    pub fn capacity(&self) -> usize {
+        self.in_order.capacity()
+            + self
+                .out_of_order
+                .iter()
+                .map(|s| s.data.capacity())
+                .sum::<usize>()
+    }
+
+    /// In-order bytes the user can read now.
+    pub fn in_order_len(&self) -> usize {
+        self.in_order.len()
     }
 
     /// `true` iff `read()` would return at least one byte.

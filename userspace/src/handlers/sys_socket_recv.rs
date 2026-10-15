@@ -39,6 +39,31 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
                 .unwrap_or(false)
         })
         .unwrap_or(false);
+    // MSG_WAITALL on a blocking kernel-TCP socket waits for the full length
+    // (Linux `tcp_recvmsg_locked`: `target = sock_rcvlowat(sk, waitall, len)`).
+    const MSG_WAITALL: u32 = 0x100;
+    if flags & MSG_WAITALL != 0 && flags & crate::socket::MSG_PEEK == 0 && !nonblock && buf_len > 0
+    {
+        if let Some(tcb) = sock.kernel_tcb_id() {
+            match tcp_recv_waitall(ctx, &sock, tcb, buf_ptr, buf_len, resumed) {
+                None => {}
+                Some(Ok(n)) => {
+                    if args.arg4 != 0 {
+                        if let Err(errno) = move_addr_to_user(None, args.arg4, args.arg5) {
+                            ctx.set_return(errno_ret(errno));
+                            return;
+                        }
+                    }
+                    ctx.set_return(SyscallReturn::ok(n as u64));
+                }
+                Some(Err(crate::socket::SockError::WouldBlock)) => {
+                    socket_recv_would_block(ctx, nonblock, sock.as_ref(), resumed);
+                }
+                Some(Err(e)) => ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64)),
+            }
+            return;
+        }
+    }
     let mut buf = alloc::vec![0u8; buf_len];
     let result = sock.dispatch_op(crate::socket::SocketOp::Recv {
         buf: &mut buf,
@@ -194,4 +219,213 @@ pub(super) fn socket_block(
     }
     let _ = sock_timeo_take(ctx, sock);
     ctx.set_return(errno_ret(EAGAIN));
+}
+
+/// Bytes the same blocking stream call (same syscall return address and
+/// socket) had already moved before it parked; 0 for a fresh call. Taken —
+/// a completed call never leaves progress for the next one.
+pub(super) fn sock_progress_take(ctx: &dyn TrapContext, sock: &crate::socket::SocketFile) -> usize {
+    use core::sync::atomic::Ordering;
+    let Some(uctx) = crate::user_task::current_user_task() else {
+        return 0;
+    };
+    // SAFETY: the live per-task context of the task executing this syscall;
+    // only atomics are touched.
+    let uc = unsafe { &*uctx };
+    let key = uc.sock_progress_key.swap(0, Ordering::AcqRel);
+    let done = uc.sock_progress_done.swap(0, Ordering::AcqRel);
+    if key != 0 && key == sock_timeo_key(ctx, sock) {
+        done as usize
+    } else {
+        0
+    }
+}
+
+fn sock_progress_store(ctx: &dyn TrapContext, sock: &crate::socket::SocketFile, done: usize) {
+    use core::sync::atomic::Ordering;
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: as in `sock_progress_take`.
+        let uc = unsafe { &*uctx };
+        uc.sock_progress_done.store(done as u64, Ordering::Release);
+        uc.sock_progress_key.store(sock_timeo_key(ctx, sock), Ordering::Release);
+    }
+}
+
+/// What a progress-keeping stream wait decided.
+pub(super) enum StreamWait {
+    /// The task parked; the syscall re-executes when the socket is ready.
+    Parked,
+    /// Stop here and return the bytes already moved (Linux returns the
+    /// partial count when a signal, the SO_{RCV,SND}TIMEO timeout or a
+    /// non-sleeping context ends the wait after some progress).
+    Return,
+}
+
+/// Park a blocking stream call that has already moved `done > 0` bytes until
+/// `interest` is ready, keeping `done` (and the SO_*TIMEO deadline) for the
+/// re-execution. Linux `sk_stream_wait_memory` / `sk_wait_data` loops return
+/// the partial count instead of an error once something was copied.
+pub(super) fn stream_wait_with_progress(
+    ctx: &mut dyn TrapContext,
+    sock: &crate::socket::SocketFile,
+    interest: u32,
+    timeo: Option<u64>,
+    resumed: Option<u64>,
+    done: usize,
+) -> StreamWait {
+    use core::sync::atomic::Ordering;
+    if has_interrupting_signal(current_task_id()) {
+        return StreamWait::Return;
+    }
+    let deadline = match crate::socket::timeo_ns(timeo) {
+        None => u64::MAX,
+        Some(0) => return StreamWait::Return,
+        Some(t) => {
+            let now = narf_scheduler::narf_time::monotonic_ns();
+            let d = resumed.unwrap_or_else(|| now.saturating_add(t));
+            if now >= d {
+                return StreamWait::Return;
+            }
+            if let Some(uctx) = crate::user_task::current_user_task() {
+                // SAFETY: as in `sock_timeo_take`.
+                let uc = unsafe { &*uctx };
+                uc.sock_timeo_deadline_ns.store(d, Ordering::Release);
+                uc.sock_timeo_key
+                    .store(sock_timeo_key(ctx, sock), Ordering::Release);
+            }
+            d
+        }
+    };
+    sock_progress_store(ctx, sock, done);
+    if park_reexecute_on_fd_until(ctx, sock, interest, deadline) {
+        return StreamWait::Parked;
+    }
+    let _ = sock_progress_take(ctx, sock);
+    let _ = sock_timeo_take(ctx, sock);
+    StreamWait::Return
+}
+
+/// Outcome of [`tcp_send_all`].
+pub(super) enum SendAll {
+    /// Return this byte count (the whole buffer, or a partial count after a
+    /// signal / timeout / error that followed some progress).
+    Done(usize),
+    /// The call parked and re-executes later.
+    Parked,
+    /// Nothing was sent and the send buffer is full: the caller's ordinary
+    /// would-block path (EAGAIN / park / EINTR / timeout) applies.
+    WouldBlock,
+    /// Nothing was sent: this error (EPIPE raises SIGPIPE at the caller).
+    Err(crate::socket::SockError),
+}
+
+/// Linux `tcp_sendmsg_locked` on a BLOCKING socket: queue the whole user
+/// buffer, sleeping for send-buffer space as often as needed, and return the
+/// full length. The send buffer holds far less than a 16 MiB write, so one
+/// call spans many park / re-execute rounds; the bytes already queued ride
+/// across them in `sock_progress_*`. A signal or SO_SNDTIMEO ends the wait
+/// with the partial count, as does an error after some progress
+/// (`do_error: if (copied) goto out`).
+pub(super) fn tcp_send_all(
+    ctx: &mut dyn TrapContext,
+    sock: &crate::socket::SocketFile,
+    tcb: u32,
+    user_ptr: u64,
+    len: usize,
+    resumed_timeo: Option<u64>,
+) -> SendAll {
+    const CHUNK: usize = 1 << 20;
+    let mut done = sock_progress_take(ctx, sock).min(len);
+    while done < len {
+        let want = core::cmp::min(CHUNK, len - done);
+        // SAFETY: the caller validated the whole user range; the guarded
+        // copy still reports a racing unmap.
+        let payload = match unsafe { copy_from_user_vec(user_ptr + done as u64, want) } {
+            Ok(p) => p,
+            Err(_) if done > 0 => return SendAll::Done(done),
+            Err(e) => return SendAll::Err(crate::socket::SockError::Stack(e as i32)),
+        };
+        match narf_net::tcp_stack::send_errno(tcb, &payload) {
+            Ok(n) => {
+                done += n;
+                if n == want {
+                    continue;
+                }
+            }
+            Err(e) if e == narf_lib::errno::EAGAIN as i32 => {}
+            Err(_) if done > 0 => return SendAll::Done(done),
+            Err(e) => return SendAll::Err(crate::socket::SockError::from_stack(e)),
+        }
+        if done == 0 {
+            return SendAll::WouldBlock;
+        }
+        match stream_wait_with_progress(
+            ctx,
+            sock,
+            narf_filesystem::POLL_OUT | narf_filesystem::POLL_HUP,
+            sock.sndtimeo(),
+            resumed_timeo,
+            done,
+        ) {
+            StreamWait::Parked => return SendAll::Parked,
+            StreamWait::Return => return SendAll::Done(done),
+        }
+    }
+    SendAll::Done(done)
+}
+
+/// Linux `tcp_recvmsg_locked` with MSG_WAITALL on a BLOCKING socket: keep
+/// reading until `len` bytes arrived, EOF, an error, a signal or the
+/// SO_RCVTIMEO timeout; what was copied so far is returned in the last four
+/// cases. Bytes go straight to the user buffer, so a re-execution resumes at
+/// `user_ptr + done`. `None`: the call parked. `Some(Err(WouldBlock))`:
+/// nothing arrived yet and the caller's ordinary would-block path applies.
+pub(super) fn tcp_recv_waitall(
+    ctx: &mut dyn TrapContext,
+    sock: &crate::socket::SocketFile,
+    tcb: u32,
+    user_ptr: u64,
+    len: usize,
+    resumed_timeo: Option<u64>,
+) -> Option<Result<usize, crate::socket::SockError>> {
+    const CHUNK: usize = 1 << 20;
+    let mut done = sock_progress_take(ctx, sock).min(len);
+    let mut buf = alloc::vec![0u8; core::cmp::min(CHUNK, len.saturating_sub(done)).max(1)];
+    while done < len {
+        let want = core::cmp::min(buf.len(), len - done);
+        match narf_net::tcp_stack::recv_errno(tcb, &mut buf[..want]) {
+            Ok(0) => return Some(Ok(done)),
+            Ok(n) => {
+                // SAFETY: the caller validated the whole user range; the
+                // guarded copy reports a racing unmap.
+                if unsafe { copy_to_user(user_ptr + done as u64, &buf[..n]) }.is_err() {
+                    return Some(if done > 0 {
+                        Ok(done)
+                    } else {
+                        Err(crate::socket::SockError::Stack(EFAULT as i32))
+                    });
+                }
+                done += n;
+                continue;
+            }
+            Err(e) if e == narf_lib::errno::EAGAIN as i32 => {}
+            Err(_) if done > 0 => return Some(Ok(done)),
+            Err(e) => return Some(Err(crate::socket::SockError::from_stack(e))),
+        }
+        if done == 0 {
+            return Some(Err(crate::socket::SockError::WouldBlock));
+        }
+        match stream_wait_with_progress(
+            ctx,
+            sock,
+            narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
+            sock.rcvtimeo(),
+            resumed_timeo,
+            done,
+        ) {
+            StreamWait::Parked => return None,
+            StreamWait::Return => return Some(Ok(done)),
+        }
+    }
+    Some(Ok(done))
 }
