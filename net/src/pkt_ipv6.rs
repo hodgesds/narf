@@ -28,7 +28,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use crate::pkt::ip_checksum;
+use crate::pkt::{ip_checksum, ones_complement_add, ones_complement_sum};
 
 /// IPv6 fixed header size.
 pub const IPV6_HDR_LEN: usize = 40;
@@ -128,11 +128,10 @@ fn ipv6_pseudo_header(src: [u8; 16], dst: [u8; 16], length: u32, next_header: u8
 /// Compute the upper-layer checksum (TCP / UDP / ICMPv6) against the
 /// IPv6 pseudo-header.
 pub fn pseudo_checksum(src: [u8; 16], dst: [u8; 16], next_header: u8, body: &[u8]) -> u16 {
+    // Sum the 40-byte pseudo-header and the body in place (no scratch copy
+    // of the body); the even-length header keeps word alignment.
     let pseudo = ipv6_pseudo_header(src, dst, body.len() as u32, next_header);
-    let mut buf = Vec::with_capacity(pseudo.len() + body.len());
-    buf.extend_from_slice(&pseudo);
-    buf.extend_from_slice(body);
-    ip_checksum(&buf)
+    !ones_complement_add(ones_complement_sum(&pseudo), ones_complement_sum(body))
 }
 
 /// The IPv6 upper-layer checksum-offload *seed*: the one's-complement sum of

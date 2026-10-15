@@ -152,6 +152,20 @@ TTL, TOS, DF, and a fixed or per-segment-incrementing IP ID. PSH, a short
 segment, or the size ceiling ends the batch. SYN/FIN/RST/URG, pure ACKs and
 segments without ACK are never held; they flush their flow first.
 
+### 3.2a Software checksum primitives
+
+```rust
+pub fn ip_checksum(buf: &[u8]) -> u16;
+pub fn ones_complement_sum(buf: &[u8]) -> u16;
+pub const fn ones_complement_add(a: u16, b: u16) -> u16;
+```
+
+`ones_complement_sum` returns the folded, uncomplemented RFC 1071 sum.
+`ones_complement_add` combines independently folded sums; every fragment but
+the last must have even length so the wire's 16-bit word alignment is
+preserved. The L4 pseudo-header helpers use these primitives without allocating
+or copying the segment body.
+
 ### 3.3 Control-plane operations
 
 ```rust

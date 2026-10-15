@@ -31,7 +31,7 @@
 //!   bytes 10..11 UDP length
 //! ```
 
-use crate::pkt::ip_checksum;
+use crate::pkt::{ones_complement_add, ones_complement_sum};
 
 /// UDP header size in bytes.
 pub const UDP_HDR_LEN: usize = 8;
@@ -73,15 +73,24 @@ impl UdpHeader {
 /// computed value of 0 is transmitted as 0xFFFF so receivers can
 /// distinguish "checksum disabled" from "all zero".
 pub fn ipv4_pseudo_checksum(src: [u8; 4], dst: [u8; 4], udp: &[u8]) -> u16 {
-    let mut buf = alloc::vec::Vec::with_capacity(12 + udp.len() + 1);
-    buf.extend_from_slice(&src);
-    buf.extend_from_slice(&dst);
-    buf.push(0); // zero
-    buf.push(crate::pkt::IP_PROTO_UDP);
+    // Sum the 12-byte pseudo-header and the datagram in place (no scratch
+    // copy of the datagram); the even-length header keeps word alignment.
     let length = udp.len() as u16;
-    buf.extend_from_slice(&length.to_be_bytes());
-    buf.extend_from_slice(udp);
-    let sum = ip_checksum(&buf);
+    let ph = [
+        src[0],
+        src[1],
+        src[2],
+        src[3],
+        dst[0],
+        dst[1],
+        dst[2],
+        dst[3],
+        0, // zero
+        crate::pkt::IP_PROTO_UDP,
+        (length >> 8) as u8,
+        length as u8,
+    ];
+    let sum = !ones_complement_add(ones_complement_sum(&ph), ones_complement_sum(udp));
     if sum == 0 {
         0xFFFF
     } else {
