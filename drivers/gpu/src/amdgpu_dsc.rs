@@ -22,14 +22,14 @@ mod qp;
 /// Linux's `struct fixed31_32` (dc/basics/fixpt31_32.c), as the DSC code
 /// uses it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Fixed(i64);
+pub(crate) struct Fixed(pub(crate) i64);
 impl Fixed {
-    fn int(v: i32) -> Self {
+    pub(crate) fn int(v: i32) -> Self {
         Self(i64::from(v) << 32)
     }
     /// dc_fixpt_from_fraction: 32 fraction bits by long division, the last
     /// rounded half up.
-    fn fraction(numerator: i64, denominator: i64) -> Self {
+    pub(crate) fn fraction(numerator: i64, denominator: i64) -> Self {
         let negative = (numerator < 0) ^ (denominator < 0);
         let a = numerator.unsigned_abs();
         let b = denominator.unsigned_abs();
@@ -49,7 +49,7 @@ impl Fixed {
     }
     /// dc_fixpt_mul: integer and fraction halves, the fraction product
     /// rounded half up.
-    fn mul(self, other: Self) -> Self {
+    pub(crate) fn mul(self, other: Self) -> Self {
         let negative = (self.0 < 0) ^ (other.0 < 0);
         let a = self.0.unsigned_abs();
         let b = other.0.unsigned_abs();
@@ -63,22 +63,22 @@ impl Fixed {
         let v = v as i64;
         Self(if negative { v.wrapping_neg() } else { v })
     }
-    fn div(self, other: Self) -> Self {
+    pub(crate) fn div(self, other: Self) -> Self {
         Self::fraction(self.0, other.0)
     }
-    fn div_int(self, v: i64) -> Self {
+    pub(crate) fn div_int(self, v: i64) -> Self {
         Self::fraction(self.0, Self::int(v as i32).0)
     }
-    fn mul_int(self, v: i32) -> Self {
+    pub(crate) fn mul_int(self, v: i32) -> Self {
         self.mul(Self::int(v))
     }
-    fn add_int(self, v: i32) -> Self {
+    pub(crate) fn add_int(self, v: i32) -> Self {
         Self(self.0.wrapping_add(Self::int(v).0))
     }
-    fn sub_int(self, v: i32) -> Self {
+    pub(crate) fn sub_int(self, v: i32) -> Self {
         Self(self.0.wrapping_sub(Self::int(v).0))
     }
-    fn floor(self) -> i32 {
+    pub(crate) fn floor(self) -> i32 {
         let v = (self.0.unsigned_abs() >> 32) as i32;
         if self.0 >= 0 {
             v
@@ -86,7 +86,7 @@ impl Fixed {
             -v
         }
     }
-    fn ceil(self) -> i32 {
+    pub(crate) fn ceil(self) -> i32 {
         let v = (self.0.unsigned_abs().wrapping_add((1 << 32) - 1) >> 32) as i32;
         if self.0 >= 0 {
             v

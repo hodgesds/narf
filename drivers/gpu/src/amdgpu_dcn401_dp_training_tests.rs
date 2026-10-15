@@ -195,6 +195,15 @@ impl Transport for Link {
     }
 }
 fn fixture(p: u8, lanes: u8, rate: LinkRate, pattern: TrainingPattern) -> (Engine<LinkIo>, Link) {
+    fixture_mode(p, lanes, rate, pattern, false)
+}
+fn fixture_mode(
+    p: u8,
+    lanes: u8,
+    rate: LinkRate,
+    pattern: TrainingPattern,
+    mst: bool,
+) -> (Engine<LinkIo>, Link) {
     let (mut e, mut f) = super::fixture(
         p,
         if lanes == 1 {
@@ -205,11 +214,7 @@ fn fixture(p: u8, lanes: u8, rate: LinkRate, pattern: TrainingPattern) -> (Engin
             15
         },
     );
-    let settings = DpPhySettings {
-        lanes,
-        rate,
-        mst: false,
-    };
+    let settings = DpPhySettings { lanes, rate, mst };
     run(e.enable_dp_phy(&mut f, path(p), settings)).unwrap();
     let source = Arc::new(AtomicU32::new(0));
     let change = Arc::new(AtomicU64::new(0));
@@ -935,4 +940,71 @@ fn dcn401_dp_training_sets_fec_ready_and_enable_like_linux() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_dp_training_sets_fec_ready_and_enable_like_linux
+);
+
+/// Linux's allocate_mst_payload on the source: SAT0/SAT1 with each
+/// payload's DIO stream and slots (the rest cleared), the update with
+/// ACT; then each stream's VC rate, X.Y slots per MTP. Only an MST link of
+/// the selected display, at most 63 slots in four payloads.
+fn dcn401_mst_allocation_programs_sat_and_vc_rate_like_linux() -> TestResult {
+    use super::super::mst::{vc_rate, MstAllocation};
+    let (mut e, mut io) = fixture(1, 4, LinkRate::Hbr2, TrainingPattern::Tps3);
+    run(e.train_dp_link(&mut io, path(1), true, false)).unwrap();
+    let table = [
+        MstAllocation {
+            stream: 1,
+            slots: 13,
+        },
+        MstAllocation {
+            stream: 2,
+            slots: 20,
+        },
+    ];
+    // An SST link carries no allocation table.
+    assert_eq!(run(e.update_mst_allocation(1, &table)), Err(Error::Busy));
+    let (mut e, mut io) = fixture_mode(1, 4, LinkRate::Hbr2, TrainingPattern::Tps3, true);
+    run(e.train_dp_link(&mut io, path(1), true, false)).unwrap();
+    run(e.update_mst_allocation(1, &table)).unwrap();
+    let reg =
+        |e: &Engine<LinkIo>, r: u64| e.io.inner.inner.regs.get(&dio(1, r)).copied().unwrap_or(0);
+    if reg(&e, 0x2150) != (1 | 13 << 8 | (2 | 20 << 8) << 16)
+        || reg(&e, 0x2151) & 0x3f07_3f07 != 0
+        || reg(&e, 0x2153) & 3 != 1
+    {
+        return TestResult::Fail("SAT");
+    }
+    let too_many = [
+        MstAllocation {
+            stream: 0,
+            slots: 40,
+        },
+        MstAllocation {
+            stream: 3,
+            slots: 24,
+        },
+    ];
+    assert_eq!(
+        run(e.update_mst_allocation(1, &too_many)),
+        Err(Error::Invalid)
+    );
+    // 1080p60 RGB (3,564,000 kbps, PBN 528) on 4 x HBR2 (40 PBN per slot):
+    // 13.2 slots per MTP; 3,240,000 kbps is exactly 12.
+    let Some((x, y)) = vc_rate(3_564_000, 17_280_000) else {
+        return TestResult::Fail("VC rate");
+    };
+    if x != 13
+        || !(13_421_772..=13_421_774).contains(&y)
+        || vc_rate(3_240_000, 17_280_000) != Some((12, 0))
+    {
+        return TestResult::Fail("VC rate value");
+    }
+    run(e.set_mst_vc_rate(1, 2, (x, y))).unwrap();
+    if e.io.inner.inner.regs.get(&dio(2, 0x214d)) != Some(&(x << 26 | y)) {
+        return TestResult::Fail("VC rate register");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_mst_allocation_programs_sat_and_vc_rate_like_linux
 );

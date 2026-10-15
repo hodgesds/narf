@@ -794,6 +794,43 @@ impl ColdBoot {
     }
     /// Divide acknowledged global clocks for a retired native display pipe.
     /// The link/modeset owner must still program its PLL, PHY and scanout.
+    /// Program the port's MST link's VC payload table and trigger ACT.
+    /// # Safety
+    /// Fulfil `Otg::update_mst_allocation` obligations.
+    pub async unsafe fn update_display_mst_allocation(
+        &mut self,
+        port: usize,
+        table: &[otg::MstAllocation],
+    ) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: the caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .update_mst_allocation(path.transmitter, table)
+                .await
+        }
+    }
+    /// Set DIO stream `stream`'s VC rate on the port's MST link.
+    /// # Safety
+    /// Fulfil `Otg::set_mst_vc_rate` obligations.
+    pub async unsafe fn set_display_mst_vc_rate(
+        &mut self,
+        port: usize,
+        stream: u8,
+        rate: (u32, u32),
+    ) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: the caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .set_mst_vc_rate(path.transmitter, stream, rate)
+                .await
+        }
+    }
     /// Run DSC `pipe`'s DSCCLK from its DTO for the stream on `pipe`'s
     /// prepared pixel clock (above 48 MHz, as Linux does). Returns whether
     /// the DTO runs.

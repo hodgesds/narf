@@ -54,6 +54,9 @@ mod tmds_phy;
 pub use tmds_phy::TmdsDisabled;
 #[path = "amdgpu_dcn401_dsc_hw.rs"]
 mod dsc_hw;
+#[path = "amdgpu_dcn401_mst.rs"]
+mod mst;
+pub use mst::{vc_rate, MstAllocation};
 #[path = "amdgpu_dcn401_frl.rs"]
 mod frl;
 pub use frl::{
