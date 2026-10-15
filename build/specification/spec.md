@@ -88,7 +88,9 @@ and CI compiler-cache integration.
   e1000-module-net-smoke --arch=x86_64` runs the identical exchanges over an
   exclusively module-owned QEMU 82540EM: xtask builds and ABI-stamps
   `e1000.ko`, stages it in an initramfs, selects `driver2` at boot load, and
-  suppresses the built-in e1000 registration for that fixture.
+  suppresses the built-in e1000 registration for that fixture. `cargo xtask
+  igb-net-smoke --arch=x86_64` runs the same exchanges over the built-in IGB
+  driver and QEMU's 82576 `igb` model, with no competing virtio-net device.
 - QEMU network backends are selectable without source changes.
   `XTASK_QEMU_TAP=<ifname>` attaches virtio-net to a pre-created TAP, or e1000
   when `--hw-profile=legacy-only` makes that selection unambiguous.

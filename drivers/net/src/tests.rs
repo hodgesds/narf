@@ -350,6 +350,61 @@ fn smoke_igc_advanced_rx_descriptor_layout() -> TestResult {
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_advanced_rx_descriptor_layout);
 
+// ── igb ────────────────────────────────────────────────────────────
+
+fn smoke_igb_pci_match_ownership() -> TestResult {
+    // igb is the *sole* owner of the I210/I211/82576/I350 IDs: every id
+    // in its `SUPPORTED_DEVICE_IDS` must register, and e1000 must NOT
+    // claim any of them (they were moved off the legacy driver).
+    use crate::{e1000, igb};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::{registered_pci_drivers, MatchKind};
+    __reset_for_test();
+    igb::register_pci_driver();
+    e1000::register_pci_driver();
+    let registered = registered_pci_drivers();
+    for did in igb::SUPPORTED_DEVICE_IDS.iter().copied() {
+        let on_igb = registered.iter().any(|m| {
+            m.name.starts_with("igb-")
+                && matches!(m.kind, MatchKind::VendorDevice {
+                    vendor, device,
+                } if vendor == igb::IGB_VENDOR && device == did)
+        });
+        if !on_igb {
+            return TestResult::Fail("igb match entry missing");
+        }
+        // The same id must not also be claimed by an e1000 match.
+        let on_e1000 = registered.iter().any(|m| {
+            !m.name.starts_with("igb-")
+                && matches!(m.kind, MatchKind::VendorDevice {
+                    vendor, device,
+                } if vendor == 0x8086 && device == did)
+        });
+        if on_e1000 {
+            return TestResult::Fail("igb id still squatted by e1000");
+        }
+    }
+    // Spot-check the datasheet-named IDs explicitly.
+    let must_have: &[u16] = &[
+        igb::IGB_I210_COPPER,
+        igb::IGB_I211_COPPER,
+        igb::IGB_82576,
+        igb::IGB_I350_COPPER,
+    ];
+    for did in must_have.iter().copied() {
+        let found = registered.iter().any(|m| {
+            matches!(m.kind, MatchKind::VendorDevice {
+                vendor, device,
+            } if vendor == igb::IGB_VENDOR && device == did)
+        });
+        if !found {
+            return TestResult::Fail("igb spot-check id missing");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igb", smoke_igb_pci_match_ownership);
+
 fn smoke_e1000_pci_match_table_covers_modern_pch() -> TestResult {
     // Structural smoke: register the e1000 driver and assert every
     // ID in `SUPPORTED_DEVICE_IDS` is present in the bus's match
@@ -435,18 +490,14 @@ fn smoke_e1000_is_pch_part_discriminator() -> TestResult {
             return TestResult::Fail("PCH part mis-classified as legacy");
         }
     }
-    // Legacy / QEMU-emulated parts + the igb-style I210/I211/I350 IDs
-    // we recognise for bus-probe purposes — none of these have an
-    // ME-attached PHY.
+    // Legacy / QEMU-emulated parts — none of these have an ME-attached
+    // PHY. (The I210/I211/82576/I350 IDs moved to the `igb` crate; see
+    // `smoke_igb_pci_match_ownership`.)
     let must_legacy: &[u16] = &[
         e1000::E1000_DEV_82540EM, // QEMU -device e1000
         e1000::E1000_DEV_82545EM,
         e1000::E1000_DEV_82544GC,
         e1000::E1000E_DEV_82574L, // QEMU q35 default e1000e
-        e1000::E1000_DEV_I210_COPPER,
-        e1000::E1000_DEV_I211_COPPER,
-        e1000::E1000_DEV_82576,
-        e1000::E1000_DEV_I350_COPPER,
     ];
     for did in must_legacy.iter().copied() {
         if e1000::is_pch_part(did) {

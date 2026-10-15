@@ -67,6 +67,7 @@ members = [
     "drivers/net/enic",
     "drivers/net/forcedeth",
     "drivers/net/i40e",
+    "drivers/net/igb",
     "drivers/net/igc",
     "drivers/net/ixgbe",
     "drivers/net/mlx5",

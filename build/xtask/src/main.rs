@@ -147,6 +147,11 @@ enum Cmd {
     /// loads it into an operator-selected driver frame before PCI probing,
     /// and leaves the built-in e1000 registration disabled for this boot.
     E1000ModuleNetSmoke(BuildArgs),
+    /// The same live TCP/UDP/DNS smoke over the built-in igb driver bound to
+    /// QEMU's `-device igb` (82576, 0x10C9). Boots LegacyOnly with the static
+    /// IPv4 late initcall so igb is the sole NIC and owns the SLIRP lease,
+    /// exercising the advanced one-buffer-descriptor datapath end to end.
+    IgbNetSmoke(BuildArgs),
     /// Off-box redis smoke. Boot with `qemu-net` + a QEMU `hostfwd`,
     /// wait for the auto-spawned unmodified `redis-server` to print
     /// `Ready to accept connections`, then open a real host TCP socket to
@@ -1160,11 +1165,23 @@ impl Arch {
                         "nvme,drive=nvm0,serial=narf".into(),
                     ]);
                     let n1 = legacy_qemu_netdev(profile);
+                    // `XTASK_QEMU_IGB=1` swaps the legacy NIC model for QEMU's
+                    // `igb` (82576, 0x10C9) so the advanced-descriptor igb
+                    // driver can be exercised on the same `n1` backend. The
+                    // emulated 82576 drives the identical datapath as the i210.
+                    let legacy_nic_dev = if std::env::var("XTASK_QEMU_IGB")
+                        .map(|v| v == "1")
+                        .unwrap_or(false)
+                    {
+                        "igb,netdev=n1"
+                    } else {
+                        "e1000,netdev=n1"
+                    };
                     args.extend_from_slice(&[
                         "-netdev".into(),
                         n1,
                         "-device".into(),
-                        "e1000,netdev=n1".into(),
+                        legacy_nic_dev.into(),
                     ]);
                     args.extend_from_slice(&[
                         "-drive".into(),
@@ -1390,11 +1407,23 @@ impl Arch {
                         "nvme,drive=nvm0,serial=narf".into(),
                     ]);
                     let n1 = legacy_qemu_netdev(profile);
+                    // `XTASK_QEMU_IGB=1` swaps the legacy NIC model for QEMU's
+                    // `igb` (82576, 0x10C9) so the advanced-descriptor igb
+                    // driver can be exercised on the same `n1` backend. The
+                    // emulated 82576 drives the identical datapath as the i210.
+                    let legacy_nic_dev = if std::env::var("XTASK_QEMU_IGB")
+                        .map(|v| v == "1")
+                        .unwrap_or(false)
+                    {
+                        "igb,netdev=n1"
+                    } else {
+                        "e1000,netdev=n1"
+                    };
                     args.extend_from_slice(&[
                         "-netdev".into(),
                         n1,
                         "-device".into(),
-                        "e1000,netdev=n1".into(),
+                        legacy_nic_dev.into(),
                     ]);
                 }
 
@@ -5893,18 +5922,25 @@ fn run_interactive_boot(
 enum NetSmokeNic {
     Virtio,
     E1000Module,
+    /// Built-in igb driver bound to QEMU's `-device igb` (82576, 0x10C9)
+    /// on the same advanced one-buffer-descriptor datapath as the i210.
+    Igb,
 }
 
-/// Live network-stack smoke — see [`Cmd::NetSmoke`] and
-/// [`Cmd::E1000ModuleNetSmoke`]. Both variants drive the same host-to-guest
-/// TCP/UDP echo and guest-to-SLIRP DNS checks; only the NIC ownership and QEMU
-/// backend differ.
+/// Live network-stack smoke — see [`Cmd::NetSmoke`],
+/// [`Cmd::E1000ModuleNetSmoke`], and [`Cmd::IgbNetSmoke`]. All variants drive
+/// the same host-to-guest TCP/UDP echo and guest-to-SLIRP DNS checks; only the
+/// NIC ownership and QEMU backend differ.
 fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     net_smoke_cmd_with_nic(args, NetSmokeNic::Virtio)
 }
 
 fn e1000_module_net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     net_smoke_cmd_with_nic(args, NetSmokeNic::E1000Module)
+}
+
+fn igb_net_smoke_cmd(args: &BuildArgs) -> Result<()> {
+    net_smoke_cmd_with_nic(args, NetSmokeNic::Igb)
 }
 
 fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
@@ -5916,6 +5952,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     let smoke_name = match nic {
         NetSmokeNic::Virtio => "net-smoke",
         NetSmokeNic::E1000Module => "e1000-module-net-smoke",
+        NetSmokeNic::Igb => "igb-net-smoke",
     };
     if !matches!(args.arch, Arch::X86_64) {
         bail!("xtask {smoke_name}: only x86_64 is wired (boot-init is x86_64-only)");
@@ -5953,6 +5990,17 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
             "xtask e1000-module-net-smoke: staged ABI 0x{abi:08x} e1000.ko for pre-probe autoload"
         );
     }
+    if nic == NetSmokeNic::Igb {
+        // Built-in igb on QEMU's `-device igb` (82576). LegacyOnly keeps
+        // virtio-net out of the picture so igb is the sole NIC, and the
+        // static-IPv4 late initcall drops 10.0.2.15 on it so SLIRP hostfwd
+        // + DNS work. `XTASK_QEMU_IGB=1` makes `qemu_args` emit the igb
+        // device model on the legacy `n1` netdev (which carries the hostfwd).
+        build.hw_profile = HwProfile::LegacyOnly;
+        ensure_feature(&mut build.features, "narf-drivers-net/qemu-static-ipv4");
+        std::env::set_var("XTASK_QEMU_IGB", "1");
+        println!("xtask igb-net-smoke: QEMU -device igb (82576) on the legacy n1 backend");
+    }
     let out_dir = cargo_build(&build, &root)?;
     let kernel = out_dir.join(&build.package);
     if !kernel.exists() {
@@ -5971,7 +6019,9 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     );
     match nic {
         NetSmokeNic::Virtio => std::env::set_var("XTASK_QEMU_HOSTFWD", forwards),
-        NetSmokeNic::E1000Module => std::env::set_var("XTASK_QEMU_LEGACY_HOSTFWD", forwards),
+        NetSmokeNic::E1000Module | NetSmokeNic::Igb => {
+            std::env::set_var("XTASK_QEMU_LEGACY_HOSTFWD", forwards)
+        }
     }
     // Suppress the redis-server auto-spawn: net-smoke only exercises
     // netserve, and redis's heavy multi-threaded startup starves
@@ -5982,7 +6032,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     {
         let existing = std::env::var("XTASK_QEMU_APPEND").unwrap_or_default();
         let extra = match nic {
-            NetSmokeNic::Virtio => "no_redis",
+            NetSmokeNic::Virtio | NetSmokeNic::Igb => "no_redis",
             NetSmokeNic::E1000Module => {
                 "no_redis modules_load=lib/modules/e1000.ko modules_domain=driver2"
             }
@@ -6311,6 +6361,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     let transport = match nic {
         NetSmokeNic::Virtio => "virtio-net",
         NetSmokeNic::E1000Module => "module-owned e1000",
+        NetSmokeNic::Igb => "built-in igb (QEMU 82576)",
     };
     println!("xtask {smoke_name}: ok — live TCP, UDP, and DNS passed over {transport}");
     Ok(())
@@ -11621,6 +11672,7 @@ fn main() -> Result<()> {
         Cmd::RunInteractive(args) => run_interactive_cmd(&args),
         Cmd::NetSmoke(args) => net_smoke_cmd(&args),
         Cmd::E1000ModuleNetSmoke(args) => e1000_module_net_smoke_cmd(&args),
+        Cmd::IgbNetSmoke(args) => igb_net_smoke_cmd(&args),
         Cmd::RedisSmoke(args) => redis_smoke_cmd(&args),
         Cmd::RedisBench(args) => redis_bench_cmd(&args),
         Cmd::StressBench(args) => stress_bench_cmd(&args),
