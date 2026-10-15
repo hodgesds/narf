@@ -438,6 +438,14 @@ Other displays remain owned; failures retain reservations. Replug allocates
 fresh buffers without accumulating geometry-specific VRAM. Low-level callers
 can still retain buffers until explicit release, and link retraining keeps its
 surfaces. Reclamation is model-tested; physical transitions remain unvalidated.
+Teardown now checkpoints completed native steps in the retained owner, allowing
+the same modeset to resume a preflight rejection without replaying prior audio,
+scanout or link work. Intent is recorded before CPU withdrawal; the monitor
+finishes interrupted retirement before reactivation and publishes the CRTC
+inactive meanwhile. Cancelled CPU drains can resume, but cancellation inside
+a native phase blocks replay even when that phase spans several owners.
+Native failure guards still block uncertain operations; arbitrary partial
+activation and physical recovery validation remain open.
 The lit Navi48 display is published as DRM KMS state on the amdgpu card, with
 the sink's real EDID and exact timing (disconnected on unplug). SETCRTC
 accepts only that timing, and the base amdgpu DRM version 3.0.0 claims no

@@ -453,6 +453,7 @@ pub struct ColdBoot {
     otg: Result<otg::Otg, otg::Error>,
     /// Ports running DP MST, by `display_paths` index.
     mst: alloc::collections::BTreeMap<usize, mst::MstLink>,
+    teardowns: teardown::Teardowns,
 }
 impl ColdBoot {
     /// # Safety
@@ -579,6 +580,7 @@ impl ColdBoot {
             dccg,
             otg,
             mst: alloc::collections::BTreeMap::new(),
+            teardowns: teardown::Teardowns::new(),
             sequence: Sequence {
                 backend: Hardware {
                     gpu: saved,
@@ -2489,12 +2491,15 @@ mod mst;
 pub use mst::{select_mst, MstFailure, MstLink, MstOutput, MstOutputId, MstPayload};
 #[path = "amdgpu_navi48_modeset.rs"]
 mod modeset;
+#[path = "amdgpu_navi48_teardown.rs"]
+mod teardown;
 pub use modeset::{
     broadcast_rgb, frl_audio, frl_cap, frl_carries, frl_enabled, frl_link, limited_range, max_bpc,
     set_broadcast_rgb, set_frl, set_max_bpc, Configuration, FrlRate, Health, InheritedRetired,
     Modeset, ModesetError, MstStream, Selection, BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL,
     BROADCAST_RGB_LIMITED,
 };
+pub use teardown::{TeardownStatus, TeardownStep};
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi48_boot_tests.rs"]
 mod tests;

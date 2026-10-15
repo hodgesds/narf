@@ -978,6 +978,42 @@ otherwise. Failures leave every owner where it stopped. `stop_modeset`
 reverses a success down to a disabled PHY with timing and planes retired; the
 surface allocation remains bound to its pipe.
 
+`ColdBoot::begin_modeset_teardown(m, unplugged)` records teardown intent without
+hardware access, before an async CPU-writer withdrawal. `stop_modeset` and
+`unplug_modeset` also begin it automatically. Per-pipe progress stays in the
+retained owner across errors and dropped futures. `display_teardown_status`
+returns `TeardownStatus { next: TeardownStep, in_flight, unplugged }`: audio, scanout,
+video, protocol-specific SCDC/payload/frontend work, link, timing, optional
+DSC clock, planes, then Complete. Only successful steps advance, with no
+await between completion and recording it. A resume must carry the original
+modeset's scanout address/stream/frame witness and teardown parameters;
+unplug intent can be upgraded but never downgraded. Completed phases are
+not replayed. TMDS/FRL sink cleanup keeps its existing best-effort SCDC policy.
+MST link handover/detach runs only after video, payload and frontend retirement.
+
+The unfinished operation still performs all native state/authority/hardware
+checks. A returned transient preflight rejection can be retried; native failed
+owners remain blocked. Cancellation during CPU withdrawal can resume, since no
+native phase has started. Once a native phase starts, a dropped future leaves
+`in_flight` set and replay is refused, including compound SCDC/MST work without
+a single native completion witness. This does not reset quarantined hardware
+or recover arbitrary partial activation.
+Completed progress is historical, and requires the owner still to be in
+PlanesRetired; fresh CPU/hardware proof remains mandatory for surface release.
+High-level activation/retraining rejects incomplete teardowns, and a new
+activation clears only that pipe's completed progress.
+
+The monitor records intent before draining CPU views, publishes the retiring
+CRTC inactive, and retains its Modeset until teardown and surface release both
+succeed. A later pass resumes recorded teardowns before ordinary health checks
+or MST notification service, even if DRM has since asked to reactivate. It
+finishes retirement before considering a fresh relight. Console withdrawal
+never selects another retiring pipe. Errors still stop the spawned monitor;
+explicit resumes and cancellation recovery do not bypass native quarantine.
+Models cover every protocol's step ordering, rejection/cancellation at every
+step, request identity, sibling progress and unplug upgrades. Physical
+transition/recovery validation remains open.
+
 Before training, the modeset enables the connector's HPD block, as Linux's
 interrupt-mode HPD GPIO and `enable_hpd` do: the pad's DC_GPIO_HPD_MASK bit is
 cleared and DC_HPD_EN set. The board path's one-based selector names
@@ -1093,8 +1129,8 @@ selects that timing when the sink lists it and it fits, else the preferred
 one. If the requested mode fails to light, the preferred mode is lit and
 the request cleared. The last DRM file closing returns to the preferred
 mode. Mode changes are therefore asynchronous to the ioctl (the next monitor
-pass, up to a second), and the switch path itself is composed from tested
-owner operations without a model of its own. Unplug (and `stop_modeset`)
+pass, up to a second). The teardown sequence now has its own progress and
+fault/cancellation models; partial activation recovery remains open. Unplug (and `stop_modeset`)
 publish the connector disconnected, with no modes, no EDID, and no mode
 accepted. The CRTC is disabled with its framebuffer cleared, and open
 clients keep their GEM and framebuffer objects. DRM_IOCTL_VERSION reports

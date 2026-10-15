@@ -646,6 +646,8 @@ fn pipe_of(port: usize) -> Option<u8> {
 struct OutputState {
     /// DRM wants the CRTC on (SETCRTC with a framebuffer, atomic ACTIVE=1).
     active: bool,
+    /// A recorded teardown stays inactive even if DRM requests on meanwhile.
+    retiring: bool,
     /// The mode DRM last set, or None for the sink's preferred mode.
     requested: Option<Timing>,
     /// The lit sink: EDID, running timing and every offered timing.
@@ -658,6 +660,7 @@ impl OutputState {
     const fn new() -> Self {
         Self {
             active: true,
+            retiring: false,
             requested: None,
             shown: None,
             mst_id: None,
@@ -691,6 +694,9 @@ impl OutputState {
             self.shown.as_ref()
         }
     }
+    fn published_active(&self) -> bool {
+        self.active && !self.retiring
+    }
 }
 static OUTPUT_STATE: narf_lib::sync::IrqSafeSpinLock<[OutputState; 4]> =
     narf_lib::sync::IrqSafeSpinLock::new([const { OutputState::new() }; 4]);
@@ -703,7 +709,7 @@ fn publish_outputs() {
     let sinks: Vec<_> = outputs
         .iter()
         .enumerate()
-        .map(|(k, &(_, kind))| (kind, state[k].published(), state[k].active))
+        .map(|(k, &(_, kind))| (kind, state[k].published(), state[k].published_active()))
         .collect();
     let kms: Vec<crate::amdgpu_navi48_kms::Output> = sinks
         .iter()
@@ -792,6 +798,7 @@ async unsafe fn adopt(boot: &mut boot::ColdBoot, m: &Modeset) {
     let offered: Vec<Timing> = m.modes.iter().flatten().copied().collect();
     if let Some(o) = OUTPUT_STATE.lock().get_mut(usize::from(pipe)) {
         o.shown = Some((s.edid, s.timing, offered));
+        o.retiring = false;
     }
 }
 
@@ -800,7 +807,11 @@ async unsafe fn adopt(boot: &mut boot::ColdBoot, m: &Modeset) {
 async fn withdraw(boot: &boot::ColdBoot, pipe: u8, lit: &[Option<Modeset>; 4]) {
     present_slot(pipe).native.store(false, Ordering::Release);
     if CURSOR_PIPE.load(Ordering::Acquire) == pipe {
-        let next = lit.iter().flatten().map(|m| m.pipe).find(|&p| p != pipe);
+        let next = lit
+            .iter()
+            .flatten()
+            .map(|m| m.pipe)
+            .find(|&p| p != pipe && boot.display_teardown_status(p).is_none());
         publish_console(boot, next);
     }
     crate::scanout_access::wait_retired().await;
@@ -831,6 +842,12 @@ async unsafe fn light_displays(
     fill: impl FnMut(u8, u32, &mut [u32]),
 ) -> Result<crate::amdgpu_navi48_boot::Configuration, ModesetError> {
     use crate::drm::card::ConnectorType;
+    if (0..4).any(|p| {
+        boot.display_teardown_status(p)
+            .is_some_and(|s| s.next != boot::TeardownStep::Complete)
+    }) {
+        return Err(crate::amdgpu_dcn401_otg::Error::Busy.into());
+    }
     // The first plugged DP port whose sink is an MST branch lights its end
     // devices, one output each; the other ports stay dark meanwhile.
     let board = lightable_outputs(boot);
@@ -1437,6 +1454,12 @@ fn needs_relight(changed: bool, wanted: u8, lit: u8, considered: &mut u8) -> boo
     changed || wanted & !*considered & !lit != 0
 }
 
+fn monitor_order(pending: u8) -> impl Iterator<Item = u8> {
+    (0..4u8)
+        .filter(move |p| pending & (1 << p) != 0)
+        .chain((0..4u8).filter(move |p| pending & (1 << p) == 0))
+}
+
 /// Physical HPD describes the root only. MST output presence comes from the
 /// retained downstream snapshot, including when no stream is running.
 fn output_present(boot: &mut boot::ColdBoot, port: usize, slot: usize, mst: bool) -> bool {
@@ -1448,6 +1471,41 @@ fn output_present(boot: &mut boot::ColdBoot, port: usize, slot: usize, mst: bool
                     .and_then(Option::as_ref)
                     .is_some_and(|o| o.sink.is_some())
             }))
+}
+
+/// Record before the CPU drain, then finish native retirement and release.
+/// The caller's Displays retains the Modeset across cancellation and errors.
+/// # Safety
+/// As for monitor_displays, with OWNER held.
+async unsafe fn retire_monitored_display(
+    boot: &mut boot::ColdBoot,
+    displays: &mut Displays,
+    pipe: u8,
+    unplugged: bool,
+) -> Result<(), ModesetError> {
+    let m = displays.lit[usize::from(pipe)].ok_or(crate::amdgpu_dcn401_otg::Error::Invalid)?;
+    boot.begin_modeset_teardown(&m, unplugged)?;
+    OUTPUT_STATE.lock()[usize::from(pipe)].retiring = true;
+    publish_outputs();
+    withdraw(boot, pipe, &displays.lit).await;
+    // SAFETY: CPU views drained and OWNER excludes native producers. The
+    // retained journal skips successes; the unfinished native step checks itself.
+    unsafe {
+        if unplugged {
+            boot.unplug_modeset(&m).await?;
+        } else {
+            boot.stop_modeset(&m).await?;
+        }
+        boot.release_display_surfaces(pipe)?;
+    }
+    displays.lit[usize::from(pipe)] = None;
+    // A request to reactivate during withdrawal is a new lighting attempt.
+    displays.considered &= !(1 << pipe);
+    if unplugged {
+        OUTPUT_STATE.lock()[usize::from(pipe)].shown = None;
+    }
+    publish_outputs();
+    Ok(())
 }
 
 /// One monitor pass over every output: tear down displays DRM switched
@@ -1490,39 +1548,36 @@ pub async unsafe fn monitor_displays(
         .collect();
     let limited =
         crate::amdgpu_navi48_boot::limited_range(crate::amdgpu_navi48_boot::broadcast_rgb());
+    let pending_mask = (0..4u8)
+        .filter(|&p| {
+            displays.lit[usize::from(p)].is_some() && boot.display_teardown_status(p).is_some()
+        })
+        .fold(0u8, |mask, p| mask | (1 << p));
     let mut relight = false;
     if let Some(port) = mst_port {
-        if boot.display_hpd(port) == Ok(true) && boot.display_mst(port).is_some() {
+        if pending_mask == 0
+            && boot.display_hpd(port) == Ok(true)
+            && boot.display_mst(port).is_some()
+        {
             relight = boot.service_display_mst(port).await?;
         }
     }
-    for k in 0..4u8 {
+    for k in monitor_order(pending_mask) {
         let Some(m) = displays.lit[usize::from(k)] else {
             continue;
         };
-        if boot.display_hpd(m.selection.port) == Ok(false) {
-            withdraw(boot, k, &displays.lit).await;
-            // SAFETY: writers withdrawn; HPD reports physical removal.
-            unsafe { boot.unplug_modeset(&m) }.await?;
-            // SAFETY: withdrawal drained CPU views; teardown retired this
-            // display's fetchers, and OWNER excludes every native producer.
-            unsafe { boot.release_display_surfaces(k) }?;
-            displays.lit[usize::from(k)] = None;
-            OUTPUT_STATE.lock()[usize::from(k)].shown = None;
-            steps.push(MonitorStep::Unplugged(k));
-            continue;
-        }
-        if !wants[usize::from(k)].0 {
-            // Withdraw writers first, then stop: the CRTC is off, the
-            // connector still connected.
-            withdraw(boot, k, &displays.lit).await;
-            // SAFETY: the caller's obligations; the scanout is withdrawn.
-            unsafe { boot.stop_modeset(&m) }.await?;
-            // SAFETY: withdrawal drained CPU views; teardown retired this
-            // display's fetchers, and OWNER excludes every native producer.
-            unsafe { boot.release_display_surfaces(k) }?;
-            displays.lit[usize::from(k)] = None;
-            steps.push(MonitorStep::Disabled(k));
+        let pending = boot.display_teardown_status(k);
+        let unplugged =
+            boot.display_hpd(m.selection.port) == Ok(false) || pending.is_some_and(|p| p.unplugged);
+        if unplugged || !wants[usize::from(k)].0 || pending.is_some() {
+            // Finish a recorded teardown even when DRM has since requested on.
+            // SAFETY: OWNER and the caller's exclusions cover the whole resume.
+            unsafe { retire_monitored_display(boot, displays, k, unplugged) }.await?;
+            steps.push(if unplugged {
+                MonitorStep::Unplugged(k)
+            } else {
+                MonitorStep::Disabled(k)
+            });
             continue;
         }
         let preferred = m.modes.iter().flatten().next().copied();
@@ -1550,16 +1605,8 @@ pub async unsafe fn monitor_displays(
                 steps.push(MonitorStep::Retrained(k));
             }
             Health::Unplugged => {
-                withdraw(boot, k, &displays.lit).await;
-                if let Some(o) = OUTPUT_STATE.lock().get_mut(usize::from(k)) {
-                    o.shown = None;
-                }
-                // SAFETY: as above; the scanout is withdrawn first.
-                unsafe { boot.unplug_modeset(&m) }.await?;
-                // SAFETY: withdrawal drained CPU views; teardown retired this
-                // display's fetchers, and OWNER excludes every native producer.
-                unsafe { boot.release_display_surfaces(k) }?;
-                displays.lit[usize::from(k)] = None;
+                // SAFETY: as above; the helper records intent before withdrawing.
+                unsafe { retire_monitored_display(boot, displays, k, true) }.await?;
                 steps.push(MonitorStep::Unplugged(k));
             }
         }
@@ -1583,18 +1630,9 @@ pub async unsafe fn monitor_displays(
             let Some(m) = displays.lit[usize::from(k)] else {
                 continue;
             };
-            withdraw(boot, k, &displays.lit).await;
-            if boot.display_hpd(m.selection.port) == Ok(false) {
-                // SAFETY: the caller's obligations; writers withdrawn first.
-                unsafe { boot.unplug_modeset(&m) }.await?;
-            } else {
-                // SAFETY: the caller's obligations; writers withdrawn first.
-                unsafe { boot.stop_modeset(&m) }.await?;
-            }
-            // SAFETY: withdrawal drained CPU views; teardown retired this
-            // display's fetchers, and OWNER excludes every native producer.
-            unsafe { boot.release_display_surfaces(k) }?;
-            displays.lit[usize::from(k)] = None;
+            let unplugged = boot.display_hpd(m.selection.port) == Ok(false);
+            // SAFETY: the caller's exclusions and OWNER cover withdrawal/retirement.
+            unsafe { retire_monitored_display(boot, displays, k, unplugged) }.await?;
         }
         let fill = |_: u8, _: u32, row: &mut [u32]| row.fill(0);
         // SAFETY: as above; every display is stopped.
@@ -2245,6 +2283,31 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi48",
         navi48_monitor_relights_only_for_new_sinks_and_changes
+    );
+
+    fn navi48_monitor_finishes_retirement_before_reactivation() -> TestResult {
+        let mut output = OutputState::new();
+        output.active = false;
+        output.retiring = true;
+        // DRM asks to reactivate while CPU withdrawal or native stop waits.
+        output.active = true;
+        assert!(!output.published_active());
+        // Finishing retirement removes the old pipe and makes it newly wanted.
+        let mut considered = 0b1111 & !(1 << 3);
+        assert!(needs_relight(false, 0b1111, 0b0111, &mut considered));
+        // Adoption after a successful relight restores publication.
+        output.retiring = false;
+        assert!(output.published_active());
+        // Resume a higher-numbered interrupted pipe before health checks can
+        // select another owner or a shared-link notification can start a relight.
+        assert_eq!(monitor_order(0b1000).collect::<Vec<_>>(), [3, 0, 1, 2]);
+        assert_eq!(monitor_order(0b1010).collect::<Vec<_>>(), [1, 3, 0, 2]);
+        assert_eq!(monitor_order(0).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi48",
+        navi48_monitor_finishes_retirement_before_reactivation
     );
 
     fn navi48_handoff_distinguishes_primary_and_secondary_apertures() -> TestResult {

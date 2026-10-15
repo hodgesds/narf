@@ -1461,6 +1461,7 @@ impl ColdBoot {
         mut fill: impl FnMut(u32, &mut [u32]),
         want: Option<Timing>,
     ) -> Result<Modeset, ModesetError> {
+        self.teardowns.check_idle()?;
         if pipe >= 4 {
             return Err(ModesetError::Display(otg::Error::Invalid));
         }
@@ -1499,6 +1500,7 @@ impl ColdBoot {
         want: impl Fn(usize) -> Option<Timing>,
         pipe_of: impl Fn(usize) -> Option<u8>,
     ) -> Result<Configuration, ModesetError> {
+        self.teardowns.check_idle()?;
         let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
         let paths = self
             .display_paths()
@@ -1604,6 +1606,7 @@ impl ColdBoot {
         plan: dml::Plan,
         fill: &mut impl FnMut(u8, u32, &mut [u32]),
     ) -> Result<Modeset, ModesetError> {
+        self.teardowns.rearm(pipe)?;
         self.select_display(pipe)?;
         let (width, height) = (selection.timing.h_active, selection.timing.v_active);
         // SAFETY: the caller's exclusion and retention obligations cover each
@@ -1922,38 +1925,28 @@ impl ColdBoot {
             ))
         }
     }
-    /// Stop a running FRL display's video, return its sink to legacy
-    /// TMDS as Linux's write_scdc_data does on any HDMI stop (FRL rate and
-    /// update flag cleared, Source_Version, TMDS_Config 0; unchecked), then
-    /// stop the link. Scanout stopped first.
-    /// # Safety
-    /// As for `stop_modeset`.
-    async unsafe fn stop_frl(&mut self, port: usize) -> Result<(), ModesetError> {
+    /// Return an FRL sink to legacy TMDS after video stopped: rate/update
+    /// cleared, Source_Version and TMDS_Config 0, all best effort as before.
+    pub(super) async fn stop_frl_sink(&mut self, port: usize) {
         use crate::amdgpu_frl_training::{CONFIG_1, SINK_VERSION, SOURCE_VERSION, UPDATE_0};
-        // SAFETY: the caller's obligations; each step checks its predecessor.
-        unsafe {
-            self.stop_display_frl_video(port).await?;
-            if self
-                .display_scdc_read(port, CONFIG_1)
-                .await
-                .is_ok_and(|v| v & 0xf != 0)
-            {
-                let _ = self.display_scdc_write(port, CONFIG_1, 0).await;
-            }
-            if self
-                .display_scdc_read(port, UPDATE_0)
-                .await
-                .is_ok_and(|v| v & 0x20 != 0)
-            {
-                let _ = self.display_scdc_write(port, UPDATE_0, 0x20).await;
-            }
-            if self.display_scdc_read(port, SINK_VERSION).await == Ok(1) {
-                let _ = self.display_scdc_write(port, SOURCE_VERSION, 1).await;
-            }
-            let _ = self.display_scdc_write(port, scdc::TMDS_CONFIG, 0).await;
-            self.stop_display_frl_link(port).await?;
+        if self
+            .display_scdc_read(port, CONFIG_1)
+            .await
+            .is_ok_and(|v| v & 0xf != 0)
+        {
+            let _ = self.display_scdc_write(port, CONFIG_1, 0).await;
         }
-        Ok(())
+        if self
+            .display_scdc_read(port, UPDATE_0)
+            .await
+            .is_ok_and(|v| v & 0x20 != 0)
+        {
+            let _ = self.display_scdc_write(port, UPDATE_0, 0x20).await;
+        }
+        if self.display_scdc_read(port, SINK_VERSION).await == Ok(1) {
+            let _ = self.display_scdc_write(port, SOURCE_VERSION, 1).await;
+        }
+        let _ = self.display_scdc_write(port, scdc::TMDS_CONFIG, 0).await;
     }
     /// Stop a running 128b/132b display's video and link (scanout stopped).
     /// # Safety
@@ -2042,6 +2035,7 @@ impl ColdBoot {
     /// # Safety
     /// As for `modeset_display`; stop every CPU writer of the surface first.
     pub async unsafe fn retrain_modeset(&mut self, m: &mut Modeset) -> Result<(), ModesetError> {
+        self.teardowns.check_idle()?;
         // Display k runs on pipe k, in its own records.
         self.select_display(m.pipe)?;
         let port = m.selection.port;
@@ -2075,70 +2069,18 @@ impl ColdBoot {
     /// # Safety
     /// As for `stop_modeset`.
     pub async unsafe fn unplug_modeset(&mut self, m: &Modeset) -> Result<(), ModesetError> {
-        // Display k runs on pipe k, in its own records.
-        self.select_display(m.pipe)?;
-        let port = m.selection.port;
-        // SAFETY: as documented above; each step checks its predecessor state.
-        unsafe {
-            if m.selection.audio.is_some() && !m.selection.uhbr() && m.selection.frl.is_none() {
-                self.stop_display_audio(port, m.selection.hdmi).await?;
-            }
-            self.stop_display_scanout(m.pipe).await?;
-            if m.selection.frl.is_some() {
-                self.stop_frl(port).await?;
-            } else if m.selection.hdmi {
-                self.stop_hdmi(port, m.selection.scdc).await?;
-            } else if m.selection.uhbr() {
-                self.stop_uhbr(port, true).await?;
-            } else if m.selection.mst.is_some() {
-                self.stop_mst_stream(port, m.pipe, true).await?;
-            } else {
-                self.stop_display_dp_video(port).await?;
-                self.stop_display_dp_frontend(port).await?;
-                self.stop_unplugged_display_dp_link(port).await?;
-            }
-            self.retire_display_timing(m.pipe).await?;
-            if m.selection.dsc.is_some() {
-                self.stop_display_dscclk(m.pipe)?;
-            }
-            self.retire_display_planes().await?;
-        }
-        Ok(())
+        // SAFETY: caller has withdrawn CPU writers and retains exclusive owners.
+        unsafe { self.teardown_modeset(m, true) }.await
     }
     /// Reverse a successful modeset down to a disabled PHY with timing and
     /// planes retired. The surface allocation is retained by its pipe.
+    /// Retained per-pipe progress lets the same Modeset resume from its first
+    /// unfinished step; native failed/in-flight guards remain authoritative.
     /// # Safety
     /// As for `modeset_display`; stop every CPU writer of the surface first.
     pub async unsafe fn stop_modeset(&mut self, m: &Modeset) -> Result<(), ModesetError> {
-        // Display k runs on pipe k, in its own records.
-        self.select_display(m.pipe)?;
-        let port = m.selection.port;
-        // SAFETY: as documented above; each step checks its predecessor state.
-        unsafe {
-            if m.selection.audio.is_some() && !m.selection.uhbr() && m.selection.frl.is_none() {
-                self.stop_display_audio(port, m.selection.hdmi).await?;
-            }
-            self.stop_display_scanout(m.pipe).await?;
-            if m.selection.frl.is_some() {
-                self.stop_frl(port).await?;
-            } else if m.selection.hdmi {
-                self.stop_hdmi(port, m.selection.scdc).await?;
-            } else if m.selection.uhbr() {
-                self.stop_uhbr(port, false).await?;
-            } else if m.selection.mst.is_some() {
-                self.stop_mst_stream(port, m.pipe, false).await?;
-            } else {
-                self.stop_display_dp_video(port).await?;
-                self.stop_display_dp_frontend(port).await?;
-                self.stop_display_dp_link(port).await?;
-            }
-            self.retire_display_timing(m.pipe).await?;
-            if m.selection.dsc.is_some() {
-                self.stop_display_dscclk(m.pipe)?;
-            }
-            self.retire_display_planes().await?;
-        }
-        Ok(())
+        // SAFETY: caller has withdrawn CPU writers and retains exclusive owners.
+        unsafe { self.teardown_modeset(m, false) }.await
     }
     /// Linux's write_scdc_data before the TMDS link starts: with SCDC, read
     /// the sink version, answer version 1 with source version 1, then set
@@ -2172,21 +2114,6 @@ impl ColdBoot {
             Err(e) if scrambled => Err(ModesetError::Scdc(e)),
             _ => Ok(()),
         }
-    }
-    /// Mute and stop HDMI video, tell an SCDC sink it returns to legacy HDMI
-    /// (Linux's link_set_dpms_off), then stop the transmitter and frontend.
-    /// # Safety
-    /// As for `stop_modeset`, with scanout stopped.
-    async unsafe fn stop_hdmi(&mut self, port: usize, scdc: bool) -> Result<(), ModesetError> {
-        // SAFETY: the caller's obligations; each step checks its predecessor.
-        unsafe {
-            self.stop_display_hdmi_video(port).await?;
-            if scdc {
-                let _ = self.display_scdc_write(port, scdc::TMDS_CONFIG, 0).await;
-            }
-            self.stop_display_hdmi_link(port).await?;
-        }
-        Ok(())
     }
 }
 

@@ -595,6 +595,7 @@ impl ColdBoot {
         want: impl Fn(usize) -> Option<Timing>,
         pipes: &[Option<u8>],
     ) -> Result<Configuration, ModesetError> {
+        self.teardowns.check_idle()?;
         if pipes.is_empty()
             || pipes.len() > modeset::MAX_DISPLAYS
             || pipes.iter().flatten().any(|&p| p >= 4)
@@ -744,15 +745,14 @@ impl ColdBoot {
             Ok(self.start_display_scanout(pipe).await?)
         }
     }
-    /// deallocate_mst_payload's teardown of pipe `pipe`'s stream, its
-    /// scanout stopped: video, the payload, the frontend; then an attached
-    /// display detaches, while the link's owner hands the link to a
+    /// Finish teardown after video, payload and frontend have stopped:
+    /// an attached display detaches, while the link's owner hands the link to a
     /// remaining stream's display or, the last, stops the link (without
     /// addressing an `unplugged` sink). A connected root keeps its manager
     /// and connector reservations even after the last stream stops.
     /// # Safety
     /// As for `stop_modeset`.
-    pub(super) async unsafe fn stop_mst_stream(
+    pub(super) async unsafe fn finish_mst_stream(
         &mut self,
         port: usize,
         pipe: u8,
@@ -761,9 +761,6 @@ impl ColdBoot {
         let owner = self.mst.get(&port).ok_or(MstFailure::Invalid)?.owner == Some(pipe);
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
-            self.stop_display_dp_video(port).await?;
-            self.remove_display_mst_payload(port, pipe).await?;
-            self.stop_display_dp_frontend(port).await?;
             if !owner {
                 return Ok(self.detach_display_mst_link(port)?);
             }
