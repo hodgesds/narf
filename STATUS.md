@@ -695,10 +695,13 @@ the configuration. Downstream hotplug now stops payloads using the old routes,
 reprobes and relights, retaining output slots by root/branch GUID, route and
 port across branch reordering and removal/replug. All-off and empty branches
 keep their managers enabled; physical removal drops them without AUX waits.
-Changed EDIDs invalidate stale modes, and new disabled monitors can publish
-their EDID as connected without unadmitted modes. Independent mode admission
-while disabled, mixed MST/SST, resource-notification bandwidth updates, UHBR
-MST and MST audio/DSC remain open; no physical validation.
+Changed EDIDs invalidate stale modes. New disabled monitors now publish their
+EDID and independently admitted timings without starting a stream: remaining
+MST slots, path PBN and joint DML bound the offered modes. All-off branches query
+board clock limits without installing clock floors or allocating scanout, and
+KMS keeps the CRTC mode unset until enabled. Ordinary disables retain admitted
+modes without restarting siblings. Mixed MST/SST, resource-notification bandwidth
+updates, UHBR MST and MST audio/DSC remain open; no physical validation.
 The MST manager now also exposes bounded idle notification polling over
 DMUB AUX, retains fragmented messages across transaction/poll boundaries and
 applies queue backpressure. Connection notices drive topology reconciliation

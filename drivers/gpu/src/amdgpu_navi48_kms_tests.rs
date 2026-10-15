@@ -25,6 +25,7 @@ fn one<'a>(kind: ConnectorType, sink: Option<Sink<'a>>) -> [Output<'a>; 1] {
         kind,
         sink,
         edid: None,
+        offered: &[],
     }]
 }
 fn lit<'a>(edid: &'a [u8; 128], timing: &'a Timing, offered: &'a [Timing]) -> Option<Sink<'a>> {
@@ -58,6 +59,7 @@ fn navi48_kms_discovery_keeps_disabled_connector_connected() -> TestResult {
         kind: ConnectorType::DisplayPort,
         sink: None,
         edid: Some(&edid),
+        offered: &[],
     };
     let timing = cea_1080p();
     apply(
@@ -87,6 +89,66 @@ fn navi48_kms_discovery_keeps_disabled_connector_connected() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-kms",
     navi48_kms_discovery_keeps_disabled_connector_connected
+);
+
+fn navi48_kms_admitted_modes_do_not_enable_crtc() -> TestResult {
+    let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
+    let edid = [7u8; 128];
+    let a = cea_1080p();
+    let b = Timing {
+        pixel_clock_khz: 74_250,
+        h_active: 1280,
+        h_total: 1650,
+        h_front_porch: 110,
+        h_sync_width: 40,
+        v_active: 720,
+        v_total: 750,
+        v_front_porch: 5,
+        v_sync_width: 5,
+        ..a
+    };
+    let modes = [a, b];
+    let mut output = Output {
+        kind: ConnectorType::DisplayPort,
+        sink: None,
+        edid: Some(&edid),
+        offered: &modes,
+    };
+    apply(&mut card, &[output]);
+    assert_eq!(card.connectors[0].status, ConnectorStatus::Connected);
+    assert!(!card.crtcs[0].enabled && card.crtcs[0].mode.is_none());
+    assert!(card.crtcs[0].primary_fb.is_none());
+    let mut arg = [0u8; 80];
+    arg[48..52].copy_from_slice(&CONNECTOR.to_le_bytes());
+    match dispatch(&mut card, 0xA7, &arg, &DrmFileCtx::primary_master()) {
+        Ok(DrmIoctlResult::GetConnector(_, offered)) => {
+            assert_eq!(offered.len(), 2);
+            assert_eq!(offered[0].clock, a.pixel_clock_khz);
+            assert_eq!(offered[0].r#type, PREFERRED_DRIVER);
+            assert_eq!(offered[1].clock, b.pixel_clock_khz);
+            assert_eq!(offered[1].r#type, DRIVER);
+        }
+        other => panic!("GETCONNECTOR {other:?}"),
+    }
+    assert!(card.accepts_mode(&timing_wire(&a)) && card.accepts_mode(&timing_wire(&b)));
+    let unadmitted = Timing {
+        pixel_clock_khz: 297_000,
+        ..a
+    };
+    assert!(!card.accepts_mode(&timing_wire(&unadmitted)));
+    // Neither a stale mode list after disconnect nor an explicit ACTIVE=1
+    // without a set CRTC mode may make the connector scan out.
+    set_crtc_active(&mut card, 0, true);
+    assert!(!card.crtcs[0].enabled);
+    output.edid = None;
+    apply(&mut card, &[output]);
+    assert!(card.connectors[0].modes.is_empty());
+    assert!(!card.accepts_mode(&timing_wire(&a)));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-kms",
+    navi48_kms_admitted_modes_do_not_enable_crtc
 );
 
 fn navi48_kms_reports_exact_sink_timing() -> TestResult {
@@ -339,16 +401,19 @@ fn navi48_kms_publishes_an_output_per_port() -> TestResult {
     let outputs = [
         Output {
             edid: None,
+            offered: &[],
             kind: ConnectorType::DisplayPort,
             sink: lit(&edid_a, &a, &ta),
         },
         Output {
             edid: None,
+            offered: &[],
             kind: ConnectorType::DisplayPort,
             sink: None,
         },
         Output {
             edid: None,
+            offered: &[],
             kind: ConnectorType::HdmiA,
             sink: lit(&edid_c, &c, &tc),
         },

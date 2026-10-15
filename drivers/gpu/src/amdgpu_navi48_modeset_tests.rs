@@ -1324,3 +1324,66 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_mst_keeps_sink_output_assignments
 );
+
+fn navi48_mst_admits_dark_connector_modes() -> TestResult {
+    use super::super::mst::dark_mst_modes;
+    let caps = DpCaps {
+        lanes: 4,
+        rate: LinkRate::Hbr2,
+        uhbr: 0,
+        fec: false,
+        dsc: None,
+    };
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [500_000, 2_000_000],
+        dcfclk_khz: [300_000, 1_200_000],
+        socclk_khz: 600_000,
+        dispclk_max_khz: 1_500_000,
+        dppclk_max_khz: 1_500_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let edid = edid_three_modes(false);
+    let widths = |m: Vec<Timing>| m.iter().map(|t| t.h_active).collect::<Vec<_>>();
+    // Enumeration works before any stream has ever been selected or lit.
+    let all = dark_mst_modes(&soc, caps, &edid, 0, &[]);
+    assert_eq!(widths(all.clone()), [1920, 3840, 1280]);
+    assert_eq!(
+        widths(dark_mst_modes(&soc, caps, &edid, 600, &[])),
+        [1920, 1280]
+    );
+    assert!(dark_mst_modes(&soc, caps, &edid, 1, &[]).is_empty());
+    assert!(dark_mst_modes(&soc, caps, &[], 0, &[]).is_empty());
+    let slow = dml::Soc {
+        dispclk_max_khz: 50_000,
+        ..soc
+    };
+    assert!(dark_mst_modes(&slow, caps, &edid, 0, &[]).is_empty());
+
+    let sink = crate::dp_mst_mgr::Sink { branch: 0, port: 1 };
+    let mut lit = super::super::select_mst(0, caps, &[(sink, edid_2160p(), 0)], &|_| None);
+    // A running 4K60 stream owns 54 slots; only 720p fits in the remaining 9.
+    assert_eq!(widths(dark_mst_modes(&soc, caps, &edid, 0, &lit)), [1280]);
+    lit[0].mst.as_mut().unwrap().slots = 63;
+    assert!(dark_mst_modes(&soc, caps, &edid, 0, &lit).is_empty());
+    // Even spare link slots cannot admit a fifth display engine stream.
+    let one = super::super::select_mst(0, caps, &[(sink, edid_1080p(), 0)], &|_| None)[0];
+    assert!(dark_mst_modes(&soc, caps, &edid, 0, &[one; 4]).is_empty());
+    // Advertising a timing does not enable the connector. A later explicit
+    // request retains its fixed pipe and gets full configuration admission.
+    let devices = [(sink, edid, 0)];
+    assert!(
+        super::super::mst::select_mst_outputs(0, caps, &devices, &|_| None, &[None]).is_empty()
+    );
+    let enabled =
+        super::super::mst::select_mst_outputs(0, caps, &devices, &|_| Some(all[1]), &[Some(3)]);
+    assert_eq!((enabled[0].0.timing, enabled[0].1), (all[1], 3));
+    assert!(admit_displays(&soc, &[enabled[0].0]).is_ok());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_mst_admits_dark_connector_modes
+);

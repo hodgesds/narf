@@ -1551,12 +1551,20 @@ impl ColdBoot {
             failed,
         })
     }
-    /// Start PMFW at the clock floor (which publishes the DPM levels
-    /// admission needs) and return the board's admission inputs.
+    /// Query the DPM levels admission needs, install clock floors for a
+    /// nonempty configuration, and return the board's admission inputs.
     pub(super) async fn prepare_configuration(
         &mut self,
         selections: &[Selection],
     ) -> Result<dml::Soc, ModesetError> {
+        // An all-off MST branch still needs real board limits to enumerate
+        // modes. Query them without claiming a display or setting clock floors.
+        if selections.is_empty() {
+            self.start_display_clocks()
+                .await
+                .map_err(ModesetError::Clocks)?;
+            return Ok(self.display_soc()?);
+        }
         // Requests are clamped up to each clock's minimum.
         let floor = clocks::Request {
             displays: selections.len().clamp(1, MAX_DISPLAYS) as u8,

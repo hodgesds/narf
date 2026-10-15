@@ -1364,6 +1364,16 @@ devices are admitted. Disconnected slots retain their requests for replug;
 new devices use empty slots first, then reclaim absent reservations if full.
 Reassignment resets old DRM requests. Replug of the same endpoint preserves
 CRTC disable; changed EDIDs (including extensions) invalidate cached modes.
+`MstOutput::modes` holds independently admitted timings for a present output
+without a lit stream; reprobe clears the list before new admission. Successful
+configuration refreshes each dark output against the slots left by running
+payloads, its probed available PBN and joint DML admission with all running
+streams. Each candidate is an independent possible addition, not a reservation;
+enabling several connectors still reruns complete configuration admission.
+The list follows EDID order and is bounded to sixteen timings. An all-off
+branch queries the board's DPM limits (starting display power if needed), but
+does not request an active-display count, clock floors, pipe clocks, payloads
+or scanout allocations. Startup failures do not publish new dark-output modes.
 
 `unsafe ColdBoot::modeset_mst_displays(port, fill, want, pipes)` lights one
 branch's sinks with joint DML admission, 8-bpc RGB and the maximum supported
@@ -1413,11 +1423,14 @@ while the branch remains connected. Removing the branch restores board-port
 outputs. Shared-link loss stops and relights the whole configuration instead
 of invoking the SST retrain path. Downstream changes use the same whole-link
 stop/reprobe/relight sequence, so other streams briefly blank. KMS can publish
-a newly discovered EDID as connected with its CRTC off, without advertising
-unadmitted modes (`amdgpu_navi48_kms::Output::edid`). New monitor modes are
-still admitted when an enabled output is lit; independent mode admission for
-disabled connectors remains open. Simultaneous MST/SST ports, UHBR MST, DSC
-and audio on MST remain unsupported. This path is model-tested only.
+a newly discovered EDID and independently admitted timings as connected with
+its CRTC off (`amdgpu_navi48_kms::Output::{edid, offered}`). These timings reach
+GETCONNECTOR and the platform's mode-request gate without setting a CRTC mode
+or framebuffer. A missing EDID suppresses the offered timings. Ordinary MST
+disable retains previously admitted timings without restarting siblings;
+the next configuration/reprobe recomputes admission against remaining resources.
+Simultaneous MST/SST ports, UHBR MST, DSC and audio on MST remain unsupported.
+This path is model-tested only.
 
 `unsafe ColdBoot::retire_inherited_display` retires the legacy DP SST output
 the firmware left running. It runs in native dependency order:

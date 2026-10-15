@@ -655,6 +655,7 @@ struct OutputState {
     mst_id: Option<boot::MstOutputId>,
     mst_present: bool,
     mst_edid: Vec<u8>,
+    mst_modes: Vec<Timing>,
 }
 impl OutputState {
     const fn new() -> Self {
@@ -666,6 +667,7 @@ impl OutputState {
             mst_id: None,
             mst_present: false,
             mst_edid: Vec::new(),
+            mst_modes: Vec::new(),
         }
     }
 
@@ -676,9 +678,14 @@ impl OutputState {
             self.mst_id = id;
         }
         self.mst_present = output.is_some_and(|o| o.sink.is_some());
+        self.mst_modes.clear();
+        if !self.active {
+            self.shown = None;
+        }
         // Preserve disabled requests at this connector, but never advertise
         // the old monitor's modes after a different/unreadable EDID appears.
         if let Some(output) = output.filter(|_| self.mst_present) {
+            self.mst_modes.clone_from(&output.modes);
             if self.mst_edid != output.edid {
                 self.shown = None;
                 self.requested = None;
@@ -688,7 +695,7 @@ impl OutputState {
     }
 
     fn published(&self) -> Option<&([u8; 128], Timing, Vec<Timing>)> {
-        if self.mst_id.is_some() && !self.mst_present {
+        if self.mst_id.is_some() && (!self.mst_present || !self.active) {
             None
         } else {
             self.shown.as_ref()
@@ -696,6 +703,32 @@ impl OutputState {
     }
     fn published_active(&self) -> bool {
         self.active && !self.retiring
+    }
+    fn offered(&self) -> &[Timing] {
+        if let Some((_, _, offered)) = self
+            .shown
+            .as_ref()
+            .filter(|_| self.mst_id.is_none() || self.mst_present)
+        {
+            offered
+        } else if self.mst_present {
+            &self.mst_modes
+        } else {
+            &[]
+        }
+    }
+    fn find_mode(&self, mode: &crate::drm::ioctl::DrmModeModeInfo) -> Option<Timing> {
+        let geometry = |w: &crate::drm::ioctl::DrmModeModeInfo| {
+            (
+                w.clock,
+                [w.hdisplay, w.hsync_start, w.hsync_end, w.htotal],
+                [w.vdisplay, w.vsync_start, w.vsync_end, w.vtotal],
+            )
+        };
+        self.offered()
+            .iter()
+            .copied()
+            .find(|t| geometry(&crate::amdgpu_navi48_kms::timing_wire(t)) == geometry(mode))
     }
 }
 static OUTPUT_STATE: narf_lib::sync::IrqSafeSpinLock<[OutputState; 4]> =
@@ -716,6 +749,7 @@ fn publish_outputs() {
         .enumerate()
         .map(|(k, &(kind, shown, _))| crate::amdgpu_navi48_kms::Output {
             kind,
+            offered: state[k].offered(),
             edid: state[k]
                 .mst_present
                 .then(|| state[k].mst_edid.get(..128)?.try_into().ok())
@@ -921,6 +955,11 @@ async unsafe fn light_displays(
         // SAFETY: the caller's obligations.
         unsafe { boot.modeset_displays(fill, want, pipe) }.await?
     };
+    if let Some(link) = mst.and_then(|port| boot.display_mst(port)) {
+        for (state, output) in OUTPUT_STATE.lock().iter_mut().zip(&link.outputs) {
+            state.reconcile_mst(output.as_ref());
+        }
+    }
     for m in &config.displays {
         // SAFETY: as above.
         unsafe { adopt(boot, m) }.await;
@@ -1367,22 +1406,10 @@ pub fn request_broadcast_rgb(value: u8) {
 
 /// Whether display `display` offers `mode` (one of its published timings).
 pub fn display_offers(display: u8, mode: &crate::drm::ioctl::DrmModeModeInfo) -> bool {
-    let geometry = |w: &crate::drm::ioctl::DrmModeModeInfo| {
-        (
-            w.clock,
-            [w.hdisplay, w.hsync_start, w.hsync_end, w.htotal],
-            [w.vdisplay, w.vsync_start, w.vsync_end, w.vtotal],
-        )
-    };
     OUTPUT_STATE
         .lock()
         .get(usize::from(display))
-        .and_then(|o| o.shown.as_ref())
-        .is_some_and(|(_, _, offered)| {
-            offered
-                .iter()
-                .any(|t| geometry(&crate::amdgpu_navi48_kms::timing_wire(t)) == geometry(mode))
-        })
+        .is_some_and(|o| o.find_mode(mode).is_some())
 }
 
 /// Record the mode a DRM client set on display `display` (SETCRTC or an
@@ -1401,19 +1428,7 @@ pub fn request_display_mode(
         o.requested = None;
         return true;
     };
-    let geometry = |w: &crate::drm::ioctl::DrmModeModeInfo| {
-        (
-            w.clock,
-            [w.hdisplay, w.hsync_start, w.hsync_end, w.htotal],
-            [w.vdisplay, w.vsync_start, w.vsync_end, w.vtotal],
-        )
-    };
-    let found = o.shown.as_ref().and_then(|(_, _, offered)| {
-        offered
-            .iter()
-            .copied()
-            .find(|t| geometry(&crate::amdgpu_navi48_kms::timing_wire(t)) == geometry(m))
-    });
+    let found = o.find_mode(m);
     match found {
         Some(t) => {
             o.requested = Some(t);
@@ -1506,8 +1521,22 @@ async unsafe fn retire_monitored_display(
     displays.lit[usize::from(pipe)] = None;
     // A request to reactivate during withdrawal is a new lighting attempt.
     displays.considered &= !(1 << pipe);
-    if unplugged {
-        OUTPUT_STATE.lock()[usize::from(pipe)].shown = None;
+    {
+        let mut state = OUTPUT_STATE.lock();
+        let output = &mut state[usize::from(pipe)];
+        if m.selection.mst.is_some() {
+            // A disable need not relight surviving streams. Retain the modes
+            // already admitted beside them, without retaining a CRTC mode.
+            // The next configuration/reprobe recomputes independent admission.
+            output.mst_modes = if unplugged {
+                Vec::new()
+            } else {
+                m.modes.iter().flatten().copied().collect()
+            };
+            output.shown = None;
+        } else if unplugged {
+            output.shown = None;
+        }
     }
     publish_outputs();
     Ok(())
@@ -2148,6 +2177,7 @@ mod tests {
             id,
             sink: Some(crate::dp_mst_mgr::Sink { branch: 1, port: 3 }),
             edid: alloc::vec![0; 256],
+            modes: Vec::new(),
         };
         let timing = Timing {
             pixel_clock_khz: 148500,
@@ -2163,6 +2193,7 @@ mod tests {
             v_sync_positive: true,
         };
         let mut state = OutputState::new();
+        output.modes.push(timing);
         state.reconcile_mst(Some(&output));
         state.shown = Some(([0; 128], timing, alloc::vec![timing]));
         state.requested = Some(timing);
@@ -2174,24 +2205,31 @@ mod tests {
         output.edid.clear();
         state.reconcile_mst(Some(&output));
         assert!(state.published().is_none());
+        assert!(state.offered().is_empty());
         assert!(!state.active);
         assert_eq!(state.requested, Some(timing));
         // The same connector and EDID return with a different branch index.
         output.sink = Some(crate::dp_mst_mgr::Sink { branch: 2, port: 3 });
         output.edid.resize(256, 0);
         state.reconcile_mst(Some(&output));
-        assert!(state.published().is_some());
+        assert!(state.published().is_none());
+        assert_eq!(state.offered(), &[timing]);
+        let wire = crate::amdgpu_navi48_kms::timing_wire(&timing);
+        assert_eq!(state.find_mode(&wire), Some(timing));
         assert!(!state.active);
         assert_eq!(state.requested, Some(timing));
         assert!(!needs_relight(false, 0, 0, &mut considered));
         state.active = true;
+        assert_eq!(state.find_mode(&wire), Some(timing));
         assert!(needs_relight(false, 1, 0, &mut considered));
         // A different monitor on this connector retains disabled state but
         // loses stale modes. Reassigning the slot resets old DRM requests.
         state.active = false;
         output.edid[128] = 1; // same base block, changed extension modes
+        output.modes.clear(); // a reprobe invalidates admission too
         state.reconcile_mst(Some(&output));
         assert!(!state.active && state.shown.is_none() && state.requested.is_none());
+        assert!(state.find_mode(&wire).is_none());
         output.id.branch = [3; 16];
         state.reconcile_mst(Some(&output));
         assert!(state.active && state.shown.is_none() && state.requested.is_none());

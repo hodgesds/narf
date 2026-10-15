@@ -761,6 +761,12 @@ impl ColdBoot {
         &mut self,
         request: clocks::Request,
     ) -> Result<clocks::Applied, clocks::Error> {
+        self.start_display_clocks().await?;
+        self.clocks.as_mut().map_err(|e| *e)?.prepare(request).await
+    }
+    /// Query board DPM limits without requesting any active displays or
+    /// programming pipe clocks. The same ownership checks govern both paths.
+    async fn start_display_clocks(&mut self) -> Result<(), clocks::Error> {
         if self.state() != State::MemoryReady
             || self.queue_state() != Some(queues::State::InterruptVerified)
             || self.sdma_state() != Some(sdma::State::InterruptVerified)
@@ -792,7 +798,10 @@ impl ColdBoot {
             // clock owner checks every display consumer before changing DPM.
             unsafe { clocks.start(smu).await }?;
         }
-        clocks.prepare(request).await
+        match clocks.status().state {
+            clocks::State::Ready | clocks::State::Applied => Ok(()),
+            _ => Err(clocks::Error::Busy),
+        }
     }
     pub fn display_pipe_clock_status(&self) -> Result<dccg::Status, dccg::Error> {
         self.dccg.as_ref().map(dccg::Dccg::status).map_err(|e| *e)

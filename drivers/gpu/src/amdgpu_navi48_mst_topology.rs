@@ -19,6 +19,9 @@ pub struct MstOutput {
     pub sink: Option<dp_mst_mgr::Sink>,
     /// Empty if absent or unreadable. An unreadable EDID never shifts slots.
     pub edid: Vec<u8>,
+    /// Independently admitted timings while no stream is lit on this output.
+    /// Recomputed against the current configuration; empty after a reprobe.
+    pub modes: Vec<Timing>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -37,6 +40,7 @@ fn reconcile(previous: &[Option<MstOutput>; 4], topology: &Topology) -> [Option<
     for o in out.iter_mut().flatten() {
         o.sink = None;
         o.edid.clear();
+        o.modes.clear();
     }
     let Some(root) = topology.branches.first() else {
         return out;
@@ -76,6 +80,7 @@ fn reconcile(previous: &[Option<MstOutput>; 4], topology: &Topology) -> [Option<
             id,
             sink: Some(sink),
             edid: Vec::new(),
+            modes: Vec::new(),
         });
     }
     out

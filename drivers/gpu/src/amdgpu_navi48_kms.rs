@@ -53,15 +53,17 @@ pub struct Sink<'a> {
     pub offered: &'a [Timing],
 }
 
-/// One output: its connector type and its sink, while one is lit (or
-/// switched off by DRM, still connected).
+/// One output: its connector type, optional current sink mode, and optional
+/// EDID/mode inventory for a connected sink with no stream.
 #[derive(Clone, Copy, Debug)]
 pub struct Output<'a> {
     pub kind: ConnectorType,
     pub sink: Option<Sink<'a>>,
-    /// Discovered EDID before any mode has been admitted/lit, e.g. a new
-    /// monitor on a disabled MST connector. Reports connected with no modes.
+    /// Discovered EDID, including a monitor with no lit stream.
     pub edid: Option<&'a [u8; 128]>,
+    /// Admitted connector timings when `sink` is None. Requires `edid`;
+    /// publishing these does not set or enable a CRTC mode.
+    pub offered: &'a [Timing],
 }
 
 /// The exact DRM wire form of a DCN timing.
@@ -95,8 +97,8 @@ pub fn timing_wire(t: &Timing) -> DrmModeModeInfo {
 }
 
 /// Set the card's outputs to `outputs` (at most `MAX_OUTPUTS`): output k
-/// connected to its lit sink, or disconnected. The topology is built for
-/// the outputs' count and kept while it stays the same.
+/// connected when it has an EDID, even without a lit sink. The topology is
+/// built for the outputs' count and kept while it stays the same.
 pub fn apply(card: &mut Card, outputs: &[Output]) {
     let outputs = &outputs[..outputs.len().min(MAX_OUTPUTS)];
     if card.connectors.len() != outputs.len() {
@@ -145,24 +147,31 @@ pub fn apply(card: &mut Card, outputs: &[Output]) {
         // The running timing first, so a mode that two timings round to the
         // same size and refresh reports the one being scanned out.
         let mut timings: alloc::vec::Vec<DrmModeModeInfo> = wire.into_iter().collect();
-        if let Some(sink) = o.sink {
-            for t in sink.offered.iter().filter(|t| *t != sink.timing) {
-                let w = timing_wire(t);
-                // PREFERRED marks only the EDID's first (preferred) timing.
-                let w = DrmModeModeInfo {
-                    r#type: if Some(t) == sink.offered.first() {
-                        PREFERRED_DRIVER
-                    } else {
-                        DRIVER
-                    },
-                    ..w
-                };
-                timings.push(w);
-            }
-            if let Some(first) = timings.first_mut() {
-                if sink.offered.first().is_some_and(|p| p != sink.timing) {
-                    first.r#type = DRIVER;
-                }
+        let offered = o.sink.map_or_else(
+            || if edid.is_some() { o.offered } else { &[] },
+            |s| s.offered,
+        );
+        for t in offered
+            .iter()
+            .filter(|t| Some(*t) != o.sink.map(|s| s.timing))
+        {
+            let w = timing_wire(t);
+            // PREFERRED marks only the first admitted EDID timing.
+            let w = DrmModeModeInfo {
+                r#type: if Some(t) == offered.first() {
+                    PREFERRED_DRIVER
+                } else {
+                    DRIVER
+                },
+                ..w
+            };
+            timings.push(w);
+        }
+        if let Some(first) = timings.first_mut() {
+            if o.sink
+                .is_some_and(|s| offered.first().is_some_and(|p| p != s.timing))
+            {
+                first.r#type = DRIVER;
             }
         }
         let mut modes: alloc::vec::Vec<Mode> = alloc::vec::Vec::new();

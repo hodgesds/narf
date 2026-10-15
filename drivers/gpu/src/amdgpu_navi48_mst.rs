@@ -617,6 +617,40 @@ pub(super) fn select_mst_outputs(
         .collect()
 }
 
+/// Timings a dark connector could add beside the running streams. Each
+/// candidate is independent: advertising a mode reserves neither a payload
+/// nor a pipe, and enabling multiple connectors still needs joint admission.
+pub(super) fn dark_mst_modes(
+    soc: &crate::amdgpu_dcn401_dml::Soc,
+    caps: modeset::DpCaps,
+    edid: &[u8],
+    available: u16,
+    lit: &[Selection],
+) -> Vec<Timing> {
+    let used = lit.iter().try_fold(0u8, |n, s| n.checked_add(s.mst?.slots));
+    let Some(free) = used.and_then(|n| 63u8.checked_sub(n)) else {
+        return Vec::new();
+    };
+    let mut joint: Vec<_> = lit.iter().map(modeset::selection_mode).collect();
+    let mut offered = Vec::new();
+    for t in modeset::edid_timings(edid) {
+        if offered.len() == modeset::MAX_MODES {
+            break;
+        }
+        if !mst_slots(&t, caps.lanes, DpRate::Legacy(caps.rate), caps.fec)
+            .is_some_and(|(pbn, slots)| slots <= free && (available == 0 || pbn <= available))
+        {
+            continue;
+        }
+        joint.push(modeset::mode(t));
+        if crate::amdgpu_dcn401_dml::admit_all(soc, &joint).is_ok() {
+            offered.push(t);
+        }
+        joint.pop();
+    }
+    offered
+}
+
 impl ColdBoot {
     /// Light the end devices behind DP `port`'s MST branch (`select_mst`),
     /// stable output k on `pipes[k]` (its display slot too), skipping None, as one
@@ -626,6 +660,8 @@ impl ColdBoot {
     /// link, the others attach to it, and each adds its payload before its
     /// video starts. `want(k)` is the timing asked of output k. An empty
     /// configuration keeps the manager enabled for downstream hotplug.
+    /// On success, dark outputs carry independently admitted `MstOutput::modes`
+    /// beside the lit streams, including when every requested pipe is None.
     /// # Safety
     /// As for `modeset_displays`.
     pub async unsafe fn modeset_mst_displays(
@@ -667,7 +703,7 @@ impl ColdBoot {
             .iter()
             .map(|&k| pipes.get(k).copied().flatten())
             .collect();
-        if assigned.iter().all(Option::is_none) {
+        if devices.is_empty() {
             return Ok(Configuration {
                 displays: Vec::new(),
                 failed: None,
@@ -689,7 +725,16 @@ impl ColdBoot {
             select_mst_outputs(port, caps, &devices, &|k| want(slots[k]), &assigned)
                 .into_iter()
                 .unzip();
+        // Discard old admission before any asynchronous clock/startup work.
+        if let Some(link) = self.mst.get_mut(&port) {
+            for output in link.outputs.iter_mut().flatten() {
+                output.modes.clear();
+            }
+        }
+        self.select_display(pipes.first().copied().unwrap_or(0))?;
+        let soc = self.prepare_configuration(&selections).await?;
         if selections.is_empty() {
+            self.admit_dark_mst_outputs(port, &soc, caps, &devices, &[]);
             return Ok(Configuration {
                 displays: Vec::new(),
                 failed: None,
@@ -699,8 +744,6 @@ impl ColdBoot {
         for s in &mut selections {
             s.limited = limited;
         }
-        self.select_display(pipes[0])?;
-        let soc = self.prepare_configuration(&selections).await?;
         let plans = modeset::admit_displays(&soc, &selections).map_err(otg::Error::Admission)?;
         selections.truncate(plans.len());
         self.prepare_pipes(&selections, &plans, &pipes).await?;
@@ -726,10 +769,36 @@ impl ColdBoot {
                 .unwrap_or_default();
             lit[k].modes = self.offered_modes(&soc, &lit, k, &edid);
         }
+        let running: Vec<_> = lit.iter().map(|m| m.selection).collect();
+        if failed.is_none() {
+            self.admit_dark_mst_outputs(port, &soc, caps, &devices, &running);
+        }
         Ok(Configuration {
             displays: lit,
             failed,
         })
+    }
+    fn admit_dark_mst_outputs(
+        &mut self,
+        port: usize,
+        soc: &crate::amdgpu_dcn401_dml::Soc,
+        caps: modeset::DpCaps,
+        devices: &[(dp_mst_mgr::Sink, Vec<u8>, u16)],
+        lit: &[Selection],
+    ) {
+        if let Some(link) = self.mst.get_mut(&port) {
+            for output in link.outputs.iter_mut().flatten() {
+                output.modes.clear();
+                if lit.iter().any(|s| s.mst.map(|m| m.sink) == output.sink) {
+                    continue;
+                }
+                if let Some((_, edid, available)) =
+                    devices.iter().find(|d| Some(d.0) == output.sink)
+                {
+                    output.modes = dark_mst_modes(soc, caps, edid, *available, lit);
+                }
+            }
+        }
     }
     /// Start `selection`'s MST stream on staged `pipe` (DIO stream `pipe`):
     /// the first stream trains the port's MST link at the selected
