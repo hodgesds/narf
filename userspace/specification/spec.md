@@ -506,13 +506,22 @@ Connected socket rings advance their token only on readiness transitions
 leave readiness unchanged do not synthesize edges. A drain followed by new
 data before the next `epoll_wait` remains a deliverable edge even though both
 sampled readiness masks contain `POLL_IN`.
-Blocking stream `send(2)`, `write(2)`, and `sendmsg(2)` preserve every
-committed prefix over the connected ring's durable writable-readiness wait,
-then re-execute from the unsent suffix after space or closure is published.
-They return the full request unless a signal, send timeout, or subsequent
-error ends the wait, in which case they return that prefix.  On AF_UNIX,
-SCM_RIGHTS and explicit credentials remain attached only to the first queued
-unit. `O_NONBLOCK` and `MSG_DONTWAIT` return `EAGAIN` immediately.
+Blocking stream `send(2)`, `write(2)`, and `sendmsg(2)` (TCP and AF_UNIX)
+wait for the connected ring's durable writable readiness in place, keeping
+the committed prefix in the handler, and continue with the unsent suffix
+after space or closure is published. They return the full request unless a
+signal, the SO_SNDTIMEO timeout, or an error ends the wait, in which case
+they return that prefix (a signal after progress is never turned into
+`EINTR` or a restart). With nothing queued a signal is `sock_intr_errno`: a
+restart-pending frame (`-ERESTARTSYS`, restarted under `SA_RESTART`) for an
+infinite wait, `EINTR` for a finite SO_SNDTIMEO/SO_RCVTIMEO; an expired
+timeout is `EAGAIN`. On AF_UNIX, SCM_RIGHTS and explicit credentials
+remain attached only to the first queued unit. An AF_UNIX stream/seqpacket
+endpoint that closes with unread data leaves its peer `ECONNRESET`: a send
+woken from its wait by that close consumes it (the prefix, or `ECONNRESET`
+with nothing queued, no SIGPIPE), otherwise `SO_ERROR` reports it once; a
+send that finds the peer already gone is `EPIPE` plus SIGPIPE unless
+`MSG_NOSIGNAL`. `O_NONBLOCK` and `MSG_DONTWAIT` return `EAGAIN` immediately.
 `sendmmsg(2)` returns an already-transmitted prefix without retrying it; when
 its first message would block it follows the same park-or-`EAGAIN` rule.
 Native `read(2)`, `write(2)`, `readv(2)`, and `writev(2)` resolve the

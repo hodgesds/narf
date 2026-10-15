@@ -35,7 +35,7 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
                 if sock.domain == crate::socket::AF_UNIX
                     && sock.kind == crate::socket::SOCK_STREAM
                 {
-                    unix_blocking_send(ctx, fd, flags, &sock, buf_ptr, buf_len, resumed);
+                    unix_blocking_send(ctx, flags, &sock, buf_ptr, buf_len, resumed);
                     return;
                 }
                 if let Some(tcb) = sock.kernel_tcb_id() {
@@ -134,7 +134,6 @@ pub(super) fn tcp_blocking_send(
     use handler_sys_socket_recv::SendAll;
     match handler_sys_socket_recv::tcp_send_all(ctx, sock, tcb, buf_ptr, buf_len, resumed) {
         SendAll::Done(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-        SendAll::Parked => {}
         SendAll::WouldBlock => socket_send_would_block(ctx, fd, flags, sock, resumed),
         SendAll::Err(e) => {
             if e == crate::socket::SockError::Pipe
@@ -148,77 +147,120 @@ pub(super) fn tcp_blocking_send(
     }
 }
 
-/// The AF_UNIX counterpart of [`tcp_blocking_send`].  A Unix stream's ring
-/// deliberately accepts only the units that fit its current send buffer; for
-/// a blocking syscall, Linux waits and queues the rest.  Keep the user-buffer
-/// offset in the per-task stream-progress cell while the task is parked so a
-/// re-execution never repeats a prefix (or a control boundary attached to it).
-#[allow(clippy::too_many_arguments)]
+/// The AF_UNIX counterpart of [`tcp_blocking_send`]: `send`/`sendto`/`write`
+/// on a BLOCKING connected stream. See [`unix_stream_send_loop`].
 pub(super) fn unix_blocking_send(
     ctx: &mut dyn TrapContext,
-    fd: u32,
     flags: u32,
     sock: &crate::socket::SocketFile,
     buf_ptr: u64,
     buf_len: usize,
     resumed: Option<u64>,
 ) {
-    use handler_sys_socket_recv::SendAll;
-    match unix_send_all(ctx, sock, buf_ptr, buf_len, resumed) {
-        SendAll::Done(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-        SendAll::Parked => {}
-        SendAll::WouldBlock => socket_send_would_block(ctx, fd, flags, sock, resumed),
-        SendAll::Err(e) => {
-            if e == crate::socket::SockError::Pipe
-                && flags & crate::socket::MSG_NOSIGNAL == 0
-                && sock.epipe_raises_sigpipe()
-            {
+    const CHUNK: usize = 1 << 20;
+    let outcome = unix_stream_send_loop(ctx, sock, buf_len, resumed, |done| {
+        let want = core::cmp::min(CHUNK, buf_len - done);
+        // SAFETY: the caller validated the complete range. This bounded copy
+        // still handles an unmap race; after committed progress Linux returns
+        // that prefix rather than replacing it with EFAULT.
+        let payload = unsafe { copy_from_user_vec(buf_ptr + done as u64, want) }
+            .map_err(|errno| crate::socket::SockError::Stack(errno as i32))?;
+        sock.unix_sendmsg(&payload, alloc::vec::Vec::new(), None)
+    });
+    match outcome {
+        UnixSend::Done(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+        UnixSend::Restart => {}
+        UnixSend::Err { err, out_pipe } => {
+            if out_pipe && flags & crate::socket::MSG_NOSIGNAL == 0 && sock.epipe_raises_sigpipe() {
                 raise_signal_pending(current_task_id(), 13); // SIGPIPE
             }
-            ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
+            ctx.set_return(SyscallReturn::ok((-(err.errno() as i64)) as u64));
         }
     }
 }
 
-/// Queue a blocking AF_UNIX stream write without eagerly copying the complete
-/// user buffer.  `RingBuf::write_stream_with_fds` may return a short count
-/// when its send-buffer charge reaches the configured limit; that is progress,
-/// not the result of the blocking syscall.  Match `unix_stream_sendmsg` by
-/// waiting for POLL_OUT and retaining the completed prefix across restarts.
-fn unix_send_all(
+/// Outcome of [`unix_stream_send_loop`].
+pub(super) enum UnixSend {
+    /// Return this byte count: the whole payload, or the prefix queued
+    /// before a signal, SO_SNDTIMEO expiry or an error ended the send.
+    Done(usize),
+    /// Nothing was queued and a signal ended an infinite wait: the frame is
+    /// restart-pending; return without a value (`-ERESTARTSYS`).
+    Restart,
+    /// Nothing was queued: fail with `err`. `out_pipe` is Linux's
+    /// `out_pipe:` label — an EPIPE found before any wait, the only one that
+    /// raises SIGPIPE (unless MSG_NOSIGNAL). After a wait the error comes
+    /// from `sock_alloc_send_pskb` instead and raises nothing.
+    Err {
+        err: crate::socket::SockError,
+        out_pipe: bool,
+    },
+}
+
+/// Linux `unix_stream_sendmsg` on a BLOCKING socket. `send_unit(done)`
+/// queues as much of the payload after its first `done` bytes as the
+/// send buffer admits (`RingBuf::write_stream_with_fds`: whole units while
+/// the charge is below `sk_sndbuf`); a short count is progress, not the
+/// result. Between attempts the call waits in place for POLL_OUT, the way
+/// `sock_alloc_send_pskb` sleeps in `sock_wait_for_wmem`, so `done` (and a
+/// control message attached to the first unit) is never repeated:
+///
+/// - a signal: the prefix, or with nothing queued `sock_intr_errno` —
+///   [`UnixSend::Restart`] (infinite wait) or EINTR (SO_SNDTIMEO);
+/// - SO_SNDTIMEO expiry: the prefix, or EAGAIN;
+/// - the peer closing: the prefix with no SIGPIPE; with nothing queued,
+///   EPIPE + SIGPIPE if it was already gone when the call began (the
+///   `SEND_SHUTDOWN` check ahead of the loop), else the error the woken
+///   `sock_alloc_send_pskb` finds — `sock_error`'s ECONNRESET when the peer
+///   closed with unread data (always, for a sender that had to wait), then
+///   `SEND_SHUTDOWN`'s EPIPE — neither of which raises SIGPIPE.
+///
+/// Only blocking callers enter: MSG_DONTWAIT / O_NONBLOCK keep the one-shot
+/// short-or-EAGAIN path.
+pub(super) fn unix_stream_send_loop(
     ctx: &mut dyn TrapContext,
     sock: &crate::socket::SocketFile,
-    user_ptr: u64,
     len: usize,
-    resumed_timeo: Option<u64>,
-) -> handler_sys_socket_recv::SendAll {
-    use handler_sys_socket_recv::{SendAll, StreamWait};
+    mut resumed_timeo: Option<u64>,
+    mut send_unit: impl FnMut(usize) -> Result<usize, crate::socket::SockError>,
+) -> UnixSend {
+    use crate::socket::SockError;
+    use handler_sys_socket_recv::StreamWait;
 
-    const CHUNK: usize = 1 << 20;
+    // Non-zero only after a legacy longjmp park re-executed this call.
     let mut done = handler_sys_socket_recv::sock_progress_take(ctx, sock).min(len);
+    let mut waited = done > 0;
     while done < len {
-        let want = core::cmp::min(CHUNK, len - done);
-        // SAFETY: the caller validated the complete range.  This bounded copy
-        // still handles an unmap race; after committed progress Linux returns
-        // that prefix rather than replacing it with EFAULT.
-        let payload = match unsafe { copy_from_user_vec(user_ptr + done as u64, want) } {
-            Ok(payload) => payload,
-            Err(_) if done > 0 => return SendAll::Done(done),
-            Err(errno) => return SendAll::Err(crate::socket::SockError::Stack(errno as i32)),
-        };
-        match sock.unix_sendmsg(&payload, alloc::vec::Vec::new(), None) {
-            Ok(n) => {
-                if n != 0 {
-                    done += n;
-                    continue;
+        match send_unit(done) {
+            Ok(n) if n > 0 => {
+                done += n;
+                continue;
+            }
+            Ok(_) | Err(SockError::WouldBlock) => {}
+            Err(SockError::Pipe) if done > 0 || waited => {
+                // Inside the unit loop: `sock_alloc_send_pskb` reads (and
+                // clears) `sk_err` before it tests SEND_SHUTDOWN.
+                let reset = sock.take_unix_reset();
+                if done > 0 {
+                    return UnixSend::Done(done);
+                }
+                let err = if reset {
+                    SockError::Stack(narf_lib::errno::ECONNRESET as i32)
+                } else {
+                    SockError::Pipe
+                };
+                return UnixSend::Err {
+                    err,
+                    out_pipe: false,
+                };
+            }
+            Err(_) if done > 0 => return UnixSend::Done(done),
+            Err(err) => {
+                return UnixSend::Err {
+                    err,
+                    out_pipe: err == SockError::Pipe,
                 }
             }
-            Err(crate::socket::SockError::WouldBlock) => {}
-            Err(_) if done > 0 => return SendAll::Done(done),
-            Err(error) => return SendAll::Err(error),
-        }
-        if done == 0 {
-            return SendAll::WouldBlock;
         }
         match handler_sys_socket_recv::stream_wait_with_progress(
             ctx,
@@ -228,11 +270,21 @@ fn unix_send_all(
             resumed_timeo,
             done,
         ) {
-            StreamWait::Parked => return SendAll::Parked,
-            StreamWait::Return => return SendAll::Done(done),
+            StreamWait::Retry(deadline) => {
+                resumed_timeo = deadline;
+                waited = true;
+            }
+            StreamWait::Return => return UnixSend::Done(done),
+            StreamWait::Fail(err) => {
+                return UnixSend::Err {
+                    err,
+                    out_pipe: false,
+                }
+            }
+            StreamWait::Restart => return UnixSend::Restart,
         }
     }
-    SendAll::Done(done)
+    UnixSend::Done(done)
 }
 
 fn import_sendto_addr(ptr: u64, raw_len: u64) -> Result<Option<crate::socket::SockAddr>, i64> {

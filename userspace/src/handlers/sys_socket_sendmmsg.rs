@@ -67,9 +67,12 @@ pub(crate) fn sys_socket_sendmmsg(ctx: &mut dyn TrapContext) {
                 first_error = EAGAIN;
                 break;
             }
-            handler_sys_socket_sendmsg::SendMsgResult::Parked => unreachable!(
-                "sendmmsg does not supply a blocking stream progress context"
-            ),
+            // Only the blocking `sendmsg(2)` path (which hands
+            // `sendmsg_on_socket` a trap context) waits; sendmmsg never does.
+            handler_sys_socket_sendmsg::SendMsgResult::Restart
+            | handler_sys_socket_sendmsg::SendMsgResult::QuietError(_) => {
+                unreachable!("sendmmsg passes no wait context to sendmsg_on_socket")
+            }
             handler_sys_socket_sendmsg::SendMsgResult::Error(errno) => {
                 // SIGPIPE is raised inside the protocol send path in Linux
                 // (`sk_stream_error` / `unix_stream_sendmsg`), so a batch

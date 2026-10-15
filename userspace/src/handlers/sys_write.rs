@@ -58,7 +58,7 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
                     && sock.kind == crate::socket::SOCK_STREAM
                 {
                     handler_sys_socket_send::unix_blocking_send(
-                        ctx, fd_num, 0, &sock, user_ptr, count, resumed,
+                        ctx, 0, &sock, user_ptr, count, resumed,
                     );
                     return;
                 }

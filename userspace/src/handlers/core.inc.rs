@@ -14100,6 +14100,33 @@ pub(crate) fn park_reexecute_on_fd_until(
     }
 }
 
+/// Continue a syscall in place after [`park_reexecute_on_fd_until`] returned
+/// `true`.  That return means the park has already ended on this task's own
+/// stack (or the descriptor was ready at arm time), with RIP still rewound
+/// onto the syscall instruction.  Undo the rewind and drop the
+/// restart-pending marker so the handler can keep its local progress and
+/// finish with a real return value.  The exit trap then sees a completed
+/// frame: a signal that arrived during the park is delivered over that
+/// result instead of turning the frame into `-EINTR` or a restart (Linux
+/// `unix_stream_sendmsg` / `tcp_sendmsg_locked` return the bytes already
+/// queued when `sock_intr_errno` ends their wait).  The legacy longjmp park
+/// never returns here; its callers keep re-execution state instead.
+pub(crate) fn resume_parked_syscall_in_place(ctx: &mut dyn TrapContext) {
+    #[cfg(target_arch = "x86_64")]
+    const SYSCALL_INSN_LEN: u64 = 2;
+    #[cfg(target_arch = "aarch64")]
+    const SYSCALL_INSN_LEN: u64 = 4;
+    ctx.set_rip(ctx.rip().wrapping_add(SYSCALL_INSN_LEN));
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: the in-flight task's poller-pinned ctx; atomic store only.
+        unsafe {
+            (*uctx)
+                .syscall_parked_restarting
+                .store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 /// Encode a `siginfo_t` (128 bytes, x86_64/aarch64 layout) describing a
 /// child state change for `waitid(2)`. Fills si_signo = SIGCHLD,
 /// si_code (CLD_EXITED / CLD_KILLED / CLD_DUMPED), si_pid, si_uid (0),

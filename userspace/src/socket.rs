@@ -2970,6 +2970,17 @@ impl SocketFile {
         self.pending_error.lock().take()
     }
 
+    /// Consume the ECONNRESET a connected AF_UNIX stream/seqpacket peer left
+    /// by closing with unread data (`unix_release_sock`: `if (skb ||
+    /// embrion) WRITE_ONCE(skpair->sk_err, ECONNRESET)`). Like `sk_err` it
+    /// is reported once: `sock_error` exchanges it for 0.
+    pub(crate) fn take_unix_reset(&self) -> bool {
+        match &*self.state.lock() {
+            SocketState::UnixConnected { tx, .. } => tx.take_reset(),
+            _ => false,
+        }
+    }
+
     /// Record an async error so a subsequent getsockopt(SO_ERROR)
     /// can report it. Used by connect/send failure paths.
     pub fn set_pending_error(&self, e: SockError) {
@@ -6453,6 +6464,9 @@ impl SocketFile {
             // each cleared once read. A kernel-TCP socket's errors live on its
             // TCB (`take_sock_error` applies the same order there).
             let mut val = self.take_pending_error().map_or(0, |e| e.errno());
+            if val == 0 && self.take_unix_reset() {
+                val = errno::ECONNRESET as i32;
+            }
             if val == 0 {
                 let tcb = match &*self.state.lock() {
                     SocketState::InetWired { tcb_id, .. }
@@ -9354,6 +9368,16 @@ impl Drop for SocketFile {
         //   `err = -EPIPE`). Leaving rx open let a peer keep buffering into a
         //   ring no one would ever read — a lost write reported as success.
         let closed = match &*self.state.lock() {
+            // `unix_release_sock`: a stream/seqpacket endpoint closing with
+            // unread data leaves its peer ECONNRESET in `sk_err`. The peer's
+            // send ring is this end's `rx`, so the reset rides on it.
+            SocketState::UnixConnected { tx, rx, .. }
+                if self.kind == SOCK_STREAM || self.kind == SOCK_SEQPACKET =>
+            {
+                tx.close();
+                rx.close_reader();
+                true
+            }
             SocketState::UnixConnected { tx, rx, .. }
             | SocketState::InetConnected { tx, rx, .. }
             | SocketState::Inet6Connected { tx, rx, .. } => {
@@ -9377,6 +9401,15 @@ impl Drop for SocketFile {
 pub struct RingBuf {
     inner: IrqSafeSpinLock<RingInner>,
     closed: AtomicBool,
+    /// The reading endpoint closed with data still queued: its writer's
+    /// `sk_err` is ECONNRESET until consumed (see
+    /// [`SocketFile::take_unix_reset`]). Consumed by `SO_ERROR` and by a
+    /// blocking stream send woken from its wait.
+    ///
+    /// LINUX-GAP: Linux also reports it as POLLERR and from a recv that
+    /// finds its queue empty (`unix_stream_read_generic` → `sock_error`);
+    /// NARF's poll and recv do not consult it yet.
+    reset: AtomicBool,
     /// Whether the endpoint receiving from this ring currently requests
     /// automatic Unix credentials. The sender samples it at send time, just
     /// like Linux's `unix_maybe_add_creds(sk, other)`.
@@ -9537,6 +9570,7 @@ impl RingBuf {
                 sndbuf: UNIX_DEFAULT_SNDBUF,
             }),
             closed: AtomicBool::new(false),
+            reset: AtomicBool::new(false),
             capture_credentials: AtomicBool::new(false),
             owner_task: AtomicU64::new(0),
             // A fresh ring is empty: writable (has space), not readable, not
@@ -9943,6 +9977,20 @@ impl RingBuf {
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// [`Self::close`] by the endpoint that READS this ring. Unread data
+    /// left behind resets the writer (`unix_release_sock`). Latched before
+    /// the close publishes POLL_HUP, so a writer woken by it sees the reset.
+    fn close_reader(&self) {
+        if self.has_data() {
+            self.reset.store(true, Ordering::Release);
+        }
+        self.close();
+    }
+
+    fn take_reset(&self) -> bool {
+        self.reset.swap(false, Ordering::AcqRel)
     }
 
     fn close(&self) {

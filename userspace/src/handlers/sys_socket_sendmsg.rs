@@ -8,11 +8,14 @@ const MSGHDR_SIZE: usize = 56;
 
 pub(super) enum SendMsgResult {
     Sent { written: usize, complete: bool },
-    /// A blocking stream send parked after committing a prefix.  Its syscall
-    /// will re-execute with that byte count in the per-task progress cell.
-    Parked,
     WouldBlock,
     Error(i64),
+    /// An error that raises no SIGPIPE even when it is EPIPE (a blocking
+    /// AF_UNIX stream send woken from its wait; see `unix_stream_send_loop`).
+    QuietError(i64),
+    /// A blocking stream send left its frame restart-pending: return without
+    /// a value. Only the trap-context `sendmsg` path produces it.
+    Restart,
 }
 
 /// `sendmsg(fd, msghdr, flags)` with Linux's native validation order:
@@ -48,7 +51,8 @@ pub(crate) fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
     };
     match sendmsg_on_socket(&sock, msg_ptr, flags, false, wait_ctx, resumed) {
         SendMsgResult::Sent { written, .. } => ctx.set_return(SyscallReturn::ok(written as u64)),
-        SendMsgResult::Parked => {}
+        SendMsgResult::Restart => {}
+        SendMsgResult::QuietError(errno) => ctx.set_return(errno_ret(errno)),
         SendMsgResult::WouldBlock => {
             handler_sys_socket_send::socket_send_would_block(ctx, fd, flags, sock.as_ref(), resumed)
         }
@@ -191,12 +195,9 @@ pub(super) fn sendmsg_on_socket(
         return SendMsgResult::Error(EINVAL);
     }
     // A blocking AF_UNIX stream send must queue the entire iovec payload,
-    // waiting for its peer to drain whenever a bounded stream ring fills.
-    // Keep the prefix count over a park/re-execution, and hand SCM_RIGHTS / an
-    // explicit SCM_CREDENTIALS record to only its first queued unit.  Reparse
-    // the control message on re-execution (as Linux reimports the iterator),
-    // but discard it once a prefix has already committed so descriptor rights
-    // can never be duplicated.
+    // waiting in place for its peer to drain whenever a bounded stream ring
+    // fills. SCM_RIGHTS and an explicit SCM_CREDENTIALS record ride on the
+    // first queued unit only.
     if sock.domain == crate::socket::AF_UNIX
         && sock.kind == crate::socket::SOCK_STREAM
         && dest.is_none()
@@ -295,7 +296,9 @@ pub(super) fn sendmsg_on_socket(
     }
 }
 
-/// Finish a blocking AF_UNIX stream `sendmsg` across one or more wakeups.
+/// Finish a blocking AF_UNIX stream `sendmsg` with
+/// [`handler_sys_socket_send::unix_stream_send_loop`], which waits in place,
+/// so `done` and the fds' first-unit-only attachment survive every wait.
 /// The generic `sendmsg_on_socket` path intentionally remains one attempt so
 /// `sendmmsg` preserves its per-message short-write behaviour; only the
 /// ordinary blocking syscall supplies a trap context and enters this loop.
@@ -307,54 +310,38 @@ fn unix_stream_sendmsg_all(
     explicit_cred: Option<crate::socket::Ucred>,
     resumed_timeo: Option<u64>,
 ) -> SendMsgResult {
-    use handler_sys_socket_recv::StreamWait;
+    use handler_sys_socket_send::UnixSend;
 
-    let mut done = handler_sys_socket_recv::sock_progress_take(ctx, sock).min(total.len());
-    let mut first_fds = (done == 0).then_some(fds);
-    while done < total.len() {
-        let fds = if done == 0 {
-            first_fds.take().unwrap_or_default()
-        } else {
-            alloc::vec::Vec::new()
-        };
-        let cred = (done == 0).then_some(explicit_cred).flatten();
-        match sock.unix_sendmsg(&total[done..], fds, cred) {
-            Ok(n) => {
-                done += n;
-                continue;
+    // `unix_scm_to_skb(&scm, skb, !fds_sent)`: the rights go out with the
+    // first unit that is queued. A first attempt that queues nothing drops
+    // what it was handed, so it gets a copy until one succeeds.
+    let mut fds = Some(fds);
+    let outcome =
+        handler_sys_socket_send::unix_stream_send_loop(ctx, sock, total.len(), resumed_timeo, |done| {
+            let unit_fds = match (&fds, done) {
+                (Some(f), 0) => f.clone(),
+                _ => alloc::vec::Vec::new(),
+            };
+            let cred = (done == 0).then_some(explicit_cred).flatten();
+            let n = sock.unix_sendmsg(&total[done..], unit_fds, cred)?;
+            if n > 0 {
+                fds = None;
             }
-            Err(crate::socket::SockError::WouldBlock) if done == 0 => {
-                return SendMsgResult::WouldBlock;
-            }
-            Err(crate::socket::SockError::WouldBlock) => {}
-            Err(_) if done > 0 => {
-                return SendMsgResult::Sent {
-                    written: done,
-                    complete: false,
-                };
-            }
-            Err(error) => return SendMsgResult::Error(error.errno() as i64),
-        }
-        match handler_sys_socket_recv::stream_wait_with_progress(
-            ctx,
-            sock,
-            narf_filesystem::POLL_OUT | narf_filesystem::POLL_HUP,
-            sock.sndtimeo(),
-            resumed_timeo,
-            done,
-        ) {
-            StreamWait::Parked => return SendMsgResult::Parked,
-            StreamWait::Return => {
-                return SendMsgResult::Sent {
-                    written: done,
-                    complete: false,
-                };
+            Ok(n)
+        });
+    match outcome {
+        UnixSend::Done(written) => SendMsgResult::Sent {
+            written,
+            complete: written == total.len(),
+        },
+        UnixSend::Restart => SendMsgResult::Restart,
+        UnixSend::Err { err, out_pipe } => {
+            if out_pipe {
+                SendMsgResult::Error(err.errno() as i64)
+            } else {
+                SendMsgResult::QuietError(err.errno() as i64)
             }
         }
-    }
-    SendMsgResult::Sent {
-        written: done,
-        complete: true,
     }
 }
 
