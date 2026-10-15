@@ -296,6 +296,7 @@ pub mod nvidia_gpu_fifo;
 pub mod nvidia_gpu_gsp;
 pub mod nvidia_gpu_pmc;
 pub mod qxl;
+pub mod scanout_access;
 pub mod vmware_svga;
 
 mod tests;

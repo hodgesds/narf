@@ -972,14 +972,49 @@ preparation may restage an occupied pipe only right after plane retirement
 fetches. Its own previous staged address may still be pending, because those
 buffers stay owned either way. The same geometry reuses the front, back and
 cursor buffers, re-cleared.
-A console write still in flight to the withdrawn scanout can then only land
-on that same surface. A new geometry allocates fresh buffers and parks the
-old surface (front, back, cursor); a published reservation is never returned
-to the pool. There is no writer-quiescence barrier between the fb layer and a
-withdrawn scanout, so freeing them could let a late write corrupt a later
-allocation. A later request for a parked geometry on the same pipe reuses
-that surface, so switching among a sink's offered modes retains at most one
-surface per distinct geometry rather than one per switch.
+A new geometry allocates fresh buffers and parks the old surface (front,
+back, cursor); a published reservation is still never returned to the pool.
+A later request for a parked geometry on the same pipe reuses that surface,
+so switching among a sink's offered modes retains at most one surface per
+distinct geometry rather than one per switch. CPU writer quiescence now
+exists (below); connecting it to fresh hardware fetch-retirement evidence
+and releasing the corresponding reservations remains separate work.
+
+`scanout_access::unsafe snapshot(read)` captures a CPU mapping/geometry and
+an epoch lease under the same short IRQ-safe lock that
+`scanout_access::replace(change)` uses to replace it. The returned `View<T>`
+holds no lock while pixels are accessed. It is !Send and holds a scheduler
+preemption guard, with IRQ delivery unchanged; it must not span a yield or
+await. Pointer/framebuffer values must not escape their lease and their
+destructors must not access the mapping. Drop executes MFENCE (x86_64) or
+DSB SY (aarch64), between compiler fences, before releasing the epoch and
+preemption guard. This drains the originating CPU's WC writes and device
+reads; it does not replace HDP/PCIe flush or display fetch retirement.
+
+The fb layer replaces generic mappings through this gate and leases
+`FbWriter` fills/blits, cursor snapshots and status-panel writes. DRM fallback
+copies lease the query hook's mapping through the last copied row, dropping
+the lease before flushing. `query_scanout` alone remains a metadata snapshot,
+not lifetime authority. Raw `FbScanout::framebuffer` callers must use the
+same lease or independently retain the backing; the early boot console
+retains its permanently reserved boot range. Native surfaces are not exposed
+through fbdev mmap. A stale pull adoption revalidates the current publication;
+failed replacement/restoration clears the generic mapping when no boot mapping
+is available, so cached writers see an empty view rather than a dangling one.
+
+`scanout_access::wait_retired().await` cooperatively drains all replaced
+epochs, including earlier flips, without waiting for writers on the current
+mapping. Cancellation retains outstanding epochs. Navi48 withdrawal waits
+after moving/clearing the mapping and before teardown. Both platform flips
+and the presenter publish and drain while still holding the async display
+owner lock, before another presenter can overwrite the former front as its
+back buffer. Back-buffer acquisition and native presentation also drain a
+previous cancelled wait before reuse. This proves CPU access completion only;
+it neither serializes overlapping pixel writers nor authorizes VRAM reuse.
+The legacy DCN314 teardown also drains after withdrawing its shared fb mapping
+and before returning to the caller that owns the scanout reservation.
+Epoch/cancellation and framebuffer-withdrawal regressions run in QEMU on both
+architectures; physical display transitions remain unvalidated.
 
 `amdgpu_navi48_kms` publishes the lit sink as KMS state on the registered
 amdgpu card. KMS state is attached on first publication; until then every
@@ -1077,7 +1112,7 @@ possible and no vblank synchronisation is claimed. The platform `stop_modeset`
 withdraws the scanout first, clearing the flush before observers run, so the
 console returns to the boot framebuffer. That range stays excluded from the
 VRAM pool for its lifetime and therefore remains valid memory. The surface is
-retained, so a console write already in flight lands in owned memory.
+retained; teardown also waits for leased fb/DRM accesses to finish.
 
 Page flips are double-buffered on one pipe. `unsafe Otg::prepare_back_buffer`
 (ColdBoot `prepare_display_back_buffer`) reserves a second allocation of the
@@ -1099,7 +1134,8 @@ binding and live fetch are re-verified at the new front. `FlipDone` names the
 new front, the now-reusable back and the frame count. Any failure leaves
 `Failed`, with both buffers retained because which one is still fetched is
 unknown. The platform `flip_display` moves a console that had adopted the old
-front onto the new one. There is no flip interrupt or event queue yet:
+front onto the new one and drains CPU views before releasing the owner lock.
+There is no flip interrupt or event queue yet:
 completion is polled.
 
 Live updates have one synchronization policy per writer. The front's

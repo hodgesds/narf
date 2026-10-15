@@ -56,6 +56,7 @@ pub use registry::{
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_capabilities::{Cap, CapKind, CapType, Read, Write};
+use narf_drivers_gpu::scanout_access;
 use narf_graphics::{Framebuffer, Pixel32};
 
 /// Pixel format the kernel exposes to consumers. Today we only
@@ -95,7 +96,9 @@ pub trait FbScanout: Send + Sync + core::fmt::Debug {
     /// Caller must hold a `Cap<FbScanoutCap, Write>` and ensure no
     /// other writer is in flight. The returned Framebuffer aliases
     /// the scanout buffer; lifetime is tied to the scanout's
-    /// lifetime (which today is `'static`).
+    /// lifetime. For a replaceable generic scanout, capture and use the view
+    /// under `scanout_access::snapshot`; a raw view may otherwise be retained
+    /// only with independent backing ownership (the permanent boot range).
     unsafe fn framebuffer(&self) -> Framebuffer;
 }
 
@@ -430,8 +433,10 @@ pub fn register_generic(fb: narf_graphics_driver::generic::GenericFb) {
             *boot = Some(fb);
         }
     }
-    GENERIC_PHYS.store(fb.addr, core::sync::atomic::Ordering::Release);
-    *GENERIC_FB.lock() = Some(fb);
+    scanout_access::replace(|| {
+        GENERIC_PHYS.store(fb.addr, core::sync::atomic::Ordering::Release);
+        *GENERIC_FB.lock() = Some(fb);
+    });
 }
 
 /// Adopt the external DisplayPort scanout the AMD display pipeline publishes,
@@ -452,8 +457,8 @@ pub fn adopt_external_scanout() -> bool {
     adopt(fb)
 }
 /// Kernel mappings made for adopted scanouts, as (phys, len, va). Never
-/// unmapped: a writer that read the previous `GENERIC_FB` may still be drawing
-/// through it, and every provider retains the memory behind what it published.
+/// unmapped. CPU views lease their publication epoch; withdrawal waits for
+/// old epochs before a provider may consider reclaiming the backing memory.
 static ADOPTED_MAPS: narf_lib::sync::IrqSafeSpinLock<[Option<(u64, u64, u64)>; 8]> =
     narf_lib::sync::IrqSafeSpinLock::new([None; 8]);
 
@@ -501,18 +506,42 @@ fn adopt(fb: narf_graphics_driver::generic::GenericFb) -> bool {
     let Some(mapped) = map_scanout(fb) else {
         return false;
     };
-    GENERIC_PHYS.store(fb.addr, core::sync::atomic::Ordering::Release);
-    *GENERIC_FB.lock() = Some(mapped);
-    true
+    let mut installed = false;
+    scanout_access::replace(|| {
+        // A pull adoption may have raced withdrawal while mapping the range.
+        // Publication changes ACTIVE before invoking its observer, so a stale
+        // pull either fails here or precedes that observer's replacement.
+        let current = narf_drivers_gpu::amdgpu_dcn_display::active_scanout();
+        let boot = *BOOT_GENERIC.lock();
+        if ![current, boot].into_iter().flatten().any(|f| {
+            (f.addr, f.width, f.height, f.pitch, f.bpp)
+                == (fb.addr, fb.width, fb.height, fb.pitch, fb.bpp)
+        }) {
+            return;
+        }
+        GENERIC_PHYS.store(fb.addr, core::sync::atomic::Ordering::Release);
+        *GENERIC_FB.lock() = Some(mapped);
+        installed = true;
+    });
+    installed
 }
 /// Put the console back on the framebuffer it booted with. Used when an adopted
 /// external scanout goes away: its memory is about to be released, so continuing
 /// to draw there would write into whatever claims it next.
 pub fn restore_boot_scanout() -> bool {
-    let Some(fb) = *BOOT_GENERIC.lock() else {
-        return false;
-    };
-    adopt(fb)
+    let boot = *BOOT_GENERIC.lock();
+    if boot.is_some_and(adopt) {
+        return true;
+    }
+    clear_generic();
+    false
+}
+
+fn clear_generic() {
+    scanout_access::replace(|| {
+        GENERIC_PHYS.store(0, core::sync::atomic::Ordering::Release);
+        *GENERIC_FB.lock() = None;
+    });
 }
 /// The console draws to exactly the scanout a driver published.
 pub(crate) fn adopted_external_scanout() -> bool {
@@ -526,7 +555,10 @@ pub(crate) fn adopted_external_scanout() -> bool {
 /// and nothing here is exposed to a userspace mmap.
 fn external_scanout_geom() -> Option<narf_drivers_gpu::drm_fb_hook::ScanoutGeom> {
     let published = narf_drivers_gpu::amdgpu_dcn_display::active_scanout()?;
-    if !adopted_external_scanout() {
+    // Compare with this publication, not a second ACTIVE sample that could
+    // already name the next front. The caller leases GENERIC_FB under the
+    // replacement gate, so its mapping cannot change during this query.
+    if GENERIC_PHYS.load(core::sync::atomic::Ordering::Acquire) != published.addr {
         return None;
     }
     let fb = (*GENERIC_FB.lock())?;
@@ -553,7 +585,11 @@ fn external_scanout_geom() -> Option<narf_drivers_gpu::drm_fb_hook::ScanoutGeom>
 fn external_scanout_changed(scanout: Option<narf_graphics_driver::generic::GenericFb>) {
     match scanout {
         Some(fb) => {
-            adopt(fb);
+            if !adopt(fb) {
+                // Never leave the withdrawn mapping reachable if mapping the
+                // replacement failed. Restoration can also clear it entirely.
+                restore_boot_scanout();
+            }
         }
         None => {
             restore_boot_scanout();
@@ -569,9 +605,11 @@ fn external_scanout_changed(scanout: Option<narf_graphics_driver::generic::Gener
 /// No-op when no GenericFb is registered. Single-threaded boot
 /// context only.
 pub fn rebase_generic(new_addr: u64) {
-    if let Some(fb) = GENERIC_FB.lock().as_mut() {
-        fb.addr = new_addr;
-    }
+    scanout_access::replace(|| {
+        if let Some(fb) = GENERIC_FB.lock().as_mut() {
+            fb.addr = new_addr;
+        }
+    });
 }
 
 /// Bus-physical base of the generic FB, as registered. Unaffected by
@@ -617,7 +655,12 @@ impl FbScanout for GenericScanout {
                 // SAFETY: register_generic caller asserts addr/size validity.
                 unsafe { f.framebuffer() }
             })
-            .expect("generic-fb scanout selected without device")
+            .unwrap_or_else(|| {
+                // SAFETY: a cached writer can outlive withdrawal on a machine
+                // without a boot framebuffer. A zero-sized view is never
+                // dereferenced by the bounds-checked drawing operations.
+                unsafe { Framebuffer::new(core::ptr::NonNull::dangling().as_ptr(), 0, 0, 0) }
+            })
     }
 }
 
@@ -861,7 +904,7 @@ impl FbWriter {
             .clip(self.scanout.width(), self.scanout.height())
             .ok_or(FbWriteError::OutOfBounds)?;
         // SAFETY: cap-checked above; FbWriter owns exclusive Write.
-        let mut fb = unsafe { self.scanout.framebuffer() };
+        let mut fb = unsafe { self.scanout_for_cursor() };
         fb.fill_rect(clipped.x, clipped.y, clipped.w, clipped.h, pixel);
         Ok(())
     }
@@ -900,7 +943,7 @@ impl FbWriter {
         let dx = (clipped.x - rect.x) as usize;
         let dy = (clipped.y - rect.y) as usize;
         // SAFETY: cap-checked above; FbWriter owns exclusive Write.
-        let mut fb = unsafe { self.scanout.framebuffer() };
+        let mut fb = unsafe { self.scanout_for_cursor() };
         for row in 0..clipped.h {
             for col in 0..clipped.w {
                 let s = src[(dy + row as usize) * (rect.w as usize) + (dx + col as usize)];
@@ -946,7 +989,7 @@ impl FbWriter {
             return Err(FbWriteError::OutOfBounds);
         }
         // SAFETY: cap-checked above; FbWriter owns exclusive Write.
-        let mut fb = unsafe { self.scanout.framebuffer() };
+        let mut fb = unsafe { self.scanout_for_cursor() };
         for row in 0..clipped.h {
             let row_base =
                 src_offset as u64 + (dy + row) as u64 * src_stride as u64 + dx as u64 * 4;
@@ -1084,20 +1127,21 @@ pub(crate) fn pump_writer_ref() -> Option<&'static FbWriter> {
 }
 
 impl FbWriter {
-    /// Acquire the underlying `Framebuffer` view for the cursor
-    /// renderer's read-pixel pass. `pub(crate)` because direct
-    /// framebuffer access bypasses the cap-checked write helpers
-    /// (fill / blit / flush) — only the cursor save-restore loop
-    /// is allowed to use it, and it only reads.
+    /// Lease the underlying `Framebuffer` for drawing or cursor reads.
+    /// `pub(crate)` because direct framebuffer access bypasses the
+    /// cap-checked write helpers. The lease pins the mapping until the
+    /// last access finishes, even when another CPU withdraws the display.
     ///
     /// # Safety
     /// Caller must ensure no other agent holds a `Framebuffer`
     /// view of the same scanout for the lifetime of the returned
     /// value (FbWriter is the FB owner; concurrent draws by other
-    /// FbWriters race the underlying MMIO).
-    pub(crate) unsafe fn scanout_for_cursor(&self) -> narf_graphics::Framebuffer {
-        // SAFETY: forwarded to caller — see method docs.
-        unsafe { self.scanout.framebuffer() }
+    /// FbWriters race the underlying MMIO). Do not extract the framebuffer
+    /// from its lease or yield/await while holding it.
+    pub(crate) unsafe fn scanout_for_cursor(&self) -> scanout_access::View<Framebuffer> {
+        // SAFETY: generic mapping replacements use the same epoch lock. The
+        // caller keeps the lease for the complete access and excludes writers.
+        unsafe { scanout_access::snapshot(|| self.scanout.framebuffer()) }
     }
 
     /// Mutable variant for the status panel's `draw_string_8x8`
@@ -1107,9 +1151,9 @@ impl FbWriter {
     ///
     /// # Safety
     /// Same as `scanout_for_cursor`.
-    pub(crate) unsafe fn scanout_for_cursor_mut(&self) -> narf_graphics::Framebuffer {
+    pub(crate) unsafe fn scanout_for_cursor_mut(&self) -> scanout_access::View<Framebuffer> {
         // SAFETY: forwarded to caller.
-        unsafe { self.scanout.framebuffer() }
+        unsafe { self.scanout_for_cursor() }
     }
 }
 

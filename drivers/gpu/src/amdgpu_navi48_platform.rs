@@ -797,12 +797,13 @@ async unsafe fn adopt(boot: &mut boot::ColdBoot, m: &Modeset) {
 
 /// Stop presenting on `pipe` and, when it carried the console, move the
 /// console to another lit display (or withdraw it).
-fn withdraw(boot: &boot::ColdBoot, pipe: u8, lit: &[Option<Modeset>; 4]) {
+async fn withdraw(boot: &boot::ColdBoot, pipe: u8, lit: &[Option<Modeset>; 4]) {
     present_slot(pipe).native.store(false, Ordering::Release);
     if CURSOR_PIPE.load(Ordering::Acquire) == pipe {
         let next = lit.iter().flatten().map(|m| m.pipe).find(|&p| p != pipe);
         publish_console(boot, next);
     }
+    crate::scanout_access::wait_retired().await;
 }
 
 /// Light every plugged sink whose CRTC DRM has not switched off, as one
@@ -921,6 +922,7 @@ pub async unsafe fn prepare_display_back_buffer(
     pipe: u8,
 ) -> Result<GenericFb, crate::amdgpu_dcn401_otg::Error> {
     let mut owner = OWNER.lock().await;
+    crate::scanout_access::wait_retired().await;
     let boot = owner
         .as_mut()
         .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
@@ -937,27 +939,25 @@ pub async unsafe fn prepare_display_back_buffer(
 pub async unsafe fn flip_display(
     pipe: u8,
 ) -> Result<crate::amdgpu_dcn401_otg::FlipDone, crate::amdgpu_dcn401_otg::Error> {
-    let (done, before, after) = {
-        let mut owner = OWNER.lock().await;
-        let boot = owner
-            .as_mut()
-            .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
-        let before = boot.display_scanout_framebuffer(pipe)?;
-        // SAFETY: serialized retained owners; caller excludes external writers.
-        let done = unsafe { boot.flip_display(pipe).await }?;
-        (done, before, boot.display_scanout_framebuffer(pipe)?)
-    };
-    follow_flip(before, after);
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    let before = boot.display_scanout_framebuffer(pipe)?;
+    // SAFETY: serialized retained owners; caller excludes external writers.
+    let done = unsafe { boot.flip_display(pipe).await }?;
+    follow_flip(before, boot.display_scanout_framebuffer(pipe)?).await;
     Ok(done)
 }
 
-/// A published scanout that was the old front follows the new one, so the
-/// console (or DRM's fallback copy) keeps writing the visible buffer.
-fn follow_flip(before: GenericFb, after: GenericFb) {
+/// Follow a flip while still holding OWNER. Retired CPU views must finish
+/// before another presenter can overwrite the former front as its back buffer.
+async fn follow_flip(before: GenericFb, after: GenericFb) {
     if crate::amdgpu_dcn_display::active_scanout().is_some_and(|fb| fb.addr == before.addr) {
         crate::amdgpu_dcn_display::publish_external(Some(after), Some(flush_scanout));
         crate::amdgpu_dcn_display::publish_external_cursor(Some(scanout_cursor));
     }
+    crate::scanout_access::wait_retired().await;
 }
 
 /// One display's DRM presentation: whether frames go through its back
@@ -1204,17 +1204,18 @@ async fn presenter(display: u8) {
                 // frame's dumb buffer stays valid under DRM's buffer rules.
                 Some(boot) => match unsafe { present_native(boot, display, frame).await } {
                     // The vblank the flip latched in, as DRM counts it.
-                    Ok((before, after, _)) => Ok((before, after, read_vblank(boot, display))),
+                    Ok((before, after, _)) => {
+                        let latched = read_vblank(boot, display);
+                        follow_flip(before, after).await;
+                        Ok(latched)
+                    }
                     Err(e) => Err(e),
                 },
                 None => Err(crate::amdgpu_dcn401_otg::Error::Busy),
             }
         };
         match result {
-            Ok((before, after, latched)) => {
-                complete_flip(display, frame.ticket, latched);
-                follow_flip(before, after);
-            }
+            Ok(latched) => complete_flip(display, frame.ticket, latched),
             Err(e) => {
                 complete_flip(display, frame.ticket, None);
                 // A failed flip quarantines the pipe; later frames use the
@@ -1241,6 +1242,9 @@ async unsafe fn present_native(
     (GenericFb, GenericFb, crate::amdgpu_dcn401_otg::FlipDone),
     crate::amdgpu_dcn401_otg::Error,
 > {
+    // A previous presenter may have been cancelled while draining the old
+    // front after a successful flip. Finish that barrier before reusing it.
+    crate::scanout_access::wait_retired().await;
     let back = boot.display_back_framebuffer(pipe)?;
     let width = frame.width.min(back.width);
     for y in 0..frame.height.min(back.height) {
@@ -1497,7 +1501,7 @@ pub async unsafe fn monitor_displays(
             continue;
         };
         if boot.display_hpd(m.selection.port) == Ok(false) {
-            withdraw(boot, k, &displays.lit);
+            withdraw(boot, k, &displays.lit).await;
             // SAFETY: writers withdrawn; HPD reports physical removal.
             unsafe { boot.unplug_modeset(&m) }.await?;
             displays.lit[usize::from(k)] = None;
@@ -1508,7 +1512,7 @@ pub async unsafe fn monitor_displays(
         if !wants[usize::from(k)].0 {
             // Withdraw writers first, then stop: the CRTC is off, the
             // connector still connected.
-            withdraw(boot, k, &displays.lit);
+            withdraw(boot, k, &displays.lit).await;
             // SAFETY: the caller's obligations; the scanout is withdrawn.
             unsafe { boot.stop_modeset(&m) }.await?;
             displays.lit[usize::from(k)] = None;
@@ -1540,7 +1544,7 @@ pub async unsafe fn monitor_displays(
                 steps.push(MonitorStep::Retrained(k));
             }
             Health::Unplugged => {
-                withdraw(boot, k, &displays.lit);
+                withdraw(boot, k, &displays.lit).await;
                 if let Some(o) = OUTPUT_STATE.lock().get_mut(usize::from(k)) {
                     o.shown = None;
                 }
@@ -1570,7 +1574,7 @@ pub async unsafe fn monitor_displays(
             let Some(m) = displays.lit[usize::from(k)] else {
                 continue;
             };
-            withdraw(boot, k, &displays.lit);
+            withdraw(boot, k, &displays.lit).await;
             if boot.display_hpd(m.selection.port) == Ok(false) {
                 // SAFETY: the caller's obligations; writers withdrawn first.
                 unsafe { boot.unplug_modeset(&m) }.await?;

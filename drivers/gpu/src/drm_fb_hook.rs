@@ -69,6 +69,8 @@ pub unsafe fn install_drm_fb_hook(query: QueryFn, flush: FlushFn) {
 
 /// Query the active scanout geometry. Returns `None` if the hook has
 /// not been installed yet (headless CI / early-boot).
+/// This is metadata, not a memory lease: a CPU blitter must capture it via
+/// `scanout_access::snapshot` and retain that view through its final access.
 pub fn query_scanout() -> Option<ScanoutGeom> {
     if !INSTALLED.load(Ordering::Acquire) {
         return None;

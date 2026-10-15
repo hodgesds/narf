@@ -4970,7 +4970,10 @@ fn blit_to_virtio_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32)
 /// The scanout geometry is fetched through the DRM fbdev hook installed
 /// by `narf_fb` at `Stage::Late` — avoids a circular crate dependency.
 fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
-    let info = match crate::drm_fb_hook::query_scanout() {
+    // SAFETY: fb replaces its generic mapping through scanout_access; all
+    // destination accesses below finish before this view is dropped.
+    let view = unsafe { crate::scanout_access::snapshot(crate::drm_fb_hook::query_scanout) };
+    let info = match *view {
         Some(i) => i,
         None => {
             // No live scanout: the client's pixels are being dropped on the
@@ -5030,6 +5033,7 @@ fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
             );
         }
     }
+    drop(view);
     // Tell the FB cursor renderer the frame was fully repainted so it drops
     // its now-stale saved-background snapshot and re-composites the pointer
     // over the fresh frame (otherwise the compositor's repaint would leave the

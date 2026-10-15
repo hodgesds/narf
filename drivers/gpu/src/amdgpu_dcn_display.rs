@@ -270,7 +270,9 @@ pub(crate) fn publish_external_cursor(cursor: Option<ScanoutCursor>) {
     }
 }
 /// Publish a scanout owned outside this module, with its flush. Clearing the
-/// flush (and cursor) first means no writer reaches a surface being withdrawn.
+/// flush (and cursor) first detaches the hooks before notifying the fb layer.
+/// Callers still retain the backing and drain scanout_access's retired CPU
+/// views before teardown or buffer reuse; notification alone is not a barrier.
 pub(crate) fn publish_external(scanout: Option<GenericFb>, flush: Option<ScanoutFlush>) {
     if scanout.is_none() {
         *FLUSH.lock() = None;
@@ -660,6 +662,7 @@ impl Pipeline {
         }
         self.streaming = false;
         publish(None);
+        crate::scanout_access::wait_retired().await;
         first
     }
     /// Take the stream down. The scanout is safe to release once this returns.

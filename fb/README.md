@@ -50,3 +50,13 @@ logging continues. This boot-only handoff cannot revoke runtime mmap writers.
 See the [GPU handoff contract](../drivers/gpu/specification/spec.md#navi-22-boot-ownership-and-framebuffer-handoff).
 Navi48 selects its PSP14/SMU14/GMC12/SDMA7/DCN4 owner and preserves the same
 preflight rollback and primary-framebuffer quarantine behavior.
+
+Runtime generic scanout replacement uses `narf_drivers_gpu::scanout_access`
+epochs. FbWriter drawing, cursor/status views and DRM fallback copies retain
+their mapping until the last CPU access finishes. Navi48 withdrawal and flips
+drain retired epochs before teardown or back-buffer reuse. Leases keep IRQs
+enabled but prevent task preemption until a device-memory fence completes;
+they must not cross a yield or await. Raw framebuffer views require the same
+lease or independent ownership of the backing. A failed boot restoration
+clears the mapping so cached writers become empty. This CPU barrier does not
+prove hardware fetch retirement or release parked VRAM reservations.

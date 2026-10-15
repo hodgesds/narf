@@ -1292,6 +1292,7 @@ fn smoke_fb_adopted_scanout_is_installed_through_its_mapping() -> TestResult {
     }
     let mapped = crate::map_scanout(fb);
     let reused = mapped.map(|m| (m.addr, m.width, m.height, m.pitch));
+    let stale_adopted = crate::adopt(fb);
     crate::ADOPTED_MAPS
         .lock()
         .iter_mut()
@@ -1299,6 +1300,9 @@ fn smoke_fb_adopted_scanout_is_installed_through_its_mapping() -> TestResult {
         .for_each(|m| *m = None);
     if reused != Some((VA, 640, 480, 640 * 4)) {
         return TestResult::Fail("cached mapping not used for the same range");
+    }
+    if stale_adopted {
+        return TestResult::Fail("withdrawn publication was adopted by a stale pull");
     }
     if crate::adopt(GenericFb::new(0, 640, 480, 640 * 4, 32))
         || crate::adopt(GenericFb::new(PHYS, 0, 480, 640 * 4, 32))
@@ -1310,6 +1314,55 @@ fn smoke_fb_adopted_scanout_is_installed_through_its_mapping() -> TestResult {
 kernel_test_in!(
     "fb",
     smoke_fb_adopted_scanout_is_installed_through_its_mapping
+);
+
+/// A cached FbWriter can outlive a display on a headless boot. Withdrawal
+/// must clear its mapping and wait for the view already writing the old one.
+fn smoke_fb_withdrawal_drains_views_and_clears_cached_writers() -> TestResult {
+    use crate::FbScanout;
+    use core::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    use narf_drivers_gpu::scanout_access;
+    use narf_graphics_driver::generic::GenericFb;
+
+    let saved = *crate::GENERIC_FB.lock();
+    let saved_phys = crate::GENERIC_PHYS.load(core::sync::atomic::Ordering::Acquire);
+    let saved_boot = crate::BOOT_GENERIC.lock().take();
+    let mut pixels = alloc::vec![0u32; 16];
+    scanout_access::replace(|| {
+        *crate::GENERIC_FB.lock() = Some(GenericFb::new(pixels.as_mut_ptr() as u64, 4, 4, 16, 32));
+    });
+    let before = narf_scheduler::preempt_count();
+    // SAFETY: the test owns the backing and keeps the lease until writes end.
+    let mut old = unsafe { scanout_access::snapshot(|| crate::GENERIC.framebuffer()) };
+    assert_eq!(narf_scheduler::preempt_count(), before + 1);
+    assert!(!crate::restore_boot_scanout());
+    assert!(crate::generic_phys().is_none());
+    // SAFETY: the withdrawn generic backend returns an empty, bounded view.
+    let empty = unsafe { scanout_access::snapshot(|| crate::GENERIC.framebuffer()) };
+    assert_eq!((empty.width, empty.height), (0, 0));
+    assert!(empty.read_pixel(0, 0).is_none());
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut wait = core::pin::pin!(scanout_access::wait_retired());
+    assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+    old.draw_pixel(1, 1, narf_graphics::Pixel32(0x123456));
+    assert_eq!(pixels[5], 0x123456);
+    drop(old);
+    assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(()));
+    drop(empty);
+    assert_eq!(narf_scheduler::preempt_count(), before);
+    scanout_access::replace(|| {
+        *crate::GENERIC_FB.lock() = saved;
+        crate::GENERIC_PHYS.store(saved_phys, core::sync::atomic::Ordering::Release);
+    });
+    *crate::BOOT_GENERIC.lock() = saved_boot;
+    TestResult::Pass
+}
+kernel_test_in!(
+    "fb",
+    smoke_fb_withdrawal_drains_views_and_clears_cached_writers
 );
 
 /// Without a driver-published external scanout, the DRM blit target stays
