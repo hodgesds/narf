@@ -9,20 +9,22 @@ fn run<T>(f: impl Future<Output = T>) -> T {
 
 /// A two-level MST hub: the primary branch (port 0 input, 1 an SST sink,
 /// 2 a branch, 3 empty) and behind port 2 a branch with an SST sink on 1.
-struct Hub {
-    dpcd: BTreeMap<u32, u8>,
+pub(crate) struct Hub {
+    pub(crate) dpcd: BTreeMap<u32, u8>,
     down: Vec<u8>,
     rx: Rx,
     replies: VecDeque<Vec<u8>>,
     up: VecDeque<Vec<u8>>,
     up_acks: Vec<Vec<u8>>,
-    requests: Vec<(u8, [u8; 8], u8)>,
+    /// Each down request: LCT, RAD and body.
+    pub(crate) requests: Vec<(u8, [u8; 8], u8)>,
+    pub(crate) bodies: Vec<Vec<u8>>,
     edid: [u8; 256],
 }
 const ROOT: [u8; 16] = [0x11; 16];
 const CHILD: [u8; 16] = [0x22; 16];
 impl Hub {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut dpcd = BTreeMap::new();
         dpcd.insert(MSTM_CAP, 1);
         let mut edid = [0u8; 256];
@@ -37,6 +39,7 @@ impl Hub {
             up: VecDeque::new(),
             up_acks: Vec::new(),
             requests: Vec::new(),
+            bodies: Vec::new(),
             edid,
         }
     }
@@ -113,6 +116,9 @@ impl Hub {
                 r.extend_from_slice(&self.edid[start..start + 128]);
                 r
             }
+            dp_mst::ALLOCATE_PAYLOAD => {
+                vec![kind, body[1] & 0xf0, body[2], body[3], body[4]]
+            }
             _ => vec![kind],
         }
     }
@@ -167,6 +173,7 @@ impl MstAux for Hub {
                     let body = self.rx.msg[..usize::from(self.rx.len)].to_vec();
                     self.rx = Rx::default();
                     self.requests.push((hdr.lct, hdr.rad, body[0]));
+                    self.bodies.push(body.clone());
                     // An unplug notice arrives during the first request.
                     if self.requests.len() == 1 {
                         let mut csn = vec![dp_mst::CONNECTION_STATUS_NOTIFY, 0x20];

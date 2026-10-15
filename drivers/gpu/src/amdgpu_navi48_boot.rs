@@ -451,6 +451,8 @@ pub struct ColdBoot {
     clocks: Result<clocks::ClockManager, clocks::Error>,
     dccg: Result<dccg::Dccg, dccg::Error>,
     otg: Result<otg::Otg, otg::Error>,
+    /// Ports running DP MST, by `display_paths` index.
+    mst: alloc::collections::BTreeMap<usize, mst::MstLink>,
 }
 impl ColdBoot {
     /// # Safety
@@ -576,6 +578,7 @@ impl ColdBoot {
             clocks,
             dccg,
             otg,
+            mst: alloc::collections::BTreeMap::new(),
             sequence: Sequence {
                 backend: Hardware {
                     gpu: saved,
@@ -2469,6 +2472,9 @@ impl ColdBoot {
     }
 }
 
+#[path = "amdgpu_navi48_mst.rs"]
+mod mst;
+pub use mst::{MstFailure, MstLink, MstPayload};
 #[path = "amdgpu_navi48_modeset.rs"]
 mod modeset;
 pub use modeset::{

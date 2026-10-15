@@ -455,4 +455,4 @@ pub async fn write_payload<A: MstAux>(
 
 #[cfg(feature = "kernel-test")]
 #[path = "dp_mst_mgr_tests.rs"]
-mod tests;
+pub(crate) mod tests;
