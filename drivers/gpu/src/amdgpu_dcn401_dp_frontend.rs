@@ -82,36 +82,41 @@ impl<I: Io> Engine<I> {
             }
         }
         // Other displays route their own streams and backends after this
-        // snapshot; every other route must stay as it was.
+        // snapshot, and release them when they stop: every other route
+        // stays as it was or is released. This display's own stream and
+        // backend routes stay exactly as programmed. An MST backend permits
+        // the currently owned sibling selections, but no foreign frontend.
         let others = self.displays.siblings;
-        // On this display's MST backend, other displays' streams select it
-        // too; their bits are theirs.
-        let shared = if plan.link.phy.settings.mst {
-            u32::from(others.streams) << 8
-        } else {
-            0
-        };
+        let phy = plan.link.phy.path.transmitter;
         for b in 0..4 {
-            let own_backend = b == plan.link.phy.path.transmitter;
-            for (at, mask, value, theirs) in [
+            let shared = b == phy && plan.link.phy.settings.mst;
+            let backend_mask = if shared {
+                0x7f00 & !(u32::from(others.streams) << 8)
+            } else {
+                0x7f00
+            };
+            for (at, mask, value, theirs, own) in [
                 (
                     l.dio_clock + u64::from(b) * 4,
                     0x711,
                     plan.clock_routes[usize::from(b)],
                     others.streams & bit(b) != 0,
+                    b == r.stream,
                 ),
                 (
                     DpStream::Dio(b).at(l, 0x20bc),
-                    if own_backend {
-                        0x7f00 & !shared
+                    backend_mask,
+                    if shared {
+                        plan.backend_routes[usize::from(b)] & (0x100 << r.stream)
                     } else {
-                        0x7f00
+                        plan.backend_routes[usize::from(b)]
                     },
-                    plan.backend_routes[usize::from(b)],
-                    others.transmitters & bit(b) != 0 && !(own_backend && shared != 0),
+                    others.transmitters & bit(b) != 0 && b != phy,
+                    b == phy,
                 ),
             ] {
-                if !theirs && self.read(at)? & mask != value & mask {
+                let now = self.read(at)? & mask;
+                if !theirs && now != value & mask && (own || now != 0) {
                     return Err(Error::Readback(at));
                 }
             }

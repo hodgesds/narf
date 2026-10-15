@@ -1273,3 +1273,54 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_selects_mst_streams_like_amdgpu_dm
 );
+
+fn navi48_mst_keeps_sink_output_assignments() -> TestResult {
+    use crate::dp_mst_mgr::Sink;
+    let caps = DpCaps {
+        lanes: 4,
+        rate: LinkRate::Hbr2,
+        uhbr: 0,
+        fec: false,
+        dsc: None,
+    };
+    let sink = |port| Sink { branch: 0, port };
+    let mut devices = [
+        (sink(1), edid_2160p(), 0),
+        (sink(2), Vec::new(), 0), // EDID read failed: keep the gap.
+        (sink(3), edid_three_modes(false), 0),
+    ];
+    let timing = edid_timings(&devices[2].1)[1];
+    let pipes = [None, Some(1), Some(2)];
+    let choose = |devices: &[_], pipes: &[_]| {
+        super::super::mst::select_mst_outputs(
+            2,
+            caps,
+            devices,
+            &|k| (k == 2).then_some(timing),
+            pipes,
+        )
+    };
+    let picked = choose(&devices, &pipes);
+    if picked.len() != 1
+        || picked[0].1 != 2
+        || picked[0].0.mst.unwrap().sink != sink(3)
+        || picked[0].0.timing != timing
+    {
+        return TestResult::Fail("disabled or unreadable sink shifted the output");
+    }
+    // An enabled sink with no fitting timing must not consume another
+    // sink's pipe or requested mode either.
+    devices[0].2 = 1;
+    let picked = choose(&devices, &[Some(0), Some(1), Some(2)]);
+    if picked.len() != 1 || picked[0].1 != 2 || picked[0].0.timing != timing {
+        return TestResult::Fail("unadmitted sink shifted the output");
+    }
+    if !choose(&devices, &[None, None, None]).is_empty() {
+        return TestResult::Fail("disabled CRTCs were selected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_mst_keeps_sink_output_assignments
+);

@@ -1159,6 +1159,39 @@ never paints a software sprite into a hardware-cursor surface. The fb cursor
 pump uses it for both the console pointer and a compositor's DRM cursor
 whenever the console adopted exactly the published scanout.
 
+Native 8b/10b MST uses `dp_mst_mgr::Manager` over the port's DMUB AUX channel.
+`ColdBoot::display_mst_capable(port)` checks DPCD revision and MSTM_CAP before
+the platform chooses MST. `start_display_mst` enables MST/up requests, clears
+payload tables and probes LINK_ADDRESS/ENUM_PATH_RESOURCES depth first;
+`read_display_mst_edid` reads end-device EDIDs through REMOTE_I2C_READ. The
+probe uses an explicit stack so its future can run in the display monitor.
+
+`unsafe ColdBoot::modeset_mst_displays(port, fill, want, pipes)` lights one
+branch's sinks with joint DML admission, 8-bpc RGB and the maximum supported
+8b/10b link. `pipes[k]: Option<u8>` assigns topology device k to a distinct
+display/pipe, or disables it. Disabled, unreadable and unadmitted devices
+leave gaps; their successors never inherit their CRTC or requested mode.
+Each payload must fit the remaining 63 slots and the end port's available
+PBN. Add orders the DPCD payload table, source SAT/ACT, ACT handled,
+ALLOCATE_PAYLOAD and stream VC rate before video. Remove zeroes the VC rate,
+deallocates remotely, updates SAT/ACT and compacts later payload slots.
+
+The first display trains the link; the others attach and own their own
+DIG_FE_MODE=5 frontend selections. When the link owner stops its frontend,
+`hand_over_mst_link` transfers ownership to a remaining attached display.
+Only the last display stops the PHY and MST manager. Source verification
+accepts sibling routes being released while still rejecting unowned frontend
+selections. Failed transitions retain their owners and allocations.
+
+The platform chooses the first connected MST branch and dedicates four KMS
+outputs to its end devices, leaving other board ports dark. Output k uses
+pipe/CRTC k; an all-off DRM configuration keeps those identities and requests
+while the branch remains connected. Removing the branch restores board-port
+outputs. Shared-link loss stops and relights the whole configuration instead
+of invoking the SST retrain path. Downstream hotplug notifications, stable
+identities across topology changes, simultaneous MST/SST ports, UHBR MST,
+DSC and audio on MST remain unsupported. This path is model-tested only.
+
 `unsafe ColdBoot::retire_inherited_display` retires the legacy DP SST output
 the firmware left running. It runs in native dependency order:
 1. Blank every DIO stream (a no-op when already blank).

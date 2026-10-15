@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use core::future::Future;
 
 /// DP_MSTM_CAP, DP_MSTM_CTRL and their bits.
-const MSTM_CAP: u32 = 0x21;
+pub const MSTM_CAP: u32 = 0x21;
 const MSTM_CTRL: u32 = 0x111;
 const MST_EN: u8 = 1;
 const UP_REQ_EN: u8 = 2;
@@ -144,9 +144,16 @@ pub fn child_rad(lct: u8, rad: &[u8; 8], port: u8) -> (u8, [u8; 8]) {
     (lct + 1, out)
 }
 
-/// A boxed recursive branch probe.
-type BoxedProbe<'a, E> =
-    core::pin::Pin<alloc::boxed::Box<dyn Future<Output = Result<usize, MstError<E>>> + 'a>>;
+/// A branch being probed: its ports in reply order, the next one, and a
+/// port waiting for the branch behind it.
+struct Frame {
+    index: usize,
+    lct: u8,
+    rad: [u8; 8],
+    ports: Vec<dp_mst::LinkPort>,
+    next: usize,
+    pending: Option<Port>,
+}
 
 #[derive(Debug)]
 pub struct Manager {
@@ -316,69 +323,91 @@ impl Manager {
             self.transact(aux, 1, &[0; 8], &Request::ClearPayloadIdTable)
                 .await?;
         }
+        // drm_dp_send_link_address and, per port in reply order,
+        // drm_dp_mst_handle_link_address_port: ENUM_PATH_RESOURCES for a
+        // connected output port, then at once the LINK_ADDRESS of a new
+        // branch behind it (depth first, as Linux sends them).
         let mut topology = Topology::default();
-        self.probe_branch(aux, 1, [0; 8], &mut topology).await?;
+        let mut stack = alloc::vec![self.link_address(aux, 1, [0; 8], &mut topology).await?];
+        while let Some(top) = stack.last_mut() {
+            if top.next == top.ports.len() {
+                let done = stack.pop().ok_or(MstError::Malformed)?;
+                if let Some(parent) = stack.last_mut() {
+                    let mut port = parent.pending.take().ok_or(MstError::Malformed)?;
+                    port.branch = Some(done.index);
+                    topology.branches[parent.index].ports.push(port);
+                }
+                continue;
+            }
+            let info = top.ports[top.next];
+            top.next += 1;
+            let (index, lct, rad) = (top.index, top.lct, top.rad);
+            let mut port = Port {
+                info,
+                full_pbn: 0,
+                available_pbn: 0,
+                fec: false,
+                branch: None,
+            };
+            if info.ddps && !info.input {
+                if let Reply::EnumPathResources {
+                    fec,
+                    full_pbn,
+                    available_pbn,
+                    ..
+                } = self
+                    .transact(
+                        aux,
+                        lct,
+                        &rad,
+                        &Request::EnumPathResources { port: info.port },
+                    )
+                    .await?
+                {
+                    (port.fec, port.full_pbn, port.available_pbn) = (fec, full_pbn, available_pbn);
+                }
+                if info.peer_device_type == dp_mst::PEER_MST_BRANCHING && info.mcs {
+                    let (clct, crad) = child_rad(lct, &rad, info.port);
+                    let child = self.link_address(aux, clct, crad, &mut topology).await?;
+                    if let Some(top) = stack.last_mut() {
+                        top.pending = Some(port);
+                    }
+                    stack.push(child);
+                    continue;
+                }
+            }
+            topology.branches[index].ports.push(port);
+        }
         Ok(topology)
     }
-    /// drm_dp_send_link_address and, per port in reply order,
-    /// drm_dp_mst_handle_link_address_port: ENUM_PATH_RESOURCES for a
-    /// connected output port, then at once the LINK_ADDRESS of a new branch
-    /// behind it (depth first, as Linux sends them). Returns the branch's
-    /// index.
-    fn probe_branch<'a, A: MstAux>(
-        &'a mut self,
-        aux: &'a mut A,
+    /// LINK_ADDRESS of the branch at (`lct`, `rad`), recorded in
+    /// `topology` with no ports yet.
+    async fn link_address<A: MstAux>(
+        &mut self,
+        aux: &mut A,
         lct: u8,
         rad: [u8; 8],
-        topology: &'a mut Topology,
-    ) -> BoxedProbe<'a, A::Error> {
-        alloc::boxed::Box::pin(async move {
-            let Reply::LinkAddress { guid, ports } =
-                self.transact(aux, lct, &rad, &Request::LinkAddress).await?
-            else {
-                return Err(MstError::Malformed);
-            };
-            let index = topology.branches.len();
-            topology.branches.push(Branch {
-                lct,
-                rad,
-                guid,
-                ports: Vec::new(),
-            });
-            for info in ports {
-                let mut port = Port {
-                    info,
-                    full_pbn: 0,
-                    available_pbn: 0,
-                    fec: false,
-                    branch: None,
-                };
-                if info.ddps && !info.input {
-                    if let Reply::EnumPathResources {
-                        fec,
-                        full_pbn,
-                        available_pbn,
-                        ..
-                    } = self
-                        .transact(
-                            aux,
-                            lct,
-                            &rad,
-                            &Request::EnumPathResources { port: info.port },
-                        )
-                        .await?
-                    {
-                        (port.fec, port.full_pbn, port.available_pbn) =
-                            (fec, full_pbn, available_pbn);
-                    }
-                    if info.peer_device_type == dp_mst::PEER_MST_BRANCHING && info.mcs {
-                        let (clct, crad) = child_rad(lct, &rad, info.port);
-                        port.branch = Some(self.probe_branch(aux, clct, crad, topology).await?);
-                    }
-                }
-                topology.branches[index].ports.push(port);
-            }
-            Ok(index)
+        topology: &mut Topology,
+    ) -> Result<Frame, MstError<A::Error>> {
+        let Reply::LinkAddress { guid, ports } =
+            self.transact(aux, lct, &rad, &Request::LinkAddress).await?
+        else {
+            return Err(MstError::Malformed);
+        };
+        let index = topology.branches.len();
+        topology.branches.push(Branch {
+            lct,
+            rad,
+            guid,
+            ports: Vec::new(),
+        });
+        Ok(Frame {
+            index,
+            lct,
+            rad,
+            ports,
+            next: 0,
+            pending: None,
         })
     }
     /// Read EDID block `block` of an end device through its branch

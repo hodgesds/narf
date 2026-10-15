@@ -598,10 +598,20 @@ pub fn console_pipe() -> u8 {
     CURSOR_PIPE.load(Ordering::Acquire)
 }
 
-/// The lightable board ports in output order: (display-path index,
-/// connector type). Fixed for the board once the monitor starts.
+/// The outputs in order: (display-path index, connector type). The
+/// lightable board ports; while a DP port's MST branch is lit, its end
+/// devices instead, `MAX_OUTPUTS` outputs on that port.
 static OUTPUTS: narf_lib::sync::IrqSafeSpinLock<Vec<(usize, crate::drm::card::ConnectorType)>> =
     narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+
+/// The initial MST configuration dedicates all four outputs to one branch.
+fn mst_output_port(outputs: &[(usize, crate::drm::card::ConnectorType)]) -> Option<usize> {
+    let first = *outputs.first()?;
+    (outputs.len() == crate::amdgpu_navi48_kms::MAX_OUTPUTS
+        && first.1 == crate::drm::card::ConnectorType::DisplayPort
+        && outputs.iter().all(|o| *o == first))
+    .then_some(first.0)
+}
 
 fn lightable_outputs(boot: &boot::ColdBoot) -> Vec<(usize, crate::drm::card::ConnectorType)> {
     use crate::amdgpu_dcn_inventory::Connector;
@@ -782,10 +792,44 @@ async unsafe fn light_displays(
     boot: &mut boot::ColdBoot,
     fill: impl FnMut(u8, u32, &mut [u32]),
 ) -> Result<crate::amdgpu_navi48_boot::Configuration, ModesetError> {
-    {
+    use crate::drm::card::ConnectorType;
+    // The first plugged DP port whose sink is an MST branch lights its end
+    // devices, one output each; the other ports stay dark meanwhile.
+    let board = lightable_outputs(boot);
+    let mut mst = None;
+    for &(port, kind) in &board {
+        if kind != ConnectorType::DisplayPort {
+            continue;
+        }
+        // HPD may still be disabled on cold boot; sense refuses such a
+        // block. Route the board pin before using sense to choose MST.
+        // SAFETY: the board-routed pin has no concurrent GPIO user.
+        match unsafe { boot.enable_display_hpd(port) } {
+            Ok(()) => {}
+            Err(crate::amdgpu_dcn401_otg::Error::Unsupported) => continue,
+            Err(e) => return Err(e.into()),
+        }
+        if boot.display_hpd(port) == Ok(true) && boot.display_mst_capable(port).await {
+            mst = Some(port);
+            break;
+        }
+    }
+    let shape = match mst {
+        Some(port) => {
+            alloc::vec![(port, ConnectorType::DisplayPort); crate::amdgpu_navi48_kms::MAX_OUTPUTS]
+        }
+        None => board,
+    };
+    let reshaped = {
         let mut outputs = OUTPUTS.lock();
-        if outputs.is_empty() {
-            *outputs = lightable_outputs(boot);
+        let reshaped = *outputs != shape;
+        *outputs = shape;
+        reshaped
+    };
+    if reshaped {
+        // Other outputs: DRM's requests were the old ones'.
+        for o in OUTPUT_STATE.lock().iter_mut() {
+            *o = OutputState::new();
         }
     }
     let wants: Vec<(bool, Option<Timing>)> = {
@@ -799,8 +843,19 @@ async unsafe fn light_displays(
     };
     let want = |port: usize| pipe_of(port).and_then(|k| wants[usize::from(k)].1);
     let pipe = |port: usize| pipe_of(port).filter(|&k| wants[usize::from(k)].0);
-    // SAFETY: the caller's obligations.
-    let config = unsafe { boot.modeset_displays(fill, want, pipe) }.await?;
+    let config = if let Some(port) = mst {
+        // End device k stays on output k, including gaps for disabled or
+        // unreadable devices. Compacting would move another monitor here.
+        let pipes: Vec<Option<u8>> = (0..4u8)
+            .map(|k| wants[usize::from(k)].0.then_some(k))
+            .collect();
+        let want = |k: usize| wants[k].1;
+        // SAFETY: the caller's obligations.
+        unsafe { boot.modeset_mst_displays(port, fill, want, &pipes) }.await?
+    } else {
+        // SAFETY: the caller's obligations.
+        unsafe { boot.modeset_displays(fill, want, pipe) }.await?
+    };
     for m in &config.displays {
         // SAFETY: as above.
         unsafe { adopt(boot, m) }.await;
@@ -1342,6 +1397,24 @@ pub async unsafe fn monitor_displays(
     let mut steps = Vec::new();
     let mut owner = OWNER.lock().await;
     let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
+    // Keep a connected branch's output identities and DRM requests even
+    // when every CRTC is off. Only its physical removal restores board ports.
+    let mst_port = mst_output_port(&OUTPUTS.lock());
+    if displays.lit.iter().all(Option::is_none)
+        && mst_port.is_some_and(|p| boot.display_hpd(p) == Ok(false))
+    {
+        let board = lightable_outputs(boot);
+        let mut outputs = OUTPUTS.lock();
+        if *outputs != board {
+            *outputs = board;
+            drop(outputs);
+            for o in OUTPUT_STATE.lock().iter_mut() {
+                *o = OutputState::new();
+            }
+            displays.considered = 0;
+            publish_outputs();
+        }
+    }
     let outputs = OUTPUTS.lock().clone();
     let wants: Vec<(bool, Option<Timing>)> = OUTPUT_STATE
         .lock()
@@ -1375,6 +1448,12 @@ pub async unsafe fn monitor_displays(
         match unsafe { boot.check_modeset(&m) }.await? {
             Health::Running(_) => {}
             Health::LinkLost(_) => {
+                if m.selection.mst.is_some() {
+                    // Retraining affects every stream on the shared link.
+                    // Stop them all before the next configuration trains it.
+                    relight = true;
+                    continue;
+                }
                 // The surface stays allocated and published: writes during
                 // the retrain land in it and show once scanout resumes.
                 let mut m = m;
@@ -1458,7 +1537,16 @@ pub async unsafe fn monitor_displays(
                 count += 1;
             }
         }
-        displays.considered = wanted;
+        // Every plugged output the lighting saw, on its outputs (an MST
+        // branch's replace the board's).
+        let outputs = OUTPUTS.lock().clone();
+        let state = OUTPUT_STATE.lock();
+        displays.considered = outputs
+            .iter()
+            .enumerate()
+            .filter(|&(k, &(port, _))| state[k].active && boot.display_hpd(port) == Ok(true))
+            .fold(0, |acc, (k, _)| acc | 1 << k);
+        drop(state);
         steps.push(MonitorStep::Relit(count));
     }
     if !steps.is_empty() {
@@ -1488,17 +1576,21 @@ pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configura
         {
             let mut owner = OWNER.lock().await;
             if let Some(boot) = owner.as_mut() {
-                let ports: Vec<usize> = OUTPUTS.lock().iter().map(|&(p, _)| p).collect();
-                for (k, port) in ports.into_iter().enumerate() {
-                    // A sink plugged but not lit at boot was considered too.
-                    if boot.display_hpd(port) == Ok(true) {
-                        displays.considered |= 1 << k;
-                    }
+                // Every board port, whatever the outputs are now.
+                let ports: Vec<usize> = lightable_outputs(boot).iter().map(|&(p, _)| p).collect();
+                for port in ports {
                     // SAFETY: board-routed selectors; no GPIO user of HPD pins.
                     if unsafe { boot.enable_display_hpd(port) }.is_ok() {
                         // SAFETY: the interrupt worker routes DCN vectors to
                         // the dispatcher this monitor waits on.
                         let _ = unsafe { boot.enable_display_hpd_irq(port) };
+                    }
+                }
+                // Bits describe current outputs, which can be MST devices
+                // rather than board-port ordinals.
+                for (k, &(port, _)) in OUTPUTS.lock().iter().enumerate() {
+                    if boot.display_hpd(port) == Ok(true) {
+                        displays.considered |= 1 << k;
                     }
                 }
             }

@@ -2078,9 +2078,6 @@ impl ColdBoot {
         // Display k runs on pipe k, in its own records.
         self.select_display(m.pipe)?;
         let port = m.selection.port;
-        if m.selection.mst.is_some() {
-            self.mst_stop_allowed(port, m.pipe)?;
-        }
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
             if m.selection.audio.is_some() && !m.selection.uhbr() && m.selection.frl.is_none() {
@@ -2116,9 +2113,6 @@ impl ColdBoot {
         // Display k runs on pipe k, in its own records.
         self.select_display(m.pipe)?;
         let port = m.selection.port;
-        if m.selection.mst.is_some() {
-            self.mst_stop_allowed(port, m.pipe)?;
-        }
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
             if m.selection.audio.is_some() && !m.selection.uhbr() && m.selection.frl.is_none() {

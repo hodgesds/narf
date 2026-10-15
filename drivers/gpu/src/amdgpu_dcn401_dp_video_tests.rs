@@ -1124,9 +1124,46 @@ fn dcn401_mst_displays_share_one_link() -> TestResult {
     if run(e.stop_dp_link(&mut io, path(t))) != Err(Error::Busy) || e.detach_mst_link(t).is_err() {
         return TestResult::Fail("attached display and the link");
     }
-    e.io.inner.stream = s0;
-    if e.select_display(0).is_err() || run(e.stop_dp_video(&mut io, path(t))).is_err() {
-        return TestResult::Fail("owner's stream after the second left");
+    // Display 1 rides the link again; the owner leaves first and hands it
+    // over, and display 1 stops it last.
+    if e.attach_mst_link(t).is_err() {
+        return TestResult::Fail("attach again");
+    }
+    (e.io.inner.stream, e.io.pipe) = (s1, p1);
+    run(e.prepare_dp_frontend(&mut io, path(t), super::req(s1, p1), c1)).unwrap();
+    // A live sibling is allowed on the shared backend; an unowned
+    // frontend must still be rejected, even when our own bit is intact.
+    let routes = e.io.fake().regs[&be];
+    e.io.fake().regs.insert(be, routes | 0x100);
+    if run(e.stop_dp_frontend(path(t))).is_ok() {
+        return TestResult::Fail("foreign frontend on the shared backend");
+    }
+    e.io.fake().regs.insert(be, routes);
+    start(&mut e, &mut io, c1);
+    (e.io.inner.stream, e.io.pipe) = (s0, p0);
+    if let Err(err) = e.select_display(0) {
+        panic!("owner beside the second {err:?}");
+    }
+    if let Err(err) = run(e.stop_dp_video(&mut io, path(t))) {
+        panic!("owner's stream beside the second {err:?}");
+    }
+    run(e.stop_dp_frontend(path(t))).unwrap();
+    if run(e.stop_dp_link(&mut io, path(t))).is_ok() {
+        return TestResult::Fail("the owner stopped a shared link");
+    }
+    if e.hand_over_mst_link(t, 2) != Err(Error::Invalid) || e.hand_over_mst_link(t, 1).is_err() {
+        return TestResult::Fail("hand over");
+    }
+    if e.io.fake().regs[&be] & 0x7f00 != 0x100 << s1 || e.select_display(1).is_err() {
+        return TestResult::Fail("the second stream after the owner left");
+    }
+    (e.io.inner.stream, e.io.pipe) = (s1, p1);
+    if let Err(err) = run(e.stop_dp_video(&mut io, path(t))) {
+        panic!("second stream after the hand-over {err:?}");
+    }
+    run(e.stop_dp_frontend(path(t))).unwrap();
+    if let Err(err) = run(e.stop_dp_link(&mut io, path(t))) {
+        panic!("new owner stops the link {err:?}");
     }
     TestResult::Pass
 }

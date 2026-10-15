@@ -103,6 +103,45 @@ impl<I: Io> Engine<I> {
         self.status.state = State::Ready;
         Ok(())
     }
+    /// Hand the MST link on `transmitter`, which the selected display
+    /// trained and no longer streams on (its frontend stopped), to
+    /// display `to`, attached to it: `to` owns it from now on, the other
+    /// attached displays ride `to`'s link, and the selected display lets it
+    /// go, the link left running (Linux's link outlives any one stream).
+    pub(in crate::amdgpu_dcn401_otg) fn hand_over_mst_link(
+        &mut self,
+        transmitter: u8,
+        to: u8,
+    ) -> Result<(), Error> {
+        let selected = self.displays.selected;
+        let ours = self
+            .status
+            .dp_link_trained
+            .is_some_and(|l| l.phy.settings.mst && l.phy.path.transmitter == transmitter);
+        if self.status.state != State::DpLinkTrained(transmitter)
+            || self.status.mst_owner.is_some()
+            || !ours
+        {
+            return Err(Error::Busy);
+        }
+        if to == selected
+            || self
+                .displays
+                .parked
+                .get(usize::from(to))
+                .is_none_or(|s| s.mst_owner != Some(selected))
+        {
+            return Err(Error::Invalid);
+        }
+        for (k, s) in self.displays.parked.iter_mut().enumerate() {
+            if k != usize::from(selected) && s.mst_owner == Some(selected) {
+                s.mst_owner = (k != usize::from(to)).then_some(to);
+            }
+        }
+        self.status.dp_link_trained = None;
+        self.status.state = State::Ready;
+        Ok(())
+    }
     /// The trained MST link of the selected display on `transmitter`.
     fn mst_link(&self, transmitter: u8) -> Result<DpLinkTrained, Error> {
         let link = self.status.dp_link_trained.ok_or(Error::Invalid)?;
@@ -221,6 +260,16 @@ impl Otg {
         transmitter: u8,
     ) -> Result<DpLinkTrained, Error> {
         self.0.attach_mst_link(transmitter)
+    }
+    /// Hand the selected display's MST link on to display `to`.
+    /// # Safety
+    /// `to` keeps the link running; the MST manager's state follows.
+    pub(crate) unsafe fn hand_over_mst_link(
+        &mut self,
+        transmitter: u8,
+        to: u8,
+    ) -> Result<(), Error> {
+        self.0.hand_over_mst_link(transmitter, to)
     }
     /// Detach the selected display, its stream stopped, from its MST link.
     pub(crate) fn detach_mst_link(&mut self, transmitter: u8) -> Result<(), Error> {

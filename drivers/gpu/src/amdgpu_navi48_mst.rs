@@ -71,7 +71,7 @@ pub struct MstPayload {
 /// A port running MST: its manager, topology and payloads.
 #[derive(Debug, Default)]
 pub struct MstLink {
-    /// The pipe whose display trained the link, while one runs.
+    /// The pipe whose display owns the trained link, while one runs.
     pub owner: Option<u8>,
     pub manager: Manager,
     pub topology: Topology,
@@ -298,6 +298,22 @@ impl ColdBoot {
         self.mst.insert(port, link);
         result
     }
+    /// Whether DP `port`'s sink is an MST branch (DPCD 1.2 and MSTM_CAP),
+    /// which Linux drives in MST mode (dc_connection_mst_branch).
+    pub async fn display_mst_capable(&mut self, port: usize) -> bool {
+        let Ok((instance, _)) = self.mst_path(port) else {
+            return false;
+        };
+        let mut aux = DmubAux {
+            dmub: &mut self.sequence.backend.dmub,
+            instance,
+        };
+        let (mut rev, mut cap) = ([0u8], [0u8]);
+        aux.read(0, &mut rev).await.is_ok()
+            && rev[0] >= 0x12
+            && aux.read(dp_mst_mgr::MSTM_CAP, &mut cap).await.is_ok()
+            && cap[0] & 1 != 0
+    }
     pub fn display_mst(&self, port: usize) -> Option<&MstLink> {
         self.mst.get(&port)
     }
@@ -479,9 +495,33 @@ pub fn select_mst(
     out
 }
 
+/// Keep a sink's output assignment even when an earlier sink is disabled,
+/// has an unreadable EDID, or cannot fit. `pipes[k]` belongs to device k.
+pub(super) fn select_mst_outputs(
+    port: usize,
+    caps: modeset::DpCaps,
+    devices: &[(dp_mst_mgr::Sink, Vec<u8>, u16)],
+    want: &dyn Fn(usize) -> Option<Timing>,
+    pipes: &[Option<u8>],
+) -> Vec<(Selection, u8)> {
+    let enabled: Vec<usize> = (0..devices.len())
+        .filter(|&k| pipes.get(k).is_some_and(Option::is_some))
+        .collect();
+    let selected: Vec<_> = enabled.iter().map(|&k| devices[k].clone()).collect();
+    select_mst(port, caps, &selected, &|k| want(enabled[k]))
+        .into_iter()
+        .filter_map(|s| {
+            let k = devices
+                .iter()
+                .position(|d| Some(d.0) == s.mst.map(|m| m.sink))?;
+            Some((s, pipes[k]?))
+        })
+        .collect()
+}
+
 impl ColdBoot {
     /// Light the end devices behind DP `port`'s MST branch (`select_mst`),
-    /// display k on `pipes[k]` (its display slot too), as one
+    /// device k on `pipes[k]` (its display slot too), skipping None, as one
     /// configuration like `modeset_displays`: MST started and the topology
     /// probed, each device's EDID read, the admitted streams' clocks
     /// programmed, then each stream lit: the first trains the port's MST
@@ -494,10 +534,15 @@ impl ColdBoot {
         port: usize,
         mut fill: impl FnMut(u8, u32, &mut [u32]),
         want: impl Fn(usize) -> Option<Timing>,
-        pipes: &[u8],
+        pipes: &[Option<u8>],
     ) -> Result<Configuration, ModesetError> {
         if pipes.is_empty()
-            || pipes.iter().any(|&p| p >= 4)
+            || pipes.len() > modeset::MAX_DISPLAYS
+            || pipes.iter().flatten().any(|&p| p >= 4)
+            || pipes
+                .iter()
+                .enumerate()
+                .any(|(k, p)| p.is_some() && pipes[..k].contains(p))
             || self.mst.get(&port).is_some_and(|l| l.owner.is_some())
         {
             return Err(ModesetError::Display(otg::Error::Invalid));
@@ -519,11 +564,16 @@ impl ColdBoot {
         for sink in topology.sinks().into_iter().take(pipes.len()) {
             let available = topology.port(sink).map_or(0, |p| p.available_pbn);
             // A device whose EDID can't be read stays dark.
-            if let Ok(edid) = self.read_display_mst_edid(port, sink).await {
-                devices.push((sink, edid, available));
-            }
+            let edid = self
+                .read_display_mst_edid(port, sink)
+                .await
+                .unwrap_or_default();
+            devices.push((sink, edid, available));
         }
-        let mut selections = select_mst(port, caps, &devices, &want);
+        let (mut selections, pipes): (Vec<_>, Vec<_>) =
+            select_mst_outputs(port, caps, &devices, &want, pipes)
+                .into_iter()
+                .unzip();
         if selections.is_empty() {
             self.stop_display_mst(port).await;
             return Err(ModesetError::NoSink);
@@ -532,15 +582,14 @@ impl ColdBoot {
         for s in &mut selections {
             s.limited = limited;
         }
-        let pipes = &pipes[..selections.len()];
         self.select_display(pipes[0])?;
         let soc = self.prepare_configuration(&selections).await?;
         let plans = modeset::admit_displays(&soc, &selections).map_err(otg::Error::Admission)?;
         selections.truncate(plans.len());
-        self.prepare_pipes(&selections, &plans, pipes).await?;
+        self.prepare_pipes(&selections, &plans, &pipes).await?;
         let mut lit = Vec::with_capacity(selections.len());
         let mut failed = None;
-        for ((selection, plan), &pipe) in selections.iter().zip(&plans).zip(pipes) {
+        for ((selection, plan), &pipe) in selections.iter().zip(&plans).zip(&pipes) {
             // SAFETY: the caller's obligations; every earlier display is lit
             // in its own slot and left to it by each step.
             match unsafe { self.light(pipe, *selection, *plan, &mut fill) }.await {
@@ -619,19 +668,11 @@ impl ColdBoot {
             Ok(self.start_display_scanout(pipe).await?)
         }
     }
-    /// Whether pipe `pipe`'s MST stream on `port` may stop now: the
-    /// display that trained the link stops last.
-    pub(super) fn mst_stop_allowed(&self, port: usize, pipe: u8) -> Result<(), ModesetError> {
-        let link = self.mst.get(&port).ok_or(MstFailure::Invalid)?;
-        if link.owner == Some(pipe) && link.payloads.iter().any(|p| p.stream != pipe) {
-            return Err(ModesetError::Display(otg::Error::Busy));
-        }
-        Ok(())
-    }
     /// deallocate_mst_payload's teardown of pipe `pipe`'s stream, its
-    /// scanout stopped: video, the payload, the frontend; then the link's
-    /// owner stops the link (without addressing an `unplugged` sink) and
-    /// MST, while an attached display detaches.
+    /// scanout stopped: video, the payload, the frontend; then an attached
+    /// display detaches, while the link's owner hands the link to a
+    /// remaining stream's display or, the last, stops the link (without
+    /// addressing an `unplugged` sink) and MST.
     /// # Safety
     /// As for `stop_modeset`.
     pub(super) async unsafe fn stop_mst_stream(
@@ -640,8 +681,7 @@ impl ColdBoot {
         pipe: u8,
         unplugged: bool,
     ) -> Result<(), ModesetError> {
-        self.mst_stop_allowed(port, pipe)?;
-        let owner = self.mst.get(&port).is_some_and(|l| l.owner == Some(pipe));
+        let owner = self.mst.get(&port).ok_or(MstFailure::Invalid)?.owner == Some(pipe);
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
             self.stop_display_dp_video(port).await?;
@@ -649,6 +689,24 @@ impl ColdBoot {
             self.stop_display_dp_frontend(port).await?;
             if !owner {
                 return Ok(self.detach_display_mst_link(port)?);
+            }
+            // Display k runs on pipe k: the next owner is a remaining
+            // stream's pipe.
+            let next = self
+                .mst
+                .get(&port)
+                .and_then(|l| l.payloads.first())
+                .map(|p| p.stream);
+            if let Some(to) = next {
+                let transmitter = self.dp_phy_path(port)?.transmitter;
+                self.otg
+                    .as_mut()
+                    .map_err(|e| *e)?
+                    .hand_over_mst_link(transmitter, to)?;
+                if let Some(link) = self.mst.get_mut(&port) {
+                    link.owner = Some(to);
+                }
+                return Ok(());
             }
             if unplugged {
                 self.stop_unplugged_display_dp_link(port).await?;

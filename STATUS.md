@@ -651,6 +651,15 @@ cancellation. The final framebuffer handoff selects Navi48, blocks legacy
 controller/PM access after preparation and quarantines the primary framebuffer
 on incomplete startup. Read-only preparation failures restore CPU writers.
 
+Native 8b/10b DP MST now reaches the platform display monitor and KMS for one
+branch (up to four outputs, other board ports dark). End-device EDIDs feed
+joint mode admission and per-stream payload allocation. Disabling the display
+that trained the link transfers ownership to a surviving stream; only the
+last stops the PHY. Disabled, unreadable or unadmitted devices leave output
+gaps, and switching every CRTC off keeps them off. Shared-link loss relights
+the configuration. Downstream hotplug, topology-stable connector identities,
+mixed MST/SST, UHBR MST and MST audio/DSC remain open; no physical validation.
+
 Still open: physical MSI delivery verification, queue reset and fault-source
 re-arming after containment, GC12 rendering and shader
 dispatch, production GPU VM and userspace submission, VCN5 video queues, native DCN4 clock/bandwidth/link
