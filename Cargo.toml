@@ -52,6 +52,7 @@ members = [
     "pmbus",
     "i3c",
     "filesystem",
+    "filesystem/bench",
     "power",
     "scmi",
     "observability",

@@ -3041,6 +3041,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_shmem::register_initcalls();
             narf_initramfs::register_initcalls();
             narf_filesystem::register_initcalls();
+            #[cfg(feature = "bench")]
+            narf_filesystem_bench::register_initcalls();
             narf_firmware::register_initcalls();
             // After the firmware scans above, so the Bluetooth
             // controller's firmware download can find its blobs.

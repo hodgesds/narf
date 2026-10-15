@@ -1,0 +1,21 @@
+[package]
+name        = "narf-filesystem-bench"
+description = "Benchmarks for the NARF VFS"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_filesystem_bench"
+path = "src/lib.rs"
+
+[dependencies]
+narf-bpf-bench = { path = "../../bpf/bench" }
+narf-filesystem = { path = "../" }
+narf-lib     = { path = "../../lib" }
+narf-init    = { path = "../../init" }
+
+[lints]
+workspace = true
