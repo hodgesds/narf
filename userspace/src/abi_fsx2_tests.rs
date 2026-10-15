@@ -130,7 +130,14 @@ fn smoke_abi_fsx2_proc_mountinfo_pollpri_after_mount_change() -> TestResult {
         })
         .flatten()
         .ok_or("mountinfo fd was not installed")?;
-        if file.poll_readiness() & narf_filesystem::POLL_PRI != 0 {
+        let fresh = file.poll_readiness();
+        if fresh & narf_filesystem::POLL_IN == 0 {
+            return Err("a fresh mountinfo fd must report POLLIN");
+        }
+        if fresh & narf_filesystem::POLL_OUT != 0 {
+            return Err("a fresh mountinfo fd must not report POLLOUT");
+        }
+        if fresh & narf_filesystem::POLL_PRI != 0 {
             return Err("a fresh mountinfo fd must not report a stale POLLPRI edge");
         }
         if mount_fstype(target, fstype) != Some(0) {
