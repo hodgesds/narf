@@ -34,6 +34,7 @@ mod composition;
 mod crate_release;
 /// The `affected` subcommand: crate reverse-dependency closure → the set
 /// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
+mod net_robust;
 mod passthrough;
 mod relocs;
 
@@ -152,6 +153,10 @@ enum Cmd {
     /// IPv4 late initcall so igb is the sole NIC and owns the SLIRP lease,
     /// exercising the advanced one-buffer-descriptor datapath end to end.
     IgbNetSmoke(BuildArgs),
+    /// Internal: net-smoke's namespace TCP peer. Runs inside `unshare -rn`
+    /// (spawned by net-smoke), owns tap0 and serves the Linux-peer phases.
+    #[command(hide = true)]
+    NetPeer(NetPeerArgs),
     /// Off-box redis smoke. Boot with `qemu-net` + a QEMU `hostfwd`,
     /// wait for the auto-spawned unmodified `redis-server` to print
     /// `Ready to accept connections`, then open a real host TCP socket to
@@ -523,6 +528,20 @@ struct TestArgs {
     kernel_tests_only: bool,
 }
 
+/// Args for the hidden `xtask net-peer` (see `net_robust::net_peer_main`).
+#[derive(Parser, Clone)]
+struct NetPeerArgs {
+    /// Unix socket QEMU's `-netdev stream` connects to.
+    #[arg(long)]
+    sock: PathBuf,
+    /// Bitmask of namespace phases to serve.
+    #[arg(long, default_value_t = 0)]
+    mask: u64,
+    /// Long-run sizes.
+    #[arg(long)]
+    long: bool,
+}
+
 /// Wave-49 — args for `xtask run-interactive`. Inherits BuildArgs
 /// (flatten) so all the usual `--features`, `--release`,
 /// `--display`, `--arch` knobs work, plus `--cmd <LINE>` /
@@ -708,6 +727,29 @@ fn qemu_display_arg(display: &str, backend: GpuBackend) -> String {
     options
 }
 
+/// The default audio sink deliberately discards samples so automated QEMU
+/// tests remain hermetic. Interactive desktop runs can opt into the host's
+/// PipeWire session with `XTASK_QEMU_AUDIO=pipewire`.
+///
+/// Keep this a closed set rather than passing arbitrary QEMU fragments from
+/// the environment: both HDA and virtio-sound consume the same selected
+/// backend, and an invalid value must not turn into an injection path in the
+/// machine command line.
+fn qemu_audio_backend_from(value: Option<&str>) -> &'static str {
+    match value {
+        Some("pipewire") => "pipewire",
+        _ => "none",
+    }
+}
+
+fn qemu_audio_backend() -> &'static str {
+    qemu_audio_backend_from(std::env::var("XTASK_QEMU_AUDIO").ok().as_deref())
+}
+
+fn qemu_audio_device_arg(id: &str) -> String {
+    format!("{},id={id}", qemu_audio_backend())
+}
+
 #[cfg(test)]
 mod gpu_backend_tests {
     use super::*;
@@ -749,6 +791,14 @@ mod gpu_backend_tests {
             qemu_display_arg("gtk,grab-on-hover=off", GpuBackend::Virtio2d),
             "gtk,grab-on-hover=off"
         );
+    }
+
+    #[test]
+    fn qemu_audio_is_hermetic_unless_pipewire_is_explicitly_requested() {
+        assert_eq!(qemu_audio_backend_from(None), "none");
+        assert_eq!(qemu_audio_backend_from(Some("none")), "none");
+        assert_eq!(qemu_audio_backend_from(Some("unexpected")), "none");
+        assert_eq!(qemu_audio_backend_from(Some("pipewire")), "pipewire");
     }
 
     #[test]
@@ -1210,7 +1260,7 @@ impl Arch {
                     // VirtIO playback test, making audio tests order-dependent.
                     args.extend_from_slice(&[
                         "-audiodev".into(),
-                        "none,id=hda0".into(),
+                        qemu_audio_device_arg("hda0"),
                         "-device".into(),
                         "intel-hda".into(),
                         "-device".into(),
@@ -1219,14 +1269,17 @@ impl Arch {
                 }
 
                 if virtio {
-                    // VirGL must be the only display adapter. Leaving QEMU's
-                    // default Bochs VGA attached gives KWin two DRM devices;
-                    // its libdrm probe can then associate card0's render path
-                    // with the 1234:1111 fallback instead of the 1af4:1050
-                    // virtio-gpu transport. This applies to VirtioOnly too;
-                    // it formerly sat in the legacy fixture block, so a
-                    // single-NIC desktop had no usable KDE display.
-                    if gpu_backend == GpuBackend::Virgl {
+                    // A graphical virtio-only fixture must expose virtio-gpu
+                    // as its sole display adapter. Leaving QEMU's default
+                    // Bochs VGA attached gives KWin two DRM devices; on VirGL
+                    // it can associate card0's render path with the 1234:1111
+                    // fallback instead of 1af4:1050, and on 2D QEMU presents
+                    // the legacy VGA text console rather than Plasma's
+                    // virtio-gpu scanout. Full + 2D deliberately retains its
+                    // legacy display fixture coverage.
+                    if gpu_backend == GpuBackend::Virgl
+                        || (matches!(profile, HwProfile::VirtioOnly) && display != "none")
+                    {
                         args.extend_from_slice(&["-vga".into(), "none".into()]);
                     }
                     args.extend_from_slice(&[
@@ -1328,7 +1381,7 @@ impl Arch {
                         ]);
                     }
                     args.extend_from_slice(&["-device".into(), virtio_gpu_device_arg(gpu_backend)]);
-                    args.extend_from_slice(&["-audiodev".into(), "none,id=snd0".into()]);
+                    args.extend_from_slice(&["-audiodev".into(), qemu_audio_device_arg("snd0")]);
                     args.extend_from_slice(&[
                         "-device".into(),
                         "virtio-sound-pci,audiodev=snd0,disable-legacy=on,disable-modern=off"
@@ -1527,7 +1580,7 @@ impl Arch {
                         ]);
                     }
                     args.extend_from_slice(&["-device".into(), virtio_gpu_device_arg(gpu_backend)]);
-                    args.extend_from_slice(&["-audiodev".into(), "none,id=snd0".into()]);
+                    args.extend_from_slice(&["-audiodev".into(), qemu_audio_device_arg("snd0")]);
                     args.extend_from_slice(&[
                         "-device".into(),
                         "virtio-sound-pci,audiodev=snd0,disable-legacy=on,disable-modern=off"
@@ -2137,11 +2190,21 @@ fn nvme_image_path() -> PathBuf {
     path
 }
 
-/// Minimal FAT12 image — single-FAT, single-root-dir-sector, one
+/// Minimal FAT12 image — two FAT copies, single-root-dir-sector, one
 /// file (`NARF.TXT`) at cluster 2. Layout per Microsoft FATGEN §3.
+///
+/// Each FAT copy is sized to map every data cluster the volume has
+/// (FATGEN §3.5: 1.5 bytes per FAT12 entry, two reserved entries). A
+/// one-sector FAT maps only 341 entries, while this 1 MiB volume has ~2000
+/// clusters, so a file allocated past cluster 340 had its chain written over
+/// the second FAT copy and then the root directory. Linux refuses to mount
+/// such a volume at all (`fat_fill_super`: "count of clusters too big").
 fn build_fat12_nvme_image(total_sectors: u32, data: &[u8]) -> Vec<u8> {
     const LBS: usize = 512;
     let mut img = vec![0u8; LBS * total_sectors as usize];
+    // Upper bound: every sector a data cluster, plus the two reserved
+    // entries, at 3 bytes per pair of entries.
+    let fat_sz = ((total_sectors as usize + 2) * 3).div_ceil(2).div_ceil(LBS);
 
     // BPB
     img[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
@@ -2153,12 +2216,12 @@ fn build_fat12_nvme_image(total_sectors: u32, data: &[u8]) -> Vec<u8> {
     img[17..19].copy_from_slice(&16u16.to_le_bytes());
     img[19..21].copy_from_slice(&(total_sectors as u16).to_le_bytes());
     img[21] = 0xF8;
-    img[22..24].copy_from_slice(&1u16.to_le_bytes());
+    img[22..24].copy_from_slice(&(fat_sz as u16).to_le_bytes());
     img[510] = 0x55;
     img[511] = 0xAA;
 
     // FAT 1 + FAT 2 — entry 0 media, entry 1 EOC, entry 2 EOC.
-    for &lba in &[1usize, 2usize] {
+    for lba in [1usize, 1 + fat_sz] {
         let fat = &mut img[lba * LBS..lba * LBS + LBS];
         fat12_set(fat, 0, 0xFF8);
         fat12_set(fat, 1, 0xFFF);
@@ -2168,16 +2231,43 @@ fn build_fat12_nvme_image(total_sectors: u32, data: &[u8]) -> Vec<u8> {
     }
 
     if !data.is_empty() {
-        let root_lba = 3usize;
+        let root_lba = 1 + 2 * fat_sz;
         let entry = &mut img[root_lba * LBS..root_lba * LBS + 32];
         entry[0..11].copy_from_slice(b"NARF    TXT");
         entry[11] = 0x20;
         entry[26..28].copy_from_slice(&2u16.to_le_bytes());
         entry[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        let data_lba = 4usize;
+        let data_lba = root_lba + 1;
         img[data_lba * LBS..data_lba * LBS + data.len()].copy_from_slice(data);
     }
     img
+}
+
+#[cfg(test)]
+mod fat12_nvme_image_tests {
+    use super::*;
+
+    /// The FAT must map every data cluster: `fat_fill_super` rejects a
+    /// volume whose cluster count exceeds what its FAT can address, and a
+    /// driver that mounts it anyway chains clusters into whatever follows
+    /// the FAT.
+    #[test]
+    fn fat_covers_every_data_cluster() {
+        let img = build_fat12_nvme_image(2048, b"narf\n");
+        let u16_at = |o: usize| u16::from_le_bytes([img[o], img[o + 1]]) as usize;
+        let (bps, rsvd, nfats) = (u16_at(11), u16_at(14), img[16] as usize);
+        let (root_ents, total, fat_sz) = (u16_at(17), u16_at(19), u16_at(22));
+        let root_secs = (root_ents * 32).div_ceil(bps);
+        let clusters = total - rsvd - nfats * fat_sz - root_secs;
+        assert!(clusters < 4085, "must stay FAT12");
+        assert!(
+            fat_sz * bps * 2 / 3 >= clusters + 2,
+            "FAT maps too few clusters"
+        );
+        // NARF.TXT sits right after the root directory and is readable there.
+        let data = (rsvd + nfats * fat_sz + root_secs) * bps;
+        assert_eq!(&img[data..data + 5], b"narf\n");
+    }
 }
 
 /// Build a FAT16 disk image at `out_path` populated with `/init`
@@ -2523,6 +2613,14 @@ fn legacy_qemu_netdev(profile: HwProfile) -> String {
     } else {
         None
     };
+    // net-smoke's namespace peer: a unix stream socket relayed to a tap in
+    // an unprivileged network namespace.
+    if let Some(path) = std::env::var("XTASK_QEMU_LEGACY_STREAM")
+        .ok()
+        .filter(|p| !p.is_empty())
+    {
+        return format!("stream,id=n1,server=off,addr.type=unix,addr.path={path}");
+    }
     let hostfwd = std::env::var("XTASK_QEMU_LEGACY_HOSTFWD")
         .ok()
         .filter(|fwd| !fwd.is_empty());
@@ -4634,6 +4732,7 @@ fn musl_case_group(cmd: &str) -> &'static str {
         "wl_",
         "mini_compositor",
         "drm_smoke",
+        "dmabuf_sync",
         "modetest",
         "fb_smoke",
         "kms",
@@ -4694,7 +4793,16 @@ fn musl_case_group(cmd: &str) -> &'static str {
         "lsm",
     ]) {
         "fs"
-    } else if has(&["mremap", "mcore", "mem2", "mempolicy", "pkey", "pvm"]) {
+    } else if has(&[
+        "mremap",
+        "mcore",
+        "mem2",
+        "mempolicy",
+        "pkey",
+        "pvm",
+        "jitrwx",
+        "uaccessfile",
+    ]) {
         "mem"
     } else if has(&[
         "hello",
@@ -4719,6 +4827,12 @@ fn musl_case_group(cmd: &str) -> &'static str {
         "linux-compat"
     }
 }
+
+// The default musl-demo machine deliberately contains both the legacy Bochs
+// adapter and VirtIO GPU.  Name the VirtIO DRM driver explicitly so the
+// modetest regression covers the 1280x800 transport scanout rather than the
+// legacy adapter's 1024x768 console mode.
+const VIRTIO_MODETEST_CASE: (&str, &str) = ("modetest -M virtio_gpu", "(1280x800)");
 
 /// Boot a single musl-demo case up to `attempts` times, returning true once
 /// it passes. Retries on BOTH an assertion miss and a boot-level error
@@ -4832,6 +4946,28 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("sigrt_smoke", "sigrt-ok"),
         // Live PTRACE_SYSCALL strace loop (TRACEME + syscall-stops + GETREGS).
         ("strace_smoke", "strace-ok"),
+        // Remote process-memory access against a forked, COW-sharing tracee:
+        // PTRACE_PEEK*/POKE* (FOLL_FORCE: PROT_NONE, read-only text, lazy and
+        // unfaulted file pages; COW isolation), process_vm_readv/writev
+        // (multi-iovec, partial transfer, EFAULT/ESRCH/EPERM) and
+        // /proc/<pid>/mem pread/pwrite/lseek. See remotevm_smoke_x86_64.c.
+        ("remotevm_smoke", "remotevm-ok"),
+        // A kernel write into a read-only file mapping that first has to be read in is EFAULT, not a panic.
+        ("uaccessfile_smoke", "uaccessfile-ok"),
+        // /proc/<tid> resolves a non-leader thread (Linux proc_pid_lookup).
+        ("proctid_smoke", "proctid-ok"),
+        // /proc state letters: S for a task asleep in a syscall, T stopped, R for the reader.
+        ("procstate_smoke", "procstate-ok"),
+        // SIGKILL ends a job-control stop (paused and running children).
+        ("killstopped_smoke", "killstopped-ok"),
+        // seccomp(2): Chromium's EFAULT probes, filter validation, ERRNO/TRAP/KILL/strict, TSYNC.
+        ("seccomp_smoke", "seccomp-ok"),
+        // ptrace follow-fork: TRACEFORK/VFORK/CLONE events, auto-attached children, GETEVENTMSG/GETSIGINFO.
+        ("ptracefork_smoke", "ptracefork-ok"),
+        // no_new_privs / securebits / dumpable inherited by fork and threads; pdeathsig not.
+        ("prctlinherit_smoke", "prctlinherit-ok"),
+        // W|X JIT memory (V8's pkey_mprotect RWX code range) and its MDWE refusal.
+        ("jitrwx_smoke", "jitrwx-ok"),
         // OCI container end-to-end: the `oci_smoke` runtime reads the
         // /oci bundle, unshares namespaces, sets the container hostname,
         // chroots into the bundle rootfs, and execs the contained
@@ -4884,6 +5020,11 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // mmap MAP_SHARED, ADDFB2, SETCRTC. Proves Rung-3 modeset
         // path end-to-end from stock musl.
         ("drm_smoke", "drm-ok"),
+        // dma-buf implicit sync from ring 3: an atomic OUT_FENCE_PTR fence
+        // imported into a PRIME dma-buf; DMA_BUF_IOCTL_SYNC(START) over it
+        // restarts under SA_RESTART (-ERESTARTSYS) and EINTRs without it;
+        // EXPORT_SYNC_FILE polls; SYNC_IOC_MERGE + FILE_INFO.
+        ("dmabuf_sync_smoke", "dmabuf-sync-ok"),
         // VirGL 3D smoke — hand-rolled virgl command stream (clear + a
         // TGSI-shaded triangle) through renderD128, rendered by the HOST
         // GPU and pixel-verified after TRANSFER_FROM_HOST_3D. The token
@@ -4904,17 +5045,16 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // tfd_epoll_smoke's single 120 ms step-F window only tripped on
         // layout-cursed builds ("slab: double free ... class 32 B").
         ("polltmo_hammer", "polltmo-ok"),
-        // modetest (real libdrm) enumerates /dev/dri/card0 end-to-end —
+        // modetest (real libdrm) enumerates the VirtIO DRM node end-to-end —
         // VERSION + GET_CAP + GETRESOURCES + GETCONNECTOR/ENCODER/CRTC +
-        // OBJ_GETPROPERTIES. Anchors on the enumerated 1280x800 mode.
-        ("modetest -M narf-drm", "(1280x800)"),
-        // NOTE: `modetest -s 3@1:1280x800` (set a mode + present an SMPTE
-        // pattern) is NOT an auto case — `modetest -s` holds the mode and
-        // blocks on stdin (interactive), so it never returns to the shell
-        // prompt. The CREATE_DUMB → ADDFB2 → SETCRTC modeset path it exercises
-        // is already covered for CI by `drm_smoke`; run it by hand for a
-        // visual check: `xtask run-interactive --cmd "modetest -M narf-drm -s
-        // 3@1:1280x800" --expect "crtc 1"`.
+        // OBJ_GETPROPERTIES. The full fixture also contains Bochs, whose
+        // 1024x768 scanout is intentionally not this test's target.
+        VIRTIO_MODETEST_CASE,
+        // NOTE: `modetest -s` (set a mode + present an SMPTE pattern) is NOT
+        // an auto case — it holds the mode and blocks on stdin (interactive),
+        // so it never returns to the shell prompt. The CREATE_DUMB → ADDFB2 →
+        // SETCRTC modeset path it exercises is already covered for CI by
+        // `drm_smoke`.
         ("net_smoke", "net-ok"),
         ("net6_smoke", "net6-ok"),
         ("unix_smoke", "unix-ok"),
@@ -5029,6 +5169,12 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("pthread_sched_glibc", "pthread-sched-ok"),
         ("unix_listen_wake_smoke", "unix-listen-wake-ok"),
         ("unix_listen_wake_glibc", "unix-listen-wake-ok"),
+        ("wlproxy_sockpair_smoke", "wlproxy-ok"),
+        ("wlproxy_sockpair_glibc", "wlproxy-ok"),
+        // A blocking AF_UNIX stream send queues the whole payload; signal,
+        // SO_SNDTIMEO and peer close end it with Linux's prefix / errno.
+        ("sockpair_block_smoke", "sockpair-block-ok"),
+        ("sockpair_block_glibc", "sockpair-block-ok"),
         ("fd_inherit_exec_smoke", "fd-inherit-exec-ok"),
         ("fd_inherit_exec_glibc", "fd-inherit-exec-ok"),
         ("xserver_epoll_wake_smoke", "xserver-epoll-wake-ok"),
@@ -5962,6 +6108,36 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     let tcp_guest_port: u16 = 7777;
     let udp_host_port: u16 = 17778;
     let udp_guest_port: u16 = 7778;
+    let bulk_host_port: u16 = 17779;
+    let bulk_guest_port: u16 = 7779;
+    // Host-side servers the GUEST dials (via SLIRP's 10.0.2.2 host alias).
+    // Ports and every size/seed below must match netserve_smoke_x86_64.c.
+    let download_port: u16 = 17780;
+    let udp_client_port: u16 = 17781;
+    let parallel_port: u16 = 17782;
+    const PARALLEL_LEN: u64 = 16 << 20;
+    const BULK_LEN: u64 = 4 << 20;
+    const BULK_SEED: u8 = 0x5a;
+    const DOWNLOAD_LEN: u64 = 8 << 20;
+    const DOWNLOAD_SEED: u8 = 0xc3;
+    const UDP_SIZES: [usize; 7] = [1, 100, 512, 1400, 1472, 4000, 8000];
+    const UDP_BURST: usize = 64;
+    const UDP_BURST_LEN: usize = 1200;
+    const UDP_CLIENT_ROUNDS: usize = 16;
+    // The UDP GSO phase: UDP_GSO_SEGS datagrams of UDP_GSO_LEN bytes, segment
+    // `i` filled with `pat(k, UDP_GSO_SEED + i)`, sent in one sendmsg.
+    const UDP_GSO_SEGS: usize = 5;
+    const UDP_GSO_LEN: usize = 1200;
+    const UDP_GSO_SEED: u8 = 0x90;
+    // netserve's stream pattern: byte `i` of a stream seeded `seed`.
+    fn pat(i: u64, seed: u8) -> u8 {
+        ((i.wrapping_mul(2_654_435_761) >> 13) as u8) ^ ((i >> 20) as u8) ^ seed
+    }
+    fn fill(buf: &mut [u8], off: u64, seed: u8) {
+        for (k, b) in buf.iter_mut().enumerate() {
+            *b = pat(off + k as u64, seed);
+        }
+    }
 
     let mut build = args.clone();
     ensure_feature(&mut build.features, "boot-init");
@@ -6013,10 +6189,135 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     // Set in THIS process's env: `qemu_args` (called below, in-process)
     // reads it to splice `hostfwd` into the user-mode netdev. Setting it
     // on the child Command would be too late — the arg list is built here.
-    let forwards = format!(
+    let mut forwards = format!(
         "tcp:127.0.0.1:{tcp_host_port}-:{tcp_guest_port},\
-         hostfwd=udp:127.0.0.1:{udp_host_port}-:{udp_guest_port}"
+         hostfwd=udp:127.0.0.1:{udp_host_port}-:{udp_guest_port},\
+         hostfwd=tcp:127.0.0.1:{bulk_host_port}-:{bulk_guest_port}"
     );
+
+    // TCP robustness phases (net_robust.rs): SLIRP-side servers, plus the
+    // Linux peer in a network namespace on the second NIC (virtio run only;
+    // the e1000-module run owns that NIC).
+    let robust_cfg = net_robust::RobustConfig::from_env();
+    let robust_report = net_robust::Report::default();
+    let mut ns_peer = None;
+    if nic == NetSmokeNic::Virtio {
+        if robust_cfg.ns != 0 {
+            let sock = root.join("target").join("net-smoke-ns-peer.sock");
+            ns_peer = net_robust::spawn_ns_peer(&sock, robust_cfg);
+            if ns_peer.is_some() {
+                std::env::set_var("XTASK_QEMU_LEGACY_STREAM", &sock);
+            }
+        }
+        net_robust::start_slirp_servers(robust_cfg, ns_peer.is_some(), &robust_report)?;
+        forwards.push_str(&format!(
+            ",hostfwd=tcp:127.0.0.1:{}-:{}",
+            net_robust::CHURN_FWD_PORT,
+            net_robust::CHURN_GUEST_PORT
+        ));
+    } else {
+        net_robust::start_slirp_servers(
+            net_robust::RobustConfig {
+                long: false,
+                slirp: 0,
+                ns: 0,
+            },
+            false,
+            &robust_report,
+        )?;
+    }
+    let robust_tokens = net_robust::expected_tokens(
+        if nic == NetSmokeNic::Virtio {
+            robust_cfg
+        } else {
+            net_robust::RobustConfig {
+                long: false,
+                slirp: 0,
+                ns: 0,
+            }
+        },
+        ns_peer.is_some(),
+    );
+
+    // The servers the guest dials must exist before it boots. The download
+    // server streams DOWNLOAD_LEN patterned bytes then closes; the UDP server
+    // echoes every datagram until the smoke ends.
+    let download_listener = std::net::TcpListener::bind(("127.0.0.1", download_port))
+        .with_context(|| format!("xtask {smoke_name}: binding download server :{download_port}"))?;
+    let download_server = std::thread::spawn(move || -> Result<u64, String> {
+        let (mut conn, _) = download_listener
+            .accept()
+            .map_err(|e| format!("accept: {e}"))?;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut off = 0u64;
+        while off < DOWNLOAD_LEN {
+            let n = buf.len().min((DOWNLOAD_LEN - off) as usize);
+            fill(&mut buf[..n], off, DOWNLOAD_SEED);
+            conn.write_all(&buf[..n])
+                .map_err(|e| format!("write at offset {off}: {e}"))?;
+            off += n as u64;
+        }
+        Ok(off)
+    });
+    // The parallel-download server: every connection names its stream seed in
+    // one byte, then gets PARALLEL_LEN patterned bytes and a close. Each is
+    // served on its own thread so the streams genuinely run concurrently.
+    let parallel_listener = std::net::TcpListener::bind(("127.0.0.1", parallel_port))
+        .with_context(|| format!("xtask {smoke_name}: binding parallel server :{parallel_port}"))?;
+    let parallel_served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let served = parallel_served.clone();
+        std::thread::spawn(move || {
+            for conn in parallel_listener.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                let served = served.clone();
+                std::thread::spawn(move || {
+                    let mut seed = [0u8; 1];
+                    let _ = conn.set_read_timeout(Some(Duration::from_secs(20)));
+                    if conn.read_exact(&mut seed).is_err() {
+                        return;
+                    }
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut off = 0u64;
+                    while off < PARALLEL_LEN {
+                        let n = buf.len().min((PARALLEL_LEN - off) as usize);
+                        fill(&mut buf[..n], off, seed[0]);
+                        if conn.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                        off += n as u64;
+                    }
+                    served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+        });
+    }
+    let udp_client_server = UdpSocket::bind(("127.0.0.1", udp_client_port))
+        .with_context(|| format!("xtask {smoke_name}: binding UDP server :{udp_client_port}"))?;
+    udp_client_server.set_read_timeout(Some(Duration::from_millis(200)))?;
+    let udp_server_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let udp_server_echoed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Every datagram the server received, as it arrived: the GSO phase is
+    // judged by what reached this host, not only by the guest's echoes.
+    let udp_server_seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let stop = udp_server_stop.clone();
+        let echoed = udp_server_echoed.clone();
+        let seen = udp_server_seen.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok((n, peer)) = udp_client_server.recv_from(&mut buf) {
+                    if let Ok(mut seen) = seen.lock() {
+                        seen.push(buf[..n].to_vec());
+                    }
+                    if udp_client_server.send_to(&buf[..n], peer).is_ok() {
+                        echoed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+    }
     match nic {
         NetSmokeNic::Virtio => std::env::set_var("XTASK_QEMU_HOSTFWD", forwards),
         NetSmokeNic::E1000Module | NetSmokeNic::Igb => {
@@ -6050,7 +6351,12 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     cmd.args(qemu_boot_args(&build, &kernel)?);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    // Serial is captured from stdout for prompt matching.  Keep QEMU's
+    // diagnostics on the invoking terminal: hiding an immediate launch
+    // failure (such as an image lock or unavailable accelerator) behind an
+    // indistinguishable stdout EOF turns a one-line host error into a blind
+    // 120-second test retry.
+    cmd.stderr(Stdio::inherit());
 
     println!(
         "xtask {smoke_name}: launching {} {} (TCP 127.0.0.1:{tcp_host_port} -> guest :{tcp_guest_port}; UDP 127.0.0.1:{udp_host_port} -> guest :{udp_guest_port})",
@@ -6280,12 +6586,114 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         String::from_utf8_lossy(&got)
     );
 
-    // 4. Wait until the guest has completed TCP and is ready for UDP.
-    if !wait_for(b"netserve-tcp-ok", timeout_secs) {
-        let _ = child.kill();
-        let _ = child.wait();
-        bail!("xtask {smoke_name}: guest did not confirm the TCP round-trip");
+    // Every failure below must stop QEMU and the host UDP server.
+    macro_rules! abort {
+        ($($t:tt)*) => {{
+            udp_server_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!($($t)*);
+        }};
     }
+
+    // 4. Wait until the guest has completed the TCP echo.
+    if !wait_for(b"netserve-tcp-ok", timeout_secs) {
+        abort!("xtask {smoke_name}: guest did not confirm the TCP round-trip");
+    }
+
+    // 4a. Bulk echo: stream BULK_LEN patterned bytes in while reading the
+    //     guest's echo out, then verify every echoed byte and the EOF.
+    if !wait_for(b"netserve: bulk listening", timeout_secs) {
+        abort!("xtask {smoke_name}: guest bulk server did not become ready");
+    }
+    let bulk_start = Instant::now();
+    let mut bulk = None;
+    while bulk_start.elapsed() < Duration::from_secs(20) {
+        match TcpStream::connect(("127.0.0.1", bulk_host_port)) {
+            Ok(s) => {
+                bulk = Some(s);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    let Some(bulk) = bulk else {
+        abort!("xtask {smoke_name}: could not connect to the bulk port within 20s");
+    };
+    let _ = bulk.set_read_timeout(Some(Duration::from_secs(30)));
+    let mut bulk_writer = match bulk.try_clone() {
+        Ok(w) => w,
+        Err(e) => abort!("xtask {smoke_name}: cloning the bulk stream: {e}"),
+    };
+    let bulk_tx = std::thread::spawn(move || -> Result<(), String> {
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut off = 0u64;
+        while off < BULK_LEN {
+            let n = buf.len().min((BULK_LEN - off) as usize);
+            fill(&mut buf[..n], off, BULK_SEED);
+            bulk_writer
+                .write_all(&buf[..n])
+                .map_err(|e| format!("write at offset {off}: {e}"))?;
+            off += n as u64;
+        }
+        bulk_writer
+            .shutdown(std::net::Shutdown::Write)
+            .map_err(|e| format!("shutdown: {e}"))
+    });
+    let mut bulk_reader = bulk;
+    let mut echoed = 0u64;
+    let mut rbuf = vec![0u8; 64 * 1024];
+    loop {
+        match bulk_reader.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Some(k) = (0..n).find(|&k| rbuf[k] != pat(echoed + k as u64, BULK_SEED)) {
+                    abort!(
+                        "xtask {smoke_name}: bulk echo byte mismatch at offset {}",
+                        echoed + k as u64
+                    );
+                }
+                echoed += n as u64;
+            }
+            Err(e) => abort!("xtask {smoke_name}: bulk echo stalled after {echoed} bytes: {e}"),
+        }
+    }
+    match bulk_tx.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => abort!("xtask {smoke_name}: bulk send failed: {e}"),
+        Err(_) => abort!("xtask {smoke_name}: bulk sender panicked"),
+    }
+    if echoed != BULK_LEN {
+        abort!("xtask {smoke_name}: bulk echo returned {echoed} of {BULK_LEN} bytes");
+    }
+    drop(bulk_reader);
+    println!(
+        "xtask {smoke_name}: bulk echo verified ({BULK_LEN} bytes each way in {:.2?})",
+        bulk_start.elapsed()
+    );
+    if !wait_for(b"netserve-bulk-ok", timeout_secs) {
+        abort!("xtask {smoke_name}: guest did not confirm the bulk echo");
+    }
+
+    // 4b. The guest now downloads from the host server as a client.
+    if !wait_for(b"netserve-download-ok", timeout_secs) {
+        abort!("xtask {smoke_name}: guest did not verify the {DOWNLOAD_LEN}-byte download");
+    }
+    match download_server.join() {
+        Ok(Ok(n)) => println!("xtask {smoke_name}: guest downloaded and verified {n} bytes"),
+        Ok(Err(e)) => abort!("xtask {smoke_name}: download server: {e}"),
+        Err(_) => abort!("xtask {smoke_name}: download server panicked"),
+    }
+
+    // 4c. Concurrent downloads: 8 then 16 streams, read by one epoll loop and
+    //     by one thread per socket, then a fresh connection. The guest checks
+    //     every byte, the EOFs and that no stream lags far behind the others.
+    if !wait_for(b"netserve-parallel-ok", timeout_secs) {
+        abort!("xtask {smoke_name}: guest parallel downloads did not all complete");
+    }
+    let par_streams = parallel_served.load(std::sync::atomic::Ordering::Relaxed);
+    println!("xtask {smoke_name}: served {par_streams} concurrent {PARALLEL_LEN}-byte streams");
+
     if !wait_for(b"netserve: udp listening", timeout_secs) {
         let _ = child.kill();
         let _ = child.wait();
@@ -6335,11 +6743,106 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         "xtask {smoke_name}: host received the UDP echo ({:?})",
         String::from_utf8_lossy(&udp_buf[..udp_len])
     );
-    if !wait_for(b"netserve-udp-ok", timeout_secs) {
-        let _ = child.kill();
-        let _ = child.wait();
-        bail!("xtask {smoke_name}: guest did not confirm the UDP round-trip");
+
+    // 5a. Datagrams of many sizes, each echoed exactly. 4000 and 8000 exceed
+    //     the 1500-byte MTU: they reach the guest as IPv4 fragments and the
+    //     echo leaves it fragmented, so both reassembly and fragmentation run.
+    let mut big = vec![0u8; 65536];
+    for (i, &len) in UDP_SIZES.iter().enumerate() {
+        let mut out = vec![0u8; len];
+        fill(&mut out, 0, 0x10 + i as u8);
+        if let Err(e) = udp.send_to(&out, ("127.0.0.1", udp_host_port)) {
+            abort!("xtask {smoke_name}: host UDP send of {len} bytes failed: {e}");
+        }
+        match udp.recv_from(&mut big) {
+            Ok((n, _)) if n == len && big[..n] == out[..] => {}
+            Ok((n, _)) => {
+                abort!("xtask {smoke_name}: UDP {len}-byte echo came back as {n} wrong bytes")
+            }
+            Err(e) => abort!("xtask {smoke_name}: no echo for the {len}-byte UDP datagram: {e}"),
+        }
     }
+    // 5b. A back-to-back burst; the echoes may reorder but none may be lost
+    //     or altered (SLIRP on loopback does not drop).
+    for i in 0..UDP_BURST {
+        let mut out = vec![0u8; UDP_BURST_LEN];
+        fill(&mut out, 0, 0x80);
+        out[..2].copy_from_slice(&(i as u16).to_be_bytes());
+        if let Err(e) = udp.send_to(&out, ("127.0.0.1", udp_host_port)) {
+            abort!("xtask {smoke_name}: host UDP burst send {i} failed: {e}");
+        }
+    }
+    let mut seen = [false; UDP_BURST];
+    for _ in 0..UDP_BURST {
+        let n = match udp.recv_from(&mut big) {
+            Ok((n, _)) => n,
+            Err(e) => abort!(
+                "xtask {smoke_name}: UDP burst lost datagrams ({} of {UDP_BURST} echoed): {e}",
+                seen.iter().filter(|s| **s).count()
+            ),
+        };
+        let idx = u16::from_be_bytes([big[0], big[1]]) as usize;
+        let mut want = vec![0u8; UDP_BURST_LEN];
+        fill(&mut want, 0, 0x80);
+        if n != UDP_BURST_LEN || idx >= UDP_BURST || seen[idx] || big[2..n] != want[2..] {
+            abort!(
+                "xtask {smoke_name}: UDP burst echo corrupt or duplicated (len {n}, index {idx})"
+            );
+        }
+        seen[idx] = true;
+    }
+    println!(
+        "xtask {smoke_name}: UDP sizes {UDP_SIZES:?} and a {UDP_BURST}-datagram burst echoed intact"
+    );
+    if !wait_for(b"netserve-udp-ok", timeout_secs) {
+        abort!("xtask {smoke_name}: guest did not confirm the UDP round-trip");
+    }
+
+    // 5c. The guest's connect()ed UDP client round-trips with our server.
+    if !wait_for(b"netserve-udp-client-ok", timeout_secs) {
+        abort!("xtask {smoke_name}: guest connected-UDP client did not complete");
+    }
+    let echoed_client = udp_server_echoed.load(std::sync::atomic::Ordering::Relaxed);
+    if echoed_client < UDP_CLIENT_ROUNDS {
+        abort!("xtask {smoke_name}: host UDP server echoed {echoed_client} of {UDP_CLIENT_ROUNDS}");
+    }
+
+    // 5d. UDP GSO: the guest sent UDP_GSO_SEGS x UDP_GSO_LEN bytes in ONE
+    // sendmsg with a UDP_SEGMENT cmsg; this host must have received them as
+    // UDP_GSO_SEGS separate UDP_GSO_LEN-byte datagrams, each exactly once.
+    if !wait_for(b"netserve-udp-gso-ok", timeout_secs) {
+        abort!("xtask {smoke_name}: guest UDP GSO phase did not complete");
+    }
+    let gso_seen: Vec<Vec<u8>> = udp_server_seen
+        .lock()
+        .map(|seen| seen.clone())
+        .unwrap_or_default();
+    if gso_seen
+        .iter()
+        .any(|d| d.len() == UDP_GSO_SEGS * UDP_GSO_LEN)
+    {
+        abort!(
+            "xtask {smoke_name}: host received the GSO batch as one {}-byte datagram",
+            UDP_GSO_SEGS * UDP_GSO_LEN
+        );
+    }
+    let mut gso_sizes = Vec::new();
+    for i in 0..UDP_GSO_SEGS {
+        let mut want = vec![0u8; UDP_GSO_LEN];
+        fill(&mut want, 0, UDP_GSO_SEED + i as u8);
+        let copies = gso_seen.iter().filter(|d| **d == want).count();
+        if copies != 1 {
+            abort!(
+                "xtask {smoke_name}: host received GSO segment {i} {copies} times (want exactly 1)"
+            );
+        }
+        gso_sizes.push(want.len());
+    }
+    println!(
+        "xtask {smoke_name}: UDP GSO sendmsg arrived as {} separate datagrams of {:?} bytes",
+        gso_sizes.len(),
+        gso_sizes
+    );
 
     // 6. The guest now issues a real DNS query to SLIRP's 10.0.2.3 proxy.
     if !wait_for(b"netserve-dns-ok", timeout_secs) {
@@ -6348,6 +6851,32 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         bail!("xtask {smoke_name}: guest DNS query did not return a valid answer");
     }
 
+    // 6b. The TCP robustness phases, in the guest's order.
+    for (token, secs) in &robust_tokens {
+        if !wait_for(token.as_bytes(), *secs) {
+            let mut why = robust_report.failures();
+            if let Some(p) = ns_peer.as_ref() {
+                why.extend(p.failures());
+            }
+            abort!(
+                "xtask {smoke_name}: guest did not print `{token}` within {secs}s; host-side: {why:?}"
+            );
+        }
+        let mut why = robust_report.failures();
+        if let Some(p) = ns_peer.as_ref() {
+            why.extend(p.failures());
+        }
+        if !why.is_empty() {
+            abort!(
+                "xtask {smoke_name}: robustness phase failed host-side after `{token}`: {why:?}"
+            );
+        }
+    }
+    if let Some(mut p) = ns_peer.take() {
+        p.kill();
+    }
+    std::env::remove_var("XTASK_QEMU_LEGACY_STREAM");
+
     // 7. Require the aggregate guest verdict as well as each path token.
     if !wait_for(b"netserve-ok", timeout_secs) {
         let _ = child.kill();
@@ -6355,6 +6884,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         bail!("xtask {smoke_name}: guest did not print `netserve-ok` within {timeout_secs}s");
     }
 
+    udp_server_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader.join();
@@ -6363,7 +6893,9 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         NetSmokeNic::E1000Module => "module-owned e1000",
         NetSmokeNic::Igb => "built-in igb (QEMU 82576)",
     };
-    println!("xtask {smoke_name}: ok — live TCP, UDP, and DNS passed over {transport}");
+    println!(
+        "xtask {smoke_name}: ok — live TCP (echo, {BULK_LEN}-byte bulk echo, {DOWNLOAD_LEN}-byte client download), UDP (sizes incl. fragmented, burst, connected client, GSO) and DNS passed over {transport}"
+    );
     Ok(())
 }
 
@@ -8924,9 +9456,14 @@ fn run_interactive_multi(
             }
             Wait::Died(why) => {
                 let _ = child.kill();
-                let _ = child.wait();
+                let status = child.wait().ok();
                 let _ = reader_handle.join();
-                bail!("xtask musl-demo: {why} before login prompt");
+                bail!(
+                    "xtask musl-demo: {why} before login prompt ({})",
+                    status
+                        .map(|status| status.to_string())
+                        .unwrap_or_else(|| "QEMU status unavailable".into())
+                );
             }
         }
         // QEMU's emulated USB keyboard enumerates just after getty prints the
@@ -8968,9 +9505,14 @@ fn run_interactive_multi(
         }
         Wait::Died(why) => {
             let _ = child.kill();
-            let _ = child.wait();
+            let status = child.wait().ok();
             let _ = reader_handle.join();
-            bail!("xtask musl-demo: {why} before first prompt");
+            bail!(
+                "xtask musl-demo: {why} before first prompt ({})",
+                status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "QEMU status unavailable".into())
+            );
         }
     }
     // Late-boot log noise (USB-HID enumeration) can interleave with
@@ -9152,6 +9694,7 @@ fn without_kernel_test_features(features: &str) -> String {
 mod kernel_test_feature_tests {
     use super::{
         legacy_qemu_netdev_from, validate_test_subsystems, without_kernel_test_features, Cli, Cmd,
+        VIRTIO_MODETEST_CASE,
     };
     use clap::Parser;
 
@@ -9252,7 +9795,7 @@ mod kernel_test_feature_tests {
     }
 
     #[test]
-    fn virgl_disables_default_vga_in_every_virtio_x86_fixture() {
+    fn graphical_virtio_gpu_disables_default_vga_when_it_owns_the_display() {
         use super::{Arch, GpuBackend, HwProfile};
 
         for profile in [HwProfile::Full, HwProfile::VirtioOnly] {
@@ -9282,6 +9825,51 @@ mod kernel_test_feature_tests {
                 "{profile:?} has no virtio GPU to own the display"
             );
         }
+
+        let graphical_2d = Arch::X86_64.qemu_args(
+            std::path::Path::new("kernel"),
+            "gtk",
+            HwProfile::VirtioOnly,
+            GpuBackend::Virtio2d,
+            "",
+        );
+        assert!(
+            graphical_2d.windows(2).any(|pair| pair == ["-vga", "none"]),
+            "graphical virtio-only 2D fixtures must scan out virtio-gpu, not default VGA"
+        );
+
+        let headless_2d = Arch::X86_64.qemu_args(
+            std::path::Path::new("kernel"),
+            "none",
+            HwProfile::VirtioOnly,
+            GpuBackend::Virtio2d,
+            "",
+        );
+        assert!(
+            !headless_2d.windows(2).any(|pair| pair == ["-vga", "none"]),
+            "headless 2D fixtures do not need to alter legacy display coverage"
+        );
+
+        let full_2d = Arch::X86_64.qemu_args(
+            std::path::Path::new("kernel"),
+            "gtk",
+            HwProfile::Full,
+            GpuBackend::Virtio2d,
+            "",
+        );
+        assert!(
+            !full_2d.windows(2).any(|pair| pair == ["-vga", "none"]),
+            "full 2D fixtures retain their explicit legacy display coverage"
+        );
+    }
+
+    #[test]
+    fn modetest_regression_targets_virtio_scanout() {
+        assert_eq!(
+            VIRTIO_MODETEST_CASE,
+            ("modetest -M virtio_gpu", "(1280x800)"),
+            "the dual-GPU fixture must not select Bochs while asserting the VirtIO mode"
+        );
     }
 
     #[test]
@@ -11673,6 +12261,7 @@ fn main() -> Result<()> {
         Cmd::NetSmoke(args) => net_smoke_cmd(&args),
         Cmd::E1000ModuleNetSmoke(args) => e1000_module_net_smoke_cmd(&args),
         Cmd::IgbNetSmoke(args) => igb_net_smoke_cmd(&args),
+        Cmd::NetPeer(args) => net_robust::net_peer_main(&args.sock, args.mask, args.long),
         Cmd::RedisSmoke(args) => redis_smoke_cmd(&args),
         Cmd::RedisBench(args) => redis_bench_cmd(&args),
         Cmd::StressBench(args) => stress_bench_cmd(&args),

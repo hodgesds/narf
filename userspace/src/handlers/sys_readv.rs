@@ -209,7 +209,7 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
     // vfs_readv: rw_verify_area(READ, file, &f_pos, tot_len) -> -EINVAL when
     // the position plus the vector length passes LLONG_MAX.
     if !endpoint.ops.is_stream() {
-        if let Err(errno) = rw_verify_area_pos(offset, count) {
+        if let Err(errno) = rw_verify_area_file(endpoint.ops.as_ref(), offset, count) {
             ctx.set_return(errno_ret(errno));
             return;
         }

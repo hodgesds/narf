@@ -1539,6 +1539,107 @@ kernel_test_in!(
     smoke_abi_pathx_getcwd_removed_directory_is_enoent
 );
 
+/// The working directory of a task whose root is not `/` exists under THAT
+/// root. `fs/d_path.c::SYSCALL_DEFINE2(getcwd)` asks only whether the pwd
+/// dentry is unlinked (`d_unlinked`) before rendering it relative to the
+/// caller's root, so a live directory that has no counterpart at the same
+/// spelling under the HOST root is still reported.
+///
+/// Every task under a directly rooted PID 1 lives in exactly this shape, and
+/// OpenSSH's session process chdirs to the user's home inside it before
+/// exec'ing the shell: `shell-init: error retrieving current directory:
+/// getcwd: cannot access parent directories` on every login came from the
+/// liveness probe testing the root-relative cwd against the host root.
+///
+/// The removed-directory arm runs under the same root, so the probe still
+/// detects an rmdir'd cwd once it looks in the right place.
+fn smoke_abi_pathx_getcwd_under_chroot_reports_root_relative_cwd() -> TestResult {
+    with_memfs("/gcroot", "gcroot", &[("keep", b"x")], || {
+        // MemFs seeds are flat names; build the home directory through
+        // the syscalls, from outside the root.
+        for dir in [&b"/gcroot/home\0"[..], &b"/gcroot/home/rpuser\0"[..]] {
+            if call_mkdir(dir.as_ptr() as u64, 0o755) != Some(0) {
+                return Err("mkdir of the in-root home directory failed");
+            }
+        }
+        let root = b"/gcroot\0";
+        if call(Syscall::Chroot.raw(), a0(root.as_ptr() as u64)) != Some(0) {
+            return Err("chroot into the test root failed");
+        }
+        let result = (|| {
+            // Only "/gcroot/home/rpuser" exists on the host; inside the
+            // root it is "/home/rpuser".
+            let home = b"/home/rpuser\0";
+            if call(Syscall::Chdir.raw(), a0(home.as_ptr() as u64)) != Some(0) {
+                return Err("chdir to the root-relative home failed");
+            }
+            let mut buf = [0u8; 128];
+            let r = call(
+                Syscall::Getcwd.raw(),
+                a1(buf.as_mut_ptr() as u64, buf.len() as u64),
+            );
+            if r != Some(b"/home/rpuser".len() as i64 + 1) {
+                return Err("getcwd under a chroot failed for a live directory");
+            }
+            if &buf[..b"/home/rpuser\0".len()] != b"/home/rpuser\0" {
+                return Err("getcwd under a chroot did not report the root-relative path");
+            }
+            // A relative chdir keeps working from there, and getcwd
+            // follows it.
+            let up = b"..\0";
+            if call(Syscall::Chdir.raw(), a0(up.as_ptr() as u64)) != Some(0) {
+                return Err("relative chdir .. under a chroot failed");
+            }
+            if call(
+                Syscall::Getcwd.raw(),
+                a1(buf.as_mut_ptr() as u64, buf.len() as u64),
+            ) != Some(b"/home".len() as i64 + 1)
+                || &buf[..6] != b"/home\0"
+            {
+                return Err("getcwd under a chroot after chdir .. was not /home");
+            }
+            // The unlinked arm, under the same root: make a directory,
+            // stand in it, remove it.
+            let gone = b"/home/gone\0";
+            if call_mkdir(gone.as_ptr() as u64, 0o755) != Some(0) {
+                return Err("mkdir under the chroot failed");
+            }
+            if call(Syscall::Chdir.raw(), a0(gone.as_ptr() as u64)) != Some(0) {
+                return Err("chdir into the new directory under the chroot failed");
+            }
+            let rmdir_r = if wired(Syscall::Rmdir) {
+                call(Syscall::Rmdir.raw(), a0(gone.as_ptr() as u64))
+            } else {
+                call(
+                    Syscall::Unlinkat.raw(),
+                    a2(AT_FDCWD, gone.as_ptr() as u64, AT_REMOVEDIR),
+                )
+            };
+            if rmdir_r != Some(0) {
+                return Err("rmdir of the cwd under the chroot failed");
+            }
+            if call(
+                Syscall::Getcwd.raw(),
+                a1(buf.as_mut_ptr() as u64, buf.len() as u64),
+            ) != Some(ENOENT_E)
+            {
+                return Err("getcwd of a removed directory under a chroot was not -ENOENT");
+            }
+            Ok(())
+        })();
+        // chroot("/") from inside the root would only re-install it;
+        // drop the root the way the harness's own setup does.
+        crate::handlers::__test_root_dir_reset();
+        let slash = b"/\0";
+        let _ = call(Syscall::Chdir.raw(), a0(slash.as_ptr() as u64));
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_getcwd_under_chroot_reports_root_relative_cwd
+);
+
 /// `fs/namei.c` gives up on a symlink cycle with -ELOOP:
 ///
 ///     if (unlikely(nd->total_link_count++ >= MAXSYMLINKS))

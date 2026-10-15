@@ -157,6 +157,77 @@ fn enqueue6(target: &SocketFile, pkt: DgramPacket6) {
     }
 }
 
+/// [`enqueue6`] for a datagram this host sent to itself: a GSO send
+/// (`gso`, payload > gso_size) reaches a `UDP_GRO` socket whole, marked with
+/// its segment size, and any other socket as the batched datagrams
+/// (`udp_unexpected_gso` -> `udp_rcv_segment`). See `inet_dgram::enqueue_local`.
+fn enqueue6_local(target: &SocketFile, pkt: DgramPacket6, gso: Option<u16>) {
+    let Some(gso) = gso else {
+        enqueue6(target, pkt);
+        return;
+    };
+    if target.options.lock().ext.udp_gro {
+        enqueue6(
+            target,
+            DgramPacket6 {
+                gso_size: gso,
+                ..pkt
+            },
+        );
+        return;
+    }
+    for chunk in narf_net::udp_gso::segment_payload(&pkt.payload, usize::from(gso)) {
+        enqueue6(
+            target,
+            DgramPacket6 {
+                peer_addr: pkt.peer_addr,
+                peer_port: pkt.peer_port,
+                scope_id: pkt.scope_id,
+                destination: pkt.destination,
+                hop_limit: pkt.hop_limit,
+                traffic_class: pkt.traffic_class,
+                payload: chunk.to_vec(),
+                gso_size: 0,
+            },
+        );
+    }
+}
+
+/// `udp_v6_send_skb`'s GSO checks for a `len`-byte payload against the
+/// cork's `fragsize`: `Some(gso_size)` when the payload is split.
+fn udp6_gso_send_check(
+    len: usize,
+    gso_size: u16,
+    fragsize: u32,
+    no_check6_tx: bool,
+) -> Result<Option<u16>, SockError> {
+    if gso_size == 0 {
+        return Ok(None);
+    }
+    match narf_net::udp_gso::gso_check(
+        narf_net::pkt_ipv6::IPV6_HDR_LEN,
+        len,
+        gso_size,
+        fragsize,
+        no_check6_tx,
+    ) {
+        Ok(split) => Ok(split.then_some(gso_size)),
+        Err(narf_net::udp_gso::GsoError::MsgSize) => Err(SockError::MsgSize),
+        Err(narf_net::udp_gso::GsoError::Invalid) => Err(SockError::InvalidArg),
+    }
+}
+
+/// The device MTU of interface `ifindex` (lo's 64 KiB when unregistered).
+fn dev_mtu_v6(ns: u64, ifindex: u32) -> u32 {
+    let lo_default = || narf_net::iface::lookup_in(ns, "lo").map_or(64 * 1024, |lo| lo.mtu);
+    if ifindex == super::sockopt::LOOPBACK_IFINDEX {
+        return lo_default();
+    }
+    super::sockopt::ifindex_name(ns, ifindex)
+        .and_then(|name| narf_net::iface::lookup_in(ns, &name))
+        .map_or_else(lo_default, |i| i.mtu)
+}
+
 /// The address a multicast leaving device `ifindex` carries: ::1 out lo,
 /// else the device's first (link-local preferred) address.
 fn mc_source_v6(ns: u64, ifindex: u32) -> [u8; 16] {
@@ -335,6 +406,14 @@ impl SocketFile {
         if let SocketState::Inet6Dgram { peer: slot, .. } = &mut *self.state.lock() {
             *slot = Some(peer);
         }
+        // `__ip6_datagram_connect` hands a v4-mapped peer to
+        // `__ip4_datagram_connect`, which seeds `inet_id` randomly.
+        if mapped_v4(&peer.0).is_some() {
+            self.inet_id.store(
+                narf_net::ip_output::get_random_u16(),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
         SocketOpResult::Ok(0)
     }
 
@@ -424,6 +503,13 @@ impl SocketFile {
                 None => return SocketOpResult::Err(SockError::DestAddrReq),
             },
         };
+        // `udp_cmsg_send` (from `udpv6_sendmsg`, or `udp_sendmsg` for a
+        // v4-mapped destination): a `UDP_SEGMENT` cmsg overrides the socket's
+        // GSO size, a malformed SOL_UDP cmsg is EINVAL.
+        let gso_size = match self.udp_send_gso_size() {
+            Ok(g) => g,
+            Err(e) => return SocketOpResult::Err(e),
+        };
         if self.sk_shutdown() & inet_dgram::SEND_SHUTDOWN != 0 {
             return SocketOpResult::Err(SockError::Pipe);
         }
@@ -437,10 +523,19 @@ impl SocketFile {
                 bind_to_device: options.bindtodevice_index,
                 ip_ttl: options.ip_ttl.min(255) as u8,
                 ip_tos: options.ip_tos.min(255) as u8,
+                ip_pmtudisc: options.ext.ip_pmtudisc,
                 sndbuf: narf_net::udp_sock::UDP_MAX_PAYLOAD,
+                // `udp_sendmsg` checks `sk_no_check_tx` (SO_NO_CHECK), not
+                // UDP_NO_CHECK6_TX, for a v4-mapped destination.
+                gso_size,
+                no_check_tx: options.ext.no_check,
                 ..Default::default()
             };
             let destination = narf_net::udp_sock::SocketAddrV4::new(v4, dest.1);
+            // Any connected AF_INET6 socket has a nonzero `inet_daddr` (the
+            // mapped peer, or LOOPBACK4_IPV6 for a native one), so
+            // `ip_select_ident_segs` takes `inet_id`.
+            let inet_id = connected.map(|_| &self.inet_id);
             return match narf_net::udp_sock::udp_send_from(
                 self.net_ns_id(),
                 local_port,
@@ -448,9 +543,11 @@ impl SocketFile {
                 buf,
                 &udp_options,
                 0,
+                inet_id,
             ) {
                 Ok(n) => SocketOpResult::Ok(n as u64),
-                Err(narf_net::udp_sock::UdpError::MsgTooLong) => {
+                Err(narf_net::udp_sock::UdpError::MsgTooLong)
+                | Err(narf_net::udp_sock::UdpError::LocalMsgSize { .. }) => {
                     SocketOpResult::Err(SockError::MsgSize)
                 }
                 Err(narf_net::udp_sock::UdpError::NoBroadcastPermission) => {
@@ -459,11 +556,14 @@ impl SocketFile {
                 Err(narf_net::udp_sock::UdpError::NetworkUnreachable) => {
                     SocketOpResult::Ok(buf.len() as u64)
                 }
+                Err(narf_net::udp_sock::UdpError::GsoInvalid) => {
+                    SocketOpResult::Err(SockError::InvalidArg)
+                }
                 Err(_) => SocketOpResult::Err(SockError::NetUnreach),
             };
         }
         if super::sockopt::is_multicast_v6(&dest.0) {
-            return self.inet6_dgram_send_mcast(buf, local, local_port, dest);
+            return self.inet6_dgram_send_mcast(buf, local, local_port, dest, gso_size);
         }
         let options = self.options.lock().clone();
         let hop_limit = options.ipv6_unicast_hops;
@@ -488,10 +588,17 @@ impl SocketFile {
                 options.ipv6_mtu_set.then_some(options.ipv6_mtu),
                 options.ipv6_mtu_discover,
                 options.ipv6_dontfrag,
+                narf_net::ipv6_stack::Udp6TxOpts {
+                    gso_size,
+                    no_check6_tx: options.ext.udp_no_check6_tx,
+                },
             ) {
                 Ok(n) => SocketOpResult::Ok(n as u64),
                 Err(narf_net::ipv6_stack::Udp6SendError::MessageTooLong) => {
                     SocketOpResult::Err(SockError::MsgSize)
+                }
+                Err(narf_net::ipv6_stack::Udp6SendError::GsoInvalid) => {
+                    SocketOpResult::Err(SockError::InvalidArg)
                 }
                 // Linux queues the skb while neighbour discovery runs and
                 // reports the datagram as accepted to sendmsg.
@@ -507,6 +614,17 @@ impl SocketFile {
                 Err(_) => SocketOpResult::Err(SockError::NetUnreach),
             };
         }
+        // A local destination routes through lo: `udp_v6_send_skb` checks a
+        // GSO send against lo's MTU before the looped skb is delivered.
+        let gso = match udp6_gso_send_check(
+            buf.len(),
+            gso_size,
+            dev_mtu_v6(self.net_ns_id(), super::sockopt::LOOPBACK_IFINDEX),
+            options.ext.udp_no_check6_tx,
+        ) {
+            Ok(g) => g,
+            Err(e) => return SocketOpResult::Err(e),
+        };
         let source = if local == UNSPEC { LOOPBACK } else { local };
         let target = {
             let guard = INET6_DGRAM_BOUND.lock();
@@ -523,24 +641,20 @@ impl SocketFile {
             })
         };
         if let Some(target) = target {
-            let mut state = target.state.lock();
-            if let SocketState::Inet6Dgram { inbox, rmem, .. } = &mut *state {
-                let charge = buf.len() + DGRAM_TRUESIZE_OVERHEAD;
-                if rmem.saturating_add(charge) <= target.options.lock().rcvbuf as usize {
-                    inbox.push_back(DgramPacket6 {
-                        peer_addr: source,
-                        peer_port: local_port,
-                        scope_id: dest.2,
-                        destination: dest.0,
-                        hop_limit: if hop_limit < 0 { 64 } else { hop_limit },
-                        traffic_class: options.ext.ipv6_tclass as u8,
-                        payload: buf.to_vec(),
-                    });
-                    *rmem += charge;
-                    target.dgram_readiness.set(narf_filesystem::POLL_IN, 0);
-                    target.dgram_readiness.notify(narf_filesystem::POLL_IN);
-                }
-            }
+            enqueue6_local(
+                &target,
+                DgramPacket6 {
+                    peer_addr: source,
+                    peer_port: local_port,
+                    scope_id: dest.2,
+                    destination: dest.0,
+                    hop_limit: if hop_limit < 0 { 64 } else { hop_limit },
+                    traffic_class: options.ext.ipv6_tclass as u8,
+                    payload: buf.to_vec(),
+                    gso_size: 0,
+                },
+                gso,
+            );
         } else if connected == Some(dest) {
             self.set_pending_error(SockError::ConnectionRefused);
         }
@@ -558,11 +672,23 @@ impl SocketFile {
         local: [u8; 16],
         local_port: u16,
         dest: Inet6Peer,
+        gso_size: u16,
     ) -> SocketOpResult {
         let ns = self.net_ns_id();
         let options = self.options.lock().clone();
         let Some(egress) = super::sockopt::mc_egress_v6(ns, &options, dest.2) else {
             return SocketOpResult::Err(SockError::NetUnreach);
+        };
+        // `udp_v6_send_skb`'s GSO checks precede `ip6_finish_output2`'s
+        // loopback of the group copy.
+        let gso = match udp6_gso_send_check(
+            buf.len(),
+            gso_size,
+            dev_mtu_v6(ns, egress),
+            options.ext.udp_no_check6_tx,
+        ) {
+            Ok(g) => g,
+            Err(e) => return SocketOpResult::Err(e),
         };
         let hops = options.ext.ipv6_mcast_hops;
         let source = if local == UNSPEC {
@@ -582,7 +708,7 @@ impl SocketFile {
                     .unwrap_or_default()
             };
             for t in targets {
-                enqueue6(
+                enqueue6_local(
                     &t,
                     DgramPacket6 {
                         peer_addr: source,
@@ -592,7 +718,9 @@ impl SocketFile {
                         hop_limit: hops,
                         traffic_class: options.ext.ipv6_tclass as u8,
                         payload: buf.to_vec(),
+                        gso_size: 0,
                     },
+                    gso,
                 );
             }
         }
@@ -612,10 +740,17 @@ impl SocketFile {
             options.ipv6_mtu_set.then_some(options.ipv6_mtu),
             options.ipv6_mtu_discover,
             options.ipv6_dontfrag,
+            narf_net::ipv6_stack::Udp6TxOpts {
+                gso_size,
+                no_check6_tx: options.ext.udp_no_check6_tx,
+            },
         ) {
             Ok(n) => SocketOpResult::Ok(n as u64),
             Err(narf_net::ipv6_stack::Udp6SendError::MessageTooLong) => {
                 SocketOpResult::Err(SockError::MsgSize)
+            }
+            Err(narf_net::ipv6_stack::Udp6SendError::GsoInvalid) => {
+                SocketOpResult::Err(SockError::InvalidArg)
             }
             Err(narf_net::ipv6_stack::Udp6SendError::NeighborPending) => {
                 SocketOpResult::Ok(buf.len() as u64)
@@ -654,6 +789,7 @@ impl SocketFile {
                     ifindex: packet.scope_id,
                     hop_limit: packet.hop_limit,
                     traffic_class: packet.traffic_class,
+                    gso_size: packet.gso_size,
                 });
                 if !peek {
                     inbox.pop_front();
@@ -730,6 +866,7 @@ pub(super) fn deliver_wire(
                     hop_limit: i32::from(meta.ttl),
                     traffic_class: meta.tos,
                     payload: payload.to_vec(),
+                    gso_size: 0,
                 },
             );
         }
@@ -762,6 +899,7 @@ pub(super) fn deliver_wire(
         hop_limit: i32::from(meta.ttl),
         traffic_class: meta.tos,
         payload: payload.to_vec(),
+        gso_size: 0,
     });
     *rmem += charge;
     target.dgram_readiness.set(narf_filesystem::POLL_IN, 0);

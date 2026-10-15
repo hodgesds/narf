@@ -32,7 +32,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 #[cfg(target_arch = "x86_64")]
 use narf_lib::sync::IrqSafeSpinLock;
 #[cfg(target_arch = "x86_64")]
-use narf_memory::AddressSpace;
+use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
 
 use crate::syscall::{
     kernel_syscall_entry, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
@@ -4072,7 +4072,34 @@ fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
     const PARENT: u64 = 0xF0_65;
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    crate::fd::__test_reset();
     setup_process_state(PARENT);
+
+    // Seed a live non-stdio descriptor before the real clone3 path.  Chromium
+    // keeps a process-wide ownership bitmap and deliberately crashes if an
+    // `open()` in a CLONE_FILES sibling reuses a descriptor that is still
+    // live.  The older smoke only checked CLONE_VM, so a regression between
+    // flag decoding and fd::share could pass every clone test yet surface as
+    // that Chromium crash.
+    let seeded = crate::fd::with_table(PARENT, |table| {
+        let ops = table.get(0)?.ops.clone();
+        table.set(
+            3,
+            crate::fd::FdEntry {
+                ops,
+                offset: 0,
+                flags: 0,
+                status_flags: crate::fd::O_RDONLY,
+            },
+        );
+        Some(())
+    })
+    .flatten();
+    if seeded.is_none() {
+        teardown_process_state();
+        crate::fd::__test_reset();
+        return TestResult::Fail("could not seed parent fd table before clone3");
+    }
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
     // smokes run after kernel boot has installed the page tables.
@@ -4168,10 +4195,39 @@ fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
     if !Arc::ptr_eq(&child_as, &parent_as) {
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
+        crate::fd::__test_reset();
         return TestResult::Fail("CLONE_VM child does not share parent AS");
     }
 
-    // (3) Thread-group binding: child's visible PID matches parent's.
+    // (3) CLONE_FILES reaches the actual syscall path: the child sees the
+    // parent's open fd 3 and allocating from the child neither reuses that
+    // live number nor creates a private table.  This is the descriptor-table
+    // invariant Chromium's sandbox enforces in OpenProc().
+    let child_sees_parent_fd =
+        crate::fd::with_table(child_task_raw, |table| table.get(3).is_some()).unwrap_or(false);
+    let child_new_fd = crate::fd::with_table(child_task_raw, |table| {
+        let ops = table.get(0)?.ops.clone();
+        table.open(crate::fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: 0,
+            status_flags: crate::fd::O_RDONLY,
+        })
+    })
+    .flatten();
+    let parent_sees_child_fd = child_new_fd.is_some_and(|fd| {
+        crate::fd::with_table(PARENT, |table| table.get(fd).is_some()).unwrap_or(false)
+    });
+    if !child_sees_parent_fd || child_new_fd != Some(4) || !parent_sees_child_fd {
+        crate::fd::detach(child_task_raw);
+        crate::fd::detach(PARENT);
+        narf_scheduler::__reset_queues_for_test();
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("clone3(CLONE_FILES) did not preserve live fd allocation");
+    }
+
+    // (4) Thread-group binding: child's visible PID matches parent's.
     // The map stores (visible_pid → TaskId). For CLONE_THREAD the
     // visible_pid == parent_pid, so PID→TaskId for parent's PID now
     // resolves to the child's TaskId — which is what we want for
@@ -4181,6 +4237,9 @@ fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
     // matters is that the child's TaskId is registered and the AS
     // share holds.)
 
+    crate::fd::detach(child_task_raw);
+    crate::fd::detach(PARENT);
+    narf_scheduler::__reset_queues_for_test();
     teardown_process_state();
     *PROC_PARENT_AS.lock() = None;
     TestResult::Pass
@@ -4800,8 +4859,6 @@ fn smoke_process_ptrace_e2e() -> TestResult {
     // for exactly this.
     let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::ptrace::*;
-    use narf_memory::AddressSpace;
-
     const PARENT: u64 = 0xF0_02;
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
@@ -4815,6 +4872,23 @@ fn smoke_process_ptrace_e2e() -> TestResult {
             return TestResult::Fail("AddressSpace::new_for_user");
         }
     };
+    // A two-page lazy mapping lets PTRACE_PEEKDATA exercise Linux's
+    // `ptrace_access_vm(..., FOLL_FORCE)` contract. The peek starts four
+    // bytes before the page boundary, so a word-sized access must fault both
+    // child pages in rather than returning EIO for the sparse ELF-like VMA.
+    const PEEK_BASE: u64 = 0x0000_0066_6600_0000;
+    if parent_as
+        .map_region(Region {
+            base: VirtAddr::new(PEEK_BASE),
+            len: 0x2000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![narf_memory::PhysAddr::new(0); 2].into(),
+        })
+        .is_err()
+    {
+        teardown_process_state();
+        return TestResult::Fail("failed to install lazy ptrace mapping");
+    }
     *PROC_PARENT_AS.lock() = Some(parent_as);
     install_address_space_lookup(lookup_proc_parent_as);
 
@@ -4899,6 +4973,59 @@ fn smoke_process_ptrace_e2e() -> TestResult {
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
         return TestResult::Fail("child is not in ptrace stopped state");
+    }
+
+    // `PTRACE_PEEKDATA` operates on the stopped child, not the tracer's
+    // current (parent) root. Its FOLL_FORCE-equivalent page-in must also be
+    // word-safe across this page boundary.
+    // `generic_ptrace_peekdata` stores the word through `data` and returns
+    // 0; a lazy anonymous page reads as zero.
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut peek_word: u64 = u64::MAX;
+    let mut peek_ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: PTRACE_PEEKDATA,
+            arg1: child_pid,
+            arg2: PEEK_BASE + 0xffc,
+            arg3: &mut peek_word as *mut u64 as u64,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ptrace.raw(), &mut peek_ctx);
+    match peek_ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 && peek_word == 0 => {}
+        _ => {
+            crate::task::release_task(child_task_raw);
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("PTRACE_PEEKDATA did not page in a sparse tracee mapping");
+        }
+    }
+    let child_as = match narf_scheduler::address_space_of(narf_scheduler::TaskId(child_task_raw)) {
+        Some(as_) => as_,
+        None => {
+            crate::task::release_task(child_task_raw);
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("forked ptrace tracee has no address space");
+        }
+    };
+    // SAFETY: child is ptrace-stopped, its root is live, and these walks only
+    // inspect the two leaves PTRACE_PEEKDATA just materialized.
+    let first_page = unsafe {
+        narf_memory::paging::translate(child_as.root, VirtAddr::new(PEEK_BASE + 0xffc)).is_some()
+    };
+    // SAFETY: same as above.
+    let second_page = unsafe {
+        narf_memory::paging::translate(child_as.root, VirtAddr::new(PEEK_BASE + 0x1000)).is_some()
+    };
+    if !first_page || !second_page {
+        crate::task::release_task(child_task_raw);
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("PTRACE_PEEKDATA did not materialize both crossed tracee pages");
     }
 
     // 3. Parent wait4 to reap the stop notification
@@ -5030,7 +5157,28 @@ fn smoke_process_ptrace_e2e() -> TestResult {
         return TestResult::Fail("child still ptrace-stopped after CONT");
     }
 
+    // Linux permits PTRACE_DETACH only from a ptrace-stop. Stop the resumed
+    // child again rather than relying on the old, unsafe "live tracee"
+    // shortcut.
+    LOOKUP_TASK.store(child_task_raw, Ordering::Relaxed);
+    crate::handlers::raise_signal_pending(child_task_raw, 19); // SIGSTOP
+    let mut restop_ctx = SignalCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+        going_to_user: true,
+        delivered: None,
+    };
+    if !crate::handlers::default_signal_delivery(&mut restop_ctx, crate::handlers::SYSCALL_NUM_NONE)
+        || !is_task_ptrace_stopped(child_task_raw)
+    {
+        crate::task::release_task(child_task_raw);
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("SIGSTOP did not return the resumed tracee to ptrace-stop");
+    }
+
     // 7. Detach using PTRACE_DETACH
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
     let mut detach_ctx = StubCtx {
         args: SyscallArgs {
             arg0: PTRACE_DETACH,
@@ -5160,6 +5308,25 @@ fn smoke_process_ptrace_syscall_stop() -> TestResult {
         cleanup();
         return TestResult::Fail("PTRACE_ATTACH failed");
     }
+
+    // ATTACH queues SIGSTOP; all requests other than PTRACE_KILL must wait
+    // until that signal has produced a ptrace-stop.
+    LOOKUP_TASK.store(child_task_raw, Ordering::Relaxed);
+    let mut attach_stop_ctx = SignalCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+        going_to_user: true,
+        delivered: None,
+    };
+    if !crate::handlers::default_signal_delivery(
+        &mut attach_stop_ctx,
+        crate::handlers::SYSCALL_NUM_NONE,
+    ) || !is_task_ptrace_stopped(child_task_raw)
+    {
+        cleanup();
+        return TestResult::Fail("PTRACE_ATTACH did not reach its SIGSTOP ptrace-stop");
+    }
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
 
     // Set PTRACE_O_TRACESYSGOOD so syscall-stops use SIGTRAP|0x80.
     let mut so = StubCtx {
@@ -6343,24 +6510,39 @@ fn smoke_process_mprotect_deny_wx() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    // Try to set W|X using mprotect
+    // W|X is JIT memory: it takes the JIT capability. A task whose JIT
+    // capability was denied gets EACCES, as Linux's MDWE refusal does; a task
+    // holding it (the default grant) gets the RWX mapping, as on Linux.
+    let rwx = |ctx: &mut StubCtx| {
+        *ctx = StubCtx {
+            args: SyscallArgs {
+                arg0: 0x2000_0000,
+                arg1: 0x1000,
+                arg2: 0b111, // PROT_READ | PROT_WRITE | PROT_EXEC
+                ..Default::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::MProtect.raw(), ctx);
+        ctx.ret
+    };
     let mut ctx = StubCtx {
-        args: SyscallArgs {
-            arg0: 0x2000_0000,
-            arg1: 0x1000,
-            arg2: 0b111, // PROT_READ | PROT_WRITE | PROT_EXEC
-            ..Default::default()
-        },
+        args: SyscallArgs::default(),
         ret: None,
     };
-    kernel_syscall_entry(Syscall::MProtect.raw(), &mut ctx);
+    narf_memory::wx::__reset_jit_grants_for_test();
+    narf_memory::wx::deny_jit(crate::handlers::current_task_id());
+    let denied = rwx(&mut ctx);
+    narf_memory::wx::__reset_jit_grants_for_test();
+    let granted = rwx(&mut ctx);
+    narf_memory::wx::__reset_jit_grants_for_test();
 
-    let outcome = match ctx.ret {
-        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) == EACCES => TestResult::Pass,
-        Some(r) if r.status == SyscallReturn::OK => {
-            TestResult::Fail("mprotect setting WX must return -EACCES")
+    let outcome = match (denied, granted) {
+        (Some(d), _) if d.status != SyscallReturn::OK || (d.value as i64) != EACCES => {
+            TestResult::Fail("mprotect W|X without the JIT capability must return -EACCES")
         }
-        _ => TestResult::Fail("mprotect setting WX must return -EACCES (got non-Ok)"),
+        (_, Some(g)) if g.status == SyscallReturn::OK && g.value == 0 => TestResult::Pass,
+        _ => TestResult::Fail("mprotect W|X holding the JIT capability must succeed"),
     };
 
     teardown_process_state();

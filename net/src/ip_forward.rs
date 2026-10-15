@@ -63,7 +63,6 @@ const ARP_TIMEOUT_MS: u64 = 1000;
 
 /// IPv4 fragment-control bits, in the flags/offset word at byte 6.
 const IP_DF: u16 = 0x4000;
-const IP_MF: u16 = 0x2000;
 const FRAG_OFF_MASK: u16 = 0x1FFF;
 
 /// Offsets into the IPv4 header.
@@ -241,7 +240,7 @@ pub fn try_forward(net_ns_id: u64, iface_in: &str, packet: &[u8]) -> bool {
         // Linux answers an unresolvable neighbour with Host Unreachable.
         Err(_) => return true,
     };
-    send_ipv4(&egress, dst_mac, &owned);
+    send_ipv4(net_ns_id, &egress, dst_mac, &owned);
     true
 }
 
@@ -255,7 +254,7 @@ pub fn try_forward(net_ns_id: u64, iface_in: &str, packet: &[u8]) -> bool {
 /// per fragment of a single datagram; the last, an error aimed at an address
 /// that is either nobody or everybody. Linux's `__icmp_send` applies the same
 /// set.
-fn icmp_error_permitted(packet: &[u8], ihl: usize) -> bool {
+pub(crate) fn icmp_error_permitted(packet: &[u8], ihl: usize) -> bool {
     let frag = u16::from_be_bytes([packet[FRAG_OFF], packet[FRAG_OFF + 1]]);
     if frag & FRAG_OFF_MASK != 0 {
         return false;
@@ -285,73 +284,26 @@ fn icmp_error_permitted(packet: &[u8], ihl: usize) -> bool {
 /// Emit one IPv4 packet on `egress`, splitting it into fragments if it
 /// exceeds the link MTU.
 ///
-/// Linux ref: `ip_fragment()` / `ip_do_fragment()` in net/ipv4/ip_output.c,
-/// reached from `ip_finish_output` after the FORWARD hook. A packet with DF
-/// set never arrives here oversized — `try_forward` has already answered it
-/// with Fragmentation Needed.
+/// Linux ref: `ip_forward_finish` → `ip_output` → `__ip_finish_output` →
+/// `ip_fragment()` / `ip_do_fragment()` in net/ipv4/ip_output.c, reached
+/// after the FORWARD hook. A packet with DF set never arrives here oversized
+/// — `try_forward` has already answered it with Fragmentation Needed.
 ///
-/// Fragments of an already-fragmented packet are handled: the incoming
-/// offset is the base that each piece's offset is added to, and an incoming
-/// More Fragments bit forces MF on every piece, since this packet is not the
-/// tail of the original datagram either.
-fn send_ipv4(egress: &iface::NetIfaceSnapshot, dst_mac: [u8; 6], packet: &[u8]) {
-    let mtu = egress.mtu as usize;
-    if packet.len() <= mtu {
-        emit(egress, dst_mac, packet);
-        return;
-    }
-    let ihl = ((packet[0] & 0x0F) as usize) * 4;
-    if ihl < MIN_HDR || packet.len() < ihl {
-        return;
-    }
-    // Every fragment but the last carries a payload that is a multiple of 8
-    // bytes, because the offset field counts 8-byte units.
-    let max_data = (mtu.saturating_sub(ihl)) & !7usize;
-    if max_data == 0 {
-        // The MTU cannot even hold a header plus one unit; nothing to send.
-        return;
-    }
-
-    let frag_word = u16::from_be_bytes([packet[FRAG_OFF], packet[FRAG_OFF + 1]]);
-    let base_units = (frag_word & FRAG_OFF_MASK) as usize;
-    let inbound_mf = frag_word & IP_MF != 0;
-    let payload = &packet[ihl..];
-
-    let mut consumed = 0usize;
-    while consumed < payload.len() {
-        let chunk = max_data.min(payload.len() - consumed);
-        let more = consumed + chunk < payload.len() || inbound_mf;
-        let units = base_units + consumed / 8;
-        if units > FRAG_OFF_MASK as usize {
-            return;
-        }
-
-        let mut frag = alloc::vec![0u8; ihl + chunk];
-        frag[..ihl].copy_from_slice(&packet[..ihl]);
-        frag[2..4].copy_from_slice(&((ihl + chunk) as u16).to_be_bytes());
-        // DF is necessarily clear here, and must stay clear in a fragment.
-        let word = if more {
-            IP_MF | units as u16
-        } else {
-            units as u16
-        };
-        frag[FRAG_OFF..FRAG_OFF + 2].copy_from_slice(&word.to_be_bytes());
-        frag[CHECKSUM_OFF..CHECKSUM_OFF + 2].copy_from_slice(&[0, 0]);
-        let cs = ip_checksum(&frag[..ihl]);
-        frag[CHECKSUM_OFF..CHECKSUM_OFF + 2].copy_from_slice(&cs.to_be_bytes());
-        frag[ihl..].copy_from_slice(&payload[consumed..consumed + chunk]);
-
-        emit(egress, dst_mac, &frag);
-        consumed += chunk;
-    }
-}
-
-/// Wrap one IPv4 packet in an Ethernet header and hand it to the driver.
-fn emit(egress: &iface::NetIfaceSnapshot, dst_mac: [u8; 6], packet: &[u8]) {
+/// Fragments of an already-fragmented packet are handled by the shared
+/// fragmenter: the incoming offset is the base each piece's offset is added
+/// to, and an incoming More Fragments bit forces MF on every piece. Options
+/// without the copied bit are kept only in the first fragment
+/// (`ip_options_fragment`).
+fn send_ipv4(net_ns_id: u64, egress: &iface::NetIfaceSnapshot, dst_mac: [u8; 6], packet: &[u8]) {
     let mut frame = alloc::vec![0u8; ETH_HDR_LEN + packet.len()];
     write_eth_header(&mut frame, dst_mac, egress.mac, ETHERTYPE_IPV4);
     frame[ETH_HDR_LEN..].copy_from_slice(packet);
-    let _ = egress.xmit(&frame);
+    // A forwarded skb has no socket: `ip_skb_dst_mtu` takes the route MTU
+    // (the device MTU here, clamped to IP_MAX_MTU), and `ignore_df` is clear.
+    let mtu = egress.mtu.min(crate::ip_output::IP_MAX_MTU);
+    let _ = crate::ip_output::ip_finish_output(net_ns_id, &frame, ETH_HDR_LEN, mtu, false, |f| {
+        egress.xmit(f)
+    });
 }
 
 /// Send an ICMP error built by `pkt_icmp_extra` back to `dst`.
@@ -362,6 +314,42 @@ fn emit(egress: &iface::NetIfaceSnapshot, dst_mac: [u8; 6], packet: &[u8]) {
 /// by definition somewhere else, and for an off-link one its own address has
 /// no MAC on this segment to find.
 fn send_icmp_error(net_ns_id: u64, dst: Ipv4Addr, icmp_body: Vec<u8>) {
+    send_icmp_error_with(net_ns_id, dst, None, icmp_body, |nexthop| {
+        arp_resolve_in(net_ns_id, nexthop, ARP_TIMEOUT_MS).ok()
+    });
+}
+
+/// [`send_icmp_error`] for callers that must never spin on ARP — the
+/// fragment-reassembly expiry runs from the net timer pump, where a 1 s
+/// busy-wait for a neighbour would stall every other pump. An unresolved
+/// next hop gets an ARP request and the error is dropped, the way it would
+/// be once a neighbour's queue overflows.
+///
+/// `src` overrides the source address: an error about a datagram that was
+/// addressed to this host is sourced from that destination address
+/// (`__icmp_send`: `saddr = iph->daddr` when the route is `RTCF_LOCAL`).
+pub(crate) fn send_icmp_error_nonblocking(
+    net_ns_id: u64,
+    dst: Ipv4Addr,
+    src: Option<[u8; 4]>,
+    icmp_body: Vec<u8>,
+) {
+    send_icmp_error_with(net_ns_id, dst, src, icmp_body, |nexthop| {
+        let mac = crate::tcp_stack::arp_cached_in(net_ns_id, nexthop);
+        if mac.is_none() {
+            let _ = crate::tcp_stack::send_arp_request_in(net_ns_id, nexthop);
+        }
+        mac
+    });
+}
+
+fn send_icmp_error_with(
+    net_ns_id: u64,
+    dst: Ipv4Addr,
+    src_override: Option<[u8; 4]>,
+    icmp_body: Vec<u8>,
+    resolve: impl FnOnce([u8; 4]) -> Option<[u8; 6]>,
+) {
     let (egress, nexthop, src) = match route::route_lookup_in(net_ns_id, dst) {
         Some(r) => match iface::lookup_in(net_ns_id, &r.iface) {
             Some(e) => {
@@ -384,9 +372,10 @@ fn send_icmp_error(net_ns_id: u64, dst: Ipv4Addr, icmp_body: Vec<u8>) {
             None => return,
         },
     };
-    let dst_mac = match arp_resolve_in(net_ns_id, nexthop.0, ARP_TIMEOUT_MS) {
-        Ok(m) => m,
-        Err(_) => return,
+    let src = src_override.unwrap_or(src);
+    let dst_mac = match resolve(nexthop.0) {
+        Some(m) => m,
+        None => return,
     };
     let ip_total = MIN_HDR + icmp_body.len();
     let mut frame = alloc::vec![0u8; ETH_HDR_LEN + ip_total];

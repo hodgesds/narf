@@ -62,6 +62,17 @@ pub enum UserExit {
     Exited,
 }
 
+/// `UserTaskCtx::syscall_restart_kind`: the restart-pending park returns
+/// `-ERESTARTSYS` — restarted after a handler only with `SA_RESTART`, and
+/// only when the syscall-number table (`is_restartable_syscall`) allows it.
+pub const SYSCALL_RESTART_SYS: u32 = 0;
+/// `-ERESTARTNOINTR`: always restarted, a handler never turns it into EINTR
+/// (`arch/x86/kernel/signal.c::handle_signal`).
+pub const SYSCALL_RESTART_NOINTR: u32 = 1;
+/// `-ERESTART_RESTARTBLOCK`: -EINTR to any handler, SA_RESTART or not;
+/// restarted (through `restart_block`) only when no handler runs.
+pub const SYSCALL_RESTART_RESTARTBLOCK: u32 = 2;
+
 /// Per-task context the polling routine installs in
 /// [`current_user_task`] before transitioning to user mode. The
 /// trap handler picks up the pointer, populates `state` from the
@@ -378,6 +389,12 @@ pub struct UserTaskCtx {
     /// leaves a deadline behind for the next one.
     pub sock_timeo_deadline_ns: AtomicU64,
     pub sock_timeo_key: AtomicU64,
+    /// Bytes a blocking stream send (or an MSG_WAITALL receive) had already
+    /// moved when it parked, kept across its RIP-rewind re-executions so the
+    /// call resumes where it stopped and returns the full count, as Linux's
+    /// in-kernel wait loop does. Keyed like `sock_timeo_key`; taken on entry.
+    pub sock_progress_done: AtomicU64,
+    pub sock_progress_key: AtomicU64,
 
     /// Fd (+1) of a FIFO `open()` that has installed its per-open
     /// [`crate::fifo` handle] and is now BLOCKED waiting for the peer
@@ -407,6 +424,37 @@ pub struct UserTaskCtx {
     /// leave exit-RIP ≠ entry-RIP. Cleared when the syscall completes
     /// (exit-trap sees RIP == entry) or when a delivery converts it.
     pub syscall_parked_restarting: AtomicBool,
+    /// Which Linux restart errno a restart-pending park stands for, as one of
+    /// the `SYSCALL_RESTART_*` constants. `SYSCALL_RESTART_SYS` (0) is the
+    /// `-ERESTARTSYS` default the syscall-number table refines; a park that
+    /// means `-ERESTARTNOINTR` (FUTEX_LOCK_PI) or `-ERESTART_RESTARTBLOCK`
+    /// (a timed FUTEX_WAIT) stores its kind after `own_stack_block`, which
+    /// resets it to the default on entry so it never outlives one park.
+    pub syscall_restart_kind: AtomicU32,
+    /// `restart_block` of a timed FUTEX_WAIT interrupted by a signal: the
+    /// word it waited on and its ABSOLUTE monotonic deadline. Linux restarts
+    /// such a wait through `futex_wait_restart` with the stored expiry, so
+    /// the re-executed FUTEX_WAIT on the same word reuses it rather than
+    /// re-reading a relative timeout. Zero uaddr = no restart pending.
+    pub futex_restart_uaddr: AtomicU64,
+    pub futex_restart_deadline_ns: AtomicU64,
+    /// `restart_block` of a RELATIVE nanosleep / clock_nanosleep a signal
+    /// interrupted (`hrtimer_nanosleep_restart`): the request pointer that
+    /// identifies the call and its ABSOLUTE monotonic expiry. When no handler
+    /// runs, the re-executed sleep resumes to that expiry instead of
+    /// re-reading the relative request and sleeping it again in full. Zero
+    /// request = no restart pending.
+    pub nanosleep_restart_req: AtomicU64,
+    pub nanosleep_restart_deadline_ns: AtomicU64,
+    /// The `timespec *` of an in-flight ppoll with a non-zero timeout, kept
+    /// across its re-executions so whichever path completes the call can
+    /// write the remaining time back (`poll_select_finish`), including a
+    /// signal delivery that turns the parked call into -EINTR. Zero = none.
+    pub ppoll_timeout_ptr: AtomicU64,
+    /// True while a handler-driven futex wait (`futex_block`) has entries
+    /// queued, so a teardown that never lets the handler unqueue them
+    /// sweeps them instead (`futex_drop_task_waiters`).
+    pub futex_block_active: AtomicBool,
 
     // ── stall-watchdog diagnostics ──────────────────────────────────
     /// Monotonic count of park-condition re-checks: bumped on every
@@ -702,8 +750,17 @@ impl UserTaskCtx {
             blocking_deadline_ns: AtomicU64::new(0),
             sock_timeo_deadline_ns: AtomicU64::new(0),
             sock_timeo_key: AtomicU64::new(0),
+            sock_progress_done: AtomicU64::new(0),
+            sock_progress_key: AtomicU64::new(0),
             fifo_open_pending_fd: AtomicU64::new(0),
             syscall_parked_restarting: AtomicBool::new(false),
+            syscall_restart_kind: AtomicU32::new(SYSCALL_RESTART_SYS),
+            futex_restart_uaddr: AtomicU64::new(0),
+            futex_restart_deadline_ns: AtomicU64::new(0),
+            nanosleep_restart_req: AtomicU64::new(0),
+            nanosleep_restart_deadline_ns: AtomicU64::new(0),
+            ppoll_timeout_ptr: AtomicU64::new(0),
+            futex_block_active: AtomicBool::new(false),
             kern_span_start_ns: AtomicU64::new(0),
             kern_account_ready: AtomicU64::new(0),
             dbg_park_checks: AtomicU64::new(0),
@@ -1020,6 +1077,27 @@ mod current_user_task_source_tests {
 /// Register `waker` with the park condition's event source and report whether
 /// the task should actually block (`true`) or proceed/re-execute now (`false`,
 /// condition already satisfied or a wake raced us). Mirrors the poll dispatch.
+/// Keep a stopped task off the CPU at the top of its poll: a job-control stop
+/// until SIGCONT, a ptrace stop until the tracer resumes it — including a
+/// child auto-attached by PTRACE_O_TRACEFORK/CLONE, which is born in its
+/// SIGSTOP stop and must not run a single user instruction before its tracer
+/// lets it. A pending SIGKILL always breaks through.
+///
+/// Arm-then-recheck: the waker is registered before the second look, so a
+/// resume that lands between the two is not lost.
+fn park_while_stopped(waker: &core::task::Waker) -> bool {
+    let tp = crate::handlers::current_task_id();
+    let stopped = || {
+        (crate::handlers::is_task_stopped(tp) || crate::ptrace::is_task_ptrace_stopped(tp))
+            && (crate::handlers::signal_pending_bits(tp) & crate::handlers::sig_bit(9)) == 0
+    };
+    if !stopped() {
+        return false;
+    }
+    crate::handlers::register_signal_waker(tp, waker.clone());
+    stopped()
+}
+
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn park_should_block(
     uc: &UserTaskCtx,
@@ -2167,6 +2245,74 @@ impl FpuArea {
     }
 }
 
+/// Bytes returned by Linux x86_64 `PTRACE_GETREGSET(NT_PRFPREG)`: the legacy
+/// FXSAVE image at the head of every standard XSAVE area.
+#[cfg(target_arch = "x86_64")]
+const LEGACY_FXSAVE_BYTES: usize = 512;
+
+/// User-task futures own their FPU areas, whereas ptrace resolves a stopped
+/// tracee by task id.  This small registry bridges those identities.  Its lock
+/// protects area lifetime against a concurrent future drop; ptrace itself has
+/// already stopped the tracee before it reads the image, so the saved memory is
+/// stable instead of the CPU's live xstate.
+#[cfg(target_arch = "x86_64")]
+static TASK_FPU_AREAS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, usize>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+#[cfg(target_arch = "x86_64")]
+fn register_task_fpu(task: u64, area: &FpuArea) {
+    let mut registry = TASK_FPU_AREAS.lock();
+    registry
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(task, area as *const FpuArea as usize);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn unregister_task_fpu(task: u64, area: &FpuArea) {
+    let mut registry = TASK_FPU_AREAS.lock();
+    let expected = area as *const FpuArea as usize;
+    if let Some(entries) = registry.as_mut() {
+        if entries.get(&task).copied() == Some(expected) {
+            entries.remove(&task);
+        }
+    }
+}
+
+/// Snapshot the x86 legacy FPU regset for a ptrace-stopped task.  A task that
+/// has not reached its first user-mode entry has no published area yet; Linux
+/// reports architectural reset state for that case, which is the same state a
+/// newly-created NARF task will load on first use.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn ptrace_legacy_fpu(task: u64) -> [u8; LEGACY_FXSAVE_BYTES] {
+    let mut snapshot = [0u8; LEGACY_FXSAVE_BYTES];
+    snapshot[0] = 0x7f; // FCW = 0x037f
+    snapshot[1] = 0x03;
+    snapshot[24] = 0x80; // MXCSR = 0x1f80
+    snapshot[25] = 0x1f;
+
+    // Keep the registry lock through the copy. `UserTaskFuture::drop` removes
+    // this exact pointer under the same lock before the Box can be freed.
+    let registry = TASK_FPU_AREAS.lock();
+    if let Some(area) = registry
+        .as_ref()
+        .and_then(|entries| entries.get(&task).copied())
+    {
+        // SAFETY: registration stores the address of the future-owned,
+        // 64-byte-aligned FPU_AREA_SIZE allocation. The registry lock pins
+        // that allocation against Drop for this copy; the first 512 bytes of
+        // a standard XSAVE image are the FXSAVE-compatible legacy region.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                area as *const u8,
+                snapshot.as_mut_ptr(),
+                LEGACY_FXSAVE_BYTES,
+            );
+        }
+    }
+    snapshot
+}
+
 /// Complete Linux's CLONE_CHILD_SETTID contract after the scheduler has made
 /// the child's address space active but before its first userspace instruction.
 /// Linux does this in schedule_tail() and deliberately ignores put_user faults.
@@ -2268,6 +2414,8 @@ impl UserTaskFuture {
     /// any ready queue — hand it to `narf_scheduler::spawn_user`
     /// under the same reserved `TaskId`.
     pub fn new(process: crate::UserProcess, task: alloc::sync::Arc<crate::task::Task>) -> Self {
+        let fpu = FpuArea::reset_boxed();
+        register_task_fpu(task.tid, &fpu);
         Self {
             process,
             task,
@@ -2275,7 +2423,7 @@ impl UserTaskFuture {
             state: TaskState::Initial,
             saved_cr3: core::cell::Cell::new(None),
             sleep_handle: None,
-            fpu: FpuArea::reset_boxed(),
+            fpu,
             set_child_tid: None,
         }
     }
@@ -2318,6 +2466,7 @@ impl UserTaskFuture {
         unsafe {
             narf_arch::x86_64::xsave::fpu_save(&mut *fpu as *mut FpuArea as *mut u8);
         }
+        register_task_fpu(task.tid, &fpu);
         Self {
             process,
             task,
@@ -2345,6 +2494,13 @@ impl UserTaskFuture {
 
     fn set_child_tid(&mut self, uaddr: u64) {
         self.set_child_tid = Some(uaddr);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for UserTaskFuture {
+    fn drop(&mut self) {
+        unregister_task_fpu(self.task.tid, &self.fpu);
     }
 }
 
@@ -2388,14 +2544,8 @@ impl core::future::Future for UserTaskFuture {
         // un-killable. We register the signal waker (consumed +
         // fired by `wake_signal`) and return Pending without a
         // wake_by_ref, so the task truly idles until woken.
-        {
-            let tp = crate::handlers::current_task_id();
-            if crate::handlers::is_task_stopped(tp)
-                && (crate::handlers::signal_pending_bits(tp) & crate::handlers::sig_bit(9)) == 0
-            {
-                crate::handlers::register_signal_waker(tp, cx.waker().clone());
-                return core::task::Poll::Pending;
-            }
+        if park_while_stopped(cx.waker()) {
+            return core::task::Poll::Pending;
         }
 
         // sys_sleep parks the task by stashing an absolute deadline
@@ -3344,14 +3494,8 @@ impl core::future::Future for UserTaskFuture {
 
         // Job-control stop: keep a stopped task parked until SIGCONT
         // (or SIGKILL) — see the x86_64 sibling body for rationale.
-        {
-            let tp = crate::handlers::current_task_id();
-            if crate::handlers::is_task_stopped(tp)
-                && (crate::handlers::signal_pending_bits(tp) & crate::handlers::sig_bit(9)) == 0
-            {
-                crate::handlers::register_signal_waker(tp, cx.waker().clone());
-                return core::task::Poll::Pending;
-            }
+        if park_while_stopped(cx.waker()) {
+            return core::task::Poll::Pending;
         }
 
         // sys_sleep park-via-deadline + throttle (mirrors x86_64 —

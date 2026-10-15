@@ -62,6 +62,15 @@ pub const DESC_BYTES: u64 = 16;
 pub const RING_BYTES: u64 = RING_LEN as u64 * DESC_BYTES + DESC_BYTES;
 /// RX buffer size per descriptor.
 pub const RX_BUF_BYTES: usize = 2048;
+/// Normal MTU TX copy-buffer size. Frames larger than this use the bounded
+/// large/TSO cache below. Keeping the common case at one 2 KiB DMA mapping
+/// avoids wasting 64 KiB per outstanding packet.
+const TX_SMALL_BUF_BYTES: usize = 2048;
+/// Number of maximum-sized TSO packets that can be in flight on one 64-entry
+/// ring: a 64 KiB packet consumes sixteen data descriptors plus, at most, one
+/// context descriptor, so three fit before the mandatory one-slot gap. Four
+/// gives one spare without using unbounded memory.
+const TX_LARGE_POOL_LEN: usize = 4;
 /// Largest frame the RX queue accepts.
 pub const RX_MAX_FRAME: u16 = 1522;
 /// `I40E_RXQ_CTX_DBUFF_SHIFT` — `dbuff` counts 128-byte units.
@@ -312,7 +321,17 @@ pub struct QueuePair {
     /// PF-relative queue index.
     pub pf_q: u16,
     tx_ring: DmaBuffer,
-    tx_bufs: alloc::vec::Vec<Option<DmaBuffer>>,
+    /// DMA buffers currently owned by hardware, tagged so completion knows
+    /// whether the buffer belongs to this queue's preallocated copy cache or
+    /// to a zero-copy caller.
+    tx_bufs: alloc::vec::Vec<Option<TxBuffer>>,
+    /// Queue-local normal-MTU copy buffers. `QueuePair` itself is held under
+    /// one queue lock, so pop/push uses no allocator and no extra shared lock.
+    tx_small_free: alloc::vec::Vec<DmaBuffer>,
+    /// Queue-local 64 KiB buffers for TSO and other large packets. Kept
+    /// separate from the MTU cache so a burst of TSO traffic cannot starve
+    /// normal packets or strand 64 KiB behind every small frame.
+    tx_large_free: alloc::vec::Vec<DmaBuffer>,
     tx_clean: u16,
     tx_completed: u64,
     /// Next TX descriptor to fill.
@@ -324,6 +343,22 @@ pub struct QueuePair {
     rx_discard: bool,
 }
 
+/// Ownership provenance for a TX buffer while the device may DMA from it.
+/// Only copy-path buffers were drawn from a queue-local cache; a zero-copy
+/// caller retains its own allocation policy and is dropped after completion.
+#[derive(Debug)]
+struct TxBuffer {
+    buf: DmaBuffer,
+    cache: TxCache,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TxCache {
+    Small,
+    Large,
+    External,
+}
+
 impl QueuePair {
     /// Discard descriptors only after a confirmed PF reset has stopped DMA.
     /// Returns the number of submitted packets whose completion was lost.
@@ -332,8 +367,11 @@ impl QueuePair {
     /// The caller owns the PF exclusively and has observed completed reset.
     pub(super) unsafe fn reset_after_quiesce(&mut self) -> u64 {
         let mut dropped = 0;
-        for buffer in &mut self.tx_bufs {
-            dropped += u64::from(buffer.take().is_some());
+        for slot in 0..self.tx_bufs.len() {
+            if let Some(buffer) = self.tx_bufs[slot].take() {
+                dropped += 1;
+                self.recycle_tx(buffer);
+            }
         }
         self.tx_next = 0;
         self.tx_clean = 0;
@@ -369,10 +407,31 @@ impl QueuePair {
             );
         }
 
+        // Allocate the queue-local copy caches before the queue is enabled.
+        // The normal path gets one 2 KiB buffer per TX descriptor; four 64 KiB
+        // buffers cover the maximum concurrent TSO packets that a 64-entry
+        // ring can describe. `submit` only pops/pushes these vectors.
+        let mut tx_small_free = alloc::vec::Vec::with_capacity(RING_LEN as usize);
+        for _ in 0..RING_LEN {
+            tx_small_free.push(
+                alloc_coherent(TX_SMALL_BUF_BYTES, DomainId::DRIVER_0)
+                    .map_err(|_| I40eError::NoMemory)?,
+            );
+        }
+        let mut tx_large_free = alloc::vec::Vec::with_capacity(TX_LARGE_POOL_LEN);
+        for _ in 0..TX_LARGE_POOL_LEN {
+            tx_large_free.push(
+                alloc_coherent(super::offload::MAX_TSO_BYTES, DomainId::DRIVER_0)
+                    .map_err(|_| I40eError::NoMemory)?,
+            );
+        }
+
         let pair = Self {
             pf_q,
             tx_ring,
             tx_bufs,
+            tx_small_free,
+            tx_large_free,
             tx_next: 0,
             tx_clean: 0,
             tx_completed: 0,
@@ -543,11 +602,31 @@ impl QueuePair {
             return Err(I40eError::InvalidTxHead);
         }
         while self.tx_clean != head as u16 {
-            self.tx_bufs[self.tx_clean as usize].take();
+            if let Some(buffer) = self.tx_bufs[self.tx_clean as usize].take() {
+                self.recycle_tx(buffer);
+            }
             self.tx_clean = (self.tx_clean + 1) % RING_LEN;
             self.tx_completed = self.tx_completed.wrapping_add(1);
         }
         Ok(())
+    }
+
+    /// Return a completion-owned buffer to the exact cache it came from. The
+    /// vectors were reserved and filled at queue setup, so these pushes cannot
+    /// allocate. External zero-copy frames intentionally retain their original
+    /// lifecycle and simply drop after hardware completion.
+    fn recycle_tx(&mut self, buffer: TxBuffer) {
+        match buffer.cache {
+            TxCache::Small => {
+                debug_assert!(self.tx_small_free.len() < self.tx_small_free.capacity());
+                self.tx_small_free.push(buffer.buf);
+            }
+            TxCache::Large => {
+                debug_assert!(self.tx_large_free.len() < self.tx_large_free.capacity());
+                self.tx_large_free.push(buffer.buf);
+            }
+            TxCache::External => drop(buffer.buf),
+        }
     }
 
     /// Monotonic progress avoids mistaking a full lap for a stalled head.
@@ -580,8 +659,21 @@ impl QueuePair {
         if count > free as usize {
             return Err(I40eError::TxRingFull);
         }
-        let mut buffer =
-            alloc_coherent(frame.len(), DomainId::DRIVER_0).map_err(|_| I40eError::NoMemory)?;
+        // The copy path has no allocator fallback. Empty cache is bounded
+        // backpressure, just like a full descriptor ring. The packet is either
+        // MTU-sized or a permitted TSO-sized frame (validated by `TxPlan`).
+        let (mut buffer, cache) = if frame.len() <= TX_SMALL_BUF_BYTES {
+            (
+                self.tx_small_free.pop().ok_or(I40eError::NoMemory)?,
+                TxCache::Small,
+            )
+        } else {
+            (
+                self.tx_large_free.pop().ok_or(I40eError::NoMemory)?,
+                TxCache::Large,
+            )
+        };
+        debug_assert!(buffer.len() >= frame.len());
         buffer.as_mut_slice()[..frame.len()].copy_from_slice(frame);
         plan.prepare(&mut buffer.as_mut_slice()[..frame.len()]);
         let mut slot = self.tx_next;
@@ -605,7 +697,7 @@ impl QueuePair {
                 | ((len as u64) << TXD_QW1_TX_BUF_SZ_SHIFT);
             self.write_tx(slot, buffer.dma_addr().raw() + offset as u64, qw1);
             if last {
-                self.tx_bufs[slot as usize] = Some(buffer);
+                self.tx_bufs[slot as usize] = Some(TxBuffer { buf: buffer, cache });
                 break;
             }
             slot = (slot + 1) % RING_LEN;
@@ -678,7 +770,10 @@ impl QueuePair {
                 | ((clen as u64) << TXD_QW1_TX_BUF_SZ_SHIFT);
             self.write_tx(slot, base + chunk as u64, qw1);
             if last {
-                self.tx_bufs[slot as usize] = Some(buffer);
+                self.tx_bufs[slot as usize] = Some(TxBuffer {
+                    buf: buffer,
+                    cache: TxCache::External,
+                });
                 break;
             }
             slot = (slot + 1) % RING_LEN;
@@ -1067,6 +1162,37 @@ pub(super) mod runtime_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/i40e", smoke_i40e_tx_credit_and_bad_head);
+
+    fn smoke_i40e_copy_tx_reuses_queue_local_dma() -> TestResult {
+        let (_memory, csr) = fake_csr();
+        let mut queue = QueuePair::alloc(0).unwrap();
+        let packet = super::super::tests::tcp_packet(false, 10);
+        let free_before = queue.tx_small_free.len();
+
+        // SAFETY: test-owned simulated queue.
+        unsafe { queue.submit(&csr, &packet, TxMeta::plain()).unwrap() };
+        let first_phys = descriptor(&queue, 0).0;
+        if queue.tx_small_free.len() + 1 != free_before {
+            return TestResult::Fail("copy submit did not consume a prepared TX buffer");
+        }
+        complete(&queue, 1);
+        queue.reclaim().unwrap();
+        if queue.tx_small_free.len() != free_before {
+            return TestResult::Fail("TX completion did not return the prepared buffer");
+        }
+
+        // SAFETY: test-owned simulated queue. The LIFO cache must give the
+        // just-completed DMA storage back rather than allocate a replacement.
+        unsafe { queue.submit(&csr, &packet, TxMeta::plain()).unwrap() };
+        if descriptor(&queue, 1).0 != first_phys {
+            return TestResult::Fail("copy submit did not reuse queue-local DMA storage");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/i40e",
+        smoke_i40e_copy_tx_reuses_queue_local_dma
+    );
 
     fn smoke_i40e_submit_frame_zero_copy() -> TestResult {
         let (_memory, csr) = fake_csr();

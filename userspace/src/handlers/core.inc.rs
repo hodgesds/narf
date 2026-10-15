@@ -43,23 +43,50 @@ pub fn register_signal_waker(task_id: u64, waker: core::task::Waker) {
     }
 }
 
+/// Does a signal wake end a park with this `deadline` / `sigwait_set` now?
+/// A deliverable signal ends any interruptible sleep. Any wake ends an
+/// infinite wait (its park re-checks and re-parks if nothing is due) and a
+/// sigwait park (a just-queued in-set signal completes rt_sigtimedwait
+/// whatever its timeout). A non-deliverable wake leaves a timed sleep to
+/// run to its deadline.
+#[inline]
+fn signal_wake_cuts_deadline(deadline: u64, sigwait_set: u64, deliverable: bool) -> bool {
+    deliverable || deadline == u64::MAX || sigwait_set != 0
+}
+
+#[doc(hidden)]
+pub fn __test_signal_wake_cuts_deadline(deadline: u64, sigwait_set: u64, deliverable: bool) -> bool {
+    signal_wake_cuts_deadline(deadline, sigwait_set, deliverable)
+}
+
+/// Wake `task_id` for a signal-state change that is NOT known to be a signal
+/// it can take: a thread-directed raise it blocks, a job-control stop or
+/// continue, a ptrace resume, a vfork release. See [`signal_wake_up`].
 pub fn wake_signal(task_id: u64) {
+    signal_wake_up(task_id, false);
+}
+
+/// Linux `signal_wake_up`: fire `task_id`'s signal waker so its park loop
+/// re-checks its wait condition now.
+///
+/// `deliverable` says the wake is for a signal the thread can take
+/// (`wants_signal`: not blocked, or in its sigwait set; an ignored signal was
+/// already discarded at generation). Only such a wake reaches Linux's
+/// `signal_wake_up`, and it ends ANY `TASK_INTERRUPTIBLE` sleep, a timed
+/// one included — the syscall then returns its -EINTR / -ERESTART* as it
+/// defines. So it clears the park deadline outright, as the io-waiter wake
+/// `wake_one` does. Every other wake leaves a finite deadline alone: the
+/// park loop re-parks on a blocked signal, and a timed sleep runs to its
+/// deadline. Every sleeper keeps its absolute deadline outside
+/// `sleep_deadline_ns` (`blocking_deadline_ns`, its own restart record, a
+/// local), so a cleared deadline never re-arms a fresh full timeout.
+pub(crate) fn signal_wake_up(task_id: u64, deliverable: bool) {
     // Deref the ctx UNDER the registry lock (see `with_user_task_ctx`) so a
     // concurrent task-exit + box-drop on another CPU can't free it mid-deref.
     let sem_wait = crate::user_task::with_user_task_ctx(task_id, |uctx| {
-        // Clear the park deadline so the woken task re-executes its syscall (and
-        // re-checks the signal) NOW instead of sleeping to the ~1-tick wheel
-        // backstop. Two cases, mirroring the io-waiter wake `wake_one`:
-        //   * an infinite wait (pause / sigwaitinfo(NULL) / epoll_wait) — always;
-        //   * a task parked in sigwait with a FINITE timeout (rt_sigtimedwait,
-        //     sigwait_set != 0) — a just-queued in-set signal must complete the
-        //     wait immediately (Linux signal_wake_up), not at the timeout.
-        // A finite deadline on a NON-sigwait sleeper (nanosleep) is left intact:
-        // a blocked/ignored signal must not cut a timed sleep short (Linux only
-        // interrupts on a *deliverable* signal, handled on the re-executed
-        // syscall's return, not here).
         let deadline = uctx.sleep_deadline_ns.load(Ordering::Acquire);
-        if deadline == u64::MAX || uctx.sigwait_set.load(Ordering::Acquire) != 0 {
+        let sigwait_set = uctx.sigwait_set.load(Ordering::Acquire);
+        if signal_wake_cuts_deadline(deadline, sigwait_set, deliverable) {
             uctx.sleep_deadline_ns.store(0, Ordering::Release);
         }
         uctx.sem_wait_pending.load(Ordering::Acquire).then(|| {
@@ -2495,18 +2522,52 @@ fn resume_fifo_open(ctx: &mut dyn TrapContext, fd: u32) {
 /// Release the cross-execution park state of a restart-pending syscall
 /// whose signal delivery just completed it as -EINTR (see
 /// `default_signal_delivery_restart_pending`): the re-execution that would
-/// normally re-check/unwind that state never happens. Today the only park
-/// state that deliberately persists across re-executions is the FIFO
-/// open's pre-installed fd — remove it so its open count stops
-/// advertising a phantom endpoint to the peer rendezvous. Also drops the
-/// restart marker: the syscall is complete.
+/// normally re-check/unwind that state never happens, so everything a park
+/// keeps across its re-executions goes here: the FIFO open's pre-installed
+/// fd (whose open count would otherwise advertise a phantom endpoint to the
+/// peer rendezvous), the timed waits' persisted deadline and restart
+/// records, and poll/select's entry-time state — select also writes back
+/// its remaining time, as `poll_select_finish` does for -ERESTARTNOHAND.
+/// Also drops the restart marker: the syscall is complete.
 pub(crate) fn abort_restart_pending_park_state(task: u64) {
     if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: the in-flight task's poller-pinned ctx, live for this trap.
+        let uc = unsafe { &*uctx };
+        let deadline = uc
+            .blocking_deadline_ns
+            .load(core::sync::atomic::Ordering::Acquire);
+        crate::select::abort_interrupted(task, (deadline != 0).then_some(deadline));
+        crate::poll::abort_interrupted(task, uc);
         // SAFETY: the in-flight task's poller-pinned ctx; atomics only.
         let pending = unsafe {
             (*uctx)
                 .syscall_parked_restarting
                 .store(false, core::sync::atomic::Ordering::Release);
+            (*uctx).syscall_restart_kind.store(
+                crate::user_task::SYSCALL_RESTART_SYS,
+                core::sync::atomic::Ordering::Release,
+            );
+            // A timed FUTEX_WAIT completed as -EINTR: its restart_block
+            // (`futex_wait_restart`) will never run.
+            (*uctx)
+                .futex_restart_uaddr
+                .store(0, core::sync::atomic::Ordering::Release);
+            // Likewise a relative nanosleep's (`hrtimer_nanosleep_restart`).
+            (*uctx)
+                .nanosleep_restart_req
+                .store(0, core::sync::atomic::Ordering::Release);
+            // The call is over, so the deadline poll/select/epoll_wait (and
+            // the other timed waits) keep across their re-executions in
+            // `blocking_deadline_ns` must go with it. Left behind, the NEXT
+            // timed call took it as its own: a fresh 300 ms poll after an
+            // interrupted 5 s one slept the old call's remaining ~4.7 s, and
+            // a fresh 2 s poll after an interrupted one timed out early.
+            (*uctx)
+                .blocking_deadline_ns
+                .store(0, core::sync::atomic::Ordering::Release);
+            (*uctx)
+                .sleep_deadline_ns
+                .store(0, core::sync::atomic::Ordering::Release);
             (*uctx)
                 .fifo_open_pending_fd
                 .swap(0, core::sync::atomic::Ordering::AcqRel)
@@ -3512,8 +3573,21 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     // further (`nd_jump_link`): an O_PATH|O_NOFOLLOW fd on a symlink stats as
     // that symlink. Following on from the jump chased /etc/localtime to its
     // target and missed with ENOENT.
+    //
+    // A walk anchored outside the caller's root (a dirfd opened before a later
+    // chroot, e.g. Chromium's `/proc` fd) has no caller-view spelling, so its
+    // magic-link form is read from where it lies inside the covering procfs
+    // mount. A descriptor whose file the root no longer reaches cannot be
+    // re-walked by path either; `nd_jump_link` lands on the open file, so
+    // stat the descriptor itself.
+    let anchored_proc_view = anchored_procfs_view(raw);
+    let magic_src = anchored_proc_view.as_deref().unwrap_or(raw);
     let magic_owned;
-    let raw: &str = if let Some(n) = parse_proc_self_fd(raw).filter(|_| follow_final) {
+    let raw: &str = if let Some(n) = parse_proc_self_fd(magic_src).filter(|_| follow_final) {
+        if anchored_proc_view.is_some() || !fd_file_within_root(task, n) {
+            stat_linux_fd(ctx, n, out_ptr);
+            return;
+        }
         match fd_path_for_task(task, n).filter(|p| p.starts_with('/')) {
             // A descriptor with a real filesystem path: stat that node. The
             // path is the fd's view (chroot-stripped), so it goes back through
@@ -4942,10 +5016,37 @@ fn validate_rw_user_range(ptr: u64, len: usize) -> Result<(), u64> {
 ///
 /// So `pread(fd, buf, 10, INT64_MAX - 5)` is -EINVAL, not a 0-byte EOF.
 fn rw_verify_area_pos(pos: u64, count: usize) -> Result<(), i64> {
-    if count > isize::MAX as usize
-        || (pos as i64) < 0
-        || (pos as i64).checked_add(count as i64).is_none()
-    {
+    rw_verify_area_pos_mode(pos, count, false)
+}
+
+/// [`rw_verify_area_pos`] for a specific open file, honouring Linux's
+/// `unsigned_offsets(file)` (`FOP_UNSIGNED_OFFSET`, e.g. `/proc/<pid>/mem`):
+///
+/// ```text
+///   if (unlikely(pos < 0)) {
+///           if (!unsigned_offsets(file)) return -EINVAL;
+///           if (count >= -pos) return -EOVERFLOW;   /* both in 0..LLONG_MAX */
+///   } else if (unlikely((loff_t) (pos + count) < 0)) {
+///           if (!unsigned_offsets(file)) return -EINVAL;
+///   }
+/// ```
+fn rw_verify_area_file(ops: &dyn narf_filesystem::FileOps, pos: u64, count: usize) -> Result<(), i64> {
+    rw_verify_area_pos_mode(pos, count, ops.unsigned_offsets())
+}
+
+fn rw_verify_area_pos_mode(pos: u64, count: usize, unsigned_offsets: bool) -> Result<(), i64> {
+    if count > isize::MAX as usize {
+        return Err(EINVAL);
+    }
+    if unsigned_offsets {
+        // `-pos` of LLONG_MIN wraps to 2^63 under -fno-strict-overflow,
+        // which no admitted count reaches.
+        if (pos as i64) < 0 && count as u64 >= (pos as i64).wrapping_neg() as u64 {
+            return Err(EOVERFLOW);
+        }
+        return Ok(());
+    }
+    if (pos as i64) < 0 || (pos as i64).checked_add(count as i64).is_none() {
         return Err(EINVAL);
     }
     Ok(())
@@ -8470,13 +8571,23 @@ pub(crate) fn utimes_read_timeval(tv_ptr: u64) -> Result<UtimesSpec, i64> {
 
 // ── pkey_alloc / pkey_free / pkey_mprotect ───────────────────────────
 //
-// Memory-protection keys. NARF tracks an allocation bitmap per task
-// (keys 1..=15; key 0 is the always-present default) so alloc/free
-// round-trip and pkey_mprotect can validate its key argument, but the
-// keys are not enforced in hardware (no PKRU wiring yet) — pkey_mprotect
-// applies the requested prot exactly like mprotect.
+// Memory-protection keys. The allocation bitmap (keys 1..=15; key 0 is the
+// always-present default) belongs to the address space, as Linux's
+// `mm->context.pkey_allocation_map` does: every thread of a process sees the
+// keys any of them allocated, fork copies the map (`arch_dup_pkeys`), and
+// exec starts a new address space with only key 0. Keyed per thread, a key
+// allocated on one thread was EINVAL to `pkey_mprotect` on another, which
+// aborted every Chromium child process (PartitionAlloc / V8 thread
+// isolation allocate on one thread and tag pages on another).
+//
+// LINUX-GAP: the PKRU instruction state is saved/restored by the scheduler,
+// but these syscalls do not yet encode the selected key into user PTEs;
+// pkey_mprotect therefore applies the requested prot exactly like mprotect,
+// and an allocated key restricts nothing.
 
-/// Per-task allocated-pkey bitmap (bit k set ⇒ key k is allocated).
+/// Allocated-pkey bitmap per address space (bit k set ⇒ key k allocated).
+/// Keys are `AddressSpace::identity()`, or `PKEY_NO_MM | task` for a task
+/// with no address space installed (kernel-test fixtures only).
 static PKEY_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<alloc::collections::BTreeMap<u64, u16>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
@@ -8490,16 +8601,50 @@ pub fn pkey_init() {
     *PKEY_TABLE.lock() = None;
 }
 
-// ── process_vm_readv / process_vm_writev ─────────────────────────────
-//
-// Bulk gather/scatter copy between the caller and a target process's
-// address space. NARF has no cross-address-space copy primitive yet, so
-// this supports transfers where the target resolves to the *same*
-// address space as the caller (pid == self, or a CLONE_VM thread) —
-// which still fully exercises the iovec machinery and is a valid Linux
-// self-copy. A different address space returns EPERM.
+/// Disjoint key space for a task with no address space installed.
+const PKEY_NO_MM: u64 = 1 << 63;
 
-const PROCESS_VM_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// The `PKEY_TABLE` key the calling task's pkey syscalls use: its mm.
+pub(crate) fn pkey_mm_key() -> u64 {
+    current_address_space().map_or(PKEY_NO_MM | current_task_id(), |a| a.identity())
+}
+
+/// `arch_dup_pkeys`: a forked address space inherits its parent's allocated
+/// keys.
+pub fn fork_address_space_pkeys(parent_id: u64, child_id: u64) {
+    let mut g = PKEY_TABLE.lock();
+    if let Some(m) = g.as_mut() {
+        if let Some(bits) = m.get(&parent_id).copied() {
+            m.insert(child_id, bits);
+        }
+    }
+}
+
+/// Kernel-test seam: set the pkey bitmap of an address-space key.
+#[doc(hidden)]
+pub fn __test_pkey_set(mm: u64, bits: u16) {
+    PKEY_TABLE
+        .lock()
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(mm, bits);
+}
+
+/// Kernel-test seam: read the pkey bitmap of an address-space key.
+#[doc(hidden)]
+pub fn __test_pkey_get(mm: u64) -> Option<u16> {
+    PKEY_TABLE.lock().as_ref().and_then(|m| m.get(&mm).copied())
+}
+
+/// The allocation map dies with its address space.
+pub fn drop_address_space_pkeys(address_space_id: u64) {
+    if let Some(m) = PKEY_TABLE.lock().as_mut() {
+        m.remove(&address_space_id);
+    }
+}
+
+// ── iovec / mm helpers shared by process_madvise and migrate_pages ───
+//
+// process_vm_readv / process_vm_writev live in `remote_vm.rs`.
 
 /// Read `count` `struct iovec { void *base; size_t len; }` (16 B each).
 fn read_iovecs(arr_ptr: u64, count: usize) -> Option<alloc::vec::Vec<(u64, u64)>> {
@@ -8550,113 +8695,6 @@ pub(crate) fn resolve_mm_target(caller: u64, pid: i32) -> Result<(), i64> {
         return Err(EPERM);
     }
     Ok(())
-}
-
-/// Shared core for process_vm_readv / process_vm_writev. `is_write`
-/// selects the direction: false copies remote→local (readv), true
-/// copies local→remote (writev). Both sides live in the same AS here.
-fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
-    let a = *ctx.args();
-    let pid = a.arg0 as i32;
-    let local_ptr = a.arg1;
-    let liovcnt = a.arg2 as usize;
-    let remote_ptr = a.arg3;
-    let riovcnt = a.arg4 as usize;
-    let flags = a.arg5;
-    // `process_vm_rw` (mm/process_vm_access.c:269-284): flags, then the local
-    // iovec import (more than UIO_MAXIOV segments is -EINVAL, a fault
-    // -EFAULT), an empty local iovec returns 0, then the remote iovec array.
-    if flags != 0 || liovcnt > 1024 {
-        ctx.set_return(errno_ret(EINVAL));
-        return;
-    }
-    let Some(local) = read_iovecs(local_ptr, liovcnt) else {
-        ctx.set_return(errno_ret(EFAULT));
-        return;
-    };
-    if local.iter().all(|&(_, len)| len == 0) {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    if riovcnt > 1024 {
-        ctx.set_return(errno_ret(EINVAL));
-        return;
-    }
-    let Some(remote) = read_iovecs(remote_ptr, riovcnt) else {
-        ctx.set_return(errno_ret(EFAULT));
-        return;
-    };
-    // `process_vm_rw_core`: no remote pages → 0 before the task lookup.
-    if remote.iter().all(|&(_, len)| len == 0) {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    // `find_get_task_by_vpid(pid)` (:197): any thread in the caller's pid
-    // namespace, a non-leader's tid included; 0 names no task here (there is
-    // no `current` shortcut) — -ESRCH. Then `mm_access`: a task sharing the
-    // caller's mm needs no credential check; otherwise ptrace_may_access, and
-    // the -EACCES it yields is reported as -EPERM.
-    let caller = current_task_id();
-    let Some(target) = find_task_by_vpid(caller, pid) else {
-        ctx.set_return(errno_ret(ESRCH));
-        return;
-    };
-    // LINUX-GAP: both sides must live in the caller's address space; a
-    // foreign mm is refused with -EPERM even when ptrace_may_access allows it.
-    if !shares_mm(caller, target) {
-        ctx.set_return(errno_ret(EPERM));
-        return;
-    }
-    if current_address_space().is_none() {
-        ctx.set_return(errno_ret(EFAULT));
-        return;
-    }
-    let (src, dst) = if is_write {
-        (&local, &remote)
-    } else {
-        (&remote, &local)
-    };
-
-    let src_total: u64 = src.iter().map(|(_, l)| *l).sum();
-    let dst_total: u64 = dst.iter().map(|(_, l)| *l).sum();
-    let xfer = src_total.min(dst_total).min(PROCESS_VM_MAX_BYTES as u64) as usize;
-
-    // Gather `xfer` bytes from the source segments.
-    let mut buf = alloc::vec::Vec::with_capacity(xfer);
-    let mut remaining = xfer;
-    for &(base, len) in src {
-        if remaining == 0 {
-            break;
-        }
-        let take = (len as usize).min(remaining);
-        // SAFETY: `base` is a user address in the (current) AS; copy_from_user_vec
-        // range-validates and SMAP-brackets the read.
-        match unsafe { copy_from_user_vec(base, take) } {
-            Ok(chunk) => buf.extend_from_slice(&chunk),
-            Err(_) => {
-                ctx.set_return(errno_ret(EFAULT)); // EFAULT
-                return;
-            }
-        }
-        remaining -= take;
-    }
-
-    // Scatter into the destination segments.
-    let mut off = 0usize;
-    for &(base, len) in dst {
-        if off >= buf.len() {
-            break;
-        }
-        let take = (len as usize).min(buf.len() - off);
-        // SAFETY: `base` is a user address in the (current) AS; copy_to_user
-        // range-validates and SMAP-brackets the write.
-        if unsafe { copy_to_user(base, &buf[off..off + take]) }.is_err() {
-            ctx.set_return(errno_ret(EFAULT)); // EFAULT
-            return;
-        }
-        off += take;
-    }
-    ctx.set_return(SyscallReturn::ok(off as u64));
 }
 
 // ── NUMA memory policy: set_mempolicy / get_mempolicy / mbind ─────────
@@ -9792,7 +9830,7 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
         Some(pos)
     };
     if let Some(verify_pos) = verify_pos {
-        if let Err(errno) = rw_verify_area_pos(verify_pos, count) {
+        if let Err(errno) = rw_verify_area_file(endpoint.ops.as_ref(), verify_pos, count) {
             ctx.set_return(errno_ret(errno));
             return;
         }
@@ -10336,8 +10374,8 @@ fn mprotect_errno(error: narf_memory::AddressSpaceError) -> i64 {
 /// userspace (Linux parity, so glibc/malloc can branch on the exact code):
 ///   - **ENOMEM (12)** — the request covers an empty or gapped range
 ///     (`mprotect_range`/`jit_mprotect`/`change_perms_range`'s error).
-///   - **EACCES (13)** — a W^X denial (`DenyWX`/`DenyXtoWX`) or a
-///     JIT-gated RW→RX flip the caller has no JIT capability for.
+///   - **EACCES (13)** — an MDWE refusal, or a JIT-gated transition (the
+///     RW→RX flip or a W|X end state) the caller has no JIT capability for.
 ///   - **EINVAL (22)** — a split off a huge-page boundary
 ///     (`mprotect_errno`).
 fn mprotect_core(
@@ -10363,17 +10401,13 @@ fn mprotect_core(
     // region cleanly when the request covers only a slice; the legacy
     // `change_perms_range` is whole-region only.
     {
-        // W^X. `CapKind::Jit` gates the **RW → RX flip** — the transition
-        // `wx.rs` has described as the JIT exception since it was written —
-        // and *nothing* grants a W|X end state.
-        //
-        // This used to be the other way round: the cap was demanded only when
-        // the request contained W|X, which made `CAP_JIT` a licence to create
-        // a genuinely RWX mapping (something NARF had previously made
-        // impossible) while leaving the flip it exists for ungated. Since a
-        // task that can write a page and then make it executable has the same
-        // power as one holding RWX, gating the flip is what actually buys
-        // anything.
+        // W^X. `CapKind::Jit` gates both JIT shapes: the **RW → RX flip**
+        // (SpiderMonkey) and a **W|X end state** (V8 makes its whole code
+        // range RWX with one `pkey_mprotect` and CHECK-fails on anything but
+        // ENOMEM). A task that can write a page and then make it executable
+        // has the same power as one holding RWX, so the two take the same
+        // capability. Linux grants both unless MDWE is set, which is checked
+        // first below.
         //
         // Classified before any mutation so a capability-gated request is
         // never partially applied by the ungated path first.
@@ -10399,15 +10433,11 @@ fn mprotect_core(
         //             break;
         //     }
         //
-        // MDWE sits ABOVE the W^X policy below rather than duplicating it.
-        // NARF already refuses a W|X end state outright, which is stricter
-        // than Linux, so the only thing MDWE adds here is the second denial
-        // arm: a mapping that is not currently executable may not BECOME
-        // executable, even via the CAP_JIT-gated RW->RX flip that policy
-        // otherwise permits. That is the arm the feature exists for — a
-        // process that can write a page and then mark it executable has the
-        // same power as one holding RWX, so a sandbox that asked for MDWE and
-        // still got the flip was told it was protected when it was not.
+        // MDWE sits ABOVE the W^X policy below and refuses both JIT shapes
+        // the JIT capability would otherwise permit: a W|X end state, and a
+        // mapping that is not currently executable BECOMING executable (the
+        // RW->RX flip). A sandbox that asked for MDWE and still got either
+        // was told it was protected when it was not.
         //
         // Checked over every intersecting region, like the classification
         // below, so a range crossing one already-executable and one
@@ -10501,6 +10531,10 @@ pub(crate) fn terminate_current_task(
     signum: u32,
     core_dumped: bool,
 ) {
+    // A fatal signal is `do_group_exit(signum)` → `do_exit`: the tracer's
+    // PTRACE_EVENT_EXIT stop comes first (skipped for SIGKILL, see
+    // `ptrace_report_exit`).
+    crate::ptrace::ptrace_report_exit(ctx, encode_signaled_status(signum, core_dumped));
     let pid = task_to_pid_raw(task).unwrap_or(task);
     #[cfg(feature = "syscall-trace")]
     if crate::syscall::syscall_trace_target_task() {
@@ -10637,7 +10671,7 @@ pub(crate) fn zap_thread_group(tid: u64, pid: u64) {
         .collect();
     for s in siblings {
         raise_signal_pending(s, 9); // SIGKILL
-        wake_signal(s);
+        signal_wake_up(s, true);
     }
 }
 
@@ -10715,7 +10749,7 @@ fn maybe_deliver_signal_before_yield(ctx: &mut dyn TrapContext, syscall_no: u32)
 //                    TID is a fresh scheduler TaskId. Without this
 //                    bit the child is treated as a process (fresh
 //                    ProcessId allocation).
-//   - CLONE_FS       cwd table shared (skip cwd_fork).
+//   - CLONE_FS       root + cwd shared (`fs_fork`).
 //   - CLONE_FILES    fd table shared (skip fd::fork).
 //   - CLONE_SIGHAND  sigaction table shared (skip sigaction_fork).
 //   - CLONE_SETTLS   args.tls programmed into the architecture's user TLS
@@ -11758,6 +11792,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // owner reference keyed to a process that has already been reaped.
     if !share_vm {
         crate::mapped_file::fork_address_space(parent_as.identity(), child_as.identity());
+        fork_address_space_pkeys(parent_as.identity(), child_as.identity());
         // A child with its OWN mm carries copies of the parent's mbind range
         // policies (`dup_mmap` -> `vma_dup_policy`). A CLONE_VM child shares
         // the address space, and therefore the ranges, already.
@@ -11996,15 +12031,18 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     sid_fork(parent_pid, child_tid.raw());
     ctty_fork(parent_pid, child_tid.raw());
 
-    if !share_fs {
-        cwd_fork(parent_pid, child_tid.raw());
-        personality_fork(parent_pid, child_tid.raw());
-    }
-    // chroot: a child inherits the parent's root directory (Linux copies
-    // fs->root on fork). Without this, a process exec'd inside a chroot
-    // can't fork+exec further binaries from the chrooted rootfs — the
-    // child resolves the host root instead, breaking containers.
-    root_dir_fork(parent_pid, child_tid.raw());
+    // `copy_fs`: CLONE_FS shares the parent's root + cwd (a chdir or chroot
+    // by either is seen by both); otherwise the child gets a copy. Without
+    // the copy, a process exec'd inside a chroot couldn't fork+exec further
+    // binaries from the chrooted rootfs.
+    fs_fork(parent_pid, child_tid.raw(), share_fs);
+    // `personality` lives in task_struct, which `copy_process` duplicates for
+    // every child regardless of CLONE_FS.
+    personality_fork(parent_pid, child_tid.raw());
+    // no_new_privs, securebits and dumpable: see `prctl_fork`.
+    prctl_fork(parent_pid, child_tid.raw());
+    // `copy_seccomp`: every child shares its parent's filter chain.
+    crate::seccomp::fork(parent_pid, child_tid.raw());
     // Credentials (uid/gid/euid/...) are copied to the child so a parent
     // that dropped privilege stays dropped across fork/clone; a root
     // parent stays root. Keyed by task id, so copy unconditionally.
@@ -12164,8 +12202,13 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     if !share_thread {
         shm_fork_process(&parent_as, &child_as, child_visible_pid, share_vm);
     }
+    // ptrace auto-attach (TRACEFORK/VFORK/CLONE or CLONE_PTRACE) before the
+    // child can run; the parent's event stop after it is running.
+    let ptrace_trace =
+        crate::ptrace::attach_new_child(parent_pid, child_tid.raw(), flags, ca.exit_signal);
     pending_child.spawn();
     ctx.set_return(SyscallReturn::ok(ret_val));
+    crate::ptrace::report_clone_event(ctx, ptrace_trace, child_tid.raw(), ret_val);
 
     // CLONE_VFORK: suspend the parent here until the child execs or exits
     // (Linux TASK_KILLABLE). The child holds the shared address space; letting
@@ -12236,6 +12279,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
                 }
             }
         }
+        // `if (!wait_for_vfork_done(p, &vfork)) ptrace_event_pid(
+        // PTRACE_EVENT_VFORK_DONE, pid);` — a no-op unless traced with
+        // PTRACE_O_TRACEVFORKDONE.
+        crate::ptrace::report_vfork_done(ctx, child_tid.raw(), ret_val);
     }
 }
 
@@ -12888,9 +12935,81 @@ fn reap_pending_exit(
         }) else {
             continue;
         };
-        return if peek { Some(q[idx]) } else { Some(q.remove(idx)) };
+        if peek {
+            return Some(q[idx]);
+        }
+        let entry = q.remove(idx);
+        drop(shard);
+        if entry.ptraced {
+            hand_back_traced_zombie(parents, entry);
+        }
+        return Some(entry);
     }
     None
+}
+
+/// Zombies a tracer reaped on behalf of a real parent that still has to see
+/// them: their pid, task and parent link stay alive for that second wait.
+static HANDED_BACK: narf_lib::sync::IrqSafeSpinLock<BTreeMap<u64, ()>> =
+    narf_lib::sync::IrqSafeSpinLock::new(BTreeMap::new());
+
+/// `wait_task_zombie`, a tracer reaping a traced zombie it did not create:
+///
+/// ```text
+/// if (ptrace) {
+///         ...
+///         __ptrace_unlink(p);
+///         /* If parent wants a zombie, don't release it now. */
+///         state = EXIT_ZOMBIE;
+///         if (do_notify_parent(p, p->exit_signal))
+///                 state = EXIT_DEAD;
+/// }
+/// ```
+///
+/// The tracer's wait returns the status, and the zombie goes back to its real
+/// parent with a fresh exit notification. Without this a traced child's exit
+/// was consumed by the tracer alone: `strace -f` of a program that waits for
+/// its own children hung that program in waitpid forever.
+///
+/// A CLONE_THREAD tracee has no real parent link and is released as before;
+/// a tracer that is also the real parent (in the waiting thread group) gets
+/// the single notification it already had.
+fn hand_back_traced_zombie(reaper: &WaitParentIds, entry: PendingExit) {
+    let child = entry.child_pid;
+    let Some(link) = child_link_get(child) else {
+        return;
+    };
+    if reaper.contains(link.parent) {
+        return;
+    }
+    HANDED_BACK.lock().insert(child, ());
+    {
+        let mut g = PENDING_EXITS[pending_exit_shard(link.parent)].map.lock();
+        if let Some(m) = g.as_mut() {
+            m.entry(link.parent).or_default().push(PendingExit {
+                child_pid: child,
+                status: entry.status,
+                exit_signal: link.exit_signal,
+                ptraced: false,
+            });
+        }
+    }
+    if link.exit_signal != 0 {
+        let _ = raise_group_signal(
+            link.parent,
+            u32::from(link.exit_signal),
+            GroupSigInfo::Queued(sigchld_exit_info(link.parent, child, entry.status)),
+        );
+        narf_net::readiness::notify(0);
+    }
+    wake_wait_child_group(link.parent);
+}
+
+/// After a reap: was this zombie handed back to its real parent by
+/// [`hand_back_traced_zombie`]? Then the tracer's reap must not release its
+/// pid, task or parent link — the real parent's wait will.
+pub(crate) fn take_handed_back(child_pid: u64) -> bool {
+    HANDED_BACK.lock().remove(&child_pid).is_some()
 }
 
 fn reap_stopcont(
@@ -13172,7 +13291,7 @@ pub(crate) fn complete_group_signal(target: u64, signum: u32) {
         found
     };
     if let Some(t) = chosen {
-        wake_signal(t);
+        signal_wake_up(t, true);
         narf_scheduler::kick_task(t);
     }
 }
@@ -13195,7 +13314,7 @@ pub(crate) fn retarget_shared_pending(task: u64, newly_unwanted: u64) {
             .copied()
             .find(|&t| t != task && wants_signal(t, signum))
         {
-            wake_signal(t);
+            signal_wake_up(t, true);
             narf_scheduler::kick_task(t);
         }
     }
@@ -13290,11 +13409,22 @@ pub fn deliver_pending_stop(ctx: &mut dyn TrapContext, _syscall_no: u32) -> bool
 /// pushes the encoded status into PENDING_EXITS so wait4 sees
 /// `WIFSIGNALED + WTERMSIG(signum)`.
 ///
-/// Absent entry → on_child_exit records `0` (normal exit), which is
-/// what sys_exit_task callers want today (exit-code threading is a
-/// separate follow-on).
-static PENDING_TERMINATION: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, i32>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// Absent entry → on_child_exit records `0` (normal exit).
+///
+/// Each entry also records whether it is a GROUP status. Linux
+/// `wait_task_zombie` reports `signal->group_exit_code` once the group exited
+/// as a whole (`SIGNAL_GROUP_EXIT`: exit_group, a fatal signal) and otherwise
+/// the leader's own `exit_code`; a non-leader thread's exit(2) code is never
+/// reported.
+static PENDING_TERMINATION: narf_lib::sync::IrqSafeSpinLock<
+    Option<BTreeMap<u64, PendingTermination>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+#[derive(Clone, Copy)]
+struct PendingTermination {
+    status: i32,
+    group: bool,
+}
 
 pub fn wait_init() {
     // Once per boot: wait_init runs again on every test reset, and the pump
@@ -13454,12 +13584,13 @@ pub fn encode_signaled_status(signum: u32, core_dumped: bool) -> i32 {
     lo | core
 }
 
-/// Stage a signal-induced termination status for `task`. The exit
-/// observer drains this when the task transitions to Exited and
-/// uses it as the wstatus reported to wait4. Idempotent: if a
-/// status is already staged (e.g. SIGSEGV racing SIGTERM), the
-/// first one wins — that's the signal that actually killed the
-/// task.
+/// Stage the GROUP termination status for process `task` (exit_group, a
+/// fatal signal, a scheduler kill) — Linux `do_group_exit`'s
+/// `group_exit_code`. The exit observer drains it when the last thread exits
+/// and reports it to wait4. The first group exit wins (SIGSEGV racing
+/// SIGTERM: the signal that actually killed the task; a second exit_group
+/// while one is in flight reuses the first code), and it replaces any status
+/// a thread's plain exit(2) staged earlier.
 pub fn stage_pending_termination(task: u64, status: i32) {
     // A CLONE_VFORK child that exits WITHOUT exec'ing (e.g. posix_spawn's child
     // _exit on exec failure, or a kill) must still release the parent suspended
@@ -13470,13 +13601,34 @@ pub fn stage_pending_termination(task: u64, status: i32) {
     vfork_child_release(task);
     let mut g = PENDING_TERMINATION.lock();
     if let Some(m) = g.as_mut() {
-        m.entry(task).or_insert(status);
+        let slot = m.entry(task).or_insert(PendingTermination { status, group: true });
+        if !slot.group {
+            *slot = PendingTermination { status, group: true };
+        }
+    }
+}
+
+/// Stage a thread's plain exit(2) code for process `pid`. Only the group
+/// leader's code can become the process status (`wait_task_zombie` reads the
+/// leader's `exit_code` when no group exit happened), and never over a group
+/// status. Recording every thread's code — first one wins — reported a
+/// worker thread's `exit(0)` as the status of a process that then called
+/// `_exit(1)`.
+pub(crate) fn stage_thread_exit_termination(pid: u64, tid: u64, status: i32) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    vfork_child_release(pid);
+    if pid_to_task_raw(pid).is_some_and(|leader| leader != tid) {
+        return;
+    }
+    let mut g = PENDING_TERMINATION.lock();
+    if let Some(m) = g.as_mut() {
+        m.entry(pid).or_insert(PendingTermination { status, group: false });
     }
 }
 
 fn take_pending_termination(task: u64) -> Option<i32> {
     let mut g = PENDING_TERMINATION.lock();
-    g.as_mut().and_then(|m| m.remove(&task))
+    g.as_mut().and_then(|m| m.remove(&task)).map(|t| t.status)
 }
 
 /// Stage a SIGKILL wstatus for a task the SCHEDULER destroyed without
@@ -13646,7 +13798,7 @@ pub(crate) fn finish_wait_child(
             reaped_visible as u64
         }
     };
-    if is_terminal && !peek {
+    if is_terminal && !peek && !take_handed_back(child_pid) {
         // The exit was consumed before the user copies. Always finish the reap,
         // including on EFAULT, but only after namespace-visible PID reporting.
         release_reaped_task(child_pid);
@@ -13796,6 +13948,12 @@ pub(crate) fn own_stack_block(ctx: &mut dyn TrapContext) {
             (*uctx)
                 .syscall_parked_restarting
                 .store(true, core::sync::atomic::Ordering::Release);
+            // A fresh park is `-ERESTARTSYS` until its handler says
+            // otherwise (after this returns), so no kind outlives one park.
+            (*uctx).syscall_restart_kind.store(
+                crate::user_task::SYSCALL_RESTART_SYS,
+                core::sync::atomic::Ordering::Release,
+            );
             (*uctx)
                 .wait_child_pending
                 .load(core::sync::atomic::Ordering::Acquire)
@@ -13939,6 +14097,33 @@ pub(crate) fn park_reexecute_on_fd_until(
             parked
         }
         None => park_reexecute_on_io(ctx),
+    }
+}
+
+/// Continue a syscall in place after [`park_reexecute_on_fd_until`] returned
+/// `true`.  That return means the park has already ended on this task's own
+/// stack (or the descriptor was ready at arm time), with RIP still rewound
+/// onto the syscall instruction.  Undo the rewind and drop the
+/// restart-pending marker so the handler can keep its local progress and
+/// finish with a real return value.  The exit trap then sees a completed
+/// frame: a signal that arrived during the park is delivered over that
+/// result instead of turning the frame into `-EINTR` or a restart (Linux
+/// `unix_stream_sendmsg` / `tcp_sendmsg_locked` return the bytes already
+/// queued when `sock_intr_errno` ends their wait).  The legacy longjmp park
+/// never returns here; its callers keep re-execution state instead.
+pub(crate) fn resume_parked_syscall_in_place(ctx: &mut dyn TrapContext) {
+    #[cfg(target_arch = "x86_64")]
+    const SYSCALL_INSN_LEN: u64 = 2;
+    #[cfg(target_arch = "aarch64")]
+    const SYSCALL_INSN_LEN: u64 = 4;
+    ctx.set_rip(ctx.rip().wrapping_add(SYSCALL_INSN_LEN));
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: the in-flight task's poller-pinned ctx; atomic store only.
+        unsafe {
+            (*uctx)
+                .syscall_parked_restarting
+                .store(false, core::sync::atomic::Ordering::Release);
+        }
     }
 }
 
@@ -14391,6 +14576,7 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = PRCTL_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
+    crate::seccomp::release_task(tid);
     if let Some(m) = NICE_TABLE.lock().as_mut() {
         if m.remove(&tid).is_some() {
             NICE_CUSTOM_ROWS.fetch_sub(1, Ordering::Release);
@@ -14402,9 +14588,8 @@ fn release_task_tables(tid: u64) {
     }
 
     // Filesystem view.
-    task_map_remove(&CWD_TABLE, tid);
+    fs_release(tid);
     task_map_remove(&PERSONALITY_TABLE, tid);
-    remove_root_dir(tid);
     remove_mount_namespace(tid);
     crate::mqueue::release_task_fd_paths(tid);
 
@@ -14432,7 +14617,7 @@ fn release_task_tables(tid: u64) {
     }
     narf_scheduler::clear_task_mems_allowed(tid);
     if let Some(m) = PKEY_TABLE.lock().as_mut() {
-        m.remove(&tid);
+        m.remove(&(PKEY_NO_MM | tid));
     }
 
     // /proc mirrors.
@@ -14445,6 +14630,7 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = PROC_EXE.lock().as_mut() {
         m.remove(&tid);
     }
+    task_map_remove(&PROC_IMAGE_MAPPINGS, tid);
     if let Some(m) = TASK_START_NS.lock().as_mut() {
         m.remove(&tid);
     }
@@ -14556,15 +14742,23 @@ pub fn __test_orphanize_children_of(parent_tid: u64) {
 /// reparent target. Linux find_new_reaper does this before consulting
 /// subreapers or namespace init.
 fn find_thread_group_reaper(dying: u64) -> Option<u64> {
+    // `find_alive_thread`: the first thread not yet exiting (`PF_EXITING`,
+    // NARF's TASK_ZOMBIE flip at the top of the exit path). A sibling that is
+    // itself exiting has run, or is about to run, its own reparenting; handing
+    // it children would strand them under a thread that never looks again.
+    let alive = |task: u64| {
+        crate::task::task_get(task)
+            .is_some_and(|t| t.state.load(Ordering::Acquire) == crate::task::TASK_RUNNING)
+    };
     let tgid = task_to_pid_raw(dying)?;
     if let Some(leader) = pid_to_task_raw(tgid) {
-        if leader != dying && signal_target_exists(leader) {
+        if leader != dying && alive(leader) {
             return Some(leader);
         }
     }
     thread_group_members(tgid)
         .into_iter()
-        .find(|&task| task != dying && signal_target_exists(task))
+        .find(|&task| task != dying && alive(task))
 }
 
 fn orphanize_children_of(parent_tid: u64) {
@@ -14574,6 +14768,11 @@ fn orphanize_children_of(parent_tid: u64) {
     if parent_child_count(parent_tid) == 0 {
         return;
     }
+    // Releases of auto-reaped zombies run after the lock is dropped: dropping
+    // a Task can re-enter the exit observers, which take this lock.
+    let mut release_after: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    {
+    let _tasklist = TASKLIST.lock();
     let thread_reaper = find_thread_group_reaper(parent_tid);
     let reaper = thread_reaper.or_else(|| find_child_subreaper(parent_tid));
     let reset_exit_signal = thread_reaper.is_none();
@@ -14617,9 +14816,8 @@ fn orphanize_children_of(parent_tid: u64) {
         }
         _ => {
             for entry in stale {
-                release_reaped_task(entry.child_pid);
-                crate::release_pid(crate::ProcessId(entry.child_pid));
                 parent_of_remove(entry.child_pid);
+                release_after.push(entry.child_pid);
             }
         }
     }
@@ -14684,6 +14882,11 @@ fn orphanize_children_of(parent_tid: u64) {
             }
         }
     }
+    }
+    for child_pid in release_after {
+        release_reaped_task(child_pid);
+        crate::release_pid(crate::ProcessId(child_pid));
+    }
 }
 
 /// Run a pending Magic SysRq command (`narf_input::evdev::take_sysrq_request`)
@@ -14737,8 +14940,14 @@ pub fn sysrq_show_tasks() {
 /// must see the dying task's pgid/sid intact): the master per-task
 /// teardown. `_pid` is the visible pid; all swept tables key on tid.
 fn task_tables_exit_observer(_pid: u64, tid: u64) {
-    release_task_tables(tid);
+    // `exit_notify` -> `forget_original_parent` reparents the children while
+    // the dying thread is still whole; its signal state goes later, in
+    // `release_task`. The other order left a window in which a child that
+    // exited still resolved its parent to this thread, whose sigaction rows
+    // were already gone: SIGCHLD then took the SIG_DFL generation-time
+    // discard and never reached the surviving threads.
     orphanize_children_of(tid);
+    release_task_tables(tid);
 }
 
 /// Exit observer for the LAST thread of a group: release the group's shared
@@ -15230,6 +15439,67 @@ pub(crate) fn linux_tid_to_task_raw(tid_raw: u64) -> Option<u64> {
         .as_ref()
         .and_then(|m| m.get(&tid_raw).copied())
 }
+/// Exit status of traced non-leader threads that left through `exit(2)`,
+/// keyed by TaskId, for [`notify_tracer_of_thread_exit`]. A thread taken down
+/// by its group's exit reports the group's status instead.
+static TRACED_THREAD_EXIT: narf_lib::sync::IrqSafeSpinLock<BTreeMap<u64, i32>> =
+    narf_lib::sync::IrqSafeSpinLock::new(BTreeMap::new());
+
+/// Record a traced thread's own exit status (`exit(2)` of one thread).
+pub(crate) fn note_traced_thread_exit(tid: u64, wstatus: i32) {
+    let linux_tid = task_to_linux_tid_raw(tid).unwrap_or(tid);
+    if crate::ptrace::is_task_traced(linux_tid) {
+        TRACED_THREAD_EXIT.lock().insert(tid, wstatus);
+    }
+}
+
+/// `exit_notify` → `do_notify_parent` for a traced CLONE_THREAD tracee: its
+/// tracer sees the thread's exit through `wait(__WALL)` (strace's
+/// `+++ exited with N +++` per thread) and gets SIGCHLD. Linux then
+/// releases the thread when the tracer reaps it; NARF releases it now, so the
+/// queued entry is marked handed-back and the tracer's reap releases nothing.
+/// The thread's ptrace rows go with it, or a tracer would keep waiting for a
+/// tracee that no longer exists instead of getting ECHILD.
+fn notify_tracer_of_thread_exit(pid: u64, tid: u64) {
+    let Some(linux_tid) = task_to_linux_tid_raw(tid) else {
+        return;
+    };
+    let Some(tracer) = crate::ptrace::get_task_tracer(linux_tid) else {
+        TRACED_THREAD_EXIT.lock().remove(&tid);
+        return;
+    };
+    let tracer_task = linux_tid_to_task_raw(tracer)
+        .or_else(|| pid_to_task_raw(tracer))
+        .unwrap_or(tracer);
+    let status = TRACED_THREAD_EXIT.lock().remove(&tid).unwrap_or_else(|| {
+        PENDING_TERMINATION
+            .lock()
+            .as_ref()
+            .and_then(|m| m.get(&pid).map(|t| t.status))
+            .unwrap_or(0)
+    });
+    crate::ptrace::release_process(linux_tid);
+    HANDED_BACK.lock().insert(linux_tid, ());
+    {
+        let mut g = PENDING_EXITS[pending_exit_shard(tracer_task)].map.lock();
+        if let Some(m) = g.as_mut() {
+            m.entry(tracer_task).or_default().push(PendingExit {
+                child_pid: linux_tid,
+                status,
+                exit_signal: SIGCHLD,
+                ptraced: true,
+            });
+        }
+    }
+    let _ = raise_group_signal(
+        tracer_task,
+        u32::from(SIGCHLD),
+        GroupSigInfo::Queued(sigchld_exit_info(tracer_task, linux_tid, status)),
+    );
+    narf_net::readiness::notify(0);
+    wake_wait_child_group(tracer_task);
+}
+
 /// Release a finished non-leader thread from the task registry. Linux does
 /// not expose CLONE_THREAD siblings as wait4-reapable zombies; retaining them
 /// until the process exits leaks one Task/TCB allocation per pthread and makes
@@ -15241,6 +15511,7 @@ pub(crate) fn release_exited_thread_task(pid: u64, tid: u64) {
     if leader_tid == tid {
         return;
     }
+    notify_tracer_of_thread_exit(pid, tid);
     crate::task::release_task(tid);
     let _mutation = PID_TASK_MUTATION.lock();
     let linux_tid = TASK_TO_LINUX_TID[pid_task_shard(tid)]
@@ -15481,6 +15752,16 @@ pub(crate) fn proc_pid_to_tid(pid: u64) -> u64 {
 /// (wait4 reap entry + SIGCHLD + waker) — or, if orphaned, releases the
 /// task and returns the PID. Running this per thread double-freed the
 /// PID pool and the parent's reap queue (the OCI teardown #UD).
+/// Linux `tasklist_lock`, for the one pair of paths that must not interleave:
+/// a dying thread reparenting its children (`forget_original_parent`, held for
+/// write) and a child's exit resolving its parent, publishing its zombie and
+/// signalling that parent (`exit_notify` -> `do_notify_parent`, held too).
+/// Without it a child could resolve the dying thread, then publish its reap
+/// entry after the dying thread had already moved its list to the new
+/// reaper — a zombie no surviving thread can wait for. Nothing that can
+/// re-enter either path (a task or pid release) runs under it.
+static TASKLIST: narf_lib::sync::IrqSafeSpinLock<()> = narf_lib::sync::IrqSafeSpinLock::new(());
+
 fn on_child_exit(child_pid: u64, child_tid: u64) {
     // `child_tid` is consumed only by the cgroup-gated PIDFD-EXIT probe
     // below; keep it live for the no-cgroup build.
@@ -15489,6 +15770,10 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // Capture ptrace routing before release_process removes the tracee row.
     // Linux reports a traced zombie to its tracer first, irrespective of its
     // clone-child exit-signal class.
+    // Held from resolving the parent to signalling it (`exit_notify` holds
+    // tasklist_lock across `do_notify_parent`), so the parent cannot reparent
+    // this child or vanish in between.
+    let tasklist = TASKLIST.lock();
     let wait_recipient = get_wait_recipient(child_pid);
     // Namespace and pid↔task cleanup is deferred to release_reaped_task so a
     // zombie's inner PID remains resolvable until wait4/waitid consumes it.
@@ -15515,6 +15800,7 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
             // pidfd_open()'d watchers now, drain the staged status so a re-used
             // pid doesn't see stale state, release the refcounted Task, and
             // return the PID to the pool immediately since no one will reap it.
+            drop(tasklist);
             let _ = crate::pidfd::notify_exit(child_pid);
             let _ = take_pending_termination(child_pid);
             release_reaped_task(child_pid);
@@ -16226,6 +16512,21 @@ pub(crate) const CAP_SYS_PTRACE: u32 = 19;
 /// can restore it, so treating it as the caller's peer would hand over a
 /// process that is one `setuid` away from being root.
 pub(crate) fn ptrace_may_access(caller: u64, target: u64) -> bool {
+    ptrace_may_access_mode(caller, target, PtraceCreds::Real)
+}
+
+/// Which of the caller's credentials `__ptrace_may_access` compares against
+/// the target's: `PTRACE_MODE_REALCREDS` (a syscall naming another process —
+/// ptrace, process_vm_*, kcmp) or `PTRACE_MODE_FSCREDS` (a filesystem access
+/// to procfs, e.g. `/proc/<pid>/mem`).
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) enum PtraceCreds {
+    Real,
+    Fs,
+}
+
+/// [`ptrace_may_access`] with an explicit credential mode.
+pub(crate) fn ptrace_may_access_mode(caller: u64, target: u64, creds: PtraceCreds) -> bool {
     // `kernel/ptrace.c:298`: `if (same_thread_group(task, current)) return 0;`
     // — a thread may always inspect its own process, sibling threads included.
     if same_thread_group(caller, target) {
@@ -16239,12 +16540,18 @@ pub(crate) fn ptrace_may_access(caller: u64, target: u64) -> bool {
 
     let c = read_uidgid(caller);
     let t = read_uidgid(target);
-    let same_user = c.uid == t.euid
-        && c.uid == t.suid
-        && c.uid == t.uid
-        && c.gid == t.egid
-        && c.gid == t.sgid
-        && c.gid == t.gid;
+    // `if (mode & PTRACE_MODE_FSCREDS) { caller_uid = cred->fsuid; ... }
+    //  else { caller_uid = cred->uid; ... }`
+    let (caller_uid, caller_gid) = match creds {
+        PtraceCreds::Real => (c.uid, c.gid),
+        PtraceCreds::Fs => (c.fsuid, c.fsgid),
+    };
+    let same_user = caller_uid == t.euid
+        && caller_uid == t.suid
+        && caller_uid == t.uid
+        && caller_gid == t.egid
+        && caller_gid == t.sgid
+        && caller_gid == t.gid;
     if !same_user && !privileged {
         return false;
     }
@@ -17824,7 +18131,6 @@ struct PrctlState {
     /// unimplemented GET returned -1, forcing a doomed SET on every
     /// service start (exit 213/EXIT_SECUREBITS).
     securebits: u64,
-    seccomp_mode: u32,
 }
 
 impl Default for PrctlState {
@@ -17836,7 +18142,6 @@ impl Default for PrctlState {
             pdeathsig: 0,
             child_subreaper: false,
             securebits: 0,   // SECBIT_* all clear, per Linux default
-            seccomp_mode: 0,
         }
     }
 }
@@ -17858,6 +18163,38 @@ fn read_prctl(task: u64) -> PrctlState {
     g.as_ref()
         .and_then(|m| m.get(&task).copied())
         .unwrap_or_default()
+}
+
+/// `task_no_new_privs(task)`.
+pub(crate) fn task_no_new_privs(task: u64) -> bool {
+    read_prctl(task).no_new_privs
+}
+
+/// `task_set_no_new_privs(task)` — one-way, as everywhere else it is set.
+pub(crate) fn task_set_no_new_privs(task: u64) {
+    modify_prctl(task, |s| s.no_new_privs = true);
+}
+
+/// The `PrctlState` a child of any `clone` starts with (`copy_process`):
+///
+/// - `no_new_privs` lives in `task_struct.atomic_flags`, which
+///   `dup_task_struct` copies — a sandbox that set it before forking its
+///   workers would otherwise hand them the right to gain privilege again.
+/// - `securebits` is part of `struct cred`, which `copy_creds` copies (or
+///   shares, for CLONE_THREAD).
+/// - dumpable is an `mm->flags` bit: `mm_init` copies the parent's
+///   (`mmf_init_flags(current->mm->flags)`), and a CLONE_VM child shares it.
+///
+/// Not inherited: `pdeath_signal` (`p->pdeath_signal = 0`) and the
+/// `is_child_subreaper` bit of a new `signal_struct`; the name travels with
+/// `proc_identity_fork`.
+pub(crate) fn prctl_fork(parent: u64, child: u64) {
+    let p = read_prctl(parent);
+    modify_prctl(child, |c| {
+        c.no_new_privs = p.no_new_privs;
+        c.securebits = p.securebits;
+        c.dumpable = p.dumpable;
+    });
 }
 
 fn modify_prctl<F: FnOnce(&mut PrctlState)>(task: u64, f: F) -> bool {

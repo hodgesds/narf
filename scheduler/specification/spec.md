@@ -71,6 +71,11 @@ pub fn set_task_affinity(task: TaskId, requested: CpuSet)
     -> Result<(), SetAffinityError>;
 /// Distinct live user address spaces, including currently-polled tasks.
 pub fn all_address_spaces() -> Vec<Arc<AddressSpace>>;
+// A task's AS while some CPU is polling it (popped off its ready queue):
+// read from the CPU's active-AS cell only when CURRENT_TASK names the task
+// under that cell's lock. `address_space_of_live` = queued, else running.
+pub fn address_space_of_running(id: TaskId) -> Option<Arc<AddressSpace>>;
+pub fn address_space_of_live(id: TaskId) -> Option<Arc<AddressSpace>>;
 pub fn set_user_perf_switch_hook(hook: fn(task: u64, running: bool));
 pub fn set_user_slice_account_hook(hook: fn(elapsed_ns: u64));
 pub fn set_user_kernel_preempt_hooks(pause: fn() -> bool, resume: fn());
@@ -170,6 +175,11 @@ post-boot in-tree privileged consumer may execute a raw `clts`. A nested
 scheduler pump saves the outer current task before polling an inner stackful
 task and re-establishes the outer task's ownership before its kernel
 continuation resumes. AArch64 keeps the eager FPSIMD save/restore path.
+When x86 PKU is enabled, PKRU is additionally saved at every user-task
+switch-out and restored before every user-task return. It is intentionally
+eager rather than folded into the lazy FP/SIMD image: `WRPKRU` may execute
+without first taking the CR0.TS-driven `#NM` path. An XSAVE restoration that
+contains PKRU is immediately overwritten from that authoritative task slot.
 Kernel-test builds expose a hidden reset for the process-wide own-stack latch;
 the userspace test-hook reset invokes it so distributed tests remain independent
 of link-order. Production builds neither compile nor call this reset.

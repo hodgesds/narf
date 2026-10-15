@@ -1772,9 +1772,11 @@ fn tcp_state(id: u32) -> Option<crate::tcp::state_machine::TcpState> {
     crate::tcp::core::__with_tcb(id, |t| t.state)
 }
 
-// RFC 9293 §3.10.7.4: a RST whose sequence number is in the window resets
-// the connection; one outside it is answered with an ACK and ignored
-// (RFC 5961 §3 challenge ACK) — the blind-reset defence.
+// RFC 5961 §3.2 as Linux `tcp_validate_incoming` applies it — the
+// blind-reset defence: a RST outside the window is dropped without an answer
+// ("unless the RST bit is set, if so drop the segment and return", step 1),
+// one inside it but not at RCV.NXT draws a challenge ACK, and only one at
+// exactly RCV.NXT resets.
 fn smoke_cov_tcp_rst_window_check() -> TestResult {
     use crate::pkt_tcp::{FLAG_ACK, FLAG_RST};
     use crate::tcp::state_machine::TcpState;
@@ -1794,17 +1796,26 @@ fn smoke_cov_tcp_rst_window_check() -> TestResult {
     );
     let challenge = tcp_drain();
     let after_blind = tcp_state(sid);
-    // Exactly RCV.NXT.
-    tcp_inject(51001, 31001, ciss.wrapping_add(1), 0, FLAG_RST, &[]);
-    let after_exact = tcp_state(sid);
     if after_blind != Some(TcpState::Established) {
         return TestResult::Fail("out-of-window RST tore down the connection");
     }
-    if !challenge.iter().any(|s| seg_flags(s) & FLAG_ACK != 0) {
-        return TestResult::Fail("out-of-window RST got no challenge ACK");
+    if !challenge.is_empty() {
+        return TestResult::Fail("out-of-window RST was answered (Linux drops it silently)");
     }
+    // In the window, not at RCV.NXT: challenge ACK, connection kept.
+    tcp_inject(51001, 31001, ciss.wrapping_add(100), 0, FLAG_RST, &[]);
+    let challenged = tcp_drain();
+    if tcp_state(sid) != Some(TcpState::Established) {
+        return TestResult::Fail("an in-window but inexact RST tore down the connection");
+    }
+    if !challenged.iter().any(|s| seg_flags(s) & FLAG_ACK != 0) {
+        return TestResult::Fail("in-window inexact RST got no challenge ACK");
+    }
+    // Exactly RCV.NXT.
+    tcp_inject(51001, 31001, ciss.wrapping_add(1), 0, FLAG_RST, &[]);
+    let after_exact = tcp_state(sid);
     if matches!(after_exact, Some(TcpState::Established)) {
-        return TestResult::Fail("in-window RST did not reset the connection");
+        return TestResult::Fail("an RST at exactly RCV.NXT did not reset the connection");
     }
     TestResult::Pass
 }

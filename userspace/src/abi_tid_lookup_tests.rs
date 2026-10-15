@@ -443,10 +443,27 @@ fn a5(arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> Sysca
 fn smoke_abi_tid_process_vm_readv_non_leader() -> TestResult {
     with_groups(|| {
         install_test_address_space()?;
+        // The remote side is read from the target mm's own mapping (Linux
+        // pins the target's pages; it never dereferences the address in the
+        // caller), so the source bytes live in a page of the shared test mm.
+        const REMOTE_VA: u64 = 0x0000_0072_0000_0000;
+        let mm = crate::handlers::active_user_as().ok_or("test address space missing")?;
+        let frame = narf_memory::alloc_frame()
+            .map_err(|_| "frame allocator drained")?
+            .start_address();
+        // SAFETY: the fresh frame is exclusively owned and direct-mapped.
+        unsafe { core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0x5a, 4096) };
+        mm.map_region(narf_memory::Region {
+            base: narf_memory::VirtAddr::new(REMOTE_VA),
+            len: 4096,
+            perms: narf_memory::RegionPerms::READ | narf_memory::RegionPerms::WRITE,
+            phys: alloc::vec![frame].into(),
+        })
+        .map_err(|_| "remote fixture map_region failed")?;
         let src = [0x5au8; 8];
         let mut dst = [0u8; 8];
         let liov = [dst.as_mut_ptr() as u64, 8u64];
-        let riov = [src.as_ptr() as u64, 8u64];
+        let riov = [REMOTE_VA, 8u64];
         let l = liov.as_ptr() as u64;
         let r = riov.as_ptr() as u64;
         set_task(LEADER_TASK);

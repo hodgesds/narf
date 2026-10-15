@@ -141,29 +141,33 @@ pub(crate) fn sys_futex_wait(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
         return;
     }
-    // A deadline already in the past is -ETIMEDOUT without parking, the
-    // same shortcut the classic FUTEX_WAIT arm takes.
-    let now = narf_scheduler::narf_time::monotonic_ns();
-    let park_cap = match deadline {
-        Some(d) if d <= now => {
-            ctx.set_return(SyscallReturn::ok((-ETIMEDOUT) as u64));
+    // `futex_wait_setup` → `get_futex_key`: the remaining key checks
+    // (-EFAULT for an inaccessible word), keyed by the futex2 flags.
+    let uaddr = args.arg0;
+    let key = match get_futex_key_flags(flags & FUTEX_PRIVATE != 0, uaddr, flags) {
+        Ok(k) => k,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
-        // Never park past the caller's deadline: the bounded park resumes
-        // with 0 (a permitted spurious wake) and the caller's recheck loop
-        // re-issues, which then lands on the -ETIMEDOUT shortcut above.
-        // LINUX-GAP: Linux reports -ETIMEDOUT from the park itself.
-        Some(d) => (d - now).min(FUTEX2_PARK_CAP_NS),
-        None => FUTEX2_PARK_CAP_NS,
     };
     // `__futex_wait(uaddr, flags, val, to, mask)`: the mask is the waiter's
-    // bitset, matched by `futex_wake`.
-    futex_wait_core(
+    // bitset, matched by `futex_wake`. A deadline that has already passed
+    // still runs the setup first, so a moved word is -EAGAIN, not
+    // -ETIMEDOUT. The wait itself reports -ETIMEDOUT at the deadline.
+    //
+    // A signal: `sys_futex_wait` returns `__futex_wait`'s -ERESTARTSYS as
+    // is — timed or not, there is no restart_block on this path — so
+    // SA_RESTART re-issues the call (whose deadline is absolute) and any
+    // other handler sees -EINTR.
+    if futex_wait_one(
         ctx,
-        args.arg0,
+        uaddr,
+        key,
         args.arg1 as u32,
-        park_cap,
-        flags,
+        deadline,
         args.arg2 as u32,
-    );
+    ) {
+        restart_interrupted_syscall(ctx, crate::user_task::SYSCALL_RESTART_SYS);
+    }
 }

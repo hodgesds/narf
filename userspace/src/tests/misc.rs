@@ -1717,6 +1717,132 @@ fn smoke_userspace_futex_requeue_moves_waiters() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_userspace_futex_requeue_moves_waiters);
 
+/// The handler-driven futex wait (`futex_block`) decides "was I woken" the
+/// way Linux's `futex_unqueue` does: a wake REMOVES the entry under the
+/// bucket lock, so an entry the waiter finds gone at unqueue time was woken
+/// (return 0 / its waitv index) and one still queued was not (timeout,
+/// signal, or a spurious wakeup that retries). A requeue must move the
+/// entry AND retarget the wait's recorded key under the same locks, or the
+/// waiter would look under the old key, miss its entry, and take a wait that
+/// was never woken for a woken one — returning 0 while still queued on the
+/// destination, where a later wake would then be lost on a ghost.
+fn smoke_userspace_futex_block_unqueue_semantics() -> TestResult {
+    use crate::handlers::{
+        __test_futex_q_names, __test_futex_q_new, __test_futex_q_queue, __test_futex_q_unqueue,
+        __test_futex_requeue, __test_futex_waiter_count, futex_wake_waiters_for_test,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    fn counting_waker(counter: Arc<AtomicU32>) -> Waker {
+        unsafe fn clone_raw(d: *const ()) -> RawWaker {
+            // SAFETY: `d` came from Arc::into_raw in counting_waker/clone_raw.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            let cloned = arc.clone();
+            let _ = Arc::into_raw(arc);
+            RawWaker::new(Arc::into_raw(cloned) as *const (), &VTAB)
+        }
+        unsafe fn wake_raw(d: *const ()) {
+            // SAFETY: consumes the refcount handed to this waker.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            arc.fetch_add(1, Ordering::AcqRel);
+        }
+        unsafe fn wake_ref_raw(d: *const ()) {
+            // SAFETY: caller still owns the waker (and its refcount).
+            unsafe { (*(d as *const AtomicU32)).fetch_add(1, Ordering::AcqRel) };
+        }
+        unsafe fn drop_raw(d: *const ()) {
+            // SAFETY: consumes the refcount owned by this waker.
+            unsafe { drop(Arc::<AtomicU32>::from_raw(d as *const AtomicU32)) };
+        }
+        static VTAB: RawWakerVTable =
+            RawWakerVTable::new(clone_raw, wake_raw, wake_ref_raw, drop_raw);
+        // SAFETY: vtable matches the Arc<AtomicU32> representation.
+        unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(counter) as *const (), &VTAB)) }
+    }
+
+    // Words no other test touches.
+    const U1: u64 = 0x5EC0_5000;
+    const U2: u64 = 0x5EC0_5004;
+    const TID: u64 = 9101;
+
+    // Not woken: the waiter's own unqueue removes the still-queued entry.
+    let c = Arc::new(AtomicU32::new(0));
+    let q = __test_futex_q_new(&[U1]);
+    __test_futex_q_queue(&q, 0, TID, counting_waker(c.clone()));
+    if __test_futex_waiter_count(U1) != 1 {
+        return TestResult::Fail("futex_queue did not queue the entry");
+    }
+    if __test_futex_q_unqueue(&q, 1, TID).is_some() {
+        return TestResult::Fail("an entry nobody woke was reported woken");
+    }
+    if __test_futex_waiter_count(U1) != 0 {
+        return TestResult::Fail("futex_unqueue left the entry queued");
+    }
+
+    // Woken: FUTEX_WAKE counts it (1, not 0) and dequeues it.
+    __test_futex_q_queue(&q, 0, TID, counting_waker(c.clone()));
+    if futex_wake_waiters_for_test(U1, 1) != 1 || c.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("FUTEX_WAKE did not wake the queued entry");
+    }
+    if __test_futex_q_unqueue(&q, 1, TID) != Some(0) {
+        return TestResult::Fail("a woken entry was not reported woken");
+    }
+    // ... and a second wake finds nobody (Linux: 0 woken).
+    if futex_wake_waiters_for_test(U1, 1) != 0 {
+        return TestResult::Fail("a woken entry was still queued for the next wake");
+    }
+
+    // Requeued: the entry moves to U2 without a wake, the wait's key follows
+    // it, the waiter's unqueue finds it there (not woken), and nothing is
+    // left behind on either word.
+    let q = __test_futex_q_new(&[U1]);
+    __test_futex_q_queue(&q, 0, TID, counting_waker(c.clone()));
+    if __test_futex_requeue(U1, U2, 0, 1) != (0, 1) {
+        return TestResult::Fail("requeue did not move the futex_block entry");
+    }
+    if !__test_futex_q_names(&q, 0, U2) {
+        return TestResult::Fail("requeue did not retarget the wait's recorded key");
+    }
+    if c.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("requeue woke the moved entry");
+    }
+    if __test_futex_q_unqueue(&q, 1, TID).is_some() {
+        return TestResult::Fail("a requeued, unwoken entry was reported woken");
+    }
+    if __test_futex_waiter_count(U1) != 0 || __test_futex_waiter_count(U2) != 0 {
+        return TestResult::Fail("unqueue after requeue left a ghost entry");
+    }
+
+    // Requeued then woken on the destination: woken.
+    let q = __test_futex_q_new(&[U1]);
+    __test_futex_q_queue(&q, 0, TID, counting_waker(c.clone()));
+    let _ = __test_futex_requeue(U1, U2, 0, 1);
+    if futex_wake_waiters_for_test(U2, 1) != 1 {
+        return TestResult::Fail("wake on the requeue target missed the moved entry");
+    }
+    if __test_futex_q_unqueue(&q, 1, TID) != Some(0) {
+        return TestResult::Fail("a requeued-then-woken entry was not reported woken");
+    }
+
+    // futex_waitv: the index reported is the entry a wake dequeued.
+    let q = __test_futex_q_new(&[U1, U2]);
+    __test_futex_q_queue(&q, 0, TID, counting_waker(c.clone()));
+    __test_futex_q_queue(&q, 1, TID, counting_waker(c.clone()));
+    if futex_wake_waiters_for_test(U2, 1) != 1 {
+        return TestResult::Fail("wake on waitv entry 1 missed it");
+    }
+    if __test_futex_q_unqueue(&q, 2, TID) != Some(1) {
+        return TestResult::Fail("waitv unqueue did not report index 1");
+    }
+    if __test_futex_waiter_count(U1) != 0 {
+        return TestResult::Fail("waitv unqueue left entry 0 queued");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_futex_block_unqueue_semantics);
+
 /// The park loop's stay-parked decision (`futex_park_should_stay`) must
 /// re-validate the futex WORD, not just the wake generation. A word
 /// rewritten WITHOUT a wake on it (musl `unlock_requeue`'s barrier store,
@@ -3709,6 +3835,47 @@ fn smoke_proc_fd_hook_resolves_processid_to_taskid() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_proc_fd_hook_resolves_processid_to_taskid);
+
+/// `execve("/proc/self/exe")` follows the magic link to the process's own
+/// executable (`proc_exe_link` -> `mm->exe_file`). Chromium launches every
+/// child process this way; resolving it as an ordinary procfs path made each
+/// launch fail ("LaunchProcess: failed to execvp: /proc/self/exe").
+fn smoke_execve_proc_self_exe_resolves_to_the_executable() -> TestResult {
+    let tid = 0x0E5E_C001u64;
+    let pid = 0x0E5E_C0DEu64;
+    crate::handlers::register_pid_task_mapping(pid, tid);
+    crate::handlers::set_proc_exe(tid, "/usr/lib/chromium/chromium");
+    let target = |path: &str| crate::handlers::proc_exe_magic_target(tid, path);
+    let want = Some(alloc::string::String::from("/usr/lib/chromium/chromium"));
+    let result = (|| {
+        if target("/proc/self/exe") != want {
+            return Err("/proc/self/exe did not resolve to the executable");
+        }
+        if target("/proc/thread-self/exe") != want {
+            return Err("/proc/thread-self/exe did not resolve to the executable");
+        }
+        if target(&alloc::format!("/proc/{pid}/exe")) != want {
+            return Err("/proc/<pid>/exe did not resolve to the executable");
+        }
+        // Negative: other magic links and sub-paths are not the exe link.
+        if target("/proc/self/cwd").is_some()
+            || target("/proc/self/exe/x").is_some()
+            || target("/usr/bin/exe").is_some()
+        {
+            return Err("a non-exe path was treated as /proc/<pid>/exe");
+        }
+        Ok(())
+    })();
+    crate::handlers::__test_forget_task_pid(tid);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "userspace",
+    smoke_execve_proc_self_exe_resolves_to_the_executable
+);
 
 // Linux `task_current_syscall()` / SysRq-T: a blocked task's syscall is
 // decoded from the register frame its entry path left at the top of its

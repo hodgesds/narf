@@ -204,6 +204,9 @@ pub fn node_free_blocks(node: usize) -> [usize; BUDDY_ORDER_COUNT];
 pub fn watermark_min() -> u64;
 pub fn watermark_low() -> u64;
 pub fn watermark_high() -> u64;
+/// A NUMA node's proportional share of the min / low watermark.
+pub fn watermark_min_node(node: usize) -> u64;
+pub fn watermark_low_node(node: usize) -> u64;
 pub fn reclaim_goal_pages() -> usize;
 
 /// Linux-compatible overcommit policy; boot default is Heuristic (0).
@@ -517,7 +520,8 @@ impl AddressSpace {
     /// `Unmapped` and `OutOfRange` retain their non-reclaim meanings.
     ///
     /// A FILE_DEMAND page comes from the hook installed with
-    /// `install_file_fault_hook(fn(u64) -> Result<u64, FileFaultError>)`,
+    /// `install_file_fault_hook(fn(address_space_id: u64, vaddr: u64)
+    ///     -> Result<u64, FileFaultError>)`,
     /// whose error keeps Linux's `vm_fault_t` meaning:
     /// `FileFaultError::NoOwner` → `Unmapped` (SIGSEGV);
     /// `FileFaultError::Bus` → `AddressSpaceError::Bus` — the file refused a
@@ -525,6 +529,12 @@ impl AddressSpace {
     /// delivered as SIGBUS/BUS_ADRERR; `FileFaultError::NoMemory` →
     /// `ReclaimPressure` (`VM_FAULT_OOM`: wait for reclaim, retry), or
     /// `OutOfRange` when no reclaim can be requested. No failure backs the page.
+    /// `address_space_id` is the stable [`AddressSpace::identity`] of the
+    /// faulting root, not an implicit "currently active" address space: a
+    /// ptrace tracer may materialize a stopped tracee's FILE_DEMAND page while
+    /// the tracer's root is active. The file hook must use this identity when
+    /// selecting the mapping owner, so page contents and accounting remain
+    /// scoped to the tracee.
     ///
     /// A page carrying an `MADV_GUARD_INSTALL` marker returns
     /// `AddressSpaceError::GuardPage` (`VM_FAULT_SIGSEGV`, delivered as
@@ -604,6 +614,19 @@ impl AddressSpace {
     /// holes, lazy pages, unreadable mappings and special/device mappings.
     /// The caller faults lazy pages through guarded user access first.
     pub fn pin_user_page(&self, vaddr: VirtAddr) -> Option<UserPagePin>;
+    /// Linux `access_remote_vm` / GUP-for-another-mm over the region table
+    /// (never the target's leaves): copies between `buf` (`RemoteBuf::Read`
+    /// or `Write`) and this AS, returning the bytes moved before the first
+    /// inaccessible page. `RemoteAccess { write, force, expand_stack }`
+    /// mirrors FOLL_WRITE, FOLL_FORCE (`check_vma_flags`: PROT_NONE and
+    /// read-only private VMAs admitted; shared non-VM_WRITE and
+    /// SHARED|LOCK_EXEMPT non-RAM (VM_IO/VM_PFNMAP) refused) and
+    /// `__access_remote_vm`'s `expand_stack` under the caller's limits.
+    /// Lazy, file and swapped pages fault in through the demand path (a
+    /// forced PROT_NONE page gets a frame but no leaf); a write breaks COW
+    /// in this AS only and repoints its leaf with a broadcast flush.
+    pub unsafe fn access_remote(&self, addr: u64, buf: RemoteBuf<'_>,
+        access: RemoteAccess) -> usize;
     /// Non-owning per-region resident-page counts grouped by SRAT node.
     pub fn numa_regions_snapshot(&self) -> Vec<NumaRegionSnapshot>;
     /// One mincore-shaped residency byte per rounded base page; holes fail.
@@ -1366,6 +1389,22 @@ x86_64 is rejected at runtime.
   metadata lock is held skips compaction and follows its existing scattered or
   failure path, so migration cannot recursively acquire reverse-map or other
   allocator-adjacent metadata locks. Order-0 allocation remains non-compacting.
+- Direct compaction is also skipped unless `migrate::compaction_suitable(node,
+  order)` holds — Linux `__compaction_suitable`: node free pages exceed
+  `min + compact_gap(order)` (`2 << order`), plus `low - min` for orders above
+  `PAGE_ALLOC_COSTLY_ORDER` (3). Below that the failure is a shortage, not
+  fragmentation, and compacting would hold the target block's free frames out
+  of the pool that the caller's fallback depends on.
+- The compaction path never enters the heap: it runs on the failure path of an
+  allocation, with IRQs masked under the node cache drain, where a nested heap
+  allocation can neither compact nor reclaim. `compact_block` tracks held
+  frames in a fixed stack bitmap, `compact_scan` collects at most 64 candidate
+  blocks on the stack, `rmap::try_for_each_tracked_frame` walks shard keys in
+  bounded stack chunks (the callback can stop the walk with
+  `ControlFlow::Break`; the walk is a candidate hint that may skip or repeat a
+  key across a concurrent resize), and single-owner migration reads its owner
+  with the allocation-free `rmap::sole_owner`. Compaction migrates only
+  single-owner frames; a COW-shared frame leaves its block uncompacted.
 - `GlobalAlloc` invokes its selected backend exactly once. On failure it
   publishes a bounded per-node reclaim request, wakes kswapd, and returns null;
   it never invokes a shrinker, sleeps, or retries while its caller may hold an

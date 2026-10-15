@@ -122,7 +122,19 @@ impl SocketFile {
                     (val as u32).min(WMEM_MAX)
                 };
                 let v = requested.min((i32::MAX / 2) as u32);
-                self.options.lock().sndbuf = (v * 2).max(SOCK_MIN_SNDBUF);
+                // `__sock_set_sndbuf`: the doubled size, and SOCK_SNDBUF_LOCK
+                // in `sk_userlocks` (reported by SO_BUF_LOCK).
+                let sndbuf = (v * 2).max(SOCK_MIN_SNDBUF);
+                {
+                    let mut o = self.options.lock();
+                    o.sndbuf = sndbuf;
+                    o.ext.buf_lock |= SOCK_SNDBUF_LOCK;
+                }
+                if let Some(id) = self.kernel_tcb_id() {
+                    let _ = narf_net::tcp::core::set_buffer_limits(id, Some(sndbuf), None);
+                }
+                // `sk->sk_write_space(sk)`: a raised limit wakes writers.
+                self.unix_stream_sndbuf_changed(sndbuf as usize);
                 OK
             }
             SO_RCVBUF | SO_RCVBUFFORCE => {
@@ -136,7 +148,15 @@ impl SocketFile {
                 };
                 // `__sock_set_rcvbuf`.
                 let v = requested.min(i32::MAX / 2) as u32;
-                self.options.lock().rcvbuf = (v * 2).max(SOCK_MIN_RCVBUF);
+                let rcvbuf = (v * 2).max(SOCK_MIN_RCVBUF);
+                {
+                    let mut o = self.options.lock();
+                    o.rcvbuf = rcvbuf;
+                    o.ext.buf_lock |= SOCK_RCVBUF_LOCK;
+                }
+                if let Some(id) = self.kernel_tcb_id() {
+                    let _ = narf_net::tcp::core::set_buffer_limits(id, None, Some(rcvbuf));
+                }
                 OK
             }
             SO_OOBINLINE => {
@@ -146,8 +166,9 @@ impl SocketFile {
                 OK
             }
             SO_NO_CHECK => {
-                // LINUX-GAP: sk_setsockopt SO_NO_CHECK — stored; the UDP
-                // transmit path always checksums.
+                // `sk->sk_no_check_tx = valbool`: an IPv4 UDP datagram goes
+                // out with a zero checksum (`udp_send_skb`), and a GSO send
+                // is refused with EINVAL.
                 self.options.lock().ext.no_check = on;
                 OK
             }

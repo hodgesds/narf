@@ -815,22 +815,35 @@ impl SockError {
 
 /// A queued extended socket error for `MSG_ERRQUEUE` / `IP_RECVERR` — the
 /// `sock_extended_err` a datagram socket reports after an ICMP error (QUIC
-/// PMTU discovery reads these to learn the path MTU). Delivered by the
-/// `net`-layer ICMP hook; drained by `recvmsg(MSG_ERRQUEUE)`.
+/// PMTU discovery reads these to learn the path MTU) or a local send failure
+/// (`ip_local_error`). Delivered by the `net`-layer ICMP hook or the send
+/// path; drained by `recvmsg(MSG_ERRQUEUE)`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ExtSockError {
     /// `ee_errno` (e.g. EMSGSIZE for fragmentation-needed).
     pub errno: u32,
-    /// `ee_origin` — SO_EE_ORIGIN_ICMP (2).
+    /// `ee_origin` — [`SO_EE_ORIGIN_LOCAL`] or [`SO_EE_ORIGIN_ICMP`].
     pub origin: u8,
-    /// `ee_type` / `ee_code` — the ICMP type/code.
+    /// `ee_type` / `ee_code` — the ICMP type/code (0 for a local error).
     pub icmp_type: u8,
     pub icmp_code: u8,
-    /// `ee_info` — the discovered next-hop MTU for a frag-needed error.
+    /// `ee_info` — the next-hop MTU for a frag-needed error, the path MTU
+    /// for a local EMSGSIZE.
     pub info: u32,
     /// The router/host that sent the ICMP error (cmsg offender address).
+    /// `ip_recv_error` reports an offender only for ICMP-origin errors
+    /// (`ipv4_datagram_support_cmsg`); a local error's is all-zero.
     pub offender_ip: [u8; 4],
+    /// `msg_name`: the address `serr->addr_offset` points at and
+    /// `serr->port` — the errored datagram's destination address and port.
+    pub name_ip: [u8; 4],
+    pub name_port: u16,
 }
+
+/// `SO_EE_ORIGIN_LOCAL` (`include/uapi/linux/errqueue.h`).
+pub(crate) const SO_EE_ORIGIN_LOCAL: u8 = 1;
+/// `SO_EE_ORIGIN_ICMP` (`include/uapi/linux/errqueue.h`).
+pub(crate) const SO_EE_ORIGIN_ICMP: u8 = 2;
 
 /// A source-address override supplied by an `IP_PKTINFO` / `IPV6_PKTINFO`
 /// send control message (`sendmsg`). QUIC uses it to pin a reply's source
@@ -879,9 +892,16 @@ pub struct SocketFile {
     /// to the `recvmsg` cmsg builder (keyed by task, like the RX ancillary
     /// stash).
     inet_err_ancillary: IrqSafeSpinLock<BTreeMap<u64, ExtSockError>>,
+    /// `inet->inet_id`: the IP ID counter a connected AF_INET datagram
+    /// socket's packets take (`ip_select_ident_segs`); seeded randomly at
+    /// connect (`__ip4_datagram_connect`).
+    pub(crate) inet_id: core::sync::atomic::AtomicU16,
     /// Per-send handoff of an `IP_PKTINFO`/`IPV6_PKTINFO` source override from
     /// the `sendmsg` cmsg parser to the datagram send path (keyed by task).
     send_pktinfo: IrqSafeSpinLock<BTreeMap<u64, SendPktInfo>>,
+    /// Per-task `SOL_UDP` sendmsg cmsg outcome (`udp_cmsg_send`): the GSO
+    /// size a `UDP_SEGMENT` record sets, or its -EINVAL.
+    send_udp_gso: IrqSafeSpinLock<BTreeMap<u64, Result<u16, i64>>>,
     /// `sk_shutdown`: `RCV_SHUTDOWN` / `SEND_SHUTDOWN` bits set by
     /// shutdown(2). Read by the AF_INET datagram path.
     sk_shutdown: AtomicU8,
@@ -1638,6 +1658,11 @@ pub(crate) struct Inet4RxInfo {
     pub spec_dst: u32,
     pub ttl: u8,
     pub tos: u8,
+    /// Segment size of a coalesced UDP GSO datagram delivered whole to a
+    /// `UDP_GRO` socket (`skb_shinfo(skb)->gso_size` under
+    /// `SKB_GSO_UDP_L4`); 0 for an ordinary datagram. `udp_cmsg_recv`
+    /// reports it as the `UDP_GRO` control message.
+    pub gso_size: u16,
 }
 
 /// Which IPv4 receive control messages a socket asked for.
@@ -1683,6 +1708,9 @@ struct DgramPacket6 {
     hop_limit: i32,
     traffic_class: u8,
     payload: Vec<u8>,
+    /// `UDP_GRO` segment size of a coalesced loopback GSO datagram; 0
+    /// otherwise (see [`Inet4RxInfo::gso_size`]).
+    gso_size: u16,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1691,6 +1719,8 @@ pub(crate) struct Inet6RecvAncillary {
     pub ifindex: u32,
     pub hop_limit: i32,
     pub traffic_class: u8,
+    /// The `UDP_GRO` cmsg's segment size, or 0 for no cmsg.
+    pub gso_size: u16,
 }
 
 impl core::fmt::Debug for DgramPacket {
@@ -1766,6 +1796,14 @@ impl SocketFile {
             narf_net::tcp_stack::TCP_CONGESTION,
             &opts.tcp_congestion,
         );
+        // A user-set SO_SNDBUF / SO_RCVBUF (SOCK_*BUF_LOCK) sizes the queues.
+        const SOCK_SNDBUF_LOCK: i32 = 1;
+        const SOCK_RCVBUF_LOCK: i32 = 2;
+        let snd = (opts.ext.buf_lock & SOCK_SNDBUF_LOCK != 0).then_some(opts.sndbuf);
+        let rcv = (opts.ext.buf_lock & SOCK_RCVBUF_LOCK != 0).then_some(opts.rcvbuf);
+        if snd.is_some() || rcv.is_some() {
+            let _ = narf_net::tcp::core::set_buffer_limits(id, snd, rcv);
+        }
     }
 
     pub fn new(domain: u16, kind: u32) -> Arc<Self> {
@@ -1904,7 +1942,9 @@ impl SocketFile {
             pending_error: IrqSafeSpinLock::new(None),
             inet_err_queue: IrqSafeSpinLock::new(VecDeque::new()),
             inet_err_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
+            inet_id: core::sync::atomic::AtomicU16::new(0),
             send_pktinfo: IrqSafeSpinLock::new(BTreeMap::new()),
+            send_udp_gso: IrqSafeSpinLock::new(BTreeMap::new()),
             sk_shutdown: AtomicU8::new(0),
             net_ns_id: core::sync::atomic::AtomicU64::new(0),
             icmp_echo: IrqSafeSpinLock::new(IcmpEchoState::default()),
@@ -2770,6 +2810,11 @@ impl SocketFile {
         }
     }
 
+    /// `udp_test_bit(GRO_ENABLED, sk)`: whether recvmsg reports `UDP_GRO`.
+    pub(crate) fn udp_gro_enabled(&self) -> bool {
+        self.is_udp() && self.options.lock().ext.udp_gro
+    }
+
     pub(crate) fn inet6_ancillary_options(&self) -> (bool, bool, bool) {
         let options = self.options.lock();
         (
@@ -2925,6 +2970,17 @@ impl SocketFile {
         self.pending_error.lock().take()
     }
 
+    /// Consume the ECONNRESET a connected AF_UNIX stream/seqpacket peer left
+    /// by closing with unread data (`unix_release_sock`: `if (skb ||
+    /// embrion) WRITE_ONCE(skpair->sk_err, ECONNRESET)`). Like `sk_err` it
+    /// is reported once: `sock_error` exchanges it for 0.
+    pub(crate) fn take_unix_reset(&self) -> bool {
+        match &*self.state.lock() {
+            SocketState::UnixConnected { tx, .. } => tx.take_reset(),
+            _ => false,
+        }
+    }
+
     /// Record an async error so a subsequent getsockopt(SO_ERROR)
     /// can report it. Used by connect/send failure paths.
     pub fn set_pending_error(&self, e: SockError) {
@@ -2940,6 +2996,30 @@ impl SocketFile {
         if q.len() < MAX_ERRQ {
             q.push_back(e);
         }
+    }
+
+    /// `ip_local_error`: queue a locally detected send error for
+    /// `MSG_ERRQUEUE` when IP_RECVERR is set (otherwise nothing is queued —
+    /// the send's own return value is the only report), and wake pollers
+    /// with POLLERR as `sock_queue_err_skb` → `sk_error_report` does.
+    /// `daddr` / `port` are the datagram's destination and the socket's
+    /// connected port (`inet->inet_dport`, 0 when unconnected).
+    pub(crate) fn ip_local_error(&self, errno: u32, daddr: u32, port: u16, info: u32) {
+        if !self.options.lock().ext.ip_recverr {
+            return;
+        }
+        self.push_inet_err(ExtSockError {
+            errno,
+            origin: SO_EE_ORIGIN_LOCAL,
+            icmp_type: 0,
+            icmp_code: 0,
+            info,
+            offender_ip: [0; 4],
+            name_ip: daddr.to_be_bytes(),
+            name_port: port,
+        });
+        self.dgram_readiness.notify(narf_filesystem::POLL_ERR);
+        narf_net::readiness::notify(0);
     }
 
     /// Dequeue the oldest extended error (the errqueue recv path).
@@ -2980,6 +3060,32 @@ impl SocketFile {
         self.send_pktinfo
             .lock()
             .remove(&crate::handlers::current_task_id())
+    }
+
+    /// Stash this task's in-flight `sendmsg` `SOL_UDP` cmsg outcome for the
+    /// UDP send path (`udp_cmsg_send`).
+    pub(crate) fn stash_send_udp_gso(&self, gso: Result<u16, i64>) {
+        self.send_udp_gso
+            .lock()
+            .insert(crate::handlers::current_task_id(), gso);
+    }
+
+    /// Take this task's stashed `SOL_UDP` cmsg outcome.
+    pub(crate) fn take_send_udp_gso(&self) -> Option<Result<u16, i64>> {
+        self.send_udp_gso
+            .lock()
+            .remove(&crate::handlers::current_task_id())
+    }
+
+    /// The GSO size a UDP send uses: `ipc.gso_size = up->gso_size`, then
+    /// overridden by a `UDP_SEGMENT` cmsg; a malformed `SOL_UDP` cmsg is
+    /// -EINVAL (`udp_sendmsg` / `udpv6_sendmsg` → `udp_cmsg_send`).
+    pub(crate) fn udp_send_gso_size(&self) -> Result<u16, SockError> {
+        match self.take_send_udp_gso() {
+            Some(Ok(gso)) => Ok(gso),
+            Some(Err(_)) => Err(SockError::InvalidArg),
+            None => Ok(self.options.lock().ext.udp_gso_size),
+        }
     }
 
     /// The net-layer ICMP-error sink (registered via `install_udp_icmp_hook`).
@@ -3296,7 +3402,13 @@ impl SocketFile {
                 self.inet6_dgram_unregister(port, port_locked);
             }
             Reg::Tcb(id) => {
-                let _ = narf_net::tcp_stack::close(id);
+                // `SO_LINGER {1, 0}` aborts with an RST (Linux `tcp_close` →
+                // `tcp_disconnect`).
+                let zero_linger = {
+                    let opts = self.options.lock();
+                    opts.linger_on && opts.linger_sec == 0
+                };
+                let _ = narf_net::tcp_stack::close_linger(id, zero_linger);
                 crate::handlers::clear_tcb_owner(id);
             }
             Reg::None => {}
@@ -3806,9 +3918,45 @@ impl FileOps for SocketFile {
         // send queue). Any other request is unknown → ENOTTY (Linux
         // `sock_ioctl` default). SIOCOUTQ MUST be answered: dbus-broker treats
         // an ENOTTY from it as fatal and tears the whole system bus down.
-        let value: i32 = match cmd {
-            SIOCINQ => self.inq_bytes() as i32,
-            SIOCOUTQ => 0,
+        // A kernel-TCP socket answers from its TCB (Linux `tcp_ioctl`):
+        // queued readable bytes, `write_seq - snd_una` (unacknowledged,
+        // sent or not) and `write_seq - snd_nxt` (unsent); EINVAL on a
+        // listener.
+        const SIOCOUTQNSD: u32 = 0x894B;
+        let tcp_listener = matches!(
+            &*self.state.lock(),
+            SocketState::InetListener {
+                listen_id: Some(_),
+                ..
+            } | SocketState::Inet6Listener {
+                listen_id: Some(_),
+                ..
+            }
+        );
+        let tcb = match &*self.state.lock() {
+            SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
+                Some(*tcb_id)
+            }
+            _ => None,
+        };
+        let value: i32 = match (cmd, tcb) {
+            (SIOCINQ | SIOCOUTQ | SIOCOUTQNSD, _) if tcp_listener => {
+                return Err(FsError::InvalidPath);
+            }
+            (SIOCINQ | SIOCOUTQ | SIOCOUTQNSD, Some(id)) => {
+                use narf_net::tcp::core::TcpQueueIoctl as Q;
+                let which = match cmd {
+                    SIOCINQ => Q::Inq,
+                    SIOCOUTQ => Q::Outq,
+                    _ => Q::OutqNsd,
+                };
+                match narf_net::tcp::core::queue_ioctl(id, which) {
+                    Ok(v) => v as i32,
+                    Err(_) => return Err(FsError::InvalidPath),
+                }
+            }
+            (SIOCINQ, None) => self.inq_bytes() as i32,
+            (SIOCOUTQ, None) => 0,
             _ => return Err(FsError::Unsupported),
         };
         let bytes = value.to_le_bytes();
@@ -4156,9 +4304,16 @@ impl SocketFile {
     /// lock.
     fn readiness_bits_for_state(&self, state: &SocketState) -> u32 {
         if self.is_inet_icmp_echo() {
+            // `datagram_poll`: a non-empty error queue is EPOLLERR.
+            let err = if self.has_inet_err() {
+                narf_filesystem::POLL_ERR
+            } else {
+                0
+            };
             return self
                 .icmp_echo_socket()
-                .map_or(narf_filesystem::POLL_OUT, |echo| echo.poll_mask());
+                .map_or(narf_filesystem::POLL_OUT, |echo| echo.poll_mask())
+                | err;
         }
         match state {
             // A fresh UDP socket is already writable (`datagram_poll`,
@@ -4382,6 +4537,17 @@ impl SocketFile {
     /// it is the total buffered rx bytes. Every other state (fresh, listener,
     /// off-box kernel-TCP, bypass, uevent) yields 0 — no local byte count is
     /// tracked and a consumer reads 0 as "fall back to recv/MSG_PEEK".
+    /// The kernel-TCP connection behind a connected AF_INET/AF_INET6 stream
+    /// socket, if it is one.
+    pub(crate) fn kernel_tcb_id(&self) -> Option<u32> {
+        match &*self.state.lock() {
+            SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
+                Some(*tcb_id)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn inq_bytes(&self) -> usize {
         if self.is_inet_icmp_echo() {
             return self
@@ -6277,7 +6443,7 @@ impl SocketFile {
             && level != SOL_SOCKET
             && level != IPPROTO_IP
             && !(level == IPPROTO_TCP && self.kind == SOCK_STREAM)
-            && !(level == IPPROTO_UDP && self.kind == SOCK_DGRAM)
+            && !(level == IPPROTO_UDP && self.is_udp())
         {
             return SocketOpResult::Err(SockError::NotSupported);
         }
@@ -6289,7 +6455,7 @@ impl SocketFile {
             && level != IPPROTO_IPV6
             && !(level == IPPROTO_IP && self.kind != SOCK_RAW)
             && !(level == IPPROTO_TCP && self.kind == SOCK_STREAM)
-            && !(level == IPPROTO_UDP && self.kind == SOCK_DGRAM)
+            && !(level == IPPROTO_UDP && self.is_udp())
         {
             return SocketOpResult::Err(SockError::NoProtoOpt);
         }
@@ -6298,6 +6464,9 @@ impl SocketFile {
             // each cleared once read. A kernel-TCP socket's errors live on its
             // TCB (`take_sock_error` applies the same order there).
             let mut val = self.take_pending_error().map_or(0, |e| e.errno());
+            if val == 0 && self.take_unix_reset() {
+                val = errno::ECONNRESET as i32;
+            }
             if val == 0 {
                 let tcb = match &*self.state.lock() {
                     SocketState::InetWired { tcb_id, .. }
@@ -6634,6 +6803,12 @@ impl SocketFile {
                     return SocketOpResult::Err(SockError::Access);
                 }
                 self.icmp_echo.lock().peer = Some(ip);
+                // `ip4_datagram_connect` → `__ip4_datagram_connect`:
+                // `atomic_set(&inet->inet_id, get_random_u16())`.
+                self.inet_id.store(
+                    narf_net::ip_output::get_random_u16(),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
                 SocketOpResult::Ok(0)
             }
             SocketOp::Send { buf, flags, addr } => {
@@ -6671,15 +6846,29 @@ impl SocketFile {
                 }
                 let sequence = u16::from_be_bytes([buf[6], buf[7]]);
                 let echo = self.ensure_icmp_echo_socket();
+                let pmtudisc = self.options.lock().ext.ip_pmtudisc;
+                // A connected ping socket numbers its datagrams from
+                // `inet_id` (`ip_select_ident_segs` keys on `inet_daddr`).
+                let connected = self.icmp_echo.lock().peer.is_some();
                 match narf_net::icmp_sock::icmp_echo_send(
                     &echo,
                     target.to_be_bytes(),
                     sequence,
                     &buf[8..],
+                    pmtudisc,
+                    connected.then_some(&self.inet_id),
                 ) {
                     Ok(()) => SocketOpResult::Ok(buf.len() as u64),
                     Err(narf_net::icmp_sock::IcmpError2::MsgTooLong)
                     | Err(narf_net::icmp_sock::IcmpError2::BufferTooSmall) => {
+                        SocketOpResult::Err(SockError::MsgSize)
+                    }
+                    // `__ip_append_data` → `ip_local_error(sk, EMSGSIZE,
+                    // daddr, inet_dport, mtu)`. A ping socket's `inet_dport`
+                    // is 0: `ping_v4_sendmsg` routes with dport 0 and NARF's
+                    // connect keeps no port.
+                    Err(narf_net::icmp_sock::IcmpError2::LocalMsgSize { info }) => {
+                        self.ip_local_error(errno::EMSGSIZE as u32, target, 0, info);
                         SocketOpResult::Err(SockError::MsgSize)
                     }
                     Err(narf_net::icmp_sock::IcmpError2::NoInterface)
@@ -6689,8 +6878,18 @@ impl SocketFile {
                 }
             }
             SocketOp::Recv { buf, flags } => {
+                // `ping_recvmsg` → `inet_recv_error` → `ip_recv_error`: pop
+                // the oldest queued extended error; EAGAIN when empty.
                 if flags & MSG_ERRQUEUE != 0 {
-                    return SocketOpResult::Err(SockError::WouldBlock);
+                    let Some(ext) = self.pop_inet_err() else {
+                        return SocketOpResult::Err(SockError::WouldBlock);
+                    };
+                    self.stash_inet_err_ancillary(ext);
+                    let peer = Some(make_sockaddr_in(
+                        u32::from_be_bytes(ext.name_ip),
+                        ext.name_port,
+                    ));
+                    return SocketOpResult::Received { n: 0, peer };
                 }
                 let peek = flags & MSG_PEEK != 0;
                 if let Some(echo) = self.icmp_echo_socket() {
@@ -7820,7 +8019,8 @@ impl SocketFile {
                 let id = *tcb_id;
                 *state = SocketState::Fresh;
                 drop(state);
-                let _ = narf_net::tcp_stack::close(id);
+                // `connect(AF_UNSPEC)` is `tcp_disconnect`: an abort (RST).
+                let _ = narf_net::tcp_stack::close_linger(id, true);
                 crate::handlers::clear_tcb_owner(id);
             }
             SocketState::InetListener {
@@ -8826,6 +9026,7 @@ impl SocketFile {
         if self.domain == AF_UNIX && flags & MSG_OOB != 0 {
             return Err(SockError::NotSupported);
         }
+        let sndbuf = self.options.lock().sndbuf as usize;
         let state = self.state.lock();
         // InetWired sockets route through the kernel TCP-over-NIC stack.
         if let SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } =
@@ -8863,6 +9064,7 @@ impl SocketFile {
         let n = if self.kind == SOCK_SEQPACKET || self.kind == SOCK_DGRAM {
             tx.write_packet(buf, automatic_cred)
         } else if self.domain == AF_UNIX {
+            tx.set_sndbuf(sndbuf);
             tx.write_stream(buf, automatic_cred)
         } else {
             tx.write(buf)
@@ -8909,7 +9111,13 @@ impl SocketFile {
             // EAGAIN only when the connection is live with nothing queued.
             // Previously every empty read was EAGAIN, so a reader never saw
             // EOF, and a reset read as ENOTCONN instead of ECONNRESET.
-            let n = narf_net::tcp_stack::recv_errno(id, buf).map_err(SockError::from_stack)?;
+            // MSG_PEEK copies without consuming (Linux `tcp_recvmsg_locked`).
+            let n = if flags & MSG_PEEK != 0 {
+                narf_net::tcp_stack::recv_peek_errno(id, buf)
+            } else {
+                narf_net::tcp_stack::recv_errno(id, buf)
+            }
+            .map_err(SockError::from_stack)?;
             return Ok((n, None));
         }
         let rx = match &*state {
@@ -8945,6 +9153,19 @@ impl SocketFile {
         }
     }
 
+    /// Push a new SO_SNDBUF to this endpoint's AF_UNIX stream send ring, so
+    /// its flow control and POLL_OUT follow the option immediately.
+    pub(crate) fn unix_stream_sndbuf_changed(&self, sndbuf: usize) {
+        if self.domain != AF_UNIX || self.kind != SOCK_STREAM {
+            return;
+        }
+        let tx = match &*self.state.lock() {
+            SocketState::UnixConnected { tx, .. } => tx.clone(),
+            _ => return,
+        };
+        tx.set_sndbuf(sndbuf);
+    }
+
     /// AF_UNIX `sendmsg` with an SCM_RIGHTS fd batch: writes `buf` to the
     /// stream and queues `fds` for the peer's next `recvmsg`. Only valid on
     /// a connected AF_UNIX stream socket.
@@ -8954,6 +9175,7 @@ impl SocketFile {
         fds: Vec<ScmRightsFile>,
         explicit_cred: Option<Ucred>,
     ) -> Result<usize, SockError> {
+        let sndbuf = self.options.lock().sndbuf as usize;
         let state = self.state.lock();
         let tx = match &*state {
             SocketState::UnixConnected { tx, .. } => tx,
@@ -8969,6 +9191,7 @@ impl SocketFile {
         let n = if packet {
             tx.write_packet_with_fds(buf, fds, cred)
         } else {
+            tx.set_sndbuf(sndbuf);
             tx.write_stream_with_fds(buf, fds, cred)
         }?;
         drop(state);
@@ -9061,6 +9284,49 @@ impl SocketFile {
 
 const RING_CAP: usize = 64 * 1024;
 
+/// Linux's default `sk_sndbuf` (`net.core.wmem_default`), which a fresh
+/// AF_UNIX socket starts with.
+const UNIX_DEFAULT_SNDBUF: usize = 212_992;
+
+/// `SKB_DATA_ALIGN(sizeof(struct skb_shared_info))` on x86_64/aarch64.
+const SKB_SHINFO_SIZE: usize = 320;
+
+/// `SKB_DATA_ALIGN(sizeof(struct sk_buff))`.
+const SKB_STRUCT_SIZE: usize = 256;
+
+/// `SKB_MAX_HEAD(0)`: the linear room of a one-page head.
+const SKB_MAX_HEAD0: usize = 4096 - SKB_SHINFO_SIZE;
+
+/// Largest AF_UNIX stream send unit: `unix_stream_sendmsg` caps each skb at
+/// `SKB_MAX_HEAD(0) + UNIX_SKB_FRAGS_SZ` (32 KiB of page frags).
+const UNIX_MAX_UNIT: usize = SKB_MAX_HEAD0 + 32 * 1024;
+
+/// The `truesize` Linux charges to the sender's `sk_wmem_alloc` for one
+/// AF_UNIX stream skb carrying `unit` bytes. `unix_stream_sendmsg` puts
+/// everything past `SKB_MAX_HEAD(0)` in page frags (`data_len =
+/// PAGE_ALIGN(size - SKB_MAX_HEAD(0))`, at most `size`); `__alloc_skb` rounds
+/// the head (`SKB_DATA_ALIGN(head) + shinfo`) up to its slab (the 512-byte
+/// small-head cache, then kmalloc powers of two) and `SKB_TRUESIZE` adds the
+/// `sk_buff` itself. Checked against x86_64 Linux with the 212992-byte
+/// default sndbuf: a non-blocking peer accepts exactly 278 1-byte, 93
+/// 1000-byte, 49 3000-byte, 44 4096-byte, 24 8192-byte and 6 36544-byte
+/// sends before -EAGAIN.
+fn unix_skb_truesize(unit: usize) -> usize {
+    let page_align = |n: usize| n.div_ceil(4096) * 4096;
+    let data_len = if unit > SKB_MAX_HEAD0 {
+        unit.min(page_align(unit - SKB_MAX_HEAD0))
+    } else {
+        0
+    };
+    let head = (unit - data_len).next_multiple_of(64) + SKB_SHINFO_SIZE;
+    let head_slab = if head <= 512 {
+        512
+    } else {
+        head.next_power_of_two()
+    };
+    head_slab + SKB_STRUCT_SIZE + page_align(data_len)
+}
+
 /// Dropping the last reference to a connected socket end is a HANGUP for
 /// the peer: its reads must start returning 0 (EOF) and its
 /// `poll`/`epoll` must report `POLLIN`/`POLLHUP`.
@@ -9102,6 +9368,16 @@ impl Drop for SocketFile {
         //   `err = -EPIPE`). Leaving rx open let a peer keep buffering into a
         //   ring no one would ever read — a lost write reported as success.
         let closed = match &*self.state.lock() {
+            // `unix_release_sock`: a stream/seqpacket endpoint closing with
+            // unread data leaves its peer ECONNRESET in `sk_err`. The peer's
+            // send ring is this end's `rx`, so the reset rides on it.
+            SocketState::UnixConnected { tx, rx, .. }
+                if self.kind == SOCK_STREAM || self.kind == SOCK_SEQPACKET =>
+            {
+                tx.close();
+                rx.close_reader();
+                true
+            }
             SocketState::UnixConnected { tx, rx, .. }
             | SocketState::InetConnected { tx, rx, .. }
             | SocketState::Inet6Connected { tx, rx, .. } => {
@@ -9125,6 +9401,15 @@ impl Drop for SocketFile {
 pub struct RingBuf {
     inner: IrqSafeSpinLock<RingInner>,
     closed: AtomicBool,
+    /// The reading endpoint closed with data still queued: its writer's
+    /// `sk_err` is ECONNRESET until consumed (see
+    /// [`SocketFile::take_unix_reset`]). Consumed by `SO_ERROR` and by a
+    /// blocking stream send woken from its wait.
+    ///
+    /// LINUX-GAP: Linux also reports it as POLLERR and from a recv that
+    /// finds its queue empty (`unix_stream_read_generic` → `sock_error`);
+    /// NARF's poll and recv do not consult it yet.
+    reset: AtomicBool,
     /// Whether the endpoint receiving from this ring currently requests
     /// automatic Unix credentials. The sender samples it at send time, just
     /// like Linux's `unix_maybe_add_creds(sk, other)`.
@@ -9174,6 +9459,26 @@ struct RingInner {
     stream_cred_markers: VecDeque<StreamCredMarker>,
     stream_read_cred: Option<Ucred>,
     stream_tail_cred: Option<Ucred>,
+    /// AF_UNIX stream send units still (at least partly) queued, oldest
+    /// first — NARF's model of the sender's in-flight skbs. Each charges
+    /// [`unix_skb_truesize`] to [`Self::stream_wmem`] until the reader
+    /// consumes its LAST byte, as Linux releases `sk_wmem_alloc` only when
+    /// the whole skb is freed.
+    stream_units: VecDeque<StreamUnit>,
+    /// Sum of the charges of [`Self::stream_units`]: the sender's
+    /// `sk_wmem_alloc`.
+    stream_wmem: usize,
+    /// The sending endpoint's `sk_sndbuf` (SO_SNDBUF), refreshed on every
+    /// send and on setsockopt.
+    sndbuf: usize,
+}
+
+/// One AF_UNIX stream send unit (Linux: one skb from `unix_stream_sendmsg`).
+struct StreamUnit {
+    /// Stream offset one past the unit's last byte.
+    end: u64,
+    /// Bytes charged to `stream_wmem` ([`unix_skb_truesize`]).
+    charge: usize,
 }
 
 struct PacketRecord {
@@ -9184,12 +9489,57 @@ struct PacketRecord {
 
 struct StreamControl {
     offset: u64,
+    /// End of the send unit (skb) the rights ride on. `unix_stream_read_generic`
+    /// stops a receive once it has consumed from an skb carrying rights, so a
+    /// single recvmsg never returns bytes past this point together with them.
+    end: u64,
     fds: Vec<ScmRightsFile>,
 }
 
 struct StreamCredMarker {
     offset: u64,
     cred: Option<Ucred>,
+}
+
+impl RingInner {
+    /// Writable: `unix_writable` — `sk_wmem_alloc << 2 <= sk_sndbuf` — while
+    /// AF_UNIX stream units are in flight; otherwise the byte cap that bounds
+    /// loopback-INET streams, and the record cap for packet rings.
+    fn has_space(&self) -> bool {
+        let stream = if self.stream_units.is_empty() {
+            self.buf.len() < RING_CAP
+        } else {
+            self.stream_wmem.saturating_mul(4) <= self.sndbuf
+        };
+        stream && self.packet_bytes < RING_CAP
+    }
+
+    /// Release the wmem charge of every send unit the reader has now fully
+    /// consumed (`read_seq` at or past its end) — Linux frees the skb, and
+    /// with it the sender's `sk_wmem_alloc` charge, only then.
+    fn release_consumed_units(&mut self) {
+        while let Some(unit) = self.stream_units.front() {
+            if unit.end > self.stream_read_seq {
+                break;
+            }
+            self.stream_wmem = self.stream_wmem.saturating_sub(unit.charge);
+            self.stream_units.pop_front();
+        }
+    }
+
+    /// Cap a receive of `n` bytes from `start` at the end of the first send
+    /// unit carrying SCM_RIGHTS that it would consume from: Linux's
+    /// `unix_stream_read_generic` breaks after an skb with rights, so a
+    /// recvmsg returns at most one rights batch and never glues the bytes
+    /// that follow it onto that batch.
+    fn cap_at_rights_unit(&self, start: u64, n: usize) -> usize {
+        match self.stream_controls.front() {
+            Some(control) if control.offset < start.saturating_add(n as u64) => {
+                n.min(control.end.saturating_sub(start) as usize)
+            }
+            _ => n,
+        }
+    }
 }
 
 impl core::fmt::Debug for RingInner {
@@ -9215,8 +9565,12 @@ impl RingBuf {
                 stream_cred_markers: VecDeque::new(),
                 stream_read_cred: None,
                 stream_tail_cred: None,
+                stream_units: VecDeque::new(),
+                stream_wmem: 0,
+                sndbuf: UNIX_DEFAULT_SNDBUF,
             }),
             closed: AtomicBool::new(false),
+            reset: AtomicBool::new(false),
             capture_credentials: AtomicBool::new(false),
             owner_task: AtomicU64::new(0),
             // A fresh ring is empty: writable (has space), not readable, not
@@ -9268,10 +9622,7 @@ impl RingBuf {
         let closed = self.closed.load(Ordering::Acquire);
         let (data, space) = {
             let g = self.inner.lock();
-            (
-                !g.buf.is_empty() || !g.packets.is_empty(),
-                g.buf.len() < RING_CAP && g.packet_bytes < RING_CAP,
-            )
+            (!g.buf.is_empty() || !g.packets.is_empty(), g.has_space())
         };
         let readable = data || closed;
         let add = (if readable {
@@ -9337,7 +9688,7 @@ impl RingBuf {
 
     fn write(&self, src: &[u8]) -> Result<usize, SockError> {
         let mut g = self.inner.lock();
-        let avail = RING_CAP - g.buf.len();
+        let avail = RING_CAP.saturating_sub(g.buf.len());
         let n = core::cmp::min(src.len(), avail);
         if n != 0 {
             g.buf.try_reserve(n).map_err(|_| SockError::NoMemory)?;
@@ -9359,6 +9710,19 @@ impl RingBuf {
         Ok(n)
     }
 
+    /// AF_UNIX stream send with Linux `unix_stream_sendmsg` flow control.
+    /// The payload is split into units of at most
+    /// `min(sndbuf / 2 - 64, UNIX_MAX_UNIT)` bytes; each is queued only while
+    /// the sender's in-flight charge (`stream_wmem`) is below `sk_sndbuf`, and
+    /// a queued unit may overshoot it (`sock_alloc_send_pskb` checks before
+    /// allocating). So a send of at most one unit is all-or-nothing, a larger
+    /// one is short only after at least one whole unit went out, and `Ok(0)`
+    /// (for a non-empty `src`) means nothing could be queued — the caller's
+    /// EAGAIN. SCM_RIGHTS ride on the first unit only.  The syscall handlers
+    /// treat a short result as intermediate progress for a blocking stream
+    /// send: they retain its offset over a POLL_OUT wait and invoke this
+    /// bounded queueing operation again for the remaining suffix.  Direct
+    /// callers retain the non-blocking short-write primitive.
     fn write_stream_with_fds(
         &self,
         src: &[u8],
@@ -9366,45 +9730,62 @@ impl RingBuf {
         cred: Option<Ucred>,
     ) -> Result<usize, SockError> {
         let mut g = self.inner.lock();
-        let avail = RING_CAP - g.buf.len();
-        let n = core::cmp::min(src.len(), avail);
-        if n == 0 {
-            return Ok(0);
-        }
-        g.buf.try_reserve(n).map_err(|_| SockError::NoMemory)?;
-        if !fds.is_empty() {
-            g.stream_controls
-                .try_reserve(1)
-                .map_err(|_| SockError::NoMemory)?;
-        }
-        let cred_changed = g.stream_tail_cred != cred;
-        if cred_changed {
-            g.stream_cred_markers
-                .try_reserve(1)
-                .map_err(|_| SockError::NoMemory)?;
-        }
-        let marker = g.stream_write_seq;
-        g.buf.extend(src[..n].iter().copied());
-        g.stream_write_seq = g.stream_write_seq.saturating_add(n as u64);
-        if !fds.is_empty() {
-            g.stream_controls.push_back(StreamControl {
-                offset: marker,
-                fds,
-            });
-        }
-        if cred_changed {
-            g.stream_cred_markers.push_back(StreamCredMarker {
-                offset: marker,
-                cred,
-            });
-            g.stream_tail_cred = cred;
+        let unit_max = (g.sndbuf >> 1).saturating_sub(64).clamp(1, UNIX_MAX_UNIT);
+        let mut fds = Some(fds);
+        let mut sent = 0usize;
+        while sent < src.len() {
+            if g.stream_wmem >= g.sndbuf {
+                break;
+            }
+            let unit = (src.len() - sent).min(unit_max);
+            let first = sent == 0;
+            let reserved = g.buf.try_reserve(unit).is_ok()
+                && g.stream_units.try_reserve(1).is_ok()
+                && (!first
+                    || fds.as_ref().is_none_or(|f| f.is_empty())
+                    || g.stream_controls.try_reserve(1).is_ok())
+                && (!first
+                    || g.stream_tail_cred == cred
+                    || g.stream_cred_markers.try_reserve(1).is_ok());
+            if !reserved {
+                if first {
+                    return Err(SockError::NoMemory);
+                }
+                break;
+            }
+            let marker = g.stream_write_seq;
+            let end = marker.saturating_add(unit as u64);
+            g.buf.extend(src[sent..sent + unit].iter().copied());
+            g.stream_write_seq = end;
+            if first {
+                if let Some(fds) = fds.take().filter(|f| !f.is_empty()) {
+                    g.stream_controls.push_back(StreamControl {
+                        offset: marker,
+                        end,
+                        fds,
+                    });
+                }
+                if g.stream_tail_cred != cred {
+                    g.stream_cred_markers.push_back(StreamCredMarker {
+                        offset: marker,
+                        cred,
+                    });
+                    g.stream_tail_cred = cred;
+                }
+            }
+            let charge = unix_skb_truesize(unit);
+            g.stream_units.push_back(StreamUnit { end, charge });
+            g.stream_wmem = g.stream_wmem.saturating_add(charge);
+            sent += unit;
         }
         drop(g);
         // See RingBuf::write: fire the readable wait-queue on every data-bearing
         // write so an EPOLLET reader re-fires on bytes appended before it
-        // drained. n > 0 here (the n == 0 case returned early above).
-        self.sync_readiness(narf_filesystem::POLL_IN);
-        Ok(n)
+        // drained.
+        if sent != 0 {
+            self.sync_readiness(narf_filesystem::POLL_IN);
+        }
+        Ok(sent)
     }
 
     fn write_stream(&self, src: &[u8], cred: Option<Ucred>) -> Result<usize, SockError> {
@@ -9466,6 +9847,7 @@ impl RingBuf {
                 n = n.min(next.offset.saturating_sub(start) as usize);
             }
         }
+        n = g.cap_at_rights_unit(start, n);
         let (front, back) = g.buf.as_slices();
         let first = n.min(front.len());
         dst[..first].copy_from_slice(&front[..first]);
@@ -9497,6 +9879,7 @@ impl RingBuf {
         }
         g.stream_read_seq = end;
         g.stream_read_cred = active_cred;
+        g.release_consumed_units();
         if n != 0 && (active_cred.is_some() || !delivered.is_empty()) {
             g.delivered_ancillary.insert(
                 task,
@@ -9537,6 +9920,7 @@ impl RingBuf {
                 n = n.min(boundary.saturating_sub(start) as usize);
             }
         }
+        n = g.cap_at_rights_unit(start, n);
         let (front, back) = g.buf.as_slices();
         let first = n.min(front.len());
         dst[..first].copy_from_slice(&front[..first]);
@@ -9595,6 +9979,20 @@ impl RingBuf {
         self.closed.load(Ordering::Acquire)
     }
 
+    /// [`Self::close`] by the endpoint that READS this ring. Unread data
+    /// left behind resets the writer (`unix_release_sock`). Latched before
+    /// the close publishes POLL_HUP, so a writer woken by it sees the reset.
+    fn close_reader(&self) {
+        if self.has_data() {
+            self.reset.store(true, Ordering::Release);
+        }
+        self.close();
+    }
+
+    fn take_reset(&self) -> bool {
+        self.reset.swap(false, Ordering::AcqRel)
+    }
+
     fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
             // Closing latches POLL_IN (EOF) + POLL_HUP so a reader parked on
@@ -9622,8 +10020,22 @@ impl RingBuf {
     }
 
     fn has_space(&self) -> bool {
-        let g = self.inner.lock();
-        g.buf.len() < RING_CAP && g.packet_bytes < RING_CAP
+        self.inner.lock().has_space()
+    }
+
+    /// Record the sending endpoint's `sk_sndbuf`, which bounds how much it
+    /// may have in flight on this ring. Republishes POLL_OUT: Linux's
+    /// SO_SNDBUF calls `sk_write_space`, so a raised limit wakes writers.
+    fn set_sndbuf(&self, sndbuf: usize) {
+        let changed = {
+            let mut g = self.inner.lock();
+            let changed = g.sndbuf != sndbuf;
+            g.sndbuf = sndbuf;
+            changed
+        };
+        if changed {
+            self.sync_readiness(narf_filesystem::POLL_OUT);
+        }
     }
 }
 
@@ -11214,6 +11626,7 @@ fn smoke_ipv6_socket_options_and_ancillary_are_per_datagram() -> TestResult {
         ifindex: 9,
         hop_limit: 37,
         traffic_class: 0x2e,
+        gso_size: 0,
     };
     socket.stash_inet6_recv_ancillary(ancillary);
     if pktinfo

@@ -206,15 +206,43 @@ pub fn iter_options(mut buf: &[u8]) -> impl Iterator<Item = TcpOption<'_>> {
 
 // ── Pseudo-header checksum ─────────────────────────────────────────
 
+/// The IPv4 TCP checksum over the pseudo-header and `segment` — the value to
+/// store in the checksum field (with that field zeroed), or 0 when verifying a
+/// segment whose stored checksum is correct.
 pub fn ipv4_pseudo_checksum(src: [u8; 4], dst: [u8; 4], segment: &[u8]) -> u16 {
-    let mut buf = Vec::with_capacity(12 + segment.len() + 1);
-    buf.extend_from_slice(&src);
-    buf.extend_from_slice(&dst);
-    buf.push(0);
-    buf.push(crate::pkt::IP_PROTO_TCP);
-    buf.extend_from_slice(&(segment.len() as u16).to_be_bytes());
-    buf.extend_from_slice(segment);
-    ip_checksum(&buf)
+    ipv4_pseudo_checksum_proto(src, dst, crate::pkt::IP_PROTO_TCP, segment)
+}
+
+/// [`ipv4_pseudo_checksum`] for any L4 protocol (UDP's is the same
+/// construction). Sums in place: the RFC 1071 result of
+/// `ip_checksum(pseudo_header ++ segment)` without building that buffer, which
+/// used to allocate and copy every segment on both the send and receive paths.
+pub fn ipv4_pseudo_checksum_proto(src: [u8; 4], dst: [u8; 4], proto: u8, segment: &[u8]) -> u16 {
+    // The 12-byte pseudo-header is word-aligned, so the segment's 16-bit words
+    // line up exactly as they would after it in one buffer.
+    let mut sum: u64 = u64::from(u16::from_be_bytes([src[0], src[1]]))
+        + u64::from(u16::from_be_bytes([src[2], src[3]]))
+        + u64::from(u16::from_be_bytes([dst[0], dst[1]]))
+        + u64::from(u16::from_be_bytes([dst[2], dst[3]]))
+        + u64::from(proto)
+        + segment.len() as u64;
+    let mut words = segment.chunks_exact(4);
+    for w in &mut words {
+        sum += u64::from(u32::from_be_bytes([w[0], w[1], w[2], w[3]]));
+    }
+    let rest = words.remainder();
+    if rest.len() >= 2 {
+        sum += u64::from(u16::from_be_bytes([rest[0], rest[1]]));
+    }
+    if rest.len() % 2 == 1 {
+        sum += u64::from(rest[rest.len() - 1]) << 8;
+    }
+    // A 32-bit word adds its halves at weights 2^16 and 1; folding the carries
+    // down to 16 bits is the same one's-complement sum.
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 /// The IPv4 TCP checksum-offload *seed*: the one's-complement sum of the

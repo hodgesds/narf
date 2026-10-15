@@ -1294,6 +1294,10 @@ impl FileOps for OverlayFile {
         self.active().supports_mmap_fault()
     }
 
+    fn mmap_fault_async<'a>(&'a self, offset: u64) -> FsFuture<'a, u64> {
+        Box::pin(async move { self.active().mmap_fault_async(offset).await })
+    }
+
     fn mmap_backing_identity(&self) -> usize {
         self.active().mmap_backing_identity()
     }

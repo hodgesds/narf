@@ -560,6 +560,88 @@ kernel_test_in!(
     smoke_drm_ioctl_atomic_empty_commit_succeeds
 );
 
+/// KWin validates its initial CRTC enable with TEST_ONLY | ALLOW_MODESET
+/// before it submits the real commit.  The CRTC starts inactive because the
+/// boot scanout resource is transport-owned, so this request necessarily
+/// changes ACTIVE.  The UAPI bridge must carry ALLOW_MODESET into
+/// `AtomicState::allow_modeset`; otherwise a valid `0x500` probe is rejected
+/// as an unflagged modeset.
+#[allow(dead_code)]
+fn smoke_drm_atomic_test_only_allow_modeset_accepts_initial_crtc_enable() -> TestResult {
+    let idx = register_test_virtio_card();
+    let objects = [11u32];
+    let prop_counts = [1u32];
+    let props = [0x52u32]; // CRTC ACTIVE
+    let values = [1u64];
+    let mut req = DrmModeAtomicUapi {
+        flags: 0x0500, // DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_ALLOW_MODESET
+        count_objs: objects.len() as u32,
+        objs_ptr: objects.as_ptr() as u64,
+        count_props_ptr: prop_counts.as_ptr() as u64,
+        props_ptr: props.as_ptr() as u64,
+        prop_values_ptr: values.as_ptr() as u64,
+        ..Default::default()
+    };
+    match dispatch_card(
+        idx,
+        DRM_IOCTL_MODE_ATOMIC,
+        &mut req as *mut _ as usize,
+        /*render*/ false,
+    ) {
+        Ok(0) => TestResult::Pass,
+        _ => TestResult::Fail("TEST_ONLY | ALLOW_MODESET rejected initial CRTC enable"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_atomic_test_only_allow_modeset_accepts_initial_crtc_enable
+);
+
+/// The VirtIO transport has already completed SET_SCANOUT before the DRM card
+/// is registered.  KWin follows its initial allowed probe with a TEST_ONLY |
+/// NONBLOCK check that deliberately omits ALLOW_MODESET.  As in Linux, an
+/// unchanged ACTIVE property must remain a page-flip check, rather than being
+/// turned into a false modeset because NARF forgot the live boot scanout.
+#[allow(dead_code)]
+fn smoke_drm_atomic_test_only_keeps_active_boot_scanout_no_modeset() -> TestResult {
+    let idx = register_test_virtio_card();
+    {
+        let mode_state = match crate::drm_registry::mode_state(idx) {
+            Some(mode_state) => mode_state,
+            None => return TestResult::Fail("test VirtIO card had no mode state"),
+        };
+        let mut card = mode_state.lock();
+        card.crtcs[0].enabled = true;
+        card.crtcs[0].mode = Some(crate::Mode::XGA_60);
+    }
+    let objects = [11u32];
+    let prop_counts = [1u32];
+    let props = [0x52u32]; // CRTC ACTIVE
+    let values = [1u64];
+    let mut req = DrmModeAtomicUapi {
+        flags: 0x0300, // DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_NONBLOCK
+        count_objs: objects.len() as u32,
+        objs_ptr: objects.as_ptr() as u64,
+        count_props_ptr: prop_counts.as_ptr() as u64,
+        props_ptr: props.as_ptr() as u64,
+        prop_values_ptr: values.as_ptr() as u64,
+        ..Default::default()
+    };
+    match dispatch_card(
+        idx,
+        DRM_IOCTL_MODE_ATOMIC,
+        &mut req as *mut _ as usize,
+        /*render*/ false,
+    ) {
+        Ok(0) => TestResult::Pass,
+        _ => TestResult::Fail("unchanged active boot scanout was treated as a modeset"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_atomic_test_only_keeps_active_boot_scanout_no_modeset
+);
+
 /// KWin performs a plane-only TEST_ONLY commit, then submits the same plane
 /// update with NONBLOCK | PAGE_FLIP_EVENT. Linux implicitly adds both the
 /// plane's old and new CRTC states while decoding CRTC_ID, so the real commit
@@ -1155,6 +1237,7 @@ fn smoke_drm_map_dumb_resolves_to_phys() -> TestResult {
             order: 0,
             mmap_offset,
             refcount: 1,
+            dma_buf: Default::default(),
         });
         crate::drm_registry::register_drm_card_with_state(
             Arc::new(crate::drm_devfs_bridge::BochsCard::new(name)),
@@ -1216,6 +1299,7 @@ fn smoke_drm_prime_export_aliases_dumb_frames() -> TestResult {
             order: 1,
             mmap_offset: (handle as u64) << 12,
             refcount: 1,
+            dma_buf: Default::default(),
         });
         crate::drm_registry::register_drm_card_with_state(
             Arc::new(crate::drm_devfs_bridge::BochsCard::new(name)),
@@ -1315,6 +1399,7 @@ fn smoke_drm_primary_mmap_pins_dumb_backing() -> TestResult {
             order: 0,
             mmap_offset: (handle as u64) << 12,
             refcount: 1,
+            dma_buf: Default::default(),
         });
         crate::drm_registry::register_drm_card_with_state(
             Arc::new(crate::drm_devfs_bridge::BochsCard::new(name)),
@@ -1372,6 +1457,7 @@ fn smoke_drm_dumb_backing_survives_gem_close_while_fb_held() -> TestResult {
         order: 0,
         mmap_offset: (handle as u64) << 12,
         refcount: 1,
+        dma_buf: Default::default(),
     });
     // ADDFB2 takes a reference (refcount 1 -> 2). XR24 = 0x34325258.
     let fb = card.addfb2(64, 64, 0x3432_5258, 256, handle).unwrap();
@@ -1423,6 +1509,7 @@ fn smoke_drm_setcrtc_with_fb_succeeds() -> TestResult {
             order: 0,
             mmap_offset: (handle as u64) << 12,
             refcount: 1,
+            dma_buf: Default::default(),
         });
         // Register a framebuffer backed by this handle.
         let fb_id = card
@@ -1724,3 +1811,202 @@ const _USE_VEC: Option<alloc::vec::Vec<u8>> = None;
 fn _use_vec_macro() {
     let _ = vec![0u8; 0];
 }
+
+// ── dma-buf implicit sync on the real PRIME files ─────────────────────────
+//
+// Linux keeps ONE `dma_resv` per buffer: every dma-buf fd exported from a
+// GEM handle (and every handle that re-imports it) sees the same fences.
+// Chromium imports a render fence into the dma-buf it hands the compositor
+// and the compositor exports it back, often through a different fd.
+
+/// A sync_file stand-in fence for the dma-buf ioctl context below.
+struct PendingTestFence(u64);
+
+impl narf_filesystem::DrmFence for PendingTestFence {
+    fn is_signalled(&self) -> bool {
+        false
+    }
+    fn wait(&self, _timeout_ms: u64) -> bool {
+        false
+    }
+    fn context(&self) -> Option<u64> {
+        Some(self.0)
+    }
+}
+
+/// Offset-addressed ioctl memory plus the syscall layer's sync_file seam:
+/// fd 7 is a sync_file holding `import`; exports are captured.
+struct DmaBufCtx {
+    bytes: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u8>>,
+    import: Arc<dyn narf_filesystem::DrmFence>,
+    exported: narf_lib::sync::IrqSafeSpinLock<
+        Option<alloc::vec::Vec<Arc<dyn narf_filesystem::DrmFence>>>,
+    >,
+}
+
+impl DmaBufCtx {
+    fn new(import: Arc<dyn narf_filesystem::DrmFence>) -> Self {
+        Self {
+            bytes: narf_lib::sync::IrqSafeSpinLock::new(vec![0u8; 64]),
+            import,
+            exported: narf_lib::sync::IrqSafeSpinLock::new(None),
+        }
+    }
+
+    fn put(&self, at: usize, b: &[u8]) {
+        self.bytes.lock()[at..at + b.len()].copy_from_slice(b);
+    }
+
+    fn get32(&self, at: usize) -> i32 {
+        i32::from_ne_bytes(self.bytes.lock()[at..at + 4].try_into().unwrap())
+    }
+}
+
+impl narf_filesystem::IoctlContext for DmaBufCtx {
+    fn read(&self, a: u64, b: &mut [u8]) -> Result<(), FsError> {
+        let data = self.bytes.lock();
+        let a = a as usize;
+        b.copy_from_slice(data.get(a..a + b.len()).ok_or(FsError::BadAddress)?);
+        Ok(())
+    }
+    fn write(&self, a: u64, b: &[u8]) -> Result<(), FsError> {
+        let mut data = self.bytes.lock();
+        let a = a as usize;
+        data.get_mut(a..a + b.len())
+            .ok_or(FsError::BadAddress)?
+            .copy_from_slice(b);
+        Ok(())
+    }
+    fn nonblocking(&self) -> bool {
+        false
+    }
+    fn sync_file_fences(
+        &self,
+        fd: i32,
+    ) -> Option<alloc::vec::Vec<Arc<dyn narf_filesystem::DrmFence>>> {
+        (fd == 7).then(|| vec![self.import.clone()])
+    }
+    fn install_sync_file(
+        &self,
+        fences: alloc::vec::Vec<Arc<dyn narf_filesystem::DrmFence>>,
+        report: &mut dyn FnMut(i32) -> Result<(), FsError>,
+    ) -> Result<i32, narf_filesystem::InstallFdError> {
+        report(5).map_err(narf_filesystem::InstallFdError::Report)?;
+        *self.exported.lock() = Some(fences);
+        Ok(5)
+    }
+}
+
+const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: u32 = 0xc008_6202;
+const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: u32 = 0x4008_6203;
+
+fn dma_buf_ioctl(
+    file: &Arc<dyn FileOps>,
+    ctx: &DmaBufCtx,
+    cmd: u32,
+    flags: u32,
+    fd: i32,
+) -> Option<u64> {
+    ctx.put(8, &flags.to_ne_bytes());
+    ctx.put(12, &fd.to_ne_bytes());
+    // dma_buf_ioctl never parks for these requests: one poll completes it.
+    let mut future = file.ioctl_user(cmd, 8, ctx);
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    match future.as_mut().poll(&mut cx) {
+        core::task::Poll::Ready(result) => result.ok(),
+        core::task::Poll::Pending => None,
+    }
+}
+
+/// IMPORT through one export and EXPORT through another must meet on the
+/// shared reservation; an unknown dma-buf ioctl is ENOTTY.
+fn check_shared_reservation(
+    first: &Arc<dyn FileOps>,
+    second: &Arc<dyn FileOps>,
+) -> Result<(), &'static str> {
+    let fence: Arc<dyn narf_filesystem::DrmFence> = Arc::new(PendingTestFence(0x77));
+    let ctx = DmaBufCtx::new(fence.clone());
+    if dma_buf_ioctl(first, &ctx, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, 2, 7) != Some(0) {
+        return Err("IMPORT_SYNC_FILE(WRITE) on the PRIME dma-buf failed");
+    }
+    if dma_buf_ioctl(second, &ctx, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, 1, -1) != Some(0) {
+        return Err("EXPORT_SYNC_FILE(READ) on the second export failed");
+    }
+    if ctx.get32(12) != 5 {
+        return Err("EXPORT_SYNC_FILE did not report the installed fd");
+    }
+    let exported = ctx.exported.lock().take().unwrap_or_default();
+    if exported.len() != 1 || !Arc::ptr_eq(&exported[0], &fence) {
+        return Err("the second export did not see the fence imported through the first");
+    }
+    if dma_buf_ioctl(first, &ctx, 0x4008_6204, 0, 0) != Some((-25i64) as u64) {
+        return Err("an unknown dma-buf ioctl must be -ENOTTY");
+    }
+    Ok(())
+}
+
+fn smoke_drm_prime_dumb_exports_share_dma_resv() -> TestResult {
+    use crate::drm::card::DumbBacking;
+    let idx = {
+        let name = format!("card{}", crate::drm_registry::count());
+        let mut card = make_test_card();
+        let fake_phys = 0xBEEF_0000u64;
+        let handle = card.gem.alloc(fake_phys, 4096).unwrap();
+        card.dumb_backings.push(DumbBacking {
+            gem_handle: handle,
+            phys: fake_phys,
+            byte_len: 4096,
+            order: 0,
+            mmap_offset: (handle as u64) << 12,
+            refcount: 1,
+            dma_buf: Default::default(),
+        });
+        crate::drm_registry::register_drm_card_with_state(
+            Arc::new(crate::drm_devfs_bridge::BochsCard::new(name)),
+            card,
+        )
+    };
+    let (Some(first), Some(second)) = (
+        crate::drm_devfs_bridge::prime_export_fileops(idx, 1),
+        crate::drm_devfs_bridge::prime_export_fileops(idx, 1),
+    ) else {
+        return TestResult::Fail("PRIME export of a live dumb handle failed");
+    };
+    match check_shared_reservation(&first, &second) {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_prime_dumb_exports_share_dma_resv
+);
+
+/// VirGL PRIME files share the resource's reservation, which is also where
+/// EXECBUFFER publishes its WRITE fence (`virtio_gpu_array_add_fence`).
+fn smoke_drm_virtgpu_prime_exports_share_dma_resv() -> TestResult {
+    let resource = crate::drm_ioctl_bridge::test_virtgpu_resource(0x45, 4096);
+    let first = crate::drm_devfs_bridge::test_virtgpu_dma_buf_file(Arc::clone(&resource));
+    let second = crate::drm_devfs_bridge::test_virtgpu_dma_buf_file(Arc::clone(&resource));
+    if let Err(message) = check_shared_reservation(&first, &second) {
+        return TestResult::Fail(message);
+    }
+    let gpu_write: Arc<dyn narf_filesystem::DrmFence> = Arc::new(PendingTestFence(0x99));
+    resource.dma_buf.resv.add_fence(
+        gpu_write.clone(),
+        narf_filesystem::dma_buf::DmaResvUsage::Write,
+    );
+    let ctx = DmaBufCtx::new(gpu_write.clone());
+    if dma_buf_ioctl(&second, &ctx, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, 1, -1) != Some(0) {
+        return TestResult::Fail("EXPORT_SYNC_FILE after a GPU write failed");
+    }
+    let exported = ctx.exported.lock().take().unwrap_or_default();
+    if !exported.iter().any(|fence| Arc::ptr_eq(fence, &gpu_write)) {
+        return TestResult::Fail("EXPORT_SYNC_FILE(READ) missed the resource's GPU write fence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_virtgpu_prime_exports_share_dma_resv
+);

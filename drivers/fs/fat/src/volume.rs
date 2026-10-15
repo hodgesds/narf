@@ -334,12 +334,32 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
         Ok(())
     }
 
+    /// Whether the entry at `ent_offset` runs past the end of its sector.
+    /// Only a FAT12 entry can: it is 1.5 bytes wide, so one in three
+    /// sector boundaries splits an entry, its first byte the sector's last
+    /// and its second byte the next sector's first. Linux reads both blocks
+    /// for it (`fs/fat/fatent.c::fat12_ent_bread`, `bhs[1]`).
+    fn fat_entry_straddles(&self, ent_offset: usize, lbs: usize) -> bool {
+        self.version == FatVersion::Fat12 && ent_offset + 1 >= lbs
+    }
+
     pub async fn next_cluster(&self, cluster: u32) -> Result<super::fat::FatEntry, FsError> {
         let (sec_num, ent_offset) = self.sector_of_fat_entry(cluster);
         let lbs = self.io.lock().lbs;
         let mut buf = vec![0u8; lbs];
         self.read_sector(sec_num as u64, &mut buf).await?;
-        Ok(super::fat::parse_entry(self.version, ent_offset, &buf))
+        if self.fat_entry_straddles(ent_offset, lbs) {
+            let mut next = vec![0u8; lbs];
+            self.read_sector(sec_num as u64 + 1, &mut next).await?;
+            let pair = [buf[ent_offset], next[0]];
+            return Ok(super::fat::parse_entry(self.version, cluster, 0, &pair));
+        }
+        Ok(super::fat::parse_entry(
+            self.version,
+            cluster,
+            ent_offset,
+            &buf,
+        ))
     }
 
     pub async fn update_fat_entry(&self, cluster: u32, value: u32) -> Result<(), FsError> {
@@ -347,11 +367,27 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
         let lbs = self.io.lock().lbs;
         let mut buf = vec![0u8; lbs];
         self.read_sector(sec_num as u64, &mut buf).await?;
-        super::fat::write_entry(self.version, ent_offset, &mut buf, value);
+        // A split FAT12 entry is read-modify-written across both sectors,
+        // and both go to every FAT copy (`fat_mirror_bhs`).
+        let mut next = None;
+        if self.fat_entry_straddles(ent_offset, lbs) {
+            let mut second = vec![0u8; lbs];
+            self.read_sector(sec_num as u64 + 1, &mut second).await?;
+            let mut pair = [buf[ent_offset], second[0]];
+            super::fat::write_entry(self.version, cluster, 0, &mut pair, value);
+            buf[ent_offset] = pair[0];
+            second[0] = pair[1];
+            next = Some(second);
+        } else {
+            super::fat::write_entry(self.version, cluster, ent_offset, &mut buf, value);
+        }
         let fat_sz = self.bpb.fat_size(self.fat32_ext.as_ref());
         for i in 0..self.bpb.num_fats {
             let fat_sec = sec_num + (i as u32 * fat_sz);
             self.write_sector(fat_sec as u64, &buf).await?;
+            if let Some(second) = &next {
+                self.write_sector(fat_sec as u64 + 1, second).await?;
+            }
         }
         Ok(())
     }

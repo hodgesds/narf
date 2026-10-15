@@ -232,10 +232,14 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
             });
             return;
         }
-        release_reaped_task(child_pid);
-        crate::release_pid(crate::ProcessId(child_pid));
-        // Reaped — drop the parent record so wait4's ECHILD check is accurate.
-        parent_of_remove(child_pid);
+        // A tracer's reap of a zombie handed back to its real parent releases
+        // nothing (`hand_back_traced_zombie`).
+        if !take_handed_back(child_pid) {
+            release_reaped_task(child_pid);
+            crate::release_pid(crate::ProcessId(child_pid));
+            // Reaped — drop the parent record so wait4's ECHILD check is accurate.
+            parent_of_remove(child_pid);
+        }
         ctx.set_return(match copy_errno {
             Some(errno) => errno_ret(errno as i64),
             None => SyscallReturn::ok(0),

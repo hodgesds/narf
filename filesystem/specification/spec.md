@@ -108,6 +108,16 @@ adapter is registered as `cryptroot`. Missing credentials and authenticated
 unlock failures surface as `RootMountError::LuksUnlock`; they never fall
 through to an unrelated disk.
 
+`try_mount_root_with_options` additionally accepts
+`RootMountOptions::tmpfs_overlay`. When set (the explicit-`root=`
+`systemd_pid1` installed-distro boot path), the selected filesystem is the
+immutable OverlayFS lower and a Linux-compatible `TmpFs` upper becomes the
+visible `/` before PID 1 starts. The selector-free installed-root fallback
+uses the same wrapper at `/mnt` before PID 1 is rooted there.
+The upper inherits the lower root's owner and mode, is limited by the normal
+tmpfs policy (half of managed RAM by default), and is discarded at shutdown.
+`RootMountError::TmpfsOverlay` reports failure to construct that session view.
+
 ### 3.1 Path and node types
 
 ```rust
@@ -278,10 +288,13 @@ pub trait FileOps {
     fn mmap_is_ram(&self) -> bool;
     fn supports_mmap_fault(&self) -> bool;
     fn mmap_backing_identity(&self) -> usize;
-    fn mmap_fault(&self, offset: u64) -> Result<u64, FsError>;
+    fn mmap_fault_async(&self, offset: u64) -> FsFuture<'_, u64>;
+    fn mmap_fault(&self, offset: u64) -> Result<u64, FsError>; // legacy immediate adapter
     fn mmap_cache_generation(&self) -> Option<u64>;
     fn open_instance(&self) -> Option<Arc<dyn FileOps>>;
     fn open_instance_checked(&self, write: bool) -> Result<Option<Arc<dyn FileOps>>, FsError>;
+    fn llseek_pos(&self, offset: i64, whence: u32, pos: u64) -> Option<Result<u64, i64>>;
+    fn unsigned_offsets(&self) -> bool;
     fn readiness(&self) -> Option<&narf_lib::readiness::Readiness>;
     fn arm_readiness(&self, task_id: u64, interest: u32, waker: &Waker)
         -> Option<Poll<u32>>;
@@ -304,6 +317,30 @@ pub trait DrmFence: Send + Sync {
     fn is_signalled(&self) -> bool;
     fn wait(&self, timeout_ms: u64) -> bool;
     fn context(&self) -> Option<u64>;
+    fn seqno(&self) -> u64;            // default 0
+    fn driver_name(&self) -> &str;     // default "narf"
+    fn timeline_name(&self) -> &str;   // default "narf"
+    fn timestamp_ns(&self) -> Option<u64>; // default None
+}
+
+pub enum InstallFdError { NoDescriptor /* EMFILE */, Report(FsError) }
+
+// IoctlContext additions (defaults: None / Err / false):
+fn sync_file_fences(&self, fd: i32) -> Option<Vec<Arc<dyn DrmFence>>>;
+fn install_sync_file(
+    &self,
+    fences: Vec<Arc<dyn DrmFence>>,
+    report: &mut dyn FnMut(i32) -> Result<(), FsError>,
+) -> Result<i32, InstallFdError>;
+fn restart_after(&self, repoll_ns: u64) -> bool; // default false
+
+pub mod dma_buf {
+    pub enum DmaResvUsage { Kernel, Write, Read, Bookkeep }
+    pub fn dma_resv_usage_rw(write: bool) -> DmaResvUsage;
+    pub struct DmaResv;        // add_fence(fence, usage), fences(usage)
+    pub struct DmaBufObject { pub resv: DmaResv, /* name */ }
+    pub fn dma_buf_ioctl(obj: &DmaBufObject, cmd: u32, arg: u64,
+                         ctx: &dyn IoctlContext) -> Result<u64, FsError>;
 }
 
 pub enum FileType {
@@ -341,6 +378,20 @@ for a non-zero offset, `EINVAL` otherwise). `/dev/kmsg` is record-based: one
 record per `read`, a per-open sequence cursor (readiness keys off it, never off
 the file offset), `EINVAL` for a too-small buffer, `EPIPE` after overrun, and
 `<N>`-prefixed injection on `write`.
+`llseek_pos(offset, whence, pos)` defaults to `None` and is consulted before
+`llseek`: a file whose `file_operations.llseek` owns `f_pos` receives the
+description's position and its `Some(Ok(v))` both becomes the new position
+and lseek's return value — `/proc/<pid>/mem`'s `mem_lseek` (SEEK_SET,
+wrapping SEEK_CUR, `EINVAL` otherwise). `unsigned_offsets()` (default
+`false`) is Linux `FOP_UNSIGNED_OFFSET`: `rw_verify_area` then admits a
+position at or past `LLONG_MAX` (`EOVERFLOW` only when the count would
+wrap), as `/proc/<pid>/mem` addresses kernel-half virtual addresses.
+`/proc/<pid>/mem` and `/proc/<pid>/task/<tid>/mem` are 0600 nodes whose
+`open_instance_checked` calls the hook installed by
+`procfs::install_proc_mem_hook(fn(pid) -> Result<Arc<dyn ProcMemAccess>, FsError>)`
+(`proc_mem_open`: `ESRCH` without an mm, `EACCES` from `mm_access`); the
+open file reads/writes through the bound `ProcMemAccess` (`read_at`/
+`write_at`: `Ok(0)` once the mm is gone, `EIO` when no byte is accessible).
 `poll_edge_token` defaults to `(0, 0)`; stateful readiness providers advance
 one component whenever an edge-relevant source changes so `EPOLLET` cannot
 lose a drain/refill transition between readiness scans.
@@ -732,6 +783,18 @@ The procfs task-info hook takes a `TaskInfoQuery`: ordinary liveness,
 `stat`, `status`, `statm`, `cmdline`, and `comm` requests use allocation-free
 aggregate memory counters and leave the VMA vector empty; only `maps` and
 `numa_maps` request the potentially large per-region detail snapshot.
+Every `/proc/<pid>/maps` and `smaps` header follows Linux's token grammar
+`start-end perms offset dev inode [pathname]`. Exec-published loader image
+VMAs retain their original file offset, `st_dev`/`st_ino`, and resolved
+pathname, so consumers such as Crashpad can group every segment of an ELF
+image and reconstruct its image base from the offset-zero segment. A VMA
+created by `mmap(2)` of a file renders the file offset of the VMA's own first
+byte (`vm_pgoff << PAGE_SHIFT`, advanced across splits), the backing
+`st_dev` as `MAJOR:MINOR` and `st_ino`, and the fd's open path as the reader's
+root sees it; a newline in a pathname is escaped as `\012` (`seq_path`).
+Unknown backing identity remains `00:00 0`, and the inode is always followed by
+whitespace even for an anonymous mapping; Crashpad parses that field with a
+space delimiter.
 This per-task mountinfo projection is wired for every Linux-compat build,
 independently of optional container namespaces: service managers use
 `CLONE_NEWNS` for sandboxing and must observe private stacked file binds before
@@ -842,12 +905,16 @@ reference, never discards a dirty page, and files returning `None` retain the
 conservative final-unmap reclamation behavior.
 
 `supports_mmap_fault` is the side-effect-free capability check for direct
-demand backing. It is deliberately separate from `mmap_fault`: a refusal at
-an offset beyond the current EOF must not make `mmap(2)` select the generic
-copy fallback for the whole VMA. A filesystem shrinking such a direct-mapped
-file calls `unmap_mapping_range` before retiring its cache folios; userspace
-installs the VMA-owning hook during common boot, while standalone filesystem
-tests with no userspace mappings safely observe a no-op.
+demand backing. It is deliberately separate from `mmap_fault_async`: a
+refusal at an offset beyond the current EOF must not make `mmap(2)` select the
+generic copy fallback for the whole VMA. `mmap_fault_async` is driven with the
+faulting stackful task's executor waker; an I/O-backed implementation awaits
+its canonical cache fill, and the common fault bridge parks until that waker
+fires rather than spin-polling. The default adapter wraps the legacy immediate
+`mmap_fault` hook for RAM/device providers. A filesystem shrinking such a
+direct-mapped file calls `unmap_mapping_range` before retiring its cache
+folios; userspace installs the VMA-owning hook during common boot, while
+standalone filesystem tests with no userspace mappings safely observe a no-op.
 `mmap_backing_identity` identifies the live object owning those pages;
 forwarding wrappers preserve the underlying value so a truncate issued by the
 backing filesystem still finds and revokes VMAs owned by the wrapper.
@@ -1107,7 +1174,32 @@ EXECBUFFER. `DrmFence` supplies readiness, bounded wait, and an optional
 ordered-context key; `drm_execbuf_context(ring_idx)` supplies the matching key
 for a new submission so a same-ring input fence can rely on queue ordering
 without a synchronous wait. Drivers that do not produce device fences return
-`None` and retain the pre-signalled compatibility behavior.
+`None` and retain the pre-signalled compatibility behavior. `DrmFence` also
+carries Linux `dma_fence` identity for `SYNC_IOC_FILE_INFO` and merging:
+`seqno` (ordering within `context`), `driver_name`/`timeline_name`, and the
+signal `timestamp_ns` when the driver records one.
+
+`dma_buf` is the generic dma-buf core, mirroring Linux `drivers/dma-buf/`.
+An exporter owns one `DmaBufObject` per underlying buffer, shared by every fd
+and handle naming that buffer, and forwards `FileOps::ioctl_user` to
+`dma_buf_ioctl`, which implements `DMA_BUF_IOCTL_SYNC` (START waits,
+interruptibly, on the fences of `dma_resv_usage_rw(write)`; END is a no-op
+for NARF's coherent exporters), `DMA_BUF_SET_NAME_A/_B` (`strndup_user` with
+`DMA_BUF_NAME_LEN`), `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` and
+`DMA_BUF_IOCTL_IMPORT_SYNC_FILE` with Linux's flag checks and errno order;
+anything else is `ENOTTY`. `DmaResv` follows `dma_resv_add_fence`
+(same-context replacement, signalled-fence reuse) and `dma_resv_get_fences`
+(unsignalled fences with usage ≤ the query). sync_file fds belong to the
+syscall layer: `IoctlContext::sync_file_fences` is `sync_file_get_fence` +
+`dma_fence_unwrap` (`None` for a bad fd or a non-sync_file), and
+`install_sync_file` reserves an `O_CLOEXEC` descriptor (`NoDescriptor` =
+`EMFILE`), builds `dma_resv_get_singleton`'s result (stub, the fence, or a
+`dma_fence_array`), lets `report` copy the number out, and installs only on
+success. `restart_after(repoll_ns)` is `-ERESTARTSYS`: for a user task it
+arranges a park and re-execution of the ioctl (the driver then returns
+`WouldBlock` with no side effect), so a signal over the wait restarts it
+under `SA_RESTART` and completes it with `EINTR` otherwise; it returns
+`false` only without an executor (kernel tests), which wait synchronously.
 
 FUSE file handles register `POLL` once with a stable kernel handle and
 cache the daemon's `revents`. `FUSE_NOTIFY_POLL` invalidates that

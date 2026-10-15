@@ -1423,3 +1423,108 @@ argument = "A composed built-in receives only a validated DomainId value selecte
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "The generated registrar and per-module boot argument add no isolation exception. Unknown stages, entry syntax, domains, duplicate components, malformed per-path domain mappings, and unsigned modules without explicit development policy fail closed. For signed entries, xtask verifies the detached signature and provisions the selected public key through the existing build-time trust-store interface; module bytes are still authenticated before decompression or execution. Built-in crates are deliberately part of the signed kernel image rather than dynamically admitted code."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame boot change wraps an already-created installed-root FsInstance in the existing filesystem OverlayFs before mounting it at /mnt for PID 1. It neither creates a capability nor changes a domain, mapping, scheduler decision, task security state, or TCB membership; failed overlay construction aborts the installed-root stage before PID 1 is published."
+
+# x86 PKU instruction support. The dedicated security-review skill was not
+# available in this session; human security review remains mandatory.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "CPUID-gated CR4.PKE setup and the scheduler PKRU slot remain inside the existing Frame/arch/scheduler TCB. They add no new TCB member, capability, mapping authority, or domain ID. Every CPU enables PKE only when it advertises PKU, before untrusted CPL3 code runs; the user register is separate from PKS/PKRS and frame trap-domain state."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The scheduler saves the outgoing task's PKRU on every user-task switch and restores the incoming task value before CPL3 return. A lazy XRSTOR cannot leak stale rights because it is immediately overwritten from that authoritative slot. PKS domain rights continue to use IA32_PKRS and the existing trap/domain pairing, so this change neither bypasses a capability check nor changes a kernel-side domain tag."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L115"
+argument = "The implementation keeps the user PKRU namespace disjoint from the 16 PKS supervisor-domain keys. Existing pkey compatibility syscalls still do not retag user PTEs; enabling the architectural register makes RDPKRU/WRPKRU safe and task-local without granting access to a kernel domain or consuming a PKS slot."
+
+# Ptrace may materialize a sparse FILE_DEMAND page in a stopped tracee. The
+# dedicated security-review skill was not available in this session; human
+# security review remains mandatory before merge.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The memory change adds an explicit opaque AddressSpace identity argument to the existing FILE_DEMAND callback; it does not add a TCB member, capability, domain, mapping type, or authority. A ptrace PEEK/POKE retains the existing ptrace relationship and is allowed to materialize an inactive root only after ptrace_check_attach verifies that the tracee is stopped, so no running task can observe a partially installed leaf. The normal active-root fault path is unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The explicit target identity makes the file-mapping owner lookup select the tracee's VMA even while the tracer's root is active. The hook returns only an existing file-supplied frame through the established FILE_DEMAND validation and publication path; it neither grants a capability nor bypasses a domain check. Failed translation or page-in remains EIO to ptrace, and the byte-wise PEEK/POKE loops touch only translated tracee user pages after stopped-state validation."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame change raises the #BP (vector 3) IDT gate from DPL=0 to DPL=3, matching Linux's SYSG(X86_TRAP_BP). It lets CPL 3 execute int3 to enter the same vector-3 stub a hardware #BP already uses; that stub and the common trap path already handle user-origin entry (swapgs, PKRS save, switch to DomainId::FRAME) for every user exception. The handler only delivers SIGTRAP to the current task through the existing sync-signal hook. No new TCB member, capability, domain transition, or authority is introduced, and every other exception gate stays DPL=0 (pinned by smoke_x86_64_idt_user_gates_match_linux)."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame changes for IPv4 fragmentation are boot-time wiring in cross_crate_init.rs: they install narf_filesystem::csprng::fill as narf-net's random source for the IPv4 identification generator (__ip_select_ident), and copy narf-net's per-namespace reassembly (IPSTATS_MIB_REASM*) and fragmentation (IPSTATS_MIB_FRAG*) counters into the /proc/net/snmp snapshot. No new TCB member, capability, domain transition or authority is introduced; the hook is a plain function pointer set once at init and the counters are read-only copies."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame change in bare_main.rs adds one entry (dmabuf_sync_smoke and its embedded ELF) to the boot-init musl-demo smoke table, the same registration every ring-3 smoke uses. It runs only when that command is requested and grants the smoke nothing beyond an ordinary user process. No TCB code path, capability, or domain transition changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame change in bare_main.rs adds one entry (remotevm_smoke and its embedded ELF) to the boot-init musl-demo smoke table, the same registration every ring-3 smoke uses. It runs only when that command is requested and grants the smoke nothing beyond an ordinary user process. No TCB code path, capability, or domain transition changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Executor core (scheduler/src/lib.rs): activate_direct_task now stores the incoming task id into CURRENT_TASK before, instead of after, releasing the per-CPU active-address-space lock, and the new read-only address_space_of_running/address_space_of_live lookups clone a CPU's published address space only when CURRENT_TASK names the requested task while that same lock is held. The store is the same value at the same CPU with no new lock taken inside the critical section, so dispatch order, preemption, domain state and the root hand-off are unchanged; the reordering only guarantees that no reader under the lock can pair one task's id with another task's root. The lookup grants nothing by itself: callers (ptrace, process_vm_*, /proc/<pid>/mem) apply ptrace_check_attach or __ptrace_may_access before touching the returned address space."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Memory (address_space.rs, remote_access.rs): AddressSpace::access_remote implements Linux access_remote_vm/GUP for an inactive address space by reading the authoritative region table under its region lock and the shared-mapping transaction lock (the exclusion pin_user_page already takes), never by dereferencing user virtual addresses or walking leaves. It only reaches frames that the target region owns or borrows, refuses SHARED|LOCK_EXEMPT non-RAM (device/PFN) regions, guard markers and holes, and writes a private page only after the existing COW split gives the target its own copy (cow_split_mode with force admits any non-SHARED region, matching is_cow_mapping), followed by the existing remap_page broadcast flush. The FOLL_FORCE demand path backs a PROT_NONE page without installing a leaf, so the owner gains no access it did not have; the x86_64 swap-in path now refuses a PROT_NONE page instead of publishing an accessible leaf. No capability, domain tag, domain transition or new TCB member is introduced; authorization stays with the syscall-layer ptrace/mm_access checks."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame change in cross_crate_init.rs installs narf_userspace::handlers::proc_mem_open as procfs's /proc/<pid>/mem open hook, a plain function pointer set once at init in the same way as the existing procfs hooks. The hook enforces Linux proc_mem_open's mm_access (PTRACE_MODE_ATTACH|FSCREDS: same-mm, matching credentials plus dumpable, or CAP_SYS_PTRACE) before binding a weak reference to the target address space. No TCB code path, capability, or domain transition changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The executor change (scheduler/src/stackful.rs rearm_wake_after_preempt) sets the preempted task's own WakeCell wake bit again when its CPL0/EL1-preempted continuation resumes, so a wake that the preemption and the resuming dispatch coalesced (the task's own yield_now self-wake, or a waker it registered just before the tick) still re-polls it, as Linux keeps a preempted task TASK_RUNNING. It writes only the bit of the task that is running on this CPU, the same store a self-wake during a poll makes; it moves no slot between run queues, touches no address space, domain state, PKRS/TCF, capability or frame, and the worst case is one extra poll of that task per preemption. User-mode (CPL3/EL0) preemption is unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The only frame/ change (bare_main.rs) adds jitrwx_smoke to the table of embedded musl-demo test binaries, next to remotevm_smoke. It is test registration data compiled into verification kernels; no production code path, authority, mapping, domain transition, or capability changes. The W^X policy change it tests lives in memory/src/wx.rs and the userspace mprotect handler, outside the memory domain manager."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The only frame/ change (bare_main.rs) registers the prctlinherit_smoke test binary in the embedded musl-demo table. Test registration data for verification kernels; no production path, authority, mapping, domain transition or capability changes. The prctl inheritance fix itself lives in userspace/ (copy of no_new_privs, securebits and dumpable into a clone child)."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The only frame/ change (bare_main.rs) registers the ptracefork_smoke test binary in the embedded musl-demo table. Test registration data for verification kernels; no production path, authority, mapping, domain transition or capability changes. The ptrace follow-fork work lives in userspace/ (ptrace registry, clone/fork/exit paths, wait reaping)."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The only frame/ change (bare_main.rs) registers the seccomp_smoke test binary in the embedded musl-demo table. Test registration data for verification kernels; no production path, authority, mapping, domain transition or capability changes. seccomp filtering itself lives in userspace/ (seccomp.rs and the syscall-entry hook), outside the TCB, and only ever narrows what a task may do."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The only frame/ change (bare_main.rs) registers the killstopped_smoke test binary in the embedded musl-demo table. Test registration data for verification kernels; no production path, authority, mapping, domain transition or capability changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The only frame/ change (bare_main.rs) registers the procstate_smoke test binary in the embedded musl-demo table. Test registration data for verification kernels; no production path, authority, mapping, domain transition or capability changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The only frame/ change (bare_main.rs) registers the proctid_smoke test binary in the embedded musl-demo table. Test registration data for verification kernels; no production path, authority, mapping, domain transition or capability changes. The /proc/<tid> lookup itself lives in filesystem/src/procfs."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "frame/src/{x86_64,aarch64}/trap.rs: a kernel-mode page fault inside a guarded user copy now lifts the copy's recovery (per-CPU probe recovery + armed marker) off the CPU before running the demand-paging heal, and re-arms it on whichever CPU the task is on afterwards, with IRQs masked, before the trap returns. The heal could already park the task (a file-backed page under read) and resume it elsewhere; the recovery used to stay armed on the old CPU, where another task's fault could consume it and redirect into this task's stack, while the copy's next fault found nothing armed and panicked. The recovery address is the same label the copy armed; nothing new is armed, no domain/PKRS state, capability, mapping or frame ownership changes, and the AC/IF state the copy resumes with still comes from its own saved trap frame. bare_main.rs registers the uaccessfile_smoke test binary (test data)."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L122"
+argument = "SMAP is unchanged: the user-access window of a guarded copy is still opened by its own STAC and closed by its own CLAC; across a parked heal the window lives only in the faulting context's saved RFLAGS.AC (restored by iretq), as before. resume_guarded_copy only executes CLI and re-arms the recovery; it never sets AC."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Memory (migrate.rs, rmap.rs, reclaim.rs): direct compaction's bookkeeping moves from heap Vecs to fixed stack storage. compact_block tracks held frames in a 1 << MAX_ORDER bit stack bitmap and derives the movable set from it; it invokes only the allocation-free single-owner migration primitive, rejecting COW-shared pages rather than entering the ordinary Vec-snapshot multi-owner path. compact_scan_filtered keeps at most 64 candidate bases in a stack array; rmap::try_for_each_tracked_frame copies shard keys in 128-entry stack chunks with the shard lock dropped between chunks, exactly as the old whole-shard snapshot dropped it before the callback; rmap::sole_owner reads a single owner under the shard lock instead of cloning the owner list, and compaction now migrates only single-owner frames (a COW-shared frame is reported MultiOwner and its block left as found, because the multi-owner path snapshots owners into a Vec); the general migrate_frame API is unchanged. The frames reserved, migrated and released, their order, and the reserve/release pairing (every reserved frame is returned through free_movable_range on success or any error) are unchanged, as are the region-lock revalidation in relocate_frame_at and the TLB shootdown before a source frame is freed. A skipped or repeated key in the chunked rmap walk only changes which candidate blocks are tried, because each block re-checks ownership. direct_compact additionally refuses to run unless the node's free pages exceed min + (2 << order), plus the low-min band for orders above 3 (Linux __compaction_suitable), which only makes compaction run less often. No capability, domain tag, domain transition, mapping authority or TCB member changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The only frame/ change (bare_main.rs) registers the sockpair_block_smoke test binary (musl + glibc) in the embedded musl-demo table. Test registration data for verification kernels; no production path, authority, mapping, domain transition or capability changes. The blocking AF_UNIX stream send fix it tests lives in userspace/ (socket send handlers and socket.rs), outside the TCB."

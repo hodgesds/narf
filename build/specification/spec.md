@@ -75,10 +75,13 @@ and CI compiler-cache integration.
   caller explicitly provides a `grab-on-hover=` option. This routes the host
   keyboard and pointer to the guest's virtio input devices as soon as the
   pointer enters the window; `Ctrl-Alt-G` still releases the grab.
-- On x86_64, a VirGL-backed VirtIO fixture (`full` or `virtio-only`) passes
-  QEMU `-vga none`, leaving virtio-gpu as the sole display adapter. This keeps
-  KWin's DRM/render-node selection on the 1af4:1050 device rather than QEMU's
-  default Bochs VGA fallback.
+- On x86_64, a VirGL-backed VirtIO fixture (`full` or `virtio-only`) and a
+  graphical 2D `virtio-only` fixture pass QEMU `-vga none`, leaving virtio-gpu
+  as the sole display adapter. This keeps KWin's DRM/render-node selection on
+  the 1af4:1050 device rather than QEMU's default Bochs VGA fallback; in the
+  2D `virtio-only` case it also makes GTK present the virtio-gpu scanout rather
+  than the legacy VGA text console. Headless 2D and full-profile 2D fixtures
+  retain their legacy display coverage.
 - `cargo xtask test --arch=aarch64` — boot + run all kernel tests.
 - `cargo xtask test --arch=x86_64 --subsystem userspace` — run that subsystem
   and its `/`-delimited children, then perform the normal whole-kernel boot

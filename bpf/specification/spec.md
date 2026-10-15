@@ -233,8 +233,11 @@ pub fn jit_mprotect(cap: &JitCap, space: &AddressSpace,
 ```
 
 `jit_mprotect` is the only path by which a `W | X` user mapping can come into
-existence. `AddressSpace::mprotect_range` keeps rejecting `W | X` outright and
-stays the cap-free fast path.
+existence. It admits both JIT shapes under a live `CAP_JIT`: the RW → RX flip
+and any transition whose end state is `W | X` (V8's `pkey_mprotect(RWX)` code
+range). The syscall layer applies `PR_SET_MDWE` before it, as Linux's
+`map_deny_write_exec` does. `AddressSpace::mprotect_range` keeps rejecting
+`W | X` outright and stays the cap-free fast path.
 
 ### 3.4 Maps
 

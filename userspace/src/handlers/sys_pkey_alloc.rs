@@ -9,10 +9,10 @@ pub(crate) fn sys_pkey_alloc(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
-    let task = current_task_id();
+    let mm = pkey_mm_key();
     let mut g = PKEY_TABLE.lock();
     let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    let bits = m.entry(task).or_insert(0);
+    let bits = m.entry(mm).or_insert(0);
     for k in 1..16u32 {
         if *bits & (1 << k) == 0 {
             *bits |= 1 << k;

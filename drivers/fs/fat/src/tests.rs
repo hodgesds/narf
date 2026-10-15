@@ -126,20 +126,20 @@ fn smoke_fat_entry_codec_round_trip_fat32() -> TestResult {
     let mut buf = [0u8; 16];
     // Pre-stain reserved nibble of entry 0 to 0xC.
     buf[3] = 0xC0;
-    write_entry(FatVersion::Fat32, 0, &mut buf, 0x01234567);
+    write_entry(FatVersion::Fat32, 0, 0, &mut buf, 0x01234567);
     if buf[3] & 0xF0 != 0xC0 {
         return TestResult::Fail("write_entry must preserve reserved nibble");
     }
-    match parse_entry(FatVersion::Fat32, 0, &buf) {
+    match parse_entry(FatVersion::Fat32, 0, 0, &buf) {
         FatEntry::Next(0x0123_4567) => {}
         _ => return TestResult::Fail("parse_entry round-trip failed"),
     }
 
     // EOC sentinels recognised.
     let mut eoc = [0u8; 8];
-    write_entry(FatVersion::Fat32, 0, &mut eoc, 0x0FFF_FFFF);
+    write_entry(FatVersion::Fat32, 0, 0, &mut eoc, 0x0FFF_FFFF);
     if !matches!(
-        parse_entry(FatVersion::Fat32, 0, &eoc),
+        parse_entry(FatVersion::Fat32, 0, 0, &eoc),
         FatEntry::EndOfChain
     ) {
         return TestResult::Fail("0x0FFFFFFF must decode as EndOfChain");
@@ -147,7 +147,7 @@ fn smoke_fat_entry_codec_round_trip_fat32() -> TestResult {
 
     // Free entry sentinel.
     let zero = [0u8; 8];
-    if !matches!(parse_entry(FatVersion::Fat32, 0, &zero), FatEntry::Free) {
+    if !matches!(parse_entry(FatVersion::Fat32, 0, 0, &zero), FatEntry::Free) {
         return TestResult::Fail("zero entry must decode as Free");
     }
     TestResult::Pass
@@ -157,17 +157,17 @@ fn smoke_fat_entry_codec_fat12_packed() -> TestResult {
     // FATGEN §4: FAT12 packs two 12-bit entries into 3 bytes. Verify
     // the even/odd offset packing is reversible.
     let mut buf = [0u8; 6];
-    write_entry(FatVersion::Fat12, 0, &mut buf, 0x0ABC);
-    write_entry(FatVersion::Fat12, 1, &mut buf, 0x0123);
+    write_entry(FatVersion::Fat12, 0, 0, &mut buf, 0x0ABC);
+    write_entry(FatVersion::Fat12, 1, 1, &mut buf, 0x0123);
 
     if !matches!(
-        parse_entry(FatVersion::Fat12, 0, &buf),
+        parse_entry(FatVersion::Fat12, 0, 0, &buf),
         FatEntry::Next(0x0ABC)
     ) {
         return TestResult::Fail("FAT12 even-offset round-trip failed");
     }
     if !matches!(
-        parse_entry(FatVersion::Fat12, 1, &buf),
+        parse_entry(FatVersion::Fat12, 1, 1, &buf),
         FatEntry::Next(0x0123)
     ) {
         return TestResult::Fail("FAT12 odd-offset round-trip failed");
@@ -190,6 +190,112 @@ kernel_test_in!(
 kernel_test_in!("drivers/fs/fat", smoke_fat_sfn_reassemble_round_trip);
 kernel_test_in!("drivers/fs/fat", smoke_fat_entry_codec_round_trip_fat32);
 kernel_test_in!("drivers/fs/fat", smoke_fat_entry_codec_fat12_packed);
+
+/// FAT12 parity is the CLUSTER's (`fs/fat/fatent.c::fat12_ent_get` tests
+/// `entry & 1`), while the codec is handed an offset inside whichever FAT
+/// sector the caller read. 512 is not a multiple of 3, so from the second FAT
+/// sector on the two disagree: cluster 342 sits at FAT byte 513, i.e. offset 1
+/// of sector 1 — an even cluster at an offset an "offset % 3" test calls odd.
+/// Decoding it with the wrong nibble layout read one neighbour's bits as the
+/// chain link and wrote over the other neighbour's.
+fn smoke_fat_entry_codec_fat12_parity_follows_cluster() -> TestResult {
+    // Sector-relative bytes 0..3 of FAT sector 1: byte 0 holds the high
+    // byte of cluster 341's split entry, bytes 1..3 clusters 342 and 343.
+    let mut buf = [0u8; 4];
+    buf[0] = 0x5A;
+    write_entry(FatVersion::Fat12, 342, 1, &mut buf, 0x0ABC);
+    write_entry(FatVersion::Fat12, 343, 2, &mut buf, 0x0123);
+    if buf != [0x5A, 0xBC, 0x3A, 0x12] {
+        return TestResult::Fail("FAT12 entries packed by offset parity, not cluster parity");
+    }
+    if !matches!(
+        parse_entry(FatVersion::Fat12, 342, 1, &buf),
+        FatEntry::Next(0x0ABC)
+    ) || !matches!(
+        parse_entry(FatVersion::Fat12, 343, 2, &buf),
+        FatEntry::Next(0x0123)
+    ) {
+        return TestResult::Fail("FAT12 decode used offset parity, not cluster parity");
+    }
+    // A split entry (cluster 341: FAT byte 511, the sector's last) is coded
+    // from a two-byte window; an odd cluster takes the high 12 bits.
+    let mut pair = [0x0Fu8, 0x00];
+    write_entry(FatVersion::Fat12, 341, 0, &mut pair, 0x0DEF);
+    if pair != [0xFF, 0xDE] {
+        return TestResult::Fail("split odd FAT12 entry clobbered its neighbour's nibble");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/fat",
+    smoke_fat_entry_codec_fat12_parity_follows_cluster
+);
+
+/// A FAT12 file long enough to be chained past cluster 340 crosses the first
+/// FAT sector boundary. Cluster 341's 12 bits are FAT bytes 511..512 — the
+/// last byte of sector 0 and the first of sector 1 — and every cluster after
+/// it lives at a sector offset whose `% 3` no longer matches its parity.
+///
+/// NARF indexed byte 512 of a 512-byte sector buffer for cluster 341 and
+/// panicked the kernel (`index out of bounds: the len is 512 but the index is
+/// 512`): any process that wrote ~170 KiB to the musl-demo FAT root took the
+/// machine down. Linux reads both blocks for a split entry
+/// (`fs/fat/fatent.c::fat12_ent_bread`) and keys the nibble layout on
+/// `entry & 1`.
+///
+/// Every cluster of the file is written with a distinct pattern and read
+/// back through the chain, so a wrong link (the parity half) shows up as a
+/// byte mismatch rather than only as a missing panic.
+fn smoke_fat12_chain_crosses_fat_sector_boundary() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::FatVolume;
+
+    // 1 reserved + 2 FATs × 2 sectors + 1 root-dir sector + 400 data
+    // clusters: well under FAT12's 4085-cluster ceiling.
+    const CLUSTERS: usize = 360;
+    let img = build_fat12_image_fat_sectors(406, 2, &[]);
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(FatVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    if volume.name() != "fat12" {
+        return TestResult::Fail("expected FAT12 detection");
+    }
+    let root = volume.root();
+    let file = match poll_once(root.create("BIG.BIN")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create BIG.BIN failed"),
+    };
+    let mut payload = alloc::vec![0u8; CLUSTERS * 512];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = ((i / 512) as u8) ^ (i as u8).rotate_left(3);
+    }
+    match poll_once(file.write(0, &payload)) {
+        Some(Ok(n)) if n == payload.len() => {}
+        _ => return TestResult::Fail("write across the FAT sector boundary failed"),
+    }
+    let reopened = match poll_once(root.lookup_async("BIG.BIN")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup_async BIG.BIN failed"),
+    };
+    let mut readback = alloc::vec![0u8; payload.len()];
+    match poll_once(reopened.read(0, &mut readback)) {
+        Some(Ok(n)) if n == payload.len() => {}
+        _ => return TestResult::Fail("read across the FAT sector boundary failed"),
+    }
+    if readback != payload {
+        return TestResult::Fail("cluster chain past the first FAT sector read back wrong data");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/fat",
+    smoke_fat12_chain_crosses_fat_sector_boundary
+);
 
 // ── End-to-end mount + I/O against RamBlockDevice ──────────────────
 
@@ -242,6 +348,17 @@ fn fat12_set(fat: &mut [u8], idx: u32, val: u16) {
 /// pointing at one cluster of `data`. `total_sectors` controls the
 /// volume size; FAT region is one sector × 2, root dir one sector.
 fn build_fat12_image(total_sectors: u32, data: &[u8]) -> alloc::vec::Vec<u8> {
+    build_fat12_image_fat_sectors(total_sectors, 1, data)
+}
+
+/// [`build_fat12_image`] with a FAT of `fat_sz` sectors per copy. One FAT12
+/// sector maps only 341 entries, so a volume that allocates past cluster 340
+/// needs more than one — and that is where entries start to straddle.
+fn build_fat12_image_fat_sectors(
+    total_sectors: u32,
+    fat_sz: u16,
+    data: &[u8],
+) -> alloc::vec::Vec<u8> {
     use alloc::vec;
     const LBS: usize = 512;
     let mut img = vec![0u8; LBS * total_sectors as usize];
@@ -256,13 +373,14 @@ fn build_fat12_image(total_sectors: u32, data: &[u8]) -> alloc::vec::Vec<u8> {
     img[17..19].copy_from_slice(&16u16.to_le_bytes()); // root_ent_cnt
     img[19..21].copy_from_slice(&(total_sectors as u16).to_le_bytes()); // tot_sec_16
     img[21] = 0xF8; // media
-    img[22..24].copy_from_slice(&1u16.to_le_bytes()); // fat_sz_16
+    img[22..24].copy_from_slice(&fat_sz.to_le_bytes()); // fat_sz_16
     img[510] = 0x55;
     img[511] = 0xAA;
 
     // FAT 1 + FAT 2 — entry 0 = media, entry 1 = EOC, entry 2 =
     // EOC (single-cluster file).
-    for &lba in &[1usize, 2usize] {
+    let fat_sz = fat_sz as usize;
+    for lba in [1usize, 1 + fat_sz] {
         let fat = &mut img[lba * LBS..lba * LBS + LBS];
         fat12_set(fat, 0, 0xFF8);
         fat12_set(fat, 1, 0xFFF);
@@ -273,7 +391,7 @@ fn build_fat12_image(total_sectors: u32, data: &[u8]) -> alloc::vec::Vec<u8> {
 
     // Root directory entry: NARF.TXT → cluster 2, size = data.len()
     if !data.is_empty() {
-        let root = 3usize;
+        let root = 1 + 2 * fat_sz;
         let entry = &mut img[root * LBS..root * LBS + 32];
         entry[0..11].copy_from_slice(b"NARF    TXT");
         entry[11] = 0x20; // ARCHIVE
@@ -281,8 +399,8 @@ fn build_fat12_image(total_sectors: u32, data: &[u8]) -> alloc::vec::Vec<u8> {
         entry[26..28].copy_from_slice(&2u16.to_le_bytes()); // fst_clus_lo
         entry[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
 
-        // Cluster 2 starts at sector 4 (rsvd 1 + fats 2 + rootdir 1).
-        let data_lba = 4usize;
+        // Cluster 2 follows the root directory (rsvd 1 + fats + rootdir 1).
+        let data_lba = 2 + 2 * fat_sz;
         img[data_lba * LBS..data_lba * LBS + data.len()].copy_from_slice(data);
     }
     img

@@ -99,6 +99,28 @@ fn faccessat_common(ctx: &mut dyn TrapContext, dirfd: u64, path_ptr: u64, mode: 
             return;
         }
     };
+    // `/proc/<pid>/ns/<flavour>` is an nsfs magic link.  Its rendered
+    // `net:[inum]` target is diagnostic text, not a VFS pathname, so a
+    // regular symlink expansion incorrectly reports ENOENT.  Linux follows
+    // the final magic link to its retained namespace object instead.  In
+    // particular, systemd probes namespace support with
+    // `access("/proc/self/ns/net", F_OK)` before an executor attempts
+    // CLONE_NEWNET; returning ENOENT here makes every PrivateNetwork= service
+    // silently fall back without creating a namespace.
+    //
+    // Keep the nofollow form on procfs' symlink object, just like
+    // O_PATH|O_NOFOLLOW open: callers using AT_SYMLINK_NOFOLLOW asked not to
+    // cross this final magic link.
+    #[cfg(feature = "container")]
+    if follow {
+        let path = resolve_cwd_path(task, &effective);
+        let proc_prefix = apply_chroot("/proc");
+        if let Some(nsfd) = proc_namespace_fd_from_path(task, &path, &proc_prefix) {
+            let file: alloc::sync::Arc<dyn narf_filesystem::FileOps> = nsfd;
+            access_file(ctx, &file, mode, eaccess);
+            return;
+        }
+    }
     // `/proc/self/fd/N` is a magic link: following it lands on the open
     // file itself, which may have no path at all (pipe, socket, memfd), so
     // the textual link expansion below cannot reach it. Mirror the stat

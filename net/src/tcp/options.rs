@@ -402,6 +402,41 @@ pub fn encode_syn_options(
     opts
 }
 
+/// RFC 9293 §3.1: the data offset caps the TCP header at 60 bytes, so 40
+/// bytes of options.
+pub const MAX_TCP_OPTION_SPACE: usize = 40;
+/// Aligned Timestamps option: NOP, NOP, kind, len, TSval, TSecr.
+const TS_ALIGNED: usize = 12;
+/// Aligned SACK option header (NOP, NOP, kind, len) and per-block size.
+const SACK_BASE_ALIGNED: usize = 4;
+const SACK_PERBLOCK: usize = 8;
+
+/// SACK blocks that fit beside the other options of a non-SYN segment
+/// (`tcp_established_options`: with timestamps, 3; without, 4).
+pub fn max_sack_blocks(state: &OptionsState) -> usize {
+    let used = if state.timestamps_active {
+        TS_ALIGNED
+    } else {
+        0
+    };
+    ((MAX_TCP_OPTION_SPACE - used - SACK_BASE_ALIGNED) / SACK_PERBLOCK)
+        .min(super::sack::MAX_SACK_BLOCKS)
+}
+
+/// Bytes of options [`encode_data_options`] emits with `sack_blocks`
+/// blocks pending.
+pub fn data_options_len(state: &OptionsState, sack_blocks: usize) -> usize {
+    let mut n = if state.timestamps_active {
+        TS_ALIGNED
+    } else {
+        0
+    };
+    if state.sack_active && sack_blocks > 0 {
+        n += SACK_BASE_ALIGNED + SACK_PERBLOCK * sack_blocks.min(max_sack_blocks(state));
+    }
+    n
+}
+
 /// Encode options for a non-SYN segment. Honours the negotiation
 /// state — only emits Timestamps if TS was negotiated, only emits
 /// SACK if SACK was negotiated.
@@ -420,7 +455,10 @@ pub fn encode_data_options(
         opts.extend_from_slice(&state.ts_recent.to_be_bytes());
     }
     if state.sack_active && !sack_blocks.is_empty() {
-        let n = sack_blocks.len().min(super::sack::MAX_SACK_BLOCKS);
+        // Never past the 40-byte option space: four blocks plus timestamps
+        // made a 48-byte option area, whose 68-byte header no data-offset
+        // value can describe — the peer dropped every such ACK.
+        let n = sack_blocks.len().min(max_sack_blocks(state));
         opts.push(OPT_NOP);
         opts.push(OPT_NOP);
         opts.push(OPT_SACK);

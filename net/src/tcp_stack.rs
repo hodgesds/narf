@@ -38,13 +38,14 @@ use crate::pkt::{
 };
 
 pub use crate::tcp::core::{
-    accept, close, connect, connect6_errno_in, connect6_errno_with_options_in, connect_errno_in,
-    connect_in, endpoints6, getsockopt_cong, getsockopt_int, listen, listen6_in,
-    listen_has_pending, listen_in, lookup_tcb, readable, recv, recv_errno, release, remove_tcb,
-    send, send_errno, setsockopt_int, setsockopt_str, shutdown, shutdown_errno, take_sock_error,
-    tick_retransmit, writable, Tcb, TCP_CONGESTION, TCP_CORK, TCP_DEFER_ACCEPT, TCP_KEEPALIVE,
-    TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_MAXSEG, TCP_NODELAY, TCP_NOTSENT_LOWAT,
-    TCP_QUICKACK, TCP_SYNCNT, TCP_THIN_DUPACK, TCP_THIN_LINEAR_TIMEOUTS, TCP_USER_TIMEOUT,
+    accept, close, close_linger, connect, connect6_errno_in, connect6_errno_with_options_in,
+    connect_errno_in, connect_in, endpoints6, getsockopt_cong, getsockopt_int, listen, listen6_in,
+    listen_has_pending, listen_in, lookup_tcb, readable, recv, recv_errno, recv_peek_errno,
+    release, remove_tcb, send, send_errno, setsockopt_int, setsockopt_str, shutdown,
+    shutdown_errno, take_sock_error, tick_retransmit, writable, Tcb, TCP_CONGESTION, TCP_CORK,
+    TCP_DEFER_ACCEPT, TCP_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_MAXSEG,
+    TCP_NODELAY, TCP_NOTSENT_LOWAT, TCP_QUICKACK, TCP_SYNCNT, TCP_THIN_DUPACK,
+    TCP_THIN_LINEAR_TIMEOUTS, TCP_USER_TIMEOUT,
 };
 pub use crate::tcp::state_machine::{DropCause, Shutdown, TcpState};
 
@@ -293,14 +294,16 @@ pub fn rx_handler(iface_name: &str, frame: &mut [u8]) {
     if ingress.as_ref().is_some_and(|dev| dev.software_gro) && iface_name != "lo" {
         gro_rx::offer(iface_name, net_ns_id, frame);
     } else {
-        dispatch_l3(_iface_name, net_ns_id, frame);
+        dispatch_l3(_iface_name, net_ns_id, frame, false);
     }
 }
 
 /// Parse L2 and hand the frame to the ARP or IPv4 protocol handler. Split out
 /// of `rx_handler` so the GRO path can dispatch a coalesced frame through the
-/// identical sequence.
-fn dispatch_l3(iface_name: Option<&str>, net_ns_id: u64, frame: &[u8]) {
+/// identical sequence. `csum_verified` is Linux's `CHECKSUM_UNNECESSARY`: GRO
+/// already validated the IPv4 header and TCP checksums, so they are not summed
+/// a second time.
+fn dispatch_l3(iface_name: Option<&str>, net_ns_id: u64, frame: &[u8], csum_verified: bool) {
     let (eth, body) = match parse_eth_header(frame) {
         Some(t) => t,
         None => return,
@@ -308,7 +311,7 @@ fn dispatch_l3(iface_name: Option<&str>, net_ns_id: u64, frame: &[u8]) {
     match eth.ethertype {
         ETHERTYPE_ARP => handle_arp_on_in(body, net_ns_id, iface_name),
         ETHERTYPE_IPV4 => {
-            handle_ipv4(body, net_ns_id, iface_name.unwrap_or(""));
+            handle_ipv4(body, net_ns_id, iface_name.unwrap_or(""), csum_verified);
         }
         _ => {}
     }
@@ -321,7 +324,7 @@ fn dispatch_l3(iface_name: Option<&str>, net_ns_id: u64, frame: &[u8]) {
 /// against a mid-poll task migration or a nested RX only.
 mod gro_rx {
     use super::{dispatch_l3, iface, IrqSafeSpinLock};
-    use crate::gro::Gro;
+    use crate::gro::{Disposition, Gro};
 
     const MAX_CPUS: usize = narf_lib::percpu::MAX_CPUS;
     static TABLES: [IrqSafeSpinLock<Gro>; MAX_CPUS] =
@@ -337,9 +340,15 @@ mod gro_rx {
     /// it. Released frames all carry the ingress iface they were offered under,
     /// so the current `net_ns_id` applies to every one.
     pub fn offer(iface_name: &str, net_ns_id: u64, frame: &[u8]) {
-        let released = TABLES[cpu()].lock().offer(iface_name, frame.to_vec());
+        // An empty Vec does not allocate: a frame GRO neither holds nor
+        // flushes for costs no copy and no allocation.
+        let mut released = alloc::vec::Vec::new();
+        let disposition = TABLES[cpu()].lock().offer(iface_name, frame, &mut released);
         for (_tag, f) in released {
-            dispatch_l3(Some(iface_name), net_ns_id, &f);
+            dispatch_l3(Some(iface_name), net_ns_id, &f, true);
+        }
+        if let Disposition::Deliver { verified } = disposition {
+            dispatch_l3(Some(iface_name), net_ns_id, frame, verified);
         }
     }
 
@@ -350,7 +359,7 @@ mod gro_rx {
         let drained = TABLES[cpu()].lock().flush();
         for (tag, f) in drained {
             let net_ns_id = iface::lookup(&tag).map_or(0, |e| e.net_ns_id);
-            dispatch_l3(Some(&tag), net_ns_id, &f);
+            dispatch_l3(Some(&tag), net_ns_id, &f, true);
         }
     }
 }
@@ -445,7 +454,20 @@ fn is_dhcp_client_datagram(body: &[u8]) -> bool {
     u16::from_be_bytes([body[ihl + 2], body[ihl + 3]]) == DHCP_CLIENT_PORT
 }
 
-fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str) {
+/// Receive-side checksum failures, Linux's `Ip InHdrErrors`,
+/// `Tcp InCsumErrors` and `Udp InCsumErrors`.
+pub mod rx_csum {
+    use core::sync::atomic::AtomicU64;
+
+    /// IPv4 headers dropped for a bad header checksum.
+    pub static IP_HDR_ERRORS: AtomicU64 = AtomicU64::new(0);
+    /// TCP segments dropped for a bad checksum.
+    pub static TCP_CSUM_ERRORS: AtomicU64 = AtomicU64::new(0);
+    /// UDP datagrams dropped for a bad (nonzero) checksum.
+    pub static UDP_CSUM_ERRORS: AtomicU64 = AtomicU64::new(0);
+}
+
+fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str, csum_verified: bool) {
     // ── Netfilter PRE_ROUTING + LOCAL_IN dispatch ──
     //
     // The hooks only READ the packet (conntrack parses the tuple, filter
@@ -460,6 +482,16 @@ fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str) {
     // Matches Linux's NF_HOOK call from `ip_rcv_core()` →
     // `ip_rcv_finish()` in `net/ipv4/ip_input.c`.
     if body.len() < crate::netfilter::IPV4_MIN_HDR_LEN {
+        return;
+    }
+    // `ip_rcv_core`: `if (unlikely(ip_fast_csum((u8 *)iph, iph->ihl)))
+    // goto csum_error;` — before any hook sees the packet.
+    let ihl = (body[0] & 0x0f) as usize * 4;
+    if ihl < pkt::IPV4_HDR_LEN
+        || body.len() < ihl
+        || (!csum_verified && pkt::ip_checksum(&body[..ihl]) != 0)
+    {
+        rx_csum::IP_HDR_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return;
     }
     let mut ctx = crate::netfilter::PktCtx::new_ipv4_ref(
@@ -496,12 +528,47 @@ fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str) {
         }
     }
 
+    // ── ip_local_deliver: reassembly ──
+    //
+    // `ip_local_deliver` calls `ip_defrag(..., IP_DEFRAG_LOCAL_DELIVER)` when
+    // `ip_is_fragment()`, after the routing decision (so forwarded fragments
+    // above are never reassembled) and before NF LOCAL_IN, which sees the
+    // whole datagram. A non-fragment pays one branch on the frag_off word.
+    if crate::ip_fragment::is_fragment(ctx.packet()) {
+        let Some(mut whole) = crate::ip_fragment::ip_defrag(net_ns_id, iface_in, ctx.packet())
+        else {
+            return;
+        };
+        drop(ctx);
+        let mut ctx = crate::netfilter::PktCtx::new_ipv4(
+            crate::netfilter::HookPoint::LocalIn,
+            iface_in,
+            "",
+            &mut whole,
+        )
+        .with_net_ns(net_ns_id);
+        if crate::netfilter::nf_dispatch(&mut ctx) == crate::netfilter::Verdict::Drop {
+            return;
+        }
+        // No receive checksum offload covers a datagram stitched from
+        // several frames: `ip_frag_reasm` leaves `CHECKSUM_NONE`, so the
+        // transport verifies its checksum over the whole payload.
+        local_deliver_finish(net_ns_id, iface_in, ctx.packet(), false);
+        return;
+    }
+
     ctx.hook = crate::netfilter::HookPoint::LocalIn;
     ctx.conntrack_id = None;
     if crate::netfilter::nf_dispatch(&mut ctx) == crate::netfilter::Verdict::Drop {
         return;
     }
-    let body = ctx.packet();
+    local_deliver_finish(net_ns_id, iface_in, ctx.packet(), csum_verified);
+}
+
+/// `ip_local_deliver_finish`: hand a whole, LOCAL_IN-accepted datagram to
+/// its transport protocol. `csum_verified` is the driver/GRO
+/// `CHECKSUM_UNNECESSARY` verdict; it never covers a reassembled datagram.
+fn local_deliver_finish(net_ns_id: u64, iface_in: &str, body: &[u8], csum_verified: bool) {
     let (ip, payload) = match parse_ipv4(body) {
         Some(t) => t,
         None => return,
@@ -511,6 +578,14 @@ fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str) {
     let tos = if body.len() >= 2 { body[1] } else { 0 };
     match ip.protocol {
         IP_PROTO_TCP => {
+            // `tcp_v4_rcv` → `skb_checksum_init`: a segment whose checksum
+            // fails is dropped (TCP_MIB_CSUMERRORS) and the peer retransmits.
+            if !csum_verified
+                && crate::pkt_tcp::ipv4_pseudo_checksum(ip.src_ip, ip.dst_ip, payload) != 0
+            {
+                rx_csum::TCP_CSUM_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return;
+            }
             crate::tcp::core::handle_segment_in(net_ns_id, ip.src_ip, ip.dst_ip, payload)
         }
         IP_PROTO_UDP => handle_udp(
@@ -548,6 +623,19 @@ fn handle_udp(
         return;
     }
     let payload = &datagram[8..end];
+    // `udp4_csum_init`: a zero checksum means the sender computed none
+    // (RFC 768); any other value must verify over the whole datagram.
+    if datagram[6..8] != [0, 0]
+        && crate::pkt_tcp::ipv4_pseudo_checksum_proto(
+            src_ip,
+            dst_ip,
+            IP_PROTO_UDP,
+            &datagram[..end],
+        ) != 0
+    {
+        rx_csum::UDP_CSUM_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     // Deliver to registered UDP sockets (udp_sock layer).
     // `in_ifindex` is Linux's `dif`: SO_BINDTODEVICE is enforced against
     // the interface the datagram ARRIVED on.
@@ -618,6 +706,7 @@ static TIMER_PUMP_INSTALLED: AtomicUsize = AtomicUsize::new(0);
 
 fn timer_tick_pump() {
     crate::tcp::core::tick_all();
+    crate::ip_fragment::tick();
 }
 
 // ── Init ────────────────────────────────────────────────────────

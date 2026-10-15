@@ -68,6 +68,7 @@ pub mod wx;
 pub mod zpool;
 
 mod guard_tests;
+mod remote_access_tests;
 mod tests;
 
 pub use address_space::{
@@ -75,7 +76,7 @@ pub use address_space::{
     with_address_space_shared_mapping_transaction, with_shared_mapping_transaction, AddressSpace,
     AddressSpaceError, BrkUpdateResult, FileFaultError, FixedRelocationError, FutureLockPolicy,
     HugeRegion, MappingReceipt, MremapLimits, NumaRegionSnapshot, Region, RegionPerms,
-    SharedMremapMode, StackGrowthLimits,
+    RemoteAccess, RemoteBuf, SharedMremapMode, StackGrowthLimits,
 };
 
 #[cfg(target_arch = "x86_64")]

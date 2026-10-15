@@ -271,6 +271,40 @@ fn smoke_userspace_load_user_process_with_argv() -> TestResult {
         return TestResult::Fail("argv[1] != \"two\"");
     }
 
+    // `/proc/<pid>/auxv` must mirror the *final* vector laid out on the
+    // startup stack. Crash handlers inspect this file rather than the stack
+    // directly to find the program-header table, and an empty proc entry
+    // makes them abort before they can inspect a crashing process.
+    let proc_auxv = crate::handlers::proc_auxv_of(proc.pid.raw());
+    if proc_auxv.len() % 16 != 0 || proc_auxv.len() < 16 {
+        return TestResult::Fail("/proc auxv is not a sequence of Elf64_auxv_t entries");
+    }
+    let pair_at = |index: usize| -> (u64, u64) {
+        let entry = &proc_auxv[index * 16..index * 16 + 16];
+        (
+            u64::from_le_bytes(entry[..8].try_into().unwrap()),
+            u64::from_le_bytes(entry[8..].try_into().unwrap()),
+        )
+    };
+    let pairs = proc_auxv.len() / 16;
+    if pair_at(pairs - 1) != (0, 0) {
+        return TestResult::Fail("/proc auxv is missing its AT_NULL terminator");
+    }
+    let find_aux = |tag: u64| -> Option<u64> {
+        (0..pairs)
+            .map(pair_at)
+            .find_map(|(entry_tag, value)| (entry_tag == tag).then_some(value))
+    };
+    if !matches!(find_aux(3), Some(value) if value != 0) {
+        return TestResult::Fail("/proc auxv is missing AT_PHDR");
+    }
+    if find_aux(4) != Some(56) || find_aux(5) != Some(1) || find_aux(6) != Some(4096) {
+        return TestResult::Fail("/proc auxv does not mirror the loader's program-header entries");
+    }
+    if crate::handlers::proc_environ_of(proc.pid.raw()) != b"A=1\0" {
+        return TestResult::Fail("/proc environ does not mirror the loaded image");
+    }
+
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]

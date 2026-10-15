@@ -1,29 +1,27 @@
-//! W^X — Write XOR Execute enforcement.
+//! W^X — Write XOR Execute policy.
 //!
-//! No virtual-memory mapping may simultaneously carry the W (write)
-//! and X (exec) permission bits. The kernel refuses such mappings at
-//! the `mmap` entry and refuses such transitions at the `mprotect`
-//! entry.
+//! A mapping that is simultaneously writable and executable is a
+//! JIT engine's working memory: V8 makes its whole code range
+//! `PROT_READ | PROT_WRITE | PROT_EXEC` (guarded by a protection key where
+//! the CPU has them), and SpiderMonkey writes code into an RW page and then
+//! flips it to RX. NARF gates both shapes behind one named, revocable
+//! capability, `CAP_JIT`:
 //!
-//! The classical exception is JIT codegen: a JIT engine writes
-//! machine code into a writable page, then flips the page to
-//! read+execute and jumps to it. NARF supports that — but only
-//! through an explicit RW → RX transition gated by a CAP_JIT
-//! capability the task must already hold. There is no path through
-//! `mprotect` that adds X to an existing W mapping for a task
-//! without the cap.
+//!   * the RW → RX flip, and
+//!   * any transition whose end state is W|X,
 //!
-//! Compare:
+//! need a live `Cap<Jit, Grant>`. They are the same power — a task that can
+//! write a page and then make it executable can do everything a task holding
+//! an RWX page can — so gating one and refusing the other bought nothing,
+//! while refusing W|X outright broke every V8 embedder (Chromium, Electron,
+//! Node): `CodeRange::InitReservation` CHECKs that `pkey_mprotect(RWX)`
+//! succeeds and treats anything but ENOMEM as fatal.
 //!
-//!   * Linux historically allowed `PROT_WRITE | PROT_EXEC` and only
-//!     started encouraging W^X via per-process flags (`PROC_MEM_FORCE_*`
-//!     in 6.x). Even today, most distros enable W^X enforcement only
-//!     via SELinux/AppArmor rules — i.e. policy, not mechanism.
-//!   * grsecurity's PaX has had hard W^X via `MPROTECT` flag since
-//!     2003, with the same JIT-by-design exception. NARF takes the
-//!     same shape but expresses the JIT exception as a *capability*
-//!     not a per-process bit, so the privilege is named and revocable
-//!     rather than implicit.
+//! Linux grants both unconditionally unless the process opted into
+//! memory-deny-write-execute (`PR_SET_MDWE`), which the syscall layer
+//! enforces above this policy. NARF's difference is that the privilege is a
+//! capability the task holds by default and that can be revoked or denied,
+//! rather than ambient.
 //!
 //! References:
 //!   * grsecurity / PaX documentation, `MPROTECT` feature.
@@ -70,27 +68,15 @@ pub enum WxTransition {
     /// Transition is safe (one of: drops X, drops W, or stays at the
     /// same W^X invariant).
     Allow,
-    /// Transition adds W to an existing X mapping. Always refused —
-    /// not even CAP_JIT can do this (JIT writes new code into a
-    /// freshly-allocated RW region, then flips to RX; an existing X
-    /// region staying X across data writes is a different shape that
-    /// implies self-modifying code with no relocation, which we don't
-    /// support).
+    /// Reserved: a transition no capability can authorise. The current
+    /// policy produces none ([`classify_mprotect`] never returns it); the
+    /// variant stays so [`jit_mprotect`]'s refusal path keeps a name.
     DenyXtoWX,
-    /// Transition adds X to a currently-W mapping, ending at RX. Permitted
-    /// *only* if the caller holds `CAP_JIT`. This is the canonical JIT codegen
-    /// flip. The cap check is the caller's responsibility — this enum is just
-    /// the protocol.
+    /// Transition needs `CAP_JIT`: the RW → RX codegen flip, or any change
+    /// whose end state is W|X. The cap check is the caller's responsibility —
+    /// this enum is just the protocol.
     NeedsCapJit,
-    /// The destination state is simultaneously writable and executable.
-    /// Refused unconditionally: **no capability grants RWX.**
-    ///
-    /// This used to be [`Self::NeedsCapJit`] when the source mapping was not
-    /// already executable, which had the effect of making `CAP_JIT` a licence
-    /// to create a genuinely RWX user mapping — something NARF had previously
-    /// made impossible — while leaving the RW → RX flip the capability was
-    /// designed for ungated. That is backwards: grsecurity/PaX never permits
-    /// W|X, and the flip is the whole point of the exception.
+    /// Reserved, as [`Self::DenyXtoWX`]: never produced by the current policy.
     DenyWX,
 }
 
@@ -118,17 +104,12 @@ pub fn classify_mprotect(old: RegionPerms, new: RegionPerms) -> WxTransition {
     let new_w = new.contains(RegionPerms::WRITE);
     let new_x = new.contains(RegionPerms::EXEC);
 
-    // Refuse a W|X end state, unconditionally and whatever the caller holds.
-    //
-    // `DenyXtoWX` is kept as a distinct answer when the mapping was already
-    // executable, because that case names a different mistake (self-modifying
-    // code with no relocation) and is worth reporting separately. Both are
-    // refusals.
+    // A W|X end state is JIT memory: it needs the JIT capability, whatever
+    // the source state (PROT_NONE reservation, RW, or an existing RX range
+    // V8 makes writable again). See the module comment for why this is the
+    // same authority as the RW -> RX flip below.
     if new_w && new_x {
-        if old_x {
-            return WxTransition::DenyXtoWX;
-        }
-        return WxTransition::DenyWX;
+        return WxTransition::NeedsCapJit;
     }
 
     // Otherwise W^X holds in the destination state.
@@ -467,9 +448,9 @@ fn smoke_wx_jit_grant_lifecycle() -> TestResult {
 }
 kernel_test_in!("memory", smoke_wx_jit_grant_lifecycle);
 
-/// The classification the cap gate is built on. Positive and negative arms:
-/// RW→RX and RW→RWX need the cap, RX→RWX is refused outright, and everything
-/// that preserves W^X needs nothing.
+/// The classification the cap gate is built on: the RW→RX flip and every
+/// W|X end state need the cap, and everything that preserves W^X needs
+/// nothing.
 fn smoke_wx_classify_covers_every_arm() -> TestResult {
     let r = RegionPerms::READ;
     let rw = RegionPerms::READ | RegionPerms::WRITE;
@@ -479,18 +460,13 @@ fn smoke_wx_classify_covers_every_arm() -> TestResult {
     let cases: &[(RegionPerms, RegionPerms, WxTransition)] = &[
         // The JIT codegen flip — the one transition CAP_JIT exists for.
         (rw, rx, WxTransition::NeedsCapJit),
-        // Asking for W|X: refused, whatever the caller holds. These two used
-        // to be `NeedsCapJit`, which made the capability a licence to create a
-        // genuinely RWX mapping — something NARF had previously made
-        // impossible — while the flip above went ungated. A task that can
-        // write a page and then make it executable already has RWX's power, so
-        // gating the flip is what buys something and permitting W|X is what
-        // gives it away.
-        (rw, rwx, WxTransition::DenyWX),
-        (r, rwx, WxTransition::DenyWX),
-        // Adding W to an existing X mapping names a different mistake
-        // (self-modifying code with no relocation) and keeps its own answer.
-        (rx, rwx, WxTransition::DenyXtoWX),
+        // A W|X end state is JIT memory, whatever the source: V8 makes a
+        // PROT_NONE code range RWX in one pkey_mprotect, and re-opens RX
+        // ranges for writing. Same authority as the flip above.
+        (rw, rwx, WxTransition::NeedsCapJit),
+        (r, rwx, WxTransition::NeedsCapJit),
+        (RegionPerms(0), rwx, WxTransition::NeedsCapJit),
+        (rx, rwx, WxTransition::NeedsCapJit),
         // W^X-preserving transitions need no authority at all.
         (rx, rw, WxTransition::Allow),
         (rx, r, WxTransition::Allow),
@@ -511,9 +487,9 @@ fn smoke_wx_classify_covers_every_arm() -> TestResult {
 }
 kernel_test_in!("memory", smoke_wx_classify_covers_every_arm);
 
-/// The cap-gated entry refuses X→WX even with a live capability, and refuses
-/// everything once the capability is revoked.
-fn smoke_wx_jit_mprotect_refuses_x_to_wx() -> TestResult {
+/// The cap-gated entry makes an executable mapping RWX with a live
+/// capability, and refuses everything once the capability is revoked.
+fn smoke_wx_jit_mprotect_rwx_needs_live_cap() -> TestResult {
     let space = AddressSpace::empty();
     let base = VirtAddr::new(0x4000_0000);
     if space
@@ -531,9 +507,11 @@ fn smoke_wx_jit_mprotect_refuses_x_to_wx() -> TestResult {
     }
     let cap = JitCap::bootstrap();
     let rwx = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::EXEC;
-    match jit_mprotect(&cap, &space, base, 0x2000, rwx) {
-        Err(WxError::DenyXtoWX) => {}
-        _ => return TestResult::Fail("a live JIT cap was allowed to add W to an X mapping"),
+    if jit_mprotect(&cap, &space, base, 0x1000, rwx).is_err() {
+        return TestResult::Fail("a live JIT cap could not make an RX mapping RWX");
+    }
+    if space.perms_covering(base, 0x1000).map(|p| p.prot_only()) != Some(rwx) {
+        return TestResult::Fail("RX->RWX under a live JIT cap did not apply");
     }
     // And an unmapped range has no `old` to classify against.
     match jit_mprotect(&cap, &space, VirtAddr::new(0x9000_0000), 0x1000, rwx) {
@@ -541,12 +519,19 @@ fn smoke_wx_jit_mprotect_refuses_x_to_wx() -> TestResult {
         _ => return TestResult::Fail("jit_mprotect accepted an unmapped range"),
     }
     cap.revoke();
-    match jit_mprotect(&cap, &space, base, 0x2000, rwx) {
-        Err(WxError::CapRevoked) => TestResult::Pass,
-        _ => TestResult::Fail("a revoked JIT cap was still honoured"),
+    let second = VirtAddr::new(base.as_u64() + 0x1000);
+    match jit_mprotect(&cap, &space, second, 0x1000, rwx) {
+        Err(WxError::CapRevoked) => {}
+        _ => return TestResult::Fail("a revoked JIT cap was still honoured"),
     }
+    if space.perms_covering(second, 0x1000).map(|p| p.prot_only())
+        != Some(RegionPerms::READ | RegionPerms::EXEC)
+    {
+        return TestResult::Fail("a refused RWX request changed the mapping");
+    }
+    TestResult::Pass
 }
-kernel_test_in!("memory", smoke_wx_jit_mprotect_refuses_x_to_wx);
+kernel_test_in!("memory", smoke_wx_jit_mprotect_rwx_needs_live_cap);
 
 #[cfg(test)]
 mod tests {
@@ -585,9 +570,15 @@ mod tests {
     }
 
     #[test]
-    fn mprotect_rx_to_rwx_is_x_then_w_denied() {
+    fn mprotect_to_rwx_needs_cap() {
         let rx = RegionPerms::READ | RegionPerms::EXEC;
+        let rw = RegionPerms::READ | RegionPerms::WRITE;
         let rwx = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::EXEC;
-        assert_eq!(classify_mprotect(rx, rwx), WxTransition::DenyXtoWX);
+        assert_eq!(classify_mprotect(rx, rwx), WxTransition::NeedsCapJit);
+        assert_eq!(classify_mprotect(rw, rwx), WxTransition::NeedsCapJit);
+        assert_eq!(
+            classify_mprotect(RegionPerms(0), rwx),
+            WxTransition::NeedsCapJit
+        );
     }
 }

@@ -63,6 +63,19 @@ pub(super) fn fork_cpu(allowed: narf_scheduler::CpuSet) -> Option<narf_scheduler
 }
 
 pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
+    do_fork(ctx, false);
+}
+
+/// `vfork(2)`. NARF gives the child its own copy-on-write address space, as
+/// for fork(2) (POSIX permits a vfork that is a fork), so nothing but the
+/// tracer report differs: a traced parent with PTRACE_O_TRACEVFORK reports
+/// PTRACE_EVENT_VFORK — `kernel_clone` classifies `vfork(2)`, which is
+/// `CLONE_VFORK | CLONE_VM | SIGCHLD`, by CLONE_VFORK.
+pub(crate) fn sys_vfork(ctx: &mut dyn TrapContext) {
+    do_fork(ctx, true);
+}
+
+fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
     // Per-uid RLIMIT_NPROC. The global live-task cap below bounds the whole
     // MACHINE; this bounds ONE user, so a single unprivileged account cannot
     // consume every slot that cap allows.
@@ -222,6 +235,7 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // key here must be ProcessId, not TaskId.
     parent_of_set(child_pid.raw(), parent_pid);
     crate::mapped_file::fork_address_space(parent_as.identity(), child_as.identity());
+    fork_address_space_pkeys(parent_as.identity(), child_as.identity());
     // The child's mm carries COPIES of the parent's mbind range policies,
     // the way `dup_mmap` calls `vma_dup_policy` for every duplicated VMA.
     crate::handlers::fork_address_space_mbind_ranges(
@@ -313,6 +327,10 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     register_pid_task_mapping(child_pid.raw(), child_tid.raw());
     rlimit_fork(parent_pid, child_tid.raw());
     cap_fork(parent_pid, child_tid.raw());
+    // comm, exe, image mappings, argv, environ and auxv: the same identity
+    // the clone path inherits. A fork(2) child (musl issues SYS_fork) used to
+    // read an empty /proc/self/{comm,exe,cmdline,environ,auxv}.
+    crate::handlers::proc_identity_fork(parent_pid, child_tid.raw());
     // fork(2) copies (never shares) a pre-existing io_context.
     ioprio_fork(parent_pid, child_tid.raw(), false);
     // `sched_fork`: policy, RT priority and nice are inherited, subject to
@@ -323,10 +341,11 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // not touching the pending bitmap).
     crate::fd::fork(parent_pid, child_tid.raw());
     crate::mqueue::fork_fd_paths(parent_pid, child_tid.raw());
-    cwd_fork(parent_pid, child_tid.raw());
+    // fork(2) is clone without CLONE_FS: a private copy of root + cwd.
+    fs_fork(parent_pid, child_tid.raw(), false);
     personality_fork(parent_pid, child_tid.raw());
-    // chroot inheritance (see do_clone3) — child inherits the parent's root.
-    root_dir_fork(parent_pid, child_tid.raw());
+    prctl_fork(parent_pid, child_tid.raw());
+    crate::seccomp::fork(parent_pid, child_tid.raw());
     uidgid_fork(parent_pid, child_tid.raw());
     // `copy_process` duplicates the task mempolicy for every child.
     crate::handlers::mempolicy_fork(parent_pid, child_tid.raw());
@@ -383,17 +402,27 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // PENDING_EXITS. `fork_return_to_parent` yields the outer pid for a root-ns
     // parent (including one that just did `unshare(CLONE_NEWPID)`) and the
     // child's in-namespace pid for an ordinary container fork.
+    // A traced parent with PTRACE_O_TRACEFORK/TRACEVFORK: the child is
+    // auto-attached and born in its SIGSTOP stop, so this must precede the
+    // spawn. fork(2) is clone(SIGCHLD); vfork(2) adds CLONE_VM | CLONE_VFORK.
+    const CLONE_VM: u64 = 0x100;
+    const CLONE_VFORK: u64 = 0x4000;
+    let clone_flags = if vfork { CLONE_VM | CLONE_VFORK } else { 0 };
+    let ptrace_trace = crate::ptrace::attach_new_child(
+        parent_pid,
+        child_tid.raw(),
+        clone_flags,
+        17, /* SIGCHLD */
+    );
     // All child-visible state is now installed, so it is safe for the child
     // to execute on another CPU.
     pending_child.spawn();
     #[cfg(feature = "container")]
-    ctx.set_return(SyscallReturn::ok(crate::pid_ns::fork_return_to_parent(
-        parent_pid,
-        child_pid.raw(),
-        child_ns_pid,
-    )));
+    let ret = crate::pid_ns::fork_return_to_parent(parent_pid, child_pid.raw(), child_ns_pid);
     #[cfg(not(feature = "container"))]
-    ctx.set_return(SyscallReturn::ok(child_pid.raw()));
+    let ret = child_pid.raw();
+    ctx.set_return(SyscallReturn::ok(ret));
+    crate::ptrace::report_clone_event(ctx, ptrace_trace, child_tid.raw(), ret);
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

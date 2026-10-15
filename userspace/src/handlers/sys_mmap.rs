@@ -149,6 +149,7 @@ pub(crate) fn load_file_demand_page(
 /// zero-padding past EOF (the BSS tail of a file-backed segment).
 pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     const PROT_READ: u32 = 0x1;
+    const PROT_WRITE: u32 = 0x2;
     const PROT_EXEC: u32 = 0x4;
     let args = *ctx.args();
     let hint = args.arg0;
@@ -225,17 +226,29 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     // mmap and reports EBADF — not EACCES/EINVAL. A caller that opened O_PATH
     // to inspect a path and then tried to map it must be told the descriptor
     // is unusable, which is what sends it back through a real open(2).
-    if !anonymous {
-        // `fget` returns NULL both for an unopened slot and for an O_PATH
-        // description (its FMODE_PATH is masked out), so both are EBADF.
-        let open_and_mappable = fd >= 0
-            && fd::with_table(current_task_id(), |table| {
-                table.get(fd as u32).is_some()
-                    && table
-                        .status_flags(fd as u32)
-                        .is_none_or(|status| status & crate::fd::O_PATH == 0)
-            }) == Some(true);
-        if !open_and_mappable {
+    let file = if !anonymous {
+        // This is NARF's `fget`: retain the open-file description once and
+        // carry that exact object through validation and VMA publication. A
+        // later close or fd-number reuse must not change either the access
+        // mode just authorized or the FileOps object ultimately mapped.
+        let Some((ops, status_flags)) = (if fd >= 0 {
+            fd::with_table(current_task_id(), |table| {
+                table
+                    .get(fd as u32)
+                    .map(|entry| (Arc::clone(&entry.ops), entry.status_flags))
+            })
+            .flatten()
+        } else {
+            None
+        })
+        else {
+            ctx.set_return(errno_ret(EBADF));
+            return;
+        };
+        // `fget` masks out FMODE_PATH. An O_PATH description has neither
+        // read nor write mapping authority, so it remains EBADF rather than
+        // being misreported as an ordinary EACCES denial.
+        if status_flags & crate::fd::O_PATH != 0 {
             ctx.set_return(errno_ret(EBADF));
             return;
         }
@@ -253,7 +266,10 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             ctx.set_return(errno_ret(EINVAL));
             return;
         }
-    }
+        Some((ops, status_flags))
+    } else {
+        None
+    };
 
     let huge_size = if flags & MAP_HUGETLB != 0 {
         match (flags >> MAP_HUGE_SHIFT) & MAP_HUGE_MASK {
@@ -289,22 +305,19 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     // NARF's `path_noexec` (see the READ_IMPLIES_EXEC block below). Anonymous
     // memory always would.
     let mut file_allows_exec = true;
-    if !anonymous {
-        let ops = fd::with_table(current_task_id(), |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten();
-        if let Some(ops) = ops {
-            file_allows_exec = ops.mmap_max_prot(offset) & PROT_EXEC != 0;
-            match ops.validate_mmap(offset, len as usize, prot, flags) {
-                Ok(adjusted) => {
-                    if adjusted & 7 & !ops.mmap_max_prot(offset) != 0 {
-                        ctx.set_return(errno_ret(EACCES));
-                        return;
-                    }
-                    prot = adjusted;
-                }
-                Err(error) => {
-                    ctx.set_return(errno_ret(copy_fs_errno(error)));
+    if let Some((ops, _)) = file.as_ref() {
+        file_allows_exec = ops.mmap_max_prot(offset) & PROT_EXEC != 0;
+        match ops.validate_mmap(offset, len as usize, prot, flags) {
+            Ok(adjusted) => {
+                if adjusted & 7 & !ops.mmap_max_prot(offset) != 0 {
+                    ctx.set_return(errno_ret(EACCES));
                     return;
                 }
+                prot = adjusted;
+            }
+            Err(error) => {
+                ctx.set_return(errno_ret(copy_fs_errno(error)));
+                return;
             }
         }
     }
@@ -410,6 +423,45 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
+
+    if let Some((_, status_flags)) = file.as_ref() {
+        let access_mode = *status_flags & crate::fd::O_ACCMODE;
+        // Linux `do_mmap` first requires FMODE_WRITE for a shared writable
+        // VMA, then falls through to require FMODE_READ for every file VMA.
+        // The access bits in an open-file description are immutable, so this
+        // one snapshot remains valid for all later demand faults.
+        if (map_type == MAP_SHARED || map_type == MAP_SHARED_VALIDATE)
+            && prot & PROT_WRITE != 0
+            && access_mode != crate::fd::O_RDWR
+        {
+            ctx.set_return(errno_ret(EACCES));
+            return;
+        }
+        if access_mode != crate::fd::O_RDONLY && access_mode != crate::fd::O_RDWR {
+            ctx.set_return(errno_ret(EACCES));
+            return;
+        }
+    }
+
+    // `fs/proc/task_mmu.c::show_map_vma` prints, for every VMA with a
+    // `vm_file`, the inode's `i_sb->s_dev` and `i_ino` and the file's path.
+    // Capture that identity here, outside every VMA/owner lock, and let the
+    // file-owner row carry it through splits, mremap and fork. Crashpad groups
+    // a DSO's VMAs by `(dev, ino)` and reads the ELF header at the offset-0
+    // one, so ld.so's mappings must not look anonymous.
+    //
+    // LINUX-GAP: the eager private-file copy (MAP_POPULATE / MAP_LOCKED
+    // without MAP_NONBLOCK) registers no file owner and therefore still
+    // renders as `00:00 0` with no path; Linux keeps `vm_file` there too.
+    // LINUX-GAP: an fd with no recorded open path (memfd, anon inodes) gets
+    // dev/inode but no pathname; Linux prints `/memfd:<name> (deleted)`.
+    let provenance = file.as_ref().map(|(ops, _)| {
+        Arc::new(crate::mapped_file::MappingProvenance {
+            device: ops.inode_attrs().dev,
+            inode: ops.ino(),
+            pathname: crate::mqueue::fd_path(current_task_id(), fd as u32),
+        })
+    });
 
     // `mm/mmap.c::do_mmap`:
     //
@@ -594,7 +646,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    let mut fallback_file_ops = None;
+    let mut fallback_file_ops: Option<Arc<dyn narf_filesystem::FileOps>> = None;
     // Device-backed shared mapping — the keystone for graphics. A
     // `/dev/fb0` framebuffer (or a DRM dumb buffer) returns the
     // physical frames of its scanout buffer from `FileOps::mmap_frames`;
@@ -604,10 +656,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     // munmap/exit — same borrowed-frame contract as `sys_shmem_map` /
     // `sys_fb_ring_map`. A device that doesn't support mmap returns
     // Unsupported and we fall through to the regular file path.
-    if fd >= 0 && flags & MAP_SHARED != 0 {
-        let task = current_task_id();
-        let ops = fd::with_table(task, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten();
-        if let Some(ops) = ops {
+    if flags & MAP_SHARED != 0 {
+        if let Some((ops, _)) = file.as_ref() {
             // A coherent cache generation is the generic-file contract. It
             // cannot also expose device-owned mmap frames, so skip three
             // virtual capability probes and carry this already-retained file
@@ -657,12 +707,13 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                                     base,
                                     len,
                                     file_offset: offset,
-                                    ops: Arc::clone(&ops),
+                                    ops: Arc::clone(ops),
                                     lifetime: mmap_lifetime.clone(),
                                     writeback_phys: None,
                                     private_copy: false,
                                     replace: destructive_fixed,
                                     zero_from: None,
+                                    provenance: provenance.clone(),
                                 },
                                 || {
                                     // SAFETY: VMA -> shared transactions are held;
@@ -769,12 +820,13 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                                     base,
                                     len,
                                     file_offset: offset,
-                                    ops: Arc::clone(&ops),
+                                    ops: Arc::clone(ops),
                                     lifetime: None,
                                     writeback_phys: None,
                                     private_copy: false,
                                     replace: destructive_fixed,
                                     zero_from: None,
+                                    provenance: provenance.clone(),
                                 },
                                 || {
                                     // SAFETY: VMA -> shared transactions are held
@@ -828,7 +880,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 return;
             }
             }
-            fallback_file_ops = Some(ops);
+            fallback_file_ops = Some(Arc::clone(ops));
         }
     }
 
@@ -1018,12 +1070,10 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         // the eager fallback, streaming into scatter frames one page at a time
         // so a large DSO never requires one contiguous kernel allocation.
         let len_bytes = len as usize;
-        let ops = match fallback_file_ops.take().or_else(|| {
-            fd::with_table(current_task_id(), |t| {
-                t.get(fd as u32).map(|e| e.ops.clone())
-            })
-            .flatten()
-        }) {
+        let ops = match fallback_file_ops
+            .take()
+            .or_else(|| file.as_ref().map(|(ops, _)| Arc::clone(ops)))
+        {
             Some(o) => o,
             None => {
                 // File-backed mapping with an fd not in the fd table → EBADF.
@@ -1148,6 +1198,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                         private_copy: false,
                         replace: destructive_fixed,
                         zero_from: None,
+                        provenance: provenance.clone(),
                     },
                     || {
                         // SAFETY: VMA -> shared transactions are held and the
@@ -1214,6 +1265,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                         private_copy: true,
                         replace: destructive_fixed,
                         zero_from: None,
+                        provenance: provenance.clone(),
                     },
                     || {
                         // SAFETY: the VMA transaction and owner bucket remain
@@ -1603,6 +1655,105 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("userspace", smoke_mmap_linux_validation_errno_order);
+
+    /// `mm/mmap.c::do_mmap` admits a file mapping according to the open
+    /// file-description's access mode.  The page-fault path must never be a
+    /// second, accidentally more-permissive admission path: once a VMA exists
+    /// it retains the file reference, but an O_WRONLY descriptor cannot create
+    /// one and MAP_SHARED|PROT_WRITE needs O_RDWR.
+    fn smoke_mmap_enforces_file_description_access_mode() -> TestResult {
+        const PRIVATE_BASE: u64 = 0x0000_3700_0000_0000;
+        const SHARED_BASE: u64 = PRIVATE_BASE + 0x1000;
+        const RW_BASE: u64 = PRIVATE_BASE + 0x2000;
+        const MAP_SHARED: u64 = 0x01;
+        const MAP_PRIVATE: u64 = 0x02;
+        const MAP_FIXED: u64 = 0x10;
+
+        // SAFETY: the test owns this user root until it removes every VMA
+        // below.  A live root makes a success on a regressed implementation
+        // observable, rather than turning it into an unrelated ENOMEM.
+        let aspace = match unsafe { AddressSpace::new_for_user() } {
+            Ok(aspace) => Arc::new(aspace),
+            Err(_) => return TestResult::Fail("new_for_user failed"),
+        };
+        *USER_AS.lock() = Some(Arc::clone(&aspace));
+        install_address_space_lookup(address_space);
+        install_task_id_lookup(task);
+        CURRENT_TASK.store(TASK, Ordering::Relaxed);
+        crate::fd::__test_reset();
+
+        let file = Arc::new(TestFile {
+            bytes: IrqSafeSpinLock::new(vec![0; 4096]),
+            writes: AtomicUsize::new(0),
+        });
+        let install = |status_flags| {
+            crate::fd::install(
+                TASK,
+                crate::fd::FdEntry {
+                    ops: Arc::clone(&file) as Arc<dyn FileOps>,
+                    offset: 0,
+                    flags: 0,
+                    status_flags,
+                },
+            )
+        };
+        let (Some(write_only), Some(read_only), Some(read_write)) = (
+            install(crate::fd::O_WRONLY),
+            install(crate::fd::O_RDONLY),
+            install(crate::fd::O_RDWR),
+        ) else {
+            crate::fd::__test_reset();
+            *USER_AS.lock() = None;
+            return TestResult::Fail("could not install test file descriptors");
+        };
+
+        let invoke = |base, fd, prot, flags| {
+            let mut ctx = TestCtx {
+                args: SyscallArgs {
+                    arg0: base,
+                    arg1: 4096,
+                    arg2: prot,
+                    arg3: flags | MAP_FIXED,
+                    arg4: u64::from(fd),
+                    ..SyscallArgs::default()
+                },
+                ret: None,
+            };
+            sys_mmap(&mut ctx);
+            ctx.ret
+        };
+        let write_only_private = invoke(PRIVATE_BASE, write_only, 1, MAP_PRIVATE);
+        let read_only_shared_write = invoke(SHARED_BASE, read_only, 2, MAP_SHARED);
+        let read_write_shared = invoke(RW_BASE, read_write, 3, MAP_SHARED);
+
+        // These removals are no-ops on a correct implementation.  They also
+        // clean up the VMA owner registration when this test is first run
+        // against an older implementation that incorrectly admits a mapping.
+        for base in [PRIVATE_BASE, SHARED_BASE, RW_BASE] {
+            let _ = aspace.unmap_region(VirtAddr::new(base));
+            crate::mapped_file::unmap_current(base);
+        }
+        crate::fd::__test_reset();
+        *USER_AS.lock() = None;
+
+        let is_errno = |ret: Option<SyscallReturn>, errno: i64| {
+            ret.is_some_and(|ret| ret.status == SyscallReturn::OK && ret.value as i64 == -errno)
+        };
+        let rw_succeeded = read_write_shared.is_some_and(|ret| {
+            ret.status == SyscallReturn::OK && ret.value == RW_BASE
+        });
+        if !is_errno(write_only_private, EACCES)
+            || !is_errno(read_only_shared_write, EACCES)
+            || !rw_succeeded
+        {
+            return TestResult::Fail("mmap file-description access mode diverged from Linux");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_mmap_enforces_file_description_access_mode
+    );
 
     fn smoke_mmap_fixed_noreplace_is_non_destructive() -> TestResult {
         const BASE: u64 = 0x0000_3300_0000_0000;
@@ -2017,7 +2168,7 @@ mod tests {
                 ops: Arc::clone(&file) as Arc<dyn FileOps>,
                 offset: 0,
                 flags: 0,
-                status_flags: 0,
+                status_flags: crate::fd::O_RDONLY,
             },
         ) {
             Some(fd) => fd,
@@ -2142,7 +2293,7 @@ mod tests {
                 ops: Arc::clone(&file) as Arc<dyn FileOps>,
                 offset: 0,
                 flags: 0,
-                status_flags: 0,
+                status_flags: crate::fd::O_RDWR,
             },
         )
         .unwrap_or(u32::MAX);
@@ -2325,7 +2476,7 @@ mod tests {
                 ops,
                 offset: 0,
                 flags: 0,
-                status_flags: 0,
+                status_flags: crate::fd::O_RDWR,
             },
         )
     }

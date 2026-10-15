@@ -131,6 +131,19 @@ pub unsafe fn x86_64::user_mode::user_fs_base_for_cpu(cpu: usize) -> u64;
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn x86_64::user_mode::set_user_fs_base(fs_base: u64);
 
+/// User protection keys are enabled only on CPUs that advertise CPUID.PKU.
+/// The PKRU register is task state, distinct from supervisor PKRS domain state.
+#[cfg(target_arch = "x86_64")]
+pub fn x86_64::pku::supported() -> bool;
+#[cfg(target_arch = "x86_64")]
+pub fn x86_64::pku::enabled() -> bool;
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn x86_64::pku::enable_current_cpu() -> bool;
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn x86_64::pku::read() -> u32;
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn x86_64::pku::write(value: u32);
+
 /// Process PCIDs are independent of the PKS/PCID domain backend. Boot calls
 /// `enable_pcide` on every CPU, then closes the global gate after SMP discovery.
 #[cfg(target_arch = "x86_64")]

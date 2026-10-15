@@ -1058,6 +1058,13 @@ pub(crate) struct FdReservation {
 }
 
 impl FdReservation {
+    /// The reserved descriptor number, for ioctls that copy it out to the
+    /// caller before `fd_install` (Linux `sync_file_ioctl_merge`,
+    /// `dma_buf_export_sync_file`).
+    pub(crate) fn fd(&self) -> u32 {
+        self.fd
+    }
+
     pub(crate) fn install(mut self, entry: FdEntry) -> Option<u32> {
         let installed = with_table(self.task_id, |table| table.install_reserved(self.fd, entry))
             .unwrap_or(false);

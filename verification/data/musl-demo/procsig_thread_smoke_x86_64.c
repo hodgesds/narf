@@ -132,6 +132,52 @@ static int case_sigchld_worker_fork(void) {
     return 0;
 }
 
+// The same shape, repeated: the worker thread forks and exits at once, so its
+// child's exit races the worker's own exit-time reparenting of that child to
+// the surviving thread (Linux `forget_original_parent`, serialized with the
+// child's `do_notify_parent` by tasklist_lock). Every round the SIGCHLD must
+// reach the main thread and the zombie must be reapable from it.
+static int case_sigchld_worker_fork_stress(void) {
+    install(SIGCHLD);
+    alarm(120);
+    for (int round = 0; round < 200; round++) {
+        pthread_t t;
+        void *ret;
+        if (pthread_create(&t, NULL, fork_worker, NULL) != 0)
+            return fail("pthread_create");
+        pthread_join(t, &ret);
+        pid_t pid = (pid_t)(long)ret;
+        if (pid <= 0)
+            return fail("fork failed");
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (!await_handler(SIGCHLD, 2000)) {
+            // Tell a lost signal from a lost wake: was SIGCHLD left pending,
+            // is the zombie there to reap, and does the handler run late
+            // (the signal arrived but did not interrupt the parked poll)?
+            // And did the 2 s poll really wait 2 s?
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            long waited = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+            sigset_t pend;
+            sigemptyset(&pend);
+            sigpending(&pend);
+            int late = await_handler(SIGCHLD, 3000);
+            int zombie = waitpid(pid, NULL, WNOHANG) == pid;
+            char buf[112];
+            snprintf(buf, sizeof buf,
+                     "round %d: no SIGCHLD in 2s (pending=%d late=%d zombie=%d waited=%ldms)",
+                     round, sigismember(&pend, SIGCHLD), late, zombie, waited);
+            return fail(buf);
+        }
+        if (waitpid(pid, NULL, 0) != pid) {
+            char buf[64];
+            snprintf(buf, sizeof buf, "round %d: waitpid errno %d", round, errno);
+            return fail(buf);
+        }
+    }
+    return 0;
+}
+
 static void *kill_worker(void *arg) {
     (void)arg;
     block_all();
@@ -548,8 +594,62 @@ static int run(const char *name, int (*fn)(void)) {
     return 1;
 }
 
+static void *exit_zero(void *arg) {
+    (void)arg;
+    return NULL;
+}
+
+// A thread's own exit code is not the process's status: once a worker has
+// exited 0, the process's _exit(3) (exit_group) must still report 3, and a
+// leader that pthread_exit()s leaves the group exit code to whoever calls
+// exit_group later (Linux wait_task_zombie: group_exit_code, else the
+// leader's exit_code).
+static int exit_status_check(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        pthread_t t;
+        pthread_create(&t, NULL, exit_zero, NULL);
+        pthread_join(t, NULL);
+        _exit(3);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 3) {
+        cur_case = "exit-status";
+        char buf[64];
+        snprintf(buf, sizeof buf, "worker exit then _exit(3) reported status %#x", status);
+        return fail(buf);
+    }
+    return 0;
+}
+
+static void *exit_five_later(void *arg) {
+    (void)arg;
+    usleep(20000);
+    _exit(5);
+}
+
+static int exit_status_leader_first(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        pthread_t t;
+        pthread_create(&t, NULL, exit_five_later, NULL);
+        pthread_exit(NULL);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 5) {
+        cur_case = "exit-status-leader-first";
+        char buf[64];
+        snprintf(buf, sizeof buf, "leader pthread_exit then _exit(5) reported %#x", status);
+        return fail(buf);
+    }
+    return 0;
+}
+
 int main(void) {
     int failed = 0;
+    // The harness below trusts each case's exit status; check that first.
+    failed |= exit_status_check();
+    failed |= exit_status_leader_first();
     failed |= run("sigchld-worker-fork", case_sigchld_worker_fork);
     failed |= run("kill-from-worker", case_kill_from_worker);
     failed |= run("main-blocks", case_main_blocks);
@@ -563,6 +663,7 @@ int main(void) {
     failed |= run("group-stop", case_group_stop);
     failed |= run("siginfo-spinning", case_siginfo_spinning);
     failed |= run("sigchld-siginfo", case_sigchld_siginfo);
+    failed |= run("sigchld-worker-fork-stress", case_sigchld_worker_fork_stress);
     if (failed)
         return 1;
     w("procsig-thread-ok\n");

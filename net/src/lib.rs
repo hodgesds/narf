@@ -55,6 +55,8 @@ pub fn release_network_namespace(net_ns_id: u64) {
     raw_sock::remove_namespace(net_ns_id);
     icmp_sock::remove_namespace(net_ns_id);
     tcp_stack::remove_namespace(net_ns_id);
+    ip_fragment::remove_namespace(net_ns_id);
+    ip_output::remove_namespace(net_ns_id);
     dhcp::remove_namespace(net_ns_id);
     route::remove_namespace(net_ns_id);
     ipv6::addrs::remove_namespace(net_ns_id);
@@ -81,7 +83,9 @@ pub mod icmp_sock;
 pub mod iface;
 pub mod ifaddr;
 pub mod ip_forward;
+pub mod ip_fragment;
 pub mod ip_local;
+pub mod ip_output;
 pub mod ipv4;
 pub mod ipv6;
 pub mod ipv6_stack;
@@ -119,6 +123,7 @@ pub mod stun;
 pub mod tcp;
 pub mod tcp_stack;
 pub mod tls;
+pub mod udp_gso;
 pub mod udp_sock;
 pub mod wireguard;
 pub mod ws;
@@ -136,15 +141,23 @@ mod e2e_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod errno_linux_tests;
 #[cfg(any(test, feature = "kernel-test"))]
+mod ip_fragment_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+mod ip_output_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod ipv6_e2e_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod protocol_coverage_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tcp_e2e_tests;
 #[cfg(any(test, feature = "kernel-test"))]
+mod tcp_robust_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod tcp_timer_e2e_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;
+#[cfg(any(test, feature = "kernel-test"))]
+mod udp_gso_tests;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -191,6 +204,11 @@ pub struct Frame {
     buf: DmaBuffer,
     offset: u32,
     len: u32,
+    /// Hardware queue that owns the frame's DMA-buffer recycler. RX producers
+    /// set this to their source queue; zero-copy TX allocators set it to the
+    /// chosen destination queue so completion can recycle locally instead of
+    /// contending on an interface-wide pool.
+    queue: u16,
     tx_meta: TxMeta,
     rx_meta: RxMeta,
 }
@@ -221,6 +239,7 @@ impl Frame {
             buf,
             offset: 0,
             len: if len > cap { cap } else { len },
+            queue: 0,
             tx_meta: TxMeta::plain(),
             rx_meta: RxMeta::default(),
         }
@@ -235,6 +254,14 @@ impl Frame {
     /// buffer's allocated capacity.
     #[inline]
     pub fn with_offset(buf: DmaBuffer, offset: u32, len: u32) -> Self {
+        Self::with_offset_on_queue(buf, offset, len, 0)
+    }
+
+    /// Like [`Self::with_offset`], but records the queue that owns the DMA
+    /// buffer. A driver uses this for explicit multi-queue RX/TX ownership;
+    /// it lets a completion recycle a buffer to that queue's local pool.
+    #[inline]
+    pub fn with_offset_on_queue(buf: DmaBuffer, offset: u32, len: u32, queue: u16) -> Self {
         let cap = buf.len() as u32;
         let off = offset.min(cap);
         let max_len = cap.saturating_sub(off);
@@ -242,6 +269,7 @@ impl Frame {
             buf,
             offset: off,
             len: if len > max_len { max_len } else { len },
+            queue,
             tx_meta: TxMeta::plain(),
             rx_meta: RxMeta::default(),
         }
@@ -268,6 +296,13 @@ impl Frame {
     #[inline]
     pub fn offset(&self) -> u32 {
         self.offset
+    }
+
+    /// Hardware RX/TX queue associated with this frame's DMA-buffer owner.
+    /// A plain [`Frame::new`] or [`Frame::with_offset`] starts on queue zero.
+    #[inline]
+    pub fn queue(&self) -> u16 {
+        self.queue
     }
 
     /// Borrow the payload bytes. Honors `offset` so the slice
@@ -331,6 +366,44 @@ impl Frame {
     pub fn into_parts_with_offset(self) -> (DmaBuffer, u32, u32) {
         (self.buf, self.offset, self.len)
     }
+
+    /// Decompose into the underlying buffer, payload view, and the queue that
+    /// owns its recycler. Multi-queue zero-copy TX uses this to submit and
+    /// recycle on the same queue without an interface-wide pool lock.
+    #[inline]
+    pub fn into_parts_with_offset_and_queue(self) -> (DmaBuffer, u32, u32, u16) {
+        (self.buf, self.offset, self.len, self.queue)
+    }
+}
+
+/// Map an IPv4 transport flow to one of `queues` hardware queues using the
+/// symmetric 4-tuple hash used by multi-queue NIC drivers. The endpoints are
+/// network-order octets and ports. Reversing source/destination yields the
+/// same queue, which keeps the two directions of a flow core-affine.
+#[inline]
+pub fn ipv4_flow_queue(
+    src: [u8; 4],
+    dst: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    queues: usize,
+) -> usize {
+    if queues <= 1 {
+        return 0;
+    }
+    // Keep this byte-for-byte compatible with the virtio-net fast parser:
+    // addresses and ports are folded in wire order, then a short finalizer
+    // spreads entropy into the low bits selected by `% queues`.
+    let src = u32::from_ne_bytes(src);
+    let dst = u32::from_ne_bytes(dst);
+    let src_port = src_port.to_be_bytes();
+    let dst_port = dst_port.to_be_bytes();
+    let ports = u32::from_ne_bytes([src_port[0], src_port[1], dst_port[0], dst_port[1]]);
+    let mut hash = src ^ dst ^ ports.rotate_left(16) ^ ports;
+    hash ^= hash >> 16;
+    hash = hash.wrapping_mul(0x7feb_352d);
+    hash ^= hash >> 15;
+    (hash as usize) % queues
 }
 
 // ── Direction ───────────────────────────────────────────────────────

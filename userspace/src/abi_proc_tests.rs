@@ -2954,6 +2954,34 @@ fn smoke_abi_proc_namespace_open_mints_setns_fd() -> TestResult {
 #[cfg(feature = "container")]
 kernel_test_in!("syscall_abi", smoke_abi_proc_namespace_open_mints_setns_fd);
 
+// ── Namespace magic links are usable by pathname capability probes ─────
+//
+// systemd's namespace feature probe is deliberately smaller than an open:
+// `namespace_type_supported()` asks `access("/proc/self/ns/net", F_OK)`
+// before an executor attempts CLONE_NEWNET.  The final proc link is a magic
+// link, not a normal symlink whose rendered `net:[inum]` text is a pathname.
+// Following it must therefore reach the retained nsfs object; otherwise
+// systemd disables PrivateNetwork= without trying to create the namespace.
+#[cfg(feature = "container")]
+fn smoke_abi_proc_namespace_access_follows_magic_link() -> TestResult {
+    with_setup(|| {
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        let path = b"/proc/self/ns/net\0";
+        match call(
+            Syscall::Faccessat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("faccessat(F_OK) did not follow /proc/self/ns/net"),
+        }
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_namespace_access_follows_magic_link
+);
+
 // ── read(2) must not hold the fd-table lock across FileOps ────────
 //
 // `sys_read` used to call `FileOps::read` while holding the caller's
@@ -3084,9 +3112,29 @@ fn smoke_abi_proc_seccomp_new_listener_is_einval() -> TestResult {
     with_setup(|| {
         const SECCOMP_SET_MODE_FILTER: u64 = 1;
         const SECCOMP_FILTER_FLAG_NEW_LISTENER: u64 = 1 << 3;
-        match call(
+        // `seccomp_set_mode_filter` prepares the program before it looks at
+        // the listener: a NULL program is -EFAULT even with NEW_LISTENER.
+        if call(
             Syscall::Seccomp.raw(),
             a2(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, 0),
+        ) != Some(EFAULT)
+        {
+            return Err("seccomp NEW_LISTENER with a NULL program must be -EFAULT");
+        }
+        // A valid program reaches the listener step, which NARF refuses.
+        let mut insn = [0u8; 8];
+        insn[0..2].copy_from_slice(&0x06u16.to_ne_bytes()); // BPF_RET | BPF_K
+        insn[4..8].copy_from_slice(&0x7fff_0000u32.to_ne_bytes()); // SECCOMP_RET_ALLOW
+        let mut fprog = [0u8; 16];
+        fprog[0..2].copy_from_slice(&1u16.to_ne_bytes());
+        fprog[8..16].copy_from_slice(&(insn.as_ptr() as u64).to_ne_bytes());
+        match call(
+            Syscall::Seccomp.raw(),
+            a2(
+                SECCOMP_SET_MODE_FILTER,
+                SECCOMP_FILTER_FLAG_NEW_LISTENER,
+                fprog.as_ptr() as u64,
+            ),
         ) {
             Some(EINVAL) => Ok(()),
             _ => Err("seccomp NEW_LISTENER must return -EINVAL when notifications are unsupported"),

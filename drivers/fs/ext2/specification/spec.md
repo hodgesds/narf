@@ -96,7 +96,10 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
   that exact `FileMapping` folio (and conservatively marks it dirty because
   hardware PTE dirty-bit harvesting is not yet wired), so hard-link aliases,
   `read(2)`, and `write(2)` all observe one physical page. A failed block
-  write leaves the page dirty for writeback. `fsync` writes back dirty pages
+  write leaves the page dirty for writeback. Its direct mmap fault returns an
+  asynchronous cache-fill future; the common FileOps fault bridge parks the
+  caller on that fill's waker and retries after publication, never
+  spin-polling a folio owned by another task. `fsync` writes back dirty pages
   and flushes the device cache. `truncate` first publishes the smaller size
   and revokes every mapped page wholly beyond it, then zeroes the new last
   block's tail in the cache and on disk (`block_truncate_page`) and drops

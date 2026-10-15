@@ -1318,3 +1318,76 @@ fn smoke_time_wait_2msl_expiry() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/tcp/timer", smoke_time_wait_2msl_expiry);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ACK by bytes, not segments (`__tcp_ack_snd_check`)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Linux ACKs immediately once more than one full segment (`rcv_mss`) has
+// arrived since the last advertised window; smaller arrivals wait for the
+// delayed-ACK timer. Counting SEGMENTS instead made a GRO-merged burst — one
+// segment carrying many wire segments — wait out the timer, and ACKed two
+// tiny segments at once where Linux would not.
+
+/// Deliver `payloads` in order on a fresh connection with quickack credit
+/// spent; report whether an ACK for the new data went out immediately.
+fn acked_immediately(port_base: u16, payloads: &[&[u8]]) -> Result<bool, &'static str> {
+    const IFACE: &str = "tcp-ack-bytes";
+    const LOCAL_IP: [u8; 4] = [10, 0, 58, 1];
+    timer_full_reset(IFACE, LOCAL_IP, LOCAL_IP);
+    let client_iss = 0x5800_0000u32;
+    let (listen_id, child_id, server_iss) =
+        establish_server_side(LOCAL_IP, port_base, port_base + 100, client_iss)?;
+    __with_tcb_mut(child_id, |t| t.quickack_left = 0).ok_or("child TCB vanished")?;
+    let _ = timer_drain_captured();
+    let mut seq = client_iss.wrapping_add(1);
+    for payload in payloads {
+        let seg = build_tcp_seg(TcpSegSpec {
+            src_ip: LOCAL_IP,
+            dst_ip: LOCAL_IP,
+            src_port: port_base + 100,
+            dst_port: port_base,
+            seq,
+            ack: server_iss.wrapping_add(1),
+            flags: FLAG_ACK,
+            window: 65535,
+            payload,
+        });
+        handle_segment(LOCAL_IP, LOCAL_IP, &seg[ETH_HDR_LEN + IPV4_HDR_LEN..]);
+        seq = seq.wrapping_add(payload.len() as u32);
+    }
+    let acked = timer_drain_captured()
+        .iter()
+        .any(|f| frame_flags(f) & FLAG_ACK != 0 && frame_ack(f) == seq);
+    let _ = close(child_id);
+    let _ = close(listen_id);
+    Ok(acked)
+}
+
+fn smoke_tcp_ack_decision_counts_bytes() -> TestResult {
+    let small = [0x11u8; 100];
+    let big = [0x22u8; 4 * 536];
+    // One small segment: under one full frame — delayed.
+    match acked_immediately(58_001, &[&small]) {
+        Ok(false) => {}
+        Ok(true) => return TestResult::Fail("one small segment was ACKed immediately"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    // Two small segments still total under one full frame — delayed. (Counting
+    // segments ACKed this at once.)
+    match acked_immediately(58_002, &[&small, &small]) {
+        Ok(false) => {}
+        Ok(true) => return TestResult::Fail("two tiny segments were ACKed as if two full frames"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    // One segment carrying several full frames (what GRO hands TCP) — now.
+    match acked_immediately(58_003, &[&big]) {
+        Ok(true) => {}
+        Ok(false) => {
+            return TestResult::Fail("a multi-MSS (GRO-merged) segment waited for delayed ACK")
+        }
+        Err(e) => return TestResult::Fail(e),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp/timer", smoke_tcp_ack_decision_counts_bytes);

@@ -107,13 +107,18 @@ pub(super) fn deliver_icmp_error(e: &narf_net::udp_sock::UdpIcmpError) {
     };
     let local = u32::from_be_bytes(e.local_ip);
     let peer = (u32::from_be_bytes(e.peer_ip), e.peer_port);
+    // `ip_icmp_error`: `addr_offset` points at the quoted header's daddr and
+    // `port` is the quoted UDP header's destination port, so `msg_name` is
+    // the errored datagram's destination.
     let ext = crate::socket::ExtSockError {
         errno: e.errno,
-        origin: 2, // SO_EE_ORIGIN_ICMP
+        origin: crate::socket::SO_EE_ORIGIN_ICMP,
         icmp_type: e.icmp_type,
         icmp_code: e.icmp_code,
         info: e.info,
         offender_ip: e.offender_ip,
+        name_ip: e.peer_ip,
+        name_port: e.peer_port,
     };
     for s in socks {
         let Some(view) = view_of(&s) else { continue };
@@ -400,6 +405,32 @@ fn select_source(ns: u64, daddr: u32, dev: u32) -> Result<u32, SockError> {
         .ok_or(SockError::NetUnreach)
 }
 
+/// `udp_send_skb`'s GSO checks for an IPv4 send of a `len`-byte payload
+/// (see [`narf_net::udp_gso::gso_check`]): `Some(gso_size)` when the payload
+/// is split into several datagrams, `None` for one ordinary datagram.
+/// `no_check` is `sk_no_check_tx` (SO_NO_CHECK).
+pub(super) fn udp_gso_send_check(
+    len: usize,
+    gso_size: u16,
+    fragsize: u32,
+    no_check: bool,
+) -> Result<Option<u16>, SockError> {
+    if gso_size == 0 {
+        return Ok(None);
+    }
+    match narf_net::udp_gso::gso_check(
+        narf_net::pkt::IPV4_HDR_LEN,
+        len,
+        gso_size,
+        fragsize,
+        no_check,
+    ) {
+        Ok(split) => Ok(split.then_some(gso_size)),
+        Err(narf_net::udp_gso::GsoError::MsgSize) => Err(SockError::MsgSize),
+        Err(narf_net::udp_gso::GsoError::Invalid) => Err(SockError::InvalidArg),
+    }
+}
+
 /// Queue `pkt` on `sock`, or drop it when the receive buffer is full.
 ///
 /// `__udp_enqueue_schedule_skb` (`net/ipv4/udp.c:1527`) drops the ARRIVING
@@ -422,6 +453,42 @@ fn enqueue(sock: &SocketFile, pkt: DgramPacket) -> bool {
     sock.dgram_readiness.notify(narf_filesystem::POLL_IN);
     narf_net::readiness::notify(0);
     true
+}
+
+/// Queue a datagram this host sent to itself (lo, or the looped copy of a
+/// broadcast / multicast). `gso` is the segment size of a GSO send that
+/// `udp_send_skb` marked `SKB_GSO_UDP_L4` (payload > gso_size); lo passes such
+/// an skb up unsegmented (`NETIF_F_GSO_SOFTWARE`), so a `UDP_GRO` socket
+/// (`ACCEPT_L4`) queues it whole and reads it with a `UDP_GRO` cmsg, while any
+/// other socket gets the datagrams the sender batched, each charged on its own
+/// (`udp_unexpected_gso` -> `udp_rcv_segment` -> `__udp_gso_segment`).
+fn enqueue_local(sock: &SocketFile, pkt: DgramPacket, gso: Option<u16>) {
+    let Some(gso) = gso else {
+        enqueue(sock, pkt);
+        return;
+    };
+    if sock.options.lock().ext.udp_gro {
+        let mut pkt = pkt;
+        if let Some(rx) = pkt.inet4_rx.as_mut() {
+            rx.gso_size = gso;
+        }
+        enqueue(sock, pkt);
+        return;
+    }
+    for chunk in narf_net::udp_gso::segment_payload(&pkt.payload, usize::from(gso)) {
+        enqueue(
+            sock,
+            DgramPacket {
+                peer_unix: None,
+                sender_cred: None,
+                peer_addr: pkt.peer_addr,
+                peer_port: pkt.peer_port,
+                payload: chunk.to_vec(),
+                fds: Vec::new(),
+                inet4_rx: pkt.inet4_rx,
+            },
+        );
+    }
 }
 
 /// Deliver a datagram that arrived from the wire. See
@@ -455,6 +522,7 @@ pub(super) fn deliver_wire(
         spec_dst,
         ttl: meta.ttl,
         tos: meta.tos,
+        gso_size: 0,
     };
     if super::sockopt::is_multicast_v4(daddr) {
         // `ip_route_input_mc` accepts a group only when the arrival device
@@ -722,6 +790,13 @@ impl SocketFile {
             }
             *peer = Some((ip, port));
         }
+        drop(st);
+        // `__ip4_datagram_connect`: `atomic_set(&inet->inet_id,
+        // get_random_u16())`.
+        self.inet_id.store(
+            narf_net::ip_output::get_random_u16(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
         SocketOpResult::Ok(0)
     }
 
@@ -832,10 +907,17 @@ impl SocketFile {
                 None => return SocketOpResult::Err(SockError::DestAddrReq),
             },
         };
+        // `ipc.gso_size = up->gso_size`, overridden by a `UDP_SEGMENT` cmsg;
+        // a malformed SOL_UDP cmsg is EINVAL (`udp_cmsg_send`).
+        let gso_size = match self.udp_send_gso_size() {
+            Ok(g) => g,
+            Err(e) => return SocketOpResult::Err(e),
+        };
         if super::sockopt::is_multicast_v4(dest.0) {
-            return self.inet_dgram_send_mcast(buf, local_addr, local_port, dest);
+            return self
+                .inet_dgram_send_mcast(buf, local_addr, local_port, dest, connected, gso_size);
         }
-        let (dev, broadcast, ip_ttl, ip_tos, ip_pmtudisc) = {
+        let (dev, broadcast, ip_ttl, ip_tos, ip_pmtudisc, no_check) = {
             let o = self.options.lock();
             (
                 o.bindtodevice_index,
@@ -843,6 +925,7 @@ impl SocketFile {
                 o.ip_ttl,
                 o.ip_tos,
                 o.ext.ip_pmtudisc,
+                o.ext.no_check,
             )
         };
         // Route lookup: no route → ENETUNREACH (`net/ipv4/udp.c:1238-1244`);
@@ -856,11 +939,24 @@ impl SocketFile {
         if dest_is_broadcast && !broadcast {
             return SocketOpResult::Err(SockError::Access);
         }
-        // `__ip_append_data`: more than IP_MAX_MTU - iphdr - udphdr = 65507
-        // payload bytes → EMSGSIZE (`net/ipv4/ip_output.c:992-995`).
-        if buf.len() > narf_net::udp_sock::UDP_MAX_PAYLOAD {
-            return SocketOpResult::Err(SockError::MsgSize);
-        }
+        // `ip_make_skb` → `ip_setup_cork` (an MTU below 68 is ENETUNREACH)
+        // → `__ip_append_data`: the datagram may not exceed IP_MAX_MTU, or
+        // the path MTU for IP_PMTUDISC_DO / PROBE / INTERFACE; over it is
+        // EMSGSIZE, with an `ip_local_error` record for IP_RECVERR
+        // (`net/ipv4/ip_output.c` `__ip_append_data`). The MTU is the route's:
+        // lo's for a local destination.
+        let fragsize = match self.inet_dgram_append_check(
+            ns,
+            dest,
+            dev,
+            ip_pmtudisc,
+            buf.len(),
+            connected,
+            gso_size != 0,
+        ) {
+            Ok(f) => f,
+            Err(e) => return SocketOpResult::Err(e),
+        };
         // `sock_alloc_send_pskb` reports a pending socket error first, then
         // EPIPE after SHUT_WR (`net/core/sock.c:2869-2875`).
         if let Some(e) = self.take_pending_error() {
@@ -869,6 +965,11 @@ impl SocketFile {
         if self.sk_shutdown() & SEND_SHUTDOWN != 0 {
             return SocketOpResult::Err(SockError::Pipe);
         }
+        // `udp_send_skb`'s GSO checks on the built skb.
+        let gso = match udp_gso_send_check(buf.len(), gso_size, fragsize, no_check) {
+            Ok(g) => g,
+            Err(e) => return SocketOpResult::Err(e),
+        };
         // An IP_PKTINFO ipi_spec_dst (sendmsg) overrides the source address for
         // this datagram — both the looped-back copy and the wire send — so a
         // reply leaves from the address the peer saw (QUIC source pinning).
@@ -902,6 +1003,7 @@ impl SocketFile {
                 spec_dst: from,
                 ttl: ip_ttl.min(255) as u8,
                 tos: ip_tos.min(255) as u8,
+                gso_size: 0,
             };
             // A broadcast route's output (`ip_mc_output`,
             // `net/ipv4/ip_output.c:413`) loops a clone back to this host,
@@ -914,7 +1016,7 @@ impl SocketFile {
                     .unwrap_or_default()
             };
             for t in targets {
-                enqueue(
+                enqueue_local(
                     &t,
                     DgramPacket {
                         peer_unix: None,
@@ -925,6 +1027,7 @@ impl SocketFile {
                         fds: Vec::new(),
                         inet4_rx: Some(rx),
                     },
+                    gso,
                 );
             }
         }
@@ -937,18 +1040,33 @@ impl SocketFile {
                 ip_pmtudisc,
                 ip_src_override: src_override.map(|a| a.to_be_bytes()),
                 sndbuf: narf_net::udp_sock::UDP_MAX_PAYLOAD,
+                gso_size,
+                no_check_tx: no_check,
                 ..Default::default()
             };
             let dst = narf_net::udp_sock::SocketAddrV4::new(dest.0.to_be_bytes(), dest.1);
+            // A connected socket numbers its datagrams from `inet_id`
+            // (`ip_select_ident_segs` keys on `inet_daddr`).
+            let inet_id = connected.map(|_| &self.inet_id);
             return match narf_net::udp_sock::udp_send_from(
                 ns, local_port, dst, buf, &udp_opts, // Never block a sendto on ARP.
-                0,
+                0, inet_id,
             ) {
                 Ok(n) => SocketOpResult::Ok(n as u64),
                 Err(narf_net::udp_sock::UdpError::NoBroadcastPermission) => {
                     SocketOpResult::Err(SockError::Access)
                 }
                 Err(narf_net::udp_sock::UdpError::MsgTooLong) => {
+                    SocketOpResult::Err(SockError::MsgSize)
+                }
+                // The interface MTU changed since the check above.
+                Err(narf_net::udp_sock::UdpError::LocalMsgSize { info }) => {
+                    self.ip_local_error(
+                        errno::EMSGSIZE as u32,
+                        dest.0,
+                        connected.map_or(0, |c| c.1),
+                        info,
+                    );
                     SocketOpResult::Err(SockError::MsgSize)
                 }
                 // An unresolved neighbour is not an error to the caller:
@@ -959,6 +1077,9 @@ impl SocketFile {
                 }
                 Err(narf_net::udp_sock::UdpError::QueueFull) => {
                     SocketOpResult::Err(SockError::NoBufs)
+                }
+                Err(narf_net::udp_sock::UdpError::GsoInvalid) => {
+                    SocketOpResult::Err(SockError::InvalidArg)
                 }
                 Err(_) => SocketOpResult::Err(SockError::NetUnreach),
             };
@@ -986,8 +1107,9 @@ impl SocketFile {
                     spec_dst: dest.0,
                     ttl: ip_ttl.min(255) as u8,
                     tos: ip_tos.min(255) as u8,
+                    gso_size: 0,
                 };
-                enqueue(
+                enqueue_local(
                     &d,
                     DgramPacket {
                         peer_unix: None,
@@ -998,6 +1120,7 @@ impl SocketFile {
                         fds: Vec::new(),
                         inet4_rx: Some(rx),
                     },
+                    gso,
                 );
             }
             None => {
@@ -1017,6 +1140,51 @@ impl SocketFile {
         SocketOpResult::Ok(buf.len() as u64)
     }
 
+    /// `ip_setup_cork` + `__ip_append_data`'s size check for a `len`-byte
+    /// UDP payload to `dest` leaving through the route `bound_dev` / the
+    /// destination selects (`lo` for a local destination). Over the limit
+    /// is EMSGSIZE, after queuing `ip_local_error(sk, EMSGSIZE, daddr,
+    /// inet_dport, mtu)` for an IP_RECVERR socket; an MTU below 68 is
+    /// ENETUNREACH. A GSO send (`gso`) is limited by `IP_MAX_MTU` instead of
+    /// the path MTU. Returns the cork's `fragsize` for `udp_send_skb`.
+    #[allow(clippy::too_many_arguments)]
+    fn inet_dgram_append_check(
+        &self,
+        ns: u64,
+        dest: (u32, u16),
+        bound_dev: u32,
+        pmtudisc: i32,
+        len: usize,
+        connected: Option<(u32, u16)>,
+        gso: bool,
+    ) -> Result<u32, SockError> {
+        let Some(dev_mtu) =
+            narf_net::ip_output::route_dev_mtu_in(ns, dest.0.to_be_bytes(), bound_dev)
+        else {
+            return Err(SockError::NetUnreach);
+        };
+        let mtu = narf_net::ip_output::fragsize(pmtudisc, dev_mtu);
+        let length = narf_net::pkt_udp::UDP_HDR_LEN + len;
+        let checked = if gso {
+            narf_net::ip_output::append_check_gso(mtu, length)
+        } else {
+            narf_net::ip_output::append_check(pmtudisc, mtu, length)
+        };
+        match checked {
+            Ok(()) => Ok(mtu),
+            Err(narf_net::ip_output::AppendError::NetUnreach) => Err(SockError::NetUnreach),
+            Err(narf_net::ip_output::AppendError::MsgSize { info }) => {
+                self.ip_local_error(
+                    errno::EMSGSIZE as u32,
+                    dest.0,
+                    connected.map_or(0, |c| c.1),
+                    info,
+                );
+                Err(SockError::MsgSize)
+            }
+        }
+    }
+
     /// A datagram to an IPv4 multicast group. `udp_sendmsg` routes it out
     /// `IP_MULTICAST_IF` (else the bound device, else the route) with the
     /// `IP_MULTICAST_TTL` hop limit; `ip_mc_output` loops a copy back to
@@ -1029,29 +1197,47 @@ impl SocketFile {
         local_addr: u32,
         local_port: u16,
         dest: (u32, u16),
+        connected: Option<(u32, u16)>,
+        gso_size: u16,
     ) -> SocketOpResult {
         let ns = self.net_ns_id();
-        let (egress, mc_loop, mc_ttl, ip_tos) = {
+        let (egress, mc_loop, mc_ttl, ip_tos, ip_pmtudisc, no_check) = {
             let o = self.options.lock();
             (
                 super::sockopt::mc_egress_v4(ns, &o, dest.0),
                 o.ext.ip_mc_loop,
                 o.ip_multicast_ttl,
                 o.ip_tos,
+                o.ext.ip_pmtudisc,
+                o.ext.no_check,
             )
         };
         let Some(egress) = egress else {
             return SocketOpResult::Err(SockError::NetUnreach);
         };
-        if buf.len() > narf_net::udp_sock::UDP_MAX_PAYLOAD {
-            return SocketOpResult::Err(SockError::MsgSize);
-        }
+        // `__ip_append_data` against the multicast egress device's MTU.
+        let fragsize = match self.inet_dgram_append_check(
+            ns,
+            dest,
+            egress,
+            ip_pmtudisc,
+            buf.len(),
+            connected,
+            gso_size != 0,
+        ) {
+            Ok(f) => f,
+            Err(e) => return SocketOpResult::Err(e),
+        };
         if let Some(e) = self.take_pending_error() {
             return SocketOpResult::Err(e);
         }
         if self.sk_shutdown() & SEND_SHUTDOWN != 0 {
             return SocketOpResult::Err(SockError::Pipe);
         }
+        let gso = match udp_gso_send_check(buf.len(), gso_size, fragsize, no_check) {
+            Ok(g) => g,
+            Err(e) => return SocketOpResult::Err(e),
+        };
         let from = if local_addr == INADDR_ANY {
             super::sockopt::mc_source_v4(ns, egress)
         } else {
@@ -1067,6 +1253,7 @@ impl SocketFile {
             spec_dst: from,
             ttl: mc_ttl.min(255) as u8,
             tos: ip_tos.min(255) as u8,
+            gso_size: 0,
         };
         if (via_lo || mc_loop) && super::sockopt::host_joined_v4(ns, egress, dest.0) {
             let targets = {
@@ -1077,7 +1264,7 @@ impl SocketFile {
                     .unwrap_or_default()
             };
             for t in targets {
-                enqueue(
+                enqueue_local(
                     &t,
                     DgramPacket {
                         peer_unix: None,
@@ -1088,6 +1275,7 @@ impl SocketFile {
                         fds: Vec::new(),
                         inet4_rx: Some(rx),
                     },
+                    gso,
                 );
             }
         }
@@ -1099,13 +1287,26 @@ impl SocketFile {
             bind_to_device: egress,
             ip_ttl: mc_ttl.min(255) as u8,
             ip_tos: ip_tos.min(255) as u8,
+            ip_pmtudisc,
             sndbuf: narf_net::udp_sock::UDP_MAX_PAYLOAD,
+            gso_size,
+            no_check_tx: no_check,
             ..Default::default()
         };
         let dst = narf_net::udp_sock::SocketAddrV4::new(dest.0.to_be_bytes(), dest.1);
-        match narf_net::udp_sock::udp_send_from(ns, local_port, dst, buf, &udp_opts, 0) {
+        let inet_id = connected.map(|_| &self.inet_id);
+        match narf_net::udp_sock::udp_send_from(ns, local_port, dst, buf, &udp_opts, 0, inet_id) {
             Ok(n) => SocketOpResult::Ok(n as u64),
             Err(narf_net::udp_sock::UdpError::MsgTooLong) => {
+                SocketOpResult::Err(SockError::MsgSize)
+            }
+            Err(narf_net::udp_sock::UdpError::LocalMsgSize { info }) => {
+                self.ip_local_error(
+                    errno::EMSGSIZE as u32,
+                    dest.0,
+                    connected.map_or(0, |c| c.1),
+                    info,
+                );
                 SocketOpResult::Err(SockError::MsgSize)
             }
             // Like the unicast path: an unresolved neighbour is queued, not
@@ -1114,6 +1315,9 @@ impl SocketFile {
                 SocketOpResult::Ok(buf.len() as u64)
             }
             Err(narf_net::udp_sock::UdpError::QueueFull) => SocketOpResult::Err(SockError::NoBufs),
+            Err(narf_net::udp_sock::UdpError::GsoInvalid) => {
+                SocketOpResult::Err(SockError::InvalidArg)
+            }
             Err(_) => SocketOpResult::Err(SockError::NetUnreach),
         }
     }
@@ -1132,8 +1336,13 @@ impl SocketFile {
             };
             self.stash_inet_err_ancillary(ext);
             // The errored datagram's payload is not retained; the error is
-            // carried entirely by the cmsg. msg_name = the ICMP offender.
-            let peer = Some(make_sockaddr_in(u32::from_be_bytes(ext.offender_ip), 0));
+            // carried entirely by the cmsg. `msg_name` is the errored
+            // datagram's destination address and port
+            // (`ipv4_datagram_support_addr` holds for ICMP and LOCAL).
+            let peer = Some(make_sockaddr_in(
+                u32::from_be_bytes(ext.name_ip),
+                ext.name_port,
+            ));
             return SocketOpResult::Received { n: 0, peer };
         }
         // `__skb_recv_udp` reports a pending socket error before looking at

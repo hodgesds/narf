@@ -26,7 +26,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -79,15 +79,26 @@ pub struct UdpOptions {
     /// IP_TOS: DSCP/ECN byte override for outgoing datagrams (0 = default).
     /// Linux `ip_setsockopt` / `do_ip_setsockopt` (net/ipv4/ip_sockglue.c).
     pub ip_tos: u8,
-    /// IP_MTU_DISCOVER value (`IP_PMTUDISC_*`): controls the IPv4 Don't-Fragment
-    /// bit. `DONT`(0)/`OMIT`(5) clear DF (allow fragmentation); `WANT`(1,
-    /// default), `DO`(2), `PROBE`(3) set it. QUIC sets `IP_PMTUDISC_DO` so its
-    /// probes are never fragmented. Linux `ip_sockglue.c` / `ip_select_fb_ident`.
+    /// IP_MTU_DISCOVER value (`IP_PMTUDISC_*`): the IPv4 Don't-Fragment bit,
+    /// the send size limit and whether an oversized datagram is fragmented —
+    /// `__ip_append_data` / `__ip_make_skb` rules, see [`crate::ip_output`].
+    /// DO(2) and PROBE(3) always set DF and refuse datagrams over the MTU
+    /// (EMSGSIZE); INTERFACE(4) refuses them too but sends without DF;
+    /// WANT(1, default) sets DF on datagrams that fit and fragments larger
+    /// ones without it; DONT(0) and OMIT(5) never set DF and fragment. QUIC
+    /// sets `IP_PMTUDISC_DO` so its probes are never fragmented.
     pub ip_pmtudisc: i32,
     /// Per-send source-address override from an `IP_PKTINFO` cmsg
     /// (`ipi_spec_dst`). `None` ⇒ use the egress interface's address. QUIC
     /// uses it to pin a reply's source to the address the peer saw.
     pub ip_src_override: Option<[u8; 4]>,
+    /// UDP GSO segment size for this send (`UDP_SEGMENT`, the socket default
+    /// or a per-`sendmsg` cmsg); 0 sends one datagram. See
+    /// [`crate::udp_gso`].
+    pub gso_size: u16,
+    /// `sk_no_check_tx` (`SO_NO_CHECK`): transmit with a zero UDP checksum
+    /// (`udp_send_skb`'s CHECKSUM_NONE branch). A GSO send refuses it.
+    pub no_check_tx: bool,
 }
 
 impl Default for UdpOptions {
@@ -104,6 +115,8 @@ impl Default for UdpOptions {
             ip_tos: 0,
             ip_pmtudisc: 1, // IP_PMTUDISC_WANT: DF set (NARF's prior default)
             ip_src_override: None,
+            gso_size: 0,
+            no_check_tx: false,
         }
     }
 }
@@ -246,6 +259,9 @@ pub struct UdpSocket {
     /// ICMP error queue (SO_ERROR).
     pub err_queue: IrqSafeSpinLock<VecDeque<SockError>>,
     pub options: IrqSafeSpinLock<UdpOptions>,
+    /// `inet->inet_id`: the IP ID counter a connected socket's datagrams
+    /// take (`ip_select_ident_segs`), seeded randomly by `udp_connect`.
+    pub inet_id: AtomicU16,
 }
 
 impl UdpSocket {
@@ -257,6 +273,7 @@ impl UdpSocket {
             rx_queue: IrqSafeSpinLock::new(VecDeque::new()),
             err_queue: IrqSafeSpinLock::new(VecDeque::new()),
             options: IrqSafeSpinLock::new(options),
+            inet_id: AtomicU16::new(0),
         }
     }
 }
@@ -344,6 +361,11 @@ pub enum UdpError {
     InvalidSocket,
     /// Send buffer too small for this payload.
     MsgTooLong,
+    /// `__ip_append_data`'s -EMSGSIZE: the datagram exceeds what the socket's
+    /// IP_MTU_DISCOVER mode may send (the MTU for DO / PROBE / INTERFACE,
+    /// `IP_MAX_MTU` otherwise). `info` is the `ee_info` Linux's
+    /// `ip_local_error` queues for an IP_RECVERR socket: the path MTU.
+    LocalMsgSize { info: u32 },
     /// No data in the receive queue.
     WouldBlock,
     /// ICMP error was signalled (see `udp_err_peek`).
@@ -352,6 +374,9 @@ pub enum UdpError {
     NetworkUnreachable,
     /// The bounded unresolved-neighbor transmit queue is full.
     QueueFull,
+    /// `udp_send_skb`'s -EINVAL for a GSO send: more than
+    /// `UDP_MAX_SEGMENTS` segments, or `SO_NO_CHECK` set.
+    GsoInvalid,
 }
 
 /// An IPv4 UDP frame retained while ARP resolves its next hop.
@@ -359,6 +384,8 @@ pub enum UdpError {
 /// Linux queues the skb on the neighbor entry (`neigh_resolve_output`) and
 /// reports a successful send. Keeping the complete post-netfilter frame here
 /// gives NARF the same first-datagram behavior without blocking `sendto(2)`.
+/// A fragmented datagram is queued as one entry per fragment, in order —
+/// `ip_do_fragment` hands each fragment to `neigh_output` separately.
 #[derive(Debug)]
 struct PendingUdp4 {
     net_ns_id: u64,
@@ -371,15 +398,18 @@ const MAX_PENDING_UDP4_PACKETS: usize = 256;
 const MAX_PENDING_UDP4_BYTES: usize = 1024 * 1024;
 static PENDING_UDP4: IrqSafeSpinLock<VecDeque<PendingUdp4>> = IrqSafeSpinLock::new(VecDeque::new());
 
-fn queue_udp4(packet: PendingUdp4) -> Result<(), UdpError> {
+/// Queue every frame of one datagram (one, or its fragments in order), or
+/// none of them: a datagram missing a fragment could never reassemble.
+fn queue_udp4(packets: Vec<PendingUdp4>) -> Result<(), UdpError> {
     let mut queue = PENDING_UDP4.lock();
     let bytes: usize = queue.iter().map(|entry| entry.frame.len()).sum();
-    if queue.len() >= MAX_PENDING_UDP4_PACKETS
-        || bytes.saturating_add(packet.frame.len()) > MAX_PENDING_UDP4_BYTES
+    let add: usize = packets.iter().map(|entry| entry.frame.len()).sum();
+    if queue.len() + packets.len() > MAX_PENDING_UDP4_PACKETS
+        || bytes.saturating_add(add) > MAX_PENDING_UDP4_BYTES
     {
         return Err(UdpError::QueueFull);
     }
-    queue.push_back(packet);
+    queue.extend(packets);
     Ok(())
 }
 
@@ -465,6 +495,9 @@ pub fn udp_bind_in(
 /// `peer` as the implicit destination and `udp_recv` only accepts
 /// datagrams from `peer`. Mirrors Linux `udp_connect` (udp.c:1807+).
 pub fn udp_connect(sock: &Arc<UdpSocket>, peer: SocketAddrV4) {
+    // `__ip4_datagram_connect`: `atomic_set(&inet->inet_id, get_random_u16())`.
+    sock.inet_id
+        .store(crate::ip_output::get_random_u16(), Ordering::Relaxed);
     *sock.peer.lock() = Some(peer);
 }
 
@@ -515,13 +548,25 @@ pub fn udp_send(
     payload: &[u8],
     peer: Option<SocketAddrV4>,
 ) -> Result<usize, UdpError> {
+    let connected = *sock.peer.lock();
     let dst = match peer {
         Some(p) => p,
-        None => sock.peer.lock().ok_or(UdpError::InvalidSocket)?,
+        None => connected.ok_or(UdpError::InvalidSocket)?,
     };
     let opts = sock.options.lock().clone();
+    // A connected socket's datagrams take its own `inet_id` sequence
+    // (`ip_select_ident_segs` checks `inet_daddr`, not this send's address).
+    let inet_id = connected.map(|_| &sock.inet_id);
     // In-kernel senders (DHCP, DNS) keep the historical blocking resolve.
-    udp_send_from(sock.net_ns_id, sock.local.port, dst, payload, &opts, 1000)
+    udp_send_from(
+        sock.net_ns_id,
+        sock.local.port,
+        dst,
+        payload,
+        &opts,
+        1000,
+        inet_id,
+    )
 }
 
 /// Emit one UDP datagram without needing a bound [`UdpSocket`].
@@ -531,6 +576,10 @@ pub fn udp_send(
 /// source port but no socket in this table — notably the userspace socket
 /// layer, which keeps its own bookkeeping and must not take a second
 /// binding for the same port (that would be EADDRINUSE against itself).
+///
+/// `inet_id` is the sending socket's `inet_id` counter when that socket is
+/// connected, `None` when it is not; it selects how the IP ID is chosen
+/// (see [`crate::ip_output::select_ident`]).
 pub fn udp_send_from(
     net_ns_id: u64,
     src_port: u16,
@@ -538,8 +587,17 @@ pub fn udp_send_from(
     payload: &[u8],
     options: &UdpOptions,
     arp_timeout_ms: u64,
+    inet_id: Option<&AtomicU16>,
 ) -> Result<usize, UdpError> {
-    udp_send_inner(net_ns_id, src_port, dst, payload, options, arp_timeout_ms)
+    udp_send_inner(
+        net_ns_id,
+        src_port,
+        dst,
+        payload,
+        options,
+        arp_timeout_ms,
+        inet_id,
+    )
 }
 
 fn udp_send_inner(
@@ -549,6 +607,7 @@ fn udp_send_inner(
     payload: &[u8],
     options: &UdpOptions,
     arp_timeout_ms: u64,
+    inet_id: Option<&AtomicU16>,
 ) -> Result<usize, UdpError> {
     // The largest datagram IPv4 can carry: `__ip_append_data`
     // (`net/ipv4/ip_output.c:992`) refuses `length > IP_MAX_MTU(0xFFFF) -
@@ -601,6 +660,45 @@ fn udp_send_inner(
     let dst_ip = dst.ip;
     let dst_port = dst.port;
 
+    // `ip_make_skb` → `ip_setup_cork` + `__ip_append_data`, after the route
+    // lookup and before any neighbour work: an MTU below 68 is ENETUNREACH,
+    // a datagram above what IP_MTU_DISCOVER lets this socket send unfragmented
+    // is EMSGSIZE. Linux's `ip_local_error` record is the socket layer's to
+    // queue, with the MTU carried here.
+    let mtu = crate::ip_output::fragsize(ip_pmtudisc, iface.mtu);
+    let udp_len = UDP_HDR_LEN + payload.len();
+    // A GSO send is appended against `IP_MAX_MTU`, not the path MTU
+    // (`__ip_append_data`: `mtu = cork->gso_size ? IP_MAX_MTU : fragsize`).
+    let appended = if options.gso_size != 0 {
+        crate::ip_output::append_check_gso(mtu, udp_len)
+    } else {
+        crate::ip_output::append_check(ip_pmtudisc, mtu, udp_len)
+    };
+    match appended {
+        Ok(()) => {}
+        Err(crate::ip_output::AppendError::NetUnreach) => return Err(UdpError::NoInterface),
+        Err(crate::ip_output::AppendError::MsgSize { info }) => {
+            return Err(UdpError::LocalMsgSize { info })
+        }
+    }
+    // `udp_send_skb`: the GSO checks run on the built skb, before
+    // `ip_send_skb` reaches the neighbour layer.
+    let segment = if options.gso_size != 0 {
+        match crate::udp_gso::gso_check(
+            IPV4_HDR_LEN,
+            payload.len(),
+            options.gso_size,
+            mtu,
+            options.no_check_tx,
+        ) {
+            Ok(split) => split,
+            Err(crate::udp_gso::GsoError::MsgSize) => return Err(UdpError::MsgTooLong),
+            Err(crate::udp_gso::GsoError::Invalid) => return Err(UdpError::GsoInvalid),
+        }
+    } else {
+        false
+    };
+
     // Resolve the route's NEXT HOP, not the destination. Linux's
     // `ip_neigh_for_gw()` (include/net/route.h) uses the route's gateway when
     // it has one and the destination only when it does not (`rt_nexthop()`).
@@ -633,7 +731,6 @@ fn udp_send_inner(
         Some(Err(_)) => [0; 6],
     };
 
-    let udp_len = UDP_HDR_LEN + payload.len();
     let ip_total = IPV4_HDR_LEN + udp_len;
     let frame_len = ETH_HDR_LEN + ip_total;
     let mut frame = alloc::vec![0u8; frame_len];
@@ -649,21 +746,23 @@ fn udp_send_inner(
         dst_ip,
     );
     // Apply IP_TOS (byte 1) and IP_TTL (byte 8) overrides if set.
-    // Linux ref: `ip_build_and_send_pkt` / `ip_fragment` in net/ipv4/ip_output.c
-    // apply inet->tos and inet->ttl from the socket.
+    // Linux ref: `__ip_make_skb` in net/ipv4/ip_output.c applies inet->tos
+    // and the socket TTL; `ip_do_fragment` copies them into every fragment.
     if ip_tos != 0 {
         frame[ETH_HDR_LEN + 1] = ip_tos;
     }
     if ip_ttl != 0 {
         frame[ETH_HDR_LEN + 8] = ip_ttl;
     }
-    // IP_MTU_DISCOVER → the Don't-Fragment bit (flags byte, bit 6 of IP header
-    // byte 6). `write_ipv4_header` sets DF; honor IP_PMTUDISC_DONT(0) /
-    // IP_PMTUDISC_OMIT(5) by clearing it so those sends may fragment. All other
-    // values (WANT/DO/PROBE) keep DF — what QUIC's PMTU probing requires.
-    if ip_pmtudisc == 0 || ip_pmtudisc == 5 {
-        frame[ETH_HDR_LEN + 6] &= !0x40;
-    }
+    // `__ip_make_skb`: the DF bit from IP_MTU_DISCOVER and the datagram's
+    // size, then `ip_select_ident`.
+    crate::ip_output::make_header(
+        net_ns_id,
+        &mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN],
+        ip_pmtudisc,
+        mtu,
+        inet_id,
+    );
     set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]);
 
     // UDP header + payload.
@@ -677,37 +776,70 @@ fn udp_send_inner(
     frame[udp_off..udp_off + UDP_HDR_LEN].copy_from_slice(&udp_hdr.encode());
     frame[udp_off + UDP_HDR_LEN..udp_off + UDP_HDR_LEN + payload.len()].copy_from_slice(payload);
 
-    // Compute UDP checksum over pseudo-header + datagram.
-    let udp_segment = &frame[udp_off..udp_off + udp_len];
-    let mut pseudo = alloc::vec::Vec::with_capacity(12 + udp_len + 1);
-    pseudo.extend_from_slice(&src_ip);
-    pseudo.extend_from_slice(&dst_ip);
-    pseudo.push(0);
-    pseudo.push(IP_PROTO_UDP);
-    pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
-    pseudo.extend_from_slice(udp_segment);
-    let cs = {
-        let s = ip_checksum(&pseudo);
-        if s == 0 {
-            0xFFFF
-        } else {
-            s
-        }
-    };
-    frame[udp_off + 6..udp_off + 8].copy_from_slice(&cs.to_be_bytes());
+    // Compute UDP checksum over pseudo-header + datagram — the whole
+    // datagram, before any fragmentation (`udp_send_skb` checksums the
+    // corked skb; fragments carry no transport checksum of their own).
+    // `sk_no_check_tx` sends a zero checksum (CHECKSUM_NONE). A segmented
+    // GSO payload is checksummed per segment by `udp_gso::segment_v4`.
+    if !segment && !options.no_check_tx {
+        let cs = crate::pkt_tcp::ipv4_pseudo_checksum_proto(
+            src_ip,
+            dst_ip,
+            IP_PROTO_UDP,
+            &frame[udp_off..udp_off + udp_len],
+        );
+        let cs = if cs == 0 { 0xFFFF } else { cs };
+        frame[udp_off + 6..udp_off + 8].copy_from_slice(&cs.to_be_bytes());
+    }
 
+    // LOCAL_OUT / POST_ROUTING see the whole datagram; `ip_finish_output`
+    // fragments after them.
     if crate::tcp_stack::nf_tx_filter_in(net_ns_id, &iface.name, &mut frame[ETH_HDR_LEN..])
         != crate::netfilter::Verdict::Accept
     {
         return Ok(payload.len());
     }
+    let ignore_df = crate::ip_output::ip_sk_ignore_df(ip_pmtudisc);
+    // LOCAL_OUT / POST_ROUTING saw the whole GSO datagram; the device path
+    // (`validate_xmit_skb` → `__udp_gso_segment`) splits it afterwards.
+    let out_frames = if segment {
+        crate::udp_gso::segment_v4(&frame, ETH_HDR_LEN, usize::from(options.gso_size))
+    } else {
+        alloc::vec![frame]
+    };
     if let Some(Err(neighbor)) = pending_neighbor {
-        queue_udp4(PendingUdp4 {
-            net_ns_id,
-            iface: iface.name.clone(),
-            neighbor,
-            frame,
-        })?;
+        // Every fragment (or GSO segment) goes to `neigh_output` on its own;
+        // an unresolved neighbour queues each of them, in order.
+        let mut frames = Vec::new();
+        for frame in out_frames {
+            if crate::ip_output::needs_fragment(&frame, ETH_HDR_LEN, mtu) {
+                crate::ip_output::ip_finish_output(
+                    net_ns_id,
+                    &frame,
+                    ETH_HDR_LEN,
+                    mtu,
+                    ignore_df,
+                    |f| {
+                        frames.push(f.to_vec());
+                        Ok(())
+                    },
+                )
+                .map_err(|_| UdpError::MsgTooLong)?;
+            } else {
+                frames.push(frame);
+            }
+        }
+        queue_udp4(
+            frames
+                .into_iter()
+                .map(|frame| PendingUdp4 {
+                    net_ns_id,
+                    iface: iface.name.clone(),
+                    neighbor,
+                    frame,
+                })
+                .collect(),
+        )?;
         // Queue before starting ARP so an immediate reply cannot race past
         // the pending frame. If another sender resolved it between our cache
         // lookup and this call, flush synchronously with the returned MAC.
@@ -716,7 +848,20 @@ fn udp_send_inner(
         }
         return Ok(payload.len());
     }
-    iface.xmit(&frame).map_err(|_| UdpError::NoInterface)?;
+    for frame in &out_frames {
+        match crate::ip_output::ip_finish_output(
+            net_ns_id,
+            frame,
+            ETH_HDR_LEN,
+            mtu,
+            ignore_df,
+            |f| iface.xmit(f),
+        ) {
+            Ok(()) => {}
+            Err(crate::ip_output::OutputError::MsgSize) => return Err(UdpError::MsgTooLong),
+            Err(crate::ip_output::OutputError::Output) => return Err(UdpError::NoInterface),
+        }
+    }
     Ok(payload.len())
 }
 
@@ -1304,27 +1449,23 @@ fn smoke_udp_reuseport_load_balance() -> TestResult {
 }
 kernel_test_in!("net/udp", smoke_udp_reuseport_load_balance);
 
-/// Fragmentation reassembly: simulate the IP layer reassembling two
-/// fragments and handing the complete datagram to `deliver`.  In the
-/// NARF stack the IP layer calls `deliver` with the fully reassembled
-/// UDP segment (header + payload); this test verifies that path
-/// accepts a large payload produced by stitching two 500-byte chunks.
+/// `deliver` accepts a 1000-byte datagram — the size a reassembled
+/// datagram typically arrives at — and queues it intact.
 ///
-/// Linux ref: `ip_defrag` → `ip_frag_queue` reassembles fragments
-/// then calls `ip_local_deliver_finish` → UDP `udp_rcv` with the
-/// complete segment (net/ipv4/reassembly.c, net/ipv4/udp.c:2069).
-fn smoke_udp_fragment_reassembly_via_deliver() -> TestResult {
+/// This exercises the UDP layer only: the segment is built whole and handed
+/// straight to `deliver`, so nothing here touches IP fragments. IPv4
+/// reassembly itself (`ip_defrag`, reached from `handle_ipv4`) is covered by
+/// `ip_fragment_tests.rs`, which injects real fragments through the RX path.
+fn smoke_udp_deliver_accepts_large_datagram() -> TestResult {
     let port = 59016u16;
     let sock = match udp_bind(SocketAddrV4::new([0, 0, 0, 0], port), UdpOptions::default()) {
         Ok(s) => s,
         Err(_) => return TestResult::Fail("bind failed"),
     };
 
-    // Build a 1000-byte payload split across two 500-byte IP fragments
-    // that the IP layer would reassemble into one UDP segment.
+    // A 1000-byte payload, delivered as one whole segment.
     let payload: alloc::vec::Vec<u8> = (0u8..200).cycle().take(1000).collect();
 
-    // After IP-level reassembly, deliver() receives the full UDP segment.
     let total_udp = UDP_HDR_LEN + payload.len();
     let mut seg = alloc::vec![0u8; total_udp];
     seg[0..2].copy_from_slice(&9001u16.to_be_bytes()); // src port
@@ -1346,17 +1487,17 @@ fn smoke_udp_fragment_reassembly_via_deliver() -> TestResult {
     match result {
         Ok((n, _src)) => {
             if n != payload.len() {
-                return TestResult::Fail("reassembled datagram length mismatch");
+                return TestResult::Fail("datagram length mismatch");
             }
             if buf[..n] != payload[..] {
-                return TestResult::Fail("reassembled datagram payload mismatch");
+                return TestResult::Fail("datagram payload mismatch");
             }
             TestResult::Pass
         }
-        Err(_) => TestResult::Fail("recv failed after reassembled deliver"),
+        Err(_) => TestResult::Fail("recv failed after deliver"),
     }
 }
-kernel_test_in!("net/udp", smoke_udp_fragment_reassembly_via_deliver);
+kernel_test_in!("net/udp", smoke_udp_deliver_accepts_large_datagram);
 
 /// IP_TTL setsockopt: verify the option field is stored correctly.
 /// (Wire verification requires a real iface; this tests the option state.)
@@ -1905,6 +2046,18 @@ fn smoke_udp_pmtudisc_controls_df() -> TestResult {
     // IP_PMTUDISC_DONT (0) clears DF so the datagram may fragment.
     if df_for(0, 59042) != Some(false) {
         return TestResult::Fail("IP_PMTUDISC_DONT did not clear the DF bit");
+    }
+    // `__ip_make_skb`: PROBE (3) sets DF like DO; INTERFACE (4) and OMIT (5)
+    // are not `ip_dont_fragment`, so they send without DF (INTERFACE is
+    // still limited to the device MTU, which these 2 bytes fit).
+    if df_for(3, 59043) != Some(true) {
+        return TestResult::Fail("IP_PMTUDISC_PROBE did not set the DF bit");
+    }
+    if df_for(4, 59044) != Some(false) {
+        return TestResult::Fail("IP_PMTUDISC_INTERFACE set the DF bit");
+    }
+    if df_for(5, 59045) != Some(false) {
+        return TestResult::Fail("IP_PMTUDISC_OMIT set the DF bit");
     }
     TestResult::Pass
 }

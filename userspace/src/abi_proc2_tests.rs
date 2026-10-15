@@ -1713,6 +1713,8 @@ const PTRACE_SETOPTIONS: u64 = 0x4200;
 const PTRACE_GETREGSET: u64 = 0x4204;
 const PTRACE_O_TRACESYSGOOD: u64 = 1;
 const NT_PRSTATUS: u64 = 1;
+#[cfg(target_arch = "x86_64")]
+const NT_PRFPREG: u64 = 2;
 
 /// A registered task FAKE_TASK can legitimately trace. Distinct from the
 /// pid-namespace fixtures above so the two never collide.
@@ -1731,7 +1733,13 @@ fn ptrace_fixture() -> Result<(), &'static str> {
         Syscall::Ptrace.raw(),
         a3(PTRACE_ATTACH_REQ, TRACEE_PID, 0, 0),
     ) {
-        Some(0) if crate::ptrace::__test_tracee_count() == 1 => Ok(()),
+        Some(0) if crate::ptrace::__test_tracee_count() == 1 => {
+            // ABI tests do not run the synthetic tracee through the signal
+            // delivery path. Make the fixture match the post-SIGSTOP state a
+            // real PTRACE_ATTACH reaches before non-KILL ptrace requests.
+            crate::ptrace::__test_set_tracee_stopped(TRACEE_PID, true);
+            Ok(())
+        }
         Some(0) => Err("ptrace fixture: active-tracee count did not advance"),
         _ => Err("ptrace fixture: PTRACE_ATTACH did not succeed"),
     }
@@ -1916,6 +1924,10 @@ fn smoke_abi_proc2_ptrace_cont_bad_signal_is_eio() -> TestResult {
             if call(Syscall::Ptrace.raw(), a3(PTRACE_CONT, TRACEE_PID, 0, 0)) != Some(0) {
                 return Err("PTRACE_CONT with no signal must succeed");
             }
+            // The successful resume left the stop; `ptrace_check_attach`
+            // rejects a running tracee with -ESRCH, so re-enter the stop
+            // before exercising the boundary.
+            crate::ptrace::__test_set_tracee_stopped(TRACEE_PID, true);
             if call(Syscall::Ptrace.raw(), a3(PTRACE_CONT, TRACEE_PID, 0, 64)) != Some(0) {
                 return Err("PTRACE_CONT with signal 64 (_NSIG) must succeed");
             }
@@ -2072,6 +2084,47 @@ fn smoke_abi_proc2_ptrace_getregset_fault_beats_bad_regset() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_ptrace_getregset_fault_beats_bad_regset
+);
+
+// Crashpad obtains the legacy x86 FPU image after its general-register
+// snapshot. It only needs the standard FXSAVE-shaped 512-byte prefix, not the
+// optional XSAVE extensions, so that is the exact contract this regression
+// test fixes.
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_proc2_ptrace_getregset_returns_legacy_fpu_image() -> TestResult {
+    with_setup(|| {
+        let result = (|| {
+            ptrace_fixture()?;
+            let mut fpregs = [0u8; 512];
+            let mut iov = [fpregs.as_mut_ptr() as u64, fpregs.len() as u64];
+            if call(
+                Syscall::Ptrace.raw(),
+                a3(
+                    PTRACE_GETREGSET,
+                    TRACEE_PID,
+                    (1u64 << 32) | NT_PRFPREG,
+                    iov.as_mut_ptr() as u64,
+                ),
+            ) != Some(0)
+            {
+                return Err("PTRACE_GETREGSET(NT_PRFPREG) must succeed on x86_64");
+            }
+            if iov[1] != fpregs.len() as u64 {
+                return Err("PTRACE_GETREGSET(NT_PRFPREG) returned the wrong regset size");
+            }
+            if fpregs[..2] != [0x7f, 0x03] || fpregs[24..28] != [0x80, 0x1f, 0, 0] {
+                return Err("NT_PRFPREG did not return canonical FXSAVE control words");
+            }
+            Ok(())
+        })();
+        ptrace_fixture_teardown();
+        result
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_ptrace_getregset_returns_legacy_fpu_image
 );
 
 // PTRACE_KILL still runs ptrace_check_attach — `ignore_state` only
@@ -2308,17 +2361,36 @@ fn smoke_abi_proc2_prctl_closed_value_sets_are_einval() -> TestResult {
         if call(Syscall::Prctl.raw(), a1(PR_SET_SECCOMP, 3)) != Some(EINVAL) {
             return Err("PR_SET_SECCOMP(3) must be -EINVAL");
         }
-        // Positive paths: PR_GET_SECCOMP must report the mode actually
-        // requested, not a folded-to-FILTER stand-in.
-        if call(Syscall::Prctl.raw(), a1(PR_SET_SECCOMP, 1)) != Some(0)
-            || call(Syscall::Prctl.raw(), a0(PR_GET_SECCOMP)) != Some(1)
-        {
-            return Err("PR_SET_SECCOMP(STRICT) must be readable back as mode 1");
+        // `seccomp_set_mode_filter` copies the program in before anything
+        // else (`seccomp_prepare_user_filter`): a NULL `sock_fprog` is
+        // -EFAULT.
+        if call(Syscall::Prctl.raw(), a2(PR_SET_SECCOMP, 2, 0)) != Some(EFAULT) {
+            return Err("PR_SET_SECCOMP(FILTER, NULL) must be -EFAULT");
         }
-        if call(Syscall::Prctl.raw(), a1(PR_SET_SECCOMP, 2)) != Some(0)
+        // Positive path: PR_GET_SECCOMP must report the mode actually
+        // requested, not a folded stand-in. The program is one `RET ALLOW`.
+        let mut insn = [0u8; 8];
+        insn[0..2].copy_from_slice(&0x06u16.to_ne_bytes()); // BPF_RET | BPF_K
+        insn[4..8].copy_from_slice(&0x7fff_0000u32.to_ne_bytes()); // SECCOMP_RET_ALLOW
+        let mut fprog = [0u8; 16];
+        fprog[0..2].copy_from_slice(&1u16.to_ne_bytes());
+        fprog[8..16].copy_from_slice(&(insn.as_ptr() as u64).to_ne_bytes());
+        if call(
+            Syscall::Prctl.raw(),
+            a2(PR_SET_SECCOMP, 2, fprog.as_ptr() as u64),
+        ) != Some(0)
             || call(Syscall::Prctl.raw(), a0(PR_GET_SECCOMP)) != Some(2)
         {
             return Err("PR_SET_SECCOMP(FILTER) must be readable back as mode 2");
+        }
+        // `seccomp_may_assign_mode`: a filtered task cannot switch to strict
+        // mode (`seccomp_set_mode_strict` keeps its `ret = -EINVAL`). Strict
+        // mode's own positive path is the seccomp musl smoke: entering it
+        // here would leave the fixture task strict.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_SECCOMP, 1)) != Some(EINVAL)
+            || call(Syscall::Prctl.raw(), a0(PR_GET_SECCOMP)) != Some(2)
+        {
+            return Err("PR_SET_SECCOMP(STRICT) on a filtered task must be -EINVAL");
         }
         Ok(())
     })
@@ -2920,6 +2992,299 @@ fn smoke_abi_proc2_self_maps_from_sibling_thread() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_self_maps_from_sibling_thread);
 
+/// Chromium's Crashpad finds an ELF image by subtracting the `/proc/maps`
+/// file offset from a PT_LOAD VMA. A zero offset makes it read the first code
+/// bytes as an ELF header; no pathname leaves no way to recover the image.
+/// Exercise the production procfs hook rather than only its renderer.
+fn smoke_abi_proc2_maps_preserve_loader_image_provenance() -> TestResult {
+    with_thread_group(false, |v| {
+        let mapping = crate::process::LoadedMapping {
+            addr: v.region,
+            len: TG_REGION_LEN,
+            pgoff: 0x3000,
+            prot: 3,
+            device: (8 << 8) | 19,
+            inode: 42,
+            filename: None,
+        };
+        crate::handlers::__test_set_proc_image_mappings(
+            TG_LEADER_TASK,
+            core::slice::from_ref(&mapping),
+            "/usr/bin/narf-maps-test",
+        );
+        let result = (|| {
+            set_task(TG_THREAD_TASK);
+            let maps = tg_read(&alloc::format!("{}/self/maps", v.base))?;
+            let expected = alloc::format!(
+                "{:016x}-{:016x} rw-p 00003000 08:13 42 /usr/bin/narf-maps-test",
+                v.region,
+                v.region + TG_REGION_LEN,
+            );
+            if maps.contains(&expected) {
+                Ok(())
+            } else {
+                Err("/proc/self/maps lost the loader image offset or pathname")
+            }
+        })();
+        crate::handlers::__test_clear_proc_image_mappings(TG_LEADER_TASK);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_maps_preserve_loader_image_provenance
+);
+
+const MAPS_FILE_DIR: &[u8] = b"/abi-mapsfile\0";
+const MAPS_FILE: &[u8] = b"/abi-mapsfile/libmaps.so\0";
+const MAPS_FILE_PATH: &str = "/abi-mapsfile/libmaps.so";
+
+/// The `MAJOR:MINOR` text `show_vma_header_prefix` prints for a Linux
+/// `st_dev` (`new_decode_dev`: twelve-bit major at bit 8, minor split around
+/// it), each half `%02x`.
+fn maps_dev_text(st_dev: u64) -> alloc::string::String {
+    let major = (st_dev >> 8) & 0x0fff;
+    let minor = (st_dev & 0xff) | ((st_dev >> 12) & !0xff);
+    alloc::format!("{:02x}:{:02x}", major, minor)
+}
+
+/// Inside the thread-group procfs fixture, create a four-page file on a
+/// scratch tmpfs, keep it open read-write, and hand `body` its fd plus the
+/// `(st_dev, st_ino)` `fstat` reports for that fd.
+fn with_maps_file(
+    body: impl FnOnce(&TgView, u64, u64, u64) -> Result<(), &'static str>,
+) -> TestResult {
+    const O_RDWR: u64 = 2;
+    const O_CREAT: u64 = 0o100;
+    const AT_FDCWD: u64 = -100i64 as u64;
+    with_thread_group(false, |v| {
+        let margs = SyscallArgs {
+            arg0: c"none".as_ptr() as u64,
+            arg1: MAPS_FILE_DIR.as_ptr() as u64,
+            arg2: c"tmpfs".as_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), margs) != Some(0) {
+            return Err("fixture: mounting the scratch tmpfs failed");
+        }
+        let result = (|| {
+            let fd = match call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, MAPS_FILE.as_ptr() as u64, O_CREAT | O_RDWR, 0o644),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("fixture: creating the mapped file failed"),
+            };
+            let inner = (|| {
+                let page = [0x5au8; 4096];
+                for _ in 0..4 {
+                    if call(
+                        Syscall::Write.raw(),
+                        a2(fd, page.as_ptr() as u64, page.len() as u64),
+                    ) != Some(4096)
+                    {
+                        return Err("fixture: filling the mapped file failed");
+                    }
+                }
+                let mut sb = [0u8; 144];
+                if call(Syscall::Fstat.raw(), a1(fd, sb.as_mut_ptr() as u64)) != Some(0) {
+                    return Err("fixture: fstat of the mapped file failed");
+                }
+                let dev = u64::from_ne_bytes(sb[0..8].try_into().unwrap());
+                let ino = u64::from_ne_bytes(sb[8..16].try_into().unwrap());
+                if ino == 0 {
+                    return Err("fixture: the tmpfs file has no inode number");
+                }
+                body(v, fd, dev, ino)
+            })();
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            inner
+        })();
+        const MNT_DETACH: u64 = 1 << 1;
+        let _ = call(
+            Syscall::Umount2.raw(),
+            a1(MAPS_FILE_DIR.as_ptr() as u64, MNT_DETACH),
+        );
+        result
+    })
+}
+
+/// `mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, offset)` — the shape ld.so
+/// uses for a DSO's read-only segments.
+fn maps_map_private(fd: u64, len: u64, offset: u64) -> Result<u64, &'static str> {
+    match call(
+        Syscall::Mmap.raw(),
+        SyscallArgs {
+            arg0: 0,
+            arg1: len,
+            arg2: 1,
+            arg3: 0x02,
+            arg4: fd,
+            arg5: offset,
+        },
+    ) {
+        Some(addr) if addr > 0 => Ok(addr as u64),
+        _ => Err("MAP_PRIVATE mmap of the tmpfs file failed"),
+    }
+}
+
+/// An ordinary file `mmap` at a nonzero offset renders in `/proc/<pid>/maps`
+/// exactly as `show_map_vma` does: `vm_pgoff << PAGE_SHIFT`, the backing
+/// inode's `MAJOR:MINOR` and `i_ino` (both agreeing with `fstat` of the fd),
+/// and the file's path. Crashpad groups a DSO's VMAs by `(dev, ino)` and
+/// reads the ELF header at the offset-0 one; an anonymous-looking
+/// `00000000 00:00 0` DSO mapping is "Incorrect ELF magic number".
+fn smoke_abi_proc2_maps_file_mmap_reports_provenance() -> TestResult {
+    with_maps_file(|v, fd, dev, ino| {
+        let base = maps_map_private(fd, 0x3000, 0x1000)?;
+        let result = (|| {
+            set_task(TG_THREAD_TASK);
+            let maps = tg_read(&alloc::format!("{}/self/maps", v.base))?;
+            let expected = alloc::format!(
+                "{:016x}-{:016x} r--p 00001000 {} {} {}\n",
+                base,
+                base + 0x3000,
+                maps_dev_text(dev),
+                ino,
+                MAPS_FILE_PATH,
+            );
+            if maps.contains(&expected) {
+                Ok(())
+            } else {
+                Err("/proc/self/maps lost a file mmap's offset, dev, inode or pathname")
+            }
+        })();
+        set_task(FAKE_TASK);
+        let _ = call(Syscall::Munmap.raw(), a1(base, 0x3000));
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_maps_file_mmap_reports_provenance
+);
+
+/// Punching the middle page out of a file mapping leaves two VMAs; Linux's
+/// `__split_vma` advances the tail's `vm_pgoff`, so each half reports the
+/// file offset of its own first byte, with the same dev/inode/pathname.
+fn smoke_abi_proc2_maps_file_mmap_split_keeps_offsets() -> TestResult {
+    with_maps_file(|v, fd, dev, ino| {
+        let base = maps_map_private(fd, 0x3000, 0x1000)?;
+        let result = (|| {
+            if call(Syscall::Munmap.raw(), a1(base + 0x1000, 0x1000)) != Some(0) {
+                return Err("munmap of the middle page failed");
+            }
+            set_task(TG_THREAD_TASK);
+            let maps = tg_read(&alloc::format!("{}/self/maps", v.base))?;
+            let head = alloc::format!(
+                "{:016x}-{:016x} r--p 00001000 {} {} {}\n",
+                base,
+                base + 0x1000,
+                maps_dev_text(dev),
+                ino,
+                MAPS_FILE_PATH,
+            );
+            let tail = alloc::format!(
+                "{:016x}-{:016x} r--p 00003000 {} {} {}\n",
+                base + 0x2000,
+                base + 0x3000,
+                maps_dev_text(dev),
+                ino,
+                MAPS_FILE_PATH,
+            );
+            if !maps.contains(&head) {
+                return Err("the head of a split file mapping lost its provenance");
+            }
+            if !maps.contains(&tail) {
+                return Err("the tail of a split file mapping did not advance its offset");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        let _ = call(Syscall::Munmap.raw(), a1(base, 0x3000));
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_maps_file_mmap_split_keeps_offsets
+);
+
+/// Negative: a private anonymous mapping has no `vm_file`, so `show_map_vma`
+/// leaves offset, dev and inode zero and prints no pathname — even while a
+/// file mapping sits in the same mm.
+fn smoke_abi_proc2_maps_anonymous_mmap_has_no_provenance() -> TestResult {
+    with_maps_file(|v, fd, _dev, _ino| {
+        let base = maps_map_private(fd, 0x1000, 0)?;
+        let result = (|| {
+            set_task(TG_THREAD_TASK);
+            let maps = tg_read(&alloc::format!("{}/self/maps", v.base))?;
+            let anonymous = alloc::format!(
+                "{:016x}-{:016x} rw-p 00000000 00:00 0 \n",
+                v.region,
+                v.region + TG_REGION_LEN,
+            );
+            if !maps.contains(&anonymous) {
+                return Err("an anonymous mapping acquired a file offset, dev, inode or path");
+            }
+            if maps.matches(MAPS_FILE_PATH).count() != 1 {
+                return Err("the file's pathname was not rendered on exactly its own VMA");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        let _ = call(Syscall::Munmap.raw(), a1(base, 0x1000));
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_maps_anonymous_mmap_has_no_provenance
+);
+
+/// `stat(path)` → `Ok(st_nlink)`. x86_64 `struct stat` has a 64-bit
+/// `st_nlink` third; the generic (aarch64) layout has a 32-bit one after
+/// `st_mode`.
+fn tg_stat_nlink(path: &str) -> Result<u64, Option<i64>> {
+    let p = alloc::format!("{}\0", path);
+    let mut sb = [0u64; 32];
+    match call_stat(p.as_ptr() as u64, sb.as_mut_ptr() as u64) {
+        #[cfg(target_arch = "x86_64")]
+        Some(0) => Ok(sb[2]),
+        #[cfg(not(target_arch = "x86_64"))]
+        Some(0) => Ok(sb[2] >> 32),
+        other => Err(other),
+    }
+}
+
+/// `/proc/<pid>/task` reports `2 + nr_threads` links (`fs/proc/base.c`:
+/// `proc_pident_instantiate` sets 2, `proc_task_getattr` adds
+/// `get_nr_threads`). Chromium's sandbox `IsSingleThreaded` does
+/// `CHECK_LE(3, st_nlink)` on `/proc/self/task` and treats exactly 3 as
+/// single-threaded; the old untracked `st_nlink = 1` crashed every launch.
+fn smoke_abi_proc2_task_dir_nlink_counts_threads() -> TestResult {
+    with_thread_group(false, |v| {
+        set_task(TG_LEADER_TASK);
+        let group = tg_stat_nlink(&alloc::format!("{}/{}/task", v.base, v.pid))
+            .map_err(|_| "stat /proc/<tgid>/task failed")?;
+        if group != 4 {
+            return Err("two-thread group: /proc/<tgid>/task st_nlink != 2 + 2");
+        }
+        let via_self = tg_stat_nlink(&alloc::format!("{}/self/task", v.base))
+            .map_err(|_| "stat /proc/self/task failed")?;
+        if via_self != 4 {
+            return Err("two-thread group: /proc/self/task st_nlink != 2 + 2");
+        }
+        let single = tg_stat_nlink(&alloc::format!("{}/{}/task", v.base, TG_OTHER_PID))
+            .map_err(|_| "stat /proc/<single-threaded pid>/task failed")?;
+        if single != 3 {
+            return Err("single-threaded process: /proc/<pid>/task st_nlink != 3");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_task_dir_nlink_counts_threads);
+
 /// A per-pid file opened while its process lived and read after the process
 /// is gone answers -ESRCH (fs/proc/task_mmu.c m_start: `if (!priv->task)
 /// return ERR_PTR(-ESRCH)`; fs/proc/base.c proc_single_show: `if (!task)
@@ -2995,4 +3360,431 @@ fn smoke_abi_proc2_self_links_from_sibling_thread_pidns() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_self_links_from_sibling_thread_pidns
+);
+
+// ── fs_struct sharing (CLONE_FS) ────────────────────────────────────
+
+const FS_PARENT: u64 = 0x7F51;
+const FS_SHARER: u64 = 0x7F52;
+const FS_FORKED: u64 = 0x7F53;
+const FS_DIR: &[u8] = b"/abi-fsshare\0";
+
+fn fs_getcwd() -> Result<alloc::string::String, &'static str> {
+    let mut buf = [0u8; 128];
+    match call(
+        Syscall::Getcwd.raw(),
+        a1(buf.as_mut_ptr() as u64, buf.len() as u64),
+    ) {
+        Some(n) if n > 0 => {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(n as usize);
+            core::str::from_utf8(&buf[..end])
+                .map(alloc::string::String::from)
+                .map_err(|_| "getcwd not utf-8")
+        }
+        _ => Err("getcwd failed"),
+    }
+}
+
+fn fs_dir_visible() -> bool {
+    let mut st = [0u8; 144];
+    call(
+        Syscall::Stat.raw(),
+        a1(FS_DIR.as_ptr() as u64, st.as_mut_ptr() as u64),
+    ) == Some(0)
+}
+
+/// Run `body` with three registered tasks and a scratch tmpfs mount, then put
+/// every root, cwd and fs_struct share back.
+fn with_fs_tasks(body: impl FnOnce() -> Result<(), &'static str>) -> TestResult {
+    with_setup(|| {
+        let margs = SyscallArgs {
+            arg0: c"none".as_ptr() as u64,
+            arg1: FS_DIR.as_ptr() as u64,
+            arg2: c"tmpfs".as_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), margs) != Some(0) {
+            return Err("fixture: mounting the scratch tmpfs failed");
+        }
+        for task in [FS_PARENT, FS_SHARER, FS_FORKED] {
+            crate::task::release_task(task);
+            let _ = crate::task::Task::new_registered(task, task);
+        }
+        let r = body();
+        for task in [FS_PARENT, FS_SHARER, FS_FORKED] {
+            crate::handlers::__test_fs_release(task);
+            crate::task::release_task(task);
+        }
+        crate::handlers::__test_root_dir_reset();
+        crate::handlers::__test_cwd_reset();
+        set_task(FAKE_TASK);
+        const MNT_DETACH: u64 = 1 << 1;
+        let _ = call(
+            Syscall::Umount2.raw(),
+            a1(FS_DIR.as_ptr() as u64, MNT_DETACH),
+        );
+        r
+    })
+}
+
+/// `copy_fs` under CLONE_FS: the child shares the parent's `fs_struct`, so a
+/// chdir or chroot by either is seen by both. Chromium's sandbox relies on it
+/// (`ChrootToSafeEmptyDir`: a CLONE_FS|CLONE_VFORK child chroots and the
+/// parent then CHECKs that "/proc" is gone). A child forked without CLONE_FS
+/// keeps its own copy.
+fn smoke_abi_proc2_clone_fs_shares_root_and_cwd() -> TestResult {
+    with_fs_tasks(|| {
+        set_task(FS_PARENT);
+        if !fs_dir_visible() {
+            return Err("fixture: the scratch directory is not visible");
+        }
+        crate::handlers::fs_fork(FS_PARENT, FS_SHARER, true);
+        crate::handlers::fs_fork(FS_PARENT, FS_FORKED, false);
+        if crate::handlers::__test_fs_users(FS_PARENT) != 2 {
+            return Err("CLONE_FS did not count the child as a second fs_struct user");
+        }
+
+        set_task(FS_SHARER);
+        if call(Syscall::Chdir.raw(), a0(FS_DIR.as_ptr() as u64)) != Some(0) {
+            return Err("chdir in the CLONE_FS child failed");
+        }
+        set_task(FS_PARENT);
+        if fs_getcwd()? != "/abi-fsshare" {
+            return Err("CLONE_FS child's chdir did not move the parent's cwd");
+        }
+        set_task(FS_FORKED);
+        if fs_getcwd()? != "/" {
+            return Err("chdir leaked into a child forked without CLONE_FS");
+        }
+
+        set_task(FS_SHARER);
+        if call(Syscall::Chroot.raw(), a0(FS_DIR.as_ptr() as u64)) != Some(0) {
+            return Err("chroot in the CLONE_FS child failed");
+        }
+        set_task(FS_PARENT);
+        if fs_dir_visible() {
+            return Err("CLONE_FS child's chroot did not move the parent's root");
+        }
+        set_task(FS_FORKED);
+        if !fs_dir_visible() {
+            return Err("chroot leaked into a child forked without CLONE_FS");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_clone_fs_shares_root_and_cwd);
+
+/// `unshare(CLONE_FS)` (`unshare_fs`) gives a shared `fs_struct` a private
+/// copy: the caller keeps its cwd, and its later chdir no longer moves the
+/// task it was sharing with.
+fn smoke_abi_proc2_unshare_fs_privatizes_cwd() -> TestResult {
+    const CLONE_FS: u64 = 0x200;
+    with_fs_tasks(|| {
+        set_task(FS_PARENT);
+        if call(Syscall::Chdir.raw(), a0(FS_DIR.as_ptr() as u64)) != Some(0) {
+            return Err("fixture chdir failed");
+        }
+        crate::handlers::fs_fork(FS_PARENT, FS_SHARER, true);
+
+        set_task(FS_SHARER);
+        if call(Syscall::Unshare.raw(), a0(CLONE_FS)) != Some(0) {
+            return Err("unshare(CLONE_FS) failed");
+        }
+        if crate::handlers::__test_fs_users(FS_PARENT) != 1
+            || crate::handlers::__test_fs_users(FS_SHARER) != 1
+        {
+            return Err("unshare(CLONE_FS) left the fs_struct shared");
+        }
+        if fs_getcwd()? != "/abi-fsshare" {
+            return Err("unshare(CLONE_FS) lost the inherited cwd");
+        }
+        let root = b"/\0";
+        if call(Syscall::Chdir.raw(), a0(root.as_ptr() as u64)) != Some(0) {
+            return Err("chdir after unshare failed");
+        }
+        set_task(FS_PARENT);
+        if fs_getcwd()? != "/abi-fsshare" {
+            return Err("chdir after unshare(CLONE_FS) still moved the other task");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_unshare_fs_privatizes_cwd);
+
+/// The shared `fs_struct` lives until its last user exits: the task that
+/// created it exiting must not take the cwd away from a CLONE_FS sibling.
+fn smoke_abi_proc2_clone_fs_outlives_creator() -> TestResult {
+    with_fs_tasks(|| {
+        set_task(FS_PARENT);
+        if call(Syscall::Chdir.raw(), a0(FS_DIR.as_ptr() as u64)) != Some(0) {
+            return Err("fixture chdir failed");
+        }
+        crate::handlers::fs_fork(FS_PARENT, FS_SHARER, true);
+        crate::handlers::__test_fs_release(FS_PARENT);
+        set_task(FS_SHARER);
+        if fs_getcwd()? != "/abi-fsshare" {
+            return Err("the creator's exit dropped the shared cwd");
+        }
+        if crate::handlers::__test_fs_users(FS_SHARER) != 1 {
+            return Err("the creator's exit was not counted");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_clone_fs_outlives_creator);
+
+/// A walk from a directory fd starts at that directory, wherever the caller's
+/// root has since moved (`path_init` anchors on `f.file->f_path`). Chromium's
+/// sandbox opens `/proc`, chroots into an empty directory, then
+/// `openat(proc_fd, "self/fd/")` / `fstatat(proc_fd, "self/task/")`; NARF
+/// re-rooted the fd's path under the new root and answered -ENOENT
+/// (`proc_util.cc:80`). Absolute paths stay bounded by the new root.
+fn smoke_abi_proc2_dirfd_outside_root_resolves_from_the_fd() -> TestResult {
+    const O_RDONLY: u64 = 0;
+    const O_CREAT: u64 = 0o100;
+    const O_DIRECTORY: u64 = 0o200000;
+    const AT_FDCWD: u64 = -100i64 as u64;
+    const JAIL: &[u8] = b"/abi-fsjail\0";
+    with_fs_tasks(|| {
+        set_task(FS_PARENT);
+        let file = b"/abi-fsshare/marker\0";
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file.as_ptr() as u64, O_CREAT | O_RDONLY, 0o644),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("fixture: creating the marker file failed"),
+        }
+        let dirfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, FS_DIR.as_ptr() as u64, O_RDONLY | O_DIRECTORY, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("fixture: opening the directory fd failed"),
+        };
+        let jail = SyscallArgs {
+            arg0: c"none".as_ptr() as u64,
+            arg1: JAIL.as_ptr() as u64,
+            arg2: c"tmpfs".as_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), jail) != Some(0) {
+            let _ = call(Syscall::Close.raw(), a0(dirfd));
+            return Err("fixture: mounting the jail failed");
+        }
+        let result = (|| {
+            if call(Syscall::Chroot.raw(), a0(JAIL.as_ptr() as u64)) != Some(0) {
+                return Err("fixture: chroot into the jail failed");
+            }
+            let rel = b"marker\0";
+            let mut st = [0u8; 144];
+            if call(
+                Syscall::Newfstatat.raw(),
+                a3(dirfd, rel.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+            ) != Some(0)
+            {
+                return Err("fstatat(dirfd) re-rooted the fd's directory under the new root");
+            }
+            match call(
+                Syscall::Openat.raw(),
+                a3(dirfd, rel.as_ptr() as u64, O_RDONLY, 0),
+            ) {
+                Some(fd) if fd >= 0 => {
+                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                }
+                _ => return Err("openat(dirfd) re-rooted the fd's directory under the new root"),
+            }
+            // Negative: the absolute spelling is bounded by the new root.
+            if call(
+                Syscall::Newfstatat.raw(),
+                a3(AT_FDCWD, file.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+            ) == Some(0)
+            {
+                return Err("an absolute path escaped the new root");
+            }
+            Ok(())
+        })();
+        let _ = call(Syscall::Close.raw(), a0(dirfd));
+        crate::handlers::__test_root_dir_reset();
+        const MNT_DETACH: u64 = 1 << 1;
+        let _ = call(Syscall::Umount2.raw(), a1(JAIL.as_ptr() as u64, MNT_DETACH));
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_dirfd_outside_root_resolves_from_the_fd
+);
+
+/// Chromium's exact sequence (`sandbox::Credentials::DropFileSystemAccess`
+/// then `ProcUtil::HasOpenDirectory` / `ThreadHelpers::IsSingleThreaded`):
+/// keep a `/proc` fd, chroot somewhere `/proc` is not, then walk
+/// `self/fd/` and `self/task/` from that fd. The `self` magic link and the
+/// procfs routing must still apply to a walk that starts outside the root.
+fn proc_dirfd_survives_chroot_into(target: &[u8]) -> TestResult {
+    const O_RDONLY: u64 = 0;
+    const O_DIRECTORY: u64 = 0o200000;
+    const AT_FDCWD: u64 = -100i64 as u64;
+    const JAIL: &[u8] = b"/abi-procjail\0";
+    with_setup(|| {
+        let proc_path = b"/proc\0";
+        let proc_fd = match call(
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                proc_path.as_ptr() as u64,
+                O_RDONLY | O_DIRECTORY,
+                0,
+            ),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("fixture: opening /proc failed"),
+        };
+        let jail = SyscallArgs {
+            arg0: c"none".as_ptr() as u64,
+            arg1: JAIL.as_ptr() as u64,
+            arg2: c"tmpfs".as_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), jail) != Some(0) {
+            let _ = call(Syscall::Close.raw(), a0(proc_fd));
+            return Err("fixture: mounting the jail failed");
+        }
+        let result = (|| {
+            if call(Syscall::Chroot.raw(), a0(target.as_ptr() as u64)) != Some(0) {
+                return Err("fixture: chroot into the jail failed");
+            }
+            let mut st = [0u8; 144];
+            let task_dir = b"self/task/\0";
+            if call(
+                Syscall::Newfstatat.raw(),
+                a3(proc_fd, task_dir.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+            ) != Some(0)
+            {
+                return Err("fstatat(proc_fd, \"self/task/\") failed after chroot");
+            }
+            let fd_dir = b"self/fd/\0";
+            let fd_dir_fd = match call(
+                Syscall::Openat.raw(),
+                a3(proc_fd, fd_dir.as_ptr() as u64, O_RDONLY | O_DIRECTORY, 0),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("openat(proc_fd, \"self/fd/\") failed after chroot"),
+            };
+            // `HasOpenDirectory`'s loop body (proc_util.cc:115): follow the
+            // `/proc/self/fd/<N>` magic link for a descriptor opened before the
+            // chroot. It lands on the open file — here the `/proc` directory —
+            // which the new root can no longer reach by path.
+            let name = alloc::format!("{}\0", proc_fd);
+            let followed = call(
+                Syscall::Newfstatat.raw(),
+                a3(fd_dir_fd, name.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+            );
+            let _ = call(Syscall::Close.raw(), a0(fd_dir_fd));
+            if followed != Some(0) {
+                return Err("fstatat(self/fd dirfd, \"<N>\") failed after chroot");
+            }
+            const S_IFMT: u32 = 0o170000;
+            const S_IFDIR: u32 = 0o040000;
+            let mode = u32::from_ne_bytes(st[24..28].try_into().unwrap_or_default());
+            if mode & S_IFMT != S_IFDIR {
+                return Err("the followed fd link did not describe the open directory");
+            }
+            // Negative: "/proc" itself is gone from the new root.
+            if call(
+                Syscall::Newfstatat.raw(),
+                a3(
+                    AT_FDCWD,
+                    proc_path.as_ptr() as u64,
+                    st.as_mut_ptr() as u64,
+                    0,
+                ),
+            ) == Some(0)
+            {
+                return Err("absolute /proc still resolves inside the new root");
+            }
+            Ok(())
+        })();
+        let _ = call(Syscall::Close.raw(), a0(proc_fd));
+        crate::handlers::__test_root_dir_reset();
+        const MNT_DETACH: u64 = 1 << 1;
+        let _ = call(Syscall::Umount2.raw(), a1(JAIL.as_ptr() as u64, MNT_DETACH));
+        result
+    })
+}
+fn smoke_abi_proc2_proc_dirfd_survives_chroot() -> TestResult {
+    proc_dirfd_survives_chroot_into(b"/abi-procjail\0")
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_proc_dirfd_survives_chroot);
+
+/// The root Chromium actually picks: `ChrootToSelfFdinfo` chroots into
+/// `/proc/self/fdinfo/`, an empty procfs directory, so the root is itself
+/// inside the filesystem the dirfd walk has to reach.
+fn smoke_abi_proc2_proc_dirfd_survives_chroot_into_fdinfo() -> TestResult {
+    proc_dirfd_survives_chroot_into(b"/proc/self/fdinfo/\0")
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_proc_dirfd_survives_chroot_into_fdinfo
+);
+
+/// Protection keys belong to the address space
+/// (`mm->context.pkey_allocation_map`): a key one thread allocates is valid
+/// for every thread sharing the mm. Keyed per thread, a sibling's
+/// `pkey_mprotect` with that key was -EINVAL, which aborted every Chromium
+/// child process (PartitionAlloc allocates the key on one thread and tags
+/// pages from another).
+fn smoke_abi_proc2_pkey_shared_across_threads() -> TestResult {
+    with_thread_group(false, |v| {
+        set_task(TG_LEADER_TASK);
+        let key = match call(Syscall::PkeyAlloc.raw(), a1(0, 0)) {
+            Some(k) if (1..16).contains(&k) => k as u64,
+            _ => return Err("pkey_alloc on the leader failed"),
+        };
+        set_task(TG_THREAD_TASK);
+        let tagged = call(
+            Syscall::PkeyMprotect.raw(),
+            a3(v.region, TG_REGION_LEN, 3, key),
+        );
+        let freed = call(Syscall::PkeyFree.raw(), a0(key));
+        set_task(TG_LEADER_TASK);
+        let refree = call(Syscall::PkeyFree.raw(), a0(key));
+        if tagged != Some(0) {
+            return Err("a sibling thread could not use the leader's pkey");
+        }
+        if freed != Some(0) {
+            return Err("a sibling thread could not free the leader's pkey");
+        }
+        if refree != Some(EINVAL) {
+            return Err("a key freed by one thread stayed allocated for another");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_pkey_shared_across_threads);
+
+/// `arch_dup_pkeys`: a forked address space starts with its parent's keys,
+/// independently afterwards; the map is retired with its address space.
+fn smoke_abi_proc2_pkey_fork_copies_and_drop_retires() -> TestResult {
+    const PARENT: u64 = 0x5EED_0001;
+    const CHILD: u64 = 0x5EED_0002;
+    crate::handlers::__test_pkey_set(PARENT, 0b1010);
+    crate::handlers::fork_address_space_pkeys(PARENT, CHILD);
+    let copied = crate::handlers::__test_pkey_get(CHILD);
+    crate::handlers::drop_address_space_pkeys(PARENT);
+    crate::handlers::drop_address_space_pkeys(CHILD);
+    let retired = crate::handlers::__test_pkey_get(PARENT);
+    if copied != Some(0b1010) {
+        return TestResult::Fail("fork did not copy the parent's pkey allocation map");
+    }
+    if retired.is_some() {
+        return TestResult::Fail("the pkey map outlived its address space");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_pkey_fork_copies_and_drop_retires
 );

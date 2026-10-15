@@ -609,6 +609,31 @@ kernel_test_in!(
 
 // ── virtio-net-pci ─────────────────────────────────────────────────
 
+fn smoke_virtio_net_fast_poll_quantum_is_bounded() -> TestResult {
+    use crate::net_pci::{fast_poll_quantum_expired, FAST_POLL_QUANTUM};
+
+    let mut rounds = 0;
+    for _ in 0..(FAST_POLL_QUANTUM - 1) {
+        if fast_poll_quantum_expired(&mut rounds, true) {
+            return TestResult::Fail("fast-poll quantum expired before its bound");
+        }
+    }
+    if !fast_poll_quantum_expired(&mut rounds, true) {
+        return TestResult::Fail("fast-poll quantum never requested a yield");
+    }
+    if rounds != 0 {
+        return TestResult::Fail("fast-poll quantum did not reset after yielding");
+    }
+    if fast_poll_quantum_expired(&mut rounds, false) || rounds != 0 {
+        return TestResult::Fail("idle RX round did not reset the fast-poll budget");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_fast_poll_quantum_is_bounded
+);
+
 fn smoke_virtio_net_pci_tx() -> TestResult {
     use crate::net_pci;
     use narf_bus::driver_match::__reset_for_test;

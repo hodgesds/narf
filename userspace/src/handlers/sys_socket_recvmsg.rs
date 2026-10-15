@@ -193,18 +193,24 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                 const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
                 let mut errqueue = false;
                 let ancillary_truncated = if sock.domain == crate::socket::AF_INET {
-                    let mut trunc = install_ipv4_ancillary(
-                        msg_ptr,
-                        sock.take_inet4_recv_ancillary(),
-                        sock.inet4_cmsg_options(),
-                    );
-                    // MSG_ERRQUEUE: the errqueue recv stashed a queued ICMP
-                    // error — emit it as the IP_RECVERR control message.
+                    let rx = sock.take_inet4_recv_ancillary();
+                    // MSG_ERRQUEUE: the errqueue recv stashed a queued
+                    // extended error — `ip_recv_error` emits it as the
+                    // IP_RECVERR control message. It is the whole control
+                    // buffer: both installers write `msg_controllen`, so
+                    // running the receive-cmsg one first left a 0-byte
+                    // buffer and the IP_RECVERR record was always dropped.
                     if let Some(ext) = sock.take_inet_err_ancillary() {
-                        trunc |= install_ipv4_errqueue(msg_ptr, ext);
                         errqueue = true;
+                        install_ipv4_errqueue(msg_ptr, ext)
+                    } else {
+                        install_ipv4_ancillary(
+                            msg_ptr,
+                            rx,
+                            sock.inet4_cmsg_options(),
+                            sock.udp_gro_enabled(),
+                        )
                     }
-                    trunc
                 } else if sock.domain == crate::socket::AF_INET6 {
                     let (pktinfo, hoplimit, tclass) = sock.inet6_ancillary_options();
                     install_ipv6_ancillary(
@@ -213,6 +219,7 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                         pktinfo,
                         hoplimit,
                         tclass,
+                        sock.udp_gro_enabled(),
                     )
                 } else {
                     install_recv_ancillary(

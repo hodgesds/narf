@@ -1352,6 +1352,9 @@ impl E1000 {
             crate::BUILTIN_DOMAIN,
             TX_RING_LEN,
         ));
+        // Fill before the queue becomes visible. Zero-copy TX sees an empty
+        // pool as backpressure instead of allocating in its send path.
+        let _ = tx_zc_pool.prefill(TX_RING_LEN);
 
         let e1000 = Self {
             mmio,
@@ -2170,7 +2173,7 @@ fn e1000_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     // starves timers and RCU. See `probed_controller`.
     let ctrl = probed_controller().ok_or(())?;
     if let Some(mss) = meta.tso_mss {
-        let mut buf = ctrl.tx_zc_pool.acquire().ok_or(())?;
+        let mut buf = ctrl.tx_zc_pool.try_acquire().ok_or(())?;
         if frame.len() > buf.len() {
             ctrl.tx_zc_pool.release(buf);
             return Err(());

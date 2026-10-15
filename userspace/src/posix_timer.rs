@@ -900,7 +900,7 @@ fn nanosleep_common(
     clockid: u64,
     flags: u64,
     req_ptr: u64,
-    _rem_ptr: u64,
+    rem_ptr: u64,
 ) {
     // `SYSCALL_DEFINE4(clock_nanosleep)`:
     //   `kc = clockid_to_kclock(which_clock); if (!kc) return -EINVAL;`
@@ -941,23 +941,62 @@ fn nanosleep_common(
         }
     };
     let now = narf_scheduler::narf_time::monotonic_ns();
-    let delta = if flags & TIMER_ABSTIME != 0 {
-        target_ns.saturating_sub(now)
+    let absolute = flags & TIMER_ABSTIME != 0;
+    // `if (flags & TIMER_ABSTIME) rmtp = NULL;` — an absolute sleep never
+    // reports a remainder.
+    let rem_ptr = if absolute { 0 } else { rem_ptr };
+    // A relative sleep re-executed after an interruption that ran no handler
+    // is Linux's `hrtimer_nanosleep_restart`: it resumes to the expiry the
+    // interrupted call stored, not to a fresh `now + request`.
+    let restarted = if absolute {
+        None
     } else {
-        target_ns
+        crate::user_task::current_user_task().and_then(|u| {
+            // SAFETY: the in-flight task's live ctx; atomic fields only.
+            let uc = unsafe { &*u };
+            (uc.nanosleep_restart_req.load(Ordering::Acquire) == req_ptr).then(|| {
+                uc.nanosleep_restart_req.store(0, Ordering::Release);
+                uc.nanosleep_restart_deadline_ns.load(Ordering::Acquire)
+            })
+        })
     };
-    if delta == 0 {
+    let deadline = match restarted {
+        Some(d) => d,
+        None if absolute => target_ns,
+        None => now.saturating_add(target_ns),
+    };
+    if deadline <= now {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-    let deadline = now.saturating_add(delta);
+
+    if narf_scheduler::stackful::user_own_stack_enabled()
+        && narf_scheduler::stackful::current_stackful_waker().is_some()
+    {
+        if let Some(uctx) = crate::user_task::current_user_task() {
+            // SAFETY: the in-flight task's poller-pinned ctx, live for this
+            // trap; the own-stack park returns here when the sleep ends.
+            let uc = unsafe { &*uctx };
+            nanosleep_block(ctx, uc, deadline, req_ptr, rem_ptr, absolute);
+            return;
+        }
+    }
 
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
         crate::user_task::yield_hook(),
     ) {
-        if let Some(h) = crate::signal_delivery_hook() {
-            h(ctx, crate::Syscall::ClockNanosleep.raw());
+        // Legacy longjmp executor: the resumed task cannot return into this
+        // handler, so the sleep ends with 0 and a signal is delivered on
+        // that return. One already pending ends it with -EINTR, set BEFORE
+        // delivery: the handler frame saves the registers as they are, and
+        // sigreturn restores exactly those.
+        if crate::handlers::has_interrupting_signal(current_task_id()) {
+            ctx.set_return(err(EINTR));
+            if let Some(h) = crate::signal_delivery_hook() {
+                h(ctx, crate::Syscall::ClockNanosleep.raw());
+            }
+            return;
         }
 
         ctx.set_return(SyscallReturn::ok(0));
@@ -967,17 +1006,11 @@ fn nanosleep_common(
         // We hold the task here (no concurrent mutator), so the `&*uctx`
         // borrow, the interior-mutable atomic/Cell stores, `save_user_state`
         // into `uc.state`, and the matching `yield_hook` call are sound.
-        // SAFETY: Valid memory or trusted environment
         unsafe {
             let uc = &*uctx;
-            uc.sleep_deadline_ns
-                .store(deadline, core::sync::atomic::Ordering::Release);
+            uc.sleep_deadline_ns.store(deadline, Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-            if narf_scheduler::stackful::user_own_stack_enabled() {
-                crate::handlers::own_stack_block(ctx);
-                return;
-            }
             hook(uctx);
         }
         // unreachable
@@ -988,6 +1021,77 @@ fn nanosleep_common(
         core::hint::spin_loop();
     }
     ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// Linux `do_nanosleep` on the task's own kernel stack: sleep
+/// interruptibly until `deadline` (absolute monotonic ns) or a signal.
+///
+///   expired   — 0.
+///   signal    — `signal_pending(current)`. A relative sleep writes the time
+///               left to `rem_ptr` when that is non-NULL (-EFAULT if the
+///               write faults, `nanosleep_copyout`) and returns
+///               -ERESTART_RESTARTBLOCK, keeping its expiry for the restart;
+///               an absolute one returns -ERESTARTNOHAND. Both are -EINTR to
+///               any handler, SA_RESTART or not, and restart only when no
+///               handler runs — exactly how delivery treats a
+///               `SYSCALL_RESTART_RESTARTBLOCK` park, so both use it.
+///   otherwise — a spurious wake: sleep again to the SAME deadline.
+///
+/// Only a signal this thread can take ends the sleep early: the park loop
+/// re-parks on a blocked one, and an ignored one is discarded when sent.
+fn nanosleep_block(
+    ctx: &mut dyn TrapContext,
+    uc: &crate::user_task::UserTaskCtx,
+    deadline: u64,
+    req_ptr: u64,
+    rem_ptr: u64,
+    absolute: bool,
+) {
+    let task = current_task_id();
+    loop {
+        uc.sleep_deadline_ns.store(deadline, Ordering::Release);
+        // SAFETY: `uc` is this task's live ctx; the saved frame is what the
+        // own-stack park resumes from.
+        unsafe {
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+        }
+        crate::handlers::own_stack_block(ctx);
+        uc.sleep_deadline_ns.store(0, Ordering::Release);
+        let now = narf_scheduler::narf_time::monotonic_ns();
+        if now >= deadline {
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
+        }
+        if !crate::handlers::is_signal_pending(task) {
+            continue;
+        }
+        if !absolute {
+            if rem_ptr != 0 {
+                let left = deadline - now;
+                let mut out = [0u8; 16];
+                write_timespec(
+                    &mut out,
+                    (left / 1_000_000_000) as i64,
+                    (left % 1_000_000_000) as i64,
+                );
+                // SAFETY: `rem_ptr` is a user address; `copy_to_user`
+                // range-validates it and SMAP-brackets the 16-byte write.
+                if unsafe { crate::handlers::copy_to_user(rem_ptr, &out) }.is_err() {
+                    ctx.set_return(err(EFAULT));
+                    return;
+                }
+            }
+            uc.nanosleep_restart_deadline_ns
+                .store(deadline, Ordering::Release);
+            uc.nanosleep_restart_req.store(req_ptr, Ordering::Release);
+        }
+        crate::handlers::restart_interrupted_syscall(
+            ctx,
+            crate::user_task::SYSCALL_RESTART_RESTARTBLOCK,
+        );
+        return;
+    }
 }
 
 // ── setitimer / getitimer / alarm (ITIMER_REAL → SIGALRM) ────────────

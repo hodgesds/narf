@@ -10,6 +10,12 @@ pub(super) enum SendMsgResult {
     Sent { written: usize, complete: bool },
     WouldBlock,
     Error(i64),
+    /// An error that raises no SIGPIPE even when it is EPIPE (a blocking
+    /// AF_UNIX stream send woken from its wait; see `unix_stream_send_loop`).
+    QuietError(i64),
+    /// A blocking stream send left its frame restart-pending: return without
+    /// a value. Only the trap-context `sendmsg` path produces it.
+    Restart,
 }
 
 /// `sendmsg(fd, msghdr, flags)` with Linux's native validation order:
@@ -36,8 +42,17 @@ pub(crate) fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
     };
     // SO_SNDTIMEO: pick up this call's deadline if it is re-executing.
     let resumed = handler_sys_socket_recv::sock_timeo_take(ctx, &sock);
-    match sendmsg_on_socket(&sock, msg_ptr, flags, false) {
+    let blocking_unix_stream = flags & 0x40 == 0
+        && !socket_listener_nonblock(current_task_id(), fd, sock.as_ref());
+    let wait_ctx = if blocking_unix_stream {
+        Some(ctx as &mut dyn TrapContext)
+    } else {
+        None
+    };
+    match sendmsg_on_socket(&sock, msg_ptr, flags, false, wait_ctx, resumed) {
         SendMsgResult::Sent { written, .. } => ctx.set_return(SyscallReturn::ok(written as u64)),
+        SendMsgResult::Restart => {}
+        SendMsgResult::QuietError(errno) => ctx.set_return(errno_ret(errno)),
         SendMsgResult::WouldBlock => {
             handler_sys_socket_send::socket_send_would_block(ctx, fd, flags, sock.as_ref(), resumed)
         }
@@ -62,6 +77,8 @@ pub(super) fn sendmsg_on_socket(
     msg_ptr: u64,
     mut flags: u32,
     allow_msg_eor: bool,
+    wait_ctx: Option<&mut dyn TrapContext>,
+    resumed: Option<u64>,
 ) -> SendMsgResult {
     let mut header = [0u8; MSGHDR_SIZE];
     // SAFETY: copy_from_user validates all 56 bytes before copying them.
@@ -177,6 +194,28 @@ pub(super) fn sendmsg_on_socket(
     if !ancillary.fds.is_empty() && sock.domain != crate::socket::AF_UNIX {
         return SendMsgResult::Error(EINVAL);
     }
+    // A blocking AF_UNIX stream send must queue the entire iovec payload,
+    // waiting in place for its peer to drain whenever a bounded stream ring
+    // fills. SCM_RIGHTS and an explicit SCM_CREDENTIALS record ride on the
+    // first queued unit only.
+    if sock.domain == crate::socket::AF_UNIX
+        && sock.kind == crate::socket::SOCK_STREAM
+        && dest.is_none()
+        // `do_send` owns AF_UNIX's MSG_OOB rejection.  Do not bypass it with
+        // the blocking continuation path.
+        && flags & crate::socket::MSG_OOB == 0
+    {
+        if let Some(ctx) = wait_ctx {
+            return unix_stream_sendmsg_all(
+                ctx,
+                sock,
+                &total,
+                ancillary.fds,
+                ancillary.cred,
+                resumed,
+            );
+        }
+    }
     if !ancillary.fds.is_empty()
         || (ancillary.cred.is_some() && sock.domain == crate::socket::AF_UNIX)
     {
@@ -226,11 +265,25 @@ pub(super) fn sendmsg_on_socket(
         }
     }
 
-    match sock.dispatch_op(crate::socket::SocketOp::Send {
+    // `SOL_UDP` records (UDP_SEGMENT) are the UDP send path's to apply, at
+    // the point `udp_sendmsg` / `udpv6_sendmsg` call `udp_cmsg_send`. Clear
+    // the per-task slot afterwards whichever way the send ended, so it can
+    // never reach a later send(2)/sendto(2).
+    let udp_cmsg = sock.is_udp() && ancillary.udp_gso.is_some();
+    if udp_cmsg {
+        if let Some(gso) = ancillary.udp_gso {
+            sock.stash_send_udp_gso(gso);
+        }
+    }
+    let result = sock.dispatch_op(crate::socket::SocketOp::Send {
         buf: &total,
         flags,
         addr: dest,
-    }) {
+    });
+    if udp_cmsg {
+        let _ = sock.take_send_udp_gso();
+    }
+    match result {
         crate::socket::SocketOpResult::Ok(n) => SendMsgResult::Sent {
             written: n as usize,
             complete: n as usize >= total_len,
@@ -240,6 +293,55 @@ pub(super) fn sendmsg_on_socket(
         }
         crate::socket::SocketOpResult::Err(error) => SendMsgResult::Error(error.errno() as i64),
         _ => SendMsgResult::Error(22),
+    }
+}
+
+/// Finish a blocking AF_UNIX stream `sendmsg` with
+/// [`handler_sys_socket_send::unix_stream_send_loop`], which waits in place,
+/// so `done` and the fds' first-unit-only attachment survive every wait.
+/// The generic `sendmsg_on_socket` path intentionally remains one attempt so
+/// `sendmmsg` preserves its per-message short-write behaviour; only the
+/// ordinary blocking syscall supplies a trap context and enters this loop.
+fn unix_stream_sendmsg_all(
+    ctx: &mut dyn TrapContext,
+    sock: &alloc::sync::Arc<crate::socket::SocketFile>,
+    total: &[u8],
+    fds: alloc::vec::Vec<crate::socket::ScmRightsFile>,
+    explicit_cred: Option<crate::socket::Ucred>,
+    resumed_timeo: Option<u64>,
+) -> SendMsgResult {
+    use handler_sys_socket_send::UnixSend;
+
+    // `unix_scm_to_skb(&scm, skb, !fds_sent)`: the rights go out with the
+    // first unit that is queued. A first attempt that queues nothing drops
+    // what it was handed, so it gets a copy until one succeeds.
+    let mut fds = Some(fds);
+    let outcome =
+        handler_sys_socket_send::unix_stream_send_loop(ctx, sock, total.len(), resumed_timeo, |done| {
+            let unit_fds = match (&fds, done) {
+                (Some(f), 0) => f.clone(),
+                _ => alloc::vec::Vec::new(),
+            };
+            let cred = (done == 0).then_some(explicit_cred).flatten();
+            let n = sock.unix_sendmsg(&total[done..], unit_fds, cred)?;
+            if n > 0 {
+                fds = None;
+            }
+            Ok(n)
+        });
+    match outcome {
+        UnixSend::Done(written) => SendMsgResult::Sent {
+            written,
+            complete: written == total.len(),
+        },
+        UnixSend::Restart => SendMsgResult::Restart,
+        UnixSend::Err { err, out_pipe } => {
+            if out_pipe {
+                SendMsgResult::Error(err.errno() as i64)
+            } else {
+                SendMsgResult::QuietError(err.errno() as i64)
+            }
+        }
     }
 }
 

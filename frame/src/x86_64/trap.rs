@@ -1526,15 +1526,26 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 let v = narf_memory::VirtAddr::new(cr2);
                 // A guarded kernel uaccess owns a per-CPU recovery slot (and
                 // has SMAP's AC window open). It may heal by allocating now,
-                // but must not park for reclaim: switching here would expose
-                // that recovery to another task and migration would strand it
-                // on this CPU. Reserve pressure therefore falls through to the
-                // probe fixup, which gives the syscall ordinary EFAULT.
-                let r = if narf_arch::x86_64::smap::guarded_copy_armed() {
+                // but does not park for reclaim: reserve pressure falls
+                // through to the probe fixup, which gives the syscall
+                // ordinary EFAULT.
+                //
+                // A file-backed page can still park the task on its read
+                // (`mapped_file::demand_frame`), and the task can come back on
+                // another CPU. The recovery travels with the task across that
+                // heal: left on this CPU it would strand — the copy's next
+                // fault (the write-protect fault once a read-only page is in)
+                // finds nothing armed on the new CPU and panics, and this
+                // CPU's next task could consume a recovery into our stack.
+                let suspended = narf_arch::x86_64::smap::suspend_guarded_copy();
+                let r = if suspended.is_some() {
                     crate::bare::reclaim_wait::demand_page_no_wait(&as_arc, v)
                 } else {
                     crate::bare::reclaim_wait::demand_page(&as_arc, v)
                 };
+                if let Some(s) = suspended {
+                    narf_arch::x86_64::smap::resume_guarded_copy(s);
+                }
                 if r.is_ok() {
                     return;
                 }

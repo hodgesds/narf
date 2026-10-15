@@ -150,6 +150,14 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // `unshare_fs`: CLONE_FS — and CLONE_NEWNS / CLONE_NEWUSER, which
+    // `ksys_unshare` folds into it — gives a shared fs_struct a private copy,
+    // so the caller's later chdir/chroot no longer moves its CLONE_FS
+    // siblings.
+    if flags & (CLONE_FS | CLONE_NEWNS | CLONE_NEWUSER) != 0 {
+        fs_unshare(current_task_id());
+    }
+
     if flags & CLONE_NEWNS != 0 {
         task_mount_ns_init();
         let task = current_task_id();

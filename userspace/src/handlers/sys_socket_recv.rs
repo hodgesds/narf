@@ -39,6 +39,31 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
                 .unwrap_or(false)
         })
         .unwrap_or(false);
+    // MSG_WAITALL on a blocking kernel-TCP socket waits for the full length
+    // (Linux `tcp_recvmsg_locked`: `target = sock_rcvlowat(sk, waitall, len)`).
+    const MSG_WAITALL: u32 = 0x100;
+    if flags & MSG_WAITALL != 0 && flags & crate::socket::MSG_PEEK == 0 && !nonblock && buf_len > 0
+    {
+        if let Some(tcb) = sock.kernel_tcb_id() {
+            match tcp_recv_waitall(ctx, &sock, tcb, buf_ptr, buf_len, resumed) {
+                None => {}
+                Some(Ok(n)) => {
+                    if args.arg4 != 0 {
+                        if let Err(errno) = move_addr_to_user(None, args.arg4, args.arg5) {
+                            ctx.set_return(errno_ret(errno));
+                            return;
+                        }
+                    }
+                    ctx.set_return(SyscallReturn::ok(n as u64));
+                }
+                Some(Err(crate::socket::SockError::WouldBlock)) => {
+                    socket_recv_would_block(ctx, nonblock, sock.as_ref(), resumed);
+                }
+                Some(Err(e)) => ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64)),
+            }
+            return;
+        }
+    }
     let mut buf = alloc::vec![0u8; buf_len];
     let result = sock.dispatch_op(crate::socket::SocketOp::Recv {
         buf: &mut buf,
@@ -190,8 +215,305 @@ pub(super) fn socket_block(
         uc.sock_timeo_key.store(key, Ordering::Release);
     }
     if park_reexecute_on_fd_until(ctx, sock, interest, deadline) {
+        // `sock_intr_errno(timeo)`: a signal ending a FINITE socket timeout
+        // is -EINTR, never -ERESTARTSYS, so even an SA_RESTART handler sees
+        // EINTR. Handing the exit trap this restart-pending frame would let
+        // SA_RESTART re-run the wait; finish the call here instead.
+        if has_interrupting_signal(current_task_id()) {
+            resume_parked_syscall_in_place(ctx);
+            let _ = sock_timeo_take(ctx, sock);
+            ctx.set_return(errno_ret(EINTR));
+        }
         return;
     }
     let _ = sock_timeo_take(ctx, sock);
     ctx.set_return(errno_ret(EAGAIN));
+}
+
+/// Bytes the same blocking stream call (same syscall return address and
+/// socket) had already moved before it parked; 0 for a fresh call. Taken —
+/// a completed call never leaves progress for the next one.
+pub(super) fn sock_progress_take(ctx: &dyn TrapContext, sock: &crate::socket::SocketFile) -> usize {
+    use core::sync::atomic::Ordering;
+    let Some(uctx) = crate::user_task::current_user_task() else {
+        return 0;
+    };
+    // SAFETY: the live per-task context of the task executing this syscall;
+    // only atomics are touched.
+    let uc = unsafe { &*uctx };
+    let key = uc.sock_progress_key.swap(0, Ordering::AcqRel);
+    let done = uc.sock_progress_done.swap(0, Ordering::AcqRel);
+    if key != 0 && key == sock_timeo_key(ctx, sock) {
+        done as usize
+    } else {
+        0
+    }
+}
+
+fn sock_progress_store(ctx: &dyn TrapContext, sock: &crate::socket::SocketFile, done: usize) {
+    use core::sync::atomic::Ordering;
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: as in `sock_progress_take`.
+        let uc = unsafe { &*uctx };
+        uc.sock_progress_done.store(done as u64, Ordering::Release);
+        uc.sock_progress_key.store(sock_timeo_key(ctx, sock), Ordering::Release);
+    }
+}
+
+/// What a progress-keeping stream wait decided.
+pub(super) enum StreamWait {
+    /// The wait ended on this task's own stack: retry the transfer in place
+    /// with the same local progress. Carries the SO_*TIMEO deadline the next
+    /// wait must keep (`None` = no timeout).
+    Retry(Option<u64>),
+    /// `done > 0`: stop here and return the bytes already moved (Linux
+    /// returns the partial count when a signal, the SO_{RCV,SND}TIMEO
+    /// timeout or a non-sleeping context ends the wait after some progress).
+    Return,
+    /// `done == 0`: fail the call with this error — -EAGAIN for an expired
+    /// SO_*TIMEO (or a context that cannot sleep), -EINTR for a signal that
+    /// ends a FINITE timeout (`sock_intr_errno`).
+    Fail(crate::socket::SockError),
+    /// `done == 0`: a signal ended an INFINITE wait (`-ERESTARTSYS`). The
+    /// frame is left rewound and restart-pending; the caller returns WITHOUT
+    /// a value and the exit trap restarts the call (SA_RESTART) or completes
+    /// it as -EINTR.
+    Restart,
+}
+
+/// Wait inside a blocking stream call (`done` bytes moved so far) until
+/// `interest` is ready. Linux `sk_stream_wait_memory` / `sock_wait_for_wmem`
+/// / `sk_wait_data` sleep inside the protocol loop and return the partial
+/// count instead of an error once something was copied, so this wait must
+/// not hand the exit trap a restart-pending frame after progress: a signal
+/// delivered over one would turn the partial count into `-EINTR` (or, with
+/// SA_RESTART, keep transferring). An own-stack park returns here and the
+/// caller loops in place ([`StreamWait::Retry`]); its next wait sees the
+/// signal or the expired deadline first. With nothing moved, a signal is
+/// `sock_intr_errno(timeo)`: [`StreamWait::Restart`] for an infinite wait,
+/// -EINTR for a finite one. The legacy longjmp park never returns here; it
+/// keeps `done` (and the SO_*TIMEO deadline) for the re-execution instead.
+pub(super) fn stream_wait_with_progress(
+    ctx: &mut dyn TrapContext,
+    sock: &crate::socket::SocketFile,
+    interest: u32,
+    timeo: Option<u64>,
+    resumed: Option<u64>,
+    done: usize,
+) -> StreamWait {
+    use core::sync::atomic::Ordering;
+    let timeout_ns = crate::socket::timeo_ns(timeo);
+    let interrupted = |ctx: &mut dyn TrapContext| {
+        if done > 0 {
+            StreamWait::Return
+        } else if timeout_ns.is_some() {
+            StreamWait::Fail(crate::socket::SockError::Stack(EINTR as i32))
+        } else {
+            leave_syscall_restart_pending(ctx);
+            StreamWait::Restart
+        }
+    };
+    let timed_out = || {
+        if done > 0 {
+            StreamWait::Return
+        } else {
+            StreamWait::Fail(crate::socket::SockError::WouldBlock)
+        }
+    };
+    if has_interrupting_signal(current_task_id()) {
+        return interrupted(ctx);
+    }
+    let deadline = match timeout_ns {
+        None => u64::MAX,
+        Some(0) => return timed_out(),
+        Some(t) => {
+            let now = narf_scheduler::narf_time::monotonic_ns();
+            let d = resumed.unwrap_or_else(|| now.saturating_add(t));
+            if now >= d {
+                return timed_out();
+            }
+            if let Some(uctx) = crate::user_task::current_user_task() {
+                // SAFETY: as in `sock_timeo_take`.
+                let uc = unsafe { &*uctx };
+                uc.sock_timeo_deadline_ns.store(d, Ordering::Release);
+                uc.sock_timeo_key
+                    .store(sock_timeo_key(ctx, sock), Ordering::Release);
+            }
+            d
+        }
+    };
+    sock_progress_store(ctx, sock, done);
+    if park_reexecute_on_fd_until(ctx, sock, interest, deadline) {
+        // A `true` return means control is back in this handler: the
+        // own-stack park already ended, or the fd was ready at arm time (a
+        // legacy longjmp park never returns). RIP is still rewound. Drop the
+        // re-execution state first, keyed by the original syscall return
+        // address, since the caller keeps `done` and the deadline locally.
+        resume_parked_syscall_in_place(ctx);
+        let _ = sock_progress_take(ctx, sock);
+        let _ = sock_timeo_take(ctx, sock);
+        if done == 0 && has_interrupting_signal(current_task_id()) {
+            return interrupted(ctx);
+        }
+        return StreamWait::Retry((deadline != u64::MAX).then_some(deadline));
+    }
+    let _ = sock_progress_take(ctx, sock);
+    let _ = sock_timeo_take(ctx, sock);
+    timed_out()
+}
+
+/// Rewind RIP onto the syscall instruction and mark the frame
+/// restart-pending, exactly as a re-executing park leaves it, so the exit
+/// trap treats a signal as `-ERESTARTSYS`: SA_RESTART re-runs the call from
+/// its original arguments, anything else completes it as -EINTR.
+fn leave_syscall_restart_pending(ctx: &mut dyn TrapContext) {
+    #[cfg(target_arch = "x86_64")]
+    const SYSCALL_INSN_LEN: u64 = 2;
+    #[cfg(target_arch = "aarch64")]
+    const SYSCALL_INSN_LEN: u64 = 4;
+    use core::sync::atomic::Ordering;
+    let Some(uctx) = crate::user_task::current_user_task() else {
+        // No user task (kernel-test context): nothing can restart the call.
+        ctx.set_return(errno_ret(EINTR));
+        return;
+    };
+    ctx.set_rip(ctx.rip().wrapping_sub(SYSCALL_INSN_LEN));
+    // SAFETY: the in-flight task's poller-pinned ctx; atomic stores only.
+    unsafe {
+        (*uctx)
+            .syscall_restart_kind
+            .store(crate::user_task::SYSCALL_RESTART_SYS, Ordering::Release);
+        (*uctx)
+            .syscall_parked_restarting
+            .store(true, Ordering::Release);
+    }
+}
+
+/// Outcome of [`tcp_send_all`].
+pub(super) enum SendAll {
+    /// Return this byte count (the whole buffer, or a partial count after a
+    /// signal / timeout / error that followed some progress).
+    Done(usize),
+    /// Nothing was sent and the send buffer is full: the caller's ordinary
+    /// would-block path (EAGAIN / park / EINTR / timeout) applies.
+    WouldBlock,
+    /// Nothing was sent: this error (EPIPE raises SIGPIPE at the caller).
+    Err(crate::socket::SockError),
+}
+
+/// Linux `tcp_sendmsg_locked` on a BLOCKING socket: queue the whole user
+/// buffer, sleeping for send-buffer space as often as needed, and return the
+/// full length. The send buffer holds far less than a 16 MiB write, so one
+/// call spans many waits; the bytes already queued stay in `done` across
+/// them (the waits run in place, see [`stream_wait_with_progress`]). A signal or SO_SNDTIMEO ends the wait
+/// with the partial count, as does an error after some progress
+/// (`do_error: if (copied) goto out`).
+pub(super) fn tcp_send_all(
+    ctx: &mut dyn TrapContext,
+    sock: &crate::socket::SocketFile,
+    tcb: u32,
+    user_ptr: u64,
+    len: usize,
+    mut resumed_timeo: Option<u64>,
+) -> SendAll {
+    const CHUNK: usize = 1 << 20;
+    let mut done = sock_progress_take(ctx, sock).min(len);
+    while done < len {
+        let want = core::cmp::min(CHUNK, len - done);
+        // SAFETY: the caller validated the whole user range; the guarded
+        // copy still reports a racing unmap.
+        let payload = match unsafe { copy_from_user_vec(user_ptr + done as u64, want) } {
+            Ok(p) => p,
+            Err(_) if done > 0 => return SendAll::Done(done),
+            Err(e) => return SendAll::Err(crate::socket::SockError::Stack(e as i32)),
+        };
+        match narf_net::tcp_stack::send_errno(tcb, &payload) {
+            Ok(n) => {
+                done += n;
+                if n == want {
+                    continue;
+                }
+            }
+            Err(e) if e == narf_lib::errno::EAGAIN as i32 => {}
+            Err(_) if done > 0 => return SendAll::Done(done),
+            Err(e) => return SendAll::Err(crate::socket::SockError::from_stack(e)),
+        }
+        if done == 0 {
+            return SendAll::WouldBlock;
+        }
+        match stream_wait_with_progress(
+            ctx,
+            sock,
+            narf_filesystem::POLL_OUT | narf_filesystem::POLL_HUP,
+            sock.sndtimeo(),
+            resumed_timeo,
+            done,
+        ) {
+            StreamWait::Retry(deadline) => resumed_timeo = deadline,
+            // `done > 0` here, so the wait only ever returns the prefix.
+            StreamWait::Return | StreamWait::Fail(_) | StreamWait::Restart => {
+                return SendAll::Done(done)
+            }
+        }
+    }
+    SendAll::Done(done)
+}
+
+/// Linux `tcp_recvmsg_locked` with MSG_WAITALL on a BLOCKING socket: keep
+/// reading until `len` bytes arrived, EOF, an error, a signal or the
+/// SO_RCVTIMEO timeout; what was copied so far is returned in the last four
+/// cases. Bytes go straight to the user buffer, so a re-execution resumes at
+/// `user_ptr + done`. `None`: the call parked. `Some(Err(WouldBlock))`:
+/// nothing arrived yet and the caller's ordinary would-block path applies.
+pub(super) fn tcp_recv_waitall(
+    ctx: &mut dyn TrapContext,
+    sock: &crate::socket::SocketFile,
+    tcb: u32,
+    user_ptr: u64,
+    len: usize,
+    mut resumed_timeo: Option<u64>,
+) -> Option<Result<usize, crate::socket::SockError>> {
+    const CHUNK: usize = 1 << 20;
+    let mut done = sock_progress_take(ctx, sock).min(len);
+    let mut buf = alloc::vec![0u8; core::cmp::min(CHUNK, len.saturating_sub(done)).max(1)];
+    while done < len {
+        let want = core::cmp::min(buf.len(), len - done);
+        match narf_net::tcp_stack::recv_errno(tcb, &mut buf[..want]) {
+            Ok(0) => return Some(Ok(done)),
+            Ok(n) => {
+                // SAFETY: the caller validated the whole user range; the
+                // guarded copy reports a racing unmap.
+                if unsafe { copy_to_user(user_ptr + done as u64, &buf[..n]) }.is_err() {
+                    return Some(if done > 0 {
+                        Ok(done)
+                    } else {
+                        Err(crate::socket::SockError::Stack(EFAULT as i32))
+                    });
+                }
+                done += n;
+                continue;
+            }
+            Err(e) if e == narf_lib::errno::EAGAIN as i32 => {}
+            Err(_) if done > 0 => return Some(Ok(done)),
+            Err(e) => return Some(Err(crate::socket::SockError::from_stack(e))),
+        }
+        if done == 0 {
+            return Some(Err(crate::socket::SockError::WouldBlock));
+        }
+        match stream_wait_with_progress(
+            ctx,
+            sock,
+            narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
+            sock.rcvtimeo(),
+            resumed_timeo,
+            done,
+        ) {
+            StreamWait::Retry(deadline) => resumed_timeo = deadline,
+            // `done > 0` here, so the wait only ever returns the prefix.
+            StreamWait::Return | StreamWait::Fail(_) | StreamWait::Restart => {
+                return Some(Ok(done))
+            }
+        }
+    }
+    Some(Ok(done))
 }

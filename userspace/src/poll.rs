@@ -56,6 +56,16 @@ pub fn do_poll(task_id: u64, fds: &mut [PollFd], timeout_ms: i64) -> usize {
         None // infinite
     };
 
+    do_poll_until(task_id, fds, deadline_ns)
+}
+
+/// Core readiness loop with an already-resolved absolute deadline.
+///
+/// `Some(0)` is the non-blocking sentinel, a non-zero value is an absolute
+/// monotonic deadline, and `None` is an infinite wait. Keeping this separate
+/// from [`do_poll`] lets `ppoll(2)` preserve its `timespec` nanoseconds rather
+/// than truncating them to the millisecond `poll(2)` ABI.
+fn do_poll_until(task_id: u64, fds: &mut [PollFd], deadline_ns: Option<u64>) -> usize {
     loop {
         // --- one pass: query every fd ---
         // Snapshot each open fd's `Arc<dyn FileOps>` under the fd-table lock,
@@ -245,22 +255,37 @@ use crate::syscall::{SyscallReturn, TrapContext};
 /// Linux ref: `fs/select.c`:do_sys_poll (GPL-2.0-or-later, kernel.org).
 pub fn sys_poll(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    poll_common(
-        ctx,
-        args.arg0 as *mut u8,
-        args.arg1 as usize,
-        args.arg2 as i64,
-    );
+    let timeout_ms = args.arg2 as i64;
+    let timeout_ns = if timeout_ms < 0 {
+        None
+    } else {
+        Some((timeout_ms as u64).saturating_mul(1_000_000))
+    };
+    poll_common(ctx, args.arg0 as *mut u8, args.arg1 as usize, timeout_ns);
+}
+
+/// Convert a validated `ppoll(2)` timespec to its exact relative timeout.
+///
+/// The wire ABI supplies nanoseconds.  It is tempting to reuse the
+/// millisecond `poll(2)` timeout by flooring this value, but a positive
+/// sub-millisecond duration would then become a non-blocking poll and can
+/// make compositor frame-deadline loops spin.
+#[inline]
+pub(crate) fn ppoll_timeout_ns(seconds: u64, nanoseconds: u64) -> u64 {
+    seconds
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nanoseconds)
 }
 
 /// `ppoll(fds, nfds, timespec*, sigmask, sigsetsize)` — poll with a
-/// `timespec` timeout (NULL = block indefinitely) and an ignored
-/// sigmask. Converts the timespec to a millisecond timeout and shares
-/// the poll core with `sys_poll`.
+/// `timespec` timeout (NULL = block indefinitely) and an ignored sigmask.
+/// Unlike `poll(2)`, its timeout retains nanosecond precision through the
+/// parked-poll deadline.
 pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
+    use core::sync::atomic::Ordering;
     let args = *ctx.args();
-    let (timeout, _seconds, _nanoseconds): (i64, u64, u64) = if args.arg2 == 0 {
-        (-1, 0, 0)
+    let (timeout_ns, _seconds, _nanoseconds): (Option<u64>, u64, u64) = if args.arg2 == 0 {
+        (None, 0, 0)
     } else {
         // SAFETY: `arg2` is a user `timespec*` in-pointer; copy_from_user_vec
         // range-validates the 16-byte read.
@@ -275,11 +300,7 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
                     ctx.set_return(to_ret(EINVAL));
                     return;
                 }
-                (
-                    secs.saturating_mul(1000).saturating_add(nsec / 1_000_000) as i64,
-                    secs,
-                    nsec,
-                )
+                (Some(ppoll_timeout_ns(secs, nsec)), secs, nsec)
             }
             Err(_) => {
                 ctx.set_return(to_ret(EFAULT));
@@ -289,7 +310,8 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
     };
     #[cfg(feature = "syscall-trace")]
     crate::syscall::syscall_trace_account_ppoll_timeout(args.arg2 == 0, _seconds, _nanoseconds);
-    let mut old_mask = None;
+    let task = current_task_id();
+    let mut mask_active = false;
     if args.arg3 != 0 {
         if args.arg4 != 8 {
             ctx.set_return(to_ret(EINVAL));
@@ -299,20 +321,71 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
         // SAFETY: arg4 (sigsetsize) == 8 checked above; copy_from_user
         // range-validates `args.arg3` and SMAP-brackets the read into `buf`.
         if unsafe { crate::handlers::copy_from_user(&mut buf, args.arg3) }.is_ok() {
+            // `set_user_sigmask`: the wait — park included — runs under this
+            // mask, and the caller's is saved for the return. A re-execution
+            // after a park finds it installed and keeps the saved original.
             let mask = u64::from_ne_bytes(buf); // user sigset_t == NARF N-1 layout
-            let task = current_task_id();
-            old_mask = Some(crate::handlers::set_signal_mask_for_task(task, mask));
+            crate::handlers::install_temporary_signal_mask(task, mask);
+            mask_active = true;
         } else {
             ctx.set_return(to_ret(EFAULT));
             return;
         }
     }
 
-    poll_common(ctx, args.arg0 as *mut u8, args.arg1 as usize, timeout);
+    // `poll_select_finish` writes the time left back to a non-zero timeout
+    // whenever the call completes. Track the pointer and this call's deadline
+    // (the one `poll_common` persists across re-executions) so the completing
+    // path — here, or the signal delivery that ends a parked call as -EINTR —
+    // can do that.
+    let uctx = crate::user_task::current_user_task();
+    let tracked = match (uctx, timeout_ns) {
+        (Some(u), Some(duration)) if duration != 0 => {
+            // SAFETY: the in-flight task's live ctx; atomic fields only.
+            let uc = unsafe { &*u };
+            uc.ppoll_timeout_ptr.store(args.arg2, Ordering::Release);
+            let persisted = uc.blocking_deadline_ns.load(Ordering::Acquire);
+            Some(if persisted != 0 {
+                persisted
+            } else {
+                narf_scheduler::narf_time::monotonic_ns().saturating_add(duration)
+            })
+        }
+        _ => None,
+    };
+    let entry_rip = ctx.rip();
 
-    if let Some(old) = old_mask {
-        crate::handlers::set_signal_mask_for_task(current_task_id(), old);
+    poll_common(ctx, args.arg0 as *mut u8, args.arg1 as usize, timeout_ns);
+
+    // A parked call rewound RIP to re-execute, under the same mask; any other
+    // return completed it.
+    if ctx.rip() == entry_rip.wrapping_sub(2) {
+        return;
     }
+    // `restore_saved_sigmask_unless(ret == -ERESTARTNOHAND)`: a delivered
+    // signal's frame took the saved mask over (sigreturn restores it); any
+    // other return puts it back now.
+    if mask_active {
+        crate::handlers::restore_temporary_signal_mask(task);
+    }
+    if let (Some(u), Some(deadline)) = (uctx, tracked) {
+        // SAFETY: as above.
+        let uc = unsafe { &*u };
+        uc.ppoll_timeout_ptr.store(0, Ordering::Release);
+        write_ppoll_remaining(args.arg2, deadline);
+    }
+}
+
+/// Write the time left before `deadline_ns` to ppoll's `timespec` (Linux
+/// `poll_select_finish`, `PT_TIMESPEC`). A fault leaves the result alone.
+fn write_ppoll_remaining(ptr: u64, deadline_ns: u64) {
+    let left = deadline_ns.saturating_sub(narf_scheduler::narf_time::monotonic_ns());
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&((left / 1_000_000_000) as i64).to_ne_bytes());
+    out[8..].copy_from_slice(&((left % 1_000_000_000) as i64).to_ne_bytes());
+    // SAFETY: `ptr` is the caller's user `timespec *`; `copy_to_user`
+    // range-validates it and SMAP-brackets the 16-byte write.
+    let _ = unsafe { crate::handlers::copy_to_user(ptr, &out) };
 }
 
 /// One readiness pass over `fds`: fills each `revents`, returns the ready
@@ -434,6 +507,28 @@ fn record_poll_wait(uc: &crate::user_task::UserTaskCtx, fds: &[PollFd]) {
         slot.store(v, Ordering::Relaxed);
     }
     uc.poll_wait_nfds.store(fds.len() as u32, Ordering::Release);
+}
+
+/// A parked poll/ppoll/select that signal delivery just completed as -EINTR
+/// (`abort_restart_pending_park_state`) never re-executes, so its return-path
+/// teardown runs here: write ppoll's remaining time back, disarm the
+/// readiness cells its park armed and release the entry-time file references.
+/// Left held, the task's NEXT poll of the same length took them as its own
+/// resolution (`install_poll_files`) and waited on the old call's files.
+pub(crate) fn abort_interrupted(task_id: u64, uc: &crate::user_task::UserTaskCtx) {
+    use core::sync::atomic::Ordering;
+    let ppoll_timeout = uc.ppoll_timeout_ptr.swap(0, Ordering::AcqRel);
+    let deadline = uc.blocking_deadline_ns.load(Ordering::Acquire);
+    if ppoll_timeout != 0 && deadline != 0 {
+        write_ppoll_remaining(ppoll_timeout, deadline);
+    }
+    if let Some(t) = crate::task::task_get_local(task_id) {
+        let files = t.poll_files.lock().clone();
+        for (ops, _, _) in files.iter().flatten() {
+            ops.disarm_readiness(task_id);
+        }
+    }
+    clear_poll_wait_record(task_id, uc);
 }
 
 /// Clear the watchdog poll-park record on a poll return path, and RELEASE the
@@ -846,7 +941,7 @@ pub(crate) fn poll_wait_kernel(
     KernelPollWait::Parked
 }
 
-fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i64) {
+fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout_ns: Option<u64>) {
     use core::sync::atomic::Ordering;
     // `fs/select.c::do_sys_poll` answers an over-large nfds with -EINVAL and a
     // faulting `struct pollfd[]` with -EFAULT. The old `-1` sentinel reached
@@ -934,15 +1029,22 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
     // fd is caught by `poll_scan`'s POLLNVAL on the first pass below (immediate
     // return, no park). Only a non-blocking poll or
     // one with no task context (early boot) still takes the one-shot busy path.
-    let can_park = timeout != 0 && uctx_opt.is_some();
+    let can_park = timeout_ns != Some(0) && uctx_opt.is_some();
     if !can_park {
         #[cfg(feature = "syscall-trace")]
-        if timeout != 0 && uctx_opt.is_none() {
+        if timeout_ns != Some(0) && uctx_opt.is_none() {
             crate::syscall::syscall_trace_account_park(
                 crate::syscall::SyscallTraceParkEvent::NoContext,
             );
         }
-        let n = do_poll(task, &mut fds, timeout);
+        let deadline_ns = timeout_ns.map(|duration| {
+            if duration == 0 {
+                0
+            } else {
+                narf_scheduler::narf_time::monotonic_ns().saturating_add(duration)
+            }
+        });
+        let n = do_poll_until(task, &mut fds, deadline_ns);
         // SAFETY: same pointer/length as the parse step; user AS still active.
         unsafe { write_pollfds(ptr, &fds) };
         ctx.set_return(SyscallReturn::ok(n as u64));
@@ -978,20 +1080,19 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
     let deadline_ns: Option<u64> = {
         // SAFETY: as above.
         let uctx = unsafe { &*uctx_ptr };
-        if timeout > 0 {
+        if let Some(duration) = timeout_ns {
             let persisted = uctx.blocking_deadline_ns.load(Ordering::Acquire);
             let d = if persisted != 0 {
                 persisted
             } else {
-                let d = narf_scheduler::narf_time::monotonic_ns()
-                    .saturating_add((timeout as u64) * 1_000_000);
+                let d = narf_scheduler::narf_time::monotonic_ns().saturating_add(duration);
                 uctx.blocking_deadline_ns.store(d, Ordering::Release);
                 d
             };
             uctx.sleep_deadline_ns.store(d, Ordering::Release);
             Some(d)
         } else {
-            // Infinite (timeout < 0).
+            // Infinite wait.
             uctx.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
             None
         }
@@ -1077,19 +1178,23 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
     if let Some(hook) = crate::user_task::yield_hook() {
         #[cfg(feature = "syscall-trace")]
         crate::syscall::syscall_trace_account_park(crate::syscall::SyscallTraceParkEvent::Enter);
-        // A pending unblocked signal interrupts the wait with -EINTR.
-        if let Some(h) = crate::signal_delivery_hook() {
-            if h(ctx, crate::Syscall::Poll.raw()) {
-                disarm_readiness_cells(task, &fds);
-                // SAFETY: clearing this task's own park deadlines.
-                unsafe {
-                    (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
-                    (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
-                    clear_poll_wait_record(task, &*uctx_ptr);
-                }
-                ctx.set_return(to_ret(EINTR));
-                return;
+        // A pending unblocked signal interrupts the wait with -EINTR. The
+        // return value goes in BEFORE delivery: the handler frame saves the
+        // registers as they are now, and sigreturn restores exactly those —
+        // set after, the caller got the syscall number back instead.
+        if crate::handlers::has_interrupting_signal(task) {
+            ctx.set_return(to_ret(EINTR));
+            if let Some(h) = crate::signal_delivery_hook() {
+                let _ = h(ctx, crate::Syscall::Poll.raw());
             }
+            disarm_readiness_cells(task, &fds);
+            // SAFETY: clearing this task's own park deadlines.
+            unsafe {
+                (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
+                (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+                clear_poll_wait_record(task, &*uctx_ptr);
+            }
+            return;
         }
         // Durable per-fd wake: arm each polled fd that owns a Readiness cell so
         // a `set` edge wakes this poll directly (alongside the legacy

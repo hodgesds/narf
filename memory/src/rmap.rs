@@ -387,13 +387,6 @@ impl RmapTable {
         self.len -= 1;
         self.tombstones += 1;
     }
-
-    fn iter(&self) -> impl Iterator<Item = (u64, &OwnerList)> {
-        self.slots.iter().filter_map(|slot| match slot {
-            RmapSlot::Occupied { key, owners } => Some((*key, owners)),
-            RmapSlot::Vacant | RmapSlot::Tombstone => None,
-        })
-    }
 }
 
 impl RmapShard {
@@ -602,6 +595,25 @@ pub fn owner_count(phys: PhysAddr) -> usize {
         .map_or(0, OwnerList::len)
 }
 
+/// The single recorded owner of `phys`, or `None` when it has zero or several.
+///
+/// Allocation-free (unlike [`for_each_owner`], which snapshots into a `Vec`):
+/// single-owner migration runs inside direct compaction, i.e. on the failure
+/// path of an allocation, where entering the heap could recurse into the
+/// allocator that just failed.
+pub fn sole_owner(phys: PhysAddr) -> Option<Owner> {
+    let key = phys.raw();
+    if key == 0 {
+        return None;
+    }
+    let guard = RMAP[shard(key)].map.lock();
+    match guard.as_ref().and_then(|m| m.get(key)).map(|l| &l.owners) {
+        Some(Owners::One(owner)) => Some(*owner),
+        Some(Owners::Many(owners)) if owners.len() == 1 => Some(owners[0]),
+        _ => None,
+    }
+}
+
 /// Visit every recorded owner of `phys`. Snapshots the owner list under the
 /// shard lock, then invokes `f` with the lock RELEASED, so the callback may take
 /// page-table locks (e.g. to rewrite a PTE during migration) without a
@@ -624,23 +636,62 @@ pub fn for_each_owner(phys: PhysAddr, mut f: impl FnMut(Owner)) {
 }
 
 /// Visit every physical frame currently tracked (i.e. mapped by at least one
-/// owner). Snapshots each shard's keys under its lock, then invokes `f` with the
-/// lock RELEASED, so the callback may migrate frames / take page-table locks.
-/// Used by the compaction driver to find movable (user-mapped) frames.
+/// owner), invoking `f` with every shard lock RELEASED so the callback may
+/// migrate frames / take page-table locks. Used by the compaction driver to find
+/// movable (user-mapped) frames. See [`try_for_each_tracked_frame`].
 pub fn for_each_tracked_frame(mut f: impl FnMut(PhysAddr)) {
+    try_for_each_tracked_frame(|phys| {
+        f(phys);
+        core::ops::ControlFlow::Continue(())
+    });
+}
+
+/// Keys copied out of a shard per lock hold by [`try_for_each_tracked_frame`].
+const TRACKED_SCAN_CHUNK: usize = 128;
+
+/// Like [`for_each_tracked_frame`], but `f` may stop the walk early by
+/// returning `ControlFlow::Break`.
+///
+/// ALLOCATION-FREE. Direct compaction calls this from the failure path of a
+/// higher-order allocation, with IRQs masked under the node cache drain, so
+/// it must not enter the heap: the previous implementation collected each
+/// whole shard's keys into a `Vec` (tens of KiB on a loaded desktop), and when
+/// that `Vec` could not grow the kernel panicked in `handle_alloc_error`
+/// instead of the original allocation failing cleanly. Keys are instead
+/// copied in bounded stack chunks, resuming at a slot cursor after each lock
+/// drop. A concurrent table resize between chunks can make the walk skip or
+/// repeat a key; callers treat the walk as a candidate hint and re-validate
+/// every frame (compaction re-checks ownership under the region lock).
+pub fn try_for_each_tracked_frame(mut f: impl FnMut(PhysAddr) -> core::ops::ControlFlow<()>) {
     for shard in RMAP.iter() {
-        let frames: Vec<u64> = shard
-            .map
-            .lock()
-            .as_ref()
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(key, owners)| (owners.len() != 0).then_some(key))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for key in frames {
-            f(PhysAddr::new(key));
+        let mut cursor = 0usize;
+        loop {
+            let mut keys = [0u64; TRACKED_SCAN_CHUNK];
+            let mut n = 0usize;
+            let exhausted = {
+                let guard = shard.map.lock();
+                let Some(table) = guard.as_ref() else {
+                    break;
+                };
+                while cursor < table.slots.len() && n < TRACKED_SCAN_CHUNK {
+                    if let RmapSlot::Occupied { key, owners } = &table.slots[cursor] {
+                        if owners.len() != 0 {
+                            keys[n] = *key;
+                            n += 1;
+                        }
+                    }
+                    cursor += 1;
+                }
+                cursor >= table.slots.len()
+            };
+            for &key in &keys[..n] {
+                if f(PhysAddr::new(key)).is_break() {
+                    return;
+                }
+            }
+            if exhausted {
+                break;
+            }
         }
     }
 }

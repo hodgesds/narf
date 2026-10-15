@@ -78,6 +78,7 @@ pub mod poll;
 pub mod posix_timer;
 pub mod process;
 pub mod ptrace;
+pub mod seccomp;
 pub mod select;
 pub mod socket;
 pub mod syscall;
@@ -155,6 +156,7 @@ mod abi_signal_tests;
 mod abi_socket_errno_tests;
 mod abi_socket_tests;
 mod abi_sound_tests;
+mod abi_sync_file_tests;
 mod abi_test_support;
 mod abi_tests;
 mod abi_thp_tests;
@@ -162,7 +164,9 @@ mod abi_tid_lookup_tests;
 mod abi_time_tests;
 mod abi_uaccess_tests;
 mod abi_udev_protocol_tests;
+mod abi_udp_gso_tests;
 mod abi_udp_tests;
+mod abi_unix_stream_tests;
 mod abi_vconsole_tests;
 mod mount_e2e_tests;
 mod process_e2e_tests;
@@ -188,6 +192,8 @@ pub fn drop_mapped_file_address_space(address_space_id: u64) {
     // reason: they belong to the mm, so they are retired when it dies rather
     // than when whichever thread called `mbind` exits.
     handlers::drop_address_space_mbind_ranges(address_space_id);
+    // The pkey allocation map is per mm too.
+    handlers::drop_address_space_pkeys(address_space_id);
     // The NUMA scan cursor is address-space state for the same reason the
     // range policies are, so it dies with the address space too.
     handlers::drop_address_space_numa_cursor(address_space_id);

@@ -132,13 +132,17 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
             }
         }
         // Reaped — release the refcounted Task, then return the PID to
-        // the free pool.
-        release_reaped_task(reaped);
-        crate::release_pid(crate::ProcessId(reaped));
-        // The child is gone — drop its parent record so a later wait4 sees
-        // it's no longer a child (otherwise the ECHILD check below stays
-        // blind to the reap and the parent blocks forever).
-        parent_of_remove(reaped);
+        // the free pool. A tracer's reap of a zombie it handed back to the
+        // real parent (`hand_back_traced_zombie`) releases nothing: the
+        // parent's own wait will.
+        if !take_handed_back(reaped) {
+            release_reaped_task(reaped);
+            crate::release_pid(crate::ProcessId(reaped));
+            // The child is gone — drop its parent record so a later wait4
+            // sees it's no longer a child (otherwise the ECHILD check below
+            // stays blind to the reap and the parent blocks forever).
+            parent_of_remove(reaped);
+        }
         ctx.set_return(match copy_errno {
             Some(errno) => errno_ret(errno as i64),
             None => SyscallReturn::ok(reaped_visible),
@@ -260,9 +264,11 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
                     copy_errno = Some(errno);
                 }
             }
-            release_reaped_task(child);
-            crate::release_pid(crate::ProcessId(child));
-            parent_of_remove(child);
+            if !take_handed_back(child) {
+                release_reaped_task(child);
+                crate::release_pid(crate::ProcessId(child));
+                parent_of_remove(child);
+            }
             ctx.set_return(match copy_errno {
                 Some(errno) => errno_ret(errno as i64),
                 None => SyscallReturn::ok(child_visible),

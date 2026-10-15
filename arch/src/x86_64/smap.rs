@@ -45,8 +45,9 @@ use crate::x86_64::cr::{read_cr4, write_cr4};
 
 /// Per-CPU marker for the interval where [`copy_user_guarded`] owns the
 /// recoverable-probe slot (and, on SMAP hardware, has EFLAGS.AC set). A page
-/// fault in this interval may heal synchronously, but it must never park for
-/// reclaim: switching tasks would leave both pieces of CPU-local state live.
+/// fault in this interval does not park for reclaim, and a heal that can park
+/// for any other reason runs between [`suspend_guarded_copy`] and
+/// [`resume_guarded_copy`], which carry this state with the task.
 #[repr(C, align(64))]
 struct GuardedCopyMarker {
     armed: AtomicBool,
@@ -86,6 +87,61 @@ fn guarded_copy_marker() -> &'static GuardedCopyMarker {
 #[inline]
 pub fn guarded_copy_armed() -> bool {
     guarded_copy_marker().armed.load(Ordering::Acquire)
+}
+
+/// A guarded copy's recovery, lifted off its CPU by
+/// [`suspend_guarded_copy`] while the fault handler may sleep.
+#[derive(Debug)]
+#[must_use = "a suspended guarded copy must be resumed before the trap returns"]
+pub struct SuspendedGuardedCopy {
+    recovery: u64,
+}
+
+/// Lift this CPU's guarded-copy state (the armed marker and the probe's
+/// recovery) off the CPU, for a page-fault handler about to run a heal that
+/// can park the task — a file-backed page whose read is still in flight.
+/// Returns `None` when no guarded copy is armed here.
+///
+/// The state is CPU-local because the copy runs with IRQs masked, but a fault
+/// inside the copy is not bound by that: the heal can context-switch, and the
+/// task can resume on another CPU. Left in place, the recovery would stay
+/// armed on the old CPU, where the next task's unrelated fault could consume
+/// it and jump into this task's stack frame, while the copy's own next fault
+/// on the new CPU found nothing armed and took the fatal path. Linux keys
+/// recovery on the faulting RIP (the exception table), not on the CPU, so a
+/// sleeping uaccess fault is ordinary there.
+///
+/// Call with IRQs masked (the trap entry state), and pair every `Some` with
+/// [`resume_guarded_copy`] before the trap returns.
+#[doc(hidden)]
+pub fn suspend_guarded_copy() -> Option<SuspendedGuardedCopy> {
+    let cpu = crate::current_cpu_id().raw() as usize;
+    let marker = guarded_copy_marker_for(cpu);
+    if !marker.armed.load(Ordering::Acquire) {
+        return None;
+    }
+    let recovery = crate::x86_64::probe::take_for_cpu(cpu);
+    marker.armed.store(false, Ordering::Release);
+    Some(SuspendedGuardedCopy { recovery })
+}
+
+/// Re-arm a [`suspend_guarded_copy`] state on whichever CPU the task is on
+/// now. Masks IRQs first: the trap frame's saved RFLAGS (IF clear inside the
+/// copy) only takes effect at `iretq`, and a heal that parked may have
+/// returned with IRQs enabled, so without this a second migration could
+/// separate the re-armed state from the task again before the copy resumes.
+#[doc(hidden)]
+pub fn resume_guarded_copy(suspended: SuspendedGuardedCopy) {
+    // SAFETY: CLI at CPL=0 is always legal; the copy being resumed runs with
+    // IF clear, and the trap's `iretq` restores the frame's RFLAGS anyway.
+    unsafe {
+        asm!("cli", options(nomem, nostack));
+    }
+    let cpu = crate::current_cpu_id().raw() as usize;
+    set_guarded_copy_armed_for(cpu, true);
+    if suspended.recovery != 0 {
+        crate::x86_64::probe::arm_for_cpu(cpu, suspended.recovery);
+    }
 }
 
 #[inline]
@@ -281,10 +337,11 @@ pub unsafe fn copy_user_guarded(dst: *mut u8, src: *const u8, len: usize) -> Res
         unsafe {
             asm!("pushfq", "pop {f}", "cli", f = out(reg) saved_rflags);
         }
-        // IRQ masking pins execution to this CPU until the probe and SMAP
-        // window are both closed. Resolve the per-CPU slot once: the former
-        // marker/probe helpers each executed RDTSCP independently (four reads
-        // per 4 KiB pipe syscall) despite all four indices being identical.
+        // IRQ masking keeps IRQ-driven switches out of the armed window, so
+        // one index serves the marker and the probe here (the former helpers
+        // executed RDTSCP independently, four reads per 4 KiB pipe syscall).
+        // A fault inside the copy is the one way off this CPU; the disarm
+        // below resolves the index again for that.
         let cpu = crate::current_cpu_id().raw() as usize;
         let recovery: u64;
         // SAFETY: LEA of a local label. `98f` resolves forward into
@@ -327,6 +384,10 @@ pub unsafe fn copy_user_guarded(dst: *mut u8, src: *const u8, len: usize) -> Res
         unsafe {
             clac();
         }
+        // Resolve the CPU again: a fault inside the copy can park while it
+        // heals (a file page under read), and the task may come back on
+        // another CPU — `resume_guarded_copy` re-armed the state there.
+        let cpu = crate::current_cpu_id().raw() as usize;
         let caught = probe::disarm_for_cpu(cpu);
         set_guarded_copy_armed_for(cpu, false);
         // Restore IF exactly as found.
@@ -382,8 +443,8 @@ pub unsafe fn cmpxchg_user_guarded(uaddr: *mut u32, old: u32, new: u32) -> Resul
     unsafe {
         asm!("pushfq", "pop {f}", "cli", f = out(reg) saved_rflags);
     }
-    // IRQ masking pins execution to this CPU until the probe and the SMAP
-    // window are both closed, so the per-CPU slot resolves once.
+    // IRQ masking keeps IRQ-driven switches out of the armed window; a
+    // healed fault can still move the task, so the disarm re-resolves.
     let cpu = crate::current_cpu_id().raw() as usize;
     let recovery: u64;
     // SAFETY: LEA of a local label. `97f` resolves forward into the
@@ -426,6 +487,9 @@ pub unsafe fn cmpxchg_user_guarded(uaddr: *mut u32, old: u32, new: u32) -> Resul
     unsafe {
         clac();
     }
+    // A healed fault may have parked and moved the task (see
+    // `copy_user_guarded`).
+    let cpu = crate::current_cpu_id().raw() as usize;
     let caught = probe::disarm_for_cpu(cpu);
     set_guarded_copy_armed_for(cpu, false);
     // Restore IF exactly as found.

@@ -682,6 +682,88 @@ fn smoke_abi_fdio2_close_range_cloexec_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio2_close_range_cloexec_pos);
 
+/// `CLOSE_RANGE_UNSHARE` must first give the caller a private descriptor
+/// table, then close only in that table. Chromium's sandbox uses this when a
+/// CLONE_FILES helper discards inherited fds: closing the shared table leaves
+/// Chromium's process-wide fd-ownership bitmap stale and its next `open()`
+/// deliberately aborts.
+///
+/// Linux reference: `fs/file.c::close_range` calls `dup_fd` before
+/// `__range_close` whenever the current `files_struct` is shared.
+fn smoke_abi_fdio2_close_range_unshare_isolates_shared_table() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"hi")], || {
+        const CLOSE_RANGE_UNSHARE: u64 = 1 << 1;
+        const CHILD: u64 = FAKE_TASK + 1;
+
+        let fd = open_fd2(b"/abi/f\0")?;
+        crate::fd::share(FAKE_TASK, CHILD);
+
+        // Model the CLONE_FILES child making its own descriptor table before
+        // it closes inherited descriptors for an exec/sandbox transition.
+        set_task(CHILD);
+        let child_close = call(
+            Syscall::CloseRange.raw(),
+            a2(fd as u64, fd as u64, CLOSE_RANGE_UNSHARE),
+        );
+        let child_closed = call(Syscall::Read.raw(), a2(fd as u64, 0, 0)) == Some(EBADF);
+
+        // Switch back to the sibling that retained the original shared table:
+        // its descriptor must still be valid and readable.
+        set_task(FAKE_TASK);
+        let mut got = [0u8; 2];
+        let parent_read = call(
+            Syscall::Read.raw(),
+            a2(fd as u64, got.as_mut_ptr() as u64, got.len() as u64),
+        );
+
+        if child_close != Some(0) {
+            crate::fd::detach(CHILD);
+            return Err("close_range(UNSHARE) did not return 0");
+        }
+        if !child_closed {
+            crate::fd::detach(CHILD);
+            return Err("close_range(UNSHARE) did not close the caller's fd");
+        }
+        if parent_read != Some(got.len() as i64) || got != *b"hi" {
+            crate::fd::detach(CHILD);
+            return Err("close_range(UNSHARE) closed an fd in a CLONE_FILES sibling");
+        }
+
+        // Linux copies the full table for UNSHARE|CLOEXEC, then marks only
+        // the caller's copy. Re-share for this independent second operation
+        // and assert that the parent retains a non-CLOEXEC descriptor.
+        crate::fd::share(FAKE_TASK, CHILD);
+        set_task(CHILD);
+        let child_cloexec_call = call(
+            Syscall::CloseRange.raw(),
+            a2(fd as u64, fd as u64, CLOSE_RANGE_UNSHARE | (1 << 2)),
+        );
+        let child_cloexec = crate::fd::with_table(CHILD, |table| {
+            table
+                .get(fd)
+                .is_some_and(|entry| entry.flags & crate::fd::FD_CLOEXEC != 0)
+        })
+        .unwrap_or(false);
+        set_task(FAKE_TASK);
+        let parent_cloexec = crate::fd::with_table(FAKE_TASK, |table| {
+            table
+                .get(fd)
+                .is_some_and(|entry| entry.flags & crate::fd::FD_CLOEXEC != 0)
+        })
+        .unwrap_or(true);
+        crate::fd::detach(CHILD);
+
+        if child_cloexec_call != Some(0) || !child_cloexec || parent_cloexec {
+            return Err("close_range(UNSHARE|CLOEXEC) leaked descriptor flags to a sibling");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio2_close_range_unshare_isolates_shared_table
+);
+
 fn smoke_abi_fdio2_close_range_badflag_neg() -> TestResult {
     with_setup(|| {
         // An unrecognised flag bit (0x1) → -EINVAL (distinct from the

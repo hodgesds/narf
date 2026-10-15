@@ -62,6 +62,11 @@ pub struct LoadedMapping {
     pub len: u64,
     pub pgoff: u64,
     pub prot: u32,
+    /// Backing filesystem identity in Linux `st_dev` encoding and `st_ino`.
+    /// Both are zero when the loader did not receive a filesystem object
+    /// (for example an in-memory fexecve image).
+    pub device: u64,
+    pub inode: u64,
     /// `None` identifies the main program; exec owns its resolved path.
     pub filename: Option<alloc::string::String>,
 }
@@ -298,34 +303,39 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // recomputed here from a second copy of PROGRAM_DYN_BASE, kept in
     // sync by comment; with a randomised base a second draw would give a
     // different answer, so the loader now reports the one it picked.
-    let segment_mapping =
-        |seg: &crate::Segment, bias: u64, filename: Option<alloc::string::String>| {
-            let vaddr = seg.vaddr.wrapping_add(bias);
-            let mut prot = 0;
-            if seg.flags.contains(crate::SegmentFlags::READ) {
-                prot |= 1;
-            }
-            if seg.flags.contains(crate::SegmentFlags::WRITE) {
-                prot |= 2;
-            }
-            if seg.flags.contains(crate::SegmentFlags::EXEC) {
-                prot |= 4;
-            }
-            LoadedMapping {
-                addr: vaddr & !0xfff,
-                len: ((vaddr & 0xfff)
-                    .saturating_add(seg.mem_size)
-                    .saturating_add(0xfff))
-                    & !0xfff,
-                pgoff: seg.file_off & !0xfff,
-                prot,
-                filename,
-            }
-        };
+    let segment_mapping = |seg: &crate::Segment,
+                           bias: u64,
+                           filename: Option<alloc::string::String>,
+                           file_identity: Option<(u64, u64)>| {
+        let vaddr = seg.vaddr.wrapping_add(bias);
+        let mut prot = 0;
+        if seg.flags.contains(crate::SegmentFlags::READ) {
+            prot |= 1;
+        }
+        if seg.flags.contains(crate::SegmentFlags::WRITE) {
+            prot |= 2;
+        }
+        if seg.flags.contains(crate::SegmentFlags::EXEC) {
+            prot |= 4;
+        }
+        LoadedMapping {
+            addr: vaddr & !0xfff,
+            len: ((vaddr & 0xfff)
+                .saturating_add(seg.mem_size)
+                .saturating_add(0xfff))
+                & !0xfff,
+            pgoff: seg.file_off & !0xfff,
+            prot,
+            device: file_identity.map(|(dev, _)| dev).unwrap_or(0),
+            inode: file_identity.map(|(_, ino)| ino).unwrap_or(0),
+            filename,
+        }
+    };
+    let program_file_identity = file.map(|file| (file.inode_attrs().dev, file.ino()));
     let mut loaded_mappings: alloc::vec::Vec<LoadedMapping> = image
         .segments
         .iter()
-        .map(|seg| segment_mapping(seg, program_bias, None))
+        .map(|seg| segment_mapping(seg, program_bias, None, program_file_identity))
         .collect();
     // Static-PIE binaries (no interpreter, but PT_DYNAMIC is present)
     // use rcrt1.o from musl to self-relocate using AT_PHDR. The kernel
@@ -347,7 +357,10 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // its chroot before exec, so `apply_chroot` keyed on the current
     // task rewrites the interpreter path into the rootfs. Outside any
     // chroot, `apply_chroot` returns the path unchanged.
-    let interp_fs_owned: Option<alloc::vec::Vec<u8>> = image
+    let interp_fs_owned: Option<(
+        alloc::vec::Vec<u8>,
+        alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+    )> = image
         .interp
         .as_deref()
         .filter(|name| interp::lookup_interpreter(name).is_none())
@@ -357,12 +370,13 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
                 Some(_) => alloc::string::String::from(name),
                 None => crate::handlers::apply_chroot(name),
             };
-            read_path_from_vfs(&resolved)
+            read_path_and_file_from_vfs(&resolved)
         });
 
     if let Some(name) = image.interp.as_deref() {
         let registered: Option<&[u8]> = interp::lookup_interpreter(name).map(|s| s as &[u8]);
-        let interp_bytes_opt: Option<&[u8]> = registered.or(interp_fs_owned.as_deref());
+        let interp_bytes_opt: Option<&[u8]> =
+            registered.or_else(|| interp_fs_owned.as_ref().map(|(bytes, _)| bytes.as_slice()));
         let interp_bytes = match interp_bytes_opt {
             Some(b) => b,
             None => {
@@ -398,8 +412,16 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
             // typically an ET_DYN object with its own .rela.dyn that
             // needs the interp_bias applied as the load offset.
             let interp_image = crate::parse_elf(interp_bytes).map_err(LoadBytesError::Elf)?;
+            let interp_file_identity = interp_fs_owned
+                .as_ref()
+                .map(|(_, file)| (file.inode_attrs().dev, file.ino()));
             loaded_mappings.extend(interp_image.segments.iter().map(|seg| {
-                segment_mapping(seg, interp_bias, Some(alloc::string::String::from(name)))
+                segment_mapping(
+                    seg,
+                    interp_bias,
+                    Some(alloc::string::String::from(name)),
+                    interp_file_identity,
+                )
             }));
             if !interp_image.dynamic.is_empty() {
                 // SAFETY: the interp's segments were just mapped + materialized
@@ -517,6 +539,8 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
         } else {
             3
         },
+        device: 0,
+        inode: 0,
         filename: Some(alloc::string::String::from("[stack]")),
     });
 
@@ -805,6 +829,26 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
         // SAFETY: Valid memory or trusted environment
         Some(unsafe { crate::tls::stage_tls(&synthetic_image, src, &address_space) }?)
     };
+
+    // `/proc/<pid>/auxv` and `/proc/<pid>/environ` describe the image that
+    // has just been committed, not merely an execve request.  Publish only
+    // after every fallible loader stage has completed, so a failed PT_TLS
+    // setup cannot make procfs expose an image that never became runnable.
+    // The proc tables are task-keyed while this loader is process-keyed; a
+    // boot-time process has no mapping yet and deliberately falls back to
+    // its PID, whereas execve resolves the already-running task id here.
+    let task = crate::handlers::proc_pid_to_tid(pid.raw());
+    crate::handlers::set_proc_environ(task, envp);
+    let proc_auxv: alloc::vec::Vec<(u64, u64)> = final_aux
+        .iter()
+        // init_sysv_stack stops at an explicit caller-supplied AT_NULL, so
+        // procfs must stop there too instead of exposing later internal
+        // defaults that userspace cannot reach through its startup stack.
+        .take_while(|entry| !matches!(entry, AuxEntry::Null))
+        .map(aux_pair)
+        .map(|(tag, value)| (u64::from(tag), value))
+        .collect();
+    crate::handlers::set_proc_auxv_pairs(task, &proc_auxv);
 
     Ok(UserProcess {
         pid,
@@ -1212,7 +1256,12 @@ pub unsafe fn load_user_process_from_path(
     }
 }
 
-pub fn read_path_from_vfs(abs_path: &str) -> Option<alloc::vec::Vec<u8>> {
+fn read_path_and_file_from_vfs(
+    abs_path: &str,
+) -> Option<(
+    alloc::vec::Vec<u8>,
+    alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+)> {
     use crate::handlers::poll_io_to_completion;
 
     // 1. Walk the VFS to a FileOps for `abs_path`, through the CALLER'S mount
@@ -1245,5 +1294,9 @@ pub fn read_path_from_vfs(abs_path: &str) -> Option<alloc::vec::Vec<u8>> {
         }
         filled = filled.saturating_add(n as u64);
     }
-    Some(buf)
+    Some((buf, file))
+}
+
+pub fn read_path_from_vfs(abs_path: &str) -> Option<alloc::vec::Vec<u8>> {
+    read_path_and_file_from_vfs(abs_path).map(|(bytes, _)| bytes)
 }

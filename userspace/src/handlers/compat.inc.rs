@@ -187,26 +187,145 @@ pub fn cwd_init() {
 #[doc(hidden)]
 pub fn __test_cwd_reset() {
     task_map_init(&CWD_TABLE);
+    task_map_init(&FS_KEY_TABLE);
+    *FS_USERS.lock() = None;
 }
 
-/// fork(2) inheritance: copy `parent`'s cwd to `child`. No-op
-/// if the parent has no entry (child inherits the default `/`).
-pub fn cwd_fork(parent: u64, child: u64) {
-    task_map_fork(&CWD_TABLE, parent, child);
+// ── fs_struct sharing (CLONE_FS) ────────────────────────────────────
+//
+// Linux keeps a task's root and cwd in `struct fs_struct`, which
+// `copy_fs` SHARES under CLONE_FS (`fs->users++`) and copies otherwise.
+// Every pthread shares it, and Chromium's sandbox depends on it:
+// `ChrootToSafeEmptyDir` has a CLONE_FS|CLONE_VFORK child chroot into
+// `/proc/self/fdinfo/` so the PARENT's root moves, then CHECKs that
+// "/proc" no longer resolves.
+//
+// `CWD_TABLE` and `ROOT_DIR_TABLE` are keyed by an fs key rather than by
+// task. A task's key is its own id until it shares another task's
+// fs_struct (CLONE_FS) or re-keys a private copy (unshare). Ids allocated
+// for re-keyed copies live above every scheduler task id.
+//
+// LINUX-GAP: `fs->umask` is part of the same struct but `UMASK_TABLE` is
+// still per task.
+
+/// Task → fs key, for tasks whose key is not their own id.
+static FS_KEY_TABLE: TaskMapTable<u64> = [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
+
+/// fs key → `fs->users`, recorded only above one: an absent key has exactly
+/// one user. Changes only at clone, unshare and exit, so a single lock is
+/// enough and keeps share/release counts consistent with each other.
+static FS_USERS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Next key for a re-keyed private fs_struct (`unshare(CLONE_FS)` of a
+/// shared one). Disjoint from scheduler task ids, which never reach 2^62.
+static FS_KEY_NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1 << 62);
+
+/// The fs_struct key `task` resolves its root and cwd through.
+#[inline]
+fn fs_key(task: u64) -> u64 {
+    task_map_get(&FS_KEY_TABLE, task).unwrap_or(task)
+}
+
+fn fs_users(users: &BTreeMap<u64, u64>, key: u64) -> u64 {
+    users.get(&key).copied().unwrap_or(1)
+}
+
+/// Copy the root and cwd behind `from` into the fs_struct keyed `to`.
+fn fs_copy_entries(from: u64, to: u64) {
+    task_map_fork(&CWD_TABLE, from, to);
+    if let Some(root) = root_dir_key_prefix(from) {
+        set_root_dir_key(to, root);
+    }
+}
+
+/// Drop the root and cwd of an fs_struct nobody uses any more.
+fn fs_drop_entries(key: u64) {
+    task_map_remove(&CWD_TABLE, key);
+    remove_root_dir_key(key);
+}
+
+/// `copy_fs`: under CLONE_FS the child shares the parent's fs_struct;
+/// otherwise it gets a copy of the parent's root and cwd.
+pub fn fs_fork(parent: u64, child: u64, share: bool) {
+    let key = fs_key(parent);
+    if share {
+        let mut guard = FS_USERS.lock();
+        let users = guard.get_or_insert_with(BTreeMap::new);
+        let n = fs_users(users, key);
+        users.insert(key, n + 1);
+        task_map_set(&FS_KEY_TABLE, child, key);
+    } else {
+        fs_copy_entries(key, child);
+    }
+}
+
+/// `unshare_fs`: give `task` a private copy of a shared fs_struct. A task
+/// that is already the only user keeps the one it has.
+pub(crate) fn fs_unshare(task: u64) {
+    let key = fs_key(task);
+    let mut guard = FS_USERS.lock();
+    let users = guard.get_or_insert_with(BTreeMap::new);
+    let n = fs_users(users, key);
+    if n <= 1 {
+        return;
+    }
+    let fresh = FS_KEY_NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    fs_copy_entries(key, fresh);
+    task_map_set(&FS_KEY_TABLE, task, fresh);
+    if n == 2 {
+        users.remove(&key);
+    } else {
+        users.insert(key, n - 1);
+    }
+}
+
+/// Task exit: drop `task`'s use of its fs_struct, and its root/cwd with the
+/// last user (`exit_fs` → `free_fs_struct`).
+fn fs_release(task: u64) {
+    let key = fs_key(task);
+    task_map_remove(&FS_KEY_TABLE, task);
+    let mut guard = FS_USERS.lock();
+    let users = guard.get_or_insert_with(BTreeMap::new);
+    match fs_users(users, key) {
+        0 | 1 => {
+            users.remove(&key);
+            drop(guard);
+            fs_drop_entries(key);
+        }
+        2 => {
+            users.remove(&key);
+        }
+        n => {
+            users.insert(key, n - 1);
+        }
+    }
+}
+
+/// Number of tasks sharing `task`'s fs_struct (`fs->users`).
+#[doc(hidden)]
+pub fn __test_fs_users(task: u64) -> u64 {
+    let key = fs_key(task);
+    let mut guard = FS_USERS.lock();
+    fs_users(guard.get_or_insert_with(BTreeMap::new), key)
+}
+
+/// Kernel-test teardown for a task created by a fs_struct test.
+#[doc(hidden)]
+pub fn __test_fs_release(task: u64) {
+    fs_release(task);
 }
 
 /// Diagnostic: peek the recorded cwd for `task`. Returns the
 /// default `"/"` if `task` has never called Chdir.
 pub fn cwd_of(task: u64) -> alloc::string::String {
-    task_map_get(&CWD_TABLE, task).unwrap_or_else(|| alloc::string::String::from("/"))
+    task_map_get(&CWD_TABLE, fs_key(task)).unwrap_or_else(|| alloc::string::String::from("/"))
 }
 
 /// Set `task`'s cwd (USER-view, chroot-relative — the same frame chdir stores).
-/// Used by `sys_pivot_root` to recompute the cwd in the new root's frame after
-/// the root swap, so a following relative resolution doesn't double-apply the
-/// new chroot prefix.
+/// Every task sharing its fs_struct sees the change.
 pub(crate) fn set_cwd(task: u64, path: &str) {
-    task_map_set(&CWD_TABLE, task, alloc::string::String::from(path));
+    task_map_set(&CWD_TABLE, fs_key(task), alloc::string::String::from(path));
 }
 
 /// Collapse `.`/`..`/empty segments into a clean absolute path.
@@ -249,6 +368,9 @@ fn is_normalized_abs(path: &str) -> bool {
 /// an un-chrooted task is returned in place, avoiding the normalizer's
 /// component vector and two replacement `String` allocations.
 fn resolve_cwd_path_owned(task: u64, path: alloc::string::String) -> alloc::string::String {
+    if let Some(host) = path.strip_prefix(HOST_ANCHORED) {
+        return normalize_abs(host);
+    }
     let normalized = if is_normalized_abs(&path) {
         path
     } else {
@@ -343,6 +465,9 @@ fn chroot_path_matches(task: u64, path: &str, visible: &str, descendants: bool) 
 /// into a normalized absolute path. Relative paths are joined onto the
 /// task's current working directory; `.`/`..` are collapsed.
 pub(crate) fn resolve_cwd_path(task: u64, path: &str) -> alloc::string::String {
+    if let Some(host) = path.strip_prefix(HOST_ANCHORED) {
+        return normalize_abs(host);
+    }
     let normalized = resolve_cwd_path_user(task, path);
     // Re-root under the task's chroot (if any) so a chrooted process —
     // e.g. a container — resolves paths against the chrooted rootfs, not
@@ -1163,9 +1288,55 @@ pub(crate) fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc:
     if !is_directory {
         return Err(-ENOTDIR); // -ENOTDIR
     }
+    // A walk from a directory fd starts at that directory, whatever the
+    // caller's root is now (`path_init` takes `f.file->f_path`). The fd path
+    // is recorded host-absolute; inside the current root it is expressed in
+    // the caller's view as before. Outside it — an fd opened before a later
+    // chroot, which is how Chromium's sandbox keeps `/proc` after chrooting
+    // into an empty directory — no view path names it, so the joined host
+    // path is marked to bypass re-rooting.
+    if let Some(host) = crate::mqueue::fd_path(task, dirfd as u32) {
+        if let Some(root) = root_dir_prefix(task).filter(|root| root != "/") {
+            if !path_at_or_under(&host, &root) {
+                return Ok(alloc::format!(
+                    "{}{}/{}",
+                    HOST_ANCHORED,
+                    host.trim_end_matches('/'),
+                    raw
+                ));
+            }
+        }
+    }
     let base = fd_path_for_task(task, dirfd as u32).ok_or(-EBADF)?;
     Ok(alloc::format!("{}/{}", base.trim_end_matches('/'), raw))
 }
+
+/// For a path [`resolve_at_path`] anchored outside the caller's root: its
+/// spelling as a `/proc/...` path when it lies in a procfs mount (`self/fd/5`
+/// in a procfs mounted at `/mnt/proc` reads as `/proc/self/fd/5`), so the proc
+/// magic-link parsers apply to it. `None` for any other path.
+pub(crate) fn anchored_procfs_view(path: &str) -> Option<alloc::string::String> {
+    let host = path.strip_prefix(HOST_ANCHORED)?;
+    current_resolve_absolute(host, |fs, _root, rel| {
+        (fs.name() == "proc").then(|| alloc::format!("/proc/{}", rel.trim_start_matches('/')))
+    })
+    .flatten()
+}
+
+/// Whether fd `n`'s file is reachable by path from `task`'s current root.
+/// A descriptor opened before a later chroot can name a file outside it.
+pub(crate) fn fd_file_within_root(task: u64, n: u32) -> bool {
+    let Some(root) = root_dir_prefix(task).filter(|root| root != "/") else {
+        return true;
+    };
+    crate::mqueue::fd_path(task, n).is_none_or(|host| path_at_or_under(&host, &root))
+}
+
+/// Marks a path [`resolve_at_path`] already anchored host-absolute, outside
+/// the caller's root: the user-path to host-path conversions
+/// ([`resolve_cwd_path`], [`apply_chroot`]) pass it through un-rooted. A
+/// leading NUL cannot come from userspace, whose pathnames are C strings.
+const HOST_ANCHORED: &str = "\0";
 
 /// Stat an absolute path, handling both files and directories.
 /// Files come from the FileOps `stat()`; directories (mount roots and
@@ -2257,6 +2428,53 @@ fn do_execve_resolved(
         return;
     }
 
+    // The name exactly as the caller spelled it. `do_execveat_common` copies
+    // `bprm->filename` to the new stack as-is and points `AT_EXECFN` at that
+    // copy (`bprm->exec`), and `binfmt_script` hands the same string to the
+    // interpreter as its script argument — a relative `./prog` stays
+    // `./prog` in both, it is never rewritten to an absolute path.
+    let exec_name = path_owned.clone();
+
+    // `fs/exec.c::do_open_execat` opens the image with
+    // `do_file_open(fd, name, ...)`, and for execve that fd is AT_FDCWD: a
+    // relative name walks from `current->fs->pwd`, exactly as
+    // `openat(AT_FDCWD, ...)` does. This body used to hand a relative name
+    // straight to the absolute-path resolver, which has no cwd and looked it
+    // up beneath "/" instead — `cd /tmp; ./prog` was ENOENT ("required file
+    // not found") while `/tmp/prog` ran. Join it onto the cwd the same way
+    // the open path does (`resolve_cwd_path_user`; the chroot prefix is
+    // applied once, at lookup), so every later step — the magic-link checks,
+    // the noexec test, the lookup, `/proc/<pid>/exe` — sees one absolute
+    // name in the caller's view. A HOST_ANCHORED name from execveat is
+    // already absolute on the host side and an `image_override` has no name
+    // to resolve.
+    //
+    // The walk is literal first (`link_path_walk`): `prog/../prog` is
+    // ENOTDIR and `missing/../prog` ENOENT, though both normalise to a name
+    // that exists. Linux opens the file before it counts argv, so these
+    // errnos come ahead of an argv/envp EFAULT.
+    if image_override.is_none() && !path_owned.starts_with(HOST_ANCHORED) {
+        let task = current_task_id();
+        if let Err(errno) = literal_walk_check(task, &path_owned) {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+        if !path_owned.starts_with('/') {
+            path_owned = resolve_cwd_path_user(task, &path_owned);
+        }
+    }
+
+    // `/proc/<pid>/exe` is a magic link to the process's executable
+    // (`proc_exe_link` -> `mm->exe_file`); following it does not re-walk link
+    // text. Chromium launches every child (network service, renderers, GPU)
+    // with `execvp("/proc/self/exe", ...)`, so exec'ing the procfs node itself
+    // failed every launch.
+    if image_override.is_none() {
+        if let Some(exe) = proc_exe_magic_target(current_task_id(), &path_owned) {
+            path_owned = exe;
+        }
+    }
+
     // fexecve via the /proc/self/fd/N (or /proc/<pid>/fd/N) magic symlink:
     // glibc's fexecve and systemd 257's sd-executor spawn open the binary
     // O_PATH then execve("/proc/self/fd/<N>"). Resolve N to the fd's real
@@ -2290,7 +2508,7 @@ fn do_execve_resolved(
     // mount to test there.
     if image_override.is_none()
         && narf_filesystem::any_restricted_mounts()
-        && current_mount_flags_at(path) & narf_filesystem::mnt_flags::NOEXEC != 0
+        && current_mount_flags_at(&apply_chroot(path)) & narf_filesystem::mnt_flags::NOEXEC != 0
     {
         ctx.set_return(errno_ret(EACCES)); // -EACCES
         return;
@@ -2456,6 +2674,11 @@ fn do_execve_resolved(
     // Follow nested shebangs up to a small depth so a script interpreting a
     // script still terminates. Without this, every `#!`-script execve EINVALs.
     let mut cur_path = alloc::string::String::from(path);
+    // `bprm->interp`: the name of the image being loaded as the caller (or
+    // the `#!` line) spelled it. It is what a script interpreter receives as
+    // its script argument and what AT_EXECFN carries; `cur_path` is its
+    // resolved form, used for the lookups and `/proc/<pid>/exe`.
+    let mut cur_name = exec_name;
     let mut cur_argv: alloc::vec::Vec<alloc::string::String> = argv_strs.clone();
     let exec_src;
     // The resolved binary, when the image came from a filesystem path. Handing
@@ -2513,9 +2736,12 @@ fn do_execve_resolved(
                 if let Some(a) = optarg {
                     new_argv.push(a.into());
                 }
-                new_argv.push(cur_path.clone());
+                new_argv.push(cur_name.clone());
                 new_argv.extend(cur_argv.iter().skip(1).cloned());
-                cur_path = interp.into();
+                // `open_exec(i_name)` walks from AT_FDCWD too, so a relative
+                // interpreter (`#!./interp`) resolves against the cwd.
+                cur_name = interp.into();
+                cur_path = resolve_cwd_path_user(current_task_id(), interp);
                 cur_argv = new_argv;
                 continue;
             }
@@ -2572,11 +2798,12 @@ fn do_execve_resolved(
             None,
             crate::ProcessId(task_to_pid_raw(task).unwrap_or(task)),
             exec_file.as_ref(),
-            // AT_EXECFN — the path this exec resolved, which is what glibc
-            // expands `$ORIGIN` against. `cur_path` and not `argv_refs[0]`:
-            // after a `#!` line it names the interpreter actually being mapped,
-            // and a caller's argv[0] may be anything at all.
-            Some(cur_path.as_str()),
+            // AT_EXECFN — the name of the image being mapped as it was
+            // spelled (relative stays relative, as `bprm->exec` does), and
+            // not `argv_refs[0]`, which a caller may set to anything at all.
+            // After a `#!` line it names the interpreter actually being
+            // mapped.
+            Some(cur_name.as_str()),
         )
     } {
         Ok(p) => p,
@@ -2652,6 +2879,7 @@ fn do_execve_resolved(
     // /proc/[pid]/exe: `cur_path` survived the shebang loop, so it names
     // the binary actually being mapped (the interpreter for scripts).
     set_proc_exe(task, &cur_path);
+    set_proc_image_mappings(task, &new_proc.loaded_mappings, &cur_path);
 
     // Tell the tracer the exec happened — the exec report AND the execve
     // syscall-exit stop, in whichever order this tracer's options ask for.
@@ -2700,6 +2928,7 @@ fn do_execve_resolved(
         drop(exec_src);
         drop(cur_argv);
         drop(cur_path);
+        drop(cur_name);
         drop(argv_strs);
         drop(envp_strs);
         drop(path_owned);
@@ -2840,6 +3069,7 @@ fn do_execve_resolved(
         drop(exec_src);
         drop(cur_argv);
         drop(cur_path);
+        drop(cur_name);
         drop(argv_strs);
         drop(envp_strs);
         drop(path_owned);
@@ -2861,6 +3091,26 @@ fn do_execve_resolved(
     // for the same reason as the no-user-ctx arm above: 0 from execve is
     // "you are now the new program".
     ctx.set_return(errno_ret(ENOSYS)); // -ENOSYS
+}
+
+/// The executable `/proc/self/exe`, `/proc/thread-self/exe` or
+/// `/proc/<pid>/exe` names for a caller `task`, as the caller-view path exec
+/// recorded. `None` for any other path, or a task that has not exec'd.
+pub(crate) fn proc_exe_magic_target(task: u64, path: &str) -> Option<alloc::string::String> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (who, tail) = rest.split_once('/')?;
+    if tail != "exe" {
+        return None;
+    }
+    let owner = match who {
+        "self" | "thread-self" => task,
+        pid => proc_pid_to_tid(accept_pid_from(task, pid.parse::<u64>().ok()?)?),
+    };
+    let g = PROC_EXE.lock();
+    let map = g.as_ref()?;
+    map.get(&owner)
+        .or_else(|| map.get(&proc_pid_to_tid(task_to_pid_raw(owner)?)))
+        .cloned()
 }
 
 /// Parse `/proc/self/fd/<N>` or `/proc/<pid>/fd/<N>` → the fd number `N`.
@@ -4804,29 +5054,42 @@ fn root_dir_prefix(task: u64) -> Option<alloc::string::String> {
     if ROOT_DIR_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
         return None;
     }
-    task_map_get(&ROOT_DIR_TABLE, task)
+    task_map_get(&ROOT_DIR_TABLE, fs_key(task))
 }
 
+/// Root of the fs_struct keyed `key` (see [`fs_key`]).
+fn root_dir_key_prefix(key: u64) -> Option<alloc::string::String> {
+    if ROOT_DIR_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return None;
+    }
+    task_map_get(&ROOT_DIR_TABLE, key)
+}
+
+/// Set `task`'s root. Every task sharing its fs_struct sees the change.
 fn set_root_dir(task: u64, root: alloc::string::String) {
-    let mut shard = ROOT_DIR_TABLE[task_map_shard(task)].map.lock();
+    set_root_dir_key(fs_key(task), root);
+}
+
+fn set_root_dir_key(key: u64, root: alloc::string::String) {
+    let mut shard = ROOT_DIR_TABLE[task_map_shard(key)].map.lock();
     let roots = shard.get_or_insert_with(BTreeMap::new);
-    if !roots.contains_key(&task) {
+    if !roots.contains_key(&key) {
         // Publish the non-empty hint before the row. A racing reader that sees
         // it blocks on this shard lock until the insertion completes.
         ROOT_DIR_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
     }
-    roots.insert(task, root);
+    roots.insert(key, root);
 }
 
-fn remove_root_dir(task: u64) {
+fn remove_root_dir_key(key: u64) {
     if ROOT_DIR_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
         return;
     }
-    let removed = ROOT_DIR_TABLE[task_map_shard(task)]
+    let removed = ROOT_DIR_TABLE[task_map_shard(key)]
         .map
         .lock()
         .as_mut()
-        .and_then(|roots| roots.remove(&task));
+        .and_then(|roots| roots.remove(&key));
     if removed.is_some() {
         ROOT_DIR_COUNT.fetch_sub(1, core::sync::atomic::Ordering::Release);
     }
@@ -4855,13 +5118,6 @@ pub fn install_root_dir(task: u64, root: &str) -> bool {
 }
 
 
-/// fork(2) inheritance — child inherits parent's chroot.
-pub fn root_dir_fork(parent: u64, child: u64) {
-    if let Some(root) = root_dir_prefix(parent) {
-        set_root_dir(child, root);
-    }
-}
-
 /// Test hook — drop every per-task entry.
 #[doc(hidden)]
 pub fn __test_root_dir_reset() {
@@ -4874,6 +5130,9 @@ pub fn __test_root_dir_reset() {
 /// through unchanged. Joining strips a leading `/` from `path` so
 /// the result has no double-slash.
 pub(crate) fn apply_chroot(path: &str) -> alloc::string::String {
+    if let Some(host) = path.strip_prefix(HOST_ANCHORED) {
+        return alloc::string::String::from(host);
+    }
     let task = current_task_id();
     let prefix = match root_dir_prefix(task) {
         Some(p) => p,
@@ -6833,9 +7092,46 @@ pub(crate) fn next_deliverable(task: u64, allowed: u64) -> Option<(u32, u64)> {
 /// a #GP (stress-ng then reports "unexpected SIGSEGV" instead of the
 /// OOM kill). Dying AT the fault is Linux's `VM_FAULT_SIGKILL` shape.
 pub fn current_task_fatal_signal_pending() -> bool {
-    // Bit N == signal N in the pending mask (see SIGNAL_PENDING).
-    signal_pending_of(current_task_id()) & (1 << 9) != 0
+    task_fatal_signal_pending(current_task_id())
 }
+
+/// [`current_task_fatal_signal_pending`] for an explicit task. The pending
+/// mask keeps signal N at bit N-1 (`sig_bit`), so SIGKILL is bit 8; testing
+/// bit 9 asked about SIGUSR1 instead — every task with a SIGUSR1 queued looked
+/// condemned (a page fault ran signal delivery before servicing the fault,
+/// and a ptrace PTRACE_EVENT_EXIT stop was skipped), while a task the OOM
+/// killer had actually SIGKILLed kept faulting in fresh pages.
+pub(crate) fn task_fatal_signal_pending(task: u64) -> bool {
+    signal_pending_of(task) & sig_bit(9) != 0
+}
+
+#[cfg(feature = "kernel-test")]
+fn smoke_fatal_signal_pending_is_sigkill() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    const TASK: u64 = 0x5f_a7a1;
+    // The registries are only live once `signal_init` ran; in the kernel-test
+    // image this case can run before any ABI fixture installed them, and an
+    // uninstalled table drops every raise.
+    __test_signal_reset();
+    raise_signal_pending(TASK, 10); // SIGUSR1
+    if signal_pending_of(TASK) & sig_bit(10) == 0 {
+        __test_signal_reset();
+        return TestResult::Fail("the SIGUSR1 raise did not land");
+    }
+    if task_fatal_signal_pending(TASK) {
+        __test_signal_reset();
+        return TestResult::Fail("a pending SIGUSR1 read as a fatal signal");
+    }
+    raise_signal_pending(TASK, 9); // SIGKILL
+    let fatal = task_fatal_signal_pending(TASK);
+    __test_signal_reset();
+    if !fatal {
+        return TestResult::Fail("a pending SIGKILL did not read as fatal");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!("userspace", smoke_fatal_signal_pending_is_sigkill);
 
 /// Test hook for the exact empty/non-empty task count that gates syscall-return
 /// signal delivery.
@@ -6940,7 +7236,113 @@ static PROC_EXE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, alloc::string::String>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
-fn proc_identity_fork(parent_task: u64, child_task: u64) {
+/// File-backed image ranges published by a successful exec. The address-space
+/// region table owns permissions and lifetime; this small side table preserves
+/// the loader's file identity and page offset for `/proc/<pid>/maps`.
+///
+/// `AddressSpace` deliberately does not retain VFS paths, so keeping this
+/// exec-scoped metadata here avoids making the generic VM depend on VFS names.
+/// Dynamic mappings created by a later mmap still have unknown backing until
+/// that syscall gains equivalent provenance.
+#[derive(Clone, Debug)]
+struct ProcImageMapping {
+    start: u64,
+    end: u64,
+    file_offset: u64,
+    device: u64,
+    inode: u64,
+    pathname: alloc::string::String,
+}
+
+static PROC_IMAGE_MAPPINGS: TaskMapTable<alloc::vec::Vec<ProcImageMapping>> =
+    [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
+
+fn proc_absolute_path(task: u64, path: &str) -> alloc::string::String {
+    if path.starts_with('/') {
+        alloc::string::String::from(path)
+    } else {
+        let mut absolute = cwd_of(task);
+        if !absolute.ends_with('/') {
+            absolute.push('/');
+        }
+        absolute.push_str(path);
+        absolute
+    }
+}
+
+fn set_proc_image_mappings(
+    task: u64,
+    mappings: &[crate::process::LoadedMapping],
+    main_program_path: &str,
+) {
+    let main_program_path = proc_absolute_path(task, main_program_path);
+    let mut image_mappings = alloc::vec::Vec::new();
+    if image_mappings.try_reserve(mappings.len()).is_err() {
+        // `/proc/maps` provenance is diagnostic metadata. A failure to retain
+        // it must not turn an otherwise successful exec into a kernel panic.
+        task_map_remove(&PROC_IMAGE_MAPPINGS, task);
+        return;
+    }
+    for mapping in mappings {
+        if mapping.len == 0 {
+            continue;
+        }
+        let Some(end) = mapping.addr.checked_add(mapping.len) else {
+            continue;
+        };
+        image_mappings.push(ProcImageMapping {
+            start: mapping.addr,
+            end,
+            file_offset: mapping.pgoff,
+            device: mapping.device,
+            inode: mapping.inode,
+            pathname: mapping
+                .filename
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| main_program_path.clone()),
+        });
+    }
+    task_map_set(&PROC_IMAGE_MAPPINGS, task, image_mappings);
+}
+
+/// Kernel-test seam for `/proc/maps` loader-provenance coverage.
+#[doc(hidden)]
+pub fn __test_set_proc_image_mappings(
+    task: u64,
+    mappings: &[crate::process::LoadedMapping],
+    main_program_path: &str,
+) {
+    set_proc_image_mappings(task, mappings, main_program_path);
+}
+
+/// Kernel-test cleanup for `/proc/maps` loader-provenance coverage.
+#[doc(hidden)]
+pub fn __test_clear_proc_image_mappings(task: u64) {
+    task_map_remove(&PROC_IMAGE_MAPPINGS, task);
+}
+
+fn proc_image_mapping_for_range(
+    mappings: &[ProcImageMapping],
+    start: u64,
+    end: u64,
+) -> Option<(u64, u64, u64, alloc::string::String)> {
+    mappings
+        .iter()
+        .find(|mapping| mapping.start <= start && end <= mapping.end)
+        .map(|mapping| {
+            (
+                mapping
+                    .file_offset
+                    .saturating_add(start.saturating_sub(mapping.start)),
+                mapping.device,
+                mapping.inode,
+                mapping.pathname.clone(),
+            )
+        })
+}
+
+pub(crate) fn proc_identity_fork(parent_task: u64, child_task: u64) {
     let inherited_comm = {
         let g = PROC_COMM.lock();
         g.as_ref().and_then(|m| m.get(&parent_task).cloned())
@@ -6961,22 +7363,28 @@ fn proc_identity_fork(parent_task: u64, child_task: u64) {
             .get_or_insert_with(alloc::collections::BTreeMap::new)
             .insert(child_task, exe);
     }
+    task_map_fork(&PROC_IMAGE_MAPPINGS, parent_task, child_task);
+    // argv, environ and the auxiliary vector live in the mm on Linux
+    // (`mm->arg_start..env_end`, `mm->saved_auxv`), which `dup_mm` copies: a
+    // forked child that has not exec'd reports its parent's
+    // /proc/self/{cmdline,environ,auxv}. Chromium's zygote-forked renderers
+    // never exec, and crashpad reads their auxv for AT_PHDR / AT_BASE.
+    for table in [&PROC_ARGV, &PROC_ENVIRON, &PROC_AUXV] {
+        let inherited = table.lock().as_ref().and_then(|m| m.get(&parent_task).cloned());
+        if let Some(bytes) = inherited {
+            table
+                .lock()
+                .get_or_insert_with(alloc::collections::BTreeMap::new)
+                .insert(child_task, bytes);
+        }
+    }
 }
 
 /// Record the exec'd binary path for `/proc/[pid]/exe`. A relative
 /// exec path is resolved against the caller's cwd so the link is
 /// always absolute (Linux renders a resolved path here, never `./x`).
 pub fn set_proc_exe(pid: u64, path: &str) {
-    let abs = if path.starts_with('/') {
-        alloc::string::String::from(path)
-    } else {
-        let mut s = cwd_of(pid);
-        if !s.ends_with('/') {
-            s.push('/');
-        }
-        s.push_str(path);
-        s
-    };
+    let abs = proc_absolute_path(pid, path);
     let mut g = PROC_EXE.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
     map.insert(pid, abs);
@@ -7038,7 +7446,7 @@ fn d_path_from_root(target: &str, reader_root: &str) -> alloc::string::String {
 /// PipeWire client in the container hangs at connect.
 pub fn proc_root_path(pid: u64) -> Option<alloc::string::String> {
     let tid = proc_pid_to_tid(pid);
-    let target = task_map_get(&ROOT_DIR_TABLE, tid)
+    let target = task_map_get(&ROOT_DIR_TABLE, fs_key(tid))
         .unwrap_or_else(|| alloc::string::String::from("/"));
     let reader =
         root_dir_prefix(current_task_id()).unwrap_or_else(|| alloc::string::String::from("/"));
@@ -7114,6 +7522,33 @@ pub fn proc_thread_comm(tid: u64) -> Option<alloc::string::String> {
     proc_comm_of_task(task_of_visible_tid(tid)?)
 }
 
+/// The `task_state_array` letter of a live (not zombie) task, by Linux's
+/// precedence (`task_state_index`): 't' ptrace-stopped, 'T' job-control
+/// stopped, 'S' asleep in a syscall, 'R' running or runnable — including the
+/// task reading its own state, which is on a CPU doing exactly that.
+///
+/// 'S' is TASK_INTERRUPTIBLE: a task parked inside a syscall — poll, futex,
+/// read, wait4, nanosleep — is woken by a signal on NARF exactly as on Linux,
+/// so it is interruptible. Reporting 'R' for every one of them made `ps`,
+/// `top` and every process monitor show an idle desktop as hundreds of
+/// running tasks.
+fn live_task_state(task: u64) -> char {
+    if crate::ptrace::is_task_ptrace_stopped(task) {
+        't'
+    } else if is_task_stopped(task) {
+        'T'
+    } else if task != current_task_id()
+        && crate::user_task::with_user_task_ctx(task, |uc| {
+            uc.parked_in_syscall.load(Ordering::Acquire)
+        })
+        .unwrap_or(false)
+    {
+        'S'
+    } else {
+        'R'
+    }
+}
+
 /// `/proc/<pid>/task/<tid>/stat` hook — the thread's own name and CPU time.
 /// USER_HZ = 100, so one tick is 10 ms, matching `proc_task_info`.
 pub fn proc_thread_stat(tid: u64) -> Option<narf_filesystem::procfs::ThreadStat> {
@@ -7125,13 +7560,8 @@ pub fn proc_thread_stat(tid: u64) -> Option<narf_filesystem::procfs::ThreadStat>
         stime_ticks: kern_time_ns_of(task) / NS_PER_TICK,
         // Same precedence as the process-level report, minus 'Z': a zombie
         // thread has no row in `/proc/<pid>/task` to read.
-        state: if crate::ptrace::is_task_ptrace_stopped(task) {
-            't'
-        } else if is_task_stopped(task) {
-            'T'
-        } else {
-            'R'
-        },
+        state: live_task_state(task),
+        tgid: task_to_pid_raw(task),
     })
 }
 
@@ -7476,6 +7906,14 @@ pub fn proc_task_info(
     // live tid. systemd's child tracking also depends on the zombie arm:
     // it peeks waitid(..., WNOWAIT) and then reads /proc/<pid>/stat's
     // PPid BEFORE the real reap.
+    // The raw task-id fallback is for tasks with no process binding at all
+    // (boot init, test harnesses). A task that belongs to a DIFFERENT
+    // process is not process `pid`: when pids and task ids run through the
+    // same small numbers, a stale or never-allocated `/proc/<n>` otherwise
+    // resolved to whatever unrelated task happened to own task id `n`.
+    if mapped_tid.is_none() && task_to_pid_raw(tid).is_some_and(|owner| owner != pid) {
+        return None;
+    }
     let task = crate::task::task_get(tid);
     let zombie = task
         .as_ref()
@@ -7553,6 +7991,11 @@ pub fn proc_task_info(
         .as_ref()
         .map(|as_arc| as_arc.memory_stats())
         .unwrap_or_default();
+    // Loader image metadata is deliberately stored separately from the VM
+    // regions (the latter has no VFS-path dependency). Snapshot it once so
+    // maps rendering neither locks on every VMA nor exposes a half-updated
+    // exec image.
+    let image_mappings = task_map_get(&PROC_IMAGE_MAPPINGS, tid).unwrap_or_default();
     let stack_bytes = as_arc
         .as_ref()
         .and_then(|as_arc| {
@@ -7569,6 +8012,18 @@ pub fn proc_task_info(
     let mut vmas = alloc::vec::Vec::new();
     if query == TaskInfoQuery::Vmas {
         if let Some(as_arc) = as_arc {
+            // Per-mmap file identity, carried by the file-owner rows so it
+            // follows munmap splits, mremap and fork exactly as the mapping
+            // does. Consulted before the exec image table: an owner row is
+            // authoritative for its range, while the exec table is never
+            // retired by a later munmap.
+            let file_mappings = crate::mapped_file::file_provenance_snapshot(as_arc.identity());
+            // `d_path` renders relative to the READER's root
+            // (`current->fs->root`); a path outside it stays absolute.
+            // LINUX-GAP: `d_path` appends " (deleted)" once the dentry is
+            // unlinked; NARF keeps no dentry state here, so an unlinked
+            // mapped file still renders its original path.
+            let reader = current_task_id();
             let mut snapshot = as_arc.numa_regions_snapshot();
             // Fallible: this runs on the fatal-fault diagnostic path, where the
             // kernel heap may be exhausted. If the output can't be reserved, drop
@@ -7596,6 +8051,30 @@ pub fn proc_task_info(
                 } else {
                     ""
                 };
+                // `show_map_vma`: `pgoff = vm_pgoff << PAGE_SHIFT` of the VMA's
+                // own start, so a VMA split off an owner row (mprotect) reports
+                // the offset of its first byte.
+                let owned = file_mappings
+                    .iter()
+                    .find(|m| m.base <= base && base - m.base < m.len)
+                    .map(|m| {
+                        (
+                            m.file_offset.saturating_add(base - m.base),
+                            m.provenance.device,
+                            m.provenance.inode,
+                            m.provenance
+                                .pathname
+                                .as_deref()
+                                .map(|path| strip_chroot_prefix(reader, path)),
+                        )
+                    });
+                let (file_offset, device, inode, pathname) = owned.unwrap_or_else(|| {
+                    proc_image_mapping_for_range(&image_mappings, base, end)
+                        .map(|(file_offset, device, inode, pathname)| {
+                            (file_offset, device, inode, Some(pathname))
+                        })
+                        .unwrap_or((0, 0, 0, None))
+                });
                 vmas.push(ProcVma {
                     start: base,
                     end,
@@ -7605,6 +8084,10 @@ pub fn proc_task_info(
                     // From the UN-stripped perms — prot_only() drops the
                     // SHARED bit. Feeds maps' s/p column + statm's shared.
                     shared: r.perms.contains(RegionPerms::SHARED),
+                    file_offset,
+                    device,
+                    inode,
+                    pathname,
                     label,
                     numa_policy: policy.mode,
                     numa_nodemask: effective_nodemask,
@@ -7661,15 +8144,7 @@ pub fn proc_task_info(
         // Reporting 'R' for a stopped task made `ps` and every monitor show a
         // ptrace-stopped or job-control-stopped process as running, and left a
         // tracer with no way to confirm from /proc that its tracee had stopped.
-        state: if zombie {
-            'Z'
-        } else if crate::ptrace::is_task_ptrace_stopped(tid) {
-            't'
-        } else if is_task_stopped(tid) {
-            'T'
-        } else {
-            'R'
-        },
+        state: if zombie { 'Z' } else { live_task_state(tid) },
         brk_top,
         stack_top,
         cmdline,
@@ -7734,6 +8209,8 @@ pub fn proc_task_info(
             ]
         },
         no_new_privs: read_prctl(tid).no_new_privs,
+        seccomp_mode: crate::seccomp::mode_of(tid),
+        seccomp_filters: crate::seccomp::filter_count_of(tid) as u32,
         // `get_task_tracer` is pid-keyed and returns the tracer's pid, so
         // it goes back out through the reader's namespace like every other
         // pid in this file. A tracer the reader cannot see reports 0 —
@@ -7788,11 +8265,17 @@ fn sig_disposition_masks(task: u64) -> (u64, u64) {
     let table = sighand.lock();
     let mut ignored = 0u64;
     let mut caught = 0u64;
-    for (index, slot) in table.iter().enumerate() {
+    // The table is indexed BY signal number (slot 0 unused), exactly as
+    // `sigaction_lookup_full` reads it; bit N-1 of each mask is signal N
+    // (`render_sigset_t`). Reading slot `index` as signal `index + 1` moved
+    // every disposition up one bit — a SIGHUP handler read as SIGINT, so
+    // systemd refused Type=notify-reload services ("lacks handler for reload
+    // signal") — and pushed signal 64 off the end of the mask.
+    for (signum, slot) in table.iter().enumerate() {
         let Some(action) = slot else { continue };
-        let bit = match u32::try_from(index + 1) {
-            Ok(signum) => sig_bit(signum),
-            Err(_) => continue,
+        let bit = match u32::try_from(signum) {
+            Ok(signum @ 1..=64) => sig_bit(signum),
+            _ => continue,
         };
         match action.handler {
             SIG_IGN => ignored |= bit,
@@ -7875,8 +8358,9 @@ pub fn proc_auxv_of(pid: u64) -> alloc::vec::Vec<u8> {
         .unwrap_or_else(|| alloc::vec![0u8; 16])
 }
 
-/// Record NUL-separated environ for a task at execve time.
-pub fn set_proc_environ(pid: u64, envp: &[&str]) {
+/// Record NUL-separated environ for a scheduler task at execve time. Procfs
+/// readers translate their visible process ID to this key before lookup.
+pub fn set_proc_environ(task: u64, envp: &[&str]) {
     let mut packed = alloc::vec::Vec::new();
     for s in envp {
         packed.extend_from_slice(s.as_bytes());
@@ -7884,12 +8368,13 @@ pub fn set_proc_environ(pid: u64, envp: &[&str]) {
     }
     let mut g = PROC_ENVIRON.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(pid, packed);
+    map.insert(task, packed);
 }
 
-/// Record packed auxv (key, value) pairs for a task at execve time.
+/// Record packed auxv (key, value) pairs for a scheduler task at execve time.
+/// Procfs readers translate their visible process ID to this key before lookup;
 /// AT_NULL is appended automatically.
-pub fn set_proc_auxv_pairs(pid: u64, aux: &[(u64, u64)]) {
+pub fn set_proc_auxv_pairs(task: u64, aux: &[(u64, u64)]) {
     let mut packed: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity((aux.len() + 1) * 16);
     for (key, val) in aux {
         packed.extend_from_slice(&key.to_le_bytes());
@@ -7899,7 +8384,7 @@ pub fn set_proc_auxv_pairs(pid: u64, aux: &[(u64, u64)]) {
     packed.extend_from_slice(&0u64.to_le_bytes());
     let mut g = PROC_AUXV.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(pid, packed);
+    map.insert(task, packed);
 }
 
 /// Return the backing description for fd `n` of `pid`.  Shaped like
@@ -7998,7 +8483,7 @@ pub(crate) fn fd_path_for_task(task: u64, n: u32) -> Option<alloc::string::Strin
 /// tasks. Used so `/proc/<pid>/fd/<n>` and similar surfaces report paths a
 /// chrooted process can actually re-open.
 fn strip_chroot_prefix(task: u64, path: &str) -> alloc::string::String {
-    if let Some(prefix) = task_map_get(&ROOT_DIR_TABLE, task) {
+    if let Some(prefix) = task_map_get(&ROOT_DIR_TABLE, fs_key(task)) {
         if prefix != "/" {
             if let Some(rest) = path.strip_prefix(prefix.as_str()) {
                 if rest.is_empty() {
@@ -8159,7 +8644,7 @@ fn raise_signal_pending_inner(
     }) else {
         return;
     };
-    signal_raise_notify(task, was_empty);
+    signal_raise_notify(task, signum, was_empty);
     // On SMP the parent consuming CLD_CONTINUED and the resumed child can run
     // concurrently, so prefer the child on the sender's CPU when it is local.
     // On UP this would overwrite push_stopcont_report's waiter-first hint and
@@ -8330,7 +8815,7 @@ fn set_pending_signal_bit(slot: &mut u64, signum: u32) {
 /// path ([`sigqueue_store_and_raise_bit`]) can set the pending bit UNDER the
 /// sigqueue bucket lock and then run this notify OUTSIDE that lock (wakes and
 /// generation shards must not nest beneath it).
-fn signal_raise_notify(task: u64, was_empty: bool) {
+fn signal_raise_notify(task: u64, signum: u32, was_empty: bool) {
     if was_empty {
         signal_bits_update_or_init(&SIGNAL_READABLE_GEN, task, |generation| {
             *generation = generation.wrapping_add(1);
@@ -8343,7 +8828,12 @@ fn signal_raise_notify(task: u64, was_empty: bool) {
     // queue on delivery) so an EPOLLET consumer re-fires on a drain→re-raise
     // refill; the fd's poll_readiness still gates delivery on its mask.
     crate::io_mux::wake_signalfds(task);
-    wake_signal(task);
+    // `complete_signal` on a thread-directed send: only a thread that
+    // `wants_signal` gets `signal_wake_up`, which interrupts its sleep. One
+    // that blocks the signal just has it queued — the wake still fires (its
+    // park re-checks; a sigwait/signalfd may want it) but must not cut a
+    // timed sleep short.
+    signal_wake_up(task, wants_signal(task, signum));
     // `signal_wake_up` -> `kick_process`: a target running user code on
     // another CPU must pass through a kernel exit to take the signal now.
     narf_scheduler::kick_task(task);
@@ -8483,7 +8973,7 @@ pub(crate) fn raise_sigio_pending(
         if let Some((_depth, was_empty)) =
             sigqueue_store_and_raise_bit(task, SIGIO, 0x80, 0, 0)
         {
-            signal_raise_notify(task, was_empty);
+            signal_raise_notify(task, SIGIO, was_empty);
         }
         return;
     }
@@ -8503,7 +8993,7 @@ pub(crate) fn raise_sigio_pending(
         configured_signal,
         QueuedSiginfo::sigpoll(si_code, fd, poll_band),
     ) {
-        Some((_depth, was_empty)) => signal_raise_notify(task, was_empty),
+        Some((_depth, was_empty)) => signal_raise_notify(task, configured_signal, was_empty),
         None => {
             // Linux falls through to do_send_sig_info(SIGIO, SEND_SIG_PRIV)
             // when the configured realtime signal cannot be queued.
@@ -8511,7 +9001,7 @@ pub(crate) fn raise_sigio_pending(
             if let Some((_depth, was_empty)) =
                 sigqueue_store_and_raise_bit(task, SIGIO, 0x80, 0, 0)
             {
-                signal_raise_notify(task, was_empty);
+                signal_raise_notify(task, SIGIO, was_empty);
             }
         }
     }
@@ -8978,7 +9468,7 @@ fn sigqueue_deliver_imported(target: u64, sig: u32, info: ImportedSiginfo) -> Op
     let resumed_stopped_task = signal_stopcont_interaction(target, sig);
     let (depth, was_empty) =
         sigqueue_store_and_raise_bit(target, sig, info.code, info.value, info.pid)?;
-    signal_raise_notify(target, was_empty);
+    signal_raise_notify(target, sig, was_empty);
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if resumed_stopped_task
         && prefer_resumed_child_handoff(narf_scheduler::online_cpu_set().bits())
@@ -9279,7 +9769,7 @@ pub(crate) fn futex_key(namespace: u64, uaddr: u64) -> FutexKey {
 /// This exists to make one class of bug unrepresentable rather than merely
 /// tested-against. Every futex entry point used to validate its own
 /// address, and three of them independently grew a "null address is fine"
-/// shortcut — the classic FUTEX_WAIT arm, the shared `futex_wait_core`
+/// shortcut — the classic FUTEX_WAIT arm, the shared `futex_block`
 /// that the FUTEX2 path uses, and `futex_wake`'s zero-count arm. Each had
 /// its own justification, and fixing one left the others, because nothing
 /// connected them.
@@ -9717,7 +10207,44 @@ pub fn __test_futex_bump_counter(uaddr: u64) {
 /// loop otherwise re-parks every ~1ms (no early wake), so a contended pthread
 /// lock handoff cost ~1ms. Keyed by task id so a re-registering waiter
 /// overwrites its own slot (bounded) and `futex_drop_waiter` can remove it.
-type FutexWaiterSet = alloc::collections::BTreeMap<u64, FutexWaiter>;
+///
+/// The map key is `(task id, slot)`. Slot [`FUTEX_PARK_SLOT`] (0) is the one
+/// entry the park loop maintains for the re-execute parks (FUTEX_LOCK_PI and
+/// the legacy longjmp model); slots `1..` are the handler-driven waits of
+/// [`futex_block`], one per `futex_waitv` entry (`i + 1`), whose queue state
+/// a [`FutexQ`] tracks.
+type FutexWaiterSet = alloc::collections::BTreeMap<(u64, u32), FutexWaiter>;
+
+/// The waiter slot the park loop's re-execute futex park registers under.
+const FUTEX_PARK_SLOT: u32 = 0;
+
+/// Linux `struct futex_q` for one handler-driven wait (`futex_block`): where
+/// each of the task's queue entries currently sits. Entry `i` is queued as
+/// `(tid, i + 1)` under `keys[i]`.
+///
+/// `keys[i]` is written only while holding the bucket locks of both the key
+/// the entry is LEAVING and the one it is entering (`futex_requeue` moving
+/// it), so a reader that takes the bucket lock of the key it read and then
+/// re-reads the key has a stable view: `futex_unqueue`'s `lock_ptr` re-check.
+/// Shared with the queue entries (`Arc`), so a queue entry can never outlive
+/// the state a requeue writes through.
+pub struct FutexQ {
+    keys: alloc::vec::Vec<narf_lib::sync::IrqSafeSpinLock<FutexKey>>,
+}
+
+impl core::fmt::Debug for FutexQ {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FutexQ")
+            .field("entries", &self.keys.len())
+            .finish()
+    }
+}
+
+impl FutexQ {
+    fn key(&self, idx: usize) -> FutexKey {
+        *self.keys[idx].lock()
+    }
+}
 
 /// `FUTEX_BITSET_MATCH_ANY` — the bitset of every plain FUTEX_WAIT/WAKE.
 pub(crate) const FUTEX_BITSET_MATCH_ANY: u32 = 0xffff_ffff;
@@ -9728,6 +10255,9 @@ struct FutexWaiter {
     /// `futex_wake` takes this waiter only when `bitset & wake_bitset != 0`
     /// (`kernel/futex/waitwake.c`); requeue and wake_op ignore it.
     bitset: u32,
+    /// The handler-driven wait this entry belongs to (`None` for the park
+    /// loop's [`FUTEX_PARK_SLOT`] entry). A requeue updates its key here.
+    q: Option<alloc::sync::Arc<FutexQ>>,
 }
 type FutexWaiterMap = alloc::collections::BTreeMap<FutexKey, FutexWaiterSet>;
 
@@ -9760,7 +10290,24 @@ fn futex_drop_task_waiters(task_id: u64) {
     // registration this task can own sits under its CURRENT park key. The
     // old shape swept all 256 bucket locks per task exit; a 1000-thread
     // exit storm hammered those global locks from every CPU at once.
-    let key = crate::user_task::with_user_task_ctx(task_id, futex_park_key);
+    let key = crate::user_task::with_user_task_ctx(task_id, |uc| {
+        (
+            futex_park_key(uc),
+            uc.futex_block_active.load(Ordering::Acquire),
+        )
+    });
+    // A task torn down while queued by `futex_block` (its own handler never
+    // got to unqueue): its entries can sit under any key a requeue moved
+    // them to, so sweep them all.
+    if matches!(key, Some((_, true))) {
+        for bucket in &FUTEX_WAITERS {
+            bucket.values.lock().retain(|_, waiters| {
+                waiters.retain(|&(tid, slot), _| tid != task_id || slot == FUTEX_PARK_SLOT);
+                !waiters.is_empty()
+            });
+        }
+    }
+    let key = key.map(|(k, _)| k);
     match key {
         Some(Some(key)) => futex_drop_waiter_key(key, task_id),
         // Not parked: nothing registered, nothing to sweep.
@@ -9769,7 +10316,7 @@ fn futex_drop_task_waiters(task_id: u64) {
         None => {
             for bucket in &FUTEX_WAITERS {
                 bucket.values.lock().retain(|_, waiters| {
-                    waiters.remove(&task_id);
+                    waiters.retain(|&(tid, _), _| tid != task_id);
                     !waiters.is_empty()
                 });
             }
@@ -9783,7 +10330,7 @@ fn futex_has_task_waiter(task_id: u64) -> bool {
             .values
             .lock()
             .values()
-            .any(|waiters| waiters.contains_key(&task_id))
+            .any(|waiters| waiters.keys().any(|&(tid, _)| tid == task_id))
     })
 }
 
@@ -9809,7 +10356,14 @@ pub(crate) fn futex_register_waiter_key_bitset(
         .lock()
         .entry(key)
         .or_default()
-        .insert(task_id, FutexWaiter { waker, bitset });
+        .insert(
+            (task_id, FUTEX_PARK_SLOT),
+            FutexWaiter {
+                waker,
+                bitset,
+                q: None,
+            },
+        );
 }
 
 /// Remove `task_id`'s futex waker on `uaddr` without firing it (the task
@@ -9821,7 +10375,7 @@ pub fn futex_drop_waiter(uaddr: u64, task_id: u64) {
 pub(crate) fn futex_drop_waiter_key(key: FutexKey, task_id: u64) {
     let mut values = futex_wait_bucket(key).values.lock();
     if let Some(set) = values.get_mut(&key) {
-        set.remove(&task_id);
+        set.remove(&(task_id, FUTEX_PARK_SLOT));
         if set.is_empty() {
             values.remove(&key);
         }
@@ -9864,11 +10418,13 @@ pub(crate) fn futex_wake_waiters_key_bitset(key: FutexKey, n: u32, bitset: u32) 
         let waiter = {
             let mut values = futex_wait_bucket(key).values.lock();
             let waiter = values.get_mut(&key).and_then(|set| {
-                let tid = set
+                let slot = set
                     .iter()
                     .find(|(_, w)| w.bitset & bitset != 0)
-                    .map(|(tid, _)| *tid)?;
-                set.remove(&tid).map(|w| (tid, w.waker))
+                    .map(|(slot, _)| *slot)?;
+                // Removal IS the wake for a `futex_block` waiter: its
+                // `futex_unqueue` then finds the entry gone (woken).
+                set.remove(&slot).map(|w| (slot.0, w.waker))
             });
             if values.get(&key).is_some_and(|set| set.is_empty()) {
                 values.remove(&key);
@@ -9889,16 +10445,16 @@ pub(crate) fn futex_wake_waiters_key_bitset(key: FutexKey, n: u32, bitset: u32) 
         };
         // BTreeMap has no pop; collect the first `n` matching keys then
         // remove them.
-        let take: alloc::vec::Vec<u64> = set
+        let take: alloc::vec::Vec<(u64, u32)> = set
             .iter()
             .filter(|(_, w)| w.bitset & bitset != 0)
-            .map(|(tid, _)| *tid)
+            .map(|(slot, _)| *slot)
             .take(n as usize)
             .collect();
         let mut out = alloc::vec::Vec::with_capacity(take.len());
-        for tid in take {
-            if let Some(w) = set.remove(&tid) {
-                out.push((tid, w.waker));
+        for slot in take {
+            if let Some(w) = set.remove(&slot) {
+                out.push((slot.0, w.waker));
             }
         }
         if set.is_empty() {
@@ -9935,8 +10491,8 @@ pub(crate) fn futex_wake_one_key_spread(key: FutexKey) -> usize {
     let waiter = {
         let mut values = futex_wait_bucket(key).values.lock();
         let waiter = values.get_mut(&key).and_then(|set| {
-            let tid = set.keys().next().copied()?;
-            set.remove(&tid).map(|w| (tid, w.waker))
+            let slot = set.keys().next().copied()?;
+            set.remove(&slot).map(|w| (slot.0, w.waker))
         });
         if values.get(&key).is_some_and(|set| set.is_empty()) {
             values.remove(&key);
@@ -9989,15 +10545,15 @@ fn futex_take_waiters(
     values: &mut FutexWaiterMap,
     key: FutexKey,
     n: u32,
-) -> alloc::vec::Vec<(u64, FutexWaiter)> {
+) -> alloc::vec::Vec<((u64, u32), FutexWaiter)> {
     let Some(set) = values.get_mut(&key) else {
         return alloc::vec::Vec::new();
     };
-    let take: alloc::vec::Vec<u64> = set.keys().take(n as usize).copied().collect();
+    let take: alloc::vec::Vec<(u64, u32)> = set.keys().take(n as usize).copied().collect();
     let mut movers = alloc::vec::Vec::with_capacity(take.len());
-    for tid in take {
-        if let Some(waker) = set.remove(&tid) {
-            movers.push((tid, waker));
+    for slot in take {
+        if let Some(waker) = set.remove(&slot) {
+            movers.push((slot, waker));
         }
     }
     if set.is_empty() {
@@ -10006,22 +10562,34 @@ fn futex_take_waiters(
     movers
 }
 
+/// Insert requeue `movers` under `key`. Returns `(moved, retarget)`: the
+/// number moved, and the park-loop movers whose park state must be
+/// retargeted outside the bucket locks. A `futex_block` mover's [`FutexQ`]
+/// is retargeted HERE, under the locks of both keys, which is what keeps
+/// its `futex_unqueue` from ever looking under a key it already left.
 fn futex_insert_waiters(
     values: &mut FutexWaiterMap,
     key: FutexKey,
-    movers: alloc::vec::Vec<(u64, FutexWaiter)>,
-) -> alloc::vec::Vec<u64> {
-    let mut tids = alloc::vec::Vec::with_capacity(movers.len());
-    let dst = values.entry(key).or_default();
-    for (tid, waiter) in movers {
-        // `requeue_futex` moves the futex_q, bitset and all.
-        dst.insert(tid, waiter);
-        tids.push(tid);
+    movers: alloc::vec::Vec<((u64, u32), FutexWaiter)>,
+) -> (usize, alloc::vec::Vec<u64>) {
+    let moved = movers.len();
+    if moved == 0 {
+        return (0, alloc::vec::Vec::new());
     }
-    tids
+    let mut retarget = alloc::vec::Vec::with_capacity(movers.len());
+    let dst = values.entry(key).or_default();
+    for (slot, waiter) in movers {
+        // `requeue_futex` moves the futex_q, bitset and all.
+        match &waiter.q {
+            Some(q) => *q.keys[(slot.1 - 1) as usize].lock() = key,
+            None => retarget.push(slot.0),
+        }
+        dst.insert(slot, waiter);
+    }
+    (moved, retarget)
 }
 
-fn futex_requeue_waiters_keyed(
+pub(crate) fn futex_requeue_waiters_keyed(
     key: FutexKey,
     key2: FutexKey,
     uaddr2: u64,
@@ -10040,7 +10608,7 @@ fn futex_requeue_waiters_keyed(
     let gen2 = futex_wake_counter_key(key2);
     let source_bucket = futex_bucket_index(key);
     let destination_bucket = futex_bucket_index(key2);
-    let moved: alloc::vec::Vec<u64> = if source_bucket == destination_bucket {
+    let (moved, retarget): (usize, alloc::vec::Vec<u64>) = if source_bucket == destination_bucket {
         let mut values = FUTEX_WAITERS[source_bucket].values.lock();
         let movers = futex_take_waiters(&mut values, key, n_move);
         futex_insert_waiters(&mut values, key2, movers)
@@ -10068,7 +10636,7 @@ fn futex_requeue_waiters_keyed(
     // from strand to backstop instead of chaining wakes). The park loop
     // re-validates the sequence after registering and turns any movement
     // into a spurious return; musl re-checks the word in userspace.
-    for tid in &moved {
+    for tid in &retarget {
         crate::user_task::with_user_task_ctx(*tid, |uc| {
             uc.futex_park_seq.fetch_add(1, Ordering::AcqRel);
             uc.futex_park_gen.store(gen2, Ordering::Release);
@@ -10087,7 +10655,7 @@ fn futex_requeue_waiters_keyed(
             uc.futex_park_seq.fetch_add(1, Ordering::Release);
         });
     }
-    (woken, moved.len())
+    (woken, moved)
 }
 
 /// Read the 4-byte futex word at user address `uaddr` in the CURRENT
@@ -10295,7 +10863,7 @@ pub fn dbg_futex_waiter_registered(namespace: u64, uaddr: u64, tid: u64) -> bool
         .values
         .lock()
         .get(&key)
-        .map(|set| set.contains_key(&tid))
+        .map(|set| set.keys().any(|&(t, _)| t == tid))
         .unwrap_or(false)
 }
 
@@ -10324,76 +10892,330 @@ pub fn futex_wake_waiters_for_test(uaddr: u64, n: u32) -> usize {
     futex_wake_waiters(uaddr, n)
 }
 
-/// Shared FUTEX_WAIT core for both the classic `futex(2)` FUTEX_WAIT op
-/// and the futex2 `futex_wait(2)` syscall. Implements the same real
-/// cooperative wait NARF's pthreads already rely on:
+/// One futex word of a [`futex_block`] wait: its key, its user address,
+/// the value the caller expects there, and the waiter's bitset.
+pub(crate) struct FutexWaitWord {
+    pub(crate) key: FutexKey,
+    pub(crate) uaddr: u64,
+    pub(crate) val: u32,
+    pub(crate) bitset: u32,
+}
+
+/// How a [`futex_block`] wait ended.
+pub(crate) enum FutexBlock {
+    /// A wake dequeued entry `i` — the highest such index, as
+    /// `futex_unqueue_multiple` reports it. A plain wait returns 0.
+    Woken(usize),
+    /// The wait did not happen or ran out: `EAGAIN` (a word moved before it
+    /// could be queued), `EFAULT`, or `ETIMEDOUT` (the deadline passed with
+    /// no wake). Positive errno.
+    Errno(i64),
+    /// A signal is pending (`-ERESTARTSYS` in `__futex_wait`). The caller
+    /// picks the restart semantics and rewinds via [`restart_interrupted_syscall`].
+    Interrupted,
+    /// No own-stack executor to park on (the in-kernel test harness, or the
+    /// legacy longjmp model): the caller falls back to its re-check park.
+    NoExecutor,
+}
+
+/// Linux `futex_queue`: queue entry `idx` of `q` under `key` as
+/// `(tid, idx + 1)`.
+fn futex_queue(
+    key: FutexKey,
+    tid: u64,
+    idx: usize,
+    waker: core::task::Waker,
+    bitset: u32,
+    q: &alloc::sync::Arc<FutexQ>,
+) {
+    futex_wait_bucket(key)
+        .values
+        .lock()
+        .entry(key)
+        .or_default()
+        .insert(
+            (tid, idx as u32 + 1),
+            FutexWaiter {
+                waker,
+                bitset,
+                q: Some(q.clone()),
+            },
+        );
+}
+
+/// Linux `futex_unqueue`: remove entry `idx` of `q`. Returns `true` when the
+/// entry was still queued (so nobody woke it) and `false` when a wake had
+/// already dequeued it — the waker removes the entry under the same bucket
+/// lock, so "absent" is exactly "woken". A requeue may move the entry while
+/// we look for it; it writes `q.keys[idx]` under the locks of both keys, so
+/// the key re-read under the bucket lock either confirms the bucket or sends
+/// us after the entry (the `lock_ptr` retry in Linux).
+fn futex_unqueue(q: &FutexQ, idx: usize, tid: u64) -> bool {
+    let slot = (tid, idx as u32 + 1);
+    loop {
+        let key = q.key(idx);
+        let mut values = futex_wait_bucket(key).values.lock();
+        if q.key(idx) != key {
+            continue;
+        }
+        let Some(set) = values.get_mut(&key) else {
+            return false;
+        };
+        let queued = set.remove(&slot).is_some();
+        if set.is_empty() {
+            values.remove(&key);
+        }
+        return queued;
+    }
+}
+
+/// Test-only: a [`futex_block`] queue state over the mm-scoped (namespace 0)
+/// words `uaddrs`, so the kernel-test suite can drive `futex_queue` /
+/// `futex_unqueue` against real wakes and requeues without a user task.
+#[doc(hidden)]
+pub fn __test_futex_q_new(uaddrs: &[u64]) -> alloc::sync::Arc<FutexQ> {
+    alloc::sync::Arc::new(FutexQ {
+        keys: uaddrs
+            .iter()
+            .map(|&u| narf_lib::sync::IrqSafeSpinLock::new(futex_key(0, u)))
+            .collect(),
+    })
+}
+
+/// Test-only [`futex_queue`] of entry `idx` of `q` under its current key.
+#[doc(hidden)]
+pub fn __test_futex_q_queue(
+    q: &alloc::sync::Arc<FutexQ>,
+    idx: usize,
+    tid: u64,
+    waker: core::task::Waker,
+) {
+    futex_queue(q.key(idx), tid, idx, waker, FUTEX_BITSET_MATCH_ANY, q);
+}
+
+/// Test-only [`futex_unqueue_multiple`]: `Some(i)` = entry `i` was woken.
+#[doc(hidden)]
+pub fn __test_futex_q_unqueue(q: &FutexQ, n: usize, tid: u64) -> Option<usize> {
+    futex_unqueue_multiple(q, n, tid)
+}
+
+/// Test-only: does `q`'s entry `idx` now name the mm-scoped word `uaddr`?
+#[doc(hidden)]
+pub fn __test_futex_q_names(q: &FutexQ, idx: usize, uaddr: u64) -> bool {
+    q.key(idx) == futex_key(0, uaddr)
+}
+
+/// Linux `futex_unqueue_multiple`: unqueue entries `0..n`, returning the
+/// highest index a wake had already dequeued.
+fn futex_unqueue_multiple(q: &FutexQ, n: usize, tid: u64) -> Option<usize> {
+    let mut woken = None;
+    for idx in 0..n {
+        if !futex_unqueue(q, idx, tid) {
+            woken = Some(idx);
+        }
+    }
+    woken
+}
+
+/// The shared wait of FUTEX_WAIT / FUTEX_WAIT_BITSET, futex2 `futex_wait`
+/// and `futex_waitv`: Linux `__futex_wait` / `futex_wait_multiple`, driven
+/// from the syscall handler on the task's own kernel stack.
 ///
-///  - `*uaddr != val` ⇒ the wait condition no longer holds; return
-///    `-EAGAIN` (Linux's contract — the caller's fast path observes the
-///    change and proceeds without sleeping).
-///  - `*uaddr == val` ⇒ park the caller via a bounded yield back to the
-///    executor (the deadline branch of `UserTaskFuture::poll` keeps it
-///    off-CPU until the park expires or a wake bumps the per-uaddr
-///    counter), then resume with `0`. The libc-side recheck loop re-arms
-///    the wait until the condition is satisfied, so a `futex_wake` on the
-///    same word makes the waiter progress.
+///   setup     — for each word in order (`futex_wait_multiple_setup`): read
+///               it, `-EAGAIN` if it is not the expected value, queue it.
+///               A failure unqueues what was queued; if one of those had
+///               already been woken, that wake wins and its index returns.
+///   wait      — park until a wake, the deadline, or a signal. A deadline
+///               already passed does not park (`futex_do_wait` skips
+///               `schedule()`), but the setup above still ran first, so a
+///               moved word is `-EAGAIN`, never `-ETIMEDOUT`.
+///   unqueue   — woken ⇒ `Woken`, however the wait ended; else deadline
+///               passed ⇒ `ETIMEDOUT`; else a signal ⇒ `Interrupted`; else a
+///               spurious wakeup ⇒ the whole wait again from setup, exactly
+///               as `__futex_wait`'s `goto retry`.
 ///
-/// `uaddr == 0` is -EFAULT (`get_futex_key`'s access_ok arm). It used to
-/// be an immediate "POSIX-permitted spurious wake" so that wake-path
-/// smokes could run without a backing mapping — production behaviour bent
-/// to suit a fixture, which then pinned it in place.
-fn futex_wait_core(
+/// No bounded park and no "spurious 0": an untimed wait blocks until one of
+/// those three things happens, as on Linux.
+///
+/// Lost wakes. Linux makes `futex_wait_setup`'s read-and-queue atomic with
+/// the hash-bucket lock. Here the read cannot be under a spinlock (a user
+/// read may fault), so the per-key wake generation stands in for it:
+///
+///   waiter: g = gen(K); v = *uaddr; v == val ⇒ queue(K); gen(K) != g ⇒
+///           re-read *uaddr, and a moved word is a setup failure.
+///   waker:  *uaddr = new (userspace); bump gen(K); dequeue under the bucket
+///           lock; `wake_one` clears `sleep_deadline_ns` and fires the waker.
+///
+/// A waker whose dequeue runs after our queue (bucket-lock order) finds the
+/// entry. One whose dequeue ran before our queue bumped `gen(K)` before it,
+/// so our post-queue generation read (which follows our queue, which follows
+/// its dequeue) sees the bump — and its word store, which preceded the bump,
+/// is visible to the re-read: a changed word fails the setup, an unchanged
+/// one means the wake simply preceded our wait. `sleep_deadline_ns` is
+/// stored before the first queue, so the waker's clear always lands after it
+/// and a wake that beats the park makes the park loop return at once; one
+/// that lands after the park fires the parked task's own waker.
+pub(crate) fn futex_block(
+    ctx: &mut dyn TrapContext,
+    words: &[FutexWaitWord],
+    deadline: Option<u64>,
+) -> FutexBlock {
+    if !narf_scheduler::stackful::user_own_stack_enabled() {
+        return FutexBlock::NoExecutor;
+    }
+    let Some(uctx) = crate::user_task::current_user_task() else {
+        return FutexBlock::NoExecutor;
+    };
+    if narf_scheduler::stackful::current_stackful_waker().is_none() {
+        return FutexBlock::NoExecutor;
+    }
+    // SAFETY: the in-flight task's poller-pinned ctx, live for this trap.
+    let uc = unsafe { &*uctx };
+    let tid = current_task_id();
+    let q = alloc::sync::Arc::new(FutexQ {
+        keys: words
+            .iter()
+            .map(|w| narf_lib::sync::IrqSafeSpinLock::new(w.key))
+            .collect(),
+    });
+    let finish = |uc: &crate::user_task::UserTaskCtx| {
+        uc.sleep_deadline_ns.store(0, Ordering::Release);
+        uc.futex_block_active.store(false, Ordering::Release);
+    };
+    loop {
+        let Some(waker) = narf_scheduler::stackful::current_stackful_waker() else {
+            finish(uc);
+            return FutexBlock::NoExecutor;
+        };
+        // None of the park loop's own futex bookkeeping: this wait queues
+        // and unqueues its entries itself.
+        uc.futex_uaddr.store(0, Ordering::Release);
+        uc.futex_namespace.store(0, Ordering::Release);
+        // Before the first queue — see "Lost wakes" above.
+        uc.sleep_deadline_ns
+            .store(deadline.unwrap_or(u64::MAX), Ordering::Release);
+        uc.futex_block_active.store(true, Ordering::Release);
+        let mut queued = 0;
+        let mut setup_errno = 0;
+        for (idx, w) in words.iter().enumerate() {
+            // A requeue during an earlier pass may have moved this entry.
+            *q.keys[idx].lock() = w.key;
+            let Some((gen, current)) =
+                futex_wait_seqlock_read_key(w.key, || futex_read_user_word(w.uaddr))
+            else {
+                setup_errno = EFAULT;
+                break;
+            };
+            if current != w.val {
+                setup_errno = EAGAIN;
+                break;
+            }
+            futex_queue(w.key, tid, idx, waker.clone(), w.bitset, &q);
+            queued = idx + 1;
+            if futex_gen_key(w.key) != gen {
+                match futex_read_user_word(w.uaddr) {
+                    None => {
+                        setup_errno = EFAULT;
+                        break;
+                    }
+                    Some(v) if v != w.val => {
+                        setup_errno = EAGAIN;
+                        break;
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        if setup_errno != 0 {
+            let woken = futex_unqueue_multiple(&q, queued, tid);
+            finish(uc);
+            return woken.map_or(FutexBlock::Errno(setup_errno), FutexBlock::Woken);
+        }
+        let expired =
+            |d: Option<u64>| d.is_some_and(|d| narf_scheduler::narf_time::monotonic_ns() >= d);
+        if !expired(deadline) {
+            // SAFETY: uctx is live for the trap round-trip; the own-stack
+            // park returns here when the wait ends.
+            unsafe {
+                ctx.save_user_state(uc.state.get() as *mut u8);
+                *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            }
+            own_stack_block(ctx);
+        }
+        let woken = futex_unqueue_multiple(&q, words.len(), tid);
+        finish(uc);
+        if let Some(idx) = woken {
+            return FutexBlock::Woken(idx);
+        }
+        if expired(deadline) {
+            return FutexBlock::Errno(ETIMEDOUT);
+        }
+        // `signal_pending(current)`. The raw pending set, not just the
+        // signals that need a handler or a default action: the park loop
+        // ends on any of them, and only the return to user consumes an
+        // ignored one, so re-parking would spin. Its restart is invisible.
+        if is_signal_pending(tid) {
+            return FutexBlock::Interrupted;
+        }
+        // Spurious wakeup: `goto retry`.
+    }
+}
+
+/// End a blocking wait a signal interrupted — a [`futex_block`] that
+/// reported [`FutexBlock::Interrupted`], an interrupted nanosleep: rewind
+/// the syscall so signal delivery sees a restart-pending frame, and record
+/// which Linux restart errno the wait stands for (`kind`, one of the
+/// `SYSCALL_RESTART_*` constants). With a handler, delivery then completes
+/// the syscall as -EINTR or keeps the rewind; with none, it re-executes.
+pub(crate) fn restart_interrupted_syscall(ctx: &mut dyn TrapContext, kind: u32) {
+    #[cfg(target_arch = "x86_64")]
+    const SYSCALL_INSN_LEN: u64 = 2;
+    #[cfg(target_arch = "aarch64")]
+    const SYSCALL_INSN_LEN: u64 = 4;
+    ctx.set_rip(ctx.rip().wrapping_sub(SYSCALL_INSN_LEN));
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: the in-flight task's poller-pinned ctx; atomic stores.
+        unsafe {
+            (*uctx)
+                .syscall_parked_restarting
+                .store(true, Ordering::Release);
+            (*uctx).syscall_restart_kind.store(kind, Ordering::Release);
+        }
+    }
+}
+
+/// The re-check park the futex waits fall back to when [`futex_block`] has
+/// no own-stack executor ([`FutexBlock::NoExecutor`]): the legacy longjmp
+/// model, whose resumed task cannot return into this handler. It publishes
+/// the word to the park loop (which re-registers it on every poll and
+/// re-validates the word) and resumes userspace with 0 when the park ends —
+/// a spurious wake the caller's futex loop re-checks. Without a yield hook
+/// (the in-kernel test harness) it is a synchronous 0.
+pub(crate) fn futex_wait_legacy(
     ctx: &mut dyn TrapContext,
     uaddr: u64,
+    key: FutexKey,
     val: u32,
-    park_cap_ns: u64,
-    flags: u64,
+    deadline: Option<u64>,
     bitset: u32,
 ) {
-    // The address is validated ONLY here, by the shared funnel. This helper
-    // used to carry its own `uaddr == 0` shortcut, so the FUTEX2 wait path
-    // kept reporting a spurious wake for a null word after the classic
-    // FUTEX_WAIT arm was corrected — the same bug in a second place, which
-    // is what a duplicated special case buys.
-    let key = match get_futex_key_flags(flags & FUTEX_PRIVATE != 0, uaddr, flags) {
-        Ok(k) => k,
-        Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
-            return;
-        }
-    };
     // Seqlock read: sample the wake generation BEFORE reading `*uaddr` (see
     // `futex_wait_seqlock_read` — sampling after the read loses a racing
     // FUTEX_WAKE and deadlocks a contended mutex/condvar under SMP).
-    let (gen, current) = match futex_wait_seqlock_read_key(key, || {
-        let mut buf4 = [0u8; 4];
-        // SAFETY: copy_from_user range-validates `uaddr` + SMAP-brackets the read.
-        if unsafe { copy_from_user(&mut buf4, uaddr) }.is_ok() {
-            Some(u32::from_ne_bytes(buf4))
-        } else {
-            None
-        }
-    }) {
-        Some(x) => x,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-            return;
-        }
+    let Some((gen, current)) = futex_wait_seqlock_read_key(key, || futex_read_user_word(uaddr))
+    else {
+        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        return;
     };
     if current != val {
         ctx.set_return(SyscallReturn::ok((-EAGAIN) as u64));
         return;
     }
-    // REAL blocking park, same wait queue + per-uaddr wake counter as the
-    // classic `sys_futex` FUTEX_WAIT (Linux futex2 and classic futex operate
-    // on the SAME words — a FUTEX_WAKE must wake either). Register happens in
-    // the poll routine; here we publish the uaddr + counter snapshot + an
-    // infinite (or timeout-bounded) deadline and yield.
-    let deadline = if park_cap_ns == 0 {
-        u64::MAX
-    } else {
-        narf_scheduler::narf_time::monotonic_ns().saturating_add(park_cap_ns)
-    };
+    let deadline = deadline.unwrap_or(u64::MAX);
+    if deadline <= narf_scheduler::narf_time::monotonic_ns() {
+        ctx.set_return(SyscallReturn::ok((-ETIMEDOUT) as u64));
+        return;
+    }
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
         crate::user_task::yield_hook(),
@@ -10403,7 +11225,8 @@ fn futex_wait_core(
         unsafe {
             let uc = &*uctx;
             uc.futex_park_gen.store(gen, Ordering::Release);
-            // Park-loop word re-validation snapshot (see sys_futex).
+            // Expected word value — the park loop re-validates the word
+            // against this on every re-check.
             uc.futex_val.store(val, Ordering::Release);
             futex_park_publish(uc, uaddr, key, bitset);
             uc.sleep_deadline_ns.store(deadline, Ordering::Release);
@@ -10421,17 +11244,33 @@ fn futex_wait_core(
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-/// Bounded cooperative-park cap for the futex2 wait ops. Unlike the classic
-/// `sys_futex` FUTEX_WAIT — whose no-timeout park is infinite (`u64::MAX`) and
-/// only ever resumed by a FUTEX_WAKE waker (matching Linux block-until-woken) —
-/// the futex2 `futex_wait`/`futex_waitv` are documented (and smoke-tested) to
-/// park via a *bounded* yield and resume with 0, letting the caller's recheck
-/// loop re-arm. Passing 0 here would map to an infinite deadline that the poll
-/// routine's one-tick fallback re-parks forever (never resuming to user mode),
-/// so a self-directed wait with no concurrent waker hangs. A finite cap makes
-/// the park expire → resume 0 (POSIX-permitted spurious wake); a real waker
-/// still fires promptly through the per-uaddr wait queue well before the cap.
-const FUTEX2_PARK_CAP_NS: u64 = 50_000_000; // 50 ms
+/// Single-word wait of FUTEX_WAIT / FUTEX_WAIT_BITSET / futex2 `futex_wait`:
+/// [`futex_block`] with the result written back. `Interrupted` is returned
+/// to the caller, which owns the restart decision; every other outcome is
+/// final and already set.
+pub(crate) fn futex_wait_one(
+    ctx: &mut dyn TrapContext,
+    uaddr: u64,
+    key: FutexKey,
+    val: u32,
+    deadline: Option<u64>,
+    bitset: u32,
+) -> bool {
+    let word = FutexWaitWord {
+        key,
+        uaddr,
+        val,
+        bitset,
+    };
+    match futex_block(ctx, core::slice::from_ref(&word), deadline) {
+        // "If we were woken (and unqueued), we succeeded, whatever."
+        FutexBlock::Woken(_) => ctx.set_return(SyscallReturn::ok(0)),
+        FutexBlock::Errno(errno) => ctx.set_return(SyscallReturn::ok((-errno) as u64)),
+        FutexBlock::Interrupted => return true,
+        FutexBlock::NoExecutor => futex_wait_legacy(ctx, uaddr, key, val, deadline, bitset),
+    }
+    false
+}
 
 const SIG_BLOCK: u32 = 0;
 const SIG_UNBLOCK: u32 = 1;
@@ -10727,10 +11566,20 @@ fn default_signal_delivery_restricted_active(
     // A group stop (`do_signal_stop`) marked this thread stopped while it was
     // running: stop here, at its exit to user mode, and count it toward the
     // group's CLD_STOPPED report.
-    if task_job_stopped(task) {
+    //
+    // Not when SIGKILL is pending: a fatal signal ends a stop (`get_signal`
+    // tests `fatal_signal_pending` before `do_signal_stop`), and it must be
+    // delivered here. Parking first and returning made a SIGSTOPped task
+    // that was blocked in a syscall immortal: SIGKILL woke it, its syscall
+    // re-executed, and every exit to user mode stopped it again before the
+    // SIGKILL could be taken — `kill -9` of a stopped process hung its
+    // parent's waitpid.
+    if task_job_stopped(task) && !task_fatal_signal_pending(task) {
         group_stop_participate(task);
         park_current_stopped(ctx);
-        return true;
+        if !task_fatal_signal_pending(task) {
+            return true;
+        }
     }
 
     // Private and group-shared pending together (`dequeue_signal` reads
@@ -10790,6 +11639,13 @@ fn default_signal_delivery_restricted_active(
         return false;
     };
     if crate::ptrace::ptrace_intercept_signal(ctx, signum) {
+        // The tracer has resumed us from the signal-delivery stop. `get_signal`
+        // loops: a signal it injected on that resume (`ptrace_signal`'s
+        // return value) is delivered now, before the return to user mode —
+        // not at whatever kernel exit comes next. Delivered late, a re-
+        // injected signal a program raised at itself arrived only after the
+        // program had already moved past the point that depended on it.
+        let _ = default_signal_delivery_restricted_active(ctx, syscall_no, restrict, prerewound);
         return true;
     }
 
@@ -10871,6 +11727,28 @@ fn default_signal_delivery_restricted_active(
         task, action, signum, syscall_no, si_code, si_addr, si_value, si_pid,
     );
     params.prerewound_syscall = prerewound;
+    if prerewound {
+        // The park's own restart errno refines the syscall-number table
+        // (`handle_signal`): -ERESTARTNOINTR restarts whatever the handler's
+        // SA_RESTART says, -ERESTART_RESTARTBLOCK never restarts across a
+        // handler. The arch frame writers restart a prerewound frame iff
+        // `SA_RESTART && restartable_syscall`, so express both that way.
+        let kind = crate::user_task::current_user_task().map_or(
+            crate::user_task::SYSCALL_RESTART_SYS,
+            // SAFETY: the in-flight task's poller-pinned ctx; atomic load.
+            |u| unsafe { (*u).syscall_restart_kind.load(Ordering::Acquire) },
+        );
+        match kind {
+            crate::user_task::SYSCALL_RESTART_NOINTR => {
+                params.flags |= SA_RESTART;
+                params.restartable_syscall = true;
+            }
+            crate::user_task::SYSCALL_RESTART_RESTARTBLOCK => {
+                params.restartable_syscall = false;
+            }
+            _ => {}
+        }
+    }
     let interrupted_rsp = ctx.user_rsp();
     if !ctx.deliver_signal(&params) {
         return false;
@@ -11191,6 +12069,46 @@ pub(crate) fn page_fault_si_code(addr: u64) -> i32 {
     if mapped { 2 /* SEGV_ACCERR */ } else { 1 /* SEGV_MAPERR */ }
 }
 
+/// Serial output is line-locked, but a `writeln!` is assembled through several
+/// `fmt::Write` calls.  Two simultaneous user crashes can therefore weave
+/// their register files together byte-for-byte, destroying the evidence we
+/// need to diagnose the first one.  Keep exactly one fatal diagnostic active;
+/// a concurrent fatal still gets its normal signal termination but skips the
+/// best-effort report.  This is fatal-path-only and never participates in page
+/// fault handling or scheduling.
+static FATAL_DIAGNOSTIC_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+struct FatalDiagnosticGuard;
+
+impl Drop for FatalDiagnosticGuard {
+    fn drop(&mut self) {
+        FATAL_DIAGNOSTIC_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// `(si_code, si_addr)` of the signal a user CPU exception raises (see the
+/// table above `dump_fatal_x86_address_space`).
+fn sync_fault_si(vector: u64, info: &SyncFaultInfo) -> (i32, u64) {
+    match vector {
+        1 => (2 /* TRAP_TRACE */, info.addr),
+        // BUS_ADRERR (2): "nonexistent physical address" — the page is
+        // mapped, but the file behind it could not supply it.
+        14 if info.bus => (2, info.addr),
+        14 => (page_fault_si_code(info.addr), info.addr),
+        13 => (0x80 /* SI_KERNEL */, info.addr),
+        6 => (1 /* ILL_ILLOPC */, info.addr),
+        17 => (1 /* BUS_ADRALN */, info.addr),
+        0 => (1 /* FPE_INTDIV */, info.addr),
+        4 => (2 /* FPE_INTOVF */, info.addr),
+        3 => (1 /* TRAP_BRKPT */, info.addr),
+        // SI_KERNEL (0x80), not 0: a fault must keep a POSITIVE si_code so the
+        // arch siginfo builder writes `si_addr` at the union offset 16 (a
+        // non-positive code there means "user/queue-origin" → si_pid instead).
+        _ => (0x80, info.addr),
+    }
+}
+
 pub fn default_sync_signal_delivery(
     ctx: &mut dyn TrapContext,
     vector: u64,
@@ -11204,7 +12122,14 @@ pub fn default_sync_signal_delivery(
             None => return false,
         }
     };
-    if crate::ptrace::ptrace_intercept_signal(ctx, signum) {
+    // A tracer sees the fault's own siginfo at the signal-delivery stop
+    // (PTRACE_GETSIGINFO): strace prints `--- SIGSEGV {si_code=SEGV_MAPERR,
+    // si_addr=...} ---` from it.
+    let ptrace_info = {
+        let (code, addr) = sync_fault_si(vector, &info);
+        crate::handlers::ptrace_fault_siginfo(signum, code, addr, 0)
+    };
+    if crate::ptrace::ptrace_intercept_signal_info(ctx, signum, Some(ptrace_info)) {
         return true;
     }
     let task = current_task_id();
@@ -11220,7 +12145,16 @@ pub fn default_sync_signal_delivery(
             // crash can be symbolized against the process's mmap layout —
             // RIP alone is ambiguous across the many shared libraries a
             // desktop app maps (kwin, Qt, Mesa, glibc/musl, ...).
+            if FATAL_DIAGNOSTIC_ACTIVE
+                .compare_exchange(
+                    false,
+                    true,
+                    core::sync::atomic::Ordering::Acquire,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
             {
+                let _diagnostic_guard = FatalDiagnosticGuard;
                 use core::fmt::Write;
                 let pid = task_to_pid_raw(task).unwrap_or(task);
                 let comm = proc_comm_of(pid).unwrap_or_else(|| alloc::string::String::from("?"));
@@ -11364,23 +12298,7 @@ pub fn default_sync_signal_delivery(
     // via `info.addr`. For #PF that becomes si_addr verbatim. For
     // RIP-flavoured vectors (#UD/#DE/#OF/#BP/#AC) the arch passes
     // RIP through the same field.
-    let (si_code, si_addr) = match vector {
-        1 => (2 /* TRAP_TRACE */, info.addr),
-        // BUS_ADRERR (2): "nonexistent physical address" — the page is
-        // mapped, but the file behind it could not supply it.
-        14 if info.bus => (2, info.addr),
-        14 => (page_fault_si_code(info.addr), info.addr),
-        13 => (0x80 /* SI_KERNEL */, info.addr),
-        6 => (1 /* ILL_ILLOPC */, info.addr),
-        17 => (1 /* BUS_ADRALN */, info.addr),
-        0 => (1 /* FPE_INTDIV */, info.addr),
-        4 => (2 /* FPE_INTOVF */, info.addr),
-        3 => (1 /* TRAP_BRKPT */, info.addr),
-        // SI_KERNEL (0x80), not 0: a fault must keep a POSITIVE si_code so the
-        // arch siginfo builder writes `si_addr` at the union offset 16 (a
-        // non-positive code there means "user/queue-origin" → si_pid instead).
-        _ => (0x80, info.addr),
-    };
+    let (si_code, si_addr) = sync_fault_si(vector, &info);
     // Synchronous: not a syscall trap, so restartable_syscall =
     // false (passed via SYSCALL_NUM_NONE to is_restartable_syscall).
     // Synchronous faults carry si_addr, not a sigqueue sigval.
@@ -11420,6 +12338,176 @@ pub fn default_sync_signal_delivery(
     // the kernel survives.
     terminate_current_task(ctx, task, signum, false);
     true
+}
+
+/// The `last_siginfo` of a ptrace notification stop (`ptrace_do_notify`):
+/// `si_signo = SIGTRAP`, `si_code = exit_code` (`SIGTRAP | 0x80` for a
+/// TRACESYSGOOD syscall stop, `SIGTRAP | event << 8` for an event), `si_pid`
+/// and `si_uid` the stopping task's own, in its own namespaces.
+pub(crate) fn ptrace_notify_siginfo(task: u64, exit_code: u32) -> [u8; 128] {
+    let mut info = [0u8; 128];
+    info[0..4].copy_from_slice(&5i32.to_ne_bytes());
+    info[8..12].copy_from_slice(&(exit_code as i32).to_ne_bytes());
+    let tid = task_to_linux_tid_raw(task).unwrap_or(task);
+    let pid = report_pid_to(task, tid) as u32;
+    let uid = uid_to_user(task, read_uidgid(task).uid);
+    info[16..20].copy_from_slice(&pid.to_ne_bytes());
+    info[20..24].copy_from_slice(&uid.to_ne_bytes());
+    info
+}
+
+/// The `last_siginfo` of a signal-delivery stop for `signum`: the siginfo the
+/// signal would have been delivered with — its queued payload when it has one
+/// (sigqueue, SIGCHLD, a kernel-generated code), else `SI_USER` from an
+/// unknown sender.
+pub(crate) fn ptrace_signal_siginfo(task: u64, signum: u32) -> [u8; 128] {
+    let src = if signal_pending_private(task) & sig_bit(signum) != 0 {
+        task
+    } else {
+        shared_pending_key(task)
+    };
+    let (si_code, si_value, si_pid, si_addr) = match peek_sigqueue_info(src, signum) {
+        Some(info) => match info.poll_band {
+            Some(band) => (info.code, info.value, band, u64::from(band)),
+            None => (info.code, info.value, info.pid, 0),
+        },
+        None => (0, 0, 0, 0),
+    };
+    SigDeliveryParams {
+        handler: 0,
+        restorer: 0,
+        signum,
+        flags: 0,
+        altstack_sp: 0,
+        altstack_size: 0,
+        restartable_syscall: false,
+        si_code,
+        si_addr,
+        si_value,
+        si_pid,
+        prerewound_syscall: false,
+    }
+    .siginfo_bytes()
+}
+
+/// The `last_siginfo` of a synchronous fault's signal-delivery stop.
+pub(crate) fn ptrace_fault_siginfo(signum: u32, si_code: i32, si_addr: u64, si_value: u64) -> [u8; 128] {
+    SigDeliveryParams {
+        handler: 0,
+        restorer: 0,
+        signum,
+        flags: 0,
+        altstack_sp: 0,
+        altstack_size: 0,
+        restartable_syscall: false,
+        si_code,
+        si_addr,
+        si_value,
+        si_pid: 0,
+        prerewound_syscall: false,
+    }
+    .siginfo_bytes()
+}
+
+/// `PF_EXITING`: the thread has started exiting (a zombie, or its group is
+/// being torn down). Seccomp's TSYNC skips such threads.
+pub(crate) fn task_is_exiting(task: u64) -> bool {
+    crate::task::task_get(task).is_none_or(|t| {
+        t.state.load(Ordering::Acquire) == crate::task::TASK_ZOMBIE
+            || t.group_exiting.load(Ordering::Acquire)
+    })
+}
+
+/// `force_sig_seccomp(syscall, reason, force_coredump)` — raise SIGSYS for a
+/// seccomp `RET_TRAP` (`force_coredump == false`) or `RET_KILL_*`
+/// (`true`) on the current task, synchronously, from the syscall it skipped.
+///
+/// `seccomp_init_siginfo` fills `si_code = SYS_SECCOMP`, `si_call_addr` (the
+/// user PC, past the syscall instruction), `si_syscall`, `si_arch` and
+/// `si_errno = reason` (the filter's 16-bit data); Chromium's SIGSYS handler
+/// rejects the signal unless all of them, and the syscall number in the
+/// frame's return register, agree.
+///
+/// `force_sig_info_to_task` is what makes it *forced*: with
+/// `HANDLER_CURRENT`, a blocked or ignored SIGSYS is reset to SIG_DFL and
+/// unblocked, so a task cannot dodge a TRAP by masking the signal — it dies
+/// instead. `HANDLER_EXIT` (the kill actions) resets it unconditionally.
+/// SIGSYS's default action dumps core and takes the whole thread group.
+///
+/// The caller has already set the syscall's return value to its number
+/// (`syscall_rollback`).
+pub(crate) fn force_sigsys_seccomp(
+    ctx: &mut dyn TrapContext,
+    task: u64,
+    nr: u32,
+    arch: u32,
+    data: u16,
+    force_coredump: bool,
+) {
+    const SIGSYS: u32 = 31;
+    let bit = sig_bit(SIGSYS);
+    let action = sigaction_lookup_full(task, SIGSYS as usize);
+    let blocked = signal_mask_of(task) & bit != 0;
+    let usable = action.filter(|a| a.handler > 1 && !blocked && !force_coredump);
+    let Some(action) = usable else {
+        if action.is_some() {
+            if let Some(h) = task_map_get(&SIGACTION_TABLE, task) {
+                h.lock()[SIGSYS as usize] = None;
+            }
+        }
+        if blocked {
+            let _ = set_signal_mask_for_task(task, signal_mask_of(task) & !bit);
+        }
+        if crate::ptrace::ptrace_intercept_signal(ctx, SIGSYS) {
+            return;
+        }
+        terminate_current_task(ctx, task, SIGSYS, true);
+        return;
+    };
+    if crate::ptrace::ptrace_intercept_signal(ctx, SIGSYS) {
+        return;
+    }
+    const SYS_SECCOMP: i32 = 1;
+    // SiginfoLayout::Sys carries `si_syscall` / `si_arch` in `si_value` (the
+    // two ints at offsets 24 and 28) and `si_errno` in `si_pid`.
+    let mut params = build_delivery_params(
+        task,
+        action,
+        SIGSYS,
+        SYSCALL_NUM_NONE,
+        SYS_SECCOMP,
+        ctx.rip(),
+        u64::from(nr) | (u64::from(arch) << 32),
+        u32::from(data),
+    );
+    params.restartable_syscall = false;
+    let interrupted_rsp = ctx.user_rsp();
+    if !ctx.deliver_signal(&params) {
+        // The frame could not be placed (overflowed stack): `force_sigsegv`'s
+        // shape, the task dies rather than running on without its handler.
+        terminate_current_task(ctx, task, SIGSYS, true);
+        return;
+    }
+    push_sigreturn_record(
+        task,
+        params.restorer != 0,
+        (params.flags & 0x4) != 0 || params.restorer != 0,
+        interrupted_rsp,
+        params.altstack_sp != 0,
+    );
+    {
+        let cur = take_suspend_saved_mask(task).unwrap_or_else(|| signal_mask_of(task));
+        set_sigreturn_saved_mask(task, cur);
+    }
+    if (action.flags & SA_NODEFER) == 0 {
+        let _ = signal_bits_update(&SIGNAL_MASK, task, |slot| *slot |= bit);
+        note_mask_change(task, 0, bit);
+    }
+    if (action.flags & SA_RESETHAND) != 0 {
+        if let Some(h) = task_map_get(&SIGACTION_TABLE, task) {
+            h.lock()[SIGSYS as usize] = None;
+        }
+    }
 }
 
 // ── Sigaction — record a per-task handler vaddr ────────────────────
@@ -12043,6 +13131,11 @@ struct ScmSendAncillary {
     cred: Option<crate::socket::Ucred>,
     /// Source-address override from an `IP_PKTINFO` / `IPV6_PKTINFO` cmsg.
     src_override: Option<crate::socket::SendPktInfo>,
+    /// What `udp_cmsg_send` makes of the `SOL_UDP` records: `None` when there
+    /// are none, `Ok(gso_size)` from the last `UDP_SEGMENT`, or the -EINVAL
+    /// of the first malformed one. A UDP send path applies it after its
+    /// address checks, where Linux parses it.
+    udp_gso: Option<Result<u16, i64>>,
 }
 
 /// Parse Linux `SOL_SOCKET` send control messages. `SCM_RIGHTS` descriptors
@@ -12056,11 +13149,13 @@ fn parse_scm_send_ancillary(
     const SCM_RIGHTS: i32 = 1;
     const SCM_CREDENTIALS: i32 = 2;
     const SCM_MAX_FD: usize = 253;
+    const SOL_UDP: i32 = 17;
     // struct cmsghdr { u64 cmsg_len; i32 cmsg_level; i32 cmsg_type; } = 16 B.
     let mut out = ScmSendAncillary {
         fds: alloc::vec::Vec::new(),
         cred: None,
         src_override: None,
+        udp_gso: None,
     };
     if ctrl_len == 0 {
         return Ok(out);
@@ -12133,6 +13228,19 @@ fn parse_scm_send_ancillary(
                 }
                 _ => return Err(EINVAL),
             }
+        } else if level == SOL_UDP {
+            // `udp_cmsg_send` → `__udp_cmsg_send`: UDP_SEGMENT must be exactly
+            // CMSG_LEN(sizeof(__u16)); any other SOL_UDP type is -EINVAL. The
+            // walk stops at the first error.
+            if !matches!(out.udp_gso, Some(Err(_))) {
+                out.udp_gso = Some(
+                    if ctype as u32 == narf_net::udp_gso::UDP_SEGMENT && cmsg_len == 16 + 2 {
+                        Ok(u16::from_ne_bytes([ctrl[off + 16], ctrl[off + 17]]))
+                    } else {
+                        Err(EINVAL)
+                    },
+                );
+            }
         } else if level == 0 && ctype == 8 {
             // SOL_IP / IP_PKTINFO: struct in_pktinfo { int ipi_ifindex;
             // in_addr ipi_spec_dst; in_addr ipi_addr; } = 12 bytes. The source
@@ -12199,12 +13307,32 @@ fn install_netlink_ancillary(
     put_cmsgs(msg_ptr, &records)
 }
 
+/// `udp_cmsg_recv`: on a `UDP_GRO` socket, a datagram delivered as a
+/// coalesced GSO skb (`SKB_GSO_UDP_L4`) carries `SOL_UDP` / `UDP_GRO` with
+/// its segment size as an `int`. `udp_recvmsg` / `udpv6_recvmsg` emit it
+/// after the socket-level records and before the IP-level ones.
+fn push_udp_gro_cmsg(
+    records: &mut alloc::vec::Vec<(i32, i32, alloc::vec::Vec<u8>)>,
+    gro_enabled: bool,
+    gso_size: u16,
+) {
+    const SOL_UDP: i32 = 17;
+    if gro_enabled && gso_size != 0 {
+        records.push((
+            SOL_UDP,
+            narf_net::udp_gso::UDP_GRO as i32,
+            i32::from(gso_size).to_ne_bytes().to_vec(),
+        ));
+    }
+}
+
 fn install_ipv6_ancillary(
     msg_ptr: u64,
     ancillary: Option<crate::socket::Inet6RecvAncillary>,
     pktinfo: bool,
     hoplimit: bool,
     tclass: bool,
+    udp_gro: bool,
 ) -> bool {
     const SOL_IPV6: i32 = 41;
     const IPV6_PKTINFO: i32 = 50;
@@ -12212,6 +13340,7 @@ fn install_ipv6_ancillary(
     const IPV6_TCLASS: i32 = 67;
     let mut records = alloc::vec::Vec::new();
     if let Some(ancillary) = ancillary {
+        push_udp_gro_cmsg(&mut records, udp_gro, ancillary.gso_size);
         // `ip6_datagram_recv_common_ctl` emits PKTINFO first, followed by
         // `ip6_datagram_recv_specific_ctl`'s HOPLIMIT and TCLASS records.
         if pktinfo {
@@ -12290,6 +13419,7 @@ fn install_ipv4_ancillary(
     msg_ptr: u64,
     rx: Option<crate::socket::Inet4RxInfo>,
     opts: crate::socket::Inet4CmsgOptions,
+    udp_gro: bool,
 ) -> bool {
     const SOL_IP: i32 = 0;
     const IP_TOS: i32 = 1;
@@ -12298,6 +13428,7 @@ fn install_ipv4_ancillary(
     const IP_ORIGDSTADDR: i32 = 20;
     let mut records = alloc::vec::Vec::new();
     if let Some(rx) = rx {
+        push_udp_gro_cmsg(&mut records, udp_gro, rx.gso_size);
         if opts.pktinfo {
             let mut info = alloc::vec::Vec::with_capacity(12);
             info.extend_from_slice(&(rx.ifindex as i32).to_ne_bytes());
@@ -12332,17 +13463,23 @@ fn install_ipv4_errqueue(msg_ptr: u64, ext: crate::socket::ExtSockError) -> bool
     const IP_RECVERR: i32 = 11;
     let mut data = alloc::vec::Vec::with_capacity(32);
     data.extend_from_slice(&ext.errno.to_ne_bytes()); // ee_errno
-    data.push(ext.origin); // ee_origin (SO_EE_ORIGIN_ICMP)
+    data.push(ext.origin); // ee_origin
     data.push(ext.icmp_type); // ee_type
     data.push(ext.icmp_code); // ee_code
     data.push(0); // ee_pad
-    data.extend_from_slice(&ext.info.to_ne_bytes()); // ee_info (next-hop MTU)
+    data.extend_from_slice(&ext.info.to_ne_bytes()); // ee_info (MTU)
     data.extend_from_slice(&0u32.to_ne_bytes()); // ee_data
-    // Offender sockaddr_in (family, port 0, addr, sin_zero).
-    data.extend_from_slice(&2u16.to_ne_bytes());
-    data.extend_from_slice(&0u16.to_be_bytes());
-    data.extend_from_slice(&ext.offender_ip);
-    data.extend_from_slice(&[0u8; 8]);
+    // Offender sockaddr_in. `ip_recv_error` zeroes it and fills family +
+    // address only when `ipv4_datagram_support_cmsg` holds — true for an
+    // ICMP-origin error, false for SO_EE_ORIGIN_LOCAL.
+    if ext.origin == crate::socket::SO_EE_ORIGIN_ICMP {
+        data.extend_from_slice(&2u16.to_ne_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
+        data.extend_from_slice(&ext.offender_ip);
+        data.extend_from_slice(&[0u8; 8]);
+    } else {
+        data.extend_from_slice(&[0u8; 16]);
+    }
     put_cmsgs(msg_ptr, &[(SOL_IP, IP_RECVERR, data)])
 }
 
@@ -13176,7 +14313,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     );
     table.install_raw(Syscall::Execve, "execve", RawFnHandler(sys_execve));
     // Batch 19: process & scheduling.
-    table.install_raw(Syscall::Vfork, "vfork", RawFnHandler(sys_fork));
+    table.install_raw(Syscall::Vfork, "vfork", RawFnHandler(sys_vfork));
     table.install_raw(Syscall::Execveat, "execveat", RawFnHandler(sys_execveat));
     table.install_raw(Syscall::Rseq, "rseq", RawFnHandler(sys_rseq));
     table.install_raw(
@@ -15721,7 +16858,7 @@ pub(crate) use {
     handler_sys_execve::sys_execve,
     handler_sys_execveat::sys_execveat,
     handler_sys_exit_group::sys_exit_group,
-    handler_sys_exit_task::sys_exit_task,
+    handler_sys_exit_task::{exit_current_thread, exit_group_current_thread, sys_exit_task},
     handler_sys_fadvise64::sys_fadvise64,
     handler_sys_fallocate::sys_fallocate,
     handler_sys_fb_connect::sys_fb_connect,
@@ -15739,7 +16876,7 @@ pub(crate) use {
     handler_sys_firmware_install::sys_firmware_install,
     handler_sys_flistxattr::sys_flistxattr,
     handler_sys_flock::sys_flock,
-    handler_sys_fork::sys_fork,
+    handler_sys_fork::{sys_fork, sys_vfork},
     handler_sys_fremovexattr::sys_fremovexattr,
     handler_sys_fsetxattr::sys_fsetxattr,
     handler_sys_fstatfs::sys_fstatfs,

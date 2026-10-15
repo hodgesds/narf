@@ -1269,11 +1269,18 @@ impl DirOps for ProcTaskTidDir {
                 tid: self.tid,
                 ino: proc_pid_ino(self.ino, name),
             })),
+            // `tid_base_stuff`: `REG("mem", S_IRUSR|S_IWUSR,
+            // proc_mem_operations)`. Every thread shares the group's mm, so
+            // the open binds the same address space `/proc/<pid>/mem` does.
+            "mem" => Some(Arc::new(super::mem::ProcMemNode {
+                pid: self.pid,
+                ino: proc_pid_ino(self.ino, name),
+            })),
             _ => None,
         }
     }
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
-        Box::new(["comm", "stat"].into_iter().map(|name| DirEntry {
+        Box::new(["comm", "mem", "stat"].into_iter().map(|name| DirEntry {
             name: name.into(),
             file_type: FileType::File,
         }))
@@ -1336,15 +1343,24 @@ impl DirOps for ProcTaskDir {
     fn ino(&self) -> u64 {
         pid_entry_ino(self.pid, "task")
     }
+    /// `fs/proc/base.c`: the directory inode starts at two links
+    /// (`proc_pident_instantiate`: "set_nlink(inode, 2)") and
+    /// `proc_task_getattr` adds `get_nr_threads(p)`. Chromium's sandbox
+    /// counts threads this way (`IsSingleThreaded`: `CHECK_LE(3, st_nlink)`,
+    /// single-threaded iff `st_nlink == 3`) and aborts when the count is
+    /// missing.
     fn inode_attrs(&self) -> crate::InodeAttrs {
-        super::proc_attrs()
+        let threads = u32::try_from(self.tids().len()).unwrap_or(u32::MAX);
+        crate::InodeAttrs {
+            nlink: threads.saturating_add(2),
+            tracked: true,
+            ..super::proc_attrs()
+        }
     }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let tid: u64 = name.parse().ok()?;
         if self.tids().contains(&tid) {
-            Some(Arc::new(ProcDirMarker {
-                ino: self.tid_dir_ino(tid),
-            }))
+            Some(Arc::new(ProcDirMarker::new(self.tid_dir_ino(tid))))
         } else {
             None
         }

@@ -345,12 +345,20 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         // the copy fixup below. Gated to the user half so a genuine kernel-
         // pointer bug can't be COW/demand-heal-attempted. This mirrors the
         // x86_64 #PF handler servicing a CPL=0 fault on a user vaddr.
-        let may_wait_for_reclaim = !narf_arch::aarch64::uaccess::guarded_copy_armed();
+        //
+        // A guarded copy's recovery is lifted off this CPU for the heal: a
+        // file-backed page can park the task on its read, and the task can
+        // resume on another CPU (see `uaccess::suspend_guarded_copy`).
+        let suspended = narf_arch::aarch64::uaccess::suspend_guarded_copy();
+        let may_wait_for_reclaim = suspended.is_none();
         // A Bus outcome is not healed: the guarded copy's fixup below turns
         // it into -EFAULT, as Linux's copy_*_user does over a SIGBUS page.
-        if in_user_half(far)
-            && try_heal_user_abort(esr, far, may_wait_for_reclaim) == HealOutcome::Healed
-        {
+        let healed = in_user_half(far)
+            && try_heal_user_abort(esr, far, may_wait_for_reclaim) == HealOutcome::Healed;
+        if let Some(s) = suspended {
+            narf_arch::aarch64::uaccess::resume_guarded_copy(s);
+        }
+        if healed {
             return;
         }
 

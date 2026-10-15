@@ -86,6 +86,57 @@ struct MappingOwner {
     /// Absolute in the FILE, not relative to `base`, so `punch` moving `base`
     /// and `file_offset` cannot invalidate it.
     zero_from: Option<u64>,
+    /// `/proc/<pid>/maps` identity of the mapped file, captured at `mmap`.
+    /// `None` when the creator recorded none (the exec loader's segments,
+    /// whose identity lives in the exec image table). Shared by `Arc` so
+    /// splits, moves and fork copy it without allocating.
+    provenance: Option<Arc<MappingProvenance>>,
+}
+
+/// The file identity Linux's `show_map_vma` prints for a VMA with a
+/// `vm_file`: `inode->i_sb->s_dev` (Linux `st_dev` encoding), `i_ino`, and
+/// the open path. Captured once at `mmap` — a file's identity never changes
+/// and its pathname is the one the mapping's open used.
+pub(crate) struct MappingProvenance {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    /// Host-absolute path the mapped fd was opened on; `None` when the fd
+    /// has no recorded path (memfd, anonymous inodes).
+    pub(crate) pathname: Option<alloc::string::String>,
+}
+
+/// One file-owner row's provenance, as `/proc/<pid>/maps` needs it.
+pub(crate) struct FileMappingProvenance {
+    pub(crate) base: u64,
+    pub(crate) len: u64,
+    /// File offset of `base`.
+    pub(crate) file_offset: u64,
+    pub(crate) provenance: Arc<MappingProvenance>,
+}
+
+/// Snapshot the provenance-carrying file owners of an address space. The
+/// table lock is held only while the rows are copied (Arc clones, no
+/// FileOps calls). Fallible: procfs also runs on the fatal-fault diagnostic
+/// path, so an allocation failure yields an empty snapshot (the VMAs then
+/// render as unknown backing) instead of aborting the kernel.
+pub(crate) fn file_provenance_snapshot(address_space_id: u64) -> Vec<FileMappingProvenance> {
+    let Some(bucket) = existing_mapping_owners(address_space_id) else {
+        return Vec::new();
+    };
+    let owners = bucket.lock();
+    let mut snapshot = Vec::new();
+    if snapshot.try_reserve_exact(owners.len()).is_err() {
+        return Vec::new();
+    }
+    snapshot.extend(owners.iter().filter_map(|mapping| {
+        Some(FileMappingProvenance {
+            base: mapping.base,
+            len: mapping.len,
+            file_offset: mapping.file_offset,
+            provenance: Arc::clone(mapping.provenance.as_ref()?),
+        })
+    }));
+    snapshot
 }
 
 type MappingOwners = Arc<IrqSafeSpinLock<Vec<MappingOwner>>>;
@@ -196,6 +247,8 @@ pub(crate) struct MappingOwnerRegistration {
     pub(crate) replace: bool,
     /// See [`MappingOwner::zero_from`]. Only the ELF loader sets it.
     pub(crate) zero_from: Option<u64>,
+    /// See [`MappingOwner::provenance`]. Set by `mmap(2)`.
+    pub(crate) provenance: Option<Arc<MappingProvenance>>,
 }
 
 pub(crate) fn publish_current_mapping(
@@ -214,6 +267,7 @@ pub(crate) fn publish_current_mapping(
         private_copy,
         replace,
         zero_from,
+        provenance,
     } = registration;
     let owner_bucket = mapping_owners(address_space_id);
     let mut owners = owner_bucket.lock();
@@ -233,6 +287,7 @@ pub(crate) fn publish_current_mapping(
             phys,
         }),
         zero_from,
+        provenance,
     });
     // Publication and owner registration are now atomic with respect to
     // faults. Release the IRQ-safe global table before PTE materialization,
@@ -868,10 +923,11 @@ fn current_address_space_id() -> Option<u64> {
 /// allocate and take its own locks — a BPF arena installs a kernel page-table
 /// entry inside it — and holding an owner bucket across that would put this
 /// lock beneath every lock any demand-pageable file might take, on a path
-/// entered from the page-fault handler.
-pub(crate) fn demand_frame(vaddr: u64) -> Result<u64, FileFaultError> {
+/// entered from the page-fault handler. `address_space_id` comes from the
+/// owning `AddressSpace`, not the CPU's currently active user root: ptrace may
+/// fault a stopped tracee's file-backed page while the tracer's root is live.
+pub(crate) fn demand_frame(address_space_id: u64, vaddr: u64) -> Result<u64, FileFaultError> {
     let page = vaddr & !0xFFFu64;
-    let address_space_id = current_address_space_id().ok_or(FileFaultError::NoOwner)?;
     let owner_bucket = existing_mapping_owners(address_space_id).ok_or(FileFaultError::NoOwner)?;
     let (offset, ops, generic_fallback, private_copy, zero_from) = {
         let owners = owner_bucket.lock();
@@ -915,7 +971,13 @@ pub(crate) fn demand_frame(vaddr: u64) -> Result<u64, FileFaultError> {
         return Ok(phys.raw());
     }
     if !generic_fallback {
-        return ops.mmap_fault(offset).map_err(fault_error);
+        // `filemap_fault`: an I/O-backed direct provider returns Pending with
+        // this task's executor waker registered on its cache fill. The common
+        // synchronous bridge parks the faulting own-stack task until that
+        // waker fires; it does not spin on a folio owned by another task.
+        return crate::handlers::poll_io_to_completion(ops.mmap_fault_async(offset))
+            .ok_or(FileFaultError::Bus)?
+            .map_err(fault_error);
     }
 
     // Linux filemap_fault first looks in the inode page cache, then reads a
@@ -1161,6 +1223,7 @@ fn register(
         writeback,
         // Not an ELF segment: no `padzero` window.
         zero_from: None,
+        provenance: None,
     });
 }
 
@@ -1256,6 +1319,7 @@ fn prepare_aliases_locked(
             lifetime: mapping.lifetime.clone(),
             private_copy: mapping.private_copy,
             zero_from: mapping.zero_from,
+            provenance: mapping.provenance.clone(),
             writeback,
         });
     }
@@ -1388,6 +1452,7 @@ fn prepare_relocated_owners_locked(
             lifetime: mapping.lifetime.clone(),
             private_copy: mapping.private_copy,
             zero_from: mapping.zero_from,
+            provenance: mapping.provenance.clone(),
             writeback,
         });
     }
@@ -1482,6 +1547,7 @@ fn prepare_punch_suffixes_locked(
             lifetime: mapping.lifetime.clone(),
             private_copy: mapping.private_copy,
             zero_from: mapping.zero_from,
+            provenance: mapping.provenance.clone(),
             writeback,
         });
     }
@@ -1589,6 +1655,7 @@ fn punch_locked(owners: &mut Vec<MappingOwner>, base: u64, len: u64) {
                     lifetime: mapping.lifetime.clone(),
                     private_copy: mapping.private_copy,
                     zero_from: mapping.zero_from,
+                    provenance: mapping.provenance.clone(),
                     writeback: mapping.writeback.clone(),
                 };
                 if let Some(wb) = suffix.writeback.as_mut() {
@@ -1641,6 +1708,7 @@ pub(crate) fn fork_address_space(parent_id: u64, child_id: u64) {
             lifetime: mapping.lifetime.clone(),
             private_copy: mapping.private_copy,
             zero_from: mapping.zero_from,
+            provenance: mapping.provenance.clone(),
             writeback: mapping.writeback.clone(),
         })
         .collect();

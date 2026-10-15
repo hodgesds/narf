@@ -34,7 +34,7 @@ use narf_block::fs_detect::{detect_filesystem, FsType};
 use narf_block::BlockDeviceSync;
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::{FsError, FsInstance};
+use crate::{FsError, FsInstance, TmpFs};
 
 /// Driver-supplied factory: given a parent block device, build
 /// the corresponding `FsInstance`. Returns an `FsError` on
@@ -108,6 +108,42 @@ pub enum RootMountError {
     /// A selected LUKS container could not be opened by the installed boot
     /// credential provider or failed authenticated metadata/keyslot checks.
     LuksUnlock(narf_block::encrypted::LuksOpenError),
+    /// The selected root filesystem was found, but construction of its
+    /// session-writable tmpfs overlay failed.
+    TmpfsOverlay(FsError),
+}
+
+/// Policy applied after the selected root filesystem has been constructed but
+/// before it is attached at `/`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RootMountOptions {
+    /// Place a writable tmpfs upper over the selected filesystem. Reads still
+    /// resolve from the selected filesystem, while all mutations are copied up
+    /// into RAM and vanish at shutdown.
+    pub tmpfs_overlay: bool,
+}
+
+/// Name reported by the session-writable root overlay.
+pub const ROOT_TMPFS_OVERLAY_NAME: &str = "root-tmpfs-overlay";
+
+/// Build a writable, session-only root view over an immutable filesystem.
+///
+/// The upper uses Linux-compatible tmpfs defaults, including a capacity limit
+/// of half of managed RAM.  Root ownership and mode are copied from the lower
+/// root so mounting the overlay cannot weaken the installed system's top-level
+/// DAC policy before any copy-up occurs.
+pub fn tmpfs_overlay_root(lower: Arc<dyn FsInstance>) -> Result<Arc<dyn FsInstance>, FsError> {
+    let lower_root = lower.root();
+    let (uid, gid) = lower_root.dir_owners();
+    let upper = TmpFs::from_options("mode=0755", uid, gid)?;
+    let upper_root = upper.root();
+    upper_root.set_dir_mode(lower_root.dir_mode());
+    upper_root.set_dir_owners(uid, gid);
+    Ok(Arc::new(crate::overlayfs::OverlayFs::new(
+        ROOT_TMPFS_OVERLAY_NAME,
+        upper_root,
+        alloc::vec![lower_root],
+    )))
 }
 
 /// Walk the block registry and mount the first viable filesystem on /.
@@ -123,7 +159,17 @@ pub fn try_mount_root(
     authority: &narf_capabilities::Cap<crate::MountPoint, narf_capabilities::Grant>,
 ) -> Result<MountReport, RootMountError> {
     let selector = crate::root_selector::RootSelector::from_cmdline(narf_boot::cmdline());
-    try_mount_root_with(authority, selector.as_ref())
+    // An installed Linux userspace needs a writable root for state such as
+    // browser profiles, package caches, and `/var`. NARF's disk filesystems
+    // are deliberately immutable during this bring-up phase, so systemd PID 1
+    // boots with an explicit root selector receive a tmpfs-backed OverlayFS
+    // root while the on-disk image stays the lower, untouched layer. The
+    // selector-free installed-root fallback is attached later at `/mnt` and
+    // applies the same wrapper there before PID 1 is spawned.
+    let options = RootMountOptions {
+        tmpfs_overlay: narf_boot::args().has_flag("systemd_pid1") && selector.is_some(),
+    };
+    try_mount_root_with_options(authority, selector.as_ref(), options)
 }
 
 /// Like [`try_mount_root`] but with the selector resolved already.
@@ -132,6 +178,20 @@ pub fn try_mount_root(
 pub fn try_mount_root_with(
     authority: &narf_capabilities::Cap<crate::MountPoint, narf_capabilities::Grant>,
     selector: Option<&crate::root_selector::RootSelector>,
+) -> Result<MountReport, RootMountError> {
+    try_mount_root_with_options(authority, selector, RootMountOptions::default())
+}
+
+/// Like [`try_mount_root_with`] with an explicit root-view policy.
+///
+/// Tests and non-systemd launchers normally use [`RootMountOptions::default`]
+/// and mount the selected filesystem directly.  An installed distro launcher
+/// sets [`RootMountOptions::tmpfs_overlay`] to preserve the immutable disk
+/// image while giving the session a writable root.
+pub fn try_mount_root_with_options(
+    authority: &narf_capabilities::Cap<crate::MountPoint, narf_capabilities::Grant>,
+    selector: Option<&crate::root_selector::RootSelector>,
+    options: RootMountOptions,
 ) -> Result<MountReport, RootMountError> {
     let devices = narf_block::block_devices();
     let mut last_error: Option<RootMountError> = None;
@@ -224,6 +284,11 @@ pub fn try_mount_root_with(
         // Mount on /. mount_arc returns the per-mount handle; we
         // discard it — root unmount on shutdown will use a separate
         // boot-time-stashed handle (follow-up).
+        let fs = if options.tmpfs_overlay {
+            tmpfs_overlay_root(fs).map_err(RootMountError::TmpfsOverlay)?
+        } else {
+            fs
+        };
         let _handle = crate::registry()
             .mount_arc(authority, "/", fs)
             .map_err(|e| RootMountError::FactoryFailed(detect, e))?;

@@ -1615,6 +1615,32 @@ fn smoke_xsave_caps_decode() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/xsave", smoke_xsave_caps_decode);
 
+/// CPUID.PKU must never be exposed to userspace without the CR4.PKE opt-in:
+/// Chromium uses RDPKRU during startup and the architectural response without
+/// PKE is #UD. Exercise the instructions in kernel mode too, while restoring
+/// the exact observed value so the smoke is non-destructive.
+#[cfg(target_arch = "x86_64")]
+fn smoke_pku_rdpkru_available_when_advertised() -> TestResult {
+    use crate::x86_64::pku;
+    if !pku::supported() {
+        return TestResult::Skip("PKU not advertised by this CPU");
+    }
+    if !pku::enabled() {
+        return TestResult::Fail("CPUID.PKU without CR4.PKE");
+    }
+    // SAFETY: the CR4.PKE gate was checked above; write back the same value.
+    let before = unsafe { pku::read() };
+    // SAFETY: the CR4.PKE gate was checked above; this restores `before` exactly.
+    unsafe { pku::write(before) };
+    // SAFETY: as above.
+    if unsafe { pku::read() } != before {
+        return TestResult::Fail("PKRU changed across same-value WRPKRU");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/pku", smoke_pku_rdpkru_available_when_advertised);
+
 /// `cpuid()` must return CPUID's real EBX.
 ///
 /// EBX cannot be an inline-asm operand on x86_64 ("rbx is used internally by

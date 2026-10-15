@@ -1051,8 +1051,12 @@ pub(crate) fn activate_direct_task(
         next_as.activate().map_err(|_| ())?;
     }
     let previous = core::mem::replace(&mut *active, next);
-    drop(active);
+    // Retarget the task id while the active-AS lock is still held, so the
+    // (task id, address space) pair is never observed half-switched under
+    // that lock: `address_space_of_running` reads the id under the same lock
+    // and would otherwise attribute the new task's root to the old task.
     current_task_slot().store(id, Ordering::Release);
+    drop(active);
     Ok(previous)
 }
 
@@ -3648,6 +3652,43 @@ pub fn address_space_of(id: TaskId) -> Option<Arc<AddressSpace>> {
         }
     }
     None
+}
+
+/// The address space of `id` while some CPU is polling it.
+///
+/// [`address_space_of`] cannot see such a task: the executor pops a slot off
+/// its ready queue for the whole poll and publishes the slot's address space
+/// in the CPU's active-AS cell instead. This reads that publication, and
+/// trusts it only when the CPU's current-task id names `id` WHILE the cell's
+/// lock is held. Every writer that installs a different task's address space
+/// in the cell either changes the id under the same lock
+/// (`activate_direct_task`) or stores the id before taking the lock and
+/// publishing (top-level dispatch, whose cell is empty until then), so the
+/// pair read under the lock never pairs one task's id with another task's
+/// root.
+pub fn address_space_of_running(id: TaskId) -> Option<Arc<AddressSpace>> {
+    if id.raw() == TaskId::NONE.raw() {
+        return None;
+    }
+    for cpu in 0..narf_lib::percpu::MAX_CPUS {
+        if CURRENT_TASK[cpu].load(Ordering::Acquire) != id.raw() {
+            continue;
+        }
+        let active = ACTIVE_USER_AS[cpu].lock();
+        if CURRENT_TASK[cpu].load(Ordering::Acquire) == id.raw() {
+            if let Some(addr_space) = active.as_ref() {
+                return Some(addr_space.clone());
+            }
+        }
+    }
+    None
+}
+
+/// [`address_space_of`], falling back to [`address_space_of_running`] for a
+/// task that is being polled right now: the address space of any live task,
+/// queued, parked or running.
+pub fn address_space_of_live(id: TaskId) -> Option<Arc<AddressSpace>> {
+    address_space_of(id).or_else(|| address_space_of_running(id))
 }
 
 /// Snapshot of every task currently sitting on a per-CPU ready

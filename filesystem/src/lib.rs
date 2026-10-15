@@ -77,6 +77,7 @@ pub mod devfs_misc;
 pub mod devfs_pty;
 pub mod devfs_rtc;
 pub(crate) mod devfs_vt;
+pub mod dma_buf;
 pub mod efivarfs;
 pub mod fifo;
 pub mod fs_registry;
@@ -928,6 +929,55 @@ pub trait IoctlContext: Sync {
     fn install_file(&self, _file: Arc<dyn FileOps>, _cloexec: bool) -> Result<i32, FsError> {
         Err(FsError::Unsupported)
     }
+    /// Linux `sync_file_get_fence(fd)` followed by `dma_fence_unwrap`: the
+    /// leaf fences of the sync_file open at `fd`, or `None` when `fd` is not
+    /// an open descriptor or names a file of another type (Linux folds both
+    /// into one `NULL`). The sync_file type belongs to the syscall layer;
+    /// drivers reach it only through this context.
+    fn sync_file_fences(&self, _fd: i32) -> Option<Vec<Arc<dyn DrmFence>>> {
+        None
+    }
+    /// Mint and install an `O_CLOEXEC` sync_file holding `fences`, exactly as
+    /// Linux `dma_buf_export_sync_file` composes `get_unused_fd_flags`,
+    /// `dma_resv_get_singleton`, `sync_file_create`, `copy_to_user` and
+    /// `fd_install`:
+    ///
+    /// * the descriptor is reserved first ([`InstallFdError::NoDescriptor`]
+    ///   is `EMFILE`);
+    /// * no fence is Linux's signalled `dma_fence_get_stub()`, one fence is
+    ///   that fence, several become one `dma_fence_array` container;
+    /// * `report` receives the reserved number and copies it out to the
+    ///   caller; its failure releases the reservation and nothing is
+    ///   installed ([`InstallFdError::Report`]).
+    fn install_sync_file(
+        &self,
+        _fences: Vec<Arc<dyn DrmFence>>,
+        _report: &mut dyn FnMut(i32) -> Result<(), FsError>,
+    ) -> Result<i32, InstallFdError> {
+        Err(InstallFdError::Report(FsError::Unsupported))
+    }
+    /// Linux's interruptible wait returning `-ERESTARTSYS`: arrange for the
+    /// calling syscall to park (waking on any wake, or after `repoll_ns`)
+    /// and then re-execute from its original arguments. A signal delivered
+    /// over the parked syscall restarts it under `SA_RESTART` and completes
+    /// it with `-EINTR` otherwise (`handle_signal`).
+    ///
+    /// `true` means the restart is arranged: the driver must return
+    /// `Err(FsError::WouldBlock)` having caused no side effect, so the
+    /// re-execution is idempotent. `false` means there is no executor to
+    /// park on (a kernel-test caller) and the driver waits synchronously.
+    fn restart_after(&self, _repoll_ns: u64) -> bool {
+        false
+    }
+}
+
+/// Failure of [`IoctlContext::install_sync_file`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallFdError {
+    /// `get_unused_fd_flags` failed: the table is at `RLIMIT_NOFILE` (`EMFILE`).
+    NoDescriptor,
+    /// The `report` callback failed (normally `EFAULT`); nothing was installed.
+    Report(FsError),
 }
 
 /// Filesystem-native quota inheritance requested while creating a snapshot.
@@ -1012,7 +1062,33 @@ pub trait DrmFence: Send + Sync {
     /// Driver-private execution context used to elide a self-dependency wait:
     /// work submitted later to the same ordered ring already depends on this
     /// fence. Foreign contexts return a different key (or `None`) and wait.
+    /// It is also Linux `dma_fence.context`: fences of one context are
+    /// ordered by [`DrmFence::seqno`], which `dma_fence_unwrap_merge` and
+    /// `dma_resv_add_fence` use to keep only the latest per context.
     fn context(&self) -> Option<u64> {
+        None
+    }
+
+    /// Linux `dma_fence.seqno` within [`DrmFence::context`].
+    fn seqno(&self) -> u64 {
+        0
+    }
+
+    /// Linux `dma_fence_ops.get_driver_name`, which `SYNC_IOC_FILE_INFO`
+    /// reports while the fence is unsignalled.
+    fn driver_name(&self) -> &str {
+        "narf"
+    }
+
+    /// Linux `dma_fence_ops.get_timeline_name`.
+    fn timeline_name(&self) -> &str {
+        "narf"
+    }
+
+    /// Linux `dma_fence.timestamp`: the `CLOCK_MONOTONIC` ns at which the
+    /// fence signalled, when the driver recorded it. `None` lets a sync_file
+    /// report the first instant it observed the signalled state instead.
+    fn timestamp_ns(&self) -> Option<u64> {
         None
     }
 }
@@ -1221,6 +1297,26 @@ pub trait FileOps: Send + Sync {
     /// not a byte offset — `/dev/kmsg`'s record cursor (`devkmsg_llseek`).
     fn llseek(&self, _offset: i64, _whence: u32) -> Option<Result<u64, i64>> {
         None
+    }
+
+    /// A file-specific `llseek` that, like Linux's `mem_lseek`
+    /// (`fs/proc/base.c`), owns `file->f_pos`: it receives the description's
+    /// current position and `Some(Ok(v))` both sets the position to `v` and
+    /// is lseek's return value. `Some(Err(e))` is a positive Linux errno and
+    /// leaves the position alone. `None` (the default) defers to
+    /// [`Self::llseek`] and then the generic path. `lseek` validates `whence`
+    /// against `SEEK_MAX` first.
+    fn llseek_pos(&self, _offset: i64, _whence: u32, _pos: u64) -> Option<Result<u64, i64>> {
+        None
+    }
+
+    /// Linux `FOP_UNSIGNED_OFFSET` (`unsigned_offsets()`): the file position
+    /// is an unsigned quantity — a virtual address for `/proc/<pid>/mem` —
+    /// so `rw_verify_area` admits a position at or past `LLONG_MAX` instead
+    /// of failing it with `-EINVAL` (and returns `-EOVERFLOW` only when the
+    /// transfer would wrap the 64-bit space).
+    fn unsigned_offsets(&self) -> bool {
+        false
     }
 
     fn copy_file_range_to<'a>(
@@ -1490,10 +1586,10 @@ pub trait FileOps: Send + Sync {
         false
     }
 
-    /// Whether [`FileOps::mmap_fault`] is a supported backing path.
+    /// Whether [`FileOps::mmap_fault_async`] is a supported backing path.
     ///
     /// This is an explicit capability rather than a speculative call to
-    /// `mmap_fault`: a fault outside the current EOF is a valid refusal, not
+    /// `mmap_fault_async`: a fault outside the current EOF is a valid refusal, not
     /// evidence that the file cannot supply cache folios for other offsets.
     fn supports_mmap_fault(&self) -> bool {
         false
@@ -1553,19 +1649,34 @@ pub trait FileOps: Send + Sync {
     /// as long as any mapping of the file can exist — which is what the
     /// syscall layer's mapping-held `Arc<dyn FileOps>` guarantees.
     ///
-    /// Called from the demand-paging arm of the trap handler, i.e. with no
-    /// address-space lock held and in a context that may allocate — but *not*
-    /// one that may await, so an implementation must be synchronous.
+    /// Called from the demand-paging arm of the trap handler with no
+    /// address-space lock held. The compatibility layer drives this future
+    /// with the faulting stackful task's real executor waker: `Pending` parks
+    /// that task until the provider wakes it, then the fault retries with the
+    /// same pinned future. Providers therefore must not busy-poll another
+    /// task's page-cache fill from the synchronous compatibility boundary.
     ///
     /// **Must be idempotent per offset**: two calls for the same offset must
     /// return the same frame. Two CPUs can fault the same page concurrently,
     /// and the address space keeps whichever answer it records first — a
     /// second, different frame would simply be dropped on the floor.
     ///
-    /// The default returns [`FsError::Unsupported`]. Implementations must
-    /// also return `true` from [`FileOps::supports_mmap_fault`]; the syscall
-    /// layer uses that side-effect-free capability check when creating the
-    /// initially unbacked VMA.
+    /// The default adapts the legacy synchronous [`FileOps::mmap_fault`]
+    /// hook. An I/O-backed provider overrides this method and awaits its
+    /// canonical cache fill directly. Implementations must also return `true`
+    /// from [`FileOps::supports_mmap_fault`]; the syscall layer uses that
+    /// side-effect-free capability check when creating the initially unbacked
+    /// VMA.
+    fn mmap_fault_async<'a>(&'a self, offset: u64) -> FsFuture<'a, u64> {
+        Box::pin(async move { self.mmap_fault(offset) })
+    }
+
+    /// Legacy immediate form of [`FileOps::mmap_fault_async`].
+    ///
+    /// RAM- and device-backed files may override this directly. Filesystems
+    /// whose page fault can wait for I/O should instead override
+    /// `mmap_fault_async`, so the common fault path can park the caller rather
+    /// than spin.
     fn mmap_fault(&self, _offset: u64) -> Result<u64, FsError> {
         Err(FsError::Unsupported)
     }

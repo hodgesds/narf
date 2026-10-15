@@ -24,8 +24,11 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 #[path = "region_index.rs"]
 mod region_index;
+#[path = "remote_access.rs"]
+mod remote_access;
 use crate::region_backing::RegionBacking;
 use region_index::RegionIndex;
+pub use remote_access::{RemoteAccess, RemoteBuf};
 
 /// Serializes creation and replacement of externally-owned shared aliases.
 ///
@@ -276,14 +279,15 @@ fn reserve_rmap_alias_slots(sorted_phys: &mut [PhysAddr]) -> Result<(), ()> {
 }
 
 /// Resolves a fault on an unbacked page of a `RegionPerms::FILE_DEMAND`
-/// mapping to the frame the backing file wants there. Takes the faulting
-/// (page-aligned) user VA, returns a page-aligned physical address.
+/// mapping to the frame the backing file wants there. Takes the stable
+/// address-space identity plus the faulting (page-aligned) user VA, and
+/// returns a page-aligned physical address.
 ///
 /// A `fn` pointer rather than a filesystem dependency: `narf-memory` sits
 /// below `narf-filesystem`, and the region table deliberately holds frames
 /// and no file objects (see `userspace/src/mapped_file.rs`). This is the same
 /// seam shape as [`install_shared_frame_hooks`] and `install_pager`.
-type FileFaultHook = fn(u64) -> Result<u64, FileFaultError>;
+type FileFaultHook = fn(u64, u64) -> Result<u64, FileFaultError>;
 
 /// Why the backing file could not supply a frame for a demand fault —
 /// Linux's `vm_fault_t` outcomes for a file-backed `->fault`.
@@ -317,13 +321,13 @@ pub fn install_file_fault_hook(hook: FileFaultHook) -> Option<FileFaultHook> {
     FILE_FAULT_HOOK.lock().replace(hook)
 }
 
-/// Ask the backing file for the frame at `vaddr`. Must be called with **no**
-/// address-space lock held — the hook re-enters the filesystem, which
-/// allocates, takes its own locks, and (for a BPF arena) installs a kernel
-/// page-table entry.
-fn file_fault_frame(vaddr: u64) -> Result<u64, FileFaultError> {
+/// Ask the backing file for the frame at `vaddr` in `address_space_id`. Must
+/// be called with **no** address-space lock held — the hook re-enters the
+/// filesystem, which allocates, takes its own locks, and (for a BPF arena)
+/// installs a kernel page-table entry.
+fn file_fault_frame(address_space_id: u64, vaddr: u64) -> Result<u64, FileFaultError> {
     let hook = (*FILE_FAULT_HOOK.lock()).ok_or(FileFaultError::NoOwner)?;
-    let phys = hook(vaddr)?;
+    let phys = hook(address_space_id, vaddr)?;
     // A zero or misaligned answer would be stored in a `phys` slot where zero
     // *means* "unbacked" and every consumer assumes page alignment, so it is
     // rejected here rather than corrupting the region table.
@@ -8276,11 +8280,28 @@ impl AddressSpace {
         v: u64,
         repair_backed: impl FnOnce(PhysAddr, RegionPerms) -> Result<(), AddressSpaceError>,
     ) -> Result<DemandPageClaim, AddressSpaceError> {
+        self.claim_demand_page_mode(v, false, repair_backed)
+    }
+
+    /// [`Self::claim_demand_page`] with Linux's `FOLL_FORCE` admission:
+    /// `force` also claims a page of a `PROT_NONE` VMA, which GUP's
+    /// `check_vma_flags` admits for a forced access (`VM_MAYREAD`). Only the
+    /// remote-access path passes `true`; a hardware fault never does.
+    fn claim_demand_page_mode(
+        &self,
+        v: u64,
+        force: bool,
+        repair_backed: impl FnOnce(PhysAddr, RegionPerms) -> Result<(), AddressSpaceError>,
+    ) -> Result<DemandPageClaim, AddressSpaceError> {
         let mut regions = self.regions.lock();
         let (index, phys, perms) = {
             let region = regions.containing(v).ok_or(AddressSpaceError::Unmapped)?;
             let rb = region.base.as_u64();
-            if region.perms.prot_only().0 == 0 {
+            // A stack guard is never backed, forced or not: the remote path
+            // grows the stack instead (Linux `expand_stack`).
+            if region.perms.prot_only().0 == 0
+                && (!force || region.perms.contains(RegionPerms::STACK_GUARD))
+            {
                 return Err(AddressSpaceError::Unmapped);
             }
             // `handle_pte_marker` -> VM_FAULT_SIGSEGV. Checked before the
@@ -8744,11 +8765,31 @@ impl AddressSpace {
     /// # Safety
     /// - Identity-map of low 4 GiB must be live (used to zero
     ///   the fresh frame and walk the page tables).
-    /// - `self.root` must be a valid page-table root for the AS
-    ///   currently active on this CPU (caller's CR3 / TTBR0).
+    /// - `self.root` must be a valid page-table root for the AS currently
+    ///   active on this CPU (the normal fault path), or for a ptrace-stopped
+    ///   tracee which cannot execute concurrently with this operation.
     /// - Frame allocator must be initialised.
     #[cfg(target_arch = "x86_64")]
     pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.demand_page_in(vaddr, false) }
+    }
+
+    /// The body of [`Self::demand_alloc_page`]. `force` is Linux's
+    /// `FOLL_FORCE` for a remote access (`access_remote_vm`): it also backs a
+    /// page of a `PROT_NONE` VMA. Such a page receives its frame but NO leaf
+    /// — a present user leaf would make it accessible to the owner, which
+    /// `PROT_NONE` forbids — exactly as `mprotect(PROT_NONE)` leaves resident
+    /// pages backed but unmapped.
+    ///
+    /// # Safety
+    /// As [`Self::demand_alloc_page`].
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) unsafe fn demand_page_in(
+        &self,
+        vaddr: VirtAddr,
+        force: bool,
+    ) -> Result<(), AddressSpaceError> {
         use crate::x86_64::paging::{map_4kb_demand, MapError};
         let v = vaddr.as_u64() & !0xFFFu64;
         // Swap faults are resolved before anonymous/file demand allocation.
@@ -8764,6 +8805,12 @@ impl AddressSpace {
                 Some(SwapPageState::Evicting(_)) | Some(SwapPageState::Loading) => return Ok(()),
                 Some(SwapPageState::Swapped) => {
                     let region = table.containing(v).ok_or(AddressSpaceError::Unmapped)?;
+                    // Swap-in publishes a leaf with the VMA's permissions,
+                    // which for PROT_NONE would be an accessible user leaf.
+                    // Only a forced remote access can reach here for one.
+                    if region.perms.prot_only().0 == 0 {
+                        return Err(AddressSpaceError::NotImplemented);
+                    }
                     let index = ((v - region.base.as_u64()) >> 12) as usize;
                     if region.phys.get(index).is_none_or(|phys| phys.raw() != 0) {
                         return Err(AddressSpaceError::NotImplemented);
@@ -8843,7 +8890,12 @@ impl AddressSpace {
                 _ => AddressSpaceError::OutOfRange,
             });
         }
-        let claim = self.claim_demand_page(v, |phys, perms| {
+        let claim = self.claim_demand_page_mode(v, force, |phys, perms| {
+            // A forced remote access to a backed PROT_NONE page needs the
+            // frame, never a leaf (see `demand_page_in`).
+            if perms.prot_only().0 == 0 {
+                return Ok(());
+            }
             // Already backed, yet this CPU took a not-present #PF for it.
             // There are two causes, distinguished by `map_4kb_demand`'s result
             // in a single root-locked walk:
@@ -8925,7 +8977,7 @@ impl AddressSpace {
         // this page. Other pages in the same CLONE_VM address space can now
         // allocate/zero or enter their backing file in parallel.
         let phys = if file_backed {
-            match file_fault_frame(v) {
+            match file_fault_frame(self.identity(), v) {
                 Ok(phys) => PhysAddr::new(phys),
                 Err(error) => {
                     self.cancel_demand_page(v, ticket);
@@ -8950,6 +9002,10 @@ impl AddressSpace {
         };
 
         let published = match self.finish_demand_page(v, ticket, phys, |phys, perms| {
+            if perms.prot_only().0 == 0 {
+                // Forced PROT_NONE backing: frame only (see `demand_page_in`).
+                return Ok(());
+            }
             let flags = user_leaf_flags(perms, user_page_writable(perms, phys));
             // SAFETY: finish_demand_page holds the authoritative region lock;
             // `phys` has just become this page's backing and the root is live.
@@ -8988,13 +9044,32 @@ impl AddressSpace {
     /// - The low-memory identity map must be live (used to zero the fresh
     ///   frame and walk the translation tables).
     /// - `self.root` must be a valid `TTBR0_EL1` root for the AS currently
-    ///   active on this CPU.
+    ///   active on this CPU (the normal fault path), or for a ptrace-stopped
+    ///   tracee which cannot execute concurrently with this operation.
     /// - The frame allocator must be initialised.
     #[cfg(target_arch = "aarch64")]
     pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.demand_page_in(vaddr, false) }
+    }
+
+    /// aarch64 twin of the x86_64 `demand_page_in`; see its documentation.
+    ///
+    /// # Safety
+    /// As [`Self::demand_alloc_page`].
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) unsafe fn demand_page_in(
+        &self,
+        vaddr: VirtAddr,
+        force: bool,
+    ) -> Result<(), AddressSpaceError> {
         use crate::aarch64::paging::{map_4kb, MapError};
         let v = vaddr.as_u64() & !0xFFFu64;
-        let claim = self.claim_demand_page(v, |phys, perms| {
+        let claim = self.claim_demand_page_mode(v, force, |phys, perms| {
+            // Forced PROT_NONE backing: frame only (see the x86_64 twin).
+            if perms.prot_only().0 == 0 {
+                return Ok(());
+            }
             // Already backed, yet this CPU faulted. Attempt the leaf install
             // directly so the common lazy-fork case takes one table walk.
             // AlreadyMapped means a peer installed it while this CPU's TLB /
@@ -9032,7 +9107,7 @@ impl AddressSpace {
         };
 
         let phys = if file_backed {
-            match file_fault_frame(v) {
+            match file_fault_frame(self.identity(), v) {
                 Ok(phys) => PhysAddr::new(phys),
                 Err(error) => {
                     self.cancel_demand_page(v, ticket);
@@ -9057,6 +9132,9 @@ impl AddressSpace {
         };
 
         let published = match self.finish_demand_page(v, ticket, phys, |phys, perms| {
+            if perms.prot_only().0 == 0 {
+                return Ok(());
+            }
             let flags = user_leaf_flags(perms, user_page_writable(perms, phys));
             // SAFETY: as on x86_64, publication and leaf installation are one
             // region-lock transaction against this live TTBR0 root.
@@ -9087,6 +9165,15 @@ impl AddressSpace {
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub unsafe fn demand_alloc_page(&self, _vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::NotImplemented)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) unsafe fn demand_page_in(
+        &self,
+        _vaddr: VirtAddr,
+        _force: bool,
+    ) -> Result<(), AddressSpaceError> {
         Err(AddressSpaceError::NotImplemented)
     }
 
@@ -11918,6 +12005,32 @@ impl AddressSpace {
     /// - The frame allocator + COW refcount table are
     ///   initialised.
     pub unsafe fn cow_split_on_write(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.cow_split_mode(vaddr, false) }
+    }
+
+    /// [`Self::cow_split_on_write`] with Linux's `FOLL_FORCE | FOLL_WRITE`
+    /// admission (`check_vma_flags`: a forced write to a `!VM_WRITE` VMA is
+    /// allowed when `is_cow_mapping`, i.e. any private mapping). `force`
+    /// therefore splits a shared frame in ANY non-`SHARED` region —
+    /// read-only text after fork, a `PROT_NONE` page — which is how a
+    /// debugger plants a breakpoint without writing through to the frame the
+    /// tracee's parent (or the vDSO master) still maps.
+    ///
+    /// # Safety
+    /// As [`Self::cow_split_on_write`].
+    pub(crate) unsafe fn cow_split_mode(
+        &self,
+        vaddr: VirtAddr,
+        force: bool,
+    ) -> Result<(), AddressSpaceError> {
+        let splittable = |perms: RegionPerms| {
+            if force {
+                !perms.contains(RegionPerms::SHARED)
+            } else {
+                perms.contains(RegionPerms::WRITE) && perms.contains(RegionPerms::COW)
+            }
+        };
         // Tickets are page-scoped: faults at different byte offsets in one
         // page must serialize behind the same copy operation.
         let v = vaddr.as_u64() & !0xFFFu64;
@@ -11929,9 +12042,7 @@ impl AddressSpace {
             // A present write fault is recoverable only when fork explicitly
             // made this logically-writable private mapping COW. In particular,
             // mprotect(PROT_READ) must fall through to SIGSEGV.
-            if !region.perms.contains(RegionPerms::WRITE)
-                || !region.perms.contains(RegionPerms::COW)
-            {
+            if !splittable(region.perms) {
                 return Err(AddressSpaceError::Unmapped);
             }
             let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
@@ -11993,9 +12104,7 @@ impl AddressSpace {
             let owns_ticket = regions.cow_pages.get(&v).copied() == Some(ticket);
             let current_matches = regions.containing(v).is_some_and(|region| {
                 let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
-                region.perms.contains(RegionPerms::WRITE)
-                    && region.perms.contains(RegionPerms::COW)
-                    && region.phys.get(page_idx).copied() == Some(old_phys)
+                splittable(region.perms) && region.phys.get(page_idx).copied() == Some(old_phys)
             });
             if owns_ticket && current_matches {
                 let region = regions
@@ -13475,15 +13584,21 @@ static FILE_FAULT_HOOK_UNDER_TEST: IrqSafeSpinLock<Option<FileFaultHook>> =
 static TEST_FAULT_PAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static TEST_FAULT_FRAME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static TEST_FAULT_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Identity supplied to the test fault hook. This makes the hook boundary's
+/// target-AS routing observable: a tracer must never resolve a FILE_DEMAND
+/// page through the tracer's currently active address space.
+static TEST_FAULT_ADDRESS_SPACE_ID: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 /// Error the test hook answers `TEST_FAULT_PAGE` with instead of a frame:
 /// 0 = none (serve the frame), 1 = `Bus`, 2 = `NoMemory`.
 static TEST_FAULT_ERROR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-fn test_file_fault_hook(vaddr: u64) -> Result<u64, FileFaultError> {
+fn test_file_fault_hook(address_space_id: u64, vaddr: u64) -> Result<u64, FileFaultError> {
     use core::sync::atomic::Ordering;
     let page = TEST_FAULT_PAGE.load(Ordering::Relaxed);
     if page != 0 && vaddr == page {
         TEST_FAULT_CALLS.fetch_add(1, Ordering::Relaxed);
+        TEST_FAULT_ADDRESS_SPACE_ID.store(address_space_id, Ordering::Relaxed);
         match TEST_FAULT_ERROR.load(Ordering::Relaxed) {
             1 => return Err(FileFaultError::Bus),
             2 => return Err(FileFaultError::NoMemory),
@@ -13492,7 +13607,7 @@ fn test_file_fault_hook(vaddr: u64) -> Result<u64, FileFaultError> {
         return Ok(TEST_FAULT_FRAME.load(Ordering::Relaxed));
     }
     let chained = *FILE_FAULT_HOOK_UNDER_TEST.lock();
-    chained.map_or(Err(FileFaultError::NoOwner), |h| h(vaddr))
+    chained.map_or(Err(FileFaultError::NoOwner), |h| h(address_space_id, vaddr))
 }
 
 /// Put the test hook in front of whatever is installed, chaining to it.
@@ -14314,6 +14429,7 @@ fn smoke_memory_file_demand_page_comes_from_the_hook() -> TestResult {
     TEST_FAULT_PAGE.store(fault_page, Ordering::Relaxed);
     TEST_FAULT_FRAME.store(phys.raw(), Ordering::Relaxed);
     TEST_FAULT_CALLS.store(0, Ordering::Relaxed);
+    TEST_FAULT_ADDRESS_SPACE_ID.store(0, Ordering::Relaxed);
     arm_test_file_fault_hook();
 
     // SAFETY: `a` is a live user root from `new_for_user`; the identity map is
@@ -14331,6 +14447,8 @@ fn smoke_memory_file_demand_page_comes_from_the_hook() -> TestResult {
         TestResult::Fail("a FILE_DEMAND fault was not served by the hook")
     } else if TEST_FAULT_CALLS.load(Ordering::Relaxed) != 1 {
         TestResult::Fail("the fault did not reach the file-fault hook exactly once")
+    } else if TEST_FAULT_ADDRESS_SPACE_ID.load(Ordering::Relaxed) != a.identity() {
+        TestResult::Fail("the file-fault hook did not receive the faulting address-space identity")
     } else if slot != Some(phys) {
         TestResult::Fail("the region does not hold the frame the hook named")
     } else if !mapped {
@@ -14354,6 +14472,7 @@ fn smoke_memory_file_demand_page_comes_from_the_hook() -> TestResult {
     // Disarm by address, not by uninstalling: the hook stays in front as a
     // pure delegate. See `arm_test_file_fault_hook`.
     TEST_FAULT_PAGE.store(0, Ordering::Relaxed);
+    TEST_FAULT_ADDRESS_SPACE_ID.store(0, Ordering::Relaxed);
     // The region is SHARED, so teardown clears PTEs and frees nothing: this
     // frame is ours to return, exactly as a file's would be its own.
     drop(a);

@@ -47,6 +47,31 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // A blocking write() to a TCP or AF_UNIX stream is its family's
+    // `*_sendmsg` without flags: it returns only once the whole buffer is
+    // queued.
+    if !endpoint.nonblocking() {
+        if let Ok(sock) = current_socket_result(fd_num) {
+            if !socket_listener_nonblock(task, fd_num, sock.as_ref()) {
+                let resumed = handler_sys_socket_recv::sock_timeo_take(ctx, &sock);
+                if sock.domain == crate::socket::AF_UNIX
+                    && sock.kind == crate::socket::SOCK_STREAM
+                {
+                    handler_sys_socket_send::unix_blocking_send(
+                        ctx, 0, &sock, user_ptr, count, resumed,
+                    );
+                    return;
+                }
+                if let Some(tcb) = sock.kernel_tcb_id() {
+                handler_sys_socket_send::tcp_blocking_send(
+                    ctx, fd_num, 0, &sock, tcb, user_ptr, count, resumed,
+                );
+                return;
+                }
+            }
+        }
+    }
+
     if crate::pipe::is_pipe(endpoint.ops.as_ref()) {
         write_pipe_user(ctx, &endpoint, count, |offset, bytes| {
             // SAFETY: validated scalar range; copy commits one page at a time.
@@ -83,7 +108,7 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
     // It tests f_pos even for O_APPEND (i_size is only substituted later, in
     // generic_write_checks); streams pass ppos == NULL.
     if !endpoint.ops.is_stream() {
-        if let Err(errno) = rw_verify_area_pos(endpoint.description.offset(), requested) {
+        if let Err(errno) = rw_verify_area_file(endpoint.ops.as_ref(), endpoint.description.offset(), requested) {
             ctx.set_return(errno_ret(errno));
             return;
         }

@@ -101,6 +101,13 @@ pub fn tx_ring(iface: &Cap<NetIface, Tx>, queue: u16) -> Ring<Frame>;
   stack daemon ever touches the bytes on the hot path.
 - Multi-queue is explicit. The consumer chooses queue affinity;
   default is "per-CPU queue" for hash-steered RX.
+- A zero-copy TX allocator chooses its queue before handing out a `Frame` and
+  records that choice in the frame. The driver submits and recycles the buffer
+  on the same queue; it must not return it to an interface-wide pool shared by
+  independent completion cores.
+- Resolved interface snapshots retain references to their TX recyclers. The
+  routing/TCP fast path acquires from that snapshot, not by taking the global
+  interface-registry lock once per packet.
 
 The in-tree `Frame` owns a DMA buffer, payload offset and length. Its
 `tx_meta()` / `set_tx_meta(TxMeta)` and `rx_meta()` / `set_rx_meta(RxMeta)`
@@ -132,6 +139,18 @@ New interfaces default to disabled. A driver opts in only when every RX path
 feeding that interface flushes the current CPU's GRO table at poll completion.
 Enabling one interface never changes receive semantics for another interface;
 `NetIfaceSnapshot::software_gro` records the selected state.
+
+The coalescer follows Linux's merge rules (`inet_gro_receive`,
+`tcp4_gro_receive`, `tcp_gro_receive`). Only an unfragmented IPv4 segment
+without IP options, whose total length matches the frame (no Ethernet
+padding) and whose IPv4 and TCP checksums verify, is eligible; anything else
+is delivered unchanged, after any segments held for its flow. A segment joins
+a held flow only when it continues the sequence, is no larger than the flow's
+first segment (its MSS), and matches the held header in every other field:
+TCP flags except PSH, ACK, window, all option bytes (timestamps included),
+TTL, TOS, DF, and a fixed or per-segment-incrementing IP ID. PSH, a short
+segment, or the size ceiling ends the batch. SYN/FIN/RST/URG, pure ACKs and
+segments without ACK are never held; they flush their flow first.
 
 ### 3.3 Control-plane operations
 
@@ -465,6 +484,22 @@ headers with one identification and eight-byte-aligned non-final payloads.
 Packets retained during neighbor discovery preserve the MTU decision and are
 fragmented only after resolution, before device transmission.
 
+Received IPv4 fragments addressed to this host are reassembled by
+`ip_fragment::ip_defrag` at Linux's `ip_local_deliver` point: after the input
+routing decision (forwarded fragments are never reassembled) and before
+netfilter LOCAL_IN, which sees the whole datagram. Queues are keyed by
+(namespace, saddr, daddr, id, protocol) and follow `ip_frag_queue` /
+`inet_frag_queue_insert`: an overlapping fragment discards the whole queue,
+one wholly inside an existing run is a dropped duplicate, a non-final
+fragment's length is truncated to a multiple of 8, and a datagram longer
+than 65535 bytes fails. Over `IPFRAG_HIGH_THRESH` (4 MiB per namespace) every
+fragment is refused. A queue older than `IPFRAG_TIME_NS` (30 s) is freed by
+`ip_fragment::tick` from the net timer pump, sending ICMP Time Exceeded code 1
+quoting the first fragment when offset 0 had arrived. The reassembled
+datagram's transport checksum is verified in software over the whole
+payload. `ip_fragment::stats_in(ns)` returns the ReasmReqds / ReasmOKs /
+ReasmFails / ReasmTimeout counters `/proc/net/snmp` reports.
+
 Linux `/proc/net/{tcp,tcp6,udp,udp6,raw,arp,route,dev,nf_conntrack}` snapshots resolve
 the calling task's network namespace and exclude objects owned by every other
 namespace.
@@ -583,9 +618,13 @@ pub fn connect6_errno_in(ns: u64, addr: [u8; 16], port: u16) -> Result<u32, i32>
 pub fn listen6_in(ns: u64, addr: [u8; 16], port: u16, backlog: usize) -> Result<u32, ()>;
 pub fn send_errno(id: u32, buf: &[u8]) -> Result<usize, i32>;
 pub fn recv_errno(id: u32, buf: &mut [u8]) -> Result<usize, i32>; // Ok(0) = EOF
+pub fn recv_peek_errno(id: u32, buf: &mut [u8]) -> Result<usize, i32>;
 pub fn readable(id: u32) -> bool; // recv would not return EAGAIN
 pub fn writable(id: u32) -> bool; // send would not return EAGAIN
 pub fn shutdown_errno(id: u32, how: Shutdown) -> Result<(), i32>;
+pub fn close_linger(id: u32, zero_linger: bool) -> Result<(), ()>;
+pub enum TcpQueueIoctl { Inq, Outq, OutqNsd }
+pub fn queue_ioctl(id: u32, which: TcpQueueIoctl) -> Result<u32, i32>;
 pub fn take_sock_error(id: u32) -> i32;  // getsockopt(SO_ERROR); 0 = none
 pub fn release(id: u32);                 // socket closed: forget the TCB id
 pub fn signal_icmp_error_in(ns, local, lport, remote, rport,
@@ -605,6 +644,27 @@ Successful `recv` / `recv_errno` calls track the last raw receive window sent
 on the connection. Once application reads cumulatively reopen at least one
 peer MSS, the stack emits an immediate pure ACK/window update; a sender is not
 left waiting for its persist timer after userspace has drained a full buffer.
+
+`recv_peek_errno` is `MSG_PEEK`: it copies the current in-order receive
+prefix without consuming it or sending a window update. `queue_ioctl` supplies
+the kernel-TCP values for `SIOCINQ`/`FIONREAD` (queued readable bytes),
+`SIOCOUTQ` (queued but unacknowledged bytes), and `SIOCOUTQNSD` (queued but
+not-yet-sent bytes); listeners receive `EINVAL`. User-set `SO_SNDBUF` and
+`SO_RCVBUF` constrain the respective TCB queue limits (the receive queue uses
+the advertised-window share of the doubled Linux-visible value).
+
+`close_linger(id, true)` is `SO_LINGER { .l_onoff = 1, .l_linger = 0 }` and
+aborts an active connection with an RST. A regular close with unread received
+data also resets, rather than presenting a clean FIN. A regular close marks a
+FIN-WAIT connection orphaned; FIN-WAIT-2 then expires after `tcp_fin_timeout`
+(60 seconds). TIME-WAIT keeps only tuple/sequence/timestamp state plus unread
+receive bytes; it releases its send/retransmit and SACK storage.
+
+The core functions remain non-blocking. The userspace socket layer implements
+blocking stream `send`/`write` and `MSG_WAITALL` as a re-executed wait loop:
+it preserves the partial byte count and the `SO_SNDTIMEO`/`SO_RCVTIMEO`
+deadline across each readiness park, returning a partial count after progress
+when a signal or timeout ends the loop.
 
 The opt-in software GRO path coalesces contiguous Ethernet/IPv4/TCP data up to
 65,000 payload bytes per flow and flushes at a driver's RX-poll completion.

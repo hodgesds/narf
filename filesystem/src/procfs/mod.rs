@@ -71,6 +71,8 @@ use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, 
 
 pub mod aggregate;
 pub mod bus;
+pub mod mem;
+pub use mem::{install_proc_mem_hook, ProcMemAccess, ProcMemOpenFn};
 pub mod net;
 pub mod pid_ext;
 pub mod pressure;
@@ -290,6 +292,10 @@ pub struct ProcTaskInfo {
     /// decide whether a unit is already sandboxed, so reporting 0 for a
     /// task that had set it understated the confinement in place.
     pub no_new_privs: bool,
+    /// `Seccomp:` — the task's seccomp mode (0 disabled, 1 strict, 2 filter).
+    pub seccomp_mode: u8,
+    /// `Seccomp_filters:` — the number of filters attached to the task.
+    pub seccomp_filters: u32,
 }
 
 /// A key-value pair from the ELF auxiliary vector.  Used by
@@ -323,8 +329,8 @@ pub struct ProcFdSnapshot {
 }
 
 /// One virtual-memory area entry. Mirrors what `/proc/[pid]/maps`
-/// reports per line: range, protection bits, and an optional name.
-#[derive(Copy, Clone, Debug, Default)]
+/// reports per line: range, protection bits, and optional file backing.
+#[derive(Clone, Debug, Default)]
 pub struct ProcVma {
     pub start: u64,
     pub end: u64,
@@ -332,6 +338,17 @@ pub struct ProcVma {
     pub writable: bool,
     pub executable: bool,
     pub shared: bool,
+    /// Byte offset into the backing file. Zero for anonymous mappings.
+    pub file_offset: u64,
+    /// Linux `st_dev` encoding of the backing file's filesystem. Zero for an
+    /// anonymous mapping or when the mapping's backing identity is unknown.
+    pub device: u64,
+    /// Backing file's inode number. Zero for an anonymous mapping or when the
+    /// mapping's backing identity is unknown.
+    pub inode: u64,
+    /// Known file backing pathname. `None` for anonymous mappings or a
+    /// mapping whose backing identity is unavailable.
+    pub pathname: Option<String>,
     /// Optional Linux-style label (`[heap]`, `[stack]`, `[vdso]`).
     /// Empty for anonymous mappings.
     pub label: &'static str,
@@ -502,6 +519,33 @@ pub(crate) fn pid_report(n: u64) -> Option<u64> {
     f(n)
 }
 
+/// A `/proc/<pid>/status` body rendered for the thread group, with the
+/// `Pid:` and `NSpid:` lines naming thread `tid` instead — what Linux's
+/// `proc_pid_status` prints for `/proc/<tid>/status` (`Tgid:` and `NStgid:`
+/// keep the group id).
+fn thread_status(body: String, tid: u64) -> String {
+    body.lines()
+        .map(|l| {
+            if l.starts_with("Pid:\t") {
+                format!("Pid:\t{tid}\n")
+            } else if l.starts_with("NSpid:\t") {
+                format!("NSpid:\t{tid}\n")
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect()
+}
+
+/// `/proc/<n>` where `n` names a thread that is not its group's leader:
+/// readdir lists only leaders, but `proc_pid_lookup` resolves any tid.
+/// Returns the thread group's outer pid, or `None` when `n` is a group
+/// leader (or names no thread). `n` is in the reader's namespace.
+fn thread_group_of_visible_tid(n: u64) -> Option<u64> {
+    let tgid = hook_thread_stat(n)?.tgid?;
+    (pid_resolve(n) != Some(tgid)).then_some(tgid)
+}
+
 fn list_pids() -> Vec<u64> {
     let v = LIST_PIDS_HOOK.load(Ordering::Acquire);
     if v == 0 {
@@ -600,6 +644,9 @@ pub struct ThreadStat {
     /// tid at a time — so a per-thread `stat` that borrowed the process's
     /// letter reported a parked thread as running.
     pub state: char,
+    /// The outer pid of the thread's group (`task->tgid`), when the thread
+    /// belongs to a process. Lets `/proc/<tid>` resolve a non-leader thread.
+    pub tgid: Option<u64>,
 }
 type ThreadStatFn = fn(u64) -> Option<ThreadStat>;
 
@@ -1637,6 +1684,11 @@ pub(crate) fn task_file_owners(pid: u64) -> (u32, u32) {
 
 struct ProcPidFile {
     pid: u64,
+    /// `Some(tid)` for `/proc/<tid>` opened by a non-leader thread's id: the
+    /// thread group's file, but stat/status describe that thread (its pid
+    /// field and state), as `proc_pid_lookup` hands Linux's `/proc/<tid>`
+    /// the thread's own task. The tid is the one the reader named.
+    thread: Option<u64>,
     field: PidField,
     /// `/proc/<pid>/<name>`'s inode (see `pid_entry_ino`).
     ino: u64,
@@ -1714,9 +1766,32 @@ impl FileOps for ProcPidFile {
                     return Err(FsError::NoSuchProcess);
                 }
             };
+            // `/proc/<tid>`: the thread's own pid field and state.
+            let thread_view = self.thread.map(|tid| {
+                let state = hook_thread_stat(tid).map(|t| t.state);
+                (tid, state)
+            });
             let body = match field {
-                PidField::Stat => render_stat(&info),
-                PidField::Status => render_status(&info),
+                PidField::Stat => match thread_view {
+                    Some((tid, state)) => render_stat(&ProcTaskInfo {
+                        pid: tid,
+                        state: state.unwrap_or(info.state),
+                        ..info
+                    }),
+                    None => render_stat(&info),
+                },
+                PidField::Status => match thread_view {
+                    // Tgid stays the group's; Pid/NSpid and State are the
+                    // thread's (`proc_pid_status`).
+                    Some((tid, state)) => thread_status(
+                        render_status(&ProcTaskInfo {
+                            state: state.unwrap_or(info.state),
+                            ..info
+                        }),
+                        tid,
+                    ),
+                    None => render_status(&info),
+                },
                 PidField::Cmdline => return slice_read(&info.cmdline, offset, buf),
                 PidField::Maps => render_maps(&info),
                 PidField::NumaMaps => render_numa_maps(&info),
@@ -1808,6 +1883,19 @@ pub(crate) struct ProcDirMarker {
     /// sees the marker) and `fstat` of an open fd (which sees the DirOps)
     /// agree.
     pub(crate) ino: u64,
+    /// The directory's attributes, for the same `stat`/`fstat` agreement.
+    /// Most procfs directories report the untracked defaults; `task` reports
+    /// its live `2 + nr_threads` link count.
+    pub(crate) attrs: crate::InodeAttrs,
+}
+
+impl ProcDirMarker {
+    pub(crate) fn new(ino: u64) -> Self {
+        Self {
+            ino,
+            attrs: proc_attrs(),
+        }
+    }
 }
 
 impl FileOps for ProcDirMarker {
@@ -1815,7 +1903,7 @@ impl FileOps for ProcDirMarker {
         self.ino
     }
     fn inode_attrs(&self) -> crate::InodeAttrs {
-        proc_attrs()
+        self.attrs
     }
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Err(FsError::Unsupported) })
@@ -1838,6 +1926,8 @@ impl FileOps for ProcDirMarker {
 #[derive(Debug)]
 struct ProcPidDir {
     pid: u64,
+    /// See [`ProcPidFile::thread`].
+    thread: Option<u64>,
 }
 
 impl DirOps for ProcPidDir {
@@ -1850,10 +1940,15 @@ impl DirOps for ProcPidDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         // Subdirectory markers — resolve_async calls lookup_dir next.
         match name {
-            "fd" | "fdinfo" | "task" | "ns" | "attr" => {
+            "task" => {
+                let dir = pid_ext::ProcTaskDir { pid: self.pid };
                 return Some(Arc::new(ProcDirMarker {
                     ino: pid_entry_ino(self.pid, name),
-                }))
+                    attrs: crate::DirOps::inode_attrs(&dir),
+                }));
+            }
+            "fd" | "fdinfo" | "ns" | "attr" => {
+                return Some(Arc::new(ProcDirMarker::new(pid_entry_ino(self.pid, name))))
             }
             _ => {}
         }
@@ -1879,6 +1974,13 @@ impl DirOps for ProcPidDir {
             }
             _ => {}
         }
+        // `REG("mem", S_IRUSR|S_IWUSR, proc_mem_operations)`.
+        if name == "mem" {
+            return Some(Arc::new(mem::ProcMemNode {
+                pid: self.pid,
+                ino: pid_entry_ino(self.pid, name),
+            }));
+        }
         // Core flat files.
         let field = match name {
             "stat" => PidField::Stat,
@@ -1898,6 +2000,7 @@ impl DirOps for ProcPidDir {
             pid: self.pid,
             field,
             ino: pid_entry_ino(self.pid, name),
+            thread: self.thread,
             rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
         }))
     }
@@ -1929,6 +2032,10 @@ impl DirOps for ProcPidDir {
                 },
                 DirEntry {
                     name: "maps".into(),
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "mem".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
@@ -2363,9 +2470,10 @@ impl DirOps for ProcRoot {
             // via lookup_dir("pressure"). Static (no feature gate) so
             // it is always present, like meminfo — systemd's
             // memory-pressure event source needs it to exist.
-            "pressure" => Some(Arc::new(ProcDirMarker {
-                ino: proc_static_ino(PROC_ROOT_INO, "pressure"),
-            })),
+            "pressure" => Some(Arc::new(ProcDirMarker::new(proc_static_ino(
+                PROC_ROOT_INO,
+                "pressure",
+            )))),
             "self" => Some(Arc::new(ProcSelfSymlink)),
             // /proc/thread-self is a magic symlink (like /proc/self) that
             // resolves to `<tgid>/task/<tid>` of the CALLING thread.
@@ -2384,9 +2492,9 @@ impl DirOps for ProcRoot {
                             file: f,
                             ino: registry_ino(&[name]),
                         }) as Arc<dyn FileOps>,
-                        ProcNodeSnapshot::Dir(_) => Arc::new(ProcDirMarker {
-                            ino: registry_ino(&[name]),
-                        }) as Arc<dyn FileOps>,
+                        ProcNodeSnapshot::Dir(_) => {
+                            Arc::new(ProcDirMarker::new(registry_ino(&[name]))) as Arc<dyn FileOps>
+                        }
                     });
                 }
                 // Numeric pid → directory marker (lookup-as-file).
@@ -2396,11 +2504,15 @@ impl DirOps for ProcRoot {
                 // READER's namespace; resolve it to the outer ProcessId (None →
                 // not visible in the reader's namespace → no such entry).
                 if let Ok(n) = name.parse::<u64>() {
+                    // A non-leader thread's id (see `thread_group_of_visible_tid`).
+                    // First: the process lookup's raw-task fallback would
+                    // otherwise answer for it as a one-thread process.
+                    if thread_group_of_visible_tid(n).is_some() {
+                        return Some(Arc::new(ProcDirMarker::new(pid_dir_ino(n))));
+                    }
                     if let Some(pid) = pid_resolve(n) {
                         if task_info(pid, TaskInfoQuery::Basic).is_some() {
-                            return Some(Arc::new(ProcDirMarker {
-                                ino: pid_dir_ino(pid),
-                            }));
+                            return Some(Arc::new(ProcDirMarker::new(pid_dir_ino(pid))));
                         }
                     }
                 }
@@ -2417,6 +2529,7 @@ impl DirOps for ProcRoot {
             // /proc/self resolves to the calling task's in-namespace pid translated to outer pid.
             return Some(Arc::new(ProcPidDir {
                 pid: self_outer_pid(),
+                thread: None,
             }));
         }
         if name == "thread-self" {
@@ -2440,9 +2553,15 @@ impl DirOps for ProcRoot {
         // namespace; translate to the outer ProcessId (None → not visible) and
         // validate liveness before materialising the dir keyed on the outer id.
         if let Ok(n) = name.parse::<u64>() {
+            if let Some(tgid) = thread_group_of_visible_tid(n) {
+                return Some(Arc::new(ProcPidDir {
+                    pid: tgid,
+                    thread: Some(n),
+                }));
+            }
             if let Some(pid) = pid_resolve(n) {
                 if task_info(pid, TaskInfoQuery::Basic).is_some() {
-                    return Some(Arc::new(ProcPidDir { pid }));
+                    return Some(Arc::new(ProcPidDir { pid, thread: None }));
                 }
             }
         }
@@ -2574,7 +2693,7 @@ impl DirOps for ProcDynamicDir {
         let ino = registry_ino(&path);
         match lookup_registry(&path) {
             Some(ProcNodeSnapshot::File(f)) => Some(Arc::new(ProcDynFile { file: f, ino })),
-            Some(ProcNodeSnapshot::Dir(_)) => Some(Arc::new(ProcDirMarker { ino })),
+            Some(ProcNodeSnapshot::Dir(_)) => Some(Arc::new(ProcDirMarker::new(ino))),
             None => None,
         }
     }
@@ -3275,14 +3394,20 @@ fn render_status(info: &ProcTaskInfo) -> String {
     {
         let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{label}:\t{set:016x}\n"));
     }
-    // Seccomp: 0 = disabled (SECCOMP_MODE_DISABLED). systemd reads this to
-    // decide whether a unit is already sandboxed. NoNewPrivs mirrors it.
+    // `fs/proc/array.c::task_seccomp`: NoNewPrivs, then the mode and the
+    // attached-filter count. systemd reads these to decide whether a unit is
+    // already sandboxed.
     let _ = core::fmt::Write::write_fmt(
         &mut s,
         format_args!("NoNewPrivs:\t{}\n", u32::from(info.no_new_privs)),
     );
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Seccomp:\t0\n"));
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Seccomp_filters:\t0\n"));
+    let _ = core::fmt::Write::write_fmt(
+        &mut s,
+        format_args!(
+            "Seccomp:\t{}\nSeccomp_filters:\t{}\n",
+            info.seccomp_mode, info.seccomp_filters
+        ),
+    );
     // Linux prints `%*pb` over `nr_cpu_ids` bits (not the mask's value), so
     // every process on one machine renders the same width — libnuma sizes
     // its CPU bitmap from it and then parses the node cpumaps against it.
@@ -3330,9 +3455,10 @@ fn render_cpu_list(mask: u64) -> String {
 
 fn render_maps(info: &ProcTaskInfo) -> String {
     // Linux /proc/[pid]/maps shape:
-    //   start-end perms offset dev:major:minor inode pathname
-    // We omit dev:major:minor (NARF doesn't yet model per-VMA
-    // backing files); pathname slot carries our label or empty.
+    //   start-end perms offset dev inode pathname
+    // Unknown backing uses `00:00 0`. The inode MUST still be followed by a
+    // space when the pathname is empty: Crashpad's DelimitedFileReader
+    // consumes the inode with `GetDelim(' ')`, exactly as it does on Linux.
     let mut s = String::new();
     for v in info.vmas.iter() {
         write_maps_line(&mut s, v);
@@ -3348,18 +3474,131 @@ fn write_maps_line(s: &mut String, v: &ProcVma) {
     let w = if v.writable { 'w' } else { '-' };
     let x = if v.executable { 'x' } else { '-' };
     let p = if v.shared { 's' } else { 'p' };
+    // Linux's `new_encode_dev()` stores the low eight minor bits directly,
+    // the twelve-bit major at bit eight, and high minor bits above bit 20.
+    // `/proc/<pid>/maps` displays the decoded pair, not the packed `dev_t`.
+    let device_major = (v.device >> 8) & 0x0fff;
+    let device_minor = (v.device & 0x00ff) | ((v.device >> 12) & !0x00ff);
     let _ = core::fmt::Write::write_fmt(
         s,
         format_args!(
-            "{:016x}-{:016x} {}{}{}{} 00000000 00:00 0",
-            v.start, v.end, r, w, x, p,
+            "{:016x}-{:016x} {}{}{}{} {:08x} {:02x}:{:02x} {} ",
+            v.start, v.end, r, w, x, p, v.file_offset, device_major, device_minor, v.inode,
         ),
     );
-    if !v.label.is_empty() {
-        let _ = core::fmt::Write::write_fmt(s, format_args!("          {}", v.label));
+    if let Some(pathname) = &v.pathname {
+        // `seq_path(m, path, "\n")` (`mangle_path`): a newline in the path
+        // becomes the octal escape `\012`, so one VMA stays one line.
+        for (i, part) in pathname.split('\n').enumerate() {
+            if i != 0 {
+                s.push_str("\\012");
+            }
+            s.push_str(part);
+        }
+    } else if !v.label.is_empty() {
+        let _ = core::fmt::Write::write_str(s, v.label);
     }
     s.push('\n');
 }
+
+/// Crashpad parses `/proc/<pid>/maps` with `GetDelim(' ')` for the inode,
+/// including anonymous mappings. Linux therefore leaves a separator after an
+/// otherwise pathless inode; ending the line immediately after `0` makes
+/// Chromium's crash handler reject the whole map as malformed.
+fn smoke_maps_anonymous_inode_is_space_terminated() -> TestResult {
+    let info = ProcTaskInfo {
+        vmas: alloc::vec![ProcVma {
+            start: 0x1000,
+            end: 0x2000,
+            readable: true,
+            writable: false,
+            executable: false,
+            shared: false,
+            ..ProcVma::default()
+        }],
+        ..sample_task_info()
+    };
+    let maps = render_maps(&info);
+    let Some(line) = maps.strip_suffix('\n') else {
+        return TestResult::Fail("maps line lacked a trailing newline");
+    };
+    let mut fields = line.splitn(6, ' ');
+    let valid = fields.next() == Some("0000000000001000-0000000000002000")
+        && fields.next() == Some("r--p")
+        && fields.next() == Some("00000000")
+        && fields.next() == Some("00:00")
+        && fields.next() == Some("0")
+        // This final empty field exists only when the inode was followed by
+        // the required delimiter; it is the exact Crashpad line-162 check.
+        && fields.next() == Some("");
+    if valid {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("anonymous maps inode is not space-delimited for Crashpad")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_maps_anonymous_inode_is_space_terminated
+);
+
+/// File-backed mappings must preserve their file identity, original offset,
+/// and pathname. Crashpad groups a module by `(dev, ino)` and finds its
+/// offset-zero segment before reading its ELF header.
+fn smoke_maps_file_backing_preserves_identity_offset_and_pathname() -> TestResult {
+    let info = ProcTaskInfo {
+        vmas: alloc::vec![ProcVma {
+            start: 0x400000,
+            end: 0x401000,
+            readable: true,
+            executable: true,
+            file_offset: 0x1000,
+            device: (8 << 8) | 19,
+            inode: 42,
+            pathname: Some(String::from("/usr/bin/chromium")),
+            ..ProcVma::default()
+        }],
+        ..sample_task_info()
+    };
+    let maps = render_maps(&info);
+    if maps == "0000000000400000-0000000000401000 r-xp 00001000 08:13 42 /usr/bin/chromium\n" {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("file-backed maps entry lost its identity, ELF offset, or pathname")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_maps_file_backing_preserves_identity_offset_and_pathname
+);
+
+/// `show_map_vma` prints the path through `seq_path(m, path, "\n")`, whose
+/// `mangle_path` octal-escapes a newline: one VMA must stay one line.
+fn smoke_maps_pathname_newline_is_octal_escaped() -> TestResult {
+    let info = ProcTaskInfo {
+        vmas: alloc::vec![ProcVma {
+            start: 0x400000,
+            end: 0x401000,
+            readable: true,
+            device: (8 << 8) | 19,
+            inode: 42,
+            pathname: Some(String::from("/tmp/a\nb")),
+            ..ProcVma::default()
+        }],
+        ..sample_task_info()
+    };
+    if render_maps(&info)
+        == "0000000000400000-0000000000401000 r--p 00000000 08:13 42 /tmp/a\\012b\n"
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("a newline in a mapped file's path was not rendered as \\012")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_maps_pathname_newline_is_octal_escaped
+);
 
 /// One `/proc/<pid>/smaps` VMA block, and the `smaps_rollup` summary, share
 /// this field list.
@@ -3672,6 +3911,7 @@ fn smoke_comm_file_is_owner_write_only() -> TestResult {
         pid: 1,
         field: PidField::Comm,
         ino: 0,
+        thread: None,
         rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     let perms = f.stat().mode.perms;
@@ -3687,6 +3927,7 @@ fn smoke_comm_file_is_owner_write_only() -> TestResult {
         pid: 1,
         field: PidField::Stat,
         ino: 0,
+        thread: None,
         rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     if ro.stat().mode.perms != 0o444 {
@@ -3704,6 +3945,7 @@ fn smoke_comm_write_updates_read() -> TestResult {
         pid: PID,
         field: PidField::Comm,
         ino: 0,
+        thread: None,
         rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     // Write with a trailing newline (Linux userspace shape).
@@ -3723,6 +3965,7 @@ fn smoke_comm_write_truncates_to_15() -> TestResult {
         pid: PID,
         field: PidField::Comm,
         ino: 0,
+        thread: None,
         rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     // 30 ASCII 'a' chars + newline — handler must accept and truncate.
@@ -3743,6 +3986,7 @@ fn smoke_non_comm_write_returns_readonly() -> TestResult {
         pid: 1,
         field: PidField::Stat,
         ino: 0,
+        thread: None,
         rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     let wr = poll_once(f.write(0, b"ignored\n"));
@@ -3880,6 +4124,8 @@ fn sample_task_info() -> ProcTaskInfo {
         tracer_pid: 0,
         fd_table_size: 64,
         no_new_privs: false,
+        seccomp_mode: 0,
+        seccomp_filters: 0,
     }
 }
 
@@ -3953,6 +4199,8 @@ fn smoke_status_reports_real_capabilities() -> TestResult {
         // that is not the full mask.
         caps: [0, 1 << 10, 1 << 10, 0x3ff, 0],
         no_new_privs: true,
+        seccomp_mode: 2,
+        seccomp_filters: 3,
         ..sample_task_info()
     };
     let body = render_status(&info);
@@ -3974,6 +4222,10 @@ fn smoke_status_reports_real_capabilities() -> TestResult {
     // NoNewPrivs was a hardcoded 0 beside them.
     if !body.contains("NoNewPrivs:\t1") {
         return TestResult::Fail("status did not report the real no_new_privs flag");
+    }
+    // And Seccomp/Seccomp_filters were hardcoded 0 below it.
+    if !body.contains("NoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t3\n") {
+        return TestResult::Fail("status did not report the real seccomp mode and filter count");
     }
     TestResult::Pass
 }
@@ -4083,6 +4335,10 @@ fn smoke_smaps_pss_is_sharer_weighted() -> TestResult {
         writable: true,
         executable: false,
         shared: false,
+        file_offset: 0,
+        device: 0,
+        inode: 0,
+        pathname: None,
         label: "",
         numa_policy: 0,
         numa_nodemask: 0,
@@ -4095,7 +4351,7 @@ fn smoke_smaps_pss_is_sharer_weighted() -> TestResult {
         private_pages: 2,
     };
     let info = ProcTaskInfo {
-        vmas: alloc::vec![vma],
+        vmas: alloc::vec![vma.clone()],
         ..sample_task_info()
     };
 
@@ -4123,7 +4379,7 @@ fn smoke_smaps_pss_is_sharer_weighted() -> TestResult {
     // The rollup sums the same numbers under one header, which is why
     // systemd reads it instead of walking every mapping.
     let two = ProcTaskInfo {
-        vmas: alloc::vec![vma, vma],
+        vmas: alloc::vec![vma.clone(), vma],
         ..sample_task_info()
     };
     let rollup = render_smaps_rollup(&two);
@@ -4160,6 +4416,10 @@ fn smoke_pid_stat_real_fields() -> TestResult {
             writable: false,
             executable: false,
             shared: false,
+            file_offset: 0,
+            device: 0,
+            inode: 0,
+            pathname: None,
             label: "",
             numa_policy: 2,
             numa_nodemask: 0b11,
@@ -4197,6 +4457,8 @@ fn smoke_pid_stat_real_fields() -> TestResult {
         tracer_pid: 0,
         fd_table_size: 64,
         no_new_privs: false,
+        seccomp_mode: 0,
+        seccomp_filters: 0,
     };
     let line = render_stat(&info);
     let f: Vec<&str> = line.split_whitespace().collect();
@@ -4307,6 +4569,8 @@ fn sample_info() -> ProcTaskInfo {
         tracer_pid: 0,
         fd_table_size: 64,
         no_new_privs: false,
+        seccomp_mode: 0,
+        seccomp_filters: 0,
     }
 }
 
@@ -4602,7 +4866,10 @@ fn smoke_procfs_inode_identity_is_stable_and_distinct() -> TestResult {
     if a.inode_attrs().dev != root.inode_attrs().dev {
         return TestResult::Fail("a procfs file is not on the procfs st_dev");
     }
-    let pid = ProcPidDir { pid: 7 };
+    let pid = ProcPidDir {
+        pid: 7,
+        thread: None,
+    };
     let (Some(stat), Some(status), Some(marker), Some(fd_dir)) = (
         pid.lookup("stat"),
         pid.lookup("status"),
@@ -4617,7 +4884,10 @@ fn smoke_procfs_inode_identity_is_stable_and_distinct() -> TestResult {
     if marker.ino() != fd_dir.ino() || marker.ino() == 0 {
         return TestResult::Fail("/proc/<pid>/fd: stat marker and DirOps inodes differ");
     }
-    let other = ProcPidDir { pid: 8 };
+    let other = ProcPidDir {
+        pid: 8,
+        thread: None,
+    };
     if pid.ino() == 0 || pid.ino() == other.ino() || pid.ino() == root.ino() {
         return TestResult::Fail("/proc/<pid> inode is not keyed on the pid");
     }

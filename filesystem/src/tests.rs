@@ -1879,6 +1879,60 @@ kernel_test_in!(
     smoke_fs_root_mount_walker_yields_no_mountable_on_empty_registry
 );
 
+/// An installed distro root is immutable on disk while NARF's ext support is
+/// brought up. Its session root must therefore be an overlay, not an empty
+/// tmpfs overmount: the installed files remain visible and mutations do not
+/// reach the lower image.
+fn smoke_fs_root_tmpfs_overlay_keeps_lower_visible_and_session_writable() -> TestResult {
+    use crate::root_mount::tmpfs_overlay_root;
+    use crate::{FsInstance, MemFs};
+    use alloc::sync::Arc;
+
+    let lower: Arc<dyn FsInstance> = Arc::new(MemFs::with_seeds(
+        "root-overlay-lower",
+        &[("etc-release", b"CachyOS")],
+    ));
+    let lower_root = lower.root();
+    lower_root.set_dir_mode(0o750);
+    lower_root.set_dir_owners(1000, 100);
+
+    let overlay = match tmpfs_overlay_root(Arc::clone(&lower)) {
+        Ok(overlay) => overlay,
+        Err(_) => return TestResult::Fail("tmpfs root overlay construction failed"),
+    };
+    let root = overlay.root();
+    if root.dir_mode() != 0o750 || root.dir_owners() != (1000, 100) {
+        return TestResult::Fail("tmpfs root overlay changed lower-root DAC metadata");
+    }
+
+    let release = match root.lookup("etc-release") {
+        Some(file) => file,
+        None => return TestResult::Fail("tmpfs root overlay hid a lower file"),
+    };
+    let mut bytes = [0u8; 16];
+    match poll_once_overlay(release.read(0, &mut bytes)) {
+        Some(Ok(len)) if &bytes[..len] == b"CachyOS" => {}
+        _ => return TestResult::Fail("tmpfs root overlay lower read-through failed"),
+    }
+
+    let state = match poll_once_overlay(root.create("session-state")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs root overlay rejected a write"),
+    };
+    match poll_once_overlay(state.write(0, b"ephemeral")) {
+        Some(Ok(9)) => {}
+        _ => return TestResult::Fail("tmpfs root overlay write did not complete"),
+    }
+    if lower_root.lookup("session-state").is_some() {
+        return TestResult::Fail("tmpfs root overlay wrote into its immutable lower");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/root_mount",
+    smoke_fs_root_tmpfs_overlay_keeps_lower_visible_and_session_writable
+);
+
 // ── filesystem/root_selector ───────────────────────────────────────
 
 fn smoke_root_selector_parses_dev_path() -> TestResult {

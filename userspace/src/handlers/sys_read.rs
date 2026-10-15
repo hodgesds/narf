@@ -145,6 +145,38 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // read(2) on a kernel-TCP socket is `sock_read_iter` -> `tcp_recvmsg`
+    // with no flags: the TCP errno (ECONNRESET, ETIMEDOUT, ...) is reported
+    // as is, and a blocking read honours SO_RCVTIMEO (`sock_rcvtimeo`). The
+    // generic FileOps path could do neither.
+    if let Ok(sock) = current_socket_result(fd_num) {
+        if let Some(tcb) = sock.kernel_tcb_id() {
+            let resumed = handler_sys_socket_recv::sock_timeo_take(ctx, &sock);
+            let nonblock = endpoint.nonblocking() || sock.is_nonblock();
+            let mut staging = alloc::vec![0u8; count.min(1 << 20)];
+            match narf_net::tcp_stack::recv_errno(tcb, &mut staging) {
+                Ok(n) => {
+                    // SAFETY: the complete destination range was validated above.
+                    if n > 0 && unsafe { copy_to_user(user_ptr, &staging[..n]) }.is_err() {
+                        ctx.set_return(errno_ret(EFAULT));
+                    } else {
+                        ctx.set_return(SyscallReturn::ok(n as u64));
+                    }
+                }
+                Err(e) if e == EAGAIN as i32 => {
+                    handler_sys_socket_recv::socket_recv_would_block(
+                        ctx,
+                        nonblock,
+                        sock.as_ref(),
+                        resumed,
+                    );
+                }
+                Err(e) => ctx.set_return(errno_ret(e as i64)),
+            }
+            return;
+        }
+    }
+
     if crate::pipe::is_pipe(endpoint.ops.as_ref()) {
         read_pipe_user(ctx, &endpoint, count, |offset, src, len| {
             // SAFETY: the queue retains this raw source and the scalar
@@ -201,7 +233,7 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
     // rw_verify_area(READ, file, &f_pos, count): f_pos + count past
     // LLONG_MAX is -EINVAL (streams pass ppos == NULL and skip this).
     if !endpoint.ops.is_stream() {
-        if let Err(errno) = rw_verify_area_pos(offset, requested) {
+        if let Err(errno) = rw_verify_area_file(endpoint.ops.as_ref(), offset, requested) {
             ctx.set_return(errno_ret(errno));
             return;
         }

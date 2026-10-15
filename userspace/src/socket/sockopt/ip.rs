@@ -70,9 +70,9 @@ impl SocketFile {
                 OK
             }
             IP_RECVERR => {
-                // LINUX-GAP: do_ip_setsockopt IP_RECVERR — stored and
-                // reported; NARF keeps no ICMP error queue, so MSG_ERRQUEUE
-                // stays empty.
+                // do_ip_setsockopt IP_RECVERR: enables the error queue —
+                // ICMP errors (`ip_icmp_error`) and local send errors
+                // (`ip_local_error`) are queued for MSG_ERRQUEUE.
                 o.ext.ip_recverr = on;
                 OK
             }
@@ -151,8 +151,9 @@ impl SocketFile {
                 if !(0..=IP_PMTUDISC_OMIT).contains(&val) {
                     return Some(EINVAL_R);
                 }
-                // LINUX-GAP: IP_MTU_DISCOVER — stored and reported; the IPv4
-                // output path does not set or clear DF from it.
+                // Read by the IPv4 output path (`narf_net::ip_output`): DF,
+                // the EMSGSIZE limit and local fragmentation for UDP and
+                // ping sockets.
                 o.ext.ip_pmtudisc = val;
                 OK
             }

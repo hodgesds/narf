@@ -512,6 +512,14 @@ pub fn reset_current_user_fpu() -> bool {
         // operation. A zero XSAVE header requests architectural initial state;
         // the seeded legacy controls also make the FXSAVE fallback valid.
         let task = unsafe { &*task };
+        // PKRU is eager task state, not part of CR0.TS-governed lazy FPU
+        // state. Reset it even for an unusually early exec before a user FPU
+        // area has been published.
+        task.user_pkru.store(0, Ordering::Release);
+        if narf_arch::x86_64::pku::enabled() {
+            // SAFETY: this is the current task in CPL0; CR4.PKE is set.
+            unsafe { narf_arch::x86_64::pku::write(0) };
+        }
         let area = task.user_fpu.load(Ordering::Acquire);
         if area.is_null() {
             return false;
@@ -552,6 +560,15 @@ fn materialize_user_fpu(cpu: usize, task: &KernelTask) -> bool {
         narf_arch::x86_64::cr::clear_task_switched();
         if !live {
             narf_arch::x86_64::xsave::fpu_restore(area);
+            // XRSTOR can restore the PKRU component from an older FPU image.
+            // The dedicated task slot is authoritative because WRPKRU does
+            // not require an FPU-unavailable trap and is saved independently
+            // at every task switch.
+            if narf_arch::x86_64::pku::enabled() {
+                let pkru = task.user_pkru.load(Ordering::Acquire);
+                // SAFETY: CPL0 and CR4.PKE were checked above.
+                narf_arch::x86_64::pku::write(pkru);
+            }
             task.user_fpu_live.store(true, Ordering::Release);
         }
     }
@@ -712,6 +729,14 @@ fn user_fpu_save_task(cpu: usize, task: &KernelTask) {
     // SAFETY: CPL0 on a scheduler path, so the kernel GS is the live one.
     let gs_base = unsafe { narf_arch::x86_64::user_mode::user_gs_base() };
     task.user_gs_base.store(gs_base, Ordering::Relaxed);
+    // PKRU is user task state but is not guarded by CR0.TS: a task can execute
+    // WRPKRU before it uses FP/SIMD. Save it even when the lazy FPU image was
+    // never materialized, otherwise its rights would leak to the next task.
+    if narf_arch::x86_64::pku::enabled() {
+        // SAFETY: scheduler switch-out runs in CPL0 and CR4.PKE is set.
+        let pkru = unsafe { narf_arch::x86_64::pku::read() };
+        task.user_pkru.store(pkru, Ordering::Release);
+    }
     let area = task.user_fpu.load(Ordering::Acquire);
     let live = task.user_fpu_live.load(Ordering::Acquire);
     // A task that never consumed FP/SIMD after its last deferred resume has no
@@ -774,6 +799,16 @@ fn user_fpu_save() {}
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn user_fpu_restore_task(cpu: usize, task: &KernelTask) {
+    // Restore PKRU eagerly, before the user task can execute RDPKRU/WRPKRU.
+    // Deferred XSAVE restore below may subsequently load an older component,
+    // and materialize_user_fpu rewrites this authoritative per-task value
+    // immediately after XRSTOR. This happens before the FPU-area check:
+    // WRPKRU does not require a lazily allocated SIMD image.
+    if narf_arch::x86_64::pku::enabled() {
+        let pkru = task.user_pkru.load(Ordering::Acquire);
+        // SAFETY: scheduler switch-in runs in CPL0 and CR4.PKE is set.
+        unsafe { narf_arch::x86_64::pku::write(pkru) };
+    }
     if task.user_fpu.load(Ordering::Acquire).is_null() {
         return;
     }
@@ -820,6 +855,39 @@ fn task_wake_cell(task: &KernelTask) -> Option<&crate::WakeCell> {
     // is withdrawn, and the owning Arc stays inside KernelTask until its
     // RCU-deferred destruction. The returned borrow is bounded by `task`.
     Some(unsafe { &*ptr })
+}
+
+/// Restore the wake a preemption swallowed, on the preempted continuation's
+/// resume.
+///
+/// A tick preemption marks the task runnable by setting its slot's wake bit,
+/// and the dispatch that resumes the continuation consumes that bit. The bit is
+/// a single flag, so it also absorbed every wake that landed while the task ran
+/// or sat preempted: the inner future's own `yield_now` self-wake, or a waker it
+/// registered just before the tick fired. The resumed code then finishes that
+/// poll with `Pending` and parks with the bit clear, and nothing re-polls the
+/// future although it asked to be. The virtio-net RX forwarder parked this way
+/// inside its `yield_now`, with completions waiting in its ring, and the guest
+/// network stopped for good.
+///
+/// Linux never loses a wakeup to preemption: a preempted task stays
+/// `TASK_RUNNING`, and a `try_to_wake_up` that raced it is still in effect when
+/// it next calls `schedule()`. Setting the bit again on resume gives the same
+/// guarantee: the next voluntary `Pending` is followed by a re-poll. The cost
+/// is at most one extra poll per preemption, which a future must tolerate.
+///
+/// The task runs on this CPU, so it needs no kick: the executor checks the bit
+/// when the task yields, exactly as for a self-wake during a poll.
+pub(crate) fn rearm_wake_after_preempt(task: &KernelTask) {
+    if let Some(cell) = task_wake_cell(task) {
+        cell.flag.store(true, Ordering::Release);
+        return;
+    }
+    // Not bound to an executor slot yet: go through the installed waker.
+    let waker = task.current_waker.lock();
+    if let Some(w) = waker.as_ref() {
+        w.wake_by_ref();
+    }
 }
 
 /// Ask the currently-running direct-eligible task to requeue on `target_cpu`
@@ -1683,6 +1751,10 @@ pub struct KernelTask {
     /// possible. A false value means the task-owned memory image is current.
     #[cfg(target_arch = "x86_64")]
     user_fpu_live: AtomicBool,
+    /// User PKRU is eager task state, separate from the lazy FP/SIMD image:
+    /// WRPKRU may execute before any instruction that observes CR0.TS.
+    #[cfg(target_arch = "x86_64")]
+    user_pkru: AtomicU32,
     /// Opaque owner-defined context for the current stackful task. Userspace
     /// publishes its refcounted `Task` here so syscall paths can recover their
     /// task-local state without consulting a process-wide registry lock.
@@ -1831,6 +1903,8 @@ impl KernelTask {
             user_fpu: AtomicPtr::new(core::ptr::null_mut()),
             #[cfg(target_arch = "x86_64")]
             user_fpu_live: AtomicBool::new(false),
+            #[cfg(target_arch = "x86_64")]
+            user_pkru: AtomicU32::new(0),
             user_context: AtomicPtr::new(core::ptr::null_mut()),
             user_cr3: AtomicU64::new(0),
             user_fs_base: AtomicU64::new(0),
@@ -2887,6 +2961,10 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
         CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);
         stamp_slice_start(&*task_ptr, cpu);
     }
+    // The dispatch that resumed us consumed the wake bit; give back any wake it
+    // absorbed before the interrupted poll can return `Pending`.
+    // SAFETY: same live task as the re-publication above.
+    rearm_wake_after_preempt(unsafe { &*task_ptr });
     if kernel_span_paused {
         resume_user_kernel_span();
     }
@@ -3014,6 +3092,11 @@ pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
     // SAFETY: the task is still owned by the in-flight poll_to_yield.
     unsafe {
         stamp_slice_start(&*task_ptr, cpu);
+    }
+    if !from_user {
+        // An EL1 preemption interrupted a poll in progress: give back any wake
+        // the resuming dispatch consumed (see `rearm_wake_after_preempt`).
+        rearm_wake_after_preempt(task);
     }
     if kernel_span_paused {
         resume_user_kernel_span();
@@ -4700,6 +4783,104 @@ pub mod tests {
         TestResult::Pass
     }
 
+    /// A wake that a preemption absorbs must still re-poll the task.
+    ///
+    /// The task wakes itself the way `yield_now` does, and a tick then
+    /// preempts it before its poll returns `Pending`. The preemption sets the
+    /// same wake bit, and the dispatch that resumes the continuation consumes
+    /// it, so without `rearm_wake_after_preempt` the poll ends with the bit
+    /// clear and the task never runs again. The virtio-net RX forwarder hung
+    /// exactly this way inside its periodic `yield_now`.
+    ///
+    /// The preemption is real: `try_preempt` runs on the task's own stack with
+    /// a timer-vector CPL0 frame, a one-cycle slice and a runnable companion
+    /// on this CPU, so it switches to the executor and is resumed by it.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_preempt_keeps_a_pending_self_wake() -> TestResult {
+        static PREEMPTED: AtomicBool = AtomicBool::new(false);
+        static DONE: AtomicBool = AtomicBool::new(false);
+        static STOP: AtomicBool = AtomicBool::new(false);
+        // Lets a failing run wake the stranded task so it completes instead of
+        // pinning the run queue for every later test.
+        static RESCUE: narf_lib::sync::IrqSafeSpinLock<Option<Waker>> =
+            narf_lib::sync::IrqSafeSpinLock::new(None);
+        PREEMPTED.store(false, Ordering::Release);
+        DONE.store(false, Ordering::Release);
+        STOP.store(false, Ordering::Release);
+
+        // Keeps `has_other_runnable_work` true so the tick may preempt.
+        struct Companion;
+        impl Future for Companion {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if STOP.load(Ordering::Acquire) {
+                    return Poll::Ready(());
+                }
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        struct WakeThenPreempt {
+            woke: bool,
+        }
+        impl Future for WakeThenPreempt {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.woke {
+                    DONE.store(true, Ordering::Release);
+                    return Poll::Ready(());
+                }
+                self.woke = true;
+                *RESCUE.lock() = Some(cx.waker().clone());
+                // `yield_now`: ask to be polled again...
+                cx.waker().wake_by_ref();
+                // ...and take the timer tick before returning `Pending`.
+                let mut frame = zero_trap_frame();
+                frame.vector = current_preempt_vector();
+                frame.cs = 0x08;
+                // SAFETY: `frame` lives on this task's own stack, as a CPL0
+                // timer frame does, and this task is the CPU's current
+                // stackful task inside its executor poll. Interrupts stay
+                // masked across the switch as they are in the timer trap.
+                let preempted =
+                    narf_lib::sync::without_interrupts(|| unsafe { try_preempt(&mut frame) });
+                PREEMPTED.store(preempted, Ordering::Release);
+                Poll::Pending
+            }
+        }
+
+        crate::spawn_stackful(Companion);
+        crate::spawn_stackful_with_options(
+            WakeThenPreempt { woke: false },
+            crate::StackfulOptions {
+                slice_cycles: 1,
+                ..Default::default()
+            },
+        );
+        for _ in 0..64 {
+            crate::poll_one_round();
+            if DONE.load(Ordering::Acquire) {
+                break;
+            }
+        }
+        let lost = !DONE.load(Ordering::Acquire);
+        STOP.store(true, Ordering::Release);
+        if let Some(w) = RESCUE.lock().take() {
+            w.wake_by_ref();
+        }
+        for _ in 0..8 {
+            crate::poll_one_round();
+        }
+        if !PREEMPTED.load(Ordering::Acquire) {
+            return TestResult::Fail("the synthetic timer tick did not preempt the task");
+        }
+        if lost {
+            return TestResult::Fail("a self-wake absorbed by a preemption never re-polled");
+        }
+        TestResult::Pass
+    }
+
     /// Verify a stackful task's stack pointer is on its OWN
     /// allocated stack, not the executor's. Catches a regression
     /// where someone might "optimize" by sharing the executor stack.
@@ -4946,6 +5127,41 @@ pub mod tests {
         unsafe { narf_arch::x86_64::user_mode::set_user_gs_base(0) };
         if task.user_gs_base.load(Ordering::Acquire) != GS {
             return TestResult::Fail("switch-out did not save the live user GS base");
+        }
+        TestResult::Pass
+    }
+
+    /// PKRU is eager user state, not a component conditional on allocating a
+    /// lazy XSAVE area. A task can execute WRPKRU before its first FP/SIMD
+    /// instruction, so switching back to such a task must still restore its
+    /// value rather than inheriting the previous task's register.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_user_pkru_restores_without_fpu_area() -> TestResult {
+        use narf_arch::x86_64::pku;
+
+        if !pku::enabled() {
+            return TestResult::Skip("PKU is not enabled on this CPU");
+        }
+        let task = KernelTask::new(core::future::ready(()));
+        // Key 1 is not assigned to any kernel mapping. Flip both of its PKRU
+        // access-disable bits so the expected value differs from the live
+        // register without affecting the kernel's key-0 mappings.
+        // SAFETY: this test runs only after CPUID/CR4 enablement confirms that
+        // RDPKRU is available on the boot CPU.
+        let before = unsafe { pku::read() };
+        let expected = before ^ 0x0c;
+        task.user_pkru.store(expected, Ordering::Release);
+        // SAFETY: `before` was read from this CPU's PKRU immediately above.
+        unsafe { pku::write(before) };
+
+        user_fpu_restore_task(this_cpu(), &task);
+        // SAFETY: the same PKU availability check guards this RDPKRU.
+        let observed = unsafe { pku::read() };
+        // SAFETY: restore this CPU's original PKRU before leaving the test.
+        unsafe { pku::write(before) };
+
+        if observed != expected {
+            return TestResult::Fail("PKRU restore was skipped without an FPU area");
         }
         TestResult::Pass
     }
@@ -7971,6 +8187,8 @@ pub mod tests {
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/stackful", smoke_user_fpu_lazy_restore_round_trip);
     #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("scheduler/pku", smoke_user_pkru_restores_without_fpu_area);
+    #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",
         smoke_nested_stackful_poll_preserves_outer_fpu
@@ -8042,6 +8260,8 @@ pub mod tests {
         "scheduler/stackful",
         smoke_preempted_return_gate_reflects_preemption
     );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("scheduler/preempt", smoke_preempt_keeps_a_pending_self_wake);
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/stackful", smoke_stackful_runs_on_dedicated_stack);
     #[cfg(target_arch = "x86_64")]

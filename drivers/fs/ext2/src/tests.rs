@@ -1184,6 +1184,66 @@ pub(crate) fn noop_waker() -> core::task::Waker {
     unsafe { Waker::from_raw(raw()) }
 }
 
+/// A direct file `mmap` fault exposes its in-flight page-cache fill as one
+/// pending Future. The common fault bridge can therefore park the task on its
+/// waker; a second fault must join the same fill rather than starting another
+/// device read, then both must receive the canonical cache frame.
+fn smoke_ext2_file_fault_async_waits_for_inflight_cache_fill() -> TestResult {
+    use alloc::boxed::Box;
+    use core::future::Future;
+    use core::sync::atomic::Ordering;
+    use core::task::{Context, Poll};
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::testing;
+    use crate::volume::Ext2Volume;
+
+    let device = GatedCountingBlock::new(testing::hard_link_image(&[0xa5; 6000]));
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(volume)) => volume,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    device.held.store(true, Ordering::Release);
+    let mut owner = Box::pin(file.mmap_fault_async(0));
+    if !matches!(owner.as_mut().poll(&mut cx), Poll::Pending) {
+        return TestResult::Fail("the owner fault completed before its I/O gate opened");
+    }
+    let reads_after_owner = device.reads.load(Ordering::Relaxed);
+    let mut waiter = Box::pin(file.mmap_fault_async(0));
+    if !matches!(waiter.as_mut().poll(&mut cx), Poll::Pending) {
+        return TestResult::Fail("the joining fault completed before its I/O gate opened");
+    }
+    if device.reads.load(Ordering::Relaxed) != reads_after_owner {
+        return TestResult::Fail("the joining mmap fault issued a duplicate device read");
+    }
+
+    device.held.store(false, Ordering::Release);
+    let owner_frame = match owner.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(frame)) => frame,
+        _ => return TestResult::Fail("the owner fault did not complete after its I/O wake"),
+    };
+    let waiter_frame = match waiter.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(frame)) => frame,
+        _ => return TestResult::Fail("the joining fault did not complete after its I/O wake"),
+    };
+    if owner_frame != waiter_frame {
+        return TestResult::Fail("the mmap faults did not receive one canonical cache frame");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_file_fault_async_waits_for_inflight_cache_fill
+);
+
 /// A write to one page does not void a concurrent fill of a DIFFERENT page.
 /// Linux invalidates exactly the written range (`invalidate_mapping_pages`,
 /// the locked folio being filled); a fill whose own page was not written
@@ -3696,6 +3756,16 @@ fn smoke_ext2_created_metadata_persists() -> TestResult {
     if file.owners() != (0x1234_5678, 0x9abc_def0) || file.stat().mode.perms != 0o4640 {
         return TestResult::Fail("file metadata did not persist");
     }
+    // A demand fault is deliberately data-only: it is allowed to populate a
+    // page-cache folio, but must not replace the inode metadata cached by this
+    // handle (or by another handle).  This is the ext2/ext4 half of the VFS
+    // contract used by file-backed `mmap`.
+    if !matches!(poll_once(file.mmap_fault_async(0)), Some(Ok(_))) {
+        return TestResult::Fail("file-backed demand fault failed");
+    }
+    if file.owners() != (0x1234_5678, 0x9abc_def0) || file.stat().mode.perms != 0o4640 {
+        return TestResult::Fail("file-backed demand fault changed inode metadata");
+    }
     if poll_once(file.set_owners(1000, 1001))
         .and_then(Result::ok)
         .is_none()
@@ -5348,7 +5418,7 @@ fn smoke_ext2_unlink_keeps_an_open_inode_until_its_last_reference() -> TestResul
     {
         return TestResult::Fail("an open, unlinked inode no longer reads its data");
     }
-    if file.mmap_fault(4096).is_err() {
+    if !matches!(poll_once(file.mmap_fault_async(4096)), Some(Ok(_))) {
         return TestResult::Fail("a mapping of an open, unlinked inode was refused");
     }
     // The inode number is still in use: a new file must get another one.

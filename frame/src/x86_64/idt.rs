@@ -378,7 +378,12 @@ pub unsafe fn init() {
     install(0, int_0);
     install(1, int_1);
     install_with_ist(2, int_2, IST_NMI); // NMI runs on its own stack
-    install(3, int_3);
+                                         // #BP is a system gate on Linux (`arch/x86/kernel/idt.c`:
+                                         // `SYSG(X86_TRAP_BP, asm_exc_int3)`): a user `int3` must raise #BP
+                                         // and deliver SIGTRAP. With DPL=0 the CPU raised #GP instead, so
+                                         // debuggers' breakpoints and Chromium's `IMMEDIATE_CRASH()`
+                                         // (`int3; ud2`) arrived as SIGSEGV with the RIP still on the int3.
+    install_full(3, int_3, 0, GATE_INT_USER);
     install(4, int_4);
     install(5, int_5);
     install(6, int_6);
@@ -675,3 +680,33 @@ pub unsafe fn load_idtr_ap() {
     }
     compiler_fence(Ordering::SeqCst);
 }
+
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+/// `type_attr` of the loaded IDT's gate for `vec`.
+fn gate_attr(vec: usize) -> u8 {
+    // SAFETY: the IDT is fully written before `lidt` at bring-up and never
+    // rewritten afterwards, so a read-only copy of one entry cannot race.
+    let entry = unsafe { core::ptr::addr_of!(IDT).cast::<IdtEntry>().add(vec).read() };
+    entry.type_attr
+}
+
+/// User-raisable gates match Linux's system gates (`arch/x86/kernel/idt.c`
+/// `SYSG`): #BP for `int3` and the `int 0x80` syscall vector. Every other
+/// exception stays kernel-only, so `int 13` from CPL 3 still #GPs instead of
+/// forging a general-protection fault.
+fn smoke_x86_64_idt_user_gates_match_linux() -> TestResult {
+    if gate_attr(3) != GATE_INT_USER {
+        return TestResult::Fail("#BP gate is not DPL=3: user int3 raises #GP, not SIGTRAP");
+    }
+    if gate_attr(128) != GATE_INT_USER {
+        return TestResult::Fail("int 0x80 gate is not DPL=3");
+    }
+    for vec in [0usize, 1, 6, 13, 14] {
+        if gate_attr(vec) != GATE_INT_KERNEL {
+            return TestResult::Fail("a hardware-exception gate is user-raisable");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("frame/x86_64", smoke_x86_64_idt_user_gates_match_linux);

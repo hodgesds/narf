@@ -27,7 +27,22 @@ applications above NARF.
 
 Device ioctl dispatch passes an `IoctlContext` with guarded process-memory
 copies, the open description's O_NONBLOCK state, retained descriptor lookup
-and the caller's thread-group ID to FileOps. The shared sound
+and the caller's thread-group ID to FileOps. The syscall layer also owns the
+Linux sync_file type and serves its `IoctlContext` seam
+(`sync_file_fences`, `install_sync_file`, `restart_after`) to drivers; `restart_after`
+parks the ioctl with `park_reexecute_on_io_until` and re-executes it, which is
+Linux's `-ERESTARTSYS` under `handle_signal`.
+sync_file fds hold a set of leaf fences (Linux `dma_fence_unwrap`; a merge
+or a multi-fence export is a `dma_fence_array`) and answer
+`SYNC_IOC_MERGE` (fd reserved first, so EMFILE precedes EFAULT/EINVAL;
+`flags`/`pad` EINVAL; non-sync_file `fd2` ENOENT; `__dma_fence_unwrap_merge`
+semantics), `SYNC_IOC_FILE_INFO` (the two-call protocol of
+`sync_file_ioctl_fence_info`, `sync_file_get_name` naming) and
+`SYNC_IOC_SET_DEADLINE` (`pad` EINVAL, otherwise an accepted hint); others are
+ENOTTY. A file is readable once every leaf signalled. Fence names: VirtIO-GPU
+`virtio_gpu`/`controlq`; atomic `OUT_FENCE_PTR` fences `narf_kms`/`vblank`
+(one context each, timestamp = the simulated vblank); stubs `stub`/`stub`;
+signalled fences report Linux's `detached-driver`/`signaled-timeline`. The shared sound
 registry's PCM/control files implement the ALSA ABI; syscall handlers contain
 no sound-card lookup or driver-specific request branches. Device mmap validation
 runs before VMA replacement, and direct mappings atomically retain their backing
@@ -112,6 +127,26 @@ positive Linux errno on failure. `narf-libc::execve` publishes that exact value
 through thread-local `errno`; it must not collapse path-resolution failures,
 permission failures, and malformed images into one `ENOEXEC`, because PATH
 search depends on distinguishing `ENOENT` and `ENOTDIR` from terminal errors.
+
+The loader publishes the finalized SysV auxiliary vector and environment to
+`/proc/<pid>/auxv` and `/proc/<pid>/environ` only after a successful image
+load. Thus procfs and the initial stack carry the same `AT_PHDR`, `AT_PHENT`,
+`AT_PHNUM`, interpreter, capability, and terminator entries. On x86_64,
+`PTRACE_GETREGSET` supports both `NT_PRSTATUS` and `NT_PRFPREG`; the latter is
+the 512-byte FXSAVE-compatible legacy prefix of the task's saved XSAVE image.
+The same exec commit publishes the loader's PT_LOAD ranges with their page
+offsets, backing `(st_dev, st_ino)` identities, and resolved paths for
+`/proc/<pid>/maps`; the main image uses the resolved `/proc/<pid>/exe` path
+and an interpreter range keeps its own path. Fork copies this snapshot, a
+later exec replaces it atomically, and task exit removes it. This keeps VM
+ownership free of VFS names while allowing ELF consumers to group file VMAs
+and compute an image base from the offset-zero maps entry.
+`mmap(2)` of a file records the same identity on the mapping's file-owner row
+(`mapped_file::MappingProvenance`: `st_dev`, `st_ino`, and the fd's recorded
+open path), so it follows munmap/MAP_FIXED splits, mremap and fork exactly as
+the owner does; procfs consults owner rows before the exec image table. The
+eager private-file copy (`MAP_POPULATE`/`MAP_LOCKED` without `MAP_NONBLOCK`)
+registers no owner and still renders as unknown backing (`LINUX-GAP`).
 
 ELF `PT_LOAD` construction follows Linux's BSS split: file-image pages are
 materialized, the unused tail of the final file page is zero-filled, and every
@@ -215,7 +250,12 @@ The native mmap entry validates a page-aligned byte offset before descriptor
 lookup, resolves non-anonymous descriptors before `do_mmap`-style validation,
 rejects an exact zero length with `EINVAL`, and distinguishes fixed-address
 misalignment (`EINVAL`), range exhaustion (`ENOMEM`), and the protected
-low-address floor (`EPERM`) in Linux order.
+low-address floor (`EPERM`) in Linux order. The retained open-file description
+is the sole admission authority for a file-backed VMA: every such mapping
+requires a readable description, and `MAP_SHARED` with `PROT_WRITE` also
+requires a writable one (`EACCES` otherwise). Once admitted, the VMA retains
+that exact `FileOps` reference across descriptor close/reuse; lazy demand
+faults load its pages without re-running path DAC or substituting a reused fd.
 
 File/device mapping publication holds the address-space transaction and that
 address space's owner bucket while it atomically retires overlapping owners
@@ -466,9 +506,22 @@ Connected socket rings advance their token only on readiness transitions
 leave readiness unchanged do not synthesize edges. A drain followed by new
 data before the next `epoll_wait` remains a deliverable edge even though both
 sampled readiness masks contain `POLL_IN`.
-Blocking stream `send(2)` and `sendmsg(2)` park on the connected ring's durable
-writable readiness when no byte fits, then re-execute after space or closure is
-published. `O_NONBLOCK` and `MSG_DONTWAIT` return `EAGAIN` immediately.
+Blocking stream `send(2)`, `write(2)`, and `sendmsg(2)` (TCP and AF_UNIX)
+wait for the connected ring's durable writable readiness in place, keeping
+the committed prefix in the handler, and continue with the unsent suffix
+after space or closure is published. They return the full request unless a
+signal, the SO_SNDTIMEO timeout, or an error ends the wait, in which case
+they return that prefix (a signal after progress is never turned into
+`EINTR` or a restart). With nothing queued a signal is `sock_intr_errno`: a
+restart-pending frame (`-ERESTARTSYS`, restarted under `SA_RESTART`) for an
+infinite wait, `EINTR` for a finite SO_SNDTIMEO/SO_RCVTIMEO; an expired
+timeout is `EAGAIN`. On AF_UNIX, SCM_RIGHTS and explicit credentials
+remain attached only to the first queued unit. An AF_UNIX stream/seqpacket
+endpoint that closes with unread data leaves its peer `ECONNRESET`: a send
+woken from its wait by that close consumes it (the prefix, or `ECONNRESET`
+with nothing queued, no SIGPIPE), otherwise `SO_ERROR` reports it once; a
+send that finds the peer already gone is `EPIPE` plus SIGPIPE unless
+`MSG_NOSIGNAL`. `O_NONBLOCK` and `MSG_DONTWAIT` return `EAGAIN` immediately.
 `sendmmsg(2)` returns an already-transmitted prefix without retrying it; when
 its first message would block it follows the same park-or-`EAGAIN` rule.
 Native `read(2)`, `write(2)`, `readv(2)`, and `writev(2)` resolve the
@@ -1339,6 +1392,13 @@ keep the namespace live; kernel network teardown runs only after the final
 reference closes. Per-namespace IPv4 loopback TCP/UDP delivery uses
 namespace-keyed endpoint tables, so identical loopback endpoints coexist and
 cannot exchange traffic across namespaces.
+
+A followed pathname permission probe of `/proc/<pid>/ns/<flavour>` resolves
+the retained nsfs object, rather than treating its rendered
+`<flavour>:[inode]` text as an ordinary symlink target. `AT_SYMLINK_NOFOLLOW`
+continues to operate on the procfs symlink itself. This lets service managers
+use `access("/proc/self/ns/net", F_OK)` as the Linux namespace-support probe
+before creating a private network namespace.
 
 The TCP socket-option compatibility surface validates and round-trips Linux
 `TCP_SYNCNT`, `TCP_LINGER2`, `TCP_DEFER_ACCEPT`, `TCP_WINDOW_CLAMP`,

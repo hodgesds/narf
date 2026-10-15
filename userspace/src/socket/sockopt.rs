@@ -25,6 +25,7 @@ use super::*;
 mod ip;
 mod ipv6;
 mod sol_socket;
+pub(crate) mod udp;
 
 // ── SOL_SOCKET (include/uapi/asm-generic/socket.h) ──────────────────────
 pub const SO_DEBUG: u32 = 1;
@@ -190,7 +191,10 @@ const IGMP_MAX_MEMBERSHIPS: usize = 20;
 /// `sizeof(struct group_req)` on LP64: u32 + pad + sockaddr_storage.
 const GROUP_REQ_LEN: usize = 136;
 /// `SOCK_BUF_LOCK_MASK` (`SOCK_SNDBUF_LOCK | SOCK_RCVBUF_LOCK`).
-const SOCK_BUF_LOCK_MASK: i32 = 3;
+const SOCK_BUF_LOCK_MASK: i32 = SOCK_SNDBUF_LOCK | SOCK_RCVBUF_LOCK;
+/// `sk_userlocks` bits a user-set SO_SNDBUF / SO_RCVBUF raise.
+const SOCK_SNDBUF_LOCK: i32 = 1;
+const SOCK_RCVBUF_LOCK: i32 = 2;
 /// `SKF_AD_MAX` (`include/uapi/linux/filter.h`) — `bpf_tell_extensions()`.
 const SKF_AD_MAX: i32 = 64;
 /// `SK_MEMINFO_VARS` (`include/uapi/linux/sock_diag.h`).
@@ -305,6 +309,13 @@ pub struct SockOptExt {
     pub ipv6_srcprefs: u32,
     pub ipv6_sticky_pktinfo: ([u8; 16], u32),
     pub ipv6_mc_list: Vec<Ip6McMembership>,
+    // SOL_UDP
+    /// `up->gso_size` (`UDP_SEGMENT`): the default GSO size of every send.
+    pub udp_gso_size: u16,
+    /// `GRO_ENABLED` / `ACCEPT_L4` (`UDP_GRO`).
+    pub udp_gro: bool,
+    /// `UDP_NO_CHECK6_TX`.
+    pub udp_no_check6_tx: bool,
 }
 
 impl Default for SockOptExt {
@@ -391,6 +402,9 @@ impl Default for SockOptExt {
             ipv6_srcprefs: 0,
             ipv6_sticky_pktinfo: ([0; 16], 0),
             ipv6_mc_list: Vec::new(),
+            udp_gso_size: 0,
+            udp_gro: false,
+            udp_no_check6_tx: false,
         }
     }
 }
@@ -710,6 +724,7 @@ impl SocketFile {
             IPPROTO_IP if self.ip_level_applies() => self.ip_set(name, value),
             IPPROTO_IP if self.domain == AF_INET6 => Some(ENOPROTOOPT_R),
             IPPROTO_IPV6 if self.domain == AF_INET6 => self.ipv6_set(name, value),
+            IPPROTO_UDP if self.is_udp() => Some(self.udp_set(name, value)),
             _ => None,
         }
     }
@@ -730,6 +745,7 @@ impl SocketFile {
             SOL_SOCKET => self.sol_socket_get(name, buf),
             IPPROTO_IP if self.ip_level_applies() => self.ip_get(name, buf),
             IPPROTO_IPV6 if self.domain == AF_INET6 => self.ipv6_get(name, buf),
+            IPPROTO_UDP if self.is_udp() => Some(self.udp_get(name, buf)),
             _ => None,
         }
     }

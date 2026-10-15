@@ -27,9 +27,8 @@ use super::*;
 /// on a barrier word nobody will ever wake — a deterministic broadcast
 /// strand rather than a reported error.
 ///
-/// Under the counter model there is no per-task queue to splice, so we wake
-/// the source (bump its counter); parked waiters re-arm and re-evaluate
-/// against the destination word themselves. Reports `nr_wake` released.
+/// Wakes up to `nr_wake` source waiters and moves up to `nr_requeue` more
+/// onto the destination queue, returning woken + requeued (`task_count`).
 pub(crate) fn sys_futex_requeue(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let waiters = args.arg0;
@@ -59,14 +58,27 @@ pub(crate) fn sys_futex_requeue(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
         return;
     }
-    // Each entry's natural alignment follows its own flags: a FUTEX2_NUMA
-    // entry is a value+node pair and must be 8-byte aligned.
-    if entries[0].uaddr % futex2_word_span(entries[0].flags) != 0
-        || entries[1].uaddr % futex2_word_span(entries[1].flags) != 0
+    // `futex_requeue()`: key1, then key2 (`get_futex_key` — a skewed word is
+    // -EINVAL, an inaccessible one -EFAULT; each entry's natural alignment
+    // follows its own flags, so a FUTEX2_NUMA entry must be 8-byte aligned).
+    let src = entries[0].uaddr;
+    let dst = entries[1].uaddr;
+    let key1 = match get_futex_key_flags(entries[0].flags & FUTEX_PRIVATE != 0, src, entries[0].flags)
     {
-        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-        return;
-    }
+        Ok(k) => k,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
+    };
+    let key2 = match get_futex_key_flags(entries[1].flags & FUTEX_PRIVATE != 0, dst, entries[1].flags)
+    {
+        Ok(k) => k,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
+    };
     // `SYSCALL_DEFINE4(futex_requeue)` ends with
     //
     //     cmpval = futexes[0].w.val;
@@ -78,40 +90,26 @@ pub(crate) fn sys_futex_requeue(ctx: &mut dyn TrapContext) {
     // compare is the whole point of the argument: it is how a condvar detects
     // that a signaller raced it between reading the word and asking to
     // requeue. Skipping it requeued waiters against a stale view.
-    let src = entries[0].uaddr;
-    if src != 0 {
-        let mut word = [0u8; 4];
-        // SAFETY: `src` was alignment- and range-checked above; copy_from_user
-        // re-validates and SMAP-brackets the 4-byte read.
-        match unsafe { copy_from_user(&mut word, src) } {
-            Ok(()) => {
-                if u64::from(u32::from_ne_bytes(word)) != entries[0].val {
-                    ctx.set_return(errno_ret(EAGAIN));
-                    return;
-                }
-            }
-            Err(errno) => {
-                ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
-                return;
-            }
+    match futex_read_user_word(src) {
+        Some(cur) if u64::from(cur) == entries[0].val => {}
+        Some(_) => {
+            ctx.set_return(errno_ret(EAGAIN));
+            return;
+        }
+        None => {
+            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+            return;
         }
     }
-    if src != 0 {
-        // Flags-aware: a FUTEX2_NUMA/MPOL source hashes by node, so the wake
-        // must derive the same key the waiter registered under.
-        let key = match get_futex_key_flags(
-            (entries[0].flags & FUTEX_PRIVATE) != 0,
-            src,
-            entries[0].flags,
-        ) {
-            Ok(k) => k,
-            Err(errno) => {
-                ctx.set_return(SyscallReturn::ok((-errno) as u64));
-                return;
-            }
-        };
-        futex_bump_counter_key(key);
-        let _ = futex_wake_waiters_key(key, nr_wake as u32);
-    }
-    ctx.set_return(SyscallReturn::ok(nr_wake as u64));
+    // Wake up to `nr_wake` waiters on the source and MOVE up to
+    // `nr_requeue` more onto the destination's queue without waking them,
+    // exactly as FUTEX_CMP_REQUEUE does (`futex_requeue` is that op). A
+    // requeued waiter stays blocked until a wake on the DESTINATION word.
+    // The destination word is sampled for the park-loop movers' word
+    // re-validation, as the classic op does.
+    let new_val = futex_read_user_word(dst).unwrap_or(0);
+    let (woken, moved) =
+        futex_requeue_waiters_keyed(key1, key2, dst, nr_wake as u32, nr_requeue as u32, new_val);
+    // `futex_requeue` returns `task_count`: woken plus requeued.
+    ctx.set_return(SyscallReturn::ok((woken + moved) as u64));
 }
