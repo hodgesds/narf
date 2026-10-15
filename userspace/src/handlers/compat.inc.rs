@@ -15462,15 +15462,15 @@ pub(crate) fn aio_test_nr() -> u64 {
 
 mod aio {
     use super::{
-        copy_from_user, copy_to_user, current_task_id, fd, poll_blocking, validate_user_range,
-        SyscallReturn, TrapContext,
+        copy_from_user, copy_to_user, current_address_space, current_task_id, fd, poll_blocking,
+        validate_user_range, SyscallReturn, TrapContext, MMAP_CURSOR,
     };
     use alloc::collections::{BTreeMap, VecDeque};
     use alloc::vec::Vec;
     use narf_lib::sync::IrqSafeSpinLock;
 
     // ── errno constants (negated on return, Linux convention) ────────
-    use crate::errno::wire::{EAGAIN, EBADF, EFAULT, EINVAL};
+    use crate::errno::wire::{EAGAIN, EBADF, EFAULT, EINVAL, ENOMEM};
 
     // ── Linux <uapi/linux/aio_abi.h> opcodes ─────────────────────────
     const IOCB_CMD_PREAD: u16 = 0;
@@ -15561,6 +15561,12 @@ mod aio {
         /// through `io_destroy` or the exit sweep.
         nr_events: u32,
         completions: VecDeque<Completion>,
+        /// One mapped page returned as the opaque context handle to a real
+        /// user process. libaio probes `ctx + 16` before deciding whether it
+        /// can consume Linux's mmap completion ring. The zeroed header does
+        /// not carry Linux's ring magic, so libaio safely uses the syscall
+        /// path that this synchronous backend implements instead.
+        libaio_guard_page: Option<u64>,
     }
 
     /// Linux's global `aio_nr`: the sum of every live context's `nr_events`,
@@ -15605,10 +15611,10 @@ mod aio {
         });
     }
 
-    /// Per-task context table: tid → (ctx_id → AioContext). Context ids
-    /// are minted from a global monotonic counter so they never alias
-    /// across tasks (Linux hands back an opaque `aio_context_t`; callers
-    /// only round-trip it, so any unique non-zero token is valid).
+    /// Per-task context table: tid → (ctx_id → AioContext). A real user
+    /// process receives a mapped guard-page address as its id so libaio's
+    /// implementation-private ring probe is safe. Kernel-only tests have no
+    /// user address space to map, and keep using a unique non-zero token.
     static AIO_CONTEXTS: IrqSafeSpinLock<Option<BTreeMap<u64, BTreeMap<u64, AioContext>>>> =
         IrqSafeSpinLock::new(None);
 
@@ -15619,6 +15625,49 @@ mod aio {
 
     fn mint_ctx_id() -> u64 {
         NEXT_CTX_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reserve and materialize the one-page libaio context guard.
+    ///
+    /// Linux returns an `aio_context_t` that points to an mmap'd completion
+    /// ring. libaio's `io_getevents` first reads `ctx + 16` to discover that
+    /// fast path, even when it will immediately fall back to the syscall.
+    /// Returning a small integer therefore turns a normal LVM startup probe
+    /// into a userspace page fault. NARF's completions stay in the kernel
+    /// queue, so a zeroed page deliberately declines the private fast path
+    /// while preserving the safe opaque-pointer contract.
+    fn map_libaio_guard_page() -> Result<Option<u64>, i64> {
+        let Some(as_ref) = current_address_space() else {
+            // Kernel-test syscall contexts have no active user address space.
+            return Ok(None);
+        };
+
+        let frame = narf_memory::alloc_frame().map_err(|_| ENOMEM)?;
+        let phys = frame.start_address();
+        // SAFETY: `phys` is a fresh frame exclusively owned by this setup.
+        // A zero magic at offset 16 makes libaio use its syscall slow path.
+        unsafe {
+            core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
+        }
+        let base = MMAP_CURSOR.fetch_add(4096, core::sync::atomic::Ordering::Relaxed);
+        let region = narf_memory::Region {
+            base: narf_memory::VirtAddr::new(base),
+            len: 4096,
+            perms: narf_memory::RegionPerms::READ | narf_memory::RegionPerms::WRITE,
+            phys: alloc::vec![phys].into(),
+        };
+        if as_ref.map_region(region).is_err() {
+            narf_memory::free_frame(narf_memory::PhysFrame::new(phys));
+            return Err(ENOMEM);
+        }
+        // SAFETY: the region was just registered in the caller's live AS.
+        if unsafe { as_ref.materialize() }.is_err() {
+            // Unmapping returns the owned frame to the allocator. It is okay
+            // if a concurrent exit already removed the address space.
+            let _ = as_ref.unmap_region(narf_memory::VirtAddr::new(base));
+            return Err(ENOMEM);
+        }
+        Ok(Some(base))
     }
 
     /// Run `f` with the calling task's context map, creating the outer
@@ -15652,9 +15701,20 @@ mod aio {
         let ctx_idp = args.arg1;
 
         // Linux rejects nr_events == 0 and requires *ctx_idp be zero on
-        // entry. We validate the out-pointer and mint an id.
+        // entry. Validate + read the in/out word before charging resources.
         if ctx_idp == 0 || validate_user_range(ctx_idp, 8).is_err() {
             ctx.set_return(SyscallReturn::ok(EFAULT as u64));
+            return;
+        }
+        let mut previous = [0u8; 8];
+        // SAFETY: `ctx_idp` range-validated above; copy_from_user brackets
+        // the 8-byte read with STAC/CLAC.
+        if unsafe { copy_from_user(&mut previous, ctx_idp) }.is_err() {
+            ctx.set_return(SyscallReturn::ok(EFAULT as u64));
+            return;
+        }
+        if u64::from_le_bytes(previous) != 0 {
+            ctx.set_return(SyscallReturn::ok(EINVAL as u64));
             return;
         }
         if nr_events == 0 {
@@ -15668,7 +15728,15 @@ mod aio {
             return;
         }
 
-        let id = mint_ctx_id();
+        let libaio_guard_page = match map_libaio_guard_page() {
+            Ok(page) => page,
+            Err(errno) => {
+                aio_refund(nr_events);
+                ctx.set_return(SyscallReturn::ok(errno as u64));
+                return;
+            }
+        };
+        let id = libaio_guard_page.unwrap_or_else(mint_ctx_id);
         let tid = current_task_id();
         with_task_ctxs(tid, |m| {
             m.insert(
@@ -15676,6 +15744,7 @@ mod aio {
                 AioContext {
                     nr_events,
                     completions: VecDeque::new(),
+                    libaio_guard_page,
                 },
             );
         });
@@ -15685,9 +15754,12 @@ mod aio {
         if unsafe { copy_to_user(ctx_idp, &id.to_le_bytes()) }.is_err() {
             // Roll back the context we just minted so it doesn't leak — the
             // reservation with it.
-            with_task_ctxs(tid, |m| {
-                m.remove(&id);
-            });
+            let removed = with_task_ctxs(tid, |m| m.remove(&id));
+            if let (Some(removed), Some(as_ref)) = (removed, current_address_space()) {
+                if let Some(page) = removed.libaio_guard_page {
+                    let _ = as_ref.unmap_region(narf_memory::VirtAddr::new(page));
+                }
+            }
             aio_refund(nr_events);
             ctx.set_return(SyscallReturn::ok(EFAULT as u64));
             return;
@@ -15701,6 +15773,9 @@ mod aio {
         let tid = current_task_id();
         let removed = with_task_ctxs(tid, |m| m.remove(&ctx_id));
         if let Some(gone) = removed {
+            if let (Some(page), Some(as_ref)) = (gone.libaio_guard_page, current_address_space()) {
+                let _ = as_ref.unmap_region(narf_memory::VirtAddr::new(page));
+            }
             aio_refund(gone.nr_events);
             ctx.set_return(SyscallReturn::ok(0));
         } else {

@@ -147,6 +147,13 @@ through thread-local `errno`; it must not collapse path-resolution failures,
 permission failures, and malformed images into one `ENOEXEC`, because PATH
 search depends on distinguishing `ENOENT` and `ENOTDIR` from terminal errors.
 
+Linux kernel-AIO contexts retain NARF's synchronous submit/reap backend. In a
+real user address space, `io_setup(2)` returns a mapped, writable opaque
+context page with no Linux AIO-ring magic: libaio may safely probe it, then
+falls back to the `io_submit`/`io_getevents` syscall path. The input/output
+`aio_context_t` word must be zero on entry, is nonzero on success, and the
+context page is removed by `io_destroy(2)` or address-space teardown.
+
 The loader publishes the finalized SysV auxiliary vector and environment to
 `/proc/<pid>/auxv` and `/proc/<pid>/environ` only after a successful image
 load. Thus procfs and the initial stack carry the same `AT_PHDR`, `AT_PHENT`,

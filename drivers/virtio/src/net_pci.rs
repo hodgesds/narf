@@ -1051,29 +1051,6 @@ impl VirtioNetPci {
         }
         let buf_phys = buf.dma_addr().raw();
 
-        // Lazy completion reclaim: drain every TX the device has
-        // finished since the last transmit. For each completed head,
-        // return its descriptor to the free list and drop the buffer
-        // that was DMAed out of. This MUST run before we add the new
-        // descriptor: the descriptor allocator only hands out heads
-        // that have been freed, so freeing here guarantees the head
-        // we're about to allocate has an empty `tx_buffers` slot
-        // (no live buffer can be clobbered).
-        {
-            let mut q = pair.tx_queue.lock();
-            let q = q.as_mut().ok_or(VirtioPciError::NoQueues)?;
-            let mut bufs = pair.tx_buffers.lock();
-            while let Some((done_head, _)) = q.poll_used() {
-                q.free_chain(done_head as u16);
-                if let Some(slot) = bufs.get_mut(done_head as usize) {
-                    // Device is done with it — recycle into the TX pool.
-                    if let Some(b) = slot.take() {
-                        self.tx_buf_release_on(pair_idx, b);
-                    }
-                }
-            }
-        }
-
         // Single device-readable descriptor over [hdr | frame].
         let submit = |q: &mut Virtqueue| -> Option<u16> {
             let descs = [VirtqDesc {
@@ -1085,13 +1062,37 @@ impl VirtioNetPci {
             q.add_buffer(&descs)
         };
 
-        // Submit. If the ring is full even after the reclaim pass
-        // above, do a bounded reclaim-retry; if still full, drop the
-        // frame (return Err) rather than ever busy-waiting on the
-        // device. TCP/upper layers retransmit.
-        let (head, needs_kick) = {
+        // Serialize completion reclaim, descriptor submission, and DMA-buffer
+        // publication under the same queue/buffer lock pair. The previous
+        // split critical sections released `tx_queue` after `add_buffer()` and
+        // recorded `buf` in `tx_buffers` only afterwards. A parallel sender
+        // could reclaim a very fast completion in that window, find an empty
+        // slot, and free the descriptor. The first sender then parked its
+        // already-completed buffer under that re-usable head, permanently
+        // starving the queue-local recycler under multi-flow traffic.
+        //
+        // The queue lock is always taken before `tx_buffers`, so publishing
+        // the buffer before either lock is released closes that ownership hole
+        // without changing lock order. If the ring stays full, return the
+        // caller-owned recycler buffer before reporting backpressure; otherwise
+        // every transient full ring also drains the fixed TX pool.
+        let needs_kick = {
             let mut q = pair.tx_queue.lock();
             let q = q.as_mut().ok_or(VirtioPciError::NoQueues)?;
+            let mut bufs = pair.tx_buffers.lock();
+
+            // Lazy completion reclaim: drain every TX the device has finished
+            // since the last transmit. A descriptor can be reused only after
+            // its paired DMA buffer has been returned to this queue's pool.
+            while let Some((done_head, _)) = q.poll_used() {
+                q.free_chain(done_head as u16);
+                if let Some(slot) = bufs.get_mut(done_head as usize) {
+                    if let Some(done_buf) = slot.take() {
+                        self.tx_buf_release_on(pair_idx, done_buf);
+                    }
+                }
+            }
+
             let head = match submit(q) {
                 Some(h) => h,
                 None => {
@@ -1099,7 +1100,6 @@ impl VirtioNetPci {
                     // few times. Each pass can only free what the device
                     // has already finished — no spinning on un-finished
                     // work, no unbounded sync wait.
-                    let mut bufs = pair.tx_buffers.lock();
                     let mut retried = None;
                     for _ in 0..8 {
                         let mut freed_any = false;
@@ -1121,31 +1121,24 @@ impl VirtioNetPci {
                         }
                     }
                     // Still full after draining everything the device
-                    // finished → drop the frame (TCP retransmits).
+                    // finished → return the buffer and report backpressure.
                     match retried {
                         Some(h) => h,
-                        None => return Err(VirtioPciError::QueueTooSmall),
+                        None => {
+                            self.tx_buf_release_on(pair_idx, buf);
+                            return Err(VirtioPciError::QueueTooSmall);
+                        }
                     }
                 }
             };
+            // `head` is produced by this pair's virtqueue and is therefore in
+            // `0..tx_qsize`, exactly the range of `tx_buffers`. Publish before
+            // another sender can reclaim the descriptor.
+            bufs[head as usize] = Some(buf);
             // EVENT_IDX suppression by default; latency-first policy forces the
             // kick so a lone frame isn't stranded until the host next polls.
-            let nk = q.needs_kick();
-            (head, nk || TX_ALWAYS_KICK.load(Ordering::Relaxed))
+            q.needs_kick() || TX_ALWAYS_KICK.load(Ordering::Relaxed)
         };
-
-        // Park the buffer in its descriptor slot so it stays alive
-        // until the device completes the transmit. The slot was
-        // guaranteed empty by the reclaim pass (the head was on the
-        // free list, hence already reclaimed).
-        {
-            let mut bufs = pair.tx_buffers.lock();
-            if let Some(slot) = bufs.get_mut(head as usize) {
-                *slot = Some(buf);
-            }
-            // If the slot is out of range (can't happen: head < qsize),
-            // `buf` drops here — harmless, just no in-flight tracking.
-        }
 
         if needs_kick {
             let off = (pair.tx_notify_off as u64) * (self.notify_off_multiplier as u64);
@@ -2097,15 +2090,35 @@ fn vnet0_send_frame_zc(frame: narf_net::Frame, _meta: narf_net::TxMeta) -> Resul
     }
 }
 
-/// `iface::DrainFn` — synchronous one-frame drain used by the TCP
-/// stack's `arp_resolve` busy-wait inside a syscall handler. We
-/// pull one received frame off pair 0's used ring (zero-copy via
-/// rx_take), strip the 12-byte virtio-net header, dispatch the
-/// payload through `iface::on_rx_frame`, and let the DmaBuffer
-/// drop. Returns `true` iff a frame was actually processed.
+/// Pair chosen first by the next synchronous RX drain. The TCP connect and ARP
+/// waits call the drain hook in a tight loop, so advancing this cursor makes
+/// those waits fair across the NIC's RSS / flow-steered receive queues.
+static DRAIN_PAIR_RR: AtomicU64 = AtomicU64::new(0);
+
+/// `iface::DrainFn` — synchronous one-frame drain used by the TCP stack's
+/// `arp_resolve` / `connect` busy-waits inside a syscall handler. A caller can
+/// be occupying its executor while it waits, so it cannot rely on the spawned
+/// RX forwarders making progress. Drain one frame from every active queue pair
+/// in rotating order: with F_MQ, a flow's SYN-ACK returns on the pair selected
+/// for its outbound SYN, not necessarily pair 0.
+///
+/// The buffer stays zero-copy through `iface::on_rx_frame`; we return it to
+/// exactly the pair that supplied it and notify that pair after replenishing.
+/// Returns `true` iff a frame was actually processed.
 fn vnet0_drain_fn() -> bool {
-    let taken = with_controller(|c| c.rx_take()).flatten();
-    let (mut buf, total_len) = match taken {
+    let taken = with_controller(|c| {
+        let pairs = c.num_pairs();
+        if pairs == 0 {
+            return None;
+        }
+        let start = (DRAIN_PAIR_RR.fetch_add(1, Ordering::Relaxed) as usize) % pairs;
+        (0..pairs).find_map(|offset| {
+            let pair_idx = (start + offset) % pairs;
+            c.rx_take_on(pair_idx).map(|frame| (pair_idx, frame))
+        })
+    })
+    .flatten();
+    let (pair_idx, (mut buf, total_len)) = match taken {
         Some(t) => t,
         None => return false,
     };
@@ -2118,8 +2131,8 @@ fn vnet0_drain_fn() -> bool {
     }
     // Recycle the consumed buffer into the RX frame pool instead of freeing.
     with_controller(|c| {
-        c.rx_buf_release(buf);
-        c.rx_notify(0);
+        c.rx_buf_release_on(pair_idx, buf);
+        c.rx_notify(pair_idx);
     });
     true
 }
