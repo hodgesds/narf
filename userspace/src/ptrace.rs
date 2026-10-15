@@ -889,7 +889,11 @@ pub fn ptrace_report_seccomp(ctx: &mut dyn TrapContext, nr: u32, data: u64) -> O
     set_event_msg(pid, data);
     let code = SIGTRAP_EVENT_BASE | (PTRACE_EVENT_SECCOMP << 8);
     set_last_siginfo(pid, crate::handlers::ptrace_notify_siginfo(task, code));
-    enter_ptrace_stopped(ctx, task, pid_to_tid(tracer), code);
+    // Preserve the intercepted number in the saved syscall frame while the
+    // tracee is stopped. Besides making PEEKUSER's `orig_rax` truthful, this
+    // gives POKEUSER/SETREGS a concrete slot to replace before the seccomp
+    // path rechecks and dispatches the replacement.
+    enter_ptrace_stopped_inner(ctx, task, pid_to_tid(tracer), code, Some(u64::from(nr)));
     if crate::handlers::current_task_fatal_signal_pending() {
         return None;
     }
