@@ -14,7 +14,9 @@
 // syscall number); RET_TRAP with the siginfo Chromium's SIGSYS handler
 // insists on (si_code, si_errno, si_syscall, si_arch, si_call_addr == RIP,
 // RAX == nr) and a handler-supplied return value; RET_USER_NOTIF and
-// RET_TRACE without a listener/tracer (ENOSYS); stacking and precedence;
+// RET_TRACE without a listener/tracer (ENOSYS), and a PTRACE_EVENT_SECCOMP
+// tracer rewriting the pending syscall through PTRACE_POKEUSER; stacking and
+// precedence;
 // inheritance by fork and by threads; TSYNC (sync, failure tid,
 // TSYNC_ESRCH); RET_KILL_PROCESS, RET_KILL_THREAD; strict mode.
 //
@@ -28,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/ucontext.h>
@@ -78,6 +81,12 @@ struct seccomp_data {
 #define SECCOMP_RET_TRACE 0x7ff00000u
 #define SECCOMP_RET_LOG 0x7ffc0000u
 #define SECCOMP_RET_ALLOW 0x7fff0000u
+#ifndef PTRACE_O_TRACESECCOMP
+#define PTRACE_O_TRACESECCOMP 0x80
+#endif
+#ifndef PTRACE_EVENT_SECCOMP
+#define PTRACE_EVENT_SECCOMP 7
+#endif
 #ifndef SYS_SECCOMP
 #define SYS_SECCOMP 1
 #endif
@@ -136,6 +145,50 @@ static int child_status(pid_t c) {
     int st = 0;
     while (waitpid(c, &st, 0) < 0 && errno == EINTR) {}
     return st;
+}
+
+// A seccomp TRACE stop is special: Linux lets the tracer replace orig_rax
+// before continuing, then rechecks that replacement once and dispatches it.
+// Use PEEKUSER/POKEUSER instead of a libc user_regs_struct so this remains a
+// standalone musl-demo source. `orig_rax` is word 15 in x86_64's register
+// layout (struct user_regs_struct).
+static int trace_rewrite_smoke(void) {
+    const unsigned long ORIG_RAX = 15 * sizeof(unsigned long);
+    pid_t c = fork();
+    if (c < 0) return 1;
+    if (c == 0) {
+        long expected = syscall(SYS_getppid);
+        if (ptrace(PTRACE_TRACEME, 0, 0, 0) != 0) _exit(1);
+        raise(SIGSTOP);
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) _exit(2);
+        if (install(SYS_getpid, SECCOMP_RET_TRACE | 23, 0) != 0) _exit(3);
+        _exit(syscall(SYS_getpid) == expected ? 0 : 4);
+    }
+
+    int st;
+    if (waitpid(c, &st, 0) != c || !WIFSTOPPED(st) || WSTOPSIG(st) != SIGSTOP)
+        goto fail;
+    if (ptrace(PTRACE_SETOPTIONS, c, 0, (void *)PTRACE_O_TRACESECCOMP) != 0)
+        goto fail;
+    if (ptrace(PTRACE_CONT, c, 0, 0) != 0) goto fail;
+    if (waitpid(c, &st, 0) != c || !WIFSTOPPED(st) || WSTOPSIG(st) != SIGTRAP ||
+        ((unsigned)st >> 16) != PTRACE_EVENT_SECCOMP)
+        goto fail;
+
+    errno = 0;
+    if (ptrace(PTRACE_PEEKUSER, c, (void *)ORIG_RAX, 0) != SYS_getpid || errno != 0)
+        goto fail;
+    if (ptrace(PTRACE_POKEUSER, c, (void *)ORIG_RAX, (void *)SYS_getppid) != 0)
+        goto fail;
+    if (ptrace(PTRACE_CONT, c, 0, 0) != 0) goto fail;
+    if (waitpid(c, &st, 0) != c || !WIFEXITED(st) || WEXITSTATUS(st) != 0)
+        return 1;
+    return 0;
+
+fail:
+    kill(c, SIGKILL);
+    while (waitpid(c, &st, 0) < 0 && errno == EINTR) {}
+    return 1;
 }
 
 // ── SIGSYS handler: Chromium's sanity checks, then emulate the call. ──
@@ -319,7 +372,11 @@ int main(void) {
     st = child_status(c);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "TRAP child status %#x", st);
 
-    // 8. TSYNC: a thread created before the filter is synced to it.
+    // 8. A seccomp TRACE listener can replace orig_rax. The replacement is
+    // rechecked against the filter and is the syscall actually dispatched.
+    CHECK(trace_rewrite_smoke() == 0, "seccomp TRACE syscall rewrite");
+
+    // 9. TSYNC: a thread created before the filter is synced to it.
     c = fork();
     if (c == 0) {
         pthread_t t;
@@ -352,7 +409,7 @@ int main(void) {
     st = child_status(c);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "TSYNC refusal child status %#x", st);
 
-    // 9. KILL_PROCESS and KILL_THREAD (last thread): killed by SIGSYS.
+    // 10. KILL_PROCESS and KILL_THREAD (last thread): killed by SIGSYS.
     c = fork();
     if (c == 0) {
         install(SYS_getpid, SECCOMP_RET_KILL_PROCESS, 0);
@@ -370,7 +427,7 @@ int main(void) {
     st = child_status(c);
     CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGSYS, "KILL_THREAD status %#x", st);
 
-    // 10. Strict mode: write works, anything else is SIGKILL.
+    // 11. Strict mode: write works, anything else is SIGKILL.
     c = fork();
     if (c == 0) {
         if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT, 0, 0, 0) != 0) _exit(50);

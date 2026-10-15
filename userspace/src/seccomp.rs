@@ -767,56 +767,57 @@ pub fn active() -> bool {
 }
 
 /// `__secure_computing`, run at syscall entry after the ptrace entry stop.
-/// Returns `true` when the syscall must be skipped; its return value (or the
-/// signal frame that replaces it) has then been set on `ctx`.
+/// Returns the syscall number that must be dispatched. `None` means the
+/// filter (or its ptrace stop) consumed the call; its return value or signal
+/// frame has then been installed on `ctx`.
 #[inline]
-pub fn secure_computing(ctx: &mut dyn TrapContext, nr: u32) -> bool {
+pub fn secure_computing(ctx: &mut dyn TrapContext, nr: u32) -> Option<u32> {
     if ACTIVE_TASKS.load(Ordering::Acquire) == 0 {
-        return false;
+        return Some(nr);
     }
     secure_computing_slow(ctx, nr)
 }
 
 #[inline(never)]
-fn secure_computing_slow(ctx: &mut dyn TrapContext, nr: u32) -> bool {
+fn secure_computing_slow(ctx: &mut dyn TrapContext, nr: u32) -> Option<u32> {
     let task = current_task_id();
     // `if (IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) && unlikely(current->ptrace &
     // PT_SUSPEND_SECCOMP)) return 0;`
     if crate::ptrace::seccomp_suspended(task) {
-        return false;
+        return Some(nr);
     }
     let a = *ctx.args();
     let args = [a.arg0, a.arg1, a.arg2, a.arg3, a.arg4, a.arg5];
     match evaluate(task, nr, ctx.rip(), args) {
-        Verdict::Allow => false,
+        Verdict::Allow => Some(nr),
         Verdict::Return(v) => {
             ctx.set_return(SyscallReturn::ok(v as u64));
-            true
+            None
         }
         Verdict::Trap(data) => {
             // `syscall_rollback`: the handler sees the original registers,
             // the syscall number in the return register included.
             ctx.set_return(SyscallReturn::ok(u64::from(nr)));
             crate::handlers::force_sigsys_seccomp(ctx, task, nr, AUDIT_ARCH_NATIVE, data, false);
-            true
+            None
         }
         Verdict::KillProcess(data) => {
             mark_dead(task);
             ctx.set_return(SyscallReturn::ok(u64::from(nr)));
             crate::handlers::force_sigsys_seccomp(ctx, task, nr, AUDIT_ARCH_NATIVE, data, true);
-            true
+            None
         }
         Verdict::KillThread => {
             mark_dead(task);
             // `do_exit(SIGSYS)`: this thread only, killed-by-signal status.
             crate::handlers::exit_current_thread(ctx, 31);
-            true
+            None
         }
         Verdict::StrictKill => {
             mark_dead(task);
             // `do_exit(SIGKILL)`.
             crate::handlers::exit_current_thread(ctx, 9);
-            true
+            None
         }
         Verdict::TraceEvent(data) => {
             match crate::ptrace::ptrace_report_seccomp(ctx, nr, u64::from(data)) {
@@ -827,17 +828,17 @@ fn secure_computing_slow(ctx: &mut dyn TrapContext, nr: u32) -> bool {
                     let a = *ctx.args();
                     let args = [a.arg0, a.arg1, a.arg2, a.arg3, a.arg4, a.arg5];
                     match evaluate(task, new_nr, ctx.rip(), args) {
-                        Verdict::Allow | Verdict::TraceEvent(_) => false,
+                        Verdict::Allow | Verdict::TraceEvent(_) => Some(new_nr),
                         _ => {
                             // A recheck that is not ALLOW skips without a
                             // second action, like `__seccomp_filter`
                             // returning -1 from the recursive call.
-                            true
+                            None
                         }
                     }
                 }
                 // Skipped by the tracer (nr set to -1) or a fatal signal.
-                _ => true,
+                _ => None,
             }
         }
     }

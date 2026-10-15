@@ -879,9 +879,9 @@ pub fn seccomp_event_enabled(task: u64) -> bool {
 /// recheck, or `None` when the syscall must be skipped because a fatal
 /// signal arrived during the stop.
 ///
-/// The tracer cannot change the syscall number here: NARF's PTRACE_SETREGS
-/// does not reach `orig_rax` of a stopped syscall entry, so the number the
-/// recheck runs is the one the filter saw.
+/// A tracer can rewrite the syscall by setting `orig_rax` while the tracee is
+/// stopped. The resumed seccomp path rechecks that replacement once, just as
+/// Linux's `__seccomp_filter(..., true)` does.
 pub fn ptrace_report_seccomp(ctx: &mut dyn TrapContext, nr: u32, data: u64) -> Option<i64> {
     let task = current_task_id();
     let pid = tid_to_pid(task);
@@ -893,7 +893,30 @@ pub fn ptrace_report_seccomp(ctx: &mut dyn TrapContext, nr: u32, data: u64) -> O
     if crate::handlers::current_task_fatal_signal_pending() {
         return None;
     }
-    Some(i64::from(nr))
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::user_task::current_user_task()
+            .map(|uctx| {
+                // SAFETY: this is the in-flight, poller-pinned task. The
+                // ptrace stop has ended, so PTRACE_SETREGS' replacement is
+                // now the authoritative syscall number in its saved frame.
+                unsafe { (*(*uctx).state.get()).rax as i64 }
+            })
+            .or(Some(i64::from(nr)))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::user_task::current_user_task()
+            .map(|uctx| {
+                // SAFETY: as above. AArch64 carries the syscall number in x8.
+                unsafe { (*(*uctx).state.get()).x[8] as i64 }
+            })
+            .or(Some(i64::from(nr)))
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        Some(i64::from(nr))
+    }
 }
 
 const SIGTRAP_EVENT_BASE: u32 = 5;
@@ -1207,6 +1230,14 @@ fn get_tracee_regs(pid: u64) -> Option<user_regs_struct> {
 }
 
 fn set_tracee_regs(pid: u64, regs: user_regs_struct) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    let seccomp_event_stop = {
+        let g = PTRACE_STATE.lock();
+        g.as_ref().is_some_and(|r| {
+            r.stop_signal.get(&pid).copied()
+                == Some(SIGTRAP_EVENT_BASE | (PTRACE_EVENT_SECCOMP << 8))
+        })
+    };
     let tid = pid_to_tid(pid);
     crate::user_task::with_user_task_ctx(tid, |uctx| {
         // SAFETY: tracee is registered and stopped, so its state pointer is valid and stable.
@@ -1223,7 +1254,15 @@ fn set_tracee_regs(pid: u64, regs: user_regs_struct) -> bool {
             state.r10 = regs.r10;
             state.r9 = regs.r9;
             state.r8 = regs.r8;
-            state.rax = regs.rax;
+            // At a seccomp event stop Linux lets the tracer replace the
+            // pending syscall through orig_rax. Preserve the normal rax path
+            // for all other stops; a signal-stop's orig_rax is descriptive,
+            // not a second writable register.
+            state.rax = if seccomp_event_stop {
+                regs.orig_rax
+            } else {
+                regs.rax
+            };
             state.rcx = regs.rcx;
             state.rdx = regs.rdx;
             state.rsi = regs.rsi;
