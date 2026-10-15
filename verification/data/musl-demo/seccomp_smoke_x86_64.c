@@ -13,9 +13,10 @@
 // PR_GET_SECCOMP and /proc/self/status; RET_ERRNO (also for an unknown
 // syscall number); RET_TRAP with the siginfo Chromium's SIGSYS handler
 // insists on (si_code, si_errno, si_syscall, si_arch, si_call_addr == RIP,
-// RAX == nr) and a handler-supplied return value; RET_USER_NOTIF and
-// RET_TRACE without a listener/tracer (ENOSYS), and a PTRACE_EVENT_SECCOMP
-// tracer rewriting the pending syscall through PTRACE_POKEUSER; stacking and
+// RAX == nr) and a handler-supplied return value; RET_USER_NOTIF both without
+// a listener (ENOSYS) and with NEW_LISTENER (RECV/SEND, ID_VALID, CONTINUE),
+// RET_TRACE without a tracer (ENOSYS), and a PTRACE_EVENT_SECCOMP tracer
+// rewriting the pending syscall through PTRACE_POKEUSER; stacking and
 // precedence;
 // inheritance by fork and by threads; TSYNC (sync, failure tid,
 // TSYNC_ESRCH); RET_KILL_PROCESS, RET_KILL_THREAD; strict mode.
@@ -81,6 +82,10 @@ struct seccomp_data {
 #define SECCOMP_RET_TRACE 0x7ff00000u
 #define SECCOMP_RET_LOG 0x7ffc0000u
 #define SECCOMP_RET_ALLOW 0x7fff0000u
+#define SECCOMP_USER_NOTIF_FLAG_CONTINUE 1u
+#define SECCOMP_IOCTL_NOTIF_RECV 0xc0502100u
+#define SECCOMP_IOCTL_NOTIF_SEND 0xc0182101u
+#define SECCOMP_IOCTL_NOTIF_ID_VALID 0x40082102u
 #ifndef PTRACE_O_TRACESECCOMP
 #define PTRACE_O_TRACESECCOMP 0x80
 #endif
@@ -113,6 +118,19 @@ static int fails;
 static long sc(unsigned op, unsigned flags, void *args) {
     return syscall(SYS_seccomp, op, flags, args);
 }
+
+struct seccomp_notif {
+    unsigned long long id;
+    unsigned pid;
+    unsigned flags;
+    struct seccomp_data data;
+};
+struct seccomp_notif_resp {
+    unsigned long long id;
+    long long val;
+    int error;
+    unsigned flags;
+};
 
 // Return `ret_hit` for syscall `nr`, ALLOW for everything else.
 static int install(int nr, unsigned ret_hit, unsigned flags) {
@@ -189,6 +207,58 @@ fail:
     kill(c, SIGKILL);
     while (waitpid(c, &st, 0) < 0 && errno == EINTR) {}
     return 1;
+}
+
+// The listener belongs to the filter chain, not the installing task alone:
+// the parent monitors a child that inherited both its filter and its listener
+// fd. Cover an emulated result, stale-ID rejection after SEND, CONTINUE, and
+// the one-listener-per-chain EBUSY rule.
+static int user_notif_smoke(void) {
+    int listener = install(SYS_getppid, SECCOMP_RET_USER_NOTIF,
+                           SECCOMP_FILTER_FLAG_NEW_LISTENER);
+    if (listener < 0) return 1;
+    if (install(SYS_getuid, SECCOMP_RET_USER_NOTIF,
+                SECCOMP_FILTER_FLAG_NEW_LISTENER) != -1 || errno != EBUSY)
+        return 2;
+
+    pid_t child = fork();
+    if (child < 0) return 3;
+    if (child == 0) _exit(syscall(SYS_getppid) == 4242 ? 0 : 4);
+
+    struct seccomp_notif note = {0};
+    if (syscall(SYS_ioctl, listener, SECCOMP_IOCTL_NOTIF_RECV, &note) != 0)
+        return 5;
+    if (note.pid != (unsigned)child || note.data.nr != SYS_getppid) {
+        printf("user-notif record pid=%u child=%d nr=%d expected=%d\n",
+               note.pid, child, note.data.nr, SYS_getppid);
+        return 6;
+    }
+    if (syscall(SYS_ioctl, listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &note.id) != 0)
+        return 7;
+    struct seccomp_notif_resp reply = {.id = note.id, .val = 4242};
+    if (syscall(SYS_ioctl, listener, SECCOMP_IOCTL_NOTIF_SEND, &reply) != 0)
+        return 8;
+    errno = 0;
+    if (syscall(SYS_ioctl, listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &note.id) != -1 || errno != ENOENT)
+        return 9;
+    int st = child_status(child);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return 10;
+
+    pid_t parent = getpid();
+    child = fork();
+    if (child < 0) return 11;
+    if (child == 0) _exit(syscall(SYS_getppid) == parent ? 0 : 12);
+    memset(&note, 0, sizeof note);
+    if (syscall(SYS_ioctl, listener, SECCOMP_IOCTL_NOTIF_RECV, &note) != 0)
+        return 13;
+    reply = (struct seccomp_notif_resp) {
+        .id = note.id,
+        .flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+    };
+    if (syscall(SYS_ioctl, listener, SECCOMP_IOCTL_NOTIF_SEND, &reply) != 0)
+        return 14;
+    st = child_status(child);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 15;
 }
 
 // ── SIGSYS handler: Chromium's sanity checks, then emulate the call. ──
@@ -298,6 +368,11 @@ int main(void) {
     errno = 0;
     CHECK(sc(SECCOMP_SET_MODE_FILTER, 0, &faulty) == -1 && errno == EFAULT, "unreadable program not EFAULT");
     CHECK(prctl(PR_GET_SECCOMP, 0, 0, 0, 0) == 0, "a refused filter changed the mode");
+
+    c = fork();
+    if (c == 0) _exit(user_notif_smoke());
+    st = child_status(c);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "NEW_LISTENER smoke status %#x", st);
 
     // 6. ERRNO, status, stacking, an unknown syscall, USER_NOTIF/TRACE.
     c = fork();

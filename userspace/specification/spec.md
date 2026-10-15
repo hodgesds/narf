@@ -55,11 +55,19 @@ See [sound §3.1](../../drivers/sound/specification/spec.md#31-linux-alsa-pcm-an
 for implemented requests and compatibility limits.
 
 Seccomp supports strict mode and classic-BPF filter chains, including TSYNC,
-`RET_ERRNO`, `RET_TRAP`, `RET_TRACE`, and `RET_USER_NOTIF` without an attached
-listener (`ENOSYS`). A tracer which opted into `PTRACE_O_TRACESECCOMP` receives
-the filter data through `PTRACE_EVENT_SECCOMP`; before resume it may replace
-`orig_rax`, which is rechecked once and then dispatched as the replacement
-syscall.
+`RET_ERRNO`, `RET_TRAP`, `RET_TRACE`, and `RET_USER_NOTIF`. A user-notify
+action without an attached listener returns `ENOSYS`; installing the filter
+with `SECCOMP_FILTER_FLAG_NEW_LISTENER` returns one listener fd for that filter
+(a second listener on the chain is `EBUSY`). The listener serves
+`SECCOMP_IOCTL_NOTIF_RECV`, `SECCOMP_IOCTL_NOTIF_SEND`, and
+`SECCOMP_IOCTL_NOTIF_ID_VALID`: received records use the 80-byte
+`seccomp_notif` layout, IDs are unique per listener and stale after a response,
+and a response either emulates a return or uses `CONTINUE` to dispatch the
+original syscall. Forked tasks share the filter's listener and therefore feed
+one notification stream. A tracer which opted into `PTRACE_O_TRACESECCOMP`
+receives the filter data through `PTRACE_EVENT_SECCOMP`; before resume it may
+replace `orig_rax`, which is rechecked once and then dispatched as the
+replacement syscall.
 
 An inotify descriptor implements `FIONREAD` / `TIOCINQ` (`0x541b`), returning
 the bounded `int` byte count of its unread serialized event records. This is

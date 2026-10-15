@@ -17,7 +17,7 @@
 //! | KILL_THREAD   | the thread exits with SIGSYS (the group too if it is last)|
 //! | TRAP          | syscall skipped, SIGSYS with `SYS_SECCOMP` and `si_errno` |
 //! | ERRNO         | syscall skipped, returns `-data` (capped at MAX_ERRNO)    |
-//! | USER_NOTIF    | no listener can exist here, so `-ENOSYS`                  |
+//! | USER_NOTIF    | queue `seccomp_notif`; listener answers `RECV` / `SEND`   |
 //! | TRACE         | ptrace event stop if the tracer asked, else `-ENOSYS`     |
 //! | LOG, ALLOW    | the syscall runs                                          |
 //!
@@ -25,11 +25,13 @@
 //! `seccomp_check_filter`, so a program Linux accepts is accepted here and one
 //! Linux rejects with EINVAL is rejected with EINVAL.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use narf_filesystem::{FileOps, FsError, FsFuture, IoctlContext, Mode, Stat, POLL_IN};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::errno::{to_ret as err, *};
@@ -72,6 +74,14 @@ pub const SECCOMP_RET_LOG: u32 = 0x7ffc_0000;
 pub const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 const SECCOMP_RET_ACTION_FULL: u32 = 0xffff_0000;
 const SECCOMP_RET_DATA: u32 = 0x0000_ffff;
+
+/// `SECCOMP_USER_NOTIF_FLAG_CONTINUE`.
+const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
+/// `SECCOMP_IOCTL_NOTIF_RECV` / `SEND` / `ID_VALID`. These use the common
+/// Linux `_IOC` layout on x86_64 and aarch64.
+const SECCOMP_IOCTL_NOTIF_RECV: u32 = 0xc050_2100;
+const SECCOMP_IOCTL_NOTIF_SEND: u32 = 0xc018_2101;
+const SECCOMP_IOCTL_NOTIF_ID_VALID: u32 = 0x4008_2102;
 
 /// `MAX_ERRNO` (`include/linux/err.h`).
 const MAX_ERRNO: u32 = 4095;
@@ -214,6 +224,10 @@ pub struct SeccompFilter {
     prev: Option<Arc<SeccompFilter>>,
     /// `SECCOMP_FILTER_FLAG_LOG`.
     log: bool,
+    /// The single user-notification listener created with this filter, if
+    /// any. The filter retains it after its returned fd is closed, just as
+    /// Linux keeps the notification object attached to the filter chain.
+    listener: Option<Arc<UserNotifListener>>,
 }
 
 impl core::fmt::Debug for SeccompFilter {
@@ -221,6 +235,7 @@ impl core::fmt::Debug for SeccompFilter {
         f.debug_struct("SeccompFilter")
             .field("len", &self.prog.len())
             .field("log", &self.log)
+            .field("has_listener", &self.listener.is_some())
             .field("has_prev", &self.prev.is_some())
             .finish()
     }
@@ -567,20 +582,335 @@ fn action_only(ret: u32) -> i32 {
 }
 
 /// `seccomp_run_filters`: the lowest action across the chain wins; returns
-/// the full return value and whether the matching filter asked to log.
-fn run_filters(top: &Arc<SeccompFilter>, sd: &SeccompData) -> (u32, bool) {
+/// the full return value, whether the matching filter asked to log, and the
+/// winning filter's user-notification listener (if it has one).
+fn run_filters(
+    top: &Arc<SeccompFilter>,
+    sd: &SeccompData,
+) -> (u32, bool, Option<Arc<UserNotifListener>>) {
     let mut ret = SECCOMP_RET_ALLOW;
     let mut log = false;
+    let mut listener = None;
     let mut f = Some(top);
     while let Some(cur) = f {
         let r = run(&cur.prog, sd);
         if action_only(r) < action_only(ret) {
             ret = r;
             log = cur.log;
+            listener = cur.listener.clone();
         }
         f = cur.prev.as_ref();
     }
-    (ret, log)
+    (ret, log, listener)
+}
+
+fn chain_has_listener(top: Option<&Arc<SeccompFilter>>) -> bool {
+    let mut filter = top;
+    while let Some(current) = filter {
+        if current.listener.is_some() {
+            return true;
+        }
+        filter = current.prev.as_ref();
+    }
+    false
+}
+
+/// One target syscall that has crossed a `RET_USER_NOTIF` filter.
+#[derive(Clone)]
+struct UserNotification {
+    id: u64,
+    task: u64,
+    data: SeccompData,
+    delivered: bool,
+    response: Option<UserNotifResponse>,
+}
+
+#[derive(Copy, Clone)]
+struct UserNotifResponse {
+    value: i64,
+    error: i32,
+    flags: u32,
+}
+
+struct UserNotifState {
+    next_id: u64,
+    pending: Vec<UserNotification>,
+}
+
+/// Backing state of a Linux `struct seccomp_notif` listener fd. It is held by
+/// the filter rather than by an fd-table entry, so the task's seccomp policy
+/// outlives an individual duplicate/close of the listener descriptor. Public only because
+/// [`Verdict::UserNotif`] is part of the seccomp evaluation surface; callers
+/// receive it from the kernel path and cannot construct or mutate it directly.
+pub struct UserNotifListener {
+    state: IrqSafeSpinLock<UserNotifState>,
+    readiness: narf_lib::readiness::Readiness,
+}
+
+impl core::fmt::Debug for UserNotifListener {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UserNotifListener").finish_non_exhaustive()
+    }
+}
+
+enum UserNotifWait {
+    Queued,
+    Waiting,
+    Response(UserNotifResponse),
+}
+
+impl UserNotifListener {
+    fn new() -> Self {
+        Self {
+            state: IrqSafeSpinLock::new(UserNotifState {
+                // Zero is not a valid notification id. Saturation is harmless
+                // in practice, but preserve non-zero ids even then.
+                next_id: 1,
+                pending: Vec::new(),
+            }),
+            readiness: narf_lib::readiness::Readiness::new(0),
+        }
+    }
+
+    fn sync_readiness(&self, notify: bool) {
+        let queued = self
+            .state
+            .lock()
+            .pending
+            .iter()
+            .any(|n| !n.delivered && n.response.is_none());
+        if queued {
+            self.readiness.set(POLL_IN, 0);
+            if notify {
+                self.readiness.notify(POLL_IN);
+            }
+        } else {
+            self.readiness.set(0, POLL_IN);
+        }
+    }
+
+    /// Return an already supplied answer for this re-executed syscall, or
+    /// append one notification exactly once. An interrupted syscall that is
+    /// later replaced by a different one invalidates its old id instead of
+    /// accidentally delivering the old listener reply to the new call.
+    fn wait_or_queue(&self, task: u64, data: SeccompData) -> UserNotifWait {
+        let mut state = self.state.lock();
+        if let Some(pos) = state.pending.iter().position(|n| n.task == task) {
+            if state.pending[pos].data.nr == data.nr
+                && state.pending[pos].data.instruction_pointer == data.instruction_pointer
+                && state.pending[pos].data.args == data.args
+            {
+                if let Some(response) = state.pending[pos].response.take() {
+                    state.pending.remove(pos);
+                    drop(state);
+                    self.sync_readiness(false);
+                    return UserNotifWait::Response(response);
+                }
+                return UserNotifWait::Waiting;
+            }
+            state.pending.remove(pos);
+        }
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1).max(1);
+        state.pending.push(UserNotification {
+            id,
+            task,
+            data,
+            delivered: false,
+            response: None,
+        });
+        drop(state);
+        self.sync_readiness(true);
+        UserNotifWait::Queued
+    }
+
+    fn cancel_task(&self, task: u64) {
+        let mut state = self.state.lock();
+        state
+            .pending
+            .retain(|notification| notification.task != task);
+        drop(state);
+        self.sync_readiness(false);
+    }
+
+    fn receive(&self) -> Result<(u64, [u8; 80]), FsError> {
+        let mut state = self.state.lock();
+        let notification = state
+            .pending
+            .iter_mut()
+            .find(|notification| !notification.delivered && notification.response.is_none())
+            .ok_or(FsError::WouldBlock)?;
+        notification.delivered = true;
+        let id = notification.id;
+        let mut out = [0u8; 80];
+        out[0..8].copy_from_slice(&notification.id.to_ne_bytes());
+        // Process leaders live in the process-id map, whereas non-leader
+        // CLONE_THREAD tasks have their own Linux tid entry.  seccomp_notif's
+        // pid identifies the task that issued the syscall, so prefer the tid
+        // mapping but fall back to the leader's visible pid rather than
+        // leaking the scheduler TaskId.
+        let pid = crate::handlers::task_to_linux_tid_raw(notification.task)
+            .or_else(|| crate::handlers::task_to_pid_raw(notification.task))
+            .unwrap_or(notification.task) as u32;
+        out[8..12].copy_from_slice(&pid.to_ne_bytes());
+        out[16..20].copy_from_slice(&notification.data.nr.to_ne_bytes());
+        out[20..24].copy_from_slice(&notification.data.arch.to_ne_bytes());
+        out[24..32].copy_from_slice(&notification.data.instruction_pointer.to_ne_bytes());
+        for (index, arg) in notification.data.args.iter().enumerate() {
+            let offset = 32 + index * 8;
+            out[offset..offset + 8].copy_from_slice(&arg.to_ne_bytes());
+        }
+        drop(state);
+        self.sync_readiness(false);
+        Ok((id, out))
+    }
+
+    fn undeliver(&self, id: u64) {
+        let mut state = self.state.lock();
+        if let Some(notification) = state
+            .pending
+            .iter_mut()
+            .find(|notification| notification.id == id && notification.response.is_none())
+        {
+            notification.delivered = false;
+        }
+        drop(state);
+        self.sync_readiness(true);
+    }
+
+    fn send(&self, response: UserNotifResponse, id: u64) -> Result<(), FsError> {
+        if response.error > 0 || response.flags & !SECCOMP_USER_NOTIF_FLAG_CONTINUE != 0 {
+            return Err(FsError::InvalidData);
+        }
+        // CONTINUE has no accompanying return/error. Linux ignores these
+        // fields, but refusing a contradictory response keeps an accidental
+        // monitor bug from looking like a successfully emulated syscall.
+        if response.flags & SECCOMP_USER_NOTIF_FLAG_CONTINUE != 0
+            && (response.value != 0 || response.error != 0)
+        {
+            return Err(FsError::InvalidData);
+        }
+        let mut state = self.state.lock();
+        let notification = state
+            .pending
+            .iter_mut()
+            .find(|notification| notification.id == id && notification.delivered)
+            .ok_or(FsError::NotFound)?;
+        if notification.response.is_some() {
+            return Err(FsError::NotFound);
+        }
+        notification.response = Some(response);
+        Ok(())
+    }
+}
+
+impl FileOps for UserNotifListener {
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: narf_filesystem::FileType::Special,
+                perms: 0o600,
+            },
+            mtime_cycles: 0,
+        }
+    }
+
+    fn poll_readiness(&self) -> u32 {
+        if self
+            .state
+            .lock()
+            .pending
+            .iter()
+            .any(|notification| !notification.delivered && notification.response.is_none())
+        {
+            POLL_IN
+        } else {
+            0
+        }
+    }
+
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        Some(&self.readiness)
+    }
+
+    fn ioctl_user<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        context: &'a dyn IoctlContext,
+    ) -> FsFuture<'a, u64> {
+        Box::pin(async move {
+            match cmd {
+                SECCOMP_IOCTL_NOTIF_RECV => match self.receive() {
+                    Ok((id, notification)) => {
+                        if let Err(error) = context.write(arg, &notification) {
+                            self.undeliver(id);
+                            return Err(error);
+                        }
+                        Ok(0)
+                    }
+                    Err(FsError::WouldBlock) if !context.nonblocking() => {
+                        // `NOTIF_RECV` is a blocking ioctl. Ask the generic
+                        // ioctl path to rewind and retry, just like Linux's
+                        // interruptible wait queue; the listener's readiness
+                        // wakes poll/epoll observers immediately as well.
+                        let _ = context.restart_after(1_000_000);
+                        Err(FsError::WouldBlock)
+                    }
+                    Err(error) => Err(error),
+                },
+                SECCOMP_IOCTL_NOTIF_SEND => {
+                    let mut input = [0u8; 24];
+                    context.read(arg, &mut input)?;
+                    let id = u64::from_ne_bytes(input[0..8].try_into().unwrap_or([0; 8]));
+                    let value = i64::from_ne_bytes(input[8..16].try_into().unwrap_or([0; 8]));
+                    let error = i32::from_ne_bytes(input[16..20].try_into().unwrap_or([0; 4]));
+                    let flags = u32::from_ne_bytes(input[20..24].try_into().unwrap_or([0; 4]));
+                    self.send(
+                        UserNotifResponse {
+                            value,
+                            error,
+                            flags,
+                        },
+                        id,
+                    )?;
+                    Ok(0)
+                }
+                SECCOMP_IOCTL_NOTIF_ID_VALID => {
+                    let mut input = [0u8; 8];
+                    context.read(arg, &mut input)?;
+                    let id = u64::from_ne_bytes(input);
+                    let valid = self.state.lock().pending.iter().any(|notification| {
+                        notification.id == id && notification.response.is_none()
+                    });
+                    if valid {
+                        Ok(0)
+                    } else {
+                        Err(FsError::NotFound)
+                    }
+                }
+                _ => Err(FsError::Unsupported),
+            }
+        })
+    }
 }
 
 // ── Per-task state ──
@@ -675,6 +1005,15 @@ pub fn release_task(task: u64) {
     if ACTIVE_TASKS.load(Ordering::Acquire) == 0 {
         return;
     }
+    if let Some(top) = get(task).filter {
+        let mut filter = Some(&top);
+        while let Some(current) = filter {
+            if let Some(listener) = current.listener.as_ref() {
+                listener.cancel_task(task);
+            }
+            filter = current.prev.as_ref();
+        }
+    }
     set(task, TaskSeccomp::default());
 }
 
@@ -686,7 +1025,7 @@ pub fn __test_reset_task(task: u64) {
 // ── Syscall-entry enforcement ──
 
 /// What [`evaluate`] decided for one syscall.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum Verdict {
     /// Run the syscall.
     Allow,
@@ -702,6 +1041,10 @@ pub enum Verdict {
     StrictKill,
     /// RET_TRACE with a tracer that asked for PTRACE_EVENT_SECCOMP.
     TraceEvent(u16),
+    /// RET_USER_NOTIF with the listener from the filter that won action
+    /// precedence. The listener queues its ABI record before the tracee
+    /// parks and retries the syscall entry.
+    UserNotif(Arc<UserNotifListener>),
 }
 
 /// The decision for syscall `nr` of `task`, without acting on it.
@@ -727,7 +1070,7 @@ pub fn evaluate(task: u64, nr: u32, ip: u64, args: [u64; 6]) -> Verdict {
                 instruction_pointer: ip,
                 args,
             };
-            let (ret, _log) = run_filters(&top, &sd);
+            let (ret, _log, listener) = run_filters(&top, &sd);
             let data = (ret & SECCOMP_RET_DATA) as u16;
             match ret & SECCOMP_RET_ACTION_FULL {
                 SECCOMP_RET_ERRNO => Verdict::Return(-(i64::from(u32::from(data).min(MAX_ERRNO)))),
@@ -739,9 +1082,11 @@ pub fn evaluate(task: u64, nr: u32, ip: u64, args: [u64; 6]) -> Verdict {
                         Verdict::Return(-ENOSYS)
                     }
                 }
-                // No listener can be attached (NEW_LISTENER is refused), which
-                // is `seccomp_do_user_notification`'s `!match->notif` arm.
-                SECCOMP_RET_USER_NOTIF => Verdict::Return(-ENOSYS),
+                // A user-notification action may come from a filter installed
+                // without NEW_LISTENER. Linux answers ENOSYS in that case.
+                SECCOMP_RET_USER_NOTIF => listener
+                    .map(Verdict::UserNotif)
+                    .unwrap_or(Verdict::Return(-ENOSYS)),
                 SECCOMP_RET_LOG | SECCOMP_RET_ALLOW => Verdict::Allow,
                 SECCOMP_RET_KILL_THREAD => {
                     let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
@@ -841,6 +1186,46 @@ fn secure_computing_slow(ctx: &mut dyn TrapContext, nr: u32) -> Option<u32> {
                 _ => None,
             }
         }
+        Verdict::UserNotif(listener) => match listener.wait_or_queue(
+            task,
+            SeccompData {
+                nr: nr as i32,
+                arch: AUDIT_ARCH_NATIVE,
+                instruction_pointer: ctx.rip(),
+                args,
+            },
+        ) {
+            UserNotifWait::Response(response)
+                if response.flags & SECCOMP_USER_NOTIF_FLAG_CONTINUE != 0 =>
+            {
+                Some(nr)
+            }
+            UserNotifWait::Response(response) => {
+                let value = if response.error == 0 {
+                    response.value
+                } else {
+                    i64::from(response.error)
+                };
+                ctx.set_return(SyscallReturn::ok(value as u64));
+                None
+            }
+            UserNotifWait::Queued | UserNotifWait::Waiting => {
+                // The target is not permitted to dispatch until the monitor
+                // answers. Re-execution preserves its original registers;
+                // each retry finds the same request or consumes its reply.
+                if crate::handlers::has_interrupting_signal(task) {
+                    listener.cancel_task(task);
+                    ctx.set_return(SyscallReturn::ok((-EINTR) as u64));
+                } else if !crate::handlers::park_reexecute_on_io(ctx) {
+                    // Kernel-test/early contexts have no user-task executor to
+                    // park. Surface the same unavailable-monitor result rather
+                    // than busy-spinning in Ring 0.
+                    listener.cancel_task(task);
+                    ctx.set_return(SyscallReturn::ok((-ENOSYS) as u64));
+                }
+                None
+            }
+        },
     }
 }
 
@@ -920,12 +1305,6 @@ fn set_mode_filter(flags: u32, uargs: u64) -> SyscallReturn {
         Ok(p) => p,
         Err(e) => return err(e),
     };
-    // A listener fd needs the user-notification machinery, which NARF does
-    // not have; refuse the flag the way a kernel without it does.
-    if flags & SECCOMP_FILTER_FLAG_NEW_LISTENER != 0 {
-        return err(EINVAL);
-    }
-
     let _m = MUTATION.lock();
     let st = get(task);
     // seccomp_may_assign_mode.
@@ -942,6 +1321,12 @@ fn set_mode_filter(flags: u32, uargs: u64) -> SyscallReturn {
     }
     if total > MAX_INSNS_PER_PATH {
         return err(ENOMEM);
+    }
+    // Linux allows one listener-bearing filter on a chain.  The returned fd
+    // can be duplicated or passed over SCM_RIGHTS, but attaching a second
+    // listener is EBUSY even if the original fd has since been closed.
+    if flags & SECCOMP_FILTER_FLAG_NEW_LISTENER != 0 && chain_has_listener(st.filter.as_ref()) {
+        return err(EBUSY);
     }
     let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
     let siblings: Vec<u64> = if flags & SECCOMP_FILTER_FLAG_TSYNC != 0 {
@@ -967,11 +1352,34 @@ fn set_mode_filter(flags: u32, uargs: u64) -> SyscallReturn {
             return SyscallReturn::ok(crate::handlers::report_pid_to(task, tid));
         }
     }
+    let listener =
+        (flags & SECCOMP_FILTER_FLAG_NEW_LISTENER != 0).then(|| Arc::new(UserNotifListener::new()));
     let filter = Arc::new(SeccompFilter {
         prog,
         prev: st.filter.clone(),
         log: flags & SECCOMP_FILTER_FLAG_LOG != 0,
+        listener: listener.clone(),
     });
+    // Reserve the descriptor before publishing the filter: an EMFILE must not
+    // leave a task permanently subject to RET_USER_NOTIF with no monitor able
+    // to receive the request.  `fd::install` honours RLIMIT_NOFILE.
+    let listener_fd = if let Some(listener) = listener.as_ref() {
+        let ops: Arc<dyn FileOps> = listener.clone();
+        match crate::fd::install(
+            task,
+            crate::fd::FdEntry {
+                ops,
+                offset: 0,
+                flags: 0,
+                status_flags: crate::fd::O_RDWR,
+            },
+        ) {
+            Some(fd) => Some(fd),
+            None => return err(EMFILE),
+        }
+    } else {
+        None
+    };
     set(
         task,
         TaskSeccomp {
@@ -993,7 +1401,7 @@ fn set_mode_filter(flags: u32, uargs: u64) -> SyscallReturn {
             },
         );
     }
-    SyscallReturn::ok(0)
+    SyscallReturn::ok(listener_fd.unwrap_or(0) as u64)
 }
 
 /// `seccomp_get_action_avail`.
@@ -1214,6 +1622,7 @@ mod tests {
                 prog: alloc::vec![stmt(BPF_RET | BPF_K, ret)],
                 prev,
                 log: false,
+                listener: None,
             })
         };
         let a = f(SECCOMP_RET_ALLOW, None);
@@ -1235,4 +1644,86 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("userspace/seccomp", smoke_seccomp_chain_precedence);
+
+    /// Listener IDs remain valid until SEND, RECV describes the exact
+    /// seccomp_data payload, and CONTINUE is distinguishable from an emulated
+    /// result before syscall dispatch re-enters the filter chain.
+    fn smoke_seccomp_user_notification_queue() -> TestResult {
+        let listener = UserNotifListener::new();
+        let request = sd(110);
+        if !matches!(listener.wait_or_queue(41, request), UserNotifWait::Queued) {
+            return TestResult::Fail("first notification was not queued");
+        }
+        let (id, wire) = match listener.receive() {
+            Ok(notification) => notification,
+            Err(_) => return TestResult::Fail("listener did not receive queued notification"),
+        };
+        if id == 0
+            || u64::from_ne_bytes(wire[0..8].try_into().unwrap_or([0; 8])) != id
+            || i32::from_ne_bytes(wire[16..20].try_into().unwrap_or([0; 4])) != request.nr
+            || u64::from_ne_bytes(wire[24..32].try_into().unwrap_or([0; 8]))
+                != request.instruction_pointer
+            || u64::from_ne_bytes(wire[56..64].try_into().unwrap_or([0; 8])) != request.args[3]
+        {
+            return TestResult::Fail("seccomp_notif wire layout");
+        }
+        if listener
+            .send(
+                UserNotifResponse {
+                    value: 1234,
+                    error: 0,
+                    flags: 0,
+                },
+                id,
+            )
+            .is_err()
+        {
+            return TestResult::Fail("listener rejected response");
+        }
+        if listener
+            .send(
+                UserNotifResponse {
+                    value: 0,
+                    error: 0,
+                    flags: 0,
+                },
+                id,
+            )
+            .is_ok()
+        {
+            return TestResult::Fail("listener accepted duplicate response");
+        }
+        match listener.wait_or_queue(41, request) {
+            UserNotifWait::Response(response)
+                if response.value == 1234 && response.error == 0 && response.flags == 0 => {}
+            _ => return TestResult::Fail("listener did not deliver response once"),
+        }
+        if !matches!(listener.wait_or_queue(42, request), UserNotifWait::Queued) {
+            return TestResult::Fail("continue notification was not queued");
+        }
+        let (id, _) = match listener.receive() {
+            Ok(notification) => notification,
+            Err(_) => return TestResult::Fail("continue notification was not received"),
+        };
+        if listener
+            .send(
+                UserNotifResponse {
+                    value: 0,
+                    error: 0,
+                    flags: SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+                },
+                id,
+            )
+            .is_err()
+        {
+            return TestResult::Fail("listener rejected CONTINUE");
+        }
+        match listener.wait_or_queue(42, request) {
+            UserNotifWait::Response(response)
+                if response.flags == SECCOMP_USER_NOTIF_FLAG_CONTINUE => {}
+            _ => return TestResult::Fail("listener did not retain CONTINUE"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace/seccomp", smoke_seccomp_user_notification_queue);
 }
