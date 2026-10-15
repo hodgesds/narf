@@ -15,6 +15,7 @@ struct Model {
     pending: Option<(TeardownStep, bool)>,
     poisoned: bool,
     retired: [bool; 4],
+    released: [bool; 4],
 }
 impl Model {
     fn new() -> Self {
@@ -27,6 +28,7 @@ impl Model {
             pending: None,
             poisoned: false,
             retired: [false; 4],
+            released: [false; 4],
         }
     }
 }
@@ -46,6 +48,9 @@ impl Backend for Model {
         if self.poisoned || self.blocked == Some(s.next) {
             return Err(otg::Error::Busy.into());
         }
+        if s.next == TeardownStep::Release && !self.retired[usize::from(r.pipe)] {
+            return Err(otg::Error::Busy.into());
+        }
         if self.pending == Some((s.next, false)) {
             core::future::pending::<()>().await;
         }
@@ -61,6 +66,9 @@ impl Backend for Model {
         }
         if s.next == TeardownStep::Planes {
             self.retired[usize::from(r.pipe)] = true;
+        }
+        if s.next == TeardownStep::Release {
+            self.released[usize::from(r.pipe)] = true;
         }
         Ok(())
     }
@@ -95,9 +103,11 @@ fn request(protocol: Protocol) -> Request {
         audio: matches!(protocol, Protocol::Sst | Protocol::Tmds),
         scdc: protocol == Protocol::Tmds,
         dsc: protocol == Protocol::Sst,
-        address: 0x8_0000_1000,
-        stream: 2,
-        frames: (7, 8),
+        scanout: Some(ScanoutWitness {
+            address: 0x8_0000_1000,
+            stream: 2,
+            frames: (7, 8),
+        }),
     }
 }
 fn cases() -> [(Protocol, &'static [TeardownStep]); 5] {
@@ -144,7 +154,10 @@ fn navi48_teardown_orders_every_protocol_and_rearms_only_after_completion() -> T
         m.progress.rearm(r.pipe).unwrap();
         assert_eq!(m.progress.status(r.pipe), None);
         let next = Request {
-            address: r.address + 4096,
+            scanout: Some(ScanoutWitness {
+                address: r.scanout.unwrap().address + 4096,
+                ..r.scanout.unwrap()
+            }),
             ..r
         };
         // SAFETY: fresh model incarnation with no CPU or device references.
@@ -292,14 +305,26 @@ fn navi48_teardown_keeps_identity_siblings_and_unplug_intent() -> TestResult {
             ..r
         },
         Request {
-            address: r.address + 4096,
+            scanout: Some(ScanoutWitness {
+                address: r.scanout.unwrap().address + 4096,
+                ..r.scanout.unwrap()
+            }),
             ..r
         },
         Request {
-            frames: (9, 10),
+            scanout: Some(ScanoutWitness {
+                frames: (9, 10),
+                ..r.scanout.unwrap()
+            }),
             ..r
         },
-        Request { stream: 3, ..r },
+        Request {
+            scanout: Some(ScanoutWitness {
+                stream: 3,
+                ..r.scanout.unwrap()
+            }),
+            ..r
+        },
         Request { audio: true, ..r },
         Request { scdc: true, ..r },
         Request { dsc: true, ..r },
@@ -339,4 +364,167 @@ fn navi48_teardown_keeps_identity_siblings_and_unplug_intent() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-teardown",
     navi48_teardown_keeps_identity_siblings_and_unplug_intent
+);
+
+fn abort_model(m: &mut Model, pipe: u8) -> impl Future<Output = Result<(), ModesetError>> + '_ {
+    // SAFETY: this backend owns only bookkeeping and no hardware or CPU views.
+    unsafe { abort(m, pipe) }
+}
+
+fn activation(protocol: Protocol) -> Request {
+    Request {
+        scanout: None,
+        ..request(protocol)
+    }
+}
+
+fn abort_steps(r: Request) -> Vec<TeardownStep> {
+    use TeardownStep::*;
+    if r.dsc {
+        alloc::vec![Timing, DscClock, Planes, Release]
+    } else {
+        alloc::vec![Timing, Planes, Release]
+    }
+}
+
+fn navi48_activation_completion_and_cancellation_preserve_ownership() -> TestResult {
+    for (protocol, _) in cases() {
+        let r = activation(protocol);
+        let mut m = Model::new();
+        cancel(async {
+            m.progress.start_activation(r).unwrap();
+            core::future::pending::<()>().await;
+            m.progress.finish_activation(r.pipe, true);
+        });
+        let status = m.progress.status(r.pipe).unwrap();
+        assert!(status.activation && status.in_flight);
+        assert_eq!(status.next, TeardownStep::Timing);
+        assert_eq!(
+            finish(abort_model(&mut m, r.pipe)),
+            Err(otg::Error::Busy.into())
+        );
+        assert!(m.attempts.is_empty());
+        assert!(!m.released[usize::from(r.pipe)]);
+        assert_eq!(m.progress.check_idle(), Err(otg::Error::Busy.into()));
+        assert_eq!(m.progress.start_activation(r), Err(otg::Error::Busy.into()));
+        assert_eq!(
+            finish(run_model(&mut m, request(protocol), false)),
+            Err(otg::Error::Busy.into())
+        );
+
+        let mut m = Model::new();
+        m.progress.start_activation(r).unwrap();
+        m.progress.finish_activation(r.pipe, true);
+        assert_eq!(m.progress.status(r.pipe), None);
+        assert_eq!(m.progress.check_idle(), Ok(()));
+        // A successful Modeset has its normal teardown, never the unlit abort.
+        m.progress.begin(request(protocol), false).unwrap();
+        assert_eq!(
+            finish(abort_model(&mut m, r.pipe)),
+            Err(otg::Error::Invalid.into())
+        );
+        assert!(m.attempts.is_empty());
+        assert_eq!(finish(run_model(&mut m, request(protocol), false)), Ok(()));
+        assert!(!m.released[usize::from(r.pipe)]);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-teardown",
+    navi48_activation_completion_and_cancellation_preserve_ownership
+);
+
+fn navi48_activation_abort_resumes_without_replaying_or_touching_siblings() -> TestResult {
+    for (protocol, _) in cases() {
+        let r = activation(protocol);
+        let steps = abort_steps(r);
+        for (index, &step) in steps.iter().enumerate() {
+            let mut m = Model::new();
+            m.progress.start_activation(r).unwrap();
+            m.progress.finish_activation(r.pipe, false);
+            let sibling = Request {
+                pipe: 2,
+                ..request(Protocol::Sst)
+            };
+            m.progress.begin(sibling, false).unwrap();
+            let saved = m.progress.status(sibling.pipe);
+            m.blocked = Some(step);
+            assert_eq!(
+                finish(abort_model(&mut m, r.pipe)),
+                Err(otg::Error::Busy.into())
+            );
+            assert_eq!(m.writes.len(), index);
+            let status = m.progress.status(r.pipe).unwrap();
+            assert!(status.activation && !status.in_flight);
+            assert_eq!(status.next, step);
+            assert!(!m.released[usize::from(r.pipe)]);
+            m.blocked = None;
+            assert_eq!(finish(abort_model(&mut m, r.pipe)), Ok(()));
+            assert!(m.released[usize::from(r.pipe)]);
+            assert!(!m.released[usize::from(sibling.pipe)]);
+            assert_eq!(m.progress.status(r.pipe), None);
+            assert_eq!(m.progress.status(sibling.pipe), saved);
+            let expected: Vec<_> = steps.iter().map(|&s| (r.pipe, s)).collect();
+            assert_eq!(m.writes, expected);
+            // A second abort has no retained activation to operate on.
+            assert_eq!(
+                finish(abort_model(&mut m, r.pipe)),
+                Err(otg::Error::Invalid.into())
+            );
+            assert_eq!(m.writes, expected);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-teardown",
+    navi48_activation_abort_resumes_without_replaying_or_touching_siblings
+);
+
+fn navi48_activation_abort_quarantines_cancelled_and_failed_native_steps() -> TestResult {
+    for (protocol, _) in cases() {
+        let r = activation(protocol);
+        for step in abort_steps(r) {
+            for after_write in [false, true] {
+                let mut m = Model::new();
+                m.progress.start_activation(r).unwrap();
+                m.progress.finish_activation(r.pipe, false);
+                m.pending = Some((step, after_write));
+                cancel(abort_model(&mut m, r.pipe));
+                let attempts = m.attempts.len();
+                let writes = m.writes.clone();
+                m.pending = None;
+                assert_eq!(
+                    finish(abort_model(&mut m, r.pipe)),
+                    Err(otg::Error::Busy.into())
+                );
+                assert_eq!(m.attempts.len(), attempts);
+                assert_eq!(m.writes, writes);
+                assert!(m.progress.status(r.pipe).unwrap().in_flight);
+                assert!(!m.released[usize::from(r.pipe)]);
+            }
+            let mut m = Model::new();
+            m.progress.start_activation(r).unwrap();
+            m.progress.finish_activation(r.pipe, false);
+            m.failed = Some(step);
+            assert_eq!(
+                finish(abort_model(&mut m, r.pipe)),
+                Err(otg::Error::Readback(0).into())
+            );
+            let writes = m.writes.clone();
+            m.failed = None;
+            assert_eq!(
+                finish(abort_model(&mut m, r.pipe)),
+                Err(otg::Error::Busy.into())
+            );
+            assert_eq!(m.writes, writes);
+            assert!(!m.released[usize::from(r.pipe)]);
+            assert!(!m.progress.status(r.pipe).unwrap().in_flight);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-teardown",
+    navi48_activation_abort_quarantines_cancelled_and_failed_native_steps
 );

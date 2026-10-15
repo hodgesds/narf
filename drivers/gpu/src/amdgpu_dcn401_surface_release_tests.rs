@@ -295,3 +295,109 @@ kernel_test_in!(
     "drivers/gpu/dcn401-release",
     dcn401_release_waits_for_cpu_views_and_retains_cancelled_drains
 );
+
+fn dcn401_unlit_abort_retires_staging_before_reclaiming() -> TestResult {
+    for state in [
+        State::SurfacePrepared,
+        State::MemoryPrepared,
+        State::Prepared,
+        State::BlankPrepared,
+        State::DppPrepared,
+        State::MpcPrepared,
+        State::RequestorPrepared,
+        State::DeadlinesPrepared,
+        State::DpPhyDisabled,
+        State::HpoDpDisabled,
+        State::FrlDisabled,
+    ] {
+        let (mut e, mut surfaces, pool) = fixture();
+        let before = pool.available();
+        let sibling = e.displays.parked[1];
+        let l = e.layout;
+        e.status.state = state;
+        // A staged, connected MPC tree with fetch never started. Native abort
+        // must disconnect it even though no successful ScanoutRunning exists.
+        e.io.regs.insert(l.out_mux(0), 0);
+        e.io.regs.insert(l.mpcc(0, 0), 0);
+        e.io.regs.insert(l.mpcc(0, 2), 0);
+        assert_eq!(run(e.retire(0)), Ok(()));
+        assert_eq!(pool.available(), before);
+        assert!(run(e.retire_planes()).is_ok());
+        assert_eq!(pool.available(), before);
+        assert_eq!(e.io.regs[&l.out_mux(0)], 0xf);
+        // SAFETY: model-only unpublished buffers; timing and planes retired.
+        assert_eq!(unsafe { surfaces.release(&mut e, 0) }, Ok(48 * 1024));
+        assert_eq!(pool.available(), before + 48 * 1024);
+        assert_eq!(e.displays.parked[1], sibling);
+        assert!(surfaces.0[0].is_none());
+        assert!(surfaces.0[1].is_some());
+        assert!(surfaces.1.iter().all(|s| s.applied.request.pipe == 1));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-release",
+    dcn401_unlit_abort_retires_staging_before_reclaiming
+);
+
+fn dcn401_unlit_abort_refuses_live_failed_and_uncertain_hardware() -> TestResult {
+    for state in [
+        State::PreparingSurface(0),
+        State::PreparingMemory(0),
+        State::Preparing(0),
+        State::DpLinkTrained(0),
+        State::UhbrLinkTrained(0),
+        State::HdmiLinkReady(0),
+        State::FrlLinkActive(0),
+        State::ScanoutRunning(0),
+        State::Failed(Error::Readback(0)),
+    ] {
+        let (mut e, mut surfaces, pool) = fixture();
+        let before = pool.available();
+        e.status.state = state;
+        assert_eq!(run(e.retire(0)), Err(Error::Busy));
+        assert_eq!(run(e.retire_planes()), Err(Error::Busy));
+        // SAFETY: model-only allocations; every live/unknown state must refuse.
+        assert_eq!(unsafe { surfaces.release(&mut e, 0) }, Err(Error::Busy));
+        assert!(e.io.writes.is_empty());
+        drop(surfaces);
+        assert_eq!(pool.available(), before);
+    }
+    for flip in [false, true] {
+        let (mut e, mut surfaces, pool) = fixture();
+        let before = pool.available();
+        e.status.state = State::DeadlinesPrepared;
+        let l = e.layout;
+        if flip {
+            // Timing retirement is insufficient: an unexpected pending flip
+            // blocks the later plane drain and preserves every allocation.
+            assert_eq!(run(e.retire(0)), Ok(()));
+            e.io.regs.insert(l.hubp(0, 0x613), 0x100);
+            assert_eq!(run(e.retire_planes()), Err(Error::Busy));
+        } else {
+            // Historical staging never overrides a newly active stream.
+            let (at, mask) = l
+                .idle
+                .iter()
+                .copied()
+                .find(|&(at, mask)| {
+                    mask != 0
+                        && !e.sibling_register(at)
+                        && !(0..4).any(|p| at == l.otg(p, CONTROL) || at == l.otg(p, CLOCK))
+                })
+                .unwrap();
+            e.io.regs.insert(at, mask);
+            assert_eq!(run(e.retire(0)), Err(Error::Busy));
+            assert!(e.io.writes.is_empty());
+        }
+        // SAFETY: model-only; partial retirement has no release permission.
+        assert_eq!(unsafe { surfaces.release(&mut e, 0) }, Err(Error::Busy));
+        drop(surfaces);
+        assert_eq!(pool.available(), before);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-release",
+    dcn401_unlit_abort_refuses_live_failed_and_uncertain_hardware
+);

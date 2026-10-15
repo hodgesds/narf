@@ -974,7 +974,8 @@ memory, timing (with the plan's global sync), blank, DPP, MPC, requestor and
 deadlines are prepared before the PHY is enabled, trained, given its frontend
 (stream index = pipe), started on black video and switched to scanout.
 Inherited GOP consumers must already be retired; the clock owners refuse
-otherwise. Failures leave every owner where it stopped. `stop_modeset`
+otherwise. A returned failure in the per-pipe activation attempts the bounded
+abort described below; uncertain owners stay retained. `stop_modeset`
 reverses a success down to a disabled PHY with timing and planes retired; the
 surface allocation remains bound to its pipe.
 
@@ -982,7 +983,8 @@ surface allocation remains bound to its pipe.
 hardware access, before an async CPU-writer withdrawal. `stop_modeset` and
 `unplug_modeset` also begin it automatically. Per-pipe progress stays in the
 retained owner across errors and dropped futures. `display_teardown_status`
-returns `TeardownStatus { next: TeardownStep, in_flight, unplugged }`: audio, scanout,
+returns `TeardownStatus { next: TeardownStep, in_flight, activation, unplugged }`:
+audio, scanout,
 video, protocol-specific SCDC/payload/frontend work, link, timing, optional
 DSC clock, planes, then Complete. Only successful steps advance, with no
 await between completion and recording it. A resume must carry the original
@@ -1003,6 +1005,34 @@ PlanesRetired; fresh CPU/hardware proof remains mandatory for surface release.
 High-level activation/retraining rejects incomplete teardowns, and a new
 activation clears only that pipe's completed progress.
 
+Before per-pipe activation starts (after shared/pipe-clock preparation), the
+owner records an activation with no scanout witness and `in_flight = true`.
+Success clears that record and returns the normal `Modeset`. A returned error
+clears only the in-flight bit and attempts `abort_modeset_activation(pipe)`;
+the original startup error is returned whether cleanup succeeds or fails.
+`display_teardown_status(pipe).activation` identifies unfinished startup
+cleanup, including a failed pipe missing from `Configuration.displays`.
+
+The abort's phases are timing (including DSC disable), optional DSC clock,
+planes, then `TeardownStep::Release`. It uses the existing native guards and
+fresh retirement/reclamation proofs: it can reclaim stopped staging after
+a preflight rejection or a training refusal whose link was successfully
+stopped. It does not manufacture a successful scanout witness or try to stop
+live links, video or fetchers. Native failure/in-flight states, contradictory
+hardware and failed fresh checks retain the record and uncertain allocations.
+Completed phases survive returned errors; success clears the activation only
+after release. The caller must keep the activation unpublished to CPU writers
+and other engines, with the same exclusive ownership as `modeset_display`.
+Both require withdrawal and draining of any CPU views from earlier surface
+incarnations before starting activation, including retained same-geometry
+buffers that a low-level caller chose not to release after its previous stop.
+An unknown/non-activation pipe is Invalid. Dropping startup or an abort phase
+leaves the in-flight marker set and blocks replay, even if the native state
+looks reusable during a compound operation or retry delay. No reset or
+recovery of cancelled startup, active partial streams or shared-clock failure
+is implied. Models cover abort phase faults/cancellation and native staged
+retirement/release, including sibling isolation and unexpected live hardware.
+
 The monitor records intent before draining CPU views, publishes the retiring
 CRTC inactive, and retains its Modeset until teardown and surface release both
 succeed. A later pass resumes recorded teardowns before ordinary health checks
@@ -1010,6 +1040,10 @@ or MST notification service, even if DRM has since asked to reactivate. It
 finishes retirement before considering a fresh relight. Console withdrawal
 never selects another retiring pipe. Errors still stop the spawned monitor;
 explicit resumes and cancellation recovery do not bypass native quarantine.
+Pending activation aborts run before topology/health work, and successful
+cleanup makes the output eligible for relighting. Preferred-mode fallback and
+the benign NoSink/Link path are suppressed while any cleanup remains pending;
+they cannot discard an unfinished activation or silently retry it.
 Models cover every protocol's step ordering, rejection/cancellation at every
 step, request identity, sibling progress and unplug upgrades. Physical
 transition/recovery validation remains open.

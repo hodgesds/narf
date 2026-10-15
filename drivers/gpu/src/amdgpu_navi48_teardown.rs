@@ -1,6 +1,6 @@
 //! Durable progress through a modeset's teardown. Completed native steps are
 //! never replayed; the unfinished step still enforces its own hardware guards.
-use super::{ColdBoot, Modeset, ModesetError};
+use super::{ColdBoot, Modeset, ModesetError, Selection};
 use crate::amdgpu_dcn401_otg as otg;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,6 +15,7 @@ pub enum TeardownStep {
     Timing,
     DscClock,
     Planes,
+    Release,
     Complete,
 }
 
@@ -24,6 +25,8 @@ pub struct TeardownStatus {
     pub next: TeardownStep,
     /// A dropped native phase has no completion witness and cannot be replayed.
     pub in_flight: bool,
+    /// An activation has not returned a Modeset; abort uses native idle proof.
+    pub activation: bool,
     /// DP link shutdown keeps physical-removal semantics on every resume.
     pub unplugged: bool,
 }
@@ -38,6 +41,13 @@ enum Protocol {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScanoutWitness {
+    address: u64,
+    stream: u8,
+    frames: (u32, u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Request {
     pipe: u8,
     port: usize,
@@ -46,15 +56,22 @@ struct Request {
     scdc: bool,
     dsc: bool,
     // The original modeset witness, not the changing front address after flips.
-    address: u64,
-    stream: u8,
-    frames: (u32, u32),
+    scanout: Option<ScanoutWitness>,
 }
 impl Request {
     fn of(m: &Modeset) -> Self {
-        let s = &m.selection;
         Self {
-            pipe: m.pipe,
+            scanout: Some(ScanoutWitness {
+                address: m.scanout.address,
+                stream: m.scanout.stream,
+                frames: (m.scanout.frame_before, m.scanout.frame_after),
+            }),
+            ..Self::activation(m.pipe, &m.selection)
+        }
+    }
+    fn activation(pipe: u8, s: &Selection) -> Self {
+        Self {
+            pipe,
             port: s.port,
             protocol: if s.frl.is_some() {
                 Protocol::Frl
@@ -70,13 +87,13 @@ impl Request {
             audio: s.audio.is_some() && !s.uhbr() && s.frl.is_none(),
             scdc: s.scdc,
             dsc: s.dsc.is_some(),
-            address: m.scanout.address,
-            stream: m.scanout.stream,
-            frames: (m.scanout.frame_before, m.scanout.frame_after),
+            scanout: None,
         }
     }
     fn first(self) -> TeardownStep {
-        if self.audio {
+        if self.scanout.is_none() {
+            TeardownStep::Timing
+        } else if self.audio {
             TeardownStep::Audio
         } else {
             TeardownStep::Scanout
@@ -98,7 +115,8 @@ impl Request {
             Link => Timing,
             Timing if self.dsc => DscClock,
             Timing | DscClock => Planes,
-            Planes | Complete => Complete,
+            Planes if self.scanout.is_none() => Release,
+            Planes | Release | Complete => Complete,
         }
     }
 }
@@ -127,11 +145,39 @@ impl Teardowns {
             status: TeardownStatus {
                 next: request.first(),
                 in_flight: false,
+                activation: request.scanout.is_none(),
                 unplugged,
             },
         });
         progress.status.unplugged |= unplugged;
         Ok(())
+    }
+    fn start_activation(&mut self, request: Request) -> Result<(), ModesetError> {
+        self.rearm(request.pipe)?;
+        self.begin(request, false)?;
+        // Covers the entire activation, including compound AUX/SCDC work and
+        // retry delays whose native owner may look idle during cancellation.
+        self.0[usize::from(request.pipe)]
+            .as_mut()
+            .unwrap()
+            .status
+            .in_flight = true;
+        Ok(())
+    }
+    pub(super) fn begin_activation(
+        &mut self,
+        pipe: u8,
+        selection: &Selection,
+    ) -> Result<(), ModesetError> {
+        self.start_activation(Request::activation(pipe, selection))
+    }
+    pub(super) fn finish_activation(&mut self, pipe: u8, succeeded: bool) {
+        let slot = &mut self.0[usize::from(pipe)];
+        if succeeded {
+            *slot = None;
+        } else {
+            slot.as_mut().unwrap().status.in_flight = false;
+        }
     }
     fn status(&self, pipe: u8) -> Option<TeardownStatus> {
         self.0
@@ -216,6 +262,22 @@ async unsafe fn run(
     }
 }
 
+async unsafe fn abort(b: &mut impl Backend, pipe: u8) -> Result<(), ModesetError> {
+    let request = b
+        .teardowns()
+        .0
+        .get(usize::from(pipe))
+        .and_then(|p| *p)
+        .filter(|p| p.request.scanout.is_none())
+        .ok_or(otg::Error::Invalid)?
+        .request;
+    // SAFETY: caller retains the unpublished activation and all exclusions.
+    unsafe { run(b, request, false) }.await?;
+    // No suspension after release: a new activation can reuse this slot only
+    // after the final fresh proof and allocation release both succeeded.
+    b.teardowns().rearm(pipe)
+}
+
 impl Backend for ColdBoot {
     fn teardowns(&mut self) -> &mut Teardowns {
         &mut self.teardowns
@@ -285,6 +347,9 @@ impl Backend for ColdBoot {
                 Planes => {
                     self.retire_display_planes().await?;
                 }
+                Release => {
+                    self.release_display_surfaces(r.pipe)?;
+                }
                 Complete => {}
             }
         }
@@ -293,6 +358,18 @@ impl Backend for ColdBoot {
 }
 
 impl ColdBoot {
+    /// Abort a recorded activation which returned an error before publication.
+    /// Retire timing/DSC, planes and allocations using fresh native proofs.
+    /// Running links/video/fetchers, failed owners and cancelled operations
+    /// remain blocked. Completed abort phases are not replayed on a retry.
+    /// # Safety
+    /// As for modeset_display. The activation must remain unpublished to CPU
+    /// writers and other engines; drain any views from earlier incarnations
+    /// before activation, and retain exclusive ownership throughout the abort.
+    pub async unsafe fn abort_modeset_activation(&mut self, pipe: u8) -> Result<(), ModesetError> {
+        // SAFETY: caller supplies the unpublished activation's exclusions.
+        unsafe { abort(self, pipe) }.await
+    }
     /// Record the intended teardown before an async CPU-writer withdrawal.
     /// No hardware is touched. Keep the Modeset for every subsequent resume.
     pub fn begin_modeset_teardown(

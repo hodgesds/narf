@@ -445,7 +445,13 @@ finishes interrupted retirement before reactivation and publishes the CRTC
 inactive meanwhile. Cancelled CPU drains can resume, but cancellation inside
 a native phase blocks replay even when that phase spans several owners.
 Native failure guards still block uncertain operations; arbitrary partial
-activation and physical recovery validation remain open.
+activation and physical recovery validation remain open. Per-pipe startup now
+records an unpublished activation before staging. A returned failure attempts
+timing/DSC/plane retirement and fresh surface release when native owners prove
+the output stopped; completed cleanup steps survive preflight rejection.
+Pending cleanup blocks relighting/preferred-mode fallback and is retried before
+monitor topology work. Cancelled startup, live partial streams, failed native
+owners and shared-clock recovery remain blocked, with memory retained.
 The lit Navi48 display is published as DRM KMS state on the amdgpu card, with
 the sink's real EDID and exact timing (disconnected on unplug). SETCRTC
 accepts only that timing, and the base amdgpu DRM version 3.0.0 claims no

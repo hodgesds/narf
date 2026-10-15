@@ -1438,10 +1438,14 @@ impl ColdBoot {
     /// with `fill(y, row)` supplying each visible row before fetch starts.
     /// # Safety
     /// Inherited display consumers must be retired and every display of
-    /// this owner stopped. Exclude firmware/FAMS and concurrent
+    /// this owner stopped. Withdraw and drain all CPU views of retained
+    /// surfaces; leave each activation unpublished until success.
+    /// Exclude firmware/FAMS and concurrent
     /// display/hub/VM/IRQ/clock/reset/power/link writers; retain every owner
-    /// and allocation on every outcome, including cancellation. A failure
-    /// leaves the owners where they stopped; nothing is unwound.
+    /// and any allocations this API has not reclaimed, including on cancellation.
+    /// A returned failure
+    /// attempts to retire the unpublished pipe only when native owners prove
+    /// it stopped. Failed/in-flight owners and uncertain allocations stay held.
     pub async unsafe fn modeset_display(
         &mut self,
         pipe: u8,
@@ -1606,8 +1610,34 @@ impl ColdBoot {
         plan: dml::Plan,
         fill: &mut impl FnMut(u8, u32, &mut [u32]),
     ) -> Result<Modeset, ModesetError> {
-        self.teardowns.rearm(pipe)?;
         self.select_display(pipe)?;
+        self.teardowns.begin_activation(pipe, &selection)?;
+        // SAFETY: the caller owns this unpublished activation and every writer.
+        match unsafe { self.light_inner(pipe, selection, plan, fill) }.await {
+            Ok(m) => {
+                self.teardowns.finish_activation(pipe, true);
+                Ok(m)
+            }
+            Err(e) => {
+                self.teardowns.finish_activation(pipe, false);
+                // SAFETY: no Modeset was returned or CPU scanout published.
+                // Native guards refuse live/failed owners; cleanup failure
+                // retains the journal and memory. Preserve the original error.
+                let _ = unsafe { self.abort_modeset_activation(pipe) }.await;
+                Err(e)
+            }
+        }
+    }
+    /// The activation body, covered by light's retained in-flight marker.
+    /// # Safety
+    /// As for light.
+    async unsafe fn light_inner(
+        &mut self,
+        pipe: u8,
+        selection: Selection,
+        plan: dml::Plan,
+        fill: &mut impl FnMut(u8, u32, &mut [u32]),
+    ) -> Result<Modeset, ModesetError> {
         let (width, height) = (selection.timing.h_active, selection.timing.v_active);
         // SAFETY: the caller's exclusion and retention obligations cover each
         // retained owner below; every step validates its own preconditions.

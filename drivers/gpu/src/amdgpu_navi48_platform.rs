@@ -822,7 +822,8 @@ async fn withdraw(boot: &boot::ColdBoot, pipe: u8, lit: &[Option<Modeset>; 4]) {
 /// row)` before each fetch starts, then publish them: the console on the
 /// first display, every output on KMS. Every display must be stopped.
 /// # Safety
-/// Inherited display consumers must be retired. Exclude firmware/FAMS and
+/// Inherited display consumers must be retired; withdraw and drain any CPU
+/// views of retained surfaces before entry. Exclude firmware/FAMS and
 /// concurrent display/hub/VM/IRQ/clock/reset/power/link writers.
 pub async unsafe fn modeset_displays(
     fill: impl FnMut(u8, u32, &mut [u32]),
@@ -842,10 +843,7 @@ async unsafe fn light_displays(
     fill: impl FnMut(u8, u32, &mut [u32]),
 ) -> Result<crate::amdgpu_navi48_boot::Configuration, ModesetError> {
     use crate::drm::card::ConnectorType;
-    if (0..4).any(|p| {
-        boot.display_teardown_status(p)
-            .is_some_and(|s| s.next != boot::TeardownStep::Complete)
-    }) {
+    if pending_display_work(boot) {
         return Err(crate::amdgpu_dcn401_otg::Error::Busy.into());
     }
     // The first plugged DP port whose sink is an MST branch lights its end
@@ -1460,6 +1458,13 @@ fn monitor_order(pending: u8) -> impl Iterator<Item = u8> {
         .chain((0..4u8).filter(move |p| pending & (1 << p) == 0))
 }
 
+fn pending_display_work(boot: &boot::ColdBoot) -> bool {
+    (0..4).any(|p| {
+        boot.display_teardown_status(p)
+            .is_some_and(|s| s.next != boot::TeardownStep::Complete)
+    })
+}
+
 /// Physical HPD describes the root only. MST output presence comes from the
 /// retained downstream snapshot, including when no stream is running.
 fn output_present(boot: &mut boot::ColdBoot, port: usize, slot: usize, mst: bool) -> bool {
@@ -1521,6 +1526,22 @@ pub async unsafe fn monitor_displays(
     let mut steps = Vec::new();
     let mut owner = OWNER.lock().await;
     let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
+    // Failed activations have no Modeset in Displays. Finish their recorded
+    // abort before topology service or selecting an already-lit sibling.
+    for pipe in 0..4 {
+        if boot
+            .display_teardown_status(pipe)
+            .is_some_and(|s| s.activation)
+        {
+            if displays.lit[usize::from(pipe)].is_some() {
+                return Err(crate::amdgpu_dcn401_otg::Error::Busy.into());
+            }
+            // SAFETY: this activation never published a CPU scanout; OWNER
+            // and the caller's exclusions retain every native resource.
+            unsafe { boot.abort_modeset_activation(pipe) }.await?;
+            displays.considered &= !(1 << pipe);
+        }
+    }
     // Keep a connected branch's output identities and DRM requests even
     // when every CRTC is off. Only its physical removal restores board ports.
     let mst_port = mst_output_port(&OUTPUTS.lock());
@@ -1637,14 +1658,14 @@ pub async unsafe fn monitor_displays(
         let fill = |_: u8, _: u32, row: &mut [u32]| row.fill(0);
         // SAFETY: as above; every display is stopped.
         let lit = match unsafe { light_displays(boot, fill) }.await {
-            Err(e @ (ModesetError::NoSink | ModesetError::Link)) => {
+            Err(e @ (ModesetError::NoSink | ModesetError::Link)) if !pending_display_work(boot) => {
                 let _ = core::fmt::Write::write_fmt(
                     &mut narf_console::Writer,
                     format_args!("amdgpu: navi48 displays not lit: {e:?}\n"),
                 );
                 None
             }
-            Err(e) if wants.iter().any(|w| w.1.is_some()) => {
+            Err(e) if wants.iter().any(|w| w.1.is_some()) && !pending_display_work(boot) => {
                 // A requested mode did not light: go back to the preferred
                 // modes rather than leave the sinks dark.
                 let _ = core::fmt::Write::write_fmt(
