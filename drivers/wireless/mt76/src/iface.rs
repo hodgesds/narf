@@ -26,10 +26,10 @@ use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::iface::{HwCaps, WirelessBand, WirelessIfaceInfo, WirelessModes};
+use narf_wireless::scan::BssInfo;
 use narf_wireless::{
     AssociateRequest, ScanRequest, WirelessConfig, WirelessError, WirelessNetIface,
 };
-use narf_wireless::scan::BssInfo;
 
 use crate::mt7921::name_for;
 
@@ -53,7 +53,10 @@ impl core::fmt::Debug for Mt76Iface {
         f.debug_struct("Mt76Iface")
             .field("name", &self.name)
             .field("mac", &self.mac)
-            .field("effective_did", &format_args!("{:#06x}", self.effective_did))
+            .field(
+                "effective_did",
+                &format_args!("{:#06x}", self.effective_did),
+            )
             .finish_non_exhaustive()
     }
 }
