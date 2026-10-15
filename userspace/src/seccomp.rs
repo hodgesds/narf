@@ -378,8 +378,7 @@ fn bpf_check_classic(prog: &[SockFilter]) -> bool {
             if ins.k >= 32 {
                 return false;
             }
-        } else if c == BPF_LD | BPF_MEM || c == BPF_LDX | BPF_MEM || c == BPF_ST || c == BPF_STX
-        {
+        } else if c == BPF_LD | BPF_MEM || c == BPF_LDX | BPF_MEM || c == BPF_ST || c == BPF_STX {
             if ins.k >= BPF_MEMWORDS {
                 return false;
             }
@@ -652,7 +651,10 @@ pub fn filter_count_of(task: u64) -> usize {
     if ACTIVE_TASKS.load(Ordering::Acquire) == 0 {
         return 0;
     }
-    get(task).filter.as_ref().map_or(0, SeccompFilter::chain_len)
+    get(task)
+        .filter
+        .as_ref()
+        .map_or(0, SeccompFilter::chain_len)
 }
 
 /// `copy_seccomp` (kernel/fork.c): a child of any `clone` shares its
@@ -878,7 +880,8 @@ fn prepare_user_filter(task: u64, uargs: u64) -> Result<Vec<SockFilter>, i64> {
     }
     // CAP_SYS_ADMIN in the task's user namespace, or no_new_privs.
     const CAP_SYS_ADMIN: u32 = 21;
-    if !crate::handlers::task_no_new_privs(task) && !crate::handlers::capable_in_own_ns(CAP_SYS_ADMIN)
+    if !crate::handlers::task_no_new_privs(task)
+        && !crate::handlers::capable_in_own_ns(CAP_SYS_ADMIN)
     {
         return Err(EACCES);
     }
@@ -953,7 +956,8 @@ fn set_mode_filter(flags: u32, uargs: u64) -> SyscallReturn {
     for &t in &siblings {
         let ts = get(t);
         let ok = ts.mode == SECCOMP_MODE_DISABLED
-            || (ts.mode == SECCOMP_MODE_FILTER && is_ancestor(ts.filter.as_ref(), st.filter.as_ref()));
+            || (ts.mode == SECCOMP_MODE_FILTER
+                && is_ancestor(ts.filter.as_ref(), st.filter.as_ref()));
         if !ok {
             if flags & SECCOMP_FILTER_FLAG_TSYNC_ESRCH != 0 {
                 return err(ESRCH);
@@ -1018,7 +1022,7 @@ fn get_notif_sizes(uargs: u64) -> SyscallReturn {
     b[0..2].copy_from_slice(&80u16.to_ne_bytes()); // struct seccomp_notif
     b[2..4].copy_from_slice(&24u16.to_ne_bytes()); // struct seccomp_notif_resp
     b[4..6].copy_from_slice(&64u16.to_ne_bytes()); // struct seccomp_data
-    // SAFETY: copy_to_user range-checks and fault-contains the destination.
+                                                   // SAFETY: copy_to_user range-checks and fault-contains the destination.
     if unsafe { copy_to_user(uargs, &b) }.is_err() {
         return err(EFAULT);
     }
@@ -1068,7 +1072,12 @@ mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     const fn stmt(code: u16, k: u32) -> SockFilter {
-        SockFilter { code, jt: 0, jf: 0, k }
+        SockFilter {
+            code,
+            jt: 0,
+            jf: 0,
+            k,
+        }
     }
     const fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
         SockFilter { code, jt, jf, k }
@@ -1138,7 +1147,10 @@ mod tests {
             return TestResult::Fail("scratch cell 16 accepted");
         }
         // LEN becomes an immediate 64.
-        match validate(alloc::vec![stmt(BPF_LD | BPF_W | BPF_LEN, 0), stmt(BPF_RET | BPF_A, 0)]) {
+        match validate(alloc::vec![
+            stmt(BPF_LD | BPF_W | BPF_LEN, 0),
+            stmt(BPF_RET | BPF_A, 0)
+        ]) {
             Some(p) if run(&p, &sd(0)) == 64 => {}
             _ => return TestResult::Fail("BPF_LEN did not load sizeof(seccomp_data)"),
         }
@@ -1162,8 +1174,11 @@ mod tests {
         }
         // args[3] high word, instruction pointer halves, arch.
         let load = |off: u32| {
-            let p = validate(alloc::vec![stmt(BPF_LD | BPF_W | BPF_ABS, off), stmt(BPF_RET | BPF_A, 0)])
-                .unwrap_or_default();
+            let p = validate(alloc::vec![
+                stmt(BPF_LD | BPF_W | BPF_ABS, off),
+                stmt(BPF_RET | BPF_A, 0)
+            ])
+            .unwrap_or_default();
             run(&p, &sd(1))
         };
         if load(4) != AUDIT_ARCH_NATIVE

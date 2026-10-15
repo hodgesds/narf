@@ -576,6 +576,9 @@ mod tests {
         let rwx = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::EXEC;
         assert_eq!(classify_mprotect(rx, rwx), WxTransition::NeedsCapJit);
         assert_eq!(classify_mprotect(rw, rwx), WxTransition::NeedsCapJit);
-        assert_eq!(classify_mprotect(RegionPerms(0), rwx), WxTransition::NeedsCapJit);
+        assert_eq!(
+            classify_mprotect(RegionPerms(0), rwx),
+            WxTransition::NeedsCapJit
+        );
     }
 }

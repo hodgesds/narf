@@ -407,8 +407,7 @@ impl SigDeliveryParams {
                 ssi[4..8].copy_from_slice(&self.si_pid.to_ne_bytes());
                 ssi[SYSCALL..SYSCALL + 4].copy_from_slice(&(self.si_value as u32).to_ne_bytes());
                 ssi[CALL_ADDR..CALL_ADDR + 8].copy_from_slice(&self.si_addr.to_ne_bytes());
-                ssi[ARCH..ARCH + 4]
-                    .copy_from_slice(&((self.si_value >> 32) as u32).to_ne_bytes());
+                ssi[ARCH..ARCH + 4].copy_from_slice(&((self.si_value >> 32) as u32).to_ne_bytes());
             }
         }
         ssi
@@ -4494,8 +4493,7 @@ pub fn kernel_syscall_entry_plain_with_state(
     // `__secure_computing`, after the ptrace entry stop as in Linux's
     // `syscall_trace_enter`. A skipped syscall has its return value (or the
     // SIGSYS frame) already set and still takes the exit path below.
-    let seccomp_skipped =
-        !user_state.is_null() && crate::seccomp::secure_computing(&mut ctx, num);
+    let seccomp_skipped = !user_state.is_null() && crate::seccomp::secure_computing(&mut ctx, num);
     if !seccomp_skipped {
         table.dispatch(n, &mut ctx);
     }

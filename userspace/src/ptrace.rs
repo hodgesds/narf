@@ -763,7 +763,8 @@ pub fn ptrace_intercept_signal_info(
         // the stop and comes back if the tracer resumes with the same signal
         // (`ptrace_signal` delivers `current->last_siginfo`). Left queued, a
         // re-injected sigqueue() signal reached its handler without its value.
-        let src = if crate::handlers::signal_pending_private(task) & crate::handlers::sig_bit(signum)
+        let src = if crate::handlers::signal_pending_private(task)
+            & crate::handlers::sig_bit(signum)
             != 0
         {
             task
@@ -931,7 +932,12 @@ impl CloneTrace {
 /// that stop before its first instruction rather than queueing the signal,
 /// which is the same thing the tracer can observe: the child's first stop is
 /// SIGSTOP, and nothing it does happens before the tracer resumes it.
-pub fn attach_new_child(parent_task: u64, child_task: u64, clone_flags: u64, exit_signal: u64) -> CloneTrace {
+pub fn attach_new_child(
+    parent_task: u64,
+    child_task: u64,
+    clone_flags: u64,
+    exit_signal: u64,
+) -> CloneTrace {
     if PTRACE_TRACEES.load(Ordering::Acquire) == 0 {
         return CloneTrace::NONE;
     }
@@ -1008,7 +1014,10 @@ fn report_child_event(ctx: &mut dyn TrapContext, event: u32, child_task: u64, re
     };
     let tracer_task = pid_to_tid(tracer);
     let child_tid = tid_to_pid(child_task);
-    set_event_msg(parent, crate::handlers::report_pid_to(tracer_task, child_tid));
+    set_event_msg(
+        parent,
+        crate::handlers::report_pid_to(tracer_task, child_tid),
+    );
     let code = SIGTRAP_EVENT_BASE | (event << 8);
     set_last_siginfo(parent, crate::handlers::ptrace_notify_siginfo(task, code));
     clear_stop_rax(parent);
@@ -1644,8 +1653,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 // status); any other signal is a new one from the tracer.
                 if let Some((sig, Some((code, value, sender)))) = stopped_with {
                     if sig == data as u32 {
-                        let _ =
-                            crate::handlers::store_sigqueue_info(tid, sig, code, value, sender);
+                        let _ = crate::handlers::store_sigqueue_info(tid, sig, code, value, sender);
                     }
                 }
                 set_ptrace_signal_bypass(pid, data as u32);
