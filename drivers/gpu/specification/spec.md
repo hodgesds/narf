@@ -1166,6 +1166,20 @@ payload tables and probes LINK_ADDRESS/ENUM_PATH_RESOURCES depth first;
 `read_display_mst_edid` reads end-device EDIDs through REMOTE_I2C_READ. The
 probe uses an explicit stack so its future can run in the display monitor.
 
+`Manager::poll_up_requests` reads at most eight ready up-request chunks per
+call without waiting for a new notification. It acknowledges only
+UP_REQ_MSG_RDY, leaving down replies and other ESI bits alone. Fragment
+reassembly survives idle poll budgets and down-transaction completion;
+start/stop clear the previous session's fragments and events. Complete
+connection/resource notifications enter `events`, capped at 64. `EventsFull`
+leaves the next branch chunk unacknowledged until the caller drains the queue.
+Down transactions still consume their own replies while that queue is full.
+Truncated bodies fail instead of manufacturing zero-filled status fields.
+An event survives failure to send its sideband ACK after ESI acknowledgement.
+`ColdBoot::poll_display_mst(port)` and `take_display_mst_events(port)` expose
+this service over DMUB AUX. They do not replace the live topology or payload
+identities; applying these events in the platform monitor remains separate.
+
 `unsafe ColdBoot::modeset_mst_displays(port, fill, want, pipes)` lights one
 branch's sinks with joint DML admission, 8-bpc RGB and the maximum supported
 8b/10b link. `pipes[k]: Option<u8>` assigns topology device k to a distinct

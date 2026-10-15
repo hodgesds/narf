@@ -9,6 +9,8 @@
 //!   drm_dp_get_one_sb_msg does once ESI's DOWN_REP_MSG_RDY rises and
 //!   acknowledging it; up requests arriving meanwhile are read, answered
 //!   with drm_dp_send_up_ack_reply's ACK and queued;
+//! - `poll_up_requests` services those notifications without a down
+//!   transaction, with bounded work and reassembly retained between calls;
 //! - `probe` is drm_dp_mst_link_probe_work: CLEAR_PAYLOAD_ID_TABLE once,
 //!   then LINK_ADDRESS down the tree with ENUM_PATH_RESOURCES for every
 //!   connected output port (drm_dp_mst_handle_link_address_port);
@@ -33,6 +35,9 @@ pub const PAYLOAD_TABLE_UPDATE_STATUS: u32 = 0x2c0;
 const PAYLOAD_TABLE_UPDATED: u8 = 1;
 /// drm_dp_mst_wait_tx_reply's 4 s, polled every millisecond.
 const REPLY_TIMEOUT_MS: u32 = 4000;
+/// Bound one idle service pass and the retained notification queue.
+const UP_CHUNKS_PER_POLL: usize = 8;
+const MAX_UP_EVENTS: usize = 64;
 
 /// The DPCD side of an MST link.
 pub trait MstAux {
@@ -59,6 +64,9 @@ pub enum MstError<E> {
     Malformed,
     /// The payload table did not report its update.
     PayloadTable,
+    /// Drain `Manager::events` before servicing more up requests. The next
+    /// chunk stays unacknowledged at the branch, so no event is discarded.
+    EventsFull,
 }
 
 /// A port of a branch, as its LINK_ADDRESS reply and ENUM_PATH_RESOURCES
@@ -157,8 +165,11 @@ struct Frame {
 
 #[derive(Debug)]
 pub struct Manager {
-    /// Up requests received while waiting for replies.
+    /// Up requests received by transactions or idle polling. Consumers drain
+    /// these before retrying `EventsFull`.
     pub events: Vec<UpRequest>,
+    // An up request can span a transaction's reply or an idle poll budget.
+    up: Option<Rx>,
     cleared: bool,
 }
 impl Default for Manager {
@@ -170,6 +181,7 @@ impl Manager {
     pub const fn new() -> Self {
         Self {
             events: Vec::new(),
+            up: None,
             cleared: false,
         }
     }
@@ -192,6 +204,8 @@ impl Manager {
             .await
             .map_err(MstError::Aux)?;
         self.cleared = false;
+        self.events.clear();
+        self.up = None;
         write_payload(aux, 0, 0, 0x3f).await
     }
     /// drm_dp_mst_topology_mgr_set_mst(false): MST off (the sink may be
@@ -200,6 +214,7 @@ impl Manager {
         let _ = aux.write(MSTM_CTRL, &[0]).await;
         self.cleared = false;
         self.events.clear();
+        self.up = None;
     }
     /// One sideband message from `base` (drm_dp_get_one_sb_msg).
     async fn read_one<A: MstAux>(
@@ -246,11 +261,11 @@ impl Manager {
         Ok(())
     }
     /// An up request: read, acknowledged in ESI, answered, queued.
-    async fn up_request<A: MstAux>(
-        &mut self,
-        aux: &mut A,
-        rx: &mut Rx,
-    ) -> Result<(), MstError<A::Error>> {
+    async fn up_request<A: MstAux>(&mut self, aux: &mut A) -> Result<(), MstError<A::Error>> {
+        if self.events.len() >= MAX_UP_EVENTS {
+            return Err(MstError::EventsFull);
+        }
+        let rx = self.up.get_or_insert_with(Rx::default);
         Self::read_one(aux, dp_mst::UP_REQ_BASE, rx).await?;
         aux.write(ESI0, &[UP_REQ_MSG_RDY])
             .await
@@ -258,17 +273,49 @@ impl Manager {
         if !rx.complete() {
             return Ok(());
         }
+        let rx = self.up.take().ok_or(MstError::Malformed)?;
         let hdr = rx.initial;
         let kind = rx.msg[0] & 0x7f;
-        let parsed = UpRequest::parse(rx);
-        *rx = Rx::default();
+        // The raw codec deliberately mirrors Linux's permissive parser for
+        // reference parity. The live manager must not synthesize fields
+        // from the zero-filled tail of a truncated notification.
+        let required = match kind {
+            dp_mst::CONNECTION_STATUS_NOTIFY => 19,
+            dp_mst::RESOURCE_STATUS_NOTIFY => 20,
+            _ => return Err(MstError::Malformed),
+        };
+        if usize::from(rx.len) < required {
+            return Err(MstError::Malformed);
+        }
+        let parsed = UpRequest::parse(&rx).ok_or(MstError::Malformed)?;
+        // ESI was acknowledged: retain the notification even if sending
+        // its sideband ACK fails. The caller can drain it after the error.
+        self.events.push(parsed);
         // drm_dp_send_up_ack_reply to the requesting branch.
         let ack = dp_mst::chunks(hdr.lct, &hdr.rad, false, &UpRequest::ack(kind));
         Self::send(aux, dp_mst::UP_REP_BASE, &ack).await?;
-        if let Some(event) = parsed {
-            self.events.push(event);
-        }
         Ok(())
+    }
+    /// Service idle HPD-RX notifications, as drm_dp_mst_hpd_irq_handle_event
+    /// services UP_REQ_MSG_RDY. Consume at most eight chunks, never wait for
+    /// a notification, and acknowledge only the up-request ESI bit. Complete
+    /// messages enter `events`; partial messages survive the next call or
+    /// transaction. Returns the number of chunks consumed.
+    pub async fn poll_up_requests<A: MstAux>(
+        &mut self,
+        aux: &mut A,
+    ) -> Result<usize, MstError<A::Error>> {
+        let mut consumed = 0;
+        for _ in 0..UP_CHUNKS_PER_POLL {
+            let mut esi = [0];
+            aux.read(ESI0, &mut esi).await.map_err(MstError::Aux)?;
+            if esi[0] & UP_REQ_MSG_RDY == 0 {
+                break;
+            }
+            self.up_request(aux).await?;
+            consumed += 1;
+        }
+        Ok(consumed)
     }
     /// Send `request` to the branch at (`lct`, `rad`) and wait for its
     /// reply.
@@ -287,12 +334,13 @@ impl Manager {
         )
         .await?;
         let mut rx = Rx::default();
-        let mut up = Rx::default();
         for _ in 0..REPLY_TIMEOUT_MS {
             let mut esi = [0];
             aux.read(ESI0, &mut esi).await.map_err(MstError::Aux)?;
-            if esi[0] & UP_REQ_MSG_RDY != 0 {
-                self.up_request(aux, &mut up).await?;
+            // Backpressure on up requests must not abandon an outstanding
+            // down transaction (and leave its reply to poison the next one).
+            if esi[0] & UP_REQ_MSG_RDY != 0 && self.events.len() < MAX_UP_EVENTS {
+                self.up_request(aux).await?;
             }
             if esi[0] & DOWN_REP_MSG_RDY != 0 {
                 Self::read_one(aux, dp_mst::DOWN_REP_BASE, &mut rx).await?;

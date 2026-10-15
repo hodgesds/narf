@@ -16,6 +16,7 @@ pub(crate) struct Hub {
     replies: VecDeque<Vec<u8>>,
     up: VecDeque<Vec<u8>>,
     up_acks: Vec<Vec<u8>>,
+    fail_up_ack: bool,
     /// Each down request: LCT, RAD and body.
     pub(crate) requests: Vec<(u8, [u8; 8], u8)>,
     pub(crate) bodies: Vec<Vec<u8>>,
@@ -38,6 +39,7 @@ impl Hub {
             replies: VecDeque::new(),
             up: VecDeque::new(),
             up_acks: Vec::new(),
+            fail_up_ack: false,
             requests: Vec::new(),
             bodies: Vec::new(),
             edid,
@@ -188,6 +190,9 @@ impl MstAux for Hub {
                 }
             }
             a if (dp_mst::UP_REP_BASE..dp_mst::UP_REP_BASE + 48).contains(&a) => {
+                if self.fail_up_ack {
+                    return Err(());
+                }
                 self.up_acks.push(data.to_vec());
             }
             PAYLOAD_TABLE_UPDATE_STATUS => {
@@ -296,3 +301,237 @@ fn dp_mst_child_rad_like_linux() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/dp-mst", dp_mst_child_rad_like_linux);
+
+fn resource_notice(port: u8, pbn: u16) -> Vec<u8> {
+    let mut body = vec![dp_mst::RESOURCE_STATUS_NOTIFY, port << 4];
+    body.extend_from_slice(&ROOT);
+    body.extend_from_slice(&pbn.to_be_bytes());
+    body
+}
+
+fn up_piece(body: &[u8], first: bool, last: bool) -> Vec<u8> {
+    let mut raw = dp_mst::Header {
+        lct: 1,
+        lcr: 6,
+        broadcast: true,
+        somt: first,
+        eomt: last,
+        msg_len: body.len() as u8 + 1,
+        ..dp_mst::Header::default()
+    }
+    .encode();
+    raw.extend_from_slice(body);
+    raw.push(dp_mst::data_crc(body));
+    raw
+}
+
+/// An idle service pass handles notifications, leaving an unrelated down
+/// reply ready, and never consumes more than its chunk budget.
+fn dp_mst_idle_poll_is_bounded_and_preserves_down_reply() -> TestResult {
+    let mut hub = Hub::new();
+    let mut mgr = Manager::new();
+    for port in 1..=10 {
+        hub.up.extend(dp_mst::chunks(
+            1,
+            &[0; 8],
+            false,
+            &resource_notice(port, 100 + u16::from(port)),
+        ));
+    }
+    hub.replies.extend(dp_mst::chunks(
+        1,
+        &[0; 8],
+        false,
+        &[dp_mst::CLEAR_PAYLOAD_ID_TABLE],
+    ));
+    hub.esi();
+    if run(mgr.poll_up_requests(&mut hub)) != Ok(8)
+        || mgr.events.len() != 8
+        || hub.up.len() != 2
+        || hub.replies.len() != 1
+        || hub.dpcd[&ESI0] != UP_REQ_MSG_RDY | DOWN_REP_MSG_RDY
+    {
+        return TestResult::Fail("idle poll exceeded budget or consumed a down reply");
+    }
+    if run(mgr.poll_up_requests(&mut hub)) != Ok(2)
+        || run(mgr.poll_up_requests(&mut hub)) != Ok(0)
+        || hub.dpcd[&ESI0] != DOWN_REP_MSG_RDY
+        || hub.up_acks.len() != 10
+    {
+        return TestResult::Fail("idle notifications did not drain");
+    }
+    for (k, event) in mgr.events.iter().enumerate() {
+        if *event
+            != (UpRequest::ResourceStatus {
+                port: k as u8 + 1,
+                guid: ROOT,
+                available_pbn: 101 + k as u16,
+            })
+        {
+            return TestResult::Fail("idle event order or body");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    dp_mst_idle_poll_is_bounded_and_preserves_down_reply
+);
+
+/// A fragmented up request can outlive the down transaction carrying its
+/// first chunk, then span multiple poll budgets without losing its prefix.
+fn dp_mst_up_request_survives_transaction_and_poll_boundaries() -> TestResult {
+    let mut hub = Hub::new();
+    let mut mgr = Manager::new();
+    run(mgr.probe(&mut hub)).unwrap();
+    mgr.events.clear();
+    hub.up_acks.clear();
+    let body = resource_notice(3, 0x1234);
+    hub.up.push_back(up_piece(&body[..1], true, false));
+    hub.esi();
+    run(mgr.transact(
+        &mut hub,
+        1,
+        &[0; 8],
+        &Request::EnumPathResources { port: 1 },
+    ))
+    .unwrap();
+    if mgr.up.is_none() || !mgr.events.is_empty() || !hub.up_acks.is_empty() {
+        return TestResult::Fail("partial notification was completed or discarded");
+    }
+    for k in 1..body.len() {
+        hub.up
+            .push_back(up_piece(&body[k..k + 1], false, k + 1 == body.len()));
+    }
+    hub.esi();
+    for expected in [8, 8, 3] {
+        if run(mgr.poll_up_requests(&mut hub)) != Ok(expected) {
+            return TestResult::Fail("fragment service budget");
+        }
+    }
+    if mgr.events
+        != [UpRequest::ResourceStatus {
+            port: 3,
+            guid: ROOT,
+            available_pbn: 0x1234,
+        }]
+        || mgr.up.is_some()
+        || hub.up_acks.len() != 1
+    {
+        return TestResult::Fail("reassembled notification");
+    }
+    // A new MST session cannot inherit half of an old notification.
+    hub.up.push_back(up_piece(&body[..1], true, false));
+    hub.esi();
+    run(mgr.poll_up_requests(&mut hub)).unwrap();
+    run(mgr.stop(&mut hub));
+    if mgr.up.is_some() || !mgr.events.is_empty() {
+        return TestResult::Fail("stop retained old session notifications");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    dp_mst_up_request_survives_transaction_and_poll_boundaries
+);
+
+fn dp_mst_full_event_queue_applies_backpressure() -> TestResult {
+    let mut hub = Hub::new();
+    let mut mgr = Manager::new();
+    run(mgr.probe(&mut hub)).unwrap();
+    mgr.events.clear();
+    hub.up_acks.clear();
+    for k in 0..=MAX_UP_EVENTS {
+        hub.up.extend(dp_mst::chunks(
+            1,
+            &[0; 8],
+            false,
+            &resource_notice(1, k as u16),
+        ));
+    }
+    hub.esi();
+    for _ in 0..MAX_UP_EVENTS / UP_CHUNKS_PER_POLL {
+        run(mgr.poll_up_requests(&mut hub)).unwrap();
+    }
+    if run(mgr.poll_up_requests(&mut hub)) != Err(MstError::EventsFull)
+        || mgr.events.len() != MAX_UP_EVENTS
+        || hub.up.len() != 1
+        || hub.up_acks.len() != MAX_UP_EVENTS
+    {
+        return TestResult::Fail("full queue dropped or acknowledged the next event");
+    }
+    // The other sideband channel must still complete its transaction while
+    // up requests are backpressured, without discarding their pending chunk.
+    if run(mgr.transact(
+        &mut hub,
+        1,
+        &[0; 8],
+        &Request::EnumPathResources { port: 1 },
+    ))
+    .is_err()
+        || hub.up.len() != 1
+        || mgr.events.len() != MAX_UP_EVENTS
+    {
+        return TestResult::Fail("full up queue abandoned a down transaction");
+    }
+    mgr.events.clear();
+    if run(mgr.poll_up_requests(&mut hub)) != Ok(1)
+        || mgr.events
+            != [UpRequest::ResourceStatus {
+                port: 1,
+                guid: ROOT,
+                available_pbn: MAX_UP_EVENTS as u16,
+            }]
+    {
+        return TestResult::Fail("draining did not resume the blocked notification");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    dp_mst_full_event_queue_applies_backpressure
+);
+
+/// Truncated connection/resource bodies used to acquire zero-filled fields
+/// from the reassembly buffer, manufacturing a disconnect or resource count.
+fn dp_mst_rejects_truncated_up_requests() -> TestResult {
+    for (kind, len) in [
+        (dp_mst::CONNECTION_STATUS_NOTIFY, 18),
+        (dp_mst::RESOURCE_STATUS_NOTIFY, 19),
+    ] {
+        let mut hub = Hub::new();
+        let mut mgr = Manager::new();
+        let mut body = resource_notice(1, 123);
+        body[0] = kind;
+        body.truncate(len);
+        hub.up.extend(dp_mst::chunks(1, &[0; 8], false, &body));
+        hub.esi();
+        if run(mgr.poll_up_requests(&mut hub)) != Err(MstError::Malformed)
+            || !mgr.events.is_empty()
+            || !hub.up_acks.is_empty()
+        {
+            return TestResult::Fail("truncated up request became an event");
+        }
+    }
+    // ESI was already acknowledged when the sideband ACK failed. Keep
+    // the event available to the caller despite returning the AUX error.
+    let mut hub = Hub::new();
+    let mut mgr = Manager::new();
+    hub.fail_up_ack = true;
+    hub.up
+        .extend(dp_mst::chunks(1, &[0; 8], false, &resource_notice(2, 456)));
+    hub.esi();
+    if run(mgr.poll_up_requests(&mut hub)) != Err(MstError::Aux(()))
+        || mgr.events
+            != [UpRequest::ResourceStatus {
+                port: 2,
+                guid: ROOT,
+                available_pbn: 456,
+            }]
+        || !hub.up.is_empty()
+    {
+        return TestResult::Fail("ACK failure discarded the acknowledged event");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dp-mst", dp_mst_rejects_truncated_up_requests);

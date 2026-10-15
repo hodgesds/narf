@@ -659,6 +659,10 @@ last stops the PHY. Disabled, unreadable or unadmitted devices leave output
 gaps, and switching every CRTC off keeps them off. Shared-link loss relights
 the configuration. Downstream hotplug, topology-stable connector identities,
 mixed MST/SST, UHBR MST and MST audio/DSC remain open; no physical validation.
+The MST manager now also exposes bounded idle notification polling over
+DMUB AUX, retains fragmented messages across transaction/poll boundaries and
+applies queue backpressure. Wiring those events to topology reconciliation
+and connector updates is the next hotplug step.
 
 Still open: physical MSI delivery verification, queue reset and fault-source
 re-arming after containment, GC12 rendering and shader

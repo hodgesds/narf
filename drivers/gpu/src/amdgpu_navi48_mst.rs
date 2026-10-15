@@ -317,6 +317,27 @@ impl ColdBoot {
     pub fn display_mst(&self, port: usize) -> Option<&MstLink> {
         self.mst.get(&port)
     }
+    /// Service a connected branch's idle up requests over DMUB AUX. Complete
+    /// notifications remain in `display_mst(port).manager.events`; the caller
+    /// drains them with `take_display_mst_events` before the queue fills.
+    /// This does not change the topology or any live payload's sink identity.
+    pub async fn poll_display_mst(&mut self, port: usize) -> Result<usize, MstFailure> {
+        let (instance, _) = self.mst_path(port)?;
+        let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
+        let mut aux = DmubAux {
+            dmub: &mut self.sequence.backend.dmub,
+            instance,
+        };
+        Ok(link.manager.poll_up_requests(&mut aux).await?)
+    }
+    /// Take the branch notifications, including any retained before a failed
+    /// poll. Consuming them does not acknowledge a topology reconfiguration.
+    pub fn take_display_mst_events(&mut self, port: usize) -> Vec<dp_mst::UpRequest> {
+        self.mst
+            .get_mut(&port)
+            .map(|link| core::mem::take(&mut link.manager.events))
+            .unwrap_or_default()
+    }
     /// The EDID of an end device behind the port: block 0 and its
     /// extensions, through REMOTE_I2C_READ.
     pub async fn read_display_mst_edid(
