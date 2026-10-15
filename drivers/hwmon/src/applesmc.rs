@@ -69,9 +69,11 @@ const APPLESMC_ACPI_HID: &str = "APP0001";
 
 /// DATA port offset relative to the discovered base.
 /// applesmc.c `APPLESMC_DATA_PORT` = 0x300 (base + 0).
+#[cfg(target_arch = "x86_64")]
 const APPLESMC_DATA_OFFSET: u16 = 0x00;
 /// COMMAND/STATUS port offset relative to the discovered base.
 /// applesmc.c `APPLESMC_CMD_PORT` = 0x304 (base + 4).
+#[cfg(target_arch = "x86_64")]
 const APPLESMC_CMD_OFFSET: u16 = 0x04;
 
 /// Default I/O base used when ACPI `_CRS` yields no usable IO resource.
@@ -81,19 +83,24 @@ const APPLESMC_DEFAULT_BASE: u16 = 0x300;
 // ── Status bits (from applesmc.c "Apple SMC status bits") ──────────────
 
 /// SMC has data waiting to be read (applesmc.c `SMC_STATUS_AWAITING_DATA`, BIT(0)).
+#[cfg(target_arch = "x86_64")]
 const SMC_STATUS_AWAITING_DATA: u8 = 1 << 0;
 /// SMC will ignore any input (applesmc.c `SMC_STATUS_IB_CLOSED`, BIT(1)).
+#[cfg(target_arch = "x86_64")]
 const SMC_STATUS_IB_CLOSED: u8 = 1 << 1;
 /// Command in progress (applesmc.c `SMC_STATUS_BUSY`, BIT(2)).
+#[cfg(target_arch = "x86_64")]
 const SMC_STATUS_BUSY: u8 = 1 << 2;
 
 // ── Commands (from applesmc.c) ─────────────────────────────────────────
 
 /// Read-key command byte (applesmc.c `APPLESMC_READ_CMD`).
+#[cfg(target_arch = "x86_64")]
 const APPLESMC_READ_CMD: u8 = 0x10;
 
 /// Bounded busy-poll budget for `wait_status`. applesmc.c uses a timed
 /// back-off (~262ms); this is the no_std equivalent (see module docs).
+#[cfg(target_arch = "x86_64")]
 const WAIT_SPIN: u32 = 0x10000;
 
 // ── Pure decode helpers (host-compilable; unit-tested) ─────────────────
