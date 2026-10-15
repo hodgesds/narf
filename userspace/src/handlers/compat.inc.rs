@@ -7906,6 +7906,14 @@ pub fn proc_task_info(
     // live tid. systemd's child tracking also depends on the zombie arm:
     // it peeks waitid(..., WNOWAIT) and then reads /proc/<pid>/stat's
     // PPid BEFORE the real reap.
+    // The raw task-id fallback is for tasks with no process binding at all
+    // (boot init, test harnesses). A task that belongs to a DIFFERENT
+    // process is not process `pid`: when pids and task ids run through the
+    // same small numbers, a stale or never-allocated `/proc/<n>` otherwise
+    // resolved to whatever unrelated task happened to own task id `n`.
+    if mapped_tid.is_none() && task_to_pid_raw(tid).is_some_and(|owner| owner != pid) {
+        return None;
+    }
     let task = crate::task::task_get(tid);
     let zombie = task
         .as_ref()
