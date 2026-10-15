@@ -93,6 +93,27 @@ most 64 frames per round, rearms all consumed descriptors with one RDT write,
 then reenables and rechecks the vector before parking. A 10-ms lost-interrupt
 deadline and 1-ms no-vector polling fallback preserve forward progress.
 
+IGB is the sole owner of the I210/I211/82576/I350 PCI IDs listed by
+`igb::SUPPORTED_DEVICE_IDS`; the legacy e1000 driver must not claim them. Its
+single queue uses 256 advanced one-buffer RX descriptors and an 8-entry
+advanced TX ring with one sentinel slot. `SRRCTL` selects `ADV_ONEBUF`, and
+both `TXDCTL0` and `RXDCTL0` must reflect `QUEUE_ENABLE` before traffic starts.
+Queue-0 RX, TX, and other causes share MSI-X entry 0 through the extended
+`EIMS`/`EIMC`, `EIAC`/`EIAM`, `EITR0`, `IVAR0`, and `IVAR_MISC` registers;
+interrupt causes are acknowledged through the low `ICR` at 0x00c0. TX posting
+is serialized only through descriptor reservation and doorbell publication;
+each slot owns a persistent copy buffer, so a timeout cannot free DMA memory
+still referenced by hardware.
+No `IrqSafeSpinLock` spans the responsive DD wait, because its sleep pump may
+process RX and synchronously transmit an ARP-released packet. Per-slot
+generations make such a waiter observe ordered reclaim and safe reuse. The
+RX drain has a nonblocking reentrancy gate so a transmit wait's sleep pump
+cannot recursively acquire the descriptor locks held by its outer RX callback.
+The global controller guard is released before invoking that callback for the
+same reason: ARP resolution may synchronously re-enter the transmit hook.
+The driver does not advertise checksum or segmentation offloads until it emits
+the required context-plus-data descriptor sequence.
+
 ### 3.1 i40e runtime profile
 
 Each X710/XL710/XXV710/X722 PF negotiates 1–8 64-entry TX/RX pairs.

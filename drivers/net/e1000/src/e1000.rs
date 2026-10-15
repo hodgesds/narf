@@ -80,9 +80,9 @@ use narf_net::{Frame, RX_RING_N, TX_RING_N};
 // All share the e1000e PHY/MAC architecture; per-PCH quirks live in
 // Linux's `ich8lan.c` and are tracked in `notes/intel-e1000e-igc-audit.md`.
 //
-// Plus a few I210/I211 entries (handled by Linux's `igb` driver) so
-// the bus probe still recognises them; full bring-up needs the
-// advanced-descriptor path that igc.rs uses for I225/I226.
+// The I210/I211/82576/I350 entries that used to be squatted here now
+// live in the dedicated `narf-drivers-net-igb` crate, which drives them
+// on the advanced-descriptor path (like igc.rs for I225/I226).
 
 /// Vendor: Intel.
 pub const E1000_VENDOR: u16 = 0x8086;
@@ -243,31 +243,11 @@ pub const E1000E_DEV_I219LM29: u16 = 0x57B9;
 /// I219-V29.
 pub const E1000E_DEV_I219V29: u16 = 0x57BA;
 
-// I210 / I211 — Linux handles these via `igb`, not `e1000e`. We
-// recognise the IDs here so the bus probe binds *something*; the
-// bring-up sequence is a best-effort that may need follow-up if a
-// real I210/I211 lands on this driver (Stage-1 follow-up tracked
-// in `notes/intel-e1000e-igc-audit.md`).
-/// I210 Copper.
-pub const E1000_DEV_I210_COPPER: u16 = 0x1533;
-/// I210 Fiber.
-pub const E1000_DEV_I210_FIBER: u16 = 0x1536;
-/// I210 Serdes.
-pub const E1000_DEV_I210_SERDES: u16 = 0x1537;
-/// I210 SGMII.
-pub const E1000_DEV_I210_SGMII: u16 = 0x1538;
-/// I210 Copper flashless.
-pub const E1000_DEV_I210_COPPER_FLASHLESS: u16 = 0x157B;
-/// I210 Serdes flashless.
-pub const E1000_DEV_I210_SERDES_FLASHLESS: u16 = 0x157C;
-/// I211 Copper.
-pub const E1000_DEV_I211_COPPER: u16 = 0x1539;
-/// 82576 (used on some Lenovo ThinkPad docks via I210 PHY).
-pub const E1000_DEV_82576: u16 = 0x10C9;
-/// 82576 with NS clock.
-pub const E1000_DEV_82576_NS: u16 = 0x150A;
-/// I350 Copper (embedded server SoC).
-pub const E1000_DEV_I350_COPPER: u16 = 0x1521;
+// I210 / I211 / 82576 / I350 moved to the dedicated advanced-descriptor
+// `narf-drivers-net-igb` crate. The legacy 8254x
+// bring-up here cannot drive them correctly (no advanced RX/TX descriptors,
+// no SRRCTL, no extended MSI-X routing, no per-queue TXDCTL/RXDCTL enable),
+// so those IDs are no longer declared or claimed by this driver.
 
 // ── Register offsets ────────────────────────────────────────────────
 
@@ -2345,17 +2325,8 @@ pub const SUPPORTED_DEVICE_IDS: &[u16] = &[
     // PCH-NVL (Nova Lake).
     E1000E_DEV_I219LM29,
     E1000E_DEV_I219V29,
-    // I210 / I211 / 82576 / I350 (Linux: `igb`).
-    E1000_DEV_I210_COPPER,
-    E1000_DEV_I210_FIBER,
-    E1000_DEV_I210_SERDES,
-    E1000_DEV_I210_SGMII,
-    E1000_DEV_I210_COPPER_FLASHLESS,
-    E1000_DEV_I210_SERDES_FLASHLESS,
-    E1000_DEV_I211_COPPER,
-    E1000_DEV_82576,
-    E1000_DEV_82576_NS,
-    E1000_DEV_I350_COPPER,
+    // I210 / I211 / 82576 / I350 moved to the dedicated advanced-descriptor
+    // `narf-drivers-net-igb` crate — it is their sole PCI owner now.
 ];
 
 /// Register the driver against every Intel device id we recognise.
@@ -2448,17 +2419,7 @@ fn name_for(did: u16) -> &'static str {
         E1000E_DEV_I219V27 => "e1000e-i219v27",
         E1000E_DEV_I219LM29 => "e1000e-i219lm29",
         E1000E_DEV_I219V29 => "e1000e-i219v29",
-        // I210 / I211 / 82576 / I350.
-        E1000_DEV_I210_COPPER => "igb-i210-copper",
-        E1000_DEV_I210_FIBER => "igb-i210-fiber",
-        E1000_DEV_I210_SERDES => "igb-i210-serdes",
-        E1000_DEV_I210_SGMII => "igb-i210-sgmii",
-        E1000_DEV_I210_COPPER_FLASHLESS => "igb-i210-copper-flashless",
-        E1000_DEV_I210_SERDES_FLASHLESS => "igb-i210-serdes-flashless",
-        E1000_DEV_I211_COPPER => "igb-i211-copper",
-        E1000_DEV_82576 => "igb-82576",
-        E1000_DEV_82576_NS => "igb-82576-ns",
-        E1000_DEV_I350_COPPER => "igb-i350-copper",
+        // I210 / I211 / 82576 / I350 now live in `narf-drivers-net-igb`.
         _ => "e1000",
     }
 }

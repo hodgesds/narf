@@ -1345,6 +1345,7 @@ dependencies = [
  "narf-drivers-net-enic",
  "narf-drivers-net-forcedeth",
  "narf-drivers-net-i40e",
+ "narf-drivers-net-igb",
  "narf-drivers-net-igc",
  "narf-drivers-net-ixgbe",
  "narf-drivers-net-mlx5",
@@ -1519,6 +1520,30 @@ dependencies = [
 
 [[package]]
 name = "narf-drivers-net-i40e"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-igb"
 version = "0.0.0"
 dependencies = [
  "narf-arch",

@@ -302,7 +302,9 @@ kernel_test_in!(
 // ── Smoke 8 — Association Request frame carries SSID IE ─────────────
 
 fn smoke_e2e_mt7921_assoc_req_frame_carries_ssid_ie() -> TestResult {
-    use crate::mt76::mt7921::cmd::{encode_assoc_req_frame, FC_MGMT_ASSOC_REQ, IEEE80211_MAC_HDR_SIZE};
+    use crate::mt76::mt7921::cmd::{
+        encode_assoc_req_frame, FC_MGMT_ASSOC_REQ, IEEE80211_MAC_HDR_SIZE,
+    };
     let sta = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
     let bssid = [0x42u8; 6];
     let ssid = b"NARF-TEST";

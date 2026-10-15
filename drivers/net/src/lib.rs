@@ -35,6 +35,8 @@ pub use narf_drivers_net_enic::enic;
 pub use narf_drivers_net_forcedeth::forcedeth;
 #[cfg(feature = "i40e")]
 pub use narf_drivers_net_i40e::i40e;
+#[cfg(feature = "igb")]
+pub use narf_drivers_net_igb::igb;
 #[cfg(feature = "igc")]
 pub use narf_drivers_net_igc::igc;
 #[cfg(feature = "ixgbe")]
@@ -66,6 +68,7 @@ pub use narf_drivers_net_core::*;
     feature = "enic",
     feature = "forcedeth",
     feature = "i40e",
+    feature = "igb",
     feature = "igc",
     feature = "ixgbe",
     feature = "mlx5",
@@ -168,6 +171,11 @@ pub fn register_initcalls() {
     #[cfg(feature = "ixgbe")]
     narf_init::register(Stage::Subsys, "ixgbe", || {
         narf_drivers_net_ixgbe::register();
+        InitResult::Ok
+    });
+    #[cfg(feature = "igb")]
+    narf_init::register(Stage::Subsys, "igb", || {
+        narf_drivers_net_igb::register();
         InitResult::Ok
     });
     #[cfg(feature = "igc")]
