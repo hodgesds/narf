@@ -1846,8 +1846,12 @@ struct DmaBufCtx {
 
 impl DmaBufCtx {
     fn new(import: Arc<dyn narf_filesystem::DrmFence>) -> Self {
+        Self::with_len(64, import)
+    }
+
+    fn with_len(len: usize, import: Arc<dyn narf_filesystem::DrmFence>) -> Self {
         Self {
-            bytes: narf_lib::sync::IrqSafeSpinLock::new(vec![0u8; 64]),
+            bytes: narf_lib::sync::IrqSafeSpinLock::new(vec![0u8; len]),
             import,
             exported: narf_lib::sync::IrqSafeSpinLock::new(None),
         }
@@ -2009,4 +2013,89 @@ fn smoke_drm_virtgpu_prime_exports_share_dma_resv() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_virtgpu_prime_exports_share_dma_resv
+);
+
+/// KMS must wait for an asynchronous render write before selecting the
+/// resource for VirtIO-GPU scanout.  A pending fence fails the bounded wait;
+/// reaching SET_SCANOUT in that state would race the renderer.
+fn smoke_drm_virtgpu_scanout_waits_for_pending_write() -> TestResult {
+    let resource = crate::drm_ioctl_bridge::test_virtgpu_resource(0x46, 4096);
+    resource.dma_buf.resv.add_fence(
+        Arc::new(PendingTestFence(0xa0)),
+        narf_filesystem::dma_buf::DmaResvUsage::Write,
+    );
+    match crate::drm_ioctl_bridge::wait_virgl_scanout_writes(&resource) {
+        Err(FsError::Busy) => TestResult::Pass,
+        _ => TestResult::Fail("scanout did not wait for a pending VirGL write fence"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_virtgpu_scanout_waits_for_pending_write
+);
+
+/// Write one compact atomic request into the context-backed fake user memory.
+/// It contains a single `IN_FENCE_FD` property on the primary plane.
+fn write_atomic_in_fence(ctx: &DmaBufCtx, flags: u32, fd: i32) {
+    const OBJS: u64 = 64;
+    const COUNTS: u64 = 68;
+    const PROPS: u64 = 72;
+    const VALUES: u64 = 80;
+    let req = DrmModeAtomicUapi {
+        flags,
+        count_objs: 1,
+        objs_ptr: OBJS,
+        count_props_ptr: COUNTS,
+        props_ptr: PROPS,
+        prop_values_ptr: VALUES,
+        ..Default::default()
+    };
+    // SAFETY: `DrmModeAtomicUapi` is a `repr(C)` POD UAPI structure. The
+    // context owns a 128-byte byte buffer, enough for the header and arrays.
+    let req_bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&raw const req).cast::<u8>(),
+            core::mem::size_of::<DrmModeAtomicUapi>(),
+        )
+    };
+    ctx.put(0, req_bytes);
+    ctx.put(OBJS as usize, &0x40u32.to_ne_bytes());
+    ctx.put(COUNTS as usize, &1u32.to_ne_bytes());
+    ctx.put(PROPS as usize, &0x5fu32.to_ne_bytes()); // IN_FENCE_FD
+    ctx.put(VALUES as usize, &(fd as i64 as u64).to_ne_bytes());
+}
+
+/// Explicit KMS fences are resolved through the syscall-owned sync_file seam
+/// before the atomic dispatcher can touch card state. Invalid fds are EINVAL;
+/// pending fences hit the bounded kernel-only fallback; TEST_ONLY validates but
+/// does not consume the fence.
+fn smoke_drm_atomic_in_fence_validation_and_wait() -> TestResult {
+    let pending: Arc<dyn narf_filesystem::DrmFence> = Arc::new(PendingTestFence(0xa1));
+    let ctx = DmaBufCtx::with_len(128, pending);
+
+    write_atomic_in_fence(&ctx, 0, 7);
+    if !matches!(
+        crate::drm_ioctl_bridge::wait_atomic_in_fences(0, &ctx),
+        Err(FsError::Busy)
+    ) {
+        return TestResult::Fail("atomic IN_FENCE_FD did not wait for a pending fence");
+    }
+
+    write_atomic_in_fence(&ctx, 0, 8);
+    if !matches!(
+        crate::drm_ioctl_bridge::wait_atomic_in_fences(0, &ctx),
+        Err(FsError::InvalidData)
+    ) {
+        return TestResult::Fail("atomic IN_FENCE_FD accepted a non-sync-file fd");
+    }
+
+    write_atomic_in_fence(&ctx, 0x0100, 7); // TEST_ONLY
+    if crate::drm_ioctl_bridge::wait_atomic_in_fences(0, &ctx).is_err() {
+        return TestResult::Fail("TEST_ONLY atomic request waited for its input fence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_atomic_in_fence_validation_and_wait
 );

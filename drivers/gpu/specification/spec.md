@@ -1234,7 +1234,10 @@ and primary-plane binding; the boot resource is never exposed as a GEM object.
   dma-buf, and mmap reference; failed host teardown retains the backing rather
   than permitting DMA into recycled memory. A KMS framebuffer backed by such
   an import is presented directly with VirtIO-GPU `SET_SCANOUT` plus
-  `RESOURCE_FLUSH` rather than copied through the boot 2D resource. On a
+  `RESOURCE_FLUSH` rather than copied through the boot 2D resource. Before
+  that scanout read, every pending implicit `WRITE` fence from the shared
+  dma-buf reservation completes; the wait snapshots the reservation and holds
+  neither its lock nor the DRM mode-state lock. On a
   primary-node open, VIRTGPU-created handles are registered in the same GEM
   namespace consumed by ADDFB2; render and KMS handles on one `drm_file` must
   never diverge. DRM command words use the exact Linux UAPI structure sizes;
@@ -1242,7 +1245,11 @@ and primary-plane binding; the boot resource is never exposed as a GEM object.
   that per-open teardown path before generic KMS cleanup.
 - Primary-node inbound: the existing framebuffer / modeset ioctls; an
   accelerated buffer may be presented only after it is also registered as a
-  KMS framebuffer. `PAGE_FLIP_EVENT` completions are bound to the submitting
+  KMS framebuffer. An atomic plane's non-negative `IN_FENCE_FD` resolves to
+  sync-file leaves before the commit mutates KMS state; a pending leaf parks
+  and retries the syscall, while a kernel-only caller uses the bounded GPU
+  timeout. `TEST_ONLY` validates the descriptor but does not wait. A bad or
+  non-sync-file descriptor is `EINVAL`. `PAGE_FLIP_EVENT` completions are bound to the submitting
   primary-node open, matching Linux `struct drm_file::event_list`; an event's
   opaque `user_data` must never cross to another opener, and close discards
   that opener's unconsumed events. Reads return only complete 32-byte

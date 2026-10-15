@@ -42,7 +42,11 @@ semantics), `SYNC_IOC_FILE_INFO` (the two-call protocol of
 ENOTTY. A file is readable once every leaf signalled. Fence names: VirtIO-GPU
 `virtio_gpu`/`controlq`; atomic `OUT_FENCE_PTR` fences `narf_kms`/`vblank`
 (one context each, timestamp = the simulated vblank); stubs `stub`/`stub`;
-signalled fences report Linux's `detached-driver`/`signaled-timeline`. The shared sound
+signalled fences report Linux's `detached-driver`/`signaled-timeline`.
+VirtIO-GPU atomic KMS commits resolve a plane `IN_FENCE_FD` through the same
+`sync_file_fences` seam before any KMS mutation; a pending leaf requests a
+side-effect-free parked retry, while `TEST_ONLY` validates but does not wait.
+The shared sound
 registry's PCM/control files implement the ALSA ABI; syscall handlers contain
 no sound-card lookup or driver-specific request branches. Device mmap validation
 runs before VMA replacement, and direct mappings atomically retain their backing
