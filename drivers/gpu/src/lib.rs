@@ -271,6 +271,7 @@ pub mod dp_aux;
 pub mod dp_edid;
 pub mod dp_link_training;
 pub mod dp_mst;
+pub mod dp_mst_mgr;
 pub mod drm;
 pub mod drm_devfs_bridge;
 pub mod drm_fb_hook;
