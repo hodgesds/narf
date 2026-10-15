@@ -66,11 +66,12 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     do_fork(ctx, false);
 }
 
-/// `vfork(2)`. NARF gives the child its own copy-on-write address space, as
-/// for fork(2) (POSIX permits a vfork that is a fork), so nothing but the
-/// tracer report differs: a traced parent with PTRACE_O_TRACEVFORK reports
-/// PTRACE_EVENT_VFORK — `kernel_clone` classifies `vfork(2)`, which is
-/// `CLONE_VFORK | CLONE_VM | SIGCHLD`, by CLONE_VFORK.
+/// `vfork(2)`. This legacy entry point presently gives the child a private
+/// copy-on-write address space, but retains vfork's parent wait and ptrace
+/// event ordering: the parent does not return until the child execs or exits.
+/// A traced parent therefore observes PTRACE_EVENT_VFORK followed by
+/// PTRACE_EVENT_VFORK_DONE. `kernel_clone` classifies vfork as
+/// `CLONE_VFORK | CLONE_VM | SIGCHLD` for those ptrace events.
 pub(crate) fn sys_vfork(ctx: &mut dyn TrapContext) {
     do_fork(ctx, true);
 }
@@ -414,6 +415,14 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
         clone_flags,
         17, /* SIGCHLD */
     );
+    // Publish the wait before making the child runnable. It closes the
+    // child-exec/exit-before-parent-parks race exactly as the clone3 vfork
+    // path does. The release side receives the outer ProcessId from both the
+    // exec and exit paths, so use `child_pid`, not the namespace-translated
+    // return value.
+    if vfork {
+        crate::handlers::vfork_wait_register(child_pid.raw(), parent_pid);
+    }
     // All child-visible state is now installed, so it is safe for the child
     // to execute on another CPU.
     pending_child.spawn();
@@ -423,6 +432,12 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
     let ret = child_pid.raw();
     ctx.set_return(SyscallReturn::ok(ret));
     crate::ptrace::report_clone_event(ctx, ptrace_trace, child_tid.raw(), ret);
+    if vfork {
+        crate::handlers::vfork_parent_wait(ctx, child_pid.raw(), parent_pid);
+        // The child has committed exec or begun exit, which is the point at
+        // which Linux wakes the vfork parent and reports VFORK_DONE.
+        crate::ptrace::report_vfork_done(ctx, child_tid.raw(), ret);
+    }
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
