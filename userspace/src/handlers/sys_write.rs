@@ -47,19 +47,27 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    // A blocking write() to a kernel-TCP socket is `tcp_sendmsg` without
-    // flags: it returns only once the whole buffer is queued.
+    // A blocking write() to a TCP or AF_UNIX stream is its family's
+    // `*_sendmsg` without flags: it returns only once the whole buffer is
+    // queued.
     if !endpoint.nonblocking() {
         if let Ok(sock) = current_socket_result(fd_num) {
-            if let Some(tcb) = sock
-                .kernel_tcb_id()
-                .filter(|_| !socket_listener_nonblock(task, fd_num, sock.as_ref()))
-            {
+            if !socket_listener_nonblock(task, fd_num, sock.as_ref()) {
                 let resumed = handler_sys_socket_recv::sock_timeo_take(ctx, &sock);
+                if sock.domain == crate::socket::AF_UNIX
+                    && sock.kind == crate::socket::SOCK_STREAM
+                {
+                    handler_sys_socket_send::unix_blocking_send(
+                        ctx, fd_num, 0, &sock, user_ptr, count, resumed,
+                    );
+                    return;
+                }
+                if let Some(tcb) = sock.kernel_tcb_id() {
                 handler_sys_socket_send::tcp_blocking_send(
                     ctx, fd_num, 0, &sock, tcb, user_ptr, count, resumed,
                 );
                 return;
+                }
             }
         }
     }

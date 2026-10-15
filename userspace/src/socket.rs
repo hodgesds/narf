@@ -9684,11 +9684,11 @@ impl RingBuf {
     /// allocating). So a send of at most one unit is all-or-nothing, a larger
     /// one is short only after at least one whole unit went out, and `Ok(0)`
     /// (for a non-empty `src`) means nothing could be queued — the caller's
-    /// EAGAIN. SCM_RIGHTS ride on the first unit only.
-    ///
-    /// LINUX-GAP: a BLOCKING send larger than what fits returns the short
-    /// count instead of sleeping for more space; NARF's send re-execute path
-    /// cannot resume a partly-sent payload. Non-blocking semantics match.
+    /// EAGAIN. SCM_RIGHTS ride on the first unit only.  The syscall handlers
+    /// treat a short result as intermediate progress for a blocking stream
+    /// send: they retain its offset over a POLL_OUT wait and invoke this
+    /// bounded queueing operation again for the remaining suffix.  Direct
+    /// callers retain the non-blocking short-write primitive.
     fn write_stream_with_fds(
         &self,
         src: &[u8],

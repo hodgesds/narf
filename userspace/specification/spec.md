@@ -506,9 +506,13 @@ Connected socket rings advance their token only on readiness transitions
 leave readiness unchanged do not synthesize edges. A drain followed by new
 data before the next `epoll_wait` remains a deliverable edge even though both
 sampled readiness masks contain `POLL_IN`.
-Blocking stream `send(2)` and `sendmsg(2)` park on the connected ring's durable
-writable readiness when no byte fits, then re-execute after space or closure is
-published. `O_NONBLOCK` and `MSG_DONTWAIT` return `EAGAIN` immediately.
+Blocking stream `send(2)`, `write(2)`, and `sendmsg(2)` preserve every
+committed prefix over the connected ring's durable writable-readiness wait,
+then re-execute from the unsent suffix after space or closure is published.
+They return the full request unless a signal, send timeout, or subsequent
+error ends the wait, in which case they return that prefix.  On AF_UNIX,
+SCM_RIGHTS and explicit credentials remain attached only to the first queued
+unit. `O_NONBLOCK` and `MSG_DONTWAIT` return `EAGAIN` immediately.
 `sendmmsg(2)` returns an already-transmitted prefix without retrying it; when
 its first message would block it follows the same park-or-`EAGAIN` rule.
 Native `read(2)`, `write(2)`, `readv(2)`, and `writev(2)` resolve the

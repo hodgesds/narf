@@ -37,7 +37,9 @@ pub(crate) fn sys_socket_sendmmsg(ctx: &mut dyn TrapContext) {
             first_error = 14; // EFAULT
             break;
         };
-        match handler_sys_socket_sendmsg::sendmsg_on_socket(&sock, hdr_ptr, flags, true) {
+        match handler_sys_socket_sendmsg::sendmsg_on_socket(
+            &sock, hdr_ptr, flags, true, None, None,
+        ) {
             handler_sys_socket_sendmsg::SendMsgResult::Sent { written, complete } => {
                 // Linux increments the completed-message count only after the
                 // msg_len store succeeds. The payload may already be visible if
@@ -65,6 +67,9 @@ pub(crate) fn sys_socket_sendmmsg(ctx: &mut dyn TrapContext) {
                 first_error = EAGAIN;
                 break;
             }
+            handler_sys_socket_sendmsg::SendMsgResult::Parked => unreachable!(
+                "sendmmsg does not supply a blocking stream progress context"
+            ),
             handler_sys_socket_sendmsg::SendMsgResult::Error(errno) => {
                 // SIGPIPE is raised inside the protocol send path in Linux
                 // (`sk_stream_error` / `unix_stream_sendmsg`), so a batch
