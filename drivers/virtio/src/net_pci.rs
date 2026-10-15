@@ -220,6 +220,13 @@ struct QueuePair {
     /// on lazy reclaim (drained at the start of the next transmit)
     /// we `take()` it out and drop it. Sized to the TX queue size.
     tx_buffers: IrqSafeSpinLock<Vec<Option<DmaBuffer>>>,
+    /// Recycled TX DMA buffers owned solely by this queue pair. A completion
+    /// returns to the same pool its submission acquired from, so multi-queue
+    /// traffic never serializes on an interface-wide recycler lock.
+    tx_pool: Arc<DmaPool>,
+    /// Recycled RX DMA buffers for this queue pair. A forwarder consumes and
+    /// replenishes only its own pool, retaining queue/CPU locality.
+    rx_pool: DmaPool,
     /// Holds DMA pages backing the desc/avail/used rings alive.
     _rx_q_buf: DmaBuffer,
     _tx_q_buf: DmaBuffer,
@@ -229,12 +236,14 @@ struct QueuePair {
     tx_notify_off: u16,
 }
 
-/// Cap on the recycled TX DMA-buffer free-list (see `VirtioNetPci::tx_pool`).
-/// Comfortably covers a full TX ring's worth of in-flight + spare buffers;
-/// overflow drops (frees) rather than growing unbounded.
-const TX_POOL_CAP: usize = 64;
+/// Cap on each queue pair's recycled TX DMA-buffer free-list.
+/// Matches a standard full virtio TX ring, so a completion burst has enough
+/// recycler capacity to keep the queue supplied. Overflow drops (frees)
+/// rather than growing unbounded.
+const TX_POOL_CAP: usize = 256;
 
-/// Cap on the recycled RX DMA-buffer free-list (the RX `skb`/frame pool).
+/// Cap on each queue pair's recycled RX DMA-buffer free-list (the RX
+/// `skb`/frame pool).
 /// Sized to a full RX ring so steady-state RX never falls back to the global
 /// buddy allocator + per-frame 4 KiB zero-fill (`alloc_coherent`): the device
 /// overwrites every RX buffer, so recycled buffers need no re-zeroing. This
@@ -319,18 +328,6 @@ pub struct VirtioNetPci {
     /// driver-match registry + re-walk PCI) is idempotent — we
     /// recognise the device and don't push a duplicate controller.
     cfg_phys: u64,
-    /// Recycled TX DMA buffers (Linux `page_pool`-style). Queue setup pre-fills
-    /// this pool; `tx_buf_acquire` consumes only those prepared buffers, so an
-    /// empty pool applies backpressure instead of reaching the buddy allocator.
-    /// A completed transmit returns its 4 KiB buffer here. `Arc` lets zero-copy
-    /// TX share the same lifecycle with the iface layer.
-    tx_pool: Arc<DmaPool>,
-    /// Recycled RX DMA buffers (the RX frame/`skb` pool). The forwarder returns
-    /// each fully-consumed RX buffer here instead of freeing it, and
-    /// `rx_take_on` pops a prepared replacement to post back to the device.
-    /// Empty means backpressure; it must not allocate while polling. Capped at
-    /// `RX_POOL_CAP`. Shared `DmaPool` for this compatibility driver.
-    rx_pool: DmaPool,
 }
 
 /// Control-queue runtime state. `ctrl_buf` holds back-to-back
@@ -656,6 +653,11 @@ impl VirtioNetPci {
             // its descriptor head until the device publishes the
             // completion (lazily reclaimed before the next transmit).
             let tx_buffers: Vec<Option<DmaBuffer>> = (0..tx_qsize).map(|_| None).collect();
+            // One fixed-capacity recycler per hardware queue pair. Preparation
+            // and allocation happen before the queues are exposed; RX/TX and
+            // completion paths only pop/push their own queue-local pool.
+            let tx_pool = Arc::new(DmaPool::new(4096, DomainId::DRIVER_0, TX_POOL_CAP));
+            let rx_pool = DmaPool::new(4096, DomainId::DRIVER_0, RX_POOL_CAP);
 
             pairs.push(QueuePair {
                 rx_qidx,
@@ -664,6 +666,8 @@ impl VirtioNetPci {
                 tx_queue: IrqSafeSpinLock::new(Some(tx_q)),
                 rx_buffers: IrqSafeSpinLock::new(rx_buffers),
                 tx_buffers: IrqSafeSpinLock::new(tx_buffers),
+                tx_pool,
+                rx_pool,
                 _rx_q_buf: rx_q_buf,
                 _tx_q_buf: tx_q_buf,
                 rx_qsize,
@@ -742,15 +746,15 @@ impl VirtioNetPci {
             ctrl_qidx,
             ctrl,
             cfg_phys,
-            tx_pool: Arc::new(DmaPool::new(4096, DomainId::DRIVER_0, TX_POOL_CAP)),
-            rx_pool: DmaPool::new(4096, DomainId::DRIVER_0, RX_POOL_CAP),
         };
 
         // Preparation is deliberately outside all packet/IRQ paths. A failed
-        // prefill leaves the corresponding hot path empty/backpressured rather
-        // than smuggling a buddy allocation into the poll loop.
-        let _ = this.tx_pool.prefill(TX_POOL_CAP);
-        let _ = this.rx_pool.prefill(RX_POOL_CAP);
+        // prefill leaves only that queue backpressured rather than smuggling a
+        // buddy allocation into its poll loop.
+        for pair in &this.pairs {
+            let _ = pair.tx_pool.prefill(TX_POOL_CAP);
+            let _ = pair.rx_pool.prefill(RX_POOL_CAP);
+        }
 
         // VirtIO 1.2 §5.1.6.5.5: after DRIVER_OK, tell the device
         // how many queue pairs to actually use. Without this command
@@ -954,30 +958,47 @@ impl VirtioNetPci {
     /// VIRTIO_NET_F_MQ negotiated and >1 pairs active, parallel
     /// callers fan out across the device's TX virtqueues; with a
     /// single pair the round-robin degenerates to "always pair 0".
-    /// Take a prepared 4 KiB TX DMA buffer, or return `None` for backpressure.
-    /// Pairs with `tx_buf_release`; never allocates in the packet path.
-    fn tx_buf_acquire(&self) -> Option<DmaBuffer> {
-        self.tx_pool.try_acquire()
+    /// Take a prepared 4 KiB TX DMA buffer from one queue pair, or return
+    /// `None` for backpressure. Pairs with `tx_buf_release_on`; never
+    /// allocates in the packet path.
+    fn tx_buf_acquire_on(&self, pair_idx: usize) -> Option<DmaBuffer> {
+        self.pairs.get(pair_idx)?.tx_pool.try_acquire()
     }
 
-    /// Return a completed TX DMA buffer to `tx_pool` for reuse, or drop it
-    /// (freeing) when the pool is already at `TX_POOL_CAP`.
-    fn tx_buf_release(&self, buf: DmaBuffer) {
-        self.tx_pool.release(buf);
+    /// Return a completed TX DMA buffer to its submitting queue's recycler, or
+    /// drop it (freeing) when that bounded queue pool is already full.
+    fn tx_buf_release_on(&self, pair_idx: usize, buf: DmaBuffer) {
+        if let Some(pair) = self.pairs.get(pair_idx) {
+            pair.tx_pool.release(buf);
+        }
     }
 
-    /// Take a prepared 4 KiB RX DMA buffer. The device overwrites the whole
-    /// buffer on receive, so recycled (un-zeroed) storage is safe. `None`
-    /// applies backpressure; it never falls back to allocation. Pairs with
-    /// [`Self::rx_buf_release`].
+    /// Take a prepared 4 KiB RX DMA buffer from a queue pair. The device
+    /// overwrites the whole buffer on receive, so recycled (un-zeroed) storage
+    /// is safe. `None` applies queue-local backpressure; it never falls back
+    /// to allocation. Pairs with [`Self::rx_buf_release_on`].
+    pub fn rx_buf_acquire_on(&self, pair_idx: usize) -> Option<DmaBuffer> {
+        self.pairs.get(pair_idx)?.rx_pool.try_acquire()
+    }
+
+    /// Compatibility shorthand for pair zero. Multi-queue paths must use
+    /// [`Self::rx_buf_acquire_on`] to preserve queue locality.
     pub fn rx_buf_acquire(&self) -> Option<DmaBuffer> {
-        self.rx_pool.try_acquire()
+        self.rx_buf_acquire_on(0)
     }
 
-    /// Return a fully-consumed RX DMA buffer to the RX frame pool for reuse,
-    /// or drop it (freeing) when the pool is already at `RX_POOL_CAP`.
+    /// Return a fully-consumed RX DMA buffer to the queue that supplied it,
+    /// or drop it (freeing) when that bounded pool is already full.
+    pub fn rx_buf_release_on(&self, pair_idx: usize, buf: DmaBuffer) {
+        if let Some(pair) = self.pairs.get(pair_idx) {
+            pair.rx_pool.release(buf);
+        }
+    }
+
+    /// Compatibility shorthand for pair zero. Multi-queue paths must use
+    /// [`Self::rx_buf_release_on`] to preserve queue locality.
     pub fn rx_buf_release(&self, buf: DmaBuffer) {
-        self.rx_pool.release(buf);
+        self.rx_buf_release_on(0, buf);
     }
 
     pub fn tx_dma(&self, buf: DmaBuffer, frame_len: u32) -> Result<(), VirtioPciError> {
@@ -1047,7 +1068,7 @@ impl VirtioNetPci {
                 if let Some(slot) = bufs.get_mut(done_head as usize) {
                     // Device is done with it — recycle into the TX pool.
                     if let Some(b) = slot.take() {
-                        self.tx_buf_release(b);
+                        self.tx_buf_release_on(pair_idx, b);
                     }
                 }
             }
@@ -1086,7 +1107,7 @@ impl VirtioNetPci {
                             q.free_chain(done_head as u16);
                             if let Some(slot) = bufs.get_mut(done_head as usize) {
                                 if let Some(b) = slot.take() {
-                                    self.tx_buf_release(b);
+                                    self.tx_buf_release_on(pair_idx, b);
                                 }
                             }
                             freed_any = true;
@@ -1376,7 +1397,7 @@ impl VirtioNetPci {
         // the device-filled buffer parked in its slot and return
         // None — better than handing the stack a frame and losing
         // the refill slot.
-        let replacement = self.rx_buf_acquire()?;
+        let replacement = self.rx_buf_acquire_on(pair_idx)?;
         let rep_phys = replacement.dma_addr().raw();
         // Now swap: take the original out of its slot, free the
         // descriptor chain, post the replacement, stash it under
@@ -1499,14 +1520,13 @@ fn flow_tx_pair(frame: &[u8], npairs: usize) -> Option<usize> {
     // (src,dst)/(sport,dport), so the hash is identical for either flow
     // direction (matches the host tun's symmetric steering). One
     // xorshift-multiply finaliser scatters the low bits `% npairs` selects.
-    let src = u32::from_ne_bytes([frame[26], frame[27], frame[28], frame[29]]);
-    let dst = u32::from_ne_bytes([frame[30], frame[31], frame[32], frame[33]]);
-    let ports = u32::from_ne_bytes([frame[34], frame[35], frame[36], frame[37]]);
-    let mut h = src ^ dst ^ ports.rotate_left(16) ^ ports;
-    h ^= h >> 16;
-    h = h.wrapping_mul(0x7feb_352d);
-    h ^= h >> 15;
-    Some((h as usize) % npairs)
+    let src = [frame[26], frame[27], frame[28], frame[29]];
+    let dst = [frame[30], frame[31], frame[32], frame[33]];
+    let src_port = u16::from_be_bytes([frame[34], frame[35]]);
+    let dst_port = u16::from_be_bytes([frame[36], frame[37]]);
+    Some(narf_net::ipv4_flow_queue(
+        src, dst, src_port, dst_port, npairs,
+    ))
 }
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
@@ -1621,11 +1641,26 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
         // the stack's per-interface software GRO path.
         let _ = narf_net::iface::set_software_gro(name, true);
         *PRIMARY_IFNAME.lock() = Some(name);
-        // Opt into zero-copy TX (P-F), sharing this controller's own TX pool so
-        // the stack's `tx_acquire` and the TX reaper use one free-list. 12-byte
-        // head-room for the virtio-net header `tx_dma` writes in front.
-        if let Some(pool) = with_at(idx, |c| c.tx_pool.clone()) {
-            narf_net::iface::enable_zero_copy_tx_pool(name, vnet0_send_frame_zc, pool, 12);
+        // Opt into zero-copy TX with one recycler per TX pair. `tx_acquire`
+        // records its selected queue in the frame, and the reaper returns the
+        // buffer to that same pair. 12-byte head-room is for the virtio-net
+        // header `tx_dma_on` writes in front.
+        if let Some((pools, flow_affine)) = with_at(idx, |c| {
+            (
+                c.pairs
+                    .iter()
+                    .map(|pair| Arc::clone(&pair.tx_pool))
+                    .collect(),
+                c.flow_affine,
+            )
+        }) {
+            narf_net::iface::enable_zero_copy_tx_pools_with_affinity(
+                name,
+                vnet0_send_frame_zc,
+                pools,
+                12,
+                flow_affine,
+            );
         }
         name.into()
     } else {
@@ -1745,7 +1780,7 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                     loop {
                         let taken = match with_at(idx, |c| {
                             if let Some(b) = to_recycle.take() {
-                                c.rx_buf_release(b);
+                                c.rx_buf_release_on(pair_idx, b);
                             }
                             c.rx_take_on(pair_idx)
                         }) {
@@ -1796,7 +1831,8 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                             to_recycle = Some(buf);
                             continue;
                         }
-                        let frame = Frame::with_offset(buf, 12, payload_len);
+                        let frame =
+                            Frame::with_offset_on_queue(buf, 12, payload_len, pair_idx as u16);
                         // Secondary controllers (idx != 0) have no
                         // synchronous tap, so the channel IS their delivery
                         // path. Push best-effort: on a full ring DROP the
@@ -1830,7 +1866,7 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                     // rides the next take's `with_at`, but the final frame of the
                     // round has no next take — release it here (≤1 with_at/round).
                     if let Some(b) = to_recycle.take() {
-                        with_at(idx, |c| c.rx_buf_release(b));
+                        with_at(idx, |c| c.rx_buf_release_on(pair_idx, b));
                     }
                     // NAPI-complete for this pair: the RX ring drained this round,
                     // so flush any TCP segments GRO coalesced for the frames just
@@ -1950,8 +1986,8 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
     }
 
     // Single TX forwarder per device. Drains the tx_consumer once
-    // and round-robins each frame to one of the N TX virtqueues
-    // via the controller's `tx_dma` (which calls `next_tx_pair`).
+    // and selects one of the N TX virtqueues before it acquires that
+    // queue's recycler buffer, so completion returns to the same pool.
     //
     // tx_dma is fire-and-forget and requires the frame body at
     // offset 12 (12-byte header headroom at offset 0), taking the
@@ -1968,8 +2004,13 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
             if plen == 0 || plen > MAX_FRAME - 12 {
                 continue; // bad frame; drop it
             }
-            let mut buf = match with_at(idx, |c| c.tx_buf_acquire()).flatten() {
-                Some(buf) => buf,
+            let (pair_idx, mut buf) = match with_at(idx, |c| {
+                let pair_idx = c.tx_pair_for_frame(payload);
+                c.tx_buf_acquire_on(pair_idx).map(|buf| (pair_idx, buf))
+            })
+            .flatten()
+            {
+                Some(pair) => pair,
                 None => continue, // bounded TX pool empty; upper layers retry
             };
             {
@@ -1981,7 +2022,7 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
             }
             // tx_dma takes ownership of `buf` and keeps it alive until
             // the device completes; never wait, never drop early.
-            let _ = with_at(idx, |c| c.tx_dma(buf, plen as u32));
+            let _ = with_at(idx, |c| c.tx_dma_on(pair_idx, buf, plen as u32));
             // `frame` (and its DmaBuffer) drops at end of scope.
         }
     });
@@ -2007,9 +2048,12 @@ fn vnet0_send_fn(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     }
     // Take a prepared TX buffer. An empty pool is backpressure; the send fails
     // rather than allocating from the page allocator on the frame path.
-    let mut buf = with_controller(|c| c.tx_buf_acquire())
-        .flatten()
-        .ok_or(())?;
+    let (pair_idx, mut buf) = with_controller(|c| {
+        let pair_idx = c.tx_pair_for_frame(frame);
+        c.tx_buf_acquire_on(pair_idx).map(|buf| (pair_idx, buf))
+    })
+    .flatten()
+    .ok_or(())?;
     {
         let slice = buf.as_mut_slice();
         if slice.len() < 12 + frame.len() {
@@ -2018,9 +2062,9 @@ fn vnet0_send_fn(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
         // Frame body at offset 12; tx_dma writes the 12-byte header.
         slice[12..12 + frame.len()].copy_from_slice(frame);
     }
-    // Move `buf` into tx_dma — it owns the buffer until the device
+    // Move `buf` into its selected queue — it owns the buffer until the device
     // finishes DMAing the frame out of it.
-    let res = with_controller(|c| c.tx_dma(buf, frame.len() as u32));
+    let res = with_controller(|c| c.tx_dma_on(pair_idx, buf, frame.len() as u32));
     match res {
         Some(Ok(())) => Ok(()),
         // `tx_dma` consumed `buf` (the closure moved it in). On the
@@ -2031,22 +2075,23 @@ fn vnet0_send_fn(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
 }
 
 /// Zero-copy `iface::SendFrameFn` (P-F). The stack built the Ethernet frame
-/// directly into a buffer drawn from this controller's own TX pool, at the
-/// 12-byte head-room `enable_zero_copy_tx_pool` requested — exactly the layout
-/// `tx_dma` expects (body at offset 12, header space in front). So hand the
-/// buffer straight to the fire-and-forget `tx_dma` with no copy; the TX reaper
-/// recycles it back into the shared pool on completion. Replaces the
+/// directly into a buffer drawn from one selected queue's TX pool, at the
+/// 12-byte head-room `enable_zero_copy_tx_pools` requested — exactly the
+/// layout `tx_dma_on` expects (body at offset 12, header space in front). So
+/// hand the buffer straight to that queue with no copy; the TX reaper recycles
+/// it back into the same queue-local pool on completion. Replaces the
 /// slice-into-`buf[12..]` memcpy `vnet0_send_fn` does.
 fn vnet0_send_frame_zc(frame: narf_net::Frame, _meta: narf_net::TxMeta) -> Result<(), ()> {
     let len = frame.len() as usize;
     if len == 0 || len > MAX_FRAME - 12 {
         return Err(());
     }
-    // `tx_acquire` built this via `Frame::with_offset(buf, 12, len)`, so the
+    // `tx_acquire` built this via `Frame::with_offset_on_queue(buf, 12, len,
+    // queue)`, so the
     // body is at `buf[12..12 + len]` and `buf[0..12]` is the header space.
     // Discard the offset/len view and give `tx_dma` the whole buffer.
-    let (buf, _off, _len) = frame.into_parts_with_offset();
-    match with_controller(|c| c.tx_dma(buf, len as u32)) {
+    let (buf, _off, _len, queue) = frame.into_parts_with_offset_and_queue();
+    match with_controller(|c| c.tx_dma_on(queue as usize, buf, len as u32)) {
         Some(Ok(())) => Ok(()),
         _ => Err(()),
     }

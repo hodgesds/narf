@@ -2483,7 +2483,18 @@ fn build_tcb_frame(
         ipv4_frame_len(options.len(), payload.len())
     };
     if dev.zero_copy_tx() {
-        if let Some(mut f) = iface::tx_acquire(&dev.name, total) {
+        let frame = if t.is_ipv6 {
+            dev.tx_acquire(total)
+        } else {
+            dev.tx_acquire_ipv4_flow(
+                total,
+                t.local_addr,
+                t.remote_addr,
+                t.local_port,
+                t.remote_port,
+            )
+        };
+        if let Some(mut f) = frame {
             if t.is_ipv6 {
                 build_frame6_into(
                     f.payload_mut(),

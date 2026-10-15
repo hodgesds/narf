@@ -101,6 +101,13 @@ pub fn tx_ring(iface: &Cap<NetIface, Tx>, queue: u16) -> Ring<Frame>;
   stack daemon ever touches the bytes on the hot path.
 - Multi-queue is explicit. The consumer chooses queue affinity;
   default is "per-CPU queue" for hash-steered RX.
+- A zero-copy TX allocator chooses its queue before handing out a `Frame` and
+  records that choice in the frame. The driver submits and recycles the buffer
+  on the same queue; it must not return it to an interface-wide pool shared by
+  independent completion cores.
+- Resolved interface snapshots retain references to their TX recyclers. The
+  routing/TCP fast path acquires from that snapshot, not by taking the global
+  interface-registry lock once per packet.
 
 The in-tree `Frame` owns a DMA buffer, payload offset and length. Its
 `tx_meta()` / `set_tx_meta(TxMeta)` and `rx_meta()` / `set_rx_meta(RxMeta)`

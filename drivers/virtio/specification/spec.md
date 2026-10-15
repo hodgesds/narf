@@ -39,6 +39,11 @@ blk/net/console/rng.
   native parallelism the moment we touch real hardware. `class_blk`
   and `class_net` modules consume the per-queue rings and present
   the unified block/net subsystem interfaces.
+- Virtio-net gives each RX/TX queue pair its own bounded, prefilled DMA
+  recycler. RX refill and TX completion use only that pair's recycler; a
+  zero-copy TX frame records its selected pair before its buffer is acquired.
+  No packet/completion path reaches the general allocator or an interface-wide
+  recycler shared by independent queues.
 - The primary virtio-net interface opts into the kernel stack's
   per-interface software GRO stage. Every RX forwarder flushes the current
   CPU's held flows after its queue drains and before it parks; secondary

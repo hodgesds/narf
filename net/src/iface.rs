@@ -49,6 +49,57 @@ impl SendDispatch {
 /// driver failure (the buffer is still the driver's to recycle on Err).
 pub type SendFrameFn = fn(crate::Frame, crate::TxMeta) -> Result<(), ()>;
 
+/// Queue-local DMA pools behind a zero-copy interface. Selection happens once
+/// at frame construction; the selected queue is carried in [`crate::Frame`]
+/// through the driver's completion path. This keeps the data path off a
+/// shared recycler lock when an interface exposes multiple TX queues.
+#[derive(Debug)]
+struct TxPoolSet {
+    pools: Vec<Arc<DmaPool>>,
+    next: AtomicUsize,
+    /// True when the driver has dedicated forwarder cores and wants TCP flows
+    /// pinned to one queue. Shared-core drivers keep the cheaper RR policy.
+    flow_affine: bool,
+}
+
+impl TxPoolSet {
+    fn new(pools: Vec<Arc<DmaPool>>, flow_affine: bool) -> Option<Self> {
+        (!pools.is_empty() && pools.len() <= u16::MAX as usize + 1).then_some(Self {
+            pools,
+            next: AtomicUsize::new(0),
+            flow_affine,
+        })
+    }
+
+    fn acquire_pool(&self) -> Option<(u16, &DmaPool)> {
+        let len = self.pools.len();
+        let queue = self.next.fetch_add(1, Ordering::Relaxed) % len;
+        self.acquire_pool_on(queue)
+    }
+
+    fn acquire_ipv4_flow(
+        &self,
+        src: [u8; 4],
+        dst: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+    ) -> Option<(u16, &DmaPool)> {
+        if !self.flow_affine {
+            return self.acquire_pool();
+        }
+        let queue = crate::ipv4_flow_queue(src, dst, src_port, dst_port, self.pools.len());
+        self.acquire_pool_on(queue)
+    }
+
+    fn acquire_pool_on(&self, queue: usize) -> Option<(u16, &DmaPool)> {
+        Some((queue as u16, Arc::as_ref(self.pools.get(queue)?)))
+    }
+
+    fn pool(&self, queue: u16) -> Option<Arc<DmaPool>> {
+        self.pools.get(queue as usize).cloned()
+    }
+}
+
 /// Duplex state reported by a physical driver. `None` in snapshots means the
 /// driver has no authoritative link-mode sample.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -133,16 +184,15 @@ pub struct NetIfaceEntry {
     pub software_gro: bool,
     /// Zero-copy TX hook (P-F): `Some` once the driver opts in via
     /// [`enable_zero_copy_tx`]. When set, the stack builds egress frames
-    /// directly into a buffer from `tx_pool` and hands ownership here instead
+    /// directly into a buffer from `tx_pools` and hands ownership here instead
     /// of copying a slice through [`send`]. `None` ⇒ the classic copy path.
     pub send_frame: Option<SendFrameFn>,
-    /// Recycling pool backing zero-copy TX (`Some` iff `send_frame` is). The
-    /// stack draws build buffers from it ([`tx_acquire`]); the driver returns
-    /// them on completion ([`tx_release`], or — for a driver that shares its
-    /// own pool — its async TX reaper). `Arc` so a snapshot can hold the pool
-    /// without re-looking-up the registry, and so a driver can share the very
-    /// pool its completion path already recycles into.
-    pub tx_pool: Option<Arc<DmaPool>>,
+    /// Queue-local recycling pools backing zero-copy TX (`Some` iff
+    /// `send_frame` is). The stack chooses a pool once in [`tx_acquire`] and
+    /// records that queue in the returned frame; the driver returns the buffer
+    /// to the same queue at completion. `Arc` lets a snapshot hold the set
+    /// without re-looking-up the registry.
+    tx_pools: Option<Arc<TxPoolSet>>,
     /// Bytes of head-room the stack leaves before the Ethernet frame in a
     /// zero-copy TX buffer, for a device header the driver writes in front
     /// (virtio-net's 12-byte header). 0 for a device that DMAs from offset 0
@@ -236,13 +286,43 @@ pub fn enable_zero_copy_tx_pool(
     pool: Arc<DmaPool>,
     headroom: usize,
 ) {
+    enable_zero_copy_tx_pools(name, send_frame, alloc::vec![pool], headroom);
+}
+
+/// Opt an interface into zero-copy TX with one recycler per hardware TX queue.
+/// The stack round-robins its build-buffer selection once, records the chosen
+/// queue in [`crate::Frame`], and the driver submits/recycles on that same
+/// queue. Each pool must already be prepared and prefilled during driver
+/// bring-up; this function never allocates packet buffers.
+pub fn enable_zero_copy_tx_pools(
+    name: &str,
+    send_frame: SendFrameFn,
+    pools: Vec<Arc<DmaPool>>,
+    headroom: usize,
+) {
+    enable_zero_copy_tx_pools_with_affinity(name, send_frame, pools, headroom, false);
+}
+
+/// As [`enable_zero_copy_tx_pools`], with explicit TCP flow-affinity policy.
+/// Enable affinity only when each queue's forwarder owns a core; otherwise
+/// round-robin avoids needless hashing on a shared worker core.
+pub fn enable_zero_copy_tx_pools_with_affinity(
+    name: &str,
+    send_frame: SendFrameFn,
+    pools: Vec<Arc<DmaPool>>,
+    headroom: usize,
+    flow_affine: bool,
+) {
+    let Some(pools) = TxPoolSet::new(pools, flow_affine).map(Arc::new) else {
+        return;
+    };
     if let Some(entry) = IFACES
         .lock()
         .as_mut()
         .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == name))
     {
         entry.send_frame = Some(send_frame);
-        entry.tx_pool = Some(pool);
+        entry.tx_pools = Some(pools);
         entry.tx_headroom = headroom;
     }
 }
@@ -256,22 +336,7 @@ pub fn enable_zero_copy_tx_pool(
 /// is available. The packet path deliberately does not allocate a replacement;
 /// queue setup/refill owns that slow path.
 pub fn tx_acquire(name: &str, len: usize) -> Option<crate::Frame> {
-    let (pool, headroom) = {
-        let g = IFACES.lock();
-        let entry = g
-            .as_ref()?
-            .iter()
-            .find(|entry| entry.name == name && entry.send_frame.is_some())?;
-        (entry.tx_pool.clone()?, entry.tx_headroom)
-    };
-    if headroom + len > pool.buf_len() {
-        return None;
-    }
-    Some(crate::Frame::with_offset(
-        pool.try_acquire()?,
-        headroom as u32,
-        len as u32,
-    ))
+    lookup(name)?.tx_acquire(len)
 }
 
 /// Return a completed TX buffer to `name`'s zero-copy pool for reuse. The
@@ -279,11 +344,19 @@ pub fn tx_acquire(name: &str, len: usize) -> Option<crate::Frame> {
 /// buffer (synchronous drivers: immediately; async: on TX completion). A
 /// buffer for an iface that is no longer zero-copy simply drops (frees).
 pub fn tx_release(name: &str, buf: narf_io::DmaBuffer) {
+    tx_release_on(name, 0, buf);
+}
+
+/// Return a completed TX buffer to the queue-local zero-copy pool from which
+/// it was acquired. A stale or invalid queue deliberately drops the buffer
+/// rather than placing it on an unrelated queue's recycler.
+pub fn tx_release_on(name: &str, queue: u16, buf: narf_io::DmaBuffer) {
     let pool = {
         let g = IFACES.lock();
         g.as_ref()
             .and_then(|v| v.iter().find(|entry| entry.name == name))
-            .and_then(|entry| entry.tx_pool.clone())
+            .and_then(|entry| entry.tx_pools.as_ref())
+            .and_then(|pools| pools.pool(queue))
     };
     if let Some(pool) = pool {
         pool.release(buf);
@@ -595,7 +668,7 @@ fn register_inner(
         // A re-probe preserves any zero-copy TX opt-in (hook + pool + headroom)
         // so the stack keeps the same recycling pool across a driver reset.
         send_frame: old.as_ref().and_then(|old| old.send_frame),
-        tx_pool: old.as_ref().and_then(|old| old.tx_pool.clone()),
+        tx_pools: old.as_ref().and_then(|old| old.tx_pools.clone()),
         tx_headroom: old.as_ref().map_or(0, |old| old.tx_headroom),
     });
     drop(g);
@@ -1050,13 +1123,57 @@ pub struct NetIfaceSnapshot {
     /// an owned [`crate::Frame`] to [`Self::xmit_frame`]; private so every
     /// transmit still passes through the snapshot's tap-aware methods.
     send_frame: Option<SendFrameFn>,
+    /// Queue-local TX recyclers retained by value with this route snapshot.
+    /// Keeping the `Arc` here lets the TCP fast path acquire a build buffer
+    /// without re-entering the global interface registry lock per packet.
+    tx_pools: Option<Arc<TxPoolSet>>,
+    tx_headroom: usize,
 }
 
 impl NetIfaceSnapshot {
     /// Whether this interface accepts zero-copy (owned-`Frame`) transmits. When
     /// false the stack builds into a `Vec` and uses [`Self::xmit_meta`].
     pub fn zero_copy_tx(&self) -> bool {
-        self.send_frame.is_some()
+        self.send_frame.is_some() && self.tx_pools.is_some()
+    }
+
+    /// Acquire a zero-copy TX frame through this already-resolved interface
+    /// snapshot. The route/TCP fast path holds this snapshot for the flow, so
+    /// no global registry lock is taken per packet.
+    pub(crate) fn tx_acquire(&self, len: usize) -> Option<crate::Frame> {
+        let pools = self.tx_pools.as_ref()?;
+        self.tx_acquire_from_pool(len, pools.acquire_pool()?)
+    }
+
+    /// Acquire a TCP/IPv4 zero-copy frame. Affinity-enabled drivers use the
+    /// same symmetric 4-tuple mapping as their regular TX path; all other
+    /// drivers retain the normal round-robin pool selection.
+    pub(crate) fn tx_acquire_ipv4_flow(
+        &self,
+        len: usize,
+        src: [u8; 4],
+        dst: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+    ) -> Option<crate::Frame> {
+        let pools = self.tx_pools.as_ref()?;
+        self.tx_acquire_from_pool(len, pools.acquire_ipv4_flow(src, dst, src_port, dst_port)?)
+    }
+
+    fn tx_acquire_from_pool(
+        &self,
+        len: usize,
+        (queue, pool): (u16, &DmaPool),
+    ) -> Option<crate::Frame> {
+        if self.tx_headroom + len > pool.buf_len() {
+            return None;
+        }
+        Some(crate::Frame::with_offset_on_queue(
+            pool.try_acquire()?,
+            self.tx_headroom as u32,
+            len as u32,
+            queue,
+        ))
     }
 
     /// Transmit a frame the stack built directly into a DMA buffer drawn from
@@ -1170,6 +1287,8 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
         offloads: entry.offloads,
         software_gro: entry.software_gro,
         send_frame: entry.send_frame,
+        tx_pools: entry.tx_pools.clone(),
+        tx_headroom: entry.tx_headroom,
     }
 }
 
@@ -1713,6 +1832,95 @@ mod zc_tx_tests {
         TestResult::Pass
     }
     kernel_test_in!("net/iface", smoke_iface_zero_copy_tx_acquire);
+
+    fn smoke_iface_zero_copy_tx_pools_preserve_queue_affinity() -> TestResult {
+        use alloc::sync::Arc;
+        use narf_lib::id::DomainId;
+
+        let name = register("zc-queues-selftest", [2, 0, 0, 0, 0, 2], dummy_send);
+        let q0 = Arc::new(DmaPool::new(2048, DomainId::DRIVER_0, 2));
+        let q1 = Arc::new(DmaPool::new(2048, DomainId::DRIVER_0, 2));
+        if q0.prefill(2) != 2 || q1.prefill(2) != 2 {
+            return TestResult::Fail("could not prefill queue-local TX pools");
+        }
+        enable_zero_copy_tx_pools(
+            &name,
+            dummy_send_frame,
+            alloc::vec![Arc::clone(&q0), Arc::clone(&q1)],
+            16,
+        );
+
+        // Selection is round-robin, but the queue is carried by the Frame;
+        // completion must return to the same pool rather than a global one.
+        let f0 = match tx_acquire(&name, 64) {
+            Some(f) => f,
+            None => return TestResult::Fail("queue 0 acquire failed"),
+        };
+        let f1 = match tx_acquire(&name, 64) {
+            Some(f) => f,
+            None => return TestResult::Fail("queue 1 acquire failed"),
+        };
+        let (b0, _o0, _l0, q0_id) = f0.into_parts_with_offset_and_queue();
+        let (b1, _o1, _l1, q1_id) = f1.into_parts_with_offset_and_queue();
+        if q0_id != 0 || q1_id != 1 {
+            return TestResult::Fail("TX pool selection did not tag the chosen queue");
+        }
+        tx_release_on(&name, q0_id, b0);
+        tx_release_on(&name, q1_id, b1);
+        if q0.available() != 2 || q1.available() != 2 {
+            return TestResult::Fail("completion did not recycle to its source queue");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "net/iface",
+        smoke_iface_zero_copy_tx_pools_preserve_queue_affinity
+    );
+
+    fn smoke_iface_zero_copy_tx_ipv4_flow_affinity() -> TestResult {
+        use alloc::sync::Arc;
+        use narf_lib::id::DomainId;
+
+        let name = register("zc-flow-selftest", [2, 0, 0, 0, 0, 3], dummy_send);
+        let q0 = Arc::new(DmaPool::new(2048, DomainId::DRIVER_0, 2));
+        let q1 = Arc::new(DmaPool::new(2048, DomainId::DRIVER_0, 2));
+        if q0.prefill(2) != 2 || q1.prefill(2) != 2 {
+            return TestResult::Fail("could not prefill flow-affine TX pools");
+        }
+        enable_zero_copy_tx_pools_with_affinity(
+            &name,
+            dummy_send_frame,
+            alloc::vec![Arc::clone(&q0), Arc::clone(&q1)],
+            16,
+            true,
+        );
+        let src = [192, 0, 2, 11];
+        let dst = [198, 51, 100, 7];
+        let (sport, dport) = (41_001, 443);
+        let expected = crate::ipv4_flow_queue(src, dst, sport, dport, 2) as u16;
+        let snapshot = match lookup(&name) {
+            Some(snapshot) => snapshot,
+            None => return TestResult::Fail("flow-affine interface lookup failed"),
+        };
+        let first = match snapshot.tx_acquire_ipv4_flow(64, src, dst, sport, dport) {
+            Some(frame) => frame,
+            None => return TestResult::Fail("first flow-affine acquire failed"),
+        };
+        let (buf, _off, _len, queue) = first.into_parts_with_offset_and_queue();
+        if queue != expected {
+            return TestResult::Fail("flow-affine acquire chose a different TX queue");
+        }
+        tx_release_on(&name, queue, buf);
+        let second = match snapshot.tx_acquire_ipv4_flow(64, src, dst, sport, dport) {
+            Some(frame) => frame,
+            None => return TestResult::Fail("second flow-affine acquire failed"),
+        };
+        if second.queue() != expected {
+            return TestResult::Fail("same TCP flow did not stay on one TX queue");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/iface", smoke_iface_zero_copy_tx_ipv4_flow_affinity);
 
     fn smoke_iface_software_gro_is_per_device() -> TestResult {
         let enabled = register("gro-enabled-selftest", [2, 0, 0, 0, 0, 2], dummy_send);
