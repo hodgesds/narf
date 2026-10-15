@@ -21,7 +21,11 @@ fn cea_1080p() -> Timing {
 }
 /// One output of `kind` with `sink` lit (or none).
 fn one<'a>(kind: ConnectorType, sink: Option<Sink<'a>>) -> [Output<'a>; 1] {
-    [Output { kind, sink }]
+    [Output {
+        kind,
+        sink,
+        edid: None,
+    }]
 }
 fn lit<'a>(edid: &'a [u8; 128], timing: &'a Timing, offered: &'a [Timing]) -> Option<Sink<'a>> {
     Some(Sink {
@@ -46,6 +50,44 @@ fn geometry(m: &DrmModeModeInfo) -> [u32; 12] {
         m.r#type,
     ]
 }
+
+fn navi48_kms_discovery_keeps_disabled_connector_connected() -> TestResult {
+    let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
+    let edid = [7u8; 128];
+    let mut output = Output {
+        kind: ConnectorType::DisplayPort,
+        sink: None,
+        edid: Some(&edid),
+    };
+    let timing = cea_1080p();
+    apply(
+        &mut card,
+        &one(
+            ConnectorType::DisplayPort,
+            lit(&[1; 128], &timing, &[timing]),
+        ),
+    );
+    card.crtcs[0].primary_fb = Some(7);
+    apply(&mut card, &[output]);
+    assert_eq!(card.connectors[0].status, ConnectorStatus::Connected);
+    assert!(card.connectors[0].modes.is_empty());
+    assert!(!card.crtcs[0].enabled && card.crtcs[0].mode.is_none());
+    assert!(card.crtcs[0].primary_fb.is_none());
+    assert_eq!(
+        card.native_output(CONNECTOR).and_then(|n| n.edid),
+        Some(edid)
+    );
+    assert!(!card.accepts_mode(&timing_wire(&cea_1080p())));
+    output.edid = None;
+    apply(&mut card, &[output]);
+    assert_eq!(card.connectors[0].status, ConnectorStatus::Disconnected);
+    assert!(card.native_output(CONNECTOR).unwrap().edid.is_none());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-kms",
+    navi48_kms_discovery_keeps_disabled_connector_connected
+);
 
 fn navi48_kms_reports_exact_sink_timing() -> TestResult {
     let w = timing_wire(&cea_1080p());
@@ -296,14 +338,17 @@ fn navi48_kms_publishes_an_output_per_port() -> TestResult {
     let (ta, tc) = ([a], [c]);
     let outputs = [
         Output {
+            edid: None,
             kind: ConnectorType::DisplayPort,
             sink: lit(&edid_a, &a, &ta),
         },
         Output {
+            edid: None,
             kind: ConnectorType::DisplayPort,
             sink: None,
         },
         Output {
+            edid: None,
             kind: ConnectorType::HdmiA,
             sink: lit(&edid_c, &c, &tc),
         },

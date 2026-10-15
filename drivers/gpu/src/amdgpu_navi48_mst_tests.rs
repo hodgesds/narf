@@ -134,7 +134,7 @@ fn navi48_mst_payloads_like_linux() -> TestResult {
         return TestResult::Fail("payload table write");
     }
     source.events.clear();
-    run(remove_payload(&mut link, &mut aux, &mut source, 1)).unwrap();
+    run(remove_payload(&mut link, &mut aux, &mut source, 1, true)).unwrap();
     let h = hub.borrow();
     if h.bodies.last() != Some(&vec![0x11, 0x11, 1, 0, 0, 0])
         || row(&h) != [1, 1, 0]
@@ -156,3 +156,60 @@ fn navi48_mst_payloads_like_linux() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/dp-mst", navi48_mst_payloads_like_linux);
+
+fn navi48_mst_unplug_removes_payload_without_aux() -> TestResult {
+    // Every possible AUX operation fails the test: an unplug must only
+    // retire source state, without waiting for remote replies or ACT status.
+    struct Absent;
+    impl MstAux for Absent {
+        type Error = ();
+        async fn read(&mut self, _: u32, _: &mut [u8]) -> Result<(), ()> {
+            panic!("AUX read after unplug")
+        }
+        async fn write(&mut self, _: u32, _: &[u8]) -> Result<(), ()> {
+            panic!("AUX write after unplug")
+        }
+        async fn delay(&mut self, _: u64) {
+            panic!("AUX wait after unplug")
+        }
+    }
+    let hub = RefCell::new(Hub::new());
+    let topology = run(Manager::new().probe(&mut *hub.borrow_mut())).unwrap();
+    let mut link = MstLink {
+        topology,
+        ..Default::default()
+    };
+    link.payloads.push(MstPayload {
+        sink: link.topology.sinks()[1],
+        vcpi: 1,
+        start: 1,
+        slots: 10,
+        pbn: 100,
+        stream: 3,
+    });
+    let mut source = Source {
+        hub: &hub,
+        events: Vec::new(),
+    };
+    run(remove_payload(
+        &mut link,
+        &mut Absent,
+        &mut source,
+        3,
+        false,
+    ))
+    .unwrap();
+    assert!(link.payloads.is_empty());
+    assert_eq!(
+        source.events,
+        [
+            Event::Rate(3, (0, 0)),
+            Event::Table(Vec::new(), hub.borrow().requests.len())
+        ]
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_unplug_removes_payload_without_aux
+);

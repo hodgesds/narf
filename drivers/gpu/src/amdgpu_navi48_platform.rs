@@ -650,6 +650,9 @@ struct OutputState {
     requested: Option<Timing>,
     /// The lit sink: EDID, running timing and every offered timing.
     shown: Option<([u8; 128], Timing, Vec<Timing>)>,
+    mst_id: Option<boot::MstOutputId>,
+    mst_present: bool,
+    mst_edid: Vec<u8>,
 }
 impl OutputState {
     const fn new() -> Self {
@@ -657,6 +660,35 @@ impl OutputState {
             active: true,
             requested: None,
             shown: None,
+            mst_id: None,
+            mst_present: false,
+            mst_edid: Vec::new(),
+        }
+    }
+
+    fn reconcile_mst(&mut self, output: Option<&boot::MstOutput>) {
+        let id = output.map(|o| o.id);
+        if self.mst_id != id {
+            *self = Self::new();
+            self.mst_id = id;
+        }
+        self.mst_present = output.is_some_and(|o| o.sink.is_some());
+        // Preserve disabled requests at this connector, but never advertise
+        // the old monitor's modes after a different/unreadable EDID appears.
+        if let Some(output) = output.filter(|_| self.mst_present) {
+            if self.mst_edid != output.edid {
+                self.shown = None;
+                self.requested = None;
+                self.mst_edid.clone_from(&output.edid);
+            }
+        }
+    }
+
+    fn published(&self) -> Option<&([u8; 128], Timing, Vec<Timing>)> {
+        if self.mst_id.is_some() && !self.mst_present {
+            None
+        } else {
+            self.shown.as_ref()
         }
     }
 }
@@ -671,12 +703,17 @@ fn publish_outputs() {
     let sinks: Vec<_> = outputs
         .iter()
         .enumerate()
-        .map(|(k, &(_, kind))| (kind, state[k].shown.as_ref(), state[k].active))
+        .map(|(k, &(_, kind))| (kind, state[k].published(), state[k].active))
         .collect();
     let kms: Vec<crate::amdgpu_navi48_kms::Output> = sinks
         .iter()
-        .map(|&(kind, shown, _)| crate::amdgpu_navi48_kms::Output {
+        .enumerate()
+        .map(|(k, &(kind, shown, _))| crate::amdgpu_navi48_kms::Output {
             kind,
+            edid: state[k]
+                .mst_present
+                .then(|| state[k].mst_edid.get(..128)?.try_into().ok())
+                .flatten(),
             sink: shown.map(|(edid, timing, offered)| crate::amdgpu_navi48_kms::Sink {
                 edid,
                 timing,
@@ -809,7 +846,9 @@ async unsafe fn light_displays(
             Err(crate::amdgpu_dcn401_otg::Error::Unsupported) => continue,
             Err(e) => return Err(e.into()),
         }
-        if boot.display_hpd(port) == Ok(true) && boot.display_mst_capable(port).await {
+        if boot.display_hpd(port) == Ok(true)
+            && (boot.display_mst(port).is_some() || boot.display_mst_capable(port).await)
+        {
             mst = Some(port);
             break;
         }
@@ -831,6 +870,16 @@ async unsafe fn light_displays(
         for o in OUTPUT_STATE.lock().iter_mut() {
             *o = OutputState::new();
         }
+    }
+    if let Some(port) = mst {
+        boot.start_display_mst(port).await?;
+        let link = boot.display_mst(port).ok_or(boot::MstFailure::Invalid)?;
+        for (state, output) in OUTPUT_STATE.lock().iter_mut().zip(&link.outputs) {
+            state.reconcile_mst(output.as_ref());
+        }
+        // Clear old CRTC/framebuffer bindings for removed/reassigned monitors
+        // before a newly lit sink can inherit the slot's DRM framebuffer.
+        publish_outputs();
     }
     let wants: Vec<(bool, Option<Timing>)> = {
         let mut state = OUTPUT_STATE.lock();
@@ -1384,6 +1433,19 @@ fn needs_relight(changed: bool, wanted: u8, lit: u8, considered: &mut u8) -> boo
     changed || wanted & !*considered & !lit != 0
 }
 
+/// Physical HPD describes the root only. MST output presence comes from the
+/// retained downstream snapshot, including when no stream is running.
+fn output_present(boot: &mut boot::ColdBoot, port: usize, slot: usize, mst: bool) -> bool {
+    boot.display_hpd(port) == Ok(true)
+        && (!mst
+            || boot.display_mst(port).is_some_and(|l| {
+                l.outputs
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|o| o.sink.is_some())
+            }))
+}
+
 /// One monitor pass over every output: tear down displays DRM switched
 /// off or whose sink left, retrain lost links, and relight the whole
 /// configuration when a sink appears (or a CRTC returns) or a running
@@ -1403,6 +1465,7 @@ pub async unsafe fn monitor_displays(
     if displays.lit.iter().all(Option::is_none)
         && mst_port.is_some_and(|p| boot.display_hpd(p) == Ok(false))
     {
+        boot.forget_unplugged_display_mst(mst_port.unwrap())?;
         let board = lightable_outputs(boot);
         let mut outputs = OUTPUTS.lock();
         if *outputs != board {
@@ -1424,17 +1487,31 @@ pub async unsafe fn monitor_displays(
     let limited =
         crate::amdgpu_navi48_boot::limited_range(crate::amdgpu_navi48_boot::broadcast_rgb());
     let mut relight = false;
+    if let Some(port) = mst_port {
+        if boot.display_hpd(port) == Ok(true) && boot.display_mst(port).is_some() {
+            relight = boot.service_display_mst(port).await?;
+        }
+    }
     for k in 0..4u8 {
         let Some(m) = displays.lit[usize::from(k)] else {
             continue;
         };
+        if boot.display_hpd(m.selection.port) == Ok(false) {
+            withdraw(boot, k, &displays.lit);
+            // SAFETY: writers withdrawn; HPD reports physical removal.
+            unsafe { boot.unplug_modeset(&m) }.await?;
+            displays.lit[usize::from(k)] = None;
+            OUTPUT_STATE.lock()[usize::from(k)].shown = None;
+            steps.push(MonitorStep::Unplugged(k));
+            continue;
+        }
         if !wants[usize::from(k)].0 {
             // Withdraw writers first, then stop: the CRTC is off, the
             // connector still connected.
             withdraw(boot, k, &displays.lit);
-            displays.lit[usize::from(k)] = None;
             // SAFETY: the caller's obligations; the scanout is withdrawn.
             unsafe { boot.stop_modeset(&m) }.await?;
+            displays.lit[usize::from(k)] = None;
             steps.push(MonitorStep::Disabled(k));
             continue;
         }
@@ -1464,12 +1541,12 @@ pub async unsafe fn monitor_displays(
             }
             Health::Unplugged => {
                 withdraw(boot, k, &displays.lit);
-                displays.lit[usize::from(k)] = None;
                 if let Some(o) = OUTPUT_STATE.lock().get_mut(usize::from(k)) {
                     o.shown = None;
                 }
                 // SAFETY: as above; the scanout is withdrawn first.
                 unsafe { boot.unplug_modeset(&m) }.await?;
+                displays.lit[usize::from(k)] = None;
                 steps.push(MonitorStep::Unplugged(k));
             }
         }
@@ -1477,7 +1554,7 @@ pub async unsafe fn monitor_displays(
     // Sinks to light: plugged on an output DRM has not switched off.
     let mut wanted = 0u8;
     for (k, &(port, _)) in outputs.iter().enumerate() {
-        if wants[k].0 && boot.display_hpd(port) == Ok(true) {
+        if wants[k].0 && output_present(boot, port, k, mst_output_port(&outputs).is_some()) {
             wanted |= 1 << k;
         }
     }
@@ -1494,9 +1571,14 @@ pub async unsafe fn monitor_displays(
                 continue;
             };
             withdraw(boot, k, &displays.lit);
+            if boot.display_hpd(m.selection.port) == Ok(false) {
+                // SAFETY: the caller's obligations; writers withdrawn first.
+                unsafe { boot.unplug_modeset(&m) }.await?;
+            } else {
+                // SAFETY: the caller's obligations; writers withdrawn first.
+                unsafe { boot.stop_modeset(&m) }.await?;
+            }
             displays.lit[usize::from(k)] = None;
-            // SAFETY: the caller's obligations; writers withdrawn first.
-            unsafe { boot.stop_modeset(&m) }.await?;
         }
         let fill = |_: u8, _: u32, row: &mut [u32]| row.fill(0);
         // SAFETY: as above; every display is stopped.
@@ -1544,7 +1626,10 @@ pub async unsafe fn monitor_displays(
         displays.considered = outputs
             .iter()
             .enumerate()
-            .filter(|&(k, &(port, _))| state[k].active && boot.display_hpd(port) == Ok(true))
+            .filter(|&(k, &(port, _))| {
+                state[k].active
+                    && output_present(boot, port, k, mst_output_port(&outputs).is_some())
+            })
             .fold(0, |acc, (k, _)| acc | 1 << k);
         drop(state);
         steps.push(MonitorStep::Relit(count));
@@ -1588,8 +1673,9 @@ pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configura
                 }
                 // Bits describe current outputs, which can be MST devices
                 // rather than board-port ordinals.
-                for (k, &(port, _)) in OUTPUTS.lock().iter().enumerate() {
-                    if boot.display_hpd(port) == Ok(true) {
+                let outputs = OUTPUTS.lock().clone();
+                for (k, &(port, _)) in outputs.iter().enumerate() {
+                    if output_present(boot, port, k, mst_output_port(&outputs).is_some()) {
                         displays.considered |= 1 << k;
                     }
                 }
@@ -1974,6 +2060,72 @@ pub async fn poll_interrupts() -> Result<crate::amdgpu_ih7::Batch, boot::Error> 
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn navi48_mst_disabled_connector_survives_hotplug() -> TestResult {
+        let id = boot::MstOutputId {
+            root: [1; 16],
+            branch: [2; 16],
+            lct: 2,
+            rad: [0; 8],
+            port: 3,
+        };
+        let mut output = boot::MstOutput {
+            id,
+            sink: Some(crate::dp_mst_mgr::Sink { branch: 1, port: 3 }),
+            edid: alloc::vec![0; 256],
+        };
+        let timing = Timing {
+            pixel_clock_khz: 148500,
+            h_active: 1920,
+            h_total: 2200,
+            h_front_porch: 88,
+            h_sync_width: 44,
+            v_active: 1080,
+            v_total: 1125,
+            v_front_porch: 4,
+            v_sync_width: 5,
+            h_sync_positive: true,
+            v_sync_positive: true,
+        };
+        let mut state = OutputState::new();
+        state.reconcile_mst(Some(&output));
+        state.shown = Some(([0; 128], timing, alloc::vec![timing]));
+        state.requested = Some(timing);
+        state.active = false;
+        let mut considered = 0;
+        // Downstream disconnect drives a reprobe even with no wanted CRTC.
+        assert!(needs_relight(true, 0, 0, &mut considered));
+        output.sink = None;
+        output.edid.clear();
+        state.reconcile_mst(Some(&output));
+        assert!(state.published().is_none());
+        assert!(!state.active);
+        assert_eq!(state.requested, Some(timing));
+        // The same connector and EDID return with a different branch index.
+        output.sink = Some(crate::dp_mst_mgr::Sink { branch: 2, port: 3 });
+        output.edid.resize(256, 0);
+        state.reconcile_mst(Some(&output));
+        assert!(state.published().is_some());
+        assert!(!state.active);
+        assert_eq!(state.requested, Some(timing));
+        assert!(!needs_relight(false, 0, 0, &mut considered));
+        state.active = true;
+        assert!(needs_relight(false, 1, 0, &mut considered));
+        // A different monitor on this connector retains disabled state but
+        // loses stale modes. Reassigning the slot resets old DRM requests.
+        state.active = false;
+        output.edid[128] = 1; // same base block, changed extension modes
+        state.reconcile_mst(Some(&output));
+        assert!(!state.active && state.shown.is_none() && state.requested.is_none());
+        output.id.branch = [3; 16];
+        state.reconcile_mst(Some(&output));
+        assert!(state.active && state.shown.is_none() && state.requested.is_none());
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi48",
+        navi48_mst_disabled_connector_survives_hotplug
+    );
 
     /// A frame the native display cannot take still completes its
     /// flip-complete event, and the 24-bit OTG frame count extends across

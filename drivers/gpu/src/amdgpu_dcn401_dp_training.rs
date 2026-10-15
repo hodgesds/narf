@@ -874,7 +874,9 @@ impl<I: Io> Engine<I> {
         self.dp_training_verify(plan)?;
         self.status.state = State::StoppingDpLink(path.transmitter);
         let result = async {
-            if sink {
+            if sink && !plan.phy.settings.mst {
+                // Keep an idle MST branch powered for AUX/up requests. Our
+                // polling manager remains enabled after the last stream stops.
                 write(io, path, 0x600, &mut [2]).await?; // native sink D3 before PHY disable
                 self.dp_training_verify(plan)?;
             }
@@ -937,8 +939,9 @@ impl Otg {
     }
     /// # Safety
     /// Same direct-port, writer-exclusion and memory-retention obligations. Only
-    /// the matching trained link with no streams may be stopped. Sink D3 is an
-    /// acknowledged request; no analog-power or memory-release proof is granted.
+    /// the matching trained link with no streams may be stopped. SST requests
+    /// sink D3; MST keeps D0 for idle branch notifications. Neither grants
+    /// analog-power or memory-release proof.
     pub(crate) async unsafe fn stop_dp_link(
         &mut self,
         io: &mut dmub::Dmub,

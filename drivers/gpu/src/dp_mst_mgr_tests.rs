@@ -20,7 +20,11 @@ pub(crate) struct Hub {
     /// Each down request: LCT, RAD and body.
     pub(crate) requests: Vec<(u8, [u8; 8], u8)>,
     pub(crate) bodies: Vec<Vec<u8>>,
-    edid: [u8; 256],
+    pub(crate) edid: [u8; 256],
+    pub(crate) root_sink_present: bool,
+    pub(crate) child_present: bool,
+    pub(crate) require_power: bool,
+    recursive: bool,
 }
 const ROOT: [u8; 16] = [0x11; 16];
 const CHILD: [u8; 16] = [0x22; 16];
@@ -43,6 +47,10 @@ impl Hub {
             requests: Vec::new(),
             bodies: Vec::new(),
             edid,
+            root_sink_present: true,
+            child_present: true,
+            require_power: false,
+            recursive: false,
         }
     }
     fn esi(&mut self) {
@@ -71,7 +79,7 @@ impl Hub {
         let kind = body[0] & 0x7f;
         let child = lct == 2 && rad[0] >> 4 == 2;
         match kind {
-            LINK_ADDRESS_KIND if child => {
+            LINK_ADDRESS_KIND if child && !self.recursive => {
                 let mut r = vec![0x01];
                 r.extend_from_slice(&CHILD);
                 r.push(3);
@@ -85,8 +93,15 @@ impl Hub {
                 r.extend_from_slice(&ROOT);
                 r.push(4);
                 r.extend(Self::port(true, 1, 0, false, true, [0; 16]));
-                r.extend(Self::port(false, 3, 1, false, true, [0x44; 16]));
-                r.extend(Self::port(false, 2, 2, true, true, CHILD));
+                r.extend(Self::port(
+                    false,
+                    3,
+                    1,
+                    false,
+                    self.root_sink_present,
+                    [0x44; 16],
+                ));
+                r.extend(Self::port(false, 2, 2, true, self.child_present, CHILD));
                 r.extend(Self::port(false, 0, 3, false, false, [0; 16]));
                 r
             }
@@ -126,6 +141,44 @@ impl Hub {
     }
 }
 const LINK_ADDRESS_KIND: u8 = dp_mst::LINK_ADDRESS;
+
+fn mst_probe_bounds_depth_and_branch_count() -> TestResult {
+    let mut hub = Hub::new();
+    hub.recursive = true;
+    let mut mgr = Manager::new();
+    assert_eq!(run(mgr.probe(&mut hub)), Err(MstError::Malformed));
+    assert_eq!(
+        hub.requests
+            .iter()
+            .filter(|r| r.2 == dp_mst::LINK_ADDRESS)
+            .count(),
+        15
+    );
+    assert!(hub.requests.iter().all(|r| (1..=15).contains(&r.0)));
+    let mut topology = Topology {
+        branches: vec![
+            Branch {
+                lct: 1,
+                rad: [0; 8],
+                guid: ROOT,
+                ports: Vec::new()
+            };
+            64
+        ],
+    };
+    let sent = hub.requests.len();
+    assert!(matches!(
+        run(mgr.link_address(&mut hub, 2, [0; 8], &mut topology)),
+        Err(MstError::Malformed)
+    ));
+    assert_eq!(hub.requests.len(), sent);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    mst_probe_bounds_depth_and_branch_count
+);
+
 impl MstAux for Hub {
     type Error = ();
     async fn read(&mut self, address: u32, buf: &mut [u8]) -> Result<(), ()> {
@@ -148,6 +201,13 @@ impl MstAux for Hub {
         Ok(())
     }
     async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), ()> {
+        if self.require_power
+            && address == MSTM_CTRL
+            && data[0] != 0
+            && self.dpcd.get(&0x600) != Some(&1)
+        {
+            return Err(());
+        }
         match address {
             ESI0 => {
                 if data[0] & DOWN_REP_MSG_RDY != 0 {

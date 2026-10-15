@@ -2474,7 +2474,7 @@ impl ColdBoot {
 
 #[path = "amdgpu_navi48_mst.rs"]
 mod mst;
-pub use mst::{select_mst, MstFailure, MstLink, MstPayload};
+pub use mst::{select_mst, MstFailure, MstLink, MstOutput, MstOutputId, MstPayload};
 #[path = "amdgpu_navi48_modeset.rs"]
 mod modeset;
 pub use modeset::{

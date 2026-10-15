@@ -415,6 +415,11 @@ impl Manager {
                     (port.fec, port.full_pbn, port.available_pbn) = (fec, full_pbn, available_pbn);
                 }
                 if info.peer_device_type == dp_mst::PEER_MST_BRANCHING && info.mcs {
+                    // LCT is a four-bit wire field. Refuse a deeper tree before
+                    // child_rad or the encoded route can overflow.
+                    if lct >= 15 {
+                        return Err(MstError::Malformed);
+                    }
                     let (clct, crad) = child_rad(lct, &rad, info.port);
                     let child = self.link_address(aux, clct, crad, &mut topology).await?;
                     if let Some(top) = stack.last_mut() {
@@ -437,6 +442,10 @@ impl Manager {
         rad: [u8; 8],
         topology: &mut Topology,
     ) -> Result<Frame, MstError<A::Error>> {
+        // Bound work and retained memory when notifications trigger probes.
+        if topology.branches.len() >= 64 {
+            return Err(MstError::Malformed);
+        }
         let Reply::LinkAddress { guid, ports } =
             self.transact(aux, lct, &rad, &Request::LinkAddress).await?
         else {

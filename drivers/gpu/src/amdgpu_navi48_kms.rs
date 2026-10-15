@@ -59,6 +59,9 @@ pub struct Sink<'a> {
 pub struct Output<'a> {
     pub kind: ConnectorType,
     pub sink: Option<Sink<'a>>,
+    /// Discovered EDID before any mode has been admitted/lit, e.g. a new
+    /// monitor on a disabled MST connector. Reports connected with no modes.
+    pub edid: Option<&'a [u8; 128]>,
 }
 
 /// The exact DRM wire form of a DCN timing.
@@ -136,6 +139,7 @@ pub fn apply(card: &mut Card, outputs: &[Output]) {
     };
     let mut native = alloc::vec::Vec::with_capacity(outputs.len());
     for (k, o) in outputs.iter().enumerate() {
+        let edid = o.sink.map(|s| s.edid).or(o.edid);
         let wire = o.sink.map(|s| timing_wire(s.timing));
         let mode = wire.as_ref().map(to_mode);
         // The running timing first, so a mode that two timings round to the
@@ -175,7 +179,7 @@ pub fn apply(card: &mut Card, outputs: &[Output]) {
             }
         }
         if let Some(c) = card.connectors.iter_mut().find(|c| c.id == connector_id(k)) {
-            c.status = if o.sink.is_some() {
+            c.status = if edid.is_some() {
                 ConnectorStatus::Connected
             } else {
                 ConnectorStatus::Disconnected
@@ -185,7 +189,7 @@ pub fn apply(card: &mut Card, outputs: &[Output]) {
         }
         native.push(NativeOutput {
             connector: connector_id(k),
-            edid: o.sink.map(|s| *s.edid),
+            edid: edid.copied(),
             timings,
             // amdgpu_dm attaches it to HDMI and SST DP connectors, which is
             // all these ever are.

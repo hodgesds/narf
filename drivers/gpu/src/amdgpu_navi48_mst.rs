@@ -9,6 +9,11 @@ use crate::dp_mst;
 use crate::dp_mst::{Reply, Request};
 use crate::dp_mst_mgr::{self, Manager, MstAux, MstError, Topology};
 
+#[path = "amdgpu_navi48_mst_topology.rs"]
+mod topology;
+use topology::ProbeState;
+pub use topology::{MstOutput, MstOutputId};
+
 /// The port's AUX channel through DMUB, in 16-byte native transactions
 /// with the display probe's DEFER retries.
 struct DmubAux<'a> {
@@ -76,6 +81,10 @@ pub struct MstLink {
     pub manager: Manager,
     pub topology: Topology,
     pub payloads: Vec<MstPayload>,
+    /// Stable KMS slots, including reservations for disconnected sinks.
+    pub outputs: [Option<MstOutput>; 4],
+    state: ProbeState,
+    dirty: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,6 +225,7 @@ pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
     aux: &mut A,
     source: &mut S,
     stream: u8,
+    connected: bool,
 ) -> Result<(), MstFailure<A::Error>> {
     let index = link
         .payloads
@@ -224,7 +234,8 @@ pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
         .ok_or(MstFailure::Invalid)?;
     let payload = link.payloads[index];
     source.vc_rate(stream, (0, 0)).await?;
-    if let (Some(branch), Some(port)) = (
+    if let (true, Some(branch), Some(port)) = (
+        connected,
         link.topology.branches.get(payload.sink.branch).cloned(),
         link.topology.port(payload.sink).copied(),
     ) {
@@ -239,10 +250,14 @@ pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
             .transact(aux, branch.lct, &branch.rad, &request)
             .await;
     }
-    let _ = dp_mst_mgr::write_payload(aux, payload.vcpi, payload.start, 0).await;
+    if connected {
+        let _ = dp_mst_mgr::write_payload(aux, payload.vcpi, payload.start, 0).await;
+    }
     link.payloads.remove(index);
     source.allocation(&table(&link.payloads)).await?;
-    let _ = act_handled(aux).await;
+    if connected {
+        let _ = act_handled(aux).await;
+    }
     for p in link.payloads.iter_mut().filter(|p| p.start > payload.start) {
         p.start -= payload.slots;
     }
@@ -278,25 +293,19 @@ impl ColdBoot {
         let path = self.dp_phy_path(port)?;
         Ok((path.aux.ok_or(MstFailure::Invalid)?, path.transmitter))
     }
-    /// drm_dp_mst_topology_mgr_set_mst(true) on the port, then the probe.
+    /// Start once, or reprobe a dirty session after its streams stop. Clean
+    /// sessions retain their topology and connector slots without AUX traffic.
     pub async fn start_display_mst(&mut self, port: usize) -> Result<Topology, MstFailure> {
         let (instance, _) = self.mst_path(port)?;
-        let mut link = self.mst.remove(&port).unwrap_or_default();
+        // Keep the session in its owner across every await, including failure
+        // and cancellation. Re-entering an incomplete probe is refused.
+        let link = self.mst.entry(port).or_default();
         let mut aux = DmubAux {
             dmub: &mut self.sequence.backend.dmub,
             instance,
         };
-        let result = async {
-            let mut dpcd = [0u8; 16];
-            aux.read(0, &mut dpcd).await.map_err(MstError::Aux)?;
-            link.manager.start(&mut aux, &dpcd).await?;
-            link.topology = link.manager.probe(&mut aux).await?;
-            link.payloads.clear();
-            Ok::<_, MstFailure>(link.topology.clone())
-        }
-        .await;
-        self.mst.insert(port, link);
-        result
+        link.prepare(&mut aux).await?;
+        Ok(link.topology.clone())
     }
     /// Whether DP `port`'s sink is an MST branch (DPCD 1.2 and MSTM_CAP),
     /// which Linux drives in MST mode (dc_connection_mst_branch).
@@ -317,6 +326,34 @@ impl ColdBoot {
     pub fn display_mst(&self, port: usize) -> Option<&MstLink> {
         self.mst.get(&port)
     }
+    /// Service and coalesce downstream connection changes, preserving the old
+    /// topology until the platform has retired its streams. Drain before and
+    /// after polling so a full queue cannot block down-transaction progress.
+    pub async fn service_display_mst(&mut self, port: usize) -> Result<bool, MstFailure> {
+        self.mst
+            .get_mut(&port)
+            .ok_or(MstFailure::Invalid)?
+            .consume_events();
+        let result = self.poll_display_mst(port).await;
+        let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
+        link.consume_events();
+        result?;
+        Ok(link.dirty)
+    }
+    /// Forget a physically removed branch only after its last stream stops.
+    /// No AUX access is made to the absent device.
+    pub fn forget_unplugged_display_mst(&mut self, port: usize) -> Result<(), MstFailure> {
+        if self.display_hpd(port) != Ok(false)
+            || self
+                .mst
+                .get(&port)
+                .is_some_and(|l| l.owner.is_some() || !l.payloads.is_empty())
+        {
+            return Err(MstFailure::Invalid);
+        }
+        self.mst.remove(&port);
+        Ok(())
+    }
     /// Service a connected branch's idle up requests over DMUB AUX. Complete
     /// notifications remain in `display_mst(port).manager.events`; the caller
     /// drains them with `take_display_mst_events` before the queue fills.
@@ -324,6 +361,9 @@ impl ColdBoot {
     pub async fn poll_display_mst(&mut self, port: usize) -> Result<usize, MstFailure> {
         let (instance, _) = self.mst_path(port)?;
         let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
+        if link.state != ProbeState::Ready {
+            return Err(MstFailure::Invalid);
+        }
         let mut aux = DmubAux {
             dmub: &mut self.sequence.backend.dmub,
             instance,
@@ -351,19 +391,7 @@ impl ColdBoot {
             dmub: &mut self.sequence.backend.dmub,
             instance,
         };
-        let first = link
-            .manager
-            .read_edid_block(&mut aux, &link.topology, sink, 0)
-            .await?;
-        let mut edid = first.to_vec();
-        for block in 1..=first[126] {
-            let b = link
-                .manager
-                .read_edid_block(&mut aux, &link.topology, sink, block)
-                .await?;
-            edid.extend_from_slice(&b);
-        }
-        Ok(edid)
+        topology::read_edid(&mut link.manager, &mut aux, &link.topology, sink).await
     }
     /// Add DIO stream `stream`'s payload for `sink` (`add_payload`).
     /// # Safety
@@ -398,6 +426,7 @@ impl ColdBoot {
         port: usize,
         stream: u8,
     ) -> Result<(), MstFailure> {
+        let connected = self.display_hpd(port) != Ok(false);
         let (instance, transmitter) = self.mst_path(port)?;
         let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
         let mut aux = DmubAux {
@@ -408,10 +437,18 @@ impl ColdBoot {
             otg: self.otg.as_mut().map_err(|e| *e)?,
             transmitter,
         };
-        remove_payload(link, &mut aux, &mut source, stream).await
+        remove_payload(link, &mut aux, &mut source, stream, connected).await
     }
     /// drm_dp_mst_topology_mgr_set_mst(false), the port's MST state dropped.
+    /// A session with a source owner or retained payloads is left untouched.
     pub async fn stop_display_mst(&mut self, port: usize) {
+        if self
+            .mst
+            .get(&port)
+            .is_some_and(|l| l.owner.is_some() || !l.payloads.is_empty())
+        {
+            return;
+        }
         let Ok((instance, _)) = self.mst_path(port) else {
             return;
         };
@@ -542,12 +579,13 @@ pub(super) fn select_mst_outputs(
 
 impl ColdBoot {
     /// Light the end devices behind DP `port`'s MST branch (`select_mst`),
-    /// device k on `pipes[k]` (its display slot too), skipping None, as one
+    /// stable output k on `pipes[k]` (its display slot too), skipping None, as one
     /// configuration like `modeset_displays`: MST started and the topology
     /// probed, each device's EDID read, the admitted streams' clocks
     /// programmed, then each stream lit: the first trains the port's MST
     /// link, the others attach to it, and each adds its payload before its
-    /// video starts. `want(k)` is the timing asked of device k.
+    /// video starts. `want(k)` is the timing asked of output k. An empty
+    /// configuration keeps the manager enabled for downstream hotplug.
     /// # Safety
     /// As for `modeset_displays`.
     pub async unsafe fn modeset_mst_displays(
@@ -568,6 +606,32 @@ impl ColdBoot {
         {
             return Err(ModesetError::Display(otg::Error::Invalid));
         }
+        self.start_display_mst(port).await?;
+        let link = self.mst.get(&port).ok_or(MstFailure::Invalid)?;
+        let mut devices = Vec::new();
+        let mut slots = Vec::new();
+        for (k, output) in link.outputs.iter().enumerate() {
+            if let Some(o) = output {
+                if let Some(sink) = o.sink {
+                    devices.push((
+                        sink,
+                        o.edid.clone(),
+                        link.topology.port(sink).map_or(0, |p| p.available_pbn),
+                    ));
+                    slots.push(k);
+                }
+            }
+        }
+        let assigned: Vec<_> = slots
+            .iter()
+            .map(|&k| pipes.get(k).copied().flatten())
+            .collect();
+        if assigned.iter().all(Option::is_none) {
+            return Ok(Configuration {
+                displays: Vec::new(),
+                failed: None,
+            });
+        }
         let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
         let path = *self
             .display_paths()
@@ -580,24 +644,15 @@ impl ColdBoot {
             .and_then(|p| p.sink.as_ref().ok())
             .and_then(|sink| modeset::dp_caps(&path, sink))
             .ok_or(ModesetError::NoSink)?;
-        let topology = self.start_display_mst(port).await?;
-        let mut devices = Vec::new();
-        for sink in topology.sinks().into_iter().take(pipes.len()) {
-            let available = topology.port(sink).map_or(0, |p| p.available_pbn);
-            // A device whose EDID can't be read stays dark.
-            let edid = self
-                .read_display_mst_edid(port, sink)
-                .await
-                .unwrap_or_default();
-            devices.push((sink, edid, available));
-        }
         let (mut selections, pipes): (Vec<_>, Vec<_>) =
-            select_mst_outputs(port, caps, &devices, &want, pipes)
+            select_mst_outputs(port, caps, &devices, &|k| want(slots[k]), &assigned)
                 .into_iter()
                 .unzip();
         if selections.is_empty() {
-            self.stop_display_mst(port).await;
-            return Err(ModesetError::NoSink);
+            return Ok(Configuration {
+                displays: Vec::new(),
+                failed: None,
+            });
         }
         let limited = modeset::limited_range(modeset::broadcast_rgb());
         for s in &mut selections {
@@ -693,7 +748,8 @@ impl ColdBoot {
     /// scanout stopped: video, the payload, the frontend; then an attached
     /// display detaches, while the link's owner hands the link to a
     /// remaining stream's display or, the last, stops the link (without
-    /// addressing an `unplugged` sink) and MST.
+    /// addressing an `unplugged` sink). A connected root keeps its manager
+    /// and connector reservations even after the last stream stops.
     /// # Safety
     /// As for `stop_modeset`.
     pub(super) async unsafe fn stop_mst_stream(
@@ -735,7 +791,12 @@ impl ColdBoot {
                 self.stop_display_dp_link(port).await?;
             }
         }
-        self.stop_display_mst(port).await;
+        if let Some(link) = self.mst.get_mut(&port) {
+            link.owner = None;
+        }
+        if unplugged {
+            self.forget_unplugged_display_mst(port)?;
+        }
         Ok(())
     }
 }

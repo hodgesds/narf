@@ -119,9 +119,10 @@ impl super::super::super::dp_phy::Firmware for Link {
     ) -> Result<(), dmub::Error> {
         self.fw.command(path, Some(settings)).await
     }
-    async fn disable(&mut self, path: inventory::Path, _mst: bool) -> Result<(), dmub::Error> {
-        // Sink D3 before native transmitter disable, unless the sink left.
-        assert!(self.unplugged || self.bytes[&0x600] == 2);
+    async fn disable(&mut self, path: inventory::Path, mst: bool) -> Result<(), dmub::Error> {
+        // Trained MST roots may remain in D0; PHY-only fixtures have not
+        // trained yet and still leave the sink in D3.
+        assert!(self.unplugged || self.bytes[&0x600] == 2 || (mst && self.bytes[&0x600] == 1));
         self.fw.command(path, None).await
     }
 }
@@ -1020,4 +1021,26 @@ fn dcn401_mst_allocation_programs_sat_and_vc_rate_like_linux() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_mst_allocation_programs_sat_and_vc_rate_like_linux
+);
+
+fn dcn401_mst_last_stream_keeps_root_powered() -> TestResult {
+    let (mut e, mut io) = fixture_mode(1, 4, LinkRate::Hbr2, TrainingPattern::Tps3, true);
+    run(e.train_dp_link(&mut io, path(1), true, false)).unwrap();
+    io.events.clear();
+    run(e.stop_dp_link(&mut io, path(1))).unwrap();
+    if e.status.state != State::DpPhyDisabled
+        || io.bytes[&0x600] != 1
+        || io.bytes[&0x111] != 7
+        || io
+            .events
+            .iter()
+            .any(|ev| matches!(ev, Event::Aux(0x80, 0x600, _) | Event::Aux(0x80, 0x111, _)))
+    {
+        return TestResult::Fail("last MST stream disabled notifications or root power");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_mst_last_stream_keeps_root_powered
 );

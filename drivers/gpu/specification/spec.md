@@ -1161,10 +1161,16 @@ whenever the console adopted exactly the published scanout.
 
 Native 8b/10b MST uses `dp_mst_mgr::Manager` over the port's DMUB AUX channel.
 `ColdBoot::display_mst_capable(port)` checks DPCD revision and MSTM_CAP before
-the platform chooses MST. `start_display_mst` enables MST/up requests, clears
-payload tables and probes LINK_ADDRESS/ENUM_PATH_RESOURCES depth first;
+the platform chooses MST. `start_display_mst` requests/acknowledges receiver
+D0 even for empty branches, enables MST/up requests and clears payload tables
+once, then probes LINK_ADDRESS/ENUM_PATH_RESOURCES depth first;
 `read_display_mst_edid` reads end-device EDIDs through REMOTE_I2C_READ. The
-probe uses an explicit stack so its future can run in the display monitor.
+probe uses an explicit stack so its future can run in the display monitor,
+bounded to 15 route levels and 64 branches. Clean sessions reuse the snapshot;
+dirty sessions can reprobe only after every source owner and payload retires.
+The previous snapshot remains available until probe/EDID completion. An
+incomplete or cancelled probe retains the session and refuses replay until
+physical removal or explicit streamless manager shutdown.
 
 `Manager::poll_up_requests` reads at most eight ready up-request chunks per
 call without waiting for a new notification. It acknowledges only
@@ -1177,24 +1183,41 @@ Down transactions still consume their own replies while that queue is full.
 Truncated bodies fail instead of manufacturing zero-filled status fields.
 An event survives failure to send its sideband ACK after ESI acknowledgement.
 `ColdBoot::poll_display_mst(port)` and `take_display_mst_events(port)` expose
-this service over DMUB AUX. They do not replace the live topology or payload
-identities; applying these events in the platform monitor remains separate.
+this service over DMUB AUX. `service_display_mst` drains before/after polling
+and marks known-branch/known-port connection notifications for reprobe. The
+monitor stops all streams using their old routes, reprobes, then relights the
+enabled outputs. Notifications received during reprobe remain queued for the
+next pass. Unknown branch/port notices are ignored; resource-status notices
+are acknowledged but do not yet drive bandwidth reallocation.
+
+`MstLink::outputs` reserves four stable slots. `MstOutputId` includes root
+GUID, branch GUID, LCT/RAD and output port; probe vector indices are never
+connector identities. Surviving identities claim their old slots before new
+devices are admitted. Disconnected slots retain their requests for replug;
+new devices use empty slots first, then reclaim absent reservations if full.
+Reassignment resets old DRM requests. Replug of the same endpoint preserves
+CRTC disable; changed EDIDs (including extensions) invalidate cached modes.
 
 `unsafe ColdBoot::modeset_mst_displays(port, fill, want, pipes)` lights one
 branch's sinks with joint DML admission, 8-bpc RGB and the maximum supported
-8b/10b link. `pipes[k]: Option<u8>` assigns topology device k to a distinct
+8b/10b link. `pipes[k]: Option<u8>` assigns stable output k to a distinct
 display/pipe, or disables it. Disabled, unreadable and unadmitted devices
 leave gaps; their successors never inherit their CRTC or requested mode.
 Each payload must fit the remaining 63 slots and the end port's available
 PBN. Add orders the DPCD payload table, source SAT/ACT, ACT handled,
 ALLOCATE_PAYLOAD and stream VC rate before video. Remove zeroes the VC rate,
-deallocates remotely, updates SAT/ACT and compacts later payload slots.
+deallocates remotely, updates SAT/ACT and compacts later payload slots. Physical
+root removal skips all remote AUX transactions and waits during removal.
 
 The first display trains the link; the others attach and own their own
 DIG_FE_MODE=5 frontend selections. When the link owner stops its frontend,
 `hand_over_mst_link` transfers ownership to a remaining attached display.
-Only the last display stops the PHY and MST manager. Source verification
-accepts sibling routes being released while still rejecting unowned frontend
+Only the last display stops the PHY; a connected root stays in D0 with its
+MST manager enabled, including all-off and empty configurations. Physical
+removal drops the manager after its last source owner/payload retires;
+`forget_unplugged_display_mst` checks HPD low and performs no AUX access.
+Explicit `stop_display_mst` refuses to drop a live owner or payload.
+Source verification accepts sibling routes being released while still rejecting unowned frontend
 selections. Failed transitions retain their owners and allocations.
 
 The platform chooses the first connected MST branch and dedicates four KMS
@@ -1202,9 +1225,13 @@ outputs to its end devices, leaving other board ports dark. Output k uses
 pipe/CRTC k; an all-off DRM configuration keeps those identities and requests
 while the branch remains connected. Removing the branch restores board-port
 outputs. Shared-link loss stops and relights the whole configuration instead
-of invoking the SST retrain path. Downstream hotplug notifications, stable
-identities across topology changes, simultaneous MST/SST ports, UHBR MST,
-DSC and audio on MST remain unsupported. This path is model-tested only.
+of invoking the SST retrain path. Downstream changes use the same whole-link
+stop/reprobe/relight sequence, so other streams briefly blank. KMS can publish
+a newly discovered EDID as connected with its CRTC off, without advertising
+unadmitted modes (`amdgpu_navi48_kms::Output::edid`). New monitor modes are
+still admitted when an enabled output is lit; independent mode admission for
+disabled connectors remains open. Simultaneous MST/SST ports, UHBR MST, DSC
+and audio on MST remain unsupported. This path is model-tested only.
 
 `unsafe ColdBoot::retire_inherited_display` retires the legacy DP SST output
 the firmware left running. It runs in native dependency order:
@@ -1671,8 +1698,9 @@ Success enters `DpLinkTrained(transmitter)` and records historical
 drive levels, downspread and CR/EQ attempt counts. It blocks general owner,
 clock and raw-mailbox reuse; all frontends, video and scanout remain stopped.
 `unsafe ColdBoot::stop_display_dp_link(port).await` and its platform wrapper
-accept only this matching streamless trained state. Sink D3 acknowledgement
-precedes firmware PHY disable, independent backend/lane/TX-clock-off waits and
+accept only this matching streamless trained state. SST sink D3 acknowledgement
+precedes firmware PHY disable; idle MST roots retain D0 for notifications.
+Independent backend/lane/TX-clock-off waits and
 native training/panel cleanup. Success returns to reusable `DpPhyDisabled`,
 preserving historical training records without releasing memory. Failure enters
 `Failed`; cancellation retains `TrainingDp` or `StoppingDpLink`. Both retain

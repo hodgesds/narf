@@ -657,12 +657,19 @@ joint mode admission and per-stream payload allocation. Disabling the display
 that trained the link transfers ownership to a surviving stream; only the
 last stops the PHY. Disabled, unreadable or unadmitted devices leave output
 gaps, and switching every CRTC off keeps them off. Shared-link loss relights
-the configuration. Downstream hotplug, topology-stable connector identities,
-mixed MST/SST, UHBR MST and MST audio/DSC remain open; no physical validation.
+the configuration. Downstream hotplug now stops payloads using the old routes,
+reprobes and relights, retaining output slots by root/branch GUID, route and
+port across branch reordering and removal/replug. All-off and empty branches
+keep their managers enabled; physical removal drops them without AUX waits.
+Changed EDIDs invalidate stale modes, and new disabled monitors can publish
+their EDID as connected without unadmitted modes. Independent mode admission
+while disabled, mixed MST/SST, resource-notification bandwidth updates, UHBR
+MST and MST audio/DSC remain open; no physical validation.
 The MST manager now also exposes bounded idle notification polling over
 DMUB AUX, retains fragmented messages across transaction/poll boundaries and
-applies queue backpressure. Wiring those events to topology reconciliation
-and connector updates is the next hotplug step.
+applies queue backpressure. Connection notices drive topology reconciliation
+in the display monitor. Probes have depth/branch limits and retain incomplete
+sessions after cancellation instead of allowing replay.
 
 Still open: physical MSI delivery verification, queue reset and fault-source
 re-arming after containment, GC12 rendering and shader
