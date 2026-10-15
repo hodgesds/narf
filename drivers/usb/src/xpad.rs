@@ -29,7 +29,15 @@
 
 #![allow(dead_code)]
 
+use narf_input::evdev::DeviceCaps;
 use narf_input::{abs, btn, push_global, AbsoluteEvent, ButtonEvent, InputEvent};
+extern crate alloc;
+use crate::hid::HidError;
+use crate::xhci::{EndpointConfig, EndpointKind, Xhci};
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
+use narf_lib::sync::IrqSafeSpinLock;
 
 // ── Mapping flags (xpad.c:80–86) ─────────────────────────────────────
 
@@ -105,6 +113,26 @@ pub const GIP_MOTOR_L: u8 = 1 << 1;
 pub const GIP_MOTOR_RT: u8 = 1 << 2;
 pub const GIP_MOTOR_LT: u8 = 1 << 3;
 pub const GIP_MOTOR_ALL: u8 = GIP_MOTOR_R | GIP_MOTOR_L | GIP_MOTOR_RT | GIP_MOTOR_LT;
+
+// ── Bound device record ───────────────────────────────────────────────
+
+/// Represents an active, bound Xbox-compatible controller.
+#[derive(Debug)]
+pub struct XpadBoundDevice {
+    pub slot_id: u8,
+    pub interrupt_in_dci: u8,
+    pub interrupt_out_dci: Option<u8>,
+    pub interface_num: u8,
+    pub xtype: u8,
+    pub mapping: u8,
+    pub receiver: IrqSafeSpinLock<Option<WirelessReceiver>>,
+    pub evdev_id: narf_input::evdev::DeviceId,
+    pub evdev_node: Arc<narf_input::evdev::DeviceNode>,
+}
+
+/// Global registry of bound xpad devices.
+pub static XPAD_DEVICES_BOUND: IrqSafeSpinLock<Vec<Arc<XpadBoundDevice>>> =
+    IrqSafeSpinLock::new(Vec::new());
 
 // ── Device-ID table ───────────────────────────────────────────────────
 
@@ -1074,18 +1102,59 @@ impl WirelessReceiver {
     }
 }
 
+/// Create standard Xbox gamepad evdev capabilities.
+pub fn xpad_evdev_caps() -> DeviceCaps {
+    let mut caps = DeviceCaps::new();
+
+    // Buttons
+    caps.add_key(btn::BTN_SOUTH); // A
+    caps.add_key(btn::BTN_EAST); // B
+    caps.add_key(btn::BTN_NORTH); // X
+    caps.add_key(btn::BTN_WEST); // Y
+    caps.add_key(btn::BTN_C); // Black
+    caps.add_key(btn::BTN_Z); // White
+    caps.add_key(btn::BTN_TL);
+    caps.add_key(btn::BTN_TR);
+    caps.add_key(btn::BTN_TL2);
+    caps.add_key(btn::BTN_TR2);
+    caps.add_key(btn::BTN_START);
+    caps.add_key(btn::BTN_SELECT);
+    caps.add_key(btn::BTN_MODE);
+    caps.add_key(btn::BTN_THUMBL);
+    caps.add_key(btn::BTN_THUMBR);
+
+    caps.add_key(btn::BTN_DPAD_UP);
+    caps.add_key(btn::BTN_DPAD_DOWN);
+    caps.add_key(btn::BTN_DPAD_LEFT);
+    caps.add_key(btn::BTN_DPAD_RIGHT);
+
+    // Axes
+    caps.add_abs(abs::ABS_X);
+    caps.add_abs(abs::ABS_Y);
+    caps.add_abs(abs::ABS_Z);
+    caps.add_abs(abs::ABS_RX);
+    caps.add_abs(abs::ABS_RY);
+    caps.add_abs(abs::ABS_RZ);
+    caps.add_abs(abs::ABS_HAT0X);
+    caps.add_abs(abs::ABS_HAT0Y);
+
+    caps
+}
+
 // ── Packet decode ─────────────────────────────────────────────────────
 
 /// Emit a button event onto the global input ring.
 #[inline(always)]
-fn emit_btn(code: u16, pressed: bool) {
+fn emit_btn(code: u16, pressed: bool, node: &narf_input::evdev::DeviceNode) {
     push_global(InputEvent::Button(ButtonEvent { code, pressed }));
+    narf_input::evdev::dispatch_key_to_node(node, code, pressed);
 }
 
 /// Emit an absolute-axis event onto the global input ring.
 #[inline(always)]
-fn emit_abs(axis: u16, value: i32) {
+fn emit_abs(axis: u16, value: i32, node: &narf_input::evdev::DeviceNode) {
     push_global(InputEvent::Absolute(AbsoluteEvent { axis, value }));
+    narf_input::evdev::dispatch_abs_to_node(node, axis, value);
 }
 
 /// Read a little-endian i16 from a byte slice at the given offset.
@@ -1123,56 +1192,57 @@ fn read_le_u16(data: &[u8], offset: usize) -> u16 {
 ///   [4] A, [5] B, [6] X, [7] Y (analog 0–255 → treated as digital)
 ///   [8] Black, [9] White (analog)
 /// ```
-pub fn xpad_process_packet(data: &[u8], mapping: u8) {
+pub fn xpad_process_packet(data: &[u8], mapping: u8, node: &narf_input::evdev::DeviceNode) {
     if data.len() < 20 {
         return;
     }
 
     // Sticks — xpad.c:826–836
     if mapping & MAP_STICKS_TO_NULL == 0 {
-        emit_abs(abs::ABS_X, read_le_i16(data, 12) as i32);
-        emit_abs(abs::ABS_Y, !(read_le_i16(data, 14) as i32)); // inverted
-        emit_abs(abs::ABS_RX, read_le_i16(data, 16) as i32);
-        emit_abs(abs::ABS_RY, !(read_le_i16(data, 18) as i32)); // inverted
+        emit_abs(abs::ABS_X, read_le_i16(data, 12) as i32, node);
+        emit_abs(abs::ABS_Y, !(read_le_i16(data, 14) as i32), node); // inverted
+        emit_abs(abs::ABS_RX, read_le_i16(data, 16) as i32, node);
+        emit_abs(abs::ABS_RY, !(read_le_i16(data, 18) as i32), node); // inverted
     }
 
     // Triggers — xpad.c:839–845
     if mapping & MAP_TRIGGERS_TO_BUTTONS != 0 {
-        emit_btn(btn::BTN_TL2, data[10] != 0);
-        emit_btn(btn::BTN_TR2, data[11] != 0);
+        emit_btn(btn::BTN_TL2, data[10] != 0, node);
+        emit_btn(btn::BTN_TR2, data[11] != 0, node);
     } else {
-        emit_abs(abs::ABS_Z, data[10] as i32);
-        emit_abs(abs::ABS_RZ, data[11] as i32);
+        emit_abs(abs::ABS_Z, data[10] as i32, node);
+        emit_abs(abs::ABS_RZ, data[11] as i32, node);
     }
 
     // D-Pad — xpad.c:848–858
     if mapping & MAP_DPAD_TO_BUTTONS != 0 {
-        emit_btn(btn::BTN_DPAD_LEFT, data[2] & (1 << 2) != 0);
-        emit_btn(btn::BTN_DPAD_RIGHT, data[2] & (1 << 3) != 0);
-        emit_btn(btn::BTN_DPAD_UP, data[2] & (1 << 0) != 0);
-        emit_btn(btn::BTN_DPAD_DOWN, data[2] & (1 << 1) != 0);
+        emit_btn(btn::BTN_DPAD_LEFT, data[2] & (1 << 2) != 0, node);
+        emit_btn(btn::BTN_DPAD_RIGHT, data[2] & (1 << 3) != 0, node);
+        emit_btn(btn::BTN_DPAD_UP, data[2] & (1 << 0) != 0, node);
+        emit_btn(btn::BTN_DPAD_DOWN, data[2] & (1 << 1) != 0, node);
     } else {
         let hat_x = (data[2] & 0x08 != 0) as i32 - (data[2] & 0x04 != 0) as i32;
         let hat_y = (data[2] & 0x02 != 0) as i32 - (data[2] & 0x01 != 0) as i32;
-        emit_abs(abs::ABS_HAT0X, hat_x);
-        emit_abs(abs::ABS_HAT0Y, hat_y);
+        emit_abs(abs::ABS_HAT0X, hat_x, node);
+        emit_abs(abs::ABS_HAT0Y, hat_y, node);
     }
 
     // Start / Back / Thumb — xpad.c:862–865
-    emit_btn(btn::BTN_START, data[2] & (1 << 4) != 0);
-    emit_btn(btn::BTN_SELECT, data[2] & (1 << 5) != 0);
-    emit_btn(btn::BTN_THUMBL, data[2] & (1 << 6) != 0);
-    emit_btn(btn::BTN_THUMBR, data[2] & (1 << 7) != 0);
+    emit_btn(btn::BTN_START, data[2] & (1 << 4) != 0, node);
+    emit_btn(btn::BTN_SELECT, data[2] & (1 << 5) != 0, node);
+    emit_btn(btn::BTN_THUMBL, data[2] & (1 << 6) != 0, node);
+    emit_btn(btn::BTN_THUMBR, data[2] & (1 << 7) != 0, node);
 
     // A/B/X/Y (analog treated as digital) — xpad.c:868–875
-    emit_btn(btn::BTN_SOUTH, data[4] != 0); // A
-    emit_btn(btn::BTN_EAST, data[5] != 0); // B
-    emit_btn(btn::BTN_NORTH, data[6] != 0); // X
-    emit_btn(btn::BTN_WEST, data[7] != 0); // Y
+    emit_btn(btn::BTN_SOUTH, data[4] != 0, node); // A
+    emit_btn(btn::BTN_EAST, data[5] != 0, node); // B
+    emit_btn(btn::BTN_NORTH, data[6] != 0, node); // X
+    emit_btn(btn::BTN_WEST, data[7] != 0, node); // Y
 
     // Black / White — xpad.c:873–875
-    emit_btn(btn::BTN_C, data[8] != 0); // Black
-    emit_btn(btn::BTN_Z, data[9] != 0); // White
+    emit_btn(btn::BTN_C, data[8] != 0, node); // Black
+    emit_btn(btn::BTN_Z, data[9] != 0, node); // White
+    narf_input::evdev::dispatch_syn_report_to_node(node);
 }
 
 /// Decode an Xbox 360 wired controller 20-byte report.
@@ -1193,7 +1263,12 @@ pub fn xpad_process_packet(data: &[u8], mapping: u8) {
 ///   [12..13] RY (i16 LE, inverted)
 ///   [14..19] reserved
 /// ```
-pub fn xpad360_process_packet(data: &[u8], mapping: u8, is_wireless: bool) {
+pub fn xpad360_process_packet(
+    data: &[u8],
+    mapping: u8,
+    is_wireless: bool,
+    node: &narf_input::evdev::DeviceNode,
+) {
     if data.len() < 14 {
         return;
     }
@@ -1204,49 +1279,50 @@ pub fn xpad360_process_packet(data: &[u8], mapping: u8, is_wireless: bool) {
 
     // D-Pad — xpad.c:899–918
     if mapping & MAP_DPAD_TO_BUTTONS != 0 {
-        emit_btn(btn::BTN_DPAD_LEFT, data[2] & (1 << 2) != 0);
-        emit_btn(btn::BTN_DPAD_RIGHT, data[2] & (1 << 3) != 0);
-        emit_btn(btn::BTN_DPAD_UP, data[2] & (1 << 0) != 0);
-        emit_btn(btn::BTN_DPAD_DOWN, data[2] & (1 << 1) != 0);
+        emit_btn(btn::BTN_DPAD_LEFT, data[2] & (1 << 2) != 0, node);
+        emit_btn(btn::BTN_DPAD_RIGHT, data[2] & (1 << 3) != 0, node);
+        emit_btn(btn::BTN_DPAD_UP, data[2] & (1 << 0) != 0, node);
+        emit_btn(btn::BTN_DPAD_DOWN, data[2] & (1 << 1) != 0, node);
     }
     // Always emit hat for 360W or when not dpad-as-buttons — xpad.c:913–918
     if mapping & MAP_DPAD_TO_BUTTONS == 0 || is_wireless {
         let hat_x = (data[2] & 0x08 != 0) as i32 - (data[2] & 0x04 != 0) as i32;
         let hat_y = (data[2] & 0x02 != 0) as i32 - (data[2] & 0x01 != 0) as i32;
-        emit_abs(abs::ABS_HAT0X, hat_x);
-        emit_abs(abs::ABS_HAT0Y, hat_y);
+        emit_abs(abs::ABS_HAT0X, hat_x, node);
+        emit_abs(abs::ABS_HAT0Y, hat_y, node);
     }
 
     // Start / Back / Thumb — xpad.c:922–927
-    emit_btn(btn::BTN_START, data[2] & (1 << 4) != 0);
-    emit_btn(btn::BTN_SELECT, data[2] & (1 << 5) != 0);
-    emit_btn(btn::BTN_THUMBL, data[2] & (1 << 6) != 0);
-    emit_btn(btn::BTN_THUMBR, data[2] & (1 << 7) != 0);
+    emit_btn(btn::BTN_START, data[2] & (1 << 4) != 0, node);
+    emit_btn(btn::BTN_SELECT, data[2] & (1 << 5) != 0, node);
+    emit_btn(btn::BTN_THUMBL, data[2] & (1 << 6) != 0, node);
+    emit_btn(btn::BTN_THUMBR, data[2] & (1 << 7) != 0, node);
 
     // A/B/X/Y/LB/RB/Guide — xpad.c:930–936
-    emit_btn(btn::BTN_SOUTH, data[3] & (1 << 4) != 0); // A
-    emit_btn(btn::BTN_EAST, data[3] & (1 << 5) != 0); // B
-    emit_btn(btn::BTN_NORTH, data[3] & (1 << 6) != 0); // X
-    emit_btn(btn::BTN_WEST, data[3] & (1 << 7) != 0); // Y
-    emit_btn(btn::BTN_TL, data[3] & (1 << 0) != 0); // LB
-    emit_btn(btn::BTN_TR, data[3] & (1 << 1) != 0); // RB
-    emit_btn(btn::BTN_MODE, data[3] & (1 << 2) != 0); // Guide
+    emit_btn(btn::BTN_SOUTH, data[3] & (1 << 4) != 0, node); // A
+    emit_btn(btn::BTN_EAST, data[3] & (1 << 5) != 0, node); // B
+    emit_btn(btn::BTN_NORTH, data[3] & (1 << 6) != 0, node); // X
+    emit_btn(btn::BTN_WEST, data[3] & (1 << 7) != 0, node); // Y
+    emit_btn(btn::BTN_TL, data[3] & (1 << 0) != 0, node); // LB
+    emit_btn(btn::BTN_TR, data[3] & (1 << 1) != 0, node); // RB
+    emit_btn(btn::BTN_MODE, data[3] & (1 << 2) != 0, node); // Guide
+    narf_input::evdev::dispatch_syn_report_to_node(node);
 
     // Sticks — xpad.c:938–950
     if mapping & MAP_STICKS_TO_NULL == 0 {
-        emit_abs(abs::ABS_X, read_le_i16(data, 6) as i32);
-        emit_abs(abs::ABS_Y, !read_le_i16(data, 8) as i32); // inverted
-        emit_abs(abs::ABS_RX, read_le_i16(data, 10) as i32);
-        emit_abs(abs::ABS_RY, !read_le_i16(data, 12) as i32); // inverted
+        emit_abs(abs::ABS_X, read_le_i16(data, 6) as i32, node);
+        emit_abs(abs::ABS_Y, !read_le_i16(data, 8) as i32, node); // inverted
+        emit_abs(abs::ABS_RX, read_le_i16(data, 10) as i32, node);
+        emit_abs(abs::ABS_RY, !read_le_i16(data, 12) as i32, node); // inverted
     }
 
     // Triggers — xpad.c:953–959
     if mapping & MAP_TRIGGERS_TO_BUTTONS != 0 {
-        emit_btn(btn::BTN_TL2, data[4] != 0);
-        emit_btn(btn::BTN_TR2, data[5] != 0);
+        emit_btn(btn::BTN_TL2, data[4] != 0, node);
+        emit_btn(btn::BTN_TR2, data[5] != 0, node);
     } else {
-        emit_abs(abs::ABS_Z, data[4] as i32);
-        emit_abs(abs::ABS_RZ, data[5] as i32);
+        emit_abs(abs::ABS_Z, data[4] as i32, node);
+        emit_abs(abs::ABS_RZ, data[5] as i32, node);
     }
 }
 
@@ -1280,6 +1356,7 @@ pub fn xpad360w_process_packet(
     slot: usize,
     data: &[u8],
     mapping: u8,
+    node: &narf_input::evdev::DeviceNode,
 ) -> WirelessResult {
     if data.len() < 2 {
         return WirelessResult::NotData;
@@ -1301,7 +1378,7 @@ pub fn xpad360w_process_packet(
     }
 
     if data.len() >= 4 + 14 {
-        xpad360_process_packet(&data[4..], mapping, true);
+        xpad360_process_packet(&data[4..], mapping, true, node);
     }
     WirelessResult::DataDecoded
 }
@@ -1325,7 +1402,12 @@ pub fn xpad360w_process_packet(
 ///   data[14..15] RX (i16 LE)
 ///   data[16..17] RY (i16 LE, inverted)
 /// ```
-pub fn xpadone_process_packet(data: &[u8], len: usize, mapping: u8) {
+pub fn xpadone_process_packet(
+    data: &[u8],
+    len: usize,
+    mapping: u8,
+    node: &narf_input::evdev::DeviceNode,
+) {
     if data.is_empty() {
         return;
     }
@@ -1334,7 +1416,8 @@ pub fn xpadone_process_packet(data: &[u8], len: usize, mapping: u8) {
         GIP_CMD_VIRTUAL_KEY => {
             // Guide button virtual-key report — xpad.c:1062–1073
             if data.len() >= 5 {
-                emit_btn(btn::BTN_MODE, data[4] & 0x03 != 0);
+                emit_btn(btn::BTN_MODE, data[4] & 0x03 != 0, node);
+                narf_input::evdev::dispatch_syn_report_to_node(node);
             }
         }
         GIP_CMD_INPUT => {
@@ -1343,49 +1426,49 @@ pub fn xpadone_process_packet(data: &[u8], len: usize, mapping: u8) {
                 return;
             }
             // Menu / View — xpad.c:1105–1106
-            emit_btn(btn::BTN_START, data[4] & (1 << 2) != 0);
-            emit_btn(btn::BTN_SELECT, data[4] & (1 << 3) != 0);
+            emit_btn(btn::BTN_START, data[4] & (1 << 2) != 0, node);
+            emit_btn(btn::BTN_SELECT, data[4] & (1 << 3) != 0, node);
 
             // A / B / X / Y — xpad.c:1114–1118
-            emit_btn(btn::BTN_SOUTH, data[4] & (1 << 4) != 0); // A
-            emit_btn(btn::BTN_EAST, data[4] & (1 << 5) != 0); // B
-            emit_btn(btn::BTN_NORTH, data[4] & (1 << 6) != 0); // X
-            emit_btn(btn::BTN_WEST, data[4] & (1 << 7) != 0); // Y
+            emit_btn(btn::BTN_SOUTH, data[4] & (1 << 4) != 0, node); // A
+            emit_btn(btn::BTN_EAST, data[4] & (1 << 5) != 0, node); // B
+            emit_btn(btn::BTN_NORTH, data[4] & (1 << 6) != 0, node); // X
+            emit_btn(btn::BTN_WEST, data[4] & (1 << 7) != 0, node); // Y
 
             // D-Pad — xpad.c:1121–1132
             if mapping & MAP_DPAD_TO_BUTTONS != 0 {
-                emit_btn(btn::BTN_DPAD_LEFT, data[5] & (1 << 2) != 0);
-                emit_btn(btn::BTN_DPAD_RIGHT, data[5] & (1 << 3) != 0);
-                emit_btn(btn::BTN_DPAD_UP, data[5] & (1 << 0) != 0);
-                emit_btn(btn::BTN_DPAD_DOWN, data[5] & (1 << 1) != 0);
+                emit_btn(btn::BTN_DPAD_LEFT, data[5] & (1 << 2) != 0, node);
+                emit_btn(btn::BTN_DPAD_RIGHT, data[5] & (1 << 3) != 0, node);
+                emit_btn(btn::BTN_DPAD_UP, data[5] & (1 << 0) != 0, node);
+                emit_btn(btn::BTN_DPAD_DOWN, data[5] & (1 << 1) != 0, node);
             } else {
                 let hat_x = (data[5] & 0x08 != 0) as i32 - (data[5] & 0x04 != 0) as i32;
                 let hat_y = (data[5] & 0x02 != 0) as i32 - (data[5] & 0x01 != 0) as i32;
-                emit_abs(abs::ABS_HAT0X, hat_x);
-                emit_abs(abs::ABS_HAT0Y, hat_y);
+                emit_abs(abs::ABS_HAT0X, hat_x, node);
+                emit_abs(abs::ABS_HAT0Y, hat_y, node);
             }
 
             // LB / RB / ThL / ThR — xpad.c:1134–1140
-            emit_btn(btn::BTN_TL, data[5] & (1 << 4) != 0);
-            emit_btn(btn::BTN_TR, data[5] & (1 << 5) != 0);
-            emit_btn(btn::BTN_THUMBL, data[5] & (1 << 6) != 0);
-            emit_btn(btn::BTN_THUMBR, data[5] & (1 << 7) != 0);
+            emit_btn(btn::BTN_TL, data[5] & (1 << 4) != 0, node);
+            emit_btn(btn::BTN_TR, data[5] & (1 << 5) != 0, node);
+            emit_btn(btn::BTN_THUMBL, data[5] & (1 << 6) != 0, node);
+            emit_btn(btn::BTN_THUMBR, data[5] & (1 << 7) != 0, node);
 
             // Sticks — xpad.c:1142–1154
             if mapping & MAP_STICKS_TO_NULL == 0 {
-                emit_abs(abs::ABS_X, read_le_i16(data, 10) as i32);
-                emit_abs(abs::ABS_Y, !read_le_i16(data, 12) as i32); // inverted
-                emit_abs(abs::ABS_RX, read_le_i16(data, 14) as i32);
-                emit_abs(abs::ABS_RY, !read_le_i16(data, 16) as i32); // inverted
+                emit_abs(abs::ABS_X, read_le_i16(data, 10) as i32, node);
+                emit_abs(abs::ABS_Y, !read_le_i16(data, 12) as i32, node); // inverted
+                emit_abs(abs::ABS_RX, read_le_i16(data, 14) as i32, node);
+                emit_abs(abs::ABS_RY, !read_le_i16(data, 16) as i32, node); // inverted
             }
 
             // Triggers — xpad.c:1156–1167
             if mapping & MAP_TRIGGERS_TO_BUTTONS != 0 {
-                emit_btn(btn::BTN_TL2, read_le_u16(data, 6) != 0);
-                emit_btn(btn::BTN_TR2, read_le_u16(data, 8) != 0);
+                emit_btn(btn::BTN_TL2, read_le_u16(data, 6) != 0, node);
+                emit_btn(btn::BTN_TR2, read_le_u16(data, 8) != 0, node);
             } else {
-                emit_abs(abs::ABS_Z, read_le_u16(data, 6) as i32);
-                emit_abs(abs::ABS_RZ, read_le_u16(data, 8) as i32);
+                emit_abs(abs::ABS_Z, read_le_u16(data, 6) as i32, node);
+                emit_abs(abs::ABS_RZ, read_le_u16(data, 8) as i32, node);
             }
 
             // Share button (Xbox Series / some third-party) — xpad.c:1107–1112
@@ -1397,11 +1480,14 @@ pub fn xpadone_process_packet(data: &[u8], len: usize, mapping: u8) {
                 };
                 if off < data.len() {
                     // KEY_RECORD = 0x1D3; emit as a button code
-                    emit_btn(0x1D3, data[off] & 0x01 != 0);
+                    emit_btn(0x1D3, data[off] & 0x01 != 0, node);
                 }
             }
         }
         _ => {} // Announce/Firmware/Auth handled at probe level
+    }
+    if data[0] == GIP_CMD_INPUT {
+        narf_input::evdev::dispatch_syn_report_to_node(node);
     }
 }
 
@@ -1409,11 +1495,17 @@ pub fn xpadone_process_packet(data: &[u8], len: usize, mapping: u8) {
 ///
 /// `xtype` comes from the per-device `XpadDevice` entry or interface
 /// matching at probe time.
-pub fn process_packet(data: &[u8], xtype: u8, mapping: u8, len: usize) {
+pub fn process_packet(
+    data: &[u8],
+    xtype: u8,
+    mapping: u8,
+    len: usize,
+    node: &narf_input::evdev::DeviceNode,
+) {
     match xtype {
-        XTYPE_XBOX360 => xpad360_process_packet(data, mapping, false),
-        XTYPE_XBOXONE => xpadone_process_packet(data, len, mapping),
-        XTYPE_XBOX => xpad_process_packet(data, mapping),
+        XTYPE_XBOX360 => xpad360_process_packet(data, mapping, false, node),
+        XTYPE_XBOXONE => xpadone_process_packet(data, len, mapping, node),
+        XTYPE_XBOX => xpad_process_packet(data, mapping, node),
         // XTYPE_XBOX360W is handled at a higher level (wireless demux)
         _ => {}
     }
@@ -1608,7 +1700,9 @@ mod tests {
 
         // Push to a fresh ring and verify counts change
         narf_input::__reset_global_ring_for_test();
-        xpad360_process_packet(&data, 0, false);
+        let caps = super::xpad_evdev_caps();
+        let (_, node) = narf_input::evdev::ROUTER.register_device(caps);
+        xpad360_process_packet(&data, 0, false, &node);
         // We expect at least one A-button event and one trigger/abs event
         let mut found_a = false;
         let mut found_lt = false;
@@ -1652,7 +1746,9 @@ mod tests {
         let mut rx = WirelessReceiver::new();
         // data[0] bit3 set = presence change; data[1] bit7 = present
         let data = [0x08u8, 0x80, 0, 0, 0, 0];
-        let result = xpad360w_process_packet(&mut rx, 0, &data, 0);
+        let caps = super::xpad_evdev_caps();
+        let (_, node) = narf_input::evdev::ROUTER.register_device(caps);
+        let result = xpad360w_process_packet(&mut rx, 0, &data, 0, &node);
         match result {
             WirelessResult::PresenceChanged {
                 slot: 0,
@@ -1679,7 +1775,9 @@ mod tests {
         data[4] = 0x00; // inner[0] = type valid
         data[7] = 1 << 4; // inner[3] = A button
         narf_input::__reset_global_ring_for_test();
-        let result = xpad360w_process_packet(&mut rx, 1, &data, 0);
+        let caps = super::xpad_evdev_caps();
+        let (_, node) = narf_input::evdev::ROUTER.register_device(caps);
+        let result = xpad360w_process_packet(&mut rx, 1, &data, 0, &node);
         if result != WirelessResult::DataDecoded {
             return TestResult::Fail("360W: expected DataDecoded");
         }
@@ -1711,7 +1809,9 @@ mod tests {
         data[0] = GIP_CMD_INPUT;
         data[4] = 1 << 4; // A
         narf_input::__reset_global_ring_for_test();
-        xpadone_process_packet(&data, 18, 0);
+        let caps = super::xpad_evdev_caps();
+        let (_, node) = narf_input::evdev::ROUTER.register_device(caps);
+        xpadone_process_packet(&data, 18, 0, &node);
         let mut found_a = false;
         loop {
             match narf_input::pop_global() {
@@ -1844,7 +1944,9 @@ mod tests {
         data[0] = 0x00;
         data[2] = 0x01; // DUp bit
         narf_input::__reset_global_ring_for_test();
-        xpad360_process_packet(&data, 0, false);
+        let caps = super::xpad_evdev_caps();
+        let (_, node) = narf_input::evdev::ROUTER.register_device(caps);
+        xpad360_process_packet(&data, 0, false, &node);
         let mut found_hat_y = false;
         loop {
             match narf_input::pop_global() {
@@ -1874,7 +1976,9 @@ mod tests {
         // Connect all 4 slots in sequence
         for slot in 0..4usize {
             let data = [0x08u8, 0x80, 0, 0, 0, 0];
-            let result = xpad360w_process_packet(&mut rx, slot, &data, 0);
+            let caps = super::xpad_evdev_caps();
+            let (_, node) = narf_input::evdev::ROUTER.register_device(caps);
+            let result = xpad360w_process_packet(&mut rx, slot, &data, 0, &node);
             match result {
                 WirelessResult::PresenceChanged {
                     slot: s,
@@ -1890,7 +1994,9 @@ mod tests {
         }
         // Disconnect slot 2
         let disc = [0x08u8, 0x00, 0, 0, 0, 0];
-        let result = xpad360w_process_packet(&mut rx, 2, &disc, 0);
+        let caps = super::xpad_evdev_caps();
+        let (_, node) = narf_input::evdev::ROUTER.register_device(caps);
+        let result = xpad360w_process_packet(&mut rx, 2, &disc, 0, &node);
         match result {
             WirelessResult::PresenceChanged {
                 slot: 2,
@@ -1911,14 +2017,211 @@ pub static XPAD_MATCH: [crate::class_registry::UsbClassMatch; 1] =
         USB_CLASS_VENDOR_SPEC,
     )];
 
+/// Scan the configuration descriptor for an Xbox-compatible interface
+/// and its IN/OUT endpoints. Returns `(interface_num, xtype, ep_in, ep_out)`.
+pub fn find_xpad_interface(cfg: &[u8]) -> Option<(u8, u8, EndpointConfig, Option<EndpointConfig>)> {
+    let mut i = 0usize;
+    let mut iface_num = None;
+    let mut xtype = None;
+    let mut ep_in = None;
+    let mut ep_out = None;
+
+    while i + 2 <= cfg.len() {
+        let len = cfg[i] as usize;
+        if len < 2 || i + len > cfg.len() {
+            break;
+        }
+        let dtype = cfg[i + 1];
+
+        match dtype {
+            // Interface Descriptor.
+            4 if len >= 9 => {
+                let class = cfg[i + 5];
+                let subclass = cfg[i + 6];
+                let protocol = cfg[i + 7];
+
+                if let Some(xt) = match_interface(class, subclass, protocol) {
+                    iface_num = Some(cfg[i + 2]);
+                    xtype = Some(xt);
+                    ep_in = None;
+                    ep_out = None;
+                }
+            }
+            // Endpoint Descriptor.
+            5 if len >= 7 && iface_num.is_some() => {
+                let ep_addr = cfg[i + 2];
+                let attr = cfg[i + 3];
+                let mps = u16::from_le_bytes([cfg[i + 4], cfg[i + 5]]);
+                let xfer_t = attr & 0x03;
+                let is_in = ep_addr & 0x80 != 0;
+
+                if xfer_t == 3 {
+                    // Interrupt endpoint
+                    let ep = EndpointConfig {
+                        ep_addr,
+                        max_packet: mps,
+                        kind: if is_in {
+                            EndpointKind::InterruptIn
+                        } else {
+                            EndpointKind::InterruptOut
+                        },
+                        interval: cfg[i + 6],
+                    };
+                    if is_in && ep_in.is_none() {
+                        ep_in = Some(ep);
+                    } else if !is_in && ep_out.is_none() {
+                        ep_out = Some(ep);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // Stop parsing if we found what we need (IN endpoint is required).
+        if let (Some(num), Some(xt), Some(ein)) = (iface_num, xtype, ep_in) {
+            // For Xbox One, we strictly need both IN and OUT.
+            if xt == XTYPE_XBOXONE {
+                if ep_out.is_some() {
+                    return Some((num, xt, ein, ep_out));
+                }
+            } else {
+                return Some((num, xt, ein, ep_out));
+            }
+        }
+        i += len;
+    }
+    None
+}
+
+pub async fn try_bind_xpad_already_addressed(
+    xhci_dev: &Xhci,
+    slot_id: u8,
+    cfg: &[u8],
+    vendor_id: u16,
+    product_id: u16,
+) -> Result<(), HidError> {
+    let (interface_num, xtype, ep_in, ep_out) =
+        find_xpad_interface(cfg).ok_or(HidError::NoInterruptIn)?;
+
+    let mut endpoints = vec![ep_in];
+    if let Some(out) = ep_out {
+        endpoints.push(out);
+    }
+
+    xhci_dev
+        .configure_endpoints(slot_id, &endpoints)
+        .await
+        .map_err(HidError::Xhci)?;
+
+    if cfg.len() < 9 || cfg[1] != 2 {
+        return Err(HidError::NoInterruptIn);
+    }
+    let cfg_value = cfg[5];
+    xhci_dev
+        .control_out(
+            slot_id,
+            0x00, // bmRequestType: Host-to-Device | Standard | Device
+            crate::hid::STD_REQ_SET_CONFIGURATION,
+            cfg_value as u16,
+            0,
+            &[],
+        )
+        .await
+        .map_err(HidError::Xhci)?;
+
+    if xtype == XTYPE_XBOXONE {
+        for pkt in iter_init_packets(vendor_id, product_id) {
+            let _ = xhci_dev
+                .control_out(
+                    slot_id,
+                    0x21, // bmRequestType: Host-to-Device | Class | Interface
+                    0x09, // SET_REPORT
+                    0x0200,
+                    interface_num as u16,
+                    pkt.data,
+                )
+                .await;
+        }
+    }
+
+    let interrupt_in_dci = (ep_in.ep_addr & 0x0F) * 2 + 1;
+    let interrupt_out_dci = ep_out.map(|ep| (ep.ep_addr & 0x0F) * 2);
+
+    // Default to 64 bytes for max expected gamepad payload.
+    xhci_dev
+        .arm_interrupt_in(slot_id, interrupt_in_dci, 64)
+        .map_err(HidError::Xhci)?;
+
+    let caps = xpad_evdev_caps();
+    let (evdev_id, evdev_node) = narf_input::evdev::ROUTER.register_device(caps);
+
+    let dev_info = lookup_device(vendor_id, product_id);
+    let mapping = dev_info.mapping;
+
+    let bound_dev = Arc::new(XpadBoundDevice {
+        slot_id,
+        interrupt_in_dci,
+        interrupt_out_dci,
+        interface_num,
+        xtype,
+        mapping,
+        receiver: IrqSafeSpinLock::new(None),
+        evdev_id,
+        evdev_node,
+    });
+
+    XPAD_DEVICES_BOUND.lock().push(bound_dev);
+
+    Ok(())
+}
+
+pub fn pump_all(xhci_dev: &Xhci) -> usize {
+    let mut total = 0;
+    let pads: Vec<Arc<XpadBoundDevice>> = {
+        let g = XPAD_DEVICES_BOUND.lock();
+        g.clone()
+    };
+
+    for pad in &pads {
+        let mut buf = vec![0u8; 64];
+        loop {
+            match xhci_dev.poll_interrupt_in(pad.slot_id, pad.interrupt_in_dci, &mut buf) {
+                Ok(Some(len)) => {
+                    process_packet(&buf[..len], pad.xtype, pad.mapping, len, &pad.evdev_node);
+                    total += 1;
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+    }
+    total
+}
+
 pub fn probe(
-    _device: alloc::sync::Arc<crate::device::USBDevice>,
+    device: alloc::sync::Arc<crate::device::USBDevice>,
 ) -> Result<(), crate::class_registry::UsbProbeError> {
-    use core::fmt::Write;
-    let _ = writeln!(
-        narf_console::Writer,
-        "  usb: Xbox gamepad device bound! (xpad)"
-    );
+    // The probe is synchronous, but we need to do async xHCI requests to fetch
+    // the config descriptor and bind. So we spawn a task to do that.
+    narf_scheduler::spawn_stackful(async move {
+        let mut buf = vec![0u8; 9];
+        if device.get_config_descriptor(0, &mut buf).await.is_err() {
+            return;
+        }
+        let total = u16::from_le_bytes([buf[2], buf[3]]) as usize;
+        let mut full = vec![0u8; total];
+        if device.get_config_descriptor(0, &mut full).await.is_ok() {
+            let c = device.controller();
+            let _ = crate::xpad::try_bind_xpad_already_addressed(
+                c,
+                device.slot_id(),
+                &full,
+                device.vendor_id(),
+                device.product_id(),
+            )
+            .await;
+        }
+    });
     Ok(())
 }
 
