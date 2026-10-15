@@ -528,3 +528,137 @@ kernel_test_in!(
     "drivers/gpu/navi48-teardown",
     navi48_activation_abort_quarantines_cancelled_and_failed_native_steps
 );
+
+fn activation_checkpoints() -> [(Protocol, &'static [TeardownStep]); 4] {
+    use TeardownStep::*;
+    [
+        (Protocol::Tmds, &[Scdc, Video, Scanout]),
+        (Protocol::Sst, &[Link, Frontend, Video, Scanout]),
+        (Protocol::Uhbr, &[Link, Video]),
+        (Protocol::Frl, &[Scdc, Video]),
+    ]
+}
+
+fn navi48_partial_activation_unwinds_only_completed_phases_and_releases() -> TestResult {
+    for (protocol, checkpoints) in activation_checkpoints() {
+        for (index, &next) in checkpoints.iter().enumerate() {
+            let r = activation(protocol);
+            let normal = cases().into_iter().find(|c| c.0 == protocol).unwrap().1;
+            let start = normal.iter().position(|&s| s == next).unwrap();
+            let mut steps = normal[start..].to_vec();
+            steps.push(TeardownStep::Release);
+            // Every cleanup boundary can reject before writing and resume.
+            for (blocked_at, &blocked) in steps.iter().enumerate() {
+                let mut m = Model::new();
+                m.progress.start_activation(r).unwrap();
+                for &step in &checkpoints[..=index] {
+                    m.progress.checkpoint_activation(r.pipe, step);
+                }
+                let saved = m.progress.0[usize::from(r.pipe)].unwrap();
+                assert!(saved.status.activation && saved.status.in_flight);
+                assert_eq!(saved.status.next, next);
+                assert!(
+                    saved.request.scanout.is_none(),
+                    "invented a Modeset witness"
+                );
+                m.progress.finish_activation(r.pipe, false);
+                let sibling = Request {
+                    pipe: 2,
+                    ..request(Protocol::Mst)
+                };
+                m.progress.begin(sibling, false).unwrap();
+                let sibling_before = m.progress.status(2);
+                m.blocked = Some(blocked);
+                assert_eq!(
+                    finish(abort_model(&mut m, r.pipe)),
+                    Err(otg::Error::Busy.into())
+                );
+                assert_eq!(m.writes.len(), blocked_at);
+                assert!(!m.released[usize::from(r.pipe)]);
+                m.blocked = None;
+                assert_eq!(finish(abort_model(&mut m, r.pipe)), Ok(()));
+                let expected: Vec<_> = steps.iter().map(|&s| (r.pipe, s)).collect();
+                assert_eq!(m.writes, expected);
+                assert!(m.released[usize::from(r.pipe)]);
+                assert_eq!(m.progress.status(r.pipe), None);
+                assert_eq!(m.progress.status(2), sibling_before);
+                assert!(!m.released[2]);
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-teardown",
+    navi48_partial_activation_unwinds_only_completed_phases_and_releases
+);
+
+fn navi48_partial_activation_checkpoints_never_override_uncertain_completion() -> TestResult {
+    for (protocol, checkpoints) in activation_checkpoints() {
+        for &next in checkpoints {
+            let r = activation(protocol);
+            let mut m = Model::new();
+            cancel(async {
+                m.progress.start_activation(r).unwrap();
+                m.progress.checkpoint_activation(r.pipe, next);
+                // Dropped during the following startup phase, before return.
+                core::future::pending::<()>().await;
+                m.progress.finish_activation(r.pipe, false);
+            });
+            assert_eq!(
+                finish(abort_model(&mut m, r.pipe)),
+                Err(otg::Error::Busy.into())
+            );
+            assert!(m.attempts.is_empty());
+            assert!(m.progress.status(r.pipe).unwrap().in_flight);
+            assert_eq!(m.progress.check_idle(), Err(otg::Error::Busy.into()));
+
+            let mut m = Model::new();
+            m.progress.start_activation(r).unwrap();
+            m.progress.checkpoint_activation(r.pipe, next);
+            m.progress.finish_activation(r.pipe, false);
+            // A returned failure after writes keeps native quarantine binding.
+            m.poisoned = true;
+            assert_eq!(
+                finish(abort_model(&mut m, r.pipe)),
+                Err(otg::Error::Busy.into())
+            );
+            assert!(m.writes.is_empty());
+            assert!(!m.released[usize::from(r.pipe)]);
+            assert_eq!(m.progress.status(r.pipe).unwrap().next, next);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-teardown",
+    navi48_partial_activation_checkpoints_never_override_uncertain_completion
+);
+
+fn navi48_activation_checkpoints_do_not_create_or_replace_published_teardowns() -> TestResult {
+    let mut m = Model::new();
+    for (protocol, checkpoints) in activation_checkpoints() {
+        let r = request(protocol);
+        for &step in checkpoints {
+            // start_link is also used by retraining a published Modeset.
+            m.progress.checkpoint_activation(r.pipe, step);
+            assert_eq!(m.progress.status(r.pipe), None);
+        }
+        m.progress.begin(r, true).unwrap();
+        let before = m.progress.status(r.pipe);
+        for &step in checkpoints {
+            m.progress.checkpoint_activation(r.pipe, step);
+            assert_eq!(m.progress.status(r.pipe), before);
+        }
+        assert_eq!(finish(run_model(&mut m, r, false)), Ok(()));
+        let before = m.progress.status(r.pipe);
+        m.progress.checkpoint_activation(r.pipe, TeardownStep::Link);
+        assert_eq!(m.progress.status(r.pipe), before);
+        m.progress.rearm(r.pipe).unwrap();
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-teardown",
+    navi48_activation_checkpoints_do_not_create_or_replace_published_teardowns
+);

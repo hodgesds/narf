@@ -450,8 +450,13 @@ records an unpublished activation before staging. A returned failure attempts
 timing/DSC/plane retirement and fresh surface release when native owners prove
 the output stopped; completed cleanup steps survive preflight rejection.
 Pending cleanup blocks relighting/preferred-mode fallback and is retried before
-monitor topology work. Cancelled startup, live partial streams, failed native
-owners and shared-clock recovery remain blocked, with memory retained.
+monitor topology work. TMDS, legacy DP SST, UHBR and FRL startup now checkpoint
+completed link/frontend/video/scanout phases, so a later preflight rejection
+unwinds the completed work before timing/plane retirement and fresh release.
+This includes audio rejection after live fetch and scanout underflow recovered
+to black video. Native failure guards remain binding; cancelled startup,
+uncheckpointed active work (including MST startup), pre-link SCDC changes and
+shared-clock recovery remain open, with uncertain memory retained.
 The lit Navi48 display is published as DRM KMS state on the amdgpu card, with
 the sink's real EDID and exact timing (disconnected on unplug). SETCRTC
 accepts only that timing, and the base amdgpu DRM version 3.0.0 claims no

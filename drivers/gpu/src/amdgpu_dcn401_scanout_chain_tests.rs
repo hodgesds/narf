@@ -747,3 +747,105 @@ kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_second_display_leaves_the_live_one_alone
 );
+
+fn dcn401_partial_activation_unwinds_native_link_video_and_scanout() -> TestResult {
+    for stage in 0..4 {
+        let mut c = chain(0, 0, 0);
+        // The fixture leaves staging's flip pending for the scanout lock model.
+        // Deliver its first VUPDATE while black video runs: retirement before
+        // that event must correctly refuse the outstanding surface update.
+        c.e.io.latch();
+        let before = c.pool.available();
+        let bytes = c.e.status.surfaces[0].unwrap().bytes.next_multiple_of(4096);
+        match stage {
+            0 => {
+                // A link completed but video rejects its clock before writes.
+                run(c.e.stop_hdmi_video(path(0))).unwrap();
+                let mut wrong = c.clock;
+                wrong.request.pipe = 1;
+                assert!(run(c.e.start_hdmi_video(path(0), wrong)).is_err());
+                assert_eq!(c.e.status.state, State::HdmiLinkReady(0));
+            }
+            1 => {
+                // Black video completed; scanout's owner preflight rejects.
+                assert_eq!(
+                    run(c
+                        .surfaces
+                        .start_scanout(&mut c.e, 0, CRYSTAL_KHZ, || Err(Error::Busy))),
+                    Err(Error::Busy)
+                );
+                assert_eq!(c.e.status.state, State::HdmiVideoRunning(0));
+            }
+            2 => {
+                // Fetch completed; unsupported sink audio must not strand it.
+                run(c.start()).unwrap();
+                let mut info = crate::amdgpu_dcn401_otg::tests::hdmi_link::audio_info();
+                info.modes[0].format = 2; // AC3 only, no supported LPCM
+                info.mode_count = 1;
+                assert_eq!(
+                    run(c.e.start_hdmi_audio(path(0), info)),
+                    Err(Error::Unsupported)
+                );
+                assert_eq!(c.e.status.state, State::ScanoutRunning(0));
+                assert!(c.e.status.hdmi_audio.is_none());
+                run(c.stop()).unwrap();
+            }
+            _ => {
+                // Scanout wrote, then its native underflow recovery returned
+                // to the last completed checkpoint (black video).
+                c.e.io.underflow_after = Some(12);
+                assert!(matches!(run(c.start()), Err(Error::Underflow(_))));
+                assert_eq!(c.e.status.state, State::HdmiVideoRunning(0));
+            }
+        }
+        if stage != 0 {
+            run(c.e.stop_hdmi_video(path(0))).unwrap();
+        }
+        let mut firmware = Firmware {
+            ready: true,
+            commands: Vec::new(),
+            event: c.e.io.inner.event.clone(),
+            writes: c.e.io.inner.writes.clone(),
+            fail: None,
+        };
+        run(c.e.stop_hdmi_link(&mut firmware, path(0))).unwrap();
+        run(c.e.retire(0)).unwrap();
+        assert!(
+            run(c.e.retire_planes()).is_ok(),
+            "planes after stage {stage}"
+        );
+        // SAFETY: fixture-owned VRAM with no published CPU/other-engine views;
+        // actual native stop/retire phases above, fresh release proof below.
+        assert_eq!(unsafe { c.surfaces.release(&mut c.e, 0) }, Ok(bytes));
+        assert_eq!(c.pool.available(), before + bytes);
+        assert!(c.e.status.surfaces[0].is_none());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_partial_activation_unwinds_native_link_video_and_scanout
+);
+
+fn dcn401_partial_activation_failure_keeps_native_quarantine() -> TestResult {
+    let mut c = chain(0, 0, 0);
+    let before = c.pool.available();
+    c.e.io.drop = Some(opp(0, DPG));
+    assert!(run(c.start()).is_err());
+    assert!(matches!(c.e.status.state, State::Failed(_)));
+    let writes = c.e.io.writes;
+    // An earlier video checkpoint cannot override the failed fetch.
+    assert_eq!(run(c.e.stop_hdmi_video(path(0))), Err(Error::Busy));
+    assert_eq!(run(c.e.retire(0)), Err(Error::Busy));
+    assert_eq!(run(c.e.retire_planes()), Err(Error::Busy));
+    // SAFETY: fixture memory is never dereferenced by this refusal path.
+    assert_eq!(unsafe { c.surfaces.release(&mut c.e, 0) }, Err(Error::Busy));
+    assert_eq!(c.e.io.writes, writes);
+    assert_eq!(c.pool.available(), before);
+    assert!(c.e.status.surfaces[0].is_some());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_partial_activation_failure_keeps_native_quarantine
+);

@@ -25,7 +25,7 @@ pub struct TeardownStatus {
     pub next: TeardownStep,
     /// A dropped native phase has no completion witness and cannot be replayed.
     pub in_flight: bool,
-    /// An activation has not returned a Modeset; abort uses native idle proof.
+    /// An activation has not returned a Modeset; abort still checks native proof.
     pub activation: bool,
     /// DP link shutdown keeps physical-removal semantics on every resume.
     pub unplugged: bool,
@@ -170,6 +170,19 @@ impl Teardowns {
         selection: &Selection,
     ) -> Result<(), ModesetError> {
         self.start_activation(Request::activation(pipe, selection))
+    }
+    /// Record the inverse of a completed startup phase, without a suspension
+    /// between its native completion and this checkpoint. This is not permission
+    /// to replay a cancelled startup or bypass a failed native owner. Retraining
+    /// also uses start_link, but has no unpublished activation to checkpoint.
+    pub(super) fn checkpoint_activation(&mut self, pipe: u8, next: TeardownStep) {
+        if let Some(p) = self.0[usize::from(pipe)]
+            .as_mut()
+            .filter(|p| p.status.activation)
+        {
+            assert!(p.status.in_flight);
+            p.status.next = next;
+        }
     }
     pub(super) fn finish_activation(&mut self, pipe: u8, succeeded: bool) {
         let slot = &mut self.0[usize::from(pipe)];
@@ -359,9 +372,10 @@ impl Backend for ColdBoot {
 
 impl ColdBoot {
     /// Abort a recorded activation which returned an error before publication.
-    /// Retire timing/DSC, planes and allocations using fresh native proofs.
-    /// Running links/video/fetchers, failed owners and cancelled operations
-    /// remain blocked. Completed abort phases are not replayed on a retry.
+    /// Unwind checkpointed link/video/scanout phases, then retire timing/DSC,
+    /// planes and allocations using fresh native proofs. Uncheckpointed live
+    /// work, failed owners and cancelled operations remain blocked. Completed
+    /// abort phases are not replayed on a retry.
     /// # Safety
     /// As for modeset_display. The activation must remain unpublished to CPU
     /// writers and other engines; drain any views from earlier incarnations

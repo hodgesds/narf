@@ -1013,13 +1013,26 @@ the original startup error is returned whether cleanup succeeds or fails.
 `display_teardown_status(pipe).activation` identifies unfinished startup
 cleanup, including a failed pipe missing from `Configuration.displays`.
 
-The abort's phases are timing (including DSC disable), optional DSC clock,
-planes, then `TeardownStep::Release`. It uses the existing native guards and
-fresh retirement/reclamation proofs: it can reclaim stopped staging after
-a preflight rejection or a training refusal whose link was successfully
-stopped. It does not manufacture a successful scanout witness or try to stop
-live links, video or fetchers. Native failure/in-flight states, contradictory
-hardware and failed fresh checks retain the record and uncertain allocations.
+Startup checkpoints the inverse of each completed link, frontend, video and
+scanout phase before the next operation can suspend or fail. This covers TMDS,
+legacy DP SST, UHBR and FRL: TMDS/FRL link completion starts cleanup at SCDC,
+DP training at Link, legacy SST frontend at Frontend, and video at Video.
+TMDS/SST scanout completion starts at Scanout, so an audio preflight rejection
+does not strand live fetch. Audio is not stopped unless it actually completed;
+successful audio is the final startup operation and returns a normal Modeset.
+UHBR/FRL scanout is likewise the final startup operation. Retraining an already
+published Modeset does not create or change an activation record.
+
+The abort unwinds these checkpointed phases through the normal native stop
+operations, then retires timing (including DSC disable), optional DSC clock,
+planes and `TeardownStep::Release`. Without a checkpoint it starts at timing,
+so stopped staging or a training refusal whose link was successfully stopped
+can still be reclaimed. No successful Modeset/scanout witness is manufactured.
+Each stop checks current native ownership and hardware; a previous checkpoint
+cannot override a subsequent operation's failed or in-flight state. A scanout
+underflow whose native recovery returned to black video can unwind from Video.
+Contradictory hardware and failed fresh checks retain the record and uncertain
+allocations.
 Completed phases survive returned errors; success clears the activation only
 after release. The caller must keep the activation unpublished to CPU writers
 and other engines, with the same exclusive ownership as `modeset_display`.
@@ -1029,9 +1042,10 @@ buffers that a low-level caller chose not to release after its previous stop.
 An unknown/non-activation pipe is Invalid. Dropping startup or an abort phase
 leaves the in-flight marker set and blocks replay, even if the native state
 looks reusable during a compound operation or retry delay. No reset or
-recovery of cancelled startup, active partial streams or shared-clock failure
-is implied. Models cover abort phase faults/cancellation and native staged
-retirement/release, including sibling isolation and unexpected live hardware.
+recovery of cancelled startup, uncheckpointed active work (including MST
+startup), pre-link SCDC changes or shared-clock failure is implied. Models cover
+abort phase faults/cancellation, every supported checkpoint's cleanup suffix,
+sibling isolation and native staged/live retirement through fresh release.
 
 The monitor records intent before draining CPU views, publishes the retiring
 CRTC inactive, and retains its Modeset until teardown and surface release both

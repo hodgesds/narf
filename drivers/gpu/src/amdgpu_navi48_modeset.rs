@@ -1444,8 +1444,9 @@ impl ColdBoot {
     /// display/hub/VM/IRQ/clock/reset/power/link writers; retain every owner
     /// and any allocations this API has not reclaimed, including on cancellation.
     /// A returned failure
-    /// attempts to retire the unpublished pipe only when native owners prove
-    /// it stopped. Failed/in-flight owners and uncertain allocations stay held.
+    /// attempts to unwind checkpointed startup and retire the unpublished pipe
+    /// using native proofs. Failed/in-flight owners and uncertain allocations
+    /// stay held.
     pub async unsafe fn modeset_display(
         &mut self,
         pipe: u8,
@@ -1621,7 +1622,7 @@ impl ColdBoot {
             Err(e) => {
                 self.teardowns.finish_activation(pipe, false);
                 // SAFETY: no Modeset was returned or CPU scanout published.
-                // Native guards refuse live/failed owners; cleanup failure
+                // Native guards validate each checkpoint; cleanup failure
                 // retains the journal and memory. Preserve the original error.
                 let _ = unsafe { self.abort_modeset_activation(pipe) }.await;
                 Err(e)
@@ -1771,8 +1772,14 @@ impl ColdBoot {
                     avi: selection.avi,
                 };
                 self.prepare_display_hdmi_link(port, request).await?;
+                self.teardowns
+                    .checkpoint_activation(pipe, super::TeardownStep::Scdc);
                 self.start_display_hdmi_video(port).await?;
+                self.teardowns
+                    .checkpoint_activation(pipe, super::TeardownStep::Video);
                 let scanout = self.start_display_scanout(pipe).await?;
+                self.teardowns
+                    .checkpoint_activation(pipe, super::TeardownStep::Scanout);
                 // As Linux's post-enable: audio after the stream runs.
                 if let Some(info) = selection.audio {
                     self.start_display_audio(port, true, info).await?;
@@ -1834,10 +1841,18 @@ impl ColdBoot {
             if !trained {
                 return Err(refused);
             }
+            self.teardowns
+                .checkpoint_activation(pipe, super::TeardownStep::Link);
             self.prepare_display_dp_frontend(port, otg::DpFrontendRequest { stream: pipe, pipe })
                 .await?;
+            self.teardowns
+                .checkpoint_activation(pipe, super::TeardownStep::Frontend);
             self.start_display_dp_video(port).await?;
+            self.teardowns
+                .checkpoint_activation(pipe, super::TeardownStep::Video);
             let scanout = self.start_display_scanout(pipe).await?;
+            self.teardowns
+                .checkpoint_activation(pipe, super::TeardownStep::Scanout);
             if let Some(info) = selection.audio {
                 self.start_display_audio(port, false, info).await?;
             }
@@ -1905,7 +1920,11 @@ impl ColdBoot {
             if !trained {
                 return Err(refused);
             }
+            self.teardowns
+                .checkpoint_activation(pipe, super::TeardownStep::Link);
             self.start_display_uhbr_video(port, pipe, pipe).await?;
+            self.teardowns
+                .checkpoint_activation(pipe, super::TeardownStep::Video);
             let scanout = self.start_display_scanout(pipe).await?;
             Ok((selection, scanout))
         }
@@ -1931,6 +1950,8 @@ impl ColdBoot {
             let trained = self
                 .start_frl(port, &selection.timing, bpc, rate, audio)
                 .await?;
+            self.teardowns
+                .checkpoint_activation(pipe, super::TeardownStep::Scdc);
             let Some(FrlCap::Ok {
                 audio_packets_line,
                 borrow,
@@ -1945,6 +1966,8 @@ impl ColdBoot {
                 avi: selection.avi,
             };
             self.start_display_frl_video(port, request).await?;
+            self.teardowns
+                .checkpoint_activation(pipe, super::TeardownStep::Video);
             let scanout = self.start_display_scanout(pipe).await?;
             Ok((
                 Selection {
