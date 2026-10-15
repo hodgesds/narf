@@ -119,7 +119,7 @@ impl super::super::super::dp_phy::Firmware for Link {
     ) -> Result<(), dmub::Error> {
         self.fw.command(path, Some(settings)).await
     }
-    async fn disable(&mut self, path: inventory::Path) -> Result<(), dmub::Error> {
+    async fn disable(&mut self, path: inventory::Path, _mst: bool) -> Result<(), dmub::Error> {
         // Sink D3 before native transmitter disable, unless the sink left.
         assert!(self.unplugged || self.bytes[&0x600] == 2);
         self.fw.command(path, None).await
@@ -205,7 +205,11 @@ fn fixture(p: u8, lanes: u8, rate: LinkRate, pattern: TrainingPattern) -> (Engin
             15
         },
     );
-    let settings = DpPhySettings { lanes, rate };
+    let settings = DpPhySettings {
+        lanes,
+        rate,
+        mst: false,
+    };
     run(e.enable_dp_phy(&mut f, path(p), settings)).unwrap();
     let source = Arc::new(AtomicU32::new(0));
     let change = Arc::new(AtomicU64::new(0));

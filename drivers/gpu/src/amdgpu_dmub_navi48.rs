@@ -42,6 +42,9 @@ pub enum DpSignal {
 pub struct DpPhySettings {
     pub lanes: u8,
     pub rate: crate::dp_link_training::LinkRate,
+    /// The link carries MST (8b/10b DP_MST: transmitter control digmode 5,
+    /// DIG_BE_MODE 5).
+    pub mst: bool,
 }
 impl DpPhySettings {
     pub(crate) fn validate(self) -> Result<(), Error> {
@@ -595,6 +598,15 @@ impl Dmub {
     ) -> Result<(), Error> {
         self.engine.disable_dp_sst(path).await
     }
+    /// dcn10_link_encoder_disable_output for a DP MST link (digmode 5).
+    pub(crate) async fn disable_dp_mst(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+    ) -> Result<(), Error> {
+        self.engine
+            .disable_dp_transmitter(path, DpSignal::Mst, 19)
+            .await
+    }
     pub(crate) async fn enable_frl(
         &mut self,
         path: crate::amdgpu_dcn_inventory::Path,
@@ -788,13 +800,17 @@ impl<I: Io> Engine<I> {
         {
             return Err(Error::Invalid);
         }
-        // Native dcn10_link_encoder_enable_dp_output -> transmitter_control_v1_7.
+        // Native dcn10_link_encoder_enable_dp_output (or _enable_dp_mst_output)
+        // -> transmitter_control_v1_7.
         // Unlike DISABLE, this zero-initialized caller leaves connector_obj_id
         // zero. DCE112+ digfe_sel is also zero; host programming owns routing.
         let mut request = [0; 64];
         request[..4].copy_from_slice(&TRANSMITTER_CONTROL);
         request[4] = path.transmitter;
         request[5] = 1; // TRANSMITTER_CONTROL_ENABLE
+                        // dcn10_link_encoder_enable_dp_mst_output's signal maps to
+                        // ATOM_TRANSMITTER_DIGMODE_V6_DP_MST.
+        request[6] = if settings.mst { 5 } else { 0 };
         request[7] = settings.lanes;
         let clock_10khz = (settings.rate as u32) * 2700;
         request[8..12].copy_from_slice(&clock_10khz.to_le_bytes());

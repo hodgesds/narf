@@ -28,11 +28,14 @@ fn settings(lanes: u8) -> DpPhySettings {
     DpPhySettings {
         lanes,
         rate: LinkRate::Hbr2,
+        mst: false,
     }
 }
 struct Firmware {
     completed: Arc<AtomicU8>,
     commands: Vec<(inventory::Path, Option<DpPhySettings>)>,
+    /// Each DISABLE's mode: DP_MST rather than DP.
+    disable_mst: Vec<bool>,
     ready: bool,
     pending: bool,
     error: Option<dmub::Error>,
@@ -70,7 +73,8 @@ impl super::super::dp_phy::Firmware for Firmware {
     ) -> Result<(), dmub::Error> {
         self.command(path, Some(settings)).await
     }
-    async fn disable(&mut self, path: inventory::Path) -> Result<(), dmub::Error> {
+    async fn disable(&mut self, path: inventory::Path, mst: bool) -> Result<(), dmub::Error> {
+        self.disable_mst.push(mst);
         self.command(path, None).await
     }
 }
@@ -96,7 +100,11 @@ impl Io for PhyIo {
             // Host setup must precede the firmware command. Firmware alone
             // supplies the independent RDPCS and backend clock-on witnesses.
             assert_eq!(self.inner.regs[&dio(p, 0x20bd)] & 1, 1);
-            assert_eq!(self.inner.regs[&dio(p, 0x20bb)] & 0x77, 0x10);
+            // DIG_BE_MODE DP SST (0) or MST (5), clock requested.
+            assert!(matches!(
+                self.inner.regs[&dio(p, 0x20bb)] & 0x77,
+                0x10 | 0x15
+            ));
             assert_eq!(
                 self.inner.regs[&dio(p, 0x20bc)] & 0x70007f01,
                 u32::from(path(p).hpd - 1) << 28
@@ -114,9 +122,10 @@ impl Io for PhyIo {
                     self.inner.regs.insert(dio(p, 0x20bd), 0);
                 }
                 if self.stall & 2 == 0 {
+                    let mode = self.inner.regs[&dio(p, 0x20bb)] & 7;
                     self.inner
                         .regs
-                        .insert(dio(p, 0x20bb), if enabled { 0x810 } else { 0 });
+                        .insert(dio(p, 0x20bb), if enabled { 0x810 | mode } else { 0 });
                 }
                 if self.stall & 4 == 0 {
                     let mut lanes = 0;
@@ -181,6 +190,7 @@ fn fixture(p: u8, lanes: u8) -> (Engine<PhyIo>, Firmware) {
     let firmware = Firmware {
         completed: completed.clone(),
         commands: Vec::new(),
+        disable_mst: Vec::new(),
         ready: true,
         pending: false,
         error: None,
@@ -219,6 +229,7 @@ fn dcn401_dp_phy_supports_all_phys_rates_and_physical_lane_mappings() -> TestRes
                 let s = DpPhySettings {
                     lanes: lanes.count_ones() as u8,
                     rate,
+                    mst: false,
                 };
                 let ready = run(e.enable_dp_phy(&mut f, path(p), s)).unwrap();
                 assert_eq!(
@@ -623,4 +634,28 @@ fn dcn401_dp_phy_leaves_other_displays_consumers_to_them() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_dp_phy_leaves_other_displays_consumers_to_them
+);
+
+/// An MST link: DIG_BE_MODE 5 (dcn401_link_encoder_setup's DP MST) with
+/// the firmware enabling and disabling it as DP_MST.
+fn dcn401_dp_phy_runs_mst_links_in_mst_mode() -> TestResult {
+    let (mut e, mut f) = fixture(1, 15);
+    let s = DpPhySettings {
+        lanes: 4,
+        rate: LinkRate::Hbr2,
+        mst: true,
+    };
+    run(e.enable_dp_phy(&mut f, path(1), s)).unwrap();
+    if e.io.inner.regs[&dio(1, 0x20bb)] & 7 != 5 || f.commands != vec![(path(1), Some(s))] {
+        return TestResult::Fail("MST enable");
+    }
+    run(e.disable_dp_phy(&mut f, path(1))).unwrap();
+    if f.disable_mst != [true] {
+        return TestResult::Fail("MST disable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dp_phy_runs_mst_links_in_mst_mode
 );

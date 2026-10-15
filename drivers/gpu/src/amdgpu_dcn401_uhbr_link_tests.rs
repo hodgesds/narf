@@ -114,7 +114,7 @@ impl super::super::super::super::dp_phy::Firmware for Sink {
     ) -> Result<(), dmub::Error> {
         panic!("8b/10b enable on a 128b/132b link")
     }
-    async fn disable(&mut self, _path: inventory::Path) -> Result<(), dmub::Error> {
+    async fn disable(&mut self, _path: inventory::Path, _mst: bool) -> Result<(), dmub::Error> {
         panic!("8b/10b disable on a 128b/132b link")
     }
 }

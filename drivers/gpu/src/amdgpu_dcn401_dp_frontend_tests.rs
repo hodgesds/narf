@@ -139,6 +139,7 @@ fn io_settings() -> DpPhySettings {
     DpPhySettings {
         lanes: 4,
         rate: LinkRate::Hbr3,
+        mst: false,
     }
 }
 fn req(stream: u8, pipe: u8) -> DpFrontendRequest {
@@ -478,6 +479,7 @@ fn dcn401_dp_frontend_derives_pixel_packing_and_rejects_insufficient_capacity() 
     io.settings = DpPhySettings {
         lanes: 1,
         rate: LinkRate::Rbr,
+        mst: false,
     };
     e.io.inner.inner.lanes = 8;
     run(e.enable_dp_phy(&mut io, path(0), io_settings_low())).unwrap();
@@ -494,6 +496,7 @@ fn io_settings_low() -> DpPhySettings {
     DpPhySettings {
         lanes: 1,
         rate: LinkRate::Rbr,
+        mst: false,
     }
 }
 kernel_test_in!(

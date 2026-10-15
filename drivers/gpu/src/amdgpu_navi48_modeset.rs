@@ -1733,8 +1733,15 @@ impl ColdBoot {
                 let DpRate::Legacy(rate) = link else {
                     continue;
                 };
-                self.enable_display_dp_phy(port, otg::DpPhySettings { lanes, rate })
-                    .await?;
+                self.enable_display_dp_phy(
+                    port,
+                    otg::DpPhySettings {
+                        lanes,
+                        rate,
+                        mst: false,
+                    },
+                )
+                .await?;
                 match self.train_display_dp_link(port, false).await {
                     Ok(_) => {
                         (selection.lanes, selection.rate) = (lanes, link);

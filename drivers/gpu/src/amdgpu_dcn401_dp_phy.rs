@@ -49,7 +49,12 @@ pub(super) trait Firmware {
         path: Path,
         settings: DpPhySettings,
     ) -> impl Future<Output = Result<(), dmub::Error>> + Send;
-    fn disable(&mut self, path: Path) -> impl Future<Output = Result<(), dmub::Error>> + Send;
+    /// TRANSMITTER_CONTROL DISABLE in the link's mode (DP or DP_MST).
+    fn disable(
+        &mut self,
+        path: Path,
+        mst: bool,
+    ) -> impl Future<Output = Result<(), dmub::Error>> + Send;
 }
 impl Firmware for dmub::Dmub {
     fn ready(&self) -> bool {
@@ -58,8 +63,12 @@ impl Firmware for dmub::Dmub {
     async fn enable(&mut self, path: Path, settings: DpPhySettings) -> Result<(), dmub::Error> {
         self.enable_dp_sst(path, settings).await
     }
-    async fn disable(&mut self, path: Path) -> Result<(), dmub::Error> {
-        self.disable_dp_sst(path).await
+    async fn disable(&mut self, path: Path, mst: bool) -> Result<(), dmub::Error> {
+        if mst {
+            self.disable_dp_mst(path).await
+        } else {
+            self.disable_dp_sst(path).await
+        }
     }
 }
 fn phy_at(l: Layout, phy: u8, reg: u64) -> u64 {
@@ -306,7 +315,8 @@ impl<I: Io> Engine<I> {
         for (slot, mask, value) in [
             (0, 3, 0),
             (1, 0x70000000, u32::from(plan.path.hpd - 1) << 28),
-            (2, 7, 0),
+            // dcn401_link_encoder_setup: DIG_BE_MODE DP SST (0) or MST (5).
+            (2, 7, if plan.settings.mst { 5 } else { 0 }),
             (2, 0x10, 0x10),
             (3, 1, 1),
             (4, u32::MAX, u32::from(plan.settings.lanes - 1)),
@@ -412,7 +422,10 @@ impl<I: Io> Engine<I> {
         pattern: u32,
         complete: u32,
     ) -> Result<(), Error> {
-        firmware.disable(plan.path).await.map_err(Error::Firmware)?;
+        firmware
+            .disable(plan.path, plan.settings.mst)
+            .await
+            .map_err(Error::Firmware)?;
         let l = self.layout;
         let phy = plan.path.transmitter;
         let at = |r| DpStream::Dio(phy).at(l, r);

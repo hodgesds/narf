@@ -36,7 +36,11 @@ fn dmub_navi48_dp_drive_preserves_native_v17_zero_signal_encoding() -> TestResul
                         let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
                         run(e.set_dp_drive(
                             path,
-                            DpPhySettings { lanes, rate },
+                            DpPhySettings {
+                                lanes,
+                                rate,
+                                mst: false,
+                            },
                             DpDriveSettings {
                                 swing,
                                 pre_emphasis,
@@ -73,6 +77,7 @@ fn dmub_navi48_dp_drive_validates_electrical_levels_and_quarantines_cancellation
     let settings = DpPhySettings {
         lanes: 4,
         rate: crate::dp_link_training::LinkRate::Hbr3,
+        mst: false,
     };
     for drive in [
         DpDriveSettings {
@@ -131,7 +136,15 @@ fn dmub_navi48_dp_enable_uses_native_lane_rate_and_zero_connector_fields() -> Te
                 ] {
                     let (_pool, mut e) = ready();
                     let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
-                    run(e.enable_dp_sst(dp_path(phy, hpd), DpPhySettings { lanes, rate })).unwrap();
+                    run(e.enable_dp_sst(
+                        dp_path(phy, hpd),
+                        DpPhySettings {
+                            lanes,
+                            rate,
+                            mst: false,
+                        },
+                    ))
+                    .unwrap();
                     let mut golden = [0; 64];
                     golden[..4].copy_from_slice(&[128, 1, 0, 16]);
                     golden[4] = phy;
@@ -175,7 +188,8 @@ fn dmub_navi48_dp_enable_validates_before_submission_and_retains_cancelled_trans
                 path,
                 DpPhySettings {
                     lanes,
-                    rate: crate::dp_link_training::LinkRate::Hbr3
+                    rate: crate::dp_link_training::LinkRate::Hbr3,
+                    mst: false,
                 }
             )),
             Err(Error::Invalid)
@@ -187,6 +201,7 @@ fn dmub_navi48_dp_enable_validates_before_submission_and_retains_cancelled_trans
     let settings = DpPhySettings {
         lanes: 2,
         rate: crate::dp_link_training::LinkRate::Hbr2,
+        mst: false,
     };
     {
         let mut future = core::pin::pin!(e.enable_dp_sst(dp_path(0, 1), settings));
@@ -1028,3 +1043,48 @@ kernel_test_in!(
     "drivers/gpu/dmub-navi48",
     dmub_navi48_frl_enable_and_ffe_use_linux_v17_fields
 );
+
+/// An MST link as dcn10_link_encoder_enable_dp_mst_output and
+/// disable_output command it: transmitter control v1.7 with
+/// ATOM_TRANSMITTER_DIGMODE_V6_DP_MST (5), otherwise as for SST.
+fn dmub_navi48_dp_mst_uses_digmode_5() -> TestResult {
+    use crate::dp_link_training::LinkRate;
+    let (_pool, mut e) = ready();
+    let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
+    run(e.enable_dp_sst(
+        dp_path(1, 2),
+        DpPhySettings {
+            lanes: 4,
+            rate: LinkRate::Hbr2,
+            mst: true,
+        },
+    ))
+    .unwrap();
+    let mut golden = [0; 64];
+    golden[..4].copy_from_slice(&[128, 1, 0, 16]);
+    golden[4] = 1;
+    golden[5] = 1;
+    golden[6] = 5;
+    golden[7] = 4;
+    golden[8..12].copy_from_slice(&54000u32.to_le_bytes());
+    golden[12] = 2;
+    golden[15] = 244;
+    if e.io.slot(offset) != golden {
+        return TestResult::Fail("MST enable");
+    }
+    let (_pool, mut e) = ready();
+    let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
+    run(e.disable_dp_transmitter(dp_path(1, 2), DpSignal::Mst, 19)).unwrap();
+    let mut golden = [0; 64];
+    golden[..4].copy_from_slice(&[128, 1, 0, 16]);
+    golden[4] = 1;
+    golden[6] = 5;
+    golden[12] = 2;
+    golden[14] = 19;
+    golden[15] = 244;
+    if e.io.slot(offset) != golden {
+        return TestResult::Fail("MST disable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dmub-navi48", dmub_navi48_dp_mst_uses_digmode_5);
