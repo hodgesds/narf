@@ -794,6 +794,28 @@ impl ColdBoot {
     }
     /// Divide acknowledged global clocks for a retired native display pipe.
     /// The link/modeset owner must still program its PLL, PHY and scanout.
+    /// Attach the selected display to the port's running MST link.
+    /// # Safety
+    /// Fulfil `Otg::attach_mst_link` obligations.
+    pub unsafe fn attach_display_mst_link(&mut self, port: usize) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: the caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .attach_mst_link(path.transmitter)
+                .map(|_| ())
+        }
+    }
+    /// Detach the selected display from the port's MST link.
+    pub fn detach_display_mst_link(&mut self, port: usize) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        self.otg
+            .as_mut()
+            .map_err(|e| *e)?
+            .detach_mst_link(path.transmitter)
+    }
     /// Program the port's MST link's VC payload table and trigger ACT.
     /// # Safety
     /// Fulfil `Otg::update_mst_allocation` obligations.

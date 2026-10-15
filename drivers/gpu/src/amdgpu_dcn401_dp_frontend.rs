@@ -84,7 +84,15 @@ impl<I: Io> Engine<I> {
         // Other displays route their own streams and backends after this
         // snapshot; every other route must stay as it was.
         let others = self.displays.siblings;
+        // On this display's MST backend, other displays' streams select it
+        // too; their bits are theirs.
+        let shared = if plan.link.phy.settings.mst {
+            u32::from(others.streams) << 8
+        } else {
+            0
+        };
         for b in 0..4 {
+            let own_backend = b == plan.link.phy.path.transmitter;
             for (at, mask, value, theirs) in [
                 (
                     l.dio_clock + u64::from(b) * 4,
@@ -94,12 +102,16 @@ impl<I: Io> Engine<I> {
                 ),
                 (
                     DpStream::Dio(b).at(l, 0x20bc),
-                    0x7f00,
+                    if own_backend {
+                        0x7f00 & !shared
+                    } else {
+                        0x7f00
+                    },
                     plan.backend_routes[usize::from(b)],
-                    others.transmitters & bit(b) != 0,
+                    others.transmitters & bit(b) != 0 && !(own_backend && shared != 0),
                 ),
             ] {
-                if !theirs && self.read(at)? & mask != value {
+                if !theirs && self.read(at)? & mask != value & mask {
                     return Err(Error::Readback(at));
                 }
             }
@@ -154,14 +166,19 @@ impl<I: Io> Engine<I> {
     ) -> Result<(), Error> {
         self.dp_frontend_verify(*plan)?;
         let phy = plan.link.phy.path.transmitter;
-        let value = if connect {
-            0x100 << plan.request.stream
+        let own = 0x100 << plan.request.stream;
+        let value = if connect { own } else { 0 };
+        // dcn10_link_encoder_connect_dig_be_to_fe: an MST backend keeps the
+        // other streams' selections; an SST one takes this frontend alone.
+        let mask = if plan.link.phy.settings.mst {
+            own
         } else {
-            0
+            0x7f00
         };
-        self.update(DpStream::Dio(phy).at(self.layout, 0x20bc), 0x7f00, value)?;
-        plan.link.phy.controls[1] = (plan.link.phy.controls[1] & !0x7f00) | value;
-        plan.backend_routes[usize::from(phy)] = value;
+        self.update(DpStream::Dio(phy).at(self.layout, 0x20bc), mask, value)?;
+        plan.link.phy.controls[1] = (plan.link.phy.controls[1] & !mask) | value;
+        plan.backend_routes[usize::from(phy)] =
+            (plan.backend_routes[usize::from(phy)] & !mask) | value;
         Ok(())
     }
     fn dp_frontend_clock_route(
@@ -337,7 +354,9 @@ impl<I: Io> Engine<I> {
             self.dp_frontend_update(plan, slot, mask, value)?;
         }
         self.dp_frontend_route(plan, true)?;
-        self.dp_frontend_update(plan, 1, 7, 0)?;
+        // enc401 dp enable: DIG_FE_MODE DP SST (0) or DP MST (5).
+        let mode = if plan.link.phy.settings.mst { 5 } else { 0 };
+        self.dp_frontend_update(plan, 1, 7, mode)?;
         self.dp_frontend_update(plan, 1, 0x10, 0x10)?;
         self.dp_frontend_update(plan, 2, 1, 1)?;
         let at = DpStream::Dio(plan.request.stream).at(self.layout, 0x2094);

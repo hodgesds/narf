@@ -340,7 +340,10 @@ async fn sink_config(io: &mut impl Transport, plan: DpLinkTrained) -> Result<(),
     Ok(())
 }
 impl<I: Io> Engine<I> {
-    fn dp_training_verify(&mut self, plan: DpLinkTrained) -> Result<(), Error> {
+    pub(in crate::amdgpu_dcn401_otg) fn dp_training_verify(
+        &mut self,
+        plan: DpLinkTrained,
+    ) -> Result<(), Error> {
         self.dp_training_verify_owned(plan, None, None)
     }
     fn dp_training_verify_owned(
@@ -854,6 +857,13 @@ impl<I: Io> Engine<I> {
         let plan = self.status.dp_link_trained.ok_or(Error::Invalid)?;
         if plan.phy.path != path {
             return Err(Error::Invalid);
+        }
+        // An attached display never stops the link it rides, nor the owner
+        // while another display streams on it.
+        if self.status.mst_owner.is_some()
+            || self.displays.siblings.transmitters & bit(path.transmitter) != 0
+        {
+            return Err(Error::Busy);
         }
         self.dp_training_verify(plan)?;
         self.status.state = State::StoppingDpLink(path.transmitter);

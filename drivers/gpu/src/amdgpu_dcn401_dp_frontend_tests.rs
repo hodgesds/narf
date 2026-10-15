@@ -62,7 +62,7 @@ fn fixture_range(
     depth: ColorDepth,
     limited: bool,
 ) -> (Engine<FrontendIo>, Link, dccg::Applied) {
-    fixture_with(p, stream, pipe, depth, limited, None)
+    fixture_with(p, stream, pipe, depth, limited, None, false)
 }
 /// As `fixture_range`, the timing compressed by the pipe's DSC.
 fn fixture_with(
@@ -72,8 +72,9 @@ fn fixture_with(
     depth: ColorDepth,
     limited: bool,
     dsc: Option<crate::amdgpu_dsc::DscConfig>,
+    mst: bool,
 ) -> (Engine<FrontendIo>, Link, dccg::Applied) {
-    let (mut e, mut io) = super::fixture(p, 4, LinkRate::Hbr3, TrainingPattern::Tps4);
+    let (mut e, mut io) = super::fixture_mode(p, 4, LinkRate::Hbr3, TrainingPattern::Tps4, mst);
     // Exercise the public engine sequence, including prepared timing before PHY
     // enable/training. No forged completion records or hand-built ready state.
     run(e.disable_dp_phy(&mut io, path(p))).unwrap();
@@ -101,7 +102,12 @@ fn fixture_with(
         .inner
         .regs
         .insert(bank1 + 0x68 * 4, 4 << (pipe * 3));
-    run(e.enable_dp_phy(&mut io, path(p), io_settings())).unwrap();
+    let settings = DpPhySettings {
+        mst,
+        ..io_settings()
+    };
+    io.settings = settings;
+    run(e.enable_dp_phy(&mut io, path(p), settings)).unwrap();
     run(e.train_dp_link(&mut io, path(p), false, false)).unwrap();
     let source = dio(stream, 0x2093);
     e.io.inner.inner.regs.insert(source, 0x80000176); // clear only native routing fields

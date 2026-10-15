@@ -128,6 +128,10 @@ fn fixture_reference(
 ) -> (Engine<VideoIo>, Link, dccg::Applied) {
     fixture_dsc(p, stream, pipe, depth, reference, None)
 }
+/// The fixture on an MST link.
+fn fixture_mst(p: u8, stream: u8, pipe: u8) -> (Engine<VideoIo>, Link, dccg::Applied) {
+    fixture_mode(p, stream, pipe, ColorDepth::Bpc8, None, None, true)
+}
 fn fixture_dsc(
     p: u8,
     stream: u8,
@@ -136,7 +140,18 @@ fn fixture_dsc(
     reference: Option<u32>,
     dsc: Option<crate::amdgpu_dsc::DscConfig>,
 ) -> (Engine<VideoIo>, Link, dccg::Applied) {
-    let (mut e, mut io, mut c) = super::fixture_with(p, stream, pipe, depth, false, dsc);
+    fixture_mode(p, stream, pipe, depth, reference, dsc, false)
+}
+fn fixture_mode(
+    p: u8,
+    stream: u8,
+    pipe: u8,
+    depth: ColorDepth,
+    reference: Option<u32>,
+    dsc: Option<crate::amdgpu_dsc::DscConfig>,
+    mst: bool,
+) -> (Engine<VideoIo>, Link, dccg::Applied) {
+    let (mut e, mut io, mut c) = super::fixture_with(p, stream, pipe, depth, false, dsc, mst);
     if let Some(reference) = reference {
         // Inject the clock owner's result; its native DTO checks have separate
         // DCCG models. Never forge a frontend/video completion in this fixture.
@@ -1043,3 +1058,76 @@ kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_dp_video_sends_dsc_pps_like_linux
 );
+
+/// Two displays on one MST link, as Linux's MST streams share their link
+/// encoder: display 0 trains the link and runs its stream (DIG_FE_MODE
+/// 5); display 1 attaches to the running link, stages its timing and its
+/// own frontend, which joins the backend's frontend selection beside
+/// display 0's and leaves it alone on stop. The attached display can't
+/// stop the link; it detaches, and display 0's video still runs.
+fn dcn401_mst_displays_share_one_link() -> TestResult {
+    let (t, s0, p0, s1, p1) = (2u8, 1u8, 1u8, 3u8, 2u8);
+    let (mut e, mut io, c) = fixture_mst(t, s0, p0);
+    start(&mut e, &mut io, c);
+    let be = dio(t, 0x20bc);
+    if e.io.fake().regs[&dio(s0, 0x2094)] & 7 != 5 || e.io.fake().regs[&be] & 0x7f00 != 0x100 << s0
+    {
+        return TestResult::Fail("first MST stream");
+    }
+    if e.select_display(1).is_err() || e.displays.siblings.mst != 1 << t {
+        return TestResult::Fail("MST link as sibling");
+    }
+    let mut req = request(p1);
+    req.signal = Signal::DisplayPort;
+    let c1 = clock(req);
+    run(e.prepare(req, c1)).unwrap();
+    run(e.prepare_blank(
+        BlankRequest {
+            pipe: p1,
+            depth: ColorDepth::Bpc8,
+            limited: false,
+            ycbcr420: false,
+        },
+        c1,
+    ))
+    .unwrap();
+    let bank1 = e.layout.dio_clock - 0xa0 * 4;
+    e.io.fake()
+        .regs
+        .insert(bank1 + (0x80 + 4 * u64::from(p1)) * 4, 0x1090);
+    let sources =
+        e.io.fake()
+            .regs
+            .get(&(bank1 + 0x68 * 4))
+            .copied()
+            .unwrap_or(0);
+    e.io.fake()
+        .regs
+        .insert(bank1 + 0x68 * 4, sources | 4 << (p1 * 3));
+    // Training the shared link is the owner's; attaching is not.
+    if let Err(err) = e.attach_mst_link(t) {
+        panic!("attach {err:?}");
+    }
+    e.io.inner.stream = s1;
+    if let Err(err) = run(e.prepare_dp_frontend(&mut io, path(t), super::req(s1, p1), c1)) {
+        panic!("second MST frontend {err:?}");
+    }
+    if e.io.fake().regs[&be] & 0x7f00 != (0x100 << s0 | 0x100 << s1)
+        || e.io.fake().regs[&dio(s1, 0x2094)] & 7 != 5
+    {
+        return TestResult::Fail("second MST stream");
+    }
+    run(e.stop_dp_frontend(path(t))).unwrap();
+    if e.io.fake().regs[&be] & 0x7f00 != 0x100 << s0 {
+        return TestResult::Fail("second stream's selection removed alone");
+    }
+    if run(e.stop_dp_link(&mut io, path(t))) != Err(Error::Busy) || e.detach_mst_link(t).is_err() {
+        return TestResult::Fail("attached display and the link");
+    }
+    e.io.inner.stream = s0;
+    if e.select_display(0).is_err() || run(e.stop_dp_video(&mut io, path(t))).is_err() {
+        return TestResult::Fail("owner's stream after the second left");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dcn401-otg", dcn401_mst_displays_share_one_link);

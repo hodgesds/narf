@@ -958,6 +958,7 @@ fn dcn401_hdmi_link_starts_beside_another_display() -> TestResult {
         streams: 1 << 0,
         hpo: 0,
         frl: false,
+        mst: 0,
         live: [None; 4],
     };
     let running = |e: &mut Engine<TmdsIo>| {

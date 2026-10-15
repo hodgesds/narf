@@ -24,7 +24,7 @@ pub struct DpPhyReady {
     pub settings: DpPhySettings,
     /// Observed physical lane mask, independent of board lane reversal/mapping.
     pub physical_lanes: u8,
-    controls: [u32; 6],
+    pub(in crate::amdgpu_dcn401_otg) controls: [u32; 6],
 }
 impl DpPhyReady {
     fn registers(self, l: Layout) -> [(u64, u32); 6] {
@@ -113,7 +113,14 @@ impl<I: Io> Engine<I> {
     ) -> Result<(), Error> {
         let l = self.layout;
         let s = self.displays.siblings;
-        if s.transmitters & bit(phy) != 0
+        // Another display's link, unless it is an MST link this display's
+        // own (or attached) MST link record shares.
+        let shared = s.mst & bit(phy) != 0
+            && self
+                .status
+                .dp_link_trained
+                .is_some_and(|l| l.phy.settings.mst && l.phy.path.transmitter == phy);
+        if (s.transmitters & bit(phy) != 0 && !shared)
             || frontend.is_some_and(|f| s.streams & bit(f) != 0)
             || timing.is_some_and(|p| s.pipes & bit(p) != 0)
         {
@@ -243,8 +250,21 @@ impl<I: Io> Engine<I> {
         timing: Option<u8>,
     ) -> Result<(), Error> {
         self.dp_phy_consumers_owned(plan.path.transmitter, frontend, timing)?;
-        for ((at, mask), expected) in plan.registers(self.layout).into_iter().zip(plan.controls) {
-            if self.read(at)? & mask != expected {
+        // On an MST link, other displays' frontends select this backend too
+        // (DIG_FE_SOURCE_SELECT): their bits are theirs.
+        let theirs = if plan.settings.mst {
+            u32::from(self.displays.siblings.streams) << 8
+        } else {
+            0
+        };
+        for (i, ((at, mask), expected)) in plan
+            .registers(self.layout)
+            .into_iter()
+            .zip(plan.controls)
+            .enumerate()
+        {
+            let mask = if i == 1 { mask & !theirs } else { mask };
+            if self.read(at)? & mask != expected & mask {
                 return Err(Error::Readback(at));
             }
         }

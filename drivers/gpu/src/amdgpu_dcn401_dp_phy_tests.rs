@@ -584,6 +584,7 @@ fn dcn401_dp_phy_leaves_other_displays_consumers_to_them() -> TestResult {
         streams: 1 << 3,
         hpo: 0,
         frl: false,
+        mst: 0,
         live: [None; 4],
     };
     let running = |e: &mut Engine<PhyIo>| {

@@ -684,6 +684,7 @@ fn dcn401_second_display_leaves_the_live_one_alone() -> TestResult {
         streams: 1 << s,
         hpo: 0,
         frl: false,
+        mst: 0,
         live: [None; 4],
     };
     want.live[usize::from(p)] = Some((live.address, false));

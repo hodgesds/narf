@@ -391,6 +391,9 @@ pub struct Status {
     /// Black FRL video; current only in FrlVideoRunning (or beneath a live
     /// scanout).
     pub frl_video_running: Option<FrlVideoRunning>,
+    /// The display whose MST link this one's stream rides (attached, not
+    /// trained, by this display); its link record is a copy of theirs.
+    pub mst_owner: Option<u8>,
     /// Historical lane/TX-clock/character-root stop; forced input clocks stay owned.
     pub frl_disabled: Option<FrlDisabled>,
     /// Timing retirement only. Does not prove HUBP/VM or surface retirement.
@@ -436,6 +439,7 @@ impl Status {
             frl_link_retired: None,
             frl_link: None,
             frl_video_running: None,
+            mst_owner: None,
             frl_disabled: None,
             retired: 0,
         }
@@ -672,6 +676,9 @@ pub struct Siblings {
     pub hpo: u8,
     /// A display running FRL: the single HPO FRL encoder and its clocks.
     pub frl: bool,
+    /// Transmitters whose running link is 8b/10b MST: others' streams may
+    /// share them.
+    pub mst: u8,
     pub live: [Option<(u64, bool)>; 4],
 }
 /// An instance's bit in a `Siblings` mask; none for an instance past 7.
@@ -744,8 +751,14 @@ impl Siblings {
             }
             _ => return out,
         };
+        let mst = s.dp_video_running.is_some_and(|v| {
+            v.frontend.link.phy.settings.mst && v.frontend.request.stream == stream
+        });
         if let Some(path) = link {
             out.transmitters |= bit(path.transmitter);
+            if mst {
+                out.mst |= bit(path.transmitter);
+            }
             out.streams |= bit(stream);
             if uhbr(stream).is_some() {
                 out.hpo |= bit(stream);
@@ -766,6 +779,7 @@ impl Siblings {
             streams: self.streams | other.streams,
             hpo: self.hpo | other.hpo,
             frl: self.frl || other.frl,
+            mst: self.mst | other.mst,
             live,
         }
     }
