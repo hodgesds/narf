@@ -73,6 +73,14 @@ pub struct MstPayload {
     pub stream: u8,
 }
 
+/// A payload transaction started but has not completed its required steps.
+/// Retained after errors or cancellation; it is not permission to replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MstPayloadChange {
+    Adding(u8),
+    Removing(u8),
+}
+
 /// A port running MST: its manager, topology and payloads.
 #[derive(Debug, Default)]
 pub struct MstLink {
@@ -83,8 +91,26 @@ pub struct MstLink {
     pub payloads: Vec<MstPayload>,
     /// Stable KMS slots, including reservations for disconnected sinks.
     pub outputs: [Option<MstOutput>; 4],
+    payload_change: Option<MstPayloadChange>,
     state: ProbeState,
     dirty: bool,
+}
+
+impl MstLink {
+    /// Started payload work without a completion witness, including returned
+    /// errors and dropped futures. No automatic replay/reset is provided.
+    pub fn payload_change(&self) -> Option<MstPayloadChange> {
+        self.payload_change
+    }
+    pub(super) fn require_payload_idle<E>(&self) -> Result<(), MstFailure<E>> {
+        if self.payload_change.is_some() {
+            return Err(otg::Error::Busy.into());
+        }
+        Ok(())
+    }
+    fn has_stream_resources(&self) -> bool {
+        self.owner.is_some() || !self.payloads.is_empty() || self.payload_change.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,6 +191,7 @@ pub(crate) async fn add_payload<A: MstAux, S: MstSource>(
     slots: u8,
     rate: (u32, u32),
 ) -> Result<MstPayload, MstFailure<A::Error>> {
+    link.require_payload_idle()?;
     let info = link.topology.port(sink).ok_or(MstFailure::Invalid)?.info;
     let branch = link.topology.branches[sink.branch].clone();
     if link
@@ -193,6 +220,9 @@ pub(crate) async fn add_payload<A: MstAux, S: MstSource>(
         pbn,
         stream,
     };
+    // Persist before the first remote write, even before payloads.push. An
+    // error or dropped future may leave the receiver ahead of our bookkeeping.
+    link.payload_change = Some(MstPayloadChange::Adding(stream));
     dp_mst_mgr::write_payload(aux, vcpi, payload.start, slots).await?;
     link.payloads.push(payload);
     source.allocation(&table(&link.payloads)).await?;
@@ -212,6 +242,7 @@ pub(crate) async fn add_payload<A: MstAux, S: MstSource>(
         _ => return Err(MstFailure::Mst(MstError::Malformed)),
     }
     source.vc_rate(stream, rate).await?;
+    link.payload_change = None;
     Ok(payload)
 }
 
@@ -227,12 +258,14 @@ pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
     stream: u8,
     connected: bool,
 ) -> Result<(), MstFailure<A::Error>> {
+    link.require_payload_idle()?;
     let index = link
         .payloads
         .iter()
         .position(|p| p.stream == stream)
         .ok_or(MstFailure::Invalid)?;
     let payload = link.payloads[index];
+    link.payload_change = Some(MstPayloadChange::Removing(stream));
     source.vc_rate(stream, (0, 0)).await?;
     if let (true, Some(branch), Some(port)) = (
         connected,
@@ -261,6 +294,7 @@ pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
     for p in link.payloads.iter_mut().filter(|p| p.start > payload.start) {
         p.start -= payload.slots;
     }
+    link.payload_change = None;
     Ok(())
 }
 
@@ -347,7 +381,7 @@ impl ColdBoot {
             || self
                 .mst
                 .get(&port)
-                .is_some_and(|l| l.owner.is_some() || !l.payloads.is_empty())
+                .is_some_and(MstLink::has_stream_resources)
         {
             return Err(MstFailure::Invalid);
         }
@@ -361,6 +395,7 @@ impl ColdBoot {
     pub async fn poll_display_mst(&mut self, port: usize) -> Result<usize, MstFailure> {
         let (instance, _) = self.mst_path(port)?;
         let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
+        link.require_payload_idle()?;
         if link.state != ProbeState::Ready {
             return Err(MstFailure::Invalid);
         }
@@ -387,6 +422,7 @@ impl ColdBoot {
     ) -> Result<Vec<u8>, MstFailure> {
         let (instance, _) = self.mst_path(port)?;
         let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
+        link.require_payload_idle()?;
         let mut aux = DmubAux {
             dmub: &mut self.sequence.backend.dmub,
             instance,
@@ -394,6 +430,7 @@ impl ColdBoot {
         topology::read_edid(&mut link.manager, &mut aux, &link.topology, sink).await
     }
     /// Add DIO stream `stream`'s payload for `sink` (`add_payload`).
+    /// Incomplete transactions retain their marker and refuse further changes.
     /// # Safety
     /// The selected display's frontend on `stream` runs on the port's MST
     /// link, its video not yet started.
@@ -419,6 +456,8 @@ impl ColdBoot {
         add_payload(link, &mut aux, &mut source, sink, stream, pbn, slots, rate).await
     }
     /// Remove DIO stream `stream`'s payload (`remove_payload`).
+    /// Failure/cancellation retains the transaction even if its list entry
+    /// has already been removed; that does not prove source/sink completion.
     /// # Safety
     /// The selected display's video on `stream` is stopped.
     pub async unsafe fn remove_display_mst_payload(
@@ -440,12 +479,13 @@ impl ColdBoot {
         remove_payload(link, &mut aux, &mut source, stream, connected).await
     }
     /// drm_dp_mst_topology_mgr_set_mst(false), the port's MST state dropped.
-    /// A session with a source owner or retained payloads is left untouched.
+    /// A session with a source owner, payloads or an incomplete payload change
+    /// is left untouched.
     pub async fn stop_display_mst(&mut self, port: usize) {
         if self
             .mst
             .get(&port)
-            .is_some_and(|l| l.owner.is_some() || !l.payloads.is_empty())
+            .is_some_and(MstLink::has_stream_resources)
         {
             return;
         }
@@ -708,6 +748,7 @@ impl ColdBoot {
             return Err(ModesetError::Link);
         };
         let link = self.mst.get(&port).ok_or(MstFailure::Invalid)?;
+        link.require_payload_idle()?;
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
             if link.owner.is_none() {
@@ -730,8 +771,12 @@ impl ColdBoot {
             } else {
                 self.attach_display_mst_link(port)?;
             }
+            self.teardowns
+                .checkpoint_activation(pipe, super::TeardownStep::Link);
             self.prepare_display_dp_frontend(port, otg::DpFrontendRequest { stream: pipe, pipe })
                 .await?;
+            self.teardowns
+                .checkpoint_activation(pipe, super::TeardownStep::Frontend);
             self.add_display_mst_payload(
                 port,
                 stream.sink,
@@ -741,7 +786,11 @@ impl ColdBoot {
                 stream.rate,
             )
             .await?;
+            self.teardowns
+                .checkpoint_activation(pipe, super::TeardownStep::Payload);
             self.start_display_dp_video(port).await?;
+            self.teardowns
+                .checkpoint_activation(pipe, super::TeardownStep::Video);
             Ok(self.start_display_scanout(pipe).await?)
         }
     }
@@ -758,7 +807,9 @@ impl ColdBoot {
         pipe: u8,
         unplugged: bool,
     ) -> Result<(), ModesetError> {
-        let owner = self.mst.get(&port).ok_or(MstFailure::Invalid)?.owner == Some(pipe);
+        let link = self.mst.get(&port).ok_or(MstFailure::Invalid)?;
+        link.require_payload_idle()?;
+        let owner = link.owner == Some(pipe);
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
             if !owner {

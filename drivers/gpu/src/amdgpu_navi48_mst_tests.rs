@@ -213,3 +213,297 @@ kernel_test_in!(
     "drivers/gpu/dp-mst",
     navi48_mst_unplug_removes_payload_without_aux
 );
+
+#[derive(Clone, Copy)]
+enum Fault {
+    Error,
+    Cancel,
+}
+/// A deterministic failure/drop boundary on either side of every AUX/source
+/// operation. Cancellation uses Pending, never a race against a hardware timer.
+struct Gate {
+    calls: core::cell::Cell<usize>,
+    fault: Option<(usize, bool, Fault)>,
+}
+impl Gate {
+    async fn check(&self, call: usize, after: bool) -> Result<(), ()> {
+        if let Some((at, late, fault)) = self.fault {
+            if call == at && late == after {
+                match fault {
+                    Fault::Error => return Err(()),
+                    Fault::Cancel => core::future::pending::<()>().await,
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn before(&self) -> Result<usize, ()> {
+        let call = self.calls.get() + 1;
+        self.calls.set(call);
+        self.check(call, false).await?;
+        Ok(call)
+    }
+}
+struct FaultAux<'a> {
+    inner: Aux<'a>,
+    gate: &'a Gate,
+}
+impl MstAux for FaultAux<'_> {
+    type Error = ();
+    async fn read(&mut self, at: u32, buf: &mut [u8]) -> Result<(), ()> {
+        let call = self.gate.before().await?;
+        self.inner.read(at, buf).await?;
+        self.gate.check(call, true).await
+    }
+    async fn write(&mut self, at: u32, buf: &[u8]) -> Result<(), ()> {
+        let call = self.gate.before().await?;
+        self.inner.write(at, buf).await?;
+        self.gate.check(call, true).await
+    }
+    async fn delay(&mut self, us: u64) {
+        self.inner.delay(us).await;
+    }
+}
+struct FaultSource<'a> {
+    inner: Source<'a>,
+    gate: &'a Gate,
+}
+impl MstSource for FaultSource<'_> {
+    async fn allocation(&mut self, table: &[otg::MstAllocation]) -> Result<(), otg::Error> {
+        let call = self.gate.before().await.map_err(|()| otg::Error::Busy)?;
+        self.inner.allocation(table).await?;
+        self.gate
+            .check(call, true)
+            .await
+            .map_err(|()| otg::Error::Busy)
+    }
+    async fn vc_rate(&mut self, stream: u8, rate: (u32, u32)) -> Result<(), otg::Error> {
+        let call = self.gate.before().await.map_err(|()| otg::Error::Busy)?;
+        self.inner.vc_rate(stream, rate).await?;
+        self.gate
+            .check(call, true)
+            .await
+            .map_err(|()| otg::Error::Busy)
+    }
+}
+fn poll_once<F: core::future::Future>(f: F) -> core::task::Poll<F::Output> {
+    let mut f = core::pin::pin!(f);
+    f.as_mut().poll(&mut core::task::Context::from_waker(
+        core::task::Waker::noop(),
+    ))
+}
+fn payload_fixture(remove: bool) -> (RefCell<Hub>, MstLink) {
+    let mut hub = Hub::new();
+    hub.dpcd.insert(0, 0x14);
+    hub.edid[126] = 0;
+    let mut link = MstLink::default();
+    run(link.prepare(&mut hub)).unwrap();
+    let hub = RefCell::new(hub);
+    if remove {
+        let sink = link.topology.sinks()[0];
+        let mut source = Source {
+            hub: &hub,
+            events: Vec::new(),
+        };
+        run(add_payload(
+            &mut link,
+            &mut Aux(&hub),
+            &mut source,
+            sink,
+            1,
+            900,
+            12,
+            (11, 7),
+        ))
+        .unwrap();
+    }
+    (hub, link)
+}
+async fn change_payload(
+    link: &mut MstLink,
+    aux: &mut FaultAux<'_>,
+    source: &mut FaultSource<'_>,
+    remove: bool,
+) -> Result<(), MstFailure<()>> {
+    if remove {
+        remove_payload(link, aux, source, 1, true).await
+    } else {
+        let sink = link.topology.sinks()[0];
+        add_payload(link, aux, source, sink, 1, 900, 12, (11, 7))
+            .await
+            .map(|_| ())
+    }
+}
+
+fn payload_faults(fault: Fault) -> TestResult {
+    for remove in [false, true] {
+        let (hub, mut link) = payload_fixture(remove);
+        let gate = Gate {
+            calls: core::cell::Cell::new(0),
+            fault: None,
+        };
+        let mut aux = FaultAux {
+            inner: Aux(&hub),
+            gate: &gate,
+        };
+        let mut source = FaultSource {
+            inner: Source {
+                hub: &hub,
+                events: Vec::new(),
+            },
+            gate: &gate,
+        };
+        assert_eq!(
+            poll_once(change_payload(&mut link, &mut aux, &mut source, remove)),
+            core::task::Poll::Ready(Ok(()))
+        );
+        assert_eq!(link.payload_change(), None);
+        let calls = gate.calls.get();
+        assert!(calls > 4);
+        for call in 1..=calls {
+            for after in [false, true] {
+                let (hub, mut link) = payload_fixture(remove);
+                let gate = Gate {
+                    calls: core::cell::Cell::new(0),
+                    fault: Some((call, after, fault)),
+                };
+                let mut aux = FaultAux {
+                    inner: Aux(&hub),
+                    gate: &gate,
+                };
+                let mut source = FaultSource {
+                    inner: Source {
+                        hub: &hub,
+                        events: Vec::new(),
+                    },
+                    gate: &gate,
+                };
+                let result = poll_once(change_payload(&mut link, &mut aux, &mut source, remove));
+                if matches!(fault, Fault::Cancel) {
+                    assert!(
+                        result.is_pending(),
+                        "missed cancellation {call} after={after}"
+                    );
+                } else if result == core::task::Poll::Ready(Ok(())) {
+                    // Preserve the existing best-effort remote-removal/status
+                    // policy; its successful source steps complete normally.
+                    assert_eq!(link.payload_change(), None);
+                    continue;
+                } else {
+                    assert!(matches!(result, core::task::Poll::Ready(Err(_))));
+                }
+                let pending = if remove {
+                    MstPayloadChange::Removing(1)
+                } else {
+                    MstPayloadChange::Adding(1)
+                };
+                assert_eq!(link.payload_change(), Some(pending));
+                let attempted = gate.calls.get();
+                let payloads = link.payloads.clone();
+                let topology = link.topology.clone();
+                // Neither replay nor another stream's mutation may touch the
+                // source/sink after an unproven partial change.
+                let sink = link.topology.sinks()[1];
+                assert_eq!(
+                    poll_once(add_payload(
+                        &mut link,
+                        &mut aux,
+                        &mut source,
+                        sink,
+                        3,
+                        500,
+                        7,
+                        (6, 9)
+                    )),
+                    core::task::Poll::Ready(Err(otg::Error::Busy.into()))
+                );
+                assert_eq!(
+                    poll_once(remove_payload(&mut link, &mut aux, &mut source, 1, false)),
+                    core::task::Poll::Ready(Err(otg::Error::Busy.into()))
+                );
+                for dirty in [false, true] {
+                    link.dirty = dirty;
+                    assert_eq!(
+                        poll_once(link.prepare(&mut aux)),
+                        core::task::Poll::Ready(Err(otg::Error::Busy.into()))
+                    );
+                }
+                assert!(
+                    link.has_stream_resources(),
+                    "empty bookkeeping lost uncertain ownership"
+                );
+                assert_eq!(gate.calls.get(), attempted);
+                assert_eq!(link.payload_change(), Some(pending));
+                assert_eq!(link.payloads, payloads);
+                assert_eq!(link.topology, topology);
+            }
+        }
+    }
+    TestResult::Pass
+}
+fn navi48_mst_payload_errors_quarantine_incomplete_source_and_sink_changes() -> TestResult {
+    payload_faults(Fault::Error)
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_payload_errors_quarantine_incomplete_source_and_sink_changes
+);
+fn navi48_mst_payload_cancellation_retains_even_empty_bookkeeping() -> TestResult {
+    payload_faults(Fault::Cancel)
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_payload_cancellation_retains_even_empty_bookkeeping
+);
+
+fn navi48_mst_payload_preflight_rejection_leaves_transaction_reusable() -> TestResult {
+    let (hub, mut link) = payload_fixture(true);
+    let mut aux = Aux(&hub);
+    let mut source = Source {
+        hub: &hub,
+        events: Vec::new(),
+    };
+    let sink = link.topology.sinks()[1];
+    let sent = hub.borrow().requests.len();
+    assert_eq!(
+        run(add_payload(
+            &mut link,
+            &mut aux,
+            &mut source,
+            sink,
+            1,
+            500,
+            7,
+            (6, 9)
+        )),
+        Err(MstFailure::Invalid)
+    );
+    assert_eq!(
+        run(remove_payload(&mut link, &mut aux, &mut source, 3, true)),
+        Err(MstFailure::Invalid)
+    );
+    assert_eq!(link.payload_change(), None);
+    assert!(source.events.is_empty());
+    assert_eq!(hub.borrow().requests.len(), sent);
+    run(add_payload(
+        &mut link,
+        &mut aux,
+        &mut source,
+        sink,
+        3,
+        500,
+        7,
+        (6, 9),
+    ))
+    .unwrap();
+    assert_eq!(link.payload_change(), None);
+    run(remove_payload(&mut link, &mut aux, &mut source, 1, true)).unwrap();
+    assert_eq!(link.payload_change(), None);
+    assert_eq!(link.payloads.len(), 1);
+    assert_eq!((link.payloads[0].stream, link.payloads[0].start), (3, 1));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_payload_preflight_rejection_leaves_transaction_reusable
+);

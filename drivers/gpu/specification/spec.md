@@ -1015,13 +1015,21 @@ cleanup, including a failed pipe missing from `Configuration.displays`.
 
 Startup checkpoints the inverse of each completed link, frontend, video and
 scanout phase before the next operation can suspend or fail. This covers TMDS,
-legacy DP SST, UHBR and FRL: TMDS/FRL link completion starts cleanup at SCDC,
+legacy DP SST/MST, UHBR and FRL: TMDS/FRL link completion starts cleanup at SCDC,
 DP training at Link, legacy SST frontend at Frontend, and video at Video.
 TMDS/SST scanout completion starts at Scanout, so an audio preflight rejection
 does not strand live fetch. Audio is not stopped unless it actually completed;
 successful audio is the final startup operation and returns a normal Modeset.
 UHBR/FRL scanout is likewise the final startup operation. Retraining an already
 published Modeset does not create or change an activation record.
+
+MST checkpoints trained/attached link ownership at Link, the frontend at
+Frontend, completed payload allocation at Payload and black video at Video.
+Cleanup removes the payload before detaching the frontend/link, preserving
+other streams and handing over shared-link ownership when needed. An incomplete
+payload transaction blocks every cleanup step, even when native state looks
+settled; the retained payload marker described below is independent of the
+per-pipe activation/teardown journal.
 
 The abort unwinds these checkpointed phases through the normal native stop
 operations, then retires timing (including DSC disable), optional DSC clock,
@@ -1042,10 +1050,11 @@ buffers that a low-level caller chose not to release after its previous stop.
 An unknown/non-activation pipe is Invalid. Dropping startup or an abort phase
 leaves the in-flight marker set and blocks replay, even if the native state
 looks reusable during a compound operation or retry delay. No reset or
-recovery of cancelled startup, uncheckpointed active work (including MST
-startup), pre-link SCDC changes or shared-clock failure is implied. Models cover
-abort phase faults/cancellation, every supported checkpoint's cleanup suffix,
-sibling isolation and native staged/live retirement through fresh release.
+recovery of cancelled startup, incomplete MST payload transactions,
+uncheckpointed active work, pre-link SCDC changes or shared-clock failure is
+implied. Models cover abort phase faults/cancellation, every supported
+checkpoint's cleanup suffix, sibling isolation and native staged/live retirement
+through fresh release.
 
 The monitor records intent before draining CPU views, publishes the retiring
 CRTC inactive, and retains its Modeset until teardown and surface release both
@@ -1367,6 +1376,24 @@ ALLOCATE_PAYLOAD and stream VC rate before video. Remove zeroes the VC rate,
 deallocates remotely, updates SAT/ACT and compacts later payload slots. Physical
 root removal skips all remote AUX transactions and waits during removal.
 
+`MstLink::payload_change()` reports `Option<MstPayloadChange>`, whose Adding and
+Removing variants carry the DIO stream index. The marker is recorded before the
+first AUX/source side effect and cleared only after all required steps complete,
+without a suspension between completion and clearing. Returned failures and
+dropped futures retain it, including before an add reaches `payloads.push` or
+after a removal empties that list. It is historical uncertainty, never a retry
+or ownership proof. Another add/remove, startup, modeset teardown (including its
+link handover/detach), clean/dirty topology preparation, notification polling and
+remote EDID reads are refused with Busy while it remains. Session shutdown and
+physical removal cannot discard it merely because source-owner/payload lists are empty.
+Static request rejection before the transaction starts (such as duplicate stream
+or missing payload) leaves it clear and permits a corrected request. The existing
+best-effort remote-removal/ACT-status policy is unchanged; source completion is
+still required. No reconciliation or reset of uncertain payload state is provided.
+Models inject returned errors and deterministic cancellation on both sides of
+every AUX/source operation, checking retained state, no replay or sibling
+mutation, topology/session retention and successful slot compaction.
+
 The first display trains the link; the others attach and own their own
 DIG_FE_MODE=5 frontend selections. When the link owner stops its frontend,
 `hand_over_mst_link` transfers ownership to a remaining attached display.
@@ -1374,7 +1401,8 @@ Only the last display stops the PHY; a connected root stays in D0 with its
 MST manager enabled, including all-off and empty configurations. Physical
 removal drops the manager after its last source owner/payload retires;
 `forget_unplugged_display_mst` checks HPD low and performs no AUX access.
-Explicit `stop_display_mst` refuses to drop a live owner or payload.
+Explicit `stop_display_mst` refuses to drop a live owner, payload or incomplete
+payload transaction.
 Source verification accepts sibling routes being released while still rejecting unowned frontend
 selections. Failed transitions retain their owners and allocations.
 

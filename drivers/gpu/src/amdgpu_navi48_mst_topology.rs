@@ -107,10 +107,11 @@ impl MstLink {
         &mut self,
         aux: &mut A,
     ) -> Result<(), MstFailure<A::Error>> {
+        self.require_payload_idle()?;
         if self.state == ProbeState::Ready && !self.dirty {
             return Ok(());
         }
-        if self.state == ProbeState::Probing || self.owner.is_some() || !self.payloads.is_empty() {
+        if self.state == ProbeState::Probing || self.has_stream_resources() {
             return Err(MstFailure::Invalid);
         }
         let start = self.state == ProbeState::New;

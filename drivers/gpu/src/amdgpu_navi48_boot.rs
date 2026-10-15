@@ -2488,7 +2488,9 @@ impl ColdBoot {
 
 #[path = "amdgpu_navi48_mst.rs"]
 mod mst;
-pub use mst::{select_mst, MstFailure, MstLink, MstOutput, MstOutputId, MstPayload};
+pub use mst::{
+    select_mst, MstFailure, MstLink, MstOutput, MstOutputId, MstPayload, MstPayloadChange,
+};
 #[path = "amdgpu_navi48_modeset.rs"]
 mod modeset;
 #[path = "amdgpu_navi48_teardown.rs"]

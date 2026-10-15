@@ -450,12 +450,16 @@ records an unpublished activation before staging. A returned failure attempts
 timing/DSC/plane retirement and fresh surface release when native owners prove
 the output stopped; completed cleanup steps survive preflight rejection.
 Pending cleanup blocks relighting/preferred-mode fallback and is retried before
-monitor topology work. TMDS, legacy DP SST, UHBR and FRL startup now checkpoint
+monitor topology work. TMDS, legacy DP SST/MST, UHBR and FRL startup now checkpoint
 completed link/frontend/video/scanout phases, so a later preflight rejection
 unwinds the completed work before timing/plane retirement and fresh release.
 This includes audio rejection after live fetch and scanout underflow recovered
-to black video. Native failure guards remain binding; cancelled startup,
-uncheckpointed active work (including MST startup), pre-link SCDC changes and
+to black video. MST also checkpoints payload completion before video, retaining
+shared-link ownership until payload/frontend cleanup completes. A separate MST
+payload-transaction marker survives failure/cancellation before or after list
+updates; it blocks replay, teardown and session loss while ownership is uncertain.
+Native failure guards remain binding; cancelled startup, uncertain MST payload
+transactions, uncheckpointed active work, pre-link SCDC changes and
 shared-clock recovery remain open, with uncertain memory retained.
 The lit Navi48 display is published as DRM KMS state on the amdgpu card, with
 the sink's real EDID and exact timing (disconnected on unplug). SETCRTC

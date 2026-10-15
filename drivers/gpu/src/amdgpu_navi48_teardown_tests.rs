@@ -529,13 +529,14 @@ kernel_test_in!(
     navi48_activation_abort_quarantines_cancelled_and_failed_native_steps
 );
 
-fn activation_checkpoints() -> [(Protocol, &'static [TeardownStep]); 4] {
+fn activation_checkpoints() -> [(Protocol, &'static [TeardownStep]); 5] {
     use TeardownStep::*;
     [
         (Protocol::Tmds, &[Scdc, Video, Scanout]),
         (Protocol::Sst, &[Link, Frontend, Video, Scanout]),
         (Protocol::Uhbr, &[Link, Video]),
         (Protocol::Frl, &[Scdc, Video]),
+        (Protocol::Mst, &[Link, Frontend, Payload, Video]),
     ]
 }
 

@@ -296,6 +296,11 @@ impl Backend for ColdBoot {
         &mut self.teardowns
     }
     fn completed(&mut self, r: Request) -> Result<(), ModesetError> {
+        if r.protocol == Protocol::Mst {
+            if let Some(link) = self.display_mst(r.port) {
+                link.require_payload_idle::<super::dmub::Error>()?;
+            }
+        }
         self.select_display(r.pipe)?;
         // A raw low-level restart/power operation invalidates completion.
         // This is a lifecycle check, not the fresh proof used to free VRAM.
@@ -310,6 +315,14 @@ impl Backend for ColdBoot {
         status: TeardownStatus,
     ) -> Result<(), ModesetError> {
         use TeardownStep::*;
+        // Payload transactions span AUX and native source owners. A returned
+        // error can leave native state looking settled while remote state is
+        // uncertain; no startup checkpoint permits tearing that ownership down.
+        if r.protocol == Protocol::Mst {
+            if let Some(link) = self.display_mst(r.port) {
+                link.require_payload_idle::<super::dmub::Error>()?;
+            }
+        }
         self.select_display(r.pipe)?;
         // SAFETY: the caller supplies the same exclusions as stop_modeset;
         // each native operation checks its retained owner and current hardware.
