@@ -4,6 +4,8 @@
 use super::*;
 use crate::amdgpu_vram::{Pool, Reservation};
 use core::sync::atomic::{fence, Ordering};
+#[path = "amdgpu_dcn401_surface_release.rs"]
+mod release;
 #[path = "amdgpu_dcn401_vm.rs"]
 mod vm;
 pub use vm::MemoryApplied;
@@ -143,8 +145,8 @@ impl Surfaces {
         engine.surface_preflight(request.pipe, restage)?;
         // The same geometry reuses the buffers: a console write still in
         // flight to the old scanout can only land on this same surface. A new
-        // geometry parks them instead: published ranges are never returned to
-        // the pool (no writer-quiescence barrier exists to free them), but a
+        // geometry parks them instead until explicit CPU/hardware retirement
+        // permits release_surfaces to return them to the pool. Otherwise a
         // later request for a parked geometry on this pipe reuses that
         // surface. Mode switches between the sink's few offered modes then
         // retain at most one surface (front, back, cursor) per geometry.
@@ -282,7 +284,7 @@ impl Surfaces {
 }
 impl<I: Io> Engine<I> {
     /// A restaged pipe may still show its previous staged address pending:
-    /// those buffers stay owned (reused or permanently retired) either way.
+    /// those buffers stay owned until a separate, stricter release proof.
     fn surface_preflight(&mut self, pipe: u8, restage: bool) -> Result<(), Error> {
         if restage {
             self.hubp_tree_stopped(Some(pipe))?;
@@ -355,7 +357,7 @@ impl Otg {
     /// A staged address may remain pending; VM, bandwidth, DPP/MPC and output
     /// activation are separate prerequisites. Each pipe retains its allocation;
     /// after plane retirement the pipe may be restaged, reusing the buffers
-    /// for the same geometry and permanently retiring them otherwise.
+    /// for the same geometry and parking them otherwise until explicit release.
     /// # Safety
     /// `pool` must exclusively own this GPU's correctly mapped VRAM. Exclude
     /// firmware/FAMS and concurrent display/HDP/clock/power writers. Retain all

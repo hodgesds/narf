@@ -584,9 +584,44 @@ describes staged programming, not an active/latched framebuffer. Success enters
 reusable `SurfacePrepared`; error enters `Failed` and cancellation retains
 `PreparingSurface(pipe)`, blocking replay and clock changes. A HUBP power
 transition invalidates its staged report without releasing its allocation.
-Replacement and release are refused until an explicit retirement protocol
-exists. Published backing remains excluded even if the owner is dropped;
-unpublished backing is releasable because no address reached hardware.
+Published backing remains excluded even if the owner is dropped, unless the
+explicit `release_surfaces` protocol below succeeds. Unpublished backing is
+releasable because no address reached hardware.
+
+`unsafe Otg::release_surfaces(pipe)` (ColdBoot
+`release_display_surfaces`) returns the page-rounded bytes reclaimed from that
+pipe's current and parked front/back/cursor reservations. Callers first
+unpublish the CPU scanout and drain its view epochs, exclude raw CPU references,
+firmware/FAMS, GPUVM/writeback and other-engine use of these display-only
+allocations, and retain exclusive display/PM/reset ownership. Inherited ranges
+and another display's reservations are never released.
+
+Release requires `PlanesRetired` with a report covering the pipe, then fresh
+native evidence: disabled timing and non-sibling consumers, detached MPC routes,
+idle MPCCs, no pending flips/updates, blank/drained/clock-disabled powered HUBPs,
+inactive cursor/metadata/LUT/MALL requests, no held cursor lock, and consistent
+power-gate request/PGFSM states. A gated HUBP's registers are not accessed.
+Live siblings must still fetch their own recorded surfaces. Unlike restaging
+retained memory, even the target's pending staged flip prevents reclamation.
+The HDP remap is validated, CPU HDP writes are flushed and PCIe writes drained,
+then the complete hardware/remap check runs again before any reservation can
+be marked reusable. A failure before flushing retains everything without
+writing; a failed flush or post-flush check also records `Failed`.
+
+Success clears the released pipe's surface, memory, DPP, MPC, timing/blank,
+requestor/deadline, scanout and cursor reports before returning reservations to
+their pools. Other displays' records and historical diagnostics remain intact.
+No await or fallible hardware access follows acceptance of the proof; a
+cancelled CPU drain or incomplete hardware retirement cannot release memory.
+Double release returns zero after the same checks. The monitor performs this
+operation under the display owner lock after successful disable, unplug and
+configuration teardown; the low-level stop functions retain their allocations
+until an explicit release. Replug then allocates fresh buffers from the pool.
+Link-loss retraining keeps its existing buffers. Native mapping caches remain
+mapped, but retired CPU views cannot use them. Model tests cover reuse across
+geometries, front/back/cursor and parked reservations, sibling preservation,
+powered-off registers, cancellation, revocation and late hardware changes;
+physical modeset/reclamation testing remains open.
 
 `unsafe Otg::upload_surface(pipe,x,y,pixels)` and the matching
 ColdBoot/platform `upload_display_surface` wrapper upload a bounded visible
@@ -973,12 +1008,13 @@ fetches. Its own previous staged address may still be pending, because those
 buffers stay owned either way. The same geometry reuses the front, back and
 cursor buffers, re-cleared.
 A new geometry allocates fresh buffers and parks the old surface (front,
-back, cursor); a published reservation is still never returned to the pool.
+back, cursor) until explicit release.
 A later request for a parked geometry on the same pipe reuses that surface,
 so switching among a sink's offered modes retains at most one surface per
-distinct geometry rather than one per switch. CPU writer quiescence now
-exists (below); connecting it to fresh hardware fetch-retirement evidence
-and releasing the corresponding reservations remains separate work.
+distinct geometry rather than one per switch. The platform monitor instead
+drains CPU views and calls `release_display_surfaces` after successful teardown,
+so replug and mode changes do not accumulate these allocations. Direct callers
+can retain buffers for reuse until they explicitly perform the same protocol.
 
 `scanout_access::unsafe snapshot(read)` captures a CPU mapping/geometry and
 an epoch lease under the same short IRQ-safe lock that
@@ -1111,14 +1147,16 @@ only later. The policy is single-buffered front-buffer rendering: tearing is
 possible and no vblank synchronisation is claimed. The platform `stop_modeset`
 withdraws the scanout first, clearing the flush before observers run, so the
 console returns to the boot framebuffer. That range stays excluded from the
-VRAM pool for its lifetime and therefore remains valid memory. The surface is
-retained; teardown also waits for leased fb/DRM accesses to finish.
+VRAM pool for its lifetime and therefore remains valid memory. Teardown waits
+for leased fb/DRM accesses to finish; the monitor subsequently releases the
+native surface only after the hardware checks above succeed.
 
 Page flips are double-buffered on one pipe. `unsafe Otg::prepare_back_buffer`
 (ColdBoot `prepare_display_back_buffer`) reserves a second allocation of the
 front's geometry, staged or live. It must translate through the FB aperture,
-is cleared and HDP-flushed, and is retained by the pipe for the owner's
-lifetime. `back_framebuffer` exposes its CPU view.
+is cleared and HDP-flushed, and stays retained until explicit surface release.
+`back_framebuffer` exposes its CPU view; raw callers must exclude reclamation
+for the lifetime of their access.
 
 `unsafe Otg::flip` (ColdBoot `flip_display`) requires `ScanoutRunning`. It
 rebinds the deadlines and verifies the live fetch at the current front. It also

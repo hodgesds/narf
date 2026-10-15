@@ -1504,6 +1504,9 @@ pub async unsafe fn monitor_displays(
             withdraw(boot, k, &displays.lit).await;
             // SAFETY: writers withdrawn; HPD reports physical removal.
             unsafe { boot.unplug_modeset(&m) }.await?;
+            // SAFETY: withdrawal drained CPU views; teardown retired this
+            // display's fetchers, and OWNER excludes every native producer.
+            unsafe { boot.release_display_surfaces(k) }?;
             displays.lit[usize::from(k)] = None;
             OUTPUT_STATE.lock()[usize::from(k)].shown = None;
             steps.push(MonitorStep::Unplugged(k));
@@ -1515,6 +1518,9 @@ pub async unsafe fn monitor_displays(
             withdraw(boot, k, &displays.lit).await;
             // SAFETY: the caller's obligations; the scanout is withdrawn.
             unsafe { boot.stop_modeset(&m) }.await?;
+            // SAFETY: withdrawal drained CPU views; teardown retired this
+            // display's fetchers, and OWNER excludes every native producer.
+            unsafe { boot.release_display_surfaces(k) }?;
             displays.lit[usize::from(k)] = None;
             steps.push(MonitorStep::Disabled(k));
             continue;
@@ -1550,6 +1556,9 @@ pub async unsafe fn monitor_displays(
                 }
                 // SAFETY: as above; the scanout is withdrawn first.
                 unsafe { boot.unplug_modeset(&m) }.await?;
+                // SAFETY: withdrawal drained CPU views; teardown retired this
+                // display's fetchers, and OWNER excludes every native producer.
+                unsafe { boot.release_display_surfaces(k) }?;
                 displays.lit[usize::from(k)] = None;
                 steps.push(MonitorStep::Unplugged(k));
             }
@@ -1582,6 +1591,9 @@ pub async unsafe fn monitor_displays(
                 // SAFETY: the caller's obligations; writers withdrawn first.
                 unsafe { boot.stop_modeset(&m) }.await?;
             }
+            // SAFETY: withdrawal drained CPU views; teardown retired this
+            // display's fetchers, and OWNER excludes every native producer.
+            unsafe { boot.release_display_surfaces(k) }?;
             displays.lit[usize::from(k)] = None;
         }
         let fill = |_: u8, _: u32, row: &mut [u32]| row.fill(0);

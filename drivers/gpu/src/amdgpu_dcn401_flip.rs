@@ -111,7 +111,7 @@ impl Surfaces {
         e.flush_surface_writes()?;
         memory.publish();
         let address = memory.address();
-        // Retained even if the state moved meanwhile: never freed once owned.
+        // Retained even if the state moved meanwhile, until explicit surface release.
         let surface = self.0[slot].as_mut().ok_or(Error::Invalid)?;
         surface.back = Some(memory);
         if live && e.status.state != State::ScanoutRunning(pipe) {
@@ -259,7 +259,7 @@ impl Otg {
     /// Allocate the back buffer of a staged or live pipe.
     /// # Safety
     /// Exclude firmware/FAMS and concurrent display/HDP writers; the buffer
-    /// is retained by the pipe for the owner's lifetime.
+    /// is retained by the pipe until explicit surface release.
     pub async unsafe fn prepare_back_buffer(
         &mut self,
         pool: &Pool,

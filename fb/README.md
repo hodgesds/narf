@@ -59,4 +59,6 @@ enabled but prevent task preemption until a device-memory fence completes;
 they must not cross a yield or await. Raw framebuffer views require the same
 lease or independent ownership of the backing. A failed boot restoration
 clears the mapping so cached writers become empty. This CPU barrier does not
-prove hardware fetch retirement or release parked VRAM reservations.
+prove hardware fetch retirement. Navi48's monitor combines it with native
+fetch/route/power checks and an HDP/PCIe drain before releasing current and
+parked display-only VRAM reservations after successful teardown.

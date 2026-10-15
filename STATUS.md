@@ -424,15 +424,20 @@ PHY off), and the modeset retries lower rates, then fewer lanes.
 A running Navi48 modeset can now be checked. HPD comes from the debounced
 DCN401 HPD block, and lane lock is read from the sink. A lost link retrains,
 and an unplugged sink is torn down without AUX to it. With the opt-in native
-display, a 1 s monitor retrains, tears down and relights on replug. Replug
-reuses the pipe's surface for the same geometry; a new geometry parks the old
-buffers' VRAM for later geometry reuse. CPU scanout leases now let withdrawal
+display, a 1 s monitor retrains, tears down and relights on replug.
+CPU scanout leases now let withdrawal
 wait for fb drawing, cursor/status access and DRM fallback copies. Publication
 and the writer drain stay under the display owner lock across flips, preventing
 reuse of the former front while a CPU view remains. IRQ delivery stays enabled
 during drawing, with preemption pinned until the CPU memory fence and lease
-release. Cancellation retains pending epochs. VRAM reclamation still needs
-this barrier connected to fresh hardware fetch-retirement evidence.
+release. Cancellation retains pending epochs. After successful teardown, the
+monitor now releases the pipe's current and parked front/back/cursor buffers
+through `release_display_surfaces`: fresh fetch/route/power/transaction checks,
+HDP/PCIe drain, a second check and dependent-report invalidation precede reuse.
+Other displays remain owned; failures retain reservations. Replug allocates
+fresh buffers without accumulating geometry-specific VRAM. Low-level callers
+can still retain buffers until explicit release, and link retraining keeps its
+surfaces. Reclamation is model-tested; physical transitions remain unvalidated.
 The lit Navi48 display is published as DRM KMS state on the amdgpu card, with
 the sink's real EDID and exact timing (disconnected on unplug). SETCRTC
 accepts only that timing, and the base amdgpu DRM version 3.0.0 claims no

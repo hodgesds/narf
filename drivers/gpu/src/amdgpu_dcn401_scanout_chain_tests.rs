@@ -708,6 +708,16 @@ fn dcn401_second_display_leaves_the_live_one_alone() -> TestResult {
     }
     let plan = plan();
     // The live display's pipe belongs to it.
+    // SAFETY: the model has no external CPU or GPU references.
+    let sibling_release = unsafe { c.surfaces.release(&mut c.e, p) };
+    // SAFETY: as above; the idle pipe has no buffers or outstanding accesses.
+    let idle_release = unsafe { c.surfaces.release(&mut c.e, 0) };
+    if sibling_release != Err(Error::Busy)
+        || idle_release != Ok(0)
+        || c.e.live_fetch_with(p, live.address, false).is_err()
+    {
+        return TestResult::Fail("surface retirement stole a live sibling");
+    }
     let own = hdmi_mode(p, &plan);
     if run(c.e.prepare(own.timing, own.clock)) != Err(Error::Busy) {
         return TestResult::Fail("timing staged on another display's pipe");

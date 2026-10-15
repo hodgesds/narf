@@ -1093,6 +1093,18 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Release one pipe's display-only front/back/cursor reservations after
+    /// plane retirement. The selected display must own the pipe.
+    /// # Safety
+    /// Fulfil `Otg::release_surfaces`: withdraw and drain all CPU views, exclude
+    /// other GPU engines and firmware writers, and retain exclusive ownership.
+    pub unsafe fn release_display_surfaces(&mut self, pipe: u8) -> Result<u64, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: retained matching owner; caller supplies lifetime exclusions.
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.release_surfaces(pipe) }
+    }
     /// Upload a visible row segment into a staged, stopped framebuffer.
     /// # Safety
     /// Exclude firmware/FAMS and concurrent display/HDP/clock/power writers;

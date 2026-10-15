@@ -511,3 +511,41 @@ kernel_test_in!(
     "drivers/gpu/dcn401-surface",
     dcn401_surface_restages_a_retired_pipe_reusing_only_the_same_geometry
 );
+
+fn dcn401_surface_reclaims_staged_buffers_and_restarts_without_vram_growth() -> TestResult {
+    let (_backing, pool, mut e, mut surfaces) = fixture(1, 16384);
+    let config = crate::amdgpu_gmc_navi48::DisplayContext {
+        fb_base: 0x8_0000_0000,
+        fb_top: 0xb_ffff_ffff,
+        fb_offset: 0x1_0000_0000,
+        root: 0x1_0000_4001,
+        start: 0xc_0000_0000,
+        end: 0xc_001f_ffff,
+    };
+    for height in [3, 4, 6, 3] {
+        e.io.flushed = false;
+        let applied =
+            run(surfaces.prepare(&mut e, &pool, SurfaceRequest { height, ..req(1) })).unwrap();
+        assert_eq!(applied.address, pool.address());
+        run(surfaces.prepare_back(&mut e, &pool, 1, config)).unwrap();
+        // The staging fixture deliberately leaves a pending flip. Retirement
+        // must not infer that a stopped clock proves its completion.
+        e.status.state = State::PlanesRetired;
+        // SAFETY: model-only backing; no CPU or other-engine references escape.
+        assert_eq!(unsafe { surfaces.release(&mut e, 1) }, Err(Error::Busy));
+        assert_eq!(pool.available(), 8192);
+        // Model the real scanout having latched, then run native plane teardown.
+        *e.io.inner.regs.get_mut(&h(1, 0x613)).unwrap() &= !0x100;
+        run(e.retire_planes()).unwrap();
+        // SAFETY: no outstanding CPU views; model retired its only consumers.
+        assert_eq!(unsafe { surfaces.release(&mut e, 1) }, Ok(8192));
+        assert_eq!(pool.available(), 16384);
+        assert!(e.status.surfaces[1].is_none());
+        assert!(surfaces.back_framebuffer(1).is_err());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-release",
+    dcn401_surface_reclaims_staged_buffers_and_restarts_without_vram_growth
+);

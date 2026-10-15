@@ -329,7 +329,7 @@ impl Otg {
     /// Show a premultiplied ARGB8888 cursor (at most 64x64) on a live pipe.
     /// # Safety
     /// Exclude firmware/FAMS and concurrent display/HDP writers; the cursor
-    /// buffer is retained by the pipe for the owner's lifetime.
+    /// buffer is retained by the pipe until explicit surface release.
     pub unsafe fn set_cursor(
         &mut self,
         pool: &Pool,
