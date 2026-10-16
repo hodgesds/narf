@@ -684,3 +684,47 @@ kernel_test_in!(
     "drivers/gpu/navi48-teardown",
     navi48_activation_checkpoints_do_not_create_or_replace_published_teardowns
 );
+
+/// A link-loss retrain journals the published modeset in flight. Success
+/// forgets it; a refused retrain whose link stopped again resumes ordinary
+/// teardown at timing, never replaying the stream/link stops it performed.
+/// Until finished (a dropped or uncertain retrain) teardown refuses to run.
+fn navi48_retrain_journal_hands_refused_links_to_teardown() -> TestResult {
+    use TeardownStep::*;
+    for (protocol, tail) in [
+        (Protocol::Sst, &[Timing, DscClock, Planes][..]),
+        (Protocol::Uhbr, &[Timing, Planes][..]),
+    ] {
+        let r = request(protocol);
+        let mut m = Model::new();
+        m.progress.start_activation(r).unwrap();
+        assert!(m.progress.check_idle().is_err());
+        assert_eq!(
+            finish(run_model(&mut m, r, false)),
+            Err(otg::Error::Busy.into())
+        );
+        assert!(m.attempts.is_empty());
+        m.progress.finish_retrain(r.pipe, None);
+        assert!(m.progress.status(r.pipe).is_none());
+        assert!(m.progress.check_idle().is_ok());
+
+        let mut m = Model::new();
+        m.progress.start_activation(r).unwrap();
+        m.progress.finish_retrain(r.pipe, Some(Timing));
+        let s = m.progress.status(r.pipe).unwrap();
+        assert!(!s.in_flight && !s.activation && s.next == Timing);
+        // Another incarnation cannot take the slot meanwhile.
+        let mut other = r;
+        other.scanout.as_mut().unwrap().address += 0x1000;
+        assert!(m.progress.start_activation(other).is_err());
+        finish(run_model(&mut m, r, false)).unwrap();
+        let writes: Vec<_> = m.writes.iter().map(|w| w.1).collect();
+        assert_eq!(writes, tail);
+        assert_eq!(m.progress.status(r.pipe).unwrap().next, Complete);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-teardown",
+    navi48_retrain_journal_hands_refused_links_to_teardown
+);

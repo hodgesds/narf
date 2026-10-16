@@ -984,8 +984,13 @@ a changed EDID/DPCD, a nonresponding or empty port drops it.
 (at most `VERIFY_ROUNDS`) when the first display reports `LinkReduced`; a later
 display's reduction is returned in `Configuration::failed`, and the monitor
 leaves that output unconsidered so its next pass relights the configuration.
-A retrain that verifies lower records the link but still returns its error;
-partial retrain recovery remains open. A confirmed CR, EQ or
+`retrain_modeset` journals the published modeset in flight before its first
+stop. Success clears the record. A refused retrain (`Link`, `LinkReduced` or
+a training refusal) whose timing state is again the one recorded after the
+link stopped resumes as ordinary teardown at `TeardownStep::Timing`; the
+monitor then withdraws writers, retires timing/planes, releases surfaces and
+relights against the verified link. Any other failure or a dropped retrain
+stays in flight and blocks replay. A confirmed CR, EQ or
 link-loss failure whose idle exit is proven leaves the owner in
 `DpLinkRefused`, retaining the plan. Only `stop_dp_link` may follow: as in
 Linux's retries, the sink is put in D3 and the PHY disabled before the next

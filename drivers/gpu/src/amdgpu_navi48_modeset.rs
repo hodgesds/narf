@@ -641,6 +641,17 @@ pub(super) fn verified_link(
     (link != (caps.lanes, caps.rate)).then_some(link)
 }
 
+/// A retrain error after which start_link has stopped the link again: the
+/// fallback ladder was refused or the link verified lower.
+fn retrain_refused(e: &ModesetError) -> bool {
+    matches!(
+        e,
+        ModesetError::Link
+            | ModesetError::LinkReduced
+            | ModesetError::Display(otg::Error::DpTraining(_))
+    )
+}
+
 /// A DP SST sink's verified 8b/10b link, kept while that sink (its DPCD
 /// caps and base EDID) stays on the port.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2525,29 +2536,48 @@ impl ColdBoot {
         // Capture real board limits before changing the live link. Refilter
         // the old offered timings after training, beside every retained sibling.
         let soc = self.display_soc()?;
+        // In flight from the first stop: a dropped or uncertain retrain is
+        // never replayed or taken for a running display.
+        self.teardowns.begin_retrain(m)?;
         // SAFETY: as documented above; each step checks its predecessor state.
-        unsafe {
-            if m.selection.uhbr() {
-                if m.selection.audio.is_some() {
-                    self.stop_display_audio(port, false).await?;
-                }
-                self.stop_display_scanout(m.pipe).await?;
-                self.stop_uhbr(port, false).await?;
-                (m.selection, m.scanout) = self.start_link(m.selection, m.pipe).await?;
-                self.retain_retrained_modeset(m, &soc);
-                return Ok(());
-            }
+        let stopped = unsafe {
             if m.selection.audio.is_some() {
                 self.stop_display_audio(port, false).await?;
             }
             self.stop_display_scanout(m.pipe).await?;
-            self.stop_display_dp_video(port).await?;
-            self.stop_display_dp_frontend(port).await?;
-            self.stop_display_dp_link(port).await?;
-            (m.selection, m.scanout) = self.start_link(m.selection, m.pipe).await?;
-            self.retain_retrained_modeset(m, &soc);
+            if m.selection.uhbr() {
+                self.stop_uhbr(port, false).await?;
+            } else {
+                self.stop_display_dp_video(port).await?;
+                self.stop_display_dp_frontend(port).await?;
+                self.stop_display_dp_link(port).await?;
+            }
+            self.display_timing_status()?.state
+        };
+        // SAFETY: as above.
+        match unsafe { self.start_link(m.selection, m.pipe) }.await {
+            Ok((selection, scanout)) => {
+                (m.selection, m.scanout) = (selection, scanout);
+                self.teardowns.finish_retrain(m.pipe, None);
+                self.retain_retrained_modeset(m, &soc);
+                Ok(())
+            }
+            Err(e) => {
+                // Every setting was refused (or the link verified lower) and
+                // start_link stopped it again: the same native state as
+                // before training. Ordinary teardown continues from timing;
+                // the next configuration selects against the verified link.
+                if retrain_refused(&e)
+                    && self
+                        .display_timing_status()
+                        .is_ok_and(|s| s.state == stopped)
+                {
+                    self.teardowns
+                        .finish_retrain(m.pipe, Some(super::TeardownStep::Timing));
+                }
+                Err(e)
+            }
         }
-        Ok(())
     }
     fn retain_retrained_modeset(&mut self, m: &mut Modeset, soc: &dml::Soc) {
         // Preserve the actual completion before doing any further work.

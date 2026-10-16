@@ -190,6 +190,25 @@ impl Teardowns {
             p.status.next = next;
         }
     }
+    /// Journal a link-loss retrain of a published modeset: in flight until
+    /// `finish_retrain`, so a cancelled retrain is never replayed.
+    pub(super) fn begin_retrain(&mut self, m: &Modeset) -> Result<(), ModesetError> {
+        self.start_activation(Request::of(m))
+    }
+    /// A retrain's outcome: success forgets the record; `Some(next)` hands a
+    /// retrain whose link provably stopped again to ordinary teardown from
+    /// `next`. Uncertain failures are not reported and stay in flight.
+    pub(super) fn finish_retrain(&mut self, pipe: u8, resume: Option<TeardownStep>) {
+        let slot = &mut self.0[usize::from(pipe)];
+        match resume {
+            None => *slot = None,
+            Some(next) => {
+                let p = slot.as_mut().unwrap();
+                p.status.next = next;
+                p.status.in_flight = false;
+            }
+        }
+    }
     pub(super) fn finish_activation(&mut self, pipe: u8, succeeded: bool) {
         let slot = &mut self.0[usize::from(pipe)];
         if succeeded {

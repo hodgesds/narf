@@ -1744,7 +1744,26 @@ pub async unsafe fn monitor_displays(
                 // the retrain land in it and show once scanout resumes.
                 let mut m = m;
                 // SAFETY: as above.
-                unsafe { boot.retrain_modeset(&mut m) }.await?;
+                if let Err(e) = unsafe { boot.retrain_modeset(&mut m) }.await {
+                    // A refused retrain whose link stopped again is ordinary
+                    // teardown from timing on: retire it (writers, planes,
+                    // surfaces) and light again, against the verified link.
+                    let handed_over = boot
+                        .display_teardown_status(k)
+                        .is_some_and(|s| !s.in_flight && s.next == boot::TeardownStep::Timing);
+                    if !handed_over {
+                        return Err(e);
+                    }
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut narf_console::Writer,
+                        format_args!("amdgpu: navi48 display {k} retrain failed: {e:?}\n"),
+                    );
+                    // SAFETY: as above; the journal resumes after the link.
+                    unsafe { retire_monitored_display(boot, displays, k, false) }.await?;
+                    steps.push(MonitorStep::Disabled(k));
+                    relight = true;
+                    continue;
+                }
                 displays.lit[usize::from(k)] = Some(m);
                 OUTPUT_STATE.lock()[usize::from(k)].retrained(
                     m.selection.edid,

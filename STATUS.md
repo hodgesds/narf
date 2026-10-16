@@ -678,7 +678,8 @@ refreshes retained and published mode lists beside current siblings and drops
 invalid queued requests. When no link carrying the staged PPS trains, the
 port's link is verified like Linux's dp_verify_link_cap and the configuration
 is selected and admitted again against it, so DSC bpp/slices are recomputed
-for the reduced link (model-tested; retrain-time recovery remains open).
+for the reduced link. A refused link-loss retrain is journaled and retired
+through ordinary teardown, then relit against the verified link (model-tested).
 Native legacy DP black video now starts the matching staged OTG/OPP pattern,
 requires fresh frame progress, seeds M/N and follows steering/video/resync FIFO
 startup with native priming delays and independent acknowledgements. Fresh sink
