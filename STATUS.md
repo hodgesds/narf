@@ -57,7 +57,7 @@ An unmodified alsa-lib probe exercises HDA/VirtIO playback and HDA capture
 through those syscalls, including linked pause, boundary-mode playback and
 user controls with TLV/events. The implemented ALSA contract is listed in
 [sound §3.1](drivers/sound/specification/spec.md#31-linux-alsa-pcm-and-control-abi).
-SoundWire, HDMI/DP compressed passthrough, vendor smart-amplifier quirks and system power-transition
+SoundWire, HDMI/DP compressed passthrough on FRL/UHBR/MST links, vendor smart-amplifier quirks and system power-transition
 reinitialization remain open. See
 [audio's implemented contract](audio/specification/spec.md).
 
@@ -583,8 +583,14 @@ channel count, slot map and allocation (which feeds the hardware Audio
 InfoFrame), ramp rate, HBR off and converter DIGEN. The codec's ELD is
 rebuilt as Linux's get_eld_ati does and exposed as the `ELD` control with an
 `HDMI/DP,pcm=0 Jack`; pin sense is polled, playback routes to the ports with
-a valid ELD and is limited to their channels/sample sizes, and a port that
-gains a sink mid-stream is set up again.
+a valid ELD and is limited to their channels/sample sizes/shared rates
+(44.1–192 kHz), and a port that gains a sink mid-stream is set up again.
+Linux's IEC958 Playback Con/Pro Mask, Default and Switch controls and the
+`Playback Channel Map` control (with its CHMAP TLV) are exposed: the AES0
+non-audio bit makes the next prepare IEC 61937 passthrough (stream-order
+slots, no ramp, HBR for 8-channel non-PCM, TYPE bit in converter and SDnFMT),
+and user channel maps choose the CA and slot map under hdmi_chmap_ctl_put's
+state rules (pairwise validation before codec rev3).
 Legacy DP SST LPCM now shares the DIO stream with DSC PPS. Startup and live
 checks require fresh PPS/clock/master witnesses, and audio stop preserves those
 video-owned resources while disabling audio packets and the endpoint. Modeset
@@ -605,7 +611,9 @@ transport witnesses. Partial writes and failed shutdown retain audio/payload
 ownership. Models cover independent routes, all RGB depths, stale allocations,
 endpoint collisions, shared DTO and two-stream link-owner handover. Teardown
 stops audio before scanout/video and payload removal.
-UHBR MST audio, compressed passthrough and user channel maps remain open; physical
+Compressed formats and HBR are advertised by the TMDS and legacy DP SST
+endpoints; FRL, UHBR and MST endpoints remain LPCM-only. UHBR MST audio
+remains open; physical
 audio is untested. FRL LPCM and HDMI 4:2:0 have model coverage
 as described above. None of it has run on hardware.
 Native FRL frontend retirement now drains all generic packet schedules through

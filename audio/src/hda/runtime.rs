@@ -62,6 +62,8 @@ pub struct IntelHda {
     pub(crate) noncoherent: bool,
     /// HDMI/DP port pins on GPU codecs and their last sensed sink.
     pub(super) hdmi: IrqSafeSpinLock<Vec<super::hdmi::Port>>,
+    /// The HDMI playback PCM's IEC958 status, DIGEN and channel map.
+    pub(super) hdmi_playback: IrqSafeSpinLock<super::hdmi::Playback>,
     /// Sound card index once registered (`u32::MAX` before), for control
     /// change notifications.
     pub(super) card: AtomicU32,
@@ -202,6 +204,7 @@ impl IntelHda {
             ready: false,
             noncoherent,
             hdmi: IrqSafeSpinLock::new(Vec::new()),
+            hdmi_playback: IrqSafeSpinLock::new(super::hdmi::Playback::from_converter(0)),
             card: AtomicU32::new(u32::MAX),
         };
         if noncoherent {
@@ -293,6 +296,7 @@ impl IntelHda {
         }
         dev.discover_paths();
         dev.hdmi = IrqSafeSpinLock::new(dev.hdmi_ports());
+        dev.hdmi_playback = IrqSafeSpinLock::new(dev.initial_hdmi_playback()?);
         dev.supported_formats = [
             dev.query_supported_formats(false),
             dev.query_supported_formats(true),

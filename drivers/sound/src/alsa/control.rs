@@ -253,9 +253,11 @@ impl Control {
                         0x11 => {
                             let metadata = mx.control_info(id).map_err(sound_error)?;
                             b[64..].fill(0);
-                            // SNDRV_CTL_ELEM_TYPE_{BOOLEAN, INTEGER, BYTES}
+                            // SNDRV_CTL_ELEM_TYPE_{BOOLEAN, INTEGER, BYTES, IEC958}
                             let ty = if id.kind.is_bytes() {
                                 4
+                            } else if id.kind.is_iec958() {
+                                5
                             } else if metadata.is_boolean {
                                 1
                             } else {
@@ -269,7 +271,9 @@ impl Control {
                                     *card == self.card && *index == id.index + 1
                                 })
                                 .copied();
-                            let access = if metadata.is_read_only { 1 | 4 } else { 3 };
+                            let access = if metadata.is_read_only { 1 | 4 } else { 3 }
+                                // TLV_READ | TLV_CALLBACK
+                                | if id.kind.has_tlv() { 0x10 | 0x1000_0000 } else { 0 };
                             put32(
                                 &mut b,
                                 68,
@@ -280,7 +284,7 @@ impl Control {
                             );
                             put32(&mut b, 76, lock.map_or(0, |(_, _, _, pid)| pid));
                             put32(&mut b, 72, metadata.channels as u32);
-                            if !id.kind.is_bytes() {
+                            if !id.kind.is_bytes() && !id.kind.is_iec958() {
                                 put64(&mut b, 80, metadata.value_min as i64 as u64);
                                 put64(&mut b, 88, metadata.value_max as i64 as u64);
                                 put64(&mut b, 96, metadata.step as i64 as u64);
@@ -299,6 +303,13 @@ impl Control {
                                     let len = usize::from(len);
                                     b[72..72 + len].copy_from_slice(&data[..len]);
                                 }
+                                // snd_aes_iec958.status leads the union.
+                                ControlValue::Iec958(status) => b[72..96].copy_from_slice(&status),
+                                ControlValue::Integers { len, values } => {
+                                    for (i, v) in values[..usize::from(len)].iter().enumerate() {
+                                        put64(&mut b, 72 + 8 * i, *v as i64 as u64);
+                                    }
+                                }
                             }
                             ctx.write(arg, &b)?;
                         }
@@ -311,7 +322,20 @@ impl Control {
                             }) {
                                 return Err(FsError::OperationNotPermitted);
                             }
-                            let value = if id.kind.is_boolean() {
+                            let value = if id.kind.is_iec958() {
+                                ControlValue::iec958(&b[72..96])
+                            } else if id.kind == crate::mixer::ControlKind::ChannelMap {
+                                let count =
+                                    usize::from(mx.control_info(id).map_err(sound_error)?.channels);
+                                let mut values = Vec::with_capacity(count);
+                                for i in 0..count {
+                                    values.push(
+                                        i32::try_from(get64(&b, 72 + 8 * i) as i64)
+                                            .map_err(|_| FsError::InvalidData)?,
+                                    );
+                                }
+                                ControlValue::integers(&values)
+                            } else if id.kind.is_boolean() {
                                 let value = get64(&b, 72);
                                 if value > 1 {
                                     return Err(FsError::InvalidData);

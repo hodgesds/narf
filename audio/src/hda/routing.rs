@@ -261,16 +261,17 @@ impl IntelHda {
             0x40
         };
         self.verb(cad, pin.nid, VERB_SET_PIN_WIDGET_CONTROL | ctl)?;
+        // AC_FMT_TYPE_NON_PCM (snd_hdac_spdif_stream_format).
+        let mut format = pack_sdfmt(params.format, params.rate, params.channels) as u32;
         if ati {
             let spk_alloc = self.hdmi_sink(output).map_or(0, |sink| sink.spk_alloc);
-            self.ati_hdmi_prepare(graph, &path.nodes, params.channels.count(), spk_alloc)?;
+            let channels = params.channels.count();
+            self.ati_hdmi_prepare(graph, &path.nodes, output, channels, spk_alloc)?;
+            if self.hdmi_playback.lock().non_pcm {
+                format |= 0x8000;
+            }
         }
-        self.verb(
-            cad,
-            converter.nid,
-            VERB_SET_CONVERTER_FORMAT
-                | pack_sdfmt(params.format, params.rate, params.channels) as u32,
-        )?;
+        self.verb(cad, converter.nid, VERB_SET_CONVERTER_FORMAT | format)?;
         self.verb(
             cad,
             converter.nid,
@@ -279,24 +280,24 @@ impl IntelHda {
         Ok(())
     }
     /// Linux atihdmi_init plus snd_hda_hdmi_generic_pcm_prepare and
-    /// atihdmi_setup_stream for one HDMI/DP port carrying LPCM: zero downmix,
-    /// per-channel remap mode (rev3+), then snd_hda_hdmi_setup_audio_infoframe
-    /// (the CEA channel allocation for the sink's speakers, the converter's
-    /// channel count, the slot map and the CA the codec puts in the Audio
-    /// InfoFrame), ramp rate (rev3+), HBR off, then the converter's digital
-    /// enable (Linux leaves DIGEN to the IEC958 switch userspace turns on;
-    /// narf has no such control, so the PCM path enables it).
+    /// atihdmi_setup_stream for one HDMI/DP port: zero downmix, per-channel
+    /// remap mode (rev3+), snd_hda_hdmi_setup_audio_infoframe, then the
+    /// ramp rate (rev3+; none for non-PCM), HBR for non-PCM 8-channel
+    /// streams (atihdmi_pin_hbr_setup) and the converter's DIG1/DIG2
+    /// (snd_hda_spdif_ctls_assign; DIGEN follows "IEC958 Playback Switch").
     fn ati_hdmi_prepare(
         &self,
         graph: &hda_codec::Codec,
         nodes: &AudioPath,
+        output: usize,
         channels: u8,
         spk_alloc: u16,
     ) -> Result<(), HdaError> {
-        const SET_CHANNEL_ALLOCATION: u32 = 0x771;
         const SET_DOWNMIX_INFO: u32 = 0x772;
         const GET_HBR_CONTROL: u32 = 0xf7c;
         const SET_HBR_CONTROL: u32 = 0x77c;
+        const HBR_CAPABLE: u32 = 0x01;
+        const HBR_ENABLE: u32 = 0x10;
         const SET_MULTICHANNEL_MODE: u32 = 0x789;
         const SET_RAMP_RATE: u32 = 0x770;
         if !(2..=8).contains(&channels) {
@@ -304,31 +305,69 @@ impl IntelHda {
         }
         let (cad, pin, cvt) = (graph.addr, nodes.pin_nid, nodes.converter_nid);
         let rev3 = hda_codec::ati_hdmi_rev3(graph);
+        let pcm = *self.hdmi_playback.lock();
         self.verb(cad, pin, SET_DOWNMIX_INFO << 8)?;
         if rev3 {
             self.verb(cad, pin, (SET_MULTICHANNEL_MODE << 8) | 1)?;
         }
-        let ca = super::hdmi::channel_allocation(spk_alloc, channels);
+        let ca = self.ati_hdmi_infoframe(graph, nodes, channels, spk_alloc, &pcm)?;
+        // hdmi_setup_fake_chmap: the controls describe the primary port.
+        if self.hdmi_primary() == Some(output) {
+            let mut state = self.hdmi_playback.lock();
+            if pcm.non_pcm || !state.chmap_set {
+                state.chmap = super::hdmi::default_chmap(ca);
+            }
+        }
+        if rev3 {
+            let ramp = if pcm.non_pcm { 0 } else { 180 };
+            self.verb(cad, cvt, (SET_RAMP_RATE << 8) | ramp)?;
+        }
+        // is_hbr_format: non-PCM with eight channels.
+        let hbr = pcm.non_pcm && channels == 8;
+        let control = self.verb(cad, pin, GET_HBR_CONTROL << 8)?;
+        if control & HBR_CAPABLE != 0 {
+            let next = if hbr {
+                control | HBR_ENABLE
+            } else {
+                control & !HBR_ENABLE
+            };
+            if next != control {
+                self.verb(cad, pin, (SET_HBR_CONTROL << 8) | (next & 0xff))?;
+            }
+        } else if hbr {
+            return Err(HdaError::NoOutputStream);
+        }
+        self.verb(cad, cvt, (0x70d << 8) | u32::from(pcm.ctls & 0xff))?;
+        self.verb(cad, cvt, (0x70e << 8) | u32::from(pcm.ctls >> 8))?;
+        Ok(())
+    }
+    /// snd_hda_hdmi_setup_audio_infoframe on an ATI port: the CEA channel
+    /// allocation (the user map's, or the sink's for its speakers and for
+    /// non-PCM), the converter's channel count, the slot map and the CA
+    /// the codec puts in the Audio InfoFrame. Returns the CA.
+    pub(super) fn ati_hdmi_infoframe(
+        &self,
+        graph: &hda_codec::Codec,
+        nodes: &AudioPath,
+        channels: u8,
+        spk_alloc: u16,
+        pcm: &super::hdmi::Playback,
+    ) -> Result<u8, HdaError> {
+        const SET_CHANNEL_ALLOCATION: u32 = 0x771;
+        let (cad, pin, cvt) = (graph.addr, nodes.pin_nid, nodes.converter_nid);
+        let rev3 = hda_codec::ati_hdmi_rev3(graph);
+        let ca = super::hdmi::stream_allocation(spk_alloc, channels, pcm);
         let active = super::hdmi::active_channels(ca);
         if self.verb(cad, cvt, 0xf2d << 8)? & 0xf != u32::from(active - 1) {
             self.verb(cad, cvt, (0x72d << 8) | u32::from(active - 1))?;
         }
-        for entry in super::hdmi::channel_mapping(ca) {
+        for entry in super::hdmi::slot_entries(ca, channels, pcm) {
             if let Some((verb, setup)) = super::hdmi::ati_slot_verb(entry, rev3) {
                 self.verb(cad, pin, (verb << 8) | setup)?;
             }
         }
         self.verb(cad, pin, (SET_CHANNEL_ALLOCATION << 8) | u32::from(ca))?;
-        if rev3 {
-            self.verb(cad, cvt, (SET_RAMP_RATE << 8) | 180)?;
-        }
-        let hbr = self.verb(cad, pin, GET_HBR_CONTROL << 8)?;
-        if hbr & 1 != 0 && hbr & 0x10 != 0 {
-            self.verb(cad, pin, (SET_HBR_CONTROL << 8) | (hbr & 0xef))?;
-        }
-        let dig = self.verb(cad, cvt, 0xf0d << 8)?;
-        self.verb(cad, cvt, (0x70d << 8) | (dig & 0xff) | 1)?;
-        Ok(())
+        Ok(ca)
     }
     pub(super) fn refresh_jacks(&self) -> Result<(), HdaError> {
         // HDMI/DP sinks come and go whether or not a stream is prepared.
@@ -435,6 +474,15 @@ impl IntelHda {
                 index: 4,
                 kind: ControlKind::Eld,
             });
+            for (index, kind) in [
+                (5, ControlKind::Iec958ConMask),
+                (6, ControlKind::Iec958ProMask),
+                (7, ControlKind::Iec958Default),
+                (8, ControlKind::Iec958Switch),
+                (9, ControlKind::ChannelMap),
+            ] {
+                controls.push(ControlId { index, kind });
+            }
         }
         controls
     }
@@ -499,6 +547,18 @@ impl IntelHda {
             }
             ControlKind::HdmiJack => Ok(ControlValue::boolean(self.hdmi_jack().0)),
             ControlKind::Eld => Ok(ControlValue::bytes(&self.hdmi_jack().1)),
+            ControlKind::Iec958ConMask => Ok(ControlValue::iec958(&super::hdmi::CON_MASK)),
+            ControlKind::Iec958ProMask => Ok(ControlValue::iec958(&super::hdmi::PRO_MASK)),
+            ControlKind::Iec958Default => Ok(ControlValue::iec958(
+                &self.hdmi_playback.lock().status.to_le_bytes(),
+            )),
+            ControlKind::Iec958Switch => Ok(ControlValue::boolean(
+                self.hdmi_playback.lock().ctls & super::hdmi::DIG1_ENABLE != 0,
+            )),
+            ControlKind::ChannelMap => {
+                let map = self.hdmi_playback.lock().chmap;
+                Ok(ControlValue::integers(&map.map(i32::from)))
+            }
             _ => Err(SoundError::NoSuchControl),
         }
     }
@@ -513,6 +573,22 @@ impl IntelHda {
         };
         if !self.mixer_controls().contains(&id) {
             return Err(SoundError::NoSuchControl);
+        }
+        match (id.kind, value) {
+            (ControlKind::Iec958Default, ControlValue::Iec958(status)) => {
+                return self
+                    .set_spdif_status(status)
+                    .map_err(|_| SoundError::BadState);
+            }
+            (ControlKind::Iec958Switch, ControlValue::Boolean(enable)) => {
+                return self
+                    .set_spdif_enable(enable)
+                    .map_err(|_| SoundError::BadState);
+            }
+            (ControlKind::ChannelMap, ControlValue::Integers { len, values }) => {
+                return self.set_chmap(&values[..usize::from(len)]);
+            }
+            _ => {}
         }
         let mut current = self.volume.lock();
         let mut next = *current;

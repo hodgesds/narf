@@ -123,12 +123,21 @@ element locks, subscriptions and 72-byte coalesced events, plus PCM device
 enumeration/info and power-state queries. Control values and ranges come from
 the backend. An unowned unlock is EINVAL, another file's lock is EPERM, and a
 duplicate lock is EBUSY. Unknown controls return ENOENT. Native controls without
-TLV metadata return ENXIO for TLV requests.
+TLV metadata return ENXIO for TLV requests. A native control whose
+`ControlKind::has_tlv` (the channel map) reports TLV_READ | TLV_CALLBACK and
+answers TLV_READ from `PcmDevice::control_tlv` (`Mixer::control_tlv`), with
+ENOMEM for a short buffer as Linux's callbacks return; its TLV_WRITE and
+TLV_COMMAND are ENXIO.
 
 Native controls live on the interface Linux uses for them: HDMI/DP jacks
 (`HDMI/DP,pcm=N Jack`) on CARD, `ELD` on PCM as a read-only volatile BYTES
-element whose count is the current ELD length (at most 128 bytes), everything
-else on MIXER; name lookups match the interface. A backend reports values it
+element whose count is the current ELD length (at most 128 bytes),
+`Playback Channel Map` on PCM as eight INTEGER elements in 0..=36
+(`SNDRV_CHMAP_*`, `ControlValue::Integers`), and everything else on MIXER:
+`IEC958 Playback {Con Mask, Pro Mask, Default}` are IEC958 elements whose
+24 status bytes lead the value union (`ControlValue::Iec958`; subcode bytes are
+not carried, the masks are read-only) and `IEC958 Playback Switch` is Boolean.
+Name lookups match the interface. A backend reports values it
 changed on its own (jack sense, ELD) through `control_changed`; byte controls
 notify VALUE|INFO.
 

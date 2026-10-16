@@ -534,6 +534,14 @@ impl Mixer {
         crate::mixer::list_for_controller(self.controller_index)
     }
 
+    /// A TLV-carrying control's current TLV words.
+    pub fn control_tlv(&self, id: ControlId) -> Result<Vec<u32>, SoundError> {
+        match &self.hardware {
+            Some(hardware) if id.kind.has_tlv() => hardware.control_tlv(id),
+            _ => Err(SoundError::NoSuchControl),
+        }
+    }
+
     /// Read a control's current value.
     pub fn get_control_value(&self, id: ControlId) -> Result<ControlValue, SoundError> {
         if let Some(hardware) = &self.hardware {

@@ -245,6 +245,20 @@ impl SoundControlFile {
                     }
                     out.push('\n');
                 }
+                Ok(ControlValue::Iec958(status)) => {
+                    out.push_str(&format!("{} {} ", id.index, id.kind.name()));
+                    for byte in &status[..4] {
+                        out.push_str(&format!("{byte:02x}"));
+                    }
+                    out.push('\n');
+                }
+                Ok(ControlValue::Integers { len, values }) => {
+                    out.push_str(&format!("{} {}", id.index, id.kind.name()));
+                    for (i, v) in values[..usize::from(len)].iter().enumerate() {
+                        out.push_str(&format!("{}{v}", if i == 0 { ' ' } else { ',' }));
+                    }
+                    out.push('\n');
+                }
                 Err(_) => {}
             }
         }

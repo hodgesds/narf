@@ -29,6 +29,8 @@ struct Model {
     /// ATI ELD emulation indices last written by 0x780 / 0x776.
     sink_index: u32,
     descriptor: u32,
+    /// ATI HBR control on pin 3: capable, initially enabled.
+    hbr: u32,
 }
 impl Model {
     fn step(&mut self) {
@@ -140,7 +142,11 @@ impl Model {
             (3, 0xf1c, _) => (5 << 20) | 0x10, // Digital Other Out, jack
             (5, 0xf1c, _) if self.second_port => (5 << 20) | 0x20,
             (5, 0xf1c, _) => (1 << 30) | (5 << 20) | 0x20, // no physical connection
-            (3, 0xf7c, _) => 0x11,                         // HBR capable, left enabled
+            (3, 0xf7c, _) => self.hbr,
+            (3, 0x77c, value) => {
+                self.hbr = u32::from(value);
+                0
+            }
             (2, 0xf0d, _) => 0x0200,
             (3, 0xf09, _) if self.sink => 0xc000_0000,
             (3, 0xf70, _) if self.sink => 0x100 | 0x4f,
@@ -234,6 +240,7 @@ impl Fixture {
                 second_port,
                 sink_index: 0,
                 descriptor: 0,
+                hbr: 0x11,
             }),
         };
         *MODEL.lock() = &mut *fixture.model as *mut Model as usize;
@@ -666,3 +673,324 @@ kernel_test_in!(
     "audio/hda",
     native_hda_hdmi_sink_drives_eld_routing_and_surround
 );
+
+fn native_hda_hdmi_chmap_and_iec958_helpers_match_linux() -> TestResult {
+    use super::super::hdmi::{
+        chmap_tlv, default_chmap, manual_allocation, paired_chmap_valid, parse_eld, slot_entries,
+        spdif_ctls, spdif_status, Playback,
+    };
+    // snd_hdmi_eld_update_pcm_info's rate union over every SAD.
+    let mut eld = DELL_ELD;
+    if parse_eld(&eld).map(|s| s.rates) != Some(0x7f) {
+        return TestResult::Fail("ELD rate union");
+    }
+    eld[28] = 0x07; // the stereo companion's rates
+    if parse_eld(&eld).map(|s| s.rates) != Some(0x07) {
+        return TestResult::Fail("ELD rates follow the SADs");
+    }
+    // convert_from_spdif_status / convert_to_spdif_status.
+    for (status, ctls) in [
+        (0x06, 0x20),     // non-audio, not copyright
+        (0x0204, 0x0200), // category 2
+        (0x8200, 0x0290), // copyright, original (LEVEL)
+        (0x0d, 0x48),     // professional, 50/15 us
+        (0x0f, 0x68),     // professional non-audio
+    ] {
+        if spdif_ctls(status) != ctls {
+            return TestResult::Fail("IEC958 status -> DIG1/DIG2");
+        }
+    }
+    if spdif_status(0x0200) != 0x0204
+        || spdif_status(0x0290) != 0x8200
+        || spdif_status(0x68) != 0x0f
+        || Playback::from_converter(0x0200).status != 0x0204
+        || Playback::from_converter(0x0200).ctls != 0x0201
+    {
+        return TestResult::Fail("DIG1/DIG2 -> IEC958 status");
+    }
+    // hdmi_manual_channel_allocation: ALSA positions FL=3 FR=4 RL=5 RR=6
+    // FC=7 LFE=8 RLC=14 RRC=15; SL/SR (9/10) are not HDMI speakers.
+    let surround = [3, 4, 5, 6, 7, 8, 14, 15];
+    if manual_allocation(8, &surround) != Some(0x13)
+        || manual_allocation(8, &[3, 4, 5, 6, 7, 8, 9, 10]) != Some(0x0b)
+        || manual_allocation(8, &[3, 4, 0, 0, 0, 0, 0, 0]) != Some(0x00)
+        || manual_allocation(8, &[3, 4, 21, 24, 0, 0, 0, 0]).is_some()
+    {
+        return TestResult::Fail("manual channel allocation");
+    }
+    let user = Playback {
+        chmap: [4, 3, 5, 6, 7, 8, 14, 15],
+        chmap_set: true,
+        ..Playback::from_converter(0)
+    };
+    // hdmi_manual_setup_channel_mapping: each slot takes the stream
+    // channel naming its speaker (slot 0 FL, 1 FR, 2 LFE, 3 FC, 4 RL, ...).
+    if slot_entries(0x13, 8, &user) != [0x10, 0x01, 0x52, 0x43, 0x24, 0x35, 0x66, 0x77] {
+        return TestResult::Fail("manual slot mapping");
+    }
+    // Non-PCM keeps stream order and ignores a user map.
+    let raw = Playback {
+        non_pcm: true,
+        ..user
+    };
+    if slot_entries(0x13, 8, &raw) != [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]
+        || slot_entries(0x00, 2, &raw) != [0x00, 0x11, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7]
+    {
+        return TestResult::Fail("non-PCM slot mapping");
+    }
+    // hdmi_setup_fake_chmap from the standard layouts.
+    if default_chmap(0x13) != [3, 4, 14, 15, 7, 8, 5, 6]
+        || default_chmap(0x00) != [3, 4, 0, 0, 0, 0, 0, 0]
+        || default_chmap(0x0b) != [3, 4, 5, 6, 7, 8, 0, 0]
+    {
+        return TestResult::Fail("default channel map");
+    }
+    // atihdmi_paired_chmap_validate: whole pairs only, FC/LFE swapped.
+    if !paired_chmap_valid(0x0b, &[3, 4, 5, 6, 7, 8, 0, 0])
+        || paired_chmap_valid(0x0b, &[3, 4, 5, 6, 8, 7, 0, 0])
+        || paired_chmap_valid(0x0b, &[4, 3, 5, 6, 7, 8, 0, 0])
+        || !paired_chmap_valid(0x0b, &[5, 6, 3, 4, 7, 8, 0, 0])
+    {
+        return TestResult::Fail("paired channel-map validation");
+    }
+    // hdmi_chmap_ctl_tlv: FL/FR only, then FL/FR + LFE; pre-rev3 refuses
+    // a three-channel layout (-ENODEV) and pairs the stereo one.
+    if chmap_tlv(0x01, false) != Some(alloc::vec![0, 16, 0x102, 8, 3, 4])
+        || chmap_tlv(0x03, false) != Some(alloc::vec![0, 36, 0x102, 8, 3, 4, 0x102, 12, 3, 4, 8])
+        || chmap_tlv(0x01, true) != Some(alloc::vec![0, 16, 0x103, 8, 3, 4])
+        || chmap_tlv(0x03, true).is_some()
+    {
+        return TestResult::Fail("channel-map TLV");
+    }
+    // Paired 4.0: RL/RR follow FL/FR with no N/A filler.
+    if chmap_tlv(0x09, true) != Some(alloc::vec![0, 40, 0x103, 8, 3, 4, 0x103, 16, 3, 4, 5, 6]) {
+        return TestResult::Fail("paired 4.0 TLV");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda",
+    native_hda_hdmi_chmap_and_iec958_helpers_match_linux
+);
+
+/// Compressed passthrough the way Linux's ATI HDMI codec does it: the
+/// IEC958 non-audio bit makes the next prepare an IEC 61937 stream (stream-
+/// order slots, sink CA, no ramp, HBR for eight channels, TYPE bit in both
+/// the converter and stream formats), and the channel map follows
+/// hdmi_chmap_ctl_put's state rules.
+fn native_hda_hdmi_passthrough_and_channel_map() -> TestResult {
+    use narf_drivers_sound::{
+        format::{pack_sdfmt, ChannelCount, SampleFormat, SampleRate},
+        mixer::{ControlId, ControlKind, ControlValue},
+        SoundError,
+    };
+    let mut fixture = match Fixture::two_ports() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    fixture.model.sink = true;
+    fixture.model.hbr = 0x01;
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let id = |index, kind| ControlId { index, kind };
+    let con = id(5, ControlKind::Iec958ConMask);
+    let pro = id(6, ControlKind::Iec958ProMask);
+    let status = id(7, ControlKind::Iec958Default);
+    let switch = id(8, ControlKind::Iec958Switch);
+    let chmap = id(9, ControlKind::ChannelMap);
+    if [con, pro, status, switch, chmap]
+        .iter()
+        .any(|c| !card.controls().contains(c))
+    {
+        return TestResult::Fail("IEC958 and channel-map controls");
+    }
+    // The converter's DIG2 category 2, consumer, not copyright; enabled.
+    if card.get_control(status) != Ok(ControlValue::iec958(&[0x04, 0x02]))
+        || card.get_control(switch) != Ok(ControlValue::boolean(true))
+        || card.get_control(con) != Ok(ControlValue::iec958(&[0x0f, 0xff]))
+        || card.get_control(pro) != Ok(ControlValue::iec958(&[0x0f]))
+        || card.set_control(con, ControlValue::iec958(&[0])).is_ok()
+    {
+        return TestResult::Fail("initial IEC958 state");
+    }
+    // The switch is DIGEN on every port's converter.
+    let first = fixture.model.verbs.len();
+    if card
+        .set_control(switch, ControlValue::boolean(false))
+        .is_err()
+        || !fixture.model.verbs[first..].contains(&make_verb(0, 2, 0x70d00))
+        || !fixture.model.verbs[first..].contains(&make_verb(0, 4, 0x70d00))
+        || card.get_control(switch) != Ok(ControlValue::boolean(false))
+        || card
+            .set_control(switch, ControlValue::boolean(true))
+            .is_err()
+    {
+        return TestResult::Fail("IEC958 switch");
+    }
+    // Non-audio status: DIG1 NONAUDIO | DIGEN and DIG2 category.
+    let first = fixture.model.verbs.len();
+    if card
+        .set_control(status, ControlValue::iec958(&[0x06, 0x02]))
+        .is_err()
+        || !fixture.model.verbs[first..].contains(&make_verb(0, 2, 0x70d21))
+        || !fixture.model.verbs[first..].contains(&make_verb(0, 2, 0x70e02))
+        || card.get_control(status) != Ok(ControlValue::iec958(&[0x06, 0x02]))
+    {
+        return TestResult::Fail("IEC958 non-audio status");
+    }
+    // Without an open stream a channel map is accepted and ignored.
+    if card
+        .set_control(chmap, ControlValue::integers(&[4, 3, 0, 0, 0, 0, 0, 0]))
+        .is_err()
+        || card.get_control(chmap) != Ok(ControlValue::integers(&[0; 8]))
+    {
+        return TestResult::Fail("channel map without a stream");
+    }
+    let Ok(mut playback) = card.open(false, 0) else {
+        return TestResult::Fail("open");
+    };
+    if card.capabilities(false).rates
+        != [
+            SampleRate::R44100,
+            SampleRate::R48000,
+            SampleRate::R88200,
+            SampleRate::R96000,
+            SampleRate::R176400,
+            SampleRate::R192000,
+        ]
+    {
+        return TestResult::Fail("HDMI rates from the ELD");
+    }
+    // HBR: 7.1 IEC 61937 at 192 kHz (TrueHD / DTS-HD MA framing).
+    let mut params = super::super::stream::default_params();
+    params.channels = ChannelCount::Surround71;
+    params.rate = SampleRate::R192000;
+    params.format = SampleFormat::S16LE;
+    let first = fixture.model.verbs.len();
+    if playback.configure(params).is_err() {
+        return TestResult::Fail("configure passthrough");
+    }
+    let middle = fixture.model.verbs.len();
+    if playback.prepare().is_err() {
+        return TestResult::Fail("prepare passthrough");
+    }
+    // hw_params sets the codec up; prepare repeats it with HBR already on.
+    if fixture.model.verbs[middle..]
+        .iter()
+        .any(|v| *v >> 20 == 3 && (*v >> 8) & 0xfff == 0x77c)
+    {
+        return TestResult::Fail("HBR rewritten unchanged");
+    }
+    let verbs = &fixture.model.verbs[first..middle];
+    let expected = [
+        make_verb(0, 2, 0x72d07),
+        make_verb(0, 3, 0x77701), // ch 0 -> slot 0 ... in stream order
+        make_verb(0, 3, 0x78511),
+        make_verb(0, 3, 0x77821),
+        make_verb(0, 3, 0x78631),
+        make_verb(0, 3, 0x77941),
+        make_verb(0, 3, 0x78751),
+        make_verb(0, 3, 0x77a61),
+        make_verb(0, 3, 0x78871),
+        make_verb(0, 3, 0x77113), // the sink's 7.1 CA
+        make_verb(0, 2, 0x77000), // no ramp for non-PCM
+        make_verb(0, 3, 0x77c11), // HBR on
+        make_verb(0, 2, 0x70d21),
+    ];
+    let positions: Vec<Option<usize>> = expected
+        .iter()
+        .map(|v| verbs.iter().position(|x| x == v))
+        .collect();
+    if positions.iter().any(Option::is_none) || !positions.is_sorted() {
+        return TestResult::Fail("passthrough codec setup");
+    }
+    let verbs = &fixture.model.verbs[first..];
+    let format = 0x8000 | u32::from(pack_sdfmt(params.format, params.rate, params.channels));
+    // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
+    let sd_fmt = unsafe { dev.bar0.read16(sd_base(dev.output_stream_idx()) + SD_FMT) };
+    if !verbs.contains(&make_verb(0, 2, VERB_SET_CONVERTER_FORMAT | format))
+        || u32::from(sd_fmt) != format
+        || verbs.contains(&make_verb(0, 4, VERB_SET_CONVERTER_STREAM | 0x10))
+    {
+        return TestResult::Fail("non-PCM converter and stream format");
+    }
+    if card.get_control(chmap) != Ok(ControlValue::integers(&[3, 4, 14, 15, 7, 8, 5, 6])) {
+        return TestResult::Fail("default 7.1 channel map");
+    }
+    // Back to LPCM at the next prepare: HBR off, ramp, PCM format.
+    if card
+        .set_control(status, ControlValue::iec958(&[0x04, 0x02]))
+        .is_err()
+    {
+        return TestResult::Fail("IEC958 audio status");
+    }
+    params.rate = SampleRate::R48000;
+    let first = fixture.model.verbs.len();
+    if playback.configure(params).is_err() || playback.prepare().is_err() {
+        return TestResult::Fail("configure LPCM");
+    }
+    let verbs = &fixture.model.verbs[first..];
+    let format = u32::from(pack_sdfmt(params.format, params.rate, params.channels));
+    // SAFETY: as above.
+    let sd_fmt = unsafe { dev.bar0.read16(sd_base(dev.output_stream_idx()) + SD_FMT) };
+    if !verbs.contains(&make_verb(0, 3, 0x77c01))
+        || !verbs.contains(&make_verb(0, 2, 0x770b4))
+        || !verbs.contains(&make_verb(0, 2, VERB_SET_CONVERTER_FORMAT | format))
+        || u32::from(sd_fmt) != format
+    {
+        return TestResult::Fail("LPCM after passthrough");
+    }
+    // A prepared stream takes a user map at once (FL/FR swapped).
+    let swapped = [4, 3, 5, 6, 7, 8, 14, 15];
+    let first = fixture.model.verbs.len();
+    if card
+        .set_control(chmap, ControlValue::integers(&swapped))
+        .is_err()
+        || card.get_control(chmap) != Ok(ControlValue::integers(&swapped))
+    {
+        return TestResult::Fail("set channel map");
+    }
+    let verbs = &fixture.model.verbs[first..];
+    for v in [
+        0x77711, 0x78501, 0x77851, 0x78641, 0x77921, 0x78731, 0x77113,
+    ] {
+        if !verbs.contains(&make_verb(0, 3, v)) {
+            return TestResult::Fail("user channel map slots");
+        }
+    }
+    // No CA names top-centre plus front-centre-high alone.
+    if card.set_control(chmap, ControlValue::integers(&[3, 4, 21, 24, 0, 0, 0, 0]))
+        != Err(SoundError::OutOfRange)
+        || card.set_control(chmap, ControlValue::integers(&[3, 4, 37, 0, 0, 0, 0, 0]))
+            != Err(SoundError::OutOfRange)
+        || card.get_control(chmap) != Ok(ControlValue::integers(&swapped))
+    {
+        return TestResult::Fail("invalid channel maps");
+    }
+    let Some(tlv) = card.control_tlv(chmap).ok() else {
+        return TestResult::Fail("channel-map TLV");
+    };
+    let surround71 = [0x102, 32, 3, 4, 8, 7, 5, 6, 14, 15];
+    if tlv[..2] != [0, (tlv.len() as u32 - 2) * 4]
+        || tlv[2..6] != [0x102, 8, 3, 4]
+        || !tlv.windows(10).any(|w| w == surround71)
+    {
+        return TestResult::Fail("7.1 sink channel-map TLV");
+    }
+    // Running: busy. Closing forgets the map.
+    let data = alloc::vec![0; 16384];
+    if playback.write(&data).is_err() || playback.start().is_err() {
+        return TestResult::Fail("start");
+    }
+    if card.set_control(chmap, ControlValue::integers(&[3, 4, 5, 6, 7, 8, 14, 15]))
+        != Err(SoundError::DeviceBusy)
+    {
+        return TestResult::Fail("channel map while running");
+    }
+    drop(playback);
+    if card.get_control(chmap) != Ok(ControlValue::integers(&[0; 8])) {
+        return TestResult::Fail("close resets the channel map");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_hdmi_passthrough_and_channel_map);

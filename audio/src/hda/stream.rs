@@ -55,9 +55,25 @@ impl Stream {
         }
         Ok(())
     }
+    /// hdmi_chmap_ctl_put's substream check: `None` with no open stream,
+    /// `Some(prepared)` while open, set up or prepared, busy once running.
+    pub(super) fn chmap_state(&self) -> Result<Option<bool>, SoundError> {
+        if !self.claimed {
+            return Ok(None);
+        }
+        match self.ring.as_ref() {
+            Some(ring) if ring.running || ring.xrun => Err(SoundError::DeviceBusy),
+            ring => Ok(Some(ring.is_some_and(|r| r.prepared))),
+        }
+    }
     fn configure(&mut self, dev: &IntelHda, params: HwParams) -> Result<(), SoundError> {
+        let rates = if self.capture {
+            alloc::vec![SampleRate::R48000]
+        } else {
+            dev.playback_rates()
+        };
         if !matches!(params.format, SampleFormat::S16LE | SampleFormat::S32LE)
-            || params.rate != SampleRate::R48000
+            || !rates.contains(&params.rate)
             || !(self.capture && params.channels == ChannelCount::Stereo
                 || !self.capture && dev.playback_channels().contains(&params.channels))
         {
@@ -101,16 +117,19 @@ impl Stream {
         }
         ring.reset();
         self.last_position = 0;
+        let mut format = pack_sdfmt(ring.params.format, ring.params.rate, ring.params.channels);
+        // IEC 61937 to a GPU port: SDnFMT TYPE, as azx_pcm_prepare's
+        // snd_hdac_spdif_stream_format sets it.
+        if !self.capture && !dev.hdmi.lock().is_empty() && dev.hdmi_playback.lock().non_pcm {
+            format |= 0x8000;
+        }
         // SAFETY: Stream lock serializes access; fixed registers lie within the controller's validated mapping.
         unsafe {
             dev.bar0.write8(sd + SD_STS, 0x1c);
             dev.bar0.write32(sd + SD_CBL, ring.bytes as u32);
             dev.bar0
                 .write16(sd + SD_LVI, (ring.params.periods - 1) as u16);
-            dev.bar0.write16(
-                sd + SD_FMT,
-                pack_sdfmt(ring.params.format, ring.params.rate, ring.params.channels),
-            );
+            dev.bar0.write16(sd + SD_FMT, format);
             dev.bar0
                 .write32(sd + SD_BDPL, ring.bdl.dma_addr().raw() as u32);
             dev.bar0
@@ -221,7 +240,7 @@ impl PcmDevice for Card {
         // driver's own default format rather than offering nothing at all.
         let mut formats = self.0.supported_formats[usize::from(capture)].clone();
         // An HDMI sink without 20/24-bit LPCM takes S16_LE only.
-        if !capture && self.0.hdmi_limits().is_some_and(|(_, s32)| !s32) {
+        if !capture && self.0.hdmi_limits().is_some_and(|(_, s32, _)| !s32) {
             formats.retain(|f| *f != SampleFormat::S32LE);
         }
         if formats.is_empty() {
@@ -229,7 +248,11 @@ impl PcmDevice for Card {
         }
         PcmCapabilities {
             formats,
-            rates: alloc::vec![SampleRate::R48000],
+            rates: if capture {
+                alloc::vec![SampleRate::R48000]
+            } else {
+                self.0.playback_rates()
+            },
             channels: if capture {
                 alloc::vec![ChannelCount::Stereo]
             } else {
@@ -250,6 +273,18 @@ impl PcmDevice for Card {
         id: narf_drivers_sound::mixer::ControlId,
     ) -> Result<narf_drivers_sound::mixer::ControlValue, SoundError> {
         self.0.get_mixer(id)
+    }
+    fn control_tlv(
+        &self,
+        id: narf_drivers_sound::mixer::ControlId,
+    ) -> Result<alloc::vec::Vec<u32>, SoundError> {
+        if !self.controls().contains(&id)
+            || id.kind != narf_drivers_sound::mixer::ControlKind::ChannelMap
+        {
+            return Err(SoundError::NoSuchControl);
+        }
+        // Linux returns -ENODEV for a layout pairwise remapping cannot carry.
+        self.0.chmap_tlv().ok_or(SoundError::NoSuchDevice)
     }
     fn set_control(
         &self,
@@ -292,6 +327,9 @@ struct Pcm {
 }
 impl PcmHardware for Pcm {
     fn configure(&mut self, params: HwParams) -> Result<(), SoundError> {
+        if !self.capture {
+            self.dev.latch_non_pcm();
+        }
         self.dev.streams[usize::from(self.capture)]
             .lock()
             .configure(&self.dev, params)?;
@@ -307,6 +345,21 @@ impl PcmHardware for Pcm {
         Ok(())
     }
     fn prepare(&mut self) -> Result<(), SoundError> {
+        // GPU ports take the IEC958 non-audio bit at prepare, as Linux's
+        // snd_hda_hdmi_generic_pcm_prepare does: redo the codec setup with
+        // it before the controller's format.
+        if !self.capture && !self.dev.hdmi.lock().is_empty() {
+            let params = self.dev.streams[0]
+                .lock()
+                .ring
+                .as_ref()
+                .map(|r| r.params)
+                .ok_or(SoundError::BadState)?;
+            self.dev.latch_non_pcm();
+            self.dev
+                .configure_paths(false, params)
+                .map_err(|_| SoundError::InvalidParams)?;
+        }
         self.dev.streams[usize::from(self.capture)]
             .lock()
             .prepare(&self.dev)?;
@@ -450,6 +503,10 @@ impl Drop for Pcm {
             state.ring.take();
         }
         state.claimed = false;
+        drop(state);
+        if !self.capture {
+            self.dev.reset_chmap();
+        }
     }
 }
 

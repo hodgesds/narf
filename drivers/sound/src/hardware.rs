@@ -13,34 +13,42 @@ pub trait PcmDevice: Send + Sync + core::fmt::Debug {
         if !self.controls().contains(&id) {
             return Err(SoundError::NoSuchControl);
         }
-        // A byte control's element count is its current length (Linux
-        // hdmi_eld_ctl_info reports the live ELD size).
-        let channels = if id.kind.is_bytes() {
+        // A byte or integer-array control's element count is its current
+        // length (Linux hdmi_eld_ctl_info reports the live ELD size; the
+        // channel map has one element per slot).
+        let channels = if id.kind.is_bytes() || id.kind == crate::mixer::ControlKind::ChannelMap {
             match self.get_control(id)? {
-                crate::mixer::ControlValue::Bytes { len, .. } => len,
+                crate::mixer::ControlValue::Bytes { len, .. }
+                | crate::mixer::ControlValue::Integers { len, .. } => len,
                 _ => 0,
             }
-        } else if id.kind.is_boolean() {
+        } else if id.kind.is_boolean() || id.kind.is_iec958() {
             1
         } else {
             2
+        };
+        let (value_max, step) = match id.kind {
+            k if k.is_bytes() || k.is_iec958() => (0, 0),
+            // SNDRV_CHMAP_LAST; Linux hdmi_chmap_ctl_info leaves the step 0.
+            crate::mixer::ControlKind::ChannelMap => (36, 0),
+            k if k.is_boolean() => (1, 1),
+            _ => (87, 1),
         };
         Ok(crate::mixer::ControlInfo {
             id,
             name: id.kind.name(),
             value_min: 0,
-            value_max: if id.kind.is_bytes() {
-                0
-            } else if id.kind.is_boolean() {
-                1
-            } else {
-                87
-            },
-            step: if id.kind.is_bytes() { 0 } else { 1 },
+            value_max,
+            step,
             channels,
             is_boolean: id.kind.is_boolean(),
             is_read_only: id.kind.is_read_only(),
         })
+    }
+    /// The TLV words of a control whose kind `has_tlv`, container header
+    /// included, computed at read time like a Linux TLV callback.
+    fn control_tlv(&self, _: crate::mixer::ControlId) -> Result<alloc::vec::Vec<u32>, SoundError> {
+        Err(SoundError::NoSuchControl)
     }
     /// Side-effect-free constraints for ALSA parameter negotiation. Backends
     /// override this to describe every supported hardware configuration.
