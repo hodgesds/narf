@@ -507,3 +507,91 @@ kernel_test_in!(
     "drivers/gpu/dp-mst",
     navi48_mst_payload_preflight_rejection_leaves_transaction_reusable
 );
+
+fn navi48_mst_resource_queries_retain_uncertain_transactions() -> TestResult {
+    let fixture = |active| {
+        let (hub, mut link) = payload_fixture(active);
+        link.manager.events.clear();
+        link.resource_ports.push(link.topology.sinks()[0]);
+        if active {
+            hub.borrow_mut().resources.insert((1, 1), (2561, 1651));
+        }
+        (hub, link)
+    };
+    for active in [false, true] {
+        let (hub, mut link) = fixture(active);
+        let gate = Gate {
+            calls: core::cell::Cell::new(0),
+            fault: None,
+        };
+        let mut aux = FaultAux {
+            inner: Aux(&hub),
+            gate: &gate,
+        };
+        assert_eq!(
+            poll_once(link.refresh_resources(&mut aux)),
+            core::task::Poll::Ready(Ok(()))
+        );
+        assert!(!link.dirty && !link.resource_query_pending());
+        let calls = gate.calls.get();
+        assert!(calls >= 4);
+        for call in 1..=calls {
+            for after in [false, true] {
+                for fault in [Fault::Error, Fault::Cancel] {
+                    let (hub, mut link) = fixture(active);
+                    let topology = link.topology.clone();
+                    let payloads = link.payloads.clone();
+                    let gate = Gate {
+                        calls: core::cell::Cell::new(0),
+                        fault: Some((call, after, fault)),
+                    };
+                    let mut aux = FaultAux {
+                        inner: Aux(&hub),
+                        gate: &gate,
+                    };
+                    let result = poll_once(link.refresh_resources(&mut aux));
+                    match fault {
+                        Fault::Error => assert!(matches!(result, core::task::Poll::Ready(Err(_)))),
+                        Fault::Cancel => assert!(result.is_pending()),
+                    }
+                    assert!(link.resource_query_pending() && link.has_stream_resources());
+                    let attempted = gate.calls.get();
+                    let mut source = Source {
+                        hub: &hub,
+                        events: Vec::new(),
+                    };
+                    let busy = core::task::Poll::Ready(Err(otg::Error::Busy.into()));
+                    assert_eq!(poll_once(link.refresh_resources(&mut aux)), busy);
+                    assert_eq!(poll_once(link.prepare(&mut aux)), busy);
+                    assert_eq!(
+                        poll_once(remove_payload(&mut link, &mut aux, &mut source, 1, false)),
+                        busy
+                    );
+                    let sink = link.topology.sinks()[1];
+                    assert_eq!(
+                        poll_once(add_payload(
+                            &mut link,
+                            &mut aux,
+                            &mut source,
+                            sink,
+                            3,
+                            500,
+                            7,
+                            (6, 9)
+                        )),
+                        core::task::Poll::Ready(Err(otg::Error::Busy.into()))
+                    );
+                    assert_eq!(gate.calls.get(), attempted);
+                    assert!(source.events.is_empty());
+                    assert_eq!(link.topology, topology);
+                    assert_eq!(link.payloads, payloads);
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_resource_queries_retain_uncertain_transactions
+);

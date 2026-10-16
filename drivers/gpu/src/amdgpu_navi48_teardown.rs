@@ -298,7 +298,7 @@ impl Backend for ColdBoot {
     fn completed(&mut self, r: Request) -> Result<(), ModesetError> {
         if r.protocol == Protocol::Mst {
             if let Some(link) = self.display_mst(r.port) {
-                link.require_payload_idle::<super::dmub::Error>()?;
+                link.require_transaction_idle::<super::dmub::Error>()?;
             }
         }
         self.select_display(r.pipe)?;
@@ -320,7 +320,7 @@ impl Backend for ColdBoot {
         // uncertain; no startup checkpoint permits tearing that ownership down.
         if r.protocol == Protocol::Mst {
             if let Some(link) = self.display_mst(r.port) {
-                link.require_payload_idle::<super::dmub::Error>()?;
+                link.require_transaction_idle::<super::dmub::Error>()?;
             }
         }
         self.select_display(r.pipe)?;

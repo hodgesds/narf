@@ -700,8 +700,13 @@ EDID and independently admitted timings without starting a stream: remaining
 MST slots, path PBN and joint DML bound the offered modes. All-off branches query
 board clock limits without installing clock floors or allocating scanout, and
 KMS keeps the CRTC mode unset until enabled. Ordinary disables retain admitted
-modes without restarting siblings. Mixed MST/SST, resource-notification bandwidth
-updates, UHBR MST and MST audio/DSC remain open; no physical validation.
+modes without restarting siblings. Resource notifications now trigger fresh,
+port-bound bandwidth queries. Existing payloads are added back before comparing
+capacity, avoiding relights caused by our own allocations. Capacity changes retire
+old streams before reprobe/re-admission. Every shared path hop constrains payload
+and dark-mode admission; zero PBN rejects new modes. Incomplete resource queries
+retain the session and refuse replay. Mixed MST/SST, UHBR MST and MST audio/DSC
+remain open; no physical validation.
 The MST manager now also exposes bounded idle notification polling over
 DMUB AUX, retains fragmented messages across transaction/poll boundaries and
 applies queue backpressure. Connection notices drive topology reconciliation

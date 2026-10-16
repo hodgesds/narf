@@ -131,6 +131,36 @@ impl Topology {
             .iter()
             .find(|p| p.info.port == sink.port)
     }
+    /// Every connected output hop, from the end port back to the root.
+    /// Reject missing, cyclic or ambiguous parentage instead of omitting a
+    /// bandwidth constraint. Probe-created trees have at most 64 branches.
+    pub(crate) fn path(&self, mut sink: Sink) -> Option<Vec<Sink>> {
+        let mut out = Vec::new();
+        for _ in 0..self.branches.len().min(64) {
+            let port = self.port(sink)?;
+            if port.info.input || !port.info.ddps || out.contains(&sink) {
+                return None;
+            }
+            out.push(sink);
+            if sink.branch == 0 {
+                return Some(out);
+            }
+            let child = sink.branch;
+            let mut parents = self.branches.iter().enumerate().flat_map(|(branch, b)| {
+                b.ports.iter().filter_map(move |p| {
+                    (p.branch == Some(child)).then_some(Sink {
+                        branch,
+                        port: p.info.port,
+                    })
+                })
+            });
+            sink = parents.next()?;
+            if parents.next().is_some() {
+                return None;
+            }
+        }
+        None
+    }
 }
 
 /// drm_dp_calculate_rad: the relative address of the branch behind
@@ -398,22 +428,8 @@ impl Manager {
                 branch: None,
             };
             if info.ddps && !info.input {
-                if let Reply::EnumPathResources {
-                    fec,
-                    full_pbn,
-                    available_pbn,
-                    ..
-                } = self
-                    .transact(
-                        aux,
-                        lct,
-                        &rad,
-                        &Request::EnumPathResources { port: info.port },
-                    )
-                    .await?
-                {
-                    (port.fec, port.full_pbn, port.available_pbn) = (fec, full_pbn, available_pbn);
-                }
+                (port.fec, port.full_pbn, port.available_pbn) =
+                    self.path_resources(aux, lct, &rad, info.port).await?;
                 if info.peer_device_type == dp_mst::PEER_MST_BRANCHING && info.mcs {
                     // LCT is a four-bit wire field. Refuse a deeper tree before
                     // child_rad or the encoded route can overflow.
@@ -432,6 +448,29 @@ impl Manager {
             topology.branches[index].ports.push(port);
         }
         Ok(topology)
+    }
+    /// An authoritative resource snapshot, bound to the requested port.
+    pub(crate) async fn path_resources<A: MstAux>(
+        &mut self,
+        aux: &mut A,
+        lct: u8,
+        rad: &[u8; 8],
+        port: u8,
+    ) -> Result<(bool, u16, u16), MstError<A::Error>> {
+        match self
+            .transact(aux, lct, rad, &Request::EnumPathResources { port })
+            .await?
+        {
+            Reply::EnumPathResources {
+                port: reply_port,
+                fec,
+                full_pbn,
+                available_pbn,
+            } if reply_port == port && available_pbn <= full_pbn => {
+                Ok((fec, full_pbn, available_pbn))
+            }
+            _ => Err(MstError::Malformed),
+        }
     }
     /// LINK_ADDRESS of the branch at (`lct`, `rad`), recorded in
     /// `topology` with no ports yet.

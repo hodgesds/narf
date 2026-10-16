@@ -92,6 +92,8 @@ pub struct MstLink {
     /// Stable KMS slots, including reservations for disconnected sinks.
     pub outputs: [Option<MstOutput>; 4],
     payload_change: Option<MstPayloadChange>,
+    resource_ports: Vec<dp_mst_mgr::Sink>,
+    resource_query: bool,
     state: ProbeState,
     dirty: bool,
 }
@@ -102,14 +104,22 @@ impl MstLink {
     pub fn payload_change(&self) -> Option<MstPayloadChange> {
         self.payload_change
     }
-    pub(super) fn require_payload_idle<E>(&self) -> Result<(), MstFailure<E>> {
-        if self.payload_change.is_some() {
+    /// A resource query whose sideband completion is unproven. Failed and
+    /// cancelled queries retain this marker and refuse other transactions.
+    pub fn resource_query_pending(&self) -> bool {
+        self.resource_query
+    }
+    pub(super) fn require_transaction_idle<E>(&self) -> Result<(), MstFailure<E>> {
+        if self.payload_change.is_some() || self.resource_query {
             return Err(otg::Error::Busy.into());
         }
         Ok(())
     }
     fn has_stream_resources(&self) -> bool {
-        self.owner.is_some() || !self.payloads.is_empty() || self.payload_change.is_some()
+        self.owner.is_some()
+            || !self.payloads.is_empty()
+            || self.payload_change.is_some()
+            || self.resource_query
     }
 }
 
@@ -191,9 +201,17 @@ pub(crate) async fn add_payload<A: MstAux, S: MstSource>(
     slots: u8,
     rate: (u32, u32),
 ) -> Result<MstPayload, MstFailure<A::Error>> {
-    link.require_payload_idle()?;
+    link.require_transaction_idle()?;
     let info = link.topology.port(sink).ok_or(MstFailure::Invalid)?.info;
     let branch = link.topology.branches[sink.branch].clone();
+    let allocated: Vec<_> = link.payloads.iter().map(|p| (p.sink, p.pbn)).collect();
+    if link.dirty
+        || pbn == 0
+        || slots == 0
+        || topology::path_budget(&link.topology, sink, &allocated).is_none_or(|free| pbn > free)
+    {
+        return Err(MstFailure::Invalid);
+    }
     if link
         .payloads
         .iter()
@@ -258,7 +276,7 @@ pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
     stream: u8,
     connected: bool,
 ) -> Result<(), MstFailure<A::Error>> {
-    link.require_payload_idle()?;
+    link.require_transaction_idle()?;
     let index = link
         .payloads
         .iter()
@@ -360,7 +378,7 @@ impl ColdBoot {
     pub fn display_mst(&self, port: usize) -> Option<&MstLink> {
         self.mst.get(&port)
     }
-    /// Service and coalesce downstream connection changes, preserving the old
+    /// Service downstream connection/resource changes, preserving the old
     /// topology until the platform has retired its streams. Drain before and
     /// after polling so a full queue cannot block down-transaction progress.
     pub async fn service_display_mst(&mut self, port: usize) -> Result<bool, MstFailure> {
@@ -372,6 +390,13 @@ impl ColdBoot {
         let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
         link.consume_events();
         result?;
+        let (instance, _) = self.mst_path(port)?;
+        let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
+        let mut aux = DmubAux {
+            dmub: &mut self.sequence.backend.dmub,
+            instance,
+        };
+        link.refresh_resources(&mut aux).await?;
         Ok(link.dirty)
     }
     /// Forget a physically removed branch only after its last stream stops.
@@ -395,7 +420,7 @@ impl ColdBoot {
     pub async fn poll_display_mst(&mut self, port: usize) -> Result<usize, MstFailure> {
         let (instance, _) = self.mst_path(port)?;
         let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
-        link.require_payload_idle()?;
+        link.require_transaction_idle()?;
         if link.state != ProbeState::Ready {
             return Err(MstFailure::Invalid);
         }
@@ -422,7 +447,7 @@ impl ColdBoot {
     ) -> Result<Vec<u8>, MstFailure> {
         let (instance, _) = self.mst_path(port)?;
         let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
-        link.require_payload_idle()?;
+        link.require_transaction_idle()?;
         let mut aux = DmubAux {
             dmub: &mut self.sequence.backend.dmub,
             instance,
@@ -530,12 +555,23 @@ pub(super) fn mst_slots(timing: &Timing, lanes: u8, rate: DpRate, fec: bool) -> 
 /// does, at 8 bpc RGB on the port's maximum 8b/10b link. A payload fits
 /// the slots the earlier streams left of 63 and its port's available PBN
 /// (ENUM_PATH_RESOURCES). Devices nothing fits stay dark. `devices` are
-/// each end device, its EDID and available PBN.
+/// each end device, its EDID and available PBN. Zero PBN is exhausted capacity.
+/// The topology modeset additionally enforces every shared upstream hop.
 pub fn select_mst(
     port: usize,
     caps: modeset::DpCaps,
     devices: &[(dp_mst_mgr::Sink, Vec<u8>, u16)],
     want: &dyn Fn(usize) -> Option<Timing>,
+) -> Vec<Selection> {
+    select_mst_with_budget(port, caps, devices, want, &|_, _| u16::MAX)
+}
+
+fn select_mst_with_budget(
+    port: usize,
+    caps: modeset::DpCaps,
+    devices: &[(dp_mst_mgr::Sink, Vec<u8>, u16)],
+    want: &dyn Fn(usize) -> Option<Timing>,
+    budget: &dyn Fn(dp_mst_mgr::Sink, &[Selection]) -> u16,
 ) -> Vec<Selection> {
     let mut free = 63u8;
     let mut out = Vec::new();
@@ -547,9 +583,10 @@ pub fn select_mst(
             continue;
         };
         let (lanes, rate) = (caps.lanes, DpRate::Legacy(caps.rate));
+        let available = (*available).min(budget(*sink, &out));
         let fits = |t: &Timing| {
             mst_slots(t, lanes, rate, caps.fec)
-                .filter(|&(pbn, slots)| slots <= free && (*available == 0 || pbn <= *available))
+                .filter(|&(pbn, slots)| slots <= free && pbn <= available)
         };
         let timings = modeset::edid_timings(edid);
         let chosen = want(k)
@@ -601,12 +638,13 @@ pub(super) fn select_mst_outputs(
     devices: &[(dp_mst_mgr::Sink, Vec<u8>, u16)],
     want: &dyn Fn(usize) -> Option<Timing>,
     pipes: &[Option<u8>],
+    budget: &dyn Fn(dp_mst_mgr::Sink, &[Selection]) -> u16,
 ) -> Vec<(Selection, u8)> {
     let enabled: Vec<usize> = (0..devices.len())
         .filter(|&k| pipes.get(k).is_some_and(Option::is_some))
         .collect();
     let selected: Vec<_> = enabled.iter().map(|&k| devices[k].clone()).collect();
-    select_mst(port, caps, &selected, &|k| want(enabled[k]))
+    select_mst_with_budget(port, caps, &selected, &|k| want(enabled[k]), budget)
         .into_iter()
         .filter_map(|s| {
             let k = devices
@@ -638,7 +676,7 @@ pub(super) fn dark_mst_modes(
             break;
         }
         if !mst_slots(&t, caps.lanes, DpRate::Legacy(caps.rate), caps.fec)
-            .is_some_and(|(pbn, slots)| slots <= free && (available == 0 || pbn <= available))
+            .is_some_and(|(pbn, slots)| slots <= free && pbn <= available)
         {
             continue;
         }
@@ -721,10 +759,24 @@ impl ColdBoot {
             .and_then(|p| p.sink.as_ref().ok())
             .and_then(|sink| modeset::dp_caps(&path, sink))
             .ok_or(ModesetError::NoSink)?;
-        let (mut selections, pipes): (Vec<_>, Vec<_>) =
-            select_mst_outputs(port, caps, &devices, &|k| want(slots[k]), &assigned)
-                .into_iter()
-                .unzip();
+        let link = self.mst.get(&port).ok_or(MstFailure::Invalid)?;
+        let budget = |sink, selected: &[Selection]| {
+            let allocated: Vec<_> = selected
+                .iter()
+                .filter_map(|s| s.mst.map(|m| (m.sink, m.pbn)))
+                .collect();
+            topology::path_budget(&link.topology, sink, &allocated).unwrap_or(0)
+        };
+        let (mut selections, pipes): (Vec<_>, Vec<_>) = select_mst_outputs(
+            port,
+            caps,
+            &devices,
+            &|k| want(slots[k]),
+            &assigned,
+            &budget,
+        )
+        .into_iter()
+        .unzip();
         // Discard old admission before any asynchronous clock/startup work.
         if let Some(link) = self.mst.get_mut(&port) {
             for output in link.outputs.iter_mut().flatten() {
@@ -787,15 +839,19 @@ impl ColdBoot {
         lit: &[Selection],
     ) {
         if let Some(link) = self.mst.get_mut(&port) {
+            let allocated: Vec<_> = lit
+                .iter()
+                .filter_map(|s| s.mst.map(|m| (m.sink, m.pbn)))
+                .collect();
             for output in link.outputs.iter_mut().flatten() {
                 output.modes.clear();
                 if lit.iter().any(|s| s.mst.map(|m| m.sink) == output.sink) {
                     continue;
                 }
-                if let Some((_, edid, available)) =
-                    devices.iter().find(|d| Some(d.0) == output.sink)
-                {
-                    output.modes = dark_mst_modes(soc, caps, edid, *available, lit);
+                if let Some((sink, edid, _)) = devices.iter().find(|d| Some(d.0) == output.sink) {
+                    let available =
+                        topology::path_budget(&link.topology, *sink, &allocated).unwrap_or(0);
+                    output.modes = dark_mst_modes(soc, caps, edid, available, lit);
                 }
             }
         }
@@ -817,7 +873,7 @@ impl ColdBoot {
             return Err(ModesetError::Link);
         };
         let link = self.mst.get(&port).ok_or(MstFailure::Invalid)?;
-        link.require_payload_idle()?;
+        link.require_transaction_idle()?;
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
             if link.owner.is_none() {
@@ -877,7 +933,7 @@ impl ColdBoot {
         unplugged: bool,
     ) -> Result<(), ModesetError> {
         let link = self.mst.get(&port).ok_or(MstFailure::Invalid)?;
-        link.require_payload_idle()?;
+        link.require_transaction_idle()?;
         let owner = link.owner == Some(pipe);
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {

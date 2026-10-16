@@ -87,22 +87,67 @@ fn reconcile(previous: &[Option<MstOutput>; 4], topology: &Topology) -> [Option<
 }
 
 impl MstLink {
-    /// Coalesce connection notifications. As in Linux, unknown branches are
-    /// ignored; resource-status notifications currently have no policy handler.
+    /// Coalesce connection and resource notifications. Unknown endpoints are
+    /// ignored. Resource notices schedule a fresh query, not an assumed budget.
     /// Keep this separate from the probe: payload removal still needs old routes.
     pub(super) fn consume_events(&mut self) {
         for event in core::mem::take(&mut self.manager.events) {
-            if let dp_mst::UpRequest::ConnectionStatus { guid, port, .. } = event {
-                if self
-                    .topology
-                    .branches
-                    .iter()
-                    .any(|b| b.guid == guid && b.ports.iter().any(|p| p.info.port == port))
-                {
-                    self.dirty = true;
+            let (guid, port) = match event {
+                dp_mst::UpRequest::ConnectionStatus { guid, port, .. }
+                | dp_mst::UpRequest::ResourceStatus { guid, port, .. } => (guid, port),
+            };
+            let Some(branch) = self.topology.branches.iter().position(|b| b.guid == guid) else {
+                continue;
+            };
+            let sink = dp_mst_mgr::Sink { branch, port };
+            let Some(p) = self.topology.port(sink) else {
+                continue;
+            };
+            match event {
+                dp_mst::UpRequest::ConnectionStatus { .. } => self.dirty = true,
+                dp_mst::UpRequest::ResourceStatus { .. } => {
+                    if !p.info.input && p.info.ddps && !self.resource_ports.contains(&sink) {
+                        self.resource_ports.push(sink);
+                    }
                 }
             }
         }
+    }
+
+    /// Query resources while the retained routes/payloads still describe the
+    /// link. Add our own allocations back to the reported free PBN before
+    /// comparing with the streamless probe snapshot. Our allocation notices
+    /// therefore do not cause a perpetual stop/probe/relight cycle.
+    pub(super) async fn refresh_resources<A: MstAux>(
+        &mut self,
+        aux: &mut A,
+    ) -> Result<(), MstFailure<A::Error>> {
+        self.require_transaction_idle()?;
+        if self.dirty || self.resource_ports.is_empty() {
+            self.resource_ports.clear();
+            return Ok(());
+        }
+        let allocated: Vec<_> = self.payloads.iter().map(|p| (p.sink, p.pbn)).collect();
+        // Resolve every route before starting a sideband transaction.
+        let mut queries = Vec::new();
+        for &sink in &self.resource_ports {
+            let old = *self.topology.port(sink).ok_or(MstFailure::Invalid)?;
+            let used = used_pbn(&self.topology, sink, &allocated).ok_or(MstFailure::Invalid)?;
+            let branch = &self.topology.branches[sink.branch];
+            queries.push((sink, branch.lct, branch.rad, old, used));
+        }
+        self.resource_query = true;
+        for (sink, lct, rad, old, used) in queries {
+            let (fec, full, free) = self
+                .manager
+                .path_resources(aux, lct, &rad, sink.port)
+                .await?;
+            let available = (u32::from(free) + used).min(u32::from(full)) as u16;
+            self.dirty |= (fec, full, available) != (old.fec, old.full_pbn, old.available_pbn);
+        }
+        self.resource_ports.clear();
+        self.resource_query = false;
+        Ok(())
     }
 
     /// Initialize once, or replace a dirty topology only after all source and
@@ -112,7 +157,7 @@ impl MstLink {
         &mut self,
         aux: &mut A,
     ) -> Result<(), MstFailure<A::Error>> {
-        self.require_payload_idle()?;
+        self.require_transaction_idle()?;
         if self.state == ProbeState::Ready && !self.dirty {
             return Ok(());
         }
@@ -147,10 +192,44 @@ impl MstLink {
         }
         self.topology = topology;
         self.outputs = outputs;
+        self.resource_ports.clear();
         self.dirty = false;
         self.state = ProbeState::Ready;
         Ok(())
     }
+}
+
+fn used_pbn(
+    topology: &Topology,
+    hop: dp_mst_mgr::Sink,
+    allocated: &[(dp_mst_mgr::Sink, u16)],
+) -> Option<u32> {
+    allocated.iter().try_fold(0u32, |total, &(sink, pbn)| {
+        let path = topology.path(sink)?;
+        total.checked_add(if path.contains(&hop) {
+            u32::from(pbn)
+        } else {
+            0
+        })
+    })
+}
+
+/// Available PBN at the tightest hop, accounting for all sibling payloads
+/// which share that hop. Zero means exhausted, never unspecified/unlimited.
+pub(super) fn path_budget(
+    topology: &Topology,
+    sink: dp_mst_mgr::Sink,
+    allocated: &[(dp_mst_mgr::Sink, u16)],
+) -> Option<u16> {
+    topology
+        .path(sink)?
+        .iter()
+        .try_fold(u16::MAX, |budget, &hop| {
+            let port = topology.port(hop)?;
+            let used = used_pbn(topology, hop, allocated)?;
+            let free = u32::from(port.available_pbn.min(port.full_pbn)).checked_sub(used)?;
+            Some(budget.min(free as u16))
+        })
 }
 
 pub(super) async fn read_edid<A: MstAux>(
@@ -316,7 +395,7 @@ mod tests {
         link.manager.events.push(notice([0xaa; 16], 1));
         link.manager.events.push(dp_mst::UpRequest::ResourceStatus {
             port: 1,
-            guid: [0x11; 16],
+            guid: [0xaa; 16],
             available_pbn: 1,
         });
         link.consume_events();
@@ -327,6 +406,115 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/dp-mst",
         navi48_mst_reprobe_retains_routes_until_payload_retirement
+    );
+
+    fn navi48_mst_resources_requery_without_relighting_own_allocations() -> TestResult {
+        let mut hub = Hub::new();
+        hub.dpcd.insert(0, 0x14);
+        hub.edid[126] = 0;
+        let mut link = MstLink::default();
+        run(link.prepare(&mut hub)).unwrap();
+        link.manager.events.clear();
+        let before = link.topology.clone();
+        let ids = link.outputs.each_ref().map(|o| o.as_ref().map(|o| o.id));
+        let sink = dp_mst_mgr::Sink { branch: 1, port: 1 };
+        link.owner = Some(1);
+        link.payloads.push(MstPayload {
+            sink,
+            vcpi: 1,
+            start: 1,
+            slots: 20,
+            pbn: 900,
+            stream: 1,
+        });
+        // Root output 2 carries the child stream. An old/duplicated notice is
+        // only a hint; query its current free capacity and add our 900 back.
+        hub.resources.insert((1, 2), (2562, 1652));
+        let event = dp_mst::UpRequest::ResourceStatus {
+            port: 2,
+            guid: [0x11; 16],
+            available_pbn: 0,
+        };
+        link.manager.events.extend([event; 3]);
+        for (guid, port) in [
+            ([0x11; 16], 0),
+            ([0x11; 16], 3),
+            ([0x11; 16], 15),
+            ([0xaa; 16], 2),
+        ] {
+            link.manager.events.push(dp_mst::UpRequest::ResourceStatus {
+                guid,
+                port,
+                available_pbn: 100,
+            });
+        }
+        link.consume_events();
+        let sent = hub.requests.len();
+        run(link.refresh_resources(&mut hub)).unwrap();
+        assert_eq!(hub.requests.len(), sent + 1);
+        assert!(!link.dirty && !link.resource_query_pending());
+        assert_eq!(link.topology, before);
+        // External demand has reduced the capacity. Keep every old route and
+        // payload until the owner stops them, then reprobe authoritatively.
+        hub.resources.insert((1, 2), (2562, 1000));
+        link.manager.events.push(event);
+        link.consume_events();
+        run(link.refresh_resources(&mut hub)).unwrap();
+        assert!(link.dirty);
+        assert_eq!(link.topology, before);
+        assert_eq!(run(link.prepare(&mut hub)), Err(MstFailure::Invalid));
+        link.owner = None;
+        link.payloads.clear();
+        hub.resources.insert((1, 2), (2562, 1900));
+        run(link.prepare(&mut hub)).unwrap();
+        assert_eq!(path_budget(&link.topology, sink, &[]), Some(1900));
+        assert_eq!(
+            link.outputs.each_ref().map(|o| o.as_ref().map(|o| o.id)),
+            ids
+        );
+        // A later all-off bandwidth loss, including zero, is not ignored.
+        hub.resources.insert((1, 2), (2562, 0));
+        link.manager.events.push(event);
+        link.consume_events();
+        run(link.refresh_resources(&mut hub)).unwrap();
+        assert!(link.dirty);
+        run(link.prepare(&mut hub)).unwrap();
+        assert_eq!(path_budget(&link.topology, sink, &[]), Some(0));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/dp-mst",
+        navi48_mst_resources_requery_without_relighting_own_allocations
+    );
+
+    fn navi48_mst_path_budget_accounts_for_shared_ancestors() -> TestResult {
+        let mut hub = Hub::new();
+        let mut tree = run(Manager::new().probe(&mut hub)).unwrap();
+        let a = dp_mst_mgr::Sink { branch: 1, port: 1 };
+        let b = dp_mst_mgr::Sink { branch: 1, port: 2 };
+        let mut peer = tree.branches[1].ports[1];
+        peer.info.port = 2;
+        tree.branches[1].ports[2] = peer;
+        assert_eq!(path_budget(&tree, a, &[]), Some(2552));
+        assert_eq!(path_budget(&tree, b, &[(a, 900)]), Some(1652));
+        assert_eq!(path_budget(&tree, b, &[(a, 2552)]), Some(0));
+        assert_eq!(path_budget(&tree, b, &[(a, 2553)]), None);
+        let root_sink = dp_mst_mgr::Sink { branch: 0, port: 1 };
+        assert_eq!(path_budget(&tree, b, &[(root_sink, 900)]), Some(2552));
+        // Reject disconnected hops, absent parents and ambiguous parentage.
+        tree.branches[0].ports[2].info.ddps = false;
+        assert_eq!(path_budget(&tree, a, &[]), None);
+        tree.branches[0].ports[2].info.ddps = true;
+        tree.branches[0].ports[1].branch = Some(1);
+        assert_eq!(path_budget(&tree, a, &[]), None);
+        tree.branches[0].ports[1].branch = None;
+        tree.branches[0].ports[2].branch = None;
+        assert_eq!(path_budget(&tree, a, &[]), None);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/dp-mst",
+        navi48_mst_path_budget_accounts_for_shared_ancestors
     );
 
     struct Pending;

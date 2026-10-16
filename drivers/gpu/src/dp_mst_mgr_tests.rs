@@ -24,6 +24,9 @@ pub(crate) struct Hub {
     pub(crate) root_sink_present: bool,
     pub(crate) child_present: bool,
     pub(crate) require_power: bool,
+    /// Per-(LCT, port) resource replies, including zero-bandwidth paths.
+    pub(crate) resources: BTreeMap<(u8, u8), (u16, u16)>,
+    pub(crate) resource_reply_port: Option<u8>,
     recursive: bool,
 }
 const ROOT: [u8; 16] = [0x11; 16];
@@ -50,6 +53,8 @@ impl Hub {
             root_sink_present: true,
             child_present: true,
             require_power: false,
+            resources: BTreeMap::new(),
+            resource_reply_port: None,
             recursive: false,
         }
     }
@@ -108,9 +113,14 @@ impl Hub {
             dp_mst::ENUM_PATH_RESOURCES => {
                 let port = body[1] >> 4;
                 let full = 2560 + u16::from(port) + if child { 100 } else { 0 };
-                let mut r = vec![0x10, port << 4 | 1];
+                let (full, available) = self
+                    .resources
+                    .get(&(lct, port))
+                    .copied()
+                    .unwrap_or((full, full - 10));
+                let mut r = vec![0x10, self.resource_reply_port.unwrap_or(port) << 4 | 1];
                 r.extend_from_slice(&full.to_be_bytes());
-                r.extend_from_slice(&(full - 10).to_be_bytes());
+                r.extend_from_slice(&available.to_be_bytes());
                 r
             }
             dp_mst::REMOTE_I2C_READ => {
@@ -141,6 +151,35 @@ impl Hub {
     }
 }
 const LINK_ADDRESS_KIND: u8 = dp_mst::LINK_ADDRESS;
+
+fn mst_resource_replies_must_match_port_and_capacity() -> TestResult {
+    let mut hub = Hub::new();
+    hub.resource_reply_port = Some(7);
+    assert_eq!(
+        run(Manager::new().probe(&mut hub)),
+        Err(MstError::Malformed)
+    );
+    let mut hub = Hub::new();
+    hub.resources.insert((1, 1), (100, 101));
+    assert_eq!(
+        run(Manager::new().probe(&mut hub)),
+        Err(MstError::Malformed)
+    );
+    let mut hub = Hub::new();
+    hub.resources.insert((1, 1), (100, 0));
+    let tree = run(Manager::new().probe(&mut hub)).unwrap();
+    assert_eq!(
+        tree.port(Sink { branch: 0, port: 1 })
+            .unwrap()
+            .available_pbn,
+        0
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    mst_resource_replies_must_match_port_and_capacity
+);
 
 fn mst_probe_bounds_depth_and_branch_count() -> TestResult {
     let mut hub = Hub::new();

@@ -1723,7 +1723,7 @@ impl ColdBoot {
             } else if let Some(m) = s.mst {
                 // Within the stream's own payload.
                 super::mst::mst_slots(&t, s.lanes, s.rate, s.caps.fec)
-                    .is_some_and(|(_, slots)| slots <= m.slots)
+                    .is_some_and(|(pbn, slots)| pbn <= m.pbn && slots <= m.slots)
                     .then_some(false)
             } else {
                 dp_offer_fits(&t, &s).then_some(false)

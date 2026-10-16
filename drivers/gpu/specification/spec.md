@@ -1351,11 +1351,26 @@ Truncated bodies fail instead of manufacturing zero-filled status fields.
 An event survives failure to send its sideband ACK after ESI acknowledgement.
 `ColdBoot::poll_display_mst(port)` and `take_display_mst_events(port)` expose
 this service over DMUB AUX. `service_display_mst` drains before/after polling
-and marks known-branch/known-port connection notifications for reprobe. The
-monitor stops all streams using their old routes, reprobes, then relights the
-enabled outputs. Notifications received during reprobe remain queued for the
-next pass. Unknown branch/port notices are ignored; resource-status notices
-are acknowledged but do not yet drive bandwidth reallocation.
+and marks known-branch/known-port connection notifications for reprobe. Resource
+notifications on connected output ports coalesce into fresh ENUM_PATH_RESOURCES
+queries; notification PBN values alone never become admission authority. Replies
+must match the requested port and have available PBN no greater than full PBN.
+The driver adds its current payload PBN back to the queried free capacity,
+including descendant streams on a shared branch hop. Its own allocations thus
+do not cause repeated relights. A changed capacity/FEC snapshot requests
+reconfiguration. The monitor stops all streams using their old routes, reprobes,
+then relights enabled outputs. Notifications received during queries/reprobe
+remain queued for the next pass. Unknown branch/port, input-port and disconnected
+resource notices are ignored.
+
+`MstLink::resource_query_pending()` reports an incomplete resource-query batch.
+The marker precedes the first AUX operation and clears only after every response
+has completed. Returned failures and cancellation retain it and the topology,
+payloads and session, refusing subsequent payload/sideband transactions, startup,
+teardown and session disposal. These uncertain queries require future explicit
+reconciliation/reset; an empty source/payload list is not permission to discard
+them. Models inject faults before and after every AUX operation on both active
+and empty sessions.
 
 `MstLink::outputs` reserves four stable slots. `MstOutputId` includes root
 GUID, branch GUID, LCT/RAD and output port; probe vector indices are never
@@ -1380,8 +1395,14 @@ branch's sinks with joint DML admission, 8-bpc RGB and the maximum supported
 8b/10b link. `pipes[k]: Option<u8>` assigns stable output k to a distinct
 display/pipe, or disables it. Disabled, unreadable and unadmitted devices
 leave gaps; their successors never inherit their CRTC or requested mode.
-Each payload must fit the remaining 63 slots and the end port's available
-PBN. Add orders the DPCD payload table, source SAT/ACT, ACT handled,
+Each payload must fit the remaining 63 slots and the available PBN of every
+connected hop from the sink to the root, after subtracting selected sibling
+payloads on each shared hop. Missing, cyclic or ambiguous parentage refuses
+admission. Zero PBN is exhausted capacity (including `select_mst` inputs),
+never an unlimited/unknown sentinel. Low-level payload adds recheck path budgets
+before writes; dark-connector mode admission uses the same path accounting.
+Active-stream alternatives remain inside both their allocated slots and PBN.
+Add orders the DPCD payload table, source SAT/ACT, ACT handled,
 ALLOCATE_PAYLOAD and stream VC rate before video. Remove zeroes the VC rate,
 deallocates remotely, updates SAT/ACT and compacts later payload slots. Physical
 root removal skips all remote AUX transactions and waits during removal.

@@ -1234,9 +1234,9 @@ fn navi48_modeset_selects_mst_streams_like_amdgpu_dm() -> TestResult {
     };
     let sink = |port| Sink { branch: 0, port };
     let devices = [
-        (sink(1), edid_2160p(), 0),
-        (sink(2), edid_three_modes(false), 0),
-        (sink(3), edid_2160p(), 0),
+        (sink(1), edid_2160p(), u16::MAX),
+        (sink(2), edid_three_modes(false), u16::MAX),
+        (sink(3), edid_2160p(), u16::MAX),
     ];
     let uhd = edid_timings(&edid_2160p())[0];
     let want = |_| Some(uhd);
@@ -1285,9 +1285,9 @@ fn navi48_mst_keeps_sink_output_assignments() -> TestResult {
     };
     let sink = |port| Sink { branch: 0, port };
     let mut devices = [
-        (sink(1), edid_2160p(), 0),
-        (sink(2), Vec::new(), 0), // EDID read failed: keep the gap.
-        (sink(3), edid_three_modes(false), 0),
+        (sink(1), edid_2160p(), u16::MAX),
+        (sink(2), Vec::new(), u16::MAX), // EDID read failed: keep the gap.
+        (sink(3), edid_three_modes(false), u16::MAX),
     ];
     let timing = edid_timings(&devices[2].1)[1];
     let pipes = [None, Some(1), Some(2)];
@@ -1298,6 +1298,7 @@ fn navi48_mst_keeps_sink_output_assignments() -> TestResult {
             devices,
             &|k| (k == 2).then_some(timing),
             pipes,
+            &|_, _| u16::MAX,
         )
     };
     let picked = choose(&devices, &pipes);
@@ -1348,37 +1349,53 @@ fn navi48_mst_admits_dark_connector_modes() -> TestResult {
     let edid = edid_three_modes(false);
     let widths = |m: Vec<Timing>| m.iter().map(|t| t.h_active).collect::<Vec<_>>();
     // Enumeration works before any stream has ever been selected or lit.
-    let all = dark_mst_modes(&soc, caps, &edid, 0, &[]);
+    let all = dark_mst_modes(&soc, caps, &edid, u16::MAX, &[]);
     assert_eq!(widths(all.clone()), [1920, 3840, 1280]);
     assert_eq!(
         widths(dark_mst_modes(&soc, caps, &edid, 600, &[])),
         [1920, 1280]
     );
     assert!(dark_mst_modes(&soc, caps, &edid, 1, &[]).is_empty());
-    assert!(dark_mst_modes(&soc, caps, &[], 0, &[]).is_empty());
+    assert!(dark_mst_modes(&soc, caps, &edid, 0, &[]).is_empty());
+    assert!(dark_mst_modes(&soc, caps, &[], u16::MAX, &[]).is_empty());
     let slow = dml::Soc {
         dispclk_max_khz: 50_000,
         ..soc
     };
-    assert!(dark_mst_modes(&slow, caps, &edid, 0, &[]).is_empty());
+    assert!(dark_mst_modes(&slow, caps, &edid, u16::MAX, &[]).is_empty());
 
     let sink = crate::dp_mst_mgr::Sink { branch: 0, port: 1 };
-    let mut lit = super::super::select_mst(0, caps, &[(sink, edid_2160p(), 0)], &|_| None);
+    let mut lit = super::super::select_mst(0, caps, &[(sink, edid_2160p(), u16::MAX)], &|_| None);
     // A running 4K60 stream owns 54 slots; only 720p fits in the remaining 9.
-    assert_eq!(widths(dark_mst_modes(&soc, caps, &edid, 0, &lit)), [1280]);
+    assert_eq!(
+        widths(dark_mst_modes(&soc, caps, &edid, u16::MAX, &lit)),
+        [1280]
+    );
     lit[0].mst.as_mut().unwrap().slots = 63;
-    assert!(dark_mst_modes(&soc, caps, &edid, 0, &lit).is_empty());
+    assert!(dark_mst_modes(&soc, caps, &edid, u16::MAX, &lit).is_empty());
     // Even spare link slots cannot admit a fifth display engine stream.
-    let one = super::super::select_mst(0, caps, &[(sink, edid_1080p(), 0)], &|_| None)[0];
-    assert!(dark_mst_modes(&soc, caps, &edid, 0, &[one; 4]).is_empty());
+    let one = super::super::select_mst(0, caps, &[(sink, edid_1080p(), u16::MAX)], &|_| None)[0];
+    assert!(dark_mst_modes(&soc, caps, &edid, u16::MAX, &[one; 4]).is_empty());
     // Advertising a timing does not enable the connector. A later explicit
     // request retains its fixed pipe and gets full configuration admission.
-    let devices = [(sink, edid, 0)];
-    assert!(
-        super::super::mst::select_mst_outputs(0, caps, &devices, &|_| None, &[None]).is_empty()
+    let devices = [(sink, edid, u16::MAX)];
+    assert!(super::super::mst::select_mst_outputs(
+        0,
+        caps,
+        &devices,
+        &|_| None,
+        &[None],
+        &|_, _| u16::MAX
+    )
+    .is_empty());
+    let enabled = super::super::mst::select_mst_outputs(
+        0,
+        caps,
+        &devices,
+        &|_| Some(all[1]),
+        &[Some(3)],
+        &|_, _| u16::MAX,
     );
-    let enabled =
-        super::super::mst::select_mst_outputs(0, caps, &devices, &|_| Some(all[1]), &[Some(3)]);
     assert_eq!((enabled[0].0.timing, enabled[0].1), (all[1], 3));
     assert!(admit_displays(&soc, &[enabled[0].0]).is_ok());
     TestResult::Pass
@@ -1386,4 +1403,62 @@ fn navi48_mst_admits_dark_connector_modes() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_mst_admits_dark_connector_modes
+);
+
+fn navi48_mst_selection_obeys_shared_path_budget() -> TestResult {
+    let caps = DpCaps {
+        lanes: 4,
+        rate: LinkRate::Hbr2,
+        uhbr: 0,
+        fec: false,
+        dsc: None,
+    };
+    let devices = [
+        (
+            crate::dp_mst_mgr::Sink { branch: 1, port: 1 },
+            edid_three_modes(false),
+            u16::MAX,
+        ),
+        (
+            crate::dp_mst_mgr::Sink { branch: 1, port: 2 },
+            edid_three_modes(false),
+            u16::MAX,
+        ),
+    ];
+    // Both end ports can carry 1080p, but their common upstream hop cannot
+    // carry two such streams. The second keeps its pipe and takes 720p.
+    let budget = |_, selected: &[Selection]| {
+        900u16.saturating_sub(selected.iter().filter_map(|s| s.mst).map(|m| m.pbn).sum())
+    };
+    let picked = super::super::mst::select_mst_outputs(
+        0,
+        caps,
+        &devices,
+        &|_| None,
+        &[Some(1), Some(3)],
+        &budget,
+    );
+    assert_eq!(
+        picked
+            .iter()
+            .map(|(s, p)| (s.timing.h_active, *p))
+            .collect::<Vec<_>>(),
+        [(1920, 1), (1280, 3)]
+    );
+    assert!(super::super::mst::select_mst_outputs(
+        0,
+        caps,
+        &devices,
+        &|_| None,
+        &[Some(1), Some(3)],
+        &|_, _| 0,
+    )
+    .is_empty());
+    let zero = [(devices[0].0, devices[0].1.clone(), 0)];
+    assert!(super::super::select_mst(0, caps, &zero, &|_| None).is_empty());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_mst_selection_obeys_shared_path_budget
 );
