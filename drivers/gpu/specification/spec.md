@@ -1033,6 +1033,14 @@ the existing best-effort policy; native state and fresh release guards remain
 binding. Completed link startup replaces this obligation with the normal SCDC
 then Link cleanup path. Cancellation still retains `in_flight` and refuses replay.
 
+Native Navi48 protected output remains unsupported. KMS exposes neither Content
+Protection nor HDCP Content Type, and the native owner creates no DTM/HDCP TA
+session. Crypto helpers and HDCP exclusions in retirement safety contracts do
+not authorize protected scanout. Firmware, protocol, credential authorization,
+protected-buffer isolation and end-to-end validation are tracked separately in
+[`navi48-protected-output.md`](../research/navi48-protected-output.md); properties
+must remain absent until a supported authenticated and encrypted path exists.
+
 MST checkpoints trained/attached link ownership at Link, the frontend at
 Frontend, completed payload allocation at Payload and black video at Video.
 Cleanup removes the payload before detaching the frontend/link, preserving

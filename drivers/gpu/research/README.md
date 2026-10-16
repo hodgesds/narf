@@ -16,7 +16,9 @@
 
 ## Distilled summaries
 
-- (Defer.)
+- [Navi48 protected-output requirements](navi48-protected-output.md) — separate
+  firmware, protocol, authorization and validation gates; HDCP remains unsupported
+  and unadvertised.
 
 ## Open research questions
 

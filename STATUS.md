@@ -465,6 +465,11 @@ the UHBR/FRL output mux to DIO only after master/busy clear, with readback befor
 retirement is published. Native failure guards remain binding; cancelled startup,
 uncertain MST payload transactions, uncheckpointed active work and
 shared-clock recovery remain open, with uncertain memory retained.
+HDCP/protected output is tracked separately in
+`drivers/gpu/research/navi48-protected-output.md`, including TA firmware,
+protocol, credential authorization, isolation and physical acceptance gates.
+It remains unsupported and unadvertised; existing crypto helpers and retirement
+exclusions do not implement protected scanout.
 The lit Navi48 display is published as DRM KMS state on the amdgpu card, with
 the sink's real EDID and exact timing (disconnected on unplug). SETCRTC
 accepts only that timing, and the base amdgpu DRM version 3.0.0 claims no
