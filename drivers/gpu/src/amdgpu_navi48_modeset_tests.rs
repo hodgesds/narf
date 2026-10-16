@@ -1740,3 +1740,52 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_mst_selection_obeys_shared_path_budget
 );
+
+/// FRL's RGB-only fallback must obey the sink's Y420VDB, including when
+/// the mode fits the FRL wire rate but cannot fit TMDS at half pixel rate.
+fn navi48_frl_fallback_respects_y420_only_modes() -> TestResult {
+    let edid = edid_y420();
+    let caps = HdmiCaps {
+        max_frl_rate: 6,
+        scdc: true,
+        ..hdmi_caps(&edid)
+    };
+    let t = edid_timings(&edid)
+        .into_iter()
+        .find(|t| (t.pixel_clock_khz, t.h_active, t.h_total) == (594_000, 3840, 5280))
+        .unwrap(); // CTA VIC 96, listed only as 4:2:0.
+    let frl = Some(FrlRate::new(6).unwrap());
+    if hdmi_output(caps, &t, 8, frl) != Some((otg::ColorDepth::Bpc8, true, None)) {
+        return TestResult::Fail("lost supported TMDS 4:2:0");
+    }
+    let limited = HdmiCaps {
+        vsdb_max_khz: 165_000,
+        forum_max_khz: 0,
+        ..caps
+    };
+    for depth in [8, 10, 12] {
+        if hdmi_output(limited, &t, depth, frl).is_some() {
+            return TestResult::Fail("RGB FRL admitted a 4:2:0-only mode");
+        }
+    }
+    // The same rate/timing remains usable when RGB is allowed (including
+    // sinks that advertise 4:2:0 as an additional encoding).
+    for also in [[0; 4], caps.y420_only] {
+        let rgb = HdmiCaps {
+            y420_only: [0; 4],
+            y420_also: also,
+            ..limited
+        };
+        if !matches!(
+            hdmi_output(rgb, &t, 8, frl),
+            Some((otg::ColorDepth::Bpc8, false, Some(_)))
+        ) {
+            return TestResult::Fail("lost supported RGB FRL");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_frl_fallback_respects_y420_only_modes
+);

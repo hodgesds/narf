@@ -1099,7 +1099,7 @@ pub fn hdmi_depth(caps: HdmiCaps, pixel_khz: u32, max_bpc: u8) -> Option<otg::Co
 /// when FRL is off or taken): RGB at the deepest declared depth up to
 /// `max_bpc` with a rate carrying it, the lowest such rate. FRL carries
 /// no audio here (the HPO FRL audio path is not implemented), so the
-/// capacity check runs without it.
+/// capacity check runs without it. RGB FRL cannot carry a 4:2:0-only mode.
 pub fn hdmi_output(
     caps: HdmiCaps,
     t: &Timing,
@@ -1110,6 +1110,12 @@ pub fn hdmi_output(
         return Some((depth, ycbcr420, None));
     }
     let cap = frl_cap?;
+    let vic = narf_edid::modes::match_cea_mode(edid_mode(t));
+    if vic != 0 && caps.y420_only[usize::from(vic / 64)] & 1 << (vic % 64) != 0 {
+        // A fitting FRL wire rate cannot override the sink's pixel encoding.
+        // Native FRL 4:2:0 is not implemented yet.
+        return None;
+    }
     let audio = frl_audio(None, t.v_active);
     [
         (12, caps.dc36, otg::ColorDepth::Bpc12),

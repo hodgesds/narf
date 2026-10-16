@@ -985,6 +985,11 @@ abort described below; uncertain owners stay retained. `stop_modeset`
 reverses a success down to a disabled PHY with timing and planes retired; the
 surface allocation remains bound to its pipe.
 
+HDMI admission honors the sink's Y420VDB across protocol fallback: a 4:2:0-only
+mode may use supported TMDS 4:2:0, but cannot fall back to the current RGB-only
+FRL path when TMDS lacks capacity. A mode listed in Y420CMDB remains eligible
+for RGB FRL. FRL 4:2:0 startup is still unsupported.
+
 `amdgpu_frl_training::poll_status` handles live SCDC FRL_Start, FLT_Update
 and Source_Test_Update requests as Linux's `hdmi_frl_poll_status_flag` does.
 `FrlStatusIo::current_ffe` supplies the last acknowledged FFE level; requests
