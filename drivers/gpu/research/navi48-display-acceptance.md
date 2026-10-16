@@ -82,10 +82,10 @@ The GPU specification is authoritative for the current exposed interfaces.
 | HDMI TMDS / SCDC / RGB depth and range / 8-bpc 4:2:0 | Native register and capability models; pre-link sink cleanup implemented | None |
 | UHBR / FRL | Startup, training, scanout, shutdown and live FRL status models; FRL 8/10/12-bpc 4:2:0 up to 4096 pixels; firmware-made mux/clock assumptions need confirmation; FRL opt-in | None |
 | Legacy DP DSC | PPS/DML differential vectors and native models; HPO/FRL DSC, larger ODM layouts and other input formats remain open | None |
-| Legacy MST | Topology, payload, notification, path-budget and fixed-output models; mixed MST/SST, UHBR MST and audio/DSC remain open | None |
+| Legacy MST | Topology, payload, notification, path-budget, fixed-output and per-stream LPCM models; mixed MST/SST, UHBR MST and DSC remain open | None |
 | Joint display configuration | Joint DML/clock/CRB models, four fixed pipes; ODM, broader routing and seamless shared-clock changes remain open | None |
 | Scaling / composition / tiling / color management / HDR / VRR | Additional native programming and exposure gates remain open | None |
-| Audio | TMDS/FRL HDMI and legacy/UHBR DP LPCM models; AFMT/APG/ACR, bandwidth filtering, DTO/endpoint ownership and DP DSC shared PPS covered; compressed passthrough, channel maps and MST audio remain open | None |
+| Audio | TMDS/FRL HDMI, legacy/UHBR DP SST and legacy MST LPCM models; AFMT/APG/ACR, bandwidth filtering, DTO/endpoint ownership, MST payload/handover and DP DSC shared PPS covered; compressed passthrough, channel maps and UHBR MST audio remain open | None |
 | Board-specific panel / USB-C routes | Inventory required before applicability or implementation decisions | None |
 | Protected output | [Separate requirements](navi48-protected-output.md); unsupported, unadvertised | None |
 

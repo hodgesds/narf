@@ -1974,6 +1974,8 @@ impl ColdBoot {
     /// Start audio on the port's running HDMI or DP video.
     /// # Safety
     /// Fulfil `Otg::start_hdmi_audio` or `Otg::start_dp_audio` obligations.
+    /// For MST also exclude payload changes; the retained manager allocation
+    /// and fresh source SAT/VC witnesses must agree before endpoint exposure.
     pub async unsafe fn start_display_audio(
         &mut self,
         port: usize,
@@ -1982,10 +1984,24 @@ impl ColdBoot {
     ) -> Result<otg::DisplayAudio, otg::Error> {
         let path = self.dp_phy_path(port)?;
         let otg = self.otg.as_mut().map_err(|e| *e)?;
+        let mst_slots = if !hdmi {
+            otg.status()
+                .dp_video_running
+                .filter(|v| v.frontend.link.phy.settings.mst)
+                .map(|v| {
+                    let link = self.mst.get(&port).ok_or(otg::Error::Invalid)?;
+                    link.audio_slots(v.frontend.request.stream)
+                })
+                .transpose()?
+        } else {
+            None
+        };
         // SAFETY: matching retained board path/owners; caller's obligations.
         unsafe {
             if hdmi {
                 otg.start_hdmi_audio(path, info).await
+            } else if let Some(slots) = mst_slots {
+                otg.start_mst_audio(path, info, slots).await
             } else {
                 otg.start_dp_audio(path, info).await
             }

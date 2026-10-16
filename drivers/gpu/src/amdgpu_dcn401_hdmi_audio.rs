@@ -1,4 +1,4 @@
-//! Native DCN401 audio on a running TMDS, FRL or DP SST stream: the display half
+//! Native DCN401 audio on a running TMDS, FRL or DP stream: the display half
 //! only (the HD-Audio controller and codec stream the samples).
 //!
 //! HDMI, in Linux's order: dce_aud_wall_dto_setup (DTO0 from the pixel
@@ -26,6 +26,12 @@ mod frl_audio;
 #[path = "amdgpu_dcn401_uhbr_audio.rs"]
 mod uhbr_audio;
 pub(crate) use uhbr_audio::uhbr_lpcm_info;
+#[path = "amdgpu_dcn401_dp_audio_bw.rs"]
+mod bandwidth;
+#[path = "amdgpu_dcn401_mst_audio.rs"]
+mod mst_audio;
+pub(crate) use mst_audio::mst_lpcm_info;
+pub use mst_audio::MstAudioPayload;
 
 /// One CEA Short Audio Descriptor, as amdgpu_dm copies it from the EDID.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -57,7 +63,7 @@ pub struct AudioInfo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DisplayAudio {
     pub info: AudioInfo,
-    /// Carried by DP SST secondary packets rather than HDMI's AFMT packets.
+    /// Carried by DP secondary packets rather than HDMI's AFMT packets.
     pub dp: bool,
     /// Azalia endpoint (Linux's audio instance): the stream's own.
     pub endpoint: u8,
@@ -68,7 +74,7 @@ pub struct DisplayAudio {
     pub hbr: bool,
 }
 
-/// Valid LPCM SADs for the native HPO audio transports.
+/// Valid LPCM SADs for transports without compressed passthrough.
 pub(crate) fn lpcm_info(mut info: AudioInfo) -> Option<AudioInfo> {
     if info.mode_count == 0 || info.mode_count > 16 {
         return None;
@@ -701,6 +707,12 @@ impl<I: Io> Engine<I> {
         a: &DisplayAudio,
     ) -> Result<(), Error> {
         self.dp_audio_pps_verify(frontend)?;
+        if frontend.link.phy.settings.mst {
+            self.mst_audio_verify_payload(
+                frontend,
+                self.status.mst_audio_payload.ok_or(Error::Invalid)?,
+            )?;
+        }
         let l = self.layout;
         let at = |r| DpStream::Dio(frontend.request.stream).at(l, r);
         for (reg, mask, value) in [
@@ -785,6 +797,10 @@ impl<I: Io> Engine<I> {
             return Err(Error::Invalid);
         }
         let frontend = self.dp_audio_frontend(path)?;
+        if frontend.link.phy.settings.mst {
+            // MST needs a completed manager payload as well as running video.
+            return Err(Error::Unsupported);
+        }
         let t = frontend.blank.timing.request.timing;
         let (descriptors, ac3, hbr) = descriptors(&info, &t, None);
         if descriptors[0] == 0 {
@@ -836,6 +852,9 @@ impl<I: Io> Engine<I> {
         }
         let a = self.status.dp_audio.ok_or(Error::Invalid)?;
         let frontend = self.dp_audio_frontend(path)?;
+        if frontend.link.phy.settings.mst {
+            return self.stop_mst_audio(frontend, a);
+        }
         self.dp_audio_verify(&frontend, &a)?;
         let l = self.layout;
         let at = |r| DpStream::Dio(frontend.request.stream).at(l, r);
@@ -879,7 +898,7 @@ impl Otg {
     ) -> Result<DisplayAudio, Error> {
         self.0.start_dp_audio(path, info).await
     }
-    /// Mute and stop this owner's DP audio, keeping video running.
+    /// Mute and stop this owner's SST or legacy MST DP audio, keeping video running.
     /// # Safety
     /// As for start_dp_audio.
     pub(crate) async unsafe fn stop_dp_audio(&mut self, path: Path) -> Result<(), Error> {

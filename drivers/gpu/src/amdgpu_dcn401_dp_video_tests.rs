@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "amdgpu_dcn401_mst_audio_tests.rs"]
+mod mst_audio;
+
 struct VideoIo {
     inner: FrontendIo,
     pipe: u8,

@@ -1582,7 +1582,8 @@ GETCONNECTOR and the platform's mode-request gate without setting a CRTC mode
 or framebuffer. A missing EDID suppresses the offered timings. Ordinary MST
 disable retains previously admitted timings without restarting siblings;
 the next configuration/reprobe recomputes admission against remaining resources.
-Simultaneous MST/SST ports, UHBR MST, DSC and audio on MST remain unsupported.
+Simultaneous MST/SST ports, UHBR MST and DSC on MST remain unsupported.
+Legacy MST LPCM uses each stream's AFMT and endpoint as described below.
 This path is model-tested only.
 
 `unsafe ColdBoot::retire_inherited_display` retires the legacy DP SST output
@@ -1909,7 +1910,7 @@ unexpected audio packet/sample enables still reject before writes.
 Stopping audio disables its samples, packet enables and Azalia endpoint while
 preserving the shared AFMT clock and secondary master for GSP11. PPS data and
 scheduling remain the video owner's until video stops. This extends the
-existing LPCM path; compressed passthrough and MST audio remain unsupported.
+existing LPCM path; compressed passthrough remains unsupported.
 Register/protocol models are not physical image or audible-output acceptance.
 
 `start_display_audio(port, false, AudioInfo)` / `Otg::start_dp_audio` also dispatch
@@ -1939,6 +1940,37 @@ state. Stop disables audio packets and APG, then the endpoint, before scanout
 or video retirement. It preserves the running video's SDP master; video stops
 that path later. Failed shutdown retains ownership. The shared wall DTO includes
 UHBR, with HDMI priority and endpoint collision checks across all transports.
+
+On legacy 8b/10b MST, `start_display_audio(port, false, AudioInfo)` dispatches
+to `Otg::start_mst_audio` only after the manager owns exactly one completed
+payload for the stream. Incomplete payload/resource transactions reject before
+programming. Startup verifies the running RGB 8/10/12-bpc transport (or its
+matching live scanout), completed source SAT/VC updates, slot count and VC rate
+against the retained timing and trained link. SAT rows may move as siblings
+leave, but duplicate, foreign or overallocated rows reject. Other rows must
+belong to frontends on this same MST link. Audio never changes payloads.
+
+`mst_lpcm_info` filters the remote sink's valid LPCM SADs during selection and
+again at startup. It shares Linux's fixed-point blanking calculation with UHBR,
+using legacy MST's 40-symbol layout, 16-symbol SDP overhead, four-lane AV mapping
+and FEC-removed link budget. Mono uses stereo layout and 3..8 channels use the
+eight-channel layout. No surviving rates means silent video. The per-stream
+DIO AFMT, secondary audio packets and Azalia DP endpoint follow the SST sequence;
+compressed formats and HBR are not exposed. Shared DTO and endpoint allocation
+include the other display transports.
+
+`Status::dp_audio` and `Status::mst_audio_payload: Option<MstAudioPayload>` retain
+both the audio owner and its source allocation witness (`slots`, packed VC `rate`)
+before the first write. Startup has no suspended wait after this publication.
+Partial startup/shutdown failures retain both records in `Failed`. Live scanout
+verification includes the payload/audio witnesses. Stop verifies transport and
+payload before muting samples, disabling packets/AFMT and the endpoint; only
+then may scanout, video and payload retire. The MST activation checkpoint covers
+completed scanout before audio starts. Models cover independent stream/pipe/PHY
+indices, all RGB depths, malformed/stale payloads, failures, endpoint collisions,
+shared DTO and two-stream link handover. 2268 bandwidth vectors match Linux's
+routines. UHBR MST, MST DSC and physical audio acceptance remain outside this
+contract.
 
 `start_display_hdmi_video(port)` starts the blank timing, repeats the FIFO reset
 under live symclk, clears AVMUTE and waits for a fresh frame

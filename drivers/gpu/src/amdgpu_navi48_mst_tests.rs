@@ -398,6 +398,8 @@ fn payload_faults(fault: Fault) -> TestResult {
                     MstPayloadChange::Adding(1)
                 };
                 assert_eq!(link.payload_change(), Some(pending));
+                assert_eq!(link.audio_slots(1), Err(otg::Error::Busy));
+                assert_eq!(link.audio_slots(3), Err(otg::Error::Busy));
                 let attempted = gate.calls.get();
                 let payloads = link.payloads.clone();
                 let topology = link.topology.clone();
@@ -594,4 +596,27 @@ fn navi48_mst_resource_queries_retain_uncertain_transactions() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dp-mst",
     navi48_mst_resource_queries_retain_uncertain_transactions
+);
+
+fn navi48_mst_audio_requires_completed_manager_payload() -> TestResult {
+    let (_, mut link) = payload_fixture(true);
+    assert_eq!(link.audio_slots(1), Err(otg::Error::Invalid));
+    link.owner = Some(0);
+    assert_eq!(link.audio_slots(1), Ok(12));
+    assert_eq!(link.audio_slots(3), Err(otg::Error::Invalid));
+    link.resource_query = true;
+    assert_eq!(link.audio_slots(1), Err(otg::Error::Busy));
+    link.resource_query = false;
+    link.payloads.push(link.payloads[0]);
+    assert_eq!(link.audio_slots(1), Err(otg::Error::Invalid));
+    link.payloads.pop();
+    for slots in [0, 64] {
+        link.payloads[0].slots = slots;
+        assert_eq!(link.audio_slots(1), Err(otg::Error::Invalid));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_audio_requires_completed_manager_payload
 );

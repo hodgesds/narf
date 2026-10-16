@@ -100,7 +100,7 @@ fn request(protocol: Protocol) -> Request {
         pipe: 1,
         port: 3,
         protocol,
-        audio: protocol != Protocol::Mst,
+        audio: true,
         scdc: protocol == Protocol::Tmds,
         dsc: protocol == Protocol::Sst,
         scanout: Some(ScanoutWitness {
@@ -125,7 +125,9 @@ fn cases() -> [(Protocol, &'static [TeardownStep]); 5] {
         ),
         (
             Protocol::Mst,
-            &[Scanout, Video, Payload, Frontend, Link, Timing, Planes],
+            &[
+                Audio, Scanout, Video, Payload, Frontend, Link, Timing, Planes,
+            ],
         ),
         (
             Protocol::Uhbr,
@@ -331,7 +333,10 @@ fn navi48_teardown_keeps_identity_siblings_and_unplug_intent() -> TestResult {
             }),
             ..r
         },
-        Request { audio: true, ..r },
+        Request {
+            audio: !r.audio,
+            ..r
+        },
         Request { scdc: true, ..r },
         Request { dsc: true, ..r },
     ] {
@@ -542,7 +547,7 @@ fn activation_checkpoints() -> [(Protocol, &'static [TeardownStep]); 5] {
         (Protocol::Sst, &[Link, Frontend, Video, Scanout]),
         (Protocol::Uhbr, &[Link, Video, Scanout]),
         (Protocol::Frl, &[Scdc, Video, Scanout]),
-        (Protocol::Mst, &[Link, Frontend, Payload, Video]),
+        (Protocol::Mst, &[Link, Frontend, Payload, Video, Scanout]),
     ]
 }
 

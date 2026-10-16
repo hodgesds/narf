@@ -15,6 +15,8 @@ NARF uses stereo layout for mono and the eight-channel layout for 3..8 channels.
 The vectors cover Linux's defined 2/6/8-channel layouts, all UHBR rates/lane
 counts and RGB 8/10/12 bpc, including narrow blanking and rate-filter boundaries.
 DSC and MST audio are outside this contract.
+The same harness with `--mst` checks the separate legacy MST vectors in
+`../dcn401_mst_audio`; its default UHBR inputs remain unchanged.
 
 `registers.c` checks all four native APG/stream register offsets and masks
 against Linux DCN401 headers. Its compile command is in the file. These checks

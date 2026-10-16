@@ -62,7 +62,39 @@ impl<I: Io> Engine<I> {
             pending: false,
             mn: running.mn,
         };
-        self.dp_video_verify_source(w, true, Some(live))
+        self.dp_video_verify_source(w, true, Some(live))?;
+        if running.frontend.link.phy.settings.mst {
+            if let Some(a) = self.status.dp_audio {
+                self.dp_audio_verify(&running.frontend, &a)?;
+            }
+        }
+        Ok(())
+    }
+    /// Fresh transport witnesses for audio; does not recurse into audio checks.
+    pub(in crate::amdgpu_dcn401_otg) fn dp_audio_verify_transport(&mut self) -> Result<(), Error> {
+        let v = self.status.dp_video_running.ok_or(Error::Invalid)?;
+        let r = v.frontend.request;
+        let live = match self.status.state {
+            State::DpVideoRunning(s) if s == r.stream => None,
+            State::ScanoutRunning(p) if p == r.pipe => {
+                let live = self.status.scanout.ok_or(Error::Invalid)?;
+                if live.pipe != p || live.stream != r.stream {
+                    return Err(Error::Invalid);
+                }
+                Some(live)
+            }
+            _ => return Err(Error::Busy),
+        };
+        self.dp_video_verify_source(
+            Work {
+                frontend: v.frontend,
+                timing: true,
+                pending: false,
+                mn: v.mn,
+            },
+            true,
+            live,
+        )
     }
     fn dp_video_verify_source(
         &mut self,

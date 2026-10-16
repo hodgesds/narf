@@ -13,6 +13,7 @@ import tempfile
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--generate', action='store_true')
+parser.add_argument('--mst', action='store_true', help='check legacy 8b/10b MST instead')
 parser.add_argument('linux', nargs='?', default='/usr/src/linux', type=Path)
 args = parser.parse_args()
 here = Path(__file__).resolve().parent
@@ -55,6 +56,16 @@ int main(int argc, char **argv) {
  printf("%u\n", r.all); return 0;
 }
 '''
+if args.mst:
+    start = main.index(' l.lane_count =')
+    end = main.index(' union audio_sample_rates')
+    main = main[:start] + r'''
+ l.lane_count = atoi(argv[6]); l.encoding = DP_8b_10b_ENCODING;
+ l.is_mst = true;
+ /* hwseq removes FEC overhead for this pessimistic blanking budget. */
+ l.link_bandwidth_kbps = l.link_rate * 27000 * 8 * l.lane_count;
+''' + main[end:]
+vectors = here.parent / 'dcn401_mst_audio/vectors.txt' if args.mst else here / 'vectors.txt'
 with tempfile.TemporaryDirectory(prefix='narf-uhbr-audio-') as tmp:
     work = Path(tmp)
     (work / 'harness.c').write_text(shim + helpers + main)
@@ -66,21 +77,21 @@ with tempfile.TemporaryDirectory(prefix='narf-uhbr-audio-') as tmp:
                     str(work / 'harness.c'), str(display / 'dc/basics/fixpt31_32.c'),
                     '-o', str(binary)], check=True)
     if args.generate:
-        print('# Linux check_audio_bandwidth_dp with the native HBLANK field; see check.py.')
+        print('# Linux check_audio_bandwidth_dp; see dcn401_uhbr_audio/check.py.')
         # Normal timings and short blanking/low-clock boundaries that filter rates.
         modes = [(27000, 720, 858), (148500, 1920, 2200), (594000, 3840, 4400),
                  (1188000, 3840, 4400), (2376000, 7680, 9000), (1333000, 3840, 3920)]
         modes += [(clock, 1920, 1920 + blank) for clock in [25000, 148500, 594000]
                   for blank in [16, 32, 64, 80, 128]]
         cases = [(*m, bpc, rate, lanes, channels) for m in modes
-                 for bpc in [8, 10, 12] for rate in [1000, 1350, 2000]
+                 for bpc in [8, 10, 12] for rate in ([6, 10, 20, 30] if args.mst else [1000, 1350, 2000])
                  for lanes in [1, 2, 4] for channels in [2, 6, 8]]
         for case in cases:
             result = subprocess.check_output([str(binary), *map(str, case)], text=True).strip()
             print(*case, '=', result)
     else:
         passed = 0
-        for line in (here / 'vectors.txt').read_text().splitlines():
+        for line in vectors.read_text().splitlines():
             if not line or line.startswith('#'):
                 continue
             inputs, expected = line.split(' = ')

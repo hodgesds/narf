@@ -42,7 +42,8 @@ mod hdmi;
 pub use hdmi::HdmiTmdsRetired;
 #[path = "amdgpu_dcn401_hdmi_link.rs"]
 mod hdmi_link;
-pub(crate) use hdmi_link::audio::{frl_lpcm_info, uhbr_lpcm_info};
+pub use hdmi_link::audio::MstAudioPayload;
+pub(crate) use hdmi_link::audio::{frl_lpcm_info, mst_lpcm_info, uhbr_lpcm_info};
 pub use hdmi_link::{
     AudioInfo, AudioMode, Avi, DisplayAudio, HdmiLinkReady, HdmiLinkRequest, HdmiVideoRunning,
     TMDS_MAX_KHZ, TMDS_SCRAMBLE_KHZ,
@@ -385,6 +386,8 @@ pub struct Status {
     pub hdmi_audio: Option<DisplayAudio>,
     /// Audio on the running DP video; must stop before the video does.
     pub dp_audio: Option<DisplayAudio>,
+    /// Retained MST allocation/VC-rate witness for this stream's audio.
+    pub mst_audio_payload: Option<MstAudioPayload>,
     /// Historical timing/input clock-off only; all PHYs and memory stay retained.
     pub tmds_timing_retired: Option<TmdsTimingRetired>,
     /// Historical TMDS backend/lane/TX-clock stop, never memory retirement.
@@ -443,6 +446,7 @@ impl Status {
             hdmi_video_running: None,
             hdmi_audio: None,
             dp_audio: None,
+            mst_audio_payload: None,
             tmds_timing_retired: None,
             tmds_disabled: None,
             frl_encoder_retired: None,

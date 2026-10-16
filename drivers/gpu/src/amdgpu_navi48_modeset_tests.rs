@@ -1987,3 +1987,63 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_frl_selection_reserves_lpcm_bandwidth
 );
+
+fn navi48_mst_selection_keeps_only_remote_lpcm_that_fits() -> TestResult {
+    use crate::dp_mst_mgr::Sink;
+    // Stereo and 8ch LPCM at every sample rate, plus AC-3 (not exposed).
+    const AUDIO: &[u8] = &[0x29, 0x09, 0x7f, 7, 0x0f, 0x7f, 7, 0x15, 7, 0x50];
+    let caps = DpCaps {
+        lanes: 4,
+        rate: LinkRate::Hbr2,
+        uhbr: 0,
+        fec: false,
+        dsc: None,
+    };
+    for blocks in [&[AUDIO][..], &[][..]] {
+        for narrow in [false, true] {
+            let mut base = edid_1080p();
+            if narrow {
+                // The remote sink offers a 32-pixel horizontal blank with
+                // 8-pixel front porch/sync; its LPCM rates must be filtered.
+                base[57] = 32;
+                base[58] &= 0xf0;
+                base[62] = 8;
+                base[63] = 8;
+                base[65] &= 0x0f;
+            }
+            let edid = with_blocks(base, blocks);
+            let timing = edid_timings(&edid)[0];
+            let devices = [(Sink { branch: 0, port: 1 }, edid.clone(), u16::MAX)];
+            let s = super::super::select_mst(0, caps, &devices, &|_| Some(timing));
+            assert_eq!(s.len(), 1);
+            assert_eq!(s[0].timing, timing);
+            let expected = sink_audio_info(&edid).and_then(|a| {
+                otg::mst_lpcm_info(
+                    a,
+                    &timing,
+                    8,
+                    otg::DpPhySettings {
+                        lanes: 4,
+                        rate: LinkRate::Hbr2,
+                        mst: true,
+                    },
+                )
+            });
+            assert_eq!(s[0].audio, expected);
+            if !blocks.is_empty() {
+                let a = s[0].audio.unwrap();
+                assert!(a.modes[..usize::from(a.mode_count)]
+                    .iter()
+                    .all(|m| m.format == 1));
+                if narrow {
+                    assert!(a.mode_count < 2 || a.modes[..2].iter().any(|m| m.rates != 0x7f));
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_mst_selection_keeps_only_remote_lpcm_that_fits
+);

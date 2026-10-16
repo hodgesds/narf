@@ -598,7 +598,14 @@ retrain preserve video ownership; shared DTO and endpoint checks include UHBR.
 Models cover all stream instances, rates and lane counts, reset timeout/cancel,
 partial writes, late drift, clock sharing and shutdown; 1701 arithmetic vectors
 match the Linux routines under that native-width contract.
-MST audio, compressed passthrough and user channel maps remain open; physical
+Legacy MST now carries LPCM through each stream's DIO AFMT and DP endpoint.
+Remote EDID rates are filtered by Linux's blanking budget (2268 reference
+vectors); startup requires a completed manager payload and fresh SAT/VC and
+transport witnesses. Partial writes and failed shutdown retain audio/payload
+ownership. Models cover independent routes, all RGB depths, stale allocations,
+endpoint collisions, shared DTO and two-stream link-owner handover. Teardown
+stops audio before scanout/video and payload removal.
+UHBR MST audio, compressed passthrough and user channel maps remain open; physical
 audio is untested. FRL LPCM and HDMI 4:2:0 have model coverage
 as described above. None of it has run on hardware.
 Native FRL frontend retirement now drains all generic packet schedules through
@@ -775,7 +782,7 @@ port-bound bandwidth queries. Existing payloads are added back before comparing
 capacity, avoiding relights caused by our own allocations. Capacity changes retire
 old streams before reprobe/re-admission. Every shared path hop constrains payload
 and dark-mode admission; zero PBN rejects new modes. Incomplete resource queries
-retain the session and refuse replay. Mixed MST/SST, UHBR MST and MST audio/DSC
+retain the session and refuse replay. Mixed MST/SST, UHBR MST and MST DSC
 remain open; no physical validation.
 The MST manager now also exposes bounded idle notification polling over
 DMUB AUX, retains fragmented messages across transaction/poll boundaries and

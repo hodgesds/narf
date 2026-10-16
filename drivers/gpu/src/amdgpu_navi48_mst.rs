@@ -109,6 +109,18 @@ impl MstLink {
     pub fn resource_query_pending(&self) -> bool {
         self.resource_query
     }
+    /// Only a completed payload may expose its stream's audio endpoint.
+    pub(super) fn audio_slots(&self, stream: u8) -> Result<u8, otg::Error> {
+        if self.payload_change.is_some() || self.resource_query {
+            return Err(otg::Error::Busy);
+        }
+        let mut owned = self.payloads.iter().filter(|p| p.stream == stream);
+        let p = owned.next().ok_or(otg::Error::Invalid)?;
+        if owned.next().is_some() || self.owner.is_none() || !(1..=63).contains(&p.slots) {
+            return Err(otg::Error::Invalid);
+        }
+        Ok(p.slots)
+    }
     pub(super) fn require_transaction_idle<E>(&self) -> Result<(), MstFailure<E>> {
         if self.payload_change.is_some() || self.resource_query {
             return Err(otg::Error::Busy.into());
@@ -611,8 +623,18 @@ fn select_mst_with_budget(
             hdmi: false,
             scdc: false,
             depth: otg::ColorDepth::Bpc8,
-            // MST audio (per-stream SDPs) is not implemented.
-            audio: None,
+            audio: modeset::sink_audio_info(edid).and_then(|info| {
+                otg::mst_lpcm_info(
+                    info,
+                    &timing,
+                    8,
+                    otg::DpPhySettings {
+                        lanes,
+                        rate: caps.rate,
+                        mst: true,
+                    },
+                )
+            }),
             avi: otg::Avi::default(),
             limited: false,
             ycbcr420: false,
@@ -862,7 +884,7 @@ impl ColdBoot {
     /// Start `selection`'s MST stream on staged `pipe` (DIO stream `pipe`):
     /// the first stream trains the port's MST link at the selected
     /// setting (no fallback: every payload was sized for it), later ones
-    /// attach to it; then the frontend, the payload, video and scanout.
+    /// attach to it; then the frontend, payload, video, scanout and LPCM audio.
     /// # Safety
     /// As for `start_link`.
     pub(super) async unsafe fn start_mst_stream(
@@ -919,7 +941,13 @@ impl ColdBoot {
             self.start_display_dp_video(port).await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Video);
-            Ok(self.start_display_scanout(pipe).await?)
+            let scanout = self.start_display_scanout(pipe).await?;
+            self.teardowns
+                .checkpoint_activation(pipe, super::TeardownStep::Scanout);
+            if let Some(info) = selection.audio {
+                self.start_display_audio(port, false, info).await?;
+            }
+            Ok(scanout)
         }
     }
     /// Finish teardown after video, payload and frontend have stopped:
