@@ -85,7 +85,7 @@ The GPU specification is authoritative for the current exposed interfaces.
 | Legacy MST | Topology, payload, notification, path-budget and fixed-output models; mixed MST/SST, UHBR MST and audio/DSC remain open | None |
 | Joint display configuration | Joint DML/clock/CRB models, four fixed pipes; ODM, broader routing and seamless shared-clock changes remain open | None |
 | Scaling / composition / tiling / color management / HDR / VRR | Additional native programming and exposure gates remain open | None |
-| Audio | HDMI and legacy DP LPCM models; compressed passthrough, channel maps and HPO/MST audio remain open | None |
+| Audio | HDMI and legacy DP LPCM models, including shared PPS ownership for DP DSC; compressed passthrough, channel maps and HPO/MST audio remain open | None |
 | Board-specific panel / USB-C routes | Inventory required before applicability or implementation decisions | None |
 | Protected output | [Separate requirements](navi48-protected-output.md); unsupported, unadvertised | None |
 

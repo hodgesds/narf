@@ -566,6 +566,11 @@ rebuilt as Linux's get_eld_ati does and exposed as the `ELD` control with an
 `HDMI/DP,pcm=0 Jack`; pin sense is polled, playback routes to the ports with
 a valid ELD and is limited to their channels/sample sizes, and a port that
 gains a sink mid-stream is set up again.
+Legacy DP SST LPCM now shares the DIO stream with DSC PPS. Startup and live
+checks require fresh PPS/clock/master witnesses, and audio stop preserves those
+video-owned resources while disabling audio packets and the endpoint. Modeset
+keeps DSC sink audio capabilities and uses normal audio-first teardown/retrain.
+HPO/MST audio and compressed passthrough remain open; physical audio is untested.
 Not yet: YCbCr/4:2:0. None of it has run on hardware.
 Native FRL frontend retirement now drains all generic packet schedules through
 the actual HDMI/VUPDATE buffer status, disables FIFO then tribyte encoding and

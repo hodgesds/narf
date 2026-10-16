@@ -1165,9 +1165,9 @@ pub fn select_all(
             hdmi: false,
             scdc: false,
             depth: otg::ColorDepth::Bpc8,
-            // HPO (128b/132b) audio is not implemented, nor audio beside a
-            // DSC stream's PPS.
-            audio: if matches!(rate, DpRate::Uhbr(_)) || dsc.is_some() {
+            // HPO (128b/132b) audio is not implemented. Legacy DIO audio
+            // shares the secondary stream with DSC's independently owned PPS.
+            audio: if matches!(rate, DpRate::Uhbr(_)) {
                 None
             } else {
                 sink_audio_info(&sink.edid)

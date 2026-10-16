@@ -1059,6 +1059,135 @@ kernel_test_in!(
     dcn401_dp_video_sends_dsc_pps_like_linux
 );
 
+fn dsc_audio_fixture(stream: u8, pipe: u8) -> (Engine<AudioIo>, Link) {
+    let cfg = crate::amdgpu_dsc::DscConfig {
+        slices_h: 2,
+        slices_v: 10,
+        bpp_x16: 128,
+        block_pred: true,
+        linebuf_depth: 11,
+        version_minor: 2,
+        ycbcr422_simple: false,
+    };
+    let (mut e, mut io, c) = fixture_dsc(2, stream, pipe, ColorDepth::Bpc8, None, Some(cfg));
+    start(&mut e, &mut io, c);
+    (
+        Engine {
+            io: AudioIo {
+                inner: e.io,
+                az: alloc::collections::BTreeMap::new(),
+                index: [0; 4],
+            },
+            authority: e.authority,
+            layout: e.layout,
+            status: e.status,
+            displays: e.displays,
+        },
+        io,
+    )
+}
+
+fn dcn401_dp_audio_shares_dsc_pps_without_stopping_its_packets() -> TestResult {
+    let info = super::super::hdmi_link::audio_info();
+    for stream in 0..4 {
+        let pipe = (stream + 1) % 4;
+        let (mut e, mut io) = dsc_audio_fixture(stream, pipe);
+        let packet_state = |e: &mut Engine<AudioIo>| {
+            [0x2169, 0x2177, 0x2170].map(|r| e.io.inner.fake().regs[&dio(stream, r)])
+        };
+        let before = packet_state(&mut e);
+        e.io.inner.fake().writes.clear();
+        for _ in 0..2 {
+            let audio = run(e.start_dp_audio(path(2), info)).unwrap();
+            assert!(audio.dp);
+            assert_eq!(packet_state(&mut e), before);
+            assert_eq!(run(e.stop_dp_video(&mut io, path(2))), Err(Error::Busy));
+            run(e.stop_dp_audio(path(2))).unwrap();
+            let regs = &e.io.inner.fake().regs;
+            assert_eq!(regs[&dio(stream, 0x2141)], 1, "PPS secondary master lost");
+            assert_eq!(regs[&dio(stream, 0x20ba)] & 1, 1, "PPS clock lost");
+            assert_eq!(regs[&dio(stream, 0x2082)] & 1, 0, "audio samples remain");
+            assert_eq!(packet_state(&mut e), before);
+            assert!(e.status.dp_audio.is_none());
+            assert_eq!(e.io.az.get(&(stream, 0x54)), Some(&0));
+        }
+        assert!(!e
+            .io
+            .inner
+            .fake()
+            .writes
+            .iter()
+            .any(|&(at, _)| at == dio(stream, 0x2069)));
+        assert!(
+            e.io.inner.fake().writes.iter().all(|&(at, value)| {
+                ![dio(stream, 0x2141), dio(stream, 0x20ba)].contains(&at) || value & 1 != 0
+            }),
+            "audio transiently disabled PPS's shared clock/master"
+        );
+        // PPS stops only when its video owner stops, after audio is gone.
+        run(e.stop_dp_video(&mut io, path(2))).unwrap();
+        assert_eq!(io.bytes.get(&0x160), Some(&0));
+        assert_eq!(e.io.inner.fake().regs[&dio(stream, 0x2177)] & 0x10, 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dp_audio_shares_dsc_pps_without_stopping_its_packets
+);
+
+fn dcn401_dp_audio_requires_fresh_pps_witnesses_and_quiet_audio() -> TestResult {
+    let (mut e, _) = dsc_audio_fixture(1, 2);
+    let info = super::super::hdmi_link::audio_info();
+    for (reg, mask) in [
+        (0x20ba, 1),
+        (0x2141, 1),
+        (0x2169, 0x1000_0000),
+        (0x2177, 0x10),
+        (0x2170, 0xffff_0000),
+    ] {
+        let at = dio(1, reg);
+        let saved = e.io.inner.fake().regs[&at];
+        e.io.inner.fake().regs.insert(at, saved & !mask);
+        let writes = e.io.inner.fake().writes.len();
+        assert_eq!(
+            run(e.start_dp_audio(path(2), info)),
+            Err(Error::Readback(at))
+        );
+        assert_eq!(e.io.inner.fake().writes.len(), writes);
+        assert!(e.status.dp_audio.is_none());
+        e.io.inner.fake().regs.insert(at, saved);
+    }
+    for (reg, mask) in [(0x2141, 0x10), (0x2082, 1)] {
+        let at = dio(1, reg);
+        let saved = e.io.inner.fake().regs.get(&at).copied().unwrap_or(0);
+        e.io.inner.fake().regs.insert(at, saved | mask);
+        let writes = e.io.inner.fake().writes.len();
+        assert_eq!(run(e.start_dp_audio(path(2), info)), Err(Error::Busy));
+        assert_eq!(e.io.inner.fake().writes.len(), writes);
+        assert!(e.status.dp_audio.is_none());
+        e.io.inner.fake().regs.insert(at, saved);
+    }
+    run(e.start_dp_audio(path(2), info)).unwrap();
+    let at = dio(1, 0x2177);
+    let saved = e.io.inner.fake().regs[&at];
+    e.io.inner.fake().regs.insert(at, saved & !0x10);
+    let writes = e.io.inner.fake().writes.len();
+    assert_eq!(run(e.stop_dp_audio(path(2))), Err(Error::Readback(at)));
+    assert!(
+        e.status.dp_audio.is_some(),
+        "lost PPS discarded audio owner"
+    );
+    assert_eq!(e.io.inner.fake().writes.len(), writes);
+    e.io.inner.fake().regs.insert(at, saved);
+    run(e.stop_dp_audio(path(2))).unwrap();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dp_audio_requires_fresh_pps_witnesses_and_quiet_audio
+);
+
 /// Two displays on one MST link, as Linux's MST streams share their link
 /// encoder: display 0 trains the link and runs its stream (DIG_FE_MODE
 /// 5); display 1 attaches to the running link, stages its timing and its

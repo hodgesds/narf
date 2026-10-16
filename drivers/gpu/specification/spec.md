@@ -1800,6 +1800,19 @@ speaker block or FL/FR+FC, the 0xFC name, VSDB latencies), starts audio after
 scanout when the sink declares any mode, and stops it first on stop or unplug.
 The HD-Audio controller and codec that stream samples are separate.
 
+Legacy DP SST LPCM can run beside DSC on the DIO stream encoder. Modeset keeps
+the sink's audio capabilities for these streams and starts audio after scanout,
+with the same audio-first stop/unplug/retrain ordering as uncompressed DP.
+Startup and live audio verification require fresh PPS packet-size, GSP11
+enable/line, VBID[6] line, AFMT clock and secondary-master readbacks from the
+existing DSC video owner. A DSC request alone does not authorize sharing;
+unexpected audio packet/sample enables still reject before writes.
+Stopping audio disables its samples, packet enables and Azalia endpoint while
+preserving the shared AFMT clock and secondary master for GSP11. PPS data and
+scheduling remain the video owner's until video stops. This extends the
+existing LPCM path; compressed passthrough, HPO and MST audio remain unsupported.
+Register/protocol models are not physical image or audible-output acceptance.
+
 `start_display_hdmi_video(port)` starts the blank timing, repeats the FIFO reset
 under live symclk, clears AVMUTE and waits for a fresh frame
 (`HdmiVideoRunning(stream)`); scanout may start from it exactly as from DP video

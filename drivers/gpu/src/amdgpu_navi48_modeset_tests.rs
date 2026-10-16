@@ -1383,7 +1383,8 @@ fn navi48_modeset_decides_dsc_like_linux() -> TestResult {
     if want.is_none()
         || s.dsc != want
         || (s.lanes, s.rate) != (2, DpRate::Legacy(LinkRate::Hbr2))
-        || s.audio.is_some()
+        || s.audio != sink_audio_info(&edid_uhbr())
+        || s.audio.is_none()
         || selection_mode(&s).dsc.map(|d| (d.slices, d.bpp_x16))
             != want.map(|c| (c.slices_h, c.bpp_x16))
     {

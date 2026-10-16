@@ -590,12 +590,33 @@ impl<I: Io> Engine<I> {
         }
         Ok(frontend)
     }
+    /// DSC's running video owns PPS and the shared AFMT/secondary enables.
+    /// A recorded DSC request alone does not prove those packets are live.
+    fn dp_audio_pps_verify(&mut self, frontend: &DpFrontendReady) -> Result<(), Error> {
+        if frontend.blank.timing.request.dsc.is_none() {
+            return Ok(());
+        }
+        let at = |r| DpStream::Dio(frontend.request.stream).at(self.layout, r);
+        for (reg, mask, value) in [
+            (at(AFMT_CNTL), 1, 1),
+            (at(DP_SEC_CNTL), 1, 1),
+            (at(0x2169), 0x1000_0000, 0x1000_0000), // PPS packet size
+            (at(0x2177), 0xffff_0010, 2 << 16 | 0x10), // GSP11 on line 2
+            (at(0x2170), 0xffff_8000, 3 << 16),     // VBID[6] on line 3
+        ] {
+            if self.read(reg)? & mask != value {
+                return Err(Error::Readback(reg));
+            }
+        }
+        Ok(())
+    }
     /// The DP audio owner's live registers on top of the video's.
     pub(in crate::amdgpu_dcn401_otg) fn dp_audio_verify(
         &mut self,
         frontend: &DpFrontendReady,
         a: &DisplayAudio,
     ) -> Result<(), Error> {
+        self.dp_audio_pps_verify(frontend)?;
         let l = self.layout;
         let at = |r| DpStream::Dio(frontend.request.stream).at(l, r);
         for (reg, mask, value) in [
@@ -690,14 +711,17 @@ impl<I: Io> Engine<I> {
             descriptors,
             hbr,
         };
-        // Quiet before the first write: no audio clock, samples or packets.
+        // Quiet before the first write: no audio samples or packets. DSC's
+        // verified PPS owner already holds the clock and secondary master.
+        let pps = u32::from(frontend.blank.timing.request.dsc.is_some());
+        self.dp_audio_pps_verify(&frontend)?;
         let at = |r| DpStream::Dio(frontend.request.stream).at(self.layout, r);
-        for (reg, mask) in [
-            (at(AFMT_CNTL), 1),
-            (at(AFMT_PACKET), 1),
-            (at(DP_SEC_CNTL), 0x1ff1_1111),
+        for (reg, mask, value) in [
+            (at(AFMT_CNTL), 1, pps),
+            (at(AFMT_PACKET), 1, 0),
+            (at(DP_SEC_CNTL), 0x1ff1_1111, pps),
         ] {
-            if self.read(reg)? & mask != 0 {
+            if self.read(reg)? & mask != value {
                 return Err(Error::Busy);
             }
         }
@@ -722,16 +746,17 @@ impl<I: Io> Engine<I> {
         self.dp_audio_verify(&frontend, &a)?;
         let l = self.layout;
         let at = |r| DpStream::Dio(frontend.request.stream).at(l, r);
+        let pps = u32::from(frontend.blank.timing.request.dsc.is_some());
         let result = (|| {
             // disable_dio_audio_packet: mute, then enc1_se_disable_dp_audio
-            // (packets and ACM off; no other secondary packet runs, so the
-            // stream enable stays off) and the AFMT audio clock.
+            // (packets and ACM off). Preserve the secondary master and AFMT
+            // clock while the video owner still sends DSC PPS in GSP11.
             self.update(at(AFMT_PACKET), 1, 0)?;
-            self.update(at(DP_SEC_CNTL), DP_SEC_AUDIO | 0x1_0000, 0)?;
-            if self.read(at(DP_SEC_CNTL))? != 0 {
+            self.update(at(DP_SEC_CNTL), DP_SEC_AUDIO | 0x1_0000, pps)?;
+            if pps == 0 && self.read(at(DP_SEC_CNTL))? != 0 {
                 self.update(at(DP_SEC_CNTL), 1, 1)?;
             }
-            self.update(at(AFMT_CNTL), 1, 0)?;
+            self.update(at(AFMT_CNTL), 1, pps)?;
             self.az_disable(a.endpoint)
         })();
         match result {
