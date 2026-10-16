@@ -589,8 +589,17 @@ Legacy DP SST LPCM now shares the DIO stream with DSC PPS. Startup and live
 checks require fresh PPS/clock/master witnesses, and audio stop preserves those
 video-owned resources while disabling audio packets and the endpoint. Modeset
 keeps DSC sink audio capabilities and uses normal audio-first teardown/retrain.
-HPO/UHBR DP and MST audio, compressed passthrough and user channel maps remain
-open; physical audio is untested. FRL LPCM and HDMI 4:2:0 have model coverage
+UHBR SST now carries LPCM through the HPO stream's APG and Azalia endpoint.
+LPCM rate filtering uses Linux's fixed-point blanking budget with the native
+programmed minimum width; selection and training fallback keep only supported
+rates. Reset assertion/deassertion use bounded async waits, retain cancelled
+owners, and recheck transport/audio before APG enable. Audio-first teardown and
+retrain preserve video ownership; shared DTO and endpoint checks include UHBR.
+Models cover all stream instances, rates and lane counts, reset timeout/cancel,
+partial writes, late drift, clock sharing and shutdown; 1701 arithmetic vectors
+match the Linux routines under that native-width contract.
+MST audio, compressed passthrough and user channel maps remain open; physical
+audio is untested. FRL LPCM and HDMI 4:2:0 have model coverage
 as described above. None of it has run on hardware.
 Native FRL frontend retirement now drains all generic packet schedules through
 the actual HDMI/VUPDATE buffer status, disables FIFO then tribyte encoding and

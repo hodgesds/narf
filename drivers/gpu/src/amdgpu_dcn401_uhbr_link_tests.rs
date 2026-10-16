@@ -2,6 +2,9 @@ use super::super::super::super::dp_phy::training::uhbr::UhbrTransport;
 use super::*;
 use crate::amdgpu_dcn401_otg::{UhbrRate, UhbrSettings};
 
+#[path = "amdgpu_dcn401_uhbr_audio_tests.rs"]
+mod audio;
+
 const LINK: u8 = 1;
 fn hpo(link: u8, reg: u64) -> u64 {
     BASE + (reg + u64::from(link) * 0xd4) * 4

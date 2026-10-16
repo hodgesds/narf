@@ -23,6 +23,9 @@
 use super::*;
 #[path = "amdgpu_dcn401_frl_audio.rs"]
 mod frl_audio;
+#[path = "amdgpu_dcn401_uhbr_audio.rs"]
+mod uhbr_audio;
+pub(crate) use uhbr_audio::uhbr_lpcm_info;
 
 /// One CEA Short Audio Descriptor, as amdgpu_dm copies it from the EDID.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -58,16 +61,15 @@ pub struct DisplayAudio {
     pub dp: bool,
     /// Azalia endpoint (Linux's audio instance): the stream's own.
     pub endpoint: u8,
-    /// AFMT_AUDIO_CHANNEL_ENABLE from the speaker allocation.
+    /// AFMT channel enables from speakers, or APG pair-mode enables (0xff).
     pub channels: u8,
     /// What the endpoint advertised: per-format words, HBR capability.
     pub descriptors: [u32; 14],
     pub hbr: bool,
 }
 
-/// The native FRL path currently carries LPCM only. As in dce_aud_az_configure,
-/// standard-definition FRL timings use at most two channels (layout 0).
-pub(crate) fn frl_lpcm_info(mut info: AudioInfo, v_active: u32) -> Option<AudioInfo> {
+/// Valid LPCM SADs for the native HPO audio transports.
+pub(crate) fn lpcm_info(mut info: AudioInfo) -> Option<AudioInfo> {
     if info.mode_count == 0 || info.mode_count > 16 {
         return None;
     }
@@ -82,18 +84,24 @@ pub(crate) fn frl_lpcm_info(mut info: AudioInfo, v_active: u32) -> Option<AudioI
         if mode.rates == 0 || mode.byte2 == 0 {
             continue;
         }
-        if v_active <= 576 {
-            mode.channels = mode.channels.min(2);
-        }
         info.modes[count] = mode;
         count += 1;
     }
     info.modes[count..].fill(AudioMode::default());
     info.mode_count = count as u8;
+    (count != 0).then_some(info)
+}
+
+/// FRL's SD layouts are limited to two channels by dce_aud_az_configure.
+pub(crate) fn frl_lpcm_info(info: AudioInfo, v_active: u32) -> Option<AudioInfo> {
+    let mut info = lpcm_info(info)?;
     if v_active <= 576 {
+        for mode in &mut info.modes[..usize::from(info.mode_count)] {
+            mode.channels = mode.channels.min(2);
+        }
         info.speakers = (info.speakers & 0x80) | 1;
     }
-    (count != 0).then_some(info)
+    Some(info)
 }
 
 // DIG/AFMT registers (DIG stride).
@@ -335,7 +343,7 @@ impl<I: Io> Engine<I> {
     fn audio_endpoint_available(&self, endpoint: u8) -> bool {
         endpoint < 4
             && self.display_records().all(|s| {
-                [s.hdmi_audio, s.dp_audio, s.frl_audio]
+                [s.hdmi_audio, s.dp_audio, s.frl_audio, s.uhbr_audio]
                     .into_iter()
                     .flatten()
                     .all(|a| a.endpoint != endpoint)
@@ -368,9 +376,16 @@ impl<I: Io> Engine<I> {
             .min_by_key(|&(pipe, _, _)| pipe);
         let dp = self
             .display_records()
-            .filter(|s| s.dp_audio.is_some())
-            .filter_map(|s| s.dp_video_running.map(|v| v.frontend))
-            .min_by_key(|f| f.request.pipe);
+            .filter_map(|s| {
+                if s.dp_audio.is_some() {
+                    s.dp_video_running.map(|v| v.frontend.blank)
+                } else if s.uhbr_audio.is_some() {
+                    s.uhbr_video_running.map(|v| v.timing.blank)
+                } else {
+                    None
+                }
+            })
+            .min_by_key(|b| b.request.pipe);
         let bank1 = self.layout.dio_clock - 0xa0 * 4;
         let at = |r: u64| bank1 + r * 4;
         if let Some((pipe, Some(pixel_khz), _)) = hdmi {
@@ -380,7 +395,7 @@ impl<I: Io> Engine<I> {
             self.update(at(AUDIO_DTO0_PHASE), u32::MAX, 24 * 10_000)
         } else if let Some(reference_hz) = hdmi
             .map(|(_, _, hz)| hz)
-            .or_else(|| dp.map(|f| f.blank.timing.clock.reference_hz))
+            .or_else(|| dp.map(|b| b.timing.clock.reference_hz))
         {
             let dpref_khz = reference_hz / 1000;
             if dpref_khz == 0 {
@@ -760,6 +775,9 @@ impl<I: Io> Engine<I> {
         path: Path,
         info: AudioInfo,
     ) -> Result<DisplayAudio, Error> {
+        if self.status.uhbr_video_running.is_some() {
+            return self.start_uhbr_audio(path, info).await;
+        }
         if self.status.dp_audio.is_some() {
             return Err(Error::Busy);
         }
@@ -813,6 +831,9 @@ impl<I: Io> Engine<I> {
         &mut self,
         path: Path,
     ) -> Result<(), Error> {
+        if self.status.uhbr_video_running.is_some() {
+            return self.stop_uhbr_audio(path);
+        }
         let a = self.status.dp_audio.ok_or(Error::Invalid)?;
         let frontend = self.dp_audio_frontend(path)?;
         self.dp_audio_verify(&frontend, &a)?;
@@ -844,7 +865,7 @@ impl<I: Io> Engine<I> {
     }
 }
 impl Otg {
-    /// Start DP SST audio on this owner's running DP video (or live
+    /// Start legacy or UHBR DP SST audio on this owner's running DP video (or live
     /// scanout): the audio wall clock, audio source, the Azalia endpoint
     /// the codec reports as ELD, then the secondary audio packets, unmuted.
     /// # Safety

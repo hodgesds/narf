@@ -100,7 +100,7 @@ fn request(protocol: Protocol) -> Request {
         pipe: 1,
         port: 3,
         protocol,
-        audio: matches!(protocol, Protocol::Sst | Protocol::Tmds | Protocol::Frl),
+        audio: protocol != Protocol::Mst,
         scdc: protocol == Protocol::Tmds,
         dsc: protocol == Protocol::Sst,
         scanout: Some(ScanoutWitness {
@@ -127,7 +127,10 @@ fn cases() -> [(Protocol, &'static [TeardownStep]); 5] {
             Protocol::Mst,
             &[Scanout, Video, Payload, Frontend, Link, Timing, Planes],
         ),
-        (Protocol::Uhbr, &[Scanout, Video, Link, Timing, Planes]),
+        (
+            Protocol::Uhbr,
+            &[Audio, Scanout, Video, Link, Timing, Planes],
+        ),
         (
             Protocol::Frl,
             &[Audio, Scanout, Video, Scdc, Link, Timing, Planes],
@@ -355,7 +358,7 @@ fn navi48_teardown_keeps_identity_siblings_and_unplug_intent() -> TestResult {
     assert!(m.attempts.iter().skip(before).all(|a| a.2));
     assert_eq!(
         m.progress.status(sibling.pipe).unwrap().next,
-        TeardownStep::Scanout
+        TeardownStep::Audio
     );
     // SAFETY: invalid pipe rejected before indexing or native operations.
     assert_eq!(
@@ -537,8 +540,8 @@ fn activation_checkpoints() -> [(Protocol, &'static [TeardownStep]); 5] {
     [
         (Protocol::Tmds, &[PreLinkScdc, Scdc, Video, Scanout]),
         (Protocol::Sst, &[Link, Frontend, Video, Scanout]),
-        (Protocol::Uhbr, &[Link, Video]),
-        (Protocol::Frl, &[Scdc, Video]),
+        (Protocol::Uhbr, &[Link, Video, Scanout]),
+        (Protocol::Frl, &[Scdc, Video, Scanout]),
         (Protocol::Mst, &[Link, Frontend, Payload, Video]),
     ]
 }

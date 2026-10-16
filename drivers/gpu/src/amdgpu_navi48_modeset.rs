@@ -1247,13 +1247,13 @@ pub fn select_all(
             hdmi: false,
             scdc: false,
             depth: otg::ColorDepth::Bpc8,
-            // HPO (128b/132b) audio is not implemented. Legacy DIO audio
-            // shares the secondary stream with DSC's independently owned PPS.
-            audio: if matches!(rate, DpRate::Uhbr(_)) {
-                None
-            } else {
-                sink_audio_info(&sink.edid)
-            },
+            // HPO exposes only LPCM rates fitting its blanking budget.
+            audio: sink_audio_info(&sink.edid).and_then(|info| match rate {
+                DpRate::Uhbr(rate) => {
+                    otg::uhbr_lpcm_info(info, &timing, 8, otg::UhbrSettings { lanes, rate })
+                }
+                _ => Some(info),
+            }),
             avi: otg::Avi::default(),
             limited: false,
             ycbcr420: false,
@@ -2074,8 +2074,8 @@ impl ColdBoot {
     /// first-free assignment gives in display order), then 128b/132b video
     /// on HPO stream encoder `pipe` and scanout. Each setting gets
     /// perform_link_training_with_retries' four attempts, the link stopped
-    /// after each refusal and 50 ms more waited before each retry. No
-    /// audio: the HPO audio path (APG) is not implemented.
+    /// after each refusal and 50 ms more waited before each retry. LPCM
+    /// capabilities are filtered again at the trained link before audio starts.
     /// # Safety
     /// As for `start_link`.
     async unsafe fn start_uhbr_link(
@@ -2132,10 +2132,18 @@ impl ColdBoot {
             }
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Link);
-            self.start_display_uhbr_video(port, pipe, pipe).await?;
+            let video = self.start_display_uhbr_video(port, pipe, pipe).await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Video);
             let scanout = self.start_display_scanout(pipe).await?;
+            self.teardowns
+                .checkpoint_activation(pipe, super::TeardownStep::Scanout);
+            selection.audio = selection.audio.and_then(|info| {
+                otg::uhbr_lpcm_info(info, &selection.timing, 8, video.link.settings)
+            });
+            if let Some(info) = selection.audio {
+                self.start_display_audio(port, false, info).await?;
+            }
             Ok((selection, scanout))
         }
     }
@@ -2324,6 +2332,9 @@ impl ColdBoot {
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
             if m.selection.uhbr() {
+                if m.selection.audio.is_some() {
+                    self.stop_display_audio(port, false).await?;
+                }
                 self.stop_display_scanout(m.pipe).await?;
                 self.stop_uhbr(port, false).await?;
                 (m.selection, m.scanout) = self.start_link(m.selection, m.pipe).await?;

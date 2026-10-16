@@ -42,7 +42,7 @@ mod hdmi;
 pub use hdmi::HdmiTmdsRetired;
 #[path = "amdgpu_dcn401_hdmi_link.rs"]
 mod hdmi_link;
-pub(crate) use hdmi_link::audio::frl_lpcm_info;
+pub(crate) use hdmi_link::audio::{frl_lpcm_info, uhbr_lpcm_info};
 pub use hdmi_link::{
     AudioInfo, AudioMode, Avi, DisplayAudio, HdmiLinkReady, HdmiLinkRequest, HdmiVideoRunning,
     TMDS_MAX_KHZ, TMDS_SCRAMBLE_KHZ,
@@ -144,6 +144,8 @@ pub enum State {
     /// 128b/132b video on HPO stream encoder n: starting, running, stopping.
     StartingUhbrVideo(u8),
     UhbrVideoRunning(u8),
+    /// APG reset in progress; cancellation retains ownership and blocks reuse.
+    StartingUhbrAudio(u8),
     StoppingUhbrVideo(u8),
     PreparingDpFrontend(u8),
     DpFrontendReady(u8),
@@ -359,6 +361,8 @@ pub struct Status {
     /// Black 128b/132b video; current only in UhbrVideoRunning (or beneath
     /// a live scanout).
     pub uhbr_video_running: Option<UhbrVideoRunning>,
+    /// APG and Azalia audio owner; retained across failed/cancelled reset.
+    pub uhbr_audio: Option<DisplayAudio>,
     /// Historical blank frontend setup; current only in DpFrontendReady.
     /// Timing, video and scanout remain stopped.
     pub dp_frontend_ready: Option<DpFrontendReady>,
@@ -429,6 +433,7 @@ impl Status {
             dp_link_trained: None,
             uhbr_link: None,
             uhbr_video_running: None,
+            uhbr_audio: None,
             dp_frontend_ready: None,
             dp_video_running: None,
             hpo_link_retired: None,

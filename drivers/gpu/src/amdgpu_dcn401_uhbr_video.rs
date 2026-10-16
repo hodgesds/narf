@@ -326,13 +326,15 @@ impl<I: Io> Engine<I> {
         self.uhbr_unblank(stream, pipe).await?;
         self.uhbr_video_verify(&link, stream, blank, true)?;
         let timing = self.wait_blank_frames(blank, timeout).await?;
-        Ok(UhbrVideoRunning {
+        let running = UhbrVideoRunning {
             link,
             stream,
             timing,
             payload,
             acknowledged: table && act,
-        })
+        };
+        self.uhbr_video_verify_running(&running)?;
+        Ok(running)
     }
     /// Start black RGB video on the trained 128b/132b link through HPO
     /// stream encoder `stream`, from the prepared timing of `pipe`, whose
@@ -387,6 +389,7 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Busy);
             }
         }
+        self.uhbr_audio_quiet(stream)?;
         self.uhbr_video_verify(&link, stream, blank, false)?;
         self.status.state = State::StartingUhbrVideo(stream);
         match self
@@ -409,6 +412,18 @@ impl<I: Io> Engine<I> {
         &mut self,
         v: &UhbrVideoRunning,
     ) -> Result<(), Error> {
+        self.uhbr_video_verify_transport(v)?;
+        if let Some(a) = self.status.uhbr_audio {
+            self.uhbr_audio_verify(v, &a)
+        } else {
+            self.uhbr_audio_quiet(v.stream)
+        }
+    }
+    /// Transport checks usable during APG reset, before audio is enabled.
+    pub(in crate::amdgpu_dcn401_otg) fn uhbr_video_verify_transport(
+        &mut self,
+        v: &UhbrVideoRunning,
+    ) -> Result<(), Error> {
         let l = self.layout;
         let at = |r| DpStream::Hpo(v.stream).at(l, r);
         for (reg, mask, value) in [
@@ -426,6 +441,17 @@ impl<I: Io> Engine<I> {
         if self.read(self.stream_mapper(v.stream))? & 7 != u32::from(v.link.link) {
             return Err(Error::Readback(self.stream_mapper(v.stream)));
         }
+        // Audio bandwidth is valid only for the retained format/timing and
+        // native blank width. Recheck them before audio writes and after waits.
+        for (reg, value) in stream_attributes(v.timing.blank) {
+            let mask = if reg == PIXEL_FORMAT { 0x331 } else { u32::MAX };
+            if self.read(at(reg))? & mask != value {
+                return Err(Error::Readback(at(reg)));
+            }
+        }
+        if self.read(at(HBLANK))? & 0xffff != u32::from(v.payload.hblank_symbols) {
+            return Err(Error::Readback(at(HBLANK)));
+        }
         let pipe = v.timing.blank.request.pipe;
         self.uhbr_verify_owned(&v.link, Some(v.stream), Some(pipe))?;
         self.uhbr_stream_clocks(v.stream, pipe, v.link.path.transmitter)
@@ -441,7 +467,10 @@ impl<I: Io> Engine<I> {
         path: Path,
     ) -> Result<(), Error> {
         let v = self.status.uhbr_video_running.ok_or(Error::Invalid)?;
-        if self.status.state != State::UhbrVideoRunning(v.stream) || !io.ready() {
+        if self.status.state != State::UhbrVideoRunning(v.stream)
+            || self.status.uhbr_audio.is_some()
+            || !io.ready()
+        {
             return Err(Error::Busy);
         }
         if v.link.path != path {

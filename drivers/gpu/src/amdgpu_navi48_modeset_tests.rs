@@ -1162,7 +1162,7 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
     if ladder != want {
         return TestResult::Fail("bandwidth-ordered fallback");
     }
-    // 4K60 on a one-lane sink needs 128b/132b (1 x UHBR20), without audio.
+    // 4K60 on a one-lane sink needs 128b/132b (1 x UHBR20), with LPCM.
     let mut p = path(inventory::Connector::DisplayPort, 0);
     p.max_speed_mhz = 20_000;
     let paths = [p];
@@ -1180,7 +1180,11 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
         sink: Ok(sink.clone()),
     };
     match select(&paths, &[port], 8, None) {
-        Ok(s) if s.uhbr() && s.rate == Uhbr(U20) && s.lanes == 1 && s.audio.is_none() => {}
+        Ok(s)
+            if s.uhbr()
+                && s.rate == Uhbr(U20)
+                && s.lanes == 1
+                && s.audio == sink_audio_info(&edid_uhbr()) => {}
         other => panic!("UHBR selection {other:?}"),
     }
     // Without a board connector-speed record it does not light at all.

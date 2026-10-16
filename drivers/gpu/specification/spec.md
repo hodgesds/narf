@@ -1121,11 +1121,12 @@ Startup checkpoints the inverse of each completed link, frontend, video and
 scanout phase before the next operation can suspend or fail. This covers TMDS,
 legacy DP SST/MST, UHBR and FRL: TMDS/FRL link completion starts cleanup at SCDC,
 DP training at Link, legacy SST frontend at Frontend, and video at Video.
-TMDS/SST scanout completion starts at Scanout, so an audio preflight rejection
+TMDS/SST/UHBR/FRL scanout completion starts at Scanout, so an audio preflight rejection
 does not strand live fetch. Audio is not stopped unless it actually completed;
 successful audio is the final startup operation and returns a normal Modeset.
-UHBR/FRL scanout is likewise the final startup operation. Retraining an already
-published Modeset does not create or change an activation record.
+Retraining an already published Modeset does not create or change an activation
+record. UHBR retraining stops audio before scanout and starts it again after
+training/video/scanout, filtering capabilities against the newly trained link.
 
 TMDS also records `TeardownStep::PreLinkScdc` before its first SCDC transaction.
 A returned SCDC error or subsequent native-link preflight rejection therefore
@@ -1892,9 +1893,9 @@ Audio InfoFrame and AFMT memory state. Failed shutdown retains ownership.
 
 All display audio shares one wall DTO, recomputed on start/stop: the lowest
 HDMI audio pipe wins, using DTO0 from the TMDS pixel clock or DTO1 from DPREFCLK
-for FRL. With no HDMI audio, the lowest legacy DP audio pipe uses DTO1; no audio
+for FRL. With no HDMI audio, the lowest legacy/UHBR DP audio pipe uses DTO1; no audio
 leaves the clock unchanged. DCN401 has no audio DTBCLK DTO. Endpoint allocation
-excludes every retained TMDS, FRL and legacy DP audio owner. Models cover all
+excludes every retained TMDS, FRL, legacy DP and UHBR audio owner. Models cover all
 six FRL rates, RGB/4:2:0 depths, bandwidth admission, partial writes, late drift,
 shared DTO selection and teardown. Physical playback remains unverified.
 
@@ -1908,9 +1909,36 @@ unexpected audio packet/sample enables still reject before writes.
 Stopping audio disables its samples, packet enables and Azalia endpoint while
 preserving the shared AFMT clock and secondary master for GSP11. PPS data and
 scheduling remain the video owner's until video stops. This extends the
-existing LPCM path; compressed passthrough, HPO/UHBR DP and MST audio remain
-unsupported.
+existing LPCM path; compressed passthrough and MST audio remain unsupported.
 Register/protocol models are not physical image or audible-output acceptance.
+
+`start_display_audio(port, false, AudioInfo)` / `Otg::start_dp_audio` also dispatch
+on owned UHBR SST video or its matching scanout. `Status::uhbr_audio` retains
+the APG/Azalia owner. APG instance and endpoint follow the HPO stream, independent
+of OTG/PHY; the input mux selects that endpoint. Startup programs stream ID 0,
+pair-mode channel enables 0xff, APG memory power, a DP LPCM-only ELD (HBR off),
+ASP/ATP/AIP and SDP master. APG reset assertion and deassertion each wait up to
+10 us through the shared async wait primitive; `StartingUhbrAudio` blocks replay
+and display switching if either wait is cancelled. Before APG enable, fresh
+transport/format/blank-width and audio/endpoint checks must pass. Returned
+failures retain the owner in `Failed`; no uncertain audio/link state is reused.
+
+`uhbr_lpcm_info` filters the sink's valid LPCM SADs before selection and again
+at the trained link before audio starts. Its blanking budget follows Linux
+`check_audio_bandwidth_dp` in 31.32 fixed point, including SSC removal, SDP and
+main-link overhead and the 1.1 margin. The minimum width is the value actually
+programmed by the native stream owner, including pixel padding, rather than
+`populate_audio_dp_link_info`'s differently scaled derived field. Mono uses the
+stereo layout; 3..8 channels conservatively use the eight-channel layout.
+No remaining rates means silent video without an audio endpoint. Linux-host
+vectors cover this explicit input contract at all UHBR rates/lane counts and
+8/10/12-bpc RGB depths; they do not validate audible output or DSC/MST audio.
+
+Live UHBR checks verify retained MSA/format/blank width and APG/packet/endpoint
+state. Stop disables audio packets and APG, then the endpoint, before scanout
+or video retirement. It preserves the running video's SDP master; video stops
+that path later. Failed shutdown retains ownership. The shared wall DTO includes
+UHBR, with HDMI priority and endpoint collision checks across all transports.
 
 `start_display_hdmi_video(port)` starts the blank timing, repeats the FIFO reset
 under live symclk, clears AVMUTE and waits for a fresh frame

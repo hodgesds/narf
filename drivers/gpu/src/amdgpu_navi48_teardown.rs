@@ -86,7 +86,7 @@ impl Request {
             } else {
                 Protocol::Sst
             },
-            audio: s.audio.is_some() && !s.uhbr(),
+            audio: s.audio.is_some(),
             scdc: s.scdc,
             dsc: s.dsc.is_some(),
             scanout: None,
