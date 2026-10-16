@@ -25,12 +25,12 @@ use super::*;
 mod frl_audio;
 #[path = "amdgpu_dcn401_uhbr_audio.rs"]
 mod uhbr_audio;
-pub(crate) use uhbr_audio::uhbr_lpcm_info;
+pub(crate) use uhbr_audio::uhbr_audio_info;
 #[path = "amdgpu_dcn401_dp_audio_bw.rs"]
 mod bandwidth;
 #[path = "amdgpu_dcn401_mst_audio.rs"]
 mod mst_audio;
-pub(crate) use mst_audio::mst_lpcm_info;
+pub(crate) use mst_audio::mst_audio_info;
 pub use mst_audio::MstAudioPayload;
 
 /// One CEA Short Audio Descriptor, as amdgpu_dm copies it from the EDID.
@@ -74,36 +74,65 @@ pub struct DisplayAudio {
     pub hbr: bool,
 }
 
-/// Valid LPCM SADs for transports without compressed passthrough.
-pub(crate) fn lpcm_info(mut info: AudioInfo) -> Option<AudioInfo> {
+/// The SADs dce_aud_az_configure can program for a transport whose LPCM
+/// rates the caller filters: LPCM with channels, rates and sample sizes, and
+/// compressed formats (passed through unfiltered, as Linux does) with
+/// channels and rates, except one-bit audio and DST, which the endpoint
+/// never carries. `None` without LPCM: the codec cannot stream anything.
+pub(crate) fn audio_info(mut info: AudioInfo) -> Option<AudioInfo> {
     if info.mode_count == 0 || info.mode_count > 16 {
         return None;
     }
     let mut count = 0;
+    let mut lpcm = false;
     let modes = info.modes;
     for mut mode in modes[..usize::from(info.mode_count)].iter().copied() {
-        if mode.format != 1 || !(1..=8).contains(&mode.channels) {
+        mode.rates &= 0x7f;
+        if !(1..=8).contains(&mode.channels) || mode.rates == 0 {
             continue;
         }
-        mode.rates &= 0x7f;
-        mode.byte2 &= 7;
-        if mode.rates == 0 || mode.byte2 == 0 {
-            continue;
+        match mode.format {
+            1 => {
+                mode.byte2 &= 7;
+                if mode.byte2 == 0 {
+                    continue;
+                }
+                lpcm = true;
+            }
+            2..=8 | 10..=12 | 14 => {}
+            _ => continue,
         }
         info.modes[count] = mode;
         count += 1;
     }
     info.modes[count..].fill(AudioMode::default());
     info.mode_count = count as u8;
-    (count != 0).then_some(info)
+    lpcm.then_some(info)
 }
 
-/// FRL's SD layouts are limited to two channels by dce_aud_az_configure.
-pub(crate) fn frl_lpcm_info(info: AudioInfo, v_active: u32) -> Option<AudioInfo> {
-    let mut info = lpcm_info(info)?;
+/// `audio_info` with each LPCM SAD's rates narrowed by `filter(channels,
+/// rates)`; a `None` filter result rejects the whole timing/link.
+pub(crate) fn filtered_audio_info(
+    info: AudioInfo,
+    mut filter: impl FnMut(u8, u8) -> Option<u8>,
+) -> Option<AudioInfo> {
+    let mut info = audio_info(info)?;
+    for mode in &mut info.modes[..usize::from(info.mode_count)] {
+        if mode.format == 1 {
+            mode.rates = filter(mode.channels, mode.rates)?;
+        }
+    }
+    audio_info(info)
+}
+
+/// FRL's SD layouts are limited to two LPCM channels by dce_aud_az_configure.
+pub(crate) fn frl_audio_info(info: AudioInfo, v_active: u32) -> Option<AudioInfo> {
+    let mut info = audio_info(info)?;
     if v_active <= 576 {
         for mode in &mut info.modes[..usize::from(info.mode_count)] {
-            mode.channels = mode.channels.min(2);
+            if mode.format == 1 {
+                mode.channels = mode.channels.min(2);
+            }
         }
         info.speakers = (info.speakers & 0x80) | 1;
     }

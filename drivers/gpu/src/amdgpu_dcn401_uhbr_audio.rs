@@ -13,9 +13,10 @@ const MEM: u64 = 0x3644;
 const SDP: u64 = 0x367b;
 const PACKETS: u64 = 0x367c;
 
-/// Filter LPCM against the actual trained UHBR link and native blank budget.
-/// No surviving rates means silent video; no unsupported endpoint is exposed.
-pub(crate) fn uhbr_lpcm_info(
+/// Filter LPCM against the actual trained UHBR link and native blank budget;
+/// compressed SADs pass through as dce_aud_az_configure programs them. No
+/// surviving LPCM rate means silent video.
+pub(crate) fn uhbr_audio_info(
     info: AudioInfo,
     timing: &Timing,
     bpc: u32,
@@ -24,18 +25,23 @@ pub(crate) fn uhbr_lpcm_info(
     // Validate before uhbr_payload's blank subtraction and fixed-point math.
     bandwidth::rates(timing, bpc, settings, 0, 2, 0)?;
     let payload = uhbr_payload(timing, bpc, settings)?;
-    let mut info = lpcm_info(info)?;
-    for mode in &mut info.modes[..usize::from(info.mode_count)] {
-        mode.rates = bandwidth::rates(
+    filtered_audio_info(info, |channels, rates| {
+        bandwidth::rates(
             timing,
             bpc,
             settings,
             payload.hblank_symbols,
-            mode.channels,
-            mode.rates,
-        )?;
-    }
-    lpcm_info(info)
+            channels,
+            rates,
+        )
+    })
+}
+/// dce_aud_az_configure's HBR probe: 192-kHz eight-channel audio within the
+/// same blanking budget.
+fn uhbr_hbr(timing: &Timing, bpc: u32, settings: UhbrSettings) -> bool {
+    uhbr_payload(timing, bpc, settings)
+        .and_then(|p| bandwidth::rates(timing, bpc, settings, p.hblank_symbols, 8, 0x40))
+        .is_some_and(|r| r & 0x40 != 0)
 }
 fn bpc(v: &UhbrVideoRunning) -> u32 {
     match v.timing.blank.request.depth {
@@ -94,7 +100,7 @@ impl<I: Io> Engine<I> {
         a: &DisplayAudio,
         enabled: bool,
     ) -> Result<(), Error> {
-        if !a.dp || a.endpoint != v.stream || a.hbr {
+        if !a.dp || a.endpoint != v.stream {
             return Err(Error::Invalid);
         }
         let l = self.layout;
@@ -130,15 +136,15 @@ impl<I: Io> Engine<I> {
         }
         let v = self.uhbr_audio_video(path)?;
         let t = v.timing.blank.timing.request.timing;
-        let info = uhbr_lpcm_info(info, &t, bpc(&v), v.link.settings).ok_or(Error::Unsupported)?;
-        let (descriptors, _, _) = descriptors(&info, &t, None);
+        let info = uhbr_audio_info(info, &t, bpc(&v), v.link.settings).ok_or(Error::Unsupported)?;
+        let (descriptors, ac3, _) = descriptors(&info, &t, None);
         let a = DisplayAudio {
             info,
             dp: true,
             endpoint: v.stream,
             channels: 0xff,
             descriptors,
-            hbr: false,
+            hbr: uhbr_hbr(&t, bpc(&v), v.link.settings),
         };
         if !self.audio_endpoint_available(a.endpoint) {
             return Err(Error::Busy);
@@ -159,7 +165,7 @@ impl<I: Io> Engine<I> {
             self.update(at(CONTROL2), 0xff00, 0)?;
             self.update(at(DEBUG), 0xff00, 0xff00)?;
             self.update(at(MEM), 0x30, 0)?;
-            self.hdmi_audio_endpoint(&a, false)?;
+            self.hdmi_audio_endpoint(&a, ac3)?;
             self.az_update(
                 a.endpoint,
                 AZ_HOT_PLUG,

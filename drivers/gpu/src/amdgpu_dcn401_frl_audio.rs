@@ -148,7 +148,7 @@ impl<I: Io> Engine<I> {
         let v = self.frl_audio_video(path)?;
         let blank = v.timing.blank;
         let t = blank.timing.request.timing;
-        let info = frl_lpcm_info(info, t.v_active).ok_or(Error::Unsupported)?;
+        let info = frl_audio_info(info, t.v_active).ok_or(Error::Unsupported)?;
         Self::frl_audio_budget(&v, info)?;
         let nc = frl_acr(v.link.character_khz).ok_or(Error::Unsupported)?;
         let depth = match blank.request.depth {
@@ -156,7 +156,7 @@ impl<I: Io> Engine<I> {
             ColorDepth::Bpc10 => dmub::TmdsDepth::Bpc10,
             ColorDepth::Bpc12 => dmub::TmdsDepth::Bpc12,
         };
-        let (descriptors, _, _) = descriptors(&info, &t, Some(depth));
+        let (descriptors, ac3, hbr) = descriptors(&info, &t, Some(depth));
         if descriptors[0] & 0x7f00 == 0 {
             return Err(Error::Unsupported);
         }
@@ -166,7 +166,7 @@ impl<I: Io> Engine<I> {
             endpoint: v.request.pipe,
             channels: channels(info.speakers),
             descriptors,
-            hbr: false,
+            hbr,
         };
         if !self.audio_endpoint_available(a.endpoint) {
             return Err(Error::Busy);
@@ -206,7 +206,7 @@ impl<I: Io> Engine<I> {
             self.update(self.frl_at(FRL_SRC), u32::MAX, u32::from(a.endpoint))?;
             self.update(self.frl_at(FRL_PACKET2), 0xff00, u32::from(a.channels) << 8)?;
             self.update(self.frl_at(FRL_MEM), 0x30, 0)?;
-            self.hdmi_audio_endpoint(&a, false)?;
+            self.hdmi_audio_endpoint(&a, ac3)?;
             let at = self.frl_at(0x92b);
             self.access(|io| {
                 let old = checked(io.read(at))?;

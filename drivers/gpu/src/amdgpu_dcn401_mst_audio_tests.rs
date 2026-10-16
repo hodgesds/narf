@@ -96,11 +96,27 @@ fn dcn401_mst_audio_streams_depths_and_roundtrip() -> TestResult {
             let before = registers.map(|at| e.io.fake().regs[&at]);
             for _ in 0..2 {
                 let a = start_audio(&mut e);
-                assert!(a.dp && !a.hbr && a.endpoint == stream);
-                assert!(a.info.modes[..usize::from(a.info.mode_count)]
-                    .iter()
-                    .all(|m| m.format == 1));
-                assert!(a.descriptors[0] != 0 && a.descriptors[1..].iter().all(|&v| v == 0));
+                assert!(a.dp && a.endpoint == stream);
+                // LPCM plus the sink's AC-3 SAD, unfiltered as Linux leaves it.
+                assert_eq!(a.info.mode_count, 2);
+                assert_eq!(a.info.modes[1], info().modes[1]);
+                assert!(a.descriptors[0] != 0 && a.descriptors[1] == 0x0050_0705);
+                assert!(a.descriptors[2..].iter().all(|&v| v == 0));
+                // HBR is the 8-channel 192-kHz probe of the same budget.
+                let f = e.status.dp_video_running.unwrap().frontend;
+                let mut hbr = info();
+                hbr.modes[0].channels = 8;
+                hbr.modes[0].rates = 0x40;
+                let bpc = match depth {
+                    ColorDepth::Bpc8 => 8,
+                    ColorDepth::Bpc10 => 10,
+                    ColorDepth::Bpc12 => 12,
+                };
+                let t = f.blank.timing.request.timing;
+                assert_eq!(
+                    a.hbr,
+                    mst_audio_info(hbr, &t, bpc, f.link.phy.settings).is_some()
+                );
                 for (reg, mask, want) in [
                     (0x2141, 0x1ff1_1111, 0x1111),
                     (0x2147, u32::MAX, 0x8000),
@@ -113,7 +129,8 @@ fn dcn401_mst_audio_streams_depths_and_roundtrip() -> TestResult {
                     assert_eq!(e.io.fake().regs[&dio(stream, reg)] & mask, want);
                 }
                 assert_eq!(e.io.inner.az[&(stream, 0x54)] & 0x8000_0001, 0x8000_0000);
-                assert_eq!(e.io.inner.az[&(stream, 0x38)] & 1, 0);
+                assert_eq!(e.io.inner.az[&(stream, 0x38)] & 1, u32::from(a.hbr));
+                assert_eq!(e.io.inner.az[&(stream, 0x29)], 0x0050_0705);
                 let writes = e.io.writes.len();
                 assert_eq!(run(e.stop_dp_video(&mut link, path(2))), Err(Error::Busy));
                 assert_eq!(e.io.writes.len(), writes);

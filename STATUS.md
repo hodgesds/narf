@@ -57,7 +57,7 @@ An unmodified alsa-lib probe exercises HDA/VirtIO playback and HDA capture
 through those syscalls, including linked pause, boundary-mode playback and
 user controls with TLV/events. The implemented ALSA contract is listed in
 [sound §3.1](drivers/sound/specification/spec.md#31-linux-alsa-pcm-and-control-abi).
-SoundWire, HDMI/DP compressed passthrough on FRL/UHBR/MST links, vendor smart-amplifier quirks and system power-transition
+SoundWire, vendor smart-amplifier quirks and system power-transition
 reinitialization remain open. See
 [audio's implemented contract](audio/specification/spec.md).
 
@@ -611,9 +611,10 @@ transport witnesses. Partial writes and failed shutdown retain audio/payload
 ownership. Models cover independent routes, all RGB depths, stale allocations,
 endpoint collisions, shared DTO and two-stream link-owner handover. Teardown
 stops audio before scanout/video and payload removal.
-Compressed formats and HBR are advertised by the TMDS and legacy DP SST
-endpoints; FRL, UHBR and MST endpoints remain LPCM-only. UHBR MST audio
-remains open; physical
+Every native endpoint (TMDS, FRL, legacy/UHBR DP SST, legacy MST) advertises
+the sink's valid compressed SADs and HBR from Linux's 8-channel 192-kHz
+bandwidth probe; FRL reserves the highest SAD rate/channels like
+get_audio_check. UHBR MST audio remains open; physical
 audio is untested. FRL LPCM and HDMI 4:2:0 have model coverage
 as described above. None of it has run on hardware.
 Native FRL frontend retirement now drains all generic packet schedules through

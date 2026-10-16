@@ -152,11 +152,19 @@ fn dcn401_uhbr_audio_programs_apg_endpoint_and_preserves_video() -> TestResult {
                 let video = e.status.uhbr_video_running;
                 let a = run(e.start_dp_audio(path(2), info())).unwrap();
                 assert_eq!(a.endpoint, stream);
-                assert!(a.dp && !a.hbr);
+                // Every 8-channel LPCM rate fits, so the 192-kHz HBR probe does.
+                assert!(a.dp && a.hbr);
                 assert_eq!(a.channels, 0xff);
-                assert_eq!(a.info.mode_count, 1);
+                assert_eq!(a.info.mode_count, 2);
                 assert_eq!(a.descriptors[0], 0x7f077f07);
-                assert!(a.descriptors[1..].iter().all(|w| *w == 0));
+                assert_eq!(a.descriptors[1], 0x0050_0705); // AC-3 passthrough
+                assert!(a.descriptors[2..].iter().all(|w| *w == 0));
+                assert_eq!(e.io.az[&(stream, 0x38)] & 1, 1);
+                assert_eq!(e.io.az[&(stream, 0x29)], 0x0050_0705);
+                assert_eq!(
+                    e.io.inner.inner.regs.get(&(e.layout.base + 0x40c * 4)),
+                    Some(&5)
+                );
                 for (r, mask, want) in [
                     (0x3625, 7, u32::from(stream)),
                     (0x3630, 6, 0),
@@ -398,12 +406,14 @@ fn dcn401_uhbr_audio_filters_capabilities_and_binds_scanout() -> TestResult {
     // Narrow, slow blanking cannot carry even 32-kHz stereo (Linux vectors).
     timing.pixel_clock_khz = 25000;
     timing.h_total = 1936;
-    assert!(uhbr_lpcm_info(raw, &timing, 8, settings).is_none());
+    assert!(uhbr_audio_info(raw, &timing, 8, settings).is_none());
     timing.h_total = 2200;
     timing.pixel_clock_khz = 148500;
-    let supported = uhbr_lpcm_info(raw, &timing, 8, settings).unwrap();
-    assert_eq!(supported.mode_count, 1);
+    let supported = uhbr_audio_info(raw, &timing, 8, settings).unwrap();
+    assert_eq!(supported.mode_count, 2);
     assert_eq!(supported.modes[0].rates, 127);
+    // Compressed SADs are not rate-filtered (dce_aud_az_configure).
+    assert_eq!(supported.modes[1], raw.modes[1]);
     for (clock, active, total) in [
         (0, 1920, 2200),
         (1, 1, 65535), // intermediate fixed-point overflow despite low link BW
@@ -417,10 +427,10 @@ fn dcn401_uhbr_audio_filters_capabilities_and_binds_scanout() -> TestResult {
         invalid.pixel_clock_khz = clock;
         invalid.h_active = active;
         invalid.h_total = total;
-        assert!(uhbr_lpcm_info(raw, &invalid, 8, settings).is_none());
+        assert!(uhbr_audio_info(raw, &invalid, 8, settings).is_none());
     }
     for lanes in [0, 3, 5, 255] {
-        assert!(uhbr_lpcm_info(raw, &timing, 8, UhbrSettings { lanes, ..settings }).is_none());
+        assert!(uhbr_audio_info(raw, &timing, 8, UhbrSettings { lanes, ..settings }).is_none());
     }
     let mut no_lpcm = raw;
     no_lpcm.modes[0].format = 2;

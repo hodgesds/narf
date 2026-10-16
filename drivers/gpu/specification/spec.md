@@ -995,9 +995,13 @@ RGB cannot fit. `HdmiCaps::dc30_420` and `dc36_420` decode HF-VSDB/HF-SCDB
 4:2:0 deep-color flags independently of RGB DC_30bit/DC_36bit. FRL chooses the
 deepest declared 8/10/12-bpc depth up to the requested maximum and the lowest
 carrying rate. `hdmi_output` also takes the sink audio capabilities: FRL
-admission, training fallback and borrow parameters reserve its supported LPCM
-rates/channels, clamped to layout 0 at 576 lines or fewer. `Selection::audio`
-retains only valid LPCM SADs for FRL; compressed-only sinks use silent video.
+admission, training fallback and borrow parameters reserve the highest rate and
+channel count of its valid SADs, compressed ones included as Linux
+`get_audio_check` does, with layout 0 at 576 lines or fewer. `Selection::audio`
+keeps valid LPCM and compressed SADs for FRL (`frl_audio_info`; one-bit audio
+and DST dropped, SD LPCM clamped to two channels); sinks without valid LPCM use
+silent video. The FRL endpoint advertises those compressed descriptors and HBR
+from `check_audio_bandwidth_hdmi`'s 8-channel 192-kHz probe.
 TMDS 4:2:0 remains limited to 8 bpc.
 
 `frl_carries`, `frl_link` and `ColdBoot::start_frl` take `ycbcr420` alongside
@@ -1910,21 +1914,23 @@ unexpected audio packet/sample enables still reject before writes.
 Stopping audio disables its samples, packet enables and Azalia endpoint while
 preserving the shared AFMT clock and secondary master for GSP11. PPS data and
 scheduling remain the video owner's until video stops. This extends the
-existing LPCM path; compressed passthrough remains unsupported.
+existing LPCM path; the endpoint also advertises the sink's compressed SADs
+and HBR, as for SST DP without DSC.
 Register/protocol models are not physical image or audible-output acceptance.
 
 `start_display_audio(port, false, AudioInfo)` / `Otg::start_dp_audio` also dispatch
 on owned UHBR SST video or its matching scanout. `Status::uhbr_audio` retains
 the APG/Azalia owner. APG instance and endpoint follow the HPO stream, independent
 of OTG/PHY; the input mux selects that endpoint. Startup programs stream ID 0,
-pair-mode channel enables 0xff, APG memory power, a DP LPCM-only ELD (HBR off),
+pair-mode channel enables 0xff, APG memory power, a DP ELD (rate-filtered LPCM,
+compressed SADs unfiltered, HBR from the 8-channel 192-kHz probe),
 ASP/ATP/AIP and SDP master. APG reset assertion and deassertion each wait up to
 10 us through the shared async wait primitive; `StartingUhbrAudio` blocks replay
 and display switching if either wait is cancelled. Before APG enable, fresh
 transport/format/blank-width and audio/endpoint checks must pass. Returned
 failures retain the owner in `Failed`; no uncertain audio/link state is reused.
 
-`uhbr_lpcm_info` filters the sink's valid LPCM SADs before selection and again
+`uhbr_audio_info` filters the sink's valid LPCM SADs before selection and again
 at the trained link before audio starts. Its blanking budget follows Linux
 `check_audio_bandwidth_dp` in 31.32 fixed point, including SSC removal, SDP and
 main-link overhead and the 1.1 margin. The minimum width is the value actually
@@ -1950,13 +1956,14 @@ against the retained timing and trained link. SAT rows may move as siblings
 leave, but duplicate, foreign or overallocated rows reject. Other rows must
 belong to frontends on this same MST link. Audio never changes payloads.
 
-`mst_lpcm_info` filters the remote sink's valid LPCM SADs during selection and
+`mst_audio_info` filters the remote sink's valid LPCM SADs during selection and
 again at startup. It shares Linux's fixed-point blanking calculation with UHBR,
 using legacy MST's 40-symbol layout, 16-symbol SDP overhead, four-lane AV mapping
 and FEC-removed link budget. Mono uses stereo layout and 3..8 channels use the
 eight-channel layout. No surviving rates means silent video. The per-stream
 DIO AFMT, secondary audio packets and Azalia DP endpoint follow the SST sequence;
-compressed formats and HBR are not exposed. Shared DTO and endpoint allocation
+valid compressed SADs pass through unfiltered and HBR follows the same budget's
+8-channel 192-kHz probe, as dce_aud_az_configure does. Shared DTO and endpoint allocation
 include the other display transports.
 
 `Status::dp_audio` and `Status::mst_audio_payload: Option<MstAudioPayload>` retain

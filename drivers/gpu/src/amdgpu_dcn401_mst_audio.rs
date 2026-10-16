@@ -10,23 +10,28 @@ pub struct MstAudioPayload {
     pub rate: u32,
 }
 
-pub(crate) fn mst_lpcm_info(
+/// Legacy MST LPCM within Linux's blanking budget; compressed SADs pass
+/// through as dce_aud_az_configure programs them.
+pub(crate) fn mst_audio_info(
     info: AudioInfo,
     timing: &Timing,
     bpc: u32,
     settings: DpPhySettings,
 ) -> Option<AudioInfo> {
-    let mut info = lpcm_info(info)?;
-    for m in &mut info.modes[..usize::from(info.mode_count)] {
-        m.rates = bandwidth::rates(
+    filtered_audio_info(info, |channels, rates| {
+        bandwidth::rates(
             timing,
             bpc,
             bandwidth::AudioLink::Mst(settings),
-            m.channels,
-            m.rates,
-        )?;
-    }
-    lpcm_info(info)
+            channels,
+            rates,
+        )
+    })
+}
+/// dce_aud_az_configure's HBR probe on the MST stream.
+fn mst_hbr(timing: &Timing, bpc: u32, settings: DpPhySettings) -> bool {
+    bandwidth::rates(timing, bpc, bandwidth::AudioLink::Mst(settings), 8, 0x40)
+        .is_some_and(|r| r & 0x40 != 0)
 }
 fn depth(f: &DpFrontendReady) -> u32 {
     match f.blank.request.depth {
@@ -140,15 +145,15 @@ impl<I: Io> Engine<I> {
         let p = payload(&f, slots)?;
         let t = f.blank.timing.request.timing;
         let info =
-            mst_lpcm_info(info, &t, depth(&f), f.link.phy.settings).ok_or(Error::Unsupported)?;
-        let (descriptors, _, _) = descriptors(&info, &t, None);
+            mst_audio_info(info, &t, depth(&f), f.link.phy.settings).ok_or(Error::Unsupported)?;
+        let (descriptors, ac3, _) = descriptors(&info, &t, None);
         let a = DisplayAudio {
             info,
             dp: true,
             endpoint: f.request.stream,
             channels: channels(info.speakers),
             descriptors,
-            hbr: false,
+            hbr: mst_hbr(&t, depth(&f), f.link.phy.settings),
         };
         if !self.audio_endpoint_available(a.endpoint) {
             return Err(Error::Busy);
@@ -164,7 +169,7 @@ impl<I: Io> Engine<I> {
         // dp_audio_start performs no suspended hardware wait. Record both
         // owners first and retain them on any partial programming failure.
         let result = async {
-            self.dp_audio_start(f, a, false).await?;
+            self.dp_audio_start(f, a, ac3).await?;
             self.dp_audio_verify_transport()
         }
         .await;

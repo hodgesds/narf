@@ -624,7 +624,7 @@ fn select_mst_with_budget(
             scdc: false,
             depth: otg::ColorDepth::Bpc8,
             audio: modeset::sink_audio_info(edid).and_then(|info| {
-                otg::mst_lpcm_info(
+                otg::mst_audio_info(
                     info,
                     &timing,
                     8,

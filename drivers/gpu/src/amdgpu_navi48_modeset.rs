@@ -1134,7 +1134,7 @@ pub fn hdmi_output(
     let listed = |map: [u64; 4]| vic != 0 && map[usize::from(vic / 64)] & 1 << (vic % 64) != 0;
     let only420 = listed(caps.y420_only);
     let audio = frl_audio(
-        audio.and_then(|a| otg::frl_lpcm_info(a, t.v_active)),
+        audio.and_then(|a| otg::frl_audio_info(a, t.v_active)),
         t.v_active,
     );
     // RGB first where allowed, then subsampling only for a declared mode.
@@ -1250,7 +1250,7 @@ pub fn select_all(
             // HPO exposes only LPCM rates fitting its blanking budget.
             audio: sink_audio_info(&sink.edid).and_then(|info| match rate {
                 DpRate::Uhbr(rate) => {
-                    otg::uhbr_lpcm_info(info, &timing, 8, otg::UhbrSettings { lanes, rate })
+                    otg::uhbr_audio_info(info, &timing, 8, otg::UhbrSettings { lanes, rate })
                 }
                 _ => Some(info),
             }),
@@ -1303,7 +1303,7 @@ pub fn select_all(
             scdc: caps.scdc,
             depth,
             audio: if frl.is_some() {
-                audio.and_then(|a| otg::frl_lpcm_info(a, timing.v_active))
+                audio.and_then(|a| otg::frl_audio_info(a, timing.v_active))
             } else {
                 audio
             },
@@ -2139,7 +2139,7 @@ impl ColdBoot {
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Scanout);
             selection.audio = selection.audio.and_then(|info| {
-                otg::uhbr_lpcm_info(info, &selection.timing, 8, video.link.settings)
+                otg::uhbr_audio_info(info, &selection.timing, 8, video.link.settings)
             });
             if let Some(info) = selection.audio {
                 self.start_display_audio(port, false, info).await?;

@@ -1941,7 +1941,7 @@ kernel_test_in!(
 /// Linux dml1_frl_cap_chk: at 359.5 MHz, 1920 active + 280 blank,
 /// 3x3G carries video/ACR alone (one packet, borrow blank), but rejects
 /// 192 kHz layout 1 (-4). 3x6G carries it (two packets, no borrow).
-fn navi48_frl_selection_reserves_lpcm_bandwidth() -> TestResult {
+fn navi48_frl_selection_reserves_audio_bandwidth() -> TestResult {
     const AUDIO: &[u8] = &[1 << 5 | 6, 0x0f, 0x7f, 7, 0x15, 7, 0x50];
     const HF: &[u8] = &[3 << 5 | 7, 0xd8, 0x5d, 0xc4, 1, 33, 0x80, 0x20];
     let mut base = edid_1080p();
@@ -1965,8 +1965,11 @@ fn navi48_frl_selection_reserves_lpcm_bandwidth() -> TestResult {
     let s = chosen.unwrap();
     assert_eq!(s.frl, FrlRate::new(2));
     let a = s.audio.unwrap();
-    assert_eq!(a.mode_count, 1); // AC-3 does not enter native FRL's endpoint.
+    // AC-3 passes through beside LPCM; its 48-kHz six channels do not change
+    // the reservation the 192-kHz eight-channel LPCM already sets.
+    assert_eq!(a.mode_count, 2);
     assert_eq!(a.modes[0], raw.modes[0]);
+    assert_eq!(a.modes[1], raw.modes[1]);
     assert_eq!(frl_audio(Some(a), t.v_active).max_rate_hz, 192_000);
     assert_eq!(frl_audio(Some(a), t.v_active).layout, 1);
     assert_eq!(
@@ -1985,7 +1988,7 @@ fn navi48_frl_selection_reserves_lpcm_bandwidth() -> TestResult {
 }
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
-    navi48_frl_selection_reserves_lpcm_bandwidth
+    navi48_frl_selection_reserves_audio_bandwidth
 );
 
 fn navi48_mst_selection_keeps_only_remote_lpcm_that_fits() -> TestResult {
@@ -2018,7 +2021,7 @@ fn navi48_mst_selection_keeps_only_remote_lpcm_that_fits() -> TestResult {
             assert_eq!(s.len(), 1);
             assert_eq!(s[0].timing, timing);
             let expected = sink_audio_info(&edid).and_then(|a| {
-                otg::mst_lpcm_info(
+                otg::mst_audio_info(
                     a,
                     &timing,
                     8,
@@ -2032,11 +2035,16 @@ fn navi48_mst_selection_keeps_only_remote_lpcm_that_fits() -> TestResult {
             assert_eq!(s[0].audio, expected);
             if !blocks.is_empty() {
                 let a = s[0].audio.unwrap();
-                assert!(a.modes[..usize::from(a.mode_count)]
-                    .iter()
-                    .all(|m| m.format == 1));
+                let modes = &a.modes[..usize::from(a.mode_count)];
+                // LPCM is required; compressed SADs pass through unfiltered.
+                assert!(modes.iter().any(|m| m.format == 1));
+                let raw = sink_audio_info(&edid).unwrap();
+                for m in modes.iter().filter(|m| m.format != 1) {
+                    assert!(raw.modes.contains(m));
+                }
                 if narrow {
-                    assert!(a.mode_count < 2 || a.modes[..2].iter().any(|m| m.rates != 0x7f));
+                    let lpcm: Vec<_> = modes.iter().filter(|m| m.format == 1).collect();
+                    assert!(lpcm.len() < 2 || lpcm[..2].iter().any(|m| m.rates != 0x7f));
                 }
             }
         }

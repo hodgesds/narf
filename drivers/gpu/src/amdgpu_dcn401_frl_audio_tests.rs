@@ -65,7 +65,7 @@ fn fixture(rate: u8, y420: bool, depth: ColorDepth) -> (Engine<AudioIo>, Fw) {
         ColorDepth::Bpc10 => 10,
         ColorDepth::Bpc12 => 12,
     };
-    let a = frl_lpcm_info(info(), t.v_active).unwrap();
+    let a = frl_audio_info(info(), t.v_active).unwrap();
     let Some(FrlCap::Ok {
         audio_packets_line,
         borrow,
@@ -95,11 +95,15 @@ fn fixture(rate: u8, y420: bool, depth: ColorDepth) -> (Engine<AudioIo>, Fw) {
     )
 }
 fn reg(e: &Engine<AudioIo>, r: u64) -> u32 {
-    e.io.inner.inner.regs.get(&frl(r)).copied().unwrap_or(0)
+    reg_at(e, frl(r))
+}
+fn reg_at(e: &Engine<AudioIo>, at: u64) -> u32 {
+    e.io.inner.inner.regs.get(&at).copied().unwrap_or(0)
 }
 
 /// ACR rows from hpo_enc401's Linux table, at every FRL rate. The HDA
-/// endpoint remains HDMI and exposes LPCM only, independently of video depth.
+/// endpoint remains HDMI and, as dce_aud_az_configure does, carries the
+/// sink's AC-3 SAD and HBR beside LPCM, independently of video depth.
 fn dcn401_frl_audio_programs_afmt4_acr_endpoint_and_retires() -> TestResult {
     for (code, nc) in [
         (1, [4224, 171875, 5292, 156250, 5760, 156250]),
@@ -118,10 +122,13 @@ fn dcn401_frl_audio_programs_afmt4_acr_endpoint_and_retires() -> TestResult {
             let v = e.status.frl_video_running.unwrap();
             let a = run(e.start_hdmi_audio(path(2), info())).unwrap();
             assert_eq!(a.endpoint, v.request.pipe);
-            assert!(!a.dp && !a.hbr);
-            assert_eq!(a.info.mode_count, 1);
+            // 8-channel 192-kHz LPCM fits, so the HBR probe passes too.
+            assert!(!a.dp && a.hbr);
+            assert_eq!(a.info.mode_count, 2);
             assert_eq!(a.descriptors[0], 0x7f07_7f07);
-            assert!(a.descriptors[1..].iter().all(|d| *d == 0));
+            assert_eq!(a.descriptors[1], 0x0050_0705); // AC-3, 6 channels
+            assert!(a.descriptors[2..].iter().all(|d| *d == 0));
+            assert_eq!(reg_at(&e, e.layout.base + 0x40c * 4), 5);
             assert_eq!(a.channels, 0xff);
             let bank = e.layout.dio_clock - 0xa0 * 4;
             assert_eq!(
@@ -152,7 +159,8 @@ fn dcn401_frl_audio_programs_afmt4_acr_endpoint_and_retires() -> TestResult {
             }
             assert_eq!(e.io.az[&(a.endpoint, 0x54)], 0x8000_0000);
             assert_eq!(e.io.az[&(a.endpoint, 0x25)] & 0x30000, 0x10000);
-            assert_eq!(e.io.az[&(a.endpoint, 0x38)] & 1, 0);
+            assert_eq!(e.io.az[&(a.endpoint, 0x38)] & 1, 1);
+            assert_eq!(e.io.az[&(a.endpoint, 0x29)], 0x0050_0705);
             assert_eq!(run(e.stop_frl_video(path(2))), Err(Error::Busy));
             run(e.frl_ffe(&mut fw, path(2), 1)).unwrap();
             assert_eq!(e.status.frl_audio, Some(a));
@@ -314,12 +322,14 @@ kernel_test_in!(
 fn dcn401_frl_audio_limits_sd_layout_and_rejects_invalid_lpcm() -> TestResult {
     let raw = info();
     for lines in [480, 576, 1080] {
-        let normalized = frl_lpcm_info(raw, lines).unwrap();
-        assert_eq!(normalized.mode_count, 1);
+        let normalized = frl_audio_info(raw, lines).unwrap();
+        assert_eq!(normalized.mode_count, 2);
         assert_eq!(
             normalized.modes[0].channels,
             if lines <= 576 { 2 } else { 8 }
         );
+        // Only LPCM is clamped; AC-3 passthrough keeps its six channels.
+        assert_eq!(normalized.modes[1], raw.modes[1]);
         assert_eq!(
             normalized.speakers,
             if lines <= 576 { 1 } else { raw.speakers }
@@ -345,6 +355,40 @@ fn dcn401_frl_audio_limits_sd_layout_and_rejects_invalid_lpcm() -> TestResult {
         assert!(e.io.writes.is_empty());
         assert!(e.status.frl_audio.is_none());
     }
+    // One-bit audio, DST, reserved codes and compressed SADs without
+    // channels or rates never reach the endpoint.
+    let mut a = raw;
+    a.mode_count = 8;
+    for (i, (format, channels, rates)) in [
+        (9, 2, 7),
+        (13, 2, 7),
+        (15, 2, 7),
+        (7, 0, 7),
+        (7, 9, 7),
+        (7, 6, 0x80),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        a.modes[i] = AudioMode {
+            format,
+            channels,
+            rates,
+            byte2: 0,
+        };
+    }
+    a.modes[7] = raw.modes[0];
+    a.modes[6] = AudioMode {
+        format: 10, // E-AC-3
+        channels: 8,
+        rates: 0x47,
+        byte2: 1,
+    };
+    let kept = frl_audio_info(a, 1080).unwrap();
+    assert_eq!(kept.mode_count, 2);
+    assert_eq!(kept.modes[0].format, 10);
+    assert_eq!(kept.modes[0].rates, 0x47);
+    assert_eq!(kept.modes[1], raw.modes[0]);
     // Scanout state without its retained fetch witness cannot authorize audio.
     let (mut e, _fw) = fixture(6, false, ColorDepth::Bpc8);
     e.status.state = State::ScanoutRunning(1);
