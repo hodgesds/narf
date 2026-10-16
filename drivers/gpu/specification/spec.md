@@ -2008,13 +2008,19 @@ live divider/reference readback, matching prepared DP timing/OPP depth and no
 inherited packet/audio/metadata, format-buffer or reset work. Read-only retained
 clock references may validate a live PHY; clock programming and ordinary idle
 references keep their existing all-consumers-stopped checks. A payload ceiling
-rejects impossible RGB modes but is not DML admission or a watermark proof.
+uses the actual trained lane count/rate and reduces 8b/10b capacity to 97% when
+FEC runs. Uncompressed RGB uses its component depth; DSC uses the validated
+PPS's bits per pixel and per-slice overhead, so a mode which needs compression
+is not rejected against its uncompressed size. This native DSC path requires
+8-bpc RGB SST and a FEC-trained link; other depths, MST DSC and insufficient
+compressed capacity reject before frontend writes. This is not DML admission
+or a watermark proof.
 Native pixel packing selects 1/2/4/8 pixels per cycle from pixel rate and DPREF.
 
 `PreparingDpFrontend(stream)` is set before the first AUX wait. Fresh sink
 configuration, D0 and per-lane/alignment checks precede writes and completion.
 Setup routes the frontend symbol clock to the actual PHY, selects OTG/stereo
-sources, programs uncompressed 8/10/12-bpc full-range RGB and native MSA totals,
+sources, programs uncompressed 8/10/12-bpc RGB or 8-bpc RGB DSC and native MSA totals,
 starts, sync widths/polarities and active sizes, and disables SDP splitting.
 It connects only this frontend to the trained backend, enables the native
 frontend, waits for DISPCLK/SYMCLK acknowledgement, programs the independent

@@ -237,9 +237,26 @@ impl<I: Io> Engine<I> {
             ColorDepth::Bpc12 => 12,
         };
         // Necessary payload ceiling only, not DML admission/watermark validation.
-        if u64::from(timing.timing.pixel_clock_khz) * 3 * bpc
-            > (link.phy.settings.rate as u64) * 27_000 * 8 * u64::from(link.phy.settings.lanes)
-        {
+        let required = if let Some(cfg) = timing.dsc {
+            // This native DSC path is 8-bpc RGB SST with FEC. Its validated
+            // PPS determines the payload, including the per-slice overhead;
+            // comparing the uncompressed pixels would reject the very modes
+            // which need compression to fit their link.
+            if !link.fec || bpc != 8 || link.phy.settings.mst {
+                return Err(Error::Unsupported);
+            }
+            u64::from(crate::amdgpu_dsc::dsc_kbps(
+                &super::dsc_hw::dsc_timing(&timing.timing),
+                cfg.bpp_x16,
+                cfg.slices_h,
+            ))
+        } else {
+            u64::from(timing.timing.pixel_clock_khz) * 3 * bpc
+        };
+        let raw = (link.phy.settings.rate as u64) * 27_000 * 8 * u64::from(link.phy.settings.lanes);
+        // Linux dp_link_bandwidth_kbps: 97% of 8b/10b payload with FEC.
+        let available = if link.fec { raw * 97 / 100 } else { raw };
+        if required > available {
             return Err(Error::Unsupported);
         }
         if clock.reference_hz == 0 {

@@ -107,6 +107,11 @@ fn fixture_with(
         ..io_settings()
     };
     io.settings = settings;
+    if dsc.is_some() {
+        // Native DSC selection requires a FEC-capable sink. Keep this model
+        // on the same trained transport as real compressed configurations.
+        io.set(0x90, &[1]);
+    }
     run(e.enable_dp_phy(&mut io, path(p), settings)).unwrap();
     run(e.train_dp_link(&mut io, path(p), false, false)).unwrap();
     let source = dio(stream, 0x2093);
@@ -508,6 +513,54 @@ fn io_settings_low() -> DpPhySettings {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_dp_frontend_derives_pixel_packing_and_rejects_insufficient_capacity
+);
+
+fn dcn401_dp_frontend_admits_compressed_payload_on_the_trained_fec_link() -> TestResult {
+    // 1080p60 RGB requires 3.564 Gbit/s. One RBR lane carries 1.296
+    // Gbit/s before FEC (1.25712 after): 8-bpp DSC fits, 12-bpp does not.
+    for (bpp_x16, fec, depth, fits) in [
+        (128, true, ColorDepth::Bpc8, true),
+        (131, true, ColorDepth::Bpc8, true),
+        // 8.25 bpp + 34.56 Mbit/s slice overhead fits raw RBR, but not FEC.
+        (132, true, ColorDepth::Bpc8, false),
+        (192, true, ColorDepth::Bpc8, false),
+        (128, false, ColorDepth::Bpc8, false),
+        (128, true, ColorDepth::Bpc10, false),
+    ] {
+        let cfg = crate::amdgpu_dsc::DscConfig {
+            slices_h: 2,
+            slices_v: 10,
+            bpp_x16,
+            block_pred: true,
+            linebuf_depth: 11,
+            version_minor: 2,
+            ycbcr422_simple: false,
+        };
+        let (mut e, mut io, c) = fixture_with(0, 1, 2, depth, false, Some(cfg), false);
+        run(e.stop_dp_link(&mut io, path(0))).unwrap();
+        io.settings = io_settings_low();
+        io.set(0x90, &[u8::from(fec)]);
+        e.io.inner.inner.lanes = 8;
+        run(e.enable_dp_phy(&mut io, path(0), io_settings_low())).unwrap();
+        let trained = run(e.train_dp_link(&mut io, path(0), false, false)).unwrap();
+        assert_eq!(trained.fec, fec);
+        let writes = e.io.fake().writes.len();
+        let result = run(e.prepare_dp_frontend(&mut io, path(0), req(1, 2), c));
+        if fits {
+            let ready = result.expect("compressed payload fits the trained link");
+            assert_eq!(ready.link.phy.settings.lanes, 1);
+            assert_eq!(ready.blank.timing.request.dsc, Some(cfg));
+            assert_eq!(e.io.fake().regs[&dio(1, 0x211f)] & 1, 1);
+        } else {
+            assert_eq!(result, Err(Error::Unsupported));
+            assert_eq!(e.io.fake().writes.len(), writes);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dsc-link",
+    dcn401_dp_frontend_admits_compressed_payload_on_the_trained_fec_link
 );
 
 fn dcn401_dp_frontend_late_changes_never_publish_ready_or_detach_a_changed_route() -> TestResult {

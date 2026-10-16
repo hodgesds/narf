@@ -621,6 +621,11 @@ frontend/FIFO reset acknowledgements. It checks retained live clock references,
 source/OPP state and fresh sink lock before reporting readiness. Matching
 frontend shutdown waits for clocks off before detaching routes and returning
 to the trained link; cancellation/failure retain ownership and block replay.
+The native frontend payload guard now accounts for DSC's compressed bits per
+pixel and slice overhead instead of rejecting it as uncompressed RGB. Actual
+trained rate/lanes and FEC's capacity reduction bound both kinds of stream;
+DSC requires the supported 8-bpc RGB SST/FEC path. A native regression exercises
+DSC fitting one RBR lane when RGB does not, including the FEC capacity boundary.
 Native legacy DP black video now starts the matching staged OTG/OPP pattern,
 requires fresh frame progress, seeds M/N and follows steering/video/resync FIFO
 startup with native priming delays and independent acknowledgements. Fresh sink
