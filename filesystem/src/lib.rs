@@ -1448,9 +1448,9 @@ pub trait FileOps: Send + Sync {
         }
     }
 
-    /// Acknowledge readiness after an event multiplexer has actually delivered
-    /// it to its caller. Passive readiness probes (notably a nested epoll's
-    /// poll method) must not call this: some procfs sources expose a
+    /// Acknowledge readiness after `poll` or an event multiplexer has actually
+    /// delivered it to its caller. Passive readiness probes (notably a nested
+    /// epoll's poll method) must not call this: some procfs sources expose a
     /// per-open-file change edge which is consumed only by the monitor that
     /// receives the event.
     fn acknowledge_poll_readiness(&self, _readiness: u32) {}

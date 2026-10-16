@@ -3071,9 +3071,8 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_fdinfo_read_no_deadlock);
 
 // ── seccomp(2): compatibility query/error subset ───────────────────
 //
-// NARF does not implement a BPF VM or enforce seccomp filters. It does
-// expose the Linux feature-query subset used during runtime probing and
-// rejects NEW_LISTENER, whose notification fd semantics are unavailable.
+// NARF accepts the validation-only BPF subset used by runtime probes. It
+// exposes Linux feature queries and returns a listener fd for NEW_LISTENER.
 // Linux reference: kernel/seccomp.c::do_seccomp and
 // seccomp_get_action_avail.
 
@@ -3108,7 +3107,7 @@ fn smoke_abi_proc_seccomp_query_subset() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_proc_seccomp_query_subset);
 
 #[cfg(target_arch = "x86_64")]
-fn smoke_abi_proc_seccomp_new_listener_is_einval() -> TestResult {
+fn smoke_abi_proc_seccomp_new_listener_installs_fd() -> TestResult {
     with_setup(|| {
         const SECCOMP_SET_MODE_FILTER: u64 = 1;
         const SECCOMP_FILTER_FLAG_NEW_LISTENER: u64 = 1 << 3;
@@ -3121,13 +3120,27 @@ fn smoke_abi_proc_seccomp_new_listener_is_einval() -> TestResult {
         {
             return Err("seccomp NEW_LISTENER with a NULL program must be -EFAULT");
         }
-        // A valid program reaches the listener step, which NARF refuses.
+        // A valid program installs the listener and returns its descriptor.
         let mut insn = [0u8; 8];
         insn[0..2].copy_from_slice(&0x06u16.to_ne_bytes()); // BPF_RET | BPF_K
         insn[4..8].copy_from_slice(&0x7fff_0000u32.to_ne_bytes()); // SECCOMP_RET_ALLOW
         let mut fprog = [0u8; 16];
         fprog[0..2].copy_from_slice(&1u16.to_ne_bytes());
         fprog[8..16].copy_from_slice(&(insn.as_ptr() as u64).to_ne_bytes());
+        let listener_fd = match call(
+            Syscall::Seccomp.raw(),
+            a2(
+                SECCOMP_SET_MODE_FILTER,
+                SECCOMP_FILTER_FLAG_NEW_LISTENER,
+                fprog.as_ptr() as u64,
+            ),
+        ) {
+            Some(fd) if fd >= 0 => fd,
+            _ => return Err("seccomp NEW_LISTENER did not return a listener fd"),
+        };
+        // Linux permits one listener-bearing filter in a chain. The descriptor
+        // may be fd 0 in this synthetic task, so only validate non-negativity.
+        let _ = listener_fd;
         match call(
             Syscall::Seccomp.raw(),
             a2(
@@ -3136,13 +3149,16 @@ fn smoke_abi_proc_seccomp_new_listener_is_einval() -> TestResult {
                 fprog.as_ptr() as u64,
             ),
         ) {
-            Some(EINVAL) => Ok(()),
-            _ => Err("seccomp NEW_LISTENER must return -EINVAL when notifications are unsupported"),
+            Some(EBUSY) => Ok(()),
+            _ => Err("a second seccomp NEW_LISTENER must return -EBUSY"),
         }
     })
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("syscall_abi", smoke_abi_proc_seccomp_new_listener_is_einval);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_seccomp_new_listener_installs_fd
+);
 
 // ── securebits (`security/commoncap.c::cap_task_prctl`) ──────────
 //

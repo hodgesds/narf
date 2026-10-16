@@ -395,10 +395,15 @@ open file reads/writes through the bound `ProcMemAccess` (`read_at`/
 `poll_edge_token` defaults to `(0, 0)`; stateful readiness providers advance
 one component whenever an edge-relevant source changes so `EPOLLET` cannot
 lose a drain/refill transition between readiness scans.
-`acknowledge_poll_readiness` defaults to a no-op and is called only after an
-epoll instance accepts an event for delivery. It lets a source retire a
-per-open-file change edge without allowing a passive nested-epoll readiness
-query to consume an event owned by its inner monitor.
+`acknowledge_poll_readiness` defaults to a no-op and is called only after
+`poll`/`ppoll` or an epoll instance accepts an event for delivery. It lets a
+source retire a per-open-file change edge without allowing a passive
+nested-epoll readiness query or poll-park recheck to consume an event owned by
+its inner monitor.
+`/proc/<pid>/mountinfo` follows Linux `mounts_poll`: an open descriptor is
+readable (`POLLIN`) but never writable (`POLLOUT`), and a mount-namespace
+generation change additionally reports `POLLPRI | POLLERR` until the accepting
+epoll instance acknowledges that edge.
 `arm_readiness_exclusive` is used only by a blocking I/O syscall. Its default
 delegates to ordinary `arm_readiness`; providers backed by a Linux-style
 exclusive wait queue override it so one consumable event wakes one syscall.

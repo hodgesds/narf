@@ -38,10 +38,14 @@
 #ifndef PTRACE_O_TRACEEXIT
 #define PTRACE_O_TRACEEXIT 0x40
 #endif
+#ifndef PTRACE_O_TRACEVFORKDONE
+#define PTRACE_O_TRACEVFORKDONE 0x20
+#endif
 #ifndef PTRACE_EVENT_FORK
 #define PTRACE_EVENT_FORK 1
 #define PTRACE_EVENT_VFORK 2
 #define PTRACE_EVENT_CLONE 3
+#define PTRACE_EVENT_VFORK_DONE 5
 #endif
 #ifndef PTRACE_EVENT_EXIT
 #define PTRACE_EVENT_EXIT 6
@@ -121,14 +125,14 @@ int main(void) {
     }
     CHECK(ptrace(PTRACE_SETOPTIONS, t, 0,
                  (void *)(PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
-                          PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXIT)) == 0,
+                          PTRACE_O_TRACECLONE | PTRACE_O_TRACEVFORKDONE | PTRACE_O_TRACEEXIT)) == 0,
           "SETOPTIONS");
     errno = 0;
     CHECK(ptrace(PTRACE_GETEVENTMSG, t, 0, (void *)8) == -1 && errno == EFAULT,
           "GETEVENTMSG to a bad pointer not EFAULT");
     ptrace(PTRACE_CONT, t, 0, 0);
 
-    int ev_fork = 0, ev_vfork = 0, ev_clone = 0, new_stops = 0, usr1_stop = 0;
+    int ev_fork = 0, ev_vfork = 0, ev_vfork_done = 0, ev_clone = 0, new_stops = 0, usr1_stop = 0;
     int ev_exit = 0, exit_codes = 0, exit_zero = 0;
     int tracee_exit = -1;
     for (int iter = 0; iter < 200; iter++) {
@@ -156,6 +160,7 @@ int main(void) {
                   "event %d siginfo signo=%d code=%#x", event, si.si_signo, si.si_code);
             if (event == PTRACE_EVENT_FORK) ev_fork++;
             if (event == PTRACE_EVENT_VFORK) ev_vfork++;
+            if (event == PTRACE_EVENT_VFORK_DONE) ev_vfork_done++;
             if (event == PTRACE_EVENT_CLONE) ev_clone++;
             if (event == PTRACE_EVENT_EXIT) {
                 // The status the task is about to exit with, as wait reports it.
@@ -193,6 +198,7 @@ int main(void) {
     }
     CHECK(ev_fork == 1, "fork events %d", ev_fork);
     CHECK(ev_vfork == 1, "vfork events %d", ev_vfork);
+    CHECK(ev_vfork_done == 1, "vfork-done events %d", ev_vfork_done);
     CHECK(ev_clone == 1, "clone events %d", ev_clone);
     CHECK(new_stops == 3, "auto-attached children's SIGSTOP stops %d", new_stops);
     CHECK(usr1_stop == 1, "SIGUSR1 delivery stops %d", usr1_stop);

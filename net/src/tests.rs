@@ -7585,6 +7585,39 @@ fn smoke_tcp_transport_options_reach_live_tcb() -> TestResult {
 }
 kernel_test_in!("net/tcp", smoke_tcp_transport_options_reach_live_tcb);
 
+/// A closed advertised window must reopen after any successful read, even if
+/// the peer could only deliver a one-byte persist probe. Waiting for an MSS
+/// here leaves the sender backed off for up to `TCP_RTO_MAX`.
+fn smoke_tcp_zero_window_reopens_after_single_byte_read() -> TestResult {
+    use crate::tcp::core::{__install_test_tcb, __with_tcb_mut, receive_window_update_due};
+    use crate::tcp::socket_buf::RecvBuf;
+    use crate::tcp::state_machine::TcpState;
+
+    let id = __install_test_tcb(
+        [10, 0, 2, 15],
+        2471,
+        [10, 0, 2, 2],
+        80,
+        TcpState::Established,
+    );
+    let reopens = __with_tcb_mut(id, |t| {
+        t.recv_buf = RecvBuf::new(1);
+        t.rcv_wnd = 0;
+        let _ = t.recv_buf.accept(t.rcv_nxt, b"x", t.rcv_nxt);
+        let mut byte = [0u8; 1];
+        t.recv_buf.read(&mut byte) == 1 && receive_window_update_due(t)
+    })
+    .unwrap_or(false);
+    if !reopens {
+        return TestResult::Fail("a one-byte read did not reopen an advertised zero window");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp",
+    smoke_tcp_zero_window_reopens_after_single_byte_read
+);
+
 fn smoke_tcp_sendbuf_full_slices() -> TestResult {
     use crate::tcp::socket_buf::SendBuf;
     let mut s = SendBuf::new(1024, 0);

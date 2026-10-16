@@ -27,7 +27,13 @@ pub(crate) fn sys_uname(ctx: &mut dyn TrapContext) {
     let mut kbuf = alloc::vec![0u8; UTSNAME_STRUCT_LEN];
     let mut off = 0usize;
     // sysname / nodename / release / version / machine / domainname.
-    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], "NARF");
+    //
+    // This is the Linux syscall ABI, not a native NARF identification
+    // surface.  System services validate `uname -s` before enabling their
+    // Linux code paths; in particular, udisks rejects any other value and
+    // immediately retries its probe.  Keep the NARF identity in the release
+    // and version fields instead.
+    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], "Linux");
     off += UTSNAME_FIELD_LEN;
     pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], &hostname);
     off += UTSNAME_FIELD_LEN;

@@ -330,8 +330,47 @@ impl Drop for NprocGuard {
     }
 }
 
+/// Stable task-id → mm ownership for every live user task. Queue scans are
+/// necessarily transient on SMP: a slot can be moving between queues or be
+/// locally owned by an executor. This registry is installed at user-task
+/// spawn, updated by exec, and removed only with the final slot drop.
+type LiveUserAddressSpaces = alloc::vec::Vec<(TaskId, Arc<AddressSpace>)>;
+static LIVE_USER_ADDRESS_SPACES: IrqSafeSpinLock<LiveUserAddressSpaces> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+fn register_live_user_address_space(id: TaskId, address_space: &Arc<AddressSpace>) {
+    let mut live = LIVE_USER_ADDRESS_SPACES.lock();
+    debug_assert!(live.iter().all(|(existing, _)| *existing != id));
+    live.push((id, address_space.clone()));
+}
+
+fn replace_live_user_address_space(id: TaskId, address_space: &Arc<AddressSpace>) {
+    if let Some((_, existing)) = LIVE_USER_ADDRESS_SPACES
+        .lock()
+        .iter_mut()
+        .find(|(existing, _)| *existing == id)
+    {
+        *existing = address_space.clone();
+    }
+}
+
+fn live_user_address_space(id: TaskId) -> Option<Arc<AddressSpace>> {
+    LIVE_USER_ADDRESS_SPACES
+        .lock()
+        .iter()
+        .find(|(existing, _)| *existing == id)
+        .map(|(_, address_space)| address_space.clone())
+}
+
+fn unregister_live_user_address_space(id: TaskId) {
+    LIVE_USER_ADDRESS_SPACES
+        .lock()
+        .retain(|(existing, _)| *existing != id);
+}
+
 impl Drop for TaskSlot {
     fn drop(&mut self) {
+        unregister_live_user_address_space(self.id);
         unregister_task_affinity(self.id);
     }
 }
@@ -2437,6 +2476,7 @@ pub fn __reset_queues_for_test() {
         inbox.lock().clear();
         WAKE_INBOX_LEN[cpu].store(0, Ordering::Release);
     }
+    LIVE_USER_ADDRESS_SPACES.lock().clear();
     // A task can queue an in-poll exec replacement and then remain pending.
     // Tests that discard its slot must also discard that deferred owner or the
     // replacement address space leaks into the next test.
@@ -3618,6 +3658,7 @@ where
     awake
         .last_run_cycles
         .store(narf_time::now_cycles(), Ordering::Release);
+    register_live_user_address_space(id, &addr_space);
     let slot = TaskSlot {
         task,
         awake,
@@ -3640,7 +3681,7 @@ where
 /// `Arc` keeps the AS alive even if the task drops immediately —
 /// callers holding it observe a consistent snapshot.
 ///
-/// Searches every per-CPU queue. The lock on each CPU's queue is held
+/// Searches every per-CPU ready queue. The lock on each CPU's queue is held
 /// for the duration of its scan; no two CPUs' queues are held at once.
 pub fn address_space_of(id: TaskId) -> Option<Arc<AddressSpace>> {
     for q in READY.iter() {
@@ -3684,16 +3725,19 @@ pub fn address_space_of_running(id: TaskId) -> Option<Arc<AddressSpace>> {
     None
 }
 
-/// [`address_space_of`], falling back to [`address_space_of_running`] for a
-/// task that is being polled right now: the address space of any live task,
-/// queued, parked or running.
+/// Looks in the scheduler's lifetime registry, falling back to
+/// [`address_space_of`] and [`address_space_of_running`] for compatibility:
+/// the address space of any live task, queued, staged for a remote CPU, parked
+/// or running.
 pub fn address_space_of_live(id: TaskId) -> Option<Arc<AddressSpace>> {
-    address_space_of(id).or_else(|| address_space_of_running(id))
+    live_user_address_space(id)
+        .or_else(|| address_space_of(id))
+        .or_else(|| address_space_of_running(id))
 }
 
-/// Snapshot of every task currently sitting on a per-CPU ready
-/// queue. Used by /proc to enumerate `[pid]` subdirectories and
-/// by debug surfaces (`ps`-style introspection).
+/// Snapshot of every task currently sitting on a per-CPU ready queue. Used by
+/// /proc to enumerate `[pid]` subdirectories and by debug surfaces
+/// (`ps`-style introspection).
 ///
 /// Intentionally returns owned Vec rather than an iterator: the
 /// per-CPU lock is dropped before any caller code runs, so the
@@ -3713,7 +3757,8 @@ pub fn all_task_ids() -> alloc::vec::Vec<TaskId> {
 }
 
 /// Snapshot every distinct live user address space, including tasks currently
-/// being polled and therefore temporarily absent from the ready queues.
+/// being polled or staged for a remote CPU and therefore temporarily absent
+/// from the ready queues.
 pub fn all_address_spaces() -> alloc::vec::Vec<Arc<AddressSpace>> {
     let mut out: alloc::vec::Vec<Arc<AddressSpace>> = alloc::vec::Vec::new();
     let mut push_unique = |candidate: Arc<AddressSpace>| {
@@ -3721,6 +3766,9 @@ pub fn all_address_spaces() -> alloc::vec::Vec<Arc<AddressSpace>> {
             out.push(candidate);
         }
     };
+    for (_, address_space) in LIVE_USER_ADDRESS_SPACES.lock().iter() {
+        push_unique(address_space.clone());
+    }
     for q in READY.iter() {
         let g = q.lock();
         if let Some(ref dq) = *g {
@@ -3771,6 +3819,7 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
     //      own field.
     let id_now = current_task_slot().load(Ordering::Acquire);
     if id_now == id.raw() {
+        replace_live_user_address_space(id, &new_arc);
         {
             let mut g = active_user_as_slot().lock();
             let _ = g.take();
@@ -3790,6 +3839,7 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
         let mut g = q.lock();
         if let Some(ref mut dq) = *g {
             if let Some(slot) = dq.iter_mut().find(|s| s.id == id) {
+                replace_live_user_address_space(id, &new_arc);
                 let prev = slot.addr_space.take();
                 slot.addr_space = Some(new_arc);
                 return prev;

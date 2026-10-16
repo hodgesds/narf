@@ -1528,3 +1528,11 @@ argument = "Memory (migrate.rs, rmap.rs, reclaim.rs): direct compaction's bookke
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The only frame/ change (bare_main.rs) registers the sockpair_block_smoke test binary (musl + glibc) in the embedded musl-demo table. Test registration data for verification kernels; no production path, authority, mapping, domain transition or capability changes. The blocking AF_UNIX stream send fix it tests lives in userspace/ (socket send handlers and socket.rs), outside the TCB."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The executor's live-mm registry retains only an Arc clone of the address space already owned by each dispatched user task. It does not change task scheduling, domain-state save/restore, or the TCB boundary; it makes a live task's mm visible independently of transient queue ownership."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The registry is scheduler-private metadata and carries no authority beyond the existing address-space reference. It neither performs a kernel-side data access nor bypasses capability checks or domain tags; callers continue through their existing authorization and uaccess paths."

@@ -3593,9 +3593,14 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     // for a syscall trapped from user mode: the kernel's own dispatches
     // through here (the async file-op ring bridge) are not syscalls the task
     // made, as io_uring's work is not filtered on Linux.
-    if ctx.returning_to_user() && crate::seccomp::secure_computing(ctx, raw_n) {
-        return;
-    }
+    let raw_n = if ctx.returning_to_user() {
+        let Some(nr) = crate::seccomp::secure_computing(ctx, raw_n) else {
+            return;
+        };
+        nr
+    } else {
+        raw_n
+    };
     if let Some(variant) = Syscall::from_raw(raw_n) {
         #[cfg(feature = "syscall-trace")]
         syscall_trace_account(variant);
@@ -4397,35 +4402,6 @@ pub fn kernel_syscall_entry_plain_with_state(
     args: &SyscallArgs,
     user_state: *mut u8,
 ) -> SyscallReturn {
-    let n = match Syscall::from_raw(num) {
-        Some(v) => v,
-        None => {
-            // seccomp filters see every syscall number, including ones this
-            // kernel does not implement: Linux runs `secure_computing` before
-            // the table lookup turns an unknown number into -ENOSYS, so a
-            // filter's TRAP/ERRNO/KILL answer wins over ENOSYS.
-            if !user_state.is_null() {
-                let mut ctx = ArgsOnlyCtx::new(*args, user_state);
-                if crate::seccomp::secure_computing(&mut ctx, num) {
-                    return ctx.ret;
-                }
-            }
-            #[cfg(feature = "syscall-trace")]
-            {
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::ConsoleOnlyWriter,
-                    "UNKNOWN_SYSCALL num={} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
-                    num,
-                    args.arg0,
-                    args.arg1,
-                    args.arg2,
-                    args.arg3,
-                );
-            }
-            return SyscallReturn::not_implemented();
-        }
-    };
     let p = GLOBAL_TABLE.load(Ordering::Acquire);
     if p.is_null() {
         // No syscall table installed at all. Not the same condition as an
@@ -4440,6 +4416,41 @@ pub fn kernel_syscall_entry_plain_with_state(
     // installed, so the `&SyscallTable` is valid for this dispatch.
     // SAFETY: Valid memory or trusted environment
     let table = unsafe { &*p };
+    let mut ctx = ArgsOnlyCtx::new(*args, user_state);
+    // PTRACE_SYSCALL entry-stop: if this task is traced and armed, stop it
+    // BEFORE the syscall runs so the tracer can inspect orig_rax + args.
+    // This also covers unknown syscall numbers, as Linux does.
+    if !user_state.is_null() {
+        crate::ptrace::ptrace_syscall_stop(&mut ctx, true, num as u64);
+    }
+    let effective_num = if !user_state.is_null() {
+        let Some(nr) = crate::seccomp::secure_computing(&mut ctx, num) else {
+            return ctx.ret;
+        };
+        nr
+    } else {
+        num
+    };
+    let n = match Syscall::from_raw(effective_num) {
+        Some(v) => v,
+        None => {
+            #[cfg(feature = "syscall-trace")]
+            {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::ConsoleOnlyWriter,
+                    "UNKNOWN_SYSCALL num={} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+                    effective_num,
+                    args.arg0,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3,
+                );
+            }
+            ctx.set_return(SyscallReturn::not_implemented());
+            return ctx.ret;
+        }
+    };
     #[cfg(feature = "syscall-trace")]
     syscall_trace_account(n);
     // In errors-only mode still surface exit_group/exit ENTRY lines: a systemd
@@ -4453,8 +4464,8 @@ pub fn kernel_syscall_entry_plain_with_state(
     // flood the serial (slowing the very boot being traced) and bury the real
     // syscalls. A TRACE_LAST_PARK key matching this (tid,num) = a re-execution.
     #[cfg(feature = "syscall-trace")]
-    let trace_was_parked =
-        TRACE_LAST_PARK.load(core::sync::atomic::Ordering::Relaxed) == trace_park_key(num);
+    let trace_was_parked = TRACE_LAST_PARK.load(core::sync::atomic::Ordering::Relaxed)
+        == trace_park_key(effective_num);
     #[cfg(feature = "syscall-trace")]
     let show_entry = syscall_trace_relevant(n)
         && !trace_was_parked
@@ -4475,28 +4486,11 @@ pub fn kernel_syscall_entry_plain_with_state(
         );
         trace_syscall_paths(table.name_of(n).unwrap_or("?"), args);
     }
-    let mut ctx = ArgsOnlyCtx::new(*args, user_state);
-    // PTRACE_SYSCALL entry-stop: if this task is traced and armed, stop it
-    // BEFORE the syscall runs so the tracer can inspect orig_rax + args.
-    // Only meaningful on the live musl path (a real user frame to park).
-    // `raw_num` is the original syscall number = orig_rax at entry; it may
-    // differ from `n.raw()` after version-decoding, so pass what the user
-    // put in rax. On the own-stack path the tracee parks here and this call
-    // returns when the tracer resumes it; then the syscall dispatches.
-    if !user_state.is_null() {
-        crate::ptrace::ptrace_syscall_stop(&mut ctx, true, num as u64);
-    }
     // Entry RIP, to detect a handler that parked to RE-EXECUTE (rewinds RIP
     // by the 2-byte `syscall` width). Such a syscall has not completed, so it
     // must NOT fire an exit-stop — the re-issued syscall will trace again.
     let entry_rip = ctx.rip();
-    // `__secure_computing`, after the ptrace entry stop as in Linux's
-    // `syscall_trace_enter`. A skipped syscall has its return value (or the
-    // SIGSYS frame) already set and still takes the exit path below.
-    let seccomp_skipped = !user_state.is_null() && crate::seccomp::secure_computing(&mut ctx, num);
-    if !seccomp_skipped {
-        table.dispatch(n, &mut ctx);
-    }
+    table.dispatch(n, &mut ctx);
     // Return-value half of the trace. Without it the log shows what was
     // ASKED but not what was ANSWERED, which is exactly what you need when
     // userspace takes a different branch than it does on Linux (an epoll
@@ -4509,7 +4503,11 @@ pub fn kernel_syscall_entry_plain_with_state(
         // A park re-executes with exactly `invalid_op()` (value 0, InvalidOp).
         let parked_now = r == SyscallReturn::invalid_op();
         TRACE_LAST_PARK.store(
-            if parked_now { trace_park_key(num) } else { 0 },
+            if parked_now {
+                trace_park_key(effective_num)
+            } else {
+                0
+            },
             core::sync::atomic::Ordering::Relaxed,
         );
         // Suppress ONLY a re-execution that parked again; the first park and any
@@ -4550,7 +4548,7 @@ pub fn kernel_syscall_entry_plain_with_state(
     // exit-stop only ever pairs with a truly completed syscall.
     if !user_state.is_null() && ctx.rip() == entry_rip {
         let saved_ret = ctx.ret;
-        crate::ptrace::ptrace_syscall_stop(&mut ctx, false, num as u64);
+        crate::ptrace::ptrace_syscall_stop(&mut ctx, false, effective_num as u64);
         ctx.set_return(saved_ret);
     }
     // Linux-compatible signal delivery on the `syscall`-instruction return
@@ -4601,7 +4599,7 @@ pub fn kernel_syscall_entry_plain_with_state(
             2,
         );
         if restart_pending {
-            crate::handlers::default_signal_delivery_restart_pending(&mut ctx, num);
+            crate::handlers::default_signal_delivery_restart_pending(&mut ctx, effective_num);
         } else {
             crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
         }

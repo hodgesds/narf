@@ -77,6 +77,23 @@ fn smoke_abi_aio_setup_writes_ctx() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_aio_setup_writes_ctx);
 
+fn smoke_abi_aio_setup_requires_zero_context_word() -> TestResult {
+    with_setup(|| {
+        let mut ctx_id: u64 = 1;
+        match call(
+            Syscall::IoSetup.raw(),
+            a1(8, (&mut ctx_id as *mut u64) as u64),
+        ) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("io_setup must reject a non-zero context word"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_aio_setup_requires_zero_context_word
+);
+
 fn smoke_abi_aio_destroy_unknown() -> TestResult {
     with_setup(|| {
         // io_destroy of a ctx that was never set up → -EINVAL.

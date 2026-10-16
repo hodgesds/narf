@@ -957,6 +957,57 @@ kernel_test_in!(
     smoke_scheduler_spawn_user_carries_address_space
 );
 
+/// Remote-memory users (`ptrace`, `process_vm_*`, and `/proc/<pid>/mem`) must
+/// resolve a user mm while its slot is absent from READY during executor and
+/// cross-core handoff transitions.
+fn smoke_scheduler_live_address_space_survives_handoff() -> TestResult {
+    extern crate alloc;
+    use crate::{address_space_of_live, TaskSpec};
+    use alloc::sync::Arc;
+    use narf_memory::AddressSpace;
+
+    crate::__reset_queues_for_test();
+    // SAFETY: `new_for_user` only requires paging be enabled, which holds in
+    // the running kernel test environment.
+    let address_space = Arc::new(unsafe { AddressSpace::new_for_user() }.expect("alloc user AS"));
+    let cpu = narf_lib::percpu::current_cpu();
+
+    // A requeue is staged in its wake inbox before the destination CPU folds
+    // it into READY. The lifetime registry keeps its mm visible throughout.
+    let staged_id = crate::spawn_user(
+        crate::alloc_task_id(),
+        async {},
+        TaskSpec::unthrottled(),
+        Arc::clone(&address_space),
+    );
+    let staged = crate::READY[cpu]
+        .lock()
+        .as_mut()
+        .and_then(|ready| ready.pop_front())
+        .expect("new user task queued");
+    crate::wake_list_push(cpu, staged, crate::policy::TaskEnqueueReason::Requeued);
+
+    let enumerated = crate::all_address_spaces()
+        .iter()
+        .any(|found| Arc::ptr_eq(found, &address_space));
+    let inbox_live = address_space_of_live(staged_id)
+        .as_ref()
+        .is_some_and(|found| Arc::ptr_eq(found, &address_space));
+
+    crate::__reset_queues_for_test();
+    if !enumerated {
+        return TestResult::Fail("live-mm registry was omitted from AS enumeration");
+    }
+    if !inbox_live {
+        return TestResult::Fail("live-mm lookup lost its task address space");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/live_mm",
+    smoke_scheduler_live_address_space_survives_handoff
+);
+
 /// Regression: polling a user task must restore the kernel CR3
 /// before returning to the caller, otherwise any subsequent
 /// low-half access (FB phys, identity-mapped MMIO, beacon write)

@@ -42,7 +42,11 @@ semantics), `SYNC_IOC_FILE_INFO` (the two-call protocol of
 ENOTTY. A file is readable once every leaf signalled. Fence names: VirtIO-GPU
 `virtio_gpu`/`controlq`; atomic `OUT_FENCE_PTR` fences `narf_kms`/`vblank`
 (one context each, timestamp = the simulated vblank); stubs `stub`/`stub`;
-signalled fences report Linux's `detached-driver`/`signaled-timeline`. The shared sound
+signalled fences report Linux's `detached-driver`/`signaled-timeline`.
+VirtIO-GPU atomic KMS commits resolve a plane `IN_FENCE_FD` through the same
+`sync_file_fences` seam before any KMS mutation; a pending leaf requests a
+side-effect-free parked retry, while `TEST_ONLY` validates but does not wait.
+The shared sound
 registry's PCM/control files implement the ALSA ABI; syscall handlers contain
 no sound-card lookup or driver-specific request branches. Device mmap validation
 runs before VMA replacement, and direct mappings atomically retain their backing
@@ -53,6 +57,21 @@ EAGAIN (11), ENOTTY (25) and EFAULT
 (14) remain distinct. PCM EPIPE does not raise the pipe/socket SIGPIPE signal.
 See [sound §3.1](../../drivers/sound/specification/spec.md#31-linux-alsa-pcm-and-control-abi)
 for implemented requests and compatibility limits.
+
+Seccomp supports strict mode and classic-BPF filter chains, including TSYNC,
+`RET_ERRNO`, `RET_TRAP`, `RET_TRACE`, and `RET_USER_NOTIF`. A user-notify
+action without an attached listener returns `ENOSYS`; installing the filter
+with `SECCOMP_FILTER_FLAG_NEW_LISTENER` returns one listener fd for that filter
+(a second listener on the chain is `EBUSY`). The listener serves
+`SECCOMP_IOCTL_NOTIF_RECV`, `SECCOMP_IOCTL_NOTIF_SEND`, and
+`SECCOMP_IOCTL_NOTIF_ID_VALID`: received records use the 80-byte
+`seccomp_notif` layout, IDs are unique per listener and stale after a response,
+and a response either emulates a return or uses `CONTINUE` to dispatch the
+original syscall. Forked tasks share the filter's listener and therefore feed
+one notification stream. A tracer which opted into `PTRACE_O_TRACESECCOMP`
+receives the filter data through `PTRACE_EVENT_SECCOMP`; before resume it may
+replace `orig_rax`, which is rechecked once and then dispatched as the
+replacement syscall.
 
 An inotify descriptor implements `FIONREAD` / `TIOCINQ` (`0x541b`), returning
 the bounded `int` byte count of its unread serialized event records. This is
@@ -127,6 +146,18 @@ positive Linux errno on failure. `narf-libc::execve` publishes that exact value
 through thread-local `errno`; it must not collapse path-resolution failures,
 permission failures, and malformed images into one `ENOEXEC`, because PATH
 search depends on distinguishing `ENOENT` and `ENOTDIR` from terminal errors.
+
+Linux kernel-AIO contexts retain NARF's synchronous submit/reap backend. In a
+real user address space, `io_setup(2)` returns a mapped, writable opaque
+context page with no Linux AIO-ring magic: libaio may safely probe it, then
+falls back to the `io_submit`/`io_getevents` syscall path. The input/output
+`aio_context_t` word must be zero on entry, is nonzero on success, and the
+context page is removed by `io_destroy(2)` or address-space teardown.
+
+`uname(2)` presents the Linux compatibility identity: `sysname` is `Linux`,
+while the NARF build identity remains visible in the release and version
+fields. This lets Linux services select their normal code paths without
+mistaking the kernel for an unrelated operating system.
 
 The loader publishes the finalized SysV auxiliary vector and environment to
 `/proc/<pid>/auxv` and `/proc/<pid>/environ` only after a successful image

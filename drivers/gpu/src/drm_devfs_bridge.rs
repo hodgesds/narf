@@ -449,7 +449,7 @@ impl FileOps for DriCardFile {
         &'a self,
         cmd: u32,
         arg: u64,
-        _context: &'a dyn narf_filesystem::IoctlContext,
+        context: &'a dyn narf_filesystem::IoctlContext,
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
             if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu")
@@ -457,6 +457,21 @@ impl FileOps for DriCardFile {
             {
                 return crate::drm_ioctl_bridge::wait_virtgpu_render(arg as usize, &self.virtgpu)
                     .await;
+            }
+            // Atomic KMS commits consume their explicit sync_file dependency
+            // before taking the DRM mode-state lock. The helper either parks
+            // this syscall for a device-fence re-poll (with no side effect),
+            // or completes the bounded kernel-only fallback wait. This keeps
+            // a render submission from deadlocking behind the scanout path.
+            if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu")
+                && cmd == crate::drm_uapi::DRM_IOCTL_MODE_ATOMIC
+                // Preserve DRM_MASTER errno precedence: an unprivileged
+                // primary open reaches the normal dispatcher, which returns
+                // EACCES without first importing user fence descriptors.
+                && crate::drm_registry::mode_state(self.index)
+                    .is_some_and(|state| state.lock().is_master(self.open_id))
+            {
+                crate::drm_ioctl_bridge::wait_atomic_in_fences(arg, context)?;
             }
             self.ioctl(cmd, arg as usize)
         })

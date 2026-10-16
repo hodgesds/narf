@@ -117,11 +117,13 @@ impl FileOps for PidExtFile {
         }
         let current = hook_ns_mountinfo_generation(self.pid);
         let observed = self.mountinfo_generation.load(Ordering::Acquire);
-        // mountinfo remains an ordinary readable proc file. Linux adds the
-        // mount-namespace change edge to that normal readiness rather than
-        // replacing it; libmount may read its initial table before it arms
-        // the POLLPRI monitor.
-        let mut ready = crate::POLL_IN | crate::POLL_OUT;
+        // mountinfo remains an ordinary readable proc file. Linux's
+        // mounts_poll() reports EPOLLIN|EPOLLRDNORM, but not EPOLLOUT: a
+        // procfs sequence file has no writable side. Advertising POLLOUT
+        // makes poll()/ppoll() users which include it return immediately and
+        // can spin their monitor loop. Linux adds the mount-namespace change
+        // edge to the normal readable readiness rather than replacing it.
+        let mut ready = crate::POLL_IN;
         if current != observed {
             // Linux's proc_mounts_poll() returns both EPOLLPRI and EPOLLERR
             // for a mount-namespace event (fs/proc_namespace.c). libmount
@@ -137,7 +139,7 @@ impl FileOps for PidExtFile {
             && readiness & (crate::POLL_PRI | crate::POLL_ERR) != 0
         {
             // `proc_mounts_poll()`'s namespace sequence is per open file.
-            // Only the epoll instance that returned this event advances its
+            // The poll or epoll instance that returns this event advances its
             // cursor; a parent epoll merely querying a nested monitor must
             // leave the edge available for the monitor to drain.
             self.mountinfo_generation

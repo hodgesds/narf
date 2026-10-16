@@ -110,6 +110,15 @@ fn do_poll_until(task_id: u64, fds: &mut [PollFd], deadline_ns: Option<u64>) -> 
                     let ready = (mask as u16) & want;
                     item.revents = ready;
                     if ready != 0 {
+                        // This poll result is about to be returned to the
+                        // caller, so it owns any per-open change edge in the
+                        // readiness mask. In particular, procfs mountinfo
+                        // reports POLLPRI|POLLERR once per namespace change;
+                        // leaving that edge pending after ppoll() makes GLib
+                        // rescan the mount table in a zero-timeout loop.
+                        // Passive probes use installed_poll_files_ready()
+                        // instead and deliberately do not acknowledge.
+                        o.acknowledge_poll_readiness(ready as u32);
                         n_ready += 1;
                     }
                 }
@@ -455,6 +464,11 @@ pub(crate) fn poll_scan(task_id: u64, fds: &mut [PollFd]) -> usize {
                 let ready = (mask as u16) & (item.events | always);
                 item.revents = ready;
                 if ready != 0 {
+                    // `poll_scan` is used only by paths that immediately
+                    // return this result to the poll caller. Retire a
+                    // source-local edge now; readiness-only park probes must
+                    // use installed_poll_files_ready(), which is passive.
+                    o.acknowledge_poll_readiness(ready as u32);
                     n_ready += 1;
                 }
             }

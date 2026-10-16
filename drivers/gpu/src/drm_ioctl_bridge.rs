@@ -27,7 +27,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use narf_filesystem::FsError;
+use narf_filesystem::{dma_buf::DmaResvUsage, FsError, IoctlContext};
 use narf_io::DmaBuffer;
 
 use crate::drm::ioctl::{dispatch, DrmIoctlError, DrmIoctlResult, IoctlCmd};
@@ -3172,6 +3172,111 @@ fn handle_list_lessees(arg: usize, ctx: &DrmFileCtx) -> Result<u64, FsError> {
     Ok(0)
 }
 
+/// Validate and wait for the explicit fences named by an atomic KMS request.
+///
+/// This runs at the `FileOps::ioctl_user` boundary, before the bridge takes
+/// its card-state lock. A VirtIO render fence can only complete after taking
+/// the transport request gate, so waiting under either the card lock or a
+/// dma-buf reservation lock would create a producer/consumer lock inversion.
+///
+/// A parked retry has not touched KMS state, therefore it is safe for
+/// `IoctlContext::restart_after` to re-execute the ioctl once a device fence
+/// may have completed. Kernel-only callers have no task to park, and use the
+/// bounded synchronous fallback instead.
+pub(crate) fn wait_atomic_in_fences(arg: u64, context: &dyn IoctlContext) -> Result<(), FsError> {
+    const TEST_ONLY: u32 = 0x0100;
+    const VALID_FLAGS: u32 = 0x0001 | 0x0002 | TEST_ONLY | 0x0200 | 0x0400;
+    const FENCE_REPOLL_NS: u64 = 1_000_000;
+    const FENCE_TIMEOUT_MS: u64 = 15_000;
+
+    let mut header = [0u8; core::mem::size_of::<DrmModeAtomicUapi>()];
+    context.read(arg, &mut header)?;
+    // SAFETY: `header` is exactly one fully initialized `repr(C)` UAPI
+    // object. `read_unaligned` matches the byte-array alignment.
+    let req = unsafe { core::ptr::read_unaligned(header.as_ptr() as *const DrmModeAtomicUapi) };
+    if req.reserved != 0 || req.flags & !VALID_FLAGS != 0 || req.count_objs > 256 {
+        return Err(FsError::InvalidData);
+    }
+    if req.flags & TEST_ONLY != 0 && req.flags & 0x0001 != 0 {
+        return Err(FsError::InvalidData);
+    }
+    if req.count_objs == 0 {
+        return Ok(());
+    }
+    if req.objs_ptr == 0
+        || req.count_props_ptr == 0
+        || req.props_ptr == 0
+        || req.prop_values_ptr == 0
+    {
+        return Err(FsError::BadAddress);
+    }
+
+    let count = req.count_objs as usize;
+    // Read the same arrays, in the same order, as `handle_atomic`. The object
+    // ids are not needed for fence waiting, but validating their range keeps
+    // EFAULT precedence identical for a malformed request.
+    let mut object_bytes = vec![0u8; count * 4];
+    context.read(req.objs_ptr, &mut object_bytes)?;
+    let mut count_bytes = vec![0u8; count * 4];
+    context.read(req.count_props_ptr, &mut count_bytes)?;
+    let total_props = count_bytes
+        .chunks_exact(4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) as usize)
+        .try_fold(0usize, |sum, count| {
+            sum.checked_add(count).filter(|total| *total <= 4096)
+        })
+        .ok_or(FsError::OutOfMemory)?;
+    let mut prop_bytes = vec![0u8; total_props * 4];
+    context.read(req.props_ptr, &mut prop_bytes)?;
+    let mut value_bytes = vec![0u8; total_props * 8];
+    context.read(req.prop_values_ptr, &mut value_bytes)?;
+
+    let test_only = req.flags & TEST_ONLY != 0;
+    for (prop, value) in prop_bytes
+        .chunks_exact(4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .zip(
+            value_bytes
+                .chunks_exact(8)
+                .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap())),
+        )
+    {
+        if prop != PLANE_IN_FENCE_FD_PROP_ID {
+            continue;
+        }
+        let fd = value as i64;
+        if fd < -1 || fd > i32::MAX as i64 {
+            return Err(FsError::InvalidData);
+        }
+        let Some(fences) = (fd >= 0)
+            .then(|| context.sync_file_fences(fd as i32))
+            .flatten()
+        else {
+            if fd >= 0 {
+                return Err(FsError::InvalidData);
+            }
+            continue;
+        };
+        // TEST_ONLY imports and validates the sync_file but has no commit
+        // tail in which to consume the dependency.
+        if test_only {
+            continue;
+        }
+        for fence in fences {
+            if fence.is_signalled() {
+                continue;
+            }
+            if context.restart_after(FENCE_REPOLL_NS) {
+                return Err(FsError::WouldBlock);
+            }
+            if !fence.wait(FENCE_TIMEOUT_MS) {
+                return Err(FsError::Busy);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// DRM_IOCTL_MODE_ATOMIC — decode objs/props/values arrays, build
 /// `AtomicState`, run `core_check` + `core_commit`.
 ///
@@ -3551,8 +3656,7 @@ fn handle_atomic(
                 let fb = card.framebuffer(fb_id).ok()?;
                 let gem_handle = fb.gem_handle;
                 Some((
-                    card.virtgpu_import(gem_handle)
-                        .map(|resource| resource.resource_id),
+                    card.virtgpu_import(gem_handle).cloned(),
                     card.dumb_backing(gem_handle).map(|backing| backing.phys),
                     fb.pitch,
                     fb.width,
@@ -3574,9 +3678,9 @@ fn handle_atomic(
             presentation.is_some(),
         );
     }
-    if let Some((resource_id, src_phys, pitch, width, height, fb_id)) = presentation {
-        if let Some(resource_id) = resource_id {
-            present_virgl_frame(resource_id, width, height)?;
+    if let Some((resource, src_phys, pitch, width, height, fb_id)) = presentation {
+        if let Some(resource) = resource {
+            present_virgl_frame(&resource, width, height)?;
         } else if let Some(src_phys) = src_phys {
             present_frame(card_index, src_phys, pitch, width, height);
         } else {
@@ -3886,7 +3990,7 @@ fn handle_setcrtc(
 
     // Look up the framebuffer → GEM handle → dumb backing phys.
     let src_phys: Option<u64>;
-    let virgl_resource_id: Option<u32>;
+    let virgl_resource: Option<Arc<VirtGpuResource>>;
     let src_pitch: u32;
     let src_w: u32;
     let src_h: u32;
@@ -3915,9 +4019,7 @@ fn handle_setcrtc(
         src_h = fb.height;
         let gem_handle = fb.gem_handle;
         src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
-        virgl_resource_id = card
-            .virtgpu_import(gem_handle)
-            .map(|resource| resource.resource_id);
+        virgl_resource = card.virtgpu_import(gem_handle).cloned();
     }
 
     let (log, n) = should_log(&SETCRTC_N);
@@ -3935,8 +4037,8 @@ fn handle_setcrtc(
     }
 
     // Perform the blit if we have a valid source and a live scanout.
-    if let Some(resource_id) = virgl_resource_id {
-        present_virgl_frame(resource_id, src_w, src_h)?;
+    if let Some(resource) = virgl_resource {
+        present_virgl_frame(&resource, src_w, src_h)?;
     } else if let Some(src) = src_phys {
         present_frame(card_index, src, src_pitch, src_w, src_h);
     } else {
@@ -3992,7 +4094,7 @@ fn handle_page_flip(
     }
 
     let src_phys: Option<u64>;
-    let virgl_resource_id: Option<u32>;
+    let virgl_resource: Option<Arc<VirtGpuResource>>;
     let src_pitch: u32;
     let src_w: u32;
     let src_h: u32;
@@ -4018,9 +4120,7 @@ fn handle_page_flip(
         src_h = fb.height;
         let gem_handle = fb.gem_handle;
         src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
-        virgl_resource_id = card
-            .virtgpu_import(gem_handle)
-            .map(|resource| resource.resource_id);
+        virgl_resource = card.virtgpu_import(gem_handle).cloned();
 
         // Reserve Linux's per-file event space before changing the CRTC, so an
         // ENOMEM failure leaves scanout state untouched.
@@ -4060,8 +4160,8 @@ fn handle_page_flip(
         );
     }
 
-    if let Some(resource_id) = virgl_resource_id {
-        present_virgl_frame(resource_id, src_w, src_h)?;
+    if let Some(resource) = virgl_resource {
+        present_virgl_frame(&resource, src_w, src_h)?;
     } else if let Some(src) = src_phys {
         present_frame(card_index, src, src_pitch, src_w, src_h);
     } else {
@@ -4070,12 +4170,35 @@ fn handle_page_flip(
     Ok(0)
 }
 
+/// Wait for every GPU write that is still attached to a scanout buffer.
+///
+/// `EXECBUFFER` is asynchronous, so a KMS read must not reach the same
+/// resource until its implicit dma-buf WRITE fences have completed.  Take the
+/// reservation snapshot before waiting: device fences can reap completions by
+/// taking the VirtIO request gate, and waiting while the reservation lock is
+/// held would deadlock the producer.  The bound is the same GPU-hang bound as
+/// `VIRTGPU_WAIT` and EXECBUFFER input-fence handling.
+pub(crate) fn wait_virgl_scanout_writes(resource: &VirtGpuResource) -> Result<(), FsError> {
+    const GPU_FENCE_TIMEOUT_MS: u64 = 15_000;
+
+    for fence in resource.dma_buf.resv.fences(DmaResvUsage::Write) {
+        if !fence.is_signalled() && !fence.wait(GPU_FENCE_TIMEOUT_MS) {
+            return Err(FsError::Busy);
+        }
+    }
+    Ok(())
+}
+
 /// Present a PRIME-imported VirGL GEM object directly, matching Linux's
 /// virtio-gpu primary-plane update (`SET_SCANOUT` + `RESOURCE_FLUSH`).
-fn present_virgl_frame(resource_id: u32, width: u32, height: u32) -> Result<(), FsError> {
+fn present_virgl_frame(resource: &VirtGpuResource, width: u32, height: u32) -> Result<(), FsError> {
+    // This must precede SET_SCANOUT/RESOURCE_FLUSH.  The caller holds no DRM
+    // or reservation lock here, so an asynchronous render submission can
+    // finish and reap its fence without lock inversion.
+    wait_virgl_scanout_writes(resource)?;
     let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::InvalidData)?;
     narf_console::fb_take_for_user();
-    dev.present_virgl_resource(resource_id, width, height)
+    dev.present_virgl_resource(resource.resource_id, width, height)
         .map_err(map_gpu_transport_error)
 }
 
