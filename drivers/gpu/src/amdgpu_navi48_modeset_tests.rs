@@ -1662,6 +1662,27 @@ fn navi48_mst_admits_dark_connector_modes() -> TestResult {
     // Even spare link slots cannot admit a fifth display engine stream.
     let one = super::super::select_mst(0, caps, &[(sink, edid_1080p(), u16::MAX)], &|_| None)[0];
     assert!(dark_mst_modes(&soc, caps, &edid, u16::MAX, &[one; 4]).is_empty());
+    // Board SST/HDMI streams in the same configuration use no MST slots but
+    // do take display engine pipes in the joint admission.
+    let mut board = one;
+    board.mst = None;
+    board.port = 1;
+    assert_eq!(
+        widths(dark_mst_modes(&soc, caps, &edid, u16::MAX, &[board])),
+        [1920, 3840, 1280]
+    );
+    assert!(dark_mst_modes(&soc, caps, &edid, u16::MAX, &[board, board, one, one]).is_empty());
+    lit[0].mst.as_mut().unwrap().slots = 54;
+    assert_eq!(
+        widths(dark_mst_modes(
+            &soc,
+            caps,
+            &edid,
+            u16::MAX,
+            &[board, lit[0]]
+        )),
+        [1280]
+    );
     // Advertising a timing does not enable the connector. A later explicit
     // request retains its fixed pipe and gets full configuration admission.
     let devices = [(sink, edid, u16::MAX)];

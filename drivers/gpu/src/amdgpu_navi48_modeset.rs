@@ -892,6 +892,22 @@ pub fn refine_dsc(soc: &dml::Soc, selections: &mut [Selection]) -> Result<(), Mo
     Ok(())
 }
 
+/// One DP port's MST branch in a configuration: end device k (its
+/// `MstLink::outputs` slot) lit on `pipes[k]` at `want(k)`, None dark.
+pub struct MstRoute<'a> {
+    pub port: usize,
+    pub pipes: &'a [Option<u8>],
+    pub want: &'a (dyn Fn(usize) -> Option<Timing> + Sync),
+}
+impl core::fmt::Debug for MstRoute<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MstRoute")
+            .field("port", &self.port)
+            .field("pipes", &self.pipes)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Selection rounds after a link verifies below its sink's caps. Each
 /// round records a strictly lower link, and the 8b/10b ladder has twelve
 /// settings; real links settle within one or two.
@@ -1817,16 +1833,38 @@ impl ColdBoot {
     /// As for `modeset_display`: every display of this owner stopped.
     pub async unsafe fn modeset_displays(
         &mut self,
+        fill: impl FnMut(u8, u32, &mut [u32]),
+        want: impl Fn(usize) -> Option<Timing>,
+        pipe_of: impl Fn(usize) -> Option<u8>,
+    ) -> Result<Configuration, ModesetError> {
+        // SAFETY: the caller's obligations.
+        unsafe { self.modeset_routed(fill, want, pipe_of, None) }.await
+    }
+    /// `modeset_displays` with one DP port's MST branch beside the board's
+    /// SST/HDMI sinks, all one configuration: the branch started and probed,
+    /// board sinks (that root excluded) and end devices selected, then
+    /// clocks and joint DML admission for every stream, and each display lit
+    /// on its pipe. Board port p is lit on `pipe_of(p)` at `want(p)`; end
+    /// device k on `mst.pipes[k]` at `mst.want(k)`. Pipes must be distinct.
+    /// Admission truncates in pipe order. Dark board sinks and end devices
+    /// are admitted beside every running stream.
+    /// # Safety
+    /// As for `modeset_displays`.
+    pub async unsafe fn modeset_routed(
+        &mut self,
         mut fill: impl FnMut(u8, u32, &mut [u32]),
         want: impl Fn(usize) -> Option<Timing>,
         pipe_of: impl Fn(usize) -> Option<u8>,
+        mst: Option<MstRoute<'_>>,
     ) -> Result<Configuration, ModesetError> {
         // As `modeset_display_mode`: when the first display's link verifies
         // lower, nothing is lit yet and the configuration is chosen again.
         // A later display's reduction is returned in `failed`.
         for _ in 0..VERIFY_ROUNDS {
             // SAFETY: the caller's obligations.
-            match unsafe { self.modeset_displays_once(&mut fill, &want, &pipe_of) }.await {
+            match unsafe { self.modeset_displays_once(&mut fill, &want, &pipe_of, mst.as_ref()) }
+                .await
+            {
                 Err(ModesetError::LinkReduced) => continue,
                 result => return result,
             }
@@ -1841,34 +1879,62 @@ impl ColdBoot {
         mut fill: impl FnMut(u8, u32, &mut [u32]),
         want: impl Fn(usize) -> Option<Timing>,
         pipe_of: impl Fn(usize) -> Option<u8>,
+        mst: Option<&MstRoute<'_>>,
     ) -> Result<Configuration, ModesetError> {
         self.teardowns.check_idle()?;
         self.modesets.check_stopped()?;
         self.sst_outputs.clear();
+        if let Some(route) = mst {
+            self.start_mst_route(route).await?;
+        }
         let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
         let paths = self
             .display_paths()
             .map_err(|_| ModesetError::NoSink)?
             .to_vec();
-        self.update_sst_outputs(None, &paths, &ports, &[]);
-        let mut selections = match select_all(&paths, &ports, max_bpc(), &want) {
+        let plan = match mst {
+            Some(route) => Some(self.plan_mst_route(route, &ports)?),
+            None => None,
+        };
+        // The MST root is the branch's, never a board SST sink.
+        let root = mst.and_then(|r| paths.get(r.port).copied());
+        let board: Vec<display::Port> = ports
+            .iter()
+            .filter(|p| Some(p.path) != root)
+            .cloned()
+            .collect();
+        self.update_sst_outputs(None, &paths, &board, &[]);
+        let mut routed: Vec<(Selection, u8)> = match select_all(&paths, &board, max_bpc(), &want) {
             Ok(selections) => selections,
             // A connected sink without a carrying preferred mode can still
             // offer other modes; an all-off configuration has no stream work.
             Err(ModesetError::NoSink | ModesetError::Link) => Vec::new(),
             Err(e) => return Err(e),
-        };
-        selections.retain(|s| pipe_of(s.port).is_some_and(|p| p < 4));
+        }
+        .into_iter()
+        .filter_map(|s| Some((s, pipe_of(s.port).filter(|&p| p < 4)?)))
+        .collect();
+        if let Some(plan) = &plan {
+            routed.extend(plan.selections.iter().copied());
+        }
+        // Admission keeps a leading set: pipe order decides who stays dark.
+        routed.sort_by_key(|&(_, pipe)| pipe);
+        if routed.windows(2).any(|w| w[0].1 == w[1].1) {
+            return Err(ModesetError::Display(otg::Error::Invalid));
+        }
+        let (mut selections, pipes): (Vec<Selection>, Vec<u8>) = routed.into_iter().unzip();
         // "Broadcast RGB" is RGB's: YCbCr is limited range by itself.
         let limited = limited_range(broadcast_rgb());
         for s in &mut selections {
             s.limited = limited && !s.ycbcr420;
         }
-        let pipes: Vec<u8> = selections.iter().filter_map(|s| pipe_of(s.port)).collect();
         self.select_display(pipes.first().copied().unwrap_or(0))?;
         let soc = self.prepare_configuration(&selections).await?;
-        self.update_sst_outputs(Some(&soc), &paths, &ports, &[]);
+        self.update_sst_outputs(Some(&soc), &paths, &board, &[]);
         if selections.is_empty() {
+            if let Some(plan) = &plan {
+                self.finish_mst_plan(plan, &soc, &[]);
+            }
             return Ok(Configuration {
                 displays: Vec::new(),
                 failed: None,
@@ -1893,11 +1959,19 @@ impl ColdBoot {
             }
         }
         for k in 0..lit.len() {
-            let edid = edid_of(&ports, &paths, &lit[k].selection);
+            let s = lit[k].selection;
+            let edid = match (&plan, s.mst) {
+                (Some(plan), Some(_)) => Self::mst_plan_edid(plan, &s).unwrap_or_default(),
+                _ => edid_of(&ports, &paths, &s),
+            };
             lit[k].modes = self.offered_modes(&soc, &lit, k, &edid);
             self.modesets.retain(lit[k]);
         }
-        self.update_sst_outputs(Some(&soc), &paths, &ports, &lit);
+        self.update_sst_outputs(Some(&soc), &paths, &board, &lit);
+        if let (Some(plan), None) = (&plan, failed) {
+            let running: Vec<_> = lit.iter().map(|m| m.selection).collect();
+            self.finish_mst_plan(plan, &soc, &running);
+        }
         Ok(Configuration {
             displays: lit,
             failed,

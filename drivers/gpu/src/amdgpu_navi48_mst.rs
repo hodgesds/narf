@@ -687,7 +687,11 @@ pub(super) fn dark_mst_modes(
     available: u16,
     lit: &[Selection],
 ) -> Vec<Timing> {
-    let used = lit.iter().try_fold(0u8, |n, s| n.checked_add(s.mst?.slots));
+    // Slots are the MST streams'; DML admission is every running display's.
+    let used = lit
+        .iter()
+        .filter_map(|s| s.mst)
+        .try_fold(0u8, |n, m| n.checked_add(m.slots));
     let Some(free) = used.and_then(|n| 63u8.checked_sub(n)) else {
         return Vec::new();
     };
@@ -711,6 +715,16 @@ pub(super) fn dark_mst_modes(
     offered
 }
 
+/// An MST route's planned streams for one configuration.
+#[derive(Debug)]
+pub(super) struct MstPlan {
+    pub port: usize,
+    /// The root's link caps; None when the branch has no end device.
+    pub caps: Option<modeset::DpCaps>,
+    pub devices: Vec<(dp_mst_mgr::Sink, Vec<u8>, u16)>,
+    pub selections: Vec<(Selection, u8)>,
+}
+
 impl ColdBoot {
     /// Light the end devices behind DP `port`'s MST branch (`select_mst`),
     /// stable output k on `pipes[k]` (its display slot too), skipping None, as one
@@ -727,13 +741,25 @@ impl ColdBoot {
     pub async unsafe fn modeset_mst_displays(
         &mut self,
         port: usize,
-        mut fill: impl FnMut(u8, u32, &mut [u32]),
-        want: impl Fn(usize) -> Option<Timing>,
+        fill: impl FnMut(u8, u32, &mut [u32]),
+        want: impl Fn(usize) -> Option<Timing> + Sync,
         pipes: &[Option<u8>],
     ) -> Result<Configuration, ModesetError> {
-        self.teardowns.check_idle()?;
-        self.modesets.check_stopped()?;
-        self.sst_outputs.clear();
+        let route = modeset::MstRoute {
+            port,
+            pipes,
+            want: &want,
+        };
+        // SAFETY: the caller's obligations.
+        unsafe { self.modeset_routed(fill, |_| None, |_| None, Some(route)) }.await
+    }
+    /// Validate an MST route and start its branch: MST enabled and the
+    /// topology probed, before the configuration scans the board.
+    pub(super) async fn start_mst_route(
+        &mut self,
+        route: &modeset::MstRoute<'_>,
+    ) -> Result<(), ModesetError> {
+        let pipes = route.pipes;
         if pipes.is_empty()
             || pipes.len() > modeset::MAX_DISPLAYS
             || pipes.iter().flatten().any(|&p| p >= 4)
@@ -741,11 +767,22 @@ impl ColdBoot {
                 .iter()
                 .enumerate()
                 .any(|(k, p)| p.is_some() && pipes[..k].contains(p))
-            || self.mst.get(&port).is_some_and(|l| l.owner.is_some())
+            || self.mst.get(&route.port).is_some_and(|l| l.owner.is_some())
         {
             return Err(ModesetError::Display(otg::Error::Invalid));
         }
-        self.start_display_mst(port).await?;
+        self.start_display_mst(route.port).await?;
+        Ok(())
+    }
+    /// The route's end devices (EDID, available PBN) and the streams
+    /// selected for them with their pipes, against the scanned root caps.
+    /// Old dark-output admission is discarded before any async startup.
+    pub(super) fn plan_mst_route(
+        &mut self,
+        route: &modeset::MstRoute<'_>,
+        ports: &[display::Port],
+    ) -> Result<MstPlan, ModesetError> {
+        let port = route.port;
         let link = self.mst.get(&port).ok_or(MstFailure::Invalid)?;
         let mut devices = Vec::new();
         let mut slots = Vec::new();
@@ -761,17 +798,14 @@ impl ColdBoot {
                 }
             }
         }
-        let assigned: Vec<_> = slots
-            .iter()
-            .map(|&k| pipes.get(k).copied().flatten())
-            .collect();
         if devices.is_empty() {
-            return Ok(Configuration {
-                displays: Vec::new(),
-                failed: None,
+            return Ok(MstPlan {
+                port,
+                caps: None,
+                devices,
+                selections: Vec::new(),
             });
         }
-        let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
         let path = *self
             .display_paths()
             .map_err(|_| ModesetError::NoSink)?
@@ -783,6 +817,10 @@ impl ColdBoot {
             .and_then(|p| p.sink.as_ref().ok())
             .and_then(|sink| modeset::dp_caps(&path, sink))
             .ok_or(ModesetError::NoSink)?;
+        let assigned: Vec<_> = slots
+            .iter()
+            .map(|&k| route.pipes.get(k).copied().flatten())
+            .collect();
         let link = self.mst.get(&port).ok_or(MstFailure::Invalid)?;
         let budget = |sink, selected: &[Selection]| {
             let allocated: Vec<_> = selected
@@ -791,69 +829,43 @@ impl ColdBoot {
                 .collect();
             topology::path_budget(&link.topology, sink, &allocated).unwrap_or(0)
         };
-        let (mut selections, pipes): (Vec<_>, Vec<_>) = select_mst_outputs(
+        let selections = select_mst_outputs(
             port,
             caps,
             &devices,
-            &|k| want(slots[k]),
+            &|k| (route.want)(slots[k]),
             &assigned,
             &budget,
-        )
-        .into_iter()
-        .unzip();
-        // Discard old admission before any asynchronous clock/startup work.
+        );
         if let Some(link) = self.mst.get_mut(&port) {
             for output in link.outputs.iter_mut().flatten() {
                 output.modes.clear();
             }
         }
-        self.select_display(pipes.first().copied().unwrap_or(0))?;
-        let soc = self.prepare_configuration(&selections).await?;
-        if selections.is_empty() {
-            self.admit_dark_mst_outputs(port, &soc, caps, &devices, &[]);
-            return Ok(Configuration {
-                displays: Vec::new(),
-                failed: None,
-            });
-        }
-        let limited = modeset::limited_range(modeset::broadcast_rgb());
-        for s in &mut selections {
-            s.limited = limited;
-        }
-        let plans = modeset::admit_displays(&soc, &selections).map_err(otg::Error::Admission)?;
-        selections.truncate(plans.len());
-        self.prepare_pipes(&selections, &plans, &pipes).await?;
-        let mut lit = Vec::with_capacity(selections.len());
-        let mut failed = None;
-        for ((selection, plan), &pipe) in selections.iter().zip(&plans).zip(&pipes) {
-            // SAFETY: the caller's obligations; every earlier display is lit
-            // in its own slot and left to it by each step.
-            match unsafe { self.light(pipe, *selection, *plan, &mut fill) }.await {
-                Ok(m) => lit.push(m),
-                Err(e) if lit.is_empty() => return Err(e),
-                Err(e) => {
-                    failed = Some(e);
-                    break;
-                }
-            }
-        }
-        for k in 0..lit.len() {
-            let edid = devices
-                .iter()
-                .find(|d| Some(d.0) == lit[k].selection.mst.map(|m| m.sink))
-                .map(|d| d.1.clone())
-                .unwrap_or_default();
-            lit[k].modes = self.offered_modes(&soc, &lit, k, &edid);
-            self.modesets.retain(lit[k]);
-        }
-        let running: Vec<_> = lit.iter().map(|m| m.selection).collect();
-        if failed.is_none() {
-            self.admit_dark_mst_outputs(port, &soc, caps, &devices, &running);
-        }
-        Ok(Configuration {
-            displays: lit,
-            failed,
+        Ok(MstPlan {
+            port,
+            caps: Some(caps),
+            devices,
+            selections,
         })
+    }
+    /// Admit each dark end device's timings beside every running display.
+    pub(super) fn finish_mst_plan(
+        &mut self,
+        plan: &MstPlan,
+        soc: &crate::amdgpu_dcn401_dml::Soc,
+        running: &[Selection],
+    ) {
+        if let Some(caps) = plan.caps {
+            self.admit_dark_mst_outputs(plan.port, soc, caps, &plan.devices, running);
+        }
+    }
+    /// An MST display's EDID, from the plan's devices.
+    pub(super) fn mst_plan_edid(plan: &MstPlan, s: &Selection) -> Option<Vec<u8>> {
+        plan.devices
+            .iter()
+            .find(|d| Some(d.0) == s.mst.map(|m| m.sink))
+            .map(|d| d.1.clone())
     }
     fn admit_dark_mst_outputs(
         &mut self,

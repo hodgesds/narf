@@ -1547,7 +1547,22 @@ branch queries the board's DPM limits (starting display power if needed), but
 does not request an active-display count, clock floors, pipe clocks, payloads
 or scanout allocations. Startup failures do not publish new dark-output modes.
 
-`unsafe ColdBoot::modeset_mst_displays(port, fill, want, pipes)` lights one
+`unsafe ColdBoot::modeset_routed(fill, want, pipe_of, mst: Option<MstRoute>)`
+lights board SST/HDMI sinks and one DP port's MST branch as one configuration.
+`MstRoute { port, pipes, want }` names the branch's root port, each end
+device's pipe (`pipes[k]` for `MstLink::outputs[k]`, None dark) and timing
+request. The round validates the route and starts the branch, scans once,
+selects board sinks with the MST root excluded (`select_all`; board port p on
+`pipe_of(p)` at `want(p)`) and the branch's devices, refuses duplicate pipes,
+orders every stream by pipe (admission truncates trailing streams), and runs one
+clock request, `refine_dsc`, joint `admit_displays`, `prepare_pipes` and `light`
+per stream. SST connector inventory (`display_sst_outputs`) excludes the MST
+root; dark end devices are admitted beside every running stream, MST slots
+counted only for MST payloads. `modeset_displays` is `modeset_routed` without a
+route. Each round is retried as described for `LinkReduced`.
+
+`unsafe ColdBoot::modeset_mst_displays(port, fill, want, pipes)` is
+`modeset_routed` with that route and no board pipes. It lights one
 branch's sinks with joint DML admission, 8-bpc RGB and the maximum supported
 8b/10b link. `pipes[k]: Option<u8>` assigns stable output k to a distinct
 display/pipe, or disables it. Disabled, unreadable and unadmitted devices
