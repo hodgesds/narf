@@ -465,11 +465,28 @@ the UHBR/FRL output mux to DIO only after master/busy clear, with readback befor
 retirement is published. Native failure guards remain binding; cancelled startup,
 uncertain MST payload transactions, uncheckpointed active work and
 shared-clock recovery remain open, with uncertain memory retained.
+The device owner now also retains every completed Modeset through later-pipe
+startup, asynchronous platform adoption and failed/cancelled teardown. A dropped
+configuration or exited monitor cannot lose those live stream handles. The next
+monitor pass restores missing handles and schedules normal withdrawal/retirement,
+rejecting conflicting incarnations before changing caller records. New
+configurations remain blocked until these streams stop. Native cancellation
+quarantine and fresh surface-release checks remain binding.
 HDCP/protected output is tracked separately in
 `drivers/gpu/research/navi48-protected-output.md`, including TA firmware,
 protocol, credential authorization, isolation and physical acceptance gates.
 It remains unsupported and unadvertised; existing crypto helpers and retirement
 exclusions do not implement protected scanout.
+The board/monitor acceptance ledger is
+`drivers/gpu/research/navi48-display-acceptance.md`. It separates software models
+from physical boot/hotplug/modeset/disable evidence. No board routes or physical
+passes have been supplied; eDP/USB-C applicability remains undetermined.
+Physical DP/HDMI connectors now retain EDIDs and independently admitted modes
+while disabled or unadmitted. Link selection and full joint DML bound these
+lists, including fitting alternatives to an unsupported preferred mode. Empty
+configurations query board limits without active floors or stream allocation.
+KMS publishes dark sinks without a CRTC mode, invalidates replacement EDIDs and
+reprobes disabled ports on HPD rise. This still uses whole-configuration relights.
 The lit Navi48 display is published as DRM KMS state on the amdgpu card, with
 the sink's real EDID and exact timing (disconnected on unplug). SETCRTC
 accepts only that timing, and the base amdgpu DRM version 3.0.0 claims no

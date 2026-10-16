@@ -1,6 +1,127 @@
 use super::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn completed_modeset(pipe: u8) -> Modeset {
+    let paths = [path(inventory::Connector::DisplayPort, pipe)];
+    let ports = [port(paths[0], dpcd(0x14, 4), edid_1080p())];
+    let selection = select(&paths, &ports, 8, None).unwrap();
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 456_000,
+        fclk_khz: [300_000, 800_000],
+        dcfclk_khz: [200_000, 600_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 1_000_000,
+        dppclk_max_khz: 1_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let plan = admit_displays(&soc, &[selection]).unwrap()[0];
+    Modeset {
+        selection,
+        pipe,
+        plan,
+        scanout: otg::ScanoutRunning {
+            pipe,
+            stream: pipe,
+            plan,
+            address: 0x8_0000_0000 + u64::from(pipe) * 0x1000000,
+            frame_before: 2,
+            frame_after: 3,
+        },
+        modes: [None; MAX_MODES],
+    }
+}
+
+fn navi48_completed_modesets_survive_configuration_and_publication_cancellation() -> TestResult {
+    use core::{
+        future::Future,
+        task::{Context, Waker},
+    };
+    for during_startup in [false, true] {
+        let first = completed_modeset(0);
+        let second = completed_modeset(2);
+        let mut retained = RetainedModesets::new();
+        let mut journal = super::super::teardown::Teardowns::new();
+        {
+            let mut future = core::pin::pin!(async {
+                // A caller's temporary configuration disappears on cancellation.
+                let mut local = Vec::new();
+                for m in [first, second] {
+                    retained.retain(m);
+                    local.push(m);
+                }
+                if during_startup {
+                    journal.begin_activation(3, &second.selection).unwrap();
+                }
+                // Later native startup, or asynchronous platform adoption.
+                core::future::pending::<()>().await;
+                local
+            });
+            assert!(future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        }
+        assert_eq!(retained.check_stopped(), Err(otg::Error::Busy.into()));
+        let mut recovered = [None; 4];
+        assert_eq!(retained.restore(&mut recovered), Ok(0b0101));
+        assert_eq!(recovered, [Some(first), None, Some(second), None]);
+        assert_eq!(retained.restore(&mut recovered), Ok(0));
+        // Handle recovery must not clear a cancelled native startup's quarantine.
+        if during_startup {
+            assert_eq!(journal.check_idle(), Err(otg::Error::Busy.into()));
+        } else {
+            assert_eq!(journal.check_idle(), Ok(()));
+        }
+        // Forget only the completed teardown's pipe; a sibling still blocks
+        // configuration preparation and stays available after another restore.
+        retained.stopped(0);
+        assert_eq!(retained.check_stopped(), Err(otg::Error::Busy.into()));
+        let mut again = [None; 4];
+        assert_eq!(retained.restore(&mut again), Ok(0b0100));
+        assert_eq!(again[2], Some(second));
+        retained.stopped(2);
+        assert_eq!(retained.check_stopped(), Ok(()));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_completed_modesets_survive_configuration_and_publication_cancellation
+);
+
+fn navi48_modeset_restore_refuses_conflicting_incarnations_before_changes() -> TestResult {
+    let first = completed_modeset(0);
+    let last = completed_modeset(3);
+    let mut retained = RetainedModesets::new();
+    retained.retain(first);
+    retained.retain(last);
+    let mut old = last;
+    old.scanout.address += 4096;
+    let mut caller = [None, None, None, Some(old)];
+    let before = caller;
+    assert_eq!(retained.restore(&mut caller), Err(otg::Error::Busy.into()));
+    assert_eq!(
+        caller, before,
+        "partially restored before detecting a conflict"
+    );
+    // Updated admission and retraining witnesses replace the retained record.
+    let mut updated = last;
+    updated.modes[0] = Some(last.selection.timing);
+    updated.scanout.frame_before = 10;
+    updated.scanout.frame_after = 11;
+    retained.retain(updated);
+    let mut caller = [None; 4];
+    assert_eq!(retained.restore(&mut caller), Ok(0b1001));
+    assert_eq!(caller[3], Some(updated));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_restore_refuses_conflicting_incarnations_before_changes
+);
+
 /// One-block EDID 1.4 whose preferred mode is CEA 1920x1080@60 (148.5 MHz).
 fn edid_1080p() -> Vec<u8> {
     let mut e = alloc::vec![0u8; 128];
@@ -586,6 +707,70 @@ fn edid_three_modes(hdmi: bool) -> Vec<u8> {
     e[255] = 0u8.wrapping_sub(sum);
     e
 }
+
+fn navi48_dark_sst_modes_use_link_and_joint_display_admission() -> TestResult {
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [500_000, 2_000_000],
+        dcfclk_khz: [300_000, 1_200_000],
+        socclk_khz: 600_000,
+        dispclk_max_khz: 1_500_000,
+        dppclk_max_khz: 1_500_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let paths = [path(inventory::Connector::DisplayPort, 0)];
+    let mut device = port(paths[0], dpcd(0x14, 4), edid_three_modes(false));
+    let widths = |m: Vec<Timing>| m.iter().map(|t| t.h_active).collect::<Vec<_>>();
+    assert_eq!(
+        widths(sst::dark_modes(&soc, &paths, &device, 8, &[])),
+        [1920, 3840, 1280]
+    );
+    let one = select(&paths, core::slice::from_ref(&device), 8, None).unwrap();
+    assert!(sst::dark_modes(&soc, &paths, &device, 8, &[one; 4]).is_empty());
+    assert!(sst::dark_modes(
+        &dml::Soc {
+            dispclk_max_khz: 50_000,
+            ..soc
+        },
+        &paths,
+        &device,
+        8,
+        &[]
+    )
+    .is_empty());
+    // The preferred mode does not fit this link. Its dark connector must
+    // still offer the 720p alternative, without relabelling preferred as 720p.
+    device.sink.as_mut().unwrap().dpcd = dpcd(0x06, 2);
+    assert_eq!(
+        select(&paths, core::slice::from_ref(&device), 8, None),
+        Err(ModesetError::Link)
+    );
+    let modes = sst::dark_modes(&soc, &paths, &device, 8, &[]);
+    assert_eq!(widths(modes.clone()), [1280]);
+    assert_eq!(
+        select(&paths, core::slice::from_ref(&device), 8, Some(modes[0]))
+            .unwrap()
+            .timing,
+        modes[0]
+    );
+    device.sink.as_mut().unwrap().dpcd = dpcd(0x06, 1);
+    assert!(sst::dark_modes(&soc, &paths, &device, 8, &[]).is_empty());
+    device.sink = Err(display::Error::InvalidDpcd);
+    assert!(sst::dark_modes(&soc, &paths, &device, 8, &[]).is_empty());
+    let hdmi = [path(inventory::Connector::HdmiTypeA, 0)];
+    let device = port(hdmi[0], None, edid_three_modes(true));
+    assert_eq!(
+        widths(sst::dark_modes(&soc, &hdmi, &device, 8, &[])),
+        [1920, 1280]
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_dark_sst_modes_use_link_and_joint_display_admission
+);
 
 fn navi48_modeset_offers_edid_modes_and_selects_a_wanted_one() -> TestResult {
     use inventory::Connector::{DisplayPort as Dp, HdmiTypeA as Hdmi};

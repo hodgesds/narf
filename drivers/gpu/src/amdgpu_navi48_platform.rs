@@ -656,6 +656,10 @@ struct OutputState {
     mst_present: bool,
     mst_edid: Vec<u8>,
     mst_modes: Vec<Timing>,
+    sst_present: bool,
+    sst_edid: Vec<u8>,
+    sst_modes: Vec<Timing>,
+    last_hpd: Option<bool>,
 }
 impl OutputState {
     const fn new() -> Self {
@@ -668,7 +672,38 @@ impl OutputState {
             mst_present: false,
             mst_edid: Vec::new(),
             mst_modes: Vec::new(),
+            sst_present: false,
+            sst_edid: Vec::new(),
+            sst_modes: Vec::new(),
+            last_hpd: None,
         }
+    }
+
+    fn reconcile_sst(&mut self, output: Option<&boot::SstOutput>) {
+        self.sst_present = output.is_some();
+        self.sst_modes.clear();
+        if !self.active {
+            self.shown = None;
+        }
+        if let Some(output) = output {
+            if self.sst_edid != output.edid {
+                self.shown = None;
+                self.requested = None;
+                self.sst_edid.clone_from(&output.edid);
+            }
+            self.sst_modes.clone_from(&output.modes);
+        } else {
+            self.shown = None;
+        }
+    }
+
+    fn observe_sst_hpd(&mut self, present: bool) -> bool {
+        let reprobe = present && !self.last_hpd.unwrap_or(self.sst_present);
+        self.last_hpd = Some(present);
+        if !present {
+            self.reconcile_sst(None);
+        }
+        reprobe
     }
 
     fn reconcile_mst(&mut self, output: Option<&boot::MstOutput>) {
@@ -713,6 +748,8 @@ impl OutputState {
             offered
         } else if self.mst_present {
             &self.mst_modes
+        } else if self.sst_present {
+            &self.sst_modes
         } else {
             &[]
         }
@@ -750,10 +787,13 @@ fn publish_outputs() {
         .map(|(k, &(kind, shown, _))| crate::amdgpu_navi48_kms::Output {
             kind,
             offered: state[k].offered(),
-            edid: state[k]
-                .mst_present
-                .then(|| state[k].mst_edid.get(..128)?.try_into().ok())
-                .flatten(),
+            edid: if state[k].mst_present {
+                state[k].mst_edid.get(..128).and_then(|e| e.try_into().ok())
+            } else if state[k].sst_present {
+                state[k].sst_edid.get(..128).and_then(|e| e.try_into().ok())
+            } else {
+                None
+            },
             sink: shown.map(|(edid, timing, offered)| crate::amdgpu_navi48_kms::Sink {
                 edid,
                 timing,
@@ -942,7 +982,7 @@ async unsafe fn light_displays(
     };
     let want = |port: usize| pipe_of(port).and_then(|k| wants[usize::from(k)].1);
     let pipe = |port: usize| pipe_of(port).filter(|&k| wants[usize::from(k)].0);
-    let config = if let Some(port) = mst {
+    let result = if let Some(port) = mst {
         // End device k stays on output k, including gaps for disabled or
         // unreadable devices. Compacting would move another monitor here.
         let pipes: Vec<Option<u8>> = (0..4u8)
@@ -950,11 +990,24 @@ async unsafe fn light_displays(
             .collect();
         let want = |k: usize| wants[k].1;
         // SAFETY: the caller's obligations.
-        unsafe { boot.modeset_mst_displays(port, fill, want, &pipes) }.await?
+        unsafe { boot.modeset_mst_displays(port, fill, want, &pipes) }.await
     } else {
         // SAFETY: the caller's obligations.
-        unsafe { boot.modeset_displays(fill, want, pipe) }.await?
+        unsafe { boot.modeset_displays(fill, want, pipe) }.await
     };
+    if mst.is_none() {
+        let outputs = OUTPUTS.lock().clone();
+        for (k, &(port, _)) in outputs.iter().enumerate() {
+            let hpd = boot.display_hpd(port).ok();
+            let mut state = OUTPUT_STATE.lock();
+            state[k].reconcile_sst(boot.display_sst_outputs().iter().find(|o| o.port == port));
+            state[k].last_hpd = hpd;
+        }
+        // Even a failed preferred-mode activation leaves a valid connector
+        // inventory. It must not publish the former monitor's modes.
+        publish_outputs();
+    }
+    let config = result?;
     if let Some(link) = mst.and_then(|port| boot.display_mst(port)) {
         for (state, output) in OUTPUT_STATE.lock().iter_mut().zip(&link.outputs) {
             state.reconcile_mst(output.as_ref());
@@ -1474,10 +1527,11 @@ fn monitor_order(pending: u8) -> impl Iterator<Item = u8> {
 }
 
 fn pending_display_work(boot: &boot::ColdBoot) -> bool {
-    (0..4).any(|p| {
-        boot.display_teardown_status(p)
-            .is_some_and(|s| s.next != boot::TeardownStep::Complete)
-    })
+    boot.display_modesets().iter().any(Option::is_some)
+        || (0..4).any(|p| {
+            boot.display_teardown_status(p)
+                .is_some_and(|s| s.next != boot::TeardownStep::Complete)
+        })
 }
 
 /// Physical HPD describes the root only. MST output presence comes from the
@@ -1534,7 +1588,13 @@ async unsafe fn retire_monitored_display(
                 m.modes.iter().flatten().copied().collect()
             };
             output.shown = None;
-        } else if unplugged {
+        } else {
+            output.sst_modes = if unplugged {
+                output.sst_present = false;
+                Vec::new()
+            } else {
+                m.modes.iter().flatten().copied().collect()
+            };
             output.shown = None;
         }
     }
@@ -1555,6 +1615,15 @@ pub async unsafe fn monitor_displays(
     let mut steps = Vec::new();
     let mut owner = OWNER.lock().await;
     let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
+    // Cancellation may have lost the caller's configuration during a later
+    // pipe startup or asynchronous adoption. Restore actual completed witnesses
+    // and retire them through the usual CPU withdrawal and native journal.
+    let recovered = boot.restore_modesets(&mut displays.lit)?;
+    for pipe in (0..4u8).filter(|p| recovered & (1 << p) != 0) {
+        let m = displays.lit[usize::from(pipe)].unwrap();
+        let unplugged = boot.display_hpd(m.selection.port) == Ok(false);
+        boot.begin_modeset_teardown(&m, unplugged)?;
+    }
     // Failed activations have no Modeset in Displays. Finish their recorded
     // abort before topology service or selecting an already-lit sibling.
     for pipe in 0..4 {
@@ -1604,6 +1673,18 @@ pub async unsafe fn monitor_displays(
         })
         .fold(0u8, |mask, p| mask | (1 << p));
     let mut relight = false;
+    if mst_port.is_none() {
+        for (k, &(port, _)) in outputs.iter().enumerate() {
+            if let Ok(present) = boot.display_hpd(port) {
+                let mut state = OUTPUT_STATE.lock();
+                let o = &mut state[k];
+                // A disabled port still needs a new EDID/admission snapshot
+                // when HPD rises. Physical removal needs no AUX transaction.
+                relight |= o.observe_sst_hpd(present);
+            }
+        }
+        publish_outputs();
+    }
     if let Some(port) = mst_port {
         if pending_mask == 0
             && boot.display_hpd(port) == Ok(true)
@@ -2164,6 +2245,60 @@ pub async fn poll_interrupts() -> Result<crate::amdgpu_ih7::Batch, boot::Error> 
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn navi48_dark_sst_connector_preserves_disable_and_invalidates_replacement() -> TestResult {
+        let timing = Timing {
+            pixel_clock_khz: 148500,
+            h_active: 1920,
+            h_total: 2200,
+            h_front_porch: 88,
+            h_sync_width: 44,
+            v_active: 1080,
+            v_total: 1125,
+            v_front_porch: 4,
+            v_sync_width: 5,
+            h_sync_positive: true,
+            v_sync_positive: true,
+        };
+        let mut output = boot::SstOutput {
+            port: 2,
+            edid: alloc::vec![0; 256],
+            modes: alloc::vec![timing],
+        };
+        let mut state = OutputState::new();
+        state.active = false;
+        state.reconcile_sst(Some(&output));
+        assert!(state.sst_present && state.published().is_none());
+        assert!(!state.published_active());
+        let wire = crate::amdgpu_navi48_kms::timing_wire(&timing);
+        assert_eq!(state.find_mode(&wire), Some(timing));
+        state.requested = Some(timing);
+        assert!(!state.observe_sst_hpd(true));
+        assert!(!state.observe_sst_hpd(false));
+        assert!(!state.sst_present && state.offered().is_empty());
+        assert_eq!(state.requested, Some(timing));
+        assert!(state.observe_sst_hpd(true));
+        assert!(!state.observe_sst_hpd(true));
+        state.reconcile_sst(Some(&output));
+        assert!(!state.active && state.published().is_none());
+        assert_eq!(state.requested, Some(timing));
+        assert_eq!(state.find_mode(&wire), Some(timing));
+        // Extension changes invalidate requests even with an identical base.
+        output.edid[128] = 1;
+        output.modes.clear();
+        state.reconcile_sst(Some(&output));
+        assert!(state.sst_present && !state.active);
+        assert!(state.requested.is_none() && state.offered().is_empty());
+        let mut initially_absent = OutputState::new();
+        initially_absent.active = false;
+        assert!(initially_absent.observe_sst_hpd(true));
+        assert!(!initially_absent.observe_sst_hpd(true));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_dark_sst_connector_preserves_disable_and_invalidates_replacement
+    );
 
     fn navi48_mst_disabled_connector_survives_hotplug() -> TestResult {
         let id = boot::MstOutputId {

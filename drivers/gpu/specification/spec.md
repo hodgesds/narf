@@ -1015,6 +1015,43 @@ the original startup error is returned whether cleanup succeeds or fails.
 `display_teardown_status(pipe).activation` identifies unfinished startup
 cleanup, including a failed pipe missing from `Configuration.displays`.
 
+`ColdBoot::display_modesets()` returns the device owner's copies of completed
+Modesets. Each actual startup witness is retained synchronously before another
+pipe can start or platform adoption can suspend. Offered-mode and successful
+retraining updates refresh that record. Successful native stop/unplug removes
+only its pipe; failed/cancelled teardown keeps the handle. These are historical
+ownership records, not fresh link/fetch health or permission to reclaim memory.
+New single/MST/multi-display configurations reject while any record remains.
+This prevents a dropped configuration or exited monitor from losing completed
+streams even if the caller's temporary vector disappears.
+
+At the next monitor pass, missing caller handles are restored from these records
+and scheduled for ordinary teardown, including CPU withdrawal and fresh surface
+release. All conflicting caller records are rejected before copying any handle;
+existing siblings are preserved. Recovery never clears another pipe's pending
+activation, native failed state or cancellation marker. A cancelled native phase
+can still block the entire owner; the retained handles remain available for
+diagnosis and eventual reconciliation/reset.
+
+`ColdBoot::display_sst_outputs()` retains physical DP/HDMI connector EDIDs and
+independent timing lists from the latest `modeset_displays` probe, including
+disabled or unadmitted sinks. Dark timings must pass native link/format/depth/DSC
+selection and full joint DML beside every running stream. Four occupied pipes or
+an already occupied FRL encoder reject another candidate using that resource.
+A preferred mode which cannot fit does not hide fitting EDID alternatives.
+These lists reserve no resources; enable still runs full configuration admission.
+An all-off/no-lightable-mode configuration returns an empty `Configuration` after
+querying board clock limits, without active-display floors, pipe clocks, link
+startup or scanout allocation. Valid EDIDs survive an admission/startup error;
+failed probes do not retain the former monitor's inventory.
+
+KMS publishes a connected dark physical sink's EDID and admitted modes without
+inventing a CRTC mode or framebuffer. Base or extension EDID changes invalidate
+old requested/offered timings. Disable intent survives same-connector replug;
+HPD loss removes the public inventory, and HPD rise on a disabled port requests
+reprobe/re-admission even with no active CRTC. This uses the existing whole
+configuration relight policy, which can briefly blank connected siblings.
+
 Startup checkpoints the inverse of each completed link, frontend, video and
 scanout phase before the next operation can suspend or fail. This covers TMDS,
 legacy DP SST/MST, UHBR and FRL: TMDS/FRL link completion starts cleanup at SCDC,

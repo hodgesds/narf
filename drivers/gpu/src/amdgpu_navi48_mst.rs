@@ -710,6 +710,8 @@ impl ColdBoot {
         pipes: &[Option<u8>],
     ) -> Result<Configuration, ModesetError> {
         self.teardowns.check_idle()?;
+        self.modesets.check_stopped()?;
+        self.sst_outputs.clear();
         if pipes.is_empty()
             || pipes.len() > modeset::MAX_DISPLAYS
             || pipes.iter().flatten().any(|&p| p >= 4)
@@ -820,6 +822,7 @@ impl ColdBoot {
                 .map(|d| d.1.clone())
                 .unwrap_or_default();
             lit[k].modes = self.offered_modes(&soc, &lit, k, &edid);
+            self.modesets.retain(lit[k]);
         }
         let running: Vec<_> = lit.iter().map(|m| m.selection).collect();
         if failed.is_none() {

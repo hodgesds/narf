@@ -454,6 +454,9 @@ pub struct ColdBoot {
     /// Ports running DP MST, by `display_paths` index.
     mst: alloc::collections::BTreeMap<usize, mst::MstLink>,
     teardowns: teardown::Teardowns,
+    /// Completed modesets survive a dropped configuration/monitor future.
+    modesets: modeset::RetainedModesets,
+    sst_outputs: Vec<modeset::SstOutput>,
 }
 impl ColdBoot {
     /// # Safety
@@ -581,6 +584,8 @@ impl ColdBoot {
             otg,
             mst: alloc::collections::BTreeMap::new(),
             teardowns: teardown::Teardowns::new(),
+            modesets: modeset::RetainedModesets::new(),
+            sst_outputs: Vec::new(),
             sequence: Sequence {
                 backend: Hardware {
                     gpu: saved,
@@ -2507,7 +2512,7 @@ mod teardown;
 pub use modeset::{
     broadcast_rgb, frl_audio, frl_cap, frl_carries, frl_enabled, frl_link, limited_range, max_bpc,
     set_broadcast_rgb, set_frl, set_max_bpc, Configuration, FrlRate, Health, InheritedRetired,
-    Modeset, ModesetError, MstStream, Selection, BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL,
+    Modeset, ModesetError, MstStream, Selection, SstOutput, BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL,
     BROADCAST_RGB_LIMITED,
 };
 pub use teardown::{TeardownStatus, TeardownStep};

@@ -12,6 +12,10 @@ use crate::amdgpu_dcn401_dml as dml;
 use crate::amdgpu_dml::Timing;
 use crate::dp_link_training::LinkRate;
 
+#[path = "amdgpu_navi48_sst.rs"]
+mod sst;
+pub use sst::SstOutput;
+
 /// The DIO stream and pipe are independent of the PHY; the first native
 /// scanout uses one index for both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -358,7 +362,7 @@ pub fn limited_range(broadcast_rgb: u8) -> bool {
     broadcast_rgb == BROADCAST_RGB_LIMITED
 }
 
-/// The result of a successful modeset, retained by the caller for teardown.
+/// A successful modeset, retained by both the caller and device owner for teardown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Modeset {
     pub selection: Selection,
@@ -379,6 +383,59 @@ pub const MAX_MODES: usize = 16;
 pub struct Configuration {
     pub displays: Vec<Modeset>,
     pub failed: Option<ModesetError>,
+}
+
+/// Keep the actual completed startup witnesses in the device owner until
+/// native teardown completes, including while callers are publishing them.
+#[derive(Debug)]
+pub(super) struct RetainedModesets([Option<Modeset>; 4]);
+impl RetainedModesets {
+    pub(super) fn new() -> Self {
+        Self([None; 4])
+    }
+    pub(super) fn retain(&mut self, m: Modeset) {
+        self.0[usize::from(m.pipe)] = Some(m);
+    }
+    fn stopped(&mut self, pipe: u8) {
+        self.0[usize::from(pipe)] = None;
+    }
+    pub(super) fn check_stopped(&self) -> Result<(), ModesetError> {
+        if self.0.iter().any(Option::is_some) {
+            return Err(otg::Error::Busy.into());
+        }
+        Ok(())
+    }
+    fn restore(&self, to: &mut [Option<Modeset>; 4]) -> Result<u8, ModesetError> {
+        // Validate the whole transfer before changing any caller's records.
+        for (old, retained) in to.iter().zip(&self.0) {
+            if old.is_some() && retained.is_some() && old != retained {
+                return Err(otg::Error::Busy.into());
+            }
+        }
+        let mut recovered = 0;
+        for (pipe, (old, retained)) in to.iter_mut().zip(&self.0).enumerate() {
+            if old.is_none() && retained.is_some() {
+                *old = *retained;
+                recovered |= 1 << pipe;
+            }
+        }
+        Ok(recovered)
+    }
+}
+
+impl ColdBoot {
+    /// Actual completed startup witnesses, retained through failed/cancelled
+    /// configuration publication and teardown. This is not a fresh health check.
+    pub fn display_modesets(&self) -> [Option<Modeset>; 4] {
+        self.modesets.0
+    }
+    /// Recover missing caller handles without overwriting a different incarnation.
+    pub(crate) fn restore_modesets(
+        &self,
+        to: &mut [Option<Modeset>; 4],
+    ) -> Result<u8, ModesetError> {
+        self.modesets.restore(to)
+    }
 }
 
 /// A selected sink's whole scanned EDID (extensions included).
@@ -1467,6 +1524,7 @@ impl ColdBoot {
         want: Option<Timing>,
     ) -> Result<Modeset, ModesetError> {
         self.teardowns.check_idle()?;
+        self.modesets.check_stopped()?;
         if pipe >= 4 {
             return Err(ModesetError::Display(otg::Error::Invalid));
         }
@@ -1486,6 +1544,7 @@ impl ColdBoot {
         let mut lit =
             unsafe { self.light(pipe, selection, plans[0], &mut |_, y, row| fill(y, row)) }.await?;
         lit.modes = self.offered_modes(&soc, &[lit], 0, &edid_of(&ports, &paths, &selection));
+        self.modesets.retain(lit);
         Ok(lit)
     }
     /// Light every lightable sink (`select_all`) as one configuration, each
@@ -1497,6 +1556,8 @@ impl ColdBoot {
     /// timing asked of that port's sink; `fill(pipe, y, row)` supplies each
     /// visible row before that display's fetch starts. If a display fails to
     /// light, the ones before it stay lit and are returned with the failure.
+    /// Completed displays remain in display_modesets even when this future is
+    /// cancelled before returning their configuration.
     /// # Safety
     /// As for `modeset_display`: every display of this owner stopped.
     pub async unsafe fn modeset_displays(
@@ -1506,24 +1567,37 @@ impl ColdBoot {
         pipe_of: impl Fn(usize) -> Option<u8>,
     ) -> Result<Configuration, ModesetError> {
         self.teardowns.check_idle()?;
+        self.modesets.check_stopped()?;
+        self.sst_outputs.clear();
         let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
         let paths = self
             .display_paths()
             .map_err(|_| ModesetError::NoSink)?
             .to_vec();
-        let mut selections = select_all(&paths, &ports, max_bpc(), &want)?;
+        self.update_sst_outputs(None, &paths, &ports, &[]);
+        let mut selections = match select_all(&paths, &ports, max_bpc(), &want) {
+            Ok(selections) => selections,
+            // A connected sink without a carrying preferred mode can still
+            // offer other modes; an all-off configuration has no stream work.
+            Err(ModesetError::NoSink | ModesetError::Link) => Vec::new(),
+            Err(e) => return Err(e),
+        };
         selections.retain(|s| pipe_of(s.port).is_some_and(|p| p < 4));
-        if selections.is_empty() {
-            return Err(ModesetError::NoSink);
-        }
         // "Broadcast RGB" is RGB's: YCbCr is limited range by itself.
         let limited = limited_range(broadcast_rgb());
         for s in &mut selections {
             s.limited = limited && !s.ycbcr420;
         }
         let pipes: Vec<u8> = selections.iter().filter_map(|s| pipe_of(s.port)).collect();
-        self.select_display(pipes[0])?;
+        self.select_display(pipes.first().copied().unwrap_or(0))?;
         let soc = self.prepare_configuration(&selections).await?;
+        self.update_sst_outputs(Some(&soc), &paths, &ports, &[]);
+        if selections.is_empty() {
+            return Ok(Configuration {
+                displays: Vec::new(),
+                failed: None,
+            });
+        }
         refine_dsc(&soc, &mut selections)?;
         let plans = admit_displays(&soc, &selections).map_err(otg::Error::Admission)?;
         selections.truncate(plans.len());
@@ -1545,7 +1619,9 @@ impl ColdBoot {
         for k in 0..lit.len() {
             let edid = edid_of(&ports, &paths, &lit[k].selection);
             lit[k].modes = self.offered_modes(&soc, &lit, k, &edid);
+            self.modesets.retain(lit[k]);
         }
+        self.update_sst_outputs(Some(&soc), &paths, &ports, &lit);
         Ok(Configuration {
             displays: lit,
             failed,
@@ -1624,6 +1700,9 @@ impl ColdBoot {
         // SAFETY: the caller owns this unpublished activation and every writer.
         match unsafe { self.light_inner(pipe, selection, plan, fill) }.await {
             Ok(m) => {
+                // No await between native completion and retained ownership.
+                // A later pipe or platform adoption can suspend or be dropped.
+                self.modesets.retain(m);
                 self.teardowns.finish_activation(pipe, true);
                 Ok(m)
             }
@@ -2116,6 +2195,7 @@ impl ColdBoot {
                 self.stop_display_scanout(m.pipe).await?;
                 self.stop_uhbr(port, false).await?;
                 (m.selection, m.scanout) = self.start_link(m.selection, m.pipe).await?;
+                self.modesets.retain(*m);
                 return Ok(());
             }
             if m.selection.audio.is_some() {
@@ -2126,6 +2206,7 @@ impl ColdBoot {
             self.stop_display_dp_frontend(port).await?;
             self.stop_display_dp_link(port).await?;
             (m.selection, m.scanout) = self.start_link(m.selection, m.pipe).await?;
+            self.modesets.retain(*m);
         }
         Ok(())
     }
@@ -2138,7 +2219,9 @@ impl ColdBoot {
     /// As for `stop_modeset`.
     pub async unsafe fn unplug_modeset(&mut self, m: &Modeset) -> Result<(), ModesetError> {
         // SAFETY: caller has withdrawn CPU writers and retains exclusive owners.
-        unsafe { self.teardown_modeset(m, true) }.await
+        unsafe { self.teardown_modeset(m, true) }.await?;
+        self.modesets.stopped(m.pipe);
+        Ok(())
     }
     /// Reverse a successful modeset down to a disabled PHY with timing and
     /// planes retired. The surface allocation is retained by its pipe.
@@ -2148,7 +2231,9 @@ impl ColdBoot {
     /// As for `modeset_display`; stop every CPU writer of the surface first.
     pub async unsafe fn stop_modeset(&mut self, m: &Modeset) -> Result<(), ModesetError> {
         // SAFETY: caller has withdrawn CPU writers and retains exclusive owners.
-        unsafe { self.teardown_modeset(m, false) }.await
+        unsafe { self.teardown_modeset(m, false) }.await?;
+        self.modesets.stopped(m.pipe);
+        Ok(())
     }
     /// Linux's write_scdc_data before the TMDS link starts: with SCDC, read
     /// the sink version, answer version 1 with source version 1, then set
