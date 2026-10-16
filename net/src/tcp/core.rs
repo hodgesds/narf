@@ -2796,11 +2796,13 @@ fn effective_advertised_window(t: &mut Tcb) -> u16 {
 /// immediate pure ACK/window update. `rcv_wnd` records the raw window carried
 /// by the most recent outbound segment. Waiting until at least one peer MSS
 /// has reopened avoids silly-window updates while still accumulating a series
-/// of small reads until forward progress can resume.
-fn receive_window_update_due(t: &Tcb) -> bool {
+/// of small reads until forward progress can resume. A previously closed
+/// window is the exception: advertising even one freed byte promptly releases
+/// the peer from its exponentially backed-off persist probe timer.
+pub(crate) fn receive_window_update_due(t: &Tcb) -> bool {
     let current = t.recv_buf.window();
     let threshold = u32::from(t.opts.peer_mss.max(MIN_MSS));
-    current >= t.rcv_wnd.saturating_add(threshold)
+    current > t.rcv_wnd && (t.rcv_wnd == 0 || current >= t.rcv_wnd.saturating_add(threshold))
 }
 
 fn tsval_now() -> u32 {

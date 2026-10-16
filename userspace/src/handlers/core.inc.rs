@@ -11289,6 +11289,8 @@ pub(crate) fn vfork_parent_wait(ctx: &mut dyn TrapContext, child_pid: u64, paren
         if let Some(hook) = crate::user_task::yield_hook() {
             // The aarch64 polling-future executor returns through the legacy
             // yield hook instead of own_stack_park.
+            // SAFETY: syscall dispatch owns the live user context until the
+            // yield hook saves it and resumes this continuation.
             let uc = unsafe { &*uctx };
             uc.sleep_deadline_ns
                 .store(u64::MAX, core::sync::atomic::Ordering::Release);
@@ -14001,50 +14003,54 @@ fn park_reexecute_on_io_until(
     durable_io_wait: bool,
 ) -> bool {
     use core::sync::atomic::Ordering;
-    if let (Some(uctx), Some(hook)) = (
-        crate::user_task::current_user_task(),
-        crate::user_task::yield_hook(),
-    ) {
-        // Rewind past the architecture's syscall instruction so re-entry
-        // re-runs this syscall with its original args (`syscall`/`int 0x80`
-        // are 2 bytes; AArch64 `svc` is one fixed-width 4-byte instruction).
-        #[cfg(target_arch = "x86_64")]
-        const SYSCALL_INSN_LEN: u64 = 2;
-        #[cfg(target_arch = "aarch64")]
-        const SYSCALL_INSN_LEN: u64 = 4;
-        let resume_rip = ctx.rip().wrapping_sub(SYSCALL_INSN_LEN);
-        ctx.set_rip(resume_rip);
-        // SAFETY: `uctx` is the live per-task UserTaskCtx from
-        // current_user_task(); we hold the only reference while setting the
-        // deadline + saving the RIP-rewound CPU state before the yield hook
-        // hands the task to the executor.
-        unsafe {
-            let uc = &*uctx;
-            uc.sleep_deadline_ns.store(deadline, Ordering::Release);
-            // Clear a stale futex_uaddr so this park can't mis-route into
-            // the futex branch; snapshot the readiness generation for the
-            // check→park lost-wake guard.
-            uc.futex_uaddr.store(0, Ordering::Release);
-            uc.net_io_wait.store(true, Ordering::Release);
-            uc.durable_io_wait
-                .store(durable_io_wait, Ordering::Release);
-            uc.epoll_park_gen
-                .store(narf_net::readiness::generation(), Ordering::Release);
-            ctx.save_user_state(uc.state.get() as *mut u8);
-            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-            if narf_scheduler::stackful::user_own_stack_enabled() {
-                own_stack_block(ctx);
-                // `own_stack_block` returns only after the park has ended. It
-                // normally clears the marker itself; cover the arm-raced-ready
-                // path too so a later generic I/O wait cannot inherit it.
-                uc.durable_io_wait.store(false, Ordering::Release);
-                return true;
-            }
+    let Some(uctx) = crate::user_task::current_user_task() else {
+        return false;
+    };
+    let own_stack = narf_scheduler::stackful::user_own_stack_enabled();
+    let hook = crate::user_task::yield_hook();
+    if !crate::epoll::can_park_with_task_context(own_stack, hook.is_some()) {
+        return false;
+    }
+    // Rewind past the architecture's syscall instruction so re-entry
+    // re-runs this syscall with its original args (`syscall`/`int 0x80`
+    // are 2 bytes; AArch64 `svc` is one fixed-width 4-byte instruction).
+    #[cfg(target_arch = "x86_64")]
+    const SYSCALL_INSN_LEN: u64 = 2;
+    #[cfg(target_arch = "aarch64")]
+    const SYSCALL_INSN_LEN: u64 = 4;
+    let resume_rip = ctx.rip().wrapping_sub(SYSCALL_INSN_LEN);
+    ctx.set_rip(resume_rip);
+    // SAFETY: `uctx` is the live per-task UserTaskCtx from
+    // current_user_task(); we hold the only reference while setting the
+    // deadline + saving the RIP-rewound CPU state before handing the task to
+    // the active executor model.
+    unsafe {
+        let uc = &*uctx;
+        uc.sleep_deadline_ns.store(deadline, Ordering::Release);
+        // Clear a stale futex_uaddr so this park can't mis-route into
+        // the futex branch; snapshot the readiness generation for the
+        // check→park lost-wake guard.
+        uc.futex_uaddr.store(0, Ordering::Release);
+        uc.net_io_wait.store(true, Ordering::Release);
+        uc.durable_io_wait
+            .store(durable_io_wait, Ordering::Release);
+        uc.epoll_park_gen
+            .store(narf_net::readiness::generation(), Ordering::Release);
+        ctx.save_user_state(uc.state.get() as *mut u8);
+        *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+        if own_stack {
+            own_stack_block(ctx);
+            // `own_stack_block` returns only after the park has ended. It
+            // normally clears the marker itself; cover the arm-raced-ready
+            // path too so a later generic I/O wait cannot inherit it.
+            uc.durable_io_wait.store(false, Ordering::Release);
+            return true;
+        }
+        if let Some(hook) = hook {
             hook(uctx);
         }
-        // unreachable — hook() longjmps to the executor
     }
-    false
+    false // The precondition above guarantees the legacy hook is present.
 }
 
 /// Park a blocking syscall on one descriptor's durable readiness cell, then

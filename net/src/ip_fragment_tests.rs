@@ -744,7 +744,18 @@ fn smoke_ipfrag_not_for_us_not_reassembled() -> TestResult {
     reset();
     let dg = udp(5000, 39117, &pattern(1000));
     let mut p = piece(IP_PROTO_UDP, 0x1014, &dg, 0, 504);
-    p[16..20].copy_from_slice(&[192, 0, 2, 9]);
+    // Other kernel smokes register interfaces globally. Pick a TEST-NET
+    // destination which is not any registered interface's primary address,
+    // so this remains a non-local fragment regardless of suite order.
+    let foreign = (1..=u8::MAX)
+        .map(|last| [192, 0, 2, last])
+        .find(|candidate| {
+            !crate::iface::snapshot_all_in(0)
+                .iter()
+                .any(|iface| iface.ipv4 == *candidate)
+        })
+        .unwrap_or([198, 51, 100, 1]);
+    p[16..20].copy_from_slice(&foreign);
     p[10..12].copy_from_slice(&[0, 0]);
     let cs = ip_checksum(&p[..IPV4_HDR_LEN]);
     p[10..12].copy_from_slice(&cs.to_be_bytes());
