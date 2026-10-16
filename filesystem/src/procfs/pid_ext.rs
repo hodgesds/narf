@@ -572,10 +572,14 @@ fn render_stack(_pid: u64) -> String {
 /// that exists in neither kernel, reported for tasks blocked in `poll`,
 /// `read` or `futex`. `ps -o wchan` and anything else keyed on this file was
 /// being told the same wrong thing about every sleeper.
+///
+/// No trailing newline: `proc_pid_wchan` emits the bare symbol (or `0`).
+/// procps prints the file verbatim into the WCHAN column, so a newline split
+/// every `ps -o wchan` row in two.
 fn render_wchan(pid: u64) -> String {
     match super::hook_sched_snapshot(pid).wchan {
-        Some(name) => format!("{}\n", name),
-        None => "0\n".to_string(),
+        Some(name) => name,
+        None => "0".to_string(),
     }
 }
 
@@ -1472,7 +1476,7 @@ fn smoke_sched_files_report_the_tasks_accounting() -> TestResult {
     if !sched.contains("se.sum_exec_runtime                :        1234.567890") {
         return TestResult::Fail("sched should report sum_exec_runtime in ms");
     }
-    if wchan != "read\n" {
+    if wchan != "read" {
         return TestResult::Fail("wchan should name the syscall the task is parked in");
     }
     if syscall != "0 0x4 0x1000 0x200 0x0 0x0 0x0 0x7ffff000 0x401000\n" {
@@ -1503,7 +1507,7 @@ fn smoke_syscall_and_wchan_for_a_running_task() -> TestResult {
     let syscall = render_syscall(1);
     super::__test_sched_snapshot_hook_restore(prev);
 
-    if wchan != "0\n" {
+    if wchan != "0" {
         return TestResult::Fail("wchan for an unparked task should be '0'");
     }
     if syscall != "running\n" {
@@ -1611,13 +1615,13 @@ kernel_test_in!(
 );
 
 /// Smoke: `render_wchan` for an unknown pid (no task-info hook)
-/// returns "0\n" because the fallback state is 'R'.
+/// returns "0" (no newline, as Linux) because the fallback state is 'R'.
 fn smoke_wchan_unknown_pid_returns_zero() -> TestResult {
     let out = render_wchan(u64::MAX);
-    if out == "0\n" {
+    if out == "0" {
         TestResult::Pass
     } else {
-        TestResult::Fail("render_wchan for unknown pid should be '0\\n'")
+        TestResult::Fail("render_wchan for unknown pid should be '0' with no newline")
     }
 }
 kernel_test_in!(
