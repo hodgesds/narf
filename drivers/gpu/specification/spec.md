@@ -985,6 +985,34 @@ abort described below; uncertain owners stay retained. `stop_modeset`
 reverses a success down to a disabled PHY with timing and planes retired; the
 surface allocation remains bound to its pipe.
 
+`amdgpu_frl_training::poll_status` handles live SCDC FRL_Start, FLT_Update
+and Source_Test_Update requests as Linux's `hdmi_frl_poll_status_flag` does.
+`FrlStatusIo::current_ffe` supplies the last acknowledged FFE level; requests
+advance it modulo four and apply the source-test de-emphasis/pre-shoot flags.
+LTP3 is left unchanged outside FLT_no_timeout tests. Each W1C acknowledgement
+clears only its handled flag after source work succeeds. An ordinary retrain
+request returns `true` with FLT_Update still pending, so cancellation before
+retirement cannot lose the request. Native DDC failures propagate.
+
+`FrlLinkUp` retains `training` and `lane_set` alongside per-lane patterns.
+Native pattern/FFE controls accept the selected display's stable link or live
+FRL video/scanout, verifying its PHY, encoder, clocks and stream route. Live
+updates keep both retained link/video records consistent. `UpdatingFrlLink`
+holds ownership across a firmware command; cancellation blocks reuse and a
+command/readback failure enters `Failed`. Video, scanout and allocations stay
+retained. `ColdBoot::display_frl_current_ffe` checks ownership/readback before
+returning the acknowledged level. Source tests may leave the link emitting
+patterns while timing and memory fetch remain owned.
+
+`ColdBoot::check_modeset` checks HPD before any FRL SCDC access and returns
+`Health::FrlRetrain` for an ordinary sink retrain request. The platform monitor
+polls at 200 ms while an FRL display is lit (one second otherwise, with HPD IRQ
+wakeups for both). Retraining uses full writer withdrawal and configuration
+retirement before fresh admission and bounded FRL training/rate fallback;
+siblings may briefly blank. This path does not reset quarantined native owners.
+Source-test-only updates preserve the running configuration. Hardware behavior
+remains unvalidated.
+
 `ColdBoot::begin_modeset_teardown(m, unplugged)` records teardown intent without
 hardware access, before an async CPU-writer withdrawal. `stop_modeset` and
 `unplug_modeset` also begin it automatically. Per-pipe progress stays in the

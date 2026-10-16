@@ -43,6 +43,12 @@ impl Io for FrlIo {
                 self.inner.regs.insert(phy_reg(p, 0x2943), 0x0303_0303);
                 self.inner.regs.insert(phy_reg(p, 0x2931), 0);
             }
+            3 => {
+                self.inner.regs.insert(mux(p), 0);
+            }
+            4 => {
+                self.inner.regs.insert(BASE + 0x59 * 4, 8);
+            }
             _ => {}
         }
         self.inner.read(at)
@@ -72,6 +78,7 @@ enum Step {
     Disable,
 }
 struct Fw {
+    ffe_behavior: u8,
     steps: alloc::vec::Vec<Step>,
     event: Arc<AtomicU8>,
 }
@@ -104,7 +111,15 @@ impl FrlFirmware for Fw {
         lane_set: u8,
     ) -> Result<(), dmub::Error> {
         self.steps.push(Step::Ffe(lane_set));
-        Ok(())
+        match self.ffe_behavior {
+            1 => Err(dmub::Error::CommandTimeout),
+            2 => core::future::pending().await,
+            3 | 4 => {
+                self.event.store(self.ffe_behavior, Ordering::SeqCst);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -133,6 +148,7 @@ fn dcn401_frl_link_starts_trains_and_stops_like_linux() -> TestResult {
             displays: e.displays,
         };
         let mut fw = Fw {
+            ffe_behavior: 0,
             steps: alloc::vec::Vec::new(),
             event,
         };
@@ -183,6 +199,7 @@ fn dcn401_frl_link_starts_trains_and_stops_like_linux() -> TestResult {
         displays: e.displays,
     };
     let mut fw = Fw {
+        ffe_behavior: 0,
         steps: alloc::vec::Vec::new(),
         event: Arc::new(AtomicU8::new(0)),
     };
@@ -204,7 +221,7 @@ kernel_test_in!(
 /// handshake, CRC, double-buffer disable and OTG input, the timing, then
 /// the FIFO reset and enables. Stop: AVMUTE, blank, packets off, timing
 /// off, the link left active for its own stop.
-fn dcn401_frl_video_starts_and_stops_like_linux() -> TestResult {
+fn live_frl_video() -> (Engine<FrlIo>, Fw) {
     let (phy, pipe) = (2u8, 1u8);
     let event = Arc::new(AtomicU8::new(0));
     let mut e = engine();
@@ -224,6 +241,7 @@ fn dcn401_frl_video_starts_and_stops_like_linux() -> TestResult {
         displays: e.displays,
     };
     let mut fw = Fw {
+        ffe_behavior: 0,
         steps: alloc::vec::Vec::new(),
         event,
     };
@@ -263,6 +281,11 @@ fn dcn401_frl_video_starts_and_stops_like_linux() -> TestResult {
     if let Err(err) = run(e.start_frl_video(path(phy), request, c)) {
         panic!("FRL video: {err:?}");
     }
+    (e, fw)
+}
+fn dcn401_frl_video_starts_and_stops_like_linux() -> TestResult {
+    let (phy, pipe) = (2u8, 1u8);
+    let (mut e, mut fw) = live_frl_video();
     let r = |e: &Engine<FrlIo>, reg: u64| e.io.inner.regs.get(&frl(reg)).copied().unwrap_or(0);
     let checks = [
         (0x8e0, 0x3_0301, 0),
@@ -307,4 +330,181 @@ fn dcn401_frl_video_starts_and_stops_like_linux() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-frl-link",
     dcn401_frl_video_starts_and_stops_like_linux
+);
+
+/// Live source tests retain the stream/timing and update both link records.
+/// Normal teardown must still work with the link sending test patterns.
+fn dcn401_frl_live_controls_retain_video() -> TestResult {
+    let (mut e, mut fw) = live_frl_video();
+    let before = e.status.frl_video_running.unwrap();
+    let writes = e.io.inner.writes.len();
+    assert_eq!(e.frl_training_pattern(path(1), [2; 4]), Err(Error::Invalid));
+    assert_eq!(run(e.frl_ffe(&mut fw, path(2), 4)), Err(Error::Invalid));
+    assert_eq!(e.io.inner.writes.len(), writes);
+    assert_eq!(fw.steps.len(), 1);
+    run(e.frl_ffe(&mut fw, path(2), 0x63)).unwrap();
+    assert_eq!(e.frl_current_ffe(path(2)), Ok(3));
+    assert!(!e.status.frl_link.unwrap().training);
+    e.frl_training_pattern(path(2), [2, 7, 0xff, 1]).unwrap();
+    assert_eq!(e.status.state, State::FrlVideoRunning(1));
+    let after = e.status.frl_video_running.unwrap();
+    assert_eq!(after.timing, before.timing);
+    assert_eq!(after.request, before.request);
+    assert_eq!(after.link, e.status.frl_link.unwrap());
+    assert_eq!(after.link.patterns, [2, 7, 0, 1]);
+    assert!(after.link.training);
+    e.frl_video_verify_running(&after).unwrap();
+    run(e.stop_frl_video(path(2))).unwrap();
+    run(e.stop_frl_link(&mut fw, path(2))).unwrap();
+    assert_eq!(e.status.state, State::FrlDisabled);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-frl-link",
+    dcn401_frl_live_controls_retain_video
+);
+
+/// Firmware failure or drift after a command is uncertain: keep every owner
+/// and block another command/teardown. Preflight drift performs no mutation.
+fn dcn401_frl_live_ffe_failures_retain_owners() -> TestResult {
+    for behavior in [1, 3] {
+        let (mut e, mut fw) = live_frl_video();
+        let link = e.status.frl_link;
+        let video = e.status.frl_video_running;
+        fw.ffe_behavior = behavior;
+        assert!(run(e.frl_ffe(&mut fw, path(2), 1)).is_err());
+        assert!(matches!(e.status.state, State::Failed(_)));
+        assert_eq!(e.status.frl_link, link);
+        assert_eq!(e.status.frl_video_running, video);
+        assert_eq!(run(e.stop_frl_video(path(2))), Err(Error::Busy));
+        assert_eq!(e.frl_training_pattern(path(2), [0; 4]), Err(Error::Busy));
+    }
+    let (mut e, mut fw) = live_frl_video();
+    fw.ffe_behavior = 4;
+    assert_eq!(
+        run(e.frl_ffe(&mut fw, path(2), 1)),
+        Err(Error::Readback(BASE + 0x59 * 4))
+    );
+    assert!(matches!(e.status.state, State::Failed(_)));
+    // Firmware acknowledged the new setting, but the stream route drifted.
+    assert_eq!(e.status.frl_link.unwrap().lane_set, 1);
+    assert_eq!(
+        e.status.frl_video_running.unwrap().link,
+        e.status.frl_link.unwrap()
+    );
+    let (mut e, mut fw) = live_frl_video();
+    e.io.inner.regs.insert(BASE + 0x59 * 4, 8); // Another pipe's stream clock.
+    let writes = e.io.inner.writes.len();
+    assert!(matches!(
+        run(e.frl_ffe(&mut fw, path(2), 1)),
+        Err(Error::Readback(_))
+    ));
+    assert_eq!(fw.steps.len(), 1);
+    assert_eq!(e.io.inner.writes.len(), writes);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-frl-link",
+    dcn401_frl_live_ffe_failures_retain_owners
+);
+
+fn dcn401_frl_cancelled_ffe_quarantines_live_video() -> TestResult {
+    use core::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    let (mut e, mut fw) = live_frl_video();
+    let link = e.status.frl_link;
+    let video = e.status.frl_video_running;
+    fw.ffe_behavior = 2;
+    {
+        let mut future = core::pin::pin!(e.frl_ffe(&mut fw, path(2), 1));
+        assert_eq!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        );
+    }
+    assert_eq!(e.status.state, State::UpdatingFrlLink(2));
+    assert!(!e.status.state.settled());
+    assert_eq!(e.select_display(3), Err(Error::Busy));
+    assert_eq!(e.status.frl_link, link);
+    assert_eq!(e.status.frl_video_running, video);
+    assert_eq!(e.frl_current_ffe(path(2)), Err(Error::Busy));
+    assert_eq!(e.frl_training_pattern(path(2), [0; 4]), Err(Error::Busy));
+    assert_eq!(run(e.frl_ffe(&mut fw, path(2), 2)), Err(Error::Busy));
+    assert_eq!(run(e.stop_frl_video(path(2))), Err(Error::Busy));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-frl-link",
+    dcn401_frl_cancelled_ffe_quarantines_live_video
+);
+
+/// Scanout controls require a matching retained fetch record and must leave
+/// its allocation/deadline evidence intact, even when firmware is cancelled.
+fn dcn401_frl_controls_bind_live_scanout() -> TestResult {
+    use core::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    let (mut e, mut fw) = live_frl_video();
+    let scanout = ScanoutRunning {
+        pipe: 1,
+        stream: 1,
+        plan: dml::admit(
+            &dml::Soc {
+                umc_channels: 16,
+                uclk_khz: 1_250_000,
+                fclk_khz: [300_000, 2_500_000],
+                dcfclk_khz: [200_000, 1_564_000],
+                socclk_khz: 300_000,
+                dispclk_max_khz: 2_000_000,
+                dppclk_max_khz: 2_000_000,
+                dentist_vco_khz: 4_500_000,
+                dchub_refclk_khz: 50_000,
+            },
+            &dml::Mode {
+                timing: request(1).timing,
+                pitch: 1920,
+                ycbcr420: false,
+                dsc: None,
+            },
+        )
+        .unwrap(),
+        address: 0x8_0010_0000,
+        frame_before: 1,
+        frame_after: 2,
+    };
+    e.status.state = State::ScanoutRunning(1);
+    assert_eq!(e.frl_training_pattern(path(2), [1; 4]), Err(Error::Invalid));
+    e.status.scanout = Some(ScanoutRunning {
+        stream: 0,
+        ..scanout
+    });
+    assert_eq!(e.frl_current_ffe(path(2)), Err(Error::Invalid));
+    e.status.scanout = Some(scanout);
+    e.frl_training_pattern(path(2), [1; 4]).unwrap();
+    run(e.frl_ffe(&mut fw, path(2), 2)).unwrap();
+    assert_eq!(e.status.state, State::ScanoutRunning(1));
+    assert_eq!(e.status.scanout, Some(scanout));
+    fw.ffe_behavior = 2;
+    {
+        let mut future = core::pin::pin!(e.frl_ffe(&mut fw, path(2), 3));
+        assert_eq!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        );
+    }
+    assert_eq!(e.status.state, State::UpdatingFrlLink(2));
+    assert_eq!(e.status.scanout, Some(scanout));
+    assert_eq!(e.select_display(3), Err(Error::Busy));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-frl-link",
+    dcn401_frl_controls_bind_live_scanout
 );

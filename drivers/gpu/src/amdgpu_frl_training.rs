@@ -16,6 +16,7 @@ pub const SOURCE_TEST: u8 = 0x35;
 pub const STATUS_FLAGS_0: u8 = 0x40;
 pub const LTP_REQ: u8 = 0x41;
 const FRL_START: u8 = 0x10;
+const SOURCE_TEST_UPDATE: u8 = 0x08;
 const FLT_UPDATE: u8 = 0x20;
 const FLT_READY: u8 = 0x40;
 const FLT_NO_TIMEOUT: u8 = 0x20;
@@ -57,6 +58,51 @@ pub trait FrlTrainer {
     /// dpcs401_program_eq_setting's lane set.
     fn ffe(&mut self, lane_set: u8) -> impl Future<Output = Result<(), Self::Error>>;
     fn delay(&mut self, us: u64) -> impl Future<Output = ()>;
+}
+
+/// Live status additionally needs the last acknowledged transmitter FFE level.
+pub trait FrlStatusIo: FrlTrainer {
+    fn current_ffe(&mut self) -> Result<u8, Self::Error>;
+}
+
+/// Linux's hdmi_frl_poll_status_flag. Returns true when the caller must stop
+/// and retrain the display through its normal ownership/retirement path.
+/// That request stays pending until teardown clears it, so cancellation of
+/// the monitor cannot lose it. Source-test changes are acknowledged only
+/// after the source has accepted them; unrelated W1C flags are preserved.
+pub async fn poll_status<T: FrlStatusIo>(t: &mut T) -> Result<bool, T::Error> {
+    let test = t.scdc_read(SOURCE_TEST).await?;
+    let no_timeout = test & FLT_NO_TIMEOUT != 0;
+    let update = t.scdc_read(UPDATE_0).await?;
+    if update & FRL_START != 0 {
+        t.scdc_write(UPDATE_0, FRL_START).await?;
+    }
+    if update & FLT_UPDATE != 0 {
+        let a = t.scdc_read(LTP_REQ).await?;
+        let b = t.scdc_read(LTP_REQ + 1).await?;
+        let lanes = [a & 0xf, a >> 4, b & 0xf, b >> 4];
+        t.pattern(lanes.map(|l| {
+            if l == 3 && !no_timeout {
+                0xf // Leave LTP3 unchanged outside a source test.
+            } else {
+                l.wrapping_sub(1)
+            }
+        }))?;
+        if lanes.contains(&0xe) {
+            let level = (t.current_ffe()? + 1) & FFE_LEVELS;
+            t.ffe(lane_set(level, test)).await?;
+        } else if !no_timeout {
+            return Ok(true);
+        }
+        t.scdc_write(UPDATE_0, FLT_UPDATE).await?;
+    }
+    if update & SOURCE_TEST_UPDATE != 0 {
+        let test = t.scdc_read(SOURCE_TEST).await?;
+        let level = t.current_ffe()?;
+        t.ffe(lane_set(level, test)).await?;
+        t.scdc_write(UPDATE_0, SOURCE_TEST_UPDATE).await?;
+    }
+    Ok(false)
 }
 
 /// dpcs401_program_eq_setting: the FFE level, then de-emphasis-only (bit

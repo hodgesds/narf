@@ -472,6 +472,12 @@ monitor pass restores missing handles and schedules normal withdrawal/retirement
 rejecting conflicting incarnations before changing caller records. New
 configurations remain blocked until these streams stop. Native cancellation
 quarantine and fresh surface-release checks remain binding.
+Live FRL monitoring now handles SCDC FRL_Start, FLT_Update and Source_Test_Update
+at a 200 ms fallback cadence. Source-test patterns/FFE updates preserve owned
+video/fetch; interrupted firmware work quarantines the display. Ordinary
+retrain requests stay pending until full configuration retirement and fresh
+admission/training, including supported rate fallback. Physical FRL transitions
+and source-test acceptance remain unvalidated.
 HDCP/protected output is tracked separately in
 `drivers/gpu/research/navi48-protected-output.md`, including TA firmware,
 protocol, credential authorization, isolation and physical acceptance gates.

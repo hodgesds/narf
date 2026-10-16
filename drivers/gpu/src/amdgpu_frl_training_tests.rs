@@ -15,6 +15,8 @@ struct Sink {
     requests: VecDeque<[u8; 2]>,
     events: Vec<Event>,
     delays: Vec<u64>,
+    ffe: u8,
+    fail: Option<u8>,
 }
 impl Sink {
     fn new(requests: &[[u8; 4]]) -> Self {
@@ -29,12 +31,17 @@ impl Sink {
                 .collect(),
             events: Vec::new(),
             delays: Vec::new(),
+            ffe: 0,
+            fail: None,
         }
     }
 }
 impl FrlTrainer for Sink {
     type Error = ();
     async fn scdc_read(&mut self, offset: u8) -> Result<u8, ()> {
+        if self.fail == Some(offset) {
+            return Err(());
+        }
         // Training underway: each poll of Update_0 raises the next request.
         if offset == UPDATE_0 && self.regs[usize::from(CONFIG_1)] != 0 {
             if let Some(req) = self.requests.pop_front() {
@@ -55,15 +62,27 @@ impl FrlTrainer for Sink {
         Ok(())
     }
     fn pattern(&mut self, patterns: [u8; 4]) -> Result<(), ()> {
+        if self.fail == Some(0xfe) {
+            return Err(());
+        }
         self.events.push(Event::Pattern(patterns));
         Ok(())
     }
     async fn ffe(&mut self, lane_set: u8) -> Result<(), ()> {
+        if self.fail == Some(0xff) {
+            return Err(());
+        }
+        self.ffe = lane_set & 3;
         self.events.push(Event::Ffe(lane_set));
         Ok(())
     }
     async fn delay(&mut self, us: u64) {
         self.delays.push(us);
+    }
+}
+impl FrlStatusIo for Sink {
+    fn current_ffe(&mut self) -> Result<u8, ()> {
+        Ok(self.ffe)
     }
 }
 fn run<T>(f: impl Future<Output = T>) -> T {
@@ -166,4 +185,96 @@ fn frl_training_times_out_and_falls_back_like_linux() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/frl-training",
     frl_training_times_out_and_falls_back_like_linux
+);
+
+/// W1C acknowledgements must follow completed source work and preserve
+/// unrelated flags. No-timeout tests keep their patterns, while ordinary
+/// requests remain pending until the caller retires and retrains the link.
+fn frl_live_status_handles_tests_and_retrain() -> TestResult {
+    let mut s = Sink::new(&[]);
+    s.regs[UPDATE_0 as usize] = 0x81;
+    assert_eq!(run(poll_status(&mut s)), Ok(false));
+    assert!(s.events.is_empty());
+    s.regs[UPDATE_0 as usize] |= FRL_START;
+    assert_eq!(run(poll_status(&mut s)), Ok(false));
+    assert_eq!(s.events, [Event::Write(UPDATE_0, FRL_START)]);
+    assert_eq!(s.regs[UPDATE_0 as usize], 0x81);
+
+    // All FFE levels, wrap 3 -> 0, and all Source_Test only-flags.
+    for (test, flags) in [(0, 0), (2, 0x40), (4, 0x20), (8, 0x60)] {
+        for level in 0..4 {
+            let mut s = Sink::new(&[]);
+            s.ffe = level;
+            s.regs[SOURCE_TEST as usize] = test;
+            s.regs[UPDATE_0 as usize] = 0x81 | FRL_START | FLT_UPDATE | SOURCE_TEST_UPDATE;
+            s.regs[LTP_REQ as usize] = 0x3e;
+            s.regs[LTP_REQ as usize + 1] = 0x84;
+            assert_eq!(run(poll_status(&mut s)), Ok(false));
+            let ffe = flags | ((level + 1) & 3);
+            assert_eq!(
+                s.events,
+                [
+                    Event::Write(UPDATE_0, FRL_START),
+                    Event::Pattern([0xd, 0xf, 3, 7]),
+                    Event::Ffe(ffe),
+                    Event::Write(UPDATE_0, FLT_UPDATE),
+                    Event::Ffe(ffe),
+                    Event::Write(UPDATE_0, SOURCE_TEST_UPDATE),
+                ]
+            );
+            assert_eq!(s.regs[UPDATE_0 as usize], 0x81);
+        }
+    }
+    for test in [0, FLT_NO_TIMEOUT] {
+        let mut s = Sink::new(&[]);
+        s.regs[SOURCE_TEST as usize] = test;
+        s.regs[UPDATE_0 as usize] = FLT_UPDATE;
+        s.regs[LTP_REQ as usize] = 0x30;
+        s.regs[LTP_REQ as usize + 1] = 0xf1;
+        assert_eq!(run(poll_status(&mut s)), Ok(test == 0));
+        assert_eq!(
+            s.events[0],
+            Event::Pattern([0xff, if test == 0 { 0xf } else { 2 }, 0, 0xe])
+        );
+        assert_eq!(
+            s.regs[UPDATE_0 as usize],
+            if test == 0 { FLT_UPDATE } else { 0 }
+        );
+        assert_eq!(s.events.len(), if test == 0 { 1 } else { 2 });
+    }
+    // A Source_Test_Update alone preserves the current FFE level.
+    let mut s = Sink::new(&[]);
+    s.ffe = 2;
+    s.regs[SOURCE_TEST as usize] = 4;
+    s.regs[UPDATE_0 as usize] = SOURCE_TEST_UPDATE;
+    assert_eq!(run(poll_status(&mut s)), Ok(false));
+    assert_eq!(
+        s.events,
+        [Event::Ffe(0x22), Event::Write(UPDATE_0, SOURCE_TEST_UPDATE)]
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/frl-training",
+    frl_live_status_handles_tests_and_retrain
+);
+
+fn frl_live_status_preserves_failed_requests() -> TestResult {
+    for fail in [SOURCE_TEST, UPDATE_0, LTP_REQ, LTP_REQ + 1, 0xfe, 0xff] {
+        let mut s = Sink::new(&[]);
+        s.regs[UPDATE_0 as usize] = FLT_UPDATE | SOURCE_TEST_UPDATE;
+        s.regs[LTP_REQ as usize] = 0xee;
+        s.fail = Some(fail);
+        assert_eq!(run(poll_status(&mut s)), Err(()));
+        assert_eq!(s.regs[UPDATE_0 as usize], FLT_UPDATE | SOURCE_TEST_UPDATE);
+        assert!(!s
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Write(UPDATE_0, _))));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/frl-training",
+    frl_live_status_preserves_failed_requests
 );

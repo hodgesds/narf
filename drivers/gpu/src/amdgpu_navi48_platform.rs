@@ -1431,6 +1431,7 @@ pub fn set_frl(enabled: bool) {
 /// monitor arms each lightable port's HPD interrupt and acknowledges raised
 /// ones on wake; the period remains the fallback.
 const MONITOR_MS: u64 = 1000;
+const FRL_MONITOR_MS: u64 = 200;
 
 /// What one native display monitor pass did to an output (pipe).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1727,6 +1728,11 @@ pub async unsafe fn monitor_displays(
         // SAFETY: serialized retained owners; writers stay excluded.
         match unsafe { boot.check_modeset(&m) }.await? {
             Health::Running(_) => {}
+            Health::FrlRetrain => {
+                // Full retirement quiesces writers/fetch before SCDC cleanup
+                // and fresh admission/training (including rate fallback).
+                relight = true;
+            }
             Health::LinkLost(_) => {
                 if m.selection.mst.is_some() {
                     // Retraining affects every stream on the shared link.
@@ -1880,7 +1886,17 @@ pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configura
         }
         let mut hotplug = None;
         loop {
-            if crate::amdgpu_navi48_dispatch::wait_hotplug(&mut hotplug, MONITOR_MS).await {
+            let interval = if displays
+                .lit
+                .iter()
+                .flatten()
+                .any(|m| m.selection.frl.is_some())
+            {
+                FRL_MONITOR_MS
+            } else {
+                MONITOR_MS
+            };
+            if crate::amdgpu_navi48_dispatch::wait_hotplug(&mut hotplug, interval).await {
                 // Acknowledge (and re-arm the opposite edge of) every port's
                 // raised HPD/HPD-RX before the pass reads the sense.
                 let mut owner = OWNER.lock().await;

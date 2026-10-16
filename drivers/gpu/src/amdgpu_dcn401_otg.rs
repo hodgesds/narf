@@ -176,6 +176,8 @@ pub enum State {
     /// sending training patterns, or trained and sending FRL output.
     FrlLinkTraining(u8),
     FrlLinkActive(u8),
+    /// Pattern/FFE update in flight; cancellation retains the link and video.
+    UpdatingFrlLink(u8),
     /// FRL video from pipe n: starting, running, stopping.
     StartingFrlVideo(u8),
     FrlVideoRunning(u8),
@@ -386,7 +388,7 @@ pub struct Status {
     pub frl_encoder_retired: Option<FrlEncoderRetired>,
     /// Historical FRL digital-link stop only; PHY, root clocks and memory stay owned.
     pub frl_link_retired: Option<FrlLinkRetired>,
-    /// This owner's FRL link; current in FrlLinkTraining/FrlLinkActive.
+    /// This owner's FRL link, including live training-pattern and FFE state.
     pub frl_link: Option<FrlLinkUp>,
     /// Black FRL video; current only in FrlVideoRunning (or beneath a live
     /// scanout).

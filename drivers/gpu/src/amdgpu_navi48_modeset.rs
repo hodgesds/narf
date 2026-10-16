@@ -318,6 +318,13 @@ impl crate::amdgpu_frl_training::FrlTrainer for FrlPort<'_> {
         narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
     }
 }
+impl crate::amdgpu_frl_training::FrlStatusIo for FrlPort<'_> {
+    fn current_ffe(&mut self) -> Result<u8, FrlPortError> {
+        self.boot
+            .display_frl_current_ffe(self.port)
+            .map_err(FrlPortError::Display)
+    }
+}
 impl From<FrlPortError> for ModesetError {
     fn from(e: FrlPortError) -> Self {
         match e {
@@ -522,12 +529,14 @@ pub fn edid_timings(edid: &[u8]) -> Vec<Timing> {
 /// What a periodic check of a running modeset found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Health {
-    /// Sink present, link locked, scanout fetching; the fresh frame count.
+    /// Sink present, source/link checks passed, scanout fetching; fresh frame count.
     Running(u32),
     /// Debounced HPD low: tear down with `unplug_modeset`.
     Unplugged,
     /// The D0 sink lost lane lock: `retrain_modeset` (Linux's link loss).
     LinkLost(otg::DpLinkStatus),
+    /// FRL sink requests retraining: retire and readmit the configuration.
+    FrlRetrain,
 }
 
 /// Maximum DPCD link of a DP receiver: MAX_LINK_RATE and MAX_LANE_COUNT.
@@ -2214,7 +2223,7 @@ impl ColdBoot {
         }
     }
     /// Check a running modeset: hot-plug first (no AUX to an absent sink),
-    /// then the sink's lane lock, then the scanout itself.
+    /// then DP lane lock or FRL status/source-test requests, then scanout.
     /// # Safety
     /// As for `modeset_display`; exclude other AUX users of the port.
     pub async unsafe fn check_modeset(&mut self, m: &Modeset) -> Result<Health, ModesetError> {
@@ -2227,7 +2236,13 @@ impl ColdBoot {
         // SAFETY: as documented above.
         unsafe {
             // TMDS has no sink-side lock status to read.
-            if !m.selection.hdmi {
+            if m.selection.frl.is_some() {
+                if crate::amdgpu_frl_training::poll_status(&mut FrlPort { boot: self, port })
+                    .await?
+                {
+                    return Ok(Health::FrlRetrain);
+                }
+            } else if !m.selection.hdmi {
                 let link = self.display_dp_link_status(port).await?;
                 if link.lost() {
                     return Ok(Health::LinkLost(link));

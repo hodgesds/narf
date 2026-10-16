@@ -59,6 +59,7 @@ impl<I: Io> Engine<I> {
         if self.status.frl_link != Some(*link) {
             return Err(Error::Invalid);
         }
+        self.frl_link_witnesses(link)?;
         let route = self.layout.base + STREAM_CLOCK * 4;
         if self.read(route)? & 15 != 8 | u32::from(blank.request.pipe) {
             return Err(Error::Readback(route));
@@ -269,6 +270,7 @@ impl<I: Io> Engine<I> {
         if self.status.frl_link != Some(v.link) {
             return Err(Error::Invalid);
         }
+        self.frl_link_witnesses(&v.link)?;
         let route = self.layout.base + STREAM_CLOCK * 4;
         if self.read(route)? & 15 != 8 | u32::from(v.request.pipe) {
             return Err(Error::Readback(route));

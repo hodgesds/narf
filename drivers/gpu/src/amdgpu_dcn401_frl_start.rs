@@ -23,6 +23,10 @@ pub struct FrlLinkUp {
     pub physical_lanes: u8,
     /// The training patterns last set (register values, LTP - 1).
     pub patterns: [u8; 4],
+    /// Whether the link sends training patterns instead of FRL packets.
+    pub training: bool,
+    /// Last firmware-acknowledged TxFFE level and de/pre-only flags.
+    pub lane_set: u8,
 }
 pub(in super::super::super) trait FrlFirmware: phy::Firmware {
     fn enable_frl(
@@ -83,14 +87,17 @@ impl<I: Io> Engine<I> {
             && self.status.frl_link.is_some_and(|l| l.path == path)
     }
     /// What the firmware's ENABLE brought up, and the training state.
-    fn frl_link_witnesses(&mut self, link: &FrlLinkUp, training: bool) -> Result<(), Error> {
+    pub(in crate::amdgpu_dcn401_otg) fn frl_link_witnesses(
+        &mut self,
+        link: &FrlLinkUp,
+    ) -> Result<(), Error> {
         let l = self.layout;
         let phy = link.path.transmitter;
         let lanes = phy_reg(l, phy, 0x2943);
         if active_lanes(self.read(lanes)?, link.lanes) != Some(link.physical_lanes) {
             return Err(Error::Readback(lanes));
         }
-        let mut config = u32::from(link.lanes == 4) | u32::from(training) << 1;
+        let mut config = u32::from(link.lanes == 4) | u32::from(link.training) << 1;
         for (n, &p) in link.patterns.iter().enumerate() {
             config |= u32::from(p) << (16 + 4 * n);
         }
@@ -152,6 +159,8 @@ impl<I: Io> Engine<I> {
             character_khz,
             physical_lanes: 0,
             patterns: [0; 4],
+            training: true,
+            lane_set: 0,
         };
         self.status.state = State::FrlLinkTraining(phy);
         let result = async {
@@ -179,7 +188,7 @@ impl<I: Io> Engine<I> {
             for n in 0..4 {
                 link.patterns[n] = (config >> (16 + 4 * n) & 7) as u8;
             }
-            self.frl_link_witnesses(&link, true)
+            self.frl_link_witnesses(&link)
         }
         .await;
         match result {
@@ -203,6 +212,64 @@ impl<I: Io> Engine<I> {
         }
         Ok(link)
     }
+    /// Only this selected display's stable link/video may accept live controls.
+    fn frl_control_link(&mut self, path: Path) -> Result<FrlLinkUp, Error> {
+        let link = self.status.frl_link.ok_or(Error::Invalid)?;
+        if link.path != path {
+            return Err(Error::Invalid);
+        }
+        match self.status.state {
+            State::FrlLinkTraining(p) | State::FrlLinkActive(p) if p == path.transmitter => {
+                self.frl_link_witnesses(&link)?;
+            }
+            State::FrlVideoRunning(pipe) | State::ScanoutRunning(pipe) => {
+                let v = self.status.frl_video_running.ok_or(Error::Invalid)?;
+                if v.request.pipe != pipe || v.link != link {
+                    return Err(Error::Invalid);
+                }
+                if matches!(self.status.state, State::ScanoutRunning(_))
+                    && !self
+                        .status
+                        .scanout
+                        .is_some_and(|s| s.pipe == pipe && s.stream == pipe)
+                {
+                    return Err(Error::Invalid);
+                }
+                self.frl_video_verify_running(&v)?;
+            }
+            _ => return Err(Error::Busy),
+        }
+        Ok(link)
+    }
+    fn retain_frl_link(&mut self, link: FrlLinkUp) {
+        self.status.frl_link = Some(link);
+        if let Some(v) = self.status.frl_video_running.as_mut() {
+            v.link = link;
+        }
+    }
+    fn finish_frl_control(&mut self, link: FrlLinkUp, state: State) -> Result<(), Error> {
+        match self.frl_link_witnesses(&link) {
+            Ok(()) => {
+                self.retain_frl_link(link);
+                if let Some(v) = self.status.frl_video_running {
+                    if let Err(e) = self.frl_video_verify_running(&v) {
+                        self.status.state = State::Failed(e);
+                        return Err(e);
+                    }
+                }
+                self.status.state = state;
+                Ok(())
+            }
+            Err(e) => {
+                self.status.state = State::Failed(e);
+                Err(e)
+            }
+        }
+    }
+    /// Current acknowledged FFE level, after checking the live route.
+    pub(in super::super::super) fn frl_current_ffe(&mut self, path: Path) -> Result<u8, Error> {
+        Ok(self.frl_control_link(path)?.lane_set & 3)
+    }
     /// hpo_frl_link_enc3_set_training_pattern: training on, and each lane
     /// whose value is below 8 (LTP - 1) set; others left as they are.
     pub(in super::super::super) fn frl_training_pattern(
@@ -210,8 +277,8 @@ impl<I: Io> Engine<I> {
         path: Path,
         patterns: [u8; 4],
     ) -> Result<(), Error> {
-        let mut link = self.frl_training_link(path)?;
-        self.frl_link_witnesses(&link, true)?;
+        let mut link = self.frl_control_link(path)?;
+        let previous = self.status.state;
         let mut mask = 2;
         let mut value = 2;
         for (n, &p) in patterns.iter().enumerate() {
@@ -221,35 +288,60 @@ impl<I: Io> Engine<I> {
                 link.patterns[n] = p;
             }
         }
-        if link.patterns.iter().any(|&p| p > 7) {
-            return Err(Error::Invalid);
+        link.training = true;
+        self.status.state = State::UpdatingFrlLink(path.transmitter);
+        if let Err(e) = self.update(self.frl_at(CONFIG), mask, value) {
+            self.status.state = State::Failed(e);
+            return Err(e);
         }
-        self.update(self.frl_at(CONFIG), mask, value)?;
-        self.status.frl_link = Some(link);
-        self.frl_link_witnesses(&link, true)
+        // A bare link returns to training; live video/fetch ownership stays.
+        let state = if matches!(previous, State::FrlLinkActive(_)) {
+            State::FrlLinkTraining(path.transmitter)
+        } else {
+            previous
+        };
+        self.finish_frl_control(link, state)
     }
-    /// dpcs401_program_eq_setting: the TxFFE level and only-flags.
+    /// dpcs401_program_eq_setting: the TxFFE level and only-flags. An
+    /// interrupted firmware command quarantines the entire retained display.
     pub(in super::super::super) async fn frl_ffe(
         &mut self,
         io: &mut impl FrlFirmware,
         path: Path,
         lane_set: u8,
     ) -> Result<(), Error> {
-        let link = self.frl_training_link(path)?;
-        self.frl_link_witnesses(&link, true)?;
-        io.frl_ffe(path, link.lanes, link.character_khz, lane_set)
+        if lane_set & !0x63 != 0 {
+            return Err(Error::Invalid);
+        }
+        if !io.ready() {
+            return Err(Error::Busy);
+        }
+        let mut link = self.frl_control_link(path)?;
+        let previous = self.status.state;
+        self.status.state = State::UpdatingFrlLink(path.transmitter);
+        if let Err(e) = io
+            .frl_ffe(path, link.lanes, link.character_khz, lane_set)
             .await
-            .map_err(Error::Firmware)?;
-        self.frl_link_witnesses(&link, true)
+        {
+            let e = Error::Firmware(e);
+            self.status.state = State::Failed(e);
+            return Err(e);
+        }
+        link.lane_set = lane_set;
+        self.finish_frl_control(link, previous)
     }
     /// hpo_frl_link_enc3_enable_output: training off, FRL packets and gaps
     /// on the trained link.
     pub(in super::super::super) fn frl_link_output(&mut self, path: Path) -> Result<(), Error> {
-        let link = self.frl_training_link(path)?;
-        self.frl_link_witnesses(&link, true)?;
-        self.update(self.frl_at(CONFIG), 2, 0)?;
-        self.status.state = State::FrlLinkActive(path.transmitter);
-        self.frl_link_witnesses(&link, false)
+        let mut link = self.frl_training_link(path)?;
+        self.frl_link_witnesses(&link)?;
+        self.status.state = State::UpdatingFrlLink(path.transmitter);
+        if let Err(e) = self.update(self.frl_at(CONFIG), 2, 0) {
+            self.status.state = State::Failed(e);
+            return Err(e);
+        }
+        link.training = false;
+        self.finish_frl_control(link, State::FrlLinkActive(path.transmitter))
     }
     /// disable_hpo_frl_link_output: hpo_frl_link_enc3_disable (training
     /// pattern zero, encoder and clock off, RC compression restored), then
@@ -296,6 +388,10 @@ impl Otg {
         patterns: [u8; 4],
     ) -> Result<(), Error> {
         self.0.frl_training_pattern(path, patterns)
+    }
+    /// Read the retained FFE level after validating the selected live link.
+    pub(crate) fn frl_current_ffe(&mut self, path: Path) -> Result<u8, Error> {
+        self.0.frl_current_ffe(path)
     }
     /// Program the transmitter's TxFFE (dpcs401_program_eq_setting's lane
     /// set).

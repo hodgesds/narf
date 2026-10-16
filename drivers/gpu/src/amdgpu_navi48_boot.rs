@@ -2048,6 +2048,11 @@ impl ColdBoot {
                 .frl_training_pattern(path, patterns)
         }
     }
+    /// Last acknowledged FRL FFE level, after checking this port's live route.
+    pub fn display_frl_current_ffe(&mut self, port: usize) -> Result<u8, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        self.otg.as_mut().map_err(|e| *e)?.frl_current_ffe(path)
+    }
     /// Program the port's FRL TxFFE lane set.
     /// # Safety
     /// Fulfil `Otg::frl_ffe` obligations.
