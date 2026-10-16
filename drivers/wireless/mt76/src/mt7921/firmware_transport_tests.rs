@@ -843,6 +843,12 @@ fn mcu_passive_scan_wire_layout_and_beacon_validation() -> TestResult {
     {
         return TestResult::Fail("RX group/IE/signal parse");
     }
+    let mut forwarded = packet.clone();
+    let length = forwarded.len() as u32;
+    forwarded[..4].copy_from_slice(&((7u32 << 27) | (1 << 16) | length).to_le_bytes());
+    if scan::beacon(&forwarded, 2).is_none() {
+        return TestResult::Fail("firmware-forwarded normal beacon rejected");
+    }
     for end in 0..packet.len() {
         if scan::beacon(&packet[..end], 2).is_some() {
             return TestResult::Fail("truncated beacon accepted");

@@ -1,7 +1,7 @@
 //! x86_64 coherent PCI backend. Linux reference: ecd997b0189a mt792x_dma.c.
 use super::{Backend, Error, Firmware, RadioInfo, Report, Retained, Session, State, MAX_FRAME};
-use crate::mt7921::{registers, regs::*};
-use alloc::{vec, vec::Vec};
+use crate::mt7921::{packet_tx, registers, regs::*};
+use alloc::{collections::VecDeque, vec, vec::Vec};
 use core::sync::atomic::{fence, Ordering};
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
@@ -19,6 +19,7 @@ const TX_WM: u32 = 0xd4300 + 17 * 16;
 const RX_PRE: u32 = 0xd4500;
 const RX_POST: u32 = 0xd4540;
 const RX_DATA: u32 = 0xd4520;
+const TX_DATA: u32 = 0xd4300;
 
 #[derive(Debug)]
 struct Ring {
@@ -102,6 +103,10 @@ struct Storage {
     wm: Ring,
     fwdl: Ring,
     rx: [Ring; 3],
+    data: Ring,
+    tokens: packet_tx::Tokens,
+    pending_events: VecDeque<Vec<u8>>,
+    pending_data: VecDeque<Vec<u8>>,
 }
 #[derive(Debug)]
 struct Hardware {
@@ -151,6 +156,125 @@ impl Hardware {
         self.write(base + 8, slot as u32)?;
         self.owner.storage.as_mut().ok_or(Error::Busy)?.rx[which].index = (slot + 1) % DEPTH;
         Ok(Some(frame))
+    }
+    fn route_rx(&mut self, event: bool) -> Result<Option<Vec<u8>>, Error> {
+        self.check()?;
+        let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
+        if let Some(packet) = if event {
+            storage.pending_events.pop_front()
+        } else {
+            storage.pending_data.pop_front()
+        } {
+            return Ok(Some(packet));
+        }
+        for which in 0..3 {
+            let Some(packet) = self.receive_ring(which)? else {
+                continue;
+            };
+            let rxd = u32::from_le_bytes(packet[..4].try_into().unwrap());
+            let kind = rxd >> 27;
+            let normal = kind == 2 || kind == 7 && (rxd >> 16) & 15 == 1;
+            if kind == 0 {
+                let releases = packet_tx::releases(&packet)?;
+                self.owner
+                    .storage
+                    .as_mut()
+                    .ok_or(Error::Busy)?
+                    .tokens
+                    .firmware_done(&releases)?;
+            } else if normal || kind == 7 {
+                if !normal && packet.len() < 32 {
+                    return Err(Error::MalformedEvent);
+                }
+                if event != normal {
+                    return Ok(Some(packet));
+                }
+                let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
+                let queue = if normal {
+                    &mut storage.pending_data
+                } else {
+                    &mut storage.pending_events
+                };
+                if queue.len() == 32 {
+                    if !normal {
+                        return Err(Error::EventOverflow);
+                    }
+                    queue.pop_front(); // bounded RX loss under overload, never drop an MCU reply
+                }
+                queue.push_back(packet);
+            }
+            // TX-status and unknown reports do not satisfy a command waiter.
+        }
+        Ok(None)
+    }
+
+    // Private until association supplies a verified transmit-capable channel.
+    fn submit_management(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error> {
+        self.check()?;
+        if !self.owner.published {
+            return Err(Error::Busy);
+        }
+        let storage = self.owner.storage.as_ref().ok_or(Error::Busy)?;
+        let token = storage.tokens.available()?;
+        let ring = &storage.data;
+        let slot = ring.index;
+        if ring.pending || ring.word(slot, 1) & DONE == 0 {
+            return Err(Error::Busy);
+        }
+        let address = ring.buffers[slot].dma_addr().raw();
+        let payload = address
+            .checked_add(packet_tx::HEADER as u64)
+            .ok_or(Error::DmaAddress)?;
+        let header = packet_tx::management(frame, payload, token, wcid)?;
+        // SAFETY: fully validated lengths; this slot has neither DMA nor
+        // firmware ownership until the publication below.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                header.as_ptr(),
+                ring.buffers[slot].cpu_mut_ptr::<u8>(),
+                header.len(),
+            );
+            core::ptr::copy_nonoverlapping(
+                frame.as_ptr(),
+                ring.buffers[slot].cpu_mut_ptr::<u8>().add(header.len()),
+                frame.len(),
+            );
+        }
+        let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
+        storage.tokens.begin(token)?;
+        let ring = &mut storage.data;
+        ring.pending = true; // conservative on any later doorbell failure
+        ring.set_word(slot, 0, address as u32);
+        ring.set_word(slot, 2, 0);
+        ring.set_word(slot, 3, (address >> 32) as u32 & 15);
+        fence(Ordering::Release);
+        ring.set_word(slot, 1, ((packet_tx::HEADER as u32) << 16) | LAST);
+        fence(Ordering::SeqCst);
+        self.write(TX_DATA + 8, ((slot + 1) % DEPTH) as u32)
+    }
+    fn management_complete(&mut self) -> Result<Option<packet_tx::Completion>, Error> {
+        self.check()?;
+        let ring = &self.owner.storage.as_ref().ok_or(Error::Busy)?.data;
+        if !ring.pending {
+            return Err(Error::Ring);
+        }
+        let next = (ring.index + 1) % DEPTH;
+        let didx = self.read(TX_DATA + 12)? as usize;
+        if didx >= DEPTH || didx != ring.index && didx != next {
+            return Err(Error::Ring);
+        }
+        let done = didx == next && ring.word(ring.index, 1) & DONE != 0;
+        fence(Ordering::Acquire);
+        let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
+        if done {
+            storage.tokens.dma_done()?;
+        }
+        let result = storage.tokens.finish();
+        if result.is_some() {
+            storage.data.pending = false;
+            storage.data.index = next;
+        }
+        Ok(result)
     }
     fn read(&self, addr: u32) -> Result<u32, Error> {
         self.check()?;
@@ -228,6 +352,7 @@ impl Backend for Hardware {
         fence(Ordering::SeqCst);
         self.program(&storage.wm, false)?;
         self.program(&storage.fwdl, false)?;
+        self.program(&storage.data, false)?;
         for ring in &storage.rx {
             self.program(ring, true)?;
         }
@@ -370,19 +495,10 @@ impl Backend for Hardware {
         Ok(true)
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Error> {
-        for which in 0..2 {
-            if let Some(frame) = self.receive_ring(which)? {
-                let rxd = u32::from_le_bytes(frame[..4].try_into().unwrap());
-                if rxd >> 27 != 7 || frame.len() < 32 {
-                    return Err(Error::MalformedEvent);
-                }
-                return Ok(Some(frame));
-            }
-        }
-        Ok(None)
+        self.route_rx(true)
     }
     fn receive_data(&mut self) -> Result<Option<Vec<u8>>, Error> {
-        self.receive_ring(2)
+        self.route_rx(false)
     }
     fn release(&mut self) -> Result<(), Error> {
         if !self.idle()? || self.read(GLOBAL)? & ENABLE != 0 {
@@ -455,6 +571,10 @@ impl Transport {
         let storage = Storage {
             wm: Ring::allocate(TX_WM, false)?,
             fwdl: Ring::allocate(TX_FWDL, false)?,
+            data: Ring::allocate(TX_DATA, false)?,
+            tokens: packet_tx::Tokens::new(),
+            pending_events: VecDeque::new(),
+            pending_data: VecDeque::new(),
             rx: [
                 Ring::allocate(RX_PRE, true)?,
                 Ring::allocate(RX_POST, true)?,

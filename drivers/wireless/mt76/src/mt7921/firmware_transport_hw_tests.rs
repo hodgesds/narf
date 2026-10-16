@@ -30,6 +30,10 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
     let storage = Storage {
         wm: Ring::allocate(TX_WM, false)?,
         fwdl: Ring::allocate(TX_FWDL, false)?,
+        data: Ring::allocate(TX_DATA, false)?,
+        tokens: packet_tx::Tokens::new(),
+        pending_events: VecDeque::new(),
+        pending_data: VecDeque::new(),
         rx: [
             Ring::allocate(RX_PRE, true)?,
             Ring::allocate(RX_POST, true)?,
@@ -224,4 +228,252 @@ fn mcu_packet_rx_uses_ring_two_and_copies_before_rearming() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921/scan",
     mcu_packet_rx_uses_ring_two_and_copies_before_rearming
+);
+
+fn management_frame() -> [u8; 30] {
+    let mut frame = [0u8; 30];
+    frame[0] = 0xb0;
+    frame[4..10].copy_from_slice(&[2, 1, 2, 3, 4, 5]);
+    frame
+}
+fn release_event(token: u16, status: u8, pair: bool) -> Vec<u8> {
+    let mut packet = vec![0u8; if pair { 16 } else { 12 }];
+    let len = packet.len();
+    packet[..4].copy_from_slice(&((1u32 << 16) | len as u32).to_le_bytes());
+    let mut offset = 8;
+    if pair {
+        packet[offset..offset + 4].copy_from_slice(&((1u32 << 31) | (19 << 14)).to_le_bytes());
+        offset += 4;
+    }
+    packet[offset..offset + 4]
+        .copy_from_slice(&((u32::from(token) << 16) | (u32::from(status) << 13)).to_le_bytes());
+    packet
+}
+fn inject_rx(words: &mut [u32], hw: &Hardware, which: usize, packet: &[u8]) {
+    let ring = &hw.owner.storage.as_ref().unwrap().rx[which];
+    let slot = ring.index;
+    // SAFETY: fake device writes only to the owned descriptor buffer.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            packet.as_ptr(),
+            ring.buffers[slot].cpu_mut_ptr::<u8>(),
+            packet.len(),
+        );
+    }
+    ring.set_word(slot, 1, ((packet.len() as u32) << 16) | LAST | DONE);
+    words[(ring.base + 12) as usize / 4] = ((slot + 1) % DEPTH) as u32;
+}
+fn mcu_management_tx_matches_linux_cut_through_header() -> TestResult {
+    let frame = management_frame();
+    let header = packet_tx::management(&frame, 0x12345040, 0x1234, 19).unwrap();
+    let expected = [
+        0x2000003eu32,
+        0x80026013,
+        0x8000200b,
+        0x10007800,
+        0,
+        0,
+        4,
+        0x000b0000,
+    ];
+    for (i, word) in expected.iter().enumerate() {
+        if header[i * 4..i * 4 + 4] != word.to_le_bytes() {
+            return TestResult::Fail("management TXD differs from Linux");
+        }
+    }
+    if header[32..40] != [0x34, 0x92, 0, 0, 0, 0, 0, 0]
+        || header[40..48] != [0x40, 0x50, 0x34, 0x12, 30, 0x80, 0, 0]
+        || header[48..].iter().any(|b| *b != 0)
+        || packet_tx::management(&frame, 1u64 << 32, 1, 19) != Err(Error::DmaAddress)
+        || packet_tx::management(&frame[..23], 0, 1, 19) != Err(Error::Bounds)
+    {
+        return TestResult::Fail("TXP segment/token/last/address geometry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx",
+    mcu_management_tx_matches_linux_cut_through_header
+);
+fn mcu_management_buffer_waits_for_dma_and_firmware_release_in_either_order() -> TestResult {
+    for dma_first in [false, true] {
+        let (mut words, mut hw) = match rig() {
+            Ok(rig) => rig,
+            Err(_) => return TestResult::Fail("allocation"),
+        };
+        hw.owner.published = true;
+        for turn in 0..DEPTH + 2 {
+            let frame = management_frame();
+            let slot = turn % DEPTH;
+            let next = (slot + 1) % DEPTH;
+            if hw.submit_management(&frame, 19).is_err()
+                || words[(TX_DATA + 8) as usize / 4] != next as u32
+            {
+                return TestResult::Fail("management doorbell or ring wrap");
+            }
+            let token = turn as u16 + 1;
+            let ring = &hw.owner.storage.as_ref().unwrap().data;
+            if ring.word(slot, 1) != (64 << 16) | LAST {
+                return TestResult::Fail("DMA must publish TXD+TXP, not payload length");
+            }
+            if hw.submit_management(&frame, 19) != Err(Error::Busy)
+                || !matches!(hw.management_complete(), Ok(None))
+            {
+                return TestResult::Fail("pending token allowed reuse");
+            }
+            if dma_first {
+                hw.owner
+                    .storage
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .set_word(slot, 1, (64 << 16) | LAST | DONE);
+                words[(TX_DATA + 12) as usize / 4] = next as u32;
+                if !matches!(hw.management_complete(), Ok(None)) {
+                    return TestResult::Fail("DDONE freed payload before firmware");
+                }
+            }
+            let packet = release_event(token, 0, true);
+            inject_rx(&mut words, &hw, 0, &packet); // notifications may use any RX ring
+            if hw.receive() != Ok(None) {
+                return TestResult::Fail("TX free reached MCU command waiter");
+            }
+            if !dma_first {
+                if !matches!(hw.management_complete(), Ok(None)) {
+                    return TestResult::Fail("firmware release freed descriptor before DMA");
+                }
+                hw.owner
+                    .storage
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .set_word(slot, 1, (64 << 16) | LAST | DONE);
+                words[(TX_DATA + 12) as usize / 4] = next as u32;
+            }
+            if hw.management_complete() != Ok(Some(packet_tx::Completion { token, status: 0 })) {
+                return TestResult::Fail("two-phase completion did not retire token");
+            }
+        }
+        hw.owner.published = false; // model has no actual DMA engine
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx",
+    mcu_management_buffer_waits_for_dma_and_firmware_release_in_either_order
+);
+fn mcu_tx_release_batch_is_atomic_and_preserves_failure_status() -> TestResult {
+    let mut tokens = packet_tx::Tokens::new();
+    tokens.begin(1).unwrap();
+    tokens.dma_done().unwrap();
+    let mut packet = release_event(1, 0, true);
+    packet[..4].copy_from_slice(&((2u32 << 16) | 16).to_le_bytes()); // declares a missing second MSDU
+    if packet_tx::releases(&packet) != Err(Error::MalformedEvent) || tokens.finish().is_some() {
+        return TestResult::Fail("truncated TX release mutated owner");
+    }
+    let conflicting = [
+        packet_tx::Completion {
+            token: 1,
+            status: 0,
+        },
+        packet_tx::Completion {
+            token: 1,
+            status: 2,
+        },
+    ];
+    if tokens.firmware_done(&conflicting) != Err(Error::MalformedEvent) || tokens.finish().is_some()
+    {
+        return TestResult::Fail("conflicting duplicate release partially committed");
+    }
+    tokens
+        .firmware_done(&[packet_tx::Completion {
+            token: 77,
+            status: 0,
+        }])
+        .unwrap();
+    if tokens.finish().is_some() {
+        return TestResult::Fail("stale token freed current payload");
+    }
+    let dropped = packet_tx::releases(&release_event(1, 3, false)).unwrap();
+    tokens.firmware_done(&dropped).unwrap();
+    if tokens.finish()
+        != Some(packet_tx::Completion {
+            token: 1,
+            status: 3,
+        })
+        || tokens.available() != Ok(2)
+    {
+        return TestResult::Fail("firmware failure status lost or token reused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx",
+    mcu_tx_release_batch_is_atomic_and_preserves_failure_status
+);
+fn mcu_packet_router_separates_forwarded_management_from_command_replies() -> TestResult {
+    let (mut words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("allocation"),
+    };
+    let mut normal = vec![0u8; 64];
+    normal[..4].copy_from_slice(&((7u32 << 27) | (1 << 16) | 64).to_le_bytes());
+    inject_rx(&mut words, &hw, 0, &normal);
+    if hw.receive() != Ok(None) || hw.receive_data() != Ok(Some(normal)) {
+        return TestResult::Fail("firmware-forwarded MPDU confused with MCU response");
+    }
+    let mut reply = vec![0u8; 36];
+    reply[..4].copy_from_slice(&((7u32 << 27) | 36).to_le_bytes());
+    inject_rx(&mut words, &hw, 2, &reply);
+    if hw.receive_data() != Ok(None) || hw.receive() != Ok(Some(reply)) {
+        return TestResult::Fail("MCU response on data ring was dropped");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx",
+    mcu_packet_router_separates_forwarded_management_from_command_replies
+);
+
+fn mcu_receive_router_bounds_both_queues_without_dropping_command_replies() -> TestResult {
+    let (mut words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("allocation"),
+    };
+    for i in 0..33u8 {
+        let mut packet = [0u8; 64];
+        packet[..4].copy_from_slice(&((2u32 << 27) | 64).to_le_bytes());
+        packet[63] = i;
+        inject_rx(&mut words, &hw, 0, &packet);
+        if hw.receive() != Ok(None) {
+            return TestResult::Fail("normal packet reached command waiter");
+        }
+    }
+    let storage = hw.owner.storage.as_ref().unwrap();
+    if storage.pending_data.len() != 32 || storage.pending_data.front().unwrap()[63] != 1 {
+        return TestResult::Fail("normal RX backlog is unbounded or keeps stale data");
+    }
+    // Clear the data backlog before exercising event routing on data ring 2.
+    hw.owner.storage.as_mut().unwrap().pending_data.clear();
+    for _ in 0..32 {
+        let mut packet = [0u8; 36];
+        packet[..4].copy_from_slice(&((7u32 << 27) | 36).to_le_bytes());
+        inject_rx(&mut words, &hw, 2, &packet);
+        if hw.receive_data() != Ok(None) {
+            return TestResult::Fail("MCU reply reached packet receiver");
+        }
+    }
+    let mut packet = [0u8; 36];
+    packet[..4].copy_from_slice(&((7u32 << 27) | 36).to_le_bytes());
+    inject_rx(&mut words, &hw, 2, &packet);
+    if hw.receive_data() != Err(Error::EventOverflow)
+        || hw.owner.storage.as_ref().unwrap().pending_events.len() != 32
+    {
+        return TestResult::Fail("command reply overflow silently discarded an older reply");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx",
+    mcu_receive_router_bounds_both_queues_without_dropping_command_replies
 );

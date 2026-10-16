@@ -154,8 +154,12 @@ device commands rather than the earlier synthetic two-TLV layout.
 The retained owner also allocates and publishes WFDMA RX ring 2, with the
 same address-width checks and shutdown/retention contract as MCU rings.
 Completed descriptors are copied before rearming, and packet lengths are
-bounded by both descriptor and allocation. MCU waiters and packet RX use
-their respective physical rings; data frames cannot satisfy an MCU waiter.
+bounded by both descriptor and allocation. RX is routed by packet type on
+all three rings. Firmware-forwarded normal frames (RX-event type with flag 1)
+enter the packet queue; MCU replies enter the event queue. Each queue is
+bounded to 32 entries. Packet overload drops the oldest packet; MCU reply
+overflow reports an error instead of silently discarding a response. Neither
+normal frames nor TX releases can satisfy an MCU waiter.
 
 `Transport::scan_passive` and `scan_boot_passive` expose a bounded hardware
 diagnostic after `RadioReady`. Only unique world 2.4 GHz channels 1–11 are
@@ -183,6 +187,52 @@ profile is exposed, with HT/VHT/HE/EHT disabled. The link stays down, frame
 ring endpoints are absent, and packet sends/association/configuration fail
 until the corresponding driver paths exist. No interface is registered on
 firmware/radio initialization failure. No host device is detached for tests.
+
+### MT76 management TX backend
+
+The retained owner allocates and publishes WFDMA TX ring 0 alongside MCU
+rings. Its private serialized management TX path emits the Linux CONNAC2
+32-byte cut-through TXD plus 32-byte hardware TXP. The descriptor references
+only those 64 bytes; TXP references the separate frame extent in the same
+owned allocation. Payload addresses must fit 32 bits, lengths must fit the
+allocation/TXP field, and token IDs stay within the MT7921 8192-token range.
+Only unprotected native management headers are accepted at the basic 1 Mbps
+rate; this backend is not exposed as a user-facing injection API.
+
+After publication the slot remains pending until both a valid DMA device
+index/DDONE and a matching firmware TX-release token are observed, in either
+order. Firmware failure status is preserved. Entire release events, including
+WCID-pair records, are parsed before token state changes; conflicting duplicate
+statuses and truncated records cannot partially retire ownership. Stale token
+IDs do not retire the current frame. Drop/failure retains published DMA under
+the existing shutdown contract. Association, regulatory/channel/power setup
+for transmission, WPA2 key setup and Ethernet TX remain unfinished; the
+passive interface still rejects sends and connection requests.
+
+### MT76 station preparation and MLME
+
+`association::JoinPlan::prepare` validates a scanned ESS, exact SSID/BSSID,
+unicast station identity and legacy supported/basic rates before constructing
+an open-authentication and association request. The initial profile requires
+1 Mbps support on channels 1–11. Open and WPA2-PSK/CCMP are distinct modes:
+privacy/RSN mismatches, unknown mandatory rates, TKIP-only/SAE-only profiles
+and mandatory PMF are rejected. WPA2 requests contain the exact negotiated
+PSK/CCMP RSN IE plus supported rates; no PMK or temporal key enters the plan.
+
+The plan's read-only phase advances from prepared through authentication and
+association only on correctly addressed matching peer responses. Algorithm,
+authentication transaction, status, association capability/privacy, AID and
+IE bounds are checked. Other peers do not advance state; matching malformed
+responses, rejection and cancellation are terminal. An associated WPA2 phase
+does not authorize the controlled port.
+
+`peer_record` emits checked Linux CONNAC2 station/PHY/RA/state and nested WTBL
+records for WCID 1, with the peer classified as an AP, native RX retained,
+and `CONN_STATE_CONNECT` rather than `PORT_SECURE`. Associated records require
+the AID observed by this plan; no caller can mutate the plan's phase directly.
+This preparation/state logic is not yet dispatched by the live association
+API. Channel/power authorization, the async join runner, key exchange and
+Ethernet transport remain required before the interface accepts connections.
 
 ### 3.1 Implemented iwlwifi MLD station profile
 

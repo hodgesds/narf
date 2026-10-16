@@ -26,7 +26,12 @@ failed or cancelled attempts retain published DMA until verified shutdown.
 The retained RX ring and MCU scan path now support passive 2.4 GHz scans on
 channels 1–11. Successful radio initialization registers a passive nl80211
 interface with the real MAC; its link remains down and data sends fail.
-The targeted QEMU suite passes 83 tests with one skip, including protocol,
+The private cut-through management TX backend retains each payload until
+both descriptor completion and firmware token release. RX routing separates
+forwarded normal frames, MCU responses and TX releases on all rings. Checked
+station/MLME preparation validates legacy rates, PSK/CCMP negotiation, peer
+responses and station records; live join dispatch remains unfinished.
+The targeted QEMU suite passes 92 tests with one skip, including protocol,
 production descriptor/MAC, cancellation, country limits and MT7922 image-layout models.
 Both-architecture Clippy and an x86_64 UEFI boot smoke pass. Physical MT7922
 firmware/radio initialization and passive scan remain unverified; association and a working WLAN

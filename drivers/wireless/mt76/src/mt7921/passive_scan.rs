@@ -33,7 +33,8 @@ fn word(bytes: &[u8], offset: usize) -> Option<u32> {
 pub(super) fn beacon(packet: &[u8], nss: u8) -> Option<ScanBss> {
     let r0 = word(packet, 0)?;
     let len = (r0 & 0xffff) as usize;
-    if r0 >> 27 != 2 || len < 24 || len > packet.len() {
+    let normal = r0 >> 27 == 2 || r0 >> 27 == 7 && (r0 >> 16) & 15 == 1;
+    if !normal || len < 24 || len > packet.len() {
         return None;
     }
     let packet = &packet[..len];

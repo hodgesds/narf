@@ -18,8 +18,9 @@
 //! survive failure or cancellation until verified DMA shutdown.
 //!
 //! Post-firmware initialization reads real NIC/EFUSE identity, applies
-//! package-selected world limits and initializes the MAC/WTBL. Scan,
-//! association and the WLAN data path remain unfinished. The
+//! package-selected world limits and initializes the MAC/WTBL. Passive
+//! scanning is connected to nl80211; management TX has a private retained
+//! cut-through backend. Association and the WLAN data path remain unfinished. The
 //! older `full_bring_up` boundary intentionally returns `NotImplemented`;
 //! firmware-only initialization uses the retained transport owner instead.
 //!
@@ -31,6 +32,7 @@
 
 #![allow(dead_code)]
 
+pub mod association;
 pub mod bringup;
 pub mod cmd;
 pub mod dma;
@@ -38,6 +40,7 @@ pub mod firmware_transport;
 pub mod fwdl;
 pub mod mac;
 pub mod mcu;
+mod packet_tx;
 pub mod pci;
 mod registers;
 #[cfg(target_arch = "x86_64")]
