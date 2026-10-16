@@ -18,6 +18,8 @@ impl PcmDevice for Card {
     fn capabilities(&self, capture: bool) -> narf_drivers_sound::hardware::PcmCapabilities {
         let mut caps =
             narf_drivers_sound::hardware::PcmCapabilities::fixed(self.default_params(capture));
+        // The pointer advances only as whole TX messages complete.
+        caps.batch = true;
         let Some(info) = self.0.playback_info else {
             return caps;
         };

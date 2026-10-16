@@ -44,8 +44,11 @@ teardown emits REMOVE events. Repeated bridge initialization is idempotent.
 `default_params(capture)`, side-effect-free `capabilities(capture)`, and mixer
 `controls/control_info/get_control/set_control`. `PcmCapabilities` describes
 finite format/rate/channel sets, period-frame and period-count bounds, buffer
-byte bounds and period-byte alignment. The default restricts negotiation to
-the backend's default configuration; native backends override it.
+byte bounds, period-byte alignment, and `batch` — set when the pointer moves
+in whole transfer blocks (virtio-snd message completions), which makes
+HW_PARAMS report `SNDRV_PCM_INFO_BATCH | SNDRV_PCM_INFO_BLOCK_TRANSFER` so
+PipeWire keeps an extra period of headroom. The default restricts negotiation
+to the backend's default configuration; native backends override it.
 `PcmHardware: Send + Debug` is an exclusive lease with `configure(HwParams)`,
 `prepare`, `start`, `stop`, `pointer` (cumulative frames), `write`, `read`
 (byte counts), and `drain`. Its Drop must stop DMA or retain its storage.

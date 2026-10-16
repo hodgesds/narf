@@ -77,6 +77,7 @@ struct Backend {
     volume: AtomicI32,
     paused: [AtomicBool; 2],
     fail_start: AtomicBool,
+    batch: AtomicBool,
     samples: IrqSafeSpinLock<Vec<u8>>,
 }
 impl Default for Backend {
@@ -88,6 +89,7 @@ impl Default for Backend {
             volume: AtomicI32::new(0),
             paused: core::array::from_fn(|_| AtomicBool::new(false)),
             fail_start: AtomicBool::new(false),
+            batch: AtomicBool::new(false),
             samples: IrqSafeSpinLock::new(Vec::new()),
         }
     }
@@ -113,6 +115,11 @@ fn defaults() -> HwParams {
 impl PcmDevice for Device {
     fn default_params(&self, _: bool) -> HwParams {
         defaults()
+    }
+    fn capabilities(&self, _: bool) -> PcmCapabilities {
+        let mut caps = PcmCapabilities::fixed(defaults());
+        caps.batch = self.0.batch.load(Ordering::Acquire);
+        caps
     }
     fn open(&self, capture: bool, _: u32) -> Result<Box<dyn PcmHardware>, SoundError> {
         if self.0.claimed[usize::from(capture)].swap(true, Ordering::AcqRel) {
@@ -291,6 +298,26 @@ macro_rules! test {
         kernel_test_in!("drivers/sound/alsa", $name);
     };
 }
+
+// Block-granular pointers (virtio-snd message completions) must advertise
+// SNDRV_PCM_INFO_BATCH, as Linux sound/virtio/virtio_pcm.c does. Without it
+// PipeWire keeps no extra headroom and underruns whenever a completion lands
+// late; frame-granular hardware (HDA) must not claim it.
+test!(alsa_pcm_hw_params_reports_batch_per_device, {
+    let fixture = Fixture::new();
+    let m = Memory::new();
+    let f = fixture.pcm(false);
+    configure(f.as_ref(), &m, 3).unwrap();
+    assert_eq!(get32(&m.bytes.lock(), 128 + 520), params::INFO);
+    drop(f);
+    fixture.backend.batch.store(true, Ordering::Release);
+    let f = fixture.pcm(false);
+    configure(f.as_ref(), &m, 3).unwrap();
+    assert_eq!(
+        get32(&m.bytes.lock(), 128 + 520),
+        params::INFO | 0x10 | 0x1_0000
+    );
+});
 
 test!(alsa_pcm_refine_and_linux_errno_precedence, {
     let fixture = Fixture::new();
