@@ -626,6 +626,11 @@ pixel and slice overhead instead of rejecting it as uncompressed RGB. Actual
 trained rate/lanes and FEC's capacity reduction bound both kinds of stream;
 DSC requires the supported 8-bpc RGB SST/FEC path. A native regression exercises
 DSC fitting one RBR lane when RGB does not, including the FEC capacity boundary.
+Legacy DSC training can now fall back among rate/lane settings that carry its
+unchanged admitted PPS and bpp. Alternative DP modes carry DSC into joint DML
+with real board limits and must fit the trained link after fallback. Retraining
+refreshes retained and published mode lists beside current siblings and drops
+invalid queued requests. Changing compressed bpp during fallback remains open.
 Native legacy DP black video now starts the matching staged OTG/OPP pattern,
 requires fresh frame progress, seeds M/N and follows steering/video/resync FIFO
 startup with native priming delays and independent acknowledgements. Fresh sink

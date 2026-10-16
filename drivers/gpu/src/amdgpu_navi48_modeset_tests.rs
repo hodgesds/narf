@@ -1404,6 +1404,98 @@ kernel_test_in!(
     navi48_modeset_decides_dsc_like_linux
 );
 
+fn limited_bpp_dsc_selection() -> Selection {
+    let p = path(inventory::Connector::DisplayPort, 0);
+    let mut device = port(p, dpcd(0x1e, 2), edid_uhbr());
+    let sink = device.sink.as_mut().unwrap();
+    sink.fec = true;
+    // Same DSC capabilities as above, with the sink capped at 8 bpp.
+    sink.dsc = Some([
+        1, 0x21, 0, 0x0b, 0x0b, 4, 1, 128, 0, 0x13, 0x0e, 0xee, 16, 0, 0, 0,
+    ]);
+    select(&[p], &[device], 8, None).unwrap()
+}
+
+fn navi48_dsc_fallback_keeps_the_admitted_pps_and_filters_link_capacity() -> TestResult {
+    use DpRate::Legacy;
+    use LinkRate::{Hbr2, Hbr3};
+    let mut s = limited_bpp_dsc_selection();
+    let cfg = s.dsc.unwrap();
+    assert_eq!(cfg.bpp_x16, 128);
+    assert_eq!(
+        selected_dp_candidates(&s),
+        [(2, Legacy(Hbr3)), (2, Legacy(Hbr2)), (1, Legacy(Hbr3))]
+    );
+    assert_eq!(s.dsc, Some(cfg), "fallback changed the staged PPS");
+    s.lanes = 1;
+    assert_eq!(selected_dp_candidates(&s), [(1, Legacy(Hbr3))]);
+    s.caps.fec = false;
+    assert!(selected_dp_candidates(&s).is_empty());
+    s.caps.fec = true;
+    s.rate = Legacy(Hbr2);
+    assert!(selected_dp_candidates(&s).is_empty());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_dsc_fallback_keeps_the_admitted_pps_and_filters_link_capacity
+);
+
+fn navi48_dp_alternatives_keep_dsc_admission_and_bound_the_fallback_link() -> TestResult {
+    let mut s = limited_bpp_dsc_selection();
+    let faster = Timing {
+        pixel_clock_khz: s.timing.pixel_clock_khz * 2,
+        ..s.timing
+    };
+    let offered = dp_offered_mode(faster, &s, 2_000_000).unwrap();
+    assert_eq!(offered.dsc.unwrap().bpp_x16, 128);
+    assert!(
+        dp_offered_mode(faster, &s, 1_000).is_none(),
+        "used nominal rather than board DISPCLK"
+    );
+    s.lanes = 1; // Trained HBR3, 6.2856 Gbit/s after FEC.
+    assert!(dp_offered_mode(s.timing, &s, 2_000_000)
+        .unwrap()
+        .dsc
+        .is_some());
+    assert!(dp_offered_mode(faster, &s, 2_000_000).is_none());
+    let mut m = completed_modeset(0);
+    m.selection.lanes = 1;
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [500_000, 2_000_000],
+        dcfclk_khz: [300_000, 1_200_000],
+        socclk_khz: 600_000,
+        dispclk_max_khz: 1_500_000,
+        dppclk_max_khz: 1_500_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let previous = edid_timings(&edid_three_modes(false));
+    let refreshed = admitted_modes(&soc, &[m], 0, previous, |t| {
+        dp_offered_mode(t, &m.selection, soc.dispclk_max_khz)
+    });
+    assert_eq!(
+        refreshed
+            .into_iter()
+            .flatten()
+            .map(|t| t.h_active)
+            .collect::<Vec<_>>(),
+        [1920, 1280]
+    );
+    // Even an empty old list retains the actual running timing as a historical
+    // witness; alternatives still need fresh admission.
+    let refreshed = admitted_modes(&soc, &[m], 0, [], |_| None);
+    assert_eq!(refreshed[0], Some(m.selection.timing));
+    assert_eq!(refreshed.into_iter().flatten().count(), 1);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_dp_alternatives_keep_dsc_admission_and_bound_the_fallback_link
+);
+
 /// MST streams as amdgpu_dm's MST atomic check admits them on an HBR2 x4
 /// link (40 PBN per slot): each device takes the timing asked of it, or
 /// its first EDID timing whose payload fits the slots the earlier ones

@@ -689,15 +689,47 @@ pub fn dp_link(timing: &Timing, caps: DpCaps) -> Option<(u8, DpRate)> {
         .find(|&(l, r)| l <= caps.lanes && dp_fits(timing, caps, l, r))
 }
 
-/// Whether a DP selection's sink can take `timing`. A link that trained as
-/// selected offers what its caps carry (Linux's verified link cap); one that
-/// fell back offers only what the trained link carries.
-fn dp_offer_fits(timing: &Timing, s: &Selection) -> bool {
-    if dp_link(&s.timing, s.caps) == Some((s.lanes, s.rate)) || s.dsc.is_some() {
-        dp_link(timing, s.caps).is_some() || dp_dsc(timing, s.caps, NOMINAL_DISPCLK_KHZ).is_some()
+fn dsc_fits(
+    timing: &Timing,
+    cfg: crate::amdgpu_dsc::DscConfig,
+    lanes: u8,
+    rate: DpRate,
+    fec: bool,
+) -> bool {
+    let DpRate::Legacy(rate) = rate else {
+        return false;
+    };
+    fec && u64::from(crate::amdgpu_dsc::dsc_kbps(
+        &dsc_timing(timing),
+        cfg.bpp_x16,
+        cfg.slices_h,
+    )) <= legacy_kbps(lanes, rate, true)
+}
+
+/// Admission shape for an alternative DP timing. Recompute its DSC with the
+/// board's real DISPCLK limit, and after fallback require the configuration
+/// that selection would produce to fit the link which actually trained.
+fn dp_offered_mode(timing: Timing, s: &Selection, max_dispclk_khz: u32) -> Option<dml::Mode> {
+    let selected = if s.dsc.is_some() {
+        Some((s.caps.lanes, DpRate::Legacy(s.caps.rate)))
     } else {
-        dp_fits(timing, s.caps, s.lanes, s.rate)
+        dp_link(&s.timing, s.caps)
+    };
+    let fell_back = selected != Some((s.lanes, s.rate));
+    if dp_link(&timing, s.caps).is_some() {
+        return (!fell_back || dp_fits(&timing, s.caps, s.lanes, s.rate)).then(|| mode(timing));
     }
+    let cfg = dp_dsc(&timing, s.caps, max_dispclk_khz)?;
+    if fell_back && !dsc_fits(&timing, cfg, s.lanes, s.rate, s.caps.fec) {
+        return None;
+    }
+    Some(dml::Mode {
+        dsc: Some(dml::Dsc {
+            slices: cfg.slices_h,
+            bpp_x16: cfg.bpp_x16,
+        }),
+        ..mode(timing)
+    })
 }
 
 /// dcn4_soc_bb's DISPCLK maximum: DSC decisions before the board's levels
@@ -1292,16 +1324,24 @@ pub fn dp_candidates(timing: &Timing, caps: DpCaps, lanes: u8, rate: DpRate) -> 
 }
 
 /// Link settings to try, best first: drop the rate; below RBR halve the lanes
-/// and restart from the sink's maximum rate (narf's documented DP fallback
+/// and restart from this attempt's starting rate (narf's DP fallback
 /// ladder, as in `dp_link_training`). Settings that cannot carry the mode are
 /// never tried.
 pub fn link_candidates(timing: &Timing, lanes: u8, rate: LinkRate) -> Vec<(u8, LinkRate)> {
+    legacy_candidates(lanes, rate, |l, r| link_fits(timing, l, r))
+}
+
+fn legacy_candidates(
+    lanes: u8,
+    rate: LinkRate,
+    mut fits: impl FnMut(u8, LinkRate) -> bool,
+) -> Vec<(u8, LinkRate)> {
     let mut out = Vec::new();
     let mut l = lanes;
     while l >= 1 {
         let mut r = Some(rate);
         while let Some(current) = r {
-            if link_fits(timing, l, current) {
+            if fits(l, current) {
                 out.push((l, current));
             }
             r = current.next_lower();
@@ -1309,6 +1349,59 @@ pub fn link_candidates(timing: &Timing, lanes: u8, rate: LinkRate) -> Vec<(u8, L
         l /= 2;
     }
     out
+}
+
+/// Preserve the staged DSC/PPS and DML plan while trying lower link settings.
+/// A configuration needing a different compressed bpp requires re-admission.
+fn selected_dp_candidates(s: &Selection) -> Vec<(u8, DpRate)> {
+    let Some(cfg) = s.dsc else {
+        return dp_candidates(&s.timing, s.caps, s.lanes, s.rate);
+    };
+    let DpRate::Legacy(rate) = s.rate else {
+        return Vec::new();
+    };
+    if s.caps.uhbr != 0 || !matches!(s.lanes, 1 | 2 | 4) {
+        return Vec::new();
+    }
+    legacy_candidates(s.lanes, rate, |l, r| {
+        l <= s.caps.lanes
+            && r as u8 <= s.caps.rate as u8
+            && dsc_fits(&s.timing, cfg, l, DpRate::Legacy(r), s.caps.fec)
+    })
+    .into_iter()
+    .map(|(l, r)| (l, DpRate::Legacy(r)))
+    .collect()
+}
+
+fn admitted_modes(
+    soc: &dml::Soc,
+    lit: &[Modeset],
+    k: usize,
+    timings: impl IntoIterator<Item = Timing>,
+    candidate: impl Fn(Timing) -> Option<dml::Mode>,
+) -> [Option<Timing>; MAX_MODES] {
+    let current = lit[k].selection.timing;
+    let mut modes = [None; MAX_MODES];
+    let mut n = 0;
+    let mut joint: Vec<_> = lit.iter().map(|m| selection_mode(&m.selection)).collect();
+    for t in timings {
+        if n == MAX_MODES {
+            break;
+        }
+        if t != current {
+            let Some(mode) = candidate(t) else { continue };
+            joint[k] = mode;
+            if dml::admit_all(soc, &joint).is_err() {
+                continue;
+            }
+        }
+        modes[n] = Some(t);
+        n += 1;
+    }
+    if !modes.contains(&Some(current)) {
+        modes[n.min(MAX_MODES - 1)] = Some(current);
+    }
+    modes
 }
 
 /// Linear XRGB8888 pitch in pixels: 64-pixel (256-byte) aligned.
@@ -1787,47 +1880,24 @@ impl ColdBoot {
     ) -> [Option<Timing>; MAX_MODES] {
         let s = lit[k].selection;
         let caps = hdmi_caps(edid);
-        let mut modes = [None; MAX_MODES];
-        let mut n = 0;
-        let mut joint: Vec<dml::Mode> = lit.iter().map(|m| selection_mode(&m.selection)).collect();
-        for t in edid_timings(edid) {
-            if n == MAX_MODES {
-                break;
-            }
+        admitted_modes(soc, lit, k, edid_timings(edid), |t| {
             // How the link would carry it: HDMI may need 4:2:0.
-            let format = if s.hdmi {
+            if s.hdmi {
                 // FRL only for the display holding the HPO FRL encoder.
                 let frl = s.frl.and_then(|_| frl_cap(caps));
-                hdmi_output(caps, &t, max_bpc(), frl).map(|(_, ycbcr420, _)| ycbcr420)
+                hdmi_output(caps, &t, max_bpc(), frl).map(|(_, ycbcr420, _)| dml::Mode {
+                    ycbcr420,
+                    ..mode(t)
+                })
             } else if let Some(m) = s.mst {
                 // Within the stream's own payload.
                 super::mst::mst_slots(&t, s.lanes, s.rate, s.caps.fec)
                     .is_some_and(|(pbn, slots)| pbn <= m.pbn && slots <= m.slots)
-                    .then_some(false)
+                    .then(|| mode(t))
             } else {
-                dp_offer_fits(&t, &s).then_some(false)
-            };
-            if t == s.timing {
-                modes[n] = Some(t);
-                n += 1;
-                continue;
+                dp_offered_mode(t, &s, soc.dispclk_max_khz)
             }
-            let Some(ycbcr420) = format else {
-                continue;
-            };
-            joint[k] = dml::Mode {
-                ycbcr420,
-                ..mode(t)
-            };
-            if dml::admit_all(soc, &joint).is_ok() {
-                modes[n] = Some(t);
-                n += 1;
-            }
-        }
-        if !modes.contains(&Some(s.timing)) {
-            modes[MAX_MODES - 1] = Some(s.timing);
-        }
-        modes
+        })
     }
     /// Train the selected sink down the fallback ladder from its selection,
     /// then start the frontend, video and scanout of the staged `pipe`.
@@ -1888,17 +1958,7 @@ impl ColdBoot {
             let mut refused = ModesetError::Link;
             let transmitter =
                 self.display_paths().map_err(|_| ModesetError::NoSink)?[port].transmitter;
-            // A DSC stream's bpp was chosen for this link: no fallback.
-            let candidates = if selection.dsc.is_some() {
-                alloc::vec![(selection.lanes, selection.rate)]
-            } else {
-                dp_candidates(
-                    &selection.timing,
-                    selection.caps,
-                    selection.lanes,
-                    selection.rate,
-                )
-            };
+            let candidates = selected_dp_candidates(&selection);
             for (lanes, link) in candidates {
                 let DpRate::Legacy(rate) = link else {
                     continue;
@@ -2189,13 +2249,16 @@ impl ColdBoot {
         if m.selection.hdmi || m.selection.mst.is_some() {
             return Err(ModesetError::Display(otg::Error::Unsupported));
         }
+        // Capture real board limits before changing the live link. Refilter
+        // the old offered timings after training, beside every retained sibling.
+        let soc = self.display_soc()?;
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
             if m.selection.uhbr() {
                 self.stop_display_scanout(m.pipe).await?;
                 self.stop_uhbr(port, false).await?;
                 (m.selection, m.scanout) = self.start_link(m.selection, m.pipe).await?;
-                self.modesets.retain(*m);
+                self.retain_retrained_modeset(m, &soc);
                 return Ok(());
             }
             if m.selection.audio.is_some() {
@@ -2206,9 +2269,19 @@ impl ColdBoot {
             self.stop_display_dp_frontend(port).await?;
             self.stop_display_dp_link(port).await?;
             (m.selection, m.scanout) = self.start_link(m.selection, m.pipe).await?;
-            self.modesets.retain(*m);
+            self.retain_retrained_modeset(m, &soc);
         }
         Ok(())
+    }
+    fn retain_retrained_modeset(&mut self, m: &mut Modeset, soc: &dml::Soc) {
+        // Preserve the actual completion before doing any further work.
+        self.modesets.retain(*m);
+        let lit: Vec<_> = self.display_modesets().into_iter().flatten().collect();
+        let k = lit.iter().position(|old| old.pipe == m.pipe).unwrap();
+        m.modes = admitted_modes(soc, &lit, k, m.modes.into_iter().flatten(), |t| {
+            dp_offered_mode(t, &m.selection, soc.dispclk_max_khz)
+        });
+        self.modesets.retain(*m);
     }
     /// Tear down a modeset whose sink left: as `stop_modeset`, but a DP link
     /// stops without addressing the sink, and only while HPD stays low. An

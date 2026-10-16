@@ -736,6 +736,13 @@ impl OutputState {
             self.shown.as_ref()
         }
     }
+    fn retrained(&mut self, edid: [u8; 128], timing: Timing, offered: Vec<Timing>) {
+        // A lower trained link can invalidate alternatives and queued requests.
+        // Keep the actual running timing and update KMS without re-adopting VRAM.
+        self.requested = self.requested.filter(|t| offered.contains(t));
+        self.sst_modes.clone_from(&offered);
+        self.shown = Some((edid, timing, offered));
+    }
     fn published_active(&self) -> bool {
         self.active && !self.retiring
     }
@@ -1733,6 +1740,11 @@ pub async unsafe fn monitor_displays(
                 // SAFETY: as above.
                 unsafe { boot.retrain_modeset(&mut m) }.await?;
                 displays.lit[usize::from(k)] = Some(m);
+                OUTPUT_STATE.lock()[usize::from(k)].retrained(
+                    m.selection.edid,
+                    m.selection.timing,
+                    m.modes.into_iter().flatten().collect(),
+                );
                 steps.push(MonitorStep::Retrained(k));
             }
             Health::Unplugged => {
@@ -2298,6 +2310,42 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/navi48-kms",
         navi48_dark_sst_connector_preserves_disable_and_invalidates_replacement
+    );
+
+    fn navi48_retraining_refreshes_published_modes_and_drops_invalid_requests() -> TestResult {
+        let timing = Timing {
+            pixel_clock_khz: 148500,
+            h_active: 1920,
+            h_total: 2200,
+            h_front_porch: 88,
+            h_sync_width: 44,
+            v_active: 1080,
+            v_total: 1125,
+            v_front_porch: 4,
+            v_sync_width: 5,
+            h_sync_positive: true,
+            v_sync_positive: true,
+        };
+        let faster = Timing {
+            pixel_clock_khz: 594000,
+            ..timing
+        };
+        let mut state = OutputState::new();
+        state.shown = Some(([1; 128], timing, alloc::vec![timing, faster]));
+        state.requested = Some(faster);
+        state.retrained([1; 128], timing, alloc::vec![timing]);
+        assert_eq!(state.offered(), &[timing]);
+        assert_eq!(state.sst_modes, [timing]);
+        assert!(state.requested.is_none() && state.published_active());
+        assert_eq!(state.published().unwrap().1, timing);
+        state.requested = Some(timing);
+        state.retrained([1; 128], timing, alloc::vec![timing]);
+        assert_eq!(state.requested, Some(timing));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_retraining_refreshes_published_modes_and_drops_invalid_requests
     );
 
     fn navi48_mst_disabled_connector_survives_hotplug() -> TestResult {

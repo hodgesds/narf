@@ -962,7 +962,11 @@ only, `retrain_modeset` is `Unsupported`, and stop/unplug use
 and HDMI port.
 Training then walks narf's fallback ladder (`link_candidates`), trying only
 settings that carry the mode: the link rate drops first; below RBR the lanes
-halve and the rate restarts at the sink's maximum. A confirmed CR, EQ or
+halve and the rate restarts at this attempt's starting rate. Legacy DSC also
+walks this ladder while keeping the admitted bpp, PPS, timing and DML plan:
+only settings that carry that compressed payload plus slice overhead after
+FEC are tried. Changing bpp/slice geometry requires a new admission and is
+not done inside link fallback. A confirmed CR, EQ or
 link-loss failure whose idle exit is proven leaves the owner in
 `DpLinkRefused`, retaining the plan. Only `stop_dp_link` may follow: as in
 Linux's retries, the sink is put in D3 and the PHY disabled before the next
@@ -1125,6 +1129,17 @@ they cannot discard an unfinished activation or silently retry it.
 Models cover every protocol's step ordering, rejection/cancellation at every
 step, request identity, sibling progress and unplug upgrades. Physical
 transition/recovery validation remains open.
+
+Alternative DP timings now carry their actual DSC shape into joint DML
+admission, computed with the board's DISPCLK limit. After link fallback, the
+configuration selection would produce must fit the trained link; advertising
+a smaller bpp which the subsequent selection would not use is not allowed.
+Successful legacy/UHBR retraining re-admits the previous offered timings beside
+the retained sibling streams, always preserving the actual running timing.
+The device's retained Modeset and KMS publication both receive the refreshed
+list. A queued request for a removed timing is discarded; valid requests and
+the running CRTC remain. This neither reallocates scanout nor clears native
+failure/cancellation quarantine.
 
 Before training, the modeset enables the connector's HPD block, as Linux's
 interrupt-mode HPD GPIO and `enable_hpd` do: the pad's DC_GPIO_HPD_MASK bit is
