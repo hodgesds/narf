@@ -3,34 +3,23 @@
 //! Targets the MediaTek silicon shipping in current AMD-Zen / Phoenix
 //! HawkPoint1 laptops:
 //!
-//! - **MT7921** — Wi-Fi 6 2x2 (`14c3:0608`, `14c3:0616`).
+//! - **MT7921** — Wi-Fi 6 2x2 (`14c3:0608`).
 //! - **MT7961** — Wi-Fi 6E 2x2 (`14c3:7961`). Re-tags to MT7920 at
 //!   runtime when `MT_HW_BOUND[7]` is set (DBDC bond).
-//! - **MT7922** — Wi-Fi 6E 2x2, newer cut (`14c3:7922`, also
+//! - **MT7922** — Wi-Fi 6E 2x2, newer cut (`14c3:7922`, `14c3:0616`, also
 //!   `0e8d:7922` for the ITTIM-vendor SKU).
 //!
-//! ## Scope reached (this commit set)
+//! ## Implemented bringup
 //!
-//! - **Stage 0** — PCI device-id table for the 5 known IDs, BAR0
-//!   mapping, presence test via `MT_PCIE_MAC_INT_ENABLE`, chip-id +
-//!   revision read via the L1 remap, MT7920 re-tagging.
-//! - **Stage 1** — driver-own / FW-own handshake against
-//!   `MT_CONN_ON_LPCTL`, L0s-disable on the PCIe MAC, firmware-blob
-//!   name resolution for (patch + RAM code), trusted-loader authority
-//!   open. Real patch-apply is deferred to Stage 2.
-//! - **Stage 2 scaffolding** — TX/RX ring queue-id constants
-//!   (`MT7921_TXQ_AC_*` / `MT7921_TXQ_BMC`, `MT7921_RXQ_DATA` /
-//!   `MT7921_RXQ_MCU_EVENT`), `MCU_EXT_CMD` header byte encoder.
+//! PCI discovery validates the BAR and checked CONNAC2 register windows,
+//! obtains ownership and defers firmware work until the late init stage.
+//! `firmware_transport` owns coherent WM/FWDL/MCU rings and performs bounded
+//! patch/RAM download through the live MCU protocol. Published allocations
+//! survive failure or cancellation until verified DMA shutdown.
 //!
-//! ## Out of scope (deferred — explicit)
-//!
-//! - DMA ring memory allocation + descriptor encoding. Needs
-//!   `narf_memory::dma_alloc` ring helpers + WFDMA0 register
-//!   programming (`MT_WFDMA0_RING_BASE_*`).
-//! - MCU patch-apply + RAM-code download (depends on FWDL ring).
-//! - EFUSE read (depends on alive MCU).
-//! - 802.11 association / scan / management — those land via the
-//!   shared `narf-wireless` crate once the MCU mailbox is live.
+//! EFUSE, scan, association and the WLAN data path remain unfinished. The
+//! older `full_bring_up` boundary intentionally returns `NotImplemented`;
+//! firmware-only initialization uses the retained transport owner instead.
 //!
 //! ## Provenance
 //!
@@ -43,6 +32,7 @@
 pub mod bringup;
 pub mod cmd;
 pub mod dma;
+pub mod firmware_transport;
 pub mod fwdl;
 pub mod mac;
 pub mod mcu;
@@ -65,6 +55,13 @@ pub use regs::{
 /// (one level up in `drivers/wireless/src/lib.rs`).
 pub fn register() {
     register_pci_driver();
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register_with_budget(
+        narf_init::Stage::Late,
+        "mt76-firmware",
+        firmware_transport::start_boot,
+        30_000,
+    );
 }
 
 // Co-located smokes. The whole `mt7921` module compiles only under the

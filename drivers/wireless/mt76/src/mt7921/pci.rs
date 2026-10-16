@@ -21,13 +21,13 @@
 #![allow(dead_code)]
 
 use core::fmt::Write as _;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::mac;
-use super::mcu;
 use super::regs::*;
 
 /// One bound MT7921 controller — what the driver retains after probe.
@@ -98,6 +98,10 @@ pub enum ProbeError {
 /// Single-instance live device. Probe drops a new entry into this
 /// slot. The kernel-test smokes reset it via `__reset_for_test`.
 static CONTROLLER: IrqSafeSpinLock<Option<Mt7921Device>> = IrqSafeSpinLock::new(None);
+#[cfg(target_arch = "x86_64")]
+static FIRMWARE_BINDING: IrqSafeSpinLock<Option<(BusDevice, Cap<BusDeviceCap, Write>)>> =
+    IrqSafeSpinLock::new(None);
+static TRANSPORT_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Register the PCI match table. One entry per supported device id —
 /// names must be unique (the bus match registry is keyed by `name`)
@@ -173,6 +177,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     );
 
     let did = dev.effective_did;
+    #[cfg(target_arch = "x86_64")]
+    {
+        *FIRMWARE_BINDING.lock() = Some((device, cap));
+    }
     *CONTROLLER.lock() = Some(dev);
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -187,7 +195,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // transport are not live yet; do not publish a zero-MAC netdev/wiphy.
     let _ = writeln!(
         narf_console::Writer,
-        "  mt7921: discovery complete; firmware transport unavailable (no wlan interface)"
+        "  mt7921: discovery complete; firmware startup deferred until firmware scan"
     );
     Ok(())
 }
@@ -243,42 +251,9 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Mt7921Device, ProbeError> {
         Err(mac::PowerError::InvalidWindow) => return Err(ProbeError::UnsupportedRegisterWindow),
     };
 
-    // Firmware-load stub. Stage-1 deliberately stops at the firmware
-    // boundary — the patch + RAM-code blobs aren't typically
-    // installed in narf-firmware's registry yet, and even when they
-    // are, the patch-apply MCU sequence requires the DMA rings from
-    // Stage-2. We resolve the blob names (so a future installer
-    // knows what to ship) and call the MCU patch-load helper, which
-    // currently returns `Err(NotImplemented)` past the resolve step.
-    let mut mac_bytes = [0u8; MAC_ADDR_LEN];
-    // SAFETY: `mmio_bar0` is the live BAR0 region mapped above and
-    // driver-own was already taken (`take_driver_own` returned `Ok`),
-    // which is exactly the precondition `load_firmware_stub` requires.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let firmware_outcome = unsafe { mcu::load_firmware_stub(&mmio_bar0, effective_did) };
-    if let Err(mcu::McuError::NotImplemented) = firmware_outcome {
-        // Expected baseline path — note it but keep the device bound.
-        let _ = writeln!(
-            narf_console::Writer,
-            "  mt7921: firmware-load deferred (Stage-2 DMA rings needed)"
-        );
-    }
-
-    // EFUSE read is gated on firmware being live. If the firmware
-    // load returned `NotImplemented`, we leave `mac_bytes` zeroed
-    // and surface "no EFUSE" via the all-zero sentinel.
-    if firmware_outcome.is_ok() {
-        // SAFETY: `mmio_bar0` is the live BAR0 region; this branch only
-        // runs when `load_firmware_stub` returned `Ok`, so firmware is
-        // live and the EFUSE registers are valid to read.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        if let Ok(m) = unsafe { mcu::read_efuse_mac(&mmio_bar0) } {
-            mac_bytes = m;
-        }
-    }
-
-    // No DMA ring is published until the firmware transport is implemented.
-    // The old stub programmed rings and then freed them on NotImplemented.
+    // Firmware payloads are not registered until Late init. The retained
+    // MCU/DMA owner is prepared there, outside this controller spinlock.
+    let mac_bytes = [0u8; MAC_ADDR_LEN];
 
     Ok(Mt7921Device {
         mmio_bar0,
@@ -375,9 +350,45 @@ pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
 }
 
-/// Borrow the bound controller. Returns `None` if probe hasn't run.
+/// Borrow discovery state before the exclusive firmware transport handoff.
+/// Returns `None` if probe hasn't run or the transport owns the device.
 pub fn with_controller<R>(f: impl FnOnce(&Mt7921Device) -> R) -> Option<R> {
+    if TRANSPORT_CLAIMED.load(Ordering::Acquire) {
+        return None;
+    }
     CONTROLLER.lock().as_ref().map(f)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn claim_firmware_transport(
+) -> Result<Option<super::firmware_transport::Transport>, super::firmware_transport::Error> {
+    use super::firmware_transport::{Error, Firmware, Transport};
+    let Some((device, authority)) = *FIRMWARE_BINDING.lock() else {
+        return Ok(None);
+    };
+    if TRANSPORT_CLAIMED.load(Ordering::Acquire) {
+        return Err(Error::Busy);
+    }
+    let (mmio, did) = {
+        let guard = CONTROLLER.lock();
+        let controller = guard.as_ref().ok_or(Error::Busy)?;
+        (controller.mmio_bar0, controller.effective_did)
+    };
+    let registry = narf_firmware::trusted_loader_authority()
+        .ok_or(Error::Authority)?
+        .derive()
+        .map_err(|_| Error::Authority)?;
+    let firmware = Firmware::open(did, &registry)?;
+    // SAFETY: final single-CPU boot handoff after discovery and firmware scan,
+    // before executor polling; no MT76 rings exist and bus mastering is off.
+    let transport = unsafe { Transport::new(mmio, device, authority, firmware)? };
+    if TRANSPORT_CLAIMED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(Error::Busy);
+    }
+    Ok(Some(transport))
 }
 
 /// Test-only reset of the bound slot. Available in the built-in build (which
@@ -385,4 +396,9 @@ pub fn with_controller<R>(f: impl FnOnce(&Mt7921Device) -> R) -> Option<R> {
 #[cfg(any(test, feature = "builtin"))]
 pub fn __reset_for_test() {
     *CONTROLLER.lock() = None;
+    #[cfg(target_arch = "x86_64")]
+    {
+        *FIRMWARE_BINDING.lock() = None;
+    }
+    TRANSPORT_CLAIMED.store(false, Ordering::Release);
 }

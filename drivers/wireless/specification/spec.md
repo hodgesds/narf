@@ -85,12 +85,42 @@ must not use an indirect offset without a serialized selector transaction.
 Probe clears PCI bus mastering and leaves DMA ring publication disabled.
 Ownership waits are deadline-bounded; `PowerError::InvalidWindow` reports
 an invalid register access and `UnsupportedChip` rejects unknown identities.
-PCI discovery does not publish a zero-MAC netdev/wiphy. Firmware dispatch,
-EFUSE reading and a working Wi-Fi data path remain unimplemented. The
+PCI discovery does not publish a zero-MAC netdev/wiphy. EFUSE reading and a
+working Wi-Fi data path remain unimplemented. The legacy
 `full_bring_up` boundary returns `NotImplemented` without allocating or
 programming rings until it can retain every published allocation.
 PCI alias `14c3:0616` selects the MT7922 firmware pair. Register translation
 and selector encoding follow the local Linux reference at `ecd997b0189a`.
+
+### MT76 MCU/DMA firmware transport
+
+`mt7921::firmware_transport::Firmware::prepare` validates and owns patch and
+RAM images before device writes; `Firmware::open` obtains them through a
+live firmware-registry capability. On x86_64, unsafe `Transport::new` requires
+exclusive device/register-latch ownership, a permanent BAR mapping, coherent
+identity DMA and disabled PCI bus mastering. Per-domain IOMMU configurations
+are rejected until an explicit DMA mapping path is implemented.
+
+`Transport::run` is a single-use, cancellation-safe borrowed future. It
+quiesces inherited DMA, publishes owned WM/FWDL TX and MCU RX rings, obtains
+driver ownership, restarts the ROM, negotiates the patch semaphore, downloads
+patch/RAM regions, starts firmware and verifies its ready register. MCU
+commands carry CONNAC2 headers; scatter payloads are raw 4096-byte chunks.
+TX completion requires descriptor completion and the device index; RX validates
+descriptor lengths, packet type and event framing before rearming. Commands
+match nonzero sequence numbers and retain at most 32 unrelated events.
+Every wait checks authority and has a deadline, including a 30-second total
+boot budget. Waits self-wake and use the scheduler bridge rather than relying
+on another executor task or on enabled device interrupts.
+
+`state` reports the last stage and terminal error; `pop_event` drains retained
+notifications. Failed or cancelled attempts cannot be replayed. Published DMA
+allocations remain retained even when the owner is dropped. `shutdown` permits
+release only after DMA is disabled and idle, PCI bus mastering is confirmed
+off and ring references are cleared. Failure to prove quiescence retains memory.
+The late `mt76-firmware` initcall runs after firmware discovery and retains the
+transport on success or failure; `boot_status` exposes its state. A ready
+report proves firmware startup only and does not register a WLAN interface.
 
 ### 3.1 Implemented iwlwifi MLD station profile
 

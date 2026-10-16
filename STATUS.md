@@ -14,6 +14,18 @@ current test results.
 | 4 · Compatibility | In-tree shell gate met; compatibility continues | Interactive `echo hello world` follows serial IRQ → input ring → shell → UART. Linux-compatible musl programs, storage, networking, and graphics have additional QEMU proofs. The original relibc-specific criterion is not the closure proof. |
 | 5 · Silicon | In progress | Driver and diagnostic foundations exist; the selected AMD laptop end-to-end gate has not been demonstrated. |
 
+## MT7921/MT7922 firmware bringup
+
+The x86_64 MT76 late init path now owns coherent WM/FWDL/MCU DMA rings and
+performs ROM restart, patch semaphore negotiation, patch/RAM download and
+firmware-ready verification. Waits are bounded and report the current stage;
+failed or cancelled attempts retain published DMA until verified shutdown.
+The targeted QEMU suite passes 69 tests with one skip, including protocol,
+production descriptor, cancellation and installed MT7922 image-layout models.
+Both-architecture Clippy and an x86_64 UEFI boot smoke pass. Physical MT7922
+firmware startup remains unverified; EFUSE, association and a working WLAN
+data path remain unfinished. This does not close the Stage 5 Wi-Fi gate.
+
 ## Loadable e1000 datapath
 
 The copy-mode module ABI now has an exclusive live-wire proof. `cargo xtask

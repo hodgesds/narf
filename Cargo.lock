@@ -2255,6 +2255,7 @@ dependencies = [
  "narf-driver-runtime",
  "narf-drivers",
  "narf-firmware",
+ "narf-init",
  "narf-interrupts",
  "narf-io",
  "narf-ipc",
