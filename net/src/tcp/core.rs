@@ -1140,6 +1140,8 @@ pub fn __reset_for_test() {
 /// format. Matches what Linux's `get_tcp4_sock` extracts per row.
 #[derive(Clone, Debug)]
 pub struct TcbSnapshot {
+    /// TCB id, the key the socket layer wires a socket to.
+    pub id: u32,
     pub local_addr: [u8; 4],
     pub local_port: u16,
     pub remote_addr: [u8; 4],
@@ -1165,6 +1167,8 @@ pub struct TcbSnapshot {
 
 #[derive(Clone, Debug)]
 pub struct Tcb6Snapshot {
+    /// TCB id, the key the socket layer wires a socket to.
+    pub id: u32,
     pub local_addr: [u8; 16],
     pub local_port: u16,
     pub remote_addr: [u8; 16],
@@ -1329,7 +1333,7 @@ pub fn snapshot_in(net_ns_id: u64) -> alloc::vec::Vec<TcbSnapshot> {
             Some(m) => m,
             None => continue,
         };
-        for arc in m.values() {
+        for (&id, arc) in m.iter() {
             let t = arc.lock();
             if t.net_ns_id != net_ns_id || t.is_ipv6 {
                 continue;
@@ -1352,6 +1356,7 @@ pub fn snapshot_in(net_ns_id: u64) -> alloc::vec::Vec<TcbSnapshot> {
             };
             let mss = t.cong.mss.max(1);
             out.push(TcbSnapshot {
+                id,
                 local_addr: t.local_addr,
                 local_port: t.local_port,
                 remote_addr: t.remote_addr,
@@ -1400,12 +1405,13 @@ pub fn snapshot6_in(net_ns_id: u64) -> alloc::vec::Vec<Tcb6Snapshot> {
         let Some(table) = table.as_ref() else {
             continue;
         };
-        for tcb in table.values() {
+        for (&id, tcb) in table.iter() {
             let tcb = tcb.lock();
             if tcb.net_ns_id != net_ns_id || !tcb.is_ipv6 {
                 continue;
             }
             out.push(Tcb6Snapshot {
+                id,
                 local_addr: tcb.local_addr6,
                 local_port: tcb.local_port,
                 remote_addr: tcb.remote_addr6,

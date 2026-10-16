@@ -208,6 +208,32 @@ pub fn set_tcb_owner(tcb_id: u32, task_id: u64) {
         .insert(tcb_id, task_id);
 }
 
+/// tcb_id → (`sk_uid`, socket inode) of the socket a kernel TCB backs, for
+/// the uid/inode columns of `/proc/net/tcp{,6}` (Linux `sock_i_uid` /
+/// `sock_i_ino`). Recorded whenever a socket is wired to a TCB (listen,
+/// accept, connect) and dropped with [`clear_tcb_owner`] on close, so a TCB
+/// that outlives its socket (FIN_WAIT, TIME_WAIT) reports 0/0 as on Linux.
+#[allow(clippy::type_complexity)]
+static TCB_SOCKET: [narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u32, (u32, u64)>>,
+>; WAKE_SHARDS] = [const { narf_lib::sync::IrqSafeSpinLock::new(None) }; WAKE_SHARDS];
+
+/// Record the socket identity `(uid, inode)` backed by kernel `tcb_id`.
+pub fn set_tcb_socket(tcb_id: u32, uid: u32, inode: u64) {
+    TCB_SOCKET[tcb_owner_shard(tcb_id)]
+        .lock()
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(tcb_id, (uid, inode));
+}
+
+/// `(uid, inode)` of the socket still attached to `tcb_id`, if any.
+pub fn tcb_socket(tcb_id: u32) -> Option<(u32, u64)> {
+    TCB_SOCKET[tcb_owner_shard(tcb_id)]
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&tcb_id).copied())
+}
+
 /// Drop the ownership record for `tcb_id` (socket closed / TCB gone).
 pub fn clear_tcb_owner(tcb_id: u32) {
     {
@@ -215,6 +241,9 @@ pub fn clear_tcb_owner(tcb_id: u32) {
         if let Some(m) = g.as_mut() {
             m.remove(&tcb_id);
         }
+    }
+    if let Some(m) = TCB_SOCKET[tcb_owner_shard(tcb_id)].lock().as_mut() {
+        m.remove(&tcb_id);
     }
     // Tear down the durable readiness cell too. Latch POLL_IN|POLL_HUP first so
     // any waiter still armed on it wakes (a closed socket is readable → EOF).
@@ -16727,6 +16756,11 @@ pub fn pty_jobctl_sessions(pgrp: u64) -> (u64, u64) {
 /// visible pid plus effective uid/gid. Stamped onto every socket end at
 /// creation so `SO_PEERCRED` reports the connect-time identity. Automatic
 /// message credentials use [`current_scm_ucred`] instead.
+/// The calling task's filesystem uid (`current_fsuid()`).
+pub fn current_fsuid() -> u32 {
+    read_uidgid(current_task_id()).fsuid
+}
+
 pub fn current_ucred() -> crate::socket::Ucred {
     let task = current_task_id();
     let cached = crate::task::current_cached_identity(task);

@@ -1380,8 +1380,12 @@ values that have no authoritative NARF provider remain absent rather than
 fabricated measurements.
 `/proc/net/tcp` rows follow Linux `get_tcp4_sock` column order through the
 congestion-window and slow-start-threshold tail. Timer, probe, RTO, delayed-ACK,
-and congestion values come from the TCP snapshot hook; identity values remain
-zero until an authoritative socket-owner provider is installed.
+and congestion values come from the TCP snapshot hook. The uid and inode
+columns of `/proc/net/{tcp,tcp6,udp,udp6}` are the owning socket's `sk_uid`
+(creator fsuid) and sockfs inode — the inode `/proc/<pid>/fd/<n>` names as
+`socket:[ino]`; a TCB that outlives its socket, and kernel-internal endpoints,
+report zero. `/proc/net/udp` lists user AF_INET datagram sockets alongside the
+kernel's own UDP endpoints.
 `/proc/net/sockstat` and `sockstat6` expose Linux's line and field names and
 derive protocol in-use, TIME-WAIT, and allocation counts from the same
 namespace-scoped socket snapshots as the protocol tables.
