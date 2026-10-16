@@ -784,9 +784,10 @@ fn dcn401_otg_retirement_waits_for_current_master_and_busy() -> TestResult {
                 (BASE + (0x1ad1 + 0x10 * p) * 4, 0xabcd0000),
                 (BASE + (0x1b43 + 0x80 * p) * 4, 0x210200),
                 (BASE + (0x530 + p) * 4, 0x55),
+                (BASE + (0x1b43 + 0x80 * p) * 4, 0x200),
             ]
         );
-        assert_eq!(reg(&e, 0x1b43 + 0x80 * p), 0x200200);
+        assert_eq!(reg(&e, 0x1b43 + 0x80 * p), 0x200);
         assert_eq!(reg(&e, 0x1b84 + 0x80 * p), 0x103);
         assert_eq!(e.status.retired, 1 << pipe);
         assert_eq!(e.status.state, State::Retired);
@@ -812,8 +813,11 @@ fn dcn401_otg_retirement_faults_and_cancel_never_release_resources() -> TestResu
         assert_eq!(e.status.state, State::Failed(err));
         assert_eq!(e.status.retired, 0);
         assert_eq!(run(e.retire(0)), Err(Error::Busy));
+        // A timing which did not stop must retain its HPO route.
+        assert_eq!(reg(&e, 0x1b43) & 0x300000, 0x200000);
+        assert_eq!(e.io.writes.len(), 4);
     }
-    for n in 1..=4 {
+    for n in 1..=5 {
         let mut e = engine();
         active(&mut e, 0);
         e.io.gone = Some(n);
@@ -827,6 +831,15 @@ fn dcn401_otg_retirement_faults_and_cancel_never_release_resources() -> TestResu
         assert_eq!(e.io.writes.len(), n);
         assert_eq!(e.status.retired, 0);
     }
+    let mut e = engine();
+    active(&mut e, 0);
+    e.io.reject = Some(5);
+    let err = Error::Readback(BASE + 0x1b43 * 4);
+    assert_eq!(run(e.retire(0)), Err(err));
+    assert_eq!(e.status.state, State::Failed(err));
+    assert_eq!(e.status.retired, 0);
+    assert_eq!(reg(&e, 0x1b43) & 0x300000, 0x200000);
+    assert_eq!(run(e.retire(0)), Err(Error::Busy));
     let mut e = engine();
     active(&mut e, 0);
     e.io.stall = 4;

@@ -1773,6 +1773,13 @@ impl ColdBoot {
                 return self.start_frl_link(selection, rate, pipe).await;
             }
             if selection.hdmi {
+                if selection.scdc {
+                    // The sink may accept a write whose acknowledgement fails.
+                    // Record its cleanup before any SCDC transaction, without
+                    // inventing a native link which has not been prepared yet.
+                    self.teardowns
+                        .checkpoint_activation(pipe, super::TeardownStep::PreLinkScdc);
+                }
                 self.configure_scdc(&selection).await?;
                 let request = otg::HdmiLinkRequest {
                     stream: pipe,

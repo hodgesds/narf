@@ -422,7 +422,9 @@ surfaces, page tables, HUBP and OPP resources. It first checks that all legacy,
 HPO DP and FRL streams/link clocks are retired. It disconnects all ODM segments,
 clears combining-memory selection, requests OTG disable and disables VTG, then
 waits independently for current master state and busy to clear (150 ms each).
-Clocks remain on. This proves timing retirement only; it cannot authorize memory
+Once both clear, it restores `OTG_OUT_MUX` to DIO with readback, including
+UHBR/FRL routes. A failed disable leaves the mux unchanged; a failed mux reset
+cannot publish retirement. Clocks remain on. This proves timing retirement only; it cannot authorize memory
 reuse or replace HUBP fetch retirement. Uncertain writes, timeouts or revocation
 record `Failed`; cancellation retains `Preparing(pipe)`/`Retiring(pipe)`. Those
 states block replay and platform clock changes. `Status::pipes` is historical
@@ -1023,6 +1025,14 @@ successful audio is the final startup operation and returns a normal Modeset.
 UHBR/FRL scanout is likewise the final startup operation. Retraining an already
 published Modeset does not create or change an activation record.
 
+TMDS also records `TeardownStep::PreLinkScdc` before its first SCDC transaction.
+A returned SCDC error or subsequent native-link preflight rejection therefore
+restores legacy TMDS configuration before retiring timing and planes, without
+attempting to stop a link that never completed startup. The sink write keeps
+the existing best-effort policy; native state and fresh release guards remain
+binding. Completed link startup replaces this obligation with the normal SCDC
+then Link cleanup path. Cancellation still retains `in_flight` and refuses replay.
+
 MST checkpoints trained/attached link ownership at Link, the frontend at
 Frontend, completed payload allocation at Payload and black video at Video.
 Cleanup removes the payload before detaching the frontend/link, preserving
@@ -1051,7 +1061,7 @@ An unknown/non-activation pipe is Invalid. Dropping startup or an abort phase
 leaves the in-flight marker set and blocks replay, even if the native state
 looks reusable during a compound operation or retry delay. No reset or
 recovery of cancelled startup, incomplete MST payload transactions,
-uncheckpointed active work, pre-link SCDC changes or shared-clock failure is
+uncheckpointed active work or shared-clock failure is
 implied. Models cover abort phase faults/cancellation, every supported
 checkpoint's cleanup suffix, sibling isolation and native staged/live retirement
 through fresh release.

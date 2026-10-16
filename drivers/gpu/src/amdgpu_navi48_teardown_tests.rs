@@ -532,7 +532,7 @@ kernel_test_in!(
 fn activation_checkpoints() -> [(Protocol, &'static [TeardownStep]); 5] {
     use TeardownStep::*;
     [
-        (Protocol::Tmds, &[Scdc, Video, Scanout]),
+        (Protocol::Tmds, &[PreLinkScdc, Scdc, Video, Scanout]),
         (Protocol::Sst, &[Link, Frontend, Video, Scanout]),
         (Protocol::Uhbr, &[Link, Video]),
         (Protocol::Frl, &[Scdc, Video]),
@@ -545,8 +545,18 @@ fn navi48_partial_activation_unwinds_only_completed_phases_and_releases() -> Tes
         for (index, &next) in checkpoints.iter().enumerate() {
             let r = activation(protocol);
             let normal = cases().into_iter().find(|c| c.0 == protocol).unwrap().1;
-            let start = normal.iter().position(|&s| s == next).unwrap();
-            let mut steps = normal[start..].to_vec();
+            let mut steps = if next == TeardownStep::PreLinkScdc {
+                // Sink configuration does not prove a native link exists:
+                // restore the sink, then retire staging without a link stop.
+                alloc::vec![
+                    TeardownStep::PreLinkScdc,
+                    TeardownStep::Timing,
+                    TeardownStep::Planes,
+                ]
+            } else {
+                let start = normal.iter().position(|&s| s == next).unwrap();
+                normal[start..].to_vec()
+            };
             steps.push(TeardownStep::Release);
             // Every cleanup boundary can reject before writing and resume.
             for (blocked_at, &blocked) in steps.iter().enumerate() {

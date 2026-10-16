@@ -9,6 +9,8 @@ pub enum TeardownStep {
     Scanout,
     Video,
     Scdc,
+    /// TMDS sink configuration attempted before the native link was prepared.
+    PreLinkScdc,
     Payload,
     Frontend,
     Link,
@@ -111,6 +113,7 @@ impl Request {
                 Protocol::Uhbr => Link,
             },
             Scdc | Frontend => Link,
+            PreLinkScdc => Timing,
             Payload => Frontend,
             Link => Timing,
             Timing if self.dsc => DscClock,
@@ -172,7 +175,10 @@ impl Teardowns {
         self.start_activation(Request::activation(pipe, selection))
     }
     /// Record the inverse of a completed startup phase, without a suspension
-    /// between its native completion and this checkpoint. This is not permission
+    /// between its native completion and this checkpoint. PreLinkScdc instead
+    /// records a sink-cleanup obligation before the first SCDC transaction;
+    /// its configuration may have taken effect even on a returned error.
+    /// This is not permission
     /// to replay a cancelled startup or bypass a failed native owner. Retraining
     /// also uses start_link, but has no unpublished activation to checkpoint.
     pub(super) fn checkpoint_activation(&mut self, pipe: u8, next: TeardownStep) {
@@ -339,7 +345,7 @@ impl Backend for ColdBoot {
                     Protocol::Uhbr => self.stop_display_uhbr_video(r.port).await?,
                     Protocol::Sst | Protocol::Mst => self.stop_display_dp_video(r.port).await?,
                 },
-                Scdc => {
+                Scdc | PreLinkScdc => {
                     if r.protocol == Protocol::Frl {
                         self.stop_frl_sink(r.port).await;
                     } else if r.scdc {

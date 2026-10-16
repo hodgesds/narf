@@ -458,8 +458,12 @@ to black video. MST also checkpoints payload completion before video, retaining
 shared-link ownership until payload/frontend cleanup completes. A separate MST
 payload-transaction marker survives failure/cancellation before or after list
 updates; it blocks replay, teardown and session loss while ownership is uncertain.
-Native failure guards remain binding; cancelled startup, uncertain MST payload
-transactions, uncheckpointed active work, pre-link SCDC changes and
+TMDS records sink cleanup before the first SCDC transaction, so a returned
+failure before native-link completion restores legacy sink configuration and
+retires staging without inventing a link owner. Timing retirement also resets
+the UHBR/FRL output mux to DIO only after master/busy clear, with readback before
+retirement is published. Native failure guards remain binding; cancelled startup,
+uncertain MST payload transactions, uncheckpointed active work and
 shared-clock recovery remain open, with uncertain memory retained.
 The lit Navi48 display is published as DRM KMS state on the amdgpu card, with
 the sink's real EDID and exact timing (disconnected on unplug). SETCRTC

@@ -633,6 +633,12 @@ impl Layout {
 trait Io {
     fn read(&mut self, at: u64) -> u32;
     fn write(&mut self, at: u64, value: u32);
+    /// Models can suspend at a missing acknowledgement without racing the
+    /// host clock. Real MMIO never requests this test-only suspension.
+    #[cfg(feature = "kernel-test")]
+    fn pause_wait(&self) -> bool {
+        false
+    }
 }
 #[derive(Debug)]
 struct Mmio(MmioRegion);
@@ -982,6 +988,10 @@ impl<I: Io> Engine<I> {
             if self.read(at)? & mask == value {
                 return Ok(());
             }
+            #[cfg(feature = "kernel-test")]
+            if self.io.pause_wait() {
+                core::future::pending::<()>().await;
+            }
             if deadline.expired() {
                 return Err(Error::Timeout(at));
             }
@@ -1079,7 +1089,11 @@ impl<I: Io> Engine<I> {
         // timing's disable.
         let result = async {
             self.stop_dsc(pipe).await?;
-            self.disable(pipe).await
+            self.disable(pipe).await?;
+            // Linux resets the HPO output mux after link shutdown. Native
+            // retirement also waits for the timing to stop before switching
+            // it, so neither UHBR nor FRL leaves a stale HPO route behind.
+            self.update(self.layout.otg(pipe, CONTROL), 0x300000, 0)
         }
         .await;
         match result {

@@ -15,8 +15,12 @@ struct PowerIo {
     stall_blank: bool,
     delay: u8,
     wake_dirty: Option<(u64, u32)>,
+    pause_wait: bool,
 }
 impl Io for PowerIo {
+    fn pause_wait(&self) -> bool {
+        self.pause_wait
+    }
     fn read(&mut self, at: u64) -> u32 {
         if let Some((p, powered)) = self.pending {
             if at == pg(p, true) && !self.stall_power {
@@ -106,6 +110,7 @@ fn ready(off: u8) -> Engine<PowerIo> {
             stall_blank: false,
             delay: 1,
             wake_dirty: None,
+            pause_wait: false,
         },
         authority: e.authority,
         layout: e.layout,
@@ -265,6 +270,9 @@ fn dcn401_hubp_power_timeout_and_cancellation_retain_transition() -> TestResult 
             e.io.stall_power = phase == 0;
             e.io.stall_drain = phase == 1;
             e.io.stall_blank = phase == 2;
+            // Cancellation is an injected pending hardware acknowledgement,
+            // not a race against a 1 us timer within the first poll.
+            e.io.pause_wait = cancel;
             if phase == 2 {
                 e.io.inner.stall |= 2048;
             }
