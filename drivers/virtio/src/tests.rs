@@ -1153,6 +1153,90 @@ fn smoke_virtio_snd_pci_probe() -> TestResult {
 }
 kernel_test_in!("drivers/virtio/snd-pci", smoke_virtio_snd_pci_probe);
 
+/// The ALSA playback backend must keep the device's TX queue full without
+/// waiting for playback. The device acks a buffer only after consuming it at
+/// the stream rate, so a backend that waited for each ack inside START
+/// reported every queued frame as already played: ALSA saw an empty ring,
+/// raised XRUN, and PipeWire's DROP/PREPARE/START recovery looped forever.
+fn smoke_virtio_snd_pci_playback_queues_async() -> TestResult {
+    use crate::snd_pci;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    use narf_drivers_sound::format::{ChannelCount, HwParams, SampleFormat, SampleRate};
+    // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    if !devices().iter().any(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. })
+            && d.id.vendor == snd_pci::VIRTIO_SND_PCI_VENDOR
+            && d.id.device == snd_pci::VIRTIO_SND_PCI_DEVICE
+    }) {
+        return TestResult::Skip("no virtio-snd-pci");
+    }
+    snd_pci::__reset_for_test();
+    __reset_for_test();
+    snd_pci::register_pci_driver();
+    if probe_all_pci(&bootstrap_registry_authority()).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    let Some(card) = snd_pci::__card_index_for_test() else {
+        return TestResult::Fail("virtio-snd card not registered");
+    };
+    let Ok(mut stream) = narf_drivers_sound::open_playback(card, 0) else {
+        return TestResult::Fail("open_playback");
+    };
+    // 32 periods of 1024 frames = 683 ms at 48 kHz.
+    let params = HwParams {
+        format: SampleFormat::S16LE,
+        rate: SampleRate::R48000,
+        channels: ChannelCount::Stereo,
+        period_size: 1024,
+        periods: 32,
+    };
+    let frames = u64::from(params.period_size * params.periods);
+    if stream.hw_params(params).is_err() || stream.prepare().is_err() {
+        return TestResult::Fail("hw_params/prepare");
+    }
+    let silence = alloc::vec![0u8; params.buffer_bytes()];
+    if stream.write(&silence) != Ok(silence.len()) {
+        return TestResult::Fail("prefill did not accept the whole ring");
+    }
+    let started = narf_time::wall::monotonic_ns();
+    if stream.start().is_err() {
+        return TestResult::Fail("start");
+    }
+    let start_ms = (narf_time::wall::monotonic_ns() - started) / 1_000_000;
+    let early = stream.pointer();
+    if start_ms > 200 {
+        return TestResult::Fail("START waited for the queued audio to play");
+    }
+    if early >= frames / 2 {
+        return TestResult::Fail("pointer reported queued frames as played");
+    }
+    // Completions must still arrive and advance the pointer to the end.
+    let mut last = early;
+    let drained = narf_scheduler::responsive_spin_until(
+        || {
+            let now = stream.pointer();
+            if now < last {
+                return true;
+            }
+            last = now;
+            now >= frames
+        },
+        narf_time::Deadline::after_ms(3_000),
+    );
+    let _ = stream.stop();
+    if !drained || last != frames {
+        return TestResult::Fail("device completions did not advance the pointer to the end");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/snd-pci",
+    smoke_virtio_snd_pci_playback_queues_async
+);
+
 fn smoke_virtio_balloon_pci_probe() -> TestResult {
     use crate::balloon_pci;
     use narf_bus::driver_match::__reset_for_test;
