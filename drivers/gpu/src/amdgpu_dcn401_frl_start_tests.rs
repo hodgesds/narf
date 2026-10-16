@@ -3,6 +3,8 @@ use crate::amdgpu_dcn401_otg::frl::link::{phy::Firmware as PhyFirmware, start::F
 use crate::amdgpu_dmub_navi48 as dmub;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU8, Ordering};
+#[path = "amdgpu_dcn401_frl_audio_tests.rs"]
+mod audio;
 
 /// The firmware's half of an FRL link as the registers show it: ENABLE
 /// brings up the lanes and TX clocks, routes the PHY to the HPO FRL
@@ -236,6 +238,17 @@ fn prepared_frl_video(
     ycbcr420: bool,
     depth: ColorDepth,
 ) -> (Engine<FrlIo>, Fw, FrlVideoRequest, dccg::Applied) {
+    prepared_frl_video_rate(
+        ycbcr420,
+        depth,
+        crate::amdgpu_navi48_boot::FrlRate::new(6).unwrap(),
+    )
+}
+fn prepared_frl_video_rate(
+    ycbcr420: bool,
+    depth: ColorDepth,
+    rate: crate::amdgpu_navi48_boot::FrlRate,
+) -> (Engine<FrlIo>, Fw, FrlVideoRequest, dccg::Applied) {
     let (phy, pipe) = (2u8, 1u8);
     let event = Arc::new(AtomicU8::new(0));
     let mut e = engine();
@@ -246,7 +259,7 @@ fn prepared_frl_video(
         io: FrlIo {
             inner: e.io,
             phy,
-            lanes: 4,
+            lanes: rate.lanes(),
             event: event.clone(),
             drift_on_read: None,
         },
@@ -284,7 +297,7 @@ fn prepared_frl_video(
     for h in 0..4 {
         e.io.inner.regs.insert(BASE + (0x5f4 + h * 0xdc) * 4, 3);
     }
-    run(e.start_frl_link(&mut fw, path(phy), 4, 666_667)).unwrap();
+    run(e.start_frl_link(&mut fw, path(phy), rate.lanes(), rate.character_khz())).unwrap();
     e.frl_link_output(path(phy)).unwrap();
     let request = FrlVideoRequest {
         pipe,

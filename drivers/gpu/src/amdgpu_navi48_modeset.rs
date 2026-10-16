@@ -61,14 +61,14 @@ pub struct Selection {
     pub caps: DpCaps,
     /// The sink's base EDID block, reported to DRM verbatim.
     pub edid: [u8; 128],
-    /// A TMDS HDMI sink rather than DP SST.
+    /// An HDMI sink (TMDS or FRL) rather than DP.
     pub hdmi: bool,
     /// The HDMI sink declared SCDC (HF-VSDB/HF-SCDB SCDC_Present).
     pub scdc: bool,
     /// Output depth: 8 bpc for DP; for HDMI the deepest the sink, the
     /// link capacity and the requested maximum allow.
     pub depth: otg::ColorDepth,
-    /// The sink's audio, when it declares any (HDMI, or DP SST).
+    /// The sink's audio; FRL retains only supported LPCM modes.
     pub audio: Option<otg::AudioInfo>,
     /// The HDMI AVI InfoFrame's VIC, aspect and range for this timing.
     pub avi: otg::Avi,
@@ -1117,14 +1117,14 @@ pub fn hdmi_depth(caps: HdmiCaps, pixel_khz: u32, max_bpc: u8) -> Option<otg::Co
 /// (Linux keeps TMDS whenever it suffices), else FRL at `frl_cap` (none
 /// when FRL is off or taken): RGB first unless the mode is 4:2:0-only,
 /// then 4:2:0 where declared. Each uses the deepest declared depth up to
-/// `max_bpc` with a carrying rate, and the lowest such rate. FRL carries
-/// no audio here (the HPO FRL audio path is not implemented), so the
-/// capacity check runs without it.
+/// `max_bpc` with a carrying rate, and the lowest such rate. FRL reserves
+/// bandwidth for the sink's supported LPCM modes (layout 0 at SD timings).
 pub fn hdmi_output(
     caps: HdmiCaps,
     t: &Timing,
     max_bpc: u8,
     frl_cap: Option<FrlRate>,
+    audio: Option<otg::AudioInfo>,
 ) -> Option<(otg::ColorDepth, bool, Option<FrlRate>)> {
     if let Some((depth, ycbcr420)) = hdmi_format(caps, t, max_bpc) {
         return Some((depth, ycbcr420, None));
@@ -1133,7 +1133,10 @@ pub fn hdmi_output(
     let vic = narf_edid::modes::match_cea_mode(edid_mode(t));
     let listed = |map: [u64; 4]| vic != 0 && map[usize::from(vic / 64)] & 1 << (vic % 64) != 0;
     let only420 = listed(caps.y420_only);
-    let audio = frl_audio(None, t.v_active);
+    let audio = frl_audio(
+        audio.and_then(|a| otg::frl_lpcm_info(a, t.v_active)),
+        t.v_active,
+    );
     // RGB first where allowed, then subsampling only for a declared mode.
     for ycbcr420 in [false, true] {
         if !ycbcr420 && only420 || ycbcr420 && !only420 && !listed(caps.y420_also) {
@@ -1276,14 +1279,15 @@ pub fn select_all(
         let frl_cap = frl_cap(caps).filter(|_| frl_free);
         let audio = sink_audio_info(&sink.edid);
         let Some(timing) = pick(index, &sink.edid, &|t| {
-            hdmi_output(caps, t, max_bpc, frl_cap).is_some()
+            hdmi_output(caps, t, max_bpc, frl_cap, audio).is_some()
         }) else {
             continue;
         };
         let Some(edid) = sink.edid.get(..128).and_then(|b| b.try_into().ok()) else {
             continue;
         };
-        let Some((depth, ycbcr420, frl)) = hdmi_output(caps, &timing, max_bpc, frl_cap) else {
+        let Some((depth, ycbcr420, frl)) = hdmi_output(caps, &timing, max_bpc, frl_cap, audio)
+        else {
             link_short = true;
             continue;
         };
@@ -1298,8 +1302,11 @@ pub fn select_all(
             hdmi: true,
             scdc: caps.scdc,
             depth,
-            // The HPO FRL audio path (AFMT4/APG) is not implemented.
-            audio: if frl.is_some() { None } else { audio },
+            audio: if frl.is_some() {
+                audio.and_then(|a| otg::frl_lpcm_info(a, timing.v_active))
+            } else {
+                audio
+            },
             avi: hdmi_avi(caps, &timing),
             limited: false,
             ycbcr420,
@@ -1932,10 +1939,12 @@ impl ColdBoot {
             if s.hdmi {
                 // FRL only for the display holding the HPO FRL encoder.
                 let frl = s.frl.and_then(|_| frl_cap(caps));
-                hdmi_output(caps, &t, max_bpc(), frl).map(|(_, ycbcr420, _)| dml::Mode {
-                    ycbcr420,
-                    ..mode(t)
-                })
+                hdmi_output(caps, &t, max_bpc(), frl, sink_audio_info(edid)).map(
+                    |(_, ycbcr420, _)| dml::Mode {
+                        ycbcr420,
+                        ..mode(t)
+                    },
+                )
             } else if let Some(m) = s.mst {
                 // Within the stream's own payload.
                 super::mst::mst_slots(&t, s.lanes, s.rate, s.caps.fec)
@@ -2132,8 +2141,7 @@ impl ColdBoot {
     }
     /// The FRL half of `start_link`: train (stepping down on the sink's
     /// request), then FRL video with the borrow parameters Linux's capacity
-    /// check gives at the trained rate, then scanout. No audio: the HPO FRL
-    /// audio path is not implemented.
+    /// check gives at the trained rate, then scanout and reserved LPCM audio.
     /// # Safety
     /// As for `start_link`.
     async unsafe fn start_frl_link(
@@ -2146,7 +2154,7 @@ impl ColdBoot {
         let port = selection.port;
         let bpc = depth_bpc(selection.depth);
         let ycbcr420 = selection.ycbcr420;
-        let audio = frl_audio(None, selection.timing.v_active);
+        let audio = frl_audio(selection.audio, selection.timing.v_active);
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
             let trained = self
@@ -2171,6 +2179,11 @@ impl ColdBoot {
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Video);
             let scanout = self.start_display_scanout(pipe).await?;
+            self.teardowns
+                .checkpoint_activation(pipe, super::TeardownStep::Scanout);
+            if let Some(info) = selection.audio {
+                self.start_display_audio(port, true, info).await?;
+            }
             Ok((
                 Selection {
                     frl: Some(trained),

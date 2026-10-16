@@ -1309,7 +1309,7 @@ fn navi48_modeset_decides_frl_like_linux() -> TestResult {
         ..caps
     };
     let out = |t: &Timing, bpc, cap| {
-        hdmi_output(deep, t, bpc, cap).map(|(d, y, r)| (d, y, r.map(FrlRate::code)))
+        hdmi_output(deep, t, bpc, cap, None).map(|(d, y, r)| (d, y, r.map(FrlRate::code)))
     };
     let uhd60 = t(594_000, 3840, 4400);
     if out(&uhd60, 10, Some(cap)) != Some((otg::ColorDepth::Bpc8, false, None))
@@ -1755,7 +1755,7 @@ fn navi48_frl_fallback_respects_y420_only_modes() -> TestResult {
         .find(|t| (t.pixel_clock_khz, t.h_active, t.h_total) == (594_000, 3840, 5280))
         .unwrap(); // CTA VIC 96, listed only as 4:2:0.
     let frl = Some(FrlRate::new(6).unwrap());
-    if hdmi_output(caps, &t, 8, frl) != Some((otg::ColorDepth::Bpc8, true, None)) {
+    if hdmi_output(caps, &t, 8, frl, None) != Some((otg::ColorDepth::Bpc8, true, None)) {
         return TestResult::Fail("lost supported TMDS 4:2:0");
     }
     let limited = HdmiCaps {
@@ -1765,7 +1765,7 @@ fn navi48_frl_fallback_respects_y420_only_modes() -> TestResult {
     };
     for depth in [8, 10, 12] {
         if !matches!(
-            hdmi_output(limited, &t, depth, frl),
+            hdmi_output(limited, &t, depth, frl, None),
             Some((otg::ColorDepth::Bpc8, true, Some(_)))
         ) {
             return TestResult::Fail("FRL did not preserve 4:2:0-only encoding");
@@ -1780,7 +1780,7 @@ fn navi48_frl_fallback_respects_y420_only_modes() -> TestResult {
             ..limited
         };
         if !matches!(
-            hdmi_output(rgb, &t, 8, frl),
+            hdmi_output(rgb, &t, 8, frl, None),
             Some((otg::ColorDepth::Bpc8, false, Some(_)))
         ) {
             return TestResult::Fail("lost supported RGB FRL");
@@ -1821,7 +1821,7 @@ fn navi48_frl_420_caps_rates_and_selection() -> TestResult {
             Some(code)
         );
         assert_eq!(
-            hdmi_output(caps, &t, bpc, Some(cap)),
+            hdmi_output(caps, &t, bpc, Some(cap), None),
             Some((depth, true, FrlRate::new(code)))
         );
         for candidate in 1..=cap.code() {
@@ -1831,8 +1831,8 @@ fn navi48_frl_420_caps_rates_and_selection() -> TestResult {
             );
         }
     }
-    assert!(hdmi_output(caps, &t, 12, None).is_none());
-    assert!(hdmi_output(caps, &t, 12, FrlRate::new(1)).is_none());
+    assert!(hdmi_output(caps, &t, 12, None, None).is_none());
+    assert!(hdmi_output(caps, &t, 12, FrlRate::new(1), None).is_none());
     for bpc in [0, 6, 16] {
         assert!(frl_carries(&t, bpc, true, cap, quiet).is_none());
     }
@@ -1869,11 +1869,11 @@ fn navi48_frl_420_caps_rates_and_selection() -> TestResult {
         ..caps
     };
     assert_eq!(
-        hdmi_output(eight_only, &t, 12, Some(cap)),
+        hdmi_output(eight_only, &t, 12, Some(cap), None),
         Some((Bpc8, true, FrlRate::new(2)))
     );
     assert_eq!(
-        hdmi_output(sc, &t, 12, Some(cap)),
+        hdmi_output(sc, &t, 12, Some(cap), None),
         Some((Bpc10, true, Some(cap)))
     );
     let also = HdmiCaps {
@@ -1882,19 +1882,19 @@ fn navi48_frl_420_caps_rates_and_selection() -> TestResult {
         ..caps
     };
     assert_eq!(
-        hdmi_output(also, &t, 8, Some(cap)),
+        hdmi_output(also, &t, 8, Some(cap), None),
         Some((Bpc8, true, FrlRate::new(2)))
     );
     // RGB wins once it fits, even when deeper 4:2:0 would fit too.
     assert_eq!(
-        hdmi_output(also, &t, 12, FrlRate::new(6)),
+        hdmi_output(also, &t, 12, FrlRate::new(6), None),
         Some((Bpc8, false, FrlRate::new(4)))
     );
     let rgb = HdmiCaps {
         y420_also: [0; 4],
         ..also
     };
-    assert!(hdmi_output(rgb, &t, 12, Some(cap)).is_none());
+    assert!(hdmi_output(rgb, &t, 12, Some(cap), None).is_none());
     // The format survives complete connector selection and native admission.
     let paths = [path(inventory::Connector::HdmiTypeA, 0)];
     let ports = [port(paths[0], None, edid)];
@@ -1932,4 +1932,54 @@ fn navi48_frl_420_caps_rates_and_selection() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_frl_420_caps_rates_and_selection
+);
+
+/// Linux dml1_frl_cap_chk: at 359.5 MHz, 1920 active + 280 blank,
+/// 3x3G carries video/ACR alone (one packet, borrow blank), but rejects
+/// 192 kHz layout 1 (-4). 3x6G carries it (two packets, no borrow).
+fn navi48_frl_selection_reserves_lpcm_bandwidth() -> TestResult {
+    const AUDIO: &[u8] = &[1 << 5 | 6, 0x0f, 0x7f, 7, 0x15, 7, 0x50];
+    const HF: &[u8] = &[3 << 5 | 7, 0xd8, 0x5d, 0xc4, 1, 33, 0x80, 0x20];
+    let mut base = edid_1080p();
+    base[54..56].copy_from_slice(&35950u16.to_le_bytes());
+    let edid = with_blocks(base, &[VSDB, HF, AUDIO]);
+    let t = preferred(&edid).unwrap();
+    let caps = hdmi_caps(&edid);
+    let raw = sink_audio_info(&edid).unwrap();
+    let rate = |audio, cap| {
+        hdmi_output(caps, &t, 8, FrlRate::new(cap), audio)
+            .and_then(|(_, _, r)| r.map(FrlRate::code))
+    };
+    assert_eq!(rate(None, 1), Some(1));
+    assert_eq!(rate(Some(raw), 1), None);
+    assert_eq!(rate(Some(raw), 2), Some(2));
+    let paths = [path(inventory::Connector::HdmiTypeA, 0)];
+    let enabled = frl_enabled();
+    set_frl(true);
+    let chosen = select(&paths, &[port(paths[0], None, edid)], 8, None);
+    set_frl(enabled);
+    let s = chosen.unwrap();
+    assert_eq!(s.frl, FrlRate::new(2));
+    let a = s.audio.unwrap();
+    assert_eq!(a.mode_count, 1); // AC-3 does not enter native FRL's endpoint.
+    assert_eq!(a.modes[0], raw.modes[0]);
+    assert_eq!(frl_audio(Some(a), t.v_active).max_rate_hz, 192_000);
+    assert_eq!(frl_audio(Some(a), t.v_active).layout, 1);
+    assert_eq!(
+        frl_carries(&t, 8, false, s.frl.unwrap(), frl_audio(Some(a), t.v_active)),
+        Some(crate::amdgpu_frl_cap::FrlCap::Ok {
+            audio_packets_line: 2,
+            borrow: crate::amdgpu_frl_cap::FrlBorrow::None,
+        })
+    );
+    // A compressed-only sink remains usable as silent FRL video.
+    let mut nonpcm = raw;
+    nonpcm.modes[0] = raw.modes[1];
+    nonpcm.mode_count = 1;
+    assert_eq!(rate(Some(nonpcm), 1), Some(1));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_frl_selection_reserves_lpcm_bandwidth
 );

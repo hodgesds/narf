@@ -100,7 +100,7 @@ fn request(protocol: Protocol) -> Request {
         pipe: 1,
         port: 3,
         protocol,
-        audio: matches!(protocol, Protocol::Sst | Protocol::Tmds),
+        audio: matches!(protocol, Protocol::Sst | Protocol::Tmds | Protocol::Frl),
         scdc: protocol == Protocol::Tmds,
         dsc: protocol == Protocol::Sst,
         scanout: Some(ScanoutWitness {
@@ -128,7 +128,10 @@ fn cases() -> [(Protocol, &'static [TeardownStep]); 5] {
             &[Scanout, Video, Payload, Frontend, Link, Timing, Planes],
         ),
         (Protocol::Uhbr, &[Scanout, Video, Link, Timing, Planes]),
-        (Protocol::Frl, &[Scanout, Video, Scdc, Link, Timing, Planes]),
+        (
+            Protocol::Frl,
+            &[Audio, Scanout, Video, Scdc, Link, Timing, Planes],
+        ),
     ]
 }
 

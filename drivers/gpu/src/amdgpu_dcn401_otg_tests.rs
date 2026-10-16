@@ -191,6 +191,10 @@ impl Io for Fake {
                             .any(|r| at == MPC_BASE + (r + p * 0xb0) * 4)
                 })
                 || (MPC_BASE + 0x8d3 * 4..=MPC_BASE + 0x8f0 * 4).contains(&at)
+                // Native FRL ACR and AFMT4 LPCM source/channel state.
+                || (MPC_BASE + 0x8f2 * 4..=MPC_BASE + 0x8f7 * 4).contains(&at)
+                || [0x91d, 0x920, 0x921, 0x927, 0x92a, 0x92d, 0x92f]
+                    .iter().any(|&r| at == MPC_BASE + r * 4)
                 || [0x95b, 0x95c, 0x965, 0x966].iter().any(|&r| at == MPC_BASE + r * 4)
                 // HPO FRL stream attributes, CRC, borrow mode, AFMT4 audio
                 // InfoFrame latch, VPG4.

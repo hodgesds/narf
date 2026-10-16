@@ -32,7 +32,7 @@ struct Plan {
     db: u32,
 }
 impl<I: Io> Engine<I> {
-    fn frl_at(&self, reg: u64) -> u64 {
+    pub(in crate::amdgpu_dcn401_otg) fn frl_at(&self, reg: u64) -> u64 {
         self.layout.mpc_base + reg * 4
     }
     fn frl_quiet(&mut self) -> Result<(), Error> {

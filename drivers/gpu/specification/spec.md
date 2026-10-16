@@ -994,7 +994,11 @@ FRL tries RGB first where allowed, then 4:2:0 for Y420VDB/Y420CMDB modes when
 RGB cannot fit. `HdmiCaps::dc30_420` and `dc36_420` decode HF-VSDB/HF-SCDB
 4:2:0 deep-color flags independently of RGB DC_30bit/DC_36bit. FRL chooses the
 deepest declared 8/10/12-bpc depth up to the requested maximum and the lowest
-carrying rate. TMDS 4:2:0 remains limited to 8 bpc.
+carrying rate. `hdmi_output` also takes the sink audio capabilities: FRL
+admission, training fallback and borrow parameters reserve its supported LPCM
+rates/channels, clamped to layout 0 at 576 lines or fewer. `Selection::audio`
+retains only valid LPCM SADs for FRL; compressed-only sinks use silent video.
+TMDS 4:2:0 remains limited to 8 bpc.
 
 `frl_carries`, `frl_link` and `ColdBoot::start_frl` take `ycbcr420` alongside
 `bpc`. The raw bandwidth guard accounts for subsampling, and the Linux FRL
@@ -1011,8 +1015,8 @@ HDMISTREAMCLK retain the full pixel rate, independent of component depth.
 Writes and live format checks reject mismatched encoding, depth, compression
 or width. Startup rechecks the stream, link, clock route and format after its
 final frame wait before publishing running video. Failure after writes retains
-the link and quarantines the video owner. FRL audio, DSC and physical acceptance
-remain open.
+the link and quarantines the video owner. FRL LPCM uses the audio contract
+below; FRL DSC and physical acceptance remain open.
 
 `amdgpu_frl_training::poll_status` handles live SCDC FRL_Start, FLT_Update
 and Source_Test_Update requests as Linux's `hdmi_frl_poll_status_flag` does.
@@ -1850,10 +1854,10 @@ format full-range RGB, which is what is sent. No Audio InfoFrame or AFMT audio
 clock is enabled and no DCCG frontend symclk route is programmed, as
 `dcn401_enable_stream` does for TMDS.
 
-`start_display_hdmi_audio(port, HdmiAudioInfo)` (`Otg::start_hdmi_audio`)
-programs the display half of HDMI audio on a running HDMI video or live scanout,
-in Linux's order: the DCCG audio DTO0 (source = OTG, module = pixel clock in
-100 Hz, phase 24 MHz; DCN401 has no audio DTBCLK DTO), the stream's AFMT audio
+`start_display_audio(port, true, AudioInfo)` (`Otg::start_hdmi_audio`)
+programs the display half of HDMI audio on running video or live scanout.
+For TMDS, in Linux's order: the DCCG audio DTO0 (source = OTG, module = pixel
+clock in 100 Hz, phase 24 MHz; DCN401 has no audio DTBCLK DTO), the stream's AFMT audio
 clock, IEC 60958 channel status (channels 1..8, update request), audio delay,
 automatic ACR with hardware CTS and Linux's N/CTS tables (the 36-bpc table at
 12 bpc, the 24-bpc table otherwise, HDMI's "Other" N for unlisted clocks), the
@@ -1864,13 +1868,35 @@ rates limited by `check_audio_bandwidth_hdmi`, AC-3 stream formats, HBR
 capability, lipsync, vendor/product, Linux's default port ids, the monitor
 name), the Audio InfoFrame on line 2 (built by hardware from the codec's
 channel allocation), `az_enable` and unmuted samples. The endpoint is the
-stream's own; a sink without LPCM is `Unsupported`. `stop_display_hdmi_audio`
+stream's own; a sink without LPCM is `Unsupported`. `stop_display_audio(port, true)`
 mutes, stops the AFMT clock and Audio InfoFrame and disables the endpoint; HDMI
-video cannot stop while audio runs. Modeset builds `HdmiAudioInfo` as
+video cannot stop while audio runs. Modeset builds `AudioInfo` as
 amdgpu_dm does (`hdmi_audio_info`: SADs at CTA revision 3+, the first 3-byte
 speaker block or FL/FR+FC, the 0xFC name, VSDB latencies), starts audio after
 scanout when the sink declares any mode, and stops it first on stop or unplug.
 The HD-Audio controller and codec that stream samples are separate.
+
+The same HDMI audio entry points dispatch to native FRL when its video is owned.
+FRL programs AFMT4 (no DIO AFMT clock or APG), IEC 60958 channel status, source
+and channels, the lane-character-clock N/CTS table and automatic hardware ACR,
+then the pipe's Azalia HDMI endpoint and sample enable. Only LPCM is advertised;
+HBR is disabled, and SD timings clamp to two channels. The video must already
+reserve exactly the audio packets-per-line and borrow mode that its retained
+LPCM capabilities require. Inherited samples/ACR or an occupied endpoint reject
+before audio programming. `Status::frl_audio` retains the owner through partial
+writes; failure quarantines the display. Startup completes in one poll after
+publication and rechecks video/link/format, AFMT/ACR and the endpoint. Live video
+and source-test checks also verify owned audio. Audio stops before scanout/video:
+mute samples, stop ACR and disable the endpoint, preserving the video-owned
+Audio InfoFrame and AFMT memory state. Failed shutdown retains ownership.
+
+All display audio shares one wall DTO, recomputed on start/stop: the lowest
+HDMI audio pipe wins, using DTO0 from the TMDS pixel clock or DTO1 from DPREFCLK
+for FRL. With no HDMI audio, the lowest legacy DP audio pipe uses DTO1; no audio
+leaves the clock unchanged. DCN401 has no audio DTBCLK DTO. Endpoint allocation
+excludes every retained TMDS, FRL and legacy DP audio owner. Models cover all
+six FRL rates, RGB/4:2:0 depths, bandwidth admission, partial writes, late drift,
+shared DTO selection and teardown. Physical playback remains unverified.
 
 Legacy DP SST LPCM can run beside DSC on the DIO stream encoder. Modeset keeps
 the sink's audio capabilities for these streams and starts audio after scanout,
@@ -1882,7 +1908,8 @@ unexpected audio packet/sample enables still reject before writes.
 Stopping audio disables its samples, packet enables and Azalia endpoint while
 preserving the shared AFMT clock and secondary master for GSP11. PPS data and
 scheduling remain the video owner's until video stops. This extends the
-existing LPCM path; compressed passthrough, HPO and MST audio remain unsupported.
+existing LPCM path; compressed passthrough, HPO/UHBR DP and MST audio remain
+unsupported.
 Register/protocol models are not physical image or audible-output acceptance.
 
 `start_display_hdmi_video(port)` starts the blank timing, repeats the FIFO reset

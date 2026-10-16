@@ -42,6 +42,7 @@ mod hdmi;
 pub use hdmi::HdmiTmdsRetired;
 #[path = "amdgpu_dcn401_hdmi_link.rs"]
 mod hdmi_link;
+pub(crate) use hdmi_link::audio::frl_lpcm_info;
 pub use hdmi_link::{
     AudioInfo, AudioMode, Avi, DisplayAudio, HdmiLinkReady, HdmiLinkRequest, HdmiVideoRunning,
     TMDS_MAX_KHZ, TMDS_SCRAMBLE_KHZ,
@@ -393,6 +394,8 @@ pub struct Status {
     /// Black FRL video; current only in FrlVideoRunning (or beneath a live
     /// scanout).
     pub frl_video_running: Option<FrlVideoRunning>,
+    /// Owned AFMT4/ACR and Azalia endpoint; stop before FRL video/link.
+    pub frl_audio: Option<DisplayAudio>,
     /// The display whose MST link this one's stream rides (attached, not
     /// trained, by this display); its link record is a copy of theirs.
     pub mst_owner: Option<u8>,
@@ -441,6 +444,7 @@ impl Status {
             frl_link_retired: None,
             frl_link: None,
             frl_video_running: None,
+            frl_audio: None,
             mst_owner: None,
             frl_disabled: None,
             retired: 0,

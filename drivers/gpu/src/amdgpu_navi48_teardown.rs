@@ -86,7 +86,7 @@ impl Request {
             } else {
                 Protocol::Sst
             },
-            audio: s.audio.is_some() && !s.uhbr() && s.frl.is_none(),
+            audio: s.audio.is_some() && !s.uhbr(),
             scdc: s.scdc,
             dsc: s.dsc.is_some(),
             scanout: None,
@@ -335,8 +335,11 @@ impl Backend for ColdBoot {
         unsafe {
             match status.next {
                 Audio => {
-                    self.stop_display_audio(r.port, r.protocol == Protocol::Tmds)
-                        .await?
+                    self.stop_display_audio(
+                        r.port,
+                        matches!(r.protocol, Protocol::Tmds | Protocol::Frl),
+                    )
+                    .await?
                 }
                 Scanout => self.stop_display_scanout(r.pipe).await?,
                 Video => match r.protocol {

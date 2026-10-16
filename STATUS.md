@@ -483,7 +483,14 @@ training fallback, half-width encoder counts, AVI colorimetry and shared OPP/MPC
 subsampling/BT.709 conversion. The pixel DTO keeps the full pixel rate; live
 format checks reject stale compression or encoding state. Y420VDB modes stay
 4:2:0, and Y420CMDB modes use RGB when it fits. The single-OPP 4096-pixel limit
-remains; FRL audio/DSC and physical transitions are still open.
+remains; FRL DSC and physical transitions are still open.
+FRL now carries LPCM through AFMT4, lane-rate ACR and the pipe's Azalia endpoint.
+Admission/training reserve the sink's supported LPCM bandwidth; SD timings use
+layout 0. Audio starts after scanout and stops before it, preserving the
+video-owned InfoFrame. Fresh register checks and retained owners prevent reuse
+after partial failures. Shared audio DTO selection includes FRL on DPREFCLK.
+Register/protocol tests cover all six rates, RGB/4:2:0 depths, bandwidth limits,
+clock sharing and failed teardown; audible output remains unverified.
 HDCP/protected output is tracked separately in
 `drivers/gpu/research/navi48-protected-output.md`, including TA firmware,
 protocol, credential authorization, isolation and physical acceptance gates.
@@ -582,8 +589,9 @@ Legacy DP SST LPCM now shares the DIO stream with DSC PPS. Startup and live
 checks require fresh PPS/clock/master witnesses, and audio stop preserves those
 video-owned resources while disabling audio packets and the endpoint. Modeset
 keeps DSC sink audio capabilities and uses normal audio-first teardown/retrain.
-HPO/MST audio and compressed passthrough remain open; physical audio is untested.
-Not yet: YCbCr/4:2:0. None of it has run on hardware.
+HPO/UHBR DP and MST audio, compressed passthrough and user channel maps remain
+open; physical audio is untested. FRL LPCM and HDMI 4:2:0 have model coverage
+as described above. None of it has run on hardware.
 Native FRL frontend retirement now drains all generic packet schedules through
 the actual HDMI/VUPDATE buffer status, disables FIFO then tribyte encoding and
 requires all three stream clocks off. Native DME4, immediate packets, audio/ACR,

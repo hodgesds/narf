@@ -306,6 +306,11 @@ impl<I: Io> Engine<I> {
         if self.read(route)? & 15 != 8 | u32::from(v.request.pipe) {
             return Err(Error::Readback(route));
         }
+        if let Some(a) = self.status.frl_audio {
+            self.frl_audio_verify(v, &a)?;
+        } else {
+            self.frl_audio_quiet()?;
+        }
         Ok(())
     }
     /// Linux's FRL link_set_dpms_off up to the link: AVMUTE, blank, the
@@ -317,7 +322,7 @@ impl<I: Io> Engine<I> {
     ) -> Result<(), Error> {
         let v = self.status.frl_video_running.ok_or(Error::Invalid)?;
         let pipe = v.request.pipe;
-        if self.status.state != State::FrlVideoRunning(pipe) {
+        if self.status.state != State::FrlVideoRunning(pipe) || self.status.frl_audio.is_some() {
             return Err(Error::Busy);
         }
         if v.link.path != path {
