@@ -47,10 +47,10 @@ pub mod fwdl;
 pub mod mac;
 pub mod mcu;
 pub mod pci;
-pub mod regs;
 mod registers;
 #[cfg(target_arch = "x86_64")]
 mod registers_tests;
+pub mod regs;
 pub mod txrx;
 
 pub use pci::{
