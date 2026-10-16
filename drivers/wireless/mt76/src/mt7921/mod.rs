@@ -17,7 +17,9 @@
 //! patch/RAM download through the live MCU protocol. Published allocations
 //! survive failure or cancellation until verified DMA shutdown.
 //!
-//! EFUSE, scan, association and the WLAN data path remain unfinished. The
+//! Post-firmware initialization reads real NIC/EFUSE identity, applies
+//! package-selected world limits and initializes the MAC/WTBL. Scan,
+//! association and the WLAN data path remain unfinished. The
 //! older `full_bring_up` boundary intentionally returns `NotImplemented`;
 //! firmware-only initialization uses the retained transport owner instead.
 //!
@@ -60,7 +62,7 @@ pub fn register() {
         narf_init::Stage::Late,
         "mt76-firmware",
         firmware_transport::start_boot,
-        30_000,
+        60_000,
     );
 }
 

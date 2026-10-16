@@ -18,12 +18,15 @@ current test results.
 
 The x86_64 MT76 late init path now owns coherent WM/FWDL/MCU DMA rings and
 performs ROM restart, patch semaphore negotiation, patch/RAM download and
-firmware-ready verification. Waits are bounded and report the current stage;
+firmware-ready verification. Post-firmware MCU commands obtain the real MAC
+and PHY, read EFUSE hardware identity, select embedded world country limits,
+select on-chip calibration and initialize MAC/WTBL/RTS. Unified device command
+framing now matches the local Linux reference. Waits are bounded and report the current stage;
 failed or cancelled attempts retain published DMA until verified shutdown.
-The targeted QEMU suite passes 69 tests with one skip, including protocol,
-production descriptor, cancellation and installed MT7922 image-layout models.
+The targeted QEMU suite passes 77 tests with one skip, including protocol,
+production descriptor/MAC, cancellation, country limits and MT7922 image-layout models.
 Both-architecture Clippy and an x86_64 UEFI boot smoke pass. Physical MT7922
-firmware startup remains unverified; EFUSE, association and a working WLAN
+firmware/radio initialization remains unverified; scan, association and a working WLAN
 data path remain unfinished. This does not close the Stage 5 Wi-Fi gate.
 
 ## Loadable e1000 datapath

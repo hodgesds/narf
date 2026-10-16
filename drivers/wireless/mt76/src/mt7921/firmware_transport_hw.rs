@@ -1,5 +1,5 @@
 //! x86_64 coherent PCI backend. Linux reference: ecd997b0189a mt792x_dma.c.
-use super::{Backend, Error, Firmware, Report, Retained, Session, State, MAX_FRAME};
+use super::{Backend, Error, Firmware, RadioInfo, Report, Retained, Session, State, MAX_FRAME};
 use crate::mt7921::{registers, regs::*};
 use alloc::{vec, vec::Vec};
 use core::sync::atomic::{fence, Ordering};
@@ -173,6 +173,7 @@ impl Backend for Hardware {
         if !self.idle()? {
             return Err(Error::Busy);
         }
+        self.write(0x0041f23c, 0)?; // MT_SWDEF_MODE: normal firmware operation.
         self.update(0xd42b0, 1 << 6, 0)?; // disable DMASHDL
         self.update(0x7c026004, 0, 1 << 28)?; // bypass scheduler
         self.update(MT_WFDMA0_RST, 0x30, 0)?;
@@ -239,6 +240,28 @@ impl Backend for Hardware {
     }
     fn fw_state(&mut self) -> Result<u32, Error> {
         self.read(0x7c0600f0)
+    }
+    fn configure_mac(&mut self) -> Result<(), Error> {
+        self.update(0x820cd004, 0xfff8, 1536 << 3)?;
+        self.update(0x820cd000, 0, (1 << 15) | (1 << 19))?;
+        for band in [0u32, 0x10000] {
+            self.update(0x820e40f4 + band, 0x3f, 0x3f | (3 << 17))?;
+            self.update(0x820e53c4 + band, 0, 1 << 30)?;
+            self.update(0x820e5380 + band, 0, 1 << 30)?;
+            self.update(0x820ed004 + band, 0, 3 << 8)?;
+            self.update(0x820e7000 + band, 0xfff8 | (1 << 23), 1536 << 3)?;
+            self.update(0x820e9008 + band, (3 << 30) | (3 << 24), 3 << 24)?;
+        }
+        Ok(())
+    }
+    fn clear_wtbl(&mut self, index: u8) -> Result<(), Error> {
+        if index >= 20 {
+            return Err(Error::Bounds);
+        }
+        self.update(0x820d4230, 0x3ff, u32::from(index) | (1 << 12))
+    }
+    fn wtbl_idle(&mut self) -> Result<bool, Error> {
+        Ok(self.read(0x820d4230)? & (1 << 31) == 0)
     }
     fn submit(&mut self, scatter: bool, frame: &[u8]) -> Result<(), Error> {
         self.check()?;
@@ -441,6 +464,11 @@ impl Transport {
     /// Start once. Dropping this borrowed future requests no reset/replay.
     pub async fn run(&mut self) -> Result<Report, Error> {
         self.session.run().await
+    }
+    /// Query the real radio identity and select on-chip EFUSE calibration.
+    /// This does not yet enable packet transmission or register an interface.
+    pub async fn initialize_radio(&mut self) -> Result<RadioInfo, Error> {
+        self.session.initialize_radio().await
     }
     /// Stop DMA, verify idle, clear bus mastering and retire ring bases.
     pub async fn shutdown(&mut self) -> Result<(), Error> {

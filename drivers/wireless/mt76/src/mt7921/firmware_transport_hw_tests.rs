@@ -140,3 +140,35 @@ kernel_test_in!(
     "drivers/wireless/mt7921/transport",
     mcu_dma_production_rx_copies_before_rearm_and_checks_lengths
 );
+
+fn mcu_production_mac_configuration_preserves_unrelated_bits() -> TestResult {
+    let (mut words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("allocation"),
+    };
+    words[0xf004 / 4] = 1 << 31;
+    words[0x34230 / 4] = 1 << 20;
+    if hw.configure_mac().is_err() || hw.clear_wtbl(19).is_err() || hw.wtbl_idle() != Ok(true) {
+        return TestResult::Fail("MAC/WTBL production operations failed");
+    }
+    if words[0xf004 / 4] != (1 << 31) | (1536 << 3)
+        || words[0xf000 / 4] != (1 << 15) | (1 << 19)
+        || words[0x210f4 / 4] != 0x6003f
+        || words[0xa10f4 / 4] != 0x6003f
+        || words[0x21e00 / 4] != 1536 << 3
+        || words[0xa1e00 / 4] != 1536 << 3
+        || words[0x34230 / 4] != (1 << 20) | (1 << 12) | 19
+        || hw.clear_wtbl(20) != Err(Error::Bounds)
+    {
+        return TestResult::Fail("MAC register fields differ from Linux");
+    }
+    words[0x34230 / 4] |= 1 << 31;
+    if hw.wtbl_idle() != Ok(false) {
+        return TestResult::Fail("busy WTBL accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/station",
+    mcu_production_mac_configuration_preserves_unrelated_bits
+);

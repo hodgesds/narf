@@ -84,9 +84,8 @@ pub enum ProbeError {
     /// retries. Either the firmware never released ownership (cold
     /// power-up with no PCIE_BUS_PWR), or the chip is wedged.
     DriverOwnTimeout,
-    /// EFUSE MAC read failed. Not fatal — probe records the device
-    /// bound with the all-zero MAC sentinel and the iface comes up
-    /// with a derived MAC instead.
+    /// Legacy EFUSE probe error. Discovery leaves MAC unset; the retained
+    /// post-firmware path requires a valid firmware-reported MAC.
     EfuseRead,
     /// MCU patch / RAM-code firmware load hit `NotImplemented`. The
     /// firmware-loader path needs the blob to be registered via the

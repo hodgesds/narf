@@ -85,8 +85,8 @@ must not use an indirect offset without a serialized selector transaction.
 Probe clears PCI bus mastering and leaves DMA ring publication disabled.
 Ownership waits are deadline-bounded; `PowerError::InvalidWindow` reports
 an invalid register access and `UnsupportedChip` rejects unknown identities.
-PCI discovery does not publish a zero-MAC netdev/wiphy. EFUSE reading and a
-working Wi-Fi data path remain unimplemented. The legacy
+PCI discovery does not publish a zero-MAC netdev/wiphy. A working Wi-Fi data
+path remains unimplemented. The legacy
 `full_bring_up` boundary returns `NotImplemented` without allocating or
 programming rings until it can retain every published allocation.
 PCI alias `14c3:0616` selects the MT7922 firmware pair. Register translation
@@ -121,6 +121,32 @@ off and ring references are cleared. Failure to prove quiescence retains memory.
 The late `mt76-firmware` initcall runs after firmware discovery and retains the
 transport on success or failure; `boot_status` exposes its state. A ready
 report proves firmware startup only and does not register a WLAN interface.
+
+After `run`, `Transport::initialize_radio` performs a second single-use,
+30-second-bounded initialization. `NicCapabilities::parse` decodes the counted
+32-bit TLV table, requires a nonzero unicast MAC and a supported PHY, rejects
+duplicate identity records and bounds every payload. The transport implements
+distinct CE, extended and unified command headers; unified results check both
+the command ID and the full 32-bit status. Extended queries check event and
+extended-command identity. Unrelated notifications remain bounded.
+
+Initialization obtains the NIC capabilities, checks the address and validity
+of the EFUSE block containing hardware type 0x55b, chooses the matching power
+table package and sends the embedded `00` indoor country rules. CLC container
+geometry is validated during firmware preparation; all selected commands are
+validated before the first CLC send. Capability-requested CLC response TLVs
+must fit their enclosing event. Opaque vendor rule bytes are preserved.
+On-chip EFUSE calibration mode is selected, MAC receive limits and counters
+are configured on both bands, all 20 WTBL entries are cleared with bounded
+idle waits, and RTS thresholds are sent through the MCU. `RadioReady(RadioInfo)`
+reports this initialization, including the actual MAC/PHY, EFUSE hardware type,
+number of country commands and optional channel configuration. Cancellation
+or failure cannot replay initialization or release published DMA. Radio enable,
+host regulatory/channel/power configuration, scan, association and packet
+queues remain separate prerequisites for an operational WLAN interface.
+`cmd::encode_uni_dev_info_update` emits the four-byte own-MAC/band header and
+one 12-byte active/link-index/MAC TLV (16 bytes total), matching CONNAC2 unified
+device commands rather than the earlier synthetic two-TLV layout.
 
 ### 3.1 Implemented iwlwifi MLD station profile
 

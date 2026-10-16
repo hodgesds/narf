@@ -5,6 +5,10 @@ use super::fwdl;
 use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::{future::poll_fn, ops::Range, task::Poll};
 
+#[path = "station_mcu.rs"]
+mod station;
+pub use station::{NicCapabilities, PhyCapabilities, RadioInfo};
+
 #[cfg(target_arch = "x86_64")]
 #[path = "firmware_transport_hw.rs"]
 mod hardware;
@@ -60,7 +64,10 @@ pub(super) fn start_boot() -> narf_init::InitResult {
     };
     // Before executor polling, regular Mutex (no IRQ spinlock) retained.
     // This future is self-waking and never depends on another executor task.
-    let result = narf_scheduler::block_on_spin(transport.run());
+    let result = narf_scheduler::block_on_spin(async {
+        transport.run().await?;
+        transport.initialize_radio().await
+    });
     let _ = writeln!(
         narf_console::Writer,
         "mt76: firmware {result:?}; retained {:?}; WLAN data path not enabled",
@@ -113,6 +120,8 @@ pub enum Error {
     MalformedEvent,
     EventOverflow,
     Rejected(u8),
+    RejectedCommand(u32),
+    InvalidIdentity,
 }
 /// Last operation reached by a single firmware boot attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +138,11 @@ pub enum Stage {
     RamDownload,
     StartFirmware,
     FirmwareReady,
+    NicCapabilities,
+    Efuse,
+    EepromMode,
+    CountryLimits,
+    MacInitialize,
     Shutdown,
 }
 /// Firmware observations, not an operational WLAN interface.
@@ -145,6 +159,7 @@ pub enum State {
     Prepared,
     Running(Stage),
     Ready(Report),
+    RadioReady(RadioInfo),
     Failed { stage: Stage, error: Error },
     Stopped,
 }
@@ -161,6 +176,7 @@ pub struct Firmware {
     ram: Arc<[u8]>,
     patch_regions: Vec<Region>,
     ram_regions: Vec<Region>,
+    clc_regions: Vec<Range<usize>>,
     version: [u8; 10],
     build_date: [u8; 15],
     override_addr: u32,
@@ -221,6 +237,7 @@ impl Firmware {
         }
         let mut offset = 0usize;
         let mut ram_regions = Vec::new();
+        let mut clc_regions = Vec::new();
         let mut override_addr = 0;
         for region in fwdl::iter_fw_regions(ram, &tail).map_err(|_| Error::InvalidFirmware)? {
             let region = region.map_err(|_| Error::InvalidFirmware)?;
@@ -252,6 +269,9 @@ impl Firmware {
                     mode,
                     bytes: offset..next,
                 });
+            } else if region.region_type == 2 {
+                station::validate_clc_tables(&ram[offset..next])?;
+                clc_regions.push(offset..next);
             }
             offset = next;
         }
@@ -263,6 +283,7 @@ impl Firmware {
             ram: ram.into(),
             patch_regions,
             ram_regions,
+            clc_regions,
             version: tail.fw_ver,
             build_date: tail.build_date,
             override_addr,
@@ -314,6 +335,9 @@ trait Backend {
     fn tx_complete(&mut self, scatter: bool) -> Result<bool, Error>;
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Error>;
     fn release(&mut self) -> Result<(), Error>;
+    fn configure_mac(&mut self) -> Result<(), Error>;
+    fn clear_wtbl(&mut self, index: u8) -> Result<(), Error>;
+    fn wtbl_idle(&mut self) -> Result<bool, Error>;
 }
 #[derive(Debug)]
 struct Session<B: Backend> {
