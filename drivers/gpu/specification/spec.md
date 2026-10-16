@@ -399,8 +399,11 @@ this operation with clock and engine owners after drained kernel proofs.
 without MMIO writes. It requires the same native discovery, permanent mappings
 and exclusive display/PM/reset ownership; firmware/FAMS timing writers must be
 excluded. `prepare(&mut ClockManager, &mut Dccg, Request).await` programs disabled
-progressive RGB timing with fixed refresh and one OPP per OTG. Interlace, DSC,
-ODM combining and VRR are not represented by this request. `GlobalSync` supplies
+progressive timing with fixed refresh and one OPP per OTG. HDMI TMDS and FRL
+also accept YCbCr 4:2:0: horizontal boundaries must be even and active width
+must fit the 4096-pixel formatter buffer. The OTG divides horizontal timing
+by two and selects 4:2:0 data format. Interlace, ODM combining and VRR are not
+represented by this request. `GlobalSync` supplies
 validated DLG field values (startup/keepout in lines; update/ready in pixels),
 not a bandwidth proof. Totals, porches, sync widths, blanking minima and every
 native field width are checked before writes. Zero vertical front porch is
@@ -986,9 +989,30 @@ reverses a success down to a disabled PHY with timing and planes retired; the
 surface allocation remains bound to its pipe.
 
 HDMI admission honors the sink's Y420VDB across protocol fallback: a 4:2:0-only
-mode may use supported TMDS 4:2:0, but cannot fall back to the current RGB-only
-FRL path when TMDS lacks capacity. A mode listed in Y420CMDB remains eligible
-for RGB FRL. FRL 4:2:0 startup is still unsupported.
+mode uses 4:2:0 over TMDS or FRL. TMDS remains preferred when it carries a mode.
+FRL tries RGB first where allowed, then 4:2:0 for Y420VDB/Y420CMDB modes when
+RGB cannot fit. `HdmiCaps::dc30_420` and `dc36_420` decode HF-VSDB/HF-SCDB
+4:2:0 deep-color flags independently of RGB DC_30bit/DC_36bit. FRL chooses the
+deepest declared 8/10/12-bpc depth up to the requested maximum and the lowest
+carrying rate. TMDS 4:2:0 remains limited to 8 bpc.
+
+`frl_carries`, `frl_link` and `ColdBoot::start_frl` take `ycbcr420` alongside
+`bpc`. The raw bandwidth guard accounts for subsampling, and the Linux FRL
+capacity calculation receives the actual encoding. Training fallback and
+borrow-parameter calculation preserve encoding/depth. DML admission and native
+OTG checks still enforce the single-OPP 4096-pixel 4:2:0 limit; no ODM is added.
+
+Native FRL video derives encoding/depth from its retained blank/timing owner.
+It programs the 4:2:0 pixel format, uncompressed FIFO format and half-width
+active/blank counts, clears stale DSC fields, and sends AVI Y=4:2:0,
+BT.709 colorimetry and limited YCbCr range. Existing OPP subsampling, YCbCr black
+and MPC BT.709 output CSC are reused. The DTB-derived pixel DTO and
+HDMISTREAMCLK retain the full pixel rate, independent of component depth.
+Writes and live format checks reject mismatched encoding, depth, compression
+or width. Startup rechecks the stream, link, clock route and format after its
+final frame wait before publishing running video. Failure after writes retains
+the link and quarantines the video owner. FRL audio, DSC and physical acceptance
+remain open.
 
 `amdgpu_frl_training::poll_status` handles live SCDC FRL_Start, FLT_Update
 and Source_Test_Update requests as Linux's `hdmi_frl_poll_status_flag` does.

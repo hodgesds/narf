@@ -353,7 +353,7 @@ const PREFETCH_SOURCE_LINES: i64 = 2;
 /// Upper bound for any clock input: 10 GHz.
 const MAX_CLOCK_KHZ: u32 = 10_000_000;
 /// `DML2_MAX_FMT_420_BUFFER_WIDTH`: widest 4:2:0 output line per OPP.
-const FMT_420_BUFFER_WIDTH: u32 = 4096;
+pub(crate) const FMT_420_BUFFER_WIDTH: u32 = 4096;
 /// PMO only budgets stutter when the nominal blank is three times its cost.
 const MIN_BLANK_STUTTER_FACTOR: i64 = 3;
 

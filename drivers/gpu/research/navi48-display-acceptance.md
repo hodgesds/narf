@@ -80,7 +80,7 @@ The GPU specification is authoritative for the current exposed interfaces.
 | --- | --- | --- |
 | Legacy DP SST / FEC / LTTPR | Native sequencing and protocol models; transition/reset recovery incomplete | None |
 | HDMI TMDS / SCDC / RGB depth and range / 8-bpc 4:2:0 | Native register and capability models; pre-link sink cleanup implemented | None |
-| UHBR / FRL | Startup, training, scanout and shutdown models; firmware-made mux/clock assumptions need confirmation; FRL opt-in | None |
+| UHBR / FRL | Startup, training, scanout, shutdown and live FRL status models; FRL 8/10/12-bpc 4:2:0 up to 4096 pixels; firmware-made mux/clock assumptions need confirmation; FRL opt-in | None |
 | Legacy DP DSC | PPS/DML differential vectors and native models; HPO/FRL DSC, larger ODM layouts and other input formats remain open | None |
 | Legacy MST | Topology, payload, notification, path-budget and fixed-output models; mixed MST/SST, UHBR MST and audio/DSC remain open | None |
 | Joint display configuration | Joint DML/clock/CRB models, four fixed pipes; ODM, broader routing and seamless shared-clock changes remain open | None |

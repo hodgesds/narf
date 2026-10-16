@@ -366,33 +366,35 @@ kernel_test_in!(
 /// matrix (output_csc_matrix's YCBCR709_TYPE row) in set A, loaded like the
 /// limited-range one.
 fn dcn401_mpc_loads_ycbcr709_output_csc_for_420() -> TestResult {
-    let p = 1u8;
-    let mut mode = small(p);
-    (mode.timing.signal, mode.timing.ycbcr420) = (Signal::Tmds, true);
-    mode.timing.timing.h_active = 64;
-    mode.surface.width = 64;
-    mode.clock = clock(mode.timing);
-    let (_backing, _pool, mut e, mut surfaces, clock) =
-        ready_mpc_range(p, ColorDepth::Bpc8, mode, false);
-    let csc = |r: u64| MPC_BASE + (0x30b + u64::from(p) * 0xd + r) * 4;
-    let a = surfaces
-        .prepare_mpc(&mut e, p, || Ok((clock, config())))
-        .unwrap();
-    let f = &e.io.surface.inner;
-    let want = [
-        (csc(1), 0xf345_0e04), // Cr: 0.4375 R, -0.3977 G
-        (csc(2), 0x1004_feb7), //     -0.0398 B, + 0x1004 offset
-        (csc(3), 0x1399_05d3), // Y:  0.1819 R, 0.6118 G
-        (csc(4), 0x0201_01fa), //     0.0618 B, + 0x201 offset
-        (csc(5), 0xf533_fcca), // Cb: -0.1006 R, -0.3368 G
-        (csc(6), 0x1004_0e04), //     0.4375 B, + 0x1004 offset
-    ];
-    if !a.ycbcr420
-        || a.limited
-        || want.iter().any(|&(at, v)| f.regs[&at] != v)
-        || f.regs[&csc(0)] & 3 != 1
-    {
-        return TestResult::Fail("YCbCr 709 output CSC");
+    for signal in [Signal::Tmds, Signal::HdmiFrl] {
+        let p = 1u8;
+        let mut mode = small(p);
+        (mode.timing.signal, mode.timing.ycbcr420) = (signal, true);
+        mode.timing.timing.h_active = 64;
+        mode.surface.width = 64;
+        mode.clock = clock(mode.timing);
+        let (_backing, _pool, mut e, mut surfaces, clock) =
+            ready_mpc_range(p, ColorDepth::Bpc8, mode, false);
+        let csc = |r: u64| MPC_BASE + (0x30b + u64::from(p) * 0xd + r) * 4;
+        let a = surfaces
+            .prepare_mpc(&mut e, p, || Ok((clock, config())))
+            .unwrap();
+        let f = &e.io.surface.inner;
+        let want = [
+            (csc(1), 0xf345_0e04), // Cr: 0.4375 R, -0.3977 G
+            (csc(2), 0x1004_feb7), //     -0.0398 B, + 0x1004 offset
+            (csc(3), 0x1399_05d3), // Y:  0.1819 R, 0.6118 G
+            (csc(4), 0x0201_01fa), //     0.0618 B, + 0x201 offset
+            (csc(5), 0xf533_fcca), // Cb: -0.1006 R, -0.3368 G
+            (csc(6), 0x1004_0e04), //     0.4375 B, + 0x1004 offset
+        ];
+        if !a.ycbcr420
+            || a.limited
+            || want.iter().any(|&(at, v)| f.regs[&at] != v)
+            || f.regs[&csc(0)] & 3 != 1
+        {
+            return TestResult::Fail("YCbCr 709 output CSC");
+        }
     }
     TestResult::Pass
 }

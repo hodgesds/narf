@@ -4,7 +4,7 @@
 //! line, general control, audio InfoFrame line), the AVI (and HDMI 1.4b
 //! vendor) InfoFrame in VPG4 (hpo_enc401_update_hdmi_info_packets),
 //! hpo_enc401_enable from the OTG, the timing running, hpo_enc401_unblank.
-//! RGB black until a scanout takes over. The HDMISTREAMCLK half is the
+//! RGB or YCbCr black until a scanout takes over. The HDMISTREAMCLK half is the
 //! clock owner's; this owner requires and rechecks it. Stop is Linux's
 //! AVMUTE, hpo_enc401_blank and hpo_enc401_stop_hdmi_info_packets.
 use super::*;
@@ -67,25 +67,45 @@ impl<I: Io> Engine<I> {
         let plan = blank.timing.request.plan()?;
         self.verify_blank_source(blank, plan, running, true, false)
     }
-    /// hpo_enc401_set_hdmi_stream_attribute for uncompressed RGB.
-    fn frl_stream_attribute(
-        &mut self,
-        request: FrlVideoRequest,
-        blank: BlankApplied,
-    ) -> Result<(), Error> {
+    /// hpo_enc401_set_hdmi_stream_attribute and set_dsc_config(NULL):
+    /// uncompressed RGB or 4:2:0. The DTO keeps the full pixel rate;
+    /// subsampled active/blank widths count pixel pairs in the encoder.
+    fn frl_format_registers(blank: BlankApplied) -> [(u64, u32, u32); 3] {
         let t = blank.timing.request.timing;
+        let y420 = u32::from(blank.request.ycbcr420);
         let (depth, deep) = match blank.request.depth {
             ColorDepth::Bpc8 => (0, 0),
             ColorDepth::Bpc10 => (1, 1),
             ColorDepth::Bpc12 => (2, 1),
         };
-        self.update(self.frl_at(PIXEL_FORMAT), 0x3_0301, depth << 8 | deep)?;
-        self.update(self.frl_at(FIFO), 0x1000, 0)?;
-        self.update(
-            self.frl_at(H_ACTIVE_BLANK),
-            u32::MAX,
-            t.h_active | (t.h_total - t.h_active) << 16,
-        )?;
+        [
+            (PIXEL_FORMAT, 0x303_0301, y420 << 17 | depth << 8 | deep),
+            (FIFO, 0x11100, y420 << 12),
+            (
+                H_ACTIVE_BLANK,
+                u32::MAX,
+                (t.h_active >> y420) | ((t.h_total - t.h_active) >> y420) << 16,
+            ),
+        ]
+    }
+    fn frl_verify_format(&mut self, blank: BlankApplied) -> Result<(), Error> {
+        for (reg, mask, value) in Self::frl_format_registers(blank) {
+            let at = self.frl_at(reg);
+            if self.read(at)? & mask != value {
+                return Err(Error::Readback(at));
+            }
+        }
+        Ok(())
+    }
+    /// Program the uncompressed format and capacity-check borrow parameters.
+    fn frl_stream_attribute(
+        &mut self,
+        request: FrlVideoRequest,
+        blank: BlankApplied,
+    ) -> Result<(), Error> {
+        for (reg, mask, value) in Self::frl_format_registers(blank) {
+            self.update(self.frl_at(reg), mask, value)?;
+        }
         self.update(
             self.frl_at(MODE),
             3,
@@ -122,7 +142,12 @@ impl<I: Io> Engine<I> {
             self.wait(self.frl_at(VPG_MEM_PWR), 0x100, 0, 1000).await?;
         }
         let t = blank.timing.request.timing;
-        let avi = avi_infoframe(&t, request.avi, blank.request.limited, false);
+        let avi = avi_infoframe(
+            &t,
+            request.avi,
+            blank.request.limited,
+            blank.request.ycbcr420,
+        );
         let vendor = vendor_infoframe(&t, request.avi);
         let base = self.layout.mpc_base;
         for (index, packet) in [(0u32, Some(avi)), (1, vendor)] {
@@ -193,15 +218,20 @@ impl<I: Io> Engine<I> {
         self.frl_video_verify(&link, blank, false)?;
         self.enable_blank(blank, timeout).await?;
         self.frl_unblank().await?;
+        self.frl_verify_format(blank)?;
         self.frl_video_verify(&link, blank, true)?;
         let timing = self.wait_blank_frames(blank, timeout).await?;
-        Ok(FrlVideoRunning {
+        let running = FrlVideoRunning {
             link,
             request,
             timing,
-        })
+        };
+        // Frame progress yielded after unblank: recheck the stream/link
+        // witnesses before publishing the running owner.
+        self.frl_video_verify_running(&running)?;
+        Ok(running)
     }
-    /// Start black RGB video on the active FRL link from the prepared
+    /// Start black RGB/4:2:0 video on the active FRL link from the prepared
     /// timing of `request.pipe`, whose HDMISTREAMCLK the clock owner has
     /// routed.
     pub(in crate::amdgpu_dcn401_otg) async fn start_frl_video(
@@ -226,7 +256,7 @@ impl<I: Io> Engine<I> {
             return Err(Error::Invalid);
         }
         let timing = blank.timing.request;
-        if timing.signal != Signal::HdmiFrl || timing.ycbcr420 {
+        if timing.signal != Signal::HdmiFrl {
             return Err(Error::Unsupported);
         }
         timing.validate_clock(clock)?;
@@ -271,6 +301,7 @@ impl<I: Io> Engine<I> {
             return Err(Error::Invalid);
         }
         self.frl_link_witnesses(&v.link)?;
+        self.frl_verify_format(v.timing.blank)?;
         let route = self.layout.base + STREAM_CLOCK * 4;
         if self.read(route)? & 15 != 8 | u32::from(v.request.pipe) {
             return Err(Error::Readback(route));
@@ -326,7 +357,7 @@ impl<I: Io> Engine<I> {
     }
 }
 impl Otg {
-    /// Route HDMISTREAMCLK from `request.pipe` and start black RGB video on
+    /// Route HDMISTREAMCLK from `request.pipe` and start black RGB/4:2:0 video on
     /// the port's active FRL link.
     /// # Safety
     /// start_hdmi_video's obligations for the FRL link and the HPO FRL

@@ -1294,10 +1294,10 @@ fn navi48_modeset_decides_frl_like_linux() -> TestResult {
     let cap = FrlRate::new(6).unwrap();
     let uhd120 = t(1_188_000, 3840, 4400);
     let uhd8k = t(2_376_000, 7680, 9000);
-    if frl_link(&uhd120, 8, cap, quiet).map(FrlRate::code) != Some(4)
-        || frl_link(&uhd120, 10, cap, quiet).map(FrlRate::code) != Some(5)
-        || frl_link(&uhd8k, 8, cap, quiet).is_some()
-        || frl_link(&uhd120, 8, FrlRate::new(3).unwrap(), quiet).is_some()
+    if frl_link(&uhd120, 8, false, cap, quiet).map(FrlRate::code) != Some(4)
+        || frl_link(&uhd120, 10, false, cap, quiet).map(FrlRate::code) != Some(5)
+        || frl_link(&uhd8k, 8, false, cap, quiet).is_some()
+        || frl_link(&uhd120, 8, false, FrlRate::new(3).unwrap(), quiet).is_some()
     {
         return TestResult::Fail("FRL rate decision");
     }
@@ -1741,7 +1741,7 @@ kernel_test_in!(
     navi48_mst_selection_obeys_shared_path_budget
 );
 
-/// FRL's RGB-only fallback must obey the sink's Y420VDB, including when
+/// FRL fallback must obey the sink's Y420VDB, including when
 /// the mode fits the FRL wire rate but cannot fit TMDS at half pixel rate.
 fn navi48_frl_fallback_respects_y420_only_modes() -> TestResult {
     let edid = edid_y420();
@@ -1764,8 +1764,11 @@ fn navi48_frl_fallback_respects_y420_only_modes() -> TestResult {
         ..caps
     };
     for depth in [8, 10, 12] {
-        if hdmi_output(limited, &t, depth, frl).is_some() {
-            return TestResult::Fail("RGB FRL admitted a 4:2:0-only mode");
+        if !matches!(
+            hdmi_output(limited, &t, depth, frl),
+            Some((otg::ColorDepth::Bpc8, true, Some(_)))
+        ) {
+            return TestResult::Fail("FRL did not preserve 4:2:0-only encoding");
         }
     }
     // The same rate/timing remains usable when RGB is allowed (including
@@ -1788,4 +1791,145 @@ fn navi48_frl_fallback_respects_y420_only_modes() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_frl_fallback_respects_y420_only_modes
+);
+
+/// HF 4:2:0 deep-color flags are independent of the RGB VSDB flags.
+/// FRL capacity/rate selection preserves the chosen encoding and depth.
+fn navi48_frl_420_caps_rates_and_selection() -> TestResult {
+    use otg::ColorDepth::{Bpc10, Bpc12, Bpc8};
+    let hf = [3 << 5 | 7, 0xd8, 0x5d, 0xc4, 1, 68, 0x80, 0x33];
+    let y420 = [7 << 5 | 2, 14, 118]; // 3840x2160p120, 4:2:0-only.
+    let edid = with_blocks(edid_1080p(), &[VSDB, &hf, &y420]);
+    let caps = hdmi_caps(&edid);
+    assert!(caps.dc30_420 && caps.dc36_420);
+    assert!(!caps.dc30 && !caps.dc36);
+    assert_eq!(caps.max_frl_rate, 3);
+    // HF-SCDB places the same byte after its reserved/version/rate/flags.
+    let scdb = [7 << 5 | 7, 0x79, 0, 0, 1, 68, 0x80, 0x31];
+    let sc = hdmi_caps(&with_blocks(edid_1080p(), &[VSDB, &scdb, &y420]));
+    assert!(sc.dc30_420 && !sc.dc36_420);
+    let t = edid_timings(&edid)
+        .into_iter()
+        .find(|t| t.pixel_clock_khz == 1_188_000)
+        .unwrap();
+    let cap = FrlRate::new(3).unwrap();
+    let quiet = frl_audio(None, t.v_active);
+    // Linux reference vectors: 8 bpc uses 3x6G; 10/12 require 4x6G.
+    for (bpc, depth, code) in [(8, Bpc8, 2), (10, Bpc10, 3), (12, Bpc12, 3)] {
+        assert_eq!(
+            frl_link(&t, bpc, true, cap, quiet).map(FrlRate::code),
+            Some(code)
+        );
+        assert_eq!(
+            hdmi_output(caps, &t, bpc, Some(cap)),
+            Some((depth, true, FrlRate::new(code)))
+        );
+        for candidate in 1..=cap.code() {
+            assert_eq!(
+                frl_carries(&t, bpc, true, FrlRate::new(candidate).unwrap(), quiet).is_some(),
+                candidate >= code
+            );
+        }
+    }
+    assert!(hdmi_output(caps, &t, 12, None).is_none());
+    assert!(hdmi_output(caps, &t, 12, FrlRate::new(1)).is_none());
+    for bpc in [0, 6, 16] {
+        assert!(frl_carries(&t, bpc, true, cap, quiet).is_none());
+    }
+    for invalid in [
+        Timing { h_active: 0, ..t },
+        Timing {
+            h_active: t.h_active + 1,
+            ..t
+        },
+        Timing {
+            h_total: t.h_total + 1,
+            ..t
+        },
+        Timing {
+            h_total: t.h_active - 1,
+            ..t
+        },
+        Timing {
+            pixel_clock_khz: 0,
+            ..t
+        },
+        Timing {
+            pixel_clock_khz: u32::MAX,
+            ..t
+        },
+    ] {
+        assert!(frl_carries(&invalid, 8, true, cap, quiet).is_none());
+    }
+    let eight_only = HdmiCaps {
+        dc30_420: false,
+        dc36_420: false,
+        dc30: true,
+        dc36: true,
+        ..caps
+    };
+    assert_eq!(
+        hdmi_output(eight_only, &t, 12, Some(cap)),
+        Some((Bpc8, true, FrlRate::new(2)))
+    );
+    assert_eq!(
+        hdmi_output(sc, &t, 12, Some(cap)),
+        Some((Bpc10, true, Some(cap)))
+    );
+    let also = HdmiCaps {
+        y420_only: [0; 4],
+        y420_also: caps.y420_only,
+        ..caps
+    };
+    assert_eq!(
+        hdmi_output(also, &t, 8, Some(cap)),
+        Some((Bpc8, true, FrlRate::new(2)))
+    );
+    // RGB wins once it fits, even when deeper 4:2:0 would fit too.
+    assert_eq!(
+        hdmi_output(also, &t, 12, FrlRate::new(6)),
+        Some((Bpc8, false, FrlRate::new(4)))
+    );
+    let rgb = HdmiCaps {
+        y420_also: [0; 4],
+        ..also
+    };
+    assert!(hdmi_output(rgb, &t, 12, Some(cap)).is_none());
+    // The format survives complete connector selection and native admission.
+    let paths = [path(inventory::Connector::HdmiTypeA, 0)];
+    let ports = [port(paths[0], None, edid)];
+    let enabled = frl_enabled();
+    set_frl(true);
+    let chosen = select(&paths, &ports, 12, Some(t));
+    set_frl(enabled);
+    let s = chosen.unwrap();
+    assert!(s.hdmi && s.ycbcr420 && s.audio.is_none());
+    assert_eq!(s.depth, Bpc12);
+    assert_eq!(s.frl, Some(cap));
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [500_000, 2_000_000],
+        dcfclk_khz: [300_000, 1_200_000],
+        socclk_khz: 600_000,
+        dispclk_max_khz: 1_500_000,
+        dppclk_max_khz: 1_500_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let plan = dml::admit(&soc, &selection_mode(&s)).unwrap();
+    assert!(plan.mode.ycbcr420);
+    assert_eq!(timing_request(0, &plan, &s).signal, otg::Signal::HdmiFrl);
+    assert!(timing_request(0, &plan, &s).ycbcr420);
+    assert_eq!(
+        pipe_clock_request(0, &plan, &s).pixel,
+        dccg::PixelClock::HdmiFrl {
+            pixel_hz: 1_188_000_000
+        }
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_frl_420_caps_rates_and_selection
 );

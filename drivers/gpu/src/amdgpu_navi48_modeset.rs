@@ -65,8 +65,8 @@ pub struct Selection {
     pub hdmi: bool,
     /// The HDMI sink declared SCDC (HF-VSDB/HF-SCDB SCDC_Present).
     pub scdc: bool,
-    /// RGB output depth: 8 bpc for DP; for HDMI the deepest the sink, the
-    /// TMDS rate and the requested maximum allow.
+    /// Output depth: 8 bpc for DP; for HDMI the deepest the sink, the
+    /// link capacity and the requested maximum allow.
     pub depth: otg::ColorDepth,
     /// The sink's audio, when it declares any (HDMI, or DP SST).
     pub audio: Option<otg::AudioInfo>,
@@ -239,26 +239,39 @@ pub fn frl_audio(audio: Option<otg::AudioInfo>, v_active: u32) -> crate::amdgpu_
     }
 }
 
-/// frl_validate_mode_timing for RGB at `bpc`: the stream within the raw
+/// frl_validate_mode_timing for RGB or YCbCr 4:2:0 at `bpc`: the stream within the raw
 /// link rate, and Linux's capacity check passing.
 pub fn frl_carries(
     t: &Timing,
     bpc: u8,
+    ycbcr420: bool,
     rate: FrlRate,
     audio: crate::amdgpu_frl_cap::FrlAudio,
 ) -> Option<crate::amdgpu_frl_cap::FrlCap> {
     use crate::amdgpu_frl_cap::{frl_cap_check, FrlCap, FrlCapInput, FrlEncoding};
-    if u64::from(t.pixel_clock_khz) * u64::from(bpc) * 3 > rate.kbps() {
+    let h_blank = t.h_total.checked_sub(t.h_active)?;
+    if !matches!(bpc, 8 | 10 | 12)
+        || t.pixel_clock_khz == 0
+        || t.h_active == 0
+        || h_blank == 0
+        || ycbcr420 && (t.h_active | h_blank) & 1 != 0
+        || u64::from(t.pixel_clock_khz) * u64::from(bpc) * 3
+            > rate.kbps() * if ycbcr420 { 2 } else { 1 }
+    {
         return None;
     }
     let check = frl_cap_check(&FrlCapInput {
         lanes: rate.lanes(),
         gbps: rate.gbps(),
-        pixel_clock_100hz: t.pixel_clock_khz * 10,
+        pixel_clock_100hz: t.pixel_clock_khz.checked_mul(10)?,
         h_active: t.h_active,
-        h_blank: t.h_total - t.h_active,
+        h_blank,
         bpc,
-        encoding: FrlEncoding::Rgb444,
+        encoding: if ycbcr420 {
+            FrlEncoding::Ycbcr420
+        } else {
+            FrlEncoding::Rgb444
+        },
         audio,
     });
     matches!(check, FrlCap::Ok { .. }).then_some(check)
@@ -270,13 +283,14 @@ pub fn frl_carries(
 pub fn frl_link(
     t: &Timing,
     bpc: u8,
+    ycbcr420: bool,
     cap: FrlRate,
     audio: crate::amdgpu_frl_cap::FrlAudio,
 ) -> Option<FrlRate> {
-    frl_carries(t, bpc, cap, audio)?;
+    frl_carries(t, bpc, ycbcr420, cap, audio)?;
     (1..=cap.code())
         .filter_map(FrlRate::new)
-        .find(|&r| frl_carries(t, bpc, r, audio).is_some())
+        .find(|&r| frl_carries(t, bpc, ycbcr420, r, audio).is_some())
 }
 
 /// FRL training on a ColdBoot port: SCDC over native DDC, the HPO FRL
@@ -866,6 +880,9 @@ pub struct HdmiCaps {
     /// VSDB DC_30bit / DC_36bit: RGB 4:4:4 at 10 / 12 bpc.
     pub dc30: bool,
     pub dc36: bool,
+    /// HF DC_30bit_420 / DC_36bit_420, independent of RGB deep color.
+    pub dc30_420: bool,
+    pub dc36_420: bool,
     /// HF Max_FRL_Rate (drm_get_max_frl_rate's code: 1 = 3 x 3G ... 6 =
     /// 4 x 12G), zero for none or an unknown code.
     pub max_frl_rate: u8,
@@ -960,6 +977,8 @@ pub fn hdmi_caps(edid: &[u8]) -> HdmiCaps {
                 caps.scdc = flags & 0x80 != 0;
             }
             if let Some(&frl) = forum.and_then(|f| f.get(3)) {
+                caps.dc30_420 = frl & 1 != 0;
+                caps.dc36_420 = frl & 2 != 0;
                 caps.max_frl_rate = Some(frl >> 4).filter(|r| (1..=6).contains(r)).unwrap_or(0);
             }
         }
@@ -1096,10 +1115,11 @@ pub fn hdmi_depth(caps: HdmiCaps, pixel_khz: u32, max_bpc: u8) -> Option<otg::Co
 
 /// How an HDMI sink carries `t`: TMDS where `hdmi_format` finds a depth
 /// (Linux keeps TMDS whenever it suffices), else FRL at `frl_cap` (none
-/// when FRL is off or taken): RGB at the deepest declared depth up to
-/// `max_bpc` with a rate carrying it, the lowest such rate. FRL carries
+/// when FRL is off or taken): RGB first unless the mode is 4:2:0-only,
+/// then 4:2:0 where declared. Each uses the deepest declared depth up to
+/// `max_bpc` with a carrying rate, and the lowest such rate. FRL carries
 /// no audio here (the HPO FRL audio path is not implemented), so the
-/// capacity check runs without it. RGB FRL cannot carry a 4:2:0-only mode.
+/// capacity check runs without it.
 pub fn hdmi_output(
     caps: HdmiCaps,
     t: &Timing,
@@ -1111,20 +1131,32 @@ pub fn hdmi_output(
     }
     let cap = frl_cap?;
     let vic = narf_edid::modes::match_cea_mode(edid_mode(t));
-    if vic != 0 && caps.y420_only[usize::from(vic / 64)] & 1 << (vic % 64) != 0 {
-        // A fitting FRL wire rate cannot override the sink's pixel encoding.
-        // Native FRL 4:2:0 is not implemented yet.
-        return None;
-    }
+    let listed = |map: [u64; 4]| vic != 0 && map[usize::from(vic / 64)] & 1 << (vic % 64) != 0;
+    let only420 = listed(caps.y420_only);
     let audio = frl_audio(None, t.v_active);
-    [
-        (12, caps.dc36, otg::ColorDepth::Bpc12),
-        (10, caps.dc30, otg::ColorDepth::Bpc10),
-        (8, true, otg::ColorDepth::Bpc8),
-    ]
-    .into_iter()
-    .filter(|&(bpc, declared, _)| bpc <= max_bpc && declared)
-    .find_map(|(bpc, _, depth)| frl_link(t, bpc, cap, audio).map(|r| (depth, false, Some(r))))
+    // RGB first where allowed, then subsampling only for a declared mode.
+    for ycbcr420 in [false, true] {
+        if !ycbcr420 && only420 || ycbcr420 && !only420 && !listed(caps.y420_also) {
+            continue;
+        }
+        let (dc30, dc36) = if ycbcr420 {
+            (caps.dc30_420, caps.dc36_420)
+        } else {
+            (caps.dc30, caps.dc36)
+        };
+        for (bpc, declared, depth) in [
+            (12, dc36, otg::ColorDepth::Bpc12),
+            (10, dc30, otg::ColorDepth::Bpc10),
+            (8, true, otg::ColorDepth::Bpc8),
+        ] {
+            if bpc <= max_bpc && declared {
+                if let Some(rate) = frl_link(t, bpc, ycbcr420, cap, audio) {
+                    return Some((depth, ycbcr420, Some(rate)));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The bits per component of an output depth.
@@ -2113,18 +2145,19 @@ impl ColdBoot {
         use crate::amdgpu_frl_cap::{FrlBorrow, FrlCap};
         let port = selection.port;
         let bpc = depth_bpc(selection.depth);
+        let ycbcr420 = selection.ycbcr420;
         let audio = frl_audio(None, selection.timing.v_active);
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
             let trained = self
-                .start_frl(port, &selection.timing, bpc, rate, audio)
+                .start_frl(port, &selection.timing, bpc, ycbcr420, rate, audio)
                 .await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Scdc);
             let Some(FrlCap::Ok {
                 audio_packets_line,
                 borrow,
-            }) = frl_carries(&selection.timing, bpc, trained, audio)
+            }) = frl_carries(&selection.timing, bpc, ycbcr420, trained, audio)
             else {
                 return Err(ModesetError::Link);
             };
@@ -2181,7 +2214,8 @@ impl ColdBoot {
         }
         Ok(())
     }
-    /// Enable and train an FRL link for `timing` at `bpc` on HDMI port
+    /// Enable and train an FRL link for `timing` at `bpc`, preserving its
+    /// RGB/4:2:0 encoding, on HDMI port
     /// `port`, from `rate` down: hdmi_frl_perform_link_training_with_retries
     /// at each rate, stepping one rate code down when the sink asks for a
     /// lower rate (as Linux's verification walk does), never below one that
@@ -2194,6 +2228,7 @@ impl ColdBoot {
         port: usize,
         timing: &Timing,
         bpc: u8,
+        ycbcr420: bool,
         rate: FrlRate,
         audio: crate::amdgpu_frl_cap::FrlAudio,
     ) -> Result<FrlRate, ModesetError> {
@@ -2203,7 +2238,7 @@ impl ColdBoot {
         unsafe {
             loop {
                 let r = FrlRate::new(code).ok_or(ModesetError::Link)?;
-                if frl_carries(timing, bpc, r, audio).is_none() {
+                if frl_carries(timing, bpc, ycbcr420, r, audio).is_none() {
                     return Err(ModesetError::Link);
                 }
                 self.start_display_frl_link(port, r.lanes(), r.character_khz())

@@ -477,9 +477,13 @@ at a 200 ms fallback cadence. Source-test patterns/FFE updates preserve owned
 video/fetch; interrupted firmware work quarantines the display. Ordinary
 retrain requests stay pending until full configuration retirement and fresh
 admission/training, including supported rate fallback. Physical FRL transitions
-and source-test acceptance remain unvalidated. FRL admission also respects
-4:2:0-only EDID modes: if TMDS 4:2:0 cannot carry one, the RGB-only FRL path
-refuses it rather than selecting an unsupported sink encoding.
+and source-test acceptance remain unvalidated. Native FRL now also supports
+YCbCr 4:2:0 at sink-declared 8/10/12-bpc depths, with format-aware capacity and
+training fallback, half-width encoder counts, AVI colorimetry and shared OPP/MPC
+subsampling/BT.709 conversion. The pixel DTO keeps the full pixel rate; live
+format checks reject stale compression or encoding state. Y420VDB modes stay
+4:2:0, and Y420CMDB modes use RGB when it fits. The single-OPP 4096-pixel limit
+remains; FRL audio/DSC and physical transitions are still open.
 HDCP/protected output is tracked separately in
 `drivers/gpu/research/navi48-protected-output.md`, including TA firmware,
 protocol, credential authorization, isolation and physical acceptance gates.

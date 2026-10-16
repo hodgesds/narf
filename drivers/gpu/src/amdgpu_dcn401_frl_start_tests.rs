@@ -15,6 +15,7 @@ struct FrlIo {
     phy: u8,
     lanes: u8,
     event: Arc<AtomicU8>,
+    drift_on_read: Option<(u64, u64, u32)>,
 }
 fn phy_reg(p: u8, r: u64) -> u64 {
     BASE + (r + u64::from(p) * 0xd8) * 4
@@ -51,7 +52,15 @@ impl Io for FrlIo {
             }
             _ => {}
         }
-        self.inner.read(at)
+        let value = self.inner.read(at);
+        if let Some((trigger, reg, value)) = self.drift_on_read {
+            // Only after FRL unblank: timing enable has its own frame wait.
+            if trigger == at && self.inner.regs.get(&frl(0x8d6)).is_some_and(|v| v & 1 != 0) {
+                self.inner.regs.insert(reg, value);
+                self.drift_on_read = None;
+            }
+        }
+        value
     }
     fn write(&mut self, at: u64, value: u32) {
         // DC never routes the PHY or brings up the character clock itself.
@@ -64,7 +73,7 @@ impl Io for FrlIo {
         // Tribyte encoder and ramp FIFO reset-done follow their requests.
         for (reg, from, to) in [(0x8df, 0x10, 0x100), (0x8d6, 0x10, 0x10_0000)] {
             if at == frl(reg) {
-                let v = self.inner.regs[&at];
+                let v = self.inner.regs.get(&at).copied().unwrap_or(0);
                 let done = if v & from != 0 { to } else { 0 };
                 self.inner.regs.insert(at, (v & !to) | done);
             }
@@ -141,6 +150,7 @@ fn dcn401_frl_link_starts_trains_and_stops_like_linux() -> TestResult {
                 phy,
                 lanes,
                 event: event.clone(),
+                drift_on_read: None,
             },
             authority: e.authority,
             layout: e.layout,
@@ -192,6 +202,7 @@ fn dcn401_frl_link_starts_trains_and_stops_like_linux() -> TestResult {
             phy,
             lanes: 4,
             event: Arc::new(AtomicU8::new(0)),
+            drift_on_read: None,
         },
         authority: e.authority,
         layout: e.layout,
@@ -221,7 +232,10 @@ kernel_test_in!(
 /// handshake, CRC, double-buffer disable and OTG input, the timing, then
 /// the FIFO reset and enables. Stop: AVMUTE, blank, packets off, timing
 /// off, the link left active for its own stop.
-fn live_frl_video() -> (Engine<FrlIo>, Fw) {
+fn prepared_frl_video(
+    ycbcr420: bool,
+    depth: ColorDepth,
+) -> (Engine<FrlIo>, Fw, FrlVideoRequest, dccg::Applied) {
     let (phy, pipe) = (2u8, 1u8);
     let event = Arc::new(AtomicU8::new(0));
     let mut e = engine();
@@ -234,6 +248,7 @@ fn live_frl_video() -> (Engine<FrlIo>, Fw) {
             phy,
             lanes: 4,
             event: event.clone(),
+            drift_on_read: None,
         },
         authority: e.authority,
         layout: e.layout,
@@ -247,10 +262,19 @@ fn live_frl_video() -> (Engine<FrlIo>, Fw) {
     };
     let mut req = request(pipe);
     req.signal = Signal::HdmiFrl;
+    req.ycbcr420 = ycbcr420;
     let c = clock(req);
     run(e.prepare(req, c)).unwrap();
     e.io.inner.retiring = [false; 4];
-    run(e.prepare_blank(blank_request(pipe), c)).unwrap();
+    run(e.prepare_blank(
+        BlankRequest {
+            ycbcr420,
+            depth,
+            ..blank_request(pipe)
+        },
+        c,
+    ))
+    .unwrap();
     // The clock owner's DTBCLK-fed DTO, and every fetcher stopped.
     let bank1 = e.layout.dio_clock - 0xa0 * 4;
     e.io.inner
@@ -278,10 +302,20 @@ fn live_frl_video() -> (Engine<FrlIo>, Fw) {
     ));
     e.status.state = State::FrlLinkActive(phy);
     e.io.inner.regs.insert(BASE + 0x59 * 4, 8 | u32::from(pipe));
-    if let Err(err) = run(e.start_frl_video(path(phy), request, c)) {
+    (e, fw, request, c)
+}
+fn live_frl_video_format(ycbcr420: bool, depth: ColorDepth) -> (Engine<FrlIo>, Fw) {
+    let (mut e, fw, request, c) = prepared_frl_video(ycbcr420, depth);
+    // Stale prior encoding/DSC fields must be replaced by uncompressed output.
+    e.io.inner.regs.insert(frl(0x8e0), 0x0303_0301);
+    e.io.inner.regs.insert(frl(0x8d6), 0x11100);
+    if let Err(err) = run(e.start_frl_video(path(2), request, c)) {
         panic!("FRL video: {err:?}");
     }
     (e, fw)
+}
+fn live_frl_video() -> (Engine<FrlIo>, Fw) {
+    live_frl_video_format(false, ColorDepth::Bpc8)
 }
 fn dcn401_frl_video_starts_and_stops_like_linux() -> TestResult {
     let (phy, pipe) = (2u8, 1u8);
@@ -507,4 +541,100 @@ fn dcn401_frl_controls_bind_live_scanout() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-frl-link",
     dcn401_frl_controls_bind_live_scanout
+);
+
+/// Linux's 4:2:0 stream attribute counts pixel pairs, keeps uncompressed
+/// FIFO encoding, and tells the sink BT.709/limited 4:2:0 through VPG4.
+fn dcn401_frl_420_stream_format_packets_and_retirement() -> TestResult {
+    for (depth, pixel_format) in [
+        (ColorDepth::Bpc8, 0x20000),
+        (ColorDepth::Bpc10, 0x20101),
+        (ColorDepth::Bpc12, 0x20201),
+    ] {
+        let (mut e, mut fw) = live_frl_video_format(true, depth);
+        let r = &e.io.inner.regs;
+        assert_eq!(r[&frl(0x8e0)] & 0x3030301, pixel_format);
+        assert_eq!(r[&frl(0x8d6)] & 0x11100, 0x1000);
+        assert_eq!(r[&frl(0x900)], 960 | 140 << 16);
+        assert_eq!(r[&e.layout.otg(1, H_TIMING)] & 0x103, 1);
+        assert_eq!(r[&e.layout.odm(1, FORMAT)] & 0x33, 2);
+        // VPG4 generic packet 0, nine words: inspect the actual emitted AVI.
+        let words: alloc::vec::Vec<u32> =
+            e.io.inner
+                .writes
+                .iter()
+                .filter_map(|&(a, v)| (a == frl(0x932)).then_some(v))
+                .collect();
+        assert_eq!(words.len(), 9);
+        let bytes: alloc::vec::Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(&bytes[..3], &[0x82, 2, 13]);
+        assert_eq!(bytes[5] >> 5, 3); // YCbCr420
+        assert_eq!(bytes[6] >> 6, 2); // BT.709
+        assert_eq!(bytes[7] & 0xc, 0); // RGB range unspecified
+        assert_eq!(bytes[9] & 0xc0, 0); // YCbCr limited range
+        assert_eq!(bytes.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)), 0);
+        e.frl_video_verify_running(&e.status.frl_video_running.unwrap())
+            .unwrap();
+        run(e.stop_frl_video(path(2))).unwrap();
+        run(e.stop_frl_link(&mut fw, path(2))).unwrap();
+        assert_eq!(e.status.state, State::FrlDisabled);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-frl-link",
+    dcn401_frl_420_stream_format_packets_and_retirement
+);
+
+/// Rejected format writes quarantine startup before video is published;
+/// late encoding drift is detected by live checks, including source tests.
+fn dcn401_frl_420_format_failures_retain_link() -> TestResult {
+    for (nth, reg) in [(1, 0x8e0), (2, 0x8d6), (3, 0x900)] {
+        let (mut e, _fw, req, c) = prepared_frl_video(true, ColorDepth::Bpc10);
+        e.io.inner.reject = Some(e.io.inner.writes.len() + nth);
+        let link = e.status.frl_link;
+        assert_eq!(
+            run(e.start_frl_video(path(2), req, c)),
+            Err(Error::Readback(frl(reg)))
+        );
+        assert!(matches!(e.status.state, State::Failed(_)));
+        assert_eq!(e.status.frl_link, link);
+        assert!(e.status.frl_video_running.is_none());
+        assert_eq!(run(e.start_frl_video(path(2), req, c)), Err(Error::Busy));
+    }
+    // The encoder can drift after unblank, while waiting for fresh frames.
+    let (mut e, _fw, req, c) = prepared_frl_video(true, ColorDepth::Bpc10);
+    let link = e.status.frl_link;
+    e.io.drift_on_read = Some((e.layout.otg(req.pipe, 0x1b4d), frl(0x8e0), 0));
+    if run(e.start_frl_video(path(2), req, c)) != Err(Error::Readback(frl(0x8e0))) {
+        return TestResult::Fail("published FRL video after frame-wait format drift");
+    }
+    assert!(matches!(e.status.state, State::Failed(_)));
+    assert_eq!(e.status.frl_link, link);
+    assert!(e.status.frl_video_running.is_none());
+    for (reg, bit) in [
+        (0x8e0, 0x10000),
+        (0x8e0, 0x1000000),
+        (0x8d6, 0x1000),
+        (0x8d6, 0x100),
+        (0x900, 1),
+    ] {
+        let (mut e, mut fw) = live_frl_video_format(true, ColorDepth::Bpc8);
+        *e.io.inner.regs.get_mut(&frl(reg)).unwrap() ^= bit;
+        assert_eq!(
+            e.frl_video_verify_running(&e.status.frl_video_running.unwrap()),
+            Err(Error::Readback(frl(reg)))
+        );
+        let writes = e.io.inner.writes.len();
+        assert_eq!(
+            run(e.frl_ffe(&mut fw, path(2), 1)),
+            Err(Error::Readback(frl(reg)))
+        );
+        assert_eq!(e.io.inner.writes.len(), writes);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-frl-link",
+    dcn401_frl_420_format_failures_retain_link
 );

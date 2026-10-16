@@ -534,7 +534,9 @@ impl Request {
         // 4:2:0 is HDMI only, and every horizontal boundary must divide by
         // two (Linux would switch to the manual mode; this owner refuses).
         if self.ycbcr420
-            && (self.signal != Signal::Tmds || (t.h_total | t.h_sync_width | hs | he) & 1 != 0)
+            && (!matches!(self.signal, Signal::Tmds | Signal::HdmiFrl)
+                || t.h_active > dml::FMT_420_BUFFER_WIDTH
+                || (t.h_total | t.h_sync_width | hs | he) & 1 != 0)
         {
             return Err(Error::Unsupported);
         }
