@@ -72,6 +72,7 @@ struct ScanIo {
     writes: usize,
     /// Set once the lock has been requested (a cancellation point).
     lock_requested: Arc<AtomicBool>,
+    pause_wait: bool,
 }
 impl ScanIo {
     fn get(&mut self, at: u64) -> u32 {
@@ -103,6 +104,9 @@ impl ScanIo {
     }
 }
 impl Io for ScanIo {
+    fn pause_wait(&self) -> bool {
+        self.pause_wait
+    }
     fn read(&mut self, at: u64) -> u32 {
         if !self.armed {
             return self.inner.read(at);
@@ -306,6 +310,7 @@ fn chain(phy_index: u8, stream: u8, pipe: u8) -> Chain {
             },
             pipe,
             armed: false,
+            pause_wait: false,
             grant: true,
             latch_delay: 0,
             pending_latch: None,
@@ -495,6 +500,7 @@ fn dcn401_scanout_chain_owner_changes_and_cancellation_quarantine() -> TestResul
     // replayable.
     let mut c = chain(3, 2, 1);
     c.e.io.grant = false;
+    c.e.io.pause_wait = true;
     let requested = c.e.io.lock_requested.clone();
     let clock = c.clock;
     cancel_at(
@@ -633,6 +639,7 @@ fn dcn401_scanout_chain_live_updates_go_through_the_back_buffer() -> TestResult 
         }
         // Not while a flip is in transition, nor after the pipe stopped.
         c.e.io.grant = false;
+        c.e.io.pause_wait = true;
         let requested = c.e.io.lock_requested.clone();
         requested.store(false, Ordering::SeqCst);
         let clock = c.clock;

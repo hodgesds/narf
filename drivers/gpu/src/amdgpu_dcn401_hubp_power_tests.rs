@@ -18,6 +18,11 @@ struct PowerIo {
     pause_wait: bool,
 }
 impl Io for PowerIo {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // PGFSM acknowledgements are read-driven; host scheduling must not
+        // expire their real-hardware deadline before the model advances.
+        Some(8)
+    }
     fn pause_wait(&self) -> bool {
         self.pause_wait
     }

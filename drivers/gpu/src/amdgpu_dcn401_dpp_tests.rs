@@ -68,6 +68,12 @@ impl DppIo {
     }
 }
 impl Io for DppIo {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // Acknowledgements advance on reads, not elapsed time. Retain the
+        // delayed success, stuck acknowledgement and cancellation cases
+        // without letting host scheduling turn fault injection into timeout.
+        Some(8)
+    }
     fn read(&mut self, at: u64) -> u32 {
         self.accessible(at);
         for (index, (r, mask)) in [(0xd25, 3), (0xd62, 0x30)].into_iter().enumerate() {
