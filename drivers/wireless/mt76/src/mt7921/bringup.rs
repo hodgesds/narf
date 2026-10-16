@@ -1,7 +1,6 @@
-//! MT7921 full bring-up orchestrator — Stages 7..14 wired together.
+//! MT7921 command builders and the unimplemented full bring-up boundary.
 //!
-//! This module composes the smaller Stage-N pieces into a single
-//! linear bring-up sequence that, on real silicon, takes the radio
+//! The intended sequence composes the smaller Stage-N pieces to take the radio
 //! from a freshly probed link state through MCU + WM + WA firmware
 //! load, vif setup, channel programming, association, and live data
 //! TX/RX.
@@ -23,17 +22,14 @@
 //!  12. tx + rx pumps live                         (Stage-13/14)
 //! ```
 //!
-//! Each step is a typed function that takes the already-allocated
-//! Stage-4 ring set + the chip MMIO + a side channel for the live
-//! MCU mailbox (when one exists).
+//! The command builders encode individual steps. They do not dispatch to
+//! a live MCU or establish an association.
 //!
 //! ## Status
 //!
-//! The orchestrator is fully assembled but stops short of real
-//! firmware dispatch — the MCU send/receive helpers return
-//! `NotImplemented` because the cooperative MCU pump isn't wired
-//! to the WFDMA0 RX completion IRQ yet. The shape of the sequence
-//! is what real-silicon bring-up will fill in.
+//! `full_bring_up` returns `NotImplemented` before allocating or publishing
+//! DMA rings. Firmware transport and its retained DMA lifecycle are missing;
+//! programming rings and freeing their backing on return is unsafe.
 
 #![allow(dead_code)]
 
@@ -259,28 +255,20 @@ pub fn build_secure_sta_rec_body(
     out
 }
 
-/// The orchestrator entry — composes Stages 1-12 into a single
-/// linear sequence. On a real-silicon bring-up this returns
-/// `Ok(BringUpResult)`. Right now it stops at the firmware-load
-/// boundary with `NotImplemented` because the MCU pump isn't wired
-/// to a WFDMA0 IRQ vector yet.
+/// Boundary for the intended retained firmware/data transport. Currently
+/// returns `NotImplemented` without device operations or DMA allocation.
 ///
 /// # Safety
-/// `mmio` is the live BAR0 region; caller owns the device.
+/// This unimplemented boundary performs no MMIO or DMA publication. Once a
+/// transport is implemented the caller must supply an exclusively owned live
+/// BAR0 and retain the returned ring owner until device shutdown completes.
 pub unsafe fn full_bring_up(
     mmio: &narf_bus::MmioRegion,
     config: BringUpConfig,
 ) -> Result<BringUpResult, BringUpError> {
-    // Stage-4: DMA quiesce + ring alloc + ring program.
-    // SAFETY: forwarded.
-    let rings = dma::allocate_ring_set()?;
-    // SAFETY: forwarded.
-    unsafe { dma::program_ring_set(mmio, &rings)? };
-
-    // Stage-5/6/7: firmware loads — gated on alive `narf_firmware`
-    // registry. Without the blob nothing here can succeed; we surface
-    // `NotImplemented` as the typed signal that "everything up to
-    // this point worked, dispatch is the next missing piece."
-    let _ = config;
+    // Firmware dispatch has no transport owner yet. Do not program rings
+    // that would be freed when returning NotImplemented. Keep this public
+    // boundary side-effect-free until the full retained lifecycle exists.
+    let _ = (mmio, config);
     Err(BringUpError::NotImplemented)
 }

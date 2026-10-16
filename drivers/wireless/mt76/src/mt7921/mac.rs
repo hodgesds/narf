@@ -28,12 +28,14 @@
 use narf_bus::MmioRegion;
 use narf_time::Deadline;
 
-use super::pci::l1_remap;
+use super::registers;
 use super::regs::*;
 
 /// Errors raised by the ownership handshake.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PowerError {
+    /// Register access exceeds the mapped BAR or uses an unsupported address.
+    InvalidWindow,
     /// Driver-own poll hit `DRV_OWN_RETRY_COUNT` retries without
     /// seeing `OWN_SYNC` clear. Either firmware is wedged or the
     /// chip never got a clock — usually fixed by a PCIe-link cold
@@ -46,24 +48,24 @@ pub enum PowerError {
 
 const READ_GONE_U32: u32 = 0xFFFF_FFFF;
 
-/// Read MT_CONN_ON_LPCTL through the L1 remap.
+/// Read MT_CONN_ON_LPCTL through its fixed CONN_HOST_CSR window.
 ///
 /// # Safety
 /// Caller owns BAR0 exclusively.
 #[inline]
-unsafe fn read_lpctl(mmio: &MmioRegion) -> u32 {
+unsafe fn read_lpctl(mmio: &MmioRegion) -> Result<u32, PowerError> {
     // SAFETY: BAR0 mapped + owned per `# Safety`.
-    unsafe { mmio.read32(l1_remap(MT_CONN_ON_LPCTL) as u64) }
+    unsafe { registers::read32(mmio, MT_CONN_ON_LPCTL) }.map_err(|_| PowerError::InvalidWindow)
 }
 
-/// Write MT_CONN_ON_LPCTL through the L1 remap.
+/// Write MT_CONN_ON_LPCTL through its fixed CONN_HOST_CSR window.
 ///
 /// # Safety
 /// As `read_lpctl`.
 #[inline]
-unsafe fn write_lpctl(mmio: &MmioRegion, v: u32) {
+unsafe fn write_lpctl(mmio: &MmioRegion, v: u32) -> Result<(), PowerError> {
     // SAFETY: BAR0 mapped + owned per `# Safety`.
-    unsafe { mmio.write32(l1_remap(MT_CONN_ON_LPCTL) as u64, v) }
+    unsafe { registers::write32(mmio, MT_CONN_ON_LPCTL, v) }.map_err(|_| PowerError::InvalidWindow)
 }
 
 /// Take driver ownership of the PCIe link. Idempotent — if firmware
@@ -76,7 +78,7 @@ pub unsafe fn take_driver_own(mmio: &MmioRegion) -> Result<(), PowerError> {
     for _ in 0..DRV_OWN_RETRY_COUNT {
         // Tell the link to give ownership to the driver.
         // SAFETY: BAR0 mapped + owned.
-        unsafe { write_lpctl(mmio, PCIE_LPCR_HOST_CLR_OWN) };
+        unsafe { write_lpctl(mmio, PCIE_LPCR_HOST_CLR_OWN)? };
 
         // Linux always pauses 2..3 ms after the CLR write when ASPM
         // is in the picture. We don't track ASPM yet; the conservative
@@ -89,10 +91,17 @@ pub unsafe fn take_driver_own(mmio: &MmioRegion) -> Result<(), PowerError> {
         // matching Linux's `mt76_poll_msec_tick(50, 1)`.
         let deadline = Deadline::after_ms(DRV_OWN_POLL_MS);
         let mut last: u32 = 0;
+        let mut access_error = None;
         let cleared = narf_scheduler::responsive_spin_until(
             || {
                 // SAFETY: BAR0 mapped + owned.
-                last = unsafe { read_lpctl(mmio) };
+                last = match unsafe { read_lpctl(mmio) } {
+                    Ok(value) => value,
+                    Err(error) => {
+                        access_error = Some(error);
+                        return true;
+                    }
+                };
                 if last == READ_GONE_U32 {
                     // Surface device-gone as a hard early-out.
                     return true;
@@ -102,6 +111,9 @@ pub unsafe fn take_driver_own(mmio: &MmioRegion) -> Result<(), PowerError> {
             deadline,
         );
 
+        if let Some(error) = access_error {
+            return Err(error);
+        }
         if last == READ_GONE_U32 {
             return Err(PowerError::DeviceGone);
         }
@@ -119,17 +131,24 @@ pub unsafe fn take_driver_own(mmio: &MmioRegion) -> Result<(), PowerError> {
 pub unsafe fn give_firmware_own(mmio: &MmioRegion) -> Result<(), PowerError> {
     for _ in 0..DRV_OWN_RETRY_COUNT {
         // SAFETY: BAR0 mapped + owned.
-        unsafe { write_lpctl(mmio, PCIE_LPCR_HOST_SET_OWN) };
+        unsafe { write_lpctl(mmio, PCIE_LPCR_HOST_SET_OWN)? };
 
         // Poll OWN_SYNC for the SET-direction completion (Linux:
         // `mt76_poll_msec_tick(MT_CONN_ON_LPCTL, OWN_SYNC, 4, 50, 1)`
         // — value 4 = BIT(2) set).
         let deadline = Deadline::after_ms(DRV_OWN_POLL_MS);
         let mut last: u32 = 0;
+        let mut access_error = None;
         let set = narf_scheduler::responsive_spin_until(
             || {
                 // SAFETY: BAR0 mapped + owned.
-                last = unsafe { read_lpctl(mmio) };
+                last = match unsafe { read_lpctl(mmio) } {
+                    Ok(value) => value,
+                    Err(error) => {
+                        access_error = Some(error);
+                        return true;
+                    }
+                };
                 if last == READ_GONE_U32 {
                     return true;
                 }
@@ -138,6 +157,9 @@ pub unsafe fn give_firmware_own(mmio: &MmioRegion) -> Result<(), PowerError> {
             deadline,
         );
 
+        if let Some(error) = access_error {
+            return Err(error);
+        }
         if last == READ_GONE_U32 {
             return Err(PowerError::DeviceGone);
         }

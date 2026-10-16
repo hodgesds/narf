@@ -20,13 +20,9 @@
 //! - `drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h` —
 //!   `enum mt7921_txq_id` / `enum mt7921_rxq_id`.
 //!
-//! The MT7921 silicon (Pebble) exposes a flat 32-bit BAR0 register
-//! window. The register *addresses* are 32-bit absolute on-chip
-//! addresses — Linux uses a per-chip "L1" remap to fold them into
-//! the BAR window. The remap is documented in
-//! `mt7921/mt7921_l1_rr`; for the baseline we use the same low-16-MiB
-//! mapping as Linux: BAR0 starts at chip address 0, so absolute
-//! addresses 0x0_0000..0xff_ffff are direct offsets.
+//! Chip addresses are not BAR offsets. A 1 MiB BAR contains fixed windows
+//! and a 64 KiB L1 aperture selected through a read-modify-write register.
+//! See `registers` for checked translation and posted-write ordering.
 
 #![allow(dead_code)]
 

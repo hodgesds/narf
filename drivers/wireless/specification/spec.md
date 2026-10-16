@@ -68,6 +68,30 @@ pub trait WirelessDriver: Driver {
 
 Drivers receive traffic via four distinct Narf-Rings (one per AC) from the stack daemon.
 
+### MT76 PCI discovery and register access
+
+MT7921/MT7922 discovery supports the physical 1 MiB PCI BAR0. Accesses use
+Linux CONNAC2 fixed windows or a 64 KiB L1 aperture. L1 transactions preserve
+unrelated selector bits, write the chip page into selector bits 15:0, read
+back before window access, and restore/flush the prior selector afterward.
+The caller exclusively owns BAR0 and the latch across the entire transaction.
+Misaligned, unsupported, and out-of-range accesses are rejected before MMIO;
+`ProbeError::UnsupportedRegisterWindow` reports an insufficient probe window.
+`ProbeError::RemapRejected` reports a selector readback mismatch without
+accessing the wrongly selected window; a removed selector reports `DeviceGone`.
+`l1_remap` returns an offset or `u32::MAX` for an unsupported address; callers
+must not use an indirect offset without a serialized selector transaction.
+
+Probe clears PCI bus mastering and leaves DMA ring publication disabled.
+Ownership waits are deadline-bounded; `PowerError::InvalidWindow` reports
+an invalid register access and `UnsupportedChip` rejects unknown identities.
+PCI discovery does not publish a zero-MAC netdev/wiphy. Firmware dispatch,
+EFUSE reading and a working Wi-Fi data path remain unimplemented. The
+`full_bring_up` boundary returns `NotImplemented` without allocating or
+programming rings until it can retain every published allocation.
+PCI alias `14c3:0616` selects the MT7922 firmware pair. Register translation
+and selector encoding follow the local Linux reference at `ecd997b0189a`.
+
 ### 3.1 Implemented iwlwifi MLD station profile
 
 The production Gen3 probe owns firmware/IML/PNVM bytes and schedules
