@@ -8,6 +8,9 @@ use core::{future::poll_fn, ops::Range, task::Poll};
 #[path = "station_mcu.rs"]
 mod station;
 pub use station::{NicCapabilities, PhyCapabilities, RadioInfo};
+#[path = "passive_scan.rs"]
+mod scan;
+pub use scan::{ScanBss, ScanReport};
 
 #[cfg(target_arch = "x86_64")]
 #[path = "firmware_transport_hw.rs"]
@@ -36,6 +39,20 @@ pub fn boot_status() -> BootStatus {
             BootStatus::Retained(owner.state())
         }),
     }
+}
+
+/// Run a receive-only hardware diagnostic using the retained boot owner.
+/// May be awaited from the executor; no sync bridge or IRQ lock is held.
+#[cfg(target_arch = "x86_64")]
+pub async fn scan_boot_passive(channels: &[u8]) -> Result<ScanReport, Error> {
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .scan_passive(channels)
+        .await
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -73,7 +90,10 @@ pub(super) fn start_boot() -> narf_init::InitResult {
         "mt76: firmware {result:?}; retained {:?}; WLAN data path not enabled",
         transport.state()
     );
-    if result.is_ok() {
+    if let Ok(info) = result {
+        if crate::iface::register_scan_iface(info).is_err() {
+            return InitResult::Error("MT76 scan interface identity");
+        }
         InitResult::Ok
     } else {
         InitResult::Error("MT76 firmware startup (owner retained)")
@@ -143,6 +163,8 @@ pub enum Stage {
     EepromMode,
     CountryLimits,
     MacInitialize,
+    ScanSetup,
+    ScanWait,
     Shutdown,
 }
 /// Firmware observations, not an operational WLAN interface.
@@ -160,6 +182,7 @@ pub enum State {
     Running(Stage),
     Ready(Report),
     RadioReady(RadioInfo),
+    ScanReady(RadioInfo),
     Failed { stage: Stage, error: Error },
     Stopped,
 }
@@ -334,6 +357,7 @@ trait Backend {
     fn submit(&mut self, scatter: bool, frame: &[u8]) -> Result<(), Error>;
     fn tx_complete(&mut self, scatter: bool) -> Result<bool, Error>;
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Error>;
+    fn receive_data(&mut self) -> Result<Option<Vec<u8>>, Error>;
     fn release(&mut self) -> Result<(), Error>;
     fn configure_mac(&mut self) -> Result<(), Error>;
     fn clear_wtbl(&mut self, index: u8) -> Result<(), Error>;
@@ -348,6 +372,7 @@ struct Session<B: Backend> {
     events: VecDeque<Vec<u8>>,
     transferred: usize,
     boot_started: Option<u64>,
+    scan_seq: u8,
 }
 impl<B: Backend> Session<B> {
     fn new(backend: B, firmware: Firmware) -> Self {
@@ -359,6 +384,7 @@ impl<B: Backend> Session<B> {
             events: VecDeque::new(),
             transferred: 0,
             boot_started: None,
+            scan_seq: 0,
         }
     }
     fn stage(&mut self, stage: Stage) {

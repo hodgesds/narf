@@ -120,7 +120,8 @@ release only after DMA is disabled and idle, PCI bus mastering is confirmed
 off and ring references are cleared. Failure to prove quiescence retains memory.
 The late `mt76-firmware` initcall runs after firmware discovery and retains the
 transport on success or failure; `boot_status` exposes its state. A ready
-report proves firmware startup only and does not register a WLAN interface.
+report proves firmware startup only. The late initcall registers a passive
+scan interface only after the subsequent radio initialization succeeds.
 
 After `run`, `Transport::initialize_radio` performs a second single-use,
 30-second-bounded initialization. `NicCapabilities::parse` decodes the counted
@@ -142,11 +143,46 @@ idle waits, and RTS thresholds are sent through the MCU. `RadioReady(RadioInfo)`
 reports this initialization, including the actual MAC/PHY, EFUSE hardware type,
 number of country commands and optional channel configuration. Cancellation
 or failure cannot replay initialization or release published DMA. Radio enable,
-host regulatory/channel/power configuration, scan, association and packet
+host regulatory/channel/power configuration for transmission, association and packet
 queues remain separate prerequisites for an operational WLAN interface.
 `cmd::encode_uni_dev_info_update` emits the four-byte own-MAC/band header and
 one 12-byte active/link-index/MAC TLV (16 bytes total), matching CONNAC2 unified
 device commands rather than the earlier synthetic two-TLV layout.
+
+### MT76 passive scan and receive
+
+The retained owner also allocates and publishes WFDMA RX ring 2, with the
+same address-width checks and shutdown/retention contract as MCU rings.
+Completed descriptors are copied before rearming, and packet lengths are
+bounded by both descriptor and allocation. MCU waiters and packet RX use
+their respective physical rings; data frames cannot satisfy an MCU waiter.
+
+`Transport::scan_passive` and `scan_boot_passive` expose a bounded hardware
+diagnostic after `RadioReady`. Only unique world 2.4 GHz channels 1–11 are
+accepted. The first scan configures an unassociated station VIF with unified
+device/BSS commands, installs a 20 MHz `00` channel domain with NO_IR flags,
+enables the MAC/RX path, and submits a version-1 CONNAC2 passive scan request
+with zero probe requests. Subsequent scans reuse the VIF. Scan completion
+must match the separate nonzero seven-bit scan sequence. The receive wait is
+15 seconds and the whole attempt retains the existing 30-second budget.
+Failure/cancellation leaves the last stage and retains DMA; it cannot replay.
+
+The parser checks the six-word RX prefix, all optional groups and padding,
+frame-control/type, source/BSSID, FCS/security/aggregation errors, SSID and
+IE bounds, RSN syntax, and consistency between RX and DS channels. Results
+retain original IEs and optional measured RSSI; unknown RSSI maps to -128
+at the wireless interface boundary. At most 64 BSSID/channel entries are
+retained, with a truncation flag; hidden-to-visible SSID updates are preserved.
+
+After successful radio initialization, `Mt76Iface` registers an exact shared
+netdev/wiphy name and its real MAC for passive nl80211 scans. Its constructor
+takes `(name, RadioInfo)` and rejects invalid identity; the old PCI-ID-derived
+constructor/registration scaffold is removed. Active/directed scans and
+unsupported channels are rejected before MMIO. Only the implemented 2.4 GHz
+profile is exposed, with HT/VHT/HE/EHT disabled. The link stays down, frame
+ring endpoints are absent, and packet sends/association/configuration fail
+until the corresponding driver paths exist. No interface is registered on
+firmware/radio initialization failure. No host device is detached for tests.
 
 ### 3.1 Implemented iwlwifi MLD station profile
 

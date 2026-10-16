@@ -23,10 +23,13 @@ and PHY, read EFUSE hardware identity, select embedded world country limits,
 select on-chip calibration and initialize MAC/WTBL/RTS. Unified device command
 framing now matches the local Linux reference. Waits are bounded and report the current stage;
 failed or cancelled attempts retain published DMA until verified shutdown.
-The targeted QEMU suite passes 77 tests with one skip, including protocol,
+The retained RX ring and MCU scan path now support passive 2.4 GHz scans on
+channels 1–11. Successful radio initialization registers a passive nl80211
+interface with the real MAC; its link remains down and data sends fail.
+The targeted QEMU suite passes 83 tests with one skip, including protocol,
 production descriptor/MAC, cancellation, country limits and MT7922 image-layout models.
 Both-architecture Clippy and an x86_64 UEFI boot smoke pass. Physical MT7922
-firmware/radio initialization remains unverified; scan, association and a working WLAN
+firmware/radio initialization and passive scan remain unverified; association and a working WLAN
 data path remain unfinished. This does not close the Stage 5 Wi-Fi gate.
 
 ## Loadable e1000 datapath

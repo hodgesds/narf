@@ -54,6 +54,8 @@ struct Model {
     revoke_on_submit: bool,
     wtbl_stall: bool,
     clc_result: bool,
+    packets: VecDeque<Vec<u8>>,
+    scan_stall: bool,
     resources: Arc<AtomicUsize>,
 }
 impl Model {
@@ -79,6 +81,8 @@ impl Model {
             revoke_on_submit: false,
             wtbl_stall: false,
             clc_result: false,
+            packets: VecDeque::new(),
+            scan_stall: false,
             resources,
         }
     }
@@ -148,7 +152,15 @@ impl Backend for Model {
                     0
                 };
                 let mut reply = event(cmd, frame[39], status);
-                if cmd == 0x8a {
+                if frame[43] == 7 {
+                    let mut result = [0u8; 8];
+                    result[0] = frame[34];
+                    reply = runtime_event(1, frame[39], 0, &result);
+                } else if cmd == 3 {
+                    let mut done = [0u8; 8];
+                    done[0] = frame[64];
+                    reply = runtime_event(0x0d, 0, 0, &done);
+                } else if cmd == 0x8a {
                     let mut caps = capabilities();
                     if self.clc_result {
                         caps[55] |= 1;
@@ -171,7 +183,7 @@ impl Backend for Model {
                 if self.malformed {
                     reply.truncate(10);
                 }
-                if !(cmd == 0x5c && frame[71] == 0) {
+                if !(cmd == 0x5c && frame[71] == 0 || cmd == 0x0f || cmd == 3 && self.scan_stall) {
                     self.replies.push_back(reply);
                 }
             }
@@ -195,6 +207,9 @@ impl Backend for Model {
         } else {
             Ok(self.replies.pop_front())
         }
+    }
+    fn receive_data(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self.packets.pop_front())
     }
     fn release(&mut self) -> Result<(), Error> {
         self.owner.published = false;
@@ -782,4 +797,180 @@ fn mcu_clc_commands_reach_dma_and_consume_capability_requested_result() -> TestR
 kernel_test_in!(
     "drivers/wireless/mt7921/station",
     mcu_clc_commands_reach_dma_and_consume_capability_requested_result
+);
+
+fn scan_beacon(channel: u8, ssid: &[u8]) -> Vec<u8> {
+    let mut packet = vec![0u8; 32 + 36 + 2 + ssid.len() + 3];
+    let len = packet.len();
+    packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
+    packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+    packet[12..16].copy_from_slice(&(u32::from(channel) << 8).to_le_bytes());
+    packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
+    let frame = &mut packet[32..];
+    frame[0] = 0x80;
+    frame[10..16].copy_from_slice(&[2, 1, 2, 3, 4, 5]);
+    frame[16..22].copy_from_slice(&[2, 1, 2, 3, 4, 5]);
+    frame[32..34].copy_from_slice(&100u16.to_le_bytes());
+    frame[34..36].copy_from_slice(&0x11u16.to_le_bytes());
+    frame[37] = ssid.len() as u8;
+    frame[38..38 + ssid.len()].copy_from_slice(ssid);
+    frame[38 + ssid.len()..].copy_from_slice(&[3, 1, channel]);
+    packet
+}
+fn mcu_passive_scan_wire_layout_and_beacon_validation() -> TestResult {
+    let body = scan::scan_request(127, &[1, 6, 11]).unwrap();
+    if body.len() != 1186
+        || body[..8] != [127, 0, 0, 1, 0, 0, 32, 1]
+        || body[158..166] != [4, 3, 1, 1, 1, 6, 1, 11]
+        || body[1110..1116] != [255; 6]
+        || body[224..1110].iter().any(|b| *b != 0)
+    {
+        return TestResult::Fail("passive CONNAC2 scan wire layout");
+    }
+    for channels in [&[][..], &[0], &[12], &[1, 1]] {
+        if scan::scan_request(1, channels).is_ok() {
+            return TestResult::Fail("invalid or non-world channels accepted");
+        }
+    }
+    let packet = scan_beacon(6, b"narf-test");
+    let Some(bss) = scan::beacon(&packet, 2) else {
+        return TestResult::Fail("valid beacon");
+    };
+    if bss.ssid != b"narf-test"
+        || bss.signal_dbm != Some(-50)
+        || bss.channel != 6
+        || bss.beacon_interval != 100
+    {
+        return TestResult::Fail("RX group/IE/signal parse");
+    }
+    for end in 0..packet.len() {
+        if scan::beacon(&packet[..end], 2).is_some() {
+            return TestResult::Fail("truncated beacon accepted");
+        }
+    }
+    for (offset, mask) in [(7, 8u8), (9, 32), (10, 128), (11, 1)] {
+        let mut bad = packet.clone();
+        bad[offset] |= mask;
+        if scan::beacon(&bad, 2).is_some() {
+            return TestResult::Fail("FCS/translated/AMSDU/length error accepted");
+        }
+    }
+    let mut bad = packet.clone();
+    *bad.last_mut().unwrap() = 11;
+    if scan::beacon(&bad, 2).is_some() {
+        return TestResult::Fail("DS/RX channel mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/scan",
+    mcu_passive_scan_wire_layout_and_beacon_validation
+);
+fn mcu_passive_scan_dispatches_real_setup_and_deduplicates_bss() -> TestResult {
+    let mut session = Session::new(Model::new(), firmware(32));
+    if run(session.run()).is_err() || run(session.initialize_radio()).is_err() {
+        return TestResult::Fail("radio init");
+    }
+    session.backend.packets.push_back(scan_beacon(6, &[]));
+    session
+        .backend
+        .packets
+        .push_back(scan_beacon(6, b"narf-test"));
+    session
+        .backend
+        .packets
+        .push_back(scan_beacon(11, b"off-channel"));
+    session.backend.packets.push_back(vec![0; 8]);
+    let before = session.backend.frames.len();
+    let report = match run(session.scan_passive(&[1, 6])) {
+        Ok(report) => report,
+        Err(_) => return TestResult::Fail("hardware scan model failed"),
+    };
+    if report.bss.len() != 1
+        || report.bss[0].ssid != b"narf-test"
+        || report.received != 4
+        || report.ignored != 1
+        || report.truncated
+        || !matches!(session.state, State::ScanReady(_))
+    {
+        return TestResult::Fail("scan observations/deduplication/state");
+    }
+    let frames = &session.backend.frames[before..];
+    if frames.len() != 6
+        || frames[0].1[34] != 1
+        || frames[1].1[34] != 2
+        || frames[2].1[36] != 0x0f
+        || frames[3].1[41] != 0x46
+        || frames[4].1[41] != 0x4e
+        || frames[5].1[36] != 3
+        || frames[5].1[66] != 0
+        || frames[5].1[69] != 0
+    {
+        return TestResult::Fail("VIF/domain/MAC/RX/passive scan sequence");
+    }
+    for channel in frames[2].1[76..].chunks_exact(8) {
+        if channel[4..8] != [2, 0, 0, 0] {
+            return TestResult::Fail("channel domain allows active radiation");
+        }
+    }
+    let before = session.backend.frames.len();
+    if run(session.scan_passive(&[6])).is_err() || session.backend.frames.len() != before + 1 {
+        return TestResult::Fail("repeat scan rebuilt VIF or reused stale completion");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/scan",
+    mcu_passive_scan_dispatches_real_setup_and_deduplicates_bss
+);
+fn mcu_passive_scan_timeout_cancel_and_stale_completion_retain_dma() -> TestResult {
+    let mut session = Session::new(Model::new(), firmware(32));
+    if run(session.run()).is_err() || run(session.initialize_radio()).is_err() {
+        return TestResult::Fail("radio init");
+    }
+    session.backend.scan_stall = true;
+    let before = session.backend.frames.len();
+    if !matches!(run(session.scan_passive(&[12])), Err(Error::Bounds))
+        || session.backend.frames.len() != before
+    {
+        return TestResult::Fail("invalid scan published commands");
+    }
+    let mut done = [0u8; 8];
+    done[0] = 127;
+    session
+        .backend
+        .replies
+        .push_back(runtime_event(0x0d, 0, 0, &done));
+    if !matches!(run(session.scan_passive(&[1])), Err(Error::Timeout))
+        || session.state
+            != (State::Failed {
+                stage: Stage::ScanWait,
+                error: Error::Timeout,
+            })
+        || !session.backend.owner.published
+    {
+        return TestResult::Fail("stale completion accepted or timeout freed owner");
+    }
+    let mut cancelled = Session::new(Model::new(), firmware(32));
+    if run(cancelled.run()).is_err() || run(cancelled.initialize_radio()).is_err() {
+        return TestResult::Fail("radio init");
+    }
+    cancelled.backend.scan_stall = true;
+    {
+        let mut future = pin!(cancelled.scan_passive(&[1]));
+        let mut cx = Context::from_waker(Waker::noop());
+        if future.as_mut().poll(&mut cx).is_ready() {
+            return TestResult::Fail("scan should wait");
+        }
+    }
+    if !matches!(run(cancelled.scan_passive(&[1])), Err(Error::Busy))
+        || !cancelled.backend.owner.published
+    {
+        return TestResult::Fail("cancelled scan replayed or freed DMA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/scan",
+    mcu_passive_scan_timeout_cancel_and_stale_completion_retain_dma
 );

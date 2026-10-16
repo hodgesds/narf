@@ -1,128 +1,64 @@
-//! MT7922 `WirelessNetIface` scaffold — compiling wiphy/netdev registration.
-//!
-//! This lands the control-plane skeleton the wireless stack needs: an
-//! [`Mt76Iface`] that implements [`narf_net::Interface`] (so the netdev/TCP
-//! stack sees the MAC + rings) and [`narf_wireless::WirelessNetIface`] (so the
-//! nl80211 control plane sees a wiphy with bands + capabilities). Registration
-//! goes through the same two calls iwlwifi uses:
-//!
-//!   * [`narf_net::iface::register`] — netdev identity.
-//!   * [`narf_wireless::registry::register`] — wiphy registration.
-//!
-//! The datapath + MLME methods (`scan`/`associate`/`disassociate`/`set_config`)
-//! return [`WirelessError::NotSupported`] for now: they depend on a live MCU
-//! mailbox and the WFDMA data rings, which require real MediaTek silicon. QEMU
-//! emulates no such device, so those paths are **hardware-gated** and cannot be
-//! exercised here. See `PLAN.md` ("next steps for full association").
-
-use alloc::boxed::Box;
-use alloc::string::String;
+//! Validated MT76 radio control plane: passive scanning, no associated link.
+//! Registration requires real NIC/EFUSE/MAC initialization. Data and MLME
+//! requests remain unsupported until the retained transport implements them.
+use crate::mt7921::firmware_transport::{RadioInfo, ScanBss};
+#[cfg(target_arch = "x86_64")]
 use alloc::sync::Arc;
-use alloc::vec;
-use alloc::vec::Vec;
-
+use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use async_trait::async_trait;
-use narf_ipc::{channel, Consumer, Producer};
+use narf_ipc::{Consumer, Producer};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::iface::{HwCaps, WirelessBand, WirelessIfaceInfo, WirelessModes};
-use narf_wireless::scan::BssInfo;
 use narf_wireless::{
-    AssociateRequest, ScanRequest, WirelessConfig, WirelessError, WirelessNetIface,
+    scan::BssInfo, AssociateRequest, ScanRequest, WirelessConfig, WirelessError, WirelessNetIface,
 };
 
-use crate::mt7921::name_for;
-
-/// One control-plane interface for a bound MT7921/MT7922/MT7961 radio.
-///
-/// Holds the netdev identity (name + MAC + rings) and the static wiphy data
-/// (bands + capabilities). The TX/RX rings are the `narf-net` frame rings; the
-/// real device DMA rings live in the `mt7921::dma`/`txrx` path and are not yet
-/// bridged to these (hardware-gated).
+/// Passive scan interface; it never represents an associated Ethernet link.
+#[derive(Debug)]
 pub struct Mt76Iface {
     name: String,
-    mac: [u8; 6],
-    /// Matched (effective) PCI device id — determines the band set.
-    effective_did: u16,
+    radio: RadioInfo,
+    scan_cache: IrqSafeSpinLock<Vec<ScanBss>>,
     rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
-
-impl core::fmt::Debug for Mt76Iface {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Mt76Iface")
-            .field("name", &self.name)
-            .field("mac", &self.mac)
-            .field(
-                "effective_did",
-                &format_args!("{:#06x}", self.effective_did),
-            )
-            .finish_non_exhaustive()
-    }
-}
-
 impl Mt76Iface {
-    /// Build the iface for a bound radio. Allocates the netdev frame rings and
-    /// seeds the static wiphy data from the matched device id.
-    pub fn new(effective_did: u16, mac: [u8; 6]) -> Self {
-        // Create the netdev frame-ring endpoints so the Interface contract is
-        // satisfied. The device-side halves (the DMA-backed producer/consumer
-        // bridge) land with the WFDMA datapath; the stack-facing halves are
-        // held here.
-        let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
-        let (_rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
-        Self {
-            name: String::from(name_for(effective_did)),
-            mac,
-            effective_did,
-            rx_ring: IrqSafeSpinLock::new(Some(rx_cons)),
-            tx_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+    /// Build from validated radio identity, without disconnected frame rings.
+    pub fn new(name: String, radio: RadioInfo) -> Result<Self, WirelessError> {
+        if radio.capabilities.mac == [0; 6]
+            || radio.capabilities.mac[0] & 1 != 0
+            || radio.capabilities.phy.bands & 1 == 0
+        {
+            return Err(WirelessError::InvalidArgs);
         }
+        Ok(Self {
+            name,
+            radio,
+            scan_cache: IrqSafeSpinLock::new(Vec::new()),
+            rx_ring: IrqSafeSpinLock::new(None),
+            tx_ring: IrqSafeSpinLock::new(None),
+        })
     }
-
-    /// Supported bands for the matched chip. All CONNAC2 parts here cover
-    /// 2.4 GHz + 5 GHz; the Wi-Fi 6E parts (MT7922/MT7961/MT7920) add 6 GHz.
+    /// Only the implemented world 2.4 GHz passive scan channels are exposed.
     pub fn bands(&self) -> Vec<WirelessBand> {
-        use crate::mt7921::{MTK_DEV_MT7920, MTK_DEV_MT7922, MTK_DEV_MT7961};
-        let mut bands = vec![
-            WirelessBand {
-                freq_mhz: 2400,
-                channels: (1..=13).collect(),
-            },
-            WirelessBand {
-                freq_mhz: 5000,
-                channels: vec![
-                    36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132,
-                    136, 140, 144, 149, 153, 157, 161, 165,
-                ],
-            },
-        ];
-        if matches!(
-            self.effective_did,
-            MTK_DEV_MT7922 | MTK_DEV_MT7961 | MTK_DEV_MT7920
-        ) {
-            bands.push(WirelessBand {
-                freq_mhz: 6000,
-                channels: (1..=233u32).step_by(4).collect(),
-            });
-        }
-        bands
+        vec![WirelessBand {
+            freq_mhz: 2400,
+            channels: (1..=11).collect(),
+        }]
     }
 }
-
 impl Interface for Mt76Iface {
     fn name(&self) -> &str {
         &self.name
     }
     fn mac(&self) -> [u8; 6] {
-        self.mac
+        self.radio.capabilities.mac
     }
     fn mtu(&self) -> u32 {
         1500
     }
     fn link_up(&self) -> bool {
-        // No association yet (hardware-gated); the link comes up when the MLME
-        // path completes a 4-way handshake on real silicon.
         false
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
@@ -132,99 +68,245 @@ impl Interface for Mt76Iface {
         &self.tx_ring
     }
 }
-
 #[async_trait]
 impl WirelessNetIface for Mt76Iface {
     fn get_wireless_info(&self) -> WirelessIfaceInfo {
-        // The whole CONNAC2 family (Wi-Fi 6 MT7921 + Wi-Fi 6E MT7922/61/20) is
-        // HE-capable; the 6E parts differ only in the extra 6 GHz band, which
-        // `bands()` already reflects. No EHT/Wi-Fi 7 on this family.
         WirelessIfaceInfo {
             base_name: self.name.clone(),
-            base_mac: self.mac,
+            base_mac: self.mac(),
             bands: self.bands(),
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
-                ht_supported: true,
-                vht_supported: true,
-                // CONNAC2 is Wi-Fi 6 (HE); the 6E parts additionally open the
-                // 6 GHz band but remain HE (no EHT/Wi-Fi 7 on this family).
-                he_supported: true,
+                ht_supported: false,
+                vht_supported: false,
+                he_supported: false,
                 eht_supported: false,
             },
         }
     }
+    fn scan_information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
+        self.scan_cache
+            .lock()
+            .iter()
+            .find(|entry| entry.bssid == bssid)
+            .map(|entry| entry.information_elements.clone())
+    }
 
-    async fn scan(&self, _req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        // Needs a live MCU mailbox (SCAN_REQ) + RX event path. Hardware-gated.
-        Err(WirelessError::NotSupported)
+    async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+        let channels = passive_channels(&req)?;
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::mt7921::firmware_transport::{scan_boot_passive, Error};
+            let report = scan_boot_passive(&channels)
+                .await
+                .map_err(|error| match error {
+                    Error::Bounds => WirelessError::InvalidArgs,
+                    Error::Busy => WirelessError::Busy,
+                    Error::Timeout => WirelessError::Timeout,
+                    Error::Authority => WirelessError::Denied,
+                    _ => WirelessError::HardwareError,
+                })?;
+            let results = report
+                .bss
+                .iter()
+                .map(|bss| BssInfo {
+                    bssid: bss.bssid,
+                    ssid: bss.ssid.clone(),
+                    channel: u32::from(bss.channel),
+                    rssi: bss.signal_dbm.unwrap_or(-128),
+                    security: scan_security(bss),
+                })
+                .collect();
+            *self.scan_cache.lock() = report.bss;
+            Ok(results)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = channels;
+            Err(WirelessError::NotSupported)
+        }
     }
 
     async fn associate(&self, _req: AssociateRequest) -> Result<(), WirelessError> {
-        // Needs MCU STA_REC_UPDATE + the WFDMA datapath. Hardware-gated.
         Err(WirelessError::NotSupported)
     }
-
     async fn disassociate(&self) -> Result<(), WirelessError> {
         Err(WirelessError::NotSupported)
     }
-
     async fn set_config(&self, _cfg: WirelessConfig) -> Result<(), WirelessError> {
-        // Channel/tx-power programming is an MCU command. Hardware-gated.
         Err(WirelessError::NotSupported)
     }
 }
+fn passive_channels(req: &ScanRequest) -> Result<Vec<u8>, WirelessError> {
+    if req.active || !req.ssids.is_empty() {
+        return Err(WirelessError::NotSupported);
+    }
+    if req.channels.is_empty() {
+        return Ok((1..=11).collect());
+    }
+    let mut channels = Vec::new();
+    for channel in &req.channels {
+        if !(1..=11).contains(channel) || channels.contains(&(*channel as u8)) {
+            return Err(WirelessError::InvalidArgs);
+        }
+        channels.push(*channel as u8);
+    }
+    Ok(channels)
+}
+fn scan_security(
+    bss: &crate::mt7921::firmware_transport::ScanBss,
+) -> narf_wireless::scan::BssSecurity {
+    use narf_wireless::{rsn, scan::BssSecurity};
+    let mut ies = &bss.information_elements[..];
+    let mut wpa = false;
+    while ies.len() >= 2 {
+        let len = usize::from(ies[1]);
+        let Some(value) = ies.get(2..2 + len) else {
+            break;
+        };
+        if ies[0] == 48 {
+            if let Some(rsn) = rsn::RsnIe::decode_body(value) {
+                return if !rsn.akms.contains(&rsn::Suite::standard(rsn::AKM_PSK))
+                    && rsn.akms.contains(&rsn::Suite::standard(rsn::AKM_SAE))
+                {
+                    BssSecurity::Wpa3
+                } else {
+                    BssSecurity::Wpa2
+                };
+            }
+        }
+        wpa |= ies[0] == 221 && value.starts_with(&[0, 0x50, 0xf2, 1]);
+        ies = &ies[2 + len..];
+    }
+    if wpa {
+        BssSecurity::Wpa
+    } else if bss.capability & 0x10 != 0 {
+        BssSecurity::Wep
+    } else {
+        BssSecurity::Open
+    }
+}
 
-/// Register a bound radio's control-plane iface: the netdev identity with the
-/// net stack and the wiphy with the wireless registry. Mirrors the iwlwifi
-/// registration path. Returns the `Arc` so callers can retain it.
-///
-/// `send` is the net-stack TX hook (the `mt7921::pci::send_frame_unimpl`
-/// placeholder until the DMA datapath lands).
-pub fn register_iface(
-    effective_did: u16,
-    mac: [u8; 6],
-    send: narf_net::iface::SendFn,
-) -> Arc<Mt76Iface> {
-    // Netdev identity so the kernel-side stack can see the MAC.
-    let _name = narf_net::iface::register("wlan%d", mac, send);
-    // Wiphy registration so the nl80211 control plane lists the radio.
-    let iface = Arc::new(Mt76Iface::new(effective_did, mac));
+/// Register the boot-owned radio for passive nl80211 scans only. Validate
+/// before changing either registry; share the exact allocated netdev name.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, WirelessError> {
+    fn no_tx(_frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+        Err(())
+    }
+    let mut iface = Mt76Iface::new(String::new(), info)?;
+    iface.name = narf_net::iface::register("wlan%d", info.capabilities.mac, no_tx);
+    narf_net::iface::set_link_state(&iface.name, false);
+    let iface = Arc::new(iface);
     narf_wireless::registry::register(iface.clone());
-    iface
+    Ok(iface)
 }
 
 #[cfg(any(test, feature = "builtin"))]
 mod tests {
     use super::*;
+    use crate::mt7921::firmware_transport::{NicCapabilities, PhyCapabilities, Report};
     use narf_kernel_test::{kernel_test_in, TestResult};
-
-    fn smoke_mt76_iface_wiphy_bands_6ghz() -> TestResult {
-        // MT7922 is Wi-Fi 6E → must advertise the 6 GHz band.
-        let iface = Mt76Iface::new(crate::mt7921::MTK_DEV_MT7922, [0x00; 6]);
+    fn radio() -> RadioInfo {
+        RadioInfo {
+            firmware: Report {
+                version: [0; 10],
+                build_date: [0; 15],
+                patch_already_loaded: false,
+                bytes_transferred: 0,
+            },
+            capabilities: NicCapabilities {
+                mac: [2, 0, 0xde, 0xad, 0xbe, 0xef],
+                phy: PhyCapabilities {
+                    ht: true,
+                    vht: true,
+                    he: true,
+                    max_bandwidth: 3,
+                    spatial_streams: 2,
+                    bands: 3,
+                    tx_ldpc: true,
+                    rx_ldpc: true,
+                    tx_stbc: true,
+                    rx_stbc: true,
+                },
+                has_6ghz: true,
+                chip_capabilities: 0,
+            },
+            hardware_type: 1,
+            world_limit_commands: 3,
+            channel_configuration: Some(0),
+        }
+    }
+    fn mt76_scan_interface_reports_implemented_profile() -> TestResult {
+        let iface = Mt76Iface::new(String::from("wlan7"), radio()).unwrap();
         let info = iface.get_wireless_info();
-        if !info.modes.contains(WirelessModes::STATION) {
-            return TestResult::Fail("mt76 wiphy missing STATION mode");
+        if iface.name() != "wlan7"
+            || iface.mac() != radio().capabilities.mac
+            || iface.link_up()
+            || iface.rx_ring().lock().is_some()
+            || iface.tx_ring().lock().is_some()
+            || info.base_name != "wlan7"
+            || info.bands.len() != 1
+            || info.bands[0].channels != (1..=11).collect::<Vec<_>>()
+            || info.hw_caps.ht_supported
+            || info.hw_caps.vht_supported
+            || info.hw_caps.he_supported
+            || info.hw_caps.eht_supported
+            || iface.supports_handshake_offload()
+            || iface.supports_sae_offload()
+        {
+            return TestResult::Fail("passive interface claims unfinished data/PHY support");
         }
-        let has_6ghz = info.bands.iter().any(|b| b.freq_mhz == 6000);
-        let has_24 = info.bands.iter().any(|b| b.freq_mhz == 2400);
-        if has_6ghz && has_24 && info.hw_caps.he_supported {
-            TestResult::Pass
-        } else {
-            TestResult::Fail("mt76 MT7922 wiphy missing 2.4/6 GHz band or HE cap")
+        let mut invalid = radio();
+        invalid.capabilities.mac = [0; 6];
+        if Mt76Iface::new(String::new(), invalid).is_ok() {
+            return TestResult::Fail("zero MAC registered");
         }
+        invalid.capabilities.mac = [1; 6];
+        if Mt76Iface::new(String::new(), invalid).is_ok() {
+            return TestResult::Fail("multicast MAC registered");
+        }
+        TestResult::Pass
     }
-    kernel_test_in!("drivers/wireless/mt76", smoke_mt76_iface_wiphy_bands_6ghz);
-
-    fn smoke_mt76_iface_netdev_identity() -> TestResult {
-        // The Interface MAC + name must round-trip from the bound radio.
-        let mac = [0x02, 0x00, 0xde, 0xad, 0xbe, 0xef];
-        let iface = Mt76Iface::new(crate::mt7921::MTK_DEV_MT7922, mac);
-        if iface.mac() == mac && iface.mtu() == 1500 && !iface.name().is_empty() {
-            TestResult::Pass
-        } else {
-            TestResult::Fail("mt76 netdev identity did not round-trip")
+    kernel_test_in!(
+        "drivers/wireless/mt7921/scan",
+        mt76_scan_interface_reports_implemented_profile
+    );
+    fn mt76_passive_scan_policy_rejects_active_and_non_world_channels() -> TestResult {
+        let mut req = ScanRequest {
+            ssids: Vec::new(),
+            channels: vec![1, 6, 11],
+            active: false,
+        };
+        if passive_channels(&req) != Ok(vec![1, 6, 11]) {
+            return TestResult::Fail("valid passive request");
         }
+        req.active = true;
+        if passive_channels(&req) != Err(WirelessError::NotSupported) {
+            return TestResult::Fail("active scan silently downgraded");
+        }
+        req.active = false;
+        req.ssids.push(Vec::new());
+        if passive_channels(&req) != Err(WirelessError::NotSupported) {
+            return TestResult::Fail("directed probes allowed");
+        }
+        req.ssids.clear();
+        req.channels = vec![36];
+        if passive_channels(&req) != Err(WirelessError::InvalidArgs) {
+            return TestResult::Fail("unimplemented band exposed");
+        }
+        req.channels = vec![1, 1];
+        if passive_channels(&req) != Err(WirelessError::InvalidArgs) {
+            return TestResult::Fail("duplicate channel");
+        }
+        req.channels.clear();
+        if passive_channels(&req) != Ok((1..=11).collect()) {
+            return TestResult::Fail("default scan channels");
+        }
+        TestResult::Pass
     }
-    kernel_test_in!("drivers/wireless/mt76", smoke_mt76_iface_netdev_identity);
+    kernel_test_in!(
+        "drivers/wireless/mt7921/scan",
+        mt76_passive_scan_policy_rejects_active_and_non_world_channels
+    );
 }

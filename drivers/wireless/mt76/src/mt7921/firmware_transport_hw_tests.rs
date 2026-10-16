@@ -33,6 +33,7 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
         rx: [
             Ring::allocate(RX_PRE, true)?,
             Ring::allocate(RX_POST, true)?,
+            Ring::allocate(RX_DATA, true)?,
         ],
     };
     Ok((
@@ -171,4 +172,56 @@ fn mcu_production_mac_configuration_preserves_unrelated_bits() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921/station",
     mcu_production_mac_configuration_preserves_unrelated_bits
+);
+
+fn mcu_packet_rx_uses_ring_two_and_copies_before_rearming() -> TestResult {
+    let (mut words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("allocation"),
+    };
+    for iteration in 0..DEPTH + 2 {
+        let slot = iteration % DEPTH;
+        let next = (slot + 1) % DEPTH;
+        let mut packet = [0xabu8; 64];
+        packet[..4].copy_from_slice(&((2u32 << 27) | 64).to_le_bytes());
+        let ring = &hw.owner.storage.as_ref().unwrap().rx[2];
+        // SAFETY: model writes only into the owned coherent RX allocation.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                packet.as_ptr(),
+                ring.buffers[slot].cpu_mut_ptr::<u8>(),
+                packet.len(),
+            );
+        }
+        ring.set_word(slot, 1, (64 << 16) | LAST | DONE);
+        words[(RX_DATA + 12) as usize / 4] = next as u32;
+        if hw.receive() != Ok(None) {
+            return TestResult::Fail("data ring consumed by MCU waiter");
+        }
+        let received = match hw.receive_data() {
+            Ok(Some(packet)) => packet,
+            _ => return TestResult::Fail("data ring not harvested"),
+        };
+        let ring = &hw.owner.storage.as_ref().unwrap().rx[2];
+        // SAFETY: emulate the device immediately reusing the released buffer.
+        unsafe {
+            core::ptr::write_bytes(ring.buffers[slot].cpu_mut_ptr::<u8>(), 0, 64);
+        }
+        if received != packet
+            || ring.index != next
+            || ring.word(slot, 1) != (4096 << 16)
+            || words[(RX_DATA + 8) as usize / 4] != slot as u32
+        {
+            return TestResult::Fail("data copy/rearm/wrap/doorbell ordering");
+        }
+    }
+    hw.authority.revoke();
+    if hw.receive_data() != Err(Error::Authority) {
+        return TestResult::Fail("revoked packet RX authority accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/scan",
+    mcu_packet_rx_uses_ring_two_and_copies_before_rearming
 );

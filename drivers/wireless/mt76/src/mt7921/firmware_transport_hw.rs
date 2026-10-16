@@ -18,6 +18,7 @@ const TX_FWDL: u32 = 0xd4300 + 16 * 16;
 const TX_WM: u32 = 0xd4300 + 17 * 16;
 const RX_PRE: u32 = 0xd4500;
 const RX_POST: u32 = 0xd4540;
+const RX_DATA: u32 = 0xd4520;
 
 #[derive(Debug)]
 struct Ring {
@@ -100,7 +101,7 @@ impl Ring {
 struct Storage {
     wm: Ring,
     fwdl: Ring,
-    rx: [Ring; 2],
+    rx: [Ring; 3],
 }
 #[derive(Debug)]
 struct Hardware {
@@ -110,6 +111,47 @@ struct Hardware {
     owner: Retained<Storage>,
 }
 impl Hardware {
+    fn receive_ring(&mut self, which: usize) -> Result<Option<Vec<u8>>, Error> {
+        self.check()?;
+        let storage = self.owner.storage.as_ref().ok_or(Error::Busy)?;
+        let ring = &storage.rx[which];
+        let didx = self.read(ring.base + 12)? as usize;
+        if didx >= DEPTH {
+            return Err(Error::Ring);
+        }
+        if didx == ring.index {
+            return Ok(None);
+        }
+        fence(Ordering::Acquire);
+        let ctrl = ring.word(ring.index, 1);
+        let len = ((ctrl >> 16) & 0x3fff) as usize;
+        if ctrl & (DONE | LAST) != (DONE | LAST) || !(8..=MAX_FRAME).contains(&len) {
+            return Err(Error::MalformedEvent);
+        }
+        fence(Ordering::Acquire); // device payload writes precede observed DDONE
+        let mut frame = vec![0u8; len];
+        // SAFETY: completion/length verified; copy before returning buffer to DMA.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                ring.buffers[ring.index].cpu_ptr::<u8>(),
+                frame.as_mut_ptr(),
+                len,
+            )
+        };
+        let rxd = u32::from_le_bytes(frame[..4].try_into().map_err(|_| Error::MalformedEvent)?);
+        let packet_len = (rxd & 0xffff) as usize;
+        if !(8..=len).contains(&packet_len) {
+            return Err(Error::MalformedEvent);
+        }
+        frame.truncate(packet_len);
+        let slot = ring.index;
+        ring.arm_rx(slot);
+        fence(Ordering::SeqCst);
+        let base = ring.base;
+        self.write(base + 8, slot as u32)?;
+        self.owner.storage.as_mut().ok_or(Error::Busy)?.rx[which].index = (slot + 1) % DEPTH;
+        Ok(Some(frame))
+    }
     fn read(&self, addr: u32) -> Result<u32, Error> {
         self.check()?;
         // SAFETY: constructor's exclusive device/latch ownership; checked access.
@@ -329,46 +371,18 @@ impl Backend for Hardware {
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Error> {
         for which in 0..2 {
-            self.check()?;
-            let storage = self.owner.storage.as_ref().ok_or(Error::Busy)?;
-            let ring = &storage.rx[which];
-            let didx = self.read(ring.base + 12)? as usize;
-            if didx >= DEPTH {
-                return Err(Error::Ring);
+            if let Some(frame) = self.receive_ring(which)? {
+                let rxd = u32::from_le_bytes(frame[..4].try_into().unwrap());
+                if rxd >> 27 != 7 || frame.len() < 32 {
+                    return Err(Error::MalformedEvent);
+                }
+                return Ok(Some(frame));
             }
-            if didx == ring.index {
-                continue;
-            }
-            fence(Ordering::Acquire);
-            let ctrl = ring.word(ring.index, 1);
-            let len = ((ctrl >> 16) & 0x3fff) as usize;
-            if ctrl & (DONE | LAST) != (DONE | LAST) || !(32..=MAX_FRAME).contains(&len) {
-                return Err(Error::MalformedEvent);
-            }
-            let mut frame = vec![0u8; len];
-            // SAFETY: completion/length verified; copy before returning buffer to DMA.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    ring.buffers[ring.index].cpu_ptr::<u8>(),
-                    frame.as_mut_ptr(),
-                    len,
-                )
-            };
-            let rxd = u32::from_le_bytes(frame[..4].try_into().map_err(|_| Error::MalformedEvent)?);
-            let packet_len = (rxd & 0xffff) as usize;
-            if rxd >> 27 != 7 || !(32..=len).contains(&packet_len) {
-                return Err(Error::MalformedEvent);
-            }
-            frame.truncate(packet_len);
-            let slot = ring.index;
-            ring.arm_rx(slot);
-            fence(Ordering::SeqCst);
-            let base = ring.base;
-            self.write(base + 8, slot as u32)?;
-            self.owner.storage.as_mut().ok_or(Error::Busy)?.rx[which].index = (slot + 1) % DEPTH;
-            return Ok(Some(frame));
         }
         Ok(None)
+    }
+    fn receive_data(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        self.receive_ring(2)
     }
     fn release(&mut self) -> Result<(), Error> {
         if !self.idle()? || self.read(GLOBAL)? & ENABLE != 0 {
@@ -444,6 +458,7 @@ impl Transport {
             rx: [
                 Ring::allocate(RX_PRE, true)?,
                 Ring::allocate(RX_POST, true)?,
+                Ring::allocate(RX_DATA, true)?,
             ],
         };
         Ok(Self {
@@ -469,6 +484,10 @@ impl Transport {
     /// This does not yet enable packet transmission or register an interface.
     pub async fn initialize_radio(&mut self) -> Result<RadioInfo, Error> {
         self.session.initialize_radio().await
+    }
+    /// Perform a bounded, receive-only scan on world 2.4 GHz channels 1..=11.
+    pub async fn scan_passive(&mut self, channels: &[u8]) -> Result<super::ScanReport, Error> {
+        self.session.scan_passive(channels).await
     }
     /// Stop DMA, verify idle, clear bus mastering and retire ring bases.
     pub async fn shutdown(&mut self) -> Result<(), Error> {
