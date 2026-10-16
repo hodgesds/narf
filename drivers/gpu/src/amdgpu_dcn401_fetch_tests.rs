@@ -7,6 +7,9 @@ mod surface;
 
 fn planes(off: u8) -> Engine<Fake> {
     let mut e = engine();
+    // Plane acknowledgements advance on reads; cancellation must suspend at
+    // a missing acknowledgement instead of racing the host's first deadline.
+    e.io.poll_limit = Some(16);
     for p in 0..4 {
         let h = |r| BASE + (r + p * 0xdc) * 4;
         let m = |r| MPC_BASE + (r + p * 0x15) * 4;

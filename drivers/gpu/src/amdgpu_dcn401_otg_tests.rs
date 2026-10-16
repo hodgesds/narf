@@ -16,6 +16,7 @@ pub(super) struct Fake {
     // input clock, OTG clock, retire master/busy, OPP clock, enable master,
     // DPG latch, FMT latch, frame progress
     stall: u16,
+    poll_limit: Option<u32>,
     retiring: [bool; 4],
     delay: [u8; 4],
     reject: Option<usize>,
@@ -34,6 +35,9 @@ pub(super) struct Fake {
     encoder_stall: u8,
 }
 impl Io for Fake {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        self.poll_limit
+    }
     fn read(&mut self, at: u64) -> u32 {
         if self.gone == Some(self.writes.len()) {
             return u32::MAX;
@@ -362,6 +366,7 @@ pub(super) fn engine() -> Engine<Fake> {
             regs: BTreeMap::new(),
             writes: Vec::new(),
             stall: 0,
+            poll_limit: None,
             retiring: [false; 4],
             delay: [0; 4],
             reject: None,

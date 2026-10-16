@@ -46,6 +46,10 @@ impl Hw {
     }
 }
 impl Io for Hw {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // Latches are synchronous and the frame counter advances on reads.
+        Some(16)
+    }
     fn read(&mut self, at: u64) -> u32 {
         if at == self.layout.otg(self.pipe, FRAME_COUNT) {
             self.frame = self.frame.wrapping_add(1);

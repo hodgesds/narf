@@ -247,12 +247,24 @@ impl<I: Io> Engine<I> {
         mut done: impl FnMut(&mut Self) -> Result<Option<u64>, Error>,
     ) -> Result<(), Error> {
         let deadline = narf_time::Deadline::after_us(p.timeout_us);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             if p.watch {
                 self.underflow(p.pipe)?;
             }
             match done(self)? {
                 None => return Ok(()),
+                #[cfg(feature = "kernel-test")]
+                Some(at) if polls.is_some() => {
+                    let left = polls.as_mut().unwrap();
+                    if *left == 0 {
+                        return Err(Error::Timeout(at));
+                    }
+                    *left -= 1;
+                    narf_scheduler::yield_now().await;
+                    continue;
+                }
                 Some(at) if deadline.expired() => return Err(Error::Timeout(at)),
                 Some(_) => {}
             }

@@ -104,6 +104,11 @@ impl ScanIo {
     }
 }
 impl Io for ScanIo {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // After arming, the longest successful latch needs 200 reads. Keep
+        // frozen frames/latches bounded without racing the host clock.
+        self.armed.then_some(256)
+    }
     fn pause_wait(&self) -> bool {
         self.pause_wait
     }

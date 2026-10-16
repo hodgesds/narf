@@ -13,6 +13,10 @@ struct Model {
     db_delay: u8,
 }
 impl Io for Model {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // Acknowledgements advance on reads, independently of host scheduling.
+        Some(16)
+    }
     fn read(&mut self, reg: u64) -> u32 {
         if self.inner.writes.len() >= 10 && reg == at(self.stream, 0x20b0) {
             if self.packet_delay == 0 {
