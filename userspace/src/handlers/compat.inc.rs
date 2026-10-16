@@ -2485,7 +2485,7 @@ fn do_execve_resolved(
             // Only an ABSOLUTE filesystem path is exec'able by re-reading the FS.
             // A pathless/anonymous fd (a memfd — systemd seals its sd-executor
             // into a memfd and fexecve's /proc/self/fd/N — whose recorded "path"
-            // is the "anon_inode:[FileOps]" placeholder) must be exec'd from the
+            // is an `anon_inode:` link, never a `/` path) must be exec'd from the
             // fd's own bytes instead.
             let fs_path = fd_path_string_of(t, n).filter(|p| p.starts_with('/'));
             if let Some(real) = fs_path {
@@ -8428,13 +8428,32 @@ fn fd_path_string_of(pid: u64, n: u32) -> Option<alloc::string::String> {
             return Some(strip_chroot_prefix(tid, &path));
         }
     }
-    crate::fd::with_table(tid, |table| {
-        let entry = table.get(n)?;
-        let name = core::any::type_name_of_val(&*entry.ops);
-        let short = name.rsplit("::").next().unwrap_or(name);
-        Some(alloc::format!("anon_inode:[{}]", short))
-    })
-    .flatten()
+    crate::fd::with_table(tid, |table| Some(pathless_fd_link(&*table.get(n)?.ops))).flatten()
+}
+
+/// `/proc/<pid>/fd/<n>` target of an fd with no recorded path — what Linux's
+/// pseudo-filesystem `d_dname` produces: `socket:[ino]` (sockfs),
+/// `pipe:[ino]` (pipefs), `anon_inode:<name>` (anon_inodefs, e.g.
+/// `anon_inode:[eventfd]`). `lsof`/`ss -p` match sockets by that inode, and
+/// tools tell eventfds from timerfds by the name.
+///
+/// Never starts with `/`: fexecve via `/proc/self/fd/N` uses that to decide
+/// between re-resolving a path and exec'ing the fd's own bytes.
+fn pathless_fd_link(ops: &dyn narf_filesystem::FileOps) -> alloc::string::String {
+    use narf_filesystem::inode_id::PseudoFs;
+    if let Some(name) = ops.anon_name() {
+        return alloc::format!("anon_inode:{name}");
+    }
+    let dev = ops.inode_attrs().dev;
+    if dev != 0 && dev == PseudoFs::Sock.dev() {
+        return alloc::format!("socket:[{}]", ops.ino());
+    }
+    if dev != 0 && dev == PseudoFs::Pipe.dev() {
+        return alloc::format!("pipe:[{}]", ops.ino());
+    }
+    // Types not yet given an identity (e.g. memfd, whose Linux target is
+    // `/memfd:<name> (deleted)`) keep the non-empty placeholder.
+    "anon_inode:[FileOps]".into()
 }
 
 pub fn fd_path_of(pid: u64, n: u32) -> Option<narf_filesystem::procfs::ProcFdSnapshot> {
@@ -8469,13 +8488,7 @@ pub(crate) fn fd_path_for_task(task: u64, n: u32) -> Option<alloc::string::Strin
     if let Some(p) = crate::mqueue::fd_path(task, n) {
         return Some(strip_chroot_prefix(task, &p));
     }
-    crate::fd::with_table(task, |t| {
-        let entry = t.get(n)?;
-        let name = core::any::type_name_of_val(&*entry.ops);
-        let short = name.rsplit("::").next().unwrap_or(name);
-        Some(alloc::format!("anon_inode:[{}]", short))
-    })
-    .flatten()
+    crate::fd::with_table(task, |t| Some(pathless_fd_link(&*t.get(n)?.ops))).flatten()
 }
 
 /// Strip the task's chroot prefix from a host-absolute path, yielding the

@@ -1225,6 +1225,73 @@ fn smoke_abi_proc2_anon_fd_readlink_nonempty() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_anon_fd_readlink_nonempty);
 
+// Pathless fds readlink to what Linux's pseudo-filesystem d_dname produces:
+// `anon_inode:<name>` for anon_inodefs files, `pipe:[ino]` / `socket:[ino]`
+// for pipefs / sockfs with the inode fstat reports. Every one of these used to
+// read `anon_inode:[FileOps]` (the trait object's name), so lsof / `ss -p`
+// could not tie a socket to its process and an eventfd was indistinguishable
+// from a timerfd.
+fn smoke_abi_proc2_pathless_fd_links_name_the_file() -> TestResult {
+    with_procfs(FAKE_TASK, "fdlinks", &["fdlinks"], 0, |base| {
+        let readlink = |fd: u32| -> Result<alloc::string::String, &'static str> {
+            let link = alloc::format!("{}/{}/fd/{}\0", base, FAKE_TASK, fd);
+            let mut buf = [0u8; 128];
+            match call_readlink(
+                link.as_ptr() as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            ) {
+                Some(n) if n > 0 => {
+                    Ok(alloc::string::String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+                }
+                _ => Err("readlink of /proc/<pid>/fd/<n> failed"),
+            }
+        };
+        let ino = |fd: u32| {
+            crate::fd::with_table(FAKE_TASK, |t| t.get(fd).map(|e| e.ops.ino()))
+                .flatten()
+                .unwrap_or(0)
+        };
+        let fd = |r: Option<i64>, what: &'static str| match r {
+            Some(fd) if fd >= 0 => Ok(fd as u32),
+            _ => Err(what),
+        };
+        let efd = fd(call(Syscall::Eventfd.raw(), a1(0, 0)), "eventfd")?;
+        if readlink(efd)? != "anon_inode:[eventfd]" {
+            return Err("eventfd link should be anon_inode:[eventfd]");
+        }
+        let tfd = fd(
+            call(Syscall::TimerfdCreate.raw(), a1(1, 0)),
+            "timerfd_create",
+        )?;
+        if readlink(tfd)? != "anon_inode:[timerfd]" {
+            return Err("timerfd link should be anon_inode:[timerfd]");
+        }
+        let epfd = fd(call(Syscall::EpollCreate.raw(), a0(0)), "epoll_create1")?;
+        if readlink(epfd)? != "anon_inode:[eventpoll]" {
+            return Err("epoll link should be anon_inode:[eventpoll]");
+        }
+        let mut pipefd = [0i32; 2];
+        if call(Syscall::Pipe2.raw(), a1(pipefd.as_mut_ptr() as u64, 0)) != Some(0) {
+            return Err("pipe2");
+        }
+        let (r, w) = (pipefd[0] as u32, pipefd[1] as u32);
+        let pipe_link = alloc::format!("pipe:[{}]", ino(r));
+        if ino(r) == 0 || readlink(r)? != pipe_link || readlink(w)? != pipe_link {
+            return Err("both pipe ends should link to pipe:[<shared ino>]");
+        }
+        let sfd = fd(call(Syscall::SocketOpen.raw(), a2(1, 1, 0)), "socket")?;
+        if ino(sfd) == 0 || readlink(sfd)? != alloc::format!("socket:[{}]", ino(sfd)) {
+            return Err("socket link should be socket:[<ino>]");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_pathless_fd_links_name_the_file
+);
+
 fn smoke_abi_proc2_fdinfo_uses_live_fd_metadata() -> TestResult {
     with_procfs(FAKE_TASK, "fdinfoproc", &["fdinfoproc"], 0, |base| {
         let auth = bootstrap_mount_authority();

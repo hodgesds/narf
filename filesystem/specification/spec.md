@@ -276,6 +276,7 @@ pub trait DirOps {
 pub trait FileOps {
     fn ioctl_user(&self, cmd: u32, arg: u64, ctx: &dyn IoctlContext) -> FsFuture<'_, u64>;
     fn has_flush(&self) -> bool;
+    fn anon_name(&self) -> Option<&'static str>; // anon_inodefs name, e.g. "[eventfd]"
     fn poll_readiness(&self) -> u32;
     fn poll_readiness_at(&self, offset: u64) -> u32;
     fn poll_edge_token(&self) -> (u64, u64);
@@ -475,6 +476,12 @@ lock. `validate_mmap` runs before VMA mutation and returns effective protections
 or a device error; only Unsupported from mmap_backing selects generic file
 fallback. `mmap_max_prot` defaults to RWX and constrains later mprotect calls,
 including after fd close, fork and mapping splits. Overlay forwards these hooks.
+
+`FileOps::anon_name()` names an `anon_inodefs` file as Linux's
+`anon_inode_getfile(name, ...)` does (`[eventfd]`, `[timerfd]`, `[eventpoll]`,
+`inotify`, ...); it defaults to `None`. A pathless fd's `/proc/<pid>/fd/<n>`
+link reads `anon_inode:<name>`, or `socket:[ino]` / `pipe:[ino]` for files on
+the sockfs / pipefs pseudo superblocks, and never begins with `/`.
 
 `FileOps::mmap_is_ram()` defaults to false. A true implementation promises
 that both mmap backing methods expose ordinary allocator frames retired via

@@ -1136,6 +1136,15 @@ pub trait FileOps: Send + Sync {
         0
     }
 
+    /// The name an `anon_inodefs` file was created under — Linux
+    /// `anon_inode_getfile(name, ...)`, e.g. `[eventfd]`, `[eventpoll]`,
+    /// `inotify`. `/proc/<pid>/fd/<n>` reads `anon_inode:<name>` for it.
+    /// `None` for files with a real path or their own pseudo filesystem
+    /// (pipes and sockets are named from their inode instead).
+    fn anon_name(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Asynchronous stat — required for disk-backed or remote FS.
     fn stat_async<'a>(&'a self) -> FsFuture<'a, Stat> {
         Box::pin(async move { Ok(self.stat()) })
