@@ -162,6 +162,7 @@ fn port(path: inventory::Path, dpcd: Option<[u8; 16]>, edid: Vec<u8>) -> display
             lttpr_uhbr: None,
             fec: false,
             dsc: None,
+            verified_link: None,
         }),
     }
 }
@@ -1060,6 +1061,7 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
             lttpr_uhbr,
             fec: false,
             dsc: None,
+            verified_link: None,
         };
         dp_caps(&p, &sink).unwrap().uhbr
     };
@@ -1174,6 +1176,7 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
         lttpr_uhbr: None,
         fec: false,
         dsc: None,
+        verified_link: None,
     };
     let port = display::Port {
         path: p,
@@ -1352,6 +1355,7 @@ fn navi48_modeset_decides_dsc_like_linux() -> TestResult {
         lttpr_uhbr: None,
         fec,
         dsc,
+        verified_link: None,
     };
     let pick = |s: display::Sink| {
         select(
@@ -2054,4 +2058,122 @@ fn navi48_mst_selection_keeps_only_remote_lpcm_that_fits() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_mst_selection_keeps_only_remote_lpcm_that_fits
+);
+
+/// dp_verify_link_cap after the staged DSC/PPS fits no link that trains:
+/// the rest of the 8b/10b ladder is trained without a stream, the first
+/// setting that trains (else one RBR lane) bounds the sink's caps, and
+/// selecting again computes new DSC geometry for that link, as Linux's
+/// next detection and dc_dsc_compute_config do. The cap lasts while the same
+/// sink stays on the port.
+fn navi48_dsc_link_verification_reselects_compressed_geometry() -> TestResult {
+    use crate::amdgpu_dsc::{compute_config, DscSinkCaps, LinkEncoding};
+    use LinkRate::{Hbr, Hbr2, Hbr3, Rbr};
+    const DSC: [u8; 16] = [
+        1, 0x21, 0, 0x0b, 0x0b, 4, 1, 0, 0, 0x13, 0x0e, 0xee, 16, 0, 0, 0,
+    ];
+    let p = path(inventory::Connector::DisplayPort, 0);
+    let sink = || display::Sink {
+        dpcd: dpcd(0x1e, 2),
+        edid: edid_uhbr(),
+        lttpr: None,
+        uhbr: 0,
+        lttpr_uhbr: None,
+        fec: true,
+        dsc: Some(DSC),
+        verified_link: None,
+    };
+    let ports = || {
+        alloc::vec![display::Port {
+            path: p,
+            sink: Ok(sink()),
+        }]
+    };
+    let first = select(&[p], &ports(), 8, None).unwrap();
+    let wide = first.dsc.unwrap();
+    assert_eq!((first.lanes, first.rate), (2, DpRate::Legacy(Hbr3)));
+    // The highest bpp 2 x HBR3 carries: no slower link carries that PPS.
+    let tried = selected_dp_candidates(&first);
+    assert_eq!(tried, [(2, DpRate::Legacy(Hbr3))]);
+    assert_eq!(
+        verify_ladder(first.caps, &tried),
+        [
+            (2, Hbr2),
+            (2, Hbr),
+            (2, Rbr),
+            (1, Hbr3),
+            (1, Hbr2),
+            (1, Hbr),
+            (1, Rbr)
+        ]
+    );
+    assert_eq!(verified_link(first.caps, Some((2, Hbr2))), Some((2, Hbr2)));
+    assert_eq!(verified_link(first.caps, None), Some((1, Rbr)));
+    let floor = DpCaps {
+        lanes: 1,
+        rate: Rbr,
+        ..first.caps
+    };
+    assert_eq!(verified_link(floor, None), None, "no lower link to select");
+
+    // The port keeps 2 x HBR2: selection compresses harder for it.
+    let s = sink();
+    let identity = VerifiedLink {
+        path: p,
+        dpcd: s.dpcd.unwrap(),
+        edid: s.edid[..128].try_into().unwrap(),
+        lanes: 2,
+        rate: Hbr2,
+    };
+    let mut links = alloc::vec![identity];
+    let mut scanned = ports();
+    apply_verified_links(&mut links, &mut scanned);
+    assert_eq!(links, [identity]);
+    assert_eq!(
+        scanned[0].sink.as_ref().unwrap().verified_link,
+        Some((0x14, 2))
+    );
+    let again = select(&[p], &scanned, 8, None).unwrap();
+    assert_eq!((again.caps.lanes, again.caps.rate), (2, Hbr2));
+    assert_eq!((again.lanes, again.rate), (2, DpRate::Legacy(Hbr2)));
+    let narrow = again.dsc.unwrap();
+    let want = compute_config(
+        &DscSinkCaps::parse(&DSC, &[0; 3]).unwrap(),
+        NOMINAL_DISPCLK_KHZ,
+        legacy_kbps(2, Hbr2, true) as u32,
+        &dsc_timing(&again.timing),
+        LinkEncoding::Dp8b10b,
+        false,
+    );
+    assert_eq!(Some(narrow), want);
+    assert!(narrow.bpp_x16 < wide.bpp_x16, "bpp was not lowered");
+    assert_eq!(again.timing, first.timing);
+    assert_eq!(selected_dp_candidates(&again)[0], (2, DpRate::Legacy(Hbr2)));
+    // A verified link also removes 128b/132b.
+    let mut uhbr = sink();
+    uhbr.uhbr = 1;
+    uhbr.verified_link = Some((0x14, 2));
+    assert_eq!(dp_caps(&p, &uhbr).map(|c| (c.uhbr, c.lanes)), Some((0, 2)));
+
+    // Another sink, a changed EDID, no answer or no sink: the cap is gone.
+    for change in 0..4 {
+        let mut links = alloc::vec![identity];
+        let mut scanned = ports();
+        match change {
+            0 => scanned[0].sink.as_mut().unwrap().dpcd = dpcd(0x1e, 4),
+            1 => scanned[0].sink.as_mut().unwrap().edid[8] ^= 1,
+            2 => scanned[0].sink = Err(display::Error::Busy),
+            _ => scanned.clear(),
+        }
+        apply_verified_links(&mut links, &mut scanned);
+        assert!(links.is_empty());
+        if let Some(Ok(s)) = scanned.first().map(|p| &p.sink) {
+            assert_eq!(s.verified_link, None);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_dsc_link_verification_reselects_compressed_geometry
 );

@@ -33,6 +33,11 @@ pub enum ModesetError {
     Display(otg::Error),
     /// The port's MST branch or a payload on its link failed.
     Mst(super::MstFailure),
+    /// Every 8b/10b setting carrying the selected stream (its DSC/PPS
+    /// unchanged) was refused, and training proved a lower verified link
+    /// (Linux's dp_verify_link_cap). Selection must run again: the sink's
+    /// caps are now bounded by that link, which may need new DSC geometry.
+    LinkReduced,
 }
 impl From<super::MstFailure> for ModesetError {
     fn from(e: super::MstFailure) -> Self {
@@ -615,6 +620,59 @@ impl DpCaps {
     }
 }
 
+/// dp_verify_link_cap's walk after a refused selection: the 8b/10b ladder
+/// from the sink's caps (Linux's decide_fallback_link_setting order: rate
+/// down, then fewer lanes from the top rate), skipping settings already
+/// refused while carrying the stream.
+pub(super) fn verify_ladder(caps: DpCaps, tried: &[(u8, DpRate)]) -> Vec<(u8, LinkRate)> {
+    legacy_candidates(caps.lanes, caps.rate, |l, r| {
+        !tried.contains(&(l, DpRate::Legacy(r)))
+    })
+}
+
+/// The verified link to keep: the first setting that trained, else Linux's
+/// fail-safe one lane at RBR. `None` when that is no lower than the caps
+/// already are, so selecting again could not change anything.
+pub(super) fn verified_link(
+    caps: DpCaps,
+    trained: Option<(u8, LinkRate)>,
+) -> Option<(u8, LinkRate)> {
+    let link = trained.unwrap_or((1, LinkRate::Rbr));
+    (link != (caps.lanes, caps.rate)).then_some(link)
+}
+
+/// A DP SST sink's verified 8b/10b link, kept while that sink (its DPCD
+/// caps and base EDID) stays on the port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifiedLink {
+    pub path: inventory::Path,
+    pub dpcd: [u8; 16],
+    pub edid: [u8; 128],
+    pub lanes: u8,
+    pub rate: LinkRate,
+}
+
+/// Bound each scanned sink by its port's verified link. A port whose sink
+/// changed, left or stopped answering drops its entry, so a new sink (or a
+/// replug) is judged by its own caps again, as Linux re-verifies on
+/// detection.
+pub fn apply_verified_links(links: &mut Vec<VerifiedLink>, ports: &mut [display::Port]) {
+    links.retain(|v| {
+        ports.iter_mut().any(|port| {
+            let Ok(sink) = &mut port.sink else {
+                return false;
+            };
+            let same = port.path == v.path
+                && sink.dpcd == Some(v.dpcd)
+                && sink.edid.get(..128) == Some(&v.edid[..]);
+            if same {
+                sink.verified_link = Some((v.rate as u8, v.lanes));
+            }
+            same
+        })
+    });
+}
+
 /// The board's 128b/132b ceiling: dcn401_link_encoder_construct's UHBR
 /// flags from the connector-speed record, the highest one set.
 fn board_uhbr(path: &inventory::Path) -> Option<otg::UhbrRate> {
@@ -637,7 +695,17 @@ fn best_uhbr(bits: u8) -> Option<otg::UhbrRate> {
 
 /// A DP sink's usable links on its board path.
 pub fn dp_caps(path: &inventory::Path, sink: &display::Sink) -> Option<DpCaps> {
-    let (lanes, rate) = max_link(sink.dpcd.as_ref()?, sink.lttpr)?;
+    let (lanes, mut rate) = max_link(sink.dpcd.as_ref()?, sink.lttpr)?;
+    let mut lanes = lanes;
+    // A verified link bounds the 8b/10b link and excludes 128b/132b, as
+    // Linux's verified_link_cap replaces the reported cap.
+    if let Some((code, verified_lanes)) = sink.verified_link {
+        lanes = lanes.min(verified_lanes);
+        rate = LinkRate::from_dpcd_byte(code.min(rate as u8))?;
+        if !matches!(lanes, 1 | 2 | 4) {
+            return None;
+        }
+    }
     let mut max = board_uhbr(path)
         .zip(best_uhbr(sink.uhbr))
         .map(|(a, b)| a.min(b));
@@ -654,7 +722,11 @@ pub fn dp_caps(path: &inventory::Path, sink: &display::Sink) -> Option<DpCaps> {
     Some(DpCaps {
         lanes,
         rate,
-        uhbr,
+        uhbr: if sink.verified_link.is_some() {
+            0
+        } else {
+            uhbr
+        },
         fec: sink.fec,
         dsc: sink
             .dsc
@@ -808,6 +880,11 @@ pub fn refine_dsc(soc: &dml::Soc, selections: &mut [Selection]) -> Result<(), Mo
     }
     Ok(())
 }
+
+/// Selection rounds after a link verifies below its sink's caps. Each
+/// round records a strictly lower link, and the 8b/10b ladder has twelve
+/// settings; real links settle within one or two.
+const VERIFY_ROUNDS: usize = 4;
 
 /// LINK_TRAINING_ATTEMPTS and LINK_TRAINING_RETRY_DELAY.
 const UHBR_TRAINING_ATTEMPTS: u8 = 4;
@@ -1670,6 +1747,26 @@ impl ColdBoot {
         mut fill: impl FnMut(u32, &mut [u32]),
         want: Option<Timing>,
     ) -> Result<Modeset, ModesetError> {
+        // A link verified below the sink's caps selects and admits again
+        // (new DSC geometry included); each round lowers that link.
+        for _ in 0..VERIFY_ROUNDS {
+            // SAFETY: the caller's obligations.
+            match unsafe { self.modeset_display_once(pipe, &mut fill, want) }.await {
+                Err(ModesetError::LinkReduced) => continue,
+                result => return result,
+            }
+        }
+        Err(ModesetError::Link)
+    }
+    /// One selection/admission/lighting round of `modeset_display_mode`.
+    /// # Safety
+    /// As for `modeset_display`.
+    async unsafe fn modeset_display_once(
+        &mut self,
+        pipe: u8,
+        mut fill: impl FnMut(u32, &mut [u32]),
+        want: Option<Timing>,
+    ) -> Result<Modeset, ModesetError> {
         self.teardowns.check_idle()?;
         self.modesets.check_stopped()?;
         if pipe >= 4 {
@@ -1708,6 +1805,27 @@ impl ColdBoot {
     /// # Safety
     /// As for `modeset_display`: every display of this owner stopped.
     pub async unsafe fn modeset_displays(
+        &mut self,
+        mut fill: impl FnMut(u8, u32, &mut [u32]),
+        want: impl Fn(usize) -> Option<Timing>,
+        pipe_of: impl Fn(usize) -> Option<u8>,
+    ) -> Result<Configuration, ModesetError> {
+        // As `modeset_display_mode`: when the first display's link verifies
+        // lower, nothing is lit yet and the configuration is chosen again.
+        // A later display's reduction is returned in `failed`.
+        for _ in 0..VERIFY_ROUNDS {
+            // SAFETY: the caller's obligations.
+            match unsafe { self.modeset_displays_once(&mut fill, &want, &pipe_of) }.await {
+                Err(ModesetError::LinkReduced) => continue,
+                result => return result,
+            }
+        }
+        Err(ModesetError::Link)
+    }
+    /// One selection/admission/lighting round of `modeset_displays`.
+    /// # Safety
+    /// As for `modeset_displays`.
+    async unsafe fn modeset_displays_once(
         &mut self,
         mut fill: impl FnMut(u8, u32, &mut [u32]),
         want: impl Fn(usize) -> Option<Timing>,
@@ -2015,7 +2133,7 @@ impl ColdBoot {
             let transmitter =
                 self.display_paths().map_err(|_| ModesetError::NoSink)?[port].transmitter;
             let candidates = selected_dp_candidates(&selection);
-            for (lanes, link) in candidates {
+            for &(lanes, link) in &candidates {
                 let DpRate::Legacy(rate) = link else {
                     continue;
                 };
@@ -2049,6 +2167,9 @@ impl ColdBoot {
                 }
             }
             if !trained {
+                if matches!(refused, ModesetError::Display(otg::Error::DpTraining(_))) {
+                    self.verify_dp_link(&selection, &candidates).await?;
+                }
                 return Err(refused);
             }
             self.teardowns
@@ -2068,6 +2189,81 @@ impl ColdBoot {
             }
             Ok((selection, scanout))
         }
+    }
+    /// dp_verify_link_cap after every carrying setting was refused: train
+    /// the rest of the 8b/10b ladder from the sink's caps (no stream) and
+    /// keep the first setting that trains, else Linux's fail-safe one lane
+    /// at RBR, as the port's verified link; stop the link again. Returns
+    /// `LinkReduced` once a lower link is recorded. Sinks with 128b/132b
+    /// caps keep Linux's UHBR fallback table instead.
+    async unsafe fn verify_dp_link(
+        &mut self,
+        selection: &Selection,
+        tried: &[(u8, DpRate)],
+    ) -> Result<(), ModesetError> {
+        let caps = selection.caps;
+        if caps.uhbr != 0 || selection.mst.is_some() || selection.hdmi {
+            return Ok(());
+        }
+        let port = selection.port;
+        let path = self.display_paths().map_err(|_| ModesetError::NoSink)?[port];
+        let transmitter = path.transmitter;
+        let mut trained = None;
+        for (lanes, rate) in verify_ladder(caps, tried) {
+            // SAFETY: the caller's obligations; the port's PHY is stopped.
+            unsafe {
+                self.enable_display_dp_phy(
+                    port,
+                    otg::DpPhySettings {
+                        lanes,
+                        rate,
+                        mst: false,
+                    },
+                )
+                .await?;
+                match self.train_display_dp_link(port, false).await {
+                    Ok(_) => {
+                        self.stop_display_dp_link(port).await?;
+                        trained = Some((lanes, rate));
+                        break;
+                    }
+                    Err(otg::Error::DpTraining(_))
+                        if self
+                            .display_timing_status()
+                            .is_ok_and(|s| s.state == otg::State::DpLinkRefused(transmitter)) =>
+                    {
+                        self.stop_display_dp_link(port).await?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        let Some(verified) = verified_link(caps, trained) else {
+            return Ok(()); // nothing below the caps to select from
+        };
+        let (dpcd, edid) = self.verified_identity(port)?;
+        self.record_verified_link(VerifiedLink {
+            path,
+            dpcd,
+            edid,
+            lanes: verified.0,
+            rate: verified.1,
+        });
+        Err(ModesetError::LinkReduced)
+    }
+    /// The scanned DPCD and base EDID of the sink on `port`.
+    fn verified_identity(&self, port: usize) -> Result<([u8; 16], [u8; 128]), ModesetError> {
+        let path = self.display_paths().map_err(|_| ModesetError::NoSink)?[port];
+        self.scanned_sinks
+            .iter()
+            .find(|(p, _, _)| *p == path)
+            .map(|&(_, dpcd, edid)| (dpcd, edid))
+            .ok_or(ModesetError::NoSink)
+    }
+    /// Replace the port's verified link.
+    fn record_verified_link(&mut self, link: VerifiedLink) {
+        self.verified_links.retain(|v| v.path != link.path);
+        self.verified_links.push(link);
     }
     /// The 128b/132b half of `start_link`: train down Linux's fallback
     /// table on HPO link encoder `pipe` (one display per pipe, as Linux's

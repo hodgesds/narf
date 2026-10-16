@@ -1786,7 +1786,9 @@ pub async unsafe fn monitor_displays(
         let fill = |_: u8, _: u32, row: &mut [u32]| row.fill(0);
         // SAFETY: as above; every display is stopped.
         let lit = match unsafe { light_displays(boot, fill) }.await {
-            Err(e @ (ModesetError::NoSink | ModesetError::Link)) if !pending_display_work(boot) => {
+            Err(e @ (ModesetError::NoSink | ModesetError::Link | ModesetError::LinkReduced))
+                if !pending_display_work(boot) =>
+            {
                 let _ = core::fmt::Write::write_fmt(
                     &mut narf_console::Writer,
                     format_args!("amdgpu: navi48 displays not lit: {e:?}\n"),
@@ -1810,6 +1812,11 @@ pub async unsafe fn monitor_displays(
             Ok(config) => Some(config),
         };
         let mut count = 0;
+        // A later display whose link verified below its caps lights at the
+        // next pass, selected (and DSC-admitted) against that link.
+        let reduced = lit
+            .as_ref()
+            .is_some_and(|c| c.failed == Some(ModesetError::LinkReduced));
         if let Some(config) = lit {
             if let Some(e) = config.failed {
                 let _ = core::fmt::Write::write_fmt(
@@ -1835,6 +1842,14 @@ pub async unsafe fn monitor_displays(
             })
             .fold(0, |acc, (k, _)| acc | 1 << k);
         drop(state);
+        if reduced {
+            displays.considered = displays
+                .lit
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.is_some())
+                .fold(0, |acc, (k, _)| acc | 1 << k);
+        }
         steps.push(MonitorStep::Relit(count));
     }
     if !steps.is_empty() {

@@ -59,6 +59,11 @@ pub struct Sink {
     pub fec: bool,
     /// DSC decoder caps (DPCD 0x060-0x06F), read from DPCD 1.4 on.
     pub dsc: Option<[u8; 16]>,
+    /// Linux's verified_link_cap where training proved less than the caps:
+    /// the 8b/10b rate code and lane count the link last trained at after
+    /// every setting above it was refused. Never set by a probe; the display
+    /// owner applies it while the same sink stays attached.
+    pub verified_link: Option<(u8, u8)>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Port {
@@ -229,6 +234,7 @@ async fn read_sink(io: &mut impl Aux, instance: u8) -> Result<Sink, Error> {
         lttpr_uhbr,
         fec: fec[0] & 1 != 0,
         dsc,
+        verified_link: None,
     })
 }
 
@@ -319,6 +325,7 @@ impl Probe {
                                 lttpr_uhbr: None,
                                 fec: false,
                                 dsc: None,
+                                verified_link: None,
                             })
                             .map_err(Error::Ddc)
                     }

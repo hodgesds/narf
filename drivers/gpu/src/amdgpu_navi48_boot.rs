@@ -457,6 +457,10 @@ pub struct ColdBoot {
     /// Completed modesets survive a dropped configuration/monitor future.
     modesets: modeset::RetainedModesets,
     sst_outputs: Vec<modeset::SstOutput>,
+    /// DP SST links training proved below their sinks' caps.
+    verified_links: Vec<modeset::VerifiedLink>,
+    /// The last scan's DP sinks: port path, DPCD caps and base EDID.
+    scanned_sinks: Vec<(inventory::Path, [u8; 16], [u8; 128])>,
 }
 impl ColdBoot {
     /// # Safety
@@ -586,6 +590,8 @@ impl ColdBoot {
             teardowns: teardown::Teardowns::new(),
             modesets: modeset::RetainedModesets::new(),
             sst_outputs: Vec::new(),
+            verified_links: Vec::new(),
+            scanned_sinks: Vec::new(),
             sequence: Sequence {
                 backend: Hardware {
                     gpu: saved,
@@ -2477,10 +2483,18 @@ impl ColdBoot {
                 let _ = unsafe { otg.set_aux_timeout(*path, otg::Otg::AUX_TIMEOUT_LTTPR_US) };
             }
         }
-        let ports = display
+        let mut ports = display
             .scan(&mut self.sequence.backend.dmub, self.ddc.as_mut().ok())
             .await
             .map_err(Error::Display)?;
+        self.scanned_sinks = ports
+            .iter()
+            .filter_map(|p| {
+                let sink = p.sink.as_ref().ok()?;
+                Some((p.path, sink.dpcd?, sink.edid.get(..128)?.try_into().ok()?))
+            })
+            .collect();
+        modeset::apply_verified_links(&mut self.verified_links, &mut ports);
         if let Ok(otg) = self.otg.as_mut() {
             for port in &ports {
                 let repeater = port.sink.as_ref().is_ok_and(|s| s.lttpr.is_some());

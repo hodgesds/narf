@@ -355,6 +355,7 @@ fn navi48_display_scans_hdmi_with_native_ddc_and_dp_with_aux() -> TestResult {
                     lttpr_uhbr: None,
                     fec: false,
                     dsc: None,
+                    verified_link: None,
                 })
                 .map_err(Error::Ddc)
         );

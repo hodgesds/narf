@@ -969,7 +969,23 @@ halve and the rate restarts at this attempt's starting rate. Legacy DSC also
 walks this ladder while keeping the admitted bpp, PPS, timing and DML plan:
 only settings that carry that compressed payload plus slice overhead after
 FEC are tried. Changing bpp/slice geometry requires a new admission and is
-not done inside link fallback. A confirmed CR, EQ or
+not done inside link fallback. When every carrying 8b/10b setting of an SST
+sink without 128b/132b caps is refused, `start_link` follows Linux's
+`dp_verify_link_cap`: it trains the rest of the ladder from the sink's caps
+(`verify_ladder`) without a stream, stops the link again and records the first
+setting that trained, else one RBR lane, as the port's `VerifiedLink`
+(`verified_link`), keyed by the sink's scanned DPCD and base EDID. It returns
+`ModesetError::LinkReduced` only when that link is below the caps.
+`ColdBoot::scan_display` applies the record as `display::Sink::verified_link`
+(`apply_verified_links`), so `dp_caps`, selection, offered modes and DSC
+(`dp_dsc`/`refine_dsc`) use the verified link and no 128b/132b; another sink,
+a changed EDID/DPCD, a nonresponding or empty port drops it.
+`modeset_display_mode` and `modeset_displays` select, admit and light again
+(at most `VERIFY_ROUNDS`) when the first display reports `LinkReduced`; a later
+display's reduction is returned in `Configuration::failed`, and the monitor
+leaves that output unconsidered so its next pass relights the configuration.
+A retrain that verifies lower records the link but still returns its error;
+partial retrain recovery remains open. A confirmed CR, EQ or
 link-loss failure whose idle exit is proven leaves the owner in
 `DpLinkRefused`, retaining the plan. Only `stop_dp_link` may follow: as in
 Linux's retries, the sink is put in D3 and the PHY disabled before the next
