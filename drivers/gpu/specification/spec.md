@@ -518,6 +518,10 @@ ring creation → trusted-memory setup → SMC upload → SMU version handshake 
 optional board PowerPlay upload → optional DMUB quiesce → graphics upload/autoload → RLC boot check →
 optional board calibration/protected GFX DPM setup → optional memory hubs →
 optional SDMA execution test → optional DMUB start.
+Production cold boot emits a serial `start` and terminal `complete` or
+`failed` checkpoint for each stage. A pending/cancelled stage emits no false
+completion; checkpoints do not run per poll or write training-owned framebuffer
+memory. These markers identify startup progress, not native-display readiness.
 `ColdBoot::prepare_memory_hubs()` reserves the above VMID0 backing before run;
 it requires a prepared board power policy and performs no I/O. Production boot
 always calls it. Explicit firmware-only callers may omit this stage.

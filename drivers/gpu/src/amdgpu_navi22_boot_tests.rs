@@ -29,6 +29,7 @@ struct Fake {
     fail: Option<Stage>,
     stall: Option<Stage>,
     calls: Vec<Stage>,
+    progress: Vec<(Stage, Option<Result<(), Error>>)>,
     missing_report: bool,
     _owned: crate::amdgpu_vram::Reservation,
     dropped: Arc<AtomicBool>,
@@ -39,6 +40,9 @@ impl Drop for Fake {
     }
 }
 impl Backend for Fake {
+    fn progress(&mut self, stage: Stage, result: Option<Result<(), Error>>) {
+        self.progress.push((stage, result));
+    }
     async fn step(&mut self, stage: Stage) -> Result<(), Error> {
         self.calls.push(stage);
         if self.fail == Some(stage) {
@@ -81,6 +85,7 @@ fn sequence() -> (Pool, Arc<AtomicBool>, Sequence<Fake>) {
         fail: None,
         stall: None,
         calls: Vec::new(),
+        progress: Vec::new(),
         missing_report: false,
         _owned: owned,
         dropped: dropped.clone(),
@@ -103,6 +108,11 @@ fn navi22_boot_orders_stages_and_keeps_successful_owners() -> TestResult {
     if run(sequence.run()) != Ok(report())
         || sequence.state != State::FirmwareReady(report())
         || sequence.backend.calls != STAGES
+        || sequence.backend.progress
+            != STAGES
+                .into_iter()
+                .flat_map(|stage| [(stage, None), (stage, Some(Ok(())))])
+                .collect::<Vec<_>>()
         || dropped.load(Ordering::SeqCst)
         || pool.available() != 4096
     {
@@ -130,6 +140,8 @@ fn navi22_boot_failure_stops_at_each_stage_without_cleanup_or_replay() -> TestRe
         if run(sequence.run()) != Err(error)
             || sequence.state != (State::Failed { stage, error })
             || sequence.backend.calls != STAGES[..=index]
+            || sequence.backend.progress.last() != Some(&(stage, Some(Err(error))))
+            || sequence.backend.progress.len() != (index + 1) * 2
             || dropped.load(Ordering::SeqCst)
             || run(sequence.run()) != Err(Error::Busy)
             || pool.available() != 4096
@@ -173,6 +185,8 @@ fn navi22_boot_cancel_at_each_stage_retains_session_and_ownership() -> TestResul
         }
         if sequence.state != State::Running(stage)
             || sequence.backend.calls != STAGES[..=index]
+            || sequence.backend.progress.last() != Some(&(stage, None))
+            || sequence.backend.progress.len() != index * 2 + 1
             || dropped.load(Ordering::SeqCst)
             || pool.available() != 4096
             || run(sequence.run()) != Err(Error::Busy)

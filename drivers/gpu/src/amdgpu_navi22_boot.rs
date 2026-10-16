@@ -130,6 +130,8 @@ pub enum State {
     Released,
 }
 trait Backend {
+    /// None marks entry; Some records the terminal result, once per stage.
+    fn progress(&mut self, stage: Stage, result: Option<Result<(), Error>>);
     async fn step(&mut self, stage: Stage) -> Result<(), Error>;
     fn report(&self) -> Result<Report, Error>;
 }
@@ -147,7 +149,10 @@ impl<B: Backend> Sequence<B> {
             // Stored outside the future, so dropping the future cannot permit
             // replay or discard the backend's outstanding hardware owners.
             self.state = State::Running(stage);
-            if let Err(error) = self.backend.step(stage).await {
+            self.backend.progress(stage, None);
+            let result = self.backend.step(stage).await;
+            self.backend.progress(stage, Some(result));
+            if let Err(error) = result {
                 self.state = State::Failed { stage, error };
                 return Err(error);
             }
@@ -187,6 +192,19 @@ struct Hardware {
     dmub: Option<crate::amdgpu_dmub_navi22::Dmub>,
 }
 impl Backend for Hardware {
+    fn progress(&mut self, stage: Stage, result: Option<Result<(), Error>>) {
+        use core::fmt::Write;
+        // Boot-only checkpoints, never a poll-loop trace. Do not write to
+        // the framebuffer while training owns its VRAM preimage.
+        let _ = match result {
+            None => writeln!(narf_console::Writer, "amdgpu: navi22 {stage:?}: start"),
+            Some(Ok(())) => writeln!(narf_console::Writer, "amdgpu: navi22 {stage:?}: complete"),
+            Some(Err(error)) => writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 {stage:?}: failed {error:?}"
+            ),
+        };
+    }
     async fn step(&mut self, stage: Stage) -> Result<(), Error> {
         match stage {
             Stage::MemoryTraining => {
