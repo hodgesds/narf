@@ -221,19 +221,30 @@ meta)` (and by `cryptroot`, registered against its container).
 
 ```rust
 pub mod disk_policy {
-    pub const ARG: &str = "narf.disks";            // all | boot-only
-    pub enum DiskPolicy { All, BootOnly }
+    pub const ARG: &str = "narf.disks";  // all | boot-only | root-ro | root-rw
+    pub enum DiskPolicy { All, BootOnly, RootRo, RootRw }
+    pub enum PolicyError { NotRootPolicy, NoRootUuidArg, UuidMismatch, NoSuchDevice,
+        NotAPartition, IdentityMismatch, Ambiguous, EfiOrVfat, NotBtrfs,
+        AlreadyDesignated, Revoked }
+    pub type DiskId = u64;                          // physical disk, never reused
+    pub type DevId = u64;                           // registry entry, never reused
     pub fn parse(value: Option<&str>) -> Result<DiskPolicy, &'static str>;
     pub fn policy() -> DiskPolicy;                  // lazily from the cmdline
-    pub fn init_from_cmdline() -> DiskPolicy;       // unknown value: BootOnly
+    pub fn init_from_cmdline() -> DiskPolicy;       // unknown/repeated value: BootOnly
     pub fn trust_boot_medium(device_name: &str, disk: DiskId);
     pub fn is_boot_medium(device_name: &str) -> bool;
+    pub fn root_uuid_arg() -> Option<[u8; 16]>;     // the single root=UUID=
+    pub fn designate_root(device_name: &str, fs_uuid: [u8; 16]) -> Result<(), PolicyError>;
+    pub fn designated_root() -> Option<&'static str>;
+    pub fn root_writable() -> bool;
     pub fn automount_allowed(device_name: &str) -> bool;
     pub fn write_allowed(device_name: &str) -> bool;
     pub fn refused_writes() -> u64;
-    pub struct PolicyGuard; // impl BlockDeviceSync
+    pub struct PolicyGuard; // impl BlockDeviceSync; dev_id() -> DevId
 }
 pub fn disk_of(name: &str) -> Option<DiskId>;
+// RegisteredBlockDevice { name, dev, disk: DiskId, dev_id: DevId, partition }
+// partition::{discover_volume_uuid (ext, FAT, LUKS, btrfs fsid), parse_uuid, format_uuid_bytes}
 // BlockDeviceSync::is_read_only / BlockDevice::is_read_only (default false)
 ```
 
@@ -244,6 +255,20 @@ secret on the medium (the bootlog's `/NARFLOG.ID` token), using the `DiskId`
 from the same registry snapshot they read the proof from. `is_read_only`
 reports the guard's state through `SyncBlock` so filesystems mount a read-only
 device without writing. `All` (the default) is a pass-through.
+
+Under `RootRo` / `RootRw` nothing is writable until root mounting calls
+`designate_root` for the partition whose filesystem UUID matched
+`root=UUID=`. The designation (at most one per boot) re-verifies the UUID
+against the command line (exactly one `root=`), the partition metadata and the
+device's own superblock; refuses whole disks, ESP / vfat partitions, a UUID
+carried by more than one registered device, and (under `RootRw`) anything but
+btrfs. Under `RootRw` exactly the guard whose `DevId` was designated passes
+writes; under `RootRo` none does. The designation is revoked for the rest of
+the boot if that entry is unregistered or replaced or another device carrying
+the UUID registers. `automount_allowed` admits only the `root=UUID=` candidate
+(before designation), the designated root, and vfat partitions on its disk.
+Both modes print a framed banner at policy resolution and at designation
+naming the writable device and UUID.
 
 ### 3.6 Encrypted-device stacking
 

@@ -96,6 +96,28 @@ pub fn discover_volume_uuid(dev: &dyn BlockDeviceSync) -> Option<String> {
     Some(crate::registry::format_uuid_bytes(&fsid))
 }
 
+/// Canonical lowercase 8-4-4-4-12 rendering of a 16-byte UUID.
+pub use crate::registry::format_uuid_bytes;
+
+/// Parse a canonical (hyphenated or not) 32-hex-digit UUID. FAT serials
+/// (`6D89-28C5`) and anything else not exactly 16 bytes return `None`.
+pub fn parse_uuid(text: &str) -> Option<[u8; 16]> {
+    let mut out = [0u8; 16];
+    let mut nibbles = 0usize;
+    for c in text.chars() {
+        if c == '-' {
+            continue;
+        }
+        let v = c.to_digit(16)? as u8;
+        if nibbles >= 32 {
+            return None;
+        }
+        out[nibbles / 2] |= if nibbles % 2 == 0 { v << 4 } else { v };
+        nibbles += 1;
+    }
+    (nibbles == 32).then_some(out)
+}
+
 // ── Common signatures ──────────────────────────────────────────────
 
 /// Last two bytes of LBA 0 on a partitioned disk — both MBR and

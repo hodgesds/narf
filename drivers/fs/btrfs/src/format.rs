@@ -79,6 +79,10 @@ pub const DEV_ITEMS_OBJECTID: u64 = 1;
 pub const FIRST_CHUNK_TREE_OBJECTID: u64 = 256;
 /// Free-space tree (`space_cache=v2`).
 pub const FREE_SPACE_TREE_OBJECTID: u64 = 10;
+/// Block-group tree (`BTRFS_BLOCK_GROUP_TREE_OBJECTID`): holds every
+/// `BLOCK_GROUP_ITEM` instead of the extent tree when
+/// [`COMPAT_RO_BLOCK_GROUP_TREE`] is set.
+pub const BLOCK_GROUP_TREE_OBJECTID: u64 = 11;
 /// Objectid all data-checksum items share (`BTRFS_EXTENT_CSUM_OBJECTID`, -10).
 pub const EXTENT_CSUM_OBJECTID: u64 = (-10i64) as u64;
 /// The tree-log tree (`BTRFS_TREE_LOG_OBJECTID`, -7): the fsync log root, and the
@@ -248,8 +252,8 @@ pub(crate) const OFF_SYS_CHUNK_ARRAY_SIZE: usize = 160;
 const OFF_COMPAT_RO_FLAGS: usize = 180;
 pub(crate) const OFF_INCOMPAT_FLAGS: usize = 188;
 const OFF_CSUM_TYPE: usize = 196;
-const OFF_ROOT_LEVEL: usize = 198;
-const OFF_CHUNK_ROOT_LEVEL: usize = 199;
+pub(crate) const OFF_ROOT_LEVEL: usize = 198;
+pub(crate) const OFF_CHUNK_ROOT_LEVEL: usize = 199;
 const OFF_FSID: usize = 32;
 /// Embedded member-specific `struct btrfs_dev_item` in each superblock.
 pub const SUPERBLOCK_DEV_ITEM_OFFSET: usize = 201;
@@ -258,13 +262,18 @@ const OFF_DEV_ITEM: usize = SUPERBLOCK_DEV_ITEM_OFFSET;
 const DEV_ITEM_UUID: usize = 66;
 const DEV_ITEM_FSID: usize = 82;
 
-// Features whose on-disk shapes are understood by this driver. Read-only
-// compatibility bits are not safe to ignore here because this implementation
-// can mount writable and does not yet have a read-only fallback mount mode.
+// Read-only-compatible features (`btrfs_check_features`): a bit outside
+// `SUPPORTED_COMPAT_RO_FLAGS` still permits a read-only mount and refuses a
+// read-write one. `WRITE_SUPPORTED_COMPAT_RO_FLAGS` is the subset the COW
+// writer maintains; anything else forces the mount read-only-or-refused.
 pub const COMPAT_RO_FREE_SPACE_TREE: u64 = 1 << 0;
 pub const COMPAT_RO_FREE_SPACE_TREE_VALID: u64 = 1 << 1;
+/// Block group items live in their own tree (objectid 11).
+pub const COMPAT_RO_BLOCK_GROUP_TREE: u64 = 1 << 3;
 pub const SUPPORTED_COMPAT_RO_FLAGS: u64 =
-    COMPAT_RO_FREE_SPACE_TREE | COMPAT_RO_FREE_SPACE_TREE_VALID;
+    COMPAT_RO_FREE_SPACE_TREE | COMPAT_RO_FREE_SPACE_TREE_VALID | COMPAT_RO_BLOCK_GROUP_TREE;
+pub const WRITE_SUPPORTED_COMPAT_RO_FLAGS: u64 =
+    COMPAT_RO_FREE_SPACE_TREE | COMPAT_RO_FREE_SPACE_TREE_VALID | COMPAT_RO_BLOCK_GROUP_TREE;
 
 pub const INCOMPAT_MIXED_BACKREF: u64 = 1 << 0;
 pub const INCOMPAT_DEFAULT_SUBVOL: u64 = 1 << 1;
@@ -332,6 +341,22 @@ pub struct Superblock {
 }
 
 impl Superblock {
+    /// compat_ro bits this driver cannot write while keeping consistent. A
+    /// non-zero value permits only a read-only mount.
+    pub fn compat_ro_unwritable(&self) -> u64 {
+        self.compat_ro_flags & !WRITE_SUPPORTED_COMPAT_RO_FLAGS
+    }
+
+    /// compat_ro bits whose on-disk shape this driver does not understand.
+    pub fn compat_ro_unknown(&self) -> u64 {
+        self.compat_ro_flags & !SUPPORTED_COMPAT_RO_FLAGS
+    }
+
+    /// Block group items live in tree 11, not the extent tree.
+    pub fn has_block_group_tree(&self) -> bool {
+        self.compat_ro_flags & COMPAT_RO_BLOCK_GROUP_TREE != 0
+    }
+
     /// Read the checksum selector before decoding the rest of a raw superblock.
     /// Mount needs this field in order to verify the block that contains it.
     pub(crate) fn checksum_type(buf: &[u8]) -> Result<u16, FsError> {
@@ -401,9 +426,9 @@ impl Superblock {
 
         let compat_ro_flags = le64(buf, OFF_COMPAT_RO_FLAGS)?;
         let incompat_flags = le64(buf, OFF_INCOMPAT_FLAGS)?;
-        if compat_ro_flags & !SUPPORTED_COMPAT_RO_FLAGS != 0
-            || incompat_flags & !SUPPORTED_INCOMPAT_FLAGS != 0
-        {
+        // Unknown incompat bits refuse every mount. Unknown compat_ro bits are
+        // kept and judged at mount time against the requested mode.
+        if incompat_flags & !SUPPORTED_INCOMPAT_FLAGS != 0 {
             return Err(FsError::Unsupported);
         }
 

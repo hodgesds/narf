@@ -147,6 +147,9 @@ pub struct BtrfsNode<B: BlockDevice + 'static> {
     tree_id: Option<u64>,
     ino: u64,
     inode: InodeItem,
+    /// The file size as of this node's latest write: `inode` is the item as
+    /// looked up, and `stat` has no tree access.
+    live_size: core::sync::atomic::AtomicU64,
 }
 
 impl<B: BlockDevice + 'static> BtrfsNode<B> {
@@ -161,6 +164,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             tree_root,
             tree_id: None,
             ino,
+            live_size: core::sync::atomic::AtomicU64::new(inode.size),
             inode,
         })
     }
@@ -177,6 +181,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             tree_root: Some(tree_root),
             tree_id: Some(tree_id),
             ino,
+            live_size: core::sync::atomic::AtomicU64::new(inode.size),
             inode,
         })
     }
@@ -624,7 +629,13 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
         Box::pin(async move {
             let vol = self.volume()?;
             let root = self.root(&vol);
-            crate::extent::read_file(&vol, root, self.ino, self.inode.size, offset, buf).await
+            // The size is re-read from the tree: this node's cached inode
+            // predates any write made through it (or through another open
+            // file of the same inode).
+            let size = vol.load_inode_in(root, self.ino).await?.size;
+            self.live_size
+                .store(size, core::sync::atomic::Ordering::Relaxed);
+            crate::extent::read_file(&vol, root, self.ino, size, offset, buf).await
         })
     }
 
@@ -639,10 +650,15 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
-            autogrow!(
+            let written = autogrow!(
                 vol,
                 crate::write::cow_write_file(&vol, self.ino, &self.inode, offset, buf).await
-            )
+            )?;
+            self.live_size.fetch_max(
+                offset.saturating_add(written as u64),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            Ok(written)
         })
     }
 
@@ -660,8 +676,11 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
 
     fn stat(&self) -> Stat {
         Stat {
-            size: self.inode.size,
-            blocks: self.inode.size.div_ceil(512),
+            size: self.live_size.load(core::sync::atomic::Ordering::Relaxed),
+            blocks: self
+                .live_size
+                .load(core::sync::atomic::Ordering::Relaxed)
+                .div_ceil(512),
             mode: Mode {
                 file_type: self.inode.file_type(),
                 perms: self.inode.perms() & 0o777,
@@ -709,8 +728,11 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 gid: self.inode.gid,
                 mode: (self.inode.mode & 0xffff) as u16,
                 ino: self.ino,
-                size: self.inode.size,
-                blocks: self.inode.size.div_ceil(512),
+                size: self.live_size.load(core::sync::atomic::Ordering::Relaxed),
+                blocks: self
+                    .live_size
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    .div_ceil(512),
                 // `btrfs_getattr`: each timespec as stored, otime as btime.
                 atime: ts(self.inode.atime_sec, self.inode.atime_nsec),
                 btime: ts(self.inode.otime_sec, self.inode.otime_nsec),
@@ -791,6 +813,17 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
 impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     fn ino(&self) -> u64 {
         self.ino
+    }
+
+    /// A directory's `fsync`/`syncfs` makes every returned write durable, as
+    /// a file's does (see [`FileOps::fsync`] above): `sync(2)`, `syncfs` on a
+    /// directory fd and `fsync` of a directory after a rename all land here.
+    fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.volume()?.sync_to_disk().await })
+    }
+
+    fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.volume()?.sync_to_disk().await })
     }
 
     fn dcache_identity(&self) -> (usize, u64, u64) {
@@ -1176,13 +1209,45 @@ impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
         })
     }
 
+    /// A volume the write-safety gate (or the disk policy) made read-only is
+    /// read-only for every mount of it: the VFS then refuses writes with
+    /// EROFS and reports `ro` in mountinfo.
+    fn always_read_only(&self) -> bool {
+        self.is_read_only()
+    }
+
     fn reconfigure(&self, options: &str) -> Result<(), FsError> {
-        // Read-only volume: accept only `ro`/empty option tokens.
-        for opt in options.split(',').filter(|s| !s.is_empty()) {
-            if opt != "ro" {
-                return Err(FsError::Unsupported);
-            }
+        // `systemd-remount-fs` remounts `/` with its fstab options
+        // (`subvol=/@,compress=zstd:1`, ...). Accept what a mount accepts;
+        // like Linux, `subvol=`/`subvolid=` cannot change on remount and are
+        // ignored, everything else replaces the recorded run-time options.
+        let mut parsed = crate::mount_opts::parse(options)?;
+        // A volume made read-only (disk policy, write-safety gate, a second
+        // writer of its fsid) stays read-only: `rw` is refused, not ignored.
+        if options.split(',').any(|o| o == "rw") && self.is_read_only() {
+            return Err(FsError::ReadOnly);
         }
+        let current = self.mount_options();
+        parsed.subvol = current.subvol;
+        if parsed.read_only && !self.is_read_only() {
+            // A writable volume cannot be flipped read-only in place yet.
+            return Err(FsError::Unsupported);
+        }
+        parsed.read_only = current.read_only;
+        self.set_mount_options(parsed);
         Ok(())
+    }
+
+    fn show_options(&self) -> alloc::string::String {
+        let options = self.mount_options();
+        let mut out = options.render();
+        let id = self.mounted_subvol_id();
+        out.push_str(&alloc::format!(",subvolid={id}"));
+        if let Some(crate::volume::Subvol::Name(path)) = &options.subvol {
+            out.push_str(&alloc::format!(",subvol=/{path}"));
+        } else if id == crate::format::FS_TREE_OBJECTID {
+            out.push_str(",subvol=/");
+        }
+        out
     }
 }

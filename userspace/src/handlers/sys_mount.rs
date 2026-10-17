@@ -618,6 +618,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         fs_type: &fstype, source: &source_resolved, options: &data,
         uid, gid, umask: current_umask() as u16,
         initial_namespace: current_mount_namespace().is_none(),
+        read_only: flags & MS_RDONLY != 0,
     };
     ctx.set_return(match fs_type.init(&request) {
         Ok(fs) => match current_mount_arc_with_flags(&auth, &target, fs, mnt_flags) {

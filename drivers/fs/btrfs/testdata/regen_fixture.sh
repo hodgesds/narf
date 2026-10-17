@@ -24,6 +24,7 @@
 #   fixture-fst.img.sparse   like fixture.img but WITH a free-space tree
 #                            (space_cache=v2); exercises the write path's
 #                            free-space-tree maintenance
+#   fixture-bgt.img.sparse   block-group-tree + CachyOS subvolume layout
 #   fixture-raid{0,1,1c3,1c4,10,5,6}-N.img.sparse  genuine multi-device members;
 #                            RAID6 uses RAID6 for metadata as well as data so
 #                            two-member degraded recovery is testable
@@ -496,6 +497,35 @@ btrfs check "$imgbm" >/dev/null
 btrfs inspect-internal dump-tree -t FREE_SPACE "$imgbm" | grep -q FREE_SPACE_BITMAP \
     || { echo "fixture-bitmap has no FREE_SPACE_BITMAP" >&2; exit 1; }
 sparse_encode "$imgbm" fixture-bitmap.img.sparse
+
+# A CachyOS-root lookalike (512 MiB so the boot write smoke can grow it
+# four times): the host's real feature set (compat_ro 0xb =
+# free-space-tree + valid + BLOCK_GROUP_TREE, incompat 0x371), crc32c, 4 KiB
+# sectors, 16 KiB nodes, zstd, and its subvolume layout (@, @home, @root, @srv,
+# @cache, @tmp, @log) created by mkfs `--subvol` (no mount needed). The
+# top level also carries hello.txt + big.dat so the boot-time NVMe read/write
+# smokes can run against it (`XTASK_BTRFS_NVME_FIXTURE=bgt`). Generated with
+# btrfs-progs v7.1 (block-group-tree needs >= 6.1).
+bgtstage="$(mktemp -d)"
+imgbgt="$(mktemp)"
+for d in @ @home @root @srv @cache @tmp @log; do mkdir -p "$bgtstage/$d"; done
+mkdir -p "$bgtstage/@/etc" "$bgtstage/@home/user"
+printf 'NAME="CachyOS Linux"\nID=cachyos\n' > "$bgtstage/@/etc/os-release"
+printf 'home user file\n' > "$bgtstage/@home/user/notes.txt"
+printf 'narf\n' > "$bgtstage/hello.txt"
+python3 -c "import sys;sys.stdout.write(''.join('L%04d\n'%i for i in range(2000)))" \
+    > "$bgtstage/big.dat"
+truncate -s 512M "$imgbgt"
+mkfs.btrfs --csum crc32c --nodesize 16384 --sectorsize 4096 --compress zstd \
+    -O block-group-tree,free-space-tree,no-holes \
+    --subvol rw:@ --subvol rw:@home --subvol rw:@root --subvol rw:@srv \
+    --subvol rw:@cache --subvol rw:@tmp --subvol rw:@log \
+    --rootdir "$bgtstage" "$imgbgt" >/dev/null
+btrfs check --readonly "$imgbgt" >/dev/null
+btrfs inspect-internal dump-super "$imgbgt" | grep -q 'compat_ro_flags.*0xb' \
+    || { echo "fixture-bgt lacks block-group-tree" >&2; exit 1; }
+sparse_encode "$imgbgt" fixture-bgt.img.sparse
+rm -rf "$bgtstage" "$imgbgt"
 
 for profile in raid0 raid1 raid10 raid5 raid6; do
     generate_raid_fixture "$profile"

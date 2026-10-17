@@ -930,11 +930,15 @@ impl DevNvmeCtrlProxy {
 /// Sanitize, Firmware Commit, Write) against any namespace. So it is
 /// writable only when EVERY namespace of that controller is the
 /// identified boot medium (and it has at least one); under
-/// `narf.disks=all` it always is.
+/// `narf.disks=all` it always is; under `root-ro`/`root-rw` it never is.
 fn nvme_ctrl_writable(ctrl: &NvmeCtrlNode) -> bool {
     match narf_block::disk_policy::policy() {
         narf_block::disk_policy::DiskPolicy::All => true,
-        narf_block::disk_policy::DiskPolicy::BootOnly => {
+        // The root modes restrict writes at least as tightly as boot-only:
+        // a namespace counts only if the policy lets it be written.
+        narf_block::disk_policy::DiskPolicy::BootOnly
+        | narf_block::disk_policy::DiskPolicy::RootRo
+        | narf_block::disk_policy::DiskPolicy::RootRw => {
             !ctrl.namespaces.is_empty()
                 && ctrl
                     .namespaces

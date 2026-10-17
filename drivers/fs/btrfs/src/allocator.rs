@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 use narf_block::BlockDevice;
 use narf_filesystem::FsError;
 
+use crate::block_group;
 use crate::btree::Cursor;
 use crate::format::{self, BtrfsKey};
 use crate::roots;
@@ -95,25 +96,17 @@ async fn read_free_extents<B: BlockDevice + 'static>(
     Ok(out)
 }
 
-/// Logical `(start, len)` ranges of every **system** block group, read from the
-/// extent tree's `BLOCK_GROUP_ITEM`s. A system block group is reserved for the
-/// chunk tree (it must stay reachable via `sys_chunk_array` at mount), so the
-/// general write path must never allocate data / fs metadata there.
-async fn read_system_block_groups<B: BlockDevice + 'static>(
+/// `(start, len, flags)` of every block group, read from the
+/// `BLOCK_GROUP_ITEM`s in `bg_tree` (the extent tree, or the block-group tree on
+/// a `BLOCK_GROUP_TREE` filesystem).
+async fn read_block_group_types<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
-    extent_tree: u64,
-) -> Result<Vec<(u64, u64)>, FsError> {
-    let mut cursor = Cursor::seek(vol, extent_tree, &BtrfsKey::new(0, 0, 0)).await?;
+    bg_tree: u64,
+) -> Result<Vec<(u64, u64, u64)>, FsError> {
+    // BLOCK_GROUP_ITEM: used@0, chunk_objectid@8, flags@16.
     let mut out = Vec::new();
-    while let Some((key, body)) = cursor.current()? {
-        // BLOCK_GROUP_ITEM: used@0, chunk_objectid@8, flags@16.
-        if key.item_type == format::BLOCK_GROUP_ITEM_KEY
-            && body.len() >= 24
-            && format::le64(body, 16)? & format::BLOCK_GROUP_SYSTEM != 0
-        {
-            out.push((key.objectid, key.offset));
-        }
-        cursor.advance().await?;
+    for (start, len, body) in block_group::read_block_groups(vol, bg_tree).await? {
+        out.push((start, len, format::le64(&body, 16)?));
     }
     Ok(out)
 }
@@ -165,7 +158,12 @@ pub(crate) fn subtract_pinned(free: Vec<(u64, u64)>, pinned: &[(u64, u64)]) -> V
 pub enum Allocator {
     /// Carve from the free-space tree's free extents (sorted by start). Reused
     /// space comes first, so the tail free run is consumed only when needed.
-    Reclaim { ranges: Vec<(u64, u64)> },
+    /// Each range carries its block group's type flags: a data extent is
+    /// carved only from a DATA group and a tree block only from a METADATA
+    /// group (mixed groups carry both bits), as Linux `find_free_extent`
+    /// restricts each allocation to space_info of its type. SYSTEM groups
+    /// (reserved for the chunk tree) are never offered.
+    Reclaim { ranges: Vec<(u64, u64, u64)> },
     /// Append past the extent-tree high-water (no free-space tree present).
     Bump { next: u64 },
 }
@@ -181,35 +179,43 @@ impl Allocator {
         if let Ok((fst_root, _)) =
             roots::find_root(vol, root_tree, format::FREE_SPACE_TREE_OBJECTID).await
         {
-            // Reclaim from every free extent except those in a system block group
-            // (reserved for the chunk tree).
-            let sys = read_system_block_groups(vol, ext).await?;
-            let mut ranges: Vec<(u64, u64)> = read_free_extents(vol, fst_root)
-                .await?
-                .into_iter()
-                .filter(|&(start, _)| {
-                    !sys.iter()
-                        .any(|&(s, l)| start >= s && start < s.saturating_add(l))
-                })
-                .collect();
+            // Reclaim from every free extent, tagged with its block group's
+            // type; system block groups (reserved for the chunk tree) drop out.
+            let bg_tree = block_group::bg_home(vol, root_tree).await?.scan_root(ext);
+            let groups = read_block_group_types(vol, bg_tree).await?;
+            let mut ranges: Vec<(u64, u64)> = read_free_extents(vol, fst_root).await?;
             ranges.sort_unstable();
             // Withhold anything the in-flight transaction freed. A pinned
             // range can fall in the middle of a free one, so this subtracts
             // rather than filters — keeping the surviving fragments usable
             // instead of discarding a whole free extent.
-            let ranges = subtract_pinned(ranges, &vol.pinned_ranges());
+            let ranges = subtract_pinned(ranges, &vol.pinned_ranges())
+                .into_iter()
+                .filter_map(|(start, len)| {
+                    groups
+                        .iter()
+                        .find(|&&(s, l, _)| start >= s && start < s.saturating_add(l))
+                        .map(|&(_, _, flags)| (start, len, flags))
+                })
+                .filter(|&(_, _, flags)| {
+                    flags & format::BLOCK_GROUP_SYSTEM == 0
+                        && flags & (format::BLOCK_GROUP_DATA | format::BLOCK_GROUP_METADATA) != 0
+                })
+                .collect();
             return Ok(Allocator::Reclaim { ranges });
         }
         let hw = extent_high_water(vol, ext).await?.max(vol.alloc_floor());
         Ok(Allocator::Bump { next: hw })
     }
 
-    /// Allocate `len` bytes aligned to `align`.
+    /// Allocate `len` bytes aligned to `align` from a block group whose flags
+    /// include `kind` (`BLOCK_GROUP_DATA` or `BLOCK_GROUP_METADATA`).
     fn alloc<B: BlockDevice + 'static>(
         &mut self,
         vol: &BtrfsVolume<B>,
         len: u64,
         align: u64,
+        kind: u64,
     ) -> Result<u64, FsError> {
         let size = align_up(len, align).max(align);
         match self {
@@ -218,17 +224,20 @@ impl Allocator {
             // range is physically contiguous by construction.
             Allocator::Reclaim { ranges } => {
                 for i in 0..ranges.len() {
-                    let (rs, rl) = ranges[i];
+                    let (rs, rl, flags) = ranges[i];
+                    if flags & kind == 0 {
+                        continue;
+                    }
                     let start = align_up(rs, align);
                     let end = start + size;
                     if end <= rs + rl {
                         // Replace the extent with its front pad and tail remainder.
-                        let mut repl: Vec<(u64, u64)> = Vec::new();
+                        let mut repl: Vec<(u64, u64, u64)> = Vec::new();
                         if start > rs {
-                            repl.push((rs, start - rs));
+                            repl.push((rs, start - rs, flags));
                         }
                         if end < rs + rl {
-                            repl.push((end, rs + rl - end));
+                            repl.push((end, rs + rl - end, flags));
                         }
                         ranges.splice(i..=i, repl);
                         return Ok(start);
@@ -260,7 +269,7 @@ impl Allocator {
         vol: &BtrfsVolume<B>,
     ) -> Result<u64, FsError> {
         let n = vol.nodesize() as u64;
-        self.alloc(vol, n, n)
+        self.alloc(vol, n, n, format::BLOCK_GROUP_METADATA)
     }
 
     /// Allocate a data extent of `len` bytes (sector-aligned).
@@ -270,7 +279,7 @@ impl Allocator {
         len: u64,
     ) -> Result<u64, FsError> {
         let s = u64::from(vol.sectorsize());
-        self.alloc(vol, len, s)
+        self.alloc(vol, len, s, format::BLOCK_GROUP_DATA)
     }
 
     /// Snapshot the allocator's free state so the commit's metadata fixed point

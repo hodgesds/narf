@@ -705,3 +705,30 @@ kernel_test_in!(
     "filesystem/devfs_block",
     smoke_devfs_disk_by_uuid_symlink_roundtrip
 );
+
+// ── mount(2) block sources: registry names behind /dev/ paths ─────────
+
+fn smoke_block_source_name_resolves_dev_paths() -> TestResult {
+    use crate::fs_registry::block_source_name;
+    let snap = narf_block::registry::__snapshot_for_test();
+    narf_block::registry::register_block_device("narfsrcp9", FakeBlockDevice::new(8, 512));
+    // The bare name, its /dev/ path, and the chrooted /mnt/dev/ path that
+    // mount(8) passes from systemd's root all name the device; a deeper
+    // path does not.
+    let ok = ["narfsrcp9", "/dev/narfsrcp9", "/mnt/dev/narfsrcp9"]
+        .iter()
+        .all(|source| block_source_name(source) == Some("narfsrcp9"));
+    let nested = block_source_name("/dev/disk/narfsrcp9").is_none();
+    narf_block::registry::__restore_for_test(snap);
+    if !ok {
+        return TestResult::Fail("registered block source not resolved from its path");
+    }
+    if !nested {
+        return TestResult::Fail("only a direct child of a dev/ directory names a device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/devfs_block",
+    smoke_block_source_name_resolves_dev_paths
+);

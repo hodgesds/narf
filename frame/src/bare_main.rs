@@ -3513,6 +3513,28 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 "  root-mount: cmdline root= selector failed: {:?}",
                                 e
                             );
+                            // `narf.disks=root-ro|root-rw` boots exactly the
+                            // installed root or nothing: a refused designation
+                            // or a btrfs write-safety refusal must stop the
+                            // boot visibly, never degrade to another root.
+                            let policy = narf_block::disk_policy::policy();
+                            if policy.is_root_policy() {
+                                let rule = "  root-mount: ==========================================================";
+                                let _ = writeln!(console::Writer, "{rule}");
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  root-mount: narf.disks={} ROOT MOUNT FAILED: {:?}; NOT falling back",
+                                    policy.as_str(),
+                                    e
+                                );
+                                if let Some(why) = narf_drivers_fs_btrfs::rw_gate::last_refusal() {
+                                    let _ = writeln!(console::Writer, "  root-mount: {why}");
+                                }
+                                let _ = writeln!(console::Writer, "{rule}");
+                                return narf_init::InitResult::Error(
+                                    "narf.disks root policy: installed root not mounted",
+                                );
+                            }
                             // Fall through to initramfs/walk fallbacks
                             // so a typoed root= still boots into a shell
                             // rather than panicking the kernel.
@@ -3558,6 +3580,21 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 }
                 narf_init::InitResult::NotPresent
             });
+
+            // Test vehicle for `cargo xtask btrfs-rootrw-interop`: systemd-
+            // and pacman-shaped writes on the mounted root, run only when the
+            // harness passes `narf.rootrw_interop=<mode>` together with
+            // `narf.disks=root-rw` against its own disposable image (the
+            // workload refuses any other root). Inert otherwise.
+            narf_init::register_with_budget(
+                narf_init::Stage::Late,
+                "btrfs-rootrw-interop",
+                || match narf_boot::args().value("narf.rootrw_interop") {
+                    Some(mode) => narf_drivers_fs_btrfs::interop::run(mode),
+                    None => narf_init::InitResult::NotPresent,
+                },
+                300_000,
+            );
 
             // Mount the UEFI EFI System Partition before PID 1 starts.  This
             // is selected from the GPT ESP type GUID, never from a volatile
