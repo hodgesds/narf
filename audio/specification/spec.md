@@ -11,8 +11,9 @@ The sound-card registry, PCM lifecycle, mixer and file bridge live in
 [drivers/sound](../../drivers/sound/specification/spec.md).
 Mixing, resampling and policy belong to a future userspace audio service.
 
-The implemented native profile is analog HDA plus ACP PDM. HDMI/DisplayPort
-audio, SoundWire codecs, vendor smart-amplifier fixups and DSP firmware
+The implemented native profile is analog HDA, LPCM HDMI/DisplayPort audio
+(stereo to 7.1) on AMD GPU HD-Audio, and ACP PDM. Compressed (non-PCM/HBR)
+HDMI passthrough, user channel maps, SoundWire codecs, vendor smart-amplifier fixups and DSP firmware
 execution are outside this profile. PCI identity alone does not establish
 which codec or amplifier a laptop contains.
 
@@ -71,6 +72,65 @@ Headphone presence disables speaker pins. Mixer controls expose master volume
 when the routed converters have output amplifiers, output enable/mute through
 pin controls, and headphone presence where supported. Gain never exceeds the
 codec's advertised 0 dB offset.
+
+AMD GPU HD-Audio functions (Linux's ATI HDMI NS IDs, `HDA_ATI_HDMI_NS_DEVICES`,
+through 0xab40) run without snoop as Linux's `AZX_DCAPS_SNOOP_OFF`: narf DMA
+memory is write-back, so the CPU-zeroed CORB/RIRB are written back before the
+controller owns them, CORB entries after queueing, RIRB entries invalidated
+before reading, and PCM rings write back their BDL/data at reset and after
+each playback write or retired-byte clear and invalidate before capture reads
+(`DmaBuffer::sync`). Their ATI HDMI codec (0x1002aa01) contributes every
+connected digital output pin as an output path; Linux's converter capability
+override (any rate, S16/S32, eight channels) replaces the PCM capability
+query. Setting up a playback stream follows atihdmi and Linux's generic HDMI
+prepare, at hw_params and again at prepare (so the IEC958 non-audio bit is
+taken at prepare, as Linux does): zero downmix, per-channel remap mode
+(revision 3+), the CEA channel allocation (a user channel map's
+`hdmi_manual_channel_allocation` for PCM, otherwise
+`hdmi_channel_allocation_spk_alloc_blk` for the channel count and the sink's
+ELD speaker allocation), converter channel count, the slot map (the user
+map's, stream order for non-PCM, else `hdmi_std_setup_channel_mapping`)
+written through the ATI slot verbs (pairs with FC/LFE swapped before
+revision 3), `SET_CHANNEL_ALLOCATION` (the hardware's Audio InfoFrame
+source), ramp rate 180 for PCM and 0 for non-PCM (revision 3+), HBR enabled
+exactly for eight-channel non-PCM (refused on a port without HBR
+capability), the converter's DIG1/DIG2 from the IEC958 state, then the
+stream format and tag. Non-PCM sets the TYPE bit in both the converter and
+the controller's SDnFMT (`snd_hdac_spdif_stream_format`). Playback offers
+stereo, 4, 6 and 8 channels up to the smallest channel ceiling among attached
+sinks, S32_LE only while every attached sink advertises 20/24-bit LPCM, and
+the 44.1–192 kHz rates every attached sink's SADs share
+(`snd_hdmi_eld_update_pcm_info`; 48 kHz if they share none, no 32 kHz); with
+no sink the converter's own limits apply. Analog codecs stay at 48 kHz.
+
+GPU codecs expose Linux's digital-output controls for the one playback PCM:
+`IEC958 Playback Con Mask`/`Pro Mask` (read-only), `IEC958 Playback Default`
+(`convert_from_spdif_status` into DIG1/DIG2 on every port's converter;
+setting AES0 non-audio selects IEC 61937 passthrough at the next prepare) and
+`IEC958 Playback Switch` (DIGEN). The state starts from the first converter's
+GET_DIGI_CONVERT_1 with DIGEN set, since no userspace hook is required to
+play. `Playback Channel Map` follows `hdmi_chmap_ctl_put`: ignored with no
+open stream, accepted while open, set up or prepared (applied at once to
+every routed port when prepared), EBUSY once running, EINVAL for positions
+past `SNDRV_CHMAP_LAST`, for maps no CA carries and (before revision 3) for
+maps that split a slot pair. Closing the stream clears it; after a prepare it
+reports the standard layout's map (`hdmi_setup_fake_chmap`). Its TLV lists the
+CAs the primary port's speakers cover (CHMAP_VAR, or CHMAP_PAIRED with N/A
+fillers before revision 3, where an odd layout is ENODEV as in Linux). The
+primary port is the first one with a valid ELD, the same port the ELD control
+reports; mirrored ports may differ in speaker allocation and CA. The ATI codec has no ELD buffer: narf rebuilds one as `get_eld_ati`
+does from the speaker allocation, sink info (revision 3+), audio descriptor
+and A/V delay verbs, and parses it as `snd_parse_eld`. Pin sense (presence
+and ELD-valid) is polled every 100 ms with the other jacks; the ELD is
+re-read only when the sense changes or the last read was unusable. A playback
+PCM routes to every port whose monitor has a valid ELD (mirroring, since a
+native card has one playback PCM), detaching the converters of the others; with
+none it routes to every port as Linux's static PCM mapping keeps pins
+attached. A port that gains a valid ELD while a stream is configured is set
+up again, as Linux update_eld does. The card exposes "HDMI/DP,pcm=0 Jack"
+(CARD interface) and "ELD" (PCM interface, volatile read-only bytes) and
+notifies subscribers when either changes. The display side (DCN Azalia
+endpoint, ACR, AFMT) is programmed by the amdgpu modeset.
 
 `hda::probe`, `register_pci_driver`, `controller`, `capture_card`,
 `play_buffer`, and the legacy codec/period helpers share this runtime.

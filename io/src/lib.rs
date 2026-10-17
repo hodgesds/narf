@@ -300,6 +300,21 @@ impl DmaBuffer {
         self.phys
     }
 
+    /// Write back and invalidate the CPU cache lines covering
+    /// `offset..offset + len` (clamped to the buffer), for a device that does
+    /// not snoop CPU caches: call it after CPU writes the device will read,
+    /// and before CPU reads of what the device wrote. Linux maps such buffers
+    /// uncached instead (e.g. HD-Audio's `AZX_DCAPS_SNOOP_OFF`); every
+    /// allocation here is write-back, so maintenance is explicit.
+    pub fn sync(&self, offset: usize, len: usize) {
+        let end = offset.saturating_add(len).min(self.len);
+        if offset >= end {
+            return;
+        }
+        let base = self.cpu_ptr::<u8>() as usize;
+        cache_clean_invalidate(base + offset, base + end);
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.len
@@ -389,6 +404,43 @@ impl Drop for DmaBuffer {
         if !self.freed {
             free_pages(PhysFrame::new(self.phys), self.order);
             self.freed = true;
+        }
+    }
+}
+
+/// Clean and invalidate every data-cache line touching `start..end`, then
+/// order the maintenance before later device-visible accesses.
+fn cache_clean_invalidate(start: usize, end: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // CLFLUSH is in the x86-64 baseline; lines are 64 bytes.
+        let mut line = start & !63;
+        // SAFETY: fences and CLFLUSH of the caller's mapped buffer lines.
+        unsafe {
+            core::arch::asm!("mfence", options(nostack, preserves_flags));
+            while line < end {
+                core::arch::asm!("clflush [{}]", in(reg) line, options(nostack, preserves_flags));
+                line += 64;
+            }
+            core::arch::asm!("mfence", options(nostack, preserves_flags));
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let ctr: u64;
+        // SAFETY: CTR_EL0 is readable at EL1.
+        unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
+        // DminLine: log2 of the smallest data-cache line in words.
+        let step = 4usize << ((ctr >> 16) & 0xf);
+        let mut line = start & !(step - 1);
+        // SAFETY: DC CIVAC of the caller's mapped buffer lines, then DSB.
+        unsafe {
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            while line < end {
+                core::arch::asm!("dc civac, {}", in(reg) line, options(nostack, preserves_flags));
+                line += step;
+            }
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
         }
     }
 }

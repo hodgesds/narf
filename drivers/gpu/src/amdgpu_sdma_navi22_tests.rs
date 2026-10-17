@@ -21,6 +21,7 @@ struct Fake {
     fence_only: bool,
     progress: Arc<AtomicU32>,
     revoke: Option<(u64, u32, Cap<BusDeviceCap, Write>)>,
+    traps: Vec<u32>,
 }
 impl Fake {
     // Minimal independent decoder of the public Navi10 SDMA packet ABI.
@@ -36,7 +37,7 @@ impl Fake {
             assert_eq!(address % 4, 0);
             ((address - 0xb_0000_0000) / 4) as usize
         };
-        let mut cursor = 0;
+        let mut cursor = *self.regs.get(&(GC + 0x83 * 4)).unwrap_or(&0) as usize / 4;
         while cursor < end as usize / 4 {
             let words = &self.memory[cursor..];
             cursor += match words[0] {
@@ -60,6 +61,11 @@ impl Fake {
                     self.target[dst] = words[3];
                     4
                 }
+                6 => {
+                    assert_eq!(self.regs[&(GC + 0x1c * 4)] & 1, 1, "trap disabled");
+                    self.traps.push(words[1]);
+                    2
+                }
                 _ => panic!("incorrect SDMA header"),
             };
         }
@@ -75,6 +81,9 @@ impl Fake {
     }
 }
 impl Io for Fake {
+    async fn reset_delay(&mut self) {
+        narf_scheduler::yield_now().await;
+    }
     fn read(&mut self, address: u64) -> u32 {
         *self.regs.get(&address).unwrap_or(&0)
     }
@@ -156,6 +165,7 @@ fn fixture() -> (Pool, Engine<Fake>, gmc::Aperture, MmioRegion) {
             fence_only: false,
             progress: Arc::new(AtomicU32::new(0)),
             revoke: None,
+            traps: Vec::new(),
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -166,6 +176,7 @@ fn fixture() -> (Pool, Engine<Fake>, gmc::Aperture, MmioRegion) {
         memory: pool.reserve(BYTES).unwrap(),
         state: State::Prepared,
         proof: None,
+        trapped: false,
     };
     (
         pool,
@@ -400,4 +411,38 @@ fn sdma_navi22_layout_rejects_wrong_versions_and_bank_bounds() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/sdma-navi22",
     sdma_navi22_layout_rejects_wrong_versions_and_bank_bounds
+);
+fn sdma_navi22_trap_enables_interrupt_once_after_verified_start() -> TestResult {
+    let (pool, mut engine, aperture, target) = fixture();
+    if run(engine.trap(0x22)) != Err(Error::Busy) || !engine.io.writes.is_empty() {
+        return TestResult::Fail("trap before verified start");
+    }
+    run(engine.initialize(aperture, target)).unwrap();
+    if run(engine.trap(0xf675_0022)) != Ok(())
+        || engine.io.traps != [0x0675_0022]
+        || engine.io.regs[&(GC + 0x83 * 4)] != 192
+        || engine.io.regs[&(GC + 0x1c * 4)] & 1 != 1
+        || engine.state != State::Verified
+    {
+        return TestResult::Fail("trap packet, context mask or enable");
+    }
+    let count = engine.io.writes.len();
+    if run(engine.trap(1)) != Err(Error::Busy) || engine.io.writes.len() != count {
+        return TestResult::Fail("trap replayed");
+    }
+    let (_pool2, mut stalled, aperture, target) = fixture();
+    run(stalled.initialize(aperture, target)).unwrap();
+    stalled.io.complete = false;
+    if run(stalled.trap(1)) != Err(Error::Timeout) || stalled.state != State::Failed {
+        return TestResult::Fail("stalled trap accepted");
+    }
+    drop(engine);
+    if pool.available() != 0 {
+        return TestResult::Fail("ring recycled after trap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/sdma-navi22",
+    sdma_navi22_trap_enables_interrupt_once_after_verified_start
 );

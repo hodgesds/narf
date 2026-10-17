@@ -182,7 +182,7 @@ fn navi22_rom_bank_is_selected_before_hardware_access() -> TestResult {
     let cap = Cap::bootstrap();
     cap.revoke();
     // SAFETY: revoked authority rejects before touching the null MMIO mapping.
-    if unsafe { read_navi22(&gpu, &device, &cap) }.err() != Some(Error::Revoked) {
+    if unsafe { read_discrete(&gpu, &device, &cap) }.err() != Some(Error::Revoked) {
         return TestResult::Fail("ROM backend bypassed live PCI invocation");
     }
     gpu.ip_blocks[2].revision = 6;
@@ -199,4 +199,69 @@ fn navi22_rom_bank_is_selected_before_hardware_access() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/vbios",
     navi22_rom_bank_is_selected_before_hardware_access
+);
+
+fn navi48_rom_profile_and_snapshot_are_independent_of_navi22() -> TestResult {
+    use crate::{amdgpu, amdgpu_discovery as ip};
+    let (mut device, mut io) = fixture();
+    device.id.device = amdgpu::NAVI48;
+    io.bytes[0x186..0x188].copy_from_slice(&0x7550u16.to_le_bytes());
+    let cap = Cap::bootstrap();
+    let image = read(&mut io, &device, &cap).unwrap();
+    if image.bytes() != io.bytes || io.index != 0xdead_0000 {
+        return TestResult::Fail("Navi48 ROM snapshot identity or latch restoration");
+    }
+    let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+    gpu.chip = amdgpu::__test_chip_info_for_pci_id(0x1002, 0x7550).unwrap();
+    gpu.regs.len = 0x10000;
+    gpu.regs.virt = 0;
+    let template = gpu.ip_blocks[0];
+    gpu.ip_blocks = [
+        (ip::HW_ID_GC, 12, 0, 1),
+        (ip::HW_ID_NBIF, 7, 7, 0),
+        (ip::HW_ID_SMUIO, 14, 0, 2),
+    ]
+    .iter()
+    .map(|&(hw_id, major, minor, revision)| ip::IpBlock {
+        hw_id,
+        major,
+        minor,
+        revision,
+        base_addrs: [0x1000, 0, 0, 0, 0],
+        num_bases: 1,
+        ..template
+    })
+    .collect();
+    if bank(&gpu, &device) != Ok(0x4000) {
+        return TestResult::Fail("SMUIO14 ROM base index/offset");
+    }
+    cap.revoke();
+    // SAFETY: revoked authority must reject before dereferencing the null map.
+    if unsafe { read_discrete(&gpu, &device, &cap) }.err() != Some(Error::Revoked) {
+        return TestResult::Fail("Navi48 ROM ignored live authority");
+    }
+    let good = gpu.ip_blocks.clone();
+    for case in 0..7 {
+        gpu.ip_blocks = good.clone();
+        gpu.regs.len = 0x10000;
+        match case {
+            0 => gpu.ip_blocks[0].revision = 0,
+            1 => gpu.ip_blocks[1].major = 3,
+            2 => gpu.ip_blocks[2].major = 11,
+            3 => gpu.ip_blocks[2].revision = 3,
+            4 => gpu.ip_blocks.push(gpu.ip_blocks[2]),
+            5 => gpu.ip_blocks[2].num_bases = 0,
+            _ => gpu.regs.len = 0x4000 + 0xe5 * 4 + 3,
+        }
+        if bank(&gpu, &device).is_ok() {
+            return TestResult::Fail(
+                "Navi48 ROM admitted ambiguous, unsupported or truncated bank",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vbios",
+    navi48_rom_profile_and_snapshot_are_independent_of_navi22
 );

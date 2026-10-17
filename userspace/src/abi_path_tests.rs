@@ -245,8 +245,8 @@ fn smoke_abi_path_os_release_symlink_chase_and_follow() -> TestResult {
         if call(Syscall::Fstat.raw(), a1(lfd, sb.as_mut_ptr() as u64)) != Some(0) {
             return Err("fstat of the O_NOFOLLOW|O_PATH fd failed");
         }
-        // st_mode at offset 24; S_IFMT=0o170000, S_IFLNK=0o120000.
-        let lmode = u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]);
+        // S_IFMT=0o170000, S_IFLNK=0o120000.
+        let lmode = stat_mode(&sb);
         if lmode & 0o170000 != 0o120000 {
             return Err("O_NOFOLLOW|O_PATH fd must fstat as S_IFLNK (the link, not its target)");
         }
@@ -278,7 +278,7 @@ fn smoke_abi_path_os_release_symlink_chase_and_follow() -> TestResult {
         if call(Syscall::Fstat.raw(), a1(ffd, fsb.as_mut_ptr() as u64)) != Some(0) {
             return Err("fstat of the followed fd failed");
         }
-        let fmode = u32::from_ne_bytes([fsb[24], fsb[25], fsb[26], fsb[27]]);
+        let fmode = stat_mode(&fsb);
         if fmode & 0o170000 != 0o100000 {
             return Err("symlink-followed fd must fstat as S_IFREG, not a directory");
         }
@@ -888,8 +888,8 @@ fn smoke_abi_path_mknodat_fifo_honors_mode() -> TestResult {
         if call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
             return Err("stat of the new FIFO should return 0");
         }
-        // st_mode is at offset 24; S_IFMT=0o170000, S_IFIFO=0o010000.
-        let mode = u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]);
+        // S_IFMT=0o170000, S_IFIFO=0o010000.
+        let mode = stat_mode(&sb);
         if mode & 0o170000 != 0o010000 {
             return Err("mknodat(S_IFIFO) node must stat as a FIFO");
         }
@@ -1081,7 +1081,7 @@ fn smoke_abi_path_mknod_legacy_alias() -> TestResult {
         if call_lstat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
             return Err("legacy mknod result should be reachable by lstat");
         }
-        let mode = u32::from_ne_bytes(sb[24..28].try_into().unwrap()) as u64;
+        let mode = u64::from(stat_mode(&sb));
         // The umask applies to mknod like any other create. For a POSIX-ACL
         // filesystem `mode_strip_umask` defers it rather than skipping it —
         // "umask stripping is deferred until the filesystem calls
@@ -1172,9 +1172,8 @@ fn smoke_abi_path_stat_mount_ancestor_is_dir() -> TestResult {
         if call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
             return Err("stat on a mount-ancestor dir should return 0, not ENOENT");
         }
-        // st_mode is at offset 24 in the x86_64/aarch64 struct stat;
         // S_IFMT=0o170000, S_IFDIR=0o40000.
-        let mode = u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]);
+        let mode = stat_mode(&sb);
         if mode & 0o170000 == 0o40000 {
             Ok(())
         } else {
@@ -1806,8 +1805,7 @@ fn smoke_abi_path_chmod_file_mode_roundtrips() -> TestResult {
         if call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
             return Err("stat(/run/cfg) should return 0");
         }
-        // st_mode is at offset 24 in the x86_64/aarch64 struct stat.
-        let mode = u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]);
+        let mode = stat_mode(&sb);
         if mode & 0o777 == 0o640 {
             Ok(())
         } else {
@@ -1834,8 +1832,8 @@ fn smoke_abi_path_chmod_dir_mode_roundtrips() -> TestResult {
         if call_stat(dir.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
             return Err("stat(/run/lock) should return 0");
         }
-        // st_mode at offset 24: S_IFMT=0o170000, S_IFDIR=0o40000.
-        let mode = u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]);
+        // S_IFMT=0o170000, S_IFDIR=0o40000.
+        let mode = stat_mode(&sb);
         if mode & 0o170000 != 0o40000 {
             return Err("chmod'd dir must still stat as S_IFDIR");
         }
@@ -1874,7 +1872,7 @@ fn smoke_abi_path_symlink_stats_as_link() -> TestResult {
             return Err("lstat(/run/ln) should return 0");
         }
         // S_IFLNK = 0o120000.
-        let mode = u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]);
+        let mode = stat_mode(&sb);
         if mode & 0o170000 == 0o120000 {
             Ok(())
         } else {

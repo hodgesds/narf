@@ -16,7 +16,11 @@
 
 ## Distilled summaries
 
-- (Defer.)
+- [Navi48 display acceptance](navi48-display-acceptance.md) — board/route
+  inventory, physical run matrix and required artifacts; no physical passes yet.
+- [Navi48 protected-output requirements](navi48-protected-output.md) — separate
+  firmware, protocol, authorization and validation gates; HDCP remains unsupported
+  and unadvertised.
 
 ## Open research questions
 

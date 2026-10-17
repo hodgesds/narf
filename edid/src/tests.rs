@@ -614,3 +614,79 @@ fn smoke_displayid_unknown_block_kept_opaque() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("edid/displayid", smoke_displayid_unknown_block_kept_opaque);
+
+fn edid_mode_tables_follow_linux() -> TestResult {
+    use crate::modes::{cea_mode, established_modes, find_dmt, standard_mode};
+    // VIC 16: 1920x1080p60, 148.5 MHz; VIC 5 is interlaced; VIC 97 is 4K60.
+    let m = cea_mode(16).unwrap();
+    if (m.clock_khz, m.h, m.v, m.refresh_hz())
+        != (
+            148_500,
+            [1920, 2008, 2052, 2200],
+            [1080, 1084, 1089, 1125],
+            60,
+        )
+        || !cea_mode(5).unwrap().interlaced()
+        || cea_mode(97).map(|m| (m.clock_khz, m.h[0])) != Some((594_000, 3840))
+        || cea_mode(128).is_some()
+        || cea_mode(0).is_some()
+        || cea_mode(219).map(|m| m.h[0]) != Some(4096)
+        || cea_mode(220).is_some()
+    {
+        return TestResult::Fail("VIC table");
+    }
+    let d = m.detailed();
+    if (
+        d.h_blanking,
+        d.h_sync_offset,
+        d.h_sync_width,
+        d.v_sync_offset,
+        d.v_sync_width,
+    ) != (280, 88, 44, 4, 5)
+        || !d.h_sync_positive
+    {
+        return TestResult::Fail("VIC as a detailed timing");
+    }
+    // Established timings: byte 35 bit 0 is 800x600@60, bit 5 640x480@60.
+    let est: Vec<_> = established_modes(0x21, 0, 0)
+        .map(|m| (m.h[0], m.refresh_hz()))
+        .collect();
+    if est != [(800, 60), (640, 60)] {
+        return TestResult::Fail("established bit order");
+    }
+    // Standard timing 1280x1024@60 (5:4) is DMT 0x23, 108 MHz.
+    if standard_mode(0x81, 0x80, 4).map(|m| m.clock_khz) != Some(108_000)
+        || standard_mode(1, 1, 4).is_some()
+        || standard_mode(0xd1, 0xc0, 4).map(|m| (m.h[0], m.v[0])) != Some((1920, 1080))
+        || find_dmt(1920, 1200, 60, true).map(|m| m.clock_khz) != Some(154_000)
+    {
+        return TestResult::Fail("standard timings through DMT");
+    }
+    // svd_to_vic: only 1..=64 and 129..=192 carry the native flag.
+    use crate::cta861::ShortVideoDescriptor as Svd;
+    if Svd::parse(0x80 | 16)
+        != (Svd {
+            vic: 16,
+            native: true,
+        })
+        || Svd::parse(97)
+            != (Svd {
+                vic: 97,
+                native: false,
+            })
+        || Svd::parse(193)
+            != (Svd {
+                vic: 193,
+                native: false,
+            })
+        || Svd::parse(0xff)
+            != (Svd {
+                vic: 255,
+                native: false,
+            })
+    {
+        return TestResult::Fail("SVD to VIC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("edid", edid_mode_tables_follow_linux);

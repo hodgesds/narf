@@ -129,6 +129,20 @@ A read of a device that has fallen off the bus returns `0xFFFF_FFFF`,
 the same as the raw ECAM read; callers that need to distinguish that
 from a real all-ones value must check liveness another way.
 
+```rust
+pub fn pci::write_config32(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+    offset: u16,
+    value: u32,
+) -> Result<(), PciError>;
+```
+
+Writes one dword with the same offset rules. It exists for state that
+`pci::restore_config` does not cover after a device-level reset: PCIe
+capability control words and extended capabilities such as Resizable
+BAR. Callers write zero into RW1C status halves sharing the dword.
+
 ### 3.5 Hot-plug
 
 ```rust

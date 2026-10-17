@@ -1,4 +1,4 @@
-//! Board routing for Navi22/DCN3.0 and Phoenix/DCN3.1.4, plus the APU memory
+//! Board routing for Navi22/DCN3.0, Phoenix/DCN3.1.4 and Navi48/DCN4.0.1, plus the APU memory
 //! and reference-clock inventory. AUX, HPD and transmitter identities are
 //! independently decoded from connector records and the GPIO pin LUT.
 //!
@@ -11,7 +11,9 @@
 //!
 //! Table layouts follow `atomfirmware.h`
 //! (`atom_display_controller_info_v4_*`, `atom_integrated_system_info_v2_*`,
-//! `display_object_info_table_v1_4`) and `displayobject.h`; the transmitter
+//! `display_object_info_table_v1_4`). Object ids use `ObjectID.h`, the values
+//! Linux's `bios_parser_common.c` decodes these tables with (never the
+//! unused `displayobject.h` numbering); the transmitter
 //! mapping follows Linux `link_factory.c::translate_encoder_to_transmitter` and
 //! the VCO read follows `dcn314_clk_mgr.c::get_vco_frequency_from_reg`.
 use crate::{
@@ -36,7 +38,7 @@ const TABLE_INTEGRATED_SYSTEM_INFO: u16 = 30;
 /// four-byte common header plus `supporteddevices` and `number_of_path`.
 const PATH_SIZE: usize = 16;
 const PATHS_OFFSET: usize = 8;
-/// `displayobject.h` object-id encoding.
+/// `ObjectID.h` object-id encoding.
 const OBJECT_ID_MASK: u16 = 0x00ff;
 const ENUM_ID_SHIFT: u32 = 8;
 const ENUM_ID_MASK: u16 = 0x0f00;
@@ -49,6 +51,7 @@ const TYPE_CONNECTOR: u16 = 0x03;
 const RECORD_HEADER: usize = 2;
 const RECORD_I2C: u8 = 1;
 const RECORD_HPD_INT: u8 = 2;
+const RECORD_CONNECTOR_SPEED: u8 = 4;
 const RECORD_END: u8 = 0xff;
 /// A connector's record list is short; this only bounds a malformed one.
 const MAX_RECORDS: usize = 64;
@@ -65,6 +68,72 @@ const HPD_SHIFTS: [u8; 6] = [0, 8, 16, 24, 26, 28];
 /// says the backend is already driving a link.
 const DIG_BE_EN_CNTL: u64 = 0x20b2;
 const DIG_STRIDE: u64 = 0x100;
+
+/// Routing compatibility does not grant access to DCN3 plane/timing methods.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Routing {
+    Legacy(Profile),
+    Navi48,
+}
+impl From<Profile> for Routing {
+    fn from(profile: Profile) -> Self {
+        Self::Legacy(profile)
+    }
+}
+impl Routing {
+    fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
+        if gpu.chip.vid == crate::amdgpu::AMD_VENDOR && gpu.chip.did == crate::amdgpu::NAVI48 {
+            crate::amdgpu_psp_ring::bank(
+                gpu,
+                crate::amdgpu_discovery::HW_ID_GC,
+                &[(12, 0, 1)],
+                0,
+                0,
+            )
+            .map_err(|_| Error::Unsupported)?;
+            Self::Navi48.bank(gpu, GPIO_HPD_A)?;
+            Ok(Self::Navi48)
+        } else {
+            Profile::resolve(gpu)
+                .map(Self::Legacy)
+                .map_err(|_| Error::Unsupported)
+        }
+    }
+    fn streams(self) -> u8 {
+        match self {
+            Self::Legacy(p) => p.streams(),
+            Self::Navi48 => 4,
+        }
+    }
+    fn hpd_count(self) -> u8 {
+        if self == Self::Navi48 {
+            4
+        } else {
+            6
+        }
+    }
+    fn bank(self, gpu: &AmdGpu, last: u32) -> Result<u64, Error> {
+        match self {
+            Self::Legacy(p) => p.bank(gpu, 2, last).map_err(|_| Error::Unsupported),
+            Self::Navi48 => crate::amdgpu_psp_ring::bank(
+                gpu,
+                crate::amdgpu_discovery::HW_ID_DCN,
+                &[(4, 0, 1), (4, 1, 0)],
+                2,
+                last,
+            )
+            .map_err(|_| Error::Unsupported),
+        }
+    }
+    fn backend(self) -> (u64, u64) {
+        match self {
+            Self::Legacy(Profile::Navi22) => (DIG_BE_EN_CNTL - 1, DIG_STRIDE),
+            Self::Legacy(Profile::Dcn314) => (DIG_BE_EN_CNTL, DIG_STRIDE),
+            // dcn_4_1_0_offset.h DIG0..3_DIG_BE_EN_CNTL.
+            Self::Navi48 => (0x20bd, 0x124),
+        }
+    }
+}
 /// `atom_dmi_t17_mem_type_def`: DDR5 is 34 and LPDDR5 is 35.
 const MEM_TYPE_DDR5: u8 = 34;
 const MEM_TYPE_LPDDR5: u8 = 35;
@@ -72,8 +141,10 @@ const MEM_TYPE_LPDDR5: u8 = 35;
 const DDR5_CHANNEL_WIDTH_BYTES: u32 = 8;
 const LPDDR5_CHANNEL_WIDTH_BYTES: u32 = 4;
 /// `atom_display_controller_info_v4_*` places `dce_refclk_10khz` here, in every
-/// content revision from 4.1 to 4.4.
+/// content revision from 4.1 to 4.5.
 const DCE_REFCLK_OFFSET: usize = 12;
+const DCE_DISPLAY_CAPS_OFFSET: usize = 4;
+const DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE: u32 = 0x20;
 /// `atom_integrated_system_info_v2_*` field offsets, the same in v2.1 and v2.2.
 const MEMORY_TYPE_OFFSET: usize = 26;
 const CHANNEL_COUNT_OFFSET: usize = 27;
@@ -120,13 +191,18 @@ pub struct Path {
     /// One-based instance from the object's enum id, as the table encodes it.
     pub connector_instance: u8,
     pub transmitter: u8,
-    /// Hardware AUX channel resolved from the I2C record and GPIO LUT.
-    /// None means the board supplies no usable native AUX route.
+    /// Physical DDC/AUX channel resolved from the I2C record and GPIO LUT.
+    /// DP uses AUX, HDMI uses native I2C on these pins. None means no usable route.
     pub aux: Option<u8>,
     /// One-based ATOM HPD selector from the connector's record list, or zero
     /// when the board declares none for this connector.
     pub hpd: u8,
     pub device_tag: u16,
+    /// ATOM_CONNECTOR_SPEED_UPTO's connector_max_speed in MHz, zero when the
+    /// board declares none: the source's DP rate ceiling (UHBR10 from 10000,
+    /// UHBR13.5 from 13500, UHBR20 from 20000; Linux's
+    /// bios_parser_get_connector_speed_cap_info).
+    pub max_speed_mhz: u32,
 }
 
 fn u16_at(bytes: &[u8], offset: usize) -> u16 {
@@ -171,17 +247,19 @@ fn transmitter(encoder_objid: u16) -> Result<u8, Error> {
         return Err(Error::Unsupported);
     }
     let enum_id = (encoder_objid & ENUM_ID_MASK) >> ENUM_ID_SHIFT;
-    // UNIPHY is 1, UNIPHY1 is 2, UNIPHY2 is 3; each pairs two transmitters.
-    let pair = match encoder_objid & OBJECT_ID_MASK {
-        1 => 0,
-        2 => 1,
-        3 => 2,
+    // UNIPHY (0x1e), UNIPHY1 (0x20) and UNIPHY2 (0x21) each pair two
+    // transmitters; UNIPHY3 (0x25) carries only G.
+    let (pair, enums) = match encoder_objid & OBJECT_ID_MASK {
+        0x1e => (0, 2),
+        0x20 => (1, 2),
+        0x21 => (2, 2),
+        0x25 => (3, 1),
         _ => return Err(Error::Unsupported),
     };
-    match enum_id {
-        1 | 2 => Ok(pair * 2 + (enum_id as u8 - 1)),
-        _ => Err(Error::Unsupported),
+    if !(1..=enums).contains(&enum_id) {
+        return Err(Error::Unsupported);
     }
+    Ok(pair * 2 + (enum_id as u8 - 1))
 }
 fn connector(objid: u16) -> Result<(Connector, u8), Error> {
     if (objid & OBJECT_TYPE_MASK) >> OBJECT_TYPE_SHIFT != TYPE_CONNECTOR {
@@ -192,9 +270,9 @@ fn connector(objid: u16) -> Result<(Connector, u8), Error> {
         return Err(Error::Invalid);
     }
     let kind = match (objid & OBJECT_ID_MASK) as u8 {
-        0x03 => Connector::HdmiTypeA,
-        0x05 => Connector::DisplayPort,
-        0x06 => Connector::EmbeddedDisplayPort,
+        0x0c => Connector::HdmiTypeA,
+        0x13 => Connector::DisplayPort,
+        0x14 => Connector::EmbeddedDisplayPort,
         other => Connector::Other(other),
     };
     Ok((kind, instance))
@@ -207,6 +285,8 @@ fn connector(objid: u16) -> Result<(Connector, u8), Error> {
 struct Wiring {
     i2c: Option<u8>,
     hpd: Option<u8>,
+    /// The first connector-speed record's MHz (Linux takes the first).
+    speed: Option<u32>,
 }
 fn wiring(vbios: &[u8], base: usize, offset: u16, paths_end: usize) -> Result<Wiring, Error> {
     let mut result = Wiring::default();
@@ -229,6 +309,10 @@ fn wiring(vbios: &[u8], base: usize, offset: u16, paths_end: usize) -> Result<Wi
             return Err(Error::Invalid);
         }
         let record = vbios.get(at..at + size).ok_or(Error::Invalid)?;
+        // atom_connector_speed_record: header, u32 MHz, u16 reserved.
+        if head[0] == RECORD_CONNECTOR_SPEED && size >= 8 && result.speed.is_none() {
+            result.speed = Some(u32::from_le_bytes(record[2..6].try_into().unwrap()));
+        }
         let field = match head[0] {
             RECORD_I2C => Some(&mut result.i2c),
             RECORD_HPD_INT => Some(&mut result.hpd),
@@ -281,20 +365,21 @@ fn hpd_selector(vbios: &[u8], uid: u8, dcn: u32) -> Result<u8, Error> {
         .ok_or(Error::Unsupported)
 }
 
-/// Walk `display_object_info_table_v1_4`. Paths whose encoder or connector this
+/// Walk `display_object_info_table_v1_4/v1_5`. Paths whose encoder or connector this
 /// does not understand are skipped rather than failing the whole table: a board
 /// may wire something alongside the DisplayPort connectors we care about.
 pub fn display_paths(gpu: &AmdGpu, vbios: &[u8]) -> Result<Vec<Path>, Error> {
-    let profile = Profile::resolve(gpu).map_err(|_| Error::Unsupported)?;
-    let dcn = profile
-        .bank(gpu, 2, GPIO_HPD_A)
-        .map_err(|_| Error::Unsupported)?
-        / 4;
-    display_paths_at(
+    let profile = Routing::resolve(gpu)?;
+    let dcn = profile.bank(gpu, GPIO_HPD_A)? / 4;
+    let paths = display_paths_at(
         vbios,
         u32::try_from(dcn).map_err(|_| Error::Invalid)?,
         profile.streams(),
-    )
+    )?;
+    if paths.iter().any(|path| path.hpd > profile.hpd_count()) {
+        return Err(Error::Unsupported);
+    }
+    Ok(paths)
 }
 fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, Error> {
     let info = table(vbios, TABLE_DISPLAY_OBJECT_INFO)?;
@@ -303,7 +388,7 @@ fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, 
             .table_offset(TABLE_DISPLAY_OBJECT_INFO)
             .ok_or(Error::Missing)?,
     );
-    header(info, 1, &[4])?;
+    header(info, 1, &[4, 5])?;
     if info.len() < PATHS_OFFSET {
         return Err(Error::Invalid);
     }
@@ -324,7 +409,9 @@ fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, 
         };
         // An external encoder needs a separate bridge driver; the downstream
         // id cannot be treated as an on-chip transmitter.
-        if u16_at(entry, 6) != 0 || transmitter >= dig_count {
+        // v1.5 keeps the field positions but replaces extencoderobjid with a
+        // reserved USB-C field. It no longer describes an external encoder.
+        if (info[3] == 4 && u16_at(entry, 6) != 0) || transmitter >= dig_count {
             continue;
         }
         let pins = wiring(
@@ -349,6 +436,7 @@ fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, 
             aux,
             hpd,
             device_tag: u16_at(entry, 12),
+            max_speed_mhz: pins.speed.unwrap_or(0),
         });
     }
     if paths.is_empty() {
@@ -363,12 +451,29 @@ fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, 
 /// documented reference rather than a guess at this board's wiring.
 pub fn dchub_refclk_khz(vbios: &[u8]) -> Result<u32, Error> {
     let info = table(vbios, TABLE_DCE_INFO)?;
-    header(info, 4, &[1, 2, 3, 4])?;
+    header(info, 4, &[1, 2, 3, 4, 5])?;
     if (u16_at(info, 0) as usize) < DCE_REFCLK_OFFSET + 2 {
         return Err(Error::Invalid);
     }
     let refclk = u16_at(info, DCE_REFCLK_OFFSET) as u32 * 10;
     Ok(if refclk == 0 { 27_000 } else { refclk })
+}
+
+/// `atom_display_controller_info_v4_*.display_caps`
+/// DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE: the board wants DP repeaters
+/// (LTTPRs) trained hop by hop (non-transparent mode). Linux's DCN401 is
+/// always VBIOS-LTTPR-aware, so without the bit a present repeater is used
+/// in transparent mode (dp_decide_8b_10b_lttpr_mode); a missing or unknown
+/// table reads as the bit clear, as bios_get_lttpr_caps' failure does.
+pub fn lttpr_non_transparent(vbios: &[u8]) -> Result<bool, Error> {
+    let info = table(vbios, TABLE_DCE_INFO)?;
+    header(info, 4, &[1, 2, 3, 4, 5])?;
+    if (u16_at(info, 0) as usize) < DCE_DISPLAY_CAPS_OFFSET + 4 {
+        return Err(Error::Invalid);
+    }
+    let caps = u32::from(u16_at(info, DCE_DISPLAY_CAPS_OFFSET))
+        | u32::from(u16_at(info, DCE_DISPLAY_CAPS_OFFSET + 2)) << 16;
+    Ok(caps & DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE != 0)
 }
 
 /// The memory configuration, from `atom_integrated_system_info_v2_*` for the
@@ -415,19 +520,15 @@ pub fn routes_for_sink(
     sink: &crate::amdgpu_usbc::Sink,
     frontend: u8,
 ) -> Result<Vec<crate::amdgpu_dio::Route>, Error> {
-    routes_for_profile(
-        Profile::resolve(gpu).map_err(|_| Error::Unsupported)?,
-        paths,
-        sink,
-        frontend,
-    )
+    routes_for_profile(Routing::resolve(gpu)?, paths, sink, frontend)
 }
 fn routes_for_profile(
-    profile: Profile,
+    profile: impl Into<Routing>,
     paths: &[Path],
     sink: &crate::amdgpu_usbc::Sink,
     frontend: u8,
 ) -> Result<Vec<crate::amdgpu_dio::Route>, Error> {
+    let profile = profile.into();
     if frontend >= profile.streams() {
         return Err(Error::Invalid);
     }
@@ -452,7 +553,7 @@ fn routes_for_profile(
             {
                 return Err(Error::Invalid);
             }
-            if path.transmitter >= profile.streams() || path.hpd > 6 {
+            if path.transmitter >= profile.streams() || path.hpd > profile.hpd_count() {
                 return Err(Error::Invalid);
             }
             if !matches!(
@@ -471,7 +572,7 @@ fn routes_for_profile(
             });
         }
         crate::amdgpu_dmub::Channel::Dpia => {
-            if profile != Profile::Dcn314 {
+            if profile != Routing::Legacy(Profile::Dcn314) {
                 return Err(Error::Unsupported);
             }
             if sink.instance >= DPIA_COUNT {
@@ -523,21 +624,17 @@ pub unsafe fn transmitter_busy(
     authority: &Cap<BusDeviceCap, Write>,
     dig: u8,
 ) -> Result<bool, Error> {
-    let profile = Profile::resolve(gpu).map_err(|_| Error::Unsupported)?;
+    let profile = Routing::resolve(gpu)?;
     if dig >= profile.streams() {
         return Err(Error::Invalid);
     }
-    // DCN30 DIG_BE_EN_CNTL is one dword before Phoenix's register.
-    let enable = DIG_BE_EN_CNTL - u64::from(profile == Profile::Navi22);
-    let base = profile
-        .bank(
-            gpu,
-            2,
-            (enable + (u64::from(profile.streams()) - 1) * DIG_STRIDE) as u32,
-        )
-        .map_err(|_| Error::Unsupported)?;
+    let (enable, stride) = profile.backend();
+    let base = profile.bank(
+        gpu,
+        (enable + (u64::from(profile.streams()) - 1) * stride) as u32,
+    )?;
     let regs: MmioRegion = gpu.regs;
-    let offset = base + (enable + u64::from(dig) * DIG_STRIDE) * 4;
+    let offset = base + (enable + u64::from(dig) * stride) * 4;
     let value = authority
         .invoke(Op(|| {
             // SAFETY: the bank bounds every DIG instance.

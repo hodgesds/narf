@@ -647,6 +647,11 @@ pub struct ThreadStat {
     /// The outer pid of the thread's group (`task->tgid`), when the thread
     /// belongs to a process. Lets `/proc/<tid>` resolve a non-leader thread.
     pub tgid: Option<u64>,
+    /// The frame this thread is parked in, as in [`ProcSchedSnapshot`]:
+    /// `task/<tid>/syscall` reports the thread's own, not the leader's.
+    pub syscall: Option<[u64; 9]>,
+    /// The handler this thread is waiting in (`task/<tid>/wchan`).
+    pub wchan: Option<String>,
 }
 type ThreadStatFn = fn(u64) -> Option<ThreadStat>;
 
@@ -846,6 +851,21 @@ pub fn __test_sched_snapshot_hook_swap(f: Option<SchedSnapshotFn>) -> usize {
 #[doc(hidden)]
 pub fn __test_sched_snapshot_hook_restore(prev: usize) {
     SCHED_SNAPSHOT_HOOK.store(prev, Ordering::Release);
+}
+
+/// Test-only: swap the thread-stat hook slot; pair with
+/// [`__test_thread_stat_hook_restore`].
+#[doc(hidden)]
+pub fn __test_thread_stat_hook_swap(f: Option<ThreadStatFn>) -> usize {
+    let prev = THREAD_STAT_HOOK.load(Ordering::Acquire);
+    THREAD_STAT_HOOK.store(f.map_or(0, |f| f as usize), Ordering::Release);
+    prev
+}
+
+/// Test-only counterpart to [`__test_thread_stat_hook_swap`].
+#[doc(hidden)]
+pub fn __test_thread_stat_hook_restore(prev: usize) {
+    THREAD_STAT_HOOK.store(prev, Ordering::Release);
 }
 
 /// Wire the writable per-pid procfs hooks. Called once at boot after

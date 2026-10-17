@@ -187,6 +187,13 @@ pub fn drain_and_render(fb: &FbWriter) {
     if !moved {
         return;
     }
+    // The adopted scanout's own cursor needs no snapshot or redraw.
+    if hardware_cursor(Some((
+        POS_X.load(Ordering::Relaxed),
+        POS_Y.load(Ordering::Relaxed),
+    ))) {
+        return;
+    }
     // Snapshot-restore-then-draw cycle. try_lock, NOT lock: the cursor is drawn
     // concurrently from many CPUs, so a blocking acquire thundering-herds SAVED
     // under load. If another CPU is mid-draw, skip — the next tick redraws (a
@@ -314,8 +321,45 @@ fn render_user_cursor(fb: &FbWriter) {
     }
 }
 
+/// The arrow as a premultiplied ARGB image for a hardware cursor: opaque
+/// white where the bitmap is set, fully transparent elsewhere.
+pub(crate) fn arrow_image() -> [u32; (ARROW_W * ARROW_H) as usize] {
+    let mut image = [0u32; (ARROW_W * ARROW_H) as usize];
+    for row in 0..ARROW_H {
+        for col in 0..ARROW_W {
+            if (ARROW_FILL[row as usize] >> col) & 1 != 0 {
+                image[(row * ARROW_W + col) as usize] = CURSOR_COLOUR.0;
+            }
+        }
+    }
+    image
+}
+
+/// Show or hide the pointer on the adopted scanout's hardware cursor, when
+/// its owner published one. True when handled: no software sprite may then
+/// be drawn into that surface.
+pub(crate) fn hardware_cursor(position: Option<(u32, u32)>) -> bool {
+    if !crate::adopted_external_scanout() {
+        return false;
+    }
+    let Some(cursor) = narf_drivers_gpu::amdgpu_dcn_display::active_scanout_cursor() else {
+        return false;
+    };
+    let image = arrow_image();
+    let at = position.map(|(x, y)| (x.min(i32::MAX as u32) as i32, y.min(i32::MAX as u32) as i32));
+    if cursor((ARROW_W, ARROW_H, &image), at) {
+        MOVES.fetch_add(1, Ordering::Release);
+        true
+    } else {
+        false
+    }
+}
+
 /// Erase the currently-drawn cursor sprite (restore the saved background).
 fn erase_cursor(fb: &FbWriter) {
+    if hardware_cursor(None) {
+        return;
+    }
     // try_lock, NOT lock: avoid a thundering-herd on concurrent draws.
     let Some(mut g) = USER_SAVED.try_lock() else {
         return;
@@ -335,6 +379,11 @@ fn render_cursor_at(fb: &FbWriter, ux: u32, uy: u32) {
     let x = ux.min(fb.width().saturating_sub(ARROW_W));
     let y = uy.min(fb.height().saturating_sub(ARROW_H));
     if USER_LAST_X.load(Ordering::Acquire) == x && USER_LAST_Y.load(Ordering::Acquire) == y {
+        return;
+    }
+    if hardware_cursor(Some((x, y))) {
+        USER_LAST_X.store(x, Ordering::Release);
+        USER_LAST_Y.store(y, Ordering::Release);
         return;
     }
 

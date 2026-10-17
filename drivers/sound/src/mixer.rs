@@ -50,6 +50,28 @@ pub enum ControlKind {
     CaptureVolume,
     /// Jack-Sense — read-only, 1 = plugged.
     JackSense,
+    /// HDMI/DP sink jack — read-only, 1 = a monitor with valid ELD is
+    /// attached (Linux `snd_jack_report(SND_JACK_AVOUT)`).
+    HdmiJack,
+    /// The sink's EDID-Like Data — read-only, volatile bytes on the PCM
+    /// interface (Linux `hdmi_create_eld_ctl`). Empty when no sink.
+    Eld,
+    /// IEC958 channel-status bits the consumer format can carry — read-only
+    /// (Linux `snd_hda_spdif_cmask_get`).
+    Iec958ConMask,
+    /// IEC958 channel-status bits the professional format can carry —
+    /// read-only (`snd_hda_spdif_pmask_get`).
+    Iec958ProMask,
+    /// The digital output's IEC958 channel status. The AES0 non-audio bit
+    /// selects compressed (IEC 61937) passthrough at the next prepare
+    /// (`snd_hda_spdif_default_put`).
+    Iec958Default,
+    /// The digital converter's enable (`snd_hda_spdif_out_switch_put`).
+    Iec958Switch,
+    /// The playback PCM's ALSA channel map, one `SNDRV_CHMAP_*` position
+    /// per channel, with the layouts the sink takes as a TLV
+    /// (`snd_hdac_add_chmap_ctls`).
+    ChannelMap,
 }
 
 impl ControlKind {
@@ -62,19 +84,76 @@ impl ControlKind {
             ControlKind::MicBoost => "Mic Boost",
             ControlKind::CaptureVolume => "Capture Volume",
             ControlKind::JackSense => "Headphone Jack",
+            // PCM device 0 is the only playback PCM a native card has.
+            ControlKind::HdmiJack => "HDMI/DP,pcm=0 Jack",
+            ControlKind::Eld => "ELD",
+            ControlKind::Iec958ConMask => "IEC958 Playback Con Mask",
+            ControlKind::Iec958ProMask => "IEC958 Playback Pro Mask",
+            ControlKind::Iec958Default => "IEC958 Playback Default",
+            ControlKind::Iec958Switch => "IEC958 Playback Switch",
+            ControlKind::ChannelMap => "Playback Channel Map",
         }
     }
 
     /// True if the control is a boolean (mute or sense).
     pub const fn is_boolean(self) -> bool {
-        matches!(self, ControlKind::MasterMute | ControlKind::JackSense)
+        matches!(
+            self,
+            ControlKind::MasterMute
+                | ControlKind::JackSense
+                | ControlKind::HdmiJack
+                | ControlKind::Iec958Switch
+        )
+    }
+
+    /// True if the control is a byte array.
+    pub const fn is_bytes(self) -> bool {
+        matches!(self, ControlKind::Eld)
+    }
+
+    /// True if the control is an IEC958 channel-status value
+    /// (`SNDRV_CTL_ELEM_TYPE_IEC958`).
+    pub const fn is_iec958(self) -> bool {
+        matches!(
+            self,
+            ControlKind::Iec958ConMask | ControlKind::Iec958ProMask | ControlKind::Iec958Default
+        )
+    }
+
+    /// True if the control has a TLV the driver computes on read
+    /// (`SNDRV_CTL_ELEM_ACCESS_TLV_READ | TLV_CALLBACK`).
+    pub const fn has_tlv(self) -> bool {
+        matches!(self, ControlKind::ChannelMap)
     }
 
     /// True if the control is read-only.
     pub const fn is_read_only(self) -> bool {
-        matches!(self, ControlKind::JackSense)
+        matches!(
+            self,
+            ControlKind::JackSense
+                | ControlKind::HdmiJack
+                | ControlKind::Eld
+                | ControlKind::Iec958ConMask
+                | ControlKind::Iec958ProMask
+        )
+    }
+
+    /// The ALSA `snd_ctl_elem_iface_t` the control lives on. Linux creates
+    /// jack controls on CARD and ELD on PCM; PulseAudio and PipeWire look
+    /// them up there. The older headphone sense control stays on MIXER.
+    pub const fn iface(self) -> u32 {
+        match self {
+            ControlKind::HdmiJack => 1,
+            ControlKind::Eld | ControlKind::ChannelMap => 3,
+            _ => 2,
+        }
     }
 }
+
+/// Largest byte control payload. ELD is at most 256 bytes in the HDA
+/// specification, but every producer narf has (the AMD codec's emulated
+/// ELD) stays under 84; 128 keeps the count within a `u8`.
+pub const BYTES_MAX: usize = 128;
 
 /// A current control value.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -83,9 +162,49 @@ pub enum ControlValue {
     Integer { left: i32, right: i32 },
     /// Boolean (mute / jack-sense).
     Boolean(bool),
+    /// Byte array (ELD); `len` bytes of `data` are meaningful.
+    Bytes { len: u8, data: [u8; BYTES_MAX] },
+    /// IEC958 channel status (`snd_aes_iec958.status`); subcode and
+    /// subframe bytes are not carried.
+    Iec958([u8; 24]),
+    /// Integer array (channel map); `len` entries of `values` are meaningful.
+    Integers {
+        len: u8,
+        values: [i32; INTEGERS_MAX],
+    },
 }
 
+/// Largest integer-array control (the eight HDMI audio slots).
+pub const INTEGERS_MAX: usize = 8;
+
 impl ControlValue {
+    /// `bytes` truncated to `BYTES_MAX`.
+    pub fn bytes(bytes: &[u8]) -> Self {
+        let len = bytes.len().min(BYTES_MAX);
+        let mut data = [0; BYTES_MAX];
+        data[..len].copy_from_slice(&bytes[..len]);
+        ControlValue::Bytes {
+            len: len as u8,
+            data,
+        }
+    }
+    /// `values` truncated to `INTEGERS_MAX`.
+    pub fn integers(values: &[i32]) -> Self {
+        let len = values.len().min(INTEGERS_MAX);
+        let mut out = [0; INTEGERS_MAX];
+        out[..len].copy_from_slice(&values[..len]);
+        ControlValue::Integers {
+            len: len as u8,
+            values: out,
+        }
+    }
+    /// Channel status whose first bytes are `status`.
+    pub fn iec958(status: &[u8]) -> Self {
+        let mut out = [0; 24];
+        let len = status.len().min(24);
+        out[..len].copy_from_slice(&status[..len]);
+        ControlValue::Iec958(out)
+    }
     pub const fn integer(left: i32, right: i32) -> Self {
         ControlValue::Integer { left, right }
     }
@@ -169,6 +288,9 @@ impl Control {
                 self.value_packed.store(b as i32, Ordering::Release);
                 Ok(())
             }
+            ControlValue::Bytes { .. }
+            | ControlValue::Iec958(_)
+            | ControlValue::Integers { .. } => Err(MixerError::OutOfRange),
         }
     }
 }
@@ -201,6 +323,9 @@ pub fn register_standard_realtek(
                 ((left as u16 as u32) << 16) | (right as u16 as u32)
             }
             ControlValue::Boolean(b) => b as u32,
+            ControlValue::Bytes { .. }
+            | ControlValue::Iec958(_)
+            | ControlValue::Integers { .. } => 0,
         };
         controls.push(Control {
             info,

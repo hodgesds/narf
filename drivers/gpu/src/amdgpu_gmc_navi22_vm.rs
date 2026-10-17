@@ -190,6 +190,11 @@ impl Fault {
     /// (VMC_1_0__SRCID__VM_FAULT, UTCL2_1_0__SRCID__FAULT).
     pub const CLIENT_VMC: u8 = 0x12;
     pub const CLIENT_UTCL2: u8 = 0x1b;
+    /// Adapter for IVs delivered by `ColdBoot::interrupts()` subscriptions to
+    /// `ih::source::{VMC_FAULT, UTCL2_FAULT}`.
+    pub fn from_iv(iv: &crate::amdgpu_ih_navi22::Iv) -> Option<Self> {
+        Self::decode(iv.client, iv.src, iv.vmid, [iv.src_data[0], iv.src_data[1]])
+    }
     /// gmc_v10_0_process_interrupt's decode of `src_data[0..2]`.
     pub fn decode(client: u8, source: u8, vmid: u8, data: [u32; 2]) -> Option<Self> {
         let hub = match (client, source) {

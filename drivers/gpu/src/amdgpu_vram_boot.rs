@@ -75,14 +75,53 @@ impl Plan {
         boot_framebuffer: Option<Range<u64>>,
         other_clients: &[Range<u64>],
     ) -> Result<Self, Error> {
-        use crate::{amdgpu, amdgpu_discovery as ip, amdgpu_psp_ring::bank};
-        if gpu.chip.vid != amdgpu::AMD_VENDOR || gpu.chip.did != amdgpu::NAVI22 {
+        if gpu.chip.did != crate::amdgpu::NAVI22 {
             return Err(Error::Unsupported);
         }
-        let gc =
-            bank(gpu, ip::HW_ID_GC, &[(10, 3, 2)], 0, 0x16fd).map_err(|_| Error::Unsupported)?;
+        // SAFETY: caller supplies the complete exclusive GPU/client contract.
+        unsafe { Self::read_discrete(gpu, authority, boot_framebuffer, other_clients) }
+    }
+    /// Inventory Navi48's GMC12 aperture, four DCN4 scanouts/cursors and
+    /// inherited DMUB windows. Both VM hubs must have no enabled contexts.
+    ///
+    /// # Safety
+    /// Same stable mappings, exclusive GPU and complete client inventory
+    /// contract as `read_navi22`. No hardware writes are performed.
+    pub unsafe fn read_navi48(
+        gpu: &AmdGpu,
+        authority: &Cap<BusDeviceCap, Write>,
+        boot_framebuffer: Option<Range<u64>>,
+        other_clients: &[Range<u64>],
+    ) -> Result<Self, Error> {
+        if gpu.chip.did != crate::amdgpu::NAVI48 {
+            return Err(Error::Unsupported);
+        }
+        // SAFETY: caller supplies the complete exclusive GPU/client contract.
+        unsafe { Self::read_discrete(gpu, authority, boot_framebuffer, other_clients) }
+    }
+    unsafe fn read_discrete(
+        gpu: &AmdGpu,
+        authority: &Cap<BusDeviceCap, Write>,
+        boot_framebuffer: Option<Range<u64>>,
+        other_clients: &[Range<u64>],
+    ) -> Result<Self, Error> {
+        use crate::{amdgpu, amdgpu_discovery as ip, amdgpu_psp_ring::bank};
+        if gpu.chip.vid != amdgpu::AMD_VENDOR {
+            return Err(Error::Unsupported);
+        }
+        let (gc_version, dcn_versions, fb_regs): (_, &[_], _) = match gpu.chip.did {
+            amdgpu::NAVI22 => ((10, 3, 2), &[(3, 0, 0)], [0x16fc, 0x16fd, 0x16e7]),
+            amdgpu::NAVI48 => (
+                (12, 0, 1),
+                &[(4, 0, 1), (4, 1, 0)],
+                [0x1614, 0x1615, 0x15a7],
+            ),
+            _ => return Err(Error::Unsupported),
+        };
+        let gc = bank(gpu, ip::HW_ID_GC, &[gc_version], 0, fb_regs[1])
+            .map_err(|_| Error::Unsupported)?;
         let dcn =
-            bank(gpu, ip::HW_ID_DCN, &[(3, 0, 0)], 2, 0x477).map_err(|_| Error::Unsupported)?;
+            bank(gpu, ip::HW_ID_DCN, dcn_versions, 2, 0x477).map_err(|_| Error::Unsupported)?;
         let vbios = gpu.vbios.as_ref().ok_or(Error::MissingVbios)?;
         let inherited = crate::amdgpu_platform::boot_clients(gpu, authority)?;
         authority
@@ -90,9 +129,9 @@ impl Plan {
                 // SAFETY: exact discovered banks bounded above, live authority.
                 let fields = unsafe {
                     [
-                        gpu.regs.read32(gc + 0x16fc * 4),
-                        gpu.regs.read32(gc + 0x16fd * 4),
-                        gpu.regs.read32(gc + 0x16e7 * 4),
+                        gpu.regs.read32(gc + fb_regs[0] as u64 * 4),
+                        gpu.regs.read32(gc + fb_regs[1] as u64 * 4),
+                        gpu.regs.read32(gc + fb_regs[2] as u64 * 4),
                     ]
                 };
                 for (index, field) in fields.iter().enumerate() {
@@ -104,12 +143,15 @@ impl Plan {
                         return Err(Error::Invalid);
                     }
                 }
-                let mut plan = snapshot_with_fields(
+                let mut plan = snapshot_with_layout(
                     gpu.fb_bar,
                     vbios.bytes(),
                     boot_framebuffer,
                     other_clients,
-                    fields,
+                    SnapshotLayout {
+                        fields,
+                        region6: gpu.chip.did == amdgpu::NAVI48,
+                    },
                     // SAFETY: DCN bank bounds every window register read.
                     |reg| unsafe { gpu.regs.read32(dcn + reg as u64 * 4) },
                 )?;
@@ -299,13 +341,38 @@ fn snapshot(
     )
 }
 fn snapshot_with_fields(
-    mut mapping: MmioRegion,
+    mapping: MmioRegion,
     vbios: &[u8],
     boot_framebuffer: Option<Range<u64>>,
     other_clients: &[Range<u64>],
     fields: [u32; 3],
+    read: impl FnMut(u32) -> u32,
+) -> Result<Plan, Error> {
+    snapshot_with_layout(
+        mapping,
+        vbios,
+        boot_framebuffer,
+        other_clients,
+        SnapshotLayout {
+            fields,
+            region6: false,
+        },
+        read,
+    )
+}
+struct SnapshotLayout {
+    fields: [u32; 3],
+    region6: bool,
+}
+fn snapshot_with_layout(
+    mut mapping: MmioRegion,
+    vbios: &[u8],
+    boot_framebuffer: Option<Range<u64>>,
+    other_clients: &[Range<u64>],
+    layout: SnapshotLayout,
     mut read: impl FnMut(u32) -> u32,
 ) -> Result<Plan, Error> {
+    let fields = layout.fields;
     if fields.contains(&u32::MAX) {
         return Err(Error::Invalid);
     }
@@ -403,8 +470,8 @@ fn snapshot_with_fields(
         }
         plan.protect_gpu(Owner::Dmub, address, size)?;
     }
-    // Region5 is the Linux trace alias. Other enabled region layouts are
-    // unsupported; do not assume their address translation matches Region5.
+    // Region5 is the trace alias. DCN4 additionally maps shared firmware state
+    // into Region6, with a direct GPU offset and inclusive top (dmub_dcn401).
     for index in 0..3 {
         let top = read(0x1a1 + index);
         if top == u32::MAX {
@@ -413,7 +480,7 @@ fn snapshot_with_fields(
         if top & ENABLE == 0 {
             continue;
         }
-        if index != 1 {
+        if index != 1 && !(index == 2 && layout.region6) {
             return Err(Error::Unsupported);
         }
         let low = read(0x196 + index * 2);

@@ -42,6 +42,7 @@ extern crate alloc;
 pub mod cec;
 pub mod cta861;
 pub mod displayid;
+pub mod modes;
 mod tests;
 
 use alloc::string::String;

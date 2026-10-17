@@ -1,9 +1,11 @@
-//! PSP 11 signed SOS containers (Linux `amdgpu_ucode.h` and
+//! PSP 11/14 signed SOS containers (Linux `amdgpu_ucode.h` and
 //! `amdgpu_psp.c::psp_init_sos_microcode`). Offsets are payload-relative.
 //! Parsing checks structure only; the firmware registry and PSP authenticate
 //! the image. No untrusted descriptor becomes an MMIO address.
 
 pub const NAVI22_SOS: &str = "amdgpu/navy_flounder_sos.bin";
+pub const PSP14_0_2_SOS: &str = "amdgpu/psp_14_0_2_sos.bin";
+pub const PSP14_0_3_SOS: &str = "amdgpu/psp_14_0_3_sos.bin";
 pub const STAGING_SIZE: usize = 1024 * 1024;
 const MAX_CONTAINER: usize = 8 * STAGING_SIZE;
 
@@ -18,6 +20,11 @@ pub enum Component {
     KeyDatabase,
     Spl,
     SystemDriver,
+    SocDriver,
+    InterfaceDriver,
+    HardwareDebugDriver,
+    RasDriver,
+    IpKeyManager,
     SecureOs,
 }
 impl Component {
@@ -26,6 +33,11 @@ impl Component {
             Self::KeyDatabase => 0x0008_0000,
             Self::Spl => 0x1000_0000,
             Self::SystemDriver => 0x0001_0000,
+            Self::SocDriver => 0x000b_0000,
+            Self::InterfaceDriver => 0x000d_0000,
+            Self::HardwareDebugDriver => 0x000c_0000,
+            Self::RasDriver => 0x000e_0000,
+            Self::IpKeyManager => 0x000f_0000,
             Self::SecureOs => 0x0002_0000,
         }
     }
@@ -33,7 +45,7 @@ impl Component {
 
 #[derive(Debug)]
 pub struct Image<'a> {
-    components: [Option<(Component, &'a [u8])>; 4],
+    components: [Option<(Component, &'a [u8])>; 9],
     version: u32,
     toc: Option<&'a [u8]>,
 }
@@ -110,10 +122,83 @@ impl<'a> Image<'a> {
                 part(3, Component::KeyDatabase),
                 part(4, Component::Spl),
                 part(0, Component::SystemDriver),
+                None,
+                None,
+                None,
+                None,
+                None,
                 part(1, Component::SecureOs),
             ],
             version: word(bytes, 16),
             toc: (toc_size != 0).then(|| &payload[toc_offset..toc_offset + toc_size]),
+        })
+    }
+    /// PSP14's v2.0 descriptor table. The common header's size is 36 bytes;
+    /// the variable descriptors follow it, before the payload offset. Every
+    /// descriptor is validated, including TOC/RL which are not boot commands.
+    /// v2.1 auxiliary-image selection and SPDM are deliberately unsupported.
+    pub fn parse_psp14(bytes: &'a [u8]) -> Result<Self, Error> {
+        if bytes.len() < 36 || bytes.len() > MAX_CONTAINER {
+            return Err(Error::Invalid);
+        }
+        if bytes[8..12] != [2, 0, 0, 0] || bytes[12..16] != [14, 0, 0, 0] {
+            return Err(Error::Unsupported);
+        }
+        let count = word(bytes, 32) as usize;
+        let start = word(bytes, 24) as usize;
+        let size = word(bytes, 20) as usize;
+        if !(2..=11).contains(&count)
+            || word(bytes, 0) as usize != bytes.len()
+            || word(bytes, 4) != 36
+            || start < 36 + count * 16
+            || size == 0
+        {
+            return Err(Error::Invalid);
+        }
+        let end = start.checked_add(size).ok_or(Error::Invalid)?;
+        let payload = bytes.get(start..end).ok_or(Error::Invalid)?;
+        let mut parts = [None; 12];
+        let mut ranges = [(0usize, 0usize); 12];
+        for descriptor in bytes[36..36 + count * 16].chunks_exact(16) {
+            let kind = word(descriptor, 0) as usize;
+            if !(1..=11).contains(&kind) {
+                return Err(Error::Unsupported);
+            }
+            let offset = word(descriptor, 8) as usize;
+            let length = word(descriptor, 12) as usize;
+            if parts[kind].is_some()
+                || length == 0
+                || length > STAGING_SIZE
+                || offset.checked_add(length).is_none_or(|end| end > size)
+            {
+                return Err(Error::Invalid);
+            }
+            for &(other, length_other) in &ranges {
+                if length_other != 0 && offset < other + length_other && other < offset + length {
+                    return Err(Error::Invalid);
+                }
+            }
+            ranges[kind] = (offset, length);
+            parts[kind] = Some(&payload[offset..offset + length]);
+        }
+        if parts[1].is_none() || parts[2].is_none() {
+            return Err(Error::Invalid);
+        }
+        let part = |index: usize, kind| parts[index].map(|bytes| (kind, bytes));
+        Ok(Self {
+            components: [
+                part(3, Component::KeyDatabase),
+                part(5, Component::Spl),
+                part(2, Component::SystemDriver),
+                part(7, Component::SocDriver),
+                part(8, Component::InterfaceDriver),
+                part(9, Component::HardwareDebugDriver),
+                part(10, Component::RasDriver),
+                part(11, Component::IpKeyManager),
+                part(1, Component::SecureOs),
+            ],
+            version: word(bytes, 16),
+            toc: parts[4],
         })
     }
     pub fn version(&self) -> u32 {
@@ -124,7 +209,8 @@ impl<'a> Image<'a> {
     pub fn toc(&self) -> Option<&'a [u8]> {
         self.toc
     }
-    /// Linux PSP11 boot order, omitting optional absent KDB/SPL components.
+    /// Linux boot order, omitting optional absent components. SOS is last;
+    /// descriptor ordering in a PSP14 container does not change boot ordering.
     pub fn components(&self) -> impl Iterator<Item = (Component, &'a [u8])> + '_ {
         self.components.iter().flatten().copied()
     }

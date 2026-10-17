@@ -2334,16 +2334,15 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_socket_acceptconn_listening);
 fn smoke_abi_socket_fstat_is_sock() -> TestResult {
     with_setup(|| {
         let fd = open_unix_stream()?;
-        // Linux x86_64 `struct stat` (this suite is linux-compat, so Fstat
-        // routes to sys_fstat_linux): st_dev(8) st_ino(8) st_nlink(8) then
-        // st_mode(u32) at offset 24.
+        // This suite is linux-compat, so Fstat routes to sys_fstat_linux and
+        // writes the arch's uapi `struct stat`.
         let mut stat = [0u8; 256];
         let r =
             call(Syscall::Fstat.raw(), a1(fd, stat.as_mut_ptr() as u64)).ok_or("status not Ok")?;
         if r != 0 {
             return Err("fstat of a socket fd did not return 0");
         }
-        let mode = u32::from_ne_bytes([stat[24], stat[25], stat[26], stat[27]]);
+        let mode = stat_mode(&stat);
         if mode & 0o170000 != 0o140000 {
             return Err("socket fd did not fstat as S_IFSOCK");
         }

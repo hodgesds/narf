@@ -32,6 +32,7 @@ mod bpf_bench;
 mod ci_clippy;
 mod composition;
 mod crate_release;
+mod http3_smoke;
 /// The `affected` subcommand: crate reverse-dependency closure → the set
 /// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
 mod net_robust;
@@ -130,6 +131,13 @@ enum Cmd {
     /// `XTASK_SYSTEMD_PID1_FAILURE_MARKER` turn the capture into a
     /// fail-fast integration assertion.
     SystemdPid1(BuildArgs),
+    /// Exercise real HTTP/3 from a running CachyOS guest through SLIRP.
+    ///
+    /// The host runs an in-process QUIC/HTTP/3 fixture. The guest's curl must
+    /// complete 16 parallel HTTP/3 requests on exactly one QUIC connection,
+    /// then eight independent concurrent connections. This requires an SSH
+    /// forward to the already-running guest and an explicit scoped password.
+    Http3Smoke(http3_smoke::Args),
     /// Cross-compile and boot under QEMU with `boot-init` on, drive
     /// the serial port programmatically by typing `echo hello world`
     /// into QEMU's stdin, and assert that `hello world\n` appears on
@@ -12257,6 +12265,7 @@ fn main() -> Result<()> {
         }
         Cmd::BootSmoke(args) => boot_smoke_cmd(&args),
         Cmd::SystemdPid1(args) => systemd_pid1_cmd(&args),
+        Cmd::Http3Smoke(args) => http3_smoke::run(&args),
         Cmd::RunInteractive(args) => run_interactive_cmd(&args),
         Cmd::NetSmoke(args) => net_smoke_cmd(&args),
         Cmd::E1000ModuleNetSmoke(args) => e1000_module_net_smoke_cmd(&args),

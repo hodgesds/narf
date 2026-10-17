@@ -45,7 +45,7 @@ kernel_test_in!(
     navi22_graphics_set_requires_all_images_except_missing_mec2
 );
 
-fn gpu() -> AmdGpu {
+pub(crate) fn gpu() -> AmdGpu {
     let map = narf_bus::MmioRegion {
         phys: narf_memory::PhysAddr::new(0),
         virt: 0,

@@ -91,6 +91,9 @@ impl FileOps for SignalFdFile {
     fn ino(&self) -> u64 {
         narf_filesystem::inode_id::anon_inode().ino
     }
+    fn anon_name(&self) -> Option<&'static str> {
+        Some("[signalfd]")
+    }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
         narf_filesystem::inode_id::anon_inode().attrs()
@@ -317,6 +320,9 @@ pub struct MemFdFile {
     /// This memfd's own inode: `memfd_create` -> `shmem_file_setup` gets a
     /// fresh inode on `shm_mnt`; `memfd_secret` one on `secretmem`.
     inode: narf_filesystem::inode_id::InodeId,
+    /// Dentry name on the internal mount: `memfd:<name>` (`mm/memfd.c::
+    /// memfd_alloc_file`) or `secretmem` (`mm/secretmem.c`).
+    name: alloc::string::String,
 }
 
 impl core::fmt::Debug for MemFdFile {
@@ -334,8 +340,12 @@ impl MemFdFile {
     /// memfd_alloc_file` -> `shmem_file_setup`).
     // LINUX-GAP: MFD_HUGETLB memfds live on the internal hugetlbfs mount
     // (`hugetlb_file_setup`), a different st_dev; NARF puts them on shm_mnt.
-    pub fn new(flags: u32) -> Arc<Self> {
-        Self::with_inode(flags, narf_filesystem::inode_id::shmem_kernel_inode())
+    pub fn new(flags: u32, name: &str) -> Arc<Self> {
+        Self::with_inode(
+            flags,
+            narf_filesystem::inode_id::shmem_kernel_inode(),
+            alloc::format!("memfd:{name}"),
+        )
     }
 
     /// `memfd_secret(2)`: an inode on the `secretmem` kern_mount
@@ -344,10 +354,15 @@ impl MemFdFile {
         Self::with_inode(
             0,
             narf_filesystem::inode_id::PseudoFs::SecretMem.new_inode(),
+            "secretmem".into(),
         )
     }
 
-    fn with_inode(flags: u32, inode: narf_filesystem::inode_id::InodeId) -> Arc<Self> {
+    fn with_inode(
+        flags: u32,
+        inode: narf_filesystem::inode_id::InodeId,
+        name: alloc::string::String,
+    ) -> Arc<Self> {
         let allow = (flags & MFD_ALLOW_SEALING) != 0;
         // When sealing is not allowed, the read-side F_GET_SEALS
         // must return F_SEAL_SEAL per Linux man-page semantics.
@@ -360,6 +375,7 @@ impl MemFdFile {
             seals: AtomicU32::new(initial_seals),
             allow_sealing: allow,
             inode,
+            name,
         })
     }
 
@@ -432,6 +448,10 @@ fn store_copy(store: &MemfdStore, off: usize, buf: &mut [u8], to_store: bool) {
 impl FileOps for MemFdFile {
     fn ino(&self) -> u64 {
         self.inode.ino
+    }
+
+    fn internal_name(&self) -> Option<alloc::string::String> {
+        Some(self.name.clone())
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {

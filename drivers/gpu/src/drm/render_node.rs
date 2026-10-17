@@ -299,11 +299,16 @@ pub fn ioctl_flags(cmd: u32) -> Option<IoctlFlags> {
         0xBD | 0xBE => Some(IoctlFlags::auth_only()),
         // LIST_LESSEES is a DRM_MASTER operation.
         0xC7 => Some(IoctlFlags::master_only()),
+        // SETPROPERTY (connector) and OBJ_SETPROPERTY — DRM_MASTER.
+        0xAB | 0xBA => Some(IoctlFlags::master_only()),
         // CREATE_DUMB, MAP_DUMB, DESTROY_DUMB — RENDER_ALLOW per Linux.
         // Linux: DRM_RENDER_ALLOW in drm_ioctls[] (drm_ioctl.c).
         0xB2..=0xB4 => Some(IoctlFlags::render_allow()),
         // PRIME handle ↔ fd — RENDER_ALLOW (no display authority needed).
         0x2D | 0x2E => Some(IoctlFlags::render_allow()),
+        // WAIT_VBLANK, CRTC_GET_SEQUENCE, CRTC_QUEUE_SEQUENCE: Linux flags 0
+        // (primary opens are authenticated in NARF, render opens are denied).
+        0x3A..=0x3C => Some(IoctlFlags::auth_only()),
         // SYNCOBJ create/destroy/wait/signal — RENDER_ALLOW.
         0xBF | 0xC0 | 0xC3 | 0xC5 => Some(IoctlFlags::render_allow()),
         _ => None,

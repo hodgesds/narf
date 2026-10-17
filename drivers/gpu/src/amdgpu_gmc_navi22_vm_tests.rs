@@ -504,6 +504,12 @@ fn vm_navi22_faults_attribute_to_owning_vm() -> TestResult {
     let Some(fault) = Fault::decode(Fault::CLIENT_UTCL2, 0, 1, iv) else {
         return TestResult::Fail("UTCL2 IV rejected");
     };
+    let word = u32::from(Fault::CLIENT_UTCL2) | 1 << 24;
+    let iv = crate::amdgpu_ih_navi22::Iv::decode([word, 0, 0, 0, iv[0], iv[1], 0, 0]);
+    if Fault::from_iv(&iv) != Some(fault) {
+        return TestResult::Fail("IH IV adapter");
+    }
+    let iv = [iv.src_data[0], iv.src_data[1]];
     if fault.hub != Hub::Gfx || fault.address != address || !fault.write || fault.retry {
         return TestResult::Fail("IV decode differs from gmc_v10_0_process_interrupt");
     }

@@ -792,3 +792,30 @@ fn smoke_iommu_attach_detach_free_functions() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("io/iommu", smoke_iommu_attach_detach_free_functions);
+
+fn io_dma_sync_keeps_cpu_data_and_clamps_ranges() -> TestResult {
+    use crate::{alloc_coherent, free_coherent};
+    use narf_lib::id::DomainId;
+    let Ok(buf) = alloc_coherent(8192, DomainId::DRIVER_0) else {
+        return TestResult::Fail("alloc");
+    };
+    // SAFETY: the buffer is 8 KiB and exclusively ours.
+    unsafe {
+        for i in 0..8192 {
+            buf.cpu_mut_ptr_at::<u8>(i).write_volatile(i as u8);
+        }
+    }
+    buf.sync(0, 8192);
+    buf.sync(100, 1); // unaligned single byte
+    buf.sync(8000, 1 << 20); // clamped to the buffer
+    buf.sync(9000, 10); // empty after clamping
+                        // SAFETY: as above.
+    let intact = (0..8192).all(|i| unsafe { buf.cpu_ptr_at::<u8>(i).read_volatile() } == i as u8);
+    free_coherent(buf);
+    if intact {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("data changed by cache maintenance")
+    }
+}
+kernel_test_in!("io", io_dma_sync_keeps_cpu_data_and_clamps_ranges);

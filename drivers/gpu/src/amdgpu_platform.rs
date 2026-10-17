@@ -110,6 +110,12 @@ impl crate::amdgpu_psp_ring::RegWindow for VmWindow {
 /// unconditionally — and puts `regGCVM_CONTEXT0_CNTL` at 0x1688 on
 /// `_BASE_IDX 0`, running to `regGCVM_CONTEXT15_CNTL` 0x1697.
 const GFXHUB_WINDOWS: &[VmWindow] = &[
+    // gc_12_0_0_offset.h, GC12.0.1.
+    VmWindow {
+        version: (12, 0, 1),
+        base_idx: 0,
+        ctx0_cntl: 0x1624,
+    },
     // Phoenix1 (780M).
     VmWindow {
         version: (11, 0, 1),
@@ -142,6 +148,12 @@ const GFXHUB_WINDOWS: &[VmWindow] = &[
 /// happened to carry. `amdgpu_vmhub_regs` already recorded that this
 /// generation's MMHUB is BASE_IDX 1.
 const MMHUB_WINDOWS: &[VmWindow] = &[
+    // mmhub_4_1_0_offset.h, selected by gmc_v12_0.c.
+    VmWindow {
+        version: (4, 1, 0),
+        base_idx: 0,
+        ctx0_cntl: 0x0564,
+    },
     // `mmhub_3_0_0_offset.h` — Navi3x (`mmhub_v3_0.c`).
     VmWindow {
         version: (3, 0, 0),
@@ -214,6 +226,9 @@ struct SurfaceWindow {
     pipe_stride: u32,
     /// Dword distance between OTG instances.
     otg_stride: u32,
+    viewport_start_mask: u32,
+    pitch_mask: u32,
+    sw_mode_mask: u32,
 }
 impl SurfaceWindow {
     /// Highest dword any reader of this window touches: the last pipe's
@@ -262,6 +277,9 @@ const DCN_3_1_4: SurfaceWindow = SurfaceWindow {
     pipes: 4,
     pipe_stride: 0xdc,
     otg_stride: 0x80,
+    viewport_start_mask: 0x3fff,
+    pitch_mask: 0x3fff,
+    sw_mode_mask: 0x1f,
 };
 
 /// `dcn/dcn_3_5_0_offset.h` — Strix / HawkPoint, the other display generation
@@ -289,7 +307,29 @@ const DCN_3_0_0: SurfaceWindow = SurfaceWindow {
     pipes: 6,
     ..DCN_3_1_4
 };
-const SURFACE_WINDOWS: &[SurfaceWindow] = &[DCN_3_1_4, DCN_3_5_0, DCN_3_0_0];
+// dcn_4_1_0 headers implement Linux's normalized DCN4.0.1 resource.
+// Viewport starts/pitch expand to 16 bits; dimensions remain 14 bits.
+const DCN_4_0_1: SurfaceWindow = SurfaceWindow {
+    version: (4, 0, 1),
+    viewport_dimension: 0x05eb,
+    hubp_cntl: 0x05f4,
+    surface_control: 0x0612,
+    surface_inuse: 0x0618,
+    surface_earliest_inuse: 0x061c,
+    cursor_control: 0x0679,
+    cursor_address: 0x067a,
+    cursor_size: 0x067c,
+    otg_control: 0x1b43,
+    viewport_start_mask: 0xffff,
+    pitch_mask: 0xffff,
+    sw_mode_mask: 7,
+    ..DCN_3_1_4
+};
+const DCN_4_1_0: SurfaceWindow = SurfaceWindow {
+    version: (4, 1, 0),
+    ..DCN_4_0_1
+};
+const SURFACE_WINDOWS: &[SurfaceWindow] = &[DCN_3_1_4, DCN_3_5_0, DCN_3_0_0, DCN_4_0_1, DCN_4_1_0];
 
 // Field masks. `dcn_3_1_4_sh_mask.h` and `dcn_3_5_0_sh_mask.h` agree on every
 // one of these, so they are not part of the per-version window:
@@ -303,14 +343,12 @@ const SURFACE_WINDOWS: &[SurfaceWindow] = &[DCN_3_1_4, DCN_3_5_0, DCN_3_0_0];
 //   CURSOR_HEIGHT               0x000001ff   CURSOR_WIDTH         0x01ff0000
 //   *_SURFACE_ADDRESS_HIGH      0x0000ffff
 const SURFACE_PIXEL_FORMAT: u32 = 0x7f;
-const SW_MODE: u32 = 0x1f;
 /// `PRIMARY_SURFACE_TMZ` | `PRIMARY_SURFACE_DCC_EN` |
 /// `SECONDARY_SURFACE_TMZ` | `SECONDARY_SURFACE_DCC_EN`. With DCC off there is
 /// no metadata surface to account for.
 const SURFACE_PROTECTED_OR_COMPRESSED: u32 = 0x0303;
 const VMID: u32 = 0xf;
 const VIEWPORT_COORD: u32 = 0x3fff;
-const PITCH: u32 = 0x3fff;
 const ADDRESS_HIGH: u32 = 0xffff;
 const CURSOR_ENABLE: u32 = 1 << 0;
 /// `CURSOR_MODE` is 0x00000700 — three bits at 8.
@@ -394,7 +432,7 @@ fn scan_surfaces(
                 24 | 26 => 8,
                 _ => return Err(Error::Unsupported),
             };
-            if read(window.tiling_config + delta)? & SW_MODE != 0
+            if read(window.tiling_config + delta)? & window.sw_mode_mask != 0
                 || read(window.surface_control + delta)? & SURFACE_PROTECTED_OR_COMPRESSED != 0
                 || read(window.vmid_settings + delta)? & VMID != 0
             {
@@ -402,11 +440,12 @@ fn scan_surfaces(
             }
             let viewport = read(window.viewport_dimension + delta)?;
             let start = read(window.viewport_start + delta)?;
-            let pitch = (read(window.surface_pitch + delta)? & PITCH) + 1;
-            let rows = ((start >> 16) & VIEWPORT_COORD) + ((viewport >> 16) & VIEWPORT_COORD);
+            let pitch = (read(window.surface_pitch + delta)? & window.pitch_mask) + 1;
+            let rows =
+                ((start >> 16) & window.viewport_start_mask) + ((viewport >> 16) & VIEWPORT_COORD);
             if rows == 0
                 || (viewport & VIEWPORT_COORD) == 0
-                || (start & VIEWPORT_COORD) + (viewport & VIEWPORT_COORD) > pitch
+                || (start & window.viewport_start_mask) + (viewport & VIEWPORT_COORD) > pitch
             {
                 return Err(Error::Invalid);
             }
@@ -914,6 +953,11 @@ mod tests {
         // regGCVM_CONTEXT15_CNTL 0x1697. Both GC 11.0.x revisions use it.
         let gfxhub_expected = [
             VmWindow {
+                version: (12, 0, 1),
+                base_idx: 0,
+                ctx0_cntl: 0x1624,
+            },
+            VmWindow {
                 version: (11, 0, 1),
                 base_idx: 0,
                 ctx0_cntl: 0x1688,
@@ -936,6 +980,11 @@ mod tests {
         // mmhub_3_0_1_offset.h: 0x0740 _BASE_IDX 1.
         // mmhub_3_0_2_offset.h: 0x06c0 _BASE_IDX 0.
         let mmhub_expected = [
+            VmWindow {
+                version: (4, 1, 0),
+                base_idx: 0,
+                ctx0_cntl: 0x0564,
+            },
             VmWindow {
                 version: (3, 0, 0),
                 base_idx: 0,
@@ -968,7 +1017,7 @@ mod tests {
         }
         {
             use crate::amdgpu_psp_ring::RegWindow as _;
-            if GFXHUB_WINDOWS[0].last() != 0x1697 || MMHUB_WINDOWS[1].last() != 0x074f {
+            if GFXHUB_WINDOWS[1].last() != 0x1697 || MMHUB_WINDOWS[1].last() != 0x074f {
                 return TestResult::Fail("a VM window stops short of CONTEXT15_CNTL");
             }
         }
@@ -995,6 +1044,9 @@ mod tests {
             pipes: 4,
             pipe_stride: 0xdc,
             otg_stride: 0x80,
+            viewport_start_mask: 0x3fff,
+            pitch_mask: 0x3fff,
+            sw_mode_mask: 0x1f,
         };
         // dcn/dcn_3_5_0_offset.h. Identical except for the two in-use reports
         // and OTG_CONTROL, which is the whole reason this is a table.
@@ -1010,7 +1062,35 @@ mod tests {
             pipes: 6,
             ..dcn314_expected
         };
-        if SURFACE_WINDOWS != [dcn314_expected, dcn350_expected, dcn300_expected] {
+        let dcn401_expected = SurfaceWindow {
+            version: (4, 0, 1),
+            viewport_dimension: 0x05eb,
+            hubp_cntl: 0x05f4,
+            surface_control: 0x0612,
+            surface_inuse: 0x0618,
+            surface_earliest_inuse: 0x061c,
+            cursor_control: 0x0679,
+            cursor_address: 0x067a,
+            cursor_size: 0x067c,
+            otg_control: 0x1b43,
+            viewport_start_mask: 0xffff,
+            pitch_mask: 0xffff,
+            sw_mode_mask: 7,
+            ..dcn314_expected
+        };
+        let dcn410_expected = SurfaceWindow {
+            version: (4, 1, 0),
+            ..dcn401_expected
+        };
+        if SURFACE_WINDOWS
+            != [
+                dcn314_expected,
+                dcn350_expected,
+                dcn300_expected,
+                dcn401_expected,
+                dcn410_expected,
+            ]
+        {
             return TestResult::Fail("a DCN row does not match its dcn_x_y_z_offset.h");
         }
         if dcn314_expected.surface_inuse == dcn350_expected.surface_inuse
