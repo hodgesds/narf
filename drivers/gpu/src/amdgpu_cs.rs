@@ -510,6 +510,11 @@ pub trait Submitter: Send + Sync {
     /// The ring index (a ticket's high 32 bits) that runs `ip_type`
     /// instance `ip_instance`, ring `ring`, if this engine has one.
     fn ring_for(&self, ip_type: u32, ip_instance: u32, ring: u32) -> Option<u32>;
+    /// How many IBs one submission on ring `ring` may carry
+    /// (`AMDGPU_INFO_MAX_IBS`); more are refused.
+    fn max_ibs(&self, _ring: u32) -> u32 {
+        1
+    }
     /// Whether sequence `seq` has completed, waiting until monotonic
     /// `deadline_ns` (0: don't wait).
     fn wait(

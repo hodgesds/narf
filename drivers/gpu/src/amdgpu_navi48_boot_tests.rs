@@ -40,6 +40,7 @@ fn report() -> Report {
             active_arrays: 0xff,
             cu_bitmap: [[0xff, 0xff, 0, 0]; 4],
             enabled_rb_mask: 0xffff,
+            gb_addr_config: 0x2644_2043,
         },
         smu: smu::Versions {
             firmware: 0x684c00,

@@ -11951,6 +11951,28 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
     });
     register_submitter(card, fake.clone());
     let result = (|| {
+        // AMDGPU_INFO_MAX_IBS: per IP type, what one CS may carry on the
+        // card's rings (the fake runs only GFX, one IB at a time).
+        let mut max_ibs = [0u32; u::AMDGPU_HW_IP_NUM as usize];
+        let mut info = [0u8; core::mem::size_of::<u::DrmAmdgpuInfo>()];
+        info[0..8].copy_from_slice(&(max_ibs.as_mut_ptr() as u64).to_le_bytes());
+        info[8..12].copy_from_slice(&(core::mem::size_of_val(&max_ibs) as u32).to_le_bytes());
+        info[12..16].copy_from_slice(&u::AMDGPU_INFO_MAX_IBS.to_le_bytes());
+        let info_cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_INFO;
+        let ok = crate::amdgpu_info::dispatch_for(
+            info_cmd,
+            info.as_mut_ptr() as usize,
+            Some(&VmState::for_card(card)),
+        );
+        let mut want = [0u32; u::AMDGPU_HW_IP_NUM as usize];
+        want[u::AMDGPU_HW_IP_GFX as usize] = 1;
+        if ok.is_err()
+            || max_ibs != want
+            || crate::amdgpu_info::dispatch_for(info_cmd, info.as_mut_ptr() as usize, Some(&state))
+                != Err(FsError::InvalidData)
+        {
+            return Some("MAX_IBS from the card's submitter");
+        }
         if run(cs_cmd, &mut cs).is_err() || u64::from_le_bytes(cs[0..8].try_into().unwrap()) != 1 {
             return Some("CS handle");
         }

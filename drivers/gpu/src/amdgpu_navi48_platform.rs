@@ -159,6 +159,25 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
             crate::amdgpu_navi48_firmware::MesMode::Unified,
         )
         .map_err(Error::Firmware)?;
+        // What AMDGPU_INFO_FW_VERSION reports for the CP firmware.
+        {
+            use crate::amdgpu_navi48_firmware::Source;
+            use crate::amdgpu_uapi as u;
+            let images = firmware.images().map_err(Error::Firmware)?;
+            let cp = |source, fw_type| {
+                images
+                    .iter()
+                    .find(|i| i.source() == source)
+                    .map(|i| (fw_type, i.version(), i.feature()))
+            };
+            if let (Some(me), Some(pfp), Some(mec)) = (
+                cp(Source::Me, u::AMDGPU_INFO_FW_GFX_ME),
+                cp(Source::Pfp, u::AMDGPU_INFO_FW_GFX_PFP),
+                cp(Source::Mec, u::AMDGPU_INFO_FW_GFX_MEC),
+            ) {
+                crate::amdgpu_info::publish_navi48_firmware([me, pfp, mec]);
+            }
+        }
         let end = gpu
             .vram
             .base
@@ -408,6 +427,9 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             }
             _ => None,
         }
+    }
+    fn max_ibs(&self, _ring: u32) -> u32 {
+        crate::amdgpu_gfx12_queue::MAX_JOB_IBS as u32
     }
     fn signalled(&self, ticket: u64) -> bool {
         // A revoked or vanished device makes no more progress; report done

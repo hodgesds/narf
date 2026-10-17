@@ -123,6 +123,10 @@ pub struct Firmware {
     dmub: Option<dmub::Prepared>,
 }
 impl Firmware {
+    /// The validated IP firmware images (not the SOS or DMCUB preparation).
+    pub(crate) fn images(&self) -> Result<[gfx::Image<'_>; 11], Error> {
+        self.gfx.images().map_err(Error::Firmware)
+    }
     pub fn open(
         gpu: &AmdGpu,
         registry: &Cap<narf_firmware::FirmwareRegistry, Read>,

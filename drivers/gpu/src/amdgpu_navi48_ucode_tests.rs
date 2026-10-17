@@ -39,6 +39,7 @@ pub(crate) fn container(source: Source) -> Vec<u8> {
     match source {
         Source::Pfp | Source::Me | Source::Mec => {
             for (at, v) in [
+                (32, 0x2f),
                 (36, 16),
                 (40, 256),
                 (44, 16),
@@ -97,8 +98,10 @@ fn navi48_ucode_splits_stacks_imu_and_signed_media() -> TestResult {
             Source::Vcn => &[13],
             Source::Dmcub => &[51],
         };
+        let cp = matches!(source, Source::Pfp | Source::Me | Source::Mec);
         if image.source() != source
             || image.version() != 74
+            || image.feature() != if cp { 0x2f } else { 0 }
             || image.payloads().map(|p| p.kind).collect::<Vec<_>>() != expected
         {
             return TestResult::Fail("GC12 firmware type/stack count/version");

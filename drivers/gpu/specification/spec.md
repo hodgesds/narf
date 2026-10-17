@@ -129,6 +129,15 @@ table, then reports `AMDGPU_FAMILY_GC_12_0_0` (152), eight hardware contexts,
 and GMC12's 48-bit VA geometry. Shader geometry describes discovered maxima;
 the active CU count, CU bitmap and enabled render-backend mask remain zero
 until the cold-boot owner samples harvesting. `ACCEL_WORKING` remains zero.
+What Mesa 26's ac_query_gpu_info cannot start without is answered too:
+`FW_VERSION` reports ME, PFP and MEC `ucode_version` and v2.0
+`ucode_feature_version` (`amdgpu_navi48_ucode::Image::feature`), published
+by `prepare` (other types EINVAL); `READ_MMR_REG` answers soc24's
+allow-list only for `GB_ADDR_CONFIG` (GC segment 0 + 0x13de, from the
+topology sample's `gb_addr_config`), with Linux's SE (< 4) / SH (< 2) /
+count (<= 128) checks and EFAULT for any other offset. `MAX_IBS` on an open
+of a card with a submitter reports `Submitter::max_ibs` for each IP type it
+runs (8 on Navi48, `MAX_JOB_IBS`) and 0 for the rest.
 
 `unsafe amdgpu_gfx12_topology::read` requires exclusive GRBM selector ownership
 and ready firmware/power. It validates GC12.0.1 banks and discovery dimensions,

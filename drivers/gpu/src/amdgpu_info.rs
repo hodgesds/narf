@@ -210,6 +210,68 @@ static NAVI48_TOPOLOGY: narf_lib::sync::IrqSafeSpinLock<
 pub(crate) fn publish_navi48_topology(topology: crate::amdgpu_gfx12_topology::Topology) {
     *NAVI48_TOPOLOGY.lock() = Some(topology);
 }
+/// Navi48's CP firmware, `(fw_type, ver, feature)` for ME, PFP and MEC, as
+/// amdgpu_firmware_info reports them — published when the platform opens
+/// the firmware set.
+static NAVI48_FIRMWARE: narf_lib::sync::IrqSafeSpinLock<Option<[(u32, u32, u32); 3]>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+pub(crate) fn publish_navi48_firmware(firmware: [(u32, u32, u32); 3]) {
+    *NAVI48_FIRMWARE.lock() = Some(firmware);
+}
+/// `AMDGPU_INFO_FW_VERSION` → `drm_amdgpu_info_firmware { ver, feature }`
+/// for the firmware types this card published; anything else is EINVAL,
+/// amdgpu_firmware_info's default.
+fn firmware_version(
+    snap: &Snapshot,
+    firmware: Option<[(u32, u32, u32); 3]>,
+    fw_type: u32,
+) -> Result<Vec<u8>, FsError> {
+    let (_, ver, feature) = firmware
+        .filter(|_| snap.did == u32::from(crate::amdgpu::NAVI48))
+        .and_then(|f| f.into_iter().find(|(t, ..)| *t == fw_type))
+        .ok_or(FsError::InvalidData)?;
+    Ok(as_bytes(&uapi::DrmAmdgpuInfoFirmware { ver, feature }))
+}
+/// `AMDGPU_INFO_READ_MMR_REG` → `count` registers from `dword_offset`, as
+/// soc24_read_register answers them: of its allow-list only
+/// `GB_ADDR_CONFIG` (GC segment 0 + 0x13de), from the value
+/// gfx_v12_0_gpu_early_init cached; any other offset is EFAULT. The SE/SH
+/// selector and count are checked as amdgpu_info_ioctl does. Navi48 only.
+fn read_mmr_reg(
+    snap: &Snapshot,
+    topology: Option<crate::amdgpu_gfx12_topology::Topology>,
+    payload: [u32; 4],
+) -> Result<Vec<u8>, FsError> {
+    let [offset, count, instance, _flags] = payload;
+    if snap.did != u32::from(crate::amdgpu::NAVI48) {
+        return Err(FsError::InvalidData);
+    }
+    let se =
+        (instance >> uapi::AMDGPU_INFO_MMR_SE_INDEX_SHIFT) & uapi::AMDGPU_INFO_MMR_SE_INDEX_MASK;
+    let sh =
+        (instance >> uapi::AMDGPU_INFO_MMR_SH_INDEX_SHIFT) & uapi::AMDGPU_INFO_MMR_SH_INDEX_MASK;
+    // AMDGPU_GFX_MAX_SE and AMDGPU_GFX_MAX_SH_PER_SE; all-ones broadcasts.
+    if (se != uapi::AMDGPU_INFO_MMR_SE_INDEX_MASK && se >= 4)
+        || (sh != uapi::AMDGPU_INFO_MMR_SH_INDEX_MASK && sh >= 2)
+        || count > 128
+    {
+        return Err(FsError::InvalidData);
+    }
+    let gb_addr_config =
+        crate::amdgpu_discovery::find_ip(&snap.ip_blocks, crate::amdgpu_discovery::HW_ID_GC, 0)
+            .filter(|gc| gc.num_bases > 0)
+            .and_then(|gc| gc.base_addrs[0].checked_add(0x13de))
+            .zip(topology.map(|t| t.gb_addr_config));
+    let mut out = Vec::new();
+    for i in 0..count {
+        let reg = offset.checked_add(i).ok_or(FsError::BadAddress)?;
+        match gb_addr_config {
+            Some((at, value)) if at == reg => out.extend_from_slice(&value.to_le_bytes()),
+            _ => return Err(FsError::BadAddress),
+        }
+    }
+    Ok(out)
+}
 fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
     let topology = *NAVI48_TOPOLOGY.lock();
     dev_info_topology(snap, topology)
@@ -398,6 +460,10 @@ pub fn query_against(snap: &Snapshot, query: u32, payload: [u32; 4]) -> Result<V
         // `query_hw_ip { type, ip_instance }` — type is word 0.
         uapi::AMDGPU_INFO_HW_IP_INFO => hw_ip_info(snap, payload[0]),
         uapi::AMDGPU_INFO_HW_IP_COUNT => hw_ip_count(snap, payload[0]),
+        // `read_mmr_reg { dword_offset, count, instance, flags }`.
+        uapi::AMDGPU_INFO_READ_MMR_REG => read_mmr_reg(snap, *NAVI48_TOPOLOGY.lock(), payload),
+        // `query_fw { fw_type, ip_instance, index }`.
+        uapi::AMDGPU_INFO_FW_VERSION => firmware_version(snap, *NAVI48_FIRMWARE.lock(), payload[0]),
         // Everything else: `amdgpu_info_ioctl`'s default arm.
         _ => Err(FsError::InvalidData),
     }
@@ -478,6 +544,22 @@ pub fn dispatch_for(
             }
             reply
         }
+        // amdgpu_ring_max_ibs per IP type: what one CS may carry on the
+        // rings the open's card runs, 0 for the rest.
+        (uapi::AMDGPU_INFO_MAX_IBS, Some(vm)) => {
+            let engine = vm
+                .card()
+                .and_then(crate::amdgpu_cs::submitter)
+                .ok_or(FsError::InvalidData)?;
+            (0..uapi::AMDGPU_HW_IP_NUM)
+                .flat_map(|ip| {
+                    engine
+                        .ring_for(ip, 0, 0)
+                        .map_or(0, |ring| engine.max_ibs(ring))
+                        .to_le_bytes()
+                })
+                .collect()
+        }
         _ => query(which, payload)?,
     };
     // Linux copies `min(size, sizeof(result))`: a userspace built against an
@@ -525,6 +607,7 @@ mod topology_tests {
                 [0xff, 0, 0, 0],
             ],
             enabled_rb_mask: 0x3fff,
+            gb_addr_config: 0x2644_2043,
         };
         let known = decode(&dev_info_topology(&snap, Some(topology)).unwrap());
         if unknown.cu_active_number != 0
@@ -549,5 +632,66 @@ mod topology_tests {
     kernel_test_in!(
         "drivers/gpu/gfx12",
         gfx12_dev_info_uses_harvesting_without_claiming_acceleration
+    );
+
+    /// What Mesa's ac_query_gpu_info cannot start without on GFX12: the
+    /// CP firmware versions, and `GB_ADDR_CONFIG` at dword 0x263e (GC
+    /// segment 0 at 0x1260, plus 0x13de) — and nothing else of the
+    /// register file.
+    fn gfx12_info_answers_mesa_firmware_and_register_queries() -> TestResult {
+        let mut gpu = crate::amdgpu_navi48_firmware::tests::gpu();
+        gpu.ip_blocks[0].base_addrs[0] = 0x1260;
+        gpu.ip_blocks[0].num_bases = 2;
+        let snap = Snapshot::from_gpu(&gpu);
+        let topology = crate::amdgpu_gfx12_topology::Topology {
+            active_cus: 64,
+            active_arrays: 0xff,
+            cu_bitmap: [[0xff, 0xff, 0, 0]; 4],
+            enabled_rb_mask: 0xffff,
+            gb_addr_config: 0x2644_2043,
+        };
+        let all = u32::MAX;
+        let read =
+            |offset, count, instance, t| read_mmr_reg(&snap, t, [offset, count, instance, 0]);
+        if read(0x263e, 1, all, Some(topology)) != Ok(0x2644_2043u32.to_le_bytes().to_vec())
+            || read(0x263e, 1, 0x0001_0103, Some(topology)).is_err()
+            || read(0x263e, 0, all, Some(topology)) != Ok(Vec::new())
+            || read(0x263e, 2, all, Some(topology)) != Err(FsError::BadAddress)
+            || read(0x263d, 1, all, Some(topology)) != Err(FsError::BadAddress)
+            || read(0x263e, 1, all, None) != Err(FsError::BadAddress)
+            || read(0x263e, 1, 0x04, Some(topology)) != Err(FsError::InvalidData)
+            || read(0x263e, 1, 0x0200, Some(topology)) != Err(FsError::InvalidData)
+            || read(0x263e, 129, all, Some(topology)) != Err(FsError::InvalidData)
+        {
+            return TestResult::Fail("READ_MMR_REG allow-list");
+        }
+        let mut other = snap.clone();
+        other.did = 0x73df;
+        if read_mmr_reg(&other, Some(topology), [0x263e, 1, all, 0]) != Err(FsError::InvalidData) {
+            return TestResult::Fail("READ_MMR_REG off Navi48");
+        }
+        let firmware = Some([
+            (uapi::AMDGPU_INFO_FW_GFX_ME, 0x10, 0x2f),
+            (uapi::AMDGPU_INFO_FW_GFX_PFP, 0x11, 0x2f),
+            (uapi::AMDGPU_INFO_FW_GFX_MEC, 0x12, 0x30),
+        ]);
+        let fw = |t| firmware_version(&snap, firmware, t);
+        if fw(uapi::AMDGPU_INFO_FW_GFX_MEC)
+            != Ok(as_bytes(&uapi::DrmAmdgpuInfoFirmware {
+                ver: 0x12,
+                feature: 0x30,
+            }))
+            || fw(uapi::AMDGPU_INFO_FW_GFX_ME).is_err()
+            || fw(uapi::AMDGPU_INFO_FW_VCN) != Err(FsError::InvalidData)
+            || firmware_version(&snap, None, uapi::AMDGPU_INFO_FW_GFX_ME).is_ok()
+            || firmware_version(&other, firmware, uapi::AMDGPU_INFO_FW_GFX_ME).is_ok()
+        {
+            return TestResult::Fail("FW_VERSION");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/gfx12",
+        gfx12_info_answers_mesa_firmware_and_register_queries
     );
 }
