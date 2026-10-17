@@ -785,7 +785,7 @@ pub(crate) struct Engine<I: Io> {
     pub proof: Proof,
 }
 /// `vcn_v2_0_dec_ring_emit_fence`: context_id = seq, fence then trap.
-fn dec_fence(address: u64, seq: u32) -> [u32; 14] {
+pub(crate) fn dec_fence(address: u64, seq: u32) -> [u32; 14] {
     use cmd::*;
     [
         packet0(INTERNAL_CONTEXT_ID),
@@ -806,7 +806,7 @@ fn dec_fence(address: u64, seq: u32) -> [u32; 14] {
     ]
 }
 /// `vcn_v2_0_dec_ring_insert_start`.
-fn dec_start() -> [u32; 4] {
+pub(crate) fn dec_start() -> [u32; 4] {
     use cmd::*;
     [
         packet0(INTERNAL_DATA0),
@@ -830,7 +830,7 @@ fn dec_ib(address: u64, dwords: u32) -> [u32; 8] {
     ]
 }
 /// `vcn_v2_0_dec_ring_insert_end`.
-fn dec_end() -> [u32; 2] {
+pub(crate) fn dec_end() -> [u32; 2] {
     [
         cmd::packet0(cmd::INTERNAL_CMD),
         cmd::DEC_KMD | (cmd::DEC_PACKET_END << 1),
@@ -1566,6 +1566,8 @@ pub fn route_interrupts(
 #[derive(Debug)]
 pub struct Media {
     engine: Engine<Mmio>,
+    /// Client submission (None: MMHUB unresolved, media stays kernel-only).
+    client: Option<Client>,
 }
 impl Media {
     /// Reserve per-instance VCPU/ring/IB storage without device I/O.
@@ -1601,7 +1603,9 @@ impl Media {
         } else {
             None
         };
+        let client = Client::new(gpu, pool, instances, jpeg.is_some());
         Ok(Self {
+            client,
             engine: Engine {
                 hw: Hw {
                     io: Mmio {
@@ -1666,6 +1670,315 @@ impl Media {
             jpeg: self.engine.jpeg_state,
             proof: self.engine.proof,
         }
+    }
+}
+
+// ── Client submission (append-only) ─────────────────────────────────────
+//
+// User jobs on instance 0's decode ring, both encode rings and the JPEG
+// ring, framed by `amdgpu_navi22_submit::encode_media` under the client's
+// VMID on MMHUB. They continue each kernel ring's fence sequence (the IB
+// tests' last value) and complete through the same IH VCN/JPEG traps
+// (`route_interrupts`). Instance 1 takes no client work: Linux's
+// `vcn_v3_0_limit_sched` would move every non-H.264/HEVC/VP9 decode to
+// instance 0 anyway, and on this card VCN1 is harvested.
+use crate::amdgpu_navi22_submit::{self as submit, Ib, MediaRing, VmRef};
+
+/// One kernel copy slot of a JPEG job's IBs (`amdgpu_jpeg_dec_parse_cs`
+/// validates a copy executed at VMID 0); one slot per outstanding job.
+pub(crate) const JPEG_IB_SLOT: u64 = 64 << 10; // linux: n/a (NARF bound on one JPEG job's IB bytes)
+/// The JPEG ring's fence dword, after its wptr shadow.
+pub(crate) const JPEG_FENCE: u64 = RING_BYTES + 64; // linux: n/a (NARF layout)
+
+/// Client-submission state of the media owner.
+#[derive(Debug)]
+pub(crate) struct Client {
+    /// MMHUB segment-0 dword base, for the ring-side VM flush.
+    pub mmhub: u32,
+    /// OSSSYS segment-0 dword base, for the MMHUB IH VMID LUT.
+    pub oss: u32,
+    /// Unharvested VCN instances (MMHUB invalidation-engine order).
+    pub instances: u8,
+    /// JPEG IB copies: `HW_SUBMISSIONS` slots of `JPEG_IB_SLOT` bytes.
+    pub jpeg_ibs: Option<Reservation>,
+}
+impl Client {
+    fn new(gpu: &AmdGpu, pool: &Pool, instances: u8, jpeg: bool) -> Option<Self> {
+        // linux: n/a (MMHUB 2.1.0 discovery version)
+        let base =
+            crate::amdgpu_psp_ring::bank(gpu, ip::HW_ID_MMHUB, &[(2, 1, 0)], 0, submit::MM_PTB_HI)
+                .ok()?;
+        // linux: n/a (OSSSYS 5.0.3 discovery version)
+        let oss = crate::amdgpu_psp_ring::bank(
+            gpu,
+            ip::HW_ID_OSSSYS,
+            &[(5, 0, 3)],
+            0,
+            submit::IH_VMID_LUT_LAST,
+        )
+        .ok()?;
+        let jpeg_ibs = if jpeg {
+            pool.reserve(JPEG_IB_SLOT * u64::from(submit::HW_SUBMISSIONS))
+                .ok()
+                .map(|mut r| {
+                    // Fetched by JPEG once a job uses it; never recycled.
+                    r.publish();
+                    r
+                })
+        } else {
+            None
+        };
+        Some(Self {
+            mmhub: u32::try_from(base / 4).ok()?,
+            oss: u32::try_from(oss / 4).ok()?,
+            instances,
+            jpeg_ibs,
+        })
+    }
+}
+
+/// Lock-free reader of the client media rings' fences (dec, enc0, enc1,
+/// JPEG), sampled after an HDP read-cache invalidate like `FenceReader`.
+#[derive(Clone, Copy, Debug)]
+pub struct MediaFenceReader {
+    regs: MmioRegion,
+    hdp_invalidate: u64,
+    slots: [Option<(MmioRegion, u64)>; 4],
+    authority: Cap<BusDeviceCap, Write>,
+}
+impl MediaFenceReader {
+    /// The last sequence `ring` wrote; None when it takes no client work.
+    pub fn completed(&self, ring: MediaRing) -> Result<Option<u32>, Error> {
+        let Some((slot, offset)) = self.slots[ring.index()] else {
+            return Ok(None);
+        };
+        let (regs, hdp) = (self.regs, self.hdp_invalidate);
+        self.authority
+            .invoke(Op(|| {
+                // SAFETY: the HDP register lies in the BAR5 bank Layout
+                // bounded; the slot is a published, permanent ring
+                // reservation whose fence dword is in bounds.
+                unsafe {
+                    regs.write32(hdp, 1);
+                    regs.read32(hdp);
+                    barrier(Ordering::SeqCst);
+                    checked(slot.read32(offset)).map(Some)
+                }
+            }))
+            .map_err(|_| Error::Revoked)?
+    }
+}
+
+impl<I: Io> Engine<I> {
+    /// Whether `ring` passed its kernel ring and IB tests.
+    pub(crate) fn client_ready(&self, ring: MediaRing) -> bool {
+        match ring {
+            MediaRing::Jpeg => self.jpeg_state == JpegState::Verified,
+            MediaRing::Dec => self.state == State::Verified && self.proof.dec_ring[0],
+            MediaRing::Enc(j) => {
+                self.state == State::Verified && self.proof.enc_ring[0][usize::from(j & 1)]
+            }
+        }
+    }
+    /// The ring, its reservation's mapping and MC address, and the ring's
+    /// fence offset in it.
+    fn client_ring(&mut self, ring: MediaRing) -> Result<(&mut Ring, MmioRegion, u64, u64), Error> {
+        if !self.client_ready(ring) {
+            return Err(Error::Busy);
+        }
+        client_ring(&mut self.vcn[0], &mut self.jpeg, ring)
+    }
+    /// (last completed, throttle) sequences of client ring `ring`.
+    pub(crate) fn client_fences(&mut self, ring: MediaRing) -> Result<(u32, u32), Error> {
+        let (r, map, _, fence_at) = self.client_ring(ring)?;
+        let throttle = r.seq.wrapping_sub(submit::HW_SUBMISSIONS - 1);
+        let completed = self.hw.access(|io, l| {
+            invalidate(io, l);
+            checked(io.read_memory(map, fence_at))
+        })?;
+        Ok((completed, throttle))
+    }
+    /// Queue one client job on `ring` (see `amdgpu_navi22_submit`'s media
+    /// section). JPEG IBs arrive as validated copies (`copies`, one per IB),
+    /// written to a kernel slot and fetched at VMID 0; VCN IBs run from the
+    /// client's VA. `vm` is the job's MMHUB grant (`media_grant`). `Busy`:
+    /// two jobs outstanding — wait for the throttle sequence of
+    /// [`Engine::client_fences`] and retry.
+    pub(crate) fn submit_client(
+        &mut self,
+        client: &Client,
+        ring: MediaRing,
+        vm: VmRef,
+        ibs: &[Ib],
+        copies: &[alloc::vec::Vec<u32>],
+    ) -> Result<u32, Error> {
+        submit::validate_media(vm, ibs).map_err(|_| Error::Invalid)?;
+        let jpeg_slot = if ring == MediaRing::Jpeg {
+            let pool = client.jpeg_ibs.as_ref().ok_or(Error::Unsupported)?;
+            let bytes: u64 = copies.iter().map(|c| c.len() as u64 * 4).sum();
+            if copies.len() != ibs.len()
+                || copies
+                    .iter()
+                    .zip(ibs)
+                    .any(|(c, ib)| c.len() != ib.dwords as usize)
+                || bytes > JPEG_IB_SLOT
+            {
+                return Err(Error::Invalid);
+            }
+            Some((pool.mapping(), pool.address()))
+        } else {
+            if !copies.is_empty() {
+                return Err(Error::Invalid);
+            }
+            None
+        };
+        let (completed, throttle) = self.client_fences(ring)?;
+        if !fence::signaled(completed, throttle) {
+            return Err(Error::Busy);
+        }
+        let engine = ring.inv_engine(client.instances);
+        let (r, map, base, fence_at) = client_ring(&mut self.vcn[0], &mut self.jpeg, ring)?;
+        let (fence_address, ring_base) = (base + fence_at, base + r.base);
+        let seq = r.next_seq();
+        // JPEG copies go to slot `seq % HW_SUBMISSIONS`, free once the job
+        // two behind (the throttle fence) completed.
+        let mut kernel_ibs = alloc::vec::Vec::new();
+        let mut placed = alloc::vec::Vec::new();
+        if let Some((pool_map, pool_mc)) = jpeg_slot {
+            let mut at = u64::from(seq % submit::HW_SUBMISSIONS) * JPEG_IB_SLOT;
+            for copy in copies {
+                kernel_ibs.push(Ib {
+                    va: pool_mc + at,
+                    dwords: copy.len() as u32,
+                });
+                placed.push((pool_map, at, copy));
+                at += copy.len() as u64 * 4;
+            }
+        }
+        let frame = submit::MediaFrame {
+            ring,
+            mmhub: client.mmhub,
+            engine,
+            flush: vm.flush.then_some(vm),
+            pasid_map: (vm.flush && vm.map_pasid).then_some((
+                client.oss + submit::IH_VMID_0_LUT_MM + u32::from(vm.vmid),
+                vm.pasid,
+            )),
+            vmid: vm.vmid,
+            ibs: if jpeg_slot.is_some() {
+                &kernel_ibs
+            } else {
+                ibs
+            },
+            fence: fence_address,
+            seq,
+            ring_base,
+        };
+        let words = submit::encode_media(&frame);
+        let fits = words.len() as u32 + r.align() <= RING_DW / submit::HW_SUBMISSIONS;
+        let result = if fits {
+            self.hw.access(|io, l| {
+                for (pool_map, at, copy) in &placed {
+                    for (k, &word) in copy.iter().enumerate() {
+                        io.write_memory(*pool_map, at + k as u64 * 4, word);
+                    }
+                }
+                r.emit(io, map, &words)?;
+                // Pads, publishes the shadow wptr, flushes HDP (which also
+                // carries the JPEG copies out), rings the doorbell.
+                r.commit(io, map, l);
+                Ok(())
+            })
+        } else {
+            Err(Error::Invalid)
+        };
+        if result.is_err() {
+            // Nothing reached the engine: return the sequence.
+            r.seq = seq.wrapping_sub(1);
+        }
+        result?;
+        Ok(seq)
+    }
+}
+
+/// [`Engine::client_ring`] over the split-borrowed owners.
+fn client_ring<'a>(
+    vcn0: &'a mut Option<Instance>,
+    jpeg: &'a mut Option<Jpeg>,
+    ring: MediaRing,
+) -> Result<(&'a mut Ring, MmioRegion, u64, u64), Error> {
+    Ok(match ring {
+        MediaRing::Jpeg => {
+            let jpeg = jpeg.as_mut().ok_or(Error::Invalid)?;
+            let (map, base) = (jpeg.memory.mapping(), jpeg.memory.address());
+            (&mut jpeg.ring, map, base, JPEG_FENCE)
+        }
+        MediaRing::Dec => {
+            let i = vcn0.as_mut().ok_or(Error::Invalid)?;
+            let (map, base) = (i.memory.mapping(), i.memory.address());
+            (&mut i.dec, map, base, FENCE[0])
+        }
+        MediaRing::Enc(j) => {
+            let i = vcn0.as_mut().ok_or(Error::Invalid)?;
+            let (map, base) = (i.memory.mapping(), i.memory.address());
+            let j = usize::from(j & 1);
+            (&mut i.enc[j], map, base, FENCE[1 + j])
+        }
+    })
+}
+
+impl Media {
+    /// Bit `MediaRing::index()` per ring that accepts client jobs.
+    pub fn client_rings(&self) -> u8 {
+        let Some(client) = self.client.as_ref() else {
+            return 0;
+        };
+        MediaRing::ALL
+            .iter()
+            .filter(|&&r| self.engine.client_ready(r))
+            .filter(|&&r| r != MediaRing::Jpeg || client.jpeg_ibs.is_some())
+            .fold(0, |m, r| m | 1 << r.index())
+    }
+    /// Lock-free fence reader over the client rings.
+    pub fn fence_reader(&self) -> MediaFenceReader {
+        let rings = self.client_rings();
+        let mut slots = [None; 4];
+        if let Some(i) = self.engine.vcn[0].as_ref() {
+            for (k, at) in FENCE.iter().enumerate() {
+                if rings & (1 << k) != 0 {
+                    slots[k] = Some((i.memory.mapping(), *at));
+                }
+            }
+        }
+        if let Some(j) = self.engine.jpeg.as_ref() {
+            if rings & (1 << MediaRing::Jpeg.index()) != 0 {
+                slots[3] = Some((j.memory.mapping(), JPEG_FENCE));
+            }
+        }
+        MediaFenceReader {
+            regs: self.engine.hw.io.regs,
+            hdp_invalidate: self.engine.hw.layout.hdp + 0xd1 * 4, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+            slots,
+            authority: self.engine.hw.authority,
+        }
+    }
+    /// Queue a client job (`Engine::submit_client`).
+    pub fn submit(
+        &mut self,
+        ring: MediaRing,
+        vm: VmRef,
+        ibs: &[Ib],
+        copies: &[alloc::vec::Vec<u32>],
+    ) -> Result<u32, Error> {
+        if self.client_rings() & (1 << ring.index()) == 0 {
+            return Err(Error::Busy);
+        }
+        let client = self.client.as_ref().ok_or(Error::Unsupported)?;
+        self.engine.submit_client(client, ring, vm, ibs, copies)
+    }
+    /// (last completed, throttle) sequences of client ring `ring`.
+    pub fn client_fences(&mut self, ring: MediaRing) -> Result<(u32, u32), Error> {
+        self.engine.client_fences(ring)
     }
 }
 

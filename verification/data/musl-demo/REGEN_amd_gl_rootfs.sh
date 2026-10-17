@@ -19,7 +19,11 @@
 # device: the smoke proves the drivers load, enumerate through
 # libdrm_amdgpu, decline every node cleanly, and that the software fallback
 # still renders. On the RX 6750 XT the same script is the first on-hardware
-# check (docs/MESA_AMD.md lists the rest).
+# check (docs/MESA_AMD.md lists the rest). Video: the smoke also loads the
+# radeonsi VA-API driver and runs vainfo/ffmpeg's VA path against every
+# node (clean VA errors without an AMD GPU); /mesa-amd-video.sh is the
+# on-hardware decode/encode check against software-decode checksums of the
+# clips in /video, generated here with Alpine's ffmpeg.
 #
 #   MESA_AMD_HOST_CHECK=1   after building, also run /mesa-amd-smoke.sh in a
 #                           user-namespace chroot on THIS host. On a Linux
@@ -62,14 +66,14 @@ mkdir -p "$RD/etc/apk"
 # on-hardware test vehicles: eglinfo/glxinfo (mesa-demos), vulkaninfo/vkcube
 # (vulkan-tools), kmscube, and weston's DRM backend + simple-egl.
 MESA_PKGS="mesa mesa-dri-gallium mesa-gbm mesa-egl mesa-gles mesa-gl \
-    mesa-vulkan-ati mesa-vulkan-swrast mesa-vulkan-layers"
+    mesa-vulkan-ati mesa-vulkan-swrast mesa-vulkan-layers mesa-va-gallium"
 "$APK" --root "$RD" --arch "$ARCH" --initdb --usermode \
     -X "$CDN/$ALPINE/main" -X "$CDN/$ALPINE/community" \
     --allow-untrusted --no-cache \
     add alpine-baselayout busybox musl libdrm libpciaccess $MESA_PKGS \
     vulkan-loader vulkan-tools mesa-demos kmscube \
     weston weston-backend-drm weston-shell-desktop weston-clients \
-    strace
+    strace libva libva-utils ffmpeg
 
 echo "replacing Alpine's Mesa $MESA_VER files with the from-source build"
 "$APK" --root "$RD" --usermode info -L $MESA_PKGS 2>/dev/null |
@@ -86,6 +90,7 @@ cp "$PKG/BUILDINFO" "$RD/etc/narf-mesa-amd.buildinfo"
 for f in usr/lib/libEGL.so.1 usr/lib/libgbm.so.1 usr/lib/libGLESv2.so.2 \
          usr/lib/libgallium-$MESA_VER.so usr/lib/libvulkan_radeon.so \
          usr/lib/libvulkan_lvp.so usr/lib/libdrm_amdgpu.so.1 usr/lib/libdrm.so.2 \
+         usr/lib/dri/radeonsi_drv_video.so usr/bin/vainfo usr/bin/ffmpeg \
          usr/share/libdrm/amdgpu.ids usr/share/vulkan/icd.d/radeon_icd.$ARCH.json \
          usr/share/vulkan/icd.d/lvp_icd.$ARCH.json usr/bin/mesa_amd_probe \
          usr/lib/narf/narf_ioctl_trace.so; do
@@ -108,14 +113,16 @@ TRACE=/usr/lib/narf/narf_ioctl_trace.so
 ls -l /dev/dri 2>&1
 FAIL=0
 
-# step <name> <must-succeed:1|0> cmd...  — a signal (rc >= 128) always fails.
+# step <name> <must-succeed:1|0> cmd...  — a signal (rc 129..192, the
+# shell's 128 + signo) always fails; ffmpeg's negative AVERROR exits
+# (251..255) are ordinary errors.
 step() {
     name=$1; must=$2; shift 2
     echo "MESA-AMD-STEP $name begin"
     "$@" > "$name.log" 2>&1
     rc=$?
     cat "$name.log"
-    if [ "$rc" -ge 128 ]; then
+    if [ "$rc" -gt 128 ] && [ "$rc" -le 192 ]; then
         echo "MESA-AMD-STEP $name CRASH rc=$rc"; FAIL=1
     elif [ "$must" = 1 ] && [ "$rc" != 0 ]; then
         echo "MESA-AMD-STEP $name FAIL rc=$rc"; FAIL=1
@@ -158,6 +165,22 @@ if ! grep -q 'class=llvmpipe' egl-swrast.log ||
     echo "MESA-AMD-STEP egl-swrast not all llvmpipe"; FAIL=1
 fi
 
+# Video: the radeonsi VA-API driver on every render node. Without an amdgpu
+# node vaInitialize must fail with a VA status (no VA display claims AMD),
+# vainfo and ffmpeg's VA hwaccel must exit with an error, never a signal.
+step va 1 env LD_PRELOAD=$TRACE LIBVA_DRIVER_NAME=radeonsi /usr/bin/mesa_amd_probe va
+AMD_VA=$(sed -n 's/.*va result=ok amd_va=\([0-9]*\).*/\1/p' va.log)
+if [ -z "$AMD_VA" ] || { [ "$AMD" = 0 ] && [ "$AMD_VA" != 0 ]; }; then
+    echo "MESA-AMD-STEP va unexpected amd_va=$AMD_VA amdgpu_nodes=$AMD"; FAIL=1
+fi
+NODE=$(ls /dev/dri/renderD* 2>/dev/null | head -1)
+if [ -n "$NODE" ]; then
+    step vainfo 0 env LIBVA_DRIVER_NAME=radeonsi /usr/bin/vainfo --display drm --device "$NODE"
+    step ffmpeg-vaapi 0 env LIBVA_DRIVER_NAME=radeonsi /usr/bin/ffmpeg -v error -nostdin \
+        -hwaccel vaapi -hwaccel_device "$NODE" -hwaccel_output_format vaapi \
+        -i /video/h264.mkv -vf hwdownload,format=nv12 -f md5 -
+fi
+
 if [ "$AMD" != 0 ]; then
     if grep -q 'class=amd' egl-default.log && grep -q 'driver=RADV' vk-radv.log; then
         echo "MESA-AMD-HW=amd radeonsi+RADV active"
@@ -165,12 +188,95 @@ if [ "$AMD" != 0 ]; then
         echo "MESA-AMD-HW=fallback amdgpu node present but Mesa did not use it"
     fi
 fi
-echo "MESA-AMD-SUMMARY amdgpu_nodes=$AMD radv_devices=$RADV ioctls=$(cat *.log | grep -c '^IOCTL ')"
+echo "MESA-AMD-SUMMARY amdgpu_nodes=$AMD radv_devices=$RADV amd_va=$AMD_VA ioctls=$(cat *.log | grep -c '^IOCTL ')"
 if [ "$FAIL" = 0 ]; then echo "MESA-AMD-OK"; else echo "MESA-AMD-FAIL"; fi
 SMOKE
 chmod +x "$RD/mesa-amd-smoke.sh"
 # chroot_run's default payload.
 ln -sf /mesa-amd-smoke.sh "$RD/probe.sh"
+
+cat > "$RD/mesa-amd-video.sh" <<'VIDEO'
+#!/bin/busybox sh
+# On-hardware video check (RX 6750 XT, amdgpu.navi22_accel): VA-API and
+# Vulkan video decode of the /video clips must reproduce the software
+# decoder's NV12 checksum bit for bit; VA-API encode must produce a stream
+# the software decoder reads back frame for frame. Verdict lines:
+# VIDEO-<test> PASS|FAIL, then VIDEO-OK / VIDEO-FAIL.
+[ -e /proc/self ] || mount -t proc proc /proc 2>/dev/null
+mkdir -p /tmp/video && cd /tmp/video
+export HOME=/tmp/video XDG_RUNTIME_DIR=/tmp/video LIBVA_DRIVER_NAME=radeonsi
+NODE=${NODE:-$(ls /dev/dri/renderD* 2>/dev/null | head -1)}
+[ -n "$NODE" ] || { echo "VIDEO-FAIL no render node"; exit 1; }
+FAIL=0
+verdict() { echo "VIDEO-$1 $2${3:+ $3}"; [ "$2" = FAIL ] && FAIL=1; return 0; }
+vainfo --display drm --device "$NODE" > vainfo.log 2>&1; rc=$?
+cat vainfo.log
+if [ "$rc" = 0 ] && grep -q 'VAProfileH264High.*VAEntrypointVLD' vainfo.log &&
+   grep -q 'VAProfileHEVCMain .*VAEntrypointVLD' vainfo.log &&
+   grep -q 'VAProfileAV1Profile0.*VAEntrypointVLD' vainfo.log &&
+   grep -q 'VAProfileH264High.*VAEntrypointEncSlice' vainfo.log; then
+    verdict vainfo PASS
+else
+    verdict vainfo FAIL "rc=$rc (needs H.264/HEVC/AV1 decode + H.264 encode)"
+fi
+for ref in /video/*.md5; do
+    name=$(basename "$ref" .md5); clip=$(ls /video/"$name".* | grep -v '\.md5$' | head -1)
+    want=$(cat "$ref")
+    got=$(ffmpeg -v error -nostdin -hwaccel vaapi -hwaccel_device "$NODE" \
+        -hwaccel_output_format vaapi -i "$clip" -vf hwdownload,format=nv12 -f md5 - 2>vaapi-$name.err)
+    if [ "$got" = "$want" ]; then verdict "vaapi-$name" PASS
+    else verdict "vaapi-$name" FAIL "got=$got want=$want $(head -c 300 vaapi-$name.err)"; fi
+    [ "$name" = jpeg ] && continue
+    got=$(ffmpeg -v error -nostdin -init_hw_device vulkan=vk:0 -hwaccel vulkan -hwaccel_device vk \
+        -hwaccel_output_format vulkan -i "$clip" -vf hwdownload,format=nv12 -f md5 - 2>vulkan-$name.err)
+    if [ "$got" = "$want" ]; then verdict "vulkan-$name" PASS
+    else verdict "vulkan-$name" FAIL "got=$got want=$want $(head -c 300 vulkan-$name.err)"; fi
+done
+for codec in h264 hevc; do
+    if ffmpeg -v error -nostdin -vaapi_device "$NODE" -f lavfi -i testsrc2=size=640x360:rate=30 \
+        -frames:v 60 -vf format=nv12,hwupload -c:v ${codec}_vaapi -y enc-$codec.mkv 2>enc-$codec.err; then
+        frames=$(ffmpeg -v error -nostdin -i enc-$codec.mkv -f framemd5 - 2>/dev/null | grep -vc '^#')
+        if [ "$frames" = 60 ]; then verdict "encode-$codec" PASS
+        else verdict "encode-$codec" FAIL "frames=$frames"; fi
+    else
+        verdict "encode-$codec" FAIL "$(head -c 300 enc-$codec.err)"
+    fi
+done
+if [ "$FAIL" = 0 ]; then echo "VIDEO-OK"; else echo "VIDEO-FAIL"; fi
+VIDEO
+chmod +x "$RD/mesa-amd-video.sh"
+
+# Known clips and their software-decode NV12 checksums, made with the
+# image's own ffmpeg (single-threaded, bitexact): H.264 High, HEVC Main,
+# AV1 Main (whichever AV1 encoder Alpine's ffmpeg has) and a baseline JPEG.
+# Hardware decode must reproduce these bit for bit.
+mkdir -p "$RD/video"
+cat > "$RD/video/make.sh" <<'CLIPS'
+#!/bin/busybox sh
+cd /video
+SRC="-f lavfi -i testsrc2=size=1280x720:rate=30 -frames:v 30 -pix_fmt yuv420p -threads 1 -fflags +bitexact"
+ffmpeg -v error -nostdin $SRC -c:v libx264 -profile:v high -y h264.mkv
+ffmpeg -v error -nostdin $SRC -c:v libx265 -x265-params log-level=error:pools=none:frame-threads=1 -y hevc.mkv
+ffmpeg -v error -nostdin $SRC -c:v libaom-av1 -cpu-used 8 -y av1.mkv 2>/dev/null ||
+    ffmpeg -v error -nostdin $SRC -c:v libsvtav1 -preset 12 -y av1.mkv 2>/dev/null || rm -f av1.mkv
+ffmpeg -v error -nostdin -f lavfi -i testsrc2=size=1280x720 -frames:v 1 -pix_fmt yuvj420p -y jpeg.jpg
+for f in h264.mkv hevc.mkv av1.mkv jpeg.jpg; do
+    [ -s "$f" ] || continue
+    ffmpeg -v error -nostdin -i "$f" -vf format=nv12 -f md5 - > "${f%.*}.md5"
+done
+ls -l /video
+CLIPS
+if [ "${MESA_AMD_NO_CLIPS:-0}" != 1 ]; then
+    echo "generating /video clips with the image's ffmpeg"
+    unshare --user --map-root-user --mount --fork /bin/sh -c '
+        RD="$1"
+        mkdir -p "$RD/proc" "$RD/dev" "$RD/tmp"
+        mount --rbind /dev "$RD/dev"; mount --rbind /proc "$RD/proc"
+        mount -t tmpfs tmpfs "$RD/tmp"
+        exec chroot "$RD" /usr/bin/env -i PATH=/usr/bin:/bin /bin/busybox sh /video/make.sh
+    ' -- "$RD" || { echo "clip generation failed" >&2; exit 1; }
+    [ -s "$RD/video/h264.md5" ] || { echo "no H.264 reference clip" >&2; exit 1; }
+fi
 
 if [ "${MESA_AMD_HOST_CHECK:-0}" = 1 ]; then
     echo "running /mesa-amd-smoke.sh on this host (user-namespace chroot)"

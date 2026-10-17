@@ -1718,6 +1718,34 @@ impl ColdBoot {
         .map_err(Error::Queues)
     }
 
+    // ── Client media submission (amdgpu_vcn_navi22_cs) ─────────────────
+    /// Media rings that accept client jobs (bit `MediaRing::index()`) and
+    /// their lock-free fence reader; None without a verified media owner.
+    pub fn client_media(&self) -> Option<(u8, crate::amdgpu_vcn_navi22::MediaFenceReader)> {
+        let media = self.sequence.backend.media.as_ref()?;
+        let rings = media.client_rings();
+        (rings != 0).then(|| (rings, media.fence_reader()))
+    }
+    /// Queue a client job on a verified media ring (`Media::submit`).
+    pub fn submit_media(
+        &mut self,
+        ring: crate::amdgpu_navi22_submit::MediaRing,
+        vm: crate::amdgpu_navi22_submit::VmRef,
+        ibs: &[crate::amdgpu_navi22_submit::Ib],
+        copies: &[alloc::vec::Vec<u32>],
+    ) -> Result<u32, Error> {
+        let media = self.sequence.backend.media.as_mut().ok_or(Error::Invalid)?;
+        media.submit(ring, vm, ibs, copies).map_err(Error::Media)
+    }
+    /// (last completed, throttle) fence sequences of client media `ring`.
+    pub fn media_fences(
+        &mut self,
+        ring: crate::amdgpu_navi22_submit::MediaRing,
+    ) -> Result<(u32, u32), Error> {
+        let media = self.sequence.backend.media.as_mut().ok_or(Error::Invalid)?;
+        media.client_fences(ring).map_err(Error::Media)
+    }
+
     // ── Native display presentation (amdgpu_navi22_kms) ────────────────
     /// Light `connector` with `sink` at `want` (None: its preferred mode),
     /// filling rows with `draw` before fetch starts, then adopt the pipe for

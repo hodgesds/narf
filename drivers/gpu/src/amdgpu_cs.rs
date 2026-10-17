@@ -93,6 +93,8 @@ const IB_PACKET_SIZE_MAX_DW: u64 = 0xF_FFFF;
 const MAX_IBS_GFX: usize = 192;
 /// `amdgpu_ring_max_ibs(AMDGPU_RING_TYPE_COMPUTE)`.
 const MAX_IBS_COMPUTE: usize = 125;
+/// `AMDGPU_RING_TYPE_VCN_JPEG`.
+const MAX_IBS_JPEG: usize = 16;
 /// Everything else.
 const MAX_IBS_OTHER: usize = 49;
 
@@ -193,6 +195,7 @@ fn max_ibs(ip_type: u32) -> usize {
     match ip_type {
         uapi::AMDGPU_HW_IP_GFX => MAX_IBS_GFX,
         uapi::AMDGPU_HW_IP_COMPUTE => MAX_IBS_COMPUTE,
+        uapi::AMDGPU_HW_IP_VCN_JPEG => MAX_IBS_JPEG,
         _ => MAX_IBS_OTHER,
     }
 }
@@ -262,7 +265,12 @@ fn parse_ib(words: &[u32], vm: &VmState) -> Result<Ib, FsError> {
     // honest one for this driver.
     if !matches!(
         ip_type,
-        uapi::AMDGPU_HW_IP_GFX | uapi::AMDGPU_HW_IP_COMPUTE | uapi::AMDGPU_HW_IP_DMA
+        uapi::AMDGPU_HW_IP_GFX
+            | uapi::AMDGPU_HW_IP_COMPUTE
+            | uapi::AMDGPU_HW_IP_DMA
+            | uapi::AMDGPU_HW_IP_VCN_DEC
+            | uapi::AMDGPU_HW_IP_VCN_ENC
+            | uapi::AMDGPU_HW_IP_VCN_JPEG
     ) {
         return Err(FsError::InvalidData);
     }

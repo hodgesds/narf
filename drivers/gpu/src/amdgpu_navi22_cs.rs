@@ -30,7 +30,7 @@
 //! is no SPM/debugger user.
 //!
 //! Tickets are `ring << 32 | sequence`; the ring index carries the GPU
-//! recovery epoch above its two ring bits, so a ticket from before a
+//! recovery epoch above its three ring-id bits, so a ticket from before a
 //! recovery names a ring no current queue has and reads as complete
 //! (abandoned) instead of being compared with the new queues' sequences.
 //!
@@ -69,21 +69,27 @@ pub fn ring_id(ip_type: u32, ip_instance: u32, ring: u32) -> Option<usize> {
         (uapi::AMDGPU_HW_IP_GFX, 0, 0) => Some(0),
         (uapi::AMDGPU_HW_IP_COMPUTE, 0, 0..=3) => Some(1),
         (uapi::AMDGPU_HW_IP_DMA, 0, r @ 0..=1) => Some(2 + r as usize),
-        _ => None,
+        // VCN decode/encode and JPEG: ids 4..=7 (amdgpu_vcn_navi22_cs).
+        _ => crate::amdgpu_vcn_navi22_cs::ring_id(ip_type, ip_instance, ring),
     }
 }
+/// Ticket ring ids: the four kernel queues, then the four media rings.
+pub const RING_IDS: usize = 8; // linux: n/a (NARF ticket ring ids)
 /// The ticket ring index of ring `id` in recovery epoch `epoch`.
 pub const fn ring_index(epoch: u64, id: usize) -> u32 {
-    ((epoch as u32 & 0xff) << 2) | id as u32
+    ((epoch as u32 & 0xff) << 3) | id as u32
 }
 /// Whether `ticket` completed, given each ring's completed sequence in
 /// `epoch`. Tickets of another epoch were abandoned by a recovery.
-pub fn job_done(epoch: u64, completed: [u32; 4], ticket: u64) -> bool {
+/// `completed` holds the first `N` ring ids' sequences (`RING_IDS` in
+/// production); a ring beyond them has completed nothing.
+pub fn job_done<const N: usize>(epoch: u64, completed: [u32; N], ticket: u64) -> bool {
     let index = (ticket >> 32) as u32;
-    if index & !3 != ring_index(epoch, 0) {
+    if index & !7 != ring_index(epoch, 0) {
         return true;
     }
-    crate::amdgpu_fence_navi22::signaled(completed[(index & 3) as usize], ticket as u32)
+    let done = completed.get((index & 7) as usize).copied().unwrap_or(0);
+    crate::amdgpu_fence_navi22::signaled(done, ticket as u32)
 }
 /// The ring's scheduler entity for a job: Linux compares the entity's fence
 /// context (`ring->current_ctx`), one per (open's VM, context) and ring. Low
@@ -145,10 +151,13 @@ pub struct Submitter {
 impl Submitter {
     /// Every ring's completed sequence, retiring what completed jobs held
     /// and writing their user fences. None when the device stopped answering.
-    fn progress(&self) -> Option<[u32; 4]> {
-        let mut completed = [0; 4];
+    fn progress(&self) -> Option<[u32; RING_IDS]> {
+        let mut completed = [0; RING_IDS];
         for (i, c) in completed.iter_mut().enumerate() {
-            *c = self.reader.completed(i).ok()?;
+            *c = match i.checked_sub(crate::amdgpu_vcn_navi22_cs::FIRST_ID) {
+                None => self.reader.completed(i).ok()?,
+                Some(media) => crate::amdgpu_vcn_navi22_cs::completed(media).ok()?,
+            };
         }
         let epoch = self.epoch;
         crate::amdgpu_cs::retire(self.card, &|t| job_done(epoch, completed, t));
@@ -219,6 +228,16 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             let index = ring_index(self.epoch, id);
             let request = grab_request(vm, page_table_base, pasid, index);
             let context = entity(request.owner, submission.ctx_id);
+            if id >= crate::amdgpu_vcn_navi22_cs::FIRST_ID {
+                // VCN/JPEG: MMHUB VMIDs of their own (amdgpu_vcn_navi22_cs).
+                let progress = || self.progress();
+                let seq = crate::amdgpu_vcn_navi22_cs::submit(
+                    vm, submission, request, self.epoch, &progress,
+                )
+                .await?;
+                let _ = self.progress();
+                return Ok(u64::from(index) << 32 | u64::from(seq));
+            }
             let ring = RINGS[id];
             let deadline = narf_time::monotonic_ns().saturating_add(THROTTLE_NS);
             let seq = loop {
@@ -344,6 +363,7 @@ pub async fn register(boot: &mut crate::amdgpu_navi22_boot::ColdBoot) {
             );
         }
     }
+    crate::amdgpu_vcn_navi22_cs::register(boot, first, last);
     crate::amdgpu_cs::register_submitter(
         card,
         Arc::new(Submitter {
@@ -364,6 +384,7 @@ pub fn unregister() {
         crate::amdgpu_cs::unregister_submitter(card);
         crate::amdgpu_gem::unregister_vram_heap(card);
     }
+    crate::amdgpu_vcn_navi22_cs::unregister();
     // Its owner is being replaced; the handle must not reach the new one.
     let _ = CLIENT_VMIDS.lock().take();
 }
@@ -387,7 +408,7 @@ mod tests {
             return TestResult::Fail("amdgpu_ctx_get_entity mapping");
         }
         let ticket = |epoch, id, seq: u32| u64::from(ring_index(epoch, id)) << 32 | u64::from(seq);
-        let done = [10, 0, 7, u32::MAX];
+        let done = [10, 0, 7, u32::MAX, 0, 0, 0, 0];
         let cases = [
             (job_done(0, done, ticket(0, 0, 10)), true),
             (job_done(0, done, ticket(0, 0, 11)), false),
@@ -400,8 +421,8 @@ mod tests {
         if cases.iter().any(|(got, want)| got != want) {
             return TestResult::Fail("ticket completion or epoch abandonment");
         }
-        // The generic VmState's ring slot (`ticket >> 32 % 4`) is the ring id.
-        if (ring_index(5, 3) % 4) != 3 {
+        // The generic VmState's ring slot (`ticket >> 32 % 8`) is the ring id.
+        if (ring_index(5, 3) % 8) != 3 || (ring_index(5, 7) % 8) != 7 {
             return TestResult::Fail("epoch tag leaked into the ring slot");
         }
         TestResult::Pass

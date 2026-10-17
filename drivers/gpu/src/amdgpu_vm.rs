@@ -510,7 +510,7 @@ pub struct Mapping {
 }
 
 /// Rings an address space tracks jobs on (`amdgpu_cs` ticket ring indices).
-const RINGS: usize = 4;
+const RINGS: usize = 8;
 
 /// A recorded mapping and the buffer it maps. The record keeps the buffer
 /// alive (`amdgpu_bo_va` holds its BO in Linux): a client that closes the
@@ -561,6 +561,10 @@ impl Drop for VmState {
         // charged to the next space given the same PASID.
         let pasid = self.pasid.lock().take();
         self.release((root, mappings, pasid));
+        // Its media decode sessions close with it (amdgpu_uvd_free_handles).
+        crate::amdgpu_vcn_navi22_cs::forget_owner(
+            self.owner.load(core::sync::atomic::Ordering::Acquire),
+        );
     }
 }
 

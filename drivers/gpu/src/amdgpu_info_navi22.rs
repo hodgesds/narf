@@ -241,6 +241,12 @@ pub struct Published {
     /// PCI config revision (offset 0x08), `pdev->revision`.
     pub pci_revision: Option<u8>,
     pub boot: Option<Boot>,
+    /// `adev->vcn.harvest_config` (discovery harvest table plus the Navy
+    /// Flounder quirk), published by the platform owner before the boot.
+    pub vcn_harvest: Option<u8>,
+    /// Media rings that take client jobs (bit `MediaRing::index()`: dec,
+    /// enc0, enc1, JPEG), published by `amdgpu_vcn_navi22_cs::register`.
+    pub media_rings: u8,
 }
 
 /// `available_rings` per IP once [`SUBMISSION`] is wired: Linux's
@@ -258,10 +264,26 @@ fn available_rings(published: &Published, submission: Submission, ip: u32) -> u3
     if !accepting(published, submission) {
         return 0;
     }
+    if let Some(mask) = media_available_rings(published, ip) {
+        return mask;
+    }
     LINUX_RINGS
         .iter()
         .find(|(t, _)| *t == ip)
         .map_or(0, |(_, mask)| *mask)
+}
+/// `amdgpu_hw_ip_info` for the media IPs: `(1 << min(1 entity, ready
+/// rings)) - 1` over the rings that passed their tests and take client
+/// jobs — VCN instance 0's decode ring, its encode rings, the JPEG ring.
+fn media_available_rings(published: &Published, ip: u32) -> Option<u32> {
+    let rings = published.media_rings;
+    let ready = match ip {
+        uapi::AMDGPU_HW_IP_VCN_DEC => rings & 1 != 0,
+        uapi::AMDGPU_HW_IP_VCN_ENC => rings & 0b110 != 0,
+        uapi::AMDGPU_HW_IP_VCN_JPEG => rings & 0b1000 != 0,
+        _ => return None,
+    };
+    Some(u32::from(ready))
 }
 
 fn gc(snap: &Snapshot) -> Option<&IpBlock> {
@@ -401,6 +423,14 @@ fn hw_ip_count(snap: &Snapshot, submission: Submission, ip: u32) -> Result<Vec<u
                 .iter()
                 .filter(|b| matches!(b.hw_id, discovery::HW_ID_SDMA0 | discovery::HW_ID_SDMA1))
                 .count() as u32,
+            // `adev->vcn.num_vcn_inst`: every discovered instance, harvested
+            // ones included; JPEG is `num_jpeg_inst * num_jpeg_rings` = 1.
+            uapi::AMDGPU_HW_IP_VCN_DEC | uapi::AMDGPU_HW_IP_VCN_ENC => {
+                snap.ip_blocks
+                    .iter()
+                    .filter(|b| b.hw_id == discovery::HW_ID_VCN)
+                    .count() as u32
+            }
             _ => 1,
         }
     };
@@ -524,11 +554,13 @@ fn vram_gtt(snap: &Snapshot) -> Vec<u8> {
     })
 }
 
-/// `AMDGPU_INFO_VIDEO_CAPS` (`nv_query_video_codecs`): VCN instances absent
-/// from discovery are harvested. Linux answers it whether or not media rings
-/// run; Mesa only acts on it once VCN rings are advertised (they are not).
+/// `AMDGPU_INFO_VIDEO_CAPS` (`nv_query_video_codecs`) with this card's
+/// `harvest_config`: the published harvest table (VCN1 harvested on the RX
+/// 6750 XT, so decode reports `sc_video_codecs_decode_vcn0`, AV1 included),
+/// plus every VCN instance absent from discovery. Linux answers it whether
+/// or not media rings run; Mesa acts on it once VCN rings are advertised.
 fn video_caps(snap: &Snapshot, kind: u32) -> Result<Vec<u8>, FsError> {
-    let mut harvested = 0u8;
+    let mut harvested = snap.navi22.vcn_harvest.unwrap_or(0) & 3;
     for inst in 0..2u8 {
         if discovery::find_ip(&snap.ip_blocks, discovery::HW_ID_VCN, inst).is_none() {
             harvested |= 1 << inst;

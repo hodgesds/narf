@@ -29,6 +29,11 @@
 #                      when this build replaces Alpine's.
 #   amdgpu-virtio      As Alpine builds it: radeonsi/RADV over a virtio-gpu
 #                      DRM native context (XTASK_GPU_DRM_NATIVE=1).
+#   gallium-va         VA-API for radeonsi (/usr/lib/dri/radeonsi_drv_video.so)
+#                      over the VCN 3.0 decode/encode and JPEG 3.0 rings, with
+#                      every codec (-Dvideo-codecs=all, as Alpine builds it).
+#                      RADV's Vulkan video (VK_KHR_video_decode/encode_*)
+#                      comes with the same codec list. libva is Alpine's.
 #
 # Output (target/ is git-ignored):
 #   target/narf-mesa-amd/narf-mesa-amd-26.2.4-x86_64.tar.gz  install tree
@@ -88,8 +93,9 @@ if [ ! -x "$BR/usr/bin/meson" ]; then
     tar -xzf "$WORK/apk.apk" -C "$WORK/apk" 2>/dev/null
     mkdir -p "$BR/etc/apk"
     # Build dependencies of Alpine's mesa APKBUILD (llvm23, as Alpine's
-    # 26.2.4-r1), minus the rusticl/clang/VA-API/cbindgen ones this
-    # configuration does not use, plus vulkan-headers for the probes.
+    # 26.2.4-r1), minus the rusticl/clang/cbindgen ones this configuration
+    # does not use, plus vulkan-headers for the probes; libva-dev for
+    # gallium-va.
     # --usermode: apk-tools 3 refuses to create a database as non-root
     # otherwise; every file is owned by the invoking user, which is root
     # inside the build namespace below.
@@ -104,7 +110,13 @@ if [ ! -x "$BR/usr/bin/meson" ]; then
         libdisplay-info-dev wayland-dev wayland-protocols \
         libx11-dev libxext-dev libxfixes-dev libxrandr-dev libxxf86vm-dev \
         libxdamage-dev libxshmfence-dev libxcb-dev xorgproto \
-        vulkan-loader-dev vulkan-headers
+        vulkan-loader-dev vulkan-headers libva-dev
+fi
+# Build roots made before VA-API was enabled lack libva-dev.
+if [ ! -f "$BR/usr/include/va/va.h" ]; then
+    "$WORK/apk/sbin/apk.static" --root "$BR" --arch "$ARCH" --usermode \
+        -X "$CDN/$ALPINE/main" -X "$CDN/$ALPINE/community" \
+        --allow-untrusted --no-cache add libva-dev
 fi
 
 # A fresh copy of the sources each run, so an aborted build never leaves a
@@ -127,7 +139,7 @@ MESA_OPTS="--prefix=/usr --libdir=lib --sysconfdir=/etc --localstatedir=/var
  -Dvulkan-drivers=amd,swrast -Dvulkan-layers=device-select
  -Damd-use-llvm=false -Damdgpu-virtio=true
  -Dllvm=enabled -Dshared-llvm=enabled
- -Dgallium-va=disabled -Dgallium-rusticl=false -Dvideo-codecs=
+ -Dgallium-va=enabled -Dgallium-rusticl=false -Dvideo-codecs=all
  -Dexpat=enabled -Dzstd=enabled -Dshader-cache=enabled -Dxmlconfig=enabled
  -Dallow-kcmp=enabled -Dxlib-lease=enabled
  -Ddri-drivers-path=/usr/lib/dri -Dbuild-tests=false"
@@ -155,7 +167,10 @@ DESTDIR=/stage meson install -C /bld/libdrm --no-rebuild --quiet
 meson install -C /bld/libdrm --no-rebuild --quiet
 
 cd /src/mesa-$MESA_VER
+# A build dir configured with other options (e.g. before VA-API) starts over.
+cmp -s /bld/mesa.opts /bld/mesa.opts.want 2>/dev/null || rm -rf /bld/mesa
 [ -f /bld/mesa/build.ninja ] || meson setup /bld/mesa . $(echo $MESA_OPTS)
+cp /bld/mesa.opts.want /bld/mesa.opts
 meson configure --no-pager /bld/mesa > /bld/mesa-configure.txt
 ninja -C /bld/mesa -j $JOBS
 DESTDIR=/stage meson install -C /bld/mesa --no-rebuild --quiet
@@ -165,7 +180,7 @@ meson install -C /bld/mesa --no-rebuild --quiet
 # mesa_amd_probe.c / narf_ioctl_trace.c in verification/data/musl-demo).
 mkdir -p /stage/usr/bin /stage/usr/lib/narf
 cc -O2 -g -Wall -Wextra -DNARF_MESA_VER=\"$MESA_VER\" -o /stage/usr/bin/mesa_amd_probe /probes/mesa_amd_probe.c \
-   -I/usr/include/libdrm -ldrm -ldrm_amdgpu -lEGL -lGLESv2 -lgbm -lvulkan -ldl
+   -I/usr/include/libdrm -ldrm -ldrm_amdgpu -lEGL -lGLESv2 -lgbm -lvulkan -lva -lva-drm -ldl
 cc -O2 -g -Wall -Wextra -shared -fPIC -o /stage/usr/lib/narf/narf_ioctl_trace.so \
    /probes/narf_ioctl_trace.c -I/usr/include/libdrm -ldl
 
@@ -173,6 +188,7 @@ apk info -v 2>/dev/null | sort > /stage-buildroot-packages.txt
 EOF
 chmod +x "$BR/build.sh"
 mkdir -p "$BR/bld"
+printf '%s\n' "$MESA_OPTS" > "$BR/bld/mesa.opts.want"
 
 echo "building libdrm $LIBDRM_VER + Mesa $MESA_VER in the Alpine $ALPINE build root (-j$JOBS)"
 unshare --user --map-root-user --mount --fork /bin/sh -c '

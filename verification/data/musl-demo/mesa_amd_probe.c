@@ -1,6 +1,6 @@
 // Mesa AMD driver probe for NARF (Navi22 milestone 9).
 //
-// One binary, four subcommands, each printing grep-able `MESAPROBE` lines.
+// One binary, five subcommands, each printing grep-able `MESAPROBE` lines.
 // It is the payload of /mesa-amd-smoke.sh in the image REGEN_amd_gl_rootfs.sh
 // builds, and the first thing to run on bare metal:
 //
@@ -19,6 +19,12 @@
 //                        and the GBM platform a KMS compositor uses — then a
 //                        GLES2 triangle into a 64x64 FBO with pixel readback.
 //                        The renderer string says which driver Mesa picked.
+//   mesa_amd_probe va    VA-API (libva-drm) on every render node with the
+//                        driver LIBVA_DRIVER_NAME names (radeonsi in the
+//                        smoke): vaInitialize, then on success the decode /
+//                        encode profiles the VCN 3.0 / JPEG 3.0 rings expose.
+//                        On a non-amdgpu node the expected answer is a clean
+//                        VA error, never a signal.
 //
 // Exit status: 0 when every step either worked or failed the way a missing
 // device should (an error code, never a signal); 1 when something that must
@@ -44,6 +50,8 @@
 #include <GLES2/gl2.h>
 #include <gbm.h>
 #include <vulkan/vulkan.h>
+#include <va/va.h>
+#include <va/va_drm.h>
 
 #define P(...) printf("MESAPROBE " __VA_ARGS__)
 
@@ -91,6 +99,27 @@ static int cmd_libs(void)
         bad = 1;
     }
     P("libs path=/usr/lib/dri/radeonsi_dri.so present=%d\n", access("/usr/lib/dri/radeonsi_dri.so", F_OK) == 0);
+    // gallium-va: the VA-API driver libva loads for amdgpu (radeonsi), which
+    // exports __vaDriverInit_<libva major>_<minor> for the libva it was
+    // built against.
+    const char *va = "/usr/lib/dri/radeonsi_drv_video.so";
+    void *d = dlopen(va, RTLD_NOW | RTLD_LOCAL);
+    P("libs path=%s dlopen=%s%s%s\n", va, d ? "ok" : "fail", d ? "" : " err=", d ? "" : dlerror());
+    if (d) {
+        char sym[32] = "";
+        for (int minor = 0; minor < 64 && !sym[0]; minor++) {
+            char name[32];
+            snprintf(name, sizeof(name), "__vaDriverInit_1_%d", minor);
+            if (dlsym(d, name))
+                snprintf(sym, sizeof(sym), "%s", name);
+        }
+        P("libs path=%s sym=%s\n", va, sym[0] ? sym : "__vaDriverInit_1_* missing");
+        if (!sym[0])
+            bad = 1;
+        dlclose(d);
+    } else {
+        bad = 1;
+    }
     void *v = dlopen("/usr/lib/libvulkan_radeon.so", RTLD_NOW | RTLD_LOCAL);
     P("libs path=/usr/lib/libvulkan_radeon.so dlopen=%s%s%s\n", v ? "ok" : "fail", v ? "" : " err=",
       v ? "" : dlerror());
@@ -252,6 +281,35 @@ static int cmd_vk(void)
         P("vk  device[%u] name=\"%s\" vendor=0x%x device=0x%x type=%d driver=%s info=\"%s\"\n", i,
           p2.properties.deviceName, p2.properties.vendorID, p2.properties.deviceID, p2.properties.deviceType,
           driver_id_name(drv.driverID), drv.driverInfo);
+        // Vulkan video (RADV on VCN): the codec extensions and the queue
+        // families with video decode/encode capability.
+        static const char *const video[] = {
+            "VK_KHR_video_queue", "VK_KHR_video_decode_queue", "VK_KHR_video_decode_h264",
+            "VK_KHR_video_decode_h265", "VK_KHR_video_decode_av1", "VK_KHR_video_encode_queue",
+            "VK_KHR_video_encode_h264", "VK_KHR_video_encode_h265", NULL,
+        };
+        uint32_t ne = 0;
+        vkEnumerateDeviceExtensionProperties(pd[i], NULL, &ne, NULL);
+        VkExtensionProperties *ext = ne ? calloc(ne, sizeof(*ext)) : NULL;
+        if (ext)
+            vkEnumerateDeviceExtensionProperties(pd[i], NULL, &ne, ext);
+        for (int v = 0; video[v]; v++) {
+            int has = 0;
+            for (uint32_t e = 0; ext && e < ne; e++)
+                has |= !strcmp(ext[e].extensionName, video[v]);
+            P("vk  device[%u] ext %s=%d\n", i, video[v], has);
+        }
+        free(ext);
+        uint32_t nq = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(pd[i], &nq, NULL);
+        VkQueueFamilyProperties qf[16];
+        if (nq > 16)
+            nq = 16;
+        vkGetPhysicalDeviceQueueFamilyProperties(pd[i], &nq, qf);
+        for (uint32_t q = 0; q < nq; q++)
+            P("vk  device[%u] queue[%u] flags=0x%x count=%u video_decode=%d video_encode=%d\n", i, q,
+              qf[q].queueFlags, qf[q].queueCount, !!(qf[q].queueFlags & VK_QUEUE_VIDEO_DECODE_BIT_KHR),
+              !!(qf[q].queueFlags & VK_QUEUE_VIDEO_ENCODE_BIT_KHR));
     }
     vkDestroyInstance(inst, NULL);
     P("vk result=ok devices=%u\n", n);
@@ -415,11 +473,93 @@ static int cmd_egl(void)
     return bad;
 }
 
+// -------------------------------------------------------------------- va ---
+static const char *va_profile_name(VAProfile p)
+{
+    switch (p) {
+    case VAProfileMPEG2Main: return "MPEG2Main";
+    case VAProfileVC1Advanced: return "VC1Advanced";
+    case VAProfileH264ConstrainedBaseline: return "H264ConstrainedBaseline";
+    case VAProfileH264Main: return "H264Main";
+    case VAProfileH264High: return "H264High";
+    case VAProfileHEVCMain: return "HEVCMain";
+    case VAProfileHEVCMain10: return "HEVCMain10";
+    case VAProfileVP9Profile0: return "VP9Profile0";
+    case VAProfileVP9Profile2: return "VP9Profile2";
+    case VAProfileAV1Profile0: return "AV1Profile0";
+    case VAProfileJPEGBaseline: return "JPEGBaseline";
+    default: return NULL;
+    }
+}
+
+static int cmd_va(void)
+{
+    const char *driver = getenv("LIBVA_DRIVER_NAME");
+    P("va driver=%s\n", driver ? driver : "(libva default)");
+    int amd = 0;
+    DIR *dir = opendir("/dev/dri");
+    if (!dir) {
+        P("va result=ok amd_va=0 nodes=0\n");
+        return 0;
+    }
+    struct dirent *de;
+    int nodes = 0;
+    while ((de = readdir(dir))) {
+        if (strncmp(de->d_name, "renderD", 7))
+            continue;
+        char path[64];
+        snprintf(path, sizeof(path), "/dev/dri/%s", de->d_name);
+        int fd = open(path, O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            P("va node=%s open=%d\n", path, -errno);
+            continue;
+        }
+        nodes++;
+        VADisplay dpy = vaGetDisplayDRM(fd);
+        int major = 0, minor = 0;
+        VAStatus st = dpy ? vaInitialize(dpy, &major, &minor) : VA_STATUS_ERROR_INVALID_DISPLAY;
+        P("va node=%s vaInitialize=%d (%s)\n", path, st, vaErrorStr(st));
+        if (st == VA_STATUS_SUCCESS) {
+            const char *vendor = vaQueryVendorString(dpy);
+            P("va node=%s api=%d.%d vendor=\"%s\"\n", path, major, minor, vendor ? vendor : "");
+            if (vendor && (strstr(vendor, "AMD") || strstr(vendor, "radeonsi")))
+                amd++;
+            int np = vaMaxNumProfiles(dpy), ne = vaMaxNumEntrypoints(dpy);
+            VAProfile *profiles = calloc(np > 0 ? np : 1, sizeof(*profiles));
+            VAEntrypoint *eps = calloc(ne > 0 ? ne : 1, sizeof(*eps));
+            int count = 0;
+            if (profiles && eps && vaQueryConfigProfiles(dpy, profiles, &count) == VA_STATUS_SUCCESS) {
+                for (int i = 0; i < count; i++) {
+                    const char *name = va_profile_name(profiles[i]);
+                    int n = 0;
+                    if (!name || vaQueryConfigEntrypoints(dpy, profiles[i], eps, &n) != VA_STATUS_SUCCESS)
+                        continue;
+                    int dec = 0, enc = 0;
+                    for (int e = 0; e < n; e++) {
+                        dec |= eps[e] == VAEntrypointVLD;
+                        enc |= eps[e] == VAEntrypointEncSlice || eps[e] == VAEntrypointEncSliceLP;
+                    }
+                    P("va node=%s profile=%s decode=%d encode=%d\n", path, name, dec, enc);
+                }
+            }
+            free(profiles);
+            free(eps);
+            vaTerminate(dpy);
+        } else if (dpy) {
+            vaTerminate(dpy);
+        }
+        close(fd);
+    }
+    closedir(dir);
+    P("va result=ok amd_va=%d nodes=%d\n", amd, nodes);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc < 2) {
-        fprintf(stderr, "usage: %s libs|drm|vk|egl\n", argv[0]);
+        fprintf(stderr, "usage: %s libs|drm|vk|egl|va\n", argv[0]);
         return 2;
     }
     if (!strcmp(argv[1], "libs"))
@@ -430,6 +570,8 @@ int main(int argc, char **argv)
         return cmd_vk();
     if (!strcmp(argv[1], "egl"))
         return cmd_egl();
+    if (!strcmp(argv[1], "va"))
+        return cmd_va();
     fprintf(stderr, "unknown subcommand %s\n", argv[1]);
     return 2;
 }

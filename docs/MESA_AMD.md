@@ -68,9 +68,18 @@ sh verification/data/musl-demo/REGEN_mesa_amd.sh
     when this build replaces Alpine's; `amdgpu-virtio` lets radeonsi/RADV run
     over a virtio-gpu DRM native context (`XTASK_GPU_DRM_NATIVE=1`) where the
     host supports it.
-  - Not built: VA-API, video codecs, rusticl, zink, other vendors' drivers.
+  - `gallium-va=enabled`, `video-codecs=all` (as Alpine): radeonsi's VA-API
+    driver (`/usr/lib/dri/radeonsi_drv_video.so`, against Alpine's libva)
+    and RADV's Vulkan video (`VK_KHR_video_decode/encode_*`) over the VCN
+    3.0 decode/encode and JPEG 3.0 rings the kernel exposes behind
+    `amdgpu.navi22_accel` (`amdgpu_vcn_navi22_cs`).
+  - Not built: rusticl, zink, VDPAU, other vendors' drivers.
 - **Also built:** `mesa_amd_probe` and `narf_ioctl_trace.so`, against the
   just-installed libraries.
+
+A build directory configured with different meson options (for example one
+made before VA-API was enabled) is discarded and configured again; an older
+build root gets `libva-dev` added.
 
 Outputs (`target/narf-mesa-amd/`): the install tree as
 `narf-mesa-amd-26.2.4-x86_64.tar.gz`, `MANIFEST.sha256` (per-file), and
@@ -91,11 +100,19 @@ builds `target/narf-amd-gl-vblk.img` (ext2, mounted by NARF at `/mnt`):
    libelf, libxcb, wayland, libdisplay-info, eudev-libs, …), plus the
    on-hardware test clients: `mesa-demos` (eglinfo/glxinfo),
    `vulkan-tools` (vulkaninfo/vkcube), `kmscube`, weston with the DRM
-   backend and `weston-simple-egl`, and `strace`.
+   backend and `weston-simple-egl`, `strace`, and for video `libva`,
+   `libva-utils` (vainfo) and `ffmpeg` (VA-API and Vulkan hwaccels).
 2. Every file Alpine's mesa packages installed is deleted, then the
    from-source tree is extracted over `/` (runtime files only). A missing
    radeonsi/RADV/lavapipe/libdrm_amdgpu file aborts the build.
-3. `/mesa-amd-smoke.sh` (also `/probe.sh`, `chroot_run`'s default payload).
+3. `/mesa-amd-smoke.sh` (also `/probe.sh`, `chroot_run`'s default payload),
+   and `/mesa-amd-video.sh`, the on-hardware video check.
+4. `/video`: reference clips made with the image's own ffmpeg at build time
+   (30 frames of `testsrc2` 1280×720: H.264 High via libx264, HEVC Main via
+   libx265, AV1 via libaom/libsvtav1 when present, one baseline JPEG) and
+   each one's software-decode NV12 MD5 (`-vf format=nv12 -f md5`). The
+   generation runs in a user-namespace chroot of the image;
+   `MESA_AMD_NO_CLIPS=1` skips it.
 
 **Driver selection** needs no configuration. Mesa's loader maps the kernel
 driver name from `DRM_IOCTL_VERSION` to a gallium driver: `amdgpu` →
@@ -139,9 +156,14 @@ exit status checked (a signal always fails the run):
 | `egl-default` | EGL device + GBM platforms with the loader's own choice, plus a GLES2 triangle with pixel readback | rc 0, correct pixels |
 | `egl-radeonsi` | radeonsi forced on every node (`MESA_LOADER_DRIVER_OVERRIDE`) | rc 0, no `class=amd`, falls back |
 | `egl-swrast` | the llvmpipe fallback the desktops use | every renderer llvmpipe |
+| `va` | radeonsi's VA driver through libva-drm on every render node (`LIBVA_DRIVER_NAME=radeonsi`), plus `mesa_amd_probe libs` resolving `__vaDriverInit_1_*` | rc 0, `amd_va=0`, each node a VA error status |
+| `vainfo` | the libva-utils client the on-hardware list starts with | any rc, no signal |
+| `ffmpeg-vaapi` | ffmpeg's VA hwaccel on `/video/h264.mkv` | any rc, no signal |
 
 `IOCTL …` lines interleaved in the output come from `narf_ioctl_trace.so`
-(LD_PRELOAD on the `drm`, `vk-radv` and `egl-*` steps): one line per DRM
+(LD_PRELOAD on the `drm`, `vk-radv`, `egl-*` and `va` steps). A step
+"crashes" only on a signal exit (129–192); ffmpeg's negative AVERROR exits
+(251–255) are ordinary errors: one line per DRM
 ioctl with the AMDGPU_INFO query decoded and the kernel's answer.
 `MESA_AMD_HOST_CHECK=1 sh REGEN_amd_gl_rootfs.sh` runs the same script in a
 user-namespace chroot on the build host; on a Linux host with an amdgpu GPU
@@ -162,6 +184,15 @@ init fails cleanly, GBM falls back to kms_swrast). The kernel's
 `ld-musl` must be staged for `chroot_run` to exec — on a host without a musl
 package, point `LDMUSL_PATH` at the build root's
 `/lib/ld-musl-x86_64.so.1`.
+
+**Video under QEMU** (2026-10-17, VA-API + Vulkan video build, same
+backend): `MESA-AMD-OK`. `libs` resolves `__vaDriverInit_1_24` in
+`radeonsi_drv_video.so` (libva 2.24); `va` gets `vaInitialize` = 2
+("resource allocation failed") on both render nodes, `amd_va=0`; `vainfo`
+exits 3 and `ffmpeg -hwaccel vaapi` on `/video/h264.mkv` exits 251
+(AVERROR(EIO), "Device creation failed: -5") — clean errors, no signal.
+The image build generated all four reference clips (H.264, HEVC, AV1 via
+Alpine's ffmpeg, JPEG) and their MD5s.
 
 **Same binaries on a Linux host** (`MESA_AMD_HOST_CHECK=1`, amdgpu 3.64,
 Raphael iGPU GC 10.3.6 — not Navi22): `MESA-AMD-HW=amd`. radeonsi
@@ -242,6 +273,20 @@ Run from the image (`chroot_run /bin/busybox sh …`), capturing serial:
    image (`fedora-systemd-start.sh` now leaves radeonsi enabled).
 8. Repeat 3–5 with `LD_PRELOAD=/usr/lib/narf/narf_ioctl_trace.so` and diff
    against the Linux reference trace for the same Mesa build.
+
+9. Video (needs `amdgpu.navi22_accel`; the boot log shows
+   `amdgpu: navi22 media rings for clients 0xf`): `LIBVA_DRIVER_NAME=radeonsi
+   mesa_amd_probe va` — one node with `vendor="Mesa Gallium driver … for AMD
+   Radeon RX 6750 XT"` and H264High/HEVCMain/HEVCMain10/VP9Profile0/
+   AV1Profile0/JPEGBaseline decode plus H264/HEVC encode; `vainfo --display
+   drm --device /dev/dri/renderD128`; `RADV_DEBUG=startup mesa_amd_probe
+   vk` — `VK_KHR_video_decode_h264/h265/av1=1` and a queue with
+   `video_decode=1`. Then `/mesa-amd-video.sh` (prints `VIDEO-OK`): VA-API
+   and Vulkan decode of `/video/{h264,hevc,av1}.mkv` and VA-API JPEG decode
+   must match the software-decode MD5 bit for bit, and VA-API H.264/HEVC
+   encode of 60 frames must decode back to 60 frames. On a mismatch rerun
+   the failing ffmpeg line with `LD_PRELOAD=/usr/lib/narf/narf_ioctl_trace.so`
+   and `AMD_DEBUG=` / `RADV_DEBUG=` to see the CS that ran.
 
 Failure handling to verify on hardware: kill a client mid-submission
 (context teardown), `AMD_DEBUG=` off/`RADV_DEBUG=hang` on a hang, and that a

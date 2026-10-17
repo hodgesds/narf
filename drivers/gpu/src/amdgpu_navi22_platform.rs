@@ -160,7 +160,10 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         // and index latch probe used for the discovery read.
         match unsafe { crate::amdgpu_vcn_navi22::Harvest::read(gpu, &authority, identity.revision) }
         {
-            Ok(harvest) => firmware.harvest_vcn(harvest.0),
+            Ok(harvest) => {
+                crate::amdgpu_info::publish_navi22_vcn_harvest(harvest.0);
+                firmware.harvest_vcn(harvest.0)
+            }
             Err(error) => {
                 use core::fmt::Write;
                 let _ = writeln!(
