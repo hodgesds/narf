@@ -163,7 +163,16 @@ struct Engine<I: Io> {
     memory: Reservation,
     state: State,
     sequence: u32,
+    /// Linux psp_cmd_submit_buf only warns on a nonzero response status on
+    /// bare metal ("Some version of PSP FW doesn't write 0 to that field").
+    /// Navi22 follows it for bring-up commands; DESTROY_TMR stays strict
+    /// because a refused teardown must not recycle trusted memory.
+    lenient: bool,
 }
+/// psp_cmd_submit_buf: `psp_timeout` (20000) polls of usleep_range(60, 100),
+/// i.e. up to ~2 s before the fence is declared lost.
+const FENCE_TIMEOUT_MS: u64 = 2000;
+const GFX_CMD_ID_DESTROY_TMR: u32 = 7;
 async fn delay(ms: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms).as_instant()).await;
 }
@@ -269,7 +278,7 @@ impl<I: Io> Engine<I> {
             io.flush();
             io.write(WPTR, (wptr + 16) % 1024);
         })?;
-        let deadline = narf_time::Deadline::after_ms(500);
+        let deadline = narf_time::Deadline::after_ms(FENCE_TIMEOUT_MS);
         loop {
             let done = self.access(|io| {
                 io.invalidate();
@@ -297,7 +306,15 @@ impl<I: Io> Engine<I> {
         })?;
         self.state = State::Ready;
         if status != 0 {
-            return Err(Error::Rejected(status));
+            if !self.lenient || words[2] == GFX_CMD_ID_DESTROY_TMR {
+                return Err(Error::Rejected(status));
+            }
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: psp gfx command {:#x} response status {status:#x}",
+                words[2]
+            );
         }
         Ok(reply)
     }
@@ -569,6 +586,18 @@ impl Layout {
 pub(crate) fn validate_navi22_layout(gpu: &AmdGpu) -> Result<(), Error> {
     Layout::resolve(gpu, Kind::Navi22).map(|_| ())
 }
+/// Re-read GMC10's live FB location and check the pool still lies inside it
+/// (the same check `Psp::new_navi22` makes), e.g. after a reset-on-init and
+/// before the bootloader is handed any pool GPU address.
+pub(crate) fn validate_navi22_pool(
+    gpu: &AmdGpu,
+    authority: &Cap<BusDeviceCap, Write>,
+    pool: &Pool,
+) -> Result<(), Error> {
+    Layout::resolve(gpu, Kind::Navi22)?
+        .validate_pool(gpu, authority, pool)
+        .map(|_| ())
+}
 /// Resolve the PSP14/GMC12/HDP6 transport without touching hardware.
 pub(crate) fn navi48_layout(gpu: &AmdGpu) -> Result<Layout, Error> {
     let ip =
@@ -726,6 +755,7 @@ impl Psp {
                     memory,
                     state: State::Prepared,
                     sequence: 0,
+                    lenient: kind == Kind::Navi22,
                 },
                 pool: pool.clone(),
                 payload: None,
@@ -756,8 +786,12 @@ impl Psp {
             .setup_tmr_payload(Some(toc_payload(toc)?))
             .await
     }
-    /// Use the validated SOS container's embedded TOC, or PSP11's 4 MiB default
-    /// if no TOC is present. The allocation remains owned until verified stop.
+    /// `psp_tmr_init`: LOAD_TOC from the validated SOS container's embedded
+    /// TOC (or PSP11's 4 MiB default) and reserve the TMR. MP0 11.0.11 has
+    /// PMFW-centralized C-state management, so SETUP_TMR is deferred until
+    /// `load_smc_navi22` has loaded PMFW (amdgpu_psp.c psp_hw_start: "TMR
+    /// setup should be performed after PMFW loaded"). The allocation remains
+    /// owned until verified stop.
     pub async fn setup_tmr_navi22(
         &mut self,
         firmware: &crate::amdgpu_psp_boot::Firmware,
@@ -766,7 +800,7 @@ impl Psp {
             return Err(Error::Unsupported);
         }
         let image = firmware.image().map_err(|_| Error::Invalid)?;
-        self.session.setup_tmr_payload(image.toc()).await
+        self.session.init_tmr(image.toc()).await
     }
     /// Install the trusted region described by this PSP14 target's embedded
     /// TOC. A missing TOC is rejected; no size from another GPU is substituted.
@@ -795,10 +829,12 @@ impl Psp {
             .await
             .map(|_| ())
     }
-    /// Load Navi22 SMC once during cold boot, after trusted memory setup and
-    /// before other IP firmware. Only microcode is sent, never the header/PPT.
-    /// Completion means PSP accepted it; use Smu::after_upload/verify to check
-    /// runtime responsiveness. This does not implement BACO/resume/reload.
+    /// Load Navi22 SMC once during cold boot, after LOAD_TOC/TMR reservation
+    /// and before other IP firmware, then SETUP_TMR (psp_hw_start's
+    /// psp_load_smu_fw then psp_tmr_load for pmfw_centralized_cstate_management).
+    /// Only microcode is sent, never the header/PPT. Completion means PSP
+    /// accepted both; use Smu::after_upload/verify to check runtime
+    /// responsiveness. This does not implement BACO/resume/reload.
     pub async fn load_smc_navi22(
         &mut self,
         firmware: &crate::amdgpu_smu_navi22::Firmware,
@@ -807,7 +843,7 @@ impl Psp {
             return Err(Error::Unsupported);
         }
         let image = firmware.image().map_err(|_| Error::Invalid)?;
-        self.session.load_smc(image.payload()).await
+        self.session.load_smc_centralized(image.payload()).await
     }
     /// Load the complete Navi22 SDMA/CP/RLC set once, after SMC. Successful
     /// return acknowledges AUTOLOAD_RLC; GC/SDMA readiness, reset/golden-register
@@ -868,6 +904,11 @@ impl Psp {
     }
     pub fn media_firmware(&self) -> MediaFirmware {
         self.session.media_firmware
+    }
+    /// The GMC system aperture validated against the pool at construction:
+    /// (`gmc.fb_start`, `vm_manager.vram_base_offset`) in Linux terms.
+    pub(crate) fn fb_location(&self) -> (u64, u64) {
+        (self.session.fb_base, self.session.fb_offset)
     }
     pub(crate) fn dmub_tmr(&self) -> Result<core::ops::Range<u64>, Error> {
         if self.kind != Kind::Navi22
@@ -939,7 +980,14 @@ impl<I: Io> Session<I> {
         }
     }
     /// TOC bytes have already been selected from a validated firmware container.
+    /// psp_tmr_init then psp_tmr_load, for PSPs without centralized C-states.
     async fn setup_tmr_payload(&mut self, toc: Option<&[u8]>) -> Result<(), Error> {
+        self.init_tmr(toc).await?;
+        self.load_tmr().await
+    }
+    /// psp_tmr_init: LOAD_TOC (size from PSP) and the TMR reservation. No
+    /// address reaches PSP yet; an unloaded reservation is not published.
+    async fn init_tmr(&mut self, toc: Option<&[u8]>) -> Result<(), Error> {
         if self.tmr.is_some() || self.payload.is_some() || self.engine.state != State::Ready {
             return Err(Error::Busy);
         }
@@ -957,18 +1005,28 @@ impl<I: Io> Session<I> {
         if size == 0 || size > 64 * 1024 * 1024 || size % 4096 != 0 {
             return Err(Error::Invalid);
         }
-        let mut tmr = self
+        let tmr = self
             .pool
             .reserve_aligned(size, 1 << 20)
             .map_err(|_| Error::Allocation)?;
-        let address = tmr.address();
-        let physical = address
+        tmr.address()
             .checked_sub(self.fb_base)
             .and_then(|n| n.checked_add(self.fb_offset))
             .filter(|n| n.checked_add(size).is_some_and(|end| end <= 1 << 48))
             .ok_or(Error::Invalid)?;
-        tmr.publish();
         self.tmr = Some(tmr);
+        Ok(())
+    }
+    /// psp_tmr_load: SETUP_TMR for the reserved region, published first.
+    async fn load_tmr(&mut self) -> Result<(), Error> {
+        if self.tmr_ready || self.payload.is_some() || self.engine.state != State::Ready {
+            return Err(Error::Busy);
+        }
+        let (fb_base, fb_offset) = (self.fb_base, self.fb_offset);
+        let tmr = self.tmr.as_mut().ok_or(Error::Busy)?;
+        let (address, size) = (tmr.address(), tmr.size());
+        let physical = address - fb_base + fb_offset;
+        tmr.publish();
         self.engine
             .submit(&command(
                 5,
@@ -990,6 +1048,13 @@ impl<I: Io> Session<I> {
         if !self.tmr_ready {
             return Err(Error::Busy);
         }
+        self.load_ip_unchecked(bytes, firmware_type).await
+    }
+    async fn load_ip_unchecked(
+        &mut self,
+        bytes: &[u8],
+        firmware_type: u32,
+    ) -> Result<Reply, Error> {
         let (address, size) = self.stage(bytes).await?;
         let result = self
             .engine
@@ -1014,6 +1079,28 @@ impl<I: Io> Session<I> {
             SmcState::Failed
         };
         result
+    }
+    /// PMFW-centralized C-state order (MP0 11.0.0..13, 13.0.0/2/7): SMC
+    /// LOAD_IP_FW after LOAD_TOC/TMR reservation but before SETUP_TMR, which
+    /// follows immediately (psp_hw_start).
+    async fn load_smc_centralized(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.smc_state != SmcState::Absent
+            || self.tmr.is_none()
+            || self.tmr_ready
+            || self.engine.state != State::Ready
+            || self.payload.is_some()
+        {
+            return Err(Error::Busy);
+        }
+        self.smc_state = SmcState::Pending;
+        let result = self.load_ip_unchecked(bytes, 18).await.map(|_| ());
+        self.smc_state = if result.is_ok() {
+            SmcState::Loaded
+        } else {
+            SmcState::Failed
+        };
+        result?;
+        self.load_tmr().await
     }
     async fn load_gfx(
         &mut self,

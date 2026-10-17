@@ -156,6 +156,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
             memory,
             state: State::Prepared,
             sequence: 0,
+            lenient: false,
         },
     )
 }

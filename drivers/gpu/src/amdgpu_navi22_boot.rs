@@ -487,6 +487,18 @@ impl Backend for Hardware {
                 }
             }
             Stage::Sos => {
+                // The pool's GPU addresses came from the pre-reset/pre-training
+                // FB location; re-validate before any reaches the bootloader.
+                psp::validate_navi22_pool(&self.gpu, &self.authority, &self.pool).map_err(
+                    |error| {
+                        Error::Sos(match error {
+                            psp::Error::Revoked => sos::Error::Revoked,
+                            psp::Error::DeviceGone => sos::Error::DeviceGone,
+                            psp::Error::Unsupported => sos::Error::Unsupported,
+                            _ => sos::Error::Invalid,
+                        })
+                    },
+                )?;
                 if self.bootstrap.is_none() {
                     // SAFETY: explicit training finished before claiming PSP
                     // bootstrap ownership; its idle owner retains only data.
