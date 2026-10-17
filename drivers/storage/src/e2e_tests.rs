@@ -735,7 +735,16 @@ kernel_test_in!("drivers/storage/nvme-e2e", smoke_nvme_write_command);
 /// After a fake bring-up (FakeBlockDevice representing a 4 KiB-sector
 /// NVMe namespace), register it as "nvme90n1" and verify the registry
 /// entry round-trips the lba_size and capacity correctly.
+/// Runs [`smoke_nvme_register_block_device_inner`] against a scratch registry and restores the
+/// boot-time entries afterwards, so later suites still see the probed disks.
 fn smoke_nvme_register_block_device() -> TestResult {
+    let saved = narf_block::registry::__snapshot_for_test();
+    let r = smoke_nvme_register_block_device_inner();
+    narf_block::registry::__restore_for_test(saved);
+    r
+}
+
+fn smoke_nvme_register_block_device_inner() -> TestResult {
     // Clean slate for this smoke.
     narf_block::registry::__reset_for_test();
 
@@ -1206,7 +1215,16 @@ kernel_test_in!("drivers/storage/ahci-e2e", smoke_ahci_write_dma_ext);
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Register a fake AHCI device as "sata0" and verify lba_size + capacity.
+/// Runs [`smoke_ahci_register_block_device_inner`] against a scratch registry and restores the
+/// boot-time entries afterwards, so later suites still see the probed disks.
 fn smoke_ahci_register_block_device() -> TestResult {
+    let saved = narf_block::registry::__snapshot_for_test();
+    let r = smoke_ahci_register_block_device_inner();
+    narf_block::registry::__restore_for_test(saved);
+    r
+}
+
+fn smoke_ahci_register_block_device_inner() -> TestResult {
     narf_block::registry::__reset_for_test();
 
     let dev = FakeBlockDevice::new_4mib();
@@ -1321,7 +1339,16 @@ fn write_synthetic_gpt_with_label(buf: &mut [u8], label: &str) {
 /// PartitionMetadata and verify `find_block_device("nvme90n1p1")` resolves.
 ///
 /// Mirrors the Wave 27 GPT pattern from filesystem/src/e2e_tests.rs.
+/// Runs [`smoke_nvme_gpt_partition_resolves_inner`] against a scratch registry and restores the
+/// boot-time entries afterwards, so later suites still see the probed disks.
 fn smoke_nvme_gpt_partition_resolves() -> TestResult {
+    let saved = narf_block::registry::__snapshot_for_test();
+    let r = smoke_nvme_gpt_partition_resolves_inner();
+    narf_block::registry::__restore_for_test(saved);
+    r
+}
+
+fn smoke_nvme_gpt_partition_resolves_inner() -> TestResult {
     narf_block::registry::__reset_for_test();
 
     const LABEL: &str = "TEST_NVME";
@@ -1405,7 +1432,16 @@ kernel_test_in!(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Same as Smoke 15 but for the AHCI stack ("sata0" / "sata0p1").
+/// Runs [`smoke_ahci_gpt_partition_resolves_inner`] against a scratch registry and restores the
+/// boot-time entries afterwards, so later suites still see the probed disks.
 fn smoke_ahci_gpt_partition_resolves() -> TestResult {
+    let saved = narf_block::registry::__snapshot_for_test();
+    let r = smoke_ahci_gpt_partition_resolves_inner();
+    narf_block::registry::__restore_for_test(saved);
+    r
+}
+
+fn smoke_ahci_gpt_partition_resolves_inner() -> TestResult {
     narf_block::registry::__reset_for_test();
 
     const LABEL: &str = "TEST_SATA";
