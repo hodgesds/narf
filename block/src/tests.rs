@@ -1565,6 +1565,28 @@ kernel_test_in!(
     smoke_block_disk_policy_parse_fails_closed
 );
 
+/// The boot console names the policy in every case — including the default
+/// `All`, which before printed nothing, so a bare-metal boot without
+/// `narf.disks=` gave no sign that the internal disks were writable.
+fn smoke_block_disk_policy_banner_names_every_policy() -> TestResult {
+    use crate::disk_policy::{banner, DiskPolicy};
+    let boot = banner(DiskPolicy::BootOnly, true);
+    let all = banner(DiskPolicy::All, true);
+    let default = banner(DiskPolicy::All, false);
+    if !boot.contains("POLICY narf.disks=boot-only")
+        || !all.contains("EVERY disk is writable")
+        || !default.contains("EVERY disk is writable")
+        || !default.contains("no narf.disks=")
+    {
+        return TestResult::Fail("disk policy banner must name the active policy");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "block/disk_policy",
+    smoke_block_disk_policy_banner_names_every_policy
+);
+
 /// Model of the boot-only guarantee: a registered disk and its partition are
 /// read-only (reads pass, writes return `ReadOnly`, the bytes stay intact)
 /// until the disk is identified as the boot medium; identifying a partition

@@ -231,7 +231,7 @@ enum Cmd {
     /// directly; x86_64 UEFI chainloads the bundled Limine EFI app. The BIOS
     /// ELF retains NARF's compact KASLR table but has no ordinary linker
     /// relocation sections, which GRUB refuses even when they are non-loadable.
-    GrubImage(BuildArgs),
+    GrubImage(GrubImageArgs),
     /// Build removable media and boot it under OVMF/AAVMF UEFI.
     IsoBoot(BuildArgs),
     /// Boot under QEMU with a graphical display + the user-mode
@@ -351,6 +351,122 @@ struct PackFirmwareArgs {
     out: Option<String>,
 }
 
+/// `xtask grub-image`: the image build plus the host-install disk policy.
+#[derive(Parser, Clone)]
+struct GrubImageArgs {
+    #[command(flatten)]
+    build: BuildArgs,
+
+    /// Leave `narf.disks=boot-only` off the generated GRUB and Limine
+    /// command lines, so every disk of the machine is writable. Never use
+    /// this on a machine whose internal disks hold data you want to keep.
+    #[arg(long)]
+    allow_all_disks: bool,
+}
+
+/// `cmdline` with the host-install disk policy applied: `narf.disks=boot-only`
+/// appended unless `allow_all_disks` (or the line already names a policy).
+/// Every generator of media meant for a real machine goes through this, as
+/// `usb-image` does; the kernel's own default (`all`) is kept for QEMU.
+fn cmdline_with_disk_policy(cmdline: &str, allow_all_disks: bool) -> String {
+    let cmdline = cmdline.trim();
+    if allow_all_disks
+        || cmdline
+            .split_whitespace()
+            .any(|a| a.starts_with("narf.disks="))
+    {
+        return cmdline.to_string();
+    }
+    if cmdline.is_empty() {
+        usb_image::BOOT_ONLY_ARG.to_string()
+    } else {
+        format!("{cmdline} {}", usb_image::BOOT_ONLY_ARG)
+    }
+}
+
+/// A staged `limine.conf` with [`cmdline_with_disk_policy`] applied to its
+/// `kernel_cmdline:` lines; a config without one (the staged image has none
+/// when the composition adds no boot arguments) gets one after each entry's
+/// `path:`.
+fn limine_conf_with_disk_policy(conf: &str, allow_all_disks: bool) -> String {
+    let has_cmdline = conf
+        .lines()
+        .any(|l| l.trim_start().starts_with("kernel_cmdline:"));
+    let mut out = String::with_capacity(conf.len() + 32);
+    for line in conf.lines() {
+        let trimmed = line.trim_start();
+        let indent = &line[..line.len() - trimmed.len()];
+        if let Some(rest) = trimmed.strip_prefix("kernel_cmdline:") {
+            let cl = cmdline_with_disk_policy(rest, allow_all_disks);
+            out.push_str(&format!("{indent}kernel_cmdline: {cl}\n"));
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        if !has_cmdline && (trimmed.starts_with("path:") || trimmed.starts_with("kernel_path:")) {
+            let cl = cmdline_with_disk_policy("", allow_all_disks);
+            if !cl.is_empty() {
+                out.push_str(&format!("{indent}kernel_cmdline: {cl}\n"));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod disk_policy_tests {
+    use super::*;
+
+    #[test]
+    fn host_install_cmdline_defaults_to_boot_only() {
+        assert_eq!(cmdline_with_disk_policy("", false), "narf.disks=boot-only");
+        assert_eq!(
+            cmdline_with_disk_policy(" quiet root=PARTLABEL=NARF_ROOT", false),
+            "quiet root=PARTLABEL=NARF_ROOT narf.disks=boot-only"
+        );
+        assert_eq!(cmdline_with_disk_policy("quiet", true), "quiet");
+        assert_eq!(
+            cmdline_with_disk_policy("narf.disks=all", false),
+            "narf.disks=all"
+        );
+    }
+
+    #[test]
+    fn grub_image_limine_conf_gets_boot_only() {
+        let without = "/NARF\n    protocol: multiboot2\n    path: boot():/boot/narf-frame\n    module_path: boot():/boot/initramfs.cpio\n";
+        let got = limine_conf_with_disk_policy(without, false);
+        assert!(got.contains(
+            "    path: boot():/boot/narf-frame\n    kernel_cmdline: narf.disks=boot-only\n"
+        ));
+        let with = "/NARF\n    path: boot():/boot/narf-frame\n    kernel_cmdline: amdgpu.native_display=1\n";
+        let got = limine_conf_with_disk_policy(with, false);
+        assert!(got.contains("    kernel_cmdline: amdgpu.native_display=1 narf.disks=boot-only\n"));
+        assert_eq!(got.matches("kernel_cmdline").count(), 1);
+        assert_eq!(limine_conf_with_disk_policy(without, true), without);
+    }
+
+    #[test]
+    fn grub_image_and_installed_root_parse_the_opt_out() {
+        let cli = Cli::try_parse_from(["xtask", "grub-image"]).expect("grub-image must parse");
+        let Cmd::GrubImage(args) = cli.cmd else {
+            panic!("grub-image")
+        };
+        assert!(!args.allow_all_disks);
+        let cli = Cli::try_parse_from(["xtask", "grub-image", "--allow-all-disks"]).unwrap();
+        let Cmd::GrubImage(args) = cli.cmd else {
+            panic!("grub-image")
+        };
+        assert!(args.allow_all_disks);
+        let cli = Cli::try_parse_from(["xtask", "disk-write-partitioned"]).unwrap();
+        let Cmd::DiskWritePartitioned(args) = cli.cmd else {
+            panic!("disk-write-partitioned")
+        };
+        assert!(!args.allow_all_disks);
+        assert!(installed_root_limine_conf(&args)
+            .contains("kernel_cmdline: quiet root=PARTLABEL=NARF_ROOT narf.disks=boot-only\n"));
+    }
+}
+
 #[derive(Parser, Clone)]
 struct DiskWritePartitionedArgs {
     /// Block device to format (e.g. /dev/sda). Auto-detected USB
@@ -383,6 +499,12 @@ struct DiskWritePartitionedArgs {
     /// any wrong --device will wipe the wrong disk.
     #[arg(long)]
     yes: bool,
+
+    /// Leave `narf.disks=boot-only` off the installed kernel command line,
+    /// so every disk of the machine is writable. Never use this on a
+    /// machine whose internal disks hold data you want to keep.
+    #[arg(long)]
+    allow_all_disks: bool,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -10792,7 +10914,8 @@ interface_resolution: 1024x768
 /// NARF's loadable, compact `.kaslr_relocs` table. This command then removes
 /// only the original ELF relocation sections, preserving every PT_LOAD
 /// segment and NARF's own runtime KASLR support.
-fn grub_image_cmd(args: &BuildArgs) -> Result<()> {
+fn grub_image_cmd(grub: &GrubImageArgs) -> Result<()> {
+    let args = &grub.build;
     if matches!(args.arch, Arch::Aarch64) {
         bail!("direct GRUB Multiboot2 artifacts are currently x86_64-only");
     }
@@ -10873,17 +10996,27 @@ fn grub_image_cmd(args: &BuildArgs) -> Result<()> {
         .with_context(|| format!("copying UEFI kernel from {}", kernel.display()))?;
     std::fs::copy(&initramfs, esp_boot.join("initramfs.cpio"))
         .with_context(|| format!("copying UEFI initramfs from {}", initramfs.display()))?;
-    std::fs::copy(&limine_conf, esp_limine.join("limine.conf")).with_context(|| {
+    // The staged config is the QEMU image's (kernel default `narf.disks=all`);
+    // a host install gets `narf.disks=boot-only` unless opted out.
+    let staged_conf = std::fs::read_to_string(&limine_conf).with_context(|| {
         format!(
-            "copying Limine configuration from {}",
+            "reading Limine configuration from {}",
             limine_conf.display()
         )
     })?;
+    std::fs::write(
+        esp_limine.join("limine.conf"),
+        limine_conf_with_disk_policy(&staged_conf, grub.allow_all_disks),
+    )
+    .context("writing the bundle's limine.conf")?;
     std::fs::copy(&limine_efi, esp_efi.join("BOOTX64.EFI"))
         .with_context(|| format!("copying Limine EFI app from {}", limine_efi.display()))?;
 
     let composition = composition_plan(args, &root)?;
-    let composition_bootargs = composition::boot_arguments(&composition).join(" ");
+    let composition_bootargs = cmdline_with_disk_policy(
+        &composition::boot_arguments(&composition).join(" "),
+        grub.allow_all_disks,
+    );
     let composition_bootargs = if composition_bootargs.is_empty() {
         String::new()
     } else {
@@ -10937,6 +11070,14 @@ menuentry "NARF" {
     println!("  ESP:       {}", esp_dir.display());
     println!("  stanza:    {}", bundle.join("grub.cfg").display());
     println!("  BIOS: direct GRUB Multiboot2; UEFI: GRUB chainloads bundled Limine");
+    if grub.allow_all_disks {
+        println!("  disks: ALL writable (--allow-all-disks)");
+    } else {
+        println!(
+            "  disks: {} (internal disks read-only, never auto-mounted)",
+            usb_image::BOOT_ONLY_ARG
+        );
+    }
     Ok(())
 }
 
@@ -11646,6 +11787,27 @@ fn disk_write_cmd(args: &DiskWriteArgs) -> Result<()> {
     }
 }
 
+/// The installed root's `limine.conf`: `root=PARTLABEL=<label>` so the
+/// kernel's root_selector picks the root partition, plus the host-install
+/// disk policy (`narf.disks=boot-only` unless `--allow-all-disks`).
+fn installed_root_limine_conf(args: &DiskWritePartitionedArgs) -> String {
+    let cmdline = cmdline_with_disk_policy(
+        &format!("quiet root=PARTLABEL={}", args.root_label),
+        args.allow_all_disks,
+    );
+    format!(
+        r#"timeout: 1
+
+/NARF
+    protocol: multiboot2
+    kernel_path: boot():/boot/narf-frame
+    kernel_cmdline: {cmdline}
+    module_path: boot():/boot/initramfs.cpio
+    module_string: initramfs
+"#
+    )
+}
+
 fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
     use std::io::{BufRead, Write};
 
@@ -11952,18 +12114,7 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
     // Limine config — same shape as the ISO's, but with `root=
     // PARTLABEL=<label>` so the kernel's root_selector picks the
     // ext4 partition.
-    let limine_conf = format!(
-        r#"timeout: 1
-
-/NARF
-    protocol: multiboot2
-    kernel_path: boot():/boot/narf-frame
-    kernel_cmdline: quiet root=PARTLABEL={label}
-    module_path: boot():/boot/initramfs.cpio
-    module_string: initramfs
-"#,
-        label = args.root_label,
-    );
+    let limine_conf = installed_root_limine_conf(args);
     write_as_root(&mnt_esp.join("boot/limine.conf"), &limine_conf)?;
 
     // ── 5b. Populate the root filesystem ─────────────────────────
@@ -12072,7 +12223,13 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
 
     println!();
     println!("✓ {} is ready. Plug into the target laptop and boot.", dev);
-    println!("  Kernel cmdline: root=PARTLABEL={}", args.root_label);
+    println!(
+        "  Kernel cmdline: {}",
+        cmdline_with_disk_policy(
+            &format!("quiet root=PARTLABEL={}", args.root_label),
+            args.allow_all_disks
+        )
+    );
     Ok(())
 }
 
@@ -12315,8 +12472,8 @@ fn main() -> Result<()> {
             // Keep direct-GRUB media behaviour aligned with the normal image:
             // it should start the init/userspace path rather than only the
             // async demo, and current bring-up firmware remains unsigned.
-            ensure_feature(&mut args.features, "boot-init");
-            ensure_feature(&mut args.features, "firmware-allow-unsigned");
+            ensure_feature(&mut args.build.features, "boot-init");
+            ensure_feature(&mut args.build.features, "firmware-allow-unsigned");
             grub_image_cmd(&args)
         }
         Cmd::IsoBoot(mut args) => {
