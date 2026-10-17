@@ -3855,3 +3855,107 @@ pub fn decode_event(frame: &[u8]) -> Result<WmiEvent<'_>, WmiError> {
         other => WmiEvent::Unhandled(other),
     })
 }
+
+// ── Mac-layer commands (added for `mac.rs`) ─────────────────────────
+
+/// `ath11k_wmi_scan_prob_req_oui` → `WMI_SCAN_PROB_REQ_OUI_CMDID`
+/// (`struct wmi_scan_prob_req_oui_cmd`): the first three MAC bytes as
+/// `mac[0] << 16 | mac[1] << 8 | mac[2]`.
+pub fn scan_prob_req_oui_cmd(mac_addr: &[u8; 6]) -> WmiCmd {
+    let oui = ((mac_addr[0] as u32) << 16) | ((mac_addr[1] as u32) << 8) | mac_addr[2] as u32;
+    simple_cmd(
+        WMI_SCAN_PROB_REQ_OUI_CMDID,
+        WMI_TAG_SCAN_PROB_REQ_OUI_CMD,
+        &[oui],
+    )
+}
+
+/// `ath11k_wmi_send_dfs_phyerr_offload_enable_cmd` →
+/// `WMI_PDEV_DFS_PHYERR_OFFLOAD_ENABLE_CMDID` (`pdev_id` only).
+pub fn dfs_phyerr_offload_enable_cmd(pdev_id: u32) -> WmiCmd {
+    simple_cmd(
+        WMI_PDEV_DFS_PHYERR_OFFLOAD_ENABLE_CMDID,
+        WMI_TAG_PDEV_DFS_PHYERR_OFFLOAD_ENABLE_CMD,
+        &[pdev_id],
+    )
+}
+
+/// `ATH11K_IPV4_TH_SEED_SIZE`.
+pub const ATH11K_IPV4_TH_SEED_SIZE: usize = 5;
+/// `ATH11K_IPV6_TH_SEED_SIZE`.
+pub const ATH11K_IPV6_TH_SEED_SIZE: usize = 11;
+
+/// `ath11k_wmi_pdev_lro_cfg` → `WMI_LRO_CONFIG_CMDID`
+/// (`struct ath11k_wmi_pdev_lro_config_cmd`: `lro_enable` and `res`
+/// stay 0, `th_4` / `th_6` are `get_random_bytes` seeds, then
+/// `pdev_id`).
+pub fn pdev_lro_cfg_cmd(
+    pdev_id: u32,
+    th_4: &[u32; ATH11K_IPV4_TH_SEED_SIZE],
+    th_6: &[u32; ATH11K_IPV6_TH_SEED_SIZE],
+) -> WmiCmd {
+    let mut words = alloc::vec![0u32, 0u32];
+    words.extend_from_slice(th_4);
+    words.extend_from_slice(th_6);
+    words.push(pdev_id);
+    simple_cmd(WMI_LRO_CONFIG_CMDID, WMI_TAG_LRO_INFO_CMD, &words)
+}
+
+/// `struct wmi_wmm_params_arg`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WmmParamsArg {
+    pub acm: u8,
+    pub aifs: u8,
+    pub cwmin: u16,
+    pub cwmax: u16,
+    pub txop: u16,
+    pub no_ack: u8,
+}
+
+/// `WMI_WMM_PARAM_TYPE_LEGACY`.
+pub const WMI_WMM_PARAM_TYPE_LEGACY: u32 = 0;
+/// `sizeof(struct wmi_vdev_set_wmm_params_cmd)`.
+pub const WMI_VDEV_SET_WMM_PARAMS_CMD_SIZE: usize = 124;
+
+/// `ath11k_wmi_send_wmm_update_cmd_tlv` → `WMI_VDEV_SET_WMM_PARAMS_CMDID`.
+/// `ac` is in `WME_AC_*` order: BE, BK, VI, VO. Linux tags every
+/// per-AC `wmi_wmm_params` with `WMI_TAG_VDEV_SET_WMM_PARAMS_CMD` too
+/// (not `WMI_TAG_WMM_PARAMS`); reproduced.
+pub fn vdev_set_wmm_params_cmd(vdev_id: u32, ac: &[WmmParamsArg; 4], param_type: u32) -> WmiCmd {
+    let len = WMI_VDEV_SET_WMM_PARAMS_CMD_SIZE;
+    let mut w = W::new(len);
+    w.tlv(WMI_TAG_VDEV_SET_WMM_PARAMS_CMD, len - TLV_HDR_SIZE);
+    w.u32(vdev_id);
+    for a in ac {
+        w.tlv(WMI_TAG_VDEV_SET_WMM_PARAMS_CMD, 28 - TLV_HDR_SIZE);
+        w.u32(a.cwmin as u32);
+        w.u32(a.cwmax as u32);
+        w.u32(a.aifs as u32);
+        w.u32(a.txop as u32);
+        w.u32(a.acm as u32);
+        w.u32(a.no_ack as u32);
+    }
+    w.u32(param_type);
+    w.finish(WMI_VDEV_SET_WMM_PARAMS_CMDID, len)
+}
+
+/// `ath11k_wmi_send_obss_spr_cmd` → `WMI_PDEV_OBSS_PD_SPATIAL_REUSE_CMDID`
+/// (`struct wmi_obss_spatial_reuse_params_cmd`). Linux never fills
+/// `pdev_id`, so it stays 0; reproduced.
+pub fn obss_spr_cmd(vdev_id: u32, enable: u32, min_offset: i32, max_offset: i32) -> WmiCmd {
+    simple_cmd(
+        WMI_PDEV_OBSS_PD_SPATIAL_REUSE_CMDID,
+        WMI_TAG_OBSS_SPATIAL_REUSE_SET_CMD,
+        &[0, enable, min_offset as u32, max_offset as u32, vdev_id],
+    )
+}
+
+/// `ath11k_reg_11d_new_cc_event` (`WMI_11D_NEW_COUNTRY_EVENTID`): the
+/// two alpha2 bytes of `wmi_11d_new_cc_ev.new_alpha2`. A missing TLV is
+/// `-EPROTO` as in Linux.
+pub fn decode_11d_new_cc(payload: &[u8]) -> Result<[u8; 2], WmiError> {
+    let tb = TlvTable::parse(payload)?;
+    let v = tb.need(WMI_TAG_11D_NEW_COUNTRY_EVENT)?.value;
+    need_len(v, 4, "11d new cc: short TLV")?;
+    Ok([v[0], v[1]])
+}

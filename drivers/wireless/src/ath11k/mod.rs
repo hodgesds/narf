@@ -50,6 +50,10 @@ pub mod hal;
 pub mod htc;
 pub mod htt;
 pub mod hw;
+pub mod mac;
+pub mod mac_frame;
+pub mod mac_peer;
+pub mod mac_reg;
 pub mod mhi;
 pub mod mhi_host;
 pub mod pci;
@@ -85,6 +89,8 @@ pub mod dp_tests;
 pub mod hal_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod htt_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod mac_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod mhi_tests;
 #[cfg(any(test, feature = "kernel-test"))]
