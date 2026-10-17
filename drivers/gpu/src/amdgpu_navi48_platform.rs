@@ -210,11 +210,20 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     if let Some((limits, level)) = boot.power_info() {
         crate::amdgpu_navi48_power::start(limits, level);
     }
-    // Clients' command submissions run on the graphics queue.
+    // Clients' command submissions run on the GC12 queues and SDMA0.
     if let (Some(card), Some(fence)) = (boot::ColdBoot::drm_card(), boot.client_fence_reader()) {
         crate::amdgpu_cs::register_submitter(
             card,
-            alloc::sync::Arc::new(Submitter { card, fence }),
+            alloc::sync::Arc::new(Submitter {
+                card,
+                fence,
+                sdma_fence: boot.client_sdma_fence_reader(),
+                contexts: narf_lib::sync::IrqSafeSpinLock::new([(0, 0); RINGS]),
+                vmids: narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_vmid::VmidManager::new(
+                    CLIENT_VMIDS.0,
+                    CLIENT_VMIDS.1,
+                )),
+            }),
         );
     }
     // Clients' VRAM buffers; without it they fall back to system memory.
@@ -236,45 +245,64 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
 }
 
 /// The Navi48 kernel queues behind AMDGPU_CS: up to eight IBs per
-/// submission, all for the graphics ring or all for the compute ring, run
-/// in the open's address space on client VMID 1, whose context every job's
-/// VM flush points at that space's root first.
+/// submission, all for one ring — graphics, compute or SDMA0 — run
+/// in the open's address space on a GFX hub VMID from 1–7 (8–15 are KFD's,
+/// as gmc_v12_0 sets first_kfd_vmid), granted by `amdgpu_vmid::VmidManager`
+/// as amdgpu_vmid_grab does: a space keeps reusing its VMID without a
+/// flush until it removes a mapping, and a submission that finds no idle
+/// VMID waits for one.
 ///
 /// A job's ticket is its pipe in the high 32 bits and its ring sequence in
 /// the low. `amdgpu_cs` records each job on its address space, so the
 /// buffers and page tables it may reach are freed only once its fence
 /// passes; every fence read here retires what completed jobs held.
 ///
-/// Each job maps VMID 1 to its open's PASID in the IH LUT, so its faults
-/// carry the client's PASID and reach that open's GPUVM_FAULT query.
+/// A job maps its VMID to its open's PASID in the IH LUT whenever the
+/// VMID last mapped another (or that write may not have run yet), so its
+/// faults carry the client's PASID and reach that open's GPUVM_FAULT query.
 ///
-/// LINUX-GAP: VMID 1 for every client, always flushed — no per-client VMID
-/// reuse (amdgpu_vmid_grab). AMDGPU_INFO keeps reporting acceleration
-/// unavailable, so Mesa does not submit here.
+/// AMDGPU_INFO keeps reporting acceleration unavailable, so Mesa does not
+/// submit here.
 struct Submitter {
     card: u32,
     fence: crate::amdgpu_gfx12_queue::FenceReader,
+    /// SDMA0's job fence (no DMA ring without SDMA0). Its jobs are refused
+    /// as busy until both SDMA proofs pass, as the GC12 queues' are.
+    sdma_fence: Option<crate::amdgpu_sdma_navi48::FenceReader>,
+    /// Touched only under OWNER, beside the submission it grants.
+    vmids: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_vmid::VmidManager>,
+    /// Each ring's last job's context, `(VmState::owner, ctx_id)`: the
+    /// scheduler entity Linux compares for AMDGPU_HAVE_CTX_SWITCH. Touched
+    /// only under OWNER.
+    contexts: narf_lib::sync::IrqSafeSpinLock<[(u64, u32); RINGS]>,
 }
-const CLIENT_VMID: u8 = 1;
+/// Client VMIDs on the GFX hub: 1 up to first_kfd_vmid (8) exclusive.
+const CLIENT_VMIDS: (u8, u8) = (1, 7);
+/// The rings by ticket index: the two GC12 queues, then SDMA0 (index 2).
 const PIPES: [crate::amdgpu_gfx12_queue::Pipe; 2] = [
     crate::amdgpu_gfx12_queue::Pipe::Graphics,
     crate::amdgpu_gfx12_queue::Pipe::Compute,
 ];
-/// Whether `ticket` is complete, given each pipe's completed sequence
+const SDMA_RING: u32 = 2;
+const RINGS: usize = 3;
+/// Whether `ticket` is complete, given each ring's completed sequence
 /// (32-bit sequences wrap).
-fn job_done(completed: [u32; 2], ticket: u64) -> bool {
+fn job_done(completed: [u32; RINGS], ticket: u64) -> bool {
     let pipe = (ticket >> 32) as usize;
     completed
         .get(pipe)
         .is_some_and(|&c| c.wrapping_sub(ticket as u32) as i32 >= 0)
 }
 impl Submitter {
-    /// Both pipes' completed sequences, retiring what completed jobs held.
+    /// Every ring's completed sequence, retiring what completed jobs held.
     /// None when the device stopped answering.
-    fn progress(&self) -> Option<[u32; 2]> {
-        let mut completed = [0; 2];
+    fn progress(&self) -> Option<[u32; RINGS]> {
+        let mut completed = [0; RINGS];
         for (c, pipe) in completed.iter_mut().zip(PIPES) {
             *c = self.fence.completed(pipe).ok()?;
+        }
+        if let Some(sdma) = &self.sdma_fence {
+            completed[SDMA_RING as usize] = sdma.completed().ok()?;
         }
         crate::amdgpu_cs::retire(self.card, &|t| job_done(completed, t));
         Some(completed)
@@ -285,6 +313,9 @@ impl crate::amdgpu_cs::Submitter for Submitter {
         match (ip_type, ip_instance, ring) {
             (crate::amdgpu_uapi::AMDGPU_HW_IP_GFX, 0, 0) => Some(0),
             (crate::amdgpu_uapi::AMDGPU_HW_IP_COMPUTE, 0, 0) => Some(1),
+            (crate::amdgpu_uapi::AMDGPU_HW_IP_DMA, 0, 0) if self.sdma_fence.is_some() => {
+                Some(SDMA_RING)
+            }
             _ => None,
         }
     }
@@ -317,7 +348,6 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             {
                 return Err(FsError::Unsupported);
             }
-            let pipe = PIPES[ring as usize];
             let ibs: alloc::vec::Vec<(u64, u32)> = submission
                 .ibs
                 .iter()
@@ -328,21 +358,67 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             }
             let pd_addr = vm.root_pde().ok_or(FsError::InvalidData)?;
             let pasid = vm.pasid().ok_or(FsError::NoSpace)?;
-            let job = crate::amdgpu_gfx12_queue::Job::new(CLIENT_VMID, pasid, pd_addr, &ibs)
+            let request = crate::amdgpu_vmid::GrabRequest {
+                owner: vm.owner(),
+                pd_addr,
+                tlb_seq: vm.tlb_seq(),
+                pasid,
+                ring,
+            };
+            let mut job = crate::amdgpu_gfx12_queue::Job::new(0, pasid, pd_addr, &ibs)
                 .ok_or(FsError::InvalidData)?;
-            let mut owner = OWNER.lock().await;
-            let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
-            // SAFETY: the platform serializes every queue user under OWNER;
-            // `amdgpu_cs` holds the job's memory until its fence.
-            let result = unsafe { boot.submit_client_job(pipe, job) };
-            drop(owner);
+            // amdgpu_ib_schedule asks the first IB.
+            job.mem_sync = first.flags & crate::amdgpu_uapi::AMDGPU_IB_FLAG_EMIT_MEM_SYNC != 0;
+            let entity = (request.owner, submission.ctx_id);
+            let result = loop {
+                let mut owner = OWNER.lock().await;
+                let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
+                let completed = self.progress().ok_or(FsError::NoDevice)?;
+                let done = |t| job_done(completed, t);
+                let grant = self.vmids.lock().grab(request, &done);
+                let Some(grant) = grant else {
+                    // amdgpu_vmid_grab_idle: wait for a VMID to go idle.
+                    drop(owner);
+                    narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant())
+                        .await;
+                    continue;
+                };
+                job.vmid = grant.vmid;
+                job.flush = grant.needs_flush;
+                job.map_pasid = grant.map_pasid;
+                job.ctx_switch = self.contexts.lock()[ring as usize] != entity;
+                let result = match PIPES.get(ring as usize) {
+                    // SAFETY: the platform serializes every queue user under
+                    // OWNER; `amdgpu_cs` holds the job's memory until its
+                    // fence, and the grant keeps another space off this VMID
+                    // until then.
+                    Some(&pipe) => unsafe { boot.submit_client_job(pipe, job) }.map_err(|e| {
+                        use crate::amdgpu_gfx12_queue::Error;
+                        match e {
+                            Error::Busy => FsError::Busy,
+                            Error::Invalid => FsError::InvalidData,
+                            _ => FsError::NoDevice,
+                        }
+                    }),
+                    // SAFETY: as above.
+                    None => unsafe { boot.submit_client_sdma_job(job) }.map_err(|e| {
+                        use crate::amdgpu_sdma_navi48::Error;
+                        match e {
+                            Error::Busy => FsError::Busy,
+                            Error::Invalid => FsError::InvalidData,
+                            _ => FsError::NoDevice,
+                        }
+                    }),
+                };
+                if let Ok(seq) = result {
+                    let ticket = u64::from(ring) << 32 | u64::from(seq);
+                    self.vmids.lock().commit(request, grant, ticket);
+                    self.contexts.lock()[ring as usize] = entity;
+                }
+                break result;
+            };
             let _ = self.progress();
-            match result {
-                Ok(seq) => Ok(u64::from(ring) << 32 | u64::from(seq)),
-                Err(crate::amdgpu_gfx12_queue::Error::Busy) => Err(FsError::Busy),
-                Err(crate::amdgpu_gfx12_queue::Error::Invalid) => Err(FsError::InvalidData),
-                Err(_) => Err(FsError::NoDevice),
-            }
+            result.map(|seq| u64::from(ring) << 32 | u64::from(seq))
         })
     }
     fn wait(
@@ -356,7 +432,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
     > {
         alloc::boxed::Box::pin(async move {
             use narf_filesystem::FsError;
-            if (ticket >> 32) as usize >= PIPES.len() {
+            if (ticket >> 32) as usize >= RINGS {
                 return Err(FsError::InvalidData);
             }
             loop {

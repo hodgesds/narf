@@ -712,6 +712,31 @@ impl ColdBoot {
         // SAFETY: the caller's obligations.
         unsafe { queues.submit(pipe, job) }
     }
+    /// Queue a client job on SDMA0 (see `sdma::Sdma::submit`).
+    /// # Safety
+    /// As `submit_client_job`.
+    pub(crate) unsafe fn submit_client_sdma_job(
+        &mut self,
+        job: queues::Job,
+    ) -> Result<u32, sdma::Error> {
+        let sdma = self
+            .sequence
+            .backend
+            .sdma
+            .as_mut()
+            .ok_or(sdma::Error::Invalid)?;
+        // SAFETY: the caller's obligations.
+        unsafe { sdma.submit(job) }
+    }
+    /// A reader of SDMA0's client-job fence. Jobs are refused (busy)
+    /// until both SDMA proofs pass, which the platform runs after boot.
+    pub(crate) fn client_sdma_fence_reader(&self) -> Option<sdma::FenceReader> {
+        self.sequence
+            .backend
+            .sdma
+            .as_ref()
+            .map(sdma::Sdma::fence_reader)
+    }
     /// A reader of the graphics ring's job fence that needs no access to
     /// this owner.
     pub(crate) fn client_fence_reader(&self) -> Option<queues::FenceReader> {

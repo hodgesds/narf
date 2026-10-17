@@ -314,14 +314,14 @@ kernel queues pass their ring/IB tests. Implemented (software models only):
 | CTX | `amdgpu_ctx` | priority permits as Linux (HIGH needs CAP_SYS_NICE or master → EACCES); QUERY_STATE/QUERY_STATE2 report GPU recoveries (`UNKNOWN_RESET`, `RESET`+`VRAMLOST`) |
 | GEM_CREATE (VRAM heap / system), GEM_MMAP, GEM_VA, GEM_WAIT_IDLE, GEM_OP, GEM_CLOSE | generic `amdgpu_gem` / `amdgpu_vm` | Navi22 registers its heap from the cold-boot pool; GEM_MMAP's out arm fixed to offset 0 of the 8-byte union |
 | GEM_METADATA | generic `amdgpu_gem` | stored on the object, visible to PRIME importers |
-| PRIME export/import of amdgpu GEM objects | `drm_devfs_bridge` | same-driver dma-buf; no implicit-sync fences |
-| CS: IB, BO_HANDLES, SYNCOBJ_IN/OUT, DEPENDENCIES, FENCE | generic `amdgpu_cs` + `amdgpu_navi22_cs` | user fence written by the CPU on observed completion; IBs on gfx ring 0, compute 0–3 (one queue), SDMA 0/1 |
+| PRIME export/import of amdgpu GEM objects | `drm_devfs_bridge` (`AmdgpuDmaBufFile`) | same-driver dma-buf with a shared reservation; jobs listing it in BO_HANDLES fence it (implicit sync) |
+| CS: IB, BO_HANDLES, SYNCOBJ_IN/OUT, DEPENDENCIES, FENCE | generic `amdgpu_cs` + `amdgpu_navi22_cs` | user fence (4 KiB BO) written by the CPU when the job retires; IBs on gfx ring 0, compute 0–3 (one queue), SDMA 0/1 |
 | WAIT_CS, SYNCOBJ_* (binary) | generic | SYNCOBJ_WAIT timeout now `-ETIME`, unsubmitted without WAIT_FOR_SUBMIT `-EINVAL` (Linux) |
 
 Open gaps for the first hardware run: timeline syncobjs (cap 0, Linux 1;
 Mesa falls back to binary SYNCOBJ_OUT), syncobj fds and sync_file
 import/export, WAIT_FENCES / FENCE_TO_HANDLE, BO_LIST ioctl (Mesa uses the
-BO_HANDLES chunk), implicit sync on dma-bufs, GDS/GWS/OA, GEM_USERPTR,
+BO_HANDLES chunk), implicit sync for buffers not listed in BO_HANDLES, GDS/GWS/OA, GEM_USERPTR,
 PRT/sparse, SET_PLACEMENT, GTT heap size in MEMORY (0), ADDFB2_MODIFIERS and
 modifier lists (KMS), TIMESTAMP/SENSOR/GPUVM_FAULT/usage counters, one
 client VMID for all clients (no per-client fault attribution), VCN/JPEG user

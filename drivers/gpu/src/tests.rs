@@ -11843,6 +11843,147 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
                 return Some("dependency on another ring's ticket");
             }
         }
+        // A user fence: a one-page buffer gets the job's handle once a
+        // fence read retires the job, never stepping back to an older one.
+        let mut page = [0u8; 32];
+        page[0..8].copy_from_slice(&GPU_PAGE_SIZE.to_le_bytes());
+        page[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+        crate::amdgpu_gem::dispatch(
+            DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+            page.as_mut_ptr() as usize,
+            &gem,
+        )
+        .ok()?;
+        let fence_bo = u32::from_le_bytes(page[0..4].try_into().unwrap());
+        let object = gem.object(fence_bo)?;
+        let fenced =
+            |offset: u32| cs_with(&[(u::AMDGPU_CHUNK_ID_FENCE, alloc::vec![fence_bo, offset])]);
+        let mut first = fenced(16);
+        let mut second = fenced(16);
+        if run(cs_cmd, &mut first.req).is_err() || run(cs_cmd, &mut second.req).is_err() {
+            return Some("CS with a user fence");
+        }
+        let a = u64::from_le_bytes(first.req[0..8].try_into().unwrap());
+        let b = u64::from_le_bytes(second.req[0..8].try_into().unwrap());
+        if object.load_u64(16) != Some(0) {
+            return Some("user fence written before the job retired");
+        }
+        crate::amdgpu_cs::retire(card, &|t| t <= b);
+        if object.load_u64(16) != Some(b) || b != a + 1 {
+            return Some("user fence after both jobs retired");
+        }
+        for (bo, offset) in [(fence_bo, 4089), (handle, 0), (fence_bo + 99, 0)] {
+            let mut c = cs_with(&[(u::AMDGPU_CHUNK_ID_FENCE, alloc::vec![bo, offset])]);
+            if run(cs_cmd, &mut c.req) != Err(FsError::InvalidData) {
+                return Some("bad user fence");
+            }
+        }
+        let mut c = cs_with(&[(u::AMDGPU_CHUNK_ID_FENCE, alloc::vec![fence_bo])]);
+        if run(cs_cmd, &mut c.req) != Err(FsError::InvalidData) {
+            return Some("short fence chunk");
+        }
+        // Implicit sync. A job that lists a buffer becomes its writer, in
+        // the graphics ring's own fence context.
+        let shared = gem.object(handle)?;
+        let resv = &shared.dma_buf().resv;
+        let use_read = narf_filesystem::dma_buf::DmaResvUsage::Read;
+        let (_keep, listed) = list(handle);
+        let mut c = cs_with(&[(u::AMDGPU_CHUNK_ID_BO_HANDLES, listed.clone())]);
+        if run(cs_cmd, &mut c.req).is_err() {
+            return Some("CS listing a buffer");
+        }
+        let writer = u64::from_le_bytes(c.req[0..8].try_into().unwrap());
+        let own = resv.fences(use_read);
+        if own.len() != 1
+            || own[0].context() != Some(u64::from(card) << 32)
+            || own[0].seqno() != writer
+        {
+            return Some("the job is the buffer's writer");
+        }
+        // Another context's fence on the buffer holds the next listing job
+        // back; the ring's own unfinished job does not.
+        struct Gate(core::sync::atomic::AtomicBool);
+        impl narf_filesystem::DrmFence for Gate {
+            fn is_signalled(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+            fn wait(&self, _: u64) -> bool {
+                self.is_signalled()
+            }
+            fn context(&self) -> Option<u64> {
+                Some(0xdead)
+            }
+        }
+        let gate = alloc::sync::Arc::new(Gate(core::sync::atomic::AtomicBool::new(false)));
+        resv.add_fence(gate.clone(), narf_filesystem::dma_buf::DmaResvUsage::Write);
+        let seen = fake.seen.lock().len();
+        let mut c = cs_with(&[(u::AMDGPU_CHUNK_ID_BO_HANDLES, listed.clone())]);
+        {
+            let mut job = core::pin::pin!(dispatch_async(
+                card,
+                cs_cmd,
+                c.req.as_mut_ptr() as usize,
+                &state,
+                &gem,
+                &ctx,
+                &syncobjs,
+            ));
+            let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+            if core::future::Future::poll(job.as_mut(), &mut cx).is_ready()
+                || fake.seen.lock().len() != seen
+            {
+                return Some("a job ran before the buffer's other writer");
+            }
+            // GEM_WAIT_IDLE sees the pending writer too.
+            let mut w = idle_req(handle);
+            if run(idle_cmd, &mut w).is_err()
+                || u32::from_le_bytes(w[0..4].try_into().unwrap()) != 1
+            {
+                return Some("GEM_WAIT_IDLE with a pending reservation fence");
+            }
+            gate.0.store(true, Ordering::SeqCst);
+            if narf_scheduler::block_on_spin(job).is_err() || fake.seen.lock().len() != seen + 1 {
+                return Some("the job after the other writer signalled");
+            }
+        }
+        // EXPLICIT_SYNC buffers skip the wait.
+        let mut create = [0u8; 32];
+        create[0..8].copy_from_slice(&GPU_PAGE_SIZE.to_le_bytes());
+        create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+        create[24..32]
+            .copy_from_slice(&u64::from(u::AMDGPU_GEM_CREATE_EXPLICIT_SYNC).to_le_bytes());
+        crate::amdgpu_gem::dispatch(
+            DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+            create.as_mut_ptr() as usize,
+            &gem,
+        )
+        .ok()?;
+        let explicit = u32::from_le_bytes(create[0..4].try_into().unwrap());
+        let closed = alloc::sync::Arc::new(Gate(core::sync::atomic::AtomicBool::new(false)));
+        gem.object(explicit)?
+            .dma_buf()
+            .resv
+            .add_fence(closed, narf_filesystem::dma_buf::DmaResvUsage::Write);
+        let (_keep, listed) = list(explicit);
+        let mut c = cs_with(&[(u::AMDGPU_CHUNK_ID_BO_HANDLES, listed)]);
+        {
+            let mut job = core::pin::pin!(dispatch_async(
+                card,
+                cs_cmd,
+                c.req.as_mut_ptr() as usize,
+                &state,
+                &gem,
+                &ctx,
+                &syncobjs,
+            ));
+            let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+            if !matches!(
+                core::future::Future::poll(job.as_mut(), &mut cx),
+                core::task::Poll::Ready(Ok(_))
+            ) {
+                return Some("an EXPLICIT_SYNC buffer does not wait");
+            }
+        }
         None
     })();
     unregister_submitter(card);
@@ -11884,10 +12025,23 @@ fn smoke_amdgpu_vm_holds_job_memory_until_its_fence() -> TestResult {
         // No job yet: an unmapped, closed buffer goes at once.
         let vm = VmState::for_card(card);
         let (h, weak) = map_one(&vm, 0x4_0000_0000)?;
+        // A map leaves the TLB sequence alone; removing a mapping bumps it.
+        if vm.tlb_seq() != 0 {
+            return Some("a map needs no TLB flush");
+        }
         close(h);
         gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_UNMAP, 0, 0x4_0000_0000, 0, P).ok()?;
         if weak.upgrade().is_some() || deferred(card) != 0 {
             return Some("freed before any job");
+        }
+        if vm.tlb_seq() != 1 {
+            return Some("an unmap bumps the TLB sequence");
+        }
+        // Each space has its own, stable VMID owner identity.
+        let other = VmState::for_card(card);
+        let id = vm.owner();
+        if id == 0 || vm.owner() != id || other.owner() == id {
+            return Some("owner identities");
         }
         // After job 5: held until the engine passes 5.
         let (h, weak) = map_one(&vm, 0x4_0000_0000)?;
@@ -12807,4 +12961,365 @@ fn smoke_amdgpu_dcn_offsets_match_headers() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu_dcn",
     smoke_amdgpu_dcn_offsets_match_headers
+);
+
+/// `VmidManager` follows amdgpu_vmid_grab: a space reuses its VMID without
+/// a flush until it removes a mapping or its flush is pending on another
+/// ring; a new space takes an idle VMID and flushes; nothing idle means
+/// waiting; the LUT entry is rewritten only for a new PASID.
+fn smoke_amdgpu_vmid_grab_reuses_and_flushes_like_linux() -> TestResult {
+    use crate::amdgpu_vmid::{GrabRequest, VmidManager};
+    let mut m = VmidManager::new(1, 2);
+    let a = GrabRequest {
+        owner: 1,
+        pd_addr: 0x1000,
+        tlb_seq: 0,
+        pasid: 7,
+        ring: 0,
+    };
+    let none_done = |_: u64| false;
+    let all_done = |_: u64| true;
+    // First use: the most recently used idle VMID, flushed, LUT written.
+    let g = match m.grab(a, &all_done) {
+        Some(g) if g.needs_flush && g.map_pasid => g,
+        _ => return TestResult::Fail("first grab flushes"),
+    };
+    m.commit(a, g, 1);
+    // Same ring, same space, nothing removed: reuse without a flush, even
+    // while job 1 runs, as long as another VMID is idle.
+    match m.grab(a, &none_done) {
+        Some(r) if r.vmid == g.vmid && !r.needs_flush && !r.map_pasid => m.commit(a, r, 2),
+        _ => return TestResult::Fail("reuse without a flush"),
+    }
+    // From another ring while the flush (job 1) is pending: flush again.
+    let on_compute = GrabRequest { ring: 1, ..a };
+    match m.grab(on_compute, &|t| t != 1 && t != 2) {
+        Some(r) if r.vmid == g.vmid && r.needs_flush && r.map_pasid => {}
+        _ => return TestResult::Fail("cross-ring pending flush"),
+    }
+    match m.grab(on_compute, &all_done) {
+        Some(r) if r.vmid == g.vmid && !r.needs_flush && !r.map_pasid => {}
+        _ => return TestResult::Fail("cross-ring after the flush completed"),
+    }
+    // A removed mapping bumps the TLB sequence: flush.
+    let removed = GrabRequest { tlb_seq: 1, ..a };
+    match m.grab(removed, &all_done) {
+        Some(r) if r.vmid == g.vmid && r.needs_flush => {}
+        _ => return TestResult::Fail("flush after an unmap"),
+    }
+    // Another space takes the other (idle) VMID and flushes.
+    let b = GrabRequest {
+        owner: 2,
+        pd_addr: 0x2000,
+        pasid: 8,
+        ..a
+    };
+    let gb = match m.grab(b, &|t| t > 2) {
+        Some(r) if r.vmid != g.vmid && r.needs_flush && r.map_pasid => r,
+        _ => return TestResult::Fail("second space"),
+    };
+    m.commit(b, gb, 3);
+    // Both VMIDs busy: a third space waits.
+    let c = GrabRequest {
+        owner: 3,
+        pd_addr: 0x3000,
+        pasid: 9,
+        ..a
+    };
+    if m.grab(c, &none_done).is_some() {
+        return TestResult::Fail("grab with no idle VMID");
+    }
+    // Space A's jobs finish: its VMID is the idle one handed over, with a
+    // flush and a LUT rewrite for the new PASID.
+    match m.grab(c, &|t| t <= 2) {
+        Some(r) if r.vmid == g.vmid && r.needs_flush && r.map_pasid => m.commit(c, r, 4),
+        _ => return TestResult::Fail("third space takes the idle VMID"),
+    }
+    // A comes back: its old VMID now belongs to C, B's is busy, so it waits.
+    if m.grab(a, &|t| t <= 2).is_some() {
+        return TestResult::Fail("A must wait for an idle VMID");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vmid",
+    smoke_amdgpu_vmid_grab_reuses_and_flushes_like_linux
+);
+
+/// GEM_METADATA follows amdgpu_gem_metadata_ioctl: SET stores the tiling
+/// flags and a blob of at most 256 bytes on the buffer, GET returns them
+/// and leaves the rest of the data array alone, an empty SET clears the
+/// blob but keeps its flags, and an unknown handle is ENOENT.
+fn smoke_amdgpu_gem_metadata_round_trips() -> TestResult {
+    use crate::amdgpu_gem::{dispatch, GemState};
+    use crate::amdgpu_uapi as u;
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+    use narf_filesystem::FsError;
+    let state = GemState::new();
+    let mut req = [0u8; 32];
+    req[0..8].copy_from_slice(&4096u64.to_le_bytes());
+    req[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        req.as_mut_ptr() as usize,
+        &state,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE");
+    }
+    let handle = u32::from_le_bytes(req[0..4].try_into().unwrap());
+    let cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_METADATA;
+    let request = |handle: u32, op: u32, flags: u64, tiling: u64, data: &[u8], size: u32| {
+        let mut r = [0u8; 288];
+        r[0..4].copy_from_slice(&handle.to_le_bytes());
+        r[4..8].copy_from_slice(&op.to_le_bytes());
+        r[8..16].copy_from_slice(&flags.to_le_bytes());
+        r[16..24].copy_from_slice(&tiling.to_le_bytes());
+        r[24..28].copy_from_slice(&size.to_le_bytes());
+        r[28..28 + data.len()].copy_from_slice(data);
+        r
+    };
+    let (set, get) = (
+        u::AMDGPU_GEM_METADATA_OP_SET_METADATA,
+        u::AMDGPU_GEM_METADATA_OP_GET_METADATA,
+    );
+    let blob = [7u8, 6, 5, 4, 3, 2, 1, 0, 9, 9];
+    let mut r = request(handle, set, 0x11, 0xabcd_0000_1234, &blob, 10);
+    if dispatch(cmd, r.as_mut_ptr() as usize, &state) != Ok(0) {
+        return TestResult::Fail("SET_METADATA");
+    }
+    let mut r = request(handle, get, 0, 0, &[0xee; 256], 0);
+    if dispatch(cmd, r.as_mut_ptr() as usize, &state) != Ok(0)
+        || r[8..16] != 0x11u64.to_le_bytes()
+        || r[16..24] != 0xabcd_0000_1234u64.to_le_bytes()
+        || r[24..28] != 10u32.to_le_bytes()
+        || r[28..38] != blob
+        || r[38..284].iter().any(|&b| b != 0xee)
+    {
+        return TestResult::Fail("GET_METADATA");
+    }
+    // An empty blob clears it, keeping the flags; the tiling is replaced.
+    let mut r = request(handle, set, 0x99, 5, &[], 0);
+    let mut g = request(handle, get, 0, 0, &[], 0);
+    if dispatch(cmd, r.as_mut_ptr() as usize, &state) != Ok(0)
+        || dispatch(cmd, g.as_mut_ptr() as usize, &state) != Ok(0)
+        || g[8..16] != 0x11u64.to_le_bytes()
+        || g[16..24] != 5u64.to_le_bytes()
+        || g[24..28] != 0u32.to_le_bytes()
+    {
+        return TestResult::Fail("clearing the blob");
+    }
+    let mut big = request(handle, set, 0, 0, &[], 257);
+    if dispatch(cmd, big.as_mut_ptr() as usize, &state) != Err(FsError::InvalidData) {
+        return TestResult::Fail("a blob past 256 bytes");
+    }
+    let mut other = request(handle, 3, 0, 0, &[], 0);
+    if dispatch(cmd, other.as_mut_ptr() as usize, &state) != Ok(0) {
+        return TestResult::Fail("an unknown op does nothing, as in Linux");
+    }
+    let mut missing = request(handle + 1, get, 0, 0, &[], 0);
+    if dispatch(cmd, missing.as_mut_ptr() as usize, &state) != Err(FsError::NotFound) {
+        return TestResult::Fail("an unknown handle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_gem",
+    smoke_amdgpu_gem_metadata_round_trips
+);
+
+/// A CPU mapping holds its buffer (`GemState::mapping_object`, which the
+/// render and card nodes hand the mapping as its lifetime): GEM_CLOSE drops
+/// the handle, but the pages stay until the mapping goes.
+fn smoke_amdgpu_gem_mapping_outlives_gem_close() -> TestResult {
+    use crate::amdgpu_gem::{dispatch, GemState};
+    use crate::amdgpu_uapi as u;
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+    let state = GemState::new();
+    let mut req = [0u8; 32];
+    req[0..8].copy_from_slice(&8192u64.to_le_bytes());
+    req[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        req.as_mut_ptr() as usize,
+        &state,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE");
+    }
+    let handle = u32::from_le_bytes(req[0..4].try_into().unwrap());
+    let offset = u64::from(handle) << 12;
+    if state.mapping_object(offset, 8193).is_some() {
+        return TestResult::Fail("a mapping past the buffer");
+    }
+    let Some(mapping) = state.mapping_object(offset, 8192) else {
+        return TestResult::Fail("the mapping's buffer");
+    };
+    let weak = alloc::sync::Arc::downgrade(&mapping);
+    let mut close = [0u8; 8];
+    close[0..4].copy_from_slice(&handle.to_le_bytes());
+    if dispatch(0x09, close.as_mut_ptr() as usize, &state).is_err()
+        || state.object(handle).is_some()
+    {
+        return TestResult::Fail("GEM_CLOSE");
+    }
+    if weak.upgrade().is_none() {
+        return TestResult::Fail("pages freed under a live mapping");
+    }
+    drop(mapping);
+    if weak.upgrade().is_some() {
+        return TestResult::Fail("pages kept after the mapping went");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_gem",
+    smoke_amdgpu_gem_mapping_outlives_gem_close
+);
+
+/// PRIME for amdgpu buffers: an export holds the buffer past GEM_CLOSE,
+/// maps its frames, and imports into another open of the same card as one
+/// handle (the same one on a second import), sharing the buffer and its
+/// reservation; another card's open refuses it.
+fn smoke_amdgpu_gem_prime_export_import() -> TestResult {
+    use crate::amdgpu_gem::{dispatch, GemState};
+    use crate::amdgpu_uapi as u;
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+    use narf_filesystem::FsError;
+    let card = 0x7ffe_0101;
+    let (exporter, importer, foreign) = (
+        GemState::for_card(card),
+        GemState::for_card(card),
+        GemState::for_card(card + 1),
+    );
+    let mut req = [0u8; 32];
+    req[0..8].copy_from_slice(&8192u64.to_le_bytes());
+    req[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        req.as_mut_ptr() as usize,
+        &exporter,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE");
+    }
+    let handle = u32::from_le_bytes(req[0..4].try_into().unwrap());
+    let Some(object) = exporter.object(handle) else {
+        return TestResult::Fail("setup: object");
+    };
+    let file = crate::drm_devfs_bridge::amdgpu_dma_buf_file(object.clone());
+    let weak = alloc::sync::Arc::downgrade(&object);
+    drop(object);
+    let mut close = [0u8; 8];
+    close[0..4].copy_from_slice(&handle.to_le_bytes());
+    if dispatch(0x09, close.as_mut_ptr() as usize, &exporter).is_err() || weak.upgrade().is_none() {
+        return TestResult::Fail("the dma-buf holds the buffer past GEM_CLOSE");
+    }
+    let Some(object) = weak.upgrade() else {
+        return TestResult::Fail("buffer");
+    };
+    if file.mmap_frames(4096, 4096) != Ok(alloc::vec![object.phys + 4096])
+        || file.mmap_frames(4096, 8192).is_ok()
+        || file.mmap_frames(100, 4096).is_ok()
+        || file.stat().size != 8192
+    {
+        return TestResult::Fail("dma-buf mmap frames");
+    }
+    if file
+        .as_any()
+        .and_then(|a| a.downcast_ref::<crate::drm_devfs_bridge::AmdgpuDmaBufFile>())
+        .is_none()
+    {
+        return TestResult::Fail("the dma-buf identifies its buffer");
+    }
+    let first = importer.import(&object);
+    let again = importer.import(&object);
+    let Ok(h) = first else {
+        return TestResult::Fail("import on the same card");
+    };
+    if again != Ok(h)
+        || !alloc::sync::Arc::ptr_eq(&importer.object(h).unwrap(), &object)
+        || !alloc::sync::Arc::ptr_eq(importer.object(h).unwrap().dma_buf(), object.dma_buf())
+    {
+        return TestResult::Fail("one handle sharing the buffer and its reservation");
+    }
+    if foreign.import(&object) != Err(FsError::InvalidData) {
+        return TestResult::Fail("import on another card");
+    }
+    drop(object);
+    drop(file);
+    // The importer's handle keeps it; closing that frees it.
+    if weak.upgrade().is_none() {
+        return TestResult::Fail("the importer's handle holds the buffer");
+    }
+    let mut close = [0u8; 8];
+    close[0..4].copy_from_slice(&h.to_le_bytes());
+    if dispatch(0x09, close.as_mut_ptr() as usize, &importer).is_err() || weak.upgrade().is_some() {
+        return TestResult::Fail("freed once every holder is gone");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_gem",
+    smoke_amdgpu_gem_prime_export_import
+);
+
+/// AMDGPU_INFO_HW_IP_INFO's `available_rings` follows the open's card: bit 0
+/// for an IP whose ring 0 the card's submitter serves, zero otherwise or
+/// with no submitter.
+fn smoke_amdgpu_info_available_rings_follow_the_submitter() -> TestResult {
+    use crate::amdgpu_info::available_rings;
+    use crate::amdgpu_uapi as u;
+    use alloc::boxed::Box;
+    use narf_filesystem::FsError;
+    struct GfxOnly;
+    impl crate::amdgpu_cs::Submitter for GfxOnly {
+        fn submit<'a>(
+            &'a self,
+            _: &'a crate::amdgpu_vm::VmState,
+            _: &'a crate::amdgpu_cs::Submission,
+        ) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<u64, FsError>> + Send + 'a>>
+        {
+            Box::pin(async { Err(FsError::Unsupported) })
+        }
+        fn signalled(&self, _: u64) -> bool {
+            true
+        }
+        fn ring_for(&self, ip: u32, instance: u32, ring: u32) -> Option<u32> {
+            (ip == u::AMDGPU_HW_IP_GFX && instance == 0 && ring == 0).then_some(0)
+        }
+        fn wait(
+            &self,
+            _: u64,
+            _: u64,
+        ) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<bool, FsError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(true) })
+        }
+    }
+    let card = 0x7ffe_0202;
+    if available_rings(Some(card), u::AMDGPU_HW_IP_GFX, 0) != 0 {
+        return TestResult::Fail("no submitter, no rings");
+    }
+    crate::amdgpu_cs::register_submitter(card, alloc::sync::Arc::new(GfxOnly));
+    let result = [
+        (Some(card), u::AMDGPU_HW_IP_GFX, 0, 1),
+        (Some(card), u::AMDGPU_HW_IP_GFX, 1, 0),
+        (Some(card), u::AMDGPU_HW_IP_COMPUTE, 0, 0),
+        (None, u::AMDGPU_HW_IP_GFX, 0, 0),
+    ]
+    .into_iter()
+    .all(|(c, ip, instance, want)| available_rings(c, ip, instance) == want);
+    crate::amdgpu_cs::unregister_submitter(card);
+    if !result || available_rings(Some(card), u::AMDGPU_HW_IP_GFX, 0) != 0 {
+        return TestResult::Fail("available rings");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_info",
+    smoke_amdgpu_info_available_rings_follow_the_submitter
 );

@@ -543,6 +543,13 @@ pub struct VmState {
     last_job: [core::sync::atomic::AtomicU64; RINGS],
     /// This space's PASID, allocated on first use.
     pasid: IrqSafeSpinLock<Option<crate::amdgpu_vmid::PasidHandle>>,
+    /// `amdgpu_vm_tlb_seq`: bumped whenever a mapping is removed, so a
+    /// VMID that last flushed at an older value needs a TLB flush. New
+    /// mappings fill entries that were invalid, which the GPU never caches.
+    tlb_seq: core::sync::atomic::AtomicU64,
+    /// A card-wide identity for VMID reuse (`amdgpu_vmid::VmidManager`),
+    /// never shared with another space; assigned on first use.
+    owner: core::sync::atomic::AtomicU64,
 }
 
 impl Drop for VmState {
@@ -642,7 +649,47 @@ impl VmState {
             card,
             last_job: [const { core::sync::atomic::AtomicU64::new(0) }; RINGS],
             pasid: IrqSafeSpinLock::new(None),
+            tlb_seq: core::sync::atomic::AtomicU64::new(0),
+            owner: core::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// The DRM card whose engine runs this space's jobs.
+    pub fn card(&self) -> Option<u32> {
+        self.card
+    }
+
+    /// This space's TLB sequence (see the field).
+    pub fn tlb_seq(&self) -> u64 {
+        self.tlb_seq.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// This space's owner identity for VMID reuse: nonzero, unique for the
+    /// kernel's lifetime.
+    pub fn owner(&self) -> u64 {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let current = self.owner.load(Ordering::Acquire);
+        if current != 0 {
+            return current;
+        }
+        let fresh = NEXT.fetch_add(1, Ordering::Relaxed);
+        match self
+            .owner
+            .compare_exchange(0, fresh, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => fresh,
+            Err(set) => set,
+        }
+    }
+
+    /// Note removed mappings in the TLB sequence, then release them.
+    fn release_removed<T: Send + Sync + 'static>(&self, removed: T, any: bool) {
+        if any {
+            self.tlb_seq
+                .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        }
+        self.release(removed);
     }
 
     pub fn geometry(&self) -> Geometry {
@@ -706,7 +753,8 @@ impl VmState {
             map.insert(mapping.va, Entry { mapping, object });
             removed
         };
-        self.release(removed);
+        let any = !removed.is_empty();
+        self.release_removed(removed, any);
         Ok(())
     }
 
@@ -777,7 +825,8 @@ impl VmState {
             None => return Err(FsError::NotFound),
         };
         drop(g);
-        self.release(removed);
+        let any = removed.is_some();
+        self.release_removed(removed, any);
         Ok(())
     }
 
@@ -787,7 +836,8 @@ impl VmState {
             let map = g.get_or_insert_with(BTreeMap::new);
             Self::clear_range(map, va, size)
         };
-        self.release(removed);
+        let any = !removed.is_empty();
+        self.release_removed(removed, any);
         Ok(())
     }
 
