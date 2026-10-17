@@ -513,7 +513,7 @@ constructors return a `Send + 'static` owner which may leave `with_controller`
 before `run` is polled. This copies no physical ownership: callers must still
 exclude reset/PM/other clients and retain permanent mappings for the session.
 
-`ColdBoot::run().await` executes optional memory training → SOS bootstrap →
+`ColdBoot::run().await` executes optional reset-on-init → optional memory training → SOS bootstrap →
 ring creation → trusted-memory setup → SMC upload → SMU version handshake →
 optional board PowerPlay upload → optional DMUB quiesce → graphics upload/autoload → RLC boot check →
 optional board calibration/protected GFX DPM setup → optional memory hubs →
@@ -522,6 +522,21 @@ Production cold boot emits a serial `start` and terminal `complete` or
 `failed` checkpoint for each stage. A pending/cancelled stage emits no false
 completion; checkpoints do not run per poll or write training-owned framebuffer
 memory. These markers identify startup progress, not native-display readiness.
+`unsafe ColdBoot::prepare_reset(device)` adds `Stage::ResetOnInit` before every
+firmware stage, as Linux's `nv_need_reset_on_init` does for every posted discrete
+Navi: when MP0 C2PMSG_81 shows a running SOS, `amdgpu_reset_navi22::Reset`
+caches PCI state (type-0 header, PCIe DevCtl/LnkCtl/DevCtl2/LnkCtl2 and
+Resizable BAR controls), clears bus mastering, and issues a mode1 reset through
+PMFW (`Mode1Reset`, PMFW >= 58.26) or else through the PSP
+(`GFX_CTRL_CMD_ID_MODE1_RST` after TOS ready). After the 500 ms settle — with no
+MMIO while config space is reset — it restores and verifies config space,
+waits up to 2 s for the PSP bootloader (C2PMSG_35 bit 31) and 100 ms for NBIO
+MEMSIZE, and brackets the reset with the ATOM BIOS_SCRATCH_3 engine-hung flag.
+A card without running SOS is left untouched (`Ok(None)`). The reset discards
+every inherited scanout, so a boot framebuffer on this card goes dark. Failure
+or cancellation is terminal for the session. Production boot calls it; the
+explicit firmware-only callers may omit it. `Report::reset` carries the method,
+PMFW version, SOS values before/after and MEMSIZE.
 `ColdBoot::prepare_memory_hubs()` reserves the above VMID0 backing before run;
 it requires a prepared board power policy and performs no I/O. Production boot
 always calls it. Explicit firmware-only callers may omit this stage.
@@ -545,7 +560,7 @@ Every attempt prevents replay, and no failure automatically resets hardware or
 destroys device-owned memory. Dropping a session quarantines any memory still
 owned by hardware through the underlying owners' existing rules.
 
-Success returns `Report { smu: Versions, gfx: GfxBootStatus, power: Option<Info>,
+Success returns `Report { reset: Option<reset::Report>, smu: Versions, gfx: GfxBootStatus, power: Option<Info>,
 power_status: Option<PowerStatus>, media_firmware: MediaFirmware,
 memory_aperture: Option<Aperture>, sdma: Option<Proof>, dmub: Option<Status> }`;
 `power` is populated only when the prepared table was uploaded. The session must

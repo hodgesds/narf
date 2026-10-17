@@ -1,6 +1,8 @@
 //! Ordered cold-boot firmware bring-up for Navi22. The caller supplies an
-//! exclusive pool and trained VRAM or an explicit training inventory. No implicit reset, pool carving, platform
-//! initcall, modeset or acceleration publication happens here.
+//! exclusive pool and trained VRAM or an explicit training inventory. The
+//! only reset is the explicitly prepared reset-on-init of a posted card (Linux
+//! `nv_need_reset_on_init`). No pool carving, platform initcall, modeset or
+//! acceleration publication happens here.
 use crate::{
     amdgpu::AmdGpu, amdgpu_gddr6 as gddr6, amdgpu_gfx_navi22 as gfx, amdgpu_power_navi22 as power,
     amdgpu_psp_boot as sos, amdgpu_psp_ring as psp, amdgpu_smu_navi22 as smu, amdgpu_vram::Pool,
@@ -22,6 +24,7 @@ pub enum Error {
     MemoryHubs(crate::amdgpu_gmc_navi22::Error),
     Sdma(crate::amdgpu_sdma_navi22::Error),
     Dmub(crate::amdgpu_dmub_navi22::Error),
+    Reset(crate::amdgpu_reset_navi22::Error),
 }
 /// All files are validated and copied before the first device operation.
 #[derive(Debug)]
@@ -77,6 +80,7 @@ impl Firmware {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
+    ResetOnInit,
     MemoryTraining,
     Sos,
     Ring,
@@ -92,7 +96,8 @@ pub enum Stage {
     SdmaTest,
     DmubStart,
 }
-const STAGES: [Stage; 14] = [
+const STAGES: [Stage; 15] = [
+    Stage::ResetOnInit,
     Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
@@ -112,6 +117,8 @@ const STAGES: [Stage; 14] = [
 /// This does not publish acceleration or initialize native display.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Report {
+    /// Present when SOS was running and the ASIC was reset before bring-up.
+    pub reset: Option<crate::amdgpu_reset_navi22::Report>,
     pub smu: smu::Versions,
     pub gfx: psp::GfxBootStatus,
     pub power: Option<power::Info>,
@@ -180,6 +187,8 @@ struct Hardware {
     authority: Cap<BusDeviceCap, Write>,
     pool: Pool,
     firmware: Firmware,
+    reset: Option<crate::amdgpu_reset_navi22::Reset>,
+    reset_report: Option<crate::amdgpu_reset_navi22::Report>,
     training: Option<gddr6::Trainer>,
     bootstrap: Option<sos::Bootloader>,
     psp: Option<psp::Psp>,
@@ -207,6 +216,11 @@ impl Backend for Hardware {
     }
     async fn step(&mut self, stage: Stage) -> Result<(), Error> {
         match stage {
+            Stage::ResetOnInit => {
+                if let Some(reset) = self.reset.as_mut() {
+                    self.reset_report = reset.run().await.map_err(Error::Reset)?;
+                }
+            }
             Stage::MemoryTraining => {
                 if let Some(training) = self.training.as_mut() {
                     training.run().await.map_err(Error::Training)?;
@@ -358,6 +372,7 @@ impl Backend for Hardware {
     }
     fn report(&self) -> Result<Report, Error> {
         Ok(Report {
+            reset: self.reset_report,
             smu: self.versions.ok_or(Error::Invalid)?,
             gfx: self.gfx_status.ok_or(Error::Invalid)?,
             power: self.firmware.power.as_ref().map(power::Prepared::info),
@@ -434,6 +449,8 @@ impl ColdBoot {
                     authority,
                     pool: pool.clone(),
                     firmware,
+                    reset: None,
+                    reset_report: None,
                     training: None,
                     bootstrap: Some(bootstrap),
                     psp: None,
@@ -477,6 +494,8 @@ impl ColdBoot {
                     authority,
                     pool: pool.clone(),
                     firmware,
+                    reset: None,
+                    reset_report: None,
                     training: Some(training),
                     bootstrap: None,
                     psp: None,
@@ -498,6 +517,27 @@ impl ColdBoot {
             .training
             .as_ref()
             .map(gddr6::Trainer::state)
+    }
+    /// Reset a posted card before any firmware stage, as Linux does whenever
+    /// the VBIOS left SOS running. Production boot calls this; without it the
+    /// sequence loads firmware over the inherited SOS/PMFW (test callers).
+    /// Performs no I/O; `run` decides from the live SOS sign of life.
+    ///
+    /// # Safety
+    /// `new`'s ownership contract, plus `Reset::new`'s: `device` is this GPU's
+    /// PCI function and its config space has no other user. The reset discards
+    /// every inherited scanout, so a boot framebuffer on this card goes dark.
+    pub unsafe fn prepare_reset(&mut self, device: narf_bus::BusDevice) -> Result<(), Error> {
+        if self.sequence.state != State::Prepared || self.sequence.backend.reset.is_some() {
+            return Err(Error::Busy);
+        }
+        let h = &mut self.sequence.backend;
+        // SAFETY: forwarded exclusive GPU/config-space ownership; no I/O here.
+        h.reset = Some(
+            unsafe { crate::amdgpu_reset_navi22::Reset::new(&h.gpu, h.authority, device) }
+                .map_err(Error::Reset)?,
+        );
+        Ok(())
     }
     /// Reserve the native VMID0 backing pages before run. Production boot calls
     /// this; explicit firmware-only callers can leave memory hubs untouched.

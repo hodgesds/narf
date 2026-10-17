@@ -209,6 +209,7 @@ pub mod amdgpu_psp_boot;
 pub mod amdgpu_psp_firmware;
 pub mod amdgpu_psp_ring;
 pub mod amdgpu_reset;
+pub mod amdgpu_reset_navi22;
 pub mod amdgpu_ring;
 pub mod amdgpu_rlc;
 pub mod amdgpu_sdma;
