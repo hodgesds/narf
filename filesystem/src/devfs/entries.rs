@@ -92,6 +92,13 @@ pub(super) const ENTRIES: &[Entry] = &[
         visible: || true,
     },
     Entry {
+        name: "btrfs-control",
+        file_type: FileType::Special,
+        file: || Some(Arc::new(crate::devfs_misc::DevBtrfsControl)),
+        directory: || None,
+        visible: || true,
+    },
+    Entry {
         name: "random",
         file_type: FileType::Special,
         file: || Some(Arc::new(DevBlockingRandom)),
