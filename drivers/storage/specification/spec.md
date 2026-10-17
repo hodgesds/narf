@@ -53,8 +53,20 @@ All driver code is derived strictly from the references below.
 ## Scope
 
 ### Landed
-- **AHCI** (`ahci`): MMIO bring-up, port enumeration via PI, port
-  signature read so a follow-up can route IDENTIFY commands per port.
+- **AHCI** (`ahci`): binds `8086:2922` / `8086:3a22` by ID and every
+  `01:06:01` controller by class (Linux's generic `ahci_pci_tbl` entry; e.g.
+  AMD 600-series `1022:43f6`, which Linux drives as `board_ahci` with no
+  quirks). HBA bring-up `hba_global_init(&impl AhciRegs) -> Result<HbaConfig,
+  AhciError>` mirrors Linux `ahci_save_initial_config` + `ahci_reset_controller`
+  (AE with 5 retries, CAP / CAP2 / PI / port-capability save, GHC.HR with a 1 s
+  bound, restore) plus the AHCI §10.6.3 BIOS/OS handoff (`BiosHandoff`);
+  `effective_port_map(cap, vs, pi)` is Linux's PI cross-check / fabrication.
+  Each implemented port is deinitialised, given a FIS receive area, spun up,
+  COMRESET (`sata_link_debounce`, `SATA_DEB_TIMING_NORMAL`) and waited on for
+  BSY (10 s) before its signature is classified. `Ahci::{cap2, handoff,
+  block_port, capacity}`; `identify_n_sectors`; `sata0` reports the IDENTIFY
+  capacity and is partition-scanned (`sata0p<n>`). An HBA without CAP.S64A
+  refuses DMA buffers above 4 GiB. New `AhciError::AhciEnableFailed`.
 - **SDHCI** (`sdhci`): full controller bring-up — software reset,
   power on at 3.3 V, supply 400 kHz init clock, run the SD
   identification sequence (CMD0 / CMD8 / ACMD41 / CMD2 / CMD3 / CMD7
