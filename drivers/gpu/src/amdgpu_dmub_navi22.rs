@@ -291,6 +291,11 @@ impl<I: Io> Engine<I> {
     /// dmub_srv_hw_init after PSP loaded the firmware: STOP_FW unless held
     /// in reset, a bounded acknowledgement, clear GPINT, then a forced reset
     /// ("in case we timed out, DMCUB is likely hung").
+    ///
+    /// A DMCUB that was never started (DMCUB_ENABLE = 0, the state UEFI GOP
+    /// leaves it in) cannot acknowledge: STOP_FW is still posted as Linux
+    /// does, but there is nothing to wait for and its silence is not a
+    /// fault (Linux's bound there is a few register reads and logs nothing).
     async fn reset(&mut self) -> Result<(), Error> {
         let base = self.layout.dcn;
         let control = self.access(|io| read(io, base, CNTL))?;
@@ -299,6 +304,7 @@ impl<I: Io> Engine<I> {
                 io.write(base + u64::from(GPINT) * 4, STOP);
                 Ok(())
             })?;
+            let running = control & ENABLE != 0;
             let deadline = narf_time::Deadline::after_ms(100);
             while !self.access(|io| {
                 Ok(read(io, base, GPINT)? == STOP & !(1 << 28)
@@ -306,6 +312,9 @@ impl<I: Io> Engine<I> {
                     // linux-lit: 0xdeaddead=DMUB_GPINT__STOP_FW_RESPONSE
                     && read(io, base, 0x1ea)? == 0xdeaddead)
             })? {
+                if !running {
+                    break;
+                }
                 if deadline.expired() {
                     use core::fmt::Write;
                     let _ = writeln!(
