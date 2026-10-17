@@ -322,6 +322,7 @@ pub trait DrmFence: Send + Sync {
     fn seqno(&self) -> u64;            // default 0
     fn driver_name(&self) -> &str;     // default "narf"
     fn timeline_name(&self) -> &str;   // default "narf"
+    fn owner(&self) -> Option<u64>;   // default None (implicit-sync owner)
     fn timestamp_ns(&self) -> Option<u64>; // default None
 }
 

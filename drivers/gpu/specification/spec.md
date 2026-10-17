@@ -4461,27 +4461,55 @@ paths; only the tables differ.
   (`dispatch_async`, for card and render nodes) queues a validated
   `AMDGPU_CS` and returns the engine's sequence as the handle, and
   `AMDGPU_WAIT_CS` parks until it completes or the client's absolute
-  monotonic deadline passes (status 0/1). `AMDGPU_GEM_WAIT_IDLE` there
-  waits for the open's last jobs (`VmState::last_jobs`) and the buffer's
-  reservation fences (any open's jobs that listed it) and reports the
-  buffer's preferred domains. `dispatch_async` notes every submitted job on its
-  address space. `AMDGPU_CHUNK_ID_SYNCOBJ_IN`/`_OUT` and `BO_HANDLES` are
-  accepted: in-syncobjs must hold a fence (EINVAL without, ENOENT unknown)
-  and are waited for before queueing — the ioctl waits, where Linux's
-  scheduler would hold the job; out-syncobjs get the job's `JobFence`
-  (signalled through `Submitter::signalled`); every listed BO must be the
-  open's (ENOENT), with no residency. Implicit sync (amdgpu_cs_sync_rings /
-  amdgpu_cs_submit): before queueing, the ioctl waits for every unsignalled
-  fence on each listed BO's reservation (`GemObject::dma_buf`) except the
-  target ring's own (`JobFence` context: card << 32 | ring) and except on
-  `EXPLICIT_SYNC` buffers; the job then becomes each listed BO's WRITE
-  fence. amdgpu opens now
-  route the DRM syncobj ioctls (0xbf..=0xc5) to their own table
-  (`drm_ioctl_bridge::dispatch_syncobj`). `DEPENDENCIES` name a context
-  the open owns (EINVAL otherwise) on the engine's ring (others
-  `Unsupported`) and are waited for before queueing; `SCHEDULED_DEPENDENCIES`
-  are validated only, as every earlier job of the single in-order ring is
-  already scheduled. Timeline syncobjs are still refused. Without a submitter, CS parses and is refused as before
+  monotonic deadline passes (status 0/1; a negative s64 deadline waits
+  forever, `amdgpu_gem_timeout`). Every `drm_amdgpu_fence`-shaped handle
+  (WAIT_CS, WAIT_FENCES, FENCE_TO_HANDLE, DEPENDENCIES) resolves through
+  `amdgpu_ctx_get_fence`'s rules: the context must be the open's and the
+  IP/ring one the engine runs (EINVAL), 0 is signalled, `!0` the ring's last
+  job, a handle of another ring or past the ring's last emitted job EINVAL.
+  `AMDGPU_GEM_WAIT_IDLE` waits for the buffer's reservation fences, and for
+  the open's last jobs (`VmState::last_jobs`) only on a `VM_ALWAYS_VALID`
+  buffer (Linux's shared root reservation); unknown handles ENOENT.
+  `dispatch_async(card, cmd, arg, &CsOpen { vm, gem, ctx, syncobjs,
+  bo_lists, files })` also answers `AMDGPU_WAIT_FENCES` (all/any, count 0
+  EINVAL, all stops at the first timeout, any reports `first_signaled`,
+  `!0` on timeout) and `AMDGPU_FENCE_TO_HANDLE` (GET_SYNCOBJ,
+  GET_SYNCOBJ_FD, GET_SYNC_FILE_FD through `files`; other `what` EINVAL),
+  with or without a registered submitter. CS chunks: `SYNCOBJ_IN`/`OUT`,
+  `SYNCOBJ_TIMELINE_WAIT`/`SIGNAL` (`Submission::{in,out}_syncobjs` of
+  `SyncobjPoint { handle, flags, point }`; one post-dependency chunk; an
+  unknown out-syncobj EINVAL, in-syncobj ENOENT, no fence/point EINVAL or,
+  with WAIT_FOR_SUBMIT, waited up to 5 s then ETIME), `BO_HANDLES` or a
+  `bo_list_handle` (not both, EINVAL; unknown list ENOENT), `FENCE`,
+  `DEPENDENCIES`/`SCHEDULED_DEPENDENCIES`. In-fences and dependencies are
+  waited for before queueing — the ioctl waits, where Linux's scheduler
+  would hold the job. Out points get the job's `JobFence`
+  (`SyncObjCore::add_point` for a non-zero point, the payload otherwise).
+  Implicit sync (amdgpu_cs_sync_rings / amdgpu_cs_submit): before queueing,
+  the ioctl waits for every unsignalled fence on the reservation of each
+  listed BO and of the user-fence BO, except fences of the open's own
+  address space (`DrmFence::owner` == `VmState::owner`,
+  `AMDGPU_SYNC_NE_OWNER`) and except on `EXPLICIT_SYNC` buffers; the job
+  then becomes each of those BOs' WRITE fence. A BO the job does not list
+  gets no fence, as in Linux.
+- `amdgpu_bo_list`: `dispatch(cmd, arg, &BoListTable, &GemState)` is
+  `DRM_IOCTL_AMDGPU_BO_LIST` (CREATE / UPDATE / DESTROY, entries read as
+  `amdgpu_bo_create_list_entry_array` reads them, > 128 Ki EINVAL, unknown
+  BO ENOENT, UPDATE of an unknown list ENOENT, DESTROY of one succeeds);
+  `read_entries` is shared with the BO_HANDLES chunk.
+- DRM syncobjs (`drm::syncobj`, `drm::syncobj_ioctl`): a handle names a
+  shared `SyncObjCore` whose payload is a fence or a `FenceChain`
+  (`dma_fence_chain`, with `find_seqno` / `query_point` and walk-time
+  collection); `FenceArray` and the `to_drm_leaves` / `from_drm_leaves`
+  adapters bridge to sync_file leaves. `syncobj_ioctl::dispatch(nr, arg,
+  table, timeline, ctx)` (user opens; array waits park through
+  `IoctlContext::restart_after`) and `dispatch_sync` (kernel callers, no fd
+  ioctls, 15 s cap) serve CREATE, DESTROY, HANDLE_TO_FD / FD_TO_HANDLE
+  (opaque `SyncobjFile` fds and EXPORT/IMPORT_SYNC_FILE), WAIT, RESET,
+  SIGNAL and, when `timeline` (amdgpu; EOPNOTSUPP otherwise),
+  TIMELINE_WAIT, QUERY, TRANSFER, TIMELINE_SIGNAL and EVENTFD, with
+  `drm_syncobj.c`'s errnos. amdgpu reports `DRM_CAP_SYNCOBJ_TIMELINE` = 1
+  (`drm_ioctl_bridge::amdgpu_cap_value` / `amdgpu_get_cap`). Without a submitter, CS parses and is refused as before
   and GEM_WAIT_IDLE reports idle. `pm4::Pm4Builder::vm_flush` builds the in-ring VM flush
   (shared by GMC 11 and 12).
 

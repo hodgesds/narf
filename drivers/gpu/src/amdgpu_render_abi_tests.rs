@@ -116,10 +116,14 @@ fn render_abi_user_fence_reaches_the_bo_after_completion() -> TestResult {
         CARD,
         amd(uapi::DRM_AMDGPU_CS),
         cs.as_mut_ptr() as usize,
-        &vm,
-        &gem,
-        &ctxs,
-        &syncobjs,
+        &crate::amdgpu_cs::CsOpen {
+            vm: &vm,
+            gem: &gem,
+            ctx: &ctxs,
+            syncobjs: &syncobjs,
+            bo_lists: &crate::amdgpu_bo_list::BoListTable::new(),
+            files: None,
+        },
     ));
     let ticket = u64::from_le_bytes(cs[0..8].try_into().unwrap());
     crate::amdgpu_cs::retire(CARD, &|_| true);
@@ -142,7 +146,18 @@ kernel_test_in!(
 );
 
 fn render_abi_metadata_mmap_layout_and_prime_identity() -> TestResult {
-    let (a, b) = (GemState::new(), GemState::new());
+    let (a, b) = (
+        GemState::for_card(0x7ffe_0303),
+        GemState::for_card(0x7ffe_0303),
+    );
+    // A buffer bound to no card is no device's, so it is never imported.
+    let unbound = GemState::new();
+    let orphan = create(&unbound, 4096, uapi::AMDGPU_GEM_DOMAIN_GTT as u64);
+    if GemState::new().import(&unbound.object(orphan).unwrap()) != Err(FsError::InvalidData)
+        || a.import(&unbound.object(orphan).unwrap()) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("a buffer of no card must not import");
+    }
     let h = create(&a, 8192, uapi::AMDGPU_GEM_DOMAIN_GTT as u64);
     // GEM_MMAP: out.addr_ptr at offset 0 of the 8-byte union.
     let mut m = [0u8; 8];

@@ -1079,20 +1079,45 @@ fn handle_transfer_3d(
     Ok(0)
 }
 
-/// DRM syncobj ioctls on the render node, backed by this open's per-fd table.
-/// The DRM native context (radeonsi-over-virtio) creates syncobjs during device
-/// init and rendering. Dispatched by ioctl number (0xbf..=0xc5).
-/// The DRM syncobj ioctls (nr 0xbf..=0xc5) on any driver's open, against
-/// the open's own table.
+/// The DRM syncobj ioctls (`drm::syncobj_ioctl`) on any driver's open,
+/// against the open's own table, for a kernel caller (no descriptor table).
+/// `timeline`: the driver has `DRIVER_SYNCOBJ_TIMELINE` (amdgpu does,
+/// virtio-gpu does not). User opens go through [`dispatch_syncobj_user`].
 pub(crate) fn dispatch_syncobj(
     cmd: u32,
     arg: usize,
     state: &VirtGpuRenderState,
+    timeline: bool,
 ) -> Option<Result<u64, FsError>> {
-    let nr = crate::drm_uapi::ioc_nr(cmd);
-    (0xbf..=0xc5)
-        .contains(&nr)
-        .then(|| handle_syncobj(nr, arg, state))
+    crate::drm::syncobj_ioctl::dispatch_sync(
+        crate::drm_uapi::ioc_nr(cmd),
+        arg,
+        &state.syncobjs,
+        timeline,
+    )
+}
+
+/// The DRM syncobj ioctls from a user open: fd export/import through
+/// `context`, and waits that park the syscall (`IoctlContext::restart_after`).
+/// `None` for any other ioctl or a non-DRM ('d') command.
+pub(crate) async fn dispatch_syncobj_user(
+    cmd: u32,
+    arg: usize,
+    state: &VirtGpuRenderState,
+    timeline: bool,
+    context: &dyn IoctlContext,
+) -> Option<Result<u64, FsError>> {
+    if (cmd >> 8) & 0xff != u32::from(b'd') {
+        return None;
+    }
+    crate::drm::syncobj_ioctl::dispatch(
+        crate::drm_uapi::ioc_nr(cmd),
+        arg,
+        &state.syncobjs,
+        timeline,
+        context,
+    )
+    .await
 }
 
 impl VirtGpuRenderState {
@@ -1105,134 +1130,8 @@ impl VirtGpuRenderState {
 }
 
 fn handle_syncobj(nr: u32, arg: usize, state: &VirtGpuRenderState) -> Result<u64, FsError> {
-    match nr {
-        // SYNCOBJ_CREATE { u32 handle (out), u32 flags }
-        0xbf => {
-            let mut req: crate::drm_uapi::DrmSyncobjCreateUapi = read_uapi(arg)?;
-            let handle = state
-                .syncobjs
-                .lock()
-                .create(req.flags)
-                .map_err(|_| FsError::InvalidData)?;
-            req.handle = handle;
-            write_uapi(arg, req)?;
-            Ok(0)
-        }
-        // SYNCOBJ_DESTROY { u32 handle, u32 pad }
-        0xc0 => {
-            // SAFETY: `arg` is the ioctl's user struct pointer; copy_in bounds
-            // the 8-byte read and SMAP-brackets it.
-            let bytes = unsafe { copy_in(arg, 8)? };
-            let handle =
-                u32::from_le_bytes(bytes[0..4].try_into().map_err(|_| FsError::InvalidData)?);
-            state
-                .syncobjs
-                .lock()
-                .destroy(handle)
-                .map_err(|_| FsError::InvalidData)?;
-            Ok(0)
-        }
-        // SYNCOBJ_RESET (0xc4) / SIGNAL (0xc5): drm_syncobj_array
-        // { u64 handles, u32 count_handles, u32 pad }
-        0xc4 | 0xc5 => {
-            // SAFETY: `arg` is the ioctl's user struct pointer; copy_in bounds
-            // the 16-byte read and SMAP-brackets it.
-            let bytes = unsafe { copy_in(arg, 16)? };
-            let handles_ptr = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-            let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-            if count == 0 || count > 4096 || handles_ptr == 0 {
-                return Err(FsError::InvalidData);
-            }
-            // SAFETY: `handles_ptr` is the user handle-array pointer from the
-            // ioctl struct; copy_in bounds `count * 4` and SMAP-brackets it.
-            let hbytes = unsafe { copy_in(handles_ptr as usize, count * 4)? };
-            let ids: Vec<u32> = hbytes
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
-            let mut tbl = state.syncobjs.lock();
-            if nr == 0xc5 {
-                tbl.signal_handles(&ids).map_err(|_| FsError::InvalidData)?;
-            } else {
-                tbl.reset_handles(&ids).map_err(|_| FsError::InvalidData)?;
-            }
-            Ok(0)
-        }
-        // SYNCOBJ_WAIT: drm_syncobj_wait { u64 handles, s64 timeout_nsec,
-        //   u32 count_handles, u32 flags, u32 first_signaled, u32 pad,
-        //   u64 deadline_nsec } (40 bytes in the current UAPI).
-        0xc3 => {
-            // SAFETY: `arg` is the ioctl's user struct pointer; copy_in bounds
-            // the 40-byte read and SMAP-brackets it.
-            let bytes = unsafe { copy_in(arg, 40)? };
-            let handles_ptr = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-            let timeout_abs_ns = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
-            let count = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
-            let flags = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-            const WAIT_ALL: u32 = 1 << 0;
-            const WAIT_FOR_SUBMIT: u32 = 1 << 1;
-            if count == 0
-                || count > 4096
-                || handles_ptr == 0
-                || flags & !(WAIT_ALL | WAIT_FOR_SUBMIT) != 0
-            {
-                return Err(FsError::InvalidData);
-            }
-            // SAFETY: `handles_ptr` is the user handle-array pointer from the
-            // ioctl struct; copy_in bounds `count * 4` and SMAP-brackets it.
-            let hbytes = unsafe { copy_in(handles_ptr as usize, count * 4)? };
-            let ids: Vec<u32> = hbytes
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
-            let fences = state
-                .syncobjs
-                .lock()
-                .snapshot_fences(&ids)
-                .map_err(|_| FsError::InvalidData)?;
-            // WAIT_FOR_SUBMIT only changes the no-fence case. Output syncobjs
-            // are bound before EXECBUFFER returns, so ordinary Mesa waits
-            // arrive with a fence already present; an overlapping wait on an
-            // unbound object remains retryable rather than holding the table
-            // lock across the producer.
-            // drm_syncobj_array_wait_timeout: an unsubmitted syncobj is
-            // -EINVAL unless the caller asked to wait for submission.
-            if fences.iter().any(Option::is_none) {
-                if flags & WAIT_FOR_SUBMIT == 0 {
-                    return Err(FsError::InvalidData);
-                }
-                return Err(FsError::WouldBlock);
-            }
-            let now = narf_time::wall::monotonic_ns();
-            // Linux interprets this as an absolute CLOCK_MONOTONIC instant.
-            // A negative value is already expired; INT64_MAX is the ordinary
-            // userspace spelling of an effectively infinite wait, capped here
-            // by the same 15 s GPU-hang bound as VIRTGPU_WAIT.
-            let timeout_ns = u64::try_from(timeout_abs_ns)
-                .unwrap_or(0)
-                .saturating_sub(now)
-                .min(15_000_000_000);
-            match crate::drm::syncobj::SyncObjTable::wait_fences(&ids, &fences, timeout_ns, flags) {
-                Ok(first_handle) => {
-                    let first = ids
-                        .iter()
-                        .position(|handle| *handle == first_handle)
-                        .unwrap_or(0) as u32;
-                    // SAFETY: writes 4 bytes to the `first_signaled` field at
-                    // offset 24 of the ioctl struct; copy_out SMAP-brackets it.
-                    unsafe { copy_out(arg + 24, &first.to_le_bytes())? };
-                    Ok(0)
-                }
-                // Linux's timed-out wait is -ETIME, which RADV maps to
-                // VK_TIMEOUT (any other error is device loss). ETIME has no
-                // FsError; the raw negative return carries it.
-                Err(_) => Ok((-62i64) as u64),
-            }
-        }
-        // HANDLE_TO_FD (0xc1) / FD_TO_HANDLE (0xc2): fence-fd export/import needs
-        // sync_file fd infrastructure NARF does not have yet.
-        _ => Err(FsError::Unsupported),
-    }
+    crate::drm::syncobj_ioctl::dispatch_sync(nr, arg, &state.syncobjs, false)
+        .unwrap_or(Err(FsError::Unsupported))
 }
 
 /// Whether `cmd` is DRM_IOCTL_WAIT_VBLANK, which a user file waits out
@@ -1432,11 +1331,11 @@ fn dispatch_virtgpu_render_inner(
     if ioc_nr(cmd) == DRM_VIRTGPU_NR_RESOURCE_CREATE_BLOB {
         return handle_resource_create_blob(arg, state);
     }
-    // DRM syncobj ioctls (nr 0xbf..=0xc5: CREATE/DESTROY/HANDLE_TO_FD/
-    // FD_TO_HANDLE/WAIT/RESET/SIGNAL). The DRM native context creates and uses
-    // syncobjs; route them to this open's per-fd table. Dispatched by number so
-    // struct-size variations don't matter.
-    if (0xbf..=0xc5).contains(&ioc_nr(cmd)) {
+    // DRM syncobj ioctls (`drm::syncobj_ioctl`). The DRM native context
+    // creates and uses syncobjs; route them to this open's per-fd table.
+    // Dispatched by number so struct-size variations don't matter. virtio-gpu
+    // has no DRIVER_SYNCOBJ_TIMELINE, so the timeline ones are -EOPNOTSUPP.
+    if crate::drm::syncobj_ioctl::is_syncobj_ioctl(ioc_nr(cmd)) {
         return handle_syncobj(ioc_nr(cmd), arg, state);
     }
     match cmd {
@@ -1737,8 +1636,7 @@ fn dispatch_virtgpu_render_inner(
                         table
                             .get(dep.handle)
                             .map_err(|_| FsError::InvalidData)?
-                            .fence
-                            .clone()
+                            .fence()
                             .ok_or(FsError::InvalidData)
                     })
                     .collect::<Result<Vec<_>, _>>()?
@@ -1823,8 +1721,8 @@ fn dispatch_virtgpu_render_inner(
             let mut table = state.syncobjs.lock();
             for dep in &in_syncobjs {
                 if dep.reset {
-                    if let Ok(obj) = table.get_mut(dep.handle) {
-                        obj.fence = None;
+                    if let Ok(obj) = table.get(dep.handle) {
+                        obj.reset();
                     }
                 }
             }
@@ -5367,7 +5265,7 @@ pub fn without_kms(card_index: u32, cmd: u32, arg: usize) -> Option<Result<u64, 
             // SAFETY: `arg` is the ioctl struct pointer; 16 bytes.
             let mut b = unsafe { copy_in(arg, 16)? };
             let cap = u64::from_le_bytes(b[0..8].try_into().unwrap());
-            let value = crate::drm::ioctl::cap_value(cap);
+            let value = amdgpu_cap_value(cap);
             b[8..16].copy_from_slice(&value.to_le_bytes());
             // SAFETY: as above.
             unsafe { copy_out(arg, &b)? };
@@ -5375,6 +5273,37 @@ pub fn without_kms(card_index: u32, cmd: u32, arg: usize) -> Option<Result<u64, 
         })()),
         _ => None,
     }
+}
+
+/// `DRM_IOCTL_GET_CAP` for amdgpu: the generic table, plus
+/// `DRM_CAP_SYNCOBJ_TIMELINE` = 1 (amdgpu has `DRIVER_SYNCOBJ_TIMELINE`).
+pub fn amdgpu_cap_value(cap: u64) -> u64 {
+    if cap == crate::drm::ioctl::drm_cap::SYNCOBJ_TIMELINE {
+        1
+    } else {
+        crate::drm::ioctl::cap_value(cap)
+    }
+}
+
+/// `DRM_IOCTL_GET_CAP(SYNCOBJ_TIMELINE)` on an amdgpu open (with or without
+/// KMS state); `None` for any other ioctl or capability, which the card's
+/// generic table answers identically for amdgpu.
+pub fn amdgpu_get_cap(cmd: u32, arg: usize) -> Option<Result<u64, FsError>> {
+    if (cmd >> 8) & 0xff != u32::from(b'd') || drm_uapi::ioc_nr(cmd) != 0x0c {
+        return None;
+    }
+    // SAFETY: `arg` is the ioctl struct pointer; drm_get_cap is 16 bytes.
+    let mut b = match unsafe { copy_in(arg, 16) } {
+        Ok(b) => b,
+        Err(e) => return Some(Err(e)),
+    };
+    let cap = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    if cap != crate::drm::ioctl::drm_cap::SYNCOBJ_TIMELINE {
+        return None;
+    }
+    b[8..16].copy_from_slice(&amdgpu_cap_value(cap).to_le_bytes());
+    // SAFETY: as above.
+    Some(unsafe { copy_out(arg, &b) }.map(|()| 0))
 }
 
 /// `struct drm_version` for the amdgpu driver: `amdgpu`, `20150101`,
