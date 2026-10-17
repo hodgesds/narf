@@ -479,6 +479,8 @@ pub(super) struct Scdc {
     pub regs: [u8; 256],
     pub log: Vec<(bool, u8, u8)>,
     pub nack: bool,
+    /// NACK reads only (a sink that will not answer Sink_Version).
+    pub nack_reads: bool,
 }
 impl Scdc {
     pub fn new(sink_version: u8) -> Self {
@@ -488,6 +490,7 @@ impl Scdc {
             regs,
             log: Vec::new(),
             nack: false,
+            nack_reads: false,
         }
     }
 }
@@ -499,7 +502,7 @@ impl Aux for Scdc {
         Err(M::Aux)
     }
     async fn scdc_read(&mut self, offset: u8) -> Result<u8, M> {
-        if self.nack {
+        if self.nack || self.nack_reads {
             return Err(M::Hdmi(Error::Scdc));
         }
         let v = self.regs[usize::from(offset)];
@@ -548,6 +551,14 @@ fn dcn30_hdmi_scdc_protocol_matches_link_ddc() -> TestResult {
     let mut v0 = Scdc::new(0);
     if run(write_scdc_data(&mut v0, &s)).is_err() || v0.log != [(false, 1, 0), (true, 0x20, 3)] {
         return TestResult::Fail("write_scdc_data v0");
+    }
+    // A Sink_Version read that fails is `sink_version = 0` in link_ddc.c:
+    // no Source_Version, and TMDS_Config is still written (the old code
+    // aborted, leaving a scrambled stream the sink was never told about).
+    let mut mute = Scdc::new(1);
+    mute.nack_reads = true;
+    if run(write_scdc_data(&mut mute, &s)).is_err() || mute.log != [(true, 0x20, 3)] {
+        return TestResult::Fail("failed Sink_Version read must still write TMDS_Config");
     }
     // A scrambled stream whose SCDC fails fails the link.
     let mut nack = Scdc::new(1);
