@@ -3793,24 +3793,47 @@ DMUB (`dc_is_dmub_outbox_supported` is false outside DCN3.1 DPIA/GC11 unless
 
 ### Navi 22 DCN3.0 mode math
 
-`amdgpu_dml30::plan(&Config, &Soc) -> Result<Plan, Error>` is the DCN3.0
-`display_mode_vba_30.c` performance calculation plus `display_rq_dlg_calc_30.c`
-encoding for one unscaled linear RGB plane on one pipe (GPUVM/HostVM, DCC,
-dynamic metadata, cursor, writeback, ODM/MPC split off), with `dcn3_0_ip` /
-`dcn3_0_soc` constants (184 KiB DET, 84 PTE requests, 191-cycle ping, 404 us
-p-state, 15.5/20 us self refresh, fabric-adjusted urgent latency) in
-`amdgpu_dml::Fx` fixed point. `Soc` carries the board's DCFCLK/fabric/SOCCLK,
-`memclk*16` DRAM rate, VBIOS channel count/width, clock ceilings, DENTIST VCO
-and DCHUB reference. It tries prefetch modes 0..2 and VStartup from 13 to
-`vtotal - vactive - 1` with Linux's bandwidth, urgent-burst, two-line and
-VRatio<=4 checks, and returns `Plan { prefetch_mode, geometry, clocks,
-watermarks, prefetch, registers: amdgpu_dml_regs::Registers, hubbub:
-WatermarkSet (refclk cycles, `convert_and_clamp`), dram_clock_change,
-urgent_bandwidth_thousandths }`. Register fields are Linux's `(unsigned int)`
-truncations and are refused (not wrapped) when they exceed the DCN3.0 mask.
-Out-of-scope planes, PHY/display-clock overruns and unschedulable blanks fail
-before any hardware is touched. Host vectors from a double transliteration of
-the Linux formulas are checked to one LSB.
+`amdgpu_dml30::plan_joint(&[Stream], &Soc) -> Result<JointPlan, Error>` is the
+DCN3.0 admission of a whole context (one to six streams, one unscaled linear
+RGB plane each; GPUVM/HostVM, DCC, dynamic metadata, writeback and MPC combine
+off): `dml30_ModeSupportAndSystemConfigurationFull`'s ODM choice per stream
+(`Odm::TwoToOne` when one pipe's DISPCLK exceeds the DFS-rounded ceiling or a
+DSC line is wider than 5184; 4:1, odd widths and more than six pipes are
+refused), ROB and vertical-active bandwidth support (60% SDP / 40% DRAM), then
+`display_mode_vba_30.c`'s performance calculation across every plane — one
+DISPCLK and one DPPCLK DFS step (each plane its 1/255 DPPCLK share), the summed
+read bandwidth, deep-sleep DCFCLK over all planes, extra latency per active
+DPP, one VStartup search (each plane capped at its own MaxVStartupLines), the
+multi-plane DRAM clock change margin (SynchronizedVBlank false: no OTG sync)
+and stutter critical plane, one watermark set, DSC delay (`dscceComputeDelay`)
+and ODM after-scaler allowance — and `display_rq_dlg_calc_30.c` per pipe (an
+ODM slice's viewport, swath and blank end). `Stream { config, dsc:
+Option<Dsc { slices, bits_per_pixel_x16 }>, phy_khz }` (`Stream::tmds(config)`
+for 8-bpc TMDS); `JointPlan { prefetch_mode, clocks, watermarks, hubbub,
+dram_clock_change, urgent_bandwidth_thousandths, planes: Vec<PlanePlan { odm,
+geometry, prefetch, dppclk_khz, dsc_delay, pipes: [Option<PipePlan {
+viewport_x, viewport_width, registers, cursor }>; 2] }> }`. The prefetch-mode
+policy is `dcn30_internal_validate_bw`'s: mode 0, then mode 1 when mode 0 fails
+or leaves the DRAM clock change unsupported; never mode 2. Without p-state
+support the set A p-state watermark is 0 (`dcn30_fpu_calculate_wm_and_dlg`).
+A top DCFCLK below `dcn3_0_soc.min_dcfclk` (500 MHz) is refused.
+`plan(&Config, &Soc) -> Result<Plan, Error>` is the one-stream, one-pipe form
+(`Plan { prefetch_mode, geometry, clocks, watermarks, prefetch, registers:
+amdgpu_dml_regs::Registers, hubbub: WatermarkSet, dram_clock_change,
+urgent_bandwidth_thousandths, cursor }`; a stream needing ODM is
+`Unsupported` there). `dcn3_0_ip` / `dcn3_0_soc` constants (184 KiB DET per
+pipe, 84 PTE requests, 191-cycle ping, 404 us p-state, 15.5/20 us self refresh,
+fabric-adjusted urgent latency) in `amdgpu_dml::Fx` fixed point. Register
+fields are Linux's `(unsigned int)` truncations and are refused (not wrapped)
+when they exceed the DCN3.0 mask; everything fails before hardware is touched.
+`drivers/gpu/tests/navi22_dml30/check.sh <linux>` compiles Linux's own
+`display_mode_vba.c`, `dcn30/display_mode_vba_30.c`,
+`dcn30/display_rq_dlg_calc_30.c` and `calcs/dcn_calc_math.c` on the host and
+runs them under the same policy (`harness.c`, with DCN30's
+`OutputBppPerState[k][VoltageLevel]` DSC-delay index swap corrected) over
+`vectors.txt` (234 single- and multi-stream, cursor, ODM, DSC and rejection
+cases); `dml30_matches_linux_dml_vectors` checks the port against the same
+file within one LSB (two, upward, on deep-sleep DCFCLK).
 
 `Soc::from_board(levels, channels, width, dchub_refclk)` builds the top
 bounding-box state from the DAL DPM table (DCFCLK doubling as fabric clock,

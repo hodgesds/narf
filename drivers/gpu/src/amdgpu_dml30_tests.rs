@@ -6,6 +6,7 @@
 //! ceilings, a 3650 MHz DENTIST VCO and a 50 MHz DCHUB reference.
 use super::*;
 use crate::amdgpu_dml::{Format, Plane, Timing};
+use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn soc() -> Soc {
@@ -62,112 +63,184 @@ fn config(
         cursors: 0,
     }
 }
-fn observed(plan: &Plan) -> [u32; 28] {
-    let d = &plan.registers.dlg;
-    let t = &plan.registers.ttu;
-    let p = &plan.prefetch;
+/// `drivers/gpu/tests/navi22_dml30/vectors.txt`: Linux's own DCN3.0 DML,
+/// compiled on the host by `check.sh`, run on each configuration.
+const VECTORS: &str = include_str!("../tests/navi22_dml30/vectors.txt");
+
+/// One vector line's configuration: the SoC and its streams.
+fn vector_inputs(fields: &[u32]) -> Option<(Soc, Vec<Stream>)> {
+    let s = fields.get(..10)?;
+    let soc = Soc {
+        dcfclk_khz: s[0],
+        fabric_khz: s[0],
+        socclk_khz: 1_000_000,
+        dram_speed_mts: s[1],
+        channels: s[2],
+        channel_width_bytes: s[3],
+        max_dispclk_khz: s[4],
+        max_dppclk_khz: s[5],
+        max_phyclk_khz: s[6],
+        dentist_vco_khz: s[7],
+        dchub_refclk_khz: s[8],
+    };
+    let mut streams = Vec::new();
+    for k in 0..s[9] as usize {
+        let f = fields.get(10 + 13 * k..23 + 13 * k)?;
+        let mut config = config(f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+        config.timing.v_sync_width = f[8];
+        config.plane.pitch = (f[1] * 4).next_multiple_of(256) / 4;
+        config.dentist_vco_khz = s[7];
+        config.cursors = f[9];
+        streams.push(Stream {
+            config,
+            dsc: (f[10] != 0).then_some(Dsc {
+                slices: f[10],
+                bits_per_pixel_x16: f[11],
+            }),
+            // TMDS runs the PHY at the pixel clock, DP at its link rate.
+            phy_khz: if f[12] != 0 { f[0] } else { s[6] },
+        });
+    }
+    Some((soc, streams))
+}
+
+/// The harness's PLAN tokens for `plan`, in its order (see harness.c).
+fn observed_joint(plan: &JointPlan) -> Vec<u32> {
     let w = &plan.hubbub;
-    [
-        p.v_startup,
-        p.v_update_offset_pix,
-        p.v_update_width_pix,
-        p.v_ready_offset_pix,
-        d.ref_freq_to_pix_freq,
-        d.refcyc_per_htotal,
-        d.refcyc_h_blank_end,
-        d.min_dst_y_next_start,
-        d.refcyc_x_after_scaler,
-        d.dst_y_prefetch,
-        d.dst_y_per_vm_vblank,
-        d.dst_y_per_row_vblank,
-        d.vratio_prefetch,
-        d.refcyc_per_pte_group_vblank_l,
-        d.dst_y_per_pte_row_nom_l,
-        d.refcyc_per_pte_group_nom_l,
-        d.refcyc_per_line_delivery_l,
-        d.refcyc_per_line_delivery_pre_l,
-        t.refcyc_per_req_delivery_l,
-        t.refcyc_per_req_delivery_pre_l,
-        t.min_ttu_vblank,
-        t.qos_level_high_wm,
+    let mut out = alloc::vec![
+        plan.prefetch_mode as u32,
+        plan.clocks.dispclk_khz,
+        plan.clocks.dppclk_khz,
+        plan.clocks.deep_sleep_dcfclk_khz,
+        match plan.dram_clock_change {
+            DramClockChange::Vactive => 0,
+            DramClockChange::Vblank => 1,
+            DramClockChange::Unsupported => 2,
+        },
         w.urgent,
         w.urgent_latency,
         w.sr_enter,
         w.sr_exit,
         w.dram_clock_change,
         w.frac_urg_bw_nom,
-    ]
-}
-/// Fixed point and double may round a truncated product to adjacent integers
-/// only where the double result sits within 2^-24 of an integer; every field
-/// here is a single truncation of a well-conditioned value, so allow one LSB
-/// and nothing more.
-fn close(a: &[u32; 28], b: &[u32; 28]) -> bool {
-    a.iter().zip(b).all(|(x, y)| x.abs_diff(*y) <= 1)
+    ];
+    for plane in &plan.planes {
+        let p = &plane.prefetch;
+        for pipe in plane.pipes.iter().flatten() {
+            let d = &pipe.registers.dlg;
+            let t = &pipe.registers.ttu;
+            let c = pipe.cursor;
+            out.extend_from_slice(&[
+                u32::MAX,
+                plane.odm.pipes(),
+                p.v_startup,
+                p.v_update_offset_pix,
+                p.v_update_width_pix,
+                p.v_ready_offset_pix,
+                plane.dppclk_khz,
+                d.ref_freq_to_pix_freq,
+                d.refcyc_per_htotal,
+                d.refcyc_h_blank_end,
+                d.min_dst_y_next_start,
+                d.refcyc_x_after_scaler,
+                d.dst_y_after_scaler,
+                d.dst_y_prefetch,
+                d.dst_y_per_vm_vblank,
+                d.dst_y_per_row_vblank,
+                d.vratio_prefetch,
+                d.refcyc_per_pte_group_vblank_l,
+                d.dst_y_per_pte_row_nom_l,
+                d.refcyc_per_pte_group_nom_l,
+                d.refcyc_per_line_delivery_l,
+                d.refcyc_per_line_delivery_pre_l,
+                t.refcyc_per_req_delivery_l,
+                t.refcyc_per_req_delivery_pre_l,
+                t.min_ttu_vblank,
+                t.qos_level_high_wm,
+                d.vready_after_vcount0,
+                c.map_or(0, |c| c.refcyc_per_req_delivery),
+                c.map_or(0, |c| c.refcyc_per_req_delivery_pre),
+            ]);
+        }
+    }
+    out
 }
 
-fn dml30_matches_linux_reference_vectors() -> TestResult {
-    let cases: [(&str, u8, Config, [u32; 28]); 5] = [
-        (
-            "1080p60",
-            0,
-            config(148_500, 1920, 2200, 88, 44, 1080, 1125, 4),
-            [
-                31, 550, 254, 340, 176527, 189629, 64, 4484, 68, 11, 1, 2, 699050, 370, 512, 94814,
-                646, 321, 22065, 10971, 20565, 2962, 247, 191, 1104, 879, 20447, 11,
-            ],
-        ),
-        (
-            "1440p60 reduced blanking",
-            0,
-            config(241_500, 2560, 2720, 48, 32, 1440, 1481, 3),
-            [
-                40, 680, 254, 340, 108548, 144165, 23, 5912, 42, 12, 1, 2, 599186, 140, 512, 36041,
-                530, 263, 13568, 6733, 20519, 2252, 247, 191, 1086, 861, 20447, 16,
-            ],
-        ),
-        (
-            "2160p30",
-            0,
-            config(297_000, 3840, 4400, 176, 88, 2160, 2250, 8),
-            [
-                31, 1100, 254, 340, 88263, 189629, 64, 8968, 34, 12, 1, 2, 599186, 185, 512, 47407,
-                646, 320, 11032, 5472, 20506, 2962, 247, 191, 1080, 855, 20447, 19,
-            ],
-        ),
-        (
-            "480p60",
-            0,
-            config(25_175, 640, 800, 16, 96, 480, 525, 10),
-            [
-                16, 200, 95, 149, 1041286, 406752, 285, 2060, 407, 9, 1, 2, 1048576, 794, 512,
-                203376, 1271, 632, 130160, 64750, 20597, 6355, 247, 191, 1118, 893, 20447, 2,
-            ],
-        ),
-        (
-            // CVT-RB 1080p60: 30 lines cannot hide the 404 us switch, so
-            // the support search falls back to prefetch mode 1.
-            "1080p60 reduced blanking",
-            1,
-            config(138_500, 1920, 2080, 48, 32, 1080, 1111, 3),
-            [
-                13, 520, 254, 340, 189273, 192231, 40, 4432, 73, 13, 1, 2, 524288, 375, 512, 96115,
-                693, 693, 23659, 23659, 1234, 3003, 247, 191, 1108, 883, 20447, 8,
-            ],
-        ),
-    ];
-    for (name, mode, config, expected) in cases {
-        let Ok(plan) = plan(&config, &soc()) else {
-            let _ = name;
-            return TestResult::Fail("reference mode refused");
-        };
-        if plan.prefetch_mode != mode || !close(&observed(&plan), &expected) {
-            return TestResult::Fail("register vector differs from Linux DML30");
+/// Fixed point and Linux's double/float DML may round a truncated product
+/// to adjacent integers only where the exact value sits within 2^-24 of an
+/// integer, and Linux truncates the clocks the port rounds up; every field
+/// is a single truncation of a well-conditioned value, so allow one LSB.
+/// The deep-sleep DCFCLK gets two: Linux's `dml_max` returns it through a
+/// float and truncates (24.3 MHz becomes 24299 kHz) where the port rounds
+/// its sum up (24301 kHz), the safe side. The prefetch mode, DRAM clock
+/// change support, pipe count per plane and the separators match exactly.
+fn vector_matches(got: &[u32], want: &[u32]) -> bool {
+    got.len() == want.len()
+        && got.iter().zip(want).enumerate().all(|(i, (g, w))| {
+            let exact = i == 0 || i == 4 || *w == u32::MAX || (i > 0 && want[i - 1] == u32::MAX);
+            if exact {
+                g == w
+            } else if i == 3 {
+                g.abs_diff(*w) <= 2 && g >= w
+            } else {
+                g.abs_diff(*w) <= 1
+            }
+        })
+}
+
+fn dml30_matches_linux_dml_vectors() -> TestResult {
+    let mut checked = 0;
+    for line in VECTORS.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
         }
+        let (inputs, kind, rest) = match (line.find('='), line.find('!')) {
+            (Some(i), _) => (&line[..i], '=', &line[i + 1..]),
+            (None, Some(i)) => (&line[..i], '!', &line[i + 1..]),
+            _ => return TestResult::Fail("malformed vector line"),
+        };
+        let fields: Vec<u32> = inputs
+            .split_whitespace()
+            .filter_map(|f| f.parse().ok())
+            .collect();
+        let Some((soc, streams)) = vector_inputs(&fields) else {
+            return TestResult::Fail("malformed vector inputs");
+        };
+        let result = plan_joint(&streams, &soc);
+        match (kind, result) {
+            ('!', Err(_)) => {}
+            ('!', Ok(_)) => {
+                return TestResult::Fail("Linux rejects a configuration the port plans")
+            }
+            ('=', Err(_)) => {
+                return TestResult::Fail("Linux plans a configuration the port rejects")
+            }
+            ('=', Ok(plan)) => {
+                let want: Vec<u32> = rest
+                    .split_whitespace()
+                    .map(|t| {
+                        if t == "|" {
+                            u32::MAX
+                        } else {
+                            t.parse().unwrap_or(u32::MAX - 1)
+                        }
+                    })
+                    .collect();
+                if !vector_matches(&observed_joint(&plan), &want) {
+                    return TestResult::Fail("plan differs from Linux DML30");
+                }
+            }
+            _ => return TestResult::Fail("malformed vector kind"),
+        }
+        checked += 1;
+    }
+    if checked < 40 {
+        return TestResult::Fail("vector file truncated");
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/dml30", dml30_matches_linux_reference_vectors);
+kernel_test_in!("drivers/gpu/dml30", dml30_matches_linux_dml_vectors);
 
 fn dml30_uses_dcn30_parameters_not_dcn314() -> TestResult {
     let plan = plan(&config(148_500, 1920, 2200, 88, 44, 1080, 1125, 4), &soc()).unwrap();
@@ -288,4 +361,129 @@ fn dml30_budgets_one_cursor_like_dcn20_populate_dml_pipes() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dml30",
     dml30_budgets_one_cursor_like_dcn20_populate_dml_pipes
+);
+
+fn stream(config: Config) -> Stream {
+    let mut config = config;
+    config.cursors = 1;
+    Stream::tmds(config)
+}
+
+fn dml30_joint_plan_shares_clocks_latency_and_watermarks() -> TestResult {
+    let a = config(148_500, 1920, 2200, 88, 44, 1080, 1125, 4);
+    let b = config(533_250, 3840, 4000, 48, 32, 2160, 2222, 3);
+    let (Ok(one), Ok(two)) = (
+        plan_joint(&[stream(a)], &soc()),
+        plan_joint(&[stream(a), stream(b)], &soc()),
+    ) else {
+        return TestResult::Fail("two-stream configuration refused");
+    };
+    if two.planes.len() != 2 || two.pipes() != 2 {
+        return TestResult::Fail("one plane and pipe per stream");
+    }
+    // One DISPCLK for both, at least the faster stream's; each plane its own
+    // DPPCLK share and the global DPPCLK the larger.
+    let fast = &two.planes[1];
+    if two.clocks.dispclk_khz < 533_250
+        || two.clocks.dppclk_khz != fast.dppclk_khz
+        || two.planes[0].dppclk_khz >= fast.dppclk_khz
+    {
+        return TestResult::Fail("shared clocks");
+    }
+    // CalculateExtraLatency counts every active DPP's pixel chunk: a second
+    // pipe raises the urgent watermark every plane runs under.
+    if two.watermarks.extra_latency_us <= one.watermarks.extra_latency_us
+        || two.hubbub.urgent <= one.hubbub.urgent
+    {
+        return TestResult::Fail("extra latency per active DPP");
+    }
+    // One MinTTUVBlank for the whole configuration.
+    let ttu = |p: &PlanePlan| p.pipes[0].map(|x| x.registers.ttu.min_ttu_vblank);
+    if ttu(&two.planes[0]) != ttu(&two.planes[1]) {
+        return TestResult::Fail("min TTU differs between planes");
+    }
+    // Neither display alone is refused, yet six 4K streams on a slow memory
+    // state exceed the bandwidth display may use: joint admission refuses
+    // what single admission of each would allow.
+    let slow = Soc {
+        dcfclk_khz: 500_000,
+        fabric_khz: 500_000,
+        dram_speed_mts: 2_000,
+        channels: 6,
+        ..soc()
+    };
+    let six = [stream(b); 6];
+    if plan_joint(&six[..1], &slow).is_err() || plan_joint(&six, &slow).is_ok() {
+        return TestResult::Fail("joint bandwidth admission");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dml30",
+    dml30_joint_plan_shares_clocks_latency_and_watermarks
+);
+
+fn dml30_odm_combines_where_one_pipe_cannot_carry_the_stream() -> TestResult {
+    // A 600 MHz DISPCLK ceiling: 2160p60 (594 MHz) needs both halves.
+    let low = Soc {
+        max_dispclk_khz: 600_000,
+        max_dppclk_khz: 600_000,
+        ..soc()
+    };
+    let uhd = config(594_000, 3840, 4400, 176, 88, 2160, 2250, 8);
+    let Ok(joint) = plan_joint(&[stream(uhd)], &low) else {
+        return TestResult::Fail("2160p60 on ODM refused");
+    };
+    let plane = &joint.planes[0];
+    let (Some(left), Some(right)) = (plane.pipes[0], plane.pipes[1]) else {
+        return TestResult::Fail("ODM 2:1 without two pipes");
+    };
+    if plane.odm != Odm::TwoToOne
+        || joint.pipes() != 2
+        || left.viewport_x != 0
+        || right.viewport_x != 1920
+        || left.viewport_width != 1920
+        || plane.geometry.swath_width != 1920
+    {
+        return TestResult::Fail("ODM slices");
+    }
+    // The right slice's blank ends 1920 pixels later; everything else is the
+    // same pacing.
+    let (l, r) = (left.registers.dlg, right.registers.dlg);
+    // (blank end 4400 - 176 - 3840 = 384, plus 1920) x 50 / 594.
+    if r.refcyc_h_blank_end.abs_diff((384 + 1920) * 50 / 594) > 1
+        || r.refcyc_x_after_scaler != l.refcyc_x_after_scaler
+        || r.dst_y_prefetch != l.dst_y_prefetch
+    {
+        return TestResult::Fail("ODM slice registers");
+    }
+    // The single-pipe entry point refuses what needs ODM.
+    if plan(&uhd, &low) != Err(Error::Unsupported) {
+        return TestResult::Fail("single-pipe plan admitted an ODM stream");
+    }
+    // More than six pipes, or 4:1, are refused.
+    let eight_k = Stream {
+        dsc: Some(Dsc {
+            slices: 4,
+            bits_per_pixel_x16: 192,
+        }),
+        phy_khz: 810_000,
+        ..stream(config(2_039_800, 7680, 7760, 48, 32, 4320, 4381, 3))
+    };
+    let four = [eight_k; 4];
+    if plan_joint(&four[..3], &soc()).map(|p| p.pipes()) != Ok(6)
+        || plan_joint(&four, &soc()).is_ok()
+    {
+        return TestResult::Fail("pipe budget");
+    }
+    let mut fast = uhd;
+    fast.timing.pixel_clock_khz = 1_188_000;
+    if plan_joint(&[stream(fast)], &low).is_ok() {
+        return TestResult::Fail("ODM 4:1 admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dml30",
+    dml30_odm_combines_where_one_pipe_cannot_carry_the_stream
 );
