@@ -17,43 +17,69 @@ use crate::{
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, Write};
 
+// linux-ctx: hdr=gc101,pm4,amdgpu
 /// `amdgpu_gfx_kiq_acquire` on GC 10.3 (2 MEC x 4 pipes x 4 queues): the
 /// highest free queue-0 slot not on MEC2 pipes 2/3 is MEC2 pipe 1 queue 0.
-pub const KIQ_QUEUE: (u32, u32, u32) = (2, 1, 0);
+pub const KIQ_QUEUE: (u32, u32, u32) = (2, 1, 0); // linux: n/a (amdgpu_gfx_kiq_acquire result)
 /// Single kernel compute ring: `compute_ring[0]` at MEC1 pipe 0 queue 0.
-pub const COMPUTE_QUEUE: (u32, u32, u32) = (1, 0, 0);
+pub const COMPUTE_QUEUE: (u32, u32, u32) = (1, 0, 0); // linux: n/a (NARF single compute ring)
 
 /// `struct v10_compute_mqd` dword indices (v10_structs.h, 512 dwords).
 pub(crate) mod mqd {
-    pub const HEADER: usize = 0;
+    pub const HEADER: usize = 0; // linux: offsetof(struct v10_compute_mqd, header) / 4
+                                 // linux: offsetof(struct v10_compute_mqd, compute_pipelinestat_enable) / 4
     pub const PIPELINESTAT_ENABLE: usize = 11;
+    // linux: offsetof(struct v10_compute_mqd, compute_static_thread_mgmt_se0) / 4; offsetof(struct v10_compute_mqd, compute_static_thread_mgmt_se1) / 4
+    // linux: offsetof(struct v10_compute_mqd, compute_static_thread_mgmt_se2) / 4; offsetof(struct v10_compute_mqd, compute_static_thread_mgmt_se3) / 4
     pub const STATIC_THREAD_MGMT: [usize; 4] = [23, 24, 26, 27];
+    // linux: offsetof(struct v10_compute_mqd, compute_misc_reserved) / 4
     pub const MISC_RESERVED: usize = 32;
+    // linux: offsetof(struct v10_compute_mqd, cp_mqd_base_addr_lo) / 4
     pub const MQD_BASE_ADDR_LO: usize = 128;
+    // linux: offsetof(struct v10_compute_mqd, cp_mqd_base_addr_hi) / 4
     pub const MQD_BASE_ADDR_HI: usize = 129;
-    pub const HQD_ACTIVE: usize = 130;
-    pub const HQD_VMID: usize = 131;
+    pub const HQD_ACTIVE: usize = 130; // linux: offsetof(struct v10_compute_mqd, cp_hqd_active) / 4
+    pub const HQD_VMID: usize = 131; // linux: offsetof(struct v10_compute_mqd, cp_hqd_vmid) / 4
+                                     // linux: offsetof(struct v10_compute_mqd, cp_hqd_persistent_state) / 4
     pub const PERSISTENT_STATE: usize = 132;
+    // linux: offsetof(struct v10_compute_mqd, cp_hqd_pipe_priority) / 4
     pub const PIPE_PRIORITY: usize = 133;
+    // linux: offsetof(struct v10_compute_mqd, cp_hqd_queue_priority) / 4
     pub const QUEUE_PRIORITY: usize = 134;
+    // linux: offsetof(struct v10_compute_mqd, cp_hqd_pq_base_lo) / 4
     pub const PQ_BASE_LO: usize = 136;
+    // linux: offsetof(struct v10_compute_mqd, cp_hqd_pq_base_hi) / 4
     pub const PQ_BASE_HI: usize = 137;
-    pub const PQ_RPTR: usize = 138;
+    pub const PQ_RPTR: usize = 138; // linux: offsetof(struct v10_compute_mqd, cp_hqd_pq_rptr) / 4
+                                    // linux: offsetof(struct v10_compute_mqd, cp_hqd_pq_rptr_report_addr_lo) / 4
     pub const RPTR_REPORT_LO: usize = 139;
+    // linux: offsetof(struct v10_compute_mqd, cp_hqd_pq_rptr_report_addr_hi) / 4
     pub const RPTR_REPORT_HI: usize = 140;
+    // linux: offsetof(struct v10_compute_mqd, cp_hqd_pq_wptr_poll_addr_lo) / 4
     pub const WPTR_POLL_LO: usize = 141;
+    // linux: offsetof(struct v10_compute_mqd, cp_hqd_pq_wptr_poll_addr_hi) / 4
     pub const WPTR_POLL_HI: usize = 142;
+    // linux: offsetof(struct v10_compute_mqd, cp_hqd_pq_doorbell_control) / 4
     pub const PQ_DOORBELL_CONTROL: usize = 143;
+    // linux: offsetof(struct v10_compute_mqd, cp_hqd_pq_control) / 4
     pub const PQ_CONTROL: usize = 145;
+    // linux: offsetof(struct v10_compute_mqd, cp_hqd_ib_control) / 4
     pub const IB_CONTROL: usize = 149;
+    // linux: offsetof(struct v10_compute_mqd, cp_hqd_dequeue_request) / 4
     pub const DEQUEUE_REQUEST: usize = 152;
+    // linux: offsetof(struct v10_compute_mqd, cp_mqd_control) / 4
     pub const MQD_CONTROL: usize = 162;
+    // linux: offsetof(struct v10_compute_mqd, cp_hqd_eop_base_addr_lo) / 4
     pub const EOP_BASE_LO: usize = 165;
+    // linux: offsetof(struct v10_compute_mqd, cp_hqd_eop_base_addr_hi) / 4
     pub const EOP_BASE_HI: usize = 166;
+    // linux: offsetof(struct v10_compute_mqd, cp_hqd_eop_control) / 4
     pub const EOP_CONTROL: usize = 167;
+    // linux: offsetof(struct v10_compute_mqd, cp_hqd_pq_wptr_lo) / 4
     pub const PQ_WPTR_LO: usize = 182;
+    // linux: offsetof(struct v10_compute_mqd, cp_hqd_pq_wptr_hi) / 4
     pub const PQ_WPTR_HI: usize = 183;
-    pub const DWORDS: usize = 512;
+    pub const DWORDS: usize = 512; // linux: sizeof(struct v10_compute_mqd) / 4
 }
 
 /// `gfx_v10_0_compute_mqd_init` for a kernel queue at the selected HQD.
@@ -66,42 +92,55 @@ pub(crate) fn compute_mqd<I: Io>(
 ) -> Result<[u32; mqd::DWORDS], Error> {
     let mut m = [0u32; mqd::DWORDS];
     let read = |io: &mut I, r| checked(io.read(l.reg(r)));
-    m[mqd::HEADER] = 0xc031_0800;
+    m[mqd::HEADER] = 0xc031_0800; // linux: n/a (literal in gfx_v10_0.c:gfx_v10_0_compute_mqd_init)
+                                  // linux: n/a (literal in gfx_v10_0.c:gfx_v10_0_compute_mqd_init)
     m[mqd::PIPELINESTAT_ENABLE] = 1;
     for i in mqd::STATIC_THREAD_MGMT {
         m[i] = u32::MAX;
     }
-    m[mqd::MISC_RESERVED] = 3;
+    m[mqd::MISC_RESERVED] = 3; // linux: n/a (literal in gfx_v10_0.c:gfx_v10_0_compute_mqd_init)
     let eop = queue.address(EOP) >> 8;
     m[mqd::EOP_BASE_LO] = eop as u32;
     m[mqd::EOP_BASE_HI] = (eop >> 32) as u32;
     // EOP_SIZE = order_base_2(GFX10_MEC_HPD_SIZE / 4) - 1
+    // linux-lit: 0x3f=CP_HQD_EOP_CONTROL__EOP_SIZE_MASK
     m[mqd::EOP_CONTROL] = (read(io, CP_HQD_EOP_CONTROL)? & !0x3f) | 8;
     m[mqd::PQ_DOORBELL_CONTROL] =
+        // linux-lit: 2=CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_OFFSET__SHIFT; 30=CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_EN__SHIFT
+        // linux-lit: 0xdffffffc=CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_OFFSET_MASK | CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_EN_MASK | CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_SOURCE_MASK | CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_HIT_MASK
         (read(io, CP_HQD_PQ_DOORBELL_CONTROL)? & !0xdfff_fffc) | (queue.doorbell << 2) | (1 << 30);
     let address = queue.address(MQD);
+    // linux: n/a (literal 0xfffffffc in compute_mqd_init)
     m[mqd::MQD_BASE_ADDR_LO] = address as u32 & !3;
     m[mqd::MQD_BASE_ADDR_HI] = (address >> 32) as u32;
+    // linux-lit: 0xf=CP_MQD_CONTROL__VMID_MASK
     m[mqd::MQD_CONTROL] = read(io, CP_MQD_CONTROL)? & !0xf;
     let pq = queue.address(0) >> 8;
     m[mqd::PQ_BASE_LO] = pq as u32;
     m[mqd::PQ_BASE_HI] = (pq >> 32) as u32;
     // QUEUE_SIZE = order_base_2(8192 / 4) - 1, RPTR_BLOCK_SIZE = 9 (4 KiB),
     // UNORD_DISPATCH, PRIV_STATE, KMD_QUEUE; no tunneling (one compute ring).
+    // linux-lit: 0xf0003f3f=CP_HQD_PQ_CONTROL__QUEUE_SIZE_MASK | CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE_MASK | CP_HQD_PQ_CONTROL__UNORD_DISPATCH_MASK | CP_HQD_PQ_CONTROL__TUNNEL_DISPATCH_MASK | CP_HQD_PQ_CONTROL__PRIV_STATE_MASK | CP_HQD_PQ_CONTROL__KMD_QUEUE_MASK
     m[mqd::PQ_CONTROL] = (read(io, CP_HQD_PQ_CONTROL)? & !0xf000_3f3f)
-        | 10
-        | (9 << 8)
-        | (1 << 28)
-        | (1 << 30)
-        | (1 << 31);
+        | 10 // linux: n/a (order_base_2(NARF 8 KiB ring / 4) - 1)
+        | (9 << 8) // linux-lit: 8=CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE__SHIFT
+        | (1 << 28) // linux-lit: 28=CP_HQD_PQ_CONTROL__UNORD_DISPATCH__SHIFT
+        | (1 << 30) // linux-lit: 30=CP_HQD_PQ_CONTROL__PRIV_STATE__SHIFT
+        | (1 << 31); // linux-lit: 31=CP_HQD_PQ_CONTROL__KMD_QUEUE__SHIFT
     let rptr = queue.address(RPTR);
+    // linux: n/a (literal 0xfffffffc in compute_mqd_init)
     m[mqd::RPTR_REPORT_LO] = rptr as u32 & !3;
+    // linux-lit: 0xffff=CP_HQD_PQ_RPTR_REPORT_ADDR_HI__RPTR_REPORT_ADDR_HI_MASK
     m[mqd::RPTR_REPORT_HI] = (rptr >> 32) as u32 & 0xffff;
     let wptr = queue.address(WPTR);
-    m[mqd::WPTR_POLL_LO] = wptr as u32 & !3;
+    m[mqd::WPTR_POLL_LO] = wptr as u32 & !3; // linux: n/a (literal 0xfffffffc in compute_mqd_init)
+                                             // linux-lit: 0xffff=CP_HQD_PQ_WPTR_POLL_ADDR_HI__WPTR_ADDR_HI_MASK
     m[mqd::WPTR_POLL_HI] = (wptr >> 32) as u32 & 0xffff;
     m[mqd::PQ_RPTR] = read(io, CP_HQD_PQ_RPTR)?;
+    // linux-lit: 0x3ff00=CP_HQD_PERSISTENT_STATE__PRELOAD_SIZE_MASK; 8=CP_HQD_PERSISTENT_STATE__PRELOAD_SIZE__SHIFT
+    // 0x53: PRELOAD_SIZE literal in gfx_v10_0_compute_mqd_init
     m[mqd::PERSISTENT_STATE] = (read(io, CP_HQD_PERSISTENT_STATE)? & !0x3ff00) | (0x53 << 8);
+    // linux-lit: 0x300000=CP_HQD_IB_CONTROL__MIN_IB_AVAIL_SIZE_MASK; 20=CP_HQD_IB_CONTROL__MIN_IB_AVAIL_SIZE__SHIFT
     m[mqd::IB_CONTROL] = (read(io, CP_HQD_IB_CONTROL)? & !0x30_0000) | (3 << 20);
     // Static priority of a normal-priority kernel compute ring.
     m[mqd::PIPE_PRIORITY] = 0;
@@ -165,9 +204,12 @@ impl<I: Io> Engine<I> {
             compute.clear(io);
             flush(io, l);
             // gfx_v10_0_kiq_setting: tell the RLC which queue is the KIQ.
+            // linux: n/a (literal in gfx_v10_0_kiq_setting)
             let old = checked(io.read(l.reg(RLC_CP_SCHEDULERS)))? & 0xffff_ff00;
+            // linux: n/a (literal in gfx_v10_0_kiq_setting)
             let id = (me << 5) | (pipe << 3) | queue;
             io.write(l.reg(RLC_CP_SCHEDULERS), old | id);
+            // linux: n/a (literal in gfx_v10_0_kiq_setting)
             io.write(l.reg(RLC_CP_SCHEDULERS), old | id | 0x80);
             grbm_select(io, l, me, pipe, queue, 0);
             let m = compute_mqd(io, l, kiq, true)?;
@@ -176,9 +218,12 @@ impl<I: Io> Engine<I> {
             }
             flush(io, l);
             // gfx_v10_0_kiq_init_register
+            // linux-lit: 31=31 * (CP_PQ_WPTR_POLL_CNTL__EN_MASK >> 31)
             update(io, l.reg(CP_PQ_WPTR_POLL_CNTL), 1 << 31, 0)?;
+            // linux-lit: 1=CP_HQD_ACTIVE__ACTIVE_MASK
             let active = checked(io.read(l.reg(CP_HQD_ACTIVE)))? & 1 != 0;
             if active {
+                // linux: n/a (literal in gfx_v10_0_kiq_init_register)
                 io.write(l.reg(CP_HQD_DEQUEUE_REQUEST), 1);
             }
             Ok((m, active))
@@ -190,6 +235,7 @@ impl<I: Io> Engine<I> {
             let waited = self
                 .hw
                 .poll(fence::Engine::Kiq, REG_TIMEOUT_MS, |io, l| {
+                    // linux-lit: 1=CP_HQD_ACTIVE__ACTIVE_MASK
                     Ok((checked(io.read(l.reg(CP_HQD_ACTIVE)))? & 1 == 0).then_some(()))
                 })
                 .await;
@@ -226,10 +272,12 @@ impl<I: Io> Engine<I> {
             w(io, CP_HQD_PQ_RPTR_REPORT_ADDR_HI, m[mqd::RPTR_REPORT_HI]);
             w(io, CP_HQD_PQ_WPTR_POLL_ADDR, m[mqd::WPTR_POLL_LO]);
             w(io, CP_HQD_PQ_WPTR_POLL_ADDR_HI, m[mqd::WPTR_POLL_HI]);
+            // linux: n/a (literal in gfx_v10_0_kiq_init_register)
             w(io, CP_MEC_DOORBELL_RANGE_LOWER, (doorbell::KIQ * 2) << 2);
             w(
                 io,
                 CP_MEC_DOORBELL_RANGE_UPPER,
+                // linux: n/a (literal in gfx_v10_0_kiq_init_register)
                 (doorbell::USERQUEUE_END * 2) << 2,
             );
             w(io, CP_HQD_PQ_DOORBELL_CONTROL, m[mqd::PQ_DOORBELL_CONTROL]);
@@ -238,7 +286,8 @@ impl<I: Io> Engine<I> {
             w(io, CP_HQD_VMID, m[mqd::HQD_VMID]);
             w(io, CP_HQD_PERSISTENT_STATE, m[mqd::PERSISTENT_STATE]);
             w(io, CP_HQD_ACTIVE, m[mqd::HQD_ACTIVE]);
-            update(io, l.reg(CP_PQ_STATUS), 2, 2)?; // DOORBELL_ENABLE
+            // linux-lit: 2=CP_PQ_STATUS__DOORBELL_ENABLE_MASK
+            update(io, l.reg(CP_PQ_STATUS), 2, 2)?;
             grbm_select(io, l, 0, 0, 0, 0);
             Ok(())
         })
@@ -257,7 +306,7 @@ impl<I: Io> Engine<I> {
             io.write(l.reg(CP_MEC_CNTL), 0);
             Ok(())
         })?;
-        delay(50).await;
+        delay(50).await; // linux: n/a (udelay(50) in gfx_v10_0_cp_compute_enable)
         let kiq = &mut self.kiq;
         self.hw.access(|io, l| {
             grbm_select(io, l, me, pipe, queue, 0);
@@ -269,6 +318,7 @@ impl<I: Io> Engine<I> {
             }
             flush(io, l);
             // amdgpu_queue_mask_bit_to_set_resource_bit: mec*32 + pipe*8 + queue
+            // linux: n/a (literal in amdgpu_gfx.c)
             let mask = 1u64 << ((me - 1) * 32 + pipe * 8 + queue);
             kiq.emit(io, &pm4::set_resources(mask))?;
             kiq.emit(
@@ -320,7 +370,8 @@ impl Compute {
         pool: &Pool,
         doorbells: Doorbells,
     ) -> Result<Self, Error> {
-        const { assert!(RING_BYTES == 8192) };
+        const { assert!(RING_BYTES == 8192) }; // linux: n/a (NARF ring size)
+                                               // linux-ctx: reset
         Ok(Self {
             engine: Engine {
                 hw: Hw {

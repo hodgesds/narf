@@ -81,29 +81,32 @@ impl Profile {
             return Err(Error::Unsupported);
         }
         match (block.major, block.minor, block.revision) {
+            // linux: n/a (DCE_HWIP IP_VERSION(3, 0, 0) case in amdgpu_discovery.c, Navi22 1002:73df)
             (3, 0, 0) if gpu.chip.vid == amdgpu::AMD_VENDOR && gpu.chip.did == amdgpu::NAVI22 => {
                 Ok(Self::Navi22)
             }
-            (3, 1, 4) => Ok(Self::Dcn314),
+            (3, 1, 4) => Ok(Self::Dcn314), // linux: n/a (DCN 3.1.4 path)
             _ => Err(Error::Unsupported),
         }
     }
     pub fn pipes(self) -> u8 {
         match self {
+            // linux: n/a (literal in dcn30_resource.c: res_cap_dcn3.num_timing_generator)
             Self::Navi22 => 6,
-            Self::Dcn314 => 4,
+            Self::Dcn314 => 4, // linux: n/a (DCN 3.1.4 path)
         }
     }
     pub fn streams(self) -> u8 {
         match self {
+            // linux: n/a (literal in dcn30_resource.c: res_cap_dcn3.num_stream_encoder)
             Self::Navi22 => 6,
-            Self::Dcn314 => 5,
+            Self::Dcn314 => 5, // linux: n/a (DCN 3.1.4 path)
         }
     }
     pub fn bank(self, gpu: &amdgpu::AmdGpu, index: usize, last: u32) -> Result<u64, Error> {
         let versions: &[(u8, u8, u8)] = match self {
-            Self::Navi22 => &[(3, 0, 0)],
-            Self::Dcn314 => &[(3, 1, 4)],
+            Self::Navi22 => &[(3, 0, 0)], // linux: n/a (DCE_HWIP IP_VERSION(3, 0, 0))
+            Self::Dcn314 => &[(3, 1, 4)], // linux: n/a (DCN 3.1.4 path)
         };
         crate::amdgpu_psp_ring::bank(gpu, ip::HW_ID_DCN, versions, index, last)
             .map_err(|_| Error::Unsupported)

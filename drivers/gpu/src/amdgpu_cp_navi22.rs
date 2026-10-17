@@ -35,20 +35,21 @@ pub enum Error {
     DataMismatch,
 }
 
+// linux-ctx: hdr=gc101,pm4,sdma,amdgpu,nbio,hdp
 /// Linux AMDGPU_NAVI10_DOORBELL_* assignments as `ring->doorbell_index`
 /// (64-bit doorbell index << 1, i.e. a dword index into BAR2).
 pub mod doorbell {
-    pub const KIQ: u32 = 0x000 << 1;
-    pub const MEC_RING0: u32 = 0x003 << 1;
-    pub const USERQUEUE_END: u32 = 0x08a;
-    pub const GFX_RING0: u32 = 0x08b << 1;
-    pub const SDMA0: u32 = 0x100 << 1;
-    pub const SDMA1: u32 = 0x10a << 1;
+    pub const KIQ: u32 = 0x000 << 1; // linux: AMDGPU_NAVI10_DOORBELL_KIQ << 1
+    pub const MEC_RING0: u32 = 0x003 << 1; // linux: AMDGPU_NAVI10_DOORBELL_MEC_RING0 << 1
+    pub const USERQUEUE_END: u32 = 0x08a; // linux: AMDGPU_NAVI10_DOORBELL_USERQUEUE_END
+    pub const GFX_RING0: u32 = 0x08b << 1; // linux: AMDGPU_NAVI10_DOORBELL_GFX_RING0 << 1
+    pub const SDMA0: u32 = 0x100 << 1; // linux: AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 << 1
+    pub const SDMA1: u32 = 0x10a << 1; // linux: AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE1 << 1
     /// `adev->doorbell_index.sdma_doorbell_range` (nv.c).
-    pub const SDMA_RANGE: u32 = 20;
+    pub const SDMA_RANGE: u32 = 20; // linux: n/a (literal in nv.c:nv_init_doorbell_index)
 }
 /// First BAR2 page: every kernel doorbell above lies inside it.
-pub const DOORBELL_BYTES: u64 = 4096;
+pub const DOORBELL_BYTES: u64 = 4096; // linux: n/a (NARF mapping size, one page)
 
 /// UC mapping of the first BAR2 page plus its bus address for the NBIF
 /// self-ring aperture. The kernel doorbell block sits at BAR2 offset 0, as
@@ -118,6 +119,7 @@ impl Layout {
     pub(crate) fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
         if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
             || gpu.chip.did != crate::amdgpu::NAVI22
+            // linux: n/a (NARF bound: MMIO_REG_HOLE_OFFSET 0x7f000 + one dword)
             || gpu.regs.len < 0x7f004
         {
             return Err(Error::Unsupported);
@@ -150,14 +152,16 @@ impl Layout {
                 ip::HW_ID_HDP,
                 &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
                 0,
-                0xd1,
+                0xd1, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
             )?,
         };
         // SET_UCONFIG_REG and the CSB context index are encoded relative to
         // fixed apertures; reject bases that would alias other registers.
-        if layout.dword(SCRATCH_REG0) < 0xc000
+        if layout.dword(SCRATCH_REG0) < 0xc000 // linux-lit: 0xc000=PACKET3_SET_UCONFIG_REG_START
             || crate::amdgpu_clearstate_gfx10::csb(layout.segment(1), 0).is_none()
+            // linux-lit: 0xffff=GRBM_CAM_DATA__CAM_ADDR_MASK
             || layout.dword(CAM_REMAP[0].0) > 0xffff
+            // linux-lit: 0xffff=GRBM_CAM_DATA__CAM_ADDR_MASK
             || layout.dword(CAM_REMAP[6].1) > 0xffff
         {
             return Err(Error::Unsupported);
@@ -251,8 +255,9 @@ pub(crate) async fn delay(us: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
 }
 /// Ring test / register poll bound (`adev->usec_timeout`, 100 ms).
-pub(crate) const REG_TIMEOUT_MS: u64 = 100;
+pub(crate) const REG_TIMEOUT_MS: u64 = 100; // linux: AMDGPU_MAX_USEC_TIMEOUT / 1000
 /// IB test fence bound (`AMDGPU_IB_TEST_TIMEOUT`, 1 s).
+// linux: n/a (AMDGPU_IB_TEST_TIMEOUT msecs_to_jiffies(1000), amdgpu_ib.c)
 pub(crate) const FENCE_TIMEOUT_MS: u64 = 1000;
 
 /// Live PCI authority plus register access shared by every queue owner.
@@ -295,20 +300,23 @@ pub(crate) fn update<I: Io>(io: &mut I, address: u64, mask: u32, value: u32) -> 
 /// engine fetches them (`amdgpu_device_flush_hdp`).
 pub(crate) fn flush<I: Io>(io: &mut I, l: Layout) {
     barrier(Ordering::SeqCst);
+    // linux: n/a (nbio_v2_3.c MMIO_REG_HOLE_OFFSET 0x80000 - PAGE_SIZE + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL 0)
     io.write(0x7f000, 0);
-    io.read(l.nbio + 0xc3 * 4);
+    io.read(l.nbio + 0xc3 * 4); // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
     barrier(Ordering::SeqCst);
 }
 /// HDP read-cache invalidate before the CPU samples engine writes.
 pub(crate) fn invalidate<I: Io>(io: &mut I, l: Layout) {
-    io.write(l.hdp + 0xd1 * 4, 1);
-    io.read(l.hdp + 0xd1 * 4);
+    io.write(l.hdp + 0xd1 * 4, 1); // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+    io.read(l.hdp + 0xd1 * 4); // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
     barrier(Ordering::SeqCst);
 }
 /// `nv_grbm_select(me, pipe, queue, vmid)`.
 pub(crate) fn grbm_select<I: Io>(io: &mut I, l: Layout, me: u32, pipe: u32, queue: u32, vmid: u32) {
     io.write(
         l.reg(GRBM_GFX_CNTL),
+        // linux-lit: 3=GRBM_GFX_CNTL__PIPEID_MASK; 2=GRBM_GFX_CNTL__MEID__SHIFT; 4=GRBM_GFX_CNTL__VMID__SHIFT
+        // linux-lit: 0xf=GRBM_GFX_CNTL__VMID_MASK >> 4; 7=GRBM_GFX_CNTL__QUEUEID_MASK >> 8; 8=GRBM_GFX_CNTL__QUEUEID__SHIFT
         (pipe & 3) | ((me & 3) << 2) | ((vmid & 0xf) << 4) | ((queue & 7) << 8),
     );
 }
@@ -316,11 +324,13 @@ pub(crate) fn grbm_select<I: Io>(io: &mut I, l: Layout, me: u32, pipe: u32, queu
 /// PM4 / SDMA packet encoders shared by the owners and their models.
 pub(crate) mod pm4 {
     use super::*;
-    pub(crate) const UCONFIG_START: u32 = 0xc000;
+    pub(crate) const UCONFIG_START: u32 = 0xc000; // linux: PACKET3_SET_UCONFIG_REG_START
     /// `PACKET3(PACKET3_NOP, 0x3FFF)`: the CP's one-dword NOP.
+    // linux-lit: 0xc0000000=PACKET3(0, 0)
     pub(crate) const NOP: u32 = 0xc000_0000 | (0x3fff << 16) | (PACKET3_NOP << 8);
     pub(crate) fn set_uconfig(dword: u32, value: u32) -> [u32; 3] {
         [
+            // linux: n/a (count literal in gfx_v10_0.c:gfx_v10_0_ring_test_ring)
             packet3(PACKET3_SET_UCONFIG_REG, 1),
             dword - UCONFIG_START,
             value,
@@ -329,8 +339,9 @@ pub(crate) mod pm4 {
     /// WRITE_DATA, DST_SEL(5) memory, WR_CONFIRM, ENGINE_SEL(0).
     pub(crate) fn write_data(address: u64, value: u32) -> [u32; 5] {
         [
+            // linux: n/a (count literal in gfx_v10_0.c:gfx_v10_0_ring_test_ib)
             packet3(PACKET3_WRITE_DATA, 3),
-            (5 << 8) | (1 << 20),
+            (5 << 8) | (1 << 20), // linux: WRITE_DATA_DST_SEL(5) | WR_CONFIRM
             address as u32,
             (address >> 32) as u32,
             value,
@@ -340,9 +351,11 @@ pub(crate) mod pm4 {
     /// `_compute` (adds INDIRECT_BUFFER_VALID).
     pub(crate) fn indirect_buffer(address: u64, dwords: u32, compute: bool) -> [u32; 4] {
         [
+            // linux: n/a (count literal in gfx_v10_0.c:gfx_v10_0_ring_emit_ib_*)
             packet3(PACKET3_INDIRECT_BUFFER, 2),
-            address as u32 & !3,
+            address as u32 & !3, // linux: n/a (dword alignment, BUG_ON in gfx_v10_0_ring_emit_ib_*)
             (address >> 32) as u32,
+            // linux-lit: 23=23 * (INDIRECT_BUFFER_VALID >> 23)
             dwords | if compute { 1 << 23 } else { 0 },
         ]
     }
@@ -350,8 +363,12 @@ pub(crate) mod pm4 {
     /// (delivered only once IH enables the CP timestamp interrupt).
     pub(crate) fn release_mem(address: u64, seq: u32) -> [u32; 8] {
         [
+            // linux: n/a (count literal in gfx_v10_0.c:gfx_v10_0_ring_emit_fence)
             packet3(PACKET3_RELEASE_MEM, 6),
+            // 0x14 = CACHE_FLUSH_AND_INV_TS_EVENT (navi10_enum.h, not a checker header set)
+            // linux: PACKET3_RELEASE_MEM_GCR_SEQ | PACKET3_RELEASE_MEM_GCR_GL2_WB | PACKET3_RELEASE_MEM_GCR_GLM_INV | PACKET3_RELEASE_MEM_GCR_GLM_WB | PACKET3_RELEASE_MEM_CACHE_POLICY(3) | PACKET3_RELEASE_MEM_EVENT_TYPE(0x14) | PACKET3_RELEASE_MEM_EVENT_INDEX(5)
             (1 << 22) | (1 << 21) | (1 << 13) | (1 << 12) | (3 << 25) | 0x14 | (5 << 8),
+            // linux: PACKET3_RELEASE_MEM_DATA_SEL(1) | PACKET3_RELEASE_MEM_INT_SEL(2)
             (1 << 29) | (2 << 24),
             address as u32,
             (address >> 32) as u32,
@@ -362,19 +379,22 @@ pub(crate) mod pm4 {
     }
     /// `PACKET3(SET_BASE, 2)` CE partition base from `gfx_v10_0_cp_gfx_start`.
     pub(crate) fn ce_partition_base() -> [u32; 4] {
+        // linux-lit: 3=PACKET3_BASE_INDEX(CE_PARTITION_BASE)
+        // linux: n/a (count 2 and 0x8000 literals in gfx_v10_0_cp_gfx_start)
         [packet3(PACKET3_SET_BASE, 2), 3, 0x8000, 0x8000]
     }
     /// `gfx10_kiq_set_resources`; no cleaner shader is installed (address 0).
     pub(crate) fn set_resources(queue_mask: u64) -> [u32; 8] {
         [
+            // linux: n/a (count literal in gfx_v10_0.c:gfx10_kiq_set_resources)
             packet3(PACKET3_SET_RESOURCES, 6),
-            0,
+            0, // linux: PACKET3_SET_RESOURCES_VMID_MASK(0) | PACKET3_SET_RESOURCES_QUEUE_TYPE(0)
             queue_mask as u32,
             (queue_mask >> 32) as u32,
-            0,
-            0,
-            0,
-            0,
+            0, // linux: n/a (cleaner shader address lo; none installed)
+            0, // linux: n/a (cleaner shader address hi; none installed)
+            0, // linux: n/a (oac mask literal 0 in gfx10_kiq_set_resources)
+            0, // linux: n/a (gds heap literal 0 in gfx10_kiq_set_resources)
         ]
     }
     /// `gfx10_kiq_map_queues` for a compute queue (ENGINE_SEL 0).
@@ -387,56 +407,62 @@ pub(crate) mod pm4 {
         wptr: u64,
     ) -> [u32; 7] {
         [
+            // linux: n/a (count literal in gfx_v10_0.c:gfx10_kiq_map_queues)
             packet3(PACKET3_MAP_QUEUES, 5),
+            // linux-lit: 13=13 * (PACKET3_MAP_QUEUES_QUEUE(1) >> 13); 16=16 * (PACKET3_MAP_QUEUES_PIPE(1) >> 16)
+            // linux-lit: 18=18 * (PACKET3_MAP_QUEUES_ME(1) >> 18); 29=29 * (PACKET3_MAP_QUEUES_NUM_QUEUES(1) >> 29)
             (queue << 13) | (pipe << 16) | (u32::from(me != 1) << 18) | (1 << 29),
-            doorbell << 2,
+            doorbell << 2, // linux-lit: 2=2 * (PACKET3_MAP_QUEUES_DOORBELL_OFFSET(1) >> 2)
             mqd as u32,
             (mqd >> 32) as u32,
             wptr as u32,
             (wptr >> 32) as u32,
         ]
     }
-    pub(crate) const SDMA_NOP: u32 = 0;
+    pub(crate) const SDMA_NOP: u32 = 0; // linux: SDMA_PKT_NOP_HEADER_OP(SDMA_OP_NOP)
     /// SDMA_OP_WRITE / SUBOP_WRITE_LINEAR of one dword.
     pub(crate) fn sdma_write(address: u64, value: u32) -> [u32; 5] {
+        // linux-lit: 2=SDMA_PKT_HEADER_OP(SDMA_OP_WRITE) | SDMA_PKT_HEADER_SUB_OP(SDMA_SUBOP_WRITE_LINEAR)
+        // linux-lit: 0=SDMA_PKT_WRITE_UNTILED_DW_3_COUNT(0)
         [2, address as u32, (address >> 32) as u32, 0, value]
     }
     /// SDMA_OP_FENCE, MTYPE UC, then SDMA_OP_TRAP (`sdma_v5_2_ring_emit_fence`).
     pub(crate) fn sdma_fence(address: u64, seq: u32) -> [u32; 6] {
         [
+            // linux: SDMA_PKT_HEADER_OP(SDMA_OP_FENCE) | SDMA_PKT_FENCE_HEADER_MTYPE(0x3)
             5 | (3 << 16),
             address as u32,
             (address >> 32) as u32,
             seq,
-            6,
-            0,
+            6, // linux: SDMA_PKT_HEADER_OP(SDMA_OP_TRAP)
+            0, // linux: SDMA_PKT_TRAP_INT_CONTEXT_INT_CONTEXT(0)
         ]
     }
     /// SDMA_OP_INDIRECT, VMID0, no CSA (`sdma_v5_2_ring_emit_ib`).
     pub(crate) fn sdma_indirect(address: u64, dwords: u32) -> [u32; 6] {
         [
-            4,
-            address as u32 & !0x1f,
+            4, // linux: SDMA_PKT_HEADER_OP(SDMA_OP_INDIRECT) | SDMA_PKT_INDIRECT_HEADER_VMID(0)
+            address as u32 & !0x1f, // linux: n/a (literal 0xffffffe0 in sdma_v5_2_ring_emit_ib)
             (address >> 32) as u32,
             dwords,
-            0,
-            0,
+            0, // linux: n/a (CSA address lo; no CSA, VMID0)
+            0, // linux: n/a (CSA address hi; no CSA, VMID0)
         ]
     }
 }
 
 /// One kernel queue's VRAM: ring, writeback, IB, MQD/CSB and EOP pages.
-pub(crate) const RING_BYTES: u64 = 8192;
+pub(crate) const RING_BYTES: u64 = 8192; // linux: n/a (NARF queue layout)
 pub(crate) const RING_DW: u64 = RING_BYTES / 4;
-pub(crate) const WB: u64 = 8192;
+pub(crate) const WB: u64 = 8192; // linux: n/a (NARF queue layout)
 pub(crate) const RPTR: u64 = WB;
 pub(crate) const WPTR: u64 = WB + 8;
 pub(crate) const FENCE: u64 = WB + 16;
 pub(crate) const SCRATCH: u64 = WB + 24;
-pub(crate) const IB: u64 = 12288;
-pub(crate) const MQD: u64 = 16384;
-pub(crate) const EOP: u64 = 20480;
-pub(crate) const QUEUE_BYTES: u64 = 24576;
+pub(crate) const IB: u64 = 12288; // linux: n/a (NARF queue layout)
+pub(crate) const MQD: u64 = 16384; // linux: n/a (NARF queue layout)
+pub(crate) const EOP: u64 = 20480; // linux: n/a (NARF queue layout)
+pub(crate) const QUEUE_BYTES: u64 = 24576; // linux: n/a (NARF queue layout)
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -483,6 +509,7 @@ impl Queue {
         for offset in (0..QUEUE_BYTES).step_by(4) {
             io.write_memory(map, offset, 0);
         }
+        // linux: n/a (literal in gfx_v10_0.c:gfx_v10_0_ring_test_ib)
         io.write_memory(map, SCRATCH, 0xcafe_dead);
         self.wptr = 0;
     }
@@ -494,8 +521,8 @@ impl Queue {
     }
     fn align(&self) -> u64 {
         match self.kind {
-            Kind::Cp => 256,
-            Kind::Sdma => 16,
+            Kind::Cp => 256,  // linux: n/a (.align_mask 0xff in gfx_v10_0.c ring funcs)
+            Kind::Sdma => 16, // linux: n/a (.align_mask 0xf in sdma_v5_2.c ring funcs)
         }
     }
     /// Append dwords. Callers submit only to an idle ring, so one submission
@@ -524,6 +551,7 @@ impl Queue {
             (_, 0) => {}
             (Kind::Cp, 1) => put(self, pm4::NOP),
             (Kind::Cp, n) => {
+                // linux: n/a (literal in gfx_v10_0.c:gfx_v10_ring_insert_nop)
                 put(self, packet3(PACKET3_NOP, (n as u32 - 2).min(0x3ffe)));
                 for _ in 1..n {
                     put(self, pm4::NOP);
@@ -540,6 +568,7 @@ impl Queue {
     pub(crate) fn hw_wptr(&self) -> u64 {
         match self.kind {
             Kind::Cp => self.wptr,
+            // linux: n/a (literal in sdma_v5_2.c:sdma_v5_2_ring_set_wptr)
             Kind::Sdma => self.wptr << 2,
         }
     }
@@ -571,7 +600,7 @@ pub(crate) fn progress<I: Io>(
 ) -> Result<crate::amdgpu_navi22_tdr::Progress, Error> {
     hw.access(|io, l| {
         let signaled = queue.read(io, l, FENCE);
-        checked(io.read(l.hdp + 0xd1 * 4))?;
+        checked(io.read(l.hdp + 0xd1 * 4))?; // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
         Ok(crate::amdgpu_navi22_tdr::Progress {
             engine: queue.engine,
             emitted: queue.seq,
@@ -595,12 +624,15 @@ pub(crate) async fn wait_fence<I: Io>(
 /// 0xDEADBEEF, polled through MMIO for at most `adev->usec_timeout`.
 pub(crate) async fn ring_test<I: Io>(hw: &mut Hw<I>, queue: &mut Queue) -> Result<(), Error> {
     hw.access(|io, l| {
+        // linux: n/a (literal in gfx_v10_0.c:gfx_v10_0_ring_test_ring)
         io.write(l.reg(SCRATCH_REG0), 0xcafe_dead);
+        // linux: n/a (literal in gfx_v10_0.c:gfx_v10_0_ring_test_ring)
         queue.emit(io, &pm4::set_uconfig(l.dword(SCRATCH_REG0), 0xdead_beef))?;
         queue.commit(io, l);
         Ok(())
     })?;
     hw.poll(queue.engine, REG_TIMEOUT_MS, |io, l| {
+        // linux: n/a (literal in gfx_v10_0_ring_test_ring)
         Ok((checked(io.read(l.reg(SCRATCH_REG0)))? == 0xdead_beef).then_some(()))
     })
     .await
@@ -611,12 +643,15 @@ pub(crate) async fn ib_test<I: Io>(hw: &mut Hw<I>, queue: &mut Queue) -> Result<
     let compute = queue.engine != fence::Engine::Gfx;
     let seq = queue.next_seq();
     hw.access(|io, l| {
+        // linux: n/a (literal in gfx_v10_0.c:gfx_v10_0_ring_test_ib)
         queue.write(io, SCRATCH, &[0xcafe_dead]);
         queue.write(
             io,
             IB,
+            // linux: n/a (literal in gfx_v10_0.c:gfx_v10_0_ring_test_ib)
             &pm4::write_data(queue.address(SCRATCH), 0xdead_beef),
         );
+        // linux: n/a (ib.length_dw literal in gfx_v10_0_ring_test_ib)
         queue.emit(io, &pm4::indirect_buffer(queue.address(IB), 5, compute))?;
         queue.emit(io, &pm4::release_mem(queue.address(FENCE), seq))?;
         queue.commit(io, l);
@@ -624,7 +659,7 @@ pub(crate) async fn ib_test<I: Io>(hw: &mut Hw<I>, queue: &mut Queue) -> Result<
     })?;
     wait_fence(hw, queue, seq).await?;
     hw.access(|io, l| match queue.read(io, l, SCRATCH) {
-        0xdead_beef => Ok(seq),
+        0xdead_beef => Ok(seq), // linux: n/a (literal in gfx_v10_0.c:gfx_v10_0_ring_test_ib)
         _ => Err(Error::DataMismatch),
     })
 }
@@ -686,10 +721,12 @@ pub struct QueueProof {
 /// NBIF doorbell aperture (`nv_common_hw_init`) and self-ring aperture
 /// (`nv_common_late_init`), nbio_v2_3.c. Idempotent.
 pub(crate) fn enable_doorbells<I: Io>(io: &mut I, l: Layout, bus: u64) -> Result<(), Error> {
+    // linux-lit: 1=RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN__BIF_DOORBELL_APER_EN_MASK
     update(io, l.nbio(NBIO_DOORBELL_APER_EN), 1, 1)?;
     io.write(l.nbio(NBIO_SELFRING_BASE_LOW), bus as u32);
     io.write(l.nbio(NBIO_SELFRING_BASE_HIGH), (bus >> 32) as u32);
-    io.write(l.nbio(NBIO_SELFRING_CNTL), 0b11); // EN | MODE, SIZE 0
+    // linux-lit: 0b11=BIF_BX_PF_DOORBELL_SELFRING_GPA_APER_CNTL__DOORBELL_SELFRING_GPA_APER_EN_MASK | BIF_BX_PF_DOORBELL_SELFRING_GPA_APER_CNTL__DOORBELL_SELFRING_GPA_APER_MODE_MASK
+    io.write(l.nbio(NBIO_SELFRING_CNTL), 0b11);
     Ok(())
 }
 
@@ -717,9 +754,10 @@ pub struct GfxProof {
     pub ib_fence: u32,
 }
 /// gfx ring 0 (ME0 pipe 0), 8 KiB: RB_BUFSZ = order_base_2(8192 / 8).
-const RB_BUFSZ: u32 = 10;
+const RB_BUFSZ: u32 = 10; // linux: n/a (order_base_2(NARF 8 KiB ring / 8))
+                          // linux: (0 << SH_MEM_CONFIG__ADDRESS_MODE__SHIFT) | (3 << SH_MEM_CONFIG__ALIGNMENT_MODE__SHIFT) | (0 << SH_MEM_CONFIG__RETRY_MODE__SHIFT) | (3 << SH_MEM_CONFIG__INITIAL_INST_PREFETCH__SHIFT)
 const SH_MEM_CONFIG_DEFAULT: u32 = (3 << 2) | (3 << 14); // 64-bit, unaligned, retry all
-const FIRST_KFD_VMID: u32 = 8;
+const FIRST_KFD_VMID: u32 = 8; // linux: n/a (literal in gmc_v10_0.c:gmc_v10_0_sw_init)
 
 #[derive(Debug)]
 pub(crate) struct GfxEngine<I: Io> {
@@ -735,6 +773,7 @@ fn program_golden<I: Io>(io: &mut I, l: Layout) -> Result<(), Error> {
     for (reg, and, or) in GOLDEN {
         // soc15_program_register_sequence
         if and == u32::MAX {
+            // linux: n/a (soc15_program_register_sequence full-mask test)
             io.write(l.reg(reg), or);
         } else {
             update(io, l.reg(reg), and, or)?;
@@ -807,7 +846,9 @@ impl<I: Io> GfxEngine<I> {
             // gfx_v10_0_check_grbm_cam_remapping
             let data = checked(io.read(l.reg(VGT_ESGS_RING_SIZE)))?;
             io.write(l.reg(VGT_ESGS_RING_SIZE), 0);
+            // linux: n/a (pattern literal in gfx_v10_0_check_grbm_cam_remapping)
             io.write(l.reg(VGT_ESGS_RING_SIZE_UMD), 0xdead_beef);
+            // linux: n/a (pattern literal in gfx_v10_0_check_grbm_cam_remapping)
             let remapped = io.read(l.reg(VGT_ESGS_RING_SIZE)) == 0xdead_beef;
             if remapped {
                 io.write(l.reg(VGT_ESGS_RING_SIZE_UMD), data);
@@ -817,18 +858,23 @@ impl<I: Io> GfxEngine<I> {
                 io.write(l.reg(GRBM_CAM_INDEX), 0);
                 for (umd, target) in CAM_REMAP {
                     io.write(l.reg(GRBM_CAM_DATA_UPPER), 0);
+                    // linux-lit: 16=GRBM_CAM_DATA__CAM_REMAPADDR__SHIFT
                     io.write(l.reg(GRBM_CAM_DATA), l.dword(umd) | (l.dword(target) << 16));
                 }
             }
             // gfx_v10_0_constants_init. setup_rb/get_cu_info only read and
             // end in SE/SA/instance broadcast; tile steering is 0 on GC 10.3.
+            // linux-lit: 0xff=GRBM_CNTL__READ_TIMEOUT_MASK
             update(io, l.reg(GRBM_CNTL), 0xff, 0xff)?;
+            // linux-lit: 0xe0000000=GRBM_GFX_INDEX__SA_BROADCAST_WRITES_MASK | GRBM_GFX_INDEX__INSTANCE_BROADCAST_WRITES_MASK | GRBM_GFX_INDEX__SE_BROADCAST_WRITES_MASK
             io.write(l.reg(GRBM_GFX_INDEX), 0xe000_0000);
             for vmid in 0..16 {
+                // linux: n/a (AMDGPU_NUM_VMID 16, amdgpu_ids.h not in checker sets)
                 grbm_select(io, l, 0, 0, 0, vmid);
                 io.write(l.reg(SH_MEM_CONFIG), SH_MEM_CONFIG_DEFAULT);
                 if vmid != 0 {
                     // private 0x1000.., shared 0x2000.. (gmc_v10_0 apertures)
+                    // linux-lit: 0x20001000=(0x2000000000000000 >> 48 << SH_MEM_BASES__SHARED_BASE__SHIFT) | (0x1000000000000000 >> 48 << SH_MEM_BASES__PRIVATE_BASE__SHIFT)
                     io.write(l.reg(SH_MEM_BASES), 0x2000_1000);
                 }
             }
@@ -837,11 +883,14 @@ impl<I: Io> GfxEngine<I> {
             for vmid in FIRST_KFD_VMID..16 {
                 grbm_select(io, l, 0, 0, 0, vmid);
                 io.write(l.reg(SH_MEM_CONFIG), SH_MEM_CONFIG_DEFAULT);
+                // linux-lit: 0x60006000=DEFAULT_SH_MEM_BASES | (DEFAULT_SH_MEM_BASES << 16)
                 io.write(l.reg(SH_MEM_BASES), 0x6000_6000);
             }
             grbm_select(io, l, 0, 0, 0, 0);
             let gds = |io: &mut I, vmid: u32| {
+                // linux-lit: 2=mmGDS_VMID1_BASE - mmGDS_VMID0_BASE
                 io.write(l.reg(GDS_VMID0_BASE) + u64::from(2 * vmid) * 4, 0);
+                // linux-lit: 2=mmGDS_VMID1_SIZE - mmGDS_VMID0_SIZE
                 io.write(l.reg(GDS_VMID0_SIZE) + u64::from(2 * vmid) * 4, 0);
                 io.write(l.reg(GDS_GWS_VMID0) + u64::from(vmid) * 4, 0);
                 io.write(l.reg(GDS_OA_VMID0) + u64::from(vmid) * 4, 0);
@@ -850,12 +899,14 @@ impl<I: Io> GfxEngine<I> {
                 gds(io, vmid);
             }
             // gfx_v10_0_debug_trap_config_init(8, 16)
+            // linux-lit: 16=SPI_GDBG_TRAP_CONFIG__VMID_SEL__SHIFT; 15=15 * (SPI_GDBG_TRAP_CONFIG__TRAP_EN_MASK >> 15)
             io.write(l.reg(SPI_GDBG_TRAP_CONFIG), (0xff00 << 16) | (1 << 15));
             for reg in [SPI_GDBG_TRAP_MASK, SPI_GDBG_TRAP_DATA0, SPI_GDBG_TRAP_DATA1] {
                 io.write(l.reg(reg), 0);
             }
             // gfx_v10_0_init_gds_vmid
             for vmid in 1..16 {
+                // linux: n/a (AMDGPU_NUM_VMID 16, amdgpu_ids.h not in checker sets)
                 gds(io, vmid);
             }
             Ok(remapped)
@@ -866,6 +917,7 @@ impl<I: Io> GfxEngine<I> {
             .poll(fence::Engine::Gfx, REG_TIMEOUT_MS, |io, l| {
                 let cp = checked(io.read(l.reg(CP_STAT)))?;
                 let boot = checked(io.read(l.reg(RLC_RLCS_BOOTLOAD_STATUS)))?;
+                // linux-lit: 31=31 * (RLC_RLCS_BOOTLOAD_STATUS__BOOTLOAD_COMPLETE_MASK >> 31)
                 Ok((cp == 0 && boot & (1 << 31) != 0).then_some(()))
             })
             .await?;
@@ -873,17 +925,21 @@ impl<I: Io> GfxEngine<I> {
         self.hw.access(|io, l| {
             // gfx_v10_0_init_csb
             io.write(l.reg(RLC_CSIB_ADDR_HI), (csib >> 32) as u32);
+            // linux: n/a (literal 0xfffffffc in gfx_v10_0_init_csb)
             io.write(l.reg(RLC_CSIB_ADDR_LO), csib as u32 & !3);
             io.write(l.reg(RLC_CSIB_LENGTH), csb.len() as u32);
             // gfx_v10_0_update_spm_vmid_internal(0xf): write only on change
             let spm = checked(io.read(l.reg(RLC_SPM_MC_CNTL)))?;
             if spm & 0xf != 0xf {
+                // linux-lit: 0xf=RLC_SPM_MC_CNTL__RLC_SPM_VMID_MASK
                 io.write(l.reg(RLC_SPM_MC_CNTL), spm | 0xf);
             }
             // gfx_v10_0_rlc_enable_srm
+            // linux-lit: 3=RLC_SRM_CNTL__AUTO_INCR_ADDR_MASK | RLC_SRM_CNTL__SRM_ENABLE_MASK
             update(io, l.reg(RLC_SRM_CNTL), 3, 3)?;
             // gfx_v10_0_enable_gui_idle_interrupt(false), ME0 pipes 0 and 1
             for reg in [CP_INT_CNTL_RING0, CP_INT_CNTL_RING1] {
+                // linux-lit: 0x3c0000=CP_INT_CNTL_RING0__CNTX_BUSY_INT_ENABLE_MASK | CP_INT_CNTL_RING0__CNTX_EMPTY_INT_ENABLE_MASK | CP_INT_CNTL_RING0__CMP_BUSY_INT_ENABLE_MASK | CP_INT_CNTL_RING0__GFX_IDLE_INT_ENABLE_MASK
                 update(io, l.reg(reg), 0x003c_0000, 0)?;
             }
             Ok(())
@@ -903,40 +959,49 @@ impl<I: Io> GfxEngine<I> {
         let q = &self.queue;
         let (base, rptr, wptr, index) =
             (q.address(0), q.address(RPTR), q.address(WPTR), q.doorbell);
-        let cntl = RB_BUFSZ | ((RB_BUFSZ - 2) << 8);
+        let cntl = RB_BUFSZ | ((RB_BUFSZ - 2) << 8); // linux-lit: 8=CP_RB0_CNTL__RB_BLKSZ__SHIFT
         self.hw.access(|io, l| {
             io.write(l.reg(CP_RB_WPTR_DELAY), 0);
             io.write(l.reg(CP_RB_VMID), 0);
-            update(io, l.reg(GRBM_GFX_CNTL), 3, 0)?; // PIPE_ID0
+            update(io, l.reg(GRBM_GFX_CNTL), 3, 0)?; // linux-lit: 3=GRBM_GFX_CNTL__PIPEID_MASK
             io.write(l.reg(CP_RB0_CNTL), cntl);
             io.write(l.reg(CP_RB0_WPTR), 0);
             io.write(l.reg(CP_RB0_WPTR_HI), 0);
             io.write(l.reg(CP_RB0_RPTR_ADDR), rptr as u32);
+            // linux-lit: 0xffff=CP_RB_RPTR_ADDR_HI__RB_RPTR_ADDR_HI_MASK
             io.write(l.reg(CP_RB0_RPTR_ADDR_HI), (rptr >> 32) as u32 & 0xffff);
             io.write(l.reg(CP_RB_WPTR_POLL_ADDR_LO), wptr as u32);
             io.write(l.reg(CP_RB_WPTR_POLL_ADDR_HI), (wptr >> 32) as u32);
             Ok(())
         })?;
-        delay(1000).await; // mdelay(1)
+        delay(1000).await; // linux: n/a (mdelay(1) in gfx_v10_0_cp_gfx_resume)
         self.hw.access(|io, l| {
             io.write(l.reg(CP_RB0_CNTL), cntl);
+            // linux: n/a (literal in gfx_v10_0_cp_gfx_resume)
             io.write(l.reg(CP_RB0_BASE), (base >> 8) as u32);
+            // linux: n/a (literal in gfx_v10_0_cp_gfx_resume)
             io.write(l.reg(CP_RB0_BASE_HI), (base >> 40) as u32);
             io.write(l.reg(CP_RB_ACTIVE), 1);
             // gfx_v10_0_cp_gfx_set_doorbell, Sienna Cichlid range fields
             update(
                 io,
                 l.reg(CP_RB_DOORBELL_CONTROL),
+                // linux: CP_RB_DOORBELL_CONTROL__DOORBELL_OFFSET_MASK | CP_RB_DOORBELL_CONTROL__DOORBELL_EN_MASK
                 0x4fff_fffc,
+                // linux-lit: 30=CP_RB_DOORBELL_CONTROL__DOORBELL_EN__SHIFT; 2=CP_RB_DOORBELL_CONTROL__DOORBELL_OFFSET__SHIFT
                 (1 << 30) | (index << 2),
             )?;
+            // linux-lit: 2=CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER_Sienna_Cichlid__SHIFT; 0xffc=CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER_Sienna_Cichlid_MASK
             io.write(l.reg(CP_RB_DOORBELL_RANGE_LOWER), (index << 2) & 0xffc);
+            // linux-lit: 0xffc=CP_RB_DOORBELL_RANGE_UPPER__DOORBELL_RANGE_UPPER_Sienna_Cichlid_MASK
             io.write(l.reg(CP_RB_DOORBELL_RANGE_UPPER), 0xffc);
-            update(io, l.reg(GRBM_GFX_CNTL), 3, 0)?;
-            // gfx_v10_0_cp_gfx_start
+            update(io, l.reg(GRBM_GFX_CNTL), 3, 0)?; // linux-lit: 3=GRBM_GFX_CNTL__PIPEID_MASK
+                                                     // gfx_v10_0_cp_gfx_start
+                                                     // linux: n/a (max_hw_contexts literal 8 in gfx_v10_0_gpu_early_init)
             io.write(l.reg(CP_MAX_CONTEXT), 8 - 1);
             io.write(l.reg(CP_DEVICE_ID), 1);
-            update(io, l.reg(CP_ME_CNTL), 0x1500_0000, 0)?; // unhalt ME/PFP/CE
+            // linux-lit: 0x15000000=CP_ME_CNTL__ME_HALT_MASK | CP_ME_CNTL__PFP_HALT_MASK | CP_ME_CNTL__CE_HALT_MASK
+            update(io, l.reg(CP_ME_CNTL), 0x1500_0000, 0)?;
             Ok(())
         })?;
         // cp_gfx_enable waits for CP_STAT idle but only logs a timeout; the
@@ -961,6 +1026,7 @@ impl<I: Io> GfxEngine<I> {
         // gfx_v10_0_hw_init ends with gfx_v10_3_set_power_brake_sequence for
         // GC >= 10.3 after cp_resume; the KIQ/KCQ halves ran before this ring.
         self.hw.access(|io, l| {
+            // linux-lit: 0xe0000000=GRBM_GFX_INDEX__SA_BROADCAST_WRITES_MASK | GRBM_GFX_INDEX__INSTANCE_BROADCAST_WRITES_MASK | GRBM_GFX_INDEX__SE_BROADCAST_WRITES_MASK
             io.write(l.reg(GRBM_GFX_INDEX), 0xe000_0000);
             io.write(l.reg(GC_CAC_IND_INDEX), IX_PWRBRK_STALL_PATTERN_CTRL);
             io.write(l.reg(GC_CAC_IND_DATA), PWRBRK_STALL_PATTERN);
@@ -1105,9 +1171,10 @@ pub unsafe fn enable_doorbell_apertures(
 }
 
 /// `TIME_STAMP_INT_ENABLE` in CP_INT_CNTL_RING0 / CP_ME1_PIPE0_INT_CNTL.
-const TIME_STAMP_INT_ENABLE: u32 = 1 << 26;
+const TIME_STAMP_INT_ENABLE: u32 = 1 << 26; // linux: CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK
 /// `SDMA0_CNTL.TRAP_ENABLE`.
-const SDMA_TRAP_ENABLE: u32 = 1;
+const SDMA_TRAP_ENABLE: u32 = 1; // linux: SDMA0_CNTL__TRAP_ENABLE_MASK@gc
+                                 // linux-ctx: reset
 /// The interrupt sources `amdgpu_fence_driver_hw_init` arms through
 /// `amdgpu_irq_get` for the kernel rings created here:
 /// `gfx_v10_0_set_gfx_eop_interrupt_state` (ME0 pipe 0),

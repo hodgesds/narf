@@ -17,38 +17,38 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 /// amd_shared.h `AMD_CG_SUPPORT_*`.
 pub mod cg {
-    pub const GFX_MGCG: u64 = 1 << 0;
-    pub const GFX_MGLS: u64 = 1 << 1;
-    pub const GFX_CGCG: u64 = 1 << 2;
-    pub const GFX_CGLS: u64 = 1 << 3;
-    pub const GFX_CP_LS: u64 = 1 << 6;
-    pub const GFX_RLC_LS: u64 = 1 << 7;
-    pub const MC_LS: u64 = 1 << 8;
-    pub const MC_MGCG: u64 = 1 << 9;
-    pub const SDMA_LS: u64 = 1 << 10;
-    pub const SDMA_MGCG: u64 = 1 << 11;
-    pub const BIF_LS: u64 = 1 << 12;
-    pub const HDP_LS: u64 = 1 << 15;
-    pub const HDP_MGCG: u64 = 1 << 16;
-    pub const ROM_MGCG: u64 = 1 << 17;
-    pub const BIF_MGCG: u64 = 1 << 19;
-    pub const GFX_3D_CGCG: u64 = 1 << 20;
-    pub const GFX_3D_CGLS: u64 = 1 << 21;
-    pub const VCN_MGCG: u64 = 1 << 24;
-    pub const HDP_DS: u64 = 1 << 25;
-    pub const HDP_SD: u64 = 1 << 26;
-    pub const IH_CG: u64 = 1 << 27;
-    pub const JPEG_MGCG: u64 = 1 << 30;
-    pub const GFX_FGCG: u64 = 1 << 31;
+    pub const GFX_MGCG: u64 = 1 << 0; // linux: AMD_CG_SUPPORT_GFX_MGCG
+    pub const GFX_MGLS: u64 = 1 << 1; // linux: AMD_CG_SUPPORT_GFX_MGLS
+    pub const GFX_CGCG: u64 = 1 << 2; // linux: AMD_CG_SUPPORT_GFX_CGCG
+    pub const GFX_CGLS: u64 = 1 << 3; // linux: AMD_CG_SUPPORT_GFX_CGLS
+    pub const GFX_CP_LS: u64 = 1 << 6; // linux: AMD_CG_SUPPORT_GFX_CP_LS
+    pub const GFX_RLC_LS: u64 = 1 << 7; // linux: AMD_CG_SUPPORT_GFX_RLC_LS
+    pub const MC_LS: u64 = 1 << 8; // linux: AMD_CG_SUPPORT_MC_LS
+    pub const MC_MGCG: u64 = 1 << 9; // linux: AMD_CG_SUPPORT_MC_MGCG
+    pub const SDMA_LS: u64 = 1 << 10; // linux: AMD_CG_SUPPORT_SDMA_LS
+    pub const SDMA_MGCG: u64 = 1 << 11; // linux: AMD_CG_SUPPORT_SDMA_MGCG
+    pub const BIF_LS: u64 = 1 << 12; // linux: AMD_CG_SUPPORT_BIF_LS
+    pub const HDP_LS: u64 = 1 << 15; // linux: AMD_CG_SUPPORT_HDP_LS
+    pub const HDP_MGCG: u64 = 1 << 16; // linux: AMD_CG_SUPPORT_HDP_MGCG
+    pub const ROM_MGCG: u64 = 1 << 17; // linux: AMD_CG_SUPPORT_ROM_MGCG
+    pub const BIF_MGCG: u64 = 1 << 19; // linux: AMD_CG_SUPPORT_BIF_MGCG
+    pub const GFX_3D_CGCG: u64 = 1 << 20; // linux: AMD_CG_SUPPORT_GFX_3D_CGCG
+    pub const GFX_3D_CGLS: u64 = 1 << 21; // linux: AMD_CG_SUPPORT_GFX_3D_CGLS
+    pub const VCN_MGCG: u64 = 1 << 24; // linux: AMD_CG_SUPPORT_VCN_MGCG
+    pub const HDP_DS: u64 = 1 << 25; // linux: AMD_CG_SUPPORT_HDP_DS
+    pub const HDP_SD: u64 = 1 << 26; // linux: AMD_CG_SUPPORT_HDP_SD
+    pub const IH_CG: u64 = 1 << 27; // linux: AMD_CG_SUPPORT_IH_CG
+    pub const JPEG_MGCG: u64 = 1 << 30; // linux: AMD_CG_SUPPORT_JPEG_MGCG
+    pub const GFX_FGCG: u64 = 1 << 31; // linux: AMD_CG_SUPPORT_GFX_FGCG
 }
 /// amd_shared.h `AMD_PG_SUPPORT_*`.
 pub mod pg {
-    pub const GFX_PG: u32 = 1 << 0;
-    pub const MMHUB: u32 = 1 << 13;
-    pub const VCN: u32 = 1 << 14;
-    pub const VCN_DPG: u32 = 1 << 15;
-    pub const ATHUB: u32 = 1 << 16;
-    pub const JPEG: u32 = 1 << 17;
+    pub const GFX_PG: u32 = 1 << 0; // linux: AMD_PG_SUPPORT_GFX_PG
+    pub const MMHUB: u32 = 1 << 13; // linux: AMD_PG_SUPPORT_MMHUB
+    pub const VCN: u32 = 1 << 14; // linux: AMD_PG_SUPPORT_VCN
+    pub const VCN_DPG: u32 = 1 << 15; // linux: AMD_PG_SUPPORT_VCN_DPG
+    pub const ATHUB: u32 = 1 << 16; // linux: AMD_PG_SUPPORT_ATHUB
+    pub const JPEG: u32 = 1 << 17; // linux: AMD_PG_SUPPORT_JPEG
 }
 /// nv.c `nv_common_early_init`, `case IP_VERSION(10, 3, 2)`. No MGLS, FGCG,
 /// 3D CGLS, CP/RLC LS, SDMA, BIF or ROM gating on this ASIC.
@@ -88,52 +88,81 @@ const fn reg(block: Block, offset: u32) -> Reg {
     Reg { block, offset }
 }
 // gc_10_3_0_offset.h (GC base index in the comment's segment).
+// linux-lit: 0x2200=mmGRBM_GFX_INDEX@gc101
 pub(crate) const GRBM_GFX_INDEX: Reg = reg(Block::Gc1, 0x2200);
+// linux-lit: 0x5084=mmCGTT_VGT_CLK_CTRL@gc101
 pub(crate) const CGTT_VGT_CLK_CTRL: Reg = reg(Block::Gc1, 0x5084);
+// linux-lit: 0x5085=mmCGTT_IA_CLK_CTRL@gc101
 pub(crate) const CGTT_IA_CLK_CTRL: Reg = reg(Block::Gc1, 0x5085);
+// linux-lit: 0x5086=mmCGTT_WD_CLK_CTRL@gc101
 pub(crate) const CGTT_WD_CLK_CTRL: Reg = reg(Block::Gc1, 0x5086);
-pub(crate) const RLC_CNTL: Reg = reg(Block::Gc1, 0x4c00);
+pub(crate) const RLC_CNTL: Reg = reg(Block::Gc1, 0x4c00); // linux-lit: 0x4c00=mmRLC_CNTL@gc101
+                                                          // linux-lit: 0x4c06=mmRLC_MEM_SLP_CNTL@gc101
 pub(crate) const RLC_MEM_SLP_CNTL: Reg = reg(Block::Gc1, 0x4c06);
+// linux-lit: 0x4c48=mmRLC_CGTT_MGCG_OVERRIDE@gc101
 pub(crate) const RLC_CGTT_MGCG_OVERRIDE: Reg = reg(Block::Gc1, 0x4c48);
+// linux-lit: 0x4c49=mmRLC_CGCG_CGLS_CTRL@gc101
 pub(crate) const RLC_CGCG_CGLS_CTRL: Reg = reg(Block::Gc1, 0x4c49);
+// linux-lit: 0x4cc5=mmRLC_CGCG_CGLS_CTRL_3D@gc101
 pub(crate) const RLC_CGCG_CGLS_CTRL_3D: Reg = reg(Block::Gc1, 0x4cc5);
 /// gfx_v10_0.c `mmRLC_SAFE_MODE_Sienna_Cichlid`.
+// linux-lit: 0x4ca0=mmRLC_SAFE_MODE_Sienna_Cichlid
 pub(crate) const RLC_SAFE_MODE: Reg = reg(Block::Gc1, 0x4ca0);
+// linux-lit: 0x5b31=mmRLC_CLK_CNTL@gc101
 pub(crate) const RLC_CLK_CNTL: Reg = reg(Block::Gc1, 0x5b31);
+// linux-lit: 0x0f62=mmCP_RB_WPTR_POLL_CNTL@gc101
 pub(crate) const CP_RB_WPTR_POLL_CNTL: Reg = reg(Block::Gc0, 0x0f62);
+// linux-lit: 0x1e0a=mmCP_INT_CNTL_RING0@gc101
 pub(crate) const CP_INT_CNTL_RING0: Reg = reg(Block::Gc0, 0x1e0a);
+// linux-lit: 0x1e0b=mmCP_INT_CNTL_RING1@gc101
 pub(crate) const CP_INT_CNTL_RING1: Reg = reg(Block::Gc0, 0x1e0b);
+// linux-lit: 0x1e19=mmCP_MEM_SLP_CNTL@gc101
 pub(crate) const CP_MEM_SLP_CNTL: Reg = reg(Block::Gc0, 0x1e19);
 /// SDMA0 registers sit on GC base 0; `sdma_v5_2_get_reg_offset` adds
 /// `SDMA1_REG_OFFSET` (0x600) for instance 1.
+// linux-lit: 0x001a=mmSDMA0_POWER_CNTL; 0x061a=mmSDMA0_POWER_CNTL + SDMA1_REG_OFFSET
 pub(crate) const SDMA_POWER_CNTL: [Reg; 2] = [reg(Block::Gc0, 0x001a), reg(Block::Gc0, 0x061a)];
+// linux-lit: 0x001b=mmSDMA0_CLK_CTRL; 0x061b=mmSDMA0_CLK_CTRL + SDMA1_REG_OFFSET
 pub(crate) const SDMA_CLK_CTRL: [Reg; 2] = [reg(Block::Gc0, 0x001b), reg(Block::Gc0, 0x061b)];
 /// mmhub_v2_0.c `mmDAGB0_CNTL_MISC2_Sienna_Cichlid` (MMHUB 2.1.x).
+// linux-lit: 0x0070=mmDAGB0_CNTL_MISC2_Sienna_Cichlid
 pub(crate) const DAGB0_CNTL_MISC2: Reg = reg(Block::Mmhub, 0x0070);
 /// athub_2_1_0_offset.h.
+// linux-lit: 0x0009=mmATHUB_MISC_CNTL
 pub(crate) const ATHUB_MISC_CNTL: Reg = reg(Block::Athub, 0x0009);
 /// hdp_5_0_0_offset.h.
+// linux-lit: 0x00d4=mmHDP_MEM_POWER_CTRL
 pub(crate) const HDP_MEM_POWER_CTRL: Reg = reg(Block::Hdp, 0x00d4);
-pub(crate) const HDP_CLK_CNTL: Reg = reg(Block::Hdp, 0x00d8);
+pub(crate) const HDP_CLK_CNTL: Reg = reg(Block::Hdp, 0x00d8); // linux-lit: 0x00d8=mmHDP_CLK_CNTL
 /// osssys_5_0_0_offset.h.
-pub(crate) const IH_CLK_CTRL: Reg = reg(Block::Osssys, 0x00db);
+pub(crate) const IH_CLK_CTRL: Reg = reg(Block::Osssys, 0x00db); // linux-lit: 0x00db=mmIH_CLK_CTRL
 /// smuio_11_0_6_offset.h.
+// linux-lit: 0x00e4=mmCGTT_ROM_CLK_CTRL0@smuio
 pub(crate) const CGTT_ROM_CLK_CTRL0: Reg = reg(Block::Smuio, 0x00e4);
-const GC0_LAST: u32 = 0x1e19;
-const GC1_LAST: u32 = 0x5b31;
+const GC0_LAST: u32 = 0x1e19; // linux: mmCP_MEM_SLP_CNTL@gc101
+const GC1_LAST: u32 = 0x5b31; // linux: mmRLC_CLK_CNTL@gc101
 
 // gc_10_3_0_sh_mask.h fields.
-const RLC_ENABLE_F32: u32 = 1 << 0;
-const SAFE_MODE_CMD: u32 = 1 << 0;
-const SAFE_MODE_MESSAGE_SHIFT: u32 = 1;
+const RLC_ENABLE_F32: u32 = 1 << 0; // linux: RLC_CNTL__RLC_ENABLE_F32_MASK@gc101
+const SAFE_MODE_CMD: u32 = 1 << 0; // linux: RLC_SAFE_MODE__CMD_MASK@gc101
+const SAFE_MODE_MESSAGE_SHIFT: u32 = 1; // linux: RLC_SAFE_MODE__MESSAGE__SHIFT@gc101
+                                        // linux: RLC_CGTT_MGCG_OVERRIDE__RLC_CGTT_SCLK_OVERRIDE_MASK@gc101
 const OVERRIDE_RLC_CGTT_SCLK: u32 = 1 << 1;
+// linux: RLC_CGTT_MGCG_OVERRIDE__GFXIP_MGCG_OVERRIDE_MASK@gc101
 const OVERRIDE_GFXIP_MGCG: u32 = 1 << 2;
+// linux: RLC_CGTT_MGCG_OVERRIDE__GFXIP_CGCG_OVERRIDE_MASK@gc101
 const OVERRIDE_GFXIP_CGCG: u32 = 1 << 3;
+// linux: RLC_CGTT_MGCG_OVERRIDE__GFXIP_CGLS_OVERRIDE_MASK@gc101
 const OVERRIDE_GFXIP_CGLS: u32 = 1 << 4;
+// linux: RLC_CGTT_MGCG_OVERRIDE__GRBM_CGTT_SCLK_OVERRIDE_MASK@gc101
 const OVERRIDE_GRBM_CGTT_SCLK: u32 = 1 << 5;
+// linux: RLC_CGTT_MGCG_OVERRIDE__GFXIP_MGLS_OVERRIDE_MASK@gc101
 const OVERRIDE_GFXIP_MGLS: u32 = 1 << 6;
+// linux: RLC_CGTT_MGCG_OVERRIDE__GFXIP_GFX3D_CG_OVERRIDE_MASK@gc101
 const OVERRIDE_GFXIP_GFX3D_CG: u32 = 1 << 7;
+// linux: RLC_CGTT_MGCG_OVERRIDE__GFXIP_FGCG_OVERRIDE_MASK@gc101
 const OVERRIDE_GFXIP_FGCG: u32 = 1 << 8;
+// linux: RLC_CGTT_MGCG_OVERRIDE__ENABLE_CGTS_LEGACY_MASK@gc101
 const OVERRIDE_ENABLE_CGTS_LEGACY: u32 = 1 << 16;
 /// The six bits `gfx_v10_0_update_medium_grain_clock_gating` clears/sets.
 const MGCG_OVERRIDES: u32 = OVERRIDE_GRBM_CGTT_SCLK
@@ -142,41 +171,53 @@ const MGCG_OVERRIDES: u32 = OVERRIDE_GRBM_CGTT_SCLK
     | OVERRIDE_GFXIP_MGLS
     | OVERRIDE_GFXIP_FGCG
     | OVERRIDE_ENABLE_CGTS_LEGACY;
-const MEM_LS_EN: u32 = 1 << 0;
-const CGCG_EN: u32 = 1 << 0;
-const CGLS_EN: u32 = 1 << 1;
+const MEM_LS_EN: u32 = 1 << 0; // linux: RLC_MEM_SLP_CNTL__RLC_MEM_LS_EN_MASK@gc101
+const CGCG_EN: u32 = 1 << 0; // linux: RLC_CGCG_CGLS_CTRL__CGCG_EN_MASK@gc101
+const CGLS_EN: u32 = 1 << 1; // linux: RLC_CGCG_CGLS_CTRL__CGLS_EN_MASK@gc101
+                             // linux: RLC_CGCG_CGLS_CTRL__CGLS_REP_COMPANSAT_DELAY__SHIFT@gc101
 const CGLS_REP_COMPANSAT_DELAY_SHIFT: u32 = 2;
+// linux: RLC_CGCG_CGLS_CTRL__CGCG_GFX_IDLE_THRESHOLD__SHIFT@gc101
 const CGCG_GFX_IDLE_THRESHOLD_SHIFT: u32 = 8;
 /// "set IDLE_POLL_COUNT(0x00900100)": POLL_FREQUENCY 0x100, IDLE_POLL_COUNT 0x90.
+// linux: (0x0100 << CP_RB_WPTR_POLL_CNTL__POLL_FREQUENCY__SHIFT@gc101) | (0x0090 << CP_RB_WPTR_POLL_CNTL__IDLE_POLL_COUNT__SHIFT@gc101)
 pub(crate) const WPTR_POLL_IDLE: u32 = 0x0100 | 0x0090 << 16;
+// linux: RLC_CLK_CNTL__RLC_SRAM_CLK_GATER_OVERRIDE_MASK@gc101
 const RLC_SRAM_CLK_GATER_OVERRIDE: u32 = 1 << 8;
 /// CP_INT_CNTL_RING0: CMP_BUSY, CNTX_BUSY, CNTX_EMPTY, GFX_IDLE.
+// linux: CP_INT_CNTL_RING0__CMP_BUSY_INT_ENABLE_MASK@gc101 | CP_INT_CNTL_RING0__CNTX_BUSY_INT_ENABLE_MASK@gc101 | CP_INT_CNTL_RING0__CNTX_EMPTY_INT_ENABLE_MASK@gc101 | CP_INT_CNTL_RING0__GFX_IDLE_INT_ENABLE_MASK@gc101
 pub(crate) const GUI_IDLE_INTERRUPTS: u32 = (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21);
 /// sdma0 SOFT_OVERRIDE4..0 and SOFT_OVERRIDER_REG.
+// linux: SDMA0_CLK_CTRL__SOFT_OVERRIDE4_MASK@gc | SDMA0_CLK_CTRL__SOFT_OVERRIDE3_MASK@gc | SDMA0_CLK_CTRL__SOFT_OVERRIDE2_MASK@gc | SDMA0_CLK_CTRL__SOFT_OVERRIDE1_MASK@gc | SDMA0_CLK_CTRL__SOFT_OVERRIDE0_MASK@gc | SDMA0_CLK_CTRL__SOFT_OVERRIDER_REG_MASK@gc
 const SDMA_SOFT_OVERRIDES: u32 = 0xfc00_0000;
-const SDMA_MEM_POWER_OVERRIDE: u32 = 1 << 8;
+const SDMA_MEM_POWER_OVERRIDE: u32 = 1 << 8; // linux: SDMA0_POWER_CNTL__MEM_POWER_OVERRIDE_MASK@gc
 /// DAGB0_CNTL_MISC2 DISABLE_{WRREQ,WRRET,RDREQ,RDRET,TLBWR,TLBRD}_CG.
+// linux: DAGB0_CNTL_MISC2__DISABLE_WRREQ_CG_MASK | DAGB0_CNTL_MISC2__DISABLE_WRRET_CG_MASK | DAGB0_CNTL_MISC2__DISABLE_RDREQ_CG_MASK | DAGB0_CNTL_MISC2__DISABLE_RDRET_CG_MASK | DAGB0_CNTL_MISC2__DISABLE_TLBWR_CG_MASK | DAGB0_CNTL_MISC2__DISABLE_TLBRD_CG_MASK
 const DAGB_DISABLE_CG: u32 = 0xfc;
-const ATHUB_CG_ENABLE: u32 = 1 << 6;
-const ATHUB_CG_MEM_LS_ENABLE: u32 = 1 << 7;
+const ATHUB_CG_ENABLE: u32 = 1 << 6; // linux: ATHUB_MISC_CNTL__CG_ENABLE_MASK
+const ATHUB_CG_MEM_LS_ENABLE: u32 = 1 << 7; // linux: ATHUB_MISC_CNTL__CG_MEM_LS_ENABLE_MASK
+                                            // linux: HDP_CLK_CNTL__IPH_MEM_CLK_SOFT_OVERRIDE_MASK
 const HDP_IPH_MEM_CLK_SOFT_OVERRIDE: u32 = 1 << 26;
+// linux: HDP_CLK_CNTL__RC_MEM_CLK_SOFT_OVERRIDE_MASK
 const HDP_RC_MEM_CLK_SOFT_OVERRIDE: u32 = 1 << 27;
 /// IPH/RC mem, DBUS, DYN, XDP_REG and HDP_REG clock soft overrides.
+// linux: HDP_CLK_CNTL__IPH_MEM_CLK_SOFT_OVERRIDE_MASK | HDP_CLK_CNTL__RC_MEM_CLK_SOFT_OVERRIDE_MASK | HDP_CLK_CNTL__DBUS_CLK_SOFT_OVERRIDE_MASK | HDP_CLK_CNTL__DYN_CLK_SOFT_OVERRIDE_MASK | HDP_CLK_CNTL__XDP_REG_CLK_SOFT_OVERRIDE_MASK | HDP_CLK_CNTL__HDP_REG_CLK_SOFT_OVERRIDE_MASK
 const HDP_CLK_SOFT_OVERRIDES: u32 = 0xfc00_0000;
-const HDP_IPH_CTRL_EN: u32 = 1 << 0;
-const HDP_IPH_LS_EN: u32 = 1 << 1;
-const HDP_IPH_DS_EN: u32 = 1 << 2;
-const HDP_IPH_SD_EN: u32 = 1 << 3;
-const HDP_RC_CTRL_EN: u32 = 1 << 16;
-const HDP_RC_LS_EN: u32 = 1 << 17;
-const HDP_RC_DS_EN: u32 = 1 << 18;
-const HDP_RC_SD_EN: u32 = 1 << 19;
+const HDP_IPH_CTRL_EN: u32 = 1 << 0; // linux: HDP_MEM_POWER_CTRL__IPH_MEM_POWER_CTRL_EN_MASK
+const HDP_IPH_LS_EN: u32 = 1 << 1; // linux: HDP_MEM_POWER_CTRL__IPH_MEM_POWER_LS_EN_MASK
+const HDP_IPH_DS_EN: u32 = 1 << 2; // linux: HDP_MEM_POWER_CTRL__IPH_MEM_POWER_DS_EN_MASK
+const HDP_IPH_SD_EN: u32 = 1 << 3; // linux: HDP_MEM_POWER_CTRL__IPH_MEM_POWER_SD_EN_MASK
+const HDP_RC_CTRL_EN: u32 = 1 << 16; // linux: HDP_MEM_POWER_CTRL__RC_MEM_POWER_CTRL_EN_MASK
+const HDP_RC_LS_EN: u32 = 1 << 17; // linux: HDP_MEM_POWER_CTRL__RC_MEM_POWER_LS_EN_MASK
+const HDP_RC_DS_EN: u32 = 1 << 18; // linux: HDP_MEM_POWER_CTRL__RC_MEM_POWER_DS_EN_MASK
+const HDP_RC_SD_EN: u32 = 1 << 19; // linux: HDP_MEM_POWER_CTRL__RC_MEM_POWER_SD_EN_MASK
 /// IH_CLK_CTRL DBUS_MUX, OSSSYS_SHARE, LIMIT_SMN, DYN and REG soft overrides.
+// linux: IH_CLK_CTRL__DBUS_MUX_CLK_SOFT_OVERRIDE_MASK | IH_CLK_CTRL__OSSSYS_SHARE_CLK_SOFT_OVERRIDE_MASK | IH_CLK_CTRL__LIMIT_SMN_CLK_SOFT_OVERRIDE_MASK | IH_CLK_CTRL__DYN_CLK_SOFT_OVERRIDE_MASK | IH_CLK_CTRL__REG_CLK_SOFT_OVERRIDE_MASK
 const IH_SOFT_OVERRIDES: u32 = 0xf800_0000;
 /// CGTT_ROM_CLK_CTRL0 SOFT_OVERRIDE0/1.
+// linux: CGTT_ROM_CLK_CTRL0__SOFT_OVERRIDE0_MASK@smuio | CGTT_ROM_CLK_CTRL0__SOFT_OVERRIDE1_MASK@smuio
 const ROM_SOFT_OVERRIDES: u32 = 0xc000_0000;
 /// `adev->usec_timeout` (AMDGPU_MAX_USEC_TIMEOUT): the RLC safe-mode wait.
-const SAFE_MODE_TIMEOUT_MS: u64 = 100;
+const SAFE_MODE_TIMEOUT_MS: u64 = 100; // linux: AMDGPU_MAX_USEC_TIMEOUT / 1000
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -620,9 +661,13 @@ fn medium_grain<I: Io>(s: &mut Seq<'_, I>, flags: u64, enable: bool) -> Result<(
     }
     if enable && flags & cg::GFX_MGCG != 0 {
         // 0 - disable some blocks' MGCG (broadcast GRBM index).
+        // linux-lit: 0xe0000000=GRBM_GFX_INDEX__SE_BROADCAST_WRITES_MASK@gc101 | GRBM_GFX_INDEX__SA_BROADCAST_WRITES_MASK@gc101 | GRBM_GFX_INDEX__INSTANCE_BROADCAST_WRITES_MASK@gc101
         s.wr(GRBM_GFX_INDEX, 0xe000_0000);
+        // linux: n/a (literal in gfx_v10_0.c:gfx_v10_0_update_medium_grain_clock_gating)
         s.wr(CGTT_WD_CLK_CTRL, 0xff00_0000);
+        // linux: n/a (literal in gfx_v10_0.c:gfx_v10_0_update_medium_grain_clock_gating)
         s.wr(CGTT_VGT_CLK_CTRL, 0xff00_0000);
+        // linux: n/a (literal in gfx_v10_0.c:gfx_v10_0_update_medium_grain_clock_gating)
         s.wr(CGTT_IA_CLK_CTRL, 0xff00_0000);
         // 1 - RLC_CGTT_MGCG_OVERRIDE.
         let def = s.rd(RLC_CGTT_MGCG_OVERRIDE)?;
@@ -661,9 +706,11 @@ fn medium_grain<I: Io>(s: &mut Seq<'_, I>, flags: u64, enable: bool) -> Result<(
 const fn cgcg_fsm(cgcg: bool, cgls: bool) -> u32 {
     let mut data = 0;
     if cgcg {
+        // linux: n/a (literal 0x36 in gfx_v10_0.c:gfx_v10_0_update_coarse_grain_clock_gating)
         data = 0x36 << CGCG_GFX_IDLE_THRESHOLD_SHIFT | CGCG_EN;
     }
     if cgls {
+        // linux: n/a (literal 0x000F in gfx_v10_0.c:gfx_v10_0_update_coarse_grain_clock_gating)
         data |= 0xf << CGLS_REP_COMPANSAT_DELAY_SHIFT | CGLS_EN;
     }
     data

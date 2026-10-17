@@ -33,63 +33,90 @@ use narf_bus::{pci, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // mp_11_0_offset.h, MP0/MP1 base index 0.
-const BOOTLOADER: u32 = 0x63; // MP0_SMN_C2PMSG_35
-const TOS: u32 = 0x80; // MP0_SMN_C2PMSG_64
-const SOS: u32 = 0x91; // MP0_SMN_C2PMSG_81
-const MESSAGE: u32 = 0x282; // MP1_SMN_C2PMSG_66
-const ARGUMENT: u32 = 0x292; // MP1_SMN_C2PMSG_82
-const RESPONSE: u32 = 0x29a; // MP1_SMN_C2PMSG_90
+// linux-ctx: hdr=mp seg=0
+// linux: mmMP0_SMN_C2PMSG_35
+const BOOTLOADER: u32 = 0x63;
+// linux: mmMP0_SMN_C2PMSG_64
+const TOS: u32 = 0x80;
+// linux: mmMP0_SMN_C2PMSG_81
+const SOS: u32 = 0x91;
+// linux: mmMP1_SMN_C2PMSG_66
+const MESSAGE: u32 = 0x282;
+// linux: mmMP1_SMN_C2PMSG_82
+const ARGUMENT: u32 = 0x292;
+// linux: mmMP1_SMN_C2PMSG_90
+const RESPONSE: u32 = 0x29a;
+// linux-ctx: reset
 
 // nbio_2_3_offset.h.
-const SCRATCH_0: u32 = 0x38; // BIOS_SCRATCH_0, base index 1
-const PCIE_INDEX2: u32 = 0xe; // base index 0
-const PCIE_DATA2: u32 = 0xf; // base index 0
-const MEMSIZE: u32 = 0xc3; // RCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE, base index 2
+// linux-ctx: hdr=nbio seg=1
+// linux: mmBIOS_SCRATCH_0
+const SCRATCH_0: u32 = 0x38;
+// linux-ctx: hdr=nbio seg=0
+// linux: mmPCIE_INDEX2
+const PCIE_INDEX2: u32 = 0xe;
+// linux: mmPCIE_DATA2
+const PCIE_DATA2: u32 = 0xf;
+// linux-ctx: hdr=nbio seg=2
+// linux: mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
+const MEMSIZE: u32 = 0xc3;
+// linux-ctx: reset
 const NBIF: &[(u8, u8, u8)] = &[(2, 3, 0), (2, 3, 1), (2, 3, 2), (3, 3, 0), (3, 3, 1)];
 // smu_v11_0_7_ppsmc.h.
-const GET_SMU_VERSION: u32 = 0x2;
-const MODE1_RESET: u32 = 0x30;
+const GET_SMU_VERSION: u32 = 0x2; // linux: PPSMC_MSG_GetSmuVersion
+const MODE1_RESET: u32 = 0x30; // linux: PPSMC_MSG_Mode1Reset
 /// "PM FW support mode1 reset from 58.26".
+// linux: n/a (literal 0x003a1a00 in sienna_cichlid_ppt.c:sienna_cichlid_is_mode1_reset_supported)
 const SMU_MODE1_MIN_VERSION: u32 = 0x003a_1a00;
+// linux: GFX_CTRL_CMD_ID_MODE1_RST
 const GFX_CTRL_CMD_ID_MODE1_RST: u32 = 0x0007_0000;
 // MBOX_TOS_READY_FLAG / MBOX_TOS_READY_MASK and the bootloader ready bit.
-const READY: u32 = 0x8000_0000;
-const READY_MASK: u32 = 0x8000_ffff;
-const ATOM_S3_ASIC_GUI_ENGINE_HUNG: u32 = 0x2000_0000;
+const READY: u32 = 0x8000_0000; // linux: MBOX_TOS_READY_FLAG
+const READY_MASK: u32 = 0x8000_ffff; // linux: MBOX_TOS_READY_MASK
+const ATOM_S3_ASIC_GUI_ENGINE_HUNG: u32 = 0x2000_0000; // linux: ATOM_S3_ASIC_GUI_ENGINE_HUNG
 /// atombios.h `ATOM_S7_ASIC_INIT_COMPLETE_MASK`.
-pub const ATOM_S7_ASIC_INIT_COMPLETE: u32 = 0x0000_0200;
+pub const ATOM_S7_ASIC_INIT_COMPLETE: u32 = 0x0000_0200; // linux: ATOM_S7_ASIC_INIT_COMPLETE_MASK
 /// `ATOM_CMD_INIT`: ASIC_Init, master command table entry 0.
+// linux: n/a (ATOM_CMD_INIT = 0, amdgpu/atom.h; not in checker sets)
 const ASIC_INIT: u8 = 0;
 // atom.h / atom_master_list_of_data_tables_v2_1.
+// linux: offsetof(struct atom_master_list_of_data_tables_v2_1, firmwareinfo) / 2
 const DATA_FIRMWAREINFO: usize = 4;
+// linux: offsetof(struct atom_master_list_of_data_tables_v2_1, vram_usagebyfirmware) / 2
 const DATA_VRAM_USAGE: usize = 11;
-const FWI_DEFSCLK: usize = 8; // ATOM_FWI_DEFSCLK_PTR
-const FWI_DEFMCLK: usize = 0xc; // ATOM_FWI_DEFMCLK_PTR
+// ATOM_FWI_DEFSCLK_PTR
+// linux: offsetof(struct atom_firmware_info_v3_4, bootup_sclk_in10khz)
+const FWI_DEFSCLK: usize = 8;
+// ATOM_FWI_DEFMCLK_PTR
+// linux: offsetof(struct atom_firmware_info_v3_4, bootup_mclk_in10khz)
+const FWI_DEFMCLK: usize = 0xc;
+// linux: offsetof(struct atom_firmware_info_v3_4, bios_scratch_reg_startaddr)
 const FWI_SCRATCH_START: usize = 0x18; // bios_scratch_reg_startaddr
 /// amdgpu_atomfirmware_allocate_fb_scratch's default FB scratch.
+// linux: n/a (literal 20 * 1024 in amdgpu_atomfirmware.c:amdgpu_atomfirmware_allocate_fb_scratch)
 const FB_SCRATCH_DEFAULT: usize = 20 * 1024;
 /// NARF bound on one ASIC_Init execution. Linux has only atom.c's 20 s
 /// same-jump guard, which the VM applies as well.
-const POST_MS: u64 = 60_000;
+const POST_MS: u64 = 60_000; // linux: n/a (NARF bound)
 /// Opcodes between cooperative yields and liveness checks.
-const YIELD_STEPS: u64 = 1024;
+const YIELD_STEPS: u64 = 1024; // linux: n/a (NARF policy)
 /// SMU11_MODE1_RESET_WAIT_TIME_IN_MS, and the PSP path's msleep(500).
-const SETTLE_MS: u64 = 500;
+const SETTLE_MS: u64 = 500; // linux: SMU11_MODE1_RESET_WAIT_TIME_IN_MS
 /// psp_v11_0_wait_for_bootloader: 20 retries of a 100 ms register wait.
-const BOOTLOADER_MS: u64 = 2000;
+const BOOTLOADER_MS: u64 = 2000; // linux: n/a (NARF bound, 20 x usec_timeout)
 /// adev->usec_timeout for the PSP mailbox and MEMSIZE waits.
-const REGISTER_MS: u64 = 100;
+const REGISTER_MS: u64 = 100; // linux: n/a (NARF bound, usec_timeout)
 /// smu_cmn message timeout (usec_timeout * 20).
-const MESSAGE_MS: u64 = 2000;
-const PCI_EXPRESS: u8 = 0x10;
-const PCI_MSI: u8 = 0x05;
-const PCI_MSIX: u8 = 0x11;
-const MSIX_ENABLE: u16 = 0x8000;
-const MSIX_MASKALL: u16 = 0x4000;
+const MESSAGE_MS: u64 = 2000; // linux: n/a (NARF bound, usec_timeout * 20)
+const PCI_EXPRESS: u8 = 0x10; // linux: n/a (PCI_CAP_ID_EXP, uapi pci_regs.h)
+const PCI_MSI: u8 = 0x05; // linux: n/a (PCI_CAP_ID_MSI, uapi pci_regs.h)
+const PCI_MSIX: u8 = 0x11; // linux: n/a (PCI_CAP_ID_MSIX, uapi pci_regs.h)
+const MSIX_ENABLE: u16 = 0x8000; // linux: n/a (PCI_MSIX_FLAGS_ENABLE, pci_regs.h)
+const MSIX_MASKALL: u16 = 0x4000; // linux: n/a (PCI_MSIX_FLAGS_MASKALL, pci_regs.h)
 /// BAR5, the register BAR Linux maps as rmmio.
-const MMIO_BIR: u32 = 5;
-const MSIX_SAVED: usize = 64;
-const RESIZABLE_BAR: u16 = 0x15;
+const MMIO_BIR: u32 = 5; // linux: n/a (BAR index of rmmio on NV)
+const MSIX_SAVED: usize = 64; // linux: n/a (NARF bound)
+const RESIZABLE_BAR: u16 = 0x15; // linux: n/a (PCI_EXT_CAP_ID_REBAR, pci_regs.h)
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -231,6 +258,7 @@ struct PciState {
     /// entries, count). The reset wipes it with the rest of the device.
     msix_table: Option<(u64, [[u32; 4]; MSIX_SAVED], usize)>,
 }
+// linux: n/a (PCI_EXP_DEVCTL, PCI_EXP_LNKCTL, PCI_EXP_DEVCTL2, PCI_EXP_LNKCTL2; pci_regs.h)
 const EXPRESS_CONTROLS: [u16; 4] = [0x08, 0x10, 0x28, 0x30];
 
 fn config(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice, offset: u16) -> Result<u32, Error> {
@@ -242,6 +270,7 @@ fn save(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Result<PciState, 
     let mut express = None;
     let mut msi = None;
     let mut msix = None;
+    // linux: n/a (PCI_CAPABILITY_LIST = 0x34, pci_regs.h)
     let mut pointer = (config(cap, device, 0x34)? & 0xfc) as u16;
     for _ in 0..48 {
         if pointer < 0x40 {
@@ -260,7 +289,7 @@ fn save(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Result<PciState, 
             // (pci_restore_msi_state rewrites it from the descriptors).
             PCI_MSI => {
                 let control = (header >> 16) as u16;
-                let wide = control & 0x80 != 0;
+                let wide = control & 0x80 != 0; // linux: n/a (PCI_MSI_FLAGS_64BIT)
                 let mut words = [0; 4];
                 words[0] = config(cap, device, pointer + 4)?;
                 let data = if wide {
@@ -289,6 +318,7 @@ fn save(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Result<PciState, 
             break;
         }
         if header as u16 == RESIZABLE_BAR {
+            // linux: n/a (PCI_REBAR_CTRL = 8, PCI_REBAR_CTRL_NBAR_SHIFT = 5, NBAR_MASK 0xe0)
             let count = ((config(cap, device, offset + 8)? >> 5) & 7) as usize;
             if count == 0 || count > rebar.len() {
                 return Err(Error::Pci);
@@ -300,7 +330,7 @@ fn save(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Result<PciState, 
             rebar_count = count;
             break;
         }
-        offset = ((header >> 20) & 0xffc) as u16;
+        offset = ((header >> 20) & 0xffc) as u16; // linux: n/a (PCI_EXT_CAP_NEXT)
         if offset < 0x100 {
             break;
         }
@@ -351,7 +381,8 @@ fn restore(
     }
     for &(offset, control) in &state.rebar[..state.rebar_count] {
         // Only the size and index fields are guaranteed to read back.
-        if config(cap, device, offset)? & 0x3f07 != control & 0x3f07 {
+        // linux-lit: 0x1f07=PCI_REBAR_CTRL_BAR_IDX | PCI_REBAR_CTRL_BAR_SIZE
+        if config(cap, device, offset)? & 0x1f07 != control & 0x1f07 {
             return Err(Error::Pci);
         }
     }
@@ -430,6 +461,7 @@ impl Io for Mmio {
         if let Some((pointer, control)) = saved.msix {
             let table = config(authority, &self.device, pointer + 4)?;
             let offset = u64::from(table & !7);
+            // linux: n/a (PCI_MSIX_FLAGS_QSIZE = 0x7ff, PCI_MSIX_TABLE_BIR = 7)
             let count = (usize::from(control & 0x7ff) + 1).min(MSIX_SAVED);
             if table & 7 == MMIO_BIR && offset + count as u64 * 16 <= self.regs.len {
                 let mut entries = [[0u32; 4]; MSIX_SAVED];
@@ -533,11 +565,13 @@ impl<'a> Image<'a> {
     }
     /// `CU16(cmd_table + 4 + 2 * id)`; zero (absent) beyond the image.
     fn command(&self, id: u8) -> usize {
+        // linux-lit: 4=sizeof(struct atom_common_table_header); 2=sizeof(uint16_t)
         self.u16_at(self.cmd_table + 4 + 2 * usize::from(id))
             .unwrap_or(0)
     }
     /// `CU16(data_table + 4 + 2 * index)`.
     fn data(&self, index: usize) -> Option<usize> {
+        // linux-lit: 4=sizeof(struct atom_common_table_header); 2=sizeof(uint16_t)
         self.u16_at(self.data_table + 4 + 2 * index)
             .filter(|&at| at != 0)
     }
@@ -568,13 +602,17 @@ impl<'a> Image<'a> {
     /// `amdgpu_atomfirmware_allocate_fb_scratch`'s size in bytes.
     fn fb_scratch_bytes(&self) -> usize {
         let usage = self.data(DATA_VRAM_USAGE).and_then(|at| {
+            // linux-lit: 2=offsetof(struct atom_common_table_header, format_revision); 3=offsetof(struct atom_common_table_header, content_revision)
             let (frev, crev) = (*self.bios.get(at + 2)?, *self.bios.get(at + 3)?);
             if frev == 2 && crev == 1 {
+                // linux-lit: 4=offsetof(struct vram_usagebyfirmware_v2_1, start_address_in_kb)
                 let start = self.u32_at(at + 4)?;
                 // ATOM_VRAM_BLOCK_SRIOV_MSG_SHARE_RESERVATION keeps the default.
+                // linux-lit: 0xc000_0000=ATOM_VRAM_OPERATION_FLAGS_MASK; 2=ATOM_VRAM_BLOCK_SRIOV_MSG_SHARE_RESERVATION; 30=ATOM_VRAM_OPERATION_FLAGS_SHIFT
                 if start & 0xc000_0000 == 2 << 30 {
                     return Some(0);
                 }
+                // linux-lit: 10=offsetof(struct vram_usagebyfirmware_v2_1, used_by_driver_in_kb)
                 return Some(self.u16_at(at + 10)? << 10);
             }
             Some(0)
@@ -667,8 +705,9 @@ impl<I: Io> Engine<I> {
         loop {
             match self.access(|io| io.mp1(RESPONSE))? {
                 u32::MAX => return Err(Error::DeviceGone),
+                // linux-lit: 1=PPSMC_Result_OK
                 1 if read_argument => return self.access(|io| io.mp1(ARGUMENT)),
-                1 => return Ok(0),
+                1 => return Ok(0), // linux-lit: 1=PPSMC_Result_OK
                 0 => {}
                 status => return Err(Error::Rejected(status)),
             }
@@ -694,6 +733,7 @@ impl<I: Io> Engine<I> {
     }
     /// amdgpu_atombios_scratch_regs_engine_hung.
     fn engine_hung(&mut self, hung: bool) -> Result<(), Error> {
+        // linux: n/a (bios_scratch_reg_offset + 3, amdgpu_atombios.c)
         let register = self.scratch + 3;
         self.access(|io| {
             let value = io.reg(register);
@@ -767,7 +807,7 @@ impl<I: Io> Engine<I> {
     /// `amdgpu_device_need_post` + `amdgpu_device_asic_init`. `always` is
     /// recovery's unconditional post after a full reset.
     async fn post(&mut self, always: bool) -> Result<Post, Error> {
-        let s7 = self.scratch + 7;
+        let s7 = self.scratch + 7; // linux: n/a (bios_scratch_reg_offset + 7, amdgpu_atombios.c)
         let before = self.access(|io| io.reg(s7))?;
         if before == u32::MAX {
             return Err(Error::DeviceGone);
@@ -805,7 +845,7 @@ impl<I: Io> Engine<I> {
         fb.try_reserve_exact(fb_words)
             .map_err(|_| failed(PostError::Allocation))?;
         fb.resize(fb_words, 0);
-        let mut ps = [0u32; 16];
+        let mut ps = [0u32; 16]; // linux: n/a (uint32_t ps[16] in atom.c:amdgpu_atom_asic_init)
         ps[0] = sclk;
         ps[1] = mclk;
         post.sclk = sclk;
@@ -963,6 +1003,7 @@ impl Reset {
         };
         // amdgpu_atomfirmware_scratch_regs_init takes BIOS_SCRATCH_0 from
         // FirmwareInfo; without it, nbio_2_3's mmBIOS_SCRATCH_0.
+        // linux-lit: 1=mmBIOS_SCRATCH_0_BASE_IDX; 7=mmBIOS_SCRATCH_7 - mmBIOS_SCRATCH_0
         let nbio = dword(bank(discovery::HW_ID_NBIF, NBIF, 1, SCRATCH_0 + 7)?)? + SCRATCH_0;
         let scratch = vbios
             .as_deref()
@@ -972,14 +1013,17 @@ impl Reset {
         if (u64::from(scratch) + 8) * 4 > gpu.regs.len {
             return Err(Error::Invalid);
         }
+        // linux-lit: 0=mmPCIE_DATA2_BASE_IDX
         let pcie = dword(bank(discovery::HW_ID_NBIF, NBIF, 0, PCIE_DATA2)?)?;
         Ok(Self {
             engine: Engine {
                 io: Mmio {
                     regs: gpu.regs,
+                    // linux-lit: 0=mmMP0_SMN_C2PMSG_81_BASE_IDX
                     mp0: bank(discovery::HW_ID_MP0, &[(11, 0, 11)], 0, SOS)?,
                     mp1: crate::amdgpu_smu_navi22::mp1_bank(gpu).map_err(|_| Error::Unsupported)?,
                     pcie: (pcie + PCIE_INDEX2, pcie + PCIE_DATA2),
+                    // linux-lit: 2=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE_BASE_IDX
                     memsize: bank(discovery::HW_ID_NBIF, NBIF, 2, MEMSIZE)?,
                     device,
                     saved: None,

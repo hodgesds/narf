@@ -24,9 +24,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Pipes this owner can light (`amdgpu_navi22_modeset` drives pipe 0).
-pub const MAX_CRTCS: usize = 1;
+pub const MAX_CRTCS: usize = 1; // linux: n/a (NARF policy: one CRTC)
 
 /// DRM_FORMAT_XRGB8888 and ARGB8888: what the native scanout presents.
+// linux: n/a (DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888: fourcc_code() in drm_fourcc.h)
 const PLANE_FORMATS: [u32; 2] = [0x3432_5258, 0x3432_5241];
 
 /// One board connector and its sink as last detected.
@@ -479,6 +480,7 @@ pub fn display_admission(
         fclk_change: false,
         stutter: false,
         watermarks: false,
+        // linux: n/a (memclk_mhz * 16, dcn30_resource.c dcn30_update_bw_bounding_box)
         min_uclk_mhz: u16::try_from(admitted.soc.dram_speed_mts / 16).unwrap_or(u16::MAX),
         min_fclk_mhz: mhz(admitted.soc.fabric_khz),
         min_dcefclk_mhz: mhz(admitted.plan.clocks.dcfclk_khz),

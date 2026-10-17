@@ -48,89 +48,106 @@ use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // DCN base index 1 (dcn_3_0_0_offset.h).
+// linux-ctx: hdr=dcn seg=1
+// linux: mmD1VGA_CONTROL; mmD2VGA_CONTROL; mmD3VGA_CONTROL; mmD4VGA_CONTROL; mmD5VGA_CONTROL
+// linux: mmD6VGA_CONTROL
 const D_VGA_CONTROL: [u64; 6] = [0x000c, 0x000e, 0x0038, 0x0039, 0x003a, 0x003b];
 // DCN base index 2.
-const DOMAIN0_PG_CONFIG: u64 = 0x0080;
+// linux-ctx: hdr=dcn seg=2
+const DOMAIN0_PG_CONFIG: u64 = 0x0080; // linux: mmDOMAIN0_PG_CONFIG
 /// DOMAIN0..11 (HUBP/DPP) and DOMAIN16..21 (DSC).
 const PLANE_DOMAINS: core::ops::Range<u64> = 0..12;
-const DSC_DOMAIN16_PG_CONFIG: u64 = 0x00a1;
+const DSC_DOMAIN16_PG_CONFIG: u64 = 0x00a1; // linux: mmDOMAIN16_PG_CONFIG
 /// DSC_TOP0_DSC_TOP_CONTROL (stride 0x5c) and DSCRM0_DSCRM_DSC_FORWARD_CONFIG.
-const DSC_TOP_CONTROL: u64 = 0x3000; // linux: mmDSC_TOP0_DSC_TOP_CONTROL dcn_3_0_0_offset.h
-const DSC_TOP_STRIDE: u64 = 0x5c; // linux: mmDSC_TOP1_DSC_TOP_CONTROL - mmDSC_TOP0_DSC_TOP_CONTROL dcn_3_0_0_offset.h
-const DSC_CLOCK_EN: u32 = 1 << 0; // linux: DSC_TOP0_DSC_TOP_CONTROL__DSC_CLOCK_EN_MASK dcn_3_0_0_sh_mask.h
-const DSCRM_DSC_FORWARD_CONFIG: u64 = 0x1a64; // linux: mmDSCRM0_DSCRM_DSC_FORWARD_CONFIG dcn_3_0_0_offset.h
-const DSCRM_DSC_FORWARD_EN: u32 = 1 << 0; // linux: DSCRM0_DSCRM_DSC_FORWARD_CONFIG__DSCRM_DSC_FORWARD_EN_MASK dcn_3_0_0_sh_mask.h
-const DSCRM_DSC_OPP_PIPE_SOURCE: u32 = 0x70; // linux: DSCRM0_DSCRM_DSC_FORWARD_CONFIG__DSCRM_DSC_OPP_PIPE_SOURCE_MASK dcn_3_0_0_sh_mask.h
+const DSC_TOP_CONTROL: u64 = 0x3000; // linux: mmDSC_TOP0_DSC_TOP_CONTROL
+const DSC_TOP_STRIDE: u64 = 0x5c; // linux: mmDSC_TOP1_DSC_TOP_CONTROL - mmDSC_TOP0_DSC_TOP_CONTROL
+const DSC_CLOCK_EN: u32 = 1 << 0; // linux: DSC_TOP0_DSC_TOP_CONTROL__DSC_CLOCK_EN_MASK
+const DSCRM_DSC_FORWARD_CONFIG: u64 = 0x1a64; // linux: mmDSCRM0_DSCRM_DSC_FORWARD_CONFIG
+const DSCRM_DSC_FORWARD_EN: u32 = 1 << 0; // linux: DSCRM0_DSCRM_DSC_FORWARD_CONFIG__DSCRM_DSC_FORWARD_EN_MASK
+const DSCRM_DSC_OPP_PIPE_SOURCE: u32 = 0x70; // linux: DSCRM0_DSCRM_DSC_FORWARD_CONFIG__DSCRM_DSC_OPP_PIPE_SOURCE_MASK
 /// DCN30 `num_dsc`.
-const DSCS: u8 = 6; // linux: res_cap_dcn3.num_dsc dcn30_resource.c
+const DSCS: u8 = 6; // linux: n/a (dcn30_resource.c res_cap_dcn3.num_dsc)
 /// HUBBUB watermark sets (dcn_3_0_0_offset.h, base index 2): five per set
 /// from DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A, NOM/FLIP pairs per set from
 /// DCHUBBUB_ARB_FRAC_URG_BW_NOM_A.
-const WATERMARK_A: u64 = 0x0509; // linux: mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A dcn_3_0_0_offset.h
-const WATERMARK_SET: u64 = 5; // linux: mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_B - _A dcn_3_0_0_offset.h
-const FRAC_URG_BW_NOM_A: u64 = 0x053f; // linux: mmDCHUBBUB_ARB_FRAC_URG_BW_NOM_A dcn_3_0_0_offset.h
-const DOMAIN_POWER_FORCEON: u32 = 1 << 0;
-const DOMAIN_POWER_GATE: u32 = 1 << 8;
+const WATERMARK_A: u64 = 0x0509; // linux: mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A
+const WATERMARK_SET: u64 = 5; // linux: mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_B - mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A
+const FRAC_URG_BW_NOM_A: u64 = 0x053f; // linux: mmDCHUBBUB_ARB_FRAC_URG_BW_NOM_A
+const DOMAIN_POWER_FORCEON: u32 = 1 << 0; // linux: DOMAIN0_PG_CONFIG__DOMAIN0_POWER_FORCEON_MASK
+const DOMAIN_POWER_GATE: u32 = 1 << 8; // linux: DOMAIN0_PG_CONFIG__DOMAIN0_POWER_GATE_MASK
+                                       // linux: DOMAIN0_PG_STATUS__DOMAIN0_PGFSM_PWR_STATUS_MASK
 const DOMAIN_PGFSM_PWR_STATUS: u32 = 0xc000_0000;
-const DC_IP_REQUEST_CNTL: u64 = 0x00b2;
-const IP_REQUEST_EN: u32 = 1 << 0;
-const DPP_CONTROL: u64 = 0x0cc5;
-const DPP_STRIDE: u64 = 0x16b;
-const DPP_CLOCK_ENABLE: u32 = 1 << 4;
-const HUBP_CLK_CNTL: u64 = 0x05f4;
-const HUBP_STRIDE: u64 = 0xdc;
-const HUBP_CLOCK_ENABLE: u32 = 1 << 0;
-const DPG_CONTROL: u64 = 0x1854;
-const DPG_DIMENSIONS: u64 = 0x1856;
-const DPG_STATUS: u64 = 0x185b;
-const DPG_STRIDE: u64 = 0x5a;
-const DPG_EN: u32 = 1 << 0;
+const DC_IP_REQUEST_CNTL: u64 = 0x00b2; // linux: mmDC_IP_REQUEST_CNTL
+const IP_REQUEST_EN: u32 = 1 << 0; // linux: DC_IP_REQUEST_CNTL__IP_REQUEST_EN_MASK
+const DPP_CONTROL: u64 = 0x0cc5; // linux: mmDPP_TOP0_DPP_CONTROL
+const DPP_STRIDE: u64 = 0x16b; // linux: mmDPP_TOP1_DPP_CONTROL - mmDPP_TOP0_DPP_CONTROL
+const DPP_CLOCK_ENABLE: u32 = 1 << 4; // linux: DPP_TOP0_DPP_CONTROL__DPP_CLOCK_ENABLE_MASK
+const HUBP_CLK_CNTL: u64 = 0x05f4; // linux: mmHUBP0_HUBP_CLK_CNTL
+const HUBP_STRIDE: u64 = 0xdc; // linux: mmHUBP1_HUBP_CLK_CNTL - mmHUBP0_HUBP_CLK_CNTL
+const HUBP_CLOCK_ENABLE: u32 = 1 << 0; // linux: HUBP0_HUBP_CLK_CNTL__HUBP_CLOCK_ENABLE_MASK
+const DPG_CONTROL: u64 = 0x1854; // linux: mmDPG0_DPG_CONTROL
+const DPG_DIMENSIONS: u64 = 0x1856; // linux: mmDPG0_DPG_DIMENSIONS
+const DPG_STATUS: u64 = 0x185b; // linux: mmDPG0_DPG_STATUS
+const DPG_STRIDE: u64 = 0x5a; // linux: mmDPG1_DPG_CONTROL - mmDPG0_DPG_CONTROL
+const DPG_EN: u32 = 1 << 0; // linux: DPG0_DPG_CONTROL__DPG_EN_MASK
+                            // linux: DPG0_DPG_STATUS__DPG_DOUBLE_BUFFER_PENDING_MASK
 const DPG_DOUBLE_BUFFER_PENDING: u32 = 1 << 0;
-const ODM_DATA_SOURCE_SELECT: u64 = 0x1acb;
-const ODM_DATA_FORMAT_CONTROL: u64 = 0x1acc; // linux: mmODM0_OPTC_DATA_FORMAT_CONTROL dcn_3_0_0_offset.h
-const OPTC_DSC_MODE: u32 = 0x30; // linux: ODM0_OPTC_DATA_FORMAT_CONTROL__OPTC_DSC_MODE_MASK dcn_3_0_0_sh_mask.h
-const OPTC_NUM_OF_INPUT_SEGMENT: u32 = 0x3; // linux: ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_NUM_OF_INPUT_SEGMENT_MASK dcn_3_0_0_sh_mask.h
-const OPTC_SEG1_SRC_SEL: u32 = 0x0000_f000; // linux: ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG1_SRC_SEL_MASK dcn_3_0_0_sh_mask.h
-const ODM_INPUT_GLOBAL_CONTROL: u64 = 0x1aca;
+const ODM_DATA_SOURCE_SELECT: u64 = 0x1acb; // linux: mmODM0_OPTC_DATA_SOURCE_SELECT
+const ODM_DATA_FORMAT_CONTROL: u64 = 0x1acc; // linux: mmODM0_OPTC_DATA_FORMAT_CONTROL
+const OPTC_DSC_MODE: u32 = 0x30; // linux: ODM0_OPTC_DATA_FORMAT_CONTROL__OPTC_DSC_MODE_MASK
+const OPTC_NUM_OF_INPUT_SEGMENT: u32 = 0x3; // linux: ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_NUM_OF_INPUT_SEGMENT_MASK
+const OPTC_SEG1_SRC_SEL: u32 = 0x0000_f000; // linux: ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG1_SRC_SEL_MASK
+const ODM_INPUT_GLOBAL_CONTROL: u64 = 0x1aca; // linux: mmODM0_OPTC_INPUT_GLOBAL_CONTROL
+                                              // linux: mmODM1_OPTC_DATA_SOURCE_SELECT - mmODM0_OPTC_DATA_SOURCE_SELECT
 const ODM_STRIDE: u64 = 0x10;
+// linux: ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG0_SRC_SEL_MASK
 const OPTC_SEG0_SRC_SEL: u32 = 0x0000_0f00;
+// linux: ODM0_OPTC_INPUT_GLOBAL_CONTROL__OPTC_UNDERFLOW_CLEAR_MASK
 const OPTC_UNDERFLOW_CLEAR: u32 = 0x1000;
-const OTG_STRIDE: u64 = 0x80;
-const OTG_H_BLANK_START_END: u64 = 0x1b2b;
-const OTG_V_BLANK_START_END: u64 = 0x1b36;
-const OTG_CONTROL: u64 = 0x1b41;
-const OTG_MASTER_EN: u32 = 1 << 0;
-const OTG_DOUBLE_BUFFER_CONTROL: u64 = 0x1b5b;
+const OTG_STRIDE: u64 = 0x80; // linux: mmOTG1_OTG_CONTROL - mmOTG0_OTG_CONTROL
+const OTG_H_BLANK_START_END: u64 = 0x1b2b; // linux: mmOTG0_OTG_H_BLANK_START_END
+const OTG_V_BLANK_START_END: u64 = 0x1b36; // linux: mmOTG0_OTG_V_BLANK_START_END
+const OTG_CONTROL: u64 = 0x1b41; // linux: mmOTG0_OTG_CONTROL
+const OTG_MASTER_EN: u32 = 1 << 0; // linux: OTG0_OTG_CONTROL__OTG_MASTER_EN_MASK
+const OTG_DOUBLE_BUFFER_CONTROL: u64 = 0x1b5b; // linux: mmOTG0_OTG_DOUBLE_BUFFER_CONTROL
+                                               // linux: OTG0_OTG_DOUBLE_BUFFER_CONTROL__OTG_DRR_TIMING_DBUF_UPDATE_MODE_MASK
 const OTG_DRR_TIMING_DBUF_UPDATE_MODE: u32 = 0x0300_0000;
-const OTG_MASTER_UPDATE_LOCK: u64 = 0x1b8b;
-const OTG_GLOBAL_CONTROL2: u64 = 0x1b92;
+const OTG_MASTER_UPDATE_LOCK: u64 = 0x1b8b; // linux: mmOTG0_OTG_MASTER_UPDATE_LOCK
+const OTG_GLOBAL_CONTROL2: u64 = 0x1b92; // linux: mmOTG0_OTG_GLOBAL_CONTROL2
+                                         // linux: OTG0_OTG_GLOBAL_CONTROL2__OTG_MASTER_UPDATE_LOCK_SEL_MASK
 const OTG_MASTER_UPDATE_LOCK_SEL: u32 = 0x0e00_0000;
+// linux: OTG0_OTG_MASTER_UPDATE_LOCK__UPDATE_LOCK_STATUS_MASK
 const UPDATE_LOCK_STATUS: u32 = 1 << 8;
-const DIG_STRIDE: u64 = 0x100;
-const DIG_BE_CNTL: u64 = 0x20b0;
-const DIG_BE_EN_CNTL: u64 = 0x20b1;
-const DIG_ENABLE: u32 = 1 << 0;
-const DIG_MODE: u32 = 0x0007_0000;
-const DIG_FE_SOURCE_SELECT: u32 = 0x7f00;
-const TMDS_CTL_BITS: u64 = 0x20de;
-const TMDS_CTL0: u32 = 1 << 0;
-const DP_VID_STREAM_CNTL: u64 = 0x210c;
-// DCN base index 3: MPCC instances stride 0x20, MPC_OUTn_MUX stride 4.
-const MPCC_TOP_SEL: u64 = 0x0000;
-const MPCC_BOT_SEL: u64 = 0x0001;
-const MPCC_OPP_ID: u64 = 0x0002;
-const MPCC_UPDATE_LOCK_SEL: u64 = 0x0005;
-const MPCC_STATUS: u64 = 0x000d;
-const MPCC_STRIDE: u64 = 0x20;
-const MPCC_IDLE: u32 = 1 << 0;
-const MPC_OUT_MUX: u64 = 0x0580;
-const MPC_OUT_STRIDE: u64 = 4;
-const MPC_OUT_MUX_SEL: u32 = 0xf;
+const DIG_STRIDE: u64 = 0x100; // linux: mmDIG1_DIG_BE_CNTL - mmDIG0_DIG_BE_CNTL
+const DIG_BE_CNTL: u64 = 0x20b0; // linux: mmDIG0_DIG_BE_CNTL
+const DIG_BE_EN_CNTL: u64 = 0x20b1; // linux: mmDIG0_DIG_BE_EN_CNTL
+const DIG_ENABLE: u32 = 1 << 0; // linux: DIG0_DIG_BE_EN_CNTL__DIG_ENABLE_MASK
+const DIG_MODE: u32 = 0x0007_0000; // linux: DIG0_DIG_BE_CNTL__DIG_MODE_MASK
+const DIG_FE_SOURCE_SELECT: u32 = 0x7f00; // linux: DIG0_DIG_BE_CNTL__DIG_FE_SOURCE_SELECT_MASK
+const TMDS_CTL_BITS: u64 = 0x20de; // linux: mmDIG0_TMDS_CTL_BITS
+const TMDS_CTL0: u32 = 1 << 0; // linux: DIG0_TMDS_CTL_BITS__TMDS_CTL0_MASK
+const DP_VID_STREAM_CNTL: u64 = 0x210c; // linux: mmDP0_DP_VID_STREAM_CNTL
+                                        // DCN base index 3: MPCC instances stride 0x20, MPC_OUTn_MUX stride 4.
+                                        // linux-ctx: hdr=dcn seg=3
+const MPCC_TOP_SEL: u64 = 0x0000; // linux: mmMPCC0_MPCC_TOP_SEL
+const MPCC_BOT_SEL: u64 = 0x0001; // linux: mmMPCC0_MPCC_BOT_SEL
+const MPCC_OPP_ID: u64 = 0x0002; // linux: mmMPCC0_MPCC_OPP_ID
+const MPCC_UPDATE_LOCK_SEL: u64 = 0x0005; // linux: mmMPCC0_MPCC_UPDATE_LOCK_SEL
+const MPCC_STATUS: u64 = 0x000d; // linux: mmMPCC0_MPCC_STATUS
+const MPCC_STRIDE: u64 = 0x20; // linux: mmMPCC1_MPCC_TOP_SEL - mmMPCC0_MPCC_TOP_SEL
+const MPCC_IDLE: u32 = 1 << 0; // linux: MPCC0_MPCC_STATUS__MPCC_IDLE_MASK
+const MPC_OUT_MUX: u64 = 0x0580; // linux: mmMPC_OUT0_MUX
+const MPC_OUT_STRIDE: u64 = 4; // linux: mmMPC_OUT1_MUX - mmMPC_OUT0_MUX
+const MPC_OUT_MUX_SEL: u32 = 0xf; // linux: MPC_OUT0_MUX__MPC_OUT_MUX_MASK
+                                  // linux: MPC_OUT0_MUX__MPC_OUT_RATE_CONTROL_DISABLE_MASK
 const MPC_OUT_RATE_CONTROL_DISABLE: u32 = 1 << 8;
+// linux: MPC_OUT0_MUX__MPC_OUT_FLOW_CONTROL_COUNT_MASK
 const MPC_OUT_FLOW_CONTROL_COUNT: u32 = 0x007f_f800;
 /// The last dwords this module touches per bank, for the bounds.
-pub(crate) const LAST_DCN1: u32 = 0x003b;
+// linux-ctx: reset
+pub(crate) const LAST_DCN1: u32 = 0x003b; // linux: mmD6VGA_CONTROL
 pub(crate) const LAST_DCN2: u32 = (DSC_TOP_CONTROL + (DSCS as u64 - 1) * DSC_TOP_STRIDE) as u32;
+// linux: n/a (NARF bank bound)
 pub(crate) const LAST_DCN3: u32 = (MPC_OUT_MUX + 5 * MPC_OUT_STRIDE) as u32;
 
 struct Op<F>(F);
@@ -245,10 +262,13 @@ impl Takeover<'_> {
             .step_by(2)
             .chain(PLANE_DOMAINS.skip(1).step_by(2))
         {
+            // linux-lit: 2=mmDOMAIN1_PG_CONFIG - mmDOMAIN0_PG_CONFIG
             let reg = self.d2(DOMAIN0_PG_CONFIG + 2 * domain);
             self.regs.update(reg, DOMAIN_POWER_FORCEON, 0)?;
         }
+        // linux: n/a (DOMAIN16..21: dcn20_enable_power_gating_plane's six DSC domains)
         for dsc in 0..6 {
+            // linux-lit: 2=mmDOMAIN17_PG_CONFIG - mmDOMAIN16_PG_CONFIG
             let reg = self.d2(DSC_DOMAIN16_PG_CONFIG + 2 * dsc);
             self.regs.update(reg, DOMAIN_POWER_FORCEON, 0)?;
         }
@@ -312,6 +332,8 @@ impl Takeover<'_> {
         let h = self.regs.read(self.otg(OTG_H_BLANK_START_END, pipe))?;
         let v = self.regs.read(self.otg(OTG_V_BLANK_START_END, pipe))?;
         let mut width = (h & 0x7fff).saturating_sub((h >> 16) & 0x7fff);
+        // linux-lit: 0x7fff=OTG0_OTG_V_BLANK_START_END__OTG_V_BLANK_START_MASK
+        // linux-lit: 16=OTG0_OTG_V_BLANK_START_END__OTG_V_BLANK_END__SHIFT
         let height = (v & 0x7fff).saturating_sub((v >> 16) & 0x7fff);
         // ODM 2:1: each OPP generates half the active width.
         if bottom.is_some() {
@@ -320,7 +342,7 @@ impl Takeover<'_> {
         for target in core::iter::once(opp).chain(bottom) {
             self.regs.write(
                 self.d2(DPG_DIMENSIONS + u64::from(target) * DPG_STRIDE),
-                height | width << 16,
+                height | width << 16, // linux-lit: 16=DPG0_DPG_DIMENSIONS__DPG_ACTIVE_WIDTH__SHIFT
             )?;
             // SAFETY: the takeover holds the whole display engine.
             let mut owner = unsafe { Opp::new(self.gpu, self.regs.authority, target) }?;
@@ -335,6 +357,7 @@ impl Takeover<'_> {
     /// `mpc3_mpc_init_single_inst`.
     fn mpc_init(&mut self, mpcc: u8) -> Result<(), Error> {
         let base = u64::from(mpcc) * MPCC_STRIDE;
+        // linux-lit: 0xf=MPCC0_MPCC_OPP_ID__MPCC_OPP_ID_MASK
         let opp = self.regs.read(self.d3(MPCC_OPP_ID + base))? & 0xf;
         for reg in [
             MPCC_TOP_SEL,
@@ -342,10 +365,12 @@ impl Takeover<'_> {
             MPCC_OPP_ID,
             MPCC_UPDATE_LOCK_SEL,
         ] {
+            // linux: n/a (literal 0xf in:mpc1_mpc_init_single_inst)
             self.regs.write(self.d3(reg + base), 0xf)?;
         }
         if opp < u32::from(PIPES) {
             let mux = self.d3(MPC_OUT_MUX + u64::from(opp) * MPC_OUT_STRIDE);
+            // linux: n/a (literal 0xf in:mpc1_mpc_init_single_inst)
             self.regs.update(mux, MPC_OUT_MUX_SEL, 0xf)?;
         }
         let mux = self.d3(MPC_OUT_MUX + u64::from(mpcc) * MPC_OUT_STRIDE);
@@ -367,6 +392,9 @@ impl Takeover<'_> {
         self.regs
             .update(config, DOMAIN_POWER_GATE, DOMAIN_POWER_GATE)?;
         self.regs
+            // linux-lit: 4=(mmDOMAIN0_PG_STATUS - mmDOMAIN0_PG_CONFIG) * 4
+            // linux-lit: 30=DOMAIN0_PG_STATUS__DOMAIN0_PGFSM_PWR_STATUS__SHIFT
+            // linux: n/a (2 = PGFSM_POWER_OFF, literal in)
             .wait(config + 4, DOMAIN_PGFSM_PWR_STATUS, 2 << 30, 1, 1000)
             .await?;
         Ok(())
@@ -404,6 +432,7 @@ impl Takeover<'_> {
         self.regs.update(
             self.otg(OTG_DOUBLE_BUFFER_CONTROL, pipe),
             OTG_DRR_TIMING_DBUF_UPDATE_MODE,
+            // linux: n/a (mode 2, literal in:optc3_set_timing_double_buffer)
             2 << OTG_DRR_TIMING_DBUF_UPDATE_MODE.trailing_zeros(),
         )?;
         self.regs.update(
@@ -425,6 +454,9 @@ impl Takeover<'_> {
         self.regs
             .update(config, DOMAIN_POWER_GATE, DOMAIN_POWER_GATE)?;
         self.regs
+            // linux-lit: 4=(mmDOMAIN0_PG_STATUS - mmDOMAIN0_PG_CONFIG) * 4
+            // linux-lit: 30=DOMAIN0_PG_STATUS__DOMAIN0_PGFSM_PWR_STATUS__SHIFT
+            // linux: n/a (2 = PGFSM_POWER_OFF, literal in)
             .wait(config + 4, DOMAIN_PGFSM_PWR_STATUS, 2 << 30, 1, 1000)
             .await?;
         if original == 0 {
@@ -524,6 +556,7 @@ impl Takeover<'_> {
         if be & DIG_MODE != 0 {
             return Ok(());
         }
+        // linux-lit: 8=DIG0_DIG_BE_CNTL__DIG_FE_SOURCE_SELECT__SHIFT
         let sources = (be & DIG_FE_SOURCE_SELECT) >> 8;
         if sources == 0 {
             return Ok(());
@@ -597,6 +630,7 @@ impl Takeover<'_> {
                 return Err(Error::Busy);
             }
             let stream = self.d2(DP_VID_STREAM_CNTL + u64::from(i) * DIG_STRIDE);
+            // linux-lit: 1=DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_ENABLE_MASK
             if self.regs.read(stream)? & 1 != 0 {
                 return Err(Error::Busy);
             }

@@ -257,7 +257,7 @@ const STAGES: [Stage; 31] = [
     Stage::ReadTopology,
 ];
 /// INT_CONTEXT of the boot SDMA0 TRAP round trip.
-const TRAP_CONTEXT: u32 = 0x0675_0022;
+const TRAP_CONTEXT: u32 = 0x0675_0022; // linux: n/a (NARF-chosen TRAP INT_CONTEXT tag)
 /// Firmware/power observations, optional VMID0 and SDMA execution proof.
 /// This does not publish acceleration or initialize native display.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1645,7 +1645,7 @@ impl ColdBoot {
     pub fn reserve_client_vram(
         &mut self,
     ) -> Result<(crate::amdgpu_vram::Reservation, crate::amdgpu_gem::VramHeap), Error> {
-        const ALIGN: u64 = 2 << 20;
+        const ALIGN: u64 = 2 << 20; // linux: n/a (NARF policy, client heap alignment)
         let hw = &mut self.sequence.backend;
         let (fb_base, fb_offset) = hw
             .gmc

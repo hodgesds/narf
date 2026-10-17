@@ -39,68 +39,114 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 mod format;
 pub use format::Formatter;
 
+// linux-ctx: hdr=dcn seg=2
+// linux: mmDIG1_DIG_FE_CNTL - mmDIG0_DIG_FE_CNTL
 const STRIDE: u64 = 0x100;
 // VPG instance (per stream frontend).
+// linux: mmVPG0_VPG_GENERIC_PACKET_ACCESS_CTRL
 const VPG_GENERIC_PACKET_ACCESS_CTRL: u64 = 0x2068;
+// linux: mmVPG0_VPG_GENERIC_PACKET_DATA
 const VPG_GENERIC_PACKET_DATA: u64 = 0x2069;
+// linux: mmVPG0_VPG_GSP_IMMEDIATE_UPDATE_CTRL
 const VPG_GSP_IMMEDIATE_UPDATE_CTRL: u64 = 0x206b;
+// linux: mmVPG0_VPG_GENERIC_STATUS
 const VPG_GENERIC_STATUS: u64 = 0x206c;
 // DIG frontend.
+// linux: mmDIG0_DIG_FE_CNTL
 const DIG_FE_CNTL: u64 = 0x208b;
+// linux: mmDIG0_HDMI_CONTROL
 const HDMI_CONTROL: u64 = 0x2093;
+// linux: mmDIG0_HDMI_VBI_PACKET_CONTROL
 const HDMI_VBI_PACKET_CONTROL: u64 = 0x2097;
+// linux: mmDIG0_HDMI_GENERIC_PACKET_CONTROL0
 const HDMI_GENERIC_PACKET_CONTROL0: u64 = 0x209a;
+// linux: mmDIG0_HDMI_GC
 const HDMI_GC: u64 = 0x209d;
 /// `HDMI_GENERIC_PACKET_CONTROL1..4`: GENERIC0/1, 2/3, 4/5 and 6/7 lines.
+// linux: mmDIG0_HDMI_GENERIC_PACKET_CONTROL1; mmDIG0_HDMI_GENERIC_PACKET_CONTROL2; mmDIG0_HDMI_GENERIC_PACKET_CONTROL3; mmDIG0_HDMI_GENERIC_PACKET_CONTROL4
 const HDMI_GENERIC_PACKET_LINES: [u64; 4] = [0x209e, 0x209f, 0x20a0, 0x20a1];
+// linux: mmDIG0_HDMI_DB_CONTROL
 const HDMI_DB_CONTROL: u64 = 0x20a6;
+// linux: mmDIG0_AFMT_CNTL
 const AFMT_CNTL: u64 = 0x20af;
 // DIG backend.
-const DIG_BE_CNTL: u64 = 0x20b0;
-const DIG_BE_EN_CNTL: u64 = 0x20b1;
-const LAST_REG: u32 = (DIG_BE_EN_CNTL + 5 * STRIDE) as u32;
+const DIG_BE_CNTL: u64 = 0x20b0; // linux: mmDIG0_DIG_BE_CNTL
+const DIG_BE_EN_CNTL: u64 = 0x20b1; // linux: mmDIG0_DIG_BE_EN_CNTL
+const LAST_REG: u32 = (DIG_BE_EN_CNTL + 5 * STRIDE) as u32; // linux: mmDIG5_DIG_BE_EN_CNTL
 
+// linux-ctx: reset
+// linux: DIG0_DIG_FE_CNTL__DIG_SOURCE_SELECT_MASK
 const DIG_SOURCE_SELECT: u32 = 0x7;
+// linux: DIG0_DIG_FE_CNTL__DIG_STEREOSYNC_SELECT_MASK
 const DIG_STEREOSYNC_SELECT: u32 = 0x70;
+// linux: DIG0_DIG_FE_CNTL__DIG_STEREOSYNC_GATE_EN_MASK
 const DIG_STEREOSYNC_GATE_EN: u32 = 1 << 8;
+// linux: DIG0_DIG_FE_CNTL__TMDS_PIXEL_ENCODING_MASK
 const TMDS_PIXEL_ENCODING: u32 = 1 << 28;
+// linux: DIG0_DIG_FE_CNTL__TMDS_COLOR_FORMAT_MASK
 const TMDS_COLOR_FORMAT: u32 = 0xc000_0000;
+// linux: DIG0_HDMI_CONTROL__HDMI_KEEPOUT_MODE_MASK
 const HDMI_KEEPOUT_MODE: u32 = 1 << 0;
+// linux: DIG0_HDMI_CONTROL__HDMI_DATA_SCRAMBLE_EN_MASK
 const HDMI_DATA_SCRAMBLE_EN: u32 = 1 << 1;
+// linux: DIG0_HDMI_CONTROL__HDMI_CLOCK_CHANNEL_RATE_MASK
 const HDMI_CLOCK_CHANNEL_RATE: u32 = 1 << 2;
+// linux: DIG0_HDMI_CONTROL__HDMI_NO_EXTRA_NULL_PACKET_FILLED_MASK
 const HDMI_NO_EXTRA_NULL_PACKET_FILLED: u32 = 1 << 3;
+// linux: DIG0_HDMI_CONTROL__HDMI_PACKET_GEN_VERSION_MASK
 const HDMI_PACKET_GEN_VERSION: u32 = 1 << 4;
+// linux: DIG0_HDMI_CONTROL__HDMI_DEEP_COLOR_ENABLE_MASK
 const HDMI_DEEP_COLOR_ENABLE: u32 = 1 << 24;
+// linux: DIG0_HDMI_CONTROL__HDMI_DEEP_COLOR_DEPTH_MASK
 const HDMI_DEEP_COLOR_DEPTH: u32 = 0x3000_0000;
+// linux: DIG0_HDMI_VBI_PACKET_CONTROL__HDMI_NULL_SEND_MASK
 const HDMI_NULL_SEND: u32 = 1 << 0;
+// linux: DIG0_HDMI_VBI_PACKET_CONTROL__HDMI_GC_SEND_MASK
 const HDMI_GC_SEND: u32 = 1 << 4;
+// linux: DIG0_HDMI_VBI_PACKET_CONTROL__HDMI_GC_CONT_MASK
 const HDMI_GC_CONT: u32 = 1 << 5;
+// linux: DIG0_HDMI_VBI_PACKET_CONTROL__HDMI_ACP_SEND_MASK
 const HDMI_ACP_SEND: u32 = 1 << 12;
+// linux: DIG0_HDMI_GC__HDMI_GC_AVMUTE_MASK
 const HDMI_GC_AVMUTE: u32 = 1 << 0;
+// linux: DIG0_HDMI_DB_CONTROL__HDMI_DB_DISABLE_MASK
 const HDMI_DB_DISABLE: u32 = 1 << 12;
+// linux: DIG0_AFMT_CNTL__AFMT_AUDIO_CLOCK_EN_MASK
 const AFMT_AUDIO_CLOCK_EN: u32 = 1 << 0;
+// linux: VPG0_VPG_GENERIC_STATUS__VPG_GENERIC_CONFLICT_OCCURED_MASK
 const VPG_GENERIC_CONFLICT_OCCURED: u32 = 1 << 1;
+// linux: VPG0_VPG_GENERIC_STATUS__VPG_GENERIC_CONFLICT_CLR_MASK
 const VPG_GENERIC_CONFLICT_CLR: u32 = 1 << 4;
+// linux: VPG0_VPG_GENERIC_PACKET_ACCESS_CTRL__VPG_GENERIC_DATA_INDEX_MASK
 const VPG_GENERIC_DATA_INDEX: u32 = 0xff;
+// linux: DIG0_DIG_BE_CNTL__DIG_FE_SOURCE_SELECT_MASK
 const DIG_FE_SOURCE_SELECT: u32 = 0x7f00;
+// linux: DIG0_DIG_BE_CNTL__DIG_MODE_MASK
 const DIG_MODE: u32 = 0x0007_0000;
+// linux: DIG0_DIG_BE_EN_CNTL__DIG_ENABLE_MASK
 const DIG_ENABLE: u32 = 1 << 0;
 /// `enc3_update_hdmi_info_packet` sends on line 2.
+// linux: n/a (literal `line = 2` in dcn30_dio_stream_encoder.c:enc3_update_hdmi_info_packet)
 const INFO_PACKET_LINE: u32 = 2;
 /// The highest TMDS character rate without scrambling
 /// (`HDMI_CLOCK_CHANNEL_RATE_MORE_340M`).
+// linux: n/a (HDMI_CLOCK_CHANNEL_RATE_MORE_340M, local #define in dcn30_dio_stream_encoder.c)
 pub const TMDS_SCRAMBLE_KHZ: u32 = 340_000;
 /// DCN3.0 `link_enc_feature.max_hdmi_pixel_clock`.
+// linux: n/a (max_hdmi_pixel_clock = 600000, literal in dcn30_resource.c:link_enc_feature)
 pub const TMDS_MAX_KHZ: u32 = 600_000;
 /// `TMDS_MIN_PIXEL_CLOCK`.
-pub const TMDS_MIN_KHZ: u32 = 25_000;
+pub const TMDS_MIN_KHZ: u32 = 25_000; // linux: TMDS_MIN_PIXEL_CLOCK
 /// Without HDMI_6GB_EN `dcn10_link_encoder_validate_hdmi_output` refuses a
 /// character clock of 300 MHz and up.
+// linux: n/a (adjusted_pix_clk_100hz >= 3000000, literal in dcn10_link_encoder.c:dcn10_link_encoder_validate_hdmi_output)
 pub const TMDS_NO_6G_KHZ: u32 = 300_000;
 /// `enc3_stream_encoder_update_hdmi_info_packets`' packets in its order:
 /// AVI (0), HF-VSIF (5), gamut (2), vendor (1), SPD (3), HDR (4), VTEM (6).
 const PACKET_ORDER: [u32; 7] = [0, 5, 2, 1, 3, 4, 6];
+// linux: n/a (packet_index 0, literal in dcn30_dio_stream_encoder.c:enc3_stream_encoder_update_hdmi_info_packets)
 const PACKET_AVI: u32 = 0;
+// linux: n/a (packet_index 1, literal in dcn30_dio_stream_encoder.c:enc3_stream_encoder_update_hdmi_info_packets)
 const PACKET_VENDOR: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,15 +169,16 @@ pub enum Error {
 /// HDMI 2.0 SCDC registers (`dc_hdmi_types.h`).
 pub mod scdc {
     /// The sink's 7-bit I2C address.
+    // linux: n/a (HDMI_SCDC_ADDRESS in dc_hdmi_types.h, not in the checker's sets)
     pub const ADDRESS: u8 = 0x54;
-    pub const SINK_VERSION: u8 = 0x01;
-    pub const SOURCE_VERSION: u8 = 0x02;
-    pub const TMDS_CONFIG: u8 = 0x20;
-    pub const SCRAMBLER_STATUS: u8 = 0x21;
-    pub const STATUS_FLAGS: u8 = 0x40;
+    pub const SINK_VERSION: u8 = 0x01; // linux: SCDC_SINK_VERSION
+    pub const SOURCE_VERSION: u8 = 0x02; // linux: SCDC_SOURCE_VERSION
+    pub const TMDS_CONFIG: u8 = 0x20; // linux: SCDC_TMDS_CONFIG
+    pub const SCRAMBLER_STATUS: u8 = 0x21; // linux: SCDC_SCRAMBLER_STATUS
+    pub const STATUS_FLAGS: u8 = 0x40; // linux: SCDC_STATUS_FLAGS_0
     /// TMDS_Config: Scrambling_Enable and TMDS_Bit_Clock_Ratio (1/40).
-    pub const SCRAMBLING_ENABLE: u8 = 1 << 0;
-    pub const BIT_CLOCK_RATIO_40: u8 = 1 << 1;
+    pub const SCRAMBLING_ENABLE: u8 = 1 << 0; // linux: SCDC_SCRAMBLING_ENABLE
+    pub const BIT_CLOCK_RATIO_40: u8 = 1 << 1; // linux: SCDC_TMDS_BIT_CLOCK_RATIO_BY_40
 }
 
 /// Bits per component on an HDMI stream (`display_color_depth`).
@@ -269,6 +316,7 @@ fn low_rate_scrambling(edid: &[u8]) -> bool {
                         v.payload.get(3..)
                     }
                     DataBlock::Extended {
+                        // linux: n/a (CTA_EXT_DB_HF_SCDB, local #define in drm_edid.c)
                         ext_tag: 0x79,
                         payload,
                     } if payload.len() >= 6 => payload.get(2..),
@@ -547,6 +595,7 @@ impl<I: Io> Engine<I> {
     }
     /// `enc1_dig_connect_to_otg`: the frontend takes its pixels from `otg`.
     pub(crate) fn connect_to_otg(&mut self, otg: u8) -> Result<(), Error> {
+        // linux: n/a (NARF bound: DCN30 has six OTGs)
         if otg >= 6 {
             return Err(Error::Invalid);
         }
@@ -554,23 +603,27 @@ impl<I: Io> Engine<I> {
     }
     /// `enc1_setup_stereo_sync(otg, false)`: stereo sync from `otg`, gated.
     pub(crate) fn setup_stereo_sync(&mut self, otg: u8) -> Result<(), Error> {
+        // linux: n/a (NARF bound: DCN30 has six OTGs)
         if otg >= 6 {
             return Err(Error::Invalid);
         }
         self.update(
             self.fe(DIG_FE_CNTL),
             DIG_STEREOSYNC_SELECT | DIG_STEREOSYNC_GATE_EN,
+            // linux-lit: 4=DIG0_DIG_FE_CNTL__DIG_STEREOSYNC_SELECT__SHIFT
             u32::from(otg) << 4 | DIG_STEREOSYNC_GATE_EN,
         )
     }
     /// `dcn10_link_encoder_setup`: the backend's DIG_MODE for the signal.
     pub(crate) fn setup(&mut self, mode: DigMode) -> Result<(), Error> {
+        // linux-lit: 16=DIG0_DIG_BE_CNTL__DIG_MODE__SHIFT
         self.update(self.be(DIG_BE_CNTL), DIG_MODE, (mode as u32) << 16)
     }
     /// `dcn10_link_encoder_connect_dig_be_to_fe`: add or drop this frontend
     /// in the backend's one-hot source mask, keeping any other frontend.
     pub(crate) fn connect_be_to_fe(&mut self, connect: bool) -> Result<(), Error> {
         let be = self.read(self.be(DIG_BE_CNTL))?;
+        // linux-lit: 8=DIG0_DIG_BE_CNTL__DIG_FE_SOURCE_SELECT__SHIFT
         let source = 1 << (8 + u32::from(self.dig));
         let field = if connect {
             (be & DIG_FE_SOURCE_SELECT) | source
@@ -656,11 +709,13 @@ impl<I: Io> Engine<I> {
     async fn vpg_packet(&mut self, index: u32, packet: &[u8; 36]) -> Result<(), Error> {
         let status = self.fe(VPG_GENERIC_STATUS);
         let mut clear = false;
+        // linux: n/a (max_retries = 50, literal in dcn30_vpg.c:vpg3_update_generic_info_packet)
         for _ in 0..50 {
             if self.read(status)? & VPG_GENERIC_CONFLICT_OCCURED == 0 {
                 clear = true;
                 break;
             }
+            // linux: n/a (REG_WAIT delay 10 us, literal in dcn30_vpg.c:vpg3_update_generic_info_packet)
             sleep_us(10).await;
         }
         // Linux's REG_WAIT only logs the timeout, then clears the conflict
@@ -677,6 +732,7 @@ impl<I: Io> Engine<I> {
         self.update(
             self.fe(VPG_GENERIC_PACKET_ACCESS_CTRL),
             VPG_GENERIC_DATA_INDEX,
+            // linux: n/a (packet_index*9, literal in dcn30_vpg.c:vpg3_update_generic_info_packet)
             index * 9,
         )?;
         // HB0..HB3, then the first 32 SB bytes; the last four are never used.
@@ -694,6 +750,7 @@ impl<I: Io> Engine<I> {
     }
     /// `HDMI_GENERIC_PACKET_CONTROL0` CONT/SEND and the packet's line field.
     fn packet_control(&mut self, index: u32, send: bool) -> Result<(), Error> {
+        // linux-lit: 0x3=DIG0_HDMI_GENERIC_PACKET_CONTROL0__HDMI_GENERIC0_SEND_MASK | DIG0_HDMI_GENERIC_PACKET_CONTROL0__HDMI_GENERIC0_CONT_MASK; 4=DIG0_HDMI_GENERIC_PACKET_CONTROL0__HDMI_GENERIC1_SEND__SHIFT
         let bits = 0x3 << (4 * index);
         self.update(
             self.fe(HDMI_GENERIC_PACKET_CONTROL0),
@@ -701,9 +758,11 @@ impl<I: Io> Engine<I> {
             if send { bits } else { 0 },
         )?;
         let reg = HDMI_GENERIC_PACKET_LINES[(index / 2) as usize];
+        // linux-lit: 16=DIG0_HDMI_GENERIC_PACKET_CONTROL1__HDMI_GENERIC1_LINE__SHIFT
         let shift = 16 * (index % 2);
         self.update(
             self.fe(reg),
+            // linux-lit: 0xffff=DIG0_HDMI_GENERIC_PACKET_CONTROL1__HDMI_GENERIC0_LINE_MASK
             0xffff << shift,
             if send { INFO_PACKET_LINE << shift } else { 0 },
         )
@@ -753,9 +812,10 @@ impl<I: Io> Engine<I> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DigMode {
     /// `SIGNAL_TYPE_DISPLAY_PORT` (SST).
+    // linux: n/a (DIG_MODE 0, literal in dcn10_link_encoder.c:dcn10_link_encoder_setup)
     DisplayPort = 0,
     /// `SIGNAL_TYPE_HDMI_TYPE_A`.
-    Hdmi = 3,
+    Hdmi = 3, // linux: n/a (DIG_MODE 3, literal in dcn10_link_encoder.c:dcn10_link_encoder_setup)
 }
 
 /// One HDMI stream frontend `dig` routed to physical transmitter `transmitter`.
@@ -775,11 +835,12 @@ impl Hdmi {
         if Profile::resolve(gpu).map_err(|_| Error::Unsupported)? != Profile::Navi22 {
             return Err(Error::Unsupported);
         }
+        // linux: n/a (NARF bound: six DIG frontends/backends)
         if dig >= 6 || transmitter >= 6 {
             return Err(Error::Invalid);
         }
         let base = Profile::Navi22
-            .bank(gpu, 2, LAST_REG)
+            .bank(gpu, 2, LAST_REG) // linux-lit: 2=mmDIG0_DIG_FE_CNTL_BASE_IDX
             .map_err(|_| Error::Unsupported)?;
         Ok(Self(Engine::new_with(
             Mmio {

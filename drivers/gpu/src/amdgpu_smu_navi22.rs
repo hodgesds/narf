@@ -12,32 +12,38 @@ use alloc::vec::Vec;
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Read, Write};
 
+// linux-ctx: hdr=mp seg=0
+// linux: mmMP1_SMN_C2PMSG_66
 const MESSAGE: u32 = 0x282;
+// linux: mmMP1_SMN_C2PMSG_82
 const ARGUMENT: u32 = 0x292;
+// linux: mmMP1_SMN_C2PMSG_90
 const RESPONSE: u32 = 0x29a;
+// linux-ctx: reset
+// linux: PPSMC_MSG_GetSmuVersion
 const GET_VERSION: u32 = 2;
-const GET_INTERFACE: u32 = 3;
-const SET_DRIVER_HIGH: u32 = 0xe;
-const SET_DRIVER_LOW: u32 = 0xf;
-const TRANSFER_TABLE: u32 = 0x13;
-const RUN_DC_BTC: u32 = 0x36;
-const ALLOWED_HIGH: u32 = 5;
-const ALLOWED_LOW: u32 = 4;
-const ENABLE_FEATURES: u32 = 6;
-const RUNNING_LOW: u32 = 0xc;
-const RUNNING_HIGH: u32 = 0xd;
-const MIN_DPM_FREQ: u32 = 0x1d;
-const MAX_DPM_FREQ: u32 = 0x1e;
-const TRANSFER_TO_DRIVER: u32 = 0x12;
-const GET_PPT_LIMIT: u32 = 0x33;
-const REENABLE_ACDC_INTERRUPT: u32 = 0x34;
-// smu_v11_0_7_ppsmc.h runtime feature and GFXOFF messages.
-const ENABLE_FEATURES_LOW: u32 = 0x8;
-const ENABLE_FEATURES_HIGH: u32 = 0x9;
-const DISABLE_FEATURES_LOW: u32 = 0xa;
-const DISABLE_FEATURES_HIGH: u32 = 0xb;
-const ALLOW_GFXOFF: u32 = 0x28;
-const DISALLOW_GFXOFF: u32 = 0x29;
+const GET_INTERFACE: u32 = 3; // linux: PPSMC_MSG_GetDriverIfVersion
+const SET_DRIVER_HIGH: u32 = 0xe; // linux: PPSMC_MSG_SetDriverDramAddrHigh
+const SET_DRIVER_LOW: u32 = 0xf; // linux: PPSMC_MSG_SetDriverDramAddrLow
+const TRANSFER_TABLE: u32 = 0x13; // linux: PPSMC_MSG_TransferTableDram2Smu
+const RUN_DC_BTC: u32 = 0x36; // linux: PPSMC_MSG_RunDcBtc
+const ALLOWED_HIGH: u32 = 5; // linux: PPSMC_MSG_SetAllowedFeaturesMaskHigh
+const ALLOWED_LOW: u32 = 4; // linux: PPSMC_MSG_SetAllowedFeaturesMaskLow
+const ENABLE_FEATURES: u32 = 6; // linux: PPSMC_MSG_EnableAllSmuFeatures
+const RUNNING_LOW: u32 = 0xc; // linux: PPSMC_MSG_GetRunningSmuFeaturesLow
+const RUNNING_HIGH: u32 = 0xd; // linux: PPSMC_MSG_GetRunningSmuFeaturesHigh
+const MIN_DPM_FREQ: u32 = 0x1d; // linux: PPSMC_MSG_GetMinDpmFreq
+const MAX_DPM_FREQ: u32 = 0x1e; // linux: PPSMC_MSG_GetMaxDpmFreq
+const TRANSFER_TO_DRIVER: u32 = 0x12; // linux: PPSMC_MSG_TransferTableSmu2Dram
+const GET_PPT_LIMIT: u32 = 0x33; // linux: PPSMC_MSG_GetPptLimit
+const REENABLE_ACDC_INTERRUPT: u32 = 0x34; // linux: PPSMC_MSG_ReenableAcDcInterrupt
+                                           // smu_v11_0_7_ppsmc.h runtime feature and GFXOFF messages.
+const ENABLE_FEATURES_LOW: u32 = 0x8; // linux: PPSMC_MSG_EnableSmuFeaturesLow
+const ENABLE_FEATURES_HIGH: u32 = 0x9; // linux: PPSMC_MSG_EnableSmuFeaturesHigh
+const DISABLE_FEATURES_LOW: u32 = 0xa; // linux: PPSMC_MSG_DisableSmuFeaturesLow
+const DISABLE_FEATURES_HIGH: u32 = 0xb; // linux: PPSMC_MSG_DisableSmuFeaturesHigh
+const ALLOW_GFXOFF: u32 = 0x28; // linux: PPSMC_MSG_AllowGfxOff
+const DISALLOW_GFXOFF: u32 = 0x29; // linux: PPSMC_MSG_DisallowGfxOff
 /// The only feature bits the opt-in power-saving path may switch at runtime
 /// (amdgpu_navi22_power_policy): UCLK/FCLK DPM with memory rail scaling,
 /// DS_* and GFX ULV, GFXOFF and MMHUB/ATHUB PG. Never a protection bit.
@@ -51,46 +57,80 @@ pub(crate) const GATING_FEATURES: u64 = {
         | p::SMU_GFXOFF
         | p::SMU_HUB_PG
 };
-pub const DRIVER_INTERFACE: u32 = 0x0e;
+pub const DRIVER_INTERFACE: u32 = 0x0e; // linux: SMU11_DRIVER_IF_VERSION_Navy_Flounder
 /// smu_v11_0.h: `MP1_Public | (smnMP1_FIRMWARE_FLAGS & 0xffffffff)`, read
 /// through the NBIO PCIe index/data pair (nbio_v2_3 PCIE_INDEX2/PCIE_DATA2,
 /// BASE_IDX 0, 0xe/0xf).
+// linux: MP1_Public@ppsmc | (smnMP1_FIRMWARE_FLAGS@ppsmc & 0xffffffff)
 const MP1_FIRMWARE_FLAGS: u32 = 0x03b0_0000 | 0x0301_0024;
+// linux: MP1_FIRMWARE_FLAGS__INTERRUPTS_ENABLED_MASK
 const FIRMWARE_FLAGS_INTERRUPTS_ENABLED: u32 = 1 << 0;
+// linux-ctx: hdr=nbio seg=0
+// linux: mmPCIE_INDEX2
 const PCIE_INDEX2: u32 = 0xe;
+// linux: mmPCIE_DATA2
 const PCIE_DATA2: u32 = 0xf;
 /// smu_cmn: `default_timeout = adev->usec_timeout * 20` polls of udelay(1),
 /// i.e. at least 2 s per message.
+// linux-ctx: reset
+// linux: n/a (NARF bound for smu_cmn's usec_timeout * 20 polls)
 const MESSAGE_TIMEOUT_MS: u64 = 2000;
 /// Bound on PMFW raising MP1_FIRMWARE_FLAGS.INTERRUPTS_ENABLED after PSP's
 /// LOAD_IP_FW. Linux checks it once in smu_start_smc_engine, much later in
 /// hw_init; NARF asks right after the upload, so it polls (bounded).
+// linux: n/a (NARF bound)
 const FIRMWARE_READY_TIMEOUT_MS: u64 = 1000;
 // mp_11_0_offset.h, MP1 base index 0: MP1_SMN_IH_SW_INT{,_CTRL}.
+// linux-ctx: hdr=mp seg=0
+// linux: mmMP1_SMN_IH_SW_INT
 pub(crate) const MP1_SW_INT: u32 = 0x2c2;
+// linux: mmMP1_SMN_IH_SW_INT_CTRL
 pub(crate) const MP1_SW_INT_CTRL: u32 = 0x2c3;
+// linux-ctx: reset
+// linux: n/a (literal ID 0xFE in smu_v11_0.c:smu_v11_0_set_irq_state)
 const SW_INT_ID_TO_DRIVER: u32 = 0xfe;
+// linux: MP1_SMN_IH_SW_INT__VALID_MASK
 const SW_INT_VALID: u32 = 1 << 8;
+// linux: MP1_SMN_IH_SW_INT_CTRL__INT_MASK_MASK
 const SW_INT_CTRL_MASK: u32 = 1 << 0;
+// linux: MP1_SMN_IH_SW_INT_CTRL__INT_ACK_MASK
 const SW_INT_CTRL_ACK: u32 = 1 << 8;
 // thm_11_0_2_offset.h, THM base index 0.
+// linux-ctx: hdr=thm seg=0
+// linux: mmTHM_THERMAL_INT_ENA
 pub(crate) const THM_INT_ENA: u32 = 0x0a;
+// linux: mmTHM_THERMAL_INT_CTRL
 pub(crate) const THM_INT_CTRL: u32 = 0x0b;
+// linux: mmCG_FDO_CTRL1
 pub(crate) const CG_FDO_CTRL1: u32 = 0x68;
+// linux: mmCG_THERMAL_STATUS
 pub(crate) const CG_THERMAL_STATUS: u32 = 0x6c;
 // THM_THERMAL_INT_CTRL / _ENA fields (thm_11_0_2_sh_mask.h).
+// linux-ctx: reset
+// linux: THM_THERMAL_INT_CTRL__DIG_THERM_INTH_MASK
 const INT_CTRL_INTH: u32 = 0xff;
+// linux: THM_THERMAL_INT_CTRL__DIG_THERM_INTL_MASK
 const INT_CTRL_INTL: u32 = 0xff << 8;
+// linux: THM_THERMAL_INT_CTRL__THERM_INTH_MASK_MASK
 const INT_CTRL_INTH_MASK: u32 = 1 << 24;
+// linux: THM_THERMAL_INT_CTRL__THERM_INTL_MASK_MASK
 const INT_CTRL_INTL_MASK: u32 = 1 << 25;
+// linux: THM_THERMAL_INT_CTRL__THERM_TRIGGER_MASK_MASK
 const INT_CTRL_TRIGGER_MASK: u32 = 1 << 26;
+// linux: THM_THERMAL_INT_CTRL__THERM_IH_HW_ENA_MASK
 const INT_CTRL_IH_HW_ENA: u32 = 1 << 28;
+// linux: THM_THERMAL_INT_CTRL__MAX_IH_CREDIT_MASK
 const INT_CTRL_MAX_IH_CREDIT: u32 = 7 << 29;
+// linux: THM_THERMAL_INT_ENA__THERM_INTH_CLR_MASK | THM_THERMAL_INT_ENA__THERM_INTL_CLR_MASK | THM_THERMAL_INT_ENA__THERM_TRIGGER_CLR_MASK
 const INT_ENA_CLEAR: u32 = (1 << 3) | (1 << 4) | (1 << 5);
 // smuio_11_0_0_offset.h, SMUIO base index 0: SMUSVI0_TEL_PLANE0.
+// linux-ctx: hdr=smuio0 seg=0
+// linux: mmSMUSVI0_TEL_PLANE0
 pub(crate) const SVI0_TEL_PLANE0: u32 = 0x04;
 /// Protection features whose loss after boot is reported: PPT, TDC,
 /// VR0HOT, FW_CTF, FAN_CONTROL and THERMAL.
+// linux-ctx: reset
+// linux: (1ULL << FEATURE_PPT_BIT) | (1ULL << FEATURE_TDC_BIT) | (1ULL << FEATURE_VR0HOT_BIT) | (1ULL << FEATURE_FW_CTF_BIT) | (1ULL << FEATURE_FAN_CONTROL_BIT) | (1ULL << FEATURE_THERMAL_BIT)
 const PROTECTION: u64 = (1 << 24) | (1 << 25) | (1 << 29) | (1 << 31) | (1 << 32) | (1 << 33);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -267,14 +307,17 @@ impl Mmio {
         // PSP ring startup already installed this exact HDP flush remapping.
         // Refuse a changed mapping instead of racing another HDP owner.
         // SAFETY: nbio and remap hole were bounded at construction.
+        // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
+        // linux: n/a (0x7f000 = MMIO_REG_HOLE_OFFSET, nbio_v2_3.c, 4 KiB pages)
         if unsafe { self.regs.read32(nbio + 0x12d * 4) } != 0x7f000 {
             return Err(Error::Invalid);
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         // SAFETY: verified remap; MEMSIZE read drains the posted flush write.
         unsafe {
+            // linux: n/a (MMIO_REG_HOLE_OFFSET + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL, amdgpu_hdp_generic_flush)
             self.regs.write32(0x7f000, 0);
-            self.regs.read32(nbio + 0xc3 * 4);
+            self.regs.read32(nbio + 0xc3 * 4); // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -328,6 +371,7 @@ impl Io for Mmio {
         if out.len() as u64 > memory.size() || out.len() % 4 != 0 {
             return Err(Error::Invalid);
         }
+        // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
         let hdp = Self::bank(self.hdp, 0xd1, 0xd1)?;
         // SAFETY: HDP_READ_CACHE_INVALIDATE, bounded at construction.
         unsafe {
@@ -376,6 +420,7 @@ impl Io for Mmio {
         bytes: &[u8],
     ) -> Result<u32, Error> {
         let nbio = self.nbio.ok_or(Error::Unsupported)?;
+        // linux: n/a (1 << 20 = PSP_RUNTIME_DB_OFFSET below mc_vram_size, amdgpu_psp.c:psp_get_runtime_db_entry)
         let base = self.vram_size.checked_sub(1 << 20).ok_or(Error::Invalid)?;
         // SAFETY: exclusive GPU/index-latch ownership inherited from the SMU
         // constructor and uploader; this entire method runs in Cap::invoke.
@@ -388,6 +433,8 @@ impl Io for Mmio {
         // PSP ring startup already installed this exact HDP flush remapping.
         // Refuse a changed mapping instead of racing another HDP owner.
         // SAFETY: nbio and remap hole were bounded at construction.
+        // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
+        // linux: n/a (0x7f000 = MMIO_REG_HOLE_OFFSET, nbio_v2_3.c, 4 KiB pages)
         if unsafe { self.regs.read32(nbio + 0x12d * 4) } != 0x7f000 {
             return Err(Error::Invalid);
         }
@@ -405,8 +452,9 @@ impl Io for Mmio {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         // SAFETY: verified remap; MEMSIZE read drains the posted flush write.
         unsafe {
+            // linux: n/a (MMIO_REG_HOLE_OFFSET + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL, amdgpu_hdp_generic_flush)
             self.regs.write32(0x7f000, 0);
-            self.regs.read32(nbio + 0xc3 * 4);
+            self.regs.read32(nbio + 0xc3 * 4); // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(scpm)
@@ -479,7 +527,7 @@ impl<I: Io> Engine<I> {
             let response = self.access(|io| io.read(RESPONSE))?;
             match response {
                 u32::MAX => return Err(Error::DeviceGone),
-                1 => return self.access(|io| io.read(ARGUMENT)),
+                1 => return self.access(|io| io.read(ARGUMENT)), // linux-lit: 1=PPSMC_Result_OK
                 0 => {}
                 status => return Err(Error::Rejected(status)),
             }
@@ -560,6 +608,7 @@ impl<I: Io> Engine<I> {
         self.state = State::UploadingPowerTable;
         let result = async {
             let scpm = self.access(|io| io.stage_power(&memory, bytes))??;
+            // linux-lit: 0=SCPM_DISABLE
             if scpm != 0 {
                 use core::fmt::Write;
                 let _ = writeln!(
@@ -579,7 +628,7 @@ impl<I: Io> Engine<I> {
             // PPTable transferring"; otherwise TABLE_PPTABLE == 0 (the upper
             // 16-bit table argument also zero).
             if !self.scpm {
-                self.command(TRANSFER_TABLE, 0).await?;
+                self.command(TRANSFER_TABLE, 0).await?; // linux-lit: 0=TABLE_PPTABLE
             }
             Ok(())
         }
@@ -618,8 +667,8 @@ impl<I: Io> Engine<I> {
             }
             // PPCLK_GFXCLK == 0 in the upper 16 bits. Read only: leave the
             // board's frequency/voltage limits intact and use automatic DPM.
-            let min = self.command(MIN_DPM_FREQ, 0).await?;
-            let max = self.command(MAX_DPM_FREQ, 0).await?;
+            let min = self.command(MIN_DPM_FREQ, 0).await?; // linux-lit: 0=PPCLK_GFXCLK
+            let max = self.command(MAX_DPM_FREQ, 0).await?; // linux-lit: 0=PPCLK_GFXCLK
             if min == 0 || min > max || max > u32::from(u16::MAX) {
                 return Err(Error::Invalid);
             }
@@ -740,15 +789,17 @@ impl<I: Io> Engine<I> {
                             | INT_CTRL_INTL_MASK
                             | INT_CTRL_TRIGGER_MASK
                             | INT_CTRL_MAX_IH_CREDIT))
-                        | 5 << 29
+                        | 5 << 29 // linux-lit: 29=THM_THERMAL_INT_CTRL__MAX_IH_CREDIT__SHIFT
                         | INT_CTRL_IH_HW_ENA
                         | u32::from(high)
+                        // linux-lit: 8=THM_THERMAL_INT_CTRL__DIG_THERM_INTL__SHIFT
                         | u32::from(low) << 8;
                     io.set_thm(THM_INT_CTRL, ctrl)?;
                     io.set_thm(THM_INT_ENA, INT_ENA_CLEAR)?;
                     let sw = io.read(MP1_SW_INT);
                     io.write(
                         MP1_SW_INT,
+                        // linux-lit: 0xff=MP1_SMN_IH_SW_INT__ID_MASK
                         (sw & !(0xff | SW_INT_VALID)) | SW_INT_ID_TO_DRIVER,
                     );
                     let ctrl = io.read(MP1_SW_INT_CTRL);
@@ -961,13 +1012,14 @@ impl Smu {
                     hdp: optional(
                         discovery::HW_ID_HDP,
                         &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
-                        0xd1,
+                        0xd1, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
                     ),
                     thm: optional(discovery::HW_ID_THM, &[(11, 0, 5)], CG_THERMAL_STATUS),
                     smuio: optional(discovery::HW_ID_SMUIO, &[(11, 0, 6)], SVI0_TEL_PLANE0),
                     pcie: optional(discovery::HW_ID_NBIF, &nbio_versions, PCIE_DATA2),
                     vram: gpu.fb_bar,
                     vram_size: gpu.vram.size,
+                    // linux: n/a (MMIO_REG_HOLE_OFFSET + 4, end of the remapped flush register)
                     nbio: if gpu.regs.len >= 0x7f004 {
                         crate::amdgpu_psp_ring::bank(
                             gpu,
@@ -981,8 +1033,8 @@ impl Smu {
                                 (3, 3, 2),
                                 (3, 3, 3),
                             ],
-                            2,
-                            0x12d,
+                            2,     // linux-lit: 2=mmREMAP_HDP_MEM_FLUSH_CNTL_BASE_IDX
+                            0x12d, // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
                         )
                         .ok()
                     } else {

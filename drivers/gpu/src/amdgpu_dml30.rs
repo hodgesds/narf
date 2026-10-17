@@ -34,64 +34,94 @@ use crate::{
 
 // ── dcn3_0_ip ──────────────────────────────────────────────────────────
 /// `det_buffer_size_kbytes`.
-pub const DET_BUFFER_KBYTES: u64 = 184;
+pub const DET_BUFFER_KBYTES: u64 = 184; // linux: n/a (dcn30_fpu.c dcn3_0_ip.det_buffer_size_kbytes)
+                                        // linux: n/a (dcn30_fpu.c dcn3_0_ip.line_buffer_size_bits)
 const LINE_BUFFER_SIZE_BITS: u64 = 789_504;
 /// `dm_lb_16`, which `dcn20_populate_dml_pipes_from_context` always selects.
-const LB_BIT_PER_PIXEL: u64 = 48;
-const MAX_LINE_BUFFER_LINES: i64 = 12;
-const MAX_SCL_TAPS: u32 = 8;
+const LB_BIT_PER_PIXEL: u64 = 48; // linux: n/a (display_mode_vba.c: dm_lb_16 lb_depth 48)
+const MAX_LINE_BUFFER_LINES: i64 = 12; // linux: n/a (dcn30_fpu.c dcn3_0_ip.max_line_buffer_lines)
+const MAX_SCL_TAPS: u32 = 8; // linux: n/a (dcn30_fpu.c dcn3_0_ip.max_hscl_taps / max_vscl_taps)
 /// `dpte_buffer_size_in_pte_reqs_luma`; DCN30 sets no chroma share, so a
 /// single-plane surface gets exactly this.
+// linux: n/a (dcn30_fpu.c dcn3_0_ip.dpte_buffer_size_in_pte_reqs_luma)
 const DPTE_BUFFER_IN_PTE_REQS: u64 = 84;
-const PTE_GROUP_BYTES: u64 = 2048;
+const PTE_GROUP_BYTES: u64 = 2048; // linux: n/a (dcn30_fpu.c dcn3_0_ip.pte_group_size_bytes)
+                                   // linux: n/a (dcn30_fpu.c dcn3_0_ip.gpuvm_max_page_table_levels)
 const GPUVM_MAX_PAGE_TABLE_LEVELS: i64 = 4;
-const PIXEL_CHUNK_KBYTES: i64 = 8;
-const DPPCLK_DELAY_SUBTOTAL: i64 = 46;
-const DPPCLK_DELAY_SCL: i64 = 50;
+const PIXEL_CHUNK_KBYTES: i64 = 8; // linux: n/a (dcn30_fpu.c dcn3_0_ip.pixel_chunk_size_kbytes)
+const DPPCLK_DELAY_SUBTOTAL: i64 = 46; // linux: n/a (dcn30_fpu.c dcn3_0_ip.dppclk_delay_subtotal)
+const DPPCLK_DELAY_SCL: i64 = 50; // linux: n/a (dcn30_fpu.c dcn3_0_ip.dppclk_delay_scl)
+                                  // linux: n/a (dcn30_fpu.c dcn3_0_ip.dppclk_delay_scl_lb_only)
 const DPPCLK_DELAY_SCL_LB_ONLY: i64 = 16;
+// linux: n/a (dcn30_fpu.c dcn3_0_ip.dppclk_delay_cnvc_formatter)
 const DPPCLK_DELAY_CNVC_FORMATTER: i64 = 27;
 /// `dppclk_delay_cnvc_cursor`, per cursor.
+// linux: n/a (dcn30_fpu.c dcn3_0_ip.dppclk_delay_cnvc_cursor)
 const DPPCLK_DELAY_CNVC_CURSOR: i64 = 6;
 /// `cursor_buffer_size` in KiB and `number_of_cursors`.
-const CURSOR_BUFFER_KBYTES: u64 = 8;
-const MAX_CURSORS: u32 = 1;
+const CURSOR_BUFFER_KBYTES: u64 = 8; // linux: n/a (dcn30_fpu.c dcn3_0_ip.cursor_buffer_size)
+const MAX_CURSORS: u32 = 1; // linux: n/a (dcn30_fpu.c dcn3_0_ip.number_of_cursors)
 /// `cur0_src_width` 256 at `dm_cur_32bit`.
+// linux: n/a (dcn20_fpu.c dcn20_populate_dml_pipes_from_context: cur0_src_width = 256)
 pub const CURSOR_WIDTH: u64 = 256;
-const CURSOR_BPP: u64 = 32;
+const CURSOR_BPP: u64 = 32; // linux: n/a (display_mode_vba.c: dm_cur_32bit = 32 bpp)
+                            // linux: n/a (dcn30_fpu.c dcn3_0_ip.dispclk_delay_subtotal)
 const DISPCLK_DELAY_SUBTOTAL: i64 = 119;
+// linux: n/a (dcn30_fpu.c dcn3_0_ip.max_inter_dcn_tile_repeaters)
 const MAX_INTER_DCN_TILE_REPEATERS: i64 = 8;
 /// `dispclk_ramp_margin_percent` = 1 and `dcn_downspread_percent` = 0.5.
+// linux: n/a (dcn30_fpu.c dcn3_0_ip.dispclk_ramp_margin_percent = 1)
 const DISPCLK_RAMP_MARGIN_HUNDREDTHS: i64 = 100;
+// linux: n/a (dcn30_fpu.c dcn3_0_soc.dcn_downspread_percent = 0.5)
 const DOWNSPREAD_HUNDREDTHS: i64 = 50;
 /// Linear surfaces: `MaximumSwathWidthSupportLuma`.
+// linux: n/a (literal 8192 in display_mode_vba_30.c, dm_sw_linear)
 const MAX_SWATH_WIDTH_LINEAR: u64 = 8192;
 // rq sizing (`get_surf_rq_param`).
+// linux: n/a (display_rq_dlg_calc_30.c get_surf_rq_param: chunk_bytes)
 const CHUNK_BYTES: u64 = 8192;
+// linux: n/a (display_rq_dlg_calc_30.c get_surf_rq_param: min_chunk_bytes)
 const MIN_CHUNK_BYTES: u64 = 1024;
+// linux: n/a (display_rq_dlg_calc_30.c get_surf_rq_param: meta_chunk_bytes)
 const META_CHUNK_BYTES: u64 = 2048;
+// linux: n/a (display_rq_dlg_calc_30.c get_surf_rq_param: min_meta_chunk_bytes)
 const MIN_META_CHUNK_BYTES: u64 = 256;
+// linux: n/a (display_rq_dlg_calc_30.c get_surf_rq_param: mpte_group_bytes, no hostvm)
 const MPTE_GROUP_BYTES: u64 = 2048;
+// linux: n/a (dcn30_fpu.c dcn3_0_soc.gpuvm_min_page_size_bytes)
 const GPUVM_MIN_PAGE_BYTES: u64 = 4096;
 
 // ── dcn3_0_soc ─────────────────────────────────────────────────────────
 /// `sr_exit_time_us` 15.5 and `sr_enter_plus_exit_time_us` 20 (WM_A inputs).
-const SR_EXIT_US_TENTHS: i64 = 155;
+const SR_EXIT_US_TENTHS: i64 = 155; // linux: n/a (dcn30_fpu.c dcn3_0_soc.sr_exit_time_us = 15.5)
+                                    // linux: n/a (dcn30_fpu.c dcn3_0_soc.sr_enter_plus_exit_time_us)
 const SR_ENTER_PLUS_EXIT_US: i64 = 20;
 /// `urgent_latency_*_us`: all three are 4.0, so the max3 collapses.
+// linux: n/a (dcn30_fpu.c dcn3_0_soc.urgent_latency_us and the pixel/vm variants)
 const URGENT_LATENCY_US: i64 = 4;
 /// `do_urgent_latency_adjustment` with a 1.0 us component at 1000 MHz.
+// linux: n/a (dcn30_fpu.c dcn3_0_soc.urgent_latency_adjustment_fabric_clock_component_us)
 const URGENT_ADJUST_COMPONENT_US: i64 = 1;
+// linux: n/a (dcn30_fpu.c dcn3_0_soc.urgent_latency_adjustment_fabric_clock_reference_mhz)
 const URGENT_ADJUST_REFERENCE_MHZ: i64 = 1000;
+// linux: n/a (dcn30_fpu.c dcn3_0_soc.urgent_out_of_order_return_per_channel_pixel_only_bytes)
 const URGENT_OUT_OF_ORDER_BYTES_PER_CHANNEL: i64 = 4096;
+// linux: n/a (dcn30_fpu.c dcn3_0_soc.pct_ideal_dram_sdp_bw_after_urgent_pixel_only)
 const PCT_IDEAL_AFTER_URGENT_PIXEL_ONLY: i64 = 80;
+// linux: n/a (dcn30_fpu.c dcn3_0_soc.fabric_datapath_to_dcn_data_return_bytes)
 const FABRIC_DATAPATH_TO_DCN_RETURN_BYTES: i64 = 64;
+// linux: n/a (dcn30_fpu.c dcn3_0_soc.return_bus_width_bytes)
 const RETURN_BUS_WIDTH_BYTES: i64 = 64;
+// linux: n/a (dcn30_fpu.c dcn3_0_soc.round_trip_ping_latency_dcfclk_cycles)
 const ROUND_TRIP_PING_LATENCY_DCFCLK_CYCLES: i64 = 191;
 /// `dram_clock_change_latency_us`, the WM_A p-state latency.
+// linux: n/a (dcn30_fpu.c dcn3_0_soc.dram_clock_change_latency_us)
 pub const DRAM_CLOCK_CHANGE_LATENCY_US: i64 = 404;
 /// DCN30's prefetch search starts here (`v->VStartupLines = 13`).
+// linux: n/a (literal in display_mode_vba_30.c: v->VStartupLines = 13)
 const FIRST_VSTARTUP_LINES: u32 = 13;
 /// `max_vratio_pre`.
+// linux: n/a (literal 4 in display_mode_vba_30.c: VRatioPrefetchY > 4; soc.max_vratio_pre unset)
 const MAX_VRATIO_PREFETCH: i64 = 4;
 
 /// The SoC state the plan is computed for, taken from the board: the clock
@@ -857,10 +887,12 @@ fn finish(
                 .plus(c.cursor_bandwidth.times(s.v_ratio_prefetch)),
         )
         .over(c.return_bw);
+    // linux-lit: 0x3ff=DCHUBBUB_ARB_FRAC_URG_BW_NOM_A__DCHUBBUB_ARB_FRAC_URG_BW_NOM_A_MASK
     let frac_urg_bw_nom = fraction.times(Fx::int(1000)).floor().clamp(0, 0x3ff) as u32;
     // convert_and_clamp(ns, refclk): ns is already truncated by the caller.
     let cycles = |us: Fx| -> u32 {
         let ns = us.times(Fx::int(1000)).floor().max(0);
+        // linux: n/a (clamp 0x1fffff, literal in dcn21_hubbub.c convert_and_clamp calls)
         (ns as u64 * (soc.dchub_refclk_khz as u64 / 1000) / 1000).min(0x1f_ffff) as u32
     };
     let hubbub = WatermarkSet {
@@ -891,6 +923,7 @@ fn finish(
                     .over(Fx::int(req_per_width))
             }
         };
+        // linux: n/a (refcyc_per_req_delivery_cur0 * 2^10, display_rq_dlg_calc_30.c)
         let fixed = |v: Fx| field(v, 10, 23);
         (
             fixed(delivery(Fx::ONE)),
@@ -901,7 +934,7 @@ fn finish(
         Some((Ok(nominal), Ok(pre))) => Some(CursorTtu {
             refcyc_per_req_delivery: nominal,
             refcyc_per_req_delivery_pre: pre,
-            qos_level_fixed: 8,
+            qos_level_fixed: 8, // linux: n/a (qos_level_fixed_cur0 = 8, display_rq_dlg_calc_30.c)
             qos_ramp_disable: 0,
         }),
         Some(_) => return Err(Error::Unsupported),
@@ -991,19 +1024,27 @@ fn registers(
         req_per_swath_ub,
     };
     let rq = RequestRegisters {
+        // linux: n/a (dml_log2(chunk_bytes) - 10, display_rq_dlg_calc_30.c:extract_rq_sizing_regs)
         chunk_size: log2_floor(CHUNK_BYTES) - 10,
+        // linux: n/a (dml_log2(min_chunk_bytes) - 8 + 1, display_rq_dlg_calc_30.c)
         min_chunk_size: log2_floor(MIN_CHUNK_BYTES) - 8 + 1,
+        // linux: n/a (dml_log2(meta_chunk_bytes) - 10, display_rq_dlg_calc_30.c)
         meta_chunk_size: log2_floor(META_CHUNK_BYTES) - 10,
+        // linux: n/a (dml_log2(min_meta_chunk_bytes) - 6 + 1, display_rq_dlg_calc_30.c)
         min_meta_chunk_size: log2_floor(MIN_META_CHUNK_BYTES) - 6 + 1,
+        // linux: n/a (dml_log2(dpte_group_bytes) - 6, display_rq_dlg_calc_30.c)
         dpte_group_size: log2_floor(PTE_GROUP_BYTES) - 6,
+        // linux: n/a (dml_log2(mpte_group_bytes) - 6, display_rq_dlg_calc_30.c)
         mpte_group_size: log2_floor(MPTE_GROUP_BYTES) - 6,
         // Linear: log2 swath height 0.
         swath_height: 0,
+        // linux: n/a (dml_log2(dpte_row_height) - 3, display_rq_dlg_calc_30.c)
         pte_row_height_linear: log2_floor(dpte_row_height) - 3,
+        // linux: n/a (drq_expansion_mode = 2, display_rq_dlg_calc_30.c:dml30_rq_dlg_get_rq_reg)
         drq_expansion_mode: 2,
-        prq_expansion_mode: 1,
-        mrq_expansion_mode: 1,
-        crq_expansion_mode: 1,
+        prq_expansion_mode: 1, // linux: n/a (prq_expansion_mode = 1, display_rq_dlg_calc_30.c)
+        mrq_expansion_mode: 1, // linux: n/a (mrq_expansion_mode = 1, display_rq_dlg_calc_30.c)
+        crq_expansion_mode: 1, // linux: n/a (crq_expansion_mode = 1, display_rq_dlg_calc_30.c)
     };
     let vready_sum = (prefetch.v_ready_offset_pix
         + prefetch.v_update_width_pix
@@ -1059,9 +1100,11 @@ fn registers(
         .times(ref_to_pix)
         .over(groups)
         .floor()
-        .clamp(0, (1 << 23) - 1);
+        .clamp(0, (1 << 23) - 1); // linux: n/a (dml_pow(2, 23) - 1 clamp, display_rq_dlg_calc_30.c)
     let dlg = LatencyRegisters {
+        // linux: n/a (ref_freq_to_pix_freq * dml_pow(2, 19), display_rq_dlg_calc_30.c)
         ref_freq_to_pix_freq: field(ref_to_pix, 19, W_REF_FREQ_TO_PIX_FREQ)?,
+        // linux: n/a (refcyc_per_htotal * dml_pow(2, 8), display_rq_dlg_calc_30.c)
         refcyc_per_htotal: field(
             ref_to_pix.times(Fx::int(h_total as i64)),
             8,
@@ -1073,6 +1116,7 @@ fn registers(
             W_REFCYC_H_BLANK_END,
         )?,
         dlg_vblank_end: whole(t.v_blank_end() as u64, W_DLG_VBLANK_END)?,
+        // linux: n/a (min_dst_y_next_start * dml_pow(2, 2), display_rq_dlg_calc_30.c)
         min_dst_y_next_start: whole(vblank_start * 4, W_MIN_DST_Y_NEXT_START)?,
         refcyc_x_after_scaler: field(
             Fx::int(prefetch.dst_x_after_scaler as i64).times(ref_to_pix),
@@ -1080,11 +1124,16 @@ fn registers(
             W_REFCYC_X_AFTER_SCALER,
         )?,
         dst_y_after_scaler: whole(prefetch.dst_y_after_scaler as u64, W_DST_Y_AFTER_SCALER)?,
+        // linux: n/a (dst_y_prefetch * dml_pow(2, 2), display_rq_dlg_calc_30.c)
         dst_y_prefetch: field(prefetch.dst_y_prefetch, 2, W_DST_Y_PREFETCH)?,
+        // linux: n/a (dst_y_per_vm_vblank * dml_pow(2, 2), display_rq_dlg_calc_30.c)
         dst_y_per_vm_vblank: field(prefetch.dst_y_per_vm_vblank, 2, W_DST_Y_PER_VM_VBLANK)?,
+        // linux: n/a (dst_y_per_row_vblank * dml_pow(2, 2), display_rq_dlg_calc_30.c)
         dst_y_per_row_vblank: field(prefetch.dst_y_per_row_vblank, 2, W_DST_Y_PER_ROW_VBLANK)?,
+        // linux: n/a (vratio_prefetch * dml_pow(2, 19), display_rq_dlg_calc_30.c)
         vratio_prefetch: field(prefetch.v_ratio_prefetch, 19, W_VRATIO_PREFETCH)?,
         vready_after_vcount0,
+        // linux: n/a (dst_y_per_pte_row_nom_l * dml_pow(2, 2), display_rq_dlg_calc_30.c)
         dst_y_per_pte_row_nom_l: field(row_lines, 2, W_DST_Y_PER_PTE_ROW_NOM_L)?,
         refcyc_per_pte_group_nom_l: whole(pte_group_nom as u64, W_REFCYC_PER_PTE_GROUP_NOM_L)?,
         refcyc_per_pte_group_vblank_l: field(
@@ -1098,22 +1147,27 @@ fn registers(
         )?,
         refcyc_per_line_delivery_l: field(line_delivery, 0, W_REFCYC_PER_LINE_DELIVERY)?,
         refcyc_per_line_delivery_pre_l: field(line_delivery_pre, 0, W_REFCYC_PER_LINE_DELIVERY)?,
+        // linux: n/a (dst_y_delta_drq_limit = 0x7fff "off", display_rq_dlg_calc_30.c)
         dst_y_delta_drq_limit: 0x7fff,
+        // linux: n/a (chunk_hdl_adjust_cur0 = 3, display_rq_dlg_calc_30.c)
         chunk_hdl_adjust_cur0: 3,
         dst_y_offset_cur0: 0,
     };
     let ttu = ThrottleRegisters {
         min_ttu_vblank: field(min_ttu_vblank.times(refclk), 0, W_MIN_TTU_VBLANK)?,
-        qos_level_low_wm: 0,
+        qos_level_low_wm: 0, // linux: n/a (qos_level_low_wm = 0, display_rq_dlg_calc_30.c)
+        // linux: n/a (4.0 * htotal * ref_freq_to_pix_freq, display_rq_dlg_calc_30.c)
         qos_level_high_wm: field(
             Fx::int(4).times(Fx::int(h_total as i64)).times(ref_to_pix),
             0,
             W_QOS_LEVEL_WM,
         )?,
-        qos_level_flip: 14,
+        qos_level_flip: 14, // linux: n/a (qos_level_flip = 14, display_rq_dlg_calc_30.c)
+        // linux: n/a (refcyc_per_req_delivery_l * dml_pow(2, 10), display_rq_dlg_calc_30.c)
         refcyc_per_req_delivery_l: field(req_delivery, 10, W_REFCYC_PER_REQ_DELIVERY)?,
+        // linux: n/a (refcyc_per_req_delivery_pre_l * dml_pow(2, 10), display_rq_dlg_calc_30.c)
         refcyc_per_req_delivery_pre_l: field(req_delivery_pre, 10, W_REFCYC_PER_REQ_DELIVERY)?,
-        qos_level_fixed_l: 8,
+        qos_level_fixed_l: 8, // linux: n/a (qos_level_fixed_l = 8, display_rq_dlg_calc_30.c)
         qos_ramp_disable_l: 0,
     };
     Ok(Registers {

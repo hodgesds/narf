@@ -24,44 +24,60 @@ use crate::{amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_dcn_profile::Profile};
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
+// linux-ctx: hdr=dcn seg=2
 // HUBPREQ instance block, stride 0xdc.
-pub(crate) const VMID_SETTINGS_0: u64 = 0x0609;
+pub(crate) const VMID_SETTINGS_0: u64 = 0x0609; // linux: mmHUBPREQ0_VMID_SETTINGS_0
+                                                // linux: mmHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS
 pub(crate) const PRIMARY_SURFACE_ADDRESS: u64 = 0x060a;
+// linux: mmHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH
 pub(crate) const PRIMARY_SURFACE_ADDRESS_HIGH: u64 = 0x060b;
-pub(crate) const SURFACE_CONTROL: u64 = 0x061a;
-pub(crate) const FLIP_CONTROL: u64 = 0x061b;
-pub(crate) const FLIP_INTERRUPT: u64 = 0x0620;
-pub(crate) const EARLIEST_INUSE: u64 = 0x0625;
+pub(crate) const SURFACE_CONTROL: u64 = 0x061a; // linux: mmHUBPREQ0_DCSURF_SURFACE_CONTROL
+pub(crate) const FLIP_CONTROL: u64 = 0x061b; // linux: mmHUBPREQ0_DCSURF_FLIP_CONTROL
+pub(crate) const FLIP_INTERRUPT: u64 = 0x0620; // linux: mmHUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT
+pub(crate) const EARLIEST_INUSE: u64 = 0x0625; // linux: mmHUBPREQ0_DCSURF_SURFACE_EARLIEST_INUSE
+                                               // linux: mmHUBPREQ0_DCSURF_SURFACE_EARLIEST_INUSE_HIGH
 pub(crate) const EARLIEST_INUSE_HIGH: u64 = 0x0626;
+// linux: mmHUBPREQ1_DCSURF_PRIMARY_SURFACE_ADDRESS - mmHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS
 pub(crate) const HUBP_STRIDE: u64 = 0xdc;
 // OTG instance block, stride 0x80.
-pub(crate) const OTG_V_BLANK_START_END: u64 = 0x1b36;
-pub(crate) const OTG_STATUS_POSITION: u64 = 0x1b4a;
-pub(crate) const OTG_STATUS_FRAME_COUNT: u64 = 0x1b4c;
-pub(crate) const OTG_GLOBAL_SYNC_STATUS: u64 = 0x1b8a;
-pub(crate) const OTG_STRIDE: u64 = 0x80;
+pub(crate) const OTG_V_BLANK_START_END: u64 = 0x1b36; // linux: mmOTG0_OTG_V_BLANK_START_END
+pub(crate) const OTG_STATUS_POSITION: u64 = 0x1b4a; // linux: mmOTG0_OTG_STATUS_POSITION
+pub(crate) const OTG_STATUS_FRAME_COUNT: u64 = 0x1b4c; // linux: mmOTG0_OTG_STATUS_FRAME_COUNT
+pub(crate) const OTG_GLOBAL_SYNC_STATUS: u64 = 0x1b8a; // linux: mmOTG0_OTG_GLOBAL_SYNC_STATUS
+pub(crate) const OTG_STRIDE: u64 = 0x80; // linux: mmOTG1_OTG_CONTROL - mmOTG0_OTG_CONTROL
 #[cfg(feature = "kernel-test")]
+// linux: n/a (NARF test bound)
 pub(crate) const LAST_REG: u64 = OTG_GLOBAL_SYNC_STATUS + 5 * OTG_STRIDE;
+// linux-ctx: reset
 
-const VMID_MASK: u32 = 0xf;
+const VMID_MASK: u32 = 0xf; // linux: HUBPREQ0_VMID_SETTINGS_0__VMID_MASK
+                            // linux: HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH__PRIMARY_SURFACE_ADDRESS_HIGH_MASK
 const ADDRESS_HIGH_MASK: u32 = 0xffff;
 /// PRIMARY_SURFACE_TMZ | PRIMARY_META_SURFACE_TMZ.
+// linux: HUBPREQ0_DCSURF_SURFACE_CONTROL__PRIMARY_SURFACE_TMZ_MASK | HUBPREQ0_DCSURF_SURFACE_CONTROL__PRIMARY_META_SURFACE_TMZ_MASK
 const TMZ: u32 = 0x0001_0001;
-const FLIP_TYPE: u32 = 1 << 1;
-const FLIP_PENDING: u32 = 1 << 8;
+const FLIP_TYPE: u32 = 1 << 1; // linux: HUBPREQ0_DCSURF_FLIP_CONTROL__SURFACE_FLIP_TYPE_MASK
+const FLIP_PENDING: u32 = 1 << 8; // linux: HUBPREQ0_DCSURF_FLIP_CONTROL__SURFACE_FLIP_PENDING_MASK
 /// SURFACE_FLIP_MODE_FOR_STEREOSYNC | SURFACE_FLIP_IN_STEREOSYNC.
+// linux: HUBPREQ0_DCSURF_FLIP_CONTROL__SURFACE_FLIP_MODE_FOR_STEREOSYNC_MASK | HUBPREQ0_DCSURF_FLIP_CONTROL__SURFACE_FLIP_IN_STEREOSYNC_MASK
 const STEREO: u32 = 0x0000_3000 | 0x0001_0000;
+// linux: HUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT__SURFACE_FLIP_INT_MASK_MASK
 const FLIP_INT_MASK: u32 = 1 << 0;
+// linux: HUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT__SURFACE_FLIP_CLEAR_MASK
 const FLIP_CLEAR: u32 = 1 << 8;
-const VSTARTUP_INT_EN: u32 = 1 << 0;
+const VSTARTUP_INT_EN: u32 = 1 << 0; // linux: OTG0_OTG_GLOBAL_SYNC_STATUS__VSTARTUP_INT_EN_MASK
+                                     // linux: OTG0_OTG_GLOBAL_SYNC_STATUS__VSTARTUP_EVENT_CLEAR_MASK
 const VSTARTUP_EVENT_CLEAR: u32 = 1 << 4;
+// linux: OTG0_OTG_GLOBAL_SYNC_STATUS__VUPDATE_NO_LOCK_INT_EN_MASK
 const VUPDATE_NO_LOCK_INT_EN: u32 = 1 << 12;
+// linux: OTG0_OTG_GLOBAL_SYNC_STATUS__VUPDATE_NO_LOCK_EVENT_CLEAR_MASK
 const VUPDATE_NO_LOCK_EVENT_CLEAR: u32 = 1 << 16;
-const COUNT_MASK: u32 = 0x7fff;
+const COUNT_MASK: u32 = 0x7fff; // linux: OTG0_OTG_STATUS_POSITION__OTG_VERT_COUNT_MASK
+                                // linux: OTG0_OTG_STATUS_FRAME_COUNT__OTG_FRAME_COUNT_MASK
 pub(crate) const FRAME_MASK: u32 = 0x00ff_ffff;
 /// HUBP surface addresses are 48-bit and start on a 256-byte request.
-const ADDRESS_BITS: u32 = 48;
-const ADDRESS_ALIGN: u64 = 256;
+const ADDRESS_BITS: u32 = 48; // linux: n/a (48-bit HUBP surface address space)
+const ADDRESS_ALIGN: u64 = 256; // linux: n/a (NARF validation: 256-byte request alignment)
 
 pub(crate) trait Io: Send {
     fn read(&mut self, reg: u64) -> u32;
@@ -236,8 +252,10 @@ impl<I: Io> Engine<I> {
                 return Ok(Position {
                     frame: after,
                     vpos: position & COUNT_MASK,
+                    // linux-lit: 16=OTG0_OTG_STATUS_POSITION__OTG_HORZ_COUNT__SHIFT
                     hpos: position >> 16 & COUNT_MASK,
                     vblank_start: blank & COUNT_MASK,
+                    // linux-lit: 16=OTG0_OTG_V_BLANK_START_END__OTG_V_BLANK_END__SHIFT
                     vblank_end: blank >> 16 & COUNT_MASK,
                 });
             }
@@ -263,7 +281,7 @@ impl Wake for Poll {
 }
 
 /// Poll period between latch reads while waiting for a flip.
-pub const POLL_US: u64 = 500;
+pub const POLL_US: u64 = 500; // linux: n/a (NARF poll period)
 
 impl<I: Io> Engine<I> {
     /// Wait until the requested surface is the earliest one in use, for at

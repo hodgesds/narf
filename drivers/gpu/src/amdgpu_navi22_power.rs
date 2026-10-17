@@ -13,7 +13,7 @@ use alloc::{string::String, vec::Vec};
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Refresh period; also hwmon's natural update granularity.
-pub const POLL_MS: u64 = 1000;
+pub const POLL_MS: u64 = 1000; // linux: n/a (NARF refresh period)
 
 /// Last telemetry state, published to diagnostics and hwmon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -25,6 +25,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use narf_lib::mutex::Mutex;
 
 /// `GFX_OFF_DELAY_ENABLE`: `msecs_to_jiffies(100)`.
+// linux: n/a (GFX_OFF_DELAY_ENABLE = msecs_to_jiffies(100) in amdgpu_gfx.c)
 pub const DELAY_MS: u64 = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

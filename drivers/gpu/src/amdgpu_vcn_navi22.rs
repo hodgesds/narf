@@ -46,138 +46,177 @@ pub enum Error {
 pub(crate) mod regs {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Reg(pub u8, pub u32);
-    pub const PGFSM_CONFIG: Reg = Reg(1, 0x000);
-    pub const PGFSM_STATUS: Reg = Reg(1, 0x001);
-    pub const POWER_STATUS: Reg = Reg(1, 0x004);
-    pub const CC_UVD_HARVESTING: Reg = Reg(1, 0x007);
-    pub const JPEG_POWER_STATUS: Reg = Reg(1, 0x00a);
-    pub const SCRATCH2: Reg = Reg(1, 0x016);
-    pub const SCRATCH9: Reg = Reg(1, 0x01d);
-    pub const GFX10_ADDR_CONFIG: Reg = Reg(1, 0x04a);
-    pub const STATUS: Reg = Reg(1, 0x080);
-    pub const SOFT_RESET: Reg = Reg(1, 0x084);
-    pub const CGC_GATE: Reg = Reg(1, 0x088);
-    pub const CGC_CTRL: Reg = Reg(1, 0x08a);
-    pub const SUVD_CGC_GATE: Reg = Reg(1, 0x08c);
-    pub const SUVD_CGC_CTRL: Reg = Reg(1, 0x08e);
-    pub const SUVD_CGC_GATE2: Reg = Reg(1, 0x0ff);
-    pub const MASTINT_EN: Reg = Reg(1, 0x0a1);
+    pub const PGFSM_CONFIG: Reg = Reg(1, 0x000); // linux: mmUVD_PGFSM_CONFIG
+    pub const PGFSM_STATUS: Reg = Reg(1, 0x001); // linux: mmUVD_PGFSM_STATUS
+    pub const POWER_STATUS: Reg = Reg(1, 0x004); // linux: mmUVD_POWER_STATUS
+    pub const CC_UVD_HARVESTING: Reg = Reg(1, 0x007); // linux: mmCC_UVD_HARVESTING
+    pub const JPEG_POWER_STATUS: Reg = Reg(1, 0x00a); // linux: mmUVD_JPEG_POWER_STATUS
+    pub const SCRATCH2: Reg = Reg(1, 0x016); // linux: mmUVD_SCRATCH2
+    pub const SCRATCH9: Reg = Reg(1, 0x01d); // linux: mmUVD_SCRATCH9
+    pub const GFX10_ADDR_CONFIG: Reg = Reg(1, 0x04a); // linux: mmUVD_GFX10_ADDR_CONFIG
+    pub const STATUS: Reg = Reg(1, 0x080); // linux: mmUVD_STATUS
+    pub const SOFT_RESET: Reg = Reg(1, 0x084); // linux: mmUVD_SOFT_RESET
+    pub const CGC_GATE: Reg = Reg(1, 0x088); // linux: mmUVD_CGC_GATE
+    pub const CGC_CTRL: Reg = Reg(1, 0x08a); // linux: mmUVD_CGC_CTRL
+    pub const SUVD_CGC_GATE: Reg = Reg(1, 0x08c); // linux: mmUVD_SUVD_CGC_GATE
+    pub const SUVD_CGC_CTRL: Reg = Reg(1, 0x08e); // linux: mmUVD_SUVD_CGC_CTRL
+    pub const SUVD_CGC_GATE2: Reg = Reg(1, 0x0ff); // linux: mmUVD_SUVD_CGC_GATE2
+    pub const MASTINT_EN: Reg = Reg(1, 0x0a1); // linux: mmUVD_MASTINT_EN
     /// Encode ring 0 (general purpose) and ring 1 (low latency).
+    // linux: mmUVD_RB_BASE_LO; mmUVD_RB_BASE_LO2
     pub const RB_BASE_LO: [Reg; 2] = [Reg(1, 0x0aa), Reg(1, 0x0af)];
+    // linux: mmUVD_RB_BASE_HI; mmUVD_RB_BASE_HI2
     pub const RB_BASE_HI: [Reg; 2] = [Reg(1, 0x0ab), Reg(1, 0x0b0)];
+    // linux: mmUVD_RB_SIZE; mmUVD_RB_SIZE2
     pub const RB_SIZE: [Reg; 2] = [Reg(1, 0x0ac), Reg(1, 0x0b1)];
+    // linux: mmUVD_RB_RPTR; mmUVD_RB_RPTR2
     pub const RB_RPTR: [Reg; 2] = [Reg(1, 0x0ad), Reg(1, 0x0b2)];
+    // linux: mmUVD_RB_WPTR; mmUVD_RB_WPTR2
     pub const RB_WPTR: [Reg; 2] = [Reg(1, 0x0ae), Reg(1, 0x0b3)];
-    pub const RB_ARB_CTRL: Reg = Reg(1, 0x0c6);
-    pub const VCPU_CACHE_OFFSET0: Reg = Reg(1, 0x140);
-    pub const VCPU_CACHE_SIZE0: Reg = Reg(1, 0x141);
-    pub const VCPU_CACHE_OFFSET1: Reg = Reg(1, 0x142);
-    pub const VCPU_CACHE_SIZE1: Reg = Reg(1, 0x143);
-    pub const VCPU_CACHE_OFFSET2: Reg = Reg(1, 0x144);
-    pub const VCPU_CACHE_SIZE2: Reg = Reg(1, 0x145);
-    pub const VCPU_NONCACHE_OFFSET0: Reg = Reg(1, 0x152);
-    pub const VCPU_NONCACHE_SIZE0: Reg = Reg(1, 0x153);
-    pub const VCPU_CNTL: Reg = Reg(1, 0x156);
-    pub const MPC_CNTL: Reg = Reg(1, 0x2cc);
-    pub const MPC_SET_MUXA0: Reg = Reg(1, 0x2ce);
-    pub const MPC_SET_MUXB0: Reg = Reg(1, 0x2d0);
-    pub const MPC_SET_MUX: Reg = Reg(1, 0x2d2);
-    pub const RBC_RB_CNTL: Reg = Reg(1, 0x2de);
-    pub const RBC_RB_RPTR: Reg = Reg(1, 0x2e0);
-    pub const RBC_RB_WPTR: Reg = Reg(1, 0x2e1);
-    pub const LMI_RBC_RB_BAR_LOW: Reg = Reg(1, 0x432);
-    pub const LMI_RBC_RB_BAR_HIGH: Reg = Reg(1, 0x433);
-    pub const LMI_VCPU_NC0_BAR_LOW: Reg = Reg(1, 0x438);
+    pub const RB_ARB_CTRL: Reg = Reg(1, 0x0c6); // linux: mmUVD_RB_ARB_CTRL
+    pub const VCPU_CACHE_OFFSET0: Reg = Reg(1, 0x140); // linux: mmUVD_VCPU_CACHE_OFFSET0
+    pub const VCPU_CACHE_SIZE0: Reg = Reg(1, 0x141); // linux: mmUVD_VCPU_CACHE_SIZE0
+    pub const VCPU_CACHE_OFFSET1: Reg = Reg(1, 0x142); // linux: mmUVD_VCPU_CACHE_OFFSET1
+    pub const VCPU_CACHE_SIZE1: Reg = Reg(1, 0x143); // linux: mmUVD_VCPU_CACHE_SIZE1
+    pub const VCPU_CACHE_OFFSET2: Reg = Reg(1, 0x144); // linux: mmUVD_VCPU_CACHE_OFFSET2
+    pub const VCPU_CACHE_SIZE2: Reg = Reg(1, 0x145); // linux: mmUVD_VCPU_CACHE_SIZE2
+    pub const VCPU_NONCACHE_OFFSET0: Reg = Reg(1, 0x152); // linux: mmUVD_VCPU_NONCACHE_OFFSET0
+    pub const VCPU_NONCACHE_SIZE0: Reg = Reg(1, 0x153); // linux: mmUVD_VCPU_NONCACHE_SIZE0
+    pub const VCPU_CNTL: Reg = Reg(1, 0x156); // linux: mmUVD_VCPU_CNTL
+    pub const MPC_CNTL: Reg = Reg(1, 0x2cc); // linux: mmUVD_MPC_CNTL
+    pub const MPC_SET_MUXA0: Reg = Reg(1, 0x2ce); // linux: mmUVD_MPC_SET_MUXA0
+    pub const MPC_SET_MUXB0: Reg = Reg(1, 0x2d0); // linux: mmUVD_MPC_SET_MUXB0
+    pub const MPC_SET_MUX: Reg = Reg(1, 0x2d2); // linux: mmUVD_MPC_SET_MUX
+    pub const RBC_RB_CNTL: Reg = Reg(1, 0x2de); // linux: mmUVD_RBC_RB_CNTL
+    pub const RBC_RB_RPTR: Reg = Reg(1, 0x2e0); // linux: mmUVD_RBC_RB_RPTR
+    pub const RBC_RB_WPTR: Reg = Reg(1, 0x2e1); // linux: mmUVD_RBC_RB_WPTR
+    pub const LMI_RBC_RB_BAR_LOW: Reg = Reg(1, 0x432); // linux: mmUVD_LMI_RBC_RB_64BIT_BAR_LOW
+    pub const LMI_RBC_RB_BAR_HIGH: Reg = Reg(1, 0x433); // linux: mmUVD_LMI_RBC_RB_64BIT_BAR_HIGH
+    pub const LMI_VCPU_NC0_BAR_LOW: Reg = Reg(1, 0x438); // linux: mmUVD_LMI_VCPU_NC0_64BIT_BAR_LOW
+    /// linux: mmUVD_LMI_VCPU_NC0_64BIT_BAR_HIGH
     pub const LMI_VCPU_NC0_BAR_HIGH: Reg = Reg(1, 0x439);
+    // linux: mmUVD_LMI_VCPU_CACHE_64BIT_BAR_LOW
     pub const LMI_VCPU_CACHE_BAR_LOW: Reg = Reg(1, 0x43c);
+    // linux: mmUVD_LMI_VCPU_CACHE_64BIT_BAR_HIGH
     pub const LMI_VCPU_CACHE_BAR_HIGH: Reg = Reg(1, 0x43d);
+    // linux: mmUVD_LMI_VCPU_CACHE1_64BIT_BAR_LOW
     pub const LMI_VCPU_CACHE1_BAR_LOW: Reg = Reg(1, 0x468);
+    // linux: mmUVD_LMI_VCPU_CACHE1_64BIT_BAR_HIGH
     pub const LMI_VCPU_CACHE1_BAR_HIGH: Reg = Reg(1, 0x469);
+    // linux: mmUVD_LMI_VCPU_CACHE2_64BIT_BAR_LOW
     pub const LMI_VCPU_CACHE2_BAR_LOW: Reg = Reg(1, 0x46c);
+    // linux: mmUVD_LMI_VCPU_CACHE2_64BIT_BAR_HIGH
     pub const LMI_VCPU_CACHE2_BAR_HIGH: Reg = Reg(1, 0x46d);
-    pub const LMI_CTRL2: Reg = Reg(1, 0x4a6);
-    pub const LMI_CTRL: Reg = Reg(1, 0x4a8);
-    pub const LMI_STATUS: Reg = Reg(1, 0x4a9);
-    pub const LMI_RBC_RB_VMID: Reg = Reg(1, 0x4b0);
+    pub const LMI_CTRL2: Reg = Reg(1, 0x4a6); // linux: mmUVD_LMI_CTRL2
+    pub const LMI_CTRL: Reg = Reg(1, 0x4a8); // linux: mmUVD_LMI_CTRL
+    pub const LMI_STATUS: Reg = Reg(1, 0x4a9); // linux: mmUVD_LMI_STATUS
+    pub const LMI_RBC_RB_VMID: Reg = Reg(1, 0x4b0); // linux: mmUVD_LMI_RBC_RB_VMID
+    /// linux: mmUVD_LMI_RBC_RB_VMID
     pub const LAST1: u32 = 0x4b0;
     // JPEG 3.0, BASE_IDX 0 of VCN instance 0.
-    pub const JPEG_PITCH: Reg = Reg(0, 0x09f);
+    pub const JPEG_PITCH: Reg = Reg(0, 0x09f); // linux: mmUVD_JPEG_PITCH
+    /// linux: mmJPEG_DEC_GFX10_ADDR_CONFIG
     pub const JPEG_DEC_GFX10_ADDR_CONFIG: Reg = Reg(0, 0x0a6);
+    // linux: mmJPEG_ENC_GFX10_ADDR_CONFIG
     pub const JPEG_ENC_GFX10_ADDR_CONFIG: Reg = Reg(0, 0x0ec);
-    pub const JRBC_RB_WPTR: Reg = Reg(0, 0x100);
-    pub const JRBC_RB_CNTL: Reg = Reg(0, 0x101);
-    pub const JRBC_RB_RPTR: Reg = Reg(0, 0x10a);
-    pub const JRBC_RB_SIZE: Reg = Reg(0, 0x113);
-    pub const LMI_JRBC_RB_VMID: Reg = Reg(0, 0x150);
-    pub const LMI_JRBC_RB_BAR_LOW: Reg = Reg(0, 0x166);
-    pub const LMI_JRBC_RB_BAR_HIGH: Reg = Reg(0, 0x167);
-    pub const JMI_CNTL: Reg = Reg(0, 0x192);
-    pub const JPEG_SYS_INT_EN: Reg = Reg(0, 0x1c1);
-    pub const JPEG_CGC_GATE: Reg = Reg(0, 0x1e0);
-    pub const JPEG_CGC_CTRL: Reg = Reg(0, 0x1e1);
-    pub const LAST0: u32 = 0x1e1;
+    pub const JRBC_RB_WPTR: Reg = Reg(0, 0x100); // linux: mmUVD_JRBC_RB_WPTR
+    pub const JRBC_RB_CNTL: Reg = Reg(0, 0x101); // linux: mmUVD_JRBC_RB_CNTL
+    pub const JRBC_RB_RPTR: Reg = Reg(0, 0x10a); // linux: mmUVD_JRBC_RB_RPTR
+    pub const JRBC_RB_SIZE: Reg = Reg(0, 0x113); // linux: mmUVD_JRBC_RB_SIZE
+    pub const LMI_JRBC_RB_VMID: Reg = Reg(0, 0x150); // linux: mmUVD_LMI_JRBC_RB_VMID
+    pub const LMI_JRBC_RB_BAR_LOW: Reg = Reg(0, 0x166); // linux: mmUVD_LMI_JRBC_RB_64BIT_BAR_LOW
+    pub const LMI_JRBC_RB_BAR_HIGH: Reg = Reg(0, 0x167); // linux: mmUVD_LMI_JRBC_RB_64BIT_BAR_HIGH
+    pub const JMI_CNTL: Reg = Reg(0, 0x192); // linux: mmUVD_JMI_CNTL
+    pub const JPEG_SYS_INT_EN: Reg = Reg(0, 0x1c1); // linux: mmJPEG_SYS_INT_EN
+    pub const JPEG_CGC_GATE: Reg = Reg(0, 0x1e0); // linux: mmJPEG_CGC_GATE
+    pub const JPEG_CGC_CTRL: Reg = Reg(0, 0x1e1); // linux: mmJPEG_CGC_CTRL
+    pub const LAST0: u32 = 0x1e1; // linux: mmJPEG_CGC_CTRL
     /// gc_10_3_0_offset.h mmGB_ADDR_CONFIG, GC BASE_IDX 0.
-    pub const GB_ADDR_CONFIG: u32 = 0x13de;
+    // linux-ctx: hdr=gc seg=0
+    pub const GB_ADDR_CONFIG: u32 = 0x13de; // linux: mmGB_ADDR_CONFIG
     /// nbio_2_3_offset.h / nbio_v2_3.c, NBIO BASE_IDX 2.
-    pub const NBIO_DOORBELL_APER_EN: u32 = 0x0c0;
+    // linux-ctx: hdr=nbio seg=2
+    pub const NBIO_DOORBELL_APER_EN: u32 = 0x0c0; // linux: mmRCC_DEV0_EPF0_RCC_DOORBELL_APER_EN
+    /// linux: mmBIF_MMSCH0_DOORBELL_RANGE; mmBIF_MMSCH1_DOORBELL_RANGE
     pub const NBIO_MMSCH_DOORBELL_RANGE: [u32; 2] = [0x1d3, 0x1d8];
-    pub const LAST_NBIO: u32 = 0x1d8;
+    pub const LAST_NBIO: u32 = 0x1d8; // linux: mmBIF_MMSCH1_DOORBELL_RANGE
 }
+// linux-ctx: reset
 use regs::*;
 
 /// Field values from vcn_3_0_0_sh_mask.h and amdgpu_vcn.h.
 pub(crate) mod bits {
+    // linux: n/a (literal `status & 2` in vcn_v3_0.c:vcn_v3_0_start)
     pub const VCPU_REPORT_BOOTED: u32 = 2;
-    pub const STATUS_UVD_BUSY: u32 = 4;
+    pub const STATUS_UVD_BUSY: u32 = 4; // linux: UVD_STATUS__UVD_BUSY
     /// `UVD_STATUS__IDLE` in the low three bits (stop path).
-    pub const STATUS_IDLE: u32 = 2;
-    pub const VCPU_CLK_EN: u32 = 1 << 9;
-    pub const VCPU_BLK_RST: u32 = 1 << 28;
-    pub const MASTINT_VCPU_EN: u32 = 1 << 1;
-    pub const LMI_CTRL2_STALL_ARB_UMC: u32 = 1 << 8;
-    pub const SOFT_RESET_LMI: u32 = 1 << 2;
-    pub const SOFT_RESET_LMI_UMC: u32 = 1 << 13;
-    pub const RB_ARB_VCPU_DIS: u32 = 1 << 3;
+    pub const STATUS_IDLE: u32 = 2; // linux: UVD_STATUS__IDLE
+    pub const VCPU_CLK_EN: u32 = 1 << 9; // linux: UVD_VCPU_CNTL__CLK_EN_MASK
+    pub const VCPU_BLK_RST: u32 = 1 << 28; // linux: UVD_VCPU_CNTL__BLK_RST_MASK
+    pub const MASTINT_VCPU_EN: u32 = 1 << 1; // linux: UVD_MASTINT_EN__VCPU_EN_MASK
+    pub const LMI_CTRL2_STALL_ARB_UMC: u32 = 1 << 8; // linux: UVD_LMI_CTRL2__STALL_ARB_UMC_MASK
+    pub const SOFT_RESET_LMI: u32 = 1 << 2; // linux: UVD_SOFT_RESET__LMI_SOFT_RESET_MASK
+    pub const SOFT_RESET_LMI_UMC: u32 = 1 << 13; // linux: UVD_SOFT_RESET__LMI_UMC_SOFT_RESET_MASK
+    pub const RB_ARB_VCPU_DIS: u32 = 1 << 3; // linux: UVD_RB_ARB_CTRL__VCPU_DIS_MASK
     /// WRITE_CLEAN_TIMER_EN | MASK_MC_URGENT | DATA_COHERENCY_EN |
     /// VCPU_DATA_COHERENCY_EN, OR-ed into UVD_LMI_CTRL.
+    // linux: UVD_LMI_CTRL__WRITE_CLEAN_TIMER_EN_MASK | UVD_LMI_CTRL__MASK_MC_URGENT_MASK | UVD_LMI_CTRL__DATA_COHERENCY_EN_MASK | UVD_LMI_CTRL__VCPU_DATA_COHERENCY_EN_MASK
     pub const LMI_CTRL_SET: u32 = 0x0020_3100;
-    pub const MPC_REPLACEMENT_MODE: u32 = 0x38;
+    pub const MPC_REPLACEMENT_MODE: u32 = 0x38; // linux: UVD_MPC_CNTL__REPLACEMENT_MODE_MASK
     /// VARA/VARB_1..4 = 1..4 and SET_0..2 = 0..2.
+    // linux: (0x1 << UVD_MPC_SET_MUXA0__VARA_1__SHIFT) | (0x2 << UVD_MPC_SET_MUXA0__VARA_2__SHIFT) | (0x3 << UVD_MPC_SET_MUXA0__VARA_3__SHIFT) | (0x4 << UVD_MPC_SET_MUXA0__VARA_4__SHIFT)
     pub const MPC_MUX0: u32 = (1 << 6) | (2 << 12) | (3 << 18) | (4 << 24);
+    // linux: (0x0 << UVD_MPC_SET_MUX__SET_0__SHIFT) | (0x1 << UVD_MPC_SET_MUX__SET_1__SHIFT) | (0x2 << UVD_MPC_SET_MUX__SET_2__SHIFT)
     pub const MPC_MUX: u32 = (1 << 3) | (2 << 6);
     /// Every PGFSM tile except UVDJ set to 1 (power on): the
     /// `!AMD_PG_SUPPORT_VCN` branch of `vcn_v3_0_disable_static_power_gating`.
+    // linux: (1 << UVD_PGFSM_CONFIG__UVDM_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDU_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDF_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDC_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDB_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDIRL_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDLM_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDTD_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDTE_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDE_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDAB_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDATD_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDNA_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDNB_PWR_CONFIG__SHIFT)
     pub const PGFSM_ALL_ON: u32 = 0x1515_5555;
+    // linux: n/a (literal 0x3F3FFFFF in vcn_v3_0_disable_static_power_gating)
     pub const PGFSM_STATUS_MASK: u32 = 0x3f3f_ffff;
     /// UVD_POWER_STATUS bits cleared with PG disabled (POWER_STATUS, PG_EN).
+    // linux: UVD_POWER_STATUS__UVD_PG_EN_MASK | UVD_POWER_STATUS__UVD_POWER_STATUS_MASK
     pub const POWER_STATUS_CLEAR: u32 = 0x103;
     /// DYN_CLOCK_MODE (VCN_MGCG) | CLK_GATE_DLY_TIMER 1 | CLK_OFF_DELAY 4.
+    // linux: (1 << UVD_CGC_CTRL__DYN_CLOCK_MODE__SHIFT) | (1 << UVD_CGC_CTRL__CLK_GATE_DLY_TIMER__SHIFT) | (4 << UVD_CGC_CTRL__CLK_OFF_DELAY__SHIFT)
     pub const CGC_CTRL_DYN: u32 = 1 | (1 << 2) | (4 << 6);
     /// SYS..MMSCH gates of UVD_CGC_GATE cleared.
+    // linux: UVD_CGC_GATE__SYS_MASK | UVD_CGC_GATE__UDEC_MASK | UVD_CGC_GATE__MPEG2_MASK | UVD_CGC_GATE__REGS_MASK | UVD_CGC_GATE__RBC_MASK | UVD_CGC_GATE__LMI_MC_MASK | UVD_CGC_GATE__LMI_UMC_MASK | UVD_CGC_GATE__IDCT_MASK | UVD_CGC_GATE__MPRD_MASK | UVD_CGC_GATE__MPC_MASK | UVD_CGC_GATE__LBSI_MASK | UVD_CGC_GATE__LRBBM_MASK | UVD_CGC_GATE__UDEC_RE_MASK | UVD_CGC_GATE__UDEC_CM_MASK | UVD_CGC_GATE__UDEC_IT_MASK | UVD_CGC_GATE__UDEC_DB_MASK | UVD_CGC_GATE__UDEC_MP_MASK | UVD_CGC_GATE__WCB_MASK | UVD_CGC_GATE__VCPU_MASK | UVD_CGC_GATE__MMSCH_MASK
     pub const CGC_GATE_ALL: u32 = 0x0017_ffff;
     /// UDEC_RE..MMSCH mode bits of UVD_CGC_CTRL.
+    // linux: UVD_CGC_CTRL__UDEC_RE_MODE_MASK | UVD_CGC_CTRL__UDEC_CM_MODE_MASK | UVD_CGC_CTRL__UDEC_IT_MODE_MASK | UVD_CGC_CTRL__UDEC_DB_MODE_MASK | UVD_CGC_CTRL__UDEC_MP_MODE_MASK | UVD_CGC_CTRL__SYS_MODE_MASK | UVD_CGC_CTRL__UDEC_MODE_MASK | UVD_CGC_CTRL__MPEG2_MODE_MASK | UVD_CGC_CTRL__REGS_MODE_MASK | UVD_CGC_CTRL__RBC_MODE_MASK | UVD_CGC_CTRL__LMI_MC_MODE_MASK | UVD_CGC_CTRL__LMI_UMC_MODE_MASK | UVD_CGC_CTRL__IDCT_MODE_MASK | UVD_CGC_CTRL__MPRD_MODE_MASK | UVD_CGC_CTRL__MPC_MODE_MASK | UVD_CGC_CTRL__LBSI_MODE_MASK | UVD_CGC_CTRL__LRBBM_MODE_MASK | UVD_CGC_CTRL__WCB_MODE_MASK | UVD_CGC_CTRL__VCPU_MODE_MASK | UVD_CGC_CTRL__MMSCH_MODE_MASK
     pub const CGC_CTRL_MODES: u32 = 0xbfff_f800;
+    // linux: UVD_SUVD_CGC_GATE__SRE_MASK | UVD_SUVD_CGC_GATE__SIT_MASK | UVD_SUVD_CGC_GATE__SMP_MASK | UVD_SUVD_CGC_GATE__SCM_MASK | UVD_SUVD_CGC_GATE__SDB_MASK | UVD_SUVD_CGC_GATE__SRE_H264_MASK | UVD_SUVD_CGC_GATE__SRE_HEVC_MASK | UVD_SUVD_CGC_GATE__SIT_H264_MASK | UVD_SUVD_CGC_GATE__SIT_HEVC_MASK | UVD_SUVD_CGC_GATE__SCM_H264_MASK | UVD_SUVD_CGC_GATE__SCM_HEVC_MASK | UVD_SUVD_CGC_GATE__SDB_H264_MASK | UVD_SUVD_CGC_GATE__SDB_HEVC_MASK | UVD_SUVD_CGC_GATE__SCLR_MASK | UVD_SUVD_CGC_GATE__ENT_MASK | UVD_SUVD_CGC_GATE__IME_MASK | UVD_SUVD_CGC_GATE__SIT_HEVC_DEC_MASK | UVD_SUVD_CGC_GATE__SIT_HEVC_ENC_MASK | UVD_SUVD_CGC_GATE__SITE_MASK | UVD_SUVD_CGC_GATE__SRE_VP9_MASK | UVD_SUVD_CGC_GATE__SCM_VP9_MASK | UVD_SUVD_CGC_GATE__SIT_VP9_DEC_MASK | UVD_SUVD_CGC_GATE__SDB_VP9_MASK | UVD_SUVD_CGC_GATE__IME_HEVC_MASK | UVD_SUVD_CGC_GATE__EFC_MASK | UVD_SUVD_CGC_GATE__SAOE_MASK | UVD_SUVD_CGC_GATE__SRE_AV1_MASK | UVD_SUVD_CGC_GATE__FBC_PCLK_MASK | UVD_SUVD_CGC_GATE__FBC_CCLK_MASK | UVD_SUVD_CGC_GATE__SCM_AV1_MASK | UVD_SUVD_CGC_GATE__SMPA_MASK
     pub const SUVD_CGC_GATE_ALL: u32 = 0xffff_bfff;
+    // linux: UVD_SUVD_CGC_GATE2__MPBE0_MASK | UVD_SUVD_CGC_GATE2__MPBE1_MASK | UVD_SUVD_CGC_GATE2__SIT_AV1_MASK | UVD_SUVD_CGC_GATE2__SDB_AV1_MASK | UVD_SUVD_CGC_GATE2__MPC1_MASK
     pub const SUVD_CGC_GATE2_ALL: u32 = 0x1f;
+    // linux: UVD_SUVD_CGC_CTRL__SRE_MODE_MASK | UVD_SUVD_CGC_CTRL__SIT_MODE_MASK | UVD_SUVD_CGC_CTRL__SMP_MODE_MASK | UVD_SUVD_CGC_CTRL__SCM_MODE_MASK | UVD_SUVD_CGC_CTRL__SDB_MODE_MASK | UVD_SUVD_CGC_CTRL__SCLR_MODE_MASK | UVD_SUVD_CGC_CTRL__ENT_MODE_MASK | UVD_SUVD_CGC_CTRL__IME_MODE_MASK | UVD_SUVD_CGC_CTRL__SITE_MODE_MASK | UVD_SUVD_CGC_CTRL__EFC_MODE_MASK | UVD_SUVD_CGC_CTRL__SAOE_MODE_MASK | UVD_SUVD_CGC_CTRL__SMPA_MODE_MASK | UVD_SUVD_CGC_CTRL__MPBE0_MODE_MASK | UVD_SUVD_CGC_CTRL__MPBE1_MODE_MASK | UVD_SUVD_CGC_CTRL__SIT_AV1_MODE_MASK | UVD_SUVD_CGC_CTRL__SDB_AV1_MODE_MASK | UVD_SUVD_CGC_CTRL__MPC1_MODE_MASK | UVD_SUVD_CGC_CTRL__FBC_PCLK_MASK | UVD_SUVD_CGC_CTRL__FBC_CCLK_MASK
     pub const SUVD_CGC_CTRL_MODES: u32 = 0x3003_ffbf;
     /// VCPU_LMI_WRITE_CLEAN | READ_CLEAN | WRITE_CLEAN | WRITE_CLEAN_RAW.
+    // linux: UVD_LMI_STATUS__VCPU_LMI_WRITE_CLEAN_MASK | UVD_LMI_STATUS__READ_CLEAN_MASK | UVD_LMI_STATUS__WRITE_CLEAN_MASK | UVD_LMI_STATUS__WRITE_CLEAN_RAW_MASK
     pub const LMI_STATUS_CLEAN: u32 = 0xf;
     /// UMC_READ_CLEAN_RAW | UMC_WRITE_CLEAN_RAW.
+    // linux: UVD_LMI_STATUS__UMC_READ_CLEAN_RAW_MASK | UVD_LMI_STATUS__UMC_WRITE_CLEAN_RAW_MASK
     pub const LMI_STATUS_UMC_CLEAN: u32 = 0x240;
     /// RB_BUFSZ 12 | RB_BLKSZ 1 | RB_NO_FETCH | RB_NO_UPDATE | RB_RPTR_WR_EN.
+    // linux: (12 << UVD_RBC_RB_CNTL__RB_BUFSZ__SHIFT) | (1 << UVD_RBC_RB_CNTL__RB_BLKSZ__SHIFT) | (1 << UVD_RBC_RB_CNTL__RB_NO_FETCH__SHIFT) | (1 << UVD_RBC_RB_CNTL__RB_NO_UPDATE__SHIFT) | (1 << UVD_RBC_RB_CNTL__RB_RPTR_WR_EN__SHIFT)
     pub const RBC_RB_CNTL_IDLE: u32 = 12 | (1 << 8) | (1 << 16) | (1 << 24) | (1 << 28);
-    pub const CC_UVD_DISABLE: u32 = 1 << 1;
-    pub const PGFSM_UVDJ_ON: u32 = 1 << 22;
-    pub const PGFSM_UVDJ_STATUS: u32 = 0x00c0_0000;
+    pub const CC_UVD_DISABLE: u32 = 1 << 1; // linux: CC_UVD_HARVESTING__UVD_DISABLE_MASK
+    pub const PGFSM_UVDJ_ON: u32 = 1 << 22; // linux: 1 << UVD_PGFSM_CONFIG__UVDJ_PWR_CONFIG__SHIFT
+    pub const PGFSM_UVDJ_STATUS: u32 = 0x00c0_0000; // linux: UVD_PGFSM_STATUS__UVDJ_PWR_STATUS_MASK
+    /// linux: UVD_JPEG_POWER_STATUS__JPEG_POWER_STATUS_MASK
     pub const JPEG_POWER_STATUS_MASK: u32 = 1;
-    pub const JPEG_PG_MODE: u32 = 1 << 4;
+    pub const JPEG_PG_MODE: u32 = 1 << 4; // linux: UVD_JPEG_POWER_STATUS__JPEG_PG_MODE_MASK
     /// DYN_CLOCK_MODE (JPEG_MGCG) | CLK_GATE_DLY_TIMER 1 | CLK_OFF_DELAY 4.
+    // linux: (1 << JPEG_CGC_CTRL__DYN_CLOCK_MODE__SHIFT) | (1 << JPEG_CGC_CTRL__CLK_GATE_DLY_TIMER__SHIFT) | (4 << JPEG_CGC_CTRL__CLK_OFF_DELAY__SHIFT)
     pub const JPEG_CGC_CTRL_DYN: u32 = 1 | (1 << 1) | (4 << 5);
+    // linux: JPEG_CGC_GATE__JPEG_DEC_MASK | JPEG_CGC_GATE__JPEG2_DEC_MASK | JPEG_CGC_GATE__JPEG_ENC_MASK | JPEG_CGC_GATE__JMCIF_MASK | JPEG_CGC_GATE__JRBBM_MASK
     pub const JPEG_CGC_GATE_ALL: u32 = 0x1f;
     /// JPEG_DEC | JPEG2_DEC | JMCIF | JRBBM mode bits.
+    // linux: JPEG_CGC_CTRL__JPEG_DEC_MODE_MASK | JPEG_CGC_CTRL__JPEG2_DEC_MODE_MASK | JPEG_CGC_CTRL__JMCIF_MODE_MASK | JPEG_CGC_CTRL__JRBBM_MODE_MASK
     pub const JPEG_CGC_CTRL_MODES: u32 = 0x001b_0000;
-    pub const JMI_SOFT_RESET: u32 = 1;
-    pub const JPEG_SYS_INT_DJRBC: u32 = 1 << 1;
+    pub const JMI_SOFT_RESET: u32 = 1; // linux: UVD_JMI_CNTL__SOFT_RESET_MASK
+    pub const JPEG_SYS_INT_DJRBC: u32 = 1 << 1; // linux: JPEG_SYS_INT_EN__DJRBC_MASK
 }
 use bits::*;
 
@@ -185,39 +224,41 @@ use bits::*;
 pub(crate) mod cmd {
     /// `PACKET0(reg, 0)` (soc15d.h): type 0, one register.
     pub const fn packet0(reg: u32) -> u32 {
-        reg & 0xffff
+        reg & 0xffff // linux: n/a (PACKET0(reg, 0), soc15d.h)
     }
-    pub const INTERNAL_CMD: u32 = 0x0f;
-    pub const INTERNAL_DATA0: u32 = 0x10;
-    pub const INTERNAL_DATA1: u32 = 0x11;
-    pub const INTERNAL_CONTEXT_ID: u32 = 0x27;
-    pub const INTERNAL_NOP: u32 = 0x29;
-    pub const INTERNAL_IB_SIZE: u32 = 0x25c;
+    pub const INTERNAL_CMD: u32 = 0x0f; // linux: mmUVD_GPCOM_VCPU_CMD_INTERNAL_OFFSET@vcn
+    pub const INTERNAL_DATA0: u32 = 0x10; // linux: mmUVD_GPCOM_VCPU_DATA0_INTERNAL_OFFSET@vcn
+    pub const INTERNAL_DATA1: u32 = 0x11; // linux: mmUVD_GPCOM_VCPU_DATA1_INTERNAL_OFFSET@vcn
+    pub const INTERNAL_CONTEXT_ID: u32 = 0x27; // linux: mmUVD_CONTEXT_ID_INTERNAL_OFFSET@vcn
+    pub const INTERNAL_NOP: u32 = 0x29; // linux: mmUVD_NO_OP_INTERNAL_OFFSET@vcn
+    pub const INTERNAL_IB_SIZE: u32 = 0x25c; // linux: mmUVD_RBC_IB_SIZE_INTERNAL_OFFSET@vcn
+    /// linux: mmUVD_LMI_RBC_IB_64BIT_BAR_LOW_INTERNAL_OFFSET@vcn
     pub const INTERNAL_IB_BAR_LOW: u32 = 0x3b4;
+    // linux: mmUVD_LMI_RBC_IB_64BIT_BAR_HIGH_INTERNAL_OFFSET@vcn
     pub const INTERNAL_IB_BAR_HIGH: u32 = 0x3b5;
-    pub const INTERNAL_IB_VMID: u32 = 0x431;
-    pub const INTERNAL_SCRATCH9: u32 = 0xc01d;
-    pub const DEC_KMD: u32 = 0x8000_0000;
-    pub const DEC_FENCE: u32 = 0;
-    pub const DEC_TRAP: u32 = 1;
-    pub const DEC_PACKET_START: u32 = 0x0a;
-    pub const DEC_PACKET_END: u32 = 0x0b;
-    pub const ENC_NOP: u32 = 0;
-    pub const ENC_END: u32 = 1;
-    pub const ENC_IB: u32 = 2;
-    pub const ENC_FENCE: u32 = 3;
-    pub const ENC_TRAP: u32 = 4;
+    pub const INTERNAL_IB_VMID: u32 = 0x431; // linux: mmUVD_LMI_RBC_IB_VMID_INTERNAL_OFFSET@vcn
+    pub const INTERNAL_SCRATCH9: u32 = 0xc01d; // linux: mmUVD_SCRATCH9_INTERNAL_OFFSET@vcn
+    pub const DEC_KMD: u32 = 0x8000_0000; // linux: VCN_DEC_KMD_CMD
+    pub const DEC_FENCE: u32 = 0; // linux: VCN_DEC_CMD_FENCE
+    pub const DEC_TRAP: u32 = 1; // linux: VCN_DEC_CMD_TRAP
+    pub const DEC_PACKET_START: u32 = 0x0a; // linux: VCN_DEC_CMD_PACKET_START
+    pub const DEC_PACKET_END: u32 = 0x0b; // linux: VCN_DEC_CMD_PACKET_END
+    pub const ENC_NOP: u32 = 0; // linux: VCN_ENC_CMD_NO_OP
+    pub const ENC_END: u32 = 1; // linux: VCN_ENC_CMD_END
+    pub const ENC_IB: u32 = 2; // linux: VCN_ENC_CMD_IB
+    pub const ENC_FENCE: u32 = 3; // linux: VCN_ENC_CMD_FENCE
+    pub const ENC_TRAP: u32 = 4; // linux: VCN_ENC_CMD_TRAP
     /// jpeg_v3_0.c `mmUVD_JPEG_PITCH_INTERNAL_OFFSET`.
-    pub const JPEG_INTERNAL_PITCH: u32 = 0x401f;
+    pub const JPEG_INTERNAL_PITCH: u32 = 0x401f; // linux: mmUVD_JPEG_PITCH_INTERNAL_OFFSET@vcn
     /// `PACKETJ(0, 0, 0, PACKETJ_TYPE6)`, the JRBC NOP.
-    pub const JPEG_NOP: u32 = 6 << 28;
+    pub const JPEG_NOP: u32 = 6 << 28; // linux: PACKETJ(0, 0, 0, PACKETJ_TYPE6)
 }
 
 /// `AMDGPU_NAVI10_DOORBELL64_VCN0_1 << 1`; vcn_v3_0_sw_init assigns the
 /// decode ring `base + 8 * i` and encode ring j `base + 2 + j + 8 * i`, and
 /// jpeg_v3_0_sw_init the JPEG ring `base + 1` (32-bit doorbells).
 pub mod doorbell {
-    pub const VCN_BASE: u32 = 0x188 << 1;
+    pub const VCN_BASE: u32 = 0x188 << 1; // linux: AMDGPU_NAVI10_DOORBELL64_VCN0_1 << 1
     pub const fn dec(instance: u32) -> u32 {
         VCN_BASE + 8 * instance
     }
@@ -226,6 +267,7 @@ pub mod doorbell {
     }
     pub const JPEG: u32 = VCN_BASE + 1;
     /// `BIF_MMSCH0_DOORBELL_RANGE.SIZE` programmed by vcn_doorbell_range.
+    // linux: n/a (literal SIZE 8 in nbio_v2_3.c:nbio_v2_3_vcn_doorbell_range)
     pub const RANGE: u32 = 8;
 }
 
@@ -233,11 +275,12 @@ pub mod doorbell {
 // firmware: stack, context, then page-aligned fw_shared at the end), the
 // three 512-dword rings (4 KiB with amdgpu_sched_hw_submission = 2),
 // fence writeback and the IB-test buffers.
-pub(crate) const STACK_SIZE: u32 = 128 << 10;
-pub(crate) const CONTEXT_SIZE: u32 = 512 << 10;
-pub(crate) const STACK: u64 = 0;
+pub(crate) const STACK_SIZE: u32 = 128 << 10; // linux: AMDGPU_VCN_STACK_SIZE
+pub(crate) const CONTEXT_SIZE: u32 = 512 << 10; // linux: AMDGPU_VCN_CONTEXT_SIZE
+pub(crate) const STACK: u64 = 0; // linux: n/a (NARF BO layout; Linux PSP offset 0)
 pub(crate) const CONTEXT: u64 = STACK + STACK_SIZE as u64;
 pub(crate) const SHARED: u64 = CONTEXT + CONTEXT_SIZE as u64;
+// linux: n/a (AMDGPU_GPU_PAGE_ALIGN(sizeof(struct amdgpu_fw_shared)) = 4096; struct not in probe)
 pub(crate) const SHARED_SIZE: u32 = 4096;
 pub(crate) const DEC_RING: u64 = SHARED + SHARED_SIZE as u64;
 pub(crate) const ENC_RING: [u64; 2] = [DEC_RING + 4096, DEC_RING + 8192];
@@ -251,23 +294,28 @@ pub(crate) const IBS: [u64; 4] = [IB, IB + 0x100, IB + 0x200, IB + 0x300];
 pub(crate) const MSG: [u64; 2] = [IB + 4096, IB + 8192];
 pub(crate) const SESSION: u64 = IB + 12288;
 /// `amdgpu_vcn_enc_ring_test_ib`: 128 KiB + one page session buffer.
+// linux: n/a ((128 << 10) + AMDGPU_GPU_PAGE_SIZE, amdgpu_vcn_enc_ring_test_ib)
 pub(crate) const SESSION_SIZE: u64 = (128 << 10) + 4096;
 pub(crate) const INSTANCE_BYTES: u64 = SESSION + SESSION_SIZE;
+// linux: n/a (roundup_pow_of_two(512 * 4 * 2), amdgpu_ring_init)
 pub(crate) const RING_BYTES: u64 = 4096;
 pub(crate) const RING_DW: u32 = (RING_BYTES / 4) as u32;
 /// JPEG ring plus one writeback page for its shadow wptr.
 pub(crate) const JPEG_BYTES: u64 = 2 * RING_BYTES;
 /// amdgpu_fw_shared byte offsets (natural C layout, not packed).
 pub(crate) mod shared {
-    pub const PRESENT_FLAG_0: u64 = 0;
-    pub const RB_WPTR: u64 = 52;
+    pub const PRESENT_FLAG_0: u64 = 0; // linux: n/a (offsetof amdgpu_fw_shared.present_flag_0)
+    pub const RB_WPTR: u64 = 52; // linux: n/a (offsetof amdgpu_fw_shared.rb.wptr = 52)
     /// Dword holding pad1 and the multi_queue decode/encode-GP/encode-LL
     /// mode bytes (offsets 57, 58, 59).
-    pub const QUEUE_MODES: u64 = 56;
+    pub const QUEUE_MODES: u64 = 56; // linux: n/a (offsetof amdgpu_fw_shared.pad1 = 56)
     /// SW_RING | MULTI_QUEUE | FW_SHARED_FLAG_0_RB | SMU_VERSION_INFO.
+    // linux: AMDGPU_VCN_SW_RING_FLAG | AMDGPU_VCN_MULTI_QUEUE_FLAG | AMDGPU_VCN_FW_SHARED_FLAG_0_RB | AMDGPU_VCN_SMU_VERSION_INFO_FLAG
     pub const PRESENT: u32 = (1 << 9) | (1 << 8) | (1 << 6) | (1 << 11);
-    pub const RING_RESET: u32 = 1;
+    pub const RING_RESET: u32 = 1; // linux: FW_QUEUE_RING_RESET
+    /// linux: n/a (multi_queue.decode_queue_mode at fw_shared byte 57 = QUEUE_MODES + 1)
     pub const DECODE_SHIFT: u32 = 8;
+    // linux: n/a (encode_generalpurpose/lowlatency_queue_mode at bytes 58/59)
     pub const ENCODE_SHIFT: [u32; 2] = [16, 24];
 }
 
@@ -278,8 +326,9 @@ impl Harvest {
     /// Discovery harvest-table mask plus `amdgpu_discovery_harvest_config_quirk`:
     /// these Navy Flounder revisions ship a harvest table missing VCN1.
     pub fn navi22(table: u8, revision: u8) -> Self {
+        // linux: n/a (revision literals in amdgpu_discovery.c:amdgpu_discovery_harvest_config_quirk)
         let quirk = matches!(revision, 0xc1 | 0xc2 | 0xc3 | 0xc5 | 0xc7 | 0xcf | 0xdf);
-        Self(table | if quirk { 2 } else { 0 })
+        Self(table | if quirk { 2 } else { 0 }) // linux-lit: 2=AMDGPU_VCN_HARVEST_VCN1
     }
     /// Read the harvest table from the discovery copy at the top of VRAM.
     ///
@@ -385,7 +434,7 @@ impl Layout {
                 ip::HW_ID_HDP,
                 &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
                 0,
-                0xd1,
+                0xd1, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
             )?,
         })
     }
@@ -471,19 +520,21 @@ async fn delay(us: u64) {
 /// CPU VRAM writes leave the HDP write cache before an engine fetches them.
 fn flush<I: Io>(io: &mut I, l: Layout) {
     barrier(Ordering::SeqCst);
+    // linux: n/a (MMIO_REG_HOLE_OFFSET write, amdgpu_hdp_generic_flush)
     io.write(0x7f000, 0);
-    io.read(l.nbio + 0xc3 * 4);
+    io.read(l.nbio + 0xc3 * 4); // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
     barrier(Ordering::SeqCst);
 }
 /// HDP read-cache invalidate before the CPU samples engine writes.
 fn invalidate<I: Io>(io: &mut I, l: Layout) {
-    io.write(l.hdp + 0xd1 * 4, 1);
-    io.read(l.hdp + 0xd1 * 4);
+    io.write(l.hdp + 0xd1 * 4, 1); // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+    io.read(l.hdp + 0xd1 * 4); // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
     barrier(Ordering::SeqCst);
 }
 /// `adev->usec_timeout` (100 ms) for register waits and ring tests.
-pub(crate) const REG_TIMEOUT_MS: u64 = 100;
+pub(crate) const REG_TIMEOUT_MS: u64 = 100; // linux: n/a (adev->usec_timeout)
 /// `AMDGPU_IB_TEST_TIMEOUT` (1 s), used for multimedia rings on bare metal.
+// linux: n/a (AMDGPU_IB_TEST_TIMEOUT = msecs_to_jiffies(1000))
 pub(crate) const FENCE_TIMEOUT_MS: u64 = 1000;
 
 /// `vcn_v3_0_start` VCPU boot loop bounds: 10 resets, 100 samples of
@@ -495,6 +546,7 @@ pub(crate) struct Timing {
     pub poll_us: u64,
     pub reset_us: u64,
 }
+// linux: n/a (loop literals in vcn_v3_0.c:vcn_v3_0_start)
 pub(crate) const LINUX_TIMING: Timing = Timing {
     retries: 10,
     polls: 100,
@@ -741,6 +793,7 @@ fn dec_fence(address: u64, seq: u32) -> [u32; 14] {
         packet0(INTERNAL_DATA0),
         address as u32,
         packet0(INTERNAL_DATA1),
+        // linux: n/a (literal in vcn_v2_0.c:vcn_v2_0_dec_ring_emit_fence)
         (address >> 32) as u32 & 0xff,
         packet0(INTERNAL_CMD),
         DEC_KMD | (DEC_FENCE << 1),
@@ -805,8 +858,10 @@ fn dec_msg_ib(msg: u64) -> [u32; 16] {
 /// the 1024-dword message is zero.
 pub(crate) fn dec_msg(create: bool) -> [u32; 14] {
     if create {
+        // linux: n/a (msg literals in amdgpu_vcn.c:amdgpu_vcn_dec_get_create_msg, handle 1)
         [0x28, 0x38, 1, 0, 1, 0, 1, 0x28, 0x10, 0, 7, 0, 0x780, 0x440]
     } else {
+        // linux: n/a (msg literals in amdgpu_vcn.c:amdgpu_vcn_dec_get_destroy_msg, handle 1)
         [0x28, 0x18, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     }
 }
@@ -814,6 +869,7 @@ pub(crate) fn dec_msg(create: bool) -> [u32; 14] {
 /// unified-queue header on VCN 3.0): session info, task info, op.
 pub(crate) fn enc_msg_ib(session: u64, create: bool) -> [u32; 16] {
     let mut ib = [0; 16];
+    // linux: n/a (IB literals in amdgpu_vcn.c:amdgpu_vcn_enc_get_create_msg/_destroy_msg)
     ib[..13].copy_from_slice(&[
         0x18,
         1,
@@ -850,6 +906,7 @@ impl<I: Io> Engine<I> {
         let images = [firmware.vcn, firmware.vcn1];
         let missing = self.active().any(|i| images[i].is_none());
         // FEATURE_MM_DPM_PG_BIT (22): Linux would send PowerUpVcn here.
+        // linux-lit: 22=FEATURE_MM_DPM_PG_BIT
         let gated = power.is_some_and(|p| p.enabled & (1 << 22) != 0);
         if self.vcn.iter().all(Option::is_none) || missing || gated {
             self.state = State::Failed;
@@ -899,6 +956,7 @@ impl<I: Io> Engine<I> {
         let map = instance.memory.mapping();
         let index = instance.dec.doorbell;
         self.hw.access(|io, l| {
+            // linux-lit: 1=RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN__BIF_DOORBELL_APER_EN_MASK
             if checked(io.read(l.nbio(NBIO_DOORBELL_APER_EN)))? & 1 == 0 {
                 // Doorbells stage did not open the NBIF aperture.
                 return Err(Error::Invalid);
@@ -910,7 +968,9 @@ impl<I: Io> Engine<I> {
             update(
                 io,
                 l.nbio(NBIO_MMSCH_DOORBELL_RANGE[i]),
+                // linux-lit: 0x001f_0ffc=BIF_MMSCH0_DOORBELL_RANGE__OFFSET_MASK | BIF_MMSCH0_DOORBELL_RANGE__SIZE_MASK
                 0x001f_0ffc,
+                // linux-lit: 2=BIF_MMSCH0_DOORBELL_RANGE__OFFSET__SHIFT; 0xffc=BIF_MMSCH0_DOORBELL_RANGE__OFFSET_MASK; 16=BIF_MMSCH0_DOORBELL_RANGE__SIZE__SHIFT
                 ((index << 2) & 0xffc) | (doorbell::RANGE << 16),
             )
         })?;
@@ -934,6 +994,7 @@ impl<I: Io> Engine<I> {
         let instance = self.vcn[i].as_ref().ok_or(Error::Invalid)?;
         let (engine, base) = (instance.engine, instance.address(0));
         let shared_address = instance.address(SHARED);
+        // linux: n/a (AMDGPU_GPU_PAGE_ALIGN(fw->size + 4), vcn_v3_0_mc_resume)
         let cache0 = (self.firmware_bytes + 4 + 4095) & !4095;
         let r = move |l: Layout, reg: Reg| l.reg(i, reg);
         // vcn_v3_0_disable_static_power_gating, !AMD_PG_SUPPORT_VCN branch.
@@ -980,6 +1041,7 @@ impl<I: Io> Engine<I> {
             update(io, r(l, SOFT_RESET), SOFT_RESET_LMI | SOFT_RESET_LMI_UMC, 0)?;
             let lmi = checked(io.read(r(l, LMI_CTRL)))?;
             io.write(r(l, LMI_CTRL), lmi | LMI_CTRL_SET);
+            // linux-lit: 3=UVD_MPC_CNTL__REPLACEMENT_MODE__SHIFT
             update(io, r(l, MPC_CNTL), MPC_REPLACEMENT_MODE, 2 << 3)?;
             io.write(r(l, MPC_SET_MUXA0), MPC_MUX0);
             io.write(r(l, MPC_SET_MUXB0), MPC_MUX0);
@@ -1095,6 +1157,7 @@ impl<I: Io> Engine<I> {
         let (map, engine) = (instance.memory.mapping(), instance.engine);
         let ring = &mut instance.dec;
         self.hw.access(|io, l| {
+            // linux: n/a (literal in amdgpu_vcn_dec_ring_test_ring)
             io.write(l.reg(i, SCRATCH9), 0xcafe_dead);
             ring.emit(
                 io,
@@ -1281,6 +1344,7 @@ impl<I: Io> Engine<I> {
             let engine = self.vcn[i].as_ref().ok_or(Error::Invalid)?.engine;
             let reg = |l: Layout, r: Reg| l.reg(i, r);
             let (status, lmi) = (reg(self.hw.layout, STATUS), reg(self.hw.layout, LMI_STATUS));
+            // linux: n/a (literal 0x7, vcn_v3_0_stop)
             self.hw.wait_reg(engine, status, STATUS_IDLE, 0x7).await?;
             self.hw
                 .wait_reg(engine, lmi, LMI_STATUS_CLEAN, LMI_STATUS_CLEAN)
@@ -1345,6 +1409,7 @@ impl<I: Io> Engine<I> {
             if harvest & CC_UVD_DISABLE != 0 {
                 return Ok(false);
             }
+            // linux-lit: 1=RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN__BIF_DOORBELL_APER_EN_MASK
             if checked(io.read(l.nbio(NBIO_DOORBELL_APER_EN)))? & 1 == 0 {
                 return Err(Error::Invalid);
             }
@@ -1354,7 +1419,9 @@ impl<I: Io> Engine<I> {
             update(
                 io,
                 l.nbio(NBIO_MMSCH_DOORBELL_RANGE[0]),
+                // linux-lit: 0x001f_0ffc=BIF_MMSCH0_DOORBELL_RANGE__OFFSET_MASK | BIF_MMSCH0_DOORBELL_RANGE__SIZE_MASK
                 0x001f_0ffc,
+                // linux-lit: 2=BIF_MMSCH0_DOORBELL_RANGE__OFFSET__SHIFT; 0xffc=BIF_MMSCH0_DOORBELL_RANGE__OFFSET_MASK; 16=BIF_MMSCH0_DOORBELL_RANGE__SIZE__SHIFT
                 ((doorbell::VCN_BASE << 2) & 0xffc) | (doorbell::RANGE << 16),
             )?;
             // jpeg_v3_0_disable_static_power_gating: power UVDJ on
@@ -1392,12 +1459,13 @@ impl<I: Io> Engine<I> {
                 JPEG_SYS_INT_DJRBC,
             )?;
             io.write(r(l, LMI_JRBC_RB_VMID), 0);
-            io.write(r(l, JRBC_RB_CNTL), 3); // RB_NO_FETCH | RB_RPTR_WR_EN
+            // linux-lit: 3=UVD_JRBC_RB_CNTL__RB_NO_FETCH_MASK | UVD_JRBC_RB_CNTL__RB_RPTR_WR_EN_MASK
+            io.write(r(l, JRBC_RB_CNTL), 3);
             io.write(r(l, LMI_JRBC_RB_BAR_LOW), address as u32);
             io.write(r(l, LMI_JRBC_RB_BAR_HIGH), (address >> 32) as u32);
             io.write(r(l, JRBC_RB_RPTR), 0);
             io.write(r(l, JRBC_RB_WPTR), 0);
-            io.write(r(l, JRBC_RB_CNTL), 2);
+            io.write(r(l, JRBC_RB_CNTL), 2); // linux-lit: 2=UVD_JRBC_RB_CNTL__RB_RPTR_WR_EN_MASK
             io.write(r(l, JRBC_RB_SIZE), RING_DW);
             let wptr = checked(io.read(r(l, JRBC_RB_WPTR)))?;
             if wptr >= RING_DW {
@@ -1405,6 +1473,7 @@ impl<I: Io> Engine<I> {
             }
             ring.wptr = wptr;
             // amdgpu_jpeg_dec_ring_test_ring
+            // linux: n/a (literal in amdgpu_jpeg_dec_ring_test_ring)
             io.write(r(l, JPEG_PITCH), 0xcafe_dead);
             checked(io.read(r(l, JPEG_PITCH)))?;
             ring.emit(

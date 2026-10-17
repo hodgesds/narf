@@ -29,21 +29,26 @@ use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::RefCell;
 
 // atom_master_list_of_command_functions_v2_1 indices.
+// linux: offsetof(struct atom_master_list_of_command_functions_v2_1, digxencodercontrol) / 2
 const DIGX_ENCODER_CONTROL: u16 = 4;
+// linux: offsetof(struct atom_master_list_of_command_functions_v2_1, setpixelclock) / 2
 const SET_PIXEL_CLOCK: u16 = 12;
+// linux: offsetof(struct atom_master_list_of_command_functions_v2_1, enabledisppowergating) / 2
 const ENABLE_DISP_POWER_GATING: u16 = 13;
+// linux: offsetof(struct atom_master_list_of_command_functions_v2_1, dig1transmittercontrol) / 2
 const DIG1_TRANSMITTER_CONTROL: u16 = 76;
 // atomfirmware.h enumerations.
-const ATOM_ENCODER_MODE_HDMI: u8 = 3;
-const ATOM_ENCODER_CMD_STREAM_SETUP: u8 = 0x0f;
-const ATOM_COMBOPHY_PLL0: u8 = 20;
+const ATOM_ENCODER_MODE_HDMI: u8 = 3; // linux: ATOM_ENCODER_MODE_HDMI
+const ATOM_ENCODER_CMD_STREAM_SETUP: u8 = 0x0f; // linux: ATOM_ENCODER_CMD_STREAM_SETUP
+const ATOM_COMBOPHY_PLL0: u8 = 20; // linux: ATOM_COMBOPHY_PLL0
 /// `ENCODER_OBJECT_ID_INTERNAL_UNIPHY`, `_UNIPHY1`, `_UNIPHY2`.
+// linux: n/a (ENCODER_OBJECT_ID_INTERNAL_UNIPHY{,1,2} = 0x1E/0x20/0x21, amdgpu/ObjectID.h; not in checker sets)
 const UNIPHY_OBJECT_IDS: [u8; 3] = [0x1e, 0x20, 0x21];
-const ATOM_DISABLE: u8 = 0;
-const ATOM_ENABLE: u8 = 1;
-const ATOM_INIT: u8 = 7;
+const ATOM_DISABLE: u8 = 0; // linux: ATOM_DISABLE
+const ATOM_ENABLE: u8 = 1; // linux: ATOM_ENABLE
+const ATOM_INIT: u8 = 7; // linux: ATOM_INIT
 /// DCN30 drives six streams and six PHY PLLs.
-const STREAMS: u8 = 6;
+const STREAMS: u8 = 6; // linux: n/a (DCN30 pipe/PHY count)
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -74,18 +79,18 @@ pub enum PipeAction {
 /// (`atom_dig_transmitter_control_action`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransmitterAction {
-    Disable = 0,
-    Enable = 1,
+    Disable = 0, // linux-lit: 0=ATOM_TRANSMITTER_ACTION_DISABLE
+    Enable = 1,  // linux-lit: 1=ATOM_TRANSMITTER_ACTION_ENABLE
     /// `TRANSMITTER_CONTROL_SET_VOLTAGE_AND_PREEMPASIS`.
-    SetupVsemph = 11,
+    SetupVsemph = 11, // linux-lit: 11=ATOM_TRANSMITTER_ACTION_SETUP_VSEMPH
 }
 /// `signal_type_to_atom_dig_mode` (`command_table_helper2_dce112.c`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransmitterMode {
-    DisplayPort = 0,
+    DisplayPort = 0, // linux-lit: 0=ATOM_TRANSMITTER_DIGMODE_V6_DP
     /// Also what `SIGNAL_TYPE_NONE` maps to (the power-down path).
-    Dvi = 2,
-    Hdmi = 3,
+    Dvi = 2, // linux-lit: 2=ATOM_TRANSMITTER_DIGMODE_V6_DVI
+    Hdmi = 3,        // linux-lit: 3=ATOM_TRANSMITTER_DIGMODE_V6_HDMI
 }
 
 /// The register bus the interpreter drives.
@@ -215,6 +220,7 @@ impl<'a> Tables<'a> {
             .atom
             .cmd_table(table)
             .map_err(|_| Error::Missing(table))?;
+        // linux-lit: 3=offsetof(struct atom_common_table_header, content_revision)
         header.get(3).copied().ok_or(Error::Missing(table))
     }
     fn require(&self, table: u16, revisions: &[u8]) -> Result<u8, Error> {
@@ -365,20 +371,25 @@ impl<'a> Tables<'a> {
         let bytes = control.params(revision, lane_set)?;
         // dig_transmitter_control_ps_allocation_v1_6 is 32 bytes; the v1.7
         // payload is 60.
+        // linux-lit: 60=sizeof(struct dmub_dig_transmitter_control_data_v1_7); 32=sizeof(struct dig_transmitter_control_ps_allocation_v1_6)
         let len = if revision == 7 { 60 } else { 32 };
         let mut params = ps(&bytes[..len]);
         self.execute(bus, DIG1_TRANSMITTER_CONTROL, &mut params)
     }
 }
 
+// linux-lit: 16=sizeof(struct enable_disp_power_gating_parameters_v2_1) * 4
 pub(crate) fn pipe_power_gating_params(pipe: u8, action: PipeAction) -> Result<[u8; 16], Error> {
     if pipe >= STREAMS {
         return Err(Error::Invalid);
     }
     // enable_disp_power_gating_ps_allocation: the 4-byte parameters plus
     // ATOM_COMMON_ROM_COMMAND_TABLE_HEADER-sized reserve; ATOM_CRTC1 = 0.
+    // linux-lit: 16=sizeof(struct enable_disp_power_gating_parameters_v2_1) * 4
     let mut p = [0u8; 16];
+    // linux-lit: 0=offsetof(struct enable_disp_power_gating_parameters_v2_1, disp_pipe_id)
     p[0] = pipe;
+    // linux-lit: 1=offsetof(struct enable_disp_power_gating_parameters_v2_1, enable)
     p[1] = match action {
         PipeAction::Init => ATOM_INIT,
         PipeAction::Disable => ATOM_DISABLE,
@@ -414,32 +425,43 @@ impl PixelClock {
         {
             return Err(Error::Invalid);
         }
+        // linux-lit: 16=sizeof(struct set_pixel_clock_parameter_v1_7)
         let mut p = [0u8; 16];
         // set_pixel_clock_v7: pixclk_100hz, pll_id, encoderobjid,
         // encoder_mode, miscinfo (XTALIN reference: 0), crtc_id and
         // deep_color_ratio.
         p[..4].copy_from_slice(&self.pixel_100hz.to_le_bytes());
+        // linux-lit: 4=offsetof(struct set_pixel_clock_parameter_v1_7, pll_id)
         p[4] = ATOM_COMBOPHY_PLL0 + self.pll;
+        // linux-lit: 5=offsetof(struct set_pixel_clock_parameter_v1_7, encoderobjid)
         p[5] = UNIPHY_OBJECT_IDS[usize::from(self.transmitter / 2)];
+        // linux-lit: 6=offsetof(struct set_pixel_clock_parameter_v1_7, encoder_mode)
         p[6] = ATOM_ENCODER_MODE_HDMI;
-        p[7] = 0;
-        p[8] = self.otg;
+        p[7] = 0; // linux-lit: 7=offsetof(struct set_pixel_clock_parameter_v1_7, miscinfo)
+        p[8] = self.otg; // linux-lit: 8=offsetof(struct set_pixel_clock_parameter_v1_7, crtc_id)
         p[9] = self.deep_color;
         Ok(p)
     }
 }
 
+// linux-lit: 12=sizeof(struct dig_encoder_stream_setup_parameters_v1_5)
 pub(crate) fn hdmi_stream_setup_params(dig: u8, pixel_khz: u32) -> Result<[u8; 12], Error> {
     if dig >= STREAMS || pixel_khz == 0 {
         return Err(Error::Invalid);
     }
     // dig_encoder_stream_setup_parameters_v1_5. The HDMI caller never sets
     // a colour depth, so bitpercolor stays 0, and lanenum is LANE_COUNT_FOUR.
+    // linux-lit: 12=sizeof(struct dig_encoder_stream_setup_parameters_v1_5)
     let mut p = [0u8; 12];
+    // linux-lit: 0=offsetof(struct dig_encoder_stream_setup_parameters_v1_5, digid)
     p[0] = dig;
+    // linux-lit: 1=offsetof(struct dig_encoder_stream_setup_parameters_v1_5, action)
     p[1] = ATOM_ENCODER_CMD_STREAM_SETUP;
+    // linux-lit: 2=offsetof(struct dig_encoder_stream_setup_parameters_v1_5, digmode)
     p[2] = ATOM_ENCODER_MODE_HDMI;
+    // linux-lit: 3=offsetof(struct dig_encoder_stream_setup_parameters_v1_5, lanenum)
     p[3] = 4;
+    // linux-lit: 4=offsetof(struct dig_encoder_stream_setup_parameters_v1_5, pclk_10khz); 8=offsetof(struct dig_encoder_stream_setup_parameters_v1_5, bitpercolor)
     p[4..8].copy_from_slice(&(pixel_khz / 10).to_le_bytes());
     Ok(p)
 }
@@ -480,19 +502,27 @@ impl Transmitter {
         // which Linux derives from an unset hpo_engine_id on the DIO path;
         // DCN3.0 has no HPO, so it is sent as instance 0.
         let mut p = [0u8; 60];
+        // linux-lit: 0=offsetof(struct dig_transmitter_control_parameters_v1_6, phyid)
         p[0] = self.transmitter;
+        // linux-lit: 1=offsetof(struct dig_transmitter_control_parameters_v1_6, action)
         p[1] = self.action as u8;
+        // linux-lit: 2=offsetof(struct dig_transmitter_control_parameters_v1_6, mode_laneset)
         p[2] = if self.action == TransmitterAction::SetupVsemph {
             lane_set
         } else {
             self.mode as u8
         };
+        // linux-lit: 3=offsetof(struct dig_transmitter_control_parameters_v1_6, lanenum)
         p[3] = self.lanes;
+        // linux-lit: 4=offsetof(struct dig_transmitter_control_parameters_v1_6, symclk_10khz); 8=offsetof(struct dig_transmitter_control_parameters_v1_6, hpdsel)
         p[4..8].copy_from_slice(&(self.symbol_khz / 10).to_le_bytes());
+        // linux-lit: 8=offsetof(struct dig_transmitter_control_parameters_v1_6, hpdsel)
         p[8] = self.hpd.map_or(0, |h| h + 1);
-        p[9] = 0;
+        p[9] = 0; // linux-lit: 9=offsetof(struct set_pixel_clock_parameter_v1_7, deep_color_ratio)
+                  // linux-lit: 10=offsetof(struct dig_transmitter_control_parameters_v1_6, connobj_id)
         p[10] = self.connector;
         if revision == 7 {
+            // linux-lit: 11=offsetof(struct dmub_dig_transmitter_control_data_v1_7, HPO_instance)
             p[11] = 0;
         }
         Ok(p)

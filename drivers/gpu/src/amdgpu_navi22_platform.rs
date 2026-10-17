@@ -103,6 +103,7 @@ fn training_clients(protected: &[vram::Protected]) -> Result<(), Error> {
     // by racing a CPU backup/restore. No caller-supplied OtherClient ranges
     // exist here: Plan produces those only from inherited display surfaces.
     if protected.iter().any(|region| {
+        // linux: n/a (NARF policy: protected 32 MiB VRAM prefix)
         region.range.start < 32 * 1024 * 1024
             && !matches!(
                 region.owner,
@@ -509,7 +510,7 @@ pub(crate) async fn power_sample() -> Result<crate::amdgpu_navi22_power::Sample,
 
 /// Faults logged before the service only counts them (Linux rate-limits
 /// `gmc_v10_0_process_interrupt`'s report the same way).
-const FAULT_LOG_LIMIT: u64 = 16;
+const FAULT_LOG_LIMIT: u64 = 16; // linux: n/a (NARF policy)
 static FAULTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Faults delivered to the service since boot.
 pub fn fault_count() -> u64 {
@@ -851,8 +852,8 @@ pub async unsafe fn modeset_displays(
 
 /// Poll period of the display monitor; DRM requests and recoveries wake it
 /// within `MONITOR_STEP_MS`.
-const MONITOR_MS: u64 = 1000;
-const MONITOR_STEP_MS: u64 = 50;
+const MONITOR_MS: u64 = 1000; // linux: n/a (NARF policy)
+const MONITOR_STEP_MS: u64 = 50; // linux: n/a (NARF policy)
 static MONITOR: AtomicBool = AtomicBool::new(false);
 /// Recoveries the display was last lit after.
 static RELIT: AtomicU64 = AtomicU64::new(0);

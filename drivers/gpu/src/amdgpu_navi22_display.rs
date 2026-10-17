@@ -23,16 +23,16 @@ use narf_capabilities::{Cap, Write};
 use narf_edid::DetailedTiming;
 
 /// One base block plus up to four extensions, as `amdgpu_ddc` bounds them.
-const MAX_BLOCKS: usize = 1 + crate::amdgpu_ddc::MAX_EXT_BLOCKS as usize;
-const BLOCK: usize = 128;
+const MAX_BLOCKS: usize = 1 + crate::amdgpu_ddc::MAX_EXT_BLOCKS as usize; // linux: n/a (NARF bound)
+const BLOCK: usize = 128; // linux: n/a (EDID_LENGTH 128, include/drm/drm_edid.h)
 /// `drm_do_get_edid` retries a block that fails its checksum four times.
-const BLOCK_TRIES: u32 = 4;
-const DDC_EDID: u8 = 0x50;
-const DDC_SEGMENT: u8 = 0x30;
+const BLOCK_TRIES: u32 = 4; // linux: n/a (literal 4 in drm_edid.c:drm_do_get_edid)
+const DDC_EDID: u8 = 0x50; // linux: n/a (DDC_ADDR 0x50, include/drm/drm_edid.h)
+const DDC_SEGMENT: u8 = 0x30; // linux: n/a (DDC_SEGMENT_ADDR 0x30, local in drm_edid.c)
 /// HDMI 2.0 SCDC.
-pub const DDC_SCDC: u8 = 0x54;
+pub const DDC_SCDC: u8 = 0x54; // linux: n/a (HDMI_SCDC_ADDRESS 0x54, dc/dc_hdmi_types.h)
 /// DPCD receiver capability field, `DP_DPCD_REV` .. `DP_RECEIVE_PORT_1_CAP_1`.
-const DPCD_CAPS: usize = 16;
+const DPCD_CAPS: usize = 16; // linux: DP_ADAPTER_CAP - DP_DPCD_REV + 1
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -66,8 +66,8 @@ impl Connector {
     /// and CONNECTOR_ID_DISPLAY_PORT, as the VBIOS transmitter table takes it.
     pub fn object_id(&self) -> u8 {
         match self.signal {
-            Signal::Hdmi => 12,
-            Signal::DisplayPort => 19,
+            Signal::Hdmi => 12,        // linux-lit: 12=CONNECTOR_ID_HDMI_TYPE_A
+            Signal::DisplayPort => 19, // linux-lit: 19=CONNECTOR_ID_DISPLAY_PORT
         }
     }
     fn from_path(path: Path) -> Option<Self> {
@@ -147,8 +147,8 @@ pub(crate) struct Detector<I: Io> {
 }
 /// How long a freshly enabled HPD block may read disconnected before the
 /// filter has run: the longest connect delay plus margin.
-const HPD_SETTLE_MS: u64 = 1000;
-const HPD_SETTLE_POLL_MS: u64 = 10;
+const HPD_SETTLE_MS: u64 = 1000; // linux: n/a (NARF policy)
+const HPD_SETTLE_POLL_MS: u64 = 10; // linux: n/a (NARF policy)
 impl<I: Io> Detector<I> {
     pub(crate) fn new_with(engine: Engine<I>, paths: &[Path]) -> Result<Self, Error> {
         Ok(Self {
@@ -283,7 +283,7 @@ fn sink(edid: Vec<u8>, dpcd: Option<[u8; DPCD_CAPS]>) -> Sink {
         .ok()
         .and_then(|block| block.preferred_mode());
     let hdmi = edid[BLOCK..].chunks_exact(BLOCK).any(|ext| {
-        ext[0] == 0x02
+        ext[0] == 0x02 // linux: n/a (CEA_EXT 0x02, include/drm/drm_edid.h)
             && narf_edid::cta861::CtaExtension::parse(ext)
                 .ok()
                 .and_then(|cta| cta.hdmi_vsdb())
@@ -367,9 +367,11 @@ pub(crate) async fn read_edid<I: Io>(
         .map_err(|_| Error::Allocation)?;
     edid.resize(BLOCK, 0);
     read_block(engine, line, mode, 0, &mut edid[..BLOCK]).await?;
+    // linux: n/a (EDID header, drm_edid.c edid_header[])
     if edid[..8] != [0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0] {
         return Err(Error::Edid(narf_edid::EdidError::BadHeader));
     }
+    // linux: n/a (EDID byte 126 extension count, struct edid.extensions)
     let blocks = (1 + usize::from(edid[126])).min(MAX_BLOCKS);
     edid.resize(blocks * BLOCK, 0);
     for index in 1..blocks {
@@ -536,7 +538,7 @@ pub struct Hotplug(narf_lib::sync::IrqSafeSpinLock<(u64, Vec<core::task::Waker>)
 pub static HOTPLUG: Hotplug = Hotplug(narf_lib::sync::IrqSafeSpinLock::new((0, Vec::new())));
 /// A level-triggered source that is not acked would re-fire at once; never
 /// return to a poller more often than this.
-pub const HOTPLUG_MIN_MS: u64 = 50;
+pub const HOTPLUG_MIN_MS: u64 = 50; // linux: n/a (NARF policy)
 impl Hotplug {
     pub fn version(&self) -> u64 {
         self.0.lock().0
