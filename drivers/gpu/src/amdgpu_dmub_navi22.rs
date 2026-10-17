@@ -491,19 +491,19 @@ impl<I: Io> Engine<I> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VbiosCommand {
     /// `DMUB_CMD__VBIOS_DIGX_ENCODER_CONTROL`: `dig_encoder_control_parameters_v1_5`.
-    DigxEncoderControl = 0,
+    DigxEncoderControl = 0, // linux: DMUB_CMD__VBIOS_DIGX_ENCODER_CONTROL dmub_cmd.h
     /// `DMUB_CMD__VBIOS_DIG1_TRANSMITTER_CONTROL`: the v1.6 parameters or
     /// `dmub_dig_transmitter_control_data_v1_7`.
-    Dig1TransmitterControl = 1,
+    Dig1TransmitterControl = 1, // linux: DMUB_CMD__VBIOS_DIG1_TRANSMITTER_CONTROL dmub_cmd.h
     /// `DMUB_CMD__VBIOS_SET_PIXEL_CLOCK`: `set_pixel_clock_parameter_v1_7`.
-    SetPixelClock = 2,
+    SetPixelClock = 2, // linux: DMUB_CMD__VBIOS_SET_PIXEL_CLOCK dmub_cmd.h
     /// `DMUB_CMD__VBIOS_ENABLE_DISP_POWER_GATING`:
     /// `enable_disp_power_gating_parameters_v2_1`.
-    EnableDispPowerGating = 3,
+    EnableDispPowerGating = 3, // linux: DMUB_CMD__VBIOS_ENABLE_DISP_POWER_GATING dmub_cmd.h
 }
-const DMUB_CMD_VBIOS: u8 = 128;
+const DMUB_CMD_VBIOS: u8 = 128; // linux: DMUB_CMD__VBIOS dmub_cmd.h
 /// dc_dmub_srv.c MAX_WAIT_US: dmub_srv_wait_for_idle's bound.
-const VBIOS_WAIT_US: u64 = 100_000;
+const VBIOS_WAIT_US: u64 = 100_000; // linux: MAX_WAIT_US dc_dmub_srv.c
 impl VbiosCommand {
     /// `sizeof(cmd.X) - sizeof(cmd.X.header)` under dmub_cmd.h's
     /// `#pragma pack(1)`: the payload union/struct size.

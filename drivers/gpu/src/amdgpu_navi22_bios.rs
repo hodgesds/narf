@@ -397,31 +397,34 @@ pub struct PixelClock {
     pub pll: u8,
     /// The path's physical transmitter, which names the UNIPHY encoder.
     pub transmitter: u8,
-    /// Pixel clock in kHz; zero powers the PLL down.
-    pub pixel_khz: u32,
+    /// `bp_params->target_pixel_clock_100hz`: the PLL target in 100 Hz
+    /// units (`actual_pix_clk_100hz`, deep-colour scaled), sent verbatim as
+    /// `pixclk_100hz`; zero powers the PLL down.
+    pub pixel_100hz: u32,
+    /// `transmitter_color_depth_to_atom`: PIXEL_CLOCK_V7_DEEPCOLOR_RATIO_DIS
+    /// (0), _5_4 (1), _3_2 (2) or _2_1 (3).
+    pub deep_color: u8,
 }
 impl PixelClock {
     fn params(&self) -> Result<[u8; 16], Error> {
-        if self.otg >= STREAMS || self.pll >= STREAMS || self.transmitter >= STREAMS {
+        if self.otg >= STREAMS
+            || self.pll >= STREAMS
+            || self.transmitter >= STREAMS
+            || self.deep_color > 3
+        {
             return Err(Error::Invalid);
         }
         let mut p = [0u8; 16];
-        // pixclk_100hz (actual = requested at 24 bpp), pll_id, encoderobjid,
-        // encoder_mode, miscinfo (XTALIN reference: 0), crtc_id, and
-        // deep_color_ratio (PIXEL_CLOCK_V7_DEEPCOLOR_RATIO_DIS: 0).
-        p[..4].copy_from_slice(
-            &self
-                .pixel_khz
-                .checked_mul(10)
-                .ok_or(Error::Invalid)?
-                .to_le_bytes(),
-        );
+        // set_pixel_clock_v7: pixclk_100hz, pll_id, encoderobjid,
+        // encoder_mode, miscinfo (XTALIN reference: 0), crtc_id and
+        // deep_color_ratio.
+        p[..4].copy_from_slice(&self.pixel_100hz.to_le_bytes());
         p[4] = ATOM_COMBOPHY_PLL0 + self.pll;
         p[5] = UNIPHY_OBJECT_IDS[usize::from(self.transmitter / 2)];
         p[6] = ATOM_ENCODER_MODE_HDMI;
         p[7] = 0;
         p[8] = self.otg;
-        p[9] = 0;
+        p[9] = self.deep_color;
         Ok(p)
     }
 }

@@ -55,20 +55,20 @@ const DOMAIN0_PG_CONFIG: u64 = 0x0080;
 const PLANE_DOMAINS: core::ops::Range<u64> = 0..12;
 const DSC_DOMAIN16_PG_CONFIG: u64 = 0x00a1;
 /// DSC_TOP0_DSC_TOP_CONTROL (stride 0x5c) and DSCRM0_DSCRM_DSC_FORWARD_CONFIG.
-const DSC_TOP_CONTROL: u64 = 0x3000;
-const DSC_TOP_STRIDE: u64 = 0x5c;
-const DSC_CLOCK_EN: u32 = 1 << 0;
-const DSCRM_DSC_FORWARD_CONFIG: u64 = 0x1a64;
-const DSCRM_DSC_FORWARD_EN: u32 = 1 << 0;
-const DSCRM_DSC_OPP_PIPE_SOURCE: u32 = 0x70;
+const DSC_TOP_CONTROL: u64 = 0x3000; // linux: mmDSC_TOP0_DSC_TOP_CONTROL dcn_3_0_0_offset.h
+const DSC_TOP_STRIDE: u64 = 0x5c; // linux: mmDSC_TOP1_DSC_TOP_CONTROL - mmDSC_TOP0_DSC_TOP_CONTROL dcn_3_0_0_offset.h
+const DSC_CLOCK_EN: u32 = 1 << 0; // linux: DSC_TOP0_DSC_TOP_CONTROL__DSC_CLOCK_EN_MASK dcn_3_0_0_sh_mask.h
+const DSCRM_DSC_FORWARD_CONFIG: u64 = 0x1a64; // linux: mmDSCRM0_DSCRM_DSC_FORWARD_CONFIG dcn_3_0_0_offset.h
+const DSCRM_DSC_FORWARD_EN: u32 = 1 << 0; // linux: DSCRM0_DSCRM_DSC_FORWARD_CONFIG__DSCRM_DSC_FORWARD_EN_MASK dcn_3_0_0_sh_mask.h
+const DSCRM_DSC_OPP_PIPE_SOURCE: u32 = 0x70; // linux: DSCRM0_DSCRM_DSC_FORWARD_CONFIG__DSCRM_DSC_OPP_PIPE_SOURCE_MASK dcn_3_0_0_sh_mask.h
 /// DCN30 `num_dsc`.
-const DSCS: u8 = 6;
+const DSCS: u8 = 6; // linux: res_cap_dcn3.num_dsc dcn30_resource.c
 /// HUBBUB watermark sets (dcn_3_0_0_offset.h, base index 2): five per set
 /// from DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A, NOM/FLIP pairs per set from
 /// DCHUBBUB_ARB_FRAC_URG_BW_NOM_A.
-const WATERMARK_A: u64 = 0x0509;
-const WATERMARK_SET: u64 = 5;
-const FRAC_URG_BW_NOM_A: u64 = 0x053f;
+const WATERMARK_A: u64 = 0x0509; // linux: mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A dcn_3_0_0_offset.h
+const WATERMARK_SET: u64 = 5; // linux: mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_B - _A dcn_3_0_0_offset.h
+const FRAC_URG_BW_NOM_A: u64 = 0x053f; // linux: mmDCHUBBUB_ARB_FRAC_URG_BW_NOM_A dcn_3_0_0_offset.h
 const DOMAIN_POWER_FORCEON: u32 = 1 << 0;
 const DOMAIN_POWER_GATE: u32 = 1 << 8;
 const DOMAIN_PGFSM_PWR_STATUS: u32 = 0xc000_0000;
@@ -87,10 +87,10 @@ const DPG_STRIDE: u64 = 0x5a;
 const DPG_EN: u32 = 1 << 0;
 const DPG_DOUBLE_BUFFER_PENDING: u32 = 1 << 0;
 const ODM_DATA_SOURCE_SELECT: u64 = 0x1acb;
-const ODM_DATA_FORMAT_CONTROL: u64 = 0x1acc;
-const OPTC_DSC_MODE: u32 = 0x30;
-const OPTC_NUM_OF_INPUT_SEGMENT: u32 = 0x3;
-const OPTC_SEG1_SRC_SEL: u32 = 0x0000_f000;
+const ODM_DATA_FORMAT_CONTROL: u64 = 0x1acc; // linux: mmODM0_OPTC_DATA_FORMAT_CONTROL dcn_3_0_0_offset.h
+const OPTC_DSC_MODE: u32 = 0x30; // linux: ODM0_OPTC_DATA_FORMAT_CONTROL__OPTC_DSC_MODE_MASK dcn_3_0_0_sh_mask.h
+const OPTC_NUM_OF_INPUT_SEGMENT: u32 = 0x3; // linux: ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_NUM_OF_INPUT_SEGMENT_MASK dcn_3_0_0_sh_mask.h
+const OPTC_SEG1_SRC_SEL: u32 = 0x0000_f000; // linux: ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG1_SRC_SEL_MASK dcn_3_0_0_sh_mask.h
 const ODM_INPUT_GLOBAL_CONTROL: u64 = 0x1aca;
 const ODM_STRIDE: u64 = 0x10;
 const OPTC_SEG0_SRC_SEL: u32 = 0x0000_0f00;

@@ -112,7 +112,8 @@ fn navi22_bios_parameter_blocks_match_command_table2() -> TestResult {
         otg: 2,
         pll: 0,
         transmitter: 3,
-        pixel_khz: 148_500,
+        pixel_100hz: 1_485_000,
+        deep_color: 0,
     };
     let p = clock.params().unwrap();
     if p[..4] != 1_485_000u32.to_le_bytes()
@@ -120,6 +121,26 @@ fn navi22_bios_parameter_blocks_match_command_table2() -> TestResult {
         || p[10..] != [0; 6]
     {
         return TestResult::Fail("set_pixel_clock_parameter_v1_7");
+    }
+    // 10 bpc HDMI at 25.175 MHz: actual_pix_clk_100hz = 251750 * 5 >> 2 =
+    // 314687, sent verbatim (a kHz path would round to 314680), ratio 5:4.
+    let deep = PixelClock {
+        pixel_100hz: 314_687,
+        deep_color: 1,
+        ..clock
+    };
+    let p = deep.params().unwrap();
+    if p[..4] != 314_687u32.to_le_bytes() || p[9] != 1 {
+        return TestResult::Fail("deep-colour pixclk_100hz / deep_color_ratio");
+    }
+    if (PixelClock {
+        deep_color: 4,
+        ..clock
+    })
+    .params()
+    .is_ok()
+    {
+        return TestResult::Fail("undefined deep colour ratio accepted");
     }
     // encoder_control_digx_v1_5 STREAM_SETUP: DIG 1, HDMI, four lanes.
     let e = hdmi_stream_setup_params(1, 148_500).unwrap();
@@ -185,7 +206,8 @@ fn navi22_bios_interpreter_follows_atom_c_data_blocks_ws_and_delays() -> TestRes
         otg: 0,
         pll: 1,
         transmitter: 0,
-        pixel_khz: 25_175,
+        pixel_100hz: 251_750,
+        deep_color: 0,
     };
     if let Err(error) = tables.set_pixel_clock(bus.clone(), &clock) {
         let _ = error;
@@ -217,7 +239,8 @@ fn navi22_bios_refuses_revisions_and_out_of_window_access() -> TestResult {
         otg: 0,
         pll: 0,
         transmitter: 0,
-        pixel_khz: 25_175,
+        pixel_100hz: 251_750,
+        deep_color: 0,
     };
     if tables.set_pixel_clock(bus(), &clock)
         != Err(Error::Revision {
@@ -284,7 +307,8 @@ fn navi22_bios_tables_go_to_dmub_when_running() -> TestResult {
         otg: 2,
         pll: 0,
         transmitter: 3,
-        pixel_khz: 148_500,
+        pixel_100hz: 1_485_000,
+        deep_color: 0,
     };
     let t = Transmitter {
         action: TransmitterAction::Enable,
@@ -401,7 +425,8 @@ fn navi22_bios_atom_fallback_uses_fb_scratch_size_and_clock() -> TestResult {
         otg: 0,
         pll: 0,
         transmitter: 0,
-        pixel_khz: 25_175,
+        pixel_100hz: 251_750,
+        deep_color: 0,
     };
     if tables.set_pixel_clock(bus.clone(), &clock) != Err(Error::Atom(AtomError::Stuck))
         || !(20..1000).contains(&bus.borrow().calls)

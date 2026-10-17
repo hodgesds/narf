@@ -3947,8 +3947,10 @@ DMUB the tables run on the ATOM interpreter (logged), with
 `now_ms` driving atom.c's 20 s loop guard.
 `pipe_power_gating(bus, pipe, Init|Disable|Enable)`
 (EnableDispPowerGating v2.1), `set_pixel_clock(bus, &PixelClock { otg, pll,
-transmitter, pixel_khz })` (v1.7, combo PHY PLL, UNIPHY encoder object, HDMI
-mode, XTALIN reference), `hdmi_stream_setup(bus, dig, pixel_khz)`
+transmitter, pixel_100hz, deep_color })` (v1.7, combo PHY PLL, UNIPHY encoder
+object, HDMI mode, XTALIN reference; `pixclk_100hz` is the deep-colour-scaled
+`actual_pix_clk_100hz` verbatim and `deep_color_ratio` the
+`transmitter_color_depth_to_atom` code), `hdmi_stream_setup(bus, dig, pixel_khz)`
 (DIGxEncoderControl v1.5 STREAM_SETUP) and `transmitter(bus, &Transmitter)`
 (DIG1TransmitterControl v1.6/1.7, as `dcn10_link_encoder_enable_tmds_output`)
 fill the `atomfirmware.h` blocks exactly as `command_table2.c` does; the ATOM
