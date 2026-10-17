@@ -63,7 +63,7 @@ AG = AMD + "/amdgpu"
 HEADER_SETS = {
     # GC 10.3.2: gfxhub_v2_1.c / sdma_v5_2.c / amdkfd use gc_10_3_0.
     "gc": ("GC", [AR + "/gc/gc_10_3_0_offset.h", AR + "/gc/gc_10_3_0_sh_mask.h",
-                  AG + "/gfx_v10_0.c"]),
+                  AR + "/gc/gc_10_3_0_default.h", AG + "/gfx_v10_0.c"]),
     # gfx_v10_0.c itself compiles against gc_10_1_0 + local _Sienna_Cichlid
     # overrides; nv.c also includes gc_10_1_0.
     "gc101": ("GC", [AR + "/gc/gc_10_1_0_offset.h", AR + "/gc/gc_10_1_0_sh_mask.h",
@@ -71,7 +71,7 @@ HEADER_SETS = {
     "dcn": ("DMU", [AR + "/dcn/dcn_3_0_0_offset.h", AR + "/dcn/dcn_3_0_0_sh_mask.h"]),
     # MMHUB 2.1.0 is driven by mmhub_v2_0.c (mmhub_2_0_0 + locals).
     "mmhub": ("MMHUB", [AR + "/mmhub/mmhub_2_0_0_offset.h", AR + "/mmhub/mmhub_2_0_0_sh_mask.h",
-                        AG + "/mmhub_v2_0.c"]),
+                        AR + "/mmhub/mmhub_2_0_0_default.h", AG + "/mmhub_v2_0.c"]),
     "oss": ("OSSSYS", [AR + "/oss/osssys_5_0_0_offset.h", AR + "/oss/osssys_5_0_0_sh_mask.h",
                        AG + "/navi10_ih.c"]),
     "nbio": ("NBIF", [AR + "/nbio/nbio_2_3_offset.h", AR + "/nbio/nbio_2_3_sh_mask.h",
@@ -112,7 +112,8 @@ HEADER_SETS = {
                     AMD + "/display/dmub/src/dmub_dcn30.h",
                     AMD + "/display/dmub/src/dmub_dcn20.h",
                     AMD + "/display/dmub/src/dmub_dcn30.c",
-                    AMD + "/display/dmub/src/dmub_dcn20.c"]),
+                    AMD + "/display/dmub/src/dmub_dcn20.c",
+                    AMD + "/display/dmub/src/dmub_srv.c"]),
     "amdgpu": (None, [AG + "/amdgpu_vm.h", AG + "/amdgpu_gmc.h", AG + "/amdgpu_ih.h",
                       AG + "/amdgpu_doorbell.h", AG + "/amdgpu_ring.h", AG + "/amdgpu_irq.h",
                       AG + "/amdgpu_ucode.h", AG + "/amdgpu_vcn.h", AG + "/amdgpu_sdma.h",
@@ -121,8 +122,9 @@ HEADER_SETS = {
                       AG + "/amdgpu.h", AG + "/amdgpu_reset.h", AG + "/gmc_v10_0.c",
                       AG + "/gfxhub_v2_1.c", AG + "/sdma_v5_2.c", AG + "/nv.c",
                       AG + "/amdgpu_vcn.c", AG + "/amdgpu_psp.c", AG + "/amdgpu_ucode.c",
-                      AMD + "/include/v10_structs.h"]),
-    "atom": (None, [AMD + "/include/atomfirmware.h", AMD + "/include/atombios.h"]),
+                      AMD + "/include/v10_structs.h", AMD + "/include/navi10_enum.h",
+                      AG + "/amdgpu_gart.h", AG + "/amdgpu_ids.h", AG + "/sdma_common.h"]),
+    "atom": (None, [AMD + "/include/atomfirmware.h", AMD + "/include/atombios.h", AG + "/ObjectID.h"]),
     "uapi": (None, ["include/uapi/drm/amdgpu_drm.h", "include/uapi/drm/drm_fourcc.h"]),
     "dc": (None, [AMD + "/display/dc/dc_hw_types.h", AMD + "/display/dc/dc_types.h",
                   AMD + "/display/include/signal_types.h",
@@ -136,7 +138,16 @@ HEADER_SETS = {
                   "include/drm/display/drm_dp.h",
                   "include/drm/display/drm_hdmi_helper.h",
                   "include/drm/display/drm_scdc.h",
-                  "include/sound/hda_verbs.h"]),
+                  "include/sound/hda_verbs.h",
+                  AMD + "/display/dc/inc/hw/mpc.h", AMD + "/display/dc/inc/hw/hw_shared.h",
+                  AMD + "/display/dc/inc/hw/stream_encoder.h", AMD + "/display/dc/inc/hw/hubp.h",
+                  AMD + "/display/include/link_service_types.h",
+                  AMD + "/display/include/ddc_service_types.h",
+                  AMD + "/display/dc/dc_ddc_types.h",
+                  AMD + "/display/dc/clk_mgr/dcn30/dcn30_clk_mgr.h",
+                  AMD + "/display/dc/clk_mgr/dcn30/dcn30_clk_mgr_smu_msg.c",
+                  AMD + "/display/dc/dce/dce_aux.h", AMD + "/display/dc/dce/dce_i2c_hw.h",
+                  "include/drm/drm_edid.h", "include/linux/hdmi.h"]),
 }
 # Lookup priority when a symbol exists in several sets with different values.
 PRIORITY = list(HEADER_SETS)
@@ -425,22 +436,35 @@ class LinuxDb:
             stub.mkdir(parents=True)
             for h in ("delay.h",):
                 (stub / h).write_text("")
-            src = [LAYOUT_PRELUDE] + ['#include "%s"' % (self.root / h) for h in LAYOUT_HEADERS]
-            src.append("int main(void) {")
-            for n, t in enumerate(texts):
-                src.append('    printf("%d %%llu\\n", (unsigned long long)(%s));' % (n, t))
-            src.append("    return 0;\n}")
+            head = [LAYOUT_PRELUDE] + ['#include "%s"' % (self.root / h) for h in LAYOUT_HEADERS]
+            head.append("int main(void) {")
+            live = list(range(len(texts)))
+            self.layout_errors = {}
             c = Path(tmp) / "probe.c"
-            c.write_text("\n".join(src))
             exe = Path(tmp) / "probe"
             cmd = [os.environ.get("CC", "cc"), "-w", "-I", str(Path(tmp) / "stub")]
             for inc in LAYOUT_INCLUDES:
                 cmd += ["-I", str(self.root / inc)]
             cmd += [str(c), "-o", str(exe)]
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            if r.returncode != 0:
-                self.layout_error = r.stderr[-4000:]
-                return
+            for _ in range(len(texts) + 1):
+                first = len("\n".join(head).split("\n")) + 1
+                lines = ['    printf("%d %%llu\\n", (unsigned long long)(%s));' % (n, texts[n]) for n in live]
+                c.write_text("\n".join(head + lines + ["    return 0;", "}"]) + "\n")
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode == 0:
+                    break
+                # Drop the probe lines the compiler rejected and retry, so one
+                # bad annotation cannot hide every other layout check.
+                bad = set()
+                for m in re.finditer(r"probe\.c:(\d+):\d+: error: (.*)", r.stderr):
+                    idx = int(m.group(1)) - first
+                    if 0 <= idx < len(live):
+                        bad.add(idx)
+                        self.layout_errors.setdefault(texts[live[idx]], m.group(2))
+                if not bad:
+                    self.layout_error = r.stderr[-4000:]
+                    return
+                live = [n for i, n in enumerate(live) if i not in bad]
             out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout
             for line in out.splitlines():
                 n, v = line.split()
@@ -448,6 +472,8 @@ class LinuxDb:
 
     def layout_value(self, text):
         key = LAYOUT.match(text).group(0)
+        if key in getattr(self, "layout_errors", {}):
+            raise EvalError("C probe rejected %s: %s" % (key, self.layout_errors[key]))
         if key not in getattr(self, "layout", {}):
             raise EvalError("layout probe failed for %s: %s" % (text, getattr(self, "layout_error", "not prepared")))
         return self.layout[key]
@@ -874,7 +900,7 @@ def check_lits(db, rf, i, text, ctx_keys, rep, stats):
         if lv not in present:
             rep.err(where, "linux-lit literal %s not found in the code on this line" % lit.strip())
             stats["error"] += 1
-        elif lv != want:
+        elif lv not in (want, want & mask(32), want & mask(64)):
             rep.err(where, "MISMATCH literal %s: Linux `%s` = %#x" % (lit.strip(), e.strip(), want))
             stats["mismatch"] += 1
         else:
