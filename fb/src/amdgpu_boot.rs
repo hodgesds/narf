@@ -93,6 +93,11 @@ pub(super) fn start() -> InitResult {
     // pumps, not the executor. No spinlock guard is held; spin works even if
     // this boot profile has not enabled interrupts yet.
     // SAFETY: all CPU writers remain paused until successful terminal return.
+    // `amdgpu.navi22_accel`: advertise native client submission (Mesa
+    // radeonsi/RADV). Off by default until validated on hardware.
+    narf_drivers_gpu::amdgpu_info_navi22::set_accel(
+        narf_boot::args().has_flag("amdgpu.navi22_accel"),
+    );
     let ok = if navi48 {
         // SAFETY: the retained prepared owner and paused CPU writers persist.
         let result = narf_scheduler::block_on_spin(unsafe { navi48::run() });
@@ -136,6 +141,13 @@ pub(super) fn start() -> InitResult {
         }
         if native {
             navi22_native_display();
+        }
+        // Power saving (GFXOFF, clock gating, memory DPM, ...) only on an
+        // explicit `amdgpu.navi22_pg=` list; a default boot programs none.
+        if let Some(value) = narf_boot::args().value("amdgpu.navi22_pg") {
+            // SAFETY: after a successful firmware run; the TDR sampler takes
+            // GFXOFF references and no other GC MMIO client runs yet.
+            let _ = narf_scheduler::block_on_spin(unsafe { platform::power_saving(value) });
         }
     }
     // `amdgpu.max_bpc=10|12`: allow HDMI deep colour, as DRM's max bpc.

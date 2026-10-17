@@ -445,6 +445,62 @@ fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, 
     Ok(paths)
 }
 
+/// `ATOM_ENCODER_CAP_RECORD_TYPE`, and its HDMI6Gbps_EN bit.
+const RECORD_ENCODER_CAP: u8 = 20;
+pub const ENCODER_CAP_HDMI6GBPS_EN: u32 = 0x04;
+/// `bios_parser_get_encoder_cap_info` for the encoder that drives physical
+/// transmitter `transmitter` (`get_bios_object`: the first path naming it):
+/// the `atom_encoder_caps_record.encodercaps` of its encoder record list.
+/// None when there is no such record, which Linux also reports for every
+/// v1.5 object table (`BP_RESULT_NORECORD`); the link encoder then keeps
+/// its defaults (HDMI_6GB_EN 1).
+pub fn encoder_caps(vbios: &[u8], transmitter: u8) -> Result<Option<u32>, Error> {
+    let info = table(vbios, TABLE_DISPLAY_OBJECT_INFO)?;
+    let base = usize::from(
+        directory(vbios)?
+            .table_offset(TABLE_DISPLAY_OBJECT_INFO)
+            .ok_or(Error::Missing)?,
+    );
+    header(info, 1, &[4, 5])?;
+    if info[3] == 5 {
+        return Ok(None);
+    }
+    if info.len() < PATHS_OFFSET {
+        return Err(Error::Invalid);
+    }
+    let count = info[6] as usize;
+    if PATHS_OFFSET + count * PATH_SIZE > u16_at(info, 0) as usize {
+        return Err(Error::Invalid);
+    }
+    let Some(entry) = info[PATHS_OFFSET..][..count * PATH_SIZE]
+        .chunks_exact(PATH_SIZE)
+        .find(|e| self::transmitter(u16_at(e, 4)) == Ok(transmitter))
+    else {
+        return Ok(None);
+    };
+    let offset = u16_at(entry, 8);
+    if offset == 0 {
+        return Ok(None);
+    }
+    let mut at = base
+        .checked_add(usize::from(offset))
+        .ok_or(Error::Invalid)?;
+    for _ in 0..MAX_RECORDS {
+        let head = vbios.get(at..at + RECORD_HEADER).ok_or(Error::Invalid)?;
+        let size = usize::from(head[1]);
+        // get_encoder_cap_record stops at the end record or a zero size.
+        if head[0] == RECORD_END || size == 0 {
+            return Ok(None);
+        }
+        if head[0] == RECORD_ENCODER_CAP && size >= RECORD_HEADER + 4 {
+            let record = vbios.get(at + 2..at + 6).ok_or(Error::Invalid)?;
+            return Ok(Some(u32::from_le_bytes(record.try_into().unwrap())));
+        }
+        at += size;
+    }
+    Err(Error::Invalid)
+}
+
 /// `atom_master_list_of_data_tables_v2_1::vram_info`.
 const TABLE_VRAM_INFO: u16 = 28;
 /// `atom_vram_info_header_v2_5`: the four-byte header, eight u16 offsets and

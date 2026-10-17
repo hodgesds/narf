@@ -138,6 +138,10 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
     }
     let authority = amdgpu::pci_authority().ok_or(Error::Authority)?;
     let device = amdgpu::pci_device().ok_or(Error::Authority)?;
+    // pdev->revision (cfg 0x08), the amdgpu.ids key with the device id.
+    if let Ok(class_rev) = narf_bus::pci::read_config32(&authority, &device, 0x08) {
+        crate::amdgpu_info::publish_navi22_pci_revision(class_rev as u8);
+    }
     let identity = crate::amdgpu_power_navi22::Identity::read(&device, &authority)
         .map_err(|error| Error::Firmware(boot::Error::Power(error)))?;
     let registry: Cap<narf_firmware::FirmwareRegistry, Read> =
@@ -265,8 +269,23 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     let mut owner = OWNER.lock().await;
     let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
     let report = boot.run().await?;
+    // AMDGPU_INFO_FW_VERSION and DPM clocks describe what actually loaded.
+    if let Some(firmware) = boot.uapi_versions() {
+        crate::amdgpu_info::publish_navi22_boot(crate::amdgpu_info_navi22::Boot {
+            firmware,
+            smc: report.smu.firmware,
+            gfx_mhz: report.power_status.map(|p| (p.gfx_min_mhz, p.gfx_max_mhz)),
+            queues_verified: report.queues.is_some(),
+        });
+    }
     start_services(boot).await;
     Ok(report)
+}
+
+/// Serialised access to the retained owner for client submission
+/// (`amdgpu_navi22_cs`). Never held across a fence wait.
+pub(crate) async fn owner() -> narf_lib::mutex::MutexGuard<'static, Option<boot::ColdBoot>> {
+    OWNER.lock().await
 }
 
 /// Runtime services of a completed (or recovered) owner: PMFW telemetry and
@@ -274,6 +293,12 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
 /// take the owner lock per refresh. Failures are reported, never fatal.
 async fn start_services(boot: &mut boot::ColdBoot) {
     use core::fmt::Write;
+    // Clients' command submissions and VRAM buffers (generic CS/GEM path).
+    if boot.queues_verified()
+        && crate::amdgpu_info_navi22::submission() == crate::amdgpu_info_navi22::Submission::Wired
+    {
+        crate::amdgpu_navi22_cs::register(boot).await;
+    }
     start_hotplug(boot);
     if boot.queues_verified() {
         crate::amdgpu_navi22_tdr::start();
@@ -342,6 +367,10 @@ fn start_hotplug(boot: &mut boot::ColdBoot) {
 /// TDR sample of every verified kernel queue, serialized with the owner.
 pub(crate) async fn queue_progress(
 ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_tdr::Progress>, boot::Error> {
+    // The sample reads CP registers: hold GC powered (no-op without GFXOFF).
+    let _gc = crate::amdgpu_navi22_gfxoff::Reference::acquire()
+        .await
+        .map_err(|_| boot::Error::Busy)?;
     let mut owner = OWNER.lock().await;
     owner.as_mut().ok_or(boot::Error::Invalid)?.queue_progress()
 }
@@ -424,6 +453,7 @@ impl crate::amdgpu_navi22_recovery::Backend for Recovering<'_> {
 pub async unsafe fn recover() -> Result<boot::Report, crate::amdgpu_navi22_recovery::Error> {
     use crate::amdgpu_navi22_recovery::Error;
     let mut recovery = RECOVERY.try_lock().ok_or(Error::Busy)?;
+    crate::amdgpu_navi22_cs::unregister();
     let device = amdgpu::pci_device().ok_or(Error::Busy)?;
     let mut owner = OWNER.lock().await;
     let mut backend = Recovering {
@@ -1189,6 +1219,105 @@ async unsafe fn present_native(
     let before = boot.display_scanout()?.front().fb;
     boot.flip_display().await?;
     Ok((before, boot.display_scanout()?.front().fb))
+}
+
+// ── Opt-in power saving (`amdgpu.navi22_pg`) ────────────────────────────
+
+/// Apply the features named by the `amdgpu.navi22_pg=` boot argument's
+/// value that the power policy admits (amdgpu_navi22_power_saving), then
+/// start GFXOFF if it was admitted. Never called on a default boot. Each
+/// refusal is reported on the console.
+///
+/// # Safety
+/// After a successful `run`; every GC MMIO client (TDR, uapi/CS) takes a
+/// GFXOFF reference, and the caller holds neither lock.
+pub async unsafe fn power_saving(
+    value: &str,
+) -> Result<crate::amdgpu_navi22_power_saving::Applied, boot::Error> {
+    use core::fmt::Write;
+    let optin = crate::amdgpu_navi22_power_policy::OptIn::parse(Some(value));
+    if optin.is_empty() {
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: navi22 power saving: unrecognised amdgpu.navi22_pg={value}; nothing enabled"
+        );
+        return Err(boot::Error::Invalid);
+    }
+    let result = {
+        let mut owner = OWNER.lock().await;
+        let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
+        // SAFETY: owner lock held, GFXOFF not started (it starts below).
+        unsafe { boot.apply_power_saving(optin) }.await
+    };
+    let applied = match result {
+        Ok(applied) => applied,
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 power saving failed: {error:?}"
+            );
+            return Err(error);
+        }
+    };
+    for (feature, refusal) in crate::amdgpu_navi22_power_policy::FEATURES
+        .iter()
+        .zip(applied.plan.refusals)
+    {
+        if let Some(refusal) = refusal
+            .filter(|r| !matches!(r, crate::amdgpu_navi22_power_policy::Refusal::NotOptedIn(_)))
+        {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 power saving: {feature:?} refused: {refusal:?}"
+            );
+        }
+    }
+    if applied.plan.policy.gfxoff() {
+        if let Err(error) = crate::amdgpu_navi22_gfxoff::start().await {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 GFXOFF start: {error:?}"
+            );
+        }
+    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: navi22 power saving (unvalidated opt-in): cg {:?}, smu {:#x}, wm {}, uclk {:?}, fclk {:?}, gfxoff {}",
+        applied.blocks,
+        applied.smu_bits,
+        applied.watermarks,
+        applied.uclk_floor_mhz,
+        applied.fclk_floor_mhz,
+        applied.plan.policy.gfxoff()
+    );
+    Ok(applied)
+}
+
+/// Undo `power_saving`: stop GFXOFF (GC powered on return), then floors,
+/// PMFW bits and clock gating in reverse.
+///
+/// # Safety
+/// As `power_saving`.
+pub async unsafe fn remove_power_saving() -> Result<(), boot::Error> {
+    let stopped = crate::amdgpu_navi22_gfxoff::stop().await;
+    let mut owner = OWNER.lock().await;
+    let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
+    // A failed stop leaves GC power unknown: do not touch GC clock gating.
+    stopped.map_err(|e| {
+        boot::Error::PowerSaving(crate::amdgpu_navi22_power_saving::Error::GfxOff(e))
+    })?;
+    // SAFETY: owner lock held, GFXOFF stopped above.
+    unsafe { boot.remove_power_saving() }.await
+}
+
+/// The GFXOFF controller's PMFW transport (`smu_v11_0_gfx_off_control`).
+pub(crate) async fn gfx_off_control(allow: bool) -> Result<(), boot::Error> {
+    let mut owner = OWNER.lock().await;
+    owner
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .gfx_off_control(allow)
+        .await
 }
 
 #[cfg(feature = "kernel-test")]

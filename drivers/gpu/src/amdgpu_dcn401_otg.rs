@@ -46,7 +46,7 @@ pub use hdmi_link::audio::MstAudioPayload;
 pub(crate) use hdmi_link::audio::{
     acr, channels, descriptors, frl_audio_info, mst_audio_info, uhbr_audio_info,
 };
-pub(crate) use hdmi_link::avi_infoframe;
+pub(crate) use hdmi_link::{avi_infoframe, vendor_infoframe};
 pub use hdmi_link::{
     AudioInfo, AudioMode, Avi, DisplayAudio, HdmiLinkReady, HdmiLinkRequest, HdmiVideoRunning,
     TMDS_MAX_KHZ, TMDS_SCRAMBLE_KHZ,

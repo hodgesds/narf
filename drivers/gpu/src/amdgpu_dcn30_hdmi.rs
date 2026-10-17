@@ -1,6 +1,7 @@
 //! Navi22 DCN3.0 HDMI TMDS stream: the DIG frontend/backend and VPG register
 //! half of Linux's HDMI enable, around the VBIOS STREAM_SETUP and transmitter
-//! tables that `amdgpu_navi22_bios` runs. Sequences follow
+//! tables that `amdgpu_navi22_bios` runs, plus the HDMI 2.0 decisions and the
+//! sink-side SCDC protocol. Sequences follow
 //! `dcn30_dio_stream_encoder.c::enc3_stream_encoder_hdmi_set_stream_attribute`,
 //! `enc3_update_hdmi_info_packet`, `enc3_stream_encoder_update_hdmi_info_packets`
 //! and `enc3_stream_encoder_stop_hdmi_info_packets`, `dcn30_vpg.c::
@@ -10,12 +11,33 @@
 //! `_sh_mask.h` at DCN base index 2; DIG frontends, backends and VPGs stride
 //! 0x100.
 //!
-//! Scope is 8-bpc RGB TMDS at or below 340 MHz: no scrambling (which needs
-//! the sink's SCDC first), no deep colour, no audio. Linux also starts the
-//! Audio InfoFrame; with no audio endpoint here nothing is sent for it.
-use crate::{amdgpu::AmdGpu, amdgpu_dcn_profile::Profile};
+//! HDMI 2.0 (`link_dpms.c::enable_link_hdmi`, `link_ddc.c::write_scdc_data` /
+//! `read_scdc_data`): a TMDS character clock above 340 MHz scrambles with a
+//! 1/4-rate clock channel, and the sink is told over SCDC (I2C 0x54) before
+//! the transmitter starts; a sink declaring LTE_340Mcsc_scramble scrambles
+//! below it too. On the way down `link_set_dpms_off` returns an SCDC sink to
+//! legacy TMDS ([`write_scdc_legacy`]). Linux's encoder switches at >= 340 MHz
+//! but tells the sink only at > 340 MHz; both use > here, as the Navi48 path
+//! does, so source and sink never disagree.
+//!
+//! Output formats follow amdgpu_dm (`convert_color_depth_from_display_info`,
+//! `create_validate_stream_for_sink`'s 2-bpc step-down and 4:2:0 retry)
+//! against `dcn10_link_encoder_validate_hdmi_output` with DCN3.0's
+//! `link_enc_feature` (12 bpc, 600 MHz, 4:2:0, HDMI_6GB_EN from the VBIOS
+//! encoder caps): RGB at 8, 10 or 12 bpc up to `amdgpu.max_bpc`, YCbCr 4:2:0
+//! (8 bpc, BT.709) for modes the sink takes only that way or that fit no RGB
+//! depth. The pixel-path half (FMT, OTG, MPC OCSC, DPG black) is
+//! [`Formatter`].
+use crate::{
+    amdgpu::AmdGpu, amdgpu_dcn30_dp::Aux, amdgpu_dcn_profile::Profile, amdgpu_dml::Timing,
+    amdgpu_navi22_modeset::Error as LinkError,
+};
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
+
+#[path = "amdgpu_dcn30_hdmi_format.rs"]
+mod format;
+pub use format::Formatter;
 
 const STRIDE: u64 = 0x100;
 // VPG instance (per stream frontend).
@@ -65,11 +87,21 @@ const DIG_MODE: u32 = 0x0007_0000;
 const DIG_ENABLE: u32 = 1 << 0;
 /// `enc3_update_hdmi_info_packet` sends on line 2.
 const INFO_PACKET_LINE: u32 = 2;
-/// The highest TMDS rate without scrambling (`HDMI_CLOCK_CHANNEL_RATE_MORE_340M`).
+/// The highest TMDS character rate without scrambling
+/// (`HDMI_CLOCK_CHANNEL_RATE_MORE_340M`).
 pub const TMDS_SCRAMBLE_KHZ: u32 = 340_000;
-/// Packets `enc3_stream_encoder_update_hdmi_info_packets` manages: AVI (0) is
-/// sent; vendor (1), gamut (2), SPD (3), HDR (4), HF-VSIF (5), VTEM (6) not.
-const MANAGED_PACKETS: u32 = 7;
+/// DCN3.0 `link_enc_feature.max_hdmi_pixel_clock`.
+pub const TMDS_MAX_KHZ: u32 = 600_000;
+/// `TMDS_MIN_PIXEL_CLOCK`.
+pub const TMDS_MIN_KHZ: u32 = 25_000;
+/// Without HDMI_6GB_EN `dcn10_link_encoder_validate_hdmi_output` refuses a
+/// character clock of 300 MHz and up.
+pub const TMDS_NO_6G_KHZ: u32 = 300_000;
+/// `enc3_stream_encoder_update_hdmi_info_packets`' packets in its order:
+/// AVI (0), HF-VSIF (5), gamut (2), vendor (1), SPD (3), HDR (4), VTEM (6).
+const PACKET_ORDER: [u32; 7] = [0, 5, 2, 1, 3, 4, 6];
+const PACKET_AVI: u32 = 0;
+const PACKET_VENDOR: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -81,6 +113,351 @@ pub enum Error {
     Busy,
     /// The VPG reported a GSP memory conflict that never cleared.
     Conflict,
+    /// An SCDC transaction to a sink that must scramble failed, or the DDC
+    /// channel has no SCDC (a DP-only AUX).
+    Scdc,
+    /// A memory power state never settled (`REG_WAIT` bound).
+    Timeout,
+}
+
+/// HDMI 2.0 SCDC registers (`dc_hdmi_types.h`).
+pub mod scdc {
+    /// The sink's 7-bit I2C address.
+    pub const ADDRESS: u8 = 0x54;
+    pub const SINK_VERSION: u8 = 0x01;
+    pub const SOURCE_VERSION: u8 = 0x02;
+    pub const TMDS_CONFIG: u8 = 0x20;
+    pub const SCRAMBLER_STATUS: u8 = 0x21;
+    pub const STATUS_FLAGS: u8 = 0x40;
+    /// TMDS_Config: Scrambling_Enable and TMDS_Bit_Clock_Ratio (1/40).
+    pub const SCRAMBLING_ENABLE: u8 = 1 << 0;
+    pub const BIT_CLOCK_RATIO_40: u8 = 1 << 1;
+}
+
+/// Bits per component on an HDMI stream (`display_color_depth`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Depth {
+    Bpc8,
+    Bpc10,
+    Bpc12,
+}
+impl Depth {
+    pub fn bpc(self) -> u8 {
+        match self {
+            Self::Bpc8 => 8,
+            Self::Bpc10 => 10,
+            Self::Bpc12 => 12,
+        }
+    }
+    /// HDMI_DEEP_COLOR_DEPTH and PHYPLL DCCG_DEEP_COLOR_CNTL: 0, 1 or 2.
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Bpc8 => 0,
+            Self::Bpc10 => 1,
+            Self::Bpc12 => 2,
+        }
+    }
+    /// `dcn3_get_pix_clk_dividers`' HDMI deep-colour scaling, in 100 Hz:
+    /// x5/4 or x6/4, truncated (the PLL target, `actual_pix_clk_100hz`).
+    pub fn character_100hz(self, pixel_khz: u32) -> u64 {
+        let p = u64::from(pixel_khz) * 10;
+        match self {
+            Self::Bpc8 => p,
+            Self::Bpc10 => (p * 5) >> 2,
+            Self::Bpc12 => (p * 6) >> 2,
+        }
+    }
+    /// The TMDS character clock in kHz (`phy_pix_clk`), 0 if it overflows.
+    pub fn character_khz(self, pixel_khz: u32) -> u32 {
+        u32::try_from(self.character_100hz(pixel_khz) / 10).unwrap_or(0)
+    }
+}
+
+/// The output format of one HDMI stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Format {
+    pub depth: Depth,
+    /// YCbCr 4:2:0 (BT.709, `COLOR_SPACE_YCBCR709`), else RGB.
+    pub ycbcr420: bool,
+    /// RGB limited range (`COLOR_SPACE_SRGB_LIMITED`, "Broadcast RGB"
+    /// Limited); never set with 4:2:0.
+    pub limited: bool,
+}
+impl Format {
+    pub const RGB8: Self = Self {
+        depth: Depth::Bpc8,
+        ycbcr420: false,
+        limited: false,
+    };
+}
+
+/// The board's ceilings on an HDMI character clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// The VBIOS encoder caps' HDMI6Gbps_EN; Linux keeps 1 without a record.
+    pub hdmi6g: bool,
+    /// DML30's `min(600, PHYCLK)` HDMI output bandwidth bound, in kHz.
+    pub max_phy_khz: u32,
+}
+impl Limits {
+    pub const DEFAULT: Self = Self {
+        hdmi6g: true,
+        max_phy_khz: TMDS_MAX_KHZ,
+    };
+    fn max_khz(self) -> u32 {
+        let board = if self.hdmi6g {
+            TMDS_MAX_KHZ
+        } else {
+            TMDS_NO_6G_KHZ - 1
+        };
+        board.min(self.max_phy_khz)
+    }
+}
+
+/// How the sink is told to descramble: `write_scdc_data`'s TMDS_Config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scramble {
+    /// Legacy TMDS (TMDS_Config 0).
+    Off,
+    /// LTE_340MCSC_SCRAMBLE at or below 340 MHz: scrambled, clock channel at
+    /// the character rate (TMDS_Config 1).
+    LowRate,
+    /// Above 340 MHz: scrambled, 1/4-rate clock channel (TMDS_Config 3).
+    Above340,
+}
+impl Scramble {
+    pub fn tmds_config(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::LowRate => scdc::SCRAMBLING_ENABLE,
+            Self::Above340 => scdc::SCRAMBLING_ENABLE | scdc::BIT_CLOCK_RATIO_40,
+        }
+    }
+}
+
+/// Everything one HDMI/DVI stream needs beyond its timing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stream {
+    pub format: Format,
+    /// The pixel clock the TMDS link carries (`requested_pix_clk`): the
+    /// timing's, halved for 4:2:0's two pixels per container.
+    pub pixel_khz: u32,
+    /// The SetPixelClock target (`actual_pix_clk_100hz`).
+    pub character_100hz: u32,
+    /// The TMDS character clock (`phy_pix_clk`): STREAM_SETUP, the
+    /// transmitter and the scrambling decision take it.
+    pub character_khz: u32,
+    pub scramble: Scramble,
+    /// The sink declared SCDC (`edid_caps.scdc_present`).
+    pub scdc: bool,
+    /// The AVI InfoFrame; None for a DVI sink (no data islands).
+    pub avi: Option<[u8; 36]>,
+    /// The HDMI 1.4b vendor InfoFrame for a 4K HDMI VIC.
+    pub vendor: Option<[u8; 36]>,
+}
+
+/// HF-VSDB/HF-SCDB LTE_340Mcsc_scramble, as DRM's
+/// `drm_parse_hdmi_forum_scds` sets `scrambling.low_rates`: SCDC present,
+/// a non-zero Max_TMDS_Character_Rate, and flag bit 3.
+fn low_rate_scrambling(edid: &[u8]) -> bool {
+    use narf_edid::cta861::{CtaExtension, DataBlock};
+    edid.chunks_exact(128).skip(1).any(|block| {
+        CtaExtension::parse(block).is_ok_and(|cta| {
+            cta.data_blocks.iter().any(|db| {
+                let forum = match db {
+                    DataBlock::Vendor(v) if v.is_hdmi_forum() && v.payload.len() >= 7 => {
+                        v.payload.get(3..)
+                    }
+                    DataBlock::Extended {
+                        ext_tag: 0x79,
+                        payload,
+                    } if payload.len() >= 6 => payload.get(2..),
+                    _ => None,
+                };
+                matches!(forum, Some(&[_, rate, flags, ..])
+                    if rate != 0 && flags & 0x80 != 0 && flags & 0x08 != 0)
+            })
+        })
+    })
+}
+
+/// `t` as DRM's mode matchers take it.
+fn edid_mode(t: &Timing) -> narf_edid::modes::FixedMode {
+    let field = |active: u32, front: u32, sync: u32, total: u32| {
+        let at = |x: u32| u16::try_from(x).unwrap_or(u16::MAX);
+        [
+            at(active),
+            at(active + front),
+            at(active + front + sync),
+            at(total),
+        ]
+    };
+    narf_edid::modes::progressive(
+        t.pixel_clock_khz,
+        field(t.h_active, t.h_front_porch, t.h_sync_width, t.h_total),
+        field(t.v_active, t.v_front_porch, t.v_sync_width, t.v_total),
+        t.h_sync_positive,
+        t.v_sync_positive,
+    )
+}
+
+type Caps = crate::amdgpu_navi48_boot::HdmiCaps;
+
+/// Whether the sink and this board carry a TMDS character clock: the
+/// encoder's range, then the EDID's ceiling (DRM's `max_tmds_clock`: the
+/// HF rate when it declares more than 340 MHz, else the VSDB's) and, above
+/// 340 MHz, SCDC (DRM's scrambling-support rule).
+fn fits(caps: &Caps, khz: u32, limits: Limits) -> bool {
+    if !(TMDS_MIN_KHZ..=limits.max_khz()).contains(&khz) {
+        return false;
+    }
+    if khz <= TMDS_SCRAMBLE_KHZ {
+        let max = if caps.forum_max_khz > TMDS_SCRAMBLE_KHZ {
+            caps.forum_max_khz
+        } else {
+            caps.vsdb_max_khz
+        };
+        return max == 0 || khz <= max;
+    }
+    caps.scdc && khz <= caps.forum_max_khz
+}
+
+/// The format amdgpu_dm would drive `t` with on this sink: a mode the sink
+/// takes only as 4:2:0 (`drm_mode_is_420_only`) as 4:2:0; otherwise RGB at
+/// the deepest declared depth up to `max_bpc` that fits, stepping down by 2
+/// bpc; failing that 4:2:0 where the sink also takes it
+/// (`drm_mode_is_420_also`). 4:2:0 is 8 bpc. A DVI sink gets 8-bpc RGB.
+fn choose(caps: &Caps, t: &Timing, max_bpc: u8, limits: Limits) -> Option<(Depth, bool)> {
+    let vic = narf_edid::modes::match_cea_mode(edid_mode(t));
+    let listed = |map: [u64; 4]| vic != 0 && map[usize::from(vic / 64)] & 1 << (vic % 64) != 0;
+    let fits_420 = || caps.hdmi && fits(caps, t.pixel_clock_khz / 2, limits);
+    if caps.hdmi && listed(caps.y420_only) {
+        return fits_420().then_some((Depth::Bpc8, true));
+    }
+    let rgb = [
+        (Depth::Bpc12, caps.hdmi && caps.dc36),
+        (Depth::Bpc10, caps.hdmi && caps.dc30),
+        (Depth::Bpc8, true),
+    ];
+    let deepest = rgb.into_iter().find(|&(depth, declared)| {
+        declared
+            && depth.bpc() <= max_bpc.max(8)
+            && fits(caps, depth.character_khz(t.pixel_clock_khz), limits)
+    });
+    if let Some((depth, _)) = deepest {
+        return Some((depth, false));
+    }
+    (listed(caps.y420_also) && fits_420()).then_some((Depth::Bpc8, true))
+}
+
+/// The stream amdgpu_dm and DC would build for `t` on the sink whose whole
+/// EDID is `edid`: the format ([`choose`]), its clocks, the scrambling
+/// decision, and the AVI (CTA VIC, Q for RGB) and HDMI vendor InfoFrames.
+/// `limited` is "Broadcast RGB" Limited. None when nothing fits.
+pub fn stream_for(
+    edid: &[u8],
+    t: &Timing,
+    max_bpc: u8,
+    limited: bool,
+    limits: Limits,
+) -> Option<Stream> {
+    use crate::amdgpu_navi48_boot as navi48;
+    let caps = navi48::hdmi_caps(edid);
+    let (depth, ycbcr420) = choose(&caps, t, max_bpc, limits)?;
+    let pixel_khz = t.pixel_clock_khz >> u32::from(ycbcr420);
+    let character_100hz = u32::try_from(depth.character_100hz(pixel_khz)).ok()?;
+    let character_khz = character_100hz / 10;
+    let scramble = if character_khz > TMDS_SCRAMBLE_KHZ {
+        Scramble::Above340
+    } else if caps.hdmi && caps.scdc && low_rate_scrambling(edid) {
+        Scramble::LowRate
+    } else {
+        Scramble::Off
+    };
+    let limited = limited && !ycbcr420 && caps.hdmi;
+    let avi = navi48::hdmi_avi(caps, t);
+    Some(Stream {
+        format: Format {
+            depth,
+            ycbcr420,
+            limited,
+        },
+        pixel_khz,
+        character_100hz,
+        character_khz,
+        scramble,
+        scdc: caps.hdmi && caps.scdc,
+        avi: caps
+            .hdmi
+            .then(|| crate::amdgpu_dcn401_otg::avi_infoframe(t, avi, limited, ycbcr420)),
+        vendor: caps
+            .hdmi
+            .then(|| crate::amdgpu_dcn401_otg::vendor_infoframe(t, avi))
+            .flatten(),
+    })
+}
+
+/// `write_scdc_data` before the TMDS link starts: nothing for a sink
+/// without SCDC; else read Sink_Version, answer version 1 with
+/// Source_Version 1, then write TMDS_Config. A scrambled stream the sink was
+/// not told about cannot display, so its failures fail the link; Linux
+/// ignores the legacy write's result, and so does this.
+pub async fn write_scdc_data<A: Aux>(ddc: &mut A, stream: &Stream) -> Result<(), Error> {
+    if !stream.scdc {
+        return Ok(());
+    }
+    let config = stream.scramble.tmds_config();
+    let result: Result<(), LinkError> = async {
+        if ddc.scdc_read(scdc::SINK_VERSION).await? == 1 {
+            ddc.scdc_write(scdc::SOURCE_VERSION, 1).await?;
+        }
+        ddc.scdc_write(scdc::TMDS_CONFIG, config).await
+    }
+    .await;
+    match result {
+        Err(_) if config != 0 => Err(Error::Scdc),
+        _ => Ok(()),
+    }
+}
+
+/// `link_set_dpms_off`'s `write_scdc_data(165000, false)`: tell an SCDC sink
+/// it is back on legacy TMDS, best effort (a sink already unplugged NACKs).
+/// The link owner calls this on disable and on unplug, before the
+/// transmitter stops.
+pub async fn write_scdc_legacy<A: Aux>(ddc: &mut A, scdc_present: bool) {
+    if !scdc_present {
+        return;
+    }
+    if ddc.scdc_read(scdc::SINK_VERSION).await == Ok(1) {
+        let _ = ddc.scdc_write(scdc::SOURCE_VERSION, 1).await;
+    }
+    let _ = ddc.scdc_write(scdc::TMDS_CONFIG, 0).await;
+}
+
+/// What `read_scdc_data` reads once the transmitter runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScdcStatus {
+    pub tmds_config: u8,
+    /// Scrambling_Status (bit 0) and the status flags (clock detected,
+    /// channel locks), read only when TMDS_Config says scrambling.
+    pub scrambler_status: Option<u8>,
+    pub status_flags: Option<u8>,
+}
+/// `read_scdc_data` after `enable_tmds_link_output`: diagnostics only.
+pub async fn read_scdc_data<A: Aux>(ddc: &mut A, stream: &Stream) -> Option<ScdcStatus> {
+    if !stream.scdc {
+        return None;
+    }
+    let tmds_config = ddc.scdc_read(scdc::TMDS_CONFIG).await.ok()?;
+    let mut status = ScdcStatus {
+        tmds_config,
+        ..ScdcStatus::default()
+    };
+    if tmds_config & scdc::SCRAMBLING_ENABLE != 0 {
+        status.scrambler_status = ddc.scdc_read(scdc::SCRAMBLER_STATUS).await.ok();
+        status.status_flags = ddc.scdc_read(scdc::STATUS_FLAGS).await.ok();
+    }
+    Some(status)
 }
 
 pub(crate) trait Io: Send {
@@ -211,11 +588,29 @@ impl<I: Io> Engine<I> {
         )
     }
     /// The register half of `enc3_stream_encoder_hdmi_set_stream_attribute`
-    /// after the VBIOS STREAM_SETUP: RGB pixel encoding, the HDMI engine at
-    /// 8 bpc without scrambling, GC/NULL packets every frame, ACP off, and
-    /// AVMUTE released.
+    /// after the VBIOS STREAM_SETUP, for 8-bpc RGB without scrambling.
     pub(crate) fn stream_attribute(&mut self, character_khz: u32) -> Result<(), Error> {
-        if character_khz == 0 || character_khz >= TMDS_SCRAMBLE_KHZ {
+        if character_khz >= TMDS_SCRAMBLE_KHZ {
+            return Err(Error::Unsupported);
+        }
+        self.hdmi_stream_attribute(Format::RGB8, character_khz, Scramble::Off)
+    }
+    /// `enc3_stream_encoder_hdmi_set_stream_attribute`'s register half:
+    /// `enc1_stream_encoder_set_stream_attribute_helper` (RGB and 4:2:0 both
+    /// TMDS_PIXEL_ENCODING 0), the HDMI engine reset to GEN v1, keepout and
+    /// no extra NULL, then the deep-colour depth (enabled for every depth but
+    /// 8 bpc), the scrambler (1/4-rate clock channel above 340 MHz, character
+    /// rate for LTE_340MCSC), GC/NULL packets every frame, ACP off and AVMUTE
+    /// released.
+    pub(crate) fn hdmi_stream_attribute(
+        &mut self,
+        format: Format,
+        character_khz: u32,
+        scramble: Scramble,
+    ) -> Result<(), Error> {
+        if !(TMDS_MIN_KHZ..=TMDS_MAX_KHZ).contains(&character_khz)
+            || (scramble == Scramble::Above340) != (character_khz > TMDS_SCRAMBLE_KHZ)
+        {
             return Err(Error::Unsupported);
         }
         self.update(self.fe(DIG_FE_CNTL), TMDS_PIXEL_ENCODING, 0)?;
@@ -230,7 +625,25 @@ impl<I: Io> Engine<I> {
                 | HDMI_CLOCK_CHANNEL_RATE,
             HDMI_PACKET_GEN_VERSION | HDMI_KEEPOUT_MODE | HDMI_NO_EXTRA_NULL_PACKET_FILLED,
         )?;
-        self.update(self.fe(HDMI_CONTROL), HDMI_DEEP_COLOR_DEPTH, 0)?;
+        let code = format.depth.code();
+        let enable = if code != 0 { HDMI_DEEP_COLOR_ENABLE } else { 0 };
+        self.update(
+            self.fe(HDMI_CONTROL),
+            HDMI_DEEP_COLOR_DEPTH | HDMI_DEEP_COLOR_ENABLE,
+            code << 28 | enable,
+        )?;
+        let scrambler = match scramble {
+            Scramble::Off => None,
+            Scramble::LowRate => Some(HDMI_DATA_SCRAMBLE_EN),
+            Scramble::Above340 => Some(HDMI_DATA_SCRAMBLE_EN | HDMI_CLOCK_CHANNEL_RATE),
+        };
+        if let Some(bits) = scrambler {
+            self.update(
+                self.fe(HDMI_CONTROL),
+                HDMI_DATA_SCRAMBLE_EN | HDMI_CLOCK_CHANNEL_RATE,
+                bits,
+            )?;
+        }
         self.update(
             self.fe(HDMI_VBI_PACKET_CONTROL),
             HDMI_GC_CONT | HDMI_GC_SEND | HDMI_NULL_SEND,
@@ -250,8 +663,15 @@ impl<I: Io> Engine<I> {
             }
             sleep_us(10).await;
         }
+        // Linux's REG_WAIT only logs the timeout, then clears the conflict
+        // and writes the packet anyway.
         if !clear {
-            return Err(Error::Conflict);
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 VPG {} GSP conflict did not clear; writing packet {index}",
+                self.dig
+            );
         }
         self.update(status, VPG_GENERIC_CONFLICT_CLR, VPG_GENERIC_CONFLICT_CLR)?;
         self.update(
@@ -291,15 +711,31 @@ impl<I: Io> Engine<I> {
     /// `enc3_stream_encoder_update_hdmi_info_packets` with only the AVI
     /// InfoFrame valid.
     pub(crate) async fn info_packets(&mut self, avi: &[u8; 36]) -> Result<(), Error> {
-        if avi[0] != 0x82 {
+        self.hdmi_info_packets(avi, None).await
+    }
+    /// `enc3_stream_encoder_update_hdmi_info_packets`: the AVI InfoFrame,
+    /// and the HDMI vendor InfoFrame when there is one; every other managed
+    /// packet off, in Linux's order.
+    pub(crate) async fn hdmi_info_packets(
+        &mut self,
+        avi: &[u8; 36],
+        vendor: Option<&[u8; 36]>,
+    ) -> Result<(), Error> {
+        if avi[0] != 0x82 || vendor.is_some_and(|v| v[0] != 0x81) {
             return Err(Error::Invalid);
         }
         self.update(self.fe(HDMI_DB_CONTROL), HDMI_DB_DISABLE, HDMI_DB_DISABLE)?;
         self.update(self.fe(AFMT_CNTL), AFMT_AUDIO_CLOCK_EN, AFMT_AUDIO_CLOCK_EN)?;
-        self.vpg_packet(0, avi).await?;
-        self.packet_control(0, true)?;
-        for index in 1..MANAGED_PACKETS {
-            self.packet_control(index, false)?;
+        for index in PACKET_ORDER {
+            let packet = match index {
+                PACKET_AVI => Some(avi),
+                PACKET_VENDOR => vendor,
+                _ => None,
+            };
+            if let Some(packet) = packet {
+                self.vpg_packet(index, packet).await?;
+            }
+            self.packet_control(index, packet.is_some())?;
         }
         Ok(())
     }
@@ -376,8 +812,18 @@ impl Hdmi {
     pub fn stream_attribute(&mut self, character_khz: u32) -> Result<(), Error> {
         self.0.stream_attribute(character_khz)
     }
+    /// [`Engine::hdmi_stream_attribute`] for `stream`.
+    pub fn hdmi_stream_attribute(&mut self, stream: &Stream) -> Result<(), Error> {
+        self.0
+            .hdmi_stream_attribute(stream.format, stream.character_khz, stream.scramble)
+    }
     pub async fn info_packets(&mut self, avi: &[u8; 36]) -> Result<(), Error> {
         self.0.info_packets(avi).await
+    }
+    /// The AVI and (when present) HDMI vendor InfoFrames of `stream`.
+    pub async fn hdmi_info_packets(&mut self, stream: &Stream) -> Result<(), Error> {
+        let avi = stream.avi.as_ref().ok_or(Error::Invalid)?;
+        self.0.hdmi_info_packets(avi, stream.vendor.as_ref()).await
     }
     pub fn stop_info_packets(&mut self) -> Result<(), Error> {
         self.0.stop_info_packets()
@@ -385,127 +831,5 @@ impl Hdmi {
 }
 
 #[cfg(feature = "kernel-test")]
-mod tests {
-    use super::*;
-    use alloc::{vec, vec::Vec};
-    use narf_kernel_test::{kernel_test_in, TestResult};
-
-    struct Fake {
-        regs: Vec<u32>,
-        data: Vec<u32>,
-        conflict: bool,
-    }
-    impl Io for Fake {
-        fn read(&mut self, reg: u64) -> u32 {
-            let v = self.regs[reg as usize];
-            if reg % STRIDE == VPG_GENERIC_STATUS % STRIDE && self.conflict {
-                return v | VPG_GENERIC_CONFLICT_OCCURED;
-            }
-            v
-        }
-        fn write(&mut self, reg: u64, value: u32) {
-            if reg % STRIDE == VPG_GENERIC_PACKET_DATA % STRIDE && reg > 0x2000 {
-                self.data.push(value);
-            }
-            self.regs[reg as usize] = value;
-        }
-    }
-    fn engine(dig: u8, transmitter: u8) -> Engine<Fake> {
-        Engine::new_with(
-            Fake {
-                regs: vec![0; LAST_REG as usize + 1],
-                data: Vec::new(),
-                conflict: false,
-            },
-            Cap::bootstrap(),
-            dig,
-            transmitter,
-        )
-    }
-    fn run<T>(f: impl core::future::Future<Output = T>) -> T {
-        narf_scheduler::block_on_spin(f)
-    }
-
-    fn dcn30_hdmi_routes_and_programs_tmds_stream() -> TestResult {
-        let mut e = engine(1, 3);
-        // GOP left HDMI_CONTROL with deep colour and scrambling set.
-        e.io.regs[(HDMI_CONTROL + STRIDE) as usize] =
-            HDMI_DEEP_COLOR_ENABLE | HDMI_DATA_SCRAMBLE_EN | 0x1000_0000;
-        if e.check_idle().is_err()
-            || e.connect_to_otg(2).is_err()
-            || e.setup(DigMode::Hdmi).is_err()
-            || e.connect_be_to_fe(true).is_err()
-            || e.stream_attribute(148_500).is_err()
-        {
-            return TestResult::Fail("HDMI stream setup");
-        }
-        let r = &e.io.regs;
-        // Literal DCN30 ids: DIG3_DIG_BE_CNTL 0x23b0, DIG1_DIG_FE_CNTL 0x218b,
-        // DIG1_HDMI_CONTROL 0x2193, DIG1_HDMI_VBI_PACKET_CONTROL 0x2197.
-        if r[0x23b0] != 3 << 16 | 1 << 9
-            || r[0x218b] & 7 != 2
-            || r[0x2193]
-                != HDMI_PACKET_GEN_VERSION | HDMI_KEEPOUT_MODE | HDMI_NO_EXTRA_NULL_PACKET_FILLED
-            || r[0x2197] != HDMI_GC_CONT | HDMI_GC_SEND | HDMI_NULL_SEND
-        {
-            return TestResult::Fail("HDMI registers");
-        }
-        if e.stream_attribute(340_000) != Err(Error::Unsupported) {
-            return TestResult::Fail("scrambled rate admitted");
-        }
-        e.io.regs[0x23b1] = 1;
-        if e.check_idle() != Err(Error::Busy) {
-            return TestResult::Fail("live backend claimed");
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!(
-        "drivers/gpu/dcn30-hdmi",
-        dcn30_hdmi_routes_and_programs_tmds_stream
-    );
-
-    fn dcn30_hdmi_sends_only_the_avi_infoframe_and_stops() -> TestResult {
-        let mut e = engine(0, 0);
-        let mut avi = [0u8; 36];
-        avi[..4].copy_from_slice(&[0x82, 2, 13, 0]);
-        avi[8] = 16;
-        if run(e.info_packets(&avi)).is_err() {
-            return TestResult::Fail("AVI packet");
-        }
-        let r = &e.io.regs;
-        // Nine VPG words for generic packet 0, immediate update, then
-        // GENERIC0 CONT/SEND on line 2 and every other managed packet off.
-        if e.io.data.len() != 9
-            || e.io.data[0] != u32::from_le_bytes([0x82, 2, 13, 0])
-            || r[VPG_GENERIC_PACKET_ACCESS_CTRL as usize] != 0
-            || r[VPG_GSP_IMMEDIATE_UPDATE_CTRL as usize] & 1 == 0
-            || r[HDMI_GENERIC_PACKET_CONTROL0 as usize] != 3
-            || r[0x209e] != 2
-            || r[HDMI_DB_CONTROL as usize] & HDMI_DB_DISABLE == 0
-        {
-            return TestResult::Fail("AVI programming");
-        }
-        e.io.conflict = true;
-        if run(e.info_packets(&avi)) != Err(Error::Conflict) {
-            return TestResult::Fail("VPG conflict ignored");
-        }
-        if run(e.info_packets(&[0; 36])) != Err(Error::Invalid) {
-            return TestResult::Fail("non-AVI packet");
-        }
-        e.io.regs[DIG_BE_CNTL as usize] = 3 << 16 | 1 << 8;
-        if e.stop_info_packets().is_err()
-            || e.set_avmute(true).is_err()
-            || e.connect_be_to_fe(false).is_err()
-            || e.io.regs[HDMI_GENERIC_PACKET_CONTROL0 as usize] != 0
-            || e.io.regs[HDMI_GC as usize] & HDMI_GC_AVMUTE == 0
-            || e.io.regs[DIG_BE_CNTL as usize] & DIG_FE_SOURCE_SELECT != 0
-        {
-            return TestResult::Fail("stop");
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!(
-        "drivers/gpu/dcn30-hdmi",
-        dcn30_hdmi_sends_only_the_avi_infoframe_and_stops
-    );
-}
+#[path = "amdgpu_dcn30_hdmi_tests.rs"]
+mod tests;
