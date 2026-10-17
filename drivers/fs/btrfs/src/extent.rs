@@ -243,7 +243,12 @@ async fn read_compressed_cached<B: BlockDevice + 'static>(
     sectorsize: usize,
 ) -> Result<alloc::sync::Arc<Vec<u8>>, FsError> {
     use crate::decompress_cache as cache;
-    let owner: alloc::sync::Weak<dyn core::any::Any + Send + Sync> = vol.self_weak.clone();
+    // Keyed by the shared core, not this mount's view: every subvolume mount
+    // of one filesystem shares the cache, and a write through any of them
+    // invalidates it.
+    let core: alloc::sync::Weak<crate::volume::VolCore<B>> =
+        alloc::sync::Arc::downgrade(vol.core());
+    let owner: alloc::sync::Weak<dyn core::any::Any + Send + Sync> = core;
     let handle = cache::VolumeRef::new(owner);
     if let Some(plain) = cache::get(&handle, id) {
         return Ok(plain);

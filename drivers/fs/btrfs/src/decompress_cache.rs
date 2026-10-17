@@ -20,9 +20,12 @@
 //!   entry and moves the volume's epoch. A reader records the epoch before its
 //!   device read and only inserts if the epoch has not moved, so bytes read
 //!   while a write was in flight are never published.
-//! - **Volume lifetime.** Entries hold a `Weak` to their volume. That keeps
-//!   the allocation's address from being reused while the entry exists, and a
-//!   dead volume's entries are dropped on the next insert.
+//! - **Per shared core.** Entries are keyed by the filesystem's shared
+//!   `VolCore` (see [`crate::registry`]), so every subvolume mount of one
+//!   filesystem shares them and a write through any mount invalidates them.
+//!   Entries hold a `Weak` to the core. That keeps its address from being
+//!   reused while an entry exists. A dead core's entries are never served
+//!   and are dropped on the next insert.
 //! - **Only verified data.** Callers insert only after the compressed bytes
 //!   passed the checksum check (when the volume verifies checksums) *and*
 //!   decompressed successfully. Failures are never cached.
@@ -99,7 +102,7 @@ impl core::fmt::Debug for VolumeRef {
 }
 
 impl VolumeRef {
-    /// `owner` is the volume's own `self_weak`.
+    /// `owner` is a `Weak` to the volume's shared core.
     pub fn new(owner: Weak<dyn Any + Send + Sync>) -> Self {
         Self {
             key: owner.as_ptr() as *const () as usize,

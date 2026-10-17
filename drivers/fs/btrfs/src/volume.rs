@@ -2104,9 +2104,10 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// block's bytes unchanged to new backing, so cached contents stay
     /// correct. Superblock writes likewise: they are never read as nodes.
     fn invalidate_nodes(&self, logical: u64, len: usize) -> u64 {
-        // Decompressed data extents in the written range are stale too.
+        // Decompressed data extents in the written range are stale too, for
+        // every mount (view) of the shared core.
         crate::decompress_cache::invalidate(
-            crate::decompress_cache::VolumeRef::key_of(self as *const Self),
+            crate::decompress_cache::VolumeRef::key_of(Arc::as_ptr(self.core())),
             logical,
             len,
         );

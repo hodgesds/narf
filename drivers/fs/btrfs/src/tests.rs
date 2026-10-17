@@ -12581,7 +12581,8 @@ fn smoke_btrfs_decompress_cache_hit_and_write() -> TestResult {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("zstd fixture failed to mount"),
     };
-    let handle = cache::VolumeRef::new(vol.self_weak.clone());
+    let core = Arc::downgrade(vol.core());
+    let handle = cache::VolumeRef::new(core);
     let big = match poll_once(vol.root().lookup_async("big.dat")) {
         Some(Ok(f)) => f,
         _ => return TestResult::Fail("lookup big.dat failed"),
