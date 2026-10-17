@@ -19,12 +19,17 @@
 //!    unlocked, its plane disabled (`dcn20_plane_atomic_disable`: MPCC idle,
 //!    HUBP blank, HUBP and DPP clocks off, `dcn10_plane_atomic_power_down`
 //!    with pipe 5's domains left on as `dcn20_{dpp,hubp}_pg_control` require)
-//!    and `optc3_tg_init`.
+//!    and `optc3_tg_init`; an ODM 2:1 OTG blanks both OPPs at half width.
+//!    Then every DSC not driven by a running OTG is power-gated
+//!    (`dcn20_dsc_pg_control`).
 //! 5. `dce110_power_down` when any DIG backend is enabled:
 //!    `power_down_encoders` (DP streams blanked, VBIOS transmitter DISABLE
 //!    with `SIGNAL_TYPE_NONE`), then `power_down_controllers` (every OTG's
 //!    `optc1_disable_crtc`). `power_down_clock_sources` is a no-op on DCN:
 //!    `set_pixel_clock_v7` rejects `CONTROLLER_ID_UNDEFINED`.
+//!
+//! 6. `hubbub3_init_watermarks` (set A copied to B..D) when the VBIOS is not
+//!    in accelerated mode, called by the modeset owner after `retire`.
 //!
 //! `link_blank_all_dp_displays` is not repeated: at `init_hw` no link has a
 //! local sink yet, so Linux skips every link there.
@@ -42,17 +47,32 @@ use crate::{
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
-// linux-ctx: hdr=dcn seg=1
 // DCN base index 1 (dcn_3_0_0_offset.h).
+// linux-ctx: hdr=dcn seg=1
 // linux: mmD1VGA_CONTROL; mmD2VGA_CONTROL; mmD3VGA_CONTROL; mmD4VGA_CONTROL; mmD5VGA_CONTROL
 // linux: mmD6VGA_CONTROL
 const D_VGA_CONTROL: [u64; 6] = [0x000c, 0x000e, 0x0038, 0x0039, 0x003a, 0x003b];
-// linux-ctx: hdr=dcn seg=2
 // DCN base index 2.
+// linux-ctx: hdr=dcn seg=2
 const DOMAIN0_PG_CONFIG: u64 = 0x0080; // linux: mmDOMAIN0_PG_CONFIG
 /// DOMAIN0..11 (HUBP/DPP) and DOMAIN16..21 (DSC).
 const PLANE_DOMAINS: core::ops::Range<u64> = 0..12;
 const DSC_DOMAIN16_PG_CONFIG: u64 = 0x00a1; // linux: mmDOMAIN16_PG_CONFIG
+/// DSC_TOP0_DSC_TOP_CONTROL (stride 0x5c) and DSCRM0_DSCRM_DSC_FORWARD_CONFIG.
+const DSC_TOP_CONTROL: u64 = 0x3000; // linux: mmDSC_TOP0_DSC_TOP_CONTROL
+const DSC_TOP_STRIDE: u64 = 0x5c; // linux: mmDSC_TOP1_DSC_TOP_CONTROL - mmDSC_TOP0_DSC_TOP_CONTROL
+const DSC_CLOCK_EN: u32 = 1 << 0; // linux: DSC_TOP0_DSC_TOP_CONTROL__DSC_CLOCK_EN_MASK
+const DSCRM_DSC_FORWARD_CONFIG: u64 = 0x1a64; // linux: mmDSCRM0_DSCRM_DSC_FORWARD_CONFIG
+const DSCRM_DSC_FORWARD_EN: u32 = 1 << 0; // linux: DSCRM0_DSCRM_DSC_FORWARD_CONFIG__DSCRM_DSC_FORWARD_EN_MASK
+const DSCRM_DSC_OPP_PIPE_SOURCE: u32 = 0x70; // linux: DSCRM0_DSCRM_DSC_FORWARD_CONFIG__DSCRM_DSC_OPP_PIPE_SOURCE_MASK
+/// DCN30 `num_dsc`.
+const DSCS: u8 = 6; // linux: n/a (dcn30_resource.c res_cap_dcn3.num_dsc)
+/// HUBBUB watermark sets (dcn_3_0_0_offset.h, base index 2): five per set
+/// from DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A, NOM/FLIP pairs per set from
+/// DCHUBBUB_ARB_FRAC_URG_BW_NOM_A.
+const WATERMARK_A: u64 = 0x0509; // linux: mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A
+const WATERMARK_SET: u64 = 5; // linux: mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_B - mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A
+const FRAC_URG_BW_NOM_A: u64 = 0x053f; // linux: mmDCHUBBUB_ARB_FRAC_URG_BW_NOM_A
 const DOMAIN_POWER_FORCEON: u32 = 1 << 0; // linux: DOMAIN0_PG_CONFIG__DOMAIN0_POWER_FORCEON_MASK
 const DOMAIN_POWER_GATE: u32 = 1 << 8; // linux: DOMAIN0_PG_CONFIG__DOMAIN0_POWER_GATE_MASK
                                        // linux: DOMAIN0_PG_STATUS__DOMAIN0_PGFSM_PWR_STATUS_MASK
@@ -73,6 +93,10 @@ const DPG_EN: u32 = 1 << 0; // linux: DPG0_DPG_CONTROL__DPG_EN_MASK
                             // linux: DPG0_DPG_STATUS__DPG_DOUBLE_BUFFER_PENDING_MASK
 const DPG_DOUBLE_BUFFER_PENDING: u32 = 1 << 0;
 const ODM_DATA_SOURCE_SELECT: u64 = 0x1acb; // linux: mmODM0_OPTC_DATA_SOURCE_SELECT
+const ODM_DATA_FORMAT_CONTROL: u64 = 0x1acc; // linux: mmODM0_OPTC_DATA_FORMAT_CONTROL
+const OPTC_DSC_MODE: u32 = 0x30; // linux: ODM0_OPTC_DATA_FORMAT_CONTROL__OPTC_DSC_MODE_MASK
+const OPTC_NUM_OF_INPUT_SEGMENT: u32 = 0x3; // linux: ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_NUM_OF_INPUT_SEGMENT_MASK
+const OPTC_SEG1_SRC_SEL: u32 = 0x0000_f000; // linux: ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG1_SRC_SEL_MASK
 const ODM_INPUT_GLOBAL_CONTROL: u64 = 0x1aca; // linux: mmODM0_OPTC_INPUT_GLOBAL_CONTROL
                                               // linux: mmODM1_OPTC_DATA_SOURCE_SELECT - mmODM0_OPTC_DATA_SOURCE_SELECT
 const ODM_STRIDE: u64 = 0x10;
@@ -103,8 +127,8 @@ const DIG_FE_SOURCE_SELECT: u32 = 0x7f00; // linux: DIG0_DIG_BE_CNTL__DIG_FE_SOU
 const TMDS_CTL_BITS: u64 = 0x20de; // linux: mmDIG0_TMDS_CTL_BITS
 const TMDS_CTL0: u32 = 1 << 0; // linux: DIG0_TMDS_CTL_BITS__TMDS_CTL0_MASK
 const DP_VID_STREAM_CNTL: u64 = 0x210c; // linux: mmDP0_DP_VID_STREAM_CNTL
-                                        // linux-ctx: hdr=dcn seg=3
                                         // DCN base index 3: MPCC instances stride 0x20, MPC_OUTn_MUX stride 4.
+                                        // linux-ctx: hdr=dcn seg=3
 const MPCC_TOP_SEL: u64 = 0x0000; // linux: mmMPCC0_MPCC_TOP_SEL
 const MPCC_BOT_SEL: u64 = 0x0001; // linux: mmMPCC0_MPCC_BOT_SEL
 const MPCC_OPP_ID: u64 = 0x0002; // linux: mmMPCC0_MPCC_OPP_ID
@@ -119,11 +143,10 @@ const MPC_OUT_MUX_SEL: u32 = 0xf; // linux: MPC_OUT0_MUX__MPC_OUT_MUX_MASK
 const MPC_OUT_RATE_CONTROL_DISABLE: u32 = 1 << 8;
 // linux: MPC_OUT0_MUX__MPC_OUT_FLOW_CONTROL_COUNT_MASK
 const MPC_OUT_FLOW_CONTROL_COUNT: u32 = 0x007f_f800;
-// linux-ctx: reset
 /// The last dwords this module touches per bank, for the bounds.
+// linux-ctx: reset
 pub(crate) const LAST_DCN1: u32 = 0x003b; // linux: mmD6VGA_CONTROL
-                                          // linux: n/a (NARF bank bound)
-pub(crate) const LAST_DCN2: u32 = (TMDS_CTL_BITS + 5 * DIG_STRIDE) as u32;
+pub(crate) const LAST_DCN2: u32 = (DSC_TOP_CONTROL + (DSCS as u64 - 1) * DSC_TOP_STRIDE) as u32;
 // linux: n/a (NARF bank bound)
 pub(crate) const LAST_DCN3: u32 = (MPC_OUT_MUX + 5 * MPC_OUT_STRIDE) as u32;
 
@@ -280,12 +303,21 @@ impl Takeover<'_> {
     /// `dcn20_init_blank` + `dcn20_wait_for_blank_complete` for one running
     /// OTG: black through the OPP feeding segment 0, over the OTG's active
     /// size (`optc1_get_otg_active_size`).
-    async fn init_blank(&mut self, pipe: u8) -> Result<(), Error> {
+    /// `optc2_get_optc_source`: the OPPs feeding segment 0 and, for ODM 2:1
+    /// (`OPTC_NUM_OF_INPUT_SEGMENT == 1`, unless VBIOS left SEG1 at 0xf),
+    /// segment 1.
+    fn optc_source(&mut self, pipe: u8) -> Result<(u8, Option<u8>), Error> {
         let source = self
             .regs
             .read(self.d2(ODM_DATA_SOURCE_SELECT + u64::from(pipe) * ODM_STRIDE))?;
-        let opp = ((source & OPTC_SEG0_SRC_SEL) >> OPTC_SEG0_SRC_SEL.trailing_zeros()) as u8;
-        if opp >= PIPES {
+        let seg0 = ((source & OPTC_SEG0_SRC_SEL) >> OPTC_SEG0_SRC_SEL.trailing_zeros()) as u8;
+        let seg1 = ((source & OPTC_SEG1_SRC_SEL) >> OPTC_SEG1_SRC_SEL.trailing_zeros()) as u8;
+        let two = source & OPTC_NUM_OF_INPUT_SEGMENT == 1 && seg1 != 0xf;
+        Ok((seg0, two.then_some(seg1)))
+    }
+    async fn init_blank(&mut self, pipe: u8) -> Result<(), Error> {
+        let (opp, bottom) = self.optc_source(pipe)?;
+        if opp >= PIPES || bottom.is_some_and(|b| b >= PIPES) {
             // Linux asserts and leaves this OTG unblanked.
             return Ok(());
         }
@@ -299,19 +331,23 @@ impl Takeover<'_> {
         }
         let h = self.regs.read(self.otg(OTG_H_BLANK_START_END, pipe))?;
         let v = self.regs.read(self.otg(OTG_V_BLANK_START_END, pipe))?;
-        // linux-lit: 0x7fff=OTG0_OTG_H_BLANK_START_END__OTG_H_BLANK_START_MASK
-        // linux-lit: 16=OTG0_OTG_H_BLANK_START_END__OTG_H_BLANK_END__SHIFT
-        let width = (h & 0x7fff).saturating_sub((h >> 16) & 0x7fff);
+        let mut width = (h & 0x7fff).saturating_sub((h >> 16) & 0x7fff);
         // linux-lit: 0x7fff=OTG0_OTG_V_BLANK_START_END__OTG_V_BLANK_START_MASK
         // linux-lit: 16=OTG0_OTG_V_BLANK_START_END__OTG_V_BLANK_END__SHIFT
         let height = (v & 0x7fff).saturating_sub((v >> 16) & 0x7fff);
-        self.regs.write(
-            self.d2(DPG_DIMENSIONS + u64::from(opp) * DPG_STRIDE),
-            height | width << 16, // linux-lit: 16=DPG0_DPG_DIMENSIONS__DPG_ACTIVE_WIDTH__SHIFT
-        )?;
-        // SAFETY: the takeover holds the whole display engine.
-        let mut owner = unsafe { Opp::new(self.gpu, self.regs.authority, opp) }?;
-        owner.set_blank(true)?;
+        // ODM 2:1: each OPP generates half the active width.
+        if bottom.is_some() {
+            width /= 2;
+        }
+        for target in core::iter::once(opp).chain(bottom) {
+            self.regs.write(
+                self.d2(DPG_DIMENSIONS + u64::from(target) * DPG_STRIDE),
+                height | width << 16, // linux-lit: 16=DPG0_DPG_DIMENSIONS__DPG_ACTIVE_WIDTH__SHIFT
+            )?;
+            // SAFETY: the takeover holds the whole display engine.
+            let mut owner = unsafe { Opp::new(self.gpu, self.regs.authority, target) }?;
+            owner.set_blank(true)?;
+        }
         // 1000 x 100 us for the pattern to latch; Linux logs a timeout.
         self.regs
             .wait(status, DPG_DOUBLE_BUFFER_PENDING, 0, 100, 1000)
@@ -329,12 +365,12 @@ impl Takeover<'_> {
             MPCC_OPP_ID,
             MPCC_UPDATE_LOCK_SEL,
         ] {
-            // linux: n/a (literal 0xf in dcn10_mpc.c:mpc1_mpc_init_single_inst)
+            // linux: n/a (literal 0xf in:mpc1_mpc_init_single_inst)
             self.regs.write(self.d3(reg + base), 0xf)?;
         }
         if opp < u32::from(PIPES) {
             let mux = self.d3(MPC_OUT_MUX + u64::from(opp) * MPC_OUT_STRIDE);
-            // linux: n/a (literal 0xf in dcn10_mpc.c:mpc1_mpc_init_single_inst)
+            // linux: n/a (literal 0xf in:mpc1_mpc_init_single_inst)
             self.regs.update(mux, MPC_OUT_MUX_SEL, 0xf)?;
         }
         let mux = self.d3(MPC_OUT_MUX + u64::from(mpcc) * MPC_OUT_STRIDE);
@@ -358,7 +394,7 @@ impl Takeover<'_> {
         self.regs
             // linux-lit: 4=(mmDOMAIN0_PG_STATUS - mmDOMAIN0_PG_CONFIG) * 4
             // linux-lit: 30=DOMAIN0_PG_STATUS__DOMAIN0_PGFSM_PWR_STATUS__SHIFT
-            // linux: n/a (2 = PGFSM_POWER_OFF, literal in dcn10_hwseq.c)
+            // linux: n/a (2 = PGFSM_POWER_OFF, literal in)
             .wait(config + 4, DOMAIN_PGFSM_PWR_STATUS, 2 << 30, 1, 1000)
             .await?;
         Ok(())
@@ -396,7 +432,7 @@ impl Takeover<'_> {
         self.regs.update(
             self.otg(OTG_DOUBLE_BUFFER_CONTROL, pipe),
             OTG_DRR_TIMING_DBUF_UPDATE_MODE,
-            // linux: n/a (mode 2, literal in dcn30_optc.c:optc3_set_timing_double_buffer)
+            // linux: n/a (mode 2, literal in:optc3_set_timing_double_buffer)
             2 << OTG_DRR_TIMING_DBUF_UPDATE_MODE.trailing_zeros(),
         )?;
         self.regs.update(
@@ -405,7 +441,85 @@ impl Takeover<'_> {
             OPTC_UNDERFLOW_CLEAR,
         )
     }
-    /// `dcn10_init_pipes` with no seamless boot.
+    /// `dcn20_dsc_pg_control(false)`: gate one DSC domain (DOMAIN16 + dsc)
+    /// under DC_IP_REQUEST_CNTL and wait 1000 x 1 us for PGFSM (logged
+    /// only, as REG_WAIT).
+    async fn gate_dsc(&mut self, dsc: u8) -> Result<(), Error> {
+        let request = self.d2(DC_IP_REQUEST_CNTL);
+        let original = self.regs.read(request)? & IP_REQUEST_EN;
+        if original == 0 {
+            self.regs.write(request, IP_REQUEST_EN)?;
+        }
+        let config = self.d2(DSC_DOMAIN16_PG_CONFIG + 2 * u64::from(dsc));
+        self.regs
+            .update(config, DOMAIN_POWER_GATE, DOMAIN_POWER_GATE)?;
+        self.regs
+            // linux-lit: 4=(mmDOMAIN0_PG_STATUS - mmDOMAIN0_PG_CONFIG) * 4
+            // linux-lit: 30=DOMAIN0_PG_STATUS__DOMAIN0_PGFSM_PWR_STATUS__SHIFT
+            // linux: n/a (2 = PGFSM_POWER_OFF, literal in)
+            .wait(config + 4, DOMAIN_PGFSM_PWR_STATUS, 2 << 30, 1, 1000)
+            .await?;
+        if original == 0 {
+            self.regs.write(request, 0)?;
+        }
+        Ok(())
+    }
+    /// The tail of `dcn10_init_pipes`: power-gate every DSC except the one
+    /// a running OTG drives (`optc2_get_dsc_status`, `dsc2_read_state`).
+    async fn gate_idle_dscs(&mut self) -> Result<(), Error> {
+        let mut sources = (None, None);
+        for pipe in 0..PIPES {
+            if !self.otg_enabled(pipe)? {
+                continue;
+            }
+            let format = self
+                .regs
+                .read(self.d2(ODM_DATA_FORMAT_CONTROL + u64::from(pipe) * ODM_STRIDE))?;
+            if format & OPTC_DSC_MODE != 0 {
+                let (seg0, seg1) = self.optc_source(pipe)?;
+                sources = (Some(seg0), seg1);
+                break;
+            }
+        }
+        for dsc in 0..DSCS {
+            let clock = self
+                .regs
+                .read(self.d2(DSC_TOP_CONTROL + u64::from(dsc) * DSC_TOP_STRIDE))?;
+            let forward = self
+                .regs
+                .read(self.d2(DSCRM_DSC_FORWARD_CONFIG + u64::from(dsc)))?;
+            let source = ((forward & DSCRM_DSC_OPP_PIPE_SOURCE) >> 4) as u8;
+            let in_use = (sources.0 == Some(source) || sources.1 == Some(source))
+                && clock & DSC_CLOCK_EN != 0
+                && forward & DSCRM_DSC_FORWARD_EN != 0;
+            if !in_use {
+                self.gate_dsc(dsc).await?;
+            }
+        }
+        Ok(())
+    }
+    /// `hubbub3_init_watermarks`: copy watermark set A into B, C and D.
+    /// `dcn30_init_hw` runs it when the VBIOS is not in accelerated mode.
+    pub(crate) fn init_watermarks(&mut self) -> Result<(), Error> {
+        for reg in 0..WATERMARK_SET {
+            let value = self.regs.read(self.d2(WATERMARK_A + reg))?;
+            for set in 1..4 {
+                self.regs
+                    .write(self.d2(WATERMARK_A + set * WATERMARK_SET + reg), value)?;
+            }
+        }
+        for reg in 0..2 {
+            let value = self.regs.read(self.d2(FRAC_URG_BW_NOM_A + reg))?;
+            for set in 1..4 {
+                self.regs
+                    .write(self.d2(FRAC_URG_BW_NOM_A + set * 2 + reg), value)?;
+            }
+        }
+        Ok(())
+    }
+    /// `dcn10_init_pipes` with no seamless boot. `hubp_reset`/`dpp_reset`
+    /// only clear Linux's cached cursor/scaler state (no register access;
+    /// these owners cache none) and DCN3.0's OPTC has no `init_odm`.
     async fn init_pipes(&mut self) -> Result<u8, Error> {
         let mut enabled = 0u8;
         for pipe in 0..PIPES {
@@ -426,6 +540,7 @@ impl Takeover<'_> {
             self.disable_plane(pipe, running).await?;
             self.tg_init(pipe)?;
         }
+        self.gate_idle_dscs().await?;
         Ok(enabled)
     }
     fn dig(&self, reg: u64, transmitter: u8) -> u64 {

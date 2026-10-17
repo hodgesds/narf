@@ -154,8 +154,8 @@ pub enum PostError {
     },
     /// ASIC_Init exceeded [`POST_MS`].
     Timeout,
-    /// ASIC_Init returned but BIOS_SCRATCH_7 still lacks
-    /// `ATOM_S7_ASIC_INIT_COMPLETE` (the value read back).
+    /// Retained for callers matching on it; ASIC_Init returning without
+    /// `ATOM_S7_ASIC_INIT_COMPLETE` is only logged, as in Linux.
     Incomplete(u32),
 }
 
@@ -624,6 +624,13 @@ impl<'a> Image<'a> {
     }
 }
 
+/// `amdgpu_atomfirmware_allocate_fb_scratch`'s FB scratch size for `bios`
+/// (VRAM_UsageByFirmware v2.1, else the 20 KiB default), shared with the
+/// display-table interpreter (`amdgpu_navi22_bios`).
+pub(crate) fn atom_fb_scratch_bytes(bios: &[u8]) -> usize {
+    Image::parse(bios).map_or(FB_SCRATCH_DEFAULT, |image| image.fb_scratch_bytes())
+}
+
 /// The ATOM `card_info` for ASIC_Init: register callbacks through the
 /// device authority, table resolution from the retained image.
 struct Bus<'h, 'a, I: Io> {
@@ -896,8 +903,18 @@ impl<I: Io> Engine<I> {
         drop(state);
         let after = self.access(|io| io.reg(s7))?;
         post.scratch7_after = after;
-        if after == u32::MAX || after & ATOM_S7_ASIC_INIT_COMPLETE == 0 {
-            return Err(failed(PostError::Incomplete(after)));
+        if after == u32::MAX {
+            return Err(Error::DeviceGone);
+        }
+        // amdgpu_atomfirmware_asic_init returns amdgpu_atom_execute_table's
+        // result and never re-reads BIOS_SCRATCH_7: a table that ran to its
+        // end is a completed post. A still-clear bit is reported only.
+        if after & ATOM_S7_ASIC_INIT_COMPLETE == 0 {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 post: ASIC_Init ran but scratch7 {after:#x} lacks ASIC_INIT_COMPLETE"
+            );
         }
         Ok(post)
     }

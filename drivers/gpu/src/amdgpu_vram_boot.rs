@@ -350,6 +350,26 @@ impl Plan {
         let start = address.checked_sub(self.gpu_base).ok_or(Error::Invalid)?;
         self.protect(owner, start, size)
     }
+    /// An inherited DMUB window. dm_dmub_sw_init places the DMUB BO in
+    /// `VRAM | GTT`, so after a warm boot from Linux a window may sit in the
+    /// GART range (system memory) instead of the FB aperture: such a window
+    /// names no VRAM and is skipped. One straddling the aperture is refused.
+    fn protect_dmub(&mut self, address: u64, size: u64) -> Result<(), Error> {
+        let end = address.checked_add(size).ok_or(Error::Invalid)?;
+        let fb_end = self
+            .gpu_base
+            .checked_add(self.vram_size)
+            .ok_or(Error::Invalid)?;
+        if end <= self.gpu_base || address >= fb_end {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: inherited DMUB window {address:#x}+{size:#x} outside VRAM; not reserved"
+            );
+            return Ok(());
+        }
+        self.protect_gpu(Owner::Dmub, address, size)
+    }
 }
 
 struct ReadOp<F>(F);
@@ -528,7 +548,7 @@ fn snapshot_with_layout(
                 .and_then(|n| n.checked_add(gpu_base))
                 .ok_or(Error::Invalid)?;
         }
-        plan.protect_gpu(Owner::Dmub, address, size)?;
+        plan.protect_dmub(address, size)?;
     }
     // Region5 is the trace alias. DCN4 additionally maps shared firmware state
     // into Region6, with a direct GPU offset and inclusive top (dmub_dcn401).
@@ -555,7 +575,7 @@ fn snapshot_with_layout(
         // linux-lit: 0xffff=DMCUB_REGION4_OFFSET_HIGH__DMCUB_REGION4_OFFSET_HIGH_MASK@dcn
         // linux-lit: 0xffff_ff00=DMCUB_REGION4_OFFSET__DMCUB_REGION4_OFFSET_MASK@dcn
         let address = ((high & 0xffff) as u64) << 32 | (low & 0xffff_ff00) as u64;
-        plan.protect_gpu(Owner::Dmub, address, (top & ADDRESS_MASK) as u64 + 1)?;
+        plan.protect_dmub(address, (top & ADDRESS_MASK) as u64 + 1)?;
     }
     Ok(plan)
 }

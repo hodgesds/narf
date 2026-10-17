@@ -182,6 +182,9 @@ struct Engine<I: Io> {
     instance: u8,
     blanked: bool,
     profile: Profile,
+    /// Blanks whose HUBP_NO_OUTSTANDING_REQ wait expired (Linux logs the
+    /// REG_WAIT timeout and blanks anyway).
+    blank_stalls: u32,
 }
 impl<I: Io> Engine<I> {
     fn reg(&self, reg: u64) -> u64 {
@@ -348,9 +351,11 @@ impl<I: Io> Engine<I> {
         // linux-lit: 8=HUBP0_DCHUBP_CNTL__HUBP_VREADY_AT_OR_AFTER_VSYNC__SHIFT
         self.update(DCHUBP_CNTL, 1 << 8, value << 8)
     }
-    /// `hubp2_set_blank_regs`. Blanking waits for the pipe's outstanding
-    /// requests to retire, so scanout memory is not released while in flight.
-    /// A powered-down pipe reads back zero and is already quiet.
+    /// `hubp2_set_blank_regs`. Blanking waits up to 100 ms for the pipe's
+    /// outstanding requests to retire. Like Linux's REG_WAIT, an expired wait
+    /// is logged (and counted) and the pipe is blanked anyway: a HUBP whose
+    /// requests never drain (power-gated or hung GOP pipe at takeover) must
+    /// not stop the sequence. A powered-down pipe reads back zero.
     async fn set_blank(&mut self, blank: bool) -> Result<(), Error> {
         if blank {
             let cntl = self.reg(DCHUBP_CNTL);
@@ -370,7 +375,14 @@ impl<I: Io> Engine<I> {
                         break;
                     }
                     if deadline.expired() {
-                        return Err(Error::Timeout);
+                        use core::fmt::Write;
+                        self.blank_stalls = self.blank_stalls.saturating_add(1);
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "amdgpu: hubp{} blank: outstanding requests did not retire (100 ms); blanking anyway",
+                            self.instance
+                        );
+                        break;
                     }
                     delay(1).await;
                 }
@@ -415,6 +427,7 @@ impl Hubp {
             instance,
             blanked: true,
             profile,
+            blank_stalls: 0,
         }))
     }
     pub fn instance(&self) -> u8 {
@@ -423,6 +436,10 @@ impl Hubp {
     pub fn blanked(&self) -> bool {
         self.0.blanked
     }
+    /// Blanks that proceeded after the outstanding-request wait expired.
+    pub fn blank_stalls(&self) -> u32 {
+        self.0.blank_stalls
+    }
     /// Program the surface and the pacing that goes with it. The two belong
     /// together: deadlines derived for one surface do not hold for another.
     pub fn program(&mut self, surface: &Surface, registers: &Registers) -> Result<(), Error> {
@@ -430,7 +447,8 @@ impl Hubp {
         self.0.program_vready(registers)?;
         self.0.program_surface(surface)
     }
-    /// Blank the pipe, waiting for its outstanding requests to retire.
+    /// Blank the pipe, waiting (bounded, then logged) for its outstanding
+    /// requests to retire.
     pub async fn blank(&mut self) -> Result<(), Error> {
         self.0.set_blank(true).await
     }

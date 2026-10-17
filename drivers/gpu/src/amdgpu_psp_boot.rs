@@ -227,9 +227,12 @@ struct Engine<I: Io> {
     /// waiting", not a rejection. PSP14 keeps the strict DONE-then-status rule.
     psp11: bool,
 }
-/// psp_v11_0_wait_for_bootloader: 20 × psp_wait_for(usec_timeout = 100 ms).
-// linux: n/a (NARF bound: 20 retries x usec_timeout in psp_v11_0_wait_for_bootloader)
-const PSP11_BOOTLOADER_TIMEOUT_MS: u64 = 2000;
+/// psp_v11_0_wait_for_bootloader: 20 × psp_wait_for, each usec_timeout
+/// (100 000) iterations of RREG32 + udelay(1). The udelays alone are 2 s; the
+/// uncached MMIO read per iteration (1-2 us over PCIe) makes Linux's real
+/// bound 4-6 s, so wait the upper end.
+// linux: n/a (bound derived from psp_v11_0_wait_for_bootloader loops)
+pub(crate) const PSP11_BOOTLOADER_TIMEOUT_MS: u64 = 6000;
 async fn delay(ms: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms).as_instant()).await;
 }

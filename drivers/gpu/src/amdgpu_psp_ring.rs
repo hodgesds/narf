@@ -470,8 +470,10 @@ impl Layout {
         }
         // linux-lit: 0xffffff=GCMC_VM_FB_LOCATION_BASE__FB_BASE_MASK
         let fb_base = (base as u64 & 0xffffff) << 24;
-        // linux-lit: 0xffffff=GCMC_VM_FB_LOCATION_TOP__FB_TOP_MASK
-        let fb_end = ((top as u64 & 0xffffff) + 1) << 24;
+        // amdgpu_gmc_vram_location: vram_end = vram_start + mc_vram_size - 1
+        // (RCC_CONFIG_MEMSIZE). FB_LOCATION_TOP is inherited 16 MiB-granular
+        // state; it is read only to detect a removed device.
+        let fb_end = fb_base.checked_add(gpu.vram.size).ok_or(Error::Invalid)?;
         // linux-lit: 0xffffff=GCMC_VM_FB_OFFSET__FB_OFFSET_MASK
         let fb_offset = (offset as u64 & 0xffffff) << 24;
         let pool_offset = pool.address().checked_sub(fb_base).ok_or(Error::Invalid)?;
@@ -1121,7 +1123,7 @@ impl<I: Io> Session<I> {
             return Err(Error::Busy);
         }
         self.smc_state = SmcState::Pending;
-        let result = self.load_ip(bytes, 18).await.map(|_| ()); // linux-lit: 18=GFX_FW_TYPE_SMU
+        let result = self.load_ip(bytes, 18).await.map(|_| ()); // GFX_FW_TYPE_SMU
         self.smc_state = if result.is_ok() {
             SmcState::Loaded
         } else {

@@ -319,41 +319,54 @@ impl<I: Io> Engine<I> {
         }
         result
     }
+    /// A DAL query whose rejection Linux ignores (dcn30_smu_send_msg_with_param
+    /// leaves the response 0): a rejected message reads as 0, while timeouts,
+    /// device loss and revocation still fail.
+    async fn query_lenient(&mut self, msg: u32, arg: u32) -> Result<u32, Error> {
+        match self.command(msg, arg).await {
+            Err(Error::Rejected(_)) => Ok(0),
+            other => other,
+        }
+    }
+    /// `dcn3_init_clocks`: only the SMU version query decides `smu_present`;
+    /// the driver-interface and message-header checks are logged ("do we
+    /// fail if these fail? ... do we not care to check?"), and
+    /// `dcn3_init_single_clock` records whatever levels PMFW reports (a
+    /// failed query is 0 levels). Unusable ranges are refused later, by the
+    /// clock plan, rather than here.
     async fn start_inner(&mut self) -> Result<Levels, Error> {
         let vco_khz = vco(self.access(|io| io.read(PLL))?)?;
         let firmware = self.command(GET_VERSION, 0).await?;
         // Driver-table versions differ between Navy and Sienna. We record
         // this diagnostic but use only the version-1 scalar DAL protocol.
-        let interface = self.command(GET_INTERFACE, 0).await?;
-        // linux-lit: 1=DALSMC_VERSION
-        if firmware == 0 || interface == 0 || self.command(GET_HEADER, 0).await? != 1 {
-            return Err(Error::Unsupported);
+        let interface = self.query_lenient(GET_INTERFACE, 0).await?;
+        let header = self.query_lenient(GET_HEADER, 0).await?;
+        if header != 1 {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 DAL msg header version {header} (driver 1), if {interface:#x}"
+            );
         }
         let mut ranges = [Range::default(); 7];
         for (range, clock) in ranges.iter_mut().zip(CLOCKS) {
             let features = self
-                // linux: n/a (clk << 16 | 0xFF query, literals in dcn30_clk_mgr.c:dcn3_init_single_clock)
-                .command(DPM_BY_INDEX, (clock as u32) << 16 | 0xff)
+                .query_lenient(DPM_BY_INDEX, (clock as u32) << 16 | 0xff)
                 .await?;
             // linux: n/a (1 << 31 fine-grained flag, literal in dcn30_clk_mgr.c:dcn3_init_single_clock)
             range.fine_grained = features & 1 << 31 != 0;
+            // clk_table holds at most LEVELS entries; never index past it.
             range.count = if range.fine_grained {
                 2 // linux: n/a (num_levels = 2, literal in dcn30_clk_mgr.c:dcn3_init_single_clock)
             } else {
-                features as u8
+                (features as u8).min(LEVELS as u8)
             };
-            if range.count == 0 || usize::from(range.count) > LEVELS {
-                return Err(Error::Invalid);
-            }
             for index in 0..usize::from(range.count) {
                 let value = self
-                    .command(DPM_BY_INDEX, (clock as u32) << 16 | index as u32)
+                    .query_lenient(DPM_BY_INDEX, (clock as u32) << 16 | index as u32)
                     .await?
                     // linux: n/a (& 0xFFFF, literal in dcn30_clk_mgr.c:dcn3_init_single_clock)
                     & 0xffff;
-                if value == 0 || (index != 0 && value < u32::from(range.mhz[index - 1])) {
-                    return Err(Error::Invalid);
-                }
                 range.mhz[index] = value as u16;
             }
         }

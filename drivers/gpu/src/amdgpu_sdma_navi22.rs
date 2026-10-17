@@ -13,7 +13,7 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 const BYTES: u64 = 8192; // linux: n/a (NARF ring + writeback allocation)
 const RPTR: u64 = 4096; // linux: n/a (NARF writeback layout)
 const WPTR: u64 = 4104; // linux: n/a (NARF writeback layout)
-const FENCE: u64 = 8188; // linux: n/a (NARF layout: last dword of GMC's destination page)
+const FENCE: u64 = 8188; // linux: n/a (last dword of GMC's destination page)
 const SEQUENCE: u32 = 0x6750_0022; // linux: n/a (NARF fence sequence)
                                    // linux-ctx: hdr=gc seg=0
 const RESET: u32 = 0x0da8; // linux: mmGRBM_SOFT_RESET
@@ -22,8 +22,7 @@ const RB_CNTL: u32 = 0x80; // linux: mmSDMA0_GFX_RB_CNTL
 const RB_RPTR: u32 = 0x83; // linux: mmSDMA0_GFX_RB_RPTR
 const RB_WPTR: u32 = 0x85; // linux: mmSDMA0_GFX_RB_WPTR
                            // linux-ctx: reset
-const TRAP_END: u32 = 192; // linux: n/a (NARF: first submission plus one 16-dword TRAP block)
-                           // linux: n/a (NARF test pattern)
+const TRAP_END: u32 = 192; // linux: n/a (first submission plus one 16-dword TRAP block)
 const PATTERN: [u32; 16] = [
     0x01234567, 0x89abcdef, 0x76543210, 0xfedcba98, 0xaaaaaaaa, 0x55555555, 0xff00ff00, 0x00ff00ff,
     0x00000001, 0x80000000, 0x01010101, 0x10101010, 0x67506750, 0x00220022, 0xdeadbeef, 0xcafebabe,
@@ -60,6 +59,8 @@ struct Layout {
     gc: u64,
     nbio: u64,
     hdp: u64,
+    /// RCC_CONFIG_MEMSIZE (`gmc.mc_vram_size`): the FB aperture's length.
+    vram_size: u64,
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
@@ -84,6 +85,7 @@ impl Layout {
         };
         Ok(Self {
             // SDMA0 is in GC bank zero, NOT the standalone discovery SDMA bank.
+            vram_size: gpu.vram.size,
             // linux-lit: 0=mmGCMC_VM_FB_LOCATION_TOP_BASE_IDX@gc; 0x16fd=mmGCMC_VM_FB_LOCATION_TOP@gc
             gc: resolve(ip::HW_ID_GC, &[(10, 3, 2)], 0, 0x16fd)?,
             nbio: resolve(
@@ -251,8 +253,11 @@ impl<I: Io> Engine<I> {
         self.access(|io| {
             // linux-lit: 0x16fc=mmGCMC_VM_FB_LOCATION_BASE@gc; 0xffffff=GCMC_VM_FB_LOCATION_BASE__FB_BASE_MASK@gc
             let fb = u64::from(checked(io.read(l.gc + 0x16fc * 4))? & 0xffffff) << 24;
-            // linux-lit: 0x16fd=mmGCMC_VM_FB_LOCATION_TOP@gc; 0xffffff=GCMC_VM_FB_LOCATION_TOP__FB_TOP_MASK@gc
-            let end = (u64::from(checked(io.read(l.gc + 0x16fd * 4))? & 0xffffff) + 1) << 24;
+            // amdgpu_gmc_vram_location: vram_end = vram_start + mc_vram_size
+            // - 1. FB_LOCATION_TOP is VBIOS/previous-driver state (16 MiB
+            // granular) and is only checked for a present device here.
+            checked(io.read(l.gc + 0x16fd * 4))?;
+            let end = fb.checked_add(l.vram_size).ok_or(Error::Invalid)?;
             // The boot aperture is the head of Linux's BEST_FIT GART range
             // (0 below a high FB), never inside the FB aperture itself.
             let aperture_end = aperture.start.checked_add(aperture.size);

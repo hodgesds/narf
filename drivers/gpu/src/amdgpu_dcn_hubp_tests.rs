@@ -46,6 +46,7 @@ fn engine(instance: u8) -> Engine<Fake> {
         instance,
         blanked: true,
         profile: Profile::Dcn314,
+        blank_stalls: 0,
     }
 }
 fn timing() -> Timing {
@@ -380,29 +381,32 @@ fn hubp_blank_waits_for_outstanding_requests() -> TestResult {
     if hubp.io.values[(DCHUBP_CNTL + STRIDE) as usize] & 1 != 1 {
         return TestResult::Fail("pipe not blanked");
     }
-    // A pipe whose requests never retire must time out rather than be called
-    // blanked while a fetch is still in flight against scanout memory.
+    // hubp2_set_blank_regs: REG_WAIT(HUBP_NO_OUTSTANDING_REQ) only logs on
+    // timeout and the blank is still written. A pipe whose requests never
+    // retire (a GOP pipe at takeover) must not fail the caller's sequence.
     let mut stuck = engine(1);
     stuck.io.values[(DCHUBP_CNTL + STRIDE) as usize] = 1 << 12;
     stuck.io.stuck = true;
-    // Start from a running pipe, so the state after a failed blank is the
-    // failure's doing rather than the initial condition.
     stuck.blanked = false;
-    if run(stuck.set_blank(true)) != Err(Error::Timeout) {
-        return TestResult::Fail("in-flight pipe reported as blanked");
+    if run(stuck.set_blank(true)).is_err() {
+        return TestResult::Fail("stalled outstanding-request wait failed the blank");
     }
-    if stuck.blanked {
-        return TestResult::Fail("in-flight pipe marked blanked");
+    if !stuck.blanked || stuck.blank_stalls != 1 {
+        return TestResult::Fail("stalled blank not recorded");
     }
-    if stuck.io.values[(DCHUBP_CNTL + STRIDE) as usize] & 1 != 0 {
-        return TestResult::Fail("blank bit set while a fetch was in flight");
+    if stuck.io.values[(DCHUBP_CNTL + STRIDE) as usize] & (1 | 1 << 12) != 1 {
+        return TestResult::Fail("blank not written (or TTU left disabled) after the wait expired");
+    }
+    stuck.io.gone = true;
+    if run(stuck.set_blank(true)) != Err(Error::DeviceGone) {
+        return TestResult::Fail("removed device blanked");
     }
     // A powered-down pipe reads back zero and needs no wait at all.
     let mut gated = engine(1);
     gated.io.stuck = true;
     gated.io.values[(DCHUBP_CNTL + STRIDE) as usize] = 0;
-    if run(gated.set_blank(true)).is_err() {
-        return TestResult::Fail("power-gated pipe timed out");
+    if run(gated.set_blank(true)).is_err() || gated.blank_stalls != 0 {
+        return TestResult::Fail("power-gated pipe waited");
     }
     TestResult::Pass
 }

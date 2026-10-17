@@ -1029,8 +1029,12 @@ vectors computed from the Linux DML30 formulas.
 An opt-in (`amdgpu.native_display`) native HDMI TMDS path lights the first
 connected HDMI sink on pipe 0 with a test pattern: DCN init, HUBBUB/DML30
 deadlines, the DAL clocks and the VBIOS PixelClock/STREAM_SETUP/transmitter
-tables (now executed by an `atom.c`-faithful interpreter), then fetch and
-unblank. Model-tested per block; never run on hardware.
+tables (sent to DMCUB as `DMUB_CMD__VBIOS` commands while DMUB runs, as
+DCN3.0's `dmub_command_table`; the `atom.c`-faithful interpreter is the logged
+fallback), then fetch and unblank. Model-tested per block; never run on
+hardware. HPD/AUX/DDC engines are armed only with `amdgpu.native_display` or
+`amdgpu.display_probe`; SMU interface mismatches, a fused-off or hung DMCUB,
+stuck HUBP blanks and ASIC_Init's S7 bit are logged, not fatal, as in Linux.
 The lit pipe is presented natively: console/status publication with the
 `scanout_access` withdraw-before-teardown contract, DCN3.0 HUBP VSYNC page
 flips completed from EARLIEST_INUSE (pflip/vupdate IH sources armed), a

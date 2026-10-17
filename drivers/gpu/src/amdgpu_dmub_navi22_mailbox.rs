@@ -218,10 +218,11 @@ impl<I: Io> Engine<I> {
         self.status.as_mut().ok_or(Error::Invalid)?.capabilities = caps;
         Ok(())
     }
-    // Private raw transport: only typed, bounded requests below can reach it.
-    // The outer operation holds InFlight across both inbox and AUX completion.
-    pub(super) async fn command(&mut self, request: [u8; 64]) -> Result<[u8; 64], Error> {
-        if !valid_header(&request) {
+    /// Copy one validated request into the next inbox slot, flush, then
+    /// publish the write pointer. Returns the (old, next) write pointers for
+    /// [`Self::consumed`]. The caller owns the InFlight mailbox.
+    pub(super) fn post(&mut self, request: &[u8; 64]) -> Result<(u32, u32), Error> {
+        if !valid_header(request) {
             return Err(Error::Invalid);
         }
         self.check_mailbox()?;
@@ -245,24 +246,45 @@ impl<I: Io> Engine<I> {
             io.write(l.dcn + u64::from(IN_W) * 4, next);
             Ok(())
         })?;
+        Ok((old, next))
+    }
+    /// One poll of a posted request (dmub_srv_wait_for_idle's rptr == wptr):
+    /// the validated reply slot once firmware consumed it.
+    pub(super) fn consumed(
+        &mut self,
+        request: &[u8; 64],
+        (old, next): (u32, u32),
+    ) -> Result<Option<[u8; 64]>, Error> {
+        let l = self.layout;
+        let map = self.memory.mapping();
+        let offset = self.mailbox_offset() + u64::from(old);
+        let done = self.access(|io| {
+            alive(io, l)?;
+            if read(io, l.dcn, IN_W)? != next {
+                return Err(Error::Protocol);
+            }
+            let rp = pointer(read(io, l.dcn, IN_R)?)?;
+            if rp != old && rp != next {
+                return Err(Error::Protocol);
+            }
+            Ok(rp == next)
+        })?;
+        if !done {
+            return Ok(None);
+        }
+        let reply = self.access(|io| Ok(download(io, l, map, offset)))?;
+        if !valid_header(&reply) || reply[..2] != request[..2] || reply[3] != request[3] {
+            return Err(Error::Protocol);
+        }
+        Ok(Some(reply))
+    }
+    // Private raw transport: only typed, bounded requests below can reach it.
+    // The outer operation holds InFlight across both inbox and AUX completion.
+    pub(super) async fn command(&mut self, request: [u8; 64]) -> Result<[u8; 64], Error> {
+        let posted = self.post(&request)?;
         let deadline = narf_time::Deadline::after_ms(200);
         loop {
-            let done = self.access(|io| {
-                alive(io, l)?;
-                if read(io, l.dcn, IN_W)? != next {
-                    return Err(Error::Protocol);
-                }
-                let rp = pointer(read(io, l.dcn, IN_R)?)?;
-                if rp != old && rp != next {
-                    return Err(Error::Protocol);
-                }
-                Ok(rp == next)
-            })?;
-            if done {
-                let reply = self.access(|io| Ok(download(io, l, map, offset)))?;
-                if !valid_header(&reply) || reply[..2] != request[..2] || reply[3] != request[3] {
-                    return Err(Error::Protocol);
-                }
+            if let Some(reply) = self.consumed(&request, posted)? {
                 return Ok(reply);
             }
             if deadline.expired() {

@@ -37,7 +37,7 @@ const MAX_DPM_FREQ: u32 = 0x1e; // linux: PPSMC_MSG_GetMaxDpmFreq
 const TRANSFER_TO_DRIVER: u32 = 0x12; // linux: PPSMC_MSG_TransferTableSmu2Dram
 const GET_PPT_LIMIT: u32 = 0x33; // linux: PPSMC_MSG_GetPptLimit
 const REENABLE_ACDC_INTERRUPT: u32 = 0x34; // linux: PPSMC_MSG_ReenableAcDcInterrupt
-/// smu_v11_0_7_ppsmc.h runtime feature and GFXOFF messages.
+                                           // smu_v11_0_7_ppsmc.h runtime feature and GFXOFF messages.
 const ENABLE_FEATURES_LOW: u32 = 0x8; // linux: PPSMC_MSG_EnableSmuFeaturesLow
 const ENABLE_FEATURES_HIGH: u32 = 0x9; // linux: PPSMC_MSG_EnableSmuFeaturesHigh
 const DISABLE_FEATURES_LOW: u32 = 0xa; // linux: PPSMC_MSG_DisableSmuFeaturesLow
@@ -260,11 +260,13 @@ impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
 trait Io {
     fn read(&mut self, register: u32) -> u32;
     fn write(&mut self, register: u32, value: u32);
+    /// Stage the PPTable into the transfer buffer; returns the PSP runtime
+    /// DB SCPM status (0: disabled).
     fn stage_power(
         &mut self,
         memory: &crate::amdgpu_vram::Reservation,
         bytes: &[u8],
-    ) -> Result<(), Error>;
+    ) -> Result<u32, Error>;
     /// CPU write into the retained transfer buffer, then the HDP flush
     /// (`amdgpu_asic_flush_hdp`) before the SMU reads it.
     fn write_table(
@@ -416,7 +418,7 @@ impl Io for Mmio {
         &mut self,
         memory: &crate::amdgpu_vram::Reservation,
         bytes: &[u8],
-    ) -> Result<(), Error> {
+    ) -> Result<u32, Error> {
         let nbio = self.nbio.ok_or(Error::Unsupported)?;
         // linux: n/a (1 << 20 = PSP_RUNTIME_DB_OFFSET below mc_vram_size, amdgpu_psp.c:psp_get_runtime_db_entry)
         let base = self.vram_size.checked_sub(1 << 20).ok_or(Error::Invalid)?;
@@ -424,7 +426,7 @@ impl Io for Mmio {
         // constructor and uploader; this entire method runs in Cap::invoke.
         let mut reader =
             unsafe { crate::amdgpu_vram_access::MmioReader::new(&self.vram, &self.regs) };
-        power_policy(|offset, out| {
+        let scpm = power_policy(|offset, out| {
             crate::amdgpu_vram_access::read(&mut reader, self.vram_size, base + offset as u64, out)
                 .map_err(|_| crate::amdgpu_gddr6::Error::Invalid)
         })?;
@@ -455,21 +457,18 @@ impl Io for Mmio {
             self.regs.read32(nbio + 0xc3 * 4); // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        Ok(())
+        Ok(scpm)
     }
 }
+/// psp_sw_init: the PSP runtime DB PPTABLE_ERR_STATUS entry (type 6). A
+/// nonzero status is `adev->scpm_enabled`, which Linux does not treat as an
+/// error ("TODO: stop gpu driver services"); it changes the SMU sequence.
 fn power_policy(
     read: impl FnMut(usize, &mut [u8]) -> Result<(), crate::amdgpu_gddr6::Error>,
-) -> Result<(), Error> {
-    // linux-lit: 6=PSP_RUNTIME_ENTRY_TYPE_PPTABLE_ERR_STATUS
-    let scpm = crate::amdgpu_gddr6::runtime_entry::<4>(read, 6)
+) -> Result<u32, Error> {
+    Ok(crate::amdgpu_gddr6::runtime_entry::<4>(read, 6)
         .map_err(|_| Error::Invalid)?
-        .map_or(0, u32::from_le_bytes);
-    // linux-lit: 0=SCPM_DISABLE
-    if scpm != 0 {
-        return Err(Error::PowerPolicy(scpm));
-    }
-    Ok(())
+        .map_or(0, u32::from_le_bytes))
 }
 #[derive(Debug)]
 struct Engine<I: Io> {
@@ -484,6 +483,9 @@ struct Engine<I: Io> {
     limits: Option<Limits>,
     /// PROTECTION features running when boot power configuration completed.
     protection: Option<u64>,
+    /// SCPM enabled (PSP runtime DB): PSP transfers the PPTable and the
+    /// allowed-feature mask messages are not permitted (smu_smc_hw_setup).
+    scpm: bool,
     /// Opt-in gating bits added to the allowed mask at runtime.
     gating_allowed: u64,
 }
@@ -557,15 +559,22 @@ impl<I: Io> Engine<I> {
         if interface == u32::MAX {
             return Err(Error::DeviceGone);
         }
-        if interface != DRIVER_INTERFACE {
-            return Err(Error::InterfaceMismatch(interface));
-        }
         let firmware = self.query(GET_VERSION).await?;
         if firmware == u32::MAX {
             return Err(Error::DeviceGone);
         }
         if firmware == 0 {
             return Err(Error::Invalid);
+        }
+        // smu_cmn_check_fw_version (sienna_cichlid .check_fw_version) only
+        // logs the driver/firmware interface pair: shipping Navi22 PMFW
+        // 0x413f00 reports interface 0x12 against the driver's 0xe.
+        if interface != DRIVER_INTERFACE {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 smu driver if version = {DRIVER_INTERFACE:#010x}, smu fw if version = {interface:#010x}, smu fw version = {firmware:#010x}"
+            );
         }
         Ok(Versions {
             firmware,
@@ -598,15 +607,29 @@ impl<I: Io> Engine<I> {
             .map_err(|_| Error::Allocation)?;
         self.state = State::UploadingPowerTable;
         let result = async {
-            self.access(|io| io.stage_power(&memory, bytes))??;
+            let scpm = self.access(|io| io.stage_power(&memory, bytes))??;
+            // linux-lit: 0=SCPM_DISABLE
+            if scpm != 0 {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi22 SCPM enabled (status {scpm:#x}): PSP owns the PPTable"
+                );
+            }
+            self.scpm = scpm != 0;
             let address = memory.address();
             memory.publish();
             self.power_memory = Some(memory);
+            // smu_set_driver_table_location runs regardless of SCPM.
             self.command(SET_DRIVER_HIGH, (address >> 32) as u32)
                 .await?;
             self.command(SET_DRIVER_LOW, address as u32).await?;
-            // TABLE_PPTABLE == 0; upper 16 bits (table argument) also zero.
-            self.command(TRANSFER_TABLE, 0).await?; // linux-lit: 0=TABLE_PPTABLE
+            // smu_smc_hw_setup: with SCPM, "PSP is responsible for the
+            // PPTable transferring"; otherwise TABLE_PPTABLE == 0 (the upper
+            // 16-bit table argument also zero).
+            if !self.scpm {
+                self.command(TRANSFER_TABLE, 0).await?; // linux-lit: 0=TABLE_PPTABLE
+            }
             Ok(())
         }
         .await;
@@ -625,9 +648,13 @@ impl<I: Io> Engine<I> {
         self.state = State::ConfiguringPower;
         let result = async {
             self.command(RUN_DC_BTC, 0).await?;
-            self.command(ALLOWED_HIGH, (policy.allowed() >> 32) as u32)
-                .await?;
-            self.command(ALLOWED_LOW, policy.allowed() as u32).await?;
+            // smu_feature_set_allowed_mask is skipped under SCPM ("not
+            // needed and permitted"); the enabled set is still validated.
+            if !self.scpm {
+                self.command(ALLOWED_HIGH, (policy.allowed() >> 32) as u32)
+                    .await?;
+                self.command(ALLOWED_LOW, policy.allowed() as u32).await?;
+            }
             self.command(ENABLE_FEATURES, 0).await?;
             let low = self.command(RUNNING_LOW, 0).await?;
             let high = self.command(RUNNING_HIGH, 0).await?;
@@ -818,8 +845,12 @@ impl<I: Io> Engine<I> {
             };
             let allowed = base | self.gating_allowed | mask;
             if enable {
-                self.command(ALLOWED_HIGH, (allowed >> 32) as u32).await?;
-                self.command(ALLOWED_LOW, allowed as u32).await?;
+                // Under SCPM every feature is allowed and the mask messages
+                // are not permitted (smu_init_driver_allowed_feature_mask).
+                if !self.scpm {
+                    self.command(ALLOWED_HIGH, (allowed >> 32) as u32).await?;
+                    self.command(ALLOWED_LOW, allowed as u32).await?;
+                }
                 self.command(ENABLE_FEATURES_LOW, mask as u32).await?;
                 self.command(ENABLE_FEATURES_HIGH, (mask >> 32) as u32)
                     .await?;
@@ -872,8 +903,10 @@ impl<I: Io> Engine<I> {
         let allowed = policy.display_allowed().map_err(|_| Error::Unsupported)?;
         self.state = State::EnablingDisplayPower;
         let result = async {
-            self.command(ALLOWED_HIGH, (allowed >> 32) as u32).await?;
-            self.command(ALLOWED_LOW, allowed as u32).await?;
+            if !self.scpm {
+                self.command(ALLOWED_HIGH, (allowed >> 32) as u32).await?;
+                self.command(ALLOWED_LOW, allowed as u32).await?;
+            }
             self.command(ENABLE_FEATURES, 0).await?;
             let low = self.command(RUNNING_LOW, 0).await?;
             let high = self.command(RUNNING_HIGH, 0).await?;
@@ -1015,6 +1048,7 @@ impl Smu {
                 versions: None,
                 limits: None,
                 protection: None,
+                scpm: false,
                 gating_allowed: 0,
             },
         })

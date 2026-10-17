@@ -2062,14 +2062,15 @@ kernel_test_in!(
 );
 
 fn smoke_amdgpu_atom_vm_bad_opcode_rejected() -> TestResult {
-    use crate::amdgpu_atom_vm::{execute_bytes, AtomError, AtomState};
-    let code: &[u8] = &[127, 91]; // 127 == ATOM_OP_CNT (out of range)
+    use crate::amdgpu_atom_vm::{execute_bytes, Anomaly, AtomState};
+    // 127 == ATOM_OP_CNT: atom.c breaks out of the table, returning 0.
+    let code: &[u8] = &[127, 91];
     let mut state = AtomState::new(4, 4);
     let mut ps: [u32; 0] = [];
     match execute_bytes(&mut state, code, &mut ps, 0) {
-        Err(AtomError::BadOpcode(127)) => TestResult::Pass,
-        Err(_) => TestResult::Fail("wrong AtomError variant"),
-        Ok(()) => TestResult::Fail("bad opcode silently accepted"),
+        Ok(()) if state.first_anomaly == Some(Anomaly::BadOpcode(127)) => TestResult::Pass,
+        Ok(()) => TestResult::Fail("bad opcode not recorded as an anomaly"),
+        Err(_) => TestResult::Fail("bad opcode aborted instead of ending the table"),
     }
 }
 kernel_test_in!(
