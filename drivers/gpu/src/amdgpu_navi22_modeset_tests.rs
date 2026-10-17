@@ -169,7 +169,7 @@ type Pred<'a> = (&'static str, &'a dyn Fn(&m::Write) -> bool);
 fn in_order(log: &[m::Write], from: usize, steps: &[Pred<'_>]) -> Result<usize, &'static str> {
     let mut at = from;
     for (name, pred) in steps {
-        match log[at..].iter().position(|w| pred(w)) {
+        match log[at..].iter().position(pred) {
             Some(i) => at += i + 1,
             None => return Err(name),
         }
@@ -649,7 +649,7 @@ kernel_test_in!(
 fn step_marks(log: &[m::Write], r: Route) -> Vec<(Step, usize)> {
     let p = u32::from(r.pipe);
     let f = u32::from(r.stream);
-    let first = |pred: &dyn Fn(&m::Write) -> bool| log.iter().position(|w| pred(w)).unwrap();
+    let first = |pred: &dyn Fn(&m::Write) -> bool| log.iter().position(pred).unwrap();
     vec![
         (Step::InitHw, first(&is(d1(0x7b)))),
         (Step::Clocks, first(&dal(0xe))),
@@ -732,14 +732,16 @@ kernel_test_in!(
 );
 
 fn navi22_modeset_cancellation_at_each_step_is_retained() -> TestResult {
-    use core::task::{Context, Poll, Waker};
+    use core::task::{Context, Waker};
     let (r, marks) = clean_marks();
     let mark = |step| marks.iter().find(|(s, _)| *s == step).unwrap().1;
     let (p0, f) = (u32::from(r.pipe), u32::from(r.stream));
     // For every step with an await, the acknowledgement withheld so the
     // bring-up is pending inside it. Watermarks and Timing are synchronous
     // and cannot be cancelled part-way.
-    let points: [(Step, usize, Option<(u32, u32, u32)>, bool); 7] = [
+    /// (step, cancel after this write, withheld ack (dword, mask, value), GOP lit).
+    type Point = (Step, usize, Option<(u32, u32, u32)>, bool);
+    let points: [Point; 7] = [
         // A live GOP OTG whose blank never latches (dcn20_init_blank).
         (
             Step::InitHw,
@@ -794,9 +796,10 @@ fn navi22_modeset_cancellation_at_each_step_is_retained() -> TestResult {
             let mut future = core::pin::pin!(enable_with(&mut p, &vram, &tables, &sink, &mut none));
             let deadline = narf_time::Deadline::after_ms(5000);
             loop {
-                if let Poll::Ready(_) = future
+                if future
                     .as_mut()
                     .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready()
                 {
                     return TestResult::Fail("finished before the cancellation point");
                 }
