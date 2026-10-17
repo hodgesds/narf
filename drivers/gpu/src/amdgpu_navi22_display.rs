@@ -636,6 +636,58 @@ impl crate::amdgpu_dcn30_dp::Aux for DisplayAux<'_> {
         }
         Ok(())
     }
+    /// `link_query_ddc_data(0x54, &offset, 1, &value, 1)` on the HDMI
+    /// connector's hardware I2C engine: the offset written, one byte read
+    /// back under a repeated start.
+    async fn scdc_read(&mut self, offset: u8) -> Result<u8, crate::amdgpu_navi22_modeset::Error> {
+        let mut at = [offset];
+        let mut value = [0u8];
+        self.scdc(&mut [
+            Message {
+                address: DDC_SCDC,
+                write: true,
+                data: &mut at,
+            },
+            Message {
+                address: DDC_SCDC,
+                write: false,
+                data: &mut value,
+            },
+        ])
+        .await?;
+        Ok(value[0])
+    }
+    /// `link_query_ddc_data(0x54, [offset, value], 2, NULL, 0)`.
+    async fn scdc_write(
+        &mut self,
+        offset: u8,
+        value: u8,
+    ) -> Result<(), crate::amdgpu_navi22_modeset::Error> {
+        let mut data = [offset, value];
+        self.scdc(&mut [Message {
+            address: DDC_SCDC,
+            write: true,
+            data: &mut data,
+        }])
+        .await
+    }
+}
+impl DisplayAux<'_> {
+    /// SCDC only exists on an HDMI connector's DDC.
+    async fn scdc(
+        &mut self,
+        messages: &mut [Message<'_>],
+    ) -> Result<(), crate::amdgpu_navi22_modeset::Error> {
+        let scdc = crate::amdgpu_navi22_modeset::Error::Hdmi(crate::amdgpu_dcn30_hdmi::Error::Scdc);
+        match self.display.connectors().get(self.index) {
+            Some(c) if c.signal == Signal::Hdmi => {}
+            _ => return Err(scdc),
+        }
+        self.display
+            .i2c(self.index, messages)
+            .await
+            .map_err(|_| scdc)
+    }
 }
 
 #[cfg(feature = "kernel-test")]

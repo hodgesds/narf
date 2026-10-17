@@ -1224,7 +1224,8 @@ fn navi22_modeset_dp_unplug_teardown_sends_no_aux() -> TestResult {
         return TestResult::Fail("DP enable");
     };
     let from = bench.log().len();
-    if run(p.disable_unplugged(&tables)).is_err() || p.state() != State::At(Step::Stopped) {
+    if run(p.disable_unplugged(&tables, &mut aux)).is_err() || p.state() != State::At(Step::Stopped)
+    {
         return TestResult::Fail("unplugged disable");
     }
     let log = bench.log();

@@ -125,6 +125,23 @@ pub trait Aux {
     fn delay_us(&mut self, us: u64) -> impl Future<Output = ()> + Send {
         sleep_us(us)
     }
+    /// One HDMI SCDC register read over the connector's DDC (I2C 0x54,
+    /// `link_query_ddc_data`); see `amdgpu_dcn30_hdmi::write_scdc_data`. A
+    /// channel with no SCDC (DP AUX, no sink) fails; a sink that declared
+    /// no SCDC is never asked.
+    fn scdc_read(&mut self, offset: u8) -> impl Future<Output = Result<u8, Error>> + Send {
+        let _ = offset;
+        core::future::ready(Err(Error::Hdmi(crate::amdgpu_dcn30_hdmi::Error::Scdc)))
+    }
+    /// One HDMI SCDC register write (`[offset, value]` to I2C 0x54).
+    fn scdc_write(
+        &mut self,
+        offset: u8,
+        value: u8,
+    ) -> impl Future<Output = Result<(), Error>> + Send {
+        let _ = (offset, value);
+        core::future::ready(Err(Error::Hdmi(crate::amdgpu_dcn30_hdmi::Error::Scdc)))
+    }
 }
 
 /// Bits per component on a DP RGB stream.
