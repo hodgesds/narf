@@ -23,6 +23,7 @@ fn report() -> Report {
         memory_aperture: None,
         sdma: None,
         dmub: None,
+        interrupts: None,
     }
 }
 struct Fake {

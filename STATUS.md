@@ -363,6 +363,11 @@ full modeset coordination are still pending. Native routing now resolves
 AUX and HPD independently through the board GPIO LUT, follows display-table
 relative record offsets, and rejects ambiguous routes. The Navi22 backend probe
 uses the DCN30 enable register and includes the sixth transmitter.
+OSSSYS 5.0.3 IH ring 0 now follows navi10_ih_irq_init with a VRAM ring
+reached through VMID0, MSI-X/MSI delivery with polling fallback, and
+overflow-safe task-context drains. It routes IVs to generation-tagged
+subscribers that receive a terminal error on device loss. Boot enables it
+after the memory hubs and proves delivery with an SDMA0 TRAP.
 These are software-tested foundations; training resume,
 VCN startup, display-aware DPM and OS thermal interrupt handling,
 hardware boot, general GPU mappings/GFX10 queue initialization, production

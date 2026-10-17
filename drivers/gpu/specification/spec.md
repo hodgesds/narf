@@ -384,6 +384,10 @@ authority; completion has a 1 s deadline. Revocation, cancellation, removal,
 timeout or corrupted data prevents replay. Ring/writeback memory is published
 before reset and retained on every started path; no destructor resets hardware.
 This is one boot execution test, not a general submission or acceleration API.
+After verification, crate-internal `trap(context).await` appends one
+`SDMA_OP_TRAP` block (INT_CONTEXT masked to 28 bits), sets
+`SDMA0_CNTL.TRAP_ENABLE` and waits at most 100 ms for both read pointers to
+reach 192 bytes. It runs once; failure marks the engine `Failed`.
 
 ### Navi 22 OSSSYS 5.0.3 interrupt ring and dispatch
 
@@ -556,7 +560,8 @@ exclude reset/PM/other clients and retain permanent mappings for the session.
 ring creation → trusted-memory setup → SMC upload → SMU version handshake →
 optional board PowerPlay upload → optional DMUB quiesce → graphics upload/autoload → RLC boot check →
 optional board calibration/protected GFX DPM setup → optional memory hubs →
-optional SDMA execution test → optional DMUB start.
+optional IH enable → optional SDMA execution test → optional SDMA TRAP
+interrupt round trip → optional DMUB start.
 Production cold boot emits a serial `start` and terminal `complete` or
 `failed` checkpoint for each stage. A pending/cancelled stage emits no false
 completion; checkpoints do not run per poll or write training-owned framebuffer
@@ -569,7 +574,13 @@ requires prepared memory hubs. Production boot also calls it. `Stage::SdmaTest`
 identifies a failure in this stage, with the SDMA error retained.
 `Firmware::prepare_dmub(gpu)` prepares board-specific DMUB backing before
 construction; `ColdBoot::prepare_dmub()` reserves its VRAM after memory hubs
-are prepared. Production boot requires both calls. This places `DmubQuiesce`
+are prepared. Production boot requires both calls.
+`ColdBoot::prepare_interrupts(bus_device)` reserves IH storage after memory
+hubs; `interrupts()` (and `amdgpu_navi22_platform::interrupts().await`)
+returns its `Handle`. `Stage::InterruptTest` fails the boot only on device
+loss or revoked authority. Other failures are printed as `degraded` and
+retained in `Report::interrupts` (`Status::proof`); delivery stays on
+watchdog/polling. This places `DmubQuiesce`
 before any PSP DMCUB upload and `DmubStart` after memory-hub/SDMA startup.
 `DmubStart` includes the runtime version/capability handshake above.
 `Firmware::prepare_power(gpu, Identity)` prepares the board table before the
@@ -586,7 +597,8 @@ owned by hardware through the underlying owners' existing rules.
 
 Success returns `Report { smu: Versions, gfx: GfxBootStatus, power: Option<Info>,
 power_status: Option<PowerStatus>, media_firmware: MediaFirmware,
-memory_aperture: Option<Aperture>, sdma: Option<Proof>, dmub: Option<Status> }`;
+memory_aperture: Option<Aperture>, sdma: Option<Proof>, dmub: Option<Status>,
+interrupts: Option<amdgpu_ih_navi22::Status> }`;
 `power` is populated only when the prepared table was uploaded. The session must
 stay alive, or `take_psp()` can transfer its live ring/TMR owner to subsequent
 GPU initialization after full success; that changes state to `Released` and
