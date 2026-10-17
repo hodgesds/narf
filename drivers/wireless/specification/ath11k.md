@@ -1,7 +1,9 @@
 # ath11k — Specification
 
-> Status: **v0.2** — PCI identify only. No firmware boot, no
-> control plane, no data path; no network interface is registered.
+> Status: **v0.3** — PCI identify, power-up and the MHI host:
+> firmware boots to mission mode and the IPCR channels start
+> (offline-tested only). No control plane (QMI), no data path; no
+> network interface is registered.
 >
 > Qualcomm ath11k Wi-Fi 6 / 6E driver for PCIe host-attached
 > silicon (QCA6390 / WCN6855 / QCN9074). Adapted from Linux
@@ -38,12 +40,41 @@ resolve to `HwRev` exactly as Linux `ath11k_pci_probe`: WCN6855
 HW2.0 / HW2.1, QCA2066 HW2.1, QCA6698AQ HW2.1. Unsupported steppings
 fail probe. `HwRev::fw_dir()` = Linux `hw_params.fw.dir`.
 
+### 2.3 MHI host (`mhi.rs`, `mhi_host.rs`)
+
+`mhi.rs` holds the wire definitions (`drivers/bus/mhi/common.h`,
+`host/internal.h`, `include/linux/mhi.h`): register map, 44-byte
+`#[repr(C, packed(4))]` channel / event / command contexts, 16-byte
+ring elements, `mhi_ee_type` / `mhi_state` as raw newtypes, the PM
+state bits + `dev_state_transitions[]`, and ath11k's QCA6390 /
+WCN6855 controller config. `mhi_host.rs` ports the host controller
+against an `MhiBus` trait (direct BAR0 like `ath11k_mhi_op_read_reg`,
+MSI bits, sleep, time, randomness): context arrays + rings in DMA32
+memory, `mhi_init_mmio`, `mhi_async_power_up` / `mhi_sync_power_up`,
+FBC download (BHI of the first `sbl_size` bytes, then a BHIe vector
+table for the image, skipping the SBL if a second ELF header
+follows it), READY → M0 → SBL → AMSS, event-ring processing, the
+command ring and `mhi_prepare_for_transfer` with QRTR's buffer policy
+(63 pre-posted 8 KiB DL buffers, recycled on completion). Timeouts are
+`MHI_TIMEOUT_DEFAULT_MS` = 20 s (`ath11k_mhi_start` overrides the
+config's 2 s). One async task (`pci::mhi_task`) owns the controller;
+every wait services the MHI interrupt work and also polls the event
+rings each 25 ms slice, counting events that arrived without an MSI.
+Not ported: RDDM, SYS_ERR recovery, power-down, M3 suspend/resume,
+BW scaling, RSC/offload/client-managed rings, EDL.
+
 ## 3. Public interface
 
 - `register()` — registers the three Linux PCI ids.
-- `pci::probe` — identify + log `hw_rev` and firmware dir.
+- `pci::probe` — identify, power up, spawn the MHI bring-up task.
 - `pci::{read32, write32}` — Linux-equivalent register access.
 - `pci::{is_probed, with_controller}` — bound-device inspection.
+- `pci::{take_mhi, mhi_ready}` — the running MHI controller (IPCR
+  started) for the QRTR layer.
+- `mhi_host::MhiController::{queue_ul, take_dl, poll, wait_and_poll}`
+  — IPCR UL send (`mhi_queue_skb(…, MHI_EOT)`) / DL receive.
+- `narf_io::alloc_coherent_masked` (32-bit coherent mask) backs every
+  MHI buffer.
 
 Phase 3 groundwork — pure codecs, no MMIO, not yet wired to MHI:
 
@@ -98,8 +129,8 @@ card (QEMU emulates none) is exercised once, after phase 8.
 | # | Phase | Linux source |
 |---|---|---|
 | 0 | PCI identify, correct register access (**done**) | `pci.c`, `pcic.c` |
-| 1 | MSI vectors, power-up (`soc_global_reset`, LTSSM, L1SS / ASPM handling) | `pci.c`, `pcic.c` |
-| 2 | MHI host: context arrays, event rings, BHI SBL (512 KiB) + BHIe full image, EE/state machine to mission mode, IPCR ch 20/21 | `mhi.c`, `bus/mhi/host/*` |
+| 1 | MSI vectors, power-up (`soc_global_reset`, LTSSM, L1SS / ASPM handling) (**done**) | `pci.c`, `pcic.c` |
+| 2 | MHI host: context arrays, event rings, BHI SBL (512 KiB) + BHIe full image, EE/state machine to mission mode, IPCR ch 20/21 (**done**, offline) | `mhi.c`, `bus/mhi/host/*` |
 | 3 | QRTR over MHI + QMI encode/decode; WLFW handshake: host cap, ind register, respond mem, target cap, BDF (`board-2.bin` by bus/qmi-chip-id/board-id), M3 (`m3.bin`), regdb, wlan cfg, mode ON | `qmi.c`, `net/qrtr`, `soc/qcom/qmi_*` |
 | 4 | Copy Engines + HTC + WMI: service ready, init, ready; MAC from firmware | `ce.c`, `htc.c`, `wmi.c` |
 | 5 | HAL SRNG + DP rings (TCL, REO, WBM, RXDMA refill) | `hal*.c`, `dp.c` |
@@ -126,6 +157,12 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   the QCNFA765 laptop (`docs/BOOTING_ON_CACHYOS.md`). No serial
   there, so every bring-up stage reports to a pinned framebuffer
   status line as well as the console.
+- MHI diag steps: `mhi_host::step` (10–35) latch through
+  `diag::latch_wifi_error`; the stage moves to `transport` at the
+  first M0 and `fw-boot` at mission mode.
+- Open: Linux prefers `firmware-2.bin` (an `amss.bin` IE) over
+  `amss.bin` when present (`ath11k_fw_pre_init`); only `amss.bin` is
+  loaded today.
 - Firmware: `cargo xtask import-firmware --vendor ath11k`
   decompresses the distro `.zst` blobs at image build time. Open:
   whether probe runs before the rootfs firmware scan, i.e. whether

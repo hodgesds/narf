@@ -10,13 +10,17 @@
 //!     `ath11k_pci_enable_ltssm`).
 //!   - hw_rev resolution (TCSR major/minor + WCN6855 sub-version).
 //!
-//! Then power-up (Linux `ath11k_pci_power_up` short of MHI start):
-//! MSI vectors (32, else 1), `sw_reset(power_on)`, ASPM off, MSI on.
+//! Then power-up (Linux `ath11k_pci_power_up`): MSI vectors (32,
+//! else 1), `sw_reset(power_on)`, ASPM off, MSI on, and
+//! `ath11k_mhi_start` — run by a spawned task ([`mhi_task`]) because
+//! the firmware download and MHI state machine take seconds: the MHI
+//! host ([`super::mhi_host`]) loads `amss.bin` over BHI/BHIe, follows
+//! the device to mission mode and starts the IPCR channels 20/21.
 //!
-//! Not yet: MHI host + firmware boot, QMI, CE/HTC/WMI, DP. Until
-//! those land the device registers no network interface — a
-//! `wlan%d` with a made-up MAC that "associates" without touching
-//! the radio would only mislead userspace.
+//! Not yet: QMI, CE/HTC/WMI, DP. Until those land the device
+//! registers no network interface — a `wlan%d` with a made-up MAC
+//! that "associates" without touching the radio would only mislead
+//! userspace.
 //!
 //! Linux references (BSD-3 / dual GPL):
 //! - `drivers/net/wireless/ath/ath11k/pci.c::ath11k_pci_probe`
@@ -30,7 +34,10 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::future::Future;
+use core::pin::Pin;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::task::{Context, Poll, Waker};
 
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
@@ -41,6 +48,8 @@ use super::hw::{
     self, name_for, refine_hw_rev, ChipInfo, HwParams, HwRev, ALL_DEV_IDS, MSI_CONFIG_ONE,
     QCOM_VENDOR,
 };
+use super::mhi::{self, ATH11K_AMSS_FILE};
+use super::mhi_host::{self, ControllerParams, MhiBus, MhiController, MhiError, MhiNotify};
 use super::power::{self, ChipIo, PowerUpReport};
 
 /// Failing-step codes latched into `narf_memory::diag` (shown on the
@@ -143,13 +152,310 @@ impl ChipIo for Bar0Io<'_> {
     }
 }
 
-/// MSI deliveries seen, any vector. Nothing consumes them until the
-/// MHI host lands; the count shows the chip can reach the host.
+/// MSI deliveries seen, any vector — the count shows the chip can
+/// reach the host.
 pub static MSI_FIRES: AtomicU64 = AtomicU64::new(0);
 
+/// Vectors not yet claimed by a subsystem (CE / WAKE / DP until those
+/// phases land).
 fn msi_irq(_cookie: u64) -> narf_interrupts::IrqStatus {
     MSI_FIRES.fetch_add(1, Ordering::Relaxed);
     narf_interrupts::IrqStatus::Handled
+}
+
+/// `mhi_cntrl->irq[]` indexes that fired and the MHI task has not
+/// consumed yet (bit `i` = `irq[i]`: 0 = BHI / intvec, 1–2 = event
+/// rings).
+static MHI_IRQ_PENDING: AtomicU32 = AtomicU32::new(0);
+/// The MHI task parked in [`MhiIrqWait`].
+static MHI_WAKER: IrqSafeSpinLock<Option<Waker>> = IrqSafeSpinLock::new(None);
+
+/// Handler on the MHI vectors (Linux `mhi_intvec_handler` /
+/// `mhi_irq_handler` top halves): note which `irq[]` entries fired and
+/// wake the MHI task, which does the work. `cookie` is the bitmask of
+/// `irq[]` indexes this vector carries (all three when MSI fell back
+/// to one shared vector).
+fn mhi_msi_irq(cookie: u64) -> narf_interrupts::IrqStatus {
+    MSI_FIRES.fetch_add(1, Ordering::Relaxed);
+    MHI_IRQ_PENDING.fetch_or(cookie as u32, Ordering::AcqRel);
+    if let Some(w) = MHI_WAKER.lock().take() {
+        w.wake();
+    }
+    narf_interrupts::IrqStatus::Handled
+}
+
+/// `ath11k_mhi_get_msi`: `(irq[] count, IDT vector of irq[0], one
+/// vector per entry?)` from the "MHI" user assignment.
+fn mhi_vectors(msi: &MsiState) -> Option<(u32, u8, bool)> {
+    let (num, _user_base_data, base_vector) =
+        msi.config.user_assignment("MHI", msi.ep_base_data)?;
+    let multi = msi.n_vectors > 1;
+    Some((num, msi.base_irq + base_vector as u8, multi))
+}
+
+/// Handler cookie for IDT vector `base_irq + i`: the bitmask of MHI
+/// `irq[]` entries it carries, or `None` for a non-MHI vector. With one
+/// vector per entry `irq[k]` = `base_vector + k`; with the shared
+/// single-MSI fallback every entry is `base_vector`.
+pub fn mhi_vector_cookie(
+    config: &hw::MsiConfig,
+    ep_base_data: u32,
+    n_vectors: u8,
+    i: u8,
+) -> Option<u64> {
+    let (num, _, base_vector) = config.user_assignment("MHI", ep_base_data)?;
+    if n_vectors > 1 {
+        let k = (i as u32).checked_sub(base_vector)?;
+        (k < num).then_some(1u64 << k)
+    } else {
+        (i as u32 == base_vector).then_some((1u64 << num) - 1)
+    }
+}
+
+/// Resolves when an MHI vector fires or the slice ends.
+struct MhiIrqWait {
+    sleep: narf_time::SleepUntil,
+}
+
+impl Future for MhiIrqWait {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if MHI_IRQ_PENDING.load(Ordering::Acquire) != 0 {
+            return Poll::Ready(());
+        }
+        *MHI_WAKER.lock() = Some(cx.waker().clone());
+        // Re-check after publishing the waker: an IRQ between the two
+        // loads either sees the waker or left the bit for us.
+        if MHI_IRQ_PENDING.load(Ordering::Acquire) != 0 {
+            return Poll::Ready(());
+        }
+        Pin::new(&mut self.sleep).poll(cx)
+    }
+}
+
+/// The MHI host's view of the chip: direct BAR0 (Linux
+/// `ath11k_mhi_op_read_reg` is a plain `readl(regs + offset)`, no
+/// window), the MHI vectors, time and entropy.
+#[derive(Debug)]
+pub struct Bar0Mhi {
+    mmio: MmioRegion,
+}
+
+impl Bar0Mhi {
+    fn in_bar(&self, offset: u32) -> bool {
+        offset as u64 + 4 <= self.mmio.len && offset % 4 == 0
+    }
+}
+
+impl MhiBus for Bar0Mhi {
+    fn read32(&self, offset: u32) -> u32 {
+        if !self.in_bar(offset) {
+            return u32::MAX;
+        }
+        // SAFETY: `mmio` is the driver-owned live BAR0 mapping and the
+        // access is inside it (checked above).
+        unsafe { self.mmio.read32(offset as u64) }
+    }
+    fn write32(&self, offset: u32, value: u32) {
+        if !self.in_bar(offset) {
+            return;
+        }
+        // SAFETY: as `read32`.
+        unsafe { self.mmio.write32(offset as u64, value) }
+    }
+    fn take_irqs(&self) -> u32 {
+        MHI_IRQ_PENDING.swap(0, Ordering::AcqRel)
+    }
+    fn wait_irq(&self, ms: u32) -> impl Future<Output = ()> + Send {
+        MhiIrqWait {
+            sleep: narf_time::SleepUntil::new(
+                narf_time::Deadline::after_ms(ms as u64).as_instant(),
+            ),
+        }
+    }
+    fn sleep(&self, ms: u32) -> impl Future<Output = ()> + Send {
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms as u64).as_instant())
+    }
+    fn now_ms(&self) -> u64 {
+        narf_time::wall::monotonic_ns() / 1_000_000
+    }
+    fn random_nonzero(&self, max: u32) -> u32 {
+        let mut b = [0u8; 4];
+        narf_crypto::fill_random_bytes(&mut b);
+        let v = u32::from_le_bytes(b) & max;
+        if v == 0 {
+            1
+        } else {
+            v
+        }
+    }
+    fn notify(&self, ev: MhiNotify) {
+        use core::fmt::Write as _;
+        match ev {
+            MhiNotify::FirstM0 => diag::set_wifi_stage(WifiStage::Transport),
+            MhiNotify::EeMissionMode => diag::set_wifi_stage(WifiStage::FwBoot),
+            _ => {}
+        }
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath11k: notify status reason {:?}",
+            ev
+        );
+    }
+    fn log(&self, args: core::fmt::Arguments<'_>) {
+        use core::fmt::Write as _;
+        let _ = writeln!(narf_console::Writer, "  ath11k: {}", args);
+    }
+}
+
+/// The MHI controller once the IPCR channels are running, for the QRTR
+/// layer. Take it out ([`take_mhi`]) before driving it from a task —
+/// never hold this lock across an `.await`.
+static MHI: IrqSafeSpinLock<Option<MhiController<Bar0Mhi>>> = IrqSafeSpinLock::new(None);
+
+/// Hand the running MHI controller to its next owner (Phase 3: QRTR).
+pub fn take_mhi() -> Option<MhiController<Bar0Mhi>> {
+    MHI.lock().take()
+}
+
+/// `true` once MHI reached mission mode and IPCR is running.
+pub fn mhi_ready() -> bool {
+    MHI.lock().is_some()
+}
+
+/// Firmware lookup retries: probe can run before the rootfs firmware
+/// scan registers the ath11k blobs (spec §8), so keep looking for a
+/// while instead of failing like `request_firmware`.
+const FW_WAIT_MS: u64 = 60_000;
+const FW_RETRY_MS: u64 = 500;
+
+/// Linux `request_firmware(ath11k/<fw_dir>/amss.bin)`.
+async fn load_amss(fw_dir: &str) -> Result<alloc::vec::Vec<u8>, MhiError> {
+    use core::fmt::Write as _;
+    let name = alloc::format!("ath11k/{}/{}", fw_dir, ATH11K_AMSS_FILE);
+    let auth = match narf_firmware::trusted_loader_authority().and_then(|a| a.derive().ok()) {
+        Some(a) => a,
+        None => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ath11k: no firmware authority for {}",
+                name
+            );
+            return Err(MhiError::new(
+                mhi_host::step::FW_NOT_FOUND,
+                1,
+                mhi_host::errno::EIO,
+            ));
+        }
+    };
+    let start = narf_time::wall::monotonic_ns() / 1_000_000;
+    loop {
+        match narf_firmware::open(&name, &auth) {
+            Ok(cap) => {
+                let view = narf_firmware::view_of(&cap).map_err(|_| {
+                    MhiError::new(mhi_host::step::FW_NOT_FOUND, 2, mhi_host::errno::EIO)
+                })?;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  ath11k: firmware {} ({} bytes)",
+                    name,
+                    view.bytes.len()
+                );
+                return Ok(view.bytes.to_vec());
+            }
+            Err(e) => {
+                let now = narf_time::wall::monotonic_ns() / 1_000_000;
+                if now.saturating_sub(start) >= FW_WAIT_MS {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  ath11k: firmware {} not found: {:?}",
+                        name,
+                        e
+                    );
+                    return Err(MhiError::new(
+                        mhi_host::step::FW_NOT_FOUND,
+                        3,
+                        mhi_host::errno::EIO,
+                    ));
+                }
+            }
+        }
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(FW_RETRY_MS).as_instant()).await;
+    }
+}
+
+/// What [`mhi_task`] needs from the bound device.
+#[derive(Copy, Clone, Debug)]
+pub struct MhiStart {
+    pub mmio: MmioRegion,
+    pub hw_rev: HwRev,
+    pub fw_dir: &'static str,
+    /// `nr_irqs` (the "MHI" MSI user's vector count).
+    pub nr_irqs: u32,
+}
+
+/// Linux `ath11k_mhi_register` + `ath11k_mhi_start`
+/// (`mhi_prepare_for_power_up` + `mhi_sync_power_up`), then the QRTR
+/// MHI client's `mhi_prepare_for_transfer` on IPCR.
+async fn mhi_bring_up(s: MhiStart) -> Result<MhiController<Bar0Mhi>, MhiError> {
+    use core::fmt::Write as _;
+    let cfg = mhi::config_for(s.hw_rev).ok_or(MhiError::new(
+        mhi_host::step::BAD_CONFIG,
+        0,
+        mhi_host::errno::EINVAL,
+    ))?;
+    let fw = load_amss(s.fw_dir).await?;
+    let params = ControllerParams::ath11k(s.mmio.len.min(u32::MAX as u64) as u32, s.nr_irqs);
+    let mut ctrl = MhiController::new(Bar0Mhi { mmio: s.mmio }, cfg, params)?;
+    ctrl.prepare_for_power_up()?;
+    let (bhi, bhie) = ctrl.bhi_offsets();
+    let _ = writeln!(
+        narf_console::Writer,
+        "  ath11k: mhi: BHI at {:#x}, BHIe at {:#x}, timeout {} ms",
+        bhi,
+        bhie,
+        params.timeout_ms
+    );
+    ctrl.set_firmware(fw);
+    ctrl.sync_power_up().await?;
+    ctrl.prepare_for_transfer("IPCR").await?;
+    let st = ctrl.stats;
+    let _ = writeln!(
+        narf_console::Writer,
+        "  ath11k: mhi: mission mode, IPCR ch20/21 started; irqs {:?} events {:?} \
+         events-without-msi {} serial {:#x}",
+        st.irqs,
+        st.events,
+        st.events_without_irq,
+        ctrl.serial_number()
+    );
+    if st.events_without_irq != 0 {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath11k: warning: MHI events arrived without MSI; running on polling"
+        );
+    }
+    Ok(ctrl)
+}
+
+/// The MHI bring-up task spawned by probe.
+pub async fn mhi_task(s: MhiStart) {
+    use core::fmt::Write as _;
+    match mhi_bring_up(s).await {
+        Ok(ctrl) => {
+            *MHI.lock() = Some(ctrl);
+        }
+        Err(e) => {
+            diag::latch_wifi_error(e.step, e.detail);
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ath11k: MHI bring-up failed: step {} detail {:#x} (-{})",
+                e.step,
+                e.detail,
+                e.errno
+            );
+        }
+    }
 }
 
 impl core::fmt::Debug for Ath11kDevice {
@@ -279,7 +585,19 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
+    let start = mhi_vectors(&dev.msi).map(|(nr_irqs, _, _)| MhiStart {
+        mmio: dev.mmio_bar0,
+        hw_rev: dev.hw_rev,
+        fw_dir: dev.params.fw_dir,
+        nr_irqs,
+    });
     *CONTROLLER.lock() = Some(dev);
+    match start {
+        Some(s) => {
+            narf_scheduler::spawn(mhi_task(s));
+        }
+        None => diag::latch_wifi_error(mhi_host::step::BAD_CONFIG, 0),
+    }
     Ok(())
 }
 
@@ -395,8 +713,17 @@ unsafe fn alloc_msi(
     let state = attempt(want)
         .or_else(|| attempt(&MSI_CONFIG_ONE))
         .ok_or(ProbeError::MsiUnavailable)?;
+    // `ath11k_mhi_get_msi`: irq[i] = base_vector (+ i with one vector
+    // per entry); everything else keeps the counting handler until its
+    // subsystem lands.
     for i in 0..state.n_vectors {
-        narf_interrupts::install_handler_named(state.base_irq + i, "ath11k", i as u64, msi_irq);
+        let v = state.base_irq + i;
+        match mhi_vector_cookie(state.config, state.ep_base_data, state.n_vectors, i) {
+            Some(cookie) => {
+                narf_interrupts::install_handler_named(v, "ath11k-mhi", cookie, mhi_msi_irq)
+            }
+            None => narf_interrupts::install_handler_named(v, "ath11k", i as u64, msi_irq),
+        }
     }
     // SAFETY: caller owns cfg space exclusively.
     unsafe { narf_bus::msi::disable(&state.bus_cfg) }.map_err(|_| ProbeError::MsiUnavailable)?;

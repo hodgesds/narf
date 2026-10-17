@@ -1,7 +1,7 @@
 //! ath11k smoke tests — co-located per project convention.
 //!
-//! Pure-data only: PCI match presence, hw_rev decode, MHI ring
-//! arithmetic, WMI TLV round-trip, DP ring sizing. Live silicon
+//! Pure-data only: PCI match presence, hw_rev decode, WMI TLV
+//! round-trip, DP ring sizing. Live silicon
 //! is exercised by the probe-bound-or-skip smoke at the bottom —
 //! that one Skips cleanly on QEMU.
 
@@ -192,126 +192,7 @@ kernel_test_in!(
     smoke_ath11k_window_constants_consistent
 );
 
-// ── MHI ring arithmetic ────────────────────────────────────────────
-
-fn smoke_ath11k_mhi_ring_push_pop_modular() -> TestResult {
-    let mut r = MhiRing::new(8);
-    if !r.is_empty() {
-        return TestResult::Fail("freshly-allocated ring should be empty");
-    }
-    if r.is_full() {
-        return TestResult::Fail("freshly-allocated ring should not be full");
-    }
-    // Push 7 (capacity - 1 since MHI reserves a slot).
-    for i in 0..7 {
-        if r.push(MhiTre::pack_data(0x1000 + i, 64, true, false, false, false))
-            .is_none()
-        {
-            return TestResult::Fail("push under capacity rejected");
-        }
-    }
-    if !r.is_full() {
-        return TestResult::Fail("ring at capacity-1 not classified as full");
-    }
-    // One more push refused.
-    if r.push(MhiTre::default()).is_some() {
-        return TestResult::Fail("push past capacity should fail");
-    }
-    // Pop one + push one — verifies modular wrap behaviour.
-    if r.pop().is_none() {
-        return TestResult::Fail("pop on full ring should succeed");
-    }
-    if r.is_full() {
-        return TestResult::Fail("ring shouldn't be full after one pop");
-    }
-    if r.push(MhiTre::default()).is_none() {
-        return TestResult::Fail("push after pop should succeed");
-    }
-    if !r.is_full() {
-        return TestResult::Fail("ring should be full again after push");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/wireless/ath11k",
-    smoke_ath11k_mhi_ring_push_pop_modular
-);
-
-fn smoke_ath11k_mhi_tre_pack_and_unpack() -> TestResult {
-    let dma = 0x1234_5678_9ABC_DEF0u64;
-    let tre = MhiTre::pack_data(dma, 0x0040, true, true, false, false);
-    if tre.dma() != dma {
-        return TestResult::Fail("dma round-trip wrong");
-    }
-    if tre.len() != 0x0040 {
-        return TestResult::Fail("payload length wrong");
-    }
-    if tre.tre_type() != 0x02 {
-        return TestResult::Fail("TRE type for data should be 0x02");
-    }
-    if !tre.ieot() || !tre.ieob() {
-        return TestResult::Fail("IEOT/IEOB bits not honoured");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/wireless/ath11k",
-    smoke_ath11k_mhi_tre_pack_and_unpack
-);
-
-fn smoke_ath11k_mhi_channel_tables() -> TestResult {
-    // QCA6390 channel set: ch20/ch21 IPCR, 64 elements.
-    let qca = channels_for_did(ATH11K_DEV_QCA6390);
-    if qca.len() != 2 {
-        return TestResult::Fail("QCA6390 channel count should be 2");
-    }
-    if qca[0].num != 20 || qca[1].num != 21 {
-        return TestResult::Fail("QCA6390 channels should be 20/21");
-    }
-    if qca[0].num_elements != 64 {
-        return TestResult::Fail("QCA6390 ch20 should have 64 elements");
-    }
-    // QCN9074 — same pair, 32 elements.
-    let qcn = channels_for_did(ATH11K_DEV_QCN9074);
-    if qcn[0].num_elements != 32 {
-        return TestResult::Fail("QCN9074 ch20 should have 32 elements");
-    }
-    // WCN6855 falls back to QCA6390 layout.
-    let wcn = channels_for_did(ATH11K_DEV_WCN6855);
-    if wcn[0].num_elements != 64 {
-        return TestResult::Fail("WCN6855 should share QCA6390 channel layout");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mhi_channel_tables);
-
-fn smoke_ath11k_mhi_doorbell_offsets() -> TestResult {
-    if ch_doorbell_offset(0) != MHI_CHDB_BASE {
-        return TestResult::Fail("ch0 doorbell should be at MHI_CHDB_BASE");
-    }
-    if ch_doorbell_offset(20) != MHI_CHDB_BASE + 20 * 8 {
-        return TestResult::Fail("ch20 doorbell offset wrong");
-    }
-    if er_doorbell_offset(1) != MHI_ERDB_BASE + 8 {
-        return TestResult::Fail("er1 doorbell offset wrong");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mhi_doorbell_offsets);
-
-fn smoke_ath11k_mhi_exec_env_decode() -> TestResult {
-    if MhiExecEnv::from_raw(0) != MhiExecEnv::Pbl {
-        return TestResult::Fail("raw 0 should decode to Pbl");
-    }
-    if MhiExecEnv::from_raw(2) != MhiExecEnv::Amss {
-        return TestResult::Fail("raw 2 should decode to Amss");
-    }
-    if MhiExecEnv::from_raw(0xff) != MhiExecEnv::Disabled {
-        return TestResult::Fail("raw 0xff should decode to Disabled");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mhi_exec_env_decode);
+// MHI protocol + host tests live in `mhi_tests.rs`.
 
 // ── WMI TLV encoder ────────────────────────────────────────────────
 

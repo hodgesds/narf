@@ -44,6 +44,7 @@ extern crate alloc;
 pub mod dp;
 pub mod hw;
 pub mod mhi;
+pub mod mhi_host;
 pub mod pci;
 pub mod power;
 pub mod qmi;
@@ -64,6 +65,8 @@ pub fn register() {
     register_pci_driver();
 }
 
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod mhi_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod qmi_tests;
 #[cfg(any(test, feature = "kernel-test"))]
