@@ -363,6 +363,16 @@ full modeset coordination are still pending. Native routing now resolves
 AUX and HPD independently through the board GPIO LUT, follows display-table
 relative record offsets, and rejects ambiguous routes. The Navi22 backend probe
 uses the DCN30 enable register and includes the sixth transmitter.
+Production cold boot now resets a posted card before any firmware stage, as
+Linux does whenever the VBIOS left SOS running: PMFW (or PSP) mode1 reset,
+PCI config restore including Resizable BAR sizes, then bootloader and MEMSIZE
+waits. Without it the sequence would load SMC/graphics/DMCUB over the
+VBIOS-started SOS and PMFW, a state Linux never initializes from.
+OSSSYS 5.0.3 IH ring 0 now follows navi10_ih_irq_init with a VRAM ring
+reached through VMID0, MSI-X/MSI delivery with polling fallback, and
+overflow-safe task-context drains. It routes IVs to generation-tagged
+subscribers that receive a terminal error on device loss. Boot enables it
+after the memory hubs and proves delivery with an SDMA0 TRAP.
 Navi22 display AUX/DDC/HPD is now native, as Linux drives DCN3.0
 (`dc_is_dmub_outbox_supported` is false there): the DCE AUX engine with
 `dce_aux_transfer_with_retries` policy, I2C-over-AUX, the hardware I2C engine

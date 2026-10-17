@@ -734,7 +734,20 @@ fn dcn30_hw_i2c_nack_timeout_and_busy_fail_closed() -> TestResult {
         data: &mut byte,
     }];
     if run(i2c(&mut e, 0, Mode::I2c, &mut messages)) != Err(Error::Unsupported) {
-        return TestResult::Fail("zero time base");
+        return TestResult::Fail("zero time base without crystal");
+    }
+    // After reset-on-init the divider is zero; the VBIOS crystal paces it.
+    e.crystal_khz = 100_000;
+    e.io.ddc[0] = Some(Sink::new(edid()));
+    let mut messages = [Message {
+        address: 0x50,
+        write: false,
+        data: &mut byte,
+    }];
+    if run(i2c(&mut e, 0, Mode::I2c, &mut messages)).is_err()
+        || field(e.io.get(Engine::<Fake>::i2c_speed(0)), I2C_PRESCALE) != 500
+    {
+        return TestResult::Fail("crystal fallback");
     }
     TestResult::Pass
 }
@@ -853,7 +866,7 @@ fn dcn30_ddc_constructor_binds_navi22_banks() -> TestResult {
     gpu.ip_blocks.push(dcn);
     gpu.regs.len = 0x100000;
     // SAFETY: the constructor only validates the inert map.
-    let ddc = unsafe { Ddc::new(&gpu, Cap::bootstrap()) };
+    let ddc = unsafe { Ddc::new(&gpu, Cap::bootstrap(), 100_000) };
     let Ok(mut ddc) = ddc else {
         return TestResult::Fail("Navi22 DDC refused");
     };
@@ -868,7 +881,7 @@ fn dcn30_ddc_constructor_binds_navi22_banks() -> TestResult {
     }
     gpu.regs.len = (BASE + u64::from(LAST_REG)) * 4 + 3;
     // SAFETY: as above.
-    if unsafe { Ddc::new(&gpu, Cap::bootstrap()) }.is_ok() {
+    if unsafe { Ddc::new(&gpu, Cap::bootstrap(), 100_000) }.is_ok() {
         return TestResult::Fail("truncated bank admitted");
     }
     TestResult::Pass

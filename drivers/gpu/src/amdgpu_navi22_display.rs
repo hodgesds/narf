@@ -313,14 +313,16 @@ impl core::fmt::Debug for Display {
 impl Display {
     /// # Safety
     /// As [`ddc::Ddc::new`]: exclusive, permanent ownership of every DDC, AUX
-    /// and HPD block and pad. `paths` must be this GPU's validated VBIOS routes.
+    /// and HPD block and pad. `paths` must be this GPU's validated VBIOS routes
+    /// and `crystal_khz` its VBIOS crystal.
     pub unsafe fn new(
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,
         paths: &[Path],
+        crystal_khz: u32,
     ) -> Result<Self, Error> {
         // SAFETY: forwarded unchanged.
-        let ddc = unsafe { ddc::Ddc::new(gpu, authority) }?;
+        let ddc = unsafe { ddc::Ddc::new(gpu, authority, crystal_khz) }?;
         Ok(Self(Detector::new_with(ddc.into_engine(), paths)?))
     }
     pub fn connectors(&self) -> &[Connector] {

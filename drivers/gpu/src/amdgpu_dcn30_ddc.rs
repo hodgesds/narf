@@ -348,6 +348,8 @@ pub(crate) struct Engine<I: Io> {
     transactions: u32,
     used_bytes: u32,
     used_write: u32,
+    /// `fw_info.pll_info.crystal_frequency`, zero when unknown.
+    pub(crate) crystal_khz: u32,
 }
 
 impl<I: Io> Engine<I> {
@@ -367,6 +369,7 @@ impl<I: Io> Engine<I> {
             transactions: 0,
             used_bytes: 0,
             used_write: 0,
+            crystal_khz: 0,
         }
     }
     fn check(&self, line: u8) -> Result<(), Error> {
@@ -893,8 +896,9 @@ impl<I: Io> Engine<I> {
         }
         Ok(!self.i2c_available(line)?)
     }
-    /// `set_speed`. A zero time-base divider would need the VBIOS crystal,
-    /// which `dccg2_init` makes unnecessary on any initialized DCN3.0.
+    /// `set_speed`. With a zero time-base divider (a DCN not yet through
+    /// `dccg2_init`, e.g. after reset-on-init) Linux uses
+    /// `reference_frequency * 2`, the VBIOS crystal (`dce_refclk_10khz`).
     fn i2c_set_speed(&mut self, line: u8, khz: u32) -> Result<(), Error> {
         let time_base = {
             let dword = self.base1 + MICROSECOND_TIME_BASE_DIV;
@@ -912,10 +916,15 @@ impl<I: Io> Engine<I> {
             0 => 2,
             div => div,
         };
-        if reference_div == 0 {
+        let reference_khz = if reference_div == 0 {
+            self.crystal_khz
+        } else {
+            reference_div * 1000
+        };
+        if reference_khz == 0 || khz == 0 {
             return Err(Error::Unsupported);
         }
-        let prescale = reference_div * 1000 / xtal_div / khz;
+        let prescale = reference_khz / xtal_div / khz;
         self.update(
             Self::i2c_speed(line),
             I2C_PRESCALE | I2C_THRESHOLD | I2C_START_STOP_TIMING_CNTL,
@@ -1323,7 +1332,12 @@ impl Ddc {
     /// Caller exclusively owns every DDC/AUX/HPD block and pad of this GPU's
     /// DCN for the object's lifetime (no DMUB AUX client, no other driver),
     /// holds matching PCI authority, and the register mapping is permanent.
-    pub unsafe fn new(gpu: &AmdGpu, authority: Cap<BusDeviceCap, Write>) -> Result<Self, Error> {
+    /// `crystal_khz` is the VBIOS crystal (`amdgpu_dcn_inventory::dchub_refclk_khz`).
+    pub unsafe fn new(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        crystal_khz: u32,
+    ) -> Result<Self, Error> {
         if Profile::resolve(gpu).map_err(|_| Error::Unsupported)? != Profile::Navi22 {
             return Err(Error::Unsupported);
         }
@@ -1333,12 +1347,9 @@ impl Ddc {
         let base1 = Profile::Navi22
             .bank(gpu, 1, MICROSECOND_TIME_BASE_DIV as u32)
             .map_err(|_| Error::Unsupported)?;
-        Ok(Self(Engine::new_with(
-            Mmio { regs: gpu.regs },
-            authority,
-            base / 4,
-            base1 / 4,
-        )))
+        let mut engine = Engine::new_with(Mmio { regs: gpu.regs }, authority, base / 4, base1 / 4);
+        engine.crystal_khz = crystal_khz;
+        Ok(Self(engine))
     }
     pub fn state(&self) -> State {
         self.0.state
