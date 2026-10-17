@@ -890,7 +890,9 @@ version = "0.0.0"
 dependencies = [
  "argon2",
  "async-trait",
+ "narf-boot",
  "narf-capabilities",
+ "narf-console",
  "narf-crypto",
  "narf-io",
  "narf-ipc",
