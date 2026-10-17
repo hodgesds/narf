@@ -573,6 +573,12 @@ impl Gmc {
     pub fn runtime(&self) -> Runtime {
         self.engine.runtime
     }
+    /// (MC_VM_FB_LOCATION_BASE, MC_VM_FB_OFFSET) as byte addresses: a pool
+    /// address becomes the physical VRAM address entries carry as
+    /// `address - fb + offset` (`gmc_v10_0_get_vm_pde`).
+    pub fn framebuffer(&self) -> Option<(u64, u64)> {
+        self.engine.geometry.map(|g| (g.fb, g.offset))
+    }
     pub fn aperture(&self) -> Option<Aperture> {
         self.engine.aperture
     }
