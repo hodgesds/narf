@@ -77,6 +77,17 @@ pub(super) fn start() -> InitResult {
         // SAFETY: the retained prepared owner and paused CPU writers persist.
         let result = narf_scheduler::block_on_spin(unsafe { platform::run() });
         completed(generation, result, platform::status());
+        if result.is_ok() {
+            // Polls only the owner lock; the forwarding tasks run later on
+            // the executor.
+            if let Err(error) = narf_scheduler::block_on_spin(platform::start_fault_service()) {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi22 page faults not reported: {error:?}"
+                );
+            }
+        }
         result.is_ok()
     };
     if ok || !affected {

@@ -3575,6 +3575,13 @@ or cancelled transport attempts without accessing hardware.
 
 ### Navi 22 boot ownership and framebuffer handoff
 
+`amdgpu_navi22_platform::start_fault_service().await` runs once after a
+successful boot: it subscribes to `VMC_FAULT` and `UTCL2_FAULT`, then unmasks
+the GMC fault interrupts and spawns one task per source that attributes each
+entry through `Gmc::handle_fault` under the owner lock. The first 16 faults
+are logged; `fault_count()` counts all of them. The framebuffer handoff calls
+it; a failure only logs, and faults then stay masked (default-page redirect).
+
 `amdgpu_navi22_platform::prepare(physical_boot_framebuffer)` is an unsafe,
 single-CPU boot-only entry. It requires a posted physical GPU, permanent probe
 mappings, no NARF VRAM allocations/queues, and stopped CPU framebuffer writers.

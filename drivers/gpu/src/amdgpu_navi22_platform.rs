@@ -216,6 +216,61 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     owner.as_mut().ok_or(boot::Error::Invalid)?.run().await
 }
 
+/// Faults logged before the service only counts them (Linux rate-limits
+/// `gmc_v10_0_process_interrupt`'s report the same way).
+const FAULT_LOG_LIMIT: u64 = 16;
+static FAULTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Faults delivered to the service since boot.
+pub fn fault_count() -> u64 {
+    FAULTS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Start VM fault delivery after a completed boot: subscribe to the VMC and
+/// UTCL2 sources, then unmask the GMC fault interrupts, and attribute every
+/// entry through `Gmc::handle_fault` (`gmc_v10_0_process_interrupt`). Until
+/// this runs, faults stay masked and only redirect to the default page.
+pub async fn start_fault_service() -> Result<(), boot::Error> {
+    use crate::amdgpu_ih_navi22::source;
+    let mut owner = OWNER.lock().await;
+    let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
+    let ih = boot.interrupts().ok_or(boot::Error::Invalid)?;
+    let mut subscriptions = alloc::vec::Vec::new();
+    // Subscribe first so no fault raised after unmasking goes unclaimed.
+    for from in [source::VMC_FAULT, source::UTCL2_FAULT] {
+        subscriptions.push(ih.subscribe(from).map_err(boot::Error::Interrupts)?);
+    }
+    boot.memory()?
+        .set_fault_interrupts(true)
+        .map_err(boot::Error::MemoryHubs)?;
+    drop(owner);
+    for mut subscription in subscriptions {
+        narf_scheduler::spawn(async move {
+            while let Ok(iv) = subscription.wait().await {
+                let Some(fault) = crate::amdgpu_gmc_navi22::Fault::from_iv(&iv) else {
+                    continue;
+                };
+                let result = {
+                    let mut owner = OWNER.lock().await;
+                    owner
+                        .as_mut()
+                        .ok_or(boot::Error::Invalid)
+                        .and_then(|boot| boot.memory())
+                        .and_then(|gmc| gmc.handle_fault(fault).map_err(boot::Error::MemoryHubs))
+                };
+                let seen = FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if seen < FAULT_LOG_LIMIT {
+                    use core::fmt::Write;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: navi22 GPU page fault {fault:?} -> {result:?}"
+                    );
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
 /// IH dispatch endpoint of the retained owner (see amdgpu_ih_navi22).
 pub async fn interrupts() -> Option<crate::amdgpu_ih_navi22::Handle> {
     OWNER.lock().await.as_ref()?.interrupts()
