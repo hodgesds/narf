@@ -1969,6 +1969,7 @@ dependencies = [
  "narf-block",
  "narf-bus",
  "narf-capabilities",
+ "narf-console",
  "narf-driver-macros",
  "narf-drivers",
  "narf-filesystem",

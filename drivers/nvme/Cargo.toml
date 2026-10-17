@@ -21,7 +21,7 @@ builtin = [
     "dep:narf-block", "dep:narf-bus", "dep:narf-interrupts",
     "dep:narf-scheduler", "dep:narf-time", "dep:narf-drivers", "dep:narf-init",
     "dep:narf-kernel-test", "dep:narf-arch", "dep:narf-power",
-    "dep:narf-filesystem",
+    "dep:narf-filesystem", "dep:narf-console",
 ]
 module = []
 
@@ -42,6 +42,7 @@ narf-kernel-test  = { path = "../../verification/kernel-test", optional = true }
 narf-arch         = { path = "../../arch", optional = true }
 narf-power        = { path = "../../power", optional = true }
 narf-filesystem   = { path = "../../filesystem", optional = true }
+narf-console      = { path = "../../console", optional = true }
 
 [lints]
 workspace = true

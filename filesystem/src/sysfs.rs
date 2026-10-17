@@ -1071,6 +1071,51 @@ pub fn populate_block_class() {
             format!("{}\n", capacity * (lba_size as u64))
         });
         kobject_add_attr(&flat, "removable", || "0\n".to_string());
+
+        // Hardware identity of a whole disk (NVMe namespace): the
+        // attributes Linux `nvme_ns_id_attrs` exposes on the gendisk
+        // (`wwid`, `nsid`, `eui`, `nguid`, `uuid`) and the controller's
+        // `model` / `serial` / `firmware_rev` under `device/`. These — not
+        // the enumeration-order name — identify the disk.
+        if let (None, Some(id)) = (dev.parent, dev.identity.as_ref()) {
+            for node in [&kobj, &flat] {
+                add_identity_attrs(node, id);
+            }
+        }
+    }
+}
+
+fn add_identity_attrs(node: &Arc<Kobject>, id: &Arc<narf_block::DiskIdentity>) {
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+    let wwid = format!("{}\n", id.wwid());
+    kobject_add_attr(node, "wwid", move || wwid.clone());
+    if id.nsid != 0 {
+        let nsid = format!("{}\n", id.nsid);
+        kobject_add_attr(node, "nsid", move || nsid.clone());
+    }
+    if let Some(e) = id.eui64 {
+        let v = format!("{}\n", hex(&e));
+        kobject_add_attr(node, "eui", move || v.clone());
+    }
+    if let Some(g) = id.nguid {
+        let v = format!("{}\n", hex(&g));
+        kobject_add_attr(node, "nguid", move || v.clone());
+    }
+    if let Some(u) = id.uuid {
+        let v = format!("{}\n", narf_block::registry::format_uuid_bytes(&u));
+        kobject_add_attr(node, "uuid", move || v.clone());
+    }
+    for (attr, value) in [
+        ("device/model", &id.model),
+        ("device/serial", &id.serial),
+        ("device/firmware_rev", &id.firmware),
+    ] {
+        if !value.is_empty() {
+            let v = format!("{value}\n");
+            kobject_add_attr(node, attr, move || v.clone());
+        }
     }
 }
 

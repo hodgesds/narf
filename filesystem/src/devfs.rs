@@ -826,78 +826,166 @@ impl FileOps for DevFb0Proxy {
     }
 }
 
-// ── /dev/nvme0 ───────────────────────────────────────────────────────
+// ── /dev/nvme<C> ─────────────────────────────────────────────────────
 
-/// Optional `FileOps` delegate for `/dev/nvme0` — the NVMe controller
-/// character device. Installed by the NVMe driver after `bring_up`, it
-/// serves the `NVME_IOCTL_ADMIN_CMD` passthrough interface so `smartctl
-/// -d nvme` / `nvme-cli` can read SMART/Health logs, Identify, etc.
+/// One NVMe controller character device: the driver's `FileOps` plus the
+/// block names of the controller's namespaces (what the write policy
+/// checks).
+#[derive(Clone)]
+struct NvmeCtrlNode {
+    node: Arc<dyn FileOps>,
+    namespaces: Vec<&'static str>,
+}
+
+/// `/dev/nvme<C>` delegates by controller instance — the NVMe controller
+/// character devices. Installed by the NVMe driver after `bring_up`, each
+/// serves the `NVME_IOCTL_ADMIN_CMD` passthrough interface so `smartctl -d
+/// nvme` / `nvme-cli` can read SMART/Health logs, Identify, etc.
 ///
-/// Stored as a global so the NVMe crate registers the node without devfs
-/// depending on the driver (same pattern as `FB0_NODE` / `TPM0_NODE`).
-static NVME0_NODE: IrqSafeSpinLock<Option<Arc<dyn FileOps>>> = IrqSafeSpinLock::new(None);
+/// Stored as a global so the NVMe crate registers nodes without devfs
+/// depending on the driver (same pattern as `FB0_NODE` / `TPM0_NODE`),
+/// projected into `/dev` through a [`DeviceProvider`].
+static NVME_CTRL_NODES: IrqSafeSpinLock<alloc::collections::BTreeMap<u32, NvmeCtrlNode>> =
+    IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
 
-/// Register (or replace) the `/dev/nvme0` controller node. Called by the
-/// NVMe driver once a controller is probed and brought up.
+/// Register (or replace) `/dev/nvme<instance>`. `namespaces` are the block
+/// registry names of the controller's namespaces (`nvme<C>n<N>`).
+pub fn register_nvme_controller(
+    instance: u32,
+    node: Arc<dyn FileOps>,
+    namespaces: Vec<&'static str>,
+) {
+    NVME_CTRL_NODES
+        .lock()
+        .insert(instance, NvmeCtrlNode { node, namespaces });
+    register_provider(DeviceProvider {
+        name: "nvme-ctrl",
+        lookup: nvme_ctrl_lookup,
+        lookup_dir: |_| None,
+        enumerate: nvme_ctrl_enumerate,
+    });
+}
+
+/// Unregister `/dev/nvme<instance>` (controller removed).
+pub fn unregister_nvme_controller(instance: u32) {
+    NVME_CTRL_NODES.lock().remove(&instance);
+}
+
+/// Register (or replace) `/dev/nvme0` with no namespace list: its
+/// passthrough is then writable only under `narf.disks=all`.
 pub fn register_nvme0(node: Arc<dyn FileOps>) {
-    *NVME0_NODE.lock() = Some(node);
+    register_nvme_controller(0, node, Vec::new());
 }
 
 /// Unregister the `/dev/nvme0` node (controller removed).
 pub fn unregister_nvme0() {
-    *NVME0_NODE.lock() = None;
+    unregister_nvme_controller(0);
 }
 
-/// `/dev/nvme0` — proxy to the installed NVMe controller FileOps.
-struct DevNvme0Proxy;
+/// `nvme<digits>` → instance (no leading zeros, nothing after the digits,
+/// so `nvme0n1` is left to the block registry).
+fn nvme_ctrl_instance(name: &str) -> Option<u32> {
+    let digits = name.strip_prefix("nvme")?;
+    if digits.is_empty()
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+        || (digits.len() > 1 && digits.starts_with('0'))
+    {
+        return None;
+    }
+    digits.parse().ok()
+}
 
+fn nvme_ctrl_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
+    let instance = nvme_ctrl_instance(name)?;
+    NVME_CTRL_NODES
+        .lock()
+        .contains_key(&instance)
+        .then(|| Arc::new(DevNvmeCtrlProxy { instance }) as Arc<dyn FileOps>)
+}
+
+fn nvme_ctrl_enumerate() -> Vec<(String, FileType)> {
+    NVME_CTRL_NODES
+        .lock()
+        .keys()
+        .map(|i| (alloc::format!("nvme{i}"), FileType::Special))
+        .collect()
+}
+
+/// `/dev/nvme<C>` — proxy to the installed controller `FileOps`.
+struct DevNvmeCtrlProxy {
+    instance: u32,
+}
+
+impl DevNvmeCtrlProxy {
+    fn node(&self) -> Option<NvmeCtrlNode> {
+        NVME_CTRL_NODES.lock().get(&self.instance).cloned()
+    }
+}
+
+/// Whether raw commands through controller node `ctrl` may change media.
+///
 /// Under `narf.disks=boot-only` the controller node is the one path that
 /// reaches an internal disk without the block layer's write guard: its
 /// passthrough ioctls submit arbitrary admin/IO opcodes (Format NVM,
-/// Sanitize, Firmware Commit, Write). Unless `nvme0` is the identified boot
-/// medium, only `NVME_IOCTL_ID` (`_IO('N', 0x40)`, namespace id query) is
-/// allowed and `write` is refused.
-fn nvme0_passthrough_allowed(cmd: u32) -> bool {
-    const NVME_IOCTL_ID: u32 = 0x4E40;
-    cmd == NVME_IOCTL_ID || narf_block::disk_policy::write_allowed("nvme0")
+/// Sanitize, Firmware Commit, Write) against any namespace. So it is
+/// writable only when EVERY namespace of that controller is the
+/// identified boot medium (and it has at least one); under
+/// `narf.disks=all` it always is.
+fn nvme_ctrl_writable(ctrl: &NvmeCtrlNode) -> bool {
+    match narf_block::disk_policy::policy() {
+        narf_block::disk_policy::DiskPolicy::All => true,
+        // The root modes restrict writes at least as tightly as boot-only:
+        // a namespace counts only if the policy lets it be written.
+        narf_block::disk_policy::DiskPolicy::BootOnly
+        | narf_block::disk_policy::DiskPolicy::RootRo
+        | narf_block::disk_policy::DiskPolicy::RootRw => {
+            !ctrl.namespaces.is_empty()
+                && ctrl
+                    .namespaces
+                    .iter()
+                    .all(|n| narf_block::disk_policy::write_allowed(n))
+        }
+    }
 }
 
-impl FileOps for DevNvme0Proxy {
+/// Unless the controller is writable (see [`nvme_ctrl_writable`]), only
+/// `NVME_IOCTL_ID` (`_IO('N', 0x40)`, namespace id query) is allowed and
+/// `write` is refused.
+fn nvme_passthrough_allowed(ctrl: &NvmeCtrlNode, cmd: u32) -> bool {
+    const NVME_IOCTL_ID: u32 = 0x4E40;
+    cmd == NVME_IOCTL_ID || nvme_ctrl_writable(ctrl)
+}
+
+impl FileOps for DevNvmeCtrlProxy {
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        let node = NVME0_NODE.lock().clone();
+        let node = self.node();
         Box::pin(async move {
             match node {
-                Some(n) => n.read(offset, buf).await,
+                Some(n) => n.node.read(offset, buf).await,
                 None => Ok(0),
             }
         })
     }
     fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        let node = NVME0_NODE.lock().clone();
+        let node = self.node();
         Box::pin(async move {
-            if !narf_block::disk_policy::write_allowed("nvme0") {
-                return Err(FsError::ReadOnly);
-            }
             match node {
-                Some(n) => n.write(offset, buf).await,
-                None => Ok(0),
+                Some(n) if !nvme_ctrl_writable(&n) => Err(FsError::ReadOnly),
+                Some(n) => n.node.write(offset, buf).await,
+                None => Err(FsError::ReadOnly),
             }
         })
     }
     fn stat(&self) -> Stat {
-        NVME0_NODE
-            .lock()
-            .as_ref()
-            .map(|n| n.stat())
-            .unwrap_or_else(|| Stat {
-                size: 0,
-                blocks: 0,
-                mode: Mode {
-                    file_type: FileType::Special,
-                    perms: 0o600,
-                },
-                mtime_cycles: 0,
-            })
+        self.node().map(|n| n.node.stat()).unwrap_or(Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o600,
+            },
+            mtime_cycles: 0,
+        })
     }
     fn ioctl_user<'a>(
         &'a self,
@@ -905,27 +993,28 @@ impl FileOps for DevNvme0Proxy {
         arg: u64,
         context: &'a dyn crate::IoctlContext,
     ) -> FsFuture<'a, u64> {
-        let node = NVME0_NODE.lock().clone();
+        let node = self.node();
         Box::pin(async move {
-            if !nvme0_passthrough_allowed(cmd) {
-                return Err(FsError::ReadOnly);
-            }
             match node {
-                Some(n) => n.ioctl_user(cmd, arg, context).await,
+                Some(n) if !nvme_passthrough_allowed(&n, cmd) => Err(FsError::ReadOnly),
+                Some(n) => n.node.ioctl_user(cmd, arg, context).await,
                 None => Err(FsError::NoDevice),
             }
         })
     }
     fn rdev(&self) -> u64 {
-        NVME0_NODE
-            .lock()
-            .as_ref()
-            .map(|node| node.rdev())
-            .unwrap_or(0)
+        self.node().map(|n| n.node.rdev()).unwrap_or(0)
     }
     fn ino(&self) -> u64 {
-        named_inode("nvme0", 1)
+        named_inode(&alloc::format!("nvme{}", self.instance), 1)
     }
+}
+
+/// Test hook: the policy decision for `/dev/nvme<instance>` with `cmd`.
+#[doc(hidden)]
+pub fn __nvme_passthrough_allowed_for_test(instance: u32, cmd: u32) -> Option<bool> {
+    let node = NVME_CTRL_NODES.lock().get(&instance).cloned()?;
+    Some(nvme_passthrough_allowed(&node, cmd))
 }
 
 // ── /dev/tpm0 + /dev/tpmrm0 ──────────────────────────────────────────

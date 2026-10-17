@@ -488,6 +488,10 @@ static BY_PARTUUID_LINKS: IrqSafeSpinLock<crate::devfs::DynamicMap> =
     IrqSafeSpinLock::new(BTreeMap::new());
 static BY_LABEL_LINKS: IrqSafeSpinLock<crate::devfs::DynamicMap> =
     IrqSafeSpinLock::new(BTreeMap::new());
+static BY_ID_LINKS: IrqSafeSpinLock<crate::devfs::DynamicMap> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+static BY_PATH_LINKS: IrqSafeSpinLock<crate::devfs::DynamicMap> =
+    IrqSafeSpinLock::new(BTreeMap::new());
 
 /// Drop all udev-created by-* symlinks (test isolation).
 #[doc(hidden)]
@@ -495,6 +499,8 @@ pub fn __reset_disk_links_for_test() {
     BY_UUID_LINKS.lock().clear();
     BY_PARTUUID_LINKS.lock().clear();
     BY_LABEL_LINKS.lock().clear();
+    BY_ID_LINKS.lock().clear();
+    BY_PATH_LINKS.lock().clear();
 }
 
 /// Create a udev symlink in a by-* overlay. `generated_exists` guards against
@@ -526,8 +532,10 @@ fn disk_enumerate(
     generated.into_iter().skip(cursor).take(max).collect()
 }
 
-/// `/dev/disk/` — a virtual directory with three subdirectories:
-/// `by-label`, `by-uuid` (filesystem UUID), and `by-partuuid`.
+/// `/dev/disk/` — a virtual directory with five subdirectories:
+/// `by-label`, `by-uuid` (filesystem UUID), `by-partuuid`, and the
+/// hardware-identity views `by-id` (model/serial, WWID) and `by-path`
+/// (controller PCI address).
 pub struct DevDiskDir;
 
 impl core::fmt::Debug for DevDiskDir {
@@ -550,6 +558,8 @@ impl DirOps for DevDiskDir {
             "by-label" => Some(Arc::new(DevDiskByLabel) as Arc<dyn DirOps>),
             "by-uuid" => Some(Arc::new(DevDiskByUuid) as Arc<dyn DirOps>),
             "by-partuuid" => Some(Arc::new(DevDiskByPartUuid) as Arc<dyn DirOps>),
+            "by-id" => Some(Arc::new(DevDiskByIdentity::BY_ID) as Arc<dyn DirOps>),
+            "by-path" => Some(Arc::new(DevDiskByIdentity::BY_PATH) as Arc<dyn DirOps>),
             _ => None,
         }
     }
@@ -571,6 +581,14 @@ impl DirOps for DevDiskDir {
             },
             DirEntry {
                 name: alloc::borrow::Cow::Borrowed("by-partuuid"),
+                file_type: FileType::Dir,
+            },
+            DirEntry {
+                name: alloc::borrow::Cow::Borrowed("by-id"),
+                file_type: FileType::Dir,
+            },
+            DirEntry {
+                name: alloc::borrow::Cow::Borrowed("by-path"),
                 file_type: FileType::Dir,
             },
         ];
@@ -829,6 +847,133 @@ impl DevDiskByPartUuid {
                 .unwrap_or(false)
         })
     }
+}
+
+// ── by-id / by-path ───────────────────────────────────────────────────
+
+/// `/dev/disk/by-id/` and `/dev/disk/by-path/` — links named from a disk's
+/// hardware identity ([`narf_block::DiskIdentity`]), so a disk can be found
+/// independently of its enumeration-order name. Names follow udev's
+/// `60-persistent-storage.rules`: `nvme-<model>_<serial>`,
+/// `nvme-<model>_<serial>_<nsid>`, `nvme-<wwid>`, and
+/// `pci-<bdf>-nvme-<nsid>`; a partition appends `-part<N>`.
+#[derive(Clone, Copy)]
+pub struct DevDiskByIdentity {
+    ino: u64,
+    names: fn(&narf_block::DiskIdentity) -> Vec<String>,
+    overlay: &'static IrqSafeSpinLock<crate::devfs::DynamicMap>,
+}
+
+impl core::fmt::Debug for DevDiskByIdentity {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DevDiskByIdentity")
+            .field("ino", &self.ino)
+            .finish_non_exhaustive()
+    }
+}
+
+fn by_path_names(i: &narf_block::DiskIdentity) -> Vec<String> {
+    i.by_path_name().into_iter().collect()
+}
+
+impl DevDiskByIdentity {
+    /// `/dev/disk/by-id/`.
+    pub const BY_ID: Self = Self {
+        ino: 14,
+        names: narf_block::DiskIdentity::by_id_names,
+        overlay: &BY_ID_LINKS,
+    };
+    /// `/dev/disk/by-path/`.
+    pub const BY_PATH: Self = Self {
+        ino: 15,
+        names: by_path_names,
+        overlay: &BY_PATH_LINKS,
+    };
+
+    /// Every synthesised `(link name, registry name)` pair.
+    fn generated(&self) -> Vec<(String, &'static str)> {
+        let mut out = Vec::new();
+        for r in narf_block::block_devices() {
+            let Some(id) = r.identity.as_ref() else {
+                continue;
+            };
+            let suffix = match (r.parent, r.partno) {
+                (None, _) => String::new(),
+                (Some(_), Some(n)) => alloc::format!("-part{n}"),
+                // A partition whose number is unknown gets no link rather
+                // than one that collides with its disk's.
+                (Some(_), None) => continue,
+            };
+            for base in (self.names)(id) {
+                out.push((alloc::format!("{base}{suffix}"), r.name));
+            }
+        }
+        out
+    }
+}
+
+impl DirOps for DevDiskByIdentity {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        self.generated()
+            .into_iter()
+            .find(|(link, _)| link == name)
+            .map(|(_, dev)| crate::devfs::symlink_file(name, alloc::format!("../../{dev}")))
+            .or_else(|| crate::devfs::dynamic_lookup_file(self.overlay, name))
+    }
+
+    fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        let generated_exists = self.generated().iter().any(|(link, _)| link == name);
+        disk_symlink(self.overlay, generated_exists, name, target)
+    }
+
+    fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        let result = crate::devfs::dynamic_unlink(self.overlay, name);
+        Box::pin(async move { result })
+    }
+
+    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+        Box::new(core::iter::empty())
+    }
+
+    fn enumerate(&self, cursor: usize, max: usize) -> Vec<(alloc::string::String, FileType)> {
+        let generated = self
+            .generated()
+            .into_iter()
+            .map(|(link, _)| (link, FileType::Symlink))
+            .collect();
+        disk_enumerate(generated, self.overlay, cursor, max)
+    }
+
+    fn enumerate_async<'a>(
+        &'a self,
+        cursor: usize,
+        max: usize,
+    ) -> crate::FsFuture<'a, Vec<(alloc::string::String, FileType)>> {
+        let v = self.enumerate(cursor, max);
+        Box::pin(async move { Ok(v) })
+    }
+}
+
+/// Registry name the `/dev/disk/by-id/<name>` link points at, if any.
+pub fn by_id_target(name: &str) -> Option<&'static str> {
+    DevDiskByIdentity::BY_ID
+        .generated()
+        .into_iter()
+        .find(|(link, _)| link == name)
+        .map(|(_, dev)| dev)
+}
+
+/// Registry name the `/dev/disk/by-path/<name>` link points at, if any.
+pub fn by_path_target(name: &str) -> Option<&'static str> {
+    DevDiskByIdentity::BY_PATH
+        .generated()
+        .into_iter()
+        .find(|(link, _)| link == name)
+        .map(|(_, dev)| dev)
 }
 
 // ── Block-device ioctl smokes ─────────────────────────────────────────
