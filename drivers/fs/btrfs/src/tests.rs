@@ -70,6 +70,11 @@ const FIXTURE_DEFAULTSUBVOL_SPARSE: &[u8] =
 /// metadata), with `root` (default) + `home` subvolumes.
 const FIXTURE_LAPTOP_SPARSE: &[u8] = include_bytes!("../testdata/fixture-laptop.img.sparse");
 
+/// The host CachyOS root's exact feature set: block-group-tree + free-space
+/// tree (compat_ro 0xb), incompat 0x371, crc32c, 4K/16K, zstd, single device,
+/// with the `@`, `@home`, `@root`, `@srv`, `@cache`, `@tmp`, `@log` subvolumes.
+const FIXTURE_BGT_SPARSE: &[u8] = include_bytes!("../testdata/fixture-bgt.img.sparse");
+
 /// Same small mixed layout as the primary fixture but WITH a free-space tree
 /// (`space_cache=v2`); exercises the write path's free-space-tree maintenance.
 const FIXTURE_FST_SPARSE: &[u8] = include_bytes!("../testdata/fixture-fst.img.sparse");
@@ -593,10 +598,13 @@ fn smoke_btrfs_superblock_decode() -> TestResult {
     ) {
         return TestResult::Fail("unknown incompat feature must be Unsupported");
     }
+    // An unknown compat_ro bit is kept for the mount to judge (Linux
+    // `btrfs_check_features`: read-only allowed, read-write refused).
     let mut verity = good.clone();
     verity[180..188].copy_from_slice(&(1u64 << 2).to_le_bytes());
-    if !matches!(Superblock::decode(&verity), Err(FsError::Unsupported)) {
-        return TestResult::Fail("unsupported compat-ro feature must be Unsupported");
+    match Superblock::decode(&verity) {
+        Ok(sb) if sb.compat_ro_unknown() == 1 << 2 && sb.compat_ro_unwritable() == 1 << 2 => {}
+        _ => return TestResult::Fail("unknown compat-ro feature must decode for an RO mount"),
     }
 
     let mut supported = good;
@@ -10551,3 +10559,218 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_read_only_device_refuses_log_replay
 );
+
+// ── Feature-flag mount semantics + BLOCK_GROUP_TREE ────────────────
+
+/// OR `compat_ro` / `incompat` bits into, and clear `incompat_clear` from,
+/// every superblock copy present on `dev`, re-stamping each checksum.
+fn patch_feature_flags(
+    dev: &WritableSparseDevice,
+    compat_ro_or: u64,
+    incompat_or: u64,
+    incompat_clear: u64,
+) {
+    use narf_block::BlockDeviceSync;
+    let total = dev.capacity() * u64::from(dev.lba_size());
+    for &offset in &format::SUPERBLOCK_MIRROR_OFFSETS {
+        if offset + format::SUPERBLOCK_SIZE as u64 > total {
+            continue;
+        }
+        let mut sb = read_super_at(dev, offset);
+        if format::le64(&sb, 64) != Ok(format::BTRFS_MAGIC) {
+            continue;
+        }
+        let ro = format::le64(&sb, 180).unwrap() | compat_ro_or;
+        let inc = (format::le64(&sb, 188).unwrap() | incompat_or) & !incompat_clear;
+        sb[180..188].copy_from_slice(&ro.to_le_bytes());
+        sb[188..196].copy_from_slice(&inc.to_le_bytes());
+        checksum::stamp_block(format::CSUM_TYPE_CRC32, &mut sb).unwrap();
+        let lba = offset / u64::from(dev.lba_size());
+        let n = (format::SUPERBLOCK_SIZE / dev.lba_size() as usize) as u16;
+        dev.write(lba, n, &sb).unwrap();
+    }
+}
+
+fn mount_writable_ro(
+    dev: Arc<WritableSparseDevice>,
+) -> Result<Arc<BtrfsVolume<narf_block::SyncBlock>>, FsError> {
+    let async_dev = narf_block::SyncBlock::new(dev as Arc<dyn narf_block::BlockDeviceSync>);
+    poll_once(BtrfsVolume::mount_devices_read_only(
+        alloc::vec![async_dev],
+        DomainId::DRIVER_0,
+        true,
+    ))
+    .ok_or(FsError::InvalidData)?
+}
+
+/// Linux `btrfs_check_features`: an unknown compat_ro bit allows a read-only
+/// mount and refuses read-write; an unknown incompat bit refuses both.
+fn smoke_btrfs_unknown_feature_mount_modes() -> TestResult {
+    use narf_filesystem::FsInstance;
+    const UNKNOWN_RO: u64 = 1 << 20;
+    const UNKNOWN_INCOMPAT: u64 = 1 << 40;
+    for fixture in [FIXTURE_LAPTOP_SPARSE, FIXTURE_BGT_SPARSE] {
+        let dev = writable_sparse(fixture);
+        patch_feature_flags(&dev, UNKNOWN_RO, 0, 0);
+        let vol = match mount_writable_ro(dev.clone()) {
+            Ok(vol) => vol,
+            Err(_) => return TestResult::Fail("unknown compat_ro bit refused a read-only mount"),
+        };
+        if vol.supports_writes() {
+            return TestResult::Fail("read-only mount with unknown compat_ro is writable");
+        }
+        // Reads work: the default subvolume's root directory lists.
+        if !matches!(poll_once(vol.root().enumerate_async(0, 64)), Some(Ok(e)) if !e.is_empty()) {
+            return TestResult::Fail("read-only mount with unknown compat_ro cannot read");
+        }
+        drop(vol);
+        if !matches!(mount_writable(dev.clone()), Err(FsError::Unsupported)) {
+            return TestResult::Fail("unknown compat_ro bit did not refuse a read-write mount");
+        }
+
+        let dev = writable_sparse(fixture);
+        patch_feature_flags(&dev, 0, UNKNOWN_INCOMPAT, 0);
+        if mount_writable_ro(dev.clone()).is_ok() {
+            return TestResult::Fail("unknown incompat bit allowed a read-only mount");
+        }
+        if mount_writable(dev).is_ok() {
+            return TestResult::Fail("unknown incompat bit allowed a read-write mount");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_unknown_feature_mount_modes);
+
+/// A block-group-tree filesystem (the host's CachyOS feature set) mounts
+/// read-only, loads tree 11, and reads its subvolumes.
+fn smoke_btrfs_block_group_tree_ro_mount() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable_ro(dev) {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("block-group-tree fixture refused a read-only mount"),
+    };
+    let sb = vol.superblock();
+    if sb.compat_ro_flags != 0xb || sb.incompat_flags != 0x371 || !sb.has_block_group_tree() {
+        return TestResult::Fail("fixture does not carry the host feature set");
+    }
+    let root_tree = vol.root_tree_root().0;
+    match poll_once(crate::block_group::bg_home(&vol, root_tree)) {
+        Some(Ok(crate::block_group::BgHome::BlockGroupTree { .. })) => {}
+        _ => return TestResult::Fail("block-group tree root (objectid 11) not loaded"),
+    }
+    match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => match read_all(&f, 16) {
+            Some(got) if got == b"L0000\nL0001\nL000" => {}
+            _ => return TestResult::Fail("big.dat content wrong on block-group-tree fs"),
+        },
+        _ => return TestResult::Fail("big.dat missing on block-group-tree fs"),
+    }
+    if poll_once(vol.switch_to_subvol(&crate::volume::Subvol::Name("@home".into())))
+        .is_none_or(|r| r.is_err())
+    {
+        return TestResult::Fail("subvol=@home did not resolve");
+    }
+    let user = match poll_once(vol.root().lookup_dir_async("user")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("@home/user missing"),
+    };
+    match poll_once(user.lookup_async("notes.txt")) {
+        Some(Ok(f)) => match read_all(&f, 64) {
+            Some(got) if got == b"home user file\n" => TestResult::Pass,
+            _ => TestResult::Fail("@home/user/notes.txt content wrong"),
+        },
+        _ => TestResult::Fail("@home/user/notes.txt missing"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_block_group_tree_ro_mount);
+
+/// Linux's artificial dependency: block-group-tree without no-holes is
+/// rejected at mount (`btrfs_check_features`).
+fn smoke_btrfs_block_group_tree_requires_no_holes() -> TestResult {
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    patch_feature_flags(&dev, 0, 0, format::INCOMPAT_NO_HOLES);
+    if mount_writable_ro(dev).is_ok() {
+        return TestResult::Fail("block-group-tree without no-holes was mounted");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_block_group_tree_requires_no_holes
+);
+
+/// Block groups of a block-group-tree filesystem are read from tree 11: the
+/// extent tree carries none, each one maps its chunk, their `used` sums to the
+/// superblock's `bytes_used`, and the allocator's system-group exclusion sees
+/// them (Linux `btrfs_read_block_groups` via `btrfs_block_group_root`).
+fn smoke_btrfs_block_group_tree_read() -> TestResult {
+    let vol = match mount_writable_ro(writable_sparse(FIXTURE_BGT_SPARSE)) {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("block-group-tree fixture did not mount"),
+    };
+    let bgs = match poll_once(crate::block_group::live_block_groups(&vol)) {
+        Some(Ok(bgs)) => bgs,
+        _ => return TestResult::Fail("could not read block groups from tree 11"),
+    };
+    let flags = |body: &[u8]| format::le64(body, 16).unwrap_or(0);
+    let kinds = [
+        format::BLOCK_GROUP_DATA,
+        format::BLOCK_GROUP_METADATA,
+        format::BLOCK_GROUP_SYSTEM,
+    ];
+    if bgs.len() < 3
+        || kinds
+            .iter()
+            .any(|k| !bgs.iter().any(|(_, _, b)| flags(b) & k != 0))
+    {
+        return TestResult::Fail("tree 11 lacks a data, metadata or system block group");
+    }
+    for &(start, len, _) in &bgs {
+        if vol.logical_chunk_remaining(start) != Ok(len) {
+            return TestResult::Fail("a tree-11 block group does not match its chunk");
+        }
+    }
+    let used: u64 = bgs
+        .iter()
+        .map(|(_, _, b)| format::le64(b, 0).unwrap_or(0))
+        .sum();
+    if used != vol.superblock().bytes_used {
+        return TestResult::Fail("tree-11 block group used != superblock bytes_used");
+    }
+    let root_tree = vol.root_tree_root().0;
+    let ext = match poll_once(crate::roots::find_root(
+        &vol,
+        root_tree,
+        format::EXTENT_TREE_OBJECTID,
+    )) {
+        Some(Ok((ext, _))) => ext,
+        _ => return TestResult::Fail("extent tree root missing"),
+    };
+    match poll_once(crate::block_group::read_block_groups(&vol, ext)) {
+        Some(Ok(in_ext)) if in_ext.is_empty() => {}
+        _ => return TestResult::Fail("extent tree unexpectedly holds block group items"),
+    }
+    let sys: Vec<(u64, u64)> = bgs
+        .iter()
+        .filter(|(_, _, b)| flags(b) & format::BLOCK_GROUP_SYSTEM != 0)
+        .map(|&(s, l, _)| (s, l))
+        .collect();
+    match poll_once(crate::allocator::Allocator::build(&vol)) {
+        Some(Ok(crate::allocator::Allocator::Reclaim { ranges })) => {
+            if ranges
+                .iter()
+                .any(|&(r, _)| sys.iter().any(|&(s, l)| r >= s && r < s + l))
+            {
+                return TestResult::Fail("allocator offered system block group space");
+            }
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("allocator did not build from the free-space tree"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_block_group_tree_read);
