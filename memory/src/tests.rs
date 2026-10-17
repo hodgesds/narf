@@ -10819,6 +10819,42 @@ fn smoke_diag_phase_round_trip() -> TestResult {
 }
 kernel_test_in!("memory", smoke_diag_phase_round_trip);
 
+fn smoke_diag_wifi_first_error_wins() -> TestResult {
+    use crate::diag::{self, WifiStage};
+    diag::__reset_for_test();
+    if diag::snapshot().wifi_stage != WifiStage::None || diag::snapshot().wifi_err != 0 {
+        diag::__reset_for_test();
+        return TestResult::Fail("wifi diag not clear after reset");
+    }
+    diag::set_wifi_stage(WifiStage::PowerUp);
+    // err 0 is "no failure" and must not latch.
+    diag::latch_wifi_error(0, 0xAAAA);
+    if diag::snapshot().wifi_err != 0 {
+        diag::__reset_for_test();
+        return TestResult::Fail("latch_wifi_error(0, _) latched");
+    }
+    diag::latch_wifi_error(3, 0x1234);
+    diag::latch_wifi_error(7, 0xBEEF);
+    let snap = diag::snapshot();
+    diag::__reset_for_test();
+    if snap.wifi_stage != WifiStage::PowerUp {
+        return TestResult::Fail("wifi stage not recorded");
+    }
+    if snap.wifi_err != 3 || snap.wifi_detail != 0x1234 {
+        return TestResult::Fail("later wifi error overwrote the first");
+    }
+    for v in 0..=9u8 {
+        if WifiStage::from_u8(v) as u8 != v {
+            return TestResult::Fail("WifiStage::from_u8 does not round-trip");
+        }
+    }
+    if WifiStage::from_u8(200) != WifiStage::None {
+        return TestResult::Fail("out-of-range WifiStage must decode to None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_diag_wifi_first_error_wins);
+
 fn smoke_diag_bump_irq_counts_total_and_last() -> TestResult {
     use crate::diag;
     // `bump_irq` is also called by the live IRQ handler (interrupts::on_irq),

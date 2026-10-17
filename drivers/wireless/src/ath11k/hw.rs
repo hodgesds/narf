@@ -126,6 +126,174 @@ pub const fn name_for(did: u16) -> &'static str {
     }
 }
 
+// ── Per-hw_rev parameters ─────────────────────────────────────────
+//
+// The subset of Linux `struct ath11k_hw_params` (`core.c`) and
+// `ath11k_msi_config[]` (`pcic.c`) the driver consumes so far.
+// Fields are added as later bring-up phases need them.
+
+/// One MSI consumer — Linux `struct ath11k_msi_user`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MsiUser {
+    pub name: &'static str,
+    pub num_vectors: u32,
+    pub base_vector: u32,
+}
+
+/// Linux `struct ath11k_msi_config`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MsiConfig {
+    pub total_vectors: u32,
+    pub users: &'static [MsiUser],
+}
+
+impl MsiConfig {
+    /// Linux `ath11k_pcic_get_user_msi_assignment`: `(num_vectors,
+    /// user_base_data, base_vector)` for `name`, where
+    /// `user_base_data = base_vector + ep_base_data`.
+    pub fn user_assignment(&self, name: &str, ep_base_data: u32) -> Option<(u32, u32, u32)> {
+        self.users
+            .iter()
+            .find(|u| u.name == name)
+            .map(|u| (u.num_vectors, u.base_vector + ep_base_data, u.base_vector))
+    }
+}
+
+/// 32 vectors: QCA6390 / WCN6855 / QCA2066 / QCA6698AQ.
+pub const MSI_CONFIG_QCA6390: MsiConfig = MsiConfig {
+    total_vectors: 32,
+    users: &[
+        MsiUser {
+            name: "MHI",
+            num_vectors: 3,
+            base_vector: 0,
+        },
+        MsiUser {
+            name: "CE",
+            num_vectors: 10,
+            base_vector: 3,
+        },
+        MsiUser {
+            name: "WAKE",
+            num_vectors: 1,
+            base_vector: 13,
+        },
+        MsiUser {
+            name: "DP",
+            num_vectors: 18,
+            base_vector: 14,
+        },
+    ],
+};
+
+/// 16 vectors: QCN9074.
+pub const MSI_CONFIG_QCN9074: MsiConfig = MsiConfig {
+    total_vectors: 16,
+    users: &[
+        MsiUser {
+            name: "MHI",
+            num_vectors: 3,
+            base_vector: 0,
+        },
+        MsiUser {
+            name: "CE",
+            num_vectors: 5,
+            base_vector: 3,
+        },
+        MsiUser {
+            name: "DP",
+            num_vectors: 8,
+            base_vector: 8,
+        },
+    ],
+};
+
+/// Fallback when the multi-vector allocation fails — Linux
+/// `msi_config_one_msi`: every user shares vector 0.
+pub const MSI_CONFIG_ONE: MsiConfig = MsiConfig {
+    total_vectors: 1,
+    users: &[
+        MsiUser {
+            name: "MHI",
+            num_vectors: 3,
+            base_vector: 0,
+        },
+        MsiUser {
+            name: "CE",
+            num_vectors: 1,
+            base_vector: 0,
+        },
+        MsiUser {
+            name: "WAKE",
+            num_vectors: 1,
+            base_vector: 0,
+        },
+        MsiUser {
+            name: "DP",
+            num_vectors: 1,
+            base_vector: 0,
+        },
+    ],
+};
+
+/// PCIe PHY registers `ath11k_pci_fix_l1ss` programs — Linux
+/// `ath11k_hw_regs::pcie_qserdes_sysclk_en_sel` /
+/// `pcie_pcs_osc_dtct_config_base`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct L1ssRegs {
+    pub qserdes_sysclk_en_sel: u32,
+    pub pcs_osc_dtct_config_base: u32,
+}
+
+/// Linux `struct ath11k_hw_params`, PCI-relevant subset.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HwParams {
+    pub hw_rev: HwRev,
+    pub fw_dir: &'static str,
+    pub msi: &'static MsiConfig,
+    /// `Some` iff Linux sets `fix_l1ss = true` for this part.
+    pub fix_l1ss: Option<L1ssRegs>,
+    pub static_window_map: bool,
+}
+
+impl HwRev {
+    /// Linux `ath11k_hw_params[]` entry for this revision.
+    pub fn params(self) -> Option<HwParams> {
+        let fw_dir = self.fw_dir()?;
+        let (msi, fix_l1ss, static_window_map) = match self {
+            // qca6390_regs
+            HwRev::Qca6390Hw20 => (
+                &MSI_CONFIG_QCA6390,
+                Some(L1ssRegs {
+                    qserdes_sysclk_en_sel: 0x01e0_c0ac,
+                    pcs_osc_dtct_config_base: 0x01e0_c628,
+                }),
+                false,
+            ),
+            // qcn9074_regs
+            HwRev::Qcn9074Hw10 => (
+                &MSI_CONFIG_QCN9074,
+                Some(L1ssRegs {
+                    qserdes_sysclk_en_sel: 0x01e0_e0a8,
+                    pcs_osc_dtct_config_base: 0x01e0_f45c,
+                }),
+                true,
+            ),
+            HwRev::Wcn6855Hw20 | HwRev::Wcn6855Hw21 | HwRev::Qca2066Hw21 | HwRev::Qca6698aqHw21 => {
+                (&MSI_CONFIG_QCA6390, None, false)
+            }
+            HwRev::Unknown => return None,
+        };
+        Some(HwParams {
+            hw_rev: self,
+            fw_dir,
+            msi,
+            fix_l1ss,
+            static_window_map,
+        })
+    }
+}
+
 // ── BAR0 register-window constants ─────────────────────────────────
 //
 // ath11k uses a 128-byte sliding window at BAR0 + 0x80000 to address

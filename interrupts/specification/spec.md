@@ -67,7 +67,17 @@ pub unsafe fn ipi::shoot_full_mask(target_cpus: u64);
 
 #[cfg(target_arch = "aarch64")]
 pub fn gic::configure_pmu_ppi(intid: u32) -> Result<(), ()>;
+
+pub fn vector::alloc() -> Result<u8, VectorError>;
+pub fn vector::alloc_block(n: u8) -> Result<u8, VectorError>;
+pub fn vector::alloc_block_aligned(n: u8, align: u8) -> Result<u8, VectorError>;
+pub fn vector::free(vector: u8) -> Result<(), VectorError>;
 ```
+
+`alloc_block_aligned` returns a contiguous run whose base is a multiple of
+`align` (a power of two). Multi-message MSI requires it: the function writes
+the vector index into the low `log2(n)` bits of Message Data, so the base's
+low bits must be zero.
 
 The x86 shootdown mask is a logical-CPU bitmap. Implementations intersect it
 with the online set and remove the sender, publish pending state only for the

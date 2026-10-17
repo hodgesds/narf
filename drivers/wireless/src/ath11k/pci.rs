@@ -10,6 +10,9 @@
 //!     `ath11k_pci_enable_ltssm`).
 //!   - hw_rev resolution (TCSR major/minor + WCN6855 sub-version).
 //!
+//! Then power-up (Linux `ath11k_pci_power_up` short of MHI start):
+//! MSI vectors (32, else 1), `sw_reset(power_on)`, ASPM off, MSI on.
+//!
 //! Not yet: MHI host + firmware boot, QMI, CE/HTC/WMI, DP. Until
 //! those land the device registers no network interface — a
 //! `wlan%d` with a made-up MAC that "associates" without touching
@@ -27,11 +30,28 @@
 
 extern crate alloc;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_memory::diag::{self, WifiStage};
 
-use super::hw::{self, name_for, refine_hw_rev, ChipInfo, HwRev, ALL_DEV_IDS, QCOM_VENDOR};
+use super::hw::{
+    self, name_for, refine_hw_rev, ChipInfo, HwParams, HwRev, ALL_DEV_IDS, MSI_CONFIG_ONE,
+    QCOM_VENDOR,
+};
+use super::power::{self, ChipIo, PowerUpReport};
+
+/// Failing-step codes latched into `narf_memory::diag` (shown on the
+/// framebuffer status panel as `wifi: <stage> FAILED step=N`).
+pub mod step {
+    pub const BAR0_MAP: u32 = 1;
+    pub const LINK_DOWN: u32 = 2;
+    pub const UNSUPPORTED_SOC: u32 = 3;
+    pub const NO_HW_PARAMS: u32 = 4;
+    pub const MSI_UNAVAILABLE: u32 = 5;
+}
 
 /// Errors raised by the baseline probe path.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -44,6 +64,40 @@ pub enum ProbeError {
     /// The TCSR version names a stepping Linux's `ath11k_pci_probe`
     /// rejects (`unsupported_*_soc`).
     UnsupportedSoc { major: u32, minor: u32 },
+    /// Neither the per-chip vector count nor a single MSI vector
+    /// could be set up (Linux `ath11k_pci_alloc_msi` -EINVAL).
+    MsiUnavailable,
+}
+
+impl ProbeError {
+    /// `(step, detail)` for `diag::latch_wifi_error`.
+    fn diag_code(self) -> (u32, u32) {
+        match self {
+            ProbeError::Bar0MapFailed => (step::BAR0_MAP, 0),
+            ProbeError::LinkDown => (step::LINK_DOWN, 0xffff_ffff),
+            ProbeError::UnsupportedSoc { major, minor } => {
+                (step::UNSUPPORTED_SOC, (major << 8) | minor)
+            }
+            ProbeError::MsiUnavailable => (step::MSI_UNAVAILABLE, 0),
+        }
+    }
+}
+
+/// MSI vectors granted to the chip. The chip itself is told
+/// `addr` + `ep_base_data + base_vector` per user (MHI, CE, DP) in
+/// later bring-up phases, so these must match what was programmed.
+#[derive(Debug)]
+pub struct MsiState {
+    pub bus_cfg: narf_bus::msi::MsiConfig,
+    /// Per-user layout — the chip's table, or `MSI_CONFIG_ONE`.
+    pub config: &'static hw::MsiConfig,
+    /// First IDT vector; vectors are `base_irq..base_irq + n_vectors`.
+    pub base_irq: u8,
+    pub n_vectors: u8,
+    /// Programmed Message Address.
+    pub addr: u64,
+    /// Programmed Message Data (Linux `msi.ep_base_data`).
+    pub ep_base_data: u32,
 }
 
 /// One bound ath11k device. Holds the BAR0 mapping + the hw_rev
@@ -54,6 +108,48 @@ pub struct Ath11kDevice {
     pub hw_rev: HwRev,
     /// PCI device id we matched on.
     pub device_id: u16,
+    pub params: HwParams,
+    pub msi: MsiState,
+    /// Link Control before ASPM was disabled for firmware download
+    /// (Linux `ab_pci->link_ctl`); restored once firmware is up.
+    pub saved_link_ctl: Option<u16>,
+    pub power: PowerUpReport,
+}
+
+/// The device's BAR0 as a [`ChipIo`].
+#[derive(Debug)]
+pub struct Bar0Io<'a>(pub &'a MmioRegion);
+
+impl ChipIo for Bar0Io<'_> {
+    fn read32(&self, offset: u32) -> u32 {
+        // SAFETY: Bar0Io wraps the driver-owned live BAR0 mapping;
+        // offsets come from Linux's register tables.
+        unsafe { read32(self.0, offset) }
+    }
+    fn write32(&self, offset: u32, value: u32) {
+        // SAFETY: as `read32`.
+        unsafe { write32(self.0, offset, value) }
+    }
+    fn delay_ms(&self, ms: u32) {
+        let deadline = narf_time::Deadline::after_ms(ms as u64);
+        narf_scheduler::responsive_spin_until(
+            || deadline.expired(),
+            narf_time::Deadline::after_ms(ms as u64 + 1),
+        );
+    }
+    fn restore_window(&self) {
+        // SAFETY: as `read32`.
+        unsafe { restore_window(self.0) }
+    }
+}
+
+/// MSI deliveries seen, any vector. Nothing consumes them until the
+/// MHI host lands; the count shows the chip can reach the host.
+pub static MSI_FIRES: AtomicU64 = AtomicU64::new(0);
+
+fn msi_irq(_cookie: u64) -> narf_interrupts::IrqStatus {
+    MSI_FIRES.fetch_add(1, Ordering::Relaxed);
+    narf_interrupts::IrqStatus::Handled
 }
 
 impl core::fmt::Debug for Ath11kDevice {
@@ -112,9 +208,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     // SAFETY: caller hands us exclusive BusDeviceCap authority for
     // this device's cfg + BARs.
-    let dev = match unsafe { bring_up(&device, chip) } {
+    let result = unsafe { bring_up(&device, &cap, chip) };
+    let dev = match result {
         Ok(d) => d,
         Err(e) => {
+            let (code, detail) = e.diag_code();
+            diag::latch_wifi_error(code, detail);
             let _ = writeln!(
                 narf_console::Writer,
                 "  ath11k: {} ({:04x}:{:04x}) bring-up failed: {:?}",
@@ -134,8 +233,43 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         chip.vid,
         chip.did,
         dev.hw_rev.name(),
-        dev.hw_rev.fw_dir().unwrap_or("?"),
+        dev.params.fw_dir,
     );
+    let p = &dev.power;
+    let _ = writeln!(
+        narf_console::Writer,
+        "  ath11k: powered up: msi {}x@{} data={:#x} ltssm={:#x} hot_rst={:#x} \
+         reset_cause={:#x} mhistatus={:#x} aspm_saved={:?}",
+        dev.msi.n_vectors,
+        dev.msi.base_irq,
+        dev.msi.ep_base_data,
+        p.ltssm,
+        p.hot_rst,
+        p.reset_cause,
+        p.mhistatus,
+        dev.saved_link_ctl,
+    );
+    // Linux only warns on these and carries on.
+    if p.ltssm != power::PARM_LTSSM_VALUE {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath11k: warning: LTSSM did not settle ({:#x})",
+            p.ltssm
+        );
+    }
+    if p.link_down_after_reset {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath11k: warning: link down error during global reset"
+        );
+    }
+    if let Some(reg) = p.l1ss_failed_reg {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath11k: warning: failed to set pcie link register {:#010x}",
+            reg
+        );
+    }
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(dev.device_id)),
@@ -149,13 +283,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     Ok(())
 }
 
-/// Bring the chip up: map BAR0, read the TCSR SoC version (and the
-/// sub-version where Linux needs it), resolve `hw_rev`. Pure-IO; no
-/// MHI register programming.
+/// Bring the chip up: map BAR0, resolve `hw_rev` from the TCSR
+/// version registers, allocate MSI, then run Linux's power-up
+/// sequence short of starting MHI.
 ///
 /// # Safety
-/// Caller owns the device's BARs exclusively.
-pub unsafe fn bring_up(device: &BusDevice, chip: ChipInfo) -> Result<Ath11kDevice, ProbeError> {
+/// Caller owns the device's BARs and cfg space exclusively.
+pub unsafe fn bring_up(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+    chip: ChipInfo,
+) -> Result<Ath11kDevice, ProbeError> {
     // SAFETY: `bring_up`'s contract is that the caller owns the device's BARs
     // exclusively — exactly the precondition `map_bar` requires.
     let mmio_bar0 = unsafe { map_bar(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
@@ -178,16 +316,91 @@ pub unsafe fn bring_up(device: &BusDevice, chip: ChipInfo) -> Result<Ath11kDevic
         0
     };
     let hw_rev = refine_hw_rev(chip.did, major, minor, sub_version);
-    if hw_rev == HwRev::Unknown {
-        return Err(ProbeError::UnsupportedSoc { major, minor });
-    }
+    let params = hw_rev
+        .params()
+        .ok_or(ProbeError::UnsupportedSoc { major, minor })?;
+    diag::set_wifi_stage(WifiStage::Probe);
+
+    // SAFETY: caller owns cfg space exclusively.
+    let msi = unsafe { alloc_msi(device, cap, params.msi) }?;
+
+    // ── Linux `ath11k_pci_power_up`, minus `ath11k_mhi_start` ──
+    *WINDOW.lock() = 0; // `ab_pci->register_window = 0`
+    let report = power::sw_reset(&Bar0Io(&mmio_bar0), true, params.fix_l1ss.as_ref());
+    // "Disable ASPM during firmware download due to problems
+    // switching to AMSS state."
+    let saved_link_ctl = narf_bus::pci_express::clear_and_set_link_control(
+        cap,
+        device,
+        narf_bus::pci_express::LNKCTL_ASPMC,
+        0,
+    )
+    .ok();
+    // SAFETY: caller owns cfg space exclusively.
+    unsafe { narf_bus::msi::enable(&msi.bus_cfg) }.map_err(|_| ProbeError::MsiUnavailable)?;
+    diag::set_wifi_stage(WifiStage::PowerUp);
 
     Ok(Ath11kDevice {
         mmio_bar0,
         chip,
         hw_rev,
         device_id: chip.did,
+        params,
+        msi,
+        saved_link_ctl,
+        power: report,
     })
+}
+
+/// Linux `ath11k_pci_alloc_msi`: the chip's full vector count, else
+/// one shared vector with `MSI_CONFIG_ONE`. Programs the message and
+/// installs the handler, then leaves MSI *disabled* — power-up
+/// enables it.
+///
+/// # Safety
+/// Caller owns `device`'s cfg space exclusively.
+unsafe fn alloc_msi(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+    want: &'static hw::MsiConfig,
+) -> Result<MsiState, ProbeError> {
+    // Multi-message MSI needs a block aligned to its size.
+    let attempt = |config: &'static hw::MsiConfig| -> Option<MsiState> {
+        let n = config.total_vectors as u8;
+        let mut bus_cfg = narf_bus::msi::enable_msi(cap, device, n as u16).ok()?;
+        if bus_cfg.vectors_enabled() != n as u16 {
+            return None;
+        }
+        let base_irq = narf_interrupts::vector::alloc_block_aligned(n, n).ok()?;
+        // SAFETY: caller owns cfg space exclusively; `base_irq..+n`
+        // was just reserved for this device.
+        let addr = match unsafe { narf_bus::msi::program_msi(&mut bus_cfg, 0, base_irq) } {
+            Ok(a) => a,
+            Err(_) => {
+                for i in 0..n {
+                    let _ = narf_interrupts::vector::free(base_irq + i);
+                }
+                return None;
+            }
+        };
+        Some(MsiState {
+            bus_cfg,
+            config,
+            base_irq,
+            n_vectors: n,
+            addr,
+            ep_base_data: base_irq as u32,
+        })
+    };
+    let state = attempt(want)
+        .or_else(|| attempt(&MSI_CONFIG_ONE))
+        .ok_or(ProbeError::MsiUnavailable)?;
+    for i in 0..state.n_vectors {
+        narf_interrupts::install_handler_named(state.base_irq + i, "ath11k", i as u64, msi_irq);
+    }
+    // SAFETY: caller owns cfg space exclusively.
+    unsafe { narf_bus::msi::disable(&state.bus_cfg) }.map_err(|_| ProbeError::MsiUnavailable)?;
+    Ok(state)
 }
 
 /// Read a chip register. Offsets below `ATH11K_PCI_WINDOW_START`
@@ -292,6 +505,24 @@ pub unsafe fn write_via_window(mmio: &MmioRegion, offset: u32, value: u32) {
     unsafe {
         select_window(mmio, &mut cur, offset);
         mmio.write32(windowed_bar_offset(offset) as u64, value);
+    }
+}
+
+/// Re-select the cached window after a global reset cleared the
+/// hardware register (Linux `ath11k_pci_restore_window`).
+///
+/// # Safety
+/// `mmio` must be a valid BAR0 mapping.
+pub unsafe fn restore_window(mmio: &MmioRegion) {
+    let cur = WINDOW.lock();
+    let window = if *cur == u32::MAX { 0 } else { *cur };
+    // SAFETY: caller-asserted BAR0 mapping.
+    unsafe {
+        mmio.write32(
+            hw::ATH11K_PCI_WINDOW_REG_ADDRESS as u64,
+            hw::ATH11K_PCI_WINDOW_ENABLE_BIT | window,
+        );
+        let _ = mmio.read32(hw::ATH11K_PCI_WINDOW_REG_ADDRESS as u64);
     }
 }
 

@@ -580,6 +580,258 @@ kernel_test_in!(
     smoke_ath11k_wmi_vdev_set_param_channel_encode
 );
 
+// ── Phase 1: power-up sequence (Linux ath11k_pci_sw_reset) ─────────
+
+mod fake_io {
+    use alloc::collections::BTreeMap;
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+
+    use super::super::power::ChipIo;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Op {
+        R(u32),
+        W(u32, u32),
+        Delay(u32),
+        RestoreWindow,
+    }
+
+    /// Register file: writes stick unless the offset is `stuck`, in
+    /// which case reads always return the stuck value.
+    #[derive(Default)]
+    pub struct FakeIo {
+        pub regs: RefCell<BTreeMap<u32, u32>>,
+        pub stuck: BTreeMap<u32, u32>,
+        pub ops: RefCell<Vec<Op>>,
+    }
+
+    impl ChipIo for FakeIo {
+        fn read32(&self, offset: u32) -> u32 {
+            self.ops.borrow_mut().push(Op::R(offset));
+            if let Some(&v) = self.stuck.get(&offset) {
+                return v;
+            }
+            *self.regs.borrow().get(&offset).unwrap_or(&0)
+        }
+        fn write32(&self, offset: u32, value: u32) {
+            self.ops.borrow_mut().push(Op::W(offset, value));
+            self.regs.borrow_mut().insert(offset, value);
+        }
+        fn delay_ms(&self, ms: u32) {
+            self.ops.borrow_mut().push(Op::Delay(ms));
+        }
+        fn restore_window(&self) {
+            self.ops.borrow_mut().push(Op::RestoreWindow);
+        }
+    }
+}
+
+fn smoke_ath11k_sw_reset_matches_linux_sequence() -> TestResult {
+    use super::power::*;
+    use fake_io::{FakeIo, Op::*};
+    let io = FakeIo::default();
+    io.regs.borrow_mut().insert(WLAON_QFPROM_PWR_CTRL_REG, 0xF);
+    io.regs.borrow_mut().insert(PCIE_SOC_GLOBAL_RESET, 0x10);
+    io.regs.borrow_mut().insert(WLAON_SOC_RESET_CAUSE_REG, 0x5);
+    io.regs.borrow_mut().insert(MHISTATUS, 0x4); // SYSERR latched
+                                                 // WCN6855: fix_l1ss = false.
+    let report = sw_reset(&io, true, None);
+    let expected = [
+        Delay(100),
+        // ath11k_pci_enable_ltssm
+        R(PCIE_PCIE_PARF_LTSSM),
+        W(PCIE_PCIE_PARF_LTSSM, PARM_LTSSM_VALUE),
+        R(PCIE_PCIE_PARF_LTSSM),
+        R(GCC_GCC_PCIE_HOT_RST),
+        W(GCC_GCC_PCIE_HOT_RST, GCC_GCC_PCIE_HOT_RST_VAL),
+        R(GCC_GCC_PCIE_HOT_RST),
+        Delay(5),
+        // ath11k_pci_clear_all_intrs
+        W(PCIE_PCIE_INT_ALL_CLEAR, PCIE_INT_CLEAR_ALL),
+        // ath11k_pci_set_wlaon_pwr_ctrl: clear VDD4BLOW (bit 2)
+        R(WLAON_QFPROM_PWR_CTRL_REG),
+        W(WLAON_QFPROM_PWR_CTRL_REG, 0xB),
+        // ath11k_mhi_clear_vector
+        W(0x360, 0),
+        W(0x368, 0),
+        W(0x394, 0),
+        W(0x39C, 0),
+        // ath11k_pci_clear_dbg_registers
+        R(PCIE_Q6_COOKIE_ADDR),
+        R(WLAON_WARM_SW_ENTRY),
+        Delay(10),
+        W(WLAON_WARM_SW_ENTRY, 0),
+        Delay(10),
+        R(WLAON_WARM_SW_ENTRY),
+        R(WLAON_SOC_RESET_CAUSE_REG),
+        // ath11k_pci_soc_global_reset: set V, then toggle it back
+        R(PCIE_SOC_GLOBAL_RESET),
+        W(PCIE_SOC_GLOBAL_RESET, 0x11),
+        Delay(10),
+        W(PCIE_SOC_GLOBAL_RESET, 0x10),
+        Delay(10),
+        R(PCIE_SOC_GLOBAL_RESET),
+        RestoreWindow,
+        // ath11k_mhi_set_mhictrl_reset
+        R(0x48),
+        W(0x38, 0x2),
+        Delay(10),
+    ];
+    if io.ops.borrow().as_slice() != expected {
+        return TestResult::Fail("sw_reset(power_on) op sequence differs from Linux");
+    }
+    if report.ltssm != PARM_LTSSM_VALUE
+        || report.reset_cause != 0x5
+        || report.mhistatus != 0x4
+        || report.link_down_after_reset
+        || report.l1ss_failed_reg.is_some()
+    {
+        return TestResult::Fail("sw_reset report fields wrong on a healthy chip");
+    }
+    // power_on = false skips LTSSM / interrupt clear / WLAON / L1SS.
+    let io = FakeIo::default();
+    let _ = sw_reset(&io, false, None);
+    if io.ops.borrow().contains(&R(PCIE_PCIE_PARF_LTSSM)) {
+        return TestResult::Fail("sw_reset(power_on=false) touched LTSSM");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_sw_reset_matches_linux_sequence
+);
+
+fn smoke_ath11k_power_up_failure_paths() -> TestResult {
+    use super::power::*;
+    use fake_io::{FakeIo, Op};
+    // LTSSM never settles and reads all-ones: 5 retries, 5 ms apart.
+    let mut io = FakeIo::default();
+    io.stuck.insert(PCIE_PCIE_PARF_LTSSM, 0xffff_ffff);
+    let mut report = PowerUpReport::default();
+    enable_ltssm(&io, &mut report);
+    let writes = io
+        .ops
+        .borrow()
+        .iter()
+        .filter(|o| matches!(o, Op::W(PCIE_PCIE_PARF_LTSSM, _)))
+        .count();
+    if writes != 5 || report.ltssm != 0xffff_ffff {
+        return TestResult::Fail("stuck LTSSM must be retried exactly 5 times");
+    }
+    // Link down after global reset is reported, not fatal.
+    io = FakeIo::default();
+    io.stuck.insert(PCIE_SOC_GLOBAL_RESET, 0xffff_ffff);
+    let report = sw_reset(&io, true, None);
+    if !report.link_down_after_reset {
+        return TestResult::Fail("all-ones after global reset not reported as link down");
+    }
+    if !io.ops.borrow().contains(&Op::W(0x38, 0x2)) {
+        return TestResult::Fail("MHICTRL reset must still run after a link-down warning");
+    }
+    // set_link_reg: a register that never takes the value fails after
+    // 10 attempts, 2 ms apart, naming the register.
+    io = FakeIo::default();
+    io.stuck.insert(0x1000, 0x0);
+    if set_link_reg(&io, 0x1000, 0x52, 0xff) != Err(0x1000) {
+        return TestResult::Fail("set_link_reg must fail with the stuck register offset");
+    }
+    let attempts = io
+        .ops
+        .borrow()
+        .iter()
+        .filter(|o| matches!(o, Op::W(0x1000, _)))
+        .count();
+    if attempts != 10 {
+        return TestResult::Fail("set_link_reg must make exactly 10 write attempts");
+    }
+    // Already-correct register: no write at all.
+    io = FakeIo::default();
+    io.regs.borrow_mut().insert(0x2000, 0x1252);
+    if set_link_reg(&io, 0x2000, 0x52, 0xff) != Ok(())
+        || io.ops.borrow().iter().any(|o| matches!(o, Op::W(..)))
+    {
+        return TestResult::Fail("set_link_reg wrote a register already holding the value");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_power_up_failure_paths
+);
+
+fn smoke_ath11k_fix_l1ss_programs_qca6390_phy() -> TestResult {
+    use super::power::*;
+    use fake_io::FakeIo;
+    let regs = match HwRev::Qca6390Hw20.params().and_then(|p| p.fix_l1ss) {
+        Some(r) => r,
+        None => return TestResult::Fail("QCA6390 must have fix_l1ss (Linux true)"),
+    };
+    let io = FakeIo::default();
+    if fix_l1ss(&io, &regs).is_err() {
+        return TestResult::Fail("fix_l1ss failed on a writable register file");
+    }
+    let r = io.regs.borrow();
+    let get = |o: u32| *r.get(&o).unwrap_or(&0);
+    if get(0x01e0_c0ac) != 0x10
+        || get(0x01e0_c628) != 0x02
+        || get(0x01e0_c62c) != 0x52
+        || get(0x01e0_c634) != 0xff
+    {
+        return TestResult::Fail("fix_l1ss did not program Linux's qca6390 PHY values");
+    }
+    // WCN6855 family: fix_l1ss = false in every Linux hw_params entry.
+    for rev in [
+        HwRev::Wcn6855Hw20,
+        HwRev::Wcn6855Hw21,
+        HwRev::Qca2066Hw21,
+        HwRev::Qca6698aqHw21,
+    ] {
+        match rev.params() {
+            Some(p) if p.fix_l1ss.is_none() && !p.static_window_map => {}
+            _ => return TestResult::Fail("WCN6855-family hw_params differ from Linux"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_fix_l1ss_programs_qca6390_phy
+);
+
+fn smoke_ath11k_msi_user_assignment() -> TestResult {
+    // Linux ath11k_pcic_get_user_msi_assignment for WCN6855 HW2.1
+    // with ep_base_data 64: user_base_data = base_vector + 64.
+    let p = match HwRev::Wcn6855Hw21.params() {
+        Some(p) => p,
+        None => return TestResult::Fail("WCN6855 HW2.1 has no hw_params"),
+    };
+    if p.msi.total_vectors != 32 {
+        return TestResult::Fail("WCN6855 must request 32 MSI vectors");
+    }
+    for (name, want) in [
+        ("MHI", (3, 64, 0)),
+        ("CE", (10, 67, 3)),
+        ("WAKE", (1, 77, 13)),
+        ("DP", (18, 78, 14)),
+    ] {
+        if p.msi.user_assignment(name, 64) != Some(want) {
+            return TestResult::Fail("WCN6855 MSI user layout differs from Linux");
+        }
+    }
+    if p.msi.user_assignment("BOGUS", 64).is_some() {
+        return TestResult::Fail("unknown MSI user must not resolve");
+    }
+    // Single-vector fallback: every user on vector 0, MHI still 3.
+    if MSI_CONFIG_ONE.user_assignment("CE", 50) != Some((1, 50, 0))
+        || MSI_CONFIG_ONE.user_assignment("MHI", 50) != Some((3, 50, 0))
+    {
+        return TestResult::Fail("one-MSI fallback layout differs from Linux");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_msi_user_assignment);
+
 // Suppress the unused-import warning when the `Vec` import isn't
 // used by any helper above (compiler can't tell from the macro
 // expansion).

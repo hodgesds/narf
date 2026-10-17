@@ -14,14 +14,15 @@
 //!
 //! 1. [`pci`] — vendor/device match, BAR0 mapping, direct vs.
 //!    sliding-window register access, hw_rev resolution.
-//! 2. [`mhi`] — Modem-Host-Interface ring + channel-table data.
-//! 3. [`wmi`] — WMI TLV frame builder / decoder.
-//! 4. [`dp`] — data-path ring descriptor layouts (TCL / REO / WBM).
+//! 2. [`power`] — reset / LTSSM / L1SS power-up sequence.
+//! 3. [`mhi`] — Modem-Host-Interface ring + channel-table data.
+//! 4. [`wmi`] — WMI TLV frame builder / decoder.
+//! 5. [`dp`] — data-path ring descriptor layouts (TCL / REO / WBM).
 //!
 //! ## Status
 //!
-//! Probe identifies the chip and its firmware directory, then
-//! stops: no MHI host, firmware boot, QMI, CE/HTC/WMI transport or
+//! Probe identifies the chip and its firmware directory, allocates
+//! MSI and runs Linux's power-up sequence, then stops: no MHI host, firmware boot, QMI, CE/HTC/WMI transport or
 //! data path yet, so no network interface is registered.
 //!
 //! ## References
@@ -44,6 +45,7 @@ pub mod dp;
 pub mod hw;
 pub mod mhi;
 pub mod pci;
+pub mod power;
 pub mod wmi;
 
 pub use hw::{

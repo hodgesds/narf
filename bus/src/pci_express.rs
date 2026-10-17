@@ -159,6 +159,41 @@ pub fn set_device_control(
     Ok(new)
 }
 
+/// ASPM Control field of Link Control (bits[1:0]: L0s, L1) —
+/// Linux `PCI_EXP_LNKCTL_ASPMC`.
+pub const LNKCTL_ASPMC: u16 = 0x0003;
+
+/// Read-modify-write Link Control (PCIe cap + 0x10): clear `clear`,
+/// then set `set`. Returns the value *before* the write so callers
+/// can restore it — Linux `pcie_capability_clear_and_set_word(dev,
+/// PCI_EXP_LNKCTL, clear, set)`, as ath11k uses to disable ASPM
+/// during firmware download and restore it afterwards.
+pub fn clear_and_set_link_control(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+    clear: u16,
+    set: u16,
+) -> Result<u16, PcieCapError> {
+    cap.check_live()?;
+    let cfg_phys = pcie_cfg_phys(device)?;
+    // SAFETY: cap-list walker bounded.
+    let off = unsafe { pci_cap::find_cap(device, PCIE_CAP_ID) }
+        .map_err(|_| PcieCapError::NotPcie)?
+        .ok_or(PcieCapError::NotExpress)?;
+    // SAFETY: off + 0x10 < 0x100; aligned 16-bit access.
+    let cur = unsafe { cfg_read16(cfg_phys, off + 0x10) };
+    // SAFETY: same window.
+    unsafe {
+        cfg_write16(cfg_phys, off + 0x10, link_control_update(cur, clear, set));
+    }
+    Ok(cur)
+}
+
+/// Pure half of [`clear_and_set_link_control`].
+pub const fn link_control_update(cur: u16, clear: u16, set: u16) -> u16 {
+    (cur & !clear) | set
+}
+
 /// Issue a Function-Level Reset (FLR) on `device`.
 ///
 /// Steps (PCIe base 5.0 §6.6.2):

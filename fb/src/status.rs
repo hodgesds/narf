@@ -41,11 +41,11 @@ const PANEL_BG_PANIC: Pixel32 = Pixel32(0xFF40_0000); // dark red
 /// the same log through the same screen, so the two writers produced
 /// interleaved, unreadable boot output. The log is already on the console
 /// and on serial; this panel's unique value is the state summary.
-/// Number of header lines: the 5 input/USB/AML/i8042 lines PLUS
-/// one diag line (boot phase + IRQ + heap + #PF/panic). Adding the
+/// Number of header lines: the 5 input/USB/AML/i8042 lines, one
+/// Wi-Fi bring-up line, PLUS one diag line (boot phase + IRQ + heap + #PF/panic). Adding the
 /// diag line at the top is intentional — it's the densest
 /// real-HW-diagnostic line and operators read top-down.
-const HEADER_LINES: u32 = 6;
+const HEADER_LINES: u32 = 7;
 const PANEL_HEIGHT: u32 = 8 * (HEADER_LINES + 1); // header lines + one pad row
 const PANEL_PAD: u32 = 4;
 
@@ -88,6 +88,8 @@ fn change_signature() -> u64 {
     let diag = narf_memory::diag::snapshot();
     mix(&mut h, diag.panic_latched as u64);
     mix(&mut h, diag.first_pf_seen as u64);
+    mix(&mut h, diag.wifi_stage as u64);
+    mix(&mut h, diag.wifi_err as u64);
     for b in diag.phase.as_str().bytes() {
         mix(&mut h, b as u64);
     }
@@ -325,8 +327,23 @@ pub fn paint(fb: &FbWriter) {
         )
     };
 
+    // Wi-Fi bring-up: furthest stage reached + the first failing step
+    // (driver-defined code + detail word). Bare-metal laptops have no
+    // serial, so this is how a stuck firmware boot is located.
+    let wifi_line = if diag.wifi_err != 0 {
+        format!(
+            "wifi: {} FAILED step={} detail={:#010x}",
+            diag.wifi_stage.as_str(),
+            diag.wifi_err,
+            diag.wifi_detail,
+        )
+    } else {
+        format!("wifi: {}", diag.wifi_stage.as_str())
+    };
+
     let header = [
         diag_line.as_str(),
+        wifi_line.as_str(),
         fb_line.as_str(),
         dev_line.as_str(),
         usb_hid_line.as_str(),

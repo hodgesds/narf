@@ -86,11 +86,29 @@ pub fn alloc() -> Result<u8, VectorError> {
 /// vector; the reserved range is `[base, base + n)`. All-or-nothing
 /// — partial reservations are rolled back on failure.
 pub fn alloc_block(n: u8) -> Result<u8, VectorError> {
-    if n == 0 {
+    alloc_block_aligned(n, 1)
+}
+
+/// Reserve `n` contiguous vectors whose base is a multiple of `align`
+/// (a power of two). Multi-message MSI needs this: the function
+/// substitutes the vector index into the low `log2(n)` bits of the
+/// Message Data (PCIe base 5.0 §6.1.4.3), so the base vector's low
+/// bits must be zero — Linux's x86 vector domain enforces the same
+/// for multi-MSI. `OutOfRange` for `n == 0` or a non-power-of-two
+/// `align`; `Exhausted` when no aligned run is free.
+pub fn alloc_block_aligned(n: u8, align: u8) -> Result<u8, VectorError> {
+    if n == 0 || align == 0 || !align.is_power_of_two() {
         return Err(VectorError::OutOfRange);
     }
-    let last_start = ALLOC_MAX.saturating_sub(n - 1);
-    'outer: for base in ALLOC_BASE..=last_start {
+    let align = align as u16;
+    let first = (ALLOC_BASE as u16).div_ceil(align) * align;
+    let Some(last_start) = (ALLOC_MAX as u16 + 1).checked_sub(n as u16) else {
+        return Err(VectorError::Exhausted);
+    };
+    let mut base16 = first;
+    'outer: while base16 <= last_start {
+        let base = base16 as u8;
+        base16 += align;
         // Speculatively flip every bit in [base, base+n). If any
         // flip fails (already allocated), roll back the prior ones
         // and try the next base.
