@@ -514,9 +514,8 @@ async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart) {
             wlfw::ENOENT,
         ));
     };
-    // NARF parses no SMBIOS tables at runtime, so no type-0xF8
-    // `BDF_<variant>` string reaches here; Linux uses the same
-    // no-variant board name when `ath11k_core_check_smbios` finds none.
+    // `ath11k_core_check_smbios`: the type-0xF8 `BDF_<variant>` string
+    // from the table the boot-time DMI scan kept (empty = no variant).
     let Some(cfg) = WlfwConfig::pci(
         s.hw_rev,
         s.vendor,
@@ -524,7 +523,7 @@ async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart) {
         s.subsystem_vendor,
         s.subsystem_device,
         pci_dev_name(s.pci_addr),
-        alloc::vec::Vec::new(),
+        super::board::check_smbios().bdf_ext,
     ) else {
         return wlfw_fail(wlfw::WlfwError::new(
             wlfw::step::UNSUPPORTED,

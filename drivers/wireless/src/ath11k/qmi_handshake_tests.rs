@@ -1383,6 +1383,153 @@ fn smoke_wlfw_smbios_variant() -> TestResult {
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_wlfw_smbios_variant);
 
+/// A structure table: `(type, formatted tail after the header, strings)`
+/// per structure, then end-of-table (SMBIOS 3: `num = 0`).
+/// `(type, formatted tail after the header, strings)`.
+type DmiRec<'a> = (u8, &'a [u8], &'a [&'a [u8]]);
+
+fn dmi_table(recs: &[DmiRec<'_>]) -> narf_firmware_smbios::RawTable {
+    let mut t = Vec::new();
+    for (i, (kind, tail, strings)) in recs.iter().enumerate() {
+        t.push(*kind);
+        t.push(4 + tail.len() as u8);
+        t.extend_from_slice(&(i as u16).to_le_bytes());
+        t.extend_from_slice(tail);
+        if strings.is_empty() {
+            t.push(0);
+        }
+        for s in *strings {
+            t.extend_from_slice(s);
+            t.push(0);
+        }
+        t.push(0);
+    }
+    t.extend_from_slice(&[127, 4, 0xFF, 0xFE, 0, 0]);
+    narf_firmware_smbios::RawTable::from_bytes(t, 0)
+}
+
+/// `ath11k_core_check_smbios` over a whole DMI table, the way
+/// `dmi_walk` feeds it: the variant reaches the board name, invalid
+/// 0xF8 structures are skipped without stopping the walk.
+fn smoke_wlfw_smbios_table_variant() -> TestResult {
+    run_test(|| {
+        let sys: &[u8] = &[
+            1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        // features_disabled, cc flag, cc code (LE), bdf_enabled.
+        let f8 = |flag: u8, en: u8| -> [u8; 5] { [0, flag, 0x53, 0x55, en] };
+        let (iso, off) = (f8(1, 1), f8(0, 0));
+        let (on, ww) = (f8(0, 1), f8(2, 1));
+
+        // ThinkPad P14s Gen 5 AMD (17aa:9309): `le_lfr-1`.
+        let t = dmi_table(&[
+            (1, sys, &[b"LENOVO", b"21ME"]),
+            (0xF8, &iso, &[b"BDF_le_lfr-1"]),
+        ]);
+        let st = check_smbios_in(&t);
+        ensure!(
+            st.bdf_ext == b"le_lfr-1" && st.alpha2 == Some(*b"US"),
+            "variant + ISO cc"
+        );
+        let mut id = BoardId {
+            search_bus_and_board: true,
+            vendor: 0x17cb,
+            device: 0x1103,
+            subsystem_vendor: 0x17aa,
+            subsystem_device: 0x9309,
+            chip_id: 2,
+            board_id: 255,
+            bdf_ext: st.bdf_ext,
+        };
+        ensure!(
+            board_name(&id, true, BdfNameType::Full)
+                == "bus=pci,vendor=17cb,device=1103,subsystem-vendor=17aa,\
+                    subsystem-device=9309,qmi-chip-id=2,qmi-board-id=255,variant=le_lfr-1",
+            "P14s full board name carries the variant"
+        );
+        id.bdf_ext.clear();
+        ensure!(
+            !board_name(&id, true, BdfNameType::Full).contains("variant"),
+            "no variant without SMBIOS"
+        );
+
+        // No 0xF8 structure at all → -ENODATA (empty).
+        let t = dmi_table(&[(1, sys, &[b"LENOVO", b"21ME"])]);
+        ensure!(check_smbios_in(&t) == SmbiosBdf::default(), "no type 0xF8");
+
+        // Disabled / bad magic / wrong length first: the walk goes on
+        // and the later valid structure wins; its WW cc overrides the
+        // earlier ISO one (new_alpha2 is rewritten per structure).
+        let wrong_len: &[u8] = &[0, 1, 0x53, 0x55, 1, 0];
+        let t = dmi_table(&[
+            (0xF8, &off, &[b"BDF_disabled"]),
+            (0xF8, &on, &[b"XDF_bad"]),
+            (0xF8, wrong_len, &[b"BDF_len10"]),
+            (0xF8, &ww, &[b"BDF_LE_NDA-M"]),
+            (0xF8, &on, &[b"BDF_LE"]),
+        ]);
+        let st = check_smbios_in(&t);
+        ensure!(
+            st.bdf_ext == b"LE_NDA-M" && st.alpha2 == Some(*b"00"),
+            "first valid variant after rejected ones"
+        );
+
+        // bdf_enabled = 0 everywhere → nothing.
+        let t = dmi_table(&[(0xF8, &off, &[b"BDF_LE"])]);
+        ensure!(check_smbios_in(&t).bdf_ext.is_empty(), "bdf disabled");
+        // Magic wrong → nothing.
+        let t = dmi_table(&[(0xF8, &on, &[b"bdf_LE"])]);
+        ensure!(
+            check_smbios_in(&t).bdf_ext.is_empty(),
+            "magic is case-sensitive"
+        );
+        // No string set → nothing.
+        let t = dmi_table(&[(0xF8, &on, &[])]);
+        ensure!(check_smbios_in(&t).bdf_ext.is_empty(), "empty string set");
+        // "BDF_" alone leaves bdf_ext empty, so a later one still counts.
+        let t = dmi_table(&[(0xF8, &on, &[b"BDF_"]), (0xF8, &on, &[b"BDF_LE"])]);
+        ensure!(
+            check_smbios_in(&t).bdf_ext == b"LE",
+            "empty variant is no variant"
+        );
+        // Only the first string is the variant (`bdf_ext[]` = string 1).
+        let t = dmi_table(&[(0xF8, &on, &[b"junk", b"BDF_LE"])]);
+        ensure!(check_smbios_in(&t).bdf_ext.is_empty(), "string 2 ignored");
+        // Over-long: strscpy truncates to 31 and Linux keeps the copy.
+        let long = [b"BDF_".as_slice(), &[b'Q'; 32]].concat();
+        let t = dmi_table(&[(0xF8, &on, &[&long])]);
+        ensure!(
+            check_smbios_in(&t).bdf_ext == [b'Q'; 31],
+            "over-long variant truncated to 31"
+        );
+        // A non-printable byte inside the 32-char window → refused;
+        // past it (index ≥ 32) Linux does not look.
+        let mut bad = long.clone();
+        bad[31] = 0x7F;
+        let t = dmi_table(&[(0xF8, &on, &[&bad])]);
+        ensure!(check_smbios_in(&t).bdf_ext.is_empty(), "DEL in window");
+        let mut late = long.clone();
+        late[33] = 0x7F;
+        let t = dmi_table(&[(0xF8, &on, &[&late])]);
+        ensure!(check_smbios_in(&t).bdf_ext.len() == 31, "byte 33 unchecked");
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_wlfw_smbios_table_variant);
+
+/// The boot path: `check_smbios` reads the table the DMI scan kept.
+/// Skips when the firmware gave none.
+fn smoke_wlfw_smbios_boot_table() -> TestResult {
+    let Some(t) = narf_firmware_smbios::boot_table() else {
+        return TestResult::Skip("no SMBIOS table at boot");
+    };
+    if check_smbios() != check_smbios_in(t) {
+        return TestResult::Fail("check_smbios must read the boot table");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_wlfw_smbios_boot_table);
+
 fn smoke_wlfw_board_fallbacks() -> TestResult {
     run_test(|| {
         // Only a chip-id entry: third name wins.

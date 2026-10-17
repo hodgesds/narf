@@ -28,7 +28,8 @@ narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-scheduler    = { path = "../../scheduler" }
 narf-console      = { path = "../../console" }
 narf-firmware     = { path = "../../firmware" }
-narf-crypto       = { path = "../../crypto" }
+narf-firmware-smbios = { path = "../../firmware/smbios" }
+narf-crypto      = { path = "../../crypto" }
 narf-init         = { path = "../../init" }
 narf-drivers-sdio = { path = "../sdio" }
 narf-drivers-usb  = { path = "../usb" }

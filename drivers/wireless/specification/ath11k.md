@@ -152,8 +152,13 @@ tables.
   ids, 199-byte cap, 40-byte variant), `bdf_search` / `regdb_search`
   (Linux's fallback order), `fetch_board_data_api_n` (`board-2.bin`
   magic + IE walk, Linux's never-reset name match and `-EINVAL` /
-  `-ENODATA` cases), `smbios_bdf_ext` (type 0xF8 decoder),
-  `build_board2` (test fixtures).
+  `-ENODATA` cases), `smbios_bdf_ext` (type 0xF8 decoder:
+  `ath11k_core_check_cc_code_bdfext`), `check_smbios_in(&RawTable)` /
+  `check_smbios()` (`ath11k_core_check_smbios`: `dmi_walk` over the
+  table `firmware/smbios` retained at boot; empty = `-ENODATA`),
+  `build_board2` (test fixtures). `pci::wlfw_bring_up` passes
+  `check_smbios().bdf_ext` into `WlfwConfig::pci`, so the full board
+  name carries `,variant=<v>` exactly as `__ath11k_core_create_board_name`.
 
 Tests: `qmi_handshake_tests.rs` — a scripted fake WLFW firmware
 behind a fake pipe runs HELLO → FW_READY → `firmware_start`, every
@@ -351,12 +356,16 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   register map) the HAL/CE phase ports. The handshake therefore parks
   at FW_READY and `firmware_start` takes the list as a parameter —
   sending a guessed list would misprogram the firmware.
-- Board variant: NARF parses no SMBIOS tables at runtime (only tests
-  call `narf_firmware_smbios::parse_stream`, and it drops OEM type
-  0xF8), so `bdf_ext` is empty and the full board name equals the
-  fallback name — what Linux uses when `ath11k_core_check_smbios`
-  finds no `BDF_` string. `board::smbios_bdf_ext` is ready for when
-  the table is retained.
+- Board variant: `board::check_smbios` walks the boot DMI table
+  (`narf_firmware_smbios::boot_table`, found by the `dmi-scan`
+  `Stage::Core` initcall before `pci-probe-all`) with Linux's rules:
+  type 0xF8, `hdr->length == 9` exactly, cc flag ISO/WW sets
+  `new_alpha2` per structure (decoded, not yet applied), `bdf_enabled`,
+  first string starts `BDF_`, the first `min(strlen, 32)` bytes are
+  printable ASCII, `strscpy` into 32 bytes (an over-long suffix is kept
+  truncated to 31, as Linux leaves it), first structure that sets a
+  non-empty `bdf_ext` wins. No 0xF8 / none valid = no variant (QEMU).
+  DT variant (`ath11k_core_check_dt`) is not ported (x86 only).
 - NARF-only bounds: Linux waits forever for the WLFW server and for
   REQUEST_MEM / FW_MEM_READY / FW_READY and for QRTR RESUME_TX, and
   silently stalls when the memory-request callback cannot allocate;
