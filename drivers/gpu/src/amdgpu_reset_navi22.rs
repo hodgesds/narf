@@ -690,6 +690,12 @@ impl<I: Io> Engine<I> {
             .invoke(Op(|| f(io)))
             .map_err(|_| Error::Revoked)
     }
+    /// Whether `ms` have passed since `began` on [`Io::now_ms`], the clock
+    /// every reset-path bound is measured on (as POST's is), so a model
+    /// device's poll count, not host scheduling, decides its timeouts.
+    fn expired(&mut self, began: u64, ms: u64) -> bool {
+        self.io.now_ms().saturating_sub(began) >= ms
+    }
     /// smu_cmn_send_smc_msg_with_param. The first message after load ignores
     /// the stale response register (SMU_FW_INIT), as every message here is.
     /// `read_argument` is false for Mode1Reset: Linux passes no read_arg, and
@@ -705,7 +711,7 @@ impl<I: Io> Engine<I> {
             io.set_mp1(ARGUMENT, argument);
             io.set_mp1(MESSAGE, message);
         })?;
-        let deadline = narf_time::Deadline::after_ms(MESSAGE_MS);
+        let began = self.io.now_ms();
         loop {
             match self.access(|io| io.mp1(RESPONSE))? {
                 u32::MAX => return Err(Error::DeviceGone),
@@ -715,7 +721,7 @@ impl<I: Io> Engine<I> {
                 0 => {}
                 status => return Err(Error::Rejected(status)),
             }
-            if deadline.expired() {
+            if self.expired(began, MESSAGE_MS) {
                 return Err(Error::Timeout);
             }
             sleep_ms(1).await;
@@ -723,13 +729,13 @@ impl<I: Io> Engine<I> {
     }
     /// Outer error: revocation. Inner error: the last value, never ready.
     async fn wait_mp0(&mut self, register: u32, ms: u64) -> Result<Result<u32, u32>, Error> {
-        let deadline = narf_time::Deadline::after_ms(ms);
+        let began = self.io.now_ms();
         loop {
             let value = self.access(|io| io.mp0(register))?;
             if value != u32::MAX && value & READY_MASK == READY {
                 return Ok(Ok(value));
             }
-            if deadline.expired() {
+            if self.expired(began, ms) {
                 return Ok(Err(value));
             }
             sleep_ms(1).await;
@@ -786,13 +792,13 @@ impl<I: Io> Engine<I> {
                     Error::Timeout
                 }
             })?;
-        let deadline = narf_time::Deadline::after_ms(REGISTER_MS);
+        let began = self.io.now_ms();
         let memsize = loop {
             let memsize = self.access(|io| io.memsize())?;
             if memsize != u32::MAX {
                 break memsize;
             }
-            if deadline.expired() {
+            if self.expired(began, REGISTER_MS) {
                 return Err(Error::Timeout);
             }
             sleep_ms(1).await;
