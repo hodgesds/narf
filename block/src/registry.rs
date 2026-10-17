@@ -48,6 +48,17 @@ pub enum BlockIoError {
     ReadOnly,
 }
 
+/// Write-cache capabilities of a block device.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockCaps {
+    /// Completed writes may sit in a volatile cache until
+    /// [`BlockDeviceSync::flush`]; `false` = write-through (flush is a no-op).
+    pub volatile_cache: bool,
+    /// [`BlockDeviceSync::write_fua`] is native (one command); `false` =
+    /// emulated as write + flush.
+    pub fua: bool,
+}
+
 /// Synchronous block-device interface usable behind `dyn`.
 pub trait BlockDeviceSync: Send + Sync {
     /// LBA size in bytes (typically 512 or 4096).
@@ -64,6 +75,31 @@ pub trait BlockDeviceSync: Send + Sync {
     /// metadata repairs a writable mount performs. Wrappers must forward it.
     fn is_read_only(&self) -> bool {
         false
+    }
+    /// Make every write that has completed so far durable: drain the
+    /// device's volatile write cache (Linux `REQ_PREFLUSH` /
+    /// `blkdev_issue_flush`; NVMe Flush, ATA FLUSH CACHE). Returns only once
+    /// the device has reported the flush complete. The default is for
+    /// write-through devices, where a completed write is already durable.
+    /// Wrappers must forward it.
+    fn flush(&self) -> Result<(), BlockIoError> {
+        Ok(())
+    }
+    /// Write-cache capabilities (Linux `blk_queue_write_cache(q, wc, fua)`).
+    /// The default describes a write-through device without native FUA.
+    /// Wrappers must forward it.
+    fn capabilities(&self) -> BlockCaps {
+        BlockCaps::default()
+    }
+    /// Write with Force Unit Access (Linux `REQ_FUA`): the data is durable
+    /// when this returns, whatever the device's write cache does. It does
+    /// NOT order earlier writes — issue [`Self::flush`] first for that
+    /// (btrfs `write_all_supers`: flush, then the superblock FUA). The
+    /// default emulates FUA with a write followed by a flush, as the block
+    /// layer does for devices without native FUA.
+    fn write_fua(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
+        self.write(lba, n_blocks, data)?;
+        self.flush()
     }
 }
 
@@ -561,7 +597,10 @@ impl BlockDevice for SyncBlock {
         // a sync transport, fine to advertise; the FS layer relies
         // on the call returning quickly more than on a hardware
         // doorbell).
-        matches!(f, BlockFeature::Flush | BlockFeature::WriteZeroes)
+        matches!(
+            f,
+            BlockFeature::Flush | BlockFeature::Fua | BlockFeature::WriteZeroes
+        )
     }
 
     fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion> + Send {
@@ -575,10 +614,28 @@ impl BlockDevice for SyncBlock {
             }
         }
     }
-    async fn flush(&self) {}
+    /// Forwards to [`BlockDeviceSync::flush`]; an error is dropped here
+    /// (the trait returns `()`) — use [`BlockDevice::flush_result`].
+    async fn flush(&self) {
+        let _ = self.0.flush();
+    }
+    fn flush_result(&self) -> impl Future<Output = Result<(), BlockError>> + Send {
+        let r = self.0.flush().map_err(map_io_err);
+        async move { r }
+    }
     async fn discard(&self, _r: LbaRange) {}
     async fn cancel(&self, _t: u64) -> CancelResult {
         CancelResult::NotFound
+    }
+}
+
+fn map_io_err(e: BlockIoError) -> BlockError {
+    match e {
+        BlockIoError::OutOfRange => BlockError::InvalidRange,
+        BlockIoError::BufferTooSmall => BlockError::InvalidRange,
+        BlockIoError::DeviceRemoved => BlockError::DeviceRemoved,
+        BlockIoError::DriverError => BlockError::IOError,
+        BlockIoError::ReadOnly => BlockError::PermissionDenied,
     }
 }
 
@@ -604,16 +661,13 @@ impl SyncBlock {
         // exclusive for the duration of this synchronous IO.
         // SAFETY: Valid memory or trusted environment
         let slice = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), total) };
-        let map_err = |e: BlockIoError| match e {
-            BlockIoError::OutOfRange => BlockError::InvalidRange,
-            BlockIoError::BufferTooSmall => BlockError::InvalidRange,
-            BlockIoError::DeviceRemoved => BlockError::DeviceRemoved,
-            BlockIoError::DriverError => BlockError::IOError,
-            BlockIoError::ReadOnly => BlockError::PermissionDenied,
-        };
+        let map_err = map_io_err;
         match req.op {
             BlockOp::Read => self.0.read(req.lba, blocks, slice).map_err(map_err),
-            BlockOp::Write { fua: _ } => self.0.write(req.lba, blocks, slice).map_err(map_err),
+            BlockOp::Write { fua: false } => self.0.write(req.lba, blocks, slice).map_err(map_err),
+            BlockOp::Write { fua: true } => {
+                self.0.write_fua(req.lba, blocks, slice).map_err(map_err)
+            }
             BlockOp::WriteZeroes => {
                 for b in slice.iter_mut() {
                     *b = 0;
