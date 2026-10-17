@@ -381,8 +381,8 @@ fn restore(
     }
     for &(offset, control) in &state.rebar[..state.rebar_count] {
         // Only the size and index fields are guaranteed to read back.
-        // linux: n/a (PCI_REBAR_CTRL_BAR_IDX | BAR_SIZE is 0x1f07 in pci_regs.h; bit 13 extra)
-        if config(cap, device, offset)? & 0x3f07 != control & 0x3f07 {
+        // linux-lit: 0x1f07=PCI_REBAR_CTRL_BAR_IDX | PCI_REBAR_CTRL_BAR_SIZE
+        if config(cap, device, offset)? & 0x1f07 != control & 0x1f07 {
             return Err(Error::Pci);
         }
     }
