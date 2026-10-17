@@ -3557,6 +3557,28 @@ change, FRAC_URG_BW nom/flip), `ARB_SAT_LEVEL = 60 * refclk_mhz`,
 `MIN_REQ_OUTSTAND = 0x1ff`, forces self refresh off, and reads every write
 back; values wider than their DCN3.0 field are refused rather than masked.
 
+### Navi 22 VBIOS display command tables
+
+DCN3.0 does not route VBIOS commands through DMUB (`dmub_command_table` is
+unset for `dcn30_resource.c`), so `amdgpu_navi22_bios::Tables::new(vbios)` runs
+them on the ATOM interpreter. `pipe_power_gating(bus, pipe, Init|Disable|Enable)`
+(EnableDispPowerGating v2.1), `set_pixel_clock(bus, &PixelClock { otg, pll,
+transmitter, pixel_khz })` (v1.7, combo PHY PLL, UNIPHY encoder object, HDMI
+mode, XTALIN reference), `hdmi_stream_setup(bus, dig, pixel_khz)`
+(DIGxEncoderControl v1.5 STREAM_SETUP) and `transmitter(bus, &Transmitter)`
+(DIG1TransmitterControl v1.6/1.7, as `dcn10_link_encoder_enable_tmds_output`)
+fill the `atomfirmware.h` blocks exactly as `command_table2.c` does and refuse
+other table revisions. `Bus` (BAR5 dword `Mmio`, bounded by the mapping)
+carries register access and DELAY; an out-of-window access or port I/O fails
+the table with `Error::Bus`.
+
+`amdgpu_atom_vm` now follows `atom.c` when `AtomState::bios`/`data_table` are
+bound: `SET_DATA_BLOCK` takes absolute offsets from the master data table (255
+selects the table start), ID operands read the image, every table execution
+(including each CALLTABLE callee) gets its own zeroed WS from its header
+(`ResolvedTable::ws_dwords`), and DELAY opcodes call `AtomState::delay_us`.
+Unbound, the synthetic-table behaviour is unchanged.
+
 ### Navi 22 native AUX, DDC and HPD
 
 `unsafe amdgpu_dcn30_ddc::Ddc::new(gpu, pci_cap, crystal_khz)` claims all six DCN3.0 AUX

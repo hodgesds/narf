@@ -220,6 +220,7 @@ pub mod amdgpu_mes_hw;
 pub mod amdgpu_modeset;
 pub mod amdgpu_mqd;
 pub mod amdgpu_mst;
+pub mod amdgpu_navi22_bios;
 pub mod amdgpu_navi22_boot;
 pub mod amdgpu_navi22_display;
 pub mod amdgpu_navi22_platform;

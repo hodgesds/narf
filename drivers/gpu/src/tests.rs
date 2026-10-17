@@ -2029,10 +2029,14 @@ fn smoke_amdgpu_atom_vm_calltable_shifts_the_parameter_window() -> TestResult {
         1 => Some(ResolvedTable {
             body: CALLER,
             ps_dwords: 2,
+            start: 0,
+            ws_dwords: None,
         }),
         2 => Some(ResolvedTable {
             body: CALLEE,
             ps_dwords: 1,
+            start: 0,
+            ws_dwords: None,
         }),
         _ => None,
     });
@@ -2060,6 +2064,8 @@ fn smoke_amdgpu_atom_vm_calltable_shifts_the_parameter_window() -> TestResult {
         1 => Some(ResolvedTable {
             body: LOOP,
             ps_dwords: 0,
+            start: 0,
+            ws_dwords: None,
         }),
         _ => None,
     });
