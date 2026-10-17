@@ -1017,6 +1017,14 @@ static, power-gating-disabled path with PSP-loaded TMR images, VCPU reset
 retries, decode/encode ring and IB tests, IH-routed fences) plus JPEG 3.0 with
 a ring test; PSP loads one VCN image per unharvested instance (type 13/58)
 from the discovery harvest table, and media failures leave the boot degraded.
+With `amdgpu.navi22_accel`, VCN decode/encode and JPEG are client IPs on the
+generic CS path (`amdgpu_vcn_navi22_cs`): Linux's ring frames with a
+ring-side MMHUB VM flush under the client VMID, `vcn_v3_0_dec_msg`
+message checks, per-client decode sessions, JPEG `parse_cs` on a kernel
+copy, IH-routed fences; HW_IP_INFO/COUNT and VIDEO_CAPS answer Linux's
+values for the RX 6750 XT (VCN1 harvested). The Mesa recipe now builds
+radeonsi VA-API and RADV Vulkan video; the amd-gl image carries vainfo,
+ffmpeg, reference clips and `/mesa-amd-video.sh`. Register models only.
 Navi22 display AUX/DDC/HPD is now native, as Linux drives DCN3.0
 (`dc_is_dmub_outbox_supported` is false there): the DCE AUX engine with
 `dce_aux_transfer_with_retries` policy, I2C-over-AUX, the hardware I2C engine

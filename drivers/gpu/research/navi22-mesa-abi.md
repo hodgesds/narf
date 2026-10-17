@@ -93,7 +93,7 @@ with ACCEL_WORKING and `available_rings`, once milestone 8 lands.
 | SENSOR (GFX_SCLK, GFX_MCLK, GPU_TEMP, GPU_LOAD, …) | HUD/queries | no | SMU metrics; `-ENOENT` without DPM | EINVAL | M10 |
 | VRAM_USAGE, VIS_VRAM_USAGE, GTT_USAGE, NUM_BYTES_MOVED, NUM_EVICTIONS, NUM_VRAM_CPU_PAGE_FAULTS | HUD / budget (`VK_EXT_memory_budget`) | no | TTM counters | EINVAL | M8 |
 | GPUVM_FAULT | RADV fault reporting (minor ≥ 55) | no | last fault (addr, status, vmhub) | EINVAL | M8 |
-| VIDEO_CAPS | radeonsi VA-API only | no | VCN 3.0 codec table | EINVAL | M10 |
+| VIDEO_CAPS | radeonsi VA-API only | no | VCN 3.0 codec table | Sienna Cichlid tables with the published VCN harvest (VCN0 table on this card) | M10 (done) |
 | VBIOS (SIZE/IMAGE/INFO) | tools | no | VBIOS | EINVAL | M9 |
 | UQ_FW_AREAS | only with `AMD_USERQ` | no | EOPNOTSUPP on gfx10 | EINVAL | — |
 | GDS_CONFIG | none in 26.2.4 init | no | gds sizes | EINVAL | — |
@@ -175,9 +175,9 @@ DMA 2, others 1}.
 | COMPUTE | gfx_v10_0 | 10.0 | 0x0a0302 | 32/32 | 0xf | 1 | same |
 | DMA | sdma_v5_2 | 5.2 | 0x050202 | 256/4 | 0x3 | 2 | align 32/32 (wrong), count = SDMA0 blocks |
 | UVD, VCE, UVD_ENC | absent | 0 | 0 | 0 | 0 | EINVAL | EINVAL |
-| VCN_DEC | vcn_v3_0 | 3.0 | VCN inst 0 | 256/64 | 0x1 once VCN rings run | `num_vcn_inst` | EINVAL |
-| VCN_ENC | vcn_v3_0 | 3.0 | same | 256/4 | 0x1 | same | EINVAL |
-| VCN_JPEG | jpeg_v3_0 | 3.0 | same | 256/64 | 0x1 | 1·1 | EINVAL |
+| VCN_DEC | vcn_v3_0 | 3.0 | VCN inst 0 | 256/64 | 0x1 once VCN rings run | `num_vcn_inst` | 0x1 / 2 once the decode ring verified (accel only) |
+| VCN_ENC | vcn_v3_0 | 3.0 | same | 256/4 | 0x1 | same | 0x1 / 2 once an encode ring verified |
+| VCN_JPEG | jpeg_v3_0 | 3.0 | same | 256/64 | 0x1 | 1·1 | 0x1 / 1 once the JPEG ring verified |
 | VPE | absent | 0 | 0 | 0 | 0 | EINVAL | EINVAL |
 
 Mesa pads `ib_alignment` to ≥ 256 anyway, but the reply must still be the
@@ -259,7 +259,11 @@ values otherwise (sclk/mclk MHz, temperature m°C, load %). Mesa uses it only
 for the HUD/`GALLIUM_HUD` and `VK_AMD`-style queries; failure is tolerated.
 VIDEO_CAPS (decode/encode codec limits) is read only by radeonsi's VA-API
 path; Mesa 26.2.4 computes the VCN 3.0 caps itself in `ac_fill_video_info`
-once VCN rings are advertised. Both are M10.
+once VCN rings are advertised. Both are M10. VIDEO_CAPS now answers the
+Sienna Cichlid tables with `harvest_config` applied; the VCN/JPEG rings are
+client-submittable through `amdgpu_vcn_navi22_cs` behind
+`amdgpu.navi22_accel` (see `docs/MESA_AMD.md` for the VA-API/Vulkan video
+userspace).
 
 ## 10. Memory and submission ioctls
 
@@ -324,8 +328,9 @@ import/export, WAIT_FENCES / FENCE_TO_HANDLE, BO_LIST ioctl (Mesa uses the
 BO_HANDLES chunk), implicit sync for buffers not listed in BO_HANDLES, GDS/GWS/OA, GEM_USERPTR,
 PRT/sparse, SET_PLACEMENT, GTT heap size in MEMORY (0), ADDFB2_MODIFIERS and
 modifier lists (KMS), TIMESTAMP/SENSOR/GPUVM_FAULT/usage counters, one
-client VMID for all clients (no per-client fault attribution), VCN/JPEG user
-submission.
+client VMID for all clients (no per-client fault attribution). VCN/JPEG user
+submission is wired (`amdgpu_vcn_navi22_cs`); its IH VMID LUT write
+(`emit_pasid_mapping`) stays with the VMID work.
 
 ## 13. Navi 22 card backend design
 
