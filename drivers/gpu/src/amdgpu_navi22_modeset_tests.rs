@@ -1345,3 +1345,47 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/navi22-modeset",
     navi22_takeover_odm_dsc_and_watermarks_like_dcn30_init_hw
 );
+
+/// dcn10_init_pipes compares each DSC's OPP source against both
+/// `optc2_get_optc_source` outputs, and `src_opp_id_1` is SEG1 as read even
+/// for a one-segment OTG: a clocked, forwarding DSC fed from that OPP stays
+/// powered. NARF dropped SEG1 unless ODM 2:1 and gated it.
+fn navi22_takeover_keeps_dsc_on_single_segment_seg1() -> TestResult {
+    let bench = Bench::new();
+    bench.set(m::MP1 + 0x274, 1);
+    // OTG 1 running, one input segment: SEG0 = OPP 1, SEG1 field = 2; DSC
+    // mode on. DSC 0 clocked and forwarding from OPP 2.
+    bench.set(d2(0x1b41 + 0x80), 1);
+    bench.set(d2(0x1acb + 0x10), 1 << 8 | 2 << 12);
+    bench.set(d2(0x1acc + 0x10), 1 << 4);
+    bench.set(d2(0x1b2b + 0x80), 2020 | 100 << 16);
+    bench.set(d2(0x1b36 + 0x80), 1100 | 20 << 16);
+    bench.set(d2(0x3000), 1);
+    bench.set(d2(0x1a64), 1 | 2 << 4);
+    // DIG backend 3 lit in HDMI mode from frontend 1, so power_down runs.
+    bench.set(d2(0x20b1 + 0x300), 1);
+    bench.set(d2(0x20b0 + 0x300), 3 << 16 | 1 << 9);
+    let vram = Vram::new(VRAM_BYTES);
+    let image = m::vbios(6);
+    let tables = Tables::new(&image).unwrap();
+    let connector = m::connector(Signal::Hdmi, 3, 3);
+    let r = Resources::new().acquire(&connector).unwrap();
+    let mut p = pipeline(&bench, connector, r);
+    let sink = m::sink(Signal::Hdmi, None);
+    if run(enable_with(&mut p, &vram, &tables, &sink, &mut NoAux)).is_err() {
+        return TestResult::Fail("enable over a one-segment DSC GOP");
+    }
+    let log = bench.log();
+    let gated = |dsc: u32| {
+        log.iter()
+            .any(|w| w.dword == d2(0xa1 + 2 * dsc) && w.value & 1 << 8 != 0)
+    };
+    if gated(0) || !(1..6).all(gated) {
+        return TestResult::Fail("DSC fed from SEG1 of a one-segment OTG was gated");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_takeover_keeps_dsc_on_single_segment_seg1
+);

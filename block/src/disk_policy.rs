@@ -21,8 +21,11 @@
 //!
 //! Absent the argument (or `narf.disks=all`) the policy is
 //! [`DiskPolicy::All`] and the guard is a pass-through, which is what every
-//! QEMU test boot relies on. An unrecognised value fails closed to
-//! `boot-only`.
+//! QEMU test boot relies on. Every xtask generator of media meant for a real
+//! machine (`usb-image`, `grub-image`, `disk-write-partitioned`) therefore
+//! writes `narf.disks=boot-only` itself unless `--allow-all-disks` is given.
+//! An unrecognised value fails closed to `boot-only`. The resolved policy is
+//! printed as a framed console banner either way.
 //!
 //! Limits: the guard covers every write that goes through the registry
 //! (filesystems, devfs block nodes, the bootlog). A driver writing through a
@@ -120,13 +123,35 @@ pub fn init_from_cmdline() -> DiskPolicy {
         }
     };
     POLICY.store(encode(policy), Ordering::Release);
-    if policy == DiskPolicy::BootOnly {
-        let _ = writeln!(
-            narf_console::Writer,
-            "disks: {ARG}=boot-only: every disk is read-only until identified as the boot medium"
-        );
-    }
+    // Both outcomes are announced, framed so the line stands out of the
+    // probe noise: on a bare-metal boot the operator must be able to see at
+    // a glance whether the internal disks are protected.
+    let _ = writeln!(
+        narf_console::Writer,
+        "disks: ================================"
+    );
+    let _ = writeln!(narf_console::Writer, "{}", banner(policy, value.is_some()));
+    let _ = writeln!(
+        narf_console::Writer,
+        "disks: ================================"
+    );
     policy
+}
+
+/// The console line [`init_from_cmdline`] prints for the active policy.
+/// `explicit` is whether `narf.disks=` was on the command line.
+pub fn banner(policy: DiskPolicy, explicit: bool) -> &'static str {
+    match (policy, explicit) {
+        (DiskPolicy::BootOnly, _) => {
+            "disks: POLICY narf.disks=boot-only: every disk is read-only until identified as the boot medium"
+        }
+        (DiskPolicy::All, true) => {
+            "disks: POLICY narf.disks=all: EVERY disk is writable (internal disks NOT protected)"
+        }
+        (DiskPolicy::All, false) => {
+            "disks: POLICY all (no narf.disks= argument): EVERY disk is writable (internal disks NOT protected)"
+        }
+    }
 }
 
 /// Test-only: force the policy (and with `None`, return to the unresolved

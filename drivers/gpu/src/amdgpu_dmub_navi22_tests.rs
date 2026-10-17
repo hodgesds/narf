@@ -591,6 +591,34 @@ kernel_test_in!(
     dmub_navi22_fused_off_dmcub_is_unsupported_without_writes
 );
 
+/// A DMCUB that GOP never started (DMCUB_ENABLE = 0, not in reset) cannot
+/// acknowledge STOP_FW: dmub_dcn20_reset still posts it, clears GPINT and
+/// forces the reset, but the 100 ms acknowledgement wait (and its "not
+/// acknowledged" fault line) is for a running DMCUB only.
+fn dmub_navi22_never_started_dmcub_skips_the_stop_wait() -> TestResult {
+    let (_pool, mut engine) = fixture();
+    engine.io.stop = false;
+    engine.io.regs.insert(DCN + 0x1f6 * 4, 0);
+    let quick = narf_time::Deadline::after_ms(60);
+    if run(engine.quiesce()).is_err() || engine.state != State::Reset {
+        return TestResult::Fail("never-started DMCUB not reset");
+    }
+    if quick.expired() {
+        return TestResult::Fail("waited for a STOP_FW ack from a DMCUB that never ran");
+    }
+    if engine.io.writes.first() != Some(&(DCN + 0x1f8 * 4, 0x10020000))
+        || engine.io.writes.get(1) != Some(&(DCN + 0x1f8 * 4, 0))
+        || engine.io.regs[&(DCN + 0x1f6 * 4)] & 0x30000 != 0x20000
+    {
+        return TestResult::Fail("dmub_dcn20_reset sequence for a stopped DMCUB");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi22",
+    dmub_navi22_never_started_dmcub_skips_the_stop_wait
+);
+
 /// command_table2.c `*_dmcub` + dc_wake_and_execute_dmub_cmd(WAIT): the
 /// DMUB_CMD__VBIOS slot carries header and parameters, completes once DMCUB
 /// consumes it, and a DMCUB that never does fails within the 100 ms bound.

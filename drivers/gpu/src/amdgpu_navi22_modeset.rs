@@ -979,7 +979,10 @@ impl Pipeline {
                         pll,
                         transmitter: self.connector.path.transmitter,
                         pixel_100hz: self.hdmi.map_or(pixel_khz * 10, |s| s.character_100hz),
-                        deep_color: self.hdmi.map_or(0, |s| s.format.depth.code() as u8),
+                        // dce112_program_pix_clk never sets bp_pc_params.color_depth:
+                        // the table gets DEEPCOLOR_RATIO_DIS and the deep-colour DTO is
+                        // the resync below (dce112_program_pixel_clk_resync).
+                        deep_color: 0, // linux: PIXEL_CLOCK_V7_DEEPCOLOR_RATIO_DIS
                     },
                 )?;
                 let resync = self.d1(PIXCLK_RESYNC_CNTL[usize::from(pll)]);

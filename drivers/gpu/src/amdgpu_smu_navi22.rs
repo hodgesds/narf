@@ -852,6 +852,10 @@ impl<I: Io> Engine<I> {
                     self.command(ALLOWED_LOW, allowed as u32).await?;
                 }
                 self.command(ENABLE_FEATURES_LOW, mask as u32).await?;
+                // From here the Low half may run even if High fails
+                // (smu_cmn_feature_update_enable_state returns between the
+                // two): record it so the opt-in's removal switches it off.
+                self.gating_allowed |= mask & 0xffff_ffff;
                 self.command(ENABLE_FEATURES_HIGH, (mask >> 32) as u32)
                     .await?;
             } else {

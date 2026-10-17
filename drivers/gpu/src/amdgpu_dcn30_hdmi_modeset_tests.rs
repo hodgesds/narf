@@ -146,6 +146,15 @@ fn dcn30_hdmi_modeset_deep_colour_scrambled_with_scdc_in_linux_order() -> TestRe
     if marker(m::SLOT_PIXEL_CLOCK, 0) != 377_550 || lit.bench.get(d1(0x40)) & 0x30 != 0x20 {
         return TestResult::Fail("12-bpc pixel clock");
     }
+    // dcn3_program_pix_clk → dce112_program_pix_clk leaves color_depth 0:
+    // set_pixel_clock_v7's deep_color_ratio (PS byte 9) is RATIO_DIS even at
+    // 12 bpc, and miscinfo (byte 7) carries no YUV420 bit (DCN2+ never sets
+    // SUPPORT_YCBCR420); only the DCCG resync carries the depth.
+    if (marker(m::SLOT_PIXEL_CLOCK, 2) >> 8) & 0xff != 0
+        || (marker(m::SLOT_PIXEL_CLOCK, 1) >> 24) & 0x04 != 0
+    {
+        return TestResult::Fail("SetPixelClock v7 deep_color_ratio / miscinfo");
+    }
     // Deep colour 2 + enable, scrambler at the character rate.
     let control = lit.bench.get(d2(0x2093 + f * 0x100));
     if control & 0x3100_0006 != 0x2100_0002 {

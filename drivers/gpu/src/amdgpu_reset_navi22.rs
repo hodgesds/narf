@@ -102,8 +102,12 @@ const POST_MS: u64 = 60_000; // linux: n/a (NARF bound)
 const YIELD_STEPS: u64 = 1024; // linux: n/a (NARF policy)
 /// SMU11_MODE1_RESET_WAIT_TIME_IN_MS, and the PSP path's msleep(500).
 const SETTLE_MS: u64 = 500; // linux: SMU11_MODE1_RESET_WAIT_TIME_IN_MS
-/// psp_v11_0_wait_for_bootloader: 20 retries of a 100 ms register wait.
-const BOOTLOADER_MS: u64 = 2000; // linux: n/a (NARF bound, 20 x usec_timeout)
+/// psp_v11_0_wait_for_bootloader after the reset: the same 20 x
+/// usec_timeout register polls the cold PSP11 boot waits, whose real bound
+/// is 4-6 s (the udelays alone are 2 s; see
+/// [`crate::amdgpu_psp_boot::PSP11_BOOTLOADER_TIMEOUT_MS`]).
+// linux: n/a (bound derived from psp_v11_0_wait_for_bootloader loops)
+pub(crate) const BOOTLOADER_MS: u64 = crate::amdgpu_psp_boot::PSP11_BOOTLOADER_TIMEOUT_MS;
 /// adev->usec_timeout for the PSP mailbox and MEMSIZE waits.
 const REGISTER_MS: u64 = 100; // linux: n/a (NARF bound, usec_timeout)
 /// smu_cmn message timeout (usec_timeout * 20).

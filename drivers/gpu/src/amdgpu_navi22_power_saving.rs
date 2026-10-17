@@ -226,9 +226,14 @@ pub(crate) async unsafe fn apply(
     let bits = plan.smu_enable();
     if bits != 0 {
         // SAFETY: the policy admitted every feature these bits belong to.
-        unsafe { parts.smu.update_gating_features(bits, true) }
-            .await
-            .map_err(Error::Smu)?;
+        if let Err(e) = unsafe { parts.smu.update_gating_features(bits, true) }.await {
+            // EnableSmuFeaturesLow may have succeeded before High failed:
+            // retain the bits the SMU owner reports as possibly running so
+            // `remove` disables them.
+            applied.smu_bits = parts.smu.gating_features() & bits;
+            r.applied = applied;
+            return Err(Error::Smu(e));
+        }
         applied.smu_bits = bits;
         r.applied = applied;
         if bits & policy::SMU_GFXOFF != 0 {
