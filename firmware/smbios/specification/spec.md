@@ -52,16 +52,57 @@ SMBIOS3 entry point).
 
 ## Entry-point discovery
 
-The parser ships two ways to locate the structure stream:
+### Boot-time scan (`dmi-scan`, `Stage::Core`)
 
-1. **`scan_legacy_bios()`** — x86_64 only. Walks
-   `0x000F_0000 .. 0x0010_0000` on 16-byte boundaries looking
-   for the `_SM3_` / `_SM_` anchor. Validates the entry-point
-   checksum before declaring victory; firmware sometimes leaves
-   stale anchors lying around. Returns `(struct_table_phys,
-   struct_table_len, version_major, version_minor)` on success.
-   The caller copies the structure stream into a slice and
-   hands that to `parse_stream`.
+`register_initcalls()` registers `dmi-scan` at `Stage::Core`, which
+runs before `pci-probe-all` (`Stage::Device`), mirroring Linux's
+`dmi_setup` from `setup_arch`. It ports `drivers/firmware/dmi_scan.c`
+(`src/discover.rs`):
+
+1. **EFI** (`narf_boot::firmware_handoff().efi_system_table`, i.e.
+   multiboot2 tag 12 from Limine / GRUB on UEFI): the system table
+   must carry `EFI_SYSTEM_TABLE_SIGNATURE` (`efi_systab_init`); its
+   configuration table (`nr_tables` @104, `tables` @112, 24-byte
+   `{guid, u64}` rows, at most `MAX_EFI_CONFIG_TABLES`, a later
+   duplicate GUID overriding) yields `efi.smbios3`
+   (`SMBIOS3_TABLE_GUID`) and `efi.smbios` (`SMBIOS_TABLE_GUID`).
+   `efi.smbios3` is tried first; if it fails to decode or its table
+   cannot be read, `efi.smbios`.
+2. **Loader copies** (NARF addition — Linux is its own EFI stub): the
+   multiboot2 tag-13 entry points, `_SM3_` before `_SM_`.
+3. **Legacy scan**, only when EFI is not enabled and only on x86_64
+   (`CONFIG_DMI_SCAN_MACHINE_NON_EFI_FALLBACK`): the 64 KiB at
+   `0xF0000` with Linux's sliding 32-byte window — every paragraph
+   but the last as an `_SM3_` candidate first, then `_SM_` at q-16 /
+   `_DMI_` at q (a bare `_DMI_` = legacy DMI). PVH boots (QEMU
+   `-kernel` + SeaBIOS) take this path.
+
+Entry-point checks are Linux's: `_SM3_` length 24..=32 + checksum,
+`dmi_ver` = be24 @7, `dmi_len` = le32 @12, `dmi_base` = le64 @16,
+`dmi_num` = 0; `_SM_` length 30..=32 + checksum (optional), `_DMI_`
+15-byte checksum (mandatory), le16 len @+6, le32 base @+8, le16 num
+@+12, the 2.31/2.33 → 2.3 and 2.51 → 2.6 version fixups. A candidate
+counts only if its table can be read (`dmi_walk_early`). Physical
+memory is read through `PhysRead`; at boot `KernelPhys` reads via
+`PhysAddr::kernel_ptr` (the direct map — the low half is user space
+after the MMU handoff), refusing address 0 and anything past
+512 GiB. The copied table is bounded by `MAX_TABLE_LEN` (1 MiB;
+Linux maps `dmi_len` whole — for SMBIOS 3 that is only a maximum).
+
+The table is walked with `dmi_decode_table`'s exact bounds: stop on
+a structure shorter than 4 bytes, a structure is decoded only when
+its string set ends inside `dmi_len`, end-of-table (127) ends the
+walk only behind a 64-bit entry point (`dmi_num == 0`; 32-bit tables
+are bounded by `dmi_num`), and `dmi_len` is trimmed to the walked
+length. The decoded records go through `parse_stream`; the raw copy
+is kept as the boot `RawTable`. One line is logged:
+`dmi: SMBIOS <ver> via <Source>: <n> bytes, <m> structures; product "<type-1 product>"`
+or `dmi: DMI not present or invalid.`
+
+### Helpers
+
+1. **`scan_legacy_bios()`** — the legacy scan above, returning the
+   decoded `EntryPoint`. `None` off x86_64.
 
 2. **`from_anchor_bytes(bytes)`** — pure-data: takes a slice
    covering the entry-point structure (e.g. content of QEMU
@@ -227,7 +268,48 @@ pub fn copy_baseboard(out: &mut [SmbiosBaseboard]) -> usize;
 pub fn copy_processors(out: &mut [SmbiosProcessor]) -> usize;
 pub fn copy_memory_devices(out: &mut [SmbiosMemoryDevice]) -> usize;
 pub fn is_known() -> bool;
+
+// Boot-time discovery + raw retention (src/discover.rs)
+pub fn register_initcalls();                     // `dmi-scan`, Stage::Core
+pub trait PhysRead { fn read(&self, phys: u64, out: &mut [u8]) -> bool; }
+pub struct KernelPhys;                           // direct-map reader, < 512 GiB, != 0
+pub struct TableLocation { pub base: u64, pub len: u32, pub num: u16, pub version: u32 }
+pub enum Source { EfiSmbios3, EfiSmbios, LoaderSmbios3, LoaderSmbios,
+                  LegacySmbios3, LegacySmbios }
+pub struct Sources { pub efi_system_table: Option<u64>,
+                     pub loader_smbios3: Option<[u8; 32]>,
+                     pub loader_smbios: Option<[u8; 32]>, pub legacy_scan: bool }
+pub fn smbios3_present(buf: &[u8; 32]) -> Option<TableLocation>; // dmi_smbios3_present
+pub fn dmi_present(buf: &[u8; 32]) -> Option<TableLocation>;     // dmi_present
+pub fn efi_smbios_tables(systab: u64, mem: &dyn PhysRead)
+    -> Option<(Option<u64>, Option<u64>)>;       // (efi.smbios3, efi.smbios); None = not EFI
+pub fn scan_legacy_region<T>(region: &[u8],
+    try_entry: impl FnMut(&[u8; 32], bool /*sm3*/) -> Option<T>) -> Option<T>;
+pub fn scan_machine(src: &Sources, mem: &dyn PhysRead) -> Option<RawTable>;
+
+pub struct RawTable;                             // trimmed copy of the structure table
+impl RawTable {
+    pub fn from_bytes(bytes: Vec<u8>, num: u16) -> Self; // num = 0 → SMBIOS 3 rules
+    pub fn read(loc: TableLocation, source: Source, mem: &dyn PhysRead) -> Option<Self>;
+    pub fn bytes(&self) -> &[u8];
+    pub fn structure_count(&self) -> u16;
+    pub fn version(&self) -> u32;                // dmi_ver
+    pub fn source(&self) -> Option<Source>;
+    pub fn structures(&self) -> Vec<RawStructure<'_>>;          // dmi_walk order
+    pub fn structures_of_type(&self, kind: u8) -> Vec<RawStructure<'_>>;
+}
+pub struct RawStructure<'a> { pub kind: u8, pub handle: u16,
+                              pub bytes: &'a [u8] } // formatted area + string set (incl. "\0\0")
+impl RawStructure<'_> { fn length(&self) -> u8; fn formatted(&self) -> &[u8];
+                        fn strings(&self) -> &[u8]; fn string(&self, idx: u8) -> Option<&[u8]>; }
+pub fn boot_table() -> Option<&'static RawTable>;           // dmi_available
+pub fn raw_structures_of_type(kind: u8) -> Vec<RawStructure<'static>>; // empty without a table
 ```
+
+`parse_stream` overwrites the global typed tables (tests call it with
+synthetic streams); `boot_table()` is set once and never overwritten,
+so consumers of OEM structures (ath11k type 0xF8) read the firmware's
+table regardless of what ran later.
 
 ## 5. Test surface
 
@@ -238,6 +320,16 @@ pub fn is_known() -> bool;
 | `smoke_smbios_processor_record`      | Type 4 max/current speeds          |
 | `smoke_smbios_memory_device`         | Type 17 size + speed              |
 | `smoke_smbios_skips_unknown`         | unknown types walked correctly     |
+| `smoke_smbios_ep3_linux_window`      | `_SM3_` 24..=32, checksum, be24 version |
+| `smoke_smbios_ep_linux_window`       | `_SM_` 30..=32, fixups, bare `_DMI_` |
+| `smoke_smbios_efi_config_table`      | GUID rows, last duplicate wins, signature |
+| `smoke_smbios_scan_machine_efi_precedence` | SMBIOS3 first, fallback to 32-bit |
+| `smoke_smbios_scan_machine_no_legacy_under_efi` | no F-segment scan under EFI; loader tag; unreadable table |
+| `smoke_smbios_legacy_scan_order`     | SM3 pass first, q-16 window, last paragraph |
+| `smoke_smbios_raw_type_f8_retained`  | type 0xF8 formatted area + strings |
+| `smoke_smbios_walk_bounds`           | EOT trust, `dmi_num`, short entry, unterminated set |
+| `smoke_smbios_parsed_at_boot`        | boot table present with type 1 (Skip if none) |
+| `boot/firmware` `smoke_mb2_firmware_handoff{,_absent}` | multiboot2 tags 12/13 copied |
 
 ## 6. Out of scope (v0.1)
 
@@ -245,5 +337,6 @@ pub fn is_known() -> bool;
 - String index dereference beyond 64-byte truncation.
 - Type-3 enclosure / Type-9 slot / Type-19 memory-array
   records — extend the parser as drivers come online.
-- Live entry-point discovery (callers hand the parser the
-  structure-stream slice).
+- aarch64 discovery: the NARF UEFI loader hands over a DTB only (no
+  EFI system table), so `dmi-scan` reports not-present there.
+- `/sys/firmware/dmi` exposure of the retained table.

@@ -22,13 +22,27 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
+mod discover;
+mod discover_tests;
 mod tests;
 
-/// Force-link hook. The crate has no boot-time initcalls of its own
-/// (parsing happens on demand from the entry-point discovery code),
-/// but `frame/` calls this to keep the linker from dropping the
-/// `kernel_test_in!` registrations in `tests.rs`.
-pub fn register_initcalls() {}
+pub use discover::{
+    boot_table, dmi_present, efi_smbios_tables, raw_structures_of_type, scan_legacy_region,
+    scan_machine, smbios3_present, KernelPhys, PhysRead, RawStructure, RawTable, Source, Sources,
+    TableLocation, EFI_SYSTEM_TABLE_SIGNATURE, MAX_EFI_CONFIG_TABLES, MAX_TABLE_LEN,
+    SMBIOS3_TABLE_GUID, SMBIOS_ENTRY_POINT_SCAN_LEN, SMBIOS_ENTRY_POINT_SCAN_START,
+    SMBIOS_TABLE_GUID,
+};
+
+/// Register the boot-time scan (`dmi-scan`, `Stage::Core`). Linux runs
+/// `dmi_setup` from `setup_arch`, long before any driver probes, so
+/// the table is decoded and its raw copy retained before
+/// `pci-probe-all` (`Stage::Device`) binds drivers that consult it
+/// (ath11k's type-0xF8 board-data variant). Also keeps the linker from
+/// dropping the `kernel_test_in!` registrations in `tests.rs`.
+pub fn register_initcalls() {
+    narf_init::register(narf_init::Stage::Core, "dmi-scan", discover::dmi_setup);
+}
 
 // ───────────────────────────────────────────────────────────────────
 // Entry-point discovery
@@ -47,118 +61,89 @@ pub struct EntryPoint {
     pub structure_count: u16,
 }
 
-fn checksum(bytes: &[u8]) -> u8 {
-    bytes.iter().fold(0u8, |a, b| a.wrapping_add(*b))
+fn pad32(bytes: &[u8]) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    let n = bytes.len().min(32);
+    b[..n].copy_from_slice(&bytes[..n]);
+    b
 }
 
 fn decode_sm3(bytes: &[u8]) -> Option<EntryPoint> {
-    if bytes.len() < 24 || &bytes[0..5] != b"_SM3_" {
+    if bytes.len() < 24 {
         return None;
     }
-    let len = bytes[6] as usize;
-    if len < 24 || bytes.len() < len {
+    let buf = pad32(bytes);
+    if bytes.len() < buf[6] as usize {
         return None;
     }
-    if checksum(&bytes[..len]) != 0 {
-        return None;
-    }
-    let major = bytes[7];
-    let minor = bytes[8];
-    let max_size = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
-    let table_phys = u64::from_le_bytes([
-        bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
-    ]);
+    let loc = smbios3_present(&buf)?;
     Some(EntryPoint {
-        version_major: major,
-        version_minor: minor,
-        struct_table_phys: table_phys,
-        struct_table_len: max_size,
+        version_major: buf[7],
+        version_minor: buf[8],
+        struct_table_phys: loc.base,
+        struct_table_len: loc.len,
         structure_count: 0,
     })
 }
 
 fn decode_sm(bytes: &[u8]) -> Option<EntryPoint> {
+    // `_SM_` + the embedded `_DMI_` header (16 + 15 bytes). Linux's
+    // `dmi_present` also accepts a bare `_DMI_` (legacy DMI); an
+    // anchor handed in-band must carry a valid `_SM_` header here.
     if bytes.len() < 31 || &bytes[0..4] != b"_SM_" {
         return None;
     }
-    let ep_len = bytes[5] as usize;
-    if ep_len < 31 || bytes.len() < ep_len {
+    let buf = pad32(bytes);
+    if bytes.len() < buf[5] as usize || !(30..=32).contains(&buf[5]) {
         return None;
     }
-    if checksum(&bytes[..ep_len]) != 0 {
+    if buf[..buf[5] as usize]
+        .iter()
+        .fold(0u8, |a, b| a.wrapping_add(*b))
+        != 0
+    {
         return None;
     }
-    if &bytes[16..21] != b"_DMI_" {
-        return None;
-    }
-    if checksum(&bytes[16..32.min(bytes.len())]) != 0 {
-        return None;
-    }
-    let major = bytes[6];
-    let minor = bytes[7];
-    let table_len = u16::from_le_bytes([bytes[22], bytes[23]]) as u32;
-    let table_phys = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]) as u64;
-    let count = u16::from_le_bytes([bytes[28], bytes[29]]);
+    let loc = dmi_present(&buf)?;
     Some(EntryPoint {
-        version_major: major,
-        version_minor: minor,
-        struct_table_phys: table_phys,
-        struct_table_len: table_len,
-        structure_count: count,
+        version_major: buf[6],
+        version_minor: buf[7],
+        struct_table_phys: loc.base,
+        struct_table_len: loc.len,
+        structure_count: loc.num,
     })
 }
 
 /// Decode an entry-point structure handed in as a byte slice.
-/// Tries `_SM3_` first, then falls back to `_SM_`. Validates
-/// checksums on both forms.
+/// Tries `_SM3_` first, then falls back to `_SM_`, with Linux's
+/// `dmi_smbios3_present` / `dmi_present` length windows and checksums.
 pub fn from_anchor_bytes(bytes: &[u8]) -> Option<EntryPoint> {
     decode_sm3(bytes).or_else(|| decode_sm(bytes))
 }
 
 /// Scan the legacy BIOS region `0x000F_0000 .. 0x0010_0000` for an
-/// SMBIOS entry-point anchor. x86_64 only; returns `None` on every
-/// other architecture.
+/// SMBIOS entry-point anchor with `dmi_scan_machine`'s non-EFI search
+/// (every `_SM3_` candidate first, then `_SM_`). Returns `None` where
+/// the region cannot be read ([`KernelPhys`] reads nothing off
+/// x86_64).
 ///
 /// # Safety
-/// The scanned range is identity-mapped low ROM on every PC firmware
-/// path the kernel boots through. Reads are 32-byte-bounded against
-/// the upper limit.
-#[cfg(target_arch = "x86_64")]
+/// The scanned range must be mapped (the kernel direct map on x86_64).
 pub unsafe fn scan_legacy_bios() -> Option<EntryPoint> {
-    const START: usize = 0x000F_0000;
-    const END: usize = 0x0010_0000;
-    let mut p = START;
-    while p + 32 <= END {
-        // SAFETY: identity-mapped low ROM; 32-byte read at 16-byte
-        // alignment is defined.
-        // SAFETY: Valid memory or trusted environment
-        let slice = unsafe { core::slice::from_raw_parts(p as *const u8, 32) };
-        if &slice[0..5] == b"_SM3_" {
-            // SAFETY: 24-byte read fits the 32-byte window.
-            if let Some(ep) = decode_sm3(slice) {
-                return Some(ep);
-            }
-        }
-        if &slice[0..4] == b"_SM_" {
-            if let Some(ep) = decode_sm(slice) {
-                return Some(ep);
-            }
-        }
-        p += 16;
+    let mut region = alloc::vec![0u8; SMBIOS_ENTRY_POINT_SCAN_LEN];
+    if !KernelPhys.read(SMBIOS_ENTRY_POINT_SCAN_START, &mut region) {
+        return None;
     }
-    None
-}
-
-/// Non-x86_64 stub: there is no architectural legacy BIOS region to
-/// scan, so this always returns `None`.
-///
-/// # Safety
-/// This stub performs no memory accesses and has no preconditions; it
-/// is marked `unsafe` only to share the signature with the x86_64
-/// `scan_legacy_bios`, which dereferences identity-mapped low ROM.
-#[cfg(not(target_arch = "x86_64"))]
-pub unsafe fn scan_legacy_bios() -> Option<EntryPoint> {
-    None
+    scan_legacy_region(
+        &region,
+        |buf, sm3| {
+            if sm3 {
+                decode_sm3(buf)
+            } else {
+                decode_sm(buf)
+            }
+        },
+    )
 }
 
 pub const MAX_BIOS: usize = 1;

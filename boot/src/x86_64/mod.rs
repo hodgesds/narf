@@ -150,6 +150,17 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         unsafe { store_cmdline(bytes) };
     }
 
+    // Firmware-table pointers for the later SMBIOS scan. PVH's
+    // `hvm_start_info` carries none (the scan falls back to the
+    // 0xF0000 anchor search there, as Linux does on non-EFI boots).
+    let handoff = match proto {
+        // SAFETY: payload validated above.
+        Protocol::Multiboot2 => unsafe { multiboot2::firmware_handoff(info_ptr) },
+        Protocol::Pvh => crate::firmware::FirmwareHandoff::EMPTY,
+    };
+    // SAFETY: single-threaded boot, before any reader runs.
+    unsafe { crate::firmware::store(handoff) };
+
     Ok(BootInfo {
         memory_map: regions,
         cmdline: cmdline(),

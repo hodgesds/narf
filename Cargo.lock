@@ -2595,6 +2595,9 @@ dependencies = [
 name = "narf-firmware-smbios"
 version = "0.0.0"
 dependencies = [
+ "narf-boot",
+ "narf-console",
+ "narf-init",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
