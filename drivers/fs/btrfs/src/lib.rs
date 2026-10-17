@@ -25,6 +25,7 @@ use narf_driver_runtime::DomainId;
 use narf_filesystem::{FsError, FsInstance};
 
 pub mod allocator;
+pub(crate) mod block_group;
 pub mod btree;
 pub mod checksum;
 pub mod chunk;

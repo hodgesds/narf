@@ -1228,6 +1228,21 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let csum_type = superblock.csum_type;
         let read_only =
             read_only_requested || devices.values().any(|member| member.device.is_read_only());
+        // `btrfs_check_features`: unknown incompat bits were already refused
+        // by `Superblock::decode`. A compat_ro bit the writer does not maintain
+        // permits a read-only mount and refuses a read-write one.
+        if !read_only && superblock.compat_ro_unwritable() != 0 {
+            return Err(FsError::Unsupported);
+        }
+        // Linux's artificial dependency: block-group-tree requires no-holes
+        // and a valid free-space tree (`btrfs_check_features`,
+        // `btrfs_validate_super`).
+        if superblock.has_block_group_tree()
+            && (superblock.incompat_flags & format::INCOMPAT_NO_HOLES == 0
+                || superblock.compat_ro_flags & format::COMPAT_RO_FREE_SPACE_TREE_VALID == 0)
+        {
+            return Err(FsError::InvalidData);
+        }
 
         // Seed the chunk map so the chunk tree is reachable by logical address.
         let seed = ChunkMap::seed_from_sys_array(&superblock.sys_chunk_array)?;
@@ -1366,6 +1381,20 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             for (key, body) in &chunks {
                 g.chunk_map.insert_chunk_item(key.offset, body)?;
             }
+        }
+
+        // 1b. Block-group tree (`load_global_roots` for objectid 11): load its
+        //     root and cross-check every block group against its chunk, as
+        //     `btrfs_read_block_groups` does. Without the feature the items sit
+        //     in the extent tree and are read lazily by the writer.
+        if let crate::block_group::BgHome::BlockGroupTree { root, .. } =
+            crate::block_group::bg_home(self, root_tree).await?
+        {
+            let chunk_items: Vec<(u64, Vec<u8>)> = chunks
+                .iter()
+                .map(|(key, body)| (key.offset, body.clone()))
+                .collect();
+            crate::block_group::validate_block_groups(self, root, true, &chunk_items).await?;
         }
 
         // 2. Find the FS_TREE root item (5, ROOT_ITEM, *) in the root tree and
