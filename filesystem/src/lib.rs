@@ -849,6 +849,13 @@ pub enum FsError {
     ///
     /// Maps to POSIX `EAGAIN`/`EWOULDBLOCK`.
     WouldBlock,
+    /// The device gave up on the work after its timeout: a GPU job that
+    /// hung (Linux sets the job fence's error to `-ETIME`). Maps to `ETIME`.
+    TimedOut,
+    /// The work was abandoned without running to completion — a GPU job
+    /// queued behind one that hung, or any job of a context that caused a
+    /// hang (`-ECANCELED`). Maps to `ECANCELED`.
+    Canceled,
 }
 
 /// Type-erased owner retained for the lifetime of a shared device mapping.

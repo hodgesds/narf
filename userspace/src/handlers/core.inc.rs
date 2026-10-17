@@ -2008,6 +2008,8 @@ fn open_impl_reserved(
                         narf_filesystem::FsError::NoDeviceAddress => 6,
                         narf_filesystem::FsError::BadFd => 9,             // EBADF
                         narf_filesystem::FsError::WouldBlock => 11,       // EAGAIN
+                        narf_filesystem::FsError::TimedOut => 62,         // ETIME
+                        narf_filesystem::FsError::Canceled => 125,        // ECANCELED
                         narf_filesystem::FsError::NoSpace => 28,
                         narf_filesystem::FsError::NoDevice => 19, // ENODEV
                         narf_filesystem::FsError::OutOfMemory => 12,
@@ -4965,6 +4967,8 @@ fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::StreamSuspended => 86,
         narf_filesystem::FsError::NoDeviceAddress => 6,
         narf_filesystem::FsError::WouldBlock => EAGAIN,
+        narf_filesystem::FsError::TimedOut => 62,  // ETIME
+        narf_filesystem::FsError::Canceled => 125, // ECANCELED
     }
 }
 

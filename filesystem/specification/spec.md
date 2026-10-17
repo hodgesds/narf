@@ -388,6 +388,9 @@ An open file that is healthy but temporarily has no readable data returns
 layer maps `WouldBlock` to `EAGAIN` for `O_NONBLOCK` or parks and re-executes a
 blocking read. File operations do not expose a separate readiness predicate
 for callers to re-classify a zero-byte result.
+`FsError::TimedOut` (`ETIME`) and `FsError::Canceled` (`ECANCELED`) report
+device work that was given up on: a GPU job that hung its ring, and one
+abandoned behind such a job or submitted on a context that caused a hang.
 `poll_readiness_at` defaults to `poll_readiness`; offset-sensitive device
 descriptions such as `/dev/kmsg` override it so EOF is not reported readable.
 `llseek(offset, whence) -> Option<Result<u64, i64>>` defaults to `None`
