@@ -3536,6 +3536,14 @@ paths; only the tables differ.
   without a heap are buddy pages (SYSTEM|SNOOPED, identity IOMMU); a
   VRAM-only buffer on a full heap is `NoSpace`. `GemObject::{phys, gpu,
   system}` give the CPU-mapped address, the entry address and the kind.
+- PRIME (`drm_devfs_bridge::AmdgpuDmaBufFile`): `PRIME_HANDLE_TO_FD` on an
+  amdgpu card or render open exports a GEM buffer as a dma-buf that holds
+  it (pages outlive every handle while the fd or a mapping of it lives),
+  maps its frames (`GemObject::frames`) and answers `dma_buf_ioctl` against
+  the buffer's one shared reservation (`GemObject::dma_buf`).
+  `PRIME_FD_TO_HANDLE` on an open of the same card imports it as the handle
+  that open already has for the buffer or a new one (`GemState::import`);
+  another card's buffer is EINVAL (no foreign dma-buf attach yet).
 - Metadata (`amdgpu_gem`, `GEM_METADATA`): each `GemObject` keeps its
   tiling flags and an opaque blob of at most 256 bytes with its flags, so
   every handle to the buffer sees what its exporter set (SET; an empty blob

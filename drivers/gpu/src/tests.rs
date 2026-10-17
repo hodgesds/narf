@@ -13058,3 +13058,91 @@ kernel_test_in!(
     "drivers/gpu/amdgpu_gem",
     smoke_amdgpu_gem_mapping_outlives_gem_close
 );
+
+/// PRIME for amdgpu buffers: an export holds the buffer past GEM_CLOSE,
+/// maps its frames, and imports into another open of the same card as one
+/// handle (the same one on a second import), sharing the buffer and its
+/// reservation; another card's open refuses it.
+fn smoke_amdgpu_gem_prime_export_import() -> TestResult {
+    use crate::amdgpu_gem::{dispatch, GemState};
+    use crate::amdgpu_uapi as u;
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+    use narf_filesystem::FsError;
+    let card = 0x7ffe_0101;
+    let (exporter, importer, foreign) = (
+        GemState::for_card(card),
+        GemState::for_card(card),
+        GemState::for_card(card + 1),
+    );
+    let mut req = [0u8; 32];
+    req[0..8].copy_from_slice(&8192u64.to_le_bytes());
+    req[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        req.as_mut_ptr() as usize,
+        &exporter,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE");
+    }
+    let handle = u32::from_le_bytes(req[0..4].try_into().unwrap());
+    let Some(object) = exporter.object(handle) else {
+        return TestResult::Fail("setup: object");
+    };
+    let file = crate::drm_devfs_bridge::amdgpu_dma_buf_file(object.clone());
+    let weak = alloc::sync::Arc::downgrade(&object);
+    drop(object);
+    let mut close = [0u8; 8];
+    close[0..4].copy_from_slice(&handle.to_le_bytes());
+    if dispatch(0x09, close.as_mut_ptr() as usize, &exporter).is_err() || weak.upgrade().is_none() {
+        return TestResult::Fail("the dma-buf holds the buffer past GEM_CLOSE");
+    }
+    let Some(object) = weak.upgrade() else {
+        return TestResult::Fail("buffer");
+    };
+    if file.mmap_frames(4096, 4096) != Ok(alloc::vec![object.phys + 4096])
+        || file.mmap_frames(4096, 8192).is_ok()
+        || file.mmap_frames(100, 4096).is_ok()
+        || file.stat().size != 8192
+    {
+        return TestResult::Fail("dma-buf mmap frames");
+    }
+    if file
+        .as_any()
+        .and_then(|a| a.downcast_ref::<crate::drm_devfs_bridge::AmdgpuDmaBufFile>())
+        .is_none()
+    {
+        return TestResult::Fail("the dma-buf identifies its buffer");
+    }
+    let first = importer.import(&object);
+    let again = importer.import(&object);
+    let Ok(h) = first else {
+        return TestResult::Fail("import on the same card");
+    };
+    if again != Ok(h)
+        || !alloc::sync::Arc::ptr_eq(&importer.object(h).unwrap(), &object)
+        || !alloc::sync::Arc::ptr_eq(importer.object(h).unwrap().dma_buf(), object.dma_buf())
+    {
+        return TestResult::Fail("one handle sharing the buffer and its reservation");
+    }
+    if foreign.import(&object) != Err(FsError::InvalidData) {
+        return TestResult::Fail("import on another card");
+    }
+    drop(object);
+    drop(file);
+    // The importer's handle keeps it; closing that frees it.
+    if weak.upgrade().is_none() {
+        return TestResult::Fail("the importer's handle holds the buffer");
+    }
+    let mut close = [0u8; 8];
+    close[0..4].copy_from_slice(&h.to_le_bytes());
+    if dispatch(0x09, close.as_mut_ptr() as usize, &importer).is_err() || weak.upgrade().is_some() {
+        return TestResult::Fail("freed once every holder is gone");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_gem",
+    smoke_amdgpu_gem_prime_export_import
+);

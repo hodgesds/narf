@@ -183,6 +183,11 @@ pub struct GemObject {
     /// `GEM_METADATA`: what a DRI client tells its peer about the buffer,
     /// kept with the buffer so every handle to it sees the same.
     metadata: IrqSafeSpinLock<Metadata>,
+    /// The DRM card whose open created it (None outside a card).
+    card: Option<u32>,
+    /// The reservation and name every PRIME export of it shares, as Linux
+    /// keeps one dma_buf per GEM object.
+    dma_buf: Arc<narf_filesystem::dma_buf::DmaBufObject>,
 }
 
 /// `amdgpu_bo_user`'s tiling flags and opaque metadata blob.
@@ -225,6 +230,34 @@ impl GemObject {
         // SAFETY: as `load_u64`.
         unsafe { core::ptr::write_volatile(at.cast::<[u8; 8]>(), value.to_le_bytes()) };
         Some(())
+    }
+
+    /// The DRM card whose open created the buffer.
+    pub fn card(&self) -> Option<u32> {
+        self.card
+    }
+
+    /// The reservation and name its PRIME exports share.
+    pub fn dma_buf(&self) -> &Arc<narf_filesystem::dma_buf::DmaBufObject> {
+        &self.dma_buf
+    }
+
+    /// The physical frames backing `len` bytes from byte `offset`, both
+    /// page aligned and inside the buffer, for a CPU mapping.
+    pub fn frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
+        let len = len as u64;
+        if offset % PAGE_SIZE != 0
+            || len == 0
+            || len % PAGE_SIZE != 0
+            || offset
+                .checked_add(len)
+                .is_none_or(|end| end > self.byte_len)
+        {
+            return Err(FsError::InvalidData);
+        }
+        Ok((0..len / PAGE_SIZE)
+            .map(|i| self.phys + offset + i * PAGE_SIZE)
+            .collect())
     }
 
     /// Where the buffer lives: `AMDGPU_GEM_DOMAIN_VRAM` or `_GTT`.
@@ -285,6 +318,10 @@ impl GemState {
     }
 
     fn insert(&self, object: GemObject) -> Result<u32, FsError> {
+        self.insert_shared(Arc::new(object))
+    }
+
+    fn insert_shared(&self, object: Arc<GemObject>) -> Result<u32, FsError> {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         // Wrapping back into the dumb-handle space would make two different
         // objects answer to one number. Refuse instead.
@@ -292,9 +329,26 @@ impl GemState {
             return Err(FsError::NoSpace);
         }
         let mut g = self.objects.lock();
-        g.get_or_insert_with(BTreeMap::new)
-            .insert(handle, Arc::new(object));
+        g.get_or_insert_with(BTreeMap::new).insert(handle, object);
         Ok(handle)
+    }
+
+    /// `drm_gem_prime_fd_to_handle` for a buffer another open of the same
+    /// card exported: the handle this open already has for it, or a new
+    /// one. A buffer of another card is refused (`InvalidData`).
+    pub fn import(&self, object: &Arc<GemObject>) -> Result<u32, FsError> {
+        if object.card != self.card {
+            return Err(FsError::InvalidData);
+        }
+        let existing = self.objects.lock().as_ref().and_then(|m| {
+            m.iter()
+                .find(|(_, o)| Arc::ptr_eq(o, object))
+                .map(|(h, _)| *h)
+        });
+        match existing {
+            Some(handle) => Ok(handle),
+            None => self.insert_shared(Arc::clone(object)),
+        }
     }
 
     fn get(&self, handle: u32) -> Option<Arc<GemObject>> {
@@ -435,6 +489,8 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
                 preferred_domains: domains,
                 flags,
                 metadata: IrqSafeSpinLock::new(Metadata::default()),
+                card: state.card,
+                dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
             }
         }
         None if domains & (uapi::AMDGPU_GEM_DOMAIN_GTT | uapi::AMDGPU_GEM_DOMAIN_CPU) as u64
@@ -471,6 +527,8 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
                 preferred_domains: domains,
                 flags,
                 metadata: IrqSafeSpinLock::new(Metadata::default()),
+                card: state.card,
+                dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
             }
         }
     };
