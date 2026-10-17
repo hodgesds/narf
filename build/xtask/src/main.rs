@@ -1410,6 +1410,7 @@ impl Arch {
                 let append = [
                     std::env::var("XTASK_QEMU_APPEND").unwrap_or_default(),
                     extra_bootargs.to_string(),
+                    btrfs_smoke_bootarg().to_string(),
                 ]
                 .into_iter()
                 .filter(|value| !value.is_empty())
@@ -1616,6 +1617,7 @@ impl Arch {
                 let append = [
                     std::env::var("XTASK_QEMU_APPEND").unwrap_or_default(),
                     extra_bootargs.to_string(),
+                    btrfs_smoke_bootarg().to_string(),
                 ]
                 .into_iter()
                 .filter(|value| !value.is_empty())
@@ -2167,6 +2169,17 @@ fn verify_btrfs_write_interop() -> Result<()> {
     } else {
         eprintln!("{combined}");
         bail!("`btrfs check` reported errors on the NARF-written image (write-interop regression)");
+    }
+}
+
+/// The kernel's btrfs read/write smokes mutate whichever btrfs volume they
+/// find, so they run only with `narf.btrfs_smoke`, which xtask passes solely
+/// when it serves its own disposable `narf-nvme-btrfs.img` on nvme0.
+fn btrfs_smoke_bootarg() -> &'static str {
+    if KERNEL_TEST_DISK.load(std::sync::atomic::Ordering::Relaxed) {
+        "narf.btrfs_smoke"
+    } else {
+        ""
     }
 }
 
