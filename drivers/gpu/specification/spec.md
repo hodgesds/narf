@@ -3881,6 +3881,30 @@ TPS1–4, passthrough/video idle, `link_encoder_disable`; MSA, VSC SDP via VPG,
 `Transmitter { action, transmitter, mode, lanes, hpd, connector, symbol_khz }`
 marshals v1.6/v1.7 (SETUP_VSEMPH via `Tables::transmitter_lane`, HPO 0).
 
+HDMI 2.0 on DCN3.0 (m5hdmi): `hdmi::stream_for(edid, &timing, max_bpc,
+limited, Limits { hdmi6g, max_phy_khz }) -> Option<Stream>` chooses amdgpu_dm's
+format (4:2:0-only modes as 4:2:0; else RGB at the deepest declared depth up to
+`amdgpu.max_bpc`, 2-bpc step-down; else 4:2:0-also) against
+`dcn10_link_encoder_validate_hdmi_output` (600 MHz, HDMI_6GB_EN from
+`amdgpu_dcn_inventory::encoder_caps`) and DML30's `min(600, PHYCLK)`.
+`Stream { format: Format { depth, ycbcr420, limited }, pixel_khz,
+character_100hz, character_khz, scramble: Scramble::{Off, LowRate, Above340},
+scdc, avi, vendor }` carries the halved TMDS pixel clock, `phy_pix_clk`, the
+scrambling decision (> 340 MHz, or LTE_340Mcsc) and the AVI/HDMI-VIC vendor
+InfoFrames. `write_scdc_data(ddc, &stream)` (Sink/Source_Version, TMDS_Config
+0/1/3; fails only a scrambled stream), `read_scdc_data` and
+`write_scdc_legacy(ddc, scdc_present)` (disable/unplug, best effort) speak SCDC
+over `dp::Aux::scdc_read/scdc_write` (default: unsupported;
+`DisplayAux` implements them on the HDMI connector's I2C engine at 0x54).
+`Hdmi::hdmi_stream_attribute(&stream)` programs depth/scrambler/1/4 clock rate,
+`hdmi_info_packets(&stream)` sends AVI (packet 0) and vendor (packet 1) in
+Linux's order; a VPG conflict that never clears is logged, not fatal.
+`unsafe hdmi::Formatter::new(gpu, cap, pipe)` owns the pipe's FMT (dynamic
+expansion, SPATIAL8/10 dither, full-range clamp, 4:2:0 subsampling), OTG 4:2:0
+container (OPTC_DATA_FORMAT, H_TIMING_DIV_MODE), MPC OCSC (sRGB / sRGB limited /
+YCbCr709, coefficient set A) and DPG black. `Pipeline::hdmi_output()` exposes
+the admitted stream to the unplug path.
+
 `amdgpu_navi22_modeset::Resources::acquire(&connector)` is the DCN3.0 pool:
 first free pipe, the preferred DIG FE (= transmitter) or else the last free
 one, `dc_resource_find_first_free_pll` for TMDS, the DP DTO for DP.

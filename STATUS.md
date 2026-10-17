@@ -1021,6 +1021,13 @@ flips completed from EARLIEST_INUSE (pflip/vupdate IH sources armed), a
 256x256 DCN3.0 cursor (opt-in), KMS on the amdgpu card (DP-1..3, HDMI-A-1;
 DML30-admitted modes, SETCRTC/atomic/TEST_ONLY, disable, vblank, flip
 events) and a monitor that relights after GPU recovery. Register models only.
+Navi22 HDMI 2.0 (`amdgpu_dcn30_hdmi`): TMDS above 340 MHz scrambles (1/4
+clock channel) after Linux's `write_scdc_data` (SCDC over native DDC; legacy
+TMDS_Config 0 on every SCDC sink at enable and disable/unplug), opt-in 10/12-bpc
+deep colour (`amdgpu.max_bpc`, FMT SPATIAL8/10 dither), YCbCr 4:2:0 for
+Y420VDB/CMDB modes (OTG container, FMT, YCbCr709 OCSC, DPG black), Broadcast
+RGB limited (OCSC), CTA VIC/HDMI-VIC vendor InfoFrames and HDMI_6GB_EN from the
+VBIOS encoder caps. Register/DDC models only.
 For bare-metal runs, `cargo xtask usb-image` builds a UEFI stick whose kernel
 appends its log to `/narf-boot-<n>.log` on that stick (`narf.bootlog=`,
 marker-gated, USB-only, bounded); a secondary card's cold boot keeps the iGPU
