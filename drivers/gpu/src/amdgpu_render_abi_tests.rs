@@ -164,7 +164,7 @@ fn render_abi_metadata_mmap_layout_and_prime_identity() -> TestResult {
         &a,
     );
     // An importer sees the same object and its metadata.
-    let imported = b.import(a.object(h).unwrap());
+    let imported = b.import(&a.object(h).unwrap());
     let ih = match imported {
         Ok(ih) => ih,
         Err(_) => return TestResult::Fail("PRIME import"),
@@ -185,7 +185,7 @@ fn render_abi_metadata_mmap_layout_and_prime_identity() -> TestResult {
         || got.is_err()
         || u64::from_le_bytes(get[16..24].try_into().unwrap()) != 0x1234_5678
         || &get[28..36] != b"umd-data"
-        || b.import(a.object(h).unwrap()) != Ok(ih)
+        || b.import(&a.object(h).unwrap()) != Ok(ih)
         || !alloc::sync::Arc::ptr_eq(&b.object(ih).unwrap(), &a.object(h).unwrap())
         || dispatch(
             amd(uapi::DRM_AMDGPU_GEM_METADATA),

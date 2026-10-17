@@ -16,6 +16,9 @@ struct Fake {
     broadcast: u32,
     memory: Vec<u32>,
     writes: Vec<(u32, u64, u32)>,
+    /// SH_MEM_CONFIG / SH_MEM_BASES by the GRBM selection they were written
+    /// under.
+    sh_mem: BTreeMap<(u32, u64), u32>,
     busy: Option<(u32, u64)>,
     dirty: bool,
     refuse: Option<u64>,
@@ -60,7 +63,13 @@ impl Io for Fake {
                 return;
             }
             0x14f48 | 0x15094 | 0x4b864 => assert_eq!(self.broadcast, 0xe0000000),
-            0x42790 | 0x17828 | 0x17938 | 0x177ac => assert_eq!(self.index, 0),
+            0x42790 | 0x4278c => {
+                // Only a VMID is selected: ME, pipe and queue 0.
+                assert_eq!(self.index & !0xf0, 0);
+                assert!(at == 0x42790 || self.index != 0, "VMID0 keeps its bases");
+                self.sh_mem.insert((self.index >> 4, at), v);
+            }
+            0x17828 | 0x17938 | 0x177ac => assert_eq!(self.index, 0),
             0x4261c | 0x42620 | 0x42624 | 0x53200 | 0x4a410 | 0x4200c => {
                 assert!(!self.dirty, "RLC pointer published before flush");
                 assert_eq!(self.memory[0], 6);
@@ -115,6 +124,7 @@ fn fixture(revision: u8) -> (Pool, Engine<Fake>) {
             broadcast: 0x12345678,
             memory: vec![u32::MAX; 1024],
             writes: Vec::new(),
+            sh_mem: BTreeMap::new(),
             busy: None,
             dirty: false,
             refuse: None,
@@ -149,6 +159,15 @@ fn gfx12_setup_builds_linux_clearstate_and_preserves_controls() -> TestResult {
         assert_eq!(run(e.initialize()), Ok(want));
         assert_eq!(e.report, Some(want));
         assert_eq!(e.state, State::Ready);
+        // VMIDs 0-7: DEFAULT_SH_MEM_CONFIG; 1-7 also the apertures.
+        let mut sh_mem = BTreeMap::new();
+        for vmid in 0..8 {
+            sh_mem.insert((vmid, 0x42790), 0xc00c);
+            if vmid != 0 {
+                sh_mem.insert((vmid, 0x4278c), 0x2000_1000);
+            }
+        }
+        assert_eq!(e.io.sh_mem, sh_mem);
         let r = &e.io.regs;
         assert_eq!(
             r[&0x14f48],
@@ -176,7 +195,6 @@ fn gfx12_setup_builds_linux_clearstate_and_preserves_controls() -> TestResult {
         );
         assert_eq!(r[&0x13680], 0x123450ff);
         assert_eq!(r[&0x14eec], 0xa5a5a5a5);
-        assert_eq!(r[&0x42790], 0xc00c);
         assert_eq!(r[&0x17828], 0x40000001);
         assert_eq!(r[&0x17938], 7);
         assert_eq!(r[&0x177ac], 1);

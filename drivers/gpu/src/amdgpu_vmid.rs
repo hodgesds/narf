@@ -378,6 +378,153 @@ impl VmidPool {
     }
 }
 
+// ── Per-ring VMID grab (amdgpu_vmid_grab) ───────────────────────
+
+/// Rings a `VmidManager` tracks jobs on (ticket ring indices, the high
+/// 32 bits of a ticket as `amdgpu_cs` names jobs).
+pub const GRAB_RINGS: usize = 4;
+
+/// One VMID as `amdgpu_vmid` tracks it for job submission.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GrabId {
+    /// The address space (`VmState::owner`) that last used it; 0 none.
+    owner: u64,
+    /// The page directory its context was last pointed at.
+    pd_addr: u64,
+    /// The owner's TLB sequence at its last flush.
+    flushed_updates: u64,
+    /// The job that last flushed it (0: never, or a flush is pending
+    /// assignment).
+    last_flush: u64,
+    /// The PASID the IH LUT maps it to, and the job that wrote that.
+    pasid: Pasid,
+    pasid_mapping: u64,
+    /// The last job using it on each ring (0: none).
+    active: [u64; GRAB_RINGS],
+}
+
+/// What a submission was granted: the VMID, whether its job must flush the
+/// VM (pointing the context at `pd_addr` and invalidating the TLB) and
+/// whether it must rewrite the IH LUT entry for its PASID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Grant {
+    pub vmid: u8,
+    pub needs_flush: bool,
+    pub map_pasid: bool,
+}
+
+/// A submission's view of its address space, for `VmidManager::grab`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GrabRequest {
+    /// `VmState::owner`.
+    pub owner: u64,
+    pub pd_addr: u64,
+    /// `VmState::tlb_seq`.
+    pub tlb_seq: u64,
+    pub pasid: Pasid,
+    /// The ring index the job runs on.
+    pub ring: u32,
+}
+
+/// `amdgpu_vmid_grab` for one hub with concurrent flushes (every GFX10+
+/// part but Navi10/14): VMIDs `first..last` of the hub, in LRU order.
+///
+/// A submission first needs some idle VMID — one with no unfinished job
+/// on any ring — or it waits, so a busy client cannot starve the others.
+/// It then reuses the most recent VMID its own address space used at the
+/// same page directory, flushing only if the space removed mappings since
+/// that VMID's flush or that flush ran on another ring and has not
+/// completed; otherwise it takes the idle VMID and flushes. The LUT entry
+/// is rewritten when the VMID last mapped another PASID or that write is
+/// still pending on another ring.
+///
+/// `grab` decides without changing anything; `commit` records the job once
+/// the ring accepted it, so a refused submission leaves no trace.
+#[derive(Clone, Debug)]
+pub struct VmidManager {
+    first: u8,
+    ids: Vec<GrabId>,
+    /// VMID indices into `ids`, least recently used first.
+    lru: Vec<u8>,
+}
+
+impl VmidManager {
+    /// VMIDs `first..=last` on one hub.
+    pub fn new(first: u8, last: u8) -> Self {
+        let count = usize::from(last.saturating_sub(first)) + 1;
+        Self {
+            first,
+            ids: alloc::vec![GrabId::default(); count],
+            lru: (0..count as u8).collect(),
+        }
+    }
+
+    /// Whether `ticket` belongs to `ring` and needs nothing from another
+    /// ring: same-ring jobs run in order, so they never block.
+    fn settled(ticket: u64, ring: u32, done: &dyn Fn(u64) -> bool) -> bool {
+        ticket == 0 || (ticket >> 32) as u32 == ring || done(ticket)
+    }
+
+    /// The grant for `req`, or None to wait for a running job. `done`
+    /// reports whether a ticket has completed.
+    pub fn grab(&self, req: GrabRequest, done: &dyn Fn(u64) -> bool) -> Option<Grant> {
+        // amdgpu_vmid_grab_idle: with concurrent flushes, idle means no
+        // unfinished job on any ring (most recently used first).
+        let idle = self.lru.iter().rev().copied().find(|&i| {
+            self.ids[usize::from(i)]
+                .active
+                .iter()
+                .all(|&t| t == 0 || done(t))
+        })?;
+        // amdgpu_vmid_grab_used.
+        let used = self.lru.iter().rev().copied().find(|&i| {
+            let id = &self.ids[usize::from(i)];
+            id.owner == req.owner && id.pd_addr == req.pd_addr
+        });
+        let (index, needs_flush) = match used {
+            Some(i) => {
+                let id = &self.ids[usize::from(i)];
+                let flush = id.last_flush == 0
+                    || !Self::settled(id.last_flush, req.ring, done)
+                    || id.flushed_updates < req.tlb_seq;
+                (i, flush)
+            }
+            None => (idle, true),
+        };
+        let id = &self.ids[usize::from(index)];
+        let map_pasid = needs_flush
+            || id.pasid != req.pasid
+            || id.pasid_mapping == 0
+            || !Self::settled(id.pasid_mapping, req.ring, done);
+        Some(Grant {
+            vmid: self.first + index,
+            needs_flush,
+            map_pasid,
+        })
+    }
+
+    /// Record that job `ticket` runs `req` under `grant` (from `grab`).
+    pub fn commit(&mut self, req: GrabRequest, grant: Grant, ticket: u64) {
+        let index = grant.vmid - self.first;
+        let Some(id) = self.ids.get_mut(usize::from(index)) else {
+            return;
+        };
+        if grant.needs_flush {
+            id.flushed_updates = req.tlb_seq;
+            id.last_flush = ticket;
+        }
+        if grant.map_pasid {
+            id.pasid = req.pasid;
+            id.pasid_mapping = ticket;
+        }
+        id.owner = req.owner;
+        id.pd_addr = req.pd_addr;
+        id.active[(ticket >> 32) as usize % GRAB_RINGS] = ticket;
+        self.lru.retain(|&i| i != index);
+        self.lru.push(index);
+    }
+}
+
 // ── Smoke tests ──────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]

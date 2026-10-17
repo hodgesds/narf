@@ -31,6 +31,12 @@ struct Fake {
     job_writes: Vec<(u32, u32)>,
     job_waits: Vec<(u32, u32, u32, u32, u32)>,
     job_syncs: u32,
+    /// Pipeline syncs: (fence address, sequence waited for).
+    job_pipeline_syncs: Vec<(u64, u32)>,
+    /// CONTEXT_CONTROL load words, graphics jobs only.
+    job_context_controls: Vec<u32>,
+    /// ACQUIRE_MEM cache flushes.
+    job_mem_syncs: u32,
     job_ibs: Vec<(u64, u32)>,
 }
 impl Fake {
@@ -56,6 +62,19 @@ impl Fake {
                         assert_eq!(words[3], 0);
                         self.job_writes.push((words[2], words[4]));
                     }
+                    0x3c if words[1] & 0x10 != 0 => {
+                        // A pipeline sync: on the ring's own engine, equal,
+                        // the whole fence word, poll interval 4.
+                        let pfp = if pipe == 0 { 0x100 } else { 0 };
+                        assert_eq!(
+                            (length, words[1], words[5], words[6]),
+                            (7, 0x13 | pfp, !0, 4)
+                        );
+                        let address = u64::from(words[2]) | u64::from(words[3]) << 32;
+                        // Jobs run to completion here, so the wait is met.
+                        assert_eq!(self.memory[((address - GPU) / 4) as usize], words[4]);
+                        self.job_pipeline_syncs.push((address, words[4]));
+                    }
                     0x3c => {
                         assert_eq!((length, words[6]), (7, 0x20));
                         self.job_waits
@@ -64,6 +83,14 @@ impl Fake {
                     0x42 => {
                         assert_eq!((length, words[1]), (2, 0));
                         self.job_syncs += 1;
+                    }
+                    0x28 => {
+                        assert_eq!((pipe, length, words[2]), (0, 3, 0), "graphics only");
+                        self.job_context_controls.push(words[1]);
+                    }
+                    0x58 => {
+                        assert_eq!(words[1..length], [0, !0, 0xff_ffff, 0, 0, 10, 0xc3b1]);
+                        self.job_mem_syncs += 1;
                     }
                     0x3f => {
                         assert_eq!(length, 4);
@@ -283,6 +310,9 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
             job_writes: Vec::new(),
             job_waits: Vec::new(),
             job_syncs: 0,
+            job_pipeline_syncs: Vec::new(),
+            job_context_controls: Vec::new(),
+            job_mem_syncs: 0,
             job_ibs: Vec::new(),
         },
         authority: Cap::bootstrap(),
@@ -682,18 +712,28 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
         ]
         || e.io.job_waits != [(gc + 0x1647, gc + 0x1659, 0x00f8_0008, 8, 0x143)]
         || e.io.job_syncs != 1
+        || e.io.job_pipeline_syncs != [(GPU + 10496, 0)]
+        || e.io.job_context_controls != [0x8101_8003]
+        || e.io.job_mem_syncs != 0
         || e.io.job_ibs != [(0x2_0000_1000, 64 | 3 << 24)]
         || e.io.memory[2562] != 768
     {
         return TestResult::Fail("first job's packets");
     }
     // Four more wrap the ring (slots at 768, 0, 256, 512).
+    // Job 3 follows the same context: CONTEXT_CONTROL only enables loads.
     for seq in 2..=5 {
-        if e.submit(Pipe::Graphics, Job { vmid: 5, ..job }) != Ok(seq)
-            || e.completed_job(Pipe::Graphics) != Ok(seq)
-        {
+        let next = Job {
+            vmid: 5,
+            ctx_switch: seq != 3,
+            ..job
+        };
+        if e.submit(Pipe::Graphics, next) != Ok(seq) || e.completed_job(Pipe::Graphics) != Ok(seq) {
             return TestResult::Fail("wrapped jobs");
         }
+    }
+    if e.io.job_context_controls[2] != 0x8000_0000 || e.io.job_context_controls[3] != 0x8101_8003 {
+        return TestResult::Fail("CONTEXT_CONTROL without a context switch");
     }
     if Job::new(3, 1, 0, &[(0, 1); 9]).is_some() {
         return TestResult::Fail("more IBs than a slot holds");
@@ -737,8 +777,39 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
         || e.io.job_waits.last() != Some(&(gc + 0x1648, gc + 0x165a, 0x00f8_0004, 4, 0x43))
         || e.io.job_ibs.last() != Some(&(0x2_0000_4000, 8 | 1 << 23 | 2 << 24))
         || e.io.memory[3072 + 2562] != 768
+        || e.io.job_pipeline_syncs.last() != Some(&(GPU + 12288 + 10496, 0))
     {
         return TestResult::Fail("compute job");
+    }
+    // A reused VMID: no flush and no LUT write, only the IB and fence.
+    let (writes, waits) = (e.io.job_writes.len(), e.io.job_waits.len());
+    let pipeline_syncs = e.io.job_pipeline_syncs.len();
+    let reused = Job {
+        flush: false,
+        map_pasid: false,
+        ..compute
+    };
+    if e.submit(Pipe::Compute, reused) != Ok(2)
+        || e.completed_job(Pipe::Compute) != Ok(2)
+        || e.io.job_writes.len() != writes
+        || e.io.job_waits.len() != waits
+        || e.io.job_pipeline_syncs.len() != pipeline_syncs
+        || e.io.job_ibs.last() != Some(&(0x2_0000_4000, 8 | 1 << 23 | 2 << 24))
+    {
+        return TestResult::Fail("job on a reused VMID");
+    }
+    // A memory sync: ACQUIRE_MEM before the IB; compute has no
+    // CONTEXT_CONTROL.
+    let controls = e.io.job_context_controls.len();
+    let synced = Job {
+        mem_sync: true,
+        ..reused
+    };
+    if e.submit(Pipe::Compute, synced) != Ok(3)
+        || e.io.job_mem_syncs != 1
+        || e.io.job_context_controls.len() != controls
+    {
+        return TestResult::Fail("memory sync");
     }
     // With the CP stalled, four slots fill and a fifth is refused.
     e.io.complete = false;

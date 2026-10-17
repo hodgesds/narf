@@ -2511,8 +2511,10 @@ After RS64, restricted power, GMC and the SDMA proof, `unsafe initialize().await
 requires inactive CP/MES queues and applies GC12 golden settings. It reads the
 ASIC strap using the NBIO7.7 or NBIF6.3.1 offset; revision-zero workarounds do
 not affect later revisions. Shader-engine broadcast and queue/VMID selectors
-are restored on every exit. Constants configure VMID0 shader access, the
-single graphics pipe, eight hardware contexts and disabled GUI-idle IRQs.
+are restored on every exit. Constants configure shader access for every
+graphics VMID (0–7: DEFAULT_SH_MEM_CONFIG; 1–7 also SH_MEM_BASES with
+gmc_v12_0's private/shared apertures), the single graphics pipe, eight
+hardware contexts and disabled GUI-idle IRQs.
 The RLC image contains the six GC12 clusters (75 dwords), checked independently
 against Linux's clear-state table by `tests/gfx12_clearstate.c`. Publication
 retains the page through cancellation/failure; the driver programs CSIB and
@@ -3653,11 +3655,16 @@ seq`; tickets of an earlier recovery epoch read as complete. Fences are read
 by `amdgpu_cp_navi22::FenceReader` (`ColdBoot::client_fence_reader`) without
 the owner. `unregister` runs at the start of recovery.
 
-Generic additions used by it: `amdgpu_cs` accepts the `FENCE` chunk
-(`Submission::user_fence`; `retire` writes the job's ticket to the BO);
-`amdgpu_gem` answers `GEM_METADATA`, `GemState::{import, mmap_owner}`,
-`GemObject::write_u64`, and `GEM_MMAP` returns its offset at byte 0 of the
-8-byte union; amdgpu GEM objects export/import as PRIME dma-bufs;
+Generic paths it uses (shared with Navi48): the `FENCE` chunk
+(`Submission::user_fence`, written with the job's ticket when `retire` frees
+it), `GEM_METADATA`, PRIME export/import of amdgpu GEM objects
+(`AmdgpuDmaBufFile`, `GemState::import`), CPU-mapped GEM lifetime
+(`GemState::mapping_object`) and implicit sync on `BO_HANDLES`-listed
+buffers, whose fence contexts are the Navi 22 ticket ring indices.
+`HW_IP_INFO` keeps the Navi 22 multi-ring mask (`amdgpu_info_navi22`) while
+the card's submitter serves the IP, and reports 0 otherwise. Navi 22 keeps
+one client VMID flushed per job rather than `amdgpu_vmid` reuse.
+`GEM_MMAP` returns its offset at byte 0 of the 8-byte union;
 `drm_ioctl_bridge::{get_client, without_kms}` answer `GET_CLIENT` on primary
 nodes and `VERSION`/`GET_CAP` on amdgpu nodes without KMS state;
 `SYNCOBJ_WAIT` returns `-ETIME` on timeout and `-EINVAL` for an unsubmitted
@@ -4406,9 +4413,25 @@ paths; only the tables differ.
   without a heap are buddy pages (SYSTEM|SNOOPED, identity IOMMU); a
   VRAM-only buffer on a full heap is `NoSpace`. `GemObject::{phys, gpu,
   system}` give the CPU-mapped address, the entry address and the kind.
+- PRIME (`drm_devfs_bridge::AmdgpuDmaBufFile`): `PRIME_HANDLE_TO_FD` on an
+  amdgpu card or render open exports a GEM buffer as a dma-buf that holds
+  it (pages outlive every handle while the fd or a mapping of it lives),
+  maps its frames (`GemObject::frames`) and answers `dma_buf_ioctl` against
+  the buffer's one shared reservation (`GemObject::dma_buf`).
+  `PRIME_FD_TO_HANDLE` on an open of the same card imports it as the handle
+  that open already has for the buffer or a new one (`GemState::import`);
+  another card's buffer is EINVAL (no foreign dma-buf attach yet).
+- Metadata (`amdgpu_gem`, `GEM_METADATA`): each `GemObject` keeps its
+  tiling flags and an opaque blob of at most 256 bytes with its flags, so
+  every handle to the buffer sees what its exporter set (SET; an empty blob
+  clears the blob and keeps its flags) and GET returns them, leaving the
+  rest of `data` as passed. Unknown ops succeed doing nothing and unknown
+  handles are ENOENT, as amdgpu_gem_metadata_ioctl. `GemObject::load_u64` /
+  `store_u64` read and write 8 bytes through the kernel's own mapping.
 - Lifetimes: each VA mapping record holds its buffer (`Arc<GemObject>`, as
   `amdgpu_bo_va` holds its BO), so `GEM_CLOSE` cannot free pages the tables
-  still point at. CLEAR and REPLACE split partly covered mappings
+  still point at; a CPU mapping holds it too (`GemState::mapping_object`,
+  the card and render nodes' `mmap_lifetime`), as a VMA holds its object. CLEAR and REPLACE split partly covered mappings
   (`amdgpu_vm_bo_clear_mappings`): the remainders keep their records,
   offsets and entries; only the covered range's entries are cleared.
   Once a job ran in an address space (`VmState::note_job`), what it drops —
@@ -4423,22 +4446,26 @@ paths; only the tables differ.
   `AMDGPU_CS` and returns the engine's sequence as the handle, and
   `AMDGPU_WAIT_CS` parks until it completes or the client's absolute
   monotonic deadline passes (status 0/1). `AMDGPU_GEM_WAIT_IDLE` there
-  waits for the open's last job (`VmState::last_job`; a buffer another
-  process uses through PRIME is not covered) and reports the buffer's
-  preferred domains. `dispatch_async` notes every submitted job on its
+  waits for the open's last jobs (`VmState::last_jobs`) and the buffer's
+  reservation fences (any open's jobs that listed it) and reports the
+  buffer's preferred domains. `dispatch_async` notes every submitted job on its
   address space. `AMDGPU_CHUNK_ID_SYNCOBJ_IN`/`_OUT` and `BO_HANDLES` are
   accepted: in-syncobjs must hold a fence (EINVAL without, ENOENT unknown)
   and are waited for before queueing — the ioctl waits, where Linux's
   scheduler would hold the job; out-syncobjs get the job's `JobFence`
   (signalled through `Submitter::signalled`); every listed BO must be the
-  open's (ENOENT), with no residency or implicit sync. amdgpu opens now
+  open's (ENOENT), with no residency. Implicit sync (amdgpu_cs_sync_rings /
+  amdgpu_cs_submit): before queueing, the ioctl waits for every unsignalled
+  fence on each listed BO's reservation (`GemObject::dma_buf`) except the
+  target ring's own (`JobFence` context: card << 32 | ring) and except on
+  `EXPLICIT_SYNC` buffers; the job then becomes each listed BO's WRITE
+  fence. amdgpu opens now
   route the DRM syncobj ioctls (0xbf..=0xc5) to their own table
   (`drm_ioctl_bridge::dispatch_syncobj`). `DEPENDENCIES` name a context
   the open owns (EINVAL otherwise) on the engine's ring (others
   `Unsupported`) and are waited for before queueing; `SCHEDULED_DEPENDENCIES`
   are validated only, as every earlier job of the single in-order ring is
-  already scheduled. Timeline syncobjs and `FENCE` chunks are still
-  refused. Without a submitter, CS parses and is refused as before
+  already scheduled. Timeline syncobjs are still refused. Without a submitter, CS parses and is refused as before
   and GEM_WAIT_IDLE reports idle. `pm4::Pm4Builder::vm_flush` builds the in-ring VM flush
   (shared by GMC 11 and 12).
 
@@ -4447,17 +4474,28 @@ index in its high 32 bits (`Submitter::ring_for` maps an IP/ring to it).
 An address space keeps its last ticket per ring (`VmState::last_jobs`); a
 deferred free waits for all of them, and GEM_WAIT_IDLE for each.
 Dependencies must name a ring the engine serves and a handle of that ring.
+A `FENCE` chunk (`Submission::user_fence`: handle, offset) names a
+one-page GEM buffer of the open with the 8 bytes at `offset` inside it
+(EINVAL otherwise, as amdgpu_cs_p1_user_fence); the job's handle is stored
+there by the CPU when a fence read retires the job (`GemObject::store_u64`
+through `defer_until`), never replacing a newer handle of the same ring.
 
 The Navi48 platform registers both kernel queues as its card's submitter
 after boot: up to eight IBs per submission (`Job::new`, in order in one
 slot), all for the graphics ring or all for the compute ring
 (`Queues::submit(Pipe, Job)`; the compute frame writes registers without
 the PFP, skips PFP_SYNC_ME, flushes on invalidation engine 1 and marks IBs
-`INDIRECT_BUFFER_VALID`), run on client VMID 1 with the
+`INDIRECT_BUFFER_VALID`), run on a GFX hub VMID from 1–7 with the
 open's root page directory (`VmState::root_pde`, GMC 12 only), through
-`amdgpu_gfx12_queue::Queues::submit` — one 256-dword ring slot of VM flush
-(GFX hub, engine 0, PFP_SYNC_ME), IB and interrupting RELEASE_MEM fence;
-`Busy` when the 1024-dword ring is full. Each job also maps VMID 1 to its
+`amdgpu_gfx12_queue::Queues::submit` — one 256-dword ring slot of pipeline
+sync (wait for the ring's previous fence) and VM flush (GFX hub, the ring's
+engine, PFP_SYNC_ME) when the grant asks for a flush, the LUT write, an
+ACQUIRE_MEM when the first IB carries `AMDGPU_IB_FLAG_EMIT_MEM_SYNC`
+(`Job::mem_sync`; GCR_REQ on SDMA), CONTEXT_CONTROL on the graphics ring
+(state reloads when `Job::ctx_switch`: the ring's previous job came from
+another `(owner, ctx_id)`, Linux's scheduler entity), IBs and an
+interrupting RELEASE_MEM fence;
+`Busy` when the 1024-dword ring is full. A job also maps its VMID to its
 open's PASID in the IH VMID LUT (OSSSYS `IH_VMID_0_LUT + vmid`, after the
 flush, as gmc_v12_0_emit_pasid_mapping), so a fault carries the client's
 PASID; `VmState::pasid` allocates one per address space
@@ -4468,8 +4506,33 @@ the IV's PASID (`amdgpu_vmid::record_fault`: address from the IV, the hub's
 protection-fault status, GFX 0 / MM 1; a zero status never replaces a
 useful one; faults for freed PASIDs are dropped), and
 `AMDGPU_INFO_GPUVM_FAULT` (`amdgpu_info::dispatch_for`) answers from the
-open's PASID. VMID reuse is not implemented, and `AMDGPU_INFO` still
-reports acceleration unavailable.
+open's PASID. `AMDGPU_INFO` still reports acceleration unavailable, while
+`HW_IP_INFO`'s `available_rings` reports bit 0 for each IP whose ring 0
+the open's card's submitter serves (`amdgpu_info::available_rings`).
+
+`amdgpu_vmid::VmidManager` grants VMIDs as amdgpu_vmid_grab does with
+concurrent flushes: `grab(GrabRequest { owner, pd_addr, tlb_seq, pasid,
+ring }, done)` returns a `Grant { vmid, needs_flush, map_pasid }` or None
+to wait. A submission needs some VMID with no unfinished job on any ring;
+it then reuses the most recent VMID its own space (`VmState::owner`, a
+never-reused identity) used at the same page directory, flushing only if
+`VmState::tlb_seq` (bumped whenever a mapping is removed) passed that
+VMID's last flush or that flush is pending on another ring, and otherwise
+takes the idle VMID and flushes. The LUT entry is rewritten when the VMID
+mapped another PASID or that write is pending on another ring. `commit`
+records the job once the ring accepted it. Navi48 grants VMIDs 1–7 (8–15
+are KFD's, first_kfd_vmid) and sets `Job::flush` / `Job::map_pasid`
+from the grant.
+
+SDMA0 runs client jobs as ring 2 (`AMDGPU_HW_IP_DMA`, instance 0, ring 0)
+through `amdgpu_sdma_navi48::Sdma::submit(Job)`, after both SDMA proofs
+(busy before). Its frame follows sdma_v7_0's ring functions in 256-dword
+slots of the 1024-dword ring: when flushing, a memory POLL_REGMEM pipeline
+sync and the GFX hub flush on invalidation engine 11 (REGISTER_WRITE /
+POLL_REGMEM); the LUT write; INDIRECT packets NOP-aligned to end on 8
+dwords, IBs 32-byte aligned with no CSA; and an uncached FENCE (no TRAP;
+completion is polled through `FenceReader`). The ring is started with
+`IB_ENABLE`, as sdma_v7_0_gfx_resume does.
 
 ### AMD platform VBIOS
 
