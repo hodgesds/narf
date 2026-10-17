@@ -3485,49 +3485,50 @@ fn smoke_userspace_statx_device_node_reports_rdev() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_statx_device_node_reports_rdev);
 
 fn smoke_userspace_linux_stat_layout_offsets() -> TestResult {
-    // Compile-time check that linux_compat::Stat field offsets match
-    // the Linux x86_64 ABI (man 2 stat).
+    // Compile-time check that linux_compat::Stat field offsets match the
+    // arch's uapi `struct stat`: arch/x86/include/uapi/asm/stat.h on x86_64,
+    // include/uapi/asm-generic/stat.h on arm64.
     use crate::handlers::linux_compat::Stat;
-    use core::mem::offset_of;
+    use core::mem::{offset_of, size_of};
 
-    if offset_of!(Stat, st_dev) != 0 {
-        return TestResult::Fail("st_dev offset != 0");
-    }
-    if offset_of!(Stat, st_ino) != 8 {
-        return TestResult::Fail("st_ino offset != 8");
-    }
-    if offset_of!(Stat, st_nlink) != 16 {
-        return TestResult::Fail("st_nlink offset != 16");
-    }
-    if offset_of!(Stat, st_mode) != 24 {
-        return TestResult::Fail("st_mode offset != 24");
-    }
-    if offset_of!(Stat, st_uid) != 28 {
-        return TestResult::Fail("st_uid offset != 28");
-    }
-    if offset_of!(Stat, st_gid) != 32 {
-        return TestResult::Fail("st_gid offset != 32");
-    }
-    if offset_of!(Stat, st_rdev) != 40 {
-        return TestResult::Fail("st_rdev offset != 40");
-    }
-    if offset_of!(Stat, st_size) != 48 {
-        return TestResult::Fail("st_size offset != 48");
-    }
-    if offset_of!(Stat, st_blksize) != 56 {
-        return TestResult::Fail("st_blksize offset != 56");
-    }
-    if offset_of!(Stat, st_blocks) != 64 {
-        return TestResult::Fail("st_blocks offset != 64");
-    }
-    if offset_of!(Stat, st_atim) != 72 {
-        return TestResult::Fail("st_atim offset != 72");
-    }
-    if offset_of!(Stat, st_mtim) != 88 {
-        return TestResult::Fail("st_mtim offset != 88");
-    }
-    if offset_of!(Stat, st_ctim) != 104 {
-        return TestResult::Fail("st_ctim offset != 104");
+    #[cfg(target_arch = "x86_64")]
+    let expect: [(usize, usize); 14] = [
+        (offset_of!(Stat, st_dev), 0),
+        (offset_of!(Stat, st_ino), 8),
+        (offset_of!(Stat, st_nlink), 16),
+        (offset_of!(Stat, st_mode), 24),
+        (offset_of!(Stat, st_uid), 28),
+        (offset_of!(Stat, st_gid), 32),
+        (offset_of!(Stat, st_rdev), 40),
+        (offset_of!(Stat, st_size), 48),
+        (offset_of!(Stat, st_blksize), 56),
+        (offset_of!(Stat, st_blocks), 64),
+        (offset_of!(Stat, st_atim), 72),
+        (offset_of!(Stat, st_mtim), 88),
+        (offset_of!(Stat, st_ctim), 104),
+        (size_of::<Stat>(), 144),
+    ];
+    #[cfg(target_arch = "aarch64")]
+    let expect: [(usize, usize); 14] = [
+        (offset_of!(Stat, st_dev), 0),
+        (offset_of!(Stat, st_ino), 8),
+        (offset_of!(Stat, st_mode), 16),
+        (offset_of!(Stat, st_nlink), 20),
+        (offset_of!(Stat, st_uid), 24),
+        (offset_of!(Stat, st_gid), 28),
+        (offset_of!(Stat, st_rdev), 32),
+        (offset_of!(Stat, st_size), 48),
+        (offset_of!(Stat, st_blksize), 56),
+        (offset_of!(Stat, st_blocks), 64),
+        (offset_of!(Stat, st_atim), 72),
+        (offset_of!(Stat, st_mtim), 88),
+        (offset_of!(Stat, st_ctim), 104),
+        (size_of::<Stat>(), 128),
+    ];
+    for (got, want) in expect {
+        if got != want {
+            return TestResult::Fail("linux_compat::Stat layout differs from the uapi struct stat");
+        }
     }
     TestResult::Pass
 }

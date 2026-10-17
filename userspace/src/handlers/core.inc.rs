@@ -3304,7 +3304,6 @@ pub mod linux_compat {
 
     use core::mem::{align_of, size_of};
 
-    // ── stat (Linux x86_64) — 144 bytes ──────────────────────────
     #[repr(C)]
     #[derive(Copy, Clone, Debug, Default)]
     pub struct Timespec {
@@ -3312,6 +3311,8 @@ pub mod linux_compat {
         pub tv_nsec: i64,
     }
 
+    // ── stat (arch/x86/include/uapi/asm/stat.h, x86_64) — 144 bytes ──
+    #[cfg(not(target_arch = "aarch64"))]
     #[repr(C)]
     #[derive(Copy, Clone, Debug, Default)]
     pub struct Stat {
@@ -3332,7 +3333,38 @@ pub mod linux_compat {
         pub __unused: [i64; 3],
     }
 
+    #[cfg(not(target_arch = "aarch64"))]
     const _: () = assert!(size_of::<Stat>() == 144);
+
+    // ── stat (include/uapi/asm-generic/stat.h, arm64) — 128 bytes ──
+    // arm64 has no stat.h of its own; it takes the generic layout, where
+    // `st_mode` precedes a 32-bit `st_nlink` and `st_blksize` is an int.
+    // Reusing the x86_64 shape here put the link count where every
+    // aarch64 libc reads `st_mode`.
+    #[cfg(target_arch = "aarch64")]
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct Stat {
+        pub st_dev: u64,
+        pub st_ino: u64,
+        pub st_mode: u32,
+        pub st_nlink: u32,
+        pub st_uid: u32,
+        pub st_gid: u32,
+        pub st_rdev: u64,
+        pub __pad1: u64,
+        pub st_size: i64,
+        pub st_blksize: i32,
+        pub __pad2: i32,
+        pub st_blocks: i64,
+        pub st_atim: Timespec,
+        pub st_mtim: Timespec,
+        pub st_ctim: Timespec,
+        pub __unused: [u32; 2],
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    const _: () = assert!(size_of::<Stat>() == 128);
     const _: () = assert!(align_of::<Stat>() == 8);
 
     // ── statx (kernel uapi) — 256 bytes ──────────────────────────
@@ -3474,11 +3506,10 @@ fn linux_stat_from_fs(
         // `O_TMPFILE` inode really does have zero links until `linkat`
         // gives it a name, and that zero is how userspace tells an
         // unlinked temporary from a named file.
-        st_nlink: if attrs.tracked { attrs.nlink as u64 } else { 1 },
+        st_nlink: if attrs.tracked { attrs.nlink as _ } else { 1 },
         st_mode: mode_word,
         st_uid: uid_to_user(current_task_id(), uid),
         st_gid: gid_to_user(current_task_id(), gid),
-        __pad0: 0,
         st_rdev: rdev,
         st_size: s.size as i64,
         st_blksize: 4096,
@@ -3486,11 +3517,11 @@ fn linux_stat_from_fs(
         st_atim: atime,
         st_mtim: mtime,
         st_ctim: ctime,
-        __unused: [0; 3],
+        ..Default::default()
     }
 }
 
-// Linux-ABI sys_stat: writes a 144-byte `struct stat`. Same path-
+// Linux-ABI sys_stat: writes the arch's uapi `struct stat`. Same path-
 // resolution as the NARF-shape sys_stat, only the wire layout
 // changes.
 

@@ -185,6 +185,12 @@ following full page through `p_memsz` is private anonymous demand-zero memory.
 Untouched BSS therefore consumes neither a frame nor fork-COW ownership, while
 first access observes zeroes with the segment's original permissions.
 
+The stat family (`stat`, `lstat`, `fstat`, `newfstatat`) writes the
+architecture's uapi `struct stat`: the 144-byte x86_64 layout
+(`arch/x86/include/uapi/asm/stat.h`) on x86_64, and the 128-byte
+`include/uapi/asm-generic/stat.h` layout on aarch64, where `st_mode` (offset
+16) precedes a 32-bit `st_nlink` and `st_blksize` is 32-bit.
+
 Architecture syscall reverse tables are unambiguous: every published wire
 number resolves through `Syscall::from_raw` to a single canonical variant. On
 aarch64, generic-ABI numbers such as `openat`, `newfstatat`, and `pipe2` are

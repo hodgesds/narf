@@ -3348,17 +3348,12 @@ kernel_test_in!(
     smoke_abi_proc2_maps_anonymous_mmap_has_no_provenance
 );
 
-/// `stat(path)` → `Ok(st_nlink)`. x86_64 `struct stat` has a 64-bit
-/// `st_nlink` third; the generic (aarch64) layout has a 32-bit one after
-/// `st_mode`.
+/// `stat(path)` → `Ok(st_nlink)`.
 fn tg_stat_nlink(path: &str) -> Result<u64, Option<i64>> {
     let p = alloc::format!("{}\0", path);
-    let mut sb = [0u64; 32];
+    let mut sb = [0u8; STAT_SIZE];
     match call_stat(p.as_ptr() as u64, sb.as_mut_ptr() as u64) {
-        #[cfg(target_arch = "x86_64")]
-        Some(0) => Ok(sb[2]),
-        #[cfg(not(target_arch = "x86_64"))]
-        Some(0) => Ok(sb[2] >> 32),
+        Some(0) => Ok(stat_nlink(&sb)),
         other => Err(other),
     }
 }
@@ -3794,7 +3789,7 @@ fn proc_dirfd_survives_chroot_into(target: &[u8]) -> TestResult {
             }
             const S_IFMT: u32 = 0o170000;
             const S_IFDIR: u32 = 0o040000;
-            let mode = u32::from_ne_bytes(st[24..28].try_into().unwrap_or_default());
+            let mode = stat_mode(&st);
             if mode & S_IFMT != S_IFDIR {
                 return Err("the followed fd link did not describe the open directory");
             }
