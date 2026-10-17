@@ -826,3 +826,153 @@ fn smoke_fat_time_decode_edges() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/fat", smoke_fat_time_decode_edges);
+
+// ── Persistent boot log ─────────────────────────────────────────────
+
+fn smoke_fat_bootlog_policy() -> TestResult {
+    use crate::bootlog::{
+        candidate_allowed, log_index, marker_matches, next_log_index, parse_config, Config,
+        MAX_LOGS,
+    };
+    if parse_config(None) != Ok(Config::Disabled)
+        || parse_config(Some("off")) != Ok(Config::Disabled)
+        || parse_config(Some("short")).is_ok()
+        || parse_config(Some("bad token!")).is_ok()
+        || parse_config(Some("rx6750xt-0123"))
+            != Ok(Config::Enabled {
+                token: String::from("rx6750xt-0123"),
+            })
+    {
+        return TestResult::Fail("narf.bootlog= parsing");
+    }
+    // Internal disks are never candidates, only USB mass storage.
+    if !candidate_allowed("usb-msc0p1")
+        || !candidate_allowed("usb-msc1")
+        || [
+            "nvme0p1",
+            "nvme0",
+            "ahci0p1",
+            "vblk0p1",
+            "mmcblk0p1",
+            "sdhci0",
+        ]
+        .iter()
+        .any(|n| candidate_allowed(n))
+    {
+        return TestResult::Fail("candidate filter must admit only usb-msc*");
+    }
+    if !marker_matches(b"rx6750xt-0123\n", "rx6750xt-0123")
+        || !marker_matches(b"  rx6750xt-0123\r\nextra", "rx6750xt-0123")
+        || marker_matches(b"rx6750xt-01234\n", "rx6750xt-0123")
+        || marker_matches(b"", "rx6750xt-0123")
+        || marker_matches(b"x", "")
+    {
+        return TestResult::Fail("marker comparison");
+    }
+    if log_index("NARF-BOOT-12.LOG") != Some(12)
+        || log_index("narf-boot-.log").is_some()
+        || log_index("narf-boot-1.log.bak").is_some()
+        || next_log_index(["EFI", "narf-boot-2.log", "narf-boot-9.log"]) != Some(10)
+        || next_log_index([]) != Some(1)
+    {
+        return TestResult::Fail("log index naming");
+    }
+    let last = alloc::format!("narf-boot-{MAX_LOGS}.log");
+    if next_log_index([last.as_str()]).is_some() {
+        return TestResult::Fail("must refuse past MAX_LOGS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/fat", smoke_fat_bootlog_policy);
+
+/// Marker-gated arming, sequential file naming, append and the size bound,
+/// end to end on a FAT12 volume in RAM.
+fn smoke_fat_bootlog_session_round_trip() -> TestResult {
+    use crate::bootlog::{open_session, MARKER_FILE};
+    use crate::volume::FatVolume;
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    let device = RamBlockDevice::from_image(512, build_fat12_image(512, &[]));
+    let Some(Ok(volume)) = poll_once(FatVolume::mount(device, DomainId::DRIVER_0)) else {
+        return TestResult::Fail("mount failed");
+    };
+    let token = "rx6750xt-0123";
+    // No marker: never written to.
+    if !matches!(
+        poll_once(open_session(&volume, token, 4096, b"h\n")),
+        Some(Ok(None))
+    ) {
+        return TestResult::Fail("a volume without the marker must not arm");
+    }
+    let root = volume.root();
+    let Some(Ok(marker)) = poll_once(root.create(MARKER_FILE)) else {
+        return TestResult::Fail("create marker");
+    };
+    if !matches!(poll_once(marker.write(0, b"other-token-99\n")), Some(Ok(_))) {
+        return TestResult::Fail("write marker");
+    }
+    if !matches!(
+        poll_once(open_session(&volume, token, 4096, b"h\n")),
+        Some(Ok(None))
+    ) {
+        return TestResult::Fail("a different token must not arm");
+    }
+    let names = |root: &alloc::sync::Arc<dyn narf_filesystem::DirOps>| -> alloc::vec::Vec<String> {
+        poll_once(root.enumerate_async(0, 64))
+            .and_then(Result::ok)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
+    };
+    if names(&root).iter().any(|n| n.starts_with("narf-boot")) {
+        return TestResult::Fail("a refused volume must stay untouched");
+    }
+    // Matching token: arm, append, then hit a 200-byte bound.
+    if !matches!(poll_once(marker.truncate(0)), Some(Ok(())))
+        || !matches!(poll_once(marker.write(0, b"rx6750xt-0123\n")), Some(Ok(14)))
+    {
+        return TestResult::Fail("rewrite marker");
+    }
+    let Some(Ok(Some(mut first))) = poll_once(open_session(&volume, token, 200, b"header\n"))
+    else {
+        return TestResult::Fail("matching marker must arm");
+    };
+    if first.index != 1 {
+        return TestResult::Fail("first log must be narf-boot-1.log");
+    }
+    let line = [b'x'; 100];
+    for _ in 0..3 {
+        if !matches!(poll_once(first.append(&line)), Some(Ok(100))) {
+            return TestResult::Fail("append");
+        }
+    }
+    if !first.is_full() || first.len() > 200 {
+        return TestResult::Fail("size bound not enforced");
+    }
+    let Some(Ok(file)) = poll_once(root.lookup_async("narf-boot-1.log")) else {
+        return TestResult::Fail("log file missing");
+    };
+    let mut back = [0u8; 256];
+    let Some(Ok(n)) = poll_once(file.read(0, &mut back)) else {
+        return TestResult::Fail("read back");
+    };
+    let text = &back[..n];
+    if n as u64 != first.len()
+        || !text.starts_with(b"header\nxxxx")
+        || !text.ends_with(b"later lines were not saved]\n")
+    {
+        return TestResult::Fail("log contents / truncation note");
+    }
+    // Next boot gets the next number.
+    let Some(Ok(Some(second))) = poll_once(open_session(&volume, token, 200, b"h\n")) else {
+        return TestResult::Fail("second arm");
+    };
+    if second.index != 2 || !names(&root).iter().any(|n| n == "narf-boot-2.log") {
+        return TestResult::Fail("second boot must create narf-boot-2.log");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/fat", smoke_fat_bootlog_session_round_trip);
