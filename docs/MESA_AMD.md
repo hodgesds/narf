@@ -148,6 +148,66 @@ user-namespace chroot on the build host; on a Linux host with an amdgpu GPU
 that yields the Linux reference trace for the same binaries
 (`target/narf-mesa-amd/host-check.log`).
 
+## Results so far (2026-10-17)
+
+**NARF under QEMU** (default backend: virtio-gpu 2D `card0`/`renderD128` +
+the in-tree `narf-drm` bochs card `card1`/`renderD129`, no AMD GPU):
+`MESA-AMD-OK`. Every step exited 0; no signal. libgallium/RADV load,
+`amdgpu_device_initialize` declines all four nodes (render nodes: "DRM
+version is 0.1.0/1.0.0 but this driver is only compatible with 3.x.x",
+`-EBADF`; primary nodes: `amdgpu_get_auth` fails, see below), RADV creates an
+instance and finds 0 devices, lavapipe finds 1, and every EGL/GBM session
+renders the triangle correctly on llvmpipe (radeonsi forced: EGL device
+init fails cleanly, GBM falls back to kms_swrast). The kernel's
+`ld-musl` must be staged for `chroot_run` to exec — on a host without a musl
+package, point `LDMUSL_PATH` at the build root's
+`/lib/ld-musl-x86_64.so.1`.
+
+**Same binaries on a Linux host** (`MESA_AMD_HOST_CHECK=1`, amdgpu 3.64,
+Raphael iGPU GC 10.3.6 — not Navi22): `MESA-AMD-HW=amd`. radeonsi
+(`radeonsi, raphael_mendocino, ACO, DRM 3.64`) renders the triangle through
+both EGL device and GBM; RADV enumerates `RADV RAPHAEL_MENDOCINO`. This
+validates the build itself on real AMD silicon and provides the reference
+ioctl sequence below.
+
+### ioctls Mesa issued
+
+Under NARF (no amdgpu), the complete set across all steps:
+
+| ioctl | Node | NARF answer | Note |
+|-------|------|-------------|------|
+| `VERSION` (×2 per open) | all | ok: `virtio_gpu` 0.1.0, `narf-drm` 1.0.0 | loader driver choice |
+| `GET_CLIENT` | primary (`card*`) | **`-ENOTTY`** | libdrm `amdgpu_get_auth()` issues it on every primary node before anything else; Linux answers it. On the RX 6750 XT this makes `amdgpu_device_initialize` fail for any client that opens `card0` (GBM/kmscube/compositors) — **gap for the uapi workstream** |
+| `GET_CAP(PRIME)` | all | 3 | |
+| `VIRTGPU_GETPARAM` 1–7 | virtio | ok | virgl probe |
+| `VIRTGPU_GET_CAPS` capset 6 (DRM native ctx) | virtio | `-ENOSYS` | RADV/radeonsi `amdgpu-virtio` probe; matches Linux with no capsets |
+
+Linux reference, RADV and radeonsi device init on GFX10.3 (identical order
+for both drivers up to `MAX_IBS`; render node unless noted):
+
+1. `VERSION` ×2 (+ `GET_CLIENT` first on a primary node)
+2. `AMDGPU_INFO`: `ACCEL_WORKING` → `DEV_INFO` (size 448) →
+   `READ_MMR_REG 0x263e` count 1 instance 0xffffffff →
+   `HW_IP_COUNT(GFX)` → `HW_IP_INFO(GFX)` (size 32)
+3. `GET_CAP(SYNCOBJ_TIMELINE)`; radeonsi then `SYNCOBJ_CREATE` (winsys VM
+   timeline syncobj)
+4. `DEV_INFO`, `READ_MMR_REG 0x263e`, `DEV_INFO` again (ac_gpu_info)
+5. `HW_IP_INFO` + `HW_IP_COUNT` for GFX, COMPUTE, DMA, UVD, VCE, UVD_ENC,
+   VCN_DEC, VCN_ENC, VCN_JPEG, VPE — absent IPs: `HW_IP_INFO` succeeds with
+   zeros, `HW_IP_COUNT` returns `-EINVAL`
+6. `FW_VERSION` GFX_ME, GFX_MEC, GFX_PFP (index 0), VCN
+7. `MEMORY` (size 96), `GET_CAP(ADDFB2_MODIFIERS)`, `VIDEO_CAPS` decode and
+   encode (size 192), `MAX_IBS` (size 40)
+8. radeonsi: `GET_CAP(PRIME)`, `CTX` alloc (priority 0), then BOs:
+   `GEM_CREATE` (4 KiB / 2 MiB, domains GTT `0x2` or VRAM|GTT `0x6`, flags
+   `CPU_ACCESS_REQUIRED`/`NO_CPU_ACCESS`-class `0x4`/`0x6`), `GEM_MMAP`,
+   `GEM_VA MAP` at `0xffff8001_00000000`+ (high VA, flags `0xe`/`0x8e`);
+   first draw: `SYNCOBJ_CREATE`, `CS` with chunks BO_HANDLES(6),
+   SYNCOBJ_TIMELINE_SIGNAL(9), FENCE(2), IB(1), `SYNCOBJ_WAIT`; teardown
+   `GEM_VA UNMAP` + `GEM_CLOSE` per BO, `CTX` free, `SYNCOBJ_DESTROY`.
+9. RADV: `SYNCOBJ_CREATE/WAIT/DESTROY` probe, `CTX` alloc at priorities
+   low/normal (high/realtime get `-EACCES` unprivileged — expected).
+
 ## Bare-metal checklist (RX 6750 XT)
 
 Prerequisites from the kernel side, in the order Mesa trips over them

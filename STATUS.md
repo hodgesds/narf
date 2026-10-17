@@ -980,6 +980,12 @@ connected HDMI sink on pipe 0 with a test pattern: DCN init, HUBBUB/DML30
 deadlines, the DAL clocks and the VBIOS PixelClock/STREAM_SETUP/transmitter
 tables (now executed by an `atom.c`-faithful interpreter), then fetch and
 unblank. Model-tested per block; never run on hardware.
+Mesa 26.2.4 radeonsi + RADV (ACO-only, llvmpipe fallback kept) now builds
+reproducibly for NARF's musl userspace and stages into a rootfs; the
+`mesa-amd-smoke` passes inside NARF under QEMU with no AMD GPU (clean
+decline, software fallback renders) and the same binaries render on a Linux
+amdgpu host ([Mesa AMD](docs/MESA_AMD.md)). libdrm_amdgpu's `GET_CLIENT` on
+primary nodes is the first NARF gap Mesa hits.
 These are software-tested foundations; training resume,
 media submission/DPG, display-aware DPM, user command submission,
 hardware boot and DCN3.0 modesetting remain open. See the
