@@ -1,5 +1,7 @@
 //! Two retained VMID0 GC12 kernel queues, with a bounded translated-memory
-//! WRITE_DATA and native EOP-interrupt proofs. No user IBs, draws, shaders or reset.
+//! WRITE_DATA and native EOP-interrupt proofs, then client jobs on the
+//! graphics queue: each a VM flush for the client's VMID, its IB and a
+//! fence (`submit`). No draws, shaders or reset.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip, amdgpu_gmc_navi48 as gmc, amdgpu_mes12 as api, amdgpu_mes12_hw as mes,
@@ -15,6 +17,16 @@ const BYTES: u64 = PIPE_BYTES * 2;
 const RPTR: u64 = 10240;
 const WPTR: u64 = 10248;
 const BELLS: [u32; 2] = [0x116, 6];
+/// The graphics queue's job fence: the last completed job's sequence.
+const JOB_FENCE: u64 = 10496;
+/// One job's ring slot: GC12's 256-dword submission alignment.
+const JOB_DWORDS: u64 = 256;
+/// Ring capacity in dwords (4 KiB).
+const RING_DWORDS: u64 = 1024;
+/// The graphics ring's invalidation engine on the GFX hub, as
+/// amdgpu_gmc_allocate_vm_inv_eng hands the first ring engine 0 (MES
+/// reserves 5 and 6; the kernel's CPU invalidations use 17).
+const GFX_INV_ENGINE: u32 = 0;
 const FENCES: [u32; 2] = [0x9070cafe, 0x9070beef];
 const PATTERN: [u32; 16] = [
     0x01234567, 0x89abcdef, 0x76543210, 0xfedcba98, 0xaaaaaaaa, 0x55555555, 0xff00ff00, 0x00ff00ff,
@@ -43,6 +55,48 @@ pub enum State {
     InterruptSubmitted(u8),
     InterruptVerified,
     Failed(Error),
+}
+/// A client job: an IB of `ib_dwords` at `ib` in VMID `vmid`'s address
+/// space, whose page directory is `pd_addr` (the root's entry address with
+/// VALID, as gmc_v12_0_get_vm_pde leaves it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Job {
+    pub vmid: u8,
+    pub pd_addr: u64,
+    pub ib: u64,
+    pub ib_dwords: u32,
+}
+/// gfx_v12_0's frame for one job on the graphics ring: the VM flush
+/// (gmc_v12_0_emit_flush_gpu_tlb on the GFX hub through the ring's engine,
+/// then PFP_SYNC_ME), the IB under the job's VMID, and an interrupting
+/// RELEASE_MEM of `seq` to `fence`, NOP-padded to the 256-dword slot.
+fn job_packets(job: Job, gc: u32, fence: u64, seq: u32) -> Result<[u32; 256], Error> {
+    use crate::amdgpu_pm4::Pm4Builder;
+    if !(1..16).contains(&job.vmid)
+        || job.ib_dwords == 0
+        || job.ib_dwords > 0xf_ffff
+        || job.ib & 3 != 0
+    {
+        return Err(Error::Invalid);
+    }
+    let mut words = [0u32; 256];
+    let mut b = Pm4Builder::new(&mut words);
+    let built = (|| {
+        b.vm_flush(
+            &crate::amdgpu_vmhub_regs::GFXHUB_V12_0,
+            gc,
+            GFX_INV_ENGINE,
+            job.vmid,
+            job.pd_addr,
+            true,
+        )?;
+        b.indirect_buffer(job.ib, job.ib_dwords, job.vmid)?;
+        b.release_mem_fence(fence, u64::from(seq), false, true)?;
+        let used = b.words().len();
+        b.nop(256 - used - 1)
+    })();
+    built.map_err(|_| Error::Invalid)?;
+    Ok(words)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Proof {
@@ -249,6 +303,10 @@ struct Engine<I: Io> {
     state: State,
     proof: Option<Proof>,
     interrupt_result: Option<Result<InterruptProof, Error>>,
+    /// Dwords written to the graphics ring so far (its WPTR).
+    gfx_wptr: u64,
+    /// The last job sequence submitted on the graphics ring.
+    gfx_seq: u32,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -494,6 +552,56 @@ impl<I: Io> Engine<I> {
         })
     }
 }
+impl<I: Io> Engine<I> {
+    /// Queue one client job on the graphics ring, after both proofs, if its
+    /// 256-dword slot is free: the ring holds 1024 dwords, and only the low
+    /// 32 bits of GC12's RPTR writeback are live. Returns the job's
+    /// sequence; `completed_job` reports when the fence passes it.
+    fn submit(&mut self, job: Job) -> Result<u32, Error> {
+        if self.state != State::InterruptVerified {
+            return Err(Error::Busy);
+        }
+        let l = self.layout;
+        let map = self.memory.mapping();
+        let db = self.doorbells;
+        // The proofs left the graphics ring at 512 dwords.
+        let wptr = self.gfx_wptr.max(512);
+        let seq = self.gfx_seq.wrapping_add(1);
+        let fence = self.memory.address() + JOB_FENCE;
+        let words = job_packets(job, (l.gc / 4) as u32, fence, seq)?;
+        self.access(|io| {
+            flush(io, l);
+            let rptr = u64::from(io.memory_read(map, RPTR));
+            // The 32-bit RPTR trails WPTR by what the CP has yet to read.
+            let pending = (wptr as u32).wrapping_sub(rptr as u32) as u64;
+            if pending > wptr || pending + JOB_DWORDS > RING_DWORDS {
+                return Err(Error::Busy);
+            }
+            let slot = wptr % RING_DWORDS * 4;
+            for (i, word) in words.into_iter().enumerate() {
+                io.memory_write(map, slot + i as u64 * 4, word);
+            }
+            let next = wptr + JOB_DWORDS;
+            io.memory_write(map, WPTR, next as u32);
+            io.memory_write(map, WPTR + 4, (next >> 32) as u32);
+            flush(io, l);
+            io.doorbell(db, BELLS[0], next);
+            Ok(())
+        })?;
+        self.gfx_wptr = wptr + JOB_DWORDS;
+        self.gfx_seq = seq;
+        Ok(seq)
+    }
+    /// The last job sequence the graphics ring's fence reached.
+    fn completed_job(&mut self) -> Result<u32, Error> {
+        let l = self.layout;
+        let map = self.memory.mapping();
+        self.access(|io| {
+            flush(io, l);
+            Ok(io.memory_read(map, JOB_FENCE))
+        })
+    }
+}
 #[derive(Debug)]
 pub struct Queues(Engine<Mmio>);
 impl Queues {
@@ -516,6 +624,8 @@ impl Queues {
             state: State::Prepared,
             proof: None,
             interrupt_result: None,
+            gfx_wptr: 0,
+            gfx_seq: 0,
         }))
     }
     /// # Safety
@@ -553,6 +663,19 @@ impl Queues {
     }
     pub fn proof(&self) -> Option<Proof> {
         self.0.proof
+    }
+    /// Queue a client job on the graphics ring (see `Job`).
+    /// # Safety
+    /// `job.vmid`'s context points at `job.pd_addr` only through this
+    /// job's flush; that page directory, the IB and everything it reaches
+    /// stay mapped and alive until `completed_job` passes the returned
+    /// sequence, and no one else writes this ring.
+    pub unsafe fn submit(&mut self, job: Job) -> Result<u32, Error> {
+        self.0.submit(job)
+    }
+    /// The last client job sequence the graphics ring completed.
+    pub fn completed_job(&mut self) -> Result<u32, Error> {
+        self.0.completed_job()
     }
 }
 #[cfg(feature = "kernel-test")]

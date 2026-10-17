@@ -26,8 +26,63 @@ struct Fake {
     busy: bool,
     revoked: Option<Cap<BusDeviceCap, Write>>,
     regs: BTreeMap<u64, u32>,
+    /// Client-job packets the CP ran: register writes, waits (reg0, reg1,
+    /// reference, mask, info), PFP syncs and IBs (address, control).
+    job_writes: Vec<(u32, u32)>,
+    job_waits: Vec<(u32, u32, u32, u32, u32)>,
+    job_syncs: u32,
+    job_ibs: Vec<(u64, u32)>,
 }
 impl Fake {
+    /// The graphics CP running client-job slots from its RPTR to `tail`.
+    fn execute_jobs(&mut self, tail: u64) {
+        let mut rptr = u64::from(self.memory[2560]);
+        while rptr < tail {
+            let slot = (rptr % 1024) as usize;
+            let mut cursor = 0;
+            while cursor < 256 {
+                let words = &self.memory[slot + cursor..slot + 256];
+                let header = words[0];
+                assert_eq!(header >> 30, 3);
+                let length = ((header >> 16) & 0x3fff) as usize + 2;
+                assert!(cursor + length <= 256, "a packet crosses its job slot");
+                match (header >> 8) & 255 {
+                    0x37 => {
+                        assert_eq!(length, 5);
+                        assert_eq!(words[1], 0x4010_0000, "PFP register write, confirmed");
+                        assert_eq!(words[3], 0);
+                        self.job_writes.push((words[2], words[4]));
+                    }
+                    0x3c => {
+                        assert_eq!((length, words[6]), (7, 0x20));
+                        self.job_waits
+                            .push((words[2], words[3], words[4], words[5], words[1]));
+                    }
+                    0x42 => {
+                        assert_eq!((length, words[1]), (2, 0));
+                        self.job_syncs += 1;
+                    }
+                    0x3f => {
+                        assert_eq!(length, 4);
+                        self.job_ibs
+                            .push((u64::from(words[1]) | u64::from(words[2]) << 32, words[3]));
+                    }
+                    0x49 => {
+                        assert_eq!((length, words[1], words[2]), (8, 0x06600514, 0x22000000));
+                        let address = u64::from(words[3]) | (u64::from(words[4]) << 32);
+                        self.memory[((address - GPU) / 4) as usize] = words[5];
+                    }
+                    0x10 => {}
+                    op => panic!("unexpected job opcode {op:#x}"),
+                }
+                cursor += length;
+            }
+            assert_eq!(cursor, 256, "the job fills its slot exactly");
+            rptr += 256;
+            // GC12 writes back only the low 32 bits.
+            self.memory[2560] = rptr as u32;
+        }
+    }
     fn execute(&mut self, pipe: usize, tail: u32) {
         assert!(!self.dirty);
         assert_eq!(self.mapped.load(Ordering::SeqCst) & (1 << pipe), 1 << pipe);
@@ -136,6 +191,14 @@ impl Io for Fake {
         }
     }
     fn doorbell(&mut self, _: MmioRegion, offset: u32, v: u64) {
+        if v > 512 {
+            assert_eq!(offset, 0x116, "client jobs ring the graphics queue");
+            self.bells.push(offset);
+            if self.complete {
+                self.execute_jobs(v);
+            }
+            return;
+        }
         assert!(v == 256 || v == 512);
         let pipe = match offset {
             0x116 => 0,
@@ -210,6 +273,10 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
             busy: false,
             revoked: None,
             regs: BTreeMap::from([(0x17828, 0x84000000), (0x17894, 0x84000000)]),
+            job_writes: Vec::new(),
+            job_waits: Vec::new(),
+            job_syncs: 0,
+            job_ibs: Vec::new(),
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -222,6 +289,8 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
         state: State::Prepared,
         proof: None,
         interrupt_result: None,
+        gfx_wptr: 0,
+        gfx_seq: 0,
     };
     let mes = FakeMes {
         mapped,
@@ -561,4 +630,83 @@ fn gfx12_eop_cancellation_retains_sources_queues_and_prevents_replay() -> TestRe
 kernel_test_in!(
     "drivers/gpu/gfx12",
     gfx12_eop_cancellation_retains_sources_queues_and_prevents_replay
+);
+
+/// Client jobs on the graphics ring, as gfx_v12_0 frames them: each job's
+/// 256-dword slot carries the VM flush for its VMID on the GFX hub through
+/// the ring's engine 0 (PT base written through the PFP, then REQ written
+/// and ACK waited for, then PFP_SYNC_ME), its IB under that VMID, and an
+/// interrupting fence of its sequence. Slots wrap around the 1024-dword
+/// ring; a ring the CP has not drained refuses a fifth job; bad jobs and
+/// jobs before both proofs are refused without a write.
+fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
+    let (_pool, mut e, mut mes, aperture, target) = fixture();
+    run(e.initialize(&mut mes, aperture, target)).unwrap();
+    let job = Job {
+        vmid: 3,
+        pd_addr: 0x1_0000_8001,
+        ib: 0x2_0000_1000,
+        ib_dwords: 64,
+    };
+    if e.submit(job) != Err(Error::Busy) {
+        return TestResult::Fail("job before the interrupt proof");
+    }
+    // As the interrupt proof leaves the graphics ring.
+    e.state = State::InterruptVerified;
+    e.io.memory[2560] = 512;
+    let writes = e.io.bells.len();
+    for bad in [
+        Job { vmid: 0, ..job },
+        Job { vmid: 16, ..job },
+        Job {
+            ib_dwords: 0,
+            ..job
+        },
+        Job {
+            ib: job.ib + 2,
+            ..job
+        },
+    ] {
+        if e.submit(bad) != Err(Error::Invalid) || e.io.bells.len() != writes {
+            return TestResult::Fail("bad job");
+        }
+    }
+    if e.submit(job) != Ok(1) || e.completed_job() != Ok(1) {
+        return TestResult::Fail("first job");
+    }
+    let gc = 0x10000 / 4;
+    if e.io.job_writes != [(gc + 0x168f + 6, 0x8001), (gc + 0x1690 + 6, 1)]
+        || e.io.job_waits != [(gc + 0x1647, gc + 0x1659, 0x00f8_0008, 8, 0x143)]
+        || e.io.job_syncs != 1
+        || e.io.job_ibs != [(0x2_0000_1000, 64 | 3 << 24)]
+        || e.io.memory[2562] != 768
+    {
+        return TestResult::Fail("first job's packets");
+    }
+    // Four more wrap the ring (slots at 768, 0, 256, 512).
+    for seq in 2..=5 {
+        if e.submit(Job { vmid: 5, ..job }) != Ok(seq) || e.completed_job() != Ok(seq) {
+            return TestResult::Fail("wrapped jobs");
+        }
+    }
+    if e.io.job_ibs.len() != 5 || e.io.job_ibs[4].1 != 64 | 5 << 24 || e.io.memory[2562] != 1792 {
+        return TestResult::Fail("wrapped job slots");
+    }
+    // With the CP stalled, four slots fill and a fifth is refused.
+    e.io.complete = false;
+    for seq in 6..=9 {
+        if e.submit(job) != Ok(seq) {
+            return TestResult::Fail("filling the ring");
+        }
+    }
+    let bells = e.io.bells.len();
+    if e.submit(job) != Err(Error::Busy) || e.io.bells.len() != bells || e.completed_job() != Ok(5)
+    {
+        return TestResult::Fail("full ring");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_graphics_queue_runs_client_jobs_with_vm_flushes
 );
