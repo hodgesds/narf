@@ -297,6 +297,7 @@ pub mod amdgpu_smu_navi48;
 pub mod amdgpu_smu_navi48_telemetry;
 pub mod amdgpu_smu_v12;
 pub mod amdgpu_smu_v13;
+pub mod amdgpu_smuio14;
 pub mod amdgpu_uapi;
 pub mod amdgpu_ucode_header;
 pub mod amdgpu_usbc;

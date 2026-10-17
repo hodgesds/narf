@@ -96,6 +96,7 @@ fn snap(published: Published) -> Snapshot {
             ip(HW_ID_NBIF, (3, 3, 1), 0),
         ],
         navi22: published,
+        reference_clock_10khz: 0,
     }
 }
 fn booted(queues_verified: bool) -> Published {

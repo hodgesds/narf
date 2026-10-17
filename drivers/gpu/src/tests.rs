@@ -8487,6 +8487,7 @@ fn smoke_amdgpu_discrete_is_not_an_apu() -> TestResult {
         gc: Some(gc),
         ip_blocks: alloc::vec![ip(HW_ID_GC, 10, 3, 2)],
         navi22: Default::default(),
+        reference_clock_10khz: 0,
     };
 
     // VRAM_GTT reports both, and they differ.
@@ -9387,6 +9388,8 @@ fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
         gc: Some(gc),
         ip_blocks: alloc::vec![ip(HW_ID_GC, 11, 0, 1), ip(HW_ID_SDMA0, 6, 0, 1)],
         navi22: Default::default(),
+        // 100 MHz, the usual SOC reference.
+        reference_clock_10khz: 10_000,
     };
 
     let decode = |bytes: &[u8]| -> u::DrmAmdgpuInfoDevice {
@@ -9414,6 +9417,9 @@ fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
     let d = decode(&bytes);
     if d.device_id != 0x15BF {
         return TestResult::Fail("DEV_INFO did not report the PCI device id");
+    }
+    if d.gpu_counter_freq != 100_000 {
+        return TestResult::Fail("gpu_counter_freq must be the reference clock in kHz");
     }
     // Mesa keys ASIC behaviour off this; GFX 11.0.1 is family 148.
     if d.family != u::AMDGPU_FAMILY_GC_11_0_1 {

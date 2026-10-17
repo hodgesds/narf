@@ -330,6 +330,12 @@ impl Backend for Hardware {
                     .map_err(Error::Topology)?;
                 self.topology = Some(topology);
                 crate::amdgpu_info::publish_navi48_topology(topology);
+                // The GPU clock counter runs once firmware and power are up.
+                if let Ok(clock) =
+                    crate::amdgpu_smuio14::ClockReader::new(&self.gpu, self.authority)
+                {
+                    crate::amdgpu_info::publish_navi48_clock(clock);
+                }
             }
             Stage::ConfigureRs64 => {
                 // SAFETY: PSP authenticated this exact retained set and RLC

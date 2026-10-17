@@ -27,12 +27,15 @@
 //! the submission path proving itself on silicon.
 //!
 //! LINUX-GAP: the queries that need subsystems this driver has not built are
-//! refused rather than guessed — TIMESTAMP (no GFX clock-counter read),
-//! FW_VERSION (loaded microcode versions are parsed during the PSP sequence
-//! but not retained) and READ_MMR_REG (no register whitelist).
+//! refused rather than guessed. Navi48 answers FW_VERSION (CP firmware),
+//! READ_MMR_REG (GB_ADDR_CONFIG only) and TIMESTAMP (SMUIO's golden TSC)
+//! from what its platform publishes; other parts refuse them.
 //!
-//! LINUX-GAP: clocks (`max/min_engine_clock`, `max/min_memory_clock`,
-//! `gpu_counter_freq`) need an SMU metrics read, and `vram_type` /
+//! `gpu_counter_freq` is the VBIOS reference clock amdgpu_atomfirmware
+//! reads (smu_info, overridden by gfx_info on Navi and later), times ten.
+//!
+//! LINUX-GAP: clocks (`max/min_engine_clock`, `max/min_memory_clock`)
+//! need an SMU metrics read, and `vram_type` /
 //! `vram_bit_width` need the GMC memory configuration. Both exist elsewhere in
 //! the tree — `amdgpu_smu`, and the platform inventory's memory type and
 //! channel count — but are not plumbed to this ioctl yet; they are zero, not
@@ -111,6 +114,9 @@ pub struct Snapshot {
     pub ip_blocks: Vec<crate::amdgpu_discovery::IpBlock>,
     /// Navi 22 identity published by its cold-boot owner; default elsewhere.
     pub navi22: crate::amdgpu_info_navi22::Published,
+    /// The GPU timestamp counter's reference clock in 10 kHz units (see
+    /// [`reference_clock_10khz`]); 0 when the VBIOS does not say.
+    pub reference_clock_10khz: u32,
 }
 
 /// Navi 22 topology, PCI revision and boot observations, published by the
@@ -144,6 +150,37 @@ pub(crate) fn publish_navi22_media_rings(rings: u8) {
     NAVI22.lock().media_rings = rings;
 }
 
+/// amdgpu_atomfirmware_get_clock_info's system reference clock, in 10 kHz:
+/// smu_info's `core_refclk_10khz` (v3.x and v4.0, byte 16), which on Navi and
+/// later the gfx_info table's timer reference replaces — v3.0 and v2.6
+/// `golden_tsc_count_lower_refclk`, other v2.2+ `rlc_gpu_timer_refclk`, both
+/// at byte 40.
+pub fn reference_clock_10khz(vbios: &[u8], navi: bool) -> Option<u32> {
+    use crate::atombios::{header::parse_rom_header, tables::MasterDataTable};
+    let header = parse_rom_header(vbios).ok()?;
+    let tables = MasterDataTable::parse(vbios, &header).ok()?;
+    let word = |table: &[u8], at: usize| {
+        table
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    };
+    let revision = |table: &[u8]| Some((*table.get(2)?, *table.get(3)?));
+    let mut clock = None;
+    if let Some(smu) = tables.table_slice(8) {
+        if matches!(revision(smu), Some((3 | 4, _))) {
+            clock = word(smu, 16);
+        }
+    }
+    if navi {
+        if let Some(gfx) = tables.table_slice(14) {
+            if matches!(revision(gfx), Some((3, _) | (2, 2..))) {
+                clock = word(gfx, 40).or(clock);
+            }
+        }
+    }
+    clock
+}
+
 fn snapshot() -> Option<Snapshot> {
     crate::amdgpu::info_snapshot()
 }
@@ -163,6 +200,15 @@ impl Snapshot {
             } else {
                 Default::default()
             },
+            reference_clock_10khz: gpu
+                .vbios
+                .as_ref()
+                .and_then(|v| {
+                    // Vega/Renoir predate the gfx_info override.
+                    let navi = !matches!(gpu.chip.family, Family::Vega | Family::Renoir);
+                    reference_clock_10khz(v.bytes(), navi)
+                })
+                .unwrap_or(0),
         }
     }
 }
@@ -272,6 +318,25 @@ fn read_mmr_reg(
     }
     Ok(out)
 }
+/// Navi48's GPU clock counter, published once its platform owns the device.
+static NAVI48_CLOCK: narf_lib::sync::IrqSafeSpinLock<Option<crate::amdgpu_smuio14::ClockReader>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+pub(crate) fn publish_navi48_clock(clock: crate::amdgpu_smuio14::ClockReader) {
+    *NAVI48_CLOCK.lock() = Some(clock);
+}
+/// `AMDGPU_INFO_TIMESTAMP` → amdgpu_gfx_get_gpu_clock_counter as a u64.
+/// Without a reader (or once the device is gone) EINVAL, as amdgpu's
+/// default arm.
+fn timestamp(
+    snap: &Snapshot,
+    clock: Option<crate::amdgpu_smuio14::ClockReader>,
+) -> Result<Vec<u8>, FsError> {
+    clock
+        .filter(|_| snap.did == u32::from(crate::amdgpu::NAVI48))
+        .and_then(|c| c.read())
+        .map(|t| t.to_le_bytes().to_vec())
+        .ok_or(FsError::InvalidData)
+}
 fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
     let topology = *NAVI48_TOPOLOGY.lock();
     dev_info_topology(snap, topology)
@@ -309,6 +374,8 @@ fn dev_info_topology(
         enabled_rb_pipes_mask: topology.map_or(0, |t| t.enabled_rb_mask),
         num_rb_pipes: gc.num_rb_per_se.saturating_mul(gc.num_se),
         num_hw_gfx_contexts: GFX_HW_CONTEXTS,
+        // amdgpu_asic_get_xclk (10 kHz) * 10: kHz, Mesa's clock_crystal_freq.
+        gpu_counter_freq: snap.reference_clock_10khz.saturating_mul(10),
         // FUSION means the GPU shares the CPU's memory — an APU. It used to
         // be claimed unconditionally, on the premise that "every part this
         // driver supports is an APU". A discrete card is not, and userspace
@@ -466,6 +533,7 @@ pub fn query_against(snap: &Snapshot, query: u32, payload: [u32; 4]) -> Result<V
         uapi::AMDGPU_INFO_HW_IP_COUNT => hw_ip_count(snap, payload[0]),
         // `read_mmr_reg { dword_offset, count, instance, flags }`.
         uapi::AMDGPU_INFO_READ_MMR_REG => read_mmr_reg(snap, *NAVI48_TOPOLOGY.lock(), payload),
+        uapi::AMDGPU_INFO_TIMESTAMP => timestamp(snap, *NAVI48_CLOCK.lock()),
         // `query_fw { fw_type, ip_instance, index }`.
         uapi::AMDGPU_INFO_FW_VERSION => firmware_version(snap, *NAVI48_FIRMWARE.lock(), payload[0]),
         // Everything else: `amdgpu_info_ioctl`'s default arm.
@@ -697,5 +765,46 @@ mod topology_tests {
     kernel_test_in!(
         "drivers/gpu/gfx12",
         gfx12_info_answers_mesa_firmware_and_register_queries
+    );
+
+    /// The reference clock comes from smu_info, and on Navi and later from
+    /// gfx_info's timer reference instead, by table revision.
+    fn info_reference_clock_follows_atomfirmware() -> TestResult {
+        let image = |smu: Option<[u8; 2]>, gfx: Option<[u8; 2]>| {
+            let mut b = alloc::vec![0u8; 1024];
+            b[..2].copy_from_slice(&[0x55, 0xaa]);
+            b[0x48..0x4a].copy_from_slice(&0x80u16.to_le_bytes());
+            b[0x80..0x88].copy_from_slice(&[40, 0, 2, 1, b'A', b'T', b'O', b'M']);
+            b[0xa0..0xa2].copy_from_slice(&0xc0u16.to_le_bytes());
+            // Master data table v2.1 with 16 entries.
+            b[0xc0..0xc4].copy_from_slice(&[36, 0, 2, 1]);
+            if let Some([f, c]) = smu {
+                b[0xd4..0xd6].copy_from_slice(&0x100u16.to_le_bytes());
+                b[0x100..0x104].copy_from_slice(&[64, 0, f, c]);
+                b[0x110..0x114].copy_from_slice(&2_500u32.to_le_bytes());
+            }
+            if let Some([f, c]) = gfx {
+                b[0xe0..0xe2].copy_from_slice(&0x200u16.to_le_bytes());
+                b[0x200..0x204].copy_from_slice(&[64, 0, f, c]);
+                b[0x228..0x22c].copy_from_slice(&10_000u32.to_le_bytes());
+            }
+            b
+        };
+        let both = image(Some([3, 1]), Some([3, 0]));
+        if reference_clock_10khz(&both, true) != Some(10_000)
+            || reference_clock_10khz(&both, false) != Some(2_500)
+            || reference_clock_10khz(&image(Some([4, 0]), Some([2, 2])), true) != Some(10_000)
+            || reference_clock_10khz(&image(Some([3, 1]), Some([2, 1])), true) != Some(2_500)
+            || reference_clock_10khz(&image(Some([2, 0]), None), true).is_some()
+            || reference_clock_10khz(&image(None, Some([3, 0])), true) != Some(10_000)
+            || reference_clock_10khz(&[0; 64], true).is_some()
+        {
+            return TestResult::Fail("reference clock table selection");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/gfx12",
+        info_reference_clock_follows_atomfirmware
     );
 }

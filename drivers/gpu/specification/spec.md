@@ -138,6 +138,14 @@ topology sample's `gb_addr_config`), with Linux's SE (< 4) / SH (< 2) /
 count (<= 128) checks and EFAULT for any other offset. `MAX_IBS` on an open
 of a card with a submitter reports `Submitter::max_ibs` for each IP type it
 runs (8 on Navi48, `MAX_JOB_IBS`) and 0 for the rest.
+`DEV_INFO.gpu_counter_freq` is `Snapshot::reference_clock_10khz` times
+ten (kHz), from `amdgpu_info::reference_clock_10khz(vbios, navi)`:
+smu_info v3/v4 `core_refclk_10khz` (byte 16), replaced on Navi and later by
+gfx_info v3.x/v2.2+ timer reference (byte 40), as
+amdgpu_atomfirmware_get_clock_info; 0 without a VBIOS. On Navi48,
+`TIMESTAMP` returns SMUIO 14.0.2's GOLDEN_TSC counter
+(`amdgpu_smuio14::ClockReader`, upper-lower-upper with a re-read when the
+upper half moved), published at the topology stage; elsewhere EINVAL.
 
 `unsafe amdgpu_gfx12_topology::read` requires exclusive GRBM selector ownership
 and ready firmware/power. It validates GC12.0.1 banks and discovery dimensions,
