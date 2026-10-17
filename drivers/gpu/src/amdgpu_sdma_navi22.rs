@@ -240,12 +240,17 @@ impl<I: Io> Engine<I> {
         self.access(|io| {
             let fb = u64::from(checked(io.read(l.gc + 0x16fc * 4))? & 0xffffff) << 24;
             let end = (u64::from(checked(io.read(l.gc + 0x16fd * 4))? & 0xffffff) + 1) << 24;
+            // The boot aperture is the head of Linux's BEST_FIT GART range
+            // (0 below a high FB), never inside the FB aperture itself.
+            let aperture_end = aperture.start.checked_add(aperture.size);
             if target.len != 8192
                 || address < fb
                 || address.checked_add(BYTES).is_none_or(|v| v > end)
                 || end >= 1 << 48
-                || aperture.start != end
                 || aperture.size != 2 << 20
+                || aperture.start % (2 << 20) != 0
+                || aperture_end.is_none_or(|v| v > 1 << 48)
+                || (aperture.start < end && aperture_end.is_some_and(|v| fb < v))
                 || aperture.source != aperture.start
                 || aperture.destination != aperture.start + 4096
                 || checked(io.read(l.nbio + 0x12d * 4))? != 0x7f000
@@ -258,9 +263,10 @@ impl<I: Io> Engine<I> {
                     return Err(Error::Busy);
                 }
             }
-            if checked(io.read(l.gc + 0x25 * 4))? & 1 == 0
-                || checked(io.read(l.gc + u64::from(RESET) * 4))? != 0
-            {
+            // sdma_v5_2_start soft-resets SDMA without first requiring
+            // SDMA0_STATUS_REG.IDLE; only a GRBM reset already in flight
+            // is refused here.
+            if checked(io.read(l.gc + u64::from(RESET) * 4))? != 0 {
                 return Err(Error::Busy);
             }
             Ok(())

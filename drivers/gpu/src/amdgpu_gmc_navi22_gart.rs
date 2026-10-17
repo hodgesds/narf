@@ -15,7 +15,6 @@ const TABLE: u64 = PAGES * 8; // gart.table_size = num_gpu_pages * 8
 /// Shared all-invalid PDB2 for unbound user VMIDs, after the GART table.
 const EMPTY_ROOT: u64 = TABLE;
 const BOOT_PAGES: u64 = APERTURE_SIZE / 4096;
-const FOUR_GB: u64 = 4 << 30;
 /// gmc_v10_0_sw_init: dma_set_mask_and_coherent(DMA_BIT_MASK(44)).
 pub(super) const DMA_LIMIT: u64 = 1 << 44;
 /// AMDGPU_GMC_HOLE_START: Linux caps MC placement below the hole.
@@ -168,9 +167,10 @@ impl<I: Io> Engine<I> {
         if gart.enabled {
             return Err(Error::Busy);
         }
-        // Linux BEST_FIT would pick 0 on this board; NARF keeps the GART at
-        // the boot aperture (directly above VRAM) so its pages stay valid.
-        // Preserve Linux's intent: no 4 GiB crossing, below the MC hole.
+        // The boot aperture already sits at Linux's BEST_FIT GART start
+        // (amdgpu_gmc_gart_location: 0 for this board's 0x80_0000_0000 FB),
+        // so its two pages keep their addresses. Re-check Linux's intent:
+        // 4 GiB aligned, no 4 GiB crossing, below the MC hole.
         let start = geometry.aperture.start;
         if start % FOUR_GB + GART_SIZE > FOUR_GB
             || start

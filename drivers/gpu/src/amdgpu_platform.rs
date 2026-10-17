@@ -371,9 +371,13 @@ fn inventory(gpu: &AmdGpu, cap: &Cap<BusDeviceCap, Write>) -> Result<Vec<Range<u
     if gpu.fw_loaded || gpu.mode.is_some() {
         return Err(Error::Busy);
     }
+    // Firmware/GOP may leave the kernel context VMID0 enabled on a discrete
+    // Navi22; no engine runs in it and gmc_v10_0_gart_enable reprograms it,
+    // so only user contexts 1..15 mean unknown live page tables there.
+    let first_context = u64::from(gpu.chip.did == crate::amdgpu::NAVI22);
     cap.invoke(Op(|| {
         for (base, first) in [(gc, gfxhub.ctx0_cntl), (hub, mmhub.ctx0_cntl)] {
-            for index in 0..u64::from(VM_CONTEXTS) {
+            for index in first_context..u64::from(VM_CONTEXTS) {
                 // SAFETY: exact IP bank and entire context array bounded above.
                 let value = unsafe { gpu.regs.read32(base + (u64::from(first) + index) * 4) };
                 if value == u32::MAX || value & VM_CONTEXT_ENABLE != 0 {
@@ -415,6 +419,13 @@ fn scan_surfaces(
     };
     for index in 0..u32::from(window.pipes) {
         let delta = index * window.pipe_stride;
+        // dcn10_init_pipes: only a pipe whose timing generator runs
+        // (is_tg_enabled, OTG_MASTER_EN) scans out; a disabled TG's pipe is
+        // powered down whatever its HUBP blank state says.
+        let otg = read(window.otg_control + index * window.otg_stride)?;
+        if otg & crate::amdgpu_dcn::OTG_MASTER_EN == 0 {
+            continue;
+        }
         if read(window.hubp_cntl + delta)? & crate::amdgpu_dcn::HUBP_BLANK_FORCE == 0 {
             // Only packed, linear RGB is a bounded inherited scanout here.
             // Reject DCC/YUV/stereo/VM surfaces instead of overlooking metadata.
@@ -938,10 +949,12 @@ mod tests {
     use super::*;
     use alloc::vec;
     use narf_kernel_test::{kernel_test_in, TestResult};
+    /// Four blanked DCN3.1.4 pipes whose timing generators all run.
     fn registers() -> Vec<u32> {
-        let mut regs = vec![0; 0x910];
+        let mut regs = vec![0; 0x1cc2];
         for index in 0..4 {
             regs[0x5f3 + index * 0xdc] = 1;
+            regs[0x1b41 + index * 0x80] = 1;
         }
         regs
     }
@@ -1177,10 +1190,11 @@ mod tests {
         platform_inventory_retains_latched_surfaces_and_cursor
     );
     fn navi22_inventory_includes_the_sixth_pipe() -> TestResult {
-        let mut regs = vec![0; 0xb00];
+        let mut regs = vec![0; 0x1dc2];
         for pipe in 0..6 {
             regs[0x5f3 + pipe * 0xdc] = 1;
         }
+        regs[0x1dc1] = 1; // OTG5_OTG_CONTROL.OTG_MASTER_EN
         regs[0xa3f] = 0;
         regs[0xa31] = 8; // HUBP5 surface format
         regs[0xa36] = (1080 << 16) | 1920;
@@ -1202,6 +1216,29 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/vram", navi22_inventory_includes_the_sixth_pipe);
+    /// dcn10_init_pipes gates on is_tg_enabled: an unblanked HUBP behind a
+    /// stopped OTG (GOP leaves unused pipes like this) is not a live scanout,
+    /// so its stale, unsupported surface state must not fail the inventory.
+    fn navi22_inventory_ignores_pipes_without_a_running_otg() -> TestResult {
+        let mut regs = vec![0; 0x1dc2];
+        for pipe in 0..6 {
+            regs[0x5e5 + pipe * 0xdc] = 12; // AYCrCb8888: refused if scanned
+            regs[0x5e7 + pipe * 0xdc] = 1; // tiled
+            regs[0x678 + pipe * 0xdc] = 1; // mono cursor: refused if scanned
+        }
+        if scan_surfaces(&DCN_3_0_0, |r| regs[r as usize]) != Ok(alloc::vec::Vec::new()) {
+            return TestResult::Fail("pipe with a stopped OTG treated as live");
+        }
+        regs[0x1b41] = 1;
+        if scan_surfaces(&DCN_3_0_0, |r| regs[r as usize]).is_ok() {
+            return TestResult::Fail("running OTG0's unsupported surface accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/vram",
+        navi22_inventory_ignores_pipes_without_a_running_otg
+    );
     fn platform_only_claims_a_blanked_and_stopped_pipe() -> TestResult {
         // Pipe 0 is fetching, pipe 1 is blanked but its generator still runs,
         // pipe 2 is genuinely idle.

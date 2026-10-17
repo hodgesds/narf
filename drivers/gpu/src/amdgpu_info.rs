@@ -350,6 +350,16 @@ pub fn query_against(snap: &Snapshot, query: u32, payload: [u32; 4]) -> Result<V
 /// caller falls through to the generic DRM/KMS path exactly as the virtio-gpu
 /// private dispatcher does.
 pub fn dispatch(cmd: u32, arg: usize) -> Result<u64, FsError> {
+    dispatch_for(cmd, arg, None)
+}
+
+/// `AMDGPU_INFO` for an open with address space `vm`: queries about the
+/// open itself (`AMDGPU_INFO_GPUVM_FAULT`) answer from it.
+pub fn dispatch_for(
+    cmd: u32,
+    arg: usize,
+    vm: Option<&crate::amdgpu_vm::VmState>,
+) -> Result<u64, FsError> {
     let nr = drm_uapi::ioc_nr(cmd);
     if nr != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_INFO {
         return Err(FsError::Unsupported);
@@ -376,7 +386,18 @@ pub fn dispatch(cmd: u32, arg: usize) -> Result<u64, FsError> {
         return Err(FsError::InvalidData);
     }
 
-    let reply = query(which, payload)?;
+    let reply = match (which, vm) {
+        // amdgpu_info_ioctl: the open's VM fault cache, under the PASID lock.
+        (uapi::AMDGPU_INFO_GPUVM_FAULT, Some(vm)) => {
+            let f = vm.fault();
+            let mut out = alloc::vec::Vec::with_capacity(16);
+            out.extend_from_slice(&f.addr.to_le_bytes());
+            out.extend_from_slice(&f.status.to_le_bytes());
+            out.extend_from_slice(&f.vmhub.to_le_bytes());
+            out
+        }
+        _ => query(which, payload)?,
+    };
     // Linux copies `min(size, sizeof(result))`: a userspace built against an
     // older header asks for fewer bytes and must get a short, valid answer
     // rather than EINVAL.

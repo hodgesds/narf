@@ -95,15 +95,18 @@ fn framebuffer_range(
 
 fn training_clients(protected: &[vram::Protected]) -> Result<(), Error> {
     // Long training temporarily overwrites this entire prefix, regardless of
-    // allocator exclusions. Display/cursor readers can show transient pixels,
-    // but live DMUB code/data or another firmware writer cannot be preserved
+    // allocator exclusions. Display/cursor readers can show transient pixels.
+    // Inherited DMUB windows are tolerated as Linux does: psp_v11_0's long
+    // training backs up/restores the prefix whatever DCN maps there, and the
+    // DMCUB is stopped and reset (DmubQuiesce, dm_dmub_hw_init) before its
+    // firmware is reloaded. Other firmware writers there cannot be preserved
     // by racing a CPU backup/restore. No caller-supplied OtherClient ranges
     // exist here: Plan produces those only from inherited display surfaces.
     if protected.iter().any(|region| {
         region.range.start < 32 * 1024 * 1024
             && !matches!(
                 region.owner,
-                vram::Owner::BootFramebuffer | vram::Owner::OtherClient
+                vram::Owner::BootFramebuffer | vram::Owner::OtherClient | vram::Owner::Dmub
             )
     }) {
         return Err(Error::Memory(vram::Error::Busy));
@@ -1230,8 +1233,12 @@ mod tests {
         if training_clients(core::slice::from_ref(&region)).is_err() {
             return TestResult::Fail("inventoried display reader refused");
         }
+        // A GOP-era DMUB window in the prefix: Linux trains regardless.
+        region.owner = vram::Owner::Dmub;
+        if training_clients(core::slice::from_ref(&region)).is_err() {
+            return TestResult::Fail("inherited DMUB window blocked cold training");
+        }
         for owner in [
-            vram::Owner::Dmub,
             vram::Owner::FirmwareUsage,
             vram::Owner::DriverUsage,
             vram::Owner::FirmwareTail,

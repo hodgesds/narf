@@ -116,27 +116,17 @@ pub fn encode_init_ra_cfg(
 
 // ── UNI DEV_INFO_UPDATE (Stage-8 + Stage-9 dual-use) ─────────────
 
-/// `MCU_UNI_CMD_DEV_INFO_UPDATE` header — 4 bytes opcode + 4 bytes
-/// padding + N TLV-encoded options.
-pub const UNI_DEV_INFO_HDR_SIZE: usize = 8;
+/// CONNAC2 unified device header: own-MAC index, band index and padding.
+pub const UNI_DEV_INFO_HDR_SIZE: usize = 4;
 /// One UNI TLV: `{ tag: u16 LE, len: u16 LE, data[len-4] }`.
 pub const UNI_TLV_HDR_SIZE: usize = 4;
-/// `UNI_DEV_INFO_TAG_ACTIVE` — toggle the device active. Linux
-/// `mt76_connac_mcu.c::mt76_connac_mcu_uni_add_dev` (~L1100).
-pub const UNI_DEV_INFO_TAG_ACTIVE: u16 = 0x00;
-/// `UNI_DEV_INFO_TAG_INFO` — set the own-MAC + omac index.
-pub const UNI_DEV_INFO_TAG_INFO: u16 = 0x01;
-
-/// Build the UNI DEV_INFO_UPDATE body. Two TLVs:
-///
-///   - ACTIVE TLV (tag 0): `{ active: u8, dbdc: u8, rsv: u8[2] }`
-///     — 4 data bytes, 4 hdr = 8 bytes total.
-///   - INFO TLV (tag 1): `{ omac_idx: u8, band_idx: u8, rsv: u8[2],
-///     own_mac: u8[6], rsv: u8[2] }` — 12 data bytes, 4 hdr = 16
-///     bytes total.
-///
-/// Total body: 4 (hdr) + 8 + 16 = 28 bytes.
-pub const UNI_DEV_INFO_BODY_SIZE: usize = UNI_DEV_INFO_HDR_SIZE + 8 + 16;
+/// Linux DEV_INFO_ACTIVE: active + link index + own MAC in one TLV.
+pub const UNI_DEV_INFO_TAG_ACTIVE: u16 = 0;
+/// Legacy extended-device builder tag; not a unified device TLV.
+pub const UNI_DEV_INFO_TAG_INFO: u16 = 1;
+/// Header plus the single 12-byte active TLV used by Linux
+/// ecd997b0189a mt76_connac_mcu_uni_add_dev.
+pub const UNI_DEV_INFO_BODY_SIZE: usize = 16;
 
 pub fn encode_uni_dev_info_update(
     omac_idx: u8,
@@ -145,35 +135,15 @@ pub fn encode_uni_dev_info_update(
     own_mac: [u8; MAC_ADDR_LEN],
     out: &mut [u8],
 ) -> Option<()> {
-    if out.len() < UNI_DEV_INFO_BODY_SIZE {
-        return None;
-    }
-    // Header (8 bytes): { bss_idx: u8, rsv: u8[3], opcode_pad: u8[4] }.
-    out[0] = 0; // bss_idx
-    for b in &mut out[1..UNI_DEV_INFO_HDR_SIZE] {
-        *b = 0;
-    }
-
-    // ACTIVE TLV at offset 8.
-    let mut p = UNI_DEV_INFO_HDR_SIZE;
-    out[p..p + 2].copy_from_slice(&UNI_DEV_INFO_TAG_ACTIVE.to_le_bytes());
-    out[p + 2..p + 4].copy_from_slice(&8u16.to_le_bytes()); // len = 8 (TLV total)
-    out[p + 4] = active as u8;
-    out[p + 5] = 0; // dbdc
-    out[p + 6] = 0;
-    out[p + 7] = 0;
-    p += 8;
-
-    // INFO TLV at offset 16.
-    out[p..p + 2].copy_from_slice(&UNI_DEV_INFO_TAG_INFO.to_le_bytes());
-    out[p + 2..p + 4].copy_from_slice(&16u16.to_le_bytes()); // len = 16
-    out[p + 4] = omac_idx;
-    out[p + 5] = band_idx;
-    out[p + 6] = 0;
-    out[p + 7] = 0;
-    out[p + 8..p + 8 + MAC_ADDR_LEN].copy_from_slice(&own_mac);
-    out[p + 8 + MAC_ADDR_LEN] = 0;
-    out[p + 8 + MAC_ADDR_LEN + 1] = 0;
+    let body = out.get_mut(..UNI_DEV_INFO_BODY_SIZE)?;
+    body.fill(0);
+    body[0] = omac_idx;
+    body[1] = band_idx;
+    body[4..6].copy_from_slice(&UNI_DEV_INFO_TAG_ACTIVE.to_le_bytes());
+    body[6..8].copy_from_slice(&12u16.to_le_bytes());
+    body[8] = u8::from(active);
+    // link_idx=0: first station link, independent of the own-MAC index.
+    body[10..16].copy_from_slice(&own_mac);
     Some(())
 }
 

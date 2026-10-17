@@ -48,8 +48,8 @@ use core::convert::TryInto;
 // ── Wire-layout constants ────────────────────────────────────────
 
 /// Size of `struct mt76_connac2_patch_hdr` (16 + 4 + 4 + 4 + 2 + 2 +
-/// 4 + 4 + 4 + 4 + 4 + 4*11 = 92 bytes).
-pub const PATCH_HDR_SIZE: usize = 92;
+/// 4 + 4 + 4 + 4 + 4 + 4*11 = 96 bytes).
+pub const PATCH_HDR_SIZE: usize = 96;
 /// Size of `struct mt76_connac2_patch_sec` (4 + 4 + 4 + 4*13 = 64).
 pub const PATCH_SEC_SIZE: usize = 64;
 /// Size of `struct mt76_connac2_fw_trailer` (1+1+1+1+1+2+10+15+4 = 36).
@@ -59,7 +59,7 @@ pub const FW_REGION_SIZE: usize = 40;
 
 /// `PATCH_SEC_TYPE_MASK` — Linux `mt76_connac_mcu.h:1389`-ish, low byte
 /// of `mt76_connac2_patch_sec.type`.
-pub const PATCH_SEC_TYPE_MASK: u32 = 0x0000_00FF;
+pub const PATCH_SEC_TYPE_MASK: u32 = 0x0000_FFFF;
 /// `PATCH_SEC_TYPE_INFO` — the only section type Linux currently
 /// accepts in `mt76_connac2_load_patch`.
 pub const PATCH_SEC_TYPE_INFO: u32 = 0x02;
@@ -156,7 +156,10 @@ pub fn iter_patch_sections<'a>(
     hdr: &Connac2PatchHdr,
 ) -> Result<impl Iterator<Item = Result<Connac2PatchSection, FwParseError>> + 'a, FwParseError> {
     let n = hdr.n_region as usize;
-    let needed = PATCH_HDR_SIZE + n * PATCH_SEC_SIZE;
+    let needed = n
+        .checked_mul(PATCH_SEC_SIZE)
+        .and_then(|size| PATCH_HDR_SIZE.checked_add(size))
+        .ok_or(FwParseError::SectionTableOverrun)?;
     if blob.len() < needed {
         return Err(FwParseError::SectionTableOverrun);
     }
@@ -420,7 +423,10 @@ pub fn download_patch(blob: &[u8]) -> Result<Connac2PatchHdr, DownloadError> {
     // Walk the sections so a malformed blob fails up-front rather
     // than mid-download.
     let n = hdr.n_region as usize;
-    let needed = PATCH_HDR_SIZE + n * PATCH_SEC_SIZE;
+    let needed = n
+        .checked_mul(PATCH_SEC_SIZE)
+        .and_then(|size| PATCH_HDR_SIZE.checked_add(size))
+        .ok_or(FwParseError::SectionTableOverrun)?;
     if blob.len() < needed {
         return Err(DownloadError::Parse(FwParseError::SectionTableOverrun));
     }

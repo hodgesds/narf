@@ -18,6 +18,10 @@ const CHUNK: usize = 4096;
 const SIGNATURE: u32 = 0x5453_4942;
 const HDP_HOLE: u64 = 0x7f000;
 const RUNTIME_DB_OFFSET: u64 = 1 << 20;
+/// psp_v11_0_memory_training_send_msg: MEM_TRAIN_SEND_MSG_TIMEOUT_US (3 s)
+/// split into 30 psp_wait_for rounds of usec_timeout polls, each poll an MMIO
+/// read plus udelay(1): at least 3 s, in practice longer. Allow twice that.
+const TRAINING_TIMEOUT_MS: u64 = 6000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -170,7 +174,7 @@ impl<I: Io> Engine<I> {
             .map_err(|_| Error::Revoked)
     }
     async fn response(&mut self) -> Result<u32, Error> {
-        let deadline = narf_time::Deadline::after_ms(3000);
+        let deadline = narf_time::Deadline::after_ms(TRAINING_TIMEOUT_MS);
         loop {
             let status = self.access(|io| io.read(STATUS))?;
             if status == u32::MAX {
@@ -228,8 +232,14 @@ impl<I: Io> Engine<I> {
             narf_scheduler::yield_now().await;
         }
         self.access(|io| io.flush())?;
+        // psp_v11_0_memory_training_send_msg waits on bit 31 alone and treats
+        // it as success; the low status bits are only reported.
         if response & 0xffff != 0 {
-            return Err(Error::Rejected(response & 0xffff));
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: gddr6 long training status {response:#x}"
+            );
         }
         self.state = State::SavingResult;
         let io = &mut self.io;
@@ -238,11 +248,22 @@ impl<I: Io> Engine<I> {
         self.authority
             .invoke(Op(|| io.read_result(offset, cache)))
             .map_err(|_| Error::Revoked)??;
-        if u32::from_le_bytes(self.cache[..4].try_into().unwrap()) != SIGNATURE {
-            return Err(Error::InvalidTrainingData);
+        // Linux PSP_MEM_TRAIN_SAVE copies P2C unconditionally after long
+        // training; the "BIST" signature only decides reuse on resume. A
+        // missing signature therefore leaves the boot running but exposes
+        // no training cache (`training_data`).
+        if !self.cache_valid() {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: gddr6 training cache lacks the BIST signature"
+            );
         }
         self.state = State::Ready;
         Ok(())
+    }
+    fn cache_valid(&self) -> bool {
+        u32::from_le_bytes(self.cache[..4].try_into().unwrap()) == SIGNATURE
     }
     async fn run(&mut self) -> Result<(), Error> {
         if self.state != State::Prepared {
@@ -256,14 +277,19 @@ impl<I: Io> Engine<I> {
         result
     }
 }
-/// PSP runtime DB v1.0, amdgpu_psp.h: 4-byte header, padded u16 count,
-/// then at most 63 eight-byte directory entries. Unknown/malformed versions
-/// fail closed; absent DB/boot config preserves the Linux enable default.
+/// PSP runtime DB, amdgpu_psp.h: 4-byte header, padded u16 count, then at
+/// most 63 eight-byte directory entries. As psp_get_runtime_db_entry, any
+/// malformed database or entry is "absent", which preserves the Linux
+/// enable default.
 fn training_policy(read: impl FnMut(usize, &mut [u8]) -> Result<(), Error>) -> Result<bool, Error> {
     let entry = runtime_entry::<8>(read, 5)?;
     Ok(entry.is_none_or(|entry| u32::from_le_bytes(entry[..4].try_into().unwrap()) & 2 != 0))
 }
 /// Bounded PSP runtime DB lookup shared by training and SMU power policy.
+/// psp_get_runtime_db_entry: no version check, an entry count of 64 or more
+/// or an undersized entry means "no entry", and the first match wins. An
+/// entry outside the 64 KiB window (which Linux would read blindly) is
+/// likewise treated as absent. Only a failed VRAM read is an error.
 pub(crate) fn runtime_entry<const N: usize>(
     mut read: impl FnMut(usize, &mut [u8]) -> Result<(), Error>,
     kind: u32,
@@ -274,32 +300,24 @@ pub(crate) fn runtime_entry<const N: usize>(
     if word(&header[..2]) != 0xed5 {
         return Ok(None);
     }
-    if word(&header[2..4]) != 0x100 {
-        return Err(Error::Unsupported);
-    }
     let count = word(&header[4..6]);
     if count >= 64 {
-        return Err(Error::Invalid);
+        return Ok(None);
     }
     let end = 8 + count * 8;
     let mut directory = [0; 63 * 8];
     read(8, &mut directory[..count * 8])?;
-    let mut boot = None;
-    for entry in directory[..count * 8].chunks_exact(8) {
-        if u32::from_le_bytes(entry[..4].try_into().unwrap()) != kind {
-            continue;
-        }
-        let offset = word(&entry[4..6]);
-        let size = word(&entry[6..8]);
-        if boot.is_some() || offset < end || offset % 4 != 0 || size < N || offset + size > 0x10000
-        {
-            return Err(Error::Invalid);
-        }
-        boot = Some(offset);
-    }
-    let Some(offset) = boot else {
+    let Some(entry) = directory[..count * 8]
+        .chunks_exact(8)
+        .find(|entry| u32::from_le_bytes(entry[..4].try_into().unwrap()) == kind)
+    else {
         return Ok(None);
     };
+    let offset = word(&entry[4..6]);
+    let size = word(&entry[6..8]);
+    if offset < end || offset % 4 != 0 || size < N || offset + size > 0x10000 {
+        return Ok(None);
+    }
     let mut entry = [0; N];
     read(offset, &mut entry)?;
     Ok(Some(entry))
@@ -452,7 +470,8 @@ impl Trainer {
     /// Retained for subsequent resume implementation; no short-training replay
     /// is currently exposed.
     pub fn training_data(&self) -> Option<&[u8]> {
-        (self.state() == State::Ready).then_some(self.engine.cache.as_slice())
+        (self.state() == State::Ready && self.engine.cache_valid())
+            .then_some(self.engine.cache.as_slice())
     }
 }
 

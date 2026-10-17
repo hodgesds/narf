@@ -93,6 +93,18 @@ pub struct VmHubRegs {
     pub inv_eng0_req: u32,
     /// `*VM_INVALIDATE_ENG0_ACK` — paired ack register.
     pub inv_eng0_ack: u32,
+    /// `*VM_INVALIDATE_ENG0_SEM` — the engine's semaphore.
+    pub inv_eng0_sem: u32,
+    /// `hub->eng_distance`: `*VM_INVALIDATE_ENG1_REQ - *VM_INVALIDATE_ENG0_REQ`,
+    /// the stride between one engine's SEM/REQ/ACK and the next's.
+    pub eng_distance: u32,
+    /// `gmc_v*_0_use_invalidate_semaphore`: MMHUB invalidations hold the
+    /// engine's semaphore so a power-gating cycle cannot lose the ACK.
+    pub semaphore: bool,
+    /// How far `*VM_CONTEXT*_CNTL`'s fields from `PAGE_TABLE_BLOCK_SIZE` up
+    /// sit above GFX10/11's: 1 on GC 12 and MMHUB 4.1, whose block size is
+    /// at 7:4 (bit 3 reserved), so retry and every fault enable move up too.
+    pub cntl_shift: u32,
 }
 
 // ── GFX11 GFXHUB (Phoenix) ─────────────────────────────────────────
@@ -129,6 +141,10 @@ pub const GFXHUB_V3_0: VmHubRegs = VmHubRegs {
     ctx_distance: 1,
     inv_eng0_req: 0x16ab,
     inv_eng0_ack: 0x16bd,
+    inv_eng0_sem: 0x1699,
+    eng_distance: 1,
+    semaphore: false,
+    cntl_shift: 0,
 };
 
 // ── MMHUB v3.0 (Phoenix) ───────────────────────────────────────────
@@ -159,6 +175,10 @@ pub const MMHUB_V3_0: VmHubRegs = VmHubRegs {
     ctx_distance: 1,
     inv_eng0_req: 0x0763,
     inv_eng0_ack: 0x0775,
+    inv_eng0_sem: 0x0751,
+    eng_distance: 1,
+    semaphore: true,
+    cntl_shift: 0,
 };
 
 // ── GFX10.3 GFXHUB (Renoir) ───────────────────────────────────────
@@ -183,6 +203,10 @@ pub const GFXHUB_V2_3: VmHubRegs = VmHubRegs {
     ctx_distance: 1,
     inv_eng0_req: 0x161f,
     inv_eng0_ack: 0x1631,
+    inv_eng0_sem: 0x160d,
+    eng_distance: 1,
+    semaphore: false,
+    cntl_shift: 0,
 };
 
 // ── MMHUB v2.3 (Renoir) ───────────────────────────────────────────
@@ -221,6 +245,61 @@ pub const MMHUB_V2_3: VmHubRegs = VmHubRegs {
     ctx_distance: 1,
     inv_eng0_req: 0x0a01,
     inv_eng0_ack: 0x0a02,
+    inv_eng0_sem: 0x0a00,
+    eng_distance: 8,
+    semaphore: true,
+    cntl_shift: 0,
+};
+
+// ── GC 12.0 GFXHUB and MMHUB 4.1 (Navi4x) ──────────────────────────
+//
+// gc_12_0_0_offset.h / mmhub_4_1_0_offset.h (BASE_IDX 0), as
+// gfxhub_v12_0.c and mmhub_v4_1_0.c program them:
+// regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32  = 0x168f  (CONTEXT1 0x1691)
+// regGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32 = 0x16af
+// regGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32   = 0x16cf
+// regGCVM_CONTEXT0_CNTL                       = 0x1624  (CONTEXT1 0x1625)
+// regGCVM_INVALIDATE_ENG0_SEM/REQ/ACK         = 0x1635 / 0x1647 / 0x1659
+// regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32  = 0x05cf  (CONTEXT1 0x05d1)
+// regMMVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32 = 0x05ef
+// regMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32   = 0x060f
+// regMMVM_CONTEXT0_CNTL                       = 0x0564  (CONTEXT1 0x0565)
+// regMMVM_INVALIDATE_ENG0_SEM/REQ/ACK         = 0x0575 / 0x0587 / 0x0599
+
+pub const GFXHUB_V12_0: VmHubRegs = VmHubRegs {
+    ctx0_pt_base_lo: 0x168f,
+    ctx0_pt_base_hi: 0x1690,
+    ctx0_pt_start_lo: 0x16af,
+    ctx0_pt_start_hi: 0x16b0,
+    ctx0_pt_end_lo: 0x16cf,
+    ctx0_pt_end_hi: 0x16d0,
+    ctx_addr_distance: 2,
+    ctx0_cntl: 0x1624,
+    ctx_distance: 1,
+    inv_eng0_req: 0x1647,
+    inv_eng0_ack: 0x1659,
+    inv_eng0_sem: 0x1635,
+    eng_distance: 1,
+    semaphore: false,
+    cntl_shift: 1,
+};
+
+pub const MMHUB_V4_1: VmHubRegs = VmHubRegs {
+    ctx0_pt_base_lo: 0x05cf,
+    ctx0_pt_base_hi: 0x05d0,
+    ctx0_pt_start_lo: 0x05ef,
+    ctx0_pt_start_hi: 0x05f0,
+    ctx0_pt_end_lo: 0x060f,
+    ctx0_pt_end_hi: 0x0610,
+    ctx_addr_distance: 2,
+    ctx0_cntl: 0x0564,
+    ctx_distance: 1,
+    inv_eng0_req: 0x0587,
+    inv_eng0_ack: 0x0599,
+    inv_eng0_sem: 0x0575,
+    eng_distance: 1,
+    semaphore: true,
+    cntl_shift: 1,
 };
 
 /// Look up the per-hub register layout for `family` + `hub`.
@@ -233,6 +312,8 @@ pub fn regs_for(family: Family, hub: VmHub) -> Option<VmHubRegs> {
         (Family::Phoenix, VmHub::Mm) => Some(MMHUB_V3_0),
         (Family::Renoir, VmHub::Gfx) => Some(GFXHUB_V2_3),
         (Family::Renoir, VmHub::Mm) => Some(MMHUB_V2_3),
+        (Family::Navi4, VmHub::Gfx) => Some(GFXHUB_V12_0),
+        (Family::Navi4, VmHub::Mm) => Some(MMHUB_V4_1),
         _ => None,
     }
 }
@@ -384,39 +465,60 @@ pub fn write_vmid_cntl<M: VmHubMmio>(
     fault_on_invalid: bool,
 ) {
     let dword = regs.ctx0_cntl + regs.ctx_distance * (vmid as u32);
+    mmio.write(
+        dword << 2,
+        vmid_cntl_value(regs, depth, block_size, fault_on_invalid),
+    );
+}
+
+/// The CONTEXT_CNTL word [`write_vmid_cntl`] writes, for readback checks.
+pub fn vmid_cntl_value(regs: &VmHubRegs, depth: u8, block_size: u8, fault_on_invalid: bool) -> u32 {
     let mut val = CTX_CNTL_ENABLE_CONTEXT;
     val |= ((depth as u32) & CTX_CNTL_PT_DEPTH_MASK) << CTX_CNTL_PT_DEPTH_SHIFT;
     // `block_size - 9`, saturating: a block size below 9 is not a layout this
     // register can describe, and wrapping would set every bit of the field.
     let encoded = u32::from(block_size.saturating_sub(9));
-    val |= (encoded & CTX_CNTL_PT_BLOCK_SIZE_MASK) << CTX_CNTL_PT_BLOCK_SIZE_SHIFT;
+    // Everything from the block size up sits `cntl_shift` higher on GC 12.
+    let up = regs.cntl_shift;
+    val |= (encoded & CTX_CNTL_PT_BLOCK_SIZE_MASK) << (CTX_CNTL_PT_BLOCK_SIZE_SHIFT + up);
     if !fault_on_invalid {
-        val |= 1 << CTX_CNTL_RETRY_FAULT_SHIFT;
+        val |= 1 << (CTX_CNTL_RETRY_FAULT_SHIFT + up);
     }
-    val |= CTX_CNTL_FAULT_ENABLE_DEFAULTS;
-    mmio.write(dword << 2, val);
+    val | CTX_CNTL_FAULT_ENABLE_DEFAULTS << up
 }
 
-/// Issue a TLB invalidate for `vmid` on the given hub. The hub
-/// has `MAX_INVALIDATE_ENGINES` (typically 18) — engine 0 is the
-/// kernel-driver-issued one. Bit field layout per
-/// `gmc_v11_0.c::gmc_v11_0_flush_gpu_tlb_pasid` (and the older
-/// `gmc_v9_0.c`):
+/// The invalidation engine the kernel driver owns: `gmc_v*_0_flush_vm_hub`'s
+/// `const unsigned int eng = 17` ("Use register 17 for GART"). Linux hands
+/// engines 0..16 out to rings (`amdgpu_gmc_allocate_vm_inv_eng`), so a CPU
+/// invalidate on engine 0 would race whatever ring holds it.
+pub const KERNEL_INVALIDATE_ENGINE: u32 = 17;
+
+/// `gfxhub_v3_0_get_invalidate_req` (the same fields on every GFX10..12 hub,
+/// `GCVM_INVALIDATE_ENG0_REQ` in `gc_1*_sh_mask.h`):
 ///
-/// | bits  | field                       |
-/// |-------|-----------------------------|
-/// | 0     | PER_VMID_INVALIDATE_REQ.0   |
-/// | 7:4   | FLUSH_TYPE (0=range,1=ALL2) |
-/// | 8     | INVALIDATE_L2_PTES          |
-/// | 9     | INVALIDATE_L2_PDE0          |
-/// | 10    | INVALIDATE_L2_PDE1          |
-/// | 11    | INVALIDATE_L2_PDE2          |
-/// | 12    | INVALIDATE_L1_PTES          |
-/// | 13    | CLEAR_PROTECTION_FAULT_STATUS_ADDR |
-/// | 25:16 | PER_VMID_INVALIDATE_REQ bitmask |
+/// | bits  | field                              | value      |
+/// |-------|------------------------------------|------------|
+/// | 15:0  | PER_VMID_INVALIDATE_REQ            | 1 << vmid  |
+/// | 18:16 | FLUSH_TYPE                         | flush_type |
+/// | 19    | INVALIDATE_L2_PTES                 | 1          |
+/// | 20    | INVALIDATE_L2_PDE0                 | 1          |
+/// | 21    | INVALIDATE_L2_PDE1                 | 1          |
+/// | 22    | INVALIDATE_L2_PDE2                 | 1          |
+/// | 23    | INVALIDATE_L1_PTES                 | 1          |
+/// | 24    | CLEAR_PROTECTION_FAULT_STATUS_ADDR | 0          |
+pub fn invalidate_req(vmid: u8, flush_type: u8) -> u32 {
+    (1u32 << vmid) | (u32::from(flush_type) & 7) << 16 | 0x1f << 19
+}
+
+/// `gmc_v*_0_flush_vm_hub` for `vmid` on one hub, through the kernel's
+/// engine: on a hub that uses it, acquire the engine's semaphore (a read
+/// of 1); write the request; poll the ACK for the VMID's bit; release the
+/// semaphore (write 0). Linux releases it even when the ACK never comes,
+/// and so does this, before reporting the timeout.
 ///
-/// Polling the matching `_ACK` register tells us when the
-/// invalidate is done.
+/// LINUX-GAP: once KIQ or MES runs, Linux issues this through the firmware
+/// (`amdgpu_gmc_fw_reg_write_reg_wait`), which GFXOFF needs on bare metal.
+/// This is the register path Linux uses before then.
 pub fn write_invalidate_tlb<M: VmHubMmio>(
     mmio: &mut M,
     regs: &VmHubRegs,
@@ -426,29 +528,37 @@ pub fn write_invalidate_tlb<M: VmHubMmio>(
     if vmid >= 16 {
         return Err(TlbInvalidateError::BadVmid);
     }
-    // bit field per the table above.
-    let bits = ((flush_type as u32) & 0xF) << 4
-        | (1 << 8)  // L2 PTE
-        | (1 << 9)  // L2 PDE0
-        | (1 << 10) // L2 PDE1
-        | (1 << 11) // L2 PDE2
-        | (1 << 12) // L1 PTE
-        | (1 << 13) // clear fault status
-        | ((1u32 << (vmid as u32)) << 16); // per-VMID mask
-    mmio.write(regs.inv_eng0_req << 2, bits);
-    // Poll the ack; budget is generous (TLB invalidate is fast
-    // but real silicon can stall on outstanding accesses).
+    let eng = regs.eng_distance * KERNEL_INVALIDATE_ENGINE;
+    let sem = (regs.inv_eng0_sem + eng) << 2;
+    if regs.semaphore {
+        let mut i = 0u32;
+        while mmio.read(sem) & 1 == 0 {
+            i += 1;
+            if i >= TLB_POLL_BUDGET {
+                return Err(TlbInvalidateError::Semaphore);
+            }
+        }
+    }
+    mmio.write(
+        (regs.inv_eng0_req + eng) << 2,
+        invalidate_req(vmid, flush_type),
+    );
+    let vmid_bit = 1u32 << vmid;
     let mut i = 0u32;
-    let vmid_bit = 1u32 << (vmid as u32);
-    loop {
-        let ack = mmio.read(regs.inv_eng0_ack << 2);
-        if ack & vmid_bit != 0 {
-            break;
+    let acked = loop {
+        if mmio.read((regs.inv_eng0_ack + eng) << 2) & vmid_bit != 0 {
+            break true;
         }
         i += 1;
         if i >= TLB_POLL_BUDGET {
-            return Err(TlbInvalidateError::Timeout);
+            break false;
         }
+    };
+    if regs.semaphore {
+        mmio.write(sem, 0);
+    }
+    if !acked {
+        return Err(TlbInvalidateError::Timeout);
     }
     Ok(())
 }
@@ -456,6 +566,8 @@ pub fn write_invalidate_tlb<M: VmHubMmio>(
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TlbInvalidateError {
     BadVmid,
+    /// The engine's semaphore was never granted; nothing was requested.
+    Semaphore,
     Timeout,
 }
 
@@ -491,11 +603,8 @@ pub fn broadcast_invalidate_tlb<MG: VmHubMmio, MM: VmHubMmio>(
 /// changing a VMID's page-table root — all in-flight translations
 /// for that VMID need to drop.
 ///
-/// In production silicon there are up to 18 invalidate engines per
-/// hub (eng0 = host, eng1-17 = HW clients). For the bring-up arc
-/// we issue against eng0 — the host-owned engine — which is enough
-/// for the page-table-bind path. A future optimisation could issue
-/// to each engine in parallel and mask their _ACK bits.
+/// Both hubs go through the kernel's engine 17
+/// ([`KERNEL_INVALIDATE_ENGINE`]), as `gmc_v*_0_flush_gpu_tlb` does.
 pub fn invalidate_vmid_full<MG: VmHubMmio, MM: VmHubMmio>(
     mmio_gfx: &mut MG,
     regs_gfx: &VmHubRegs,
@@ -650,6 +759,24 @@ mod smoke_tests {
             return TestResult::Fail("MMHUB v2.3's start follows its base by two");
         }
 
+        // Each engine's semaphore block sits 0x12 below its REQ block; the
+        // engines are one register apart but on MMHUB v2.3, eight.
+        if GFXHUB_V3_0.inv_eng0_sem != 0x1699
+            || MMHUB_V3_0.inv_eng0_sem != 0x0751
+            || GFXHUB_V2_3.inv_eng0_sem != 0x160d
+            || MMHUB_V2_3.inv_eng0_sem != 0x0a00
+            || [GFXHUB_V3_0, MMHUB_V3_0, GFXHUB_V2_3]
+                .iter()
+                .any(|r| r.eng_distance != 1)
+            || MMHUB_V2_3.eng_distance != 8
+            || GFXHUB_V3_0.semaphore
+            || GFXHUB_V2_3.semaphore
+            || !MMHUB_V3_0.semaphore
+            || !MMHUB_V2_3.semaphore
+        {
+            return TestResult::Fail("invalidation semaphores and engine strides");
+        }
+
         // The CNTL block is one dword per context on every hub.
         if GFXHUB_V3_0.ctx0_cntl + GFXHUB_V3_0.ctx_distance != 0x1689
             || MMHUB_V3_0.ctx0_cntl + MMHUB_V3_0.ctx_distance != 0x0741
@@ -775,21 +902,101 @@ mod smoke_tests {
     }
     kernel_test_in!("drivers/gpu", smoke_write_vmid_cntl_enables_context);
 
+    /// GC 12 / MMHUB 4.1 against `gc_12_0_0_offset.h` and
+    /// `mmhub_4_1_0_offset.h`, and their CONTEXT_CNTL word as
+    /// `gfxhub_v12_0_setup_vmid_config` builds it from the GC 12 field
+    /// shifts: depth at 2:1, block size at 7:4, retry at 8, the seven fault
+    /// defaults at 11, 13, 15, 17, 19, 21 and 23.
+    fn smoke_navi4_hubs_and_gc12_context_cntl() -> TestResult {
+        let g = GFXHUB_V12_0;
+        let m = MMHUB_V4_1;
+        if g.ctx0_pt_base_lo + g.ctx_addr_distance != 0x1691
+            || g.ctx0_pt_start_lo + g.ctx_addr_distance != 0x16b1
+            || g.ctx0_pt_end_lo + g.ctx_addr_distance != 0x16d1
+            || g.ctx0_cntl + g.ctx_distance != 0x1625
+            || (g.inv_eng0_sem, g.inv_eng0_req, g.inv_eng0_ack) != (0x1635, 0x1647, 0x1659)
+            || m.ctx0_pt_base_lo + m.ctx_addr_distance != 0x05d1
+            || m.ctx0_pt_start_lo + m.ctx_addr_distance != 0x05f1
+            || m.ctx0_pt_end_lo + m.ctx_addr_distance != 0x0611
+            || m.ctx0_cntl + m.ctx_distance != 0x0565
+            || (m.inv_eng0_sem, m.inv_eng0_req, m.inv_eng0_ack) != (0x0575, 0x0587, 0x0599)
+            || g.semaphore
+            || !m.semaphore
+            || (g.cntl_shift, m.cntl_shift) != (1, 1)
+        {
+            return TestResult::Fail("GC 12 / MMHUB 4.1 offsets");
+        }
+        if regs_for(Family::Navi4, VmHub::Gfx).map(|r| r.ctx0_cntl) != Some(0x1624)
+            || regs_for(Family::Navi4, VmHub::Mm).map(|r| r.ctx0_cntl) != Some(0x0564)
+        {
+            return TestResult::Fail("Navi4 hub mapping");
+        }
+        let defaults = [11, 13, 15, 17, 19, 21, 23]
+            .iter()
+            .fold(0u32, |v, b| v | 1 << b);
+        for (hub, regs) in [("gfx", g), ("mm", m)] {
+            let _ = hub;
+            let mut io = MockVmHubMmio::new();
+            write_vmid_cntl(&mut io, &regs, 2, 3, 9, true);
+            let mut retry = MockVmHubMmio::new();
+            write_vmid_cntl(&mut retry, &regs, 2, 3, 10, false);
+            if io.writes != [((regs.ctx0_cntl + 2) << 2, 1 | 3 << 1 | defaults)]
+                || retry.writes
+                    != [(
+                        (regs.ctx0_cntl + 2) << 2,
+                        1 | 3 << 1 | 1 << 4 | 1 << 8 | defaults,
+                    )]
+            {
+                return TestResult::Fail("GC 12 CONTEXT_CNTL word");
+            }
+        }
+        // GFX11's word is unchanged.
+        let mut io = MockVmHubMmio::new();
+        write_vmid_cntl(&mut io, &GFXHUB_V3_0, 2, 3, 9, true);
+        if io.writes[0].1 != 1 | 3 << 1 | CTX_CNTL_FAULT_ENABLE_DEFAULTS {
+            return TestResult::Fail("GFX11 CONTEXT_CNTL word moved");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_navi4_hubs_and_gc12_context_cntl);
+
+    /// The kernel engine's REQ/ACK/SEM, as byte offsets.
+    fn eng17(r: &VmHubRegs) -> (u32, u32, u32) {
+        let e = r.eng_distance * KERNEL_INVALIDATE_ENGINE;
+        (
+            (r.inv_eng0_req + e) << 2,
+            (r.inv_eng0_ack + e) << 2,
+            (r.inv_eng0_sem + e) << 2,
+        )
+    }
+
+    /// `gfxhub_v3_0_get_invalidate_req`: the VMID mask in 15:0, FLUSH_TYPE
+    /// in 18:16, the four L2 and the L1 invalidates in 23:19, no fault
+    /// status clear.
+    fn smoke_invalidate_req_matches_linux_fields() -> TestResult {
+        if invalidate_req(0, 0) != 0x00f8_0001
+            || invalidate_req(5, 0) != 0x00f8_0020
+            || invalidate_req(15, 2) != 0x00fa_8000
+            || invalidate_req(3, 7) & 0x0007_0000 != 0x0007_0000
+            || invalidate_req(3, 0) & 1 << 24 != 0
+        {
+            return TestResult::Fail("invalidate request word");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_invalidate_req_matches_linux_fields);
+
+    /// A GFX hub invalidates on engine 17 with no semaphore: one request
+    /// write, then ACK polls for the VMID's bit.
     fn smoke_invalidate_tlb_polls_ack() -> TestResult {
         let mut m = MockVmHubMmio::new();
-        // Set up: ack reads 0 twice, then bit-for-VMID-2 appears.
-        m.auto_ack_after = Some(((GFXHUB_V3_0.inv_eng0_ack << 2), 1 << 2));
-        let r = write_invalidate_tlb(&mut m, &GFXHUB_V3_0, 2, 0);
-        if r.is_err() {
+        let (req, ack, _) = eng17(&GFXHUB_V3_0);
+        m.auto_ack_after = Some((ack, 1 << 2));
+        if write_invalidate_tlb(&mut m, &GFXHUB_V3_0, 2, 0).is_err() {
             return TestResult::Fail("tlb invalidate failed");
         }
-        // One write to REQ should have happened.
-        if !m
-            .writes
-            .iter()
-            .any(|(off, _)| *off == GFXHUB_V3_0.inv_eng0_req << 2)
-        {
-            return TestResult::Fail("REQ register not written");
+        if m.writes != [(req, invalidate_req(2, 0))] || req != (0x16ab + 17) << 2 {
+            return TestResult::Fail("one engine-17 request, no semaphore");
         }
         TestResult::Pass
     }
@@ -797,33 +1004,67 @@ mod smoke_tests {
 
     fn smoke_invalidate_tlb_bad_vmid_rejected() -> TestResult {
         let mut m = MockVmHubMmio::new();
-        if write_invalidate_tlb(&mut m, &GFXHUB_V3_0, 17, 0) != Err(TlbInvalidateError::BadVmid) {
+        if write_invalidate_tlb(&mut m, &GFXHUB_V3_0, 17, 0) != Err(TlbInvalidateError::BadVmid)
+            || !m.writes.is_empty()
+        {
             return TestResult::Fail("VMID 17 should be rejected");
         }
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_invalidate_tlb_bad_vmid_rejected);
 
+    /// An MMHUB invalidation holds engine 17's semaphore around the request
+    /// (acquire by reading 1, release by writing 0), including on MMHUB
+    /// v2.3, whose engines sit eight registers apart.
+    fn smoke_mmhub_invalidate_holds_the_semaphore() -> TestResult {
+        for r in [MMHUB_V3_0, MMHUB_V2_3] {
+            let (req, ack, sem) = eng17(&r);
+            let mut m = MockVmHubMmio::new();
+            m.reads.push_back((sem, 0));
+            m.reads.push_back((sem, 1));
+            m.auto_ack_after = Some((ack, 1 << 4));
+            if write_invalidate_tlb(&mut m, &r, 4, 0).is_err()
+                || m.writes != [(req, invalidate_req(4, 0)), (sem, 0)]
+            {
+                return TestResult::Fail("semaphore, request, release");
+            }
+        }
+        if eng17(&MMHUB_V2_3).0 != (0x0a01 + 8 * 17) << 2 {
+            return TestResult::Fail("MMHUB v2.3 engine stride");
+        }
+        // A semaphore never granted requests nothing.
+        let mut m = MockVmHubMmio::new();
+        if write_invalidate_tlb(&mut m, &MMHUB_V3_0, 4, 0) != Err(TlbInvalidateError::Semaphore)
+            || !m.writes.is_empty()
+        {
+            return TestResult::Fail("ungranted semaphore");
+        }
+        // An ACK that never comes still releases the semaphore.
+        let (req, _, sem) = eng17(&MMHUB_V3_0);
+        let mut m = MockVmHubMmio::new();
+        m.reads.push_back((sem, 1));
+        if write_invalidate_tlb(&mut m, &MMHUB_V3_0, 4, 0) != Err(TlbInvalidateError::Timeout)
+            || m.writes != [(req, invalidate_req(4, 0)), (sem, 0)]
+        {
+            return TestResult::Fail("timed-out ACK keeps the semaphore");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_mmhub_invalidate_holds_the_semaphore);
+
     fn smoke_broadcast_invalidate_writes_both_hubs() -> TestResult {
         let mut g = MockVmHubMmio::new();
         let mut m = MockVmHubMmio::new();
-        g.auto_ack_after = Some(((GFXHUB_V3_0.inv_eng0_ack << 2), 1 << 5));
-        m.auto_ack_after = Some(((MMHUB_V3_0.inv_eng0_ack << 2), 1 << 5));
-        broadcast_invalidate_tlb(&mut g, &GFXHUB_V3_0, &mut m, &MMHUB_V3_0, 5, 0)
-            .expect("broadcast");
-        if !g
-            .writes
-            .iter()
-            .any(|(off, _)| *off == GFXHUB_V3_0.inv_eng0_req << 2)
+        let (greq, gack, _) = eng17(&GFXHUB_V3_0);
+        let (mreq, mack, msem) = eng17(&MMHUB_V3_0);
+        g.auto_ack_after = Some((gack, 1 << 5));
+        m.auto_ack_after = Some((mack, 1 << 5));
+        m.reads.push_back((msem, 1));
+        if broadcast_invalidate_tlb(&mut g, &GFXHUB_V3_0, &mut m, &MMHUB_V3_0, 5, 0).is_err()
+            || g.writes != [(greq, invalidate_req(5, 0))]
+            || m.writes != [(mreq, invalidate_req(5, 0)), (msem, 0)]
         {
-            return TestResult::Fail("GFX hub not written");
-        }
-        if !m
-            .writes
-            .iter()
-            .any(|(off, _)| *off == MMHUB_V3_0.inv_eng0_req << 2)
-        {
-            return TestResult::Fail("MM hub not written");
+            return TestResult::Fail("both hubs");
         }
         TestResult::Pass
     }
@@ -832,15 +1073,17 @@ mod smoke_tests {
     fn smoke_invalidate_vmid_full_uses_range_flush_type() -> TestResult {
         let mut g = MockVmHubMmio::new();
         let mut m = MockVmHubMmio::new();
-        g.auto_ack_after = Some(((GFXHUB_V3_0.inv_eng0_ack << 2), 1 << 3));
-        m.auto_ack_after = Some(((MMHUB_V3_0.inv_eng0_ack << 2), 1 << 3));
-        invalidate_vmid_full(&mut g, &GFXHUB_V3_0, &mut m, &MMHUB_V3_0, 3).expect("full");
-        // The REQ word's flush_type field is bits[7:4]; we passed
-        // 0 for range — check the field is 0 in the first write
-        // to GFX hub's REQ register.
-        let req_off = GFXHUB_V3_0.inv_eng0_req << 2;
-        let req_write = g.writes.iter().find(|(off, _)| *off == req_off).unwrap();
-        if (req_write.1 >> 4) & 0xF != 0 {
+        let (greq, gack, _) = eng17(&GFXHUB_V3_0);
+        let (_, mack, msem) = eng17(&MMHUB_V3_0);
+        g.auto_ack_after = Some((gack, 1 << 3));
+        m.auto_ack_after = Some((mack, 1 << 3));
+        m.reads.push_back((msem, 1));
+        if invalidate_vmid_full(&mut g, &GFXHUB_V3_0, &mut m, &MMHUB_V3_0, 3).is_err() {
+            return TestResult::Fail("full");
+        }
+        // FLUSH_TYPE (18:16) is 0: a legacy, range invalidate.
+        let req = g.writes.iter().find(|(off, _)| *off == greq).unwrap();
+        if req.1 >> 16 & 7 != 0 {
             return TestResult::Fail("flush_type not 0 (range)");
         }
         TestResult::Pass

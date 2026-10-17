@@ -1081,6 +1081,28 @@ fn handle_transfer_3d(
 /// DRM syncobj ioctls on the render node, backed by this open's per-fd table.
 /// The DRM native context (radeonsi-over-virtio) creates syncobjs during device
 /// init and rendering. Dispatched by ioctl number (0xbf..=0xc5).
+/// The DRM syncobj ioctls (nr 0xbf..=0xc5) on any driver's open, against
+/// the open's own table.
+pub(crate) fn dispatch_syncobj(
+    cmd: u32,
+    arg: usize,
+    state: &VirtGpuRenderState,
+) -> Option<Result<u64, FsError>> {
+    let nr = crate::drm_uapi::ioc_nr(cmd);
+    (0xbf..=0xc5)
+        .contains(&nr)
+        .then(|| handle_syncobj(nr, arg, state))
+}
+
+impl VirtGpuRenderState {
+    /// This open's syncobj table.
+    pub(crate) fn syncobjs(
+        &self,
+    ) -> &narf_lib::sync::IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable> {
+        &self.syncobjs
+    }
+}
+
 fn handle_syncobj(nr: u32, arg: usize, state: &VirtGpuRenderState) -> Result<u64, FsError> {
     match nr {
         // SYNCOBJ_CREATE { u32 handle (out), u32 flags }

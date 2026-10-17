@@ -1034,27 +1034,20 @@ fn smoke_mt7921_init_ra_cfg_encode() -> TestResult {
 kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_init_ra_cfg_encode);
 
 fn smoke_mt7921_uni_dev_info_update_encode() -> TestResult {
-    use super::cmd::{
-        encode_uni_dev_info_update, UNI_DEV_INFO_BODY_SIZE, UNI_DEV_INFO_HDR_SIZE,
-        UNI_DEV_INFO_TAG_ACTIVE, UNI_DEV_INFO_TAG_INFO,
-    };
+    use super::cmd::{encode_uni_dev_info_update, UNI_DEV_INFO_BODY_SIZE};
     let mac = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
     let mut buf = [0xFFu8; UNI_DEV_INFO_BODY_SIZE];
-    encode_uni_dev_info_update(0, 0, true, mac, &mut buf).unwrap();
-    let tag = u16::from_le_bytes([buf[UNI_DEV_INFO_HDR_SIZE], buf[UNI_DEV_INFO_HDR_SIZE + 1]]);
-    if tag != UNI_DEV_INFO_TAG_ACTIVE {
-        return TestResult::Fail("ACTIVE TLV tag wrong");
+    encode_uni_dev_info_update(2, 1, true, mac, &mut buf).unwrap();
+    if buf
+        != [
+            2, 1, 0, 0, 0, 0, 12, 0, 1, 0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
+        ]
+    {
+        return TestResult::Fail("unified device body differs from Linux");
     }
-    if buf[UNI_DEV_INFO_HDR_SIZE + 4] != 1 {
-        return TestResult::Fail("active byte wrong");
-    }
-    let p = UNI_DEV_INFO_HDR_SIZE + 8;
-    let info_tag = u16::from_le_bytes([buf[p], buf[p + 1]]);
-    if info_tag != UNI_DEV_INFO_TAG_INFO {
-        return TestResult::Fail("INFO TLV tag wrong");
-    }
-    if buf[p + 8..p + 8 + 6] != mac {
-        return TestResult::Fail("own_mac round-trip wrong");
+    let mut short = [0xa5u8; 15];
+    if encode_uni_dev_info_update(0, 0, false, mac, &mut short).is_some() || short != [0xa5; 15] {
+        return TestResult::Fail("short device body partially written");
     }
     TestResult::Pass
 }

@@ -23,6 +23,9 @@ const STOP: u32 = 0x10020000;
 const STATUS: u32 = 0x1e3;
 const MASK: u32 = 0x1fffffff;
 const NATIVE_CHANNELS: u8 = 6;
+/// Linux dm_dmub_hw_init never compares the GPINT version reply with the
+/// firmware header on DCN3.0; a mismatch is only reported.
+const STRICT_VERSION: bool = false;
 #[allow(
     clippy::duplicate_mod,
     reason = "instantiate the shared protocol against each generation's private Engine and register accessors"
@@ -100,6 +103,16 @@ struct Layout {
     nbio: u64,
     hdp: u64,
 }
+/// The GMC-validated system aperture handed to DMUB, as Linux
+/// dm_dmub_hw_init fills `soc_fb_info`: fb_base = `gmc.fb_start`,
+/// fb_offset = `vm_manager.vram_base_offset` (MC_VM_FB_OFFSET). DCN's own
+/// DCN_VM_FB_* copy is not programmed before DC init and is never read here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Aperture {
+    base: u64,
+    end: u64,
+    offset: u64,
+}
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
         if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
@@ -109,8 +122,8 @@ impl Layout {
             return Err(Error::Unsupported);
         }
         Ok(Self {
-            dcn: bank(gpu, ip::HW_ID_DCN, &[(3, 0, 0)], 2, 0x477)
-                .map_err(|_| Error::Unsupported)?,
+            // Highest DCN register used: MMHUBBUB_SOFT_RESET (0x341).
+            dcn: bank(gpu, ip::HW_ID_DCN, &[(3, 0, 0)], 2, HUB).map_err(|_| Error::Unsupported)?,
             nbio: bank(
                 gpu,
                 ip::HW_ID_NBIF,
@@ -197,6 +210,22 @@ fn is_running(io: &mut impl Io, l: Layout) -> Result<bool, Error> {
         && read(io, l.dcn, HUB)? & 0x100 == 0
         && read(io, l.dcn, STATUS)? & 3 == 3)
 }
+/// The register half of dmub_dcn20_reset: clear GPINT, assert DMCUB soft
+/// reset, disable, hold DMUIF reset and clear the mailbox pointers/SCRATCH0.
+fn hold_reset(io: &mut impl Io, base: u64) -> Result<(), Error> {
+    io.write(base + u64::from(GPINT) * 4, 0);
+    update(io, base, CNTL, RESET, RESET)?;
+    update(io, base, CNTL, ENABLE, 0)?;
+    update(io, base, HUB, 0x100, 0x100)?;
+    if !is_reset(io, base)? {
+        return Err(Error::Readback);
+    }
+    // Never touch SEC_CNTL or CW0/CW1: PSP owns their authentication.
+    for reg in [0x1d6, 0x1d7, 0x1da, 0x1db, 0x1de, 0x1df, STATUS] {
+        io.write(base + u64::from(reg) * 4, 0);
+    }
+    Ok(())
+}
 fn invalidate(io: &mut impl Io, l: Layout) {
     io.write(l.hdp + 0xd1 * 4, 1);
     io.read(l.hdp + 0xd1 * 4);
@@ -263,27 +292,36 @@ impl<I: Io> Engine<I> {
                 tick().await;
             }
         }
-        self.access(|io| {
-            io.write(base + u64::from(GPINT) * 4, 0);
-            update(io, base, CNTL, RESET, RESET)?;
-            update(io, base, CNTL, ENABLE, 0)?;
-            update(io, base, HUB, 0x100, 0x100)?;
-            if !is_reset(io, base)? {
-                return Err(Error::Readback);
-            }
-            // Never touch SEC_CNTL or CW0/CW1: PSP owns their authentication.
-            for reg in [0x1d6, 0x1d7, 0x1da, 0x1db, 0x1de, 0x1df, STATUS] {
-                io.write(base + u64::from(reg) * 4, 0);
-            }
-            Ok(())
-        })
+        self.access(|io| hold_reset(io, base))
     }
-    async fn start(&mut self, tmr: Range<u64>) -> Result<Status, Error> {
+    /// dmub_srv_hw_init begins with `dmub_dcn20_reset` even after PSP loaded
+    /// the firmware: STOP_FW if running, bounded acknowledgement, then a
+    /// forced reset ("in case we timed out, DMCUB is likely hung").
+    async fn reset_after_load(&mut self) -> Result<(), Error> {
+        let base = self.layout.dcn;
+        let control = self.access(|io| read(io, base, CNTL))?;
+        if control & RESET == 0 {
+            self.access(|io| {
+                io.write(base + u64::from(GPINT) * 4, STOP);
+                Ok(())
+            })?;
+            let deadline = narf_time::Deadline::after_ms(100);
+            while !self.access(|io| {
+                Ok(read(io, base, GPINT)? == STOP & !(1 << 28)
+                    && read(io, base, 0x1ea)? == 0xdeaddead)
+            })? && !deadline.expired()
+            {
+                tick().await;
+            }
+        }
+        self.access(|io| hold_reset(io, base))
+    }
+    async fn start(&mut self, tmr: Range<u64>, fb: Aperture) -> Result<Status, Error> {
         if self.state != State::Reset {
             return Err(Error::Busy);
         }
         self.state = State::Starting;
-        let result = self.start_inner(tmr).await;
+        let result = self.start_inner(tmr, fb).await;
         self.state = if result.is_ok() {
             State::Running
         } else {
@@ -294,17 +332,25 @@ impl<I: Io> Engine<I> {
         }
         result
     }
-    async fn start_inner(&mut self, tmr: Range<u64>) -> Result<Status, Error> {
+    async fn start_inner(&mut self, tmr: Range<u64>, fb: Aperture) -> Result<Status, Error> {
         let l = self.layout;
         let address = self.memory.address();
         let shape = self.prepared.layout;
+        if !self.access(|io| is_reset(io, l.dcn))? {
+            self.reset_after_load().await?;
+        }
         let placement = self.access(|io| {
             if !is_reset(io, l.dcn)? || read(io, l.dcn, 0x1ce)? & (1 << 16) != 0 {
                 return Err(Error::Busy);
             }
-            let fb = u64::from(read(io, l.dcn, 0x475)? & 0xffffff) << 24;
-            let end = (u64::from(read(io, l.dcn, 0x476)? & 0xffffff) + 1) << 24;
-            let offset = u64::from(read(io, l.dcn, 0x477)? & 0xffffff) << 24;
+            let Aperture {
+                base: fb,
+                end,
+                offset,
+            } = fb;
+            if fb >= end {
+                return Err(Error::Invalid);
+            }
             let place = shape.place(address, fb..end).map_err(Error::Firmware)?;
             if tmr.start < fb
                 || tmr.start >= tmr.end
@@ -413,7 +459,8 @@ impl<I: Io> Engine<I> {
                 (0x1dd, 8192),
                 (0x1d8, 0xa0000010),
                 (0x1d9, trace_size - 16),
-                (0x1f1, 1 << 5),
+                // dmub_dcn20_enable_dmub_boot_options: all-zero on DCN3.0.
+                (0x1f1, 0),
                 (0x1f2, psp_version & 0x001100ff),
             ] {
                 io.write(l.dcn + u64::from(reg) * 4, value);
@@ -452,6 +499,8 @@ impl<I: Io> Engine<I> {
 #[derive(Debug)]
 pub struct Dmub {
     engine: Engine<Mmio>,
+    /// RCC_CONFIG_MEMSIZE: the aperture end is fb_start + mc_vram_size.
+    vram_size: u64,
 }
 impl Dmub {
     /// Reserve all nonsecure DMUB storage without I/O.
@@ -480,6 +529,7 @@ impl Dmub {
                 status: None,
                 mailbox: mailbox::Mailbox::new(),
             },
+            vram_size: gpu.vram.size,
         })
     }
     /// Stop inherited firmware and hold DCN3.0 reset before PSP replaces CW0/1.
@@ -494,7 +544,11 @@ impl Dmub {
     /// after failure or cancellation without independent recovery.
     pub async unsafe fn start(&mut self, psp: &Psp) -> Result<Status, Error> {
         let tmr = psp.dmub_tmr().map_err(|_| Error::Invalid)?;
-        self.engine.start(tmr).await?;
+        let (base, offset) = psp.fb_location();
+        let end = base.checked_add(self.vram_size).ok_or(Error::Invalid)?;
+        self.engine
+            .start(tmr, Aperture { base, end, offset })
+            .await?;
         if let Err(error) = self.engine.initialize_mailbox().await {
             self.engine.state = State::Failed;
             return Err(error);
