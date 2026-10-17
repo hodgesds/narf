@@ -1005,6 +1005,105 @@ impl ColdBoot {
         let smu = self.sequence.backend.smu.as_mut().ok_or(Error::Invalid)?;
         smu.reenable_acdc_interrupt().await.map_err(Error::Smu)
     }
+    /// Every kernel queue passed its ring and IB tests.
+    pub fn queues_verified(&self) -> bool {
+        matches!(self.sequence.state, State::FirmwareReady(_))
+            && self
+                .sequence
+                .backend
+                .queues
+                .as_ref()
+                .and_then(Queues::proof)
+                .is_some()
+    }
+    /// TDR sample of every verified kernel queue; empty without queues.
+    pub(crate) fn queue_progress(
+        &mut self,
+    ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_tdr::Progress>, Error> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_)) {
+            return Err(Error::Busy);
+        }
+        let mut samples = alloc::vec::Vec::new();
+        let Some(queues) = self.sequence.backend.queues.as_mut() else {
+            return Ok(samples);
+        };
+        if queues.proof().is_none() {
+            return Ok(samples);
+        }
+        samples
+            .try_reserve_exact(5)
+            .map_err(|_| Error::Allocation)?;
+        samples.push(queues.gfx.progress().map_err(Error::Queues)?);
+        samples.extend(queues.compute.progress().map_err(Error::Queues)?);
+        samples.extend(queues.sdma.progress().map_err(Error::Queues)?);
+        Ok(samples)
+    }
+    /// Whether `into_recovery` can rebuild this owner: a completed boot with
+    /// a board power table and IH, and no GDDR6 training to replay (Linux
+    /// replays it as `PSP_MEM_TRAIN_RESUME`; NARF has no short training).
+    pub fn recoverable(&self) -> bool {
+        let h = &self.sequence.backend;
+        matches!(self.sequence.state, State::FirmwareReady(_))
+            && h.training.is_none()
+            && h.firmware.power.is_some()
+            && h.psp.is_some()
+            && h.ih.is_some()
+    }
+    /// Recovery quiesce: bounded `navi10_ih_irq_disable`, after which every
+    /// IH subscriber (fence routing, thermal) has received `Disabled`.
+    ///
+    /// # Safety
+    /// Recovery's contract (`amdgpu_navi22_platform::recover`): this owner is
+    /// about to be reset, and no consumer depends on IH delivery any more.
+    pub(crate) async unsafe fn quiesce_for_reset(&mut self) -> Result<(), Error> {
+        if !self.recoverable() {
+            return Err(Error::Busy);
+        }
+        let ih = self.sequence.backend.ih.as_mut().ok_or(Error::Invalid)?;
+        // SAFETY: forwarded recovery contract; the ring is quarantined.
+        unsafe { ih.disable().await }.map_err(Error::Interrupts)
+    }
+    /// Rebuild a fresh cold-boot owner for `amdgpu_device_gpu_recover`: the
+    /// same GPU snapshot, authority, pool and prepared firmware, a
+    /// `Reset::new_recovery` mode1 reset in `ResetOnInit`, and newly reserved
+    /// memory hubs, SDMA proof, IH and kernel queues (same BAR2 doorbells).
+    /// DMUB is not restarted. Every old owner is dropped without I/O, so its
+    /// published VRAM stays quarantined. No device I/O happens here.
+    ///
+    /// # Safety
+    /// `quiesce_for_reset` completed, `device` is this GPU's PCI function
+    /// and recovery's whole-device contract holds. Run the result once.
+    pub(crate) unsafe fn into_recovery(self, device: narf_bus::BusDevice) -> Result<Self, Error> {
+        if !self.recoverable() {
+            return Err(Error::Busy);
+        }
+        let Hardware {
+            gpu,
+            authority,
+            pool,
+            firmware,
+            queues,
+            ..
+        } = self.sequence.backend;
+        let doorbells = queues.as_ref().map(|q| q.doorbells);
+        drop(queues);
+        // SAFETY: forwarded exclusive whole-GPU contract; the mode1 reset
+        // below runs before any firmware stage touches the device.
+        let mut boot = unsafe { Self::new(&gpu, authority, &pool, firmware) }?;
+        let h = &mut boot.sequence.backend;
+        // SAFETY: forwarded recovery contract; construction has no I/O.
+        h.reset = Some(
+            unsafe { crate::amdgpu_reset_navi22::Reset::new_recovery(&h.gpu, h.authority, device) }
+                .map_err(Error::Reset)?,
+        );
+        boot.prepare_memory_hubs()?;
+        boot.prepare_sdma()?;
+        boot.prepare_interrupts(device)?;
+        if let Some(doorbells) = doorbells {
+            boot.prepare_queues(doorbells)?;
+        }
+        Ok(boot)
+    }
     /// Transfer the live ring/TMR owner after full firmware success. It must
     /// remain alive for subsequent GPU initialization; dropping it quarantines
     /// device-owned VRAM. Reset all consumers before calling its unsafe stop.

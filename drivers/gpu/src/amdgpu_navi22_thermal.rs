@@ -263,6 +263,13 @@ pub(crate) fn spawn(
     }
 }
 
+/// Recovery quiesce: the current tasks end at their next IV; their IH
+/// subscriptions close with the old ring.
+pub(crate) fn stop() {
+    EPOCH.fetch_add(1, Ordering::AcqRel);
+    STATUS.lock().armed = None;
+}
+
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi22_thermal_tests.rs"]
 mod tests;

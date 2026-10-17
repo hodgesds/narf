@@ -3372,6 +3372,36 @@ reduces to its forced fallback, `narf_power::system::power_off()`.
 `amdgpu_navi22_thermal::status()` (also in platform `Diagnostics::thermal`)
 reports the alert, per-source counters and any shutdown reason.
 
+Hang detection (`amdgpu_navi22_tdr`) follows drm_sched's per-ring job timeout
+with Linux's default `lockup_timeout` of 2 s for every queue. After a boot whose
+queues all verified, a task samples every 250 ms, under the owner lock,
+`Progress { engine, emitted, signaled }` of GFX, KIQ, compute and SDMA0/1
+(`ColdBoot::queue_progress`: the queue's last sequence and its fence writeback
+after an HDP invalidate; an all-ones read-back is device loss). The per-engine
+timer starts when unsignalled work is first seen and restarts on every fence
+advance; a stall past the timeout logs `ring <engine> timeout, signaled seq=…,
+emitted seq=…` once and is retained in `tdr::status()`. Detection is always on;
+recovery is triggered only by `unsafe tdr::set_automatic_recovery(true)` (off by
+default) or an explicit call.
+
+`unsafe amdgpu_navi22_platform::recover().await` is the opt-in
+`amdgpu_device_gpu_recover` for mode1 (`amdgpu_navi22_recovery::Recovery`, state
+stored outside the future). `check` refuses (`Unsupported`, no side effects) a
+boot that needed GDDR6 training (no short-training replay yet) or lacks a board
+table, PSP or IH. Quiesce stops TDR, telemetry and thermal, disables the IH ring
+(every subscriber gets `Disabled`) and calls `amdgpu_fence_navi22::abandon_all`,
+which ends every pending fence wait with its error. Reinitialize consumes the
+owner (`ColdBoot::into_recovery`: same snapshot, authority, pool and prepared
+firmware; old owners dropped without I/O, their VRAM quarantined), prepares a
+`Reset::new_recovery` — the reset-on-init core without the SOS shortcut — plus
+fresh hubs, SDMA proof, IH and queues on the same BAR2 doorbells, stores it,
+and runs the complete cold-boot sequence including ring/IB tests. Restart
+re-arms telemetry, thermal and TDR. DMUB/display are not restarted: the screen
+stays dark until the display owner restarts DMUB and modesets. Any failure or
+cancellation is terminal `Lost`: services stop, fence waits are abandoned and
+the old and new IH endpoints close with `DeviceLost`. `recoveries()` counts
+successes; platform `Diagnostics` adds `tdr` and `recovery`. Model-tested only.
+
 ### Navi 22 DCN3.0 DMUB startup
 
 `amdgpu_dmub_navi22::Prepared::new(image, vbios, psp_version)` parses the

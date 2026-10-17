@@ -28,6 +28,20 @@ pub const POLL_US: u64 = 1000;
 static WAKERS: [IrqSafeSpinLock<Option<Waker>>; ENGINES] =
     [const { IrqSafeSpinLock::new(None) }; ENGINES];
 static INTERRUPTS: [AtomicU64; ENGINES] = [const { AtomicU64::new(0) }; ENGINES];
+/// Bumped when the device is reset or lost: work emitted before it can
+/// never signal, so every waiter that started earlier completes with error.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Recovery/device-loss hook (`amdgpu_fence_driver_force_completion`):
+/// abandon every outstanding wait and wake it to complete with its error.
+pub fn abandon_all() {
+    GENERATION.fetch_add(1, Ordering::AcqRel);
+    notify_all();
+}
+/// Observability: number of resets/device losses that abandoned work.
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
+}
 
 /// IH hook: an engine reported completion. Safe from IRQ or task context:
 /// the stored waker is only woken by reference, never dropped here.
@@ -88,12 +102,14 @@ pub(crate) async fn wait<T, E>(
     timeout: E,
     mut sample: impl FnMut() -> Result<Option<T>, E>,
 ) -> Result<T, E> {
+    let generation = GENERATION.load(Ordering::Acquire);
     loop {
         let expired = deadline.expired();
         if let Some(value) = sample()? {
             return Ok(value);
         }
-        if expired {
+        // Abandoned by a reset/device loss: complete now, with the error.
+        if expired || GENERATION.load(Ordering::Acquire) != generation {
             return Err(timeout);
         }
         Tick {
@@ -157,6 +173,23 @@ mod tests {
         ));
         if failed != Err(9) {
             return TestResult::Fail("fence sample error swallowed");
+        }
+        // A reset abandons a pending wait well before its deadline.
+        let polls = Cell::new(0);
+        let abandoned = narf_scheduler::block_on_spin(wait(
+            Engine::Sdma0,
+            narf_time::Deadline::after_ms(60_000),
+            "abandoned",
+            || {
+                polls.set(polls.get() + 1);
+                if polls.get() == 2 {
+                    abandon_all();
+                }
+                Ok::<Option<()>, _>(None)
+            },
+        ));
+        if abandoned != Err("abandoned") || polls.get() != 2 {
+            return TestResult::Fail("reset did not complete abandoned work");
         }
         TestResult::Pass
     }

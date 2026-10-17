@@ -261,6 +261,18 @@ pub(crate) fn start(limits: Option<Limits>) {
     narf_scheduler::spawn(monitor(epoch));
 }
 
+/// Stop the current monitor (recovery quiesce or device loss); hwmon keeps
+/// the last sample and reports `error`.
+pub(crate) fn stop(error: Option<smu::Error>) {
+    use core::sync::atomic::Ordering;
+    EPOCH.fetch_add(1, Ordering::AcqRel);
+    if let Some(snapshot) = SNAPSHOT.lock().as_mut() {
+        if error.is_some() {
+            snapshot.error = error;
+        }
+    }
+}
+
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi22_power_tests.rs"]
 mod tests;

@@ -559,6 +559,22 @@ impl Queue {
     }
 }
 
+/// TDR sample: the last emitted sequence and the fence writeback, read after
+/// an HDP invalidate. An all-ones invalidate read-back means device loss.
+pub(crate) fn progress<I: Io>(
+    hw: &mut Hw<I>,
+    queue: &Queue,
+) -> Result<crate::amdgpu_navi22_tdr::Progress, Error> {
+    hw.access(|io, l| {
+        let signaled = queue.read(io, l, FENCE);
+        checked(io.read(l.hdp + 0xd1 * 4))?;
+        Ok(crate::amdgpu_navi22_tdr::Progress {
+            engine: queue.engine,
+            emitted: queue.seq,
+            signaled,
+        })
+    })
+}
 /// Wait for the engine to write `seq` into the queue's fence slot.
 pub(crate) async fn wait_fence<I: Io>(
     hw: &mut Hw<I>,
@@ -927,6 +943,13 @@ impl Gfx {
     }
     pub fn proof(&self) -> GfxProof {
         self.engine.proof
+    }
+    /// Fence progress of the verified ring (hang detection only).
+    pub(crate) fn progress(&mut self) -> Result<crate::amdgpu_navi22_tdr::Progress, Error> {
+        if self.engine.state != GfxState::Verified {
+            return Err(Error::Busy);
+        }
+        progress(&mut self.engine.hw, &self.engine.queue)
     }
 }
 
