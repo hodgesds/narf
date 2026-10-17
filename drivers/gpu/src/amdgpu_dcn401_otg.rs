@@ -43,7 +43,9 @@ pub use hdmi::HdmiTmdsRetired;
 #[path = "amdgpu_dcn401_hdmi_link.rs"]
 mod hdmi_link;
 pub use hdmi_link::audio::MstAudioPayload;
-pub(crate) use hdmi_link::audio::{frl_audio_info, mst_audio_info, uhbr_audio_info};
+pub(crate) use hdmi_link::audio::{
+    acr, channels, descriptors, frl_audio_info, mst_audio_info, uhbr_audio_info,
+};
 pub(crate) use hdmi_link::avi_infoframe;
 pub use hdmi_link::{
     AudioInfo, AudioMode, Avi, DisplayAudio, HdmiLinkReady, HdmiLinkRequest, HdmiVideoRunning,

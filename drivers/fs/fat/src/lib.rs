@@ -27,6 +27,7 @@
 
 extern crate alloc;
 
+pub mod bootlog;
 pub mod bpb;
 pub mod dir;
 pub mod fat;
@@ -115,6 +116,8 @@ pub fn register_initcalls() {
         register_fstypes();
         InitResult::Ok
     });
+    // Persistent boot log (`narf.bootlog=<token>`); inert without the arg.
+    narf_init::register(Stage::Late, "fat-bootlog", bootlog::start);
 }
 
 /// Factory for FsType::Fat. Wraps the sync block device in a

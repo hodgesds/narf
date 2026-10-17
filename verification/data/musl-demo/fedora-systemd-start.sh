@@ -79,8 +79,17 @@ export QT_QPA_PLATFORM=wayland
 export QT_LOGGING_RULES="kwin_*.debug=true"
 export XDG_SESSION_TYPE=wayland
 export XDG_CURRENT_DESKTOP=KDE
-export LIBGL_ALWAYS_SOFTWARE=1
-export GALLIUM_DRIVER=llvmpipe
+# Software GL unless an amdgpu render node exists: Mesa's loader maps the
+# amdgpu kernel driver to radeonsi itself, and EGL retries in software when
+# the hardware screen cannot be created. Every QEMU card (bochs, virtio-gpu
+# 2D) still lands on llvmpipe exactly as before. NARF_MESA_SOFTWARE=1 forces
+# llvmpipe regardless. (docs/MESA_AMD.md)
+if [ "${NARF_MESA_SOFTWARE:-0}" = 1 ] ||
+   ! cat /sys/class/drm/renderD*/uevent /sys/class/drm/renderD*/device/uevent 2>/dev/null |
+     grep -qx 'DRIVER=amdgpu'; then
+  export LIBGL_ALWAYS_SOFTWARE=1
+  export GALLIUM_DRIVER=llvmpipe
+fi
 
 echo "=== FED-SYSTEMD launching Plasma ==="
 dbus-run-session -- startplasma-wayland &

@@ -293,3 +293,63 @@ fn smoke_klog_console_only_not_recorded() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("console/klog", smoke_klog_console_only_not_recorded);
+
+/// `export_since` renders dmesg-style lines, chunks by size without
+/// duplicating or skipping a record, and reports records lost to the ring.
+fn smoke_klog_export_since_chunks_without_gaps() -> TestResult {
+    let seq = next_seq();
+    for line in [
+        "narf-export-probe-a\n",
+        "narf-export-probe-b\n",
+        "narf-export-probe-c\n",
+    ] {
+        crate::write_str(line);
+    }
+    let Some(all) = export_since(seq, usize::MAX, true) else {
+        return TestResult::Fail("export_since refused an idle store");
+    };
+    let text = core::str::from_utf8(&all.text).unwrap_or("");
+    let probes: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("narf-export-probe-"))
+        .collect();
+    if probes.len() != 3
+        || !probes
+            .iter()
+            .all(|l| l.starts_with('[') && l.contains("] narf-export-probe-"))
+        || all.next_seq < seq + 3
+        || all.lost != 0
+    {
+        return TestResult::Fail("full export missing records or prefixes");
+    }
+    // One record per chunk with a tiny budget; the cursor walks every record.
+    let mut cursor = seq;
+    let mut joined = Vec::new();
+    for _ in 0..64 {
+        let Some(chunk) = export_since(cursor, 1, false) else {
+            return TestResult::Fail("non-blocking export refused an idle store");
+        };
+        if chunk.next_seq == cursor {
+            break;
+        }
+        if chunk.next_seq != cursor + 1 {
+            return TestResult::Fail("a 1-byte budget must still export exactly one record");
+        }
+        joined.extend_from_slice(&chunk.text);
+        cursor = chunk.next_seq;
+        if cursor >= all.next_seq {
+            break;
+        }
+    }
+    if joined != all.text {
+        return TestResult::Fail("chunked export differs from the single export");
+    }
+    // A cursor below the ring's oldest record reports the gap.
+    if let Some(first) = export_since(0, 1, true) {
+        if first.lost != first_seq() {
+            return TestResult::Fail("lost count must equal records evicted before seq");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("console/klog", smoke_klog_export_since_chunks_without_gaps);

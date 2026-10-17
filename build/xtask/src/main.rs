@@ -38,6 +38,7 @@ mod http3_smoke;
 mod net_robust;
 mod passthrough;
 mod relocs;
+mod usb_image;
 
 #[derive(Parser)]
 #[command(author, version, about = "NARF build orchestrator")]
@@ -246,6 +247,11 @@ enum Cmd {
     /// + /bin/sh. Boot picks the root via `root=PARTLABEL=NARF_ROOT`
     /// on the kernel cmdline.
     DiskWritePartitioned(DiskWritePartitionedArgs),
+    /// Build a UEFI USB-stick image file (MBR + FAT32 ESP) with the
+    /// persistent boot log enabled (`narf.bootlog=<token>` + marker file).
+    /// Write it with `disk-write --iso <image>`; `--qemu` boots a copy as
+    /// QEMU USB storage and prints the logs it wrote.
+    UsbImage(usb_image::UsbImageArgs),
     /// Wrap a raw firmware payload with the NARF trailer
     /// (`firmware/specification/spec.md` §6). Accepts a detached signature
     /// and public key; omitting both produces a developer-only unsigned
@@ -1404,6 +1410,7 @@ impl Arch {
                 let append = [
                     std::env::var("XTASK_QEMU_APPEND").unwrap_or_default(),
                     extra_bootargs.to_string(),
+                    btrfs_smoke_bootarg().to_string(),
                 ]
                 .into_iter()
                 .filter(|value| !value.is_empty())
@@ -1610,6 +1617,7 @@ impl Arch {
                 let append = [
                     std::env::var("XTASK_QEMU_APPEND").unwrap_or_default(),
                     extra_bootargs.to_string(),
+                    btrfs_smoke_bootarg().to_string(),
                 ]
                 .into_iter()
                 .filter(|value| !value.is_empty())
@@ -2161,6 +2169,17 @@ fn verify_btrfs_write_interop() -> Result<()> {
     } else {
         eprintln!("{combined}");
         bail!("`btrfs check` reported errors on the NARF-written image (write-interop regression)");
+    }
+}
+
+/// The kernel's btrfs read/write smokes mutate whichever btrfs volume they
+/// find, so they run only with `narf.btrfs_smoke`, which xtask passes solely
+/// when it serves its own disposable `narf-nvme-btrfs.img` on nvme0.
+fn btrfs_smoke_bootarg() -> &'static str {
+    if KERNEL_TEST_DISK.load(std::sync::atomic::Ordering::Relaxed) {
+        "narf.btrfs_smoke"
+    } else {
+        ""
     }
 }
 
@@ -12311,6 +12330,12 @@ fn main() -> Result<()> {
         }
         Cmd::DiskWrite(args) => disk_write_cmd(&args),
         Cmd::DiskWritePartitioned(args) => disk_write_partitioned_cmd(&args),
+        Cmd::UsbImage(mut args) => {
+            // Same kernel configuration as `xtask image`.
+            ensure_feature(&mut args.build.features, "boot-init");
+            ensure_feature(&mut args.build.features, "firmware-allow-unsigned");
+            usb_image::usb_image_cmd(&args)
+        }
         Cmd::PackFirmware(args) => pack_firmware_cmd(&args),
         Cmd::ImportFirmware(args) => import_firmware_cmd(&args),
         Cmd::Demo(mut args) => {
