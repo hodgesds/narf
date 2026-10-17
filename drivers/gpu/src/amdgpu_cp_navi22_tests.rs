@@ -908,3 +908,37 @@ kernel_test_in!(
     "drivers/gpu/cp-navi22",
     cp_navi22_owner_constructors_reserve_without_io
 );
+
+fn cp_navi22_fence_interrupts_arm_eop_and_both_sdma_traps() -> TestResult {
+    let mut model = enabled();
+    for (reg, value) in [
+        (r(CP_INT_CNTL_RING0), 0x0000_0001),
+        (r(CP_ME1_PIPE0_INT_CNTL), 0),
+        (sdma(0, SDMA0_CNTL), 0x22),
+        (sdma(1, SDMA0_CNTL), 0x22),
+    ] {
+        model.regs.insert(reg, value);
+    }
+    if enable_fence_irqs(&mut model, layout()).is_err() {
+        return TestResult::Fail("fence interrupt enable failed");
+    }
+    let expected = [
+        (r(CP_INT_CNTL_RING0), 0x0400_0001),
+        (r(CP_ME1_PIPE0_INT_CNTL), 0x0400_0000),
+        (sdma(0, SDMA0_CNTL), 0x23),
+        (sdma(1, SDMA0_CNTL), 0x23),
+    ];
+    if model.writes != expected {
+        return TestResult::Fail("wrong EOP/trap enable writes or clobbered neighbouring bits");
+    }
+    let mut model = enabled();
+    model.regs.insert(r(CP_INT_CNTL_RING0), u32::MAX);
+    if enable_fence_irqs(&mut model, layout()).is_ok() || !model.writes.is_empty() {
+        return TestResult::Fail("absent device received interrupt enables");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    cp_navi22_fence_interrupts_arm_eop_and_both_sdma_traps
+);

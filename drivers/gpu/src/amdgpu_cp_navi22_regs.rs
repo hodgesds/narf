@@ -71,6 +71,7 @@ pub const CP_MEC_DOORBELL_RANGE_LOWER: Reg = Reg(0, 0x1dfc);
 pub const CP_MEC_DOORBELL_RANGE_UPPER: Reg = Reg(0, 0x1dfd);
 pub const CP_INT_CNTL_RING0: Reg = Reg(0, 0x1e0a);
 pub const CP_INT_CNTL_RING1: Reg = Reg(0, 0x1e0b);
+pub const CP_ME1_PIPE0_INT_CNTL: Reg = Reg(0, 0x1e25);
 pub const CP_MAX_CONTEXT: Reg = Reg(0, 0x1e4e);
 pub const CP_RB0_BASE_HI: Reg = Reg(0, 0x1e51);
 pub const CP_RB_WPTR_POLL_ADDR_LO: Reg = Reg(0, 0x1e8b);

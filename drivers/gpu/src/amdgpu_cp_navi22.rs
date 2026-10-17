@@ -948,6 +948,51 @@ pub unsafe fn enable_doorbell_apertures(
     hw.access(|io, l| enable_doorbells(io, l, doorbells.bus))
 }
 
+/// `TIME_STAMP_INT_ENABLE` in CP_INT_CNTL_RING0 / CP_ME1_PIPE0_INT_CNTL.
+const TIME_STAMP_INT_ENABLE: u32 = 1 << 26;
+/// `SDMA0_CNTL.TRAP_ENABLE`.
+const SDMA_TRAP_ENABLE: u32 = 1;
+/// The interrupt sources `amdgpu_fence_driver_hw_init` arms through
+/// `amdgpu_irq_get` for the kernel rings created here:
+/// `gfx_v10_0_set_gfx_eop_interrupt_state` (ME0 pipe 0),
+/// `gfx_v10_0_set_compute_eop_interrupt_state` (MEC1 pipe 0) and
+/// `sdma_v5_2_set_trap_irq_state` (both engines). The KIQ's MEC2 pipe is not
+/// armed, as in Linux; its fences stay polled.
+pub(crate) fn enable_fence_irqs<I: Io>(io: &mut I, l: Layout) -> Result<(), Error> {
+    for reg in [CP_INT_CNTL_RING0, CP_ME1_PIPE0_INT_CNTL] {
+        update(io, l.reg(reg), TIME_STAMP_INT_ENABLE, TIME_STAMP_INT_ENABLE)?;
+    }
+    // Re-armed after SdmaQueues' soft reset cleared the IH proof's enable.
+    for instance in 0..2 {
+        update(
+            io,
+            l.sdma(instance, SDMA0_CNTL),
+            SDMA_TRAP_ENABLE,
+            SDMA_TRAP_ENABLE,
+        )?;
+    }
+    Ok(())
+}
+/// Arm fence completion interrupts once every kernel queue is verified.
+/// Fence waits keep polling; interrupts only shorten them.
+///
+/// # Safety
+/// Same exclusive-GPU contract as the queue owners. IH must be enabled and
+/// routing these sources before the engines produce more fences, or the
+/// interrupts are merely dropped by the ring's unclaimed-source path.
+pub unsafe fn enable_fence_interrupts(
+    gpu: &AmdGpu,
+    authority: Cap<BusDeviceCap, Write>,
+    doorbells: Doorbells,
+) -> Result<(), Error> {
+    let mut hw = Hw {
+        layout: Layout::resolve(gpu)?,
+        io: Mmio::new(gpu, doorbells),
+        authority,
+    };
+    hw.access(enable_fence_irqs)
+}
+
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_cp_navi22_tests.rs"]
 pub(crate) mod tests;

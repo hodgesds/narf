@@ -430,6 +430,15 @@ HPD/DMUB-outbox and SMU11 thermal/CTF/MP1 ids.
 
 ### Navi 22 kernel queues: GFX, KIQ/compute and SDMA
 
+`unsafe amdgpu_cp_navi22::enable_fence_interrupts(gpu, pci_cap, doorbells)` sets
+`TIME_STAMP_INT_ENABLE` for ME0 pipe 0 and MEC1 pipe 0 and `TRAP_ENABLE` on both
+SDMA engines, the sources Linux's fence driver arms with `amdgpu_irq_get` (the
+KIQ stays polled). `Stage::FenceInterrupts`, the final ColdBoot stage, runs it
+once every queue is verified, then subscribes to `GFX_EOP`, `SDMA0_TRAP` and
+`SDMA1_TRAP` and spawns one forwarder per source that calls
+`amdgpu_fence_navi22::notify` for the decoded engine (`notify_all` on a
+terminal IH error). A subscription failure only logs; fences keep polling.
+
 GC 10.3.2 runs without MES. `amdgpu_cp_navi22::Doorbells::map_navi22(device)`
 (unsafe, boot-time) maps BAR2's first 4 KiB uncached; kernel doorbells use the
 Linux Navi10 assignment (KIQ 0, MEC ring0 6, GFX ring0 0x116, SDMA0 0x200,

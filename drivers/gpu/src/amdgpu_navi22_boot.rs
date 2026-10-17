@@ -106,8 +106,9 @@ pub enum Stage {
     GfxRing,
     SdmaQueues,
     IbTests,
+    FenceInterrupts,
 }
-const STAGES: [Stage; 24] = [
+const STAGES: [Stage; 25] = [
     Stage::ResetOnInit,
     Stage::MemoryTraining,
     Stage::Sos,
@@ -135,6 +136,8 @@ const STAGES: [Stage; 24] = [
     Stage::GfxRing,
     Stage::SdmaQueues,
     Stage::IbTests,
+    // Last: arms EOP/trap interrupts and routes them to fence waiters.
+    Stage::FenceInterrupts,
 ];
 /// INT_CONTEXT of the boot SDMA0 TRAP round trip.
 const TRAP_CONTEXT: u32 = 0x0675_0022;
@@ -285,6 +288,56 @@ impl Queues {
                 sdma: self.sdma.proof(),
             })
     }
+}
+/// Kernel queue a CP EOP / SDMA trap entry completed (`gfx_v10_0_eop_irq`
+/// me/pipe decode, `sdma_v5_2_process_trap_irq` client).
+fn fence_engine(iv: &crate::amdgpu_ih_navi22::Iv) -> Option<crate::amdgpu_fence_navi22::Engine> {
+    use crate::{amdgpu_fence_navi22::Engine, amdgpu_ih_navi22::source};
+    let from = crate::amdgpu_ih_navi22::Source {
+        client: iv.client,
+        src: iv.src,
+    };
+    if from == source::GFX_EOP {
+        return match iv.cp_queue().me {
+            0 => Some(Engine::Gfx),
+            1 => Some(Engine::Compute),
+            2 => Some(Engine::Kiq),
+            _ => None,
+        };
+    }
+    if from == source::SDMA0_TRAP {
+        return Some(Engine::Sdma0);
+    }
+    (from == source::SDMA1_TRAP).then_some(Engine::Sdma1)
+}
+/// One task per source forwards entries to fence waiters. A terminal IH
+/// error wakes every waiter so each re-samples and observes device loss.
+fn route_fences(
+    ih: &crate::amdgpu_ih_navi22::Handle,
+) -> Result<(), crate::amdgpu_ih_navi22::Error> {
+    use crate::amdgpu_ih_navi22::source;
+    let mut subscriptions = alloc::vec::Vec::new();
+    for from in [source::GFX_EOP, source::SDMA0_TRAP, source::SDMA1_TRAP] {
+        subscriptions.push(ih.subscribe(from)?);
+    }
+    for mut subscription in subscriptions {
+        narf_scheduler::spawn(async move {
+            loop {
+                match subscription.wait().await {
+                    Ok(iv) => {
+                        if let Some(engine) = fence_engine(&iv) {
+                            crate::amdgpu_fence_navi22::notify(engine);
+                        }
+                    }
+                    Err(_) => {
+                        crate::amdgpu_fence_navi22::notify_all();
+                        return;
+                    }
+                }
+            }
+        });
+    }
+    Ok(())
 }
 /// Device loss and revoked authority stop the boot; any other failure of the
 /// diagnostic round trip leaves IH enabled with watchdog/polling delivery.
@@ -491,6 +544,29 @@ impl Backend for Hardware {
                         .step(&self.gpu, self.authority, stage)
                         .await
                         .map_err(Error::Queues)?;
+                }
+            }
+            Stage::FenceInterrupts => {
+                if let (Some(queues), Some(ih)) = (self.queues.as_ref(), self.ih.as_ref()) {
+                    if queues.proof().is_some() {
+                        // SAFETY: every kernel queue is verified, IH is live and
+                        // this owner holds the GPU exclusively.
+                        unsafe {
+                            crate::amdgpu_cp_navi22::enable_fence_interrupts(
+                                &self.gpu,
+                                self.authority,
+                                queues.doorbells,
+                            )
+                        }
+                        .map_err(Error::Queues)?;
+                        if let Err(error) = route_fences(&ih.handle()) {
+                            use core::fmt::Write;
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "amdgpu: navi22 FenceInterrupts: polling only {error:?}"
+                            );
+                        }
+                    }
                 }
             }
             Stage::Interrupts => {
