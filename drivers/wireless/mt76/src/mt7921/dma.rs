@@ -558,25 +558,25 @@ pub unsafe fn ring_dma_index(mmio: &MmioRegion, regs: RingRegs) -> u32 {
 
 // ── INFRA L1 remap (re)programming ───────────────────────────────
 //
-// Stage-0/1 use a conservative fold-into-upper-half remap that hits
-// the upper 8 MiB of BAR0 for any absolute address ≥ 0x100_0000. The
-// CONNAC2 silicon expects the driver to explicitly program the
-// `MT_HIF_REMAP_L1` window to pick which upper-address slab lands at
-// BAR0 offset `MT_HIF_REMAP_BASE_L1` (0x40000). Stage-4 introduces a
-// helper for that — used by the firmware-loader to slide the patch /
-// RAM-code MCU address into view.
+// L1 selector encoding follows Linux mt7921/mt7921.h::mt7921_reg_map_l1.
+// The upper half of the chip address is stored in the LOW selector bits.
 
-/// Program the L1 remap window so accesses to BAR0 offset
-/// `MT_HIF_REMAP_BASE_L1` route to absolute address `upper << 16`.
-///
-/// `upper` is the upper 16 bits of the chip-side absolute address.
-///
+/// Program the L1 window for `upper << 16`, retaining unrelated register bits.
 /// # Safety
-/// `mmio` is the live BAR0 region; caller owns the device.
+/// Caller exclusively owns BAR0 and its latch, including the later window
+/// access. BAR0 must cover MT_HIF_REMAP_L1; the caller validates geometry.
 pub unsafe fn program_l1_remap(mmio: &MmioRegion, upper: u16) {
-    let v = (upper as u32) << 16;
-    // SAFETY: BAR0 mapped + owned.
-    unsafe { mmio.write32(MT_HIF_REMAP_L1 as u64, v & MT_HIF_REMAP_L1_BASE) };
+    // SAFETY: caller guarantees the mapped selector register and ownership.
+    let old = unsafe { mmio.read32(MT_HIF_REMAP_L1 as u64) };
+    // SAFETY: same selector ownership and validated bounds.
+    unsafe {
+        mmio.write32(
+            MT_HIF_REMAP_L1 as u64,
+            (old & !MT_HIF_REMAP_L1_MASK) | u32::from(upper),
+        )
+    };
+    // SAFETY: push the posted selector write before the window access.
+    let _ = unsafe { mmio.read32(MT_HIF_REMAP_L1 as u64) };
 }
 
 /// Translate an absolute on-chip address into a BAR0 offset that hits

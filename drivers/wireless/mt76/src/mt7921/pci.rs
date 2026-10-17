@@ -21,13 +21,13 @@
 #![allow(dead_code)]
 
 use core::fmt::Write as _;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::mac;
-use super::mcu;
 use super::regs::*;
 
 /// One bound MT7921 controller — what the driver retains after probe.
@@ -68,6 +68,12 @@ impl core::fmt::Debug for Mt7921Device {
 /// Errors raised by the Stage-0/Stage-1 probe path.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProbeError {
+    /// The register window cannot contain all required probe accesses.
+    UnsupportedRegisterWindow,
+    /// The hardware did not latch the requested indirect register page.
+    RemapRejected,
+    /// Chip identity is not supported by this CONNAC2 implementation.
+    UnsupportedChip,
     /// `map_bar(device, 0)` failed. Most likely the BAR isn't
     /// implemented (wrong PCI ID matched) or another driver claimed it.
     Bar0MapFailed,
@@ -78,9 +84,8 @@ pub enum ProbeError {
     /// retries. Either the firmware never released ownership (cold
     /// power-up with no PCIE_BUS_PWR), or the chip is wedged.
     DriverOwnTimeout,
-    /// EFUSE MAC read failed. Not fatal — probe records the device
-    /// bound with the all-zero MAC sentinel and the iface comes up
-    /// with a derived MAC instead.
+    /// Legacy EFUSE probe error. Discovery leaves MAC unset; the retained
+    /// post-firmware path requires a valid firmware-reported MAC.
     EfuseRead,
     /// MCU patch / RAM-code firmware load hit `NotImplemented`. The
     /// firmware-loader path needs the blob to be registered via the
@@ -92,6 +97,10 @@ pub enum ProbeError {
 /// Single-instance live device. Probe drops a new entry into this
 /// slot. The kernel-test smokes reset it via `__reset_for_test`.
 static CONTROLLER: IrqSafeSpinLock<Option<Mt7921Device>> = IrqSafeSpinLock::new(None);
+#[cfg(target_arch = "x86_64")]
+static FIRMWARE_BINDING: IrqSafeSpinLock<Option<(BusDevice, Cap<BusDeviceCap, Write>)>> =
+    IrqSafeSpinLock::new(None);
+static TRANSPORT_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Register the PCI match table. One entry per supported device id —
 /// names must be unique (the bus match registry is keyed by `name`)
@@ -129,16 +138,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         return Ok(());
     }
 
-    // Enable MEM_SPACE + BUS_MASTER. BAR reads need MEM_SPACE; future
-    // DMA ring posting needs BUS_MASTER. Mirrors the `e1000` /
-    // `rtw88` shape so the test harness's mocked-cfg writes route
-    // through the same code path.
-    narf_bus::pci::set_command(
-        &cap,
-        &device,
-        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
-    )
-    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    // Discovery does not publish DMA rings. Keep bus mastering disabled
+    // until a live firmware transport owns all device-visible allocations.
+    narf_bus::pci::clear_command(&cap, &device, narf_bus::pci::cmd::BUS_MASTER)
+        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    narf_bus::pci::set_command(&cap, &device, narf_bus::pci::cmd::MEM_SPACE)
+        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
     // SAFETY: bus dispatch hands us exclusive BusDeviceCap authority
     // for this device's cfg + BARs for the duration of probe.
@@ -171,7 +176,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     );
 
     let did = dev.effective_did;
-    let mac = dev.mac;
+    #[cfg(target_arch = "x86_64")]
+    {
+        *FIRMWARE_BINDING.lock() = Some((device, cap));
+    }
     *CONTROLLER.lock() = Some(dev);
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -182,11 +190,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
-    // Register the control-plane iface: netdev identity (so the
-    // kernel-side TCP stack sees the MAC) + wiphy (so the nl80211
-    // control plane lists the radio). send_frame returns Err until the
-    // DMA-ring datapath lands. The wireless registry retains the Arc.
-    let _iface = crate::iface::register_iface(did, mac, send_frame_unimpl);
+    // Hardware discovery is not radio readiness. Firmware/EFUSE and DMA
+    // transport are not live yet; do not publish a zero-MAC netdev/wiphy.
+    let _ = writeln!(
+        narf_console::Writer,
+        "  mt7921: discovery complete; firmware startup deferred until firmware scan"
+    );
     Ok(())
 }
 
@@ -202,46 +211,34 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Mt7921Device, ProbeError> {
     // SAFETY: caller-asserted BAR exclusivity.
     let mmio_bar0 = unsafe { map_bar(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
 
-    // Presence test: a fresh BAR window on absent silicon returns
-    // all-FF on every 32-bit read. `MT_HW_CHIPID` is the lowest
-    // 32-bit register guaranteed to exist regardless of PMU state.
-    //
-    // We have to remap the absolute 32-bit address into a BAR0
-    // offset. CONNAC2 maps the lower 16 MiB of the chip address
-    // space directly into BAR0, so absolute addresses < 0x100_0000
-    // are direct offsets. `MT_HW_CHIPID = 0x70010200` lives outside
-    // that window; Linux's `mt7921_l1_rr` uses a remap table. For
-    // the baseline we use a presence test that hits a known register
-    // *inside* the direct window, namely `MT_PCIE_MAC_INT_ENABLE`
-    // (0x10188), and fall back to the chip-id read via the remap.
-    // SAFETY: identity-mapped MMIO; offset within mapped BAR len.
-    let presence = unsafe { mmio_bar0.read32(MT_PCIE_MAC_INT_ENABLE as u64) };
-    if presence == 0xFFFF_FFFF {
+    validate_probe_window(mmio_bar0.len)?;
+    let _ = writeln!(
+        narf_console::Writer,
+        "  mt7921: BAR0 mapped ({} bytes); reading identity",
+        mmio_bar0.len
+    );
+    // SAFETY: caller owns BAR0/latch; checked access validates every word.
+    let chip_id = unsafe { chip_id_read(&mmio_bar0)? };
+    // SAFETY: same ownership and checked transaction.
+    let hw_rev = unsafe { hw_rev_read(&mmio_bar0)? };
+    // SAFETY: same ownership and checked transaction.
+    let bound = unsafe { hw_bound_read(&mmio_bar0)? };
+    if [chip_id, hw_rev, bound].contains(&u32::MAX) {
         return Err(ProbeError::DeviceGone);
     }
-
-    // Chip-ID + rev read via the L1 remap helper. Linux's
-    // `mt7921_l1_rr(dev, MT_HW_CHIPID)` does the same thing — it
-    // walks an internal table that maps the absolute address to a
-    // BAR-relative offset. Our `chip_id_read` is the minimal version
-    // of that for the two registers we actually need.
-    //
-    // SAFETY: BAR0 mapped, presence test passed.
-    let chip_id = unsafe { chip_id_read(&mmio_bar0) };
-    // SAFETY: same.
-    let hw_rev = unsafe { hw_rev_read(&mmio_bar0) };
-    // SAFETY: same.
-    let bound = unsafe { hw_bound_read(&mmio_bar0) };
-
-    // MT7920 re-tagging — `mt7921/pci.c:358`:
-    //   if (chipid == 0x7961 && (mt7921_l1_rr(dev, MT_HW_BOUND) & BIT(7)))
-    //       chipid = 0x7920;
     let raw_chip = (chip_id & 0xffff) as u16;
+    if !matches!(raw_chip, MTK_DEV_MT7961 | MTK_DEV_MT7922 | MTK_DEV_MT7920) {
+        return Err(ProbeError::UnsupportedChip);
+    }
     let effective_did = if raw_chip == MTK_DEV_MT7961 && (bound & MT_HW_BOUND_DBDC) != 0 {
         MTK_DEV_MT7920
     } else {
         raw_chip
     };
+    let _ = writeln!(
+        narf_console::Writer,
+        "  mt7921: chip={raw_chip:04x} rev={hw_rev:#x}; taking driver ownership"
+    );
 
     // ── Stage 1: driver-own + firmware-load stub + EFUSE ─────────
     //
@@ -250,63 +247,12 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Mt7921Device, ProbeError> {
         Ok(()) => true,
         Err(mac::PowerError::Timeout) => return Err(ProbeError::DriverOwnTimeout),
         Err(mac::PowerError::DeviceGone) => return Err(ProbeError::DeviceGone),
+        Err(mac::PowerError::InvalidWindow) => return Err(ProbeError::UnsupportedRegisterWindow),
     };
 
-    // Firmware-load stub. Stage-1 deliberately stops at the firmware
-    // boundary — the patch + RAM-code blobs aren't typically
-    // installed in narf-firmware's registry yet, and even when they
-    // are, the patch-apply MCU sequence requires the DMA rings from
-    // Stage-2. We resolve the blob names (so a future installer
-    // knows what to ship) and call the MCU patch-load helper, which
-    // currently returns `Err(NotImplemented)` past the resolve step.
-    let mut mac_bytes = [0u8; MAC_ADDR_LEN];
-    // SAFETY: `mmio_bar0` is the live BAR0 region mapped above and
-    // driver-own was already taken (`take_driver_own` returned `Ok`),
-    // which is exactly the precondition `load_firmware_stub` requires.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let firmware_outcome = unsafe { mcu::load_firmware_stub(&mmio_bar0, effective_did) };
-    if let Err(mcu::McuError::NotImplemented) = firmware_outcome {
-        // Expected baseline path — note it but keep the device bound.
-        let _ = writeln!(
-            narf_console::Writer,
-            "  mt7921: firmware-load deferred (Stage-2 DMA rings needed)"
-        );
-    }
-
-    // EFUSE read is gated on firmware being live. If the firmware
-    // load returned `NotImplemented`, we leave `mac_bytes` zeroed
-    // and surface "no EFUSE" via the all-zero sentinel.
-    if firmware_outcome.is_ok() {
-        // SAFETY: `mmio_bar0` is the live BAR0 region; this branch only
-        // runs when `load_firmware_stub` returned `Ok`, so firmware is
-        // live and the EFUSE registers are valid to read.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        if let Ok(m) = unsafe { mcu::read_efuse_mac(&mmio_bar0) } {
-            mac_bytes = m;
-        }
-    }
-
-    // Stage-4..13 bring-up orchestrator. On real silicon this would
-    // allocate the WFDMA0 ring set, program the rings, download the
-    // patch + WM + WA firmware, run the MCU init sequence, set up
-    // the vif, switch channel, and arm the data path. On QEMU /
-    // missing-firmware it returns `NotImplemented` at the FW dispatch
-    // step, which we treat as "ring set allocated successfully, real
-    // bring-up needs live MCU".
-    //
-    // The orchestrator is invoked with a default config primed with
-    // the EFUSE-derived MAC; the result is dropped because the ring
-    // set lives in the orchestrator's stack frame — when the real
-    // dispatch path lands, we'll thread the result into `Mt7921Device`.
-    use super::bringup::{full_bring_up, BringUpConfig};
-    let cfg = BringUpConfig {
-        effective_did,
-        own_mac: mac_bytes,
-        ..BringUpConfig::default()
-    };
-    // SAFETY: BAR0 mapped + owned per `# Safety`.
-    let bringup_outcome = unsafe { full_bring_up(&mmio_bar0, cfg) };
-    let _ = bringup_outcome;
+    // Firmware payloads are not registered until Late init. The retained
+    // MCU/DMA owner is prepared there, outside this controller spinlock.
+    let mac_bytes = [0u8; MAC_ADDR_LEN];
 
     Ok(Mt7921Device {
         mmio_bar0,
@@ -318,75 +264,52 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Mt7921Device, ProbeError> {
     })
 }
 
-/// Read `MT_HW_CHIPID` (chip absolute address `0x70010200`) via the
-/// minimal L1 remap. CONNAC2 maps the upper-address registers into
-/// BAR0 starting at a fixed remap offset of `0xb000_0000`; the
-/// in-tree Linux helper `mt7921_l1_rr` walks a table for this but
-/// the two registers we read in Stage-0 (CHIPID + REV + BOUND) all
-/// live in the same 0x7001_xxxx page which Linux's remap drops at
-/// BAR0 offset `0xb_0200`.
-///
-/// # Safety
-/// `mmio` is the live BAR0 region and the chip is in a state that
-/// tolerates reads (post-presence-test).
-unsafe fn chip_id_read(mmio: &MmioRegion) -> u32 {
-    // SAFETY: forwarded.
-    unsafe { l1_read32(mmio, MT_HW_CHIPID) }
-}
-
-/// Read `MT_HW_REV`. See `chip_id_read`.
-///
-/// # Safety
-/// As `chip_id_read`.
-unsafe fn hw_rev_read(mmio: &MmioRegion) -> u32 {
-    // SAFETY: forwarded.
-    unsafe { l1_read32(mmio, MT_HW_REV) }
-}
-
-/// Read `MT_HW_BOUND`. See `chip_id_read`.
-///
-/// # Safety
-/// As `chip_id_read`.
-unsafe fn hw_bound_read(mmio: &MmioRegion) -> u32 {
-    // SAFETY: forwarded.
-    unsafe { l1_read32(mmio, MT_HW_BOUND) }
-}
-
-/// L1 remap helper. Translates an absolute 32-bit on-chip address
-/// into a BAR0-relative offset.
-///
-/// The CONNAC2 BAR0 window is 16 MiB. Direct-mapped addresses live
-/// in `0x0000_0000..0x00ff_ffff`; the higher pages (`0x18xx_xxxx`,
-/// `0x7xxx_xxxx`, etc.) come through a remap of the upper 12 bits.
-/// Linux's `mt7921_l1_rr` keeps a table for this; the baseline
-/// reduces it to two cases:
-///
-///   - Address < `0x100_0000` → direct (BAR0 offset = address).
-///   - Otherwise → fold the upper bits into the high half of the
-///     BAR0 window (`0x80_0000 + (address & 0x7f_ffff)`).
-///
-/// This is intentionally conservative: it lands the read on the
-/// upper 8 MiB of BAR0 where the remap window sits, then masks the
-/// address to a 23-bit offset. The mapped reads return 0 / 0xFF on
-/// absent silicon but never wedge the bus.
-///
-/// # Safety
-/// `mmio.len` covers the resulting offset (Stage-0 maps BAR0 with a
-/// 16 MiB length); chip tolerates the read.
-unsafe fn l1_read32(mmio: &MmioRegion, abs: u32) -> u32 {
-    let offset = l1_remap(abs);
-    // SAFETY: caller-asserted.
-    unsafe { mmio.read32(offset as u64) }
-}
-
-/// Translate an absolute on-chip address to a BAR0-relative offset.
-/// See `l1_read32` for the policy.
-pub fn l1_remap(abs: u32) -> u32 {
-    if abs < 0x0100_0000 {
-        abs
-    } else {
-        0x0080_0000 | (abs & 0x007f_ffff)
+/// Validate all identity/power accesses, including the indirect selector.
+pub(super) fn validate_probe_window(len: u64) -> Result<(), ProbeError> {
+    for addr in [
+        MT_PCIE_MAC_INT_ENABLE,
+        MT_HW_CHIPID,
+        MT_HW_REV,
+        MT_HW_BOUND,
+        MT_CONN_ON_LPCTL,
+    ] {
+        super::registers::plan(addr, len).map_err(|_| ProbeError::UnsupportedRegisterWindow)?;
     }
+    Ok(())
+}
+
+/// # Safety
+/// Caller exclusively owns BAR0 and the L1 selector.
+unsafe fn chip_id_read(mmio: &MmioRegion) -> Result<u32, ProbeError> {
+    // SAFETY: forwarded ownership; access validates the complete word.
+    unsafe { super::registers::read32(mmio, MT_HW_CHIPID) }.map_err(register_error)
+}
+/// # Safety
+/// Caller exclusively owns BAR0 and the L1 selector.
+unsafe fn hw_rev_read(mmio: &MmioRegion) -> Result<u32, ProbeError> {
+    // SAFETY: forwarded ownership; access validates the complete word.
+    unsafe { super::registers::read32(mmio, MT_HW_REV) }.map_err(register_error)
+}
+/// # Safety
+/// Caller exclusively owns BAR0 and the L1 selector.
+unsafe fn hw_bound_read(mmio: &MmioRegion) -> Result<u32, ProbeError> {
+    // SAFETY: forwarded ownership; access validates the complete word.
+    unsafe { super::registers::read32(mmio, MT_HW_BOUND) }.map_err(register_error)
+}
+
+fn register_error(error: super::registers::Error) -> ProbeError {
+    match error {
+        super::registers::Error::DeviceGone => ProbeError::DeviceGone,
+        super::registers::Error::RemapRejected => ProbeError::RemapRejected,
+        _ => ProbeError::UnsupportedRegisterWindow,
+    }
+}
+
+/// Return the checked PCI register offset, or `u32::MAX` if unsupported.
+/// An indirect offset alone is not sufficient for I/O: use the checked
+/// register transaction, which programs and flushes the L1 selector first.
+pub fn l1_remap(abs: u32) -> u32 {
+    super::registers::plan(abs, 0x100000).map_or(u32::MAX, |plan| plan.offset)
 }
 
 /// SendFn registered with `narf_net::iface` at probe. Stage-2 lights
@@ -414,7 +337,7 @@ pub const fn name_for(did: u16) -> &'static str {
 /// `(patch_name, ram_code_name)`. Used by the firmware-load stub.
 pub fn firmware_blobs_for(did: u16) -> (&'static str, &'static str) {
     match did {
-        MTK_DEV_MT7922 => (MT7922_ROM_PATCH, MT7922_FIRMWARE_WM),
+        MTK_DEV_MT7922 | MTK_DEV_MT7921_ALT => (MT7922_ROM_PATCH, MT7922_FIRMWARE_WM),
         MTK_DEV_MT7920 => (MT7920_ROM_PATCH, MT7961_FIRMWARE_WM),
         // MT7921 + MT7961 share the 7961 patch and RAM code.
         _ => (MT7961_ROM_PATCH, MT7961_FIRMWARE_WM),
@@ -426,9 +349,45 @@ pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
 }
 
-/// Borrow the bound controller. Returns `None` if probe hasn't run.
+/// Borrow discovery state before the exclusive firmware transport handoff.
+/// Returns `None` if probe hasn't run or the transport owns the device.
 pub fn with_controller<R>(f: impl FnOnce(&Mt7921Device) -> R) -> Option<R> {
+    if TRANSPORT_CLAIMED.load(Ordering::Acquire) {
+        return None;
+    }
     CONTROLLER.lock().as_ref().map(f)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn claim_firmware_transport(
+) -> Result<Option<super::firmware_transport::Transport>, super::firmware_transport::Error> {
+    use super::firmware_transport::{Error, Firmware, Transport};
+    let Some((device, authority)) = *FIRMWARE_BINDING.lock() else {
+        return Ok(None);
+    };
+    if TRANSPORT_CLAIMED.load(Ordering::Acquire) {
+        return Err(Error::Busy);
+    }
+    let (mmio, did) = {
+        let guard = CONTROLLER.lock();
+        let controller = guard.as_ref().ok_or(Error::Busy)?;
+        (controller.mmio_bar0, controller.effective_did)
+    };
+    let registry = narf_firmware::trusted_loader_authority()
+        .ok_or(Error::Authority)?
+        .derive()
+        .map_err(|_| Error::Authority)?;
+    let firmware = Firmware::open(did, &registry)?;
+    // SAFETY: final single-CPU boot handoff after discovery and firmware scan,
+    // before executor polling; no MT76 rings exist and bus mastering is off.
+    let transport = unsafe { Transport::new(mmio, device, authority, firmware)? };
+    if TRANSPORT_CLAIMED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(Error::Busy);
+    }
+    Ok(Some(transport))
 }
 
 /// Test-only reset of the bound slot. Available in the built-in build (which
@@ -436,4 +395,9 @@ pub fn with_controller<R>(f: impl FnOnce(&Mt7921Device) -> R) -> Option<R> {
 #[cfg(any(test, feature = "builtin"))]
 pub fn __reset_for_test() {
     *CONTROLLER.lock() = None;
+    #[cfg(target_arch = "x86_64")]
+    {
+        *FIRMWARE_BINDING.lock() = None;
+    }
+    TRANSPORT_CLAIMED.store(false, Ordering::Release);
 }

@@ -68,6 +68,185 @@ pub trait WirelessDriver: Driver {
 
 Drivers receive traffic via four distinct Narf-Rings (one per AC) from the stack daemon.
 
+### MT76 PCI discovery and register access
+
+MT7921/MT7922 discovery supports the physical 1 MiB PCI BAR0. Accesses use
+Linux CONNAC2 fixed windows or a 64 KiB L1 aperture. L1 transactions preserve
+unrelated selector bits, write the chip page into selector bits 15:0, read
+back before window access, and restore/flush the prior selector afterward.
+The caller exclusively owns BAR0 and the latch across the entire transaction.
+Misaligned, unsupported, and out-of-range accesses are rejected before MMIO;
+`ProbeError::UnsupportedRegisterWindow` reports an insufficient probe window.
+`ProbeError::RemapRejected` reports a selector readback mismatch without
+accessing the wrongly selected window; a removed selector reports `DeviceGone`.
+`l1_remap` returns an offset or `u32::MAX` for an unsupported address; callers
+must not use an indirect offset without a serialized selector transaction.
+
+Probe clears PCI bus mastering and leaves DMA ring publication disabled.
+Ownership waits are deadline-bounded; `PowerError::InvalidWindow` reports
+an invalid register access and `UnsupportedChip` rejects unknown identities.
+PCI discovery does not publish a zero-MAC netdev/wiphy. A working Wi-Fi data
+path remains unimplemented. The legacy
+`full_bring_up` boundary returns `NotImplemented` without allocating or
+programming rings until it can retain every published allocation.
+PCI alias `14c3:0616` selects the MT7922 firmware pair. Register translation
+and selector encoding follow the local Linux reference at `ecd997b0189a`.
+
+### MT76 MCU/DMA firmware transport
+
+`mt7921::firmware_transport::Firmware::prepare` validates and owns patch and
+RAM images before device writes; `Firmware::open` obtains them through a
+live firmware-registry capability. On x86_64, unsafe `Transport::new` requires
+exclusive device/register-latch ownership, a permanent BAR mapping, coherent
+identity DMA and disabled PCI bus mastering. Per-domain IOMMU configurations
+are rejected until an explicit DMA mapping path is implemented.
+
+`Transport::run` is a single-use, cancellation-safe borrowed future. It
+quiesces inherited DMA, publishes owned WM/FWDL TX and MCU RX rings, obtains
+driver ownership, restarts the ROM, negotiates the patch semaphore, downloads
+patch/RAM regions, starts firmware and verifies its ready register. MCU
+commands carry CONNAC2 headers; scatter payloads are raw 4096-byte chunks.
+TX completion requires descriptor completion and the device index; RX validates
+descriptor lengths, packet type and event framing before rearming. Commands
+match nonzero sequence numbers and retain at most 32 unrelated events.
+Every wait checks authority and has a deadline, including a 30-second total
+boot budget. Waits self-wake and use the scheduler bridge rather than relying
+on another executor task or on enabled device interrupts.
+
+`state` reports the last stage and terminal error; `pop_event` drains retained
+notifications. Failed or cancelled attempts cannot be replayed. Published DMA
+allocations remain retained even when the owner is dropped. `shutdown` permits
+release only after DMA is disabled and idle, PCI bus mastering is confirmed
+off and ring references are cleared. Failure to prove quiescence retains memory.
+The late `mt76-firmware` initcall runs after firmware discovery and retains the
+transport on success or failure; `boot_status` exposes its state. A ready
+report proves firmware startup only. The late initcall registers a passive
+scan interface only after the subsequent radio initialization succeeds.
+
+After `run`, `Transport::initialize_radio` performs a second single-use,
+30-second-bounded initialization. `NicCapabilities::parse` decodes the counted
+32-bit TLV table, requires a nonzero unicast MAC and a supported PHY, rejects
+duplicate identity records and bounds every payload. The transport implements
+distinct CE, extended and unified command headers; unified results check both
+the command ID and the full 32-bit status. Extended queries check event and
+extended-command identity. Unrelated notifications remain bounded.
+
+Initialization obtains the NIC capabilities, checks the address and validity
+of the EFUSE block containing hardware type 0x55b, chooses the matching power
+table package and sends the embedded `00` indoor country rules. CLC container
+geometry is validated during firmware preparation; all selected commands are
+validated before the first CLC send. Capability-requested CLC response TLVs
+must fit their enclosing event. Opaque vendor rule bytes are preserved.
+On-chip EFUSE calibration mode is selected, MAC receive limits and counters
+are configured on both bands, all 20 WTBL entries are cleared with bounded
+idle waits, and RTS thresholds are sent through the MCU. `RadioReady(RadioInfo)`
+reports this initialization, including the actual MAC/PHY, EFUSE hardware type,
+number of country commands and optional channel configuration. Cancellation
+or failure cannot replay initialization or release published DMA. Radio enable,
+host regulatory/channel/power configuration for transmission, association and packet
+queues remain separate prerequisites for an operational WLAN interface.
+`cmd::encode_uni_dev_info_update` emits the four-byte own-MAC/band header and
+one 12-byte active/link-index/MAC TLV (16 bytes total), matching CONNAC2 unified
+device commands rather than the earlier synthetic two-TLV layout.
+
+### MT76 passive scan and receive
+
+The retained owner also allocates and publishes WFDMA RX ring 2, with the
+same address-width checks and shutdown/retention contract as MCU rings.
+Completed descriptors are copied before rearming, and packet lengths are
+bounded by both descriptor and allocation. RX is routed by packet type on
+all three rings. Firmware-forwarded normal frames (RX-event type with flag 1)
+enter the packet queue; MCU replies enter the event queue. Each queue is
+bounded to 32 entries. Packet overload drops the oldest packet; MCU reply
+overflow reports an error instead of silently discarding a response. Neither
+normal frames nor TX releases can satisfy an MCU waiter.
+
+`Transport::scan_passive` and `scan_boot_passive` expose a bounded hardware
+diagnostic after `RadioReady`. Only unique world 2.4 GHz channels 1–11 are
+accepted. The first scan configures an unassociated station VIF with unified
+device/BSS commands, installs a 20 MHz `00` channel domain with NO_IR flags,
+enables the MAC/RX path, and submits a version-1 CONNAC2 passive scan request
+with zero probe requests. Subsequent scans reuse the VIF. Scan completion
+must match the separate nonzero seven-bit scan sequence. The receive wait is
+15 seconds and the whole attempt retains the existing 30-second budget.
+Failure/cancellation leaves the last stage and retains DMA; it cannot replay.
+
+The parser checks the six-word RX prefix, all optional groups and padding,
+frame-control/type, source/BSSID, FCS/security/aggregation errors, SSID and
+IE bounds, RSN syntax, and consistency between RX and DS channels. Results
+retain original IEs and optional measured RSSI; unknown RSSI maps to -128
+at the wireless interface boundary. At most 64 BSSID/channel entries are
+retained, with a truncation flag; hidden-to-visible SSID updates are preserved.
+
+After successful radio initialization, `Mt76Iface` registers an exact shared
+netdev/wiphy name and its real MAC for passive nl80211 scans. Its constructor
+takes `(name, RadioInfo)` and rejects invalid identity; the old PCI-ID-derived
+constructor/registration scaffold is removed. Active/directed scans and
+unsupported channels are rejected before MMIO. Only the implemented 2.4 GHz
+profile is exposed, with HT/VHT/HE/EHT disabled. The link stays down, frame
+ring endpoints are absent, and packet sends/association/configuration fail
+until the corresponding driver paths exist. No interface is registered on
+firmware/radio initialization failure. No host device is detached for tests.
+
+### MT76 management TX backend
+
+The retained owner allocates and publishes WFDMA TX ring 0 alongside MCU
+rings. Its private serialized management TX path emits the Linux CONNAC2
+32-byte cut-through TXD plus 32-byte hardware TXP. The descriptor references
+only those 64 bytes; TXP references the separate frame extent in the same
+owned allocation. Payload addresses must fit 32 bits, lengths must fit the
+allocation/TXP field, and token IDs stay within the MT7921 8192-token range.
+Only unprotected native management headers are accepted at the basic 1 Mbps
+rate; this backend is not exposed as a user-facing injection API.
+
+After publication the slot remains pending until both a valid DMA device
+index/DDONE and a matching firmware TX-release token are observed, in either
+order. Firmware failure status is preserved. Entire release events, including
+WCID-pair records, are parsed before token state changes; conflicting duplicate
+statuses and truncated records cannot partially retire ownership. Stale token
+IDs do not retire the current frame. Drop/failure retains published DMA under
+the existing shutdown contract.
+
+### MT76 station preparation and MLME
+
+`association::JoinPlan::prepare` validates a scanned ESS, exact SSID/BSSID,
+unicast station identity and legacy supported/basic rates before constructing
+an open-authentication and association request. The initial profile requires
+1 Mbps support on channels 1–11. Open and WPA2-PSK/CCMP are distinct modes:
+privacy/RSN mismatches, unknown mandatory rates, TKIP-only/SAE-only profiles
+and mandatory PMF are rejected. WPA2 requests contain the exact negotiated
+PSK/CCMP RSN IE plus supported rates; no PMK or temporal key enters the plan.
+
+The plan's read-only phase advances from prepared through authentication and
+association only on correctly addressed matching peer responses. Algorithm,
+authentication transaction, status, association capability/privacy, AID and
+IE bounds are checked. Other peers do not advance state; matching malformed
+responses, rejection and cancellation are terminal. An associated WPA2 phase
+does not authorize the controlled port until key exchange completes.
+
+`peer_record` emits checked Linux CONNAC2 station/PHY/RA/state and nested WTBL
+records for WCID 1, with the peer classified as an AP, native RX retained,
+and `CONN_STATE_CONNECT`. Associated records require the AID observed by this plan;
+no caller can mutate the plan's phase directly.
+
+### MT76 live join dispatch, WPA2 keys, and Ethernet data transport
+
+`Session::associate_station` executes the full live join workflow:
+1. Validates host regulatory rules and dispatches channel/power configuration
+   via `MCU_EXT_CMD_CHANNEL_SWITCH` before frame transmission.
+2. Transmits 802.11 Open Authentication and Association requests via the management TX queue,
+   awaiting matching responses within a bounded 3-second timeout per phase.
+3. For WPA2-PSK connections, drives the IEEE 802.11i 4-way handshake via `narf_wireless::eapol::Supplicant`.
+   Computes HMAC-SHA1 and verifies/generates message integrity codes (MIC).
+   On receiving M1, derives the PTK (`KCK`, `KEK`, `TK`) and emits M2 containing the negotiated RSN IE.
+   Upon receiving and verifying M3, sends M4 and installs the 16-byte temporal key via a checked
+   `STA_REC_KEY_V2` (tag 0x12) WTBL record with cipher 6 (`MCU_CIPHER_AES_CCMP`) and `CONN_STATE_PORT_SECURE`.
+4. Datapath transport submits 802.3 Ethernet frames encapsulated in 32-byte CONNAC2 TXD headers
+   over WFDMA data rings, and translates incoming 802.11 LLC/SNAP data frames to 802.3 Ethernet.
+5. `Mt76Iface` binds `narf_ipc` producer/consumer rings (`tx_ring` and `rx_ring`) and exposes
+   `poll_data()` to bridge frames between IPC endpoints and hardware rings, updating the link state
+   in the network registry upon association and teardown upon disassociation.
+
 ### 3.1 Implemented iwlwifi MLD station profile
 
 The production Gen3 probe owns firmware/IML/PNVM bytes and schedules

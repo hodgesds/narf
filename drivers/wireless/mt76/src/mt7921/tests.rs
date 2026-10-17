@@ -169,19 +169,30 @@ kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_wfdma0_block);
 
 // ── L1 remap arithmetic ────────────────────────────────────────────
 
+fn smoke_mt7921_probe_validates_real_bar_geometry() -> TestResult {
+    use super::pci::validate_probe_window;
+    // Regression: the 1 MiB hardware window now covers the selector,
+    // fixed ownership CSR, and indirect identity window.
+    if validate_probe_window(0x100000).is_err() {
+        return TestResult::Fail("real MT7922 BAR refused");
+    }
+    let end = u64::from(MT_HIF_REMAP_L1) + 4;
+    if validate_probe_window(end - 1).is_ok() || validate_probe_window(end).is_err() {
+        return TestResult::Fail("selector bounds are not end-exclusive");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_probe_validates_real_bar_geometry
+);
+
 fn smoke_mt7921_l1_remap_direct_window() -> TestResult {
-    // Addresses below 0x100_0000 land directly in BAR0.
-    if l1_remap(0) != 0 {
-        return TestResult::Fail("zero address didn't remap to zero");
-    }
-    if l1_remap(0x10188) != 0x10188 {
-        return TestResult::Fail("PCIe-MAC INT_ENABLE didn't direct-map");
-    }
-    if l1_remap(MT_PCIE_MAC_INT_ENABLE) != MT_PCIE_MAC_INT_ENABLE {
-        return TestResult::Fail("MT_PCIE_MAC_INT_ENABLE didn't direct-map");
-    }
-    if l1_remap(0x00ff_ffff) != 0x00ff_ffff {
-        return TestResult::Fail("upper edge of direct window didn't direct-map");
+    if l1_remap(0) != 0
+        || l1_remap(MT_PCIE_MAC_INT_ENABLE) != 0x10188
+        || l1_remap(0x00ffffff) != u32::MAX
+    {
+        return TestResult::Fail("direct BAR window is not bounded to 1 MiB");
     }
     TestResult::Pass
 }
@@ -191,22 +202,12 @@ kernel_test_in!(
 );
 
 fn smoke_mt7921_l1_remap_high_window() -> TestResult {
-    // Addresses >= 0x100_0000 fold into the upper 8 MiB of BAR0.
-    let remapped = l1_remap(MT_HW_CHIPID);
-    if remapped & 0x0080_0000 == 0 {
-        return TestResult::Fail("high address didn't land in upper half of BAR0");
-    }
-    // Low 23 bits preserved.
-    if (remapped & 0x007f_ffff) != (MT_HW_CHIPID & 0x007f_ffff) {
-        return TestResult::Fail("low 23 bits of remapped address dropped");
-    }
-    // Same for MT_CONN_ON_LPCTL.
-    let lpctl_remap = l1_remap(MT_CONN_ON_LPCTL);
-    if lpctl_remap & 0x0080_0000 == 0 {
-        return TestResult::Fail("LPCTL didn't land in upper half of BAR0");
-    }
-    if (lpctl_remap & 0x007f_ffff) != (MT_CONN_ON_LPCTL & 0x007f_ffff) {
-        return TestResult::Fail("LPCTL low 23 bits dropped");
+    if l1_remap(MT_HW_CHIPID) != 0x40200
+        || l1_remap(MT_HW_REV) != 0x40204
+        || l1_remap(MT_HW_BOUND) != 0x40020
+        || l1_remap(MT_CONN_ON_LPCTL) != 0xe0010
+    {
+        return TestResult::Fail("identity/ownership register mapping differs from Linux");
     }
     TestResult::Pass
 }
@@ -225,8 +226,12 @@ fn smoke_mt7921_firmware_blobs_for_each_chip() -> TestResult {
     if p != MT7920_ROM_PATCH || r != MT7961_FIRMWARE_WM {
         return TestResult::Fail("MT7920 firmware blob names drift");
     }
-    // Default (MT7961, MT7921 either SKU) falls through to 7961 blobs.
-    for &did in [MTK_DEV_MT7961, MTK_DEV_MT7921, MTK_DEV_MT7921_ALT].iter() {
+    // PCI alias 0616 selects MT7922 firmware, as in the Linux match table.
+    if firmware_blobs_for(MTK_DEV_MT7921_ALT) != firmware_blobs_for(MTK_DEV_MT7922) {
+        return TestResult::Fail("0616 selected firmware for the wrong chip");
+    }
+    // MT7961 and the 0608 SKU select 7961 blobs.
+    for &did in [MTK_DEV_MT7961, MTK_DEV_MT7921].iter() {
         let (p, r) = firmware_blobs_for(did);
         if p != MT7961_ROM_PATCH || r != MT7961_FIRMWARE_WM {
             return TestResult::Fail("MT7961-family firmware blob names drift");
@@ -1029,27 +1034,20 @@ fn smoke_mt7921_init_ra_cfg_encode() -> TestResult {
 kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_init_ra_cfg_encode);
 
 fn smoke_mt7921_uni_dev_info_update_encode() -> TestResult {
-    use super::cmd::{
-        encode_uni_dev_info_update, UNI_DEV_INFO_BODY_SIZE, UNI_DEV_INFO_HDR_SIZE,
-        UNI_DEV_INFO_TAG_ACTIVE, UNI_DEV_INFO_TAG_INFO,
-    };
+    use super::cmd::{encode_uni_dev_info_update, UNI_DEV_INFO_BODY_SIZE};
     let mac = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
     let mut buf = [0xFFu8; UNI_DEV_INFO_BODY_SIZE];
-    encode_uni_dev_info_update(0, 0, true, mac, &mut buf).unwrap();
-    let tag = u16::from_le_bytes([buf[UNI_DEV_INFO_HDR_SIZE], buf[UNI_DEV_INFO_HDR_SIZE + 1]]);
-    if tag != UNI_DEV_INFO_TAG_ACTIVE {
-        return TestResult::Fail("ACTIVE TLV tag wrong");
+    encode_uni_dev_info_update(2, 1, true, mac, &mut buf).unwrap();
+    if buf
+        != [
+            2, 1, 0, 0, 0, 0, 12, 0, 1, 0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
+        ]
+    {
+        return TestResult::Fail("unified device body differs from Linux");
     }
-    if buf[UNI_DEV_INFO_HDR_SIZE + 4] != 1 {
-        return TestResult::Fail("active byte wrong");
-    }
-    let p = UNI_DEV_INFO_HDR_SIZE + 8;
-    let info_tag = u16::from_le_bytes([buf[p], buf[p + 1]]);
-    if info_tag != UNI_DEV_INFO_TAG_INFO {
-        return TestResult::Fail("INFO TLV tag wrong");
-    }
-    if buf[p + 8..p + 8 + 6] != mac {
-        return TestResult::Fail("own_mac round-trip wrong");
+    let mut short = [0xa5u8; 15];
+    if encode_uni_dev_info_update(0, 0, false, mac, &mut short).is_some() || short != [0xa5; 15] {
+        return TestResult::Fail("short device body partially written");
     }
     TestResult::Pass
 }
