@@ -319,8 +319,7 @@ fn decode_resp_only(payload: &[u8]) -> Result<QmiResponse, QmiError> {
     decode_tlvs(payload, &[QMI_RESPONSE_TLV], |_, v| {
         resp = QmiResponse::from_tlv(v)?;
         Ok(())
-    })?
-    .require(&[QMI_RESPONSE_TLV])?;
+    })?;
     Ok(resp)
 }
 
@@ -566,8 +565,7 @@ impl WlfwMessage for IndRegisterResp {
                 _ => m.fw_status = Some(tlv_u64(ty, v)?),
             }
             Ok(())
-        })?
-        .require(&[0x02])?;
+        })?;
         Ok(m)
     }
 }
@@ -635,8 +633,7 @@ impl WlfwMessage for RequestMemInd {
                 read_mem_seg,
             )?;
             Ok(())
-        })?
-        .require(&[0x01])?;
+        })?;
         Ok(m)
     }
 }
@@ -837,8 +834,7 @@ impl WlfwMessage for CapResp {
                 _ => m.eeprom_read_timeout = Some(tlv_u32(ty, v)?),
             }
             Ok(())
-        })?
-        .require(&[0x02])?;
+        })?;
         Ok(m)
     }
 }
@@ -976,8 +972,7 @@ impl WlfwMessage for DeviceInfoResp {
                 _ => m.bar_size = Some(tlv_u32(ty, v)?),
             }
             Ok(())
-        })?
-        .require(&[0x02])?;
+        })?;
         Ok(m)
     }
 }

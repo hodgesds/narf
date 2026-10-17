@@ -262,19 +262,23 @@ kernel_test_in!(
 fn smoke_qmi_decode_missing_mandatory_and_duplicates() -> TestResult {
     run(|| {
         // Oracle D10: Linux decodes a response without TLV 0x02 as
-        // result = 0 (SUCCESS). Deliberate deviation: refuse it.
+        // result = 0 (SUCCESS) and a request_mem without TLV 0x01 as
+        // zero segments; match it.
+        let c = CapResp::decode_payload(&[0x15, 0x01, 0x00, 0x03])
+            .map_err(|_| "response without TLV 0x02 must decode, as in Linux")?;
         ensure!(
-            CapResp::decode_payload(&[0x15, 0x01, 0x00, 0x03])
-                == Err(QmiError::MissingMandatoryTlv(0x02)),
-            "response without TLV 0x02"
+            c.resp == QmiResponse::default() && c.num_macs == Some(3),
+            "missing TLV 0x02 must read as SUCCESS with other TLVs kept"
         );
         ensure!(
-            HostCapResp::decode_payload(&[]) == Err(QmiError::MissingMandatoryTlv(0x02)),
-            "empty response"
+            HostCapResp::decode_payload(&[]).is_ok(),
+            "empty response must decode, as in Linux"
         );
+        let m = RequestMemInd::decode_payload(&[])
+            .map_err(|_| "request_mem without mem_seg must decode, as in Linux")?;
         ensure!(
-            RequestMemInd::decode_payload(&[]) == Err(QmiError::MissingMandatoryTlv(0x01)),
-            "request_mem without mem_seg"
+            m.mem_seg.is_empty(),
+            "missing mem_seg must read as zero segments"
         );
         // Oracle D13: a repeated TLV — the last copy wins.
         let mut p = RESP_OK.to_vec();

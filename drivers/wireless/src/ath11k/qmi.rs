@@ -57,9 +57,10 @@
 //! - a known TLV of basic elements whose length is not exactly the
 //!   element bytes is [`QmiError::LengthMismatch`] (Linux advances by
 //!   the element size, not the TLV length, and desynchronises);
-//! - a missing mandatory TLV (`< 0x10`) is
-//!   [`QmiError::MissingMandatoryTlv`] (Linux leaves the zeroed field,
-//!   which for `qmi_response_type_v01` reads as SUCCESS).
+//! - a missing mandatory TLV (`< 0x10`) leaves the field at its
+//!   default, exactly as Linux leaves the zeroed field — so a response
+//!   without TLV 0x02 reads as SUCCESS. Firmware is developed against
+//!   Linux, so accepting what Linux accepts is the compatible choice.
 //!
 //! Like Linux `qmi_decode_message`, decoding uses every byte after
 //! the header; `qmi_header.msg_len` is not consulted.
@@ -148,9 +149,6 @@ pub enum QmiError {
     /// Struct TLV not consumed exactly, or a nested struct array
     /// short of its count (`qmi_decode_struct_elem` `-EFAULT`).
     StructLengthMismatch { tlv: u8 },
-    /// Mandatory TLV absent. Stricter than Linux, which decodes the
-    /// zeroed field.
-    MissingMandatoryTlv(u8),
     /// Header `type` / `msg_id` not the message being decoded.
     /// (Linux matches responses by `txn_id` alone and indications by
     /// `(type, msg_id)` in `qmi_invoke_handler`.)
@@ -617,17 +615,6 @@ impl TlvSeen {
 
     pub fn contains(&self, ty: u8) -> bool {
         self.0[(ty >> 6) as usize] & (1u64 << (ty & 63)) != 0
-    }
-
-    /// `Err(MissingMandatoryTlv)` for the first of `mandatory` not
-    /// seen.
-    pub fn require(&self, mandatory: &[u8]) -> Result<(), QmiError> {
-        for &ty in mandatory {
-            if !self.contains(ty) {
-                return Err(QmiError::MissingMandatoryTlv(ty));
-            }
-        }
-        Ok(())
     }
 }
 
