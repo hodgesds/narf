@@ -38,17 +38,17 @@ use alloc::vec::Vec;
 
 /// `mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32` (GC BASE_IDX 0); HI32 is +1,
 /// `ctx_addr_distance` 2.
-const PTB_LO: u32 = 0x1667;
+const PTB_LO: u32 = 0x1667; // linux: mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32@gc
 /// `mmGCVM_INVALIDATE_ENG0_REQ` / `_ACK`, `eng_distance` 1.
-const INV_REQ: u32 = 0x161f;
-const INV_ACK: u32 = 0x1631;
+const INV_REQ: u32 = 0x161f; // linux: mmGCVM_INVALIDATE_ENG0_REQ@gc
+const INV_ACK: u32 = 0x1631; // linux: mmGCVM_INVALIDATE_ENG0_ACK@gc
 /// `amdgpu_sched_hw_submission` default.
-pub const HW_SUBMISSIONS: u32 = 2;
+pub const HW_SUBMISSIONS: u32 = 2; // linux: n/a (amdgpu_sched_hw_submission module default)
 /// Largest IB count per submission (`AMDGPU_CS_MAX_IBS_PER_SUBMIT`); 16
 /// frames of at most 13 dwords stay far inside one ring half.
-pub const MAX_IBS: usize = 16;
+pub const MAX_IBS: usize = 16; // linux: n/a (NARF bound)
 /// Largest single IB, in dwords (`length_dw` is 20 bits in the packet).
-pub const MAX_IB_DWORDS: u32 = (1 << 20) - 1;
+pub const MAX_IB_DWORDS: u32 = (1 << 20) - 1; // linux: n/a (20-bit IB length_dw)
 
 /// The ring a submission targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
