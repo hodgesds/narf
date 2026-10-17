@@ -213,7 +213,13 @@ struct Engine<I: Io> {
     authority: Cap<BusDeviceCap, Write>,
     memory: Reservation,
     state: State,
+    /// psp_v11_0_wait_for_bootloader waits for `(C2PMSG_35 & 0x8000FFFF) ==
+    /// 0x80000000` (20 rounds of usec_timeout): nonzero low bits mean "keep
+    /// waiting", not a rejection. PSP14 keeps the strict DONE-then-status rule.
+    psp11: bool,
 }
+/// psp_v11_0_wait_for_bootloader: 20 × psp_wait_for(usec_timeout = 100 ms).
+const PSP11_BOOTLOADER_TIMEOUT_MS: u64 = 2000;
 async fn delay(ms: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms).as_instant()).await;
 }
@@ -231,20 +237,27 @@ impl<I: Io> Engine<I> {
         }
     }
     async fn response(&mut self) -> Result<(), Error> {
-        let deadline = narf_time::Deadline::after_ms(1000);
+        let timeout = if self.psp11 {
+            PSP11_BOOTLOADER_TIMEOUT_MS
+        } else {
+            1000
+        };
+        let deadline = narf_time::Deadline::after_ms(timeout);
         loop {
             let value = self.access(|io| io.read(STATUS))?;
             if value == u32::MAX {
                 return Err(Error::DeviceGone);
             }
             if value & DONE != 0 {
-                return if value & 0xffff == 0 {
-                    Ok(())
-                } else {
-                    Err(Error::Rejected(value & 0xffff))
-                };
-            }
-            if deadline.expired() {
+                if value & 0xffff == 0 {
+                    return Ok(());
+                }
+                // A persistent status at the deadline is still reported as
+                // the bootloader's rejection code for diagnostics.
+                if !self.psp11 || deadline.expired() {
+                    return Err(Error::Rejected(value & 0xffff));
+                }
+            } else if deadline.expired() {
                 return Err(Error::Timeout);
             }
             delay(1).await;
@@ -375,6 +388,7 @@ impl Bootloader {
                 authority,
                 memory,
                 state: State::Prepared,
+                psp11: target == Target::Navi22,
             },
         })
     }
