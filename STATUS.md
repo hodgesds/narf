@@ -953,6 +953,8 @@ handled as smu_v11_0 does, including the delayed SW CTF check and power-off.
 Kernel-queue hang detection (2 s fence-progress timeout per ring) is active
 and logging; mode1 device recovery with a full cold-boot re-init exists behind
 an explicit opt-in API (display stays dark; training boots refuse it).
+GFXOFF, clock/power gating, memory/fabric DPM and deep sleep remain disabled
+behind a typed policy hook that states their display-admission requirements.
 These are software-tested foundations; training resume,
 VCN startup, display-aware DPM,
 hardware boot, general GPU mappings/GFX10 queue initialization, production

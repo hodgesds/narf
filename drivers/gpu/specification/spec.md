@@ -3402,6 +3402,19 @@ cancellation is terminal `Lost`: services stop, fence waits are abandoned and
 the old and new IH endpoints close with `DeviceLost`. `recoveries()` counts
 successes; platform `Diagnostics` adds `tdr` and `recovery`. Model-tested only.
 
+`amdgpu_navi22_power_policy::Policy` is the typed hook for the power savings
+Linux enables by default on sienna_cichlid — GFXOFF, clock gating, MMHUB/ATHUB
+power gating, memory (UCLK) and fabric (FCLK) DPM and deep sleep. `requirement`
+states what each needs: SMU feature bits, display admission
+(`DisplayAdmission`: watermark sets/PMFW watermark table, DML DRAM- and
+FCLK-change support, stutter with the deep-sleep DCEFCLK floor, bandwidth
+floors) and driver readiness (GFXOFF-safe GC access, RLC safe mode, validated
+recovery). `Policy::new()`/`Default` disable everything; `request` checks the
+requirements, then refuses with `NotValidated` while `HARDWARE_VALIDATED` is
+false, so `smu_features()` adds no bits and `gfxoff()`/`clock_gating()` stay
+false. Nothing calls it. The DCN-owned `Smu::enable_display_power` remains the
+only path that adds UCLK/FCLK DPM, under its own contract.
+
 ### Navi 22 DCN3.0 DMUB startup
 
 `amdgpu_dmub_navi22::Prepared::new(image, vbios, psp_version)` parses the
