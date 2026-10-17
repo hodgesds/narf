@@ -3864,41 +3864,56 @@ range, PCI/SYSIO and undefined-IIO cases continue as in Linux and are counted in
 `AtomState::anomalies`/`first_anomaly`; the same-jump stuck guard is 20 s by
 `now_ms` (65 536 repeats / 1 000 000 opcodes without a clock).
 
-### Navi 22 native HDMI scanout (opt-in)
+### Navi 22 native HDMI and DP SST scanout (opt-in)
 
 `unsafe amdgpu_dcn30_hdmi::Hdmi::new(gpu, pci_cap, dig, transmitter)` owns one
-DIG frontend/VPG and backend: `check_idle` (refuses a live backend), `route(otg)`
-(`dcn10_link_encoder_setup(HDMI)`, `connect_dig_be_to_fe`,
-`enc1_dig_connect_to_otg`), `stream_attribute(khz)` (the register half of
-`enc3_stream_encoder_hdmi_set_stream_attribute`: RGB, 8 bpc, no scrambling —
-refused at or above 340 MHz — GC/NULL every frame, ACP off, AVMUTE released),
-`info_packets(&avi)` (VPG generic packet 0 with immediate update, GENERIC0 on
-line 2, packets 1–6 off; a pending VPG conflict fails) and `stop()`.
-`Otg::program_tmds_timing` is `optc1_program_timing` with start point 0.
+DIG frontend/VPG and backend in Linux's split: `connect_to_otg(otg)`
+(`enc1_dig_connect_to_otg`), `setup(DigMode)` (`dcn10_link_encoder_setup`),
+`setup_stereo_sync(otg)`, `connect_be_to_fe(bool)` (one-hot FE source,
+others kept), `stream_attribute(khz)` (RGB, 8 bpc, no scrambling — refused at
+or above 340 MHz), `info_packets(&avi)`, `stop_info_packets()`,
+`set_avmute(bool)` and the no-op `audio_infoframe` hook.
+`amdgpu_dcn30_dp::{Link, Stream}` are the DIO DP halves (`enc1_configure_encoder`,
+TPS1–4, passthrough/video idle, `link_encoder_disable`; MSA, VSC SDP via VPG,
+`enc2_stream_encoder_dp_unblank` M/N and stream enable,
+`enc1_stream_encoder_dp_blank`); `dp::Aux` is the sink transport
+(`amdgpu_navi22_display::DisplayAux` over native AUX). VBIOS
+`Transmitter { action, transmitter, mode, lanes, hpd, connector, symbol_khz }`
+marshals v1.6/v1.7 (SETUP_VSEMPH via `Tables::transmitter_lane`, HPO 0).
 
-`unsafe amdgpu_navi22_modeset::Pipeline::new(gpu, pci_cap, connector)` claims
-pipe 0 (OTG/HUBP/DPP/MPCC/OPP), the DAL clock owner, HUBBUB and the
-connector's DIG. `unsafe enable(smu, pool, tables, vbios, crystal, sink, draw)`
-starts the DAL clocks, runs `dccg2_init` and (outside accelerated mode)
-`dcn10_bios_golden_init`, builds `dml30::Soc` from the board, `select`s the
-first EDID timing under the unscrambled TMDS and VSDB ceilings that DML30
-admits (with the CTA AVI InfoFrame; DVI sinks are refused), reserves,
-draws, HDP-flushes and publishes the scanout, programs HUBBUB, DISPCLK/DPPCLK
-and the DPP DTO, VBIOS SetPixelClock on combo PHY PLL 0, OTG timing/global
-sync, powers on DPP0/HUBP0 (`power_on_plane_resources`, HUBP clock), programs
-DPP/MPCC/OPP blanked and HUBP blanked, starts the OTG, then
-`enable_link_hdmi` (route, VBIOS STREAM_SETUP, attributes, AVI, VBIOS
-transmitter ENABLE) and finally unblanks HUBP then OPP. Any failure records
-`State::Failed { step, error }`, tears down in reverse and keeps the
-reservation published. `disable(tables)` is the same reverse order;
-`flush()` HDP-flushes CPU writes. `ColdBoot::modeset_hdmi()` (after
-`FirmwareReady`) lights the first connected HDMI sink with `test_pattern`
-and retains the pipeline; `amdgpu_navi22_platform::modeset_hdmi()` also
-publishes the scanout through `amdgpu_dcn_display::publish_external`, moving
-the console. The framebuffer handoff calls it only with the
-`amdgpu.native_display` kernel argument (the Navi48 flag). It reuses
-`amdgpu_navi48_boot::{edid_timings, hdmi_caps, hdmi_avi, limited_range,
-broadcast_rgb}` and `amdgpu_dcn401_otg::avi_infoframe`.
+`amdgpu_navi22_modeset::Resources::acquire(&connector)` is the DCN3.0 pool:
+first free pipe, the preferred DIG FE (= transmitter) or else the last free
+one, `dc_resource_find_first_free_pll` for TMDS, the DP DTO for DP.
+`choose(&reports)` picks a connected HDMI sink, else the first DP sink with
+EDID and DPCD. `unsafe Pipeline::new(gpu, pci_cap, connector, route)` claims
+the route's pipe and DIG plus the DAL clock owner and HUBBUB; `unsafe
+enable(power, pool, tables, Board, links, sink, aux, draw)` runs
+`dcn30_init_hw` (dccg2_init, golden init, VGA off) and the GOP takeover
+(`amdgpu_dcn30_takeover`: `enc3_hw_init`, plane power gating, `dcn10_init_pipes`,
+`dce110_power_down`; pipe 5 never power gated), then the DAL clocks and mode,
+prepare_bandwidth (clocks then watermarks), `dcn20_enable_stream_timing`
+(OPTC/OTG clock enable with bounded waits, SetPixelClock + PHYPLL resync or
+DP DTO phase/modulo, timing, OPP black, `enable_crtc`, one frame),
+`link_set_dpms_on` (HDMI: setup, STREAM_SETUP, attributes, AVI, transmitter
+ENABLE, setup, BE→FE, AVI, AVMUTE off; DP: setup, MSA/VSC, PHYCLK floor,
+BE→FE, `amdgpu_dp_training::train` with rate/lane fallback, setup, unblank),
+then the front end under `optc3_lock` and a two-frame underflow watch.
+`Output` carries the route, trained `DpLink` and `Inherited` GOP state.
+Failure records `State::Failed { step, error }` and undoes only started steps
+(no zero-clock SetPixelClock); cancellation keeps `State::At(step)` and
+`disable(tables, aux)` retires it. `check_underflow()` turns an OTG/HUBP
+underflow black and sets `State::Quarantined`. `ColdBoot::modeset_hdmi()`
+detects, `choose`s, acquires a route and lights with `test_pattern`.
+The pipeline budgets DCN30's one 256-wide 32-bpp cursor in DML30 as
+`dcn20_populate_dml_pipes_from_context` does (`Config::cursors` ≤ 1: CNVC
+cursor DPPCLK delay, cursor bandwidth and urgent burst in the prefetch and
+urgent-fraction checks, `Plan::cursor` = `calculate_ttu_cursor`) and programs
+`DCN_CUR0_TTU_CNTL0/1` with the HUBP. After the front end latches it starts
+the stream's audio through `amdgpu_dcn30_audio::Audio::start_for_sink`
+(`ClockManager` implements `AzaliaWake` with DALSMC 0x11); teardown stops it
+first; audio errors are logged and never fail the display.
+Kernel-test builds route every display owner's `amdgpu_reg_window::Window`
+through one attachable register model (`amdgpu_navi22_modeset_model`).
 
 ### Navi 22 HDMI and DP audio
 
@@ -4029,6 +4044,20 @@ for firmware bring-up. `ColdBoot::detect_displays().await` requires
 serializes it through the retained owner. The framebuffer boot handoff logs one
 line per connector after a successful firmware run; detection reads sinks only. `dmub_mailbox_state()` also reports failed
 or cancelled transport attempts without accessing hardware.
+
+HPD over the IH ring: `Display::arm_hpd_interrupts()` is `amdgpu_dm_hpd_init`
+over DCN3.0's irq service (every HPD/HPD_RX source acked and disabled, then
+HPD on per wired connector and HPD_RX on for DP; `hpd0_ack` re-arms the
+opposite polarity), `hpd_event(instance, rx)` is `dc_interrupt_ack` and
+returns the connector index. `ColdBoot::arm_display_hpd()` subscribes to
+`amdgpu_ih_navi22::source::DCN_HPD` before arming and returns the
+subscription; `ColdBoot::display_hpd(Hpd)` acknowledges one vector.
+`amdgpu_navi22_display::serve_hpd(sub, ack)` drives them and bumps
+`HOTPLUG` (`version`, `notify`, `wait(&mut since, period_ms)` with a 50 ms
+floor), and the platform's runtime services spawn it and wake the display
+monitor; without an IH ring polling runs alone. A freshly enabled HPD block
+is polled up to 1 s for its connect filter before detection reports
+`Disconnected`.
 
 ### Navi 22 boot ownership and framebuffer handoff
 

@@ -14,7 +14,7 @@
 //! the sink's SCDC first), no deep colour, no audio. Linux also starts the
 //! Audio InfoFrame; with no audio endpoint here nothing is sent for it.
 use crate::{amdgpu::AmdGpu, amdgpu_dcn_profile::Profile};
-use narf_bus::{BusDeviceCap, MmioRegion};
+use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 const STRIDE: u64 = 0x100;
@@ -39,6 +39,8 @@ const DIG_BE_EN_CNTL: u64 = 0x20b1;
 const LAST_REG: u32 = (DIG_BE_EN_CNTL + 5 * STRIDE) as u32;
 
 const DIG_SOURCE_SELECT: u32 = 0x7;
+const DIG_STEREOSYNC_SELECT: u32 = 0x70;
+const DIG_STEREOSYNC_GATE_EN: u32 = 1 << 8;
 const TMDS_PIXEL_ENCODING: u32 = 1 << 28;
 const TMDS_COLOR_FORMAT: u32 = 0xc000_0000;
 const HDMI_KEEPOUT_MODE: u32 = 1 << 0;
@@ -60,7 +62,6 @@ const VPG_GENERIC_CONFLICT_CLR: u32 = 1 << 4;
 const VPG_GENERIC_DATA_INDEX: u32 = 0xff;
 const DIG_FE_SOURCE_SELECT: u32 = 0x7f00;
 const DIG_MODE: u32 = 0x0007_0000;
-const DIG_MODE_HDMI: u32 = 3;
 const DIG_ENABLE: u32 = 1 << 0;
 /// `enc3_update_hdmi_info_packet` sends on line 2.
 const INFO_PACKET_LINE: u32 = 2;
@@ -88,7 +89,7 @@ pub(crate) trait Io: Send {
 }
 #[derive(Debug)]
 struct Mmio {
-    regs: MmioRegion,
+    regs: crate::amdgpu_reg_window::Window,
     base: u64,
 }
 impl Io for Mmio {
@@ -167,17 +168,47 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
-    /// `dcn10_link_encoder_setup(HDMI)` + `connect_dig_be_to_fe(dig, true)` +
-    /// `enc1_dig_connect_to_otg(otg)`.
-    pub(crate) fn route(&mut self, otg: u8) -> Result<(), Error> {
+    /// `enc1_dig_connect_to_otg`: the frontend takes its pixels from `otg`.
+    pub(crate) fn connect_to_otg(&mut self, otg: u8) -> Result<(), Error> {
         if otg >= 6 {
             return Err(Error::Invalid);
         }
-        self.update(self.be(DIG_BE_CNTL), DIG_MODE, DIG_MODE_HDMI << 16)?;
-        let be = self.read(self.be(DIG_BE_CNTL))?;
-        let sources = (be & DIG_FE_SOURCE_SELECT) | (1 << (8 + u32::from(self.dig)));
-        self.update(self.be(DIG_BE_CNTL), DIG_FE_SOURCE_SELECT, sources)?;
         self.update(self.fe(DIG_FE_CNTL), DIG_SOURCE_SELECT, u32::from(otg))
+    }
+    /// `enc1_setup_stereo_sync(otg, false)`: stereo sync from `otg`, gated.
+    pub(crate) fn setup_stereo_sync(&mut self, otg: u8) -> Result<(), Error> {
+        if otg >= 6 {
+            return Err(Error::Invalid);
+        }
+        self.update(
+            self.fe(DIG_FE_CNTL),
+            DIG_STEREOSYNC_SELECT | DIG_STEREOSYNC_GATE_EN,
+            u32::from(otg) << 4 | DIG_STEREOSYNC_GATE_EN,
+        )
+    }
+    /// `dcn10_link_encoder_setup`: the backend's DIG_MODE for the signal.
+    pub(crate) fn setup(&mut self, mode: DigMode) -> Result<(), Error> {
+        self.update(self.be(DIG_BE_CNTL), DIG_MODE, (mode as u32) << 16)
+    }
+    /// `dcn10_link_encoder_connect_dig_be_to_fe`: add or drop this frontend
+    /// in the backend's one-hot source mask, keeping any other frontend.
+    pub(crate) fn connect_be_to_fe(&mut self, connect: bool) -> Result<(), Error> {
+        let be = self.read(self.be(DIG_BE_CNTL))?;
+        let source = 1 << (8 + u32::from(self.dig));
+        let field = if connect {
+            (be & DIG_FE_SOURCE_SELECT) | source
+        } else {
+            be & DIG_FE_SOURCE_SELECT & !source
+        };
+        self.update(self.be(DIG_BE_CNTL), DIG_FE_SOURCE_SELECT, field)
+    }
+    /// `enc1_stream_encoder_set_avmute`.
+    pub(crate) fn set_avmute(&mut self, mute: bool) -> Result<(), Error> {
+        self.update(
+            self.fe(HDMI_GC),
+            HDMI_GC_AVMUTE,
+            if mute { HDMI_GC_AVMUTE } else { 0 },
+        )
     }
     /// The register half of `enc3_stream_encoder_hdmi_set_stream_attribute`
     /// after the VBIOS STREAM_SETUP: RGB pixel encoding, the HDMI engine at
@@ -272,17 +303,23 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
-    /// `enc3_stream_encoder_stop_hdmi_info_packets` for packets 0..7, then
-    /// AVMUTE asserted and the frontend disconnected from the backend.
-    pub(crate) fn stop(&mut self) -> Result<(), Error> {
+    /// `enc3_stream_encoder_stop_hdmi_info_packets` for packets 0..7.
+    pub(crate) fn stop_info_packets(&mut self) -> Result<(), Error> {
         self.write(self.fe(HDMI_GENERIC_PACKET_CONTROL0), 0)?;
         for reg in HDMI_GENERIC_PACKET_LINES {
             self.write(self.fe(reg), 0)?;
         }
-        self.update(self.fe(HDMI_GC), HDMI_GC_AVMUTE, HDMI_GC_AVMUTE)?;
-        let source = 1 << (8 + u32::from(self.dig));
-        self.update(self.be(DIG_BE_CNTL), source, 0)
+        Ok(())
     }
+}
+
+/// `DIG_BE_CNTL.DIG_MODE` values `dcn10_link_encoder_setup` writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DigMode {
+    /// `SIGNAL_TYPE_DISPLAY_PORT` (SST).
+    DisplayPort = 0,
+    /// `SIGNAL_TYPE_HDMI_TYPE_A`.
+    Hdmi = 3,
 }
 
 /// One HDMI stream frontend `dig` routed to physical transmitter `transmitter`.
@@ -310,7 +347,7 @@ impl Hdmi {
             .map_err(|_| Error::Unsupported)?;
         Ok(Self(Engine::new_with(
             Mmio {
-                regs: gpu.regs,
+                regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                 base,
             },
             authority,
@@ -321,8 +358,20 @@ impl Hdmi {
     pub fn check_idle(&mut self) -> Result<(), Error> {
         self.0.check_idle()
     }
-    pub fn route(&mut self, otg: u8) -> Result<(), Error> {
-        self.0.route(otg)
+    pub fn connect_to_otg(&mut self, otg: u8) -> Result<(), Error> {
+        self.0.connect_to_otg(otg)
+    }
+    pub fn setup(&mut self, mode: DigMode) -> Result<(), Error> {
+        self.0.setup(mode)
+    }
+    pub fn setup_stereo_sync(&mut self, otg: u8) -> Result<(), Error> {
+        self.0.setup_stereo_sync(otg)
+    }
+    pub fn connect_be_to_fe(&mut self, connect: bool) -> Result<(), Error> {
+        self.0.connect_be_to_fe(connect)
+    }
+    pub fn set_avmute(&mut self, mute: bool) -> Result<(), Error> {
+        self.0.set_avmute(mute)
     }
     pub fn stream_attribute(&mut self, character_khz: u32) -> Result<(), Error> {
         self.0.stream_attribute(character_khz)
@@ -330,8 +379,8 @@ impl Hdmi {
     pub async fn info_packets(&mut self, avi: &[u8; 36]) -> Result<(), Error> {
         self.0.info_packets(avi).await
     }
-    pub fn stop(&mut self) -> Result<(), Error> {
-        self.0.stop()
+    pub fn stop_info_packets(&mut self) -> Result<(), Error> {
+        self.0.stop_info_packets()
     }
 }
 
@@ -382,7 +431,12 @@ mod tests {
         // GOP left HDMI_CONTROL with deep colour and scrambling set.
         e.io.regs[(HDMI_CONTROL + STRIDE) as usize] =
             HDMI_DEEP_COLOR_ENABLE | HDMI_DATA_SCRAMBLE_EN | 0x1000_0000;
-        if e.check_idle().is_err() || e.route(2).is_err() || e.stream_attribute(148_500).is_err() {
+        if e.check_idle().is_err()
+            || e.connect_to_otg(2).is_err()
+            || e.setup(DigMode::Hdmi).is_err()
+            || e.connect_be_to_fe(true).is_err()
+            || e.stream_attribute(148_500).is_err()
+        {
             return TestResult::Fail("HDMI stream setup");
         }
         let r = &e.io.regs;
@@ -439,7 +493,9 @@ mod tests {
             return TestResult::Fail("non-AVI packet");
         }
         e.io.regs[DIG_BE_CNTL as usize] = 3 << 16 | 1 << 8;
-        if e.stop().is_err()
+        if e.stop_info_packets().is_err()
+            || e.set_avmute(true).is_err()
+            || e.connect_be_to_fe(false).is_err()
             || e.io.regs[HDMI_GENERIC_PACKET_CONTROL0 as usize] != 0
             || e.io.regs[HDMI_GC as usize] & HDMI_GC_AVMUTE == 0
             || e.io.regs[DIG_BE_CNTL as usize] & DIG_FE_SOURCE_SELECT != 0

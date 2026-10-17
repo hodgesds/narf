@@ -1221,10 +1221,13 @@ impl ColdBoot {
             .as_ref()
             .map(crate::amdgpu_navi22_display::Display::connectors)
     }
-    /// Light the first connected HDMI connector natively with a colour-bar
-    /// test pattern (`amdgpu_navi22_modeset`). Off unless the platform opts in;
-    /// requires firmware readiness, the retained SMU and the display owner.
-    /// The pipeline is retained, lit or failed; there is no retry.
+    /// Light a connector natively with a colour-bar test pattern
+    /// (`amdgpu_navi22_modeset`): a connected HDMI sink if there is one, else
+    /// the first DisplayPort sink with EDID and receiver caps
+    /// ([`crate::amdgpu_navi22_modeset::choose`]). Off unless the platform
+    /// opts in; requires firmware readiness, the retained SMU and the display
+    /// owner. The GOP's stream, if still lit, is retired first. The pipeline
+    /// is retained, lit or failed; there is no retry.
     ///
     /// # Safety
     /// No other display, DMUB or VBIOS client may run, and nothing may write
@@ -1232,45 +1235,17 @@ impl ColdBoot {
     pub async unsafe fn modeset_hdmi(
         &mut self,
     ) -> Result<crate::amdgpu_navi22_modeset::Output, Error> {
-        use crate::amdgpu_navi22_display::{Detection, Signal};
         use crate::amdgpu_navi22_modeset as modeset;
-        if self.sequence.backend.modeset.is_some() {
-            return Err(Error::Busy);
-        }
         let reports = self.detect_displays().await?;
-        let h = &mut self.sequence.backend;
-        let Some((connector, sink)) = reports.into_iter().find_map(|r| match r.detection {
-            Detection::Connected(sink) if r.connector.signal == Signal::Hdmi => {
-                Some((r.connector, sink))
-            }
-            _ => None,
-        }) else {
+        let Some((connector, sink)) = modeset::choose(&reports) else {
             return Err(Error::Modeset(modeset::Error::NoSink));
         };
-        let (vbios, crystal) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
-        let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
-            .map_err(|e| Error::Modeset(modeset::Error::Bios(e)))?;
-        let smu = h.smu.as_mut().ok_or(Error::Invalid)?;
-        // SAFETY: this cold-boot owner holds the whole GPU; the caller's
-        // contract excludes other display clients.
-        let mut pipeline = unsafe { modeset::Pipeline::new(&h.gpu, h.authority, connector) }
-            .map_err(Error::Modeset)?;
-        // SAFETY: forwarded; the pool and SMU are this owner's.
-        let result = unsafe {
-            pipeline
-                .enable(
-                    smu,
-                    &h.pool,
-                    &tables,
-                    vbios,
-                    *crystal,
-                    &sink,
-                    modeset::test_pattern,
-                )
+        let sink = sink.clone();
+        // SAFETY: forwarded unchanged.
+        unsafe {
+            self.modeset_display(connector, &sink, None, modeset::test_pattern)
                 .await
-        };
-        h.modeset = Some(pipeline);
-        result.map_err(Error::Modeset)
+        }
     }
     /// HDP flush for CPU writes to the native scanout.
     pub fn flush_display_scanout(&mut self) -> Result<(), Error> {
@@ -1571,16 +1546,39 @@ impl ColdBoot {
         let (vbios, crystal) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
         let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
             .map_err(|e| Error::Modeset(modeset::Error::Bios(e)))?;
+        let board = modeset::Board::from_vbios(vbios, *crystal).map_err(Error::Modeset)?;
         let smu = h.smu.as_mut().ok_or(Error::Invalid)?;
+        let display = h.display.as_mut().ok_or(Error::Invalid)?;
+        let links: alloc::vec::Vec<_> = display.connectors().to_vec();
+        let index = links
+            .iter()
+            .position(|c| *c == connector)
+            .ok_or(Error::Invalid)?;
+        // One stream: the DCN3.0 pool from empty (the previous pipeline, if
+        // any, stopped or failed and was dropped above).
+        let route = modeset::Resources::new()
+            .acquire(&connector)
+            .map_err(Error::Modeset)?;
         // SAFETY: this cold-boot owner holds the whole GPU; the caller's
         // contract excludes other display clients.
-        let mut pipeline = unsafe { modeset::Pipeline::new(&h.gpu, h.authority, connector) }
+        let mut pipeline = unsafe { modeset::Pipeline::new(&h.gpu, h.authority, connector, route) }
             .map_err(Error::Modeset)?;
         pipeline.request(want);
-        // SAFETY: forwarded; the pool and SMU are this owner's.
+        let mut aux = crate::amdgpu_navi22_display::DisplayAux { display, index };
+        // SAFETY: forwarded; the pool and SMU are this owner's, and the
+        // display-power future is polled only by ClockManager::start_with.
         let result = unsafe {
             pipeline
-                .enable(smu, &h.pool, &tables, vbios, *crystal, sink, draw)
+                .enable(
+                    crate::amdgpu_dcn30_clk::display_power(smu),
+                    &h.pool,
+                    &tables,
+                    board,
+                    &links,
+                    sink,
+                    &mut aux,
+                    draw,
+                )
                 .await
         };
         let output = match result {
@@ -1602,13 +1600,14 @@ impl ColdBoot {
             address,
             fb: output.scanout,
         };
-        // SAFETY: the pipeline just lit pipe 0 with this surface and both
-        // owners live in this cold-boot owner, serialized by its caller.
+        // SAFETY: the pipeline just lit its route's pipe with this surface
+        // and both owners live in this cold-boot owner, serialized by its
+        // caller.
         let mut scanout = unsafe {
             crate::amdgpu_navi22_scanout::Scanout::new(
                 &h.gpu,
                 h.authority,
-                0,
+                route.pipe,
                 front,
                 map,
                 output.timing,
@@ -1641,7 +1640,18 @@ impl ColdBoot {
         let (vbios, _) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
         let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
             .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Bios(e)))?;
-        pipeline.disable(&tables).await.map_err(Error::Modeset)?;
+        let connector = pipeline.connector();
+        let display = h.display.as_mut().ok_or(Error::Invalid)?;
+        let index = display
+            .connectors()
+            .iter()
+            .position(|c| *c == connector)
+            .ok_or(Error::Invalid)?;
+        let mut aux = crate::amdgpu_navi22_display::DisplayAux { display, index };
+        pipeline
+            .disable(&tables, &mut aux)
+            .await
+            .map_err(Error::Modeset)?;
         // SAFETY: the pipeline stopped cleanly (HUBP drained and blanked, OTG
         // off) and the caller retired every CPU view.
         unsafe {
@@ -1722,6 +1732,32 @@ impl ColdBoot {
     ) -> Result<crate::amdgpu_dcn30_cursor::Shown, crate::amdgpu_dcn_clk::Error> {
         let (scanout, pool, flush) = self.presentation()?;
         scanout.set_cursor(pool, image, at, flush)
+    }
+}
+
+/// IH-driven HPD (`amdgpu_dm_hpd_init` / `dm_irq_handler`) for the native
+/// display owner.
+impl ColdBoot {
+    /// Subscribe to the DCN HPD source, then arm every connector's HPD (and
+    /// DP HPD_RX) interrupt. Polling detection keeps working without it.
+    pub fn arm_display_hpd(&mut self) -> Result<crate::amdgpu_ih_navi22::Subscription, Error> {
+        let ih = self.interrupts().ok_or(Error::Invalid)?;
+        let subscription = ih
+            .subscribe(crate::amdgpu_ih_navi22::source::DCN_HPD)
+            .map_err(|_| Error::Busy)?;
+        self.display_mut()?
+            .arm_hpd_interrupts()
+            .map_err(Error::Display)?;
+        Ok(subscription)
+    }
+    /// Acknowledge one HPD/HPD_RX vector; returns the connector index.
+    pub fn display_hpd(
+        &mut self,
+        hpd: crate::amdgpu_ih_navi22::Hpd,
+    ) -> Result<Option<usize>, Error> {
+        self.display_mut()?
+            .hpd_event(hpd.instance, hpd.rx)
+            .map_err(Error::Display)
     }
 }
 

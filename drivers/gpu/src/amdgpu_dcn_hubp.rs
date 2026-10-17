@@ -11,7 +11,7 @@ use crate::{
     amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_dcn_profile::Profile, amdgpu_dml::Format,
     amdgpu_dml_regs::Registers,
 };
-use narf_bus::{BusDeviceCap, MmioRegion};
+use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // HUBP block, stride 0xdc.
@@ -115,7 +115,7 @@ trait Io: Send {
 }
 #[derive(Debug)]
 struct Mmio {
-    regs: MmioRegion,
+    regs: crate::amdgpu_reg_window::Window,
     base: u64,
 }
 impl Io for Mmio {
@@ -370,7 +370,7 @@ impl Hubp {
         )?;
         Ok(Self(Engine {
             io: Mmio {
-                regs: gpu.regs,
+                regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                 base,
             },
             authority,

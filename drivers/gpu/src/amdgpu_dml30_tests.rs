@@ -205,11 +205,12 @@ kernel_test_in!("drivers/gpu/dml30", dml30_uses_dcn30_parameters_not_dcn314);
 
 fn dml30_refuses_unsupported_and_unschedulable_modes() -> TestResult {
     let base = config(148_500, 1920, 2200, 88, 44, 1080, 1125, 4);
-    // Scaling, cursors, interlace-like shapes and taps are out of scope.
+    // Scaling, a second cursor, interlace-like shapes and taps are out of
+    // scope (DCN30's number_of_cursors is 1).
     let mut scaled = base;
     scaled.plane.viewport_width = 1280;
     let mut cursor = base;
-    cursor.cursors = 1;
+    cursor.cursors = 2;
     if plan(&scaled, &soc()) != Err(Error::Unsupported)
         || plan(&cursor, &soc()) != Err(Error::Unsupported)
     {
@@ -247,4 +248,44 @@ fn dml30_refuses_unsupported_and_unschedulable_modes() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dml30",
     dml30_refuses_unsupported_and_unschedulable_modes
+);
+
+fn dml30_budgets_one_cursor_like_dcn20_populate_dml_pipes() -> TestResult {
+    let base = config(148_500, 1920, 2200, 88, 44, 1080, 1125, 4);
+    let mut with = base;
+    with.cursors = 1;
+    let (Ok(plain), Ok(cursor)) = (plan(&base, &soc()), plan(&with, &soc())) else {
+        return TestResult::Fail("1080p60 with a cursor");
+    };
+    if plain.cursor.is_some() {
+        return TestResult::Fail("cursor TTU without a cursor");
+    }
+    let Some(ttu) = cursor.cursor else {
+        return TestResult::Fail("no cursor TTU");
+    };
+    // calculate_ttu_cursor: 256 px / 4 requests at ref_freq_to_pix_freq
+    // 50/148.5, in U?.10: floor(64 * 50 / 148.5 * 1024) = 22066 (within
+    // the fixed point's last bit).
+    if ttu.refcyc_per_req_delivery.abs_diff(22_066) > 1 {
+        return TestResult::Fail("cursor request delivery");
+    }
+    if ttu.qos_level_fixed != 8 || ttu.qos_ramp_disable != 0 || ttu.refcyc_per_req_delivery_pre == 0
+    {
+        return TestResult::Fail("cursor TTU fields");
+    }
+    // dppclk_delay_cnvc_cursor (6 DPPCLK) moves the after-scaler point, and
+    // the cursor's 1 KiB per line raises the urgent bandwidth fraction.
+    if cursor.prefetch.dst_x_after_scaler == plain.prefetch.dst_x_after_scaler
+        && cursor.prefetch.dst_y_after_scaler == plain.prefetch.dst_y_after_scaler
+    {
+        return TestResult::Fail("cursor DPPCLK delay");
+    }
+    if cursor.urgent_bandwidth_thousandths <= plain.urgent_bandwidth_thousandths {
+        return TestResult::Fail("cursor bandwidth");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dml30",
+    dml30_budgets_one_cursor_like_dcn20_populate_dml_pipes
 );
