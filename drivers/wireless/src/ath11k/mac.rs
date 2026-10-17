@@ -2471,11 +2471,6 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                     let Ok(Some(mut m2)) = sup.handle(&HmacSha1, pmk, 16, &key) else {
                         return fail(step::EAPOL_PROTO, 1, errno::EPROTO, "4-way (bad M1)");
                     };
-                    m2.key_information |= ver;
-                    // narf_wireless sizes M2's MIC field from the HMAC
-                    // output (20 for SHA-1); AKM 00-0F-AC:2 uses a
-                    // 16-byte Key MIC (IEEE 802.11-2020 Table 12-11).
-                    m2.key_mic = alloc::vec![0u8; 16];
                     m2.key_data = our_rsn.clone();
                     let mut bytes = m2.into_eapol();
                     let kck = sup.ptk.as_ref().unwrap().kck.clone();
@@ -2531,8 +2526,6 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                         Ok(Some(m)) => m,
                         _ => return fail(step::EAPOL_PROTO, 5, errno::EPROTO, "4-way (bad M3)"),
                     };
-                    let mut m4 = m4;
-                    m4.key_information |= ver;
                     let mut bytes = m4.into_eapol();
                     let mic = eapol_mic(&kck, &bytes);
                     bytes[EAPOL_MIC_OFFSET..EAPOL_MIC_OFFSET + 16].copy_from_slice(&mic);

@@ -748,6 +748,16 @@ mod tests {
         if m2.replay_counter != 1 || !m2.has_mic() || m2.key_ack() {
             return TestResult::Fail("M2 flags / counter wrong");
         }
+        // Key MIC field = the AKM's length (16 for AKM 2, IEEE
+        // 802.11-2020 Table 12-11), not the HMAC output length; an AP
+        // misparses an M2 with a 20-byte MIC field.
+        if m2.key_mic.len() != 16 || m2.encode().len() != m1.encode().len() {
+            return TestResult::Fail("M2 Key MIC field is not M1's (AKM) length");
+        }
+        // Key Descriptor Version (bits 2:0) echoed from M1.
+        if m2.key_information & 0x7 != 0x02 {
+            return TestResult::Fail("M2 dropped the key descriptor version");
+        }
         if sup.ptk.is_none() {
             return TestResult::Fail("PTK should be derived after M1");
         }
@@ -768,6 +778,9 @@ mod tests {
         }
         if m4.install() || !m4.has_mic() {
             return TestResult::Fail("M4 flags wrong");
+        }
+        if m4.key_mic.len() != 16 || m4.key_information & 0x7 != 0x02 {
+            return TestResult::Fail("M4 MIC length / key descriptor version wrong");
         }
         TestResult::Pass
     }

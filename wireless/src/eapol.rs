@@ -70,6 +70,8 @@ pub const KEY_DESCRIPTOR_WPA_LEGACY: u8 = 254;
 // ── Key Information bits (802.11 §12.7.2 figure 12-32) ────────────
 //
 // 16-bit bitmap; bits 0..2 are Key Descriptor Version, then per-flag.
+/// Key Information bits 2:0 — Key Descriptor Version.
+pub const KI_VERSION_MASK: u16 = 0x0007;
 pub const KI_VERSION_HMAC_SHA1_AES: u16 = 0x02;
 pub const KI_VERSION_AES_128_CMAC: u16 = 0x03;
 pub const KI_KEY_TYPE_PAIRWISE: u16 = 1 << 3;
@@ -434,9 +436,18 @@ impl Supplicant {
         // mirrors M1, key_data carries the supplicant's RSN IE
         // (provided by the caller via .key_data; we leave it empty
         // here — the supplicant top-level fills it).
-        let mut m2 = KeyFrame::empty(hmac.out_len().min(32));
+        //
+        // The Key MIC field length is the AKM's (IEEE 802.11-2020
+        // Table 12-11: 16 for AKM 1/2, HMAC-SHA1-128 truncated), not
+        // the HMAC output length (20 for SHA-1). The caller decoded M1
+        // with that length, so mirror it — wpa_supplicant uses
+        // `wpa_mic_len(akmp)` the same way. The Key Descriptor Version
+        // (Key Information bits 2:0) is echoed from M1, as
+        // `wpa_supplicant_send_2_of_4` does via `ver`.
+        let mut m2 = KeyFrame::empty(m1.key_mic.len());
         m2.descriptor_type = m1.descriptor_type;
-        m2.key_information = KI_KEY_TYPE_PAIRWISE | KI_KEY_MIC;
+        m2.key_information =
+            (m1.key_information & KI_VERSION_MASK) | KI_KEY_TYPE_PAIRWISE | KI_KEY_MIC;
         m2.replay_counter = m1.replay_counter;
         m2.key_nonce = self.snonce;
         // MIC computed over the encoded EAPOL-Key body with MIC zeroed.
@@ -465,7 +476,8 @@ impl Supplicant {
         let mic_len = m3.key_mic.len();
         let mut m4 = KeyFrame::empty(mic_len);
         m4.descriptor_type = m3.descriptor_type;
-        m4.key_information = KI_KEY_TYPE_PAIRWISE | KI_KEY_MIC | KI_SECURE;
+        m4.key_information =
+            (m3.key_information & KI_VERSION_MASK) | KI_KEY_TYPE_PAIRWISE | KI_KEY_MIC | KI_SECURE;
         m4.replay_counter = m3.replay_counter;
         self.state = FourWayState::PtkDone;
         Ok(Some(m4))
