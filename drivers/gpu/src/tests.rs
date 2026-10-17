@@ -10548,7 +10548,8 @@ fn smoke_amdgpu_vm_activate_programs_both_hubs() -> TestResult {
     use crate::amdgpu_uapi as u;
     use crate::amdgpu_vm::{self as vm, ActivateError, VmState, GPU_PAGE_SIZE};
     use crate::amdgpu_vmhub_regs::{
-        test_support::MockVmHubMmio, GFXHUB_V3_0, MMHUB_V3_0, TLB_POLL_BUDGET,
+        test_support::MockVmHubMmio, GFXHUB_V3_0, KERNEL_INVALIDATE_ENGINE as ENG, MMHUB_V3_0,
+        TLB_POLL_BUDGET,
     };
     use crate::amdgpu_vmid::{Pasid, VmidPool};
     use crate::drm_uapi::DRM_COMMAND_BASE;
@@ -10621,8 +10622,11 @@ fn smoke_amdgpu_vm_activate_programs_both_hubs() -> TestResult {
     // so the budget is not spent.
     // The poll waits for the VMID's own bit in the ACK; all-ones satisfies it
     // whichever VMID the pool hands out.
-    gfx.auto_ack_after = Some((GFXHUB_V3_0.inv_eng0_ack << 2, u32::MAX));
-    mm.auto_ack_after = Some((MMHUB_V3_0.inv_eng0_ack << 2, u32::MAX));
+    gfx.auto_ack_after = Some(((GFXHUB_V3_0.inv_eng0_ack + ENG) << 2, u32::MAX));
+    mm.auto_ack_after = Some(((MMHUB_V3_0.inv_eng0_ack + ENG) << 2, u32::MAX));
+    // The MMHUB invalidation first acquires the kernel engine's semaphore.
+    mm.reads
+        .push_back(((MMHUB_V3_0.inv_eng0_sem + ENG) << 2, 1));
 
     let vmid = match vm::activate(
         &state,
@@ -10694,7 +10698,7 @@ fn smoke_amdgpu_vm_activate_programs_both_hubs() -> TestResult {
     let inv_at = gfx
         .writes
         .iter()
-        .position(|(off, _)| *off == GFXHUB_V3_0.inv_eng0_req << 2);
+        .position(|(off, _)| *off == (GFXHUB_V3_0.inv_eng0_req + ENG) << 2);
     match (cntl_at, inv_at) {
         (Some(c), Some(i)) if i > c => {}
         (_, None) => return TestResult::Fail("no TLB invalidate was issued"),
