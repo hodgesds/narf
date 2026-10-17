@@ -10860,6 +10860,28 @@ fn smoke_amdgpu_vm_gmc12_tables() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/amdgpu_vm", smoke_amdgpu_vm_gmc12_tables);
 
+/// A client's address space follows its card: GMC 12 for a Navi4x id (the
+/// RX 9070 XT), GMC 11's layout and encoding for every other family and
+/// for an unknown card, as before.
+fn smoke_amdgpu_vm_geometry_follows_the_card() -> TestResult {
+    use crate::amdgpu::{family_for_pci_id, Family, AMD_VENDOR, NAVI22, NAVI48};
+    use crate::amdgpu_vm::{Geometry, VmState};
+    if family_for_pci_id(AMD_VENDOR, NAVI48) != Some(Family::Navi4)
+        || Geometry::for_family(Some(Family::Navi4)) != Geometry::GMC12
+        || Geometry::for_family(family_for_pci_id(AMD_VENDOR, NAVI22)) != Geometry::GMC11
+        || Geometry::for_family(Some(Family::Phoenix)) != Geometry::GMC11
+        || Geometry::for_family(None) != Geometry::GMC11
+        || VmState::for_card(u32::MAX).geometry() != Geometry::GMC11
+    {
+        return TestResult::Fail("per-card VM geometry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_vm_geometry_follows_the_card
+);
+
 /// `AMDGPU_CS`'s parser against the input a hostile client would send.
 ///
 /// The IB's CONTENTS are not validated — not here and not in Linux, where

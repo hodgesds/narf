@@ -180,7 +180,7 @@ impl DriCardFile {
             metadata,
             virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
             amdgpu_gem: crate::amdgpu_gem::GemState::new(),
-            amdgpu_vm: crate::amdgpu_vm::VmState::new(),
+            amdgpu_vm: crate::amdgpu_vm::VmState::for_card(index),
             amdgpu_ctx: crate::amdgpu_ctx::CtxState::new(),
             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
             events: narf_lib::sync::IrqSafeSpinLock::new(crate::drm::card::DrmEventQueue::new()),
@@ -1114,7 +1114,7 @@ impl DirOps for DriDir {
                             metadata,
                             virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
                             amdgpu_gem: crate::amdgpu_gem::GemState::new(),
-                            amdgpu_vm: crate::amdgpu_vm::VmState::new(),
+                            amdgpu_vm: crate::amdgpu_vm::VmState::for_card(idx),
                             amdgpu_ctx: crate::amdgpu_ctx::CtxState::new(),
                             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
                         }));

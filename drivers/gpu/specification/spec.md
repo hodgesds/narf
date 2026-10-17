@@ -3496,7 +3496,10 @@ paths; only the tables differ.
 - `Geometry::{GMC11, GMC12}`: GMC 12 (GC 12.0.x) walks GMC 11's four-level,
   48-bit layout (`amdgpu_vm_adjust_size(256 * 1024, 9, 3, 48)`) and differs
   in `format`. `VmState::with_geometry` builds an address space for a
-  generation; `VmState::new` remains GMC 11.
+  generation; `VmState::new` remains GMC 11. Each DRM open takes
+  `VmState::for_card(index)`: GMC 12 for a Navi4x card (by
+  `drm_registry::pci_id` and `amdgpu::family_for_pci_id`), GMC 11's layout
+  and encoding — which GMC 10 shares — for every other card.
 - `PteFormat::{Nv10, Gfx12}` encodes entries as `gmc_v1x_0_get_vm_pte`:
   GMC 12 puts MTYPE at 55:54 (NC/UC only), PRT at 56 with IS_PTE, PDE_PTE at
   63 and the block fragment size at 62:58, sets DCC for `GFX12_DCC` buffers

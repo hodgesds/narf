@@ -316,6 +316,16 @@ impl Geometry {
         ..Geometry::GMC11
     };
 
+    /// The geometry a family's GMC presents: GMC 12's for Navi4x, GMC 11's
+    /// otherwise — the layout GMC 10 shares, and what an unknown device
+    /// was always given.
+    pub fn for_family(family: Option<crate::amdgpu::Family>) -> Geometry {
+        match family {
+            Some(crate::amdgpu::Family::Navi4) => Geometry::GMC12,
+            _ => Geometry::GMC11,
+        }
+    }
+
     /// `amdgpu_vm_pt_level_shift` — how far to shift a PFN to get this
     /// level's index. In GPU pages, so the VA bit position is this plus 12.
     pub fn level_shift(&self, level: Level) -> u32 {
@@ -523,6 +533,14 @@ impl VmState {
     /// A GMC 11 address space.
     pub const fn new() -> Self {
         Self::with_geometry(Geometry::GMC11)
+    }
+
+    /// The address space a client of DRM card `index` gets: GMC 12's for a
+    /// Navi4x card, GMC 11's (which GMC 10 shares) for every other.
+    pub fn for_card(index: u32) -> Self {
+        let family = crate::drm_registry::pci_id(index)
+            .and_then(|(vid, did)| crate::amdgpu::family_for_pci_id(vid, did));
+        Self::with_geometry(Geometry::for_family(family))
     }
 
     /// An address space laid out and encoded as `geometry`'s generation.
