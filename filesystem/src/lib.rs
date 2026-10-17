@@ -1136,6 +1136,16 @@ pub trait FileOps: Send + Sync {
         0
     }
 
+    /// The dentry name of a file created unlinked on a kernel-internal
+    /// mount — Linux `alloc_file_pseudo(inode, mnt, name, ...)` outside
+    /// anon_inodefs, e.g. `memfd:<name>` on `shm_mnt` or `secretmem`.
+    /// `d_path` renders it as `/<name> (deleted)`, which is what
+    /// `/proc/<pid>/fd/<n>` and `/proc/<pid>/maps` show. `None` for every
+    /// other file.
+    fn internal_name(&self) -> Option<alloc::string::String> {
+        None
+    }
+
     /// The name an `anon_inodefs` file was created under — Linux
     /// `anon_inode_getfile(name, ...)`, e.g. `[eventfd]`, `[eventpoll]`,
     /// `inotify`. `/proc/<pid>/fd/<n>` reads `anon_inode:<name>` for it.

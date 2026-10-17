@@ -8458,16 +8458,29 @@ fn pathless_fd_link(ops: &dyn narf_filesystem::FileOps) -> alloc::string::String
     if dev != 0 && dev == PseudoFs::Pipe.dev() {
         return alloc::format!("pipe:[{}]", ops.ino());
     }
-    // Types not yet given an identity (e.g. memfd, whose Linux target is
-    // `/memfd:<name> (deleted)`) keep the non-empty placeholder.
+    // Types not yet given an identity keep the non-empty placeholder. A
+    // memfd lands here too: its `/memfd:<name> (deleted)` link is rendered
+    // only by `fd_path_of`, because callers of this treat a `/` as a path to
+    // reopen.
     "anon_inode:[FileOps]".into()
+}
+
+/// `d_path` of a file created unlinked on a kernel-internal mount
+/// ([`narf_filesystem::FileOps::internal_name`]): `/memfd:<name> (deleted)`.
+pub(crate) fn internal_file_path(ops: &dyn narf_filesystem::FileOps) -> Option<alloc::string::String> {
+    ops.internal_name().map(|name| alloc::format!("/{name} (deleted)"))
 }
 
 pub fn fd_path_of(pid: u64, n: u32) -> Option<narf_filesystem::procfs::ProcFdSnapshot> {
     let tid = proc_pid_to_tid(pid);
-    let (pos, flags, ino) = crate::fd::with_table(tid, |table| {
+    let (pos, flags, ino, internal) = crate::fd::with_table(tid, |table| {
         let entry = table.get(n)?;
-        Some((table.offset(n)?, table.status_flags(n)?, entry.ops.ino()))
+        Some((
+            table.offset(n)?,
+            table.status_flags(n)?,
+            entry.ops.ino(),
+            internal_file_path(&*entry.ops),
+        ))
     })
     .flatten()?;
     // Preferred: the real backing path recorded at open() time (the same
@@ -8475,8 +8488,17 @@ pub fn fd_path_of(pid: u64, n: u32) -> Option<narf_filesystem::procfs::ProcFdSna
     // readlinks to — musl's realpath() opens O_PATH then readlinks here.
     // Report it chroot-relative so a chrooted process (e.g. udev in a
     // distro chroot) can re-open the link target in its own namespace.
+    //
+    // A memfd's link is what Linux readlink shows, `/memfd:<name> (deleted)`.
+    // It is display-only: the path helpers the exec and open paths consult
+    // (`fd_path_string_of`, `fd_path_for_task`) keep reporting no `/` path
+    // for it, so fexecve still runs the fd's own bytes rather than looking
+    // the text up as a file.
     Some(narf_filesystem::procfs::ProcFdSnapshot {
-        path: fd_path_string_of(pid, n)?,
+        path: match internal {
+            Some(path) => path,
+            None => fd_path_string_of(pid, n)?,
+        },
         info: narf_filesystem::procfs::ProcFdInfo {
             pos,
             flags,

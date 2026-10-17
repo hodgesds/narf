@@ -453,13 +453,14 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     // LINUX-GAP: the eager private-file copy (MAP_POPULATE / MAP_LOCKED
     // without MAP_NONBLOCK) registers no file owner and therefore still
     // renders as `00:00 0` with no path; Linux keeps `vm_file` there too.
-    // LINUX-GAP: an fd with no recorded open path (memfd, anon inodes) gets
-    // dev/inode but no pathname; Linux prints `/memfd:<name> (deleted)`.
+    // A memfd has no open path; `show_map_vma` prints its `d_path`,
+    // `/memfd:<name> (deleted)`.
     let provenance = file.as_ref().map(|(ops, _)| {
         Arc::new(crate::mapped_file::MappingProvenance {
             device: ops.inode_attrs().dev,
             inode: ops.ino(),
-            pathname: crate::mqueue::fd_path(current_task_id(), fd as u32),
+            pathname: crate::mqueue::fd_path(current_task_id(), fd as u32)
+                .or_else(|| internal_file_path(&**ops)),
         })
     });
 

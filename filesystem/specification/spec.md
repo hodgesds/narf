@@ -277,6 +277,7 @@ pub trait FileOps {
     fn ioctl_user(&self, cmd: u32, arg: u64, ctx: &dyn IoctlContext) -> FsFuture<'_, u64>;
     fn has_flush(&self) -> bool;
     fn anon_name(&self) -> Option<&'static str>; // anon_inodefs name, e.g. "[eventfd]"
+    fn internal_name(&self) -> Option<String>;   // unlinked internal-mount name, e.g. "memfd:x"
     fn poll_readiness(&self) -> u32;
     fn poll_readiness_at(&self, offset: u64) -> u32;
     fn poll_edge_token(&self) -> (u64, u64);
@@ -486,6 +487,14 @@ including after fd close, fork and mapping splits. Overlay forwards these hooks.
 `inotify`, ...); it defaults to `None`. A pathless fd's `/proc/<pid>/fd/<n>`
 link reads `anon_inode:<name>`, or `socket:[ino]` / `pipe:[ino]` for files on
 the sockfs / pipefs pseudo superblocks, and never begins with `/`.
+
+`FileOps::internal_name()` is the dentry name of a file created unlinked on
+a kernel-internal mount: `memfd:<name>` for `memfd_create`, `secretmem` for
+`memfd_secret`. It defaults to `None`. `/proc/<pid>/fd/<n>` and
+`/proc/<pid>/maps` render it as Linux's `d_path` does,
+`/<name> (deleted)`. That text is display-only: the fd-path helpers that
+exec and open re-resolve still report no `/` path for such a file, so
+fexecve of `/proc/self/fd/N` runs the fd's bytes.
 
 `FileOps::mmap_is_ram()` defaults to false. A true implementation promises
 that both mmap backing methods expose ordinary allocator frames retired via

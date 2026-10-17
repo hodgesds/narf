@@ -1292,6 +1292,57 @@ kernel_test_in!(
     smoke_abi_proc2_pathless_fd_links_name_the_file
 );
 
+/// A memfd is an unlinked file on the internal `shm_mnt`, named
+/// `memfd:<name>` (`mm/memfd.c::memfd_alloc_file`), so readlink of its fd
+/// gives `d_path`'s `/memfd:<name> (deleted)`; `memfd_secret` gives
+/// `/secretmem (deleted)`. That text begins with `/` but names nothing, so
+/// the fd-path helpers fexecve and open consult must still report no
+/// reopenable path for it, or exec'ing `/proc/self/fd/N` would look the text
+/// up instead of running the fd's bytes.
+fn smoke_abi_proc2_memfd_fd_link_is_memfd_name_deleted() -> TestResult {
+    with_procfs(FAKE_TASK, "memfdlink", &["memfdlink"], 0, |base| {
+        let readlink = |fd: u32| -> Result<alloc::string::String, &'static str> {
+            let link = alloc::format!("{}/{}/fd/{}\0", base, FAKE_TASK, fd);
+            let mut buf = [0u8; 128];
+            match call_readlink(
+                link.as_ptr() as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            ) {
+                Some(n) if n > 0 => {
+                    Ok(alloc::string::String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+                }
+                _ => Err("readlink of /proc/<pid>/fd/<n> failed"),
+            }
+        };
+        let mfd = match call(
+            Syscall::MemfdCreate.raw(),
+            a1(c"narf-test".as_ptr() as u64, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("memfd_create"),
+        };
+        if readlink(mfd)? != "/memfd:narf-test (deleted)" {
+            return Err("memfd link should be /memfd:<name> (deleted)");
+        }
+        if crate::handlers::fd_path_for_task(FAKE_TASK, mfd).is_some_and(|p| p.starts_with('/')) {
+            return Err("a memfd must not report a reopenable / path to exec and open");
+        }
+        let sfd = match call(Syscall::MemfdSecret.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("memfd_secret"),
+        };
+        if readlink(sfd)? != "/secretmem (deleted)" {
+            return Err("memfd_secret link should be /secretmem (deleted)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_memfd_fd_link_is_memfd_name_deleted
+);
+
 // A descriptor number freed without close(2) — CLOEXEC at exec, close_range,
 // a CLONE_FILES sibling — used to keep its fd→path row, so the next file
 // installed at that number readlinked to the OLD file (a pipe end reading
@@ -3268,6 +3319,47 @@ fn smoke_abi_proc2_maps_file_mmap_reports_provenance() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_maps_file_mmap_reports_provenance
+);
+
+/// `show_map_vma` prints a memfd mapping's `d_path`, `/memfd:<name>
+/// (deleted)`, after its dev and inode — the memfd has no open path.
+fn smoke_abi_proc2_maps_memfd_mmap_names_the_memfd() -> TestResult {
+    with_thread_group(false, |v| {
+        let fd = match call(
+            Syscall::MemfdCreate.raw(),
+            a1(c"narf-maps".as_ptr() as u64, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("memfd_create"),
+        };
+        let result = (|| {
+            if call(Syscall::Ftruncate.raw(), a1(fd, 0x1000)) != Some(0) {
+                return Err("ftruncate of the memfd failed");
+            }
+            let base = maps_map_private(fd, 0x1000, 0)?;
+            set_task(TG_THREAD_TASK);
+            let maps = tg_read(&alloc::format!("{}/self/maps", v.base));
+            set_task(FAKE_TASK);
+            let _ = call(Syscall::Munmap.raw(), a1(base, 0x1000));
+            let prefix = alloc::format!("{:016x}-{:016x} r--p 00000000 ", base, base + 0x1000);
+            let line = maps?
+                .lines()
+                .find(|l| l.starts_with(&prefix))
+                .map(alloc::string::String::from)
+                .ok_or("the memfd mapping is missing from /proc/self/maps")?;
+            if line.ends_with(" /memfd:narf-maps (deleted)") {
+                Ok(())
+            } else {
+                Err("a memfd mapping should be named /memfd:<name> (deleted)")
+            }
+        })();
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_maps_memfd_mmap_names_the_memfd
 );
 
 /// Punching the middle page out of a file mapping leaves two VMAs; Linux's
