@@ -5414,9 +5414,31 @@ impl SocketFile {
                     return result;
                 }
                 let dest_portid = self.ensure_netlink_portid();
+                let udp4: Vec<_> = udp_snapshot_in(self.net_ns_id())
+                    .into_iter()
+                    .map(|socket| {
+                        // inet_diag_sockid carries IPv4 in the first word.
+                        let widen = |addr: [u8; 4]| {
+                            let mut out = [0; 16];
+                            out[..4].copy_from_slice(&addr);
+                            out
+                        };
+                        narf_net::netlink_diag::UdpDiagRecord {
+                            state: socket.state_code,
+                            local_addr: widen(socket.local_addr),
+                            local_port: socket.local_port,
+                            remote_addr: widen(socket.remote_addr),
+                            remote_port: socket.remote_port,
+                            tx_queue: socket.tx_queue,
+                            rx_queue: socket.rx_queue,
+                            uid: socket.uid,
+                            inode: socket.inode,
+                        }
+                    })
+                    .collect();
                 let udp6: Vec<_> = udp6_snapshot_in(self.net_ns_id())
                     .into_iter()
-                    .map(|socket| narf_net::netlink_diag::Udp6DiagRecord {
+                    .map(|socket| narf_net::netlink_diag::UdpDiagRecord {
                         state: socket.state_code,
                         local_addr: socket.local_addr,
                         local_port: socket.local_port,
@@ -5424,12 +5446,19 @@ impl SocketFile {
                         remote_port: socket.remote_port,
                         tx_queue: socket.tx_queue,
                         rx_queue: socket.rx_queue,
+                        uid: socket.uid,
+                        inode: socket.inode,
                     })
                     .collect();
-                let mut replies = match narf_net::netlink_diag::build_replies_in_with_udp6(
+                let user = narf_net::netlink_diag::UserSockets {
+                    udp4: &udp4,
+                    udp6: &udp6,
+                    tcp_identity: crate::handlers::tcb_socket,
+                };
+                let mut replies = match narf_net::netlink_diag::build_replies_in_with(
                     self.net_ns_id(),
                     buf,
-                    &udp6,
+                    &user,
                 ) {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
