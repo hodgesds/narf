@@ -10716,6 +10716,150 @@ kernel_test_in!(
     smoke_amdgpu_vm_activate_programs_both_hubs
 );
 
+/// `gmc_v12_0_get_vm_pte` against GMC 11's, arm by arm: GMC 12 moves MTYPE
+/// to 55:54 and honours only NC and UC, marks PRT at 56 with IS_PTE at 63
+/// (no LOG), sets DCC for a GFX12_DCC buffer and forces UC only for an
+/// UNCACHED one; PDE_PTE and the block fragment size move to 63 and 62:58.
+fn smoke_amdgpu_vm_gmc12_pte_format() -> TestResult {
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, PteFormat::*};
+    let rwx =
+        u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE | u::AMDGPU_VM_PAGE_EXECUTABLE;
+    let base = vm::base_flags(true);
+    let perms = vm::PTE_READABLE | vm::PTE_WRITEABLE | vm::PTE_EXECUTABLE;
+    let gfx12 = |flags, bo| Gfx12.pte_flags(base, flags, bo);
+    let nv10 = |flags, bo| Nv10.pte_flags(base, flags, bo);
+    let checks = [
+        // NC is zero in both fields.
+        (gfx12(rwx, 0), base | perms),
+        (nv10(rwx, 0), base | perms),
+        // WC and CC are GMC 10/11 types; GMC 12 maps them to NC.
+        (gfx12(rwx | u::AMDGPU_VM_MTYPE_WC, 0), base | perms),
+        (nv10(rwx | u::AMDGPU_VM_MTYPE_WC, 0), base | perms | 1 << 48),
+        (gfx12(rwx | u::AMDGPU_VM_MTYPE_CC, 0), base | perms),
+        (
+            gfx12(rwx | u::AMDGPU_VM_MTYPE_UC, 0),
+            base | perms | 3 << 54,
+        ),
+        (nv10(rwx | u::AMDGPU_VM_MTYPE_UC, 0), base | perms | 3 << 48),
+        // PRT: never VALID, and IS_PTE rather than LOG on GMC 12.
+        (
+            gfx12(u::AMDGPU_VM_PAGE_PRT, 0),
+            (base | 1 << 56 | 1 << 63) & !vm::PTE_VALID,
+        ),
+        (
+            nv10(u::AMDGPU_VM_PAGE_PRT, 0),
+            (base | 1 << 51 | 1 << 55) & !vm::PTE_VALID,
+        ),
+        // The buffer's flags: DCC (GMC 12 only), and which force UC.
+        (
+            gfx12(rwx, u::AMDGPU_GEM_CREATE_GFX12_DCC as u64),
+            base | perms | 1 << 58,
+        ),
+        (
+            nv10(rwx, u::AMDGPU_GEM_CREATE_GFX12_DCC as u64),
+            base | perms,
+        ),
+        (
+            gfx12(rwx, u::AMDGPU_GEM_CREATE_UNCACHED as u64),
+            base | perms | 3 << 54,
+        ),
+        (
+            gfx12(rwx, u::AMDGPU_GEM_CREATE_COHERENT as u64),
+            base | perms,
+        ),
+        (
+            nv10(rwx, u::AMDGPU_GEM_CREATE_COHERENT as u64),
+            base | perms | 3 << 48,
+        ),
+    ];
+    if let Some(i) = checks.iter().position(|(got, want)| got != want) {
+        let _ = i;
+        return TestResult::Fail("PTE encoding");
+    }
+    // The old entry point is GMC 11's.
+    if vm::pte_flags(base, rwx | u::AMDGPU_VM_MTYPE_WC, true)
+        != nv10(rwx, u::AMDGPU_GEM_CREATE_UNCACHED as u64)
+    {
+        return TestResult::Fail("legacy pte_flags");
+    }
+    if (Gfx12.pde_pte(), Nv10.pde_pte()) != (1 << 63, 1 << 54)
+        || (Gfx12.pde_bfs(9), Nv10.pde_bfs(9)) != (9 << 58, 9 << 59)
+        || vm::Geometry::GMC12.max_pfn != vm::Geometry::GMC11.max_pfn
+        || vm::Geometry::GMC12.root_level != vm::Geometry::GMC11.root_level
+        || vm::Geometry::GMC12.format != Gfx12
+    {
+        return TestResult::Fail("PDE bits and GMC 12 geometry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/amdgpu_vm", smoke_amdgpu_vm_gmc12_pte_format);
+
+/// A GMC 12 address space writes GMC 12 entries: a UC mapping's leaf has
+/// its memory type at 55:54, and an emptied directory is restored to GMC
+/// 12's PDE_PTE pattern (bit 63), not GMC 11's (bit 54).
+fn smoke_amdgpu_vm_gmc12_tables() -> TestResult {
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, Geometry, Level, VmState, GPU_PAGE_SIZE};
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+
+    let gem = GemState::new();
+    let state = VmState::with_geometry(Geometry::GMC12);
+    let mut create = [0u8; 32];
+    create[0..8].copy_from_slice(&(2 * GPU_PAGE_SIZE).to_le_bytes());
+    create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if crate::amdgpu_gem::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        create.as_mut_ptr() as usize,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE failed");
+    }
+    let handle = u32::from_le_bytes(create[0..4].try_into().unwrap());
+    let va_op = |op: u32, va: u64| {
+        let mut map = [0u8; 40];
+        map[0..4].copy_from_slice(&handle.to_le_bytes());
+        map[8..12].copy_from_slice(&op.to_le_bytes());
+        map[12..16]
+            .copy_from_slice(&(u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_MTYPE_UC).to_le_bytes());
+        map[16..24].copy_from_slice(&va.to_le_bytes());
+        map[32..40].copy_from_slice(&GPU_PAGE_SIZE.to_le_bytes());
+        vm::dispatch(
+            DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA,
+            map.as_mut_ptr() as usize,
+            &state,
+            &gem,
+        )
+    };
+    // Two pages in different leaf tables, so one unmap empties a directory
+    // the other keeps alive.
+    let (a, b) = (0x1_0000_0000u64, 0x1_4000_0000u64);
+    if va_op(u::AMDGPU_VA_OP_MAP, a).is_err() || va_op(u::AMDGPU_VA_OP_MAP, b).is_err() {
+        return TestResult::Fail("setup: MAP failed");
+    }
+    let leaf = state.leaf_entry(a).unwrap_or(0);
+    if leaf & vm::PTE_VALID == 0 || leaf >> 54 & 3 != 3 || leaf >> 48 & 7 != 0 {
+        return TestResult::Fail("GMC 12 leaf memory type");
+    }
+    if va_op(u::AMDGPU_VA_OP_UNMAP, a).is_err() {
+        return TestResult::Fail("UNMAP failed");
+    }
+    // `a`'s PDB0 entry in the PDB1 table that `b` keeps alive.
+    match state.directory_entry(a, Level::Pdb1) {
+        Some(e) if e == 1 << 63 => {}
+        _ => return TestResult::Fail("GMC 12 cleared directory pattern"),
+    }
+    let _ = va_op(u::AMDGPU_VA_OP_UNMAP, b);
+    let mut c = [0u8; 8];
+    c[0..4].copy_from_slice(&handle.to_le_bytes());
+    let _ = crate::amdgpu_gem::dispatch(0x09, c.as_mut_ptr() as usize, &gem);
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/amdgpu_vm", smoke_amdgpu_vm_gmc12_tables);
+
 /// `AMDGPU_CS`'s parser against the input a hostile client would send.
 ///
 /// The IB's CONTENTS are not validated — not here and not in Linux, where

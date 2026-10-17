@@ -3475,6 +3475,37 @@ independent reset/recovery; drop never restores VRAM or resets the GPU. No
 short-training/resume command is exposed yet. The boot-only framebuffer handoff
 above supplies the initial CPU-writer exclusion.
 
+### Shared client GPU virtual memory (GMC 10–12)
+
+`amdgpu_vm` holds the client address-space geometry and entry encoding for
+every GMC generation; `amdgpu_vmhub_regs` holds the per-hub VMID registers
+and TLB invalidation. Both are shared by the Phoenix, Navi 22 and Navi 48
+paths; only the tables differ.
+
+- `Geometry::{GMC11, GMC12}`: GMC 12 (GC 12.0.x) walks GMC 11's four-level,
+  48-bit layout (`amdgpu_vm_adjust_size(256 * 1024, 9, 3, 48)`) and differs
+  in `format`. `VmState::with_geometry` builds an address space for a
+  generation; `VmState::new` remains GMC 11.
+- `PteFormat::{Nv10, Gfx12}` encodes entries as `gmc_v1x_0_get_vm_pte`:
+  GMC 12 puts MTYPE at 55:54 (NC/UC only), PRT at 56 with IS_PTE, PDE_PTE at
+  63 and the block fragment size at 62:58, sets DCC for `GFX12_DCC` buffers
+  and forces UC only for `UNCACHED` ones (GMC 10/11 also for the coherent
+  flags). Fresh and emptied directories use the format's PDE_PTE pattern.
+  `pte_flags` remains GMC 11's entry point.
+- `VmHubRegs` per hub: `GFXHUB_V3_0`/`MMHUB_V3_0` (Phoenix),
+  `GFXHUB_V2_3`/`MMHUB_V2_3`, and `GFXHUB_V12_0`/`MMHUB_V4_1`
+  (`regs_for(Family::Navi4, ..)`). `cntl_shift` moves CONTEXT_CNTL's block
+  size, retry and fault-enable fields up one bit on GC 12 / MMHUB 4.1.
+- `write_invalidate_tlb` issues `gmc_v*_0_flush_vm_hub` on the kernel's
+  engine 17 at each hub's `eng_distance`, with Linux's request word
+  (`invalidate_req`: VMID mask 15:0, FLUSH_TYPE 18:16, L2/L1 invalidates
+  23:19). Hubs with `semaphore` (MMHUB) acquire the engine semaphore first
+  and release it after the ACK, also on timeout (`TlbInvalidateError::{
+  Semaphore, Timeout}`). The firmware-issued invalidate Linux uses once
+  KIQ/MES runs is not implemented.
+
+No client VMID is bound to a submission yet on any generation.
+
 ### AMD platform VBIOS
 
 `atombios::header::parse_rom_header` and `amdgpu_atombios::Atombios::parse`

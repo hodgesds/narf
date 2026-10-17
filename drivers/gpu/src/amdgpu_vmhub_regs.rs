@@ -101,6 +101,10 @@ pub struct VmHubRegs {
     /// `gmc_v*_0_use_invalidate_semaphore`: MMHUB invalidations hold the
     /// engine's semaphore so a power-gating cycle cannot lose the ACK.
     pub semaphore: bool,
+    /// How far `*VM_CONTEXT*_CNTL`'s fields from `PAGE_TABLE_BLOCK_SIZE` up
+    /// sit above GFX10/11's: 1 on GC 12 and MMHUB 4.1, whose block size is
+    /// at 7:4 (bit 3 reserved), so retry and every fault enable move up too.
+    pub cntl_shift: u32,
 }
 
 // ── GFX11 GFXHUB (Phoenix) ─────────────────────────────────────────
@@ -140,6 +144,7 @@ pub const GFXHUB_V3_0: VmHubRegs = VmHubRegs {
     inv_eng0_sem: 0x1699,
     eng_distance: 1,
     semaphore: false,
+    cntl_shift: 0,
 };
 
 // ── MMHUB v3.0 (Phoenix) ───────────────────────────────────────────
@@ -173,6 +178,7 @@ pub const MMHUB_V3_0: VmHubRegs = VmHubRegs {
     inv_eng0_sem: 0x0751,
     eng_distance: 1,
     semaphore: true,
+    cntl_shift: 0,
 };
 
 // ── GFX10.3 GFXHUB (Renoir) ───────────────────────────────────────
@@ -200,6 +206,7 @@ pub const GFXHUB_V2_3: VmHubRegs = VmHubRegs {
     inv_eng0_sem: 0x160d,
     eng_distance: 1,
     semaphore: false,
+    cntl_shift: 0,
 };
 
 // ── MMHUB v2.3 (Renoir) ───────────────────────────────────────────
@@ -241,6 +248,58 @@ pub const MMHUB_V2_3: VmHubRegs = VmHubRegs {
     inv_eng0_sem: 0x0a00,
     eng_distance: 8,
     semaphore: true,
+    cntl_shift: 0,
+};
+
+// ── GC 12.0 GFXHUB and MMHUB 4.1 (Navi4x) ──────────────────────────
+//
+// gc_12_0_0_offset.h / mmhub_4_1_0_offset.h (BASE_IDX 0), as
+// gfxhub_v12_0.c and mmhub_v4_1_0.c program them:
+// regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32  = 0x168f  (CONTEXT1 0x1691)
+// regGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32 = 0x16af
+// regGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32   = 0x16cf
+// regGCVM_CONTEXT0_CNTL                       = 0x1624  (CONTEXT1 0x1625)
+// regGCVM_INVALIDATE_ENG0_SEM/REQ/ACK         = 0x1635 / 0x1647 / 0x1659
+// regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32  = 0x05cf  (CONTEXT1 0x05d1)
+// regMMVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32 = 0x05ef
+// regMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32   = 0x060f
+// regMMVM_CONTEXT0_CNTL                       = 0x0564  (CONTEXT1 0x0565)
+// regMMVM_INVALIDATE_ENG0_SEM/REQ/ACK         = 0x0575 / 0x0587 / 0x0599
+
+pub const GFXHUB_V12_0: VmHubRegs = VmHubRegs {
+    ctx0_pt_base_lo: 0x168f,
+    ctx0_pt_base_hi: 0x1690,
+    ctx0_pt_start_lo: 0x16af,
+    ctx0_pt_start_hi: 0x16b0,
+    ctx0_pt_end_lo: 0x16cf,
+    ctx0_pt_end_hi: 0x16d0,
+    ctx_addr_distance: 2,
+    ctx0_cntl: 0x1624,
+    ctx_distance: 1,
+    inv_eng0_req: 0x1647,
+    inv_eng0_ack: 0x1659,
+    inv_eng0_sem: 0x1635,
+    eng_distance: 1,
+    semaphore: false,
+    cntl_shift: 1,
+};
+
+pub const MMHUB_V4_1: VmHubRegs = VmHubRegs {
+    ctx0_pt_base_lo: 0x05cf,
+    ctx0_pt_base_hi: 0x05d0,
+    ctx0_pt_start_lo: 0x05ef,
+    ctx0_pt_start_hi: 0x05f0,
+    ctx0_pt_end_lo: 0x060f,
+    ctx0_pt_end_hi: 0x0610,
+    ctx_addr_distance: 2,
+    ctx0_cntl: 0x0564,
+    ctx_distance: 1,
+    inv_eng0_req: 0x0587,
+    inv_eng0_ack: 0x0599,
+    inv_eng0_sem: 0x0575,
+    eng_distance: 1,
+    semaphore: true,
+    cntl_shift: 1,
 };
 
 /// Look up the per-hub register layout for `family` + `hub`.
@@ -253,6 +312,8 @@ pub fn regs_for(family: Family, hub: VmHub) -> Option<VmHubRegs> {
         (Family::Phoenix, VmHub::Mm) => Some(MMHUB_V3_0),
         (Family::Renoir, VmHub::Gfx) => Some(GFXHUB_V2_3),
         (Family::Renoir, VmHub::Mm) => Some(MMHUB_V2_3),
+        (Family::Navi4, VmHub::Gfx) => Some(GFXHUB_V12_0),
+        (Family::Navi4, VmHub::Mm) => Some(MMHUB_V4_1),
         _ => None,
     }
 }
@@ -409,11 +470,13 @@ pub fn write_vmid_cntl<M: VmHubMmio>(
     // `block_size - 9`, saturating: a block size below 9 is not a layout this
     // register can describe, and wrapping would set every bit of the field.
     let encoded = u32::from(block_size.saturating_sub(9));
-    val |= (encoded & CTX_CNTL_PT_BLOCK_SIZE_MASK) << CTX_CNTL_PT_BLOCK_SIZE_SHIFT;
+    // Everything from the block size up sits `cntl_shift` higher on GC 12.
+    let up = regs.cntl_shift;
+    val |= (encoded & CTX_CNTL_PT_BLOCK_SIZE_MASK) << (CTX_CNTL_PT_BLOCK_SIZE_SHIFT + up);
     if !fault_on_invalid {
-        val |= 1 << CTX_CNTL_RETRY_FAULT_SHIFT;
+        val |= 1 << (CTX_CNTL_RETRY_FAULT_SHIFT + up);
     }
-    val |= CTX_CNTL_FAULT_ENABLE_DEFAULTS;
+    val |= CTX_CNTL_FAULT_ENABLE_DEFAULTS << up;
     mmio.write(dword << 2, val);
 }
 
@@ -831,6 +894,64 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_write_vmid_cntl_enables_context);
+
+    /// GC 12 / MMHUB 4.1 against `gc_12_0_0_offset.h` and
+    /// `mmhub_4_1_0_offset.h`, and their CONTEXT_CNTL word as
+    /// `gfxhub_v12_0_setup_vmid_config` builds it from the GC 12 field
+    /// shifts: depth at 2:1, block size at 7:4, retry at 8, the seven fault
+    /// defaults at 11, 13, 15, 17, 19, 21 and 23.
+    fn smoke_navi4_hubs_and_gc12_context_cntl() -> TestResult {
+        let g = GFXHUB_V12_0;
+        let m = MMHUB_V4_1;
+        if g.ctx0_pt_base_lo + g.ctx_addr_distance != 0x1691
+            || g.ctx0_pt_start_lo + g.ctx_addr_distance != 0x16b1
+            || g.ctx0_pt_end_lo + g.ctx_addr_distance != 0x16d1
+            || g.ctx0_cntl + g.ctx_distance != 0x1625
+            || (g.inv_eng0_sem, g.inv_eng0_req, g.inv_eng0_ack) != (0x1635, 0x1647, 0x1659)
+            || m.ctx0_pt_base_lo + m.ctx_addr_distance != 0x05d1
+            || m.ctx0_pt_start_lo + m.ctx_addr_distance != 0x05f1
+            || m.ctx0_pt_end_lo + m.ctx_addr_distance != 0x0611
+            || m.ctx0_cntl + m.ctx_distance != 0x0565
+            || (m.inv_eng0_sem, m.inv_eng0_req, m.inv_eng0_ack) != (0x0575, 0x0587, 0x0599)
+            || g.semaphore
+            || !m.semaphore
+            || (g.cntl_shift, m.cntl_shift) != (1, 1)
+        {
+            return TestResult::Fail("GC 12 / MMHUB 4.1 offsets");
+        }
+        if regs_for(Family::Navi4, VmHub::Gfx).map(|r| r.ctx0_cntl) != Some(0x1624)
+            || regs_for(Family::Navi4, VmHub::Mm).map(|r| r.ctx0_cntl) != Some(0x0564)
+        {
+            return TestResult::Fail("Navi4 hub mapping");
+        }
+        let defaults = [11, 13, 15, 17, 19, 21, 23]
+            .iter()
+            .fold(0u32, |v, b| v | 1 << b);
+        for (hub, regs) in [("gfx", g), ("mm", m)] {
+            let _ = hub;
+            let mut io = MockVmHubMmio::new();
+            write_vmid_cntl(&mut io, &regs, 2, 3, 9, true);
+            let mut retry = MockVmHubMmio::new();
+            write_vmid_cntl(&mut retry, &regs, 2, 3, 10, false);
+            if io.writes != [((regs.ctx0_cntl + 2) << 2, 1 | 3 << 1 | defaults)]
+                || retry.writes
+                    != [(
+                        (regs.ctx0_cntl + 2) << 2,
+                        1 | 3 << 1 | 1 << 4 | 1 << 8 | defaults,
+                    )]
+            {
+                return TestResult::Fail("GC 12 CONTEXT_CNTL word");
+            }
+        }
+        // GFX11's word is unchanged.
+        let mut io = MockVmHubMmio::new();
+        write_vmid_cntl(&mut io, &GFXHUB_V3_0, 2, 3, 9, true);
+        if io.writes[0].1 != 1 | 3 << 1 | CTX_CNTL_FAULT_ENABLE_DEFAULTS {
+            return TestResult::Fail("GFX11 CONTEXT_CNTL word moved");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_navi4_hubs_and_gc12_context_cntl);
 
     /// The kernel engine's REQ/ACK/SEM, as byte offsets.
     fn eng17(r: &VmHubRegs) -> (u32, u32, u32) {

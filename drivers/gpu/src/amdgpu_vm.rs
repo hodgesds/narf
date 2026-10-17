@@ -112,6 +112,132 @@ pub const fn with_mtype(flags: u64, mtype: u64) -> u64 {
     (flags & !MTYPE_MASK) | ((mtype << MTYPE_SHIFT) & MTYPE_MASK)
 }
 
+/// `AMDGPU_PTE_PRT_GFX12`.
+pub const PTE_PRT_GFX12: u64 = 1 << 56;
+/// `AMDGPU_PDE_PTE_GFX12`, also `AMDGPU_PTE_IS_PTE`.
+pub const PDE_PTE_GFX12: u64 = 1 << 63;
+/// `AMDGPU_PTE_DCC`: the page is DCC-compressed (GFX12, shares bit 58 with
+/// `NOALLOC`).
+pub const PTE_DCC: u64 = 1 << 58;
+/// `AMDGPU_PTE_MTYPE_GFX12`: the memory type at bits 55:54.
+pub const MTYPE_GFX12_SHIFT: u32 = 54;
+pub const MTYPE_GFX12_MASK: u64 = 3 << MTYPE_GFX12_SHIFT;
+
+/// Where one GMC generation puts the bits that moved (`amdgpu_vm.h`):
+/// everything else — VALID, SYSTEM, SNOOPED, the permissions, FRAG, the
+/// address field and NOALLOC — is common to GMC 10, 11 and 12.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PteFormat {
+    /// GMC 10 and 11 (`gmc_v10_0_get_vm_pte`, `gmc_v11_0_get_vm_pte`):
+    /// MTYPE_NV10 at 50:48, PRT at 51, PDE_PTE at 54, the PDE block
+    /// fragment size at 63:59.
+    Nv10,
+    /// GMC 12 (`gmc_v12_0_get_vm_pte`): MTYPE_GFX12 at 55:54, PRT at 56,
+    /// PDE_PTE (IS_PTE) at 63, the block fragment size at 62:58, DCC at 58.
+    Gfx12,
+}
+
+impl PteFormat {
+    /// The format's MTYPE field set to `mtype`.
+    pub const fn with_mtype(self, flags: u64, mtype: u64) -> u64 {
+        match self {
+            PteFormat::Nv10 => with_mtype(flags, mtype),
+            PteFormat::Gfx12 => {
+                (flags & !MTYPE_GFX12_MASK) | ((mtype << MTYPE_GFX12_SHIFT) & MTYPE_GFX12_MASK)
+            }
+        }
+    }
+
+    /// `AMDGPU_PDE_PTE_FLAG(adev)`: a directory entry that is a leaf, and
+    /// what `amdgpu_vm_pt_clear` writes into an empty directory's entries.
+    pub const fn pde_pte(self) -> u64 {
+        match self {
+            PteFormat::Nv10 => PDE_PTE,
+            PteFormat::Gfx12 => PDE_PTE_GFX12,
+        }
+    }
+
+    /// `AMDGPU_PDE_BFS_FLAG(adev, a)`: a directory's block-fragment size.
+    pub const fn pde_bfs(self, a: u64) -> u64 {
+        match self {
+            PteFormat::Nv10 => pde_bfs(a),
+            PteFormat::Gfx12 => (a & 0x1f) << 58,
+        }
+    }
+
+    /// `gmc_v1x_0_get_vm_pte` — turn a client's `AMDGPU_VM_PAGE_*` word into
+    /// PTE bits on top of `base`, for a buffer created with `bo_flags`
+    /// (`AMDGPU_GEM_CREATE_*`).
+    ///
+    /// Transcribed arm for arm, because the negative cases matter as much as
+    /// the positive ones: Linux CLEARS `EXECUTABLE` and `NOALLOC` when the
+    /// request does not ask for them rather than leaving whatever was there,
+    /// and PRT clears `VALID` — a PRT entry is deliberately not a valid
+    /// translation. The generations differ in the memory types they honour
+    /// (GMC 12 has only NC and UC), in which buffers force UC (GMC 11: the
+    /// coherent ones too; GMC 12: only UNCACHED), and in GMC 12's DCC bit.
+    pub fn pte_flags(self, base: u64, vm_flags: u32, bo_flags: u64) -> u64 {
+        let mut flags = base;
+
+        if vm_flags & uapi::AMDGPU_VM_PAGE_READABLE != 0 {
+            flags |= PTE_READABLE;
+        } else {
+            flags &= !PTE_READABLE;
+        }
+        if vm_flags & uapi::AMDGPU_VM_PAGE_WRITEABLE != 0 {
+            flags |= PTE_WRITEABLE;
+        } else {
+            flags &= !PTE_WRITEABLE;
+        }
+        if vm_flags & uapi::AMDGPU_VM_PAGE_EXECUTABLE != 0 {
+            flags |= PTE_EXECUTABLE;
+        } else {
+            flags &= !PTE_EXECUTABLE;
+        }
+
+        let mtype = match (self, vm_flags & uapi::AMDGPU_VM_MTYPE_MASK) {
+            (_, uapi::AMDGPU_VM_MTYPE_UC) => MTYPE_UC,
+            (PteFormat::Nv10, uapi::AMDGPU_VM_MTYPE_WC) => MTYPE_WC,
+            (PteFormat::Nv10, uapi::AMDGPU_VM_MTYPE_CC) => MTYPE_CC,
+            // DEFAULT, NC, and anything else: non-coherent.
+            _ => MTYPE_NC,
+        };
+        flags = self.with_mtype(flags, mtype);
+
+        if vm_flags & uapi::AMDGPU_VM_PAGE_NOALLOC != 0 {
+            flags |= PTE_NOALLOC;
+        } else {
+            flags &= !PTE_NOALLOC;
+        }
+
+        if vm_flags & uapi::AMDGPU_VM_PAGE_PRT != 0 {
+            flags |= match self {
+                PteFormat::Nv10 => PTE_PRT | PTE_SNOOPED | PTE_LOG | PTE_SYSTEM,
+                PteFormat::Gfx12 => PTE_PRT_GFX12 | PTE_SNOOPED | PTE_SYSTEM | PDE_PTE_GFX12,
+            };
+            flags &= !PTE_VALID;
+        }
+
+        // The buffer's own properties win, and are applied last for that
+        // reason.
+        let forced_uc = match self {
+            PteFormat::Nv10 => {
+                uapi::AMDGPU_GEM_CREATE_COHERENT
+                    | uapi::AMDGPU_GEM_CREATE_EXT_COHERENT
+                    | uapi::AMDGPU_GEM_CREATE_UNCACHED
+            }
+            PteFormat::Gfx12 => uapi::AMDGPU_GEM_CREATE_UNCACHED,
+        };
+        if self == PteFormat::Gfx12 && bo_flags & uapi::AMDGPU_GEM_CREATE_GFX12_DCC as u64 != 0 {
+            flags |= PTE_DCC;
+        }
+        if bo_flags & forced_uc as u64 != 0 {
+            flags = self.with_mtype(flags, MTYPE_UC);
+        }
+        flags
+    }
+}
+
 // ── Address-space geometry ──────────────────────────────────────────────
 
 /// Page-table level, outermost first. `amdgpu_vm.h`'s
@@ -146,6 +272,8 @@ pub struct Geometry {
     pub block_size: u32,
     /// `vm_manager.fragment_size`.
     pub fragment_size: u32,
+    /// How the generation encodes its entries.
+    pub format: PteFormat,
 }
 
 impl Geometry {
@@ -176,6 +304,16 @@ impl Geometry {
         root_level: Level::Pdb2,
         block_size: 9,
         fragment_size: 9,
+        format: PteFormat::Nv10,
+    };
+
+    /// Navi4x (GC 12.0.x): `gmc_v12_0_sw_init` makes the same
+    /// `amdgpu_vm_adjust_size(adev, 256 * 1024, 9, 3, 48)` call as GMC 11,
+    /// so the walk is GMC 11's; only the entry encoding differs. (GC 12.1's
+    /// five-level, 57-bit layout is a different part.)
+    pub const GMC12: Geometry = Geometry {
+        format: PteFormat::Gfx12,
+        ..Geometry::GMC11
     };
 
     /// `amdgpu_vm_pt_level_shift` — how far to shift a PFN to get this
@@ -322,61 +460,15 @@ pub fn base_flags(system: bool) -> u64 {
     flags
 }
 
-/// `gmc_v11_0_get_vm_pte` — turn a client's `AMDGPU_VM_PAGE_*` word into PTE
-/// bits, on top of `base`.
-///
-/// Transcribed arm for arm, because the negative cases matter as much as the
-/// positive ones: Linux CLEARS `EXECUTABLE` and `NOALLOC` when the request
-/// does not ask for them rather than leaving whatever was there, and PRT
-/// clears `VALID` — a PRT entry is deliberately not a valid translation.
+/// [`PteFormat::Nv10`]'s `pte_flags`, with `bo_uncached` standing for a
+/// COHERENT, EXT_COHERENT or UNCACHED buffer.
 pub fn pte_flags(base: u64, vm_flags: u32, bo_uncached: bool) -> u64 {
-    let mut flags = base;
-
-    if vm_flags & uapi::AMDGPU_VM_PAGE_READABLE != 0 {
-        flags |= PTE_READABLE;
+    let bo_flags = if bo_uncached {
+        uapi::AMDGPU_GEM_CREATE_UNCACHED as u64
     } else {
-        flags &= !PTE_READABLE;
-    }
-    if vm_flags & uapi::AMDGPU_VM_PAGE_WRITEABLE != 0 {
-        flags |= PTE_WRITEABLE;
-    } else {
-        flags &= !PTE_WRITEABLE;
-    }
-    if vm_flags & uapi::AMDGPU_VM_PAGE_EXECUTABLE != 0 {
-        flags |= PTE_EXECUTABLE;
-    } else {
-        flags &= !PTE_EXECUTABLE;
-    }
-
-    flags = with_mtype(
-        flags,
-        match vm_flags & uapi::AMDGPU_VM_MTYPE_MASK {
-            uapi::AMDGPU_VM_MTYPE_WC => MTYPE_WC,
-            uapi::AMDGPU_VM_MTYPE_CC => MTYPE_CC,
-            uapi::AMDGPU_VM_MTYPE_UC => MTYPE_UC,
-            // DEFAULT, NC, and anything else: non-coherent.
-            _ => MTYPE_NC,
-        },
-    );
-
-    if vm_flags & uapi::AMDGPU_VM_PAGE_NOALLOC != 0 {
-        flags |= PTE_NOALLOC;
-    } else {
-        flags &= !PTE_NOALLOC;
-    }
-
-    if vm_flags & uapi::AMDGPU_VM_PAGE_PRT != 0 {
-        flags |= PTE_PRT | PTE_SNOOPED | PTE_LOG | PTE_SYSTEM;
-        flags &= !PTE_VALID;
-    }
-
-    // A buffer created COHERENT / EXT_COHERENT / UNCACHED overrides the
-    // request's memory type — the BO's own property wins, and it is applied
-    // last for that reason.
-    if bo_uncached {
-        flags = with_mtype(flags, MTYPE_UC);
-    }
-    flags
+        0
+    };
+    PteFormat::Nv10.pte_flags(base, vm_flags, bo_flags)
 }
 
 /// One leaf entry: a physical address with its flags.
@@ -428,9 +520,15 @@ impl Default for VmState {
 }
 
 impl VmState {
+    /// A GMC 11 address space.
     pub const fn new() -> Self {
+        Self::with_geometry(Geometry::GMC11)
+    }
+
+    /// An address space laid out and encoded as `geometry`'s generation.
+    pub const fn with_geometry(geometry: Geometry) -> Self {
         VmState {
-            geometry: Geometry::GMC11,
+            geometry,
             mappings: IrqSafeSpinLock::new(None),
             root: IrqSafeSpinLock::new(None),
             tables: IrqSafeSpinLock::new(0),
@@ -639,14 +737,9 @@ pub fn dispatch(
                 vm_flags: flags,
             };
             vm.insert(mapping, replace)?;
-            // A buffer created COHERENT / EXT_COHERENT / UNCACHED forces the
-            // memory type, whatever the mapping asked for.
-            let uncached = object.flags
-                & (uapi::AMDGPU_GEM_CREATE_COHERENT
-                    | uapi::AMDGPU_GEM_CREATE_EXT_COHERENT
-                    | uapi::AMDGPU_GEM_CREATE_UNCACHED) as u64
-                != 0;
-            if let Err(error) = vm.materialise(&mapping, object.phys, uncached) {
+            // The buffer's creation flags can force the memory type (and on
+            // GMC 12 set DCC), whatever the mapping asked for.
+            if let Err(error) = vm.materialise(&mapping, object.phys, object.flags) {
                 // Leave neither half-written tables nor a mapping record
                 // claiming translations that do not exist.
                 vm.dematerialise(va, size);
@@ -706,7 +799,7 @@ impl PageTable {
         let invalid: u64 = if level == Level::Ptb {
             PTE_EXECUTABLE
         } else {
-            PDE_PTE
+            geometry.format.pde_pte()
         };
         for i in 0..geometry.entries_at(level) {
             // SAFETY: `i` is bounded by the table's entry count and the
@@ -805,14 +898,11 @@ impl VmState {
     /// hardware to walk. Doing that needs the fragment logic in
     /// `amdgpu_vm_pt_update_range`, and getting it wrong maps more than was
     /// asked for — so the slow, exact form comes first.
-    fn materialise(
-        &self,
-        mapping: &Mapping,
-        phys_base: u64,
-        uncached: bool,
-    ) -> Result<(), FsError> {
+    fn materialise(&self, mapping: &Mapping, phys_base: u64, bo_flags: u64) -> Result<(), FsError> {
         let geometry = self.geometry;
-        let flags = pte_flags(base_flags(true), mapping.vm_flags, uncached);
+        let flags = geometry
+            .format
+            .pte_flags(base_flags(true), mapping.vm_flags, bo_flags);
         let pages = mapping.size / GPU_PAGE_SIZE;
 
         let mut root_guard = self.root.lock();
@@ -927,7 +1017,7 @@ impl VmState {
         node.live = node.live.saturating_sub(1);
         if child.live == 0 {
             // SAFETY: `index` is masked to the table's entry count.
-            unsafe { node.table.write(index, PDE_PTE) };
+            unsafe { node.table.write(index, geometry.format.pde_pte()) };
             node.children.remove(&index);
             *tables -= 1;
         }
