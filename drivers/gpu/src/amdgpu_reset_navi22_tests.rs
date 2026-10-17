@@ -572,21 +572,7 @@ kernel_test_in!(
 
 fn reset_navi22_post_failures_are_terminal() -> TestResult {
     type Case = (Option<Vec<u8>>, fn(Error) -> bool);
-    let cases: [Case; 4] = [
-        // A table the VM refuses: the reset completed, the post did not.
-        (Some(vbios(Some(&[0x7f, 91]))), |error| {
-            matches!(
-                error,
-                Error::Post(PostError::Atom {
-                    error: AtomError::BadOpcode(0x7f),
-                    site: Some(OpSite { offset: 0, .. }),
-                })
-            )
-        }),
-        // ASIC_Init returned without setting ASIC_INIT_COMPLETE.
-        (Some(vbios(Some(&[91]))), |error| {
-            error == Error::Post(PostError::Incomplete(0x0001_0005))
-        }),
+    let cases: [Case; 2] = [
         // atom.c's 20 s same-jump guard on a table that never finishes.
         (Some(vbios(Some(&[67, 6, 0]))), |error| {
             matches!(
@@ -623,6 +609,39 @@ fn reset_navi22_post_failures_are_terminal() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     reset_navi22_post_failures_are_terminal
+);
+
+/// amdgpu_atomfirmware_asic_init returns amdgpu_atom_execute_table's result
+/// and never re-reads BIOS_SCRATCH_7; atom.c ends a table at a bad opcode
+/// with success. Both complete the post (logged), they do not fail it.
+fn reset_navi22_post_completes_like_linux_without_s7_recheck() -> TestResult {
+    // ASIC_Init returned without setting ASIC_INIT_COMPLETE.
+    let mut e = engine(Fake::posted());
+    e.vbios = Some(vbios(Some(&[91])));
+    let report = match run(e.run()) {
+        Ok(Some(report)) => report,
+        _ => return TestResult::Fail("post failed on a clear S7 bit Linux never re-reads"),
+    };
+    if !matches!(e.state, State::Complete(_))
+        || !report.post.ran
+        || report.post.scratch7_after & ATOM_S7_ASIC_INIT_COMPLETE != 0
+    {
+        return TestResult::Fail("post evidence for a clear S7 bit");
+    }
+    // A table the VM cannot decode ends there (atom.c `else break;`).
+    let mut e = engine(Fake::posted());
+    e.vbios = Some(vbios(Some(&[0x7f, 91])));
+    match run(e.run()) {
+        Ok(Some(report))
+            if report.post.anomalies == 1
+                && report.post.first_anomaly == Some(Anomaly::BadOpcode(0x7f)) => {}
+        _ => return TestResult::Fail("bad opcode aborted the post"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    reset_navi22_post_completes_like_linux_without_s7_recheck
 );
 
 fn reset_navi22_post_cancellation_and_revocation() -> TestResult {
