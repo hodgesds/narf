@@ -3571,7 +3571,8 @@ paths; only the tables differ.
   (shared by GMC 11 and 12).
 
 The Navi48 platform registers the graphics queue as its card's submitter
-after boot: one graphics IB per submission, run on client VMID 1 with the
+after boot: up to eight graphics IBs per submission (`Job::new`, in order in
+one slot), run on client VMID 1 with the
 open's root page directory (`VmState::root_pde`, GMC 12 only), through
 `amdgpu_gfx12_queue::Queues::submit` — one 256-dword ring slot of VM flush
 (GFX hub, engine 0, PFP_SYNC_ME), IB and interrupting RELEASE_MEM fence;

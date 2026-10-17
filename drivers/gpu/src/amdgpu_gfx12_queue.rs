@@ -66,21 +66,47 @@ pub struct Job {
     /// names the client.
     pub pasid: u16,
     pub pd_addr: u64,
-    pub ib: u64,
-    pub ib_dwords: u32,
+    /// The job's IBs in order, `(address, dwords)`; `ib_count` are used.
+    pub ibs: [(u64, u32); MAX_JOB_IBS],
+    pub ib_count: u8,
+}
+/// IBs one job may carry: all fit one 256-dword slot beside the flush,
+/// PASID mapping and fence.
+pub const MAX_JOB_IBS: usize = 8;
+impl Job {
+    /// A job of `ibs` (at most `MAX_JOB_IBS`).
+    pub fn new(vmid: u8, pasid: u16, pd_addr: u64, ibs: &[(u64, u32)]) -> Option<Self> {
+        if ibs.is_empty() || ibs.len() > MAX_JOB_IBS {
+            return None;
+        }
+        let mut all = [(0, 0); MAX_JOB_IBS];
+        all[..ibs.len()].copy_from_slice(ibs);
+        Some(Self {
+            vmid,
+            pasid,
+            pd_addr,
+            ibs: all,
+            ib_count: ibs.len() as u8,
+        })
+    }
+    fn ibs(&self) -> &[(u64, u32)] {
+        &self.ibs[..usize::from(self.ib_count).min(MAX_JOB_IBS)]
+    }
 }
 /// gfx_v12_0's frame for one job on the graphics ring, as amdgpu_vm_flush
 /// and amdgpu_ib_schedule emit it: the VM flush (gmc_v12_0_emit_flush_gpu_tlb
 /// on the GFX hub through the ring's engine, then PFP_SYNC_ME), the PASID
 /// mapping (gmc_v12_0_emit_pasid_mapping: IH_VMID_0_LUT + vmid at OSSSYS
-/// base `oss`), the IB under the job's VMID, and an interrupting RELEASE_MEM
+/// base `oss`), the IBs under the job's VMID, and an interrupting RELEASE_MEM
 /// of `seq` to `fence`, NOP-padded to the 256-dword slot.
 fn job_packets(job: Job, gc: u32, oss: u32, fence: u64, seq: u32) -> Result<[u32; 256], Error> {
     use crate::amdgpu_pm4::Pm4Builder;
     if !(1..16).contains(&job.vmid)
-        || job.ib_dwords == 0
-        || job.ib_dwords > 0xf_ffff
-        || job.ib & 3 != 0
+        || job.ibs().is_empty()
+        || job
+            .ibs()
+            .iter()
+            .any(|&(at, dwords)| dwords == 0 || dwords > 0xf_ffff || at & 3 != 0)
     {
         return Err(Error::Invalid);
     }
@@ -96,7 +122,9 @@ fn job_packets(job: Job, gc: u32, oss: u32, fence: u64, seq: u32) -> Result<[u32
             true,
         )?;
         b.write_reg(oss + u32::from(job.vmid), u32::from(job.pasid), true)?;
-        b.indirect_buffer(job.ib, job.ib_dwords, job.vmid)?;
+        for &(at, dwords) in job.ibs() {
+            b.indirect_buffer(at, dwords, job.vmid)?;
+        }
         b.release_mem_fence(fence, u64::from(seq), false, true)?;
         let used = b.words().len();
         b.nop(256 - used - 1)

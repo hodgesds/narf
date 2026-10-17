@@ -235,8 +235,8 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     Ok(report)
 }
 
-/// The Navi48 graphics queue behind AMDGPU_CS: one graphics IB per
-/// submission, run in the open's address space on client VMID 1, whose
+/// The Navi48 graphics queue behind AMDGPU_CS: up to eight graphics IBs
+/// per submission, run in the open's address space on client VMID 1, whose
 /// context every job's VM flush points at that space's root first.
 ///
 /// `amdgpu_cs` records each job on its address space, so the buffers and
@@ -282,26 +282,27 @@ impl crate::amdgpu_cs::Submitter for Submitter {
     > {
         alloc::boxed::Box::pin(async move {
             use narf_filesystem::FsError;
-            let [ib] = submission.ibs.as_slice() else {
-                return Err(FsError::Unsupported);
-            };
-            if ib.ip_type != crate::amdgpu_uapi::AMDGPU_HW_IP_GFX
-                || ib.ip_instance != 0
-                || ib.ring != 0
+            if submission.ibs.len() > crate::amdgpu_gfx12_queue::MAX_JOB_IBS
+                || submission.ibs.iter().any(|ib| {
+                    ib.ip_type != crate::amdgpu_uapi::AMDGPU_HW_IP_GFX
+                        || ib.ip_instance != 0
+                        || ib.ring != 0
+                })
             {
                 return Err(FsError::Unsupported);
             }
+            let ibs: alloc::vec::Vec<(u64, u32)> = submission
+                .ibs
+                .iter()
+                .map(|ib| (ib.va_start, ib.length_dw))
+                .collect();
             if vm.geometry() != crate::amdgpu_vm::Geometry::GMC12 {
                 return Err(FsError::InvalidData);
             }
             let pd_addr = vm.root_pde().ok_or(FsError::InvalidData)?;
-            let job = crate::amdgpu_gfx12_queue::Job {
-                vmid: CLIENT_VMID,
-                pasid: vm.pasid().ok_or(FsError::NoSpace)?,
-                pd_addr,
-                ib: ib.va_start,
-                ib_dwords: ib.length_dw,
-            };
+            let pasid = vm.pasid().ok_or(FsError::NoSpace)?;
+            let job = crate::amdgpu_gfx12_queue::Job::new(CLIENT_VMID, pasid, pd_addr, &ibs)
+                .ok_or(FsError::InvalidData)?;
             let mut owner = OWNER.lock().await;
             let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
             // SAFETY: the platform serializes every queue user under OWNER;

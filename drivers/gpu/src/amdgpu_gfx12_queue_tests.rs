@@ -643,13 +643,7 @@ kernel_test_in!(
 fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
     let (_pool, mut e, mut mes, aperture, target) = fixture();
     run(e.initialize(&mut mes, aperture, target)).unwrap();
-    let job = Job {
-        vmid: 3,
-        pasid: 0x1234,
-        pd_addr: 0x1_0000_8001,
-        ib: 0x2_0000_1000,
-        ib_dwords: 64,
-    };
+    let job = Job::new(3, 0x1234, 0x1_0000_8001, &[(0x2_0000_1000, 64)]).unwrap();
     if e.submit(job) != Err(Error::Busy) {
         return TestResult::Fail("job before the interrupt proof");
     }
@@ -660,14 +654,9 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
     for bad in [
         Job { vmid: 0, ..job },
         Job { vmid: 16, ..job },
-        Job {
-            ib_dwords: 0,
-            ..job
-        },
-        Job {
-            ib: job.ib + 2,
-            ..job
-        },
+        Job::new(3, 1, 0x1_0000_8001, &[(0x2_0000_1000, 0)]).unwrap(),
+        Job::new(3, 1, 0x1_0000_8001, &[(0x2_0000_1002, 64)]).unwrap(),
+        Job { ib_count: 0, ..job },
     ] {
         if e.submit(bad) != Err(Error::Invalid) || e.io.bells.len() != writes {
             return TestResult::Fail("bad job");
@@ -697,18 +686,39 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
             return TestResult::Fail("wrapped jobs");
         }
     }
+    if Job::new(3, 1, 0, &[(0, 1); 9]).is_some() {
+        return TestResult::Fail("more IBs than a slot holds");
+    }
     if e.io.job_ibs.len() != 5 || e.io.job_ibs[4].1 != 64 | 5 << 24 || e.io.memory[2562] != 1792 {
         return TestResult::Fail("wrapped job slots");
     }
+    // Several IBs run in order under the job's VMID, in one slot.
+    let three = [
+        (0x3_0000_0000, 16),
+        (0x3_0000_1000, 32),
+        (0x3_0000_2000, 48),
+    ];
+    let multi = Job::new(4, 0x99, 0x1_0000_8001, &three).unwrap();
+    if e.submit(multi) != Ok(6)
+        || e.completed_job() != Ok(6)
+        || e.io.job_ibs[5..]
+            != [
+                (0x3_0000_0000, 16 | 4 << 24),
+                (0x3_0000_1000, 32 | 4 << 24),
+                (0x3_0000_2000, 48 | 4 << 24),
+            ]
+    {
+        return TestResult::Fail("multi-IB job");
+    }
     // With the CP stalled, four slots fill and a fifth is refused.
     e.io.complete = false;
-    for seq in 6..=9 {
+    for seq in 7..=10 {
         if e.submit(job) != Ok(seq) {
             return TestResult::Fail("filling the ring");
         }
     }
     let bells = e.io.bells.len();
-    if e.submit(job) != Err(Error::Busy) || e.io.bells.len() != bells || e.completed_job() != Ok(5)
+    if e.submit(job) != Err(Error::Busy) || e.io.bells.len() != bells || e.completed_job() != Ok(6)
     {
         return TestResult::Fail("full ring");
     }
