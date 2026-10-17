@@ -349,6 +349,9 @@ struct Designation {
     name: &'static str,
     dev: DevId,
     disk: DiskId,
+    /// Hardware identity of the root's disk (PCI path, serial, namespace),
+    /// when its transport reports one.
+    identity: Option<Arc<crate::registry::DiskIdentity>>,
     uuid: [u8; 16],
 }
 
@@ -477,9 +480,14 @@ pub fn designate_root(device_name: &str, fs_uuid: [u8; 16]) -> Result<(), Policy
     {
         return Err(PolicyError::NotBtrfs);
     }
-    if devices
-        .iter()
-        .any(|other| other.dev_id != entry.dev_id && entry_uuid(other) == Some(fs_uuid))
+    // Unique by the registry's identity index (a duplicated partition UUID
+    // yields no match) and by every whole-disk entry's own superblock.
+    let unique = crate::registry::find_by_fs_uuid(&format_uuid_bytes(&fs_uuid))
+        .is_some_and(|found| found.dev_id == entry.dev_id);
+    if !unique
+        || devices
+            .iter()
+            .any(|other| other.dev_id != entry.dev_id && entry_uuid(other) == Some(fs_uuid))
     {
         return Err(PolicyError::Ambiguous);
     }
@@ -492,6 +500,7 @@ pub fn designate_root(device_name: &str, fs_uuid: [u8; 16]) -> Result<(), Policy
             name: entry.name,
             dev: entry.dev_id,
             disk: entry.disk,
+            identity: entry.identity.clone(),
             uuid: fs_uuid,
         });
     }
@@ -596,8 +605,14 @@ pub fn automount_allowed(device_name: &str) -> bool {
                             .is_some_and(|meta| parse_uuid(&meta.fs_uuid) == want)
                 }
                 Some(d) if d.dev == entry.dev_id => true,
+                // Same physical disk: the registry's disk id (a partition
+                // inherits its parent's) and, when the transport reports one,
+                // the same hardware identity (PCI path, serial, namespace).
                 Some(d) => {
-                    entry.disk == d.disk && entry.partition.is_some() && entry_is_vfat(&entry)
+                    entry.disk == d.disk
+                        && entry.identity.as_deref() == d.identity.as_deref()
+                        && entry.partition.is_some()
+                        && entry_is_vfat(&entry)
                 }
             }
         }

@@ -28,9 +28,11 @@
 pub mod admin;
 pub mod chardev;
 pub mod mi;
+pub mod ns;
 pub mod prp;
 
 mod tests;
+mod tests_multi;
 
 use core::cell::UnsafeCell;
 use core::future::Future;
@@ -330,9 +332,8 @@ const IO_QID: u16 = 1;
 /// the host requests.
 const NVME_MAX_IO_QUEUE_PAIRS: u16 = 8;
 
-/// Hardcoded namespace id used for I/O. QEMU NVMe always exposes
-/// NSID=1 with the default settings; multi-namespace support is a
-/// follow-up.
+/// Namespace id the single-namespace helpers fall back to before a scan
+/// found any namespace (I/O is then refused as `NamespaceUnusable`).
 const DEFAULT_NSID: u32 = 1;
 
 /// NVMe controller handle.
@@ -426,6 +427,15 @@ pub struct Controller {
     /// released only by [`Controller::disable_after_failure`], and only
     /// once CC.EN=0 / CSTS.RDY=0 confirms the controller stopped.
     in_flight_dma: Vec<DmaBuffer>,
+    /// Registered namespaces from the bring-up scan, ascending NSID
+    /// (Linux `nvme_scan_work`). Inactive, zero-capacity and unusable-format
+    /// namespaces are not listed.
+    namespaces: Vec<ns::NamespaceInfo>,
+    /// NSID of `namespaces[0]` — the namespace `lba_bytes` / `nsze` and the
+    /// single-namespace I/O helpers (`read_lba`, ...) address.
+    primary_nsid: u32,
+    /// The VS register value read at bring-up.
+    vs: u32,
 }
 
 impl core::fmt::Debug for Controller {
@@ -554,6 +564,10 @@ pub struct IdentifyController {
     /// Maximum Data Transfer Size (byte 77): a power of two in units of
     /// the CAP.MPSMIN page; 0 = no limit.
     pub mdts: u8,
+    /// Version (bytes 80..84), as the VS register encodes it.
+    pub ver: u32,
+    /// Number of Namespaces (bytes 516..520): the largest valid NSID.
+    pub nn: u32,
 }
 
 impl Controller {
@@ -582,7 +596,37 @@ impl Controller {
             prp_list: None,
             dead: false,
             in_flight_dma: Vec::new(),
+            namespaces: Vec::new(),
+            primary_nsid: DEFAULT_NSID,
+            vs: 0,
         }
+    }
+
+    /// Namespaces the bring-up scan registered (ascending NSID).
+    pub fn namespaces(&self) -> &[ns::NamespaceInfo] {
+        &self.namespaces
+    }
+
+    /// The bus device this controller drives, if any.
+    pub fn bus_device(&self) -> Option<BusDevice> {
+        self.device
+    }
+
+    /// Geometry of the primary namespace (what `lba_bytes` / `nsze`
+    /// describe), for the single-namespace I/O helpers.
+    fn primary_geom(&self) -> ns::NamespaceInfo {
+        ns::NamespaceInfo {
+            nsid: self.primary_nsid,
+            lba_bytes: self.lba_bytes,
+            nsze: self.nsze,
+            usable: self.ns_usable,
+            ids: ns::NsIds::default(),
+        }
+    }
+
+    /// Geometry of namespace `nsid`, if the scan registered it.
+    fn ns_geom(&self, nsid: u32) -> Option<ns::NamespaceInfo> {
+        self.namespaces.iter().find(|n| n.nsid == nsid).copied()
     }
 
     /// Largest data transfer one I/O command may carry, in bytes.
@@ -728,6 +772,7 @@ impl Controller {
 
         self.bar0 = bar0.phys.raw();
         self.caps = Some(caps);
+        self.vs = vs;
         // NARF programs CC.MPS = 0 (4 KiB pages) and builds every PRP
         // on 4 KiB boundaries. Refuse a controller whose minimum page
         // is larger before touching CC, as Linux `nvme_enable_ctrl`
@@ -877,24 +922,20 @@ impl Controller {
         let id = unsafe { parse_identify(&id_buf) };
         drop(id_buf);
 
-        // ── 8. IDENTIFY NAMESPACE (NSID=1, CNS=0) ─────────────────
-        // Pulls LBA size + namespace capacity. Required before we
-        // can validate read/write LBA ranges or compute byte offsets.
-        let ns_buf =
-            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NvmeError::OutOfDmaMemory)?;
-        let mut sqe = Sqe::zero();
-        sqe.cdw0 = AdminOpcode::Identify as u32;
-        sqe.nsid = DEFAULT_NSID;
-        sqe.prp1 = ns_buf.dma_addr().raw();
-        sqe.cdw10 = 0; // CNS = 0: Identify Namespace
-                       // SAFETY: same queue + bar.
-        if let Err(e) = unsafe { admin.submit(bar0, sqe) } {
-            self.in_flight_dma.push(ns_buf);
-            return Err(e);
-        }
-        // SAFETY: ns_buf is a live identity-mapped DMA page.
-        let fmt = unsafe { parse_identify_namespace(&ns_buf) };
-        drop(ns_buf);
+        // ── 8. Namespace scan (Linux `nvme_scan_work`) ────────────
+        // Every active namespace with capacity and a usable LBA format,
+        // with its EUI64 / NGUID / UUID. Pulls LBA size + capacity, which
+        // I/O range checks need.
+        let namespaces = match scan_namespaces(admin, bar0, self.vs, id.nn) {
+            Ok(v) => v,
+            Err((e, page)) => {
+                // The failed command may still target the page.
+                if let Some(page) = page {
+                    self.in_flight_dma.push(page);
+                }
+                return Err(e);
+            }
+        };
 
         // Persistent PRP-list page for > 2-page transfers (see
         // `Controller::prp_list`).
@@ -903,9 +944,21 @@ impl Controller {
 
         self.max_transfer = prp::max_transfer_bytes(id.mdts, caps.mpsmin);
         self.identify = Some(id);
-        self.lba_bytes = fmt.lba_bytes;
-        self.nsze = fmt.nsze;
-        self.ns_usable = fmt.usable;
+        match namespaces.first() {
+            Some(p) => {
+                self.primary_nsid = p.nsid;
+                self.lba_bytes = p.lba_bytes;
+                self.nsze = p.nsze;
+                self.ns_usable = true;
+            }
+            None => {
+                self.primary_nsid = DEFAULT_NSID;
+                self.lba_bytes = 512;
+                self.nsze = 0;
+                self.ns_usable = false;
+            }
+        }
+        self.namespaces = namespaces;
         self.prp_list = Some(prp_list);
         self.dead = false;
         Ok(())
@@ -2234,10 +2287,24 @@ impl Controller {
         dma: u64,
         len: usize,
     ) -> Result<Sqe, NvmeError> {
+        let ns = self.primary_geom();
+        self.build_nvm_sqe_ns(ns, opcode, lba, n_blocks, dma, len)
+    }
+
+    /// [`Self::build_nvm_sqe`] against namespace `ns`.
+    fn build_nvm_sqe_ns(
+        &mut self,
+        ns: ns::NamespaceInfo,
+        opcode: u8,
+        lba: u64,
+        n_blocks: u32,
+        dma: u64,
+        len: usize,
+    ) -> Result<Sqe, NvmeError> {
         if self.dead {
             return Err(NvmeError::ControllerDead);
         }
-        if !self.ns_usable {
+        if !ns.usable {
             return Err(NvmeError::NamespaceUnusable);
         }
         // NLB is a 16-bit zero-based field (NVM Command Set §3.2.4).
@@ -2246,11 +2313,11 @@ impl Controller {
         }
         if lba
             .checked_add(n_blocks as u64)
-            .is_none_or(|end| end > self.nsze)
+            .is_none_or(|end| end > ns.nsze)
         {
             return Err(NvmeError::OutOfRange);
         }
-        let bytes = n_blocks as u64 * self.lba_bytes as u64;
+        let bytes = n_blocks as u64 * ns.lba_bytes as u64;
         if bytes > len as u64 {
             return Err(NvmeError::BadTransfer);
         }
@@ -2283,7 +2350,7 @@ impl Controller {
 
         let mut sqe = Sqe::zero();
         sqe.cdw0 = opcode as u32;
-        sqe.nsid = DEFAULT_NSID;
+        sqe.nsid = ns.nsid;
         sqe.prp1 = pair.prp1;
         sqe.prp2 = pair.prp2;
         // CDW10/11 = SLBA (64-bit, little-endian split).
@@ -2299,6 +2366,7 @@ impl Controller {
     /// marks the controller dead (see [`NvmeError::ControllerDead`]).
     fn nvm_io_dma(
         &mut self,
+        ns: ns::NamespaceInfo,
         opcode: u8,
         lba: u64,
         n_blocks: u32,
@@ -2311,7 +2379,7 @@ impl Controller {
         if n_blocks == 0 {
             return Ok(());
         }
-        let sqe = self.build_nvm_sqe(opcode, lba, n_blocks, dma, len)?;
+        let sqe = self.build_nvm_sqe_ns(ns, opcode, lba, n_blocks, dma, len)?;
         let qi = self.pick_queue();
         let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
@@ -2337,10 +2405,38 @@ impl Controller {
         buf: &DmaBuffer,
         offset: usize,
     ) -> Result<(), NvmeError> {
+        let ns = self.primary_geom();
+        self.nvm_io_ns_at(ns, opcode, lba, n_blocks, buf, offset)
+    }
+
+    /// [`Self::nvm_io_at`] against registered namespace `nsid`.
+    pub fn nvm_io_nsid_at(
+        &mut self,
+        nsid: u32,
+        opcode: u8,
+        lba: u64,
+        n_blocks: u32,
+        buf: &DmaBuffer,
+        offset: usize,
+    ) -> Result<(), NvmeError> {
+        let ns = self.ns_geom(nsid).ok_or(NvmeError::NamespaceUnusable)?;
+        self.nvm_io_ns_at(ns, opcode, lba, n_blocks, buf, offset)
+    }
+
+    fn nvm_io_ns_at(
+        &mut self,
+        ns: ns::NamespaceInfo,
+        opcode: u8,
+        lba: u64,
+        n_blocks: u32,
+        buf: &DmaBuffer,
+        offset: usize,
+    ) -> Result<(), NvmeError> {
         if offset > buf.len() || offset & 0x3 != 0 {
             return Err(NvmeError::BadTransfer);
         }
         self.nvm_io_dma(
+            ns,
             opcode,
             lba,
             n_blocks,
@@ -2405,7 +2501,7 @@ impl Controller {
 
         let mut sqe = Sqe::zero();
         sqe.cdw0 = opcode as u32;
-        sqe.nsid = DEFAULT_NSID;
+        sqe.nsid = self.primary_nsid;
         sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
         sqe.cdw11 = (lba >> 32) as u32;
         sqe.cdw12 = (n_blocks - 1) as u32;
@@ -2591,27 +2687,136 @@ unsafe fn parse_identify(buf: &DmaBuffer) -> IdentifyController {
         fr,
         // SAFETY: byte 77 of the same 4 KiB page.
         mdts: unsafe { core::ptr::read_volatile(base.add(77)) },
+        // SAFETY: bytes 80..84 / 516..520 of the same 4 KiB page, 4-aligned.
+        ver: unsafe { core::ptr::read_volatile(base.add(80) as *const u32) },
+        // SAFETY: as above.
+        nn: unsafe { core::ptr::read_volatile(base.add(516) as *const u32) },
     }
 }
 
-/// Decode the namespace LBA format out of an IDENTIFY NAMESPACE page.
+/// Admin Identify (opcode 0x06, `cns`, `nsid`) into the 4 KiB DMA `page`.
+/// The page is zeroed first so a short structure never leaves stale bytes.
+fn admin_identify(
+    admin: &mut Queue,
+    bar0: &MmioRegion,
+    nsid: u32,
+    cns: u8,
+    page: &DmaBuffer,
+) -> Result<(), NvmeError> {
+    // SAFETY: `page` is a live 4 KiB coherent buffer no command currently
+    // targets (the previous Identify into it completed).
+    unsafe { core::ptr::write_bytes(page.cpu_mut_ptr::<u8>(), 0, 4096) };
+    compiler_fence(Ordering::Release);
+    let mut sqe = Sqe::zero();
+    sqe.cdw0 = AdminOpcode::Identify as u32;
+    sqe.nsid = nsid;
+    sqe.prp1 = page.dma_addr().raw();
+    sqe.cdw10 = cns as u32;
+    // SAFETY: the admin queue and BAR0 are live (bring-up, CC.EN=1, RDY=1).
+    unsafe { admin.submit(bar0, sqe) }.map(|_| ())
+}
+
+/// Copy the 4 KiB Identify result out of `page`.
+fn identify_page_bytes(page: &DmaBuffer) -> Vec<u8> {
+    compiler_fence(Ordering::Acquire);
+    let mut raw = alloc::vec![0u8; 4096];
+    // SAFETY: the controller finished writing `page` (its CQE was consumed);
+    // `raw` is a fresh heap buffer that cannot overlap it.
+    unsafe { core::ptr::copy_nonoverlapping(page.cpu_ptr::<u8>(), raw.as_mut_ptr(), 4096) };
+    raw
+}
+
+/// Linux `nvme_scan_work`: list the active NSIDs (Active Namespace List
+/// from NVMe 1.1, `1..=NN` before or when the list command fails), Identify
+/// each, keep those with capacity and a usable format, and read their
+/// identification descriptors (NVMe 1.3+).
 ///
-/// Copies the header + LBA-format table (the first 384 bytes) out of
-/// the DMA page and hands it to [`prp::decode_namespace_format`],
-/// which mirrors Linux's FLBAS index, LBA-size and metadata checks.
-///
-/// # Safety
-/// `buf` must be a 4 KiB coherent DMA buffer the controller has
-/// finished writing to (CQE arrived).
-unsafe fn parse_identify_namespace(buf: &DmaBuffer) -> prp::NamespaceFormat {
-    let mut raw = [0u8; 384];
-    // SAFETY: caller contract — `buf` is a live 4 KiB page the device
-    // finished writing; 384 bytes stay inside it, and `raw` is a stack
-    // array that cannot overlap it.
-    unsafe {
-        core::ptr::copy_nonoverlapping(buf.cpu_ptr::<u8>(), raw.as_mut_ptr(), raw.len());
+/// A command the controller completes with an error status skips that
+/// namespace (or that step). Any other failure — a completion timeout, a
+/// fatal status — aborts the scan and hands the Identify page back with the
+/// error: the controller may still DMA into it, so the caller parks it in
+/// `in_flight_dma` until `disable_after_failure` proves the controller
+/// stopped (and leaks it if it does not).
+#[allow(clippy::type_complexity)]
+fn scan_namespaces(
+    admin: &mut Queue,
+    bar0: &MmioRegion,
+    vs: u32,
+    nn: u32,
+) -> Result<Vec<ns::NamespaceInfo>, (NvmeError, Option<DmaBuffer>)> {
+    use core::fmt::Write as _;
+    let page =
+        alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| (NvmeError::OutOfDmaMemory, None))?;
+    let fatal = |e: NvmeError| !matches!(e, NvmeError::CommandFailed { .. });
+
+    // ── Which NSIDs ────────────────────────────────────────────────
+    let mut nsids: Option<Vec<u32>> = None;
+    if ns::use_ns_list(vs) {
+        let mut list = Vec::new();
+        let mut start = 0u32;
+        let mut ok = true;
+        loop {
+            match admin_identify(admin, bar0, start, admin::CNS_NAMESPACE_LIST, &page) {
+                Ok(()) => {}
+                Err(e) if fatal(e) => return Err((e, Some(page))),
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+            let chunk = ns::decode_ns_list(&identify_page_bytes(&page));
+            // Ascending and above `start`, or the device is confused.
+            let n = chunk.len();
+            let last = chunk.last().copied();
+            list.extend(chunk.into_iter().filter(|&id| id > start));
+            match last {
+                Some(l)
+                    if n == 1024 && l > start && (list.len() as u32) < ns::MAX_SCANNED_NSIDS =>
+                {
+                    start = l
+                }
+                _ => break,
+            }
+        }
+        if ok {
+            list.truncate(ns::MAX_SCANNED_NSIDS as usize);
+            nsids = Some(list);
+        }
     }
-    prp::decode_namespace_format(&raw)
+    let nsids = nsids.unwrap_or_else(|| (1..=nn.min(ns::MAX_SCANNED_NSIDS)).collect());
+
+    // ── Identify each ──────────────────────────────────────────────
+    let mut out = Vec::new();
+    for nsid in nsids {
+        match admin_identify(admin, bar0, nsid, admin::CNS_NAMESPACE, &page) {
+            Ok(()) => {}
+            Err(e) if fatal(e) => return Err((e, Some(page))),
+            Err(_) => continue,
+        }
+        let mut info = match ns::classify_namespace(nsid, &identify_page_bytes(&page)) {
+            Ok(info) => info,
+            Err(why) => {
+                let _ = writeln!(narf_console::Writer, "nvme: nsid {nsid} skipped: {why:?}");
+                continue;
+            }
+        };
+        if ns::use_ns_descriptors(vs) {
+            match admin_identify(
+                admin,
+                bar0,
+                nsid,
+                admin::CNS_NAMESPACE_DESCRIPTOR_LIST,
+                &page,
+            ) {
+                Ok(()) => ns::apply_ns_descriptors(&identify_page_bytes(&page), &mut info.ids),
+                Err(e) if fatal(e) => return Err((e, Some(page))),
+                Err(_) => {}
+            }
+        }
+        out.push(info);
+    }
+    drop(page);
+    Ok(out)
 }
 
 /// Build a Security Send or Security Receive SQE.
@@ -2632,11 +2837,10 @@ fn build_security_sqe(opcode: u8, secp: u8, spsp: u16, len: u32, prp1: u64) -> S
     sqe
 }
 
-/// Async `BlockDevice` adapter for the singleton NVMe controller.
+/// Async `BlockDevice` adapter for the first NVMe controller (`nvme0`).
 ///
-/// Sibling of `NvmeBlockSync` — both reach into `CONTROLLER` (the
-/// global `IrqSafeSpinLock<Option<Controller>>` populated by
-/// `probe`); this one satisfies the async `block::BlockDevice`
+/// Sibling of `NvmeBlockSync` — both reach instance 0's slot in
+/// `CONTROLLERS` (populated by `probe`); this one satisfies the async `block::BlockDevice`
 /// contract that the VFS / filesystem stack consumes, while the
 /// sync version is what early-boot smoke paths use.
 ///
@@ -2730,7 +2934,7 @@ fn nvme_submit_blocking(
         BlockOp::Trim => return Ok(()),
     };
     // Interrupts stay enabled for the whole transfer: hold the
-    // device's request gate, not the IRQ-masking CONTROLLER lock.
+    // device's request gate, not the IRQ-masking CONTROLLERS lock.
     // See `InstalledController`.
     let mut ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
     let lba_bytes = ctrl.lba_bytes as u64;
@@ -2799,12 +3003,12 @@ pub const PCI_SUBCLASS_NVM: u8 = 0x08;
 /// PCI prog-if for NVMe (vs. AHCI / SATA / etc).
 pub const PCI_PROGIF_NVME: u8 = 0x02;
 
-/// Heap slot for the installed controller, leaked at install time.
+/// Heap slot for one installed controller, leaked at install time.
 ///
 /// Why a leaked slot instead of `IrqSafeSpinLock<Option<Controller>>`:
 /// every NVMe I/O is a device round-trip — submit an SQE, then
-/// busy-poll the CQ for up to 5 s (`wait_cqe`). Holding `CONTROLLER`
-/// (an `IrqSafeSpinLock`) across that transfer masks interrupts on the
+/// busy-poll the CQ for up to 5 s (`wait_cqe`). Holding an
+/// `IrqSafeSpinLock` across that transfer masks interrupts on the
 /// waiting CPU for the whole round-trip and forces every other CPU
 /// doing I/O to spin on the same lock, also interrupts-masked. Under a
 /// filesystem workload that starves timers and RCU and livelocks the
@@ -2813,11 +3017,17 @@ pub const PCI_PROGIF_NVME: u8 = 0x02;
 /// worse (thundering herd, not a race).
 ///
 /// The fix splits the two things the lock was serialising:
-///  - *Finding* the controller: `CONTROLLER` is taken only long enough
-///    to copy this slot's `&'static` reference out, then released.
+///  - *Finding* the controller: `CONTROLLERS` is taken only long enough
+///    to copy a slot's `&'static` reference out, then released.
 ///  - *Using* the controller: `req_gate`, a plain atomic spun on
 ///    WITHOUT masking interrupts, so timer ticks, RCU quiescent states
 ///    and the sleep pumps keep running while a CPU waits its turn.
+///
+/// One slot per controller (Linux: one `struct nvme_dev` per PCI
+/// function, `nvme_probe` in `drivers/nvme/host/pci.c`). Each slot owns
+/// its controller's BAR mapping, admin and I/O queues, MSI-X vectors, PRP
+/// list and DMA scratch; two controllers never share a gate or a buffer,
+/// so I/O to `nvme0` and `nvme1` proceeds in parallel.
 ///
 /// The `UnsafeCell` is what makes handing out `&mut Controller` sound:
 /// the slot reference is `&'static` (never moves, never drops — even a
@@ -2825,20 +3035,29 @@ pub const PCI_PROGIF_NVME: u8 = 0x02;
 /// rather than dropping it, so a stale reference can dangle only
 /// logically, never point at freed memory), and `req_gate` guarantees
 /// at most one `ControllerGuard` — hence at most one live `&mut` —
-/// exists at a time.
+/// exists per slot at a time.
 struct InstalledController {
     /// Serialises device round-trips and all references into `ctrl`.
-    /// Acquired by [`probed_controller`]; spun on with interrupts
-    /// ENABLED.
+    /// Acquired by [`acquire`]; spun on with interrupts ENABLED.
     req_gate: AtomicBool,
+    /// Probe-order instance: the controller is `nvme<instance>`.
+    instance: u32,
+    /// PCI function this slot drives (`None` for a device-less test
+    /// controller). Re-probing the same function is a no-op.
+    bdf: Option<narf_bus::PcieAddr>,
+    /// Set by [`remove_controller`]: every later I/O is refused.
+    removed: AtomicBool,
+    /// This controller's DMA scratch for the sync block path, leaked on
+    /// first use. Its contents are serialised by `req_gate`; this lock
+    /// only covers the lazy init.
+    scratch: IrqSafeSpinLock<Option<&'static DmaBuffer>>,
     ctrl: UnsafeCell<Controller>,
 }
 
-// SAFETY: all access to `ctrl` goes through `req_gate` (see
-// `probed_controller` — the only constructor of references into the
-// cell), which admits one holder at a time; `Controller` itself is
-// Send (asserted below), so migrating that exclusive access across
-// CPUs is fine.
+// SAFETY: all access to `ctrl` goes through `req_gate` (see `acquire` —
+// the only constructor of references into the cell), which admits one
+// holder at a time; `Controller` itself is Send (asserted below), so
+// migrating that exclusive access across CPUs is fine.
 unsafe impl Sync for InstalledController {}
 
 const _: () = {
@@ -2846,38 +3065,74 @@ const _: () = {
     assert_send::<Controller>()
 };
 
-/// Slot pointer for the live controller produced by `probe`. Wave-3a
-/// single-instance — multi-controller support arrives with a real
-/// driver-handle table.
-///
-/// Held only long enough to copy the `&'static` slot reference out —
-/// NEVER across a device round-trip. See [`InstalledController`].
-static CONTROLLER: IrqSafeSpinLock<Option<&'static InstalledController>> =
-    IrqSafeSpinLock::new(None);
+/// Every installed controller, indexed by position; `instance` equals the
+/// position (slots are only appended or replaced in place). Held only long
+/// enough to copy a `&'static` slot reference out — NEVER across a device
+/// round-trip. See [`InstalledController`].
+static CONTROLLERS: IrqSafeSpinLock<Vec<&'static InstalledController>> =
+    IrqSafeSpinLock::new(Vec::new());
 
-/// Install `ctrl` as the live controller, replacing (and leaking) any
-/// previous slot.
-///
-/// The old slot is deliberately leaked, not dropped: a concurrent I/O
-/// path may still hold a `ControllerGuard` against it, and freeing the
-/// allocation under that guard would be a use-after-free reachable
-/// only under load. Leaking keeps every outstanding reference valid
-/// forever. Outside the kernel-test harness this is called exactly
-/// once per boot (probe early-returns when a controller exists), so
-/// nothing accumulates; the harness's reinstall path
-/// (`smoke_nvme_block_device_async_round_trip`) leaks one dead
-/// controller per run, which is bounded and intentional.
-pub(crate) fn install_controller(ctrl: Controller) {
-    let slot: &'static InstalledController =
-        alloc::boxed::Box::leak(alloc::boxed::Box::new(InstalledController {
-            req_gate: AtomicBool::new(false),
-            ctrl: UnsafeCell::new(ctrl),
-        }));
-    *CONTROLLER.lock() = Some(slot);
+fn controller_bdf(ctrl: &Controller) -> Option<narf_bus::PcieAddr> {
+    match ctrl.device?.addr {
+        narf_bus::BusAddr::Pcie(a) => Some(a),
+        _ => None,
+    }
 }
 
-/// Exclusive handle to the installed controller for one device
-/// round-trip. Holds the slot's `req_gate`, NOT the `CONTROLLER`
+fn leak_slot(
+    instance: u32,
+    bdf: Option<narf_bus::PcieAddr>,
+    ctrl: Controller,
+) -> &'static InstalledController {
+    alloc::boxed::Box::leak(alloc::boxed::Box::new(InstalledController {
+        req_gate: AtomicBool::new(false),
+        instance,
+        bdf,
+        removed: AtomicBool::new(false),
+        scratch: IrqSafeSpinLock::new(None),
+        ctrl: UnsafeCell::new(ctrl),
+    }))
+}
+
+/// Install `ctrl` and return its instance number. A slot already driving
+/// the same PCI function is replaced (and leaked) in place, keeping its
+/// instance — the kernel-test harness's reinstall path. A controller with
+/// no bus device replaces instance 0. Anything else is appended as the
+/// next instance.
+///
+/// Old slots are deliberately leaked, not dropped: a concurrent I/O path
+/// may still hold a `ControllerGuard` against one, and freeing it under
+/// that guard would be a use-after-free reachable only under load. Outside
+/// the harness every probe installs a new function exactly once, so
+/// nothing accumulates.
+pub(crate) fn install_controller(ctrl: Controller) -> u32 {
+    let bdf = controller_bdf(&ctrl);
+    let mut g = CONTROLLERS.lock();
+    let pos = match bdf {
+        Some(b) => g.iter().position(|s| s.bdf == Some(b)),
+        None => (!g.is_empty()).then_some(0),
+    };
+    match pos {
+        Some(i) => {
+            let instance = g[i].instance;
+            g[i] = leak_slot(instance, bdf, ctrl);
+            instance
+        }
+        None => {
+            let instance = g.len() as u32;
+            g.push(leak_slot(instance, bdf, ctrl));
+            instance
+        }
+    }
+}
+
+fn slot_of(instance: u32) -> Option<&'static InstalledController> {
+    let s = CONTROLLERS.lock().get(instance as usize).copied()?;
+    (!s.removed.load(Ordering::Acquire)).then_some(s)
+}
+
+/// Exclusive handle to one installed controller for one device
+/// round-trip. Holds the slot's `req_gate`, NOT the `CONTROLLERS`
 /// spinlock — interrupts stay enabled for the whole transfer.
 pub struct ControllerGuard {
     slot: &'static InstalledController,
@@ -2885,17 +3140,18 @@ pub struct ControllerGuard {
 
 impl core::fmt::Debug for ControllerGuard {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ControllerGuard").finish_non_exhaustive()
+        f.debug_struct("ControllerGuard")
+            .field("instance", &self.slot.instance)
+            .finish_non_exhaustive()
     }
 }
 
 impl core::ops::Deref for ControllerGuard {
     type Target = Controller;
     fn deref(&self) -> &Controller {
-        // SAFETY: `req_gate` is held (only `probed_controller` builds a
-        // guard, and it acquires the gate first), so no other reference
-        // into the cell exists; the slot itself is `&'static` and never
-        // freed.
+        // SAFETY: `req_gate` is held (only `acquire` builds a guard, and it
+        // acquires the gate first), so no other reference into the cell
+        // exists; the slot itself is `&'static` and never freed.
         unsafe { &*self.slot.ctrl.get() }
     }
 }
@@ -2914,20 +3170,10 @@ impl Drop for ControllerGuard {
     }
 }
 
-/// Acquire exclusive access to the probed controller WITHOUT holding
-/// `CONTROLLER` for the caller's use of it.
-///
-/// `CONTROLLER` is taken only long enough to copy the slot reference,
-/// then released; the wait for our turn happens on the slot's
-/// `req_gate` with interrupts ENABLED, so a CPU parked here still
-/// takes timer ticks and reaches RCU quiescent states while another
-/// CPU's 5-second-budget completion poll runs.
-///
-/// `smoke_nvme_controller_slot_is_stable` pins the address-stability
-/// invariant this relies on: a repeat probe must not move or replace
-/// the installed slot.
-fn probed_controller() -> Option<ControllerGuard> {
-    let slot = (*CONTROLLER.lock())?;
+/// Take `slot`'s gate, spinning with interrupts ENABLED: a CPU parked
+/// here still takes timer ticks and reaches RCU quiescent states while
+/// another CPU's 5-second-budget completion poll runs.
+fn acquire(slot: &'static InstalledController) -> ControllerGuard {
     while slot
         .req_gate
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -2935,50 +3181,99 @@ fn probed_controller() -> Option<ControllerGuard> {
     {
         core::hint::spin_loop();
     }
-    Some(ControllerGuard { slot })
+    ControllerGuard { slot }
 }
 
-/// The installed slot's address, or `None` before probe. Test hook for
-/// the install-once invariant `probed_controller` relies on.
+/// Exclusive access to controller `instance`, or `None` if it is not
+/// installed (or was removed).
+///
+/// `smoke_nvme_controller_slot_is_stable` pins the address-stability
+/// invariant this relies on: a repeat probe must not move or replace an
+/// installed slot.
+fn controller_at(instance: u32) -> Option<ControllerGuard> {
+    slot_of(instance).map(acquire)
+}
+
+/// Exclusive access to the first controller (`nvme0`).
+fn probed_controller() -> Option<ControllerGuard> {
+    controller_at(0)
+}
+
+/// Instance 0's slot address, or `None` before probe. Test hook for the
+/// install-once invariant `acquire` relies on.
 #[doc(hidden)]
 pub fn dbg_slot_addr() -> Option<usize> {
-    (*CONTROLLER.lock()).map(|s| s as *const InstalledController as usize)
+    dbg_slot_addr_at(0)
 }
 
-// ── BlockDeviceSync adapter (registry/lib.rs) ─────────────────────────
+/// [`dbg_slot_addr`] for controller `instance`.
+#[doc(hidden)]
+pub fn dbg_slot_addr_at(instance: u32) -> Option<usize> {
+    slot_of(instance).map(|s| s as *const InstalledController as usize)
+}
 
-/// Sync wrapper that lets the kernel's block registry address NVMe
-/// uniformly with virtio-blk-pci + AHCI. Wraps the singleton
-/// CONTROLLER static; reads / writes go through the polled
-/// `read_lba` / `write_lba` paths today.
+/// Number of installed controllers (removed ones included: instance
+/// numbers are never reused within a boot).
+pub fn controller_count() -> usize {
+    CONTROLLERS.lock().len()
+}
+
+/// Instance number of the controller driving PCI function `bdf`.
+pub fn instance_of(bdf: narf_bus::PcieAddr) -> Option<u32> {
+    CONTROLLERS
+        .lock()
+        .iter()
+        .find(|s| s.bdf == Some(bdf) && !s.removed.load(Ordering::Acquire))
+        .map(|s| s.instance)
+}
+
+// ── BlockDeviceSync adapters (registry/lib.rs) ────────────────────────
+
+/// Block device for one namespace of one controller: what the registry
+/// holds as `nvme<C>n<N>`. Resolves its controller by instance on every
+/// call, so a kernel-test reinstall of that controller is picked up and a
+/// removed controller reports `DeviceRemoved`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NvmeNamespaceBlock {
+    instance: u32,
+    nsid: u32,
+}
+
+impl NvmeNamespaceBlock {
+    pub const fn new(instance: u32, nsid: u32) -> Self {
+        Self { instance, nsid }
+    }
+    pub fn instance(&self) -> u32 {
+        self.instance
+    }
+    pub fn nsid(&self) -> u32 {
+        self.nsid
+    }
+}
+
+/// Sync wrapper for the first controller's primary namespace — the
+/// pre-multi-controller surface, kept for callers and smokes that address
+/// "the" NVMe disk. The registry holds [`NvmeNamespaceBlock`]s.
 #[derive(Debug)]
 pub struct NvmeBlockSync;
 
-/// Size of the persistent DMA scratch behind [`NvmeBlockSync`]. A
+/// Size of the persistent DMA scratch behind the sync block path. A
 /// registry transfer is split into commands of at most
 /// `min(scratch, max_transfer_bytes)` bytes; 128 KiB moves a standard
 /// 16 KiB GPT entry array, or 32 4 KiB blocks, in one command.
 const NVME_SYNC_SCRATCH_BYTES: usize = 128 * 1024;
 
-/// Persistent DMA scratch shared by NvmeBlockSync::read + write.
-/// Both paths hold the installed controller's `req_gate` (via
-/// [`probed_controller`]) for the whole transfer, so a single buffer
-/// is safe to share — the gate, not this lock, serialises the
-/// CONTENTS. This lock covers only the lazy init and the pointer
-/// read; it is never held across a device round-trip (holding an
-/// IRQ-masking spinlock across the CQ poll is the livelock the gate
-/// exists to prevent — see `InstalledController`).
+/// `slot`'s DMA scratch, allocated (and leaked) on first use.
 ///
-/// The buffer is leaked on first use so the returned `&'static` can
-/// outlive the lock, and so a command that times out can never leave
-/// the device DMA-ing into a recycled page (audit #2: pre-fix every
-/// read/write call did `alloc_coherent(4096)` and dropped the result
-/// at function end). If the 128 KiB contiguous allocation fails the
-/// scratch falls back to one page; transfers are then split per page.
-static NVME_SCRATCH_BUF: IrqSafeSpinLock<Option<&'static DmaBuffer>> = IrqSafeSpinLock::new(None);
-
-fn nvme_scratch() -> Option<&'static DmaBuffer> {
-    let mut g = NVME_SCRATCH_BUF.lock();
+/// Leaked so the returned `&'static` can outlive the lock, and so a
+/// command that times out can never leave the device DMA-ing into a
+/// recycled page (audit #2: pre-fix every read/write call did
+/// `alloc_coherent(4096)` and dropped the result at function end). If the
+/// 128 KiB contiguous allocation fails the scratch falls back to one page;
+/// transfers are then split per page. The caller holds `slot`'s gate,
+/// which is what serialises the contents.
+fn slot_scratch(slot: &InstalledController) -> Option<&'static DmaBuffer> {
+    let mut g = slot.scratch.lock();
     if g.is_none() {
         *g = alloc_coherent(NVME_SYNC_SCRATCH_BYTES, DomainId::DRIVER_0)
             .or_else(|_| alloc_coherent(PAGE_SIZE as usize, DomainId::DRIVER_0))
@@ -3005,97 +3300,81 @@ fn nvme_sync_chunk_blocks(scratch: usize, max_transfer: u32, lba_bytes: u32) -> 
     core::cmp::max(1, bytes / lba_bytes.max(1) as usize) as u32
 }
 
-impl narf_block::BlockDeviceSync for NvmeBlockSync {
-    fn lba_size(&self) -> u32 {
-        with_controller(|c| c.lba_bytes).unwrap_or(512)
+/// Geometry of namespace `nsid` (`None` = primary) on `ctrl`.
+fn geom(ctrl: &Controller, nsid: Option<u32>) -> Option<ns::NamespaceInfo> {
+    match nsid {
+        Some(id) => ctrl.ns_geom(id),
+        None => Some(ctrl.primary_geom()),
     }
-    fn capacity(&self) -> u64 {
-        // A namespace whose format NARF cannot drive reports no
-        // capacity, as Linux sets a zero-capacity disk.
-        with_controller(|c| if c.ns_usable { c.nsze } else { 0 }).unwrap_or(0)
+}
+
+fn sync_lba_size(instance: u32, nsid: Option<u32>) -> u32 {
+    with_controller_at(instance, |c| geom(c, nsid).map(|g| g.lba_bytes))
+        .flatten()
+        .unwrap_or(512)
+}
+
+fn sync_capacity(instance: u32, nsid: Option<u32>) -> u64 {
+    // A namespace whose format NARF cannot drive reports no capacity, as
+    // Linux sets a zero-capacity disk.
+    with_controller_at(instance, |c| {
+        geom(c, nsid).map(|g| if g.usable { g.nsze } else { 0 })
+    })
+    .flatten()
+    .unwrap_or(0)
+}
+
+/// Sync read/write of `n_blocks` LBAs of namespace `nsid` on controller
+/// `instance` through the controller's scratch. `write` selects direction;
+/// `data` is the source (write) or destination (read).
+fn sync_io(
+    instance: u32,
+    nsid: Option<u32>,
+    write: bool,
+    lba: u64,
+    n_blocks: u16,
+    data: SyncData<'_>,
+) -> Result<(), narf_block::BlockIoError> {
+    use narf_block::BlockIoError;
+    if n_blocks == 0 {
+        return Ok(());
     }
-    fn read(
-        &self,
-        lba: u64,
-        n_blocks: u16,
-        out: &mut [u8],
-    ) -> Result<(), narf_block::BlockIoError> {
-        if n_blocks == 0 {
-            return Ok(());
-        }
-        // Interrupts stay enabled for the whole transfer: hold the
-        // device's request gate, not the IRQ-masking CONTROLLER lock.
-        // The gate is what serialises the shared scratch, so acquire
-        // it BEFORE touching the buffer.
-        let mut ctrl = probed_controller().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        let lba_bytes = ctrl.lba_bytes as usize;
-        let need = n_blocks as usize * lba_bytes;
-        if out.len() < need {
-            return Err(narf_block::BlockIoError::BufferTooSmall);
-        }
-        let buf = nvme_scratch().ok_or(narf_block::BlockIoError::DriverError)?;
-        let chunk =
-            nvme_sync_chunk_blocks(buf.len(), ctrl.max_transfer_bytes(), ctrl.lba_bytes) as usize;
-        let mut done = 0usize;
-        while done < n_blocks as usize {
-            let n = core::cmp::min(chunk, n_blocks as usize - done);
-            ctrl.nvm_io_at(
-                IoOpcode::Read as u8,
-                lba.saturating_add(done as u64),
-                n as u32,
-                buf,
-                0,
-            )
-            .map_err(map_nvme_sync_err)?;
-            // The CQ poll inside `nvm_io_at` is what makes the device's
-            // writes visible; fence so the compiler cannot hoist this
-            // bulk copy above it.
-            compiler_fence(Ordering::Acquire);
-            let bytes = n * lba_bytes;
-            let at = done * lba_bytes;
-            // SAFETY: the scratch is a live coherent DMA buffer of
-            // `buf.len()` ≥ `bytes` bytes (chunk is bounded by it) that
-            // the controller just filled; `out[at..at + bytes]` is in
-            // bounds (`need` checked above) and a kernel slice cannot
-            // overlap the DMA buffer. Bulk copy rather than a per-byte
-            // volatile loop: the payload is coherent DMA memory, not
-            // MMIO.
+    // Interrupts stay enabled for the whole transfer: hold this
+    // controller's request gate, not an IRQ-masking lock. The gate is what
+    // serialises the controller's scratch, so acquire it BEFORE touching
+    // the buffer.
+    let slot = slot_of(instance).ok_or(BlockIoError::DeviceRemoved)?;
+    let mut ctrl = acquire(slot);
+    if slot.removed.load(Ordering::Acquire) {
+        return Err(BlockIoError::DeviceRemoved);
+    }
+    let ns = geom(&ctrl, nsid).ok_or(BlockIoError::DeviceRemoved)?;
+    let lba_bytes = ns.lba_bytes as usize;
+    let need = n_blocks as usize * lba_bytes;
+    if data.len() < need {
+        return Err(BlockIoError::BufferTooSmall);
+    }
+    let buf = slot_scratch(slot).ok_or(BlockIoError::DriverError)?;
+    let chunk = nvme_sync_chunk_blocks(buf.len(), ctrl.max_transfer_bytes(), ns.lba_bytes) as usize;
+    let opcode = if write {
+        IoOpcode::Write as u8
+    } else {
+        IoOpcode::Read as u8
+    };
+    let mut data = data;
+    let mut done = 0usize;
+    while done < n_blocks as usize {
+        let n = core::cmp::min(chunk, n_blocks as usize - done);
+        let bytes = n * lba_bytes;
+        let at = done * lba_bytes;
+        if let SyncData::Out(src) = &data {
+            // SAFETY: the scratch is a live coherent DMA buffer of at least
+            // `bytes` bytes (chunk is bounded by it); `src[at..at + bytes]`
+            // is in bounds (`need` checked above) and a kernel slice cannot
+            // overlap the DMA buffer.
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    buf.cpu_ptr::<u8>(),
-                    out.as_mut_ptr().add(at),
-                    bytes,
-                );
-            }
-            done += n;
-        }
-        Ok(())
-    }
-    fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
-        if n_blocks == 0 {
-            return Ok(());
-        }
-        // Same shape as `read` above: gate first (it owns the scratch
-        // contents), no IRQ-masking lock across the transfer.
-        let mut ctrl = probed_controller().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        let lba_bytes = ctrl.lba_bytes as usize;
-        let need = n_blocks as usize * lba_bytes;
-        if data.len() < need {
-            return Err(narf_block::BlockIoError::BufferTooSmall);
-        }
-        let buf = nvme_scratch().ok_or(narf_block::BlockIoError::DriverError)?;
-        let chunk =
-            nvme_sync_chunk_blocks(buf.len(), ctrl.max_transfer_bytes(), ctrl.lba_bytes) as usize;
-        let mut done = 0usize;
-        while done < n_blocks as usize {
-            let n = core::cmp::min(chunk, n_blocks as usize - done);
-            let bytes = n * lba_bytes;
-            let at = done * lba_bytes;
-            // SAFETY: as in `read` — in-bounds source slice, scratch of
-            // at least `bytes` bytes, no overlap.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    data.as_ptr().add(at),
+                    src.as_ptr().add(at),
                     buf.cpu_mut_ptr::<u8>(),
                     bytes,
                 );
@@ -3103,32 +3382,120 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
             // Publish the payload before the SQE + doorbell that lets
             // the device DMA-read it.
             compiler_fence(Ordering::Release);
-            ctrl.nvm_io_at(
-                IoOpcode::Write as u8,
-                lba.saturating_add(done as u64),
-                n as u32,
-                buf,
-                0,
-            )
-            .map_err(map_nvme_sync_err)?;
-            done += n;
         }
-        Ok(())
+        ctrl.nvm_io_ns_at(
+            ns,
+            opcode,
+            lba.saturating_add(done as u64),
+            n as u32,
+            buf,
+            0,
+        )
+        .map_err(map_nvme_sync_err)?;
+        if let SyncData::In(dst) = &mut data {
+            // The CQ poll inside `nvm_io_ns_at` is what makes the device's
+            // writes visible; fence so the compiler cannot hoist this bulk
+            // copy above it.
+            compiler_fence(Ordering::Acquire);
+            // SAFETY: as above, with `dst[at..at + bytes]` in bounds. Bulk
+            // copy rather than a per-byte volatile loop: the payload is
+            // coherent DMA memory, not MMIO.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    buf.cpu_ptr::<u8>(),
+                    dst.as_mut_ptr().add(at),
+                    bytes,
+                );
+            }
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+/// Caller buffer of [`sync_io`].
+enum SyncData<'a> {
+    In(&'a mut [u8]),
+    Out(&'a [u8]),
+}
+
+impl SyncData<'_> {
+    fn len(&self) -> usize {
+        match self {
+            SyncData::In(b) => b.len(),
+            SyncData::Out(b) => b.len(),
+        }
     }
 }
 
-/// Probe entry point dispatched by `bus::probe_all_pci`. Brings the
-/// NVMe controller online (admin queue + IDENTIFY + I/O queue) and
-/// stashes it in `CONTROLLER`. Returns `BadDevice` on bring-up
-/// failure — caller logs + continues with the next device.
+impl narf_block::BlockDeviceSync for NvmeNamespaceBlock {
+    fn lba_size(&self) -> u32 {
+        sync_lba_size(self.instance, Some(self.nsid))
+    }
+    fn capacity(&self) -> u64 {
+        sync_capacity(self.instance, Some(self.nsid))
+    }
+    fn read(
+        &self,
+        lba: u64,
+        n_blocks: u16,
+        out: &mut [u8],
+    ) -> Result<(), narf_block::BlockIoError> {
+        sync_io(
+            self.instance,
+            Some(self.nsid),
+            false,
+            lba,
+            n_blocks,
+            SyncData::In(out),
+        )
+    }
+    fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        sync_io(
+            self.instance,
+            Some(self.nsid),
+            true,
+            lba,
+            n_blocks,
+            SyncData::Out(data),
+        )
+    }
+}
+
+impl narf_block::BlockDeviceSync for NvmeBlockSync {
+    fn lba_size(&self) -> u32 {
+        sync_lba_size(0, None)
+    }
+    fn capacity(&self) -> u64 {
+        sync_capacity(0, None)
+    }
+    fn read(
+        &self,
+        lba: u64,
+        n_blocks: u16,
+        out: &mut [u8],
+    ) -> Result<(), narf_block::BlockIoError> {
+        sync_io(0, None, false, lba, n_blocks, SyncData::In(out))
+    }
+    fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        sync_io(0, None, true, lba, n_blocks, SyncData::Out(data))
+    }
+}
+
+/// Probe entry point dispatched by `bus::probe_all_pci`, once per NVMe
+/// PCI function (Linux `nvme_probe`). Brings that controller online
+/// (BAR mapping, admin queue, IDENTIFY, namespace scan, I/O queue),
+/// installs it as the next instance `nvme<C>`, and registers every
+/// namespace `nvme<C>n<N>` plus its partitions with the block registry.
+/// Returns `BadDevice` on bring-up failure — the controller is stopped
+/// first (see [`Controller::disable_after_failure`]) and the caller logs +
+/// continues with the next device; other controllers are unaffected.
 ///
-/// Idempotent: re-probing a device that's already set up just
-/// returns `Ok(())`. The kernel-test harness re-runs probe_all
-/// across smokes; resetting + re-bringing-up an already-running
-/// NVMe controller risks crossing CC.EN=0/1 state with queues held
-/// by the prior smoke (e.g. MSI-X-configured I/O queues are easier
-/// to leave alone than rewire). Once Stage-4 wires unbind +
-/// hot-plug, this guard goes away.
+/// Idempotent per PCI function: re-probing a function that is already
+/// installed returns `Ok(())`; a function torn down by
+/// [`remove_controller`] is brought up again under its old instance. The kernel-test harness re-runs probe_all
+/// across smokes; resetting + re-bringing-up a running controller risks
+/// crossing CC.EN=0/1 state with queues held by the prior smoke.
 pub fn probe(
     device: narf_bus::BusDevice,
     cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
@@ -3146,7 +3513,12 @@ pub fn probe(
     if class == PCI_CLASS_STORAGE && (subclass != PCI_SUBCLASS_NVM || prog_if != PCI_PROGIF_NVME) {
         return Err(narf_bus::ProbeError::BadDevice);
     }
-    if CONTROLLER.lock().is_some() {
+    let bdf = match device.addr {
+        narf_bus::BusAddr::Pcie(a) => Some(a),
+        _ => None,
+    };
+    let live = |s: &&InstalledController| s.bdf == bdf && !s.removed.load(Ordering::Acquire);
+    if bdf.is_some() && CONTROLLERS.lock().iter().any(live) {
         // Already brought up — make sure the param slot still has
         // something installed (test harness may have cleared it).
         if !PARAMS.is_installed() {
@@ -3167,105 +3539,153 @@ pub fn probe(
         ctrl.disable_after_failure(&cap);
         return Err(narf_bus::ProbeError::BadDevice);
     }
-    install_controller(ctrl);
+    let instance = install_controller(ctrl);
     // Install the typed parameter surface so observers + tuners can
     // reach the driver via `Cap<DriverHandle, Write>`.
-    PARAMS.install(NvmeParams {
-        log_level: LogLevel::Info,
-    });
-    // Register against the unified block-device registry so the
-    // kernel can address NVMe uniformly with other storage drivers.
-    let parent: alloc::sync::Arc<dyn narf_block::BlockDeviceSync> =
-        alloc::sync::Arc::new(NvmeBlockSync);
-    narf_block::register_block_device("nvme0", parent.clone());
-    // Read LBA 0/1, parse the partition table, and register a child
-    // BlockDeviceSync for each non-empty partition entry under names
-    // like "nvme0p1", "nvme0p2", ... Errors here are non-fatal —
-    // an unpartitioned / unformatted device still has its parent
-    // registered above; the partition scan just logs what failed.
-    match narf_block::partition::scan_and_register_partitions(parent, "nvme0") {
-        Ok(_report) => {
-            // Partition layout discovered; child devices in registry.
-            // (Boot log entry is the registry contents itself.)
-        }
-        Err(_e) => {
-            // Disk is unpartitioned or the parser couldn't decode it.
-            // `nvme0` (the parent) remains usable for whole-device I/O.
-        }
+    if !PARAMS.is_installed() {
+        PARAMS.install(NvmeParams {
+            log_level: LogLevel::Info,
+        });
     }
+    register_controller(instance, device);
+    Ok(())
+}
+
+/// Publish controller `instance`: block devices (namespaces + partitions,
+/// each behind the registry's `narf.disks` guard), the bound-driver record,
+/// device PM, and the `/dev/nvme<C>` controller node.
+fn register_controller(instance: u32, device: narf_bus::BusDevice) {
+    let bus_path = match device.addr {
+        narf_bus::BusAddr::Pcie(a) => ns::bdf_string(a),
+        _ => alloc::string::String::new(),
+    };
+    let Some((ident, namespaces)) = with_controller_at(instance, |c| {
+        let id = c.identify();
+        (
+            ns::ControllerIdentity {
+                instance,
+                bus_path,
+                vendor_id: device.id.vendor,
+                model: id.map(|i| ns::trim_ascii(&i.mn)).unwrap_or_default(),
+                serial: id.map(|i| ns::trim_ascii(&i.sn)).unwrap_or_default(),
+                firmware: id.map(|i| ns::trim_ascii(&i.fr)).unwrap_or_default(),
+            },
+            c.namespaces().to_vec(),
+        )
+    }) else {
+        return;
+    };
+    let names = ns::register_namespaces(&ident, &namespaces, |nsid| {
+        alloc::sync::Arc::new(NvmeNamespaceBlock::new(instance, nsid))
+            as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>
+    });
+    let ctrl_name = ns::controller_name(instance);
     // Record the bind in the framework's bound-driver inventory.
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name: alloc::string::String::from("nvme0"),
+        name: ctrl_name.clone(),
         kind: narf_drivers::BoundKind::Block,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Block.default_domain(),
     });
-    // Register against the device PM registry. NVMe suspend stops
-    // the controller via CC.EN=0 (admin + I/O queues quiesce);
-    // resume re-enables CC.EN and waits for CSTS.RDY=1.
-    narf_power::device_pm::register_device_pm("nvme0", nvme_suspend_handler, nvme_resume_handler);
-    // Expose the controller character device `/dev/nvme0` so userspace
-    // admin passthrough (smartctl / nvme-cli) can reach the admin queue
-    // via NVME_IOCTL_ADMIN_CMD.
-    narf_filesystem::devfs::register_nvme0(alloc::sync::Arc::new(chardev::NvmeCharDev::new(0)));
-    Ok(())
+    // Device PM: suspend stops this controller via CC.EN=0 (admin + I/O
+    // queues quiesce); resume re-enables CC.EN and waits for CSTS.RDY=1.
+    narf_power::device_pm::register_device_pm_ops(
+        &ctrl_name,
+        alloc::sync::Arc::new(NvmePm { instance }),
+    );
+    // `/dev/nvme<C>`: admin passthrough (smartctl / nvme-cli) for this
+    // controller. devfs gates it on every one of its namespaces being
+    // writable under `narf.disks`.
+    narf_filesystem::devfs::register_nvme_controller(
+        instance,
+        alloc::sync::Arc::new(chardev::NvmeCharDev::new(instance)),
+        names,
+    );
 }
 
-/// NVMe suspend handler — clears CC.EN so the controller stops
-/// fetching from the admin/IO submission queues. The queues
-/// themselves stay in DRAM; resume re-enables CC.EN.
-fn nvme_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
-    if !is_probed() {
-        return Ok(());
-    }
-    let ok = with_controller(|c| {
-        // SAFETY: caller-asserted BAR exclusivity.
-        unsafe { c.disable_for_suspend() }
-    })
-    .unwrap_or(false);
-    if ok {
-        Ok(())
-    } else {
-        Err(narf_power::device_pm::DeviceSuspendError::DriverError)
-    }
-}
-
-/// NVMe resume handler — re-asserts CC.EN and polls CSTS.RDY.
-fn nvme_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
-    if !is_probed() {
-        return Ok(());
-    }
-    let ok = with_controller(|c| {
-        // SAFETY: same.
-        unsafe { c.enable_for_resume() }
-    })
-    .unwrap_or(false);
-    if ok {
-        Ok(())
-    } else {
-        Err(narf_power::device_pm::DeviceSuspendError::DriverError)
-    }
-}
-
-/// Read-only accessor for the probed controller. Returns `true` iff
-/// `probe` has run successfully.
-pub fn is_probed() -> bool {
-    CONTROLLER.lock().is_some()
-}
-
-/// Run `f` against the probed controller, if any. The closure
-/// receives `&Controller` for read-only inspection (capacity, model,
-/// etc.); `&mut` access for I/O is reserved for a Wave-3b API that
-/// threads the cap through.
+/// Tear controller `instance` down (Linux `nvme_remove` →
+/// `nvme_dev_disable`): refuse new I/O, withdraw its block devices,
+/// partitions and `/dev/nvme<C>` node, wait for the in-flight round-trip
+/// (the gate), then stop the controller with CC.EN=0 and only then release
+/// its DMA — or leak every page the controller was given if CSTS.RDY never
+/// drops (see [`Controller::disable_after_failure`]). Other controllers are
+/// untouched.
 ///
-/// Serialises on the slot's `req_gate` (not the `CONTROLLER` lock):
-/// the reference handed to `f` must not alias a live I/O path's
-/// `&mut Controller`, and the gate is what excludes those. Callers
-/// must not re-enter `with_controller` / `probed_controller` from
-/// inside `f` — the gate is not reentrant.
+/// Returns `None` if `instance` is not installed, else whether the
+/// controller was confirmed stopped.
+pub fn remove_controller(instance: u32, cap: &Cap<BusDeviceCap, Write>) -> Option<bool> {
+    let slot = slot_of(instance)?;
+    slot.removed.store(true, Ordering::Release);
+    let prefix = ns::controller_name(instance);
+    for entry in narf_block::block_devices() {
+        if entry
+            .identity
+            .as_ref()
+            .is_some_and(|i| i.transport == "nvme" && i.controller == prefix)
+        {
+            narf_block::unregister_block_device(entry.name);
+        }
+    }
+    narf_filesystem::devfs::unregister_nvme_controller(instance);
+    let mut ctrl = acquire(slot);
+    Some(ctrl.disable_after_failure(cap))
+}
+
+/// Per-controller suspend/resume (`DevicePmOps`).
+#[derive(Debug)]
+struct NvmePm {
+    instance: u32,
+}
+
+impl narf_power::device_pm::DevicePmOps for NvmePm {
+    /// Clears CC.EN so the controller stops fetching from the admin/IO
+    /// submission queues. The queues themselves stay in DRAM; resume
+    /// re-enables CC.EN.
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        let ok = with_controller_at(self.instance, |c| {
+            // SAFETY: the gate gives exclusive use of this controller's BAR.
+            unsafe { c.disable_for_suspend() }
+        });
+        match ok {
+            None | Some(true) => Ok(()),
+            Some(false) => Err(narf_power::device_pm::DeviceSuspendError::DriverError),
+        }
+    }
+    /// Re-asserts CC.EN and polls CSTS.RDY.
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        let ok = with_controller_at(self.instance, |c| {
+            // SAFETY: as in `suspend`.
+            unsafe { c.enable_for_resume() }
+        });
+        match ok {
+            None | Some(true) => Ok(()),
+            Some(false) => Err(narf_power::device_pm::DeviceSuspendError::DriverError),
+        }
+    }
+}
+
+/// `true` iff at least one controller has been probed successfully.
+pub fn is_probed() -> bool {
+    !CONTROLLERS.lock().is_empty()
+}
+
+/// Run `f` against the first controller (`nvme0`), if any. See
+/// [`with_controller_at`].
 pub fn with_controller<R>(f: impl FnOnce(&Controller) -> R) -> Option<R> {
-    let g = probed_controller()?;
+    with_controller_at(0, f)
+}
+
+/// Run `f` against controller `instance`, if installed. The closure
+/// receives `&Controller` for read-only inspection (capacity, model,
+/// namespaces, ...).
+///
+/// Serialises on the slot's `req_gate`: the reference handed to `f` must
+/// not alias a live I/O path's `&mut Controller`, and the gate is what
+/// excludes those. Callers must not re-enter `with_controller*` from
+/// inside `f` for the same instance — the gate is not reentrant.
+pub fn with_controller_at<R>(instance: u32, f: impl FnOnce(&Controller) -> R) -> Option<R> {
+    let g = controller_at(instance)?;
     Some(f(&g))
 }
 
@@ -3279,18 +3699,28 @@ pub struct PassthruResult {
     pub result: u32,
 }
 
-/// Run an admin passthrough command against the probed controller.
-///
-/// Acquires exclusive controller access via the slot's `req_gate` (so it
-/// serialises against I/O, exactly like `with_controller`), runs the
-/// command, and returns the raw status + CQE DW0. `None` if no controller
-/// is probed. This is the entry point the `/dev/nvme0` char device's
-/// `ioctl_user` handler calls for `NVME_IOCTL_ADMIN_CMD`.
+/// Run an admin passthrough command against the first controller.
 pub fn admin_passthrough(
     cmd: &admin::AdminSqe,
     data: &mut [u8],
 ) -> Option<Result<PassthruResult, NvmeError>> {
-    let mut g = probed_controller()?;
+    admin_passthrough_at(0, cmd, data)
+}
+
+/// Run an admin passthrough command against controller `instance`.
+///
+/// Acquires exclusive controller access via the slot's `req_gate` (so it
+/// serialises against that controller's I/O, exactly like
+/// `with_controller_at`), runs the command, and returns the raw status +
+/// CQE DW0. `None` if the controller is not installed. This is the entry
+/// point the `/dev/nvme<C>` char device's `ioctl_user` handler calls for
+/// `NVME_IOCTL_ADMIN_CMD`.
+pub fn admin_passthrough_at(
+    instance: u32,
+    cmd: &admin::AdminSqe,
+    data: &mut [u8],
+) -> Option<Result<PassthruResult, NvmeError>> {
+    let mut g = controller_at(instance)?;
     Some(g.admin_passthrough(cmd, data))
 }
 

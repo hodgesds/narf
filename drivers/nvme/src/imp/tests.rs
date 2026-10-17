@@ -2101,7 +2101,7 @@ kernel_test_in!("drivers/nvme", smoke_security_send_receive_round_trip_qemu);
 /// re-probe, or be dropped.
 ///
 /// `probed_controller` copies the slot's `&'static` reference out
-/// under the CONTROLLER lock, releases the lock, and then uses that
+/// under the CONTROLLERS lock, releases the lock, and then uses that
 /// reference for the whole transfer — which is what lets an NVMe
 /// round-trip (up to a 5 s CQ poll) run with interrupts enabled
 /// instead of livelocking every other CPU on an IRQ-masking spinlock.

@@ -162,6 +162,39 @@ owned registry snapshot. The indexed form captures the registration-order index
 and device under the same registry lock so `devfs` can derive a coherent Linux
 minor number across concurrent hot-unplug.
 
+**Names and identity.** Registry names are Linux-like and follow enumeration
+order (`nvme0n1`, `nvme1n1`, ... in NVMe probe = PCI order; partitions
+`<disk>p<N>`), so they are **not** an identity. A disk's identity is its
+`DiskIdentity`, given at registration and inherited by its partitions:
+
+```rust
+pub struct DiskIdentity {
+    pub transport: &'static str, pub bus_path: String, pub controller: String,
+    pub model: String, pub serial: String, pub firmware: String,
+    pub vendor_id: u16, pub nsid: u32,
+    pub eui64: Option<[u8; 8]>, pub nguid: Option<[u8; 16]>, pub uuid: Option<[u8; 16]>,
+}
+impl DiskIdentity {
+    pub fn wwid(&self) -> String;              // Linux nvme wwid_show
+    pub fn by_id_names(&self) -> Vec<String>;  // udev 60-persistent-storage
+    pub fn by_path_name(&self) -> Option<String>;
+}
+pub fn register_block_device_with_identity(name: &'static str, dev, identity: DiskIdentity);
+pub fn identity_of(name: &str) -> Option<Arc<DiskIdentity>>;
+pub fn find_by_fs_uuid(uuid: &str) -> Option<RegisteredBlockDevice>;   // unique match only
+pub fn find_by_partuuid(uuid: &str) -> Option<RegisteredBlockDevice>;  // unique match only
+pub fn find_disk_by_bus_path(bus_path: &str, nsid: u32) -> Option<RegisteredBlockDevice>;
+// RegisteredBlockDevice { .., parent: Option<&'static str>, partno: Option<u32>,
+//                         identity: Option<Arc<DiskIdentity>> }
+pub fn registry::format_uuid_bytes(&[u8; 16]) -> String;
+```
+
+`discover_volume_uuid` also reports a btrfs `fsid` (superblock at 64 KiB).
+`DevFs` adds `/dev/disk/by-id` (`nvme-<model>_<serial>`,
+`nvme-<model>_<serial>_<nsid>`, `nvme-<wwid>`) and `/dev/disk/by-path`
+(`pci-<bdf>-nvme-<nsid>`), `-part<N>` for partitions; sysfs exposes `wwid`,
+`nsid`, `eui`, `nguid`, `uuid` and `device/{model,serial,firmware_rev}`.
+
 Every device entering the registry is wrapped in a
 `disk_policy::PolicyGuard`; `RegisteredBlockDevice::disk` is its physical-disk
 identity (`DiskId`, never reused), shared by a disk and the partitions the

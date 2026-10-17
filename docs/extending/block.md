@@ -60,8 +60,11 @@ pub fn register_block_device_with_meta(                     // block/src/registr
 );
 ```
 
-- `name` is a `'static str` set at registration (`"nvme0"`, `"vblk0"`,
-  `"sata0"` by convention; partitions get `"vblk0p1"` etc.).
+- `name` is a `'static str` set at registration (`"nvme0n1"`, `"vblk0"`,
+  `"sata0"` by convention; partitions get `"vblk0p1"`, `"nvme0n1p1"` etc.).
+  Names follow enumeration order and are not an identity; a driver that knows
+  its hardware identity registers through `register_block_device_with_identity`
+  (`DiskIdentity`) so consumers can find the disk regardless of order.
 - Registration is **idempotent on `name`** (`block/src/registry.rs:107`) — a
   re-bring-up replaces the entry rather than doubling it. It also reserves a
   default `IoScheduler` slot (a boxed `DeadlineScheduler`) for the device
