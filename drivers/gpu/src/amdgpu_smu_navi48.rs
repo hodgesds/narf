@@ -297,12 +297,21 @@ impl<I: Io> Engine<I> {
         self.state = State::Querying;
         let result = async {
             let interface = self.command(3, 0).await?;
-            if interface != DRIVER_INTERFACE {
-                return Err(Error::InterfaceMismatch(interface));
+            if interface == u32::MAX {
+                return Err(Error::DeviceGone);
             }
             let firmware = self.command(2, 0).await?;
             if firmware == 0 || firmware == u32::MAX {
                 return Err(Error::Invalid);
+            }
+            // smu_cmn_check_fw_version (smu_v14_0_2 .check_fw_version) only
+            // logs an interface mismatch; PMFW updates move it independently.
+            if interface != DRIVER_INTERFACE {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi48 smu driver if version = {DRIVER_INTERFACE:#010x}, smu fw if version = {interface:#010x}, smu fw version = {firmware:#010x}"
+                );
             }
             Ok(Versions {
                 firmware,

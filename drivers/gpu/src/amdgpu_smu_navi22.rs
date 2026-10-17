@@ -485,15 +485,22 @@ impl<I: Io> Engine<I> {
         if interface == u32::MAX {
             return Err(Error::DeviceGone);
         }
-        if interface != DRIVER_INTERFACE {
-            return Err(Error::InterfaceMismatch(interface));
-        }
         let firmware = self.query(GET_VERSION).await?;
         if firmware == u32::MAX {
             return Err(Error::DeviceGone);
         }
         if firmware == 0 {
             return Err(Error::Invalid);
+        }
+        // smu_cmn_check_fw_version (sienna_cichlid .check_fw_version) only
+        // logs the driver/firmware interface pair: shipping Navi22 PMFW
+        // 0x413f00 reports interface 0x12 against the driver's 0xe.
+        if interface != DRIVER_INTERFACE {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 smu driver if version = {DRIVER_INTERFACE:#010x}, smu fw if version = {interface:#010x}, smu fw version = {firmware:#010x}"
+            );
         }
         Ok(Versions {
             firmware,

@@ -246,7 +246,9 @@ fn engine() -> Engine<Fake> {
         io: Fake {
             response: 0,
             argument: 0xdeadbeef,
-            interface: DRIVER_INTERFACE,
+            // The host's RX 6750 XT: PMFW 0x413f00 reports interface 0x12
+            // while the driver (smu11_driver_if_sienna_cichlid.h) is 0xe.
+            interface: 0x12,
             firmware: 0x413f00,
             stall: None,
             reject: None,
@@ -288,7 +290,7 @@ fn smu_navi22_cold_mailbox_and_versions() -> TestResult {
     if run(e.verify())
         != Ok(Versions {
             firmware: 0x413f00,
-            interface: 0xe,
+            interface: 0x12,
         })
         || e.state != State::Ready
     {
@@ -340,17 +342,27 @@ kernel_test_in!(
     smu_navi22_waits_for_firmware_interrupts_before_first_message
 );
 
-fn smu_navi22_rejects_bad_interface_response_and_absent_device() -> TestResult {
-    for interface in [0, 0xd, 0xf, 0x40, u32::MAX] {
+fn smu_navi22_tolerates_interface_mismatch_rejects_absent_device() -> TestResult {
+    // smu_cmn_check_fw_version only logs the interface pair: any value but
+    // all-ones (device gone) proceeds to GET_VERSION and succeeds.
+    for interface in [0, 0xd, DRIVER_INTERFACE, 0xf, 0x12, 0x40, u32::MAX] {
         let mut e = engine();
         e.io.interface = interface;
-        let expected = if interface == u32::MAX {
-            Error::DeviceGone
-        } else {
-            Error::InterfaceMismatch(interface)
-        };
-        if run(e.verify()) != Err(expected) || e.state != State::Failed || e.io.writes.len() != 3 {
-            return TestResult::Fail("unsupported interface accepted or second query issued");
+        let result = run(e.verify());
+        if interface == u32::MAX {
+            if result != Err(Error::DeviceGone) || e.state != State::Failed || e.io.writes.len() != 3
+            {
+                return TestResult::Fail("absent device accepted or second query issued");
+            }
+        } else if result
+            != Ok(Versions {
+                firmware: 0x413f00,
+                interface,
+            })
+            || e.state != State::Ready
+            || e.io.writes.len() != 6
+        {
+            return TestResult::Fail("PMFW interface mismatch was fatal");
         }
     }
     for message in [GET_INTERFACE, GET_VERSION] {
@@ -388,7 +400,7 @@ fn smu_navi22_rejects_bad_interface_response_and_absent_device() -> TestResult {
 }
 kernel_test_in!(
     "drivers/gpu/smu-navi22",
-    smu_navi22_rejects_bad_interface_response_and_absent_device
+    smu_navi22_tolerates_interface_mismatch_rejects_absent_device
 );
 
 fn smu_navi22_timeout_cancellation_and_revocation() -> TestResult {
