@@ -14,7 +14,7 @@ states following the May 2026 relicensing to GPL-2.0:
 | Driver | Generation | Status | Mechanism |
 | :--- | :--- | :--- | :--- |
 | **iwlwifi** | AX210+ transport; Sc/BE211 MLD station profile | RX/TX and station implementation; silicon validation pending | Firmware self-load, RFH, command/data queues, Open/WPA2-PSK |
-| **ath11k** | Wi-Fi 6E | **Stage 2** (M0) | MHI State Machine, BHI AMSS load |
+| **ath11k** | Wi-Fi 6E | **Stage 0** (identify) | PCI match + hw_rev; MHI/QMI/WMI/DP not yet — see `ath11k.md` §5 |
 | **rtw88** | Wi-Fi 5 | **Stage 2** (FW Load) | RTL8822C IDDMA, MCU handshake |
 
 ## 1. Purpose & scope

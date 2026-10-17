@@ -20,21 +20,18 @@
 pub const QCOM_VENDOR: u16 = 0x17cb;
 
 // ── PCI device IDs ────────────────────────────────────────────────
-// QCA6390, QCN9074, WCN6855 are the canonical Linux entries; QCA2066
-// shares the WCN6855 PCI ID with a different sub-version. WCN7850
-// and QCN6122/QCN9224 are listed here because they appear in NARF's
-// real-hardware target table even though Linux's main `pci.c` table
-// is shorter.
+// Exactly Linux's `ath11k_pci_id_table` (`pci.c`). QCA2066 and
+// QCA6698AQ have no PCI id of their own: they enumerate as WCN6855
+// (`17cb:1103`) and are told apart by `TCSR_SOC_HW_SUB_VER`.
+// `17cb:1107` (WCN7850) and `17cb:1109` (QCN9274) belong to ath12k,
+// which shares none of ath11k's HAL/DP layout.
 pub const ATH11K_DEV_QCA6390: u16 = 0x1101;
 pub const ATH11K_DEV_WCN6855: u16 = 0x1103;
 pub const ATH11K_DEV_QCN9074: u16 = 0x1104;
-pub const ATH11K_DEV_QCA2066: u16 = 0x1105;
-pub const ATH11K_DEV_WCN7850: u16 = 0x1107;
-pub const ATH11K_DEV_QCN6122: u16 = 0x1109;
 
 /// Hardware revision tag — drives per-chip register/MHI/DP config.
-/// Cribbed verbatim from Linux `enum ath11k_hw_rev`, plus a stable
-/// `Unknown` so probe can report devices we haven't tabulated yet.
+/// The PCI-attached subset of Linux `enum ath11k_hw_rev`, plus
+/// `Unknown` for a stepping `ath11k_pci_probe` rejects.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HwRev {
     Qca6390Hw20,
@@ -42,8 +39,7 @@ pub enum HwRev {
     Wcn6855Hw20,
     Wcn6855Hw21,
     Qca2066Hw21,
-    Wcn7850Hw20,
-    Qcn6122Hw10,
+    Qca6698aqHw21,
     Unknown,
 }
 
@@ -55,10 +51,23 @@ impl HwRev {
             HwRev::Wcn6855Hw20 => "WCN6855 HW2.0",
             HwRev::Wcn6855Hw21 => "WCN6855 HW2.1",
             HwRev::Qca2066Hw21 => "QCA2066 HW2.1",
-            HwRev::Wcn7850Hw20 => "WCN7850 HW2.0",
-            HwRev::Qcn6122Hw10 => "QCN6122 HW1.0",
+            HwRev::Qca6698aqHw21 => "QCA6698AQ HW2.1",
             HwRev::Unknown => "ath11k unknown",
         }
+    }
+
+    /// Firmware directory under `ath11k/` — `hw_params.fw.dir` in
+    /// Linux `core.c::ath11k_hw_params`. `None` for `Unknown`.
+    pub fn fw_dir(self) -> Option<&'static str> {
+        Some(match self {
+            HwRev::Qca6390Hw20 => "QCA6390/hw2.0",
+            HwRev::Qcn9074Hw10 => "QCN9074/hw1.0",
+            HwRev::Wcn6855Hw20 => "WCN6855/hw2.0",
+            HwRev::Wcn6855Hw21 => "WCN6855/hw2.1",
+            HwRev::Qca2066Hw21 => "QCA2066/hw2.1",
+            HwRev::Qca6698aqHw21 => "QCA6698AQ/hw2.1",
+            HwRev::Unknown => return None,
+        })
     }
 }
 
@@ -74,8 +83,7 @@ pub struct ChipInfo {
 }
 
 /// Match a PCI vendor/device pair to a ChipInfo entry. Returns
-/// `None` if not an ath11k part. The TCSR-derived HwRev refinement
-/// (e.g. WCN6855 1.0 vs 2.0 vs QCA2066) lands with Stage-1.
+/// `None` if not an ath11k part.
 pub fn chip_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
     if vid != QCOM_VENDOR {
         return None;
@@ -90,7 +98,7 @@ pub fn chip_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
         ATH11K_DEV_WCN6855 => ChipInfo {
             vid,
             did,
-            display_name: "WCN6855/QCA2066",
+            display_name: "WCN6855",
             default_hw_rev: HwRev::Wcn6855Hw20,
         },
         ATH11K_DEV_QCN9074 => ChipInfo {
@@ -99,37 +107,12 @@ pub fn chip_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
             display_name: "QCN9074",
             default_hw_rev: HwRev::Qcn9074Hw10,
         },
-        ATH11K_DEV_QCA2066 => ChipInfo {
-            vid,
-            did,
-            display_name: "QCA2066",
-            default_hw_rev: HwRev::Qca2066Hw21,
-        },
-        ATH11K_DEV_WCN7850 => ChipInfo {
-            vid,
-            did,
-            display_name: "WCN7850",
-            default_hw_rev: HwRev::Wcn7850Hw20,
-        },
-        ATH11K_DEV_QCN6122 => ChipInfo {
-            vid,
-            did,
-            display_name: "QCN6122/QCN9224",
-            default_hw_rev: HwRev::Qcn6122Hw10,
-        },
         _ => return None,
     })
 }
 
 /// Bare PCI ID table used to register matches.
-pub const ALL_DEV_IDS: &[u16] = &[
-    ATH11K_DEV_QCA6390,
-    ATH11K_DEV_WCN6855,
-    ATH11K_DEV_QCN9074,
-    ATH11K_DEV_QCA2066,
-    ATH11K_DEV_WCN7850,
-    ATH11K_DEV_QCN6122,
-];
+pub const ALL_DEV_IDS: &[u16] = &[ATH11K_DEV_QCA6390, ATH11K_DEV_WCN6855, ATH11K_DEV_QCN9074];
 
 /// Per-PCI-ID match name. The PCI driver-match registry is keyed
 /// by `name`, so each entry needs its own — collapsing them all to
@@ -139,9 +122,6 @@ pub const fn name_for(did: u16) -> &'static str {
         ATH11K_DEV_QCA6390 => "ath11k-qca6390",
         ATH11K_DEV_WCN6855 => "ath11k-wcn6855",
         ATH11K_DEV_QCN9074 => "ath11k-qcn9074",
-        ATH11K_DEV_QCA2066 => "ath11k-qca2066",
-        ATH11K_DEV_WCN7850 => "ath11k-wcn7850",
-        ATH11K_DEV_QCN6122 => "ath11k-qcn6122",
         _ => "ath11k",
     }
 }
@@ -170,22 +150,32 @@ pub const TCSR_SOC_HW_VERSION_MAJOR_SHIFT: u32 = 8;
 pub const TCSR_SOC_HW_VERSION_MINOR_MASK: u32 = 0x0000_00FF;
 pub const TCSR_SOC_HW_SUB_VER: u32 = 0x1910010;
 
-/// Decode the TCSR major-minor pair into a refined `HwRev`. Mirrors
-/// the per-PCI-ID switch in `ath11k_pci_probe` — Linux infers
-/// HW2.0 vs HW2.1 etc. from the major/minor pair.
-pub fn refine_hw_rev(did: u16, major: u32, minor: u32) -> HwRev {
+/// Decode the TCSR major/minor pair (plus, for WCN6855 HW2.1-class
+/// parts, the `TCSR_SOC_HW_SUB_VER` word) into a `HwRev`. Mirrors
+/// the per-PCI-ID switch in Linux `pci.c::ath11k_pci_probe`.
+/// `sub_version` is consulted only for WCN6855 minor 0x10/0x11;
+/// steppings Linux rejects (`unsupported_*_soc`) map to `Unknown`.
+pub fn refine_hw_rev(did: u16, major: u32, minor: u32, sub_version: u32) -> HwRev {
     match did {
-        ATH11K_DEV_QCA6390 => HwRev::Qca6390Hw20,
+        ATH11K_DEV_QCA6390 => match major {
+            2 => HwRev::Qca6390Hw20,
+            _ => HwRev::Unknown,
+        },
         ATH11K_DEV_QCN9074 => HwRev::Qcn9074Hw10,
         ATH11K_DEV_WCN6855 => match (major, minor) {
-            (2, 0) => HwRev::Wcn6855Hw20,
-            (2, 1) => HwRev::Wcn6855Hw21,
-            (2, m) if m >= 0x10 => HwRev::Qca2066Hw21,
-            _ => HwRev::Wcn6855Hw20,
+            (2, 0x00 | 0x01) => HwRev::Wcn6855Hw20,
+            (2, 0x10 | 0x11) => match sub_version {
+                0x1019_A0E1 | 0x1019_B0E1 | 0x1019_C0E1 | 0x1019_D0E1 => HwRev::Qca2066Hw21,
+                0x001E_60E1 => HwRev::Qca6698aqHw21,
+                _ => HwRev::Wcn6855Hw21,
+            },
+            _ => HwRev::Unknown,
         },
-        ATH11K_DEV_QCA2066 => HwRev::Qca2066Hw21,
-        ATH11K_DEV_WCN7850 => HwRev::Wcn7850Hw20,
-        ATH11K_DEV_QCN6122 => HwRev::Qcn6122Hw10,
         _ => HwRev::Unknown,
     }
+}
+
+/// True when `refine_hw_rev` needs the `TCSR_SOC_HW_SUB_VER` word.
+pub fn needs_sub_version(did: u16, major: u32, minor: u32) -> bool {
+    did == ATH11K_DEV_WCN6855 && major == 2 && matches!(minor, 0x10 | 0x11)
 }

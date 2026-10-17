@@ -55,9 +55,6 @@ fn smoke_ath11k_name_for_known_ids() -> TestResult {
     if name_for(ATH11K_DEV_WCN6855) != "ath11k-wcn6855" {
         return TestResult::Fail("wcn6855 name mismatch");
     }
-    if name_for(ATH11K_DEV_WCN7850) != "ath11k-wcn7850" {
-        return TestResult::Fail("wcn7850 name mismatch");
-    }
     if name_for(0xFFFF) != "ath11k" {
         return TestResult::Fail("default name mismatch");
     }
@@ -68,20 +65,29 @@ kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_name_for_known_ids);
 // ── ChipInfo decode ────────────────────────────────────────────────
 
 fn smoke_ath11k_chip_for_pci_id_known_pairs() -> TestResult {
-    let qca = chip_for_pci_id(QCOM_VENDOR, ATH11K_DEV_QCA6390).expect("qca6390");
-    if qca.default_hw_rev != HwRev::Qca6390Hw20 {
-        return TestResult::Fail("QCA6390 default hw_rev mismatch");
+    // Positive: every Linux `ath11k_pci_id_table` entry resolves.
+    for &(did, rev) in &[
+        (ATH11K_DEV_QCA6390, HwRev::Qca6390Hw20),
+        (ATH11K_DEV_WCN6855, HwRev::Wcn6855Hw20),
+        (ATH11K_DEV_QCN9074, HwRev::Qcn9074Hw10),
+    ] {
+        match chip_for_pci_id(QCOM_VENDOR, did) {
+            Some(c) if c.did == did && c.default_hw_rev == rev => {}
+            _ => return TestResult::Fail("ath11k PCI id did not resolve to its ChipInfo"),
+        }
     }
-    if qca.display_name != "QCA6390" {
-        return TestResult::Fail("QCA6390 display_name mismatch");
+    // Negative: ath12k parts (WCN7850 1107, QCN9274 1109) and the
+    // never-assigned 1105 are not ath11k; nor is a non-Qualcomm vid.
+    for &did in &[0x1105u16, 0x1107, 0x1109] {
+        if chip_for_pci_id(QCOM_VENDOR, did).is_some() {
+            return TestResult::Fail("ath11k claimed a non-ath11k Qualcomm PCI id");
+        }
     }
-    let none = chip_for_pci_id(0x8086, 0x2723);
-    if none.is_some() {
-        return TestResult::Fail("Intel PCI id should not match ath11k");
+    if chip_for_pci_id(0x8086, ATH11K_DEV_WCN6855).is_some() {
+        return TestResult::Fail("ath11k claimed a non-Qualcomm vendor id");
     }
-    let none2 = chip_for_pci_id(QCOM_VENDOR, 0x0000);
-    if none2.is_some() {
-        return TestResult::Fail("unknown Qualcomm device id should not match");
+    if ALL_DEV_IDS.len() != 3 {
+        return TestResult::Fail("ath11k match table is not exactly Linux's three ids");
     }
     TestResult::Pass
 }
@@ -91,21 +97,58 @@ kernel_test_in!(
 );
 
 fn smoke_ath11k_refine_hw_rev_wcn6855_subversions() -> TestResult {
-    // WCN6855 2.0 stays WCN6855 2.0.
-    if refine_hw_rev(ATH11K_DEV_WCN6855, 2, 0) != HwRev::Wcn6855Hw20 {
-        return TestResult::Fail("WCN6855 major=2 minor=0 not classified as HW2.0");
+    // Linux `ath11k_pci_probe`: WCN6855 major 2, minor 0x00/0x01 → HW2.0.
+    for minor in [0x00, 0x01] {
+        if refine_hw_rev(ATH11K_DEV_WCN6855, 2, minor, 0) != HwRev::Wcn6855Hw20 {
+            return TestResult::Fail("WCN6855 2.0x not classified as HW2.0");
+        }
+        if needs_sub_version(ATH11K_DEV_WCN6855, 2, minor) {
+            return TestResult::Fail("WCN6855 HW2.0 should not read TCSR_SOC_HW_SUB_VER");
+        }
     }
-    // 2.1 → WCN6855 2.1.
-    if refine_hw_rev(ATH11K_DEV_WCN6855, 2, 1) != HwRev::Wcn6855Hw21 {
-        return TestResult::Fail("WCN6855 major=2 minor=1 not classified as HW2.1");
+    // minor 0x10/0x11 → classify by TCSR_SOC_HW_SUB_VER.
+    for minor in [0x10, 0x11] {
+        if !needs_sub_version(ATH11K_DEV_WCN6855, 2, minor) {
+            return TestResult::Fail("WCN6855 2.1x must read TCSR_SOC_HW_SUB_VER");
+        }
+        for sub in [0x1019_A0E1, 0x1019_B0E1, 0x1019_C0E1, 0x1019_D0E1] {
+            if refine_hw_rev(ATH11K_DEV_WCN6855, 2, minor, sub) != HwRev::Qca2066Hw21 {
+                return TestResult::Fail("QCA2066 sub-version not classified as QCA2066");
+            }
+        }
+        if refine_hw_rev(ATH11K_DEV_WCN6855, 2, minor, 0x001E_60E1) != HwRev::Qca6698aqHw21 {
+            return TestResult::Fail("QCA6698AQ sub-version not classified as QCA6698AQ");
+        }
+        if refine_hw_rev(ATH11K_DEV_WCN6855, 2, minor, 0x1234_5678) != HwRev::Wcn6855Hw21 {
+            return TestResult::Fail("other sub-version not classified as WCN6855 HW2.1");
+        }
     }
-    // 2.16+ → QCA2066 (the rebadged WCN6855 variant).
-    if refine_hw_rev(ATH11K_DEV_WCN6855, 2, 0x12) != HwRev::Qca2066Hw21 {
-        return TestResult::Fail("WCN6855 major=2 minor>=0x10 not classified as QCA2066");
+    // Steppings Linux rejects (`unsupported_wcn6855_soc`).
+    if refine_hw_rev(ATH11K_DEV_WCN6855, 2, 0x12, 0x1019_A0E1) != HwRev::Unknown {
+        return TestResult::Fail("WCN6855 minor 0x12 must be unsupported, as in Linux");
     }
-    // Unrelated PCI ID always falls through.
-    if refine_hw_rev(0x9999, 0, 0) != HwRev::Unknown {
+    if refine_hw_rev(ATH11K_DEV_WCN6855, 1, 0, 0) != HwRev::Unknown {
+        return TestResult::Fail("WCN6855 major 1 must be unsupported, as in Linux");
+    }
+    if refine_hw_rev(ATH11K_DEV_QCA6390, 3, 0, 0) != HwRev::Unknown {
+        return TestResult::Fail("QCA6390 major != 2 must be unsupported, as in Linux");
+    }
+    if refine_hw_rev(0x9999, 0, 0, 0) != HwRev::Unknown {
         return TestResult::Fail("unknown PCI id should produce HwRev::Unknown");
+    }
+    // Firmware dirs = Linux `hw_params.fw.dir`.
+    for (rev, dir) in [
+        (HwRev::Wcn6855Hw20, "WCN6855/hw2.0"),
+        (HwRev::Wcn6855Hw21, "WCN6855/hw2.1"),
+        (HwRev::Qca2066Hw21, "QCA2066/hw2.1"),
+        (HwRev::Qca6698aqHw21, "QCA6698AQ/hw2.1"),
+    ] {
+        if rev.fw_dir() != Some(dir) {
+            return TestResult::Fail("hw_rev firmware dir differs from Linux hw_params");
+        }
+    }
+    if HwRev::Unknown.fw_dir().is_some() {
+        return TestResult::Fail("HwRev::Unknown must have no firmware dir");
     }
     TestResult::Pass
 }
@@ -128,6 +171,19 @@ fn smoke_ath11k_window_constants_consistent() -> TestResult {
     // Enable bit is bit 30.
     if ATH11K_PCI_WINDOW_ENABLE_BIT != 1u32 << 30 {
         return TestResult::Fail("window enable bit not at bit 30");
+    }
+    // Linux `ath11k_pci_select_window` writes the window *number*
+    // (FIELD_GET of bits[24:19]), not the shifted field. 0x1910010
+    // (TCSR_SOC_HW_SUB_VER) lives in window 0x32.
+    use super::pci::{window_of, window_select_value, windowed_bar_offset};
+    if window_of(TCSR_SOC_HW_SUB_VER) != 0x32 {
+        return TestResult::Fail("window_of(0x1910010) != 0x32");
+    }
+    if window_select_value(TCSR_SOC_HW_SUB_VER) != (1 << 30) | 0x32 {
+        return TestResult::Fail("window select must write ENABLE | window number");
+    }
+    if windowed_bar_offset(TCSR_SOC_HW_SUB_VER) != 0x80000 + 0x10010 {
+        return TestResult::Fail("windowed BAR offset wrong for 0x1910010");
     }
     TestResult::Pass
 }
