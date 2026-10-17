@@ -149,6 +149,10 @@ HEADER_SETS = {
                   AMD + "/display/dc/clk_mgr/dcn30/dcn30_clk_mgr.h",
                   AMD + "/display/dc/clk_mgr/dcn30/dcn30_clk_mgr_smu_msg.c",
                   AMD + "/display/dc/dce/dce_aux.h", AMD + "/display/dc/dce/dce_i2c_hw.h",
+                  AMD + "/display/dc/link/protocols/link_ddc.h", AMD + "/display/include/dpcd_defs.h",
+                  AMD + "/display/dc/link/protocols/link_dp_training_8b_10b.h",
+                  AMD + "/display/dc/link/protocols/link_dp_training.c",
+                  AMD + "/display/dc/link/link_dpms.c", AMD + "/display/dc/link/link_detection.c",
                   "include/drm/drm_edid.h", "include/linux/hdmi.h"]),
 }
 # Lookup priority when a symbol exists in several sets with different values.
