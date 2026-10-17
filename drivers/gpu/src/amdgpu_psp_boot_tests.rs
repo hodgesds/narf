@@ -406,6 +406,8 @@ struct Fake {
     images: Vec<Vec<u8>>,
     /// STATUS reads that report DONE with nonzero low bits before settling.
     busy: usize,
+    /// Model milliseconds: each read of the clock is one 1 ms poll.
+    clock: u64,
 }
 impl Io for Fake {
     fn read(&mut self, reg: u32) -> u32 {
@@ -451,6 +453,10 @@ impl Io for Fake {
     fn finish_upload(&mut self) {
         self.dirty = false;
     }
+    fn now_ms(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
 }
 fn map() -> MmioRegion {
     MmioRegion {
@@ -479,6 +485,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
         writes: Vec::new(),
         images: Vec::new(),
         busy: 0,
+        clock: 0,
     };
     (
         pool,
