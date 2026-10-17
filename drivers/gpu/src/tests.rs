@@ -2574,7 +2574,8 @@ kernel_test_in!(
 fn smoke_amdgpu_psp_ring_create_sequence() -> TestResult {
     use crate::amdgpu_psp::{
         gfx_ctrl_cmd_id, ring_control, ring_create, MockPsp, PspError, MP0_C2PMSG_64_REL,
-        MP0_C2PMSG_69_REL, MP0_C2PMSG_70_REL, MP0_C2PMSG_71_REL, PSP_STATUS_DONE_BIT,
+        MP0_C2PMSG_69_REL, MP0_C2PMSG_70_REL, MP0_C2PMSG_71_REL, PSP_RING_TYPE_KM,
+        PSP_STATUS_DONE_BIT,
     };
     let mp0_base = 0x000B_0000;
     let ready = mp0_base + MP0_C2PMSG_64_REL;
@@ -2585,7 +2586,7 @@ fn smoke_amdgpu_psp_ring_create_sequence() -> TestResult {
     m.stage_read(ready, PSP_STATUS_DONE_BIT);
 
     let ring_phys: u64 = 0xDEAD_BEEF_0000_1000;
-    if ring_create(&mut m, mp0_base, ring_phys, 0x1000, 1).is_err() {
+    if ring_create(&mut m, mp0_base, ring_phys, 0x1000, PSP_RING_TYPE_KM).is_err() {
         return TestResult::Fail("ring create errored on happy path");
     }
     if m.writes.len() != 4 {
@@ -2600,9 +2601,10 @@ fn smoke_amdgpu_psp_ring_create_sequence() -> TestResult {
     if m.writes[2] != (mp0_base + MP0_C2PMSG_71_REL, 0x1000) {
         return TestResult::Fail("ring size in bytes goes to C2PMSG_71");
     }
-    // The ring type is shifted into bits 31:16.
-    if m.writes[3] != (ready, 0x0001_0000) {
-        return TestResult::Fail("ring type is written to C2PMSG_64 shifted left sixteen");
+    // The KM ring type is shifted into bits 31:16: INIT_GPCOM_RING, never
+    // INIT_RBI_RING (0x0001_0000).
+    if m.writes[3] != (ready, 0x0002_0000) || gfx_ctrl_cmd_id::INIT_GPCOM_RING != 0x0002_0000 {
+        return TestResult::Fail("KM ring type is written to C2PMSG_64 shifted left sixteen");
     }
 
     // GFX_CTRL_CMD_ID values are already positioned in bits 31:16, so a
@@ -2618,7 +2620,7 @@ fn smoke_amdgpu_psp_ring_create_sequence() -> TestResult {
 
     // Nothing ready: the wait must time out rather than publish the ring.
     let mut m = MockPsp::new();
-    match ring_create(&mut m, mp0_base, 0x1000, 0x1000, 1) {
+    match ring_create(&mut m, mp0_base, 0x1000, 0x1000, PSP_RING_TYPE_KM) {
         Err(PspError::Timeout) => {}
         _ => return TestResult::Fail("expected a timeout when sOS never signals ready"),
     }

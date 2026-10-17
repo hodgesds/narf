@@ -18,8 +18,12 @@ const RING_HI: u32 = 0x86;
 const RING_SIZE: u32 = 0x87;
 const SOS: u32 = 0x91;
 const RESPONSE: u32 = 1 << 31;
-const CREATE: u32 = 1 << 16;
-const DESTROY: u32 = 3 << 16;
+/// psp_v{11_0,13_0,13_0_4,14_0}_ring_create write `ring_type << 16` with
+/// `PSP_RING_TYPE__KM` (2, formerly GPCOM), i.e. GFX_CTRL_CMD_ID_INIT_GPCOM_RING.
+/// `1 << 16` would be INIT_RBI_RING, the user-mode ring.
+const CREATE: u32 = crate::amdgpu_psp::gfx_ctrl_cmd_id::INIT_GPCOM_RING;
+/// GFX_CTRL_CMD_ID_DESTROY_RINGS (psp_v*_ring_stop).
+const DESTROY: u32 = crate::amdgpu_psp::gfx_ctrl_cmd_id::DESTROY_RINGS;
 const COMMAND: u64 = 4096;
 const FENCE: u64 = 8192;
 const BUFFER_SIZE: u64 = 12288;

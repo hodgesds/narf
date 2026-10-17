@@ -35,7 +35,8 @@ impl Io for Fake {
     fn write(&mut self, reg: u32, value: u32) {
         self.writes.push((reg, value));
         self.regs[reg as usize] = value;
-        if reg == CTRL && (value == CREATE || value == DESTROY && self.destroy) {
+        // Literal Linux values: KM ring create 2 << 16, DESTROY_RINGS 3 << 16.
+        if reg == CTRL && (value == 0x0002_0000 || value == 0x0003_0000 && self.destroy) {
             self.regs[CTRL as usize] = RESPONSE;
         }
         if reg == WPTR {
@@ -172,7 +173,7 @@ fn psp_ring_linux_wire_and_wrap() -> TestResult {
             (RING_LO, address as u32),
             (RING_HI, (address >> 32) as u32),
             (RING_SIZE, 4096),
-            (CTRL, CREATE),
+            (CTRL, 0x0002_0000),
         ]
     }) {
         return TestResult::Fail("Linux mailbox sequence");
