@@ -945,6 +945,39 @@ impl Gfx {
     pub fn state(&self) -> GfxState {
         self.engine.state
     }
+    /// Queue client IBs under a user VMID (`amdgpu_navi22_submit`); only on
+    /// a ring whose ring and IB tests passed. `Busy` means two submissions
+    /// are outstanding: wait for [`Gfx::throttle_seq`] and retry.
+    pub fn submit(
+        &mut self,
+        state: &mut crate::amdgpu_navi22_submit::RingState,
+        vm: crate::amdgpu_navi22_submit::VmRef,
+        context: u64,
+        ibs: &[crate::amdgpu_navi22_submit::Ib],
+    ) -> Result<u32, Error> {
+        if self.engine.state != GfxState::Verified {
+            return Err(Error::Busy);
+        }
+        let e = &mut self.engine;
+        crate::amdgpu_navi22_submit::submit(
+            &mut e.hw,
+            &mut e.queue,
+            state,
+            crate::amdgpu_navi22_submit::Ring::Gfx,
+            vm,
+            context,
+            ibs,
+        )
+    }
+    /// Last fence sequence the ring wrote, and the one a new submission
+    /// must wait for.
+    pub fn fences(&mut self) -> Result<(u32, u32), Error> {
+        let e = &mut self.engine;
+        Ok((
+            crate::amdgpu_navi22_submit::completed(&mut e.hw, &e.queue)?,
+            crate::amdgpu_navi22_submit::throttle_seq(&e.queue),
+        ))
+    }
     pub fn proof(&self) -> GfxProof {
         self.engine.proof
     }

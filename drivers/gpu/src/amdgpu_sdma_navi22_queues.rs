@@ -318,6 +318,38 @@ impl Sdma {
     pub fn state(&self) -> State {
         self.engine.state
     }
+    /// Client IBs on SDMA `instance` (0 or 1); see `Gfx::submit`.
+    pub fn submit(
+        &mut self,
+        instance: u8,
+        state: &mut crate::amdgpu_navi22_submit::RingState,
+        vm: crate::amdgpu_navi22_submit::VmRef,
+        context: u64,
+        ibs: &[crate::amdgpu_navi22_submit::Ib],
+    ) -> Result<u32, Error> {
+        if self.engine.state != State::Verified || instance > 1 {
+            return Err(Error::Busy);
+        }
+        let e = &mut self.engine;
+        crate::amdgpu_navi22_submit::submit(
+            &mut e.hw,
+            &mut e.queues[usize::from(instance)],
+            state,
+            crate::amdgpu_navi22_submit::Ring::Sdma(instance),
+            vm,
+            context,
+            ibs,
+        )
+    }
+    /// See `Gfx::fences`.
+    pub fn fences(&mut self, instance: u8) -> Result<(u32, u32), Error> {
+        let e = &mut self.engine;
+        let q = e.queues.get(usize::from(instance)).ok_or(Error::Invalid)?;
+        Ok((
+            crate::amdgpu_navi22_submit::completed(&mut e.hw, q)?,
+            crate::amdgpu_navi22_submit::throttle_seq(q),
+        ))
+    }
     pub fn proof(&self) -> Proof {
         self.engine.proof
     }

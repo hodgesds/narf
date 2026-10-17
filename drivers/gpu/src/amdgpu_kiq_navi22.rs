@@ -352,6 +352,36 @@ impl Compute {
     pub fn state(&self) -> State {
         self.engine.state
     }
+    /// Client IBs on the kernel compute queue; see `Gfx::submit`.
+    pub fn submit(
+        &mut self,
+        state: &mut crate::amdgpu_navi22_submit::RingState,
+        vm: crate::amdgpu_navi22_submit::VmRef,
+        context: u64,
+        ibs: &[crate::amdgpu_navi22_submit::Ib],
+    ) -> Result<u32, Error> {
+        if self.engine.state != State::Verified {
+            return Err(Error::Busy);
+        }
+        let e = &mut self.engine;
+        crate::amdgpu_navi22_submit::submit(
+            &mut e.hw,
+            &mut e.compute,
+            state,
+            crate::amdgpu_navi22_submit::Ring::Compute,
+            vm,
+            context,
+            ibs,
+        )
+    }
+    /// See `Gfx::fences`.
+    pub fn fences(&mut self) -> Result<(u32, u32), Error> {
+        let e = &mut self.engine;
+        Ok((
+            crate::amdgpu_navi22_submit::completed(&mut e.hw, &e.compute)?,
+            crate::amdgpu_navi22_submit::throttle_seq(&e.compute),
+        ))
+    }
     pub fn proof(&self) -> Proof {
         self.engine.proof
     }

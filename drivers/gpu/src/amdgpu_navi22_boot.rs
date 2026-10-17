@@ -1495,6 +1495,54 @@ impl ColdBoot {
         self.sequence.state = State::Released;
         Ok(psp)
     }
+    /// Queue client IBs on a verified kernel queue under `vm`
+    /// (`amdgpu_navi22_submit`). `Busy` means the ring already has two
+    /// submissions outstanding; wait for [`ColdBoot::fences`]'s throttle
+    /// sequence (without holding this owner) and retry.
+    pub fn submit(
+        &mut self,
+        ring: crate::amdgpu_navi22_submit::Ring,
+        state: &mut crate::amdgpu_navi22_submit::RingState,
+        vm: crate::amdgpu_navi22_submit::VmRef,
+        context: u64,
+        ibs: &[crate::amdgpu_navi22_submit::Ib],
+    ) -> Result<u32, Error> {
+        use crate::amdgpu_navi22_submit::Ring;
+        if !self.queues_verified() {
+            return Err(Error::Busy);
+        }
+        let queues = self
+            .sequence
+            .backend
+            .queues
+            .as_mut()
+            .ok_or(Error::Invalid)?;
+        match ring {
+            Ring::Gfx => queues.gfx.submit(state, vm, context, ibs),
+            Ring::Compute => queues.compute.submit(state, vm, context, ibs),
+            Ring::Sdma(i) => queues.sdma.submit(i, state, vm, context, ibs),
+        }
+        .map_err(Error::Queues)
+    }
+    /// (last completed, throttle) fence sequences of `ring`.
+    pub fn fences(&mut self, ring: crate::amdgpu_navi22_submit::Ring) -> Result<(u32, u32), Error> {
+        use crate::amdgpu_navi22_submit::Ring;
+        if !self.queues_verified() {
+            return Err(Error::Busy);
+        }
+        let queues = self
+            .sequence
+            .backend
+            .queues
+            .as_mut()
+            .ok_or(Error::Invalid)?;
+        match ring {
+            Ring::Gfx => queues.gfx.fences(),
+            Ring::Compute => queues.compute.fences(),
+            Ring::Sdma(i) => queues.sdma.fences(i),
+        }
+        .map_err(Error::Queues)
+    }
 }
 
 #[cfg(feature = "kernel-test")]

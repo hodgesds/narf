@@ -89,7 +89,18 @@ pub(crate) struct Model {
     rptr: [u64; 5],
     pub progress: Arc<AtomicU32>,
     pub revoke: Option<(u64, u32, Cap<BusDeviceCap, Write>)>,
+    /// User VMIDs: 4 KiB VA page -> MC page (the GMC10 walk is modelled in
+    /// the vm owner's tests; here only its result).
+    pub vms: BTreeMap<u8, BTreeMap<u64, u64>>,
+    /// (invalidation engine, VMID) per completed ring-side TLB flush.
+    pub flushes: Vec<(u32, u8)>,
+    /// (ring engine, VMID) per executed client IB.
+    pub user_ibs: Vec<(usize, u8)>,
 }
+/// GCVM PTB / invalidation registers used by ring-side VM flushes.
+const PTB_LO: u64 = GC0 + 0x1667 * 4;
+const INV_REQ: u64 = GC0 + 0x161f * 4;
+const INV_ACK: u64 = GC0 + 0x1631 * 4;
 fn mc(map: MmioRegion, offset: u64) -> u64 {
     map.phys.raw() - PHYS + MC + offset
 }
@@ -125,6 +136,44 @@ impl Model {
             rptr: [0; 5],
             progress: Arc::new(AtomicU32::new(0)),
             revoke: None,
+            vms: BTreeMap::new(),
+            flushes: Vec::new(),
+            user_ibs: Vec::new(),
+        }
+    }
+    /// Translate an engine access made under `vmid`. A user VMID must have
+    /// been flushed on a ring with the page-table base the test installed
+    /// in `vms` (`PTB` key u64::MAX), and the page must be mapped.
+    fn gpu(&self, vmid: u8, va: u64) -> u64 {
+        if vmid == 0 {
+            return va;
+        }
+        let vm = self.vms.get(&vmid).expect("IB under an unknown VMID");
+        let ptb = u64::from(self.reg(PTB_LO + u64::from(vmid) * 8))
+            | (u64::from(self.reg(PTB_LO + u64::from(vmid) * 8 + 4)) << 32);
+        assert_eq!(Some(&ptb), vm.get(&u64::MAX), "stale page-table base");
+        assert!(
+            self.flushes.iter().any(|&(_, v)| v == vmid),
+            "user VMID used before a ring TLB flush"
+        );
+        let page = vm.get(&(va & !0xfff)).expect("GPU page fault in the model");
+        page + (va & 0xfff)
+    }
+    /// Register write performed by an engine; an invalidation request
+    /// acknowledges its per-VMID bits on the same engine.
+    fn engine_wreg(&mut self, dword: u32, value: u32) {
+        let address = u64::from(dword) * 4;
+        self.regs.insert(address, value);
+        if (INV_REQ..INV_REQ + 18 * 4).contains(&address) {
+            let eng = ((address - INV_REQ) / 4) as u32;
+            assert_eq!(value & 0xf8_0000, 0xf8_0000, "legacy L1/L2 invalidation");
+            self.regs
+                .insert(INV_ACK + u64::from(eng) * 4, value & 0xffff);
+            for vmid in 0..16u8 {
+                if value & (1 << vmid) != 0 {
+                    self.flushes.push((eng, vmid));
+                }
+            }
         }
     }
     pub(crate) fn reg(&self, address: u64) -> u32 {
@@ -171,18 +220,13 @@ impl Model {
         }
         address
     }
-    fn linear(&self, address: u64, dwords: u32) -> Vec<u32> {
-        (0..u64::from(dwords))
-            .map(|i| self.word(address + i * 4))
-            .collect()
-    }
     fn ring(&self, base: u64, size_dw: u64, from: u64, to: u64) -> Vec<u32> {
         (from..to)
             .map(|i| self.word(base + (i % size_dw) * 4))
             .collect()
     }
     /// PM4 type-3 decoder. `engine`: 0 gfx, 1 KIQ, 2 compute.
-    fn pm4(&mut self, words: &[u32], engine: usize, ib: bool) {
+    fn pm4(&mut self, words: &[u32], engine: usize, ib: bool, vmid: u8) {
         let mut i = 0;
         while i < words.len() {
             let h = words[i];
@@ -201,13 +245,55 @@ impl Model {
                     let reg = 0xc000 + body[0];
                     self.regs.insert(u64::from(reg) * 4, body[1]);
                 }
+                0x37 if body[0] & 0xf00 == 0 => {
+                    // WRITE_DATA to a register: ENGINE_SEL(1) on gfx only.
+                    let want = if engine == 0 {
+                        (1 << 30) | (1 << 20)
+                    } else {
+                        1 << 20
+                    };
+                    assert_eq!(body[0], want, "register WRITE_DATA engine/confirm");
+                    assert!(!ib, "register write from a client IB");
+                    self.engine_wreg(body[1], body[3]);
+                }
                 0x37 => {
                     assert_eq!(body[0], (5 << 8) | (1 << 20));
                     if !(ib && self.drop_ib_writes) {
                         let address = u64::from(body[1]) | (u64::from(body[2]) << 32);
+                        let address = self.gpu(vmid, address);
                         self.put(address, body[3]);
                     }
                 }
+                0x3c => {
+                    let (space, op) = ((body[0] >> 4) & 3, (body[0] >> 6) & 3);
+                    assert_eq!(body[0] & 0xf, 3, "WAIT_REG_MEM equal");
+                    assert_eq!(
+                        (body[0] >> 8) & 1,
+                        u32::from(engine == 0),
+                        "PFP on gfx only"
+                    );
+                    match (space, op) {
+                        (1, 0) => {
+                            let address = u64::from(body[1]) | (u64::from(body[2]) << 32);
+                            assert_eq!(
+                                self.word(address) & body[4],
+                                body[3],
+                                "pipeline sync would hang"
+                            );
+                        }
+                        (0, 1) => {
+                            self.engine_wreg(body[1], body[3]);
+                            assert_eq!(
+                                self.reg(u64::from(body[2]) * 4) & body[4],
+                                body[4],
+                                "no invalidate ack"
+                            );
+                        }
+                        _ => panic!("unexpected WAIT_REG_MEM form"),
+                    }
+                }
+                0x42 => assert_eq!(engine, 0, "PFP_SYNC_ME on a compute queue"),
+                0x90 => assert_eq!(engine, 0, "FRAME_CONTROL on a compute queue"),
                 0x49 => {
                     assert_eq!(n, 6);
                     assert_eq!(body[0], 0x0660_3514);
@@ -221,9 +307,16 @@ impl Model {
                     assert!(!ib, "chained IB");
                     let compute = body[2] & (1 << 23) != 0;
                     assert_eq!(compute, engine == 2, "IB VALID bit per ring type");
+                    let ib_vmid = ((body[2] >> 24) & 0xf) as u8;
                     let address = u64::from(body[0]) | (u64::from(body[1]) << 32);
-                    let ib_words = self.linear(address, body[2] & 0xfffff);
-                    self.pm4(&ib_words, engine, true);
+                    let dwords = body[2] & 0xfffff;
+                    let ib_words: Vec<u32> = (0..u64::from(dwords))
+                        .map(|k| self.word(self.gpu(ib_vmid, address + k * 4)))
+                        .collect();
+                    if ib_vmid != 0 {
+                        self.user_ibs.push((engine, ib_vmid));
+                    }
+                    self.pm4(&ib_words, engine, true, ib_vmid);
                 }
                 0x4a | 0x28 | 0x12 | 0x11 | 0x69 => {
                     assert_eq!(engine, 0, "graphics state on a compute queue");
@@ -263,7 +356,7 @@ impl Model {
             i += 2 + n as usize;
         }
     }
-    fn sdma_packets(&mut self, words: &[u32], ib: bool) {
+    fn sdma_packets(&mut self, words: &[u32], ib: bool, vmid: u8, instance: usize) {
         let mut i = 0;
         while i < words.len() {
             let h = words[i];
@@ -275,7 +368,8 @@ impl Model {
                     if !(ib && self.drop_ib_writes) {
                         let address = u64::from(words[i + 1]) | (u64::from(words[i + 2]) << 32);
                         for k in 0..count {
-                            self.put(address + k as u64 * 4, words[i + 4 + k]);
+                            let at = self.gpu(vmid, address + k as u64 * 4);
+                            self.put(at, words[i + 4 + k]);
                         }
                     }
                     4 + count
@@ -295,10 +389,46 @@ impl Model {
                 4 => {
                     assert!(!ib);
                     assert_eq!(i % 8, 2, "SDMA IB packet must end on an 8-dword boundary");
+                    let ib_vmid = ((h >> 16) & 0xf) as u8;
                     let address = u64::from(words[i + 1]) | (u64::from(words[i + 2]) << 32);
                     assert_eq!(address % 32, 0);
-                    let ib_words = self.linear(address, words[i + 3]);
-                    self.sdma_packets(&ib_words, true);
+                    let ib_words: Vec<u32> = (0..u64::from(words[i + 3]))
+                        .map(|k| self.word(self.gpu(ib_vmid, address + k * 4)))
+                        .collect();
+                    if ib_vmid != 0 {
+                        self.user_ibs.push((3 + instance, ib_vmid));
+                    }
+                    self.sdma_packets(&ib_words, true, ib_vmid, instance);
+                    6
+                }
+                14 => {
+                    assert_eq!(h, 14 | (0xf << 28), "SRBM_WRITE byte enables");
+                    assert!(!ib, "register write from a client IB");
+                    self.engine_wreg(words[i + 1], words[i + 2]);
+                    3
+                }
+                8 if (h >> 8) & 0xff == 4 => {
+                    // VM_INVALIDATION on GFX engine (h >> 16) & 0x1f.
+                    assert_eq!(h >> 24, 0x1f, "MMHUB engine unused");
+                    let eng = (h >> 16) & 0x1f;
+                    self.engine_wreg((INV_REQ / 4) as u32 + eng, words[i + 1]);
+                    let ack = self.reg(INV_ACK + u64::from(eng) * 4);
+                    assert_eq!(
+                        ack & words[i + 3] & 0xffff,
+                        words[i + 3] & 0xffff,
+                        "no invalidate ack"
+                    );
+                    4
+                }
+                8 => {
+                    assert_eq!((h >> 28) & 7, 3, "POLL_REGMEM equal");
+                    assert!(h & (1 << 31) != 0, "register POLL_REGMEM unexpected");
+                    let address = u64::from(words[i + 1]) | (u64::from(words[i + 2]) << 32);
+                    assert_eq!(
+                        self.word(address) & words[i + 4],
+                        words[i + 3],
+                        "pipeline sync would hang"
+                    );
                     6
                 }
                 op => panic!("unexpected SDMA opcode {op}"),
@@ -340,7 +470,7 @@ impl Model {
             }
             let size = (8u64 << (cntl & 0x3f)) / 4;
             let words = self.ring(base, size, self.rptr[0], value);
-            self.pm4(&words, 0, false);
+            self.pm4(&words, 0, false, 0);
             self.rptr[0] = value;
             self.regs.insert(r(CP_RB0_RPTR), value as u32);
             self.put(rptr_address, value as u32);
@@ -371,7 +501,7 @@ impl Model {
                 return;
             }
             let words = self.ring(base, size, self.rptr[1], value);
-            self.pm4(&words, 1, false);
+            self.pm4(&words, 1, false, 0);
             self.rptr[1] = value;
             self.put(rptr_address, value as u32);
             return;
@@ -390,7 +520,7 @@ impl Model {
             let base = (u64::from(field(self, 136)) | (u64::from(field(self, 137)) << 32)) << 8;
             let size = 2u64 << (field(self, 145) & 0x3f);
             let words = self.ring(base, size, self.rptr[2], value);
-            self.pm4(&words, 2, false);
+            self.pm4(&words, 2, false, 0);
             self.rptr[2] = value;
             self.put(q.rptr, value as u32);
             return;
@@ -421,7 +551,7 @@ impl Model {
             let size = 1u64 << ((cntl >> 1) & 0x1f);
             let from = self.rptr[3 + i as usize];
             let words = self.ring(base, size, from / 4, value / 4);
-            self.sdma_packets(&words, false);
+            self.sdma_packets(&words, false, 0, i as usize);
             self.rptr[3 + i as usize] = value;
             for (reg, v) in [
                 (SDMA0_GFX_RB_RPTR, value as u32),
