@@ -2152,3 +2152,379 @@ fn smoke_nvme_controller_slot_is_stable() -> TestResult {
     }
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_controller_slot_is_stable);
+
+// ── PRP construction / transfer limits (model tests) ────────────────
+//
+// `prp::setup_prps` is checked against a software model of the
+// controller's side of the PRP walk (NVMe Base 2.0c §4.1.1): PRP1 may
+// carry a page offset, every later entry is page aligned, PRP2 is a data
+// pointer when at most one more page remains and a list pointer
+// otherwise, and the last slot of a full list page chains to the next
+// list page when more than one page of data remains.
+
+/// Walk the data pointer the way a controller does and return the
+/// `(address, length)` segments it would transfer.
+fn model_walk_prps(
+    prp1: u64,
+    prp2: u64,
+    len: usize,
+    lists: &[u64],
+    list_dma: &[u64],
+) -> Result<alloc::vec::Vec<(u64, usize)>, &'static str> {
+    use super::prp::{NVME_CTRL_PAGE_SIZE as PAGE, PRPS_PER_PAGE};
+    let mut segs = alloc::vec::Vec::new();
+    let first = core::cmp::min(len, PAGE - (prp1 as usize & (PAGE - 1)));
+    segs.push((prp1, first));
+    let mut rem = len - first;
+    if rem == 0 {
+        return Ok(segs);
+    }
+    if rem <= PAGE {
+        if prp2 as usize & (PAGE - 1) != 0 {
+            return Err("PRP2 data pointer not page aligned");
+        }
+        segs.push((prp2, rem));
+        return Ok(segs);
+    }
+    let mut list = list_dma
+        .iter()
+        .position(|&d| d == prp2)
+        .ok_or("PRP2 is not a list page")?;
+    let mut idx = 0usize;
+    loop {
+        let entry = lists[list * PRPS_PER_PAGE + idx];
+        if idx == PRPS_PER_PAGE - 1 && rem > PAGE {
+            list = list_dma
+                .iter()
+                .position(|&d| d == entry)
+                .ok_or("chain entry is not a list page")?;
+            idx = 0;
+            continue;
+        }
+        if entry as usize & (PAGE - 1) != 0 {
+            return Err("PRP list entry not page aligned");
+        }
+        let take = core::cmp::min(rem, PAGE);
+        segs.push((entry, take));
+        rem -= take;
+        idx += 1;
+        if rem == 0 {
+            return Ok(segs);
+        }
+    }
+}
+
+/// The walked segments must tile `addr .. addr + len` exactly, in order.
+fn segs_cover(segs: &[(u64, usize)], addr: u64, len: usize) -> bool {
+    let mut at = addr;
+    for &(a, l) in segs {
+        if a != at || l == 0 {
+            return false;
+        }
+        at += l as u64;
+    }
+    at == addr + len as u64
+}
+
+fn smoke_nvme_prp_setup_matches_controller_walk() -> TestResult {
+    use super::prp::{prp_list_pages_needed, setup_prps, PRPS_PER_PAGE};
+    const LIST_PAGES: usize = 3;
+    let list_dma: [u64; LIST_PAGES] = [0x7000_0000, 0x7000_5000, 0x7001_2000];
+    let mut lists = alloc::vec![0u64; LIST_PAGES * PRPS_PER_PAGE];
+    // Offsets: page aligned, sector aligned, and the last dword of a page.
+    for off in [0u64, 0x200, 0xFFC] {
+        for len in [
+            4usize,
+            512,
+            4096,
+            4096 + 4,
+            8192,
+            12 * 1024,
+            16 * 1024, // standard GPT entry array
+            128 * 1024,
+            1 << 20,
+            2 << 20,
+            (2 << 20) + 4096,
+            4 << 20,
+            (4 << 20) - 4096 + 4,
+        ] {
+            let addr = 0x1_2340_0000 + off;
+            lists.fill(0);
+            let need = prp_list_pages_needed(addr, len);
+            let pair = match setup_prps(addr, len, &mut lists, &list_dma) {
+                Ok(p) => p,
+                Err(_) => return TestResult::Fail("setup_prps rejected a valid buffer"),
+            };
+            if pair.list_pages != need {
+                return TestResult::Fail("list page count disagrees with prp_list_pages_needed");
+            }
+            if pair.prp1 != addr {
+                return TestResult::Fail("PRP1 must be the buffer start");
+            }
+            match model_walk_prps(pair.prp1, pair.prp2, len, &lists, &list_dma) {
+                Ok(segs) if segs_cover(&segs, addr, len) => {}
+                Ok(_) => return TestResult::Fail("controller walk does not tile the buffer"),
+                Err(why) => return TestResult::Fail(why),
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_prp_setup_matches_controller_walk);
+
+fn smoke_nvme_prp_page_crossing_and_errors() -> TestResult {
+    use super::prp::{setup_prps, PrpError, PRPS_PER_PAGE};
+    let mut one = alloc::vec![0u64; PRPS_PER_PAGE];
+    let dma = [0x9000_0000u64];
+    // One page, aligned: PRP2 unused.
+    let Ok(p) = setup_prps(0x10_0000, 4096, &mut one, &dma) else {
+        return TestResult::Fail("setup_prps rejected a valid buffer");
+    };
+    if p.prp2 != 0 || p.list_pages != 0 {
+        return TestResult::Fail("aligned 4 KiB transfer must use PRP1 only");
+    }
+    // 4 KiB starting mid-page crosses into the next page: PRP2 = data.
+    let Ok(p) = setup_prps(0x10_0200, 4096, &mut one, &dma) else {
+        return TestResult::Fail("setup_prps rejected a valid buffer");
+    };
+    if p.prp2 != 0x10_1000 || p.list_pages != 0 {
+        return TestResult::Fail("page-crossing 4 KiB transfer must put page 2 in PRP2");
+    }
+    // 512 B ending exactly at the page end stays in PRP1.
+    let Ok(p) = setup_prps(0x10_0E00, 512, &mut one, &dma) else {
+        return TestResult::Fail("setup_prps rejected a valid buffer");
+    };
+    if p.prp2 != 0 {
+        return TestResult::Fail("transfer ending on the page boundary needs no PRP2");
+    }
+    // Three pages: PRP2 is the list, entries are pages 2 and 3.
+    let Ok(p) = setup_prps(0x10_0000, 12 * 1024, &mut one, &dma) else {
+        return TestResult::Fail("setup_prps rejected a valid buffer");
+    };
+    if p.prp2 != dma[0] || one[0] != 0x10_1000 || one[1] != 0x10_2000 {
+        return TestResult::Fail("3-page transfer list layout wrong");
+    }
+    // Misaligned 2 MiB still fits one list page (512 entries, no chain).
+    if setup_prps(0x10_0200, 2 << 20, &mut one, &dma)
+        .map(|p| p.list_pages)
+        .ok()
+        != Some(1)
+    {
+        return TestResult::Fail("misaligned 2 MiB must fit one list page");
+    }
+    if setup_prps(0x10_0000, 0, &mut one, &dma) != Err(PrpError::Empty) {
+        return TestResult::Fail("zero length must be rejected");
+    }
+    if setup_prps(0x10_0002, 512, &mut one, &dma) != Err(PrpError::Misaligned) {
+        return TestResult::Fail("PRP1 must be dword aligned");
+    }
+    if setup_prps(0x10_0000, (2 << 20) + 8192, &mut one, &dma) != Err(PrpError::ListTooSmall) {
+        return TestResult::Fail("a transfer needing a chained list page must be refused");
+    }
+    if setup_prps(u64::MAX - 4095, 8192, &mut one, &dma) != Err(PrpError::Overflow) {
+        return TestResult::Fail("address overflow must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_prp_page_crossing_and_errors);
+
+fn smoke_nvme_mdts_and_page_size_limits() -> TestResult {
+    use super::prp::{host_page_supported, max_transfer_bytes, NVME_HOST_MAX_TRANSFER};
+    // MDTS is a power of two in CAP.MPSMIN units (Linux nvme_mps_to_sectors).
+    let cases: &[(u8, u8, u32)] = &[
+        (0, 0, NVME_HOST_MAX_TRANSFER), // no limit → host cap
+        (1, 0, 8 * 1024),
+        (5, 0, 128 * 1024),
+        (7, 0, 512 * 1024), // QEMU default
+        (8, 0, 1024 * 1024),
+        (9, 0, 2 * 1024 * 1024),
+        (10, 0, NVME_HOST_MAX_TRANSFER), // clamped
+        (5, 1, 256 * 1024),              // 8 KiB minimum page
+        (25, 0, NVME_HOST_MAX_TRANSFER), // shift overflow
+    ];
+    for &(mdts, mpsmin, want) in cases {
+        if max_transfer_bytes(mdts, mpsmin) != want {
+            return TestResult::Fail("max_transfer_bytes disagrees with MDTS << (12 + MPSMIN)");
+        }
+    }
+    if !host_page_supported(0) || host_page_supported(1) || host_page_supported(4) {
+        return TestResult::Fail("only CAP.MPSMIN = 0 admits the 4 KiB host page");
+    }
+    let caps = super::NvmeCaps::from_raw((0x3Cu64 << 24) | (1u64 << 48));
+    if caps.to != 0x3C || caps.mpsmin != 1 || caps.ready_timeout_ms() != 61 * 500 {
+        return TestResult::Fail("CAP.TO / MPSMIN decode wrong");
+    }
+    if super::NvmeCaps::from_raw(0).ready_timeout_ms() != 5_000 {
+        return TestResult::Fail("CAP.TO = 0 must keep the 5 s floor");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_mdts_and_page_size_limits);
+
+fn smoke_nvme_namespace_format_decode() -> TestResult {
+    use super::prp::decode_namespace_format;
+    let mut id = [0u8; 384];
+    id[0..8].copy_from_slice(&1_000_215_216u64.to_le_bytes());
+    // LBAF0 = 512 B, LBAF1 = 4 KiB, LBAF2 = 512 B + 8 B metadata,
+    // LBAF3 = 8 KiB, LBAF17 = 4 KiB (reachable only via FLBAS bits 6:5).
+    id[128 + 2] = 9;
+    id[132 + 2] = 12;
+    id[136..138].copy_from_slice(&8u16.to_le_bytes());
+    id[136 + 2] = 9;
+    id[140 + 2] = 13;
+    id[128 + 17 * 4 + 2] = 12;
+    let at = |flbas: u8| {
+        let mut b = id;
+        b[26] = flbas;
+        decode_namespace_format(&b)
+    };
+    let f = at(0);
+    if f.nsze != 1_000_215_216 || f.lba_bytes != 512 || !f.usable {
+        return TestResult::Fail("512 B format decode wrong");
+    }
+    let f = at(1);
+    if f.lba_bytes != 4096 || !f.usable {
+        return TestResult::Fail("4 KiB format decode wrong");
+    }
+    if at(2).usable || at(2).metadata_bytes != 8 {
+        return TestResult::Fail("a metadata format must be unusable");
+    }
+    if at(3).usable {
+        return TestResult::Fail("an LBA larger than the host page must be unusable");
+    }
+    // FLBAS = 0x21: low nibble 1, bits 6:5 = 01 → index 0x11 = 17.
+    let f = at(0x21);
+    if f.lba_bytes != 4096 || !f.usable {
+        return TestResult::Fail("FLBAS bits 6:5 must extend the format index");
+    }
+    // Bit 4 (extended metadata) is not part of the index.
+    if at(0x10).lba_bytes != 512 {
+        return TestResult::Fail("FLBAS bit 4 must not change the index");
+    }
+    if decode_namespace_format(&id[..100]).usable {
+        return TestResult::Fail("a truncated page must be unusable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_namespace_format_decode);
+
+fn smoke_nvme_sync_chunking_bounds() -> TestResult {
+    use super::nvme_sync_chunk_blocks as chunk;
+    // 128 KiB scratch, QEMU MDTS (512 KiB), 512 B LBAs → 256 blocks.
+    if chunk(128 * 1024, 512 * 1024, 512) != 256 {
+        return TestResult::Fail("scratch must bound the chunk");
+    }
+    // MDTS 8 KiB → 16 blocks of 512 B, 2 blocks of 4 KiB.
+    if chunk(128 * 1024, 8 * 1024, 512) != 16 || chunk(128 * 1024, 8 * 1024, 4096) != 2 {
+        return TestResult::Fail("MDTS must bound the chunk");
+    }
+    // One-page fallback scratch still moves one 4 KiB block.
+    if chunk(4096, 512 * 1024, 4096) != 1 {
+        return TestResult::Fail("one-page scratch must move one 4 KiB block");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_sync_chunking_bounds);
+
+/// Multi-page I/O against QEMU's NVMe: a 300-LBA (150 KiB) registry
+/// write + read through `NvmeBlockSync` (two scratch chunks, each a PRP
+/// list), a 16 KiB read (the size of a standard GPT entry array), a
+/// read into a buffer at a 512-byte offset (PRP1 with a page offset),
+/// and the MDTS refusal. Uses LBA 1700..2000, inside the first MiB the
+/// kernel-test btrfs image never allocates.
+fn smoke_nvme_multipage_io_qemu() -> TestResult {
+    use super::{Controller, IoOpcode, NvmeBlockSync, NvmeError};
+    use narf_block::BlockDeviceSync;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_io::alloc_coherent;
+    use narf_lib::id::DomainId;
+
+    // SAFETY: kernel-test runs at boot with the allocator online;
+    // ECAM_DEFAULT_BASE is QEMU q35's identity-mapped ECAM window.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let Some(dev) = devices()
+        .iter()
+        .find(|d| {
+            matches!(d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+        })
+        .copied()
+    else {
+        return TestResult::Skip("no QEMU NVMe controller");
+    };
+    let authority = bootstrap_registry_authority();
+    let Ok((_h, dev_cap)) = claim_device_cap(&authority, dev.addr) else {
+        return TestResult::Fail("claim_device_cap failed");
+    };
+    {
+        let mut ctrl = Controller::from_device(dev);
+        if ctrl.bring_up(&dev_cap).is_err() || ctrl.create_io_queue().is_err() {
+            return TestResult::Fail("bring-up failed");
+        }
+        if ctrl.lba_bytes != 512 {
+            return TestResult::Skip("test assumes 512 B LBAs");
+        }
+        // QEMU's default MDTS is 7 (512 KiB at MPSMIN = 0).
+        if ctrl.max_transfer_bytes() != 512 * 1024 {
+            return TestResult::Fail("QEMU MDTS=7 must give a 512 KiB max transfer");
+        }
+        // One block past MDTS is refused before anything is submitted.
+        let big = match alloc_coherent(1 << 20, DomainId::DRIVER_0) {
+            Ok(b) => b,
+            Err(_) => return TestResult::Fail("alloc 1 MiB"),
+        };
+        if ctrl.nvm_io_at(IoOpcode::Read as u8, 0, 1025, &big, 0)
+            != Err(NvmeError::ExceedsMaxTransfer)
+        {
+            return TestResult::Fail("a transfer past MDTS must be refused");
+        }
+        // A buffer shorter than the transfer is refused.
+        if ctrl.nvm_io_at(IoOpcode::Read as u8, 0, 8, &big, (1 << 20) - 512)
+            != Err(NvmeError::BadTransfer)
+        {
+            return TestResult::Fail("a short buffer must be refused");
+        }
+        super::install_controller(ctrl);
+    }
+
+    const LBA: u64 = 1700;
+    const N: u16 = 300;
+    let pattern = |i: usize| (i as u8).wrapping_mul(31) ^ (i >> 9) as u8;
+    let data: alloc::vec::Vec<u8> = (0..N as usize * 512).map(pattern).collect();
+    if NvmeBlockSync.write(LBA, N, &data).is_err() {
+        return TestResult::Fail("300-LBA NvmeBlockSync write failed");
+    }
+    let mut back = alloc::vec![0u8; N as usize * 512];
+    if NvmeBlockSync.read(LBA, N, &mut back).is_err() {
+        return TestResult::Fail("300-LBA NvmeBlockSync read failed");
+    }
+    if back != data {
+        return TestResult::Fail("300-LBA read-back mismatch");
+    }
+    let mut gpt_sized = alloc::vec![0u8; 16 * 1024];
+    if NvmeBlockSync.read(LBA + 10, 32, &mut gpt_sized).is_err() {
+        return TestResult::Fail("16 KiB (32-LBA) read failed");
+    }
+    if gpt_sized[..] != data[10 * 512..42 * 512] {
+        return TestResult::Fail("16 KiB read-back mismatch");
+    }
+
+    // PRP1 with a page offset: read 24 LBAs into a buffer at +0x200.
+    let buf = match alloc_coherent(16 * 1024, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc 16 KiB"),
+    };
+    let r = super::probed_controller()
+        .map(|mut c| c.nvm_io_at(IoOpcode::Read as u8, LBA, 24, &buf, 0x200));
+    if r != Some(Ok(())) {
+        return TestResult::Fail("offset read failed");
+    }
+    // SAFETY: `buf` is a live 16 KiB coherent buffer the controller
+    // filled; 0x200 + 24 * 512 ≤ 16 KiB.
+    let got = unsafe { core::slice::from_raw_parts(buf.cpu_ptr::<u8>().add(0x200), 24 * 512) };
+    if got != &data[..24 * 512] {
+        return TestResult::Fail("offset read-back mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_multipage_io_qemu);
