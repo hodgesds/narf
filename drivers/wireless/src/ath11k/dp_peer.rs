@@ -1446,6 +1446,74 @@ impl Dp {
         self.peers.clear();
     }
 
+    // ── key install ─────────────────────────────────────────────
+
+    /// Linux `ath11k_dp_peer_rx_pn_replay_config` (from
+    /// `ath11k_mac_op_set_key`, after `ath11k_install_key`): REO
+    /// UPDATE_RX_QUEUE with PN / PN_SIZE / PN_VALID / PN_CHECK / SVLD on
+    /// every active TID of the peer. Only pairwise keys (`pairwise`;
+    /// group PN checks stay with mac80211 in Linux, nowhere in NARF);
+    /// `rsn_cipher` = TKIP / CCMP / GCMP, where a `SET_KEY` (`install`)
+    /// also turns the PN check on with a 48-bit PN. Stops at the first
+    /// command that cannot be queued and returns its error, as Linux.
+    #[allow(clippy::too_many_arguments)] // the set_key arguments + HAL/IO/time
+    pub fn pn_replay_config(
+        &mut self,
+        hal: &mut Hal,
+        io: &impl ChipIo,
+        vdev_id: u8,
+        addr: &[u8; 6],
+        rsn_cipher: bool,
+        pairwise: bool,
+        install: bool,
+        now_ms: u64,
+    ) -> Result<(), TransportError> {
+        if !pairwise {
+            return Ok(());
+        }
+        let mut cmd = HalReoCmd {
+            flag: HAL_REO_CMD_FLG_NEED_STATUS,
+            upd0: HAL_REO_CMD_UPD0_PN
+                | HAL_REO_CMD_UPD0_PN_SIZE
+                | HAL_REO_CMD_UPD0_PN_VALID
+                | HAL_REO_CMD_UPD0_PN_CHECK
+                | HAL_REO_CMD_UPD0_SVLD,
+            ..HalReoCmd::default()
+        };
+        if rsn_cipher && install {
+            cmd.upd1 |= HAL_REO_CMD_UPD1_PN_CHECK;
+            cmd.pn_size = 48;
+        }
+        let pi = self.peer_rx_idx(vdev_id, addr).ok_or(perr(
+            step::PEER_NOT_FOUND,
+            vdev_id as u32,
+            ENOENT,
+        ))?;
+        for tid in 0..NUM_RX_TIDS {
+            let t = &self.peer_rx.peers[pi].rx_tid[tid];
+            if !t.active {
+                continue;
+            }
+            // One `cmd` across the TIDs, as Linux:
+            // `ath11k_hal_reo_cmd_update_rx_queue` rewrites `pn_size` (48 →
+            // its enum) and `ba_window_size` (0 → 2) in place, so later
+            // TIDs see the converted values (which encode the same).
+            cmd.addr_lo = t.paddr as u32;
+            cmd.addr_hi = (t.paddr >> 32) as u8;
+            if let Err((e, _)) = self.send_reo_cmd(
+                hal,
+                io,
+                reo_cmd_type::UPDATE_RX_QUEUE,
+                &mut cmd,
+                None,
+                now_ms,
+            ) {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
     // ── ADDBA ───────────────────────────────────────────────────
 
     /// Linux `ath11k_dp_rx_ampdu_start` (`IEEE80211_AMPDU_RX_START`):
