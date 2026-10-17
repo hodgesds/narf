@@ -1,7 +1,8 @@
 //! ath11k smoke tests — co-located per project convention.
 //!
-//! Pure-data only: PCI match presence, hw_rev decode, and DP ring sizing.
-//! MHI protocol/host tests live in `mhi_tests.rs`; WMI/HTC tests live in
+//! Pure-data only: PCI match presence, hw_rev decode, and power-up sequence.
+//! MHI tests live in `mhi_tests.rs`; HAL / DP / CE tests in `hal_tests.rs` /
+//! `ce_tests.rs`; QMI / QRTR tests in `qmi_tests.rs`; WMI / HTC tests in
 //! `wmi_tests.rs`. Live silicon
 //! is exercised by the probe-bound-or-skip smoke at the bottom —
 //! that one Skips cleanly on QEMU.
@@ -13,7 +14,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use super::dp::*;
+// DP descriptor layouts are tested in `hal_tests.rs`.
 use super::hw::*;
 use super::mhi::*;
 use super::pci::{is_probed, with_controller};
@@ -193,66 +194,6 @@ kernel_test_in!(
 );
 
 // MHI protocol + host tests live in `mhi_tests.rs`.
-
-// ── DP descriptor sizing ───────────────────────────────────────────
-
-fn smoke_ath11k_dp_ring_default_sizes() -> TestResult {
-    if default_ring_size(HalRingType::TclData) != DP_TCL_DATA_RING_SIZE {
-        return TestResult::Fail("TCL_DATA default size mismatch");
-    }
-    if default_ring_size(HalRingType::ReoDst) != DP_REO_DST_RING_SIZE {
-        return TestResult::Fail("REO_DST default size mismatch");
-    }
-    if default_ring_size(HalRingType::WbmIdleListEnd) != 0 {
-        return TestResult::Fail("WBM_IDLE_LIST_END should have zero default size");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/wireless/ath11k",
-    smoke_ath11k_dp_ring_default_sizes
-);
-
-fn smoke_ath11k_dp_descriptor_sizes() -> TestResult {
-    if HalTclDataCmd::SIZE != 32 {
-        return TestResult::Fail("HAL_TCL_DATA_CMD size should be 32 bytes");
-    }
-    if HalReoDstDesc::SIZE != 32 {
-        return TestResult::Fail("HAL_REO_DST_DESC size should be 32 bytes");
-    }
-    // Round-trip TCL data cmd.
-    let mut tcl = HalTclDataCmd::default();
-    tcl.set_buf_dma(0x1_0000_2000);
-    tcl.set_data_len(0x0400);
-    if tcl.buf_addr_lo != 0x0000_2000 {
-        return TestResult::Fail("TCL_DATA buf_addr_lo wrong");
-    }
-    if tcl.info0 & 0xFF != 1 {
-        return TestResult::Fail("TCL_DATA buf_addr_hi wrong");
-    }
-    if tcl.info1 & 0xFFFF != 0x0400 {
-        return TestResult::Fail("TCL_DATA data length wrong");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_dp_descriptor_sizes);
-
-fn smoke_ath11k_dp_ring_dir_classification() -> TestResult {
-    if HalRingType::TclData.default_dir() != HalRingDir::SrcRing {
-        return TestResult::Fail("TCL_DATA should be a source ring");
-    }
-    if HalRingType::ReoDst.default_dir() != HalRingDir::DstRing {
-        return TestResult::Fail("REO_DST should be a destination ring");
-    }
-    if HalRingType::TclStatus.default_dir() != HalRingDir::DstRing {
-        return TestResult::Fail("TCL_STATUS should be a destination ring");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/wireless/ath11k",
-    smoke_ath11k_dp_ring_dir_classification
-);
 
 // ── Live-silicon smoke ─────────────────────────────────────────────
 //

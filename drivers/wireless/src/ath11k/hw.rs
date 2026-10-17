@@ -16,6 +16,8 @@
 
 #![allow(dead_code)]
 
+use super::ce::{CeAttr, HOST_CE_CONFIG_QCA6390, HOST_CE_CONFIG_QCN9074};
+
 /// Qualcomm PCI vendor id used by all ath11k parts.
 pub const QCOM_VENDOR: u16 = 0x17cb;
 
@@ -254,12 +256,45 @@ pub struct HwParams {
     /// `Some` iff Linux sets `fix_l1ss = true` for this part.
     pub fix_l1ss: Option<L1ssRegs>,
     pub static_window_map: bool,
+    /// `hw_params.regs` — the HAL SRNG register map. `None` for parts
+    /// whose map is not ported (QCN9074).
+    pub regs: Option<&'static HalRegs>,
+    /// `hw_params.host_ce_config`; its length is `hw_params.ce_count`.
+    pub host_ce_config: &'static [CeAttr],
+    /// `hw_params.supports_shadow_regs`.
+    pub supports_shadow_regs: bool,
+    /// `hw_params.credit_flow`: HTC credit flow, and CE TX completion
+    /// frees the buffer instead of calling `send_cb`.
+    pub credit_flow: bool,
+    /// `hw_params.ring_mask` (DP interrupt groups).
+    pub ring_mask: &'static RingMask,
+}
+
+impl HwParams {
+    /// `hw_params.ce_count`.
+    pub fn ce_count(&self) -> usize {
+        self.host_ce_config.len()
+    }
 }
 
 impl HwRev {
     /// Linux `ath11k_hw_params[]` entry for this revision.
     pub fn params(self) -> Option<HwParams> {
         let fw_dir = self.fw_dir()?;
+        // (regs, host_ce_config, supports_shadow_regs, credit_flow)
+        let (regs, host_ce_config, supports_shadow_regs, credit_flow): (
+            Option<&'static HalRegs>,
+            &'static [CeAttr],
+            bool,
+            bool,
+        ) = match self {
+            HwRev::Qca6390Hw20 => (Some(&QCA6390_REGS), &HOST_CE_CONFIG_QCA6390, true, true),
+            HwRev::Qcn9074Hw10 => (None, &HOST_CE_CONFIG_QCN9074, false, false),
+            HwRev::Wcn6855Hw20 | HwRev::Wcn6855Hw21 | HwRev::Qca2066Hw21 | HwRev::Qca6698aqHw21 => {
+                (Some(&WCN6855_REGS), &HOST_CE_CONFIG_QCA6390, true, true)
+            }
+            HwRev::Unknown => return None,
+        };
         let (msi, fix_l1ss, static_window_map) = match self {
             // qca6390_regs
             HwRev::Qca6390Hw20 => (
@@ -290,9 +325,269 @@ impl HwRev {
             msi,
             fix_l1ss,
             static_window_map,
+            regs,
+            host_ce_config,
+            supports_shadow_regs,
+            credit_flow,
+            ring_mask: &RING_MASK_QCA6390,
         })
     }
 }
+
+// ── HAL register map (`struct ath11k_hw_regs`, hw.h / hw.c) ────────
+//
+// The fields `hal.c` / `ce.c` read. Values verbatim from Linux
+// `qca6390_regs` and `wcn6855_regs` (hw.c); the PCIe L1SS pair lives in
+// [`L1ssRegs`].
+
+/// Linux `struct ath11k_hw_regs` (HAL subset).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HalRegs {
+    // SW2TCL(x) R0 ring configuration
+    pub hal_tcl1_ring_base_lsb: u32,
+    pub hal_tcl1_ring_base_msb: u32,
+    pub hal_tcl1_ring_id: u32,
+    pub hal_tcl1_ring_misc: u32,
+    pub hal_tcl1_ring_tp_addr_lsb: u32,
+    pub hal_tcl1_ring_tp_addr_msb: u32,
+    pub hal_tcl1_ring_consumer_int_setup_ix0: u32,
+    pub hal_tcl1_ring_consumer_int_setup_ix1: u32,
+    pub hal_tcl1_ring_msi1_base_lsb: u32,
+    pub hal_tcl1_ring_msi1_base_msb: u32,
+    pub hal_tcl1_ring_msi1_data: u32,
+    pub hal_tcl2_ring_base_lsb: u32,
+    pub hal_tcl_ring_base_lsb: u32,
+    // TCL STATUS ring
+    pub hal_tcl_status_ring_base_lsb: u32,
+    // REO2SW(x) R0 ring configuration
+    pub hal_reo1_ring_base_lsb: u32,
+    pub hal_reo1_ring_base_msb: u32,
+    pub hal_reo1_ring_id: u32,
+    pub hal_reo1_ring_misc: u32,
+    pub hal_reo1_ring_hp_addr_lsb: u32,
+    pub hal_reo1_ring_hp_addr_msb: u32,
+    pub hal_reo1_ring_producer_int_setup: u32,
+    pub hal_reo1_ring_msi1_base_lsb: u32,
+    pub hal_reo1_ring_msi1_base_msb: u32,
+    pub hal_reo1_ring_msi1_data: u32,
+    pub hal_reo2_ring_base_lsb: u32,
+    pub hal_reo1_aging_thresh_ix_0: u32,
+    pub hal_reo1_aging_thresh_ix_1: u32,
+    pub hal_reo1_aging_thresh_ix_2: u32,
+    pub hal_reo1_aging_thresh_ix_3: u32,
+    // REO2SW(x) R2 ring pointers
+    pub hal_reo1_ring_hp: u32,
+    pub hal_reo1_ring_tp: u32,
+    pub hal_reo2_ring_hp: u32,
+    // REO2TCL
+    pub hal_reo_tcl_ring_base_lsb: u32,
+    pub hal_reo_tcl_ring_hp: u32,
+    // REO CMD
+    pub hal_reo_cmd_ring_base_lsb: u32,
+    pub hal_reo_cmd_ring_hp: u32,
+    // REO status
+    pub hal_reo_status_ring_base_lsb: u32,
+    pub hal_reo_status_hp: u32,
+    // SW2REO
+    pub hal_sw2reo_ring_base_lsb: u32,
+    pub hal_sw2reo_ring_hp: u32,
+    // WCSS relative (CE register blocks)
+    pub hal_seq_wcss_umac_ce0_src_reg: u32,
+    pub hal_seq_wcss_umac_ce0_dst_reg: u32,
+    pub hal_seq_wcss_umac_ce1_src_reg: u32,
+    pub hal_seq_wcss_umac_ce1_dst_reg: u32,
+    // WBM idle
+    pub hal_wbm_idle_link_ring_base_lsb: u32,
+    pub hal_wbm_idle_link_ring_misc: u32,
+    // SW2WBM release
+    pub hal_wbm_release_ring_base_lsb: u32,
+    // WBM2SW release
+    pub hal_wbm0_release_ring_base_lsb: u32,
+    pub hal_wbm1_release_ring_base_lsb: u32,
+    // Shadow register area
+    pub hal_shadow_base_addr: u32,
+    // REO misc control
+    pub hal_reo1_misc_ctl: u32,
+}
+
+/// Linux `qca6390_regs`.
+pub const QCA6390_REGS: HalRegs = HalRegs {
+    hal_tcl1_ring_base_lsb: 0x0000_0684,
+    hal_tcl1_ring_base_msb: 0x0000_0688,
+    hal_tcl1_ring_id: 0x0000_068c,
+    hal_tcl1_ring_misc: 0x0000_0694,
+    hal_tcl1_ring_tp_addr_lsb: 0x0000_06a0,
+    hal_tcl1_ring_tp_addr_msb: 0x0000_06a4,
+    hal_tcl1_ring_consumer_int_setup_ix0: 0x0000_06b4,
+    hal_tcl1_ring_consumer_int_setup_ix1: 0x0000_06b8,
+    hal_tcl1_ring_msi1_base_lsb: 0x0000_06cc,
+    hal_tcl1_ring_msi1_base_msb: 0x0000_06d0,
+    hal_tcl1_ring_msi1_data: 0x0000_06d4,
+    hal_tcl2_ring_base_lsb: 0x0000_06dc,
+    hal_tcl_ring_base_lsb: 0x0000_078c,
+    hal_tcl_status_ring_base_lsb: 0x0000_0894,
+    hal_reo1_ring_base_lsb: 0x0000_0244,
+    hal_reo1_ring_base_msb: 0x0000_0248,
+    hal_reo1_ring_id: 0x0000_024c,
+    hal_reo1_ring_misc: 0x0000_0254,
+    hal_reo1_ring_hp_addr_lsb: 0x0000_0258,
+    hal_reo1_ring_hp_addr_msb: 0x0000_025c,
+    hal_reo1_ring_producer_int_setup: 0x0000_0268,
+    hal_reo1_ring_msi1_base_lsb: 0x0000_028c,
+    hal_reo1_ring_msi1_base_msb: 0x0000_0290,
+    hal_reo1_ring_msi1_data: 0x0000_0294,
+    hal_reo2_ring_base_lsb: 0x0000_029c,
+    hal_reo1_aging_thresh_ix_0: 0x0000_050c,
+    hal_reo1_aging_thresh_ix_1: 0x0000_0510,
+    hal_reo1_aging_thresh_ix_2: 0x0000_0514,
+    hal_reo1_aging_thresh_ix_3: 0x0000_0518,
+    hal_reo1_ring_hp: 0x0000_3030,
+    hal_reo1_ring_tp: 0x0000_3034,
+    hal_reo2_ring_hp: 0x0000_3038,
+    hal_reo_tcl_ring_base_lsb: 0x0000_03a4,
+    hal_reo_tcl_ring_hp: 0x0000_3050,
+    hal_reo_cmd_ring_base_lsb: 0x0000_0194,
+    hal_reo_cmd_ring_hp: 0x0000_3020,
+    hal_reo_status_ring_base_lsb: 0x0000_04ac,
+    hal_reo_status_hp: 0x0000_3068,
+    hal_sw2reo_ring_base_lsb: 0x0000_01ec,
+    hal_sw2reo_ring_hp: 0x0000_3028,
+    hal_seq_wcss_umac_ce0_src_reg: 0x00a0_0000,
+    hal_seq_wcss_umac_ce0_dst_reg: 0x00a0_1000,
+    hal_seq_wcss_umac_ce1_src_reg: 0x00a0_2000,
+    hal_seq_wcss_umac_ce1_dst_reg: 0x00a0_3000,
+    hal_wbm_idle_link_ring_base_lsb: 0x0000_0860,
+    hal_wbm_idle_link_ring_misc: 0x0000_0870,
+    hal_wbm_release_ring_base_lsb: 0x0000_01d8,
+    hal_wbm0_release_ring_base_lsb: 0x0000_0910,
+    hal_wbm1_release_ring_base_lsb: 0x0000_0968,
+    hal_shadow_base_addr: 0x0000_08fc,
+    hal_reo1_misc_ctl: 0x0,
+};
+
+/// Linux `wcn6855_regs` (WCN6855 HW2.0 / HW2.1, QCA2066, QCA6698AQ).
+pub const WCN6855_REGS: HalRegs = HalRegs {
+    hal_tcl1_ring_base_lsb: 0x0000_0690,
+    hal_tcl1_ring_base_msb: 0x0000_0694,
+    hal_tcl1_ring_id: 0x0000_0698,
+    hal_tcl1_ring_misc: 0x0000_06a0,
+    hal_tcl1_ring_tp_addr_lsb: 0x0000_06ac,
+    hal_tcl1_ring_tp_addr_msb: 0x0000_06b0,
+    hal_tcl1_ring_consumer_int_setup_ix0: 0x0000_06c0,
+    hal_tcl1_ring_consumer_int_setup_ix1: 0x0000_06c4,
+    hal_tcl1_ring_msi1_base_lsb: 0x0000_06d8,
+    hal_tcl1_ring_msi1_base_msb: 0x0000_06dc,
+    hal_tcl1_ring_msi1_data: 0x0000_06e0,
+    hal_tcl2_ring_base_lsb: 0x0000_06e8,
+    hal_tcl_ring_base_lsb: 0x0000_0798,
+    hal_tcl_status_ring_base_lsb: 0x0000_08a0,
+    hal_reo1_ring_base_lsb: 0x0000_0244,
+    hal_reo1_ring_base_msb: 0x0000_0248,
+    hal_reo1_ring_id: 0x0000_024c,
+    hal_reo1_ring_misc: 0x0000_0254,
+    hal_reo1_ring_hp_addr_lsb: 0x0000_0258,
+    hal_reo1_ring_hp_addr_msb: 0x0000_025c,
+    hal_reo1_ring_producer_int_setup: 0x0000_0268,
+    hal_reo1_ring_msi1_base_lsb: 0x0000_028c,
+    hal_reo1_ring_msi1_base_msb: 0x0000_0290,
+    hal_reo1_ring_msi1_data: 0x0000_0294,
+    hal_reo2_ring_base_lsb: 0x0000_029c,
+    hal_reo1_aging_thresh_ix_0: 0x0000_05bc,
+    hal_reo1_aging_thresh_ix_1: 0x0000_05c0,
+    hal_reo1_aging_thresh_ix_2: 0x0000_05c4,
+    hal_reo1_aging_thresh_ix_3: 0x0000_05c8,
+    hal_reo1_ring_hp: 0x0000_3030,
+    hal_reo1_ring_tp: 0x0000_3034,
+    hal_reo2_ring_hp: 0x0000_3038,
+    hal_reo_tcl_ring_base_lsb: 0x0000_0454,
+    hal_reo_tcl_ring_hp: 0x0000_3060,
+    hal_reo_cmd_ring_base_lsb: 0x0000_0194,
+    hal_reo_cmd_ring_hp: 0x0000_3020,
+    hal_reo_status_ring_base_lsb: 0x0000_055c,
+    hal_reo_status_hp: 0x0000_3078,
+    hal_sw2reo_ring_base_lsb: 0x0000_01ec,
+    hal_sw2reo_ring_hp: 0x0000_3028,
+    hal_seq_wcss_umac_ce0_src_reg: 0x01b8_0000,
+    hal_seq_wcss_umac_ce0_dst_reg: 0x01b8_1000,
+    hal_seq_wcss_umac_ce1_src_reg: 0x01b8_2000,
+    hal_seq_wcss_umac_ce1_dst_reg: 0x01b8_3000,
+    hal_wbm_idle_link_ring_base_lsb: 0x0000_0870,
+    hal_wbm_idle_link_ring_misc: 0x0000_0880,
+    hal_wbm_release_ring_base_lsb: 0x0000_01e8,
+    hal_wbm0_release_ring_base_lsb: 0x0000_0920,
+    hal_wbm1_release_ring_base_lsb: 0x0000_0978,
+    hal_shadow_base_addr: 0x0000_08fc,
+    hal_reo1_misc_ctl: 0x0000_0630,
+};
+
+// ── DP interrupt groups (`struct ath11k_hw_ring_mask`) ─────────────
+
+/// hw.h `ATH11K_EXT_IRQ_GRP_NUM_MAX`.
+pub const ATH11K_EXT_IRQ_GRP_NUM_MAX: usize = 11;
+
+/// Linux `struct ath11k_hw_ring_mask`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RingMask {
+    pub tx: [u8; ATH11K_EXT_IRQ_GRP_NUM_MAX],
+    pub rx_mon_status: [u8; ATH11K_EXT_IRQ_GRP_NUM_MAX],
+    pub rx: [u8; ATH11K_EXT_IRQ_GRP_NUM_MAX],
+    pub rx_err: [u8; ATH11K_EXT_IRQ_GRP_NUM_MAX],
+    pub rx_wbm_rel: [u8; ATH11K_EXT_IRQ_GRP_NUM_MAX],
+    pub reo_status: [u8; ATH11K_EXT_IRQ_GRP_NUM_MAX],
+    pub rxdma2host: [u8; ATH11K_EXT_IRQ_GRP_NUM_MAX],
+    pub host2rxdma: [u8; ATH11K_EXT_IRQ_GRP_NUM_MAX],
+}
+
+/// Linux `ath11k_hw_ring_mask_qca6390` (QCA6390 + WCN6855 family):
+/// the C designated initialisers place each mask at the index shown.
+pub const RING_MASK_QCA6390: RingMask = RingMask {
+    tx: [0x1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    rx_mon_status: [0, 0, 0, 0, 0x1, 0x2, 0x4, 0, 0, 0, 0],
+    rx: [0, 0, 0, 0, 0, 0, 0, 0x1, 0x2, 0x4, 0x8],
+    rx_err: [0x1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    rx_wbm_rel: [0x1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    reo_status: [0x1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    rxdma2host: [0x1, 0x2, 0x4, 0, 0, 0, 0, 0, 0, 0, 0],
+    host2rxdma: [0; ATH11K_EXT_IRQ_GRP_NUM_MAX],
+};
+
+/// `enum hal_rx_buf_return_buf_manager` (hal.h).
+pub mod rbm {
+    pub const WBM_IDLE_BUF_LIST: u8 = 0;
+    pub const WBM_IDLE_DESC_LIST: u8 = 1;
+    pub const FW_BM: u8 = 2;
+    pub const SW0_BM: u8 = 3;
+    pub const SW1_BM: u8 = 4;
+    pub const SW2_BM: u8 = 5;
+    pub const SW3_BM: u8 = 6;
+    pub const SW4_BM: u8 = 7;
+}
+
+/// Linux `struct ath11k_hw_tcl2wbm_rbm_map`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Tcl2WbmRbmMap {
+    pub tcl_ring_num: u8,
+    pub wbm_ring_num: u8,
+    pub rbm_id: u8,
+}
+
+/// Linux `struct ath11k_hw_hal_params`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HwHalParams {
+    pub rx_buf_rbm: u8,
+    pub tcl2wbm_rbm_map: &'static [Tcl2WbmRbmMap],
+}
+
+/// Linux `ath11k_hw_hal_params_qca6390` (uses
+/// `ath11k_hw_tcl2wbm_rbm_map_ipq5018`: one TX ring, SW0_BM).
+pub const HW_HAL_PARAMS_QCA6390: HwHalParams = HwHalParams {
+    rx_buf_rbm: rbm::SW1_BM,
+    tcl2wbm_rbm_map: &[Tcl2WbmRbmMap {
+        tcl_ring_num: 0,
+        wbm_ring_num: 0,
+        rbm_id: rbm::SW0_BM,
+    }],
+};
 
 // ── BAR0 register-window constants ─────────────────────────────────
 //
