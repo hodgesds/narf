@@ -116,6 +116,7 @@ fn booted(queues_verified: bool) -> Published {
             gfx_mhz: Some((500, 2600)),
             queues_verified,
         }),
+        media_rings: 0,
     }
 }
 fn ask(s: &Snapshot, sub: Submission, q: u32, p: [u32; 4]) -> Result<Vec<u8>, FsError> {
@@ -438,4 +439,62 @@ fn info_navi22_acceleration_is_opt_in_per_boot() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     info_navi22_acceleration_is_opt_in_per_boot
+);
+
+/// The RX 6750 XT's media answers: discovery lists VCN 3.0.0 and 3.0.1, the
+/// harvest table removes VCN1. HW_IP_COUNT is `num_vcn_inst` (2, harvested
+/// included) and the rings follow the verified client media rings and the
+/// switch.
+fn navi22_media_hw_ip_and_video_caps_follow_linux() -> TestResult {
+    let mut published = booted(true);
+    published.media_rings = 0b1011; // dec, enc0, JPEG
+    let mut s = snap(published);
+    let mut vcn1 = ip(HW_ID_VCN, (3, 0, 1), 0x7b00);
+    vcn1.instance = 1;
+    s.ip_blocks.push(vcn1);
+    let info = |s: &Snapshot, sub, ip| -> uapi::DrmAmdgpuInfoHwIp {
+        decode(&ask(s, sub, uapi::AMDGPU_INFO_HW_IP_INFO, [ip, 0, 0, 0]).unwrap())
+    };
+    let count = |s: &Snapshot, sub, ip| {
+        u32_at(
+            &ask(s, sub, uapi::AMDGPU_INFO_HW_IP_COUNT, [ip, 0, 0, 0]).unwrap(),
+            0,
+        )
+    };
+    let (w, n) = (Submission::Wired, Submission::NotWired);
+    let dec = info(&s, w, uapi::AMDGPU_HW_IP_VCN_DEC);
+    let enc = info(&s, w, uapi::AMDGPU_HW_IP_VCN_ENC);
+    let jpeg = info(&s, w, uapi::AMDGPU_HW_IP_VCN_JPEG);
+    let wired = dec.available_rings == 1
+        && enc.available_rings == 1
+        && jpeg.available_rings == 1
+        && (dec.ib_start_alignment, dec.ib_size_alignment) == (256, 64)
+        && (enc.ib_start_alignment, enc.ib_size_alignment) == (256, 4)
+        && (jpeg.ib_start_alignment, jpeg.ib_size_alignment) == (256, 64)
+        && dec.ip_discovery_version == 0x030000
+        && count(&s, w, uapi::AMDGPU_HW_IP_VCN_DEC) == 2
+        && count(&s, w, uapi::AMDGPU_HW_IP_VCN_ENC) == 2
+        && count(&s, w, uapi::AMDGPU_HW_IP_VCN_JPEG) == 1;
+    // Without amdgpu.navi22_accel (NotWired) nothing media is offered.
+    let closed = [
+        uapi::AMDGPU_HW_IP_VCN_DEC,
+        uapi::AMDGPU_HW_IP_VCN_ENC,
+        uapi::AMDGPU_HW_IP_VCN_JPEG,
+    ]
+    .iter()
+    .all(|&ip| info(&s, n, ip).available_rings == 0 && count(&s, n, ip) == 0);
+    // Rings that did not pass their tests are not advertised.
+    let mut partial = s.clone();
+    partial.navi22.media_rings = 0b0001;
+    let partial_ok = info(&partial, w, uapi::AMDGPU_HW_IP_VCN_ENC).available_rings == 0
+        && info(&partial, w, uapi::AMDGPU_HW_IP_VCN_JPEG).available_rings == 0
+        && info(&partial, w, uapi::AMDGPU_HW_IP_VCN_DEC).available_rings == 1;
+    if !wired || !closed || !partial_ok {
+        return TestResult::Fail("media HW_IP_INFO/COUNT differ from amdgpu_hw_ip_info");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_media_hw_ip_and_video_caps_follow_linux
 );

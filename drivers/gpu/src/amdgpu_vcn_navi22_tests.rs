@@ -1066,3 +1066,222 @@ kernel_test_in!(
     "drivers/gpu/vcn-navi22",
     vcn_navi22_routes_traps_to_instance_fences
 );
+
+/// Client jobs on the verified media rings (instance 0, VCN1 harvested as on
+/// the RX 6750 XT): each frame is `encode_media`'s Linux order under the
+/// user VMID, committed with an HDP flush before the doorbell, continuing the
+/// kernel fence sequence; the VM flushes once per generation; a third job
+/// waits for the first (`amdgpu_sched_hw_submission`); JPEG runs from a
+/// kernel copy at VMID 0.
+fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
+    use crate::amdgpu_navi22_submit::{encode_media, Ib, MediaFrame, MediaRing, RingState, VmRef};
+    let (pool, mut e) = engine(Model::new(), 1);
+    if run(e.start(firmware(1), None)).is_err()
+        || run(e.start_jpeg()).is_err()
+        || run(e.test_ib()).is_err()
+    {
+        return TestResult::Fail("media bring-up");
+    }
+    // The model executes kernel frames only; client frames are recorded.
+    e.hw.io.stalled = [true; 7];
+    let mut jpeg_ibs = pool.reserve(JPEG_IB_SLOT * 2).unwrap();
+    jpeg_ibs.publish();
+    let client = Client {
+        mmhub: 0x1a000,
+        instances: 1,
+        jpeg_ibs: Some(jpeg_ibs),
+    };
+    let vm = |generation| VmRef {
+        vmid: 3,
+        generation,
+        page_table_base: 0x1_2345_6001,
+    };
+    let ibs = [Ib {
+        va: 0x7000_0010_0000,
+        dwords: 16,
+    }];
+    let mut state = RingState::new();
+    let (base, map, seq0) = {
+        let i = e.vcn[0].as_ref().unwrap();
+        (i.address(0), i.memory.mapping(), i.dec.seq)
+    };
+    let mut frames = Vec::new();
+    for generation in [1, 1] {
+        let from = e.vcn[0].as_ref().unwrap().dec.wptr;
+        let Ok(seq) = e.submit_client(
+            &client,
+            MediaRing::Dec,
+            &mut state,
+            vm(generation),
+            1,
+            &ibs,
+            &[],
+        ) else {
+            return TestResult::Fail("decode client job refused");
+        };
+        let to = e.vcn[0].as_ref().unwrap().dec.wptr;
+        frames.push((seq, e.hw.io.ring(mc(map, DEC_RING), from, to), to));
+    }
+    for (k, (seq, words, to)) in frames.iter().enumerate() {
+        let want = encode_media(&MediaFrame {
+            ring: MediaRing::Dec,
+            mmhub: 0x1a000,
+            engine: 0,
+            flush: (k == 0).then_some(vm(1)),
+            vmid: 3,
+            ibs: &ibs,
+            fence: base + FENCE[0],
+            seq: *seq,
+            ring_base: base + DEC_RING,
+        });
+        let pad = &words[want.len().min(words.len())..];
+        if *seq != seq0 + 1 + k as u32
+            || words[..want.len().min(words.len())] != want[..]
+            || to % 16 != 0
+            || pad
+                .chunks(2)
+                .any(|p| p != [cmd::packet0(cmd::INTERNAL_NOP), 0])
+        {
+            return TestResult::Fail("decode client frame/sequence");
+        }
+    }
+    let m = &e.hw.io;
+    let last = frames[1].2;
+    if m.doorbells.last() != Some(&(doorbell::dec(0), last)) || m.word(mc(map, WPTR[0])) != last {
+        return TestResult::Fail("decode commit: shadow wptr and doorbell");
+    }
+    // Two outstanding: the third waits for the first fence.
+    let third = e.submit_client(&client, MediaRing::Dec, &mut state, vm(2), 1, &ibs, &[]);
+    if third != Err(Error::Busy) || e.vcn[0].as_ref().unwrap().dec.seq != seq0 + 2 {
+        return TestResult::Fail("third outstanding decode job not throttled");
+    }
+    e.hw.io.put(mc(map, FENCE[0]), seq0 + 1);
+    let from = e.vcn[0].as_ref().unwrap().dec.wptr;
+    if e.submit_client(&client, MediaRing::Dec, &mut state, vm(2), 1, &ibs, &[]) != Ok(seq0 + 3) {
+        return TestResult::Fail("decode job after the throttle fence");
+    }
+    let to = e.vcn[0].as_ref().unwrap().dec.wptr;
+    // New generation: flushed again (insert_start then the semaphore wait).
+    let words = e.hw.io.ring(mc(map, DEC_RING), from, to);
+    if words.get(4..6) != Some(&[cmd::packet0(cmd::INTERNAL_DATA0), (0x1a000 + 0x6d1) << 2][..]) {
+        return TestResult::Fail("new VM generation not flushed");
+    }
+    // Encode ring 0: MMHUB engine 1, frame starts with the semaphore wait.
+    let enc_from = e.vcn[0].as_ref().unwrap().enc[0].wptr;
+    if e.submit_client(&client, MediaRing::Enc(0), &mut state, vm(3), 1, &ibs, &[])
+        .is_err()
+    {
+        return TestResult::Fail("encode client job refused");
+    }
+    let enc_to = e.vcn[0].as_ref().unwrap().enc[0].wptr;
+    let words = e.hw.io.ring(mc(map, ENC_RING[0]), enc_from, enc_to);
+    if words.get(..4) != Some(&[0xc, (0x1a000 + 0x6d1 + 1) << 2, 1, 1][..]) || enc_to % 64 != 0 {
+        return TestResult::Fail("encode client frame");
+    }
+    // JPEG: the copy lands in slot seq % 2 and the frame fetches it at VMID 0.
+    let copy = alloc::vec![0x6000_0000, 0, 0x4000, 7];
+    let user = [Ib {
+        va: 0x7000_0030_0000,
+        dwords: 4,
+    }];
+    let (jbase, jmap, jfrom) = {
+        let j = e.jpeg.as_ref().unwrap();
+        (j.memory.address(), j.memory.mapping(), j.ring.wptr)
+    };
+    let mismatch = [alloc::vec![0x6000_0000, 0]];
+    if e.submit_client(
+        &client,
+        MediaRing::Jpeg,
+        &mut state,
+        vm(3),
+        1,
+        &user,
+        &mismatch,
+    ) != Err(Error::Invalid)
+    {
+        return TestResult::Fail("JPEG copy/IB mismatch accepted");
+    }
+    let mut jstate = RingState::new();
+    let Ok(seq) = e.submit_client(
+        &client,
+        MediaRing::Jpeg,
+        &mut jstate,
+        vm(3),
+        1,
+        &user,
+        core::slice::from_ref(&copy),
+    ) else {
+        return TestResult::Fail("JPEG client job refused");
+    };
+    let pool_ibs = client.jpeg_ibs.as_ref().unwrap();
+    let at = u64::from(seq % 2) * JPEG_IB_SLOT;
+    let jto = e.jpeg.as_ref().unwrap().ring.wptr;
+    let words = e.hw.io.ring(mc(jmap, 0), jfrom, jto);
+    let stored: Vec<u32> = (0..4)
+        .map(|k| e.hw.io.word(mc(pool_ibs.mapping(), at + k * 4)))
+        .collect();
+    let (ib_low, ib_high) = (
+        (pool_ibs.address() + at) as u32,
+        ((pool_ibs.address() + at) >> 32) as u32,
+    );
+    // Frame: start(4) + flush + start(4), then the IB packet group.
+    let ib_group = words
+        .iter()
+        .position(|&w| w == 0x4149)
+        .map(|p| &words[p..p + 12]);
+    if seq != 1
+        || stored != copy
+        || ib_group
+            != Some(
+                &[
+                    0x4149,
+                    3 << 3,
+                    0x40cf,
+                    0,
+                    0x40d1,
+                    0x333,
+                    0x40e8,
+                    ib_low,
+                    0x40e9,
+                    ib_high,
+                    0x4082,
+                    4,
+                ][..],
+            )
+        || !words.contains(&((jbase + JPEG_FENCE) as u32))
+    {
+        return TestResult::Fail("JPEG client frame / kernel copy");
+    }
+    // A JPEG job beyond the kernel slot is refused before any ring write.
+    let huge = [Ib {
+        va: 0x7000_0030_0000,
+        dwords: (JPEG_IB_SLOT / 4 + 2) as u32,
+    }];
+    let big = [alloc::vec![0u32; huge[0].dwords as usize]];
+    if e.submit_client(&client, MediaRing::Jpeg, &mut state, vm(3), 1, &huge, &big)
+        != Err(Error::Invalid)
+        || e.jpeg.as_ref().unwrap().ring.wptr != jto
+    {
+        return TestResult::Fail("oversize JPEG job reached the ring");
+    }
+    // Kernel-VMID and empty jobs never reach validation's far side.
+    if e.submit_client(
+        &client,
+        MediaRing::Dec,
+        &mut state,
+        VmRef { vmid: 0, ..vm(4) },
+        1,
+        &ibs,
+        &[],
+    ) != Err(Error::Invalid)
+        || e.submit_client(&client, MediaRing::Dec, &mut state, vm(4), 1, &[], &[])
+            != Err(Error::Invalid)
+    {
+        return TestResult::Fail("VMID 0 or empty media job accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn_navi22_client_jobs_frame_flush_and_throttle
+);

@@ -298,6 +298,7 @@ pub mod amdgpu_ucode_header;
 pub mod amdgpu_usbc;
 pub mod amdgpu_vbios;
 pub mod amdgpu_vcn_navi22;
+pub mod amdgpu_vcn_navi22_cs;
 pub mod amdgpu_video;
 pub mod amdgpu_video_caps_navi22;
 pub mod amdgpu_vm;

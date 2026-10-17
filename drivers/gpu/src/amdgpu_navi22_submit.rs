@@ -376,6 +376,395 @@ pub fn forget(state: &mut RingState, vmid: u8) {
     }
 }
 
+// ── Media rings: VCN 3.0 decode/encode and JPEG 3.0 (append-only) ──────
+//
+// Client IBs on instance 0's decode ring, its two encode rings and the JPEG
+// ring, all on MMHUB (`ring->vm_hub = AMDGPU_MMHUB0(0)`). The frame is what
+// `amdgpu_ib_schedule` emits for these rings (vcn_v3_0.c dec/enc ring funcs
+// built from the vcn_v2_0.c emitters, jpeg_v3_0.c from jpeg_v2_0.c):
+//
+// 1. when the VM needs a flush (`amdgpu_vm_flush`): decode/JPEG
+//    `insert_start`, then `emit_vm_flush` = `gmc_v10_0_emit_flush_gpu_tlb`
+//    on MMHUB — acquire the engine's invalidation semaphore (MMHUB only,
+//    `gmc_v10_0_use_invalidate_semaphore`), write the VMID's page-table base
+//    LO/HI, write the invalidate request and wait for its ACK bit, release
+//    the semaphore — followed by the ring's wait for the PTB LO write;
+// 2. decode/JPEG `insert_start`, one `emit_ib` per IB with the job's VMID;
+// 3. the job fence (`emit_fence`), then decode/JPEG `insert_end` or the
+//    encoder's VCN_ENC_CMD_END.
+//
+// The flush decision is the kernel queues' (`RingState`, one flush per VM
+// generation per ring). Two omissions, both bookkeeping Linux needs and
+// NARF does not: the VM fence `amdgpu_vm_flush` emits after a flush (it
+// only feeds `id->last_flush`) and the IH VMID LUT write
+// (`emit_pasid_mapping`, fault attribution; owned with the VMID logic).
+
+/// `mmUVD_GP_SCRATCH8_INTERNAL_OFFSET` (vcn_v3_0.c), the decode reg-wait mask.
+pub(crate) const VCN_GP_SCRATCH8: u32 = 0x66; // linux: mmUVD_GP_SCRATCH8_INTERNAL_OFFSET@vcn
+pub(crate) const VCN_DEC_WRITE_REG: u32 = 4; // linux: VCN_DEC_CMD_WRITE_REG
+pub(crate) const VCN_DEC_REG_WAIT: u32 = 6; // linux: VCN_DEC_CMD_REG_READ_COND_WAIT
+pub(crate) const VCN_ENC_REG_WRITE: u32 = 0xb; // linux: VCN_ENC_CMD_REG_WRITE
+pub(crate) const VCN_ENC_REG_WAIT: u32 = 0xc; // linux: VCN_ENC_CMD_REG_WAIT
+
+/// jpeg_v2_0.h internal JRBC registers (jpeg_v3_0.c uses the 2.0 emitters).
+pub(crate) mod jrbc {
+    pub const EXTERNAL_REG: u32 = 0x1bfff; // linux: mmUVD_JRBC_EXTERNAL_REG_INTERNAL_OFFSET
+    pub const GPCOM_CMD: u32 = 0x4029; // linux: mmUVD_JPEG_GPCOM_CMD_INTERNAL_OFFSET
+    pub const GPCOM_DATA0: u32 = 0x402a; // linux: mmUVD_JPEG_GPCOM_DATA0_INTERNAL_OFFSET
+    pub const GPCOM_DATA1: u32 = 0x402b; // linux: mmUVD_JPEG_GPCOM_DATA1_INTERNAL_OFFSET
+                                         // linux: mmUVD_LMI_JRBC_RB_MEM_WR_64BIT_BAR_LOW_INTERNAL_OFFSET
+    pub const RB_MEM_WR_LOW: u32 = 0x40ea;
+    // linux: mmUVD_LMI_JRBC_RB_MEM_WR_64BIT_BAR_HIGH_INTERNAL_OFFSET
+    pub const RB_MEM_WR_HIGH: u32 = 0x40eb;
+    pub const IB_VMID: u32 = 0x40cf; // linux: mmUVD_LMI_JRBC_IB_VMID_INTERNAL_OFFSET
+    pub const JPEG_VMID: u32 = 0x40d1; // linux: mmUVD_LMI_JPEG_VMID_INTERNAL_OFFSET
+                                       // linux: mmUVD_LMI_JRBC_IB_64BIT_BAR_LOW_INTERNAL_OFFSET
+    pub const IB_LOW: u32 = 0x40e8;
+    // linux: mmUVD_LMI_JRBC_IB_64BIT_BAR_HIGH_INTERNAL_OFFSET
+    pub const IB_HIGH: u32 = 0x40e9;
+    pub const IB_SIZE: u32 = 0x4082; // linux: mmUVD_JRBC_IB_SIZE_INTERNAL_OFFSET
+                                     // linux: mmUVD_LMI_JRBC_RB_MEM_RD_64BIT_BAR_LOW_INTERNAL_OFFSET
+    pub const RB_MEM_RD_LOW: u32 = 0x40ec;
+    // linux: mmUVD_LMI_JRBC_RB_MEM_RD_64BIT_BAR_HIGH_INTERNAL_OFFSET
+    pub const RB_MEM_RD_HIGH: u32 = 0x40ed;
+    pub const COND_RD_TIMER: u32 = 0x4085; // linux: mmUVD_JRBC_RB_COND_RD_TIMER_INTERNAL_OFFSET
+    pub const REF_DATA: u32 = 0x4084; // linux: mmUVD_JRBC_RB_REF_DATA_INTERNAL_OFFSET
+    pub const STATUS: u32 = 0x4089; // linux: mmUVD_JRBC_STATUS_INTERNAL_OFFSET
+    pub const IH_CTRL: u32 = 0x4149; // linux: mmUVD_JPEG_IH_CTRL_INTERNAL_OFFSET
+    pub const DEC_EXTERNAL_REG_WRITE_ADDR: u32 = 0x18000; // linux: JRBC_DEC_EXTERNAL_REG_WRITE_ADDR
+    pub const IH_VMID_SHIFT: u32 = 3; // linux: JPEG_IH_CTRL__IH_VMID__SHIFT
+    /// `PACKETJ(reg, 0, cond, type)` (soc15d.h).
+    pub const fn packet(reg: u32, cond: u32, kind: u32) -> u32 {
+        (reg & 0x3ffff) | ((cond & 0xf) << 24) | ((kind & 0xf) << 28) // linux: n/a (PACKETJ, soc15d.h)
+    }
+}
+
+/// MMHUB context-0 and invalidation-engine-0 registers (mmhub_2_0_0, base
+/// index 0), with `ctx_addr_distance` 2 and `eng_distance` 1.
+// linux-ctx: hdr=mmhub seg=0
+pub(crate) const MM_PTB_LO: u32 = 0x72b; // linux: mmMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32
+pub(crate) const MM_PTB_HI: u32 = 0x72c; // linux: mmMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32
+pub(crate) const MM_INV_SEM: u32 = 0x6d1; // linux: mmMMVM_INVALIDATE_ENG0_SEM
+pub(crate) const MM_INV_REQ: u32 = 0x6e3; // linux: mmMMVM_INVALIDATE_ENG0_REQ
+pub(crate) const MM_INV_ACK: u32 = 0x6f5; // linux: mmMMVM_INVALIDATE_ENG0_ACK
+                                          // linux-ctx: reset
+/// `AMDGPU_VMHUB_INV_ENG_BITMAP`: engines 2 and 3 stay with KFD/firmware.
+pub(crate) const INV_ENG_BITMAP: u32 = 0x1fff3; // linux: AMDGPU_VMHUB_INV_ENG_BITMAP@amdgpu
+/// Largest IB count per media job: `amdgpu_ring_max_ibs(VCN_JPEG)`, and the
+/// kernel queues' bound for the other media rings.
+pub const MEDIA_MAX_IBS: usize = 16; // linux: n/a (AMDGPU_RING_TYPE_VCN_JPEG -> 16 in amdgpu_ring_max_ibs)
+
+/// A client media ring of VCN instance 0 / JPEG 3.0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaRing {
+    Dec,
+    /// Encode ring 0 (general purpose) or 1 (low latency).
+    Enc(u8),
+    Jpeg,
+}
+impl MediaRing {
+    /// Index of the ring among the media rings (dec, enc0, enc1, jpeg).
+    pub const fn index(self) -> usize {
+        match self {
+            MediaRing::Dec => 0,
+            MediaRing::Enc(0) => 1,
+            MediaRing::Enc(_) => 2,
+            MediaRing::Jpeg => 3,
+        }
+    }
+    pub const ALL: [MediaRing; 4] = [
+        MediaRing::Dec,
+        MediaRing::Enc(0),
+        MediaRing::Enc(1),
+        MediaRing::Jpeg,
+    ];
+    /// MMHUB invalidation engine, as `amdgpu_gmc_allocate_vm_inv_eng`
+    /// hands them out in ring order on MMHUB: per unharvested VCN instance
+    /// its decode ring then both encode rings (`vcn_v3_0_sw_init`), then the
+    /// JPEG ring (`jpeg_v3_0_sw_init`), each the lowest free bit of
+    /// `AMDGPU_VMHUB_INV_ENG_BITMAP` (no MES/UMSCH on GC 10.3.2).
+    pub const fn inv_engine(self, vcn_instances: u8) -> u32 {
+        let before = match self {
+            MediaRing::Dec => 0,
+            MediaRing::Enc(0) => 1,
+            MediaRing::Enc(_) => 2,
+            MediaRing::Jpeg => 3 * (vcn_instances & 3).count_ones(),
+        };
+        let mut free = INV_ENG_BITMAP;
+        let mut n = 0;
+        while n < before {
+            free &= free - 1;
+            n += 1;
+        }
+        free.trailing_zeros()
+    }
+    pub const fn fence_engine(self) -> fence::Engine {
+        match self {
+            MediaRing::Jpeg => fence::Engine::Jpeg,
+            _ => fence::Engine::Vcn0,
+        }
+    }
+}
+
+/// One media submission's frame, after the flush decision.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MediaFrame<'a> {
+    pub ring: MediaRing,
+    /// MMHUB segment-0 dword base (`adev->reg_offset[MMHUB_HWIP][0][0]`).
+    pub mmhub: u32,
+    pub engine: u32,
+    pub flush: Option<VmRef>,
+    pub vmid: u8,
+    /// IBs as the engine fetches them: client VAs for VCN, the kernel copies
+    /// (VMID 0) for JPEG, whose ring has a `parse_cs`.
+    pub ibs: &'a [Ib],
+    pub fence: u64,
+    pub seq: u32,
+    /// JPEG: the ring's own MC address (`ring->gpu_addr`, RB_MEM_RD).
+    pub ring_base: u64,
+}
+
+fn vcn_dec_wreg(w: &mut Vec<u32>, reg: u32, value: u32) {
+    use crate::amdgpu_vcn_navi22::cmd::*;
+    // vcn_v2_0_dec_ring_emit_wreg
+    w.extend([
+        packet0(INTERNAL_DATA0),
+        reg << 2,
+        packet0(INTERNAL_DATA1),
+        value,
+        packet0(INTERNAL_CMD),
+        DEC_KMD | (VCN_DEC_WRITE_REG << 1),
+    ]);
+}
+fn vcn_dec_reg_wait(w: &mut Vec<u32>, reg: u32, value: u32, mask: u32) {
+    use crate::amdgpu_vcn_navi22::cmd::*;
+    // vcn_v2_0_dec_ring_emit_reg_wait
+    w.extend([
+        packet0(INTERNAL_DATA0),
+        reg << 2,
+        packet0(INTERNAL_DATA1),
+        value,
+        packet0(VCN_GP_SCRATCH8),
+        mask,
+        packet0(INTERNAL_CMD),
+        DEC_KMD | (VCN_DEC_REG_WAIT << 1),
+    ]);
+}
+fn vcn_enc_wreg(w: &mut Vec<u32>, reg: u32, value: u32) {
+    w.extend([VCN_ENC_REG_WRITE, reg << 2, value]);
+}
+fn vcn_enc_reg_wait(w: &mut Vec<u32>, reg: u32, value: u32, mask: u32) {
+    w.extend([VCN_ENC_REG_WAIT, reg << 2, mask, value]);
+}
+/// `jpeg_v2_0_dec_ring_emit_wreg`/`_reg_wait`: registers in the JPEG
+/// window (byte offsets 0x10000..=0x105ff) are addressed directly, every
+/// other one through JRBC_DEC_EXTERNAL_REG_WRITE_ADDR.
+fn jpeg_reg(w: &mut Vec<u32>, reg: u32, kind: u32) {
+    use jrbc::*;
+    let offset = reg << 2;
+    w.push(packet(EXTERNAL_REG, 0, 0));
+    if (0x10000..=0x105ff).contains(&offset) {
+        w.extend([0, packet(offset >> 2, 0, kind)]);
+    } else {
+        w.extend([offset, packet(DEC_EXTERNAL_REG_WRITE_ADDR, 0, kind)]);
+    }
+}
+fn jpeg_wreg(w: &mut Vec<u32>, reg: u32, value: u32) {
+    jpeg_reg(w, reg, 0);
+    w.push(value);
+}
+fn jpeg_reg_wait(w: &mut Vec<u32>, reg: u32, value: u32, mask: u32) {
+    use jrbc::*;
+    // linux: n/a (literal 0x01400200 in jpeg_v2_0.c:jpeg_v2_0_dec_ring_emit_reg_wait)
+    w.extend([packet(COND_RD_TIMER, 0, 0), 0x0140_0200]);
+    w.extend([packet(REF_DATA, 0, 0), value]);
+    jpeg_reg(w, reg, 3);
+    w.push(mask);
+}
+/// decode/JPEG `insert_start`.
+fn media_start(ring: MediaRing, w: &mut Vec<u32>) {
+    match ring {
+        MediaRing::Dec => w.extend(crate::amdgpu_vcn_navi22::dec_start()),
+        // jpeg_v2_0_dec_ring_insert_start
+        // linux: n/a (literals 0x68e04, 0x80010000 in jpeg_v2_0.c:jpeg_v2_0_dec_ring_insert_start)
+        MediaRing::Jpeg => w.extend([
+            jrbc::packet(jrbc::EXTERNAL_REG, 0, 0),
+            0x68e04,
+            jrbc::packet(jrbc::DEC_EXTERNAL_REG_WRITE_ADDR, 0, 0),
+            0x8001_0000,
+        ]),
+        MediaRing::Enc(_) => {}
+    }
+}
+
+/// Encode one media submission (see the section comment for the order).
+pub(crate) fn encode_media(f: &MediaFrame<'_>) -> Vec<u32> {
+    let mut w = Vec::new();
+    type Wreg = fn(&mut Vec<u32>, u32, u32);
+    type Wait = fn(&mut Vec<u32>, u32, u32, u32);
+    let (wreg, wait): (Wreg, Wait) = match f.ring {
+        MediaRing::Dec => (vcn_dec_wreg, vcn_dec_reg_wait),
+        MediaRing::Enc(_) => (vcn_enc_wreg, vcn_enc_reg_wait),
+        MediaRing::Jpeg => (jpeg_wreg, jpeg_reg_wait),
+    };
+    if let Some(vm) = f.flush {
+        let v = u32::from(vm.vmid);
+        let reg = |offset: u32| f.mmhub + offset;
+        let (lo, hi) = (vm.page_table_base as u32, (vm.page_table_base >> 32) as u32);
+        media_start(f.ring, &mut w);
+        // gmc_v10_0_emit_flush_gpu_tlb: semaphore acquire (reads 1).
+        wait(&mut w, reg(MM_INV_SEM) + f.engine, 1, 1);
+        wreg(&mut w, reg(MM_PTB_LO) + 2 * v, lo);
+        wreg(&mut w, reg(MM_PTB_HI) + 2 * v, hi);
+        // amdgpu_ring_emit_reg_write_reg_wait_helper
+        wreg(
+            &mut w,
+            reg(MM_INV_REQ) + f.engine,
+            invalidate_request(vm.vmid),
+        );
+        wait(&mut w, reg(MM_INV_ACK) + f.engine, 1 << v, 1 << v);
+        // semaphore release
+        wreg(&mut w, reg(MM_INV_SEM) + f.engine, 0);
+        // the ring's own emit_vm_flush tail: wait for the PTB write
+        wait(&mut w, reg(MM_PTB_LO) + 2 * v, lo, u32::MAX);
+    }
+    media_start(f.ring, &mut w);
+    let vmid = u32::from(f.vmid);
+    for ib in f.ibs {
+        let (low, high) = (ib.va as u32, (ib.va >> 32) as u32);
+        match f.ring {
+            MediaRing::Dec => {
+                use crate::amdgpu_vcn_navi22::cmd::*;
+                // vcn_v2_0_dec_ring_emit_ib
+                w.extend([
+                    packet0(INTERNAL_IB_VMID),
+                    vmid,
+                    packet0(INTERNAL_IB_BAR_LOW),
+                    low,
+                    packet0(INTERNAL_IB_BAR_HIGH),
+                    high,
+                    packet0(INTERNAL_IB_SIZE),
+                    ib.dwords,
+                ]);
+            }
+            // vcn_v2_0_enc_ring_emit_ib
+            MediaRing::Enc(_) => w.extend([
+                crate::amdgpu_vcn_navi22::cmd::ENC_IB,
+                vmid,
+                low,
+                high,
+                ib.dwords,
+            ]),
+            MediaRing::Jpeg => {
+                use jrbc::*;
+                let triple = vmid | (vmid << 4) | (vmid << 8);
+                // jpeg_v2_0_dec_ring_emit_ib with parse_cs: the IB itself is
+                // the kernel's validated copy (IB_VMID 0); data uses the VMID.
+                // linux: n/a (literals 0x01400200 / 0x2 in jpeg_v2_0.c:jpeg_v2_0_dec_ring_emit_ib)
+                w.extend([
+                    packet(IH_CTRL, 0, 0),
+                    vmid << IH_VMID_SHIFT,
+                    packet(IB_VMID, 0, 0),
+                    0,
+                    packet(JPEG_VMID, 0, 0),
+                    triple,
+                    packet(IB_LOW, 0, 0),
+                    low,
+                    packet(IB_HIGH, 0, 0),
+                    high,
+                    packet(IB_SIZE, 0, 0),
+                    ib.dwords,
+                    packet(RB_MEM_RD_LOW, 0, 0),
+                    f.ring_base as u32,
+                    packet(RB_MEM_RD_HIGH, 0, 0),
+                    (f.ring_base >> 32) as u32,
+                    packet(0, 0, 2),
+                    0,
+                    packet(COND_RD_TIMER, 0, 0),
+                    0x0140_0200,
+                    packet(REF_DATA, 0, 0),
+                    0x2,
+                    packet(STATUS, 3, 3),
+                    0x2,
+                ]);
+            }
+        }
+    }
+    match f.ring {
+        MediaRing::Dec => {
+            w.extend(crate::amdgpu_vcn_navi22::dec_fence(f.fence, f.seq));
+            w.extend(crate::amdgpu_vcn_navi22::dec_end());
+        }
+        MediaRing::Enc(_) => {
+            use crate::amdgpu_vcn_navi22::cmd::*;
+            // vcn_v2_0_enc_ring_emit_fence, vcn_v2_0_enc_ring_insert_end
+            w.extend([
+                ENC_FENCE,
+                f.fence as u32,
+                (f.fence >> 32) as u32,
+                f.seq,
+                ENC_TRAP,
+                ENC_END,
+            ]);
+        }
+        MediaRing::Jpeg => {
+            use jrbc::*;
+            // jpeg_v2_0_dec_ring_emit_fence, then jpeg_v2_0_dec_ring_insert_end
+            // linux: n/a (literals 0x8, 0x3fbc, 0x1, 0x68e04, 0x10000 in jpeg_v2_0.c fence/insert_end)
+            w.extend([
+                packet(GPCOM_DATA0, 0, 0),
+                f.seq,
+                packet(GPCOM_DATA1, 0, 0),
+                f.seq,
+                packet(RB_MEM_WR_LOW, 0, 0),
+                f.fence as u32,
+                packet(RB_MEM_WR_HIGH, 0, 0),
+                (f.fence >> 32) as u32,
+                packet(GPCOM_CMD, 0, 0),
+                0x8,
+                packet(GPCOM_CMD, 0, 4),
+                0,
+                packet(EXTERNAL_REG, 0, 0),
+                0x3fbc,
+                packet(DEC_EXTERNAL_REG_WRITE_ADDR, 0, 0),
+                0x1,
+                packet(0, 0, 7),
+                0,
+                packet(EXTERNAL_REG, 0, 0),
+                0x68e04,
+                packet(DEC_EXTERNAL_REG_WRITE_ADDR, 0, 0),
+                0x0001_0000,
+            ]);
+        }
+    }
+    w
+}
+
+/// Validate a media submission before any ring access: a user VMID, 1..=16
+/// IBs, each non-empty, dword-aligned and within the 20-bit size field.
+pub fn validate_media(vm: VmRef, ibs: &[Ib]) -> Result<(), Error> {
+    if !(1..=15).contains(&vm.vmid) || ibs.is_empty() || ibs.len() > MEDIA_MAX_IBS {
+        return Err(Error::Invalid);
+    }
+    if ibs
+        .iter()
+        .any(|ib| ib.dwords == 0 || ib.dwords > MAX_IB_DWORDS || ib.va % 4 != 0)
+    {
+        return Err(Error::Invalid);
+    }
+    Ok(())
+}
+
+/// Whether `ring` must flush `vm` (`amdgpu_vmid_grab`'s `vm_needs_flush`,
+/// as [`submit`] decides it), and the record of having done so.
+pub(crate) fn media_needs_flush(state: &RingState, vm: VmRef) -> bool {
+    state.flushed[usize::from(vm.vmid)] != vm.generation
+}
+pub(crate) fn media_flushed(state: &mut RingState, vm: VmRef, context: u64) {
+    state.flushed[usize::from(vm.vmid)] = vm.generation;
+    state.context = context;
+}
+
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi22_submit_tests.rs"]
 mod tests;

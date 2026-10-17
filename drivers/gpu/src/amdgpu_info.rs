@@ -120,6 +120,7 @@ static NAVI22: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_info_navi22::Publis
         topology: None,
         pci_revision: None,
         boot: None,
+        media_rings: 0,
     });
 /// From the cold boot's `ReadTopology` stage.
 pub(crate) fn publish_navi22_topology(topology: crate::amdgpu_gfx10_topology::Topology) {
@@ -132,6 +133,10 @@ pub(crate) fn publish_navi22_pci_revision(revision: u8) {
 /// After a successful cold boot only.
 pub(crate) fn publish_navi22_boot(boot: crate::amdgpu_info_navi22::Boot) {
     NAVI22.lock().boot = Some(boot);
+}
+/// The media rings that take client jobs (0 when withdrawn).
+pub(crate) fn publish_navi22_media_rings(rings: u8) {
+    NAVI22.lock().media_rings = rings;
 }
 
 fn snapshot() -> Option<Snapshot> {

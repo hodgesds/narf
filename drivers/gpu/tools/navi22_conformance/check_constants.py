@@ -86,7 +86,7 @@ HEADER_SETS = {
     # THM 11.0.5 is driven by smu_v11_0.c with thm_11_0_2.
     "thm": ("THM", [AR + "/thm/thm_11_0_2_offset.h", AR + "/thm/thm_11_0_2_sh_mask.h"]),
     "vcn": ("VCN", [AR + "/vcn/vcn_3_0_0_offset.h", AR + "/vcn/vcn_3_0_0_sh_mask.h",
-                    AG + "/vcn_v3_0.c", AG + "/jpeg_v3_0.c"]),
+                    AG + "/vcn_v3_0.c", AG + "/jpeg_v3_0.c", AG + "/jpeg_v2_0.h"]),
     "athub": ("ATHUB", [AR + "/athub/athub_2_1_0_offset.h", AR + "/athub/athub_2_1_0_sh_mask.h"]),
     "df": ("DF", [AR + "/df/df_3_6_offset.h", AR + "/df/df_3_6_sh_mask.h"]),
     "psp": (None, [AG + "/psp_gfx_if.h", AG + "/amdgpu_psp.h"]),
@@ -120,7 +120,7 @@ HEADER_SETS = {
                       AG + "/amdgpu_gfx.h", AG + "/amdgpu_rlc.h", AG + "/amdgpu_mes.h",
                       AG + "/amdgpu_nbio.h", AG + "/amdgpu_ttm.h", AG + "/amdgpu_object.h",
                       AG + "/amdgpu.h", AG + "/amdgpu_reset.h", AG + "/gmc_v10_0.c",
-                      AG + "/gfxhub_v2_1.c", AG + "/sdma_v5_2.c", AG + "/nv.c",
+                      AG + "/gfxhub_v2_1.c", AG + "/sdma_v5_2.c", AG + "/nv.c", AG + "/amdgpu_gmc.c",
                       AG + "/amdgpu_vcn.c", AG + "/amdgpu_psp.c", AG + "/amdgpu_ucode.c",
                       AMD + "/include/v10_structs.h", AMD + "/include/navi10_enum.h",
                       AMD + "/include/amd_shared.h", AMD + "/pm/swsmu/inc/smu_types.h",

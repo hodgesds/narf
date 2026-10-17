@@ -94,8 +94,13 @@ report). Unpublished inputs leave the corresponding fields zero.
 `amdgpu_info_navi22::SUBMISSION` is the single switch for ACCEL_WORKING,
 `available_rings`, HW_IP_COUNT, GANG_SUBMIT, the DRM minor (3.64.0 vs
 3.0.0) and the render ioctls; it is `Wired`, and still advertises nothing
-unless `Boot::queues_verified`. VIDEO_CAPS returns the Sienna Cichlid
-codec tables for the discovered VCN instances; MAX_IBS reports
+unless `Boot::queues_verified`. Media IPs additionally need
+`Published::media_rings` (`publish_navi22_media_rings`, from
+`amdgpu_vcn_navi22_cs::register`): VCN_DEC/ENC/JPEG report one ring each
+when their rings passed, HW_IP_COUNT(VCN_DEC/ENC) is `num_vcn_inst` (every
+discovered instance, harvested ones included) and JPEG 1. VIDEO_CAPS
+returns the Sienna Cichlid codec tables for the discovered VCN instances; MAX_IBS
+reports
 `amdgpu_navi22_submit::MAX_IBS` (16) for advertised rings.
 
 `unsafe amdgpu_gfx10_topology::read(gpu, pci_cap)` requires exclusive GRBM
@@ -3626,8 +3631,48 @@ forwards them to `amdgpu_fence_navi22::Engine::{Vcn0, Vcn1, Jpeg}`.
 `amdgpu_video_caps_navi22::{codecs, caps}(kind, harvested)` return Linux's
 Sienna Cichlid `AMDGPU_INFO_VIDEO_CAPS` tables (decode VCN0 with AV1, or VCN1
 when VCN0 is harvested; encode AVC 4096² and HEVC 8192×4352) as
-`DrmAmdgpuInfoVideoCaps`; `None` for an unknown subquery or no VCN. Not yet
-wired into the INFO ioctl.
+`DrmAmdgpuInfoVideoCaps`; `None` for an unknown subquery or no VCN.
+`AMDGPU_INFO_VIDEO_CAPS` answers from them for the VCN instances present in
+discovery.
+
+Client media rings (append-only additions, `amdgpu.navi22_accel` only):
+`Media::{client_rings() -> u8, fence_reader() -> MediaFenceReader,
+submit(MediaRing, &mut RingState, VmRef, context, &[Ib], copies),
+client_fences(MediaRing) -> (completed, throttle)}` (and
+`ColdBoot::{client_media, submit_media, media_fences}`) queue client jobs on
+instance 0's decode ring, both encode rings and the JPEG ring once their ring
+and IB tests passed. `amdgpu_navi22_submit::{MediaRing, encode_media,
+validate_media, MEDIA_MAX_IBS}` frame them as Linux's `amdgpu_ib_schedule`
+does for vcn_v3_0/jpeg_v3_0: when the VM generation is new on the ring,
+(decode/JPEG `insert_start`,) the MMHUB `gmc_v10_0_emit_flush_gpu_tlb`
+(invalidation semaphore acquire, PTB LO/HI, request/ACK, release) and the
+ring's PTB-write wait; then `insert_start`, the IBs under the VMID
+(`vcn_v2_0_dec/enc_ring_emit_ib`, `jpeg_v2_0_dec_ring_emit_ib`), the fence on
+the kernel ring's sequence and `insert_end`/`VCN_ENC_CMD_END`. MMHUB
+invalidation engines follow `amdgpu_gmc_allocate_vm_inv_eng` over ring order
+(dec 0, enc 1/4, JPEG 5 with VCN1 harvested, 8 otherwise). JPEG IBs run from
+a kernel copy (`JPEG_IB_SLOT`, 64 KiB per outstanding job) at VMID 0 with
+data at the client's VMID; the JPEG fence is `JPEG_FENCE` in the JPEG
+reservation. Two jobs outstanding per ring; frames are bounded to half the
+ring. Not emitted: the post-flush VM fence and the IH VMID LUT
+(`emit_pasid_mapping`), both Linux bookkeeping.
+
+`amdgpu_vcn_navi22_cs::{media_ring, ring_id, completed, rings, register,
+unregister, forget_owner, submit, dec_ib_messages, check_dec_msg,
+parse_jpeg_ib, Sessions}` carry the CS side: `AMDGPU_HW_IP_VCN_DEC/ENC/JPEG`
+ring 0 of instance 0 map to ticket ring ids 4/5/7 (`FIRST_ID + index`);
+jobs with a user fence are refused (`no_user_fence`); decode IBs (at most
+`DEC_IB_MAX_DWORDS`) are scanned for messages as
+`vcn_v3_0_ring_patch_cs_in_place` and each checked as `vcn_v3_0_dec_msg`
+(8-byte alignment, 4 dwords, header and create buffers inside the mapping,
+buffer indices inside the claimed length; `NeedsVcn0` when VCN0 is
+harvested and the codec is not H.264/HEVC/VP9), on every instance; decode
+sessions follow `amdgpu_uvd_cs_msg`'s handle rules per client (create: free
+handle or EINVAL/ENOSPC, `MAX_SESSIONS` 40; decode/destroy: own handle or
+EINVAL/ENOENT), all or nothing per job and rolled back when the job never
+reaches the ring, and forgotten when the client's `VmState` drops; JPEG IBs
+pass `amdgpu_jpeg_dec_parse_cs` on the kernel copy; encode IBs are not
+parsed.
 
 ### Navi 22 client submission and render ABI
 
@@ -3650,8 +3695,11 @@ client context (`ColdBoot::reserve_client_vmid`), registers the card's client
 VRAM heap (`ColdBoot::reserve_client_vram`, retained across recoveries) with
 `amdgpu_gem::register_vram_heap`, and an `amdgpu_cs::Submitter` whose jobs run
 on gfx ring 0, the compute queue (rings 0–3) or SDMA 0/1 with a per-job VM
-flush to the open's `VmState` root. Tickets are `ring_index(epoch, id) << 32 |
-seq`; tickets of an earlier recovery epoch read as complete. Fences are read
+flush to the open's `VmState` root, and — through `amdgpu_vcn_navi22_cs` —
+on the verified media rings (ids 4–7). Tickets are `ring_index(epoch, id) <<
+32 | seq` with three ring-id bits (`RING_IDS` 8); tickets of an earlier
+recovery epoch read as complete. `amdgpu_vm::VmState` tracks eight ring
+slots. Fences are read
 by `amdgpu_cp_navi22::FenceReader` (`ColdBoot::client_fence_reader`) without
 the owner. `unregister` runs at the start of recovery.
 
