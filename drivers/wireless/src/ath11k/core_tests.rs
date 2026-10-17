@@ -165,11 +165,11 @@ impl QmiFw for FakeQmi {
 
 // ── scripted firmware ─────────────────────────────────────────────
 
-const HTT_EID: u8 = 1;
-const WMI_EID: u8 = 2;
+pub(super) const HTT_EID: u8 = 1;
+pub(super) const WMI_EID: u8 = 2;
 /// Control and HTT answers arrive on CE1, WMI on CE2, pktlog on CE5.
-const CTRL_DL: u32 = 1;
-const WMI_DL: u32 = 2;
+pub(super) const CTRL_DL: u32 = 1;
+pub(super) const WMI_DL: u32 = 2;
 
 /// WMI_TLV_SERVICE_EXT2_MSG (220): SERVICE_AVAILABLE segment word 2
 /// bit 28. WMI_TLV_SERVICE_REG_CC_EXT_EVENT_SUPPORT (281): trailing
@@ -178,31 +178,31 @@ const EXT2_MSG_SEG_W2: u32 = 1 << 28;
 const REG_CC_EXT_W0: u32 = 1 << 25;
 
 #[derive(Clone)]
-struct Script {
-    credits: u16,
-    credit_size: u16,
-    send_ready: bool,
+pub(super) struct Script {
+    pub(super) credits: u16,
+    pub(super) credit_size: u16,
+    pub(super) send_ready: bool,
     /// READY only shows up once the host polls every CE.
-    ready_on_poll: bool,
-    htt_reply: bool,
-    htt_status: u8,
-    wmi_reply: bool,
-    wmi_status: u8,
-    svc_ready: bool,
-    advertise_ext2: bool,
-    send_ext2: bool,
-    reg_cc_ext: bool,
+    pub(super) ready_on_poll: bool,
+    pub(super) htt_reply: bool,
+    pub(super) htt_status: u8,
+    pub(super) wmi_reply: bool,
+    pub(super) wmi_status: u8,
+    pub(super) svc_ready: bool,
+    pub(super) advertise_ext2: bool,
+    pub(super) send_ext2: bool,
+    pub(super) reg_cc_ext: bool,
     /// Replace SERVICE_READY_EXT with this payload.
-    ext_override: Option<Vec<u8>>,
-    ready_event: bool,
+    pub(super) ext_override: Option<Vec<u8>>,
+    pub(super) ready_event: bool,
     /// READY event without its READY TLV.
-    ready_missing_tlv: bool,
+    pub(super) ready_missing_tlv: bool,
     /// Credit for INIT returned with the READY event.
-    return_init_credit: bool,
+    pub(super) return_init_credit: bool,
     /// Extra frames sent right after SETUP_COMPLETE_EX's events.
-    extra: Vec<(u32, Vec<u8>)>,
+    pub(super) extra: Vec<(u32, Vec<u8>)>,
     /// Answer HTT VERSION_REQ (msg type 0) with VERSION_CONF.
-    htt_version_conf: bool,
+    pub(super) htt_version_conf: bool,
 }
 
 impl Default for Script {
@@ -231,7 +231,7 @@ impl Default for Script {
 }
 
 /// READY: 00:03:7f:12:34:56 (`wmi_ready_event`, wmi_tests' layout).
-const FW_MAC: [u8; 6] = [0x00, 0x03, 0x7f, 0x12, 0x34, 0x56];
+pub(super) const FW_MAC: [u8; 6] = [0x00, 0x03, 0x7f, 0x12, 0x34, 0x56];
 
 fn ready_fixed() -> Vec<u8> {
     le(&[
@@ -310,17 +310,17 @@ fn reg_ext_event() -> Vec<u8> {
 /// byte) — opaque to the core, which only routes it.
 const HTT_VERSION_CONF: [u8; 4] = [0x00, 0x51, 0x03, 0x00];
 
-struct Fw {
-    s: Script,
-    out: VecDeque<(u32, Vec<u8>)>,
-    started: bool,
+pub(super) struct Fw {
+    pub(super) s: Script,
+    pub(super) out: VecDeque<(u32, Vec<u8>)>,
+    pub(super) started: bool,
     ready_sent: bool,
     /// Host→target frames as `(pipe, transfer_id, bytes)`.
-    seen: Vec<(u8, u16, Vec<u8>)>,
+    pub(super) seen: Vec<(u8, u16, Vec<u8>)>,
 }
 
 impl Fw {
-    fn new(s: Script) -> Self {
+    pub(super) fn new(s: Script) -> Self {
         Fw {
             s,
             out: VecDeque::new(),
@@ -348,7 +348,7 @@ impl Fw {
     }
 
     /// RX buffers posted: the target sends HTC READY.
-    fn on_start(&mut self) {
+    pub(super) fn on_start(&mut self) {
         self.started = true;
         if self.s.send_ready && !self.s.ready_on_poll {
             self.send_ready();
@@ -361,7 +361,7 @@ impl Fw {
         }
     }
 
-    fn on_tx(&mut self, pipe: u8, tid: u16, f: &[u8]) {
+    pub(super) fn on_tx(&mut self, pipe: u8, tid: u16, f: &[u8]) {
         self.seen.push((pipe, tid, f.to_vec()));
         let Some(h) = HtcHdr::parse(f) else { return };
         let p = &f[8..];
@@ -569,7 +569,7 @@ impl<H: Hif, Q: QmiFw> CoreHooks<H, Q> for RecHooks {
     }
 }
 
-fn cfg() -> CoreConfig {
+pub(super) fn cfg() -> CoreConfig {
     CoreConfig::for_hw(&wcn6855()).expect("WCN6855 core config")
 }
 

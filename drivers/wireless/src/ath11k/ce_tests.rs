@@ -58,20 +58,20 @@ fn run<F: Future>(f: F) -> F::Output {
 
 // ── physical memory (the device side of DMA) ──────────────────────
 
-fn phys_rd32(pa: u64) -> u32 {
+pub(super) fn phys_rd32(pa: u64) -> u32 {
     // SAFETY: `pa` lies inside a live DMA32 coherent buffer the CE under
     // test allocated and owns; the kernel direct map covers it and it is
     // 4-byte aligned.
     unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(pa).kernel_ptr::<u32>()) }
 }
 
-fn phys_wr32(pa: u64, v: u32) {
+pub(super) fn phys_wr32(pa: u64, v: u32) {
     // SAFETY: as `phys_rd32`; the host only reads the words the device
     // model writes.
     unsafe { core::ptr::write_volatile(narf_memory::PhysAddr::new(pa).kernel_mut_ptr::<u32>(), v) }
 }
 
-fn phys_read(pa: u64, out: &mut [u8]) {
+pub(super) fn phys_read(pa: u64, out: &mut [u8]) {
     // SAFETY: `pa..pa + out.len()` is inside one live DMA buffer slot
     // (a ring slot of `src_sz_max` bytes, checked by the caller).
     unsafe {
@@ -83,7 +83,7 @@ fn phys_read(pa: u64, out: &mut [u8]) {
     }
 }
 
-fn phys_write(pa: u64, src: &[u8]) {
+pub(super) fn phys_write(pa: u64, src: &[u8]) {
     // SAFETY: as `phys_read`; the slot is a posted RX buffer the host
     // does not touch until the status descriptor reports it.
     unsafe {
@@ -136,13 +136,13 @@ impl FakeChip {
         }
         chip
     }
-    fn reg(&self, off: u32) -> u32 {
+    pub(super) fn reg(&self, off: u32) -> u32 {
         *self.regs.borrow().get(&off).unwrap_or(&0)
     }
     fn ops(&self) -> Vec<Op> {
         self.ops.borrow().clone()
     }
-    fn clear(&self) {
+    pub(super) fn clear(&self) {
         self.ops.borrow_mut().clear();
     }
     pub(super) fn take_pending(&self) -> u32 {

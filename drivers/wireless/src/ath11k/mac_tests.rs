@@ -113,10 +113,10 @@ fn mac_words(m: &[u8; 6]) -> [u32; 2] {
 
 // ── Fixture constants ───────────────────────────────────────────────
 
-const OWN: [u8; 6] = [0x00, 0x03, 0x7F, 0x12, 0x34, 0x56];
-const BSSID: [u8; 6] = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+pub(super) const OWN: [u8; 6] = [0x00, 0x03, 0x7F, 0x12, 0x34, 0x56];
+pub(super) const BSSID: [u8; 6] = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
 const BSSID2: [u8; 6] = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x01];
-const SSID: &[u8] = b"narf-ap";
+pub(super) const SSID: &[u8] = b"narf-ap";
 const PDEV: u32 = 0;
 /// `ht_cap_info`: ENABLED | HT20_SGI | DYNAMIC_SMPS | TX_STBC |
 /// RX_STBC_1SS | LDPC | HT40_SGI | RX_LDPC (`WMI_HT_CAP_*`).
@@ -212,27 +212,27 @@ fn us_reg(ext: bool) -> RegInfo {
 // ── Fake firmware + AP ──────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
-struct FwCfg {
-    scan_started: bool,
-    scan_start_failed: bool,
-    scan_completed: bool,
+pub(super) struct FwCfg {
+    pub(super) scan_started: bool,
+    pub(super) scan_start_failed: bool,
+    pub(super) scan_completed: bool,
     /// `None` → no VDEV_START_RESP.
-    vdev_start_status: Option<u32>,
-    peer_assoc_conf: bool,
-    install_key_status: Option<u32>,
-    peer_map: bool,
-    mgmt_ack: bool,
+    pub(super) vdev_start_status: Option<u32>,
+    pub(super) peer_assoc_conf: bool,
+    pub(super) install_key_status: Option<u32>,
+    pub(super) peer_map: bool,
+    pub(super) mgmt_ack: bool,
     /// `None` → the AP never answers.
-    auth_status: Option<u16>,
-    assoc_status: Option<u16>,
+    pub(super) auth_status: Option<u16>,
+    pub(super) assoc_status: Option<u16>,
     /// Frames (`(channel, snr, frame)`) delivered as MGMT_RX between
     /// STARTED and COMPLETED.
-    beacons: Vec<(u32, u32, Vec<u8>)>,
+    pub(super) beacons: Vec<(u32, u32, Vec<u8>)>,
     /// Run the WPA2 authenticator after a successful association.
-    eapol: bool,
-    send_m1: bool,
-    bad_m3_mic: bool,
-    m3_rsn: Option<Vec<u8>>,
+    pub(super) eapol: bool,
+    pub(super) send_m1: bool,
+    pub(super) bad_m3_mic: bool,
+    pub(super) m3_rsn: Option<Vec<u8>>,
 }
 
 impl Default for FwCfg {
@@ -303,36 +303,36 @@ fn aes_key_wrap(kek: &[u8; 16], plain: &[u8]) -> Vec<u8> {
     out
 }
 
-const PMK: [u8; 32] = [0x5A; 32];
+pub(super) const PMK: [u8; 32] = [0x5A; 32];
 const ANONCE: [u8; 32] = [0x11; 32];
 const SNONCE_FILL: u8 = 0x22;
-const GTK: [u8; 16] = [0x7C; 16];
+pub(super) const GTK: [u8; 16] = [0x7C; 16];
 const GTK_IDX: u8 = 1;
 
 #[derive(Default)]
-struct Ap {
-    ptk: Option<eapol::Ptk>,
-    m2_mic_ok: bool,
-    m2_rsn_ok: bool,
-    m4_ok: bool,
+pub(super) struct Ap {
+    pub(super) ptk: Option<eapol::Ptk>,
+    pub(super) m2_mic_ok: bool,
+    pub(super) m2_rsn_ok: bool,
+    pub(super) m4_ok: bool,
 }
 
 #[derive(Default)]
-struct World {
-    now: u64,
-    cfg: Option<FwCfg>,
-    sent: Vec<WmiCmd>,
-    mgmt: Vec<Vec<u8>>,
-    events: VecDeque<Vec<u8>>,
-    next_desc: u32,
-    done_descs: Vec<u32>,
-    eapol_rx: VecDeque<Vec<u8>>,
-    eth_tx: Vec<Vec<u8>>,
-    ap: Ap,
-    dp_calls: Vec<&'static str>,
-    authorized: Option<bool>,
-    sta_wme: Option<bool>,
-    pn: Vec<(u32, bool, bool)>,
+pub(super) struct World {
+    pub(super) now: u64,
+    pub(super) cfg: Option<FwCfg>,
+    pub(super) sent: Vec<WmiCmd>,
+    pub(super) mgmt: Vec<Vec<u8>>,
+    pub(super) events: VecDeque<Vec<u8>>,
+    pub(super) next_desc: u32,
+    pub(super) done_descs: Vec<u32>,
+    pub(super) eapol_rx: VecDeque<Vec<u8>>,
+    pub(super) eth_tx: Vec<Vec<u8>>,
+    pub(super) ap: Ap,
+    pub(super) dp_calls: Vec<&'static str>,
+    pub(super) authorized: Option<bool>,
+    pub(super) sta_wme: Option<bool>,
+    pub(super) pn: Vec<(u32, bool, bool)>,
 }
 
 type Shared = Arc<IrqSafeSpinLock<World>>;
@@ -369,11 +369,11 @@ fn vdev_peer_ev(id: u32, tag: u16, vdev: u32, m: &[u8; 6]) -> Vec<u8> {
 }
 
 impl World {
-    fn cfg(&self) -> FwCfg {
+    pub(super) fn cfg(&self) -> FwCfg {
         self.cfg.clone().unwrap_or_default()
     }
 
-    fn on_cmd(&mut self, c: &WmiCmd) {
+    pub(super) fn on_cmd(&mut self, c: &WmiCmd) {
         let cfg = self.cfg();
         let w = |i: usize| {
             u32::from_le_bytes([
@@ -475,10 +475,15 @@ impl World {
     }
 
     fn on_mgmt(&mut self, f: &[u8]) -> u32 {
-        let cfg = self.cfg();
-        self.mgmt.push(f.to_vec());
         let desc = self.next_desc;
         self.next_desc += 1;
+        self.on_mgmt_desc(f, desc)
+    }
+
+    /// The firmware side of `WMI_MGMT_TX_SEND_CMDID` for buffer `desc`.
+    pub(super) fn on_mgmt_desc(&mut self, f: &[u8], desc: u32) -> u32 {
+        let cfg = self.cfg();
+        self.mgmt.push(f.to_vec());
         self.events.push_back(event(
             WMI_MGMT_TX_COMPLETION_EVENTID,
             &[tlv(
@@ -511,7 +516,7 @@ impl World {
     }
 
     /// The authenticator: M2 → M3, M4 → done.
-    fn on_eth(&mut self, f: &[u8]) {
+    pub(super) fn on_eth(&mut self, f: &[u8]) {
         self.eth_tx.push(f.to_vec());
         let cfg = self.cfg();
         let Some((_, pdu)) = frame::parse_eapol_eth(f) else {
@@ -797,7 +802,7 @@ fn rates_ies() -> Vec<u8> {
 }
 
 /// A 2.4 GHz WPA2 HT40+ beacon on channel 6.
-fn beacon(bssid: &[u8; 6], ssid: &[u8], ds: u8, rsn: bool) -> Vec<u8> {
+pub(super) fn beacon(bssid: &[u8; 6], ssid: &[u8], ds: u8, rsn: bool) -> Vec<u8> {
     let mut f = frame::mgmt_hdr(frame::stype::BEACON, &[0xFF; 6], bssid, bssid);
     f.extend_from_slice(&[0x10, 0x32, 0x54, 0x76, 0, 0, 0, 0]); // TSF
     f.extend_from_slice(&100u16.to_le_bytes()); // beacon interval

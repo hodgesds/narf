@@ -245,7 +245,7 @@ fn msi() -> CeMsi {
     }
 }
 
-const SMALL: DpRingSizes = DpRingSizes {
+pub(super) const SMALL: DpRingSizes = DpRingSizes {
     wbm_release: 16,
     tcl_cmd: 8,
     tcl_status: 8,
@@ -284,25 +284,25 @@ fn rig(sizes: DpRingSizes) -> Rig {
 
 // ── RX descriptor / frame builders ────────────────────────────────
 
-const DESC_SZ: usize = 392;
+pub(super) const DESC_SZ: usize = 392;
 
 #[derive(Clone, Default)]
-struct Rxd {
-    first: bool,
-    last: bool,
-    l3pad: u32,
-    attn1: u32,
-    not_done: bool,
-    decrypt_status: u32,
-    msdu_len: u32,
-    decap: u32,
-    freq: u32,
-    enc_valid: bool,
-    enc_type: u32,
-    tid: u32,
-    seq: u32,
-    sw_peer_id: u16,
-    addr2: Option<[u8; 6]>,
+pub(super) struct Rxd {
+    pub(super) first: bool,
+    pub(super) last: bool,
+    pub(super) l3pad: u32,
+    pub(super) attn1: u32,
+    pub(super) not_done: bool,
+    pub(super) decrypt_status: u32,
+    pub(super) msdu_len: u32,
+    pub(super) decap: u32,
+    pub(super) freq: u32,
+    pub(super) enc_valid: bool,
+    pub(super) enc_type: u32,
+    pub(super) tid: u32,
+    pub(super) seq: u32,
+    pub(super) sw_peer_id: u16,
+    pub(super) addr2: Option<[u8; 6]>,
 }
 
 fn put32(b: &mut [u8], off: usize, v: u32) {
@@ -310,7 +310,7 @@ fn put32(b: &mut [u8], off: usize, v: u32) {
 }
 
 /// `struct hal_rx_desc_wcn6855` by byte offset (rx_desc.h).
-fn rx_desc_bytes(d: &Rxd) -> Vec<u8> {
+pub(super) fn rx_desc_bytes(d: &Rxd) -> Vec<u8> {
     let mut b = vec![0u8; DESC_SZ];
     // msdu_end.info2 @ 4 + 40: FIRST_MSDU bit 28, LAST_MSDU bit 29, L3 pad 27:26
     put32(
@@ -374,7 +374,14 @@ fn eth_frame(ethertype: u16, payload: &[u8]) -> Vec<u8> {
 }
 
 /// REO destination entry (`struct hal_reo_dest_ring`, 16 words).
-fn reo_dest(paddr: u64, cookie: u32, msdu_info: u32, push: u32, tid: u32, peer: u32) -> [u32; 16] {
+pub(super) fn reo_dest(
+    paddr: u64,
+    cookie: u32,
+    msdu_info: u32,
+    push: u32,
+    tid: u32,
+    peer: u32,
+) -> [u32; 16] {
     let mut w = [0u32; 16];
     w[0] = paddr as u32;
     w[1] = ((paddr >> 32) as u32 & 0xff) | (4 << 8) | (cookie << 11); // rbm SW1
@@ -385,8 +392,8 @@ fn reo_dest(paddr: u64, cookie: u32, msdu_info: u32, push: u32, tid: u32, peer: 
     w
 }
 
-const FIRST: u32 = 1 << 0;
-const LAST: u32 = 1 << 1;
+pub(super) const FIRST: u32 = 1 << 0;
+pub(super) const LAST: u32 = 1 << 1;
 const CONT: u32 = 1 << 2;
 
 /// Firmware side of the refill ring: take the next posted buffer.
@@ -411,7 +418,7 @@ fn deliver(io: &RecIo, refill: &mut DevRing, reo: &mut DevRing, d: &Rxd, msdu: &
     cookie
 }
 
-fn good_rxd(len: usize, decap_ty: u32) -> Rxd {
+pub(super) fn good_rxd(len: usize, decap_ty: u32) -> Rxd {
     Rxd {
         first: true,
         last: true,
@@ -1866,7 +1873,7 @@ fn smoke_ath11k_dp_tx_negatives() -> TestResult {
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_dp_tx_negatives);
 
 /// TQM release entry for TX descriptor `desc_id`.
-fn wbm_tqm(
+pub(super) fn wbm_tqm(
     desc_id: u32,
     reason: u32,
     ppdu: u32,

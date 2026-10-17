@@ -100,6 +100,8 @@ pub mod hal_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod htt_tests;
 #[cfg(any(test, feature = "kernel-test"))]
+pub mod integration_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 pub mod mac_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod mhi_tests;

@@ -725,6 +725,20 @@ fn smoke_ath11k_step_codes_unique_and_in_range() -> TestResult {
                 super::dp_peer::step::WMI_SEND,
             ],
         ),
+        (
+            "runtime",
+            250,
+            269,
+            &[
+                super::runtime::step::DP_UNSUPPORTED,
+                super::runtime::step::DP_MISSING,
+                super::runtime::step::HTT_VER_SEND,
+                super::runtime::step::SRING_SETUP_SEND,
+                super::runtime::step::DP_IRQ_CONFIG,
+                super::runtime::step::MAC_CAPS,
+                super::runtime::step::NET_REGISTER,
+            ],
+        ),
     ];
     let mut seen: Vec<u32> = Vec::new();
     for &(_name, lo, hi, codes) in layers {
