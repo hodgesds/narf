@@ -1163,7 +1163,7 @@ fn smoke_virtio_snd_pci_playback_queues_async() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
-    use narf_drivers_sound::format::{ChannelCount, HwParams, SampleFormat, SampleRate};
+    use narf_drivers_sound::format::{HwParams, SampleFormat};
     // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     if !devices().iter().any(|d| {
@@ -1182,14 +1182,23 @@ fn smoke_virtio_snd_pci_playback_queues_async() -> TestResult {
     let Some(card) = snd_pci::__card_index_for_test() else {
         return TestResult::Fail("virtio-snd card not registered");
     };
+    // QEMU advertises PCM_INFO from the last voice an earlier test prepared
+    // (hw/audio/virtio-snd.c::virtio_snd_pcm_prepare), so ask for a format
+    // the device reports now; the queueing is what this test pins.
+    let Ok(caps) = narf_drivers_sound::pcm_capabilities(card, false) else {
+        return TestResult::Fail("pcm_capabilities");
+    };
+    let (Some(&rate), Some(&channels)) = (caps.rates.last(), caps.channels.last()) else {
+        return TestResult::Fail("virtio-snd advertises no S16 rate or channel count");
+    };
     let Ok(mut stream) = narf_drivers_sound::open_playback(card, 0) else {
         return TestResult::Fail("open_playback");
     };
     // 32 periods of 1024 frames = 683 ms at 48 kHz.
     let params = HwParams {
         format: SampleFormat::S16LE,
-        rate: SampleRate::R48000,
-        channels: ChannelCount::Stereo,
+        rate,
+        channels,
         period_size: 1024,
         periods: 32,
     };
