@@ -296,7 +296,9 @@ fn navi22_bios_tables_go_to_dmub_when_running() -> TestResult {
         symbol_khz: 148_500,
     };
     if !tables.uses_dmub()
-        || tables.pipe_power_gating(bus.clone(), 1, PipeAction::Disable).is_err()
+        || tables
+            .pipe_power_gating(bus.clone(), 1, PipeAction::Disable)
+            .is_err()
         || tables.set_pixel_clock(bus.clone(), &clock).is_err()
         || tables.hdmi_stream_setup(bus.clone(), 1, 148_500).is_err()
         || tables.transmitter(bus.clone(), &t).is_err()
@@ -309,13 +311,19 @@ fn navi22_bios_tables_go_to_dmub_when_running() -> TestResult {
     let sent = dmcub.0.lock();
     let expect: [(VbiosCommand, Vec<u8>); 4] = [
         (VbiosCommand::EnableDispPowerGating, vec![1, 0, 0, 0]),
-        (VbiosCommand::SetPixelClock, clock.params().unwrap().to_vec()),
+        (
+            VbiosCommand::SetPixelClock,
+            clock.params().unwrap().to_vec(),
+        ),
         (
             VbiosCommand::DigxEncoderControl,
             hdmi_stream_setup_params(1, 148_500).unwrap().to_vec(),
         ),
         // Table 76 is revision 6 here: the v1.6 struct in the 60-byte union.
-        (VbiosCommand::Dig1TransmitterControl, t.params(6, 0).unwrap().to_vec()),
+        (
+            VbiosCommand::Dig1TransmitterControl,
+            t.params(6, 0).unwrap().to_vec(),
+        ),
     ];
     if *sent != expect {
         return TestResult::Fail("DMUB VBIOS payloads differ from command_table2.c");

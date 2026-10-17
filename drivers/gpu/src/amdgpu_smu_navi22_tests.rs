@@ -354,7 +354,9 @@ fn smu_navi22_tolerates_interface_mismatch_rejects_absent_device() -> TestResult
         e.io.interface = interface;
         let result = run(e.verify());
         if interface == u32::MAX {
-            if result != Err(Error::DeviceGone) || e.state != State::Failed || e.io.writes.len() != 3
+            if result != Err(Error::DeviceGone)
+                || e.state != State::Failed
+                || e.io.writes.len() != 3
             {
                 return TestResult::Fail("absent device accepted or second query issued");
             }
@@ -750,7 +752,10 @@ fn smu_navi22_scpm_skips_pptable_and_allowed_mask() -> TestResult {
     engine.io.scpm = 1;
     if run(engine.upload(&vec![0; crate::amdgpu_power_navi22::SMC_BYTES], &pool)).is_err()
         || !engine.scpm
-        || commands(&engine.io.writes).iter().map(|c| c.0).collect::<Vec<_>>()
+        || commands(&engine.io.writes)
+            .iter()
+            .map(|c| c.0)
+            .collect::<Vec<_>>()
             != [SET_DRIVER_HIGH, SET_DRIVER_LOW]
     {
         return TestResult::Fail("SCPM upload sent the PPTable or failed");

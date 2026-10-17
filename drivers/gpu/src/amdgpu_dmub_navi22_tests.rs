@@ -613,7 +613,10 @@ fn dmub_navi22_vbios_command_executes_through_the_inbox() -> TestResult {
     if sent[..4] != [128, 2, 0, 16] || sent[4..20] != payload || sent[20..] != [0; 44] {
         return TestResult::Fail("DMUB_CMD__VBIOS_SET_PIXEL_CLOCK slot");
     }
-    if engine.vbios(VbiosCommand::EnableDispPowerGating, &payload).is_ok() {
+    if engine
+        .vbios(VbiosCommand::EnableDispPowerGating, &payload)
+        .is_ok()
+    {
         return TestResult::Fail("oversized VBIOS payload accepted");
     }
     engine.io.commands = false;

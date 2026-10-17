@@ -500,7 +500,9 @@ fn dmub_result(result: Result<(), crate::amdgpu_dmub_navi22::Error>) -> Result<(
 /// a board without DMUB, not a failure; VBIOS display tables then run in the
 /// ATOM interpreter. dmub_dcn20_reset already forces a hung DMCUB into
 /// reset, so any other error (readback, device loss) stops the boot.
-fn dmub_quiesce_result(result: Result<(), crate::amdgpu_dmub_navi22::Error>) -> Result<bool, Error> {
+fn dmub_quiesce_result(
+    result: Result<(), crate::amdgpu_dmub_navi22::Error>,
+) -> Result<bool, Error> {
     match result {
         Ok(()) => Ok(true),
         Err(crate::amdgpu_dmub_navi22::Error::Unsupported) => {
