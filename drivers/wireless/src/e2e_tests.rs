@@ -559,7 +559,7 @@ kernel_test_in!(
 // ── Smoke 13 — ath11k probe + WMI VDEV_CREATE encode ────────────────
 
 fn smoke_e2e_ath11k_probe_and_vdev_create_encode() -> TestResult {
-    use crate::ath11k::wmi::build_vdev_create;
+    use crate::ath11k::wmi::{vdev_create_cmd, vdev_type, VdevCreateParams};
     use crate::ath11k::{register_pci_driver, ATH11K_DEV_QCA6390, QCOM_VENDOR};
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::{registered_pci_drivers, MatchKind};
@@ -581,9 +581,15 @@ fn smoke_e2e_ath11k_probe_and_vdev_create_encode() -> TestResult {
     // Build a WMI_VDEV_CREATE_CMDID frame and verify the MAC + vdev_id
     // round-trip into the TLV body.
     let vdev_mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
-    let frame = build_vdev_create(
-        0, /* vdev_type = STA */ 1, vdev_mac, /* pdev = 1 */ 1,
-    );
+    let frame = vdev_create_cmd(
+        &vdev_mac,
+        &VdevCreateParams {
+            vdev_type: vdev_type::STA,
+            pdev_id: 1,
+            ..Default::default()
+        },
+    )
+    .frame();
     if frame.is_empty() {
         return TestResult::Fail("VDEV_CREATE frame empty");
     }

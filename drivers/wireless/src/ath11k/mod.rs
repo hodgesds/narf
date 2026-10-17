@@ -42,6 +42,7 @@
 extern crate alloc;
 
 pub mod dp;
+pub mod htc;
 pub mod hw;
 pub mod mhi;
 pub mod mhi_host;
@@ -51,6 +52,7 @@ pub mod qmi;
 pub mod qmi_wlfw;
 pub mod qrtr;
 pub mod wmi;
+pub mod wmi_ids;
 
 pub use hw::{
     chip_for_pci_id, name_for, ChipInfo, HwRev, ATH11K_DEV_QCA6390, ATH11K_DEV_QCN9074,
@@ -71,3 +73,5 @@ pub mod mhi_tests;
 pub mod qmi_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests;
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod wmi_tests;

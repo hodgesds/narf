@@ -1,7 +1,8 @@
 //! ath11k smoke tests — co-located per project convention.
 //!
-//! Pure-data only: PCI match presence, hw_rev decode, WMI TLV
-//! round-trip, DP ring sizing. Live silicon
+//! Pure-data only: PCI match presence, hw_rev decode, and DP ring sizing.
+//! MHI protocol/host tests live in `mhi_tests.rs`; WMI/HTC tests live in
+//! `wmi_tests.rs`. Live silicon
 //! is exercised by the probe-bound-or-skip smoke at the bottom —
 //! that one Skips cleanly on QEMU.
 
@@ -16,7 +17,6 @@ use super::dp::*;
 use super::hw::*;
 use super::mhi::*;
 use super::pci::{is_probed, with_controller};
-use super::wmi::*;
 
 // ── PCI match table ────────────────────────────────────────────────
 
@@ -194,123 +194,6 @@ kernel_test_in!(
 
 // MHI protocol + host tests live in `mhi_tests.rs`.
 
-// ── WMI TLV encoder ────────────────────────────────────────────────
-
-fn smoke_ath11k_wmi_cmd_id_encode() -> TestResult {
-    // WMI_TLV_CMD(GRP_SCAN) = ((4<<12) | 0x1) = 0x4001.
-    if build_cmd_id(WMI_GRP_SCAN, 0) != 0x4001 {
-        return TestResult::Fail("WMI_START_SCAN_CMDID encoding wrong");
-    }
-    // PEER group: ((7<<12) | 1) = 0x7001.
-    if build_cmd_id(WMI_GRP_PEER, 0) != 0x7001 {
-        return TestResult::Fail("PEER_CREATE_CMDID encoding wrong");
-    }
-    // sub_id increments correctly.
-    if build_cmd_id(WMI_GRP_SCAN, 1) != 0x4002 {
-        return TestResult::Fail("WMI_STOP_SCAN_CMDID encoding wrong");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_wmi_cmd_id_encode);
-
-fn smoke_ath11k_wmi_tlv_round_trip() -> TestResult {
-    let mut b = WmiCmdBuilder::new(WMI_INIT_CMDID);
-    b.push_u32_tlv(WMI_TAG_RESOURCE_CONFIG, 0xDEAD_BEEF);
-    b.push_tlv(WMI_TAG_HOST_MEM_CHUNK, &[0xAA, 0xBB, 0xCC]);
-    let bytes = b.finish();
-    // Frame should start with the cmd_hdr.
-    let cmd_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-    if cmd_id != WMI_INIT_CMDID {
-        return TestResult::Fail("encoded cmd id wrong");
-    }
-    // Walk should yield two TLVs.
-    let (evt_id, tlvs) = walk_event(&bytes).expect("walk_event ok");
-    if evt_id != WMI_INIT_CMDID {
-        return TestResult::Fail("walked cmd id wrong");
-    }
-    if tlvs.len() != 2 {
-        return TestResult::Fail("expected 2 TLVs");
-    }
-    if tlvs[0].tag != WMI_TAG_RESOURCE_CONFIG {
-        return TestResult::Fail("first TLV tag wrong");
-    }
-    if tlvs[0].payload.len() != 4 {
-        return TestResult::Fail("first TLV payload size wrong");
-    }
-    let first_val = u32::from_le_bytes(tlvs[0].payload.try_into().unwrap());
-    if first_val != 0xDEAD_BEEF {
-        return TestResult::Fail("first TLV payload value wrong");
-    }
-    // Second TLV is 3-byte payload + 1-byte pad in the stream.
-    if tlvs[1].tag != WMI_TAG_HOST_MEM_CHUNK {
-        return TestResult::Fail("second TLV tag wrong");
-    }
-    if tlvs[1].payload != [0xAA, 0xBB, 0xCC] {
-        return TestResult::Fail("second TLV payload wrong");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_wmi_tlv_round_trip);
-
-fn smoke_ath11k_wmi_build_init_cmd() -> TestResult {
-    let rc = ResourceConfig {
-        num_vdevs: 3,
-        num_peers: 16,
-        num_tids: 256,
-        tx_chain_mask: 0x3,
-        rx_chain_mask: 0x3,
-        ..Default::default()
-    };
-    let bytes = build_init_cmd(&rc);
-    let (evt_id, tlvs) = walk_event(&bytes).expect("walk_event ok");
-    if evt_id != WMI_INIT_CMDID {
-        return TestResult::Fail("init cmd id wrong");
-    }
-    if tlvs.len() != 2 {
-        return TestResult::Fail("INIT should have 2 TLVs (init_cmd + resource_config)");
-    }
-    if tlvs[0].tag != WMI_TAG_INIT_CMD {
-        return TestResult::Fail("first TLV not WMI_TAG_INIT_CMD");
-    }
-    if tlvs[1].tag != WMI_TAG_RESOURCE_CONFIG {
-        return TestResult::Fail("second TLV not WMI_TAG_RESOURCE_CONFIG");
-    }
-    if tlvs[1].payload.len() != 40 {
-        return TestResult::Fail("resource_config payload should be 40 bytes");
-    }
-    // Spot-check encoded num_vdevs == 3.
-    let num_vdevs = u32::from_le_bytes(tlvs[1].payload[0..4].try_into().unwrap());
-    if num_vdevs != 3 {
-        return TestResult::Fail("num_vdevs not round-tripped");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_wmi_build_init_cmd);
-
-fn smoke_ath11k_wmi_truncated_tlv_detected() -> TestResult {
-    // Build a frame, lop off the last byte, expect Truncated.
-    let mut b = WmiCmdBuilder::new(WMI_INIT_CMDID);
-    b.push_u32_tlv(WMI_TAG_RESOURCE_CONFIG, 0xCAFE_F00D);
-    let mut bytes = b.finish();
-    bytes.pop();
-    match walk_event(&bytes) {
-        Err(WmiDecodeError::Truncated { .. }) => TestResult::Pass,
-        // The 4-byte payload becomes 3 bytes; with padding the
-        // stream might end exactly at a TLV boundary, in which
-        // case the decoder reports the truncation via remaining-
-        // byte mismatch. Either Truncated or a *shorter* tlv list
-        // is acceptable. We test the obvious failure mode here.
-        other => {
-            let _ = other; // hush unused
-            TestResult::Fail("expected Truncated on truncated input")
-        }
-    }
-}
-kernel_test_in!(
-    "drivers/wireless/ath11k",
-    smoke_ath11k_wmi_truncated_tlv_detected
-);
-
 // ── DP descriptor sizing ───────────────────────────────────────────
 
 fn smoke_ath11k_dp_ring_default_sizes() -> TestResult {
@@ -390,76 +273,6 @@ fn smoke_ath11k_probe_bound_or_skip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_probe_bound_or_skip);
-
-// ── Stage 3: WMI VDEV commands ─────────────────────────────────────
-
-fn smoke_ath11k_wmi_vdev_create_encode() -> TestResult {
-    let mac: [u8; 6] = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
-    let frame = build_vdev_create(0, vdev_type::STA, mac, 0);
-    // cmd_hdr(4) + VDEV_CREATE_CMD TLV hdr(4) + payload(36)
-    //           + ARRAY_STRUCT TLV hdr(4) + streams(24) = 72 bytes.
-    if frame.len() < 16 {
-        return TestResult::Fail("vdev_create frame too short");
-    }
-    let cmd_id = u32::from_le_bytes(frame[0..4].try_into().unwrap()) & 0x00FF_FFFF;
-    if cmd_id != WMI_VDEV_CREATE_CMDID {
-        return TestResult::Fail("cmd_id != WMI_VDEV_CREATE_CMDID");
-    }
-    // walk_event parses from the cmd_hdr (offset 0), treating it as the event id.
-    let (evt_id, tlvs) = match walk_event(&frame) {
-        Ok(r) => r,
-        Err(_) => return TestResult::Fail("walk_event failed on vdev_create frame"),
-    };
-    if evt_id != WMI_VDEV_CREATE_CMDID {
-        return TestResult::Fail("walk_event evt_id != WMI_VDEV_CREATE_CMDID");
-    }
-    if tlvs.is_empty() {
-        return TestResult::Fail("no TLVs in vdev_create frame");
-    }
-    // First TLV is VDEV_CREATE_CMD; payload[0..4] = vdev_id.
-    if tlvs[0].payload.len() < 4 {
-        return TestResult::Fail("first TLV payload too short");
-    }
-    let vdev_id = u32::from_le_bytes(tlvs[0].payload[0..4].try_into().unwrap());
-    if vdev_id != 0 {
-        return TestResult::Fail("vdev_id != 0 in first TLV");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/wireless/ath11k/wmi",
-    smoke_ath11k_wmi_vdev_create_encode
-);
-
-fn smoke_ath11k_wmi_vdev_set_param_channel_encode() -> TestResult {
-    let frame = build_vdev_set_param(0, vdev_param::CHANNEL, 5180);
-    // cmd_hdr(4) + VDEV_SET_PARAM_CMD TLV hdr(4) + payload(12) = 20 bytes.
-    if frame.len() != 20 {
-        return TestResult::Fail("vdev_set_param frame size wrong (expected 20)");
-    }
-    let cmd_id = u32::from_le_bytes(frame[0..4].try_into().unwrap()) & 0x00FF_FFFF;
-    if cmd_id != WMI_VDEV_SET_PARAM_CMDID {
-        return TestResult::Fail("cmd_id != WMI_VDEV_SET_PARAM_CMDID");
-    }
-    // cmd_id must differ from ath10k's 0x5003.
-    if cmd_id == 0x5003 {
-        return TestResult::Fail("ath11k set_param cmd_id wrongly matches ath10k 0x5003");
-    }
-    // TLV payload at offset 8: vdev_id(4) + param_id(4) + param_value(4).
-    let param_id = u32::from_le_bytes(frame[12..16].try_into().unwrap());
-    let param_val = u32::from_le_bytes(frame[16..20].try_into().unwrap());
-    if param_id != vdev_param::CHANNEL {
-        return TestResult::Fail("param_id != CHANNEL");
-    }
-    if param_val != 5180 {
-        return TestResult::Fail("param_value != 5180");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/wireless/ath11k/wmi",
-    smoke_ath11k_wmi_vdev_set_param_channel_encode
-);
 
 // ── Phase 1: power-up sequence (Linux ath11k_pci_sw_reset) ─────────
 

@@ -116,6 +116,52 @@ Tests: `qmi_tests.rs` (arch-neutral). WLFW golden vectors were
 produced by running Linux's own `qmi_encdec.c` on the ath11k ei
 tables.
 
+### 3.1 HTC (`htc.rs`, Linux `htc.{c,h}`)
+
+Pure state machine, no MMIO: frames in, `HtcTx { pipe, eid,
+credits, frame }` out.
+
+- `HtcHdr` (8-byte `ath11k_htc_hdr`), control-message encoders /
+  parsers (READY, CONNECT_SERVICE[_RESP], SETUP_COMPLETE_EX, credit
+  trailer records), `svc_id::*`, `conn_flags::*`, `msg_id::*`.
+- `Htc::{init, send, revert_credits, rx, wait_target,
+  connect_service_request, connect_service_complete, start}` — one
+  method per Linux step; per-endpoint TX credits charged as
+  `DIV_ROUND_UP(len, target_credit_size)` and replenished from
+  `ATH11K_HTC_RECORD_CREDITS` trailers.
+- `HtcHandshake` — `ath11k_core_start`'s HTC order: READY → connect
+  HTT_DATA_MSG → connect WMI_CONTROL (×`wmi_ep_count`) →
+  SETUP_COMPLETE_EX. `HtcConfig::wcn6855()` = credit flow on,
+  shadow regs (1 total credit), one WMI endpoint.
+- `TARGET_SERVICE_TO_CE_MAP_WLAN_QCA6390` (14 entries, hw.c) +
+  `map_service_to_pipe`; shared with the QMI WLAN-config request
+  (`ServiceToPipe::to_le_bytes`).
+
+### 3.2 WMI (`wmi.rs`, `wmi_ids.rs`, Linux `wmi.{c,h}`)
+
+- `wmi_ids.rs`: every `wmi_cmd_group` / `wmi_tlv_cmd_id` /
+  `wmi_tlv_event_id` / `wmi_tlv_tag` / `wmi_tlv_service` /
+  pdev / vdev parameter value, generated from the Linux enums
+  (compiler-evaluated); re-exported by `wmi`.
+- Encoders return `WmiCmd { cmd_id, buf }` byte-identical to the
+  Linux builder's `skb->data`; `WmiCmd::frame()` adds `wmi_cmd_hdr`.
+  INIT (`TargetResourceConfig::qca6390`, host mem chunks, hw mode),
+  SET_HW_MODE, PDEV_SET_PARAM / SET_REGDOMAIN / GET_TEMPERATURE,
+  SET_CURRENT_COUNTRY, SET_INIT_COUNTRY, 11D_SCAN_START/STOP,
+  VDEV_CREATE/DELETE/START/RESTART/UP/STOP/DOWN/SET_PARAM/INSTALL_KEY,
+  PEER_CREATE/DELETE/SET_PARAM/ASSOC, START_SCAN (+
+  `ScanReqParams::start_scan_init`), STOP_SCAN, SCAN_CHAN_LIST
+  (split by `max_msg_len`), MGMT_TX_SEND, STA_POWERSAVE_MODE/PARAM.
+- Decoders: `tlv_iter` / `TlvTable` (`ath11k_wmi_tlv_iter` +
+  `wmi_tlv_policies[]`), `decode_event` → `WmiEvent`; SERVICE_READY,
+  SERVICE_AVAILABLE (`ServiceMap`), SERVICE_READY_EXT/EXT2, READY
+  (device MAC), REG_CHAN_LIST_CC[_EXT], VDEV_START_RESP,
+  VDEV_STOPPED, VDEV/PEER_DELETE_RESP, PEER_ASSOC_CONF,
+  INSTALL_KEY_COMPLETE, PEER_STA_KICKOUT, SCAN, MGMT_RX (+
+  `rx_status()`), MGMT_TX_COMPLETION, ROAM, PDEV_TEMPERATURE. Where
+  Linux reads past a TLV unchecked, NARF rejects ("NARF-stricter" in
+  the source).
+
 ## 4. Invariants
 
 - The PCI table is exactly Linux's `ath11k_pci_id_table`.
