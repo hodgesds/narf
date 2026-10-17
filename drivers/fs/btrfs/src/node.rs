@@ -1177,12 +1177,32 @@ impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
     }
 
     fn reconfigure(&self, options: &str) -> Result<(), FsError> {
-        // Read-only volume: accept only `ro`/empty option tokens.
-        for opt in options.split(',').filter(|s| !s.is_empty()) {
-            if opt != "ro" {
-                return Err(FsError::Unsupported);
-            }
+        // `systemd-remount-fs` remounts `/` with its fstab options
+        // (`subvol=/@,compress=zstd:1`, ...). Accept what a mount accepts;
+        // like Linux, `subvol=`/`subvolid=` cannot change on remount and are
+        // ignored, everything else replaces the recorded run-time options.
+        let mut parsed = crate::mount_opts::parse(options)?;
+        let current = self.mount_options();
+        parsed.subvol = current.subvol;
+        if parsed.read_only && !self.is_read_only() {
+            // A writable volume cannot be flipped read-only in place yet.
+            return Err(FsError::Unsupported);
         }
+        parsed.read_only = current.read_only;
+        self.set_mount_options(parsed);
         Ok(())
+    }
+
+    fn show_options(&self) -> alloc::string::String {
+        let options = self.mount_options();
+        let mut out = options.render();
+        let id = self.mounted_subvol_id();
+        out.push_str(&alloc::format!(",subvolid={id}"));
+        if let Some(crate::volume::Subvol::Name(path)) = &options.subvol {
+            out.push_str(&alloc::format!(",subvol=/{path}"));
+        } else if id == crate::format::FS_TREE_OBJECTID {
+            out.push_str(",subvol=/");
+        }
+        out
     }
 }

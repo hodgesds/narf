@@ -34,6 +34,7 @@ pub mod extent;
 pub mod format;
 pub mod inode;
 pub mod lzo;
+pub mod mount_opts;
 pub mod node;
 pub mod roots;
 pub mod volume;
@@ -87,66 +88,48 @@ fn discover_members(source: Arc<dyn BlockDeviceSync>) -> alloc::vec::Vec<Arc<Syn
 }
 
 /// Parse the `mount -t btrfs` option string into an optional subvolume selector.
-/// Accepts read-only-compatible options plus `subvolid=N` / `subvol=PATH`;
-/// anything else is `Unsupported`.
+/// Accepts every option [`mount_opts::parse`] accepts; format-affecting or
+/// unknown options are `Unsupported`.
 pub fn parse_mount_subvol(options: &str) -> Result<Option<volume::Subvol>, FsError> {
-    let mut selector = None;
-    for option in options.split(',').filter(|s| !s.is_empty()) {
-        if option == "ro" || option == "errors=continue" {
-            continue;
-        } else if let Some(v) = option.strip_prefix("subvolid=") {
-            let id: u64 = v.parse().map_err(|_| FsError::InvalidData)?;
-            selector = Some(volume::Subvol::Id(id));
-        } else if let Some(v) = option.strip_prefix("subvol=") {
-            // Leading/trailing slashes are harmless, but empty, dot, and dotdot
-            // components make resolution ambiguous and are rejected.
-            let path = v.trim_matches('/');
-            if path.is_empty()
-                || path
-                    .split('/')
-                    .any(|component| component.is_empty() || component == "." || component == "..")
-            {
-                return Err(FsError::Unsupported);
-            }
-            selector = Some(volume::Subvol::Name(alloc::string::String::from(path)));
-        } else {
-            return Err(FsError::Unsupported);
-        }
-    }
-    Ok(selector)
+    Ok(mount_opts::parse(options)?.subvol)
 }
 
-/// `mount -t btrfs <source>` builder. Resolves the source to a registered block
-/// device and honours `subvol=`/`subvolid=`.
-fn btrfs_fstype_builder(source: &str, options: &str) -> Result<Arc<dyn FsInstance>, FsError> {
-    let subvol = parse_mount_subvol(options)?;
+/// `mount -t btrfs <source>` constructor. Resolves the source to a registered
+/// block device and honours `subvol=`/`subvolid=`, the recorded data options
+/// and a read-only request (`MS_RDONLY`, `fsconfig(ro)`, or `ro` in the data).
+fn btrfs_fstype_builder(
+    request: &narf_filesystem::MountRequest<'_>,
+) -> Result<Arc<dyn FsInstance>, FsError> {
+    let options = mount_opts::parse(request.options)?;
+    let source = request.source;
     let name = source.strip_prefix("/dev/").unwrap_or(source);
     let dev = narf_block::find_block_device(name).ok_or(FsError::NotFound)?;
     let devices = discover_members(dev);
-    // `ro` in the data string really mounts read-only: no log replay, no
-    // commit timer, no device write.
-    if options.split(',').any(|option| option == "ro") {
-        let volume = narf_scheduler::block_on(async {
+    // A read-only request really mounts read-only: no log replay, no commit
+    // timer, no device write.
+    let volume = if request.read_only || options.read_only {
+        narf_scheduler::block_on(async {
             let volume =
                 volume::BtrfsVolume::mount_devices_read_only(devices, DomainId::DRIVER_0, true)
                     .await?;
-            if let Some(selector) = &subvol {
+            if let Some(selector) = &options.subvol {
                 volume.switch_to_subvol(selector).await?;
             }
             Ok::<_, FsError>(volume)
-        })?;
-        return Ok(volume);
-    }
-    let volume = narf_scheduler::block_on(volume::BtrfsVolume::mount_subvol_devices(
-        devices,
-        DomainId::DRIVER_0,
-        true,
-        subvol,
-    ))?;
+        })?
+    } else {
+        narf_scheduler::block_on(volume::BtrfsVolume::mount_subvol_devices(
+            devices,
+            DomainId::DRIVER_0,
+            true,
+            options.subvol.clone(),
+        ))?
+    };
+    volume.set_mount_options(options);
     Ok(volume)
 }
 
 /// Register the named mount constructor without building a volume.
 pub fn register_fstypes() {
-    narf_filesystem::register_block_fstype("btrfs", btrfs_fstype_builder);
+    narf_filesystem::register_block_fstype_ctx("btrfs", btrfs_fstype_builder);
 }
