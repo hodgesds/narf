@@ -37,7 +37,7 @@ pub enum BlockIoError {
     /// Device was removed / not bound.
     DeviceRemoved,
     /// Write refused: the device is read-only under the active
-    /// [`crate::disk_policy`] (`narf.disks=boot-only`).
+    /// [`crate::disk_policy`] (`narf.disks=boot-only|root-ro|root-rw`).
     ReadOnly,
 }
 
@@ -102,6 +102,10 @@ pub struct RegisteredBlockDevice {
     /// Physical-disk identity shared by a disk and its partitions; the unit
     /// [`crate::disk_policy::trust_boot_medium`] trusts.
     pub disk: crate::disk_policy::DiskId,
+    /// Identity of this registration (its guard), never reused: the unit
+    /// [`crate::disk_policy::designate_root`] designates. A device
+    /// re-registered under the same name gets a new one.
+    pub dev_id: crate::disk_policy::DevId,
     /// GPT metadata, if this entry is a partition. `None` for
     /// whole-disk parents and for legacy-MBR partitions.
     pub partition: Option<PartitionMetadata>,
@@ -112,6 +116,7 @@ impl core::fmt::Debug for RegisteredBlockDevice {
         f.debug_struct("RegisteredBlockDevice")
             .field("name", &self.name)
             .field("disk", &self.disk)
+            .field("dev_id", &self.dev_id)
             .field("partition", &self.partition)
             .finish_non_exhaustive()
     }
@@ -157,25 +162,30 @@ fn register_entry(
     dev: Arc<dyn BlockDeviceSync>,
     partition: Option<PartitionMetadata>,
 ) {
-    {
+    let (entry, replaced) = {
         let mut g = REGISTRY.lock();
         let disk = parent_name
             .and_then(|parent| g.iter().find(|e| e.name == parent).map(|e| e.disk))
             .unwrap_or_else(crate::disk_policy::new_disk_id);
-        let dev = Arc::new(crate::disk_policy::PolicyGuard::new(name, disk, dev))
-            as Arc<dyn BlockDeviceSync>;
+        let guard = crate::disk_policy::PolicyGuard::new(name, disk, dev);
+        let dev_id = guard.dev_id();
         let entry = RegisteredBlockDevice {
             name,
-            dev,
+            dev: Arc::new(guard) as Arc<dyn BlockDeviceSync>,
             disk,
+            dev_id,
             partition,
         };
-        if let Some(pos) = g.iter().position(|e| e.name == name) {
-            g[pos] = entry;
+        let replaced = if let Some(pos) = g.iter().position(|e| e.name == name) {
+            Some(core::mem::replace(&mut g[pos], entry.clone()).dev_id)
         } else {
-            g.push(entry);
-        }
-    }
+            g.push(entry.clone());
+            None
+        };
+        (entry, replaced)
+    };
+    // Outside the registry lock: the hook may read the device.
+    crate::disk_policy::note_registered(&entry, replaced);
     // Wave G: pair every registered device with a default
     // `IoScheduler` slot (boxed `DeadlineScheduler`). Reservation is
     // idempotent on `name` — a second `register_block_device` for
@@ -229,9 +239,14 @@ pub fn find_block_device_indexed(name: &str) -> Option<(usize, Arc<dyn BlockDevi
 /// Unregister a block device by name.  No-op if the name is not
 /// present.  Used by hot-unplug paths and by test teardown.
 pub fn unregister_block_device(name: &str) {
-    let mut g = REGISTRY.lock();
-    if let Some(pos) = g.iter().position(|e| e.name == name) {
-        g.swap_remove(pos);
+    let removed = {
+        let mut g = REGISTRY.lock();
+        g.iter()
+            .position(|e| e.name == name)
+            .map(|pos| g.swap_remove(pos).dev_id)
+    };
+    if let Some(dev_id) = removed {
+        crate::disk_policy::note_unregistered(dev_id);
     }
 }
 

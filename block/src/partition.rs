@@ -77,14 +77,65 @@ pub fn discover_volume_uuid(dev: &dyn BlockDeviceSync) -> Option<String> {
     if dev.read(0, blocks as u16, &mut bytes).is_err()
         || bytes.get(1024 + 0x38..1024 + 0x3a) != Some(&[0x53, 0xef][..])
     {
+        // A btrfs superblock sits at byte 65536: `fsid` at +32, magic
+        // `_BHRfS_M` at +64. This is the `UUID=` Linux's blkid reports for
+        // the volume (`/dev/disk/by-uuid`), and what `root=UUID=` names on an
+        // installed btrfs distro root.
+        return btrfs_fsid(dev, lba_bytes).map(|uuid| format_uuid_bytes(&uuid));
+    }
+    let mut uuid = [0u8; 16];
+    uuid.copy_from_slice(&bytes[1024 + 0x68..1024 + 0x68 + 16]);
+    Some(format_uuid_bytes(&uuid))
+}
+
+/// Byte offset of the primary btrfs superblock.
+const BTRFS_SUPER_OFFSET: usize = 65536;
+
+/// The btrfs `fsid` of `dev`'s primary superblock, when its magic matches.
+/// Only the identification bytes are read; the driver validates the rest.
+fn btrfs_fsid(dev: &dyn BlockDeviceSync, lba_bytes: usize) -> Option<[u8; 16]> {
+    let first = BTRFS_SUPER_OFFSET / lba_bytes;
+    let span = (BTRFS_SUPER_OFFSET + 72).div_ceil(lba_bytes) - first;
+    if (first + span) as u64 > dev.capacity() || span > u16::MAX as usize {
         return None;
     }
-    let uuid = &bytes[1024 + 0x68..1024 + 0x68 + 16];
-    Some(format!(
+    let mut bytes = alloc::vec![0u8; span * lba_bytes];
+    dev.read(first as u64, span as u16, &mut bytes).ok()?;
+    let base = BTRFS_SUPER_OFFSET - first * lba_bytes;
+    if bytes.get(base + 64..base + 72) != Some(b"_BHRfS_M".as_slice()) {
+        return None;
+    }
+    let mut fsid = [0u8; 16];
+    fsid.copy_from_slice(bytes.get(base + 32..base + 48)?);
+    Some(fsid)
+}
+
+/// Canonical lowercase 8-4-4-4-12 rendering of a 16-byte UUID.
+pub fn format_uuid_bytes(uuid: &[u8; 16]) -> String {
+    format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
         uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]
-    ))
+    )
+}
+
+/// Parse a canonical (hyphenated or not) 32-hex-digit UUID. FAT serials
+/// (`6D89-28C5`) and anything else not exactly 16 bytes return `None`.
+pub fn parse_uuid(text: &str) -> Option<[u8; 16]> {
+    let mut out = [0u8; 16];
+    let mut nibbles = 0usize;
+    for c in text.chars() {
+        if c == '-' {
+            continue;
+        }
+        let v = c.to_digit(16)? as u8;
+        if nibbles >= 32 {
+            return None;
+        }
+        out[nibbles / 2] |= if nibbles % 2 == 0 { v << 4 } else { v };
+        nibbles += 1;
+    }
+    (nibbles == 32).then_some(out)
 }
 
 // ── Common signatures ──────────────────────────────────────────────
