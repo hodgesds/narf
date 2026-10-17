@@ -358,14 +358,18 @@ fn dev_info_topology(
 ///
 /// VRAM and CPU-accessible VRAM are the same number only on an APU. On a
 /// discrete card the second is BAR0's length — 256 MiB against however many
-/// gigabytes the card has, unless Resizable BAR is sized to VRAM. GTT is
-/// zero: there is no GART or system-memory heap manager, and claiming a size
-/// for a heap nothing can allocate from would be worse than reporting none.
+/// gigabytes the card has, unless Resizable BAR is sized to VRAM. GTT is the
+/// system memory GEM buffers may hold (`amdgpu_gem::gtt_limit`, half of RAM
+/// as TTM's default) and what they hold now.
 fn memory_info(snap: &Snapshot) -> Vec<u8> {
+    let gtt = crate::amdgpu_gem::gtt_limit();
     as_bytes(&uapi::DrmAmdgpuMemoryInfo {
         vram: heap_info(snap.vram_size),
         cpu_accessible_vram: heap_info(snap.visible_vram_size),
-        gtt: heap_info(0),
+        gtt: uapi::DrmAmdgpuHeapInfo {
+            heap_usage: crate::amdgpu_gem::gtt_used(),
+            ..heap_info(gtt)
+        },
     })
 }
 
@@ -374,7 +378,7 @@ fn vram_gtt(snap: &Snapshot) -> Vec<u8> {
     as_bytes(&uapi::DrmAmdgpuInfoVramGtt {
         vram_size: snap.vram_size,
         vram_cpu_accessible_size: snap.visible_vram_size,
-        gtt_size: 0,
+        gtt_size: crate::amdgpu_gem::gtt_limit(),
     })
 }
 

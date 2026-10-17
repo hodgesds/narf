@@ -29,8 +29,10 @@
 //! physical VRAM address (`gmc_v1x_0_get_vm_pde`'s translation) without
 //! SYSTEM, and the CPU maps it through the BAR. Anything else — every APU
 //! buffer, a GTT buffer, or VRAM falling back to GTT when the heap is full —
-//! is physically contiguous system memory from the buddy allocator, which
-//! the GPU reaches as SYSTEM pages (the IOMMU runs identity mappings).
+//! is system memory from the buddy allocator, which the GPU reaches as
+//! SYSTEM pages (the IOMMU runs identity mappings): power-of-two chunks
+//! covering exactly its pages, as TTM backs a GTT BO with scattered pages,
+//! within a GTT limit of half of RAM (TTM's default page limit).
 //!
 //! A `NO_CPU_ACCESS` buffer goes first to the heap's VRAM past the BAR
 //! ([`UnmappedHeap`]), when the card has some. The CPU cannot clear that, so
@@ -56,7 +58,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use narf_filesystem::FsError;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -186,8 +188,8 @@ fn domains_valid(domains: u64) -> bool {
 /// Where a buffer's memory came from, which decides how it is returned.
 #[derive(Debug)]
 enum Backing {
-    /// Buddy pages of this order.
-    System(u8),
+    /// Buddy blocks `(address, order)`, in buffer order.
+    System(Vec<(u64, u8)>),
     /// A VRAM pool reservation, held for its drop, which returns it to the
     /// pool.
     Vram {
@@ -203,11 +205,13 @@ enum Backing {
 /// asked for when it created it.
 #[derive(Debug)]
 pub struct GemObject {
-    /// What the CPU maps: the system pages, or the buffer's BAR window
-    /// (0 for a buffer past the BAR, which the CPU cannot map).
+    /// What the CPU maps at the start of the buffer: the first system
+    /// chunk, or the buffer's BAR window (0 for a buffer past the BAR,
+    /// which the CPU cannot map). [`frames`](Self::frames) gives the rest.
     pub phys: u64,
-    /// What the GPU's page-table entries carry: the system pages' address,
-    /// or the physical VRAM address.
+    /// What the GPU's page-table entries carry for the first page: the
+    /// first system chunk's address, or the physical VRAM address.
+    /// [`gpu_at`](Self::gpu_at) gives any page.
     pub gpu: u64,
     /// The GPU reaches it as system memory (SYSTEM/SNOOPED entries).
     pub system: bool,
@@ -237,6 +241,34 @@ struct Metadata {
 }
 
 impl GemObject {
+    /// The physical address of byte `offset` (inside the buffer) and how
+    /// many bytes from there lie in the same contiguous chunk.
+    fn locate(&self, offset: u64) -> Option<(u64, u64)> {
+        if offset >= self.byte_len {
+            return None;
+        }
+        match &self.backing {
+            Backing::System(chunks) => {
+                let mut start = 0;
+                for &(phys, order) in chunks {
+                    let len = PAGE_SIZE << order;
+                    if offset < start + len {
+                        return Some((phys + offset - start, start + len - offset));
+                    }
+                    start += len;
+                }
+                None
+            }
+            _ => Some((self.gpu + offset, self.byte_len - offset)),
+        }
+    }
+
+    /// The address page-table entries carry for byte `offset` of the
+    /// buffer, which must lie inside it.
+    pub fn gpu_at(&self, offset: u64) -> Option<u64> {
+        self.locate(offset).map(|(at, _)| at)
+    }
+
     /// The CPU address of byte `offset` of the buffer, if 8 bytes from
     /// there lie inside it.
     fn cpu_ptr(&self, offset: u64) -> Option<*mut u8> {
@@ -245,7 +277,11 @@ impl GemObject {
         }
         Some(match &self.backing {
             Backing::System(_) => {
-                narf_memory::PhysAddr::new(self.phys + offset).kernel_mut_ptr::<u8>()
+                let (at, run) = self.locate(offset)?;
+                if run < 8 {
+                    return None;
+                }
+                narf_memory::PhysAddr::new(at).kernel_mut_ptr::<u8>()
             }
             Backing::Vram { _held } => (_held.mapping().virt + offset) as *mut u8,
             Backing::Unmapped { .. } => return None,
@@ -302,9 +338,15 @@ impl GemObject {
         {
             return Err(FsError::InvalidData);
         }
-        Ok((0..len / PAGE_SIZE)
-            .map(|i| self.phys + offset + i * PAGE_SIZE)
-            .collect())
+        (0..len / PAGE_SIZE)
+            .map(|i| match self.backing {
+                Backing::System(_) => self
+                    .locate(offset + i * PAGE_SIZE)
+                    .map(|(at, _)| at)
+                    .ok_or(FsError::InvalidData),
+                _ => Ok(self.phys + offset + i * PAGE_SIZE),
+            })
+            .collect()
     }
 
     /// Where the buffer lives: `AMDGPU_GEM_DOMAIN_VRAM` or `_GTT`.
@@ -322,9 +364,9 @@ impl Drop for GemObject {
         // Memory returns when the last reference (handle, CPU mapping or VA
         // mapping) goes; an address space a job ran in holds its removed
         // mappings' buffers until that job's fence (`VmState::note_job`).
-        if let Backing::System(order) = self.backing {
-            let frame = narf_memory::PhysFrame::containing(narf_memory::PhysAddr::new(self.phys));
-            narf_memory::frame::free_pages(frame, order);
+        if let Backing::System(chunks) = &self.backing {
+            free_chunks(chunks);
+            GTT_USED.fetch_sub(self.byte_len, Ordering::Relaxed);
         }
     }
 }
@@ -460,6 +502,103 @@ impl GemState {
     }
 }
 
+/// Bytes of system memory GEM buffers hold, against [`gtt_limit`].
+static GTT_USED: AtomicU64 = AtomicU64::new(0);
+
+/// How much system memory GEM buffers may hold in all: half of RAM, TTM's
+/// default page limit (ttm_tt_pages_limit), which amdgpu also reports as
+/// its GTT size.
+pub fn gtt_limit() -> u64 {
+    (narf_memory::frame::stats().total as u64 * PAGE_SIZE) / 2
+}
+
+/// Bytes of system memory GEM buffers hold now.
+pub fn gtt_used() -> u64 {
+    GTT_USED.load(Ordering::Relaxed)
+}
+
+/// Return buddy blocks to the allocator.
+fn free_chunks(chunks: &[(u64, u8)]) {
+    for &(phys, order) in chunks {
+        let frame = narf_memory::PhysFrame::containing(narf_memory::PhysAddr::new(phys));
+        narf_memory::frame::free_pages(frame, order);
+    }
+}
+
+/// `pages` of zeroed system memory as buddy blocks in buffer order: the
+/// binary decomposition of `pages`, each block split in two when the
+/// allocator has none that large, within the GTT limit.
+fn alloc_system(pages: u64) -> Result<Vec<(u64, u8)>, FsError> {
+    let bytes = pages * PAGE_SIZE;
+    let limit = gtt_limit();
+    GTT_USED
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            used.checked_add(bytes).filter(|&total| total <= limit)
+        })
+        .map_err(|_| FsError::NoSpace)?;
+    let mut chunks: Vec<(u64, u8)> = Vec::new();
+    // Orders still to allocate, largest first; a failed one is retried as
+    // two of the next order down.
+    let mut wanted: Vec<u8> = Vec::new();
+    for order in (0..=63u8).rev() {
+        let order_pages = 1u64.checked_shl(u32::from(order)).unwrap_or(0);
+        if pages & order_pages == 0 {
+            continue;
+        }
+        // Blocks above the allocator's largest are several of its largest.
+        let max = narf_memory::buddy::MAX_ORDER;
+        if order > max {
+            // The GTT limit, checked above, bounds the count.
+            wanted.extend(core::iter::repeat_n(max, 1usize << (order - max)));
+        } else {
+            wanted.push(order);
+        }
+    }
+    let result = (|| {
+        let mut at = 0;
+        while at < wanted.len() {
+            let order = wanted[at];
+            match narf_memory::frame::alloc_pages_on(0, order) {
+                Ok(frame) => {
+                    let phys = frame.start_address().raw();
+                    chunks.try_reserve(1).map_err(|_| {
+                        narf_memory::frame::free_pages(frame, order);
+                        FsError::NoSpace
+                    })?;
+                    chunks.push((phys, order));
+                    at += 1;
+                }
+                Err(_) if order > 0 => {
+                    wanted.try_reserve(1).map_err(|_| FsError::NoSpace)?;
+                    wanted[at] = order - 1;
+                    wanted.insert(at + 1, order - 1);
+                }
+                Err(_) => return Err(FsError::NoSpace),
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        free_chunks(&chunks);
+        GTT_USED.fetch_sub(bytes, Ordering::Relaxed);
+        return Err(e);
+    }
+    // Zero before userspace or the GPU can see it. This is not optional:
+    // the pages come from the kernel's own allocator and may hold anything.
+    for &(phys, order) in &chunks {
+        // SAFETY: the block covers `1 << order` pages at `phys`, which the
+        // kernel maps at a fixed offset, and is this buffer's alone.
+        unsafe {
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
+                0,
+                (PAGE_SIZE << order) as usize,
+            );
+        }
+    }
+    Ok(chunks)
+}
+
 /// `amdgpu_gem_create_ioctl`.
 fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
     let size = core::mem::size_of::<uapi::DrmAmdgpuGemCreateIn>();
@@ -498,16 +637,6 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
         .checked_next_multiple_of(PAGE_SIZE)
         .ok_or(FsError::InvalidData)?;
     let pages = byte_len / PAGE_SIZE;
-    // The buddy allocator is power-of-two, and the request must also satisfy
-    // `alignment`, which a contiguous power-of-two block of this size does for
-    // any alignment up to its own size.
-    let mut order = 0u8;
-    while (1u64 << order) < pages {
-        order += 1;
-    }
-    if alignment > (1u64 << order) * PAGE_SIZE {
-        return Err(FsError::InvalidData);
-    }
 
     // VRAM first where the buffer may live there and the card has a heap —
     // past the BAR for a buffer the CPU never touches, where there is room
@@ -597,28 +726,14 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
             return Err(FsError::NoSpace);
         }
         None => {
-            let frame =
-                narf_memory::frame::alloc_pages_on(0, order).map_err(|_| FsError::NoSpace)?;
-            let phys = frame.start_address().raw();
-            // Zero before userspace can see it. This is not optional: the
-            // pages come from the kernel's own allocator and may hold
-            // anything.
-            //
-            // SAFETY: the allocation covers `(1 << order)` pages at `phys`,
-            // and phys memory is kernel-mapped at a fixed offset.
-            unsafe {
-                core::ptr::write_bytes(
-                    narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
-                    0,
-                    ((1u64 << order) * PAGE_SIZE) as usize,
-                );
-            }
+            let chunks = alloc_system(pages)?;
+            let phys = chunks[0].0;
             GemObject {
                 phys,
                 gpu: phys,
                 system: true,
                 byte_len,
-                backing: Backing::System(order),
+                backing: Backing::System(chunks),
                 alignment,
                 preferred_domains: domains,
                 flags,

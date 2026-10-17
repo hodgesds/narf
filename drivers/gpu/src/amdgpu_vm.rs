@@ -1035,7 +1035,8 @@ pub fn dispatch(
             // The buffer's creation flags can force the memory type (and on
             // GMC 12 set DCC), whatever the mapping asked for; its placement
             // decides the entry address and whether it is system memory.
-            if let Err(error) = vm.materialise(&mapping, object.gpu, object.system, object.flags) {
+            let at = |offset| object.gpu_at(offset);
+            if let Err(error) = vm.materialise(&mapping, &at, object.system, object.flags) {
                 // Leave neither half-written tables nor a mapping record
                 // claiming translations that do not exist.
                 if let Ok(removed) = vm.unmap(va, size) {
@@ -1216,7 +1217,7 @@ impl VmState {
     fn materialise(
         &self,
         mapping: &Mapping,
-        phys_base: u64,
+        address: &dyn Fn(u64) -> Option<u64>,
         system: bool,
         bo_flags: u64,
     ) -> Result<(), FsError> {
@@ -1239,7 +1240,8 @@ impl VmState {
 
         for page in 0..pages {
             let va = mapping.va + page * GPU_PAGE_SIZE;
-            let phys = phys_base + mapping.offset + page * GPU_PAGE_SIZE;
+            let phys =
+                address(mapping.offset + page * GPU_PAGE_SIZE).ok_or(FsError::InvalidData)?;
             let pte = make_pte(phys, flags)?;
 
             // Descend, creating each missing directory and linking it into its

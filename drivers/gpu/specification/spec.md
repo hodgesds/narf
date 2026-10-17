@@ -4601,9 +4601,16 @@ paths; only the tables differ.
   `address - fb_base + fb_offset` and neither SYSTEM nor SNOOPED
   (`base_flags(false)` is VALID only, as `amdgpu_ttm_tt_pte_flags`). GTT
   buffers, VRAM|GTT ones when the heap is full, and every buffer on a card
-  without a heap are buddy pages (SYSTEM|SNOOPED, identity IOMMU); a
-  VRAM-only buffer on a full heap is `NoSpace`. `GemObject::{phys, gpu,
-  system}` give the CPU-mapped address, the entry address and the kind.
+  without a heap are buddy pages (SYSTEM|SNOOPED, identity IOMMU): the
+  binary decomposition of the page count into buddy blocks (a block the
+  allocator lacks is split in two), so a buffer may exceed one 32 MiB
+  block and is never rounded up, charged against `gtt_limit()` (half of
+  RAM, TTM's default; `gtt_used()` is the charge) and refused `NoSpace`
+  past it; a VRAM-only buffer on a full heap is `NoSpace`.
+  `GemObject::{phys, gpu, system}` give the first page's CPU-mapped and
+  entry addresses and the kind; `gpu_at(offset)` and `frames` give any
+  page, and GEM_VA writes each entry through `gpu_at`. `AMDGPU_INFO_MEMORY`
+  and `VRAM_GTT` report that limit as the GTT heap, with its usage.
   A heap may also carry an `UnmappedHeap` (an `UnmappedPool` past the BAR
   and a `VramClear` engine): a `NO_CPU_ACCESS` VRAM buffer goes there
   first, falling back to the visible heap. It is cleared by

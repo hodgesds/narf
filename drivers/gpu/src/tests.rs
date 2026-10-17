@@ -9490,8 +9490,8 @@ fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
     if max_alloc != total / 4 * 3 {
         return TestResult::Fail("max_allocation should be three quarters of the heap");
     }
-    if gtt_total != 0 {
-        return TestResult::Fail("GTT must report zero while no GART manager exists");
+    if gtt_total == 0 || gtt_total != crate::amdgpu_gem::gtt_limit() {
+        return TestResult::Fail("GTT must report the GEM system-memory limit");
     }
 
     // HW_IP_INFO carries the discovered IP version and a ZERO ring mask —
@@ -10310,8 +10310,6 @@ fn smoke_amdgpu_vm_page_tables_are_walkable() -> TestResult {
     let Some(object) = gem.object(handle) else {
         return TestResult::Fail("setup: the created object is not in the table");
     };
-    let phys = object.phys;
-
     let va_cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA;
     let req = |op: u32, flags: u32, va: u64, offset: u64, size: u64| {
         let mut r = [0u8; 40];
@@ -10374,7 +10372,8 @@ fn smoke_amdgpu_vm_page_tables_are_walkable() -> TestResult {
         }
     }
 
-    // The leaves: one per page, each pointing at its own frame.
+    // The leaves: one per page, each pointing at its own frame (three
+    // pages are two buddy chunks, so not necessarily contiguous).
     for page in 0..PAGES {
         let va = BASE_VA + page * GPU_PAGE_SIZE;
         let Some(pte) = state.leaf_entry(va) else {
@@ -10383,7 +10382,7 @@ fn smoke_amdgpu_vm_page_tables_are_walkable() -> TestResult {
         if pte & vm::PTE_VALID == 0 {
             return TestResult::Fail("a mapped page's PTE is not valid");
         }
-        if pte & !0xFFFu64 & vm::GMC_HOLE_MASK != phys + page * GPU_PAGE_SIZE {
+        if Some(pte & !0xFFFu64 & vm::GMC_HOLE_MASK) != object.gpu_at(page * GPU_PAGE_SIZE) {
             return TestResult::Fail("a PTE does not point at the buffer's frame");
         }
         if pte & vm::PTE_READABLE == 0 || pte & vm::PTE_WRITEABLE == 0 {
@@ -13470,6 +13469,93 @@ fn smoke_amdgpu_gem_metadata_round_trips() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu_gem",
     smoke_amdgpu_gem_metadata_round_trips
+);
+
+/// GTT buffers are buddy chunks covering exactly their pages: three pages
+/// are two chunks, 33 MiB (past the allocator's 32 MiB blocks) works, and
+/// the frames, the GPU entries and CPU access agree page by page. Usage
+/// is charged against half of RAM and returned on close.
+fn smoke_amdgpu_gem_system_buffers_span_chunks() -> TestResult {
+    use crate::amdgpu_gem::{gtt_limit, gtt_used, GemState};
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{VmState, GPU_PAGE_SIZE as P};
+    let gem = GemState::new();
+    let vm = VmState::new();
+    let close = |h: u32| {
+        let mut req = [0u8; 8];
+        req[0..4].copy_from_slice(&h.to_le_bytes());
+        crate::amdgpu_gem::dispatch(0x09, req.as_mut_ptr() as usize, &gem)
+    };
+    let before = gtt_used();
+    let result = (|| -> Result<(), &'static str> {
+        let h = gem_create_on(&gem, 3 * P - 100, u::AMDGPU_GEM_DOMAIN_GTT).map_err(|_| "create")?;
+        let o = gem.object(h).ok_or("object")?;
+        if o.byte_len != 3 * P || gtt_used() != before + 3 * P {
+            return Err("three pages charged as three pages");
+        }
+        let frames = o.frames(0, 3 * P as usize).map_err(|_| "frames")?;
+        let pages: alloc::vec::Vec<_> = (0..3).map(|i| o.gpu_at(i * P)).collect();
+        if pages
+            != frames
+                .iter()
+                .map(|&f| Some(f))
+                .collect::<alloc::vec::Vec<_>>()
+            || o.gpu_at(3 * P).is_some()
+            || frames[0] != o.phys
+        {
+            return Err("frames and GPU addresses disagree");
+        }
+        // CPU access crosses into the second chunk.
+        o.store_u64(2 * P + 8, 0x1122_3344_5566_7788)
+            .ok_or("store")?;
+        // SAFETY: the third page is this buffer's and kernel-mapped.
+        let raw = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(frames[2] + 8).kernel_ptr::<u64>())
+        };
+        if raw != 0x1122_3344_5566_7788 || o.load_u64(2 * P + 8) != Some(raw) {
+            return Err("CPU access to a later chunk");
+        }
+        gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_MAP, h, 0x4_0000_0000, 0, 3 * P).map_err(|_| "map")?;
+        for i in 0..3 {
+            let e = vm.leaf_entry(0x4_0000_0000 + i * P).ok_or("entry")?;
+            if e & 0xffff_ffff_f000 != frames[i as usize] {
+                return Err("an entry points at the wrong chunk");
+            }
+        }
+        gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_UNMAP, 0, 0x4_0000_0000, 0, 3 * P)
+            .map_err(|_| "unmap")?;
+        drop(o);
+        close(h).map_err(|_| "close")?;
+        // Larger than any single buddy block.
+        let big = 33 << 20;
+        let b = gem_create_on(&gem, big, u::AMDGPU_GEM_DOMAIN_GTT).map_err(|_| "33 MiB buffer")?;
+        let o = gem.object(b).ok_or("big object")?;
+        let frames = o.frames(0, big as usize).map_err(|_| "big frames")?;
+        if frames.len() as u64 != big / P || frames.iter().any(|&f| f == 0 || f % P != 0) {
+            return Err("33 MiB of frames");
+        }
+        drop(o);
+        close(b).map_err(|_| "close big")?;
+        if gtt_used() != before {
+            return Err("closed buffers kept their GTT charge");
+        }
+        // Past the limit: refused, and nothing charged.
+        if gem_create_on(&gem, gtt_limit() + P, u::AMDGPU_GEM_DOMAIN_GTT)
+            != Err(narf_filesystem::FsError::NoSpace)
+            || gtt_used() != before
+        {
+            return Err("GTT limit");
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_gem_system_buffers_span_chunks
 );
 
 /// A CPU mapping holds its buffer (`GemState::mapping_object`, which the
