@@ -637,6 +637,30 @@ pub fn ptrace_syscall_stop(ctx: &mut dyn TrapContext, at_entry: bool, orig_rax: 
     ptrace_syscall_stop_active(ctx, at_entry, orig_rax);
 }
 
+/// Choose the RAX value saved while a tracee is parked at a syscall stop.
+///
+/// The syscall dispatcher owns the completed return until its exit asm folds
+/// it into the live user snapshot.  An own-stack ptrace stop saves that
+/// snapshot before the dispatcher returns, so its previously saved RAX is
+/// normally the *entry* syscall number (or an older syscall's value), not the
+/// result being reported.  Prefer the dispatcher's pending return at an exit
+/// stop, just as Linux keeps the completed value in `pt_regs` while
+/// `ptrace_report_syscall_exit()` blocks.  The saved-state value remains a
+/// fallback for TrapContext implementations that do not track a return.
+#[inline]
+pub(crate) fn syscall_stop_saved_rax(
+    at_entry: bool,
+    orig_rax: u64,
+    pending_return: Option<SyscallReturn>,
+    saved_state_rax: Option<u64>,
+) -> Option<u64> {
+    if at_entry {
+        Some(orig_rax)
+    } else {
+        pending_return.map(|ret| ret.user_rax()).or(saved_state_rax)
+    }
+}
+
 #[inline(never)]
 fn ptrace_syscall_stop_active(ctx: &mut dyn TrapContext, at_entry: bool, orig_rax: u64) {
     let task = current_task_id();
@@ -686,23 +710,19 @@ fn ptrace_syscall_stop_active(ctx: &mut dyn TrapContext, at_entry: bool, orig_ra
     let sig = syscall_stop_signal(pid);
     set_last_siginfo(pid, crate::handlers::ptrace_notify_siginfo(task, sig));
     let tracer_tid = pid_to_tid(get_task_tracer(pid).unwrap_or(pid));
-    // At the exit-stop the dispatcher already mirrored the syscall's real
-    // return value into the live user-state's rax slot; capture it so the
-    // stop park preserves it (rather than clobbering rax with 0) — the
-    // tracer's GETREGS must observe the real return value.
-    let preserve_rax = if at_entry {
-        // Entry stop: keep the syscall number visible in rax (Linux shows
-        // the nr / -ENOSYS at entry) rather than clobbering it with 0.
-        Some(orig_rax)
-    } else {
+    // An exit stop runs before the dispatcher has returned to the syscall
+    // exit asm, so `uctx.state.rax` is stale here.  Save the pending result
+    // rather than that old snapshot; otherwise the tracee resumes with zero
+    // even though GETREGS observed the correctly pinned value.
+    let saved_state_rax = {
         // Syscall-stop is x86_64-only (orig_rax/rax ABI); aarch64 UserState has
         // no `rax` and never reaches here (the syscall.rs hooks are x86_64).
         #[cfg(target_arch = "x86_64")]
         {
             crate::user_task::current_user_task().map(|uctx| {
                 // SAFETY: uctx is the current, poller-pinned task ctx (single-CPU
-                // cooperative execution), and its `state` points at the live
-                // UserState the dispatcher just wrote the return value into.
+                // cooperative execution), and its saved state is stable while
+                // this task is on CPU.
                 unsafe { (*(*uctx).state.get()).rax }
             })
         }
@@ -711,6 +731,8 @@ fn ptrace_syscall_stop_active(ctx: &mut dyn TrapContext, at_entry: bool, orig_ra
             None
         }
     };
+    let preserve_rax =
+        syscall_stop_saved_rax(at_entry, orig_rax, ctx.pending_return(), saved_state_rax);
     // The orig_rax pin persists across the stop so the tracer's GETREGS
     // (issued WHILE the tracee is parked here) reports the syscall number.
     // It is cleared by the resume path (PTRACE_SYSCALL/CONT), not here.

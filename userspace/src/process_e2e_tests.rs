@@ -5251,6 +5251,22 @@ fn smoke_process_ptrace_syscall_stop() -> TestResult {
     const SYS_GETPID: u64 = 39;
     const SIGTRAP: u32 = 5;
 
+    // A syscall-exit stop runs before the exit asm folds the result into the
+    // saved user frame.  It must therefore save the dispatcher's pending
+    // result, not an old frame value.  This is the own-stack regression that
+    // made traced waitpid(2) return zero while strace itself observed the
+    // correct child PID.
+    if syscall_stop_saved_rax(false, SYS_GETPID, Some(SyscallReturn::ok(PARENT)), Some(0))
+        != Some(PARENT)
+    {
+        return TestResult::Fail("ptrace exit stop saved a stale user-state rax");
+    }
+    if syscall_stop_saved_rax(true, SYS_GETPID, Some(SyscallReturn::ok(PARENT)), Some(0))
+        != Some(SYS_GETPID)
+    {
+        return TestResult::Fail("ptrace entry stop did not preserve the syscall number");
+    }
+
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
     setup_process_state(PARENT);
