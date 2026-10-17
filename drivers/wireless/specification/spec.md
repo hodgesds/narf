@@ -205,9 +205,7 @@ order. Firmware failure status is preserved. Entire release events, including
 WCID-pair records, are parsed before token state changes; conflicting duplicate
 statuses and truncated records cannot partially retire ownership. Stale token
 IDs do not retire the current frame. Drop/failure retains published DMA under
-the existing shutdown contract. Association, regulatory/channel/power setup
-for transmission, WPA2 key setup and Ethernet TX remain unfinished; the
-passive interface still rejects sends and connection requests.
+the existing shutdown contract.
 
 ### MT76 station preparation and MLME
 
@@ -224,15 +222,30 @@ association only on correctly addressed matching peer responses. Algorithm,
 authentication transaction, status, association capability/privacy, AID and
 IE bounds are checked. Other peers do not advance state; matching malformed
 responses, rejection and cancellation are terminal. An associated WPA2 phase
-does not authorize the controlled port.
+does not authorize the controlled port until key exchange completes.
 
 `peer_record` emits checked Linux CONNAC2 station/PHY/RA/state and nested WTBL
 records for WCID 1, with the peer classified as an AP, native RX retained,
-and `CONN_STATE_CONNECT` rather than `PORT_SECURE`. Associated records require
-the AID observed by this plan; no caller can mutate the plan's phase directly.
-This preparation/state logic is not yet dispatched by the live association
-API. Channel/power authorization, the async join runner, key exchange and
-Ethernet transport remain required before the interface accepts connections.
+and `CONN_STATE_CONNECT`. Associated records require the AID observed by this plan;
+no caller can mutate the plan's phase directly.
+
+### MT76 live join dispatch, WPA2 keys, and Ethernet data transport
+
+`Session::associate_station` executes the full live join workflow:
+1. Validates host regulatory rules and dispatches channel/power configuration
+   via `MCU_EXT_CMD_CHANNEL_SWITCH` before frame transmission.
+2. Transmits 802.11 Open Authentication and Association requests via the management TX queue,
+   awaiting matching responses within a bounded 3-second timeout per phase.
+3. For WPA2-PSK connections, drives the IEEE 802.11i 4-way handshake via `narf_wireless::eapol::Supplicant`.
+   Computes HMAC-SHA1 and verifies/generates message integrity codes (MIC).
+   On receiving M1, derives the PTK (`KCK`, `KEK`, `TK`) and emits M2 containing the negotiated RSN IE.
+   Upon receiving and verifying M3, sends M4 and installs the 16-byte temporal key via a checked
+   `STA_REC_KEY_V2` (tag 0x12) WTBL record with cipher 6 (`MCU_CIPHER_AES_CCMP`) and `CONN_STATE_PORT_SECURE`.
+4. Datapath transport submits 802.3 Ethernet frames encapsulated in 32-byte CONNAC2 TXD headers
+   over WFDMA data rings, and translates incoming 802.11 LLC/SNAP data frames to 802.3 Ethernet.
+5. `Mt76Iface` binds `narf_ipc` producer/consumer rings (`tx_ring` and `rx_ring`) and exposes
+   `poll_data()` to bridge frames between IPC endpoints and hardware rings, updating the link state
+   in the network registry upon association and teardown upon disassociation.
 
 ### 3.1 Implemented iwlwifi MLD station profile
 

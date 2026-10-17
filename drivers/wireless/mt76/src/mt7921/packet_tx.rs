@@ -25,12 +25,9 @@ pub(super) fn management(
         return Err(Error::DmaAddress);
     }
     let fc = u16::from_le_bytes([frame[0], frame[1]]);
-    if fc & 0xcf0f != 0
-        || !matches!((fc >> 4) & 15, 0 | 2 | 4 | 10 | 11 | 12)
-        || token == 0
-        || token >= TOKEN_LIMIT
-        || wcid >= 20
-    {
+    let is_data = (fc & 0x0f == 0x08) && ((fc >> 4) & 15 == 0);
+    let is_mgmt = (fc & 0x0f == 0x00) && matches!((fc >> 4) & 15, 0 | 2 | 4 | 10 | 11 | 12);
+    if (!is_data && !is_mgmt) || token == 0 || token >= TOKEN_LIMIT || wcid >= 20 {
         return Err(Error::Bounds);
     }
     let subtype = u32::from((fc >> 4) & 15);
@@ -43,7 +40,49 @@ pub(super) fn management(
         0,
         0,
         4,
-        subtype << 16,
+        (if is_data { 2 << 20 } else { 0 }) | (subtype << 16),
+    ];
+    let mut bytes = [0; HEADER];
+    for (i, word) in words.iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    bytes[32..34].copy_from_slice(&(token | 0x8000).to_le_bytes());
+    bytes[40..44].copy_from_slice(&(payload as u32).to_le_bytes());
+    bytes[44..46].copy_from_slice(&((frame.len() as u16) | 0x8000).to_le_bytes());
+    Ok(bytes)
+}
+
+/// Encode an 802.3 Ethernet frame for transmission on the WFDMA data queue.
+pub(super) fn ethernet(
+    frame: &[u8],
+    payload: u64,
+    token: u16,
+    wcid: u16,
+) -> Result<[u8; HEADER], Error> {
+    if !(14..=1536).contains(&frame.len()) {
+        return Err(Error::Bounds);
+    }
+    if payload
+        .checked_add(frame.len() as u64 - 1)
+        .is_none_or(|end| end > u64::from(u32::MAX))
+    {
+        return Err(Error::DmaAddress);
+    }
+    if token == 0 || token >= TOKEN_LIMIT || wcid >= 20 {
+        return Err(Error::Bounds);
+    }
+    let multicast = frame[0] & 1 != 0;
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    let is_eth_802_3 = ethertype >= 0x0600;
+    let words = [
+        (frame.len() as u32 + 32), // CT, LMAC AC00 (0 << 25 = 0)
+        (1 << 31) | (u32::from(is_eth_802_3) << 15) | u32::from(wcid),
+        (2 << 4) | (u32::from(multicast) << 10),
+        (15 << 11) | (1 << 1), // REM_TX_COUNT 15, PROTECT_FRAME 1
+        0,
+        0,
+        0,
+        2 << 20,
     ];
     let mut bytes = [0; HEADER];
     for (i, word) in words.iter().enumerate() {

@@ -57,6 +57,10 @@ struct Model {
     packets: VecDeque<Vec<u8>>,
     scan_stall: bool,
     resources: Arc<AtomicUsize>,
+    psk: [u8; 32],
+    anonce: [u8; 32],
+    ap_mac: [u8; 6],
+    own_mac: [u8; 6],
 }
 impl Model {
     fn new() -> Self {
@@ -84,6 +88,10 @@ impl Model {
             packets: VecDeque::new(),
             scan_stall: false,
             resources,
+            psk: [0; 32],
+            anonce: [0; 32],
+            ap_mac: [0; 6],
+            own_mac: [0; 6],
         }
     }
 }
@@ -226,6 +234,78 @@ impl Backend for Model {
     }
     fn wtbl_idle(&mut self) -> Result<bool, Error> {
         Ok(!self.wtbl_stall)
+    }
+    fn submit_management(&mut self, frame: &[u8], _wcid: u16) -> Result<(), Error> {
+        self.check()?;
+        self.frames.push((false, frame.to_vec()));
+        if self.psk != [0u8; 32] {
+            if let Some(eapol) = super::extract_eapol(frame) {
+                if let Some(m2) = eapol
+                    .get(4..)
+                    .and_then(|b| narf_wireless::eapol::KeyFrame::decode(b, 16))
+                {
+                    if m2.has_mic() && !m2.key_ack() && m2.key_nonce != [0u8; 32] {
+                        let snonce = m2.key_nonce;
+                        struct TestHmac;
+                        impl narf_wireless::eapol::HmacPrimitive for TestHmac {
+                            fn out_len(&self) -> usize {
+                                20
+                            }
+                            fn mac(&self, key: &[u8], data: &[u8]) -> Vec<u8> {
+                                narf_crypto::pbkdf2_sha1::hmac_sha1(key, data).to_vec()
+                            }
+                        }
+                        let ptk = narf_wireless::eapol::derive_ptk(
+                            &TestHmac,
+                            &self.psk,
+                            &self.ap_mac,
+                            &self.own_mac,
+                            &self.anonce,
+                            &snonce,
+                            16,
+                        );
+                        let mut m3 = narf_wireless::eapol::KeyFrame::empty(16);
+                        m3.descriptor_type = narf_wireless::eapol::KEY_DESCRIPTOR_RSN;
+                        m3.key_information = narf_wireless::eapol::KI_KEY_TYPE_PAIRWISE
+                            | narf_wireless::eapol::KI_KEY_ACK
+                            | narf_wireless::eapol::KI_KEY_MIC
+                            | narf_wireless::eapol::KI_INSTALL
+                            | narf_wireless::eapol::KI_VERSION_HMAC_SHA1_AES;
+                        m3.key_length = 16;
+                        m3.replay_counter = m2.replay_counter + 1;
+                        m3.key_nonce = self.anonce;
+                        let mut m3_bytes = m3.into_eapol();
+                        let mic_full = narf_crypto::pbkdf2_sha1::hmac_sha1(&ptk.kck, &m3_bytes);
+                        m3_bytes[81..97].copy_from_slice(&mic_full[..16]);
+                        let m3_frame =
+                            super::wrap_eapol_frame(self.ap_mac, self.own_mac, &m3_bytes);
+                        let mut m3_packet = vec![0u8; 32 + m3_frame.len()];
+                        let len = m3_packet.len();
+                        m3_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
+                        m3_packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+                        m3_packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+                        m3_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
+                        m3_packet[32..].copy_from_slice(&m3_frame);
+                        self.packets.push_back(m3_packet);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    fn submit_data(&mut self, frame: &[u8]) -> Result<(), Error> {
+        self.check()?;
+        self.frames.push((false, frame.to_vec()));
+        Ok(())
+    }
+    fn management_complete(
+        &mut self,
+    ) -> Result<Option<crate::mt7921::packet_tx::Completion>, Error> {
+        self.check()?;
+        Ok(Some(crate::mt7921::packet_tx::Completion {
+            token: 1,
+            status: 0,
+        }))
     }
 }
 fn run<T>(future: impl Future<Output = T>) -> T {
@@ -979,4 +1059,406 @@ fn mcu_passive_scan_timeout_cancel_and_stale_completion_retain_dma() -> TestResu
 kernel_test_in!(
     "drivers/wireless/mt7921/scan",
     mcu_passive_scan_timeout_cancel_and_stale_completion_retain_dma
+);
+
+fn mcu_live_join_open_dispatches_auth_assoc_and_sta_record() -> TestResult {
+    let mut session = Session::new(Model::new(), firmware(32));
+    if run(session.run()).is_err() || run(session.initialize_radio()).is_err() {
+        return TestResult::Fail("radio init");
+    }
+    let own = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let ap = [2, 1, 2, 3, 4, 5];
+    let bss = ScanBss {
+        bssid: ap,
+        ssid: b"narf-join".to_vec(),
+        channel: 6,
+        signal_dbm: Some(-45),
+        capability: 1, // ESS, open
+        beacon_interval: 100,
+        information_elements: vec![
+            0, 9, b'n', b'a', b'r', b'f', b'-', b'j', b'o', b'i', b'n', 1, 4, 0x82, 0x84, 0x8b,
+            0x96, 3, 1, 6,
+        ],
+    };
+    // Packet 1: unrelated beacon
+    session
+        .backend
+        .packets
+        .push_back(scan_beacon(6, b"other-bss"));
+
+    // Packet 2: Authentication response (subtype 0xb0) from AP to own MAC
+    let mut auth_resp = vec![0u8; 30];
+    auth_resp[0] = 0xb0;
+    auth_resp[4..10].copy_from_slice(&own);
+    auth_resp[10..16].copy_from_slice(&ap);
+    auth_resp[16..22].copy_from_slice(&ap);
+    auth_resp[24..30].copy_from_slice(&[0, 0, 2, 0, 0, 0]); // Alg 0, Seq 2, Status 0
+    let mut auth_packet = vec![0u8; 32 + auth_resp.len()];
+    let len = auth_packet.len();
+    auth_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
+    auth_packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+    auth_packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+    auth_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
+    auth_packet[32..].copy_from_slice(&auth_resp);
+    session.backend.packets.push_back(auth_packet);
+
+    // Packet 3: Association response (subtype 0x10) from AP to own MAC with AID 42
+    let mut assoc_resp = vec![0u8; 30];
+    assoc_resp[0] = 0x10;
+    assoc_resp[4..10].copy_from_slice(&own);
+    assoc_resp[10..16].copy_from_slice(&ap);
+    assoc_resp[16..22].copy_from_slice(&ap);
+    assoc_resp[24..26].copy_from_slice(&1u16.to_le_bytes()); // Capability: ESS
+    assoc_resp[26..28].copy_from_slice(&0u16.to_le_bytes()); // Status: 0
+    assoc_resp[28..30].copy_from_slice(&(42u16 | 0xc000).to_le_bytes()); // AID 42
+    let mut assoc_packet = vec![0u8; 32 + assoc_resp.len()];
+    let len = assoc_packet.len();
+    assoc_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
+    assoc_packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+    assoc_packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+    assoc_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
+    assoc_packet[32..].copy_from_slice(&assoc_resp);
+    session.backend.packets.push_back(assoc_packet);
+
+    let before = session.backend.frames.len();
+    let res = run(session.associate_station(
+        &bss,
+        b"narf-join",
+        crate::mt7921::association::Security::Open,
+    ));
+    if res != Ok(42) {
+        return TestResult::Fail("associate_station failed");
+    }
+    match session.state {
+        State::Associated {
+            peer, channel, aid, ..
+        } => {
+            if peer != ap || channel != 6 || aid != 42 {
+                return TestResult::Fail("associated state mismatch");
+            }
+        }
+        _ => return TestResult::Fail("session state not Associated"),
+    }
+    let frames = &session.backend.frames[before..];
+    let ch_switch = frames.iter().find(|(scatter, f)| {
+        !scatter
+            && f.len() >= 42
+            && f[36] == 0xed
+            && f[41] == crate::mt7921::regs::MCU_EXT_CMD_CHANNEL_SWITCH
+    });
+    if ch_switch.is_none() {
+        return TestResult::Fail("channel switch command not emitted");
+    }
+    let sta_rec = frames.iter().find(|(scatter, f)| {
+        !scatter
+            && f.len() >= 42
+            && f[36] == 0xed
+            && f[41] == crate::mt7921::txrx::MCU_EXT_CMD_STA_REC_UPDATE
+    });
+    if sta_rec.is_none() {
+        return TestResult::Fail("STA_REC_UPDATE not emitted");
+    }
+
+    if run(session.disassociate_station()).is_err() {
+        return TestResult::Fail("disassociate_station failed");
+    }
+    match session.state {
+        State::RadioReady(_) => {}
+        _ => return TestResult::Fail("session state not RadioReady after disassociate"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/join",
+    mcu_live_join_open_dispatches_auth_assoc_and_sta_record
+);
+
+fn mcu_live_join_peer_rejection_and_timeout() -> TestResult {
+    let mut session = Session::new(Model::new(), firmware(32));
+    if run(session.run()).is_err() || run(session.initialize_radio()).is_err() {
+        return TestResult::Fail("radio init");
+    }
+    let own = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let ap = [2, 1, 2, 3, 4, 5];
+    let bss = ScanBss {
+        bssid: ap,
+        ssid: b"narf-join".to_vec(),
+        channel: 6,
+        signal_dbm: Some(-45),
+        capability: 1,
+        beacon_interval: 100,
+        information_elements: vec![
+            0, 9, b'n', b'a', b'r', b'f', b'-', b'j', b'o', b'i', b'n', 1, 4, 0x82, 0x84, 0x8b,
+            0x96, 3, 1, 6,
+        ],
+    };
+    let mut auth_resp = vec![0u8; 30];
+    auth_resp[0] = 0xb0;
+    auth_resp[4..10].copy_from_slice(&own);
+    auth_resp[10..16].copy_from_slice(&ap);
+    auth_resp[16..22].copy_from_slice(&ap);
+    auth_resp[24..30].copy_from_slice(&[0, 0, 2, 0, 1, 0]); // Status: 1 (rejected)
+    let mut auth_packet = vec![0u8; 32 + auth_resp.len()];
+    let len = auth_packet.len();
+    auth_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
+    auth_packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+    auth_packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+    auth_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
+    auth_packet[32..].copy_from_slice(&auth_resp);
+    session.backend.packets.push_back(auth_packet);
+
+    let res = run(session.associate_station(
+        &bss,
+        b"narf-join",
+        crate::mt7921::association::Security::Open,
+    ));
+    if res != Err(Error::MalformedEvent) && !matches!(session.state, State::Failed { .. }) {
+        return TestResult::Fail("rejection should fail join");
+    }
+    if !session.backend.owner.published {
+        return TestResult::Fail("DMA should stay published on join failure");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/join",
+    mcu_live_join_peer_rejection_and_timeout
+);
+
+fn mcu_live_join_wpa2_psk_dispatches_4way_handshake_and_secure_sta_record() -> TestResult {
+    let mut model = Model::new();
+    let own = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let ap = [2, 1, 2, 3, 4, 5];
+    let psk = [0x55u8; 32];
+    let anonce = [0xaau8; 32];
+    model.psk = psk;
+    model.anonce = anonce;
+    model.ap_mac = ap;
+    model.own_mac = own;
+
+    let mut session = Session::new(model, firmware(32));
+    if run(session.run()).is_err() || run(session.initialize_radio()).is_err() {
+        return TestResult::Fail("radio init");
+    }
+
+    let rsn = narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body();
+    let mut ies = vec![
+        0,
+        9,
+        b'n',
+        b'a',
+        b'r',
+        b'f',
+        b'-',
+        b'j',
+        b'o',
+        b'i',
+        b'n',
+        1,
+        4,
+        0x82,
+        0x84,
+        0x8b,
+        0x96,
+        3,
+        1,
+        6,
+        48,
+        rsn.len() as u8,
+    ];
+    ies.extend_from_slice(&rsn);
+    let bss = ScanBss {
+        bssid: ap,
+        ssid: b"narf-join".to_vec(),
+        channel: 6,
+        signal_dbm: Some(-45),
+        capability: 1 | 0x10,
+        beacon_interval: 100,
+        information_elements: ies,
+    };
+
+    // 1. Auth response (status 0)
+    let mut auth_resp = vec![0u8; 30];
+    auth_resp[0] = 0xb0;
+    auth_resp[4..10].copy_from_slice(&own);
+    auth_resp[10..16].copy_from_slice(&ap);
+    auth_resp[16..22].copy_from_slice(&ap);
+    auth_resp[24..30].copy_from_slice(&[0, 0, 2, 0, 0, 0]);
+    let mut auth_packet = vec![0u8; 32 + auth_resp.len()];
+    let len = auth_packet.len();
+    auth_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
+    auth_packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+    auth_packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+    auth_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
+    auth_packet[32..].copy_from_slice(&auth_resp);
+    session.backend.packets.push_back(auth_packet);
+
+    // 2. Assoc response (status 0, aid 42)
+    let mut assoc_resp = vec![0u8; 30];
+    assoc_resp[0] = 0x10;
+    assoc_resp[4..10].copy_from_slice(&own);
+    assoc_resp[10..16].copy_from_slice(&ap);
+    assoc_resp[16..22].copy_from_slice(&ap);
+    assoc_resp[24..26].copy_from_slice(&0x0031u16.to_le_bytes());
+    assoc_resp[26..28].copy_from_slice(&0u16.to_le_bytes());
+    assoc_resp[28..30].copy_from_slice(&(42u16 | 0xc000).to_le_bytes());
+    let mut assoc_packet = vec![0u8; 32 + assoc_resp.len()];
+    let len = assoc_packet.len();
+    assoc_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
+    assoc_packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+    assoc_packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+    assoc_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
+    assoc_packet[32..].copy_from_slice(&assoc_resp);
+    session.backend.packets.push_back(assoc_packet);
+
+    // 3. EAPOL M1 from AP
+    let mut m1 = narf_wireless::eapol::KeyFrame::empty(16);
+    m1.descriptor_type = narf_wireless::eapol::KEY_DESCRIPTOR_RSN;
+    m1.key_information = narf_wireless::eapol::KI_KEY_TYPE_PAIRWISE
+        | narf_wireless::eapol::KI_KEY_ACK
+        | narf_wireless::eapol::KI_VERSION_HMAC_SHA1_AES;
+    m1.key_length = 16;
+    m1.replay_counter = 1;
+    m1.key_nonce = anonce;
+    let m1_pdu = m1.into_eapol();
+    let m1_frame = super::wrap_eapol_frame(ap, own, &m1_pdu);
+    let mut m1_packet = vec![0u8; 32 + m1_frame.len()];
+    let len = m1_packet.len();
+    m1_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
+    m1_packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+    m1_packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+    m1_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
+    m1_packet[32..].copy_from_slice(&m1_frame);
+    session.backend.packets.push_back(m1_packet);
+
+    let before = session.backend.frames.len();
+    let res = run(session.associate_station(
+        &bss,
+        b"narf-join",
+        crate::mt7921::association::Security::Wpa2Psk { psk },
+    ));
+    if res != Ok(42) {
+        return TestResult::Fail("associate_station WPA2 failed");
+    }
+    match session.state {
+        State::Associated {
+            peer, channel, aid, ..
+        } => {
+            if peer != ap || channel != 6 || aid != 42 {
+                return TestResult::Fail("associated state mismatch");
+            }
+        }
+        _ => return TestResult::Fail("session state not Associated"),
+    }
+
+    let frames = &session.backend.frames[before..];
+    let eapol_frames: Vec<_> = frames
+        .iter()
+        .filter_map(|(scatter, f)| {
+            if !scatter {
+                super::extract_eapol(f)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if eapol_frames.len() < 2 {
+        return TestResult::Fail("expected at least M2 and M4 emitted");
+    }
+
+    let secure_sta_rec = frames.iter().find(|(scatter, f)| {
+        !scatter
+            && f.len() >= 42
+            && f[36] == 0xed
+            && f[41] == crate::mt7921::txrx::MCU_EXT_CMD_STA_REC_UPDATE
+            && f.len() >= 64 + 44
+            && f[64..]
+                .windows(4)
+                .any(|w| u16::from_le_bytes([w[0], w[1]]) == 0x12)
+    });
+    if secure_sta_rec.is_none() {
+        return TestResult::Fail("secure STA_REC with key tag 0x12 not emitted");
+    }
+
+    if run(session.disassociate_station()).is_err() {
+        return TestResult::Fail("disassociate_station failed");
+    }
+    match session.state {
+        State::RadioReady(_) => {}
+        _ => return TestResult::Fail("session state not RadioReady after disassociate"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/join",
+    mcu_live_join_wpa2_psk_dispatches_4way_handshake_and_secure_sta_record
+);
+
+fn mcu_ethernet_tx_rx_frame_transport() -> TestResult {
+    let mut session = Session::new(Model::new(), firmware(32));
+    if run(session.run()).is_err() || run(session.initialize_radio()).is_err() {
+        return TestResult::Fail("radio init");
+    }
+
+    // Test TX:
+    let eth = vec![
+        2, 1, 2, 3, 4, 5, // DA
+        2, 0x11, 0x22, 0x33, 0x44, 0x55, // SA
+        0x08, 0x00, // EtherType: IPv4
+        1, 2, 3, 4, 5, 6, 7, 8, // payload
+    ];
+    let before = session.backend.frames.len();
+    if run(session.send_ethernet(&eth)).is_err() {
+        return TestResult::Fail("send_ethernet failed");
+    }
+    if session.backend.frames.len() != before + 1 {
+        return TestResult::Fail("send_ethernet frame not recorded");
+    }
+    let last = &session.backend.frames.last().unwrap().1;
+    if last != &eth {
+        return TestResult::Fail("transmitted payload mismatch");
+    }
+
+    // Test RX (CONNAC2 packet containing 802.11 QoS Data with LLC/SNAP):
+    let mut dot11 = Vec::new();
+    dot11.extend_from_slice(&[0x88, 0x02]); // QoS Data, from-DS
+    dot11.extend_from_slice(&[0x00, 0x00]); // duration
+    dot11.extend_from_slice(&[2, 0x11, 0x22, 0x33, 0x44, 0x55]); // Addr1: DA
+    dot11.extend_from_slice(&[2, 1, 2, 3, 4, 5]); // Addr2: BSSID
+    dot11.extend_from_slice(&[2, 1, 2, 3, 4, 5]); // Addr3: SA
+    dot11.extend_from_slice(&[0x00, 0x00]); // seq
+    dot11.extend_from_slice(&[0x00, 0x00]); // QoS control
+    dot11.extend_from_slice(&[0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00]); // LLC/SNAP IPv4
+    dot11.extend_from_slice(&[10, 20, 30, 40]); // payload
+
+    let mut rx_packet = vec![0u8; 32 + dot11.len()];
+    let len = rx_packet.len();
+    rx_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
+    rx_packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+    rx_packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+    rx_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
+    rx_packet[32..].copy_from_slice(&dot11);
+    session.backend.packets.push_back(rx_packet);
+
+    let received = session
+        .backend
+        .receive_data()
+        .expect("receive_data")
+        .expect("packet present");
+    let frame = super::rx_frame(&received).expect("rx_frame parse");
+    let eth_out = super::to_ethernet(frame).expect("to_ethernet parse");
+    if eth_out.len() != 14 + 4
+        || eth_out[..6] != [2, 0x11, 0x22, 0x33, 0x44, 0x55]
+        || eth_out[6..12] != [2, 1, 2, 3, 4, 5]
+        || eth_out[12..14] != [0x08, 0x00]
+        || eth_out[14..] != [10, 20, 30, 40]
+    {
+        return TestResult::Fail("translated Ethernet frame mismatch");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/transport",
+    mcu_ethernet_tx_rx_frame_transport
 );

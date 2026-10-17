@@ -252,6 +252,49 @@ impl Hardware {
         fence(Ordering::SeqCst);
         self.write(TX_DATA + 8, ((slot + 1) % DEPTH) as u32)
     }
+    fn submit_data(&mut self, frame: &[u8]) -> Result<(), Error> {
+        self.check()?;
+        if !self.owner.published {
+            return Err(Error::Busy);
+        }
+        let storage = self.owner.storage.as_ref().ok_or(Error::Busy)?;
+        let token = storage.tokens.available()?;
+        let ring = &storage.data;
+        let slot = ring.index;
+        if ring.pending || ring.word(slot, 1) & DONE == 0 {
+            return Err(Error::Busy);
+        }
+        let address = ring.buffers[slot].dma_addr().raw();
+        let payload = address
+            .checked_add(packet_tx::HEADER as u64)
+            .ok_or(Error::DmaAddress)?;
+        let header = packet_tx::ethernet(frame, payload, token, 1)?;
+        // SAFETY: fully validated lengths; this slot has neither DMA nor
+        // firmware ownership until the publication below.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                header.as_ptr(),
+                ring.buffers[slot].cpu_mut_ptr::<u8>(),
+                header.len(),
+            );
+            core::ptr::copy_nonoverlapping(
+                frame.as_ptr(),
+                ring.buffers[slot].cpu_mut_ptr::<u8>().add(header.len()),
+                frame.len(),
+            );
+        }
+        let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
+        storage.tokens.begin(token)?;
+        let ring = &mut storage.data;
+        ring.pending = true; // conservative on any later doorbell failure
+        ring.set_word(slot, 0, address as u32);
+        ring.set_word(slot, 2, 0);
+        ring.set_word(slot, 3, (address >> 32) as u32 & 15);
+        fence(Ordering::Release);
+        ring.set_word(slot, 1, ((packet_tx::HEADER as u32) << 16) | LAST);
+        fence(Ordering::SeqCst);
+        self.write(TX_DATA + 8, ((slot + 1) % DEPTH) as u32)
+    }
     fn management_complete(&mut self) -> Result<Option<packet_tx::Completion>, Error> {
         self.check()?;
         let ring = &self.owner.storage.as_ref().ok_or(Error::Busy)?.data;
@@ -269,8 +312,14 @@ impl Hardware {
         if done {
             storage.tokens.dma_done()?;
         }
-        let result = storage.tokens.finish();
+        let mut result = storage.tokens.finish();
+        if result.is_none() {
+            let _ = self.route_rx(true)?;
+            let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
+            result = storage.tokens.finish();
+        }
         if result.is_some() {
+            let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
             storage.data.pending = false;
             storage.data.index = next;
         }
@@ -522,6 +571,17 @@ impl Backend for Hardware {
         self.owner.published = false;
         Ok(())
     }
+    fn submit_management(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error> {
+        self.submit_management(frame, wcid)
+    }
+    fn submit_data(&mut self, frame: &[u8]) -> Result<(), Error> {
+        self.submit_data(frame)
+    }
+    fn management_complete(
+        &mut self,
+    ) -> Result<Option<crate::mt7921::packet_tx::Completion>, Error> {
+        self.management_complete()
+    }
 }
 /// Single-use, retained coherent MCU/FWDL transport for x86_64 CONNAC2.
 #[derive(Debug)]
@@ -609,6 +669,19 @@ impl Transport {
     pub async fn scan_passive(&mut self, channels: &[u8]) -> Result<super::ScanReport, Error> {
         self.session.scan_passive(channels).await
     }
+    /// Associate with an Access Point using legacy rates on channels 1..=11.
+    pub async fn associate_station(
+        &mut self,
+        bss: &super::ScanBss,
+        ssid: &[u8],
+        security: crate::mt7921::association::Security,
+    ) -> Result<u16, Error> {
+        self.session.associate_station(bss, ssid, security).await
+    }
+    /// Send deauthentication and tear down peer station record.
+    pub async fn disassociate_station(&mut self) -> Result<(), Error> {
+        self.session.disassociate_station().await
+    }
     /// Stop DMA, verify idle, clear bus mastering and retire ring bases.
     pub async fn shutdown(&mut self) -> Result<(), Error> {
         self.session.shutdown().await
@@ -620,5 +693,22 @@ impl Transport {
     /// Drain unrelated bounded MCU notifications retained while awaiting replies.
     pub fn pop_event(&mut self) -> Option<Vec<u8>> {
         self.session.events.pop_front()
+    }
+    /// Transmit an 802.3 Ethernet data frame.
+    pub async fn transmit_ethernet(&mut self, frame: &[u8]) -> Result<(), Error> {
+        self.session.send_ethernet(frame).await.map(|_| ())
+    }
+    /// Receive a data frame from the data queue.
+    pub async fn receive_data_frame(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        self.session.backend.check()?;
+        if let Some(packet) = self.session.backend.receive_data()? {
+            if let Some(frame) = super::rx_frame(&packet) {
+                return Ok(super::to_ethernet(frame));
+            }
+            if packet.len() >= 14 {
+                return Ok(Some(packet));
+            }
+        }
+        Ok(None)
     }
 }

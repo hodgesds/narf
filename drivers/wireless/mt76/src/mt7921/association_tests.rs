@@ -28,7 +28,13 @@ fn reply(subtype: u8, body: &[u8]) -> Vec<u8> {
     frame
 }
 fn mt76_join_plan_encodes_rates_and_exact_wpa2_rsn() -> TestResult {
-    let mut plan = JoinPlan::prepare(&bss(true), OWN, b"narf", Security::Wpa2Psk).unwrap();
+    let mut plan = JoinPlan::prepare(
+        &bss(true),
+        OWN,
+        b"narf",
+        Security::Wpa2Psk { psk: [0x55; 32] },
+    )
+    .unwrap();
     if plan.peer_record(42, true) != Err(Error::Busy) {
         return TestResult::Fail("station marked associated before AP response");
     }
@@ -71,6 +77,16 @@ fn mt76_join_plan_encodes_rates_and_exact_wpa2_rsn() -> TestResult {
     {
         return TestResult::Fail("station/WTBL layout or controlled port prematurely secured");
     }
+    let key = [0xabu8; 16];
+    let sec_rec = plan.secure_peer_record(42, &key).unwrap();
+    if sec_rec.len() != 164
+        || sec_rec[..8] != [0, 1, 6, 0, 1, 0, 0, 0]
+        || sec_rec[120..128] != [18, 0, 44, 0, 1, 1, 0, 0]
+        || sec_rec[128..132] != [6, 36, 0, 16]
+        || sec_rec[132..148] != key
+    {
+        return TestResult::Fail("secure_peer_record STA_REC_KEY_V2 layout mismatch");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
@@ -82,10 +98,20 @@ fn mt76_join_plan_rejects_downgrades_and_unsupported_basic_rates() -> TestResult
         JoinPlan::prepare(&bss(true), OWN, b"narf", Security::Open),
         Err(Error::UnsupportedSecurity)
     ) || !matches!(
-        JoinPlan::prepare(&bss(false), OWN, b"narf", Security::Wpa2Psk),
+        JoinPlan::prepare(
+            &bss(false),
+            OWN,
+            b"narf",
+            Security::Wpa2Psk { psk: [0x55; 32] }
+        ),
         Err(Error::UnsupportedSecurity)
     ) || !matches!(
-        JoinPlan::prepare(&bss(true), OWN, b"wrong", Security::Wpa2Psk),
+        JoinPlan::prepare(
+            &bss(true),
+            OWN,
+            b"wrong",
+            Security::Wpa2Psk { psk: [0x55; 32] }
+        ),
         Err(Error::InvalidBss)
     ) {
         return TestResult::Fail("SSID/security downgrade accepted");
@@ -99,7 +125,7 @@ fn mt76_join_plan_rejects_downgrades_and_unsupported_basic_rates() -> TestResult
         .extend_from_slice(&[48, body.len() as u8]);
     ap.information_elements.extend_from_slice(&body);
     if !matches!(
-        JoinPlan::prepare(&ap, OWN, b"narf", Security::Wpa2Psk),
+        JoinPlan::prepare(&ap, OWN, b"narf", Security::Wpa2Psk { psk: [0x55; 32] }),
         Err(Error::UnsupportedSecurity)
     ) {
         return TestResult::Fail("mandatory PMF silently ignored");
@@ -173,4 +199,22 @@ fn mt76_join_truncated_response_and_cancel_cannot_advance() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921/association",
     mt76_join_truncated_response_and_cancel_cannot_advance
+);
+fn mt76_disconnect_record_layout() -> TestResult {
+    let disc = disconnect_record(AP);
+    if disc.len() != 40
+        || disc[..8] != [0, 1, 2, 0, 1, 0, 0, 0]
+        || disc[8..16] != [0, 0, 20, 0, 2, 0, 1, 0]
+        || disc[16] != 1
+        || disc[20..26] != AP
+        || disc[28..36] != [7, 0, 12, 0, 0, 0, 0, 0]
+        || disc[36] != 0
+    {
+        return TestResult::Fail("disconnect STA_REC wire layout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/association",
+    mt76_disconnect_record_layout
 );

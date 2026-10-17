@@ -24,18 +24,23 @@ select on-chip calibration and initialize MAC/WTBL/RTS. Unified device command
 framing now matches the local Linux reference. Waits are bounded and report the current stage;
 failed or cancelled attempts retain published DMA until verified shutdown.
 The retained RX ring and MCU scan path now support passive 2.4 GHz scans on
-channels 1–11. Successful radio initialization registers a passive nl80211
-interface with the real MAC; its link remains down and data sends fail.
+channels 1–11. Successful radio initialization registers a wireless
+interface with the real MAC and supported regulatory channels.
 The private cut-through management TX backend retains each payload until
 both descriptor completion and firmware token release. RX routing separates
-forwarded normal frames, MCU responses and TX releases on all rings. Checked
-station/MLME preparation validates legacy rates, PSK/CCMP negotiation, peer
-responses and station records; live join dispatch remains unfinished.
-The targeted QEMU suite passes 92 tests with one skip, including protocol,
-production descriptor/MAC, cancellation, country limits and MT7922 image-layout models.
-Both-architecture Clippy and an x86_64 UEFI boot smoke pass. Physical MT7922
-firmware/radio initialization and passive scan remain unverified; association and a working WLAN
-data path remain unfinished. This does not close the Stage 5 Wi-Fi gate.
+forwarded normal frames, MCU responses and TX releases on all rings.
+Live join dispatch is integrated with regulatory authorization, channel/power
+switching via `MCU_EXT_CMD_CHANNEL_SWITCH`, open-authentication/association MLME
+handshakes, and IEEE 802.11i WPA2-PSK 4-way handshakes (M1..M4) with HMAC-SHA1 MIC
+verification/generation. WTBL station records commit temporal keys with
+tag 0x12 (`STA_REC_KEY_V2`), cipher 6 (`MCU_CIPHER_AES_CCMP`), and `PORT_SECURE`.
+The datapath encapsulates 802.3 Ethernet frames into CONNAC2 32-byte TXDs on WFDMA data rings,
+translates 802.11 LLC/SNAP to Ethernet on RX, and pumps frames through `narf_ipc`
+producer/consumer rings with link state updates.
+The targeted QEMU suite passes 99 tests with one skip (99 pass, 0 fail, 1 skip),
+including live WPA2 join dispatch, STA_REC key installation, and Ethernet transport.
+Both-architecture Clippy and `cargo fmt` pass cleanly. Physical MT7922
+silicon validation on AMD Zen2/Phoenix hardware remains open to close the Stage 5 Wi-Fi gate.
 
 ## Loadable e1000 datapath
 

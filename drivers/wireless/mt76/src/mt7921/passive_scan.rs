@@ -28,9 +28,8 @@ fn word(bytes: &[u8], offset: usize) -> Option<u32> {
     ))
 }
 
-// Parse only native management RX here. Translated/aggregated/protected data
-// cannot become scan results. Every group and padding extent is checked.
-pub(super) fn beacon(packet: &[u8], nss: u8) -> Option<ScanBss> {
+/// Extract the validated 802.11 MPDU slice from a CONNAC2 normal RX packet.
+pub fn rx_frame(packet: &[u8]) -> Option<&[u8]> {
     let r0 = word(packet, 0)?;
     let len = (r0 & 0xffff) as usize;
     let normal = r0 >> 27 == 2 || r0 >> 27 == 7 && (r0 >> 16) & 15 == 1;
@@ -40,7 +39,6 @@ pub(super) fn beacon(packet: &[u8], nss: u8) -> Option<ScanBss> {
     let packet = &packet[..len];
     let r1 = word(packet, 4)?;
     let r2 = word(packet, 8)?;
-    let r3 = word(packet, 12)?;
     let r4 = word(packet, 16)?;
     if r1 & ((0x1f << 16) | (0x3f << 23)) != 0
         || r2 & ((1 << 13) | (7 << 23) | (1 << 27)) != 0
@@ -48,12 +46,7 @@ pub(super) fn beacon(packet: &[u8], nss: u8) -> Option<ScanBss> {
     {
         return None;
     }
-    let channel = ((r3 >> 8) & 255) as u8;
-    if !(1..=11).contains(&channel) {
-        return None;
-    }
     let mut offset = 24usize;
-    let mut signal = None;
     for (flag, size) in [(14, 16), (11, 16), (12, 8)] {
         if r1 & (1 << flag) != 0 {
             packet.get(offset..offset + size)?;
@@ -62,12 +55,43 @@ pub(super) fn beacon(packet: &[u8], nss: u8) -> Option<ScanBss> {
     }
     if r1 & (1 << 13) != 0 {
         packet.get(offset..offset + 8)?;
-        let mut rcpi = word(packet, offset + 4)?;
         offset += 8;
         if r1 & (1 << 15) != 0 {
             packet.get(offset..offset + 72)?;
-            rcpi = word(packet, offset + 24)?;
             offset += 72;
+        }
+    } else if r1 & (1 << 15) != 0 {
+        return None;
+    }
+    offset += 2 * ((r2 >> 14) & 3) as usize;
+    packet.get(offset..)
+}
+
+// Parse only native management RX here. Translated/aggregated/protected data
+// cannot become scan results. Every group and padding extent is checked.
+pub(super) fn beacon(packet: &[u8], nss: u8) -> Option<ScanBss> {
+    let frame = rx_frame(packet)?;
+    let r0 = word(packet, 0)?;
+    let len = (r0 & 0xffff) as usize;
+    let packet = &packet[..len];
+    let r1 = word(packet, 4)?;
+    let r3 = word(packet, 12)?;
+    let channel = ((r3 >> 8) & 255) as u8;
+    if !(1..=11).contains(&channel) {
+        return None;
+    }
+    let mut offset = 24usize;
+    let mut signal = None;
+    for (flag, size) in [(14, 16), (11, 16), (12, 8)] {
+        if r1 & (1 << flag) != 0 {
+            offset += size;
+        }
+    }
+    if r1 & (1 << 13) != 0 {
+        let mut rcpi = word(packet, offset + 4)?;
+        offset += 8;
+        if r1 & (1 << 15) != 0 {
+            rcpi = word(packet, offset + 24)?;
         }
         for chain in 0..nss.min(2) {
             let value = ((rcpi >> (chain * 8)) & 255) as i16;
@@ -76,11 +100,7 @@ pub(super) fn beacon(packet: &[u8], nss: u8) -> Option<ScanBss> {
                 signal = Some(signal.map_or(dbm, |old: i8| old.max(dbm)));
             }
         }
-    } else if r1 & (1 << 15) != 0 {
-        return None;
     }
-    offset += 2 * ((r2 >> 14) & 3) as usize;
-    let frame = packet.get(offset..)?;
     if frame.len() < 36 {
         return None;
     }
@@ -165,11 +185,11 @@ pub(super) fn scan_request(sequence: u8, channels: &[u8]) -> Result<Vec<u8>, Err
 }
 
 impl<B: Backend> Session<B> {
-    async fn notify(&mut self, command: Command, body: &[u8]) -> Result<(), Error> {
+    pub(super) async fn notify(&mut self, command: Command, body: &[u8]) -> Result<(), Error> {
         self.seq = self.seq % 15 + 1;
         self.send(false, &command.encode(self.seq, body)?).await
     }
-    async fn scan_setup(&mut self, info: RadioInfo) -> Result<(), Error> {
+    pub(super) async fn scan_setup(&mut self, info: RadioInfo) -> Result<(), Error> {
         // Publish a single unassociated station VIF, not a host netdev.
         let mut dev = [0u8; 16];
         super::super::cmd::encode_uni_dev_info_update(0, 0, true, info.capabilities.mac, &mut dev)

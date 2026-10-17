@@ -10,7 +10,14 @@ const RATES: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Security {
     Open,
-    Wpa2Psk,
+    Wpa2Psk { psk: [u8; 32] },
+}
+
+impl Security {
+    #[inline]
+    pub fn is_wpa2(&self) -> bool {
+        matches!(self, Self::Wpa2Psk { .. })
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -152,7 +159,7 @@ impl JoinPlan {
                 }
                 None
             }
-            Security::Wpa2Psk => {
+            Security::Wpa2Psk { .. } => {
                 let rsn = rsn.ok_or(Error::UnsupportedSecurity)?;
                 if bss.capability & 0x10 == 0
                     || rsn.group_cipher != Suite::standard(rsn::CIPHER_CCMP_128)
@@ -172,13 +179,7 @@ impl JoinPlan {
         auth.extend_from_slice(&[0, 0, 1, 0, 0, 0]);
         let mut assoc = management(0, own, bss.bssid);
         // ESS, negotiated privacy, and only AP-supported short preamble/slot.
-        let capability = 1
-            | (bss.capability & 0x0420)
-            | if security == Security::Wpa2Psk {
-                0x10
-            } else {
-                0
-            };
+        let capability = 1 | (bss.capability & 0x0420) | if security.is_wpa2() { 0x10 } else { 0 };
         assoc.extend_from_slice(&capability.to_le_bytes());
         assoc.extend_from_slice(&5u16.to_le_bytes());
         assoc.extend_from_slice(&[0, ssid.len() as u8]);
@@ -267,7 +268,7 @@ impl JoinPlan {
             return Err(Error::Rejected(status));
         }
         let capability = u16::from_le_bytes([bytes[24], bytes[25]]);
-        if capability & 3 != 1 || (capability & 0x10 != 0) != (self.security == Security::Wpa2Psk) {
+        if capability & 3 != 1 || (capability & 0x10 != 0) != self.security.is_wpa2() {
             self.phase = Phase::Failed;
             return Err(Error::Protocol);
         }
@@ -334,6 +335,47 @@ impl JoinPlan {
         out[wtbl + 2..wtbl + 4].copy_from_slice(&length.to_le_bytes());
         Ok(out)
     }
+
+    pub fn rsn_body(&self) -> Option<Vec<u8>> {
+        if self.security.is_wpa2() {
+            Some(RsnIe::wpa2_psk_ccmp().encode_body())
+        } else {
+            None
+        }
+    }
+
+    /// Emits a completed station record for WCID 1 containing CCMP-128
+    /// key installation and CONN_STATE_PORT_SECURE.
+    pub fn secure_peer_record(&self, aid: u16, key: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut out = self.peer_record(aid, true)?;
+        out[2] += 1; // 6 TLVs
+        let sec = tlv(&mut out, 0x12, 44);
+        out[sec + 4] = 1; // cmd = SET_KEY
+        out[sec + 5] = 1; // n_cipher = 1
+        out[sec + 8] = 6; // cipher_id = MCU_CIPHER_AES_CCMP (6)
+        out[sec + 9] = 36; // cipher_len
+        out[sec + 10] = 0; // key_id = 0
+        out[sec + 11] = 16; // key_len = 16
+        let k = key.len().min(16);
+        out[sec + 12..sec + 12 + k].copy_from_slice(&key[..k]);
+        Ok(out)
+    }
+}
+
+/// Disconnect station record: CONN_STATE_DISCONNECT for WCID 1.
+pub fn disconnect_record(peer: [u8; 6]) -> Vec<u8> {
+    let mut out = vec![0u8; 8];
+    out[1] = 1;
+    out[2] = 2; // Two TLVs: basic + state
+    out[4] = 1; // WCID 1
+    let basic = tlv(&mut out, 0, 20);
+    out[basic + 4..basic + 8].copy_from_slice(&0x10002u32.to_le_bytes());
+    out[basic + 8] = 1;
+    out[basic + 12..basic + 18].copy_from_slice(&peer);
+    out[basic + 18..basic + 20].copy_from_slice(&3u16.to_le_bytes());
+    let state = tlv(&mut out, 7, 12);
+    out[state + 8] = 0; // CONN_STATE_DISCONNECT
+    out
 }
 
 #[cfg(any(test, feature = "builtin"))]

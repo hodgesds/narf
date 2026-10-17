@@ -10,7 +10,11 @@ mod station;
 pub use station::{NicCapabilities, PhyCapabilities, RadioInfo};
 #[path = "passive_scan.rs"]
 mod scan;
-pub use scan::{ScanBss, ScanReport};
+pub use scan::{rx_frame, ScanBss, ScanReport};
+#[path = "station_join.rs"]
+mod join;
+pub use join::to_ethernet;
+pub(super) use join::{extract_eapol, wrap_eapol_frame};
 
 #[cfg(target_arch = "x86_64")]
 #[path = "firmware_transport_hw.rs"]
@@ -52,6 +56,62 @@ pub async fn scan_boot_passive(channels: &[u8]) -> Result<ScanReport, Error> {
         .as_mut()
         .ok_or(Error::DeviceGone)?
         .scan_passive(channels)
+        .await
+}
+
+/// Dispatch station association using the retained boot owner.
+#[cfg(target_arch = "x86_64")]
+pub async fn associate_boot_station(
+    bss: &ScanBss,
+    ssid: &[u8],
+    security: crate::mt7921::association::Security,
+) -> Result<u16, Error> {
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .associate_station(bss, ssid, security)
+        .await
+}
+
+/// Disassociate the current station using the retained boot owner.
+#[cfg(target_arch = "x86_64")]
+pub async fn disassociate_boot_station() -> Result<(), Error> {
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .disassociate_station()
+        .await
+}
+
+/// Submit an Ethernet data frame using the retained boot owner.
+#[cfg(target_arch = "x86_64")]
+pub async fn transmit_boot_frame(frame: &[u8]) -> Result<(), Error> {
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .transmit_ethernet(frame)
+        .await
+}
+
+/// Receive a data frame from the data queue using the retained boot owner.
+#[cfg(target_arch = "x86_64")]
+pub async fn receive_boot_data() -> Result<Option<Vec<u8>>, Error> {
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .receive_data_frame()
         .await
 }
 
@@ -165,6 +225,11 @@ pub enum Stage {
     MacInitialize,
     ScanSetup,
     ScanWait,
+    ChannelSwitch,
+    Authenticate,
+    Associate,
+    EapolHandshake,
+    StaRecord,
     Shutdown,
 }
 /// Firmware observations, not an operational WLAN interface.
@@ -183,7 +248,16 @@ pub enum State {
     Ready(Report),
     RadioReady(RadioInfo),
     ScanReady(RadioInfo),
-    Failed { stage: Stage, error: Error },
+    Associated {
+        info: RadioInfo,
+        peer: [u8; 6],
+        channel: u8,
+        aid: u16,
+    },
+    Failed {
+        stage: Stage,
+        error: Error,
+    },
     Stopped,
 }
 #[derive(Clone, Debug)]
@@ -362,6 +436,11 @@ trait Backend {
     fn configure_mac(&mut self) -> Result<(), Error>;
     fn clear_wtbl(&mut self, index: u8) -> Result<(), Error>;
     fn wtbl_idle(&mut self) -> Result<bool, Error>;
+    fn submit_management(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error>;
+    fn management_complete(
+        &mut self,
+    ) -> Result<Option<crate::mt7921::packet_tx::Completion>, Error>;
+    fn submit_data(&mut self, frame: &[u8]) -> Result<(), Error>;
 }
 #[derive(Debug)]
 struct Session<B: Backend> {
