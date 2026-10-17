@@ -351,6 +351,7 @@ fn start_hotplug(boot: &mut boot::ColdBoot) {
                     if let Some(boot) = OWNER.lock().await.as_mut() {
                         let _ = boot.display_hpd(hpd);
                     }
+                    note_hpd_pulse(hpd);
                     crate::amdgpu_navi22_kms::wake();
                 },
             ));
@@ -704,13 +705,39 @@ async fn withdraw(boot: &boot::ColdBoot) {
     crate::scanout_access::wait_retired().await;
 }
 
-/// `Sink` view of a detected EDID for the mode checks (only the EDID is read).
-fn sink_of(edid: &[u8]) -> crate::amdgpu_navi22_display::Sink {
-    crate::amdgpu_navi22_display::Sink {
-        edid: edid.to_vec(),
-        preferred: None,
-        hdmi: true,
-        dpcd: None,
+/// Recompute every detected sink's offers and the KMS inventory: the
+/// DCN30-admitted EDID timings (once admission inputs exist), a DP sink's
+/// bounded by its verified link or, until verified, its receiver caps.
+/// Dark and disabled connectors keep their EDID and modes, as Linux keeps
+/// a connected connector's modes whatever its CRTC does.
+fn reconcile_displays(boot: &mut boot::ColdBoot, reports: &[crate::amdgpu_navi22_display::Report]) {
+    use crate::amdgpu_navi22_display::Detection;
+    use crate::amdgpu_navi22_modeset::offered_on;
+    let soc = boot
+        .display_admitted()
+        .map(|a| (a.soc, a.soc.dentist_vco_khz));
+    let links: alloc::vec::Vec<_> = reports
+        .iter()
+        .enumerate()
+        .map(|(i, r)| match &r.detection {
+            Detection::Connected(sink) => boot.display_link_cap(i, sink.dpcd),
+            _ => None,
+        })
+        .collect();
+    crate::amdgpu_navi22_kms::KMS
+        .lock()
+        .reconcile_sinks(reports, |port, sink| {
+            let i = reports.iter().position(|r| r.connector == *port)?;
+            soc.map(|(soc, vco)| offered_on(sink, &soc, vco, links[i]))
+        });
+    // What the sinks' HPD looked like at this detection.
+    let senses = boot.display_hpd_senses();
+    let mut last = SENSES.lock();
+    for (slot, sense) in last
+        .iter_mut()
+        .zip(senses.iter().chain(core::iter::repeat(&None)))
+    {
+        *slot = *sense;
     }
 }
 
@@ -724,16 +751,11 @@ async unsafe fn light(
 ) -> Result<crate::amdgpu_navi22_modeset::Output, boot::Error> {
     use crate::amdgpu_navi22_display::Detection;
     use crate::amdgpu_navi22_kms::{Action, KMS};
-    use crate::amdgpu_navi22_modeset::{offered, Error as M};
+    use crate::amdgpu_navi22_modeset::Error as M;
     let reports = boot.detect_displays().await?;
-    let admission =
-        |b: &boot::ColdBoot| b.display_admitted().map(|a| (a.soc, a.soc.dentist_vco_khz));
-    let soc = admission(boot);
+    reconcile_displays(boot, &reports);
     let action = {
         let mut kms = KMS.lock();
-        kms.reconcile(&reports, |_, edid| {
-            soc.map(|(soc, vco)| offered(&sink_of(edid), &soc, vco))
-        });
         kms.assign_route();
         let action = kms.next(None);
         if let Action::Light { route, want } = action {
@@ -751,13 +773,11 @@ async unsafe fn light(
     };
     // SAFETY: the caller's obligations.
     let result = unsafe { boot.modeset_display(connector, &sink, want, draw) }.await;
-    // Admission inputs exist now (lit or not): offer what they admit.
-    let soc = admission(boot);
+    // Admission inputs (and a DP sink's verified link) exist now, lit or
+    // not: offer what they admit.
+    reconcile_displays(boot, &reports);
     {
         let mut kms = KMS.lock();
-        kms.reconcile(&reports, |_, edid| {
-            soc.map(|(soc, vco)| offered(&sink_of(edid), &soc, vco))
-        });
         kms.crtc.shown = None;
         if let Ok(output) = result.as_ref() {
             let edid = sink
@@ -823,8 +843,158 @@ static MONITOR: AtomicBool = AtomicBool::new(false);
 /// Recoveries the display was last lit after.
 static RELIT: AtomicU64 = AtomicU64::new(0);
 
-/// One monitor pass: after a recovery, light the new owner; otherwise apply
-/// the next KMS convergence step (tear down, then light on the next pass).
+/// HPD blocks whose long pulse (plug/unplug edge) the IH service saw
+/// since the monitor's last pass; short pulses (HPD-RX) only wake it, as
+/// each pass checks the lit DP link anyway.
+static LONG_PULSES: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// Each board connector's debounced HPD at the last detection or pass.
+static SENSES: narf_lib::sync::IrqSafeSpinLock<[Option<bool>; 6]> =
+    narf_lib::sync::IrqSafeSpinLock::new([None; 6]);
+fn note_hpd_pulse(hpd: crate::amdgpu_ih_navi22::Hpd) {
+    if !hpd.rx && hpd.instance < 8 {
+        LONG_PULSES.fetch_or(1 << hpd.instance, Ordering::AcqRel);
+    }
+}
+
+/// What a monitor pass did, for its console line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MonitorStep {
+    /// The lit sink's HPD fell: withdrawn and torn down without AUX/DDC.
+    Unplugged(usize),
+    /// A connector's sink appeared, left or was replaced: detected again.
+    Reprobed(usize),
+    /// The lit DP link lost lock and trained again (same setting).
+    Retrained(crate::amdgpu_navi22_modeset::DpLink),
+    /// Retraining failed: the display was stopped, to be lit again from a
+    /// fresh verification (rate/lane fallback).
+    RetrainFailed,
+    /// The sink asked for an automated test (acknowledged, not run).
+    AutomatedTest,
+}
+
+/// Linux's long-pulse path (`handle_hpd_irq` → `dc_link_detect` → a
+/// zero-stream commit) and short-pulse path (`handle_hpd_rx_irq` →
+/// `dp_handle_link_loss`) for the single lit pipe, before KMS convergence.
+/// Returns the step taken; a teardown ends the pass.
+/// # Safety
+/// As for `modeset_displays`, with OWNER held.
+async unsafe fn monitor_hotplug(
+    boot: &mut boot::ColdBoot,
+    running: Option<(usize, crate::amdgpu_dml::Timing)>,
+) -> Option<Result<MonitorStep, boot::Error>> {
+    use crate::amdgpu_navi22_display::Signal;
+    use crate::amdgpu_navi22_kms::KMS;
+    use crate::amdgpu_navi22_modeset::RxEvent;
+    let long = LONG_PULSES.swap(0, Ordering::AcqRel);
+    let senses = boot.display_hpd_senses();
+    let ports: alloc::vec::Vec<_> = boot
+        .display_connectors()
+        .map(<[_]>::to_vec)
+        .unwrap_or_default();
+    // 1. The lit sink left: no AUX/DDC to it, surfaces released, the
+    //    connector disconnected (its EDID and modes gone).
+    if let Some((route, _)) = running {
+        if senses.get(route) == Some(&Some(false)) {
+            withdraw(boot).await;
+            // SAFETY: withdrawn and drained; serialized by OWNER.
+            let result = unsafe { boot.stop_unplugged_display() }.await;
+            {
+                let mut kms = KMS.lock();
+                kms.crtc.shown = None;
+                if let Some(c) = kms.connectors.get_mut(route) {
+                    c.present = false;
+                    c.edid.clear();
+                    c.modes.clear();
+                    c.unadmitted = false;
+                }
+                kms.attempted = None;
+                kms.assign_route();
+            }
+            SENSES.lock()[route] = Some(false);
+            crate::amdgpu_navi22_kms::publish();
+            crate::amdgpu_navi22_kms::wake();
+            return Some(result.map(|()| MonitorStep::Unplugged(route)));
+        }
+    }
+    // 2. A sink appeared, left or pulsed (replaced): detect every connector
+    //    again (EDID inventory for dark connectors too). A pulsed lit sink
+    //    that is still present is a new sink: stop it so the next pass
+    //    lights it from a fresh detection and link verification.
+    let changed: alloc::vec::Vec<usize> = {
+        let last = *SENSES.lock();
+        (0..senses.len().min(6))
+            .filter(|&i| {
+                let pulsed = ports
+                    .get(i)
+                    .and_then(|c| c.hpd)
+                    .is_some_and(|h| long & 1 << h != 0);
+                senses[i].is_some() && (senses[i] != last[i] || pulsed)
+            })
+            .collect()
+    };
+    if let Some(&first) = changed.first() {
+        for &i in &changed {
+            boot.forget_display_link(i);
+        }
+        if running.is_some_and(|(route, _)| changed.contains(&route)) {
+            // SAFETY: as above.
+            let stopped = unsafe { unlight(boot) }.await;
+            KMS.lock().attempted = None;
+            crate::amdgpu_navi22_kms::wake();
+            if let Err(error) = stopped {
+                return Some(Err(error));
+            }
+        }
+        return Some(match boot.detect_displays().await {
+            Ok(reports) => {
+                reconcile_displays(boot, &reports);
+                {
+                    let mut kms = KMS.lock();
+                    kms.attempted = None;
+                    kms.assign_route();
+                }
+                crate::amdgpu_navi22_kms::publish();
+                crate::amdgpu_navi22_kms::wake();
+                Ok(MonitorStep::Reprobed(first))
+            }
+            Err(error) => Err(error),
+        });
+    }
+    // 3. The lit DP link (HPD-RX or the periodic poll): link loss retrains.
+    let (route, _) = running?;
+    if ports.get(route).map(|c| c.signal) != Some(Signal::DisplayPort) {
+        return None;
+    }
+    match boot.check_display_link().await {
+        Ok(RxEvent::None) => None,
+        Ok(RxEvent::AutomatedTest) => Some(Ok(MonitorStep::AutomatedTest)),
+        Ok(RxEvent::LinkLoss(_)) => {
+            // SAFETY: the surfaces stay published; OWNER serializes.
+            match unsafe { boot.retrain_display() }.await {
+                Ok(link) => Some(Ok(MonitorStep::Retrained(link))),
+                Err(error) => {
+                    use core::fmt::Write;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: navi22 DP retrain failed ({error:?}); relighting"
+                    );
+                    // SAFETY: as above.
+                    let stopped = unsafe { unlight(boot) }.await;
+                    KMS.lock().attempted = None;
+                    crate::amdgpu_navi22_kms::wake();
+                    Some(stopped.map(|()| MonitorStep::RetrainFailed))
+                }
+            }
+        }
+        // An AUX failure while HPD is high: the next pass sees an unplug,
+        // or checks again.
+        Err(_) => None,
+    }
+}
+
+/// One monitor pass: after a recovery, light the new owner; then hot-plug
+/// and link maintenance (`monitor_hotplug`); otherwise apply the next KMS
+/// convergence step (tear down, then light on the next pass).
 /// # Safety
 /// As for `modeset_displays`.
 async unsafe fn monitor_pass() {
@@ -848,6 +1018,11 @@ async unsafe fn monitor_pass() {
         let route = kms.connectors.iter().position(|c| c.port == o.connector)?;
         Some((route, o.timing))
     });
+    // SAFETY: the caller's obligations, with OWNER held.
+    if let Some(step) = unsafe { monitor_hotplug(boot, running) }.await {
+        let _ = writeln!(narf_console::Writer, "amdgpu: navi22 display {step:?}");
+        return;
+    }
     let action = KMS.lock().next(running);
     let result = match action {
         Action::Nothing => return,
