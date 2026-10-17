@@ -11869,10 +11869,23 @@ fn smoke_amdgpu_vm_holds_job_memory_until_its_fence() -> TestResult {
         // No job yet: an unmapped, closed buffer goes at once.
         let vm = VmState::for_card(card);
         let (h, weak) = map_one(&vm, 0x4_0000_0000)?;
+        // A map leaves the TLB sequence alone; removing a mapping bumps it.
+        if vm.tlb_seq() != 0 {
+            return Some("a map needs no TLB flush");
+        }
         close(h);
         gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_UNMAP, 0, 0x4_0000_0000, 0, P).ok()?;
         if weak.upgrade().is_some() || deferred(card) != 0 {
             return Some("freed before any job");
+        }
+        if vm.tlb_seq() != 1 {
+            return Some("an unmap bumps the TLB sequence");
+        }
+        // Each space has its own, stable VMID owner identity.
+        let other = VmState::for_card(card);
+        let id = vm.owner();
+        if id == 0 || vm.owner() != id || other.owner() == id {
+            return Some("owner identities");
         }
         // After job 5: held until the engine passes 5.
         let (h, weak) = map_one(&vm, 0x4_0000_0000)?;
@@ -12792,4 +12805,87 @@ fn smoke_amdgpu_dcn_offsets_match_headers() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu_dcn",
     smoke_amdgpu_dcn_offsets_match_headers
+);
+
+/// `VmidManager` follows amdgpu_vmid_grab: a space reuses its VMID without
+/// a flush until it removes a mapping or its flush is pending on another
+/// ring; a new space takes an idle VMID and flushes; nothing idle means
+/// waiting; the LUT entry is rewritten only for a new PASID.
+fn smoke_amdgpu_vmid_grab_reuses_and_flushes_like_linux() -> TestResult {
+    use crate::amdgpu_vmid::{GrabRequest, VmidManager};
+    let mut m = VmidManager::new(1, 2);
+    let a = GrabRequest {
+        owner: 1,
+        pd_addr: 0x1000,
+        tlb_seq: 0,
+        pasid: 7,
+        ring: 0,
+    };
+    let none_done = |_: u64| false;
+    let all_done = |_: u64| true;
+    // First use: the most recently used idle VMID, flushed, LUT written.
+    let g = match m.grab(a, &all_done) {
+        Some(g) if g.needs_flush && g.map_pasid => g,
+        _ => return TestResult::Fail("first grab flushes"),
+    };
+    m.commit(a, g, 1);
+    // Same ring, same space, nothing removed: reuse without a flush, even
+    // while job 1 runs, as long as another VMID is idle.
+    match m.grab(a, &none_done) {
+        Some(r) if r.vmid == g.vmid && !r.needs_flush && !r.map_pasid => m.commit(a, r, 2),
+        _ => return TestResult::Fail("reuse without a flush"),
+    }
+    // From another ring while the flush (job 1) is pending: flush again.
+    let on_compute = GrabRequest { ring: 1, ..a };
+    match m.grab(on_compute, &|t| t != 1 && t != 2) {
+        Some(r) if r.vmid == g.vmid && r.needs_flush && r.map_pasid => {}
+        _ => return TestResult::Fail("cross-ring pending flush"),
+    }
+    match m.grab(on_compute, &all_done) {
+        Some(r) if r.vmid == g.vmid && !r.needs_flush && !r.map_pasid => {}
+        _ => return TestResult::Fail("cross-ring after the flush completed"),
+    }
+    // A removed mapping bumps the TLB sequence: flush.
+    let removed = GrabRequest { tlb_seq: 1, ..a };
+    match m.grab(removed, &all_done) {
+        Some(r) if r.vmid == g.vmid && r.needs_flush => {}
+        _ => return TestResult::Fail("flush after an unmap"),
+    }
+    // Another space takes the other (idle) VMID and flushes.
+    let b = GrabRequest {
+        owner: 2,
+        pd_addr: 0x2000,
+        pasid: 8,
+        ..a
+    };
+    let gb = match m.grab(b, &|t| t > 2) {
+        Some(r) if r.vmid != g.vmid && r.needs_flush && r.map_pasid => r,
+        _ => return TestResult::Fail("second space"),
+    };
+    m.commit(b, gb, 3);
+    // Both VMIDs busy: a third space waits.
+    let c = GrabRequest {
+        owner: 3,
+        pd_addr: 0x3000,
+        pasid: 9,
+        ..a
+    };
+    if m.grab(c, &none_done).is_some() {
+        return TestResult::Fail("grab with no idle VMID");
+    }
+    // Space A's jobs finish: its VMID is the idle one handed over, with a
+    // flush and a LUT rewrite for the new PASID.
+    match m.grab(c, &|t| t <= 2) {
+        Some(r) if r.vmid == g.vmid && r.needs_flush && r.map_pasid => m.commit(c, r, 4),
+        _ => return TestResult::Fail("third space takes the idle VMID"),
+    }
+    // A comes back: its old VMID now belongs to C, B's is busy, so it waits.
+    if m.grab(a, &|t| t <= 2).is_some() {
+        return TestResult::Fail("A must wait for an idle VMID");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vmid",
+    smoke_amdgpu_vmid_grab_reuses_and_flushes_like_linux
 );

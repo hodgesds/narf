@@ -740,6 +740,21 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
     {
         return TestResult::Fail("compute job");
     }
+    // A reused VMID: no flush and no LUT write, only the IB and fence.
+    let (writes, waits) = (e.io.job_writes.len(), e.io.job_waits.len());
+    let reused = Job {
+        flush: false,
+        map_pasid: false,
+        ..compute
+    };
+    if e.submit(Pipe::Compute, reused) != Ok(2)
+        || e.completed_job(Pipe::Compute) != Ok(2)
+        || e.io.job_writes.len() != writes
+        || e.io.job_waits.len() != waits
+        || e.io.job_ibs.last() != Some(&(0x2_0000_4000, 8 | 1 << 23 | 2 << 24))
+    {
+        return TestResult::Fail("job on a reused VMID");
+    }
     // With the CP stalled, four slots fill and a fifth is refused.
     e.io.complete = false;
     for seq in 7..=10 {

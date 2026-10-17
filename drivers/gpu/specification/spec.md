@@ -3581,11 +3581,11 @@ after boot: up to eight IBs per submission (`Job::new`, in order in one
 slot), all for the graphics ring or all for the compute ring
 (`Queues::submit(Pipe, Job)`; the compute frame writes registers without
 the PFP, skips PFP_SYNC_ME, flushes on invalidation engine 1 and marks IBs
-`INDIRECT_BUFFER_VALID`), run on client VMID 1 with the
+`INDIRECT_BUFFER_VALID`), run on a GFX hub VMID from 1–7 with the
 open's root page directory (`VmState::root_pde`, GMC 12 only), through
 `amdgpu_gfx12_queue::Queues::submit` — one 256-dword ring slot of VM flush
 (GFX hub, engine 0, PFP_SYNC_ME), IB and interrupting RELEASE_MEM fence;
-`Busy` when the 1024-dword ring is full. Each job also maps VMID 1 to its
+`Busy` when the 1024-dword ring is full. A job also maps its VMID to its
 open's PASID in the IH VMID LUT (OSSSYS `IH_VMID_0_LUT + vmid`, after the
 flush, as gmc_v12_0_emit_pasid_mapping), so a fault carries the client's
 PASID; `VmState::pasid` allocates one per address space
@@ -3596,8 +3596,21 @@ the IV's PASID (`amdgpu_vmid::record_fault`: address from the IV, the hub's
 protection-fault status, GFX 0 / MM 1; a zero status never replaces a
 useful one; faults for freed PASIDs are dropped), and
 `AMDGPU_INFO_GPUVM_FAULT` (`amdgpu_info::dispatch_for`) answers from the
-open's PASID. VMID reuse is not implemented, and `AMDGPU_INFO` still
-reports acceleration unavailable.
+open's PASID. `AMDGPU_INFO` still reports acceleration unavailable.
+
+`amdgpu_vmid::VmidManager` grants VMIDs as amdgpu_vmid_grab does with
+concurrent flushes: `grab(GrabRequest { owner, pd_addr, tlb_seq, pasid,
+ring }, done)` returns a `Grant { vmid, needs_flush, map_pasid }` or None
+to wait. A submission needs some VMID with no unfinished job on any ring;
+it then reuses the most recent VMID its own space (`VmState::owner`, a
+never-reused identity) used at the same page directory, flushing only if
+`VmState::tlb_seq` (bumped whenever a mapping is removed) passed that
+VMID's last flush or that flush is pending on another ring, and otherwise
+takes the idle VMID and flushes. The LUT entry is rewritten when the VMID
+mapped another PASID or that write is pending on another ring. `commit`
+records the job once the ring accepted it. Navi48 grants VMIDs 1–7 (8–15
+are KFD's, first_kfd_vmid) and sets `Job::flush` / `Job::map_pasid`
+from the grant.
 
 ### AMD platform VBIOS
 

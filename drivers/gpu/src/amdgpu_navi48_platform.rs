@@ -214,7 +214,14 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     if let (Some(card), Some(fence)) = (boot::ColdBoot::drm_card(), boot.client_fence_reader()) {
         crate::amdgpu_cs::register_submitter(
             card,
-            alloc::sync::Arc::new(Submitter { card, fence }),
+            alloc::sync::Arc::new(Submitter {
+                card,
+                fence,
+                vmids: narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_vmid::VmidManager::new(
+                    CLIENT_VMIDS.0,
+                    CLIENT_VMIDS.1,
+                )),
+            }),
         );
     }
     // Clients' VRAM buffers; without it they fall back to system memory.
@@ -237,25 +244,31 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
 
 /// The Navi48 kernel queues behind AMDGPU_CS: up to eight IBs per
 /// submission, all for the graphics ring or all for the compute ring, run
-/// in the open's address space on client VMID 1, whose context every job's
-/// VM flush points at that space's root first.
+/// in the open's address space on a GFX hub VMID from 1–7 (8–15 are KFD's,
+/// as gmc_v12_0 sets first_kfd_vmid), granted by `amdgpu_vmid::VmidManager`
+/// as amdgpu_vmid_grab does: a space keeps reusing its VMID without a
+/// flush until it removes a mapping, and a submission that finds no idle
+/// VMID waits for one.
 ///
 /// A job's ticket is its pipe in the high 32 bits and its ring sequence in
 /// the low. `amdgpu_cs` records each job on its address space, so the
 /// buffers and page tables it may reach are freed only once its fence
 /// passes; every fence read here retires what completed jobs held.
 ///
-/// Each job maps VMID 1 to its open's PASID in the IH LUT, so its faults
-/// carry the client's PASID and reach that open's GPUVM_FAULT query.
+/// A job maps its VMID to its open's PASID in the IH LUT whenever the
+/// VMID last mapped another (or that write may not have run yet), so its
+/// faults carry the client's PASID and reach that open's GPUVM_FAULT query.
 ///
-/// LINUX-GAP: VMID 1 for every client, always flushed — no per-client VMID
-/// reuse (amdgpu_vmid_grab). AMDGPU_INFO keeps reporting acceleration
-/// unavailable, so Mesa does not submit here.
+/// AMDGPU_INFO keeps reporting acceleration unavailable, so Mesa does not
+/// submit here.
 struct Submitter {
     card: u32,
     fence: crate::amdgpu_gfx12_queue::FenceReader,
+    /// Touched only under OWNER, beside the submission it grants.
+    vmids: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_vmid::VmidManager>,
 }
-const CLIENT_VMID: u8 = 1;
+/// Client VMIDs on the GFX hub: 1 up to first_kfd_vmid (8) exclusive.
+const CLIENT_VMIDS: (u8, u8) = (1, 7);
 const PIPES: [crate::amdgpu_gfx12_queue::Pipe; 2] = [
     crate::amdgpu_gfx12_queue::Pipe::Graphics,
     crate::amdgpu_gfx12_queue::Pipe::Compute,
@@ -328,14 +341,41 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             }
             let pd_addr = vm.root_pde().ok_or(FsError::InvalidData)?;
             let pasid = vm.pasid().ok_or(FsError::NoSpace)?;
-            let job = crate::amdgpu_gfx12_queue::Job::new(CLIENT_VMID, pasid, pd_addr, &ibs)
+            let request = crate::amdgpu_vmid::GrabRequest {
+                owner: vm.owner(),
+                pd_addr,
+                tlb_seq: vm.tlb_seq(),
+                pasid,
+                ring,
+            };
+            let mut job = crate::amdgpu_gfx12_queue::Job::new(0, pasid, pd_addr, &ibs)
                 .ok_or(FsError::InvalidData)?;
-            let mut owner = OWNER.lock().await;
-            let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
-            // SAFETY: the platform serializes every queue user under OWNER;
-            // `amdgpu_cs` holds the job's memory until its fence.
-            let result = unsafe { boot.submit_client_job(pipe, job) };
-            drop(owner);
+            let result = loop {
+                let mut owner = OWNER.lock().await;
+                let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
+                let completed = self.progress().ok_or(FsError::NoDevice)?;
+                let done = |t| job_done(completed, t);
+                let grant = self.vmids.lock().grab(request, &done);
+                let Some(grant) = grant else {
+                    // amdgpu_vmid_grab_idle: wait for a VMID to go idle.
+                    drop(owner);
+                    narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant())
+                        .await;
+                    continue;
+                };
+                job.vmid = grant.vmid;
+                job.flush = grant.needs_flush;
+                job.map_pasid = grant.map_pasid;
+                // SAFETY: the platform serializes every queue user under
+                // OWNER; `amdgpu_cs` holds the job's memory until its fence,
+                // and the grant keeps another space off this VMID until then.
+                let result = unsafe { boot.submit_client_job(pipe, job) };
+                if let Ok(seq) = result {
+                    let ticket = u64::from(ring) << 32 | u64::from(seq);
+                    self.vmids.lock().commit(request, grant, ticket);
+                }
+                break result;
+            };
             let _ = self.progress();
             match result {
                 Ok(seq) => Ok(u64::from(ring) << 32 | u64::from(seq)),

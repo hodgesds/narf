@@ -76,9 +76,11 @@ pub enum State {
     InterruptVerified,
     Failed(Error),
 }
-/// A client job: an IB of `ib_dwords` at `ib` in VMID `vmid`'s address
-/// space, whose page directory is `pd_addr` (the root's entry address with
-/// VALID, as gmc_v12_0_get_vm_pde leaves it).
+/// A client job: IBs in VMID `vmid`'s address space, whose page directory
+/// is `pd_addr` (the root's entry address with VALID, as
+/// gmc_v12_0_get_vm_pde leaves it). `flush` points the VMID's context at
+/// `pd_addr` and invalidates its TLB first; `map_pasid` rewrites its IH LUT
+/// entry (`amdgpu_vmid::VmidManager` decides both).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Job {
     pub vmid: u8,
@@ -89,6 +91,8 @@ pub struct Job {
     /// The job's IBs in order, `(address, dwords)`; `ib_count` are used.
     pub ibs: [(u64, u32); MAX_JOB_IBS],
     pub ib_count: u8,
+    pub flush: bool,
+    pub map_pasid: bool,
 }
 /// IBs one job may carry: all fit one 256-dword slot beside the flush,
 /// PASID mapping and fence.
@@ -107,6 +111,8 @@ impl Job {
             pd_addr,
             ibs: all,
             ib_count: ibs.len() as u8,
+            flush: true,
+            map_pasid: true,
         })
     }
     fn ibs(&self) -> &[(u64, u32)] {
@@ -145,15 +151,19 @@ fn job_packets(
     let mut words = [0u32; 256];
     let mut b = Pm4Builder::new(&mut words);
     let built = (|| {
-        b.vm_flush(
-            &crate::amdgpu_vmhub_regs::GFXHUB_V12_0,
-            gc,
-            pipe.engine(),
-            job.vmid,
-            job.pd_addr,
-            gfx,
-        )?;
-        b.write_reg(oss + u32::from(job.vmid), u32::from(job.pasid), gfx)?;
+        if job.flush {
+            b.vm_flush(
+                &crate::amdgpu_vmhub_regs::GFXHUB_V12_0,
+                gc,
+                pipe.engine(),
+                job.vmid,
+                job.pd_addr,
+                gfx,
+            )?;
+        }
+        if job.map_pasid {
+            b.write_reg(oss + u32::from(job.vmid), u32::from(job.pasid), gfx)?;
+        }
         for &(at, dwords) in job.ibs() {
             if gfx {
                 b.indirect_buffer(at, dwords, job.vmid)?;
