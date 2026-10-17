@@ -1085,6 +1085,14 @@ pub trait DrmFence: Send + Sync {
         "narf"
     }
 
+    /// The submitter a scheduler fence belongs to (Linux
+    /// `amdgpu_sync_get_owner`: the job's VM), so implicit sync can skip a
+    /// client's own work (`AMDGPU_SYNC_NE_OWNER`). `None`: no owner, always
+    /// waited for.
+    fn owner(&self) -> Option<u64> {
+        None
+    }
+
     /// Linux `dma_fence.timestamp`: the `CLOCK_MONOTONIC` ns at which the
     /// fence signalled, when the driver recorded it. `None` lets a sync_file
     /// report the first instant it observed the signalled state instead.

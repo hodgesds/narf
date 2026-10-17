@@ -976,7 +976,12 @@ sit behind one switch, now wired: the card registers a generic
 client IBs on the Navi22 kernel queues (per-job ring-side VM flush, fences,
 two in flight per ring), with user fences, GEM_METADATA, PRIME, DRM 3.64.0 and
 GET_CLIENT; proven in register/fake-engine models only (ABI audit:
-`drivers/gpu/research/navi22-mesa-abi.md`). Fences poll with an IH notify hook;
+`drivers/gpu/research/navi22-mesa-abi.md`). The generic sync ABI (shared with
+Navi48) now matches Linux: timeline syncobjs (`DRM_CAP_SYNCOBJ_TIMELINE` = 1,
+TIMELINE_WAIT/QUERY/TRANSFER/TIMELINE_SIGNAL/EVENTFD, CS timeline chunks),
+syncobj and sync_file fds, WAIT_FENCES, FENCE_TO_HANDLE, BO_LIST and
+Linux's implicit-sync rules (model-tested against Navi22- and Navi48-shaped
+engines). Fences poll with an IH notify hook;
 register models cover encodings, rejection, timeouts and cancellation only.
 Production cold boot now resets a posted card before any firmware stage, as
 Linux does whenever the VBIOS left SOS running: PMFW (or PSP) mode1 reset,
