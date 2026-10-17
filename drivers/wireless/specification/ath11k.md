@@ -1,10 +1,18 @@
 # ath11k — Specification
 
-> Status: **v0.5** — PCI identify, power-up, the MHI host (firmware
-> to mission mode, IPCR started), the WLFW QMI handshake over QRTR to
-> FW_READY, and the core bring-up (QMI firmware start, CE, HTC, WMI
-> service ready → INIT → READY with the device MAC) — offline-tested
-> only. No data path; no network interface is registered.
+> Status: **v0.9** — the whole station path is wired and
+> offline-tested end to end; nothing has run on the card yet. Probe →
+> power-up → MHI (firmware to mission mode) → WLFW QMI to FW_READY →
+> core bring-up (QMI firmware start, CE, HTC, WMI to READY) with the
+> real data path in Linux's order (DP rings, REO, HTT version, pdev
+> rings via HTT SRING_SETUP, DP ext interrupts) → mac layer (start,
+> station vif) → `wlan%d` registered with `narf_net` (frame rings, send
+> hook, RX drain), the capability registry and `narf_wireless`. Scan,
+> Open / WPA2-PSK (CCMP) connect with EAPOL over the DP rings, data TX
+> (Ethernet → native-wifi 802.11) and RX (native-wifi → Ethernet II),
+> disconnect and link loss run against a composed fake device
+> (`integration_tests.rs`). Unverified until the QCNFA765 boots: §8
+> "Unverified until hardware".
 >
 > Qualcomm ath11k Wi-Fi 6 / 6E driver for PCIe host-attached
 > silicon (QCA6390 / WCN6855 / QCN9074). Adapted from Linux
@@ -342,11 +350,19 @@ HE caps for the mac layer, HAL reg caps), `dma_ring_caps`, `ready` +
   everything else is queued. HTC frames for an endpoint nobody owns, and
   malformed frames, are counted and dropped like Linux.
 - `pci_start(Wlfw)` (from `pci::mhi_task`): `Ce::alloc` +
-  `install_ce_irq_handlers` with the probe's MSI state (Linux does both
-  at probe), then `qmi_firmware_ready(&mut NoDp)`; the core is parked
-  ready or failed. `take_core()` (only when ready), `park_core`,
-  `core_ready`, `core_failure`. A session the core cannot start on is
-  parked too: the firmware owns its target memory.
+  `install_ce_irq_handlers` + `runtime::install_dp_irq_handlers` with
+  the probe's MSI state (Linux `ath11k_pcic_config_irq` at probe), then
+  `qmi_firmware_ready(&mut runtime::DpHooks)` (§3.11, `DpRingSizes::LINUX`);
+  on success the core + DP go to `runtime::start_pci` (mac layer →
+  `wlan%d`). A failed core is parked (`park_core`, `core_failure`) with
+  its DP (`STRANDED_DP`); a session the core cannot start on is parked
+  too: the firmware owns its target memory. `take_core()` returns only a
+  parked ready core (none in the normal flow).
+- `wmi_cmd_try_send(&WmiCmd) -> Result<(), errno>` (one
+  `ath11k_wmi_cmd_send_nowait` attempt) + `wmi_send_retryable(errno)`
+  for callers that wait outside the core (the runtime ports).
+- `QmiFw::service()` (default no-op; `Wlfw`: QRTR pump + log late
+  indications) — the runtime calls it every 100 ms.
 - Steps (`core::step`, 120–139): UNSUPPORTED 120, NO_DEVICE 121,
   HTC_INIT 122, HTC_READY_TIMEOUT 123, HTC_BAD_READY 124, HTT_CONNECT
   125, HTT_CONNECT_TIMEOUT 126, WMI_CONNECT 127, WMI_CONNECT_TIMEOUT
@@ -391,7 +407,7 @@ endpoints.
 ### 3.7 DP ring runtime (`dp_ring.rs`, Linux `dp.c`, `dp_tx.c`, `dp_rx.c`, `hal_tx.c`, `hal_rx.c`)
 
 Pure layer over [`hal::Hal`] (the device's one HAL, `Ce::hal`) and
-`ChipIo`; nothing is wired into `pci.rs` yet. WCN6855 family only
+`ChipIo`; driven by `runtime.rs` (§3.11). WCN6855 family only
 (`DpHwParams::for_rev`: single pdev, `num_rxdma_per_pdev = 2`,
 `rx_mac_buf_ring`, no rxdma1 / monitor, one TCL ring with rbm SW0,
 `rx_buf_rbm` SW1, `hal_desc_sz` 392). `DpRingSizes::LINUX` is what
@@ -490,7 +506,9 @@ mac layer sees the MGMT_TX_COMPLETION), `now_ms()`, `max_msg_len()`
 timeout)` (HTT PEER_MAP / UNMAP), `peer_setup` / `peer_cleanup`,
 `rx_pn_replay_config(vdev, addr, cipher, pairwise, install)`,
 `send_eth(frame)` / `recv_eapol(timeout)` (EAPOL as 802.3,
-`ETH_P_PAE`), `set_authorized(addr, on)` (port control for data).
+`ETH_P_PAE`), `set_authorized(addr, on)` (port control for data),
+`set_sta_wme(addr, wme)` (`sta->sta.wme` from the association
+response: the TX path builds QoS Data only for a WMM AP).
 
 **`Mac<P, D>`**: `new(wmi, dp, DeviceCaps, MacConfig, initial_reg)`
 (`ath11k_mac_register`: wiphy bands from `hal_reg_cap`, the default
@@ -591,6 +609,12 @@ mac layer interleaves in Linux's order:
    `dp.rx_tid_wmi_failed`); RX_STOP → `dp.ampdu_stop(..)` → send the
    returned command if any.
 5. `ath11k_dp_free` → `dp.reo_cmd_list_cleanup()`.
+6. `ath11k_mac_op_set_key` after `ath11k_install_key`:
+   `dp.pn_replay_config(hal, io, vdev_id, addr, rsn_cipher, pairwise,
+   install, now)` = `ath11k_dp_peer_rx_pn_replay_config` (pairwise
+   only: REO UPDATE_RX_QUEUE with PN / PN_SIZE / PN_VALID / PN_CHECK /
+   SVLD on every active TID, PN check + 48-bit PN on `SET_KEY`; one
+   `cmd` carried across TIDs as Linux), then `set_peer_sec_type`.
 
 Encoders: `hal_reo_qdesc_size`, `hal_reo_qdesc_setup` (words),
 `hal_reo_cmd_desc` (TLV + 9-word body of GET_QUEUE_STATS / FLUSH_CACHE /
@@ -613,6 +637,165 @@ failed flush), REO ring full / rejected types / crash flush, setup
 unwinding (unknown peer, routing / TID WMI failure, update-path failure,
 ring full mid-setup), ADDBA stop, HTT unmap + re-map.
 
+### 3.11 Integration: DP hooks, runtime, netdev (`runtime.rs`, `tx_hdr.rs`, `iface.rs`)
+
+**DP hooks** (`runtime::DpHooks`, the `CoreHooks` of
+`qmi_firmware_ready` over `CeHif`): `dp_alloc` = `Dp::alloc(ce.hal, io,
+DpHwParams::for_rev, sizes, msi)` after `init_pipes`; `pdev_reo_setup`
+after service ready; `htt_ver_req` = `ath11k_dp_tx_htt_h2t_ver_req_msg`
+(`dp.htt.eid` from the HTT connect, VERSION_REQ via `htt_send`, every
+HTT T2H to `dp.htt_t2h_msg_handler`, wait ≤ 3 s, `version_ok` → major
+3); `pdev_create` = `dp.pdev_alloc(.., 0)` + the seven SRING_SETUP
+messages in order (first send failure ends it); `irq_enable` = DP ext
+interrupts on (`ATH11K_FLAG_EXT_IRQ_ENABLED`) + stage `data-path`.
+
+**DP MSI** (`ath11k_pcic_ext_irq_config`, verified in Linux
+`pcic.c`): a group gets one IRQ iff any `ring_mask->*[grp]` is set
+(`num_irq = 1`, `irqs[0] = ATH11K_PCI_IRQ_DP_OFFSET + grp`); its vector
+is `(grp % num_vectors) + base_vector` of the "DP" user, the IRQ
+`ath11k_pcic_get_msi_irq(vector)` = `pci_irq_vector(pdev, vector)`. The
+ring side (`ath11k_dp_srng_msi_setup`) programs MSI data
+`(group % msi_data_count) + msi_data_start` with `msi_data_start =
+base_vector + ep_base_data` — the same vector. WCN6855 (32 vectors, DP =
+18 from 14; `ath11k_hw_ring_mask_qca6390`): groups 0–2 → vectors 14–16,
+group 3 none, groups 4–10 → 18–24; single-MSI fallback: every group on
+vector 0 (shared with MHI / CE). `dp_irq_vector`, `dp_vector_cookie`,
+`install_dp_irq_handlers` (inert until `set_dp_irqs_enabled`). The MSI
+handler only marks groups pending and wakes the device owner; NAPI is the
+next service pass. `ce::MsiCeIrq` waits wake on CE **or** DP pending and
+keep up to four waiters (the runtime loop and a mac operation wait
+concurrently).
+
+**Runtime** (`Rt` = core + `Dp` + `LinkState` + management TX IDR;
+`Shared` = `Mutex<Rt>` + a clone of the interrupt source + clock / RNG /
+`max_msg_len`). Every locked step is synchronous; waits happen on the
+interrupt source with the lock released (`Shared::wait_until`), and each
+step starts with `Rt::service()`:
+
+1. CE: `ce.service(pending)` (IRQ CEs + poll of the others + timers),
+   `core.drain_rx()` (HTC / WMI events queued, HTT queued);
+2. HTT T2H → `dp.htt_t2h_msg_handler` (version, PEER_MAP / UNMAP);
+3. every DP group with rings: `dp.service_srng(grp, 64)` (re-polled
+   while it uses the whole budget, ≤ 8 rounds), work on a group whose MSI
+   did not fire is counted (`dp_polled_without_irq`, the poll
+   fallback); RX MSDUs are classified (multicast echo of our SA dropped,
+   unicast not to us dropped, EAPOL → `eapol_rx`, data → `data_rx` only
+   while authorized), `reo_status` → `dp.reo_status_handler`, TX
+   completions counted (buffers freed in the DP);
+4. `dp.service_shadow_timers`, the 10 ms monitor-status reap timer
+   (armed by `mon_status_default(true)`), `qmi.service()` every 100 ms.
+
+`Port` (`Arc<Shared>`) implements `mac::WmiPort` (`send` =
+`ath11k_wmi_cmd_send` with credit / CE-full retry for 3 s;
+`next_event`; `mgmt_tx` = IDR id (≤ 512 pending) + DMA32 copy +
+`wmi::mgmt_send_cmd(vdev, id, frame, paddr, 0, false)`, freed on
+`mgmt_tx_done`; `now_ms`; `max_msg_len`; `random_bytes` =
+`narf_crypto::fill_random_bytes`) and `mac::DataPort`
+(`ppdu_stats_req` = `htt::ppdu_stats_cfg_msgs`; `mon_status_default` =
+`dp.mon_status_default_msgs` sent, last result returned as Linux, reap
+timer armed; `vdev_tx_attach` = `VifTx::attach`; `wait_peer_mapped`
+(mapped: BSS peer recorded, AST from the peer as `ath11k_peer_create`;
+unmapped: station data state cleared); `peer_setup` per §3.10 step 1;
+`peer_cleanup` per step 2; `rx_pn_replay_config` per step 6 + PTK flag;
+`send_eth` / `recv_eapol`; `set_authorized`; `set_sta_wme`). Linux's
+synchronous calls (`vdev_tx_attach`, `peer_cleanup`, `set_authorized`,
+`set_sta_wme`, `mgmt_tx_done`) are queued (`SyncOp`) and applied in order
+at the next locked step.
+
+**TX conversion** (`tx_hdr.rs`, the vdev TX encap / RX decap are
+NATIVE_WIFI): `select_queue` = `ieee80211_select_queue` (no WMM →
+priority 0 / AC BE; EAPOL → 7; else `classify8021d` =
+`cfg80211_classify8021d`: IPv4 TOS / IPv6 TC DSCP → RFC 8325 UP, MPLS
+TC, 802.21 → 7, other 0); `build_sta_data` = `ieee80211_build_hdr` for a
+station (FC data | ToDS, + QoS Data with QoS control `[tid (| NoAck for
+group), 0]` for a WMM AP, + Protected once the PTK is installed; addr1
+BSSID, addr2 the Ethernet SA, addr3 the DA; seq from `tid_seq[tid]`
+(QoS) or the vif counter (`ieee80211_xmit_fast_finish`); RFC 1042 SNAP,
+bridge-tunnel for IPX / AARP, no encapsulation for 802.3 length frames;
+`-EPERM` for unicast before authorization unless our own EAPOL). Then
+`Dp::tx(NativeWifi, priority = tid, queue = AC, ring 0, no checksum
+offload)` strips the QoS control (`ath11k_dp_tx_encap_nwifi`). RX: the
+vdev RX decap is NATIVE_WIFI and `dp_ring` decaps native-wifi to
+Ethernet II (§3.7). Golden (WMM AP, PTK installed, IPv4 DSCP 0 from
+own MAC to `GW`): `08 41 00 00 | BSSID | OWN | GW | 00 00 | aa aa 03 00 00
+00 08 00 | <IP datagram>`; TCL `info0 = 0x0001_8004` (ENCAP NATIVE_WIFI,
+ADDRY_EN, CMD_NUM 1), `info1 = len`, `info2 = 0x0020_0000 | tid << 22`,
+desc id pool = AC.
+
+**Netdev** (`iface::Ath11kNetdev`): `narf_net::Interface` (name from
+`reserve_name("wlan%d")`, MAC from WMI READY, MTU 1500, `link_up` =
+associated + authorized, RX / TX frame rings) and
+`narf_wireless::WirelessNetIface` (`get_wireless_info` from the wiphy
+channels (2.4 / 5 GHz, enabled only) + own HT / VHT caps, HE false;
+`scan`, `associate`, `disassociate` lock the mac layer (async mutex
+across the operation); `set_config` accepts only the current channel;
+`supports_handshake_offload`, `reports_disconnect_events`).
+`register_pci`: `narf_net::iface::register(name, mac, send)` +
+`set_driver_info("ath11k_pci")` + carrier off + `install_rx_drain`, the
+capability registry (`step::NET_REGISTER` printed if refused, not
+fatal), `narf_wireless::registry::register`, then two spawned tasks:
+the runtime loop (`service_once`: service + deliver RX to the RX ring and
+`on_rx_frame_from` outside every lock, `Mac::poll` when no control
+operation holds the mac layer → carrier off on link loss; sleep ≤ 10 ms
+on the device interrupts) and the TX pump (TX ring → `tx_data`). The
+stack's send hook only queues on the TX ring (sync, no runtime lock).
+Carrier changes go to `narf_net::iface::set_link_state` (+
+`nl80211::notify_disconnect` when going down).
+
+`start_pci(core, dp)`: `Rt::new` → `device_caps` (SERVICE_READY /
+EXT / READY; `step::MAC_CAPS`) → `Mac::new(Port, Port, caps,
+MacConfig::wcn6855(), core.reg_info)` (`ath11k_mac_register`) →
+`mac.start()` + `mac.add_interface()` (what `ieee80211_do_open` does in
+Linux when userspace raises the interface; NARF does it at
+registration) → `register_pci`. Failures latch their layer's step; the
+runtime is parked (`STRANDED_RT`), nothing panics, the init path never
+waits on it (all of it runs in the probe-spawned MHI task).
+
+**Command-line autoconnect** (`autoconnect.rs`, NARF-only bring-up
+aid): nl80211 mutations need a delegated interface grant
+(`network_daemon::prepare`) that no production launcher issues yet, so
+userspace cannot trigger a scan or connect on the first hardware boot.
+`register_pci` parses `ath11k.scan=1` (one passive scan of every enabled
+channel, results printed), `ath11k.ssid=<ssid>` (active scan directed at
+the SSID, strongest matching 2.4 / 5 GHz BSS, connect; retried every
+10 s while disconnected — link loss reconnects — giving up after 6
+failures in a row), `ath11k.psk=<64 hex>` (PMK) or
+`ath11k.passphrase=<8..63>` (PMK = PBKDF2-SHA1(passphrase, SSID, 4096));
+no key = Open; `%XX` escapes (the command line splits on whitespace).
+A malformed set is reported and ignored. The key is visible in
+`/proc/cmdline` — bring-up only.
+
+Steps (`runtime::step`, 250–269): DP_UNSUPPORTED 250 (detail = hw_rev),
+DP_MISSING 251 (hook 1 / 2 / 3), HTT_VER_SEND 252 (detail = core step),
+SRING_SETUP_SEND 253 (detail = index << 16 | core step), DP_IRQ_CONFIG
+254 (no "DP" MSI user), MAC_CAPS 255 (detail bits 1 EXT, 2 READY, 4 no
+pdev), NET_REGISTER 256 (console only; detail 1 no authority, 2
+revoked, 3 duplicate).
+
+Tests: `integration_tests.rs` — one composed fake device: `core_tests`'
+`Fw` behind `ce_tests`' `FakeChip` (HTC / WMI through the real CE
+rings), `mac_tests`' `World` (WMI answers + an AP with a real WPA2
+authenticator; MGMT_TX_SEND decoded from the command, PEER_CREATE /
+DELETE → HTT PEER_MAP / UNMAP) and a DP ring model (UMAC rings from the
+programmed registers, LMAC rings from SRING_SETUP, buffers moved by
+physical address, REO commands answered on the status ring). Covered:
+DP MSI vector map (Linux table, single-MSI fallback, ring MSI data =
+vector), bring-up to `wlan%d` (HTT message order, rings, caps, stage,
+stack registration), scan, WPA2 connect (M2 / M4 over TCL with MICs
+checked by the authenticator, M1 / M3 over REO2SW1, PTK + GTK, 17 PN
+REO updates, peer ciphers), data TX from the stack's send hook through
+the TX ring to TCL (802.11 + TCL descriptor goldens, BE and EF), RX to
+the RX ring and the stack as Ethernet II, multicast-echo drop, the poll
+fallback with every DP interrupt lost, unauthorized RX drop, disconnect
+(carrier off, deauth, HTT unmap clears the data state, TX refused),
+kickout link loss through the runtime loop, PEER_MAP timeout, DP
+unsupported / DP alloc / HTT version timeout / SRING_SETUP send
+failures (latched step, firmware stopped, unwound), missing caps, the
+`tx_hdr` goldens (non-QoS, QoS, DSCP table, IPv6, EAPOL, port control,
+bridge tunnel, 802.3 length frames), and the autoconnect parameters
+(parse / rejects, the IEEE 802.11 Annex J.4.2 PBKDF2 vector, BSS
+choice, a directed-scan connect on the fake device).
+
 ## 4. Invariants
 
 - Failure-step codes (`wifi: <stage> FAILED step=N` on the panel) are
@@ -631,10 +814,19 @@ ring full mid-setup), ADDBA stop, HTT unmap + re-map.
   | 200–219 | `dp_ring` |
   | 220–229 | `htt` |
   | 230–249 | `dp_peer` (REO queues / commands) |
+  | 250–269 | `runtime` (DP hooks / IRQs, mac registration, netdev) |
 
 - The PCI table is exactly Linux's `ath11k_pci_id_table`.
 - The driver never reports a wireless capability it does not have:
-  no interface is registered until scan + connect + data work.
+  `wlan%d` is registered only after the core, the data path and the mac
+  layer (start + station vif) are up; HE / 6 GHz association / WPA3 are
+  not advertised (HwCaps.he false, bands 2.4 / 5 GHz).
+- No lock is held across an `.await`: `Shared::rt` is taken for
+  synchronous steps only; the mac-layer mutex is held across a control
+  operation and never taken by the runtime loop unless free.
+- Bring-up never blocks or panics the init path: probe spawns the MHI
+  task, which runs everything after; failures latch a step and park the
+  objects the firmware may still use.
 
 ## 5. Bring-up roadmap (WCN6855 HW2.1 first)
 
@@ -648,10 +840,10 @@ card (QEMU emulates none) is exercised once, after phase 8.
 | 2 | MHI host: context arrays, event rings, BHI SBL (512 KiB) + BHIe full image, EE/state machine to mission mode, IPCR ch 20/21 (**done**, offline) | `mhi.c`, `bus/mhi/host/*` |
 | 3 | QRTR over MHI + QMI encode/decode; WLFW handshake: host cap, ind register, respond mem, target cap, BDF (`board-2.bin` by bus/qmi-chip-id/board-id), M3 (`m3.bin`), regdb, wlan cfg, mode ON (**done** to FW_READY, offline; `firmware_start` waits for the CE shadow list) | `qmi.c`, `net/qrtr`, `soc/qcom/qmi_*` |
 | 4 | Copy Engines + HTC + WMI: service ready, init, ready; MAC from firmware (**done, offline**: HAL SRNG core, CE pipes, shadow v2 list, HTC/WMI codecs, `core.rs` bring-up to WMI READY + SET_HW_MODE DBS; DP hooks no-op) | `core.c`, `hal.c`, `ce.c`, `htc.c`, `wmi.c` |
-| 5 | DP rings (TCL, REO, WBM, RXDMA refill) on the HAL (descriptor layouts, ring runtime, HTT ring setup / filters / version / peer map, per-peer REO TID queues + REO command ring **done, offline**; wiring into bring-up open) | `hal*.c`, `dp.c`, `dp_tx.c` (HTT), `dp_rx.c` (rx_tid) |
-| 6 | Control: pdev/vdev, regulatory, scan → `BssInfo` list (**done, offline**: `mac.rs` behind `WmiPort`/`DataPort`; core wiring open) | `mac.c`, `wmi.c`, `reg.c` |
-| 7 | Connect: peer, auth/assoc via mgmt TX, EAPOL via `narf-wireless` supplicant, key install (**done, offline** for Open + WPA2-PSK/CCMP; SAE open) | `mac.c`, `wmi.c` |
-| 8 | Data path: TX (TCL → WBM completion), RX (REO dst → `Frame`); register `wlan%d` (TX / completion / RX reap + decap to Ethernet **done, offline** in `dp_ring.rs`; interface registration open) | `dp_tx.c`, `dp_rx.c` |
+| 5 | DP rings (TCL, REO, WBM, RXDMA refill) on the HAL: descriptor layouts, ring runtime, HTT ring setup / filters / version / peer map, per-peer REO TID queues + REO command ring, wired into bring-up (`DpHooks`, DP ext IRQs, NAPI service, shadow / monitor timers) (**done, offline**) | `hal*.c`, `dp.c`, `dp_tx.c` (HTT), `dp_rx.c` (rx_tid), `pcic.c` (ext IRQ) |
+| 6 | Control: pdev/vdev, regulatory, scan → `BssInfo` list, over the runtime ports (**done, offline**) | `mac.c`, `wmi.c`, `reg.c` |
+| 7 | Connect: peer, auth/assoc via mgmt TX, EAPOL via `narf-wireless` supplicant over the DP rings, key install + PN config (**done, offline** for Open + WPA2-PSK/CCMP; SAE open) | `mac.c`, `wmi.c`, `dp_rx.c` |
+| 8 | Data path: TX (Ethernet → native-wifi 802.11 → TCL → WBM completion), RX (REO dst → Ethernet II → stack / RX ring); `wlan%d` registered with `narf_net` + `narf_wireless` (**done, offline**; first hardware run pending) | `mac80211/tx.c`, `dp_tx.c`, `dp_rx.c` |
 | 9 | Power: PS, suspend/resume, firmware crash recovery | `core.c`, `mac.c` |
 
 ## 6. Dependencies
@@ -736,12 +928,12 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   failing with EXT2 still arriving — goes on without the ext caps);
   `wmi_cmd_wait` / event queues are NARF API, Linux uses per-event
   completions.
-- Open (core): the MHI controller is not serviced after FW_READY
-  (late QMI indications wait in the IPCR DL ring); `ATH11K_FLAG_*`
-  crypto / raw mode are not modelled (HW crypto, native-wifi decap as in
-  the INIT resource config); `ath11k_mac_allocate`, `ath11k_dp_*` and
-  `ath11k_core_pdev_create` are hooks only; firmware crash recovery
-  (`ath11k_core_reconfigure_on_crash`) is not ported.
+- Core after bring-up: the QRTR link over MHI is pumped every 100 ms
+  (`QmiFw::service`), so late QMI messages are drained and logged, not
+  acted on; `ATH11K_FLAG_*` crypto / raw mode are not modelled (HW
+  crypto, native-wifi encap / decap as in the INIT resource config);
+  firmware crash recovery (`ath11k_core_reconfigure_on_crash`) is not
+  ported.
 - DP deviations from Linux (deliberate): RX buffers, TX bounce buffers
   and ring memory are DMA32 coherent `DmaMem`s (Linux streams skbs);
   rings are allocated with no 7-byte slack (the page-aligned allocator
@@ -771,12 +963,51 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   peer lookup + `dp_setup_done` only), monitor / full-monitor rings, PPDU / peer TX-RX
   statistics, ring teardown (`ath11k_dp_free`; a failed `Dp::alloc`
   leaves its rings in the HAL, so a retry needs a new `Hal`).
-- Open (integration): HTT endpoint plumbing (HTC `HTT_DATA_MSG` →
-  `htt_t2h_msg_handler`; HTT messages → `Htc::send` → `Ce::send`), DP
-  MSI vectors (ext groups → vectors `(grp % 18) + 14`) driving
-  `service_srng`, the shadow-timer tick, vdev encap/decap WMI params
-  (`TX_ENCAP_TYPE` / `RX_DECAP_TYPE`), and where `wlan%d` sits on
-  `RxMsdu::frame`.
+- Integration (decided, §3.11): HTT T2H from the HTC HTT endpoint (and
+  CE5) → `htt_t2h_msg_handler` in every service pass; HTT H2T via
+  `Ath11kCore::htt_send`; the DP ext groups on vectors `(grp % 18) + 14`
+  (verified against `ath11k_pcic_ext_irq_config`) with a poll of every
+  group each pass; DP shadow timers + the 10 ms monitor reap in the
+  service pass; vdev TX encap / RX decap NATIVE_WIFI (`mac.rs`), so TX
+  frames are built as mac80211 does (`tx_hdr.rs`) and RX `RxMsdu::frame`
+  (Ethernet II) goes straight to `wlan%d`.
+- Integration deviations from Linux (deliberate): `ath11k_mac_op_start`
+  + `add_interface` run at registration, not on `ip link set up`
+  (NARF's stack has no ndo_open hook for this driver); the netdev has
+  one TX queue (no per-AC queues, `IEEE80211_HW_QUEUE_CONTROL`), no
+  NETIF_F_HW_CSUM (the stack checksums; Linux advertises it and sets the
+  TCL checksum bits), no A-MSDU / fast-xmit header cache, no TX status
+  reporting; ADDBA from the AP is not answered (no
+  `ath11k_mac_op_ampdu_action`; the AP falls back to non-aggregated
+  traffic, REO queues stay at BA window 1); management frames and data
+  keep separate sequence counters (mac80211 shares
+  `sdata->sequence_number` between non-QoS data and management); EAPOL
+  after the 4-way handshake (group rekey) is queued and never consumed;
+  carrier-off reports reason 3 to nl80211 whatever the cause; a
+  multicast EAPOL or one from a non-AP SA is not filtered beyond
+  mac80211's address checks.
+- Open (control path): userspace Wi-Fi control over nl80211 needs a
+  launcher that grants the `wlan%d` interface to the supplicant /
+  manager task (`network_daemon::prepare`); until one exists the
+  `ath11k.*` command-line autoconnect is the only trigger.
+- Unverified until hardware (the first bare-metal run answers these):
+  the real firmware's HTC credit size vs `max_msg_len` (one WMI credit
+  with shadow registers — a command larger than one credit would stall
+  as in Linux); the TCL / WBM / REO ring programming and the shadow
+  register list on silicon (only the fake device consumes them); DP MSI
+  delivery on the 32-vector block (vectors 14–24) and whether the AMD
+  IOMMU / MSI setup leaves the block contiguous; the RX descriptor
+  offsets of `HalRxDescWcn6855` on real frames (L3 pad, MSDU length,
+  decap type); that the firmware accepts native-wifi frames with seq 0 /
+  duration 0 and the Protected bit and encrypts them (expected: the TQM
+  rewrites the sequence number; Linux sends the same); PEER_MAP v1 with
+  no AST (WCN6855 `htt_peer_map_v2 = false`); monitor-status rings
+  filling and being reaped; REO status delivery for the PN updates;
+  the HE-capable firmware associating with an HT/VHT-only Association
+  Request; 5 GHz DFS / passive channels in the scan list; the board-2.bin
+  variant and regdb for the P14s Gen 5 (17aa:9309); link-loss detection
+  timing (beacon miss → 3 s); DMA32 memory pressure with the Linux ring
+  sizes (6141 × 2 KiB RX / monitor buffers ≈ 12 MiB + 4 MiB of link descriptors).
 - Peer REO deviations from Linux (deliberate, device-invisible): a queue
   descriptor Linux frees after a REO command could not be queued (ring
   full / crash flush) while the hardware may still hold it is kept in
@@ -790,13 +1021,22 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   kept: `ath11k_dp_rx_ampdu_stop` REO-updates `peer->rx_tid` (TID 0's
   queue) to window 1 whichever TID stops, then sends the WMI for the
   stopped TID.
-- Open (peer REO integration): the mac layer must call the steps of
-  §3.9 at the Linux call sites and feed `DpServiceOutput::reo_status` to
-  `reo_status_handler` with a millisecond clock.
-- Firmware: `cargo xtask import-firmware --vendor ath11k`
-  decompresses the distro `.zst` blobs at image build time. Open:
-  whether probe runs before the rootfs firmware scan, i.e. whether
-  the ath11k blobs must go in the initramfs (`--initramfs-firmware`).
+- Peer REO integration (done): the runtime ports call §3.10's steps at
+  the Linux call sites (`station_add` → `peer_setup`, `station_remove`
+  → `peer_cleanup`, `set_key` → `pn_replay_config`) and every service
+  pass feeds `DpServiceOutput::reo_status` to `reo_status_handler`.
+- Firmware (decided): `cargo xtask import-firmware --vendor ath11k`
+  decompresses the distro `.zst` blobs at image build time and now
+  imports file symlinks under their own name (linux-firmware ships every
+  `ath11k/WCN6855/hw2.1/*` as a link to `../hw2.0/*`; the importer used
+  to skip links, leaving `hw2.1/amss.bin` absent). Probe
+  (`pci-probe-all`, `Stage::Device`) runs before the rootfs firmware
+  scan (`firmware-scan-rootfs`, `Stage::Late` after `root-mount-auto`);
+  the MHI task retries `amss.bin` for 60 s, so a partitioned root works
+  without `--initramfs-firmware` when the root mounts within that
+  window; the later blobs (`m3.bin`, `board-2.bin`, `regdb.bin`) load
+  once `amss.bin` proved the store is up. An ISO / initramfs-only image
+  needs `--initramfs-firmware "ath11k/WCN6855/hw2.1/*"`.
 - Mac layer scope (decided): HT + 5 GHz VHT only, no HE in the
   Association Request (the chip is HE-capable; mac80211's HE paths,
   6 GHz association and >80 MHz are therefore unreachable), so phymodes
