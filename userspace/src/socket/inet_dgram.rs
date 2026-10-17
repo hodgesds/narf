@@ -85,6 +85,51 @@ fn view_of(s: &SocketFile) -> Option<BindView> {
     })
 }
 
+/// `/proc/net/udp` rows for the bound AF_INET datagram sockets in
+/// `net_ns_id` (Linux `udp4_seq_show`): rx_queue is `sk_rmem_alloc`, uid
+/// the socket owner, inode the sockfs inode `/proc/<pid>/fd` links name.
+pub(super) fn snapshot_in(net_ns_id: u64) -> Vec<super::UdpSocketSnapshot> {
+    let sockets: Vec<Arc<SocketFile>> = INET_DGRAM_BOUND
+        .lock()
+        .as_ref()
+        .map(|map| {
+            map.iter()
+                .filter(|((ns, _), _)| *ns == net_ns_id)
+                .flat_map(|(_, sockets)| sockets.iter().cloned())
+                .collect()
+        })
+        .unwrap_or_default();
+    sockets
+        .into_iter()
+        .filter_map(|socket| {
+            let uid = socket.sk_uid;
+            let state = socket.state.lock();
+            let SocketState::InetDgram {
+                local_addr,
+                local_port,
+                peer,
+                rmem,
+                ..
+            } = &*state
+            else {
+                return None;
+            };
+            let (remote_addr, remote_port) = peer.unwrap_or((0, 0));
+            Some(super::UdpSocketSnapshot {
+                local_addr: local_addr.to_be_bytes(),
+                local_port: *local_port,
+                remote_addr: remote_addr.to_be_bytes(),
+                remote_port,
+                state_code: if peer.is_some() { 0x01 } else { 0x07 },
+                tx_queue: 0,
+                rx_queue: (*rmem).min(u32::MAX as usize) as u32,
+                uid,
+                inode: socket.inode.ino,
+            })
+        })
+        .collect()
+}
+
 /// Deliver an ICMP error (from the net-layer `install_udp_icmp_hook` sink) to
 /// the AF_INET datagram socket that sent the offending datagram. Queues it for
 /// `recvmsg(MSG_ERRQUEUE)` when IP_RECVERR is set, and records it as the

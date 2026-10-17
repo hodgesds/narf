@@ -586,6 +586,7 @@ pub fn pcm_capabilities(card: u32, capture: bool) -> Result<hardware::PcmCapabil
         periods: (2, 32),
         buffer_bytes: (256, 256 * 1024),
         period_byte_alignment: 1,
+        batch: false,
     })
 }
 

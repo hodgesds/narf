@@ -70,6 +70,9 @@ impl FileOps for EventFd {
     fn ino(&self) -> u64 {
         narf_filesystem::inode_id::anon_inode().ino
     }
+    fn anon_name(&self) -> Option<&'static str> {
+        Some("[eventfd]")
+    }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
         narf_filesystem::inode_id::anon_inode().attrs()
@@ -300,6 +303,9 @@ impl FileOps for TimerFd {
     fn ino(&self) -> u64 {
         narf_filesystem::inode_id::anon_inode().ino
     }
+    fn anon_name(&self) -> Option<&'static str> {
+        Some("[timerfd]")
+    }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
         narf_filesystem::inode_id::anon_inode().attrs()
@@ -493,6 +499,9 @@ impl FileOps for SignalFd {
     /// same `(st_dev, st_ino)`.
     fn ino(&self) -> u64 {
         narf_filesystem::inode_id::anon_inode().ino
+    }
+    fn anon_name(&self) -> Option<&'static str> {
+        Some("[signalfd]")
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {

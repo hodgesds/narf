@@ -225,6 +225,7 @@ impl PcmDevice for Card {
             periods: (2, 256),
             buffer_bytes: (4096, 256 * 1024),
             period_byte_alignment: 128,
+            batch: false,
         }
     }
     fn controls(&self) -> alloc::vec::Vec<narf_drivers_sound::mixer::ControlId> {

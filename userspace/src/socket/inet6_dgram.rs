@@ -945,6 +945,7 @@ pub(super) fn snapshot_in(net_ns_id: u64) -> Vec<super::Udp6SocketSnapshot> {
     sockets
         .into_iter()
         .filter_map(|socket| {
+            let uid = socket.sk_uid;
             let state = socket.state.lock();
             let SocketState::Inet6Dgram {
                 local_addr,
@@ -971,6 +972,8 @@ pub(super) fn snapshot_in(net_ns_id: u64) -> Vec<super::Udp6SocketSnapshot> {
                     .map(|packet| packet.payload.len())
                     .sum::<usize>()
                     .min(u32::MAX as usize) as u32,
+                uid,
+                inode: socket.inode.ino,
             })
         })
         .collect()

@@ -387,8 +387,7 @@ fn smoke_abi_fsx_default_acl_replaces_umask() -> TestResult {
             if call_stat(path.as_ptr() as u64, st.as_mut_ptr() as u64) != Some(0) {
                 return None;
             }
-            // `struct stat` x86_64: st_mode is a u32 at offset 24.
-            Some(u32::from_ne_bytes([st[24], st[25], st[26], st[27]]) & 0o7777)
+            Some(stat_mode(&st) & 0o7777)
         };
         let dir_made = call_mkdir(child_dir.as_ptr() as u64, 0o777);
         let created = call(
@@ -680,9 +679,8 @@ fn smoke_abi_fsx_setgid_directory_propagates_its_group() -> TestResult {
             if call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
                 return None;
             }
-            // x86_64 `struct stat`: st_mode u32 @24, st_gid u32 @32.
-            let mode = u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]) & 0o7777;
-            let gid = u32::from_ne_bytes([sb[32], sb[33], sb[34], sb[35]]);
+            let mode = stat_mode(&sb) & 0o7777;
+            let gid = stat_gid(&sb);
             Some((mode, gid))
         };
         // Guard against a vacuous pass: the staging must actually have set
@@ -1939,7 +1937,7 @@ fn smoke_abi_fsx_write_strips_setuid() -> TestResult {
                 if call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
                     return None;
                 }
-                Some(u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]) & 0o7777)
+                Some(stat_mode(&sb) & 0o7777)
             };
             // Stage BOTH files while still fully privileged. Dropping uid
             // also drops capabilities, and there is no way back, so every
@@ -2131,7 +2129,7 @@ fn smoke_abi_fsx_setgid_dir_cannot_manufacture_setgid_binary() -> TestResult {
             if call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
                 return None;
             }
-            Some(u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]) & 0o7777)
+            Some(stat_mode(&sb) & 0o7777)
         };
         if call_mkdir(dir.as_ptr() as u64, 0o777) != Some(0) {
             return Err("mkdir of the shared directory failed");
@@ -4344,7 +4342,7 @@ fn smoke_abi_fsx_open_tree_mount_fd_relative() -> TestResult {
         if call(Syscall::Fstat.raw(), a1(mount_fd, stat.as_mut_ptr() as u64)) != Some(0) {
             return Err("fstat on an open_tree mount fd should succeed");
         }
-        let mode = u32::from_ne_bytes(stat[24..28].try_into().unwrap());
+        let mode = stat_mode(&stat);
         if mode & 0o170000 != 0o040000 {
             return Err("an open_tree mount fd must report S_IFDIR");
         }

@@ -1235,6 +1235,9 @@ impl FileOps for InotifyFile {
     fn ino(&self) -> u64 {
         narf_filesystem::inode_id::anon_inode().ino
     }
+    fn anon_name(&self) -> Option<&'static str> {
+        Some("inotify")
+    }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
         narf_filesystem::inode_id::anon_inode().attrs()
@@ -1815,6 +1818,9 @@ impl FileOps for FanotifyFile {
     /// same `(st_dev, st_ino)`.
     fn ino(&self) -> u64 {
         narf_filesystem::inode_id::anon_inode().ino
+    }
+    fn anon_name(&self) -> Option<&'static str> {
+        Some("[fanotify]")
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {

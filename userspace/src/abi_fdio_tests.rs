@@ -1839,9 +1839,8 @@ fn smoke_abi_fdio_pipe_fstat_is_fifo_pos() -> TestResult {
             {
                 return Err("fstat on pipe fd failed");
             }
-            // x86_64 struct stat: st_mode is the u32 at offset 24,
-            // st_size the i64 at offset 48.
-            let mode = u32::from_ne_bytes([stat[24], stat[25], stat[26], stat[27]]);
+            // st_size is the i64 at offset 48 in both arches' struct stat.
+            let mode = stat_mode(&stat);
             if mode & S_IFMT != S_IFIFO {
                 return Err("pipe fd does not fstat as S_IFIFO");
             }

@@ -489,25 +489,28 @@ fn current_net_ns_id() -> u64 {
 fn tcp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::TcbSnapshot> {
     narf_net::tcp::core::snapshot_in(current_net_ns_id())
         .into_iter()
-        .map(|t| narf_filesystem::procfs::net::TcbSnapshot {
-            local_addr: t.local_addr,
-            local_port: t.local_port,
-            remote_addr: t.remote_addr,
-            remote_port: t.remote_port,
-            state_code: t.state_code,
-            tx_queue: t.tx_queue,
-            rx_queue: t.rx_queue,
-            retrnsmt: t.retrnsmt,
-            timer_active: t.timer_active,
-            timer_expires: t.timer_expires,
-            probes_out: t.probes_out,
-            rto: t.rto,
-            ack_timeout: t.ack_timeout,
-            snd_cwnd: t.snd_cwnd,
-            snd_ssthresh: t.snd_ssthresh,
-            uid: 0,
-            timeout: 0,
-            inode: 0,
+        .map(|t| {
+            let (uid, inode) = narf_userspace::handlers::tcb_socket(t.id).unwrap_or((0, 0));
+            narf_filesystem::procfs::net::TcbSnapshot {
+                local_addr: t.local_addr,
+                local_port: t.local_port,
+                remote_addr: t.remote_addr,
+                remote_port: t.remote_port,
+                state_code: t.state_code,
+                tx_queue: t.tx_queue,
+                rx_queue: t.rx_queue,
+                retrnsmt: t.retrnsmt,
+                timer_active: t.timer_active,
+                timer_expires: t.timer_expires,
+                probes_out: t.probes_out,
+                rto: t.rto,
+                ack_timeout: t.ack_timeout,
+                snd_cwnd: t.snd_cwnd,
+                snd_ssthresh: t.snd_ssthresh,
+                uid,
+                timeout: 0,
+                inode,
+            }
         })
         .collect()
 }
@@ -526,6 +529,21 @@ fn udp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::UdpSocketSnaps
             uid: 0,
             inode: 0,
         })
+        .chain(
+            narf_userspace::socket::udp_snapshot_in(current_net_ns_id())
+                .into_iter()
+                .map(|u| narf_filesystem::procfs::net::UdpSocketSnapshot {
+                    local_addr: u.local_addr,
+                    local_port: u.local_port,
+                    remote_addr: u.remote_addr,
+                    remote_port: u.remote_port,
+                    state_code: u.state_code,
+                    tx_queue: u.tx_queue,
+                    rx_queue: u.rx_queue,
+                    uid: u.uid,
+                    inode: u.inode,
+                }),
+        )
         .collect()
 }
 
@@ -698,18 +716,21 @@ fn igmp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Igmp6Snapsho
 fn tcp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Tcb6Snapshot> {
     narf_net::tcp::core::snapshot6_in(current_net_ns_id())
         .into_iter()
-        .map(|t| narf_filesystem::procfs::net::Tcb6Snapshot {
-            local_addr: t.local_addr,
-            local_port: t.local_port,
-            remote_addr: t.remote_addr,
-            remote_port: t.remote_port,
-            state_code: t.state_code,
-            tx_queue: t.tx_queue,
-            rx_queue: t.rx_queue,
-            retrnsmt: t.retrnsmt,
-            uid: 0,
-            timeout: 0,
-            inode: 0,
+        .map(|t| {
+            let (uid, inode) = narf_userspace::handlers::tcb_socket(t.id).unwrap_or((0, 0));
+            narf_filesystem::procfs::net::Tcb6Snapshot {
+                local_addr: t.local_addr,
+                local_port: t.local_port,
+                remote_addr: t.remote_addr,
+                remote_port: t.remote_port,
+                state_code: t.state_code,
+                tx_queue: t.tx_queue,
+                rx_queue: t.rx_queue,
+                retrnsmt: t.retrnsmt,
+                uid,
+                timeout: 0,
+                inode,
+            }
         })
         .collect()
 }
@@ -725,8 +746,8 @@ fn udp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Udp6SocketSna
             state_code: u.state_code,
             tx_queue: u.tx_queue,
             rx_queue: u.rx_queue,
-            uid: 0,
-            inode: 0,
+            uid: u.uid,
+            inode: u.inode,
         })
         .collect()
 }

@@ -68,6 +68,11 @@ pub struct PcmCapabilities {
     pub periods: (u32, u32),
     pub buffer_bytes: (u32, u32),
     pub period_byte_alignment: u32,
+    /// The hardware pointer moves in whole transfer blocks (e.g. VirtIO
+    /// message completions) rather than per frame. ALSA reports
+    /// `SNDRV_PCM_INFO_BATCH | SNDRV_PCM_INFO_BLOCK_TRANSFER` so PipeWire
+    /// and PulseAudio keep an extra period of headroom.
+    pub batch: bool,
 }
 
 impl PcmCapabilities {
@@ -80,6 +85,7 @@ impl PcmCapabilities {
             periods: (params.periods, params.periods),
             buffer_bytes: (params.buffer_bytes() as u32, params.buffer_bytes() as u32),
             period_byte_alignment: 1,
+            batch: false,
         }
     }
 }

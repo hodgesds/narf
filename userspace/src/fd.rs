@@ -1042,7 +1042,21 @@ pub fn with_table_alloc<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> 
 /// `get_unused_fd_flags` + `fd_install` in one step — so handlers do not each
 /// have to reach through [`with_table`] and flatten two layers of `Option`.
 pub fn install(task_id: u64, entry: FdEntry) -> Option<u32> {
-    with_table_alloc(task_id, |t| t.open(entry)).flatten()
+    let fd = with_table_alloc(task_id, |t| t.open(entry)).flatten()?;
+    forget_previous_identity(task_id, fd);
+    Some(fd)
+}
+
+/// A freshly installed descriptor starts with no pathname identity.
+///
+/// The fd→path side table is retired by `close(2)`, but a number can also be
+/// freed by CLOEXEC at exec, `close_range`, or a `CLONE_FILES` sibling's close
+/// — and an inherited row then outlives its file. Without this, a pipe or
+/// socket that reused such a number readlinked to the old file's path (a pipe
+/// end reading `/dev/null` in `/proc/<pid>/fd`). Opens that do have a path
+/// register it after the install.
+fn forget_previous_identity(task_id: u64, fd: u32) {
+    crate::mqueue::forget_fd_path(task_id, fd);
 }
 
 /// An unpublished descriptor number reserved for one in-flight open.
@@ -1070,6 +1084,7 @@ impl FdReservation {
             .unwrap_or(false);
         if installed {
             self.active = false;
+            forget_previous_identity(self.task_id, self.fd);
             Some(self.fd)
         } else {
             None
@@ -1107,7 +1122,7 @@ pub(crate) fn reserve(task_id: u64) -> Option<FdReservation> {
 ///
 /// `None` is -EMFILE, with the table exactly as it was.
 pub fn install_pair(task_id: u64, first: FdEntry, second: FdEntry) -> Option<(u32, u32)> {
-    with_table_alloc(task_id, |t| {
+    let (a, b) = with_table_alloc(task_id, |t| {
         let a = t.open(first)?;
         match t.open(second) {
             Some(b) => Some((a, b)),
@@ -1117,7 +1132,10 @@ pub fn install_pair(task_id: u64, first: FdEntry, second: FdEntry) -> Option<(u3
             }
         }
     })
-    .flatten()
+    .flatten()?;
+    forget_previous_identity(task_id, a);
+    forget_previous_identity(task_id, b);
+    Some((a, b))
 }
 
 /// Whether `task` could allocate a descriptor right now. See
@@ -1129,7 +1147,9 @@ pub fn has_free_descriptor(task_id: u64) -> bool {
 /// As [`install`], but at the lowest free descriptor at or above `min`.
 /// Backs `fcntl(F_DUPFD)`-shaped allocation.
 pub fn install_at_least(task_id: u64, entry: FdEntry, min: u32) -> Option<u32> {
-    with_table_alloc(task_id, |t| t.open_at_least(entry, min)).flatten()
+    let fd = with_table_alloc(task_id, |t| t.open_at_least(entry, min)).flatten()?;
+    forget_previous_identity(task_id, fd);
+    Some(fd)
 }
 
 /// Hook supplying a task's RLIMIT_NOFILE soft limit. The rlimit store lives
