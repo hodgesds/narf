@@ -1,9 +1,10 @@
 # ath11k — Specification
 
-> Status: **v0.4** — PCI identify, power-up, the MHI host (firmware
-> to mission mode, IPCR started) and the WLFW QMI handshake over
-> QRTR to FW_READY (offline-tested only). No CE/HTC/WMI transport,
-> no data path; no network interface is registered.
+> Status: **v0.5** — PCI identify, power-up, the MHI host (firmware
+> to mission mode, IPCR started), the WLFW QMI handshake over QRTR to
+> FW_READY, and the core bring-up (QMI firmware start, CE, HTC, WMI
+> service ready → INIT → READY with the device MAC) — offline-tested
+> only. No data path; no network interface is registered.
 >
 > Qualcomm ath11k Wi-Fi 6 / 6E driver for PCIe host-attached
 > silicon (QCA6390 / WCN6855 / QCN9074). Adapted from Linux
@@ -70,10 +71,10 @@ BW scaling, RSC/offload/client-managed rings, EDL.
 - `pci::{read32, write32}` — Linux-equivalent register access.
 - `pci::{is_probed, with_controller}` — bound-device inspection.
 - `pci::mhi_ready` — MHI reached mission mode with IPCR running.
-- `pci::{take_wlfw, wlfw_ready}` — the [`wlfw::Wlfw`] session parked
-  at FW_READY (owns the MHI controller, target memory, M3 image).
-  The CE/HAL phase takes it and calls `firmware_start(mode,
-  shadow_reg_v2)` once it has built the shadow-register list.
+- After FW_READY the MHI task hands the [`wlfw::Wlfw`] session (owns
+  the MHI controller, target memory, M3 image) to
+  `core::pci_start` (§3.6); `pci::aspm_restore` is its
+  `ath11k_pci_start` ASPM step.
 - `mhi_host::MhiController::{queue_ul, take_dl, poll, wait_and_poll}`
   — IPCR UL send (`mhi_queue_skb(…, MHI_EOT)`) / DL receive.
 - `narf_io::alloc_coherent_masked` (32-bit coherent mask) backs every
@@ -297,6 +298,97 @@ tests drive a fake chip that only knows what the host programmed
 (ring bases, sizes, pointer addresses, shadow mirroring) and moves data
 through the real DMA32 ring memory.
 
+### 3.6 Core bring-up (`core.rs`, Linux `core.c`)
+
+`Ath11kCore<H: Hif, Q: QmiFw>` = `struct ath11k_base` for the bring-up:
+the transport, the QMI session, `Htc`, the HTT / WMI endpoints
+(`HtcConnected`), `preferred_hw_mode`, `target_caps` (SERVICE_READY),
+`svc_map` (SERVICE_READY + SERVICE_AVAILABLE), `svc_ext`
+(`ServiceReadyExt`: hw modes, MAC/PHY caps, per-pdev band / HT / VHT /
+HE caps for the mac layer, HAL reg caps), `dma_ring_caps`, `ready` +
+`mac_addr` (WMI READY), `reg_info` (latest REG_CHAN_LIST_CC[_EXT]),
+`seen` bits, `state` (`Idle` / `Ready` / `Failed(err)`), `stats`.
+
+- `Hif` — `shadow_reg_v2`, `init_pipes`, `start` (`ath11k_hif_start`),
+  `stop`, `send(pipe, frame, transfer_id = eid)`, `take_rx`,
+  `recv_kind(pipe)` (the CE's `recv_cb`: HTC, or HTT T2H for CE5),
+  `poll_all`, async `wait(ms)`, `now_ms`. `CeHif<Io, Irq>` is the real
+  one over `Ce` (`on_start` = `pci::aspm_restore`); `Bar0` is BAR0 as an
+  owned `ChipIo`.
+- `QmiFw` — `firmware_start(mode, shadow)` / `firmware_stop()` (wlan_mode
+  OFF); implemented by `wlfw::Wlfw`.
+- `CoreHooks<H, Q>` — the DP phase's insertion points in Linux's order,
+  all default no-ops (`NoDp`): `dp_alloc` (after `init_pipes`),
+  `pdev_reo_setup` (after service ready, before INIT), async
+  `htt_ver_req` (last step of `ath11k_core_start`), async `pdev_create`,
+  `irq_enable`.
+- `CoreConfig::for_hw(&HwParams)` (QCA6390 + WCN6855 family; QCN9074
+  `None`): `single_pdev_only`, `num_rxdma_per_pdev = 2`, `max_radios =
+  3`, `num_vdevs = 3`, credit flow, shadow regs, Linux timeouts (HTC
+  1 s, connect 1 s, service / unified ready 5 s, WMI send 3 s).
+- `Ath11kCore::new` (`ath11k_wmi_attach` + `ath11k_htc_init`),
+  `qmi_firmware_ready(&mut hooks)` (the whole sequence below), and the
+  pieces: `htc_wait_target`, `htt_connect`, `wmi_connect`, `htc_start`,
+  `wait_for_service_ready`, `init_cmd`, `wait_for_unified_ready`.
+- Runtime API for the next phases: `wmi_cmd_send(&WmiCmd)`
+  (`ath11k_wmi_cmd_send`: waits ≤ 3 s for credits), `wait_event(id,
+  timeout)`, `wmi_cmd_wait(cmd, id, timeout)`, `next_event(timeout)`,
+  `take_event`, `queued_event_ids`, `pump(ms)`, `drain_rx`;
+  `htt_send(payload)`, `take_htt`, `wait_htt(timeout)`. Queued events
+  are `WmiRx { id, frame }` (`frame` keeps `wmi_cmd_hdr`, so
+  `wmi::decode_event(&frame)` applies); queues hold 512, oldest dropped.
+- WMI RX is `ath11k_wmi_tlv_op_rx`: SERVICE_READY / AVAILABLE / EXT /
+  EXT2 / READY / REG_CHAN_LIST update the core (REG is queued too);
+  everything else is queued. HTC frames for an endpoint nobody owns, and
+  malformed frames, are counted and dropped like Linux.
+- `pci_start(Wlfw)` (from `pci::mhi_task`): `Ce::alloc` +
+  `install_ce_irq_handlers` with the probe's MSI state (Linux does both
+  at probe), then `qmi_firmware_ready(&mut NoDp)`; the core is parked
+  ready or failed. `take_core()` (only when ready), `park_core`,
+  `core_ready`, `core_failure`. A session the core cannot start on is
+  parked too: the firmware owns its target memory.
+- Steps (`core::step`, 120–139): UNSUPPORTED 120, NO_DEVICE 121,
+  HTC_INIT 122, HTC_READY_TIMEOUT 123, HTC_BAD_READY 124, HTT_CONNECT
+  125, HTT_CONNECT_TIMEOUT 126, WMI_CONNECT 127, WMI_CONNECT_TIMEOUT
+  128, HTC_START 129, SERVICE_READY_TIMEOUT 130 (detail = `seen` bits),
+  SERVICE_READY_DECODE 131 (event id << 16 | errno), WMI_INIT 132,
+  WMI_SEND_CREDITS 133 / WMI_SEND 134 (detail = command id), READY_TIMEOUT
+  135, READY_DECODE 136, NO_WMI_EP 137, EVENT_TIMEOUT 138 (API only,
+  never latched), HTT_SEND 139. HTC failure details are
+  `kind << 16 | value` (`htc_err_detail`). QMI start failures latch the
+  `wlfw::step` (58–60); CE failures their `ce::step`. The stage moves to
+  `commands` when WMI READY arrives.
+
+Linux order implemented (`core.c`): `ath11k_core_qmi_firmware_ready` →
+`ath11k_core_start_firmware` (`ath11k_ce_get_shadow_config`,
+`ath11k_qmi_firmware_start`: wlan_ini → wlan_cfg → wlan_mode NORMAL) →
+`ath11k_ce_init_pipes` → `ath11k_dp_alloc` (hook) → `ath11k_core_start`
+[`ath11k_wmi_attach` (preferred SINGLE) → `ath11k_htc_init` (one WMI
+endpoint) → `ath11k_hif_start` (`ath11k_pci_start`: ASPM restore if
+multi-MSI; `ath11k_pcic_start`: CE IRQs on, RX posted) →
+`ath11k_htc_wait_target` (1 s; poll every CE; 1 s) →
+`ath11k_dp_htt_connect` → `ath11k_wmi_connect` → `ath11k_htc_start` →
+`ath11k_wmi_wait_for_service_ready` → (`ath11k_mac_allocate` skipped) →
+`ath11k_dp_pdev_reo_setup` (hook) → `ath11k_wmi_cmd_init` →
+`ath11k_wmi_wait_for_unified_ready` → `ath11k_wmi_set_hw_mode(DBS)` →
+`ath11k_dp_tx_htt_h2t_ver_req_msg` (hook)] → `ath11k_core_pdev_create`
+(hook) → `ath11k_hif_irq_enable` (hook). Errors after firmware start
+unwind as Linux: `ath11k_hif_stop` (if started), then
+`ath11k_qmi_firmware_stop`.
+
+Tests: `core_tests.rs` — a scripted WCN6855 target at the HTC/WMI
+level behind a recording fake HIF (exact order of QMI start, CE init,
+hooks, HIF start, every TX frame; HTC connect / setup-complete / WMI
+INIT / SET_HW_MODE byte goldens from Linux; MAC, caps, regulatory,
+endpoints, credits) and behind the real `CeHif` over `ce_tests`'
+`FakeChip` (frames through the real CE rings). Negatives: HTC READY
+timeout (with the poll fallback), bad READY, HTT / WMI connect refused
+and silent, service ready timeout (nothing, and EXT2 advertised but
+missing), EXT decode failure, READY timeout, READY without its TLV,
+credit starvation, QMI start failure, CE init failure, CE refusing WMI
+INIT, unexpected events / endpoints / malformed frames, API without
+endpoints.
+
 ## 4. Invariants
 
 - The PCI table is exactly Linux's `ath11k_pci_id_table`.
@@ -314,7 +406,7 @@ card (QEMU emulates none) is exercised once, after phase 8.
 | 1 | MSI vectors, power-up (`soc_global_reset`, LTSSM, L1SS / ASPM handling) (**done**) | `pci.c`, `pcic.c` |
 | 2 | MHI host: context arrays, event rings, BHI SBL (512 KiB) + BHIe full image, EE/state machine to mission mode, IPCR ch 20/21 (**done**, offline) | `mhi.c`, `bus/mhi/host/*` |
 | 3 | QRTR over MHI + QMI encode/decode; WLFW handshake: host cap, ind register, respond mem, target cap, BDF (`board-2.bin` by bus/qmi-chip-id/board-id), M3 (`m3.bin`), regdb, wlan cfg, mode ON (**done** to FW_READY, offline; `firmware_start` waits for the CE shadow list) | `qmi.c`, `net/qrtr`, `soc/qcom/qmi_*` |
-| 4 | Copy Engines + HTC + WMI: service ready, init, ready; MAC from firmware (HAL SRNG core, CE pipes, shadow v2 list, HTC/WMI codecs **done, offline**; CE ↔ HTC wiring open) | `hal.c`, `ce.c`, `htc.c`, `wmi.c` |
+| 4 | Copy Engines + HTC + WMI: service ready, init, ready; MAC from firmware (**done, offline**: HAL SRNG core, CE pipes, shadow v2 list, HTC/WMI codecs, `core.rs` bring-up to WMI READY + SET_HW_MODE DBS; DP hooks no-op) | `core.c`, `hal.c`, `ce.c`, `htc.c`, `wmi.c` |
 | 5 | DP rings (TCL, REO, WBM, RXDMA refill) on the HAL (descriptor layouts **done**) | `hal*.c`, `dp.c` |
 | 6 | Control: pdev/vdev, regulatory, scan → `BssInfo` list | `mac.c`, `wmi.c`, `reg.c` |
 | 7 | Connect: peer, auth/assoc via mgmt TX, EAPOL via `narf-wireless` supplicant, key install | `mac.c`, `wmi.c` |
@@ -389,10 +481,26 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   `DEVICE_INIT_DONE` would need `mhi_device_get_sync` on Linux
   (`ath11k_pci_bus_wake_up`); HAL/CE only touch such registers during
   ring setup, before that flag, and the shadow registers are below it.
-- Open: CE ↔ HTC wiring (feed `Ce::take_rx_any` into `Htc::rx`,
-  `HtcTx` into `Ce::send`), calling `install_ce_irq_handlers` with the
-  probe's `MsiState`, and the order relative to QMI (`Ce::alloc` +
-  `shadow_reg_v2()` before `WLAN_CFG`, `init_pipes` after FW ready).
+- CE ↔ HTC wiring (decided, `core.rs`): RX by the pipe's `recv_cb`
+  (HTC handler for CE1/CE2, HTT T2H straight from CE5); TX on the
+  endpoint's `ul_pipe` with `transfer_id = eid`, credits reverted when
+  the CE refuses. `Ce::alloc` + `install_ce_irq_handlers` run after
+  FW_READY, not at probe as in Linux: both are host-only (the CE IRQ
+  flag stays off until `ath11k_hif_start`), so the firmware sees the
+  same sequence.
+- Core deviations from Linux (deliberate, documented in `core.rs`): a
+  WMI connect failure fails at once (Linux only warns and then times out
+  on service ready); a SERVICE_READY / EXT / EXT2 / READY decode failure
+  fails at once (Linux warns and either waits out the 5 s or — EXT
+  failing with EXT2 still arriving — goes on without the ext caps);
+  `wmi_cmd_wait` / event queues are NARF API, Linux uses per-event
+  completions.
+- Open (core): the MHI controller is not serviced after FW_READY
+  (late QMI indications wait in the IPCR DL ring); `ATH11K_FLAG_*`
+  crypto / raw mode are not modelled (HW crypto, native-wifi decap as in
+  the INIT resource config); `ath11k_mac_allocate`, `ath11k_dp_*` and
+  `ath11k_core_pdev_create` are hooks only; firmware crash recovery
+  (`ath11k_core_reconfigure_on_crash`) is not ported.
 - Firmware: `cargo xtask import-firmware --vendor ath11k`
   decompresses the distro `.zst` blobs at image build time. Open:
   whether probe runs before the rootfs firmware scan, i.e. whether
