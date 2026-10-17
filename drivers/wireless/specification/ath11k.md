@@ -469,6 +469,84 @@ completion decode, FIFO-full, wrap, shadow timer; negatives) and
 `htt_tests.rs`. The device model learns UMAC rings only from the
 programmed registers + the QMI shadow list and LMAC rings only from
 the HTT messages, and moves descriptors / buffers by physical address.
+### 3.9 Station mac layer (`mac.rs`, `mac_reg.rs`, `mac_peer.rs`, `mac_frame.rs`)
+
+What Linux `ath11k/mac.c` + `reg.c` do for a WCN6855 station, driven
+in the order mac80211 / cfg80211 / wpa_supplicant drive them (NARF has
+none of those). Independent of the transport: the core implements two
+traits.
+
+**`WmiPort`** (WMI side of the core): `send(WmiCmd) -> Result<(), errno>`
+(`ath11k_wmi_cmd_send`), `next_event(timeout_ms) -> Option<frame>` (every
+WMI event the core does not consume itself, `wmi_cmd_hdr` + TLVs; 0 =
+poll), `mgmt_tx(vdev_id, frame) -> Result<desc_id, errno>`
+(`ath11k_mac_mgmt_tx_wmi`: DMA-map + `WMI_MGMT_TX_SEND_CMDID`),
+`mgmt_tx_done(desc_id)` (`wmi_process_mgmt_tx_comp`, called when the
+mac layer sees the MGMT_TX_COMPLETION), `now_ms()`, `max_msg_len()`
+(WMI endpoint, for the channel-list split), `random_bytes()`.
+
+**`DataPort`** (DP side): `ppdu_stats_req()`, `mon_status_default(on)`,
+`vdev_tx_attach(vdev, addr)`, `wait_peer_mapped(vdev, addr, mapped,
+timeout)` (HTT PEER_MAP / UNMAP), `peer_setup` / `peer_cleanup`,
+`rx_pn_replay_config(vdev, addr, cipher, pairwise, install)`,
+`send_eth(frame)` / `recv_eapol(timeout)` (EAPOL as 802.3,
+`ETH_P_PAE`), `set_authorized(addr, on)` (port control for data).
+
+**`Mac<P, D>`**: `new(wmi, dp, DeviceCaps, MacConfig, initial_reg)`
+(`ath11k_mac_register`: wiphy bands from `hal_reg_cap`, the default
+regdomain from the start-up REG_CHAN_LIST_CC, world regd otherwise),
+`start()` (`ath11k_mac_op_start`), `add_interface()`
+(`ieee80211_do_open` → `ath11k_mac_op_add_interface`, ERP reset,
+`ieee80211_set_wmm_default` → `conf_tx` ×4), `scan(&ScanRequest) ->
+Vec<BssInfo>` / `hw_scan(ssids, freqs)` (`ath11k_mac_op_hw_scan`,
+`ath11k_start_scan`, scan event state machine, timeout work, cfg80211
+BSS table), `associate(&AssociateRequest)` / `connect`, `disassociate()`,
+`poll() -> Option<LinkLoss>` (dispatch events: kickout, beacon miss →
+3 s connection loss, deauth / disassoc RX, 11d new country, regulatory
+updates), `handle_event(frame)`, `connected_bssid()`.
+`DeviceCaps::from_events(service_ready, ext, ready, svc_map)`,
+`MacConfig::wcn6855()`.
+
+- `mac_reg`: `build_regd` (+ ETSI weather-radar split), `regd_intersect`,
+  `RegState::handle_chan_list` (default / new / unchanged, reg info
+  store for the STA 6 GHz client rules), `Wiphy` (Linux channel tables,
+  `hal_reg_cap` limits, `handle_channel_custom` + `reg_process_ht_flags`
+  for a self-managed wiphy, `scan_chan_list()` =
+  `ath11k_reg_update_chan_list`).
+- `mac_peer`: own HT/VHT caps (`ath11k_create_{ht,vht}_cap`), what the
+  Association Request advertises (`ieee80211_add_{ht,vht}_ie`), AP
+  station caps (`ieee80211_{ht,vht}_cap_ie_to_sta_*`, bandwidth, NSS),
+  `determine_chan` (HT/VHT operation → 20/40/80 MHz, downgraded until
+  usable), `vdev_phymode` (`ath11k_phymodes`), `peer_assoc_prepare`
+  (`ath11k_peer_assoc_h_*`), `txbf_conf`.
+- `mac_frame`: element walk, beacon / probe response / auth / assoc
+  response / deauth parsers, Open-System auth, (re)association request
+  (`ieee80211_send_assoc` element order), deauth, EAPOL ↔ 802.3.
+- WPA2-PSK: `narf_wireless::eapol::Supplicant` + HMAC-SHA1 MICs, M3 key
+  data AES-unwrapped (`iwlwifi::rekey::aes_key_unwrap`), the M3 RSN
+  element must equal the beacon's, GTK from the KDE; PTK then GTK via
+  `WMI_VDEV_INSTALL_KEY` (CCMP, pairwise / group flags) and
+  `WMI_PEER_AUTHORIZE`.
+- Diagnostics: `mac::step` 150–199, one console line per failure;
+  stage `scan` on a scan / link loss, `connected` after authorization.
+- `wmi.rs` additions: `scan_prob_req_oui_cmd`,
+  `dfs_phyerr_offload_enable_cmd`, `pdev_lro_cfg_cmd`,
+  `vdev_set_wmm_params_cmd`, `obss_spr_cmd`, `decode_11d_new_cc`.
+
+Tests: `mac_tests.rs` — a scripted fake firmware + AP behind fake
+ports: exact command lists for start / add_interface / scan / join /
+teardown (built with the Linux-pinned `wmi.rs` encoders from
+hand-derived values), literal auth / association request bytes, scan
+dedupe / adjacent channel / malformed / filtered frames, regulatory
+build / intersect / weather radar / 6 GHz client rules, peer assoc
+parameters (HT40, VHT80, 11b, MCS workaround), a full WPA2-PSK join
+against a real authenticator (PTK derived independently, MICs and the
+wrapped GTK checked both ways), and negatives (scan start timeout /
+failure / completion timeout, VDEV_START status / timeout, PEER_MAP
+timeout, auth denied / timeout + BSS unlink, assoc reject / timeout,
+peer-assoc-conf timeout, 4-way MIC failure / timeout / RSN mismatch,
+key install status / timeout, kickout, beacon loss, deauth RX, 11d new
+country).
 
 ## 4. Invariants
 
@@ -489,8 +567,8 @@ card (QEMU emulates none) is exercised once, after phase 8.
 | 3 | QRTR over MHI + QMI encode/decode; WLFW handshake: host cap, ind register, respond mem, target cap, BDF (`board-2.bin` by bus/qmi-chip-id/board-id), M3 (`m3.bin`), regdb, wlan cfg, mode ON (**done** to FW_READY, offline; `firmware_start` waits for the CE shadow list) | `qmi.c`, `net/qrtr`, `soc/qcom/qmi_*` |
 | 4 | Copy Engines + HTC + WMI: service ready, init, ready; MAC from firmware (**done, offline**: HAL SRNG core, CE pipes, shadow v2 list, HTC/WMI codecs, `core.rs` bring-up to WMI READY + SET_HW_MODE DBS; DP hooks no-op) | `core.c`, `hal.c`, `ce.c`, `htc.c`, `wmi.c` |
 | 5 | DP rings (TCL, REO, WBM, RXDMA refill) on the HAL (descriptor layouts, ring runtime, HTT ring setup / filters / version / peer map **done, offline**; wiring into bring-up open) | `hal*.c`, `dp.c`, `dp_tx.c` (HTT) |
-| 6 | Control: pdev/vdev, regulatory, scan → `BssInfo` list | `mac.c`, `wmi.c`, `reg.c` |
-| 7 | Connect: peer, auth/assoc via mgmt TX, EAPOL via `narf-wireless` supplicant, key install | `mac.c`, `wmi.c` |
+| 6 | Control: pdev/vdev, regulatory, scan → `BssInfo` list (**done, offline**: `mac.rs` behind `WmiPort`/`DataPort`; core wiring open) | `mac.c`, `wmi.c`, `reg.c` |
+| 7 | Connect: peer, auth/assoc via mgmt TX, EAPOL via `narf-wireless` supplicant, key install (**done, offline** for Open + WPA2-PSK/CCMP; SAE open) | `mac.c`, `wmi.c` |
 | 8 | Data path: TX (TCL → WBM completion), RX (REO dst → `Frame`); register `wlan%d` (TX / completion / RX reap + decap to Ethernet **done, offline** in `dp_ring.rs`; interface registration open) | `dp_tx.c`, `dp_rx.c` |
 | 9 | Power: PS, suspend/resume, firmware crash recovery | `core.c`, `mac.c` |
 
@@ -623,3 +701,19 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   decompresses the distro `.zst` blobs at image build time. Open:
   whether probe runs before the rootfs firmware scan, i.e. whether
   the ath11k blobs must go in the initramfs (`--initramfs-firmware`).
+- Mac layer scope (decided): HT + 5 GHz VHT only, no HE in the
+  Association Request (the chip is HE-capable; mac80211's HE paths,
+  6 GHz association and >80 MHz are therefore unreachable), so phymodes
+  are 11NG/11NA/11AC. Scan covers 2.4/5/6 GHz; `BssInfo` lists 2.4/5
+  GHz only (`narf_wireless` uses bare channel numbers).
+- Mac layer, open vs Linux (each is a deliberate simplification or an
+  unverified detail, see `mac.rs` comments): probe-request elements
+  approximate `ieee80211_build_preq_ies`; the SME adds only the RSN
+  element (wpa_supplicant also adds Extended Capabilities); no Country /
+  Power Constraint handling (`ap_power_level`), no TPC / 6 GHz power
+  envelope, no HE txbf / BSS colour / TWT; association comeback
+  (status 30) is a reject; WPA3-SAE, PMF/BIP, group rekey, roaming,
+  GTK rekey offload and CSA are not implemented; kickout is treated as
+  link loss (Linux reports low-ack to userspace); deauth reason after a
+  failed 4-way is 3 (17 for an RSN mismatch); the 11d "fin" path and the
+  6 GHz LPI re-handling follow Linux but are untested on hardware.
