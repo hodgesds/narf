@@ -1,5 +1,7 @@
 //! Two retained VMID0 GC12 kernel queues, with a bounded translated-memory
-//! WRITE_DATA and native EOP-interrupt proofs. No user IBs, draws, shaders or reset.
+//! WRITE_DATA and native EOP-interrupt proofs, then client jobs on either
+//! queue: each a VM flush for the client's VMID, its IBs and a fence
+//! (`submit`). No draws, shaders or reset.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip, amdgpu_gmc_navi48 as gmc, amdgpu_mes12 as api, amdgpu_mes12_hw as mes,
@@ -15,6 +17,36 @@ const BYTES: u64 = PIPE_BYTES * 2;
 const RPTR: u64 = 10240;
 const WPTR: u64 = 10248;
 const BELLS: [u32; 2] = [0x116, 6];
+/// Each queue's job fence (within its pipe's area): the last completed
+/// job's sequence.
+const JOB_FENCE: u64 = 10496;
+/// A kernel queue that runs client jobs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pipe {
+    Graphics = 0,
+    Compute = 1,
+}
+impl Pipe {
+    fn index(self) -> usize {
+        self as usize
+    }
+    /// The pipe's area in the queue memory.
+    fn base(self) -> u64 {
+        self.index() as u64 * PIPE_BYTES
+    }
+    /// The ring's invalidation engine on the GFX hub, as
+    /// amdgpu_gmc_allocate_vm_inv_eng hands engines out in ring order: the
+    /// graphics ring 0, the first compute ring 1 (MES reserves 5 and 6; the
+    /// kernel's CPU invalidations use 17).
+    fn engine(self) -> u32 {
+        self.index() as u32
+    }
+}
+/// One job's ring slot: GC12's 256-dword submission alignment.
+const JOB_DWORDS: u64 = 256;
+/// Ring capacity in dwords (4 KiB).
+const RING_DWORDS: u64 = 1024;
+
 const FENCES: [u32; 2] = [0x9070cafe, 0x9070beef];
 const PATTERN: [u32; 16] = [
     0x01234567, 0x89abcdef, 0x76543210, 0xfedcba98, 0xaaaaaaaa, 0x55555555, 0xff00ff00, 0x00ff00ff,
@@ -43,6 +75,98 @@ pub enum State {
     InterruptSubmitted(u8),
     InterruptVerified,
     Failed(Error),
+}
+/// A client job: an IB of `ib_dwords` at `ib` in VMID `vmid`'s address
+/// space, whose page directory is `pd_addr` (the root's entry address with
+/// VALID, as gmc_v12_0_get_vm_pde leaves it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Job {
+    pub vmid: u8,
+    /// The client's PASID, mapped to `vmid` in the IH VMID LUT so a fault
+    /// names the client.
+    pub pasid: u16,
+    pub pd_addr: u64,
+    /// The job's IBs in order, `(address, dwords)`; `ib_count` are used.
+    pub ibs: [(u64, u32); MAX_JOB_IBS],
+    pub ib_count: u8,
+}
+/// IBs one job may carry: all fit one 256-dword slot beside the flush,
+/// PASID mapping and fence.
+pub const MAX_JOB_IBS: usize = 8;
+impl Job {
+    /// A job of `ibs` (at most `MAX_JOB_IBS`).
+    pub fn new(vmid: u8, pasid: u16, pd_addr: u64, ibs: &[(u64, u32)]) -> Option<Self> {
+        if ibs.is_empty() || ibs.len() > MAX_JOB_IBS {
+            return None;
+        }
+        let mut all = [(0, 0); MAX_JOB_IBS];
+        all[..ibs.len()].copy_from_slice(ibs);
+        Some(Self {
+            vmid,
+            pasid,
+            pd_addr,
+            ibs: all,
+            ib_count: ibs.len() as u8,
+        })
+    }
+    fn ibs(&self) -> &[(u64, u32)] {
+        &self.ibs[..usize::from(self.ib_count).min(MAX_JOB_IBS)]
+    }
+}
+/// gfx_v12_0's frame for one job on the graphics ring, as amdgpu_vm_flush
+/// and amdgpu_ib_schedule emit it: the VM flush (gmc_v12_0_emit_flush_gpu_tlb
+/// on the GFX hub through the ring's engine, then PFP_SYNC_ME), the PASID
+/// mapping (gmc_v12_0_emit_pasid_mapping: IH_VMID_0_LUT + vmid at OSSSYS
+/// base `oss`), the IBs under the job's VMID, and an interrupting RELEASE_MEM
+/// of `seq` to `fence`, NOP-padded to the 256-dword slot.
+///
+/// On the compute pipe, as gfx_v12_0's compute ring functions: register
+/// writes without the PFP engine select, no PFP_SYNC_ME, the ring's own
+/// invalidation engine, and IBs marked `INDIRECT_BUFFER_VALID`.
+fn job_packets(
+    pipe: Pipe,
+    job: Job,
+    gc: u32,
+    oss: u32,
+    fence: u64,
+    seq: u32,
+) -> Result<[u32; 256], Error> {
+    let gfx = pipe == Pipe::Graphics;
+    use crate::amdgpu_pm4::Pm4Builder;
+    if !(1..16).contains(&job.vmid)
+        || job.ibs().is_empty()
+        || job
+            .ibs()
+            .iter()
+            .any(|&(at, dwords)| dwords == 0 || dwords > 0xf_ffff || at & 3 != 0)
+    {
+        return Err(Error::Invalid);
+    }
+    let mut words = [0u32; 256];
+    let mut b = Pm4Builder::new(&mut words);
+    let built = (|| {
+        b.vm_flush(
+            &crate::amdgpu_vmhub_regs::GFXHUB_V12_0,
+            gc,
+            pipe.engine(),
+            job.vmid,
+            job.pd_addr,
+            gfx,
+        )?;
+        b.write_reg(oss + u32::from(job.vmid), u32::from(job.pasid), gfx)?;
+        for &(at, dwords) in job.ibs() {
+            if gfx {
+                b.indirect_buffer(at, dwords, job.vmid)?;
+            } else {
+                b.indirect_buffer_valid(at, dwords, job.vmid)?;
+            }
+        }
+        b.release_mem_fence(fence, u64::from(seq), false, true)?;
+        let used = b.words().len();
+        b.nop(256 - used - 1)
+    })();
+    built.map_err(|_| Error::Invalid)?;
+    Ok(words)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Proof {
@@ -77,6 +201,8 @@ fn interrupt_packets(address: u64, pipe: usize) -> [u32; 256] {
 #[derive(Clone, Copy, Debug)]
 struct Layout {
     gc: u64,
+    /// OSSSYS 7.0 bank 0 (the IH VMID LUTs).
+    oss: u64,
     hyp: u64,
     nbio: u64,
 }
@@ -92,6 +218,8 @@ impl Layout {
             gc: bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, 0x1fab)
                 .map_err(|_| Error::Unsupported)?,
             hyp: bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 1, 0x900)
+                .map_err(|_| Error::Unsupported)?,
+            oss: bank(gpu, ip::HW_ID_OSSSYS, &[(7, 0, 0)], 0, 0x1f)
                 .map_err(|_| Error::Unsupported)?,
             nbio: bank(
                 gpu,
@@ -249,6 +377,10 @@ struct Engine<I: Io> {
     state: State,
     proof: Option<Proof>,
     interrupt_result: Option<Result<InterruptProof, Error>>,
+    /// Dwords written to each pipe's ring so far (its WPTR).
+    job_wptr: [u64; 2],
+    /// The last job sequence submitted on each pipe's ring.
+    job_seq: [u32; 2],
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -494,6 +626,81 @@ impl<I: Io> Engine<I> {
         })
     }
 }
+impl<I: Io> Engine<I> {
+    /// Queue one client job on `pipe`'s ring, after both proofs, if its
+    /// 256-dword slot is free: the ring holds 1024 dwords, and only the low
+    /// 32 bits of GC12's RPTR writeback are live. Returns the job's
+    /// sequence on that ring; `completed_job` reports when its fence
+    /// passes it.
+    fn submit(&mut self, pipe: Pipe, job: Job) -> Result<u32, Error> {
+        if self.state != State::InterruptVerified {
+            return Err(Error::Busy);
+        }
+        let l = self.layout;
+        let map = self.memory.mapping();
+        let db = self.doorbells;
+        let (i, base) = (pipe.index(), pipe.base());
+        // The proofs left both rings at 512 dwords.
+        let wptr = self.job_wptr[i].max(512);
+        let seq = self.job_seq[i].wrapping_add(1);
+        let fence = self.memory.address() + base + JOB_FENCE;
+        let words = job_packets(pipe, job, (l.gc / 4) as u32, (l.oss / 4) as u32, fence, seq)?;
+        self.access(|io| {
+            flush(io, l);
+            let rptr = u64::from(io.memory_read(map, base + RPTR));
+            // The 32-bit RPTR trails WPTR by what the CP has yet to read.
+            let pending = (wptr as u32).wrapping_sub(rptr as u32) as u64;
+            if pending > wptr || pending + JOB_DWORDS > RING_DWORDS {
+                return Err(Error::Busy);
+            }
+            let slot = base + wptr % RING_DWORDS * 4;
+            for (w, word) in words.into_iter().enumerate() {
+                io.memory_write(map, slot + w as u64 * 4, word);
+            }
+            let next = wptr + JOB_DWORDS;
+            io.memory_write(map, base + WPTR, next as u32);
+            io.memory_write(map, base + WPTR + 4, (next >> 32) as u32);
+            flush(io, l);
+            io.doorbell(db, BELLS[i], next);
+            Ok(())
+        })?;
+        self.job_wptr[i] = wptr + JOB_DWORDS;
+        self.job_seq[i] = seq;
+        Ok(seq)
+    }
+    /// The last job sequence `pipe`'s fence reached.
+    fn completed_job(&mut self, pipe: Pipe) -> Result<u32, Error> {
+        let l = self.layout;
+        let map = self.memory.mapping();
+        self.access(|io| {
+            flush(io, l);
+            Ok(io.memory_read(map, pipe.base() + JOB_FENCE))
+        })
+    }
+}
+/// Reads the queues' job fences without the queue's owner: its own
+/// capability, an HDP flush, then the fence word. Concurrent flushes
+/// and reads are harmless, so syncobj fences can poll it from anywhere.
+#[derive(Clone, Copy, Debug)]
+pub struct FenceReader {
+    regs: MmioRegion,
+    authority: Cap<BusDeviceCap, Write>,
+    layout: Layout,
+    map: MmioRegion,
+}
+impl FenceReader {
+    /// The last client job sequence `pipe`'s ring completed.
+    pub fn completed(&self, pipe: Pipe) -> Result<u32, Error> {
+        let mut io = Mmio(self.regs);
+        let (l, map) = (self.layout, self.map);
+        self.authority
+            .invoke(Op(|| {
+                flush(&mut io, l);
+                io.memory_read(map, pipe.base() + JOB_FENCE)
+            }))
+            .map_err(|_| Error::Revoked)
+    }
+}
 #[derive(Debug)]
 pub struct Queues(Engine<Mmio>);
 impl Queues {
@@ -516,6 +723,8 @@ impl Queues {
             state: State::Prepared,
             proof: None,
             interrupt_result: None,
+            job_wptr: [0; 2],
+            job_seq: [0; 2],
         }))
     }
     /// # Safety
@@ -553,6 +762,28 @@ impl Queues {
     }
     pub fn proof(&self) -> Option<Proof> {
         self.0.proof
+    }
+    /// Queue a client job on `pipe`'s ring (see `Job`).
+    /// # Safety
+    /// `job.vmid`'s context points at `job.pd_addr` only through this
+    /// job's flush; that page directory, the IB and everything it reaches
+    /// stay mapped and alive until `completed_job` passes the returned
+    /// sequence, and no one else writes this ring.
+    pub unsafe fn submit(&mut self, pipe: Pipe, job: Job) -> Result<u32, Error> {
+        self.0.submit(pipe, job)
+    }
+    /// The last client job sequence `pipe`'s ring completed.
+    pub fn completed_job(&mut self, pipe: Pipe) -> Result<u32, Error> {
+        self.0.completed_job(pipe)
+    }
+    /// A reader of the job fence that needs no access to this owner.
+    pub fn fence_reader(&self) -> FenceReader {
+        FenceReader {
+            regs: self.0.io.0,
+            authority: self.0.authority,
+            layout: self.0.layout,
+            map: self.0.memory.mapping(),
+        }
     }
 }
 #[cfg(feature = "kernel-test")]

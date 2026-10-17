@@ -313,6 +313,11 @@ impl Backend for Hardware {
                 );
                 // SAFETY: same retained owners and exclusive hub access.
                 unsafe { self.gmc.as_mut().unwrap().initialize().await }.map_err(Error::Gmc)?;
+                // Client VMIDs 1..15 at an empty root, before any queue runs,
+                // for submissions' in-ring VM flushes to point at a client.
+                // SAFETY: the same owners; no queue exists yet.
+                unsafe { self.gmc.as_mut().unwrap().prepare_client_contexts().await }
+                    .map_err(Error::Gmc)?;
             }
             Stage::ReadTopology => {
                 // SAFETY: firmware/power are ready; no concurrent index user,
@@ -461,6 +466,9 @@ pub struct ColdBoot {
     verified_links: Vec<modeset::VerifiedLink>,
     /// The last scan's DP sinks: port path, DPCD caps and base EDID.
     scanned_sinks: Vec<(inventory::Path, [u8; 16], [u8; 128])>,
+    /// The slice of CPU-visible VRAM clients' buffers come from, kept out
+    /// of the driver's own pool for good.
+    client_vram: Option<crate::amdgpu_vram::Reservation>,
 }
 impl ColdBoot {
     /// # Safety
@@ -592,6 +600,7 @@ impl ColdBoot {
             sst_outputs: Vec::new(),
             verified_links: Vec::new(),
             scanned_sinks: Vec::new(),
+            client_vram: None,
             sequence: Sequence {
                 backend: Hardware {
                     gpu: saved,
@@ -685,6 +694,41 @@ impl ColdBoot {
     /// Run from an executor task after service handoff, with all kernel queues,
     /// test pages and reset/PM still exclusively owned. Masked CPU IRQs cause
     /// the MSI proof to fail before submission.
+    /// Queue a client job on the graphics ring (`Queues::submit`).
+    /// # Safety
+    /// As for `Queues::submit`: the job's page directory, IB and what it
+    /// reaches stay alive until `completed_client_job` passes the sequence.
+    pub(crate) unsafe fn submit_client_job(
+        &mut self,
+        pipe: queues::Pipe,
+        job: queues::Job,
+    ) -> Result<u32, queues::Error> {
+        let queues = self
+            .sequence
+            .backend
+            .queues
+            .as_mut()
+            .ok_or(queues::Error::Invalid)?;
+        // SAFETY: the caller's obligations.
+        unsafe { queues.submit(pipe, job) }
+    }
+    /// A reader of the graphics ring's job fence that needs no access to
+    /// this owner.
+    pub(crate) fn client_fence_reader(&self) -> Option<queues::FenceReader> {
+        self.sequence
+            .backend
+            .queues
+            .as_ref()
+            .map(queues::Queues::fence_reader)
+    }
+
+    /// This GPU's DRM card: the registered Navi48.
+    pub(crate) fn drm_card() -> Option<u32> {
+        (0..crate::drm_registry::count() as u32).find(|&i| {
+            crate::drm_registry::pci_id(i)
+                == Some((crate::amdgpu::AMD_VENDOR, crate::amdgpu::NAVI48))
+        })
+    }
     pub(crate) async unsafe fn prove_queue_interrupts(
         &mut self,
     ) -> Result<queues::InterruptProof, queues::Error> {
@@ -728,6 +772,51 @@ impl ColdBoot {
         unsafe { sdma.prove_interrupts(gmc).await }
     }
     /// Board power limits and GFX level of the configured SMU, after boot.
+    /// Give clients of this card's DRM node a VRAM heap: half the
+    /// CPU-visible VRAM the driver's pool still has free after boot,
+    /// 2 MiB-aligned and at least 64 MiB, as a pool of its own, so with no
+    /// eviction they can never take what the driver's owners need. Entries
+    /// address it as the GMC's framebuffer geometry translates it.
+    /// Returns the heap's size.
+    pub(crate) fn publish_client_vram(&mut self) -> Result<u64, Error> {
+        const ALIGN: u64 = 2 << 20;
+        if self.client_vram.is_some() {
+            return Err(Error::Busy);
+        }
+        let hw = &mut self.sequence.backend;
+        let regs = hw.gpu.regs;
+        let context = hw
+            .gmc
+            .as_mut()
+            .ok_or(Error::Invalid)?
+            .display_context(regs)
+            .map_err(Error::Gmc)?;
+        let size = (hw.pool.available() / 2) & !(ALIGN - 1);
+        if size < 64 << 20 {
+            return Err(Error::Allocation);
+        }
+        let card = Self::drm_card().ok_or(Error::Invalid)?;
+        let mut chunk = hw
+            .pool
+            .reserve_aligned(size, ALIGN)
+            .map_err(|_| Error::Allocation)?;
+        // SAFETY: the reservation is this heap's alone, inside the owned,
+        // CPU-mapped VRAM range the boot inventory produced.
+        let heap = unsafe { Pool::from_owned_range(chunk.mapping(), chunk.address()) }
+            .map_err(|_| Error::Allocation)?;
+        // Clients' buffers outlive any one owner here; never recycle it.
+        chunk.publish();
+        crate::amdgpu_gem::register_vram_heap(
+            card,
+            crate::amdgpu_gem::VramHeap {
+                pool: heap,
+                fb_base: context.fb_base,
+                fb_offset: context.fb_offset,
+            },
+        );
+        self.client_vram = Some(chunk);
+        Ok(size)
+    }
     pub(crate) fn power_info(&self) -> Option<(Option<smu::Limits>, smu::GfxLevel)> {
         let smu = self.sequence.backend.smu.as_ref()?;
         (self.state() == State::MemoryReady && smu.power_status().is_some())

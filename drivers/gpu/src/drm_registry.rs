@@ -237,6 +237,15 @@ pub fn driver_name(index: u32) -> Option<&'static str> {
     }
 }
 
+/// A registered card's PCI vendor and device id.
+pub fn pci_id(index: u32) -> Option<(u16, u16)> {
+    REGISTRY
+        .lock()
+        .cards
+        .get(index as usize)
+        .map(|entry| (entry.card.vendor_id(), entry.card.device_id()))
+}
+
 /// Return the shared metadata for one card's primary or render node.
 pub(crate) fn node_metadata(
     index: u32,
