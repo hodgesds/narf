@@ -746,6 +746,231 @@ The ESP must be mounted during removal. If it is currently unmounted, mount it
 and run `sudo narf-uefi remove --esp <mount-point>` *before* `pacman -R`; the
 package cannot clean an unmounted filesystem after its helper has been removed.
 
+## Pre-hardware validation gate
+
+Run `cargo xtask cachyos-gate` before booting the installed CachyOS root
+under NARF on the real machine, and again after every change to storage,
+btrfs, the disk policy or the systemd path. It boots the same
+`cargo xtask grub-image` bundle that goes on the host's ESP, against disk
+images that have the host's shape, and prints one PASS/FAIL row per check.
+It exits nonzero if any row fails. It never opens a host block device.
+Everything it writes is a regular file under `target/cachyos-gate/` (or
+`--work-dir`).
+
+```sh
+cargo xtask cachyos-gate                       # full matrix (Gates A/B)
+cargo xtask cachyos-gate --cases ro,rw         # a subset, in matrix order
+cargo xtask cachyos-gate --crash-runs 3 --cycles 3 --seed 42
+cargo xtask cachyos-gate --skip-build --cases linux   # reuse the staged bundles
+cargo xtask cachyos-gate --real-root /mnt/sabrent/narf-gatec/cachyos-root-copy.img \
+  --work-dir /mnt/sabrent/narf-gatec/work      # Gate C (see below)
+```
+
+### What it boots
+
+| Piece | Gate | Host |
+| --- | --- | --- |
+| Machine | QEMU q35, OVMF (split CODE + a private VARS copy, so OVMF never writes `\NvVars` to an ESP), 4 vCPUs, 4 GiB, KVM when `/dev/kvm` is usable | B650I, UEFI |
+| NVMe controller 1 (`00:04.0`) | Decoy GPT disk: vfat p1 (1 MiB) + ext4 p2 (64 MiB, one file), like the Sabrent | Sabrent Rocket 4.0 (`04:00.0`) |
+| NVMe controller 2 (`00:07.0`) | Root disk: GPT vfat ESP p1 + btrfs p2, `boot` device | WD SN770 (`07:00.0`) |
+| USB stick | MBR FAT32 with `/NARFLOG.ID` for `narf.bootlog=` | The bring-up stick |
+| Boot chain | OVMF -> GRUB -> the bundle's `grub.cfg` stanza -> Limine (`/EFI/NARF/BOOTX64.EFI`) -> NARF | CachyOS GRUB -> the same stanza |
+
+The root disk is the `cachyos-root-smoke` image
+(`verification/data/cachyos-root/REGEN_cachyos_root_image.sh`, built
+unprivileged on first use): the real CachyOS `base` userspace, `mkfs.btrfs -O
+block-group-tree,free-space-tree,no-holes`, crc32c, 16 KiB nodes, 4 KiB
+sectors, zstd, the subvolumes `@ @home @root @srv @cache @tmp @log`, and the
+host's fstab with the image's own UUIDs. Its superblock carries the host's
+feature flags exactly (compat_ro 0xb, incompat 0x371). The gate works on a
+reflinked copy, `target/cachyos-gate/root.img`.
+
+GRUB is a `grub-mkstandalone` x86_64-efi image placed at
+`\EFI\BOOT\BOOTX64.EFI` on the root disk's ESP. Its embedded `grub.cfg` is
+`set timeout=0` plus the bundle's own `grub.cfg` stanza, unchanged, so the
+`search --file /EFI/NARF/BOOTX64.EFI` + `chainloader` path that runs on the
+host is the path tested. The bundle's `esp/` tree is copied onto the same
+ESP, as on the host. The gate builds two bundles:
+
+```sh
+cargo xtask grub-image --features cgroup-all,container \
+  --root-policy root-ro --root-uuid <image fsid>      # and --root-policy root-rw
+```
+
+`--features cgroup-all,container` (plus the `boot-init` and
+`firmware-allow-unsigned` that `grub-image` always adds) is the systemd PID 1
+configuration that `systemd-pid1` uses. Build the hardware bundle the same
+way. The gate appends `narf.bootlog=<token>` to the staged `limine.conf`
+because `grub-image` has no option for it yet. The resulting command line is
+printed in the `topology` row, for example:
+
+```
+narf.disks=root-rw root=UUID=<fsid> rootflags=subvol=/@ systemd_pid1 narf.bootlog=gate...
+```
+
+Each boot logs in on the serial console (`root` / `narf`, the image's test
+credentials) and drives the guest from a shell. The write workload writes
+under `/narf-gate` on `@`:
+
+- 400 small files, 50 of them fsynced one at a time;
+- 100 renames and 100 unlinks;
+- a 100 MiB file written through a temporary name, fsynced, then renamed;
+- a `TAG` file;
+- a file in `/home` if `/home` is writable;
+- a journald message, then `journalctl --flush`.
+
+It reports `home=rw|ro`, `journal=persistent|volatile` and the mount options
+of `/`, `/home` and `/var/log`. All content is deterministic, so the host can
+verify it byte for byte.
+
+### The rows
+
+| Row | Passes when |
+| --- | --- |
+| `topology` | Both bundles built; the root image's fsid and ESP serial differ from every host disk (the constants above plus `findmnt -no UUID` of `/`, `/boot/efi` and `/home`); its `/etc/fstab` (read with `btrfs restore`) names only the image's own btrfs and ESP UUIDs; no log tree. |
+| `1 root-ro` | The getty login prompt is reached and the workload runs on the tmpfs overlay. Afterwards the SHA-256 of the whole root disk and of the decoy is unchanged, and so is the btrfs superblock generation. |
+| `2 root-rw` | Login is reached with `/` mounted `rw`, and the workload and a clean `systemctl poweroff` complete. On the host, `btrfs check --readonly` and `btrfs check --readonly --check-data-csum` are clean, and `btrfs restore -r <id of @>` (unprivileged, on the extracted partition file) yields exactly the expected files and content. `log_root` is 0. Every byte outside the btrfs partition (GPT, ESP, slack) and the whole decoy are unchanged. |
+| `3 crash xN` | N times, QEMU is SIGKILLed at a uniformly random point (5-95%) of the workload, using the duration measured by row 2 (30 s if row 2 did not run). `btrfs check --readonly` must be clean after each kill. The next NARF root-rw boot must either mount `/` read-write (only allowed when `log_root` is 0), or refuse read-write with the `non-empty fsync log tree` reason while leaving the root partition's hash unchanged. A refusal is followed by one Linux boot, which replays the log, and the runs continue. A final boot judges the last kill. |
+| `4 cycles xN` | N consecutive root-rw boot -> workload -> poweroff cycles, each followed by the row 2 host checks: check, check-data-csum, restore, outside-bytes and decoy unchanged, `log_root` 0. |
+| `5 linux interop` | The host's own kernel (`/boot/vmlinuz-linux-cachyos`, copied) boots the post-NARF image with systemd, mounts `/` rw, reads the files of the last NARF round (SHA-256 of `big.dat`, a small file), and runs the workload. `btrfs scrub start -B /` must find no errors, and the host checks must then be clean. NARF then boots the image root-rw again, reads the Linux-written files, writes a new round and powers off, and the host checks are clean again (round trip). |
+| `boot chain` | Summary of every boot. Each NARF boot must show GRUB's `Booting 'NARF'` within 120 s, NARF's first console line within 180 s more, and its `disks: POLICY` line within 240 s after that. A boot that hangs before the kernel runs (firmware, GRUB or Limine) is killed and retried once, and is listed here. A second hang fails the row that was booting. |
+
+The Linux boot needs no initramfs. The CachyOS kernel has btrfs and
+virtio-blk built in (NVMe is a module), so the gate attaches both images as
+virtio-blk disks and boots `root=PARTUUID=<p2> rootflags=subvol=/@ rw
+console=ttyS0`. vfat is a module too, so it adds `systemd.mask=boot-efi.mount`.
+The image has no Linux modules, so the ESP cannot be mounted. Add arguments
+with `CACHYOS_GATE_LINUX_APPEND`.
+
+### Reading the output
+
+The run ends with a table:
+
+```
+cachyos-gate results
+row              result  detail
+---------------  ------  ----------------------------------------
+topology         PASS    q35+OVMF; OVMF -> GRUB (...) -> Limine -> NARF
+                         ...
+1 root-ro        PASS    login 41s; / rw (overlay); ...; root+decoy sha256 unchanged; gen 9 unchanged; ...
+2 root-rw        FAIL    / is not mounted read-write under root-rw: btrfs ...: REFUSING read-write mount: ...
+```
+
+- A row's detail starts with the first failure. The last lines of the guest
+  console follow, and then the serial log's path, so a FAIL can be read
+  without rerunning.
+- `target/cachyos-gate/logs/NN-<label>.serial.log` holds the full serial
+  console of boot `NN`: firmware, GRUB, Limine, the NARF kernel log, systemd
+  and the shell session.
+- `target/cachyos-gate/check/<label>.check.log` and `.check-csum.log` hold the
+  host `btrfs check` output. `<label>.restore.log` and `restore-<label>/` hold
+  what `btrfs restore` extracted.
+- `REFUSING read-write mount: <reason>` lines in a detail come from NARF's
+  read-write safety gate. Under `root-rw`, the gate turns the volume
+  read-only and names the reason, such as an unsupported feature bit or a log
+  tree.
+- `home=ro` or `journal=volatile` in a PASS row is information, not a
+  failure. The workload writes to `@` only. Whether the other fstab
+  subvolumes come up writable depends on the btrfs one-writer-per-fsid rule.
+- The crash row prints its seed. Rerun it with the same `--seed` to repeat
+  the same kill points.
+- `bootlog saved|not saved` in row 1 shows whether the kernel log reached the
+  USB stick under that policy.
+
+Do not boot the installed root on hardware until every row passes on the
+current tree, first against the generated image (Gates A/B) and then against
+a real copy of the host root (Gate C).
+
+### Gate C: a real copy of the host root
+
+Gate C runs the same matrix against a byte-level copy of the host's own `@`
+(and optionally `@home`). Build the copy once, on the Sabrent's ext4 data
+partition (`/mnt/sabrent`, about 519 GB free). These are the only commands
+in this workflow that need `sudo`. They read the live root through read-only
+snapshots and write only the image file through a loop device. The copy gets
+a new fsid, a new ESP serial and an fstab that names only those, so it can
+never be confused with the host root.
+
+```sh
+set -eu
+SAB=/mnt/sabrent
+DIR=$SAB/narf-gatec
+IMG=$DIR/cachyos-root-copy.img
+HOST_FSID=653602c3-cd42-420e-95ef-4c4033d17b56   # live root; never reused
+HOST_ESP=6D89-28C5
+sudo mkdir -p "$DIR" && sudo chown "$USER": "$DIR"
+
+# 1. A sparse GPT disk: 512 MiB ESP + btrfs sized for the root's data + 40 GiB.
+USED=$(sudo btrfs filesystem usage -b / | awk '/^ *Used:/ {print $2; exit}')
+truncate -s $(( USED / 1024 / 1024 / 1024 + 41 ))G "$IMG"
+sfdisk "$IMG" <<'SFDISK'
+label: gpt
+start=2048, size=1048576, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name="EFI system partition"
+start=1050624, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name="root"
+SFDISK
+
+# 2. Filesystems with fresh identities and the host root's mkfs features.
+LOOP=$(sudo losetup --find --show --partscan "$IMG")
+NEW_FSID=$(uuidgen)
+sudo mkfs.fat -F 32 -n EFI "${LOOP}p1"
+sudo mkfs.btrfs -U "$NEW_FSID" -L cachyos-gatec --csum crc32c -n 16384 -s 4096 \
+  -O block-group-tree,free-space-tree,no-holes "${LOOP}p2"
+NEW_ESP=$(sudo blkid -s UUID -o value "${LOOP}p1")
+sudo mkdir -p /mnt/narf-gatec /mnt/narf-hosttop
+sudo mount -o noatime,compress=zstd:1 "${LOOP}p2" /mnt/narf-gatec
+
+# 3. Read-only snapshots of the live subvolumes, sent into the copy.
+sudo mount -o subvolid=5 UUID=$HOST_FSID /mnt/narf-hosttop
+sudo btrfs subvolume snapshot -r /mnt/narf-hosttop/@ /mnt/narf-hosttop/@narf-gatec-root
+sudo btrfs send /mnt/narf-hosttop/@narf-gatec-root | sudo btrfs receive /mnt/narf-gatec/
+# Optional: also copy @home.
+sudo btrfs subvolume snapshot -r /mnt/narf-hosttop/@home /mnt/narf-hosttop/@narf-gatec-home
+sudo btrfs send /mnt/narf-hosttop/@narf-gatec-home | sudo btrfs receive /mnt/narf-gatec/
+
+# 4. Writable @ (and @home) in the copy, plus the remaining CachyOS subvolumes.
+sudo btrfs subvolume snapshot /mnt/narf-gatec/@narf-gatec-root /mnt/narf-gatec/@
+sudo btrfs subvolume snapshot /mnt/narf-gatec/@narf-gatec-home /mnt/narf-gatec/@home \
+  || sudo btrfs subvolume create /mnt/narf-gatec/@home
+for s in @root @srv @cache @tmp @log; do sudo btrfs subvolume create /mnt/narf-gatec/$s; done
+sudo btrfs subvolume delete /mnt/narf-gatec/@narf-gatec-root
+sudo btrfs subvolume delete /mnt/narf-gatec/@narf-gatec-home 2>/dev/null || true
+
+# 5. Inside the COPY only: fstab names the copy's UUIDs; every other UUID line
+#    (the Sabrent, other disks) is commented out. Gate login root/narf.
+F=/mnt/narf-gatec/@/etc/fstab
+sudo sed -i -e "s/$HOST_FSID/$NEW_FSID/g" -e "s/$HOST_ESP/$NEW_ESP/g" "$F"
+sudo awk -v a="UUID=$NEW_FSID" -v b="UUID=$NEW_ESP" \
+  '/^[[:space:]]*UUID=/ && $1 != a && $1 != b { print "#narf-gatec# " $0; next } { print }' \
+  "$F" | sudo tee "$F.new" >/dev/null && sudo mv "$F.new" "$F"
+echo 'root:narf' | sudo chpasswd -R /mnt/narf-gatec/@
+grep -v '^#' "$F"                           # review: only $NEW_FSID / $NEW_ESP
+
+# 6. Clean up: the host's temporary snapshots, the mounts, the loop device.
+sudo umount /mnt/narf-gatec
+sudo btrfs subvolume delete /mnt/narf-hosttop/@narf-gatec-root /mnt/narf-hosttop/@narf-gatec-home
+sudo umount /mnt/narf-hosttop
+sudo losetup -d "$LOOP"
+sudo chown "$USER": "$IMG"
+```
+
+Then, unprivileged:
+
+```sh
+cargo xtask cachyos-gate --real-root /mnt/sabrent/narf-gatec/cachyos-root-copy.img \
+  --work-dir /mnt/sabrent/narf-gatec/work
+```
+
+The gate refuses an image whose fsid or ESP serial matches a host disk, or
+whose fstab names any other UUID. ext4 has no reflinks, so the gate first
+makes a full copy of the image in `--work-dir`, and the host checks extract
+the btrfs partition to a file again after each boot. Expect a run to take
+hours for a large root. Add `--in-place` to boot the given image itself and
+skip the first copy; Gate C is then single-use until the copy is rebuilt. The
+copy keeps the host's machine-id and enabled units. If the graphical target
+gets in the way of the serial login, run `sudo ln -sfn
+/usr/lib/systemd/system/multi-user.target
+/mnt/narf-gatec/@/etc/systemd/system/default.target` in step 5.
+
 ## Why the installed CachyOS root is not ready yet
 
 CachyOS recommends Btrfs and normally uses an `@` root subvolume plus separate

@@ -31,6 +31,9 @@ mod bench_stats;
 mod bpf_bench;
 mod btrfs_crash;
 mod btrfs_interop;
+/// `cachyos-gate`: the pre-hardware validation matrix for the installed
+/// CachyOS root (docs/BOOTING_ON_CACHYOS.md, "Pre-hardware validation gate").
+mod cachyos_gate;
 mod cachyos_root;
 mod ci_clippy;
 mod composition;
@@ -154,6 +157,14 @@ enum Cmd {
     /// Kill QEMU right after a btrfs `fsync` returns, reboot, and require the
     /// data back plus a clean host `btrfs check` (commit durability).
     BtrfsCrashSmoke(btrfs_crash::Args),
+    /// Pre-hardware validation gate for booting the installed CachyOS root:
+    /// boots the real `grub-image` bundle (OVMF -> GRUB -> Limine -> NARF) on
+    /// a q35 machine with a decoy NVMe and a CachyOS-layout btrfs root NVMe,
+    /// and runs root-ro, root-rw, crash-consistency, repeated-cycle and Linux
+    /// interop rows with host-side `btrfs check`/`restore`. Prints a PASS/FAIL
+    /// table; exits nonzero on any failure. `--real-root <image>` runs the
+    /// same matrix on a copy of a real host-root image (Gate C).
+    CachyosGate(cachyos_gate::Args),
     /// Exercise real HTTP/3 from a running CachyOS guest through SLIRP.
     ///
     /// The host runs an in-process QUIC/HTTP/3 fixture. The guest's curl must
@@ -12875,6 +12886,7 @@ fn main() -> Result<()> {
         Cmd::CachyosRootSmoke(args) => cachyos_root::run(&args),
         Cmd::BtrfsRootrwInterop(args) => btrfs_interop::run_cmd(&args),
         Cmd::BtrfsCrashSmoke(args) => btrfs_crash::run(&args),
+        Cmd::CachyosGate(args) => cachyos_gate::run(&args),
         Cmd::Http3Smoke(args) => http3_smoke::run(&args),
         Cmd::RunInteractive(args) => run_interactive_cmd(&args),
         Cmd::NvmePoweroffCheck(args) => nvme_poweroff_check_cmd(&args),
