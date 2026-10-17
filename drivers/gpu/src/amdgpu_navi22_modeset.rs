@@ -1711,6 +1711,14 @@ pub fn test_pattern(_line: u32, row: &mut [u32]) {
     }
 }
 
+/// Opt-in power saving (amdgpu_navi22_power_policy): the DAL clock owner,
+/// for memory/fabric floors and the PMFW watermark table.
+impl Pipeline {
+    pub(crate) fn clock_manager(&mut self) -> &mut ClockManager {
+        &mut self.clocks
+    }
+}
+
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi22_modeset_tests.rs"]
 mod tests;

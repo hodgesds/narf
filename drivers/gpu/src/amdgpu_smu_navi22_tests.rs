@@ -115,6 +115,8 @@ struct Fake {
     /// MP1_FIRMWARE_FLAGS reads before INTERRUPTS_ENABLED is reported.
     fw_not_ready: usize,
     fw_reads: usize,
+    /// Feature bits PMFW refuses to change.
+    sticky: u64,
 }
 impl Io for Fake {
     fn write_table(
@@ -209,7 +211,15 @@ impl Io for Fake {
                     assert_eq!(self.flushes, 1, "staging not flushed before transfer");
                     let metrics = self.metrics.clone();
                     self.buffer[..metrics.len()].copy_from_slice(&metrics);
-                } else if !matches!(value, ALLOWED_HIGH | ALLOWED_LOW) {
+                } else if !matches!(
+                    value,
+                    ALLOWED_HIGH
+                        | ALLOWED_LOW
+                        | ENABLE_FEATURES_LOW
+                        | ENABLE_FEATURES_HIGH
+                        | DISABLE_FEATURES_LOW
+                        | DISABLE_FEATURES_HIGH
+                ) {
                     assert_eq!(self.argument, 0);
                 }
                 if let Some((message, cap)) = self.revoke_on {
@@ -232,6 +242,20 @@ impl Io for Fake {
                         MIN_DPM_FREQ => self.gfx_limits.0,
                         MAX_DPM_FREQ => self.gfx_limits.1,
                         TRANSFER_TO_DRIVER | REENABLE_ACDC_INTERRUPT => 0,
+                        ENABLE_FEATURES_LOW
+                        | ENABLE_FEATURES_HIGH
+                        | DISABLE_FEATURES_LOW
+                        | DISABLE_FEATURES_HIGH => {
+                            let shift = if value & 1 == 0 { 0 } else { 32 };
+                            let bits = u64::from(self.argument) << shift & !self.sticky;
+                            if value < DISABLE_FEATURES_LOW {
+                                self.running |= bits;
+                            } else {
+                                self.running &= !bits;
+                            }
+                            0
+                        }
+                        ALLOW_GFXOFF | DISALLOW_GFXOFF => 0,
                         GET_PPT_LIMIT => self.ppt_limit,
                         _ => panic!("unexpected SMU command"),
                     };
@@ -270,6 +294,7 @@ fn engine() -> Engine<Fake> {
             banks: true,
             fw_not_ready: 0,
             fw_reads: 0,
+            sticky: 0,
         },
         authority: Cap::bootstrap(),
         state: State::Prepared,
@@ -278,6 +303,7 @@ fn engine() -> Engine<Fake> {
         versions: None,
         limits: None,
         protection: None,
+        gating_allowed: 0,
     }
 }
 fn run<T>(future: impl Future<Output = T>) -> T {
@@ -1159,4 +1185,87 @@ fn smu_navi22_thermal_alert_programs_smu_v11_0_set_irq_state() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/smu-navi22",
     smu_navi22_thermal_alert_programs_smu_v11_0_set_irq_state
+);
+
+/// Opt-in gating bits: `smu_cmn_feature_update_enable_state` (Low then
+/// High) after the allowed mask, running set read back; GFXOFF messages only
+/// after FEATURE_GFXOFF; nothing outside GATING_FEATURES.
+fn smu_navi22_gating_features_follow_smu_cmn() -> TestResult {
+    use crate::amdgpu_navi22_power_policy::{SMU_DEEP_SLEEP, SMU_GFXOFF, SMU_HUB_PG};
+    let (mut e, _pool) = powered_engine(0x413f00);
+    // GFXOFF control is refused before the feature was enabled.
+    if run(e.gfx_off_control(true)) != Err(Error::Invalid) || !e.io.writes.is_empty() {
+        return TestResult::Fail("GFXOFF message before FEATURE_GFXOFF");
+    }
+    for bad in [0, 1 << 24, 1 << 33, SMU_GFXOFF | 1 << 1] {
+        if run(e.update_features(bad, true)) != Err(Error::Invalid) || !e.io.writes.is_empty() {
+            return TestResult::Fail("non-gating feature bits accepted");
+        }
+    }
+    let base = e.power_policy.unwrap().allowed();
+    let mask = SMU_GFXOFF | SMU_HUB_PG;
+    let running = match run(e.update_features(mask, true)) {
+        Ok(running) => running,
+        Err(_) => return TestResult::Fail("enable failed"),
+    };
+    let allowed = base | mask;
+    if commands(&e.io.writes)
+        != [
+            (ALLOWED_HIGH, (allowed >> 32) as u32),
+            (ALLOWED_LOW, allowed as u32),
+            (ENABLE_FEATURES_LOW, mask as u32),
+            (ENABLE_FEATURES_HIGH, (mask >> 32) as u32),
+            (RUNNING_LOW, 0),
+            (RUNNING_HIGH, 0),
+        ]
+        || running & mask != mask
+        || e.state != State::PowerReady
+        || e.gating_allowed != mask
+    {
+        return TestResult::Fail("enable protocol");
+    }
+    e.io.writes.clear();
+    run(e.gfx_off_control(false)).unwrap();
+    run(e.gfx_off_control(true)).unwrap();
+    if commands(&e.io.writes) != [(DISALLOW_GFXOFF, 0), (ALLOW_GFXOFF, 0)] {
+        return TestResult::Fail("smu_v11_0_gfx_off_control messages");
+    }
+    e.io.writes.clear();
+    run(e.update_features(SMU_HUB_PG, false)).unwrap();
+    if commands(&e.io.writes)
+        != [
+            (DISABLE_FEATURES_LOW, 0),
+            (DISABLE_FEATURES_HIGH, (SMU_HUB_PG >> 32) as u32),
+            (RUNNING_LOW, 0),
+            (RUNNING_HIGH, 0),
+        ]
+        || e.io.running & SMU_HUB_PG != 0
+        || e.io.running & SMU_GFXOFF == 0
+    {
+        return TestResult::Fail("disable protocol");
+    }
+    // A clean PMFW rejection leaves the owner usable.
+    e.io.reject = Some((ENABLE_FEATURES_LOW, 0xfe));
+    if run(e.update_features(SMU_DEEP_SLEEP, true)) != Err(Error::Rejected(0xfe))
+        || e.state != State::PowerReady
+    {
+        return TestResult::Fail("rejection");
+    }
+    e.io.reject = None;
+    // A feature that does not come up is reported and terminal.
+    // (The fake applied the rejected enable; PMFW would not have.)
+    e.io.running &= !SMU_DEEP_SLEEP;
+    e.io.sticky = SMU_DEEP_SLEEP;
+    if !matches!(
+        run(e.update_features(SMU_DEEP_SLEEP, true)),
+        Err(Error::Features { .. })
+    ) || e.state != State::Failed
+    {
+        return TestResult::Fail("feature mismatch was not terminal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    smu_navi22_gating_features_follow_smu_cmn
 );

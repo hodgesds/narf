@@ -168,6 +168,7 @@ pub mod amdgpu_dcn30_flip;
 pub mod amdgpu_dcn30_hdmi;
 pub mod amdgpu_dcn30_hubbub;
 pub mod amdgpu_dcn30_takeover;
+pub mod amdgpu_dcn30_watermarks;
 pub mod amdgpu_dcn401_clk;
 pub mod amdgpu_dcn401_dccg;
 pub mod amdgpu_dcn401_dml;
@@ -231,6 +232,7 @@ pub mod amdgpu_native_kms;
 pub mod amdgpu_navi22_bios;
 pub mod amdgpu_navi22_boot;
 pub mod amdgpu_navi22_display;
+pub mod amdgpu_navi22_gating;
 pub mod amdgpu_navi22_kms;
 pub mod amdgpu_navi22_modeset;
 #[cfg(feature = "kernel-test")]
