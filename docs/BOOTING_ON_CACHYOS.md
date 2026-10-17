@@ -172,6 +172,93 @@ does not copy or convert the installed CachyOS system. ext4 is the default
 because it is the most exercised persistent-root path. Use this only after the
 non-partitioned ISO has established that the machine reaches NARF at all.
 
+## RX 6750 XT bring-up boot
+
+Recipe for the Navi22 (RX 6750 XT, `03:00.0`) bring-up on the Gigabyte B650I
+AORUS ULTRA (BIOS F41). The console lives on the Raphael iGPU (`12:00.0`); the
+6750 XT is a secondary GPU whose cold boot cannot take the screen away. The
+stick saves the NARF kernel log to itself, so a failed boot can be read back
+under CachyOS. Nothing in this recipe writes to the NVMe disks.
+
+**Build** (no device access; the importer copies only the Navi22 blobs):
+
+```sh
+cargo xtask import-firmware --source /usr/lib/firmware \
+  --vendor amdgpu/navy_flounder --skip-existing
+cargo xtask usb-image --initramfs-firmware "amdgpu/navy_flounder*"
+```
+
+This writes `target/narf-x86_64-usb.img`: an MBR disk with one FAT32 ESP
+(label `NARFBOOT`) holding Limine, the kernel, an initramfs with the
+`navy_flounder` firmware (the Navi22 initcall runs before any root mount) and
+`/NARFLOG.ID`. The kernel command line gets `narf.bootlog=<random token>
+log_buf_len=8M` and no `quiet`. Add arguments with `--cmdline <arg>`
+(repeatable); build without the log with `--no-bootlog`. Adding `--qemu` also
+boots a copy of the image under OVMF as QEMU USB storage and prints the logs
+it wrote.
+
+**BIOS settings:**
+
+- *Settings → IO Ports → Initial Display Output*: **IGD Video**, so the UEFI
+  GOP, Limine and the NARF console are on the motherboard HDMI.
+- *Settings → IO Ports → Integrated Graphics*: **Enabled** (Auto can disable
+  the iGPU while a discrete card is installed).
+- *Boot → CSM Support*: **Disabled** (the stick is UEFI-only).
+- *Boot → Secure Boot*: **disabled** for this test, because the stick is
+  unsigned (see [UEFI Secure Boot](SECURE_BOOT.md)). This host currently
+  reports it disabled: `od -An -t u1
+  /sys/firmware/efi/efivars/SecureBoot-*` ends in `0`.
+- Choose the stick once from the boot menu (F12) instead of changing the boot
+  order, so CachyOS stays the default.
+
+**Cabling:** connect the monitor to the **motherboard HDMI**. A second cable
+from the monitor to the 6750 XT's HDMI is optional and matters only once
+native modeset lands. Attach a USB keyboard for the NARF shell.
+
+**Write the stick.** Identify it first. It must show `TRAN usb`:
+
+```sh
+lsblk -o NAME,SIZE,MODEL,TRAN,MOUNTPOINTS
+cargo xtask disk-write --iso target/narf-x86_64-usb.img \
+  --device /dev/sdX --fast-wipe
+```
+
+`disk-write` refuses non-USB targets, asks for confirmation, and verifies the
+written bytes after a replug. On this host the internal disks are `nvme0n1`
+(CachyOS), `nvme1n1` and the SATA disk `sda`. None of them is ever a valid
+`--device`.
+
+**What to expect on screen.** While the card boots, every Navi22 stage prints
+`start`, then `complete` or `failed <error>`. The cold boot ends with
+`amdgpu: navi22 stage summary (N/26 complete):` followed by one line per
+stage. If the screen stops changing, photograph it; the last `start` line
+names the stage that hung. Shortly after the shell appears, the console shows
+`bootlog: saving the kernel log to usb-msc0p1:/narf-boot-<n>.log`. To finish,
+type `reboot` in the NARF shell, which flushes the log one last time.
+Otherwise wait at least five seconds after the last line before powering off.
+
+**Retrieve the log** after booting back into CachyOS:
+
+```sh
+lsblk -o NAME,SIZE,TRAN,LABEL      # the NARFBOOT partition, e.g. sdX1
+udisksctl mount -b /dev/sdX1
+cp /run/media/$USER/NARFBOOT/narf-boot-*.log .
+udisksctl unmount -b /dev/sdX1
+```
+
+Each boot creates the next `narf-boot-<n>.log`, up to 32 files of at most
+4 MiB each; delete old ones to continue. Each line is prefixed with seconds
+since boot, as in `dmesg`. The kernel writes only to a USB FAT volume whose
+`/NARFLOG.ID` matches the token on its command line. To keep the stick
+read-only for one boot, press `e` in the Limine menu and change the argument
+to `narf.bootlog=off`.
+
+Limits: the stick becomes writable only once the USB stack runs, which is
+after the last boot initcall, including the 6750 XT cold boot. Lines logged
+before then are saved retroactively, but a hang *before* that point leaves
+only the screen. A kernel panic is appended in a final flush bounded at 3 s.
+A fatal CPU exception is not saved.
+
 ## Storage encryption and LUKS
 
 NARF has a real encrypted-block implementation, but that does not yet make an

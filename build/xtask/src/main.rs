@@ -38,6 +38,7 @@ mod http3_smoke;
 mod net_robust;
 mod passthrough;
 mod relocs;
+mod usb_image;
 
 #[derive(Parser)]
 #[command(author, version, about = "NARF build orchestrator")]
@@ -246,6 +247,11 @@ enum Cmd {
     /// + /bin/sh. Boot picks the root via `root=PARTLABEL=NARF_ROOT`
     /// on the kernel cmdline.
     DiskWritePartitioned(DiskWritePartitionedArgs),
+    /// Build a UEFI USB-stick image file (MBR + FAT32 ESP) with the
+    /// persistent boot log enabled (`narf.bootlog=<token>` + marker file).
+    /// Write it with `disk-write --iso <image>`; `--qemu` boots a copy as
+    /// QEMU USB storage and prints the logs it wrote.
+    UsbImage(usb_image::UsbImageArgs),
     /// Wrap a raw firmware payload with the NARF trailer
     /// (`firmware/specification/spec.md` §6). Accepts a detached signature
     /// and public key; omitting both produces a developer-only unsigned
@@ -12311,6 +12317,12 @@ fn main() -> Result<()> {
         }
         Cmd::DiskWrite(args) => disk_write_cmd(&args),
         Cmd::DiskWritePartitioned(args) => disk_write_partitioned_cmd(&args),
+        Cmd::UsbImage(mut args) => {
+            // Same kernel configuration as `xtask image`.
+            ensure_feature(&mut args.build.features, "boot-init");
+            ensure_feature(&mut args.build.features, "firmware-allow-unsigned");
+            usb_image::usb_image_cmd(&args)
+        }
         Cmd::PackFirmware(args) => pack_firmware_cmd(&args),
         Cmd::ImportFirmware(args) => import_firmware_cmd(&args),
         Cmd::Demo(mut args) => {

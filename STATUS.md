@@ -951,6 +951,11 @@ reached through VMID0, MSI-X/MSI delivery with polling fallback, and
 overflow-safe task-context drains. It routes IVs to generation-tagged
 subscribers that receive a terminal error on device loss. Boot enables it
 after the memory hubs and proves delivery with an SDMA0 TRAP.
+For bare-metal runs, `cargo xtask usb-image` builds a UEFI stick whose kernel
+appends its log to `/narf-boot-<n>.log` on that stick (`narf.bootlog=`,
+marker-gated, USB-only, bounded); a secondary card's cold boot keeps the iGPU
+console live and ends with a per-stage summary (see
+[docs/BOOTING_ON_CACHYOS.md](docs/BOOTING_ON_CACHYOS.md#rx-6750-xt-bring-up-boot)).
 These are software-tested foundations; training resume,
 VCN startup, display-aware DPM and OS thermal interrupt handling,
 hardware boot, general GPU mappings/GFX10 queue initialization, production
