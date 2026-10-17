@@ -44,16 +44,16 @@ const PATH_SIZE: usize = 16; // linux: sizeof(struct atom_display_object_path_v2
                              // linux: offsetof(struct display_object_info_table_v1_4, display_path)
 const PATHS_OFFSET: usize = 8;
 /// `ObjectID.h` object-id encoding.
-// linux: n/a (amdgpu/ObjectID.h OBJECT_ID_MASK 0x00FF; header not in checker set)
+// linux: OBJECT_ID_MASK
 const OBJECT_ID_MASK: u16 = 0x00ff;
-// linux: n/a (amdgpu/ObjectID.h ENUM_ID_SHIFT 0x08; header not in checker set)
+// linux: ENUM_ID_SHIFT
 const ENUM_ID_SHIFT: u32 = 8;
-// linux: n/a (MISMATCH: amdgpu/ObjectID.h ENUM_ID_MASK = 0x0700; header not in checker set)
-const ENUM_ID_MASK: u16 = 0x0f00;
-// linux: n/a (amdgpu/ObjectID.h OBJECT_TYPE_SHIFT 0x0C; header not in checker set)
+// linux: ENUM_ID_MASK
+const ENUM_ID_MASK: u16 = 0x0700;
+// linux: OBJECT_TYPE_SHIFT
 const OBJECT_TYPE_SHIFT: u32 = 12;
-// linux: n/a (MISMATCH: amdgpu/ObjectID.h OBJECT_TYPE_MASK = 0x7000; header not in checker set)
-const OBJECT_TYPE_MASK: u16 = 0xf000;
+// linux: OBJECT_TYPE_MASK
+const OBJECT_TYPE_MASK: u16 = 0x7000;
 const TYPE_ENCODER: u16 = 0x02; // linux: OBJECT_TYPE_ENCODER@dc
 const TYPE_CONNECTOR: u16 = 0x03; // linux: OBJECT_TYPE_CONNECTOR@dc
 /// `atom_common_record_header` is two bytes, and `atom_hpd_int_record` adds the
@@ -277,13 +277,13 @@ fn transmitter(encoder_objid: u16) -> Result<u8, Error> {
     // UNIPHY (0x1e), UNIPHY1 (0x20) and UNIPHY2 (0x21) each pair two
     // transmitters; UNIPHY3 (0x25) carries only G.
     let (pair, enums) = match encoder_objid & OBJECT_ID_MASK {
-        // linux: n/a (amdgpu/ObjectID.h ENCODER_OBJECT_ID_INTERNAL_UNIPHY 0x1E; not in checker set)
+        // linux-lit: 0x1e=ENCODER_OBJECT_ID_INTERNAL_UNIPHY
         0x1e => (0, 2),
-        // linux: n/a (amdgpu/ObjectID.h ENCODER_OBJECT_ID_INTERNAL_UNIPHY1 0x20; not in checker set)
+        // linux-lit: 0x20=ENCODER_OBJECT_ID_INTERNAL_UNIPHY1
         0x20 => (1, 2),
-        // linux: n/a (amdgpu/ObjectID.h ENCODER_OBJECT_ID_INTERNAL_UNIPHY2 0x21; not in checker set)
+        // linux-lit: 0x21=ENCODER_OBJECT_ID_INTERNAL_UNIPHY2
         0x21 => (2, 2),
-        // linux: n/a (amdgpu/ObjectID.h ENCODER_OBJECT_ID_INTERNAL_UNIPHY3 0x25; not in checker set)
+        // linux-lit: 0x25=ENCODER_OBJECT_ID_INTERNAL_UNIPHY3
         0x25 => (3, 1),
         _ => return Err(Error::Unsupported),
     };
