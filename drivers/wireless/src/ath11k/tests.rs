@@ -708,6 +708,23 @@ fn smoke_ath11k_step_codes_unique_and_in_range() -> TestResult {
                 super::htt::step::VERSION_TIMEOUT,
             ],
         ),
+        (
+            "dp_peer",
+            230,
+            249,
+            &[
+                super::dp_peer::step::PEER_NOT_FOUND,
+                super::dp_peer::step::QDESC_ALLOC,
+                super::dp_peer::step::REO_CMD_RING_FULL,
+                super::dp_peer::step::REO_CMD_SHUTDOWN,
+                super::dp_peer::step::REO_CMD_UNSUPPORTED,
+                super::dp_peer::step::REO_CMD_UNKNOWN,
+                super::dp_peer::step::REO_CMD_NUM_ZERO,
+                super::dp_peer::step::REO_CMD_NO_BLOCK_RES,
+                super::dp_peer::step::BAD_TID,
+                super::dp_peer::step::WMI_SEND,
+            ],
+        ),
     ];
     let mut seen: Vec<u32> = Vec::new();
     for &(_name, lo, hi, codes) in layers {

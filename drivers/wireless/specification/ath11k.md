@@ -548,7 +548,89 @@ peer-assoc-conf timeout, 4-way MIC failure / timeout / RSN mismatch,
 key install status / timeout, kickout, beacon loss, deauth RX, 11d new
 country).
 
+### 3.10 Peer REO queues + REO commands (`dp_peer.rs`, Linux `dp.c`, `dp_rx.c`, `dp_tx.c`, `hal_rx.c`)
+
+State lives in `Dp::peer_rx` (`DpPeerRx`): per HTT-mapped peer
+(`ath11k_peer_find` = `Dp::peers` by vdev + MAC) 17 `RxTid`s (TID 0..15
++ non-QoS 16), `reo_cmd_list`, `cache_flush_list` (+ count), the
+blocking-slot state, `stranded`, `stats`. WMI commands are returned,
+never sent (the core owns the WMI endpoint, the CE owns the HAL), so the
+mac layer interleaves in Linux's order:
+
+1. `ath11k_mac_station_add` (sta_state NOTEXIST → NONE), right after
+   `ath11k_peer_create` (peer HTT-mapped) and the mesh 4-addr param:
+   `let (mut op, cmd) = dp.peer_setup_begin(vdev_id, addr, mac_id)` →
+   send `cmd` (`WMI_PEER_SET_DEFAULT_ROUTING` = `DP_RX_HASH_ENABLE |
+   (mac_id + 1) << 1`; failure: return it) → `while let Some(cmd) =
+   dp.peer_setup_next(hal, io, &mut op, now)? { send cmd, on failure
+   return dp.peer_setup_wmi_failed(hal, io, &op, errno, now) }`. Each
+   step is one `ath11k_peer_rx_tid_setup(tid, ba 1, ssn 0, PN none)`:
+   a fresh queue (`hal_reo_qdesc_size(256, tid)` / `(ba, 16)` bytes,
+   128-aligned DMA32, `hal_reo_qdesc_setup`) or, when it exists, REO
+   UPDATE_RX_QUEUE (window + SSN); then its
+   `WMI_PEER_REORDER_QUEUE_SETUP_CMDID`. Failures unwind as
+   `ath11k_dp_peer_setup`'s `peer_clean` (fresh TID freed, TIDs t..0
+   deleted). The last step is the frag setup (`dp_setup_done`).
+2. `ath11k_mac_station_remove` (NONE → NOTEXIST), before
+   `ath11k_peer_delete`: `dp.peer_cleanup(hal, io, vdev_id, addr, now)`
+   (`ath11k_dp_peer_cleanup`): REO UPDATE_RX_QUEUE with VLD cleared per
+   active TID, handler `TidDel`. No WMI (Linux never sends
+   `WMI_PEER_REORDER_QUEUE_REMOVE_CMDID`; `wmi::rx_reord_queue_remove_cmd`
+   exists for completeness). `peer_cleanup_all` =
+   `ath11k_mac_peer_cleanup_all`.
+3. Every REO status: `dp.reo_status_handler(hal, io,
+   &out.reo_status, now)` after `service_srng` (or
+   `process_reo_status_and_dispatch`). Matched by command number:
+   `TidDel` = `ath11k_dp_rx_tid_del_func` (DRAIN → free; other non-success
+   → kept; success → `cache_flush_list`, entries older than 1000 ms or
+   beyond 64 are flushed: FLUSH_CACHE per 128-byte block from the end
+   without status, then the first with status → `CmdFree` =
+   `ath11k_dp_reo_cmd_free` frees).
+4. `ath11k_mac_op_ampdu_action`: RX_START → `dp.ampdu_start(.., tid,
+   buf_size, ssn, pn_type, now)` → send its `cmd` (failure:
+   `dp.rx_tid_wmi_failed`); RX_STOP → `dp.ampdu_stop(..)` → send the
+   returned command if any.
+5. `ath11k_dp_free` → `dp.reo_cmd_list_cleanup()`.
+
+Encoders: `hal_reo_qdesc_size`, `hal_reo_qdesc_setup` (words),
+`hal_reo_cmd_desc` (TLV + 9-word body of GET_QUEUE_STATS / FLUSH_CACHE /
+UPDATE_RX_QUEUE; the ring's pre-written command number kept),
+`wmi::peer_rx_reorder_queue_setup_cmd` (40 B),
+`wmi::rx_reord_queue_remove_cmd` (20 B). `Dp::send_reo_cmd` =
+`ath11k_dp_tx_send_reo_cmd` + `ath11k_hal_reo_cmd_send` (crash flush →
+`-ESHUTDOWN`, ring full → `-ENOBUFS`, shadow timer armed). HTT PEER_UNMAP
+drops the peer's RX state (queues kept in `stranded`, Linux leaks them).
+Steps 230–239 (`dp_peer::step`), returned, not latched.
+
+Tests: `dp_peer_tests.rs` — qdesc size table and descriptor goldens
+(TID 0 ba 1 / ba 64, WPA, ba 256, non-QoS), every REO command
+descriptor, WMI reorder setup / remove bytes, a full peer setup against
+the device view of the queues, the update path (double setup, ADDBA),
+teardown with deferred free (1000 ms ageing, strict `time_after`, 64
+threshold, block flush order, free on status, list cleanup), status
+dispatch negatives (unknown number, FAILED / BLOCKED, DRAIN, no handler,
+failed flush), REO ring full / rejected types / crash flush, setup
+unwinding (unknown peer, routing / TID WMI failure, update-path failure,
+ring full mid-setup), ADDBA stop, HTT unmap + re-map.
+
 ## 4. Invariants
+
+- Failure-step codes (`wifi: <stage> FAILED step=N` on the panel) are
+  one namespace; each layer owns a disjoint range, pinned by
+  `smoke_ath11k_step_codes_unique_and_in_range`:
+
+  | Range | Layer (`<module>::step`) |
+  |---|---|
+  | 1–9 | `pci` (identify, power-up, MSI) |
+  | 10–39 | `mhi_host` |
+  | 40–79 | `wlfw` (QRTR / QMI handshake) |
+  | 80–89 | `hal` |
+  | 90–119 | `ce` |
+  | 120–149 | `core` (HTC / WMI bring-up) |
+  | 150–199 | `mac` (scan / connect) |
+  | 200–219 | `dp_ring` |
+  | 220–229 | `htt` |
+  | 230–249 | `dp_peer` (REO queues / commands) |
 
 - The PCI table is exactly Linux's `ath11k_pci_id_table`.
 - The driver never reports a wireless capability it does not have:
@@ -566,7 +648,7 @@ card (QEMU emulates none) is exercised once, after phase 8.
 | 2 | MHI host: context arrays, event rings, BHI SBL (512 KiB) + BHIe full image, EE/state machine to mission mode, IPCR ch 20/21 (**done**, offline) | `mhi.c`, `bus/mhi/host/*` |
 | 3 | QRTR over MHI + QMI encode/decode; WLFW handshake: host cap, ind register, respond mem, target cap, BDF (`board-2.bin` by bus/qmi-chip-id/board-id), M3 (`m3.bin`), regdb, wlan cfg, mode ON (**done** to FW_READY, offline; `firmware_start` waits for the CE shadow list) | `qmi.c`, `net/qrtr`, `soc/qcom/qmi_*` |
 | 4 | Copy Engines + HTC + WMI: service ready, init, ready; MAC from firmware (**done, offline**: HAL SRNG core, CE pipes, shadow v2 list, HTC/WMI codecs, `core.rs` bring-up to WMI READY + SET_HW_MODE DBS; DP hooks no-op) | `core.c`, `hal.c`, `ce.c`, `htc.c`, `wmi.c` |
-| 5 | DP rings (TCL, REO, WBM, RXDMA refill) on the HAL (descriptor layouts, ring runtime, HTT ring setup / filters / version / peer map **done, offline**; wiring into bring-up open) | `hal*.c`, `dp.c`, `dp_tx.c` (HTT) |
+| 5 | DP rings (TCL, REO, WBM, RXDMA refill) on the HAL (descriptor layouts, ring runtime, HTT ring setup / filters / version / peer map, per-peer REO TID queues + REO command ring **done, offline**; wiring into bring-up open) | `hal*.c`, `dp.c`, `dp_tx.c` (HTT), `dp_rx.c` (rx_tid) |
 | 6 | Control: pdev/vdev, regulatory, scan → `BssInfo` list (**done, offline**: `mac.rs` behind `WmiPort`/`DataPort`; core wiring open) | `mac.c`, `wmi.c`, `reg.c` |
 | 7 | Connect: peer, auth/assoc via mgmt TX, EAPOL via `narf-wireless` supplicant, key install (**done, offline** for Open + WPA2-PSK/CCMP; SAE open) | `mac.c`, `wmi.c` |
 | 8 | Data path: TX (TCL → WBM completion), RX (REO dst → `Frame`); register `wlan%d` (TX / completion / RX reap + decap to Ethernet **done, offline** in `dp_ring.rs`; interface registration open) | `dp_tx.c`, `dp_rx.c` |
@@ -685,10 +767,8 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   stranded (removed from the IDR, not reposted) as in Linux.
 - DP not ported: WBM idle scatter list (dead for WBM_IDLE_LINK: > 2 MiB
   of 8-byte entries needs > 8 banks, which `ath11k_dp_link_desc_setup`
-  rejects first), REO TID queues + REO commands (until they exist,
-  unicast RX arrives through WBM `DESC_ADDR_ZERO` and is delivered by
-  the null-queue path, as Linux does before `ath11k_peer_rx_tid_setup`),
-  fragment reassembly, monitor / full-monitor rings, PPDU / peer TX-RX
+  rejects first), fragment reassembly (`ath11k_peer_rx_frag_setup` is its
+  peer lookup + `dp_setup_done` only), monitor / full-monitor rings, PPDU / peer TX-RX
   statistics, ring teardown (`ath11k_dp_free`; a failed `Dp::alloc`
   leaves its rings in the HAL, so a retry needs a new `Hal`).
 - Open (integration): HTT endpoint plumbing (HTC `HTT_DATA_MSG` →
@@ -697,6 +777,22 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   `service_srng`, the shadow-timer tick, vdev encap/decap WMI params
   (`TX_ENCAP_TYPE` / `RX_DECAP_TYPE`), and where `wlan%d` sits on
   `RxMsdu::frame`.
+- Peer REO deviations from Linux (deliberate, device-invisible): a queue
+  descriptor Linux frees after a REO command could not be queued (ring
+  full / crash flush) while the hardware may still hold it is kept in
+  `DpPeerRx::stranded`; unsupported / unknown REO command types and
+  FLUSH_CACHE BLOCK_LATER without a slot are refused before a ring entry
+  is taken (Linux takes it and publishes a stale entry; no ath11k caller
+  reaches either); the FLUSH_CACHE / UNBLOCK_CACHE status side of
+  `avail_blk_resource` is not tracked (no caller sets BLOCK_LATER);
+  TID > 16 is refused (Linux indexes out of bounds); queue memory is
+  coherent DMA32 (Linux `dma_alloc_noncoherent` + sync). Linux quirk
+  kept: `ath11k_dp_rx_ampdu_stop` REO-updates `peer->rx_tid` (TID 0's
+  queue) to window 1 whichever TID stops, then sends the WMI for the
+  stopped TID.
+- Open (peer REO integration): the mac layer must call the steps of
+  §3.9 at the Linux call sites and feed `DpServiceOutput::reo_status` to
+  `reo_status_handler` with a millisecond clock.
 - Firmware: `cargo xtask import-firmware --vendor ath11k`
   decompresses the distro `.zst` blobs at image build time. Open:
   whether probe runs before the rootfs firmware scan, i.e. whether

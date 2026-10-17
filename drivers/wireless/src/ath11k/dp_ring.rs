@@ -37,12 +37,14 @@
 //! Ethernet-II decap is passed through. Linux instead rebuilds 802.11
 //! for mac80211 (`ath11k_dp_rx_h_undecap_*`); NARF has no mac80211.
 //!
-//! Not ported: the WBM idle-list scatter setup (needs > 2 MiB of idle
-//! entries; WCN6855 needs 256 KiB), REO TID queues / REO commands
-//! (`ath11k_peer_rx_tid_setup`, `ath11k_hal_reo_cmd_send` — without
-//! them every unicast frame arrives through the WBM error path as
+//! Per-peer REO TID queues and REO commands live in
+//! [`super::dp_peer`] (state in [`Dp::peer_rx`]); until a peer's queues
+//! are set up, its unicast frames arrive through the WBM error path as
 //! `REO_DEST_RING_ERROR_CODE_DESC_ADDR_ZERO`, which Linux and NARF both
-//! deliver), RX defragmentation, monitor rings, PPDU / peer stats, TX
+//! deliver.
+//!
+//! Not ported: the WBM idle-list scatter setup (needs > 2 MiB of idle
+//! entries; WCN6855 needs 256 KiB), RX defragmentation, monitor rings, PPDU / peer stats, TX
 //! rate statistics, ring teardown (`ath11k_dp_free`).
 
 #![allow(dead_code)]
@@ -968,6 +970,8 @@ pub struct Dp {
     /// `ATH11K_FLAG_CRASH_FLUSH`.
     pub crash_flush: bool,
     pub stats: DpStats,
+    /// Per-peer REO queues + pending REO commands (`dp_peer`).
+    pub peer_rx: super::dp_peer::DpPeerRx,
 }
 
 fn dp_err(step: u32, detail: u32, errno: i32) -> TransportError {
@@ -1557,6 +1561,7 @@ impl Dp {
             peers: Vec::new(),
             crash_flush: false,
             stats: DpStats::default(),
+            peer_rx: super::dp_peer::DpPeerRx::default(),
         })
     }
 
@@ -1940,6 +1945,7 @@ impl Dp {
                 match self.peers.iter().position(|p| p.peer_id == peer_id) {
                     Some(i) => {
                         self.peers.remove(i);
+                        self.peer_rx.peer_unmapped(peer_id);
                     }
                     None => self.stats.htt_peer_unmap_unknown += 1,
                 }
@@ -3016,8 +3022,8 @@ impl Dp {
     }
 
     /// Linux `ath11k_dp_process_reo_status`: the uniform header of every
-    /// status entry (no REO commands are issued yet, so nothing is
-    /// matched against a pending command list).
+    /// status entry. Matching against the pending command list is
+    /// `Dp::reo_status_handler` (`dp_peer`).
     pub fn process_reo_status(&mut self, hal: &mut Hal, io: &impl ChipIo) -> Vec<ReoStatus> {
         let id = self.reo_status_ring.ring_id;
         let mut out = Vec::new();
