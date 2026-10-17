@@ -379,6 +379,9 @@ Navi22 display AUX/DDC/HPD is now native, as Linux drives DCN3.0
 for HDMI DDC/SCDC, and HPD sense/filter/ack. After firmware readiness the boot
 logs every board connector's HPD state and EDID. DMUB AUX/HPD is refused unless
 explicitly allowed. Register models only; no physical EDID read yet.
+A native DCN3.0 DML port (`amdgpu_dml30`) admits one unscaled linear plane
+and derives DLG/TTU/RQ and HUBBUB watermark values, checked against host
+vectors computed from the Linux DML30 formulas.
 These are software-tested foundations; training resume,
 VCN startup, display-aware DPM and OS thermal interrupt handling,
 hardware boot, general GPU mappings/GFX10 queue initialization, production

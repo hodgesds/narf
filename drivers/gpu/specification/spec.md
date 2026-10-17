@@ -631,6 +631,27 @@ firmware answered QUERY_FEATURE_CAPS: Linux never routes DCN3.0 AUX/HPD through
 DMUB (`dc_is_dmub_outbox_supported` is false outside DCN3.1 DPIA/GC11 unless
 `enable_dmub_aux_for_legacy_ddc`), and `dmub_feature_caps` has no AUX bit.
 
+### Navi 22 DCN3.0 mode math
+
+`amdgpu_dml30::plan(&Config, &Soc) -> Result<Plan, Error>` is the DCN3.0
+`display_mode_vba_30.c` performance calculation plus `display_rq_dlg_calc_30.c`
+encoding for one unscaled linear RGB plane on one pipe (GPUVM/HostVM, DCC,
+dynamic metadata, cursor, writeback, ODM/MPC split off), with `dcn3_0_ip` /
+`dcn3_0_soc` constants (184 KiB DET, 84 PTE requests, 191-cycle ping, 404 us
+p-state, 15.5/20 us self refresh, fabric-adjusted urgent latency) in
+`amdgpu_dml::Fx` fixed point. `Soc` carries the board's DCFCLK/fabric/SOCCLK,
+`memclk*16` DRAM rate, VBIOS channel count/width, clock ceilings, DENTIST VCO
+and DCHUB reference. It tries prefetch modes 0..2 and VStartup from 13 to
+`vtotal - vactive - 1` with Linux's bandwidth, urgent-burst, two-line and
+VRatio<=4 checks, and returns `Plan { prefetch_mode, geometry, clocks,
+watermarks, prefetch, registers: amdgpu_dml_regs::Registers, hubbub:
+WatermarkSet (refclk cycles, `convert_and_clamp`), dram_clock_change,
+urgent_bandwidth_thousandths }`. Register fields are Linux's `(unsigned int)`
+truncations and are refused (not wrapped) when they exceed the DCN3.0 mask.
+Out-of-scope planes, PHY/display-clock overruns and unschedulable blanks fail
+before any hardware is touched. Host vectors from a double transliteration of
+the Linux formulas are checked to one LSB.
+
 ### Navi 22 native AUX, DDC and HPD
 
 `unsafe amdgpu_dcn30_ddc::Ddc::new(gpu, pci_cap, crystal_khz)` claims all six DCN3.0 AUX

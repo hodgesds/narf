@@ -172,6 +172,7 @@ pub mod amdgpu_ddc;
 pub mod amdgpu_dio;
 pub mod amdgpu_discovery;
 pub mod amdgpu_dml;
+pub mod amdgpu_dml30;
 pub mod amdgpu_dml_regs;
 pub mod amdgpu_dmub;
 pub mod amdgpu_dmub_boot;
