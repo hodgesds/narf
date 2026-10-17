@@ -307,13 +307,21 @@ impl Takeover<'_> {
     /// (`OPTC_NUM_OF_INPUT_SEGMENT == 1`, unless VBIOS left SEG1 at 0xf),
     /// segment 1.
     fn optc_source(&mut self, pipe: u8) -> Result<(u8, Option<u8>), Error> {
+        let (seg0, seg1, segments) = self.optc_source_fields(pipe)?;
+        let two = segments == 1 && seg1 != 0xf;
+        Ok((seg0, two.then_some(seg1)))
+    }
+    /// The raw `OPTC_DATA_SOURCE_SELECT` fields `optc2_get_optc_source`
+    /// reads: SEG0, SEG1 and NUM_OF_INPUT_SEGMENT. `src_opp_id_1` comes back
+    /// whatever the segment count, and `dcn10_init_pipes` compares DSC
+    /// sources against it unconditionally.
+    fn optc_source_fields(&mut self, pipe: u8) -> Result<(u8, u8, u32), Error> {
         let source = self
             .regs
             .read(self.d2(ODM_DATA_SOURCE_SELECT + u64::from(pipe) * ODM_STRIDE))?;
         let seg0 = ((source & OPTC_SEG0_SRC_SEL) >> OPTC_SEG0_SRC_SEL.trailing_zeros()) as u8;
         let seg1 = ((source & OPTC_SEG1_SRC_SEL) >> OPTC_SEG1_SRC_SEL.trailing_zeros()) as u8;
-        let two = source & OPTC_NUM_OF_INPUT_SEGMENT == 1 && seg1 != 0xf;
-        Ok((seg0, two.then_some(seg1)))
+        Ok((seg0, seg1, source & OPTC_NUM_OF_INPUT_SEGMENT))
     }
     async fn init_blank(&mut self, pipe: u8) -> Result<(), Error> {
         let (opp, bottom) = self.optc_source(pipe)?;
@@ -476,8 +484,10 @@ impl Takeover<'_> {
                 .regs
                 .read(self.d2(ODM_DATA_FORMAT_CONTROL + u64::from(pipe) * ODM_STRIDE))?;
             if format & OPTC_DSC_MODE != 0 {
-                let (seg0, seg1) = self.optc_source(pipe)?;
-                sources = (Some(seg0), seg1);
+                // dcn10_init_pipes keeps a DSC fed from opp_id_src1 even
+                // for a one-segment OTG (SEG1 = 0xf matches no DSC).
+                let (seg0, seg1, _) = self.optc_source_fields(pipe)?;
+                sources = (Some(seg0), Some(seg1));
                 break;
             }
         }
