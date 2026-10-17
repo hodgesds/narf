@@ -10640,3 +10640,75 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_block_group_tree_requires_no_holes
 );
+
+/// Block groups of a block-group-tree filesystem are read from tree 11: the
+/// extent tree carries none, each one maps its chunk, their `used` sums to the
+/// superblock's `bytes_used`, and the allocator's system-group exclusion sees
+/// them (Linux `btrfs_read_block_groups` via `btrfs_block_group_root`).
+fn smoke_btrfs_block_group_tree_read() -> TestResult {
+    let vol = match mount_writable_ro(writable_sparse(FIXTURE_BGT_SPARSE)) {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("block-group-tree fixture did not mount"),
+    };
+    let bgs = match poll_once(crate::block_group::live_block_groups(&vol)) {
+        Some(Ok(bgs)) => bgs,
+        _ => return TestResult::Fail("could not read block groups from tree 11"),
+    };
+    let flags = |body: &[u8]| format::le64(body, 16).unwrap_or(0);
+    let kinds = [
+        format::BLOCK_GROUP_DATA,
+        format::BLOCK_GROUP_METADATA,
+        format::BLOCK_GROUP_SYSTEM,
+    ];
+    if bgs.len() < 3
+        || kinds
+            .iter()
+            .any(|k| !bgs.iter().any(|(_, _, b)| flags(b) & k != 0))
+    {
+        return TestResult::Fail("tree 11 lacks a data, metadata or system block group");
+    }
+    for &(start, len, _) in &bgs {
+        if vol.logical_chunk_remaining(start) != Ok(len) {
+            return TestResult::Fail("a tree-11 block group does not match its chunk");
+        }
+    }
+    let used: u64 = bgs
+        .iter()
+        .map(|(_, _, b)| format::le64(b, 0).unwrap_or(0))
+        .sum();
+    if used != vol.superblock().bytes_used {
+        return TestResult::Fail("tree-11 block group used != superblock bytes_used");
+    }
+    let root_tree = vol.root_tree_root().0;
+    let ext = match poll_once(crate::roots::find_root(
+        &vol,
+        root_tree,
+        format::EXTENT_TREE_OBJECTID,
+    )) {
+        Some(Ok((ext, _))) => ext,
+        _ => return TestResult::Fail("extent tree root missing"),
+    };
+    match poll_once(crate::block_group::read_block_groups(&vol, ext)) {
+        Some(Ok(in_ext)) if in_ext.is_empty() => {}
+        _ => return TestResult::Fail("extent tree unexpectedly holds block group items"),
+    }
+    let sys: Vec<(u64, u64)> = bgs
+        .iter()
+        .filter(|(_, _, b)| flags(b) & format::BLOCK_GROUP_SYSTEM != 0)
+        .map(|&(s, l, _)| (s, l))
+        .collect();
+    match poll_once(crate::allocator::Allocator::build(&vol)) {
+        Some(Ok(crate::allocator::Allocator::Reclaim { ranges })) => {
+            if ranges
+                .iter()
+                .any(|&(r, _)| sys.iter().any(|&(s, l)| r >= s && r < s + l))
+            {
+                return TestResult::Fail("allocator offered system block group space");
+            }
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("allocator did not build from the free-space tree"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_block_group_tree_read);

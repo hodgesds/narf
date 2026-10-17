@@ -36,6 +36,16 @@ pub(crate) enum BgHome {
     BlockGroupTree { root: u64, level: u8 },
 }
 
+impl BgHome {
+    /// The tree to scan for block group items, given the extent tree root.
+    pub(crate) fn scan_root(self, extent_root: u64) -> u64 {
+        match self {
+            BgHome::ExtentTree => extent_root,
+            BgHome::BlockGroupTree { root, .. } => root,
+        }
+    }
+}
+
 /// Resolve where block group items live for the root tree at `root_tree`
 /// (Linux `btrfs_block_group_root`). A block-group-tree filesystem whose root
 /// tree lacks the objectid-11 `ROOT_ITEM` is corrupt: Linux `load_global_roots`
@@ -52,6 +62,43 @@ pub(crate) async fn bg_home<B: BlockDevice + 'static>(
         Err(FsError::NotFound) => Err(FsError::InvalidData),
         Err(error) => Err(error),
     }
+}
+
+/// Every `BLOCK_GROUP_ITEM` reachable from `tree` as `(start, len, body)`, in
+/// key order. `tree` is the extent tree or the block-group tree.
+pub(crate) async fn read_block_groups<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    tree: u64,
+) -> Result<Vec<(u64, u64, Vec<u8>)>, FsError> {
+    let mut cursor = Cursor::seek(vol, tree, &BtrfsKey::new(0, 0, 0)).await?;
+    let mut out = Vec::new();
+    while let Some((k, body)) = cursor.current()? {
+        if k.item_type == format::BLOCK_GROUP_ITEM_KEY {
+            if body.len() < BLOCK_GROUP_ITEM_SIZE {
+                return Err(FsError::InvalidData);
+            }
+            out.push((k.objectid, k.offset, body.to_vec()));
+        }
+        cursor.advance().await?;
+    }
+    Ok(out)
+}
+
+/// Block groups of the live filesystem, from whichever tree holds them.
+#[cfg(feature = "kernel-test")]
+pub(crate) async fn live_block_groups<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Result<Vec<(u64, u64, Vec<u8>)>, FsError> {
+    let (root_tree, _) = vol.root_tree_root();
+    let tree = match bg_home(vol, root_tree).await? {
+        BgHome::BlockGroupTree { root, .. } => root,
+        BgHome::ExtentTree => {
+            roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
+                .await?
+                .0
+        }
+    };
+    read_block_groups(vol, tree).await
 }
 
 /// Mount-time cross-check of block groups against chunks, as Linux
