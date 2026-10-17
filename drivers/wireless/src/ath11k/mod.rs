@@ -45,6 +45,7 @@ pub mod board;
 pub mod ce;
 pub mod core;
 pub mod dp;
+pub mod dp_ring;
 pub mod hal;
 pub mod htc;
 pub mod htt;
@@ -78,6 +79,8 @@ pub fn register() {
 pub mod ce_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod core_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod dp_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod hal_tests;
 #[cfg(any(test, feature = "kernel-test"))]
