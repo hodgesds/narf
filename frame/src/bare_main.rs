@@ -3143,6 +3143,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // PCI probe lives in Stage::Device — it binds every
             // driver registered by Subsys above.
             narf_init::register(narf_init::Stage::Device, "pci-probe-all", || {
+                // Resolve (and log) `narf.disks=` before any storage driver
+                // binds and registers a disk. The block layer would resolve
+                // it lazily on first use anyway; this pins the console line.
+                narf_block::disk_policy::init_from_cmdline();
                 let auth = narf_bus::bootstrap_registry_authority();
                 match narf_bus::probe_all_pci(&auth) {
                     Ok(n) => {
@@ -3574,6 +3578,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     Err(narf_filesystem::root_mount::RootMountError::NoMountable) => {
                         narf_init::InitResult::NotPresent
                     }
+                    Err(narf_filesystem::root_mount::RootMountError::BootOnly) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  efi-mount: skipped: narf.disks=boot-only and no ESP on the boot medium",
+                        );
+                        narf_init::InitResult::NotPresent
+                    }
                     Err(error) => {
                         let _ = writeln!(
                             console::Writer,
@@ -3630,7 +3641,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 }
 
                 let session_writable_root = narf_boot::args().has_flag("systemd_pid1");
-                let devices = narf_block::block_devices();
+                // `narf.disks=boot-only`: never mount a disk other than the
+                // identified boot medium (on a laptop the first ext volume is
+                // typically the internal disk).
+                let (devices, skipped_by_policy) = narf_filesystem::root_mount::automount_devices();
                 let mut mounted = false;
                 for entry in &devices {
                     let dev = entry.dev.clone();
@@ -3707,6 +3721,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 if mounted {
                     narf_init::InitResult::Ok
                 } else {
+                    if skipped_by_policy != 0 {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  mnt-mount-ext2: skipped {} device(s): narf.disks=boot-only",
+                            skipped_by_policy
+                        );
+                    }
                     narf_init::InitResult::NotPresent
                 }
             });

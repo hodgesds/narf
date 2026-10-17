@@ -441,6 +441,9 @@ impl FileOps for DriCardFile {
                 Err(FsError::Unsupported) => {}
                 result => return result,
             }
+            if let Some(result) = crate::drm_ioctl_bridge::without_kms(self.index, cmd, arg) {
+                return result;
+            }
         }
         crate::drm_ioctl_bridge::dispatch_card_for_file(
             self.index,
@@ -481,6 +484,13 @@ impl FileOps for DriCardFile {
                     .is_some_and(|state| state.lock().is_master(self.open_id))
             {
                 crate::drm_ioctl_bridge::wait_atomic_in_fences(arg, context)?;
+            }
+            // drm_getclient, which libdrm's amdgpu_get_auth issues on every
+            // primary node before anything else.
+            if cmd == crate::drm_ioctl_bridge::DRM_IOCTL_GET_CLIENT {
+                let authenticated = crate::drm_registry::mode_state(self.index)
+                    .is_some_and(|m| m.lock().is_master(self.open_id));
+                return crate::drm_ioctl_bridge::get_client(arg, context, authenticated);
             }
             // A blocking vblank wait sleeps until its vblank.
             if crate::drm_ioctl_bridge::is_wait_vblank_ioctl(cmd) {
@@ -550,6 +560,9 @@ impl FileOps for DriCardFile {
         if let Some(lease) = retain_dumb_mapping(self.index, offset, len) {
             return Some(lease as Arc<dyn MmapLifetime>);
         }
+        if let Some(object) = self.amdgpu_gem.mmap_owner(offset) {
+            return Some(object as Arc<dyn MmapLifetime>);
+        }
         if crate::drm_registry::driver_name(self.index) != Some("virtio_gpu") {
             return None;
         }
@@ -566,6 +579,9 @@ impl FileOps for DriCardFile {
     }
 
     fn drm_prime_export_file(&self, gem_handle: u32) -> Result<Arc<dyn FileOps>, FsError> {
+        if let Some(file) = amdgpu_export(&self.amdgpu_gem, gem_handle) {
+            return Ok(file);
+        }
         let Some(resource) = self.virtgpu.export_resource(gem_handle) else {
             return Err(FsError::Unsupported);
         };
@@ -576,6 +592,9 @@ impl FileOps for DriCardFile {
     }
 
     fn drm_prime_import_file(&self, dmabuf: &Arc<dyn FileOps>) -> Result<u32, FsError> {
+        if let Some(result) = amdgpu_import(&self.amdgpu_gem, dmabuf) {
+            return result;
+        }
         let prime = dmabuf
             .as_any()
             .and_then(|any| any.downcast_ref::<VirtGpuPrimeDmaBufFile>())
@@ -823,6 +842,75 @@ impl FileOps for VirtGpuPrimeDmaBufFile {
     }
 }
 
+/// A PRIME dma-buf of an amdgpu GEM object (`amdgpu_gem_prime_export`):
+/// CPU-mappable through the object's frames and keeping it alive while any
+/// mapping or fd exists. Imports into an amdgpu open name the same object.
+/// LINUX-GAP: no reservation fences ride on it (no implicit sync).
+#[derive(Debug)]
+struct AmdgpuPrimeDmaBufFile {
+    object: Arc<crate::amdgpu_gem::GemObject>,
+    inode: narf_filesystem::inode_id::InodeId,
+}
+impl FileOps for AmdgpuPrimeDmaBufFile {
+    fn ino(&self) -> u64 {
+        self.inode.ino
+    }
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        self.inode.attrs()
+    }
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Ok(0) })
+    }
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Err(FsError::InvalidData) })
+    }
+    fn stat(&self) -> Stat {
+        let size = self.object.byte_len;
+        Stat {
+            size,
+            blocks: size.div_ceil(512),
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o600,
+            },
+            mtime_cycles: 0,
+        }
+    }
+    fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
+        if offset & 0xfff != 0
+            || len == 0
+            || offset.saturating_add(len as u64) > self.object.byte_len
+        {
+            return Err(FsError::InvalidData);
+        }
+        Ok((0..(len as u64).div_ceil(4096))
+            .map(|page| self.object.phys + offset + page * 4096)
+            .collect())
+    }
+    fn mmap_lifetime(&self, _offset: u64, _len: usize) -> Option<Arc<dyn MmapLifetime>> {
+        Some(Arc::clone(&self.object) as Arc<dyn MmapLifetime>)
+    }
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+}
+fn amdgpu_export(gem: &crate::amdgpu_gem::GemState, handle: u32) -> Option<Arc<dyn FileOps>> {
+    let object = gem.object(handle)?;
+    Some(Arc::new(AmdgpuPrimeDmaBufFile {
+        object,
+        inode: dma_buf_inode(),
+    }))
+}
+fn amdgpu_import(
+    gem: &crate::amdgpu_gem::GemState,
+    dmabuf: &Arc<dyn FileOps>,
+) -> Option<Result<u32, FsError>> {
+    let prime = dmabuf
+        .as_any()
+        .and_then(|any| any.downcast_ref::<AmdgpuPrimeDmaBufFile>())?;
+    Some(gem.import(Arc::clone(&prime.object)))
+}
+
 /// A PRIME dma-buf file for `resource`, as `drm_prime_export_file` mints
 /// one, for tests that have no live render-node open.
 #[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
@@ -1022,6 +1110,9 @@ impl FileOps for DriRenderFile {
                 Err(FsError::Unsupported) => {}
                 result => return result,
             }
+            if let Some(result) = crate::drm_ioctl_bridge::without_kms(self.index, cmd, arg) {
+                return result;
+            }
         }
         crate::drm_ioctl_bridge::dispatch_card_for_file(
             self.index,
@@ -1067,6 +1158,10 @@ impl FileOps for DriRenderFile {
                     result => return result,
                 }
             }
+            // GET_CLIENT carries no DRM_RENDER_ALLOW (drm_ioctl_permit).
+            if cmd == crate::drm_ioctl_bridge::DRM_IOCTL_GET_CLIENT {
+                return Err(FsError::PermissionDenied);
+            }
             self.ioctl(cmd, arg as usize)
         })
     }
@@ -1088,6 +1183,9 @@ impl FileOps for DriRenderFile {
     }
 
     fn drm_prime_export_file(&self, gem_handle: u32) -> Result<Arc<dyn FileOps>, FsError> {
+        if let Some(file) = amdgpu_export(&self.amdgpu_gem, gem_handle) {
+            return Ok(file);
+        }
         let Some(resource) = self.virtgpu.export_resource(gem_handle) else {
             return Err(FsError::NotFound);
         };
@@ -1098,6 +1196,9 @@ impl FileOps for DriRenderFile {
     }
 
     fn drm_prime_import_file(&self, dmabuf: &Arc<dyn FileOps>) -> Result<u32, FsError> {
+        if let Some(result) = amdgpu_import(&self.amdgpu_gem, dmabuf) {
+            return result;
+        }
         let prime = dmabuf
             .as_any()
             .and_then(|any| any.downcast_ref::<VirtGpuPrimeDmaBufFile>())
@@ -1118,6 +1219,9 @@ impl FileOps for DriRenderFile {
     }
 
     fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>> {
+        if let Some(object) = self.amdgpu_gem.mmap_owner(offset) {
+            return Some(object as Arc<dyn MmapLifetime>);
+        }
         if crate::drm_registry::driver_name(self.index) != Some("virtio_gpu") {
             return None;
         }

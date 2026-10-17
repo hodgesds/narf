@@ -30,6 +30,7 @@ pub enum Error {
     Reset(crate::amdgpu_reset_navi22::Error),
     Interrupts(crate::amdgpu_ih_navi22::Error),
     Media(crate::amdgpu_vcn_navi22::Error),
+    Topology(crate::amdgpu_gfx10_topology::Error),
     PowerSaving(crate::amdgpu_navi22_power_saving::Error),
 }
 /// All files are validated and copied before the first device operation.
@@ -43,6 +44,25 @@ pub struct Firmware {
     display: Option<DisplayPrep>,
 }
 impl Firmware {
+    /// The versions `AMDGPU_INFO_FW_VERSION` reports for this validated set
+    /// (Linux takes them from the requested files' headers, not the device).
+    pub fn uapi_versions(&self) -> Option<crate::amdgpu_info_navi22::Firmware> {
+        use crate::amdgpu_gfx_firmware::Source;
+        let g = |source| self.graphics.source_bytes(source);
+        crate::amdgpu_info_navi22::Firmware::parse(&crate::amdgpu_info_navi22::Files {
+            me: g(Source::Me)?,
+            pfp: g(Source::Pfp)?,
+            ce: g(Source::Ce)?,
+            mec: g(Source::Mec)?,
+            mec2: g(Source::Mec2),
+            rlc: g(Source::Rlc)?,
+            sdma: g(Source::Sdma)?,
+            sos: self.sos.bytes(),
+            vcn: g(Source::Vcn)?,
+            dmcub: g(Source::Dmcub)?,
+        })
+        .ok()
+    }
     pub fn open(
         gpu: &AmdGpu,
         registry: &Cap<narf_firmware::FirmwareRegistry, Read>,
@@ -183,8 +203,9 @@ pub enum Stage {
     Media,
     Jpeg,
     MediaIbTests,
+    ReadTopology,
 }
-const STAGES: [Stage; 30] = [
+const STAGES: [Stage; 31] = [
     Stage::ResetOnInit,
     Stage::MemoryTraining,
     Stage::Sos,
@@ -230,6 +251,10 @@ const STAGES: [Stage; 30] = [
     Stage::Media,
     Stage::Jpeg,
     Stage::MediaIbTests,
+    // gfx_v10_0_constants_init's setup_rb/get_cu_info/get_tcc_info reads, for
+    // AMDGPU_INFO. Appended: RLC is booted, GFX powered and the idle kernel
+    // queues never touch GRBM indexing after GfxSetup.
+    Stage::ReadTopology,
 ];
 /// INT_CONTEXT of the boot SDMA0 TRAP round trip.
 const TRAP_CONTEXT: u32 = 0x0675_0022;
@@ -686,6 +711,27 @@ impl Backend for Hardware {
                     unsafe { queues.gfx.golden() }.map_err(Error::Queues)?;
                 }
             }
+            Stage::ReadTopology => {
+                // SAFETY: firmware/RLC/power are up; this owner holds GRBM
+                // indexing and GC exclusively and no queue has started.
+                match unsafe { crate::amdgpu_gfx10_topology::read(&self.gpu, &self.authority) } {
+                    Ok(topology) => crate::amdgpu_info::publish_navi22_topology(topology),
+                    Err(
+                        error @ (crate::amdgpu_gfx10_topology::Error::DeviceGone
+                        | crate::amdgpu_gfx10_topology::Error::Revoked),
+                    ) => return Err(Error::Topology(error)),
+                    // Userspace identity only: the kernel queues do not
+                    // depend on it, so an implausible sample is reported and
+                    // DEV_INFO keeps its unknown-harvest zeros.
+                    Err(error) => {
+                        use core::fmt::Write;
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "amdgpu: navi22 topology unavailable: {error:?}"
+                        );
+                    }
+                }
+            }
             Stage::SdmaTest => {
                 if let Some(sdma) = self.sdma.as_mut() {
                     // SAFETY: firmware, protected power and both hubs are ready.
@@ -858,7 +904,8 @@ fn snapshot(gpu: &AmdGpu) -> Result<AmdGpu, Error> {
         chip: gpu.chip,
         vram: gpu.vram,
         ip_blocks: blocks,
-        gc_info: None,
+        // Immutable discovery maxima, needed to bound the topology sample.
+        gc_info: gpu.gc_info,
         vbios: None,
         mode: None,
         fw_loaded: false,
@@ -1278,6 +1325,10 @@ impl ColdBoot {
             .as_ref()
             .and_then(gddr6::Trainer::training_data)
     }
+    /// See [`Firmware::uapi_versions`]; the set this owner loads.
+    pub fn uapi_versions(&self) -> Option<crate::amdgpu_info_navi22::Firmware> {
+        self.sequence.backend.firmware.uapi_versions()
+    }
     pub fn state(&self) -> State {
         self.sequence.state
     }
@@ -1520,6 +1571,110 @@ impl ColdBoot {
         self.sequence.backend.smu.take();
         self.sequence.state = State::Released;
         Ok(psp)
+    }
+    /// Queue client IBs on a verified kernel queue under `vm`
+    /// (`amdgpu_navi22_submit`). `Busy` means the ring already has two
+    /// submissions outstanding; wait for [`ColdBoot::fences`]'s throttle
+    /// sequence (without holding this owner) and retry.
+    pub fn submit(
+        &mut self,
+        ring: crate::amdgpu_navi22_submit::Ring,
+        state: &mut crate::amdgpu_navi22_submit::RingState,
+        vm: crate::amdgpu_navi22_submit::VmRef,
+        context: u64,
+        ibs: &[crate::amdgpu_navi22_submit::Ib],
+    ) -> Result<u32, Error> {
+        use crate::amdgpu_navi22_submit::Ring;
+        if !self.queues_verified() {
+            return Err(Error::Busy);
+        }
+        let queues = self
+            .sequence
+            .backend
+            .queues
+            .as_mut()
+            .ok_or(Error::Invalid)?;
+        match ring {
+            Ring::Gfx => queues.gfx.submit(state, vm, context, ibs),
+            Ring::Compute => queues.compute.submit(state, vm, context, ibs),
+            Ring::Sdma(i) => queues.sdma.submit(i, state, vm, context, ibs),
+        }
+        .map_err(Error::Queues)
+    }
+    /// Lock-free fence reader over the verified kernel queues (client job
+    /// completion for `amdgpu_navi22_cs`).
+    pub fn client_fence_reader(&self) -> Option<crate::amdgpu_cp_navi22::FenceReader> {
+        if !self.queues_verified() {
+            return None;
+        }
+        let q = self.sequence.backend.queues.as_ref()?;
+        Some(q.gfx.fence_reader([
+            q.gfx.fence_map(),
+            q.compute.fence_map(),
+            q.sdma.fence_map(0),
+            q.sdma.fence_map(1),
+        ]))
+    }
+    /// A VRAM heap for clients, as Navi48's `publish_client_vram`: half the
+    /// pool's free VRAM, 2 MiB-aligned and at least 64 MiB, as a pool of its
+    /// own, with the GMC framebuffer translation entries need. The chunk is
+    /// published (never recycled) and returned for the caller to retain.
+    pub fn reserve_client_vram(
+        &mut self,
+    ) -> Result<(crate::amdgpu_vram::Reservation, crate::amdgpu_gem::VramHeap), Error> {
+        const ALIGN: u64 = 2 << 20;
+        let hw = &mut self.sequence.backend;
+        let (fb_base, fb_offset) = hw
+            .gmc
+            .as_ref()
+            .and_then(crate::amdgpu_gmc_navi22::Gmc::framebuffer)
+            .ok_or(Error::Invalid)?;
+        let size = (hw.pool.available() / 2) & !(ALIGN - 1);
+        if size < 64 << 20 {
+            return Err(Error::Allocation);
+        }
+        let mut chunk = hw
+            .pool
+            .reserve_aligned(size, ALIGN)
+            .map_err(|_| Error::Allocation)?;
+        // SAFETY: the reservation is this heap's alone, inside the owned,
+        // CPU-mapped VRAM range the boot inventory produced.
+        let pool = unsafe { Pool::from_owned_range(chunk.mapping(), chunk.address()) }
+            .map_err(|_| Error::Allocation)?;
+        chunk.publish();
+        Ok((
+            chunk,
+            crate::amdgpu_gem::VramHeap {
+                pool,
+                fb_base,
+                fb_offset,
+            },
+        ))
+    }
+    /// Hold one GMC10 context (VMID) for client jobs: its context registers
+    /// carry the 4-level, 48-bit layout every client space shares, and each
+    /// job's ring-side VM flush points it at that job's root.
+    pub async fn reserve_client_vmid(&mut self) -> Result<crate::amdgpu_gmc_navi22::Vm, Error> {
+        self.memory()?.create_vm().await.map_err(Error::MemoryHubs)
+    }
+    /// (last completed, throttle) fence sequences of `ring`.
+    pub fn fences(&mut self, ring: crate::amdgpu_navi22_submit::Ring) -> Result<(u32, u32), Error> {
+        use crate::amdgpu_navi22_submit::Ring;
+        if !self.queues_verified() {
+            return Err(Error::Busy);
+        }
+        let queues = self
+            .sequence
+            .backend
+            .queues
+            .as_mut()
+            .ok_or(Error::Invalid)?;
+        match ring {
+            Ring::Gfx => queues.gfx.fences(),
+            Ring::Compute => queues.compute.fences(),
+            Ring::Sdma(i) => queues.sdma.fences(i),
+        }
+        .map_err(Error::Queues)
     }
 
     // ── Native display presentation (amdgpu_navi22_kms) ────────────────
