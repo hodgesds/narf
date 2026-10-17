@@ -57,6 +57,8 @@ struct Layout {
     gc: u64,
     nbio: u64,
     hdp: u64,
+    /// RCC_CONFIG_MEMSIZE (`gmc.mc_vram_size`): the FB aperture's length.
+    vram_size: u64,
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
@@ -79,6 +81,7 @@ impl Layout {
         };
         Ok(Self {
             // SDMA0 is in GC bank zero, NOT the standalone discovery SDMA bank.
+            vram_size: gpu.vram.size,
             gc: resolve(ip::HW_ID_GC, &[(10, 3, 2)], 0, 0x16fd)?,
             nbio: resolve(
                 ip::HW_ID_NBIF,
@@ -239,7 +242,11 @@ impl<I: Io> Engine<I> {
         let address = self.memory.address();
         self.access(|io| {
             let fb = u64::from(checked(io.read(l.gc + 0x16fc * 4))? & 0xffffff) << 24;
-            let end = (u64::from(checked(io.read(l.gc + 0x16fd * 4))? & 0xffffff) + 1) << 24;
+            // amdgpu_gmc_vram_location: vram_end = vram_start + mc_vram_size
+            // - 1. FB_LOCATION_TOP is VBIOS/previous-driver state (16 MiB
+            // granular) and is only checked for a present device here.
+            checked(io.read(l.gc + 0x16fd * 4))?;
+            let end = fb.checked_add(l.vram_size).ok_or(Error::Invalid)?;
             // The boot aperture is the head of Linux's BEST_FIT GART range
             // (0 below a high FB), never inside the FB aperture itself.
             let aperture_end = aperture.start.checked_add(aperture.size);

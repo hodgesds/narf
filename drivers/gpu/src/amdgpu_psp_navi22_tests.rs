@@ -654,7 +654,9 @@ fn psp_navi22_constructor_rejects_unmapped_vram() -> TestResult {
         regs[0x2000 + 0x16e7] = 0x100;
         match case {
             0 => regs[0x2000 + 0x16fc] = u32::MAX,
-            1 => regs[0x2000 + 0x16fd] = 0x7ff,
+            // amdgpu_gmc_vram_location: the aperture is fb_start +
+            // MEMSIZE, so a pool past MEMSIZE is refused whatever TOP says.
+            1 => gpu.vram.size = 1 << 20,
             2 => regs[0x2000 + 0x16fc] = 0x801,
             3 => gpu.vram.visible_size = 1 << 20,
             4 => gpu.fb_bar.len = 1 << 20,
@@ -667,6 +669,17 @@ fn psp_navi22_constructor_rejects_unmapped_vram() -> TestResult {
         if pool.available() != 16 << 20 {
             return TestResult::Fail("invalid pool allocated ring");
         }
+    }
+    // The host card's 12272 MiB with a stale FB_LOCATION_TOP: TOP is not
+    // the aperture end, MEMSIZE is.
+    let mut gpu = gpu(&mut regs);
+    gpu.vram.size = 12272 << 20;
+    regs[0x2000 + 0x16fc] = 0x800;
+    regs[0x2000 + 0x16fd] = 0x7ff;
+    regs[0x2000 + 0x16e7] = 0x100;
+    // SAFETY: as above.
+    if unsafe { Psp::new_navi22(&gpu, Cap::bootstrap(), &pool) }.is_err() {
+        return TestResult::Fail("FB_LOCATION_TOP used as the aperture end");
     }
     TestResult::Pass
 }
