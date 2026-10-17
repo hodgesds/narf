@@ -1,4 +1,4 @@
-//! Navi22 cold-boot GDDR6 training (Linux psp_v11_0_memory_training).
+//! Navi22/Navi48 cold-boot GDDR6 training (Linux psp_v{11,14}_0).
 //! Long training overwrites the bottom 32 MiB of VRAM. Its preimage and the
 //! training cache live in the owner, including across cancelled futures.
 use alloc::vec::Vec;
@@ -67,7 +67,7 @@ struct Mmio {
     size: u64,
     mp0: u64,
     nbio: u64,
-    hdp: u64,
+    invalidate_reg: Option<u64>,
 }
 impl Io for Mmio {
     fn read(&mut self, reg: u32) -> u32 {
@@ -86,8 +86,10 @@ impl Io for Mmio {
             if self.regs.read32(self.nbio + 0x12d * 4) != HDP_HOLE as u32 {
                 return false;
             }
-            self.regs.write32(self.hdp + 0xd1 * 4, 1);
-            self.regs.read32(self.hdp + 0xd1 * 4);
+            if let Some(reg) = self.invalidate_reg {
+                self.regs.write32(reg, 1);
+                self.regs.read32(reg);
+            }
         }
         fence(Ordering::SeqCst);
         true
@@ -136,10 +138,12 @@ impl Io for Mmio {
         fence(Ordering::SeqCst);
     }
     fn read_result(&mut self, offset: u64, bytes: &mut [u8]) -> Result<(), Error> {
-        // SAFETY: exact HDP5 bank, exclusive owner, completed PSP operation.
+        // SAFETY: optional HDP5 invalidate bank; HDP6 has no invalidate step.
         unsafe {
-            self.regs.write32(self.hdp + 0xd1 * 4, 1);
-            self.regs.read32(self.hdp + 0xd1 * 4);
+            if let Some(reg) = self.invalidate_reg {
+                self.regs.write32(reg, 1);
+                self.regs.read32(reg);
+            }
         }
         fence(Ordering::SeqCst);
         // SAFETY: caller's live PCI invocation and exclusive index latch.
@@ -392,7 +396,43 @@ impl Trainer {
                     size: gpu.vram.size,
                     mp0,
                     nbio,
-                    hdp,
+                    invalidate_reg: Some(hdp + 0xd1 * 4),
+                },
+                authority,
+                exchange,
+                backup: buffer(ENCROACHED)?,
+                cache: buffer(4096)?,
+                state: State::Prepared,
+            },
+        })
+    }
+    /// Allocate Navi48's PSP14 cold-training owner before any memory access.
+    ///
+    /// # Safety
+    /// Same exclusive GPU/PSP/HDP/index/reset ownership, client quiescence and
+    /// permanent exchange reservations as `new`, for physical Navi48 instead.
+    /// The bottom 32 MiB preimage remains owned on cancellation or failure.
+    pub unsafe fn new_navi48(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        exchange: Training,
+    ) -> Result<Self, Error> {
+        let layout = crate::amdgpu_psp_ring::navi48_layout(gpu).map_err(|_| Error::Unsupported)?;
+        validate_exchange(
+            gpu.vram.size,
+            gpu.fb_bar.len.min(gpu.vram.visible_size),
+            exchange,
+        )?;
+        authority.invoke(Op(|| ())).map_err(|_| Error::Revoked)?;
+        Ok(Self {
+            engine: Engine {
+                io: Mmio {
+                    regs: gpu.regs,
+                    vram: gpu.fb_bar,
+                    size: gpu.vram.size,
+                    mp0: layout.mp0,
+                    nbio: layout.nbio,
+                    invalidate_reg: layout.invalidate_reg,
                 },
                 authority,
                 exchange,

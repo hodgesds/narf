@@ -349,6 +349,7 @@ pub fn paint(fb: &FbWriter) {
     // messages unreadable. The panel's value is the state summary above
     // (what enumerated), which the console cannot show at a glance; the log
     // itself is already on the console and on serial.
+    drop(fbm);
     let _ = fb.flush(Rect::new(0, panel_y, w, PANEL_HEIGHT + PANEL_PAD));
 }
 

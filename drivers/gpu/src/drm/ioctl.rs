@@ -44,6 +44,9 @@ pub enum IoctlCmd {
     DropMaster = 0x1F,
     PrimeHandleToFd = 0x2D,
     PrimeFdToHandle = 0x2E,
+    WaitVblank = 0x3A,
+    CrtcGetSequence = 0x3B,
+    CrtcQueueSequence = 0x3C,
     ModeGetResources = 0xA0,
     ModeGetCrtc = 0xA1,
     ModeSetCrtc = 0xA2,
@@ -59,6 +62,8 @@ pub enum IoctlCmd {
     ModeAddFb2 = 0xB8,
     ModeObjGetProperties = 0xB9,
     ModeGetProperty = 0xAA,
+    ModeConnectorSetProperty = 0xAB,
+    ModeObjSetProperty = 0xBA,
     ModeGetPropBlob = 0xAC,
     ModeGetPlaneRes = 0xB5,
     ModeGetPlane = 0xB6,
@@ -89,6 +94,9 @@ impl IoctlCmd {
             0x1F => IoctlCmd::DropMaster,
             0x2D => IoctlCmd::PrimeHandleToFd,
             0x2E => IoctlCmd::PrimeFdToHandle,
+            0x3A => IoctlCmd::WaitVblank,
+            0x3B => IoctlCmd::CrtcGetSequence,
+            0x3C => IoctlCmd::CrtcQueueSequence,
             0xA0 => IoctlCmd::ModeGetResources,
             0xA1 => IoctlCmd::ModeGetCrtc,
             0xA2 => IoctlCmd::ModeSetCrtc,
@@ -99,6 +107,8 @@ impl IoctlCmd {
             0xA8 => IoctlCmd::ModeRmFb,
             0xB9 => IoctlCmd::ModeObjGetProperties,
             0xAA => IoctlCmd::ModeGetProperty,
+            0xAB => IoctlCmd::ModeConnectorSetProperty,
+            0xBA => IoctlCmd::ModeObjSetProperty,
             0xAC => IoctlCmd::ModeGetPropBlob,
             0xB6 => IoctlCmd::ModeGetPlane,
             0xB0 => IoctlCmd::ModePageFlip,
@@ -251,6 +261,36 @@ pub struct DrmModeModeInfo {
     pub name: [u8; 32],
 }
 
+impl DrmModeModeInfo {
+    /// The 68-byte native-endian wire form (a MODE_ID property blob).
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() != 68 {
+            return None;
+        }
+        let u16_at = |at: usize| u16::from_ne_bytes([b[at], b[at + 1]]);
+        let u32_at = |at: usize| u32::from_ne_bytes(b[at..at + 4].try_into().unwrap());
+        let mut name = [0; 32];
+        name.copy_from_slice(&b[36..68]);
+        Some(Self {
+            clock: u32_at(0),
+            hdisplay: u16_at(4),
+            hsync_start: u16_at(6),
+            hsync_end: u16_at(8),
+            htotal: u16_at(10),
+            hskew: u16_at(12),
+            vdisplay: u16_at(14),
+            vsync_start: u16_at(16),
+            vsync_end: u16_at(18),
+            vtotal: u16_at(20),
+            vscan: u16_at(22),
+            vrefresh: u32_at(24),
+            flags: u32_at(28),
+            r#type: u32_at(32),
+            name,
+        })
+    }
+}
+
 /// `struct drm_mode_get_connector` — DRM_IOCTL_MODE_GETCONNECTOR.
 ///
 /// Linux: `include/uapi/drm/drm_mode.h`.
@@ -374,7 +414,11 @@ pub fn dispatch(
         | IoctlCmd::SyncobjWait
         | IoctlCmd::SyncobjSignal
         | IoctlCmd::PrimeHandleToFd
-        | IoctlCmd::PrimeFdToHandle => Err(DrmIoctlError::UnknownCmd),
+        | IoctlCmd::PrimeFdToHandle
+        // The vblank ioctls need the open's event queue: bridge-dispatched.
+        | IoctlCmd::WaitVblank
+        | IoctlCmd::CrtcGetSequence
+        | IoctlCmd::CrtcQueueSequence => Err(DrmIoctlError::UnknownCmd),
         // Dumb-buffer / modeset ioctls — handled in the bridge with
         // full serialisation of the in/out structs.
         // GET_MAGIC / AUTH_MAGIC are handled in the bridge (primary-node fd is
@@ -390,6 +434,8 @@ pub fn dispatch(
         | IoctlCmd::SetClientCap
         | IoctlCmd::ModeObjGetProperties
         | IoctlCmd::ModeGetProperty
+        | IoctlCmd::ModeConnectorSetProperty
+        | IoctlCmd::ModeObjSetProperty
         | IoctlCmd::ModeGetPropBlob
         | IoctlCmd::ModeGetPlane
         | IoctlCmd::ModePageFlip
@@ -481,7 +527,11 @@ fn handle_getconnector(card: &Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoc
         .connector(connector_id)
         .map_err(|_| DrmIoctlError::UnknownConnector)?;
 
-    let modes: alloc::vec::Vec<DrmModeModeInfo> = conn.modes.iter().map(mode_to_wire).collect();
+    // A native driver's real sink timings replace the synthesized ones.
+    let modes: alloc::vec::Vec<DrmModeModeInfo> = match card.native_output(connector_id) {
+        Some(n) if n.timings.len() == conn.modes.len() => n.timings.clone(),
+        _ => conn.modes.iter().map(mode_to_wire).collect(),
+    };
 
     let info = DrmModeGetConnector {
         count_modes: modes.len() as u32,

@@ -35,6 +35,7 @@ narf-power           = { path = "../../power" }
 narf-console         = { path = "../../console" }
 narf-filesystem      = { path = "../../filesystem" }
 narf-io              = { path = "../../io" }
+narf-interrupts      = { path = "../../interrupts" }
 narf-drivers-backlight = { path = "../backlight" }
 
 [features]

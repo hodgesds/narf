@@ -523,6 +523,31 @@ pub fn find_output_path(c: &Codec) -> Option<AudioPath> {
     None
 }
 
+/// The AMD/ATI GPU HDMI/DP codec Linux's atihdmi driver binds (`R6xx HDMI`,
+/// 0x1002aa01, which every Radeon since R6xx reports).
+pub fn is_ati_hdmi(c: &Codec) -> bool {
+    c.vendor_id == 0x1002 && c.device_id == 0xaa01
+}
+/// `is_amdhdmi_rev3_or_later`: per-slot channel remapping and ramp control.
+pub fn ati_hdmi_rev3(c: &Codec) -> bool {
+    is_ati_hdmi(c) && c.revision & 0xff00 >= 0x0300
+}
+/// Every digital output pin (HDMI/DP port) with a physical connection and a
+/// route to an Audio Output converter. On ATI codecs each port pin has its
+/// own converter (pins 3, 5, 7..., converters 2, 4, 6...).
+pub fn find_digital_output_paths(c: &Codec) -> Vec<AudioPath> {
+    c.widgets
+        .iter()
+        .filter(|w| {
+            matches!(w.ty(), WidgetType::PinComplex)
+                && w.caps.digital()
+                && w.pin_caps.unwrap_or(0) & 0x10 != 0
+                && w.pin_config.is_some_and(|p| p.port_connectivity != 0x1)
+        })
+        .filter_map(|w| trace_to_converter(c, w.nid, WidgetType::AudioOutput, 16))
+        .collect()
+}
+
 /// Walk every input Pin Complex (Mic In, Line In, AUX), pick the
 /// first one reached by an Audio-Input converter's connection list.
 pub fn find_input_path(c: &Codec) -> Option<AudioPath> {

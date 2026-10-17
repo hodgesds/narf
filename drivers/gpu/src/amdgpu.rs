@@ -34,6 +34,7 @@
 //! | 1002:1638 | Renoir             | Ryzen 4000 iGPU |
 //! | 1002:73DF | Navi 22 (RX 6750)  | RDNA2 desktop |
 //! | 1002:744C | Navi 31 (RX 7900)  | RDNA3 desktop |
+//! | 1002:7550 | Navi 48 (RX 9070)  | RDNA4 desktop, discovery only |
 //!
 //! Plus a class-match backstop (`MatchKind::Class { 0x03 }`) that
 //! fires for every PCI VGA controller; the probe checks `vendor ==
@@ -135,6 +136,10 @@ pub const RENOIR: u16 = 0x1636;
 pub const NAVI22: u16 = 0x73DF;
 /// Navi 31 (Radeon RX 7900 family).
 pub const NAVI31: u16 = 0x744C;
+/// Navi 48 (RX 9070 / 9070 XT / 9070 GRE). The PCI ID does not identify
+/// the SKU's enabled topology; discovery supplies maximum geometry, while
+/// enabled CU counts require GFX12's harvested-WGP register inventory.
+pub const NAVI48: u16 = 0x7550;
 
 /// PCI class triple for a VGA-compatible display controller. The
 /// class-match backstop catches all VGA cards; `probe` filters by
@@ -254,6 +259,8 @@ pub enum Family {
     /// V_SYNC / OTG_CONTROL / INTERRUPT_CONTROL offsets per
     /// `drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_3_5_0_offset.h`.
     Phoenix,
+    /// Navi 4x — RDNA4. Separate from both the RDNA3 APUs and Navi3.
+    Navi4,
 }
 
 /// Whether a part is an APU, keyed on its **GC IP version**.
@@ -321,7 +328,7 @@ impl Family {
     pub const fn is_apu(self) -> bool {
         match self {
             Family::Renoir | Family::Phoenix => true,
-            Family::Vega | Family::Navi1 | Family::Navi2 | Family::Navi3 => false,
+            Family::Vega | Family::Navi1 | Family::Navi2 | Family::Navi3 | Family::Navi4 => false,
         }
     }
 }
@@ -359,6 +366,7 @@ impl Family {
             Family::Navi1 => Some(0x000B_0000),
             Family::Navi2 => None,
             Family::Navi3 => None,
+            Family::Navi4 => None,
             Family::Renoir => None,
             Family::Phoenix => None,
         }
@@ -669,6 +677,9 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
             UNAUDITED_FW,
         ),
         NAVI31 => (Family::Navi3, "navi31", "amdgpu/navi31.bin", UNAUDITED_FW),
+        // PSP14 selects its SOS container by the discovered MP0 revision.
+        // No single legacy image/load command describes this device.
+        NAVI48 => (Family::Navi4, "navi48", "", UNAUDITED_FW),
         _ => return None,
     };
     Some(ChipInfo {
@@ -990,11 +1001,12 @@ impl AmdGpu {
     /// block window. GFX9 (Renoir) and GFX11 (Phoenix) place the
     /// register at distinct offsets.
     /// This chip's GFX generation, for the per-generation register tables.
-    fn gfx_generation(&self) -> crate::amdgpu_gfx::GfxGeneration {
-        match self.chip.family {
+    fn gfx_generation(&self) -> Option<crate::amdgpu_gfx::GfxGeneration> {
+        Some(match self.chip.family {
+            Family::Navi4 => return None,
             Family::Phoenix | Family::Navi3 => crate::amdgpu_gfx::GfxGeneration::Gfx11,
             _ => crate::amdgpu_gfx::GfxGeneration::Gfx9,
-        }
+        })
     }
 
     /// Resolve a `(byte offset, GC window)` register location to the dword
@@ -1036,7 +1048,7 @@ impl AmdGpu {
     /// # Safety
     /// Caller owns BAR5 exclusively (MM_INDEX / MM_DATA latch).
     pub unsafe fn read_grbm_status(&self) -> Option<crate::amdgpu_gfx::GrbmStatus> {
-        let off = self.gc_reg(self.gfx_generation().grbm_status_rel())?;
+        let off = self.gc_reg(self.gfx_generation()?.grbm_status_rel())?;
         // SAFETY: caller-asserted BAR5 ownership; mm_read uses the
         // MM_INDEX/MM_DATA pair which is a r/w latch with no side
         // effect on the addressed register.
@@ -1066,7 +1078,7 @@ impl AmdGpu {
         // offset (0x2200 * 4) added to a dword base, so the write went to
         // dword 0x8800 of window 0. `gc_base_1()` existed and nothing called
         // it; `GC_BASE_IDX_1` named this register as one that needed it.
-        let off = self.gc_reg(self.gfx_generation().grbm_gfx_index_rel())?;
+        let off = self.gc_reg(self.gfx_generation()?.grbm_gfx_index_rel())?;
         // SAFETY: caller-asserted BAR5 ownership.
         unsafe {
             mm_write(&self.regs, off, value);
@@ -1096,7 +1108,7 @@ impl AmdGpu {
     ) -> Option<Result<(), crate::amdgpu_cp_fw::CpFwError>> {
         let idx0 = self.gc_base()?;
         let idx1 = self.gc_base_1()?;
-        let generation = self.gfx_generation();
+        let generation = self.gfx_generation()?;
         // SAFETY: caller-asserted BAR5 ownership, held for the adapter's whole
         // lifetime — it borrows `self.regs` and never outlives this frame.
         let mut mmio = CpRegsAdapter { regs: &self.regs };
@@ -1125,6 +1137,9 @@ impl AmdGpu {
     /// shared latch, and a concurrent reader between the index and the data
     /// write lands on a different register.
     pub unsafe fn apply_gfx11_sequence(&self, seq: &crate::amdgpu_gfx::Gfx11Sequence) {
+        if self.gfx_generation() != Some(crate::amdgpu_gfx::GfxGeneration::Gfx11) {
+            return;
+        }
         // SAFETY: caller-asserted BAR5 ownership, held for the adapter's
         // whole lifetime — it borrows `self.regs` and never outlives this
         // frame.
@@ -1160,6 +1175,9 @@ impl AmdGpu {
         crate::amdgpu_mes_hw::MesVersion,
     )> {
         use crate::amdgpu_mes_hw as hw;
+        if self.gfx_generation() != Some(crate::amdgpu_gfx::GfxGeneration::Gfx11) {
+            return None;
+        }
         let idx1 = self.gc_base_1()?;
         let cntl = idx1 + hw::GRBM_GFX_CNTL;
         let gp3 = idx1 + hw::CP_MES_GP3_LO;
@@ -1195,7 +1213,7 @@ impl AmdGpu {
         // else. Unlike `read_vram_info` this runs after discovery, so the
         // base is available; the function returns `None` rather than reading
         // an unbased address when it is not.
-        let (low, high) = match self.gfx_generation() {
+        let (low, high) = match self.gfx_generation()? {
             crate::amdgpu_gfx::GfxGeneration::Gfx11 => (
                 crate::amdgpu_gmc::GCMC_VM_SYSTEM_APERTURE_LOW_ADDR_GFX11,
                 crate::amdgpu_gmc::GCMC_VM_SYSTEM_APERTURE_HIGH_ADDR_GFX11,
@@ -1253,7 +1271,7 @@ impl AmdGpu {
     /// Caller owns BAR5 exclusively.
     pub unsafe fn hpd_asserted(&self, connector: u8) -> Option<bool> {
         use crate::amdgpu_dcn as dcn;
-        if connector >= dcn::HPD_BLOCKS {
+        if self.chip.family == Family::Navi4 || connector >= dcn::HPD_BLOCKS {
             return None;
         }
         let base = self.ip_block_base_idx(amdgpu_discovery::HW_ID_DCN, 0, 2)?;
@@ -1292,6 +1310,9 @@ impl AmdGpu {
     /// # Safety
     /// Caller owns BAR5 exclusively.
     unsafe fn passive_mode(&self) -> Option<Mode> {
+        if self.chip.family == Family::Navi4 {
+            return None;
+        }
         use crate::amdgpu_dcn as dcn;
         // Every HUBP / HUBPREQ register is BASE_IDX 2.
         let base = self.ip_block_base_idx(amdgpu_discovery::HW_ID_DCN, 0, 2)?;
@@ -1356,7 +1377,7 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<(), AmdgpuError> {
-        if self.chip.family == Family::Phoenix || self.chip.did == NAVI22 {
+        if matches!(self.chip.family, Family::Phoenix | Family::Navi4) || self.chip.did == NAVI22 {
             // Navi22 SOS uses amdgpu_psp_boot and an owned GPU VRAM staging
             // buffer; this legacy entry point cannot satisfy that contract.
             return Err(AmdgpuError::UnsupportedFirmwareLoad);
@@ -1536,7 +1557,7 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<MultiFwReport, AmdgpuError> {
-        if self.chip.family == Family::Phoenix || self.chip.did == NAVI22 {
+        if matches!(self.chip.family, Family::Phoenix | Family::Navi4) || self.chip.did == NAVI22 {
             return Err(AmdgpuError::UnsupportedFirmwareLoad);
         }
         if crate::amdgpu_usbc::firmware_busy() {
@@ -1657,6 +1678,9 @@ impl AmdGpu {
     /// # Safety
     /// Caller owns BAR0 + BAR5 exclusively.
     pub unsafe fn set_mode(&mut self, mode: Mode) -> Result<(), AmdgpuError> {
+        if self.chip.family == Family::Navi4 {
+            return Err(AmdgpuError::UnknownAsic);
+        }
         if !self.fw_loaded {
             return Err(AmdgpuError::FirmwareLoadFailed);
         }
@@ -1717,6 +1741,9 @@ impl AmdGpu {
     /// # Safety
     /// Caller owns BAR5 exclusively.
     pub unsafe fn set_backlight(&mut self, percent: u8) -> Result<(), AmdgpuError> {
+        if self.chip.family == Family::Navi4 {
+            return Err(AmdgpuError::UnknownAsic);
+        }
         if self.mode.is_none() {
             return Err(AmdgpuError::FirmwareLoadFailed);
         }
@@ -1766,7 +1793,7 @@ impl AmdGpu {
     pub fn mp1_mailbox_base(&self) -> Option<u32> {
         // Discrete SMU11 has its own message map and owner. Never hand its
         // register window to the APU PowerUp/PowerDownGfx helpers.
-        if !self.is_apu() {
+        if self.chip.family == Family::Navi4 || !self.is_apu() {
             return None;
         }
         self.ip_block_base_idx(amdgpu_discovery::HW_ID_MP1, 0, 1)
@@ -2182,7 +2209,7 @@ unsafe fn read_vbios_version_from_rom(
 static CONTROLLER: IrqSafeSpinLock<Option<AmdGpu>> = IrqSafeSpinLock::new(None);
 // Set under CONTROLLER before the boot owner leaves that lock. It stays set
 // through success, failure and cancellation: only that owner may access MMIO.
-static NAVI22_OWNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static DISCRETE_OWNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static PCI_AUTHORITY: IrqSafeSpinLock<Option<Cap<BusDeviceCap, Write>>> =
     IrqSafeSpinLock::new(None);
 static PCI_DEVICE: IrqSafeSpinLock<Option<BusDevice>> = IrqSafeSpinLock::new(None);
@@ -2218,13 +2245,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
     // SAFETY: probe owns the GPU mappings; boot ACPI tables remain mapped.
     let vbios = unsafe { crate::amdgpu_vbios::discover(&dev, &device, &cap) };
-    if device.id.device == NAVI22 {
+    if matches!(device.id.device, NAVI22 | NAVI48) {
         use core::fmt::Write as _;
         match &vbios {
             Ok(image) => {
                 let _ = writeln!(
                     narf_console::Writer,
-                    "amdgpu: navi22 VBIOS {:?}, {} bytes",
+                    "amdgpu: {} VBIOS {:?}, {} bytes",
+                    dev.chip.asic,
                     image.source(),
                     image.bytes().len()
                 );
@@ -2232,7 +2260,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             Err(error) => {
                 let _ = writeln!(
                     narf_console::Writer,
-                    "amdgpu: navi22 VBIOS unavailable: {error:?}"
+                    "amdgpu: {} VBIOS unavailable: {error:?}",
+                    dev.chip.asic,
                 );
             }
         }
@@ -2268,10 +2297,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Graphics.default_domain(),
     });
-    // APUs and Navi22 use their retained, capability-checked image. The legacy
+    // APUs and audited discrete probes use their retained, capability-checked image. The legacy
     // ROM-version-only path remains for other discrete GPUs.
     let vbios_version: Option<alloc::string::String> =
-        if vbios_version.is_some() || is_apu || device.id.device == NAVI22 {
+        if vbios_version.is_some() || is_apu || matches!(device.id.device, NAVI22 | NAVI48) {
             vbios_version
         } else {
             // SAFETY: caller-authority over the device. ROM BAR is read-only
@@ -2318,8 +2347,12 @@ static SAVED_MODE: narf_lib::sync::IrqSafeSpinLock<Option<Mode>> =
 static PM_SUSPENDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn amdgpu_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
-    if is_navi22() {
-        // No Navi22 TMR teardown, training-cache restore or SMU11 resume yet.
+    if CONTROLLER
+        .lock()
+        .as_ref()
+        .is_some_and(|gpu| gpu.chip.family == Family::Navi4 || !gpu.is_apu())
+    {
+        // No discrete TMR teardown, training-cache restore or SMU resume yet.
         // Refuse before modifying PM state or sending an APU mailbox command.
         return Err(narf_power::device_pm::DeviceSuspendError::NotImplemented);
     }
@@ -2425,6 +2458,7 @@ pub fn register_pci_driver() {
         ("amdgpu-renoir", AMD_VENDOR, RENOIR),
         ("amdgpu-navi22", AMD_VENDOR, NAVI22),
         ("amdgpu-navi31", AMD_VENDOR, NAVI31),
+        ("amdgpu-navi48", AMD_VENDOR, NAVI48),
     ];
     for (name, v, d) in exact.iter().copied() {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
@@ -2465,14 +2499,32 @@ pub(crate) fn is_navi22() -> bool {
 pub(crate) fn claim_navi22<R, E>(
     prepare: impl FnOnce(&AmdGpu) -> Result<R, E>,
 ) -> Option<Result<R, E>> {
+    claim_discrete(NAVI22, prepare)
+}
+
+pub(crate) fn is_navi48() -> bool {
+    CONTROLLER
+        .lock()
+        .as_ref()
+        .is_some_and(|gpu| gpu.chip.did == NAVI48)
+}
+pub(crate) fn claim_navi48<R, E>(
+    prepare: impl FnOnce(&AmdGpu) -> Result<R, E>,
+) -> Option<Result<R, E>> {
+    claim_discrete(NAVI48, prepare)
+}
+fn claim_discrete<R, E>(
+    did: u16,
+    prepare: impl FnOnce(&AmdGpu) -> Result<R, E>,
+) -> Option<Result<R, E>> {
     let controller = CONTROLLER.lock();
     let gpu = controller.as_ref()?;
-    if gpu.chip.did != NAVI22 || NAVI22_OWNED.load(core::sync::atomic::Ordering::Acquire) {
+    if gpu.chip.did != did || DISCRETE_OWNED.load(core::sync::atomic::Ordering::Acquire) {
         return None;
     }
     let result = prepare(gpu);
     if result.is_ok() {
-        NAVI22_OWNED.store(true, core::sync::atomic::Ordering::Release);
+        DISCRETE_OWNED.store(true, core::sync::atomic::Ordering::Release);
     }
     Some(result)
 }
@@ -2485,11 +2537,11 @@ pub(crate) fn info_snapshot() -> Option<crate::amdgpu_info::Snapshot> {
         .map(crate::amdgpu_info::Snapshot::from_gpu)
 }
 
-/// Returns None after Navi22's boot owner claims the hardware. Its immutable
+/// Returns None after a discrete GPU boot owner claims the hardware. Its immutable
 /// DRM discovery snapshot remains available independently of this MMIO access.
 pub fn with_controller<R>(f: impl FnOnce(&AmdGpu) -> R) -> Option<R> {
     let controller = CONTROLLER.lock();
-    if NAVI22_OWNED.load(core::sync::atomic::Ordering::Acquire) {
+    if DISCRETE_OWNED.load(core::sync::atomic::Ordering::Acquire) {
         return None;
     }
     controller.as_ref().map(f)
@@ -2499,7 +2551,7 @@ pub fn with_controller<R>(f: impl FnOnce(&AmdGpu) -> R) -> Option<R> {
 /// state-mutating bring-up paths.
 pub fn with_controller_mut<R>(f: impl FnOnce(&mut AmdGpu) -> R) -> Option<R> {
     let mut controller = CONTROLLER.lock();
-    if NAVI22_OWNED.load(core::sync::atomic::Ordering::Acquire) {
+    if DISCRETE_OWNED.load(core::sync::atomic::Ordering::Acquire) {
         return None;
     }
     controller.as_mut().map(f)
@@ -2510,6 +2562,38 @@ mod navi22_ownership_tests {
     use super::*;
     use core::sync::atomic::Ordering;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn navi48_boot_claim_excludes_legacy_access_and_wrong_owner() -> TestResult {
+        if is_probed() {
+            return TestResult::Skip("real controller owns the global slot");
+        }
+        *CONTROLLER.lock() = Some(crate::amdgpu_navi48_firmware::tests::gpu());
+        let prior_pm = PM_SUSPENDED.swap(false, Ordering::AcqRel);
+        let wrong = claim_navi22(|_| Ok::<_, ()>(())).is_none();
+        let failed: Option<Result<(), ()>> = claim_navi48(|_| Err(()));
+        let released = failed == Some(Err(())) && with_controller(|_| true) == Some(true);
+        let claimed = claim_navi48(|_| Ok::<_, ()>(())) == Some(Ok(()));
+        let exclusive = with_controller(|_| true).is_none()
+            && with_controller_mut(|_| true).is_none()
+            && claim_navi48(|_| Ok::<_, ()>(())).is_none()
+            && info_snapshot().is_some_and(|info| info.did == u32::from(NAVI48))
+            && is_navi48()
+            && amdgpu_suspend_handler()
+                == Err(narf_power::device_pm::DeviceSuspendError::NotImplemented)
+            && !PM_SUSPENDED.load(Ordering::Acquire);
+        *CONTROLLER.lock() = None;
+        DISCRETE_OWNED.store(false, Ordering::Release);
+        PM_SUSPENDED.store(prior_pm, Ordering::Release);
+        if wrong && released && claimed && exclusive {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("Navi48 ownership rollback, exclusivity or PM gating")
+        }
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi48",
+        navi48_boot_claim_excludes_legacy_access_and_wrong_owner
+    );
 
     fn navi22_boot_claim_excludes_legacy_access_and_suspend() -> TestResult {
         if is_probed() {
@@ -2537,7 +2621,7 @@ mod navi22_ownership_tests {
             && amdgpu_suspend_handler()
                 == Err(narf_power::device_pm::DeviceSuspendError::NotImplemented);
         *CONTROLLER.lock() = None;
-        NAVI22_OWNED.store(false, Ordering::Release);
+        DISCRETE_OWNED.store(false, Ordering::Release);
         PM_SUSPENDED.store(prior_pm, Ordering::Release);
         if !(mailbox_blocked && failure_released && pm_refused && exclusive) {
             return TestResult::Fail("Navi22 owner/PM exclusion or failed-preflight rollback");

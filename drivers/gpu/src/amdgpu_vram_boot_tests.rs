@@ -620,3 +620,144 @@ kernel_test_in!(
     "drivers/gpu/vram",
     vram_boot_loader_construction_does_not_modify_hardware
 );
+
+fn navi48_vram_checks_gmc12_dcn4_and_training() -> TestResult {
+    use crate::amdgpu::{ChipInfo, Family, VramInfo, NAVI48};
+    use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, HW_ID_GC, HW_ID_MMHUB, MAX_BASE_ADDRS};
+    let mut regs = vec![0; 0x2000];
+    regs[0x1614] = (GPU_BASE >> 24) as u32;
+    regs[0x1615] = ((GPU_BASE + (16 << 30)) >> 24) as u32 - 1;
+    regs[0x15a7] = 0x80;
+    regs[0x475] = regs[0x1614];
+    regs[0x476] = regs[0x1615];
+    regs[0x477] = regs[0x15a7];
+    for pipe in 0..4 {
+        regs[0x5f4 + pipe * 0xdc] = 1;
+    }
+    regs[0x1a3] = (1 << 31) | 0x3fff;
+    regs[0x19a] = (40 * MIB) as u32;
+    regs[0x19b] = (GPU_BASE >> 32) as u32;
+    let before = regs.clone();
+    let mut gpu = AmdGpu {
+        fb_bar: mapping(256 * MIB),
+        regs: MmioRegion {
+            virt: regs.as_mut_ptr() as u64,
+            len: regs.len() as u64 * 4,
+            ..mapping(0)
+        },
+        chip: ChipInfo {
+            vid: 0x1002,
+            did: NAVI48,
+            family: Family::Navi4,
+            asic: "navi48",
+            fw_name: "",
+            fw_list: &[],
+        },
+        vram: VramInfo {
+            base: BAR_BASE,
+            size: 16 << 30,
+            visible_size: 256 * MIB,
+        },
+        mode: None,
+        fw_loaded: false,
+        gc_info: None,
+        ip_blocks: [
+            (HW_ID_GC, 12, 0, 1),
+            (HW_ID_DCN, 4, 1, 0),
+            (HW_ID_MMHUB, 4, 1, 0),
+        ]
+        .iter()
+        .map(|&(hw_id, major, minor, revision)| IpBlock {
+            hw_id,
+            instance: 0,
+            major,
+            minor,
+            revision,
+            sub_revision: 0,
+            variant: 0,
+            base_addrs: {
+                let mut bases = [0; MAX_BASE_ADDRS];
+                if hw_id == HW_ID_MMHUB {
+                    bases[0] = 0x1000;
+                }
+                bases
+            },
+            num_bases: 3,
+        })
+        .collect(),
+        vbios: Some(crate::amdgpu_vbios::tests::with_image(bios())),
+    };
+    let cap = Cap::bootstrap();
+    // SAFETY: owned RAM registers; BAR0 is never dereferenced by inventory.
+    if unsafe { Plan::read_navi48(&gpu, &cap, None, &[]) }.is_err() || regs != before {
+        return TestResult::Fail("GMC12/DCN4 inventory modified hardware or rejected a valid map");
+    }
+    for reg in [0x1624, 0x1633, 0x1564, 0x1573] {
+        regs[reg] = 1;
+        // SAFETY: private RAM model; an active inherited VM must prevent allocation.
+        if unsafe { Plan::read_navi48(&gpu, &cap, None, &[]) }.err() != Some(Error::Busy) {
+            return TestResult::Fail("live GFXHUB/MMHUB context admitted into boot pool");
+        }
+        regs[reg] = 0;
+    }
+    // The final cursor must be excluded even when caller supplies no clients.
+    regs[0x90d] = 1 | (2 << 8);
+    regs[0x90e] = 24 * MIB as u32;
+    regs[0x90f] = 2;
+    regs[0x910] = (64 << 16) | 64;
+    // SAFETY: same read-only fixture; no BAR0 dereference occurs.
+    let plan = unsafe { Plan::read_navi48(&gpu, &cap, None, &[]) }.unwrap();
+    if !plan
+        .protected()
+        .iter()
+        .any(|r| r.owner == Owner::Dmub && r.range == (40 * MIB..40 * MIB + 0x4000))
+    {
+        return TestResult::Fail("DCN4 Region6 shared state was not reserved");
+    }
+    if !plan
+        .protected()
+        .iter()
+        .any(|r| r.range == (24 * MIB..24 * MIB + 16384))
+    {
+        return TestResult::Fail("inherited fourth-pipe cursor omitted from automatic exclusions");
+    }
+    regs[0x90d] = 0;
+    // DCN4 has 16-bit viewport-start/pitch fields, but 14-bit dimensions.
+    // Truncating these to DCN3 widths would under-reserve an inherited surface.
+    regs[0x5f4] = 0;
+    regs[0x5e5] = 8;
+    regs[0x5e9] = 0x4000 << 16;
+    regs[0x5eb] = (1 << 16) | 1;
+    regs[0x607] = 0xffff;
+    regs[0x60a] = (32 * MIB) as u32;
+    regs[0x60b] = (GPU_BASE >> 32) as u32;
+    // SAFETY: read-only, array-backed register model.
+    let plan = unsafe { Plan::read_navi48(&gpu, &cap, None, &[]) }.unwrap();
+    let end = 32 * MIB + 65536 * 16385 * 4;
+    if !plan.protected().iter().any(|r| r.range == (32 * MIB..end)) {
+        return TestResult::Fail("DCN4 pitch/start truncated to DCN3 field widths");
+    }
+    regs[0x5f4] = 1;
+    regs[0x477] += 1;
+    // SAFETY: same RAM-only read fixture.
+    if unsafe { Plan::read_navi48(&gpu, &cap, None, &[]) }.err() != Some(Error::Invalid) {
+        return TestResult::Fail("inconsistent GMC/DCN translation accepted");
+    }
+    regs[0x477] -= 1;
+    gpu.vram.size -= 16 * MIB;
+    // SAFETY: same RAM-only read fixture.
+    if unsafe { Plan::read_navi48(&gpu, &cap, None, &[]) }.err() != Some(Error::Invalid) {
+        return TestResult::Fail("GMC aperture not checked against physical memory");
+    }
+    cap.revoke();
+    gpu.regs.virt = 0;
+    // SAFETY: revoked authority must reject before dereferencing null MMIO.
+    if unsafe { Plan::read_navi48(&gpu, &cap, None, &[]) }.err() != Some(Error::Revoked) {
+        return TestResult::Fail("Navi48 inventory bypassed capability invocation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vram",
+    navi48_vram_checks_gmc12_dcn4_and_training
+);

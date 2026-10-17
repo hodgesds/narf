@@ -482,6 +482,133 @@ kernel_test_in!(
     smoke_drm_ioctl_planes_synth_primary
 );
 
+// ── Connector "Broadcast RGB" ─────────────────────────────────────────
+//
+// drm_connector_attach_broadcast_rgb_property: an enum on native HDMI/DP
+// connectors, listed with the connector's properties and settable by the
+// master through SETPROPERTY / OBJ_SETPROPERTY (and atomic commits).
+fn smoke_drm_ioctl_broadcast_rgb_property() -> TestResult {
+    let idx = register_test_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    ms.lock().native.push(crate::drm::card::NativeOutput {
+        connector: 31,
+        edid: None,
+        timings: alloc::vec::Vec::new(),
+        broadcast_rgb: Some(0),
+    });
+    // GETPROPERTY: a settable enum with Linux's three names.
+    let mut values = [0u64; 3];
+    let mut enums = [0u8; 3 * 40];
+    let mut gp = [0u8; 64];
+    gp[0..8].copy_from_slice(&(values.as_mut_ptr() as u64).to_le_bytes());
+    gp[8..16].copy_from_slice(&(enums.as_mut_ptr() as u64).to_le_bytes());
+    gp[16..20].copy_from_slice(&0x61u32.to_le_bytes());
+    gp[56..60].copy_from_slice(&3u32.to_le_bytes());
+    gp[60..64].copy_from_slice(&3u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAA, 64),
+        gp.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("GETPROPERTY failed");
+    }
+    let name = |b: &[u8]| {
+        let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+        alloc::vec::Vec::from(&b[..end])
+    };
+    if name(&gp[24..56]) != b"Broadcast RGB"
+        || u32::from_le_bytes(gp[20..24].try_into().unwrap()) != 1 << 3
+        || values != [0, 1, 2]
+        || name(&enums[8..40]) != b"Automatic"
+        || name(&enums[48..80]) != b"Full"
+        || name(&enums[88..120]) != b"Limited 16:235"
+    {
+        return TestResult::Fail("Broadcast RGB metadata");
+    }
+    // OBJ_GETPROPERTIES(connector) lists it with its value.
+    let read = |idx: u32| -> Option<(u32, u64, u32)> {
+        let mut props = [0u32; 4];
+        let mut vals = [0u64; 4];
+        let mut og = [0u8; 32];
+        og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
+        og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+        og[16..20].copy_from_slice(&4u32.to_le_bytes());
+        og[20..24].copy_from_slice(&31u32.to_le_bytes());
+        og[24..28].copy_from_slice(&0xc0c0_c0c0u32.to_le_bytes());
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xB9, 32),
+            og.as_mut_ptr() as usize,
+            false,
+        )
+        .ok()?;
+        let count = u32::from_le_bytes(og[16..20].try_into().unwrap());
+        Some((props[2], vals[2], count))
+    };
+    if read(idx) != Some((0x61, 0, 3)) {
+        return TestResult::Fail("connector properties");
+    }
+    let obj_set = |value: u64, prop: u32, obj: u32| {
+        let mut b = [0u8; 24];
+        b[0..8].copy_from_slice(&value.to_le_bytes());
+        b[8..12].copy_from_slice(&prop.to_le_bytes());
+        b[12..16].copy_from_slice(&obj.to_le_bytes());
+        b[16..20].copy_from_slice(&0xc0c0_c0c0u32.to_le_bytes());
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xBA, 24),
+            b.as_mut_ptr() as usize,
+            false,
+        )
+    };
+    if obj_set(2, 0x61, 31) != Ok(0) || read(idx).map(|r| r.1) != Some(2) {
+        return TestResult::Fail("OBJ_SETPROPERTY Limited");
+    }
+    if obj_set(3, 0x61, 31) != Err(FsError::InvalidData)
+        || obj_set(0, 0x51, 31) != Err(FsError::InvalidData)
+        || obj_set(0, 0x61, 99) != Err(FsError::NotFound)
+        || read(idx).map(|r| r.1) != Some(2)
+    {
+        return TestResult::Fail("invalid set accepted");
+    }
+    // Legacy connector SETPROPERTY.
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&1u64.to_le_bytes());
+    b[8..12].copy_from_slice(&0x61u32.to_le_bytes());
+    b[12..16].copy_from_slice(&31u32.to_le_bytes());
+    let set = iowr(DRM_IOCTL_BASE, 0xAB, 16);
+    if dispatch_card(idx, set, b.as_mut_ptr() as usize, false) != Ok(0)
+        || read(idx).map(|r| r.1) != Some(1)
+    {
+        return TestResult::Fail("SETPROPERTY Full");
+    }
+    // Only the master may set it.
+    if crate::drm_ioctl_bridge::dispatch_card(
+        idx,
+        SMOKE_MASTER_ID + 1,
+        set,
+        b.as_mut_ptr() as usize,
+        false,
+    ) != Err(FsError::PermissionDenied)
+    {
+        return TestResult::Fail("non-master set");
+    }
+    // A connector without the property neither lists nor takes it.
+    ms.lock().native.clear();
+    if read(idx).map(|r| r.2) != Some(2) || obj_set(0, 0x61, 31) != Err(FsError::InvalidData) {
+        return TestResult::Fail("property on a plain connector");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_broadcast_rgb_property
+);
+
 // ── 6. Render-node fd rejects SETCRTC with PermissionDenied ────────────
 
 #[allow(dead_code)]
@@ -2098,4 +2225,361 @@ fn smoke_drm_atomic_in_fence_validation_and_wait() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_atomic_in_fence_validation_and_wait
+);
+
+// ── Vblank ioctls ─────────────────────────────────────────────────────
+
+/// A fake hardware vblank clock: a set count, or (with `FAKE_VBLANK_TIMED`)
+/// one vblank per millisecond of monotonic time; `FAKE_VBLANK_OFF` stops it.
+static FAKE_VBLANK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FAKE_VBLANK_TIMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static FAKE_VBLANK_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+fn fake_vblank(crtc_id: u32) -> Option<crate::drm::card::VblankTime> {
+    use core::sync::atomic::Ordering::SeqCst;
+    if crtc_id != 12 || FAKE_VBLANK_OFF.load(SeqCst) {
+        return None;
+    }
+    let count = if FAKE_VBLANK_TIMED.load(SeqCst) {
+        narf_time::wall::monotonic_ns() / 1_000_000
+    } else {
+        FAKE_VBLANK.load(SeqCst)
+    };
+    Some(crate::drm::card::VblankTime {
+        count,
+        start_ns: count * 1_000_000,
+        ns: count * 1_000_000 + 100_000,
+        period_ns: 1_000_000,
+    })
+}
+
+/// WAIT_VBLANK, CRTC_GET_SEQUENCE and CRTC_QUEUE_SEQUENCE as Linux's
+/// drm_vblank.c answers them: unsupported without hardware vblanks, EINVAL
+/// on a CRTC that is off, queries and reached targets at once, events once
+/// the count reaches their target (or the CRTC goes off), blocking waits
+/// until the target.
+fn smoke_drm_ioctl_vblank_waits_and_sequences() -> TestResult {
+    use core::sync::atomic::Ordering::SeqCst;
+    let idx = register_test_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    let caps = crate::drm_ioctl_bridge::DrmClientCaps::new();
+    let events = narf_lib::sync::IrqSafeSpinLock::new(crate::drm::card::DrmEventQueue::new());
+    let call = |nr: u32, buf: &mut [u8; 24], render: bool| {
+        crate::drm_ioctl_bridge::dispatch_card_for_file(
+            idx,
+            SMOKE_MASTER_ID,
+            iowr(DRM_IOCTL_BASE, nr, 24),
+            buf.as_mut_ptr() as usize,
+            render,
+            &caps,
+            (!render).then_some(&events),
+            None,
+        )
+    };
+    let wait = |kind: u32, seq: u32, data: u64| {
+        let mut b = [0u8; 24];
+        b[0..4].copy_from_slice(&kind.to_le_bytes());
+        b[4..8].copy_from_slice(&seq.to_le_bytes());
+        b[8..16].copy_from_slice(&data.to_le_bytes());
+        b
+    };
+    let get = |crtc: u32| {
+        let mut b = [0u8; 24];
+        b[0..4].copy_from_slice(&crtc.to_le_bytes());
+        b
+    };
+    // No hardware vblanks: unsupported, as without drm_vblank_init.
+    if call(0x3A, &mut wait(1, 0, 0), false) != Err(FsError::Unsupported)
+        || call(0x3B, &mut get(12), false) != Err(FsError::Unsupported)
+    {
+        return TestResult::Fail("vblank ioctls without vblank support");
+    }
+    ms.lock().vblank_source = Some(fake_vblank);
+    FAKE_VBLANK.store(100, SeqCst);
+    // The CRTC is off: its vblank cannot be enabled.
+    if call(0x3A, &mut wait(0x2, 0, 0), false) != Err(FsError::InvalidData)
+        || call(0x3B, &mut get(12), false) != Err(FsError::InvalidData)
+        || call(0x3B, &mut get(99), false) != Err(FsError::NotFound)
+    {
+        return TestResult::Fail("vblank on a CRTC that is off");
+    }
+    ms.lock().crtc_mut(12).unwrap().enabled = true;
+    // Second CRTC (index 1, via HIGH_CRTC) queried: the current count.
+    let mut b = wait(1 | 1 << 1, 0, 0);
+    if call(0x3A, &mut b, false) != Ok(0)
+        || u32::from_le_bytes(b[4..8].try_into().unwrap()) != 100
+        || i64::from_le_bytes(b[8..16].try_into().unwrap()) != 0
+        || i64::from_le_bytes(b[16..24].try_into().unwrap()) != 100_100
+    {
+        return TestResult::Fail("vblank query reply");
+    }
+    let mut b = get(12);
+    if call(0x3B, &mut b, false) != Ok(0)
+        || b[4..8] != 1u32.to_le_bytes()
+        || u64::from_le_bytes(b[8..16].try_into().unwrap()) != 100
+        || i64::from_le_bytes(b[16..24].try_into().unwrap()) != 100_100_000
+    {
+        return TestResult::Fail("CRTC_GET_SEQUENCE");
+    }
+    // Refused: SIGNAL, FLIP, unknown bits, a missing CRTC, render nodes.
+    for kind in [0x4000_0000u32, 0x0800_0000, 0x80, 1 | 3 << 1] {
+        if call(0x3A, &mut wait(kind | 2, 0, 0), false) != Err(FsError::InvalidData) {
+            return TestResult::Fail("bad WAIT_VBLANK flags accepted");
+        }
+    }
+    if call(0x3A, &mut wait(1 | 2, 0, 0), true) != Err(FsError::PermissionDenied) {
+        return TestResult::Fail("WAIT_VBLANK on a render node");
+    }
+    let read = || {
+        let mut out = [0u8; 32];
+        let n = events
+            .lock()
+            .read_deliverable_event(narf_time::wall::monotonic_ns(), &mut out);
+        n.map(|_| out)
+    };
+    // An event two vblanks ahead (relative, EVENT, CRTC 1).
+    let mut b = wait(0x400_0000 | 1 | 1 << 1, 2, 0xabcd);
+    if call(0x3A, &mut b, false) != Ok(0)
+        || u32::from_le_bytes(b[4..8].try_into().unwrap()) != 102
+        || read().is_some()
+    {
+        return TestResult::Fail("vblank event queued early");
+    }
+    FAKE_VBLANK.store(102, SeqCst);
+    match read() {
+        Some(e)
+            if e[0..4] == 1u32.to_le_bytes()
+                && e[4..8] == 32u32.to_le_bytes()
+                && e[8..16] == 0xabcdu64.to_le_bytes()
+                && e[24..28] == 102u32.to_le_bytes()
+                && e[28..32] == 12u32.to_le_bytes() => {}
+        _ => return TestResult::Fail("vblank event"),
+    }
+    // A sequence event on an absolute target already passed: at once.
+    let mut q = [0u8; 24];
+    q[0..4].copy_from_slice(&12u32.to_le_bytes());
+    q[8..16].copy_from_slice(&50u64.to_le_bytes());
+    q[16..24].copy_from_slice(&7u64.to_le_bytes());
+    if call(0x3C, &mut q, false) != Ok(0) || q[8..16] != 102u64.to_le_bytes() {
+        return TestResult::Fail("passed sequence target");
+    }
+    match read() {
+        Some(e)
+            if e[0..4] == 3u32.to_le_bytes()
+                && e[8..16] == 7u64.to_le_bytes()
+                && e[16..24] == 102_100_000u64.to_le_bytes()
+                && e[24..32] == 102u64.to_le_bytes() => {}
+        _ => return TestResult::Fail("CRTC sequence event"),
+    }
+    // NEXT_ON_MISS moves a missed target to the next vblank; the CRTC
+    // going off sends the pending event at once.
+    q[4..8].copy_from_slice(&2u32.to_le_bytes());
+    q[8..16].copy_from_slice(&90u64.to_le_bytes());
+    if call(0x3C, &mut q, false) != Ok(0) || q[8..16] != 103u64.to_le_bytes() || read().is_some() {
+        return TestResult::Fail("NEXT_ON_MISS");
+    }
+    FAKE_VBLANK_OFF.store(true, SeqCst);
+    let sent = read();
+    FAKE_VBLANK_OFF.store(false, SeqCst);
+    if sent.is_none_or(|e| e[24..32] != 103u64.to_le_bytes()) {
+        return TestResult::Fail("pending event of a CRTC turned off");
+    }
+    q[4..8].copy_from_slice(&4u32.to_le_bytes());
+    if call(0x3C, &mut q, false) != Err(FsError::InvalidData) {
+        return TestResult::Fail("bad CRTC_QUEUE_SEQUENCE flags");
+    }
+    // A blocking wait three vblanks ahead returns once they have begun.
+    FAKE_VBLANK_TIMED.store(true, SeqCst);
+    let start = narf_time::wall::monotonic_ns() / 1_000_000;
+    let mut b = wait(1 | 1 << 1, 3, 0);
+    let result = call(0x3A, &mut b, false);
+    FAKE_VBLANK_TIMED.store(false, SeqCst);
+    let got = u32::from_le_bytes(b[4..8].try_into().unwrap()) as u64;
+    if result != Ok(0) || got < start + 3 || got > start + 1_000 {
+        return TestResult::Fail("blocking vblank wait");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_vblank_waits_and_sequences
+);
+
+/// A natively scanned-out card's planes take only their formats, cover the
+/// CRTC's mode unscaled from the framebuffer origin (EINVAL for anything
+/// else, ENOSPC for a framebuffer smaller than the mode, in SETCRTC,
+/// PAGE_FLIP and atomic alike), and RMFB of the framebuffer on screen turns
+/// its CRTC off, as Linux's drm_framebuffer_remove does.
+fn smoke_drm_native_planes_refuse_what_scanout_cannot_show() -> TestResult {
+    use crate::drm::atomic::{AtomicState, CrtcState, PlaneState};
+    use crate::drm::card::DumbBacking;
+    use crate::drm_uapi::{DrmModeCrtcUapi, DRM_IOCTL_MODE_SETCRTC};
+    const XR24: u32 = 0x3432_5258;
+    const AR24: u32 = 0x3432_5241;
+    const RG16: u32 = 0x3631_4752;
+    let idx = register_test_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    // A dumb buffer large enough for every framebuffer below.
+    let handle = {
+        let mut card = ms.lock();
+        card.plane_formats = Some(&[XR24, AR24]);
+        let (phys, size) = (0xBEEF_0000u64, 64 * 64 * 4usize);
+        let handle = card.gem.alloc(phys, size).unwrap();
+        card.dumb_backings.push(DumbBacking {
+            gem_handle: handle,
+            phys,
+            byte_len: size,
+            order: 0,
+            mmap_offset: (handle as u64) << 12,
+            refcount: 1,
+            dma_buf: Default::default(),
+        });
+        handle
+    };
+    let addfb = |w: u32, h: u32, format: u32| ms.lock().addfb2(w, h, format, w * 4, handle);
+    // ADDFB2: a format no plane takes is refused.
+    if addfb(64, 32, RG16).is_ok() {
+        return TestResult::Fail("RGB565 framebuffer on 32-bit planes");
+    }
+    let (Ok(full), Ok(alpha), Ok(small)) = (
+        addfb(64, 32, XR24),
+        addfb(64, 32, AR24),
+        addfb(32, 32, XR24),
+    ) else {
+        return TestResult::Fail("32-bit framebuffers refused");
+    };
+    // GETPLANE lists both formats.
+    let mut ids = [0u32; 4];
+    let mut res = [0u8; 16];
+    res[0..8].copy_from_slice(&(ids.as_mut_ptr() as u64).to_le_bytes());
+    res[8..12].copy_from_slice(&4u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB5, 16),
+        res.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("GETPLANERESOURCES");
+    }
+    let mut formats = [0u32; 4];
+    let mut gp = [0u8; 32];
+    gp[0..4].copy_from_slice(&ids[0].to_le_bytes());
+    gp[20..24].copy_from_slice(&4u32.to_le_bytes());
+    gp[24..32].copy_from_slice(&(formats.as_mut_ptr() as u64).to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB6, 32),
+        gp.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || gp[20..24] != 2u32.to_le_bytes()
+        || formats[..2] != [XR24, AR24]
+    {
+        return TestResult::Fail("plane formats");
+    }
+    // SETCRTC in a 64x32 mode.
+    let setcrtc = |fb_id: u32, x: u32| {
+        let mut req = DrmModeCrtcUapi {
+            crtc_id: 11,
+            fb_id,
+            x,
+            mode_valid: 1,
+            ..Default::default()
+        };
+        req.mode.hdisplay = 64;
+        req.mode.vdisplay = 32;
+        req.mode.vrefresh = 60;
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_SETCRTC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    if setcrtc(small, 0) != Err(FsError::NoSpace)
+        || setcrtc(full, 8) != Err(FsError::InvalidData)
+        || setcrtc(999, 0) != Err(FsError::NotFound)
+        || ms.lock().crtc(11).unwrap().enabled
+    {
+        return TestResult::Fail("SETCRTC refusals (or state changed by one)");
+    }
+    if setcrtc(alpha, 0) != Ok(0) || setcrtc(full, 0) != Ok(0) {
+        return TestResult::Fail("full-screen 32-bit planes");
+    }
+    // PAGE_FLIP to a framebuffer that cannot cover the mode.
+    let mut flip = [0u8; 24];
+    flip[0..4].copy_from_slice(&11u32.to_le_bytes());
+    flip[4..8].copy_from_slice(&small.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB0, 24),
+        flip.as_mut_ptr() as usize,
+        false,
+    ) != Err(FsError::NoSpace)
+    {
+        return TestResult::Fail("PAGE_FLIP to a short framebuffer");
+    }
+    // Atomic: only the unscaled full-screen plane passes.
+    let plane = |fb: u32, crtc_w: u32, src_x: u32| PlaneState {
+        id: ids[0],
+        crtc_id: Some(11),
+        fb_id: Some(fb),
+        crtc_w,
+        crtc_h: 32,
+        src_x,
+        src_w: 64,
+        src_h: 32,
+        ..Default::default()
+    };
+    let check = |p: PlaneState, mode: Option<crate::Mode>| {
+        let mut state = AtomicState::default();
+        if let Some(m) = mode {
+            state.crtcs.push(CrtcState {
+                id: 11,
+                enable: true,
+                active: true,
+                mode: Some(m),
+                ..Default::default()
+            });
+        }
+        state.planes.push(p);
+        crate::drm_ioctl_bridge::check_native_atomic(&ms.lock(), &state)
+    };
+    let wide = crate::Mode {
+        width: 128,
+        height: 32,
+        refresh_hz: 60,
+        bpp: 32,
+    };
+    if check(plane(full, 64, 0), None) != Ok(())
+        || check(plane(full, 32, 0), None) != Err(FsError::InvalidData)
+        || check(plane(full, 64, 8), None) != Err(FsError::InvalidData)
+        || check(plane(full, 64, 0), Some(wide)) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("atomic native plane checks");
+    }
+    // RMFB of the framebuffer on screen turns the CRTC off.
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA8, 4),
+        &full as *const u32 as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("RMFB");
+    }
+    let crtc = ms.lock().crtc(11).unwrap().clone();
+    if crtc.enabled || crtc.primary_fb.is_some() || crtc.mode.is_some() {
+        return TestResult::Fail("CRTC still on after its framebuffer was removed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_native_planes_refuse_what_scanout_cannot_show
 );

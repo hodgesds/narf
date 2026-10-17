@@ -1204,6 +1204,23 @@ fn handle_syncobj(nr: u32, arg: usize, state: &VirtGpuRenderState) -> Result<u64
     }
 }
 
+/// Whether `cmd` is DRM_IOCTL_WAIT_VBLANK, which a user file waits out
+/// asynchronously (`wait_vblank_for_file`).
+pub fn is_wait_vblank_ioctl(cmd: u32) -> bool {
+    drm_uapi::ioc_nr(cmd) == 0x3A
+}
+
+/// DRM_IOCTL_WAIT_VBLANK on a primary file, sleeping rather than spinning.
+pub(crate) async fn wait_vblank_for_file(
+    card_index: u32,
+    arg: usize,
+    events: &EventQueue,
+) -> Result<u64, FsError> {
+    let mode_state = crate::drm_registry::mode_state(card_index).ok_or(FsError::Unsupported)?;
+    // Any authenticated primary open may wait (Linux flags 0).
+    wait_vblank(&mode_state, arg, &DrmFileCtx::primary(false), Some(events)).await
+}
+
 /// Dispatch the Mesa/libdrm virtgpu subset on a render-node fd.
 /// Unknown commands intentionally remain ENOTTY: advertising an ioctl that
 /// only partly implements fence or blob semantics causes Mesa to assume a
@@ -2018,12 +2035,25 @@ pub(crate) fn dispatch_card_for_file(
         IoctlCmd::ModeGetConnector => handle_getconnector(&mode_state, arg, &ctx),
         IoctlCmd::ModeGetEncoder => handle_getencoder(&mode_state, arg, &ctx),
         IoctlCmd::ModeGetCrtc => handle_getcrtc(&mode_state, arg, &ctx),
+        // In-kernel callers block by spinning, as the fence waits do; a
+        // user file's ioctl sleeps instead (`wait_vblank`).
+        IoctlCmd::WaitVblank => {
+            narf_scheduler::block_on_spin(wait_vblank(&mode_state, arg, &ctx, events))
+        }
+        IoctlCmd::CrtcGetSequence => handle_crtc_get_sequence(&mode_state, arg, &ctx),
+        IoctlCmd::CrtcQueueSequence => handle_crtc_queue_sequence(&mode_state, arg, &ctx, events),
         IoctlCmd::ModeObjGetProperties => handle_obj_getproperties(&mode_state, arg, &ctx),
         // Universal planes (synthesised PRIMARY plane per CRTC) — weston
         // needs these to find an output's primary plane on the legacy path.
         IoctlCmd::ModeGetPlaneRes => handle_getplane_res(&mode_state, arg, &ctx),
         IoctlCmd::ModeGetPlane => handle_getplane(&mode_state, arg, &ctx),
         IoctlCmd::ModeGetProperty => handle_getproperty(arg),
+        IoctlCmd::ModeConnectorSetProperty => {
+            handle_set_property(card_index, &mode_state, arg, &ctx, false)
+        }
+        IoctlCmd::ModeObjSetProperty => {
+            handle_set_property(card_index, &mode_state, arg, &ctx, true)
+        }
         IoctlCmd::ModeGetPropBlob => handle_getpropblob(&mode_state, arg, &ctx),
         // SETGAMMA — accept + no-op. We scan out the framebuffer verbatim
         // (no hardware gamma LUT), so modetest's post-modeset gamma reset
@@ -2118,6 +2148,28 @@ pub(crate) fn dispatch_card_for_file(
         IoctlCmd::ModeCursor2 => handle_cursor(arg, true),
         // GEM_CLOSE — free dumb backing if present.
         IoctlCmd::GemClose => handle_gem_close(&mode_state, arg, &ctx),
+        // RMFB of a framebuffer on screen turns its CRTC off; the native
+        // display follows.
+        IoctlCmd::ModeRmFb => {
+            // SAFETY: `arg` is the user drm_mode_rmfb pointer (a u32 fb id).
+            let fb_id = u32::from_le_bytes(unsafe { copy_in(arg, 4)? }[..4].try_into().unwrap());
+            let shown: Vec<u32> = mode_state
+                .lock()
+                .crtcs
+                .iter()
+                .filter(|c| c.primary_fb == Some(fb_id))
+                .map(|c| c.id)
+                .collect();
+            let result = handle_generic(&mode_state, cmd, arg, &ctx);
+            if result.is_ok() && crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
+                for crtc_id in shown {
+                    if let Some(display) = crate::amdgpu_navi48_kms::crtc_display(crtc_id) {
+                        crate::amdgpu_navi48_platform::request_display_active(display, false);
+                    }
+                }
+            }
+            result
+        }
         // Everything else: copy a generic buffer in, hand to the
         // generic dispatcher, copy results back. A few ioctls have
         // pure-output (no input bytes); those still funnel through the
@@ -2402,22 +2454,20 @@ fn handle_getconnector(
     // Connector properties: immutable EDID plus atomic CRTC_ID. libdrm runs the same
     // two-pass count protocol as modes/encoders, so fill the id (u32) + value
     // (u64 blob id) arrays only once the caller has sized them.
-    if props_ptr != 0 && prop_values_ptr != 0 && user_count_props >= 2 {
-        let crtc_id = {
-            let card = mode_state.lock();
-            card.encoder(info.encoder_id)
-                .ok()
-                .and_then(|encoder| encoder.crtc_id)
-                .unwrap_or(0)
-        };
-        let mut prop_ids = [0u8; 8];
-        prop_ids[0..4].copy_from_slice(&EDID_PROP_ID.to_le_bytes());
-        prop_ids[4..8].copy_from_slice(&CONNECTOR_CRTC_ID_PROP_ID.to_le_bytes());
-        let mut prop_values = [0u8; 16];
-        prop_values[0..8].copy_from_slice(&(edid_blob_id(info.connector_id) as u64).to_le_bytes());
-        prop_values[8..16].copy_from_slice(&(crtc_id as u64).to_le_bytes());
-        // SAFETY: both are user out-pointers the caller sized for >= 2 entries
-        // after the counting pass; the id array is u32, the value array u64.
+    let (props, values) = {
+        let card = mode_state.lock();
+        let crtc_id = card
+            .encoder(info.encoder_id)
+            .ok()
+            .and_then(|encoder| encoder.crtc_id)
+            .unwrap_or(0);
+        connector_properties(&card, info.connector_id, crtc_id)
+    };
+    if props_ptr != 0 && prop_values_ptr != 0 && user_count_props as usize >= props.len() {
+        let prop_ids: Vec<u8> = props.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let prop_values: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // SAFETY: both are user out-pointers the caller sized for every
+        // property after the counting pass; ids are u32, values u64.
         unsafe {
             copy_out(props_ptr as usize, &prop_ids)?;
             copy_out(prop_values_ptr as usize, &prop_values)?;
@@ -2428,7 +2478,7 @@ fn handle_getconnector(
     // bytes) and updating counts + connector fields (offsets 32..76).
     let mut out = in_bytes;
     out[32..36].copy_from_slice(&info.count_modes.to_le_bytes());
-    out[36..40].copy_from_slice(&2u32.to_le_bytes()); // EDID + CRTC_ID
+    out[36..40].copy_from_slice(&(props.len() as u32).to_le_bytes());
     out[40..44].copy_from_slice(&info.count_encoders.to_le_bytes());
     out[44..48].copy_from_slice(&info.encoder_id.to_le_bytes());
     out[48..52].copy_from_slice(&info.connector_id.to_le_bytes());
@@ -2470,6 +2520,238 @@ fn handle_getencoder(
     Ok(0)
 }
 
+// ── Vblank ioctls (drm_vblank.c) ─────────────────────────────────────
+
+const VBLANK_RELATIVE: u32 = 0x1;
+const VBLANK_HIGH_CRTC_MASK: u32 = 0x3e;
+const VBLANK_EVENT: u32 = 0x400_0000;
+const VBLANK_NEXTONMISS: u32 = 0x1000_0000;
+const VBLANK_SECONDARY: u32 = 0x2000_0000;
+const VBLANK_SIGNAL: u32 = 0x4000_0000;
+const VBLANK_FLAGS_MASK: u32 = VBLANK_EVENT | VBLANK_SIGNAL | VBLANK_SECONDARY | VBLANK_NEXTONMISS;
+/// `wait_event_interruptible_timeout(..., msecs_to_jiffies(3000))`.
+const VBLANK_WAIT_NS: u64 = 3_000_000_000;
+
+type EventQueue = narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>;
+type ModeState = alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>;
+
+/// `widen_32_to_64`: the 64-bit count nearest `current` whose low half is
+/// `seq`.
+fn widen_vblank(seq: u32, current: u64) -> u64 {
+    current.wrapping_add_signed(i64::from(seq.wrapping_sub(current as u32) as i32))
+}
+
+/// A blocking WAIT_VBLANK still to be waited out.
+pub(crate) struct VblankBlock {
+    source: crate::drm::card::VblankSource,
+    crtc_id: u32,
+    target: u64,
+    last: crate::drm::card::VblankTime,
+}
+
+/// `drm_wait_vblank_reply`: the count and its timestamp.
+fn wait_vblank_reply(arg: usize, t: crate::drm::card::VblankTime) -> Result<(), FsError> {
+    let mut reply = [0u8; 20];
+    reply[0..4].copy_from_slice(&(t.count as u32).to_le_bytes());
+    reply[4..12].copy_from_slice(&((t.ns / 1_000_000_000) as i64).to_le_bytes());
+    reply[12..20].copy_from_slice(&(((t.ns % 1_000_000_000) / 1_000) as i64).to_le_bytes());
+    // SAFETY: `arg` is the user drm_wait_vblank pointer; the reply's
+    // sequence and timeval follow its 4-byte type field.
+    unsafe { copy_out(arg + 4, &reply) }
+}
+
+/// DRM_IOCTL_WAIT_VBLANK up to the wait: validate, resolve the CRTC and
+/// target (Linux `drm_wait_vblank_ioctl`), then answer a query, a reached
+/// target or an event request at once. A target still ahead is returned
+/// for the caller to wait out.
+fn wait_vblank_begin(
+    mode_state: &ModeState,
+    arg: usize,
+    ctx: &DrmFileCtx,
+    events: Option<&EventQueue>,
+) -> Result<Option<VblankBlock>, FsError> {
+    if ctx.is_render_client() {
+        return Err(FsError::PermissionDenied);
+    }
+    // SAFETY: `arg` is the user drm_wait_vblank pointer (24 bytes).
+    let bytes = unsafe { copy_in(arg, 24)? };
+    let kind = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let sequence = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let signal = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let card = mode_state.lock();
+    // A card without hardware vblanks has none (drm_dev_has_vblank).
+    let source = card.vblank_source.ok_or(FsError::Unsupported)?;
+    if kind & VBLANK_SIGNAL != 0
+        || kind & !(VBLANK_RELATIVE | VBLANK_FLAGS_MASK | VBLANK_HIGH_CRTC_MASK) != 0
+    {
+        return Err(FsError::InvalidData);
+    }
+    let flags = kind & VBLANK_FLAGS_MASK;
+    let index = match kind & VBLANK_HIGH_CRTC_MASK {
+        0 => usize::from(flags & VBLANK_SECONDARY != 0),
+        high => (high >> 1) as usize,
+    };
+    let crtc_id = card.crtcs.get(index).ok_or(FsError::InvalidData)?.id;
+    // drm_vblank_get fails on a CRTC whose vblank is off.
+    let t = card
+        .vblank_time(crtc_id)
+        .map_err(|_| FsError::InvalidData)?;
+    let mut target = if kind & VBLANK_RELATIVE != 0 {
+        t.count.wrapping_add(u64::from(sequence))
+    } else {
+        widen_vblank(sequence, t.count)
+    };
+    if flags & VBLANK_NEXTONMISS != 0 && crate::drm::card::vblank_passed(t.count, target) {
+        target = t.count + 1;
+    }
+    if flags & VBLANK_EVENT != 0 {
+        let mut queue = events.ok_or(FsError::InvalidData)?.lock();
+        queue
+            .ensure_flip_event_space(1)
+            .map_err(|_| FsError::OutOfMemory)?;
+        // A target already passed is sent at once with the current count.
+        let passed = crate::drm::card::vblank_passed(t.count, target);
+        let target = if passed { t.count } else { target };
+        card.queue_vblank_event(&mut queue, signal, crtc_id, target, false)
+            .map_err(|_| FsError::OutOfMemory)?;
+        drop(queue);
+        drop(card);
+        // SAFETY: the reply sequence at offset 4 of the user struct.
+        unsafe { copy_out(arg + 4, &(target as u32).to_le_bytes())? };
+        return Ok(None);
+    }
+    drop(card);
+    if crate::drm::card::vblank_passed(t.count, target) {
+        wait_vblank_reply(arg, t)?;
+        return Ok(None);
+    }
+    Ok(Some(VblankBlock {
+        source,
+        crtc_id,
+        target,
+        last: t,
+    }))
+}
+
+/// DRM_IOCTL_WAIT_VBLANK, sleeping until the target vblank begins (a
+/// timer at its predicted start, then rechecks), for at most 3 s (EBUSY).
+/// A CRTC turned off ends the wait with its last count.
+pub(crate) async fn wait_vblank(
+    mode_state: &ModeState,
+    arg: usize,
+    ctx: &DrmFileCtx,
+    events: Option<&EventQueue>,
+) -> Result<u64, FsError> {
+    let Some(mut block) = wait_vblank_begin(mode_state, arg, ctx, events)? else {
+        return Ok(0);
+    };
+    let deadline = narf_time::wall::monotonic_ns().saturating_add(VBLANK_WAIT_NS);
+    while let Some(t) = (block.source)(block.crtc_id) {
+        block.last = t;
+        if crate::drm::card::vblank_passed(t.count, block.target) {
+            break;
+        }
+        let now = narf_time::wall::monotonic_ns();
+        if now >= deadline {
+            return Err(FsError::Busy);
+        }
+        let ahead = block.target.wrapping_sub(t.count).min(1 << 23);
+        let at = t
+            .start_ns
+            .saturating_add(ahead.saturating_mul(t.period_ns))
+            .min(deadline)
+            .max(now + 250_000);
+        narf_time::SleepUntil::new(narf_time::Deadline::after_us((at - now) / 1_000).as_instant())
+            .await;
+    }
+    wait_vblank_reply(arg, block.last)?;
+    Ok(0)
+}
+
+/// DRM_IOCTL_CRTC_GET_SEQUENCE (`drm_crtc_get_sequence_ioctl`).
+fn handle_crtc_get_sequence(
+    mode_state: &ModeState,
+    arg: usize,
+    ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    if ctx.is_render_client() {
+        return Err(FsError::PermissionDenied);
+    }
+    // SAFETY: `arg` is the user drm_crtc_get_sequence pointer (24 bytes).
+    let bytes = unsafe { copy_in(arg, 24)? };
+    let crtc_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let card = mode_state.lock();
+    if card.vblank_source.is_none() {
+        return Err(FsError::Unsupported);
+    }
+    let active = card.crtc(crtc_id).map_err(|_| FsError::NotFound)?.enabled;
+    let t = card
+        .vblank_time(crtc_id)
+        .map_err(|_| FsError::InvalidData)?;
+    drop(card);
+    let mut out = [0u8; 20];
+    out[0..4].copy_from_slice(&u32::from(active).to_le_bytes());
+    out[4..12].copy_from_slice(&t.count.to_le_bytes());
+    out[12..20].copy_from_slice(&(t.ns as i64).to_le_bytes());
+    // SAFETY: active, sequence and sequence_ns follow the 4-byte crtc_id.
+    unsafe { copy_out(arg + 4, &out)? };
+    Ok(0)
+}
+
+/// DRM_IOCTL_CRTC_QUEUE_SEQUENCE (`drm_crtc_queue_sequence_ioctl`).
+fn handle_crtc_queue_sequence(
+    mode_state: &ModeState,
+    arg: usize,
+    ctx: &DrmFileCtx,
+    events: Option<&EventQueue>,
+) -> Result<u64, FsError> {
+    const RELATIVE: u32 = 1;
+    const NEXT_ON_MISS: u32 = 2;
+    if ctx.is_render_client() {
+        return Err(FsError::PermissionDenied);
+    }
+    // SAFETY: `arg` is the user drm_crtc_queue_sequence pointer (24 bytes).
+    let bytes = unsafe { copy_in(arg, 24)? };
+    let crtc_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let flags = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let sequence = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let user_data = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    let card = mode_state.lock();
+    if card.vblank_source.is_none() {
+        return Err(FsError::Unsupported);
+    }
+    card.crtc(crtc_id).map_err(|_| FsError::NotFound)?;
+    if flags & !(RELATIVE | NEXT_ON_MISS) != 0 {
+        return Err(FsError::InvalidData);
+    }
+    let t = card
+        .vblank_time(crtc_id)
+        .map_err(|_| FsError::InvalidData)?;
+    let mut target = if flags & RELATIVE != 0 {
+        sequence.wrapping_add(t.count)
+    } else {
+        sequence
+    };
+    if flags & NEXT_ON_MISS != 0 && crate::drm::card::vblank_passed(t.count, target) {
+        target = t.count + 1;
+    }
+    let mut queue = events.ok_or(FsError::InvalidData)?.lock();
+    queue
+        .ensure_flip_event_space(1)
+        .map_err(|_| FsError::OutOfMemory)?;
+    // A target already passed is sent at once with the current count.
+    if crate::drm::card::vblank_passed(t.count, target) {
+        target = t.count;
+    }
+    card.queue_vblank_event(&mut queue, user_data, crtc_id, target, true)
+        .map_err(|_| FsError::OutOfMemory)?;
+    drop(queue);
+    drop(card);
+    // SAFETY: the sequence field at offset 8 of the user struct.
+    unsafe { copy_out(arg + 8, &target.to_le_bytes())? };
+    Ok(0)
+}
+
 /// DRM_IOCTL_MODE_GETCRTC — struct drm_mode_crtc (104 bytes). Reports the
 /// crtc's current fb/x/y/mode; `set_connectors_ptr`/`count_connectors` are
 /// input-only (zero on a get) and preserved.
@@ -2496,7 +2778,7 @@ fn handle_getcrtc(
         out[32..36].copy_from_slice(&mode_valid.to_le_bytes());
         match &crtc.mode {
             Some(m) => {
-                let wire = crate::drm::ioctl::mode_to_wire(m);
+                let wire = card.mode_wire(m);
                 out[36..104].copy_from_slice(&mode_to_bytes(&wire));
             }
             None => out[36..104].fill(0),
@@ -2604,6 +2886,11 @@ const CRTC_ACTIVE_PROP_ID: u32 = 0x52;
 /// `OUT_FENCE_PTR` on a CRTC: a userspace `s32*` filled with a sync_file
 /// fd whose fence signals at the commit's simulated vblank.
 const CRTC_OUT_FENCE_PTR_PROP_ID: u32 = 0x60;
+/// The connector "Broadcast RGB" enum (drm_connector_attach_broadcast_rgb_property).
+const BROADCAST_RGB_PROP_ID: u32 = 0x61;
+/// An enum property's (value, name) entries.
+type EnumEntries = [(u64, &'static [u8]); 3];
+const BROADCAST_RGB_ENUMS: EnumEntries = [(0, b"Automatic"), (1, b"Full"), (2, b"Limited 16:235")];
 /// `IN_FENCE_FD` on a plane: a sync_file fd (-1 = none) gating the flip.
 const PLANE_IN_FENCE_FD_PROP_ID: u32 = 0x5f;
 const CRTC_MODE_ID_PROP_ID: u32 = 0x53;
@@ -2657,6 +2944,9 @@ fn connector_id_from_edid_blob(blob_id: u32) -> Option<u32> {
 /// `None` if the connector has no id / no modes.
 fn connector_edid(card: &crate::drm::card::Card, connector_id: u32) -> Option<[u8; 128]> {
     let conn = card.connector(connector_id).ok()?;
+    if let Some(native) = card.native_output(connector_id) {
+        return native.edid;
+    }
     let m = conn.modes.first()?;
     Some(crate::drm::edid_gen::synth_edid(
         m.width,
@@ -2716,13 +3006,16 @@ fn handle_getplane(
     let plane_id = u32::from_le_bytes(out[0..4].try_into().unwrap());
     let user_fmt_count = u32::from_le_bytes(out[20..24].try_into().unwrap());
     let fmt_ptr = u64::from_le_bytes(out[24..32].try_into().unwrap());
-    let possible_crtcs = {
+    let (possible_crtcs, formats) = {
         let card = mode_state.lock();
         match synth_planes(&card)
             .into_iter()
             .find(|(id, _)| *id == plane_id)
         {
-            Some((_, crtc_idx)) => 1u32 << crtc_idx,
+            Some((_, crtc_idx)) => (
+                1u32 << crtc_idx,
+                card.plane_formats.unwrap_or(&[DRM_FORMAT_XRGB8888]),
+            ),
             None => return Err(FsError::InvalidData),
         }
     };
@@ -2731,13 +3024,14 @@ fn handle_getplane(
     out[12..16].copy_from_slice(&possible_crtcs.to_le_bytes());
     out[16..20].copy_from_slice(&0u32.to_le_bytes()); // gamma_size
 
-    // One supported format (XRGB8888); fill the array two-pass.
-    if fmt_ptr != 0 && user_fmt_count >= 1 {
+    // The plane's formats (XRGB8888 on the CPU-copy cards); two-pass.
+    if fmt_ptr != 0 && user_fmt_count as usize >= formats.len() {
+        let bytes: Vec<u8> = formats.iter().flat_map(|f| f.to_le_bytes()).collect();
         // SAFETY: `fmt_ptr` is the user format-array out-pointer with room
-        // for >=1 u32 (checked above).
-        unsafe { copy_out(fmt_ptr as usize, &DRM_FORMAT_XRGB8888.to_le_bytes())? };
+        // for every format (checked above).
+        unsafe { copy_out(fmt_ptr as usize, &bytes)? };
     }
-    out[20..24].copy_from_slice(&1u32.to_le_bytes()); // count_format_types
+    out[20..24].copy_from_slice(&(formats.len() as u32).to_le_bytes()); // count_format_types
 
     // SAFETY: `arg` is the validated 32-byte out-pointer.
     unsafe { copy_out(arg, &out)? };
@@ -2894,19 +3188,23 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
         unsafe { copy_out(arg, &out)? };
         return Ok(0);
     }
-    if prop_id != PLANE_TYPE_PROP_ID {
-        return Err(FsError::InvalidData);
-    }
-    out[20..24].copy_from_slice(&(DRM_MODE_PROP_ENUM | DRM_MODE_PROP_IMMUTABLE).to_le_bytes());
+    let (name, flags, enums): (&[u8], u32, EnumEntries) = match prop_id {
+        PLANE_TYPE_PROP_ID => (
+            b"type",
+            DRM_MODE_PROP_ENUM | DRM_MODE_PROP_IMMUTABLE,
+            [(0, b"Overlay"), (1, b"Primary"), (2, b"Cursor")],
+        ),
+        BROADCAST_RGB_PROP_ID => (b"Broadcast RGB", DRM_MODE_PROP_ENUM, BROADCAST_RGB_ENUMS),
+        _ => return Err(FsError::InvalidData),
+    };
+    out[20..24].copy_from_slice(&flags.to_le_bytes());
     out[24..56].fill(0);
-    let name = b"type";
     out[24..24 + name.len()].copy_from_slice(name);
     // For an ENUM property the entries go to ENUM_BLOB_PTR (offset 8) and
     // are counted by count_enum_blobs (offset 60); values_ptr/count_values
     // (offsets 0 and 56) MUST ALSO be populated with the valid enum values.
     // `modetest` iterates over both and asserts they are present.
     // Each enum entry is `drm_mode_property_enum { __u64 value; char name[32]; }` = 40 bytes.
-    let enums: [(u64, &[u8]); 3] = [(0, b"Overlay"), (1, b"Primary"), (2, b"Cursor")];
 
     let values_ptr = u64::from_le_bytes(out[0..8].try_into().unwrap());
     let user_values_count = u32::from_le_bytes(out[56..60].try_into().unwrap());
@@ -2938,6 +3236,93 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
 
     // SAFETY: `arg` is the validated 64-byte out-pointer.
     unsafe { copy_out(arg, &out)? };
+    Ok(0)
+}
+
+/// A connector's properties and current values: the EDID blob, the atomic
+/// CRTC_ID, and "Broadcast RGB" where the connector has it.
+fn connector_properties(
+    card: &crate::drm::card::Card,
+    connector_id: u32,
+    crtc_id: u32,
+) -> (Vec<u32>, Vec<u64>) {
+    let mut props = alloc::vec![EDID_PROP_ID, CONNECTOR_CRTC_ID_PROP_ID];
+    let mut values = alloc::vec![edid_blob_id(connector_id) as u64, crtc_id as u64];
+    if let Some(value) = card
+        .native_output(connector_id)
+        .and_then(|n| n.broadcast_rgb)
+    {
+        props.push(BROADCAST_RGB_PROP_ID);
+        values.push(u64::from(value));
+    }
+    (props, values)
+}
+
+/// Validate a "Broadcast RGB" value for `connector`, as
+/// drm_property_change_valid_get does for an enum: EINVAL for a connector
+/// without the property or a value outside its enum.
+fn broadcast_rgb_value(
+    card: &crate::drm::card::Card,
+    connector: u32,
+    value: u64,
+) -> Result<u8, FsError> {
+    let has = card
+        .native_output(connector)
+        .is_some_and(|n| n.broadcast_rgb.is_some());
+    if !has || !BROADCAST_RGB_ENUMS.iter().any(|&(v, _)| v == value) {
+        return Err(FsError::InvalidData);
+    }
+    Ok(value as u8)
+}
+
+/// Commit a validated "Broadcast RGB" value: the connector reports it and
+/// the native display relights in the matching range.
+fn apply_broadcast_rgb(
+    card_index: u32,
+    card: &mut crate::drm::card::Card,
+    connector: u32,
+    value: u8,
+) {
+    if let Some(native) = card.native.iter_mut().find(|n| n.connector == connector) {
+        native.broadcast_rgb = Some(value);
+    }
+    if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
+        crate::amdgpu_navi48_platform::request_broadcast_rgb(value);
+    }
+}
+
+/// DRM_IOCTL_MODE_SETPROPERTY (`struct drm_mode_connector_set_property`:
+/// value@0, prop_id@8, connector_id@12) and DRM_IOCTL_MODE_OBJ_SETPROPERTY
+/// (`struct drm_mode_obj_set_property`: value@0, prop_id@8, obj_id@12,
+/// obj_type@16). Only a connector's "Broadcast RGB" is settable this way;
+/// like drm_mode_obj_set_property_ioctl, an unknown object is ENOENT and a
+/// property the object lacks is EINVAL. Master only.
+fn handle_set_property(
+    card_index: u32,
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    ctx: &DrmFileCtx,
+    object: bool,
+) -> Result<u64, FsError> {
+    if !ctx.is_master {
+        return Err(FsError::PermissionDenied);
+    }
+    // SAFETY: `arg` is the ioctl's fixed-size argument structure.
+    let bytes = unsafe { copy_in(arg, if object { 20 } else { 16 })? };
+    let value = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let prop_id = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let obj_id = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    if object && u32::from_le_bytes(bytes[16..20].try_into().unwrap()) != DRM_MODE_OBJECT_CONNECTOR
+    {
+        return Err(FsError::InvalidData);
+    }
+    let mut card = mode_state.lock();
+    card.connector(obj_id).map_err(|_| FsError::NotFound)?;
+    if prop_id != BROADCAST_RGB_PROP_ID {
+        return Err(FsError::InvalidData);
+    }
+    let value = broadcast_rgb_value(&card, obj_id, value)?;
+    apply_broadcast_rgb(card_index, &mut card, obj_id, value);
     Ok(0)
 }
 
@@ -3072,10 +3457,7 @@ fn handle_obj_getproperties(
                 .and_then(|id| card.encoder(id).ok())
                 .and_then(|encoder| encoder.crtc_id)
                 .unwrap_or(0);
-            (
-                vec![EDID_PROP_ID, CONNECTOR_CRTC_ID_PROP_ID],
-                vec![edid_blob_id(obj_id) as u64, crtc_id as u64],
-            )
+            connector_properties(&card, obj_id, crtc_id)
         } else {
             return Err(FsError::InvalidData);
         }
@@ -3382,6 +3764,8 @@ fn handle_atomic(
         .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
         .collect();
 
+    // The exact timing an atomic MODE_ID set, for the native display.
+    let mut native_modes: Vec<(u32, crate::drm::ioctl::DrmModeModeInfo)> = Vec::new();
     let mut state = crate::drm::atomic::AtomicState {
         allow_modeset: req.flags & ALLOW_MODESET != 0,
         ..Default::default()
@@ -3403,6 +3787,8 @@ fn handle_atomic(
         // actually requested.
         let mut event_crtc_ids =
             (req.flags & PAGE_FLIP_EVENT != 0).then(|| Vec::with_capacity(card.crtcs.len()));
+        // Connector "Broadcast RGB" values, applied only with the commit.
+        let mut broadcast_rgb: Vec<(u32, u8)> = Vec::new();
         for (object_index, object_id) in objects.iter().copied().enumerate() {
             let object_prop_count = prop_counts[object_index] as usize;
             let end = prop_index
@@ -3507,6 +3893,27 @@ fn handle_atomic(
                                     .property_blob(value as u32)
                                     .filter(|blob| blob.len() == 68)
                                     .ok_or(FsError::InvalidData)?;
+                                // A native display runs only its published
+                                // timing; any other is refused at check time.
+                                if !card.accepts_mode_blob(mode) {
+                                    return Err(FsError::InvalidData);
+                                }
+                                if let Some(wire) =
+                                    crate::drm::ioctl::DrmModeModeInfo::from_bytes(mode)
+                                {
+                                    // On the native card, a timing this
+                                    // CRTC's connector offers: checked once
+                                    // every connector routing is parsed.
+                                    if crate::drm_registry::driver_name(card_index)
+                                        == Some("amdgpu")
+                                        && crate::amdgpu_navi48_kms::crtc_display(object_id)
+                                            .is_none()
+                                    {
+                                        return Err(FsError::InvalidData);
+                                    }
+                                    native_modes.retain(|(id, _)| *id != object_id);
+                                    native_modes.push((object_id, wire));
+                                }
                                 Some(crate::Mode {
                                     width: u16::from_le_bytes(mode[4..6].try_into().unwrap())
                                         as u32,
@@ -3562,6 +3969,8 @@ fn handle_atomic(
                         CONNECTOR_CRTC_ID_PROP_ID => {
                             connector_state.crtc_id = (value != 0).then_some(value as u32)
                         }
+                        BROADCAST_RGB_PROP_ID => broadcast_rgb
+                            .push((object_id, broadcast_rgb_value(&card, object_id, value)?)),
                         _ => return Err(FsError::InvalidData),
                     }
                 }
@@ -3584,6 +3993,23 @@ fn handle_atomic(
                 "  drm: ATOMIC check failed: {error:?}"
             );
             return Err(FsError::InvalidData);
+        }
+        check_native_atomic(&card, &state)?;
+        // A native MODE_ID is a timing of the connector the CRTC drives
+        // after this commit: one routed to it here, else its current one.
+        if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
+            for (crtc_id, wire) in &native_modes {
+                let connector = state
+                    .connectors
+                    .iter()
+                    .find(|c| c.crtc_id == Some(*crtc_id))
+                    .map(|c| c.id);
+                if !crate::amdgpu_navi48_kms::crtc_display(*crtc_id).is_some_and(|d| {
+                    crate::amdgpu_navi48_platform::display_offers(d, connector, wire)
+                }) {
+                    return Err(FsError::InvalidData);
+                }
+            }
         }
 
         // Linux reserves one event for every CRTC participating in the atomic
@@ -3613,10 +4039,50 @@ fn handle_atomic(
                 );
                 return Err(FsError::InvalidData);
             }
-            let active_plane = state
+            for &(connector, value) in &broadcast_rgb {
+                apply_broadcast_rgb(card_index, &mut card, connector, value);
+            }
+            let amdgpu = crate::drm_registry::driver_name(card_index) == Some("amdgpu");
+            if amdgpu {
+                // Routing first: a mode is checked against the connector the
+                // CRTC drives. Any encoder may drive any native CRTC.
+                for c in &state.connectors {
+                    let current = card
+                        .connector(c.id)
+                        .ok()
+                        .and_then(|x| x.encoder_id)
+                        .and_then(|id| card.encoder(id).ok())
+                        .and_then(|e| e.crtc_id);
+                    if current != c.crtc_id {
+                        let display = c.crtc_id.and_then(crate::amdgpu_navi48_kms::crtc_display);
+                        crate::amdgpu_navi48_platform::request_connector_crtc(c.id, display);
+                    }
+                }
+                for crtc in &state.crtcs {
+                    let Some(display) = crate::amdgpu_navi48_kms::crtc_display(crtc.id) else {
+                        continue;
+                    };
+                    if crtc.active_changed {
+                        crate::amdgpu_navi48_platform::request_display_active(display, crtc.active);
+                    }
+                    // A new mode is a native modeset the display monitor runs.
+                    if crtc.mode_changed {
+                        let wire = native_modes
+                            .iter()
+                            .find(|(id, _)| *id == crtc.id)
+                            .map(|(_, w)| w);
+                        crate::amdgpu_navi48_platform::request_display_mode(display, wire);
+                    }
+                }
+            }
+            // Every enabled plane presents on the native card (each on its
+            // own display); the CPU-copy cards show one scanout.
+            let active_planes: Vec<(u32, u32)> = state
                 .planes
                 .iter()
-                .find_map(|plane| Some((plane.crtc_id?, plane.fb_id?)));
+                .filter_map(|plane| Some((plane.crtc_id?, plane.fb_id?)))
+                .take(if amdgpu { usize::MAX } else { 1 })
+                .collect();
             // Advance the simulated vblank exactly once per affected CRTC;
             // the PAGE_FLIP_EVENT and any OUT_FENCE_PTR on the same CRTC
             // observe the same present instant.
@@ -3633,8 +4099,29 @@ fn handle_atomic(
                 at
             }
             let mut presented: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::new();
+            // CRTCs whose plane's dumb buffer goes through a hardware flip:
+            // their events wait for that flip.
+            let hardware_crtcs: Vec<u32> = active_planes
+                .iter()
+                .filter(|&&(crtc_id, _)| hardware_flips(card_index, crtc_id))
+                .filter_map(|&(crtc_id, fb_id)| {
+                    let gem_handle = card.framebuffer(fb_id).ok()?.gem_handle;
+                    (card.virtgpu_import(gem_handle).is_none()
+                        && card.dumb_backing(gem_handle).is_some())
+                    .then_some(crtc_id)
+                })
+                .collect();
+            let mut flip_tickets: Vec<(u32, u64)> = Vec::new();
             if let (Some(queue), Some(crtc_ids)) = (event_queue.as_mut(), event_crtc_ids) {
                 for crtc_id in crtc_ids {
+                    let display = crate::amdgpu_navi48_kms::crtc_display(crtc_id);
+                    if let (true, Some(display)) = (hardware_crtcs.contains(&crtc_id), display) {
+                        let ticket = crate::drm::card::flips(display).lock().reserve();
+                        card.queue_hw_flip_event(queue, req.user_data, crtc_id, display, ticket)
+                            .map_err(|_| FsError::OutOfMemory)?;
+                        flip_tickets.push((crtc_id, ticket));
+                        continue;
+                    }
                     let at = present_at_for(&mut card, &mut presented, crtc_id);
                     card.queue_flip_event_at(queue, req.user_data, crtc_id, at)
                         .map_err(|_| FsError::OutOfMemory)?;
@@ -3652,18 +4139,27 @@ fn handle_atomic(
                     }
                 }
             }
-            active_plane.and_then(|(_, fb_id)| {
-                let fb = card.framebuffer(fb_id).ok()?;
-                let gem_handle = fb.gem_handle;
-                Some((
-                    card.virtgpu_import(gem_handle).cloned(),
-                    card.dumb_backing(gem_handle).map(|backing| backing.phys),
-                    fb.pitch,
-                    fb.width,
-                    fb.height,
-                    fb_id,
-                ))
-            })
+            let presentations: Vec<_> = active_planes
+                .iter()
+                .filter_map(|&(crtc_id, fb_id)| {
+                    let fb = card.framebuffer(fb_id).ok()?;
+                    let gem_handle = fb.gem_handle;
+                    Some((
+                        crtc_id,
+                        card.virtgpu_import(gem_handle).cloned(),
+                        card.dumb_backing(gem_handle).map(|backing| backing.phys),
+                        fb.pitch,
+                        fb.width,
+                        fb.height,
+                        fb_id,
+                        flip_tickets
+                            .iter()
+                            .find(|(id, _)| *id == crtc_id)
+                            .map(|(_, t)| *t),
+                    ))
+                })
+                .collect();
+            Some(presentations)
         }
     };
 
@@ -3675,14 +4171,24 @@ fn handle_atomic(
             req.count_objs,
             total_props,
             req.flags,
-            presentation.is_some(),
+            presentation.as_ref().is_some_and(|p| !p.is_empty()),
         );
     }
-    if let Some((resource, src_phys, pitch, width, height, fb_id)) = presentation {
+    for (crtc_id, resource, src_phys, pitch, width, height, fb_id, flip_ticket) in
+        presentation.into_iter().flatten()
+    {
         if let Some(resource) = resource {
             present_virgl_frame(&resource, width, height)?;
         } else if let Some(src_phys) = src_phys {
-            present_frame(card_index, src_phys, pitch, width, height);
+            present_frame(
+                card_index,
+                crtc_id,
+                src_phys,
+                pitch,
+                width,
+                height,
+                flip_ticket,
+            );
         } else {
             note_missing_backing("ATOMIC", fb_id);
         }
@@ -3966,6 +4472,74 @@ fn should_log(counter: &AtomicU64) -> (bool, u64) {
 /// into the active scanout via `narf_fb::fbdev_info` + memcpy.
 ///
 /// Linux ref: `drivers/gpu/drm/drm_crtc.c::drm_mode_setcrtc`.
+/// A plane's destination (x, y, w, h on the CRTC) and source (x, y, w, h
+/// in the framebuffer) rectangles.
+type PlaneRects = ((i32, i32, u32, u32), (u32, u32, u32, u32));
+
+/// What a natively scanned-out primary plane can show: an unscaled,
+/// full-screen frame from the framebuffer's origin in one of the card's
+/// plane formats (`Card::plane_formats`), covering the CRTC's mode. Linux
+/// refuses scaling or positioning a plane cannot do with EINVAL, and a
+/// framebuffer smaller than its viewport with ENOSPC
+/// (drm_atomic_helper_check_plane_state, drm_crtc_check_viewport).
+/// `Ok` on cards without native planes.
+fn check_native_plane(
+    card: &crate::drm::card::Card,
+    fb_id: u32,
+    mode: Option<crate::Mode>,
+    origin: (u32, u32),
+    rects: Option<PlaneRects>,
+) -> Result<(), FsError> {
+    let Some(formats) = card.plane_formats else {
+        return Ok(());
+    };
+    let fb = card.framebuffer(fb_id).map_err(|_| FsError::NotFound)?;
+    if !formats.contains(&(fb.format as u32)) {
+        return Err(FsError::InvalidData);
+    }
+    let Some(mode) = mode else {
+        return Err(FsError::InvalidData);
+    };
+    let (w, h) = (mode.width, mode.height);
+    if origin != (0, 0) {
+        return Err(FsError::InvalidData);
+    }
+    if let Some((dst, src)) = rects {
+        if dst != (0, 0, w, h) || src != (0, 0, w, h) {
+            return Err(FsError::InvalidData);
+        }
+    }
+    if fb.width < w || fb.height < h {
+        return Err(FsError::NoSpace);
+    }
+    Ok(())
+}
+
+/// Every enabled plane of an atomic state on a native card, in the mode
+/// its CRTC has after the commit (`check_native_plane`).
+pub(crate) fn check_native_atomic(
+    card: &crate::drm::card::Card,
+    state: &crate::drm::atomic::AtomicState,
+) -> Result<(), FsError> {
+    for plane in &state.planes {
+        let (Some(fb_id), Some(crtc_id)) = (plane.fb_id, plane.crtc_id) else {
+            continue;
+        };
+        let mode = state
+            .crtcs
+            .iter()
+            .find(|c| c.id == crtc_id)
+            .map(|c| c.mode)
+            .unwrap_or_else(|| card.crtc(crtc_id).ok().and_then(|c| c.mode));
+        let rects = (
+            (plane.crtc_x, plane.crtc_y, plane.crtc_w, plane.crtc_h),
+            (plane.src_x, plane.src_y, plane.src_w, plane.src_h),
+        );
+        check_native_plane(card, fb_id, mode, (0, 0), Some(rects))?;
+    }
+    Ok(())
+}
+
 fn handle_setcrtc(
     card_index: u32,
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
@@ -3994,10 +4568,83 @@ fn handle_setcrtc(
     let src_pitch: u32;
     let src_w: u32;
     let src_h: u32;
+    // SETCRTC's single connector id, read before any card lock is held.
+    let setcrtc_connector = if req.count_connectors == 1 && req.set_connectors_ptr != 0 {
+        // SAFETY: a user pointer to count_connectors (one) u32 ids.
+        let ids = unsafe { copy_in(req.set_connectors_ptr as usize, 4)? };
+        Some(u32::from_le_bytes(ids[..4].try_into().unwrap()))
+    } else {
+        None
+    };
     {
         let mut card = mode_state.lock();
 
-        // Record the mode and active fb on the crtc.
+        // The native display behind this CRTC, on the amdgpu card.
+        let native_display = (crate::drm_registry::driver_name(card_index) == Some("amdgpu"))
+            .then(|| crate::amdgpu_navi48_kms::crtc_display(req.crtc_id))
+            .flatten();
+        // The connector SETCRTC routes the native CRTC to: one at most (no
+        // cloning); none keeps the current routing.
+        let native_connector = if native_display.is_some() && req.count_connectors != 0 {
+            if req.count_connectors != 1 || req.set_connectors_ptr == 0 {
+                return Err(FsError::InvalidData);
+            }
+            let id = setcrtc_connector.ok_or(FsError::InvalidData)?;
+            if card.connector(id).is_err() {
+                return Err(FsError::InvalidData);
+            }
+            Some(id)
+        } else {
+            None
+        };
+        let mut native_wire = None;
+        if req.mode_valid != 0 {
+            let m = req.mode;
+            let wire = crate::drm::ioctl::DrmModeModeInfo {
+                clock: m.clock,
+                hdisplay: m.hdisplay,
+                hsync_start: m.hsync_start,
+                hsync_end: m.hsync_end,
+                htotal: m.htotal,
+                hskew: m.hskew,
+                vdisplay: m.vdisplay,
+                vsync_start: m.vsync_start,
+                vsync_end: m.vsync_end,
+                vtotal: m.vtotal,
+                vscan: m.vscan,
+                vrefresh: m.vrefresh,
+                flags: m.flags,
+                r#type: m.r#type,
+                name: m.name,
+            };
+            if !card.accepts_mode(&wire) {
+                return Err(FsError::InvalidData);
+            }
+            // On the native card, a timing this CRTC's own display offers.
+            if native_display.is_some_and(|d| {
+                !crate::amdgpu_navi48_platform::display_offers(d, native_connector, &wire)
+            }) || (crate::drm_registry::driver_name(card_index) == Some("amdgpu")
+                && native_display.is_none())
+            {
+                return Err(FsError::InvalidData);
+            }
+            native_wire = Some(wire);
+        }
+
+        let requested = (req.mode_valid != 0).then(|| crate::Mode {
+            width: u32::from(req.mode.hdisplay),
+            height: u32::from(req.mode.vdisplay),
+            refresh_hz: req.mode.vrefresh as u16,
+            bpp: 32,
+        });
+        // A native plane is validated before any state changes.
+        if req.fb_id != 0 {
+            let mode = requested.or_else(|| card.crtc(req.crtc_id).ok().and_then(|c| c.mode));
+            check_native_plane(&card, req.fb_id, mode, (req.x, req.y), None)?;
+        }
+
+        // Record the mode and active fb on the crtc; switching it off
+        // without a mode clears the mode (drm_mode_setcrtc).
         if let Ok(crtc) = card.crtc_mut(req.crtc_id) {
             crtc.primary_fb = if req.fb_id != 0 {
                 Some(req.fb_id)
@@ -4005,6 +4652,21 @@ fn handle_setcrtc(
                 None
             };
             crtc.enabled = req.fb_id != 0;
+            if requested.is_some() || req.fb_id == 0 {
+                crtc.mode = requested;
+            }
+        }
+        // The native display follows the CRTC's on/off state, and another
+        // offered timing is a native modeset the display monitor runs (the
+        // current one leaves it as it is).
+        if let Some(display) = native_display {
+            if let Some(id) = native_connector {
+                crate::amdgpu_navi48_platform::request_display_route(display, Some(id));
+            }
+            if let Some(wire) = native_wire.as_ref() {
+                crate::amdgpu_navi48_platform::request_display_mode(display, Some(wire));
+            }
+            crate::amdgpu_navi48_platform::request_display_active(display, req.fb_id != 0);
         }
 
         if req.fb_id == 0 {
@@ -4040,7 +4702,7 @@ fn handle_setcrtc(
     if let Some(resource) = virgl_resource {
         present_virgl_frame(&resource, src_w, src_h)?;
     } else if let Some(src) = src_phys {
-        present_frame(card_index, src, src_pitch, src_w, src_h);
+        present_frame(card_index, req.crtc_id, src, src_pitch, src_w, src_h, None);
     } else {
         note_missing_backing("SETCRTC", req.fb_id);
     }
@@ -4098,6 +4760,7 @@ fn handle_page_flip(
     let src_pitch: u32;
     let src_w: u32;
     let src_h: u32;
+    let mut flip_ticket = None;
     {
         let mut card = mode_state.lock();
         // Linux resolves an unknown CRTC/fb as ENOENT and refuses a flip from
@@ -4115,6 +4778,13 @@ fn handle_page_flip(
         if fb.format != old_format {
             return Err(FsError::InvalidData);
         }
+        let mode = card.crtc(req.crtc_id).ok().and_then(|c| c.mode);
+        let (x, y) = card
+            .crtc(req.crtc_id)
+            .map(|c| (c.x, c.y))
+            .unwrap_or_default();
+        check_native_plane(&card, req.fb_id, mode, (x, y), None)?;
+        let fb = card.framebuffer(req.fb_id).map_err(|_| FsError::NotFound)?;
         src_pitch = fb.pitch;
         src_w = fb.width;
         src_h = fb.height;
@@ -4139,10 +4809,23 @@ fn handle_page_flip(
             .primary_fb = Some(req.fb_id);
 
         if let Some(queue) = event_queue.as_mut() {
-            // The blit is synchronous; completion is then exposed at the
-            // simulated-vblank deadline recorded by queue_flip_event.
-            card.queue_flip_event(queue, req.user_data, req.crtc_id)
-                .map_err(|_| FsError::OutOfMemory)?;
+            let hardware = (virgl_resource.is_none()
+                && src_phys.is_some()
+                && hardware_flips(card_index, req.crtc_id))
+            .then(|| crate::amdgpu_navi48_kms::crtc_display(req.crtc_id))
+            .flatten();
+            if let Some(display) = hardware {
+                // The event waits for the hardware flip of this frame.
+                let ticket = crate::drm::card::flips(display).lock().reserve();
+                card.queue_hw_flip_event(queue, req.user_data, req.crtc_id, display, ticket)
+                    .map_err(|_| FsError::OutOfMemory)?;
+                flip_ticket = Some(ticket);
+            } else {
+                // The blit is synchronous; completion is then exposed at the
+                // simulated-vblank deadline recorded by queue_flip_event.
+                card.queue_flip_event(queue, req.user_data, req.crtc_id)
+                    .map_err(|_| FsError::OutOfMemory)?;
+            }
         }
     }
 
@@ -4163,7 +4846,15 @@ fn handle_page_flip(
     if let Some(resource) = virgl_resource {
         present_virgl_frame(&resource, src_w, src_h)?;
     } else if let Some(src) = src_phys {
-        present_frame(card_index, src, src_pitch, src_w, src_h);
+        present_frame(
+            card_index,
+            req.crtc_id,
+            src,
+            src_pitch,
+            src_w,
+            src_h,
+            flip_ticket,
+        );
     } else {
         note_missing_backing("PAGE_FLIP", req.fb_id);
     }
@@ -4209,8 +4900,50 @@ fn present_virgl_frame(resource: &VirtGpuResource, width: u32, height: u32) -> R
 /// virtio card's pixels through the global fbdev hook would silently draw on
 /// bochs instead.  Select the owning card here so the primary DRM node and
 /// the visible scanout always agree.
-fn present_frame(card_index: u32, src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
-    if crate::drm_registry::driver_name(card_index) == Some("virtio_gpu") {
+/// Whether `card_index` presents dumb-buffer frames through a hardware flip,
+/// so their flip-complete events wait for that flip (see `drm::card::FlipLog`).
+fn hardware_flips(card_index: u32, crtc_id: u32) -> bool {
+    crate::drm_registry::driver_name(card_index) == Some("amdgpu")
+        && crate::amdgpu_navi48_kms::crtc_display(crtc_id)
+            .is_some_and(crate::amdgpu_navi48_platform::native_present_ready)
+}
+
+/// `flip_ticket` is the ticket of a flip-complete event waiting for this
+/// frame's hardware flip; it is completed whichever way the frame goes.
+fn present_frame(
+    card_index: u32,
+    crtc_id: u32,
+    src_phys: u64,
+    src_pitch: u32,
+    src_w: u32,
+    src_h: u32,
+    flip_ticket: Option<u64>,
+) {
+    let driver = crate::drm_registry::driver_name(card_index);
+    // A native amdgpu display presents tear-free through its back buffer
+    // and a VUPDATE-latched flip instead of copying onto the visible front.
+    if driver == Some("amdgpu") {
+        if let Some(display) = crate::amdgpu_navi48_kms::crtc_display(crtc_id) {
+            // A refused frame completes its ticket at once.
+            let native = crate::amdgpu_navi48_platform::present_frame(
+                display,
+                src_phys,
+                src_pitch,
+                src_w,
+                src_h,
+                flip_ticket,
+            );
+            if native {
+                narf_console::fb_take_for_user();
+                return;
+            }
+            // Only the console's display has a CPU front to copy onto.
+            if display != crate::amdgpu_navi48_platform::console_pipe() {
+                return;
+            }
+        }
+    }
+    if driver == Some("virtio_gpu") {
         blit_to_virtio_scanout(src_phys, src_pitch, src_w, src_h);
     } else {
         blit_to_scanout(src_phys, src_pitch, src_w, src_h);
@@ -4289,7 +5022,10 @@ fn blit_to_virtio_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32)
 /// The scanout geometry is fetched through the DRM fbdev hook installed
 /// by `narf_fb` at `Stage::Late` — avoids a circular crate dependency.
 fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
-    let info = match crate::drm_fb_hook::query_scanout() {
+    // SAFETY: fb replaces its generic mapping through scanout_access; all
+    // destination accesses below finish before this view is dropped.
+    let view = unsafe { crate::scanout_access::snapshot(crate::drm_fb_hook::query_scanout) };
+    let info = match *view {
         Some(i) => i,
         None => {
             // No live scanout: the client's pixels are being dropped on the
@@ -4329,19 +5065,27 @@ fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
     let row_bytes = (dst_w as usize) * 4;
     for row in 0..dst_h as usize {
         let src_row = src_phys + (row * src_pitch as usize) as u64;
-        let dst_row = info.phys + (row * info.stride_bytes as usize) as u64;
-        // SAFETY: Both src and dst are identity-mapped physical addresses
-        // validated by their respective allocators; `row_bytes` is within
-        // the allocation bounds (row < dst_h <= src_h, dst_w <= src_w).
+        let offset = (row * info.stride_bytes as usize) as u64;
+        // A device-memory scanout is reached through its kernel mapping; a
+        // RAM-backed one through the physical map.
+        let dst = if info.virt != 0 {
+            (info.virt + offset) as *mut u8
+        } else {
+            narf_memory::PhysAddr::new(info.phys + offset).kernel_mut_ptr::<u8>()
+        };
+        // SAFETY: src is an identity-mapped dumb buffer validated by its
+        // allocator; dst is the scanout's mapping or physical-map address.
+        // `row_bytes` is within both (row < dst_h <= src_h, dst_w <= src_w).
         // SAFETY: Valid memory or trusted environment
         unsafe {
             core::ptr::copy_nonoverlapping(
                 narf_memory::PhysAddr::new(src_row).kernel_ptr::<u8>(),
-                narf_memory::PhysAddr::new(dst_row).kernel_mut_ptr::<u8>(),
+                dst,
                 row_bytes,
             );
         }
     }
+    drop(view);
     // Tell the FB cursor renderer the frame was fully repainted so it drops
     // its now-stale saved-background snapshot and re-composites the pointer
     // over the fresh frame (otherwise the compositor's repaint would leave the

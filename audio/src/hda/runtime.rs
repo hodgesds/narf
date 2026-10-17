@@ -6,7 +6,7 @@ use crate::{
 use alloc::{sync::Arc, vec::Vec};
 use core::{
     mem::ManuallyDrop,
-    sync::atomic::{fence, AtomicBool, Ordering},
+    sync::atomic::{fence, AtomicBool, AtomicU32, Ordering},
 };
 use narf_bus::{bar, BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
@@ -57,6 +57,16 @@ pub struct IntelHda {
     /// `capabilities()` stays a pure read on a path alsa-lib walks repeatedly.
     pub(super) supported_formats: [Vec<narf_drivers_sound::format::SampleFormat>; 2],
     pub ready: bool,
+    /// AMD GPU HD-Audio does not snoop (Linux AZX_DCAPS_SNOOP_OFF): CORB,
+    /// RIRB, BDL and sample buffers need explicit cache maintenance.
+    pub(crate) noncoherent: bool,
+    /// HDMI/DP port pins on GPU codecs and their last sensed sink.
+    pub(super) hdmi: IrqSafeSpinLock<Vec<super::hdmi::Port>>,
+    /// The HDMI playback PCM's IEC958 status, DIGEN and channel map.
+    pub(super) hdmi_playback: IrqSafeSpinLock<super::hdmi::Playback>,
+    /// Sound card index once registered (`u32::MAX` before), for control
+    /// change notifications.
+    pub(super) card: AtomicU32,
 }
 impl core::fmt::Debug for IntelHda {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -100,8 +110,11 @@ impl IntelHda {
                 }
             }
         }
+        // Linux's AZX_DCAPS_PRESET_ATI_HDMI_NS: every ATI GPU HD-Audio
+        // function runs with snooping off; position comes from LPIB.
+        let noncoherent = super::ati_hdmi_noncoherent(device.id.vendor, device.id.device);
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-        let mut dev = unsafe { Self::initialize(bar) }?;
+        let mut dev = unsafe { Self::initialize(bar, noncoherent) }?;
         dev.route = Route::new(device, cap, dev.irq.clone());
         dev.irq_vector = dev.route.as_ref().map(|r| r.vector);
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
@@ -120,7 +133,10 @@ impl IntelHda {
 
     /// # Safety
     /// The window is exclusively owned and has space for all advertised streams.
-    pub(super) unsafe fn initialize(bar: bar::MmioRegion) -> Result<Self, HdaError> {
+    pub(super) unsafe fn initialize(
+        bar: bar::MmioRegion,
+        noncoherent: bool,
+    ) -> Result<Self, HdaError> {
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
         unsafe {
             bar.write32(REG_INTCTL, 0);
@@ -186,7 +202,17 @@ impl IntelHda {
                 enabled: true,
             }),
             ready: false,
+            noncoherent,
+            hdmi: IrqSafeSpinLock::new(Vec::new()),
+            hdmi_playback: IrqSafeSpinLock::new(super::hdmi::Playback::from_converter(0)),
+            card: AtomicU32::new(u32::MAX),
         };
+        if noncoherent {
+            // The CPU zeroed both rings; write that back before the
+            // controller owns them so no dirty line lands over a response.
+            dev.corb.sync(0, 4096);
+            dev.rirb.sync(0, 4096);
+        }
         // From here Drop resets/quarantines all published DMA on every failure.
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
         if unsafe { bar.read8(REG_CORBSIZE) } & 0x40 == 0
@@ -269,6 +295,8 @@ impl IntelHda {
             return Err(HdaError::NoCodecs);
         }
         dev.discover_paths();
+        dev.hdmi = IrqSafeSpinLock::new(dev.hdmi_ports());
+        dev.hdmi_playback = IrqSafeSpinLock::new(dev.initial_hdmi_playback()?);
         dev.supported_formats = [
             dev.query_supported_formats(false),
             dev.query_supported_formats(true),
@@ -318,6 +346,9 @@ impl IntelHda {
                 .write_volatile(verb);
         }
         fence(Ordering::Release);
+        if self.noncoherent {
+            self.corb.sync(next as usize * 4, 4);
+        }
         state.wp = next;
         // SAFETY: Command lock owns the next in-range CORB slot; the BAR remains mapped.
         unsafe {
@@ -347,6 +378,9 @@ impl IntelHda {
         unsafe { self.bar0.write8(REG_RIRBSTS, status & 1) };
         while state.rp != (wp & 255) {
             state.rp = (state.rp + 1) & 255;
+            if self.noncoherent {
+                self.rirb.sync(state.rp as usize * 8, 8);
+            }
             fence(Ordering::Acquire);
             // SAFETY: Masked RIRB index is within the owned 256-entry coherent completion ring.
             let (value, extra) = unsafe {
@@ -621,6 +655,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Arc::new(super::stream::Card(dev.clone())),
         Some(device.addr),
     );
+    dev.card.store(card, Ordering::Release);
     CONTROLLERS.lock().push((device.addr, dev.clone(), card));
     let weak = Arc::downgrade(&dev);
     narf_scheduler::spawn(async move {

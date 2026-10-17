@@ -1430,6 +1430,7 @@ dependencies = [
  "narf-graphics",
  "narf-graphics-driver",
  "narf-init",
+ "narf-interrupts",
  "narf-io",
  "narf-kernel-test",
  "narf-lib",
@@ -2499,6 +2500,7 @@ version = "0.0.0"
 dependencies = [
  "narf-aml",
  "narf-arch",
+ "narf-boot",
  "narf-capabilities",
  "narf-console",
  "narf-drivers-gpio",
