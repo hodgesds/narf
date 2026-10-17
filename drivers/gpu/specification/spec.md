@@ -3833,6 +3833,33 @@ the console. The framebuffer handoff calls it only with the
 `amdgpu_navi48_boot::{edid_timings, hdmi_caps, hdmi_avi, limited_range,
 broadcast_rgb}` and `amdgpu_dcn401_otg::avi_infoframe`.
 
+### Navi 22 HDMI and DP audio
+
+`unsafe amdgpu_dcn30_audio::Audio::new(gpu, pci_cap)` owns the DCCG audio DTO
+(DCN base index 1), every Azalia endpoint and function-parameter register,
+and the audio fields of each DIG's AFMT/HDMI/DP_SEC block (base index 2). The
+HD-Audio function (1002:ab28, `narf_audio::hda`, ATI codec 0x1002aa01) is a
+separate owner. `unsafe start(AudioStream, AudioInfo, &mut impl AzaliaWake)`
+and `unsafe start_for_sink(stream, edid, wake)` (ELD fields from
+`amdgpu_navi48_boot::sink_audio_info`; `Ok(None)` without audio) run after
+unblank on a stream whose OTG runs with the DIG routed to it, and refuse a
+stream whose samples or DP audio packets are already on. They run
+`dce_aud_hw_init` and the endpoint scan once, `find_first_free_audio`,
+`dce110_setup_audio_dto` (lowest HDMI pipe: DTO0 from its pixel clock; DP
+only: DTO1 from the 730 MHz DPREFCLK with 512 Fs), `enc3_se_hdmi_audio_setup`
+(AFMT, ACR N/CTS at 8 bpc) or `enc3_se_dp_audio_setup`, `dce_aud_az_configure`
+(HDMI blanking rate filter; none for DP SST 8b/10b), the HDMI Audio InfoFrame
+on line 2, `AzaliaWake::wake_azalia` (Linux's `dcn3_enable_pme_wa`,
+`DALSMC_MSG_BacoAudioD3PME`), `dce_aud_az_enable`, the DP secondary audio
+packets, unmute and a readback check. `stop(dig, wake)` runs before blank:
+mute, AFMT clock and DP audio packets off (the DP master enable stays while
+video packets need it), the PME workaround, the HDMI Audio InfoFrame off and
+`dce_aud_az_disable`; every step runs and the first error is returned.
+`record(dig)` reports `Record { stream, audio: DisplayAudio, state }`; a
+failure or cancelled start is retained (`Failed { step, error }` /
+`Programming(step)`) with its endpoint, never replayed, and only `stop`
+releases it.
+
 ### Navi 22 native AUX, DDC and HPD
 
 `unsafe amdgpu_dcn30_ddc::Ddc::new(gpu, pci_cap, crystal_khz)` claims all six DCN3.0 AUX
