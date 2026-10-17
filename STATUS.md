@@ -984,7 +984,10 @@ DCN3.0 HDMI and DP SST LPCM audio (`amdgpu_dcn30_audio`) follows Linux DC
 (`dce_audio.c`, `dcn30_afmt.c`, `enc3_se_*_audio_*`, `dce110_*_audio_stream`):
 audio wall-clock DTO0/DTO1, AFMT/ACR, the Audio InfoFrame and the Azalia
 endpoint ELD from the EDID, behind a start-after-unblank / stop-before-blank
-hook. Register models only.
+hook. The HD-Audio side binds 1002:ab28 (ATI HDMI NS, no snoop); a model of
+the host's six-port R6xx HDMI codec (rev 0x100800) checks that endpoint `e`
+reports jack and ELD on pin `3 + 2e` and routes playback there. Register
+models only.
 These are software-tested foundations; training resume,
 media submission/DPG, display-aware DPM, user command submission,
 hardware boot and DCN3.0 modesetting remain open. See the
