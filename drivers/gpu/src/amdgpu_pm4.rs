@@ -71,6 +71,11 @@ pub enum Pm4Op {
     /// Sets up a render context — used in conjunction with the
     /// state-init blob the GPU loads at ring start.
     ContextControl = 0x28,
+    /// Stall the PFP until the ME catches up (`nvd.h` 0x42).
+    PfpSyncMe = 0x42,
+    /// End-of-pipe event with a memory write and optional interrupt
+    /// (`nvd.h` 0x49).
+    ReleaseMem = 0x49,
 }
 
 // ── ACQUIRE_MEM coher-cntl bits (GFX9 only) ───────────────────────
@@ -356,5 +361,159 @@ impl<'a> Pm4Builder<'a> {
         // poll_interval in retries.
         self.push(4)?;
         Ok(())
+    }
+
+    /// `gfx_v1x_0_wait_reg_mem` (GFX10..12): wait until `(value & mask) ==
+    /// reference` (function 3), reading register `addr0` (`memory` false)
+    /// or memory at `addr1:addr0`; with `write` (operation 1) first write
+    /// `reference` to register `addr0` and wait on register `addr1`. `pfp`
+    /// runs it on the PFP (engine 1), `interval` is the poll interval.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wait_reg_mem(
+        &mut self,
+        pfp: bool,
+        memory: bool,
+        write: bool,
+        addr0: u32,
+        addr1: u32,
+        reference: u32,
+        mask: u32,
+        interval: u32,
+    ) -> Result<(), Pm4Error> {
+        let hdr = Self::type3_header(Pm4Op::WaitRegMem, 6)?;
+        self.push(hdr)?;
+        self.push(3 | u32::from(memory) << 4 | u32::from(write) << 6 | u32::from(pfp) << 8)?;
+        self.push(addr0)?;
+        self.push(addr1)?;
+        self.push(reference)?;
+        self.push(mask)?;
+        self.push(interval)
+    }
+
+    /// `gfx_v1x_0_ring_emit_wreg`: register `reg` (an absolute dword index)
+    /// written with `value`, confirmed; on a graphics ring through the PFP
+    /// (`WRITE_DATA_ENGINE_SEL(1)`).
+    pub fn write_reg(&mut self, reg: u32, value: u32, gfx: bool) -> Result<(), Pm4Error> {
+        let hdr = Self::type3_header(Pm4Op::WriteData, 4)?;
+        self.push(hdr)?;
+        const WR_CONFIRM: u32 = 1 << 20;
+        self.push(WR_CONFIRM | u32::from(gfx) << 30)?;
+        self.push(reg)?;
+        self.push(0)?;
+        self.push(value)
+    }
+
+    /// `gfx_v1x_0_ring_emit_reg_wait`: wait on register `reg` from the ME.
+    pub fn reg_wait(&mut self, reg: u32, value: u32, mask: u32) -> Result<(), Pm4Error> {
+        self.wait_reg_mem(false, false, false, reg, 0, value, mask, 0x20)
+    }
+
+    /// `gfx_v1x_0_ring_emit_reg_write_reg_wait`: write `reference` to `reg0`
+    /// and wait for `(reg1 & mask) == mask` — from the PFP on a graphics
+    /// ring.
+    pub fn reg_write_reg_wait(
+        &mut self,
+        reg0: u32,
+        reg1: u32,
+        reference: u32,
+        mask: u32,
+        gfx: bool,
+    ) -> Result<(), Pm4Error> {
+        self.wait_reg_mem(gfx, false, true, reg0, reg1, reference, mask, 0x20)
+    }
+
+    /// `PFP_SYNC_ME`.
+    pub fn pfp_sync_me(&mut self) -> Result<(), Pm4Error> {
+        let hdr = Self::type3_header(Pm4Op::PfpSyncMe, 1)?;
+        self.push(hdr)?;
+        self.push(0)
+    }
+
+    /// `gfx_v1x_0_ring_emit_fence`: RELEASE_MEM on
+    /// CACHE_FLUSH_AND_INV_TS_EVENT (index 5) with GL2 writeback and
+    /// sequenced cache actions (policy 3), writing `seq` (32 or 64 bits)
+    /// to `addr` once prior work is done, and interrupting with `interrupt`.
+    pub fn release_mem_fence(
+        &mut self,
+        addr: u64,
+        seq: u64,
+        bits64: bool,
+        interrupt: bool,
+    ) -> Result<(), Pm4Error> {
+        if addr & if bits64 { 7 } else { 3 } != 0 {
+            return Err(Pm4Error::BadCount);
+        }
+        let hdr = Self::type3_header(Pm4Op::ReleaseMem, 7)?;
+        self.push(hdr)?;
+        const GCR_SEQ: u32 = 1 << 22;
+        const GCR_GL2_WB: u32 = 1 << 21;
+        const CACHE_FLUSH_AND_INV_TS_EVENT: u32 = 0x14;
+        self.push(GCR_SEQ | GCR_GL2_WB | 3 << 25 | CACHE_FLUSH_AND_INV_TS_EVENT | 5 << 8)?;
+        self.push(if bits64 { 2 } else { 1 } << 29 | if interrupt { 2 << 24 } else { 0 })?;
+        self.push(addr as u32)?;
+        self.push((addr >> 32) as u32)?;
+        self.push(seq as u32)?;
+        self.push((seq >> 32) as u32)?;
+        self.push(0)
+    }
+
+    /// `gmc_v1x_0_emit_flush_gpu_tlb` then `gfx_v1x_0_ring_emit_vm_flush`
+    /// (identical on GMC 11 and 12): on hub `regs` at GC/MMHUB register
+    /// base `base` (absolute dwords), through invalidation engine `eng`
+    /// (the ring's own), point `vmid` at page directory `pd_addr` and
+    /// invalidate its translations, holding the engine semaphore on a hub
+    /// that uses one; a graphics ring then syncs the PFP to the ME.
+    pub fn vm_flush(
+        &mut self,
+        regs: &crate::amdgpu_vmhub_regs::VmHubRegs,
+        base: u32,
+        eng: u32,
+        vmid: u8,
+        pd_addr: u64,
+        gfx: bool,
+    ) -> Result<(), Pm4Error> {
+        let eng = regs.eng_distance * eng;
+        let ctx = regs.ctx_addr_distance * u32::from(vmid);
+        if regs.semaphore {
+            self.reg_wait(base + regs.inv_eng0_sem + eng, 1, 1)?;
+        }
+        self.write_reg(base + regs.ctx0_pt_base_lo + ctx, pd_addr as u32, gfx)?;
+        self.write_reg(
+            base + regs.ctx0_pt_base_hi + ctx,
+            (pd_addr >> 32) as u32,
+            gfx,
+        )?;
+        self.reg_write_reg_wait(
+            base + regs.inv_eng0_req + eng,
+            base + regs.inv_eng0_ack + eng,
+            crate::amdgpu_vmhub_regs::invalidate_req(vmid, 0),
+            1 << vmid,
+            gfx,
+        )?;
+        if regs.semaphore {
+            self.write_reg(base + regs.inv_eng0_sem + eng, 0, gfx)?;
+        }
+        if gfx {
+            self.pfp_sync_me()?;
+        }
+        Ok(())
+    }
+
+    /// `gfx_v12_0_ring_emit_ib_compute`: an IB with `INDIRECT_BUFFER_VALID`
+    /// (bit 23) set in its control word, as compute rings require.
+    pub fn indirect_buffer_valid(
+        &mut self,
+        ib: u64,
+        dwords: u32,
+        vmid: u8,
+    ) -> Result<(), Pm4Error> {
+        self.indirect_buffer(ib, dwords, vmid)?;
+        self.out[self.pos - 1] |= 1 << 23;
+        Ok(())
+    }
+
+    /// Words written so far.
+    pub fn words(&self) -> &[u32] {
+        &self.out[..self.pos]
     }
 }

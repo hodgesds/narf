@@ -330,6 +330,21 @@ impl<I: Io> Engine<I> {
                 checked(io.read(status))
             })?;
             self.status.last.as_mut().unwrap().protection = Some(Protection::decode(raw));
+            // amdgpu_vm_update_fault_cache: the IV's PASID names the client
+            // (each job maps its VMID to it in the IH LUT).
+            if let Kind::Vm { hub, page, .. } = kind {
+                crate::amdgpu_vmid::record_fault(
+                    event.vector.pasid,
+                    crate::amdgpu_vmid::FaultInfo {
+                        addr: page,
+                        status: raw,
+                        vmhub: match hub {
+                            Hub::Gfx => 0,
+                            Hub::Mm => 1,
+                        },
+                    },
+                );
+            }
             self.acknowledge(control)?;
         }
         self.contain()

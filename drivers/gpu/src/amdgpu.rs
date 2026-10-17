@@ -616,6 +616,11 @@ pub fn __test_chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
     chip_info_for_pci_id(vid, did)
 }
 
+/// The register family of a known AMD PCI id.
+pub(crate) fn family_for_pci_id(vid: u16, did: u16) -> Option<Family> {
+    chip_info_for_pci_id(vid, did).map(|c| c.family)
+}
+
 /// Look up family + asic + firmware name for a known PCI ID.
 fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
     if vid != AMD_VENDOR {

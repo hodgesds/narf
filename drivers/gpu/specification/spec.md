@@ -2634,6 +2634,24 @@ invalidates engine 17 in both hubs and the MMHUB private cache, and retains
 published backing across errors/cancellation. `Ready` follows both bounded
 acknowledgements, not merely table publication.
 
+`unsafe prepare_client_contexts().await` (after `initialize`) enables client
+VMIDs 1..15 on both hubs as gfxhub_v12_0/mmhub_v4_1_0_setup_vmid_config does:
+GMC 12 depth and block size in GC 12's CONTEXT_CNTL layout, every fault
+default, no retry, bounds 0..max_pfn-1. Each context's base points at an
+owned root page whose entries are GMC 12's invalid directory pattern, so a
+VMID no submission has flushed faults instead of translating. One request
+invalidates all fifteen per hub on engine 17, the MMHUB semaphore held and
+released even on timeout; every context is read back. `ClientsReady` keeps
+VMID0 live (`State::vmid0_ready`); failure quarantines the owner. The cold
+boot's memory-translation stage runs it right after `initialize`, before any
+queue exists.
+
+After boot, the platform calls `ColdBoot::publish_client_vram`: half the
+CPU-visible VRAM the driver's pool still has free (2 MiB-aligned, at least
+64 MiB) becomes a separate pool, registered as the Navi48 DRM card's
+`VramHeap` with the GMC's framebuffer geometry. The slice never returns to
+the driver's pool, so clients without eviction cannot starve its owners.
+
 `unsafe amdgpu_ih7::Rings::new` prepares native OSSSYS7.0.0 rings with exact
 GC12/NBIO discovery banks. It rejects inherited enabled rings, enabled host
 delivery or non-idle IH before allocating; preparation never writes hardware.
@@ -4096,6 +4114,112 @@ or cancellation the owner must remain retained and VRAM clients stopped until
 independent reset/recovery; drop never restores VRAM or resets the GPU. No
 short-training/resume command is exposed yet. The boot-only framebuffer handoff
 above supplies the initial CPU-writer exclusion.
+
+### Shared client GPU virtual memory (GMC 10–12)
+
+`amdgpu_vm` holds the client address-space geometry and entry encoding for
+every GMC generation; `amdgpu_vmhub_regs` holds the per-hub VMID registers
+and TLB invalidation. Both are shared by the Phoenix, Navi 22 and Navi 48
+paths; only the tables differ.
+
+- `Geometry::{GMC11, GMC12}`: GMC 12 (GC 12.0.x) walks GMC 11's four-level,
+  48-bit layout (`amdgpu_vm_adjust_size(256 * 1024, 9, 3, 48)`) and differs
+  in `format`. `VmState::with_geometry` builds an address space for a
+  generation; `VmState::new` remains GMC 11. Each DRM open takes
+  `VmState::for_card(index)`: GMC 12 for a Navi4x card (by
+  `drm_registry::pci_id` and `amdgpu::family_for_pci_id`), GMC 11's layout
+  and encoding — which GMC 10 shares — for every other card.
+- `PteFormat::{Nv10, Gfx12}` encodes entries as `gmc_v1x_0_get_vm_pte`:
+  GMC 12 puts MTYPE at 55:54 (NC/UC only), PRT at 56 with IS_PTE, PDE_PTE at
+  63 and the block fragment size at 62:58, sets DCC for `GFX12_DCC` buffers
+  and forces UC only for `UNCACHED` ones (GMC 10/11 also for the coherent
+  flags). Fresh and emptied directories use the format's PDE_PTE pattern.
+  `pte_flags` remains GMC 11's entry point.
+- `VmHubRegs` per hub: `GFXHUB_V3_0`/`MMHUB_V3_0` (Phoenix),
+  `GFXHUB_V2_3`/`MMHUB_V2_3`, and `GFXHUB_V12_0`/`MMHUB_V4_1`
+  (`regs_for(Family::Navi4, ..)`). `cntl_shift` moves CONTEXT_CNTL's block
+  size, retry and fault-enable fields up one bit on GC 12 / MMHUB 4.1.
+- `write_invalidate_tlb` issues `gmc_v*_0_flush_vm_hub` on the kernel's
+  engine 17 at each hub's `eng_distance`, with Linux's request word
+  (`invalidate_req`: VMID mask 15:0, FLUSH_TYPE 18:16, L2/L1 invalidates
+  23:19). Hubs with `semaphore` (MMHUB) acquire the engine semaphore first
+  and release it after the ACK, also on timeout (`TlbInvalidateError::{
+  Semaphore, Timeout}`). The firmware-issued invalidate Linux uses once
+  KIQ/MES runs is not implemented.
+
+- Placement (`amdgpu_gem`): a card may register a `VramHeap` (its owned
+  pool plus `fb_base`/`fb_offset`); `GemState::for_card` opens then place
+  VRAM-allowed buffers there, zeroed through the BAR, with entries carrying
+  `address - fb_base + fb_offset` and neither SYSTEM nor SNOOPED
+  (`base_flags(false)` is VALID only, as `amdgpu_ttm_tt_pte_flags`). GTT
+  buffers, VRAM|GTT ones when the heap is full, and every buffer on a card
+  without a heap are buddy pages (SYSTEM|SNOOPED, identity IOMMU); a
+  VRAM-only buffer on a full heap is `NoSpace`. `GemObject::{phys, gpu,
+  system}` give the CPU-mapped address, the entry address and the kind.
+- Lifetimes: each VA mapping record holds its buffer (`Arc<GemObject>`, as
+  `amdgpu_bo_va` holds its BO), so `GEM_CLOSE` cannot free pages the tables
+  still point at. CLEAR and REPLACE split partly covered mappings
+  (`amdgpu_vm_bo_clear_mappings`): the remainders keep their records,
+  offsets and entries; only the covered range's entries are cleared.
+  Once a job ran in an address space (`VmState::note_job`), what it drops —
+  removed records' buffers, emptied page tables, and the whole space when
+  its file closes — waits in the card's deferred list
+  (`amdgpu_cs::defer_until`) until the card's submitter reports that job
+  complete (`amdgpu_cs::retire`); before any job, frees are immediate.
+
+- Submission (`amdgpu_cs`): a card registers a `Submitter`
+  (`register_submitter`); on such a card the `/dev/dri` ioctl route
+  (`dispatch_async`, for card and render nodes) queues a validated
+  `AMDGPU_CS` and returns the engine's sequence as the handle, and
+  `AMDGPU_WAIT_CS` parks until it completes or the client's absolute
+  monotonic deadline passes (status 0/1). `AMDGPU_GEM_WAIT_IDLE` there
+  waits for the open's last job (`VmState::last_job`; a buffer another
+  process uses through PRIME is not covered) and reports the buffer's
+  preferred domains. `dispatch_async` notes every submitted job on its
+  address space. `AMDGPU_CHUNK_ID_SYNCOBJ_IN`/`_OUT` and `BO_HANDLES` are
+  accepted: in-syncobjs must hold a fence (EINVAL without, ENOENT unknown)
+  and are waited for before queueing — the ioctl waits, where Linux's
+  scheduler would hold the job; out-syncobjs get the job's `JobFence`
+  (signalled through `Submitter::signalled`); every listed BO must be the
+  open's (ENOENT), with no residency or implicit sync. amdgpu opens now
+  route the DRM syncobj ioctls (0xbf..=0xc5) to their own table
+  (`drm_ioctl_bridge::dispatch_syncobj`). `DEPENDENCIES` name a context
+  the open owns (EINVAL otherwise) on the engine's ring (others
+  `Unsupported`) and are waited for before queueing; `SCHEDULED_DEPENDENCIES`
+  are validated only, as every earlier job of the single in-order ring is
+  already scheduled. Timeline syncobjs and `FENCE` chunks are still
+  refused. Without a submitter, CS parses and is refused as before
+  and GEM_WAIT_IDLE reports idle. `pm4::Pm4Builder::vm_flush` builds the in-ring VM flush
+  (shared by GMC 11 and 12).
+
+Jobs are named by tickets: the CS handle, opaque to clients, with the ring
+index in its high 32 bits (`Submitter::ring_for` maps an IP/ring to it).
+An address space keeps its last ticket per ring (`VmState::last_jobs`); a
+deferred free waits for all of them, and GEM_WAIT_IDLE for each.
+Dependencies must name a ring the engine serves and a handle of that ring.
+
+The Navi48 platform registers both kernel queues as its card's submitter
+after boot: up to eight IBs per submission (`Job::new`, in order in one
+slot), all for the graphics ring or all for the compute ring
+(`Queues::submit(Pipe, Job)`; the compute frame writes registers without
+the PFP, skips PFP_SYNC_ME, flushes on invalidation engine 1 and marks IBs
+`INDIRECT_BUFFER_VALID`), run on client VMID 1 with the
+open's root page directory (`VmState::root_pde`, GMC 12 only), through
+`amdgpu_gfx12_queue::Queues::submit` — one 256-dword ring slot of VM flush
+(GFX hub, engine 0, PFP_SYNC_ME), IB and interrupting RELEASE_MEM fence;
+`Busy` when the 1024-dword ring is full. Each job also maps VMID 1 to its
+open's PASID in the IH VMID LUT (OSSSYS `IH_VMID_0_LUT + vmid`, after the
+flush, as gmc_v12_0_emit_pasid_mapping), so a fault carries the client's
+PASID; `VmState::pasid` allocates one per address space
+(`amdgpu_vmid::PasidHandle`) and releases it through the deferred list.
+Each job is noted on its address space and every fence read retires
+completed jobs' deferred frees. The fault monitor charges each VM fault to
+the IV's PASID (`amdgpu_vmid::record_fault`: address from the IV, the hub's
+protection-fault status, GFX 0 / MM 1; a zero status never replaces a
+useful one; faults for freed PASIDs are dropped), and
+`AMDGPU_INFO_GPUVM_FAULT` (`amdgpu_info::dispatch_for`) answers from the
+open's PASID. VMID reuse is not implemented, and `AMDGPU_INFO` still
+reports acceleration unavailable.
 
 ### AMD platform VBIOS
 
