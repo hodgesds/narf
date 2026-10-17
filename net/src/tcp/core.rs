@@ -4192,16 +4192,6 @@ fn handle_ack(
     let dup_candidate = payload_len == 0
         && hdr.flags & (FLAG_SYN | FLAG_FIN) == 0
         && (hdr.window as u32) << t.opts.peer_wscale == t.snd_wnd;
-    // Window update (RFC 9293 §3.10.7.4).
-    if seq_lt(t.snd_wl1, hdr.sequence) || (t.snd_wl1 == hdr.sequence && seq_leq(t.snd_wl2, ack)) {
-        t.snd_wnd = (hdr.window as u32) << t.opts.peer_wscale;
-        t.snd_wl1 = hdr.sequence;
-        t.snd_wl2 = ack;
-        if t.snd_wnd > 0 {
-            t.persist_deadline_cycles = 0;
-            t.persist_backoff_ns = PERSIST_INITIAL_NS;
-        }
-    }
     // Highest sequence number ever sent. An RTO rewinds `snd_nxt` to
     // `snd_una` (go-back-N), but the peer may already hold the later
     // segments and cumulatively ACK past the rewound `snd_nxt`; bounding the
@@ -4213,6 +4203,29 @@ fn handle_ack(
         .iter()
         .map(|s| s.end_seq())
         .fold(t.snd_nxt, |m, e| if seq_gt(e, m) { e } else { m });
+    // Linux validates the ACK before its `tcp_may_update_window` decision.
+    // Preserve that ordering: an out-of-range ACK must not gain authority
+    // over SND.WND simply because it carries a fresh segment sequence.
+    let ack_in_range = seq_geq(ack, t.snd_una) && seq_leq(ack, snd_max);
+    // Window update.  Follow Linux `tcp_may_update_window`: a newly
+    // cumulative ACK is authoritative even if reverse-direction data made
+    // SEG.SEQ older than SND.WL1; with the same SEG.SEQ, only a larger window
+    // (or a zero-window advertisement) may replace the current one.  The
+    // older RFC 793 WL1/WL2 comparison used here rejected the former and
+    // accepted a stale shrinking window, either of which can strand a
+    // full-duplex sender behind an obsolete window.
+    let new_wnd = (hdr.window as u32) << t.opts.peer_wscale;
+    if ack_in_range
+        && may_update_send_window(t.snd_una, t.snd_wl1, ack, hdr.sequence, t.snd_wnd, new_wnd)
+    {
+        t.snd_wnd = new_wnd;
+        t.snd_wl1 = hdr.sequence;
+        t.snd_wl2 = ack;
+        if t.snd_wnd > 0 {
+            t.persist_deadline_cycles = 0;
+            t.persist_backoff_ns = PERSIST_INITIAL_NS;
+        }
+    }
     // Cumulative ACK math.
     if seq_lt(t.snd_una, ack) && seq_leq(ack, snd_max) {
         let acked = ack.wrapping_sub(t.snd_una);
@@ -4304,6 +4317,26 @@ fn handle_ack(
     if !writable_before && writable_after {
         crate::readiness::notify(id as u64);
     }
+}
+
+/// Linux `tcp_may_update_window`, expressed over NARF's TCB state.
+///
+/// `ack_seq` is the incoming segment's sequence number and `new_wnd` is its
+/// already-window-scale-adjusted advertised window.  Keeping this separate
+/// from packet handling makes the RFC 9293 / Linux ordering rule testable at
+/// the exact boundary that matters for bidirectional streams.
+#[inline]
+pub(crate) fn may_update_send_window(
+    snd_una: u32,
+    snd_wl1: u32,
+    ack: u32,
+    ack_seq: u32,
+    snd_wnd: u32,
+    new_wnd: u32,
+) -> bool {
+    seq_lt(snd_una, ack)
+        || seq_lt(snd_wl1, ack_seq)
+        || (snd_wl1 == ack_seq && (new_wnd > snd_wnd || new_wnd == 0))
 }
 
 fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
