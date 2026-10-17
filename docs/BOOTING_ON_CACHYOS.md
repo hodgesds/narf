@@ -327,8 +327,9 @@ Limits. Exactly what this does and does not cover:
   boot log and the partition/LUKS layers. A driver writing through a private
   controller handle would bypass it. An audit of the in-tree storage drivers
   found no such write on a non-test boot.
-  - NVMe, AHCI, virtio-blk and USB MSC probes only read. Controller setup
-    (queue creation, feature negotiation) does not change media.
+  - NVMe, AHCI, virtio-blk and USB MSC probes only read: IDENTIFY and the
+    partition table. Controller setup (queue creation, feature negotiation,
+    HBA and link resets) does not change media.
   - Format/Sanitize/firmware/security commands have no in-kernel caller.
   - Test-only writes exist only in `kernel-test` builds, which usb-image does
     not use.
@@ -342,13 +343,18 @@ Limits. Exactly what this does and does not cover:
   superblock repair would still run there. On every other disk the device
   itself is read-only, so this does not arise.
 - **Current hardware coverage on this host.**
-  - NVMe partitions are registered only when the GPT entry array fits one
-    4 KiB read. A standard 128-entry GPT, as on `nvme0n1`/`nvme1n1`, is not
-    partition-scanned today, so those partitions do not appear at all.
-  - The AHCI driver binds only Intel ICH9/ICH10 controllers (QEMU q35
-    emulates ICH9), so `sda` on this AMD board is not driven.
-
-  Both would be read-only under `boot-only` if they were.
+  - NVMe: NARF drives one NVMe controller, the first it enumerates
+    (`04:00.0`, the CachyOS disk `nvme0n1`), as `nvme0`. Its standard
+    128-entry GPT is partition-scanned, so `nvme0p1` (the ESP) and
+    `nvme0p2` (btrfs root) are registered, read-only. The second controller
+    (`07:00.0`, `nvme1n1`) is not driven at all.
+  - SATA: the AHCI driver binds any AHCI-class controller (`01:06:01`), as
+    Linux does, so the AMD 600-series controller (`1022:43f6`) and `sda`
+    are driven as `sata0`, with any partitions as `sata0p<n>`, all
+    read-only. The AMD controller has not been tested: QEMU emulates only
+    Intel ICH9.
+  - Probing these disks only reads. Controller setup (NVMe queue creation,
+    the AHCI HBA reset and SATA link reset) does not change media.
 - **Testing.** This is validated in QEMU (block-layer model tests, ext and
   btrfs read-only mount tests, and the `usb-image --qemu` decoy hashes). It has
   not been validated on hardware.

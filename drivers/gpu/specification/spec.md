@@ -4037,7 +4037,8 @@ prepare_bandwidth (clocks then watermarks), `dcn20_enable_stream_timing`
 DP DTO phase/modulo, timing, OPP black, `enable_crtc`, one frame),
 `link_set_dpms_on` (HDMI: setup, STREAM_SETUP, attributes, AVI, transmitter
 ENABLE, setup, BE→FE, AVI, AVMUTE off; DP: setup, MSA/VSC, PHYCLK floor,
-BE→FE, `amdgpu_dp_training::train` with rate/lane fallback, setup, unblank),
+BE→FE, `amdgpu_dcn30_dp_link::train_with_retries` at the least verified link
+carrying the mode, setup, unblank; see "Navi 22 DP link layer"),
 then the front end under `optc3_lock` and a two-frame underflow watch.
 `Output` carries the route, trained `DpLink` and `Inherited` GOP state.
 Failure records `State::Failed { step, error }` and undoes only started steps
@@ -4128,8 +4129,12 @@ these. `into_recovery` re-prepares DMUB and the display owner from the
 retained VBIOS/routes so the recovered sequence restarts DMUB.
 
 `amdgpu_navi22_kms` holds DRM state: one CRTC (pipe 0, id 1) and one
-connector per board route (ids per `amdgpu_navi48_kms`); HDMI connectors
-offer the DML30-admitted timings, DP ports report sinks without modes.
+connector per board route (ids per `amdgpu_navi48_kms`); connectors offer
+the DML30-admitted timings (`Kms::reconcile_sinks(reports, offered)`), a DP
+sink's bounded by its verified link (`modeset::offered_on(sink, soc, vco,
+verified)`, `dp_validate_mode_timing`; the receiver-caps ceiling until
+verified). Automatic routing takes an HDMI sink first, else the first DP one;
+any board port can be routed.
 `request_display_{active,route,mode}`, `request_connector_crtc`,
 `display_offers` (TEST_ONLY/SETCRTC validation), `restore_displays`, `publish`,
 `display_admission(admitted, streams)` (`DisplayAdmission`: DML30 DRAM clock
@@ -4144,6 +4149,64 @@ before reset and the monitor relights once `recoveries()` increments. The fb
 handoff calls `modeset_displays` and the monitor with `amdgpu.native_display`
 (`amdgpu.navi22_hw_cursor` opts into the hardware cursor; display detection
 runs only with `amdgpu.native_display` or `amdgpu.display_probe`).
+
+### Navi 22 DP link layer, hot-plug and link loss
+
+`amdgpu_dcn30_dp_link` is Linux DC's 8b/10b SST link policy for the DIO,
+driving `dp::Aux` (now with `set_timeout_us`, `connected` and `delay_us`
+defaults) and a `Source` (`dp::DioSource { link, phy }`: enable_dp_output,
+training patterns, video idle, common-level SETUP_VSEMPH per lane,
+disable_output). `retrieve_caps(aux, VbiosLttpr)` is `retrieve_link_cap`:
+LTTPR timeout (3.2 ms), `dp_retrieve_lttpr_cap` on VBIOS-LTTPR-aware boards
+(`VbiosLttpr::from_vbios`: DCE_INFO display_caps 0x40 aware / 0x20
+non-transparent, `amdgpu_dcn_inventory::lttpr_caps`), else
+`wake_up_aux_channel`; transparent mode and the echoed count for a chain;
+receiver caps with 20 post-OUI retries; the 552 us timeout without a chain;
+extended caps and the DPRX feature list. `Caps::{max_link, eq_pattern}` are
+`dp_get_max_link_cap` (HBR3 x4 encoder; a DPCD 1.4 chain bounds it) and
+`decide_eq_training_pattern` (TPS4/TPS3/TPS2 by sink support only). The LTTPR
+mode is `dp_decide_8b_10b_lttpr_mode` (not aware: none). Training is
+`dp_perform_link_training`: exit, LTTPR mode (non-transparent reads each
+repeater's interval), channel coding, link settings (0.5% downspread,
+enhanced framing, POST_LT_ADJ_REQ_GRANTED below TPS4), hop-by-hop repeaters
+(farthest first, TPS4, `repeater_training_done`, source drive only for the
+hop next to it), CR (5 same-swing / 100 total, max-VS stop) and EQ (6 tries,
+CR-lost partial/full), adjust requests as `dp_decide_lane_settings`
+(maximized, PE capped by VS), then `dp_transition_to_video_idle` (5 ms and
+`dp_check_link_loss_status`, or `perform_post_lt_adj_req_sequence`).
+`train_with_retries` is a commit's `perform_link_training_with_retries`
+(4 attempts at one setting, no fallback, +50 ms delays);
+`verify_link_cap` is `dp_verify_link_cap_with_retries` (2 rounds) with
+`decide_fallback` (`decide_fallback_link_setting`: CR → rate first, EQ →
+lanes first); `decide_link_settings` and `mode_fits` are
+`decide_dp_link_settings` / `dp_validate_mode_timing`; `handle_hpd_rx_irq`
+is the SST part of `dp_handle_hpd_rx_irq` (`RxEvent::{None, AutomatedTest,
+LinkLoss}`; ESI block from DPCD 1.4; loss only with the sink in D0). AUX
+transport failures abort and disable the source; FEC, the source OUI, eDP,
+DPIA and fixed-VS paths are not implemented.
+
+`Pipeline` for DP: `set_lttpr_policy`, `assume_link_cap(Option<DpLink>)`
+(skip verification for a sink verified before with the same caps),
+`link_cap()`, `dp_caps()`; `enable` retrieves caps and verifies the link
+after `init_hw` and the clock start (`ClockManager::link_rate_floor`), then
+selects with `select_dp_on` against it. `check_dp_link(aux)`,
+`retrain(tables, aux)` (`dp_handle_link_loss`: audio, blank, link off,
+same-setting training, unblank; the front end keeps scanning out; failure
+leaves `At(Step::Link)` for `disable`) and `disable_unplugged(tables, ddc)` (no
+DPCD transaction; an HDMI SCDC sink still gets `link_set_dpms_off`'s
+unchecked legacy TMDS_Config write via `hdmi::write_scdc_legacy`; resumes an
+interrupted stop). `amdgpu_navi22_display::Display`
+retains each connector's verified link keyed by its receiver caps
+(`verified_link`, `set_verified_link`), and adds `hpd_sense(index)` and
+`aux_timeout(index, us)`. `ColdBoot::{display_hpd_senses(),
+forget_display_link(i), display_link_cap(i, dpcd), check_display_link(),
+retrain_display(), stop_unplugged_display()}` serve the platform display
+monitor, which each pass (1 s, or woken by HPD/HPD-RX vectors): tears the lit
+display down without AUX when its HPD falls (connector disconnected),
+re-detects every connector when any HPD changes or pulses (EDID inventory of
+dark connectors; a pulsed lit sink is stopped and relit), checks the lit DP
+link and retrains on loss, stopping it to relight from a fresh verification
+if retraining fails; then converges KMS as before.
 
 ### Navi 22 native AUX, DDC and HPD
 

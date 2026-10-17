@@ -45,6 +45,7 @@ use crate::{
     amdgpu_dcn30_audio::{Audio, AudioStream},
     amdgpu_dcn30_clk::{Clock, ClockManager},
     amdgpu_dcn30_dp::{self as dp, Aux, Depth},
+    amdgpu_dcn30_dp_link as dp_link,
     amdgpu_dcn30_hdmi::{self as hdmi, DigMode, Hdmi},
     amdgpu_dcn30_hubbub::{self as hubbub, Hubbub},
     amdgpu_dcn30_takeover::{self as takeover, Inherited, Regs, Takeover},
@@ -157,8 +158,6 @@ const NBIO_MEMSIZE: u64 = 0xc3;
 const VERIFY_FRAMES: u32 = 2;
 /// `link_set_dpms_off`'s `msleep(60)` after blanking a non-eDP DP stream.
 const DP_BLANK_SETTLE_US: u64 = 60_000;
-/// `dp_transition_to_video_idle` without POST_LT_ADJ_REQ: 5 ms of idle.
-const DP_IDLE_US: u64 = 5_000;
 /// `video_optimized_pixel_rates[]` (`dce_clock_source.c`): requested pixel
 /// clock range in kHz, the target rate, and the DTO multiplier/divider.
 const VIDEO_OPTIMIZED_RATES: [(u32, u32, u32, u32, u32); 28] = [
@@ -477,47 +476,43 @@ pub(crate) fn select_hdmi(
     }
     Err(Error::NoMode)
 }
-/// The sink's link ceiling against the DCN3.0 encoder's: the lower rate
-/// code and lane count (`dp_get_max_link_cap`, without LTTPR).
-fn dp_ceiling(caps: &[u8; 16]) -> Result<(u8, u8), Error> {
-    let rate = caps[1].min(MAX_DP_RATE);
-    let lanes = (caps[2] & 0x1f).min(MAX_DP_LANES);
-    if !matches!(rate, 6 | 10 | 20 | 30) || !matches!(lanes, 1 | 2 | 4) {
-        return Err(Error::NoSink);
-    }
-    Ok((rate, lanes))
+/// The link a DP sink's modes are checked against: its verified link, or
+/// before verification what its receiver caps bound
+/// (`verify_link_capability_non_destructive`'s `dp_get_max_link_cap`).
+fn dp_link_cap(sink: &Sink, verified: Option<DpLink>) -> Option<DpLink> {
+    verified.or_else(|| dp_link::Caps::from_dpcd(sink.dpcd?).max_link())
 }
-/// 8b/10b payload: rate code x 27 MHz x 8 bits per lane.
-fn dp_fits(pixel_khz: u32, bpp: u8, rate: u8, lanes: u8) -> bool {
-    u64::from(pixel_khz) * u64::from(bpp)
-        <= u64::from(rate) * u64::from(dp::LINK_RATE_REF_KHZ) * 8 * u64::from(lanes)
+/// `dp_validate_mode_timing` at 8 bpc RGB against `link`.
+fn dp_fits(timing: &Timing, link: DpLink) -> bool {
+    dp_link::mode_fits(
+        link,
+        timing.h_active,
+        timing.v_active,
+        timing.pixel_clock_khz,
+        Depth::Bpc8.bits_per_pixel(),
+    )
 }
-/// The first EDID timing the sink's maximum DP link carries at 8 bpc and
-/// the DCN30 mode math accepts (`dp_validate_mode_timing`).
-pub(crate) fn select_dp(
+/// The DP mode: exactly `want` when DRM asked for one `offered_on` admits,
+/// else the first (EDID order, so preferred first) the link and the DCN30
+/// mode math accept.
+pub(crate) fn select_dp_on(
     sink: &Sink,
     soc: &dml30::Soc,
     vco_khz: u32,
+    want: Option<Timing>,
+    verified: Option<DpLink>,
 ) -> Result<(Timing, dml30::Plan), Error> {
-    let caps = sink.dpcd.as_ref().ok_or(Error::NoSink)?;
-    let (rate, lanes) = dp_ceiling(caps)?;
-    for timing in crate::amdgpu_navi48_boot::edid_timings(&sink.edid) {
-        if timing.pixel_clock_khz < 25_000
-            || !dp_fits(
-                timing.pixel_clock_khz,
-                Depth::Bpc8.bits_per_pixel(),
-                rate,
-                lanes,
-            )
-        {
-            continue;
-        }
-        let Ok(plan) = dml30::plan(&config(&timing, vco_khz), soc) else {
-            continue;
-        };
-        return Ok((timing, plan));
+    if sink.dpcd.is_none() {
+        return Err(Error::NoSink);
     }
-    Err(Error::NoMode)
+    let offered = offered_on(sink, soc, vco_khz, verified);
+    let timing = match want {
+        Some(want) if offered.contains(&want) => want,
+        Some(_) => return Err(Error::NoMode),
+        None => *offered.first().ok_or(Error::NoMode)?,
+    };
+    let plan = dml30::plan(&config(&timing, vco_khz), soc).map_err(Error::Mode)?;
+    Ok((timing, plan))
 }
 /// `dcn3_program_pix_clk`'s DP DTO phase and modulo for `pixel_khz`.
 pub(crate) fn dp_dto(pixel_khz: u32) -> (u32, u32) {
@@ -541,23 +536,29 @@ pub struct Admitted {
     pub offered: Vec<Timing>,
 }
 
-/// Every distinct EDID timing `select`/`select_dp` could choose: inside the
-/// TMDS ceiling (HDMI) or the sink's maximum 8b/10b link at 8 bpc (a sink
-/// with DPCD, i.e. DisplayPort), and admitted by the DCN30 mode math. This is
-/// what KMS offers; a DRM TEST_ONLY or SETCRTC is checked against it.
+/// Every distinct EDID timing `select_hdmi`/`select_dp_on` could choose: a
+/// stream the DCN3.0 TMDS encoder carries (HDMI) or inside the sink's link at
+/// 8 bpc (a sink with DPCD, i.e. DisplayPort: its receiver-caps ceiling until
+/// verified), and admitted by the DCN30 mode math. This is what KMS offers;
+/// a DRM TEST_ONLY or SETCRTC is checked against it.
 pub(crate) fn offered(sink: &Sink, soc: &dml30::Soc, vco_khz: u32) -> Vec<Timing> {
-    let link = sink.dpcd.as_ref().map(dp_ceiling);
+    offered_on(sink, soc, vco_khz, None)
+}
+/// `offered` for a DP sink whose link was verified at `verified`
+/// (`dp_validate_mode_timing` against `verified_link_cap`).
+pub(crate) fn offered_on(
+    sink: &Sink,
+    soc: &dml30::Soc,
+    vco_khz: u32,
+    verified: Option<DpLink>,
+) -> Vec<Timing> {
+    let link = sink.dpcd.map(|_| dp_link_cap(sink, verified));
     let mut out: Vec<Timing> = Vec::new();
     for timing in crate::amdgpu_navi48_boot::edid_timings(&sink.edid) {
         let fits = match link {
             None => hdmi_stream(sink, &timing, soc, hdmi::Limits::DEFAULT).is_some(),
-            Some(Ok((rate, lanes))) => dp_fits(
-                timing.pixel_clock_khz,
-                Depth::Bpc8.bits_per_pixel(),
-                rate,
-                lanes,
-            ),
-            Some(Err(_)) => false,
+            Some(Some(link)) => dp_fits(&timing, link),
+            Some(None) => false,
         };
         if !fits || timing.pixel_clock_khz < 25_000 || out.contains(&timing) {
             continue;
@@ -567,24 +568,6 @@ pub(crate) fn offered(sink: &Sink, soc: &dml30::Soc, vco_khz: u32) -> Vec<Timing
         }
     }
     out
-}
-
-/// `select_dp`, or exactly `want` when DRM asked for a timing `offered`
-/// admits.
-pub(crate) fn select_dp_wanted(
-    sink: &Sink,
-    soc: &dml30::Soc,
-    vco_khz: u32,
-    want: Option<Timing>,
-) -> Result<(Timing, dml30::Plan), Error> {
-    let Some(want) = want else {
-        return select_dp(sink, soc, vco_khz);
-    };
-    if !offered(sink, soc, vco_khz).contains(&want) {
-        return Err(Error::NoMode);
-    }
-    let plan = dml30::plan(&config(&want, vco_khz), soc).map_err(Error::Mode)?;
-    Ok((want, plan))
 }
 
 fn pitch(timing: &Timing) -> u32 {
@@ -715,6 +698,8 @@ pub struct Pipeline {
     /// the DCN30 admission of the lit sink produced.
     want: Option<Timing>,
     admitted: Option<Admitted>,
+    /// The DP link layer's state (`amdgpu_dcn30_dp_link`).
+    dp: DpState,
     /// m5hdmi: the pipe's output format stages (FMT, OTG 4:2:0, OCSC, DPG
     /// black), and the admitted HDMI stream (format, clocks, scrambling).
     format: hdmi::Formatter,
@@ -815,6 +800,7 @@ impl Pipeline {
                 underflow: None,
                 want: None,
                 admitted: None,
+                dp: DpState::default(),
                 format: hdmi::Formatter::new(gpu, authority, pipe)?,
                 hdmi: None,
             })
@@ -1178,6 +1164,12 @@ impl Pipeline {
         let soc =
             dml30::Soc::from_board(&levels, board.channels, board.channel_width_bytes, refclk)
                 .map_err(Error::Mode)?;
+        // Detection's link half for DP (retrieve_link_cap, then the
+        // destructive verify_link_capability): modes are what it verified.
+        let verified = match signal {
+            Signal::DisplayPort => Some(self.discover_dp(tables, sink, aux).await?),
+            Signal::Hdmi => None,
+        };
         let (timing, avi, plan) = match signal {
             Signal::Hdmi => {
                 let limits = self.hdmi_limits(tables);
@@ -1186,7 +1178,7 @@ impl Pipeline {
                 (t, stream.avi, plan)
             }
             Signal::DisplayPort => {
-                let (timing, plan) = select_dp_wanted(sink, &soc, levels.vco_khz, self.want)?;
+                let (timing, plan) = select_dp_on(sink, &soc, levels.vco_khz, self.want, verified)?;
                 (timing, None, plan)
             }
         };
@@ -1194,7 +1186,7 @@ impl Pipeline {
             soc,
             refclk_khz: refclk,
             plan,
-            offered: offered(sink, &soc, levels.vco_khz),
+            offered: offered_on(sink, &soc, levels.vco_khz, verified),
         });
         // A DVI sink: no data islands may be sent, which this owner's HDMI
         // attribute path always enables.
@@ -1422,42 +1414,59 @@ impl Pipeline {
     pub fn hdmi_output(&self) -> Option<hdmi::Stream> {
         self.hdmi
     }
-    /// `link_set_dpms_on` for DisplayPort SST.
+    /// `link_set_dpms_on` for DisplayPort SST at the least link the
+    /// verified one has that carries the stream (`decide_dp_link_settings`).
     async fn link_dp<A: Aux + Send>(
         &mut self,
         tables: &Tables<'_>,
         timing: &Timing,
-        sink: &Sink,
+        _sink: &Sink,
         aux: &mut A,
     ) -> Result<(), Error> {
-        let caps = sink.dpcd.ok_or(Error::NoSink)?;
-        let (rate, lanes) = dp_ceiling(&caps)?;
+        let caps = self.dp.caps.ok_or(Error::NoSink)?;
+        let verified = self.dp.verified.ok_or(Error::NoSink)?;
+        let setting = dp_link::decide_link_settings(
+            verified,
+            timing.pixel_clock_khz,
+            Depth::Bpc8.bits_per_pixel(),
+        )
+        .ok_or(Error::NoMode)?;
+        self.link_dp_at(tables, timing, &caps, setting, aux).await
+    }
+    /// `link_set_dpms_on` for DisplayPort SST at `setting`: DIG setup, stream
+    /// attributes and SDPs, the PHY clock, the backend connected
+    /// (`setup_dio_stream_encoder` before training), training with retries
+    /// (`perform_link_training_with_retries`), then `dcn20_enable_stream`
+    /// and `dcn20_unblank_stream`.
+    async fn link_dp_at<A: Aux + Send>(
+        &mut self,
+        tables: &Tables<'_>,
+        timing: &Timing,
+        caps: &dp_link::Caps,
+        setting: DpLink,
+        aux: &mut A,
+    ) -> Result<(), Error> {
         self.dig.setup(DigMode::DisplayPort)?;
         self.dig.setup_stereo_sync(self.route.pipe)?;
-        // DPRX_FEATURE_ENUMERATION_LIST (DPCD 1.4+): SST_SPLIT_SDP_CAP bit 1,
-        // VSC_SDP_COLORIMETRY_SUPPORTED bit 3.
-        let mut feature = [0u8];
-        if caps[0] >= 0x14 {
-            aux.read(dp::DPCD_DPRX_FEATURE_ENUMERATION_LIST, &mut feature)
-                .await?;
-        }
-        let vsc_colorimetry = feature[0] & 1 << 3 != 0;
+        // DPRX_FEATURE_ENUMERATION_LIST (retrieve_link_cap, extended caps
+        // only): SST_SPLIT_SDP_CAP bit 1, VSC_SDP_COLORIMETRY_SUPPORTED bit 3.
+        let feature = caps.dprx_feature;
+        let vsc_colorimetry = feature & 1 << 3 != 0;
         let vsc = vsc_colorimetry.then(|| dp::vsc_packet(Depth::Bpc8));
         self.dp_stream.set_stream_attribute(
             timing,
             Depth::Bpc8,
             vsc_colorimetry,
-            feature[0] & 1 << 1 != 0,
+            feature & 1 << 1 != 0,
         )?;
         self.dp_stream.update_info_packets(vsc.as_ref()).await?;
-        // enable_link_dp: the PHY clock floor (dcn30_notify_link_rate_change,
-        // at the highest rate training may try), then the DIG backend
-        // connected (setup_dio_stream_encoder) before training.
+        // enable_link_dp: the PHY clock (requested_sym_clk, through
+        // dcn30_notify_link_rate_change), then the DIG backend connected.
         let phy_max = self
             .clocks
             .levels()
             .map_or(0, |l| l.range(Clock::Phy).max_khz());
-        let link_khz = (u32::from(rate) * dp::LINK_RATE_REF_KHZ).min(phy_max);
+        let link_khz = (u32::from(setting.rate) * dp::LINK_RATE_REF_KHZ).min(phy_max);
         self.clocks
             .phy_floor(link_khz)
             .await
@@ -1469,36 +1478,18 @@ impl Pipeline {
             authority: self.regs.authority,
             connector: self.connector,
         };
-        let mut trainer = dp::Trainer {
-            aux: &mut *aux,
+        let mut source = dp::DioSource {
             link: self.dp_link,
             phy: &mut phy,
-            settings: None,
         };
-        let settings = training::train(
-            &mut trainer,
-            caps,
-            training::Limits {
-                rate,
-                lanes,
-                pixel_clock_khz: timing.pixel_clock_khz,
-                bits_per_pixel: Depth::Bpc8.bits_per_pixel(),
-                dpia: false,
-            },
-        )
-        .await
-        .map_err(Error::Training)?;
-        self.link = Some(DpLink {
-            rate: settings.rate,
-            lanes: settings.lanes,
-        });
-        sleep_us(DP_IDLE_US).await;
+        let trained = dp_link::train_with_retries(aux, &mut source, caps, setting).await?;
+        self.link = Some(trained);
         self.dig.setup(DigMode::DisplayPort)?;
         // dcn20_enable_stream, then dcn20_unblank_stream.
         self.dig.connect_be_to_fe(true)?;
         self.dp_stream.update_info_packets(vsc.as_ref()).await?;
         self.dp_stream
-            .unblank(timing.pixel_clock_khz, settings.rate)
+            .unblank(timing.pixel_clock_khz, trained.rate)
             .await
     }
     /// Make CPU writes to the running scanout visible to display fetch.
@@ -1555,6 +1546,10 @@ impl Pipeline {
         if reached >= Step::Plane {
             record(self.mpc.release(self.route.pipe).map_err(Error::Block));
             record(self.hubp.blank().await.map_err(Error::Block));
+        }
+        // A link verification the future dropped may have left the PHY on.
+        if self.dp.probing {
+            record(self.stop_dp_probe(tables, aux).await);
         }
         if reached >= Step::Link {
             match self.connector.signal {
@@ -1678,12 +1673,239 @@ impl Pipeline {
     }
 }
 
+/// The DP link layer's view of the pipeline's sink.
+#[derive(Clone, Debug, Default)]
+struct DpState {
+    /// The board's VBIOS LTTPR policy.
+    lttpr: dp_link::VbiosLttpr,
+    /// `retrieve_link_cap`'s result for the sink being lit.
+    caps: Option<dp_link::Caps>,
+    /// `verified_link_cap`: assumed from an earlier verification of the same
+    /// sink, or found by `discover_dp`.
+    verified: Option<DpLink>,
+    /// A verification is in flight: the PHY may be on outside `Step::Link`.
+    probing: bool,
+    /// The sink's EDID, for the audio a retrain restarts.
+    edid: Vec<u8>,
+}
+
+/// What a DP link check of a running stream found
+/// (`amdgpu_dcn30_dp_link::handle_hpd_rx_irq`).
+pub use crate::amdgpu_dcn30_dp_link::RxEvent;
+
+/// The DP link layer (`amdgpu_dcn30_dp_link`): detection's capability
+/// retrieval and link verification, link-loss checks, retraining and
+/// unplug teardown.
+impl Pipeline {
+    /// The board's VBIOS LTTPR policy (`dcn30_resource_construct`), before
+    /// `enable`.
+    pub fn set_lttpr_policy(&mut self, policy: dp_link::VbiosLttpr) {
+        self.dp.lttpr = policy;
+    }
+    /// A link this DP sink (same receiver caps) was verified at before:
+    /// `enable` then skips the destructive verification, as Linux keeps
+    /// `verified_link_cap` until the next long-pulse detection.
+    pub fn assume_link_cap(&mut self, link: Option<DpLink>) {
+        self.dp.verified = link;
+    }
+    /// The DP sink's verified link (after `enable` reached detection).
+    pub fn link_cap(&self) -> Option<DpLink> {
+        self.dp.verified
+    }
+    /// The DP sink's capabilities as `enable` retrieved them.
+    pub fn dp_caps(&self) -> Option<&dp_link::Caps> {
+        self.dp.caps.as_ref()
+    }
+    /// `retrieve_link_cap`, then (unless a verified link is assumed and still
+    /// within the caps) `dp_verify_link_cap_with_retries` from the maximum
+    /// link, with the PHY clock floor at that link. Runs after `init_hw`
+    /// with no stream, as Linux's detection does.
+    async fn discover_dp<A: Aux + Send>(
+        &mut self,
+        tables: &Tables<'_>,
+        sink: &Sink,
+        aux: &mut A,
+    ) -> Result<DpLink, Error> {
+        use core::fmt::Write;
+        if sink.dpcd.is_none() {
+            return Err(Error::NoSink);
+        }
+        let caps = dp_link::retrieve_caps(aux, self.dp.lttpr).await?;
+        let max = caps.max_link().ok_or(Error::NoSink)?;
+        self.dp.caps = Some(caps);
+        self.dp.edid.clone_from(&sink.edid);
+        if let Some(v) = self
+            .dp
+            .verified
+            .filter(|v| v.rate <= max.rate && v.lanes <= max.lanes)
+        {
+            return Ok(v);
+        }
+        self.dp.verified = None;
+        let phy_max = self
+            .clocks
+            .levels()
+            .map_or(0, |l| l.range(Clock::Phy).max_khz());
+        self.clocks
+            .link_rate_floor((u32::from(max.rate) * dp::LINK_RATE_REF_KHZ).min(phy_max))
+            .await
+            .map_err(Error::Block)?;
+        let mut phy = DpPhy {
+            tables,
+            regs: self.gpu.regs,
+            authority: self.regs.authority,
+            connector: self.connector,
+        };
+        let mut source = dp::DioSource {
+            link: self.dp_link,
+            phy: &mut phy,
+        };
+        self.dp.probing = true;
+        let result = dp_link::verify_link_cap(aux, &mut source, &caps).await;
+        // Every verification exit disables the link, cancellation aside.
+        self.dp.probing = false;
+        let verified = result?;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: navi22 DP{} link verified at rate 0x{:x} x{} ({}, LTTPR {:?})",
+            self.connector.path.transmitter,
+            verified.link.rate,
+            verified.link.lanes,
+            if verified.clean {
+                "clean"
+            } else {
+                "after failures"
+            },
+            caps.mode,
+        );
+        self.dp.verified = Some(verified.link);
+        Ok(verified.link)
+    }
+    /// Disable a link a dropped verification left on (`dp_disable_link_phy`).
+    async fn stop_dp_probe<A: Aux + Send>(
+        &mut self,
+        tables: &Tables<'_>,
+        aux: &mut A,
+    ) -> Result<(), Error> {
+        let mut phy = DpPhy {
+            tables,
+            regs: self.gpu.regs,
+            authority: self.regs.authority,
+            connector: self.connector,
+        };
+        let mut source = dp::DioSource {
+            link: self.dp_link,
+            phy: &mut phy,
+        };
+        let result = dp_link::disable_link_phy(aux, &mut source).await;
+        self.dp.probing = false;
+        result
+    }
+    /// The running DP stream's link, checked as an HPD-RX short pulse is
+    /// (`dp_handle_hpd_rx_irq`'s SST part): an automated-test request is
+    /// acknowledged; a lost lock with the sink in D0 is `LinkLoss`. Nothing
+    /// for HDMI or a pipeline that is not running.
+    pub async fn check_dp_link<A: Aux + Send>(&mut self, aux: &mut A) -> Result<RxEvent, Error> {
+        if self.state != State::At(Step::Running) || self.connector.signal != Signal::DisplayPort {
+            return Ok(RxEvent::None);
+        }
+        let (Some(caps), Some(link)) = (self.dp.caps, self.link) else {
+            return Ok(RxEvent::None);
+        };
+        dp_link::handle_hpd_rx_irq(aux, caps.rev(), link.lanes).await
+    }
+    /// `dp_handle_link_loss` for the running SST stream:
+    /// `link_set_dpms_off` (audio, blank, link disabled, stream stopped) and
+    /// `link_set_dpms_on` at the same link setting with the commit's retries.
+    /// The front end keeps scanning out the same surface throughout. On
+    /// failure the link stays down and the pipeline must be disabled (the
+    /// state is `At(Step::Link)`); the next lighting verifies the link again.
+    pub async fn retrain<A: Aux + Send>(
+        &mut self,
+        tables: &Tables<'_>,
+        aux: &mut A,
+    ) -> Result<DpLink, Error> {
+        if self.state != State::At(Step::Running) || self.connector.signal != Signal::DisplayPort {
+            return Err(Error::Busy);
+        }
+        let output = self.output.ok_or(Error::Invalid)?;
+        let caps = self.dp.caps.ok_or(Error::Invalid)?;
+        let setting = self.link.ok_or(Error::Invalid)?;
+        self.state = State::At(Step::Link);
+        let dig = self.route.stream;
+        if self.audio.record(dig).is_some() {
+            if let Err(error) = self.audio.stop(dig, &mut self.clocks).await {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi22 audio stop on DIG {dig} failed ({error:?})"
+                );
+            }
+        }
+        self.unlink_dp(tables, aux).await?;
+        sleep_us(DP_BLANK_SETTLE_US).await;
+        self.link_dp_at(tables, &output.timing, &caps, setting, aux)
+            .await?;
+        self.state = State::At(Step::Running);
+        let sink = Sink {
+            edid: core::mem::take(&mut self.dp.edid),
+            preferred: None,
+            hdmi: false,
+            dpcd: None,
+        };
+        self.start_audio(&output.timing, &sink).await;
+        self.dp.edid = sink.edid;
+        Ok(setting)
+    }
+    /// `disable` after the sink left (debounced HPD low): the same teardown
+    /// with no DPCD transaction to the absent sink (`dp_disable_link_phy`
+    /// skips SET_POWER once `link->type` is none). An HDMI stream still gets
+    /// `link_set_dpms_off`'s legacy SCDC TMDS_Config write over `ddc`,
+    /// unchecked and only for a sink that declared SCDC
+    /// ([`hdmi::write_scdc_legacy`]), as Linux sends it whether or not a sink
+    /// answers. Also resumes a stop that was interrupted.
+    pub async fn disable_unplugged<A: Aux + Send>(
+        &mut self,
+        tables: &Tables<'_>,
+        ddc: &mut A,
+    ) -> Result<(), Error> {
+        if self.state == State::At(Step::Stopping) {
+            self.state = State::At(Step::Link);
+        }
+        self.disable(tables, &mut ScdcOnly(ddc)).await
+    }
+}
+
+/// The transport of an unplugged sink: SCDC (I2C) only, which Linux still
+/// writes on disable; every DPCD transaction is refused unsent.
+struct ScdcOnly<'a, A>(&'a mut A);
+impl<A: Aux + Send> Aux for ScdcOnly<'_, A> {
+    async fn read(&mut self, _: u32, _: &mut [u8]) -> Result<(), Error> {
+        Err(Error::Aux)
+    }
+    async fn write(&mut self, _: u32, _: &[u8]) -> Result<(), Error> {
+        Err(Error::Aux)
+    }
+    async fn connected(&mut self) -> bool {
+        false
+    }
+    async fn scdc_read(&mut self, offset: u8) -> Result<u8, Error> {
+        self.0.scdc_read(offset).await
+    }
+    async fn scdc_write(&mut self, offset: u8, value: u8) -> Result<(), Error> {
+        self.0.scdc_write(offset, value).await
+    }
+}
+
 /// No sink to reach: the AUX an HDMI pipeline is given.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoAux;
 impl Aux for NoAux {
     async fn read(&mut self, _: u32, _: &mut [u8]) -> Result<(), Error> {
         Err(Error::Aux)
+    }
+    async fn connected(&mut self) -> bool {
+        false
     }
     async fn write(&mut self, _: u32, _: &[u8]) -> Result<(), Error> {
         Err(Error::Aux)

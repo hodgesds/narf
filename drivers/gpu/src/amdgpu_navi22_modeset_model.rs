@@ -453,6 +453,8 @@ pub(crate) struct DpSink {
     pub dpcd: BTreeMap<u32, u8>,
     pub fail_rates: Vec<u8>,
     pub feature: u8,
+    /// Receiver caps at DPCD 0x0 (and, with bit 7 of 0xE, at 0x2200).
+    pub caps: [u8; 16],
 }
 impl DpSink {
     pub fn new(model: Arc<Model>) -> Self {
@@ -461,10 +463,12 @@ impl DpSink {
             dpcd: BTreeMap::new(),
             fail_rates: Vec::new(),
             feature: 0,
+            caps: dpcd(0x12),
         }
     }
 }
 impl crate::amdgpu_dcn30_dp::Aux for DpSink {
+    async fn delay_us(&mut self, _: u64) {}
     async fn read(
         &mut self,
         address: u32,
@@ -479,8 +483,11 @@ impl crate::amdgpu_dcn30_dp::Aux for DpSink {
         for (i, byte) in data.iter_mut().enumerate() {
             let at = address + i as u32;
             *byte = match at {
-                0x202 | 0x203 if locked => 0x77,
-                0x204 if locked => 0x01,
+                0x000..=0x00f => self.caps[at as usize],
+                0x2200..=0x220f => self.caps[(at - 0x2200) as usize],
+                0x202 | 0x203 | 0x200c | 0x200d if locked => 0x77,
+                0x204 | 0x200e if locked => 0x01,
+                0x600 => *self.dpcd.get(&0x600).unwrap_or(&1),
                 0x2210 => self.feature,
                 _ => 0,
             };

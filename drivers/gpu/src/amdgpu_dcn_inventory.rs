@@ -145,6 +145,7 @@ const LPDDR5_CHANNEL_WIDTH_BYTES: u32 = 4;
 const DCE_REFCLK_OFFSET: usize = 12;
 const DCE_DISPLAY_CAPS_OFFSET: usize = 4;
 const DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE: u32 = 0x20;
+const DCE_INFO_CAPS_VBIOS_LTTPR_TRANSPARENT_ENABLE: u32 = 0x40;
 /// `atom_integrated_system_info_v2_*` field offsets, the same in v2.1 and v2.2.
 const MEMORY_TYPE_OFFSET: usize = 26;
 const CHANNEL_COUNT_OFFSET: usize = 27;
@@ -562,6 +563,24 @@ pub fn lttpr_non_transparent(vbios: &[u8]) -> Result<bool, Error> {
     let caps = u32::from(u16_at(info, DCE_DISPLAY_CAPS_OFFSET))
         | u32::from(u16_at(info, DCE_DISPLAY_CAPS_OFFSET + 2)) << 16;
     Ok(caps & DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE != 0)
+}
+
+/// `atom_display_controller_info_v4_*.display_caps` as DCN3.0 reads it
+/// (`bios_parser_get_lttpr_interop` / `_get_lttpr_caps`): (VBIOS LTTPR
+/// aware: DCE_INFO_CAPS_VBIOS_LTTPR_TRANSPARENT_ENABLE, non-transparent
+/// wanted: DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE).
+pub fn lttpr_caps(vbios: &[u8]) -> Result<(bool, bool), Error> {
+    let info = table(vbios, TABLE_DCE_INFO)?;
+    header(info, 4, &[1, 2, 3, 4, 5])?;
+    if (u16_at(info, 0) as usize) < DCE_DISPLAY_CAPS_OFFSET + 4 {
+        return Err(Error::Invalid);
+    }
+    let caps = u32::from(u16_at(info, DCE_DISPLAY_CAPS_OFFSET))
+        | u32::from(u16_at(info, DCE_DISPLAY_CAPS_OFFSET + 2)) << 16;
+    Ok((
+        caps & DCE_INFO_CAPS_VBIOS_LTTPR_TRANSPARENT_ENABLE != 0,
+        caps & DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE != 0,
+    ))
 }
 
 /// The memory configuration, from `atom_integrated_system_info_v2_*` for the

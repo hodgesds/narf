@@ -512,9 +512,10 @@ fn dp_order(log: &[m::Write], r: Route, tx: u8, rate: u8) -> Result<usize, &'sta
             ("lane status", &|w: &m::Write| {
                 w.dword == m::AUX_READ | 0x202
             }),
-            // TPS3 at HBR2 and above when the sink has it, else TPS2.
-            ("TPS2/3", &|w: &m::Write| {
-                w.dword == d2(0x2118 + t * 0x100) && w.value == if rate >= 20 { 2 } else { 1 }
+            // TPS3 whenever the sink has it (decide_eq_training_pattern),
+            // whatever the link rate.
+            ("TPS3", &|w: &m::Write| {
+                w.dword == d2(0x2118 + t * 0x100) && w.value == 2
             }),
             ("video idle", &set(d2(0x2113 + t * 0x100), 1 << 28)),
             ("training complete", &set(d2(0x2108 + t * 0x100), 1 << 4)),
@@ -565,8 +566,12 @@ fn dp_disable_order(
     )
 }
 
-fn navi22_modeset_dp_sst_trains_falls_back_and_follows_linux_order() -> TestResult {
-    for (fail, revision, want) in [(vec![], 0x12, 20), (vec![20], 0x14, 10)] {
+/// Detection's destructive verification (with Linux's CR fallback: the rate
+/// first) bounds the link; the stream then trains the least link that
+/// carries its 640x480 mode (RBR x1, `decide_dp_link_settings`).
+fn navi22_modeset_dp_sst_verifies_falls_back_and_follows_linux_order() -> TestResult {
+    for (fail, revision, verified) in [(vec![], 0x12, 20), (vec![20], 0x14, 10)] {
+        let want = 6;
         let bench = Bench::new();
         bench.set(m::MP1 + 0x274, 1);
         let vram = Vram::new(VRAM_BYTES);
@@ -578,7 +583,11 @@ fn navi22_modeset_dp_sst_trains_falls_back_and_follows_linux_order() -> TestResu
         let sink = m::sink(Signal::DisplayPort, Some(m::dpcd(revision)));
         let mut aux = DpSink::new(bench.model.clone());
         aux.fail_rates = fail.clone();
-        // DPCD 1.4: SST split SDP and VSC colorimetry.
+        aux.caps = m::dpcd(revision);
+        // DPCD 1.4 with extended caps: SST split SDP and VSC colorimetry.
+        if revision == 0x14 {
+            aux.caps[14] = 0x80;
+        }
         aux.feature = 0x0a;
         let output = match run(enable_with(&mut p, &vram, &tables, &sink, &mut aux)) {
             Ok(o) => o,
@@ -587,10 +596,15 @@ fn navi22_modeset_dp_sst_trains_falls_back_and_follows_linux_order() -> TestResu
         if output.link
             != Some(DpLink {
                 rate: want,
-                lanes: 4,
+                lanes: 1,
             })
+            || p.link_cap()
+                != Some(DpLink {
+                    rate: verified,
+                    lanes: 4,
+                })
         {
-            return TestResult::Fail("trained link");
+            return TestResult::Fail("verified or trained link");
         }
         let log = bench.log();
         let enabled = match dp_order(&log, r, 1, want) {
@@ -602,7 +616,7 @@ fn navi22_modeset_dp_sst_trains_falls_back_and_follows_linux_order() -> TestResu
         let f = u32::from(r.stream);
         if bench.get(d2(0x2112 + f * 0x100)) != m_vid
             || bench.get(d2(0x2111 + f * 0x100)) != 0x8000
-            || bench.get(d2(0x210b + 0x100)) != 3
+            || bench.get(d2(0x210b + 0x100)) != 0
         {
             return TestResult::Fail("M/N or lane count");
         }
@@ -612,7 +626,8 @@ fn navi22_modeset_dp_sst_trains_falls_back_and_follows_linux_order() -> TestResu
         if gsp0 != (revision == 0x14) || misc1 != (revision == 0x14) {
             return TestResult::Fail("VSC SDP colorimetry");
         }
-        // A failed rate was retired (disable_output) before the next one.
+        // A rate that failed verification was retired (disable_output)
+        // before the next one.
         if !fail.is_empty()
             && in_order(
                 &log,
@@ -642,7 +657,7 @@ fn navi22_modeset_dp_sst_trains_falls_back_and_follows_linux_order() -> TestResu
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22-modeset",
-    navi22_modeset_dp_sst_trains_falls_back_and_follows_linux_order
+    navi22_modeset_dp_sst_verifies_falls_back_and_follows_linux_order
 );
 
 /// The first write of each enable step in a clean HDMI run, by step.
@@ -874,7 +889,7 @@ fn navi22_modeset_models_every_pipe_and_dig_route() -> TestResult {
             let log = bench.log();
             let order = match signal {
                 Signal::Hdmi => hdmi_enable_order(&log, r, tx),
-                Signal::DisplayPort => dp_order(&log, r, tx, 20),
+                Signal::DisplayPort => dp_order(&log, r, tx, 6),
             };
             if let Err(name) = order {
                 return TestResult::Fail(name);
@@ -1058,6 +1073,190 @@ fn navi22_modeset_retires_the_live_gop_stream_like_dcn30_init_hw() -> TestResult
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22-modeset",
     navi22_modeset_retires_the_live_gop_stream_like_dcn30_init_hw
+);
+
+/// DP offers follow `dp_validate_mode_timing` against the verified link (the
+/// receiver caps until verified); a request outside them is refused.
+fn navi22_modeset_dp_offers_follow_the_verified_link() -> TestResult {
+    let mut dp = sink(false, 0);
+    dp.dpcd = Some(m::dpcd(0x12));
+    let (uhd, fhd) = {
+        let t = crate::amdgpu_navi48_boot::edid_timings(&dp.edid);
+        (t[0], t[1])
+    };
+    let unverified = offered_on(&dp, &soc(), 3_650_000, None);
+    let hbr4 = offered_on(&dp, &soc(), 3_650_000, Some(DpLink { rate: 10, lanes: 4 }));
+    let safe = offered_on(&dp, &soc(), 3_650_000, Some(dp_link::FAIL_SAFE));
+    if hbr4 != [fhd] || !safe.is_empty() || !unverified.contains(&fhd) {
+        return TestResult::Fail("offers against the verified link");
+    }
+    // 4K60 needs more than HBR x4: never offered on it, and refused.
+    if hbr4.contains(&uhd)
+        || select_dp_on(
+            &dp,
+            &soc(),
+            3_650_000,
+            Some(uhd),
+            Some(DpLink { rate: 10, lanes: 4 }),
+        )
+        .err()
+            != Some(Error::NoMode)
+    {
+        return TestResult::Fail("mode beyond the verified link");
+    }
+    if select_dp_on(
+        &dp,
+        &soc(),
+        3_650_000,
+        None,
+        Some(DpLink { rate: 10, lanes: 4 }),
+    )
+    .map(|r| r.0)
+        != Ok(fhd)
+    {
+        return TestResult::Fail("preferred mode within the link");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_modeset_dp_offers_follow_the_verified_link
+);
+
+fn lit_dp(bench: &Bench, vram: &Vram, tables: &Tables<'_>, aux: &mut DpSink) -> Option<Pipeline> {
+    let connector = m::connector(Signal::DisplayPort, 1, 1);
+    let r = Resources::new().acquire(&connector).unwrap();
+    let mut p = pipeline(bench, connector, r);
+    let sink = m::sink(Signal::DisplayPort, Some(m::dpcd(0x12)));
+    run(enable_with(&mut p, vram, tables, &sink, aux)).ok()?;
+    Some(p)
+}
+
+/// Link loss (`dp_handle_link_loss`): the check sees lost lock with the sink
+/// in D0; the retrain stops and retrains only the link (blank, D3, PHY off,
+/// TPS1 at the same setting, unblank) while the front end keeps running.
+fn navi22_modeset_dp_link_loss_retrains_the_link_only() -> TestResult {
+    let bench = Bench::new();
+    bench.set(m::MP1 + 0x274, 1);
+    let vram = Vram::new(VRAM_BYTES);
+    let image = m::vbios(7);
+    let tables = Tables::new(&image).unwrap();
+    let mut aux = DpSink::new(bench.model.clone());
+    let Some(mut p) = lit_dp(&bench, &vram, &tables, &mut aux) else {
+        return TestResult::Fail("DP enable");
+    };
+    if run(p.check_dp_link(&mut aux)) != Ok(RxEvent::None) {
+        return TestResult::Fail("healthy link reported lost");
+    }
+    aux.fail_rates = vec![6];
+    if !matches!(run(p.check_dp_link(&mut aux)), Ok(RxEvent::LinkLoss(_))) {
+        return TestResult::Fail("link loss missed");
+    }
+    aux.fail_rates.clear();
+    let from = bench.log().len();
+    if run(p.retrain(&tables, &mut aux)) != Ok(DpLink { rate: 6, lanes: 1 })
+        || p.state() != State::At(Step::Running)
+    {
+        return TestResult::Fail("retrain");
+    }
+    let log = bench.log();
+    let (f, t) = (u32::from(p.route().stream), 1u32);
+    if let Err(name) = in_order(
+        &log,
+        from,
+        &[
+            ("dp_blank", &clear(d2(0x210c + f * 0x100), 1)),
+            ("DPCD D3", &|w: &m::Write| {
+                w.dword == m::AUX_WRITE | 0x600 && w.value == 2
+            }),
+            (
+                "disable_output",
+                &table(m::SLOT_TRANSMITTER, Some(1), Some(0)),
+            ),
+            (
+                "enable_dp_output",
+                &table(m::SLOT_TRANSMITTER, Some(1), Some(1)),
+            ),
+            ("DPCD link rate", &|w: &m::Write| {
+                w.dword == m::AUX_WRITE | 0x100 && w.value == 6
+            }),
+            ("TPS1", &|w: &m::Write| {
+                w.dword == d2(0x2118 + t * 0x100) && w.value == 0
+            }),
+            ("DP_VID_STREAM_ENABLE", &set(d2(0x210c + f * 0x100), 1)),
+        ],
+    ) {
+        return TestResult::Fail(name);
+    }
+    let p0 = u32::from(p.route().pipe);
+    if log[from..].iter().any(|w| {
+        (w.dword == d2(0x1b41 + p0 * 0x80) && w.value & 1 == 0)
+            || (w.dword == d2(0x5f3 + p0 * 0xdc) && w.value & 1 != 0)
+    }) {
+        return TestResult::Fail("retrain touched the OTG or HUBP");
+    }
+    // A retrain that cannot train leaves the link down for disable.
+    aux.fail_rates = vec![6];
+    if !matches!(run(p.retrain(&tables, &mut aux)), Err(Error::Training(_)))
+        || p.state() != State::At(Step::Link)
+    {
+        return TestResult::Fail("failed retrain state");
+    }
+    if run(p.disable(&tables, &mut aux)).is_err() || p.state() != State::At(Step::Stopped) {
+        return TestResult::Fail("disable after a failed retrain");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_modeset_dp_link_loss_retrains_the_link_only
+);
+
+/// After the sink left, teardown issues no AUX transaction at all.
+fn navi22_modeset_dp_unplug_teardown_sends_no_aux() -> TestResult {
+    let bench = Bench::new();
+    bench.set(m::MP1 + 0x274, 1);
+    let vram = Vram::new(VRAM_BYTES);
+    let image = m::vbios(7);
+    let tables = Tables::new(&image).unwrap();
+    let mut aux = DpSink::new(bench.model.clone());
+    let Some(mut p) = lit_dp(&bench, &vram, &tables, &mut aux) else {
+        return TestResult::Fail("DP enable");
+    };
+    let from = bench.log().len();
+    if run(p.disable_unplugged(&tables, &mut aux)).is_err() || p.state() != State::At(Step::Stopped)
+    {
+        return TestResult::Fail("unplugged disable");
+    }
+    let log = bench.log();
+    if log[from..]
+        .iter()
+        .any(|w| w.dword & (m::AUX_READ | m::AUX_WRITE) != 0)
+    {
+        return TestResult::Fail("AUX after unplug");
+    }
+    let r = p.route();
+    if let Err(name) = in_order(
+        &log,
+        from,
+        &[
+            (
+                "disable_output",
+                &table(m::SLOT_TRANSMITTER, Some(1), Some(0)),
+            ),
+            (
+                "disable_crtc",
+                &clear(d2(0x1b41 + u32::from(r.pipe) * 0x80), 1),
+            ),
+        ],
+    ) {
+        return TestResult::Fail(name);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_modeset_dp_unplug_teardown_sends_no_aux
 );
 
 /// dcn20_init_blank on an ODM 2:1 GOP OTG blanks both OPPs at half width;

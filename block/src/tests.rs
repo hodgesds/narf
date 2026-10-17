@@ -1703,3 +1703,244 @@ kernel_test_in!(
     "block/disk_policy",
     smoke_block_disk_policy_sync_bridge_reports_read_only
 );
+
+// ── block/partition: standard 128-entry GPT ─────────────────────────
+//
+// A stock GPT (sgdisk / sfdisk / the UEFI default, and both NVMe disks on
+// the Navi22 host) has 128 entries × 128 bytes = 16 KiB of entries at
+// LBA 2..=33. Before the chunked entry-array read the scanner asked for
+// all 32 LBAs at once, which a driver capped at one 4 KiB transfer
+// refused, so no partition was ever registered.
+
+/// Block device that refuses any read larger than `max_lbas` (as a driver
+/// with a small max transfer would) and records the largest read asked of
+/// it.
+struct CappedBlock {
+    inner: alloc::sync::Arc<dyn crate::BlockDeviceSync>,
+    max_lbas: u16,
+    largest: core::sync::atomic::AtomicU32,
+}
+
+impl crate::BlockDeviceSync for CappedBlock {
+    fn lba_size(&self) -> u32 {
+        self.inner.lba_size()
+    }
+    fn capacity(&self) -> u64 {
+        self.inner.capacity()
+    }
+    fn read(&self, lba: u64, n: u16, out: &mut [u8]) -> Result<(), crate::BlockIoError> {
+        self.largest
+            .fetch_max(n as u32, core::sync::atomic::Ordering::Relaxed);
+        if n > self.max_lbas {
+            return Err(crate::BlockIoError::BufferTooSmall);
+        }
+        self.inner.read(lba, n, out)
+    }
+    fn write(&self, lba: u64, n: u16, data: &[u8]) -> Result<(), crate::BlockIoError> {
+        self.inner.write(lba, n, data)
+    }
+}
+
+/// 4096-LBA (2 MiB) disk with a protective MBR and a 128-entry GPT whose
+/// used slots are 0, 1, 99 (in the entry array's fourth 4 KiB chunk) and
+/// 120 (which ends past the last LBA and must be ignored).
+fn gpt128_disk(num_entries: u32, entry_size: u32) -> alloc::vec::Vec<u8> {
+    const LBAS: usize = 4096;
+    let mut b = alloc::vec![0u8; LBAS * 512];
+    b[446 + 4] = 0xEE;
+    b[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
+    b[446 + 12..446 + 16].copy_from_slice(&((LBAS - 1) as u32).to_le_bytes());
+    b[510] = 0x55;
+    b[511] = 0xAA;
+    let h = 512;
+    b[h..h + 8].copy_from_slice(b"EFI PART");
+    b[h + 8..h + 12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+    b[h + 12..h + 16].copy_from_slice(&92u32.to_le_bytes());
+    b[h + 24..h + 32].copy_from_slice(&1u64.to_le_bytes());
+    b[h + 32..h + 40].copy_from_slice(&((LBAS - 1) as u64).to_le_bytes());
+    b[h + 40..h + 48].copy_from_slice(&34u64.to_le_bytes());
+    b[h + 48..h + 56].copy_from_slice(&((LBAS - 34) as u64).to_le_bytes());
+    b[h + 72..h + 80].copy_from_slice(&2u64.to_le_bytes());
+    b[h + 80..h + 84].copy_from_slice(&num_entries.to_le_bytes());
+    b[h + 84..h + 88].copy_from_slice(&entry_size.to_le_bytes());
+    // Linux filesystem data type GUID 0FC63DAF-8483-4772-8E79-3D69D8477DE4.
+    let linux = [
+        0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D,
+        0xE4,
+    ];
+    for (slot, start, end) in [
+        (0usize, 2048u64, 2111u64),
+        (1, 2112, 2175),
+        (99, 2176, 2239),
+        (120, 4000, 5000),
+    ] {
+        let e = 1024 + slot * entry_size as usize;
+        if e + 128 > 34 * 512 {
+            continue;
+        }
+        b[e..e + 16].copy_from_slice(&linux);
+        b[e + 16] = slot as u8 + 1; // distinct partition GUIDs
+        b[e + 32..e + 40].copy_from_slice(&start.to_le_bytes());
+        b[e + 40..e + 48].copy_from_slice(&end.to_le_bytes());
+    }
+    for lba in 2048..2240usize {
+        b[lba * 512..(lba + 1) * 512].fill((lba >> 6) as u8);
+    }
+    b
+}
+
+fn smoke_block_partition_scan_standard_128_entry_gpt() -> TestResult {
+    use crate::partition::{scan_and_register_partitions, GPT_ENTRY_READ_CHUNK_BYTES};
+    use crate::registry::{__reset_for_test, __restore_for_test, __snapshot_for_test};
+    use alloc::string::String;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    let expected = alloc::vec![
+        String::from("gpt128p1"),
+        String::from("gpt128p2"),
+        String::from("gpt128p100"),
+    ];
+    let snap = __snapshot_for_test();
+    let result = (|| {
+        // Uncapped, a 4 KiB-capped (8-LBA) and a single-LBA device must
+        // all register the same partitions, and no entry-array read may
+        // exceed one 4 KiB chunk.
+        for cap in [u16::MAX, 8, 1] {
+            __reset_for_test();
+            let base = Arc::new(VecBlock {
+                data: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(gpt128_disk(128, 128))),
+                lba_size: 512,
+            }) as Arc<dyn crate::BlockDeviceSync>;
+            let capped = Arc::new(CappedBlock {
+                inner: base,
+                max_lbas: cap,
+                largest: AtomicU32::new(0),
+            });
+            let parent = capped.clone() as Arc<dyn crate::BlockDeviceSync>;
+            let report = scan_and_register_partitions(parent, "gpt128")
+                .map_err(|_| "scan failed on a standard 128-entry GPT")?;
+            if !report.is_gpt || report.registered != expected {
+                return Err("128-entry GPT registered the wrong partitions");
+            }
+            if capped.largest.load(Ordering::Relaxed) as usize * 512 > GPT_ENTRY_READ_CHUNK_BYTES {
+                return Err("an entry-array read exceeded one chunk");
+            }
+            let p100 = crate::registry::find_block_device("gpt128p100")
+                .ok_or("slot-99 partition missing")?;
+            let mut sector = [0u8; 512];
+            p100.read(0, 1, &mut sector)
+                .map_err(|_| "partition read failed")?;
+            if sector.iter().any(|&v| v != (2176u64 >> 6) as u8) || p100.capacity() != 64 {
+                return Err("partition window translated wrong");
+            }
+        }
+        Ok(())
+    })();
+    __restore_for_test(snap);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "block/partition",
+    smoke_block_partition_scan_standard_128_entry_gpt
+);
+
+fn smoke_block_partition_scan_rejects_bad_entry_arrays() -> TestResult {
+    use crate::partition::{scan_and_register_partitions, GptError, ScanError};
+    use crate::registry::{__reset_for_test, __restore_for_test, __snapshot_for_test};
+    use alloc::sync::Arc;
+    let disk = |n: u32, size: u32| {
+        Arc::new(VecBlock {
+            data: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(gpt128_disk(n, size))),
+            lba_size: 512,
+        }) as Arc<dyn crate::BlockDeviceSync>
+    };
+    let snap = __snapshot_for_test();
+    __reset_for_test();
+    // Entry size below 128 used to slice past each slot; a huge entry
+    // count used to drive an unbounded allocation and a u16-truncated
+    // read length.
+    let small = scan_and_register_partitions(disk(128, 64), "gptbad");
+    let huge = scan_and_register_partitions(disk(1 << 20, 128), "gptbad");
+    let max_ok = scan_and_register_partitions(disk(8192, 128), "gptbad");
+    let none_registered = crate::block_devices().is_empty();
+    __restore_for_test(snap);
+    if small != Err(ScanError::GptHeader(GptError::BadEntrySize)) {
+        return TestResult::Fail("entry size 64 must be rejected");
+    }
+    if huge != Err(ScanError::EntriesTooLarge) {
+        return TestResult::Fail("a 128 MiB entry array must be rejected");
+    }
+    // 8192 × 128 B = 1 MiB (LBA 2..2050): exactly the bound, inside the
+    // 4096-LBA disk, so it parses. Slots that overlap the partition data
+    // decode as entries ending past the disk and are skipped.
+    if max_ok.is_err() {
+        return TestResult::Fail("a 1 MiB entry array that fits the disk must parse");
+    }
+    if none_registered {
+        return TestResult::Fail("in-range entries of the 1 MiB array were not registered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "block/partition",
+    smoke_block_partition_scan_rejects_bad_entry_arrays
+);
+
+/// Partitions found by the scanner are registry devices like any other:
+/// under `narf.disks=boot-only` they read but refuse writes, and the
+/// refused write never reaches the parent disk.
+fn smoke_block_partition_scanned_gpt_partitions_are_read_only_under_boot_only() -> TestResult {
+    use crate::disk_policy::{self, DiskPolicy};
+    use crate::partition::scan_and_register_partitions;
+    use crate::registry::find_block_device;
+    use alloc::sync::Arc;
+
+    let bytes = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(gpt128_disk(128, 128)));
+    let pristine = bytes.lock().clone();
+    let parent = Arc::new(VecBlock {
+        data: bytes.clone(),
+        lba_size: 512,
+    }) as Arc<dyn crate::BlockDeviceSync>;
+    let result = (|| {
+        disk_policy::__set_policy_for_test(Some(DiskPolicy::BootOnly));
+        crate::register_block_device("ro-gpt0", parent.clone());
+        let report =
+            scan_and_register_partitions(parent.clone(), "ro-gpt0").map_err(|_| "scan failed")?;
+        if report.registered.len() != 3 {
+            return Err("expected three scanned partitions");
+        }
+        let payload = [0x5Au8; 512];
+        let mut buf = [0u8; 512];
+        for name in ["ro-gpt0", "ro-gpt0p1", "ro-gpt0p2", "ro-gpt0p100"] {
+            let dev = find_block_device(name).ok_or("scanned device not registered")?;
+            dev.read(0, 1, &mut buf)
+                .map_err(|_| "boot-only must allow reads")?;
+            if dev.write(0, 1, &payload) != Err(crate::BlockIoError::ReadOnly) {
+                return Err("boot-only must refuse writes to a scanned partition");
+            }
+            if !dev.is_read_only() {
+                return Err("a scanned partition must report read-only");
+            }
+        }
+        if *bytes.lock() != pristine {
+            return Err("a refused write reached the disk");
+        }
+        Ok(())
+    })();
+    disk_policy::__set_policy_for_test(None);
+    for name in ["ro-gpt0p1", "ro-gpt0p2", "ro-gpt0p100", "ro-gpt0"] {
+        crate::unregister_block_device(name);
+    }
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "block/disk_policy",
+    smoke_block_partition_scanned_gpt_partitions_are_read_only_under_boot_only
+);
