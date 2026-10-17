@@ -1027,7 +1027,11 @@ marker-gated, USB-only, bounded) and boots with `narf.disks=boot-only`: every
 other disk is read-only at the block layer (writes refused, logged once) and
 skipped by the boot-time mounts, and ext/btrfs mount a read-only device without
 any repair or log-replay write (`usb-image --qemu` hashes decoy NVMe/SATA disks
-before and after); a secondary card's cold boot keeps the iGPU
+before and after). NVMe I/O now builds PRP lists up to the controller's MDTS,
+so the host's standard 128-entry GPTs are partition-scanned, and AHCI binds by
+class (`01:06:01`, the AMD 600-series `1022:43f6`) with Linux's HBA
+save/reset/restore and per-port COMRESET bring-up; both stay read-only under
+`boot-only` (AMD AHCI untested: QEMU has only ICH9). A secondary card's cold boot keeps the iGPU
 console live and ends with a per-stage summary (see
 [docs/BOOTING_ON_CACHYOS.md](docs/BOOTING_ON_CACHYOS.md#rx-6750-xt-bring-up-boot)).
 DCN3.0 HDMI and DP SST LPCM audio (`amdgpu_dcn30_audio`) follows Linux DC
