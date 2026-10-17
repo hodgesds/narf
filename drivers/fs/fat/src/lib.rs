@@ -147,6 +147,17 @@ pub fn register_fstypes() {
     narf_filesystem::register_block_fstype_ctx("fat32", build_named);
 }
 
+/// Run a mount-time future to completion from either boot code or a
+/// `mount(2)`/`fsconfig` syscall. The halting `block_on` refuses to run inside
+/// an executor poll (a syscall), so a syscall caller spins instead.
+fn wait_mount<F: core::future::Future>(fut: F) -> F::Output {
+    if narf_scheduler::current_task_id() == narf_scheduler::TaskId::NONE {
+        narf_scheduler::block_on(fut)
+    } else {
+        narf_scheduler::block_on_spin(fut)
+    }
+}
+
 fn build_named(
     request: &narf_filesystem::MountRequest<'_>,
 ) -> Result<alloc::sync::Arc<dyn narf_filesystem::FsInstance>, narf_filesystem::FsError> {
@@ -157,7 +168,7 @@ fn build_named(
         .unwrap_or(request.source);
     let dev = narf_block::find_block_device(name).ok_or(narf_filesystem::FsError::NotFound)?;
     let async_dev = narf_block::SyncBlock::new(dev);
-    let vol = narf_scheduler::block_on(volume::FatVolume::mount_with_opts(
+    let vol = wait_mount(volume::FatVolume::mount_with_opts(
         async_dev,
         DomainId::DRIVER_0,
         opts,

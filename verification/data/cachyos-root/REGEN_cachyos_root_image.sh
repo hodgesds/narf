@@ -27,6 +27,7 @@
 #   CACHYOS_ROOT_IMG=<path>      output image (default target/narf-cachyos-root.img)
 #   CACHYOS_ROOT_REBUILD=1       reinstall the rootfs from scratch
 #   CACHYOS_ROOT_BGT=0           build btrfs without block-group-tree
+#   CACHYOS_ROOT_COMPRESS=no     store file data uncompressed (default zstd:1)
 #   CACHYOS_ROOT_PACKAGES="..."  extra packages to install
 set -euo pipefail
 
@@ -48,6 +49,7 @@ ROOT_PARTUUID=c4c405ee-0000-4d15-8000-0000000000b7
 ESP_MIB=128
 BTRFS_MIB="${CACHYOS_ROOT_BTRFS_MIB:-4096}"
 BGT="${CACHYOS_ROOT_BGT:-1}"
+COMPRESS="${CACHYOS_ROOT_COMPRESS:-zstd:1}"
 
 PACKAGES="base btrfs-progs dosfstools sudo cachyos-settings cachyos-keyring \
 cachyos-mirrorlist cachyos-v4-mirrorlist ${CACHYOS_ROOT_PACKAGES:-}"
@@ -156,6 +158,11 @@ EOF
   for pair in home:@home root:@root srv:@srv var/cache:@cache var/tmp:@tmp var/log:@log; do
     dir=${pair%%:*}; sub=${pair##*:}
     mkdir -p "$R/$dir"
+    # Idempotent: a re-run (no rootfs reinstall) finds the contents already
+    # moved into the subvolume and the mount point empty.
+    if [ -d "$STAGE/$sub" ] && [ -z "$(ls -A "$R/$dir")" ]; then
+      continue
+    fi
     rm -rf "$STAGE/$sub"
     mkdir -p "$STAGE/$sub"
     chmod --reference="$R/$dir" "$STAGE/$sub"
@@ -179,7 +186,7 @@ fi
 rm -f "$WORK/root.btrfs" "$WORK/esp.fat"
 truncate -s "${BTRFS_MIB}M" "$WORK/root.btrfs"
 in_ns mkfs.btrfs -q -f -U "$BTRFS_UUID" -L cachyos -n 16384 -s 4096 \
-  -O "$FEATURES" --compress zstd:1 --rootdir "$STAGE" \
+  -O "$FEATURES" --compress "$COMPRESS" --rootdir "$STAGE" \
   --subvol rw:@ --subvol rw:@home --subvol rw:@root --subvol rw:@srv \
   --subvol rw:@cache --subvol rw:@tmp --subvol rw:@log \
   "$WORK/root.btrfs"
