@@ -3629,7 +3629,9 @@ the IV's PASID (`amdgpu_vmid::record_fault`: address from the IV, the hub's
 protection-fault status, GFX 0 / MM 1; a zero status never replaces a
 useful one; faults for freed PASIDs are dropped), and
 `AMDGPU_INFO_GPUVM_FAULT` (`amdgpu_info::dispatch_for`) answers from the
-open's PASID. `AMDGPU_INFO` still reports acceleration unavailable.
+open's PASID. `AMDGPU_INFO` still reports acceleration unavailable, while
+`HW_IP_INFO`'s `available_rings` reports bit 0 for each IP whose ring 0
+the open's card's submitter serves (`amdgpu_info::available_rings`).
 
 `amdgpu_vmid::VmidManager` grants VMIDs as amdgpu_vmid_grab does with
 concurrent flushes: `grab(GrabRequest { owner, pd_addr, tlb_seq, pasid,

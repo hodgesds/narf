@@ -470,7 +470,7 @@ pub fn unregister_submitter(card: u32) {
     SUBMITTERS.lock().retain(|(c, _)| *c != card);
 }
 
-fn submitter(card: u32) -> Option<Arc<dyn Submitter>> {
+pub(crate) fn submitter(card: u32) -> Option<Arc<dyn Submitter>> {
     SUBMITTERS
         .lock()
         .iter()

@@ -654,6 +654,11 @@ impl VmState {
         }
     }
 
+    /// The DRM card whose engine runs this space's jobs.
+    pub fn card(&self) -> Option<u32> {
+        self.card
+    }
+
     /// This space's TLB sequence (see the field).
     pub fn tlb_seq(&self) -> u64 {
         self.tlb_seq.load(core::sync::atomic::Ordering::Acquire)

@@ -13248,3 +13248,60 @@ kernel_test_in!(
     "drivers/gpu/amdgpu_gem",
     smoke_amdgpu_gem_prime_export_import
 );
+
+/// AMDGPU_INFO_HW_IP_INFO's `available_rings` follows the open's card: bit 0
+/// for an IP whose ring 0 the card's submitter serves, zero otherwise or
+/// with no submitter.
+fn smoke_amdgpu_info_available_rings_follow_the_submitter() -> TestResult {
+    use crate::amdgpu_info::available_rings;
+    use crate::amdgpu_uapi as u;
+    use alloc::boxed::Box;
+    use narf_filesystem::FsError;
+    struct GfxOnly;
+    impl crate::amdgpu_cs::Submitter for GfxOnly {
+        fn submit<'a>(
+            &'a self,
+            _: &'a crate::amdgpu_vm::VmState,
+            _: &'a crate::amdgpu_cs::Submission,
+        ) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<u64, FsError>> + Send + 'a>>
+        {
+            Box::pin(async { Err(FsError::Unsupported) })
+        }
+        fn signalled(&self, _: u64) -> bool {
+            true
+        }
+        fn ring_for(&self, ip: u32, instance: u32, ring: u32) -> Option<u32> {
+            (ip == u::AMDGPU_HW_IP_GFX && instance == 0 && ring == 0).then_some(0)
+        }
+        fn wait(
+            &self,
+            _: u64,
+            _: u64,
+        ) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<bool, FsError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(true) })
+        }
+    }
+    let card = 0x7ffe_0202;
+    if available_rings(Some(card), u::AMDGPU_HW_IP_GFX, 0) != 0 {
+        return TestResult::Fail("no submitter, no rings");
+    }
+    crate::amdgpu_cs::register_submitter(card, alloc::sync::Arc::new(GfxOnly));
+    let result = [
+        (Some(card), u::AMDGPU_HW_IP_GFX, 0, 1),
+        (Some(card), u::AMDGPU_HW_IP_GFX, 1, 0),
+        (Some(card), u::AMDGPU_HW_IP_COMPUTE, 0, 0),
+        (None, u::AMDGPU_HW_IP_GFX, 0, 0),
+    ]
+    .into_iter()
+    .all(|(c, ip, instance, want)| available_rings(c, ip, instance) == want);
+    crate::amdgpu_cs::unregister_submitter(card);
+    if !result || available_rings(Some(card), u::AMDGPU_HW_IP_GFX, 0) != 0 {
+        return TestResult::Fail("available rings");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_info",
+    smoke_amdgpu_info_available_rings_follow_the_submitter
+);
