@@ -25,6 +25,7 @@ use narf_driver_runtime::DomainId;
 use narf_filesystem::{FsError, FsInstance};
 
 pub mod allocator;
+pub(crate) mod block_group;
 pub mod btree;
 pub mod checksum;
 pub mod chunk;
@@ -34,6 +35,7 @@ pub mod extent;
 pub mod format;
 pub mod inode;
 pub mod lzo;
+pub mod mount_opts;
 pub mod node;
 pub mod roots;
 pub mod rw_gate;
@@ -88,176 +90,52 @@ fn discover_members(source: Arc<dyn BlockDeviceSync>) -> alloc::vec::Vec<Arc<Syn
     devices
 }
 
-/// Parsed `mount -t btrfs` options.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MountOptions {
-    /// `subvol=PATH` (leading/trailing slashes stripped).
-    pub subvol: Option<alloc::string::String>,
-    /// `subvolid=N`.
-    pub subvolid: Option<u64>,
-    /// `ro` (the last of `ro`/`rw` wins, as in Linux).
-    pub read_only: bool,
-}
-
-impl MountOptions {
-    /// The subvolume selector: `subvol=` when given (checked against
-    /// `subvolid=` after resolution), else `subvolid=`.
-    pub fn selector(&self) -> Option<volume::Subvol> {
-        match (&self.subvol, self.subvolid) {
-            (Some(path), _) => Some(volume::Subvol::Name(path.clone())),
-            (None, Some(id)) => Some(volume::Subvol::Id(id)),
-            (None, None) => None,
-        }
-    }
-}
-
-/// Options accepted because they change nothing NARF writes: access-time
-/// policy (NARF never updates atime), SSD allocation hints, discard (NARF
-/// never discards, which is always valid), compression (NARF writes
-/// uncompressed extents, which Linux reads under any `compress=` setting),
-/// commit interval, autodefrag, ACL and error-handling knobs.
-fn option_is_inert(option: &str) -> bool {
-    const FLAGS: &[&str] = &[
-        "defaults",
-        "noatime",
-        "relatime",
-        "strictatime",
-        "lazytime",
-        "nodiratime",
-        "diratime",
-        "atime",
-        "ssd",
-        "nossd",
-        "ssd_spread",
-        "nossd_spread",
-        "discard",
-        "nodiscard",
-        "autodefrag",
-        "noautodefrag",
-        "acl",
-        "noacl",
-        "barrier",
-        "nobarrier",
-        "datacow",
-        "datasum",
-        "compress",
-        "compress-force",
-        "nocompress",
-        "flushoncommit",
-        "noflushoncommit",
-        "skip_balance",
-        "user_subvol_rm_allowed",
-        "enospc_debug",
-        "noenospc_debug",
-        "nouser_xattr",
-        "user_xattr",
-        "space_cache=v2",
-        "errors=continue",
-        "errors=remount-ro",
-        "errors=panic",
-        "discard=async",
-        "discard=sync",
-    ];
-    if FLAGS.contains(&option) {
-        return true;
-    }
-    let value_of = |prefix: &str| option.strip_prefix(prefix);
-    if let Some(v) = value_of("compress=").or_else(|| value_of("compress-force=")) {
-        let (algo, level) = v.split_once(':').unwrap_or((v, ""));
-        return matches!(algo, "zstd" | "zlib" | "lzo" | "no" | "none" | "yes")
-            && (level.is_empty() || level.parse::<i32>().is_ok());
-    }
-    if let Some(v) = value_of("commit=") {
-        return v.parse::<u32>().is_ok();
-    }
-    false
-}
-
-/// Parse the `mount -t btrfs` option string. Accepts `ro`/`rw`, the
-/// [inert](option_is_inert) options an installed distro's fstab carries
-/// (`defaults,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2`),
-/// and `subvolid=N` / `subvol=PATH`. Anything else — notably options that
-/// would change on-disk state NARF does not maintain (`clear_cache`,
-/// `space_cache=v1`, `nospace_cache`, `rescue=`, `usebackuproot`, `degraded`,
-/// `device=`) — is `Unsupported`.
-pub fn parse_mount_options(options: &str) -> Result<MountOptions, FsError> {
-    let mut out = MountOptions::default();
-    for option in options.split(',').filter(|s| !s.is_empty()) {
-        if option == "ro" {
-            out.read_only = true;
-        } else if option == "rw" {
-            out.read_only = false;
-        } else if option_is_inert(option) {
-            continue;
-        } else if let Some(v) = option.strip_prefix("subvolid=") {
-            let id: u64 = v.parse().map_err(|_| FsError::InvalidData)?;
-            out.subvolid = Some(id);
-        } else if let Some(v) = option.strip_prefix("subvol=") {
-            // Leading/trailing slashes are harmless, but empty, dot, and dotdot
-            // components make resolution ambiguous and are rejected.
-            let path = v.trim_matches('/');
-            if path.is_empty()
-                || path
-                    .split('/')
-                    .any(|component| component.is_empty() || component == "." || component == "..")
-            {
-                return Err(FsError::Unsupported);
-            }
-            out.subvol = Some(alloc::string::String::from(path));
-        } else {
-            return Err(FsError::Unsupported);
-        }
-    }
-    Ok(out)
-}
-
-/// Parse the `mount -t btrfs` option string into an optional subvolume
-/// selector (see [`parse_mount_options`]).
+/// Parse the `mount -t btrfs` option string into an optional subvolume selector.
+/// Accepts every option [`mount_opts::parse`] accepts; format-affecting or
+/// unknown options are `Unsupported`.
 pub fn parse_mount_subvol(options: &str) -> Result<Option<volume::Subvol>, FsError> {
-    Ok(parse_mount_options(options)?.selector())
+    Ok(mount_opts::parse(options)?.subvol)
 }
 
-/// `mount -t btrfs <source>` builder. Resolves the source to a registered block
-/// device and honours `subvol=`/`subvolid=` (both given: they must agree).
-///
-/// Every call builds an independent volume; [`rw_gate`] lets at most one of
-/// them per fsid be writable, so a second read-write mount of an already
-/// writable filesystem (another fstab subvolume) comes up read-only.
-fn btrfs_fstype_builder(source: &str, options: &str) -> Result<Arc<dyn FsInstance>, FsError> {
-    let opts = parse_mount_options(options)?;
-    let subvol = opts.selector();
+/// `mount -t btrfs <source>` constructor. Resolves the source to a registered
+/// block device and honours `subvol=`/`subvolid=`, the recorded data options
+/// and a read-only request (`MS_RDONLY`, `fsconfig(ro)`, or `ro` in the data).
+fn btrfs_fstype_builder(
+    request: &narf_filesystem::MountRequest<'_>,
+) -> Result<Arc<dyn FsInstance>, FsError> {
+    let options = mount_opts::parse(request.options)?;
+    let source = request.source;
     let name = source.strip_prefix("/dev/").unwrap_or(source);
     let dev = narf_block::find_block_device(name).ok_or(FsError::NotFound)?;
     let devices = discover_members(dev);
+    // A read-only request really mounts read-only: no log replay, no commit
+    // timer, no device write. Every mount claims its fsid (rw_gate): at most
+    // one writable instance of a filesystem is live.
+    let read_only = request.read_only || options.read_only;
     let volume = narf_scheduler::block_on(async {
-        // `ro` in the data string really mounts read-only: no log replay, no
-        // commit timer, no device write.
         let volume =
-            volume::BtrfsVolume::mount_devices_claimed(devices, DomainId::DRIVER_0, opts.read_only)
+            volume::BtrfsVolume::mount_devices_claimed(devices, DomainId::DRIVER_0, read_only)
                 .await?;
-        if let Some(selector) = &subvol {
+        if let Some(selector) = &options.subvol {
             volume.switch_to_subvol(selector).await?;
-        }
-        if let (Some(_), Some(id)) = (&opts.subvol, opts.subvolid) {
-            if volume.fs_tree_id() != id {
-                return Err(FsError::InvalidData);
-            }
-        }
-        // A read-write request that cannot be honoured — the device is
-        // read-only under `narf.disks=`, the write-safety gate refused, or
-        // another writable mount of this fsid is open — fails with EROFS
-        // rather than silently handing back a read-only volume behind an `rw`
-        // mount. libmount then retries with MS_RDONLY, as it does for a
-        // write-protected disk on Linux, and mountinfo stays truthful.
-        if !opts.read_only && volume.is_read_only() {
-            return Err(FsError::ReadOnly);
         }
         Ok::<_, FsError>(volume)
     })?;
+    // A read-write request that cannot be honoured — the device is read-only
+    // under `narf.disks=`, the write-safety gate refused, or another writable
+    // mount of this fsid is open — fails with EROFS rather than handing back
+    // a read-only volume behind an `rw` mount. libmount then retries with
+    // MS_RDONLY, as it does for a write-protected disk on Linux, and
+    // mountinfo stays truthful. Dropping the volume releases nothing it
+    // never claimed.
+    if !read_only && volume.is_read_only() {
+        return Err(FsError::ReadOnly);
+    }
+    volume.set_mount_options(options);
     Ok(volume)
 }
 
 /// Register the named mount constructor without building a volume.
 pub fn register_fstypes() {
-    narf_filesystem::register_block_fstype("btrfs", btrfs_fstype_builder);
+    narf_filesystem::register_block_fstype_ctx("btrfs", btrfs_fstype_builder);
 }

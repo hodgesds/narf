@@ -2036,6 +2036,184 @@ kernel_test_in!(
     smoke_root_mount_selector_no_match_refuses
 );
 
+// ── Installed CachyOS root: root=UUID= + rootflags= + narf.disks ──────────
+
+/// The bare-metal CachyOS command line.
+const CACHYOS_CMDLINE: &str = "root=UUID=653602c3-cd42-420e-95ef-4c4033d17b56 \
+     rootflags=subvol=/@ systemd_pid1 narf.disks=root-ro";
+
+fn smoke_root_spec_parses_cachyos_cmdline() -> TestResult {
+    use crate::root_selector::{BtrfsSubvol, RootAccess, RootSelector, RootSpec};
+    let spec = RootSpec::from_cmdline(CACHYOS_CMDLINE);
+    if spec.selector
+        != Some(RootSelector::ByFsUuid(alloc::string::String::from(
+            "653602c3-cd42-420e-95ef-4c4033d17b56",
+        )))
+    {
+        return TestResult::Fail("root=UUID= not parsed as a filesystem UUID");
+    }
+    if spec.flags.as_deref() != Some("subvol=/@") || spec.fstype.is_some() {
+        return TestResult::Fail("rootflags= not captured verbatim");
+    }
+    if spec.access != RootAccess::Unspecified {
+        return TestResult::Fail("no ro/rw token must leave access unspecified");
+    }
+    if spec.btrfs_subvol() != Some(BtrfsSubvol::Path(alloc::string::String::from("@"))) {
+        return TestResult::Fail("subvol=/@ must name the top-level @ subvolume");
+    }
+    // Linux: the last ro/rw and the last rootflags= win; `--` ends the
+    // kernel's tokens.
+    let spec = RootSpec::from_cmdline(
+        "ro root=UUID=x rootflags=subvol=@home rw rootflags=subvolid=256 rootfstype=btrfs -- ro",
+    );
+    if spec.access != RootAccess::ReadWrite {
+        return TestResult::Fail("last of ro/rw before -- must win");
+    }
+    if spec.flags.as_deref() != Some("subvolid=256")
+        || spec.btrfs_subvol() != Some(BtrfsSubvol::Id(256))
+    {
+        return TestResult::Fail("last rootflags= must win");
+    }
+    if spec.fstype.as_deref() != Some("btrfs") {
+        return TestResult::Fail("rootfstype= not captured");
+    }
+    if RootSpec::from_cmdline("root=UUID=x ro").access != RootAccess::ReadOnly {
+        return TestResult::Fail("ro not recognized");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/root_selector",
+    smoke_root_spec_parses_cachyos_cmdline
+);
+
+fn smoke_root_btrfs_subvol_flags() -> TestResult {
+    use crate::root_selector::{btrfs_subvol_option, BtrfsSubvol};
+    let path = |p: &str| Some(BtrfsSubvol::Path(alloc::string::String::from(p)));
+    let cases: &[(&str, Option<BtrfsSubvol>)] = &[
+        ("subvol=/@", path("@")),
+        ("subvol=@", path("@")),
+        ("subvol=/@/", path("@")),
+        ("compress=zstd:1,subvol=/@home,noatime", path("@home")),
+        ("subvolid=256", Some(BtrfsSubvol::Id(256))),
+        ("subvol=/@,subvolid=257", Some(BtrfsSubvol::Id(257))),
+        ("subvolid=257,subvol=@log", path("@log")),
+        ("compress=zstd:1", None),
+        ("", None),
+        ("subvolid=abc", None),
+    ];
+    for (data, want) in cases {
+        if btrfs_subvol_option(data) != *want {
+            return TestResult::Fail("subvol=/subvolid= option parsed wrong");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/root_selector", smoke_root_btrfs_subvol_flags);
+
+fn smoke_root_uuid_bytes() -> TestResult {
+    use crate::root_selector::parse_uuid_bytes;
+    let Some(bytes) = parse_uuid_bytes("653602C3-cd42-420e-95ef-4c4033d17b56") else {
+        return TestResult::Fail("canonical UUID (mixed case) rejected");
+    };
+    if bytes[..4] != [0x65, 0x36, 0x02, 0xc3] || bytes[15] != 0x56 || bytes[8] != 0x95 {
+        return TestResult::Fail("UUID bytes not in written order");
+    }
+    for bad in [
+        "6D89-28C5",
+        "653602c3-cd42-420e-95ef-4c4033d17b5",
+        "653602c3cd42420e95ef4c4033d17b56",
+        "653602c3-cd42-420e-95ef-4c4033d17bzz",
+        "",
+    ] {
+        if parse_uuid_bytes(bad).is_some() {
+            return TestResult::Fail("malformed UUID accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/root_selector", smoke_root_uuid_bytes);
+
+fn smoke_root_plan_follows_disk_policy() -> TestResult {
+    use crate::root_mount::plan_root;
+    use crate::root_selector::RootSpec;
+    use narf_block::disk_policy::DiskPolicy;
+    let spec = RootSpec::from_cmdline(CACHYOS_CMDLINE);
+    // root-ro: never writable; systemd gets the tmpfs overlay.
+    let p = plan_root(DiskPolicy::RootRo, true, &spec);
+    if !(p.read_only && p.tmpfs_overlay && p.designate) || p.flags.as_deref() != Some("subvol=/@") {
+        return TestResult::Fail("root-ro must mount read-only under a tmpfs overlay");
+    }
+    let p = plan_root(DiskPolicy::RootRo, false, &spec);
+    if !p.read_only || p.tmpfs_overlay {
+        return TestResult::Fail("root-ro without systemd_pid1: plain read-only root");
+    }
+    // root-rw: the real root, writable, no overlay ...
+    let p = plan_root(DiskPolicy::RootRw, true, &spec);
+    if p.read_only || p.tmpfs_overlay || !p.designate {
+        return TestResult::Fail("root-rw must mount the real root writable without overlay");
+    }
+    // ... unless the command line explicitly says ro.
+    let ro = RootSpec::from_cmdline("root=UUID=x ro narf.disks=root-rw");
+    if !plan_root(DiskPolicy::RootRw, true, &ro).read_only {
+        return TestResult::Fail("root-rw must honour an explicit ro");
+    }
+    // Other policies keep the historical overlay behaviour and never
+    // designate.
+    let p = plan_root(DiskPolicy::All, true, &spec);
+    if p.read_only || !p.tmpfs_overlay || p.designate {
+        return TestResult::Fail("narf.disks=all keeps the selected-root tmpfs overlay");
+    }
+    let none = RootSpec::from_cmdline("systemd_pid1");
+    let p = plan_root(DiskPolicy::RootRo, true, &none);
+    if p.designate || p.flags.is_some() {
+        return TestResult::Fail("no root= means nothing to designate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/root_selector",
+    smoke_root_plan_follows_disk_policy
+);
+
+fn smoke_root_fstab_esp_detection() -> TestResult {
+    use crate::root_mount::fstab_mounts_vfat;
+    let cachyos = "# comment\n\
+        UUID=6D89-28C5 /boot/efi vfat defaults,umask=0077 0 2\n\
+        UUID=653602c3-cd42-420e-95ef-4c4033d17b56 / btrfs subvol=/@,defaults,noatime,compress=zstd:1 0 0\n\
+        tmpfs /tmp tmpfs defaults,noatime,mode=1777 0 0\n";
+    if !fstab_mounts_vfat(cachyos) {
+        return TestResult::Fail("CachyOS fstab mounts its ESP itself");
+    }
+    if fstab_mounts_vfat(
+        "#UUID=6D89-28C5 /boot/efi vfat defaults 0 2\nUUID=x / ext4 defaults 0 1\n",
+    ) {
+        return TestResult::Fail("a commented-out ESP line must not count");
+    }
+    if fstab_mounts_vfat("") {
+        return TestResult::Fail("empty fstab");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/root_selector", smoke_root_fstab_esp_detection);
+
+fn smoke_root_block_source_name() -> TestResult {
+    use crate::fs_registry::block_source_name;
+    // Unregistered names never resolve, whatever the path shape.
+    for source in [
+        "/dev/narf-no-such-disk",
+        "narf-no-such-disk",
+        "/mnt/dev/narf-no-such-disk",
+        "/",
+    ] {
+        if block_source_name(source).is_some() {
+            return TestResult::Fail("unregistered block source resolved");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/root_selector", smoke_root_block_source_name);
+
 // ── /dev/input smoke tests ─────────────────────────────────────────────────────
 //
 // All smokes prefix their ROUTER-registered devices with a comment so
@@ -3180,6 +3358,7 @@ fn smoke_fs_registry_custom_fstype_mounts() -> TestResult {
         gid: 0,
         umask: 0o022,
         initial_namespace: true,
+        read_only: false,
     }) {
         Ok(fs) => fs,
         Err(_) => return TestResult::Fail("smokefs builder returned Err"),

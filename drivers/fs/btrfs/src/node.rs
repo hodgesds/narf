@@ -1184,22 +1184,37 @@ impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
     }
 
     fn reconfigure(&self, options: &str) -> Result<(), FsError> {
-        // The same option set a mount accepts. Asking a read-only volume for
-        // `rw` is refused (it was made read-only for a reason that has not
-        // gone away); a writable volume keeps writing — `ro` on it is
-        // accepted without effect, `sync(2)`/`syncfs` makes it durable.
-        let opts = crate::parse_mount_options(options)?;
-        if opts.subvol.is_some() || opts.subvolid.is_some() {
-            // Linux refuses changing the subvolume on remount.
-            let id_ok = opts.subvolid.is_none_or(|id| id == self.fs_tree_id());
-            if !id_ok {
-                return Err(FsError::Unsupported);
-            }
-        }
-        let wants_rw = options.split(',').any(|o| o == "rw");
-        if wants_rw && self.is_read_only() {
+        // `systemd-remount-fs` remounts `/` with its fstab options
+        // (`subvol=/@,compress=zstd:1`, ...). Accept what a mount accepts;
+        // like Linux, `subvol=`/`subvolid=` cannot change on remount and are
+        // ignored, everything else replaces the recorded run-time options.
+        let mut parsed = crate::mount_opts::parse(options)?;
+        // A volume made read-only (disk policy, write-safety gate, a second
+        // writer of its fsid) stays read-only: `rw` is refused, not ignored.
+        if options.split(',').any(|o| o == "rw") && self.is_read_only() {
             return Err(FsError::ReadOnly);
         }
+        let current = self.mount_options();
+        parsed.subvol = current.subvol;
+        if parsed.read_only && !self.is_read_only() {
+            // A writable volume cannot be flipped read-only in place yet.
+            return Err(FsError::Unsupported);
+        }
+        parsed.read_only = current.read_only;
+        self.set_mount_options(parsed);
         Ok(())
+    }
+
+    fn show_options(&self) -> alloc::string::String {
+        let options = self.mount_options();
+        let mut out = options.render();
+        let id = self.mounted_subvol_id();
+        out.push_str(&alloc::format!(",subvolid={id}"));
+        if let Some(crate::volume::Subvol::Name(path)) = &options.subvol {
+            out.push_str(&alloc::format!(",subvol=/{path}"));
+        } else if id == crate::format::FS_TREE_OBJECTID {
+            out.push_str(",subvol=/");
+        }
+        out
     }
 }

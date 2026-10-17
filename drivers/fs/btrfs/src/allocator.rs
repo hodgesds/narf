@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 use narf_block::BlockDevice;
 use narf_filesystem::FsError;
 
+use crate::block_group;
 use crate::btree::Cursor;
 use crate::format::{self, BtrfsKey};
 use crate::roots;
@@ -96,24 +97,20 @@ async fn read_free_extents<B: BlockDevice + 'static>(
 }
 
 /// Logical `(start, len)` ranges of every **system** block group, read from the
-/// extent tree's `BLOCK_GROUP_ITEM`s. A system block group is reserved for the
+/// `BLOCK_GROUP_ITEM`s in `bg_tree` (the extent tree, or the block-group tree on
+/// a `BLOCK_GROUP_TREE` filesystem). A system block group is reserved for the
 /// chunk tree (it must stay reachable via `sys_chunk_array` at mount), so the
 /// general write path must never allocate data / fs metadata there.
 async fn read_system_block_groups<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
-    extent_tree: u64,
+    bg_tree: u64,
 ) -> Result<Vec<(u64, u64)>, FsError> {
-    let mut cursor = Cursor::seek(vol, extent_tree, &BtrfsKey::new(0, 0, 0)).await?;
+    // BLOCK_GROUP_ITEM: used@0, chunk_objectid@8, flags@16.
     let mut out = Vec::new();
-    while let Some((key, body)) = cursor.current()? {
-        // BLOCK_GROUP_ITEM: used@0, chunk_objectid@8, flags@16.
-        if key.item_type == format::BLOCK_GROUP_ITEM_KEY
-            && body.len() >= 24
-            && format::le64(body, 16)? & format::BLOCK_GROUP_SYSTEM != 0
-        {
-            out.push((key.objectid, key.offset));
+    for (start, len, body) in block_group::read_block_groups(vol, bg_tree).await? {
+        if format::le64(&body, 16)? & format::BLOCK_GROUP_SYSTEM != 0 {
+            out.push((start, len));
         }
-        cursor.advance().await?;
     }
     Ok(out)
 }
@@ -183,7 +180,8 @@ impl Allocator {
         {
             // Reclaim from every free extent except those in a system block group
             // (reserved for the chunk tree).
-            let sys = read_system_block_groups(vol, ext).await?;
+            let bg_tree = block_group::bg_home(vol, root_tree).await?.scan_root(ext);
+            let sys = read_system_block_groups(vol, bg_tree).await?;
             let mut ranges: Vec<(u64, u64)> = read_free_extents(vol, fst_root)
                 .await?
                 .into_iter()

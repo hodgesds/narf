@@ -32,7 +32,7 @@ use crate::format::{self, BtrfsKey, Superblock};
 use crate::inode::InodeItem;
 
 /// Selects which subvolume a `mount -t btrfs` request roots at.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Subvol {
     /// `subvolid=N` — a subvolume root objectid.
     Id(u64),
@@ -261,6 +261,10 @@ pub struct BtrfsVolume<B: BlockDevice> {
     /// tree reads and node writes, which is also what serialises the shared
     /// allocator inside it.
     fs_batch: Mutex<Option<crate::write::FsBatch>>,
+    /// The `mount -t btrfs` data options this volume was mounted with
+    /// (compression, discard, ...). Recorded so the writer and
+    /// `show_options` can honour them; see [`crate::mount_opts`].
+    mount_options: IrqSafeSpinLock<crate::mount_opts::MountOptions>,
 }
 
 /// `CAP_SYS_RESOURCE` — see [`BtrfsVolume::quota_override`].
@@ -316,6 +320,21 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// True when the volume was mounted read-only (requested, or a member
     /// device refuses writes).
+    /// The data options recorded at mount (see [`crate::mount_opts`]).
+    pub fn mount_options(&self) -> crate::mount_opts::MountOptions {
+        self.mount_options.lock().clone()
+    }
+
+    /// Record the data options of the mount that built this volume.
+    pub fn set_mount_options(&self, options: crate::mount_opts::MountOptions) {
+        *self.mount_options.lock() = options;
+    }
+
+    /// Objectid of the mounted subvolume (`5` = the top-level FS tree).
+    pub fn mounted_subvol_id(&self) -> u64 {
+        self.state.lock().fs_tree_id
+    }
+
     pub fn is_read_only(&self) -> bool {
         self.read_only.load(core::sync::atomic::Ordering::Acquire)
     }
@@ -1255,6 +1274,21 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let csum_type = superblock.csum_type;
         let read_only =
             read_only_requested || devices.values().any(|member| member.device.is_read_only());
+        // `btrfs_check_features`: unknown incompat bits were already refused
+        // by `Superblock::decode`. A compat_ro bit the writer does not maintain
+        // permits a read-only mount and refuses a read-write one.
+        if !read_only && superblock.compat_ro_unwritable() != 0 {
+            return Err(FsError::Unsupported);
+        }
+        // Linux's artificial dependency: block-group-tree requires no-holes
+        // and a valid free-space tree (`btrfs_check_features`,
+        // `btrfs_validate_super`).
+        if superblock.has_block_group_tree()
+            && (superblock.incompat_flags & format::INCOMPAT_NO_HOLES == 0
+                || superblock.compat_ro_flags & format::COMPAT_RO_FREE_SPACE_TREE_VALID == 0)
+        {
+            return Err(FsError::InvalidData);
+        }
 
         // Seed the chunk map so the chunk tree is reachable by logical address.
         let seed = ChunkMap::seed_from_sys_array(&superblock.sys_chunk_array)?;
@@ -1284,6 +1318,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             aborted: core::sync::atomic::AtomicBool::new(false),
             quota_override: core::sync::atomic::AtomicBool::new(false),
             fs_batch: Mutex::new(None),
+            mount_options: IrqSafeSpinLock::new(crate::mount_opts::MountOptions::default()),
             state: IrqSafeSpinLock::new(VolState {
                 superblock,
                 superblock_source: (source_devid, source_offset),
@@ -1398,7 +1433,21 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             }
         }
 
-        // 1b. Before anything can write (log replay below, the commit timer,
+        // 1b. Block-group tree (`load_global_roots` for objectid 11): load its
+        //     root and cross-check every block group against its chunk, as
+        //     `btrfs_read_block_groups` does. Without the feature the items sit
+        //     in the extent tree and are read lazily by the writer.
+        if let crate::block_group::BgHome::BlockGroupTree { root, .. } =
+            crate::block_group::bg_home(self, root_tree).await?
+        {
+            let chunk_items: Vec<(u64, Vec<u8>)> = chunks
+                .iter()
+                .map(|(key, body)| (key.offset, body.clone()))
+                .collect();
+            crate::block_group::validate_block_groups(self, root, true, &chunk_items).await?;
+        }
+
+        // 1c. Before anything can write (log replay below, the commit timer,
         //     any VFS operation): the read-write safety gate. A refusal makes
         //     this volume read-only for its lifetime.
         self.apply_rw_gate().await;

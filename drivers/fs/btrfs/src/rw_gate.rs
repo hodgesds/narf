@@ -35,10 +35,8 @@ use crate::volume::BtrfsVolume;
 
 // ── On-disk constants the gate reads (Linux uapi `btrfs_tree.h`) ────
 
-/// `BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE`. Named here for refusal
-/// messages only; whether it is supported is decided by
-/// [`WRITER_COMPAT_RO`] (and by the decoder for reads).
-pub const COMPAT_RO_BLOCK_GROUP_TREE: u64 = 1 << 3;
+/// `BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE` (named in refusals).
+pub const COMPAT_RO_BLOCK_GROUP_TREE: u64 = format::COMPAT_RO_BLOCK_GROUP_TREE;
 
 /// Superblock `flags` field offset (`struct btrfs_super_block::flags`).
 pub const OFF_SUPER_FLAGS: usize = 56;
@@ -84,9 +82,10 @@ const REPLACE_SUSPENDED: u64 = 4;
 pub const WRITER_INCOMPAT: u64 = format::SUPPORTED_INCOMPAT_FLAGS;
 
 /// Compat-ro bits the writer maintains: the free-space tree (and its valid
-/// bit). `BLOCK_GROUP_TREE` is added here when the writer maintains it.
-pub const WRITER_COMPAT_RO: u64 =
-    format::COMPAT_RO_FREE_SPACE_TREE | format::COMPAT_RO_FREE_SPACE_TREE_VALID;
+/// bit) — [`format::WRITE_SUPPORTED_COMPAT_RO_FLAGS`]. BLOCK_GROUP_TREE joins
+/// it there when the writer maintains that tree; until then a BGT volume
+/// (the CachyOS root) mounts read-only.
+pub const WRITER_COMPAT_RO: u64 = format::WRITE_SUPPORTED_COMPAT_RO_FLAGS;
 
 /// `narf.disks=root-rw`: the narrow incompat set a production root may
 /// carry — what `mkfs.btrfs` and a CachyOS install produce. Multi-device,

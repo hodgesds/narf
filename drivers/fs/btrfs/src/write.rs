@@ -58,6 +58,7 @@ use narf_block::BlockDevice;
 use narf_filesystem::FsError;
 
 use crate::allocator::Allocator;
+use crate::block_group;
 use crate::btree::{
     self, internal_blockptr, internal_child_slot, internal_key, leaf_item_data, leaf_item_key,
     leaf_item_span, leaf_lower_bound, level, nritems, HEADER_SIZE,
@@ -2942,31 +2943,16 @@ async fn ensure_private_subvol<B: BlockDevice + 'static>(
     .await
 }
 
-/// Read every `BLOCK_GROUP_ITEM` from the extent tree as `(start, len, body)`.
-async fn read_block_groups<B: BlockDevice + 'static>(
-    vol: &BtrfsVolume<B>,
-    ext_root: u64,
-) -> Result<Vec<(u64, u64, Vec<u8>)>, FsError> {
-    let mut cursor = btree::Cursor::seek(vol, ext_root, &BtrfsKey::new(0, 0, 0)).await?;
-    let mut out = Vec::new();
-    while let Some((k, body)) = cursor.current()? {
-        if k.item_type == format::BLOCK_GROUP_ITEM_KEY {
-            out.push((k.objectid, k.offset, body.to_vec()));
-        }
-        cursor.advance().await?;
-    }
-    Ok(out)
-}
-
 /// Sum every block group's `used` — the definition of the superblock's
-/// `bytes_used`. Read from `ext_root` after the extent tree is written so it can
-/// never drift from the block groups themselves.
+/// `bytes_used`. Read from `bg_tree` (the extent tree, or the block-group tree
+/// on a `BLOCK_GROUP_TREE` filesystem) after it is written so it can never
+/// drift from the block groups themselves.
 async fn total_block_group_used<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
-    ext_root: u64,
+    bg_tree: u64,
 ) -> Result<u64, FsError> {
     let mut total = 0u64;
-    for (_, _, body) in read_block_groups(vol, ext_root).await? {
+    for (_, _, body) in block_group::read_block_groups(vol, bg_tree).await? {
         total += le64(&body, 0)?;
     }
     Ok(total)
@@ -4534,8 +4520,11 @@ async fn commit_txn<B: BlockDevice + 'static>(
         }
         None => (None, Vec::new()),
     };
-    // Extent tree: read only its block groups (path COW touches its own leaves).
-    let bgs = read_block_groups(vol, old_ext).await?;
+    // Block groups: from the extent tree, or from the block-group tree
+    // (objectid 11) on a `BLOCK_GROUP_TREE` filesystem. Path COW touches only
+    // the leaves the edits reach in either.
+    let bg_home = block_group::bg_home(vol, root_tree).await?;
+    let bgs = block_group::read_block_groups(vol, bg_home.scan_root(old_ext)).await?;
 
     // csum tree: drop freed extents' csums, add new extents' csums.
     // Csum-tree edits, as a list rather than a whole-tree rewrite.
