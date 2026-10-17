@@ -1059,3 +1059,87 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/navi22-modeset",
     navi22_modeset_retires_the_live_gop_stream_like_dcn30_init_hw
 );
+
+/// dcn20_init_blank on an ODM 2:1 GOP OTG blanks both OPPs at half width;
+/// dcn10_init_pipes then power-gates every DSC except the one the running
+/// OTG drives (dcn20_dsc_pg_control); dcn30_init_hw copies watermark set A
+/// into B..D (hubbub3_init_watermarks) when not in accelerated mode.
+fn navi22_takeover_odm_dsc_and_watermarks_like_dcn30_init_hw() -> TestResult {
+    let bench = Bench::new();
+    bench.set(m::MP1 + 0x274, 1);
+    // OTG 1: ODM 2:1 (one input segment code, SEG0 = OPP 1, SEG1 = OPP 2),
+    // DSC mode on, 1920x1080; DSC 0 clocked and forwarding to OPP 1.
+    bench.set(d2(0x1b41 + 0x80), 1);
+    bench.set(d2(0x1acb + 0x10), 1 | 1 << 8 | 2 << 12);
+    bench.set(d2(0x1acc + 0x10), 1 << 4);
+    bench.set(d2(0x1b2b + 0x80), 2020 | 100 << 16);
+    bench.set(d2(0x1b36 + 0x80), 1100 | 20 << 16);
+    bench.set(d2(0x3000), 1);
+    bench.set(d2(0x1a64), 1 | 1 << 4);
+    // HUBBUB watermark set A as VBIOS left it.
+    for (reg, value) in [
+        (0x509, 0x101),
+        (0x50a, 0x102),
+        (0x50b, 0x103),
+        (0x50c, 0x104),
+        (0x50d, 0x105),
+        (0x53f, 0x106),
+        (0x540, 0x107),
+    ] {
+        bench.set(d2(reg), value);
+    }
+    let vram = Vram::new(VRAM_BYTES);
+    let image = m::vbios(6);
+    let tables = Tables::new(&image).unwrap();
+    let connector = m::connector(Signal::Hdmi, 3, 3);
+    let r = Resources::new().acquire(&connector).unwrap();
+    let mut p = pipeline(&bench, connector, r);
+    let sink = m::sink(Signal::Hdmi, None);
+    if run(enable_with(&mut p, &vram, &tables, &sink, &mut NoAux)).is_err() {
+        return TestResult::Fail("enable over an ODM 2:1 + DSC GOP");
+    }
+    let log = bench.log();
+    let half = |opp: u32| {
+        move |w: &m::Write| w.dword == d2(0x1856 + 0x5a * opp) && w.value == 1080 | 960 << 16
+    };
+    if in_order(
+        &log,
+        0,
+        &[
+            ("top OPP half width", &half(1)),
+            ("top DPG", &set(d2(0x1854 + 0x5a), 1)),
+            ("bottom OPP half width", &half(2)),
+            ("bottom DPG", &set(d2(0x1854 + 0x5a * 2), 1)),
+        ],
+    )
+    .is_err()
+    {
+        return TestResult::Fail("ODM 2:1 second segment not blanked");
+    }
+    let gated = |dsc: u32| {
+        log.iter()
+            .any(|w| w.dword == d2(0xa1 + 2 * dsc) && w.value & 1 << 8 != 0)
+    };
+    if gated(0) || !(1..6).all(gated) {
+        return TestResult::Fail("DSC power gating differs from dcn10_init_pipes");
+    }
+    for set in 1..4u32 {
+        for (i, value) in [0x101, 0x102, 0x103, 0x104, 0x105].into_iter().enumerate() {
+            let reg = d2(0x509 + set * 5 + i as u32);
+            if !log.iter().any(|w| w.dword == reg && w.value == value) {
+                return TestResult::Fail("watermark set A not copied to B..D");
+            }
+        }
+        for (i, value) in [0x106, 0x107].into_iter().enumerate() {
+            let reg = d2(0x53f + set * 2 + i as u32);
+            if !log.iter().any(|w| w.dword == reg && w.value == value) {
+                return TestResult::Fail("urgent bandwidth fractions not copied");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_takeover_odm_dsc_and_watermarks_like_dcn30_init_hw
+);

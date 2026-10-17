@@ -901,6 +901,9 @@ impl Pipeline {
             all.push(self.connector);
         }
         let inherited = takeover.retire(tables, &all).await?;
+        if scratch & ATOM_S6_ACC_MODE == 0 {
+            takeover.init_watermarks()?;
+        }
         self.inherited = inherited;
         // A stream the takeover could not retire stops everything here.
         self.takeover().check_idle()
