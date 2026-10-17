@@ -363,6 +363,12 @@ full modeset coordination are still pending. Native routing now resolves
 AUX and HPD independently through the board GPIO LUT, follows display-table
 relative record offsets, and rejects ambiguous routes. The Navi22 backend probe
 uses the DCN30 enable register and includes the sixth transmitter.
+Navi22 display AUX/DDC/HPD is now native, as Linux drives DCN3.0
+(`dc_is_dmub_outbox_supported` is false there): the DCE AUX engine with
+`dce_aux_transfer_with_retries` policy, I2C-over-AUX, the hardware I2C engine
+for HDMI DDC/SCDC, and HPD sense/filter/ack. After firmware readiness the boot
+logs every board connector's HPD state and EDID. DMUB AUX/HPD is refused unless
+explicitly allowed. Register models only; no physical EDID read yet.
 These are software-tested foundations; training resume,
 VCN startup, display-aware DPM and OS thermal interrupt handling,
 hardware boot, general GPU mappings/GFX10 queue initialization, production

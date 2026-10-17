@@ -138,6 +138,9 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
             .prepare_power(gpu, identity)
             .map_err(Error::Firmware)?;
         firmware.prepare_dmub(gpu).map_err(Error::Firmware)?;
+        // Display routing is diagnostic for firmware bring-up: a board whose
+        // connector table cannot be read still runs the firmware sequence.
+        let display = firmware.prepare_display(gpu);
         let end = gpu
             .vram
             .base
@@ -176,6 +179,13 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         prepared.prepare_memory_hubs().map_err(Error::Firmware)?;
         prepared.prepare_sdma().map_err(Error::Firmware)?;
         prepared.prepare_dmub().map_err(Error::Firmware)?;
+        if let Err(error) = display.and_then(|()| prepared.prepare_display()) {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 display routes: {error:?}"
+            );
+        }
         *owner = Some(prepared);
         Ok(Some(affected))
     })
@@ -194,7 +204,19 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     owner.as_mut().ok_or(boot::Error::Invalid)?.run().await
 }
 
-/// Serialized native HPD query. Requires the completed, retained cold boot.
+/// Detect every board connector over the native DCN3.0 AUX/DDC/HPD path.
+/// Requires the completed, retained cold boot; reads sinks only.
+pub async fn detect_displays(
+) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_display::Report>, boot::Error> {
+    let mut owner = OWNER.lock().await;
+    owner
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .detect_displays()
+        .await
+}
+
+/// Serialized DMUB HPD query, refused unless DMUB AUX was explicitly allowed.
 pub async fn dmub_hpd(instance: u8) -> Result<bool, boot::Error> {
     let mut owner = OWNER.lock().await;
     owner
@@ -203,7 +225,8 @@ pub async fn dmub_hpd(instance: u8) -> Result<bool, boot::Error> {
         .dmub_hpd(instance)
         .await
 }
-/// Serialized native AUX/I2C-over-AUX transaction, at most 16 bytes.
+/// Serialized DMUB AUX/I2C-over-AUX transaction, at most 16 bytes. Refused
+/// unless DMUB AUX was explicitly allowed; native AUX is the default.
 pub async fn dmub_aux(
     instance: u8,
     action: u8,

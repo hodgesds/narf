@@ -264,6 +264,7 @@ fn firmware() -> Firmware {
         graphics: gfx::tests::fixture(),
         power: None,
         dmub: None,
+        display: None,
     }
 }
 fn navi22_runtime_commands_require_completed_boot_and_retained_tmr() -> TestResult {
@@ -296,6 +297,43 @@ fn navi22_runtime_commands_require_completed_boot_and_retained_tmr() -> TestResu
 kernel_test_in!(
     "drivers/gpu/navi22-boot",
     navi22_runtime_commands_require_completed_boot_and_retained_tmr
+);
+fn navi22_native_display_requires_routes_and_firmware_readiness() -> TestResult {
+    let pool = pool(16 << 20);
+    // SAFETY: constructor performs no I/O on this unmapped fixture.
+    let mut boot = unsafe { ColdBoot::new(&gpu(), Cap::bootstrap(), &pool, firmware()) }.unwrap();
+    // No prepared VBIOS routes: nothing to bind, and nothing claimed.
+    if boot.prepare_display() != Err(Error::Invalid) || boot.display_connectors().is_some() {
+        return TestResult::Fail("display claimed without routes");
+    }
+    for state in [
+        State::Prepared,
+        State::Running(Stage::DmubStart),
+        State::Failed {
+            stage: Stage::DmubStart,
+            error: Error::Invalid,
+        },
+        State::Released,
+    ] {
+        boot.sequence.state = state;
+        if run(boot.detect_displays()).err() != Some(Error::Busy) {
+            return TestResult::Fail("detection before firmware readiness");
+        }
+    }
+    boot.sequence.state = State::FirmwareReady(report());
+    if run(boot.detect_displays()).err() != Some(Error::Invalid) {
+        return TestResult::Fail("detection without an owner");
+    }
+    // Opting into DMUB AUX does not bypass the boot/TMR gate.
+    boot.allow_dmub_aux();
+    if run(boot.dmub_hpd(0)) != Err(Error::Busy) {
+        return TestResult::Fail("DMUB HPD escaped its gate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_native_display_requires_routes_and_firmware_readiness
 );
 fn navi22_boot_outlives_the_controller_lock() -> TestResult {
     fn send_static<T: Send + 'static>(_: &T) {}

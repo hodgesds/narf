@@ -559,7 +559,49 @@ separate work.
 
 `ColdBoot::dmub_hpd`, `dmub_aux` and `dmub_notification` expose the typed runtime
 operations only after `FirmwareReady` and while PSP/TMR remains retained.
-They refuse access after `take_psp()`. `dmub_mailbox_state()` also reports failed
+They refuse access after `take_psp()`. `dmub_hpd`/`dmub_aux` additionally
+return `Dmub(Unsupported)` unless `allow_dmub_aux()` was called and the running
+firmware answered QUERY_FEATURE_CAPS: Linux never routes DCN3.0 AUX/HPD through
+DMUB (`dc_is_dmub_outbox_supported` is false outside DCN3.1 DPIA/GC11 unless
+`enable_dmub_aux_for_legacy_ddc`), and `dmub_feature_caps` has no AUX bit.
+
+### Navi 22 native AUX, DDC and HPD
+
+`unsafe amdgpu_dcn30_ddc::Ddc::new(gpu, pci_cap)` claims all six DCN3.0 AUX
+engines and DDC pads, the shared hardware I2C engine and all six HPD blocks
+(Navi22 profile only; DCN base index 2 bounded to `DC_GPIO_AUX_CTRL_5`, base
+index 1 to `MICROSECOND_TIME_BASE_DIV`). `bind(line, hpd, Signal)` performs the
+AUX half of `enc3_hw_init` (`AUX_DPHY_RX_CONTROL0` 0x103d1110, TX 0x21c7a,
+`AUX_HPD_SEL`, quarter receive window), a 552 us AUX timeout, opens the HPD pin
+in interrupt mode, enables `DC_HPD_EN` if firmware left it clear and programs
+`program_hpd_filter` delays (HDMI 500/100 ms, DP 80/0 ms); a DP line without
+HPD is refused. `hpd`/`hpd_raw` read `DC_HPD_SENSE_DELAYED`/`DC_HPD_SENSE`;
+`hpd_ack` mirrors `hpd0_ack` (ack, then arm the opposite polarity);
+`hpd_rx_ack`/`hpd_interrupt` program the IH-facing bits. `aux(line, AuxRequest)`
+is `dce_aux_transfer_with_retries` over `dce_aux_transfer_raw` (7 attempts, DEFER
+budget, 3 timeouts, 2 invalid replies, ACKM status polling, NACK/HPD-loss
+terminal); `dpcd_read`/`dpcd_write` bound payloads to 16 bytes. `i2c(line, Mode,
+messages)` is `link_query_ddc_data`: I2C-over-AUX in 16-byte MOT chunks, or one
+hardware I2C command (`dcn2_i2c_hw_construct`: 538-byte buffer, setup limit 3,
+100 kHz from `MICROSECOND_TIME_BASE_DIV`, ≤256 bytes per message). Pads are
+opened/closed exactly as `dal_ddc_open`/`dal_ddc_close` per transaction.
+DMCU/hardware-owned engines return `Engine`; every wait is bounded; a dropped
+future releases arbitration and restores pads synchronously; an all-ones read
+returns `DeviceGone` and leaves the owner `Failed`.
+
+`amdgpu_navi22_display::Display` binds every HDMI/DP VBIOS path (DDC line and
+HPD from the record list/GPIO LUT; a shared line or HPD is refused) and
+`detect(index)`/`detect_all()` return `Disconnected`, `Connected(Sink { edid,
+preferred, hdmi, dpcd })` or per-connector `Failed(error)`: HPD first, the 16-byte
+DPCD receiver capability field for DP, then a checksummed EDID (base plus up to
+four extensions, E-DDC segment pointer past block 1, four tries per block) over
+I2C-over-AUX or the hardware I2C engine. Only owner loss fails the whole probe.
+`Firmware::prepare_display(gpu)` decodes routes before device I/O and
+`ColdBoot::prepare_display()` claims the owner without I/O; both are optional
+for firmware bring-up. `ColdBoot::detect_displays().await` requires
+`FirmwareReady`, and `amdgpu_navi22_platform::detect_displays().await`
+serializes it through the retained owner. The framebuffer boot handoff logs one
+line per connector after a successful firmware run; detection reads sinks only. `dmub_mailbox_state()` also reports failed
 or cancelled transport attempts without accessing hardware.
 
 ### Navi 22 boot ownership and framebuffer handoff

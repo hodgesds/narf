@@ -22,6 +22,7 @@ pub enum Error {
     MemoryHubs(crate::amdgpu_gmc_navi22::Error),
     Sdma(crate::amdgpu_sdma_navi22::Error),
     Dmub(crate::amdgpu_dmub_navi22::Error),
+    Display(crate::amdgpu_navi22_display::Error),
 }
 /// All files are validated and copied before the first device operation.
 #[derive(Debug)]
@@ -31,6 +32,7 @@ pub struct Firmware {
     graphics: gfx::Firmware,
     power: Option<power::Prepared>,
     dmub: Option<crate::amdgpu_dmub_navi22::Prepared>,
+    display: Option<alloc::vec::Vec<crate::amdgpu_dcn_inventory::Path>>,
 }
 impl Firmware {
     pub fn open(
@@ -44,7 +46,21 @@ impl Firmware {
             graphics: gfx::Firmware::open(gpu, registry).map_err(Error::Graphics)?,
             power: None,
             dmub: None,
+            display: None,
         })
+    }
+    /// Decode the board's connector routes (DDC line, HPD, transmitter) from
+    /// the VBIOS before any device write. Optional: firmware bring-up does not
+    /// depend on display routing.
+    pub fn prepare_display(&mut self, gpu: &AmdGpu) -> Result<(), Error> {
+        psp::validate_navi22_layout(gpu).map_err(Error::Psp)?;
+        let vbios = gpu.vbios.as_ref().ok_or(Error::Invalid)?;
+        self.display = Some(
+            crate::amdgpu_dcn_inventory::display_paths(gpu, vbios.bytes()).map_err(|error| {
+                Error::Display(crate::amdgpu_navi22_display::Error::Inventory(error))
+            })?,
+        );
+        Ok(())
     }
     /// Prepare DCN3.0's nonsecure DMUB storage before starting any hardware.
     pub fn prepare_dmub(&mut self, gpu: &AmdGpu) -> Result<(), Error> {
@@ -190,6 +206,10 @@ struct Hardware {
     gmc: Option<crate::amdgpu_gmc_navi22::Gmc>,
     sdma: Option<crate::amdgpu_sdma_navi22::Sdma>,
     dmub: Option<crate::amdgpu_dmub_navi22::Dmub>,
+    display: Option<crate::amdgpu_navi22_display::Display>,
+    /// DCN3.0 Linux never routes AUX/HPD through DMUB; only an explicit
+    /// opt-in plus a firmware capability reply re-enables that transport.
+    dmub_aux: bool,
 }
 impl Backend for Hardware {
     fn progress(&mut self, stage: Stage, result: Option<Result<(), Error>>) {
@@ -444,6 +464,8 @@ impl ColdBoot {
                     gmc: None,
                     sdma: None,
                     dmub: None,
+                    display: None,
+                    dmub_aux: false,
                 },
                 state: State::Prepared,
             },
@@ -487,6 +509,8 @@ impl ColdBoot {
                     gmc: None,
                     sdma: None,
                     dmub: None,
+                    display: None,
+                    dmub_aux: false,
                 },
                 state: State::Prepared,
             },
@@ -559,6 +583,51 @@ impl ColdBoot {
         );
         Ok(())
     }
+    /// Claim the native DDC/AUX/HPD owner for the prepared board routes. No
+    /// I/O; detection runs only after firmware readiness.
+    pub fn prepare_display(&mut self) -> Result<(), Error> {
+        if self.sequence.state != State::Prepared || self.sequence.backend.display.is_some() {
+            return Err(Error::Busy);
+        }
+        let h = &mut self.sequence.backend;
+        let paths = h.firmware.display.take().ok_or(Error::Invalid)?;
+        // SAFETY: this owner holds the whole GPU exclusively; DMUB AUX stays
+        // disabled unless explicitly allowed, so no firmware AUX client exists.
+        h.display = Some(
+            unsafe { crate::amdgpu_navi22_display::Display::new(&h.gpu, h.authority, &paths) }
+                .map_err(Error::Display)?,
+        );
+        Ok(())
+    }
+    /// Detect every board connector over native AUX/DDC/HPD after the firmware
+    /// sequence. Reads sinks only; no stream or scanout is changed.
+    pub async fn detect_displays(
+        &mut self,
+    ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_display::Report>, Error> {
+        self.display_mut()?
+            .detect_all()
+            .await
+            .map_err(Error::Display)
+    }
+    fn display_mut(&mut self) -> Result<&mut crate::amdgpu_navi22_display::Display, Error> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_)) {
+            return Err(Error::Busy);
+        }
+        self.sequence.backend.display.as_mut().ok_or(Error::Invalid)
+    }
+    pub fn display_connectors(&self) -> Option<&[crate::amdgpu_navi22_display::Connector]> {
+        self.sequence
+            .backend
+            .display
+            .as_ref()
+            .map(crate::amdgpu_navi22_display::Display::connectors)
+    }
+    /// Re-enable the DMUB AUX/HPD transport (Linux `enable_dmub_aux_for_legacy_ddc`).
+    /// It is still refused unless the running firmware answered
+    /// QUERY_FEATURE_CAPS; `dmub_feature_caps` has no AUX bit to check.
+    pub fn allow_dmub_aux(&mut self) {
+        self.sequence.backend.dmub_aux = true;
+    }
     pub fn training_data(&self) -> Option<&[u8]> {
         self.sequence
             .backend
@@ -588,6 +657,14 @@ impl ColdBoot {
         }
         self.sequence.backend.dmub.as_mut().ok_or(Error::Invalid)
     }
+    fn dmub_aux_mut(&mut self) -> Result<&mut crate::amdgpu_dmub_navi22::Dmub, Error> {
+        let allowed = self.sequence.backend.dmub_aux;
+        let dmub = self.dmub_mut()?;
+        if !allowed || dmub.status().and_then(|s| s.capabilities).is_none() {
+            return Err(Error::Dmub(crate::amdgpu_dmub_navi22::Error::Unsupported));
+        }
+        Ok(dmub)
+    }
     pub fn dmub_mailbox_state(&self) -> Option<crate::amdgpu_dmub_navi22::MailboxState> {
         self.sequence
             .backend
@@ -595,9 +672,14 @@ impl ColdBoot {
             .as_ref()
             .map(|d| d.mailbox_state())
     }
-    /// Native DCN30 AUX/HPD instance, not a connector index.
+    /// DMUB AUX/HPD transport, refused unless `allow_dmub_aux` was called and
+    /// the firmware reported capabilities. The default path is native
+    /// (`detect_displays`). The instance is the DCN AUX/HPD index.
     pub async fn dmub_hpd(&mut self, instance: u8) -> Result<bool, Error> {
-        self.dmub_mut()?.hpd(instance).await.map_err(Error::Dmub)
+        self.dmub_aux_mut()?
+            .hpd(instance)
+            .await
+            .map_err(Error::Dmub)
     }
     pub async fn dmub_aux(
         &mut self,
@@ -606,7 +688,7 @@ impl ColdBoot {
         address: u32,
         data: &mut [u8],
     ) -> Result<(), Error> {
-        self.dmub_mut()?
+        self.dmub_aux_mut()?
             .aux(instance, action, address, data)
             .await
             .map_err(Error::Dmub)
