@@ -794,6 +794,7 @@ async unsafe fn light(
     {
         let mut kms = KMS.lock();
         kms.crtc.shown = None;
+        *LIT_SINK.lock() = result.is_ok().then(|| (route, sink.clone()));
         if let Ok(output) = result.as_ref() {
             let edid = sink
                 .edid
@@ -865,6 +866,29 @@ static LONG_PULSES: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8:
 /// Each board connector's debounced HPD at the last detection or pass.
 static SENSES: narf_lib::sync::IrqSafeSpinLock<[Option<bool>; 6]> =
     narf_lib::sync::IrqSafeSpinLock::new([None; 6]);
+/// The route and sink the lit pipe was lit for, for the long-pulse
+/// `same_edid` check.
+static LIT_SINK: narf_lib::sync::IrqSafeSpinLock<
+    Option<(usize, crate::amdgpu_navi22_display::Sink)>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// `detect_link_and_local_sink`'s `same_edid`: after a long pulse with HPD
+/// still high, a sink whose EDID (and, for DP, receiver capabilities) reads
+/// back unchanged is the same sink, and the lit stream is kept
+/// (`link_disconnect_remap(prev_sink)`). Anything else — a different EDID or
+/// DPCD, a disconnect, a sink that cannot be read — is a new sink.
+pub(crate) fn long_pulse_keeps_stream(
+    lit: &crate::amdgpu_navi22_display::Sink,
+    now: &crate::amdgpu_navi22_display::Detection,
+) -> bool {
+    match now {
+        crate::amdgpu_navi22_display::Detection::Connected(sink) => {
+            sink.edid == lit.edid && sink.dpcd == lit.dpcd
+        }
+        _ => false,
+    }
+}
+
 fn note_hpd_pulse(hpd: crate::amdgpu_ih_navi22::Hpd) {
     if !hpd.rx && hpd.instance < 8 {
         LONG_PULSES.fetch_or(1 << hpd.instance, Ordering::AcqRel);
@@ -935,18 +959,35 @@ async unsafe fn monitor_hotplug(
     //    again (EDID inventory for dark connectors too). A pulsed lit sink
     //    that is still present is a new sink: stop it so the next pass
     //    lights it from a fresh detection and link verification.
-    let changed: alloc::vec::Vec<usize> = {
-        let last = *SENSES.lock();
-        (0..senses.len().min(6))
-            .filter(|&i| {
-                let pulsed = ports
-                    .get(i)
-                    .and_then(|c| c.hpd)
-                    .is_some_and(|h| long & 1 << h != 0);
-                senses[i].is_some() && (senses[i] != last[i] || pulsed)
-            })
-            .collect()
-    };
+    let last = *SENSES.lock();
+    let mut changed: alloc::vec::Vec<usize> = (0..senses.len().min(6))
+        .filter(|&i| {
+            let pulsed = ports
+                .get(i)
+                .and_then(|c| c.hpd)
+                .is_some_and(|h| long & 1 << h != 0);
+            senses[i].is_some() && (senses[i] != last[i] || pulsed)
+        })
+        .collect();
+    // A long pulse on the lit connector with HPD still high (a sink's own
+    // re-assert, or one queued while `light` trained the link) is first
+    // checked as dc_link_detect does: an unchanged EDID/DPCD keeps the
+    // stream instead of tearing it down.
+    if let Some((route, _)) = running {
+        let lit = LIT_SINK.lock().clone().filter(|(r, _)| *r == route);
+        if let Some((_, lit)) = lit {
+            if changed.contains(&route)
+                && senses.get(route) == Some(&Some(true))
+                && last[route] == Some(true)
+            {
+                if let Ok(now) = boot.detect_display(route).await {
+                    if long_pulse_keeps_stream(&lit, &now) {
+                        changed.retain(|&i| i != route);
+                    }
+                }
+            }
+        }
+    }
     if let Some(&first) = changed.first() {
         for &i in &changed {
             boot.forget_display_link(i);
@@ -1579,5 +1620,43 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi22",
         navi22_training_refuses_live_firmware_in_overwritten_prefix
+    );
+
+    /// A long HPD pulse whose sink reads back the same EDID (and DPCD) keeps
+    /// the lit stream, as `detect_link_and_local_sink`'s `same_edid` does;
+    /// every pulse used to tear the display down and relight it.
+    fn navi22_long_pulse_same_edid_keeps_the_stream() -> TestResult {
+        use crate::amdgpu_navi22_display::{Detection, Error as D, Sink};
+        let lit = Sink {
+            edid: alloc::vec![0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 1, 2],
+            preferred: None,
+            hdmi: true,
+            dpcd: None,
+        };
+        let dp = Sink {
+            dpcd: Some([0x12; 16]),
+            ..lit.clone()
+        };
+        let mut other_edid = lit.clone();
+        other_edid.edid[9] = 3;
+        let mut other_dpcd = dp.clone();
+        other_dpcd.dpcd = Some([0x14; 16]);
+        if !long_pulse_keeps_stream(&lit, &Detection::Connected(lit.clone()))
+            || !long_pulse_keeps_stream(&dp, &Detection::Connected(dp.clone()))
+        {
+            return TestResult::Fail("unchanged sink after a long pulse was torn down");
+        }
+        if long_pulse_keeps_stream(&lit, &Detection::Connected(other_edid))
+            || long_pulse_keeps_stream(&dp, &Detection::Connected(other_dpcd))
+            || long_pulse_keeps_stream(&lit, &Detection::Disconnected)
+            || long_pulse_keeps_stream(&lit, &Detection::Failed(D::Invalid))
+        {
+            return TestResult::Fail("a changed or unreadable sink kept the old stream");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22",
+        navi22_long_pulse_same_edid_keeps_the_stream
     );
 }
