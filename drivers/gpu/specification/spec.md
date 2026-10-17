@@ -2634,6 +2634,17 @@ invalidates engine 17 in both hubs and the MMHUB private cache, and retains
 published backing across errors/cancellation. `Ready` follows both bounded
 acknowledgements, not merely table publication.
 
+`unsafe prepare_client_contexts().await` (after `initialize`) enables client
+VMIDs 1..15 on both hubs as gfxhub_v12_0/mmhub_v4_1_0_setup_vmid_config does:
+GMC 12 depth and block size in GC 12's CONTEXT_CNTL layout, every fault
+default, no retry, bounds 0..max_pfn-1. Each context's base points at an
+owned root page whose entries are GMC 12's invalid directory pattern, so a
+VMID no submission has flushed faults instead of translating. One request
+invalidates all fifteen per hub on engine 17, the MMHUB semaphore held and
+released even on timeout; every context is read back. `ClientsReady` keeps
+VMID0 live (`State::vmid0_ready`); failure quarantines the owner. Boot does
+not call it yet; nothing binds a client's page tables to a VMID.
+
 `unsafe amdgpu_ih7::Rings::new` prepares native OSSSYS7.0.0 rings with exact
 GC12/NBIO discovery banks. It rejects inherited enabled rings, enabled host
 delivery or non-idle IH before allocating; preparation never writes hardware.

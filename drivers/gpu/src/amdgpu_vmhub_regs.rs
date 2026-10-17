@@ -465,6 +465,14 @@ pub fn write_vmid_cntl<M: VmHubMmio>(
     fault_on_invalid: bool,
 ) {
     let dword = regs.ctx0_cntl + regs.ctx_distance * (vmid as u32);
+    mmio.write(
+        dword << 2,
+        vmid_cntl_value(regs, depth, block_size, fault_on_invalid),
+    );
+}
+
+/// The CONTEXT_CNTL word [`write_vmid_cntl`] writes, for readback checks.
+pub fn vmid_cntl_value(regs: &VmHubRegs, depth: u8, block_size: u8, fault_on_invalid: bool) -> u32 {
     let mut val = CTX_CNTL_ENABLE_CONTEXT;
     val |= ((depth as u32) & CTX_CNTL_PT_DEPTH_MASK) << CTX_CNTL_PT_DEPTH_SHIFT;
     // `block_size - 9`, saturating: a block size below 9 is not a layout this
@@ -476,8 +484,7 @@ pub fn write_vmid_cntl<M: VmHubMmio>(
     if !fault_on_invalid {
         val |= 1 << (CTX_CNTL_RETRY_FAULT_SHIFT + up);
     }
-    val |= CTX_CNTL_FAULT_ENABLE_DEFAULTS << up;
-    mmio.write(dword << 2, val);
+    val | CTX_CNTL_FAULT_ENABLE_DEFAULTS << up
 }
 
 /// The invalidation engine the kernel driver owns: `gmc_v*_0_flush_vm_hub`'s
