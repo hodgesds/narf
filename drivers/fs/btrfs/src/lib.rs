@@ -30,6 +30,7 @@ pub mod btree;
 pub mod checksum;
 pub mod chunk;
 pub mod csum;
+pub mod decompress_cache;
 pub mod dir;
 pub mod extent;
 pub mod format;
@@ -95,6 +96,17 @@ pub fn parse_mount_subvol(options: &str) -> Result<Option<volume::Subvol>, FsErr
     Ok(mount_opts::parse(options)?.subvol)
 }
 
+/// Run a mount-time future to completion from either boot code or a
+/// `mount(2)`/`fsconfig` syscall. The halting `block_on` refuses to run inside
+/// an executor poll (a syscall), so a syscall caller spins instead.
+fn wait_mount<F: core::future::Future>(fut: F) -> F::Output {
+    if narf_scheduler::current_task_id() == narf_scheduler::TaskId::NONE {
+        narf_scheduler::block_on(fut)
+    } else {
+        narf_scheduler::block_on_spin(fut)
+    }
+}
+
 /// `mount -t btrfs <source>` constructor. Resolves the source to a registered
 /// block device and honours `subvol=`/`subvolid=`, the recorded data options
 /// and a read-only request (`MS_RDONLY`, `fsconfig(ro)`, or `ro` in the data).
@@ -109,7 +121,7 @@ fn btrfs_fstype_builder(
     // A read-only request really mounts read-only: no log replay, no commit
     // timer, no device write.
     let volume = if request.read_only || options.read_only {
-        narf_scheduler::block_on(async {
+        wait_mount(async {
             let volume =
                 volume::BtrfsVolume::mount_devices_read_only(devices, DomainId::DRIVER_0, true)
                     .await?;
@@ -119,7 +131,7 @@ fn btrfs_fstype_builder(
             Ok::<_, FsError>(volume)
         })?
     } else {
-        narf_scheduler::block_on(volume::BtrfsVolume::mount_subvol_devices(
+        wait_mount(volume::BtrfsVolume::mount_subvol_devices(
             devices,
             DomainId::DRIVER_0,
             true,

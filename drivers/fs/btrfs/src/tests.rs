@@ -10774,3 +10774,118 @@ fn smoke_btrfs_block_group_tree_read() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_block_group_tree_read);
+
+// ── Decompressed-extent cache ───────────────────────────────────────
+
+/// A repeated read of a zstd extent is served from the cache, and a write
+/// through the same volume is read back, not the stale cached plain text.
+fn smoke_btrfs_decompress_cache_hit_and_write() -> TestResult {
+    use crate::decompress_cache as cache;
+    use narf_filesystem::FsInstance;
+    let vol = match mount_sparse(FIXTURE_ZSTD_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("zstd fixture failed to mount"),
+    };
+    let handle = cache::VolumeRef::new(vol.self_weak.clone());
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat failed"),
+    };
+    let want = expected_big();
+    let mut page = [0u8; 4096];
+    if poll_once(big.read(0, &mut page)) != Some(Ok(4096)) || page[..] != want[..4096] {
+        return TestResult::Fail("first zstd read wrong");
+    }
+    if cache::cached_bytes_for(&handle) == 0 {
+        return TestResult::Fail("verified zstd extent not cached");
+    }
+    let (hits, _) = cache::stats();
+    let mut page2 = [0u8; 4096];
+    if poll_once(big.read(4096, &mut page2)) != Some(Ok(4096)) || page2[..] != want[4096..8192] {
+        return TestResult::Fail("second zstd read wrong");
+    }
+    if cache::stats().0 <= hits {
+        return TestResult::Fail("repeated read of the same extent missed the cache");
+    }
+    // Overwrite the start of the file, then read it back through the cache.
+    let patch = [b'Z'; 64];
+    if poll_once(big.write(0, &patch)) != Some(Ok(64)) {
+        return TestResult::Fail("write over the compressed extent failed");
+    }
+    let mut back = [0u8; 128];
+    if poll_once(big.read(0, &mut back)) != Some(Ok(128)) {
+        return TestResult::Fail("read after write failed");
+    }
+    if back[..64] != patch || back[64..] != want[64..128] {
+        return TestResult::Fail("read after write returned stale cached data");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/compression/cache",
+    smoke_btrfs_decompress_cache_hit_and_write
+);
+
+/// The cache's identity and invalidation rules, against a stand-in volume.
+fn smoke_btrfs_decompress_cache_invalidation() -> TestResult {
+    use crate::decompress_cache::{self as cache, ExtentId, VolumeRef};
+    let owner: Arc<dyn core::any::Any + Send + Sync> = Arc::new(0u64);
+    let vol = VolumeRef::new(Arc::downgrade(&owner));
+    let key = VolumeRef::key_of(Arc::as_ptr(&owner) as *const u8);
+    let id = |bytenr: u64, generation: u64| ExtentId {
+        disk_bytenr: bytenr,
+        disk_num_bytes: 4096,
+        compression: format::COMPRESS_ZSTD,
+        generation,
+    };
+    let data = |b: u8| Arc::new(alloc::vec![b; 8192]);
+    let old = id(1 << 20, 7);
+    cache::insert(&vol, old, cache::epoch(&vol), data(1));
+    match cache::get(&vol, old) {
+        Some(p) if p[0] == 1 => {}
+        _ => return TestResult::Fail("inserted extent not returned"),
+    }
+    // Freed and reallocated: the same bytenr holds a new extent with a new
+    // generation, written through write_logical. Neither the old identity nor
+    // the new one may return the old plain text.
+    cache::invalidate(key, 1 << 20, 4096);
+    if cache::get(&vol, old).is_some() {
+        return TestResult::Fail("write over a cached extent did not invalidate it");
+    }
+    let new = id(1 << 20, 8);
+    if cache::get(&vol, new).is_some() {
+        return TestResult::Fail("reallocated bytenr hit the old extent");
+    }
+    cache::insert(&vol, new, cache::epoch(&vol), data(2));
+    if cache::get(&vol, old).is_some() || cache::get(&vol, new).map(|p| p[0]) != Some(2) {
+        return TestResult::Fail("generation does not separate old and new extents");
+    }
+    // An overlapping write (starting inside the extent) invalidates; a
+    // disjoint one does not.
+    cache::invalidate(key, (1 << 20) + 8192, 4096);
+    if cache::get(&vol, new).is_none() {
+        return TestResult::Fail("disjoint write invalidated an extent");
+    }
+    cache::invalidate(key, (1 << 20) + 4095, 1);
+    if cache::get(&vol, new).is_some() {
+        return TestResult::Fail("overlapping write did not invalidate");
+    }
+    // Bytes read while a write was in flight are not published.
+    let stale_epoch = cache::epoch(&vol);
+    cache::invalidate(key, 1 << 30, 16);
+    cache::insert(&vol, id(2 << 20, 9), stale_epoch, data(3));
+    if cache::get(&vol, id(2 << 20, 9)).is_some() {
+        return TestResult::Fail("insert across a write epoch was published");
+    }
+    // A dead volume's entries are never served.
+    cache::insert(&vol, id(3 << 20, 9), cache::epoch(&vol), data(4));
+    drop(owner);
+    if cache::get(&vol, id(3 << 20, 9)).is_some() {
+        return TestResult::Fail("entry of a dropped volume served");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/compression/cache",
+    smoke_btrfs_decompress_cache_invalidation
+);

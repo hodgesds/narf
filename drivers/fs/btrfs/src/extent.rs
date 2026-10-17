@@ -210,31 +210,57 @@ pub async fn read_file<B: BlockDevice + 'static>(
                     // `ram_bytes`), so any index past its end is implicit zero
                     // padding — dst is already zeroed.
                     let _ = ram_bytes;
-                    let raw = match csum_root {
-                        Some(root) => {
-                            crate::csum::read_checked(
-                                vol,
-                                root,
-                                disk_bytenr,
-                                disk_num_bytes as usize,
-                            )
-                            .await?
-                        }
-                        None => {
-                            vol.read_logical(disk_bytenr, disk_num_bytes as usize)
-                                .await?
-                        }
-                    };
-                    let plain = decompress(compression, &raw, sectorsize)?;
-                    for pos in ov_start..ov_end {
-                        let src_idx = (extent_offset + (pos - file_start)) as usize;
-                        if let Some(&byte) = plain.get(src_idx) {
-                            dst[(pos - offset) as usize] = byte;
-                        }
+                    let plain = read_compressed_cached(
+                        vol,
+                        csum_root,
+                        crate::decompress_cache::ExtentId {
+                            disk_bytenr,
+                            disk_num_bytes,
+                            compression,
+                            generation: le64(body, 0)?,
+                        },
+                        sectorsize,
+                    )
+                    .await?;
+                    let src_start = (extent_offset + (ov_start - file_start)) as usize;
+                    let avail = plain.len().saturating_sub(src_start).min(read_len);
+                    if avail > 0 {
+                        dst[d0..d0 + avail].copy_from_slice(&plain[src_start..src_start + avail]);
                     }
                 }
             }
         }
     }
     Ok(want)
+}
+
+/// Read, checksum-verify and decompress a whole compressed extent, through the
+/// decompressed-extent cache ([`crate::decompress_cache`]).
+async fn read_compressed_cached<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    csum_root: Option<u64>,
+    id: crate::decompress_cache::ExtentId,
+    sectorsize: usize,
+) -> Result<alloc::sync::Arc<Vec<u8>>, FsError> {
+    use crate::decompress_cache as cache;
+    let owner: alloc::sync::Weak<dyn core::any::Any + Send + Sync> = vol.self_weak.clone();
+    let handle = cache::VolumeRef::new(owner);
+    if let Some(plain) = cache::get(&handle, id) {
+        return Ok(plain);
+    }
+    let epoch = cache::epoch(&handle);
+    let raw = match csum_root {
+        Some(root) => {
+            crate::csum::read_checked(vol, root, id.disk_bytenr, id.disk_num_bytes as usize).await?
+        }
+        None => {
+            vol.read_logical(id.disk_bytenr, id.disk_num_bytes as usize)
+                .await?
+        }
+    };
+    // Only checksum-verified bytes that decompressed cleanly reach the cache;
+    // `?` leaves a failure uncached.
+    let plain = alloc::sync::Arc::new(decompress(id.compression, &raw, sectorsize)?);
+    cache::insert(&handle, id, epoch, alloc::sync::Arc::clone(&plain));
+    Ok(plain)
 }
