@@ -791,7 +791,7 @@ impl ColdBoot {
             .ok_or(Error::Invalid)?
             .display_context(regs)
             .map_err(Error::Gmc)?;
-        let size = hw.pool.available() / 2 & !(ALIGN - 1);
+        let size = (hw.pool.available() / 2) & !(ALIGN - 1);
         if size < 64 << 20 {
             return Err(Error::Allocation);
         }
