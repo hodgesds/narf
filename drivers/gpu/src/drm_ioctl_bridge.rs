@@ -39,11 +39,12 @@ use crate::drm_uapi::{
 
 // ── Copy helpers ──────────────────────────────────────────────────────
 //
-// These mirror the SMAP-bracketed helpers in `narf-userspace::handlers`
-// but stay local so the GPU crate doesn't take a dependency on the
-// syscall layer. The kernel-test smokes pass kernel-owned pointers
-// here; production traffic goes through validated user ranges already
-// gated by `sys_ioctl`.
+// These mirror `narf-userspace::handlers::{copy_from_user, copy_to_user}`
+// (range check + fault-guarded copy) but stay local so the GPU crate doesn't
+// take a dependency on the syscall layer. `sys_ioctl` passes the raw `arg`
+// through unvalidated, and every pointer *inside* an ioctl struct is the
+// client's, so both are checked here. The kernel-test smokes pass
+// kernel-owned pointers through the test-only `kernel_test_buffers` opt-out.
 
 /// Maximum per-ioctl payload size (1 MiB). Hard cap so a malicious
 /// `count_objs` field can't be used to force a huge allocation.
@@ -1908,64 +1909,173 @@ pub fn dispatch_virtgpu_mmap(
         .collect())
 }
 
-/// Read `N` bytes from a user-pointer into a kernel `Vec<u8>`.
+/// Read `len` bytes from a user pointer into a kernel `Vec<u8>`.
+///
+/// Linux `copy_from_user`: [`access_ok`] confines the whole range to the
+/// user half first (`arch/x86/include/asm/uaccess_64.h::__access_ok`), then
+/// the transfer runs through the exception-table-guarded copy
+/// (`narf_arch::x86_64::smap::copy_user_guarded`, Linux
+/// `copy_user_generic` + its extable fixup), so an unmapped or
+/// concurrently-unmapped buffer is `EFAULT` instead of a kernel #PF.
+/// Every failure of either step is [`FsError::BadAddress`] (`EFAULT`).
 ///
 /// # Safety
-/// `uptr` must be a valid user-mode pointer for the calling task or a
-/// kernel-mode pointer (test-only). The caller must hold the syscall
-/// trap context (no IRQ context, AS still active).
+/// The caller must hold the syscall trap context (not IRQ context, the
+/// calling task's address space active). `uptr` itself may be hostile.
 pub(crate) unsafe fn copy_in(uptr: usize, len: usize) -> Result<Vec<u8>, FsError> {
-    if uptr == 0 {
-        return Err(FsError::BadAddress);
-    }
     if len > IOCTL_MAX_BUF {
         return Err(FsError::InvalidData);
     }
-    let mut out = vec![0u8; len];
-    // SAFETY: `uptr` is the user (or test-kernel) ioctl arg; `user_memcpy`
-    // SMAP-brackets the read so a real user pointer doesn't #PF under SMAP.
-    unsafe {
-        user_memcpy(out.as_mut_ptr(), uptr as *const u8, len);
+    if !access_ok(uptr as u64, len) {
+        return Err(FsError::BadAddress);
     }
+    let mut out = vec![0u8; len];
+    // SAFETY: `out` is a live kernel buffer of `len` bytes; the user side
+    // is range-checked above and the guarded copy survives a fault on it.
+    unsafe { guarded_copy(out.as_mut_ptr(), uptr as *const u8, len)? };
     Ok(out)
 }
 
-/// Write a kernel slice back into a user-pointer.
-pub(crate) unsafe fn copy_out(uptr: usize, bytes: &[u8]) -> Result<(), FsError> {
-    if uptr == 0 {
-        return Err(FsError::BadAddress);
-    }
-    // SAFETY: `uptr` is the user (or test-kernel) ioctl arg; `user_memcpy`
-    // SMAP-brackets the write.
-    unsafe {
-        user_memcpy(uptr as *mut u8, bytes.as_ptr(), bytes.len());
-    }
-    Ok(())
-}
-
-/// `copy_nonoverlapping` bracketed by a SMAP user-access window so the
-/// kernel may touch user memory through the raw ioctl pointer. The DRM
-/// ioctl path reaches here from `sys_ioctl`, which passes the user `arg`
-/// straight through without clearing SMAP. Harmless on kernel pointers
-/// (the test smokes): `stac` only relaxes the U/S check, it never breaks
-/// a supervisor access.
+/// Write a kernel slice back to a user pointer: Linux `copy_to_user`, with
+/// the same [`access_ok`] range check and fault-guarded transfer as
+/// [`copy_in`]. Any failure is [`FsError::BadAddress`] (`EFAULT`).
 ///
 /// # Safety
-/// `dst`/`src` must be valid for `len` bytes; one side may be user memory.
-#[cfg(target_arch = "x86_64")]
-unsafe fn user_memcpy(dst: *mut u8, src: *const u8, len: usize) {
-    // SAFETY: caller guarantees the ranges; with_user_access toggles AC.
-    unsafe {
-        narf_arch::x86_64::smap::with_user_access(|| {
-            core::ptr::copy_nonoverlapping(src, dst, len);
-        });
+/// As [`copy_in`].
+pub(crate) unsafe fn copy_out(uptr: usize, bytes: &[u8]) -> Result<(), FsError> {
+    if !access_ok(uptr as u64, bytes.len()) {
+        return Err(FsError::BadAddress);
     }
+    // SAFETY: `bytes` is a live kernel slice; the user side is range-checked
+    // above and the guarded copy survives a fault on it.
+    unsafe { guarded_copy(uptr as *mut u8, bytes.as_ptr(), bytes.len()) }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn user_memcpy(dst: *mut u8, src: *const u8, len: usize) {
-    // SAFETY: caller guarantees the ranges.
-    unsafe { core::ptr::copy_nonoverlapping(src, dst, len) };
+/// First address above the user half of the 48-bit canonical VA space on
+/// both supported architectures. The syscall layer's `validate_user_range`
+/// splits at the same bit, so an ioctl pointer the trap layer would accept
+/// through [`IoctlContext`] is accepted here and nothing else is.
+const USER_VA_LIMIT: u64 = 1 << 47; // linux: n/a (NARF user/kernel split, = userspace USER_VA_LIMIT)
+
+/// Linux `__access_ok` (`arch/x86/include/asm/uaccess_64.h`): the sum
+/// `addr + size` must not wrap and must stay inside the user half. Null is
+/// rejected too (every DRM pointer field this guards treats 0 as "absent"
+/// before calling, so a null that reaches here is a fault, as before).
+///
+/// A canonical *kernel* pointer is rejected here rather than left to SMAP:
+/// the guarded copy runs inside STAC/CLAC, and SMAP never faults a
+/// supervisor page anyway, so without this an INFO `return_pointer`, a
+/// GEM_METADATA buffer or a VERSION name pointer aimed at kernel memory
+/// would be an arbitrary kernel read/write.
+fn access_ok(addr: u64, len: usize) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    let Some(end) = addr.checked_add(len as u64) else {
+        return false;
+    };
+    if end <= USER_VA_LIMIT {
+        return true;
+    }
+    #[cfg(feature = "kernel-test")]
+    if kernel_test_buffers::allowed(addr, end) {
+        return true;
+    }
+    false
+}
+
+/// Fault-guarded copy; a caught fault is `EFAULT`.
+///
+/// # Safety
+/// The kernel side of the copy must be valid for `len` bytes; the user side
+/// must have passed [`access_ok`].
+unsafe fn guarded_copy(dst: *mut u8, src: *const u8, len: usize) -> Result<(), FsError> {
+    if len == 0 {
+        return Ok(());
+    }
+    // SAFETY: forwarded from the caller; the arch helper arms the per-CPU
+    // recovery probe and the STAC/CLAC window itself.
+    #[cfg(target_arch = "x86_64")]
+    let copied = unsafe { narf_arch::x86_64::smap::copy_user_guarded(dst, src, len) };
+    // SAFETY: as above.
+    #[cfg(target_arch = "aarch64")]
+    let copied = unsafe { narf_arch::aarch64::uaccess::copy_user_guarded(dst, src, len) };
+    copied.map_err(|_| FsError::BadAddress)
+}
+
+/// Test-build-only relaxation of [`access_ok`] for the in-kernel smokes,
+/// which drive the ioctl handlers with kernel stack/heap buffers standing in
+/// for user memory (well over a thousand of them). Compiled only with
+/// `kernel-test`; a production build has no path that accepts a kernel
+/// address.
+///
+/// Even here the relaxation accepts only a range that lies entirely in the
+/// canonical kernel half (never one straddling the hole or the user/kernel
+/// boundary). A [`StrictUserCopies`] guard turns it off on the calling CPU
+/// so a test can assert the production predicate end to end; the guard may
+/// name one kernel buffer that keeps standing in for user memory (the ioctl
+/// struct itself), so a test can aim a pointer *inside* that struct at the
+/// kernel and see exactly that pointer refused.
+#[cfg(feature = "kernel-test")]
+pub(crate) mod kernel_test_buffers {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    use narf_lib::percpu::{current_cpu, MAX_CPUS};
+
+    /// Per-CPU strict window `[start, end)`: `start == 0` means no strict
+    /// scope is open; otherwise only kernel ranges inside the window pass.
+    /// Keyed on the CPU, as the syscall layer's `kernel_buf_scope` is,
+    /// because a smoke runs its block straight through on one CPU.
+    static START: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    static END: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+    /// While alive, the DRM copy helpers apply the production predicate on
+    /// the CPU that created it, except for the one stand-in buffer.
+    pub(crate) struct StrictUserCopies {
+        cpu: usize,
+        saved: (u64, u64),
+    }
+
+    impl StrictUserCopies {
+        /// Strict for every kernel address.
+        pub(crate) fn new() -> Self {
+            Self::open(u64::MAX, u64::MAX)
+        }
+
+        /// Strict except for `[base, base + len)`, which keeps standing in
+        /// for user memory.
+        pub(crate) fn allowing(base: usize, len: usize) -> Self {
+            Self::open(base as u64, base as u64 + len as u64)
+        }
+
+        fn open(start: u64, end: u64) -> Self {
+            let cpu = current_cpu();
+            let saved = (
+                START[cpu].swap(start, Ordering::AcqRel),
+                END[cpu].swap(end, Ordering::AcqRel),
+            );
+            Self { cpu, saved }
+        }
+    }
+
+    impl Drop for StrictUserCopies {
+        fn drop(&mut self) {
+            START[self.cpu].store(self.saved.0, Ordering::Release);
+            END[self.cpu].store(self.saved.1, Ordering::Release);
+        }
+    }
+
+    /// `[addr, end)` is wholly inside the canonical kernel half and, when a
+    /// strict scope is open on this CPU, inside its stand-in buffer.
+    pub(super) fn allowed(addr: u64, end: u64) -> bool {
+        const KERNEL_HALF: u64 = 0xffff_8000_0000_0000; // linux: n/a (48-bit canonical kernel half)
+        if addr < KERNEL_HALF || end <= addr {
+            return false;
+        }
+        let cpu = current_cpu();
+        let start = START[cpu].load(Ordering::Acquire);
+        start == 0 || (addr >= start && end <= END[cpu].load(Ordering::Acquire))
+    }
 }
 
 // ── Error translation ────────────────────────────────────────────────
