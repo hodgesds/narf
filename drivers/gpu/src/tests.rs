@@ -11615,6 +11615,16 @@ fn smoke_amdgpu_cs_parser_rejects_hostile_input() -> TestResult {
     {
         return TestResult::Fail("a CE submission must be refused");
     }
+    if run(&build(
+        IB_VA,
+        256,
+        u::AMDGPU_HW_IP_GFX,
+        u::AMDGPU_IB_FLAGS_SECURE,
+    ))
+    .is_ok()
+    {
+        return TestResult::Fail("a SECURE submission without TMZ must be refused");
+    }
     if run(&build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 1 << 20)).is_ok() {
         return TestResult::Fail("an undefined IB flag must be refused");
     }

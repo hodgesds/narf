@@ -260,6 +260,12 @@ fn parse_ib(words: &[u32], vm: &VmState) -> Result<Ib, FsError> {
     if flags & uapi::AMDGPU_IB_FLAG_CE != 0 {
         return Err(FsError::InvalidData);
     }
+    // amdgpu_ib_schedule refuses SECURE on a ring without secure
+    // submission; there is no TMZ here, so no ring has it, and DEV_INFO
+    // never offers it.
+    if flags & uapi::AMDGPU_IB_FLAGS_SECURE != 0 {
+        return Err(FsError::InvalidData);
+    }
     // Only the engines that exist. Linux resolves `ip_type` to a ring and
     // fails if there is none; the effect is the same and the list is the
     // honest one for this driver.
