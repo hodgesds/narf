@@ -120,6 +120,39 @@ impl Soc {
     }
 }
 
+impl Soc {
+    /// The top DCN30 bounding-box state from the running board: DCFCLK (also
+    /// the fabric clock, as `dcn30_fpu_update_bw_bounding_box` sets it),
+    /// SOCCLK and `memclk * 16` from the DAL DPM table, the DENTIST-reachable
+    /// display/DPP ceilings, VBIOS channels, and the HUBBUB reference.
+    pub fn from_board(
+        levels: &crate::amdgpu_dcn30_clk::Levels,
+        channels: u32,
+        channel_width_bytes: u32,
+        dchub_refclk_khz: u32,
+    ) -> Result<Self, Error> {
+        use crate::amdgpu_dcn30_clk::Clock;
+        let dcfclk = levels.range(Clock::Dcf).max_khz();
+        let soc = Self {
+            dcfclk_khz: dcfclk,
+            fabric_khz: dcfclk,
+            socclk_khz: levels.range(Clock::Soc).max_khz(),
+            dram_speed_mts: levels.range(Clock::Memory).max_khz() / 1000 * 16,
+            channels,
+            channel_width_bytes,
+            max_dispclk_khz: levels.ceiling(Clock::Display).map_err(|_| Error::Invalid)?,
+            max_dppclk_khz: levels.ceiling(Clock::Pixel).map_err(|_| Error::Invalid)?,
+            max_phyclk_khz: levels.range(Clock::Phy).max_khz(),
+            dentist_vco_khz: levels.vco_khz,
+            dchub_refclk_khz,
+        };
+        if !soc.valid() {
+            return Err(Error::Invalid);
+        }
+        Ok(soc)
+    }
+}
+
 /// HUBBUB watermark set, in reference-clock cycles, as `hubbub21_program_*`
 /// would write it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

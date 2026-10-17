@@ -3541,6 +3541,22 @@ Out-of-scope planes, PHY/display-clock overruns and unschedulable blanks fail
 before any hardware is touched. Host vectors from a double transliteration of
 the Linux formulas are checked to one LSB.
 
+`Soc::from_board(levels, channels, width, dchub_refclk)` builds the top
+bounding-box state from the DAL DPM table (DCFCLK doubling as fabric clock,
+`memclk*16`, DENTIST-reachable DISP/DPP ceilings, PHY ceiling, VCO).
+`amdgpu_dcn_inventory::vram_channels(vbios)` reads `vram_info` v2.5 module 0
+(`channel_num`, `(1 << channel_width) / 8` bytes) as `get_vram_info_v25` does;
+other revisions are refused.
+
+`unsafe amdgpu_dcn30_hubbub::Hubbub::new(gpu, pci_cap)` owns the DCN3.0
+arbiter. `dchub_refclk_khz(dccg_ref)` mirrors `hubbub2_get_dchub_ref_freq`
+but refuses a disabled global timer or a reference outside 40–60 MHz.
+`unsafe program(&WatermarkSet, refclk)` (no HUBP fetching) writes sets A–D
+identically (data/VM-row urgency, trip to memory, SR enter/exit, DRAM clock
+change, FRAC_URG_BW nom/flip), `ARB_SAT_LEVEL = 60 * refclk_mhz`,
+`MIN_REQ_OUTSTAND = 0x1ff`, forces self refresh off, and reads every write
+back; values wider than their DCN3.0 field are refused rather than masked.
+
 ### Navi 22 native AUX, DDC and HPD
 
 `unsafe amdgpu_dcn30_ddc::Ddc::new(gpu, pci_cap, crystal_khz)` claims all six DCN3.0 AUX
