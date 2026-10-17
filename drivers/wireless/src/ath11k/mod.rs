@@ -63,6 +63,7 @@ pub mod qmi;
 pub mod qmi_client;
 pub mod qmi_wlfw;
 pub mod qrtr;
+pub mod tx_hdr;
 pub mod wlfw;
 pub mod wmi;
 pub mod wmi_ids;
