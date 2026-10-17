@@ -327,6 +327,119 @@ kernel_test_in!(
     smoke_amdgpu_atombios_table_directory_round_trip
 );
 
+/// The in-ring VM flush and fence of GFX10..12 rings, word for word as
+/// `nvd.h`'s macros and `gmc_v12_0_emit_flush_gpu_tlb` /
+/// `gfx_v12_0_ring_emit_{wreg,reg_wait,reg_write_reg_wait,vm_flush,fence}`
+/// build them: on a graphics ring the register writes and the write-wait
+/// run on the PFP and a PFP_SYNC_ME follows; on MMHUB the engine semaphore
+/// is acquired first (a register wait for 1) and released last.
+fn smoke_amdgpu_pm4_vm_flush_and_fence_like_linux() -> TestResult {
+    use crate::amdgpu_pm4::Pm4Builder;
+    use crate::amdgpu_vmhub_regs::{invalidate_req, GFXHUB_V12_0, MMHUB_V4_1};
+    let mut buf = [0u32; 64];
+    let mut b = Pm4Builder::new(&mut buf);
+    let base = 0x1260;
+    if b.vm_flush(&GFXHUB_V12_0, base, 0, 3, 0x1_0000_8001, true)
+        .is_err()
+    {
+        return TestResult::Fail("graphics flush");
+    }
+    let want_gfx = [
+        0xc003_3700,
+        0x4010_0000,
+        base + 0x168f + 6,
+        0,
+        0x8001, // PT base lo
+        0xc003_3700,
+        0x4010_0000,
+        base + 0x1690 + 6,
+        0,
+        1, // PT base hi
+        0xc005_3c00,
+        0x143,
+        base + 0x1647,
+        base + 0x1659,
+        invalidate_req(3, 0),
+        8,
+        0x20,
+        0xc000_4200,
+        0, // PFP_SYNC_ME
+    ];
+    if b.words() != want_gfx || invalidate_req(3, 0) != 0x00f8_0008 {
+        return TestResult::Fail("graphics ring VM flush words");
+    }
+    let mut buf = [0u32; 64];
+    let mut b = Pm4Builder::new(&mut buf);
+    let base = 0x1a000;
+    if b.vm_flush(&MMHUB_V4_1, base, 1, 5, 0x2_0000_3001, false)
+        .is_err()
+    {
+        return TestResult::Fail("compute flush");
+    }
+    let want_mm = [
+        0xc005_3c00,
+        3,
+        base + 0x576,
+        0,
+        1,
+        1,
+        0x20, // semaphore acquire
+        0xc003_3700,
+        0x0010_0000,
+        base + 0x05cf + 10,
+        0,
+        0x3001,
+        0xc003_3700,
+        0x0010_0000,
+        base + 0x05d0 + 10,
+        0,
+        2,
+        0xc005_3c00,
+        0x43,
+        base + 0x588,
+        base + 0x59a,
+        0x00f8_0020,
+        0x20,
+        0x20,
+        0xc003_3700,
+        0x0010_0000,
+        base + 0x576,
+        0,
+        0, // semaphore release
+    ];
+    if b.words() != want_mm {
+        return TestResult::Fail("MMHUB VM flush words");
+    }
+    let mut buf = [0u32; 8];
+    let mut b = Pm4Builder::new(&mut buf);
+    if b.release_mem_fence(0x1000_0040, 0x1234_5678_9abc, false, true)
+        .is_err()
+        || b.words()
+            != [
+                0xc006_4900,
+                0x0660_0514,
+                0x2200_0000,
+                0x1000_0040,
+                0,
+                0x5678_9abc,
+                0x1234,
+                0,
+            ]
+    {
+        return TestResult::Fail("RELEASE_MEM fence words");
+    }
+    let mut buf = [0u32; 8];
+    let mut b = Pm4Builder::new(&mut buf);
+    if b.release_mem_fence(0x1000_0044, 1, true, false).is_ok() {
+        return TestResult::Fail("misaligned 64-bit fence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu",
+    smoke_amdgpu_pm4_vm_flush_and_fence_like_linux
+);
+
 fn smoke_amdgpu_pm4_indirect_buffer_packet() -> TestResult {
     // INDIRECT_BUFFER is 4 dwords: header + ib_lo + ib_hi +
     // (size | vmid<<24). Verify the header type/opcode/count
