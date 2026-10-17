@@ -680,3 +680,32 @@ kernel_test_in!(
     "drivers/gpu/navi22-boot",
     navi22_dmub_quiesce_tolerates_fused_off_dmcub
 );
+
+/// Every display path that builds the VBIOS `Tables` routes them through
+/// the running DMUB (`with_dmub(DmubRoute::new(..))`), as `modeset_display`
+/// does; `retrain_display` and `stop_unplugged_display` built bare tables,
+/// so with DMUB alive the ATOM interpreter raced the DMCUB's own table
+/// execution (DCN3.0 `dmub_command_table` in command_table2.c).
+fn navi22_display_tables_always_go_through_dmub() -> TestResult {
+    let source = include_str!("amdgpu_navi22_boot.rs");
+    let mut sites = 0;
+    let mut rest = source;
+    while let Some(at) = rest.find("amdgpu_navi22_bios::Tables::new(") {
+        let tail = &rest[at..];
+        // The builder chain ends at the statement's `;`.
+        let chain = &tail[..tail.find(';').unwrap_or(tail.len())];
+        if !chain.contains(".with_dmub(") {
+            return TestResult::Fail("a display path builds VBIOS tables without the DMUB route");
+        }
+        sites += 1;
+        rest = &tail[1..];
+    }
+    if sites < 4 {
+        return TestResult::Fail("expected modeset/stop/retrain/unplug table sites");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_display_tables_always_go_through_dmub
+);

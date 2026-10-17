@@ -433,9 +433,46 @@ fn navi22_bios_atom_fallback_uses_fb_scratch_size_and_clock() -> TestResult {
     {
         return TestResult::Fail("20 s ATOM guard not driven by the clock");
     }
+    // Two jumps that alternate targets reset the per-loop guard on every
+    // jump, so only the whole-table TABLE_MS cap ends them.
+    let mut pingpong = image(7);
+    table(&mut pingpong, TABLE_A, 7, 0, 16, &[67, 9, 0, 67, 6, 0, 91]);
+    let tables = Tables::new(&pingpong).unwrap();
+    let bus = Rc::new(RefCell::new(Clocked { now: 0, calls: 0 }));
+    if tables.set_pixel_clock(bus.clone(), &clock) != Err(Error::Timeout)
+        || bus.borrow().now > TABLE_MS + 10_000
+    {
+        return TestResult::Fail("interpreted table not bounded by TABLE_MS");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22-bios",
     navi22_bios_atom_fallback_uses_fb_scratch_size_and_clock
+);
+
+/// The DMUB table route serialises its `&self` callers without masking
+/// interrupts: a VBIOS command can wait 100 ms for the DMCUB, and Linux
+/// waits under a mutex (`dc_lock`) with IRQs on. A second caller is told
+/// `Busy` instead of spinning.
+fn navi22_dmub_route_keeps_interrupts_enabled() -> TestResult {
+    if !narf_arch::interrupts_enabled() {
+        return TestResult::Skip("test context runs with interrupts masked");
+    }
+    let lock = MailboxLock::new(0u32);
+    let during = lock.with(|v| {
+        *v += 1;
+        (narf_arch::interrupts_enabled(), lock.with(|_| ()).is_none())
+    });
+    if during != Some((true, true)) {
+        return TestResult::Fail("DMUB route masked interrupts or allowed a nested caller");
+    }
+    if lock.with(|v| *v) != Some(1) {
+        return TestResult::Fail("DMUB route lock not released");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-bios",
+    navi22_dmub_route_keeps_interrupts_enabled
 );

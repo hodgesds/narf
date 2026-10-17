@@ -1283,6 +1283,17 @@ impl ColdBoot {
             .await
             .map_err(Error::Display)
     }
+    /// Detect one board connector (the sink read of `dc_link_detect`).
+    /// Reads the sink only; no stream or scanout is changed.
+    pub async fn detect_display(
+        &mut self,
+        index: usize,
+    ) -> Result<crate::amdgpu_navi22_display::Detection, Error> {
+        self.display_mut()?
+            .detect(index)
+            .await
+            .map_err(Error::Display)
+    }
     fn display_mut(&mut self) -> Result<&mut crate::amdgpu_navi22_display::Display, Error> {
         if !matches!(self.sequence.state, State::FirmwareReady(_)) {
             return Err(Error::Busy);
@@ -1966,16 +1977,7 @@ impl ColdBoot {
         self.display_mut().ok()?.verified_link(index, dpcd)
     }
     /// The lit pipeline, its connector's index and the VBIOS tables' bytes.
-    fn lit_display(
-        &mut self,
-    ) -> Result<
-        (
-            &mut crate::amdgpu_navi22_modeset::Pipeline,
-            crate::amdgpu_navi22_display::DisplayAux<'_>,
-            &[u8],
-        ),
-        Error,
-    > {
+    fn lit_display(&mut self) -> Result<LitDisplay<'_>, Error> {
         let h = &mut self.sequence.backend;
         let pipeline = h.modeset.as_mut().ok_or(Error::Invalid)?;
         let (vbios, _) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
@@ -1990,6 +1992,7 @@ impl ColdBoot {
             pipeline,
             crate::amdgpu_navi22_display::DisplayAux { display, index },
             vbios.as_slice(),
+            h.dmub.as_mut(),
         ))
     }
     /// Check the lit DP stream's link (an HPD-RX short pulse, or the
@@ -1997,7 +2000,7 @@ impl ColdBoot {
     pub async fn check_display_link(
         &mut self,
     ) -> Result<crate::amdgpu_navi22_modeset::RxEvent, Error> {
-        let (pipeline, mut aux, _) = self.lit_display()?;
+        let (pipeline, mut aux, _, _) = self.lit_display()?;
         pipeline
             .check_dp_link(&mut aux)
             .await
@@ -2015,9 +2018,14 @@ impl ColdBoot {
     pub async unsafe fn retrain_display(
         &mut self,
     ) -> Result<crate::amdgpu_navi22_modeset::DpLink, Error> {
-        let (pipeline, mut aux, vbios) = self.lit_display()?;
+        let (pipeline, mut aux, vbios, dmub) = self.lit_display()?;
+        // As modeset_display / stop_display: the running DMUB executes the
+        // tables (DCN3.0 `dmub_command_table`), the ATOM interpreter only
+        // when it is not running.
+        let route = crate::amdgpu_navi22_bios::DmubRoute::new(dmub);
         let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
-            .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Bios(e)))?;
+            .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Bios(e)))?
+            .with_dmub(route.as_ref().map(|r| r as _));
         let result = pipeline.retrain(&tables, &mut aux).await;
         if result.is_err() {
             aux.display.set_verified_link(aux.index, None, None);
@@ -2032,7 +2040,7 @@ impl ColdBoot {
     /// As `stop_display`.
     pub async unsafe fn stop_unplugged_display(&mut self) -> Result<(), Error> {
         {
-            let (_, aux, _) = self.lit_display()?;
+            let (_, aux, _, _) = self.lit_display()?;
             if aux.display.hpd_sense(aux.index).map_err(Error::Display)? == Some(true) {
                 return Err(Error::Busy);
             }
@@ -2040,9 +2048,11 @@ impl ColdBoot {
         }
         let h = &mut self.sequence.backend;
         let stopped = h.scanout.as_mut().map(|s| s.stop());
-        let (pipeline, mut ddc, vbios) = self.lit_display()?;
+        let (pipeline, mut ddc, vbios, dmub) = self.lit_display()?;
+        let route = crate::amdgpu_navi22_bios::DmubRoute::new(dmub);
         let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
-            .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Bios(e)))?;
+            .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Bios(e)))?
+            .with_dmub(route.as_ref().map(|r| r as _));
         pipeline
             .disable_unplugged(&tables, &mut ddc)
             .await
@@ -2061,6 +2071,15 @@ impl ColdBoot {
         Ok(())
     }
 }
+
+/// The lit pipe, its connector's AUX/DDC, the VBIOS image and the running
+/// DMUB (for the table route), as `ColdBoot::lit_display` lends them.
+type LitDisplay<'a> = (
+    &'a mut crate::amdgpu_navi22_modeset::Pipeline,
+    crate::amdgpu_navi22_display::DisplayAux<'a>,
+    &'a [u8],
+    Option<&'a mut crate::amdgpu_dmub_navi22::Dmub>,
+);
 
 /// IH-driven HPD (`amdgpu_dm_hpd_init` / `dm_irq_handler`) for the native
 /// display owner.

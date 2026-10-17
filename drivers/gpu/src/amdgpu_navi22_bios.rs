@@ -65,7 +65,17 @@ pub enum Error {
     Bus,
     /// DMCUB did not execute the `DMUB_CMD__VBIOS` command.
     Dmub(crate::amdgpu_dmub_navi22::Error),
+    /// One interpreted table ran past [`TABLE_MS`] of wall clock.
+    Timeout,
 }
+
+/// Wall-clock cap on one interpreted display table, the counterpart of
+/// ASIC_Init's `POST_MS`. Linux bounds only each *loop*
+/// (`ATOM_CMD_TIMEOUT_SEC` in `atom_op_jump`), so bytecode that keeps
+/// changing its jump target, or keeps delaying, never ends there; NARF caps
+/// the whole run. Above the 20 s per-loop guard so that guard still reports
+/// a single stuck loop first.
+pub const TABLE_MS: u64 = 30_000; // linux: n/a (NARF bound)
 
 /// The action `dcn10_bios_golden_init` passes per pipe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,7 +145,26 @@ pub trait VbiosDmub: Sync {
 }
 /// A running DMUB borrowed for one modeset. The lock only gives the `&self`
 /// table calls exclusive use of the mailbox; it is never contended.
-pub struct DmubRoute<'d>(narf_lib::sync::IrqSafeSpinLock<&'d mut Dmub>);
+pub struct DmubRoute<'d>(MailboxLock<&'d mut Dmub>);
+
+/// Exclusive use of a mailbox for `&self` callers *without* masking
+/// interrupts. A VBIOS command waits up to 100 ms for the DMCUB to drain
+/// its inbox; Linux runs that wait (`dc_wake_and_execute_dmub_cmd` →
+/// `dmub_srv_wait_for_idle`) under `dc_lock`, a mutex, with IRQs on. The
+/// previous `IrqSafeSpinLock` kept interrupts off for the whole wait (the
+/// HPD/IH, timer and every other device starved, and a wait that depends
+/// on an IRQ could never finish).
+pub(crate) struct MailboxLock<T>(narf_lib::mutex::Mutex<T>);
+impl<T> MailboxLock<T> {
+    pub(crate) const fn new(value: T) -> Self {
+        Self(narf_lib::mutex::Mutex::new(value))
+    }
+    /// Run `f` with exclusive access; `None` when already held.
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let mut guard = self.0.try_lock()?;
+        Some(f(&mut guard))
+    }
+}
 impl core::fmt::Debug for DmubRoute<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("DmubRoute")
@@ -147,9 +176,7 @@ impl<'d> DmubRoute<'d> {
     /// interpreter is the fallback.
     pub fn new(dmub: Option<&'d mut Dmub>) -> Option<Self> {
         match dmub {
-            Some(dmub) if dmub.vbios_ready() => {
-                Some(Self(narf_lib::sync::IrqSafeSpinLock::new(dmub)))
-            }
+            Some(dmub) if dmub.vbios_ready() => Some(Self(MailboxLock::new(dmub))),
             _ => {
                 use core::fmt::Write;
                 let _ = writeln!(
@@ -167,11 +194,9 @@ impl VbiosDmub for DmubRoute<'_> {
         command: VbiosCommand,
         payload: &[u8],
     ) -> Result<(), crate::amdgpu_dmub_navi22::Error> {
-        let mut dmub = self
-            .0
-            .try_lock()
-            .ok_or(crate::amdgpu_dmub_navi22::Error::Busy)?;
-        dmub.execute_vbios(command, payload)
+        self.0
+            .with(|dmub| dmub.execute_vbios(command, payload))
+            .ok_or(crate::amdgpu_dmub_navi22::Error::Busy)?
     }
 }
 impl core::fmt::Debug for Tables<'_> {
@@ -284,12 +309,30 @@ impl<'a> Tables<'a> {
         let f = faulted.clone();
         state.port_write = Box::new(move |_, _| *f.borrow_mut() = true);
         let id = u8::try_from(table).map_err(|_| Error::Invalid)?;
-        let result = vm::execute_table(&mut state, id, params);
+        // `vm::execute_table`'s drive loop, plus the TABLE_MS cap.
+        let began = bus.borrow_mut().now_ms();
+        let result = match vm::Machine::start(&mut state, id, params) {
+            Err(e) => Err(Error::Atom(e)),
+            Ok(mut machine) => loop {
+                match machine.step(&mut state) {
+                    Err(e) => break Err(Error::Atom(e)),
+                    Ok(vm::Step::Done) => break Ok(()),
+                    Ok(vm::Step::Delay(us)) => bus.borrow_mut().delay_us(us),
+                    Ok(vm::Step::Continue) => {}
+                }
+                let now = bus.borrow_mut().now_ms();
+                if let (Some(began), Some(now)) = (began, now) {
+                    if now.saturating_sub(began) > TABLE_MS {
+                        break Err(Error::Timeout);
+                    }
+                }
+            },
+        };
         drop(state);
         if *faulted.borrow() {
             return Err(Error::Bus);
         }
-        result.map_err(Error::Atom)
+        result
     }
 
     /// `enable_disp_power_gating_v2_1` (`enable_disp_power_gating_parameters_v2_1`).
