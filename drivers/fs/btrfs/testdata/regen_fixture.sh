@@ -498,7 +498,8 @@ btrfs inspect-internal dump-tree -t FREE_SPACE "$imgbm" | grep -q FREE_SPACE_BIT
     || { echo "fixture-bitmap has no FREE_SPACE_BITMAP" >&2; exit 1; }
 sparse_encode "$imgbm" fixture-bitmap.img.sparse
 
-# A CachyOS-root lookalike: the host's real feature set (compat_ro 0xb =
+# A CachyOS-root lookalike (512 MiB so the boot write smoke can grow it
+# four times): the host's real feature set (compat_ro 0xb =
 # free-space-tree + valid + BLOCK_GROUP_TREE, incompat 0x371), crc32c, 4 KiB
 # sectors, 16 KiB nodes, zstd, and its subvolume layout (@, @home, @root, @srv,
 # @cache, @tmp, @log) created by mkfs `--subvol` (no mount needed). The
@@ -514,7 +515,7 @@ printf 'home user file\n' > "$bgtstage/@home/user/notes.txt"
 printf 'narf\n' > "$bgtstage/hello.txt"
 python3 -c "import sys;sys.stdout.write(''.join('L%04d\n'%i for i in range(2000)))" \
     > "$bgtstage/big.dat"
-truncate -s 128M "$imgbgt"
+truncate -s 512M "$imgbgt"
 mkfs.btrfs --csum crc32c --nodesize 16384 --sectorsize 4096 --compress zstd \
     -O block-group-tree,free-space-tree,no-holes \
     --subvol rw:@ --subvol rw:@home --subvol rw:@root --subvol rw:@srv \

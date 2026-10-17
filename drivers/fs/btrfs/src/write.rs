@@ -58,7 +58,7 @@ use narf_block::BlockDevice;
 use narf_filesystem::FsError;
 
 use crate::allocator::Allocator;
-use crate::block_group;
+use crate::block_group::{self, BgHome};
 use crate::btree::{
     self, internal_blockptr, internal_child_slot, internal_key, leaf_item_data, leaf_item_key,
     leaf_item_span, leaf_lower_bound, level, nritems, HEADER_SIZE,
@@ -2910,6 +2910,18 @@ fn build_ext_edits(
     Ok(edits)
 }
 
+/// Route `BLOCK_GROUP_ITEM` edits to the tree that holds block groups:
+/// `(extent-tree edits, block-group-tree edits)`. Without a block-group tree
+/// every edit stays in the extent tree.
+fn split_block_group_edits(edits: Vec<Edit>, home: BgHome) -> (Vec<Edit>, Vec<Edit>) {
+    match home {
+        BgHome::ExtentTree => (edits, Vec::new()),
+        BgHome::BlockGroupTree { .. } => edits
+            .into_iter()
+            .partition(|edit| edit.key().item_type != format::BLOCK_GROUP_ITEM_KEY),
+    }
+}
+
 struct DataChanges {
     edits: Vec<Edit>,
     allocated: Vec<(u64, u64)>,
@@ -4544,11 +4556,21 @@ async fn commit_txn<B: BlockDevice + 'static>(
         ext_nodes: Vec<(u64, Vec<u8>, u8)>,
         ext_root: u64,
         ext_level: u8,
+        /// The block-group tree's path COW, when the filesystem has one.
+        bgt: Option<CowOut>,
     }
     let mut done: Option<Done> = None;
     let mut prev_ext_new: Vec<(u64, u8)> = Vec::new();
     let mut prev_ext_freed: Vec<(u64, u8)> = Vec::new();
     let mut prev_ext_root = 0u64;
+    // The block-group tree is self-referential through the extent tree the
+    // same way the extent tree is through itself: its new blocks need
+    // METADATA_ITEMs and change their block group's `used`, which edits the
+    // block-group tree again. Linux settles this with delayed refs; here the
+    // previous round's blocks feed the next round until both trees are stable.
+    let mut prev_bgt_new: Vec<(u64, u8)> = Vec::new();
+    let mut prev_bgt_freed: Vec<(u64, u8)> = Vec::new();
+    let mut prev_bgt_root = 0u64;
     let mut fst_leaves = usize::from(fst_base.is_some());
 
     // A split extent tree can require more than a dozen rounds: recording the
@@ -4611,6 +4633,9 @@ async fn commit_txn<B: BlockDevice + 'static>(
         for &(a, l) in &prev_ext_new {
             new_meta.push((a, format::EXTENT_TREE_OBJECTID, l));
         }
+        for &(a, l) in &prev_bgt_new {
+            new_meta.push((a, format::BLOCK_GROUP_TREE_OBJECTID, l));
+        }
 
         let mut freed_meta: Vec<(u64, u8)> = fs_freed.clone();
         freed_meta.extend(root_old.iter().copied());
@@ -4619,6 +4644,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
         }
         freed_meta.extend(fst_old.iter().copied());
         freed_meta.extend(prev_ext_freed.iter().copied());
+        freed_meta.extend(prev_bgt_freed.iter().copied());
 
         // Free-space tree: mark every new block used, return every freed block.
         let (fst_final, fst_groups) = match &fst_base {
@@ -4659,10 +4685,34 @@ async fn commit_txn<B: BlockDevice + 'static>(
             gen,
             nodesize as i64,
         )?;
+        // `update_block_group_item` writes to `btrfs_block_group_root()`: on a
+        // block-group-tree filesystem the BLOCK_GROUP_ITEM rewrites go to tree
+        // 11, never into the extent tree.
+        let (ext_edits, bg_edits) = split_block_group_edits(ext_edits, bg_home);
         let ext_out = PathCow::new(vol, gen, old_ext, old_ext_level)
             .await?
             .apply(&mut alloc, &ext_edits)
             .await?;
+        let bgt_out = match bg_home {
+            BgHome::BlockGroupTree { root, level } => Some(
+                PathCow::new(vol, gen, root, level)
+                    .await?
+                    .apply(&mut alloc, &bg_edits)
+                    .await?,
+            ),
+            BgHome::ExtentTree => None,
+        };
+        let mut cur_bgt_new: Vec<(u64, u8)> = bgt_out
+            .as_ref()
+            .map(|out| out.nodes.iter().map(|&(a, _, l)| (a, l)).collect())
+            .unwrap_or_default();
+        let mut cur_bgt_freed = bgt_out
+            .as_ref()
+            .map(|out| out.freed.clone())
+            .unwrap_or_default();
+        cur_bgt_new.sort_unstable();
+        cur_bgt_freed.sort_unstable();
+        let cur_bgt_root = bgt_out.as_ref().map_or(0, |out| out.root_addr);
 
         let mut cur_ext_new: Vec<(u64, u8)> =
             ext_out.nodes.iter().map(|&(a, _, l)| (a, l)).collect();
@@ -4675,9 +4725,16 @@ async fn commit_txn<B: BlockDevice + 'static>(
         let mut p_freed = prev_ext_freed.clone();
         p_new.sort_unstable();
         p_freed.sort_unstable();
+        let mut pb_new = prev_bgt_new.clone();
+        let mut pb_freed = prev_bgt_freed.clone();
+        pb_new.sort_unstable();
+        pb_freed.sort_unstable();
         let converged = cur_ext_new == p_new
             && cur_ext_freed == p_freed
             && ext_out.root_addr == prev_ext_root
+            && cur_bgt_new == pb_new
+            && cur_bgt_freed == pb_freed
+            && cur_bgt_root == prev_bgt_root
             && fst_lv == fst_leaves;
         if converged {
             let csum_root = csum_out
@@ -4695,12 +4752,16 @@ async fn commit_txn<B: BlockDevice + 'static>(
                 ext_nodes: ext_out.nodes,
                 ext_root: ext_out.root_addr,
                 ext_level: ext_out.root_level,
+                bgt: bgt_out,
             });
             break;
         }
         prev_ext_new = cur_ext_new;
         prev_ext_freed = cur_ext_freed;
         prev_ext_root = ext_out.root_addr;
+        prev_bgt_new = cur_bgt_new;
+        prev_bgt_freed = cur_bgt_freed;
+        prev_bgt_root = cur_bgt_root;
         fst_leaves = fst_lv;
     }
     let Done {
@@ -4715,6 +4776,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
         ext_nodes,
         ext_root,
         ext_level,
+        bgt,
     } = done.ok_or(FsError::NoSpace)?;
 
     // ── Root tree: repoint each COWed tree's ROOT_ITEM, then pack it. ───
@@ -4737,6 +4799,21 @@ async fn commit_txn<B: BlockDevice + 'static>(
     if fst_final.is_some() {
         root_updates.push((format::FREE_SPACE_TREE_OBJECTID, fst_root.0, fst_root.1));
     }
+    // The block-group tree's ROOT_ITEM moves only when its path COW produced
+    // blocks (an all-zero `used` delta leaves it untouched, as Linux's dirty
+    // tracking would).
+    let bgt_root = match &bgt {
+        Some(out) if !out.nodes.is_empty() => {
+            root_updates.push((
+                format::BLOCK_GROUP_TREE_OBJECTID,
+                out.root_addr,
+                out.root_level,
+            ));
+            Some(out.root_addr)
+        }
+        Some(out) => Some(out.root_addr),
+        None => None,
+    };
     for &(owner, new, lvl) in &root_updates {
         let slot = leaf_find_by_type(&root_logical, owner, format::ROOT_ITEM_KEY)?
             .ok_or(FsError::NotFound)?;
@@ -4770,6 +4847,10 @@ async fn commit_txn<B: BlockDevice + 'static>(
         stamp_node(&mut buf, addr, gen, vol.csum_type())?;
         nodes.push((addr, buf));
     }
+    for (addr, mut buf, _lvl) in bgt.map(|out| out.nodes).unwrap_or_default() {
+        stamp_node(&mut buf, addr, gen, vol.csum_type())?;
+        nodes.push((addr, buf));
+    }
     nodes.extend(pack_tree_at(vol, &root_logical, &root_groups, &root_addrs, gen)?.0);
     if let (Some(f), Some(g)) = (&fst_final, &fst_groups) {
         nodes.extend(pack_tree_at(vol, f, g, &fst_addrs, gen)?.0);
@@ -4798,7 +4879,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
         return Err(FsError::Unsupported);
     }
 
-    let bytes_used = total_block_group_used(vol, ext_root).await?;
+    let bytes_used = total_block_group_used(vol, bgt_root.unwrap_or(ext_root)).await?;
 
     let mut raw = vol.read_raw_superblock().await?;
     raw[72..80].copy_from_slice(&gen.to_le_bytes());
@@ -7995,6 +8076,16 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     let (ext_base0, ext_old) = read_fs_oversized(vol, old_ext).await?;
     let (mut root_logical, root_old) = read_fs_oversized(vol, root_tree).await?;
     let (fst_base0, fst_old) = read_fs_oversized(vol, old_fst).await?;
+    // Block-group tree (objectid 11), when present, holds the block group
+    // items this grow inserts/updates (`insert_block_group_item` writes to
+    // `btrfs_block_group_root()`); it is COWed with the other trees.
+    let (bgt_base0, bgt_old) = match block_group::bg_home(vol, root_tree).await? {
+        BgHome::BlockGroupTree { root, .. } => {
+            let (logical, old) = read_fs_oversized(vol, root).await?;
+            (Some(logical), old)
+        }
+        BgHome::ExtentTree => (None, Vec::new()),
+    };
 
     // ── Locate logical high-water and per-type chunk templates ─────────
     let mut logical_hw = 0u64;
@@ -8349,29 +8440,39 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     // ── Extent/free-space bases: create each logical block group ───────
     let mut ext_base = ext_base0;
     let mut fst_base = fst_base0;
-    for relocation in &relocations {
-        let key = BtrfsKey::new(
-            relocation.old.logical,
-            format::BLOCK_GROUP_ITEM_KEY,
-            relocation.old.length,
-        );
-        let slot = leaf_find(&ext_base, &key)?.ok_or(FsError::NotFound)?;
-        let mut body = leaf_item_data(&ext_base, slot)?.to_vec();
-        if body.len() < 24 {
-            return Err(FsError::InvalidData);
+    let mut bgt_base = bgt_base0;
+    {
+        // Block group items live in the block-group tree when there is one.
+        let bg_leaf: &mut Vec<u8> = match bgt_base.as_mut() {
+            Some(leaf) => leaf,
+            None => &mut ext_base,
+        };
+        for relocation in &relocations {
+            let key = BtrfsKey::new(
+                relocation.old.logical,
+                format::BLOCK_GROUP_ITEM_KEY,
+                relocation.old.length,
+            );
+            let slot = leaf_find(bg_leaf, &key)?.ok_or(FsError::NotFound)?;
+            let mut body = leaf_item_data(bg_leaf, slot)?.to_vec();
+            if body.len() < 24 {
+                return Err(FsError::InvalidData);
+            }
+            body[16..24].copy_from_slice(&relocation.new.flags.to_le_bytes());
+            leaf_replace_inplace(bg_leaf, slot, &body)?;
         }
-        body[16..24].copy_from_slice(&relocation.new.flags.to_le_bytes());
-        leaf_replace_inplace(&mut ext_base, slot, &body)?;
+        for chunk in &chunks {
+            let mut bg = alloc::vec![0u8; 24];
+            bg[8..16].copy_from_slice(&format::FIRST_CHUNK_TREE_OBJECTID.to_le_bytes());
+            bg[16..24].copy_from_slice(&chunk.flags.to_le_bytes());
+            leaf_insert_sorted(
+                bg_leaf,
+                &BtrfsKey::new(chunk.logical, format::BLOCK_GROUP_ITEM_KEY, chunk.length),
+                &bg,
+            )?;
+        }
     }
     for chunk in &chunks {
-        let mut bg = alloc::vec![0u8; 24];
-        bg[8..16].copy_from_slice(&format::FIRST_CHUNK_TREE_OBJECTID.to_le_bytes());
-        bg[16..24].copy_from_slice(&chunk.flags.to_le_bytes());
-        leaf_insert_sorted(
-            &mut ext_base,
-            &BtrfsKey::new(chunk.logical, format::BLOCK_GROUP_ITEM_KEY, chunk.length),
-            &bg,
-        )?;
         let mut info = alloc::vec![0u8; 8];
         info[0..4].copy_from_slice(&1u32.to_le_bytes());
         leaf_insert_sorted(
@@ -8385,9 +8486,19 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     let chunk_groups = group_items(vol, &chunk_logical)?;
     let dev_groups = group_items(vol, &dev_logical)?;
     let root_groups = group_items(vol, &root_logical)?;
+    // The block-group tree's content is settled too: `used` updates below
+    // rewrite fixed-size bodies in place and never change its leaf count.
+    let bgt_groups = match &bgt_base {
+        Some(leaf) => group_items(vol, leaf)?,
+        None => Vec::new(),
+    };
     let chunk_nc = tree_block_count(chunk_groups.len(), ns);
     let dev_nc = tree_block_count(dev_groups.len(), ns);
     let root_nc = tree_block_count(root_groups.len(), ns);
+    let bgt_nc = match bgt_base {
+        Some(_) => tree_block_count(bgt_groups.len(), ns),
+        None => 0,
+    };
 
     // Every old block across every COWed tree is returned to free space.
     let mut freed_meta: Vec<(u64, u8)> = chunk_old;
@@ -8395,6 +8506,7 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     freed_meta.extend(ext_old);
     freed_meta.extend(root_old);
     freed_meta.extend(fst_old);
+    freed_meta.extend(bgt_old);
 
     // ── Fixed point over the extent/free-space leaf counts ─────────────
     // Chunk-tree blocks come from the system arena; dev/ext/root/free-space from
@@ -8407,6 +8519,7 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
         ext_addrs: Vec<u64>,
         root_addrs: Vec<u64>,
         fst_addrs: Vec<u64>,
+        bgt_addrs: Vec<u64>,
         new_meta: Vec<(u64, u64, u8)>,
         ext_final: Vec<u8>,
         ext_groups: Vec<(usize, usize)>,
@@ -8435,9 +8548,13 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
             fst_leaves + usize::from(fst_leaves > 1),
             nodesize,
         )?;
+        let bgt_addrs = take_nodes(&mut nc, new_limit, bgt_nc, nodesize)?;
         // The metadata group's used prefix is every non-chunk-tree block.
-        let newbg_used = (dev_addrs.len() + ext_addrs.len() + root_addrs.len() + fst_addrs.len())
-            as u64
+        let newbg_used = (dev_addrs.len()
+            + ext_addrs.len()
+            + root_addrs.len()
+            + fst_addrs.len()
+            + bgt_addrs.len()) as u64
             * nodesize;
 
         let mut new_meta: Vec<(u64, u64, u8)> = Vec::new();
@@ -8476,6 +8593,15 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
             format::FREE_SPACE_TREE_OBJECTID,
             &mut new_meta,
         );
+        if bgt_base.is_some() {
+            collect_tree_meta(
+                &bgt_addrs,
+                bgt_groups.len(),
+                ns,
+                format::BLOCK_GROUP_TREE_OBJECTID,
+                &mut new_meta,
+            );
+        }
 
         // Extent tree with this iteration's metadata items.
         let mut ext_final = ext_base.clone();
@@ -8518,7 +8644,8 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
             )?;
         }
         for &(blk, _) in &freed_meta {
-            let (s, l) = block_group_of(&ext_final, blk)?.ok_or(FsError::InvalidData)?;
+            let bg_leaf = bgt_base.as_deref().unwrap_or(&ext_final);
+            let (s, l) = block_group_of(bg_leaf, blk)?.ok_or(FsError::InvalidData)?;
             fst_mark_free(&mut fst_final, vol.sectorsize() as u64, s, l, blk, nodesize)?;
         }
         if !added_system_chunk {
@@ -8542,6 +8669,7 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
                 ext_addrs,
                 root_addrs,
                 fst_addrs,
+                bgt_addrs,
                 new_meta,
                 ext_final,
                 ext_groups,
@@ -8559,6 +8687,7 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
         ext_addrs,
         root_addrs,
         fst_addrs,
+        bgt_addrs,
         new_meta,
         mut ext_final,
         ext_groups,
@@ -8567,11 +8696,18 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     } = grown.ok_or(FsError::NoSpace)?;
 
     // ── Block-group `used`: charge each new block, uncharge each freed one ──
-    for &(addr, _, _) in &new_meta {
-        block_group_add_used(&mut ext_final, addr, nodesize as i64)?;
-    }
-    for &(blk, _) in &freed_meta {
-        block_group_add_used(&mut ext_final, blk, -(nodesize as i64))?;
+    let mut bgt_final = bgt_base;
+    {
+        let bg_leaf: &mut Vec<u8> = match bgt_final.as_mut() {
+            Some(leaf) => leaf,
+            None => &mut ext_final,
+        };
+        for &(addr, _, _) in &new_meta {
+            block_group_add_used(bg_leaf, addr, nodesize as i64)?;
+        }
+        for &(blk, _) in &freed_meta {
+            block_group_add_used(bg_leaf, blk, -(nodesize as i64))?;
+        }
     }
 
     // ── Root tree: repoint the device/extent/free-space ROOT_ITEMs ─────
@@ -8580,11 +8716,18 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     let (ext_root_addr, ext_lvl) = tree_root_addr(&ext_addrs, ext_groups.len(), ns);
     let (root_root_addr, _) = tree_root_addr(&root_addrs, root_groups.len(), ns);
     let (fst_root_addr, fst_lvl) = tree_root_addr(&fst_addrs, fst_groups.len(), ns);
-    for (owner, new, lvl) in [
+    let bgt_root = bgt_final
+        .as_ref()
+        .map(|_| tree_root_addr(&bgt_addrs, bgt_groups.len(), ns));
+    let mut grown_roots = alloc::vec![
         (format::DEV_TREE_OBJECTID, dev_root_addr, dev_lvl),
         (format::EXTENT_TREE_OBJECTID, ext_root_addr, ext_lvl),
         (format::FREE_SPACE_TREE_OBJECTID, fst_root_addr, fst_lvl),
-    ] {
+    ];
+    if let Some((addr, lvl)) = bgt_root {
+        grown_roots.push((format::BLOCK_GROUP_TREE_OBJECTID, addr, lvl));
+    }
+    for (owner, new, lvl) in grown_roots {
         let slot = leaf_find_by_type(&root_logical, owner, format::ROOT_ITEM_KEY)?
             .ok_or(FsError::NotFound)?;
         let mut ri = leaf_item_data(&root_logical, slot)?.to_vec();
@@ -8604,6 +8747,9 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     nodes.extend(pack_tree_at(vol, &ext_final, &ext_groups, &ext_addrs, gen)?.0);
     nodes.extend(pack_tree_at(vol, &root_logical, &root_groups, &root_addrs, gen)?.0);
     nodes.extend(pack_tree_at(vol, &fst_final, &fst_groups, &fst_addrs, gen)?.0);
+    if let Some(leaf) = &bgt_final {
+        nodes.extend(pack_tree_at(vol, leaf, &bgt_groups, &bgt_addrs, gen)?.0);
+    }
 
     for chunk in &chunks {
         vol.add_chunk_item_mapping(chunk.logical, &chunk.item)?;
@@ -8612,7 +8758,8 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
         vol.write_logical(*addr, buf).await?;
     }
 
-    let bytes_used = total_block_group_used(vol, ext_root_addr).await?;
+    let bytes_used =
+        total_block_group_used(vol, bgt_root.map_or(ext_root_addr, |(addr, _)| addr)).await?;
     let mut raw = vol.read_raw_superblock().await?;
     raw[72..80].copy_from_slice(&gen.to_le_bytes()); // generation
     raw[80..88].copy_from_slice(&root_root_addr.to_le_bytes()); // root

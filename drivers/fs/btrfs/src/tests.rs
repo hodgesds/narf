@@ -10701,7 +10701,7 @@ fn smoke_btrfs_block_group_tree_read() -> TestResult {
         Some(Ok(crate::allocator::Allocator::Reclaim { ranges })) => {
             if ranges
                 .iter()
-                .any(|&(r, _)| sys.iter().any(|&(s, l)| r >= s && r < s + l))
+                .any(|&(r, _, _)| sys.iter().any(|&(s, l)| r >= s && r < s + l))
             {
                 return TestResult::Fail("allocator offered system block group space");
             }
@@ -10712,3 +10712,196 @@ fn smoke_btrfs_block_group_tree_read() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_block_group_tree_read);
+
+/// Block-group-tree writes, as Linux `update_block_group_item` /
+/// `insert_block_group_item` do them: allocation and free update `used` in tree
+/// 11, a chunk allocation inserts its new DATA and METADATA block groups there,
+/// tree 11 is COWed with METADATA_ITEMs owned by root 11, its ROOT_ITEM moves,
+/// the extent tree never gains a block group item, `bytes_used` stays the sum,
+/// and the result remounts (mount re-validates every block group).
+fn smoke_btrfs_block_group_tree_write() -> TestResult {
+    use alloc::format;
+    use narf_filesystem::FsInstance;
+
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("block-group-tree fixture refused a read-write mount"),
+    };
+    if !vol.supports_writes() {
+        return TestResult::Fail("block-group-tree mount is not writable");
+    }
+    let bg_state = |vol: &BtrfsVolume<narf_block::SyncBlock>| {
+        let root_tree = vol.root_tree_root().0;
+        let (bgt, bgt_level) = match poll_once(crate::roots::find_root(
+            vol,
+            root_tree,
+            format::BLOCK_GROUP_TREE_OBJECTID,
+        )) {
+            Some(Ok(r)) => r,
+            _ => return Err("tree 11 root missing"),
+        };
+        let ext = match poll_once(crate::roots::find_root(
+            vol,
+            root_tree,
+            format::EXTENT_TREE_OBJECTID,
+        )) {
+            Some(Ok((r, _))) => r,
+            _ => return Err("extent root missing"),
+        };
+        let bgs = match poll_once(crate::block_group::read_block_groups(vol, bgt)) {
+            Some(Ok(b)) => b,
+            _ => return Err("tree 11 unreadable"),
+        };
+        match poll_once(crate::block_group::read_block_groups(vol, ext)) {
+            Some(Ok(e)) if e.is_empty() => {}
+            _ => return Err("extent tree gained a block group item"),
+        }
+        // The tree-11 root block is accounted to root 11 in the extent tree.
+        match poll_once(btree::find_item(
+            vol,
+            ext,
+            &BtrfsKey::new(bgt, format::METADATA_ITEM_KEY, u64::from(bgt_level)),
+        )) {
+            Some(Ok(Some(body))) if body.len() >= 24 + 9 => {
+                let ref_type = body[24];
+                let ref_root = format::le64(&body, 25).unwrap_or(0);
+                if ref_type != 176 || ref_root != format::BLOCK_GROUP_TREE_OBJECTID {
+                    return Err("tree 11 block not owned by root 11");
+                }
+            }
+            _ => return Err("tree 11 root block has no METADATA_ITEM"),
+        }
+        let used: u64 = bgs
+            .iter()
+            .map(|(_, _, b)| format::le64(b, 0).unwrap_or(0))
+            .sum();
+        // The durable superblock (every caller syncs first).
+        if used != super_bytes_used(&dev) {
+            return Err("bytes_used != sum of tree-11 block group used");
+        }
+        for &(start, len, _) in &bgs {
+            if vol.logical_chunk_remaining(start) != Ok(len) {
+                return Err("a tree-11 block group does not match its chunk");
+            }
+        }
+        Ok((bgt, bgs))
+    };
+    let (bgt0, bgs0) = match bg_state(&vol) {
+        Ok(s) => s,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let data_used = |bgs: &[(u64, u64, Vec<u8>)]| -> u64 {
+        bgs.iter()
+            .filter(|(_, _, b)| format::le64(b, 16).unwrap_or(0) & format::BLOCK_GROUP_DATA != 0)
+            .map(|(_, _, b)| format::le64(b, 0).unwrap_or(0))
+            .sum()
+    };
+    let count = |bgs: &[(u64, u64, Vec<u8>)], kind: u64| {
+        bgs.iter()
+            .filter(|(_, _, b)| format::le64(b, 16).unwrap_or(0) & kind != 0)
+            .count()
+    };
+
+    // 12 MiB of incompressible-ish data overflows the 8 MiB data block group,
+    // forcing a chunk allocation (one new DATA + one new METADATA group).
+    const MIB: usize = 1 << 20;
+    let file = match poll_once(vol.root().create("bgt-big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create on block-group-tree fs failed"),
+    };
+    let mut chunk = alloc::vec![0u8; MIB];
+    for i in 0..12usize {
+        let mut x = (i as u32).wrapping_mul(2_654_435_761) | 1;
+        for b in chunk.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x as u8;
+        }
+        match poll_once(file.write((i * MIB) as u64, &chunk)) {
+            Some(Ok(n)) if n == MIB => {}
+            Some(Err(FsError::NoSpace)) => return TestResult::Fail("12 MiB write hit NoSpace"),
+            _ => return TestResult::Fail("12 MiB write on block-group-tree fs failed"),
+        }
+    }
+    // A write into a non-default subvolume commits through the same trees.
+    if poll_once(vol.sync_to_disk()).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("sync after big write failed");
+    }
+    let (bgt1, bgs1) = match bg_state(&vol) {
+        Ok(s) => s,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if bgt1 == bgt0 {
+        return TestResult::Fail("tree 11 was not COWed by the write");
+    }
+    if count(&bgs1, format::BLOCK_GROUP_DATA) <= count(&bgs0, format::BLOCK_GROUP_DATA)
+        || count(&bgs1, format::BLOCK_GROUP_METADATA) <= count(&bgs0, format::BLOCK_GROUP_METADATA)
+    {
+        return TestResult::Fail("chunk allocation did not add DATA + METADATA groups to tree 11");
+    }
+    let used_after_write = data_used(&bgs1);
+    if used_after_write < data_used(&bgs0) + 12 * MIB as u64 / 2 {
+        return TestResult::Fail("data block group used did not grow with the write");
+    }
+
+    // Free: unlinking the file returns its extents; tree 11's `used` drops.
+    if poll_once(vol.root().unlink("bgt-big.dat")).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("unlink on block-group-tree fs failed");
+    }
+    for i in 0..4 {
+        if !matches!(
+            poll_once(vol.root().create(&format!("bgt-small-{i}.txt"))),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("create after free failed");
+        }
+    }
+    if poll_once(vol.sync_to_disk()).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("sync after unlink failed");
+    }
+    let (_, bgs2) = match bg_state(&vol) {
+        Ok(s) => s,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if data_used(&bgs2) >= used_after_write {
+        return TestResult::Fail("freeing data did not lower tree-11 used");
+    }
+    drop(file);
+    drop(vol);
+
+    // Remount (re-validates every block group against its chunk) and write
+    // into the `@home` subvolume.
+    let vol2 = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("block-group-tree fs did not remount after writes"),
+    };
+    if !dir_names(&vol2.root())
+        .iter()
+        .any(|n| n == "bgt-small-3.txt")
+    {
+        return TestResult::Fail("post-free file lost across remount");
+    }
+    if poll_once(vol2.switch_to_subvol(&crate::volume::Subvol::Name("@home".into())))
+        .is_none_or(|r| r.is_err())
+    {
+        return TestResult::Fail("subvol=@home did not resolve after writes");
+    }
+    let f = match poll_once(vol2.root().create("from-narf.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create in @home failed"),
+    };
+    if !matches!(poll_once(f.write(0, b"narf\n")), Some(Ok(5))) {
+        return TestResult::Fail("write in @home failed");
+    }
+    if poll_once(vol2.sync_to_disk()).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("sync in @home failed");
+    }
+    match bg_state(&vol2) {
+        Ok(_) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_block_group_tree_write);
