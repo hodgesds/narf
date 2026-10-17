@@ -1076,6 +1076,9 @@ fn navi22_takeover_odm_dsc_and_watermarks_like_dcn30_init_hw() -> TestResult {
     bench.set(d2(0x1b36 + 0x80), 1100 | 20 << 16);
     bench.set(d2(0x3000), 1);
     bench.set(d2(0x1a64), 1 | 1 << 4);
+    // DIG backend 3 lit in HDMI mode from frontend 1, so power_down runs.
+    bench.set(d2(0x20b1 + 0x300), 1);
+    bench.set(d2(0x20b0 + 0x300), 3 << 16 | 1 << 9);
     // HUBBUB watermark set A as VBIOS left it.
     for (reg, value) in [
         (0x509, 0x101),
