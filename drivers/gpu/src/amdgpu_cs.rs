@@ -362,6 +362,41 @@ fn submitter(card: u32) -> Option<Arc<dyn Submitter>> {
         .map(|(_, s)| s.clone())
 }
 
+/// Memory a running job may still reach, freed once its card's engine
+/// completes `seq`.
+type Held = Box<dyn core::any::Any + Send + Sync>;
+static DEFERRED: IrqSafeSpinLock<Vec<(u32, u64, Held)>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Keep `held` until DRM card `card`'s engine completes job `seq`.
+pub fn defer_until(card: u32, seq: u64, held: Held) {
+    DEFERRED.lock().push((card, seq, held));
+}
+
+/// Free what card `card` deferred for jobs `done` reports complete. A card's
+/// submitter calls this whenever it learns its engine's progress.
+pub fn retire(card: u32, done: &dyn Fn(u64) -> bool) {
+    let freed: Vec<Held> = {
+        let mut deferred = DEFERRED.lock();
+        let mut freed = Vec::new();
+        let mut i = 0;
+        while i < deferred.len() {
+            if deferred[i].0 == card && done(deferred[i].1) {
+                freed.push(deferred.swap_remove(i).2);
+            } else {
+                i += 1;
+            }
+        }
+        freed
+    };
+    // Dropped outside the lock: freeing memory can be slow.
+    drop(freed);
+}
+
+/// How many deferred frees card `card` has outstanding.
+pub fn deferred(card: u32) -> usize {
+    DEFERRED.lock().iter().filter(|d| d.0 == card).count()
+}
+
 /// Whether `cmd` is `AMDGPU_CS` or `AMDGPU_WAIT_CS`, which may park.
 pub fn is_async_ioctl(cmd: u32) -> bool {
     let nr = drm_uapi::ioc_nr(cmd);

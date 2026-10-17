@@ -532,6 +532,20 @@ pub struct VmState {
     root: IrqSafeSpinLock<Option<Node>>,
     /// Tables allocated, bounded by [`MAX_TABLES`].
     tables: IrqSafeSpinLock<u64>,
+    /// The DRM card whose engine runs this space's jobs.
+    card: Option<u32>,
+    /// The last job submitted in this space (0: none). Memory the GPU may
+    /// still reach is held until the card's engine completes it.
+    last_job: core::sync::atomic::AtomicU64,
+}
+
+impl Drop for VmState {
+    /// A closing file's tables and buffers wait out its last job too.
+    fn drop(&mut self) {
+        let root = self.root.lock().take();
+        let mappings = self.mappings.lock().take();
+        self.release((root, mappings));
+    }
 }
 
 impl Default for VmState {
@@ -551,16 +565,43 @@ impl VmState {
     pub fn for_card(index: u32) -> Self {
         let family = crate::drm_registry::pci_id(index)
             .and_then(|(vid, did)| crate::amdgpu::family_for_pci_id(vid, did));
-        Self::with_geometry(Geometry::for_family(family))
+        Self::build(Geometry::for_family(family), Some(index))
+    }
+
+    /// Record that job `seq` was submitted in this space: from now on,
+    /// buffers and page tables it drops wait for the card's engine to
+    /// complete `seq` (or a later job) before they are freed.
+    pub fn note_job(&self, seq: u64) {
+        self.last_job
+            .store(seq, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Free `item` now, or — when a job ran in this space — once the card's
+    /// engine has completed the last one (`amdgpu_cs::defer_until`), as
+    /// Linux frees page tables and BOs only after the VM's fences.
+    fn release<T: Send + Sync + 'static>(&self, item: T) {
+        let seq = self.last_job.load(core::sync::atomic::Ordering::Acquire);
+        match self.card {
+            Some(card) if seq != 0 => {
+                crate::amdgpu_cs::defer_until(card, seq, alloc::boxed::Box::new(item))
+            }
+            _ => drop(item),
+        }
     }
 
     /// An address space laid out and encoded as `geometry`'s generation.
     pub const fn with_geometry(geometry: Geometry) -> Self {
+        Self::build(geometry, None)
+    }
+
+    const fn build(geometry: Geometry, card: Option<u32>) -> Self {
         VmState {
             geometry,
             mappings: IrqSafeSpinLock::new(None),
             root: IrqSafeSpinLock::new(None),
             tables: IrqSafeSpinLock::new(0),
+            card,
+            last_job: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -610,16 +651,22 @@ impl VmState {
         object: alloc::sync::Arc<crate::amdgpu_gem::GemObject>,
         replace: bool,
     ) -> Result<(), FsError> {
-        let mut g = self.mappings.lock();
-        let map = g.get_or_insert_with(BTreeMap::new);
-        if replace {
-            Self::clear_range(map, mapping.va, mapping.size);
-        } else if Self::overlaps(map, mapping.va, mapping.size) {
-            // `amdgpu_vm_bo_map` returns -EINVAL for an overlap; REPLACE is
-            // the op that asks for one to be dropped.
-            return Err(FsError::InvalidData);
-        }
-        map.insert(mapping.va, Entry { mapping, object });
+        let removed = {
+            let mut g = self.mappings.lock();
+            let map = g.get_or_insert_with(BTreeMap::new);
+            let removed = if replace {
+                Self::clear_range(map, mapping.va, mapping.size)
+            } else if Self::overlaps(map, mapping.va, mapping.size) {
+                // `amdgpu_vm_bo_map` returns -EINVAL for an overlap; REPLACE is
+                // the op that asks for one to be dropped.
+                return Err(FsError::InvalidData);
+            } else {
+                Vec::new()
+            };
+            map.insert(mapping.va, Entry { mapping, object });
+            removed
+        };
+        self.release(removed);
         Ok(())
     }
 
@@ -628,8 +675,14 @@ impl VmState {
     /// the remainder, its offset advanced for the right-hand piece, so the
     /// record still covers every entry left in the tables (the caller
     /// clears exactly the requested range's entries) and keeps its buffer.
-    fn clear_range(map: &mut BTreeMap<u64, Entry>, va: u64, size: u64) {
+    /// Returns the removed records' buffers, for the caller to release.
+    fn clear_range(
+        map: &mut BTreeMap<u64, Entry>,
+        va: u64,
+        size: u64,
+    ) -> Vec<alloc::sync::Arc<crate::amdgpu_gem::GemObject>> {
         let end = va.saturating_add(size);
+        let mut removed = Vec::new();
         let doomed: Vec<u64> = map
             .iter()
             .filter(|(_, e)| e.mapping.va < end && va < e.mapping.va.saturating_add(e.mapping.size))
@@ -639,6 +692,7 @@ impl VmState {
             let Some(Entry { mapping: m, object }) = map.remove(&k) else {
                 continue;
             };
+            removed.push(object.clone());
             let m_end = m.va.saturating_add(m.size);
             if m.va < va {
                 let left = Mapping {
@@ -669,6 +723,7 @@ impl VmState {
                 );
             }
         }
+        removed
     }
 
     fn unmap(&self, va: u64, size: u64) -> Result<(), FsError> {
@@ -676,20 +731,23 @@ impl VmState {
         let map = g.get_or_insert_with(BTreeMap::new);
         // UNMAP names an existing mapping exactly; Linux answers -ENOENT when
         // no mapping starts there.
-        match map.get(&va).map(|e| e.mapping) {
-            Some(m) if m.size == size => {
-                map.remove(&va);
-                Ok(())
-            }
-            Some(_) => Err(FsError::InvalidData),
-            None => Err(FsError::NotFound),
-        }
+        let removed = match map.get(&va).map(|e| e.mapping) {
+            Some(m) if m.size == size => map.remove(&va),
+            Some(_) => return Err(FsError::InvalidData),
+            None => return Err(FsError::NotFound),
+        };
+        drop(g);
+        self.release(removed);
+        Ok(())
     }
 
     fn clear(&self, va: u64, size: u64) -> Result<(), FsError> {
-        let mut g = self.mappings.lock();
-        let map = g.get_or_insert_with(BTreeMap::new);
-        Self::clear_range(map, va, size);
+        let removed = {
+            let mut g = self.mappings.lock();
+            let map = g.get_or_insert_with(BTreeMap::new);
+            Self::clear_range(map, va, size)
+        };
+        self.release(removed);
         Ok(())
     }
 
@@ -1056,21 +1114,26 @@ impl VmState {
     fn dematerialise(&self, va: u64, size: u64) {
         let geometry = self.geometry;
         let pages = size / GPU_PAGE_SIZE;
-        let mut root_guard = self.root.lock();
-        let mut tables = self.tables.lock();
-        let Some(root) = root_guard.as_mut() else {
-            return;
-        };
-        let levels: Vec<Level> = geometry.levels().collect();
+        let mut freed = Vec::new();
+        {
+            let mut root_guard = self.root.lock();
+            let mut tables = self.tables.lock();
+            let Some(root) = root_guard.as_mut() else {
+                return;
+            };
+            let levels: Vec<Level> = geometry.levels().collect();
 
-        for page in 0..pages {
-            let va = va + page * GPU_PAGE_SIZE;
-            Self::clear_one(&geometry, root, &levels, 0, va, &mut tables);
+            for page in 0..pages {
+                let va = va + page * GPU_PAGE_SIZE;
+                Self::clear_one(&geometry, root, &levels, 0, va, &mut tables, &mut freed);
+            }
+            if root.live == 0 {
+                *tables -= 1;
+                freed.extend(root_guard.take());
+            }
         }
-        if root.live == 0 {
-            *tables -= 1;
-            *root_guard = None;
-        }
+        // The tables a running job may still walk outlive it.
+        self.release(freed);
     }
 
     /// Clear one leaf and unwind, freeing any directory left empty. Recursive
@@ -1083,6 +1146,7 @@ impl VmState {
         depth: usize,
         va: u64,
         tables: &mut u64,
+        freed: &mut Vec<Node>,
     ) {
         let level = levels[depth];
         let index = geometry.index_at(va, level);
@@ -1101,7 +1165,7 @@ impl VmState {
             return;
         };
         let before = child.live;
-        Self::clear_one(geometry, child, levels, depth + 1, va, tables);
+        Self::clear_one(geometry, child, levels, depth + 1, va, tables, freed);
         if child.live == before {
             // Nothing changed below, so nothing to unwind.
             return;
@@ -1110,7 +1174,7 @@ impl VmState {
         if child.live == 0 {
             // SAFETY: `index` is masked to the table's entry count.
             unsafe { node.table.write(index, geometry.format.pde_pte()) };
-            node.children.remove(&index);
+            freed.extend(node.children.remove(&index));
             *tables -= 1;
         }
     }

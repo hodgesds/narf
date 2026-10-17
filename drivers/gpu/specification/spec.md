@@ -3539,8 +3539,11 @@ paths; only the tables differ.
   still point at. CLEAR and REPLACE split partly covered mappings
   (`amdgpu_vm_bo_clear_mappings`): the remainders keep their records,
   offsets and entries; only the covered range's entries are cleared.
-  Memory returns when the last reference goes — fences must gate that once
-  a submission path exists.
+  Once a job ran in an address space (`VmState::note_job`), what it drops —
+  removed records' buffers, emptied page tables, and the whole space when
+  its file closes — waits in the card's deferred list
+  (`amdgpu_cs::defer_until`) until the card's submitter reports that job
+  complete (`amdgpu_cs::retire`); before any job, frees are immediate.
 
 - Submission (`amdgpu_cs`): a card registers a `Submitter`
   (`register_submitter`); on such a card the `/dev/dri` ioctl route
@@ -3556,9 +3559,10 @@ after boot: one graphics IB per submission, run on client VMID 1 with the
 open's root page directory (`VmState::root_pde`, GMC 12 only), through
 `amdgpu_gfx12_queue::Queues::submit` — one 256-dword ring slot of VM flush
 (GFX hub, engine 0, PFP_SYNC_ME), IB and interrupting RELEASE_MEM fence;
-`Busy` when the 1024-dword ring is full. VMID reuse, IH PASID mapping and
-holding a job's buffers until its fence are not implemented, and
-`AMDGPU_INFO` still reports acceleration unavailable.
+`Busy` when the 1024-dword ring is full. Each job is noted on its address
+space and every fence read retires completed jobs' deferred frees. VMID
+reuse and IH PASID mapping are not implemented, and `AMDGPU_INFO` still
+reports acceleration unavailable.
 
 ### AMD platform VBIOS
 

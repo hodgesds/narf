@@ -212,7 +212,7 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     }
     // Clients' command submissions run on the graphics queue.
     if let Some(card) = boot::ColdBoot::drm_card() {
-        crate::amdgpu_cs::register_submitter(card, alloc::sync::Arc::new(Submitter));
+        crate::amdgpu_cs::register_submitter(card, alloc::sync::Arc::new(Submitter { card }));
     }
     // Clients' VRAM buffers; without it they fall back to system memory.
     {
@@ -236,13 +236,21 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
 /// submission, run in the open's address space on client VMID 1, whose
 /// context every job's VM flush points at that space's root first.
 ///
+/// Each job is recorded on its address space (`VmState::note_job`), so the
+/// buffers and page tables it may reach are freed only once the fence
+/// passes; every fence read retires what completed jobs held.
+///
 /// LINUX-GAP: VMID 1 for every client, always flushed — no per-client VMID
 /// reuse (amdgpu_vmid_grab) and no IH PASID mapping, so a fault is not yet
-/// attributed to its client. The buffers a job reaches are not held until
-/// its fence passes; a client that unmaps them mid-job can have their
-/// memory reused under the GPU. AMDGPU_INFO keeps reporting acceleration
+/// attributed to its client. AMDGPU_INFO keeps reporting acceleration
 /// unavailable, so Mesa does not submit here.
-struct Submitter;
+struct Submitter {
+    card: u32,
+}
+/// Whether 32-bit job `seq` is at or before `completed` (sequences wrap).
+fn job_done(completed: u32, seq: u64) -> bool {
+    completed.wrapping_sub(seq as u32) as i32 >= 0
+}
 const CLIENT_VMID: u8 = 1;
 impl crate::amdgpu_cs::Submitter for Submitter {
     fn submit<'a>(
@@ -279,8 +287,15 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
             // SAFETY: the platform serializes every queue user under OWNER;
             // the job's lifetime gap is documented above.
-            match unsafe { boot.submit_client_job(job) } {
-                Ok(seq) => Ok(u64::from(seq)),
+            let result = unsafe { boot.submit_client_job(job) };
+            if let Ok(completed) = boot.completed_client_job() {
+                crate::amdgpu_cs::retire(self.card, &|seq| job_done(completed, seq));
+            }
+            match result {
+                Ok(seq) => {
+                    vm.note_job(u64::from(seq));
+                    Ok(u64::from(seq))
+                }
                 Err(crate::amdgpu_gfx12_queue::Error::Busy) => Err(FsError::Busy),
                 Err(crate::amdgpu_gfx12_queue::Error::Invalid) => Err(FsError::InvalidData),
                 Err(_) => Err(FsError::NoDevice),
@@ -305,8 +320,8 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                     let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
                     boot.completed_client_job().map_err(|_| FsError::NoDevice)?
                 };
-                // Sequences wrap: done when `completed` is at or past `seq`.
-                if completed.wrapping_sub(seq) as i32 >= 0 {
+                crate::amdgpu_cs::retire(self.card, &|s| job_done(completed, s));
+                if job_done(completed, u64::from(seq)) {
                     return Ok(true);
                 }
                 if narf_time::monotonic_ns() >= deadline_ns {

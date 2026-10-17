@@ -196,9 +196,9 @@ impl GemObject {
 
 impl Drop for GemObject {
     fn drop(&mut self) {
-        // LINUX-GAP: memory returns as soon as the last reference (handle,
-        // CPU mapping or VA mapping) goes. With no submission path nothing
-        // the GPU executes can hold it; fences must gate this once one lands.
+        // Memory returns when the last reference (handle, CPU mapping or VA
+        // mapping) goes; an address space a job ran in holds its removed
+        // mappings' buffers until that job's fence (`VmState::note_job`).
         if let Backing::System(order) = self.backing {
             let frame = narf_memory::PhysFrame::containing(narf_memory::PhysAddr::new(self.phys));
             narf_memory::frame::free_pages(frame, order);
