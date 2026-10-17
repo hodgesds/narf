@@ -1,10 +1,11 @@
-//! ATOMBIOS bytecode VM — Stage-9 interpreter.
+//! ATOMBIOS bytecode VM.
 //!
 //! Companion to `amdgpu_atombios.rs`: that module locates a command
 //! table by index; this module *executes* the bytecode at that
-//! table. Together they cover the AMD `atom.c` surface that pre-DCN3
-//! parts (Renoir / Cezanne / Phoenix) lean on for display, encoder,
-//! PowerPlay-base, and i2c-bus init.
+//! table. Together they cover the AMD `atom.c` surface the driver
+//! needs: display/encoder/PLL tables, and `ASIC_Init` (the post that
+//! `amdgpu_device_asic_init` runs after a reset clears
+//! `ATOM_S7_ASIC_INIT_COMPLETE`).
 //!
 //! ## Reference: Linux `drivers/gpu/drm/amd/amdgpu/atom.{h,c}`
 //!
@@ -12,44 +13,56 @@
 //! a directly citable source. Every constant + dispatch layout
 //! below is cross-referenced against:
 //!
-//! - `atom.h` lines 65–113 — opcode count (127), EOT (91), argument
-//!   classes (REG/PS/WS/FB/ID/IMM/PLL/MC), source alignment (DWORD /
-//!   WORD0/8/16 / BYTE0/8/16/24), WS pseudo-register IDs.
-//! - `atom.c` lines 77–93 — `atom_arg_mask` / `atom_arg_shift` /
-//!   `atom_dst_to_src` / `atom_def_dst` lookup tables.
-//! - `atom.c` lines 182–406 — `atom_get_src_int` / `atom_skip_src_int`.
-//! - `atom.c` lines 439–597 — `atom_get_dst` / `atom_put_dst`.
-//! - `atom.c` lines 599–1085 — per-opcode handlers.
-//! - `atom.c` lines 1087–1219 — the `opcode_table[ATOM_OP_CNT]`
-//!   dispatch table.
-//! - `atom.c` lines 1221–1310 — `amdgpu_atom_execute_table_locked`
-//!   driver loop.
+//! - `atom.h` — opcode count (127), EOT (91), argument classes
+//!   (REG/PS/WS/FB/ID/IMM/PLL/MC), source alignment, WS pseudo-register
+//!   IDs, the `ATOM_IIO_*` indirect-I/O opcodes and `ATOM_IO_*` modes.
+//! - `atom.c` — `atom_arg_mask` / `atom_arg_shift` / `atom_dst_to_src` /
+//!   `atom_def_dst`, `atom_iio_execute`, `atom_get_src_int` /
+//!   `atom_skip_src_int`, `atom_get_dst` / `atom_put_dst`, the per-opcode
+//!   handlers, `opcode_table[ATOM_OP_CNT]`,
+//!   `amdgpu_atom_execute_table_locked`, `atom_index_iio`.
 //!
-//! ## Scope of this cut
+//! ## Execution model
 //!
-//! Implements the bytecode loop in pure Rust against caller-plugged
-//! MMIO / PLL / MC / I/O-port closures. Doesn't touch real silicon
-//! — the loader (`amdgpu_atombios.rs`) hands us a `&[u8]` and the
-//! caller binds register accessors. Smoke tests in
-//! `drivers/gpu/src/tests.rs` build a synthetic table and step it
-//! through the dispatcher.
+//! Linux recurses for CALLTABLE and sleeps inside DELAY. Here a
+//! [`Machine`] keeps an explicit frame stack and executes one opcode per
+//! [`Machine::step`]; DELAY surfaces as [`Step::Delay`] so an async caller
+//! can sleep cooperatively between opcodes, and a cancelled caller simply
+//! stops stepping. [`execute_table`] / [`execute_bytes`] are the synchronous
+//! drivers (DELAY goes to [`Hooks::delay_us`]).
 //!
-//! Opcodes that need register access are routed through the bound
-//! closures; if the caller leaves them as the default
-//! "fail-on-touch" stubs, the corresponding opcode returns
-//! `AtomError::RegisterAccessNotBound`. That keeps the VM honest
-//! on pure-data tests while still exercising the dispatcher.
+//! Register, PLL and MC accesses and table resolution go through
+//! [`Hooks`]. [`Closures`] is the boxed-closure implementation the display
+//! tables bind; a `Send` owner implements `Hooks` directly.
 //!
-//! `repeat`, `savereg`, `restorereg`, `mul32`, `div32` are decoded
-//! but treated as no-ops (matching Linux `atom_op_repeat` /
-//! `atom_op_savereg` / `atom_op_restorereg`, which `pr_info` then
-//! return). The `beep`, `postcard`, and `debug` opcodes are
-//! likewise no-ops on us (Linux just `printk`s).
+//! ## Fidelity notes
+//!
+//! - Sub-dword destinations keep the untouched bits of the destination's
+//!   raw value (`atom_get_dst(..., &saved)`), and SHL/SHR shift that raw
+//!   value, exactly as `atom.c`.
+//! - Conditions Linux only `pr_info`s and continues past (PS/WS/FB index
+//!   out of range, PCI/SYSIO register classes, an undefined or malformed
+//!   IIO program) behave as Linux does and are counted in
+//!   [`AtomState::anomalies`] with the first one kept, instead of failing
+//!   the table.
+//! - Conditions that mean the stream itself is misdecoded fail the table
+//!   (Linux would execute garbage or stop with success): a bad opcode,
+//!   operands or jump targets past the table, a bad SWITCH case, a
+//!   CALLTABLE chain deeper than [`ATOM_EXECUTE_MAX_DEPTH`].
+//! - The stuck-loop guard is `atom_op_jump`'s: the same jump target taken
+//!   for more than `ATOM_CMD_TIMEOUT_SEC` (20 s) aborts, measured by
+//!   [`Hooks::now_ms`]. Hooks without a clock fall back to 65 536 repeats
+//!   of one target and 1 000 000 opcodes per execution.
+//!
+//! `repeat`, `savereg`, `restorereg` are decoded but treated as no-ops
+//! (Linux `pr_info`s "unimplemented!"). `beep`, `postcard`, `debug` are
+//! likewise no-ops (Linux just `printk`s).
 
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
+use core::ops::{Deref, DerefMut};
 
 // ── Constants mirror `atom.h` ────────────────────────────────────
 
@@ -89,6 +102,26 @@ const WS_FB_WINDOW: u8 = 0x46;
 const WS_ATTRIBUTES: u8 = 0x47;
 const WS_REGPTR: u8 = 0x48;
 
+// Indirect-I/O program opcodes — `atom.h:99-108`.
+pub const ATOM_IIO_NOP: u8 = 0;
+pub const ATOM_IIO_START: u8 = 1;
+pub const ATOM_IIO_READ: u8 = 2;
+pub const ATOM_IIO_WRITE: u8 = 3;
+pub const ATOM_IIO_CLEAR: u8 = 4;
+pub const ATOM_IIO_SET: u8 = 5;
+pub const ATOM_IIO_MOVE_INDEX: u8 = 6;
+pub const ATOM_IIO_MOVE_ATTR: u8 = 7;
+pub const ATOM_IIO_MOVE_DATA: u8 = 8;
+pub const ATOM_IIO_END: u8 = 9;
+/// `atom_iio_len[]` (`atom.c`), indexed by IIO opcode.
+const IIO_LEN: [usize; 10] = [1, 2, 3, 3, 3, 3, 4, 4, 4, 3];
+/// `ATOM_DATA_IIO_PTR` (`atom.h:52`): the master data table's
+/// `indirectioaccess` entry (index 23).
+const DATA_IIO_PTR: usize = 0x32;
+/// Bound on one IIO program's opcodes. Linux's loop is unbounded; VBIOS
+/// programs are a handful of operations.
+const IIO_MAX_OPS: usize = 4096;
+
 // Jump conditions — `atom.c:42-48` `ATOM_COND_*`.
 const COND_ABOVE: u8 = 0;
 const COND_ABOVEOREQUAL: u8 = 1;
@@ -106,7 +139,6 @@ const UNIT_MILLISEC: u8 = 1;
 const IO_MM: u32 = 0;
 const IO_PCI: u32 = 1;
 const IO_SYSIO: u32 = 2;
-#[allow(dead_code)]
 const IO_IIO: u32 = 0x80;
 
 // Port classes for SETPORT — `atom.c:50-52`.
@@ -117,6 +149,12 @@ const PORT_SYSIO: u8 = 2;
 // SWITCH delimiter magic — `atom.h:68-69`.
 const CASE_MAGIC: u8 = 0x63;
 const CASE_END: u16 = 0x5A5A;
+
+/// `ATOM_CMD_TIMEOUT_SEC` (`atom.c`), in milliseconds.
+pub const ATOM_CMD_TIMEOUT_MS: u64 = 20_000;
+/// Clockless fallbacks for the stuck-loop guard.
+const STUCK_REPEATS: u32 = 65_535;
+const STEP_CAP: u64 = 1_000_000;
 
 /// Per `atom.c:77`. Mask applied after extracting an aligned
 /// sub-word from the raw 32-bit register/memory value.
@@ -159,55 +197,61 @@ const DEF_DST: [u8; 8] = [0, 0, 1, 2, 0, 1, 2, 3];
 pub enum AtomError {
     /// Ran past the end of the bytecode buffer without an EOT.
     BytecodeTruncated,
-    /// Opcode byte ≥ `ATOM_OP_CNT` or 0 (illegal in Linux too).
+    /// Opcode byte ≥ `ATOM_OP_CNT` or 0. Linux stops the table there and
+    /// reports success; a misdecoded stream fails here.
     BadOpcode(u8),
-    /// PS index exceeds caller-supplied params slice.
+    /// Retained for API compatibility; out-of-range PS reads/writes are
+    /// [`Anomaly::PsIndex`], as in Linux.
     PsIndexOutOfRange,
-    /// WS index exceeds the working-scratch length.
+    /// Retained for API compatibility; see [`Anomaly::WsIndex`].
     WsIndexOutOfRange,
-    /// FB read/write outside the scratch region.
+    /// Retained for API compatibility; see [`Anomaly::FbIndex`].
     FbIndexOutOfRange,
     /// JUMP target lies outside the table.
     BadJumpTarget,
     /// SWITCH found neither CASE_MAGIC nor CASE_END.
     BadSwitchCase,
-    /// Opcode wants a register/PLL/MC/PCI-port access but no
-    /// closure was bound; in tests this catches "we never hooked
-    /// MMIO up". Real driver wires real closures.
+    /// Retained for API compatibility; unbound closures read 0xCDCDCDCD.
     RegisterAccessNotBound,
     /// Argument class out of range (only 3 bits — should be
     /// impossible, but guards against a malformed table).
     BadArgClass,
-    /// Stuck-jump detector: 2^16 iterations without a forward
-    /// EOT. Matches the Linux 20-second wall-clock guard but
-    /// without a wall clock.
+    /// `atom_op_jump`'s stuck-loop abort (see the module notes).
     Stuck,
     /// CALLTABLE nested deeper than [`ATOM_EXECUTE_MAX_DEPTH`].
     CallTableTooDeep,
-    /// CALLTABLE / SETDATABLOCK reached but the caller's resolver
-    /// returned an empty table.
+    /// The top-level table, or a CALLTABLE target whose directory entry is
+    /// non-zero, could not be resolved.
     UnknownTable(u8),
 }
 
-// ── Closures ─────────────────────────────────────────────────────
+/// A condition Linux's interpreter logs and continues past.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Anomaly {
+    PsIndex(u8),
+    WsIndex(u8),
+    /// Byte offset `fb_base + 4 * idx` outside the FB scratch.
+    FbIndex(u32),
+    /// A REG operand while SETPORT selected PCI or SYSIO.
+    PortIo(u32),
+    /// SETPORT ATI selected an IIO port with no program (read or write
+    /// program index given).
+    UndefinedIio(u8),
+    /// An IIO program used an unknown opcode or ran off the image.
+    BadIio(u8),
+}
 
-/// MMIO / PLL / MC / I/O accessor. Tests plug in pure-Rust closures;
-/// the real driver routes to the AMDGPU register window. The VM is
-/// driven from a single thread under the caller's mutex (see
-/// `atom.c::amdgpu_atom_execute_table` which `mutex_lock`s
-/// `ctx->mutex`), so the closures are deliberately not `Send`.
-pub type RegRead = Box<dyn FnMut(u32) -> u32>;
-pub type RegWrite = Box<dyn FnMut(u32, u32)>;
+// ── Hooks ────────────────────────────────────────────────────────
 
 /// One resolved command table: the bytecode body with its
 /// `ATOM_COMMON_TABLE_HEADER` and prelude already stripped, plus the
 /// parameter-space size the table's own header declares.
 ///
 /// `ps_dwords` is `(CU8(base + ATOM_CT_PS_PTR) & ATOM_CT_PS_MASK) / 4` —
-/// `atom.c:1255`'s `ectx.ps_shift`. It is needed because CALLTABLE hands the
+/// `atom.c`'s `ectx.ps_shift`. It is needed because CALLTABLE hands the
 /// callee the parameter window *above* the caller's own: `ctx->ps +
-/// ctx->ps_shift` (`atom.c:650`). Resolving the body alone leaves no way to
-/// compute it, which is why this is a pair.
+/// ctx->ps_shift`. Resolving the body alone leaves no way to compute it,
+/// which is why this is a pair.
 #[derive(Copy, Clone, Debug)]
 pub struct ResolvedTable<'a> {
     pub body: &'a [u8],
@@ -221,91 +265,157 @@ pub struct ResolvedTable<'a> {
     pub ws_dwords: Option<usize>,
 }
 
-/// CALLTABLE / SETDATABLOCK resolver: given a sub-table id, return that
+/// The `card_info` callbacks plus table resolution and time.
+pub trait Hooks<'a> {
+    /// `cail_reg_read`: a dword register index (`RREG32`).
+    fn reg_read(&mut self, index: u32) -> u32;
+    /// `cail_reg_write` (`WREG32`).
+    fn reg_write(&mut self, index: u32, value: u32);
+    /// `cail_pll_read`; zero on SOC15, as Linux.
+    fn pll_read(&mut self, _index: u32) -> u32 {
+        0
+    }
+    fn pll_write(&mut self, _index: u32, _value: u32) {}
+    /// `cail_mc_read`; zero on SOC15, as Linux.
+    fn mc_read(&mut self, _index: u32) -> u32 {
+        0
+    }
+    fn mc_write(&mut self, _index: u32, _value: u32) {}
+    /// The command table `id`, or `None` if it cannot be resolved.
+    fn resolve(&mut self, id: u8) -> Option<ResolvedTable<'a>>;
+    /// True when `id`'s master command-table entry is zero: `atom_op_calltable`
+    /// then does nothing.
+    fn table_absent(&mut self, _id: u8) -> bool {
+        false
+    }
+    /// DELAY for the synchronous drivers ([`execute_table`]).
+    fn delay_us(&mut self, _us: u64) {}
+    /// Monotonic milliseconds for the stuck-loop guard; `None` selects the
+    /// clockless repeat/step bounds.
+    fn now_ms(&mut self) -> Option<u64> {
+        None
+    }
+}
+
+/// MMIO / PLL / MC / I/O accessor closures. The VM is driven from a single
+/// thread under the caller's mutex (see `atom.c::amdgpu_atom_execute_table`
+/// which `mutex_lock`s `ctx->mutex`), so the closures are deliberately not
+/// `Send`.
+pub type RegRead = Box<dyn FnMut(u32) -> u32>;
+pub type RegWrite = Box<dyn FnMut(u32, u32)>;
+
+/// CALLTABLE / top-level resolver: given a sub-table id, return that
 /// table's body and declared parameter size. `None` means "no such table",
 /// which the VM converts to `AtomError::UnknownTable`.
-///
-/// The caller usually backs this with a closure that delegates into
-/// `amdgpu_atombios::Atombios::cmd_table_body_and_ps`.
 pub type TableResolver<'a> = Box<dyn FnMut(u8) -> Option<ResolvedTable<'a>> + 'a>;
 
-/// `ATOM_EXECUTE_MAX_DEPTH` (`atom.c:62`). Linux added this bound
-/// deliberately: "Limit ATOM command table recursion (calltable) to avoid
-/// kernel stack overflow". VBIOS bytecode is data read off the card, so a
-/// table whose CALLTABLE chain loops must be refused rather than recursed.
+/// Boxed-closure [`Hooks`]. Every accessor defaults to the "uninitialised"
+/// stub (reads 0xCDCDCDCD, the Linux uninit pattern; writes dropped).
+pub struct Closures<'a> {
+    pub reg_read: RegRead,
+    pub reg_write: RegWrite,
+    pub pll_read: RegRead,
+    pub pll_write: RegWrite,
+    pub mc_read: RegRead,
+    pub mc_write: RegWrite,
+    /// SYSIO / legacy port accessors. Linux implements no port I/O, and
+    /// neither does the VM; kept for binding compatibility.
+    pub port_read: RegRead,
+    pub port_write: RegWrite,
+    /// Sub-table resolver (for the entry table and CALLTABLE).
+    pub table_resolver: TableResolver<'a>,
+    /// `udelay`/`msleep` for DELAY_MICROSEC/DELAY_MILLISEC, in microseconds.
+    pub delay_us: Box<dyn FnMut(u64) + 'a>,
+}
+impl fmt::Debug for Closures<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Closures")
+    }
+}
+impl Default for Closures<'_> {
+    fn default() -> Self {
+        Self {
+            reg_read: unbound_read(),
+            reg_write: unbound_write(),
+            pll_read: unbound_read(),
+            pll_write: unbound_write(),
+            mc_read: unbound_read(),
+            mc_write: unbound_write(),
+            port_read: unbound_read(),
+            port_write: unbound_write(),
+            table_resolver: Box::new(|_id| None),
+            delay_us: Box::new(|_| {}),
+        }
+    }
+}
+impl<'a> Hooks<'a> for Closures<'a> {
+    fn reg_read(&mut self, index: u32) -> u32 {
+        (self.reg_read)(index)
+    }
+    fn reg_write(&mut self, index: u32, value: u32) {
+        (self.reg_write)(index, value)
+    }
+    fn pll_read(&mut self, index: u32) -> u32 {
+        (self.pll_read)(index)
+    }
+    fn pll_write(&mut self, index: u32, value: u32) {
+        (self.pll_write)(index, value)
+    }
+    fn mc_read(&mut self, index: u32) -> u32 {
+        (self.mc_read)(index)
+    }
+    fn mc_write(&mut self, index: u32, value: u32) {
+        (self.mc_write)(index, value)
+    }
+    fn resolve(&mut self, id: u8) -> Option<ResolvedTable<'a>> {
+        (self.table_resolver)(id)
+    }
+    fn delay_us(&mut self, us: u64) {
+        (self.delay_us)(us)
+    }
+}
+
+fn unbound_read() -> RegRead {
+    Box::new(|_addr| 0xCDCD_CDCD)
+}
+fn unbound_write() -> RegWrite {
+    Box::new(|_addr, _val| {})
+}
+
+/// `ATOM_EXECUTE_MAX_DEPTH`: CALLTABLE recursion bound. VBIOS bytecode is
+/// data read off the card, so a table whose CALLTABLE chain loops must be
+/// refused rather than followed.
 pub const ATOM_EXECUTE_MAX_DEPTH: u32 = 32;
 
 // ── VM state ─────────────────────────────────────────────────────
 
-/// `atom_context` — `atom.h:132-156`. We split this from the per-
-/// frame execution state (params + working-scratch slice) which
-/// Linux calls `atom_exec_context`. The global context survives a
-/// CALLTABLE recursion; the frame doesn't.
-pub struct AtomState<'a> {
-    /// Working-scratch ring; `atom.h` calls these slots WS[0..N].
-    /// 32 entries is the Vega+ default (`amdgpu_atom_parse` allocs
-    /// `kcalloc(4, ws, GFP_KERNEL)` per table).
+/// `atom_context` — `atom.h:132-156`. The per-execution frames (PS
+/// window, WS, jump guard) live in [`Machine`], as Linux's
+/// `atom_exec_context`. Hook fields of the default [`Closures`] are
+/// reachable directly (`state.reg_read = ...`) through `Deref`.
+pub struct AtomState<'a, H = Closures<'a>> {
+    /// Working scratch of the executing table (`ectx.ws`).
     pub scratch: Vec<u32>,
-
     /// `data_block` — current data-table base offset within the
     /// BIOS image (`atom.h:139` `uint16_t data_block`).
     pub data_block: u16,
-
-    /// `fb_base` — frame-buffer / scratch-window base in bytes
-    /// (`atom.h:140`).
+    /// `fb_base` — frame-buffer / scratch-window base in bytes.
     pub fb_base: u32,
-
-    /// `divmul[0..1]` — MUL/DIV result (`atom.h:141`).
+    /// `divmul[0..1]` — MUL/DIV result.
     pub divmul: [u32; 2],
-
-    /// `io_attr` — attribute byte loaded into IIO-script context
-    /// (`atom.h:142`).
+    /// `io_attr` — attribute word an IIO program's MOVE_ATTR reads.
     pub io_attr: u16,
-
-    /// `reg_block` — register-block base added to every REG-class
-    /// access (`atom.h:143`).
+    /// `reg_block` — register-block base added to every REG-class access.
     pub reg_block: u16,
-
-    /// `shift` — current shift register, fed by SHL/SHR
-    /// (`atom.h:144`).
+    /// `shift` — WS_SHIFT and the OR/AND mask pseudo-registers.
     pub shift: u8,
-
-    /// Compare flags from CMP / TEST. `atom.h:145`.
+    /// Compare flags from CMP / TEST.
     pub cs_equal: bool,
     pub cs_above: bool,
-
-    /// I/O mode for REG-class accesses: MM / PCI / SYSIO / IIO
-    /// (`atom.h:146`).
+    /// I/O mode for REG-class accesses: MM / PCI / SYSIO / IIO|port.
     pub io_mode: u32,
-
-    /// "Scratch" region for FB-class accesses. Linux backs this
-    /// with `kzalloc(scratch_size_bytes)`. We use a Vec<u32>.
+    /// `ctx->scratch`, the FB-class region (`amdgpu_atom*_allocate_fb_scratch`).
     pub fb_scratch: Vec<u32>,
-
-    /// MMIO read closure.
-    pub reg_read: RegRead,
-    /// MMIO write closure.
-    pub reg_write: RegWrite,
-    /// PLL read closure.
-    pub pll_read: RegRead,
-    /// PLL write closure.
-    pub pll_write: RegWrite,
-    /// MC read closure.
-    pub mc_read: RegRead,
-    /// MC write closure.
-    pub mc_write: RegWrite,
-    /// SYSIO / legacy port read.
-    pub port_read: RegRead,
-    /// SYSIO / legacy port write.
-    pub port_write: RegWrite,
-
-    /// Last jump target + a counter for the stuck-loop guard.
-    pub last_jump_addr: usize,
-    pub last_jump_count: u32,
-
-    /// Sub-table resolver (for CALLTABLE / SETDATABLOCK).
-    pub table_resolver: TableResolver<'a>,
-
     /// The whole VBIOS image and its master data table offset. When bound,
     /// `SET_DATA_BLOCK` and ID-class operands follow `atom.c` exactly:
     /// `data_block` is an absolute image offset taken from the master data
@@ -313,12 +423,30 @@ pub struct AtomState<'a> {
     /// table-relative behaviour the synthetic tests use.
     pub bios: &'a [u8],
     pub data_table: usize,
-    /// `udelay`/`msleep` for DELAY_MICROSEC/DELAY_MILLISEC, in microseconds.
-    /// Display PLL and PHY tables rely on these for lock time.
-    pub delay_us: Box<dyn FnMut(u64) + 'a>,
+    /// `ctx->iio`: per IIO port (reads `port`, writes `0x80 | port`), the
+    /// image offset of its program, 0 when undefined. `None` until indexed
+    /// ([`AtomState::index_iio`]); a [`Machine`] indexes a bound image on
+    /// first use, as `amdgpu_atom_parse` does.
+    pub iio: Option<Vec<u16>>,
+    /// Conditions Linux logs and continues past, and the first one seen.
+    pub anomalies: u32,
+    pub first_anomaly: Option<Anomaly>,
+    pub hooks: H,
 }
 
-impl<'a> fmt::Debug for AtomState<'a> {
+impl<'a, H> Deref for AtomState<'a, H> {
+    type Target = H;
+    fn deref(&self) -> &H {
+        &self.hooks
+    }
+}
+impl<'a, H> DerefMut for AtomState<'a, H> {
+    fn deref_mut(&mut self) -> &mut H {
+        &mut self.hooks
+    }
+}
+
+impl<'a, H> fmt::Debug for AtomState<'a, H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AtomState")
             .field("ws_len", &self.scratch.len())
@@ -332,20 +460,9 @@ impl<'a> fmt::Debug for AtomState<'a> {
             .field("cs_above", &self.cs_above)
             .field("io_mode", &self.io_mode)
             .field("fb_scratch_len", &self.fb_scratch.len())
+            .field("anomalies", &self.anomalies)
             .finish()
     }
-}
-
-/// Default "explode loud" closure for accessors a test forgot to
-/// bind. Returning 0xCDCDCDCD matches the Linux uninit pattern.
-fn unbound_read() -> RegRead {
-    Box::new(|_addr| 0xCDCD_CDCD)
-}
-fn unbound_write() -> RegWrite {
-    Box::new(|_addr, _val| {})
-}
-fn unbound_resolver<'a>() -> TableResolver<'a> {
-    Box::new(|_id| None)
 }
 
 impl<'a> AtomState<'a> {
@@ -354,6 +471,12 @@ impl<'a> AtomState<'a> {
     /// "uninitialised" stubs. Tests then replace whichever ones
     /// they care about.
     pub fn new(ws_words: usize, fb_words: usize) -> Self {
+        Self::with_hooks(ws_words, fb_words, Closures::default())
+    }
+}
+
+impl<'a, H> AtomState<'a, H> {
+    pub fn with_hooks(ws_words: usize, fb_words: usize, hooks: H) -> Self {
         Self {
             scratch: vec![0u32; ws_words.max(1)],
             data_block: 0,
@@ -366,39 +489,79 @@ impl<'a> AtomState<'a> {
             cs_above: false,
             io_mode: IO_MM,
             fb_scratch: vec![0u32; fb_words.max(1)],
-            reg_read: unbound_read(),
-            reg_write: unbound_write(),
-            pll_read: unbound_read(),
-            pll_write: unbound_write(),
-            mc_read: unbound_read(),
-            mc_write: unbound_write(),
-            port_read: unbound_read(),
-            port_write: unbound_write(),
-            last_jump_addr: 0,
-            last_jump_count: 0,
-            table_resolver: unbound_resolver(),
             bios: &[],
             data_table: 0,
-            delay_us: Box::new(|_| {}),
+            iio: None,
+            anomalies: 0,
+            first_anomaly: None,
+            hooks,
+        }
+    }
+    /// `atom_index_iio(ctx, CU16(ctx->data_table + ATOM_DATA_IIO_PTR) + 4)`:
+    /// record each `IIO_START port` program's body offset. Bounded by the
+    /// image; an unknown opcode ends the scan (Linux would index past
+    /// `atom_iio_len`).
+    pub fn index_iio(&mut self) {
+        let mut iio = vec![0u16; 256];
+        let bios = self.bios;
+        let u8_at = |at: usize| bios.get(at).copied();
+        let table = bios
+            .get(self.data_table + DATA_IIO_PTR..self.data_table + DATA_IIO_PTR + 2)
+            .map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])));
+        if let Some(table) = table {
+            let mut base = table + 4;
+            'programs: while u8_at(base) == Some(ATOM_IIO_START) {
+                let Some(port) = u8_at(base + 1) else { break };
+                let Ok(body) = u16::try_from(base + 2) else {
+                    break;
+                };
+                iio[usize::from(port)] = body;
+                base += 2;
+                loop {
+                    match u8_at(base) {
+                        Some(ATOM_IIO_END) => break,
+                        Some(op) if usize::from(op) < IIO_LEN.len() => {
+                            base += IIO_LEN[usize::from(op)]
+                        }
+                        _ => break 'programs,
+                    }
+                }
+                base += 3;
+            }
+        }
+        self.iio = Some(iio);
+    }
+    fn anomaly(&mut self, anomaly: Anomaly) {
+        self.anomalies = self.anomalies.saturating_add(1);
+        if self.first_anomaly.is_none() {
+            self.first_anomaly = Some(anomaly);
         }
     }
 }
 
 // ── Per-frame execution context ──────────────────────────────────
 
-/// `atom_exec_context` — `atom.c:62-71`.
+/// `atom_op_jump`'s per-execution loop guard (`last_jump`,
+/// `last_jump_jiffies`).
+#[derive(Copy, Clone, Debug, Default)]
+struct JumpGuard {
+    target: Option<usize>,
+    since_ms: u64,
+    repeats: u32,
+}
+
+/// The view of the executing `atom_exec_context` handed to one opcode.
 struct Frame<'b, 'c> {
     code: &'b [u8],
-    /// Parameter space.
+    /// Parameter space (`ectx.ps`, sized `ectx.ps_size`).
     ps: &'c mut [u32],
-    /// This table's declared parameter size in dwords — `atom.c`'s
-    /// `ectx.ps_shift`. CALLTABLE hands the callee `ps[ps_shift..]`, so the
-    /// callee's parameters begin where this table's end.
+    /// This table's declared parameter size in dwords — `ectx.ps_shift`.
     ps_shift: usize,
     /// CALLTABLE nesting depth, bounded by [`ATOM_EXECUTE_MAX_DEPTH`].
     depth: u32,
     /// Absolute image offset of this table's header (`ctx->start`).
     start: usize,
+    jump: &'c mut JumpGuard,
 }
 
 impl<'b, 'c> Frame<'b, 'c> {
@@ -427,144 +590,229 @@ impl<'b, 'c> Frame<'b, 'c> {
     }
 }
 
-// ── Source / dest decoding (atom.c:182-597) ──────────────────────
+/// `0xFFFFFFFF >> (32 - width)` with x86 shift-count masking, as the C
+/// expression evaluates on the hardware Linux runs it on.
+fn iio_mask(width: u8) -> u32 {
+    u32::MAX.wrapping_shr(32u32.wrapping_sub(u32::from(width)))
+}
 
-/// Read a value out of `(attr, ptr)` and advance `ptr` past the
-/// inline operand. Mirrors `atom_get_src_int` in atom.c:182.
-fn get_src(
-    state: &mut AtomState,
+/// `atom_iio_execute`: run the IIO program at image offset `base` with the
+/// REG operand's `index` and, for writes, the `data` to store. Every READ
+/// and WRITE goes through the same `reg_read`/`reg_write` callbacks as an
+/// MM-mode access; the programs themselves sequence the index/data pairs.
+fn iio_execute<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
+    program: u8,
+    mut base: usize,
+    index: u32,
+    data: u32,
+) -> u32 {
+    let mut temp = 0xCDCD_CDCDu32;
+    let bios = state.bios;
+    let u8_at = |at: usize| bios.get(at).copied();
+    let u16_at = |at: usize| {
+        bios.get(at..at + 2)
+            .map(|b| u32::from(u16::from_le_bytes([b[0], b[1]])))
+    };
+    for _ in 0..IIO_MAX_OPS {
+        let Some(op) = u8_at(base) else { break };
+        let (b1, b2, b3) = (
+            u8_at(base + 1).unwrap_or(0),
+            u8_at(base + 2).unwrap_or(0),
+            u8_at(base + 3).unwrap_or(0),
+        );
+        let field = |temp: u32, source: u32| {
+            let mask = iio_mask(b1);
+            (temp & !mask.wrapping_shl(u32::from(b3)))
+                | (source.wrapping_shr(u32::from(b2)) & mask).wrapping_shl(u32::from(b3))
+        };
+        match op {
+            ATOM_IIO_NOP => base += 1,
+            ATOM_IIO_READ => {
+                let Some(register) = u16_at(base + 1) else {
+                    break;
+                };
+                temp = state.hooks.reg_read(register);
+                base += 3;
+            }
+            ATOM_IIO_WRITE => {
+                let Some(register) = u16_at(base + 1) else {
+                    break;
+                };
+                state.hooks.reg_write(register, temp);
+                base += 3;
+            }
+            ATOM_IIO_CLEAR => {
+                temp &= !iio_mask(b1).wrapping_shl(u32::from(b2));
+                base += 3;
+            }
+            ATOM_IIO_SET => {
+                temp |= iio_mask(b1).wrapping_shl(u32::from(b2));
+                base += 3;
+            }
+            ATOM_IIO_MOVE_INDEX => {
+                temp = field(temp, index);
+                base += 4;
+            }
+            ATOM_IIO_MOVE_DATA => {
+                temp = field(temp, data);
+                base += 4;
+            }
+            ATOM_IIO_MOVE_ATTR => {
+                temp = field(temp, u32::from(state.io_attr));
+                base += 4;
+            }
+            ATOM_IIO_END => return temp,
+            // "Unknown IIO opcode": Linux returns 0.
+            _ => {
+                state.anomaly(Anomaly::BadIio(program));
+                return 0;
+            }
+        }
+    }
+    state.anomaly(Anomaly::BadIio(program));
+    0
+}
+
+/// The IIO program for `slot`, indexing a bound image on first use.
+fn iio_program<'a, H>(state: &mut AtomState<'a, H>, slot: u8) -> Option<usize> {
+    if state.iio.is_none() {
+        state.index_iio();
+    }
+    let program = state.iio.as_ref()?.get(usize::from(slot)).copied()?;
+    (program != 0).then_some(usize::from(program))
+}
+
+// ── Source / dest decoding (atom.c) ──────────────────────────────
+
+/// `atom_get_src_int`: the aligned value of `(attr, ptr)` and the raw
+/// 32-bit value it was taken from (`*saved`), advancing `ptr`.
+fn get_src_saved<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
     frame: &Frame,
     attr: u8,
     ptr: &mut usize,
-) -> Result<u32, AtomError> {
+) -> Result<(u32, u32), AtomError> {
     let arg = attr & 7;
     let align = (attr >> 3) & 7;
-    let mut val: u32;
-
-    match arg {
+    let val: u32 = match arg {
         ARG_REG => {
             let idx16 = frame.u16_at(*ptr)?;
             *ptr += 2;
-            let idx = (idx16 as u32).wrapping_add(state.reg_block as u32);
-            val = match state.io_mode {
-                IO_MM => (state.reg_read)(idx),
-                IO_PCI | IO_SYSIO => return Err(AtomError::RegisterAccessNotBound),
-                m if (m & 0x80) != 0 => {
-                    // IIO indirect-IO path not yet supported.
-                    return Err(AtomError::RegisterAccessNotBound);
+            let idx = u32::from(idx16).wrapping_add(u32::from(state.reg_block));
+            match state.io_mode {
+                IO_MM => state.hooks.reg_read(idx),
+                // "PCI/SYSIO registers are not implemented": return 0.
+                IO_PCI | IO_SYSIO => {
+                    state.anomaly(Anomaly::PortIo(idx));
+                    return Ok((0, 0));
+                }
+                mode if mode & IO_IIO != 0 => {
+                    let slot = (mode & 0x7F) as u8;
+                    match iio_program(state, slot) {
+                        Some(base) => iio_execute(state, slot, base, idx, 0),
+                        None => {
+                            state.anomaly(Anomaly::UndefinedIio(slot));
+                            return Ok((0, 0));
+                        }
+                    }
                 }
                 _ => return Err(AtomError::BadArgClass),
-            };
+            }
         }
         ARG_PS => {
-            let idx = frame.u8_at(*ptr)? as usize;
+            let idx = frame.u8_at(*ptr)?;
             *ptr += 1;
-            if idx >= frame.ps.len() {
-                return Err(AtomError::PsIndexOutOfRange);
+            match frame.ps.get(usize::from(idx)) {
+                Some(&v) => v,
+                None => {
+                    state.anomaly(Anomaly::PsIndex(idx));
+                    0xCDCD_CDCD
+                }
             }
-            val = frame.ps[idx];
         }
         ARG_WS => {
             let idx = frame.u8_at(*ptr)?;
             *ptr += 1;
-            val = match idx {
+            match idx {
                 WS_QUOTIENT => state.divmul[0],
                 WS_REMAINDER => state.divmul[1],
-                WS_DATAPTR => state.data_block as u32,
-                WS_SHIFT => state.shift as u32,
-                WS_OR_MASK => 1u32 << state.shift,
-                WS_AND_MASK => !(1u32 << state.shift),
+                WS_DATAPTR => u32::from(state.data_block),
+                WS_SHIFT => u32::from(state.shift),
+                WS_OR_MASK => 1u32.wrapping_shl(u32::from(state.shift)),
+                WS_AND_MASK => !1u32.wrapping_shl(u32::from(state.shift)),
                 WS_FB_WINDOW => state.fb_base,
-                WS_ATTRIBUTES => state.io_attr as u32,
-                WS_REGPTR => state.reg_block as u32,
-                _ => {
-                    let i = idx as usize;
-                    if i >= state.scratch.len() {
-                        return Err(AtomError::WsIndexOutOfRange);
+                WS_ATTRIBUTES => u32::from(state.io_attr),
+                WS_REGPTR => u32::from(state.reg_block),
+                _ => match state.scratch.get(usize::from(idx)) {
+                    Some(&v) => v,
+                    None => {
+                        state.anomaly(Anomaly::WsIndex(idx));
+                        0xCDCD_CDCD
                     }
-                    state.scratch[i]
-                }
-            };
+                },
+            }
         }
         ARG_ID => {
-            // ID = data-block-relative u32 load — `atom.c:274-284`.
+            // `U32(idx + gctx->data_block)`.
             let idx16 = frame.u16_at(*ptr)?;
             *ptr += 2;
-            let abs = (idx16 as usize).wrapping_add(state.data_block as usize);
-            if !state.bios.is_empty() {
-                // atom.c: U32(idx + gctx->data_block), an image offset.
-                let bytes = state
-                    .bios
-                    .get(abs..abs + 4)
-                    .ok_or(AtomError::BytecodeTruncated)?;
-                val = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let abs = usize::from(idx16) + usize::from(state.data_block);
+            let bytes = if !state.bios.is_empty() {
+                state.bios.get(abs..abs + 4)
             } else {
                 // Without a bound image, constrain to the table buffer
                 // (synthetic tables only).
-                if abs + 4 > frame.code.len() {
-                    return Err(AtomError::BytecodeTruncated);
-                }
-                val = u32::from_le_bytes([
-                    frame.code[abs],
-                    frame.code[abs + 1],
-                    frame.code[abs + 2],
-                    frame.code[abs + 3],
-                ]);
+                frame.code.get(abs..abs + 4)
             }
+            .ok_or(AtomError::BytecodeTruncated)?;
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
         }
         ARG_FB => {
-            let idx = frame.u8_at(*ptr)? as usize;
+            let idx = frame.u8_at(*ptr)?;
             *ptr += 1;
-            let word_off = (state.fb_base as usize / 4).wrapping_add(idx);
-            if word_off >= state.fb_scratch.len() {
-                return Err(AtomError::FbIndexOutOfRange);
+            let byte = state.fb_base.wrapping_add(u32::from(idx) * 4);
+            match state.fb_scratch.get(byte as usize / 4) {
+                Some(&v) => v,
+                None => {
+                    state.anomaly(Anomaly::FbIndex(byte));
+                    0
+                }
             }
-            val = state.fb_scratch[word_off];
         }
         ARG_IMM => {
-            val = match align {
-                SRC_DWORD => {
-                    let v = frame.u32_at(*ptr)?;
-                    *ptr += 4;
-                    v
-                }
-                SRC_WORD0 | SRC_WORD8 | SRC_WORD16 => {
-                    let v = frame.u16_at(*ptr)? as u32;
-                    *ptr += 2;
-                    v
-                }
-                SRC_BYTE0 | SRC_BYTE8 | SRC_BYTE16 | SRC_BYTE24 => {
-                    let v = frame.u8_at(*ptr)? as u32;
-                    *ptr += 1;
-                    v
-                }
-                _ => return Err(AtomError::BadArgClass),
-            };
-            // IMM short-circuits — no align mask/shift fixup.
-            return Ok(val);
+            // IMM short-circuits — no align mask/shift fixup, no saved.
+            let v = get_src_direct(frame, align, ptr)?;
+            return Ok((v, v));
         }
         ARG_PLL => {
-            let idx = frame.u8_at(*ptr)? as u32;
+            let idx = frame.u8_at(*ptr)?;
             *ptr += 1;
-            val = (state.pll_read)(idx);
+            state.hooks.pll_read(u32::from(idx))
         }
         ARG_MC => {
-            let idx = frame.u8_at(*ptr)? as u32;
+            let idx = frame.u8_at(*ptr)?;
             *ptr += 1;
-            val = (state.mc_read)(idx);
+            state.hooks.mc_read(u32::from(idx))
         }
         _ => return Err(AtomError::BadArgClass),
-    }
-
+    };
     let a = align as usize;
-    val &= ARG_MASK[a];
-    val >>= ARG_SHIFT[a];
-    Ok(val)
+    Ok(((val & ARG_MASK[a]) >> ARG_SHIFT[a], val))
 }
 
-/// Mirror of `atom_skip_src_int` (`atom.c:373`) — advance ptr
-/// past the source operand without reading it. Used by MOVE's
-/// "skip dst" path.
+/// `atom_get_src`.
+fn get_src<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
+    frame: &Frame,
+    attr: u8,
+    ptr: &mut usize,
+) -> Result<u32, AtomError> {
+    get_src_saved(state, frame, attr, ptr).map(|(v, _)| v)
+}
+
+/// Mirror of `atom_skip_src_int` — advance ptr past the source operand
+/// without reading it. Used by MOVE's "skip dst" path.
 fn skip_src(frame: &Frame, attr: u8, ptr: &mut usize) -> Result<(), AtomError> {
     let arg = attr & 7;
     let align = (attr >> 3) & 7;
@@ -584,34 +832,28 @@ fn skip_src(frame: &Frame, attr: u8, ptr: &mut usize) -> Result<(), AtomError> {
     Ok(())
 }
 
-/// Read a destination-encoded source. `atom_get_dst` in atom.c:439
-/// — same as get_src but the alignment is rebuilt from the dst-
-/// alignment field + two-bit dst-shift selector.
-fn get_dst(
-    state: &mut AtomState,
+fn dst_attr(arg: u8, attr: u8) -> u8 {
+    arg | (DST_TO_SRC[((attr >> 3) & 7) as usize][((attr >> 6) & 3) as usize] << 3)
+}
+
+/// `atom_get_dst(ctx, arg, attr, ptr, &saved, ...)`: the aligned
+/// destination value and its raw 32-bit value.
+fn get_dst<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
     frame: &Frame,
     arg: u8,
     attr: u8,
     ptr: &mut usize,
-) -> Result<u32, AtomError> {
-    let dst_align = (attr >> 3) & 7;
-    let dst_shift = (attr >> 6) & 3;
-    let src_align = DST_TO_SRC[dst_align as usize][dst_shift as usize];
-    let effective = arg | (src_align << 3);
-    get_src(state, frame, effective, ptr)
+) -> Result<(u32, u32), AtomError> {
+    get_src_saved(state, frame, dst_attr(arg, attr), ptr)
 }
 
 fn skip_dst(frame: &Frame, arg: u8, attr: u8, ptr: &mut usize) -> Result<(), AtomError> {
-    let dst_align = (attr >> 3) & 7;
-    let dst_shift = (attr >> 6) & 3;
-    let src_align = DST_TO_SRC[dst_align as usize][dst_shift as usize];
-    let effective = arg | (src_align << 3);
-    skip_src(frame, effective, ptr)
+    skip_src(frame, dst_attr(arg, attr), ptr)
 }
 
 /// Read just the raw aligned sub-word from the bytecode stream
-/// (no REG/PS/WS dispatch). Used by MASK / SHL-direct / SHR-direct.
-/// `atom_get_src_direct` in atom.c:413.
+/// (no REG/PS/WS dispatch). `atom_get_src_direct`.
 fn get_src_direct(frame: &Frame, align: u8, ptr: &mut usize) -> Result<u32, AtomError> {
     let v = match align {
         SRC_DWORD => {
@@ -620,12 +862,12 @@ fn get_src_direct(frame: &Frame, align: u8, ptr: &mut usize) -> Result<u32, Atom
             v
         }
         SRC_WORD0 | SRC_WORD8 | SRC_WORD16 => {
-            let v = frame.u16_at(*ptr)? as u32;
+            let v = u32::from(frame.u16_at(*ptr)?);
             *ptr += 2;
             v
         }
         SRC_BYTE0 | SRC_BYTE8 | SRC_BYTE16 | SRC_BYTE24 => {
-            let v = frame.u8_at(*ptr)? as u32;
+            let v = u32::from(frame.u8_at(*ptr)?);
             *ptr += 1;
             v
         }
@@ -634,55 +876,52 @@ fn get_src_direct(frame: &Frame, align: u8, ptr: &mut usize) -> Result<u32, Atom
     Ok(v)
 }
 
-/// Mirror of `atom_put_dst` (`atom.c:455`) — store `val` back into
-/// the destination encoded at (`arg`, `attr`, `ptr`). `saved` is
-/// the dst's current full-word value (so writes that update only a
-/// sub-word can preserve the surrounding bits).
-fn put_dst(
-    state: &mut AtomState,
+/// Mirror of `atom_put_dst` — store `val` back into the destination
+/// encoded at (`arg`, `attr`, `ptr`). `saved` is the destination's raw
+/// 32-bit value, so a sub-word store preserves the surrounding bits.
+fn put_dst<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
     frame: &mut Frame,
     arg: u8,
     attr: u8,
     ptr: &mut usize,
-    mut val: u32,
-    mut saved: u32,
+    val: u32,
+    saved: u32,
 ) -> Result<(), AtomError> {
-    let dst_align = (attr >> 3) & 7;
-    let dst_shift = (attr >> 6) & 3;
-    let align = DST_TO_SRC[dst_align as usize][dst_shift as usize] as usize;
-
-    val <<= ARG_SHIFT[align];
-    val &= ARG_MASK[align];
-    saved &= !ARG_MASK[align];
-    val |= saved;
+    let align = DST_TO_SRC[((attr >> 3) & 7) as usize][((attr >> 6) & 3) as usize] as usize;
+    let val = (val.wrapping_shl(ARG_SHIFT[align]) & ARG_MASK[align]) | (saved & !ARG_MASK[align]);
 
     match arg {
         ARG_REG => {
             let idx16 = frame.u16_at(*ptr)?;
             *ptr += 2;
-            let idx = (idx16 as u32).wrapping_add(state.reg_block as u32);
+            let idx = u32::from(idx16).wrapping_add(u32::from(state.reg_block));
             match state.io_mode {
-                IO_MM => {
-                    // atom.c:475-479 special-case idx==0 → write
-                    // <<2; left in place for parity.
-                    if idx == 0 {
-                        (state.reg_write)(idx, val << 2);
-                    } else {
-                        (state.reg_write)(idx, val);
+                // atom.c special-cases idx 0 (MM_INDEX takes a byte address).
+                IO_MM if idx == 0 => state.hooks.reg_write(idx, val << 2),
+                IO_MM => state.hooks.reg_write(idx, val),
+                IO_PCI | IO_SYSIO => state.anomaly(Anomaly::PortIo(idx)),
+                mode if mode & IO_IIO != 0 => {
+                    // atom_put_dst indexes the write program with `& 0xFF`:
+                    // `INDIRECT_WRITE | port`.
+                    let slot = (mode & 0xFF) as u8;
+                    match iio_program(state, slot) {
+                        Some(base) => {
+                            iio_execute(state, slot, base, idx, val);
+                        }
+                        None => state.anomaly(Anomaly::UndefinedIio(slot)),
                     }
                 }
-                IO_PCI | IO_SYSIO => return Err(AtomError::RegisterAccessNotBound),
-                m if (m & 0x80) != 0 => return Err(AtomError::RegisterAccessNotBound),
                 _ => return Err(AtomError::BadArgClass),
             }
         }
         ARG_PS => {
-            let idx = frame.u8_at(*ptr)? as usize;
+            let idx = frame.u8_at(*ptr)?;
             *ptr += 1;
-            if idx >= frame.ps.len() {
-                return Err(AtomError::PsIndexOutOfRange);
+            match frame.ps.get_mut(usize::from(idx)) {
+                Some(slot) => *slot = val,
+                None => state.anomaly(Anomaly::PsIndex(idx)),
             }
-            frame.ps[idx] = val;
         }
         ARG_WS => {
             let idx = frame.u8_at(*ptr)?;
@@ -692,138 +931,128 @@ fn put_dst(
                 WS_REMAINDER => state.divmul[1] = val,
                 WS_DATAPTR => state.data_block = val as u16,
                 WS_SHIFT => state.shift = val as u8,
-                WS_OR_MASK | WS_AND_MASK => {} // atom.c:528-530: noop
+                WS_OR_MASK | WS_AND_MASK => {}
                 WS_FB_WINDOW => state.fb_base = val,
                 WS_ATTRIBUTES => state.io_attr = val as u16,
                 WS_REGPTR => state.reg_block = val as u16,
-                _ => {
-                    let i = idx as usize;
-                    if i >= state.scratch.len() {
-                        return Err(AtomError::WsIndexOutOfRange);
-                    }
-                    state.scratch[i] = val;
-                }
+                _ => match state.scratch.get_mut(usize::from(idx)) {
+                    Some(slot) => *slot = val,
+                    None => state.anomaly(Anomaly::WsIndex(idx)),
+                },
             }
         }
         ARG_FB => {
-            let idx = frame.u8_at(*ptr)? as usize;
+            let idx = frame.u8_at(*ptr)?;
             *ptr += 1;
-            let word_off = (state.fb_base as usize / 4).wrapping_add(idx);
-            if word_off >= state.fb_scratch.len() {
-                return Err(AtomError::FbIndexOutOfRange);
+            let byte = state.fb_base.wrapping_add(u32::from(idx) * 4);
+            match state.fb_scratch.get_mut(byte as usize / 4) {
+                Some(slot) => *slot = val,
+                None => state.anomaly(Anomaly::FbIndex(byte)),
             }
-            state.fb_scratch[word_off] = val;
         }
         ARG_PLL => {
-            let idx = frame.u8_at(*ptr)? as u32;
+            let idx = frame.u8_at(*ptr)?;
             *ptr += 1;
-            (state.pll_write)(idx, val);
+            state.hooks.pll_write(u32::from(idx), val);
         }
         ARG_MC => {
-            let idx = frame.u8_at(*ptr)? as u32;
+            let idx = frame.u8_at(*ptr)?;
             *ptr += 1;
-            (state.mc_write)(idx, val);
+            state.hooks.mc_write(u32::from(idx), val);
         }
         _ => return Err(AtomError::BadArgClass),
     }
     Ok(())
 }
 
-// ── Per-opcode handlers (atom.c:599-1085) ────────────────────────
+// ── Per-opcode handlers (atom.c) ─────────────────────────────────
 
-/// Common "read attr, dst, src; combine; write dst" shape used by
-/// add / sub / and / or / xor.
-fn binop_inplace<F: Fn(u32, u32) -> u32>(
-    state: &mut AtomState,
-    frame: &mut Frame,
-    arg: u8,
-    ptr: &mut usize,
-    op: F,
-) -> Result<(), AtomError> {
-    let attr = frame.u8_at(*ptr)?;
-    *ptr += 1;
-    let dptr_start = *ptr;
-    let dst = get_dst(state, frame, arg, attr, ptr)?;
-    let saved = dst;
-    let src = get_src(state, frame, attr, ptr)?;
-    let result = op(dst, src);
-    let mut dptr = dptr_start;
-    put_dst(state, frame, arg, attr, &mut dptr, result, saved)?;
-    Ok(())
+/// What one opcode asks the machine to do next.
+enum Flow<'a> {
+    Next,
+    Eot,
+    Delay(u64),
+    Call(ResolvedTable<'a>),
 }
 
-fn op_move(
-    state: &mut AtomState,
+/// `atom_op_add/and/or/xor/sub`: read dst (with saved), read src,
+/// combine, write dst.
+fn binop<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
+    frame: &mut Frame,
+    arg: u8,
+    ptr: &mut usize,
+    op: impl Fn(u32, u32) -> u32,
+) -> Result<(), AtomError> {
+    let attr = frame.u8_at(*ptr)?;
+    *ptr += 1;
+    let mut dptr = *ptr;
+    let (dst, saved) = get_dst(state, frame, arg, attr, ptr)?;
+    let src = get_src(state, frame, attr, ptr)?;
+    put_dst(state, frame, arg, attr, &mut dptr, op(dst, src), saved)
+}
+
+fn op_move<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
     frame: &mut Frame,
     arg: u8,
     ptr: &mut usize,
 ) -> Result<(), AtomError> {
     let attr = frame.u8_at(*ptr)?;
     *ptr += 1;
-    let dptr_start = *ptr;
-    // atom.c:805 — full DWORD writes skip the dst pre-read.
+    let mut dptr = *ptr;
+    // Full DWORD writes skip the dst pre-read.
     let saved = if ((attr >> 3) & 7) != SRC_DWORD {
-        get_dst(state, frame, arg, attr, ptr)?
+        get_dst(state, frame, arg, attr, ptr)?.1
     } else {
         skip_dst(frame, arg, attr, ptr)?;
         0xCDCD_CDCD
     };
     let src = get_src(state, frame, attr, ptr)?;
-    let mut dptr = dptr_start;
     put_dst(state, frame, arg, attr, &mut dptr, src, saved)
 }
 
-fn op_clear(
-    state: &mut AtomState,
+/// The rewritten attribute byte `clear`/`shift_left`/`shift_right` use.
+fn def_dst_attr(attr: u8) -> u8 {
+    let attr = attr & 0x38;
+    attr | (DEF_DST[(attr >> 3) as usize] << 6)
+}
+
+fn op_clear<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
     frame: &mut Frame,
     arg: u8,
     ptr: &mut usize,
 ) -> Result<(), AtomError> {
-    let attr0 = frame.u8_at(*ptr)?;
+    let attr = def_dst_attr(frame.u8_at(*ptr)?);
     *ptr += 1;
-    let attr = (attr0 & 0x38) | (DEF_DST[((attr0 & 0x38) >> 3) as usize] << 6);
-    let dptr_start = *ptr;
-    let saved = get_dst(state, frame, arg, attr, ptr)?;
-    let mut dptr = dptr_start;
+    let mut dptr = *ptr;
+    let (_, saved) = get_dst(state, frame, arg, attr, ptr)?;
     put_dst(state, frame, arg, attr, &mut dptr, 0, saved)
 }
 
-fn op_compare(
-    state: &mut AtomState,
+/// The two operands of compare/test/mul/div (`atom_get_dst(..., NULL)`
+/// then `atom_get_src`).
+fn operands<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
     frame: &mut Frame,
     arg: u8,
     ptr: &mut usize,
-) -> Result<(), AtomError> {
+) -> Result<(u32, u32), AtomError> {
     let attr = frame.u8_at(*ptr)?;
     *ptr += 1;
-    let dst = get_dst(state, frame, arg, attr, ptr)?;
+    let (dst, _) = get_dst(state, frame, arg, attr, ptr)?;
     let src = get_src(state, frame, attr, ptr)?;
-    state.cs_equal = dst == src;
-    state.cs_above = dst > src;
-    Ok(())
+    Ok((dst, src))
 }
 
-fn op_test(
-    state: &mut AtomState,
-    frame: &mut Frame,
-    arg: u8,
-    ptr: &mut usize,
-) -> Result<(), AtomError> {
-    let attr = frame.u8_at(*ptr)?;
-    *ptr += 1;
-    let dst = get_dst(state, frame, arg, attr, ptr)?;
-    let src = get_src(state, frame, attr, ptr)?;
-    state.cs_equal = (dst & src) == 0;
-    Ok(())
-}
-
-fn op_jump(
-    state: &mut AtomState,
+fn op_jump<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
     frame: &mut Frame,
     cond: u8,
     ptr: &mut usize,
 ) -> Result<(), AtomError> {
-    let target = frame.u16_at(*ptr)? as usize;
+    let target = usize::from(frame.u16_at(*ptr)?);
     *ptr += 2;
     let take = match cond {
         COND_ABOVE => state.cs_above,
@@ -835,104 +1064,72 @@ fn op_jump(
         COND_NOTEQUAL => !state.cs_equal,
         _ => return Err(AtomError::BadArgClass),
     };
-    if take {
-        // `target` is measured from the start of the table — but
-        // the table header (`ATOM_CT_CODE_PTR = 6`) means our
-        // `code` slice already starts 6 bytes in. Linux walks
-        // `ctx->start + target` which equals the BIOS-absolute
-        // address; the table's first opcode lives at
-        // `ctx->start + ATOM_CT_CODE_PTR`. Targets within the
-        // bytecode are pre-shifted by +6 by the BIOS assembler.
-        // For our slice, we subtract the 6-byte header to map
-        // back into `code[]`.
-        if target < 6 {
-            return Err(AtomError::BadJumpTarget);
-        }
-        let local = target - 6;
-        if local >= frame.code.len() {
-            return Err(AtomError::BadJumpTarget);
-        }
-        // Stuck-loop detector.
-        if state.last_jump_addr == local {
-            state.last_jump_count = state.last_jump_count.saturating_add(1);
-            if state.last_jump_count > 65_535 {
-                return Err(AtomError::Stuck);
-            }
-        } else {
-            state.last_jump_addr = local;
-            state.last_jump_count = 1;
-        }
-        *ptr = local;
+    if !take {
+        return Ok(());
     }
+    // `*ptr = ctx->start + target`: targets count from the table header,
+    // and `code` starts after its 6-byte prelude (`ATOM_CT_CODE_PTR`).
+    let local = target.checked_sub(6).ok_or(AtomError::BadJumpTarget)?;
+    if local >= frame.code.len() {
+        return Err(AtomError::BadJumpTarget);
+    }
+    let now = state.hooks.now_ms();
+    let guard = &mut *frame.jump;
+    if guard.target == Some(local) {
+        guard.repeats = guard.repeats.saturating_add(1);
+        let stuck = match now {
+            Some(now) => now.saturating_sub(guard.since_ms) > ATOM_CMD_TIMEOUT_MS,
+            None => guard.repeats > STUCK_REPEATS,
+        };
+        if stuck {
+            return Err(AtomError::Stuck);
+        }
+    } else {
+        *guard = JumpGuard {
+            target: Some(local),
+            since_ms: now.unwrap_or(0),
+            repeats: 1,
+        };
+    }
+    *ptr = local;
     Ok(())
 }
 
-fn op_delay(
-    state: &mut AtomState,
-    frame: &Frame,
-    unit: u8,
-    ptr: &mut usize,
-) -> Result<(), AtomError> {
-    // `atom_op_delay`: udelay(count) or msleep(count), through the bound hook.
+fn op_delay(frame: &Frame, unit: u8, ptr: &mut usize) -> Result<u64, AtomError> {
+    // `atom_op_delay`: udelay(count) or msleep(count).
     let count = u64::from(frame.u8_at(*ptr)?);
     *ptr += 1;
-    (state.delay_us)(if unit == UNIT_MICROSEC {
+    Ok(if unit == UNIT_MICROSEC {
         count
     } else {
         count * 1000
-    });
-    Ok(())
-}
-
-fn op_calltable(
-    state: &mut AtomState,
-    frame: &mut Frame,
-    ptr: &mut usize,
-) -> Result<(), AtomError> {
-    let idx = frame.u8_at(*ptr)?;
-    *ptr += 1;
-    if frame.depth + 1 >= ATOM_EXECUTE_MAX_DEPTH {
-        return Err(AtomError::CallTableTooDeep);
-    }
-    let sub = match (state.table_resolver)(idx) {
-        Some(s) => s,
-        None => return Err(AtomError::UnknownTable(idx)),
-    };
-    // `atom.c:650`: the callee gets `ps + ps_shift`, sized
-    // `ps_size - ps_shift` — the window *above* this table's own parameters,
-    // not this table's parameters over again. A callee handed the caller's
-    // window reads the caller's inputs as its own and writes its outputs over
-    // them.
-    let shift = frame.ps_shift.min(frame.ps.len());
-    with_ws(state, sub.ws_dwords, |state| {
-        run_table(
-            state,
-            sub.body,
-            &mut frame.ps[shift..],
-            sub.ps_dwords,
-            frame.depth + 1,
-            sub.start,
-        )
     })
 }
 
-/// `amdgpu_atom_execute_table_locked`'s per-execution WS allocation.
-fn with_ws<T>(
-    state: &mut AtomState,
-    ws: Option<usize>,
-    run: impl FnOnce(&mut AtomState) -> T,
-) -> T {
-    let Some(ws) = ws else {
-        return run(state);
-    };
-    let saved = core::mem::replace(&mut state.scratch, vec![0u32; ws.max(1)]);
-    let result = run(state);
-    state.scratch = saved;
-    result
+fn op_calltable<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
+    frame: &mut Frame,
+    ptr: &mut usize,
+) -> Result<Flow<'a>, AtomError> {
+    let idx = frame.u8_at(*ptr)?;
+    *ptr += 1;
+    // `if (U16(ctx->ctx->cmd_table + 4 + 2 * idx))`: an absent table is a
+    // no-op.
+    if state.hooks.table_absent(idx) {
+        return Ok(Flow::Next);
+    }
+    if frame.depth + 1 >= ATOM_EXECUTE_MAX_DEPTH {
+        return Err(AtomError::CallTableTooDeep);
+    }
+    state
+        .hooks
+        .resolve(idx)
+        .map(Flow::Call)
+        .ok_or(AtomError::UnknownTable(idx))
 }
 
-fn op_setport(
-    state: &mut AtomState,
+fn op_setport<'a, H>(
+    state: &mut AtomState<'a, H>,
     frame: &Frame,
     arg: u8,
     ptr: &mut usize,
@@ -941,14 +1138,13 @@ fn op_setport(
         PORT_ATI => {
             let port = frame.u16_at(*ptr)?;
             *ptr += 2;
-            if port == 0 {
-                state.io_mode = IO_MM;
+            state.io_mode = if port == 0 {
+                IO_MM
             } else {
-                state.io_mode = IO_IIO | port as u32;
-            }
+                IO_IIO | u32::from(port)
+            };
         }
         PORT_PCI => {
-            // Skip a byte to match Linux atom.c:921 (`(*ptr)++`).
             *ptr += 1;
             state.io_mode = IO_PCI;
         }
@@ -961,193 +1157,110 @@ fn op_setport(
     Ok(())
 }
 
-fn op_setregblock(state: &mut AtomState, frame: &Frame, ptr: &mut usize) -> Result<(), AtomError> {
-    state.reg_block = frame.u16_at(*ptr)?;
-    *ptr += 2;
-    Ok(())
-}
-
-fn op_setfbbase(
-    state: &mut AtomState,
-    frame: &mut Frame,
+fn op_setdatablock<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
+    frame: &Frame,
     ptr: &mut usize,
 ) -> Result<(), AtomError> {
-    let attr = frame.u8_at(*ptr)?;
-    *ptr += 1;
-    state.fb_base = get_src(state, frame, attr, ptr)?;
-    Ok(())
-}
-
-fn op_setdatablock(state: &mut AtomState, frame: &Frame, ptr: &mut usize) -> Result<(), AtomError> {
     let idx = frame.u8_at(*ptr)?;
     *ptr += 1;
-    if !state.bios.is_empty() {
-        // atom_op_setdatablock: 0 clears, 255 selects this table's start,
-        // otherwise U16(data_table + 4 + 2 * idx).
-        state.data_block = match idx {
-            0 => 0,
-            255 => u16::try_from(frame.start).map_err(|_| AtomError::BytecodeTruncated)?,
-            _ => {
-                let at = state.data_table + 4 + 2 * idx as usize;
-                let bytes = state
-                    .bios
-                    .get(at..at + 2)
-                    .ok_or(AtomError::BytecodeTruncated)?;
-                u16::from_le_bytes([bytes[0], bytes[1]])
-            }
-        };
+    if state.bios.is_empty() {
+        // Synthetic tables: blocks are table-relative.
+        state.data_block = 0;
         return Ok(());
     }
-    if idx == 0 {
-        state.data_block = 0;
-    } else if idx == 255 {
-        // atom.c:889-890 — set to table start. We carry "start"
-        // as 0 here since `code` is already at-start.
-        state.data_block = 0;
+    // atom_op_setdatablock: 0 clears, 255 selects this table's start,
+    // otherwise U16(data_table + 4 + 2 * idx).
+    state.data_block = match idx {
+        0 => 0,
+        255 => u16::try_from(frame.start).map_err(|_| AtomError::BytecodeTruncated)?,
+        _ => {
+            let at = state.data_table + 4 + 2 * usize::from(idx);
+            let bytes = state
+                .bios
+                .get(at..at + 2)
+                .ok_or(AtomError::BytecodeTruncated)?;
+            u16::from_le_bytes([bytes[0], bytes[1]])
+        }
+    };
+    Ok(())
+}
+
+/// `atom_op_shift_left` / `atom_op_shift_right`: the aligned destination
+/// shifted by an immediate byte.
+fn op_shift<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
+    frame: &mut Frame,
+    arg: u8,
+    ptr: &mut usize,
+    left: bool,
+) -> Result<(), AtomError> {
+    let attr = def_dst_attr(frame.u8_at(*ptr)?);
+    *ptr += 1;
+    let mut dptr = *ptr;
+    let (dst, saved) = get_dst(state, frame, arg, attr, ptr)?;
+    let shift = get_src_direct(frame, SRC_BYTE0, ptr)?;
+    let dst = if left {
+        dst.wrapping_shl(shift)
     } else {
-        // Linux: U16(data_table + 4 + 2*idx). The resolver gives
-        // us a fully-resolved data block; we record its offset
-        // as 0 since the buffer is opaque in our cut. The hook
-        // is wired so the full driver can override.
-        let _ = (state.table_resolver)(idx); // touch resolver for parity
-        state.data_block = 0;
-    }
-    Ok(())
-}
-
-fn op_mul(
-    state: &mut AtomState,
-    frame: &mut Frame,
-    arg: u8,
-    ptr: &mut usize,
-) -> Result<(), AtomError> {
-    let attr = frame.u8_at(*ptr)?;
-    *ptr += 1;
-    let dst = get_dst(state, frame, arg, attr, ptr)?;
-    let src = get_src(state, frame, attr, ptr)?;
-    state.divmul[0] = dst.wrapping_mul(src);
-    Ok(())
-}
-
-fn op_div(
-    state: &mut AtomState,
-    frame: &mut Frame,
-    arg: u8,
-    ptr: &mut usize,
-) -> Result<(), AtomError> {
-    let attr = frame.u8_at(*ptr)?;
-    *ptr += 1;
-    let dst = get_dst(state, frame, arg, attr, ptr)?;
-    let src = get_src(state, frame, attr, ptr)?;
-    if src != 0 {
-        state.divmul[0] = dst / src;
-        state.divmul[1] = dst % src;
-    } else {
-        state.divmul[0] = 0;
-        state.divmul[1] = 0;
-    }
-    Ok(())
-}
-
-fn op_shift_left(
-    state: &mut AtomState,
-    frame: &mut Frame,
-    arg: u8,
-    ptr: &mut usize,
-) -> Result<(), AtomError> {
-    let attr0 = frame.u8_at(*ptr)?;
-    *ptr += 1;
-    let attr = (attr0 & 0x38) | (DEF_DST[((attr0 & 0x38) >> 3) as usize] << 6);
-    let dptr_start = *ptr;
-    let dst = get_dst(state, frame, arg, attr, ptr)?;
-    let saved = dst;
-    let shift = get_src_direct(frame, SRC_BYTE0, ptr)? as u32;
-    let result = dst.wrapping_shl(shift);
-    let mut dptr = dptr_start;
-    put_dst(state, frame, arg, attr, &mut dptr, result, saved)
-}
-
-fn op_shift_right(
-    state: &mut AtomState,
-    frame: &mut Frame,
-    arg: u8,
-    ptr: &mut usize,
-) -> Result<(), AtomError> {
-    let attr0 = frame.u8_at(*ptr)?;
-    *ptr += 1;
-    let attr = (attr0 & 0x38) | (DEF_DST[((attr0 & 0x38) >> 3) as usize] << 6);
-    let dptr_start = *ptr;
-    let dst = get_dst(state, frame, arg, attr, ptr)?;
-    let saved = dst;
-    let shift = get_src_direct(frame, SRC_BYTE0, ptr)? as u32;
-    let result = dst.wrapping_shr(shift);
-    let mut dptr = dptr_start;
-    put_dst(state, frame, arg, attr, &mut dptr, result, saved)
-}
-
-fn op_shl(
-    state: &mut AtomState,
-    frame: &mut Frame,
-    arg: u8,
-    ptr: &mut usize,
-) -> Result<(), AtomError> {
-    let attr = frame.u8_at(*ptr)?;
-    *ptr += 1;
-    let dst_align = ((attr >> 3) & 7) as usize;
-    let dst_shift = ((attr >> 6) & 3) as usize;
-    let align = DST_TO_SRC[dst_align][dst_shift] as usize;
-    let dptr_start = *ptr;
-    let _ = get_dst(state, frame, arg, attr, ptr)?;
-    let saved = 0u32; // atom.c:978: dst = saved; saved itself is the dst
-    let shift = get_src(state, frame, attr, ptr)?;
-    let mut dst = saved.wrapping_shl(shift);
-    dst &= ARG_MASK[align];
-    dst >>= ARG_SHIFT[align];
-    let mut dptr = dptr_start;
+        dst.wrapping_shr(shift)
+    };
     put_dst(state, frame, arg, attr, &mut dptr, dst, saved)
 }
 
-fn op_shr(
-    state: &mut AtomState,
+/// `atom_op_shl` / `atom_op_shr`: "op needs to full dst value" — the raw
+/// destination is shifted by a source operand, then realigned.
+fn op_shl_shr<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
     frame: &mut Frame,
     arg: u8,
     ptr: &mut usize,
+    left: bool,
 ) -> Result<(), AtomError> {
     let attr = frame.u8_at(*ptr)?;
     *ptr += 1;
-    let dst_align = ((attr >> 3) & 7) as usize;
-    let dst_shift = ((attr >> 6) & 3) as usize;
-    let align = DST_TO_SRC[dst_align][dst_shift] as usize;
-    let dptr_start = *ptr;
-    let _ = get_dst(state, frame, arg, attr, ptr)?;
-    let saved = 0u32;
-    let shift = get_src(state, frame, attr, ptr)?;
-    let mut dst = saved.wrapping_shr(shift);
-    dst &= ARG_MASK[align];
-    dst >>= ARG_SHIFT[align];
-    let mut dptr = dptr_start;
+    let align = DST_TO_SRC[((attr >> 3) & 7) as usize][((attr >> 6) & 3) as usize] as usize;
+    let mut dptr = *ptr;
+    let (_, saved) = get_dst(state, frame, arg, attr, ptr)?;
+    // `shift` is a uint8_t in atom.c.
+    let shift = u32::from(get_src(state, frame, attr, ptr)? as u8);
+    let dst = if left {
+        saved.wrapping_shl(shift)
+    } else {
+        saved.wrapping_shr(shift)
+    };
+    let dst = (dst & ARG_MASK[align]) >> ARG_SHIFT[align];
     put_dst(state, frame, arg, attr, &mut dptr, dst, saved)
 }
 
-fn op_mask(
-    state: &mut AtomState,
+fn op_mask<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
     frame: &mut Frame,
     arg: u8,
     ptr: &mut usize,
 ) -> Result<(), AtomError> {
     let attr = frame.u8_at(*ptr)?;
     *ptr += 1;
-    let dptr_start = *ptr;
-    let dst_in = get_dst(state, frame, arg, attr, ptr)?;
-    let saved = dst_in;
+    let mut dptr = *ptr;
+    let (dst, saved) = get_dst(state, frame, arg, attr, ptr)?;
     let mask = get_src_direct(frame, (attr >> 3) & 7, ptr)?;
     let src = get_src(state, frame, attr, ptr)?;
-    let result = (dst_in & mask) | src;
-    let mut dptr = dptr_start;
-    put_dst(state, frame, arg, attr, &mut dptr, result, saved)
+    put_dst(
+        state,
+        frame,
+        arg,
+        attr,
+        &mut dptr,
+        (dst & mask) | src,
+        saved,
+    )
 }
 
-fn op_switch(state: &mut AtomState, frame: &mut Frame, ptr: &mut usize) -> Result<(), AtomError> {
+fn op_switch<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
+    frame: &mut Frame,
+    ptr: &mut usize,
+) -> Result<(), AtomError> {
     let attr = frame.u8_at(*ptr)?;
     *ptr += 1;
     let src = get_src(state, frame, attr, ptr)?;
@@ -1157,13 +1270,12 @@ fn op_switch(state: &mut AtomState, frame: &mut Frame, ptr: &mut usize) -> Resul
             *ptr += 2;
             return Ok(());
         }
-        let magic = frame.u8_at(*ptr)?;
-        if magic != CASE_MAGIC {
+        if frame.u8_at(*ptr)? != CASE_MAGIC {
             return Err(AtomError::BadSwitchCase);
         }
         *ptr += 1;
         let case_val = get_src(state, frame, (attr & 0x38) | ARG_IMM, ptr)?;
-        let target = frame.u16_at(*ptr)? as usize;
+        let target = usize::from(frame.u16_at(*ptr)?);
         if case_val == src {
             if target < 6 || target - 6 >= frame.code.len() {
                 return Err(AtomError::BadJumpTarget);
@@ -1176,8 +1288,8 @@ fn op_switch(state: &mut AtomState, frame: &mut Frame, ptr: &mut usize) -> Resul
 }
 
 fn op_processds(frame: &Frame, ptr: &mut usize) -> Result<(), AtomError> {
-    let val = frame.u16_at(*ptr)? as usize;
-    *ptr = ptr.wrapping_add(val + 2);
+    let val = usize::from(frame.u16_at(*ptr)?);
+    *ptr += val + 2;
     if *ptr > frame.code.len() {
         return Err(AtomError::BytecodeTruncated);
     }
@@ -1361,36 +1473,78 @@ fn decode_op(op: u8) -> Result<Op, AtomError> {
     Ok(o)
 }
 
-fn run_op(
-    state: &mut AtomState,
+fn run_op<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
     frame: &mut Frame,
     op: Op,
     ptr: &mut usize,
-) -> Result<bool, AtomError> {
+) -> Result<Flow<'a>, AtomError> {
     use Op::*;
     match op {
         Move(a) => op_move(state, frame, a, ptr)?,
-        And(a) => binop_inplace(state, frame, a, ptr, |d, s| d & s)?,
-        Or(a) => binop_inplace(state, frame, a, ptr, |d, s| d | s)?,
-        Xor(a) => binop_inplace(state, frame, a, ptr, |d, s| d ^ s)?,
-        Add(a) => binop_inplace(state, frame, a, ptr, |d, s| d.wrapping_add(s))?,
-        Sub(a) => binop_inplace(state, frame, a, ptr, |d, s| d.wrapping_sub(s))?,
-        ShiftLeft(a) => op_shift_left(state, frame, a, ptr)?,
-        ShiftRight(a) => op_shift_right(state, frame, a, ptr)?,
-        Shl(a) => op_shl(state, frame, a, ptr)?,
-        Shr(a) => op_shr(state, frame, a, ptr)?,
-        Mul(a) | Mul32(a) => op_mul(state, frame, a, ptr)?,
-        Div(a) | Div32(a) => op_div(state, frame, a, ptr)?,
-        Compare(a) => op_compare(state, frame, a, ptr)?,
-        Test(a) => op_test(state, frame, a, ptr)?,
+        And(a) => binop(state, frame, a, ptr, |d, s| d & s)?,
+        Or(a) => binop(state, frame, a, ptr, |d, s| d | s)?,
+        Xor(a) => binop(state, frame, a, ptr, |d, s| d ^ s)?,
+        Add(a) => binop(state, frame, a, ptr, |d, s| d.wrapping_add(s))?,
+        Sub(a) => binop(state, frame, a, ptr, |d, s| d.wrapping_sub(s))?,
+        ShiftLeft(a) => op_shift(state, frame, a, ptr, true)?,
+        ShiftRight(a) => op_shift(state, frame, a, ptr, false)?,
+        Shl(a) => op_shl_shr(state, frame, a, ptr, true)?,
+        Shr(a) => op_shl_shr(state, frame, a, ptr, false)?,
+        Mul(a) => {
+            let (dst, src) = operands(state, frame, a, ptr)?;
+            state.divmul[0] = dst.wrapping_mul(src);
+        }
+        Mul32(a) => {
+            // atom_op_mul32: the 64-bit product in divmul[1]:divmul[0].
+            let (dst, src) = operands(state, frame, a, ptr)?;
+            let product = u64::from(dst) * u64::from(src);
+            state.divmul = [product as u32, (product >> 32) as u32];
+        }
+        Div(a) => {
+            let (dst, src) = operands(state, frame, a, ptr)?;
+            state.divmul = match src {
+                0 => [0, 0],
+                _ => [dst / src, dst % src],
+            };
+        }
+        Div32(a) => {
+            // atom_op_div32: divmul[1]:dst divided by src, the 64-bit
+            // quotient in divmul[1]:divmul[0].
+            let (dst, src) = operands(state, frame, a, ptr)?;
+            state.divmul = match src {
+                0 => [0, 0],
+                _ => {
+                    let quotient =
+                        (u64::from(state.divmul[1]) << 32 | u64::from(dst)) / u64::from(src);
+                    [quotient as u32, (quotient >> 32) as u32]
+                }
+            };
+        }
+        Compare(a) => {
+            let (dst, src) = operands(state, frame, a, ptr)?;
+            state.cs_equal = dst == src;
+            state.cs_above = dst > src;
+        }
+        Test(a) => {
+            let (dst, src) = operands(state, frame, a, ptr)?;
+            state.cs_equal = (dst & src) == 0;
+        }
         Jump(c) => op_jump(state, frame, c, ptr)?,
         Switch => op_switch(state, frame, ptr)?,
         SetPort(p) => op_setport(state, frame, p, ptr)?,
-        SetRegBlock => op_setregblock(state, frame, ptr)?,
-        SetFbBase => op_setfbbase(state, frame, ptr)?,
+        SetRegBlock => {
+            state.reg_block = frame.u16_at(*ptr)?;
+            *ptr += 2;
+        }
+        SetFbBase => {
+            let attr = frame.u8_at(*ptr)?;
+            *ptr += 1;
+            state.fb_base = get_src(state, frame, attr, ptr)?;
+        }
         SetDataBlock => op_setdatablock(state, frame, ptr)?,
-        Delay(u) => op_delay(state, frame, u, ptr)?,
-        CallTable => op_calltable(state, frame, ptr)?,
+        Delay(u) => return op_delay(frame, u, ptr).map(Flow::Delay),
+        CallTable => return op_calltable(state, frame, ptr),
         Clear(a) => op_clear(state, frame, a, ptr)?,
         Mask(a) => op_mask(state, frame, a, ptr)?,
         ProcessDs => op_processds(frame, ptr)?,
@@ -1400,193 +1554,267 @@ fn run_op(
         Nop | Beep => {}
         // Linux: each takes a single u8 operand it just prints.
         PostCard | Debug => {
-            let _ = frame.u8_at(*ptr)?;
+            frame.u8_at(*ptr)?;
             *ptr += 1;
         }
-        Eot => return Ok(true),
+        Eot => return Ok(Flow::Eot),
     }
-    Ok(false)
+    Ok(Flow::Next)
 }
 
-/// Execute the bytecode in `code` until EOT or an error. `params`
-/// is the caller's PS. `ps_shift` is the table-header PS-shift
-/// (Linux: `CU8(base + ATOM_CT_PS_PTR) & 0x7F`, divided by 4).
-pub fn execute_bytes(
-    state: &mut AtomState,
-    code: &[u8],
-    params: &mut [u32],
-    ps_shift: usize,
-) -> Result<(), AtomError> {
-    run_table(state, code, params, ps_shift, 0, 0)
+// ── Machine (amdgpu_atom_execute_table_locked) ───────────────────
+
+/// What [`Machine::step`] did.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// One opcode ran; more remain.
+    Continue,
+    /// A DELAY opcode ran: wait this many microseconds, then step again
+    /// (`udelay` below 1000, `msleep` otherwise in Linux).
+    Delay(u64),
+    /// The entry table reached its EOT.
+    Done,
 }
 
-fn run_table(
-    state: &mut AtomState,
-    code: &[u8],
-    params: &mut [u32],
+/// Where the last opcode came from, for traces and failure reports.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct OpSite {
+    pub opcode: u8,
+    /// Image offset of the executing table's header (`ctx->start`).
+    pub table_start: usize,
+    /// Offset of the opcode within the table body (after the prelude).
+    pub offset: usize,
+    /// CALLTABLE depth (0 for the entry table).
+    pub depth: u32,
+}
+
+#[derive(Debug)]
+struct Record<'c> {
+    code: &'c [u8],
+    ptr: usize,
+    /// Offset of this execution's PS window in the entry table's PS.
+    ps_base: usize,
     ps_shift: usize,
-    depth: u32,
     start: usize,
-) -> Result<(), AtomError> {
-    let mut frame = Frame {
-        code,
-        ps: params,
-        ps_shift,
-        depth,
-        start,
-    };
-    let mut ptr = 0usize;
-    let mut steps: u32 = 0;
-    loop {
-        if ptr >= frame.code.len() {
-            return Err(AtomError::BytecodeTruncated);
+    /// The caller's WS while this table runs on its own.
+    saved_ws: Option<Vec<u32>>,
+    jump: JumpGuard,
+}
+
+/// One `amdgpu_atom_execute_table` in progress: an explicit CALLTABLE
+/// stack, stepped one opcode at a time. Dropping it mid-way leaves `state`
+/// holding the innermost table's WS; discard the state with it.
+pub struct Machine<'c, 'p> {
+    stack: Vec<Record<'c>>,
+    ps: &'p mut [u32],
+    steps: u64,
+    clockless: bool,
+    last: Option<OpSite>,
+}
+
+impl fmt::Debug for Machine<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Machine")
+            .field("depth", &self.stack.len())
+            .field("steps", &self.steps)
+            .field("last", &self.last)
+            .finish()
+    }
+}
+
+impl<'c, 'p> Machine<'c, 'p> {
+    /// `amdgpu_atom_execute_table`: reset the per-execution context
+    /// (data block, register block, FB window, I/O mode, divmul), resolve
+    /// `table_id` and give it its own zeroed WS. `params` is the caller's
+    /// PS (`params_size` dwords).
+    pub fn start<'a: 'c, H: Hooks<'a>>(
+        state: &mut AtomState<'a, H>,
+        table_id: u8,
+        params: &'p mut [u32],
+    ) -> Result<Self, AtomError> {
+        let table = state
+            .hooks
+            .resolve(table_id)
+            .ok_or(AtomError::UnknownTable(table_id))?;
+        state.data_block = 0;
+        state.reg_block = 0;
+        state.fb_base = 0;
+        state.io_mode = IO_MM;
+        state.divmul = [0, 0];
+        if state.iio.is_none() && !state.bios.is_empty() {
+            state.index_iio();
         }
-        let opcode = frame.code[ptr];
+        let saved_ws = table
+            .ws_dwords
+            .map(|ws| core::mem::replace(&mut state.scratch, vec![0u32; ws]));
+        Ok(Self {
+            stack: vec![Record {
+                code: table.body,
+                ptr: 0,
+                ps_base: 0,
+                ps_shift: table.ps_dwords,
+                start: table.start,
+                saved_ws,
+                jump: JumpGuard::default(),
+            }],
+            ps: params,
+            steps: 0,
+            clockless: state.hooks.now_ms().is_none(),
+            last: None,
+        })
+    }
+    /// Run raw bytecode as an entry table, without the per-execution reset
+    /// or a WS of its own (synthetic tables).
+    pub fn from_bytes(code: &'c [u8], params: &'p mut [u32], ps_shift: usize) -> Self {
+        Self {
+            stack: vec![Record {
+                code,
+                ptr: 0,
+                ps_base: 0,
+                ps_shift,
+                start: 0,
+                saved_ws: None,
+                jump: JumpGuard::default(),
+            }],
+            ps: params,
+            steps: 0,
+            clockless: true,
+            last: None,
+        }
+    }
+    /// Current CALLTABLE depth (1 for the entry table, 0 when done).
+    pub fn depth(&self) -> usize {
+        self.stack.len()
+    }
+    pub fn steps(&self) -> u64 {
+        self.steps
+    }
+    pub fn last(&self) -> Option<OpSite> {
+        self.last
+    }
+    /// Execute one opcode. An error unwinds every frame (restoring the
+    /// caller's WS) and is terminal.
+    pub fn step<'a: 'c, H: Hooks<'a>>(
+        &mut self,
+        state: &mut AtomState<'a, H>,
+    ) -> Result<Step, AtomError> {
+        let result = self.step_inner(state);
+        if result.is_err() {
+            while let Some(record) = self.stack.pop() {
+                if let Some(ws) = record.saved_ws {
+                    state.scratch = ws;
+                }
+            }
+        }
+        result
+    }
+    fn step_inner<'a: 'c, H: Hooks<'a>>(
+        &mut self,
+        state: &mut AtomState<'a, H>,
+    ) -> Result<Step, AtomError> {
+        let depth = self.stack.len();
+        let Some(record) = self.stack.last_mut() else {
+            return Ok(Step::Done);
+        };
+        let base = record.ps_base.min(self.ps.len());
+        let mut ptr = record.ptr;
+        let opcode = *record.code.get(ptr).ok_or(AtomError::BytecodeTruncated)?;
+        self.last = Some(OpSite {
+            opcode,
+            table_start: record.start,
+            offset: ptr,
+            depth: depth as u32 - 1,
+        });
         ptr += 1;
         if opcode == 0 || opcode >= ATOM_OP_CNT {
             return Err(AtomError::BadOpcode(opcode));
         }
         let op = decode_op(opcode)?;
-        let done = run_op(state, &mut frame, op, &mut ptr)?;
-        if done {
-            return Ok(());
-        }
-        steps = steps.saturating_add(1);
-        if steps > 1_000_000 {
-            // Belt-and-suspenders: even with the per-jump stuck
-            // detector, hard-cap total opcode steps.
+        let mut frame = Frame {
+            code: record.code,
+            ps: &mut self.ps[base..],
+            ps_shift: record.ps_shift,
+            depth: depth as u32 - 1,
+            start: record.start,
+            jump: &mut record.jump,
+        };
+        let flow = run_op(state, &mut frame, op, &mut ptr)?;
+        let shift = frame.ps_shift.min(frame.ps.len());
+        record.ptr = ptr;
+        self.steps += 1;
+        if self.clockless && self.steps > STEP_CAP {
             return Err(AtomError::Stuck);
+        }
+        Ok(match flow {
+            Flow::Next => Step::Continue,
+            Flow::Delay(us) => Step::Delay(us),
+            Flow::Eot => {
+                if let Some(ws) = self.stack.pop().and_then(|r| r.saved_ws) {
+                    state.scratch = ws;
+                }
+                if self.stack.is_empty() {
+                    Step::Done
+                } else {
+                    Step::Continue
+                }
+            }
+            Flow::Call(table) => {
+                // `ctx->ps + ctx->ps_shift`, `ctx->ps_size - ctx->ps_shift`.
+                let saved_ws = table
+                    .ws_dwords
+                    .map(|ws| core::mem::replace(&mut state.scratch, vec![0u32; ws]));
+                self.stack.push(Record {
+                    code: table.body,
+                    ptr: 0,
+                    ps_base: base + shift,
+                    ps_shift: table.ps_dwords,
+                    start: table.start,
+                    saved_ws,
+                    jump: JumpGuard::default(),
+                });
+                Step::Continue
+            }
+        })
+    }
+}
+
+fn drive<'a: 'c, 'c, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
+    mut machine: Machine<'c, '_>,
+) -> Result<(), AtomError> {
+    loop {
+        match machine.step(state)? {
+            Step::Continue => {}
+            Step::Delay(us) => state.hooks.delay_us(us),
+            Step::Done => return Ok(()),
         }
     }
 }
 
-/// Execute a command table by id.
-///
-/// `table_loader` returns the `&[u8]` for the requested table id;
-/// this lets the caller back the VM with the parsed
-/// `amdgpu_atombios::Atombios` without taking a hard borrow inside
-/// the VM itself. The bytecode passed in already has its
-/// `ATOM_CT_*` header stripped — feed the post-`+6` body.
-pub fn execute_table(
-    state: &mut AtomState,
+/// Execute the bytecode in `code` until EOT or an error. `params`
+/// is the caller's PS. `ps_shift` is the table-header PS-shift
+/// (Linux: `CU8(base + ATOM_CT_PS_PTR) & 0x7F`, divided by 4).
+pub fn execute_bytes<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
+    code: &[u8],
+    params: &mut [u32],
+    ps_shift: usize,
+) -> Result<(), AtomError> {
+    drive(state, Machine::from_bytes(code, params, ps_shift))
+}
+
+/// Execute a command table by id, synchronously (`amdgpu_atom_execute_table`).
+/// DELAY opcodes call [`Hooks::delay_us`]; use [`Machine`] to sleep
+/// cooperatively instead.
+pub fn execute_table<'a, H: Hooks<'a>>(
+    state: &mut AtomState<'a, H>,
     table_id: u8,
     params: &mut [u32],
 ) -> Result<(), AtomError> {
-    let table = match (state.table_resolver)(table_id) {
-        Some(t) => t,
-        None => return Err(AtomError::UnknownTable(table_id)),
-    };
-    // Reset per-execute state — atom.c:1296-1306.
-    state.data_block = 0;
-    state.reg_block = 0;
-    state.fb_base = 0;
-    state.io_mode = IO_MM;
-    state.divmul = [0, 0];
-    state.last_jump_addr = 0;
-    state.last_jump_count = 0;
-    // `atom.c:1255` takes the entry table's own declared parameter size, not
-    // zero: a zero shift makes every CALLTABLE from this table hand the callee
-    // this table's own parameter window.
-    with_ws(state, table.ws_dwords, |state| {
-        run_table(state, table.body, params, table.ps_dwords, 0, table.start)
-    })
+    let machine = Machine::start(state, table_id, params)?;
+    drive(state, machine)
 }
 
-#[cfg(test)]
-mod inline_tests {
-    use super::*;
-
-    /// Synthetic table: `MOVE PS[0] <- IMM_DWORD 0x12345678; EOT`.
-    /// Validates immediate-DWORD source decoding + PS write.
-    #[test]
-    fn move_imm_dword_into_ps() {
-        // attr layout: align=DWORD(0)<<3=0, arg=IMM=5, dst_shift=0
-        // → attr = 0x05. But for MOVE the dst alignment is read
-        //   from the same attr's dst-shift bits — for a full DWORD
-        //   write to PS, dst_shift=0, dst_align=DWORD(0).
-        // op 2 = MOVE(PS); attr = 0x05; dst index byte = 0;
-        // imm dword = 0x78 0x56 0x34 0x12; EOT (91).
-        let code = &[2u8, 0x05, 0x00, 0x78, 0x56, 0x34, 0x12, 91];
-        let mut state = AtomState::new(8, 4);
-        let mut ps = [0u32; 1];
-        execute_bytes(&mut state, code, &mut ps, 0).unwrap();
-        assert_eq!(ps[0], 0x1234_5678);
-    }
-
-    /// Synthetic table: `MOVE WS[2] <- IMM 0xAA; ADD WS[2] += IMM 0x11; EOT`.
-    /// Verifies WS round-trip and ADD on the same slot.
-    #[test]
-    fn add_accumulates_into_ws() {
-        // MOVE(WS=op3) attr=0x05 imm dword, dst idx byte = 2.
-        // imm = 0xAA 0 0 0 (DWORD).
-        // ADD(WS=op45) attr=0x05 dst idx byte = 2, imm = 0x11 0 0 0.
-        let code = &[
-            3, 0x05, 2, 0xAA, 0, 0, 0, // MOVE WS[2] <- 0xAA
-            45, 0x05, 2, 0x11, 0, 0, 0,  // ADD WS[2] += 0x11
-            91, // EOT
-        ];
-        let mut state = AtomState::new(8, 4);
-        let mut ps: [u32; 1] = [0];
-        execute_bytes(&mut state, code, &mut ps, 0).unwrap();
-        assert_eq!(state.scratch[2], 0xBB);
-    }
-
-    /// Synthetic: COMPARE PS[0] vs IMM, then conditional JUMP.
-    #[test]
-    fn compare_and_jump_equal_taken() {
-        // Preload: MOVE PS[0] <- 0x42 (op 2, attr 0x05, idx 0,
-        // dword 0x42 0 0 0). That's 7 bytes.
-        // COMPARE(PS)=op61, attr=0x05, dst=0, src dword=0x42.
-        //   That's 1 + 1 + 1 + 4 = 7 bytes.
-        // JUMP_EQUAL=op68 target u16 = small offset past 91-EOT.
-        // EOT=91.
-        //
-        // Layout offsets in `code`:
-        //   0: MOVE      → bytes 0..7
-        //   7: COMPARE   → bytes 7..14
-        //  14: JUMP_EQUAL→ bytes 14..17 (opcode + u16 target)
-        //  17: EOT (the jump should skip past this is wrong; let
-        //          us instead jump *forward* to a second EOT)
-        //  18: BAD opcode 0x77 (would fail if reached)
-        //  19: EOT (target)
-        //
-        // Target byte-offset in the table-with-header world is
-        // `local + 6`; we want local=19 so target=25.
-        let code = &[
-            2, 0x05, 0, 0x42, 0, 0, 0, // MOVE PS[0] <- 0x42
-            61, 0x05, 0, 0x42, 0, 0, 0, // COMPARE PS[0] vs IMM 0x42
-            68, 25, 0,    // JUMP_EQUAL → local 19
-            0x77, // unreachable
-            0x77, // unreachable
-            91,   // EOT @ local 19
-        ];
-        assert_eq!(code.len(), 20);
-        let mut state = AtomState::new(8, 4);
-        let mut ps: [u32; 1] = [0];
-        execute_bytes(&mut state, code, &mut ps, 0).unwrap();
-        assert!(state.cs_equal);
-        // PS[0] stays 0x42.
-        assert_eq!(ps[0], 0x42);
-    }
-
-    #[test]
-    fn bad_opcode_rejected() {
-        let code = &[127u8, 91]; // 127 == ATOM_OP_CNT (out of range)
-        let mut state = AtomState::new(4, 4);
-        let mut ps: [u32; 0] = [];
-        assert_eq!(
-            execute_bytes(&mut state, code, &mut ps, 0),
-            Err(AtomError::BadOpcode(127))
-        );
-    }
-
-    #[test]
-    fn truncated_table_returns_error() {
-        // No EOT at all.
-        let code = &[2u8, 0x05, 0, 1, 0, 0, 0];
-        let mut state = AtomState::new(4, 4);
-        let mut ps: [u32; 1] = [0];
-        let r = execute_bytes(&mut state, code, &mut ps, 0);
-        assert_eq!(r, Err(AtomError::BytecodeTruncated));
-    }
-}
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_atom_vm_tests.rs"]
+mod tests;

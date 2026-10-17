@@ -946,6 +946,13 @@ Linux does whenever the VBIOS left SOS running: PMFW (or PSP) mode1 reset,
 PCI config restore including Resizable BAR sizes, then bootloader and MEMSIZE
 waits. Without it the sequence would load SMC/graphics/DMCUB over the
 VBIOS-started SOS and PMFW, a state Linux never initializes from.
+`ResetOnInit` then posts as `amdgpu_device_need_post` does: when BIOS_SCRATCH_7
+lacks ATOM_S7_ASIC_INIT_COMPLETE (after a mode1 reset, or on a never-posted
+card; always after a recovery reset) it runs ATOM ASIC_Init from the retained
+VBIOS through the stepped `amdgpu_atom_vm` (now with IIO programs, Linux's
+sub-dword/SHL/SHR/MUL32/DIV32 semantics and cooperative DELAY sleeps) and
+requires the bit afterwards; a GOP-posted card with the bit set is not posted.
+`drivers/gpu/tools/atom-trace` replays ASIC_Init from a dumped ROM on the host.
 OSSSYS 5.0.3 IH ring 0 now follows navi10_ih_irq_init with a VRAM ring
 reached through VMID0, MSI-X/MSI delivery with polling fallback, and
 overflow-safe task-context drains. It routes IVs to generation-tagged
@@ -980,6 +987,31 @@ connected HDMI sink on pipe 0 with a test pattern: DCN init, HUBBUB/DML30
 deadlines, the DAL clocks and the VBIOS PixelClock/STREAM_SETUP/transmitter
 tables (now executed by an `atom.c`-faithful interpreter), then fetch and
 unblank. Model-tested per block; never run on hardware.
+The lit pipe is presented natively: console/status publication with the
+`scanout_access` withdraw-before-teardown contract, DCN3.0 HUBP VSYNC page
+flips completed from EARLIEST_INUSE (pflip/vupdate IH sources armed), a
+256x256 DCN3.0 cursor (opt-in), KMS on the amdgpu card (DP-1..3, HDMI-A-1;
+DML30-admitted modes, SETCRTC/atomic/TEST_ONLY, disable, vblank, flip
+events) and a monitor that relights after GPU recovery. Register models only.
+For bare-metal runs, `cargo xtask usb-image` builds a UEFI stick whose kernel
+appends its log to `/narf-boot-<n>.log` on that stick (`narf.bootlog=`,
+marker-gated, USB-only, bounded); a secondary card's cold boot keeps the iGPU
+console live and ends with a per-stage summary (see
+[docs/BOOTING_ON_CACHYOS.md](docs/BOOTING_ON_CACHYOS.md#rx-6750-xt-bring-up-boot)).
+DCN3.0 HDMI and DP SST LPCM audio (`amdgpu_dcn30_audio`) follows Linux DC
+(`dce_audio.c`, `dcn30_afmt.c`, `enc3_se_*_audio_*`, `dce110_*_audio_stream`):
+audio wall-clock DTO0/DTO1, AFMT/ACR, the Audio InfoFrame and the Azalia
+endpoint ELD from the EDID, behind a start-after-unblank / stop-before-blank
+hook. The HD-Audio side binds 1002:ab28 (ATI HDMI NS, no snoop); a model of
+the host's six-port R6xx HDMI codec (rev 0x100800) checks that endpoint `e`
+reports jack and ELD on pin `3 + 2e` and routes playback there. Register
+models only.
+Mesa 26.2.4 radeonsi + RADV (ACO-only, llvmpipe fallback kept) now builds
+reproducibly for NARF's musl userspace and stages into a rootfs; the
+`mesa-amd-smoke` passes inside NARF under QEMU with no AMD GPU (clean
+decline, software fallback renders) and the same binaries render on a Linux
+amdgpu host ([Mesa AMD](docs/MESA_AMD.md)). libdrm_amdgpu's `GET_CLIENT` on
+primary nodes is the first NARF gap Mesa hits.
 The firmware path now follows Linux on the GOP-booted (SOS not alive) cold
 path: KM-type PSP rings on every PSP generation, LOAD_TOC → SMC → SETUP_TMR
 (PMFW-centralized C-states), DCN3.0's own FB register offsets, Linux's GART

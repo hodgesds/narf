@@ -3682,7 +3682,24 @@ PMFW (`Mode1Reset`, PMFW >= 58.26) or else through the PSP
 MMIO while config space is reset — it restores and verifies config space,
 waits up to 2 s for the PSP bootloader (C2PMSG_35 bit 31) and 100 ms for NBIO
 MEMSIZE, and brackets the reset with the ATOM BIOS_SCRATCH_3 engine-hung flag.
-A card without running SOS is left untouched (`Ok(None)`). The reset discards
+A card without running SOS is not reset (`Ok(None)`). Either way the stage then
+posts as `amdgpu_device_need_post`/`amdgpu_device_asic_init` do: BIOS_SCRATCH_7
+at `adev->bios_scratch_reg_offset` (FirmwareInfo `bios_scratch_reg_startaddr`,
+else nbio_2_3 `mmBIOS_SCRATCH_0`) is read; with `ATOM_S7_ASIC_INIT_COMPLETE`
+set nothing is written, otherwise (and always in `Mode::Recovery`, as
+`amdgpu_device_reinit_after_reset`) ATOM `ASIC_Init` runs from the VBIOS copied
+at construction with PS[0]/PS[1] the FirmwareInfo boot-up sclk/mclk dwords,
+the atomfirmware FB scratch size, register accesses through the device
+authority (past BAR5 via PCIE_INDEX2/DATA2) and every DELAY as a cooperative
+sleep, bounded by atom.c's 20 s same-jump guard and 60 s overall. The bit must
+read back set. `Report::post` / `Reset::post()` (`Post`: scratch base,
+SCRATCH_7 before/after, clocks, opcode/read/write counts, DELAY total,
+anomalies) carry the evidence; `Error::Post(PostError)` (NoVbios, Image,
+NoClocks, NoAsicInit, Allocation, Atom { error, site }, Timeout, Incomplete) is
+terminal like every reset error, and `State::Posting` is retained after
+cancellation. The PCI snapshot also keeps MSI address/data/control and the
+MSI-X Message Control plus, when it lives in BAR5, the MSI-X table, restored
+as `pci_restore_msi_state` (masked enable, table, control). The reset discards
 every inherited scanout, so a boot framebuffer on this card goes dark. Failure
 or cancellation is terminal for the session. Production boot calls it; the
 explicit firmware-only callers may omit it. `Report::reset` carries the method,
@@ -3814,6 +3831,20 @@ selects the table start), ID operands read the image, every table execution
 (including each CALLTABLE callee) gets its own zeroed WS from its header
 (`ResolvedTable::ws_dwords`), and DELAY opcodes call `AtomState::delay_us`.
 Unbound, the synthetic-table behaviour is unchanged.
+The VM is generic over `Hooks<'a>` (`reg_read`/`reg_write`, `pll_*`/`mc_*`
+defaulting to zero as SOC15 `cail_*`, `resolve`, `table_absent`, `delay_us`,
+`now_ms`); `AtomState<'a, H = Closures<'a>>` derefs to its hooks, so the
+closure fields keep working. `Machine::start(state, id, ps)` /
+`Machine::from_bytes` + `Machine::step(state) -> Step::{Continue, Delay(us),
+Done}` execute one opcode at a time with an explicit CALLTABLE stack, so async
+callers sleep between opcodes; `execute_table`/`execute_bytes` drive it
+synchronously. IIO (`ATOM_IIO_*`, indexed from data table 23 like
+`atom_index_iio`; read program `port`, write program `0x80|port`) is executed;
+sub-dword destinations keep the raw saved bits; SHL/SHR shift the raw value;
+MUL32/DIV32 are 64-bit; a CALLTABLE to a zero directory entry is a no-op. PS/WS/FB
+range, PCI/SYSIO and undefined-IIO cases continue as in Linux and are counted in
+`AtomState::anomalies`/`first_anomaly`; the same-jump stuck guard is 20 s by
+`now_ms` (65 536 repeats / 1 000 000 opcodes without a clock).
 
 ### Navi 22 native HDMI scanout (opt-in)
 
@@ -3850,6 +3881,95 @@ the console. The framebuffer handoff calls it only with the
 `amdgpu.native_display` kernel argument (the Navi48 flag). It reuses
 `amdgpu_navi48_boot::{edid_timings, hdmi_caps, hdmi_avi, limited_range,
 broadcast_rgb}` and `amdgpu_dcn401_otg::avi_infoframe`.
+
+### Navi 22 HDMI and DP audio
+
+`unsafe amdgpu_dcn30_audio::Audio::new(gpu, pci_cap)` owns the DCCG audio DTO
+(DCN base index 1), every Azalia endpoint and function-parameter register,
+and the audio fields of each DIG's AFMT/HDMI/DP_SEC block (base index 2). The
+HD-Audio function (1002:ab28, `narf_audio::hda`, ATI codec 0x1002aa01) is a
+separate owner. `unsafe start(AudioStream, AudioInfo, &mut impl AzaliaWake)`
+and `unsafe start_for_sink(stream, edid, wake)` (ELD fields from
+`amdgpu_navi48_boot::sink_audio_info`; `Ok(None)` without audio) run after
+unblank on a stream whose OTG runs with the DIG routed to it, and refuse a
+stream whose samples or DP audio packets are already on. They run
+`dce_aud_hw_init` and the endpoint scan once, `find_first_free_audio`,
+`dce110_setup_audio_dto` (lowest HDMI pipe: DTO0 from its pixel clock; DP
+only: DTO1 from the 730 MHz DPREFCLK with 512 Fs), `enc3_se_hdmi_audio_setup`
+(AFMT, ACR N/CTS at 8 bpc) or `enc3_se_dp_audio_setup`, `dce_aud_az_configure`
+(HDMI blanking rate filter; none for DP SST 8b/10b), the HDMI Audio InfoFrame
+on line 2, `AzaliaWake::wake_azalia` (Linux's `dcn3_enable_pme_wa`,
+`DALSMC_MSG_BacoAudioD3PME`), `dce_aud_az_enable`, the DP secondary audio
+packets, unmute and a readback check. `stop(dig, wake)` runs before blank:
+mute, AFMT clock and DP audio packets off (the DP master enable stays while
+video packets need it), the PME workaround, the HDMI Audio InfoFrame off and
+`dce_aud_az_disable`; every step runs and the first error is returned.
+`record(dig)` reports `Record { stream, audio: DisplayAudio, state }`; a
+failure or cancelled start is retained (`Failed { step, error }` /
+`Programming(step)`) with its endpoint, never replayed, and only `stop`
+releases it.
+
+### Navi 22 native presentation and KMS
+
+Pipeline hooks: `request(Option<Timing>)` makes `enable` light exactly that
+timing (`select_wanted`: it must be in `offered`, else `NoMode` before any
+write); `admitted()` is the retained `Admitted { soc, refclk_khz, plan,
+offered }` (`offered(sink, soc, vco)`: every distinct EDID timing inside the
+TMDS ceiling that DML30 admits); `scanout_address()`/`scanout_mapping()`;
+`unsafe release_scanout()` returns the activation surface after a successful
+`disable`.
+
+`unsafe amdgpu_dcn30_flip::Flip::new(gpu, pci_cap, pipe)` owns a pipe's
+HUBPREQ flip/address/interrupt and OTG status registers (DCN base index 2):
+`program(addr)` is `hubp3_program_surface_flip_and_addr` (VSYNC flip, VMID 0,
+stereo/TMZ off, low address last; 48-bit, 256-byte aligned), `pending()` is
+`hubp2_is_flip_pending` (FLIP_PENDING or EARLIEST_INUSE != requested),
+`wait(timeout_us, wake)` polls it to completion or `Timeout` (the flip stays
+armed), `set_interrupt`/`ack(Interrupt::{Flip, Vupdate, Vblank})` are
+`irq_service_dcn30`'s SURFACE_FLIP_INT_MASK/CLEAR and
+OTG_GLOBAL_SYNC_STATUS VUPDATE_NO_LOCK/VSTARTUP enable/clear, and
+`position()` samples OTG_STATUS_POSITION with a stable 24-bit frame count.
+`unsafe amdgpu_dcn30_cursor::Cursor::new(gpu, pci_cap, pipe)`:
+`show(addr, (w, h), at, viewport, (refclk, pixclk))` programs
+`hubp2_cursor_set_attributes` + `dpp3_set_cursor_attributes` (premultiplied
+ARGB, 256-pixel pitch, no degamma) and the position under
+`mpc1_cursor_lock` (CUR_VUPDATE_LOCK_SET, base index 3); `move_to`, `hide`.
+`placement` follows amdgpu_dm `get_cursor_position` and
+`hubp2_cursor_set_position` (negative origin into the hotspot, 256x256 cap).
+
+`unsafe amdgpu_navi22_scanout::Scanout::new(gpu, pci_cap, pipe, front, map,
+timing, refclk)` adopts the lit surface as buffer 0: `prepare_back(pool,
+flush)` reserves/clears/publishes buffer 1, `upload_back(x, y, row)` writes
+it, `flip(flush)` HDP-flushes, arms and waits up to `flip_timeout_us` (four
+frames + 20 ms, at least 50 ms) for EARLIEST_INUSE, then swaps roles;
+failure enters `State::Failed` with both buffers reserved.
+`enable_interrupts(ih)` subscribes to `source::{pflip, vupdate}(pipe)` and
+then enables them; vectors only shorten the wait. `set_cursor`,
+`move_cursor`, `hide_cursor`, `position()`, `stop()` and `unsafe release()`.
+
+`ColdBoot::{modeset_display(connector, sink, want, draw), stop_display(),
+display_scanout(), display_admitted(), display_output(),
+prepare_display_back_buffer(), flip_display(), set_display_cursor()}` own
+these. `into_recovery` re-prepares DMUB and the display owner from the
+retained VBIOS/routes so the recovered sequence restarts DMUB.
+
+`amdgpu_navi22_kms` holds DRM state: one CRTC (pipe 0, id 1) and one
+connector per board route (ids per `amdgpu_navi48_kms`); HDMI connectors
+offer the DML30-admitted timings, DP ports report sinks without modes.
+`request_display_{active,route,mode}`, `request_connector_crtc`,
+`display_offers` (TEST_ONLY/SETCRTC validation), `restore_displays`, `publish`,
+`display_admission(admitted, streams)` (`DisplayAdmission`: DML30 DRAM clock
+change; stutter/FCLK/watermark table/deep sleep false). `amdgpu_native_kms`
+dispatches the DRM bridges to Navi22 once it published, else Navi48.
+`amdgpu_navi22_platform::{modeset_displays(draw), spawn_display_monitor(),
+flip_display(), set_display_cursor(), set_hw_cursor(), present_frame(),
+native_present_ready(), crtc_vblank(), vblank_time(), display_admission(),
+relight_after_recovery()}`: publication withdraws the console and drains
+`scanout_access` before any teardown; recovery withdraws and stops the pipe
+before reset and the monitor relights once `recoveries()` increments. The fb
+handoff calls `modeset_displays` and the monitor with `amdgpu.native_display`
+(`amdgpu.navi22_hw_cursor` opts into the hardware cursor; display detection
+runs only with `amdgpu.native_display` or `amdgpu.display_probe`).
 
 ### Navi 22 native AUX, DDC and HPD
 

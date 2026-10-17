@@ -1536,3 +1536,7 @@ argument = "The executor's live-mm registry retains only an Arc clone of the add
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The registry is scheduler-private metadata and carries no authority beyond the existing address-space reference. It neither performs a kernel-side data access nor bypasses capability checks or domain tags; callers continue through their existing authorization and uaccess paths."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame/ edit only gates two existing Late initcalls (btrfs-disk-smoke, btrfs-write-smoke) behind the narf.btrfs_smoke boot argument, which xtask passes solely when it serves its own disposable btrfs image. It removes an unconditional write to whatever btrfs volume a bare-metal host exposes, and adds no authority, memory access, domain transition or TCB member."
