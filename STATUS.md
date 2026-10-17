@@ -368,6 +368,11 @@ Linux does whenever the VBIOS left SOS running: PMFW (or PSP) mode1 reset,
 PCI config restore including Resizable BAR sizes, then bootloader and MEMSIZE
 waits. Without it the sequence would load SMC/graphics/DMCUB over the
 VBIOS-started SOS and PMFW, a state Linux never initializes from.
+OSSSYS 5.0.3 IH ring 0 now follows navi10_ih_irq_init with a VRAM ring
+reached through VMID0, MSI-X/MSI delivery with polling fallback, and
+overflow-safe task-context drains. It routes IVs to generation-tagged
+subscribers that receive a terminal error on device loss. Boot enables it
+after the memory hubs and proves delivery with an SDMA0 TRAP.
 These are software-tested foundations; training resume,
 VCN startup, display-aware DPM and OS thermal interrupt handling,
 hardware boot, general GPU mappings/GFX10 queue initialization, production
