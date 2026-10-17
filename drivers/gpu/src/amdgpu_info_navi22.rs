@@ -22,7 +22,8 @@
 //! [`SUBMISSION`] is the one place that decides whether userspace is told the
 //! GPU accepts work: `ACCEL_WORKING`, every `available_rings` mask,
 //! `HW_IP_COUNT` and `AMDGPU_IDS_FLAGS_GANG_SUBMIT` all derive from it, as do
-//! the DRM version minor and the native render ioctls (`amdgpu_navi22_drm`).
+//! the DRM version minor and whether `amdgpu_navi22_cs` registers the card's
+//! submitter.
 //!
 //! LINUX-GAP: `gpu_counter_freq` (VBIOS gfx_info refclk), `vram_type` /
 //! `vram_bit_width` (VBIOS vram_info), memory clocks (SMU UCLK range),
@@ -53,14 +54,24 @@ pub enum Submission {
 }
 
 /// THE switch. `Wired` since `AMDGPU_CS` runs client IBs on the verified
-/// kernel queues under per-client VMIDs with fences (`amdgpu_navi22_drm`,
-/// `amdgpu_navi22_submit`; register-model proof
+/// kernel queues in each client's GPUVM with fences (`amdgpu_navi22_cs` on
+/// the generic `amdgpu_cs` path, `amdgpu_navi22_submit`; register-model proof
 /// `navi22_submit_gfx_user_vmid_ib_executes_and_fences`). Even wired,
 /// nothing is advertised unless the cold boot's ring/IB tests passed
 /// ([`Boot::queues_verified`]). Setting it to `NotWired` withdraws
 /// ACCEL_WORKING, every ring mask, HW_IP_COUNT, GANG_SUBMIT, DRM minor 64 and
 /// the render ioctls at once.
 pub const SUBMISSION: Submission = Submission::Wired;
+
+/// `amdgpu` 3.64.0 (`KMS_DRIVER_{MAJOR,MINOR,PATCHLEVEL}`) once submissions
+/// run; 3.0.0 before, which Mesa (minor ≥ 54) declines.
+pub fn drm_version() -> (u32, u32, u32) {
+    if SUBMISSION == Submission::Wired {
+        (3, 64, 0)
+    } else {
+        (3, 0, 0)
+    }
+}
 
 /// `AMDGPU_VM_RESERVED_VRAM`.
 const VM_RESERVED_VRAM: u64 = 8 << 20;

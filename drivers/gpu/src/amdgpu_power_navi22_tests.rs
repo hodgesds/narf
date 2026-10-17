@@ -189,10 +189,17 @@ fn navi22_boot_power_policy_preserves_display_and_protection() -> TestResult {
         | (1 << 34)
         | (1 << 40)
         | (1 << 41)
-        | (1 << 45)
         | (1 << 63);
     if policy.allowed() & forbidden != 0 || !policy.validate_enabled(policy.allowed()) {
         return TestResult::Fail("boot policy changes unowned display/memory power state");
+    }
+    // sienna_cichlid_init_allowed_features always allows RSMU_SMN_CG and
+    // DF_CSTATE, and Linux never fails on extra running features such as
+    // FW_DSTATE (19) or DPM_MP0CLK (6).
+    if policy.allowed() & (3 << 44) != 3 << 44
+        || !policy.validate_enabled(policy.allowed() | (1 << 19) | (1 << 6))
+    {
+        return TestResult::Fail("Linux-allowed or harmless running PMFW feature refused");
     }
     for required in [1, 24, 25, 31, 32, 33] {
         if BootPolicy::from_features(u64::MAX & !(1 << required)).is_ok()

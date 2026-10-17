@@ -5,7 +5,7 @@ use crate::{
     amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_dcn_dccg::Dccg, amdgpu_dcn_profile::Profile,
 };
 use core::future::Future;
-use narf_bus::{BusDeviceCap, MmioRegion};
+use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 const MESSAGE: u32 = 0x28a;
@@ -21,6 +21,8 @@ const DPM_BY_INDEX: u32 = 0xb;
 const DEEP_SLEEP_MIN: u32 = 0xd;
 const DISPLAYS: u32 = 0xe;
 const DF_CSTATE_ALLOW: u32 = 0x10;
+/// `DALSMC_MSG_BacoAudioD3PME`.
+const BACO_AUDIO_D3_PME: u32 = 0x11;
 const LEVELS: usize = 16;
 
 /// PPCLK ids in the DAL interface (MHz). PIXCLK supplies the global DPP clock.
@@ -164,7 +166,7 @@ trait Io: Send {
 }
 #[derive(Debug)]
 struct Mmio {
-    regs: MmioRegion,
+    regs: crate::amdgpu_reg_window::Window,
     mp1: u64,
     dcn: u64,
 }
@@ -412,7 +414,7 @@ impl ClockManager {
         Ok(Self {
             engine: Engine {
                 io: Mmio {
-                    regs: gpu.regs,
+                    regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                     mp1,
                     dcn,
                 },
@@ -437,20 +439,17 @@ impl ClockManager {
         &mut self,
         smu: &mut crate::amdgpu_smu_navi22::Smu,
     ) -> Result<Levels, Error> {
-        self.engine
-            .start(async {
-                // SAFETY: Engine::start checked every OTG and stream before
-                // polling this future; exclusive GPU ownership prevents new users.
-                unsafe { smu.enable_display_power().await }.map_err(|error| match error {
-                    crate::amdgpu_smu_navi22::Error::Revoked => Error::Revoked,
-                    crate::amdgpu_smu_navi22::Error::Busy => Error::Busy,
-                    crate::amdgpu_smu_navi22::Error::Timeout => Error::Timeout,
-                    crate::amdgpu_smu_navi22::Error::DeviceGone => Error::DeviceGone,
-                    crate::amdgpu_smu_navi22::Error::Rejected(status) => Error::Rejected(status),
-                    _ => Error::Unsupported,
-                })
-            })
-            .await
+        // SAFETY: start_with checks every OTG and stream before polling it;
+        // exclusive GPU ownership prevents new users.
+        self.start_with(unsafe { display_power(smu) }).await
+    }
+    /// [`ClockManager::start`] with the SMU display-power step supplied by the
+    /// caller (the retained SMU owner, or a model of it).
+    pub async fn start_with(
+        &mut self,
+        power: impl Future<Output = Result<(), Error>>,
+    ) -> Result<Levels, Error> {
+        self.engine.start(power).await
     }
     /// Configure a single-display mode with all six OTGs and DIG streams idle.
     /// The SMU display/memory DPM policy must have been enabled by the retained
@@ -460,12 +459,48 @@ impl ClockManager {
         self.dccg.set_reference_dppclk(plan.pixel_khz);
         Ok(())
     }
+    /// `dcn30_notify_link_rate_change`: the PHYCLK hard minimum for a DP link
+    /// at `khz` (link rate code x 27 MHz).
+    pub async fn phy_floor(&mut self, khz: u32) -> Result<(), Error> {
+        if self.engine.state != State::Configured {
+            return Err(Error::Busy);
+        }
+        self.engine.floor(Clock::Phy, khz).await
+    }
     pub fn pipe_clock(&mut self, pipe: u8, khz: u32) -> Result<(), Error> {
         if self.engine.state != State::Configured {
             return Err(Error::Busy);
         }
         self.dccg.update_dpp_dto(pipe, khz)
     }
+}
+/// `dcn3_enable_pme_wa`: wake the Azalia from D3 before its endpoint is
+/// touched. Linux ignores the result (`dcn30_smu_send_msg_with_param`'s
+/// response is not checked there); so does this.
+impl crate::amdgpu_dcn30_audio::AzaliaWake for ClockManager {
+    async fn wake_azalia(&mut self) {
+        let _ = self.engine.command(BACO_AUDIO_D3_PME, 0).await;
+    }
+}
+
+/// `smu_v11_0` display power through the retained SMU owner, with its errors
+/// in this module's terms.
+///
+/// # Safety
+/// As `Smu::enable_display_power`: poll it only as the future handed to
+/// [`ClockManager::start_with`], which checks every OTG and stream idle first.
+pub(crate) async unsafe fn display_power(
+    smu: &mut crate::amdgpu_smu_navi22::Smu,
+) -> Result<(), Error> {
+    // SAFETY: forwarded contract.
+    unsafe { smu.enable_display_power().await }.map_err(|error| match error {
+        crate::amdgpu_smu_navi22::Error::Revoked => Error::Revoked,
+        crate::amdgpu_smu_navi22::Error::Busy => Error::Busy,
+        crate::amdgpu_smu_navi22::Error::Timeout => Error::Timeout,
+        crate::amdgpu_smu_navi22::Error::DeviceGone => Error::DeviceGone,
+        crate::amdgpu_smu_navi22::Error::Rejected(status) => Error::Rejected(status),
+        _ => Error::Unsupported,
+    })
 }
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_dcn30_clk_tests.rs"]

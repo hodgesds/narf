@@ -12,7 +12,7 @@
 //! is validated. Linux masks oversized watermark values into the field; this
 //! owner refuses them instead, since a wrapped watermark underflows the pipe.
 use crate::{amdgpu::AmdGpu, amdgpu_dcn_profile::Profile, amdgpu_dml30::WatermarkSet};
-use narf_bus::{BusDeviceCap, MmioRegion};
+use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 const DF_REQ_OUTSTAND: u64 = 0x0505;
@@ -58,7 +58,7 @@ pub(crate) trait Io: Send {
 }
 #[derive(Debug)]
 struct Mmio {
-    regs: MmioRegion,
+    regs: crate::amdgpu_reg_window::Window,
     base: u64,
 }
 impl Io for Mmio {
@@ -192,7 +192,7 @@ impl Hubbub {
             .map_err(|_| Error::Unsupported)?;
         Ok(Self(Engine::new_with(
             Mmio {
-                regs: gpu.regs,
+                regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                 base,
             },
             authority,

@@ -629,6 +629,52 @@ pub(crate) async fn ib_test<I: Io>(hw: &mut Hw<I>, queue: &mut Queue) -> Result<
     })
 }
 
+/// Lock-free reader of the kernel queues' fence writeback (gfx, compute,
+/// SDMA0, SDMA1), for client job completion without the boot owner. Each
+/// sample invalidates the HDP read cache first, as `Queue::read` does; both
+/// operations are idempotent and safe concurrently with the owner's MMIO.
+#[derive(Clone, Copy, Debug)]
+pub struct FenceReader {
+    regs: MmioRegion,
+    hdp_invalidate: u64,
+    slots: [MmioRegion; 4],
+    authority: Cap<BusDeviceCap, Write>,
+}
+impl FenceReader {
+    /// The last sequence ring `ring` (0 gfx, 1 compute, 2/3 SDMA) wrote.
+    pub fn completed(&self, ring: usize) -> Result<u32, Error> {
+        let slot = *self.slots.get(ring).ok_or(Error::Invalid)?;
+        let (regs, hdp) = (self.regs, self.hdp_invalidate);
+        self.authority
+            .invoke(Op(|| {
+                // SAFETY: the HDP invalidate register lies in the BAR5 bank
+                // Layout bounded; the slot is the queue's permanent, published
+                // writeback reservation, whose FENCE dword is in bounds.
+                unsafe {
+                    regs.write32(hdp, 1);
+                    regs.read32(hdp);
+                    barrier(Ordering::SeqCst);
+                    checked(slot.read32(FENCE))
+                }
+            }))
+            .map_err(|_| Error::Revoked)?
+    }
+}
+impl Gfx {
+    pub(crate) fn fence_map(&self) -> MmioRegion {
+        self.engine.queue.map()
+    }
+    /// A [`FenceReader`] over this owner's registers and `slots`.
+    pub(crate) fn fence_reader(&self, slots: [MmioRegion; 4]) -> FenceReader {
+        FenceReader {
+            regs: self.engine.hw.io.regs,
+            hdp_invalidate: self.engine.hw.layout.hdp + 0xd1 * 4,
+            slots,
+            authority: self.engine.hw.authority,
+        }
+    }
+}
+
 /// Evidence from every Navi22 kernel queue after the cold-boot IB tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QueueProof {
@@ -681,6 +727,20 @@ pub(crate) struct GfxEngine<I: Io> {
     pub queue: Queue,
     pub state: GfxState,
     pub proof: GfxProof,
+    /// golden_settings_gc_10_3_2 already applied (`golden`), so `configure`
+    /// does not rewrite them after other engines started.
+    pub golden: bool,
+}
+fn program_golden<I: Io>(io: &mut I, l: Layout) -> Result<(), Error> {
+    for (reg, and, or) in GOLDEN {
+        // soc15_program_register_sequence
+        if and == u32::MAX {
+            io.write(l.reg(reg), or);
+        } else {
+            update(io, l.reg(reg), and, or)?;
+        }
+    }
+    Ok(())
 }
 impl<I: Io> GfxEngine<I> {
     /// The state is stored outside the future: cancellation leaves `busy`
@@ -700,8 +760,26 @@ impl<I: Io> GfxEngine<I> {
         };
         result
     }
-    /// golden registers, GRBM CAM, constants_init, rlc_resume (PSP autoload)
-    /// and the gui-idle interrupt mask from `gfx_v10_0_cp_resume`.
+    /// gfx_v10_0_init_golden_registers, the first step of gfx_v10_0_hw_init,
+    /// which Linux runs before SDMA's hw_init. Once, before `configure`.
+    pub(crate) fn golden(&mut self) -> Result<(), Error> {
+        if self.state != GfxState::Prepared || self.golden {
+            return Err(Error::Busy);
+        }
+        let result = self.hw.access(|io, l| {
+            checked(io.read(l.reg(GRBM_CNTL)))?;
+            program_golden(io, l)
+        });
+        // Even a partial sequence must not be replayed by `configure`.
+        self.golden = true;
+        if result.is_err() {
+            self.state = GfxState::Failed;
+        }
+        result
+    }
+    /// golden registers (unless `golden` ran), GRBM CAM, constants_init,
+    /// rlc_resume (PSP autoload) and the gui-idle interrupt mask from
+    /// `gfx_v10_0_cp_resume`.
     pub(crate) async fn configure(&mut self) -> Result<(), Error> {
         self.begin(GfxState::Prepared, GfxState::Configuring)?;
         let result = self.configure_inner().await;
@@ -720,14 +798,11 @@ impl<I: Io> GfxEngine<I> {
         })?;
         // Published before the RLC can learn the CSIB address.
         self.queue.memory.publish();
+        let golden = !self.golden;
+        self.golden = true;
         let cam = self.hw.access(|io, l| {
-            for (reg, and, or) in GOLDEN {
-                // soc15_program_register_sequence
-                if and == u32::MAX {
-                    io.write(l.reg(reg), or);
-                } else {
-                    update(io, l.reg(reg), and, or)?;
-                }
+            if golden {
+                program_golden(io, l)?;
             }
             // gfx_v10_0_check_grbm_cam_remapping
             let data = checked(io.read(l.reg(VGT_ESGS_RING_SIZE)))?;
@@ -883,6 +958,17 @@ impl<I: Io> GfxEngine<I> {
         })?;
         ring_test(&mut self.hw, &mut self.queue).await?;
         self.proof.ring = true;
+        // gfx_v10_0_hw_init ends with gfx_v10_3_set_power_brake_sequence for
+        // GC >= 10.3 after cp_resume; the KIQ/KCQ halves ran before this ring.
+        self.hw.access(|io, l| {
+            io.write(l.reg(GRBM_GFX_INDEX), 0xe000_0000);
+            io.write(l.reg(GC_CAC_IND_INDEX), IX_PWRBRK_STALL_PATTERN_CTRL);
+            io.write(l.reg(GC_CAC_IND_DATA), PWRBRK_STALL_PATTERN);
+            io.write(l.reg(GC_THROTTLE_CTRL), PWRBRK_THROTTLE);
+            io.write(l.reg(DIDT_IND_INDEX), IX_DIDT_SQ_THROTTLE_CTRL);
+            io.write(l.reg(DIDT_IND_DATA), PWRBRK_DIDT_SQ);
+            Ok(())
+        })?;
         Ok(())
     }
     pub(crate) async fn test_ib(&mut self) -> Result<(), Error> {
@@ -923,8 +1009,18 @@ impl Gfx {
                 queue: Queue::new(pool, Kind::Cp, doorbell::GFX_RING0, fence::Engine::Gfx)?,
                 state: GfxState::Prepared,
                 proof: GfxProof::default(),
+                golden: false,
             },
         })
+    }
+    /// Apply golden_settings_gc_10_3_2 ahead of SDMA bring-up, as Linux's
+    /// GFX hw_init precedes SDMA's. No queue is touched.
+    ///
+    /// # Safety
+    /// PSP/RLC autoload completed, no GC client runs, and `new`'s contract
+    /// still holds. A failure leaves the owner Failed.
+    pub unsafe fn golden(&mut self) -> Result<(), Error> {
+        self.engine.golden()
     }
     /// # Safety
     /// PSP/RLC autoload completed, VMID0 hubs are ready, clock gating and

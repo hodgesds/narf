@@ -28,8 +28,9 @@
 //! ## Status
 //!
 //! `full_bring_up` returns `NotImplemented` before allocating or publishing
-//! DMA rings. Firmware transport and its retained DMA lifecycle are missing;
-//! programming rings and freeing their backing on return is unsafe.
+//! DMA rings. The retained firmware owner lives in `firmware_transport`;
+//! this legacy result cannot represent its lifetime or the unfinished data
+//! path. Programming rings and freeing their backing on return is unsafe.
 
 #![allow(dead_code)]
 
@@ -266,7 +267,7 @@ pub unsafe fn full_bring_up(
     mmio: &narf_bus::MmioRegion,
     config: BringUpConfig,
 ) -> Result<BringUpResult, BringUpError> {
-    // Firmware dispatch has no transport owner yet. Do not program rings
+    // This legacy API cannot carry the retained firmware owner. Do not program rings
     // that would be freed when returning NotImplemented. Keep this public
     // boundary side-effect-free until the full retained lifecycle exists.
     let _ = (mmio, config);

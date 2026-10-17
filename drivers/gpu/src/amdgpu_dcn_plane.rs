@@ -12,7 +12,7 @@
 use crate::{
     amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_dcn_profile::Profile, amdgpu_dml::Format,
 };
-use narf_bus::{BusDeviceCap, MmioRegion};
+use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // DPP block (base index 2), stride 0x16b.
@@ -164,7 +164,7 @@ trait Io: Send {
 }
 #[derive(Debug)]
 struct Mmio {
-    regs: MmioRegion,
+    regs: crate::amdgpu_reg_window::Window,
     base: u64,
 }
 impl Io for Mmio {
@@ -343,7 +343,7 @@ impl Dpp {
         }
         Ok(Self(Block {
             io: Mmio {
-                regs: gpu.regs,
+                regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                 base: profile.bank(
                     gpu,
                     2,
@@ -379,7 +379,7 @@ impl Mpc {
         }
         Ok(Self(Block {
             io: Mmio {
-                regs: gpu.regs,
+                regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                 base: profile.bank(
                     gpu,
                     3,
@@ -423,7 +423,7 @@ impl Opp {
         Ok(Self {
             block: Block {
                 io: Mmio {
-                    regs: gpu.regs,
+                    regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                     base: profile.bank(
                         gpu,
                         2,

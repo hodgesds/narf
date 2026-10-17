@@ -15,7 +15,10 @@ use regs::{HubRegs, GFX, MM};
 #[path = "amdgpu_gmc_navi48_display.rs"]
 mod display;
 pub(crate) use display::DisplayContext;
-const BYTES: u64 = 16384; // PT, default page, source page, destination page
+// PT, default page, source page, destination page, then the empty root
+// directory every idle client context points at.
+const BYTES: u64 = 20480;
+const EMPTY_ROOT: u64 = 16384;
 const APERTURE_SIZE: u64 = 2 << 20; // 512 flat PTEs; only two are present
 const LIMIT: u64 = 1 << 48;
 
@@ -40,7 +43,18 @@ pub enum State {
     Programming,
     Invalidating(Hub),
     Ready,
+    /// VMIDs 1..15 enabled on both hubs, each at the empty root until a
+    /// submission's VM flush gives it a client's page tables.
+    PreparingClients,
+    ClientsReady,
     Failed,
+}
+impl State {
+    /// VMID0's translations are live: initialized, with or without the
+    /// client contexts.
+    pub fn vmid0_ready(self) -> bool {
+        matches!(self, State::Ready | State::ClientsReady)
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Aperture {
@@ -350,6 +364,144 @@ impl<I: Io> Engine<I> {
         Ok(geometry.aperture)
     }
 }
+/// One hub's register bank as the shared VM hub programming sees it.
+struct Bank<'a, I: Io> {
+    io: &'a mut I,
+    base: u64,
+}
+impl<I: Io> crate::amdgpu_vmhub_regs::VmHubMmio for Bank<'_, I> {
+    fn read(&mut self, byte_off: u32) -> u32 {
+        self.io.read(self.base + u64::from(byte_off))
+    }
+    fn write(&mut self, byte_off: u32, value: u32) {
+        self.io.write(self.base + u64::from(byte_off), value);
+    }
+}
+/// The client VMIDs, 1..=15 (VMID0 is the kernel's).
+const CLIENT_VMIDS: u16 = 0xfffe;
+impl<I: Io> Engine<I> {
+    /// gfxhub_v12_0_setup_vmid_config / mmhub_v4_1_0_setup_vmid_config for
+    /// VMIDs 1..15: each enabled with GMC 12's depth and block size, every
+    /// protection-fault default and no retry (amdgpu_noretry), bounded to
+    /// 0..max_pfn-1, and — where Linux leaves the base at whatever the last
+    /// flush wrote — pointed at an owned root directory whose every entry is
+    /// GMC 12's invalid pattern, so a context no submission has flushed
+    /// faults instead of translating. Then one invalidation of all fifteen
+    /// on each hub's kernel engine (17), the MMHUB semaphore held around it.
+    async fn prepare_clients(&mut self) -> Result<(), Error> {
+        use crate::amdgpu_vmhub_regs::{self as hub, KERNEL_INVALIDATE_ENGINE};
+        if self.state != State::Ready {
+            return Err(Error::Busy);
+        }
+        let geometry = self.geometry.ok_or(Error::Invalid)?;
+        let layout = self.layout;
+        let vm = crate::amdgpu_vm::Geometry::GMC12;
+        let root = self.memory.address() + EMPTY_ROOT;
+        let base = geometry.physical(root) | 1; // valid VRAM PDE, byte address
+        let entries = vm.entries_at(vm.root_level);
+        if entries * 8 > 4096 {
+            return Err(Error::Invalid);
+        }
+        let empty = vm.format.pde_pte();
+        let map = self.memory.mapping();
+        self.state = State::PreparingClients;
+        let result = async {
+            self.access(|io| {
+                for index in 0..entries {
+                    io.memory(map, EMPTY_ROOT + index * 8, empty as u32);
+                    io.memory(map, EMPTY_ROOT + index * 8 + 4, (empty >> 32) as u32);
+                }
+                flush(io, layout.nbio)?;
+                for (bank, regs) in layout
+                    .bases
+                    .into_iter()
+                    .zip([hub::GFXHUB_V12_0, hub::MMHUB_V4_1])
+                {
+                    let mut b = Bank { io, base: bank };
+                    for vmid in 1..16 {
+                        hub::write_vmid_pt_base(&mut b, &regs, vmid, base);
+                        hub::write_vmid_aperture(&mut b, &regs, vmid, 0, vm.max_pfn - 1);
+                        hub::write_vmid_cntl(
+                            &mut b,
+                            &regs,
+                            vmid,
+                            vm.num_level(),
+                            vm.block_size as u8,
+                            true,
+                        );
+                    }
+                }
+                Ok(())
+            })?;
+            for (index, h, regs) in [
+                (0, Hub::Gfx, hub::GFXHUB_V12_0),
+                (1, Hub::Mm, hub::MMHUB_V4_1),
+            ] {
+                let bank = layout.bases[index];
+                let eng = regs.eng_distance * KERNEL_INVALIDATE_ENGINE;
+                let at = |reg: u32| bank + u64::from(reg + eng) * 4;
+                self.state = State::Invalidating(h);
+                if regs.semaphore {
+                    self.wait(at(regs.inv_eng0_sem), 1).await?;
+                }
+                // Every client VMID in one legacy request.
+                let request = hub::invalidate_req(0, 0) & !1 | u32::from(CLIENT_VMIDS);
+                self.access(|io| {
+                    io.write(at(regs.inv_eng0_req), request);
+                    Ok(())
+                })?;
+                let acked = self
+                    .wait(at(regs.inv_eng0_ack), u32::from(CLIENT_VMIDS))
+                    .await;
+                if regs.semaphore {
+                    self.access(|io| {
+                        io.write(at(regs.inv_eng0_sem), 0);
+                        Ok(())
+                    })?;
+                }
+                acked?;
+                self.state = State::PreparingClients;
+            }
+            // Read every context back.
+            self.access(|io| {
+                for (bank, regs) in layout
+                    .bases
+                    .into_iter()
+                    .zip([hub::GFXHUB_V12_0, hub::MMHUB_V4_1])
+                {
+                    let cntl =
+                        hub::vmid_cntl_value(&regs, vm.num_level(), vm.block_size as u8, true);
+                    for vmid in 1..16u32 {
+                        let reg = |r: u32, d: u32| bank + u64::from(r + d * vmid) * 4;
+                        let lo =
+                            checked(io.read(reg(regs.ctx0_pt_base_lo, regs.ctx_addr_distance)))?;
+                        let hi =
+                            checked(io.read(reg(regs.ctx0_pt_base_hi, regs.ctx_addr_distance)))?;
+                        // max_pfn - 1 has an all-ones low word; the high
+                        // word (0xf) is what proves the device answered.
+                        let end_lo = io.read(reg(regs.ctx0_pt_end_lo, regs.ctx_addr_distance));
+                        let end_hi =
+                            checked(io.read(reg(regs.ctx0_pt_end_hi, regs.ctx_addr_distance)))?;
+                        if u64::from(hi) << 32 | u64::from(lo) != base
+                            || u64::from(end_hi) << 32 | u64::from(end_lo) != vm.max_pfn - 1
+                            || checked(io.read(reg(regs.ctx0_cntl, regs.ctx_distance)))? != cntl
+                        {
+                            return Err(Error::Invalid);
+                        }
+                    }
+                }
+                Ok(())
+            })
+        }
+        .await;
+        self.state = if result.is_ok() {
+            State::ClientsReady
+        } else {
+            State::Failed
+        };
+        result
+    }
+}
 #[derive(Debug)]
 pub struct Gmc {
     engine: Engine<Mmio>,
@@ -393,6 +545,15 @@ impl Gmc {
     pub async unsafe fn initialize(&mut self) -> Result<Aperture, Error> {
         self.engine.initialize().await
     }
+    /// Enable the client VMIDs 1..15 on both hubs at an empty root, as
+    /// Linux's GART enable does, so a submission's in-ring VM flush can
+    /// point one at a client's page tables. No client runs yet.
+    /// # Safety
+    /// As for `initialize`, after it succeeded; no queue may use a client
+    /// VMID until this returns.
+    pub async unsafe fn prepare_client_contexts(&mut self) -> Result<(), Error> {
+        self.engine.prepare_clients().await
+    }
     pub fn state(&self) -> State {
         self.engine.state
     }
@@ -400,7 +561,7 @@ impl Gmc {
         self.engine.aperture
     }
     pub(crate) fn test_mapping(&mut self) -> Option<MmioRegion> {
-        if self.state() != State::Ready {
+        if !self.state().vmid0_ready() {
             return None;
         }
         let map = self.engine.memory.mapping();

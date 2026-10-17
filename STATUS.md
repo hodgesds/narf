@@ -14,6 +14,34 @@ current test results.
 | 4 · Compatibility | In-tree shell gate met; compatibility continues | Interactive `echo hello world` follows serial IRQ → input ring → shell → UART. Linux-compatible musl programs, storage, networking, and graphics have additional QEMU proofs. The original relibc-specific criterion is not the closure proof. |
 | 5 · Silicon | In progress | Driver and diagnostic foundations exist; the selected AMD laptop end-to-end gate has not been demonstrated. |
 
+## MT7921/MT7922 firmware bringup
+
+The x86_64 MT76 late init path now owns coherent WM/FWDL/MCU DMA rings and
+performs ROM restart, patch semaphore negotiation, patch/RAM download and
+firmware-ready verification. Post-firmware MCU commands obtain the real MAC
+and PHY, read EFUSE hardware identity, select embedded world country limits,
+select on-chip calibration and initialize MAC/WTBL/RTS. Unified device command
+framing now matches the local Linux reference. Waits are bounded and report the current stage;
+failed or cancelled attempts retain published DMA until verified shutdown.
+The retained RX ring and MCU scan path now support passive 2.4 GHz scans on
+channels 1–11. Successful radio initialization registers a wireless
+interface with the real MAC and supported regulatory channels.
+The private cut-through management TX backend retains each payload until
+both descriptor completion and firmware token release. RX routing separates
+forwarded normal frames, MCU responses and TX releases on all rings.
+Live join dispatch is integrated with regulatory authorization, channel/power
+switching via `MCU_EXT_CMD_CHANNEL_SWITCH`, open-authentication/association MLME
+handshakes, and IEEE 802.11i WPA2-PSK 4-way handshakes (M1..M4) with HMAC-SHA1 MIC
+verification/generation. WTBL station records commit temporal keys with
+tag 0x12 (`STA_REC_KEY_V2`), cipher 6 (`MCU_CIPHER_AES_CCMP`), and `PORT_SECURE`.
+The datapath encapsulates 802.3 Ethernet frames into CONNAC2 32-byte TXDs on WFDMA data rings,
+translates 802.11 LLC/SNAP to Ethernet on RX, and pumps frames through `narf_ipc`
+producer/consumer rings with link state updates.
+The targeted QEMU suite passes 99 tests with one skip (99 pass, 0 fail, 1 skip),
+including live WPA2 join dispatch, STA_REC key installation, and Ethernet transport.
+Both-architecture Clippy and `cargo fmt` pass cleanly. Physical MT7922
+silicon validation on AMD Zen2/Phoenix hardware remains open to close the Stage 5 Wi-Fi gate.
+
 ## Loadable e1000 datapath
 
 The copy-mode module ABI now has an exclusive live-wire proof. `cargo xtask
@@ -943,11 +971,11 @@ ring and IB/fence tests after `DmubStart`. Navi22 `AMDGPU_INFO` now answers
 DEV_INFO, HW_IP_INFO/COUNT, FW_VERSION, READ_MMR_REG (GB_ADDR_CONFIG) and
 MEMORY as Linux does for GC 10.3.2, from a cold-boot harvest sample, the
 loaded firmware headers and the PCI revision; ACCEL_WORKING and ring masks
-sit behind one switch, now wired: client IBs run on the Navi22 kernel queues
-under per-open GPUVM VMIDs (ring-side VM flush, fences, two in flight per
-ring), with native GEM/VA/BO_LIST/CS/WAIT_CS/WAIT_FENCES/FENCE_TO_HANDLE,
-binary and timeline syncobjs, PRIME of Navi22 BOs, DRM 3.64.0 and
-GET_CLIENT, proven in register/fake-device models only (ABI audit:
+sit behind one switch, now wired: the card registers a generic
+`amdgpu_cs::Submitter` and client VRAM heap, so the shared CS/GEM/VA path runs
+client IBs on the Navi22 kernel queues (per-job ring-side VM flush, fences,
+two in flight per ring), with user fences, GEM_METADATA, PRIME, DRM 3.64.0 and
+GET_CLIENT; proven in register/fake-engine models only (ABI audit:
 `drivers/gpu/research/navi22-mesa-abi.md`). Fences poll with an IH notify hook;
 register models cover encodings, rejection, timeouts and cancellation only.
 Production cold boot now resets a posted card before any firmware stage, as
@@ -1021,10 +1049,18 @@ reproducibly for NARF's musl userspace and stages into a rootfs; the
 decline, software fallback renders) and the same binaries render on a Linux
 amdgpu host ([Mesa AMD](docs/MESA_AMD.md)). libdrm_amdgpu's `GET_CLIENT` on
 primary nodes is the first NARF gap Mesa hits.
+The firmware path now follows Linux on the GOP-booted (SOS not alive) cold
+path: KM-type PSP rings on every PSP generation, LOAD_TOC → SMC → SETUP_TMR
+(PMFW-centralized C-states), DCN3.0's own FB register offsets, Linux's GART
+placement at MC 0 (12272 MiB VRAM model), MEMSIZE-derived FB end, tolerated
+GOP VMID0/DMUB windows/stopped-OTG pipes, an MP1 firmware-ready poll, Linux
+(or longer) PSP/SMU/training deadlines, warn-only PSP status, golden settings
+before SDMA plus the GC 10.3 power brake, and a non-fatal DMUB start after the
+queue stages using the GMC aperture.
 These are software-tested foundations; training resume,
 media submission/DPG, display-aware DPM, user command submission,
 hardware boot and DCN3.0 modesetting remain open. See the
-[PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).
+[PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram). The native path now follows Linux's global order end to end (model-tested over one combined register fake, failure/cancellation per step), retires a live GOP stream like `dcn30_init_hw`, enables OPTC/OTG clocks, lights DP SST (native-AUX 8b/10b training with fallback, DP DTO, MSA/VSC) on any of the six pipes/routes, and quarantines underflows black. HPD/HPD_RX now arrive over the IH ring (DCE src 9) and wake the display monitor, with polling kept as the fallback.
 
 1. **Stage 5 laptop proof:** boot from USB on Renoir/Lucienne or Phoenix
    HawkPoint1; exercise native AMDGPU modeset, keyboard and touchpad,

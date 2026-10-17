@@ -7,6 +7,9 @@ pub(super) const CTX_ADDR_DISTANCE: u32 = 2;
 #[derive(Clone, Copy, Debug)]
 pub(super) struct HubRegs {
     pub fb_base: u32,
+    /// MC_VM_FB_LOCATION_TOP: never consulted (Linux derives fb_end from
+    /// MEMSIZE); kept so models can present a stale inherited value.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub fb_top: u32,
     pub agp_base: u32,
     pub agp_bot: u32,

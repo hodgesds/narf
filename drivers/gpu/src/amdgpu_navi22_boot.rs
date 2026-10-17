@@ -187,6 +187,7 @@ pub enum Stage {
     MemoryHubs,
     Gart,
     Interrupts,
+    GoldenSettings,
     SdmaTest,
     InterruptTest,
     DmubStart,
@@ -203,7 +204,7 @@ pub enum Stage {
     MediaIbTests,
     ReadTopology,
 }
-const STAGES: [Stage; 30] = [
+const STAGES: [Stage; 31] = [
     Stage::ResetOnInit,
     Stage::MemoryTraining,
     Stage::Sos,
@@ -222,9 +223,11 @@ const STAGES: [Stage; 30] = [
     // Linux enables IH (hw_init phase 1) after COMMON/GMC and before every
     // phase-2 engine. Its VRAM ring needs VMID0, so IH follows MemoryHubs.
     Stage::Interrupts,
+    // gfx_v10_0_hw_init's init_golden_registers: GFX precedes SDMA in the
+    // phase-2 pass, so GC golden settings land before SDMA starts.
+    Stage::GoldenSettings,
     Stage::SdmaTest,
     Stage::InterruptTest,
-    Stage::DmubStart,
     // gfx_v10_0_hw_init / cp_resume, sdma_v5_2_start, amdgpu_ib_ring_tests.
     Stage::Doorbells,
     Stage::GfxSetup,
@@ -235,6 +238,10 @@ const STAGES: [Stage; 30] = [
     Stage::IbTests,
     // Arms EOP/trap interrupts and routes them to fence waiters.
     Stage::FenceInterrupts,
+    // dm_dmub_hw_init. Linux runs it before GFX in the phase-2 pass, but no
+    // queue stage depends on DMUB; here it follows every queue/fence proof
+    // and is non-fatal, so a DMUB failure cannot cost GFX/SDMA/media.
+    Stage::DmubStart,
     // vcn_v3_0_hw_init, jpeg_v3_0_hw_init, then the multimedia part of
     // amdgpu_ib_ring_tests. Linux runs VCN/JPEG hw_init after GFX/SDMA in
     // the same phase-2 pass; here they follow every display, queue and fence
@@ -495,6 +502,24 @@ fn media_result(
         }
     }
 }
+/// Device loss and revoked authority stop the boot; any other DMUB failure
+/// leaves the owner Failed (storage retained) and the boot degraded: the
+/// display paths that need DMUB refuse a non-Running owner.
+fn dmub_result(result: Result<(), crate::amdgpu_dmub_navi22::Error>) -> Result<(), Error> {
+    use crate::amdgpu_dmub_navi22::Error as Dmub;
+    match result {
+        Ok(()) => Ok(()),
+        Err(error @ (Dmub::DeviceGone | Dmub::Revoked)) => Err(Error::Dmub(error)),
+        Err(error) => {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 DmubStart: degraded {error:?}"
+            );
+            Ok(())
+        }
+    }
+}
 async fn trap_round_trip(
     ih: &mut crate::amdgpu_ih_navi22::Ih,
     sdma: &mut crate::amdgpu_sdma_navi22::Sdma,
@@ -541,6 +566,18 @@ impl Backend for Hardware {
                 }
             }
             Stage::Sos => {
+                // The pool's GPU addresses came from the pre-reset/pre-training
+                // FB location; re-validate before any reaches the bootloader.
+                psp::validate_navi22_pool(&self.gpu, &self.authority, &self.pool).map_err(
+                    |error| {
+                        Error::Sos(match error {
+                            psp::Error::Revoked => sos::Error::Revoked,
+                            psp::Error::DeviceGone => sos::Error::DeviceGone,
+                            psp::Error::Unsupported => sos::Error::Unsupported,
+                            _ => sos::Error::Invalid,
+                        })
+                    },
+                )?;
                 if self.bootstrap.is_none() {
                     // SAFETY: explicit training finished before claiming PSP
                     // bootstrap ownership; its idle owner retains only data.
@@ -659,8 +696,16 @@ impl Backend for Hardware {
                 if let Some(dmub) = self.dmub.as_mut() {
                     // SAFETY: same exclusive GPU; trained VRAM, both hubs and
                     // protected power are ready. PSP/TMR remain retained here.
-                    unsafe { dmub.start(self.psp.as_ref().ok_or(Error::Invalid)?).await }
-                        .map_err(Error::Dmub)?;
+                    let result =
+                        unsafe { dmub.start(self.psp.as_ref().ok_or(Error::Invalid)?).await };
+                    dmub_result(result.map(|_| ()))?;
+                }
+            }
+            Stage::GoldenSettings => {
+                if let Some(queues) = self.queues.as_mut() {
+                    // SAFETY: RLC autoload completed (RlcBoot), no GC client
+                    // runs, and ColdBoot owns the whole GPU.
+                    unsafe { queues.gfx.golden() }.map_err(Error::Queues)?;
                 }
             }
             Stage::ReadTopology => {
@@ -1223,10 +1268,13 @@ impl ColdBoot {
             .as_ref()
             .map(crate::amdgpu_navi22_display::Display::connectors)
     }
-    /// Light the first connected HDMI connector natively with a colour-bar
-    /// test pattern (`amdgpu_navi22_modeset`). Off unless the platform opts in;
-    /// requires firmware readiness, the retained SMU and the display owner.
-    /// The pipeline is retained, lit or failed; there is no retry.
+    /// Light a connector natively with a colour-bar test pattern
+    /// (`amdgpu_navi22_modeset`): a connected HDMI sink if there is one, else
+    /// the first DisplayPort sink with EDID and receiver caps
+    /// ([`crate::amdgpu_navi22_modeset::choose`]). Off unless the platform
+    /// opts in; requires firmware readiness, the retained SMU and the display
+    /// owner. The GOP's stream, if still lit, is retired first. The pipeline
+    /// is retained, lit or failed; there is no retry.
     ///
     /// # Safety
     /// No other display, DMUB or VBIOS client may run, and nothing may write
@@ -1234,45 +1282,17 @@ impl ColdBoot {
     pub async unsafe fn modeset_hdmi(
         &mut self,
     ) -> Result<crate::amdgpu_navi22_modeset::Output, Error> {
-        use crate::amdgpu_navi22_display::{Detection, Signal};
         use crate::amdgpu_navi22_modeset as modeset;
-        if self.sequence.backend.modeset.is_some() {
-            return Err(Error::Busy);
-        }
         let reports = self.detect_displays().await?;
-        let h = &mut self.sequence.backend;
-        let Some((connector, sink)) = reports.into_iter().find_map(|r| match r.detection {
-            Detection::Connected(sink) if r.connector.signal == Signal::Hdmi => {
-                Some((r.connector, sink))
-            }
-            _ => None,
-        }) else {
+        let Some((connector, sink)) = modeset::choose(&reports) else {
             return Err(Error::Modeset(modeset::Error::NoSink));
         };
-        let (vbios, crystal) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
-        let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
-            .map_err(|e| Error::Modeset(modeset::Error::Bios(e)))?;
-        let smu = h.smu.as_mut().ok_or(Error::Invalid)?;
-        // SAFETY: this cold-boot owner holds the whole GPU; the caller's
-        // contract excludes other display clients.
-        let mut pipeline = unsafe { modeset::Pipeline::new(&h.gpu, h.authority, connector) }
-            .map_err(Error::Modeset)?;
-        // SAFETY: forwarded; the pool and SMU are this owner's.
-        let result = unsafe {
-            pipeline
-                .enable(
-                    smu,
-                    &h.pool,
-                    &tables,
-                    vbios,
-                    *crystal,
-                    &sink,
-                    modeset::test_pattern,
-                )
+        let sink = sink.clone();
+        // SAFETY: forwarded unchanged.
+        unsafe {
+            self.modeset_display(connector, &sink, None, modeset::test_pattern)
                 .await
-        };
-        h.modeset = Some(pipeline);
-        result.map_err(Error::Modeset)
+        }
     }
     /// HDP flush for CPU writes to the native scanout.
     pub fn flush_display_scanout(&mut self) -> Result<(), Error> {
@@ -1573,6 +1593,62 @@ impl ColdBoot {
         }
         .map_err(Error::Queues)
     }
+    /// Lock-free fence reader over the verified kernel queues (client job
+    /// completion for `amdgpu_navi22_cs`).
+    pub fn client_fence_reader(&self) -> Option<crate::amdgpu_cp_navi22::FenceReader> {
+        if !self.queues_verified() {
+            return None;
+        }
+        let q = self.sequence.backend.queues.as_ref()?;
+        Some(q.gfx.fence_reader([
+            q.gfx.fence_map(),
+            q.compute.fence_map(),
+            q.sdma.fence_map(0),
+            q.sdma.fence_map(1),
+        ]))
+    }
+    /// A VRAM heap for clients, as Navi48's `publish_client_vram`: half the
+    /// pool's free VRAM, 2 MiB-aligned and at least 64 MiB, as a pool of its
+    /// own, with the GMC framebuffer translation entries need. The chunk is
+    /// published (never recycled) and returned for the caller to retain.
+    pub fn reserve_client_vram(
+        &mut self,
+    ) -> Result<(crate::amdgpu_vram::Reservation, crate::amdgpu_gem::VramHeap), Error> {
+        const ALIGN: u64 = 2 << 20;
+        let hw = &mut self.sequence.backend;
+        let (fb_base, fb_offset) = hw
+            .gmc
+            .as_ref()
+            .and_then(crate::amdgpu_gmc_navi22::Gmc::framebuffer)
+            .ok_or(Error::Invalid)?;
+        let size = (hw.pool.available() / 2) & !(ALIGN - 1);
+        if size < 64 << 20 {
+            return Err(Error::Allocation);
+        }
+        let mut chunk = hw
+            .pool
+            .reserve_aligned(size, ALIGN)
+            .map_err(|_| Error::Allocation)?;
+        // SAFETY: the reservation is this heap's alone, inside the owned,
+        // CPU-mapped VRAM range the boot inventory produced.
+        let pool = unsafe { Pool::from_owned_range(chunk.mapping(), chunk.address()) }
+            .map_err(|_| Error::Allocation)?;
+        chunk.publish();
+        Ok((
+            chunk,
+            crate::amdgpu_gem::VramHeap {
+                pool,
+                fb_base,
+                fb_offset,
+            },
+        ))
+    }
+    /// Hold one GMC10 context (VMID) for client jobs: its context registers
+    /// carry the 4-level, 48-bit layout every client space shares, and each
+    /// job's ring-side VM flush points it at that job's root.
+    pub async fn reserve_client_vmid(&mut self) -> Result<crate::amdgpu_gmc_navi22::Vm, Error> {
+        self.memory()?.create_vm().await.map_err(Error::MemoryHubs)
+    }
     /// (last completed, throttle) fence sequences of `ring`.
     pub fn fences(&mut self, ring: crate::amdgpu_navi22_submit::Ring) -> Result<(u32, u32), Error> {
         use crate::amdgpu_navi22_submit::Ring;
@@ -1625,16 +1701,39 @@ impl ColdBoot {
         let (vbios, crystal) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
         let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
             .map_err(|e| Error::Modeset(modeset::Error::Bios(e)))?;
+        let board = modeset::Board::from_vbios(vbios, *crystal).map_err(Error::Modeset)?;
         let smu = h.smu.as_mut().ok_or(Error::Invalid)?;
+        let display = h.display.as_mut().ok_or(Error::Invalid)?;
+        let links: alloc::vec::Vec<_> = display.connectors().to_vec();
+        let index = links
+            .iter()
+            .position(|c| *c == connector)
+            .ok_or(Error::Invalid)?;
+        // One stream: the DCN3.0 pool from empty (the previous pipeline, if
+        // any, stopped or failed and was dropped above).
+        let route = modeset::Resources::new()
+            .acquire(&connector)
+            .map_err(Error::Modeset)?;
         // SAFETY: this cold-boot owner holds the whole GPU; the caller's
         // contract excludes other display clients.
-        let mut pipeline = unsafe { modeset::Pipeline::new(&h.gpu, h.authority, connector) }
+        let mut pipeline = unsafe { modeset::Pipeline::new(&h.gpu, h.authority, connector, route) }
             .map_err(Error::Modeset)?;
         pipeline.request(want);
-        // SAFETY: forwarded; the pool and SMU are this owner's.
+        let mut aux = crate::amdgpu_navi22_display::DisplayAux { display, index };
+        // SAFETY: forwarded; the pool and SMU are this owner's, and the
+        // display-power future is polled only by ClockManager::start_with.
         let result = unsafe {
             pipeline
-                .enable(smu, &h.pool, &tables, vbios, *crystal, sink, draw)
+                .enable(
+                    crate::amdgpu_dcn30_clk::display_power(smu),
+                    &h.pool,
+                    &tables,
+                    board,
+                    &links,
+                    sink,
+                    &mut aux,
+                    draw,
+                )
                 .await
         };
         let output = match result {
@@ -1656,13 +1755,14 @@ impl ColdBoot {
             address,
             fb: output.scanout,
         };
-        // SAFETY: the pipeline just lit pipe 0 with this surface and both
-        // owners live in this cold-boot owner, serialized by its caller.
+        // SAFETY: the pipeline just lit its route's pipe with this surface
+        // and both owners live in this cold-boot owner, serialized by its
+        // caller.
         let mut scanout = unsafe {
             crate::amdgpu_navi22_scanout::Scanout::new(
                 &h.gpu,
                 h.authority,
-                0,
+                route.pipe,
                 front,
                 map,
                 output.timing,
@@ -1695,7 +1795,18 @@ impl ColdBoot {
         let (vbios, _) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
         let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
             .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Bios(e)))?;
-        pipeline.disable(&tables).await.map_err(Error::Modeset)?;
+        let connector = pipeline.connector();
+        let display = h.display.as_mut().ok_or(Error::Invalid)?;
+        let index = display
+            .connectors()
+            .iter()
+            .position(|c| *c == connector)
+            .ok_or(Error::Invalid)?;
+        let mut aux = crate::amdgpu_navi22_display::DisplayAux { display, index };
+        pipeline
+            .disable(&tables, &mut aux)
+            .await
+            .map_err(Error::Modeset)?;
         // SAFETY: the pipeline stopped cleanly (HUBP drained and blanked, OTG
         // off) and the caller retired every CPU view.
         unsafe {
@@ -1776,6 +1887,32 @@ impl ColdBoot {
     ) -> Result<crate::amdgpu_dcn30_cursor::Shown, crate::amdgpu_dcn_clk::Error> {
         let (scanout, pool, flush) = self.presentation()?;
         scanout.set_cursor(pool, image, at, flush)
+    }
+}
+
+/// IH-driven HPD (`amdgpu_dm_hpd_init` / `dm_irq_handler`) for the native
+/// display owner.
+impl ColdBoot {
+    /// Subscribe to the DCN HPD source, then arm every connector's HPD (and
+    /// DP HPD_RX) interrupt. Polling detection keeps working without it.
+    pub fn arm_display_hpd(&mut self) -> Result<crate::amdgpu_ih_navi22::Subscription, Error> {
+        let ih = self.interrupts().ok_or(Error::Invalid)?;
+        let subscription = ih
+            .subscribe(crate::amdgpu_ih_navi22::source::DCN_HPD)
+            .map_err(|_| Error::Busy)?;
+        self.display_mut()?
+            .arm_hpd_interrupts()
+            .map_err(Error::Display)?;
+        Ok(subscription)
+    }
+    /// Acknowledge one HPD/HPD_RX vector; returns the connector index.
+    pub fn display_hpd(
+        &mut self,
+        hpd: crate::amdgpu_ih_navi22::Hpd,
+    ) -> Result<Option<usize>, Error> {
+        self.display_mut()?
+            .hpd_event(hpd.instance, hpd.rx)
+            .map_err(Error::Display)
     }
 }
 

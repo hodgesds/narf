@@ -22,6 +22,26 @@ pub use vm::{Buffer, Fault, FaultInfo, FaultOwner, Mapping, Vm, VmInfo};
 const BYTES: u64 = 16384; // PT, default page, source page, destination page
 const APERTURE_SIZE: u64 = 2 << 20; // 512 flat PTEs; only two are present
 const LIMIT: u64 = 1 << 48;
+const FOUR_GB: u64 = 4 << 30;
+/// AMDGPU_GMC_HOLE_START; gmc_v10 mc_mask is 48 bits, so max_mc_address is
+/// min(mc_mask, HOLE_START - 1).
+const MAX_MC_ADDRESS: u64 = 0x0000_7fff_ffff_ffff;
+
+/// amdgpu_gmc_gart_location(AMDGPU_GART_PLACEMENT_BEST_FIT), as called by
+/// gmc_v10_0_vram_gtt_location. `fb_end` is exclusive here.
+fn gart_location(fb_start: u64, fb_end: u64, gart_size: u64) -> Option<u64> {
+    let size_bf = fb_start;
+    let size_af = (MAX_MC_ADDRESS + 1).checked_sub(fb_end.checked_next_multiple_of(FOUR_GB)?)?;
+    if gart_size > size_bf.max(size_af) {
+        return None; // Linux would shrink the GART ("limiting GART").
+    }
+    let start = if (size_bf >= gart_size && size_bf < size_af) || size_af < gart_size {
+        0
+    } else {
+        MAX_MC_ADDRESS - gart_size + 1
+    };
+    Some(start & !(FOUR_GB - 1))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -68,7 +88,20 @@ pub struct Aperture {
 struct Layout {
     bases: [u64; 2],
     nbio: u64,
+    /// NBIO BASE_IDX 0 (PCIE_INDEX2/PCIE_DATA2) and HDP BASE_IDX 0.
+    pcie: u64,
+    hdp: u64,
 }
+/// nbio_v2_3.c smnPCIE_CONFIG_CNTL and its CI_SWUS_MAX_READ_REQUEST_SIZE_MODE
+/// (bit 27) / _PRIV (bits 29:28) fields (nbio_2_3_sh_mask.h).
+const SMN_PCIE_CONFIG_CNTL: u32 = 0x1118_0044;
+const MAX_READ_REQUEST_MODE: u32 = 1 << 27;
+const MAX_READ_REQUEST_PRIV: u32 = 3 << 28;
+const PCIE_INDEX2: u64 = 0xe;
+const PCIE_DATA2: u64 = 0xf;
+/// hdp_5_0_0_offset.h HDP_MISC_CNTL (BASE_IDX 0), FLUSH_INVALIDATE_CACHE bit 0.
+const HDP_MISC_CNTL: u64 = 0xd3;
+const HDP_FLUSH_INVALIDATE_CACHE: u32 = 1;
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
         if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
@@ -80,24 +113,27 @@ impl Layout {
         let reg = |id, versions: &[(u8, u8, u8)], index, last| {
             bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
         };
+        let nbif = [
+            (2, 3, 0),
+            (2, 3, 1),
+            (2, 3, 2),
+            (3, 3, 0),
+            (3, 3, 1),
+            (3, 3, 2),
+            (3, 3, 3),
+        ];
         Ok(Self {
             bases: [
                 reg(ip::HW_ID_GC, &[(10, 3, 2)], 0, 0x1703)?,
                 reg(ip::HW_ID_MMHUB, &[(2, 1, 0)], 0, 0x873)?,
             ],
-            nbio: reg(
-                ip::HW_ID_NBIF,
-                &[
-                    (2, 3, 0),
-                    (2, 3, 1),
-                    (2, 3, 2),
-                    (3, 3, 0),
-                    (3, 3, 1),
-                    (3, 3, 2),
-                    (3, 3, 3),
-                ],
-                2,
-                0x12d,
+            nbio: reg(ip::HW_ID_NBIF, &nbif, 2, 0x12d)?,
+            pcie: reg(ip::HW_ID_NBIF, &nbif, 0, PCIE_DATA2 as u32)?,
+            hdp: reg(
+                ip::HW_ID_HDP,
+                &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
+                0,
+                HDP_MISC_CNTL as u32,
             )?,
         })
     }
@@ -157,22 +193,28 @@ struct Geometry {
     aperture: Aperture,
 }
 impl Geometry {
-    fn new(fields: [u32; 3], bytes: u64, allocation: u64) -> Result<Self, Error> {
+    /// `fields` are MC_VM_FB_LOCATION_BASE and MC_VM_FB_OFFSET. Like
+    /// amdgpu_gmc_vram_location, the end is fb_start + mc_vram_size
+    /// (RCC_CONFIG_MEMSIZE); FB_LOCATION_TOP is never consulted. The boot
+    /// aperture is the first 2 MiB of the range Linux gives the GART, so
+    /// enabling the GART later keeps its pages at the same addresses.
+    fn new(fields: [u32; 2], bytes: u64, allocation: u64) -> Result<Self, Error> {
         if fields.contains(&u32::MAX) {
             return Err(Error::DeviceGone);
         }
-        let [base, top, offset] = fields.map(|v| u64::from(v & 0xff_ffff) << 24);
-        let end = top.checked_add(1 << 24).ok_or(Error::Invalid)?;
-        if end.checked_sub(base) != Some(bytes)
+        let [base, offset] = fields.map(|v| u64::from(v & 0xff_ffff) << 24);
+        let end = base.checked_add(bytes).ok_or(Error::Invalid)?;
+        if bytes == 0
+            || end > LIMIT
             || allocation < base
             || allocation.checked_add(BYTES).is_none_or(|v| v > end)
             || allocation % 4096 != 0
         {
             return Err(Error::Invalid);
         }
-        let start =
-            end.checked_add(APERTURE_SIZE - 1).ok_or(Error::Invalid)? & !(APERTURE_SIZE - 1);
-        if start.checked_add(APERTURE_SIZE).is_none_or(|v| v > LIMIT)
+        let start = gart_location(base, end, gart::GART_SIZE).ok_or(Error::Invalid)?;
+        if start.checked_add(gart::GART_SIZE).is_none_or(|v| v > LIMIT)
+            || (start < end && base < start + gart::GART_SIZE)
             || offset.checked_add(bytes).is_none_or(|v| v > LIMIT)
         {
             return Err(Error::Invalid);
@@ -205,6 +247,33 @@ fn flush<I: Io>(io: &mut I, nbio: u64) {
     io.write(0x7f000, 0);
     io.read(nbio + 0xc3 * 4);
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+}
+/// nbio_v2_3_init_registers (nv_common_hw_init, before any GMC block):
+/// RREG32_PCIE/WREG32_PCIE through PCIE_INDEX2/DATA2, written only on change.
+fn init_nbio<I: Io>(io: &mut I, pcie: u64) -> Result<(), Error> {
+    let index = pcie + PCIE_INDEX2 * 4;
+    let data = pcie + PCIE_DATA2 * 4;
+    io.write(index, SMN_PCIE_CONFIG_CNTL);
+    io.read(index);
+    let old = checked(io.read(data))?;
+    let new = (old & !MAX_READ_REQUEST_PRIV) | MAX_READ_REQUEST_MODE | (1 << 28);
+    if new != old {
+        io.write(index, SMN_PCIE_CONFIG_CNTL);
+        io.read(index);
+        io.write(data, new);
+        io.read(data);
+    }
+    Ok(())
+}
+/// hdp_v5_0_init_registers (gmc_v10_0_gart_enable, after both hubs).
+fn init_hdp<I: Io>(io: &mut I, hdp: u64) -> Result<(), Error> {
+    update(
+        io,
+        hdp,
+        HDP_MISC_CNTL as u32,
+        HDP_FLUSH_INVALIDATE_CACHE,
+        HDP_FLUSH_INVALIDATE_CACHE,
+    )
 }
 fn pair<I: Io>(io: &mut I, base: u64, reg: u32, value: u64) {
     io.write(base + u64::from(reg) * 4, value as u32);
@@ -418,22 +487,23 @@ impl<I: Io> Engine<I> {
             let g = Geometry::new(
                 [
                     io.read(layout.bases[0] + u64::from(GFX.fb_base) * 4),
-                    io.read(layout.bases[0] + u64::from(GFX.fb_top) * 4),
                     io.read(layout.bases[0] + 0x16e7 * 4),
                 ],
                 size,
                 address,
             )?;
             for (base, r) in layout.bases.into_iter().zip([GFX, MM]) {
+                // Both hubs must agree on the inherited FB base. TOP is not
+                // read (gmc_v10_0_vram_gtt_location uses MEMSIZE).
                 if u64::from(checked(io.read(base + u64::from(r.fb_base) * 4))? & 0xffffff) << 24
                     != g.fb
-                    || (u64::from(checked(io.read(base + u64::from(r.fb_top) * 4))? & 0xffffff) + 1)
-                        << 24
-                        != g.end
                 {
                     return Err(Error::Invalid);
                 }
-                for context in 0..16 {
+                // VMID0 is the kernel context firmware/GOP may leave enabled;
+                // gfxhub/mmhub gart_enable reprograms it, as Linux does. A
+                // live user context (1..15) would have unknown tables.
+                for context in 1..16 {
                     if checked(io.read(base + u64::from(r.ctx + context) * 4))? & 1 != 0 {
                         return Err(Error::Busy);
                     }
@@ -441,6 +511,7 @@ impl<I: Io> Engine<I> {
             }
             Ok(g)
         })?;
+        self.access(|io| init_nbio(io, layout.pcie))?;
         let map = self.memory.mapping();
         self.access(|io| {
             for offset in (0..BYTES).step_by(4) {
@@ -461,7 +532,9 @@ impl<I: Io> Engine<I> {
             for (base, r) in layout.bases.into_iter().zip([GFX, MM]) {
                 program(io, base, r, geometry, address)?;
             }
-            Ok(())
+            // flush_tlb's leading HDP flush is Linux's "Flush HDP after it is
+            // initialized".
+            init_hdp(io, layout.hdp)
         })?;
         self.flush_tlb(0, true).await?;
         Ok(geometry.aperture)
@@ -499,6 +572,12 @@ impl Gmc {
     }
     pub fn runtime(&self) -> Runtime {
         self.engine.runtime
+    }
+    /// (MC_VM_FB_LOCATION_BASE, MC_VM_FB_OFFSET) as byte addresses: a pool
+    /// address becomes the physical VRAM address entries carry as
+    /// `address - fb + offset` (`gmc_v10_0_get_vm_pde`).
+    pub fn framebuffer(&self) -> Option<(u64, u64)> {
+        self.engine.geometry.map(|g| (g.fb, g.offset))
     }
     pub fn aperture(&self) -> Option<Aperture> {
         self.engine.aperture

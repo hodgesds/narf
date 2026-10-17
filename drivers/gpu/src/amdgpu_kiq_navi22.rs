@@ -352,6 +352,9 @@ impl Compute {
     pub fn state(&self) -> State {
         self.engine.state
     }
+    pub(crate) fn fence_map(&self) -> narf_bus::MmioRegion {
+        self.engine.compute.map()
+    }
     /// Client IBs on the kernel compute queue; see `Gfx::submit`.
     pub fn submit(
         &mut self,

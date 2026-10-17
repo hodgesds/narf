@@ -32,6 +32,20 @@ const TRANSFER_TO_DRIVER: u32 = 0x12;
 const GET_PPT_LIMIT: u32 = 0x33;
 const REENABLE_ACDC_INTERRUPT: u32 = 0x34;
 pub const DRIVER_INTERFACE: u32 = 0x0e;
+/// smu_v11_0.h: `MP1_Public | (smnMP1_FIRMWARE_FLAGS & 0xffffffff)`, read
+/// through the NBIO PCIe index/data pair (nbio_v2_3 PCIE_INDEX2/PCIE_DATA2,
+/// BASE_IDX 0, 0xe/0xf).
+const MP1_FIRMWARE_FLAGS: u32 = 0x03b0_0000 | 0x0301_0024;
+const FIRMWARE_FLAGS_INTERRUPTS_ENABLED: u32 = 1 << 0;
+const PCIE_INDEX2: u32 = 0xe;
+const PCIE_DATA2: u32 = 0xf;
+/// smu_cmn: `default_timeout = adev->usec_timeout * 20` polls of udelay(1),
+/// i.e. at least 2 s per message.
+const MESSAGE_TIMEOUT_MS: u64 = 2000;
+/// Bound on PMFW raising MP1_FIRMWARE_FLAGS.INTERRUPTS_ENABLED after PSP's
+/// LOAD_IP_FW. Linux checks it once in smu_start_smc_engine, much later in
+/// hw_init; NARF asks right after the upload, so it polls (bounded).
+const FIRMWARE_READY_TIMEOUT_MS: u64 = 1000;
 // mp_11_0_offset.h, MP1 base index 0: MP1_SMN_IH_SW_INT{,_CTRL}.
 pub(crate) const MP1_SW_INT: u32 = 0x2c2;
 pub(crate) const MP1_SW_INT_CTRL: u32 = 0x2c3;
@@ -208,6 +222,8 @@ trait Io {
     fn thm(&mut self, register: u32) -> Result<u32, Error>;
     fn set_thm(&mut self, register: u32, value: u32) -> Result<(), Error>;
     fn smuio(&mut self, register: u32) -> Result<u32, Error>;
+    /// RREG32_PCIE(MP1_FIRMWARE_FLAGS) (`smu_v11_0_check_fw_status`).
+    fn firmware_flags(&mut self) -> Result<u32, Error>;
 }
 #[derive(Debug)]
 struct Mmio {
@@ -216,6 +232,8 @@ struct Mmio {
     vram: MmioRegion,
     vram_size: u64,
     nbio: Option<u64>,
+    /// NBIO base-0 bank holding PCIE_INDEX2/PCIE_DATA2.
+    pcie: Option<u64>,
     /// HDP / THM / SMUIO banks; None refuses runtime telemetry and alerts.
     hdp: Option<u64>,
     thm: Option<u64>,
@@ -318,6 +336,18 @@ impl Io for Mmio {
         // SAFETY: SMUIO bank bounded through SVI0_TEL_PLANE0; read-only.
         Ok(unsafe { self.regs.read32(at) })
     }
+    fn firmware_flags(&mut self) -> Result<u32, Error> {
+        let index = Self::bank(self.pcie, PCIE_INDEX2, PCIE_DATA2)?;
+        let data = Self::bank(self.pcie, PCIE_DATA2, PCIE_DATA2)?;
+        // SAFETY: NBIO PCIE_INDEX2/DATA2 bounded at construction; the cold
+        // boot owner excludes every other indirect-register user. Like
+        // amdgpu_device_indirect_rreg, the index write is posted by a read.
+        unsafe {
+            self.regs.write32(index, MP1_FIRMWARE_FLAGS);
+            self.regs.read32(index);
+            Ok(self.regs.read32(data))
+        }
+    }
     fn stage_power(
         &mut self,
         memory: &crate::amdgpu_vram::Reservation,
@@ -418,7 +448,7 @@ impl<I: Io> Engine<I> {
             io.write(MESSAGE, message);
             Ok(())
         })??;
-        let deadline = narf_time::Deadline::after_ms(1000);
+        let deadline = narf_time::Deadline::after_ms(MESSAGE_TIMEOUT_MS);
         loop {
             let response = self.access(|io| io.read(RESPONSE))?;
             match response {
@@ -433,7 +463,24 @@ impl<I: Io> Engine<I> {
             narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
         }
     }
+    /// smu_v11_0_check_fw_status: PMFW must have enabled its interrupts before
+    /// the first PPSMC message ("SMC is not ready" otherwise).
+    async fn wait_firmware(&mut self) -> Result<(), Error> {
+        let deadline = narf_time::Deadline::after_ms(FIRMWARE_READY_TIMEOUT_MS);
+        loop {
+            match self.access(|io| io.firmware_flags())?? {
+                u32::MAX => return Err(Error::DeviceGone),
+                flags if flags & FIRMWARE_FLAGS_INTERRUPTS_ENABLED != 0 => return Ok(()),
+                _ => {}
+            }
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+        }
+    }
     async fn verify_inner(&mut self) -> Result<Versions, Error> {
+        self.wait_firmware().await?;
         let interface = self.query(GET_INTERFACE).await?;
         if interface == u32::MAX {
             return Err(Error::DeviceGone);
@@ -778,6 +825,15 @@ impl Smu {
         let optional = |id, versions: &[(u8, u8, u8)], last| {
             crate::amdgpu_psp_ring::bank(gpu, id, versions, 0, last).ok()
         };
+        let nbio_versions = [
+            (2, 3, 0),
+            (2, 3, 1),
+            (2, 3, 2),
+            (3, 3, 0),
+            (3, 3, 1),
+            (3, 3, 2),
+            (3, 3, 3),
+        ];
         Ok(Self {
             engine: Engine {
                 io: Mmio {
@@ -790,6 +846,7 @@ impl Smu {
                     ),
                     thm: optional(discovery::HW_ID_THM, &[(11, 0, 5)], CG_THERMAL_STATUS),
                     smuio: optional(discovery::HW_ID_SMUIO, &[(11, 0, 6)], SVI0_TEL_PLANE0),
+                    pcie: optional(discovery::HW_ID_NBIF, &nbio_versions, PCIE_DATA2),
                     vram: gpu.fb_bar,
                     vram_size: gpu.vram.size,
                     nbio: if gpu.regs.len >= 0x7f004 {

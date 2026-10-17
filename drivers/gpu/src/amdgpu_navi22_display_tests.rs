@@ -194,3 +194,86 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/navi22-display",
     navi22_display_edid_segments_and_failures
 );
+
+fn navi22_display_arms_hpd_interrupts_like_amdgpu_dm() -> TestResult {
+    // DC_HPDn_INT_CONTROL: ACK 0x1, POLARITY 0x100, INT_EN 0x10000,
+    // RX_INT_ACK 0x100000, RX_INT_EN 0x1000000; stride 8 from 0x1f15.
+    let control = |i: u64| 0x1f15 + 8 * i;
+    let mut fake = Fake::new();
+    set_hpd(&mut fake, 3, true);
+    // Stale enables from the firmware on an unwired block.
+    fake.set(control(5), 1 << 16 | 1 << 24);
+    let mut detector = Detector::new_with(engine(fake), &board()).unwrap();
+    if detector.arm_hpd().is_err() {
+        return TestResult::Fail("arm");
+    }
+    let f = &detector.engine.io;
+    for i in 0..6u64 {
+        let v = f.get(control(i));
+        let hpd = v & 1 << 16 != 0;
+        let rx = v & 1 << 24 != 0;
+        // Connected HDMI (3) arms on the disconnect level (polarity 0);
+        // disconnected DP (0..2) on the connect level.
+        let want = match i {
+            0..=2 => (true, true, true),
+            3 => (true, false, false),
+            _ => (false, false, v & 0x100 != 0),
+        };
+        if (hpd, rx, v & 0x100 != 0) != want {
+            return TestResult::Fail("HPD/HPD_RX enables and polarity");
+        }
+    }
+    // dc_interrupt_ack for an HPD3 vector: acked, mapped to connector 3.
+    let before = detector.engine.io.writes.len();
+    if detector.hpd_event(3, false) != Ok(Some(3))
+        || !detector.engine.io.writes[before..]
+            .iter()
+            .any(|&(reg, v)| reg == 0x34c0 + control(3) && v & 1 != 0)
+        || detector.hpd_event(1, true) != Ok(Some(1))
+        || detector.hpd_event(5, false) != Ok(None)
+        || detector.hpd_event(6, false) != Err(Error::Invalid)
+    {
+        return TestResult::Fail("HPD vector acknowledgement");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-display",
+    navi22_display_arms_hpd_interrupts_like_amdgpu_dm
+);
+
+fn navi22_display_waits_for_a_freshly_enabled_hpd_filter() -> TestResult {
+    // HPD3 had DC_HPD_EN off: bind enables it, so a low sense is polled up
+    // to the settle bound before reporting disconnected. HPD0 was already
+    // enabled by the firmware and answers at once.
+    let mut fake = Fake::new();
+    fake.set(0x1f16, 1 << 28);
+    let mut detector = Detector::new_with(engine(fake), &board()).unwrap();
+    let quick = narf_time::Deadline::after_ms(500);
+    if run(detector.detect(0)) != Ok(Detection::Disconnected) || quick.expired() {
+        return TestResult::Fail("enabled HPD");
+    }
+    let (early, late) = (
+        narf_time::Deadline::after_ms(500),
+        narf_time::Deadline::after_ms(1500),
+    );
+    if run(detector.detect(3)) != Ok(Detection::Disconnected) {
+        return TestResult::Fail("fresh HPD");
+    }
+    if !early.expired() || late.expired() {
+        return TestResult::Fail("settle bound");
+    }
+    // The hotplug signal: a notify wakes a waiter early; none times out.
+    let mut since = crate::amdgpu_navi22_display::HOTPLUG.version();
+    crate::amdgpu_navi22_display::HOTPLUG.notify();
+    if !run(crate::amdgpu_navi22_display::HOTPLUG.wait(&mut since, 5000))
+        || run(crate::amdgpu_navi22_display::HOTPLUG.wait(&mut since, 60))
+    {
+        return TestResult::Fail("hotplug wake");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-display",
+    navi22_display_waits_for_a_freshly_enabled_hpd_filter
+);

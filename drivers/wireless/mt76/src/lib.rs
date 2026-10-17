@@ -60,7 +60,7 @@ narf_driver! {
 
 #[cfg(feature = "builtin")]
 fn do_register() {
-    mt7921::register_pci_driver();
+    mt7921::register();
 }
 
 #[cfg(feature = "module")]

@@ -318,6 +318,9 @@ impl Sdma {
     pub fn state(&self) -> State {
         self.engine.state
     }
+    pub(crate) fn fence_map(&self, instance: usize) -> narf_bus::MmioRegion {
+        self.engine.queues[instance & 1].map()
+    }
     /// Client IBs on SDMA `instance` (0 or 1); see `Gfx::submit`.
     pub fn submit(
         &mut self,

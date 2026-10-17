@@ -95,15 +95,18 @@ fn framebuffer_range(
 
 fn training_clients(protected: &[vram::Protected]) -> Result<(), Error> {
     // Long training temporarily overwrites this entire prefix, regardless of
-    // allocator exclusions. Display/cursor readers can show transient pixels,
-    // but live DMUB code/data or another firmware writer cannot be preserved
+    // allocator exclusions. Display/cursor readers can show transient pixels.
+    // Inherited DMUB windows are tolerated as Linux does: psp_v11_0's long
+    // training backs up/restores the prefix whatever DCN maps there, and the
+    // DMCUB is stopped and reset (DmubQuiesce, dm_dmub_hw_init) before its
+    // firmware is reloaded. Other firmware writers there cannot be preserved
     // by racing a CPU backup/restore. No caller-supplied OtherClient ranges
     // exist here: Plan produces those only from inherited display surfaces.
     if protected.iter().any(|region| {
         region.range.start < 32 * 1024 * 1024
             && !matches!(
                 region.owner,
-                vram::Owner::BootFramebuffer | vram::Owner::OtherClient
+                vram::Owner::BootFramebuffer | vram::Owner::OtherClient | vram::Owner::Dmub
             )
     }) {
         return Err(Error::Memory(vram::Error::Busy));
@@ -279,13 +282,8 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     Ok(report)
 }
 
-/// Kernel queues of the retained owner passed their tests (render ABI gate).
-static QUEUES_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-pub(crate) fn queues_ready() -> bool {
-    QUEUES_READY.load(core::sync::atomic::Ordering::Acquire)
-}
-/// Serialised access to the retained owner for the render ABI
-/// (`amdgpu_navi22_drm`). Never held across a fence wait.
+/// Serialised access to the retained owner for client submission
+/// (`amdgpu_navi22_cs`). Never held across a fence wait.
 pub(crate) async fn owner() -> narf_lib::mutex::MutexGuard<'static, Option<boot::ColdBoot>> {
     OWNER.lock().await
 }
@@ -295,10 +293,11 @@ pub(crate) async fn owner() -> narf_lib::mutex::MutexGuard<'static, Option<boot:
 /// take the owner lock per refresh. Failures are reported, never fatal.
 async fn start_services(boot: &mut boot::ColdBoot) {
     use core::fmt::Write;
-    QUEUES_READY.store(
-        boot.queues_verified(),
-        core::sync::atomic::Ordering::Release,
-    );
+    // Clients' command submissions and VRAM buffers (generic CS/GEM path).
+    if boot.queues_verified() {
+        crate::amdgpu_navi22_cs::register(boot).await;
+    }
+    start_hotplug(boot);
     if boot.queues_verified() {
         crate::amdgpu_navi22_tdr::start();
     }
@@ -332,6 +331,32 @@ async fn start_services(boot: &mut boot::ColdBoot) {
             let _ = writeln!(
                 narf_console::Writer,
                 "amdgpu: navi22 thermal alert failed: {error:?}"
+            );
+        }
+    }
+}
+
+/// HPD over the IH ring (amdgpu_navi22_display::serve_hpd): each vector is
+/// acknowledged under the owner lock, then wakes the hotplug pollers and the
+/// display monitor. Without an IH ring or display owner, polling alone runs.
+fn start_hotplug(boot: &mut boot::ColdBoot) {
+    use core::fmt::Write;
+    match boot.arm_display_hpd() {
+        Ok(subscription) => {
+            narf_scheduler::spawn(crate::amdgpu_navi22_display::serve_hpd(
+                subscription,
+                |hpd| async move {
+                    if let Some(boot) = OWNER.lock().await.as_mut() {
+                        let _ = boot.display_hpd(hpd);
+                    }
+                    crate::amdgpu_navi22_kms::wake();
+                },
+            ));
+        }
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 HPD interrupts unavailable ({error:?}); polling"
             );
         }
     }
@@ -422,7 +447,7 @@ impl crate::amdgpu_navi22_recovery::Backend for Recovering<'_> {
 pub async unsafe fn recover() -> Result<boot::Report, crate::amdgpu_navi22_recovery::Error> {
     use crate::amdgpu_navi22_recovery::Error;
     let mut recovery = RECOVERY.try_lock().ok_or(Error::Busy)?;
-    QUEUES_READY.store(false, core::sync::atomic::Ordering::Release);
+    crate::amdgpu_navi22_cs::unregister();
     let device = amdgpu::pci_device().ok_or(Error::Busy)?;
     let mut owner = OWNER.lock().await;
     let mut backend = Recovering {
@@ -1232,8 +1257,12 @@ mod tests {
         if training_clients(core::slice::from_ref(&region)).is_err() {
             return TestResult::Fail("inventoried display reader refused");
         }
+        // A GOP-era DMUB window in the prefix: Linux trains regardless.
+        region.owner = vram::Owner::Dmub;
+        if training_clients(core::slice::from_ref(&region)).is_err() {
+            return TestResult::Fail("inherited DMUB window blocked cold training");
+        }
         for owner in [
-            vram::Owner::Dmub,
             vram::Owner::FirmwareUsage,
             vram::Owner::DriverUsage,
             vram::Owner::FirmwareTail,

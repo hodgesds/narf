@@ -13,7 +13,7 @@ pub(crate) struct DisplayContext {
 }
 impl<I: Io> Engine<I> {
     pub(super) fn display_context(&mut self) -> Result<DisplayContext, Error> {
-        if self.state != State::Ready {
+        if !self.state.vmid0_ready() {
             return Err(Error::Busy);
         }
         let g = self.geometry.ok_or(Error::Busy)?;

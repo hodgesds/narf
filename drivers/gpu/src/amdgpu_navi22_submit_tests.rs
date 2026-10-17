@@ -58,6 +58,7 @@ fn gfx_engine() -> (crate::amdgpu_vram::Pool, GfxEngine<Model>) {
         queue,
         state: GfxState::Prepared,
         proof: GfxProof::default(),
+        golden: false,
     };
     assert!(run(e.configure()).is_ok() && run(e.start()).is_ok() && run(e.test_ib()).is_ok());
     (pool, e)

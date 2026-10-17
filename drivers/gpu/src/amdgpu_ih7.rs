@@ -492,7 +492,7 @@ impl Rings {
     /// Same GPU's authenticated firmware, trained VRAM and ready GMC/MMHUB0.
     /// Own VMID0, both IH rings and all sources; no concurrent reset or PM.
     pub unsafe fn initialize(&mut self, gmc: &gmc::Gmc) -> Result<Report, Error> {
-        if gmc.state() != gmc::State::Ready {
+        if !gmc.state().vmid0_ready() {
             return Err(Error::Busy);
         }
         self.0.initialize()

@@ -662,6 +662,7 @@ fn gfx(model: Model) -> (Pool, GfxEngine<Model>) {
             queue,
             state: GfxState::Prepared,
             proof: GfxProof::default(),
+            golden: false,
         },
     )
 }
@@ -796,10 +797,40 @@ kernel_test_in!(
 fn cp_navi22_gfx_ring_clear_state_ring_and_ib_tests() -> TestResult {
     let (pool, mut e) = gfx(enabled());
     let available = pool.available();
+    // gfx_v10_0_hw_init order: golden settings (before SDMA), then cp_resume.
+    if e.golden().is_err() || e.golden() != Err(Error::Busy) {
+        return TestResult::Fail("golden settings not applied exactly once");
+    }
     if run(e.configure()).is_err() || run(e.start()).is_err() || run(e.test_ib()).is_err() {
         return TestResult::Fail("gfx bring-up failed");
     }
     let m = &e.hw.io;
+    let golden_writes = m
+        .writes
+        .iter()
+        .filter(|&&(a, _)| a == r(GOLDEN[5].0))
+        .count();
+    if golden_writes != 1 {
+        return TestResult::Fail("configure re-applied golden settings after SDMA");
+    }
+    // gfx_v10_3_set_power_brake_sequence, after the ring is up.
+    let brake = [
+        (GRBM_GFX_INDEX, 0xe000_0000),
+        (GC_CAC_IND_INDEX, 0x1),
+        (GC_CAC_IND_DATA, 0x00f9_c801),
+        (GC_THROTTLE_CTRL, 0xa024),
+        (DIDT_IND_INDEX, 0x1a),
+        (DIDT_IND_DATA, 0x4),
+    ]
+    .map(|(reg, value)| (r(reg), value));
+    let ring = m
+        .writes
+        .iter()
+        .position(|&(a, _)| a == r(CP_ME_CNTL))
+        .unwrap();
+    if !m.writes[ring..].windows(6).any(|w| w == brake) {
+        return TestResult::Fail("GC 10.3 power-brake sequence missing or misordered");
+    }
     let base = e.queue.address(0);
     for (reg, value) in [
         (CP_RB0_CNTL, 0x80a),

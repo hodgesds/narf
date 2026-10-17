@@ -22,24 +22,31 @@
 //! different lifetimes, and keeping their numbering disjoint is what lets
 //! `GEM_CLOSE` tell which table a handle belongs to without a lookup in both.
 //!
-//! LINUX-GAP: the backing is always physically contiguous system memory from
-//! the buddy allocator, whatever domain the caller asked for. There is no TTM:
-//! no VRAM placement, no eviction, no migration between GTT and VRAM, and no
-//! `GEM_CREATE_VRAM_CONTIGUOUS`/`NO_CPU_ACCESS` distinction. On these APUs
-//! VRAM is carved out of system memory anyway, so the pages are of the right
-//! kind; what is missing is the GPU-side placement a discrete part would need
-//! and the pressure handling any part needs. `preferred_domains` is recorded
-//! and reported back by `GEM_OP` so userspace sees its own request, not a
-//! rewritten one.
+//! ## Placement
+//!
+//! A buffer allowed in VRAM, on a card that registered a [`VramHeap`], is a
+//! reservation in that card's owned VRAM pool: its entries carry the
+//! physical VRAM address (`gmc_v1x_0_get_vm_pde`'s translation) without
+//! SYSTEM, and the CPU maps it through the BAR. Anything else — every APU
+//! buffer, a GTT buffer, or VRAM falling back to GTT when the heap is full —
+//! is physically contiguous system memory from the buddy allocator, which
+//! the GPU reaches as SYSTEM pages (the IOMMU runs identity mappings).
+//!
+//! LINUX-GAP: there is no TTM: no eviction, no migration between GTT and
+//! VRAM, and no `GEM_CREATE_VRAM_CONTIGUOUS`/`NO_CPU_ACCESS` distinction
+//! (every VRAM buffer is contiguous and CPU-visible). `preferred_domains` is
+//! recorded and reported back by `GEM_OP` so userspace sees its own request,
+//! not a rewritten one.
 //!
 //! LINUX-GAP: `GEM_WAIT_IDLE` always reports idle immediately. That is
 //! currently true — there is no submission path, so nothing can be busy — but
 //! it will become a lie the moment `AMDGPU_CS` lands, and it is the one call
 //! here that must be revisited then rather than extended.
 //!
-//! LINUX-GAP: `GEM_USERPTR` (pinning host pages into the GPU address space),
-//! `GEM_METADATA` (the tiling descriptor a DRI client passes to its peer) and
-//! `GEM_LIST_HANDLES` are not implemented and return EINVAL.
+//! LINUX-GAP: `GEM_USERPTR` (pinning host pages into the GPU address space)
+//! and `GEM_LIST_HANDLES` are not implemented and return EINVAL.
+//! `GEM_METADATA` stores the tiling descriptor and UMD data on the object,
+//! where every PRIME importer sees it.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -61,6 +68,42 @@ const HANDLE_BASE: u32 = 0x4000_0000;
 const DRM_GEM_CLOSE_NR: u32 = 0x09;
 
 const PAGE_SIZE: u64 = 4096;
+
+/// A discrete card's VRAM that client buffers may take: its owned pool, and
+/// how a pool (GPU framebuffer) address becomes the physical VRAM address
+/// page-table entries carry — `address - fb_base + fb_offset`, as
+/// `gmc_v1x_0_get_vm_pde` subtracts `vram_start` and adds
+/// `vram_base_offset`.
+#[derive(Clone, Debug)]
+pub struct VramHeap {
+    pub pool: crate::amdgpu_vram::Pool,
+    pub fb_base: u64,
+    pub fb_offset: u64,
+}
+
+/// Each DRM card's client VRAM heap, by card index.
+static HEAPS: IrqSafeSpinLock<Vec<(u32, VramHeap)>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Let clients of DRM card `card` place buffers in `heap`, replacing any
+/// earlier heap. Buffers already created keep their placement.
+pub fn register_vram_heap(card: u32, heap: VramHeap) {
+    let mut heaps = HEAPS.lock();
+    heaps.retain(|(c, _)| *c != card);
+    heaps.push((card, heap));
+}
+
+/// Stop placing new buffers of DRM card `card` in VRAM.
+pub fn unregister_vram_heap(card: u32) {
+    HEAPS.lock().retain(|(c, _)| *c != card);
+}
+
+fn vram_heap(card: u32) -> Option<VramHeap> {
+    HEAPS
+        .lock()
+        .iter()
+        .find(|(c, _)| *c == card)
+        .map(|(_, h)| h.clone())
+}
 
 /// `AMDGPU_GEM_DOMAIN_MASK`, from the mirror — it was hand-composed here
 /// until the mirror gained the composite the C header actually defines.
@@ -109,25 +152,77 @@ fn domains_valid(domains: u64) -> bool {
     special & (special - 1) == 0
 }
 
+/// Where a buffer's memory came from, which decides how it is returned.
+#[derive(Debug)]
+enum Backing {
+    /// Buddy pages of this order.
+    System(u8),
+    /// A VRAM pool reservation, held for its drop, which returns it to the
+    /// pool.
+    Vram {
+        _held: crate::amdgpu_vram::Reservation,
+    },
+}
+
 /// One buffer object: a contiguous physical allocation plus what the client
 /// asked for when it created it.
 #[derive(Debug)]
 pub struct GemObject {
+    /// What the CPU maps: the system pages, or the buffer's BAR window.
     pub phys: u64,
+    /// What the GPU's page-table entries carry: the system pages' address,
+    /// or the physical VRAM address.
+    pub gpu: u64,
+    /// The GPU reaches it as system memory (SYSTEM/SNOOPED entries).
+    pub system: bool,
     /// Rounded up to a page, as `bo_size` is reported back.
     pub byte_len: u64,
-    /// Buddy order the allocation came from, needed to free it.
-    order: u8,
+    backing: Backing,
     /// `alignment` as requested, reported back by `GEM_OP`.
     alignment: u64,
     pub preferred_domains: u64,
     pub flags: u64,
+    /// `GEM_METADATA` (`amdgpu_bo_set_metadata`): flags, tiling info and
+    /// up to 256 bytes of UMD data, shared by every importer.
+    metadata: IrqSafeSpinLock<(u64, u64, Vec<u8>)>,
+}
+
+impl GemObject {
+    /// CPU store of a 64-bit value at `offset` (the user fence write of
+    /// `amdgpu_cs`), through the kernel's direct map or the BAR window.
+    pub fn write_u64(&self, offset: u64, value: u64) {
+        if offset.checked_add(8).is_none_or(|end| end > self.byte_len) || offset % 8 != 0 {
+            return;
+        }
+        let at = match &self.backing {
+            Backing::System(_) => {
+                narf_memory::PhysAddr::new(self.phys + offset).kernel_mut_ptr::<u64>()
+            }
+            Backing::Vram { _held } => (_held.mapping().virt + offset) as *mut u64,
+        };
+        // SAFETY: bounded inside this object's own pages or BAR window,
+        // 8-byte aligned; the object is alive for the borrow.
+        unsafe { core::ptr::write_volatile(at, value) };
+    }
+    /// Where the buffer lives: `AMDGPU_GEM_DOMAIN_VRAM` or `_GTT`.
+    pub fn domain(&self) -> u32 {
+        if self.system {
+            uapi::AMDGPU_GEM_DOMAIN_GTT
+        } else {
+            uapi::AMDGPU_GEM_DOMAIN_VRAM
+        }
+    }
 }
 
 impl Drop for GemObject {
     fn drop(&mut self) {
-        let frame = narf_memory::PhysFrame::containing(narf_memory::PhysAddr::new(self.phys));
-        narf_memory::frame::free_pages(frame, self.order);
+        // Memory returns when the last reference (handle, CPU mapping or VA
+        // mapping) goes; an address space a job ran in holds its removed
+        // mappings' buffers until that job's fence (`VmState::note_job`).
+        if let Backing::System(order) = self.backing {
+            let frame = narf_memory::PhysFrame::containing(narf_memory::PhysAddr::new(self.phys));
+            narf_memory::frame::free_pages(frame, order);
+        }
     }
 }
 
@@ -136,6 +231,8 @@ impl Drop for GemObject {
 pub struct GemState {
     objects: IrqSafeSpinLock<Option<BTreeMap<u32, Arc<GemObject>>>>,
     next_handle: AtomicU32,
+    /// The DRM card whose VRAM heap this open may place buffers in.
+    card: Option<u32>,
 }
 
 impl Default for GemState {
@@ -145,10 +242,22 @@ impl Default for GemState {
 }
 
 impl GemState {
+    /// An open with no VRAM heap: every buffer is system memory.
     pub const fn new() -> Self {
         GemState {
             objects: IrqSafeSpinLock::new(None),
             next_handle: AtomicU32::new(HANDLE_BASE),
+            card: None,
+        }
+    }
+
+    /// An open of DRM card `index`, placing VRAM buffers in its heap once
+    /// one is registered.
+    pub const fn for_card(index: u32) -> Self {
+        GemState {
+            objects: IrqSafeSpinLock::new(None),
+            next_handle: AtomicU32::new(HANDLE_BASE),
+            card: Some(index),
         }
     }
 
@@ -180,9 +289,40 @@ impl GemState {
         g.as_mut().is_some_and(|m| m.remove(&handle).is_some())
     }
 
+    /// The open's GEM table entry for `handle`, by its public name.
+    pub(crate) fn lookup(&self, handle: u32) -> Option<Arc<GemObject>> {
+        self.get(handle)
+    }
+
     /// The object named by `handle`, for the VM layer's range checks.
     pub fn object(&self, handle: u32) -> Option<Arc<GemObject>> {
         self.get(handle)
+    }
+
+    /// PRIME import (`amdgpu_gem_prime_import` of a same-driver dma-buf):
+    /// the handle this open already has for `object`, or a new one.
+    pub fn import(&self, object: Arc<GemObject>) -> Result<u32, FsError> {
+        if let Some(handle) = self.objects.lock().as_ref().and_then(|m| {
+            m.iter()
+                .find(|(_, o)| Arc::ptr_eq(o, &object))
+                .map(|(h, _)| *h)
+        }) {
+            return Ok(handle);
+        }
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        if handle < HANDLE_BASE {
+            return Err(FsError::NoSpace);
+        }
+        self.objects
+            .lock()
+            .get_or_insert_with(BTreeMap::new)
+            .insert(handle, object);
+        Ok(handle)
+    }
+
+    /// The object an mmap of `offset` (`handle << PAGE_SHIFT`) keeps alive.
+    pub fn mmap_owner(&self, offset: u64) -> Option<Arc<GemObject>> {
+        self.get(u32::try_from(offset >> 12).ok()?)
     }
 
     /// Whether `handle` belongs to this table at all, so `GEM_CLOSE` can tell
@@ -256,35 +396,81 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
         return Err(FsError::InvalidData);
     }
 
-    let frame = narf_memory::frame::alloc_pages_on(0, order).map_err(|_| FsError::NoSpace)?;
-    let phys = frame.start_address().raw();
-    // Zero before userspace can see it. This is not optional: the pages come
-    // from the kernel's own allocator and may hold anything.
-    //
-    // SAFETY: the allocation covers `(1 << order)` pages at `phys`, and phys
-    // memory is kernel-mapped at a fixed offset.
-    unsafe {
-        core::ptr::write_bytes(
-            narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
-            0,
-            ((1u64 << order) * PAGE_SIZE) as usize,
-        );
-    }
-
-    let handle = match state.insert(GemObject {
-        phys,
-        byte_len,
-        order,
-        alignment,
-        preferred_domains: domains,
-        flags,
-    }) {
-        Ok(h) => h,
-        Err(error) => {
-            narf_memory::frame::free_pages(frame, order);
-            return Err(error);
+    // VRAM first where the buffer may live there and the card has a heap;
+    // GTT next if it is also allowed (Linux's placement order).
+    let vram = (domains & uapi::AMDGPU_GEM_DOMAIN_VRAM as u64 != 0)
+        .then(|| state.card.and_then(vram_heap))
+        .flatten()
+        .and_then(|heap| {
+            let align = (alignment.max(PAGE_SIZE)).checked_next_power_of_two()?;
+            let reservation = heap.pool.reserve_aligned(byte_len, align).ok()?;
+            Some((heap, reservation))
+        });
+    let object = match vram {
+        Some((heap, reservation)) => {
+            let map = reservation.mapping();
+            // Zero through the BAR before userspace or the GPU can see it:
+            // the pool's previous owner may have left anything.
+            //
+            // SAFETY: the reservation is this buffer's alone and its CPU
+            // mapping covers `reservation.size()` bytes.
+            unsafe { core::ptr::write_bytes(map.virt as *mut u8, 0, reservation.size() as usize) };
+            let gpu = reservation
+                .address()
+                .checked_sub(heap.fb_base)
+                .and_then(|a| a.checked_add(heap.fb_offset))
+                .ok_or(FsError::InvalidData)?;
+            GemObject {
+                phys: map.phys.raw(),
+                gpu,
+                system: false,
+                byte_len,
+                backing: Backing::Vram { _held: reservation },
+                alignment,
+                preferred_domains: domains,
+                flags,
+                metadata: IrqSafeSpinLock::new((0, 0, Vec::new())),
+            }
+        }
+        None if domains & (uapi::AMDGPU_GEM_DOMAIN_GTT | uapi::AMDGPU_GEM_DOMAIN_CPU) as u64
+            == 0
+            && state.card.and_then(vram_heap).is_some() =>
+        {
+            // VRAM only, on a card with VRAM, and none left.
+            return Err(FsError::NoSpace);
+        }
+        None => {
+            let frame =
+                narf_memory::frame::alloc_pages_on(0, order).map_err(|_| FsError::NoSpace)?;
+            let phys = frame.start_address().raw();
+            // Zero before userspace can see it. This is not optional: the
+            // pages come from the kernel's own allocator and may hold
+            // anything.
+            //
+            // SAFETY: the allocation covers `(1 << order)` pages at `phys`,
+            // and phys memory is kernel-mapped at a fixed offset.
+            unsafe {
+                core::ptr::write_bytes(
+                    narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
+                    0,
+                    ((1u64 << order) * PAGE_SIZE) as usize,
+                );
+            }
+            GemObject {
+                phys,
+                gpu: phys,
+                system: true,
+                byte_len,
+                backing: Backing::System(order),
+                alignment,
+                preferred_domains: domains,
+                flags,
+                metadata: IrqSafeSpinLock::new((0, 0, Vec::new())),
+            }
         }
     };
+    // A failed insert drops the object, which returns its memory.
+    let handle = state.insert(object)?;
 
     // `drm_amdgpu_gem_create_out`: handle, _pad.
     let mut out = [0u8; 8];
@@ -297,14 +483,16 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
 
 /// `amdgpu_gem_mmap_ioctl` — hand back the offset, nothing is mapped yet.
 fn mmap(state: &GemState, arg: usize) -> Result<u64, FsError> {
+    // `union drm_amdgpu_gem_mmap` is 8 bytes: in { handle, _pad } and
+    // out { addr_ptr } both start at offset 0.
     // SAFETY: as above.
-    let bytes = unsafe { copy_in(arg, 16)? };
+    let bytes = unsafe { copy_in(arg, 8)? };
     let handle = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     if state.get(handle).is_none() {
         return Err(FsError::InvalidData);
     }
-    let mut out = [0u8; 16];
-    out[8..16].copy_from_slice(&((handle as u64) << 12).to_le_bytes());
+    let mut out = [0u8; 8];
+    out[0..8].copy_from_slice(&((handle as u64) << 12).to_le_bytes());
     // SAFETY: as above.
     unsafe { copy_out(arg, &out)? };
     Ok(0)
@@ -315,13 +503,13 @@ fn wait_idle(state: &GemState, arg: usize) -> Result<u64, FsError> {
     // SAFETY: as above.
     let bytes = unsafe { copy_in(arg, 16)? };
     let handle = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-    if state.get(handle).is_none() {
-        return Err(FsError::InvalidData);
-    }
-    // `drm_amdgpu_gem_wait_idle_out { status, domain }`: status 0 means the
-    // wait completed rather than timed out. Nothing can be busy — see the
-    // module LINUX-GAP.
-    let out = [0u8; 8];
+    let object = state.get(handle).ok_or(FsError::InvalidData)?;
+    // `drm_amdgpu_gem_wait_idle_out { status, domain }`: status 0 means idle
+    // (1: timed out), domain the buffer's preferred domains. On a card that
+    // runs jobs the `/dev/dri` route answers it from the engine
+    // (`amdgpu_cs::dispatch_async`); here nothing can be busy.
+    let mut out = [0u8; 8];
+    out[4..8].copy_from_slice(&(object.preferred_domains as u32).to_le_bytes());
     // SAFETY: as above.
     unsafe { copy_out(arg, &out)? };
     Ok(0)
@@ -362,6 +550,44 @@ fn op(state: &GemState, arg: usize) -> Result<u64, FsError> {
     }
 }
 
+/// `amdgpu_gem_metadata_ioctl`: `{ handle, op, data { flags, tiling_info,
+/// data_size_bytes, data[64] } }`, 288 bytes with padding.
+fn metadata(state: &GemState, arg: usize) -> Result<u64, FsError> {
+    // SAFETY: as above.
+    let mut b = unsafe { copy_in(arg, 288)? };
+    let handle = u32::from_le_bytes(b[0..4].try_into().unwrap());
+    let op = u32::from_le_bytes(b[4..8].try_into().unwrap());
+    let object = state.get(handle).ok_or(FsError::NotFound)?;
+    match op {
+        uapi::AMDGPU_GEM_METADATA_OP_SET_METADATA => {
+            let len = u32::from_le_bytes(b[24..28].try_into().unwrap()) as usize;
+            // amdgpu_bo_set_metadata: at most sizeof(data).
+            if len > 256 {
+                return Err(FsError::InvalidData);
+            }
+            *object.metadata.lock() = (
+                u64::from_le_bytes(b[8..16].try_into().unwrap()),
+                u64::from_le_bytes(b[16..24].try_into().unwrap()),
+                b[28..28 + len].to_vec(),
+            );
+            Ok(0)
+        }
+        uapi::AMDGPU_GEM_METADATA_OP_GET_METADATA => {
+            {
+                let m = object.metadata.lock();
+                b[8..16].copy_from_slice(&m.0.to_le_bytes());
+                b[16..24].copy_from_slice(&m.1.to_le_bytes());
+                b[24..28].copy_from_slice(&(m.2.len() as u32).to_le_bytes());
+                b[28..28 + m.2.len()].copy_from_slice(&m.2);
+            }
+            // SAFETY: as above, the same 288 bytes.
+            unsafe { copy_out(arg, &b)? };
+            Ok(0)
+        }
+        _ => Err(FsError::InvalidData),
+    }
+}
+
 /// `drm_gem_close_ioctl` for a handle this table owns.
 fn close(state: &GemState, arg: usize) -> Result<u64, FsError> {
     // SAFETY: as above.
@@ -398,6 +624,11 @@ pub fn dispatch(cmd: u32, arg: usize, state: &GemState) -> Result<u64, FsError> 
         uapi::DRM_AMDGPU_GEM_MMAP => mmap(state, arg),
         uapi::DRM_AMDGPU_GEM_WAIT_IDLE => wait_idle(state, arg),
         uapi::DRM_AMDGPU_GEM_OP => op(state, arg),
+        uapi::DRM_AMDGPU_GEM_METADATA => metadata(state, arg),
         _ => Err(FsError::Unsupported),
     }
 }
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_render_abi_tests.rs"]
+mod render_abi_tests;

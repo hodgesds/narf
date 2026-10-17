@@ -112,6 +112,132 @@ pub const fn with_mtype(flags: u64, mtype: u64) -> u64 {
     (flags & !MTYPE_MASK) | ((mtype << MTYPE_SHIFT) & MTYPE_MASK)
 }
 
+/// `AMDGPU_PTE_PRT_GFX12`.
+pub const PTE_PRT_GFX12: u64 = 1 << 56;
+/// `AMDGPU_PDE_PTE_GFX12`, also `AMDGPU_PTE_IS_PTE`.
+pub const PDE_PTE_GFX12: u64 = 1 << 63;
+/// `AMDGPU_PTE_DCC`: the page is DCC-compressed (GFX12, shares bit 58 with
+/// `NOALLOC`).
+pub const PTE_DCC: u64 = 1 << 58;
+/// `AMDGPU_PTE_MTYPE_GFX12`: the memory type at bits 55:54.
+pub const MTYPE_GFX12_SHIFT: u32 = 54;
+pub const MTYPE_GFX12_MASK: u64 = 3 << MTYPE_GFX12_SHIFT;
+
+/// Where one GMC generation puts the bits that moved (`amdgpu_vm.h`):
+/// everything else — VALID, SYSTEM, SNOOPED, the permissions, FRAG, the
+/// address field and NOALLOC — is common to GMC 10, 11 and 12.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PteFormat {
+    /// GMC 10 and 11 (`gmc_v10_0_get_vm_pte`, `gmc_v11_0_get_vm_pte`):
+    /// MTYPE_NV10 at 50:48, PRT at 51, PDE_PTE at 54, the PDE block
+    /// fragment size at 63:59.
+    Nv10,
+    /// GMC 12 (`gmc_v12_0_get_vm_pte`): MTYPE_GFX12 at 55:54, PRT at 56,
+    /// PDE_PTE (IS_PTE) at 63, the block fragment size at 62:58, DCC at 58.
+    Gfx12,
+}
+
+impl PteFormat {
+    /// The format's MTYPE field set to `mtype`.
+    pub const fn with_mtype(self, flags: u64, mtype: u64) -> u64 {
+        match self {
+            PteFormat::Nv10 => with_mtype(flags, mtype),
+            PteFormat::Gfx12 => {
+                (flags & !MTYPE_GFX12_MASK) | ((mtype << MTYPE_GFX12_SHIFT) & MTYPE_GFX12_MASK)
+            }
+        }
+    }
+
+    /// `AMDGPU_PDE_PTE_FLAG(adev)`: a directory entry that is a leaf, and
+    /// what `amdgpu_vm_pt_clear` writes into an empty directory's entries.
+    pub const fn pde_pte(self) -> u64 {
+        match self {
+            PteFormat::Nv10 => PDE_PTE,
+            PteFormat::Gfx12 => PDE_PTE_GFX12,
+        }
+    }
+
+    /// `AMDGPU_PDE_BFS_FLAG(adev, a)`: a directory's block-fragment size.
+    pub const fn pde_bfs(self, a: u64) -> u64 {
+        match self {
+            PteFormat::Nv10 => pde_bfs(a),
+            PteFormat::Gfx12 => (a & 0x1f) << 58,
+        }
+    }
+
+    /// `gmc_v1x_0_get_vm_pte` — turn a client's `AMDGPU_VM_PAGE_*` word into
+    /// PTE bits on top of `base`, for a buffer created with `bo_flags`
+    /// (`AMDGPU_GEM_CREATE_*`).
+    ///
+    /// Transcribed arm for arm, because the negative cases matter as much as
+    /// the positive ones: Linux CLEARS `EXECUTABLE` and `NOALLOC` when the
+    /// request does not ask for them rather than leaving whatever was there,
+    /// and PRT clears `VALID` — a PRT entry is deliberately not a valid
+    /// translation. The generations differ in the memory types they honour
+    /// (GMC 12 has only NC and UC), in which buffers force UC (GMC 11: the
+    /// coherent ones too; GMC 12: only UNCACHED), and in GMC 12's DCC bit.
+    pub fn pte_flags(self, base: u64, vm_flags: u32, bo_flags: u64) -> u64 {
+        let mut flags = base;
+
+        if vm_flags & uapi::AMDGPU_VM_PAGE_READABLE != 0 {
+            flags |= PTE_READABLE;
+        } else {
+            flags &= !PTE_READABLE;
+        }
+        if vm_flags & uapi::AMDGPU_VM_PAGE_WRITEABLE != 0 {
+            flags |= PTE_WRITEABLE;
+        } else {
+            flags &= !PTE_WRITEABLE;
+        }
+        if vm_flags & uapi::AMDGPU_VM_PAGE_EXECUTABLE != 0 {
+            flags |= PTE_EXECUTABLE;
+        } else {
+            flags &= !PTE_EXECUTABLE;
+        }
+
+        let mtype = match (self, vm_flags & uapi::AMDGPU_VM_MTYPE_MASK) {
+            (_, uapi::AMDGPU_VM_MTYPE_UC) => MTYPE_UC,
+            (PteFormat::Nv10, uapi::AMDGPU_VM_MTYPE_WC) => MTYPE_WC,
+            (PteFormat::Nv10, uapi::AMDGPU_VM_MTYPE_CC) => MTYPE_CC,
+            // DEFAULT, NC, and anything else: non-coherent.
+            _ => MTYPE_NC,
+        };
+        flags = self.with_mtype(flags, mtype);
+
+        if vm_flags & uapi::AMDGPU_VM_PAGE_NOALLOC != 0 {
+            flags |= PTE_NOALLOC;
+        } else {
+            flags &= !PTE_NOALLOC;
+        }
+
+        if vm_flags & uapi::AMDGPU_VM_PAGE_PRT != 0 {
+            flags |= match self {
+                PteFormat::Nv10 => PTE_PRT | PTE_SNOOPED | PTE_LOG | PTE_SYSTEM,
+                PteFormat::Gfx12 => PTE_PRT_GFX12 | PTE_SNOOPED | PTE_SYSTEM | PDE_PTE_GFX12,
+            };
+            flags &= !PTE_VALID;
+        }
+
+        // The buffer's own properties win, and are applied last for that
+        // reason.
+        let forced_uc = match self {
+            PteFormat::Nv10 => {
+                uapi::AMDGPU_GEM_CREATE_COHERENT
+                    | uapi::AMDGPU_GEM_CREATE_EXT_COHERENT
+                    | uapi::AMDGPU_GEM_CREATE_UNCACHED
+            }
+            PteFormat::Gfx12 => uapi::AMDGPU_GEM_CREATE_UNCACHED,
+        };
+        if self == PteFormat::Gfx12 && bo_flags & uapi::AMDGPU_GEM_CREATE_GFX12_DCC as u64 != 0 {
+            flags |= PTE_DCC;
+        }
+        if bo_flags & forced_uc as u64 != 0 {
+            flags = self.with_mtype(flags, MTYPE_UC);
+        }
+        flags
+    }
+}
+
 // ── Address-space geometry ──────────────────────────────────────────────
 
 /// Page-table level, outermost first. `amdgpu_vm.h`'s
@@ -146,6 +272,8 @@ pub struct Geometry {
     pub block_size: u32,
     /// `vm_manager.fragment_size`.
     pub fragment_size: u32,
+    /// How the generation encodes its entries.
+    pub format: PteFormat,
 }
 
 impl Geometry {
@@ -176,7 +304,27 @@ impl Geometry {
         root_level: Level::Pdb2,
         block_size: 9,
         fragment_size: 9,
+        format: PteFormat::Nv10,
     };
+
+    /// Navi4x (GC 12.0.x): `gmc_v12_0_sw_init` makes the same
+    /// `amdgpu_vm_adjust_size(adev, 256 * 1024, 9, 3, 48)` call as GMC 11,
+    /// so the walk is GMC 11's; only the entry encoding differs. (GC 12.1's
+    /// five-level, 57-bit layout is a different part.)
+    pub const GMC12: Geometry = Geometry {
+        format: PteFormat::Gfx12,
+        ..Geometry::GMC11
+    };
+
+    /// The geometry a family's GMC presents: GMC 12's for Navi4x, GMC 11's
+    /// otherwise — the layout GMC 10 shares, and what an unknown device
+    /// was always given.
+    pub fn for_family(family: Option<crate::amdgpu::Family>) -> Geometry {
+        match family {
+            Some(crate::amdgpu::Family::Navi4) => Geometry::GMC12,
+            _ => Geometry::GMC11,
+        }
+    }
 
     /// `amdgpu_vm_pt_level_shift` — how far to shift a PFN to get this
     /// level's index. In GPU pages, so the VA bit position is this plus 12.
@@ -315,68 +463,24 @@ pub const fn strip_hole(va: u64) -> u64 {
 /// `amdgpu_vm.c`: `flags = AMDGPU_PTE_VALID | AMDGPU_PTE_SNOOPED | ...` with
 /// readable/writeable/executable added for a normal mapping.
 pub fn base_flags(system: bool) -> u64 {
-    let mut flags = PTE_VALID | PTE_SNOOPED;
+    // amdgpu_ttm_tt_pte_flags: system pages are SYSTEM and (cached) SNOOPED;
+    // VRAM is neither.
     if system {
-        flags |= PTE_SYSTEM;
+        PTE_VALID | PTE_SYSTEM | PTE_SNOOPED
+    } else {
+        PTE_VALID
     }
-    flags
 }
 
-/// `gmc_v11_0_get_vm_pte` — turn a client's `AMDGPU_VM_PAGE_*` word into PTE
-/// bits, on top of `base`.
-///
-/// Transcribed arm for arm, because the negative cases matter as much as the
-/// positive ones: Linux CLEARS `EXECUTABLE` and `NOALLOC` when the request
-/// does not ask for them rather than leaving whatever was there, and PRT
-/// clears `VALID` — a PRT entry is deliberately not a valid translation.
+/// [`PteFormat::Nv10`]'s `pte_flags`, with `bo_uncached` standing for a
+/// COHERENT, EXT_COHERENT or UNCACHED buffer.
 pub fn pte_flags(base: u64, vm_flags: u32, bo_uncached: bool) -> u64 {
-    let mut flags = base;
-
-    if vm_flags & uapi::AMDGPU_VM_PAGE_READABLE != 0 {
-        flags |= PTE_READABLE;
+    let bo_flags = if bo_uncached {
+        uapi::AMDGPU_GEM_CREATE_UNCACHED as u64
     } else {
-        flags &= !PTE_READABLE;
-    }
-    if vm_flags & uapi::AMDGPU_VM_PAGE_WRITEABLE != 0 {
-        flags |= PTE_WRITEABLE;
-    } else {
-        flags &= !PTE_WRITEABLE;
-    }
-    if vm_flags & uapi::AMDGPU_VM_PAGE_EXECUTABLE != 0 {
-        flags |= PTE_EXECUTABLE;
-    } else {
-        flags &= !PTE_EXECUTABLE;
-    }
-
-    flags = with_mtype(
-        flags,
-        match vm_flags & uapi::AMDGPU_VM_MTYPE_MASK {
-            uapi::AMDGPU_VM_MTYPE_WC => MTYPE_WC,
-            uapi::AMDGPU_VM_MTYPE_CC => MTYPE_CC,
-            uapi::AMDGPU_VM_MTYPE_UC => MTYPE_UC,
-            // DEFAULT, NC, and anything else: non-coherent.
-            _ => MTYPE_NC,
-        },
-    );
-
-    if vm_flags & uapi::AMDGPU_VM_PAGE_NOALLOC != 0 {
-        flags |= PTE_NOALLOC;
-    } else {
-        flags &= !PTE_NOALLOC;
-    }
-
-    if vm_flags & uapi::AMDGPU_VM_PAGE_PRT != 0 {
-        flags |= PTE_PRT | PTE_SNOOPED | PTE_LOG | PTE_SYSTEM;
-        flags &= !PTE_VALID;
-    }
-
-    // A buffer created COHERENT / EXT_COHERENT / UNCACHED overrides the
-    // request's memory type — the BO's own property wins, and it is applied
-    // last for that reason.
-    if bo_uncached {
-        flags = with_mtype(flags, MTYPE_UC);
-    }
-    flags
+        0
+    };
+    PteFormat::Nv10.pte_flags(base, vm_flags, bo_flags)
 }
 
 /// One leaf entry: a physical address with its flags.
@@ -405,6 +509,18 @@ pub struct Mapping {
     pub vm_flags: u32,
 }
 
+/// Rings an address space tracks jobs on (`amdgpu_cs` ticket ring indices).
+const RINGS: usize = 4;
+
+/// A recorded mapping and the buffer it maps. The record keeps the buffer
+/// alive (`amdgpu_bo_va` holds its BO in Linux): a client that closes the
+/// handle while the mapping exists must not free pages the tables point at.
+#[derive(Clone, Debug)]
+struct Entry {
+    mapping: Mapping,
+    object: alloc::sync::Arc<crate::amdgpu_gem::GemObject>,
+}
+
 /// Per-open GPU address space.
 ///
 /// Keyed by start address so an overlap check is two neighbour lookups rather
@@ -413,12 +529,32 @@ pub struct Mapping {
 #[derive(Debug)]
 pub struct VmState {
     geometry: Geometry,
-    mappings: IrqSafeSpinLock<Option<BTreeMap<u64, Mapping>>>,
+    mappings: IrqSafeSpinLock<Option<BTreeMap<u64, Entry>>>,
     /// The root page directory and the hierarchy beneath it. `None` until the
     /// first mapping, so an open that never submits allocates nothing.
     root: IrqSafeSpinLock<Option<Node>>,
     /// Tables allocated, bounded by [`MAX_TABLES`].
     tables: IrqSafeSpinLock<u64>,
+    /// The DRM card whose engine runs this space's jobs.
+    card: Option<u32>,
+    /// The last job (ticket) submitted in this space on each ring, 0 for
+    /// none. Memory the GPU may still reach is held until the card's engine
+    /// completes all of them.
+    last_job: [core::sync::atomic::AtomicU64; RINGS],
+    /// This space's PASID, allocated on first use.
+    pasid: IrqSafeSpinLock<Option<crate::amdgpu_vmid::PasidHandle>>,
+}
+
+impl Drop for VmState {
+    /// A closing file's tables and buffers wait out its last job too.
+    fn drop(&mut self) {
+        let root = self.root.lock().take();
+        let mappings = self.mappings.lock().take();
+        // The PASID too: a fault from a job still running must not be
+        // charged to the next space given the same PASID.
+        let pasid = self.pasid.lock().take();
+        self.release((root, mappings, pasid));
+    }
 }
 
 impl Default for VmState {
@@ -428,12 +564,84 @@ impl Default for VmState {
 }
 
 impl VmState {
+    /// A GMC 11 address space.
     pub const fn new() -> Self {
+        Self::with_geometry(Geometry::GMC11)
+    }
+
+    /// The address space a client of DRM card `index` gets: GMC 12's for a
+    /// Navi4x card, GMC 11's (which GMC 10 shares) for every other.
+    pub fn for_card(index: u32) -> Self {
+        let family = crate::drm_registry::pci_id(index)
+            .and_then(|(vid, did)| crate::amdgpu::family_for_pci_id(vid, did));
+        Self::build(Geometry::for_family(family), Some(index))
+    }
+
+    /// Record that job `ticket` was submitted in this space (its ring is
+    /// `ticket >> 32`, see `amdgpu_cs::Submitter`): from now on, buffers
+    /// and page tables it drops wait for the card's engine to complete it
+    /// (or a later job of the same ring) before they are freed.
+    pub fn note_job(&self, ticket: u64) {
+        let ring = (ticket >> 32) as usize % RINGS;
+        self.last_job[ring].store(ticket, core::sync::atomic::Ordering::Release);
+    }
+
+    /// This space's PASID — what the IH VMID LUT maps a job's VMID to, so a
+    /// fault names its client — allocated on first use.
+    pub fn pasid(&self) -> Option<crate::amdgpu_vmid::Pasid> {
+        let mut pasid = self.pasid.lock();
+        if pasid.is_none() {
+            *pasid = crate::amdgpu_vmid::PasidHandle::alloc();
+        }
+        pasid.as_ref().map(crate::amdgpu_vmid::PasidHandle::get)
+    }
+
+    /// The last VM fault charged to this space's PASID (zeros for none or
+    /// no PASID yet), for `AMDGPU_INFO_GPUVM_FAULT`.
+    pub fn fault(&self) -> crate::amdgpu_vmid::FaultInfo {
+        self.pasid
+            .lock()
+            .as_ref()
+            .map(|p| crate::amdgpu_vmid::fault(p.get()))
+            .unwrap_or_default()
+    }
+
+    /// The last job submitted in this space on each ring that ran one.
+    pub fn last_jobs(&self) -> Vec<u64> {
+        self.last_job
+            .iter()
+            .map(|t| t.load(core::sync::atomic::Ordering::Acquire))
+            .filter(|&t| t != 0)
+            .collect()
+    }
+
+    /// Free `item` now, or — when a job ran in this space — once the card's
+    /// engine has completed the last one (`amdgpu_cs::defer_until`), as
+    /// Linux frees page tables and BOs only after the VM's fences.
+    fn release<T: Send + Sync + 'static>(&self, item: T) {
+        let jobs = self.last_jobs();
+        match self.card {
+            Some(card) if !jobs.is_empty() => {
+                crate::amdgpu_cs::defer_until(card, jobs, alloc::boxed::Box::new(item))
+            }
+            _ => drop(item),
+        }
+    }
+
+    /// An address space laid out and encoded as `geometry`'s generation.
+    pub const fn with_geometry(geometry: Geometry) -> Self {
+        Self::build(geometry, None)
+    }
+
+    const fn build(geometry: Geometry, card: Option<u32>) -> Self {
         VmState {
-            geometry: Geometry::GMC11,
+            geometry,
             mappings: IrqSafeSpinLock::new(None),
             root: IrqSafeSpinLock::new(None),
             tables: IrqSafeSpinLock::new(0),
+            card,
+            last_job: [const { core::sync::atomic::AtomicU64::new(0) }; RINGS],
+            pasid: IrqSafeSpinLock::new(None),
         }
     }
 
@@ -447,15 +655,25 @@ impl VmState {
         let map = g.as_ref()?;
         map.range(..=va)
             .next_back()
-            .map(|(_, m)| *m)
+            .map(|(_, e)| e.mapping)
             .filter(|m| va < m.va.saturating_add(m.size))
     }
 
-    fn overlaps(map: &BTreeMap<u64, Mapping>, va: u64, size: u64) -> bool {
+    /// The buffer the mapping covering `va` holds alive, if any.
+    pub fn mapped_object(&self, va: u64) -> Option<alloc::sync::Arc<crate::amdgpu_gem::GemObject>> {
+        let g = self.mappings.lock();
+        g.as_ref()?
+            .range(..=va)
+            .next_back()
+            .filter(|(_, e)| va < e.mapping.va.saturating_add(e.mapping.size))
+            .map(|(_, e)| e.object.clone())
+    }
+
+    fn overlaps(map: &BTreeMap<u64, Entry>, va: u64, size: u64) -> bool {
         let end = va.saturating_add(size);
         // The mapping starting at or before `va`, and the one after it.
         if let Some((_, prev)) = map.range(..=va).next_back() {
-            if va < prev.va.saturating_add(prev.size) {
+            if va < prev.mapping.va.saturating_add(prev.mapping.size) {
                 return true;
             }
         }
@@ -467,31 +685,85 @@ impl VmState {
         false
     }
 
-    fn insert(&self, mapping: Mapping, replace: bool) -> Result<(), FsError> {
-        let mut g = self.mappings.lock();
-        let map = g.get_or_insert_with(BTreeMap::new);
-        if replace {
-            Self::clear_range(map, mapping.va, mapping.size);
-        } else if Self::overlaps(map, mapping.va, mapping.size) {
-            // `amdgpu_vm_bo_map` returns -EINVAL for an overlap; REPLACE is
-            // the op that asks for one to be dropped.
-            return Err(FsError::InvalidData);
-        }
-        map.insert(mapping.va, mapping);
+    fn insert(
+        &self,
+        mapping: Mapping,
+        object: alloc::sync::Arc<crate::amdgpu_gem::GemObject>,
+        replace: bool,
+    ) -> Result<(), FsError> {
+        let removed = {
+            let mut g = self.mappings.lock();
+            let map = g.get_or_insert_with(BTreeMap::new);
+            let removed = if replace {
+                Self::clear_range(map, mapping.va, mapping.size)
+            } else if Self::overlaps(map, mapping.va, mapping.size) {
+                // `amdgpu_vm_bo_map` returns -EINVAL for an overlap; REPLACE is
+                // the op that asks for one to be dropped.
+                return Err(FsError::InvalidData);
+            } else {
+                Vec::new()
+            };
+            map.insert(mapping.va, Entry { mapping, object });
+            removed
+        };
+        self.release(removed);
         Ok(())
     }
 
-    /// Drop every mapping intersecting `[va, va+size)`.
-    fn clear_range(map: &mut BTreeMap<u64, Mapping>, va: u64, size: u64) {
+    /// `amdgpu_vm_bo_clear_mappings`: remove `[va, va+size)` from every
+    /// mapping it intersects. A mapping that reaches past either end keeps
+    /// the remainder, its offset advanced for the right-hand piece, so the
+    /// record still covers every entry left in the tables (the caller
+    /// clears exactly the requested range's entries) and keeps its buffer.
+    /// Returns the removed records' buffers, for the caller to release.
+    fn clear_range(
+        map: &mut BTreeMap<u64, Entry>,
+        va: u64,
+        size: u64,
+    ) -> Vec<alloc::sync::Arc<crate::amdgpu_gem::GemObject>> {
         let end = va.saturating_add(size);
+        let mut removed = Vec::new();
         let doomed: Vec<u64> = map
             .iter()
-            .filter(|(_, m)| m.va < end && va < m.va.saturating_add(m.size))
+            .filter(|(_, e)| e.mapping.va < end && va < e.mapping.va.saturating_add(e.mapping.size))
             .map(|(k, _)| *k)
             .collect();
         for k in doomed {
-            map.remove(&k);
+            let Some(Entry { mapping: m, object }) = map.remove(&k) else {
+                continue;
+            };
+            removed.push(object.clone());
+            let m_end = m.va.saturating_add(m.size);
+            if m.va < va {
+                let left = Mapping {
+                    size: va - m.va,
+                    ..m
+                };
+                map.insert(
+                    left.va,
+                    Entry {
+                        mapping: left,
+                        object: object.clone(),
+                    },
+                );
+            }
+            if end < m_end {
+                let right = Mapping {
+                    va: end,
+                    size: m_end - end,
+                    offset: m.offset + (end - m.va),
+                    ..m
+                };
+                map.insert(
+                    right.va,
+                    Entry {
+                        mapping: right,
+                        object,
+                    },
+                );
+            }
         }
+        removed
     }
 
     fn unmap(&self, va: u64, size: u64) -> Result<(), FsError> {
@@ -499,20 +771,23 @@ impl VmState {
         let map = g.get_or_insert_with(BTreeMap::new);
         // UNMAP names an existing mapping exactly; Linux answers -ENOENT when
         // no mapping starts there.
-        match map.get(&va) {
-            Some(m) if m.size == size => {
-                map.remove(&va);
-                Ok(())
-            }
-            Some(_) => Err(FsError::InvalidData),
-            None => Err(FsError::NotFound),
-        }
+        let removed = match map.get(&va).map(|e| e.mapping) {
+            Some(m) if m.size == size => map.remove(&va),
+            Some(_) => return Err(FsError::InvalidData),
+            None => return Err(FsError::NotFound),
+        };
+        drop(g);
+        self.release(removed);
+        Ok(())
     }
 
     fn clear(&self, va: u64, size: u64) -> Result<(), FsError> {
-        let mut g = self.mappings.lock();
-        let map = g.get_or_insert_with(BTreeMap::new);
-        Self::clear_range(map, va, size);
+        let removed = {
+            let mut g = self.mappings.lock();
+            let map = g.get_or_insert_with(BTreeMap::new);
+            Self::clear_range(map, va, size)
+        };
+        self.release(removed);
         Ok(())
     }
 
@@ -638,15 +913,11 @@ pub fn dispatch(
                 offset,
                 vm_flags: flags,
             };
-            vm.insert(mapping, replace)?;
-            // A buffer created COHERENT / EXT_COHERENT / UNCACHED forces the
-            // memory type, whatever the mapping asked for.
-            let uncached = object.flags
-                & (uapi::AMDGPU_GEM_CREATE_COHERENT
-                    | uapi::AMDGPU_GEM_CREATE_EXT_COHERENT
-                    | uapi::AMDGPU_GEM_CREATE_UNCACHED) as u64
-                != 0;
-            if let Err(error) = vm.materialise(&mapping, object.phys, uncached) {
+            vm.insert(mapping, object.clone(), replace)?;
+            // The buffer's creation flags can force the memory type (and on
+            // GMC 12 set DCC), whatever the mapping asked for; its placement
+            // decides the entry address and whether it is system memory.
+            if let Err(error) = vm.materialise(&mapping, object.gpu, object.system, object.flags) {
                 // Leave neither half-written tables nor a mapping record
                 // claiming translations that do not exist.
                 vm.dematerialise(va, size);
@@ -706,7 +977,7 @@ impl PageTable {
         let invalid: u64 = if level == Level::Ptb {
             PTE_EXECUTABLE
         } else {
-            PDE_PTE
+            geometry.format.pde_pte()
         };
         for i in 0..geometry.entries_at(level) {
             // SAFETY: `i` is bounded by the table's entry count and the
@@ -788,6 +1059,12 @@ const MAX_TABLES: u64 = 4096;
 impl VmState {
     /// Physical address of the root page directory, for
     /// `VM_CONTEXTn_PAGE_TABLE_BASE_ADDR`. `None` until something is mapped.
+    /// The page-directory base a VM flush writes for this address space:
+    /// the root as a directory entry (system memory, VALID|SYSTEM|SNOOPED).
+    pub fn root_pde(&self) -> Option<u64> {
+        make_pde(self.root_phys()?).ok()
+    }
+
     pub fn root_phys(&self) -> Option<u64> {
         self.root.lock().as_ref().map(|n| n.table.phys)
     }
@@ -809,10 +1086,13 @@ impl VmState {
         &self,
         mapping: &Mapping,
         phys_base: u64,
-        uncached: bool,
+        system: bool,
+        bo_flags: u64,
     ) -> Result<(), FsError> {
         let geometry = self.geometry;
-        let flags = pte_flags(base_flags(true), mapping.vm_flags, uncached);
+        let flags = geometry
+            .format
+            .pte_flags(base_flags(system), mapping.vm_flags, bo_flags);
         let pages = mapping.size / GPU_PAGE_SIZE;
 
         let mut root_guard = self.root.lock();
@@ -874,21 +1154,26 @@ impl VmState {
     fn dematerialise(&self, va: u64, size: u64) {
         let geometry = self.geometry;
         let pages = size / GPU_PAGE_SIZE;
-        let mut root_guard = self.root.lock();
-        let mut tables = self.tables.lock();
-        let Some(root) = root_guard.as_mut() else {
-            return;
-        };
-        let levels: Vec<Level> = geometry.levels().collect();
+        let mut freed = Vec::new();
+        {
+            let mut root_guard = self.root.lock();
+            let mut tables = self.tables.lock();
+            let Some(root) = root_guard.as_mut() else {
+                return;
+            };
+            let levels: Vec<Level> = geometry.levels().collect();
 
-        for page in 0..pages {
-            let va = va + page * GPU_PAGE_SIZE;
-            Self::clear_one(&geometry, root, &levels, 0, va, &mut tables);
+            for page in 0..pages {
+                let va = va + page * GPU_PAGE_SIZE;
+                Self::clear_one(&geometry, root, &levels, 0, va, &mut tables, &mut freed);
+            }
+            if root.live == 0 {
+                *tables -= 1;
+                freed.extend(root_guard.take());
+            }
         }
-        if root.live == 0 {
-            *tables -= 1;
-            *root_guard = None;
-        }
+        // The tables a running job may still walk outlive it.
+        self.release(freed);
     }
 
     /// Clear one leaf and unwind, freeing any directory left empty. Recursive
@@ -901,6 +1186,7 @@ impl VmState {
         depth: usize,
         va: u64,
         tables: &mut u64,
+        freed: &mut Vec<Node>,
     ) {
         let level = levels[depth];
         let index = geometry.index_at(va, level);
@@ -919,7 +1205,7 @@ impl VmState {
             return;
         };
         let before = child.live;
-        Self::clear_one(geometry, child, levels, depth + 1, va, tables);
+        Self::clear_one(geometry, child, levels, depth + 1, va, tables, freed);
         if child.live == before {
             // Nothing changed below, so nothing to unwind.
             return;
@@ -927,8 +1213,8 @@ impl VmState {
         node.live = node.live.saturating_sub(1);
         if child.live == 0 {
             // SAFETY: `index` is masked to the table's entry count.
-            unsafe { node.table.write(index, PDE_PTE) };
-            node.children.remove(&index);
+            unsafe { node.table.write(index, geometry.format.pde_pte()) };
+            freed.extend(node.children.remove(&index));
             *tables -= 1;
         }
     }
