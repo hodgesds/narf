@@ -851,6 +851,17 @@ pub fn unregister_nvme0() {
 /// `/dev/nvme0` — proxy to the installed NVMe controller FileOps.
 struct DevNvme0Proxy;
 
+/// Under `narf.disks=boot-only` the controller node is the one path that
+/// reaches an internal disk without the block layer's write guard: its
+/// passthrough ioctls submit arbitrary admin/IO opcodes (Format NVM,
+/// Sanitize, Firmware Commit, Write). Unless `nvme0` is the identified boot
+/// medium, only `NVME_IOCTL_ID` (`_IO('N', 0x40)`, namespace id query) is
+/// allowed and `write` is refused.
+fn nvme0_passthrough_allowed(cmd: u32) -> bool {
+    const NVME_IOCTL_ID: u32 = 0x4E40;
+    cmd == NVME_IOCTL_ID || narf_block::disk_policy::write_allowed("nvme0")
+}
+
 impl FileOps for DevNvme0Proxy {
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let node = NVME0_NODE.lock().clone();
@@ -864,6 +875,9 @@ impl FileOps for DevNvme0Proxy {
     fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         let node = NVME0_NODE.lock().clone();
         Box::pin(async move {
+            if !narf_block::disk_policy::write_allowed("nvme0") {
+                return Err(FsError::ReadOnly);
+            }
             match node {
                 Some(n) => n.write(offset, buf).await,
                 None => Ok(0),
@@ -893,6 +907,9 @@ impl FileOps for DevNvme0Proxy {
     ) -> FsFuture<'a, u64> {
         let node = NVME0_NODE.lock().clone();
         Box::pin(async move {
+            if !nvme0_passthrough_allowed(cmd) {
+                return Err(FsError::ReadOnly);
+            }
             match node {
                 Some(n) => n.ioctl_user(cmd, arg, context).await,
                 None => Err(FsError::NoDevice),
