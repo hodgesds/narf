@@ -60,6 +60,9 @@ pub const COMPRESSIBLE_PATCH: (u64, usize) = (40_960, 8192);
 pub const HOME_CONF: &[u8] = b"[narf]\nroot_rw = true\n";
 /// Bytes the `log` mode appends to `system.journal` (in 4 KiB writes).
 pub const JOURNAL_APPEND: usize = 32 * 4096;
+/// Bytes journald-style KEEP_SIZE preallocation reserves for the fresh
+/// `system.journal` in the `log` mode.
+pub const JOURNAL_PREALLOC: u64 = 8 << 20;
 /// Size of the journal files the image ships.
 pub const JOURNAL_SIZE: u64 = 256 * 1024;
 
@@ -315,6 +318,12 @@ async fn run_log(root: &Arc<dyn DirOps>, machine_id: &str) -> Result<(), &'stati
         .create("system.journal")
         .await
         .map_err(|_| "create journal")?;
+    // journald preallocates its file ahead of the writes, keeping the size
+    // (`journal_file_allocate` → `posix_fallocate`-style KEEP_SIZE growth).
+    fresh
+        .fallocate(crate::write::FALLOC_FL_KEEP_SIZE, 0, JOURNAL_PREALLOC)
+        .await
+        .map_err(|_| "fallocate journal")?;
     write_all(&fresh, 0, &pattern(23, 64 * 1024))
         .await
         .map_err(|_| "write fresh journal")?;
@@ -357,6 +366,156 @@ async fn run_log(root: &Arc<dyn DirOps>, machine_id: &str) -> Result<(), &'stati
     expect(&dir, "system.journal", &pattern(23, 64 * 1024)).await?;
     if dir.lookup_async("system@old.journal").await.is_ok() {
         return Err("vacuumed journal still present");
+    }
+    Ok(())
+}
+
+/// Directory the `files` mode works in (inside `@`).
+pub const FILES_DIR: &str = "narf-sizes";
+
+/// What the `files` mode leaves in [`FILES_DIR`], for the host to compare.
+pub fn files_expected() -> Vec<(&'static str, Vec<u8>)> {
+    let mut shrink = pattern(41, 300_000);
+    shrink.truncate(150_001);
+    shrink.resize(400_000, 0);
+    let mut prealloc = alloc::vec![0u8; 1 << 20];
+    prealloc[256 * 1024..256 * 1024 + 4096].copy_from_slice(&pattern(42, 4096));
+    let journal: Vec<u8> = (0..64u32).flat_map(|i| pattern(100 + i, 4096)).collect();
+    let mut punch = pattern(44, 200_000);
+    punch[10_000..110_000].fill(0);
+    let mut zero = pattern(45, 200_000);
+    zero[50_000..110_000].fill(0);
+    alloc::vec![
+        ("db.conf", b"short\n".to_vec()),
+        ("shrink.bin", shrink),
+        ("prealloc.bin", prealloc),
+        ("journal.bin", journal),
+        ("punch.bin", punch),
+        ("zero.bin", zero),
+        ("after-rw.txt", b"rw again\n".to_vec()),
+    ]
+}
+
+/// `files` mode (`@`): the size and allocation calls pacman, journald,
+/// editors and systemd make: `O_TRUNC` rewrite, `ftruncate` shrink and grow,
+/// `fallocate` (mode 0, KEEP_SIZE then appends, PUNCH_HOLE, ZERO_RANGE, an
+/// unsupported mode), then `mount -o remount,ro` (writes refused) and back
+/// to `rw` (systemd-shutdown and systemd-remount-fs).
+async fn run_files(
+    fs: &Arc<dyn narf_filesystem::FsInstance>,
+    root: &Arc<dyn DirOps>,
+) -> Result<(), &'static str> {
+    use crate::write::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
+    let dir = root
+        .mkdir(FILES_DIR)
+        .await
+        .map_err(|_| "mkdir narf-sizes")?;
+    // pacman: a config rewritten in place through O_TRUNC.
+    let f = dir.create("db.conf").await.map_err(|_| "create db.conf")?;
+    write_all(&f, 0, &pattern(40, 20_000))
+        .await
+        .map_err(|_| "write db.conf")?;
+    f.fsync(false).await.map_err(|_| "fsync db.conf")?;
+    f.truncate(0).await.map_err(|_| "O_TRUNC db.conf")?;
+    write_all(&f, 0, b"short\n")
+        .await
+        .map_err(|_| "rewrite db.conf")?;
+    // ftruncate down to an unaligned size, then up again (zeros).
+    let g = dir
+        .create("shrink.bin")
+        .await
+        .map_err(|_| "create shrink.bin")?;
+    write_all(&g, 0, &pattern(41, 300_000))
+        .await
+        .map_err(|_| "write shrink.bin")?;
+    g.truncate(150_001).await.map_err(|_| "shrink")?;
+    g.truncate(400_000).await.map_err(|_| "grow")?;
+    // fallocate mode 0, then a write that converts part of it.
+    let h = dir
+        .create("prealloc.bin")
+        .await
+        .map_err(|_| "create prealloc.bin")?;
+    h.fallocate(0, 0, 1 << 20)
+        .await
+        .map_err(|_| "fallocate 0")?;
+    write_all(&h, 256 * 1024, &pattern(42, 4096))
+        .await
+        .map_err(|_| "write prealloc.bin")?;
+    // journald: KEEP_SIZE reservation, 4 KiB appends, truncate at close.
+    let j = dir
+        .create("journal.bin")
+        .await
+        .map_err(|_| "create journal.bin")?;
+    j.fallocate(FALLOC_FL_KEEP_SIZE, 0, 8 << 20)
+        .await
+        .map_err(|_| "fallocate keep")?;
+    for i in 0..64u32 {
+        write_all(&j, u64::from(i) * 4096, &pattern(100 + i, 4096))
+            .await
+            .map_err(|_| "append journal.bin")?;
+    }
+    j.truncate(64 * 4096)
+        .await
+        .map_err(|_| "truncate journal.bin")?;
+    // Punch and zero-range in the middle of written files.
+    let k = dir
+        .create("punch.bin")
+        .await
+        .map_err(|_| "create punch.bin")?;
+    write_all(&k, 0, &pattern(44, 200_000))
+        .await
+        .map_err(|_| "write punch.bin")?;
+    k.fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 10_000, 100_000)
+        .await
+        .map_err(|_| "punch")?;
+    let z = dir
+        .create("zero.bin")
+        .await
+        .map_err(|_| "create zero.bin")?;
+    write_all(&z, 0, &pattern(45, 200_000))
+        .await
+        .map_err(|_| "write zero.bin")?;
+    z.fallocate(FALLOC_FL_ZERO_RANGE, 50_000, 60_000)
+        .await
+        .map_err(|_| "zero range")?;
+    // COLLAPSE_RANGE is EOPNOTSUPP on btrfs.
+    if !matches!(z.fallocate(0x08, 0, 4096).await, Err(FsError::Unsupported)) {
+        return Err("COLLAPSE_RANGE was not refused");
+    }
+    root.syncfs().await.map_err(|_| "syncfs")?;
+    // systemd-shutdown: remount / read-only; nothing may write; then rw.
+    use narf_filesystem::sb_flags::RDONLY;
+    fs.reconfigure_sb(RDONLY, RDONLY, "")
+        .map_err(|_| "remount ro")?;
+    if dir.create("after-ro").await.is_ok() {
+        return Err("a write succeeded after remount ro");
+    }
+    fs.reconfigure_sb(0, RDONLY, "").map_err(|_| "remount rw")?;
+    let r = dir
+        .create("after-rw.txt")
+        .await
+        .map_err(|_| "create after remount rw")?;
+    write_all(&r, 0, b"rw again\n")
+        .await
+        .map_err(|_| "write after remount rw")?;
+    root.syncfs().await.map_err(|_| "syncfs")?;
+
+    let dir = root
+        .lookup_dir_async(FILES_DIR)
+        .await
+        .map_err(|_| "relookup narf-sizes")?;
+    for (name, want) in files_expected() {
+        expect(&dir, name, &want).await?;
+        let file = dir.lookup_async(name).await.map_err(|_| "relookup file")?;
+        let size = file.stat_async().await.map_err(|_| "stat")?.size;
+        if size != want.len() as u64 {
+            let _ = writeln!(
+                narf_console::Writer,
+                "{MARKER} detail: {name}: size {size}, want {}",
+                want.len()
+            );
+            return Err("size mismatch");
+        }
     }
     Ok(())
 }
@@ -446,6 +605,7 @@ pub fn run(mode: &str) -> narf_init::InitResult {
             "home" => run_home(&root).await,
             "log" => run_log(&root, MACHINE_ID).await,
             "fstab" => run_fstab(&root).await,
+            "files" => run_files(&fs, &root).await,
             _ => Err("unknown mode"),
         }
     });

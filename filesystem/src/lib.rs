@@ -2628,6 +2628,15 @@ pub trait FsInstance: Send + Sync + 'static {
         Err(FsError::Unsupported)
     }
 
+    /// Reconfigure with the superblock flags as well (Linux passes them in
+    /// `fc->sb_flags`/`fc->sb_flags_mask` to `->reconfigure`): `sb_flags`
+    /// under `sb_mask` are what the remount sets, so a filesystem that has to
+    /// act on `SB_RDONLY` flipping (commit and stop writing, or start again)
+    /// can. The default ignores the flags and applies `options`.
+    fn reconfigure_sb(&self, _sb_flags: u64, _sb_mask: u64, options: &str) -> Result<(), FsError> {
+        self.reconfigure(options)
+    }
+
     // ── Disk quota (quotactl) ──────────────────────────────────────
     // Filesystems that support per-id disk quotas (tmpfs with usrquota /
     // grpquota) implement these; the rest inherit `Unsupported` (ESRV/ENOSYS

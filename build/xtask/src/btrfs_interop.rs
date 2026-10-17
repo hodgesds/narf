@@ -10,7 +10,8 @@
 //!    flags (with BLOCK_GROUP_TREE) and the same without BLOCK_GROUP_TREE.
 //! 2. Boot NARF on it under `narf.disks=root-rw root=UUID=…
 //!    rootflags=subvol=/<sv> narf.rootrw_interop=<mode>` once per subvolume
-//!    (`@`, `@home`, `@log`); the kernel-side workload
+//!    (`@`, `@home`, `@log`, and `files` on `@`: truncate/fallocate/punch/
+//!    zero-range and remount ro→rw); the kernel-side workload
 //!    (`drivers/fs/btrfs/src/interop.rs`) writes, syncs, reads back and
 //!    prints a verdict.
 //! 3. After every boot: every byte outside the root partition (GPT, ESP) is
@@ -541,6 +542,7 @@ fn write_boots(args: &Args, kernel: &Path, image: &Path, work: &Path, label: &st
         ("@", "root"),
         ("@home", "home"),
         ("@log", "log"),
+        ("@", "files"),
         ("@", "fstab"),
     ] {
         let (outside_before, _) = hashes(image)?;
@@ -625,6 +627,21 @@ fn write_boots(args: &Args, kernel: &Path, image: &Path, work: &Path, label: &st
         ],
         &[&format!("journal/{MACHINE_ID}/system@old.journal")],
     )?;
+    let sized: Vec<(String, Vec<u8>)> = files_expected()
+        .into_iter()
+        .map(|(name, data)| (format!("narf-sizes/{name}"), data))
+        .collect();
+    restore_and_compare(
+        &part,
+        work,
+        &ids,
+        "@",
+        &sized
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.clone()))
+            .collect::<Vec<_>>(),
+        &["narf-sizes/after-ro"],
+    )?;
     for subvol in ["@", "@home", "@root", "@srv", "@cache", "@tmp", "@log"] {
         restore_and_compare(
             &part,
@@ -640,6 +657,30 @@ fn write_boots(args: &Args, kernel: &Path, image: &Path, work: &Path, label: &st
     }
     try_loop_mount(&part, work);
     Ok(())
+}
+
+/// Must equal `narf_drivers_fs_btrfs::interop::files_expected` (the `files`
+/// mode: truncate, fallocate, punch, zero-range, remount ro/rw).
+fn files_expected() -> Vec<(&'static str, Vec<u8>)> {
+    let mut shrink = pattern(41, 300_000);
+    shrink.truncate(150_001);
+    shrink.resize(400_000, 0);
+    let mut prealloc = vec![0u8; 1 << 20];
+    prealloc[256 * 1024..256 * 1024 + 4096].copy_from_slice(&pattern(42, 4096));
+    let journal: Vec<u8> = (0..64u32).flat_map(|i| pattern(100 + i, 4096)).collect();
+    let mut punch = pattern(44, 200_000);
+    punch[10_000..110_000].fill(0);
+    let mut zero = pattern(45, 200_000);
+    zero[50_000..110_000].fill(0);
+    vec![
+        ("db.conf", b"short\n".to_vec()),
+        ("shrink.bin", shrink),
+        ("prealloc.bin", prealloc),
+        ("journal.bin", journal),
+        ("punch.bin", punch),
+        ("zero.bin", zero),
+        ("after-rw.txt", b"rw again\n".to_vec()),
+    ]
 }
 
 /// Must equal `interop::PKG_DESC`.
