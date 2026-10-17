@@ -115,16 +115,146 @@ pub enum RootMountError {
     /// `narf.disks=boot-only` restricts automatic mounts to the identified
     /// boot medium (see [`narf_block::disk_policy`]).
     BootOnly,
+    /// `narf.disks=root-ro|root-rw` refused to designate the matched volume
+    /// as the root (wrong UUID form, identity mismatch, not btrfs, ...).
+    Designate(narf_block::disk_policy::PolicyError),
+}
+
+/// Set when the selected installed root's `/etc/fstab` mounts a vfat
+/// filesystem itself (CachyOS: the ESP at `/boot/efi`). The ESP is then left
+/// for systemd's fstab mount unit instead of being pre-mounted at the
+/// installed root's `/boot`, which would hide the root's own `/boot`.
+static INSTALLED_ROOT_HAS_OWN_ESP_MOUNT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Whether an fstab text has an entry of type `vfat`/`fat`/`msdos`.
+pub fn fstab_mounts_vfat(fstab: &str) -> bool {
+    fstab.lines().any(|line| {
+        let line = line.trim_start();
+        if line.starts_with('#') {
+            return false;
+        }
+        matches!(
+            line.split_ascii_whitespace().nth(2),
+            Some("vfat" | "fat" | "msdos")
+        )
+    })
+}
+
+/// Read `etc/fstab` from a not-yet-mounted root and test it.
+fn installed_fstab_mounts_esp(fs: &dyn FsInstance) -> bool {
+    let Ok(file) = crate::resolve(fs.root(), "etc/fstab") else {
+        return false;
+    };
+    let size = (file.stat().size as usize).min(64 * 1024);
+    let mut buf = alloc::vec![0u8; size];
+    let mut done = 0;
+    while done < size {
+        match narf_scheduler::block_on(file.read(done as u64, &mut buf[done..])) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => done += n,
+        }
+    }
+    core::str::from_utf8(&buf[..done]).is_ok_and(fstab_mounts_vfat)
+}
+
+/// See [`INSTALLED_ROOT_HAS_OWN_ESP_MOUNT`].
+pub fn installed_root_mounts_own_esp() -> bool {
+    INSTALLED_ROOT_HAS_OWN_ESP_MOUNT.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Policy applied after the selected root filesystem has been constructed but
 /// before it is attached at `/`.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RootMountOptions {
     /// Place a writable tmpfs upper over the selected filesystem. Reads still
     /// resolve from the selected filesystem, while all mutations are copied up
     /// into RAM and vanish at shutdown.
     pub tmpfs_overlay: bool,
+    /// Construct the filesystem read-only (a btrfs volume then never replays
+    /// its log or starts a commit timer).
+    pub read_only: bool,
+    /// `rootflags=`: the filesystem data string, e.g. `subvol=/@`. When set,
+    /// the root is built through the named `mount -t <type>` constructor so
+    /// it honours exactly what `mount(2)` would.
+    pub flags: Option<String>,
+    /// Call [`narf_block::disk_policy::designate_root`] for the matched
+    /// device before mounting it (`narf.disks=root-ro|root-rw`).
+    pub designate: bool,
+}
+
+/// How the root selected on the command line is attached, as a function of
+/// the disk policy (`narf.disks=`), whether an installed distro's systemd
+/// runs as PID 1, and the command line's `ro` / `rw`.
+///
+/// - `root-ro`: the root is always constructed read-only. A systemd PID 1
+///   gets the session-writable tmpfs overlay over it, so systemd sees a
+///   writable `/` while not one byte reaches the disk.
+/// - `root-rw`: the real root is the writable root, with no overlay. Only an
+///   explicit `ro` keeps it read-only; the command line's default (neither
+///   `ro` nor `rw`) is treated as `rw`, because NARF cannot later flip a
+///   constructed btrfs volume to read-write the way `systemd-remount-fs`
+///   expects.
+/// - every other policy keeps the pre-existing behaviour: a systemd PID 1
+///   boot with an explicit `root=` gets the tmpfs overlay, and `ro` is
+///   honoured.
+pub fn plan_root(
+    policy: narf_block::disk_policy::DiskPolicy,
+    systemd_pid1: bool,
+    spec: &crate::root_selector::RootSpec,
+) -> RootMountOptions {
+    use crate::root_selector::RootAccess;
+    use narf_block::disk_policy::DiskPolicy;
+    let explicit_ro = spec.access == RootAccess::ReadOnly;
+    let (read_only, tmpfs_overlay, designate) = match policy {
+        DiskPolicy::RootRo => (true, systemd_pid1, true),
+        DiskPolicy::RootRw => (explicit_ro, false, true),
+        DiskPolicy::All | DiskPolicy::BootOnly => {
+            (explicit_ro, systemd_pid1 && spec.selector.is_some(), false)
+        }
+    };
+    RootMountOptions {
+        tmpfs_overlay,
+        read_only,
+        flags: spec.flags.clone(),
+        designate: designate && spec.selector.is_some(),
+    }
+}
+
+/// `mount -t` name of the constructor matching a detected filesystem.
+pub fn fstype_name(fs_type: FsType) -> Option<&'static str> {
+    match fs_type {
+        FsType::Btrfs => Some("btrfs"),
+        FsType::Ext => Some("ext4"),
+        FsType::Fat => Some("vfat"),
+        _ => None,
+    }
+}
+
+/// Build the root filesystem on `entry` through the named `mount -t`
+/// constructor, so `rootflags=` and read-only construction mean exactly what
+/// they mean to `mount(2)`.
+fn build_named_root(
+    detect: FsType,
+    device_name: &str,
+    options: &RootMountOptions,
+) -> Result<Arc<dyn FsInstance>, RootMountError> {
+    let name = fstype_name(detect).ok_or(RootMountError::NoFactory(detect))?;
+    let fs_type = crate::lookup_fstype(name).ok_or(RootMountError::NoFactory(detect))?;
+    let source = alloc::format!("/dev/{device_name}");
+    let data = options.flags.as_deref().unwrap_or("");
+    fs_type
+        .init(&crate::MountRequest {
+            fs_type: name,
+            source: &source,
+            options: data,
+            uid: 0,
+            gid: 0,
+            umask: 0o022,
+            initial_namespace: true,
+            read_only: options.read_only,
+        })
+        .map_err(|error| RootMountError::FactoryFailed(detect, error))
 }
 
 /// Name reported by the session-writable root overlay.
@@ -176,18 +306,20 @@ pub fn automount_devices() -> (alloc::vec::Vec<narf_block::RegisteredBlockDevice
 pub fn try_mount_root(
     authority: &narf_capabilities::Cap<crate::MountPoint, narf_capabilities::Grant>,
 ) -> Result<MountReport, RootMountError> {
-    let selector = crate::root_selector::RootSelector::from_cmdline(narf_boot::cmdline());
+    let spec = crate::root_selector::RootSpec::from_cmdline(narf_boot::cmdline());
     // An installed Linux userspace needs a writable root for state such as
-    // browser profiles, package caches, and `/var`. NARF's disk filesystems
-    // are deliberately immutable during this bring-up phase, so systemd PID 1
-    // boots with an explicit root selector receive a tmpfs-backed OverlayFS
-    // root while the on-disk image stays the lower, untouched layer. The
-    // selector-free installed-root fallback is attached later at `/mnt` and
-    // applies the same wrapper there before PID 1 is spawned.
-    let options = RootMountOptions {
-        tmpfs_overlay: narf_boot::args().has_flag("systemd_pid1") && selector.is_some(),
-    };
-    try_mount_root_with_options(authority, selector.as_ref(), options)
+    // browser profiles, package caches, and `/var`. Unless `narf.disks=root-rw`
+    // makes the real root writable, systemd PID 1 boots with an explicit root
+    // selector receive a tmpfs-backed OverlayFS root while the on-disk image
+    // stays the lower, untouched layer (see [`plan_root`]). The selector-free
+    // installed-root fallback is attached later at `/mnt` and applies the
+    // same wrapper there before PID 1 is spawned.
+    let options = plan_root(
+        narf_block::disk_policy::policy(),
+        narf_boot::args().has_flag("systemd_pid1"),
+        &spec,
+    );
+    try_mount_root_with_options(authority, spec.selector.as_ref(), options)
 }
 
 /// Like [`try_mount_root`] but with the selector resolved already.
@@ -292,20 +424,63 @@ pub fn try_mount_root_with_options(
             }
             saw_candidate = true;
         }
-        let factory = match lookup_factory(detect) {
-            Some(f) => f,
-            None => {
+        // `narf.disks=root-ro|root-rw`: hand the matched volume to the disk
+        // policy, which re-verifies its identity and from then on decides
+        // what may be written. A refusal is final: never mount a root the
+        // policy did not accept.
+        // A retry of the same root (the boot path falls back to a second
+        // walk after a failed mount) finds it designated already.
+        let already = narf_block::disk_policy::designated_root() == Some(entry.name);
+        if options.designate && !unlocked_luks && !already {
+            let designated = selector
+                .and_then(|sel| match sel {
+                    crate::root_selector::RootSelector::ByFsUuid(uuid) => {
+                        crate::root_selector::parse_uuid_bytes(uuid)
+                    }
+                    _ => None,
+                })
+                .ok_or(narf_block::disk_policy::PolicyError::NoRootUuidArg)
+                .and_then(|uuid| narf_block::disk_policy::designate_root(entry.name, uuid));
+            if let Err(error) = designated {
+                return Err(RootMountError::Designate(error));
+            }
+        }
+        let fs = if options.flags.is_some() || options.read_only {
+            if unlocked_luks {
+                // The named constructors resolve a registry name; the unlocked
+                // view is not registered until after the mount succeeds.
                 last_error = Some(RootMountError::NoFactory(detect));
                 continue;
             }
-        };
-        let fs = match factory(dev.clone()) {
-            Ok(f) => f,
-            Err(e) => {
-                last_error = Some(RootMountError::FactoryFailed(detect, e));
-                continue;
+            match build_named_root(detect, entry.name, &options) {
+                Ok(fs) => fs,
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            }
+        } else {
+            let factory = match lookup_factory(detect) {
+                Some(f) => f,
+                None => {
+                    last_error = Some(RootMountError::NoFactory(detect));
+                    continue;
+                }
+            };
+            match factory(dev.clone()) {
+                Ok(f) => f,
+                Err(e) => {
+                    last_error = Some(RootMountError::FactoryFailed(detect, e));
+                    continue;
+                }
             }
         };
+        if options.tmpfs_overlay || options.designate {
+            INSTALLED_ROOT_HAS_OWN_ESP_MOUNT.store(
+                installed_fstab_mounts_esp(fs.as_ref()),
+                core::sync::atomic::Ordering::Release,
+            );
+        }
         // Mount on /. mount_arc returns the per-mount handle; we
         // discard it — root unmount on shutdown will use a separate
         // boot-time-stashed handle (follow-up).
@@ -399,6 +574,15 @@ pub fn try_mount_efi_system_partition(
         let boot_handle = crate::registry()
             .mount_arc(authority, EFI_SYSTEM_PARTITION_MOUNTPOINT, fs.clone())
             .map_err(|error| RootMountError::FactoryFailed(detect, error))?;
+        if installed_root_mounts_own_esp() {
+            // The installed root's fstab mounts the ESP itself (CachyOS:
+            // `/boot/efi`); systemd's mount unit does that. Pre-mounting it at
+            // the installed root's `/boot` would hide the kernels there.
+            return Ok(MountReport {
+                device_name: String::from(entry.name),
+                fs_type: detect,
+            });
+        }
         if let Err(error) = crate::registry().mount_arc(
             authority,
             INSTALLED_ROOT_EFI_SYSTEM_PARTITION_MOUNTPOINT,

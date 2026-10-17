@@ -7428,6 +7428,68 @@ fn smoke_btrfs_deep_tree() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_deep_tree);
 
+// ── CachyOS fstab mount options ─────────────────────────────────────
+
+fn smoke_btrfs_mount_options_cachyos_fstab() -> TestResult {
+    use crate::mount_opts::{parse, CompressAlgo, Compression, Discard};
+    // What mount(8) passes for the CachyOS fstab line plus the live mount's
+    // extra options (`noatime` normally becomes MS_NOATIME, but a kernel
+    // rootflags= may carry it in the data string).
+    let opts = match parse("subvol=/@home,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2")
+    {
+        Ok(opts) => opts,
+        Err(_) => return TestResult::Fail("CachyOS fstab options refused"),
+    };
+    if opts.subvol != Some(crate::volume::Subvol::Name("@home".into())) {
+        return TestResult::Fail("subvol=/@home not recorded");
+    }
+    if opts.compress
+        != Some(Compression {
+            algo: CompressAlgo::Zstd,
+            level: Some(1),
+            force: false,
+        })
+    {
+        return TestResult::Fail("compress=zstd:1 not recorded");
+    }
+    if opts.discard != Discard::Async || opts.ssd != Some(true) || !opts.space_cache_v2 {
+        return TestResult::Fail("ssd/discard=async/space_cache=v2 not recorded");
+    }
+    if opts.render() != ",compress=zstd:1,ssd,discard=async,space_cache=v2" {
+        return TestResult::Fail("show_options rendering differs from Linux's order");
+    }
+    // `compress` alone is zlib; `compress=no` clears it.
+    match parse("compress") {
+        Ok(o) if o.compress.map(|c| c.algo) == Some(CompressAlgo::Zlib) => {}
+        _ => return TestResult::Fail("bare compress must mean zlib"),
+    }
+    match parse("compress=zstd,compress=no") {
+        Ok(o) if o.compress.is_none() => {}
+        _ => return TestResult::Fail("compress=no must clear compression"),
+    }
+    // Format- or recovery-changing options NARF does not implement are
+    // refused rather than silently ignored.
+    for bad in [
+        "nodatasum",
+        "nodatacow",
+        "space_cache=v1",
+        "clear_cache",
+        "rescue=usebackuproot",
+        "usebackuproot",
+        "degraded",
+        "norecovery",
+        "device=/dev/sda",
+        "compress=brotli",
+        "compress=zstd:99",
+    ] {
+        if parse(bad).is_ok() {
+            return TestResult::Fail("format-affecting btrfs option accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_mount_options_cachyos_fstab);
+
 // ── subvol= / subvolid= mount options ──────────────────────────────
 
 fn smoke_btrfs_mount_subvol_option() -> TestResult {

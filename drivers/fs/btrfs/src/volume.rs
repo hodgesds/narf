@@ -32,7 +32,7 @@ use crate::format::{self, BtrfsKey, Superblock};
 use crate::inode::InodeItem;
 
 /// Selects which subvolume a `mount -t btrfs` request roots at.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Subvol {
     /// `subvolid=N` — a subvolume root objectid.
     Id(u64),
@@ -251,6 +251,10 @@ pub struct BtrfsVolume<B: BlockDevice> {
     /// tree reads and node writes, which is also what serialises the shared
     /// allocator inside it.
     fs_batch: Mutex<Option<crate::write::FsBatch>>,
+    /// The `mount -t btrfs` data options this volume was mounted with
+    /// (compression, discard, ...). Recorded so the writer and
+    /// `show_options` can honour them; see [`crate::mount_opts`].
+    mount_options: IrqSafeSpinLock<crate::mount_opts::MountOptions>,
 }
 
 /// `CAP_SYS_RESOURCE` — see [`BtrfsVolume::quota_override`].
@@ -306,6 +310,21 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// True when the volume was mounted read-only (requested, or a member
     /// device refuses writes).
+    /// The data options recorded at mount (see [`crate::mount_opts`]).
+    pub fn mount_options(&self) -> crate::mount_opts::MountOptions {
+        self.mount_options.lock().clone()
+    }
+
+    /// Record the data options of the mount that built this volume.
+    pub fn set_mount_options(&self, options: crate::mount_opts::MountOptions) {
+        *self.mount_options.lock() = options;
+    }
+
+    /// Objectid of the mounted subvolume (`5` = the top-level FS tree).
+    pub fn mounted_subvol_id(&self) -> u64 {
+        self.state.lock().fs_tree_id
+    }
+
     pub fn is_read_only(&self) -> bool {
         self.read_only
     }
@@ -1269,6 +1288,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             aborted: core::sync::atomic::AtomicBool::new(false),
             quota_override: core::sync::atomic::AtomicBool::new(false),
             fs_batch: Mutex::new(None),
+            mount_options: IrqSafeSpinLock::new(crate::mount_opts::MountOptions::default()),
             state: IrqSafeSpinLock::new(VolState {
                 superblock,
                 superblock_source: (source_devid, source_offset),

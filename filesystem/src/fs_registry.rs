@@ -12,7 +12,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 mod builtins;
 
 /// Validated, kernel-owned inputs to a filesystem constructor.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct MountRequest<'a> {
     pub fs_type: &'a str,
     pub source: &'a str,
@@ -26,6 +26,27 @@ pub struct MountRequest<'a> {
     /// Linux's modes. `init_fs.umask` (0022) for a kernel-internal mount.
     pub umask: u16,
     pub initial_namespace: bool,
+    /// The mount was requested read-only (`MS_RDONLY`, `fsconfig(ro)`, or a
+    /// read-only kernel root). Device-backed constructors build a read-only
+    /// superblock; a writable request against a device the disk policy keeps
+    /// read-only is refused with [`FsError::ReadOnly`] (`EROFS`), which is
+    /// what makes `mount(8)` retry read-only, as for a write-protected disk
+    /// on Linux.
+    pub read_only: bool,
+}
+
+/// Map a device-backed mount `source` onto the block registry: a path whose
+/// last component, after a `/dev/` directory, names a registered device
+/// (`/dev/nvme0p2`, a chrooted `/mnt/dev/nvme0p2`) yields that name. A bare
+/// registry name (`nvme0p2`) yields itself.
+pub fn block_source_name(source: &str) -> Option<&str> {
+    let name = match source.rsplit_once("/dev/") {
+        Some((_, name)) => name,
+        None if !source.contains('/') => source,
+        None => return None,
+    };
+    (!name.is_empty() && !name.contains('/') && narf_block::find_block_device(name).is_some())
+        .then_some(name)
 }
 
 /// Source/options constructor retained for drivers and external filesystems.
@@ -59,10 +80,37 @@ impl FileSystemType {
     }
 
     pub fn init(&self, request: &MountRequest<'_>) -> Result<Arc<dyn FsInstance>, FsError> {
-        match self.constructor {
+        let normalized;
+        let mut request_view;
+        let request = if self.requires_device {
+            match block_source_name(request.source) {
+                Some(name) => {
+                    // `blkdev_get_by_path(.., BLK_OPEN_WRITE)` on a
+                    // write-protected disk is -EACCES/-EROFS on Linux and
+                    // mount(8) retries read-only; the disk policy is NARF's
+                    // write protection.
+                    if !request.read_only && !narf_block::disk_policy::write_allowed(name) {
+                        return Err(FsError::ReadOnly);
+                    }
+                    normalized = alloc::format!("/dev/{name}");
+                    request_view = *request;
+                    request_view.source = &normalized;
+                    &request_view
+                }
+                None => request,
+            }
+        } else {
+            request
+        };
+        let fs = match self.constructor {
             Constructor::Simple(builder) => builder(request.source, request.options),
             Constructor::Context(init) => init(request),
+        }?;
+        if request.read_only && self.requires_device {
+            // The superblock itself is read-only (mountinfo's per-sb `ro`).
+            crate::sb_flags::update(&fs, crate::sb_flags::RDONLY, crate::sb_flags::RDONLY);
         }
+        Ok(fs)
     }
 }
 

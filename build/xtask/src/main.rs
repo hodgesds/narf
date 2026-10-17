@@ -29,6 +29,7 @@ mod affected;
 mod bench_stats;
 /// The `bpf-bench` subcommand: boot the suite, harvest the samples, apply §8.
 mod bpf_bench;
+mod cachyos_root;
 mod ci_clippy;
 mod composition;
 mod crate_release;
@@ -132,6 +133,13 @@ enum Cmd {
     /// `XTASK_SYSTEMD_PID1_FAILURE_MARKER` turn the capture into a
     /// fail-fast integration assertion.
     SystemdPid1(BuildArgs),
+    /// Boot a CachyOS-layout btrfs root (GPT ESP + `@` subvolumes, the
+    /// host's fstab shape, real CachyOS systemd userspace) as an NVMe disk
+    /// with the bare-metal cmdline (`root=UUID=… rootflags=subvol=/@
+    /// systemd_pid1 narf.disks=root-ro`) and wait for agetty's login prompt.
+    /// Builds `target/narf-cachyos-root.img` unprivileged on first use (see
+    /// `verification/data/cachyos-root/REGEN_cachyos_root_image.sh`).
+    CachyosRootSmoke(cachyos_root::Args),
     /// Exercise real HTTP/3 from a running CachyOS guest through SLIRP.
     ///
     /// The host runs an in-process QUIC/HTTP/3 fixture. The guest's curl must
@@ -2373,6 +2381,12 @@ fn nvme_image_path() -> PathBuf {
         };
         reconstruct_sparse_fixture(fixture, &path);
         return path;
+    }
+    // `NARF_NVME_IMG` selects an alternate NVMe disk verbatim (e.g. the
+    // CachyOS-layout root image `cargo xtask cachyos-root-smoke` builds).
+    // Must already exist; we never synthesize an override path.
+    if let Some(p) = std::env::var_os("NARF_NVME_IMG") {
+        return PathBuf::from(p);
     }
     let path = root.join("target").join("narf-nvme.img");
     if !path.exists() {
@@ -12491,6 +12505,7 @@ fn main() -> Result<()> {
         }
         Cmd::BootSmoke(args) => boot_smoke_cmd(&args),
         Cmd::SystemdPid1(args) => systemd_pid1_cmd(&args),
+        Cmd::CachyosRootSmoke(args) => cachyos_root::run(&args),
         Cmd::Http3Smoke(args) => http3_smoke::run(&args),
         Cmd::RunInteractive(args) => run_interactive_cmd(&args),
         Cmd::NetSmoke(args) => net_smoke_cmd(&args),

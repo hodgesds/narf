@@ -260,7 +260,7 @@ pub fn build_fs_with_options(
     uid: u32,
     gid: u32,
 ) -> Result<Option<Arc<dyn FsInstance>>, FsError> {
-    build_fs_from_source(fsname, "", options, uid, gid)
+    build_fs_from_source(fsname, "", options, uid, gid, false)
 }
 
 fn build_fs_from_source(
@@ -269,6 +269,7 @@ fn build_fs_from_source(
     options: &str,
     uid: u32,
     gid: u32,
+    read_only: bool,
 ) -> Result<Option<Arc<dyn FsInstance>>, FsError> {
     crate::handlers::mount_types::register_mount_types();
     let Some(fs_type) = narf_filesystem::lookup_fstype(fsname) else {
@@ -284,6 +285,7 @@ fn build_fs_from_source(
             gid,
             umask: crate::handlers::current_umask() as u16,
             initial_namespace: crate::handlers::current_mount_namespace().is_none(),
+            read_only,
         })
         .map(Some)
 }
@@ -296,6 +298,9 @@ pub(crate) fn mount_error_errno(error: FsError) -> i64 {
         FsError::PermissionDenied | FsError::OperationNotPermitted => EPERM,
         FsError::NoSpace => ENOSPC,
         FsError::Unsupported => EOPNOTSUPP,
+        // A writable mount of a write-protected device: libmount retries
+        // read-only ("source write-protected, mounted read-only").
+        FsError::ReadOnly => EROFS,
         _ => EINVAL,
     }
 }
@@ -920,9 +925,10 @@ pub fn sys_fsconfig(ctx: &mut dyn TrapContext) {
                     context_options(c),
                     c.uid,
                     c.gid,
+                    c.sb_flags & narf_filesystem::sb_flags::RDONLY != 0,
                 )))
             });
-            let (name, source, options, uid, gid) = match inputs {
+            let (name, source, options, uid, gid, read_only) = match inputs {
                 Some(Ok(inputs)) => inputs,
                 Some(Err(())) => {
                     ctx.set_return(err(EBUSY));
@@ -933,7 +939,7 @@ pub fn sys_fsconfig(ctx: &mut dyn TrapContext) {
                     return;
                 }
             };
-            let built = build_fs_from_source(&name, &source, &options, uid, gid);
+            let built = build_fs_from_source(&name, &source, &options, uid, gid, read_only);
             let r = with_contexts(|m| {
                 let c = m.get_mut(&id)?;
                 c.phase = if matches!(built, Ok(Some(_))) {
