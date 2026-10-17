@@ -111,6 +111,20 @@ pub trait Aux {
         address: u32,
         data: &[u8],
     ) -> impl Future<Output = Result<(), Error>> + Send;
+    /// `dce_aux_configure_timeout` on this connector's AUX engine (the
+    /// LTTPR or default reply timeout, in microseconds).
+    fn set_timeout_us(&mut self, _us: u32) -> impl Future<Output = Result<(), Error>> + Send {
+        async { Ok(()) }
+    }
+    /// Whether a sink is still connected (debounced HPD): Linux's
+    /// `link->type != dc_connection_none`.
+    fn connected(&mut self) -> impl Future<Output = bool> + Send {
+        async { true }
+    }
+    /// The waits between transactions the link layer prescribes.
+    fn delay_us(&mut self, us: u64) -> impl Future<Output = ()> + Send {
+        sleep_us(us)
+    }
     /// One HDMI SCDC register read over the connector's DDC (I2C 0x54,
     /// `link_query_ddc_data`); see `amdgpu_dcn30_hdmi::write_scdc_data`. A
     /// channel with no SCDC (DP AUX, no sink) fails; a sink that declared
@@ -127,20 +141,6 @@ pub trait Aux {
     ) -> impl Future<Output = Result<(), Error>> + Send {
         let _ = (offset, value);
         core::future::ready(Err(Error::Hdmi(crate::amdgpu_dcn30_hdmi::Error::Scdc)))
-    }
-    /// `dce_aux_configure_timeout` on this connector's AUX engine (the
-    /// LTTPR or default reply timeout, in microseconds).
-    fn set_timeout_us(&mut self, _us: u32) -> impl Future<Output = Result<(), Error>> + Send {
-        async { Ok(()) }
-    }
-    /// Whether a sink is still connected (debounced HPD): Linux's
-    /// `link->type != dc_connection_none`.
-    fn connected(&mut self) -> impl Future<Output = bool> + Send {
-        async { true }
-    }
-    /// The waits between transactions the link layer prescribes.
-    fn delay_us(&mut self, us: u64) -> impl Future<Output = ()> + Send {
-        sleep_us(us)
     }
 }
 

@@ -2012,15 +2012,16 @@ impl ColdBoot {
             aux.display.set_verified_link(aux.index, None, None);
         }
         let h = &mut self.sequence.backend;
-        let pipeline = h.modeset.as_mut().ok_or(Error::Invalid)?;
         let stopped = h.scanout.as_mut().map(|s| s.stop());
-        let (vbios, _) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
+        let (pipeline, mut ddc, vbios) = self.lit_display()?;
         let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
             .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Bios(e)))?;
         pipeline
-            .disable_unplugged(&tables)
+            .disable_unplugged(&tables, &mut ddc)
             .await
             .map_err(Error::Modeset)?;
+        let h = &mut self.sequence.backend;
+        let pipeline = h.modeset.as_mut().ok_or(Error::Invalid)?;
         // SAFETY: as stop_display: stopped cleanly, CPU views retired.
         unsafe {
             if let Some(scanout) = h.scanout.take() {

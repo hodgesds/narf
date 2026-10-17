@@ -536,11 +536,11 @@ pub struct Admitted {
     pub offered: Vec<Timing>,
 }
 
-/// Every distinct EDID timing `select`/`select_dp_on` could choose: inside the
-/// TMDS ceiling (HDMI) or the sink's link at 8 bpc (a sink with DPCD, i.e.
-/// DisplayPort: its receiver-caps ceiling until verified), and admitted by
-/// the DCN30 mode math. This is what KMS offers; a DRM TEST_ONLY or SETCRTC
-/// is checked against it.
+/// Every distinct EDID timing `select_hdmi`/`select_dp_on` could choose: a
+/// stream the DCN3.0 TMDS encoder carries (HDMI) or inside the sink's link at
+/// 8 bpc (a sink with DPCD, i.e. DisplayPort: its receiver-caps ceiling until
+/// verified), and admitted by the DCN30 mode math. This is what KMS offers;
+/// a DRM TEST_ONLY or SETCRTC is checked against it.
 pub(crate) fn offered(sink: &Sink, soc: &dml30::Soc, vco_khz: u32) -> Vec<Timing> {
     offered_on(sink, soc, vco_khz, None)
 }
@@ -698,12 +698,12 @@ pub struct Pipeline {
     /// the DCN30 admission of the lit sink produced.
     want: Option<Timing>,
     admitted: Option<Admitted>,
+    /// The DP link layer's state (`amdgpu_dcn30_dp_link`).
+    dp: DpState,
     /// m5hdmi: the pipe's output format stages (FMT, OTG 4:2:0, OCSC, DPG
     /// black), and the admitted HDMI stream (format, clocks, scrambling).
     format: hdmi::Formatter,
     hdmi: Option<hdmi::Stream>,
-    /// The DP link layer's state (`amdgpu_dcn30_dp_link`).
-    dp: DpState,
 }
 impl core::fmt::Debug for Pipeline {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -800,9 +800,9 @@ impl Pipeline {
                 underflow: None,
                 want: None,
                 admitted: None,
+                dp: DpState::default(),
                 format: hdmi::Formatter::new(gpu, authority, pipe)?,
                 hdmi: None,
-                dp: DpState::default(),
             })
         }
     }
@@ -1410,7 +1410,6 @@ impl Pipeline {
     pub fn hdmi_output(&self) -> Option<hdmi::Stream> {
         self.hdmi
     }
-    /// `link_set_dpms_on` for DisplayPort SST.
     /// `link_set_dpms_on` for DisplayPort SST at the least link the
     /// verified one has that carries the stream (`decide_dp_link_settings`).
     async fn link_dp<A: Aux + Send>(
@@ -1855,16 +1854,42 @@ impl Pipeline {
         Ok(setting)
     }
     /// `disable` after the sink left (debounced HPD low): the same teardown
-    /// with no AUX or DDC transaction to the absent sink — `dp_disable_link_phy`
-    /// skips SET_POWER once `link->type` is none. Also resumes a stop that
-    /// was interrupted. (HDMI: Linux's `link_set_dpms_off` still sends the
-    /// legacy SCDC TMDS_Config write, unchecked; that belongs to the HDMI
-    /// unlink path, which owns SCDC.)
-    pub async fn disable_unplugged(&mut self, tables: &Tables<'_>) -> Result<(), Error> {
+    /// with no DPCD transaction to the absent sink (`dp_disable_link_phy`
+    /// skips SET_POWER once `link->type` is none). An HDMI stream still gets
+    /// `link_set_dpms_off`'s legacy SCDC TMDS_Config write over `ddc`,
+    /// unchecked and only for a sink that declared SCDC
+    /// ([`hdmi::write_scdc_legacy`]), as Linux sends it whether or not a sink
+    /// answers. Also resumes a stop that was interrupted.
+    pub async fn disable_unplugged<A: Aux + Send>(
+        &mut self,
+        tables: &Tables<'_>,
+        ddc: &mut A,
+    ) -> Result<(), Error> {
         if self.state == State::At(Step::Stopping) {
             self.state = State::At(Step::Link);
         }
-        self.disable(tables, &mut NoAux).await
+        self.disable(tables, &mut ScdcOnly(ddc)).await
+    }
+}
+
+/// The transport of an unplugged sink: SCDC (I2C) only, which Linux still
+/// writes on disable; every DPCD transaction is refused unsent.
+struct ScdcOnly<'a, A>(&'a mut A);
+impl<A: Aux + Send> Aux for ScdcOnly<'_, A> {
+    async fn read(&mut self, _: u32, _: &mut [u8]) -> Result<(), Error> {
+        Err(Error::Aux)
+    }
+    async fn write(&mut self, _: u32, _: &[u8]) -> Result<(), Error> {
+        Err(Error::Aux)
+    }
+    async fn connected(&mut self) -> bool {
+        false
+    }
+    async fn scdc_read(&mut self, offset: u8) -> Result<u8, Error> {
+        self.0.scdc_read(offset).await
+    }
+    async fn scdc_write(&mut self, offset: u8, value: u8) -> Result<(), Error> {
+        self.0.scdc_write(offset, value).await
     }
 }
 

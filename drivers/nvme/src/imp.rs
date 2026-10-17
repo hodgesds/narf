@@ -28,6 +28,7 @@
 pub mod admin;
 pub mod chardev;
 pub mod mi;
+pub mod prp;
 
 mod tests;
 
@@ -87,6 +88,25 @@ pub enum NvmeError {
     /// in the future). Callers split larger transfers across
     /// multiple submissions.
     TooManyPages,
+    /// `CAP.MPSMIN` asks for a memory page larger than the 4 KiB host
+    /// page NARF programs into `CC.MPS` (Linux `nvme_enable_ctrl`
+    /// refuses such a controller with `-ENODEV`).
+    UnsupportedPageSize,
+    /// The data buffer does not match the command: shorter than
+    /// `n_blocks * lba_bytes`, not dword aligned, or zero length.
+    BadTransfer,
+    /// The transfer is larger than the controller's maximum data
+    /// transfer size (Identify Controller MDTS, clamped to
+    /// [`prp::NVME_HOST_MAX_TRANSFER`]). Callers split it.
+    ExceedsMaxTransfer,
+    /// A command timed out with its data buffers still owned by the
+    /// controller. The queue state is no longer trusted and every
+    /// later I/O is refused; the buffers it may still DMA into are
+    /// never freed.
+    ControllerDead,
+    /// The namespace's LBA format cannot be used for block I/O (LBA
+    /// size outside 512..=4096 bytes, or per-block metadata).
+    NamespaceUnusable,
 }
 
 // ── Register offsets (NVMe base spec §3.1) ──────────────────────────
@@ -144,6 +164,9 @@ pub struct NvmeCaps {
     pub mpsmin: u8,
     /// Memory-page-size maximum.
     pub mpsmax: u8,
+    /// Worst-case CSTS.RDY transition time in 500 ms units (CAP.TO,
+    /// bits 31:24).
+    pub to: u8,
 }
 
 impl NvmeCaps {
@@ -155,6 +178,21 @@ impl NvmeCaps {
             dstrd: ((r >> 32) & 0xF) as u8,
             mpsmin: ((r >> 48) & 0xF) as u8,
             mpsmax: ((r >> 52) & 0xF) as u8,
+            to: ((r >> 24) & 0xFF) as u8,
+        }
+    }
+
+    /// CSTS.RDY transition budget in milliseconds. Linux
+    /// `nvme_wait_ready` waits `(NVME_CAP_TIMEOUT(cap) + 1) * HZ / 2`;
+    /// NARF keeps its former 5 s as a floor so a controller reporting
+    /// TO = 0 is not given less time than before.
+    #[inline]
+    pub const fn ready_timeout_ms(&self) -> u64 {
+        let linux = (self.to as u64 + 1) * 500;
+        if linux < 5_000 {
+            5_000
+        } else {
+            linux
         }
     }
 
@@ -358,6 +396,25 @@ pub struct Controller {
     /// the public surface so the param-snapshot path doesn't have to
     /// reach into a Vec.
     pub irq_vector: Option<u8>,
+    /// Largest data transfer per command in bytes: Identify Controller
+    /// MDTS in CAP.MPSMIN units, clamped to
+    /// [`prp::NVME_HOST_MAX_TRANSFER`]. One page until `bring_up` has
+    /// read Identify Controller.
+    max_transfer: u32,
+    /// False when the namespace's LBA format cannot carry block I/O
+    /// (see [`prp::NamespaceFormat::usable`]).
+    ns_usable: bool,
+    /// Persistent PRP-list page for I/O transfers longer than two
+    /// pages. Every I/O path holds `&mut Controller` until its CQE is
+    /// consumed, so one page serves all of them, and it is never freed
+    /// while the controller lives (a timed-out command may still read
+    /// it — see `dead`).
+    prp_list: Option<DmaBuffer>,
+    /// Set when an I/O command timed out. The CQ head/phase no longer
+    /// match the device and the command's buffers may still be DMA
+    /// targets, so later I/O is refused with
+    /// [`NvmeError::ControllerDead`].
+    dead: bool,
 }
 
 impl core::fmt::Debug for Controller {
@@ -483,6 +540,9 @@ pub struct IdentifyController {
     pub mn: [u8; 40],
     /// Firmware revision, ASCII, 8 bytes, space-padded.
     pub fr: [u8; 8],
+    /// Maximum Data Transfer Size (byte 77): a power of two in units of
+    /// the CAP.MPSMIN page; 0 = no limit.
+    pub mdts: u8,
 }
 
 impl Controller {
@@ -506,7 +566,22 @@ impl Controller {
             nsze: 0,
             msix: None,
             irq_vector: None,
+            max_transfer: prp::NVME_CTRL_PAGE_SIZE as u32,
+            ns_usable: false,
+            prp_list: None,
+            dead: false,
         }
+    }
+
+    /// Largest data transfer one I/O command may carry, in bytes.
+    pub fn max_transfer_bytes(&self) -> u32 {
+        self.max_transfer
+    }
+
+    /// `true` once an I/O command has timed out; see
+    /// [`NvmeError::ControllerDead`].
+    pub fn is_dead(&self) -> bool {
+        self.dead
     }
 
     /// Constructor taking the real `BusDevice`. The kernel-test smoke
@@ -641,6 +716,14 @@ impl Controller {
 
         self.bar0 = bar0.phys.raw();
         self.caps = Some(caps);
+        // NARF programs CC.MPS = 0 (4 KiB pages) and builds every PRP
+        // on 4 KiB boundaries. Refuse a controller whose minimum page
+        // is larger before touching CC, as Linux `nvme_enable_ctrl`
+        // does ("Minimum device page size ... too large for host").
+        if !prp::host_page_supported(caps.mpsmin) {
+            return Err(NvmeError::UnsupportedPageSize);
+        }
+        let ready_ms = caps.ready_timeout_ms();
 
         // ── 2. Reset the controller ───────────────────────────────
         // Read-modify-write CC clearing EN.
@@ -654,7 +737,7 @@ impl Controller {
         // ready almost instantly. We bound the wait at ~1M MMIO reads
         // (plenty of slack in QEMU; a real broken controller errors
         // out without locking the kernel).
-        wait_csts(&bar0, |s| (s & CSTS_RDY) == 0)?;
+        wait_csts(&bar0, ready_ms, |s| (s & CSTS_RDY) == 0)?;
 
         // ── 3. Allocate admin queues ──────────────────────────────
         let sq_buf = alloc_coherent(64 * ADMIN_Q_DEPTH as usize, DomainId::DRIVER_0)
@@ -692,7 +775,7 @@ impl Controller {
         }
 
         // ── 6. Wait for CSTS.RDY = 1 ──────────────────────────────
-        wait_csts(&bar0, |s| (s & CSTS_RDY) != 0)?;
+        wait_csts(&bar0, ready_ms, |s| (s & CSTS_RDY) != 0)?;
 
         // ── 6a. Enable MSI-X ──────────────────────────────────────
         let mut msix = narf_bus::msix::enable_msix(cap, &device).ok();
@@ -763,12 +846,21 @@ impl Controller {
                        // SAFETY: same queue + bar.
         let _ = unsafe { admin.submit(&bar0, sqe)? };
         // SAFETY: ns_buf is a live identity-mapped DMA page.
-        let (nsze, lba_bytes) = unsafe { parse_identify_namespace(&ns_buf) };
+        let fmt = unsafe { parse_identify_namespace(&ns_buf) };
         drop(ns_buf);
 
+        // Persistent PRP-list page for > 2-page transfers (see
+        // `Controller::prp_list`).
+        let prp_list = alloc_coherent(prp::NVME_CTRL_PAGE_SIZE, DomainId::DRIVER_0)
+            .map_err(|_| NvmeError::OutOfDmaMemory)?;
+
+        self.max_transfer = prp::max_transfer_bytes(id.mdts, caps.mpsmin);
         self.identify = Some(id);
-        self.lba_bytes = lba_bytes;
-        self.nsze = nsze;
+        self.lba_bytes = fmt.lba_bytes;
+        self.nsze = fmt.nsze;
+        self.ns_usable = fmt.usable;
+        self.prp_list = Some(prp_list);
+        self.dead = false;
         self.admin = Some(admin);
         self.bar0_region = Some(bar0);
         self.msix = msix;
@@ -873,8 +965,10 @@ impl Controller {
     }
 
     /// Submit an NVM Read (`opcode = 0x02`) for `n_blocks` LBAs
-    /// starting at `lba`, copying into the page-sized DMA buffer
-    /// `buf`. Polls the I/O CQ for completion. Caller-owned.
+    /// starting at `lba` into the physically contiguous DMA buffer
+    /// `buf` (PRP1 / PRP2 / PRP list built by [`prp::setup_prps`]).
+    /// `n_blocks * lba_bytes` must fit in `buf` and in
+    /// [`Self::max_transfer_bytes`]. Polls the I/O CQ for completion.
     ///
     /// `n_blocks` is encoded zero-based on the wire (NLB = blocks-1);
     /// the function takes the human-readable count.
@@ -891,12 +985,12 @@ impl Controller {
     /// caller-supplied list of physical 4-KiB page addresses.
     ///
     /// `pages[0]` becomes PRP1; `pages[1]` (if present) becomes PRP2
-    /// for ≤ 2-page transfers; larger transfers allocate a one-page
-    /// PRP-list with `pages[1..]` as 8-byte little-endian phys-addr
-    /// entries (PRP-list chaining is not yet implemented — caps at
-    /// 511 entries past PRP1, i.e. ≤ 2 MiB per submission at 4 KiB MPS).
-    /// Each `pages[i]` for `i ≥ 1` must be 4-KiB aligned (NVMe base
-    /// spec §4.1.2).
+    /// for ≤ 2-page transfers; larger transfers write `pages[1..]`
+    /// into the controller's persistent PRP-list page as 8-byte
+    /// little-endian entries. The transfer is bounded by
+    /// [`Self::max_transfer_bytes`] (≤ 2 MiB, so one list page always
+    /// suffices). Every page must be 4-KiB aligned (NVMe base spec
+    /// §4.1.1).
     ///
     /// Used by callers (e.g. the FAT loader for init/shell ELFs) that
     /// need transfers larger than the single-page `read_lba` path.
@@ -1282,7 +1376,19 @@ impl Controller {
         // SAFETY: admin queue + BAR live; the DMA pages (and optional PRP
         // list) stay mapped until after `submit_raw` returns — it polls
         // the CQ synchronously, so the controller is done with them here.
-        let cqe = unsafe { admin_q.submit_raw(bar0, sqe)? };
+        let cqe = match unsafe { admin_q.submit_raw(bar0, sqe) } {
+            Ok(cqe) => cqe,
+            Err(e) => {
+                if e == NvmeError::CompletionTimeout {
+                    // The device may still DMA into / out of these pages;
+                    // freeing them would hand live DMA targets back to
+                    // the allocator. Leak them instead.
+                    core::mem::forget(_data_pages);
+                    core::mem::forget(_prp_list_keepalive);
+                }
+                return Err(e);
+            }
+        };
         let status = cqe.status >> 1;
 
         // Controller -> host: copy the device's reply back out, only on a
@@ -1780,26 +1886,22 @@ impl Controller {
         if self.io_queues.is_empty() {
             return Err(NvmeError::NoIoQueue);
         }
+        if n_blocks == 0 {
+            return Ok(());
+        }
+        let mut sqe = self.build_nvm_sqe(
+            opcode,
+            lba,
+            n_blocks as u32,
+            buf.dma_addr().raw(),
+            buf.len(),
+        )?;
         let qi = self.pick_queue();
         let v = *self.io_irq_vectors.get(qi).ok_or(NvmeError::Msix)?;
         let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-        if n_blocks == 0 {
-            return Ok(());
-        }
-        if self.nsze != 0 && lba.saturating_add(n_blocks as u64) > self.nsze {
-            return Err(NvmeError::OutOfRange);
-        }
 
         let baseline = narf_interrupts::fire_count(v);
-
-        let mut sqe = Sqe::zero();
-        sqe.cdw0 = opcode as u32;
-        sqe.nsid = DEFAULT_NSID;
-        sqe.prp1 = buf.dma_addr().raw();
-        sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
-        sqe.cdw11 = (lba >> 32) as u32;
-        sqe.cdw12 = (n_blocks - 1) as u32;
 
         // Auto-CID + ring SQ tail doorbell.
         let cid = io.next_cid;
@@ -1836,6 +1938,9 @@ impl Controller {
             narf_time::Deadline::after_ms(5_000),
         );
         if !done {
+            // The command (and its data / PRP-list pages) may still be
+            // live in the device; stop trusting this queue.
+            self.dead = true;
             return Err(NvmeError::CompletionTimeout);
         }
 
@@ -1890,14 +1995,18 @@ impl Controller {
         // tag; routing the drain to a different queue would corrupt
         // its state). The vector is the per-queue MSI-X entry's
         // IDT vector so wakeups land on this CQ's task only.
-        let qi = self.pick_queue();
-        let v = *self.io_irq_vectors.get(qi).ok_or(NvmeError::Msix)?;
         if n_blocks == 0 {
             return Ok(());
         }
-        if self.nsze != 0 && lba.saturating_add(n_blocks as u64) > self.nsze {
-            return Err(NvmeError::OutOfRange);
-        }
+        let mut sqe = self.build_nvm_sqe(
+            opcode,
+            lba,
+            n_blocks as u32,
+            buf.dma_addr().raw(),
+            buf.len(),
+        )?;
+        let qi = self.pick_queue();
+        let v = *self.io_irq_vectors.get(qi).ok_or(NvmeError::Msix)?;
 
         // CRITICAL ORDERING: construct the WaitForIrq future
         // BEFORE writing the SQ doorbell. WaitForIrq snapshots
@@ -1921,13 +2030,6 @@ impl Controller {
         {
             let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
             let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-            let mut sqe = Sqe::zero();
-            sqe.cdw0 = opcode as u32;
-            sqe.nsid = DEFAULT_NSID;
-            sqe.prp1 = buf.dma_addr().raw();
-            sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
-            sqe.cdw11 = (lba >> 32) as u32;
-            sqe.cdw12 = (n_blocks - 1) as u32;
             let cid = io.next_cid;
             io.next_cid = io.next_cid.wrapping_add(1);
             sqe.cdw0 = (sqe.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
@@ -1949,6 +2051,9 @@ impl Controller {
         match wait.await {
             Ok(_) => {}
             Err(_elapsed) => {
+                // Same as the sync path: the buffers may still be DMA
+                // targets, so the controller is no longer trusted.
+                self.dead = true;
                 return Err(NvmeError::CompletionTimeout);
             }
         }
@@ -1980,6 +2085,138 @@ impl Controller {
         Ok(())
     }
 
+    /// Validate an NVM Read/Write against the controller and namespace
+    /// limits and build its SQE, including the data pointer for the
+    /// physically contiguous buffer at device address `dma` of `len`
+    /// bytes.
+    ///
+    /// PRPs follow Linux `nvme_pci_setup_data_prp` (see [`prp`]); a
+    /// transfer longer than two pages writes its list into the
+    /// controller's persistent `prp_list` page, which is safe to reuse
+    /// because every caller holds `&mut self` until the CQE is consumed.
+    fn build_nvm_sqe(
+        &mut self,
+        opcode: u8,
+        lba: u64,
+        n_blocks: u32,
+        dma: u64,
+        len: usize,
+    ) -> Result<Sqe, NvmeError> {
+        if self.dead {
+            return Err(NvmeError::ControllerDead);
+        }
+        if !self.ns_usable {
+            return Err(NvmeError::NamespaceUnusable);
+        }
+        // NLB is a 16-bit zero-based field (NVM Command Set §3.2.4).
+        if n_blocks == 0 || n_blocks > 0x1_0000 {
+            return Err(NvmeError::BadTransfer);
+        }
+        if lba
+            .checked_add(n_blocks as u64)
+            .is_none_or(|end| end > self.nsze)
+        {
+            return Err(NvmeError::OutOfRange);
+        }
+        let bytes = n_blocks as u64 * self.lba_bytes as u64;
+        if bytes > len as u64 {
+            return Err(NvmeError::BadTransfer);
+        }
+        if bytes > self.max_transfer as u64 {
+            return Err(NvmeError::ExceedsMaxTransfer);
+        }
+        let bytes = bytes as usize;
+        let pair = match self.prp_list.as_ref() {
+            Some(list) => {
+                // SAFETY: `list` is this controller's persistent 4 KiB
+                // coherent page (PRPS_PER_PAGE u64 entries, page aligned);
+                // `&mut self` excludes every other I/O path, and no
+                // command referencing it is in flight (each path consumes
+                // its CQE before returning, and a timeout marks the
+                // controller dead, refused above).
+                let entries = unsafe {
+                    core::slice::from_raw_parts_mut(list.cpu_mut_ptr::<u64>(), prp::PRPS_PER_PAGE)
+                };
+                prp::setup_prps(dma, bytes, entries, &[list.dma_addr().raw()])
+            }
+            None => prp::setup_prps(dma, bytes, &mut [], &[]),
+        }
+        .map_err(|e| match e {
+            prp::PrpError::ListTooSmall => NvmeError::ExceedsMaxTransfer,
+            _ => NvmeError::BadTransfer,
+        })?;
+        // Publish the list entries before the SQE + doorbell that let
+        // the controller fetch them.
+        compiler_fence(Ordering::Release);
+
+        let mut sqe = Sqe::zero();
+        sqe.cdw0 = opcode as u32;
+        sqe.nsid = DEFAULT_NSID;
+        sqe.prp1 = pair.prp1;
+        sqe.prp2 = pair.prp2;
+        // CDW10/11 = SLBA (64-bit, little-endian split).
+        sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
+        sqe.cdw11 = (lba >> 32) as u32;
+        // CDW12 bits[15:0] = NLB-1; flags (LR/FUA/PRINFO) zero.
+        sqe.cdw12 = n_blocks - 1;
+        Ok(sqe)
+    }
+
+    /// Polled NVM Read/Write of `n_blocks` LBAs at `lba` into / from the
+    /// contiguous DMA range `dma .. dma + len`. A completion timeout
+    /// marks the controller dead (see [`NvmeError::ControllerDead`]).
+    fn nvm_io_dma(
+        &mut self,
+        opcode: u8,
+        lba: u64,
+        n_blocks: u32,
+        dma: u64,
+        len: usize,
+    ) -> Result<(), NvmeError> {
+        if self.io_queues.is_empty() {
+            return Err(NvmeError::NoIoQueue);
+        }
+        if n_blocks == 0 {
+            return Ok(());
+        }
+        let sqe = self.build_nvm_sqe(opcode, lba, n_blocks, dma, len)?;
+        let qi = self.pick_queue();
+        let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        // SAFETY: io queue + bar are live; the data range and the PRP
+        // list page are DMA memory that outlives the command (the caller
+        // owns the data buffer across this synchronous call; the list is
+        // persistent).
+        let r = unsafe { io.submit(bar0, sqe) };
+        if let Err(NvmeError::CompletionTimeout) = r {
+            self.dead = true;
+        }
+        r.map(|_| ())
+    }
+
+    /// Polled NVM Read/Write of `n_blocks` LBAs to / from `buf` starting
+    /// `offset` bytes into it. `buf` must be physically contiguous
+    /// (every `alloc_coherent` buffer is).
+    pub fn nvm_io_at(
+        &mut self,
+        opcode: u8,
+        lba: u64,
+        n_blocks: u32,
+        buf: &DmaBuffer,
+        offset: usize,
+    ) -> Result<(), NvmeError> {
+        if offset > buf.len() || offset & 0x3 != 0 {
+            return Err(NvmeError::BadTransfer);
+        }
+        self.nvm_io_dma(
+            opcode,
+            lba,
+            n_blocks,
+            buf.dma_addr_at(offset as u64).raw(),
+            buf.len() - offset,
+        )
+    }
+
     fn nvm_io(
         &mut self,
         opcode: u8,
@@ -1987,39 +2224,14 @@ impl Controller {
         n_blocks: u16,
         buf: &DmaBuffer,
     ) -> Result<(), NvmeError> {
-        if self.io_queues.is_empty() {
-            return Err(NvmeError::NoIoQueue);
-        }
-        let qi = self.pick_queue();
-        let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
-        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-        if n_blocks == 0 {
-            return Ok(());
-        }
-        // Range check against the namespace's reported capacity.
-        if self.nsze != 0 && lba.saturating_add(n_blocks as u64) > self.nsze {
-            return Err(NvmeError::OutOfRange);
-        }
-        let mut sqe = Sqe::zero();
-        sqe.cdw0 = opcode as u32;
-        sqe.nsid = DEFAULT_NSID;
-        sqe.prp1 = buf.dma_addr().raw();
-        // CDW10/11 = SLBA (64-bit, little-endian split).
-        sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
-        sqe.cdw11 = (lba >> 32) as u32;
-        // CDW12 bits[15:0] = NLB-1; flags (LR/FUA/PRINFO) zero.
-        sqe.cdw12 = (n_blocks - 1) as u32;
-        // SAFETY: io queue + bar are live; buf is identity-mapped DMA.
-        unsafe {
-            io.submit(bar0, sqe)?;
-        }
-        Ok(())
+        self.nvm_io_at(opcode, lba, n_blocks as u32, buf, 0)
     }
 
-    /// Multi-page PRP-list NVM I/O. See `read_lba_pages` for the
-    /// public-API contract. The PRP-list buffer is allocated on
-    /// demand and held alive across `submit` so the controller's DMA
-    /// reads against it complete before the buffer drops.
+    /// Multi-page PRP-list NVM I/O over a caller-supplied list of
+    /// (not necessarily contiguous) 4 KiB pages. See `read_lba_pages`
+    /// for the public-API contract. The list entries go into the
+    /// persistent `prp_list` page, so no list memory is freed while the
+    /// controller might still read it.
     fn nvm_io_multipage(
         &mut self,
         opcode: u8,
@@ -2030,15 +2242,34 @@ impl Controller {
         if self.io_queues.is_empty() {
             return Err(NvmeError::NoIoQueue);
         }
-        let qi = self.pick_queue();
-        let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
-        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
         if n_blocks == 0 || pages.is_empty() {
             return Ok(());
         }
-        if self.nsze != 0 && lba.saturating_add(n_blocks as u64) > self.nsze {
+        if self.dead {
+            return Err(NvmeError::ControllerDead);
+        }
+        if !self.ns_usable {
+            return Err(NvmeError::NamespaceUnusable);
+        }
+        if lba
+            .checked_add(n_blocks as u64)
+            .is_none_or(|end| end > self.nsze)
+        {
             return Err(NvmeError::OutOfRange);
         }
+        let bytes = n_blocks as u64 * self.lba_bytes as u64;
+        if bytes > pages.len() as u64 * PAGE_SIZE {
+            return Err(NvmeError::BadTransfer);
+        }
+        if bytes > self.max_transfer as u64 {
+            return Err(NvmeError::ExceedsMaxTransfer);
+        }
+        if pages.iter().any(|p| p.raw() & (PAGE_SIZE - 1) != 0) {
+            return Err(NvmeError::BadTransfer);
+        }
+        // Only the pages the transfer actually touches become PRPs.
+        let used = (bytes as usize).div_ceil(PAGE_SIZE as usize);
+        let pages = &pages[..used];
 
         let mut sqe = Sqe::zero();
         sqe.cdw0 = opcode as u32;
@@ -2046,74 +2277,62 @@ impl Controller {
         sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
         sqe.cdw11 = (lba >> 32) as u32;
         sqe.cdw12 = (n_blocks - 1) as u32;
-
         sqe.prp1 = pages[0].raw();
 
-        // Hold the PRP-list buffer across the submit so its DMA
-        // memory stays mapped for the controller. Dropped after
-        // `submit` returns (which is synchronous: it polls the CQ).
-        let _prp_list_keepalive: Option<DmaBuffer>;
-
         match pages.len() {
-            1 => {
-                sqe.prp2 = 0;
-                _prp_list_keepalive = None;
-            }
-            2 => {
-                sqe.prp2 = pages[1].raw();
-                _prp_list_keepalive = None;
-            }
+            1 => sqe.prp2 = 0,
+            2 => sqe.prp2 = pages[1].raw(),
             _ => {
-                // PRP-list with chaining: a single 4-KiB list page
-                // holds up to 512 8-byte entries. Cap at 511 so a
-                // future change can dedicate the last slot to a
-                // chain pointer; reject larger transfers for now.
+                // One list page holds PRPS_PER_PAGE entries; the
+                // max-transfer clamp (≤ 2 MiB) keeps `pages.len() - 1`
+                // within it, so no chaining is needed here.
                 let entries = pages.len() - 1;
-                const MAX_PRP_LIST_ENTRIES: usize = 511;
-                if entries > MAX_PRP_LIST_ENTRIES {
+                if entries > prp::PRPS_PER_PAGE {
                     return Err(NvmeError::TooManyPages);
                 }
-                let buf = alloc_coherent(PAGE_SIZE as usize, DomainId::DRIVER_0)
-                    .map_err(|_| NvmeError::OutOfDmaMemory)?;
-                // SAFETY: alloc_coherent zero-fills + page-aligns the
-                // buffer; the kernel-mapped pointer stays valid for
-                // the buffer's lifetime, which we extend across the
-                // submit by binding to `_prp_list_keepalive`. NVMe
-                // expects little-endian 8-byte phys addresses; on a
-                // little-endian target a plain `write_volatile<u64>`
-                // produces that layout.
-                // SAFETY: Valid MMIO bounds or trusted driver environment
+                let list = self.prp_list.as_ref().ok_or(NvmeError::OutOfDmaMemory)?;
+                // SAFETY: persistent 4 KiB coherent list page owned by
+                // this controller; `&mut self` excludes other I/O and no
+                // command referencing it is in flight (dead checked
+                // above). `entries` ≤ PRPS_PER_PAGE.
                 unsafe {
-                    let entries_ptr = buf.as_mut_ptr() as *mut u64;
+                    let entries_ptr = list.cpu_mut_ptr::<u64>();
                     for (i, p) in pages[1..].iter().enumerate() {
                         core::ptr::write_volatile(entries_ptr.add(i), p.raw());
                     }
                 }
-                sqe.prp2 = buf.dma_addr().raw();
-                _prp_list_keepalive = Some(buf);
+                compiler_fence(Ordering::Release);
+                sqe.prp2 = list.dma_addr().raw();
             }
         }
 
-        // SAFETY: io queue + bar are live; pages + the optional
-        // PRP-list page are identity-mapped DMA owned by the caller
-        // / by `_prp_list_keepalive` respectively.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe {
-            io.submit(bar0, sqe)?;
+        let qi = self.pick_queue();
+        let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        // SAFETY: io queue + bar are live; the caller's pages and the
+        // persistent PRP-list page stay mapped across this synchronous
+        // submit.
+        let r = unsafe { io.submit(bar0, sqe) };
+        if let Err(NvmeError::CompletionTimeout) = r {
+            self.dead = true;
         }
-        Ok(())
+        r.map(|_| ())
     }
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
 
-/// Bounded poll for a `CSTS` predicate. Wall-clock-bounded at 5 s
-/// (NVMe 1.4 §3.1.5: CSTS.RDY transition is bounded by CAP.TO * 500
-/// ms, which can be up to ~127 s nominal but in practice settles in
-/// well under a second on every controller we've seen — 5 s is the
-/// "real wedge" threshold). Returns `ControllerFailed` on timeout or
-/// `ControllerFatal` if `CFS` is set during the wait.
-fn wait_csts<F: Fn(u32) -> bool>(bar: &MmioRegion, ok: F) -> Result<(), NvmeError> {
+/// Bounded poll for a `CSTS` predicate. Wall-clock-bounded at
+/// `timeout_ms`, which bring-up derives from CAP.TO like Linux
+/// `nvme_wait_ready` (NVMe 1.4 §3.1.5: the CSTS.RDY transition is
+/// bounded by (CAP.TO + 1) * 500 ms; see
+/// [`NvmeCaps::ready_timeout_ms`]). Returns `ControllerFailed` on
+/// timeout or `ControllerFatal` if `CFS` is set during the wait.
+fn wait_csts<F: Fn(u32) -> bool>(
+    bar: &MmioRegion,
+    timeout_ms: u64,
+    ok: F,
+) -> Result<(), NvmeError> {
     // responsive_spin_until ticks sleep_pumps every ~4096 iterations
     // so the cursor / FB / serial console stay alive while we busy-
     // wait on a stuck controller.
@@ -2128,7 +2347,7 @@ fn wait_csts<F: Fn(u32) -> bool>(bar: &MmioRegion, ok: F) -> Result<(), NvmeErro
             }
             ok(s)
         },
-        narf_time::Deadline::after_ms(5_000),
+        narf_time::Deadline::after_ms(timeout_ms),
     );
     if fatal {
         return Err(NvmeError::ControllerFatal);
@@ -2227,34 +2446,29 @@ unsafe fn parse_identify(buf: &DmaBuffer) -> IdentifyController {
         sn,
         mn,
         fr,
+        // SAFETY: byte 77 of the same 4 KiB page.
+        mdts: unsafe { core::ptr::read_volatile(base.add(77)) },
     }
 }
 
-/// Pull `(NSZE, lba_bytes)` out of an IDENTIFY NAMESPACE page.
+/// Decode the namespace LBA format out of an IDENTIFY NAMESPACE page.
 ///
-/// IDENTIFY NAMESPACE layout (NVMe base spec §5.15.2.2):
-///   - bytes 0..7   : NSZE (Namespace Size, in LBAs)
-///   - byte  26     : FLBAS (Formatted LBA Size). Bits[3:0] index
-///     into LBAF[].
-///   - bytes 128.. : LBAF[0..16] @ 4 bytes each. LBAF.LBADS is at
-///     byte offset 2 (relative to the LBAF start), low
-///     byte = log2(LBA size in bytes).
+/// Copies the header + LBA-format table (the first 384 bytes) out of
+/// the DMA page and hands it to [`prp::decode_namespace_format`],
+/// which mirrors Linux's FLBAS index, LBA-size and metadata checks.
 ///
 /// # Safety
 /// `buf` must be a 4 KiB coherent DMA buffer the controller has
 /// finished writing to (CQE arrived).
-unsafe fn parse_identify_namespace(buf: &DmaBuffer) -> (u64, u32) {
-    let base = buf.cpu_ptr::<u8>();
-    // SAFETY: 4 KiB DMA buffer.
-    let nsze = unsafe { core::ptr::read_volatile(base as *const u64) };
-    // SAFETY: same buffer.
-    let flbas = unsafe { core::ptr::read_volatile(base.add(26)) };
-    let lbaf_idx = (flbas & 0x0F) as usize;
-    let lbaf_off = 128 + lbaf_idx * 4;
-    // SAFETY: LBAF table fits well inside the 4 KiB page.
-    let lbads = unsafe { core::ptr::read_volatile(base.add(lbaf_off + 2)) };
-    let lba_bytes: u32 = if lbads == 0 { 512 } else { 1u32 << lbads };
-    (nsze, lba_bytes)
+unsafe fn parse_identify_namespace(buf: &DmaBuffer) -> prp::NamespaceFormat {
+    let mut raw = [0u8; 384];
+    // SAFETY: caller contract — `buf` is a live 4 KiB page the device
+    // finished writing; 384 bytes stay inside it, and `raw` is a stack
+    // array that cannot overlap it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.cpu_ptr::<u8>(), raw.as_mut_ptr(), raw.len());
+    }
+    prp::decode_namespace_format(&raw)
 }
 
 /// Build a Security Send or Security Receive SQE.
@@ -2290,10 +2504,10 @@ fn build_security_sqe(opcode: u8, secp: u8, spsp: u16, len: u32, prp1: u64) -> S
 /// shared across all `NvmeBlockDevice` instances, so this struct
 /// has no per-instance state.
 ///
-/// Single-PRP cap: each request must fit in one 4-KiB page (8
-/// LBAs at 512 B/sector, 1 LBA at 4 KiB/sector). PRP-list support
-/// for larger transfers lands when the filesystem layer starts
-/// asking for >4 KiB I/Os.
+/// Transfer size: a request may cover any number of blocks its
+/// (physically contiguous) buffer holds; `submit` splits it into
+/// commands of at most [`Controller::max_transfer_bytes`] and builds
+/// PRP1 / PRP2 / a PRP list for each (see [`prp`]).
 #[derive(Debug, Default)]
 pub struct NvmeBlockDevice;
 
@@ -2305,7 +2519,7 @@ impl BlockDevice for NvmeBlockDevice {
         4096
     }
     fn capacity_blocks(&self) -> u64 {
-        with_controller(|c| c.nsze).unwrap_or(0)
+        with_controller(|c| if c.ns_usable { c.nsze } else { 0 }).unwrap_or(0)
     }
     fn supports(&self, f: BlockFeature) -> bool {
         // Flush + Fua hit real NVMe opcodes (Flush 0x00, FUA bit in
@@ -2364,65 +2578,44 @@ fn nvme_submit_blocking(
     buffer: Option<alloc::sync::Arc<DmaBuffer>>,
 ) -> Result<(), BlockError> {
     let buffer = buffer.ok_or(BlockError::PermissionDenied)?;
-    let blocks = u16::try_from(req.blocks).map_err(|_| BlockError::InvalidRange)?;
-    if blocks == 0 {
+    if req.blocks == 0 {
         return Ok(());
     }
+    let opcode = match req.op {
+        BlockOp::Read => IoOpcode::Read as u8,
+        BlockOp::Write { fua: _ } | BlockOp::WriteZeroes => IoOpcode::Write as u8,
+        BlockOp::Trim => return Ok(()),
+    };
     // Interrupts stay enabled for the whole transfer: hold the
     // device's request gate, not the IRQ-masking CONTROLLER lock.
     // See `InstalledController`.
     let mut ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
-    let lba_bytes = ctrl.lba_bytes as usize;
-    let total_bytes = (blocks as usize)
+    let lba_bytes = ctrl.lba_bytes as u64;
+    let total_bytes = (req.blocks as u64)
         .checked_mul(lba_bytes)
         .ok_or(BlockError::InvalidRange)?;
-    if buffer.len() < total_bytes {
+    if (buffer.len() as u64) < total_bytes {
         return Err(BlockError::InvalidRange);
     }
-
-    // Build a page list from the DmaBuffer's contiguous physical
-    // memory. `alloc_coherent` returns physically-contiguous frames
-    // (the frame allocator's contract), so we can compute page
-    // addresses by stepping at PAGE_SIZE increments from the base.
-    //
-    // Single-page (≤ 4096 B): use read_lba / write_lba directly.
-    // Multi-page (> 4096 B): decompose into PhysAddr slices and
-    // use read_lba_pages / write_lba_pages (PRP1+PRP2 or PRP-list).
-    let base_phys = buffer.phys_addr();
-    let n_pages = total_bytes.div_ceil(PAGE_SIZE as usize);
-
-    if n_pages == 1 {
-        // Fast-path: single PRP, no allocation.
-        match req.op {
-            BlockOp::Read => ctrl
-                .read_lba(req.lba, blocks, &buffer)
-                .map_err(map_nvme_err),
-            BlockOp::Write { fua: _ } | BlockOp::WriteZeroes => ctrl
-                .write_lba(req.lba, blocks, &buffer)
-                .map_err(map_nvme_err),
-            BlockOp::Trim => Ok(()),
-        }
-    } else {
-        // Multi-page: build a page-address Vec then dispatch through
-        // the PRP-list path.
-        // Cap at MAX_PRP_LIST_ENTRIES + 1 (PRP1 + 511 list entries).
-        if n_pages > 512 {
-            return Err(BlockError::InvalidRange);
-        }
-        let mut pages: Vec<PhysAddr> = Vec::with_capacity(n_pages);
-        for i in 0..n_pages {
-            pages.push(PhysAddr::new(base_phys.raw() + (i as u64) * PAGE_SIZE));
-        }
-        match req.op {
-            BlockOp::Read => ctrl
-                .read_lba_pages(req.lba, blocks, &pages)
-                .map_err(map_nvme_err),
-            BlockOp::Write { fua: _ } | BlockOp::WriteZeroes => ctrl
-                .write_lba_pages(req.lba, blocks, &pages)
-                .map_err(map_nvme_err),
-            BlockOp::Trim => Ok(()),
-        }
+    // `alloc_coherent` buffers are physically contiguous, so each
+    // command takes a window of the buffer and the PRPs are built over
+    // it. Split at the controller's maximum transfer (MDTS), the way
+    // the Linux block layer splits at `max_hw_sectors`.
+    let per_cmd = core::cmp::max(1, ctrl.max_transfer_bytes() as u64 / lba_bytes) as u32;
+    let mut done: u32 = 0;
+    while done < req.blocks {
+        let n = core::cmp::min(per_cmd, req.blocks - done);
+        ctrl.nvm_io_at(
+            opcode,
+            req.lba.saturating_add(done as u64),
+            n,
+            &buffer,
+            (done as u64 * lba_bytes) as usize,
+        )
+        .map_err(map_nvme_err)?;
+        done += n;
     }
+    Ok(())
 }
 
 fn map_nvme_err(e: NvmeError) -> BlockError {
@@ -2618,30 +2811,55 @@ pub fn dbg_slot_addr() -> Option<usize> {
 #[derive(Debug)]
 pub struct NvmeBlockSync;
 
+/// Size of the persistent DMA scratch behind [`NvmeBlockSync`]. A
+/// registry transfer is split into commands of at most
+/// `min(scratch, max_transfer_bytes)` bytes; 128 KiB moves a standard
+/// 16 KiB GPT entry array, or 32 4 KiB blocks, in one command.
+const NVME_SYNC_SCRATCH_BYTES: usize = 128 * 1024;
+
 /// Persistent DMA scratch shared by NvmeBlockSync::read + write.
 /// Both paths hold the installed controller's `req_gate` (via
-/// [`probed_controller`]) for the whole transfer, so a single 4 KiB
-/// buffer is safe to share — the gate, not this lock, serialises the
+/// [`probed_controller`]) for the whole transfer, so a single buffer
+/// is safe to share — the gate, not this lock, serialises the
 /// CONTENTS. This lock covers only the lazy init and the pointer
 /// read; it is never held across a device round-trip (holding an
 /// IRQ-masking spinlock across the CQ poll is the livelock the gate
 /// exists to prevent — see `InstalledController`).
 ///
 /// The buffer is leaked on first use so the returned `&'static` can
-/// outlive the lock. Pre-fix every read/write call did
-/// `alloc_coherent(4096)` and dropped the result at function-end —
-/// under AMD-Vi the freed page could be reused while the controller
-/// still had a delayed DMA write in flight (audit #2).
+/// outlive the lock, and so a command that times out can never leave
+/// the device DMA-ing into a recycled page (audit #2: pre-fix every
+/// read/write call did `alloc_coherent(4096)` and dropped the result
+/// at function end). If the 128 KiB contiguous allocation fails the
+/// scratch falls back to one page; transfers are then split per page.
 static NVME_SCRATCH_BUF: IrqSafeSpinLock<Option<&'static DmaBuffer>> = IrqSafeSpinLock::new(None);
 
 fn nvme_scratch() -> Option<&'static DmaBuffer> {
     let mut g = NVME_SCRATCH_BUF.lock();
     if g.is_none() {
-        *g = alloc_coherent(4096, DomainId::DRIVER_0)
+        *g = alloc_coherent(NVME_SYNC_SCRATCH_BYTES, DomainId::DRIVER_0)
+            .or_else(|_| alloc_coherent(PAGE_SIZE as usize, DomainId::DRIVER_0))
             .ok()
             .map(|b| &*alloc::boxed::Box::leak(alloc::boxed::Box::new(b)));
     }
     *g
+}
+
+fn map_nvme_sync_err(e: NvmeError) -> narf_block::BlockIoError {
+    match e {
+        NvmeError::OutOfRange => narf_block::BlockIoError::OutOfRange,
+        NvmeError::NotReady | NvmeError::NoIoQueue => narf_block::BlockIoError::DeviceRemoved,
+        _ => narf_block::BlockIoError::DriverError,
+    }
+}
+
+/// Blocks per command for the sync scratch path: bounded by the scratch
+/// size and the controller's maximum transfer, never zero (the scratch
+/// and the max transfer are both at least one 4 KiB page, and the LBA
+/// size is at most 4 KiB for a usable namespace).
+fn nvme_sync_chunk_blocks(scratch: usize, max_transfer: u32, lba_bytes: u32) -> u32 {
+    let bytes = core::cmp::min(scratch, max_transfer as usize);
+    core::cmp::max(1, bytes / lba_bytes.max(1) as usize) as u32
 }
 
 impl narf_block::BlockDeviceSync for NvmeBlockSync {
@@ -2649,7 +2867,9 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
         with_controller(|c| c.lba_bytes).unwrap_or(512)
     }
     fn capacity(&self) -> u64 {
-        with_controller(|c| c.nsze).unwrap_or(0)
+        // A namespace whose format NARF cannot drive reports no
+        // capacity, as Linux sets a zero-capacity disk.
+        with_controller(|c| if c.ns_usable { c.nsze } else { 0 }).unwrap_or(0)
     }
     fn read(
         &self,
@@ -2657,62 +2877,99 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
         n_blocks: u16,
         out: &mut [u8],
     ) -> Result<(), narf_block::BlockIoError> {
-        let need = (n_blocks as usize) * 512;
-        if out.len() < need {
-            return Err(narf_block::BlockIoError::BufferTooSmall);
-        }
-        if need > 4096 {
-            return Err(narf_block::BlockIoError::BufferTooSmall);
+        if n_blocks == 0 {
+            return Ok(());
         }
         // Interrupts stay enabled for the whole transfer: hold the
         // device's request gate, not the IRQ-masking CONTROLLER lock.
         // The gate is what serialises the shared scratch, so acquire
-        // it BEFORE touching the buffer (audit #2 keeps the scratch
-        // persistent so a delayed device DMA can never land in a
-        // recycled page).
+        // it BEFORE touching the buffer.
         let mut ctrl = probed_controller().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        let lba_bytes = ctrl.lba_bytes as usize;
+        let need = n_blocks as usize * lba_bytes;
+        if out.len() < need {
+            return Err(narf_block::BlockIoError::BufferTooSmall);
+        }
         let buf = nvme_scratch().ok_or(narf_block::BlockIoError::DriverError)?;
-        ctrl.read_lba(lba, n_blocks, buf)
-            .map_err(|_| narf_block::BlockIoError::DriverError)?;
-        // The CQ poll inside `read_lba` is what makes the device's
-        // writes visible; fence so the compiler cannot hoist this bulk
-        // copy above it.
-        compiler_fence(Ordering::Acquire);
-        // SAFETY: `phys` is the identity-mapped 4 KiB scratch DMA page
-        // the controller just filled; `need` ≤ 4096 (checked above) and
-        // `out` is a kernel slice that cannot overlap the DMA page.
-        // Bulk copy rather than a per-byte volatile loop: the payload
-        // is coherent DMA memory, not MMIO, and per-byte volatility
-        // defeats vectorisation on the hottest path in the system.
-        unsafe {
-            core::ptr::copy_nonoverlapping(buf.cpu_ptr::<u8>(), out.as_mut_ptr(), need);
+        let chunk =
+            nvme_sync_chunk_blocks(buf.len(), ctrl.max_transfer_bytes(), ctrl.lba_bytes) as usize;
+        let mut done = 0usize;
+        while done < n_blocks as usize {
+            let n = core::cmp::min(chunk, n_blocks as usize - done);
+            ctrl.nvm_io_at(
+                IoOpcode::Read as u8,
+                lba.saturating_add(done as u64),
+                n as u32,
+                buf,
+                0,
+            )
+            .map_err(map_nvme_sync_err)?;
+            // The CQ poll inside `nvm_io_at` is what makes the device's
+            // writes visible; fence so the compiler cannot hoist this
+            // bulk copy above it.
+            compiler_fence(Ordering::Acquire);
+            let bytes = n * lba_bytes;
+            let at = done * lba_bytes;
+            // SAFETY: the scratch is a live coherent DMA buffer of
+            // `buf.len()` ≥ `bytes` bytes (chunk is bounded by it) that
+            // the controller just filled; `out[at..at + bytes]` is in
+            // bounds (`need` checked above) and a kernel slice cannot
+            // overlap the DMA buffer. Bulk copy rather than a per-byte
+            // volatile loop: the payload is coherent DMA memory, not
+            // MMIO.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    buf.cpu_ptr::<u8>(),
+                    out.as_mut_ptr().add(at),
+                    bytes,
+                );
+            }
+            done += n;
         }
         Ok(())
     }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
-        let need = (n_blocks as usize) * 512;
-        if data.len() < need {
-            return Err(narf_block::BlockIoError::BufferTooSmall);
-        }
-        if need > 4096 {
-            return Err(narf_block::BlockIoError::BufferTooSmall);
+        if n_blocks == 0 {
+            return Ok(());
         }
         // Same shape as `read` above: gate first (it owns the scratch
         // contents), no IRQ-masking lock across the transfer.
         let mut ctrl = probed_controller().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        let buf = nvme_scratch().ok_or(narf_block::BlockIoError::DriverError)?;
-        // SAFETY: `phys` is the identity-mapped 4 KiB scratch DMA page;
-        // `need` ≤ 4096 (checked above) and `data` is a kernel slice
-        // that cannot overlap the DMA page. Bulk copy rather than a
-        // per-byte volatile loop — see `read`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), buf.cpu_mut_ptr::<u8>(), need);
+        let lba_bytes = ctrl.lba_bytes as usize;
+        let need = n_blocks as usize * lba_bytes;
+        if data.len() < need {
+            return Err(narf_block::BlockIoError::BufferTooSmall);
         }
-        // Publish the payload before `write_lba` posts the SQE +
-        // doorbell that lets the device DMA-read it.
-        compiler_fence(Ordering::Release);
-        ctrl.write_lba(lba, n_blocks, buf)
-            .map_err(|_| narf_block::BlockIoError::DriverError)?;
+        let buf = nvme_scratch().ok_or(narf_block::BlockIoError::DriverError)?;
+        let chunk =
+            nvme_sync_chunk_blocks(buf.len(), ctrl.max_transfer_bytes(), ctrl.lba_bytes) as usize;
+        let mut done = 0usize;
+        while done < n_blocks as usize {
+            let n = core::cmp::min(chunk, n_blocks as usize - done);
+            let bytes = n * lba_bytes;
+            let at = done * lba_bytes;
+            // SAFETY: as in `read` — in-bounds source slice, scratch of
+            // at least `bytes` bytes, no overlap.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr().add(at),
+                    buf.cpu_mut_ptr::<u8>(),
+                    bytes,
+                );
+            }
+            // Publish the payload before the SQE + doorbell that lets
+            // the device DMA-read it.
+            compiler_fence(Ordering::Release);
+            ctrl.nvm_io_at(
+                IoOpcode::Write as u8,
+                lba.saturating_add(done as u64),
+                n as u32,
+                buf,
+                0,
+            )
+            .map_err(map_nvme_sync_err)?;
+            done += n;
+        }
         Ok(())
     }
 }

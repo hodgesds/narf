@@ -94,8 +94,20 @@ fn with_ahci_scratch<R>(f: impl FnOnce(&DmaBuffer) -> R) -> Option<R> {
 /// SAFETY: callers serialise on per-port busy registers; the
 /// returned phys is stable for the controller's lifetime.
 fn ahci_scratch_phys() -> u64 {
-    with_ahci_scratch(|b| b.dma_addr().raw()).unwrap_or(0)
+    let base = with_ahci_scratch(|b| b.dma_addr().raw()).unwrap_or(0);
+    // An HBA without CAP.S64A drops the upper address dwords (Linux sets a
+    // 32-bit DMA mask for it), so a scratch above 4 GiB would send the
+    // device's DMA somewhere else entirely. Refuse instead.
+    if !AHCI_S64A.load(Ordering::Acquire) && base.saturating_add(4096) > (1u64 << 32) {
+        return 0;
+    }
+    base
 }
+
+/// CAP.S64A of the installed HBA (64-bit DMA addressing). Set by
+/// `Ahci::bring_up`; `true` until then so the QEMU model smokes that
+/// drive the scratch before any bring-up keep their behaviour.
+static AHCI_S64A: AtomicBool = AtomicBool::new(true);
 
 /// Byte offset of the data area inside the shared 4 KiB scratch
 /// (cmd_list@0x000, fis_recv@0x400, cmd_tbl@0x500, data@0x600).
@@ -120,6 +132,27 @@ pub const AHCI_ICH9_DEV: u16 = 0x2922;
 /// Real silicon ICH10 AHCI.
 pub const AHCI_ICH10_DEV: u16 = 0x3A22;
 
+/// PCI class triple of an AHCI 1.0 SATA controller (`01:06:01`,
+/// Linux `PCI_CLASS_STORAGE_SATA_AHCI`). Linux's `ahci_pci_tbl` ends
+/// with a generic entry on this class (`board_ahci`), which is what
+/// binds controllers with no explicit ID entry — among them the AMD
+/// 600-series chipset SATA controller `1022:43f6`.
+pub const PCI_CLASS_STORAGE: u8 = 0x01;
+/// SATA subclass.
+pub const PCI_SUBCLASS_SATA: u8 = 0x06;
+/// AHCI 1.0 programming interface.
+pub const PCI_PROGIF_AHCI: u8 = 0x01;
+
+/// AMD vendor ID.
+pub const AMD_VENDOR: u16 = 0x1022;
+/// AMD 600-series chipset SATA controller (Promontory 21). Linux has no
+/// explicit `ahci_pci_tbl` entry for it: the generic AHCI class entry
+/// binds it with `board_ahci` (no `AHCI_HFLAG_*` quirks, MSI allowed).
+/// The only AMD-chipset special case in drivers/ata/ahci.c is a DMI
+/// LPM blacklist for one ASUS B550 board (`1022:43eb`), and NARF never
+/// enables link power management.
+pub const AMD_600_SERIES_SATA_DEV: u16 = 0x43F6;
+
 const ABAR_BAR: u8 = 5;
 
 const HBA_CAP: u64 = 0x00;
@@ -128,6 +161,28 @@ const HBA_GHC: u64 = 0x04;
 const HBA_IS: u64 = 0x08;
 const HBA_PI: u64 = 0x0C;
 const HBA_VS: u64 = 0x10;
+/// HBA Capabilities Extended (AHCI 1.2+, §3.1.10).
+const HBA_CAP2: u64 = 0x24;
+/// BIOS/OS Handoff Control and Status (AHCI 1.2+, §3.1.11).
+const HBA_BOHC: u64 = 0x28;
+
+// CAP bits (AHCI 1.3.1 §3.1.1).
+/// CAP.NP — number of ports, zero-based (bits 4:0).
+const CAP_NP_MASK: u32 = 0x1F;
+/// CAP.SSS — supports staggered spin-up.
+const CAP_SSS: u32 = 1 << 27;
+/// CAP.S64A — supports 64-bit addressing.
+const CAP_S64A: u32 = 1 << 31;
+
+// CAP2 / BOHC bits.
+/// CAP2.BOH — BIOS/OS handoff supported.
+const CAP2_BOH: u32 = 1 << 0;
+/// BOHC.BOS — BIOS owned semaphore.
+const BOHC_BOS: u32 = 1 << 0;
+/// BOHC.OOS — OS owned semaphore.
+const BOHC_OOS: u32 = 1 << 1;
+/// BOHC.BB — BIOS busy.
+const BOHC_BB: u32 = 1 << 4;
 
 // GHC bits.
 const GHC_HR: u32 = 1 << 0; // HBA Reset
@@ -187,9 +242,22 @@ const PORT_IE_MASK: u32 =
 
 // PORT_CMD bits.
 const CMD_ST: u32 = 1 << 0; // Start
+const CMD_SUD: u32 = 1 << 1; // Spin-Up Device
 const CMD_FRE: u32 = 1 << 4; // FIS Receive Enable
 const CMD_FR: u32 = 1 << 14; // FIS Receive Running
 const CMD_CR: u32 = 1 << 15; // Command List Running
+/// PxCMD.ICC — Interface Communication Control (bits 31:28).
+const CMD_ICC_MASK: u32 = 0xF << 28;
+/// ICC = 1: Active.
+const CMD_ICC_ACTIVE: u32 = 1 << 28;
+/// Platform-defined, write-once port capability bits Linux preserves
+/// across an HBA reset (`PORT_CMD_CAP` = HPCP | MPSP | CPD | ESP |
+/// FBSCP, drivers/ata/ahci.h).
+const CMD_CAP_MASK: u32 = (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22);
+/// PORT_TFD — Task File Data (status in bits 7:0).
+const PORT_TFD: u64 = 0x20;
+/// ATA status BSY.
+const ATA_BUSY: u32 = 0x80;
 
 /// Detected device class on a port (from PORT_SIG).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -233,6 +301,9 @@ pub enum AhciError {
     /// PORT_CMD never reported FR + CR cleared so we couldn't safely
     /// reprogram the port.
     PortIdleTimeout,
+    /// GHC.AE would not stay set after five writes (Linux
+    /// `ahci_enable_ahci` WARNs in the same case).
+    AhciEnableFailed,
 }
 
 /// Live AHCI HBA. Stage-4 cut keeps just the MMIO + the discovered
@@ -241,9 +312,23 @@ pub enum AhciError {
 pub struct Ahci {
     mmio: MmioRegion,
     pub cap: u32,
+    /// CAP2 (zero below AHCI 1.2).
+    pub cap2: u32,
     pub vs: u32,
     pub pi: u32,
     pub ports: alloc::vec::Vec<PortInfo>,
+    /// Outcome of the BIOS/OS ownership handoff at bring-up.
+    pub handoff: BiosHandoff,
+    /// Port the registry's `sata0` device addresses (first port that
+    /// classified as an ATA disk; port 0 if none did).
+    pub block_port: u8,
+    /// User-addressable sectors on `block_port` from IDENTIFY DEVICE
+    /// (LBA48 words 100..103, else LBA28 words 60..61); 0 if unknown.
+    pub capacity: u64,
+    /// Per-port FIS receive areas used during the link bring-up
+    /// (and the shared, never-issued command list they point at).
+    /// Kept for the HBA's lifetime: a port may post a FIS late.
+    _init_dma: Option<DmaBuffer>,
     /// Serialises synchronous transfers (and the shared
     /// `AHCI_SCRATCH` contents) across callers. Spun on WITHOUT
     /// masking interrupts — see [`crate::req_gate::ReqGate`] for why
@@ -263,9 +348,266 @@ impl core::fmt::Debug for Ahci {
     }
 }
 
+/// Register access for the HBA-global init sequence, so the same code
+/// drives the real ABAR and the register model in the kernel tests.
+pub trait AhciRegs {
+    /// Read the 32-bit HBA register at byte offset `off`.
+    fn read32(&self, off: u64) -> u32;
+    /// Write the 32-bit HBA register at byte offset `off`.
+    fn write32(&self, off: u64, val: u32);
+}
+
+/// The mapped ABAR. Only `Ahci::bring_up` (an `unsafe fn` whose caller
+/// owns BAR5) constructs one.
+struct Abar<'a>(&'a MmioRegion);
+
+impl AhciRegs for Abar<'_> {
+    fn read32(&self, off: u64) -> u32 {
+        // SAFETY: `Abar` wraps the BAR5 mapping `Ahci::bring_up` owns;
+        // every offset used by the init sequence is inside the HBA's
+        // register block.
+        unsafe { self.0.read32(off) }
+    }
+    fn write32(&self, off: u64, val: u32) {
+        // SAFETY: as in `read32`.
+        unsafe { self.0.write32(off, val) }
+    }
+}
+
+/// Outcome of the BIOS/OS handoff (AHCI 1.3.1 §10.6.3).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BiosHandoff {
+    /// CAP2.BOH clear (or AHCI < 1.2): no handoff mechanism.
+    NotSupported,
+    /// OOS set and the BIOS released BOS within the wait.
+    Completed,
+    /// The BIOS kept BOS set past the 25 ms + 2 s waits; the OS
+    /// proceeds anyway, as the spec allows.
+    TimedOut,
+}
+
+/// HBA-global configuration captured by [`hba_global_init`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HbaConfig {
+    pub cap: u32,
+    pub cap2: u32,
+    pub vs: u32,
+    /// Implemented-port map after Linux's cross-check / fabrication.
+    pub port_map: u32,
+    /// Platform PxCMD capability bits per port, restored after reset.
+    pub saved_port_cmd: [u32; 32],
+    pub handoff: BiosHandoff,
+}
+
+/// Sleep `ms` while keeping the console pumps alive.
+fn ahci_msleep(ms: u64) {
+    narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ms(ms));
+}
+
+/// Linux `ahci_enable_ahci`: set GHC.AE, retrying up to five times
+/// 10 ms apart ("Some controllers need AHCI_EN to be written multiple
+/// times").
+fn enable_ahci(regs: &impl AhciRegs) -> bool {
+    let mut ghc = regs.read32(HBA_GHC);
+    if ghc & GHC_AE != 0 {
+        return true;
+    }
+    for _ in 0..5 {
+        ghc |= GHC_AE;
+        regs.write32(HBA_GHC, ghc);
+        ghc = regs.read32(HBA_GHC);
+        if ghc & GHC_AE != 0 {
+            return true;
+        }
+        ahci_msleep(10);
+    }
+    false
+}
+
+/// Number of ports CAP.NP advertises (Linux `ahci_nr_ports`).
+pub fn ahci_nr_ports(cap: u32) -> u32 {
+    (cap & CAP_NP_MASK) + 1
+}
+
+/// Linux `ahci_save_initial_config` port-map rules: a PI with more ports
+/// than CAP.NP is discarded, and below AHCI 1.3 an empty PI is
+/// fabricated from CAP.NP.
+pub fn effective_port_map(cap: u32, vs: u32, pi: u32) -> u32 {
+    let nr = ahci_nr_ports(cap);
+    let mut map = pi;
+    if map != 0 && map.count_ones() > nr {
+        map = 0;
+    }
+    if map == 0 && vs < 0x0001_0300 {
+        map = if nr >= 32 { u32::MAX } else { (1u32 << nr) - 1 };
+    }
+    map
+}
+
+/// BIOS/OS handoff, AHCI 1.3.1 §10.6.3: set BOHC.OOS, wait up to 25 ms
+/// for the BIOS to clear BOS, and if it has not (or reports BB) give it
+/// 2 s to finish outstanding commands. Linux performs no handoff; NARF
+/// follows the spec because a firmware that still owns the HBA could
+/// otherwise race the reset below. The waits are bounded and the OS
+/// proceeds either way.
+fn bios_handoff(regs: &impl AhciRegs, cap2: u32) -> BiosHandoff {
+    if cap2 & CAP2_BOH == 0 {
+        return BiosHandoff::NotSupported;
+    }
+    let bohc = regs.read32(HBA_BOHC);
+    if bohc & BOHC_BOS == 0 && bohc & BOHC_OOS != 0 {
+        return BiosHandoff::Completed;
+    }
+    regs.write32(HBA_BOHC, bohc | BOHC_OOS);
+    let released = narf_scheduler::responsive_spin_until(
+        || regs.read32(HBA_BOHC) & BOHC_BOS == 0,
+        narf_time::Deadline::after_ms(25),
+    );
+    if released && regs.read32(HBA_BOHC) & BOHC_BB == 0 {
+        return BiosHandoff::Completed;
+    }
+    let released = narf_scheduler::responsive_spin_until(
+        || regs.read32(HBA_BOHC) & (BOHC_BOS | BOHC_BB) == 0,
+        narf_time::Deadline::after_ms(2_000),
+    );
+    if released {
+        BiosHandoff::Completed
+    } else {
+        BiosHandoff::TimedOut
+    }
+}
+
+/// HBA-global bring-up, mirroring Linux `ahci_save_initial_config` +
+/// `ahci_reset_controller` (drivers/ata/libahci.c):
+///
+/// 1. Enable AHCI mode, take ownership from the BIOS.
+/// 2. Save CAP / CAP2 / PI and each port's platform PxCMD bits. CAP and
+///    PI are write-once registers firmware programs; some controllers
+///    reset them on GHC.HR, so Linux writes them back afterwards.
+/// 3. GHC.HR (unless already set), wait up to 1 s for it to self-clear
+///    ("Reset must complete within 1 second, or the hardware should be
+///    considered fried").
+/// 4. Re-enable AHCI mode and restore the saved values.
+pub fn hba_global_init(regs: &impl AhciRegs) -> Result<HbaConfig, AhciError> {
+    if !enable_ahci(regs) {
+        return Err(AhciError::AhciEnableFailed);
+    }
+    let vs = regs.read32(HBA_VS);
+    let cap2 = if vs >= 0x0001_0200 {
+        regs.read32(HBA_CAP2)
+    } else {
+        0
+    };
+    let handoff = bios_handoff(regs, cap2);
+    let cap = regs.read32(HBA_CAP);
+    let raw_pi = regs.read32(HBA_PI);
+    let port_map = effective_port_map(cap, vs, raw_pi);
+    // Linux writes the fabricated map back; a map it discarded for
+    // disagreeing with CAP.NP keeps the original PI value.
+    let saved_pi = if raw_pi == 0 { port_map } else { raw_pi };
+    let mut saved_port_cmd = [0u32; 32];
+    for (n, slot) in saved_port_cmd.iter_mut().enumerate() {
+        if port_map & (1 << n) != 0 {
+            let off = PORT_BASE_OFF + n as u64 * PORT_STRIDE;
+            *slot = regs.read32(off + PORT_CMD) & CMD_CAP_MASK;
+        }
+    }
+
+    // Global reset.
+    if !enable_ahci(regs) {
+        return Err(AhciError::AhciEnableFailed);
+    }
+    let ghc = regs.read32(HBA_GHC);
+    if ghc & GHC_HR == 0 {
+        regs.write32(HBA_GHC, ghc | GHC_HR);
+        let _ = regs.read32(HBA_GHC); // flush
+    }
+    let done = narf_scheduler::responsive_spin_until(
+        || regs.read32(HBA_GHC) & GHC_HR == 0,
+        narf_time::Deadline::after_ms(1_000),
+    );
+    if !done {
+        return Err(AhciError::ResetTimeout);
+    }
+    if !enable_ahci(regs) {
+        return Err(AhciError::AhciEnableFailed);
+    }
+    // ahci_restore_initial_config.
+    regs.write32(HBA_CAP, cap);
+    if cap2 != 0 {
+        regs.write32(HBA_CAP2, cap2);
+    }
+    regs.write32(HBA_PI, saved_pi);
+    let _ = regs.read32(HBA_PI); // flush
+    for (n, &bits) in saved_port_cmd.iter().enumerate() {
+        if port_map & (1 << n) != 0 {
+            let off = PORT_BASE_OFF + n as u64 * PORT_STRIDE;
+            regs.write32(off + PORT_CMD, bits);
+        }
+    }
+    Ok(HbaConfig {
+        cap,
+        cap2,
+        vs,
+        port_map,
+        saved_port_cmd,
+        handoff,
+    })
+}
+
+/// SATA link debounce timing `{ interval, duration, timeout }` in ms
+/// (Linux `sata_deb_timing_normal`).
+pub const SATA_DEB_TIMING_NORMAL: [u64; 3] = [5, 100, 2_000];
+
+/// Linux `sata_link_debounce`: sample PxSSTS.DET every `interval` ms
+/// until it holds one value for `duration` ms (DET = 1, "device present,
+/// no PHY communication", keeps waiting until the deadline). Returns the
+/// settled DET, or `None` if DET was still changing at the deadline.
+pub fn sata_link_debounce(mut read_det: impl FnMut() -> u32, timing: [u64; 3]) -> Option<u32> {
+    let [interval, duration, timeout] = timing;
+    let deadline = narf_time::Deadline::after_ms(timeout);
+    let mut last = read_det() & 0xF;
+    let mut stable = narf_time::Deadline::after_ms(duration);
+    loop {
+        ahci_msleep(interval);
+        let cur = read_det() & 0xF;
+        if cur == last {
+            if cur == 1 && !deadline.expired() {
+                continue;
+            }
+            if stable.expired() {
+                return Some(cur);
+            }
+            continue;
+        }
+        last = cur;
+        stable = narf_time::Deadline::after_ms(duration);
+        if deadline.expired() {
+            return None;
+        }
+    }
+}
+
+/// Byte offset of port `n`'s FIS receive area inside the init DMA
+/// buffer (256-byte aligned, AHCI §3.3.3); the shared command list sits
+/// at offset 0 (1 KiB aligned).
+const INIT_FIS_BASE: u64 = 0x400;
+/// Init DMA size: 1 KiB command list + 32 × 256-byte FIS areas.
+const INIT_DMA_BYTES: usize = 0x400 + 32 * 0x100;
+
 impl Ahci {
-    /// Bring up the HBA: reset, enable AHCI mode, enumerate
-    /// implemented ports, capture each port's signature.
+    /// Bring up the HBA and every implemented port.
+    ///
+    /// HBA level: [`hba_global_init`] (AHCI enable, BIOS/OS handoff,
+    /// Linux's save / reset / restore of CAP, PI and the port
+    /// capability bits). Port level, mirroring `ahci_port_init` and the
+    /// libata probe hardreset (`ahci_do_hardreset` →
+    /// `sata_link_hardreset`): stop the engines, clear SERR/IS, point
+    /// the port at a FIS receive area, enable FIS reception, spin the
+    /// device up, COMRESET, debounce the link and wait (10 s, Linux's
+    /// first `ata_eh_reset_timeouts` step) for BSY to clear before the
+    /// signature is classified. Every wait is bounded; no media is
+    /// touched.
     ///
     /// # Safety
     /// Caller owns the device's BAR5 exclusively.
@@ -275,49 +617,21 @@ impl Ahci {
     ) -> Result<Self, AhciError> {
         // SAFETY: caller-authority.
         let mmio = unsafe { map_bar(device, ABAR_BAR) }.map_err(|_| AhciError::BarMapFailed)?;
+        let cfg = hba_global_init(&Abar(&mmio))?;
+        let cap = cfg.cap;
+        AHCI_S64A.store(cap & CAP_S64A != 0, Ordering::Release);
 
-        // Force AHCI mode (some HBAs come up in legacy IDE mode).
-        // SAFETY: identity-mapped MMIO.
-        let ghc = unsafe { mmio.read32(HBA_GHC) };
-        // SAFETY: same.
-        unsafe {
-            mmio.write32(HBA_GHC, ghc | GHC_AE);
-        }
+        // FIS receive areas for the link bring-up. Without CAP.S64A the
+        // HBA only sees the low address dword, so the area must sit
+        // below 4 GiB; skip the per-port bring-up rather than point the
+        // device at the wrong memory.
+        let init_dma = alloc_coherent(INIT_DMA_BYTES, DomainId::DRIVER_0)
+            .ok()
+            .filter(|b| {
+                cap & CAP_S64A != 0 || b.dma_addr().raw() + INIT_DMA_BYTES as u64 <= 1u64 << 32
+            });
 
-        // HBA Reset.
-        // SAFETY: same.
-        unsafe {
-            mmio.write32(HBA_GHC, GHC_AE | GHC_HR);
-        }
-        // responsive_spin_until ticks sleep_pumps so cursor/FB stay
-        // alive during HBA reset. AHCI 1.3.1 §10.4.3: HBA reset
-        // self-clears within 1 s.
-        let done = narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { mmio.read32(HBA_GHC) } & GHC_HR == 0,
-            narf_time::Deadline::after_ms(1_000),
-        );
-        if !done {
-            return Err(AhciError::ResetTimeout);
-        }
-        // Re-enable AHCI mode after the reset (HR clears AE on some
-        // implementations).
-        // SAFETY: same.
-        unsafe {
-            mmio.write32(HBA_GHC, GHC_AE);
-        }
-
-        // SAFETY: same.
-        let cap = unsafe { mmio.read32(HBA_CAP) };
-        // SAFETY: same.
-        let vs = unsafe { mmio.read32(HBA_VS) };
-        // SAFETY: same.
-        let pi = unsafe { mmio.read32(HBA_PI) };
-
-        // Drain any stale per-port interrupt state and clear the
-        // master HBA IS bitmap (W1C, §3.1.3) before unmasking, so a
-        // pre-existing latched IS bit doesn't fire the moment GHC.IE
-        // is set.
+        // Drain stale HBA-level interrupt state (W1C, §3.1.3).
         // SAFETY: identity-mapped MMIO.
         let stale_is = unsafe { mmio.read32(HBA_IS) };
         // SAFETY: same.
@@ -325,52 +639,297 @@ impl Ahci {
             mmio.write32(HBA_IS, stale_is);
         }
 
-        // Enumerate ports + program per-port IRQ mask.
-        let mut ports = alloc::vec::Vec::new();
-        for n in 0..32 {
-            if pi & (1u32 << n) == 0 {
-                continue;
-            }
-            let off = PORT_BASE_OFF + (n as u64) * PORT_STRIDE;
-            // SAFETY: same.
-            let sig = unsafe { mmio.read32(off + PORT_SIG) };
-            // SAFETY: same.
-            let ssts = unsafe { mmio.read32(off + PORT_SSTS) };
-            // Clear SERR (write-1-to-clear).
-            // SAFETY: same.
-            let serr = unsafe { mmio.read32(off + PORT_SERR) };
-            // SAFETY: same.
-            unsafe {
-                mmio.write32(off + PORT_SERR, serr);
-            }
-            // Clear stale PORT_IS (W1C, §3.3.5) and unmask the
-            // events we care about (§3.3.6).
-            // SAFETY: same.
-            unsafe {
-                mmio.write32(off + PORT_IS, 0xFFFF_FFFF);
-                mmio.write32(off + PORT_IE, PORT_IE_MASK);
-            }
-            let kind = PortKind::from_sig(sig, ssts);
-            ports.push(PortInfo { index: n, kind });
-        }
-
-        // Now that per-port masks + stale IS are clean, flip the
-        // master IRQ enable (§3.1.2). The HBA still cannot deliver
-        // until the platform routes the vector (MSI-X / MSI / INTx),
-        // which happens in `probe`.
-        // SAFETY: same.
-        unsafe {
-            mmio.write32(HBA_GHC, GHC_AE | GHC_IE);
-        }
-
-        Ok(Self {
+        let mut dev = Self {
             mmio,
             cap,
-            vs,
-            pi,
-            ports,
+            cap2: cfg.cap2,
+            vs: cfg.vs,
+            pi: cfg.port_map,
+            ports: alloc::vec::Vec::new(),
+            handoff: cfg.handoff,
+            block_port: 0,
+            capacity: 0,
+            _init_dma: None,
             req_gate: AtomicBool::new(false),
-        })
+        };
+
+        for n in 0..32u8 {
+            if cfg.port_map & (1u32 << n) == 0 {
+                continue;
+            }
+            let kind = match init_dma.as_ref() {
+                // SAFETY: we own the HBA (caller contract) and `n` is an
+                // implemented port.
+                Some(buf) => unsafe { dev.port_init_and_classify(n, buf) },
+                None => {
+                    // SAFETY: same.
+                    unsafe { dev.port_classify_passive(n) }
+                }
+            };
+            let off = PORT_BASE_OFF + (n as u64) * PORT_STRIDE;
+            // Clear stale PORT_IS (W1C, §3.3.5) and unmask the events
+            // we care about (§3.3.6).
+            // SAFETY: identity-mapped MMIO.
+            unsafe {
+                dev.mmio.write32(off + PORT_IS, 0xFFFF_FFFF);
+                dev.mmio.write32(off + PORT_IE, PORT_IE_MASK);
+            }
+            dev.ports.push(PortInfo { index: n, kind });
+        }
+        dev._init_dma = init_dma;
+        dev.block_port = dev
+            .ports
+            .iter()
+            .find(|p| p.kind == PortKind::Sata)
+            .map(|p| p.index)
+            .unwrap_or(0);
+
+        // Clear the HBA IS bits the port bring-up latched, then flip
+        // the master IRQ enable (§3.1.2). The HBA still cannot deliver
+        // until the platform routes the vector (MSI-X / MSI / INTx),
+        // which happens in `probe`.
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            let is = dev.mmio.read32(HBA_IS);
+            dev.mmio.write32(HBA_IS, is);
+            let ghc = dev.mmio.read32(HBA_GHC);
+            dev.mmio.write32(HBA_GHC, ghc | GHC_AE | GHC_IE);
+        }
+        Ok(dev)
+    }
+
+    /// Linux `ahci_stop_engine` + `ahci_stop_fis_rx`: clear PxCMD.ST and
+    /// wait (500 ms) for CR, then clear FRE and wait (1 s) for FR.
+    ///
+    /// # Safety
+    /// Caller owns the HBA exclusively; `port_index < 32`.
+    unsafe fn port_deinit(&self, port_index: u8) -> Result<(), AhciError> {
+        let off = PORT_BASE_OFF + (port_index as u64) * PORT_STRIDE;
+        // SAFETY: identity-mapped MMIO.
+        let cmd = unsafe { self.mmio.read32(off + PORT_CMD) };
+        if cmd == 0xFFFF_FFFF {
+            // Controller gone (Linux: "AHCI controller unavailable!").
+            return Err(AhciError::PortIdleTimeout);
+        }
+        if cmd & (CMD_ST | CMD_CR) != 0 {
+            // SAFETY: same.
+            unsafe { self.mmio.write32(off + PORT_CMD, cmd & !CMD_ST) };
+            let ok = narf_scheduler::responsive_spin_until(
+                // SAFETY: same.
+                || unsafe { self.mmio.read32(off + PORT_CMD) } & CMD_CR == 0,
+                narf_time::Deadline::after_ms(500),
+            );
+            if !ok {
+                return Err(AhciError::PortIdleTimeout);
+            }
+        }
+        // SAFETY: same.
+        let cmd = unsafe { self.mmio.read32(off + PORT_CMD) };
+        if cmd & (CMD_FRE | CMD_FR) != 0 {
+            // SAFETY: same.
+            unsafe { self.mmio.write32(off + PORT_CMD, cmd & !CMD_FRE) };
+            let ok = narf_scheduler::responsive_spin_until(
+                // SAFETY: same.
+                || unsafe { self.mmio.read32(off + PORT_CMD) } & CMD_FR == 0,
+                narf_time::Deadline::after_ms(1_000),
+            );
+            if !ok {
+                return Err(AhciError::PortIdleTimeout);
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear SERR (W1C), PxIS (W1C) and this port's HBA IS bit — Linux
+    /// `ahci_port_clear_pending_irq`.
+    ///
+    /// # Safety
+    /// Caller owns the HBA exclusively; `port_index < 32`.
+    unsafe fn port_clear_pending(&self, port_index: u8) {
+        let off = PORT_BASE_OFF + (port_index as u64) * PORT_STRIDE;
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            let serr = self.mmio.read32(off + PORT_SERR);
+            self.mmio.write32(off + PORT_SERR, serr);
+            let is = self.mmio.read32(off + PORT_IS);
+            if is != 0 {
+                self.mmio.write32(off + PORT_IS, is);
+            }
+            self.mmio.write32(HBA_IS, 1u32 << port_index);
+        }
+    }
+
+    /// Classify a port from its current registers, without resetting
+    /// the link (fallback when no FIS area could be allocated).
+    ///
+    /// # Safety
+    /// Caller owns the HBA exclusively; `port_index < 32`.
+    unsafe fn port_classify_passive(&self, port_index: u8) -> PortKind {
+        let off = PORT_BASE_OFF + (port_index as u64) * PORT_STRIDE;
+        // SAFETY: same contract.
+        let _ = unsafe { self.port_deinit(port_index) };
+        // SAFETY: same contract.
+        unsafe { self.port_clear_pending(port_index) };
+        // SAFETY: identity-mapped MMIO.
+        let (sig, ssts) = unsafe {
+            (
+                self.mmio.read32(off + PORT_SIG),
+                self.mmio.read32(off + PORT_SSTS),
+            )
+        };
+        PortKind::from_sig(sig, ssts)
+    }
+
+    /// Port init + link hardreset + classification (see `bring_up`).
+    /// Leaves the port with ST and FRE clear, the state every command
+    /// path expects before it reprograms CLB / FB.
+    ///
+    /// # Safety
+    /// Caller owns the HBA exclusively; `port_index < 32` is an
+    /// implemented port; `init` is the persistent init DMA buffer,
+    /// reachable by the HBA (below 4 GiB without CAP.S64A).
+    unsafe fn port_init_and_classify(&self, port_index: u8, init: &DmaBuffer) -> PortKind {
+        let off = PORT_BASE_OFF + (port_index as u64) * PORT_STRIDE;
+        let s64a = self.cap & CAP_S64A != 0;
+
+        // ahci_port_init: make sure the port is not active.
+        // SAFETY: same contract.
+        if unsafe { self.port_deinit(port_index) }.is_err() {
+            return PortKind::None;
+        }
+        // SAFETY: same contract.
+        unsafe { self.port_clear_pending(port_index) };
+
+        // ahci_start_fis_rx: CLB / FB (upper dwords only with S64A),
+        // then FRE.
+        let clb = init.dma_addr().raw();
+        let fb = init
+            .dma_addr_at(INIT_FIS_BASE + port_index as u64 * 0x100)
+            .raw();
+        // The D2H Register FIS lands at RFIS + 0x40; seed its status
+        // byte with BSY like `ahci_do_hardreset`, so a stale FIS can
+        // never read as "ready".
+        // SAFETY: coherent DMA buffer of INIT_DMA_BYTES; the FIS area
+        // offset + 0x42 is in bounds.
+        unsafe {
+            core::ptr::write_volatile(
+                init.cpu_mut_ptr_at::<u8>(INIT_FIS_BASE + port_index as u64 * 0x100 + 0x42),
+                ATA_BUSY as u8,
+            );
+        }
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped MMIO; port is idle (deinit above).
+        unsafe {
+            if s64a {
+                self.mmio.write32(off + 0x04, (clb >> 32) as u32);
+                self.mmio.write32(off + 0x0C, (fb >> 32) as u32);
+            }
+            self.mmio.write32(off, clb as u32);
+            self.mmio.write32(off + 0x08, fb as u32);
+            let cmd = self.mmio.read32(off + PORT_CMD);
+            self.mmio.write32(off + PORT_CMD, cmd | CMD_FRE);
+            let _ = self.mmio.read32(off + PORT_CMD);
+        }
+
+        // ahci_power_up: spin up (only meaningful with CAP.SSS) and set
+        // the interface active.
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            let mut cmd = self.mmio.read32(off + PORT_CMD) & !CMD_ICC_MASK;
+            if self.cap & CAP_SSS != 0 {
+                cmd |= CMD_SUD;
+                self.mmio.write32(off + PORT_CMD, cmd);
+            }
+            self.mmio.write32(off + PORT_CMD, cmd | CMD_ICC_ACTIVE);
+        }
+
+        // SAFETY: same contract.
+        let online = unsafe { self.link_hardreset(port_index) };
+        let kind = if online {
+            // ata_wait_ready with ahci_check_ready: BSY clear = ready,
+            // 0xFF = no device.
+            let mut absent = false;
+            let ready = narf_scheduler::responsive_spin_until(
+                || {
+                    // SAFETY: identity-mapped MMIO.
+                    let st = unsafe { self.mmio.read32(off + PORT_TFD) } & 0xFF;
+                    if st == 0xFF {
+                        absent = true;
+                        return true;
+                    }
+                    st & ATA_BUSY == 0
+                },
+                narf_time::Deadline::after_ms(10_000),
+            );
+            // SAFETY: identity-mapped MMIO.
+            let (sig, ssts) = unsafe {
+                (
+                    self.mmio.read32(off + PORT_SIG),
+                    self.mmio.read32(off + PORT_SSTS),
+                )
+            };
+            if absent || !ready {
+                PortKind::None
+            } else {
+                PortKind::from_sig(sig, ssts)
+            }
+        } else {
+            PortKind::None
+        };
+
+        // Back to the idle baseline the command paths expect.
+        // SAFETY: same contract.
+        let _ = unsafe { self.port_deinit(port_index) };
+        // SAFETY: same contract.
+        unsafe { self.port_clear_pending(port_index) };
+        kind
+    }
+
+    /// Linux `sata_link_hardreset` + `sata_link_resume`: COMRESET via
+    /// PxSCTL.DET = 1 for ≥ 1 ms (keeping SPD, IPM = 3), release with
+    /// up to five tries, wait 200 ms, debounce, clear SERR. Returns
+    /// whether the link is online (DET = 3).
+    ///
+    /// # Safety
+    /// Caller owns the HBA exclusively; `port_index < 32`; the engine
+    /// (PxCMD.ST) is stopped.
+    unsafe fn link_hardreset(&self, port_index: u8) -> bool {
+        let off = PORT_BASE_OFF + (port_index as u64) * PORT_STRIDE;
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            let sctl = self.mmio.read32(off + PORT_SCTL);
+            self.mmio.write32(off + PORT_SCTL, (sctl & 0x0F0) | 0x301);
+            let _ = self.mmio.read32(off + PORT_SCTL); // flush
+        }
+        // AHCI 1.1 §10.4.2: hold COMRESET at least 1 ms.
+        ahci_msleep(1);
+        let mut tries = 5;
+        loop {
+            // SAFETY: identity-mapped MMIO.
+            let sctl = unsafe { self.mmio.read32(off + PORT_SCTL) };
+            // SAFETY: same.
+            unsafe { self.mmio.write32(off + PORT_SCTL, (sctl & 0x0F0) | 0x300) };
+            // "Some PHYs react badly if SStatus is pounded immediately
+            // after resuming. Delay 200ms before debouncing."
+            ahci_msleep(200);
+            // SAFETY: same.
+            let sctl = unsafe { self.mmio.read32(off + PORT_SCTL) };
+            tries -= 1;
+            if sctl & 0xF0F == 0x300 || tries == 0 {
+                break;
+            }
+        }
+        let det = sata_link_debounce(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { self.mmio.read32(off + PORT_SSTS) },
+            SATA_DEB_TIMING_NORMAL,
+        );
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            let serr = self.mmio.read32(off + PORT_SERR);
+            self.mmio.write32(off + PORT_SERR, serr);
+        }
+        det == Some(SSTS_DET_PRESENT)
     }
 
     /// Write the PORT_CI doorbell for the slot mask `bit` and wait
@@ -615,6 +1174,10 @@ impl Ahci {
         //   +0x600  Data buffer   (512 bytes for IDENTIFY response)
         let scratch =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| AhciError::BarMapFailed)?;
+        // Without CAP.S64A the HBA sees only the low address dword.
+        if self.cap & CAP_S64A == 0 && scratch.dma_addr().raw() + 4096 > 1u64 << 32 {
+            return Err(AhciError::BarMapFailed);
+        }
         // Device-side handles (programmed into the HBA) and CPU-side
         // pointers (dereferenced here) are now separate types, so the two
         // cannot be confused: `DmaAddr` has no pointer conversion at all.
@@ -755,6 +1318,9 @@ impl Ahci {
             narf_time::Deadline::after_ms(5_000),
         );
         if errored || !done {
+            // The HBA may still own the command; never hand the page back
+            // to the allocator while it can be a DMA target.
+            core::mem::forget(scratch);
             return Err(AhciError::ResetTimeout);
         }
 
@@ -2174,6 +2740,18 @@ pub fn identify_lba48_capacity(id: &[u8; 512]) -> u64 {
     u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 
+/// User-addressable sectors (Linux `ata_id_n_sectors` for an LBA
+/// device): the LBA48 count when word 83 reports 48-bit support and it
+/// is non-zero, else the LBA28 count.
+pub fn identify_n_sectors(id: &[u8; 512]) -> u64 {
+    let lba48 = identify_lba48_capacity(id);
+    if lba48 != 0 {
+        lba48
+    } else {
+        identify_lba28_capacity(id) as u64
+    }
+}
+
 /// Extract the supported-feature bitmask from IDENTIFY DEVICE words
 /// 82 (byte 164) and 83 (byte 166). The upper byte of word 83 must
 /// read `0x40`/`0xC0` (validity marker); if it doesn't, word 83 is
@@ -2643,9 +3221,8 @@ impl narf_block::BlockDeviceSync for AhciBlockSync {
         512
     }
     fn capacity(&self) -> u64 {
-        // Stage-4 stub. IDENTIFY DEVICE words 100..103 = total
-        // user-addressable LBAs (48-bit); we don't cache that yet.
-        0
+        // Cached from IDENTIFY DEVICE at probe (0 = unknown).
+        probed_ahci().map(|a| a.capacity).unwrap_or(0)
     }
     fn read(
         &self,
@@ -2661,12 +3238,7 @@ impl narf_block::BlockDeviceSync for AhciBlockSync {
         // See `probed_ahci` / `crate::req_gate::ReqGate`.
         let ahci = probed_ahci().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
         let _gate = ReqGate::acquire(&ahci.req_gate);
-        let port = ahci
-            .ports
-            .iter()
-            .find(|p| p.kind == PortKind::Sata)
-            .map(|p| p.index)
-            .unwrap_or(0);
+        let port = ahci.block_port;
         // Chunk to what the one-page scratch can hold past its command
         // structures (SCRATCH_DATA_MAX); the registry contract allows
         // up to 8 sectors per call.
@@ -2698,12 +3270,7 @@ impl narf_block::BlockDeviceSync for AhciBlockSync {
         // Same reasoning (gate + chunking) as `read` above.
         let ahci = probed_ahci().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
         let _gate = ReqGate::acquire(&ahci.req_gate);
-        let port = ahci
-            .ports
-            .iter()
-            .find(|p| p.kind == PortKind::Sata)
-            .map(|p| p.index)
-            .unwrap_or(0);
+        let port = ahci.block_port;
         let max_sectors = (SCRATCH_DATA_MAX / 512) as u16;
         let mut done: u16 = 0;
         while done < n_blocks {
@@ -2965,15 +3532,34 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // BAR's physical address — `MmioRegion::virt` is the ioremap window for
     // above-map BARs and equals the PA only for identity-mapped ones.
     AHCI_MMIO_BASE.store(dev.mmio.virt as usize, Ordering::Release);
+    let mut dev = dev;
+    // Cache the disk size for `AhciBlockSync::capacity` (Linux
+    // `ata_id_n_sectors`: LBA48 words 100..103 when the device reports
+    // 48-bit support, else LBA28 words 60..61). IDENTIFY only reads.
+    if dev
+        .ports
+        .iter()
+        .any(|p| p.index == dev.block_port && p.kind == PortKind::Sata)
+    {
+        // SAFETY: the HBA is not installed yet, so we own it; the port
+        // classified as an ATA disk.
+        if let Ok(id) = unsafe { dev.identify_device(dev.block_port) } {
+            dev.capacity = identify_n_sectors(&id);
+        }
+    }
     // Negotiate IRQ delivery (MSI-X → MSI → INTx). Best-effort —
     // failure leaves the driver in sync-poll mode.
     try_setup_irq(&cap, &device);
     *CONTROLLER.lock() = Some(dev);
     // Register against the unified block-device registry.
-    narf_block::register_block_device(
-        "sata0",
-        alloc::sync::Arc::new(AhciBlockSync) as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>,
-    );
+    let parent =
+        alloc::sync::Arc::new(AhciBlockSync) as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>;
+    narf_block::register_block_device("sata0", parent.clone());
+    // Register `sata0p<n>` for each MBR / GPT partition, as the NVMe,
+    // virtio-blk and USB drivers do. Reads only; an unpartitioned disk
+    // just keeps the whole-disk `sata0`. Every partition goes through
+    // the registry's `PolicyGuard` like its parent.
+    let _ = narf_block::partition::scan_and_register_partitions(parent, "sata0");
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("sata0"),
         kind: narf_drivers::BoundKind::Block,
@@ -2984,6 +3570,19 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     Ok(())
 }
 
+/// Register the AHCI driver with the bus match table.
+///
+/// - Explicit `(vendor, device)` entries for the Intel ICH9 (QEMU q35)
+///   and ICH10 controllers.
+/// - The generic class entry Linux's `ahci_pci_tbl` ends with
+///   (`PCI_CLASS_STORAGE_SATA_AHCI`, `board_ahci`): any `01:06:01`
+///   controller, e.g. the AMD 600-series chipset `1022:43f6`. Linux has
+///   no per-ID quirk for that controller family (see
+///   [`AMD_600_SERIES_SATA_DEV`]), so the generic path is the Linux path.
+///
+/// Not mirrored: Linux's AMD entry for RAID-class (`01:04`) controllers
+/// in AHCI mode — the match table cannot express vendor + class, and a
+/// RAID-mode BIOS setting is not the configuration NARF targets.
 pub fn register_pci_driver() {
     for did in [AHCI_ICH9_DEV, AHCI_ICH10_DEV] {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
@@ -2995,6 +3594,15 @@ pub fn register_pci_driver() {
             probe,
         });
     }
+    narf_bus::register_pci_driver(narf_bus::PciMatch {
+        name: "ahci-class",
+        kind: narf_bus::MatchKind::ClassFull {
+            class: PCI_CLASS_STORAGE,
+            subclass: PCI_SUBCLASS_SATA,
+            prog_if: PCI_PROGIF_AHCI,
+        },
+        probe,
+    });
 }
 
 fn name_for(did: u16) -> &'static str {

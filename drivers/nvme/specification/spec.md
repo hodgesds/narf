@@ -36,9 +36,32 @@ multipath / fabrics (defer).
   physical I/O queues and exposes them via N rings; `block/` selects
   per-submission queue affinity.
 
+- Data pointers (`imp::prp`, mirroring Linux `nvme_pci_setup_data_prp`):
+  `setup_prps(addr, len, lists, list_dma) -> Result<PrpPair, PrpError>` builds
+  PRP1 / PRP2 / a chained PRP list for a physically contiguous buffer at any
+  dword-aligned offset; `prp_list_pages_needed`, `max_transfer_bytes(mdts,
+  mpsmin)` (MDTS in CAP.MPSMIN units, clamped to `NVME_HOST_MAX_TRANSFER` =
+  2 MiB), `host_page_supported(mpsmin)` and `decode_namespace_format(id_ns)`
+  (FLBAS index incl. bits 6:5, LBA size 512..=4096, metadata ⇒ unusable).
+- `Controller::max_transfer_bytes()`, `Controller::is_dead()`,
+  `Controller::nvm_io_at(opcode, lba, n_blocks, buf, offset)`;
+  `read_lba` / `write_lba` accept any contiguous buffer up to the max
+  transfer. `IdentifyController::mdts`, `NvmeCaps::to` +
+  `ready_timeout_ms()` (Linux `(CAP.TO + 1) * 500 ms`, 5 s floor).
+- New `NvmeError` variants: `UnsupportedPageSize` (CAP.MPSMIN > 4 KiB, bring-up
+  refused as Linux `nvme_enable_ctrl` does), `BadTransfer`,
+  `ExceedsMaxTransfer`, `ControllerDead` (an I/O command timed out; later I/O
+  refused), `NamespaceUnusable`.
+- `NvmeBlockSync` / `NvmeBlockDevice` split a request into commands of at
+  most `min(max_transfer, 128 KiB scratch)` / `max_transfer` bytes, in units of
+  the namespace's LBA size.
+
 ## 4. Invariants & safety properties
 
 - PRP / SGL lists validated against the DMA buffer's bounds.
+- No DMA buffer a command may still reference is freed: I/O uses persistent
+  scratch and PRP-list pages, a timed-out I/O marks the controller dead, and a
+  timed-out admin passthrough leaks its pages.
 - A completion cannot be processed before its submission entry is valid
   (paired ordering).
 - The admin queue is never used on the I/O fast path.

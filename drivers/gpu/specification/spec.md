@@ -4195,8 +4195,10 @@ after `init_hw` and the clock start (`ClockManager::link_rate_floor`), then
 selects with `select_dp_on` against it. `check_dp_link(aux)`,
 `retrain(tables, aux)` (`dp_handle_link_loss`: audio, blank, link off,
 same-setting training, unblank; the front end keeps scanning out; failure
-leaves `At(Step::Link)` for `disable`) and `disable_unplugged(tables)` (no
-AUX/DDC; resumes an interrupted stop). `amdgpu_navi22_display::Display`
+leaves `At(Step::Link)` for `disable`) and `disable_unplugged(tables, ddc)` (no
+DPCD transaction; an HDMI SCDC sink still gets `link_set_dpms_off`'s
+unchecked legacy TMDS_Config write via `hdmi::write_scdc_legacy`; resumes an
+interrupted stop). `amdgpu_navi22_display::Display`
 retains each connector's verified link keyed by its receiver caps
 (`verified_link`, `set_verified_link`), and adds `hpd_sense(index)` and
 `aux_timeout(index, us)`. `ColdBoot::{display_hpd_senses(),
