@@ -152,3 +152,21 @@ kernel_test_in!(
     "drivers/gpu/navi48_boot",
     navi48_boot_order_failure_and_cancellation
 );
+
+/// The driver keeps half of a small BAR's free VRAM, but never more than
+/// 512 MiB, so a BAR showing all of VRAM gives clients nearly all of it.
+fn navi48_client_vram_keeps_a_bounded_driver_reserve() -> TestResult {
+    const MIB: u64 = 1 << 20;
+    if driver_reserve(150 * MIB) != 75 * MIB
+        || driver_reserve(1024 * MIB) != 512 * MIB
+        || driver_reserve(15 << 30) != 512 * MIB
+        || driver_reserve(0) != 0
+    {
+        return TestResult::Fail("driver VRAM reserve");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48_boot",
+    navi48_client_vram_keeps_a_bounded_driver_reserve
+);

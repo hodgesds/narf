@@ -484,6 +484,13 @@ pub struct ColdBoot {
     /// The inventory's VRAM past the BAR, all of it for clients.
     unmapped_vram: Option<crate::amdgpu_vram::UnmappedPool>,
 }
+/// What the driver keeps of `available` free CPU-visible VRAM for its own
+/// later owners (scanout surfaces, display and queue memory): half of a
+/// small BAR's worth, at most 512 MiB — so a resizable BAR that shows all
+/// of VRAM hands nearly all of it to clients, not half.
+fn driver_reserve(available: u64) -> u64 {
+    (available / 2).min(512 << 20)
+}
 impl ColdBoot {
     /// # Safety
     /// Caller owns a physical Navi48 GPU, permanent mappings and a pool made
@@ -875,9 +882,10 @@ impl ColdBoot {
         unsafe { sdma.prove_interrupts(gmc).await }
     }
     /// Board power limits and GFX level of the configured SMU, after boot.
-    /// Give clients of this card's DRM node a VRAM heap: half the
-    /// CPU-visible VRAM the driver's pool still has free after boot,
-    /// 2 MiB-aligned and at least 64 MiB, as a pool of its own, so with no
+    /// Give clients of this card's DRM node a VRAM heap: the CPU-visible
+    /// VRAM the driver's pool still has free after boot, less what the
+    /// driver keeps for its own later owners (`driver_reserve`), 2 MiB-
+    /// aligned and at least 64 MiB, as a pool of its own, so with no
     /// eviction they can never take what the driver's owners need. Entries
     /// address it as the GMC's framebuffer geometry translates it.
     /// Returns the heap's size.
@@ -894,15 +902,19 @@ impl ColdBoot {
             .ok_or(Error::Invalid)?
             .display_context(regs)
             .map_err(Error::Gmc)?;
-        let size = (hw.pool.available() / 2) & !(ALIGN - 1);
-        if size < 64 << 20 {
-            return Err(Error::Allocation);
-        }
+        let available = hw.pool.available();
         let card = Self::drm_card().ok_or(Error::Invalid)?;
-        let mut chunk = hw
-            .pool
-            .reserve_aligned(size, ALIGN)
-            .map_err(|_| Error::Allocation)?;
+        let mut size = (available - driver_reserve(available)) & !(ALIGN - 1);
+        // Free space need not be one run; settle for the largest that is.
+        let mut chunk = loop {
+            if size < 64 << 20 {
+                return Err(Error::Allocation);
+            }
+            match hw.pool.reserve_aligned(size, ALIGN) {
+                Ok(chunk) => break chunk,
+                Err(_) => size = (size / 2) & !(ALIGN - 1),
+            }
+        };
         // SAFETY: the reservation is this heap's alone, inside the owned,
         // CPU-mapped VRAM range the boot inventory produced.
         let heap = unsafe { Pool::from_owned_range(chunk.mapping(), chunk.address()) }

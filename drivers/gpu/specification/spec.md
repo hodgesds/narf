@@ -2701,9 +2701,11 @@ VMID0 live (`State::vmid0_ready`); failure quarantines the owner. The cold
 boot's memory-translation stage runs it right after `initialize`, before any
 queue exists.
 
-After boot, the platform calls `ColdBoot::publish_client_vram`: half the
-CPU-visible VRAM the driver's pool still has free (2 MiB-aligned, at least
-64 MiB) becomes a separate pool, registered as the Navi48 DRM card's
+After boot, the platform calls `ColdBoot::publish_client_vram`: the
+CPU-visible VRAM the driver's pool still has free, less a driver reserve of
+half of it capped at 512 MiB (so a resizable BAR's VRAM goes nearly all to
+clients), 2 MiB-aligned, halved until one free run holds it, at least
+64 MiB, becomes a separate pool, registered as the Navi48 DRM card's
 `VramHeap` with the GMC's framebuffer geometry. The slice never returns to
 the driver's pool, so clients without eviction cannot starve its owners.
 
