@@ -93,6 +93,14 @@ fn optional(source: Source, result: Result<Vec<u8>, Error>) -> Result<Option<Vec
     }
 }
 impl Firmware {
+    /// The validated bytes of one image; `None` only for an absent MEC2.
+    pub(crate) fn source_bytes(&self, source: Source) -> Option<&[u8]> {
+        self.bytes
+            .iter()
+            .zip(Source::ORDER)
+            .find(|(_, s)| *s == source)
+            .and_then(|(bytes, _)| bytes.as_deref())
+    }
     pub(crate) fn dmcub_bytes(&self) -> Result<&[u8], Error> {
         self.bytes
             .iter()

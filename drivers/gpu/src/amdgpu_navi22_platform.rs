@@ -124,6 +124,10 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
     }
     let authority = amdgpu::pci_authority().ok_or(Error::Authority)?;
     let device = amdgpu::pci_device().ok_or(Error::Authority)?;
+    // pdev->revision (cfg 0x08), the amdgpu.ids key with the device id.
+    if let Ok(class_rev) = narf_bus::pci::read_config32(&authority, &device, 0x08) {
+        crate::amdgpu_info::publish_navi22_pci_revision(class_rev as u8);
+    }
     let identity = crate::amdgpu_power_navi22::Identity::read(&device, &authority)
         .map_err(|error| Error::Firmware(boot::Error::Power(error)))?;
     let registry: Cap<narf_firmware::FirmwareRegistry, Read> =
@@ -213,7 +217,18 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
 /// Continue to satisfy `prepare`'s exclusive hardware ownership contract.
 pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     let mut owner = OWNER.lock().await;
-    owner.as_mut().ok_or(boot::Error::Invalid)?.run().await
+    let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
+    let report = boot.run().await?;
+    // AMDGPU_INFO_FW_VERSION and DPM clocks describe what actually loaded.
+    if let Some(firmware) = boot.uapi_versions() {
+        crate::amdgpu_info::publish_navi22_boot(crate::amdgpu_info_navi22::Boot {
+            firmware,
+            smc: report.smu.firmware,
+            gfx_mhz: report.power_status.map(|p| (p.gfx_min_mhz, p.gfx_max_mhz)),
+            queues_verified: report.queues.is_some(),
+        });
+    }
+    Ok(report)
 }
 
 /// IH dispatch endpoint of the retained owner (see amdgpu_ih_navi22).

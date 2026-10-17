@@ -77,6 +77,34 @@ GC version rejects its `DEV_INFO`. This identifies the device; acceleration
 continues to report unavailable. Navi 22 firmware, GMC/GFX10 execution and
 DCN3.0 display bring-up are not enabled by this probe path.
 
+A bound Navi 22's `AMDGPU_INFO` replies come from `amdgpu_info_navi22`
+(`query`, `query_with(snapshot, Submission, query, payload)`), which mirrors
+`amdgpu_kms.c` for this ASIC: DEV_INFO (`chip_rev`/`external_rev = rev + 0x32`,
+`pci_rev`, harvested CU/AO bitmaps, RB and TCC masks, CE RAM, DPM GFXCLK
+range), HW_IP_INFO with IP-block versions (GFX/compute 10.0, SDMA 5.2,
+VCN/JPEG 3.0) plus discovery versions and Linux IB alignments, HW_IP_COUNT,
+FW_VERSION from the loaded file headers and `GetSmuVersion`, READ_MMR_REG for
+GB_ADDR_CONFIG (0x263e; other offsets EFAULT) and MEMORY/VRAM_GTT with the
+8 MiB VM reservation. `Snapshot::navi22: Published { topology, pci_revision,
+boot }` carries the inputs, published by `amdgpu_info::publish_navi22_topology`
+(cold-boot `Stage::ReadTopology`, appended after `FenceInterrupts`),
+`publish_navi22_pci_revision` (platform prepare) and `publish_navi22_boot`
+(after a successful cold boot, from `ColdBoot::uapi_versions` and the
+report). Unpublished inputs leave the corresponding fields zero.
+`amdgpu_info_navi22::SUBMISSION` is the single switch for ACCEL_WORKING,
+`available_rings`, HW_IP_COUNT and GANG_SUBMIT; it is `NotWired`, and even
+when wired requires `Boot::queues_verified`.
+
+`unsafe amdgpu_gfx10_topology::read(gpu, pci_cap)` requires exclusive GRBM
+selector ownership with RLC booted and GFX powered. It samples the NBIO
+revision strap, GB_ADDR_CONFIG, per-SE/SA fused and user RB/WGP disables and
+the TCC disables, restores SE/SA broadcast within one capability operation,
+and `derive(Limits, &Sample)` reproduces `gfx_v10_0_setup_rb`,
+`gfx_v10_0_get_cu_info` and `gfx_v10_0_get_tcc_info`. A zero or non-256 B
+interleave GB_ADDR_CONFIG, zero CUs/RBs, or GC dimensions beyond the GFX10
+DRM layout are refused; only device loss or revoked authority fails the
+cold-boot stage.
+
 ### Navi 48 PCIe probe (RX 9070 XT)
 
 The next discrete target is Navi48, selected from the September 2026

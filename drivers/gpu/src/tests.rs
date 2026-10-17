@@ -8364,6 +8364,7 @@ fn smoke_amdgpu_discrete_is_not_an_apu() -> TestResult {
         is_apu: false,
         gc: Some(gc),
         ip_blocks: alloc::vec![ip(HW_ID_GC, 10, 3, 2)],
+        navi22: Default::default(),
     };
 
     // VRAM_GTT reports both, and they differ.
@@ -8373,8 +8374,9 @@ fn smoke_amdgpu_discrete_is_not_an_apu() -> TestResult {
     };
     let vram_size = u64::from_le_bytes(vg[0..8].try_into().unwrap());
     let visible = u64::from_le_bytes(vg[8..16].try_into().unwrap());
-    if vram_size != VRAM {
-        return TestResult::Fail("VRAM_GTT must report the real VRAM size");
+    // Linux reports usable VRAM: real minus pins minus AMDGPU_VM_RESERVED_VRAM.
+    if vram_size != VRAM - (8 << 20) {
+        return TestResult::Fail("VRAM_GTT must report the real VRAM size less the VM reserve");
     }
     if visible != VISIBLE {
         return TestResult::Fail("VRAM_GTT's cpu-accessible size is the aperture, not VRAM");
@@ -8414,7 +8416,10 @@ fn smoke_amdgpu_discrete_is_not_an_apu() -> TestResult {
 
     // The same snapshot as an APU does claim it, so the flag follows the
     // part rather than having been deleted.
+    // Navi 22 cannot be an APU, so the APU twin is a Phoenix.
     let apu = Snapshot {
+        did: 0x15BF,
+        family: Family::Phoenix,
         visible_vram_size: VRAM,
         is_apu: true,
         ..discrete.clone()
@@ -9259,6 +9264,7 @@ fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
         is_apu: true,
         gc: Some(gc),
         ip_blocks: alloc::vec![ip(HW_ID_GC, 11, 0, 1), ip(HW_ID_SDMA0, 6, 0, 1)],
+        navi22: Default::default(),
     };
 
     let decode = |bytes: &[u8]| -> u::DrmAmdgpuInfoDevice {

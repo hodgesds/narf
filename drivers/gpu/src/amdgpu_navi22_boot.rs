@@ -27,6 +27,7 @@ pub enum Error {
     Queues(crate::amdgpu_cp_navi22::Error),
     Reset(crate::amdgpu_reset_navi22::Error),
     Interrupts(crate::amdgpu_ih_navi22::Error),
+    Topology(crate::amdgpu_gfx10_topology::Error),
 }
 /// All files are validated and copied before the first device operation.
 #[derive(Debug)]
@@ -38,6 +39,25 @@ pub struct Firmware {
     dmub: Option<crate::amdgpu_dmub_navi22::Prepared>,
 }
 impl Firmware {
+    /// The versions `AMDGPU_INFO_FW_VERSION` reports for this validated set
+    /// (Linux takes them from the requested files' headers, not the device).
+    pub fn uapi_versions(&self) -> Option<crate::amdgpu_info_navi22::Firmware> {
+        use crate::amdgpu_gfx_firmware::Source;
+        let g = |source| self.graphics.source_bytes(source);
+        crate::amdgpu_info_navi22::Firmware::parse(&crate::amdgpu_info_navi22::Files {
+            me: g(Source::Me)?,
+            pfp: g(Source::Pfp)?,
+            ce: g(Source::Ce)?,
+            mec: g(Source::Mec)?,
+            mec2: g(Source::Mec2),
+            rlc: g(Source::Rlc)?,
+            sdma: g(Source::Sdma)?,
+            sos: self.sos.bytes(),
+            vcn: g(Source::Vcn)?,
+            dmcub: g(Source::Dmcub)?,
+        })
+        .ok()
+    }
     pub fn open(
         gpu: &AmdGpu,
         registry: &Cap<narf_firmware::FirmwareRegistry, Read>,
@@ -107,8 +127,9 @@ pub enum Stage {
     SdmaQueues,
     IbTests,
     FenceInterrupts,
+    ReadTopology,
 }
-const STAGES: [Stage; 25] = [
+const STAGES: [Stage; 26] = [
     Stage::ResetOnInit,
     Stage::MemoryTraining,
     Stage::Sos,
@@ -138,6 +159,10 @@ const STAGES: [Stage; 25] = [
     Stage::IbTests,
     // Last: arms EOP/trap interrupts and routes them to fence waiters.
     Stage::FenceInterrupts,
+    // gfx_v10_0_constants_init's setup_rb/get_cu_info/get_tcc_info reads, for
+    // AMDGPU_INFO. Appended: RLC is booted, GFX powered and the idle kernel
+    // queues never touch GRBM indexing after GfxSetup.
+    Stage::ReadTopology,
 ];
 /// INT_CONTEXT of the boot SDMA0 TRAP round trip.
 const TRAP_CONTEXT: u32 = 0x0675_0022;
@@ -521,6 +546,27 @@ impl Backend for Hardware {
                         .map_err(Error::Dmub)?;
                 }
             }
+            Stage::ReadTopology => {
+                // SAFETY: firmware/RLC/power are up; this owner holds GRBM
+                // indexing and GC exclusively and no queue has started.
+                match unsafe { crate::amdgpu_gfx10_topology::read(&self.gpu, &self.authority) } {
+                    Ok(topology) => crate::amdgpu_info::publish_navi22_topology(topology),
+                    Err(
+                        error @ (crate::amdgpu_gfx10_topology::Error::DeviceGone
+                        | crate::amdgpu_gfx10_topology::Error::Revoked),
+                    ) => return Err(Error::Topology(error)),
+                    // Userspace identity only: the kernel queues do not
+                    // depend on it, so an implausible sample is reported and
+                    // DEV_INFO keeps its unknown-harvest zeros.
+                    Err(error) => {
+                        use core::fmt::Write;
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "amdgpu: navi22 topology unavailable: {error:?}"
+                        );
+                    }
+                }
+            }
             Stage::SdmaTest => {
                 if let Some(sdma) = self.sdma.as_mut() {
                     // SAFETY: firmware, protected power and both hubs are ready.
@@ -643,7 +689,8 @@ fn snapshot(gpu: &AmdGpu) -> Result<AmdGpu, Error> {
         chip: gpu.chip,
         vram: gpu.vram,
         ip_blocks: blocks,
-        gc_info: None,
+        // Immutable discovery maxima, needed to bound the topology sample.
+        gc_info: gpu.gc_info,
         vbios: None,
         mode: None,
         fw_loaded: false,
@@ -906,6 +953,10 @@ impl ColdBoot {
             .training
             .as_ref()
             .and_then(gddr6::Trainer::training_data)
+    }
+    /// See [`Firmware::uapi_versions`]; the set this owner loads.
+    pub fn uapi_versions(&self) -> Option<crate::amdgpu_info_navi22::Firmware> {
+        self.sequence.backend.firmware.uapi_versions()
     }
     pub fn state(&self) -> State {
         self.sequence.state
