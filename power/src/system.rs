@@ -43,6 +43,8 @@ const CF9_HARD_RESET: u8 = 0x06;
 /// state we can't recover from).
 #[cfg(target_arch = "x86_64")]
 pub fn reboot() -> ! {
+    // Final persistent-log flush before the platform resets.
+    narf_console::run_persist_hook(None);
     // SAFETY: both reboot mechanisms hard-reset the platform —
     // they can't safely return.
     // SAFETY: Valid memory or trusted environment
@@ -70,6 +72,7 @@ pub fn reboot() -> ! {
 /// Never returns on success.
 #[cfg(target_arch = "x86_64")]
 pub fn power_off() -> ! {
+    narf_console::run_persist_hook(None);
     let (slp_typ_a, slp_typ_b) = select_s5_sleep_types(narf_aml::evaluate_s5());
     // SAFETY: enters S5 — the platform powers off; this call
     // is documented to never return.
@@ -88,6 +91,7 @@ pub fn power_off() -> ! {
 /// aarch64 reboot via PSCI SYSTEM_RESET. Returns `!`.
 #[cfg(target_arch = "aarch64")]
 pub fn reboot() -> ! {
+    narf_console::run_persist_hook(None);
     // QEMU/KVM use HVC while bare-metal firmware commonly uses SMC. The
     // architecture PSCI layer owns that selection and the SMCCC clobber set.
     let _ = narf_arch::aarch64::psci::system_reset();
@@ -97,6 +101,7 @@ pub fn reboot() -> ! {
 /// aarch64 power-off via PSCI SYSTEM_OFF.
 #[cfg(target_arch = "aarch64")]
 pub fn power_off() -> ! {
+    narf_console::run_persist_hook(None);
     let _ = narf_arch::aarch64::psci::system_off();
     narf_arch::halt_forever();
 }

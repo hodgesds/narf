@@ -24,6 +24,8 @@ narf-io           = { path = "../../../io" }
 narf-time         = { path = "../../../time" }
 narf-init         = { path = "../../../init" }
 narf-scheduler    = { path = "../../../scheduler" }
+narf-console      = { path = "../../../console" }
+narf-boot         = { path = "../../../boot" }
 narf-kernel-test  = { path = "../../../verification/kernel-test" }
 
 [lints]

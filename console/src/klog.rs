@@ -878,6 +878,124 @@ pub fn snapshot() -> Vec<u8> {
     text_since(0)
 }
 
+/// One chunk of stored records rendered for an external log sink.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Export {
+    /// `[sssss.uuuuuu] text\n` per record (the `dmesg` default format).
+    pub text: Vec<u8>,
+    /// First record NOT included: pass it back to continue without
+    /// duplicating or skipping a stored record.
+    pub next_seq: u64,
+    /// Records from the requested `seq` already overwritten by the ring.
+    pub lost: u64,
+}
+
+/// Upper bound of the `[sssss.uuuuuu] ` prefix [`export_since`] renders.
+const EXPORT_PREFIX_MAX: usize = 32;
+
+/// Render records from `seq` on, stopping before the text would exceed
+/// `max_bytes` (a single record longer than that is still exported alone, so
+/// progress is guaranteed). Allocates outside the store lock, like
+/// [`text_since`]. With `wait == false` the store lock is only tried, never
+/// spun on: the fatal path must not deadlock on a CPU that died holding it.
+/// `None` means the store was busy (or re-entered from this CPU).
+pub fn export_since(seq: u64, max_bytes: usize, wait: bool) -> Option<Export> {
+    let with = |f: &mut dyn FnMut(&mut Store)| -> bool {
+        let cpu = narf_lib::percpu::current_cpu();
+        if IN_RECORD.load(Ordering::Acquire) == cpu {
+            return false;
+        }
+        let g = if wait {
+            Some(RING.lock())
+        } else {
+            RING.try_lock()
+        };
+        let Some(mut g) = g else {
+            return false;
+        };
+        IN_RECORD.store(cpu, Ordering::Release);
+        f(&mut g);
+        IN_RECORD.store(usize::MAX, Ordering::Release);
+        true
+    };
+    for _ in 0..4 {
+        // Pass 1: size the chunk (an upper bound per prefix).
+        let mut plan = (0u64, 0u64, 0usize);
+        if !with(&mut |s| {
+            let start = seq.max(s.first_seq);
+            let mut end = start;
+            let mut need = 0usize;
+            while end < s.next_seq {
+                let n = s.desc(end).len as usize + EXPORT_PREFIX_MAX + 1;
+                if end > start && need + n > max_bytes {
+                    break;
+                }
+                need += n;
+                end += 1;
+            }
+            plan = (start, end, need);
+        }) {
+            return None;
+        }
+        let (start, end, need) = plan;
+        let mut out = alloc::vec![0u8; need];
+        let mut filled = None;
+        if !with(&mut |s| {
+            // The ring may have moved between passes; retry on eviction.
+            if s.first_seq > start || s.next_seq < end {
+                return;
+            }
+            let mut n = 0;
+            for q in start..end {
+                let d = s.desc(q);
+                let mut w = SliceWriter {
+                    buf: &mut out[n..],
+                    len: 0,
+                };
+                let secs = d.ts_nsec / 1_000_000_000;
+                let usecs = (d.ts_nsec % 1_000_000_000) / 1_000;
+                let _ = core::fmt::Write::write_fmt(&mut w, format_args!("[{secs:5}.{usecs:06}] "));
+                n += w.len;
+                let t = s.rec_text(&d);
+                if n + t.len() + 1 > out.len() {
+                    return;
+                }
+                out[n..n + t.len()].copy_from_slice(t);
+                out[n + t.len()] = b'\n';
+                n += t.len() + 1;
+            }
+            filled = Some(n);
+        }) {
+            return None;
+        }
+        if let Some(n) = filled {
+            out.truncate(n);
+            return Some(Export {
+                text: out,
+                next_seq: end,
+                lost: start.saturating_sub(seq),
+            });
+        }
+    }
+    None
+}
+
+/// Bounded `fmt::Write` into a byte slice (silently truncating).
+struct SliceWriter<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl core::fmt::Write for SliceWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let room = self.buf.len().saturating_sub(self.len);
+        let n = s.len().min(room);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
 /// Test-only: empty the store and every cursor.
 #[doc(hidden)]
 pub fn __reset_for_test() {
