@@ -164,6 +164,7 @@ pub mod amdgpu_dcn30_clk;
 pub mod amdgpu_dcn30_cursor;
 pub mod amdgpu_dcn30_ddc;
 pub mod amdgpu_dcn30_dp;
+pub mod amdgpu_dcn30_dp_link;
 pub mod amdgpu_dcn30_flip;
 pub mod amdgpu_dcn30_hdmi;
 pub mod amdgpu_dcn30_hubbub;

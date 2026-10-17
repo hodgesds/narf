@@ -261,3 +261,61 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     navi22_display_admission_reports_only_what_dml30_proved
 );
+
+/// DP sinks are lightable with the offers their link admits (the whole
+/// sink, DPCD included, reaches the offer function); HDMI routes first,
+/// then the first DP sink; DRM may route any board port.
+fn navi22_kms_dp_sinks_offer_their_link_modes() -> TestResult {
+    let mut r = reports(false, 1);
+    let dp = |edid| {
+        Detection::Connected(Sink {
+            edid: vec![edid; 128],
+            preferred: None,
+            hdmi: false,
+            dpcd: Some([0x12, 0x14, 0x84, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        })
+    };
+    r[1].detection = dp(5);
+    r[2].detection = dp(6);
+    let mut k = Kms::new();
+    // Only a DP sink with receiver caps gets modes; the link bounds them.
+    k.reconcile_sinks(&r, |_, sink| {
+        Some(if sink.dpcd.is_some() {
+            vec![xga()]
+        } else {
+            vec![]
+        })
+    });
+    k.assign_route();
+    if !k.connectors[1].lightable() || k.connectors[1].modes != [xga()] || k.crtc.route != Some(1) {
+        return TestResult::Fail("DP sink not routed with its link modes");
+    }
+    let wire = crate::amdgpu_navi48_kms::timing_wire(&xga());
+    if k.find_mode(None, &wire) != Some(xga())
+        || k.find_mode(None, &crate::amdgpu_navi48_kms::timing_wire(&hd()))
+            .is_some()
+    {
+        return TestResult::Fail("DP offers");
+    }
+    // An HDMI sink is preferred when both are connected.
+    let mut both = r.clone();
+    both[3] = reports(true, 1).pop().unwrap();
+    let mut k = Kms::new();
+    k.reconcile_sinks(&both, |_, _| Some(vec![hd(), xga()]));
+    k.assign_route();
+    if k.crtc.route != Some(3) {
+        return TestResult::Fail("HDMI not preferred");
+    }
+    // A sink without admitted modes on its link is not lightable.
+    let mut k = Kms::new();
+    k.reconcile_sinks(&r, |_, _| Some(vec![]));
+    k.assign_route();
+    if k.connectors[1].lightable() || k.crtc.route.is_some() {
+        return TestResult::Fail("DP sink lit without modes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_kms_dp_sinks_offer_their_link_modes
+);

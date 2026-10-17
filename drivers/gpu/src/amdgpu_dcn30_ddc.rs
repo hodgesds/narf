@@ -1484,6 +1484,12 @@ pub(crate) fn hpd_irq_set<I: Io>(
         engine.hpd_interrupt(index, enable)
     }
 }
+/// `try_to_configure_aux_timeout` on a bound line: the LTTPR or default
+/// AUX reply timeout, in microseconds.
+pub(crate) fn aux_timeout<I: Io>(engine: &mut Engine<I>, line: u8, us: u32) -> Result<(), Error> {
+    engine.check(line)?;
+    engine.configure_timeout(line, us)
+}
 pub(crate) async fn dpcd<I: Io>(
     engine: &mut Engine<I>,
     line: u8,
