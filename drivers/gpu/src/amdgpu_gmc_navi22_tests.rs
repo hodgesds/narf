@@ -85,6 +85,8 @@ pub(super) fn fixture_with(len: u64, protected: &[core::ops::Range<u64>]) -> (Po
     let layout = Layout {
         bases: [0x10000, 0x20000],
         nbio: 0x30000,
+        pcie: 0x40000,
+        hdp: 0x50000,
     };
     let mut registers = BTreeMap::new();
     for (base, r) in layout.bases.into_iter().zip([GFX, MM]) {
@@ -117,7 +119,8 @@ pub(super) fn fixture_with(len: u64, protected: &[core::ops::Range<u64>]) -> (Po
 fn gmc_navi22_uses_vram_physical_ptes_and_bounds_vmid0() -> TestResult {
     let (pool, mut engine) = fixture();
     let aperture = run(engine.initialize()).unwrap();
-    if aperture.start != 0xb_0000_0000
+    // amdgpu_gmc_gart_location BEST_FIT: 32 GiB below the FB fits the GART.
+    if aperture.start != 0
         || aperture.destination != aperture.source + 4096
         || (0..4)
             .map(|i| engine.io.word(BAR + i * 4))
@@ -181,7 +184,7 @@ fn gmc_navi22_preflight_refuses_active_hubs_bad_geometry_and_revocation() -> Tes
                 engine
                     .io
                     .registers
-                    .insert(0x10000 + u64::from(GFX.ctx) * 4, 1);
+                    .insert(0x10000 + u64::from(GFX.ctx + 1) * 4, 1);
             }
             1 => {
                 engine
@@ -193,7 +196,7 @@ fn gmc_navi22_preflight_refuses_active_hubs_bad_geometry_and_revocation() -> Tes
                 engine
                     .io
                     .registers
-                    .insert(0x20000 + u64::from(MM.fb_top) * 4, 0xafe);
+                    .insert(0x20000 + u64::from(MM.fb_base) * 4, 0x801);
             }
             3 => {
                 engine
@@ -204,7 +207,7 @@ fn gmc_navi22_preflight_refuses_active_hubs_bad_geometry_and_revocation() -> Tes
             4 => {
                 engine.io.registers.insert(0x30000 + 0x12d * 4, 0);
             }
-            5 => engine.vram_size = 8 << 30,
+            5 => engine.vram_size = 0,
             _ => {
                 engine.authority.revoke();
             }
@@ -221,10 +224,11 @@ fn gmc_navi22_preflight_refuses_active_hubs_bad_geometry_and_revocation() -> Tes
         }
     }
     for (fields, size, address) in [
-        ([0x800, 0xaff, 0x100], 12 << 30, 0x7_ffff_f000),
-        ([0x800, 0xaff, 0x100], 12 << 30, 0x8_0000_4001),
-        ([0xffff00, 0xffffff, 0], 4 << 30, 0xffff_0000_0000),
-        ([0x800, 0xaff, 0xffff00], 12 << 30, 0x8_0000_4000),
+        ([0x800, 0x100], 12 << 30, 0x7_ffff_f000),
+        ([0x800, 0x100], 12 << 30, 0x8_0000_4001),
+        ([0xffff00, 0], 4 << 30, 0xffff_0000_0000),
+        ([0x800, 0xffff00], 12 << 30, 0x8_0000_4000),
+        ([0x800, 0x100], 0, 0x8_0000_4000),
     ] {
         if Geometry::new(fields, size, address).is_ok() {
             return TestResult::Fail("GMC bounds/overflow accepted");
@@ -235,6 +239,68 @@ fn gmc_navi22_preflight_refuses_active_hubs_bad_geometry_and_revocation() -> Tes
 kernel_test_in!(
     "drivers/gpu/gmc-navi22",
     gmc_navi22_preflight_refuses_active_hubs_bad_geometry_and_revocation
+);
+
+/// The host's Linux log for this RX 6750 XT: `VRAM: 12272M
+/// 0x8000000000-0x82FEFFFFFF`, `GART: 512M 0x0-0x1FFFFFFF`. A GART placed
+/// above the VRAM end would cross a 4 GiB boundary; GOP leaves VMID0 enabled
+/// and FB_LOCATION_TOP is not authoritative (Linux reads MEMSIZE).
+fn gmc_navi22_12272m_gop_handoff_places_gart_like_linux() -> TestResult {
+    const SIZE: u64 = 12272 << 20;
+    if gart_location(0x80_0000_0000, 0x80_0000_0000 + SIZE, GART_SIZE) != Some(0)
+        || gart_location(0, 8 << 30, GART_SIZE) != Some(0x7fff_0000_0000)
+    {
+        return TestResult::Fail("amdgpu_gmc_gart_location BEST_FIT placement");
+    }
+    let (_pool, mut engine) = fixture_sized(BYTES + (1 << 20) + 4096);
+    engine.vram_size = SIZE;
+    for (base, r) in engine.layout.bases.into_iter().zip([GFX, MM]) {
+        // GOP-lit card: VMID0 enabled, TOP from a different (stale) size.
+        engine.io.registers.insert(base + u64::from(r.ctx) * 4, 1);
+        engine
+            .io
+            .registers
+            .insert(base + u64::from(r.fb_top) * 4, 0x1234);
+    }
+    let Ok(aperture) = run(engine.initialize()) else {
+        return TestResult::Fail("GOP-enabled VMID0 or stale TOP refused");
+    };
+    if aperture.start != 0 {
+        return TestResult::Fail("boot aperture not at Linux's GART start");
+    }
+    for (base, r) in engine.layout.bases.into_iter().zip([GFX, MM]) {
+        // MC_VM_SYSTEM_APERTURE_HIGH covers the last byte of 12272 MiB.
+        if engine.io.registers[&(base + u64::from(r.sys_high) * 4)]
+            != ((0x8_0000_0000 + SIZE - 1) >> 18) as u32
+        {
+            return TestResult::Fail("system aperture not derived from MEMSIZE");
+        }
+    }
+    if engine
+        .io
+        .registers
+        .get(&(0x50000 + HDP_MISC_CNTL * 4))
+        .copied()
+        != Some(HDP_FLUSH_INVALIDATE_CACHE)
+        || engine
+            .io
+            .registers
+            .get(&(0x40000 + PCIE_DATA2 * 4))
+            .copied()
+            != Some(MAX_READ_REQUEST_MODE | (1 << 28))
+    {
+        return TestResult::Fail("hdp_v5_0/nbio_v2_3 init_registers skipped");
+    }
+    engine.prepare_gart().unwrap();
+    match run(engine.enable_gart()) {
+        Ok(info) if info.start == 0 && info.size == 512 << 20 => {}
+        _ => return TestResult::Fail("12272 MiB GART placement refused or moved"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi22",
+    gmc_navi22_12272m_gop_handoff_places_gart_like_linux
 );
 
 fn gmc_navi22_cancel_timeout_and_revoke_retain_translation_memory() -> TestResult {
@@ -287,7 +353,9 @@ fn gmc_navi22_cancel_timeout_and_revoke_retain_translation_memory() -> TestResul
     }
     let (pool, mut engine) = fixture();
     engine.io.revoke_on = Some((0x7f000, engine.authority));
-    if run(engine.initialize()) != Err(Error::Revoked) || engine.io.writes.len() != 1 {
+    // PCIE_CONFIG_CNTL index, re-index and data (nbio_v2_3_init_registers),
+    // then the first HDP flush, which revokes.
+    if run(engine.initialize()) != Err(Error::Revoked) || engine.io.writes.len() != 4 {
         return TestResult::Fail("revoked GMC programmed hubs");
     }
     drop(engine);
