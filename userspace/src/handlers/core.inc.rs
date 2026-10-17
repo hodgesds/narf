@@ -16380,7 +16380,19 @@ pub fn set_controlling_tty(
 /// `TIOCSCTTY`-on-console hook (installed in `boot_init`): record the boot
 /// console as the calling task's controlling terminal.
 fn console_tiocsctty() {
-    set_controlling_tty_console(current_task_id());
+    let task = current_task_id();
+    set_controlling_tty_console(task);
+    // `tiocsctty` -> `__proc_set_tty`: `tty->pgrp = task_pgrp(current)`.
+    // The new controlling session's process group becomes the console's
+    // foreground group. Without this the console kept whatever foreground
+    // group an earlier session left behind, so the getty that systemd made
+    // the console's controlling process (setsid + TIOCSCTTY, StandardInput=
+    // tty) was a *background* reader: its first read raised SIGTTIN, it
+    // stopped at "login:" and no keystroke ever reached it.
+    let pgrp = read_pgid(task);
+    if pgrp != 0 {
+        narf_filesystem::console_tty::set_fg_pgrp(pgrp);
+    }
 }
 
 /// `TIOCNOTTY`-on-console hook: detach the calling task's controlling tty.
