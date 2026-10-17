@@ -1292,6 +1292,45 @@ kernel_test_in!(
     smoke_abi_proc2_pathless_fd_links_name_the_file
 );
 
+// A descriptor number freed without close(2) — CLOEXEC at exec, close_range,
+// a CLONE_FILES sibling — used to keep its fd→path row, so the next file
+// installed at that number readlinked to the OLD file (a pipe end reading
+// `/dev/null`). Installing a file must start it with no inherited identity.
+fn smoke_abi_proc2_reused_fd_drops_stale_path() -> TestResult {
+    with_procfs(FAKE_TASK, "stalefd", &["stalefd"], 0, |base| {
+        let ev = match call(Syscall::Eventfd.raw(), a1(0, 0)) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("eventfd setup"),
+        };
+        // Free the slot the way exec's CLOEXEC sweep does: the table drops
+        // the file, the side table keeps a row.
+        crate::mqueue::register_fd_path(FAKE_TASK, ev, "/dev/null", None);
+        crate::fd::with_table(FAKE_TASK, |t| t.close(ev));
+        let mut pipefd = [0i32; 2];
+        if call(Syscall::Pipe2.raw(), a1(pipefd.as_mut_ptr() as u64, 0)) != Some(0) {
+            return Err("pipe2");
+        }
+        if pipefd[0] as u32 != ev {
+            return Err("pipe2 did not reuse the lowest free descriptor");
+        }
+        let link = alloc::format!("{}/{}/fd/{}\0", base, FAKE_TASK, ev);
+        let mut buf = [0u8; 64];
+        let n = match call_readlink(
+            link.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        ) {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("readlink of the reused fd failed"),
+        };
+        if !buf[..n].starts_with(b"pipe:[") {
+            return Err("a reused fd must not readlink to the previous file's path");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_reused_fd_drops_stale_path);
+
 fn smoke_abi_proc2_fdinfo_uses_live_fd_metadata() -> TestResult {
     with_procfs(FAKE_TASK, "fdinfoproc", &["fdinfoproc"], 0, |base| {
         let auth = bootstrap_mount_authority();
