@@ -23,6 +23,7 @@ fn report() -> Report {
         memory_aperture: None,
         sdma: None,
         dmub: None,
+        queues: None,
     }
 }
 struct Fake {
@@ -442,4 +443,27 @@ fn navi22_boot_preflight_and_real_backend_revocation() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi22-boot",
     navi22_boot_preflight_and_real_backend_revocation
+);
+fn navi22_boot_queue_preparation_requires_hubs_and_sdma() -> TestResult {
+    let pool = pool(16 << 20);
+    let authority = Cap::bootstrap();
+    let doorbells = crate::amdgpu_cp_navi22::tests::doorbells();
+    // SAFETY: bookkeeping-only constructor; no I/O happens in this test.
+    let mut boot = unsafe { ColdBoot::new(&gpu(), authority, &pool, firmware()) }.unwrap();
+    let available = pool.available();
+    if boot.prepare_queues(doorbells) != Err(Error::Invalid)
+        || boot.sequence.backend.queues.is_some()
+        || pool.available() != available
+    {
+        return TestResult::Fail("queues prepared without VMID0 hubs and SDMA proof");
+    }
+    boot.sequence.state = State::Running(Stage::Kiq);
+    if boot.prepare_queues(doorbells) != Err(Error::Busy) {
+        return TestResult::Fail("queues prepared during a run");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_boot_queue_preparation_requires_hubs_and_sdma
 );

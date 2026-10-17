@@ -176,6 +176,21 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         prepared.prepare_memory_hubs().map_err(Error::Firmware)?;
         prepared.prepare_sdma().map_err(Error::Firmware)?;
         prepared.prepare_dmub().map_err(Error::Firmware)?;
+        // Kernel queues are optional for the firmware/display path: without
+        // a usable BAR2 doorbell page the queue stages are skipped, visibly.
+        // SAFETY: boot-time exclusive PCI ownership; BAR2 is otherwise unused.
+        match unsafe { crate::amdgpu_cp_navi22::Doorbells::map_navi22(&device) } {
+            Ok(doorbells) => prepared
+                .prepare_queues(doorbells)
+                .map_err(Error::Firmware)?,
+            Err(error) => {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi22 kernel queues disabled: doorbells {error:?}"
+                );
+            }
+        }
         *owner = Some(prepared);
         Ok(Some(affected))
     })

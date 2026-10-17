@@ -22,6 +22,7 @@ pub enum Error {
     MemoryHubs(crate::amdgpu_gmc_navi22::Error),
     Sdma(crate::amdgpu_sdma_navi22::Error),
     Dmub(crate::amdgpu_dmub_navi22::Error),
+    Queues(crate::amdgpu_cp_navi22::Error),
 }
 /// All files are validated and copied before the first device operation.
 #[derive(Debug)]
@@ -91,8 +92,15 @@ pub enum Stage {
     MemoryHubs,
     SdmaTest,
     DmubStart,
+    Doorbells,
+    GfxSetup,
+    Kiq,
+    ComputeQueues,
+    GfxRing,
+    SdmaQueues,
+    IbTests,
 }
-const STAGES: [Stage; 14] = [
+const STAGES: [Stage; 21] = [
     Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
@@ -107,6 +115,14 @@ const STAGES: [Stage; 14] = [
     Stage::MemoryHubs,
     Stage::SdmaTest,
     Stage::DmubStart,
+    // gfx_v10_0_hw_init / cp_resume, sdma_v5_2_start, amdgpu_ib_ring_tests.
+    Stage::Doorbells,
+    Stage::GfxSetup,
+    Stage::Kiq,
+    Stage::ComputeQueues,
+    Stage::GfxRing,
+    Stage::SdmaQueues,
+    Stage::IbTests,
 ];
 /// Firmware/power observations, optional VMID0 and SDMA execution proof.
 /// This does not publish acceleration or initialize native display.
@@ -120,6 +136,8 @@ pub struct Report {
     pub memory_aperture: Option<crate::amdgpu_gmc_navi22::Aperture>,
     pub sdma: Option<crate::amdgpu_sdma_navi22::Proof>,
     pub dmub: Option<crate::amdgpu_dmub_navi22::Status>,
+    /// Kernel GFX/compute/SDMA ring and IB tests passed.
+    pub queues: Option<crate::amdgpu_cp_navi22::QueueProof>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -190,6 +208,59 @@ struct Hardware {
     gmc: Option<crate::amdgpu_gmc_navi22::Gmc>,
     sdma: Option<crate::amdgpu_sdma_navi22::Sdma>,
     dmub: Option<crate::amdgpu_dmub_navi22::Dmub>,
+    queues: Option<Queues>,
+}
+/// Kernel queue owners, retained through success, failure and cancellation.
+#[derive(Debug)]
+struct Queues {
+    doorbells: crate::amdgpu_cp_navi22::Doorbells,
+    gfx: crate::amdgpu_cp_navi22::Gfx,
+    compute: crate::amdgpu_kiq_navi22::Compute,
+    sdma: crate::amdgpu_sdma_navi22_queues::Sdma,
+}
+impl Queues {
+    // SAFETY contract for every call: ColdBoot exclusively owns the GPU,
+    // firmware/RLC are up, VMID0 is ready, clock gating and GFXOFF stay off,
+    // and stages run strictly in STAGES order without replay.
+    async fn step(
+        &mut self,
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        stage: Stage,
+    ) -> Result<(), crate::amdgpu_cp_navi22::Error> {
+        match stage {
+            // SAFETY: see above; the doorbell page belongs to this GPU's BAR2.
+            Stage::Doorbells => unsafe {
+                crate::amdgpu_cp_navi22::enable_doorbell_apertures(gpu, authority, self.doorbells)
+            },
+            // SAFETY: see above.
+            Stage::GfxSetup => unsafe { self.gfx.configure().await },
+            // SAFETY: see above; GFX setup completed in the previous stage.
+            Stage::Kiq => unsafe { self.compute.init_kiq().await },
+            // SAFETY: see above; the KIQ is live.
+            Stage::ComputeQueues => unsafe { self.compute.map_compute().await },
+            // SAFETY: see above; KIQ/KCQ precede the gfx ring as in cp_resume.
+            Stage::GfxRing => unsafe { self.gfx.start().await },
+            // SAFETY: see above; the SDMA0 proof ring finished and is idle.
+            Stage::SdmaQueues => unsafe { self.sdma.start().await },
+            Stage::IbTests => {
+                self.gfx.test_ib().await?;
+                self.compute.test_ib().await?;
+                self.sdma.test_ib().await
+            }
+            _ => Ok(()),
+        }
+    }
+    fn proof(&self) -> Option<crate::amdgpu_cp_navi22::QueueProof> {
+        (self.gfx.state() == crate::amdgpu_cp_navi22::GfxState::Verified
+            && self.compute.state() == crate::amdgpu_kiq_navi22::State::Verified
+            && self.sdma.state() == crate::amdgpu_sdma_navi22_queues::State::Verified)
+            .then(|| crate::amdgpu_cp_navi22::QueueProof {
+                gfx: self.gfx.proof(),
+                compute: self.compute.proof(),
+                sdma: self.sdma.proof(),
+            })
+    }
 }
 impl Backend for Hardware {
     fn progress(&mut self, stage: Stage, result: Option<Result<(), Error>>) {
@@ -346,6 +417,20 @@ impl Backend for Hardware {
                     .map_err(Error::Sdma)?;
                 }
             }
+            Stage::Doorbells
+            | Stage::GfxSetup
+            | Stage::Kiq
+            | Stage::ComputeQueues
+            | Stage::GfxRing
+            | Stage::SdmaQueues
+            | Stage::IbTests => {
+                if let Some(queues) = self.queues.as_mut() {
+                    queues
+                        .step(&self.gpu, self.authority, stage)
+                        .await
+                        .map_err(Error::Queues)?;
+                }
+            }
             Stage::MemoryHubs => {
                 if let Some(gmc) = self.gmc.as_mut() {
                     // SAFETY: firmware/RLC are ready, VRAM is trained, queues
@@ -375,6 +460,7 @@ impl Backend for Hardware {
                 .gmc
                 .as_ref()
                 .and_then(crate::amdgpu_gmc_navi22::Gmc::aperture),
+            queues: self.queues.as_ref().and_then(Queues::proof),
         })
     }
 }
@@ -444,6 +530,7 @@ impl ColdBoot {
                     gmc: None,
                     sdma: None,
                     dmub: None,
+                    queues: None,
                 },
                 state: State::Prepared,
             },
@@ -487,6 +574,7 @@ impl ColdBoot {
                     gmc: None,
                     sdma: None,
                     dmub: None,
+                    queues: None,
                 },
                 state: State::Prepared,
             },
@@ -539,6 +627,45 @@ impl ColdBoot {
             unsafe { crate::amdgpu_sdma_navi22::Sdma::new(&h.gpu, h.authority, &h.pool) }
                 .map_err(Error::Sdma)?,
         );
+        Ok(())
+    }
+    /// Reserve GFX ring, KIQ/compute and both production SDMA queues before
+    /// run. Memory hubs and the SDMA0 proof must already be prepared; no I/O.
+    pub fn prepare_queues(
+        &mut self,
+        doorbells: crate::amdgpu_cp_navi22::Doorbells,
+    ) -> Result<(), Error> {
+        if self.sequence.state != State::Prepared || self.sequence.backend.queues.is_some() {
+            return Err(Error::Busy);
+        }
+        let h = &mut self.sequence.backend;
+        if h.gmc.is_none() || h.sdma.is_none() {
+            return Err(Error::Invalid);
+        }
+        // SAFETY: forwarded whole-GPU/pool/BAR2 ownership; constructors only
+        // reserve VRAM. Stage order keeps the SDMA0 proof ahead of takeover.
+        let queues = unsafe {
+            Queues {
+                doorbells,
+                gfx: crate::amdgpu_cp_navi22::Gfx::new(&h.gpu, h.authority, &h.pool, doorbells)
+                    .map_err(Error::Queues)?,
+                compute: crate::amdgpu_kiq_navi22::Compute::new(
+                    &h.gpu,
+                    h.authority,
+                    &h.pool,
+                    doorbells,
+                )
+                .map_err(Error::Queues)?,
+                sdma: crate::amdgpu_sdma_navi22_queues::Sdma::new(
+                    &h.gpu,
+                    h.authority,
+                    &h.pool,
+                    doorbells,
+                )
+                .map_err(Error::Queues)?,
+            }
+        };
+        h.queues = Some(queues);
         Ok(())
     }
     /// Reserve DCN3.0 DMUB backing. Firmware preparation and memory hubs must
