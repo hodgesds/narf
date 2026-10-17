@@ -232,7 +232,7 @@ impl Drop for DriCardFile {
             // As drm_fb_helper restores the console on lastclose: a native
             // display a client switched off lights again for the console,
             // in the sink's preferred mode.
-            crate::amdgpu_navi48_platform::restore_displays();
+            crate::amdgpu_native_kms::restore_displays();
         }
     }
 }

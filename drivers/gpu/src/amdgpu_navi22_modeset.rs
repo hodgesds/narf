@@ -165,6 +165,74 @@ pub(crate) fn select(
     }
     Err(Error::NoMode)
 }
+/// The DCN30 admission of a lit sink, retained for KMS: the board SoC
+/// inputs and DCHUB reference clock it was computed with, the plan being
+/// scanned out, and every EDID timing the same checks admit (EDID order).
+#[derive(Clone, Debug)]
+pub struct Admitted {
+    pub soc: dml30::Soc,
+    pub refclk_khz: u32,
+    pub plan: dml30::Plan,
+    pub offered: Vec<Timing>,
+}
+
+/// The TMDS clock ceiling `select` applies to `sink`.
+fn tmds_ceiling(sink: &Sink) -> u32 {
+    let caps = crate::amdgpu_navi48_boot::hdmi_caps(&sink.edid);
+    if caps.vsdb_max_khz != 0 {
+        caps.vsdb_max_khz.min(MAX_TMDS_KHZ)
+    } else {
+        MAX_TMDS_KHZ
+    }
+}
+
+/// Every distinct EDID timing `select` could choose: inside the TMDS ceiling
+/// and admitted by the DCN30 mode math. This is what KMS offers; a DRM
+/// TEST_ONLY or SETCRTC is checked against it.
+pub(crate) fn offered(sink: &Sink, soc: &dml30::Soc, vco_khz: u32) -> Vec<Timing> {
+    let ceiling = tmds_ceiling(sink);
+    let mut out: Vec<Timing> = Vec::new();
+    for timing in crate::amdgpu_navi48_boot::edid_timings(&sink.edid) {
+        if timing.pixel_clock_khz > ceiling
+            || timing.pixel_clock_khz < 25_000
+            || out.contains(&timing)
+        {
+            continue;
+        }
+        if dml30::plan(&config(&timing, vco_khz), soc).is_ok() && out.try_reserve(1).is_ok() {
+            out.push(timing);
+        }
+    }
+    out
+}
+
+/// `select`, or exactly `want` when DRM asked for a timing: it must be one
+/// that `offered` admits, or the modeset fails before any device write.
+pub(crate) fn select_wanted(
+    sink: &Sink,
+    soc: &dml30::Soc,
+    vco_khz: u32,
+    want: Option<Timing>,
+) -> Result<(Timing, Option<[u8; 36]>, dml30::Plan), Error> {
+    use crate::amdgpu_navi48_boot as navi48;
+    let Some(want) = want else {
+        return select(sink, soc, vco_khz);
+    };
+    if !offered(sink, soc, vco_khz).contains(&want) {
+        return Err(Error::NoMode);
+    }
+    let plan = dml30::plan(&config(&want, vco_khz), soc).map_err(Error::Mode)?;
+    let caps = navi48::hdmi_caps(&sink.edid);
+    let avi = caps.hdmi.then(|| {
+        crate::amdgpu_dcn401_otg::avi_infoframe(
+            &want,
+            navi48::hdmi_avi(caps, &want),
+            navi48::limited_range(navi48::broadcast_rgb()),
+            false,
+        )
+    });
+    Ok((want, avi, plan))
+}
 fn pitch(timing: &Timing) -> u32 {
     (timing.h_active * 4).next_multiple_of(PITCH_ALIGN) / 4
 }
@@ -215,6 +283,10 @@ pub struct Pipeline {
     scanout: Option<Reservation>,
     state: State,
     output: Option<Output>,
+    /// KMS hooks (amdgpu_navi22_kms): the timing DRM asked for, and what
+    /// the DCN30 admission of the lit sink produced.
+    want: Option<Timing>,
+    admitted: Option<Admitted>,
 }
 impl core::fmt::Debug for Pipeline {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -286,6 +358,8 @@ impl Pipeline {
                 scanout: None,
                 state: State::At(Step::Prepared),
                 output: None,
+                want: None,
+                admitted: None,
             })
         }
     }
@@ -440,7 +514,13 @@ impl Pipeline {
         let (channels, width) =
             crate::amdgpu_dcn_inventory::vram_channels(vbios).map_err(Error::Inventory)?;
         let soc = dml30::Soc::from_board(&levels, channels, width, refclk).map_err(Error::Mode)?;
-        let (timing, avi, plan) = select(sink, &soc, levels.vco_khz)?;
+        let (timing, avi, plan) = select_wanted(sink, &soc, levels.vco_khz, self.want)?;
+        self.admitted = Some(Admitted {
+            soc,
+            refclk_khz: refclk,
+            plan,
+            offered: offered(sink, &soc, levels.vco_khz),
+        });
         if avi.is_none() {
             // A DVI sink: no data islands may be sent, which this owner's
             // HDMI attribute path always enables.
@@ -633,6 +713,45 @@ impl Pipeline {
         };
         self.output = None;
         result
+    }
+}
+
+/// KMS hooks (amdgpu_navi22_kms / amdgpu_navi22_scanout).
+impl Pipeline {
+    /// Ask `enable` for exactly this timing (None: the sink's preferred).
+    pub fn request(&mut self, timing: Option<Timing>) {
+        self.want = timing;
+    }
+    pub fn connector(&self) -> Connector {
+        self.connector
+    }
+    /// The admission of the lit (or last attempted) sink.
+    pub fn admitted(&self) -> Option<&Admitted> {
+        self.admitted.as_ref()
+    }
+    /// GPU address of the activation surface, while one is reserved.
+    pub fn scanout_address(&self) -> Option<u64> {
+        self.scanout.as_ref().map(Reservation::address)
+    }
+    /// CPU mapping of the activation surface, while one is reserved.
+    pub(crate) fn scanout_mapping(&self) -> Option<MmioRegion> {
+        self.scanout.as_ref().map(Reservation::mapping)
+    }
+    /// Return the activation surface to the pool after a successful stop.
+    ///
+    /// # Safety
+    /// `disable` returned Ok: the HUBP was blanked after its outstanding
+    /// requests retired and the OTG stopped, so no fetch reads the surface,
+    /// and no CPU view of it remains (`scanout_access::wait_retired`).
+    pub unsafe fn release_scanout(&mut self) -> Result<(), Error> {
+        if self.state != State::At(Step::Stopped) {
+            return Err(Error::Busy);
+        }
+        if let Some(mut reservation) = self.scanout.take() {
+            // SAFETY: the caller's proof that the display engine is idle.
+            unsafe { reservation.stopped() };
+        }
+        Ok(())
     }
 }
 
