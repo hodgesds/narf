@@ -31,6 +31,7 @@ pub enum Error {
     Interrupts(crate::amdgpu_ih_navi22::Error),
     Media(crate::amdgpu_vcn_navi22::Error),
     Topology(crate::amdgpu_gfx10_topology::Error),
+    PowerSaving(crate::amdgpu_navi22_power_saving::Error),
 }
 /// All files are validated and copied before the first device operation.
 #[derive(Debug)]
@@ -365,6 +366,8 @@ struct Hardware {
     queues: Option<Queues>,
     ih: Option<crate::amdgpu_ih_navi22::Ih>,
     media: Option<crate::amdgpu_vcn_navi22::Media>,
+    /// The `amdgpu.navi22_pg` opt-in's owners; None on a default boot.
+    power_saving: Option<crate::amdgpu_navi22_power_saving::Retained>,
 }
 /// Kernel queue owners, retained through success, failure and cancellation.
 #[derive(Debug)]
@@ -983,6 +986,7 @@ impl ColdBoot {
                     queues: None,
                     ih: None,
                     media: None,
+                    power_saving: None,
                 },
                 state: State::Prepared,
             },
@@ -1036,6 +1040,7 @@ impl ColdBoot {
                     queues: None,
                     ih: None,
                     media: None,
+                    power_saving: None,
                 },
                 state: State::Prepared,
             },
@@ -1512,6 +1517,9 @@ impl ColdBoot {
         if !self.recoverable() {
             return Err(Error::Busy);
         }
+        // The reset discards PMFW's GFXOFF state; the recovered boot keeps
+        // every power-saving feature off.
+        crate::amdgpu_navi22_gfxoff::forget_for_reset();
         let ih = self.sequence.backend.ih.as_mut().ok_or(Error::Invalid)?;
         // SAFETY: forwarded recovery contract; the ring is quarantined.
         unsafe { ih.disable().await }.map_err(Error::Interrupts)
@@ -1940,6 +1948,90 @@ impl ColdBoot {
         self.display_mut()?
             .hpd_event(hpd.instance, hpd.rx)
             .map_err(Error::Display)
+    }
+}
+
+/// The explicit `amdgpu.navi22_pg` opt-in (amdgpu_navi22_power_saving).
+/// Never reached on a default boot.
+impl ColdBoot {
+    fn power_saving_parts(
+        &mut self,
+    ) -> Result<
+        (
+            crate::amdgpu_navi22_power_saving::Parts<'_>,
+            &mut Option<crate::amdgpu_navi22_power_saving::Retained>,
+        ),
+        Error,
+    > {
+        if !matches!(self.sequence.state, State::FirmwareReady(_))
+            || self.sequence.backend.power_status.is_none()
+        {
+            return Err(Error::Busy);
+        }
+        let admission = self.display_admitted().map(|admitted| {
+            crate::amdgpu_navi22_kms::display_admission(
+                admitted,
+                u8::from(self.display_output().is_some()),
+            )
+        });
+        let h = &mut self.sequence.backend;
+        let smu = h.smu.as_mut().ok_or(Error::Invalid)?;
+        Ok((
+            crate::amdgpu_navi22_power_saving::Parts {
+                gpu: &h.gpu,
+                authority: h.authority,
+                pool: &h.pool,
+                smu,
+                pipeline: h.modeset.as_mut(),
+                admission,
+            },
+            &mut h.power_saving,
+        ))
+    }
+    /// Apply the opted-in features the policy admits, once per boot.
+    ///
+    /// # Safety
+    /// Called with the platform owner lock held and the GFXOFF controller
+    /// not started; every GC MMIO client holds a GFXOFF reference.
+    pub(crate) async unsafe fn apply_power_saving(
+        &mut self,
+        optin: crate::amdgpu_navi22_power_policy::OptIn,
+    ) -> Result<crate::amdgpu_navi22_power_saving::Applied, Error> {
+        let (parts, retained) = self.power_saving_parts()?;
+        // SAFETY: forwarded caller contract; parts are this completed boot's.
+        unsafe { crate::amdgpu_navi22_power_saving::apply(parts, optin, retained) }
+            .await
+            .map_err(Error::PowerSaving)
+    }
+    /// Undo `apply_power_saving`.
+    ///
+    /// # Safety
+    /// As `apply_power_saving`, with the GFXOFF controller stopped.
+    pub(crate) async unsafe fn remove_power_saving(&mut self) -> Result<(), Error> {
+        let (parts, retained) = self.power_saving_parts()?;
+        // SAFETY: forwarded caller contract.
+        unsafe { crate::amdgpu_navi22_power_saving::remove(parts, retained) }
+            .await
+            .map_err(Error::PowerSaving)
+    }
+    /// What the opt-in applied (None on a default boot).
+    pub fn power_saving(&self) -> Option<crate::amdgpu_navi22_power_saving::Applied> {
+        self.sequence
+            .backend
+            .power_saving
+            .as_ref()
+            .and_then(crate::amdgpu_navi22_power_saving::Retained::applied)
+    }
+    /// AllowGfxOff/DisallowGfxOff for the GFXOFF controller, refused unless
+    /// the opt-in enabled FEATURE_GFXOFF.
+    pub(crate) async fn gfx_off_control(&mut self, allow: bool) -> Result<(), Error> {
+        if self.power_saving().is_none_or(|applied| {
+            applied.smu_bits & crate::amdgpu_navi22_power_policy::SMU_GFXOFF == 0
+        }) {
+            return Err(Error::Busy);
+        }
+        let smu = self.sequence.backend.smu.as_mut().ok_or(Error::Invalid)?;
+        smu.gfx_off_control(allow).await.map_err(Error::Smu)
     }
 }
 

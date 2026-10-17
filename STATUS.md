@@ -1003,8 +1003,15 @@ handled as smu_v11_0 does, including the delayed SW CTF check and power-off.
 Kernel-queue hang detection (2 s fence-progress timeout per ring) is active
 and logging; mode1 device recovery with a full cold-boot re-init exists behind
 an explicit opt-in API (display stays dark; training boots refuse it).
-GFXOFF, clock/power gating, memory/fabric DPM and deep sleep remain disabled
-behind a typed policy hook that states their display-admission requirements.
+GFXOFF, clock/power gating, memory/fabric DPM and deep sleep stay disabled on
+every default boot. Linux's sequences for them are implemented and model-tested
+(gfx_v10_0 MGCG/CGCG/3D CGCG under RLC safe mode, mmhub_v2_0/athub_v2_1/
+hdp_v5_0/navi10_ih/sdma_v5_2/smuio CG with nv.c's navy_flounder flags,
+`amdgpu_gfx_off_ctrl` GFXOFF with its 100 ms delay and disable references,
+runtime PMFW feature bits, DCN3.0 PMFW watermark table, UCLK/FCLK floors). They
+run only for the features an explicit `amdgpu.navi22_pg=` list names and the
+policy admits; today that admits GC clock gating alone (no watermarks from the
+display owner, GC MMIO not yet declared GFXOFF-safe by the CS path).
 VCN 3.0 now starts both discovered instances after the fence stage (Linux's
 static, power-gating-disabled path with PSP-loaded TMR images, VCPU reset
 retries, decode/encode ring and IB tests, IH-routed fences) plus JPEG 3.0 with
@@ -1034,6 +1041,13 @@ flips completed from EARLIEST_INUSE (pflip/vupdate IH sources armed), a
 256x256 DCN3.0 cursor (opt-in), KMS on the amdgpu card (DP-1..3, HDMI-A-1;
 DML30-admitted modes, SETCRTC/atomic/TEST_ONLY, disable, vblank, flip
 events) and a monitor that relights after GPU recovery. Register models only.
+Navi22 HDMI 2.0 (`amdgpu_dcn30_hdmi`): TMDS above 340 MHz scrambles (1/4
+clock channel) after Linux's `write_scdc_data` (SCDC over native DDC; legacy
+TMDS_Config 0 on every SCDC sink at enable and disable/unplug), opt-in 10/12-bpc
+deep colour (`amdgpu.max_bpc`, FMT SPATIAL8/10 dither), YCbCr 4:2:0 for
+Y420VDB/CMDB modes (OTG container, FMT, YCbCr709 OCSC, DPG black), Broadcast
+RGB limited (OCSC), CTA VIC/HDMI-VIC vendor InfoFrames and HDMI_6GB_EN from the
+VBIOS encoder caps. Register/DDC models only.
 For bare-metal runs, `cargo xtask usb-image` builds a UEFI stick whose kernel
 appends its log to `/narf-boot-<n>.log` on that stick (`narf.bootlog=`,
 marker-gated, USB-only, bounded) and boots with `narf.disks=boot-only`: every

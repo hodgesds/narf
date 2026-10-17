@@ -71,7 +71,8 @@ use narf_capabilities::{Cap, Write};
 pub const PIPES: u8 = 6;
 pub const STREAMS: u8 = 6;
 pub const PLLS: u8 = 6;
-/// No scrambling, so no SCDC handshake: HDMI 1.4 rates only.
+/// The highest unscrambled TMDS rate; above it [`hdmi::stream_for`]
+/// scrambles and configures the sink over SCDC.
 pub const MAX_TMDS_KHZ: u32 = hdmi::TMDS_SCRAMBLE_KHZ - 1;
 /// `dcn20_link_encoder_get_max_link_cap`: HBR3 on four lanes.
 pub const MAX_DP_RATE: u8 = 0x1e;
@@ -414,37 +415,65 @@ impl Board {
 }
 
 /// Choose the first EDID timing (EDID order, so the preferred mode first)
-/// that a non-scrambled TMDS link, the sink's VSDB ceiling and the DCN30 mode
-/// math all accept, with the AVI InfoFrame Linux's `set_avi_info_frame`
-/// would send for it. DVI sinks get no InfoFrame.
+/// that the sink, the DCN3.0 TMDS encoder (HDMI 2.0 scrambling above 340
+/// MHz, deep colour, 4:2:0; [`hdmi::stream_for`]) and the DCN30 mode math all
+/// accept, with the AVI InfoFrame Linux's `set_avi_info_frame` would send
+/// for it. DVI sinks get no InfoFrame.
+#[cfg(feature = "kernel-test")]
 pub(crate) fn select(
     sink: &Sink,
     soc: &dml30::Soc,
     vco_khz: u32,
 ) -> Result<(Timing, Option<[u8; 36]>, dml30::Plan), Error> {
+    select_hdmi(sink, soc, vco_khz, None, hdmi::Limits::DEFAULT).map(|(t, s, p)| (t, s.avi, p))
+}
+/// The HDMI stream of `timing` on `sink` under the board's `limits`, with
+/// DML30's HDMI output bound (`min(600, PHYCLK)`), the `amdgpu.max_bpc`
+/// ceiling and "Broadcast RGB" shared with the Navi48 path.
+pub(crate) fn hdmi_stream(
+    sink: &Sink,
+    timing: &Timing,
+    soc: &dml30::Soc,
+    limits: hdmi::Limits,
+) -> Option<hdmi::Stream> {
     use crate::amdgpu_navi48_boot as navi48;
-    let caps = navi48::hdmi_caps(&sink.edid);
-    let ceiling = if caps.vsdb_max_khz != 0 {
-        caps.vsdb_max_khz.min(MAX_TMDS_KHZ)
-    } else {
-        MAX_TMDS_KHZ
+    let limits = hdmi::Limits {
+        max_phy_khz: limits.max_phy_khz.min(soc.max_phyclk_khz),
+        ..limits
     };
-    for timing in navi48::edid_timings(&sink.edid) {
-        if timing.pixel_clock_khz > ceiling || timing.pixel_clock_khz < 25_000 {
-            continue;
+    hdmi::stream_for(
+        &sink.edid,
+        timing,
+        navi48::max_bpc(),
+        navi48::limited_range(navi48::broadcast_rgb()),
+        limits,
+    )
+}
+/// [`select`] with the whole stream, or exactly `want` when DRM asked for a
+/// timing the same checks admit.
+pub(crate) fn select_hdmi(
+    sink: &Sink,
+    soc: &dml30::Soc,
+    vco_khz: u32,
+    want: Option<Timing>,
+    limits: hdmi::Limits,
+) -> Result<(Timing, hdmi::Stream, dml30::Plan), Error> {
+    if let Some(want) = want {
+        if !offered(sink, soc, vco_khz).contains(&want) {
+            return Err(Error::NoMode);
         }
+        let stream = hdmi_stream(sink, &want, soc, limits).ok_or(Error::NoMode)?;
+        let plan = dml30::plan(&config(&want, vco_khz), soc).map_err(Error::Mode)?;
+        return Ok((want, stream, plan));
+    }
+    for timing in crate::amdgpu_navi48_boot::edid_timings(&sink.edid) {
+        let Some(stream) = hdmi_stream(sink, &timing, soc, limits) else {
+            continue;
+        };
         let Ok(plan) = dml30::plan(&config(&timing, vco_khz), soc) else {
             continue;
         };
-        let avi = caps.hdmi.then(|| {
-            crate::amdgpu_dcn401_otg::avi_infoframe(
-                &timing,
-                navi48::hdmi_avi(caps, &timing),
-                navi48::limited_range(navi48::broadcast_rgb()),
-                false,
-            )
-        });
-        return Ok((timing, avi, plan));
+        return Ok((timing, stream, plan));
     }
     Err(Error::NoMode)
 }
@@ -512,27 +541,16 @@ pub struct Admitted {
     pub offered: Vec<Timing>,
 }
 
-/// The TMDS clock ceiling `select` applies to `sink`.
-fn tmds_ceiling(sink: &Sink) -> u32 {
-    let caps = crate::amdgpu_navi48_boot::hdmi_caps(&sink.edid);
-    if caps.vsdb_max_khz != 0 {
-        caps.vsdb_max_khz.min(MAX_TMDS_KHZ)
-    } else {
-        MAX_TMDS_KHZ
-    }
-}
-
 /// Every distinct EDID timing `select`/`select_dp` could choose: inside the
 /// TMDS ceiling (HDMI) or the sink's maximum 8b/10b link at 8 bpc (a sink
 /// with DPCD, i.e. DisplayPort), and admitted by the DCN30 mode math. This is
 /// what KMS offers; a DRM TEST_ONLY or SETCRTC is checked against it.
 pub(crate) fn offered(sink: &Sink, soc: &dml30::Soc, vco_khz: u32) -> Vec<Timing> {
-    let ceiling = tmds_ceiling(sink);
     let link = sink.dpcd.as_ref().map(dp_ceiling);
     let mut out: Vec<Timing> = Vec::new();
     for timing in crate::amdgpu_navi48_boot::edid_timings(&sink.edid) {
         let fits = match link {
-            None => timing.pixel_clock_khz <= ceiling,
+            None => hdmi_stream(sink, &timing, soc, hdmi::Limits::DEFAULT).is_some(),
             Some(Ok((rate, lanes))) => dp_fits(
                 timing.pixel_clock_khz,
                 Depth::Bpc8.bits_per_pixel(),
@@ -569,33 +587,6 @@ pub(crate) fn select_dp_wanted(
     Ok((want, plan))
 }
 
-/// `select`, or exactly `want` when DRM asked for a timing: it must be one
-/// that `offered` admits, or the modeset fails before any device write.
-pub(crate) fn select_wanted(
-    sink: &Sink,
-    soc: &dml30::Soc,
-    vco_khz: u32,
-    want: Option<Timing>,
-) -> Result<(Timing, Option<[u8; 36]>, dml30::Plan), Error> {
-    use crate::amdgpu_navi48_boot as navi48;
-    let Some(want) = want else {
-        return select(sink, soc, vco_khz);
-    };
-    if !offered(sink, soc, vco_khz).contains(&want) {
-        return Err(Error::NoMode);
-    }
-    let plan = dml30::plan(&config(&want, vco_khz), soc).map_err(Error::Mode)?;
-    let caps = navi48::hdmi_caps(&sink.edid);
-    let avi = caps.hdmi.then(|| {
-        crate::amdgpu_dcn401_otg::avi_infoframe(
-            &want,
-            navi48::hdmi_avi(caps, &want),
-            navi48::limited_range(navi48::broadcast_rgb()),
-            false,
-        )
-    });
-    Ok((want, avi, plan))
-}
 fn pitch(timing: &Timing) -> u32 {
     (timing.h_active * 4).next_multiple_of(PITCH_ALIGN) / 4
 }
@@ -724,6 +715,10 @@ pub struct Pipeline {
     /// the DCN30 admission of the lit sink produced.
     want: Option<Timing>,
     admitted: Option<Admitted>,
+    /// m5hdmi: the pipe's output format stages (FMT, OTG 4:2:0, OCSC, DPG
+    /// black), and the admitted HDMI stream (format, clocks, scrambling).
+    format: hdmi::Formatter,
+    hdmi: Option<hdmi::Stream>,
 }
 impl core::fmt::Debug for Pipeline {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -820,6 +815,8 @@ impl Pipeline {
                 underflow: None,
                 want: None,
                 admitted: None,
+                format: hdmi::Formatter::new(gpu, authority, pipe)?,
+                hdmi: None,
             })
         }
     }
@@ -954,7 +951,9 @@ impl Pipeline {
             .update(input, OPTC_INPUT_CLK_EN | OPTC_INPUT_CLK_GATE_DIS, 0)
     }
     /// `dcn3_program_pix_clk`: VBIOS SetPixelClock and the PHY PLL's deep
-    /// colour resync (8 bpc: 1:1) for TMDS; the DP DTO for DisplayPort.
+    /// colour resync for TMDS (`dce112_program_pix_clk`: the target is the
+    /// deep-colour-scaled clock of the 4:2:0-halved pixel clock, and
+    /// DCCG_DEEP_COLOR_CNTL the depth); the DP DTO for DisplayPort.
     fn program_pix_clk(&mut self, tables: &Tables<'_>, pixel_khz: u32) -> Result<(), Error> {
         let pipe = u64::from(self.route.pipe);
         match self.route.clock {
@@ -965,11 +964,12 @@ impl Pipeline {
                         otg: self.route.pipe,
                         pll,
                         transmitter: self.connector.path.transmitter,
-                        pixel_khz,
+                        pixel_khz: self.hdmi.map_or(pixel_khz, |s| s.character_khz),
                     },
                 )?;
                 let resync = self.d1(PIXCLK_RESYNC_CNTL[usize::from(pll)]);
-                self.regs.update(resync, DCCG_DEEP_COLOR_CNTL, 0)
+                let deep = self.hdmi.map_or(0, |s| s.format.depth.code() << 4);
+                self.regs.update(resync, DCCG_DEEP_COLOR_CNTL, deep)
             }
             ClockSource::DpDto => {
                 let (phase, modulo) = dp_dto(pixel_khz);
@@ -1178,7 +1178,12 @@ impl Pipeline {
             dml30::Soc::from_board(&levels, board.channels, board.channel_width_bytes, refclk)
                 .map_err(Error::Mode)?;
         let (timing, avi, plan) = match signal {
-            Signal::Hdmi => select_wanted(sink, &soc, levels.vco_khz, self.want)?,
+            Signal::Hdmi => {
+                let limits = self.hdmi_limits(tables);
+                let (t, stream, plan) = select_hdmi(sink, &soc, levels.vco_khz, self.want, limits)?;
+                self.hdmi = Some(stream);
+                (t, stream.avi, plan)
+            }
             Signal::DisplayPort => {
                 let (timing, plan) = select_dp_wanted(sink, &soc, levels.vco_khz, self.want)?;
                 (timing, None, plan)
@@ -1258,6 +1263,7 @@ impl Pipeline {
         self.opp
             .program(Encoding::Rgb, timing.h_active, timing.v_active)?;
         self.opp.set_blank(true)?;
+        self.hdmi_format().await?;
         // enable_crtc, then one frame for the timing to settle.
         self.at(Step::Start);
         self.otg.enable()?;
@@ -1266,7 +1272,7 @@ impl Pipeline {
         self.at(Step::Link);
         self.dig.connect_to_otg(pipe)?;
         match (signal, avi) {
-            (Signal::Hdmi, Some(avi)) => self.link_hdmi(tables, &timing, &avi).await?,
+            (Signal::Hdmi, Some(_)) => self.link_hdmi(tables, aux).await?,
             _ => self.link_dp(tables, &timing, sink, aux).await?,
         }
         // The front end, latched together at the unlock.
@@ -1330,21 +1336,26 @@ impl Pipeline {
         }
     }
     /// `link_set_dpms_on` for HDMI.
-    async fn link_hdmi(
+    async fn link_hdmi<A: Aux + Send>(
         &mut self,
         tables: &Tables<'_>,
-        timing: &Timing,
-        avi: &[u8; 36],
+        aux: &mut A,
     ) -> Result<(), Error> {
+        let stream = self.hdmi.ok_or(Error::Invalid)?;
         let transmitter = self.connector.path.transmitter;
         self.dig.setup(DigMode::Hdmi)?;
         // setup_dio_stream_attribute: stereo sync, then
-        // enc3_stream_encoder_hdmi_set_stream_attribute.
+        // enc3_stream_encoder_hdmi_set_stream_attribute at phy_pix_clk.
         self.dig.setup_stereo_sync(self.route.pipe)?;
-        tables.hdmi_stream_setup(self.bus(), self.route.stream, timing.pixel_clock_khz)?;
-        self.dig.stream_attribute(timing.pixel_clock_khz)?;
-        self.dig.info_packets(avi).await?;
-        // enable_link_hdmi → dcn10_link_encoder_enable_tmds_output.
+        tables.hdmi_stream_setup(self.bus(), self.route.stream, stream.character_khz)?;
+        self.dig.hdmi_stream_attribute(&stream)?;
+        self.dig.hdmi_info_packets(&stream).await?;
+        // enable_link_hdmi: write_scdc_data, then setup_dio_stream_encoder
+        // (the backend takes the frontend first, so a 1/4-rate clock channel
+        // is in place above 340 MHz), dcn10_link_encoder_enable_tmds_output
+        // at phy_pix_clk, read_scdc_data.
+        hdmi::write_scdc_data(aux, &stream).await?;
+        self.dig.connect_be_to_fe(true)?;
         tables.transmitter(
             self.bus(),
             &Transmitter {
@@ -1354,16 +1365,61 @@ impl Pipeline {
                 lanes: 4,
                 hpd: self.connector.hpd,
                 connector: 0,
-                symbol_khz: timing.pixel_clock_khz,
+                symbol_khz: stream.character_khz,
             },
         )?;
+        if let Some(status) = hdmi::read_scdc_data(aux, &stream).await {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 HDMI {} kHz {} bpc{} SCDC TMDS_Config {:#x} scrambler {:?} flags {:?}",
+                stream.character_khz,
+                stream.format.depth.bpc(),
+                if stream.format.ycbcr420 { " 4:2:0" } else { "" },
+                status.tmds_config,
+                status.scrambler_status,
+                status.status_flags,
+            );
+        }
         // The second setup Linux issues after transmitter control.
         self.dig.setup(DigMode::Hdmi)?;
         // dcn20_enable_stream: setup_dio_stream_encoder, update_info_frame.
         self.dig.connect_be_to_fe(true)?;
-        self.dig.info_packets(avi).await?;
+        self.dig.hdmi_info_packets(&stream).await?;
         self.dig.set_avmute(false)?;
         Ok(())
+    }
+    /// m5hdmi: the board's HDMI ceilings, from the VBIOS encoder caps of
+    /// this connector's transmitter (`dcn30_link_encoder_construct`: no
+    /// record keeps HDMI_6GB_EN 1).
+    fn hdmi_limits(&self, tables: &Tables<'_>) -> hdmi::Limits {
+        let caps = crate::amdgpu_dcn_inventory::encoder_caps(
+            tables.image(),
+            self.connector.path.transmitter,
+        );
+        hdmi::Limits {
+            hdmi6g: !matches!(caps, Ok(Some(c)) if c & crate::amdgpu_dcn_inventory::ENCODER_CAP_HDMI6GBPS_EN == 0),
+            ..hdmi::Limits::DEFAULT
+        }
+    }
+    /// m5hdmi: the HDMI stream's output format on the pipe, after the timing
+    /// and before the OTG starts: OTG 4:2:0 container, FMT dither/clamp/
+    /// encoding, OCSC and the DPG's black for the colour space.
+    async fn hdmi_format(&mut self) -> Result<(), Error> {
+        let Some(stream) = self.hdmi.filter(|_| self.connector.signal == Signal::Hdmi) else {
+            return Ok(());
+        };
+        let format = stream.format;
+        self.format.program_otg(format)?;
+        self.format.program_fmt(format)?;
+        self.format.program_ocsc(format).await?;
+        self.format.set_blank_color(format)?;
+        Ok(())
+    }
+    /// m5hdmi: the admitted HDMI stream (format, clocks, SCDC), for the link
+    /// owner's unplug path ([`hdmi::write_scdc_legacy`]).
+    pub fn hdmi_output(&self) -> Option<hdmi::Stream> {
+        self.hdmi
     }
     /// `link_set_dpms_on` for DisplayPort SST.
     async fn link_dp<A: Aux + Send>(
@@ -1491,6 +1547,9 @@ impl Pipeline {
         // Front end: blank_pixel_data(true), MPCC removal, HUBP blank.
         if reached >= Step::Timing {
             record(self.opp.set_blank(true).map_err(Error::Block));
+            if let Some(s) = self.hdmi.filter(|_| self.connector.signal == Signal::Hdmi) {
+                record(self.format.set_blank_color(s.format).map_err(Error::Hdmi));
+            }
         }
         if reached >= Step::Plane {
             record(self.mpc.release(self.route.pipe).map_err(Error::Block));
@@ -1498,7 +1557,12 @@ impl Pipeline {
         }
         if reached >= Step::Link {
             match self.connector.signal {
-                Signal::Hdmi => record(self.unlink_hdmi(tables)),
+                Signal::Hdmi => {
+                    // link_set_dpms_off: AVMUTE, then the legacy SCDC write.
+                    record(self.dig.set_avmute(true).map_err(Error::Hdmi));
+                    hdmi::write_scdc_legacy(aux, self.hdmi.is_some_and(|s| s.scdc)).await;
+                    record(self.unlink_hdmi(tables))
+                }
                 Signal::DisplayPort => record(self.unlink_dp(tables, aux).await),
             }
         }
@@ -1711,6 +1775,14 @@ pub fn test_pattern(_line: u32, row: &mut [u32]) {
     let width = row.len().max(1);
     for (x, pixel) in row.iter_mut().enumerate() {
         *pixel = BARS[x * 8 / width];
+    }
+}
+
+/// Opt-in power saving (amdgpu_navi22_power_policy): the DAL clock owner,
+/// for memory/fabric floors and the PMFW watermark table.
+impl Pipeline {
+    pub(crate) fn clock_manager(&mut self) -> &mut ClockManager {
+        &mut self.clocks
     }
 }
 

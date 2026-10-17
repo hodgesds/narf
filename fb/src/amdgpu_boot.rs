@@ -146,6 +146,13 @@ pub(super) fn start() -> InitResult {
         if native {
             navi22_native_display();
         }
+        // Power saving (GFXOFF, clock gating, memory DPM, ...) only on an
+        // explicit `amdgpu.navi22_pg=` list; a default boot programs none.
+        if let Some(value) = narf_boot::args().value("amdgpu.navi22_pg") {
+            // SAFETY: after a successful firmware run; the TDR sampler takes
+            // GFXOFF references and no other GC MMIO client runs yet.
+            let _ = narf_scheduler::block_on_spin(unsafe { platform::power_saving(value) });
+        }
     }
     // `amdgpu.max_bpc=10|12`: allow HDMI deep colour, as DRM's max bpc.
     if let Some(bpc) = narf_boot::args()
