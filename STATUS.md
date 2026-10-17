@@ -945,8 +945,13 @@ reached through VMID0, MSI-X/MSI delivery with polling fallback, and
 overflow-safe task-context drains. It routes IVs to generation-tagged
 subscribers that receive a terminal error on device loss. Boot enables it
 after the memory hubs and proves delivery with an SDMA0 TRAP.
+VCN 3.0 now starts both discovered instances after the fence stage (Linux's
+static, power-gating-disabled path with PSP-loaded TMR images, VCPU reset
+retries, decode/encode ring and IB tests, IH-routed fences) plus JPEG 3.0 with
+a ring test; PSP loads one VCN image per unharvested instance (type 13/58)
+from the discovery harvest table, and media failures leave the boot degraded.
 These are software-tested foundations; training resume,
-VCN startup, display-aware DPM and OS thermal interrupt handling,
+media submission/DPG, display-aware DPM and OS thermal interrupt handling,
 hardware boot, general GPU mappings/GFX10 queue initialization, production
 SDMA submissions/interrupts and DCN3.0
 modesetting remain open. See the

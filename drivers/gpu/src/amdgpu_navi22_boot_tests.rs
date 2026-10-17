@@ -26,6 +26,7 @@ fn report() -> Report {
         dmub: None,
         queues: None,
         interrupts: None,
+        media: None,
     }
 }
 struct Fake {
