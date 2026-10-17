@@ -884,6 +884,9 @@ impl Pipeline {
             all.push(self.connector);
         }
         let inherited = takeover.retire(tables, &all).await?;
+        if scratch & ATOM_S6_ACC_MODE == 0 {
+            takeover.init_watermarks()?;
+        }
         self.inherited = inherited;
         // A stream the takeover could not retire stops everything here.
         self.takeover().check_idle()
@@ -947,7 +950,8 @@ impl Pipeline {
                         otg: self.route.pipe,
                         pll,
                         transmitter: self.connector.path.transmitter,
-                        pixel_khz: self.hdmi.map_or(pixel_khz, |s| s.character_khz),
+                        pixel_100hz: self.hdmi.map_or(pixel_khz * 10, |s| s.character_100hz),
+                        deep_color: self.hdmi.map_or(0, |s| s.format.depth.code() as u8),
                     },
                 )?;
                 let resync = self.d1(PIXCLK_RESYNC_CNTL[usize::from(pll)]);

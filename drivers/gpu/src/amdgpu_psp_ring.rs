@@ -434,7 +434,10 @@ impl Layout {
             return Err(Error::DeviceGone);
         }
         let fb_base = (base as u64 & 0xffffff) << 24;
-        let fb_end = ((top as u64 & 0xffffff) + 1) << 24;
+        // amdgpu_gmc_vram_location: vram_end = vram_start + mc_vram_size - 1
+        // (RCC_CONFIG_MEMSIZE). FB_LOCATION_TOP is inherited 16 MiB-granular
+        // state; it is read only to detect a removed device.
+        let fb_end = fb_base.checked_add(gpu.vram.size).ok_or(Error::Invalid)?;
         let fb_offset = (offset as u64 & 0xffffff) << 24;
         let pool_offset = pool.address().checked_sub(fb_base).ok_or(Error::Invalid)?;
         let mapping = pool.mapping();

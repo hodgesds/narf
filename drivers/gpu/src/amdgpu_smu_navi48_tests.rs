@@ -245,7 +245,7 @@ kernel_test_in!(
     "drivers/gpu/smu14",
     smu14_board_roundtrip_and_protection_policy
 );
-fn smu14_rejects_malformed_board_and_foreign_interface() -> TestResult {
+fn smu14_rejects_malformed_board_and_tolerates_foreign_interface() -> TestResult {
     let valid = board();
     for end in 0..valid.len() {
         if board_features(&valid[..end]).is_ok() {
@@ -259,13 +259,27 @@ fn smu14_rejects_malformed_board_and_foreign_interface() -> TestResult {
             return TestResult::Fail("invalid combo format or relative subtable offset");
         }
     }
+    // smu_cmn_check_fw_version logs an interface mismatch and continues;
+    // only an absent device (all-ones) stops the handshake.
     let (_, mut e) = fixture();
-    e.io.interface = 0xe;
-    if run(e.verify()) != Err(Error::InterfaceMismatch(0xe))
+    e.io.interface = 0x2f;
+    if run(e.verify())
+        != Ok(Versions {
+            firmware: 0x684c00,
+            interface: 0x2f,
+        })
+        || e.io.commands != [(3, 0), (2, 0)]
+        || run(e.read_board()).is_err()
+    {
+        return TestResult::Fail("PMFW interface mismatch was fatal");
+    }
+    let (_, mut e) = fixture();
+    e.io.interface = u32::MAX;
+    if run(e.verify()) != Err(Error::DeviceGone)
         || e.io.commands != [(3, 0)]
         || run(e.read_board()) != Err(Error::Busy)
     {
-        return TestResult::Fail("SMU11 interface accepted or used after rejection");
+        return TestResult::Fail("all-ones interface accepted or used after failure");
     }
     let (_, mut e) = fixture();
     run(e.verify()).unwrap();
@@ -277,7 +291,7 @@ fn smu14_rejects_malformed_board_and_foreign_interface() -> TestResult {
 }
 kernel_test_in!(
     "drivers/gpu/smu14",
-    smu14_rejects_malformed_board_and_foreign_interface
+    smu14_rejects_malformed_board_and_tolerates_foreign_interface
 );
 fn smu14_cancelled_dma_and_revocation_do_not_recycle_or_retry() -> TestResult {
     for message in [0xe, 0xf, 0x12, 0x13] {

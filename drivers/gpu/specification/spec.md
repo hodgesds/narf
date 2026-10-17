@@ -3658,9 +3658,11 @@ builder; legacy/unsupported layouts fail before any hardware operation.
 NBIO and HDP 5.0.x, then reserves owned VRAM. It requires exclusive physical-GPU ownership,
 permanent mappings, and firmware/VBIOS belonging to this board.
 
-`quiesce().await` checks the DMUB enable fuse, requests `STOP_FW` when inherited
-firmware runs, and requires both matching GPINT acknowledgement and stop reply
-within 100 ms. Timeout leaves the attempt failed without forced recovery.
+`quiesce().await` checks the DMUB enable fuse (`Error::Unsupported` when the
+DMCUB is fused off: the boot drops the DMUB owner and continues, as
+`dm_dmub_hw_init` does), requests `STOP_FW` unless DMCUB is already held in
+reset, and waits up to 100 ms for the GPINT acknowledgement and stop reply.
+Like `dmub_dcn20_reset`, a timeout is logged and the reset forced.
 It holds DCN3.0 `DMCUB_CNTL.SOFT_RESET` (bit 17) and `MMHUBBUB_SOFT_RESET`
 (dword `0x341`, bit 8), disables execution, and clears mailbox pointers/status.
 It never uses DCN31's separate CNTL2 reset or dword `0x342` hub reset.
@@ -3927,18 +3929,36 @@ back; values wider than their DCN3.0 field are refused rather than masked.
 
 ### Navi 22 VBIOS display command tables
 
-DCN3.0 does not route VBIOS commands through DMUB (`dmub_command_table` is
-unset for `dcn30_resource.c`), so `amdgpu_navi22_bios::Tables::new(vbios)` runs
-them on the ATOM interpreter. `pipe_power_gating(bus, pipe, Init|Disable|Enable)`
+DCN3.0 sets `dmub_command_table` (`dcn30_resource.c`), so while DMUB runs
+`command_table2.c` sends these tables to DMCUB. `amdgpu_navi22_bios::Tables::new(vbios)`
+validates the image; `.with_dmub(Some(&route))`, where
+`DmubRoute::new(Option<&mut Dmub>)` is `Some` only for a running DMUB with an
+idle mailbox (`Dmub::vbios_ready`), routes every call through the `VbiosDmub`
+trait to `Dmub::execute_vbios(VbiosCommand, payload)`: one `DMUB_CMD__VBIOS`
+(128) inbox command with sub-type `DigxEncoderControl` (0, 12-byte payload),
+`Dig1TransmitterControl` (1, 60), `SetPixelClock` (2, 16) or
+`EnableDispPowerGating` (3, 4), executed synchronously and bounded by 100 ms
+(`dc_wake_and_execute_dmub_cmd(WAIT)`); a timeout fails the mailbox and the
+call (`Error::Dmub`). On the DMUB path table revisions are not checked
+(the `*_fallback` helpers also go to DMUB); DIG1TransmitterControl uses the
+v1.6 struct for a revision-6 table and the v1.7 data otherwise. Without
+DMUB the tables run on the ATOM interpreter (logged), with
+`amdgpu_atomfirmware_allocate_fb_scratch`'s FB scratch size and the bus's
+`now_ms` driving atom.c's 20 s loop guard.
+`pipe_power_gating(bus, pipe, Init|Disable|Enable)`
 (EnableDispPowerGating v2.1), `set_pixel_clock(bus, &PixelClock { otg, pll,
-transmitter, pixel_khz })` (v1.7, combo PHY PLL, UNIPHY encoder object, HDMI
-mode, XTALIN reference), `hdmi_stream_setup(bus, dig, pixel_khz)`
+transmitter, pixel_100hz, deep_color })` (v1.7, combo PHY PLL, UNIPHY encoder
+object, HDMI mode, XTALIN reference; `pixclk_100hz` is the deep-colour-scaled
+`actual_pix_clk_100hz` verbatim and `deep_color_ratio` the
+`transmitter_color_depth_to_atom` code), `hdmi_stream_setup(bus, dig, pixel_khz)`
 (DIGxEncoderControl v1.5 STREAM_SETUP) and `transmitter(bus, &Transmitter)`
 (DIG1TransmitterControl v1.6/1.7, as `dcn10_link_encoder_enable_tmds_output`)
-fill the `atomfirmware.h` blocks exactly as `command_table2.c` does and refuse
-other table revisions. `Bus` (BAR5 dword `Mmio`, bounded by the mapping)
-carries register access and DELAY; an out-of-window access or port I/O fails
-the table with `Error::Bus`.
+fill the `atomfirmware.h` blocks exactly as `command_table2.c` does; the ATOM
+path refuses other table revisions. `Bus` (BAR5 dword `Mmio`, bounded by the
+mapping) carries register access, DELAY and `now_ms`; an out-of-window access
+or port I/O fails the table with `Error::Bus`. The interpreter ends a table at
+an undecodable opcode or out-of-table jump and resumes after a bad SWITCH case
+(atom.c), counting each as an `Anomaly`.
 
 `amdgpu_atom_vm` now follows `atom.c` when `AtomState::bios`/`data_table` are
 bound: `SET_DATA_BLOCK` takes absolute offsets from the master data table (255
@@ -4810,10 +4830,10 @@ depth, and the primary address's low half is written last because that is what
 arms it. A surface off a 256-byte request boundary, past the pipe's 48-bit
 addressing, at address zero, or narrower than its own viewport is refused. The
 chroma request sizes are cleared rather than left behind, so a previous owner's
-chroma plane cannot keep fetching. `blank` waits for the pipe's outstanding
-requests to retire before reporting success, so scanout memory is never released
-with a fetch in flight; a power-gated pipe reads back zero and needs no wait,
-and a pipe that never retires times out rather than being called blanked.
+chroma plane cannot keep fetching. `blank` waits up to 100 ms for the pipe's
+outstanding requests to retire; a power-gated pipe reads back zero and needs no
+wait. As `hubp2_set_blank_regs`' REG_WAIT, a pipe that never retires is logged,
+counted (`blank_stalls()`) and blanked anyway.
 
 `amdgpu_dcn_plane` programs the rest of the plane path. The DPP and OPP banks are
 DCN base index 2 while the MPC bank is index 3. `Dpp::program` enables the pipe

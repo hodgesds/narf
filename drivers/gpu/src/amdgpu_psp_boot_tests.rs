@@ -627,6 +627,17 @@ fn psp_boot_revocation_rejection_and_absent_device() -> TestResult {
     if run(engine.load(&image)).is_err() || engine.io.busy != 0 {
         return TestResult::Fail("PSP11 bootloader low status bits treated as rejection");
     }
+    // A bootloader that needs ~3 s (one poll per millisecond) is still within
+    // psp_v11_0_wait_for_bootloader's 20 x usec_timeout register polls.
+    let (_, mut engine) = fixture();
+    engine.psp11 = true;
+    engine.io.busy = 3000;
+    if PSP11_BOOTLOADER_TIMEOUT_MS < 6000
+        || run(engine.load(&image)).is_err()
+        || engine.io.busy != 0
+    {
+        return TestResult::Fail("PSP11 bootloader wait shorter than Linux's");
+    }
     let (_, mut engine) = fixture();
     engine.psp11 = true;
     engine.io.reject = 7;
