@@ -30,6 +30,48 @@ fn smoke_io_dma_alloc_free() -> TestResult {
 }
 kernel_test_in!("io", smoke_io_dma_alloc_free);
 
+fn smoke_io_dma_alloc_coherent_masked() -> TestResult {
+    // Linux `dma_set_coherent_mask(DMA_BIT_MASK(32))` + `dma_alloc_coherent`:
+    // every byte of the buffer must be addressable under the mask.
+    use crate::{alloc_coherent_masked, free_coherent, IoError};
+    use narf_lib::id::DomainId;
+
+    const DMA32: u64 = 0xffff_ffff;
+    for len in [1usize, 4096, 4097, 64 * 1024, 512 * 1024] {
+        let buf = match alloc_coherent_masked(len, DomainId::DRIVER_0, DMA32) {
+            Ok(b) => b,
+            Err(_) => return TestResult::Fail("DMA32 coherent allocation failed"),
+        };
+        let first = buf.dma_addr().raw();
+        let last = first + buf.len() as u64 - 1;
+        let zeroed = buf.as_slice().iter().all(|&b| b == 0);
+        free_coherent(buf);
+        if last > DMA32 {
+            return TestResult::Fail("masked coherent buffer extends above the mask");
+        }
+        if !zeroed {
+            return TestResult::Fail("masked coherent buffer not zero-filled");
+        }
+    }
+    // Negative: no RAM lies at or below 1 MiB - 1 in the buddy, so the
+    // allocation must fail rather than fall back to an unmasked frame.
+    match alloc_coherent_masked(4096, DomainId::DRIVER_0, 0x000f_ffff) {
+        Err(IoError::NoMemory) => {}
+        Ok(b) => {
+            free_coherent(b);
+            return TestResult::Fail("masked allocation ignored an unsatisfiable mask");
+        }
+        Err(_) => return TestResult::Fail("unsatisfiable mask returned the wrong error"),
+    }
+    // u64::MAX is the unmasked path.
+    match alloc_coherent_masked(4096, DomainId::DRIVER_0, u64::MAX) {
+        Ok(b) => free_coherent(b),
+        Err(_) => return TestResult::Fail("u64::MAX mask allocation failed"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io", smoke_io_dma_alloc_coherent_masked);
+
 fn smoke_io_dma_cap_bootstrap() -> TestResult {
     // Exercises Wave-2 cap table + Wave-3a DmaBuffer: bootstrap a
     // Cap<DmaBuffer, Write>, confirm it's live, revoke, confirm dead.

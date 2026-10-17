@@ -76,6 +76,12 @@ pub struct PageSize(usize);   // base = 4 KiB; see §5 per-arch table
 
 pub fn alloc_frame() -> Option<PhysFrame>;
 pub fn alloc_folio(order: u8) -> Option<Folio>;     // 2^order base frames
+/// Contiguous kernel block with every byte at or below `limit_phys`
+/// (inclusive), searched across all online nodes — the frame half of
+/// Linux `dma_set_coherent_mask` (32-bit masks: `0xffff_ffff`). No
+/// fitting block (incl. a limit below managed RAM) is `Exhausted`, never
+/// a frame above the limit. Free with `free_pages`.
+pub fn alloc_pages_below(order: u8, limit_phys: u64) -> Result<PhysFrame, FrameAllocError>;
 /// Return independently owned frames; buddy batches COW shard acquisition and
 /// bounded no-allocation cache/zone publication, while alternative allocators
 /// retain the scalar default.
