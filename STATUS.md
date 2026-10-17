@@ -362,7 +362,12 @@ revocation, cancellation and divider completion. GDDR6 mode calculations and
 full modeset coordination are still pending. Native routing now resolves
 AUX and HPD independently through the board GPIO LUT, follows display-table
 relative record offsets, and rejects ambiguous routes. The Navi22 backend probe
-uses the DCN30 enable register and includes the sixth transmitter.
+uses the DCN30 enable register and includes the sixth transmitter. Navi22 kernel
+queues now follow Linux's non-MES GC 10.3 path: BAR2 doorbells, golden/CAM/
+constants/RLC CSB setup, the direct gfx ring with clear-state, KIQ-mapped
+compute (v10 MQD, MAP_QUEUES) and production SDMA on both engines, each with
+ring and IB/fence tests after `DmubStart`. Fences poll with an IH notify hook;
+register models cover encodings, rejection, timeouts and cancellation only.
 Production cold boot now resets a posted card before any firmware stage, as
 Linux does whenever the VBIOS left SOS running: PMFW (or PSP) mode1 reset,
 PCI config restore including Resizable BAR sizes, then bootloader and MEMSIZE

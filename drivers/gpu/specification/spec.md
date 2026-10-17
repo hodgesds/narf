@@ -428,6 +428,44 @@ interrupts, drained, unhandled, malformed, overflows, dropped, unsignalled
 EOP/fault, SDMA traps, VMC/UTCL2 faults, DCN vblank (VSTARTUP)/vupdate/pflip/
 HPD/DMUB-outbox and SMU11 thermal/CTF/MP1 ids.
 
+### Navi 22 kernel queues: GFX, KIQ/compute and SDMA
+
+GC 10.3.2 runs without MES. `amdgpu_cp_navi22::Doorbells::map_navi22(device)`
+(unsafe, boot-time) maps BAR2's first 4 KiB uncached; kernel doorbells use the
+Linux Navi10 assignment (KIQ 0, MEC ring0 6, GFX ring0 0x116, SDMA0 0x200,
+SDMA1 0x214 dwords). `enable_doorbell_apertures` sets the NBIF 2.3 doorbell
+and self-ring apertures. Each queue owns 24 KiB of published VRAM: 8 KiB ring,
+writeback (rptr, 64-bit shadow wptr, fence, scratch), IB, MQD/CSB and EOP.
+Commit pads like `amdgpu_ring_commit` (256 PM4 / 16 SDMA dwords), flushes HDP,
+updates the shadow wptr and rings a 64-bit doorbell; CPU reads invalidate HDP.
+
+`unsafe Gfx::new(gpu, pci_cap, pool, doorbells)` reserves storage only.
+`configure()` applies `golden_settings_gc_10_3_2`, checks/programs the GRBM
+CAM, runs `gfx_v10_0_constants_init` (SH_MEM per VMID, KFD/GDS VMIDs, trap
+config), re-checks RLC autoload, programs the RLC CSIB with the 949-dword
+`clearstate_gfx10.h` CSB, SPM VMID 0xf and SRM, and masks the gui-idle
+interrupts. `start()` follows `gfx_v10_0_cp_gfx_resume`/`cp_gfx_start` (the
+`async_gfx_ring=0` path, ring 0 only) and then the SCRATCH_REG0
+`SET_UCONFIG_REG` ring test. `test_ib()` runs a WRITE_DATA IB and RELEASE_MEM
+fence. `unsafe amdgpu_kiq_navi22::Compute::new(...)`: `init_kiq()` programs
+the KIQ at MEC2 pipe 1 queue 0 (`kiq_setting`, v10 MQD, `kiq_init_register`,
+dequeuing an active inherited HQD or failing on timeout); `map_compute()`
+unhalts MEC, builds the MEC1 pipe 0 queue 0 MQD and submits SET_RESOURCES +
+MAP_QUEUES through the KIQ, then runs KIQ and compute ring tests; `test_ib()`
+runs the compute IB test. `unsafe amdgpu_sdma_navi22_queues::Sdma::new(...)`:
+`start()` refuses busy engines, stops an idle predecessor ring (the SDMA0
+proof), soft-resets both engines and follows `sdma_v5_2_start` /
+`gfx_resume_instance` with doorbells and NBIF SDMA ranges plus WRITE_LINEAR
+ring tests; `test_ib()` runs IB + FENCE/TRAP tests on both engines.
+
+Every step has one predecessor state; failure or cancellation leaves a
+non-repeatable state and retains published memory. Register polls are bounded
+by 100 ms and fences by 1 s. `amdgpu_fence_navi22::{notify, notify_all}` are
+the IH hook: an EOP/trap consumer calls them so fence waits re-sample at once;
+without it waits poll every 1 ms. `QueueProof` aggregates the three proofs.
+Clock gating, GFXOFF, the cleaner shader and Linux's second gfx ring are not
+enabled. These are kernel bring-up rings, not a submission API.
+
 ### Navi 22 DCN3.0 DMUB startup
 
 `amdgpu_dmub_navi22::Prepared::new(image, vbios, psp_version)` parses the
@@ -598,6 +636,13 @@ retained in `Report::interrupts` (`Status::proof`); delivery stays on
 watchdog/polling. This places `DmubQuiesce`
 before any PSP DMCUB upload and `DmubStart` after memory-hub/SDMA startup.
 `DmubStart` includes the runtime version/capability handshake above.
+`ColdBoot::prepare_queues(doorbells)` reserves the GFX, KIQ/compute and both
+SDMA queue owners after memory hubs and the SDMA proof; production boot calls it
+when BAR2 maps. After `DmubStart` the stages `Doorbells`, `GfxSetup`, `Kiq`,
+`ComputeQueues`, `GfxRing`, `SdmaQueues` and `IbTests` follow Linux's
+`nv_common_hw_init`, `gfx_v10_0_hw_init`/`cp_resume`, `sdma_v5_2_start` and
+`amdgpu_ib_ring_tests` order; `Report::queues` is set only when all pass and
+failures are reported as `Error::Queues`.
 `Firmware::prepare_power(gpu, Identity)` prepares the board table before the
 session is constructed; production boot requires it, while explicit
 firmware-only callers may omit it. The bootstrap owner is dropped only
