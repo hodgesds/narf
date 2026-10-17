@@ -2287,11 +2287,52 @@ fn verify_btrfs_write_interop() -> Result<()> {
     );
     if out.status.success() && combined.contains("no error found") {
         println!("xtask: btrfs write-interop OK — NARF-written image is `btrfs check` clean");
-        Ok(())
+        verify_btrfs_block_group_tree(&img)
     } else {
         eprintln!("{combined}");
         bail!("`btrfs check` reported errors on the NARF-written image (write-interop regression)");
     }
+}
+
+/// On a BLOCK_GROUP_TREE image, cross-check with btrfs-progs that every chunk
+/// has its BLOCK_GROUP_ITEM in tree 11 and the extent tree holds none.
+/// No-op for images without the feature.
+fn verify_btrfs_block_group_tree(img: &Path) -> Result<()> {
+    let dump = |args: &[&str]| -> Result<String> {
+        let out = std::process::Command::new("btrfs")
+            .args(["inspect-internal"])
+            .args(args)
+            .arg(img)
+            .output()
+            .context("failed to run `btrfs inspect-internal`")?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let sb = dump(&["dump-super"])?;
+    let compat_ro = sb
+        .lines()
+        .find_map(|line| line.strip_prefix("compat_ro_flags"))
+        .and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0);
+    if compat_ro & (1 << 3) == 0 {
+        return Ok(());
+    }
+    let count = |text: &str, needle: &str| text.matches(needle).count();
+    let bgt = dump(&["dump-tree", "-t", "11"])?;
+    let chunks = dump(&["dump-tree", "-t", "3"])?;
+    let extent = dump(&["dump-tree", "-t", "2"])?;
+    let (bg_items, chunk_items) = (
+        count(&bgt, "BLOCK_GROUP_ITEM"),
+        count(&chunks, "CHUNK_ITEM"),
+    );
+    if bg_items == 0 || bg_items != chunk_items || count(&extent, "BLOCK_GROUP_ITEM") != 0 {
+        eprintln!("{bgt}");
+        bail!(
+            "block-group tree mismatch: {bg_items} BLOCK_GROUP_ITEMs in tree 11, \
+             {chunk_items} chunks, extent tree must hold none"
+        );
+    }
+    println!("xtask: block-group tree OK — {bg_items} block groups in tree 11 match the chunk tree");
+    Ok(())
 }
 
 /// The kernel's btrfs read/write smokes mutate whichever btrfs volume they
@@ -2321,7 +2362,16 @@ fn nvme_image_path() -> PathBuf {
         // NVMe hardware, and the written image stays mountable + `btrfs check`-clean
         // for a real Linux kernel. Verify manually with `mount -o loop` + `btrfs
         // check`.
-        reconstruct_sparse_fixture("drivers/fs/btrfs/testdata/fixture-bitmap.img.sparse", &path);
+        //
+        // `XTASK_BTRFS_NVME_FIXTURE=bgt` serves the block-group-tree fixture
+        // instead (the host CachyOS root's feature set: compat_ro 0xb,
+        // non-mixed 4K/16K, zstd, @-subvolumes), so the same write smoke and
+        // `btrfs check` postflight cover BLOCK_GROUP_TREE writes.
+        let fixture = match std::env::var("XTASK_BTRFS_NVME_FIXTURE").as_deref() {
+            Ok("bgt") => "drivers/fs/btrfs/testdata/fixture-bgt.img.sparse",
+            _ => "drivers/fs/btrfs/testdata/fixture-bitmap.img.sparse",
+        };
+        reconstruct_sparse_fixture(fixture, &path);
         return path;
     }
     let path = root.join("target").join("narf-nvme.img");
