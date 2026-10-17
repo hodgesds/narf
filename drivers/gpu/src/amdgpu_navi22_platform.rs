@@ -243,6 +243,36 @@ pub async fn detect_displays(
         .await
 }
 
+/// The retained native modeset's state, for diagnostics.
+pub fn modeset_state() -> Option<crate::amdgpu_navi22_modeset::State> {
+    OWNER.try_lock()?.as_ref()?.modeset_state()
+}
+
+/// Best effort: a busy owner skips the flush and buffered writes drain later.
+fn flush_scanout() {
+    if let Some(mut owner) = OWNER.try_lock() {
+        if let Some(boot) = owner.as_mut() {
+            let _ = boot.flush_display_scanout();
+        }
+    }
+}
+
+/// Opt-in native HDMI scanout (`amdgpu.native_display`): light the first
+/// connected HDMI sink with a test pattern and publish it as the external
+/// scanout, which moves the console there. The pipeline is retained.
+///
+/// # Safety
+/// Boot-time, after a successful `run`; no other display client, and no CPU
+/// writer of the new scanout except through the published framebuffer.
+pub async unsafe fn modeset_hdmi() -> Result<crate::amdgpu_navi22_modeset::Output, boot::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
+    // SAFETY: forwarded unchanged; serialized by the owner mutex.
+    let output = unsafe { boot.modeset_hdmi().await }?;
+    crate::amdgpu_dcn_display::publish_external(Some(output.scanout), Some(flush_scanout));
+    Ok(output)
+}
+
 /// Serialized DMUB HPD query, refused unless DMUB AUX was explicitly allowed.
 pub async fn dmub_hpd(instance: u8) -> Result<bool, boot::Error> {
     let mut owner = OWNER.lock().await;

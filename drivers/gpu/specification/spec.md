@@ -3579,6 +3579,42 @@ selects the table start), ID operands read the image, every table execution
 (`ResolvedTable::ws_dwords`), and DELAY opcodes call `AtomState::delay_us`.
 Unbound, the synthetic-table behaviour is unchanged.
 
+### Navi 22 native HDMI scanout (opt-in)
+
+`unsafe amdgpu_dcn30_hdmi::Hdmi::new(gpu, pci_cap, dig, transmitter)` owns one
+DIG frontend/VPG and backend: `check_idle` (refuses a live backend), `route(otg)`
+(`dcn10_link_encoder_setup(HDMI)`, `connect_dig_be_to_fe`,
+`enc1_dig_connect_to_otg`), `stream_attribute(khz)` (the register half of
+`enc3_stream_encoder_hdmi_set_stream_attribute`: RGB, 8 bpc, no scrambling —
+refused at or above 340 MHz — GC/NULL every frame, ACP off, AVMUTE released),
+`info_packets(&avi)` (VPG generic packet 0 with immediate update, GENERIC0 on
+line 2, packets 1–6 off; a pending VPG conflict fails) and `stop()`.
+`Otg::program_tmds_timing` is `optc1_program_timing` with start point 0.
+
+`unsafe amdgpu_navi22_modeset::Pipeline::new(gpu, pci_cap, connector)` claims
+pipe 0 (OTG/HUBP/DPP/MPCC/OPP), the DAL clock owner, HUBBUB and the
+connector's DIG. `unsafe enable(smu, pool, tables, vbios, crystal, sink, draw)`
+starts the DAL clocks, runs `dccg2_init` and (outside accelerated mode)
+`dcn10_bios_golden_init`, builds `dml30::Soc` from the board, `select`s the
+first EDID timing under the unscrambled TMDS and VSDB ceilings that DML30
+admits (with the CTA AVI InfoFrame; DVI sinks are refused), reserves,
+draws, HDP-flushes and publishes the scanout, programs HUBBUB, DISPCLK/DPPCLK
+and the DPP DTO, VBIOS SetPixelClock on combo PHY PLL 0, OTG timing/global
+sync, powers on DPP0/HUBP0 (`power_on_plane_resources`, HUBP clock), programs
+DPP/MPCC/OPP blanked and HUBP blanked, starts the OTG, then
+`enable_link_hdmi` (route, VBIOS STREAM_SETUP, attributes, AVI, VBIOS
+transmitter ENABLE) and finally unblanks HUBP then OPP. Any failure records
+`State::Failed { step, error }`, tears down in reverse and keeps the
+reservation published. `disable(tables)` is the same reverse order;
+`flush()` HDP-flushes CPU writes. `ColdBoot::modeset_hdmi()` (after
+`FirmwareReady`) lights the first connected HDMI sink with `test_pattern`
+and retains the pipeline; `amdgpu_navi22_platform::modeset_hdmi()` also
+publishes the scanout through `amdgpu_dcn_display::publish_external`, moving
+the console. The framebuffer handoff calls it only with the
+`amdgpu.native_display` kernel argument (the Navi48 flag). It reuses
+`amdgpu_navi48_boot::{edid_timings, hdmi_caps, hdmi_avi, limited_range,
+broadcast_rgb}` and `amdgpu_dcn401_otg::avi_infoframe`.
+
 ### Navi 22 native AUX, DDC and HPD
 
 `unsafe amdgpu_dcn30_ddc::Ddc::new(gpu, pci_cap, crystal_khz)` claims all six DCN3.0 AUX

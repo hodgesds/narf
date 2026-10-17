@@ -25,6 +25,7 @@ pub enum Error {
     Sdma(crate::amdgpu_sdma_navi22::Error),
     Dmub(crate::amdgpu_dmub_navi22::Error),
     Display(crate::amdgpu_navi22_display::Error),
+    Modeset(crate::amdgpu_navi22_modeset::Error),
     Queues(crate::amdgpu_cp_navi22::Error),
     Reset(crate::amdgpu_reset_navi22::Error),
     Interrupts(crate::amdgpu_ih_navi22::Error),
@@ -37,7 +38,7 @@ pub struct Firmware {
     graphics: gfx::Firmware,
     power: Option<power::Prepared>,
     dmub: Option<crate::amdgpu_dmub_navi22::Prepared>,
-    display: Option<(alloc::vec::Vec<crate::amdgpu_dcn_inventory::Path>, u32)>,
+    display: Option<DisplayPrep>,
 }
 impl Firmware {
     pub fn open(
@@ -67,7 +68,18 @@ impl Firmware {
         // bios_parser2 takes the crystal from dce_refclk_10khz (27 MHz if zero).
         let crystal =
             crate::amdgpu_dcn_inventory::dchub_refclk_khz(vbios.bytes()).map_err(inventory)?;
-        self.display = Some((paths, crystal));
+        // The VBIOS command tables and vram_info are needed after the
+        // controller's own copy becomes inaccessible.
+        let mut bytes = alloc::vec::Vec::new();
+        bytes
+            .try_reserve_exact(vbios.bytes().len())
+            .map_err(|_| Error::Allocation)?;
+        bytes.extend_from_slice(vbios.bytes());
+        self.display = Some(DisplayPrep {
+            paths,
+            crystal,
+            vbios: bytes,
+        });
         Ok(())
     }
     /// Prepare DCN3.0's nonsecure DMUB storage before starting any hardware.
@@ -98,6 +110,13 @@ impl Firmware {
         self.power = Some(prepared);
         Ok(())
     }
+}
+/// VBIOS-derived display inputs, copied before any device write.
+#[derive(Debug)]
+struct DisplayPrep {
+    paths: alloc::vec::Vec<crate::amdgpu_dcn_inventory::Path>,
+    crystal: u32,
+    vbios: alloc::vec::Vec<u8>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
@@ -257,6 +276,9 @@ struct Hardware {
     /// DCN3.0 Linux never routes AUX/HPD through DMUB; only an explicit
     /// opt-in plus a firmware capability reply re-enables that transport.
     dmub_aux: bool,
+    /// VBIOS copy and crystal for the native modeset, and its retained owner.
+    display_bios: Option<(alloc::vec::Vec<u8>, u32)>,
+    modeset: Option<crate::amdgpu_navi22_modeset::Pipeline>,
     queues: Option<Queues>,
     ih: Option<crate::amdgpu_ih_navi22::Ih>,
 }
@@ -718,6 +740,8 @@ impl ColdBoot {
                     dmub: None,
                     display: None,
                     dmub_aux: false,
+                    display_bios: None,
+                    modeset: None,
                     queues: None,
                     ih: None,
                 },
@@ -767,6 +791,8 @@ impl ColdBoot {
                     dmub: None,
                     display: None,
                     dmub_aux: false,
+                    display_bios: None,
+                    modeset: None,
                     queues: None,
                     ih: None,
                 },
@@ -934,7 +960,9 @@ impl ColdBoot {
             return Err(Error::Busy);
         }
         let h = &mut self.sequence.backend;
-        let (paths, crystal) = h.firmware.display.take().ok_or(Error::Invalid)?;
+        let prep = h.firmware.display.take().ok_or(Error::Invalid)?;
+        let (paths, crystal) = (prep.paths, prep.crystal);
+        h.display_bios = Some((prep.vbios, crystal));
         // SAFETY: this owner holds the whole GPU exclusively; DMUB AUX stays
         // disabled unless explicitly allowed, so no firmware AUX client exists.
         h.display = Some(
@@ -967,6 +995,70 @@ impl ColdBoot {
             .display
             .as_ref()
             .map(crate::amdgpu_navi22_display::Display::connectors)
+    }
+    /// Light the first connected HDMI connector natively with a colour-bar
+    /// test pattern (`amdgpu_navi22_modeset`). Off unless the platform opts in;
+    /// requires firmware readiness, the retained SMU and the display owner.
+    /// The pipeline is retained, lit or failed; there is no retry.
+    ///
+    /// # Safety
+    /// No other display, DMUB or VBIOS client may run, and nothing may write
+    /// the new scanout except through the returned framebuffer.
+    pub async unsafe fn modeset_hdmi(
+        &mut self,
+    ) -> Result<crate::amdgpu_navi22_modeset::Output, Error> {
+        use crate::amdgpu_navi22_display::{Detection, Signal};
+        use crate::amdgpu_navi22_modeset as modeset;
+        if self.sequence.backend.modeset.is_some() {
+            return Err(Error::Busy);
+        }
+        let reports = self.detect_displays().await?;
+        let h = &mut self.sequence.backend;
+        let Some((connector, sink)) = reports.into_iter().find_map(|r| match r.detection {
+            Detection::Connected(sink) if r.connector.signal == Signal::Hdmi => {
+                Some((r.connector, sink))
+            }
+            _ => None,
+        }) else {
+            return Err(Error::Modeset(modeset::Error::NoSink));
+        };
+        let (vbios, crystal) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
+        let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
+            .map_err(|e| Error::Modeset(modeset::Error::Bios(e)))?;
+        let smu = h.smu.as_mut().ok_or(Error::Invalid)?;
+        // SAFETY: this cold-boot owner holds the whole GPU; the caller's
+        // contract excludes other display clients.
+        let mut pipeline = unsafe { modeset::Pipeline::new(&h.gpu, h.authority, connector) }
+            .map_err(Error::Modeset)?;
+        // SAFETY: forwarded; the pool and SMU are this owner's.
+        let result = unsafe {
+            pipeline
+                .enable(
+                    smu,
+                    &h.pool,
+                    &tables,
+                    vbios,
+                    *crystal,
+                    &sink,
+                    modeset::test_pattern,
+                )
+                .await
+        };
+        h.modeset = Some(pipeline);
+        result.map_err(Error::Modeset)
+    }
+    /// HDP flush for CPU writes to the native scanout.
+    pub fn flush_display_scanout(&mut self) -> Result<(), Error> {
+        self.sequence
+            .backend
+            .modeset
+            .as_mut()
+            .ok_or(Error::Invalid)?
+            .flush()
+            .map_err(Error::Modeset)
+    }
+    pub fn modeset_state(&self) -> Option<crate::amdgpu_navi22_modeset::State> {
+        self.sequence.backend.modeset.as_ref().map(|p| p.state())
     }
     /// Re-enable the DMUB AUX/HPD transport (Linux `enable_dmub_aux_for_legacy_ddc`).
     /// It is still refused unless the running firmware answered

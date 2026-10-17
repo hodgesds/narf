@@ -954,6 +954,11 @@ explicitly allowed. Register models only; no physical EDID read yet.
 A native DCN3.0 DML port (`amdgpu_dml30`) admits one unscaled linear plane
 and derives DLG/TTU/RQ and HUBBUB watermark values, checked against host
 vectors computed from the Linux DML30 formulas.
+An opt-in (`amdgpu.native_display`) native HDMI TMDS path lights the first
+connected HDMI sink on pipe 0 with a test pattern: DCN init, HUBBUB/DML30
+deadlines, the DAL clocks and the VBIOS PixelClock/STREAM_SETUP/transmitter
+tables (now executed by an `atom.c`-faithful interpreter), then fetch and
+unblank. Model-tested per block; never run on hardware.
 These are software-tested foundations; training resume,
 VCN startup, display-aware DPM and OS thermal interrupt handling,
 hardware boot, general GPU mappings/GFX10 queue initialization, production
