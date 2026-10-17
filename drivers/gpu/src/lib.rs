@@ -159,6 +159,7 @@ pub mod amdgpu_ctx;
 pub mod amdgpu_dc;
 pub mod amdgpu_dccg;
 pub mod amdgpu_dcn;
+pub mod amdgpu_dcn30_audio;
 pub mod amdgpu_dcn30_clk;
 pub mod amdgpu_dcn30_ddc;
 pub mod amdgpu_dcn30_hdmi;

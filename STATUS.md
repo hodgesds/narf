@@ -980,6 +980,11 @@ connected HDMI sink on pipe 0 with a test pattern: DCN init, HUBBUB/DML30
 deadlines, the DAL clocks and the VBIOS PixelClock/STREAM_SETUP/transmitter
 tables (now executed by an `atom.c`-faithful interpreter), then fetch and
 unblank. Model-tested per block; never run on hardware.
+DCN3.0 HDMI and DP SST LPCM audio (`amdgpu_dcn30_audio`) follows Linux DC
+(`dce_audio.c`, `dcn30_afmt.c`, `enc3_se_*_audio_*`, `dce110_*_audio_stream`):
+audio wall-clock DTO0/DTO1, AFMT/ACR, the Audio InfoFrame and the Azalia
+endpoint ELD from the EDID, behind a start-after-unblank / stop-before-blank
+hook. Register models only.
 These are software-tested foundations; training resume,
 media submission/DPG, display-aware DPM, user command submission,
 hardware boot and DCN3.0 modesetting remain open. See the
