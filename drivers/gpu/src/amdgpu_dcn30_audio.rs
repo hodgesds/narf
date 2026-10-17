@@ -42,7 +42,7 @@ use crate::{
     amdgpu_navi22_display::Signal,
 };
 use core::future::Future;
-use narf_bus::{BusDeviceCap, MmioRegion};
+use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 /// A dword register in one of the two DCN 3.0.0 banks this owner touches.
@@ -267,7 +267,7 @@ pub(crate) trait Io: Send {
 }
 #[derive(Debug)]
 struct Mmio {
-    regs: MmioRegion,
+    regs: crate::amdgpu_reg_window::Window,
     bank1: u64,
     bank2: u64,
 }
@@ -844,7 +844,7 @@ impl Audio {
         };
         Ok(Self(Engine::new_with(
             Mmio {
-                regs: gpu.regs,
+                regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                 bank1: bank(1, LAST_BANK1)?,
                 bank2: bank(2, LAST_BANK2)?,
             },

@@ -130,14 +130,33 @@ fn navi22_bios_parameter_blocks_match_command_table2() -> TestResult {
     let t = Transmitter {
         action: TransmitterAction::Enable,
         transmitter: 3,
-        hdmi: true,
+        mode: TransmitterMode::Hdmi,
+        lanes: 4,
         hpd: Some(3),
+        connector: 0,
         symbol_khz: 148_500,
-    }
-    .params(6)
-    .unwrap();
-    if t[..12] != [3, 1, 3, 4, 0x02, 0x3a, 0, 0, 4, 0, 0, 0] || t[12..] != [0; 20] {
+    };
+    let p = t.params(6, 0).unwrap();
+    if p[..12] != [3, 1, 3, 4, 0x02, 0x3a, 0, 0, 4, 0, 0, 0] || p[12..] != [0; 48] {
         return TestResult::Fail("dig_transmitter_control_parameters_v1_6");
+    }
+    // DP lane settings as dcn10_link_encoder_dp_set_lane_settings: HBR2
+    // (symclk 54000 x 10 kHz), two lanes, DP_LANE_SET 0x09 in mode_laneset,
+    // the connector object id (CONNECTOR_ID_DISPLAY_PORT 19), HPO 0 on v1.7.
+    let lane = Transmitter {
+        action: TransmitterAction::SetupVsemph,
+        mode: TransmitterMode::DisplayPort,
+        lanes: 2,
+        connector: 19,
+        symbol_khz: 20 * 27_000,
+        ..t
+    };
+    let p = lane.params(7, 0x09).unwrap();
+    if p[..12] != [3, 11, 0x09, 2, 0xf0, 0xd2, 0, 0, 4, 0, 19, 0] {
+        return TestResult::Fail("dmub_dig_transmitter_control_data_v1_7 lane set");
+    }
+    if (Transmitter { lanes: 3, ..t }).params(6, 0).is_ok() {
+        return TestResult::Fail("three lanes admitted");
     }
     // enable_disp_power_gating_v2_1 for dcn10_bios_golden_init.
     if pipe_power_gating_params(0, PipeAction::Init).unwrap()[..2] != [0, 7]
@@ -213,8 +232,10 @@ fn navi22_bios_refuses_revisions_and_out_of_window_access() -> TestResult {
     let control = Transmitter {
         action: TransmitterAction::Disable,
         transmitter: 0,
-        hdmi: true,
+        mode: TransmitterMode::Hdmi,
+        lanes: 0,
         hpd: None,
+        connector: 12,
         symbol_khz: 0,
     };
     if tables.transmitter(bus.clone(), &control) != Err(Error::Bus)

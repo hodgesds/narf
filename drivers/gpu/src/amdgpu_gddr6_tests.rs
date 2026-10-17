@@ -160,8 +160,18 @@ kernel_test_in!(
 );
 
 fn gddr6_terminal_rejection_restores_but_unknown_completion_does_not() -> TestResult {
+    // psp_v11_0_memory_training_send_msg waits on bit 31 only: low status
+    // bits after completion are not a failure.
+    let mut e = engine();
+    let original = e.io.memory.clone();
+    e.io.completion = Some(DONE | 7);
+    if run(e.run()).is_err() || e.state != State::Ready || e.io.memory != original {
+        return TestResult::Fail("completed training with status bits treated as failure");
+    }
+    if TRAINING_TIMEOUT_MS < 3000 {
+        return TestResult::Fail("long-training deadline below MEM_TRAIN_SEND_MSG_TIMEOUT_US");
+    }
     for (completion, expected, restored) in [
-        (Some(DONE | 7), Error::Rejected(7), true),
         (Some(u32::MAX), Error::DeviceGone, false),
         (None, Error::Timeout, false),
     ] {
@@ -179,11 +189,17 @@ fn gddr6_terminal_rejection_restores_but_unknown_completion_does_not() -> TestRe
             return TestResult::Fail("failed training lost preimage, raced PSP or allowed replay");
         }
     }
+    // Linux checks the BIST signature only when deciding resume reuse.
     let mut e = engine();
     e.io.result = false;
     let original = e.io.memory.clone();
-    if run(e.run()) != Err(Error::InvalidTrainingData) || e.io.memory != original || !e.io.flushed {
-        return TestResult::Fail("invalid training cache exposed or boot pixels not restored");
+    if run(e.run()).is_err()
+        || e.state != State::Ready
+        || e.io.memory != original
+        || !e.io.flushed
+        || (e.state == State::Ready && e.cache_valid())
+    {
+        return TestResult::Fail("missing BIST signature failed boot or cache trusted");
     }
     TestResult::Pass
 }
@@ -305,17 +321,29 @@ fn gddr6_runtime_training_policy_is_bounded() -> TestResult {
     if policy(&db) != Ok(true) {
         return TestResult::Fail("enabled training flag ignored");
     }
-    for (offset, value) in [(2, 1), (4, 64), (12, 1), (13, 0), (14, 4), (15, 255)] {
+    // psp_get_runtime_db_entry ignores the version and treats a malformed
+    // directory or entry as absent (training stays enabled), never an error.
+    let mut other = db.clone();
+    other[1024] = 0;
+    other[2] = 1;
+    if policy(&other) != Ok(false) {
+        return TestResult::Fail("runtime DB version must not be checked");
+    }
+    for (offset, value) in [(4, 64), (12, 1), (13, 0), (14, 4), (15, 255)] {
         let mut bad = db.clone();
+        bad[1024] = 0;
         bad[offset] = value;
-        if policy(&bad).is_ok() {
-            return TestResult::Fail("malformed runtime DB accepted");
+        if policy(&bad) != Ok(true) {
+            return TestResult::Fail("malformed runtime DB must read as absent");
         }
     }
+    // The first matching entry wins, as in Linux's lookup loop.
+    db[1024] = 0;
     db[4] = 2;
-    db.copy_within(8..16, 16);
-    if policy(&db) != Err(Error::Invalid) {
-        return TestResult::Fail("duplicate boot configuration accepted");
+    db[16..24].copy_from_slice(&[5, 0, 0, 0, 0, 8, 8, 0]);
+    db[2048] = 2;
+    if policy(&db) != Ok(false) {
+        return TestResult::Fail("duplicate boot configuration did not use the first entry");
     }
     TestResult::Pass
 }

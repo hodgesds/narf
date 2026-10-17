@@ -24,6 +24,8 @@ const STOP: u32 = 0x10020000;
 const STATUS: u32 = 0x1e3;
 const MASK: u32 = 0x1fffffff;
 const NATIVE_CHANNELS: u8 = 4;
+/// GPINT version replies must match the firmware header on this generation.
+const STRICT_VERSION: bool = true;
 #[allow(
     clippy::duplicate_mod,
     reason = "instantiate the shared protocol against each generation's private Engine and register accessors"

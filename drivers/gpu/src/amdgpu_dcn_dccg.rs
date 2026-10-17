@@ -9,7 +9,7 @@ use crate::{
     amdgpu_dcn_profile::Profile,
 };
 use core::future::Future;
-use narf_bus::{BusDeviceCap, MmioRegion};
+use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // Profile selects DCN30 or DCN314; shared ids below were compared against
@@ -58,7 +58,7 @@ trait Io: Send {
 }
 #[derive(Debug)]
 struct Mmio {
-    regs: MmioRegion,
+    regs: crate::amdgpu_reg_window::Window,
     base: u64,
 }
 impl Io for Mmio {
@@ -258,7 +258,7 @@ impl Dccg {
         let base = profile.bank(gpu, 1, LAST_REG)?;
         Ok(Self(Engine {
             io: Mmio {
-                regs: gpu.regs,
+                regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                 base,
             },
             authority,

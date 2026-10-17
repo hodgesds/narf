@@ -78,6 +78,63 @@ impl VmHub {
 /// scheduler can evict + remint VMIDs while PASIDs are stable.
 pub type Pasid = u16;
 
+/// The PASIDs in use, one bit each (`amdgpu_pasid_alloc`'s IDA, 16 bits).
+static PASIDS: narf_lib::sync::IrqSafeSpinLock<[u64; 1024]> =
+    narf_lib::sync::IrqSafeSpinLock::new([0; 1024]);
+
+/// The last VM fault charged to a PASID, as Linux caches it per VM
+/// (`amdgpu_vm_update_fault_cache`): the faulting address, the hub's
+/// L2 protection-fault status and the hub (`AMDGPU_VMHUB_TYPE_GFX` 0,
+/// `_MM0` 1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FaultInfo {
+    pub addr: u64,
+    pub status: u32,
+    pub vmhub: u32,
+}
+
+static FAULTS: narf_lib::sync::IrqSafeSpinLock<alloc::collections::BTreeMap<Pasid, FaultInfo>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
+
+/// Charge a fault to `pasid` if it is allocated. As Linux, a zero status
+/// (a follow-on fault of the same burst) does not replace a useful one.
+pub fn record_fault(pasid: Pasid, info: FaultInfo) {
+    if info.status == 0 || pasid == 0 {
+        return;
+    }
+    let allocated = PASIDS.lock()[usize::from(pasid) / 64] & 1 << (pasid % 64) != 0;
+    if allocated {
+        FAULTS.lock().insert(pasid, info);
+    }
+}
+
+/// The last fault charged to `pasid`, zeros for none.
+pub fn fault(pasid: Pasid) -> FaultInfo {
+    FAULTS.lock().get(&pasid).copied().unwrap_or_default()
+}
+
+/// An allocated PASID, returned when dropped (`amdgpu_pasid_free`).
+#[derive(Debug)]
+pub struct PasidHandle(Pasid);
+impl PasidHandle {
+    /// The lowest free PASID, 0 excepted.
+    pub fn alloc() -> Option<Self> {
+        let mut used = PASIDS.lock();
+        let pasid = (1..=u16::MAX).find(|&p| used[usize::from(p) / 64] & 1 << (p % 64) == 0)?;
+        used[usize::from(pasid) / 64] |= 1 << (pasid % 64);
+        Some(Self(pasid))
+    }
+    pub fn get(&self) -> Pasid {
+        self.0
+    }
+}
+impl Drop for PasidHandle {
+    fn drop(&mut self) {
+        FAULTS.lock().remove(&self.0);
+        PASIDS.lock()[usize::from(self.0) / 64] &= !(1 << (self.0 % 64));
+    }
+}
+
 // ── Per-VMID state ───────────────────────────────────────────────
 
 /// State of one VMID slot.

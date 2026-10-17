@@ -103,6 +103,10 @@ pub mod bootloader_cmd {
     pub const LOAD_SPDMDRV: u32 = 0x2000_0000;
 }
 
+/// `enum psp_ring_type` (amdgpu_psp.h): every PSP11/13/14 driver creates the
+/// kernel-mode ring, `psp_ring_create(psp, PSP_RING_TYPE__KM)`.
+pub const PSP_RING_TYPE_KM: u32 = 2;
+
 // ── Ring control commands (C2PMSG_64) ─────────────────────────────
 
 /// `enum psp_gfx_ctrl_cmd_id`, written to C2PMSG_64 to create or tear down

@@ -146,6 +146,24 @@ pub const NBIO_SDMA1_DOORBELL_RANGE: u32 = 0x01d1;
 pub const NBIO_REMAP_HDP_MEM_FLUSH_CNTL: u32 = 0x012d;
 pub const LAST_NBIO: u32 = 0x01d1;
 
+// gfx_v10_3_set_power_brake_sequence (gc_10_3_0_offset.h, BASE_IDX 0;
+// GC_THROTTLE_CTRL is gfx_v10_0.c's mmGC_THROTTLE_CTRL_Sienna_Cichlid).
+pub const DIDT_IND_INDEX: Reg = Reg(0, 0x2020);
+pub const DIDT_IND_DATA: Reg = Reg(0, 0x2021);
+pub const GC_THROTTLE_CTRL: Reg = Reg(0, 0x2030);
+pub const GC_CAC_IND_INDEX: Reg = Reg(0, 0x203c);
+pub const GC_CAC_IND_DATA: Reg = Reg(0, 0x203d);
+/// Indirect ixPWRBRK_STALL_PATTERN_CTRL / ixDIDT_SQ_THROTTLE_CTRL.
+pub const IX_PWRBRK_STALL_PATTERN_CTRL: u32 = 0x0001;
+pub const IX_DIDT_SQ_THROTTLE_CTRL: u32 = 0x001a;
+/// PWRBRK_STEP_INTERVAL 1, BEGIN_STEP 0x12 (<<10), END_STEP 0x13 (<<15),
+/// THROTTLE_PATTERN_BIT_NUMS 0xf (<<20).
+pub const PWRBRK_STALL_PATTERN: u32 = 1 | (0x12 << 10) | (0x13 << 15) | (0xf << 20);
+/// PWRBRK_STALL_EN (<<2), PATTERN_MODE (<<5), RELEASE_STEP_INTERVAL 5 (<<13).
+pub const PWRBRK_THROTTLE: u32 = (1 << 2) | (1 << 5) | (5 << 13);
+/// DIDT_SQ_THROTTLE_CTRL.PWRBRK_STALL_EN (<<2).
+pub const PWRBRK_DIDT_SQ: u32 = 1 << 2;
+
 /// golden_settings_gc_10_3_2: (register, and_mask, or_mask).
 pub const GOLDEN: [(Reg, u32, u32); 42] = [
     (Reg(1, 0x507c), 0xff7f0fff, 0x78000100), // CGTT_SPI_CS_CLK_CTRL

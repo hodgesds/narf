@@ -30,8 +30,6 @@ const ENABLE_DISP_POWER_GATING: u16 = 13;
 const DIG1_TRANSMITTER_CONTROL: u16 = 76;
 // atomfirmware.h enumerations.
 const ATOM_ENCODER_MODE_HDMI: u8 = 3;
-const ATOM_TRANSMITTER_DIGMODE_V6_DP: u8 = 0;
-const ATOM_TRANSMITTER_DIGMODE_V6_HDMI: u8 = 3;
 const ATOM_ENCODER_CMD_STREAM_SETUP: u8 = 0x0f;
 const ATOM_COMBOPHY_PLL0: u8 = 20;
 /// `ENCODER_OBJECT_ID_INTERNAL_UNIPHY`, `_UNIPHY1`, `_UNIPHY2`.
@@ -65,11 +63,22 @@ pub enum PipeAction {
     Enable,
 }
 
-/// `bp_transmitter_control` actions this path issues.
+/// `bp_transmitter_control` actions this path issues
+/// (`atom_dig_transmitter_control_action`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransmitterAction {
     Disable = 0,
     Enable = 1,
+    /// `TRANSMITTER_CONTROL_SET_VOLTAGE_AND_PREEMPASIS`.
+    SetupVsemph = 11,
+}
+/// `signal_type_to_atom_dig_mode` (`command_table_helper2_dce112.c`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransmitterMode {
+    DisplayPort = 0,
+    /// Also what `SIGNAL_TYPE_NONE` maps to (the power-down path).
+    Dvi = 2,
+    Hdmi = 3,
 }
 
 /// The register bus the interpreter drives.
@@ -224,8 +233,22 @@ impl<'a> Tables<'a> {
         bus: Rc<RefCell<B>>,
         control: &Transmitter,
     ) -> Result<(), Error> {
+        self.transmitter_lane(bus, control, 0)
+    }
+    /// [`Tables::transmitter`] with the DP_LANE_SET byte a SETUP_VSEMPH
+    /// request carries (`dcn10_link_encoder_dp_set_lane_settings`).
+    pub fn transmitter_lane<B: Bus + 'static>(
+        &self,
+        bus: Rc<RefCell<B>>,
+        control: &Transmitter,
+        lane_set: u8,
+    ) -> Result<(), Error> {
         let revision = self.require(DIG1_TRANSMITTER_CONTROL, &[6, 7])?;
-        let mut params = ps(&control.params(revision)?);
+        let bytes = control.params(revision, lane_set)?;
+        // dig_transmitter_control_ps_allocation_v1_6 is 32 bytes; the v1.7
+        // payload is 60.
+        let len = if revision == 7 { 60 } else { 32 };
+        let mut params = ps(&bytes[..len]);
         self.execute(bus, DIG1_TRANSMITTER_CONTROL, &mut params)
     }
 }
@@ -300,38 +323,57 @@ pub(crate) fn hdmi_stream_setup_params(dig: u8, pixel_khz: u32) -> Result<[u8; 1
     Ok(p)
 }
 
-/// `bp_transmitter_control` for one TMDS (or DP) PHY.
+/// `bp_transmitter_control` for one PHY, marshalled as
+/// `transmitter_control_v1_6`/`v1_7` do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Transmitter {
     pub action: TransmitterAction,
     pub transmitter: u8,
-    pub hdmi: bool,
+    /// The DIG mode; for [`TransmitterAction::SetupVsemph`] the byte carries
+    /// `lane_set` instead.
+    pub mode: TransmitterMode,
+    /// `lanes_number`: four for TMDS enable, the trained count for DP, zero
+    /// when the caller leaves it unset (disable).
+    pub lanes: u8,
     /// Zero-based `hpd_source`, or `None` for `HPD_SOURCEID_UNKNOWN`.
     pub hpd: Option<u8>,
-    /// The PHY clock in kHz (`cntl->pixel_clock`).
+    /// `connector_obj_id.id`: set by the disable and lane-setting callers,
+    /// zero for enable (`dcn10_link_encoder_enable_{tmds,dp}_output`).
+    pub connector: u8,
+    /// The PHY clock in kHz (`cntl->pixel_clock`): the TMDS character rate,
+    /// or the DP link rate code x 27000.
     pub symbol_khz: u32,
 }
 impl Transmitter {
-    fn params(&self, revision: u8) -> Result<[u8; 32], Error> {
-        if self.transmitter >= STREAMS || self.hpd.is_some_and(|h| h >= STREAMS) {
+    fn params(&self, revision: u8, lane_set: u8) -> Result<[u8; 60], Error> {
+        if self.transmitter >= STREAMS
+            || self.hpd.is_some_and(|h| h >= STREAMS)
+            || !matches!(self.lanes, 0 | 1 | 2 | 4)
+        {
             return Err(Error::Invalid);
         }
-        // dig_transmitter_control_ps_allocation_v1_6 (and the byte-compatible
-        // v1.7 payload): phyid, action, digmode, lanenum, symclk_10khz,
-        // hpdsel (1-based), digfe_sel (always 0 on DCN), connobj_id (unset by
-        // the TMDS caller), HPO_instance (no HPO on DCN3.0).
-        let _ = revision;
-        let mut p = [0u8; 32];
+        // dig_transmitter_control_parameters_v1_6 / dmub_dig_transmitter_
+        // control_data_v1_7: phyid, action, digmode|dplaneset, lanenum,
+        // symclk_10khz, hpdsel (1-based), digfe_sel (always 0 on DCN: the
+        // driver routes the frontend), connobj_id. v1.7 adds HPO_instance,
+        // which Linux derives from an unset hpo_engine_id on the DIO path;
+        // DCN3.0 has no HPO, so it is sent as instance 0.
+        let mut p = [0u8; 60];
         p[0] = self.transmitter;
         p[1] = self.action as u8;
-        p[2] = if self.hdmi {
-            ATOM_TRANSMITTER_DIGMODE_V6_HDMI
+        p[2] = if self.action == TransmitterAction::SetupVsemph {
+            lane_set
         } else {
-            ATOM_TRANSMITTER_DIGMODE_V6_DP
+            self.mode as u8
         };
-        p[3] = 4;
+        p[3] = self.lanes;
         p[4..8].copy_from_slice(&(self.symbol_khz / 10).to_le_bytes());
         p[8] = self.hpd.map_or(0, |h| h + 1);
+        p[9] = 0;
+        p[10] = self.connector;
+        if revision == 7 {
+            p[11] = 0;
+        }
         Ok(p)
     }
 }
@@ -339,7 +381,7 @@ impl Transmitter {
 /// BAR5 dword bus with bounds, for the real device.
 #[derive(Debug)]
 pub struct Mmio {
-    regs: narf_bus::MmioRegion,
+    regs: crate::amdgpu_reg_window::Window,
     authority: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
 }
 impl Mmio {
@@ -350,7 +392,10 @@ impl Mmio {
         regs: narf_bus::MmioRegion,
         authority: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     ) -> Self {
-        Self { regs, authority }
+        Self {
+            regs: crate::amdgpu_reg_window::Window::new(regs),
+            authority,
+        }
     }
 }
 struct Op<F>(F);
@@ -368,7 +413,7 @@ impl<F: FnOnce() -> T, T> narf_capabilities::CapOp<narf_bus::BusDeviceCap, narf_
 impl Bus for Mmio {
     fn read(&mut self, dword: u32) -> Option<u32> {
         let offset = u64::from(dword) * 4;
-        if offset + 4 > self.regs.len {
+        if offset + 4 > self.regs.len() {
             return None;
         }
         let regs = self.regs;
@@ -379,7 +424,7 @@ impl Bus for Mmio {
     }
     fn write(&mut self, dword: u32, value: u32) -> bool {
         let offset = u64::from(dword) * 4;
-        if offset + 4 > self.regs.len {
+        if offset + 4 > self.regs.len() {
             return false;
         }
         let regs = self.regs;

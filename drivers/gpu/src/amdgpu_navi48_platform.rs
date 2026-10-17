@@ -210,7 +210,167 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     if let Some((limits, level)) = boot.power_info() {
         crate::amdgpu_navi48_power::start(limits, level);
     }
+    // Clients' command submissions run on the graphics queue.
+    if let (Some(card), Some(fence)) = (boot::ColdBoot::drm_card(), boot.client_fence_reader()) {
+        crate::amdgpu_cs::register_submitter(
+            card,
+            alloc::sync::Arc::new(Submitter { card, fence }),
+        );
+    }
+    // Clients' VRAM buffers; without it they fall back to system memory.
+    {
+        use core::fmt::Write as _;
+        let _ = match boot.publish_client_vram() {
+            Ok(bytes) => writeln!(
+                narf_console::Writer,
+                "amdgpu: navi48 client VRAM heap {} MiB",
+                bytes >> 20
+            ),
+            Err(e) => writeln!(
+                narf_console::Writer,
+                "amdgpu: navi48 no client VRAM heap: {e:?}"
+            ),
+        };
+    }
     Ok(report)
+}
+
+/// The Navi48 kernel queues behind AMDGPU_CS: up to eight IBs per
+/// submission, all for the graphics ring or all for the compute ring, run
+/// in the open's address space on client VMID 1, whose context every job's
+/// VM flush points at that space's root first.
+///
+/// A job's ticket is its pipe in the high 32 bits and its ring sequence in
+/// the low. `amdgpu_cs` records each job on its address space, so the
+/// buffers and page tables it may reach are freed only once its fence
+/// passes; every fence read here retires what completed jobs held.
+///
+/// Each job maps VMID 1 to its open's PASID in the IH LUT, so its faults
+/// carry the client's PASID and reach that open's GPUVM_FAULT query.
+///
+/// LINUX-GAP: VMID 1 for every client, always flushed — no per-client VMID
+/// reuse (amdgpu_vmid_grab). AMDGPU_INFO keeps reporting acceleration
+/// unavailable, so Mesa does not submit here.
+struct Submitter {
+    card: u32,
+    fence: crate::amdgpu_gfx12_queue::FenceReader,
+}
+const CLIENT_VMID: u8 = 1;
+const PIPES: [crate::amdgpu_gfx12_queue::Pipe; 2] = [
+    crate::amdgpu_gfx12_queue::Pipe::Graphics,
+    crate::amdgpu_gfx12_queue::Pipe::Compute,
+];
+/// Whether `ticket` is complete, given each pipe's completed sequence
+/// (32-bit sequences wrap).
+fn job_done(completed: [u32; 2], ticket: u64) -> bool {
+    let pipe = (ticket >> 32) as usize;
+    completed
+        .get(pipe)
+        .is_some_and(|&c| c.wrapping_sub(ticket as u32) as i32 >= 0)
+}
+impl Submitter {
+    /// Both pipes' completed sequences, retiring what completed jobs held.
+    /// None when the device stopped answering.
+    fn progress(&self) -> Option<[u32; 2]> {
+        let mut completed = [0; 2];
+        for (c, pipe) in completed.iter_mut().zip(PIPES) {
+            *c = self.fence.completed(pipe).ok()?;
+        }
+        crate::amdgpu_cs::retire(self.card, &|t| job_done(completed, t));
+        Some(completed)
+    }
+}
+impl crate::amdgpu_cs::Submitter for Submitter {
+    fn ring_for(&self, ip_type: u32, ip_instance: u32, ring: u32) -> Option<u32> {
+        match (ip_type, ip_instance, ring) {
+            (crate::amdgpu_uapi::AMDGPU_HW_IP_GFX, 0, 0) => Some(0),
+            (crate::amdgpu_uapi::AMDGPU_HW_IP_COMPUTE, 0, 0) => Some(1),
+            _ => None,
+        }
+    }
+    fn signalled(&self, ticket: u64) -> bool {
+        // A revoked or vanished device makes no more progress; report done
+        // so waiters cannot wedge.
+        self.progress()
+            .is_none_or(|completed| job_done(completed, ticket))
+    }
+    fn submit<'a>(
+        &'a self,
+        vm: &'a crate::amdgpu_vm::VmState,
+        submission: &'a crate::amdgpu_cs::Submission,
+    ) -> core::pin::Pin<
+        alloc::boxed::Box<
+            dyn core::future::Future<Output = Result<u64, narf_filesystem::FsError>> + Send + 'a,
+        >,
+    > {
+        alloc::boxed::Box::pin(async move {
+            use narf_filesystem::FsError;
+            let first = submission.ibs.first().ok_or(FsError::InvalidData)?;
+            let ring = self
+                .ring_for(first.ip_type, first.ip_instance, first.ring)
+                .ok_or(FsError::Unsupported)?;
+            if submission.ibs.len() > crate::amdgpu_gfx12_queue::MAX_JOB_IBS
+                || submission
+                    .ibs
+                    .iter()
+                    .any(|ib| self.ring_for(ib.ip_type, ib.ip_instance, ib.ring) != Some(ring))
+            {
+                return Err(FsError::Unsupported);
+            }
+            let pipe = PIPES[ring as usize];
+            let ibs: alloc::vec::Vec<(u64, u32)> = submission
+                .ibs
+                .iter()
+                .map(|ib| (ib.va_start, ib.length_dw))
+                .collect();
+            if vm.geometry() != crate::amdgpu_vm::Geometry::GMC12 {
+                return Err(FsError::InvalidData);
+            }
+            let pd_addr = vm.root_pde().ok_or(FsError::InvalidData)?;
+            let pasid = vm.pasid().ok_or(FsError::NoSpace)?;
+            let job = crate::amdgpu_gfx12_queue::Job::new(CLIENT_VMID, pasid, pd_addr, &ibs)
+                .ok_or(FsError::InvalidData)?;
+            let mut owner = OWNER.lock().await;
+            let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
+            // SAFETY: the platform serializes every queue user under OWNER;
+            // `amdgpu_cs` holds the job's memory until its fence.
+            let result = unsafe { boot.submit_client_job(pipe, job) };
+            drop(owner);
+            let _ = self.progress();
+            match result {
+                Ok(seq) => Ok(u64::from(ring) << 32 | u64::from(seq)),
+                Err(crate::amdgpu_gfx12_queue::Error::Busy) => Err(FsError::Busy),
+                Err(crate::amdgpu_gfx12_queue::Error::Invalid) => Err(FsError::InvalidData),
+                Err(_) => Err(FsError::NoDevice),
+            }
+        })
+    }
+    fn wait(
+        &self,
+        ticket: u64,
+        deadline_ns: u64,
+    ) -> core::pin::Pin<
+        alloc::boxed::Box<
+            dyn core::future::Future<Output = Result<bool, narf_filesystem::FsError>> + Send + '_,
+        >,
+    > {
+        alloc::boxed::Box::pin(async move {
+            use narf_filesystem::FsError;
+            if (ticket >> 32) as usize >= PIPES.len() {
+                return Err(FsError::InvalidData);
+            }
+            loop {
+                let completed = self.progress().ok_or(FsError::NoDevice)?;
+                if job_done(completed, ticket) {
+                    return Ok(true);
+                }
+                if narf_time::monotonic_ns() >= deadline_ns {
+                    return Ok(false);
+                }
+                narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
+            }
+        })
+    }
 }
 
 /// One PMFW telemetry refresh, serialized with every retained owner user.

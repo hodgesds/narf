@@ -345,11 +345,11 @@ fn navi22_dal_checks_all_six_streams_and_constructor_bounds() -> TestResult {
     }
     let mut registers = alloc::vec![0u32; 0x260d];
     let mut io = Mmio {
-        regs: MmioRegion {
+        regs: crate::amdgpu_reg_window::Window::new(narf_bus::MmioRegion {
             virt: registers.as_mut_ptr() as u64,
             len: registers.len() as u64 * 4,
             ..gpu.regs
-        },
+        }),
         mp1: 0,
         dcn: 0,
     };

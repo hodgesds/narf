@@ -112,6 +112,9 @@ struct Fake {
     smuio_vid: u32,
     mp1_sw: [u32; 2],
     banks: bool,
+    /// MP1_FIRMWARE_FLAGS reads before INTERRUPTS_ENABLED is reported.
+    fw_not_ready: usize,
+    fw_reads: usize,
 }
 impl Io for Fake {
     fn write_table(
@@ -152,6 +155,18 @@ impl Io for Fake {
             return Err(Error::Unsupported);
         }
         Ok(self.smuio_vid)
+    }
+    fn firmware_flags(&mut self) -> Result<u32, Error> {
+        assert!(
+            self.writes.is_empty(),
+            "PPSMC message before firmware ready"
+        );
+        self.fw_reads += 1;
+        Ok(if self.fw_reads > self.fw_not_ready {
+            1
+        } else {
+            0
+        })
     }
     fn stage_power(
         &mut self,
@@ -253,6 +268,8 @@ fn engine() -> Engine<Fake> {
             smuio_vid: 0x0040_0000,
             mp1_sw: [0, 1],
             banks: true,
+            fw_not_ready: 0,
+            fw_reads: 0,
         },
         authority: Cap::bootstrap(),
         state: State::Prepared,
@@ -297,6 +314,30 @@ fn smu_navi22_cold_mailbox_and_versions() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/smu-navi22",
     smu_navi22_cold_mailbox_and_versions
+);
+
+/// smu_v11_0_check_fw_status gates the first message on
+/// MP1_FIRMWARE_FLAGS.INTERRUPTS_ENABLED; never message a PMFW still booting.
+fn smu_navi22_waits_for_firmware_interrupts_before_first_message() -> TestResult {
+    let mut e = engine();
+    e.io.fw_not_ready = 3;
+    if run(e.verify()).is_err() || e.io.fw_reads != 4 || e.io.writes.len() != 6 {
+        return TestResult::Fail("first PPSMC message did not wait for INTERRUPTS_ENABLED");
+    }
+    let mut e = engine();
+    e.io.fw_not_ready = usize::MAX;
+    if run(e.verify()) != Err(Error::Timeout) || !e.io.writes.is_empty() || e.state != State::Failed
+    {
+        return TestResult::Fail("unready PMFW was messaged or wait unbounded");
+    }
+    if MESSAGE_TIMEOUT_MS < 2000 {
+        return TestResult::Fail("SMU message deadline shorter than Linux's default_timeout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    smu_navi22_waits_for_firmware_interrupts_before_first_message
 );
 
 fn smu_navi22_rejects_bad_interface_response_and_absent_device() -> TestResult {
@@ -661,18 +702,25 @@ fn smu_navi22_scpm_runtime_policy_fails_closed() -> TestResult {
             return TestResult::Fail("PSP power ownership ignored");
         }
     }
-    for (offset, value) in [(2, 1), (4, 64), (12, 8), (12, 33), (14, 3)] {
+    // psp_sw_init: a malformed DB/entry is "no SCPM entry", i.e. SCPM
+    // disabled and the driver uploads the PPTable. The version is ignored.
+    let mut other = db.clone();
+    other[2] = 1;
+    if read(&other) != Err(Error::PowerPolicy(u32::MAX)) {
+        return TestResult::Fail("runtime DB version must not be checked");
+    }
+    for (offset, value) in [(4, 64), (12, 8), (12, 33), (14, 3)] {
         let mut bad = db.clone();
         bad[offset] = value;
-        if read(&bad) != Err(Error::Invalid) {
-            return TestResult::Fail("malformed runtime policy accepted");
+        if read(&bad) != Ok(()) {
+            return TestResult::Fail("malformed runtime policy must read as absent");
         }
     }
     db[4] = 2;
-    let entry = db[8..16].to_vec();
-    db[16..24].copy_from_slice(&entry);
-    if read(&db) != Err(Error::Invalid) {
-        return TestResult::Fail("duplicate SCPM entries accepted");
+    db[16..24].copy_from_slice(&[6, 0, 0, 0, 40, 0, 4, 0]);
+    put(&mut db, 40, 0);
+    if read(&db) != Err(Error::PowerPolicy(u32::MAX)) {
+        return TestResult::Fail("duplicate SCPM entries did not use the first");
     }
     TestResult::Pass
 }

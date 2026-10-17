@@ -447,3 +447,109 @@ kernel_test_in!(
     "drivers/gpu/gmc-navi48",
     gmc_navi48_constructor_checks_exact_banks_and_pool_before_allocation
 );
+
+/// gfxhub_v12_0/mmhub_v4_1_0_setup_vmid_config for VMIDs 1..15, after
+/// VMID0: each context enabled with GMC 12's depth (3) and block size (9)
+/// in GC 12's CONTEXT_CNTL layout, every fault default and no retry,
+/// bounded to the 48-bit space, and based at an owned root whose every
+/// entry is GMC 12's invalid directory pattern. One invalidation of all
+/// fifteen per hub on engine 17, the MMHUB semaphore held around it.
+fn gmc_navi48_client_contexts_start_at_an_empty_root() -> TestResult {
+    let (_pool, mut engine) = fixture();
+    if run(engine.prepare_clients()) != Err(Error::Busy) {
+        return TestResult::Fail("client contexts before VMID0");
+    }
+    run(engine.initialize()).unwrap();
+    let ack = |hub: u64, reg: u64| hub + reg * 4;
+    for (hub, a, s) in [(0x10000, 0x166a, 0x1646), (0x20000, 0x5aa, 0x586)] {
+        engine.io.registers.insert(ack(hub, a), 0xffff);
+        engine.io.registers.insert(ack(hub, s), 1);
+    }
+    let writes = engine.io.writes.len();
+    if let Err(e) = run(engine.prepare_clients()) {
+        let _ = e;
+        return TestResult::Fail("client contexts");
+    }
+    if engine.state != State::ClientsReady
+        || !engine.state.vmid0_ready()
+        || engine.display_context().is_err()
+    {
+        return TestResult::Fail("VMID0 users after the client contexts");
+    }
+    // The empty root: 512 entries of PDE_PTE (bit 63), none VALID.
+    let root = 16384 / 4;
+    if (0..512).any(|i| engine.io.memory[root + 2 * i..root + 2 * i + 2] != [0, 0x8000_0000]) {
+        return TestResult::Fail("empty root pattern");
+    }
+    // depth 3 at 2:1, block size 0 at 7:4, no retry (bit 8), the seven
+    // fault defaults at 11..23.
+    let cntl = 1
+        | 3 << 1
+        | [11, 13, 15, 17, 19, 21, 23]
+            .iter()
+            .fold(0, |v, b| v | 1 << b);
+    for (hub, base, start, end, ctx, req, sem) in [
+        (0x10000u64, 0x168f, 0x16af, 0x16cf, 0x1624, 0x1658, 0x1646),
+        (0x20000, 0x5cf, 0x5ef, 0x60f, 0x564, 0x598, 0x586),
+    ] {
+        let reg = |r: u64| engine.io.registers.get(&(hub + r * 4)).copied();
+        for vmid in 1..16u64 {
+            // The fixture's VRAM physical addresses carry a high word of 1
+            // (VMID0's root is 0x1_0000_4001).
+            if reg(base + 2 * vmid) != Some(0x8001)
+                || reg(base + 2 * vmid + 1) != Some(1)
+                || reg(start + 2 * vmid) != Some(0)
+                || reg(end + 2 * vmid) != Some(u32::MAX)
+                || reg(end + 2 * vmid + 1) != Some(0xf)
+                || reg(ctx + vmid) != Some(cntl)
+            {
+                return TestResult::Fail("client context registers");
+            }
+        }
+        // VMID0's context is untouched.
+        if engine.io.writes[writes..]
+            .iter()
+            .any(|(a, _)| *a == hub + ctx * 4 || *a == hub + base * 4)
+        {
+            return TestResult::Fail("VMID0 reprogrammed");
+        }
+        if !engine.io.writes[writes..].contains(&(hub + req * 4, 0x00f8_fffe)) {
+            return TestResult::Fail("one invalidation of every client VMID");
+        }
+        let released = engine.io.writes[writes..].contains(&(hub + sem * 4, 0));
+        if released != (hub == 0x20000) {
+            return TestResult::Fail("semaphore only on MMHUB");
+        }
+    }
+    if run(engine.prepare_clients()) != Err(Error::Busy) {
+        return TestResult::Fail("client contexts replayed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi48",
+    gmc_navi48_client_contexts_start_at_an_empty_root
+);
+
+/// An MMHUB invalidation whose ACK never comes still releases the
+/// semaphore, and the owner quarantines itself.
+fn gmc_navi48_client_context_timeout_releases_the_semaphore() -> TestResult {
+    let (_pool, mut engine) = fixture();
+    run(engine.initialize()).unwrap();
+    engine.io.registers.insert(0x10000 + 0x166a * 4, 0xffff);
+    engine.io.registers.insert(0x20000 + 0x586 * 4, 1);
+    engine.io.stall = Some(0x20000 + 0x5aa * 4);
+    let writes = engine.io.writes.len();
+    if run(engine.prepare_clients()) != Err(Error::Timeout)
+        || engine.state != State::Failed
+        || engine.io.writes.last() != Some(&(0x20000 + 0x586 * 4, 0))
+        || engine.io.writes.len() == writes
+    {
+        return TestResult::Fail("timed-out client invalidation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi48",
+    gmc_navi48_client_context_timeout_releases_the_semaphore
+);

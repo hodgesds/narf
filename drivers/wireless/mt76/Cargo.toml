@@ -38,17 +38,19 @@ path = "src/lib.rs"
 default = ["builtin"]
 # Built-in: pull the real kernel crates. The driver body only compiles here.
 builtin = [
+    "dep:narf-init",
     "dep:narf-arch", "dep:narf-bus", "dep:narf-capabilities",
     "dep:narf-console", "dep:narf-driver-runtime", "dep:narf-drivers",
     "dep:narf-firmware", "dep:narf-interrupts", "dep:narf-io", "dep:narf-ipc",
     "dep:narf-kernel-test", "dep:narf-lib", "dep:narf-memory", "dep:narf-net",
-    "dep:narf-scheduler", "dep:narf-time", "dep:narf-wireless",
+    "dep:narf-scheduler", "dep:narf-time", "dep:narf-wireless", "dep:narf-crypto",
 ]
 # Module: NO kernel crates. The only undefined symbols in the `.ko` are the
 # C-ABI KSYMTAB exports; `xtask build-module`'s `nm -u` gate enforces that.
 module = []
 
 [dependencies]
+narf-init = { path = "../../../init", optional = true }
 # Always present: a decl-macro crate with no object code of its own, so it is
 # safe to link into the `.ko`.
 narf-driver-macros = { path = "../../../driver-macros" }
@@ -58,6 +60,7 @@ narf-arch         = { path = "../../../arch", optional = true }
 narf-bus          = { path = "../../../bus", optional = true }
 narf-capabilities = { path = "../../../capabilities", optional = true }
 narf-console      = { path = "../../../console", optional = true }
+narf-crypto       = { path = "../../../crypto", optional = true }
 narf-driver-runtime = { path = "../../runtime", optional = true, default-features = false, features = ["kernel"] }
 narf-drivers      = { path = "../..", optional = true }
 narf-firmware     = { path = "../../../firmware", optional = true }

@@ -8,8 +8,10 @@
 //! are used here.
 //!
 //! Scope, as Linux would see it: GPUVM and HostVM disabled (DCN30 scanout uses
-//! physical MC addresses), no DCC, no dynamic metadata, no writeback, no
-//! cursor, no ODM combine or MPC split, progressive scan, packed linear RGB.
+//! physical MC addresses), no DCC, no dynamic metadata, no writeback, at most
+//! the one 256-wide 32-bpp cursor `dcn20_populate_dml_pipes_from_context`
+//! always budgets for a graphics plane (`number_of_cursors` = 1), no ODM
+//! combine or MPC split, progressive scan, packed linear RGB.
 //! With GPUVM disabled `CalculateVMAndRowBytes` returns zero page-table and
 //! meta bytes, so `CalculatePrefetchSchedule`'s bandwidth cases 1 and 3 can
 //! never be selected (they need row bytes at least the row trip time); only
@@ -48,6 +50,14 @@ const DPPCLK_DELAY_SUBTOTAL: i64 = 46;
 const DPPCLK_DELAY_SCL: i64 = 50;
 const DPPCLK_DELAY_SCL_LB_ONLY: i64 = 16;
 const DPPCLK_DELAY_CNVC_FORMATTER: i64 = 27;
+/// `dppclk_delay_cnvc_cursor`, per cursor.
+const DPPCLK_DELAY_CNVC_CURSOR: i64 = 6;
+/// `cursor_buffer_size` in KiB and `number_of_cursors`.
+const CURSOR_BUFFER_KBYTES: u64 = 8;
+const MAX_CURSORS: u32 = 1;
+/// `cur0_src_width` 256 at `dm_cur_32bit`.
+pub const CURSOR_WIDTH: u64 = 256;
+const CURSOR_BPP: u64 = 32;
 const DISPCLK_DELAY_SUBTOTAL: i64 = 119;
 const MAX_INTER_DCN_TILE_REPEATERS: i64 = 8;
 /// `dispclk_ramp_margin_percent` = 1 and `dcn_downspread_percent` = 0.5.
@@ -190,6 +200,20 @@ pub struct Plan {
     pub dram_clock_change: DramClockChange,
     /// Fraction of the urgent return bandwidth this plane needs, thousandths.
     pub urgent_bandwidth_thousandths: u32,
+    /// `DCN_CUR0_TTU_CNTL0/1` for the budgeted cursor (`calculate_ttu_cursor`),
+    /// or `None` without one.
+    pub cursor: Option<CursorTtu>,
+}
+/// The cursor's request pacing, as `dml30_rq_dlg_get_dlg_reg` fills
+/// `refcyc_per_req_delivery_{pre_,}cur0`, `qos_level_fixed_cur0` and
+/// `qos_ramp_disable_cur0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorTtu {
+    /// U?.10 reference cycles per request.
+    pub refcyc_per_req_delivery: u32,
+    pub refcyc_per_req_delivery_pre: u32,
+    pub qos_level_fixed: u32,
+    pub qos_ramp_disable: u32,
 }
 
 fn mhz(khz: u32) -> Fx {
@@ -261,7 +285,7 @@ fn validate(config: &Config) -> Result<(), Error> {
         || p.viewport_height != t.v_active
         || p.h_taps != 1
         || p.v_taps != 1
-        || config.cursors != 0
+        || config.cursors > MAX_CURSORS
     {
         return Err(Error::Unsupported);
     }
@@ -315,6 +339,8 @@ struct Common {
     extra_latency: Fx,
     urgent_latency: Fx,
     read_bandwidth: Fx,
+    /// `cursor_bw` at VRatio 1: cursors x 256 x 32 / 8 bytes per line.
+    cursor_bandwidth: Fx,
     t_calc: Fx,
     dst_x_after_scaler: Fx,
     dst_y_after_scaler: u32,
@@ -447,6 +473,18 @@ fn urgent_burst(geometry: &Geometry, line_time: Fx, urgent: Fx, v_ratio: Fx) -> 
     Some(time.over(time.minus(urgent)))
 }
 
+/// The cursor half of `CalculateUrgentBurstFactor`: the cursor buffer holds
+/// `2^floor(log2(8 KiB / 1 KiB per line))` = 8 lines. `None` is
+/// `NotEnoughUrgentLatencyHiding`.
+fn cursor_burst(line_time: Fx, urgent: Fx, v_ratio: Fx) -> Option<Fx> {
+    let lines = 1u64 << log2_floor(CURSOR_BUFFER_KBYTES * 1024 / (CURSOR_WIDTH * CURSOR_BPP / 8));
+    let time = Fx::int(lines as i64).times(line_time).over(v_ratio);
+    if time <= urgent {
+        return None;
+    }
+    Some(time.over(time.minus(urgent)))
+}
+
 /// Mode support plus the performance calculation for one plane. Fails before
 /// any hardware is touched when the board cannot carry the mode.
 pub fn plan(config: &Config, soc: &Soc) -> Result<Plan, Error> {
@@ -570,6 +608,7 @@ pub fn plan(config: &Config, soc: &Soc) -> Result<Plan, Error> {
     let scaler = config.plane.h_taps > 1 || config.plane.v_taps > 1;
     let dpp_cycles = DPPCLK_DELAY_SUBTOTAL
         + DPPCLK_DELAY_CNVC_FORMATTER
+        + config.cursors as i64 * DPPCLK_DELAY_CNVC_CURSOR
         + if scaler {
             DPPCLK_DELAY_SCL
         } else {
@@ -604,6 +643,8 @@ pub fn plan(config: &Config, soc: &Soc) -> Result<Plan, Error> {
 
     // MaxVStartupLines: progressive, no writeback.
     let max_v_startup = (t.v_total - t.v_active).saturating_sub(1);
+    let cursor_bandwidth =
+        Fx::int((config.cursors as u64 * CURSOR_WIDTH * CURSOR_BPP / 8) as i64).over(line_time);
     let common = Common {
         line_time,
         pixel_clock,
@@ -614,6 +655,7 @@ pub fn plan(config: &Config, soc: &Soc) -> Result<Plan, Error> {
         extra_latency,
         urgent_latency,
         read_bandwidth,
+        cursor_bandwidth,
         t_calc,
         dst_x_after_scaler,
         dst_y_after_scaler,
@@ -632,6 +674,10 @@ pub fn plan(config: &Config, soc: &Soc) -> Result<Plan, Error> {
     // the one the configuration runs with.
     let burst = urgent_burst(&geometry, line_time, urgent_latency, geometry.v_ratio)
         .ok_or(Error::NoTimeForPrefetch)?;
+    // UrgentBurstFactorCursor (CursorWidth is 256 whether or not a cursor
+    // is budgeted, as Linux passes cur0_src_width).
+    let cursor = cursor_burst(line_time, urgent_latency, geometry.v_ratio)
+        .ok_or(Error::NoTimeForPrefetch)?;
     for mode in 0..=2u8 {
         let wait = t_wait(mode, urgent_latency);
         let mut lines = FIRST_VSTARTUP_LINES;
@@ -640,10 +686,21 @@ pub fn plan(config: &Config, soc: &Soc) -> Result<Plan, Error> {
             if let Some(s) = schedule(&common, &geometry, v_startup, wait) {
                 let pre_burst =
                     urgent_burst(&geometry, line_time, urgent_latency, s.v_ratio_prefetch);
-                if let Some(pre_burst) = pre_burst {
+                let cursor_pre = cursor_burst(line_time, urgent_latency, s.v_ratio_prefetch);
+                if let (Some(pre_burst), Some(cursor_pre)) = (pre_burst, cursor_pre) {
+                    // MaxTotalRDBandwidth: active fetch plus cursor, or the
+                    // prefetch plus the cursor at the prefetch VRatio.
                     let total = read_bandwidth
                         .times(burst)
-                        .max(s.required_bandwidth.times(pre_burst));
+                        .plus(common.cursor_bandwidth.times(cursor))
+                        .max(
+                            s.required_bandwidth.times(pre_burst).plus(
+                                common
+                                    .cursor_bandwidth
+                                    .times(s.v_ratio_prefetch)
+                                    .times(cursor_pre),
+                            ),
+                        );
                     if total <= return_bw
                         && s.dst_y_prefetch >= Fx::int(2)
                         && s.v_ratio_prefetch <= Fx::int(MAX_VRATIO_PREFETCH)
@@ -791,8 +848,15 @@ fn finish(
         min_ttu_vblank,
         soc.dchub_refclk_khz,
     )?;
-    // FractionOfUrgentBandwidth without urgent burst.
-    let fraction = c.read_bandwidth.max(s.required_bandwidth).over(c.return_bw);
+    // FractionOfUrgentBandwidth: MaxTotalRDBandwidthNoUrgentBurst.
+    let fraction = c
+        .read_bandwidth
+        .plus(c.cursor_bandwidth)
+        .max(
+            s.required_bandwidth
+                .plus(c.cursor_bandwidth.times(s.v_ratio_prefetch)),
+        )
+        .over(c.return_bw);
     let frac_urg_bw_nom = fraction.times(Fx::int(1000)).floor().clamp(0, 0x3ff) as u32;
     // convert_and_clamp(ns, refclk): ns is already truncated by the caller.
     let cycles = |us: Fx| -> u32 {
@@ -808,7 +872,43 @@ fn finish(
         frac_urg_bw_nom,
         frac_urg_bw_flip: 0,
     };
+    // calculate_ttu_cursor for one 256-wide 32-bpp cursor: 256-byte
+    // requests of 64 pixels, four per line, hscl_ratio 1.
+    let cursor = (config.cursors > 0).then(|| {
+        let refclk = mhz(soc.dchub_refclk_khz);
+        let ref_to_pix = refclk.over(c.pixel_clock);
+        let req_width = 256 / (CURSOR_BPP / 8);
+        let req_per_width = CURSOR_WIDTH.div_ceil(req_width) as i64;
+        let delivery = |v_ratio: Fx| {
+            if v_ratio <= Fx::ONE {
+                Fx::int(CURSOR_WIDTH as i64)
+                    .times(ref_to_pix)
+                    .over(Fx::int(req_per_width))
+            } else {
+                refclk
+                    .times(Fx::int(CURSOR_WIDTH as i64))
+                    .over(Fx::int(2).times(c.dppclk))
+                    .over(Fx::int(req_per_width))
+            }
+        };
+        let fixed = |v: Fx| field(v, 10, 23);
+        (
+            fixed(delivery(Fx::ONE)),
+            fixed(delivery(prefetch.v_ratio_prefetch)),
+        )
+    });
+    let cursor = match cursor {
+        Some((Ok(nominal), Ok(pre))) => Some(CursorTtu {
+            refcyc_per_req_delivery: nominal,
+            refcyc_per_req_delivery_pre: pre,
+            qos_level_fixed: 8,
+            qos_ramp_disable: 0,
+        }),
+        Some(_) => return Err(Error::Unsupported),
+        None => None,
+    };
     Ok(Plan {
+        cursor,
         prefetch_mode: mode,
         geometry: *geometry,
         clocks,

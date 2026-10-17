@@ -20,6 +20,9 @@ const BOARD_RESERVED: usize = 1592;
 
 // smu11_driver_if_sienna_cichlid.h. Retain posted display/memory/link clocks
 // until DCN owns their constraints. No deep sleep, BACO, hub gating or GFXOFF.
+// RSMU_SMN_CG (44) and DF_CSTATE (45) are in every
+// sienna_cichlid_init_allowed_features mask; with PMFW-centralized C-state
+// management (MP0 11.0.11) PMFW owns the DF C-states.
 const BOOT_ALLOWED: u64 = (1 << 0)
     | (1 << 1)
     | (1 << 24)
@@ -30,7 +33,28 @@ const BOOT_ALLOWED: u64 = (1 << 0)
     | (1 << 33)
     | (1 << 37)
     | (1 << 38)
-    | (1 << 42);
+    | (1 << 42)
+    | (1 << 44)
+    | (1 << 45);
+/// Features whose activity would break this boot's ownership assumptions if
+/// PMFW reported them without being allowed: memory/link/display DPM and
+/// rail scaling (3,4,5,7,8,10,11), deep sleep (12..17), ULV (18), GFXOFF (20),
+/// BACO (21), MM_DPM_PG (22) and MMHUB/ATHUB power gating (40, 41). Linux
+/// never checks the running set; any other extra feature is tolerated.
+const BOOT_HAZARDS: u64 = (1 << 3)
+    | (1 << 4)
+    | (1 << 5)
+    | (1 << 7)
+    | (1 << 8)
+    | (1 << 10)
+    | (1 << 11)
+    | (0x3f << 12)
+    | (1 << 18)
+    | (1 << 20)
+    | (1 << 21)
+    | (1 << 22)
+    | (1 << 40)
+    | (1 << 41);
 const BOOT_REQUIRED: u64 = (1 << 1) | (1 << 24) | (1 << 25) | (1 << 31) | (1 << 32) | (1 << 33);
 // DPM_UCLK/FCLK/SOCCLK/DCEFCLK plus board-supported memory rail scaling.
 // Deep sleep, link DPM, BACO and clock/power gating stay excluded.
@@ -58,7 +82,7 @@ impl BootPolicy {
         })
     }
     pub(crate) fn validate_enabled(self, enabled: u64) -> bool {
-        enabled & BOOT_REQUIRED == BOOT_REQUIRED && enabled & !self.allowed == 0
+        enabled & BOOT_REQUIRED == BOOT_REQUIRED && enabled & !self.allowed & BOOT_HAZARDS == 0
     }
     pub(crate) fn display_allowed(self) -> Result<u64, Error> {
         if self.board_features & DISPLAY_REQUIRED != DISPLAY_REQUIRED {
@@ -68,8 +92,9 @@ impl BootPolicy {
     }
     pub(crate) fn validate_display(self, enabled: u64) -> bool {
         let required = BOOT_REQUIRED | DISPLAY_REQUIRED;
-        self.display_allowed()
-            .is_ok_and(|allowed| enabled & required == required && enabled & !allowed == 0)
+        self.display_allowed().is_ok_and(|allowed| {
+            enabled & required == required && enabled & !allowed & BOOT_HAZARDS == 0
+        })
     }
 }
 
