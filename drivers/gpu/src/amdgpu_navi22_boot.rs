@@ -982,6 +982,29 @@ impl ColdBoot {
             limits: smu.limits(),
         })
     }
+    /// Arm the SMU11 THM/MP1 alert sources after a completed boot with power
+    /// setup (Linux smu_smc_hw_setup runs after IH hw_init). Returns the
+    /// acknowledge handle the SMU-to-driver handler uses.
+    pub(crate) async fn enable_thermal_alert(
+        &mut self,
+    ) -> Result<(smu::Alert, smu::InterruptAck), Error> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_))
+            || self.sequence.backend.power_status.is_none()
+        {
+            return Err(Error::Busy);
+        }
+        let smu = self.sequence.backend.smu.as_mut().ok_or(Error::Invalid)?;
+        let alert = smu.enable_thermal_alert().await.map_err(Error::Smu)?;
+        Ok((alert, smu.interrupt_ack()))
+    }
+    /// `ReenableAcDcInterrupt` for an AC/DC SMU-to-driver interrupt.
+    pub(crate) async fn reenable_acdc(&mut self) -> Result<(), Error> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_)) {
+            return Err(Error::Busy);
+        }
+        let smu = self.sequence.backend.smu.as_mut().ok_or(Error::Invalid)?;
+        smu.reenable_acdc_interrupt().await.map_err(Error::Smu)
+    }
     /// Transfer the live ring/TMR owner after full firmware success. It must
     /// remain alive for subsequent GPU initialization; dropping it quarantines
     /// device-owned VRAM. Reset all consumers before calling its unsafe stop.

@@ -1033,3 +1033,82 @@ kernel_test_in!(
     "drivers/gpu/smu-navi22",
     smu_navi22_telemetry_requires_power_and_fails_terminally
 );
+
+fn smu_navi22_thermal_alert_programs_smu_v11_0_set_irq_state() -> TestResult {
+    let (mut engine, _pool) = powered_engine(0x413f00);
+    // Masked/disabled reset values plus unrelated TEMP_THRESHOLD/PROCHOT bits.
+    engine.io.thm[THM_INT_CTRL as usize] = 0x0f12_3456 | (3 << 24) | (1 << 26);
+    engine.io.mp1_sw = [0x1ab, 0x1];
+    let alert = run(engine.enable_thermal_alert()).unwrap();
+    if alert
+        != (Alert {
+            armed: true,
+            window: (0, 118),
+            acdc_rearmed: false,
+        })
+    {
+        return TestResult::Fail("alert result");
+    }
+    // MAX_IH_CREDIT=5, IH_HW_ENA, INTH/INTL unmasked, TRIGGER unmasked,
+    // DIG_THERM_INTH=118, INTL=0; TEMP_THRESHOLD and PROCHOT preserved.
+    let ctrl = (5 << 29) | (1 << 28) | (1 << 27) | (0x12 << 16) | 118;
+    if engine.io.writes
+        != [
+            (0x1_0000 | THM_INT_CTRL, ctrl),
+            (0x1_0000 | THM_INT_ENA, 0x38),
+            (MP1_SW_INT, 0xfe),
+            (MP1_SW_INT_CTRL, 0),
+        ]
+    {
+        return TestResult::Fail("THM window / MP1 SW interrupt programming");
+    }
+    if engine.state != State::PowerReady {
+        return TestResult::Fail("alert left the owner busy");
+    }
+    // No thermal controller: Linux skips amdgpu_irq_get entirely.
+    let (mut engine, _pool) = powered_engine(0x413f00);
+    engine.limits.as_mut().unwrap().thermal_controller = 0;
+    if run(engine.enable_thermal_alert()).map(|a| a.armed) != Ok(false)
+        || !engine.io.writes.is_empty()
+    {
+        return TestResult::Fail("alert programmed without a thermal controller");
+    }
+    // GPIO-signalled DC with ACDC running re-arms AC/DC delivery.
+    let (mut engine, _pool) = powered_engine(0x413f00);
+    engine.limits.as_mut().unwrap().dc_by_gpio = true;
+    engine.io.running |= crate::amdgpu_smu_navi22_telemetry::FEATURE_ACDC;
+    let alert = run(engine.enable_thermal_alert()).unwrap();
+    if !alert.acdc_rearmed
+        || commands(&engine.io.writes)
+            != [
+                (RUNNING_LOW, 0),
+                (RUNNING_HIGH, 0),
+                (REENABLE_ACDC_INTERRUPT, 0),
+            ]
+    {
+        return TestResult::Fail("process_pending_interrupt");
+    }
+    // Missing THM bank and absent device fail closed; before power, Busy.
+    let (mut engine, _pool) = powered_engine(0x413f00);
+    engine.io.banks = false;
+    if run(engine.enable_thermal_alert()) != Err(Error::Unsupported) {
+        return TestResult::Fail("missing THM bank");
+    }
+    let (mut engine, _pool) = powered_engine(0x413f00);
+    engine.io.thm[THM_INT_CTRL as usize] = u32::MAX;
+    if run(engine.enable_thermal_alert()) != Err(Error::DeviceGone) || engine.state != State::Failed
+    {
+        return TestResult::Fail("absent device armed");
+    }
+    let limits = powered_engine(0x413f00).0.limits;
+    let mut engine = ready_engine();
+    engine.limits = limits;
+    if run(engine.enable_thermal_alert()) != Err(Error::Busy) {
+        return TestResult::Fail("alert before boot power setup");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    smu_navi22_thermal_alert_programs_smu_v11_0_set_irq_state
+);

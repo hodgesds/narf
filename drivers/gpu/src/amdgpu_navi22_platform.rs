@@ -35,6 +35,7 @@ pub struct Diagnostics {
     pub gfx: Option<crate::amdgpu_psp_ring::GfxBootStatus>,
     pub dmub: Option<crate::amdgpu_dmub_navi22::MailboxState>,
     pub power: Option<crate::amdgpu_navi22_power::Snapshot>,
+    pub thermal: crate::amdgpu_navi22_thermal::Status,
 }
 pub fn status() -> Status {
     match OWNER.try_lock() {
@@ -46,6 +47,7 @@ pub fn status() -> Status {
                 gfx: boot.gfx_boot_status(),
                 dmub: boot.dmub_mailbox_state(),
                 power: crate::amdgpu_navi22_power::snapshot(),
+                thermal: crate::amdgpu_navi22_thermal::status(),
             })
         }),
     }
@@ -217,16 +219,60 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     let mut owner = OWNER.lock().await;
     let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
     let report = boot.run().await?;
-    start_services(boot);
+    start_services(boot).await;
     Ok(report)
 }
 
 /// Runtime services of a completed (or recovered) owner: PMFW telemetry and
-/// hwmon. They run as executor tasks that take the owner lock per refresh.
-fn start_services(boot: &mut boot::ColdBoot) {
-    if let Some(limits) = boot.power_limits() {
-        crate::amdgpu_navi22_power::start(Some(limits));
+/// hwmon, then the SMU11 thermal interrupts. They run as executor tasks that
+/// take the owner lock per refresh. Failures are reported, never fatal.
+async fn start_services(boot: &mut boot::ColdBoot) {
+    use core::fmt::Write;
+    let Some(limits) = boot.power_limits() else {
+        return;
+    };
+    crate::amdgpu_navi22_power::start(Some(limits));
+    let Some(ih) = boot.interrupts() else {
+        return;
+    };
+    // Subscribe first so the alert enable cannot raise an unrouted IV.
+    let subscriptions = match crate::amdgpu_navi22_thermal::subscribe(&ih) {
+        Ok(subscriptions) => subscriptions,
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 thermal interrupts unavailable: {error:?}"
+            );
+            return;
+        }
+    };
+    match boot.enable_thermal_alert().await {
+        Ok((alert, ack)) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 thermal alert {alert:?}"
+            );
+            crate::amdgpu_navi22_thermal::spawn(subscriptions, alert, ack, Some(limits));
+        }
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 thermal alert failed: {error:?}"
+            );
+        }
     }
+}
+
+/// ReenableAcDcInterrupt through the retained SMU owner.
+pub(crate) async fn reenable_acdc() -> Result<(), crate::amdgpu_smu_navi22::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_smu_navi22::Error::Busy)?;
+    boot.reenable_acdc().await.map_err(|error| match error {
+        boot::Error::Smu(error) => error,
+        _ => crate::amdgpu_smu_navi22::Error::Busy,
+    })
 }
 
 /// One PMFW telemetry refresh, serialized with every retained owner user.

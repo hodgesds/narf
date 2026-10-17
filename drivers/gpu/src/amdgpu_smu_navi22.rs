@@ -670,6 +670,13 @@ impl<I: Io> Engine<I> {
         self.end_runtime(resume, &result);
         result
     }
+    /// `smu_v11_0_ack_ac_dc_interrupt` (AC/DC context of the SMU interrupt).
+    async fn reenable_acdc(&mut self) -> Result<(), Error> {
+        let resume = self.begin_runtime()?;
+        let result = self.command(REENABLE_ACDC_INTERRUPT, 0).await.map(|_| ());
+        self.end_runtime(resume, &result);
+        result
+    }
     async fn enable_display_power(&mut self) -> Result<(), Error> {
         if self.state == State::DisplayPowerReady {
             return self.access(|_| ());
@@ -883,6 +890,10 @@ impl Smu {
     /// in smu_smc_hw_setup, after IH hw_init). Fan control stays automatic.
     pub async fn enable_thermal_alert(&mut self) -> Result<Alert, Error> {
         self.engine.enable_thermal_alert().await
+    }
+    /// Re-arm AC/DC notification after an AC/DC SMU-to-driver interrupt.
+    pub async fn reenable_acdc_interrupt(&mut self) -> Result<(), Error> {
+        self.engine.reenable_acdc().await
     }
     /// The SMU-to-driver acknowledge register handle.
     pub fn interrupt_ack(&self) -> InterruptAck {

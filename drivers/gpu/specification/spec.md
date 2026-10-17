@@ -3351,6 +3351,27 @@ PMFW automatic mode. The monitor logs throttling start/end, lost protection,
 the first failed refresh and hotspot at `software_shutdown_temp`; shutdown
 policy belongs to the thermal interrupts below. Model-tested only.
 
+`Smu::enable_thermal_alert().await` (`ColdBoot::enable_thermal_alert`) follows
+`smu_v11_0_enable_thermal_alert`: with a nonzero `thermal_controller_type` it
+programs `THM_THERMAL_INT_CTRL` (MAX_IH_CREDIT 5, IH_HW_ENA, INTH/INTL and
+TRIGGER unmasked, DIG_THERM_INTH = min(255, `software_shutdown_temp`),
+DIG_THERM_INTL = 0), clears `THM_THERMAL_INT_ENA` (INTH/INTL/TRIGGER_CLR),
+sets `MP1_SMN_IH_SW_INT.ID` 0xFE and unmasks `MP1_SMN_IH_SW_INT_CTRL`; with a
+GPIO-signalled DC cap and FEATURE_ACDC running it sends `ReenableAcDcInterrupt`
+(0x34). It returns `Alert { armed, window, acdc_rearmed }`; `InterruptAck`
+sets `INT_ACK` without the mailbox. After telemetry, `run` subscribes the four
+`smu_v11_0_register_irq_handler` sources (THM 0x0f src 0/1, ROM_SMUIO 0x16 src
+83, MP1 0x1f src 0xfe) *before* arming them and spawns one task per source
+(`amdgpu_navi22_thermal`). L2H waits 50 ms (`AMDGPU_SWCTF_EXTRA_DELAY`),
+re-reads the hotspot and, at or above `software_shutdown_temp` — or with no
+reading or no limit, as `smu_swctf_delayed_work_handler` — logs the SW CTF and
+powers off; H2L only logs; GPIO19 CTF logs and powers off at once; SMU-to-driver
+acknowledges, then AC/DC (3/4) re-arms AC/DC and thermal throttling (7) counts.
+NARF has no userspace poweroff helper or write-back, so `orderly_poweroff(true)`
+reduces to its forced fallback, `narf_power::system::power_off()`.
+`amdgpu_navi22_thermal::status()` (also in platform `Diagnostics::thermal`)
+reports the alert, per-source counters and any shutdown reason.
+
 ### Navi 22 DCN3.0 DMUB startup
 
 `amdgpu_dmub_navi22::Prepared::new(image, vbios, psp_version)` parses the

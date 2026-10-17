@@ -948,8 +948,10 @@ after the memory hubs and proves delivery with an SDMA0 TRAP.
 PMFW telemetry now uses the retained SMU11 table buffer (V1/V2 metrics by
 PMFW version, Linux-checked layouts) and feeds a read-only hwmon node shared
 with Navi48 (temperatures, fan, power, clocks); fan control stays automatic.
+The SMU11 THM L2H/H2L, GPIO19 CTF and SMU-to-driver interrupts are armed and
+handled as smu_v11_0 does, including the delayed SW CTF check and power-off.
 These are software-tested foundations; training resume,
-VCN startup, display-aware DPM and OS thermal interrupt handling,
+VCN startup, display-aware DPM,
 hardware boot, general GPU mappings/GFX10 queue initialization, production
 SDMA submissions/interrupts and DCN3.0
 modesetting remain open. See the

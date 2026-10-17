@@ -221,6 +221,7 @@ pub mod amdgpu_mst;
 pub mod amdgpu_navi22_boot;
 pub mod amdgpu_navi22_platform;
 pub mod amdgpu_navi22_power;
+pub mod amdgpu_navi22_thermal;
 pub mod amdgpu_navi48_boot;
 pub mod amdgpu_navi48_dispatch;
 pub mod amdgpu_navi48_display;
