@@ -12081,3 +12081,491 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_commit_flush_failure_goes_read_only
 );
+
+// ── truncate / fallocate / punch / zero-range / remount ────────────
+
+type SyncVol = Arc<BtrfsVolume<narf_block::SyncBlock>>;
+
+fn file_layout(vol: &SyncVol, ino: u64) -> Vec<crate::write::fileops::FileItem> {
+    let (fs_root, _) = vol.fs_tree_root();
+    poll_once(crate::write::fileops::file_items(vol, fs_root, ino))
+        .and_then(|r| r.ok())
+        .unwrap_or_default()
+}
+
+/// Linux's per-inode invariants after a size/allocation change:
+/// - items sorted and non-overlapping, none starting at or past
+///   `align_up(size)` unless preallocated (`KEEP_SIZE`);
+/// - `nbytes` = the bytes of every inline/disk item;
+/// - with `^no-holes`, no gap below `align_up(size)`;
+/// - each disk extent's `EXTENT_ITEM.refs` = the items naming it;
+/// - REG ranges have checksums, purely preallocated extents none.
+fn size_invariants(vol: &SyncVol, ino: u64) -> Result<(), &'static str> {
+    use crate::write::fileops::Kind;
+    let items = file_layout(vol, ino);
+    let (fs_root, _) = vol.fs_tree_root();
+    let inode = poll_once(btree::find_item(
+        vol,
+        fs_root,
+        &BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0),
+    ))
+    .and_then(|r| r.ok())
+    .flatten()
+    .ok_or("inode missing")?;
+    let size = format::le64(&inode, 16).unwrap();
+    let nbytes = format::le64(&inode, 24).unwrap();
+    let ss = u64::from(vol.sectorsize());
+    let eof = size.div_ceil(ss) * ss;
+    let mut at = 0u64;
+    let mut sum = 0u64;
+    let no_holes = vol.superblock().incompat_flags & format::INCOMPAT_NO_HOLES != 0;
+    for item in &items {
+        if item.start < at {
+            return Err("overlapping file items");
+        }
+        if !no_holes && item.start > at && item.start <= eof {
+            return Err("gap without a hole item on a ^no-holes filesystem");
+        }
+        if item.start >= eof && !matches!(item.kind, Kind::Disk { prealloc: true }) {
+            return Err("a non-prealloc item lies past EOF");
+        }
+        if item.kind != Kind::Hole {
+            sum += item.end - item.start;
+        }
+        at = item.end;
+    }
+    if !no_holes && at < eof {
+        return Err("tail gap without a hole item on a ^no-holes filesystem");
+    }
+    if sum != nbytes {
+        return Err("inode nbytes != bytes of its items");
+    }
+    let root_tree = vol.root_tree_root().0;
+    let ext = poll_once(crate::roots::find_root(
+        vol,
+        root_tree,
+        format::EXTENT_TREE_OBJECTID,
+    ))
+    .and_then(|r| r.ok())
+    .ok_or("no extent root")?
+    .0;
+    let csum = poll_once(crate::roots::find_root(
+        vol,
+        root_tree,
+        format::CSUM_TREE_OBJECTID,
+    ))
+    .and_then(|r| r.ok())
+    .map(|r| r.0);
+    let disk: Vec<_> = items
+        .iter()
+        .filter(|i| matches!(i.kind, Kind::Disk { .. }))
+        .collect();
+    for item in &disk {
+        let bytenr = format::le64(&item.body, 21).unwrap();
+        let len = format::le64(&item.body, 29).unwrap();
+        let pieces = disk
+            .iter()
+            .filter(|o| format::le64(&o.body, 21).unwrap() == bytenr)
+            .count() as u64;
+        let ext_item = poll_once(btree::find_item(
+            vol,
+            ext,
+            &BtrfsKey::new(bytenr, format::EXTENT_ITEM_KEY, len),
+        ))
+        .and_then(|r| r.ok())
+        .flatten()
+        .ok_or("a file item names a disk extent with no EXTENT_ITEM")?;
+        if format::le64(&ext_item, 0).unwrap() != pieces {
+            return Err("EXTENT_ITEM refs != file items naming the extent");
+        }
+        let has_reg = disk.iter().any(|o| {
+            format::le64(&o.body, 21).unwrap() == bytenr
+                && matches!(o.kind, Kind::Disk { prealloc: false })
+        });
+        let csum_at = |logical: u64| {
+            csum.and_then(|root| {
+                poll_once(btree::last_before(
+                    vol,
+                    root,
+                    &BtrfsKey::new(
+                        format::EXTENT_CSUM_OBJECTID,
+                        format::EXTENT_CSUM_KEY,
+                        logical + 1,
+                    ),
+                ))
+                .and_then(|r| r.ok())
+                .flatten()
+            })
+            .is_some_and(|(k, body)| {
+                k.objectid == format::EXTENT_CSUM_OBJECTID
+                    && k.item_type == format::EXTENT_CSUM_KEY
+                    && k.offset <= logical
+                    && k.offset + (body.len() as u64 / 4) * ss > logical
+            })
+        };
+        match item.kind {
+            Kind::Disk { prealloc: false } => {
+                let first = bytenr + format::le64(&item.body, 37).unwrap();
+                if item.body[16] == format::COMPRESS_NONE && !csum_at(first) {
+                    return Err("a regular extent has no checksum");
+                }
+            }
+            Kind::Disk { prealloc: true } if !has_reg => {
+                if csum_at(bytenr) {
+                    return Err("a preallocated extent carries checksums");
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn read_back(file: &Arc<dyn narf_filesystem::FileOps>, len: usize) -> Option<Vec<u8>> {
+    read_all(file, len + 4096)
+}
+
+struct SizeCase {
+    dev: Arc<WritableSparseDevice>,
+    vol: SyncVol,
+}
+
+impl SizeCase {
+    fn new(fixture: &[u8]) -> Result<Self, &'static str> {
+        let dev = writable_sparse(fixture);
+        let vol = mount_writable(dev.clone()).map_err(|_| "fixture did not mount")?;
+        Ok(SizeCase { dev, vol })
+    }
+
+    fn create(
+        &self,
+        name: &str,
+        data: &[u8],
+    ) -> Result<Arc<dyn narf_filesystem::FileOps>, &'static str> {
+        use narf_filesystem::FsInstance;
+        let f = match poll_once(self.vol.root().create(name)) {
+            Some(Ok(f)) => f,
+            _ => return Err("create failed"),
+        };
+        if !data.is_empty()
+            && !matches!(poll_once(f.write(0, data)), Some(Ok(n)) if n == data.len())
+        {
+            return Err("initial write failed");
+        }
+        Ok(f)
+    }
+
+    /// Check content + invariants now, after a sync, and after a remount.
+    fn verify(&self, name: &str, want: &[u8]) -> Result<(), &'static str> {
+        use narf_filesystem::FsInstance;
+        // The extent tree only moves at commit, so the tree invariants are
+        // checked once the batch is committed.
+        let check = |vol: &SyncVol, committed: bool| -> Result<(), &'static str> {
+            let f = match poll_once(vol.root().lookup_async(name)) {
+                Some(Ok(f)) => f,
+                _ => return Err("file missing"),
+            };
+            match read_back(&f, want.len()) {
+                Some(got) if got == want => {}
+                _ => return Err("content differs from the Linux model"),
+            }
+            if committed {
+                size_invariants(vol, f.ino())?;
+            }
+            Ok(())
+        };
+        check(&self.vol, false)?;
+        if !matches!(poll_once(self.vol.sync_to_disk()), Some(Ok(()))) {
+            return Err("sync failed");
+        }
+        check(&self.vol, true)?;
+        let fresh = mount_writable(self.dev.clone()).map_err(|_| "remount failed")?;
+        check(&fresh, true)
+    }
+}
+
+fn smoke_btrfs_truncate_model() -> TestResult {
+    for fixture in [FIXTURE_BGT_SPARSE, FIXTURE_FST_SPARSE] {
+        let case = match SizeCase::new(fixture) {
+            Ok(c) => c,
+            Err(e) => return TestResult::Fail(e),
+        };
+        // Shrink to an unaligned size inside a multi-extent file, then grow:
+        // the bytes past the cut must come back as zeros.
+        let data = crate::interop::pattern(41, 300_000);
+        let f = match case.create("t.bin", &data) {
+            Ok(f) => f,
+            Err(e) => return TestResult::Fail(e),
+        };
+        if !matches!(poll_once(f.truncate(150_001)), Some(Ok(()))) {
+            return TestResult::Fail("truncate down failed");
+        }
+        if let Err(e) = case.verify("t.bin", &data[..150_001]) {
+            return TestResult::Fail(e);
+        }
+        if !matches!(poll_once(f.truncate(400_000)), Some(Ok(()))) {
+            return TestResult::Fail("truncate up failed");
+        }
+        let mut want = data[..150_001].to_vec();
+        want.resize(400_000, 0);
+        if let Err(e) = case.verify("t.bin", &want) {
+            return TestResult::Fail(e);
+        }
+        // O_TRUNC then a smaller rewrite (pacman): every extent is released.
+        let g = match case.create("p.conf", &crate::interop::pattern(40, 20_000)) {
+            Ok(g) => g,
+            Err(e) => return TestResult::Fail(e),
+        };
+        let _ = poll_once(case.vol.sync_to_disk());
+        if !matches!(poll_once(g.truncate(0)), Some(Ok(()))) {
+            return TestResult::Fail("O_TRUNC failed");
+        }
+        if !file_layout(&case.vol, g.ino()).is_empty() {
+            return TestResult::Fail("truncate to 0 left file items");
+        }
+        if !matches!(poll_once(g.write(0, b"short\n")), Some(Ok(6))) {
+            return TestResult::Fail("rewrite after O_TRUNC failed");
+        }
+        if let Err(e) = case.verify("p.conf", b"short\n") {
+            return TestResult::Fail(e);
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_truncate_model);
+
+fn smoke_btrfs_fallocate_model() -> TestResult {
+    use crate::write::fileops::Kind;
+    use crate::write::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
+    // The 16 MiB mixed `^no-holes` fixture gets smaller allocations.
+    for (fixture, big) in [(FIXTURE_BGT_SPARSE, true), (FIXTURE_FST_SPARSE, false)] {
+        let (pre, at, keep, records) = if big {
+            (1usize << 20, 256 * 1024usize, 2u64 << 20, 24u32)
+        } else {
+            (256 * 1024, 64 * 1024, 256 * 1024, 12)
+        };
+        let case = match SizeCase::new(fixture) {
+            Ok(c) => c,
+            Err(e) => return TestResult::Fail(e),
+        };
+        // Mode 0: size grows, PREALLOC items, reads as zeros; a write in the
+        // middle converts only its sectors (prealloc|REG|prealloc, refs 2).
+        let f = match case.create("a.bin", &[]) {
+            Ok(f) => f,
+            Err(e) => return TestResult::Fail(e),
+        };
+        if !matches!(poll_once(f.fallocate(0, 0, pre as u64)), Some(Ok(()))) {
+            return TestResult::Fail("fallocate mode 0 failed");
+        }
+        if f.stat().size != pre as u64 {
+            return TestResult::Fail("fallocate mode 0 did not set the size");
+        }
+        let items = file_layout(&case.vol, f.ino());
+        if items.is_empty()
+            || items
+                .iter()
+                .any(|i| !matches!(i.kind, Kind::Disk { prealloc: true }))
+        {
+            return TestResult::Fail("fallocate did not lay down PREALLOC items");
+        }
+        if let Err(e) = case.verify("a.bin", &alloc::vec![0u8; pre]) {
+            return TestResult::Fail(e);
+        }
+        let mut want = alloc::vec![0u8; pre];
+        want[at..at + 4096].copy_from_slice(&crate::interop::pattern(42, 4096));
+        if !matches!(
+            poll_once(f.write(at as u64, &want[at..at + 4096])),
+            Some(Ok(4096))
+        ) {
+            return TestResult::Fail("write into preallocated space failed");
+        }
+        let kinds: Vec<_> = file_layout(&case.vol, f.ino())
+            .iter()
+            .map(|i| i.kind)
+            .collect();
+        if !kinds.windows(3).any(|w| {
+            w == [
+                Kind::Disk { prealloc: true },
+                Kind::Disk { prealloc: false },
+                Kind::Disk { prealloc: true },
+            ]
+        }) {
+            return TestResult::Fail("write-to-convert did not split the prealloc extent");
+        }
+        if let Err(e) = case.verify("a.bin", &want) {
+            return TestResult::Fail(e);
+        }
+
+        // journald: KEEP_SIZE, appends, truncate at close.
+        let j = match case.create("j.bin", &[]) {
+            Ok(j) => j,
+            Err(e) => return TestResult::Fail(e),
+        };
+        if !matches!(
+            poll_once(j.fallocate(FALLOC_FL_KEEP_SIZE, 0, keep)),
+            Some(Ok(()))
+        ) {
+            return TestResult::Fail("fallocate KEEP_SIZE failed");
+        }
+        if j.stat().size != 0 {
+            return TestResult::Fail("KEEP_SIZE changed the size");
+        }
+        let mut journal = Vec::new();
+        for i in 0..records {
+            let rec = crate::interop::pattern(100 + i, 4096);
+            match poll_once(j.write(u64::from(i) * 4096, &rec)) {
+                Some(Ok(4096)) => {}
+                other => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(narf_console::Writer, "journal append {i}: {other:?}");
+                    return TestResult::Fail("journal append failed");
+                }
+            }
+            journal.extend_from_slice(&rec);
+        }
+        if let Err(e) = case.verify("j.bin", &journal) {
+            return TestResult::Fail(e);
+        }
+        if !matches!(poll_once(j.truncate(journal.len() as u64)), Some(Ok(()))) {
+            return TestResult::Fail("journal truncate at close failed");
+        }
+        if file_layout(&case.vol, j.ino())
+            .iter()
+            .any(|i| i.end > journal.len() as u64)
+        {
+            return TestResult::Fail("truncate left preallocation past EOF");
+        }
+        if let Err(e) = case.verify("j.bin", &journal) {
+            return TestResult::Fail(e);
+        }
+
+        // Punch an unaligned hole and zero a range inside written data.
+        let mut punch = crate::interop::pattern(44, 200_000);
+        let p = match case.create("p.bin", &punch) {
+            Ok(p) => p,
+            Err(e) => return TestResult::Fail(e),
+        };
+        let _ = poll_once(case.vol.sync_to_disk());
+        if !matches!(
+            poll_once(p.fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 10_000, 100_000)),
+            Some(Ok(()))
+        ) {
+            return TestResult::Fail("punch hole failed");
+        }
+        punch[10_000..110_000].fill(0);
+        if let Err(e) = case.verify("p.bin", &punch) {
+            return TestResult::Fail(e);
+        }
+        let mut zero = crate::interop::pattern(45, 200_000);
+        let z = match case.create("z.bin", &zero) {
+            Ok(z) => z,
+            Err(e) => return TestResult::Fail(e),
+        };
+        if !matches!(
+            poll_once(z.fallocate(FALLOC_FL_ZERO_RANGE, 50_000, 60_000)),
+            Some(Ok(()))
+        ) {
+            return TestResult::Fail("zero range failed");
+        }
+        zero[50_000..110_000].fill(0);
+        if let Err(e) = case.verify("z.bin", &zero) {
+            return TestResult::Fail(e);
+        }
+        // Linux btrfs refuses the rest with EOPNOTSUPP; PUNCH needs KEEP_SIZE.
+        for mode in [0x08u32, 0x20, 0x40, FALLOC_FL_PUNCH_HOLE] {
+            if !matches!(
+                poll_once(z.fallocate(mode, 0, 4096)),
+                Some(Err(FsError::Unsupported))
+            ) {
+                return TestResult::Fail("an unsupported fallocate mode was not EOPNOTSUPP");
+            }
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_fallocate_model);
+
+/// `mount -o remount,ro` commits and stops every write (every mount of the
+/// filesystem: the superblock is shared), the on-disk superblock stays put
+/// while read-only, and `remount,rw` writes again.
+fn smoke_btrfs_remount_ro_rw() -> TestResult {
+    use narf_filesystem::sb_flags::RDONLY;
+    use narf_filesystem::FsInstance;
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture did not mount"),
+    };
+    let home = match poll_once(BtrfsVolume::mount_view(
+        vol.core(),
+        Some(crate::volume::Subvol::Name("@home".into())),
+        false,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("@home view failed"),
+    };
+    let f = match poll_once(vol.root().create("before-ro.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if !matches!(
+        poll_once(f.write(0, b"committed by remount\n")),
+        Some(Ok(21))
+    ) {
+        return TestResult::Fail("write failed");
+    }
+    // Not synced: the remount itself must commit it.
+    if vol.reconfigure_sb(RDONLY, RDONLY, "").is_err() {
+        return TestResult::Fail("remount ro failed");
+    }
+    if !vol.is_read_only() || !home.is_read_only() {
+        return TestResult::Fail("remount ro did not make every mount read-only");
+    }
+    let sb_ro = read_super_at(&dev, format::SUPERBLOCK_OFFSET);
+    if poll_once(vol.root().create("x")).is_some_and(|r| r.is_ok())
+        || poll_once(home.root().create("x")).is_some_and(|r| r.is_ok())
+        || poll_once(f.truncate(0)).is_some_and(|r| r.is_ok())
+        || poll_once(f.fallocate(0, 0, 4096)).is_some_and(|r| r.is_ok())
+    {
+        return TestResult::Fail("a write succeeded on a read-only remount");
+    }
+    if read_super_at(&dev, format::SUPERBLOCK_OFFSET) != sb_ro {
+        return TestResult::Fail("the superblock changed while read-only");
+    }
+    // The commit forced by the remount is on disk: a fresh mount sees it.
+    match mount_writable_ro(dev.clone()) {
+        Ok(other) => match poll_once(other.root().lookup_async("before-ro.txt")) {
+            Some(Ok(g)) if read_all(&g, 64).as_deref() == Some(&b"committed by remount\n"[..]) => {}
+            _ => return TestResult::Fail("remount ro did not make the write durable"),
+        },
+        Err(_) => return TestResult::Fail("read-only image did not mount"),
+    }
+    if vol.reconfigure_sb(0, RDONLY, "").is_err() {
+        return TestResult::Fail("remount rw failed");
+    }
+    if vol.is_read_only() || home.is_read_only() {
+        return TestResult::Fail("remount rw left a mount read-only");
+    }
+    let g = match poll_once(home.root().create("after-rw.txt")) {
+        Some(Ok(g)) => g,
+        _ => return TestResult::Fail("create after remount rw failed"),
+    };
+    if !matches!(poll_once(g.write(0, b"rw\n")), Some(Ok(3))) {
+        return TestResult::Fail("write after remount rw failed");
+    }
+    if !matches!(poll_once(home.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("sync after remount rw failed");
+    }
+    // The data-string spelling (`rootflags=ro`, fsconfig "ro") works too.
+    if vol.reconfigure("ro").is_err() || !vol.is_read_only() {
+        return TestResult::Fail("remount via the `ro` option failed");
+    }
+    if vol.reconfigure("rw").is_err() || vol.is_read_only() {
+        return TestResult::Fail("remount via the `rw` option failed");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_remount_ro_rw);

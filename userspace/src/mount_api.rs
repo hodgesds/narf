@@ -385,10 +385,14 @@ pub(crate) fn reconfigure_super(
     // devpts remount with no options resets every option to its default
     // (`devpts_reconfigure`). A filesystem with no reconfigure op ignores an
     // empty parameter list; given parameters it rejects them.
-    match fs.reconfigure(fs_options) {
+    match fs.reconfigure_sb(sb_flags, sb_mask, fs_options) {
         Ok(()) => {}
         Err(FsError::Unsupported) if fs_options.is_empty() => {}
         Err(FsError::NoSpace) => return Err(ENOSPC),
+        // A filesystem that cannot go read-write (a read-only device, an
+        // error state) answers EROFS, as `btrfs_remount_rw` does.
+        Err(FsError::ReadOnly) => return Err(EROFS),
+        Err(FsError::Busy) => return Err(EBUSY),
         Err(_) => return Err(EINVAL),
     }
     if sb_mask != 0 {
