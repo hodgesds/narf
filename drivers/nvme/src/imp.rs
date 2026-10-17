@@ -33,6 +33,7 @@ pub mod prp;
 pub mod shutdown;
 
 mod tests;
+mod tests_flush;
 mod tests_multi;
 
 use core::cell::UnsafeCell;
@@ -3858,14 +3859,14 @@ pub fn shutdown_all_controllers() {
         let failed = report.flushes.len() - flushed;
         let _ = writeln!(
             narf_console::Writer,
-            "nvme: {name}: flushed {flushed} namespace(s){}, CC.SHN normal shutdown: {:?} ({} ms)",
+            "nvme: {name}: flushed {flushed} namespace(s){} in {} ms; CC.SHN normal shutdown: {:?}",
             if failed > 0 {
                 alloc::format!(" ({failed} flush failed)")
             } else {
                 alloc::string::String::new()
             },
-            report.shutdown,
-            narf_time::wall::monotonic_ns().saturating_sub(start) / 1_000_000
+            narf_time::wall::monotonic_ns().saturating_sub(start) / 1_000_000,
+            report.shutdown
         );
     }
 }
