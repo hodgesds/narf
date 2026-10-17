@@ -101,10 +101,15 @@ pub(super) fn start() -> InitResult {
         if paused() { "quarantined" } else { "available" }
     );
     if ok && !navi48 {
-        report_displays();
-        // Off by default until a board validates the path; the same flag
-        // Navi48 uses.
-        if narf_boot::args().has_flag("amdgpu.native_display") {
+        // Display detection programs the HPD, AUX and DDC engines, so the
+        // firmware bring-up stays free of display side effects unless the
+        // native display (or an explicit probe) was requested. Both flags
+        // are off by default until a board validates the path.
+        let native = narf_boot::args().has_flag("amdgpu.native_display");
+        if native || narf_boot::args().has_flag("amdgpu.display_probe") {
+            report_displays();
+        }
+        if native {
             navi22_native_display();
         }
     }
@@ -225,8 +230,9 @@ fn navi22_native_display() {
 }
 
 /// One serial line per board connector from native AUX/DDC/HPD detection, so
-/// the first bare-metal boot shows which sinks and EDIDs were seen. Sink reads
-/// only: no stream, scanout or framebuffer state changes.
+/// the first bare-metal boot shows which sinks and EDIDs were seen. This
+/// enables and programs the HPD, AUX and DDC engines (register writes) but
+/// changes no stream, scanout or framebuffer state.
 fn report_displays() {
     use core::fmt::Write;
     use narf_drivers_gpu::amdgpu_navi22_display::{Detection, Signal};
