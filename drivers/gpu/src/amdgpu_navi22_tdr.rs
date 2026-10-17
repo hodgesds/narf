@@ -14,10 +14,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Linux default lockup timeout for every kernel queue.
+// linux: n/a (literal msecs_to_jiffies(2000) in amdgpu_device.c:amdgpu_device_get_job_timeout_settings)
 pub const TIMEOUT_MS: u64 = 2000;
 /// Sampling period; the detection latency is at most TIMEOUT + PERIOD.
-pub const PERIOD_MS: u64 = 250;
-const ENGINES: usize = 5;
+pub const PERIOD_MS: u64 = 250; // linux: n/a (NARF sampling period)
+const ENGINES: usize = 5; // linux: n/a (NARF Engine count)
 
 /// One queue's software (emitted) and hardware (signalled) fence sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

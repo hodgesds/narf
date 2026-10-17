@@ -973,8 +973,10 @@ MEMORY as Linux does for GC 10.3.2, from a cold-boot harvest sample, the
 loaded firmware headers and the PCI revision; ACCEL_WORKING and ring masks
 sit behind one switch, now wired: the card registers a generic
 `amdgpu_cs::Submitter` and client VRAM heap, so the shared CS/GEM/VA path runs
-client IBs on the Navi22 kernel queues (per-job ring-side VM flush, fences,
-two in flight per ring), with user fences, GEM_METADATA, PRIME, DRM 3.64.0 and
+client IBs on the Navi22 kernel queues (per-client GFXHUB VMIDs 1–7 from
+the generic `amdgpu_vmid_grab` manager: flush only when a space's VMID, root
+or TLB sequence changes, PASID→VMID IH LUT writes so faults reach the
+client's GPUVM_FAULT; fences, two in flight per ring), with user fences, GEM_METADATA, PRIME, DRM 3.64.0 and
 GET_CLIENT; proven in register/fake-engine models only (ABI audit:
 `drivers/gpu/research/navi22-mesa-abi.md`). Fences poll with an IH notify hook;
 register models cover encodings, rejection, timeouts and cancellation only.
@@ -1029,8 +1031,12 @@ vectors computed from the Linux DML30 formulas.
 An opt-in (`amdgpu.native_display`) native HDMI TMDS path lights the first
 connected HDMI sink on pipe 0 with a test pattern: DCN init, HUBBUB/DML30
 deadlines, the DAL clocks and the VBIOS PixelClock/STREAM_SETUP/transmitter
-tables (now executed by an `atom.c`-faithful interpreter), then fetch and
-unblank. Model-tested per block; never run on hardware.
+tables (sent to DMCUB as `DMUB_CMD__VBIOS` commands while DMUB runs, as
+DCN3.0's `dmub_command_table`; the `atom.c`-faithful interpreter is the logged
+fallback), then fetch and unblank. Model-tested per block; never run on
+hardware. HPD/AUX/DDC engines are armed only with `amdgpu.native_display` or
+`amdgpu.display_probe`; SMU interface mismatches, a fused-off or hung DMCUB,
+stuck HUBP blanks and ASIC_Init's S7 bit are logged, not fatal, as in Linux.
 The lit pipe is presented natively: console/status publication with the
 `scanout_access` withdraw-before-teardown contract, DCN3.0 HUBP VSYNC page
 flips completed from EARLIEST_INUSE (pflip/vupdate IH sources armed), a
@@ -1092,7 +1098,7 @@ queue stages using the GMC aperture.
 These are software-tested foundations; training resume,
 media submission/DPG, display-aware DPM, user command submission,
 hardware boot and DCN3.0 modesetting remain open. See the
-[PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram). The native path now follows Linux's global order end to end (model-tested over one combined register fake, failure/cancellation per step), retires a live GOP stream like `dcn30_init_hw`, enables OPTC/OTG clocks, lights DP SST (native-AUX 8b/10b training with fallback, DP DTO, MSA/VSC) on any of the six pipes/routes, and quarantines underflows black. HPD/HPD_RX now arrive over the IH ring (DCE src 9) and wake the display monitor, with polling kept as the fallback. The DP link layer now follows Linux DC (`amdgpu_dcn30_dp_link`): capabilities with LTTPR transparent/non-transparent modes per the VBIOS DCE_INFO bits, TPS3/TPS4 by sink capability, adjust and post-LT adjust requests, destructive link verification with Linux's fallback order, the least verified link per stream, and DP modes in KMS bounded by the verified link; the monitor tears an unplugged display down without AUX, re-detects on HPD changes (dark connectors keep their EDID inventory), and retrains on HPD-RX/polled link loss. Register/AUX models only.
+[PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram). The native path now follows Linux's global order end to end (model-tested over one combined register fake, failure/cancellation per step), retires a live GOP stream like `dcn30_init_hw`, enables OPTC/OTG clocks, lights DP SST (native-AUX 8b/10b training with fallback, DP DTO, MSA/VSC) on any of the six pipes/routes, and quarantines underflows black. HPD/HPD_RX now arrive over the IH ring (DCE src 9) and wake the display monitor, with polling kept as the fallback. A host-side Linux conformance gate (`drivers/gpu/tools/navi22-conformance.sh`) checks about 2.5k annotated Navi22 constants against the exact Linux headers and discovery segments. It also checks NARF's firmware parsers against Linux's parsing of the real blobs. The DP link layer now follows Linux DC (`amdgpu_dcn30_dp_link`): capabilities with LTTPR transparent/non-transparent modes per the VBIOS DCE_INFO bits, TPS3/TPS4 by sink capability, adjust and post-LT adjust requests, destructive link verification with Linux's fallback order, the least verified link per stream, and DP modes in KMS bounded by the verified link; the monitor tears an unplugged display down without AUX, re-detects on HPD changes (dark connectors keep their EDID inventory), and retrains on HPD-RX/polled link loss. Register/AUX models only.
 
 1. **Stage 5 laptop proof:** boot from USB on Renoir/Lucienne or Phoenix
    HawkPoint1; exercise native AMDGPU modeset, keyboard and touchpad,

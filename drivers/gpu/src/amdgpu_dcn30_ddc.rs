@@ -30,199 +30,340 @@ use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // ── DP_AUX instance block, stride 0x1c ─────────────────────────────────
+// linux-ctx: hdr=dcn seg=2
+// linux: mmDP_AUX0_AUX_CONTROL
 const AUX_CONTROL: u64 = 0x1f50;
+// linux: mmDP_AUX0_AUX_SW_CONTROL
 const AUX_SW_CONTROL: u64 = 0x1f51;
+// linux: mmDP_AUX0_AUX_ARB_CONTROL
 const AUX_ARB_CONTROL: u64 = 0x1f52;
+// linux: mmDP_AUX0_AUX_INTERRUPT_CONTROL
 const AUX_INTERRUPT_CONTROL: u64 = 0x1f53;
+// linux: mmDP_AUX0_AUX_SW_STATUS
 const AUX_SW_STATUS: u64 = 0x1f54;
+// linux: mmDP_AUX0_AUX_SW_DATA
 const AUX_SW_DATA: u64 = 0x1f56;
+// linux: mmDP_AUX0_AUX_DPHY_TX_CONTROL
 const AUX_DPHY_TX_CONTROL: u64 = 0x1f59;
+// linux: mmDP_AUX0_AUX_DPHY_RX_CONTROL0
 const AUX_DPHY_RX_CONTROL0: u64 = 0x1f5a;
+// linux: mmDP_AUX0_AUX_DPHY_RX_CONTROL1
 const AUX_DPHY_RX_CONTROL1: u64 = 0x1f5b;
+// linux: mmDP_AUX1_AUX_CONTROL - mmDP_AUX0_AUX_CONTROL
 const AUX_STRIDE: u64 = 0x1c;
 // AUX_CONTROL fields.
+// linux: DP_AUX0_AUX_CONTROL__AUX_EN_MASK
 const AUX_EN: u32 = 1 << 0;
+// linux: DP_AUX0_AUX_CONTROL__AUX_RESET_MASK
 const AUX_RESET: u32 = 1 << 4;
+// linux: DP_AUX0_AUX_CONTROL__AUX_RESET_DONE_MASK
 const AUX_RESET_DONE: u32 = 1 << 5;
+// linux: DP_AUX0_AUX_CONTROL__AUX_LS_READ_EN_MASK
 const AUX_LS_READ_EN: u32 = 1 << 8;
+// linux: DP_AUX0_AUX_CONTROL__AUX_HPD_SEL_MASK
 const AUX_HPD_SEL: u32 = 0x0070_0000;
 // AUX_ARB_CONTROL fields. RW_CNTL_STATUS is 1 when software may access the
 // engine and 2 when the DMCU owns it (`SW_CAN_ACCESS_AUX`/`DMCU_CAN_ACCESS_AUX`).
+// linux: DP_AUX0_AUX_ARB_CONTROL__AUX_REG_RW_CNTL_STATUS_MASK
 const AUX_REG_RW_CNTL_STATUS: u32 = 0x0000_000c;
+// linux: DP_AUX0_AUX_ARB_CONTROL__AUX_SW_USE_AUX_REG_REQ_MASK
 const AUX_SW_USE_AUX_REG_REQ: u32 = 1 << 16;
+// linux: DP_AUX0_AUX_ARB_CONTROL__AUX_SW_DONE_USING_AUX_REG_MASK
 const AUX_SW_DONE_USING_AUX_REG: u32 = 1 << 17;
+// linux: n/a (SW_CAN_ACCESS_AUX, local #define in dce_aux.c)
 const SW_CAN_ACCESS_AUX: u32 = 1;
+// linux: n/a (DMCU_CAN_ACCESS_AUX, local #define in dce_aux.c)
 const DMCU_CAN_ACCESS_AUX: u32 = 2;
 // AUX_SW_CONTROL / AUX_INTERRUPT_CONTROL.
+// linux: DP_AUX0_AUX_SW_CONTROL__AUX_SW_GO_MASK
 const AUX_SW_GO: u32 = 1 << 0;
+// linux: DP_AUX0_AUX_SW_CONTROL__AUX_SW_START_DELAY_MASK
 const AUX_SW_START_DELAY: u32 = 0x0000_00f0;
+// linux: DP_AUX0_AUX_SW_CONTROL__AUX_SW_WR_BYTES_MASK
 const AUX_SW_WR_BYTES: u32 = 0x001f_0000;
+// linux: DP_AUX0_AUX_INTERRUPT_CONTROL__AUX_SW_DONE_ACK_MASK
 const AUX_SW_DONE_ACK: u32 = 1 << 1;
 // AUX_SW_STATUS fields.
+// linux: DP_AUX0_AUX_SW_STATUS__AUX_SW_DONE_MASK
 const AUX_SW_DONE: u32 = 1 << 0;
+// linux: DP_AUX0_AUX_SW_STATUS__AUX_SW_RX_TIMEOUT_STATE_MASK
 const AUX_SW_RX_TIMEOUT_STATE: u32 = 0x0000_0070;
+// linux: DP_AUX0_AUX_SW_STATUS__AUX_SW_RX_TIMEOUT_MASK
 const AUX_SW_RX_TIMEOUT: u32 = 1 << 7;
+// linux: DP_AUX0_AUX_SW_STATUS__AUX_SW_HPD_DISCON_MASK
 const AUX_SW_HPD_DISCON: u32 = 1 << 9;
+// linux: DP_AUX0_AUX_SW_STATUS__AUX_SW_RX_INVALID_STOP_MASK
 const AUX_SW_RX_INVALID_STOP: u32 = 1 << 14;
+// linux: DP_AUX0_AUX_SW_STATUS__AUX_SW_RX_RECV_NO_DET_MASK
 const AUX_SW_RX_RECV_NO_DET: u32 = 1 << 20;
+// linux: DP_AUX0_AUX_SW_STATUS__AUX_SW_RX_RECV_INVALID_H_MASK
 const AUX_SW_RX_RECV_INVALID_H: u32 = 1 << 22;
+// linux: DP_AUX0_AUX_SW_STATUS__AUX_SW_RX_RECV_INVALID_L_MASK
 const AUX_SW_RX_RECV_INVALID_L: u32 = 1 << 23;
+// linux: DP_AUX0_AUX_SW_STATUS__AUX_SW_REPLY_BYTE_COUNT_MASK
 const AUX_SW_REPLY_BYTE_COUNT: u32 = 0x1f00_0000;
 // AUX_SW_DATA fields.
+// linux: DP_AUX0_AUX_SW_DATA__AUX_SW_DATA_RW_MASK
 const AUX_SW_DATA_RW: u32 = 1 << 0;
+// linux: DP_AUX0_AUX_SW_DATA__AUX_SW_DATA_MASK
 const AUX_SW_DATA_FIELD: u32 = 0x0000_ff00;
+// linux: DP_AUX0_AUX_SW_DATA__AUX_SW_INDEX_MASK
 const AUX_SW_INDEX: u32 = 0x001f_0000;
+// linux: DP_AUX0_AUX_SW_DATA__AUX_SW_AUTOINCREMENT_DISABLE_MASK
 const AUX_SW_AUTOINCREMENT_DISABLE: u32 = 1 << 31;
 // AUX_DPHY_RX_CONTROL0/1 fields.
+// linux: DP_AUX0_AUX_DPHY_RX_CONTROL0__AUX_RX_RECEIVE_WINDOW_MASK
 const AUX_RX_RECEIVE_WINDOW: u32 = 0x0000_0700;
+// linux: DP_AUX0_AUX_DPHY_RX_CONTROL1__AUX_RX_TIMEOUT_LEN_MASK
 const AUX_RX_TIMEOUT_LEN: u32 = 0x0000_7f00;
+// linux: DP_AUX0_AUX_DPHY_RX_CONTROL1__AUX_RX_TIMEOUT_LEN_MUL_MASK
 const AUX_RX_TIMEOUT_LEN_MUL: u32 = 0x0001_8000;
 /// `enc3_hw_init` writes these whole: the receiver windows/threshold and the
 /// TX settings DCN3.0 uses, before `dcn10_aux_initialize`.
+// linux: n/a (literal 0x103d1110 in dcn30_dio_link_encoder.c:enc3_hw_init)
 const DCN30_AUX_RX_CONTROL0: u32 = 0x103d_1110;
+// linux: n/a (literal 0x21c7a in dcn30_dio_link_encoder.c:enc3_hw_init)
 const DCN30_AUX_TX_CONTROL: u32 = 0x0002_1c7a;
 
 // ── DC_I2C (one engine shared across the DDC pads) ─────────────────────
+// linux: mmDC_I2C_CONTROL
 const DC_I2C_CONTROL: u64 = 0x1e98;
+// linux: mmDC_I2C_ARBITRATION
 const DC_I2C_ARBITRATION: u64 = 0x1e99;
+// linux: mmDC_I2C_SW_STATUS
 const DC_I2C_SW_STATUS: u64 = 0x1e9b;
 /// `DC_I2C_DDCn_HW_STATUS`, one dword per line.
+// linux: mmDC_I2C_DDC1_HW_STATUS
 const DC_I2C_DDC1_HW_STATUS: u64 = 0x1e9c;
 /// `DC_I2C_DDCn_SPEED` and `_SETUP` pairs, two dwords per line.
+// linux: mmDC_I2C_DDC1_SPEED
 const DC_I2C_DDC1_SPEED: u64 = 0x1ea2;
+// linux: mmDC_I2C_DDC1_SETUP
 const DC_I2C_DDC1_SETUP: u64 = 0x1ea3;
+// linux: mmDC_I2C_TRANSACTION0
 const DC_I2C_TRANSACTION0: u64 = 0x1eae;
+// linux: mmDC_I2C_DATA
 const DC_I2C_DATA: u64 = 0x1eb2;
 /// `regMICROSECOND_TIME_BASE_DIV`, BASE_IDX 1.
+// linux-ctx: hdr=dcn seg=1
+// linux: mmMICROSECOND_TIME_BASE_DIV
 const MICROSECOND_TIME_BASE_DIV: u64 = 0x007b;
 // DC_I2C_CONTROL fields.
+// linux-ctx: hdr=dcn seg=2
+// linux: DC_I2C_CONTROL__DC_I2C_GO_MASK
 const I2C_GO: u32 = 1 << 0;
+// linux: DC_I2C_CONTROL__DC_I2C_SOFT_RESET_MASK
 const I2C_SOFT_RESET: u32 = 1 << 1;
+// linux: DC_I2C_CONTROL__DC_I2C_SEND_RESET_MASK
 const I2C_SEND_RESET: u32 = 1 << 2;
+// linux: DC_I2C_CONTROL__DC_I2C_SW_STATUS_RESET_MASK
 const I2C_SW_STATUS_RESET: u32 = 1 << 3;
+// linux: DC_I2C_CONTROL__DC_I2C_DDC_SELECT_MASK
 const I2C_DDC_SELECT: u32 = 0x0000_0700;
+// linux: DC_I2C_CONTROL__DC_I2C_TRANSACTION_COUNT_MASK
 const I2C_TRANSACTION_COUNT: u32 = 0x0030_0000;
 // DC_I2C_ARBITRATION fields.
+// linux: DC_I2C_ARBITRATION__DC_I2C_REG_RW_CNTL_STATUS_MASK
 const I2C_REG_RW_CNTL_STATUS: u32 = 0x0000_000c;
+// linux: DC_I2C_ARBITRATION__DC_I2C_NO_QUEUED_SW_GO_MASK
 const I2C_NO_QUEUED_SW_GO: u32 = 1 << 4;
+// linux: DC_I2C_ARBITRATION__DC_I2C_SW_USE_I2C_REG_REQ_MASK
 const I2C_SW_USE_I2C_REG_REQ: u32 = 1 << 20;
+// linux: DC_I2C_ARBITRATION__DC_I2C_SW_DONE_USING_I2C_REG_MASK
 const I2C_SW_DONE_USING_I2C_REG: u32 = 1 << 21;
 // DC_I2C_SW_STATUS / DC_I2C_DDCn_HW_STATUS fields and their `dc_i2c_status`.
+// linux: DC_I2C_SW_STATUS__DC_I2C_SW_STATUS_MASK
 const I2C_SW_STATUS_FIELD: u32 = 0x3;
+// linux: DC_I2C_SW_STATUS__DC_I2C_SW_ABORTED_MASK
 const I2C_SW_ABORTED: u32 = 1 << 4;
+// linux: DC_I2C_SW_STATUS__DC_I2C_SW_TIMEOUT_MASK
 const I2C_SW_TIMEOUT: u32 = 1 << 5;
+// linux: DC_I2C_SW_STATUS__DC_I2C_SW_STOPPED_ON_NACK_MASK
 const I2C_SW_STOPPED_ON_NACK: u32 = 1 << 8;
+// linux: DC_I2C_DDC1_HW_STATUS__DC_I2C_DDC1_HW_STATUS_MASK
 const I2C_HW_STATUS_FIELD: u32 = 0x3;
+// linux: n/a (DC_I2C_STATUS__DC_I2C_STATUS_IDLE = 0, enum dc_i2c_status in dce_i2c_hw.h; not in checker sets)
 const I2C_STATUS_IDLE: u32 = 0;
+// linux: n/a (DC_I2C_STATUS__DC_I2C_STATUS_USED_BY_SW = 1, dce_i2c_hw.h; not in checker sets)
 const I2C_STATUS_USED_BY_SW: u32 = 1;
+// linux: n/a (DC_I2C_STATUS__DC_I2C_STATUS_USED_BY_HW = 2, dce_i2c_hw.h; not in checker sets)
 const I2C_STATUS_USED_BY_HW: u32 = 2;
 /// `DC_I2C_REG_RW_CNTL_STATUS_DMCU_ONLY`.
+// linux: n/a (DC_I2C_REG_RW_CNTL_STATUS_DMCU_ONLY = 2, dce_i2c_hw.h; not in checker sets)
 const I2C_DMCU_ONLY: u32 = 2;
 // DC_I2C_DDCn_SETUP fields.
+// linux: DC_I2C_DDC1_SETUP__DC_I2C_DDC1_DATA_DRIVE_EN_MASK
 const I2C_DATA_DRIVE_EN: u32 = 1 << 0;
+// linux: DC_I2C_DDC1_SETUP__DC_I2C_DDC1_DATA_DRIVE_SEL_MASK
 const I2C_DATA_DRIVE_SEL: u32 = 1 << 1;
+// linux: DC_I2C_DDC1_SETUP__DC_I2C_DDC1_SEND_RESET_LENGTH_MASK
 const I2C_SEND_RESET_LENGTH: u32 = 1 << 2;
+// linux: DC_I2C_DDC1_SETUP__DC_I2C_DDC1_ENABLE_MASK
 const I2C_DDC_ENABLE: u32 = 1 << 6;
+// linux: DC_I2C_DDC1_SETUP__DC_I2C_DDC1_CLK_DRIVE_EN_MASK
 const I2C_CLK_DRIVE_EN: u32 = 1 << 7;
+// linux: DC_I2C_DDC1_SETUP__DC_I2C_DDC1_INTRA_BYTE_DELAY_MASK
 const I2C_INTRA_BYTE_DELAY: u32 = 0x0000_ff00;
+// linux: DC_I2C_DDC1_SETUP__DC_I2C_DDC1_INTRA_TRANSACTION_DELAY_MASK
 const I2C_INTRA_TRANSACTION_DELAY: u32 = 0x00ff_0000;
+// linux: DC_I2C_DDC1_SETUP__DC_I2C_DDC1_TIME_LIMIT_MASK
 const I2C_TIME_LIMIT: u32 = 0xff00_0000;
 // DC_I2C_DDCn_SPEED fields.
+// linux: DC_I2C_DDC1_SPEED__DC_I2C_DDC1_THRESHOLD_MASK
 const I2C_THRESHOLD: u32 = 0x3;
+// linux: DC_I2C_DDC1_SPEED__DC_I2C_DDC1_START_STOP_TIMING_CNTL_MASK
 const I2C_START_STOP_TIMING_CNTL: u32 = 0x0000_0300;
+// linux: DC_I2C_DDC1_SPEED__DC_I2C_DDC1_PRESCALE_MASK
 const I2C_PRESCALE: u32 = 0xffff_0000;
 // DC_I2C_TRANSACTIONn fields.
+// linux: DC_I2C_TRANSACTION0__DC_I2C_RW0_MASK
 const I2C_RW0: u32 = 1 << 0;
+// linux: DC_I2C_TRANSACTION0__DC_I2C_STOP_ON_NACK0_MASK
 const I2C_STOP_ON_NACK0: u32 = 1 << 8;
+// linux: DC_I2C_TRANSACTION0__DC_I2C_START0_MASK
 const I2C_START0: u32 = 1 << 12;
+// linux: DC_I2C_TRANSACTION0__DC_I2C_STOP0_MASK
 const I2C_STOP0: u32 = 1 << 13;
+// linux: DC_I2C_TRANSACTION0__DC_I2C_COUNT0_MASK
 const I2C_COUNT0: u32 = 0x03ff_0000;
 // DC_I2C_DATA fields.
+// linux: DC_I2C_DATA__DC_I2C_DATA_RW_MASK
 const I2C_DATA_RW: u32 = 1 << 0;
+// linux: DC_I2C_DATA__DC_I2C_DATA_MASK
 const I2C_DATA_FIELD: u32 = 0x0000_ff00;
+// linux: DC_I2C_DATA__DC_I2C_INDEX_MASK
 const I2C_INDEX: u32 = 0x03ff_0000;
+// linux: DC_I2C_DATA__DC_I2C_INDEX_WRITE_MASK
 const I2C_INDEX_WRITE: u32 = 1 << 31;
 // MICROSECOND_TIME_BASE_DIV fields.
+// linux: MICROSECOND_TIME_BASE_DIV__MICROSECOND_TIME_BASE_DIV_MASK
 const TIME_BASE_DIV: u32 = 0x0000_007f;
+// linux: MICROSECOND_TIME_BASE_DIV__XTAL_REF_DIV_MASK
 const XTAL_REF_DIV: u32 = 0x0000_7f00;
 /// `dcn2_i2c_hw_construct`: DCE100 buffer, DCN setup limit, a 9-cycle reset.
 /// `SEND_RESET_LENGTH` is a single bit in DCN3.0, so Linux's
 /// `set_reg_field_value(9)` lands as `(9 << 2) & 0x4`, which is one.
+// linux: n/a (I2C_HW_BUFFER_SIZE_DCE100 = 538, dce_i2c_hw.h; not in checker sets)
 const I2C_BUFFER_BYTES: u32 = 538;
+// linux: n/a (I2C_SETUP_TIME_LIMIT_DCN = 3, dce_i2c_hw.h; not in checker sets)
 const I2C_SETUP_TIME_LIMIT_DCN: u32 = 3;
 /// `dc->caps.i2c_speed_in_khz` and `i2c_speed_in_khz_hdcp` for DCN3.0.
+// linux: n/a (literal dc->caps.i2c_speed_in_khz = 100 in dcn30_resource.c)
 pub const I2C_SPEED_KHZ: u32 = 100;
+// linux: n/a (TRANSACTION_TIMEOUT_IN_I2C_CLOCKS = 32, dce_i2c_hw.h; not in checker sets)
 const TRANSACTION_TIMEOUT_IN_I2C_CLOCKS: u32 = 32;
 /// `EDID_SEGMENT_SIZE`: `link_query_ddc_data` splits I2C payloads at 256.
+// linux: n/a (EDID_SEGMENT_SIZE = 256, link/protocols/link_ddc.h; not in checker sets)
 const I2C_PAYLOAD_BYTES: usize = 256;
 // dce_i2c_transaction_action.
+// linux: n/a (DCE_I2C_TRANSACTION_ACTION_I2C_WRITE = 0x00, dce_i2c_hw.h; not in checker sets)
 const I2C_ACTION_WRITE: u8 = 0x00;
+// linux: n/a (DCE_I2C_TRANSACTION_ACTION_I2C_READ = 0x10, dce_i2c_hw.h; not in checker sets)
 const I2C_ACTION_READ: u8 = 0x10;
+// linux: n/a (DCE_I2C_TRANSACTION_ACTION_I2C_WRITE_MOT = 0x40, dce_i2c_hw.h; not in checker sets)
 const I2C_ACTION_WRITE_MOT: u8 = 0x40;
+// linux: n/a (DCE_I2C_TRANSACTION_ACTION_I2C_READ_MOT = 0x50, dce_i2c_hw.h; not in checker sets)
 const I2C_ACTION_READ_MOT: u8 = 0x50;
 
 // ── GPIO pads ──────────────────────────────────────────────────────────
 /// `DC_GPIO_DDCn_MASK/A/EN/Y`, four dwords per line.
+// linux: mmDC_GPIO_DDC1_MASK
 const DC_GPIO_DDC1_MASK: u64 = 0x28d0;
+// linux: mmDC_GPIO_DDC2_MASK - mmDC_GPIO_DDC1_MASK
 const DC_GPIO_DDC_STRIDE: u64 = 4;
+// linux: mmDC_GPIO_HPD_MASK
 const DC_GPIO_HPD_MASK: u64 = 0x28f4;
+// linux: mmPHY_AUX_CNTL
 const PHY_AUX_CNTL: u64 = 0x28ff;
+// linux: mmDC_GPIO_AUX_CTRL_5
 const DC_GPIO_AUX_CTRL_5: u64 = 0x291d;
 // DC_GPIO_DDCn_MASK/A/EN fields: the clock pin is bit 0, the data pin bit 8.
+// linux: DC_GPIO_DDC1_MASK__DC_GPIO_DDC1CLK_MASK_MASK
 const PIN_CLK: u32 = 1 << 0;
+// linux: DC_GPIO_DDC1_MASK__DC_GPIO_DDC1DATA_MASK_MASK
 const PIN_DATA: u32 = 1 << 8;
+// linux: DC_GPIO_DDC1_MASK__DC_GPIO_DDC1CLK_PD_EN_MASK
 const DDC_CLK_PD_EN: u32 = 1 << 4;
+// linux: DC_GPIO_DDC1_MASK__DC_GPIO_DDC1DATA_PD_EN_MASK
 const DDC_DATA_PD_EN: u32 = 1 << 12;
+// linux: DC_GPIO_DDC1_MASK__AUX_PAD1_MODE_MASK
 const AUX_PAD_MODE: u32 = 1 << 16;
 /// `DC_GPIO_HPDn_MASK`: not the A/Y shifts — HPD4 is bit 20 here.
+// linux: DC_GPIO_HPD_MASK__DC_GPIO_HPD1_MASK_MASK; DC_GPIO_HPD_MASK__DC_GPIO_HPD2_MASK_MASK; DC_GPIO_HPD_MASK__DC_GPIO_HPD3_MASK_MASK; DC_GPIO_HPD_MASK__DC_GPIO_HPD4_MASK_MASK; DC_GPIO_HPD_MASK__DC_GPIO_HPD5_MASK_MASK; DC_GPIO_HPD_MASK__DC_GPIO_HPD6_MASK_MASK
 const HPD_GPIO_MASK: [u32; 6] = [1 << 0, 1 << 8, 1 << 16, 1 << 20, 1 << 24, 1 << 28];
 /// `DC_GPIO_AUX_CTRL_5__DDC_PADn_I2CMODE` is bit 12 + n; `PHY_AUX_CNTL`'s
 /// two-bit `AUXn_PAD_RXSEL` is at 10 + 2n.
-const DDC_PAD_I2CMODE_SHIFT: u32 = 12;
-const AUX_PAD_RXSEL_SHIFT: u32 = 10;
+const DDC_PAD_I2CMODE_SHIFT: u32 = 12; // linux: DC_GPIO_AUX_CTRL_5__DDC_PAD1_I2CMODE__SHIFT
+const AUX_PAD_RXSEL_SHIFT: u32 = 10; // linux: PHY_AUX_CNTL__AUX1_PAD_RXSEL__SHIFT
 
 // ── HPD instance block, stride 8 ───────────────────────────────────────
+// linux: mmHPD0_DC_HPD_INT_STATUS
 const DC_HPD_INT_STATUS: u64 = 0x1f14;
+// linux: mmHPD0_DC_HPD_INT_CONTROL
 const DC_HPD_INT_CONTROL: u64 = 0x1f15;
+// linux: mmHPD0_DC_HPD_CONTROL
 const DC_HPD_CONTROL: u64 = 0x1f16;
+// linux: mmHPD0_DC_HPD_TOGGLE_FILT_CNTL
 const DC_HPD_TOGGLE_FILT_CNTL: u64 = 0x1f18;
+// linux: mmHPD1_DC_HPD_INT_STATUS - mmHPD0_DC_HPD_INT_STATUS
 const HPD_STRIDE: u64 = 8;
+// linux: HPD0_DC_HPD_INT_STATUS__DC_HPD_SENSE_MASK
 const DC_HPD_SENSE: u32 = 1 << 1;
+// linux: HPD0_DC_HPD_INT_STATUS__DC_HPD_SENSE_DELAYED_MASK
 const DC_HPD_SENSE_DELAYED: u32 = 1 << 4;
+// linux: HPD0_DC_HPD_INT_CONTROL__DC_HPD_INT_ACK_MASK
 const DC_HPD_INT_ACK: u32 = 1 << 0;
+// linux: HPD0_DC_HPD_INT_CONTROL__DC_HPD_INT_POLARITY_MASK
 const DC_HPD_INT_POLARITY: u32 = 1 << 8;
+// linux: HPD0_DC_HPD_INT_CONTROL__DC_HPD_INT_EN_MASK
 const DC_HPD_INT_EN: u32 = 1 << 16;
+// linux: HPD0_DC_HPD_INT_CONTROL__DC_HPD_RX_INT_ACK_MASK
 const DC_HPD_RX_INT_ACK: u32 = 1 << 20;
+// linux: HPD0_DC_HPD_INT_CONTROL__DC_HPD_RX_INT_EN_MASK
 const DC_HPD_RX_INT_EN: u32 = 1 << 24;
+// linux: HPD0_DC_HPD_CONTROL__DC_HPD_EN_MASK
 const DC_HPD_EN: u32 = 1 << 28;
+// linux: HPD0_DC_HPD_TOGGLE_FILT_CNTL__DC_HPD_CONNECT_INT_DELAY_MASK
 const DC_HPD_CONNECT_INT_DELAY: u32 = 0x0000_00ff;
+// linux: HPD0_DC_HPD_TOGGLE_FILT_CNTL__DC_HPD_DISCONNECT_INT_DELAY_MASK
 const DC_HPD_DISCONNECT_INT_DELAY: u32 = 0x0ff0_0000;
 
 /// `res_cap.num_ddc` and the HPD block count for DCN3.0.
+// linux-ctx: reset
+// linux: n/a (res_cap_dcn3.num_ddc = 6, literal in dcn30_resource.c)
 pub const LINES: u8 = 6;
 /// The highest dword touched at base index 2, for the bank bound.
-const LAST_REG: u32 = DC_GPIO_AUX_CTRL_5 as u32;
+const LAST_REG: u32 = DC_GPIO_AUX_CTRL_5 as u32; // linux: mmDC_GPIO_AUX_CTRL_5
 
 // ── Retry policy, `dce_aux.c` ──────────────────────────────────────────
+// linux: n/a (AUX_MAX_RETRIES 7, local #define in dce_aux.c)
 const AUX_MAX_RETRIES: u32 = 7;
+// linux: n/a (AUX_MIN_DEFER_RETRIES 7, local #define in dce_aux.c)
 const AUX_MIN_DEFER_RETRIES: u32 = 7;
+// linux: n/a (AUX_MAX_DEFER_TIMEOUT_MS 50, local #define in dce_aux.c)
 const AUX_MAX_DEFER_TIMEOUT_MS: u32 = 50;
+// linux: n/a (AUX_MAX_INVALID_REPLY_RETRIES 2, local #define in dce_aux.c)
 const AUX_MAX_INVALID_REPLY_RETRIES: u32 = 2;
+// linux: n/a (AUX_MAX_TIMEOUT_RETRIES 3, local #define in dce_aux.c)
 const AUX_MAX_TIMEOUT_RETRIES: u32 = 3;
 /// `DEFAULT_AUX_MAX_DATA_SIZE`.
+// linux: DP_AUX_MAX_PAYLOAD_BYTES
 pub const AUX_MAX_BYTES: usize = 16;
 /// `SW_AUX_TIMEOUT_PERIOD_MULTIPLIER * AUX_TIMEOUT_PERIOD`, the construct-time
 /// software poll budget before `configure_timeout` replaces it.
+// linux: n/a (SW_AUX_TIMEOUT_PERIOD_MULTIPLIER * AUX_TIMEOUT_PERIOD = 6 * 400, dce_aux.h enum; not in checker sets)
 const DEFAULT_POLL_US: u32 = 6 * 400;
 /// `LINK_AUX_DEFAULT_TIMEOUT_PERIOD`, applied by link detection.
+// linux: n/a (LINK_AUX_DEFAULT_TIMEOUT_PERIOD = 552, link/protocols/link_ddc.h; not in checker sets)
 pub const AUX_TIMEOUT_US: u32 = 552;
+// linux: n/a (SW_AUX_TIMEOUT_PERIOD_MULTIPLIER = 6, dce_aux.h enum; not in checker sets)
 const SW_AUX_TIMEOUT_PERIOD_MULTIPLIER: u32 = 6;
 // aux_transaction_reply, the reply byte's upper nibble.
-const REPLY_AUX_ACK: u8 = 0x0;
-const REPLY_AUX_NACK: u8 = 0x1;
-const REPLY_AUX_DEFER: u8 = 0x2;
-const REPLY_I2C_OVER_AUX_NACK: u8 = 0x4;
-const REPLY_I2C_OVER_AUX_DEFER: u8 = 0x8;
+const REPLY_AUX_ACK: u8 = 0x0; // linux: DP_AUX_NATIVE_REPLY_ACK
+const REPLY_AUX_NACK: u8 = 0x1; // linux: DP_AUX_NATIVE_REPLY_NACK
+const REPLY_AUX_DEFER: u8 = 0x2; // linux: DP_AUX_NATIVE_REPLY_DEFER
+const REPLY_I2C_OVER_AUX_NACK: u8 = 0x4; // linux: DP_AUX_I2C_REPLY_NACK
+const REPLY_I2C_OVER_AUX_DEFER: u8 = 0x8; // linux: DP_AUX_I2C_REPLY_DEFER
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -377,6 +518,7 @@ impl<I: Io> Engine<I> {
         if self.state != State::Ready {
             return Err(Error::Busy);
         }
+        // linux: n/a (NARF bound: six DDC lines)
         if line >= LINES {
             return Err(Error::Invalid);
         }
@@ -446,7 +588,9 @@ impl<I: Io> Engine<I> {
         let pins = PIN_DATA | PIN_CLK;
         let pads = Pads {
             mask: self.read(Self::pad(line, 0))? & pins,
+            // linux-lit: 1=mmDC_GPIO_DDC1_A - mmDC_GPIO_DDC1_MASK
             a: self.read(Self::pad(line, 1))? & pins,
+            // linux-lit: 2=mmDC_GPIO_DDC1_EN - mmDC_GPIO_DDC1_MASK
             en: self.read(Self::pad(line, 2))? & pins,
         };
         // GPIO_MODE_HARDWARE: the pin is tri-stated and driven by the engine.
@@ -469,15 +613,18 @@ impl<I: Io> Engine<I> {
                 if regval & AUX_PAD_MODE != 0 {
                     // Let the pins de-assert before switching the pad to I2C.
                     if pads.en != 0 {
+                        // linux: n/a (msleep(2), literal in gpio/hw_ddc.c:set_config)
                         sleep_us(2000).await;
                     }
                     self.update(Self::pad(line, 0), AUX_PAD_MODE, 0)?;
                 }
                 self.update(DC_GPIO_AUX_CTRL_5, i2cmode, i2cmode)?;
+                // linux-lit: 0x3=PHY_AUX_CNTL__AUX1_PAD_RXSEL_MASK >> PHY_AUX_CNTL__AUX1_PAD_RXSEL__SHIFT; 2=PHY_AUX_CNTL__AUX2_PAD_RXSEL__SHIFT - PHY_AUX_CNTL__AUX1_PAD_RXSEL__SHIFT
                 let rxsel = 0x3 << (AUX_PAD_RXSEL_SHIFT + 2 * u32::from(line));
                 self.update(
                     PHY_AUX_CNTL,
                     rxsel,
+                    // linux-lit: 2=PHY_AUX_CNTL__AUX2_PAD_RXSEL__SHIFT - PHY_AUX_CNTL__AUX1_PAD_RXSEL__SHIFT
                     1 << (AUX_PAD_RXSEL_SHIFT + 2 * u32::from(line)),
                 )?;
             }
@@ -488,7 +635,9 @@ impl<I: Io> Engine<I> {
     fn close_pads(&mut self, line: u8, pads: Pads) -> Result<(), Error> {
         for pin in [PIN_CLK, PIN_DATA] {
             self.update(Self::pad(line, 0), pin, pads.mask)?;
+            // linux-lit: 1=mmDC_GPIO_DDC1_A - mmDC_GPIO_DDC1_MASK
             self.update(Self::pad(line, 1), pin, pads.a)?;
+            // linux-lit: 2=mmDC_GPIO_DDC1_EN - mmDC_GPIO_DDC1_MASK
             self.update(Self::pad(line, 2), pin, pads.en)?;
         }
         Ok(())
@@ -517,18 +666,22 @@ impl<I: Io> Engine<I> {
     fn configure_timeout(&mut self, line: u8, timeout_us: u32) -> Result<(), Error> {
         self.poll_us[usize::from(line)] = timeout_us * SW_AUX_TIMEOUT_PERIOD_MULTIPLIER;
         let (multiplier, unit) = match timeout_us {
+            // linux: n/a (DEFAULT_AUX_ENGINE_MULT 0, local #define in dce_aux.c)
             0 => (0, 0),
+            // linux: n/a (TIME_OUT_INCREMENT 1016 / TIME_OUT_MULTIPLIER_8, local #defines in dce_aux.c)
             t if t <= 1016 => (0, 8),
+            // linux: n/a (TIME_OUT_INCREMENT / TIME_OUT_MULTIPLIER_16, local #defines in dce_aux.c)
             t if t <= 2 * 1016 => (1, 16),
+            // linux: n/a (TIME_OUT_INCREMENT / TIME_OUT_MULTIPLIER_32, local #defines in dce_aux.c)
             t if t <= 4 * 1016 => (2, 32),
-            _ => (3, 64),
+            _ => (3, 64), // linux: n/a (TIME_OUT_MULTIPLIER_64, local #define in dce_aux.c)
         };
         let length = if unit == 0 {
-            69
+            69 // linux: n/a (DEFAULT_AUX_ENGINE_LENGTH 69, local #define in dce_aux.c)
         } else {
             timeout_us.div_ceil(unit)
         }
-        .min(127);
+        .min(127); // linux: n/a (MAX_TIMEOUT_LENGTH 127, local #define in dce_aux.c)
         let reg = Self::aux(line, AUX_DPHY_RX_CONTROL1);
         // REG_UPDATE_SEQ_2: the length, then the multiplier, as two writes.
         let value = self.update(reg, AUX_RX_TIMEOUT_LEN, put(0, AUX_RX_TIMEOUT_LEN, length))?;
@@ -565,12 +718,14 @@ impl<I: Io> Engine<I> {
             // DCN3.0 supplies AUX_RESET_MASK, so enabling includes a reset.
             self.write(control, value | AUX_EN | AUX_RESET)?;
             if !self
+                // linux: n/a (REG_WAIT 1 us x 11, literals in dce_aux.c:acquire_engine)
                 .wait(control, AUX_RESET_DONE, AUX_RESET_DONE, 1, 11)
                 .await?
             {
                 return Err(Error::Timeout);
             }
             self.write(control, (value | AUX_EN) & !AUX_RESET)?;
+            // linux: n/a (REG_WAIT 1 us x 11, literals in dce_aux.c:acquire_engine)
             if !self.wait(control, AUX_RESET_DONE, 0, 1, 11).await? {
                 return Err(Error::Timeout);
             }
@@ -614,11 +769,14 @@ impl<I: Io> Engine<I> {
             Self::aux(line, AUX_SW_STATUS),
             AUX_SW_DONE,
             0,
+            // linux: n/a (REG_WAIT 10 us, literal in dce_aux.c:submit_channel_request)
             10,
+            // linux: n/a (polling_timeout_period/10, literal in dce_aux.c:submit_channel_request)
             poll / 10,
         )
         .await?;
         // Three header bytes, a length byte if any data, and the payload.
+        // linux: n/a (length 3 or 4 header bytes, literals in dce_aux.c:submit_channel_request)
         let mut length = if data.is_empty() { 3 } else { 4 };
         if write {
             length += data.len() as u32;
@@ -636,18 +794,22 @@ impl<I: Io> Engine<I> {
                 | put(
                     0,
                     AUX_SW_DATA_FIELD,
+                    // linux: n/a (COMPOSE_AUX_SW_DATA_16_20, local macro in dce_aux.c)
                     u32::from(action) | (address >> 16) & 0xf,
                 ),
         )?;
         value = put(
             value & !AUX_SW_AUTOINCREMENT_DISABLE,
             AUX_SW_DATA_FIELD,
+            // linux: n/a (COMPOSE_AUX_SW_DATA_8_15, local macro in dce_aux.c)
             (address >> 8) & 0xff,
         );
         self.write(reg, value)?;
+        // linux: n/a (COMPOSE_AUX_SW_DATA_0_7, local macro in dce_aux.c)
         value = put(value, AUX_SW_DATA_FIELD, address & 0xff);
         self.write(reg, value)?;
         if !data.is_empty() {
+            // linux: n/a (request->length - 1, dce_aux.c:submit_channel_request)
             value = put(value, AUX_SW_DATA_FIELD, data.len() as u32 - 1);
             self.write(reg, value)?;
         }
@@ -664,6 +826,7 @@ impl<I: Io> Engine<I> {
     async fn aux_status(&mut self, line: u8) -> Result<Outcome, Error> {
         let reg = Self::aux(line, AUX_SW_STATUS);
         let poll = self.poll_us[usize::from(line)];
+        // linux: n/a (REG_WAIT 10 us x polling_timeout_period/10, literals in dce_aux.c:get_channel_status)
         self.wait(reg, AUX_SW_DONE, AUX_SW_DONE, 10, poll / 10)
             .await?;
         let value = self.read(reg)?;
@@ -689,6 +852,7 @@ impl<I: Io> Engine<I> {
             0 => Ok(Outcome::InvalidReply),
             count => Ok(Outcome::Success {
                 reply: 0,
+                // linux: n/a (reply byte excluded, dce_aux.c:get_channel_status)
                 bytes: count as usize - 1,
             }),
         }
@@ -706,6 +870,7 @@ impl<I: Io> Engine<I> {
         value |= AUX_SW_AUTOINCREMENT_DISABLE;
         self.write(reg, value)?;
         self.write(reg, value | AUX_SW_DATA_RW)?;
+        // linux: n/a (reply_result_32 >> 4, literal in dce_aux.c:read_channel_reply)
         let reply = (field(self.read(reg)?, AUX_SW_DATA_FIELD) >> 4) as u8;
         if reply == REPLY_AUX_ACK {
             replied -= 1;
@@ -743,6 +908,7 @@ impl<I: Io> Engine<I> {
     /// `dce_aux_transfer_with_retries`. Returns the replied byte count.
     async fn transfer(&mut self, line: u8, request: &mut AuxRequest<'_>) -> Result<usize, Error> {
         self.check(line)?;
+        // linux: n/a (DP AUX 20-bit address space)
         if request.data.len() > AUX_MAX_BYTES || request.address >= 1 << 20 {
             return Err(Error::Invalid);
         }
@@ -778,6 +944,7 @@ impl<I: Io> Engine<I> {
                                 if ack >= AUX_MAX_RETRIES {
                                     return Err(last);
                                 }
+                                // linux: n/a (udelay(300), literal in dce_aux.c:dce_aux_transfer_with_retries)
                                 sleep_us(300).await;
                             } else if write && bytes > 0 {
                                 // AUX_ACKM: poll the write status until done.
@@ -789,6 +956,7 @@ impl<I: Io> Engine<I> {
                                 write = false;
                                 status_update = true;
                                 length = 0;
+                                // linux: n/a (udelay(300), literal in dce_aux.c:dce_aux_transfer_with_retries)
                                 sleep_us(300).await;
                             } else {
                                 return Ok(bytes);
@@ -796,6 +964,7 @@ impl<I: Io> Engine<I> {
                         }
                         REPLY_AUX_DEFER | REPLY_I2C_OVER_AUX_DEFER => {
                             if reply == REPLY_AUX_DEFER {
+                                // linux: n/a (us to ms)
                                 defer_ms += self.poll_us[usize::from(line)] / 1000;
                                 defer += 1;
                             }
@@ -821,6 +990,7 @@ impl<I: Io> Engine<I> {
                     if invalid >= AUX_MAX_INVALID_REPLY_RETRIES {
                         return Err(last);
                     }
+                    // linux: n/a (udelay(400), literal in dce_aux.c:dce_aux_transfer_with_retries)
                     sleep_us(400).await;
                 }
                 Outcome::Timeout => {
@@ -875,9 +1045,11 @@ impl<I: Io> Engine<I> {
 
     // ── Hardware I2C engine ────────────────────────────────────────────
     fn i2c_setup(line: u8) -> u64 {
+        // linux-lit: 2=mmDC_I2C_DDC2_SETUP - mmDC_I2C_DDC1_SETUP
         DC_I2C_DDC1_SETUP + 2 * u64::from(line)
     }
     fn i2c_speed(line: u8) -> u64 {
+        // linux-lit: 2=mmDC_I2C_DDC2_SPEED - mmDC_I2C_DDC1_SPEED
         DC_I2C_DDC1_SPEED + 2 * u64::from(line)
     }
     /// `is_engine_available`.
@@ -914,12 +1086,13 @@ impl<I: Io> Engine<I> {
         }
         let reference_div = field(time_base, TIME_BASE_DIV);
         let xtal_div = match field(time_base, XTAL_REF_DIV) {
-            0 => 2,
+            0 => 2, // linux: n/a (xtal_ref_div default 2, literal in dce_i2c_hw.c:set_speed)
             div => div,
         };
         let reference_khz = if reference_div == 0 {
             self.crystal_khz
         } else {
+            // linux: n/a (ref_base_div * 1000, literal in dce_i2c_hw.c:set_speed)
             reference_div * 1000
         };
         if reference_khz == 0 || khz == 0 {
@@ -930,7 +1103,9 @@ impl<I: Io> Engine<I> {
             Self::i2c_speed(line),
             I2C_PRESCALE | I2C_THRESHOLD | I2C_START_STOP_TIMING_CNTL,
             put(0, I2C_PRESCALE, prescale)
+                // linux: n/a (THRESHOLD 2, literal in dce_i2c_hw.c:set_speed)
                 | put(0, I2C_THRESHOLD, 2)
+                // linux: n/a (speed > 50 ? 2 : 1, literals in dce_i2c_hw.c:set_speed)
                 | put(0, I2C_START_STOP_TIMING_CNTL, if khz > 50 { 2 } else { 1 }),
         )?;
         Ok(())
@@ -1024,6 +1199,7 @@ impl<I: Io> Engine<I> {
             return Err(Error::Engine);
         }
         let read = action & I2C_ACTION_READ != 0;
+        // linux: n/a (transaction_count == 3, literal in dce_i2c_hw.c:process_transaction)
         let last = self.transactions == 3 || action == I2C_ACTION_WRITE || read;
         let length = data.len() as u32;
         self.update(
@@ -1050,6 +1226,7 @@ impl<I: Io> Engine<I> {
             }
         }
         self.transactions += 1;
+        // linux: n/a (length + 1 address byte, dce_i2c_hw.c:process_transaction)
         self.used_bytes += length + 1;
         Ok(last)
     }
@@ -1067,6 +1244,7 @@ impl<I: Io> Engine<I> {
         self.update(
             DC_I2C_CONTROL,
             I2C_SOFT_RESET | I2C_SW_STATUS_RESET | I2C_SEND_RESET | I2C_GO | I2C_TRANSACTION_COUNT,
+            // linux: n/a (transaction_count - 1, dce_i2c_hw.c:execute_transaction)
             put(0, I2C_TRANSACTION_COUNT, self.transactions - 1),
         )?;
         self.update(DC_I2C_CONTROL, I2C_GO, I2C_GO)?;
@@ -1091,10 +1269,13 @@ impl<I: Io> Engine<I> {
             (true, true) => I2C_ACTION_WRITE_MOT,
             (true, false) => I2C_ACTION_WRITE,
         };
+        // linux: n/a (7-bit address << 1 | read, dce_i2c_hw.c:dce_i2c_submit_command_hw)
         let address = message.address << 1 | u8::from(!message.write);
         // `get_transaction_timeout_hw`, taken before submission.
+        // linux: n/a (1000 * clocks / speed, dce_i2c_hw.c:get_transaction_timeout_hw)
         let period = 1000 * TRANSACTION_TIMEOUT_IN_I2C_CLOCKS / I2C_SPEED_KHZ;
         let stretches =
+            // linux: n/a (clock-stretch count, literals in dce_i2c_hw.c:get_transaction_timeout_hw)
             1 + ((length + 1) << 3) + 1 + (self.used_bytes << 3) + (self.transactions << 1);
         let timeout_us = u64::from(period * stretches);
         if self.i2c_queue(line, action, address, message.data)? {
@@ -1112,6 +1293,7 @@ impl<I: Io> Engine<I> {
             if deadline.expired() {
                 break Err(Error::Timeout);
             }
+            // linux: n/a (NARF poll interval; Linux polls 1 us in dce_i2c_hw_engine_wait_on_operation_result)
             sleep_us(10).await;
         };
         result?;
@@ -1163,13 +1345,17 @@ impl<I: Io> Engine<I> {
             self.update(control, DC_HPD_EN, DC_HPD_EN)?;
         }
         let (connect_ms, disconnect_ms) = match signal {
+            // linux: n/a (500/100 ms, literals in link_hpd.c:program_hpd_filter)
             Signal::Hdmi => (500, 100),
+            // linux: n/a (80/0 ms, literals in link_hpd.c:program_hpd_filter)
             Signal::DisplayPort => (80, 0),
         };
         self.update(
             Self::hpd(index, DC_HPD_TOGGLE_FILT_CNTL),
             DC_HPD_CONNECT_INT_DELAY | DC_HPD_DISCONNECT_INT_DELAY,
+            // linux: n/a (delay_on_connect / 10, literal in gpio/hw_hpd.c)
             put(0, DC_HPD_CONNECT_INT_DELAY, connect_ms / 10)
+                // linux: n/a (delay_on_disconnect / 10, literal in gpio/hw_hpd.c)
                 | put(0, DC_HPD_DISCONNECT_INT_DELAY, disconnect_ms / 10),
         )?;
         Ok(enabled)
@@ -1224,16 +1410,17 @@ impl<I: Io> Engine<I> {
 /// `i2caux_action_from_payload`.
 fn action(i2c: bool, write: bool, mot: bool, status_update: bool) -> u8 {
     if !i2c {
+        // linux-lit: 0x80=DP_AUX_NATIVE_WRITE << 4; 0x90=DP_AUX_NATIVE_READ << 4
         return if write { 0x80 } else { 0x90 };
     }
     let base = if status_update {
-        0x20
+        0x20 // linux-lit: 0x20=DP_AUX_I2C_WRITE_STATUS_UPDATE << 4
     } else if write {
-        0x00
+        0x00 // linux-lit: 0x00=DP_AUX_I2C_WRITE << 4
     } else {
-        0x10
+        0x10 // linux-lit: 0x10=DP_AUX_I2C_READ << 4
     };
-    base | if mot { 0x40 } else { 0 }
+    base | if mot { 0x40 } else { 0 } // linux-lit: 0x40=DP_AUX_I2C_MOT << 4
 }
 
 /// A raw AUX transaction holding the engine. Dropping it — including when the
@@ -1355,9 +1542,10 @@ impl Ddc {
             return Err(Error::Unsupported);
         }
         let base = Profile::Navi22
-            .bank(gpu, 2, LAST_REG)
+            .bank(gpu, 2, LAST_REG) // linux-lit: 2=mmDC_I2C_CONTROL_BASE_IDX
             .map_err(|_| Error::Unsupported)?;
         let base1 = Profile::Navi22
+            // linux-lit: 1=mmMICROSECOND_TIME_BASE_DIV_BASE_IDX
             .bank(gpu, 1, MICROSECOND_TIME_BASE_DIV as u32)
             .map_err(|_| Error::Unsupported)?;
         let mut engine = Engine::new_with(

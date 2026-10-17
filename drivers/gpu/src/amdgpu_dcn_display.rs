@@ -30,7 +30,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 /// Scanout surfaces are fetched in 256-byte requests, so the pitch is rounded
 /// out to one; the base is page aligned because the pool allocates pages.
-const PITCH_ALIGN: u32 = 256;
+const PITCH_ALIGN: u32 = 256; // linux: n/a (DCN 3.1.4 path; NARF 256-byte request alignment policy)
 /// The widest and tallest mode this single-pipe path will drive, taken from the
 /// blocks that have to carry them rather than restated here.
 ///

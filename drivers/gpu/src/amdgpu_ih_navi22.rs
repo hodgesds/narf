@@ -35,115 +35,141 @@ use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
-const RING: u64 = 256 * 1024; // IH_RING_SIZE
+const RING: u64 = 256 * 1024; // linux: IH_RING_SIZE
 const BYTES: u64 = RING + 4096; // ring, then a writeback page
 const WPTR_WB: u64 = RING;
 const MASK: u32 = (RING - 1) as u32;
-const RB_SIZE: u32 = 16; // order_base_2(ring_size / 4)
-const BATCH: usize = 32; // AMDGPU_IH_MAX_NUM_IVS
-const ROUNDS: usize = 8;
-const QUEUE: usize = 64;
-const SLOTS: usize = 64;
-const CLIENTS: u8 = 0x20; // SOC15_IH_CLIENTID_MAX
-const NO_VECTOR: u16 = 0x100;
+const RB_SIZE: u32 = 16; // linux: n/a (order_base_2(IH_RING_SIZE / 4), amdgpu_ih_ring_init)
+const BATCH: usize = 32; // linux: AMDGPU_IH_MAX_NUM_IVS
+const ROUNDS: usize = 8; // linux: n/a (NARF drain policy)
+const QUEUE: usize = 64; // linux: n/a (NARF mailbox depth)
+const SLOTS: usize = 64; // linux: n/a (NARF subscriber slots)
+const CLIENTS: u8 = 0x20; // linux: SOC15_IH_CLIENTID_MAX
+const NO_VECTOR: u16 = 0x100; // linux: n/a (NARF sentinel)
 
 // OSSSYS 5.0.0 offsets, BASE_IDX 0. WPTR_ADDR_HI/LO are reversed vs OSSSYS 4.0.
-const RB_CNTL: u32 = 0x80;
-const RB_BASE: u32 = 0x81;
-const RB_BASE_HI: u32 = 0x82;
-const RB_RPTR: u32 = 0x83;
-const RB_WPTR: u32 = 0x84;
-const WPTR_ADDR_HI: u32 = 0x85;
-const WPTR_ADDR_LO: u32 = 0x86;
-const DOORBELL_RPTR: u32 = 0x87;
-const RB_CNTL_RING1: u32 = 0x8c;
-const RB_CNTL_RING2: u32 = 0x98;
+// linux-ctx: hdr=oss seg=0
+const RB_CNTL: u32 = 0x80; // linux: mmIH_RB_CNTL
+const RB_BASE: u32 = 0x81; // linux: mmIH_RB_BASE
+const RB_BASE_HI: u32 = 0x82; // linux: mmIH_RB_BASE_HI
+const RB_RPTR: u32 = 0x83; // linux: mmIH_RB_RPTR
+const RB_WPTR: u32 = 0x84; // linux: mmIH_RB_WPTR
+const WPTR_ADDR_HI: u32 = 0x85; // linux: mmIH_RB_WPTR_ADDR_HI
+const WPTR_ADDR_LO: u32 = 0x86; // linux: mmIH_RB_WPTR_ADDR_LO
+const DOORBELL_RPTR: u32 = 0x87; // linux: mmIH_DOORBELL_RPTR
+const RB_CNTL_RING1: u32 = 0x8c; // linux: mmIH_RB_CNTL_RING1
+const RB_CNTL_RING2: u32 = 0x98; // linux: mmIH_RB_CNTL_RING2
+/// linux: mmIH_CNTL2
 const IH_CNTL2: u32 = 0xc1;
 // NBIO 2.3 offsets, BASE_IDX 2.
-const INTERRUPT_CNTL: u32 = 0xf1;
-const INTERRUPT_CNTL2: u32 = 0xf2;
-const REMAP_HDP_FLUSH: u32 = 0x12d;
-const IH_DOORBELL_RANGE: u32 = 0x1d2;
-const HDP_READ_CACHE_INVALIDATE: u32 = 0xd1;
+// linux-ctx: hdr=nbio seg=2
+const INTERRUPT_CNTL: u32 = 0xf1; // linux: mmINTERRUPT_CNTL
+const INTERRUPT_CNTL2: u32 = 0xf2; // linux: mmINTERRUPT_CNTL2
+const REMAP_HDP_FLUSH: u32 = 0x12d; // linux: mmREMAP_HDP_MEM_FLUSH_CNTL
+const IH_DOORBELL_RANGE: u32 = 0x1d2; // linux: mmBIF_IH_DOORBELL_RANGE
+/// linux-ctx: hdr=hdp seg=0
+const HDP_READ_CACHE_INVALIDATE: u32 = 0xd1; // linux: mmHDP_READ_CACHE_INVALIDATE
 
+// linux-ctx: reset
 // IH_RB_CNTL fields.
-const ENABLE: u32 = 1;
-const GPU_TS: u32 = 1 << 7;
-const WRITEBACK: u32 = 1 << 8;
-const OVERFLOW_ENABLE: u32 = 1 << 16;
-const ENABLE_INTR: u32 = 1 << 17;
-const MC_SNOOP: u32 = 1 << 20;
-const RPTR_REARM: u32 = 1 << 21;
-const MC_RO: u32 = 1 << 22;
-const MC_VMID: u32 = 0xf << 24;
-const MC_SPACE: u32 = 7 << 28;
-const OVERFLOW_CLEAR: u32 = 1 << 31;
-const SIZE_MASK: u32 = 0x3e;
-const THRESHOLD: u32 = 0xf000; // RB_USED_INT_THRESHOLD, rings 1 and 2
-const RB_OVERFLOW: u32 = 1; // IH_RB_WPTR
+const ENABLE: u32 = 1; // linux: IH_RB_CNTL__RB_ENABLE_MASK
+const GPU_TS: u32 = 1 << 7; // linux: IH_RB_CNTL__RB_GPU_TS_ENABLE_MASK
+const WRITEBACK: u32 = 1 << 8; // linux: IH_RB_CNTL__WPTR_WRITEBACK_ENABLE_MASK
+const OVERFLOW_ENABLE: u32 = 1 << 16; // linux: IH_RB_CNTL__WPTR_OVERFLOW_ENABLE_MASK
+const ENABLE_INTR: u32 = 1 << 17; // linux: IH_RB_CNTL__ENABLE_INTR_MASK
+const MC_SNOOP: u32 = 1 << 20; // linux: IH_RB_CNTL__MC_SNOOP_MASK
+const RPTR_REARM: u32 = 1 << 21; // linux: IH_RB_CNTL__RPTR_REARM_MASK
+const MC_RO: u32 = 1 << 22; // linux: IH_RB_CNTL__MC_RO_MASK
+const MC_VMID: u32 = 0xf << 24; // linux: IH_RB_CNTL__MC_VMID_MASK
+const MC_SPACE: u32 = 7 << 28; // linux: IH_RB_CNTL__MC_SPACE_MASK
+const OVERFLOW_CLEAR: u32 = 1 << 31; // linux: IH_RB_CNTL__WPTR_OVERFLOW_CLEAR_MASK
+const SIZE_MASK: u32 = 0x3e; // linux: IH_RB_CNTL__RB_SIZE_MASK
+const THRESHOLD: u32 = 0xf000; // linux: IH_RB_CNTL_RING1__RB_USED_INT_THRESHOLD_MASK
+const RB_OVERFLOW: u32 = 1; // linux: IH_RB_WPTR__RB_OVERFLOW_MASK
                             // IH_CNTL2 SELF_IV_FORCE_WPTR_UPDATE_{TIMEOUT,ENABLE}.
-const FORCE_TIMEOUT: u32 = 0x1f;
+const FORCE_TIMEOUT: u32 = 0x1f; // linux: IH_CNTL2__SELF_IV_FORCE_WPTR_UPDATE_TIMEOUT_MASK
+/// linux: IH_CNTL2__SELF_IV_FORCE_WPTR_UPDATE_ENABLE_MASK
 const FORCE_ENABLE: u32 = 1 << 8;
 // INTERRUPT_CNTL IH_DUMMY_RD_OVERRIDE / IH_REQ_NONSNOOP_EN, range SIZE.
-const DUMMY_RD_OVERRIDE: u32 = 1;
-const REQ_NONSNOOP: u32 = 1 << 3;
-const DOORBELL_SIZE: u32 = 0x1f << 16;
+const DUMMY_RD_OVERRIDE: u32 = 1; // linux: INTERRUPT_CNTL__IH_DUMMY_RD_OVERRIDE_MASK
+const REQ_NONSNOOP: u32 = 1 << 3; // linux: INTERRUPT_CNTL__IH_REQ_NONSNOOP_EN_MASK
+const DOORBELL_SIZE: u32 = 0x1f << 16; // linux: BIF_IH_DOORBELL_RANGE__SIZE_MASK
 
 /// SOC15 client and source ids. Clients: soc15_ih_clientid.h; sources from
 /// the matching ivsrcid headers and the Linux IP handlers that register them.
 pub mod source {
     use super::Source;
     pub mod client {
-        pub const IH: u8 = 0x00;
-        pub const DCE: u8 = 0x04;
+        pub const IH: u8 = 0x00; // linux: SOC15_IH_CLIENTID_IH
+        pub const DCE: u8 = 0x04; // linux: SOC15_IH_CLIENTID_DCE
         /// SOC15_IH_CLIENTID_VCN1 (UVD1) and SOC15_IH_CLIENTID_VCN (UVD).
-        pub const VCN1: u8 = 0x0e;
-        pub const VCN: u8 = 0x10;
-        pub const SDMA0: u8 = 0x08;
-        pub const SDMA1: u8 = 0x09;
-        pub const THM: u8 = 0x0f;
-        pub const VMC: u8 = 0x12;
-        pub const GRBM_CP: u8 = 0x14;
-        pub const ROM_SMUIO: u8 = 0x16;
-        pub const UTCL2: u8 = 0x1b;
-        pub const MP1: u8 = 0x1f;
+        pub const VCN1: u8 = 0x0e; // linux: SOC15_IH_CLIENTID_VCN1
+        pub const VCN: u8 = 0x10; // linux: SOC15_IH_CLIENTID_VCN
+        pub const SDMA0: u8 = 0x08; // linux: SOC15_IH_CLIENTID_SDMA0
+        pub const SDMA1: u8 = 0x09; // linux: SOC15_IH_CLIENTID_SDMA1
+        pub const THM: u8 = 0x0f; // linux: SOC15_IH_CLIENTID_THM
+        pub const VMC: u8 = 0x12; // linux: SOC15_IH_CLIENTID_VMC
+        pub const GRBM_CP: u8 = 0x14; // linux: SOC15_IH_CLIENTID_GRBM_CP
+        pub const ROM_SMUIO: u8 = 0x16; // linux: SOC15_IH_CLIENTID_ROM_SMUIO
+        pub const UTCL2: u8 = 0x1b; // linux: SOC15_IH_CLIENTID_UTCL2
+        pub const MP1: u8 = 0x1f; // linux: SOC15_IH_CLIENTID_MP1
     }
     const fn s(client: u8, src: u8) -> Source {
         Source { client, src }
     }
     /// gfx_v10_0_sw_init: GFX_10_1__SRCID__CP_* on GRBM_CP. ring_id is the
     /// ME/pipe/queue, see [`super::Iv::cp_queue`].
+    // linux-lit: 181=GFX_10_1__SRCID__CP_EOP_INTERRUPT
     pub const GFX_EOP: Source = s(client::GRBM_CP, 181);
+    // linux-lit: 183=GFX_10_1__SRCID__CP_BAD_OPCODE_ERROR
     pub const GFX_BAD_OPCODE: Source = s(client::GRBM_CP, 183);
+    // linux-lit: 184=GFX_10_1__SRCID__CP_PRIV_REG_FAULT
     pub const GFX_PRIV_REG: Source = s(client::GRBM_CP, 184);
+    // linux-lit: 185=GFX_10_1__SRCID__CP_PRIV_INSTR_FAULT
     pub const GFX_PRIV_INSTR: Source = s(client::GRBM_CP, 185);
     /// sdma_v5_2_sw_init: SDMA{0,1}_5_0__SRCID__SDMA_TRAP; src_data[0] carries
     /// the TRAP packet INT_CONTEXT and ring_id 0 is the gfx queue.
+    // linux-lit: 224=SDMA0_5_0__SRCID__SDMA_TRAP
     pub const SDMA0_TRAP: Source = s(client::SDMA0, 224);
+    // linux-lit: 224=SDMA1_5_0__SRCID__SDMA_TRAP
     pub const SDMA1_TRAP: Source = s(client::SDMA1, 224);
     /// vcn_v3_0_sw_init: VCN_2_0__SRCID__UVD_SYSTEM_MESSAGE_INTERRUPT (decode)
     /// and UVD_ENC_GENERAL_PURPOSE + j (encode ring j) per instance client;
     /// jpeg_v3_0_sw_init: VCN_2_0__SRCID__JPEG_DECODE on the VCN client.
+    // linux-lit: 124=VCN_2_0__SRCID__UVD_SYSTEM_MESSAGE_INTERRUPT
     pub const VCN0_DEC: Source = s(client::VCN, 124);
+    // linux-lit: 119=VCN_2_0__SRCID__UVD_ENC_GENERAL_PURPOSE; 120=VCN_2_0__SRCID__UVD_ENC_LOW_LATENCY
     pub const VCN0_ENC: [Source; 2] = [s(client::VCN, 119), s(client::VCN, 120)];
+    // linux-lit: 124=VCN_2_0__SRCID__UVD_SYSTEM_MESSAGE_INTERRUPT
     pub const VCN1_DEC: Source = s(client::VCN1, 124);
+    // linux-lit: 119=VCN_2_0__SRCID__UVD_ENC_GENERAL_PURPOSE; 120=VCN_2_0__SRCID__UVD_ENC_LOW_LATENCY
     pub const VCN1_ENC: [Source; 2] = [s(client::VCN1, 119), s(client::VCN1, 120)];
+    // linux-lit: 153=VCN_2_0__SRCID__JPEG_DECODE
     pub const JPEG_DEC: Source = s(client::VCN, 153);
     /// gmc_v10_0_sw_init: VMC (MMHUB) and UTCL2 (GFXHUB) faults.
+    // linux-lit: 0=VMC_1_0__SRCID__VM_FAULT
     pub const VMC_FAULT: Source = s(client::VMC, 0);
+    // linux-lit: 0=UTCL2_1_0__SRCID__FAULT
     pub const UTCL2_FAULT: Source = s(client::UTCL2, 0);
     /// DCN_1_0__SRCID__DC_HPD1_INT is shared by every HPD and HPD-RX line;
     /// src_data[0] is the context id, see [`super::Iv::hpd`].
+    // linux-lit: 9=DCN_1_0__SRCID__DC_HPD1_INT
     pub const DCN_HPD: Source = s(client::DCE, 9);
+    // linux-lit: 0x68=DCN_1_0__SRCID__DMCUB_OUTBOX_LOW_PRIORITY_READY_INT
     pub const DCN_DMUB_OUTBOX: Source = s(client::DCE, 0x68);
     /// smu_v11_0_register_irq_handler: thermal L2H/H2L, CTF GPIO19, SMU.
+    // linux-lit: 0=THM_11_0__SRCID__THM_DIG_THERM_L2H
     pub const THERMAL_HIGH: Source = s(client::THM, 0);
+    // linux-lit: 1=THM_11_0__SRCID__THM_DIG_THERM_H2L
     pub const THERMAL_LOW: Source = s(client::THM, 1);
+    // linux-lit: 83=SMUIO_11_0__SRCID__SMUIO_GPIO19
     pub const THERMAL_CTF: Source = s(client::ROM_SMUIO, 83);
+    // linux: n/a (0xfe = SMU_IH_INTERRUPT_ID_TO_DRIVER, smu_cmn.h; not in checker sets)
     pub const SMU_TO_DRIVER: Source = s(client::MP1, 0xfe);
     /// Vblank as amdgpu_dm uses it on DCN: OTG VSTARTUP (DC_D1_OTG_VSTARTUP + n).
     pub const fn vblank(otg: u8) -> Option<Source> {
         if otg < 6 {
+            // linux-lit: 0x3c=DCN_1_0__SRCID__DC_D1_OTG_VSTARTUP
             Some(s(client::DCE, 0x3c + otg))
         } else {
             None
@@ -152,6 +178,7 @@ pub mod source {
     /// OTGn_IHC_V_UPDATE_NO_LOCK_INTERRUPT, n starting at OTG0 (0x57).
     pub const fn vupdate(otg: u8) -> Option<Source> {
         if otg < 6 {
+            // linux-lit: 0x57=DCN_1_0__SRCID__OTG0_IHC_V_UPDATE_NO_LOCK_INTERRUPT
             Some(s(client::DCE, 0x57 + otg))
         } else {
             None
@@ -160,6 +187,7 @@ pub mod source {
     /// HUBPn_FLIP_INTERRUPT (0x4f + n).
     pub const fn pflip(hubp: u8) -> Option<Source> {
         if hubp < 6 {
+            // linux-lit: 0x4f=DCN_1_0__SRCID__HUBP0_FLIP_INTERRUPT
             Some(s(client::DCE, 0x4f + hubp))
         } else {
             None
@@ -245,6 +273,7 @@ pub struct Hpd {
     pub rx: bool,
 }
 impl Iv {
+    // linux: n/a (dword layout literals in amdgpu_ih.c:amdgpu_ih_decode_iv_helper)
     pub const fn decode(dw: [u32; 8]) -> Self {
         Self {
             client: dw[0] as u8,
@@ -268,6 +297,7 @@ impl Iv {
     /// gfx_v10_0_eop_irq ring_id layout.
     pub const fn cp_queue(&self) -> CpQueue {
         CpQueue {
+            // linux: n/a (ring_id literals in gfx_v10_0.c:gfx_v10_0_eop_irq)
             me: (self.ring_id & 0x0c) >> 2,
             pipe: self.ring_id & 3,
             queue: (self.ring_id & 0x70) >> 4,
@@ -282,20 +312,24 @@ impl Iv {
         }
         Some(PageFault {
             mmhub: self.client == source::client::VMC,
+            // linux: n/a (literals in gmc_v10_0.c:gmc_v10_0_process_interrupt)
             address: ((self.src_data[0] as u64) << 12) | (((self.src_data[1] & 0xf) as u64) << 44),
+            // linux-lit: 0x80=AMDGPU_GMC9_FAULT_SOURCE_DATA_RETRY
             retry: self.src_data[1] & 0x80 != 0,
+            // linux-lit: 0x20=AMDGPU_GMC9_FAULT_SOURCE_DATA_WRITE
             write: self.src_data[1] & 0x20 != 0,
         })
     }
     /// irq_service_dcn30 HPD context ids: 0..5 HPDn, 6..11 HPDn_RX.
     pub const fn hpd(&self) -> Option<Hpd> {
+        // linux-lit: 9=DCN_1_0__SRCID__DC_HPD1_INT; 11=DCN_1_0__CTXID__DC_HPD6_RX_INT
         if self.client != source::client::DCE || self.src != 9 || self.src_data[0] > 11 {
             return None;
         }
         let context = self.src_data[0] as u8;
         Some(Hpd {
-            instance: context % 6,
-            rx: context >= 6,
+            instance: context % 6, // linux-lit: 6=DCN_1_0__CTXID__DC_HPD1_RX_INT
+            rx: context >= 6,      // linux-lit: 6=DCN_1_0__CTXID__DC_HPD1_RX_INT
         })
     }
 }
@@ -465,6 +499,7 @@ impl<I: Io> Engine<I> {
             return Err(Error::Invalid);
         }
         let inherited = self.access(|io, l| {
+            // linux: n/a (MMIO_REG_HOLE_OFFSET = 0x80000 - PAGE_SIZE, nbio_v2_3.c)
             if checked(io.read(Self::nbio(l, REMAP_HDP_FLUSH)))? != 0x7f000 {
                 return Err(Error::Invalid);
             }
@@ -492,6 +527,7 @@ impl<I: Io> Engine<I> {
     fn self_int(io: &mut I, l: Layout, enable: bool) -> Result<(), Error> {
         let cntl2 = checked(io.read(Self::reg(l, IH_CNTL2)))?;
         let cntl2 =
+            // linux: n/a (timeout 8, navi10_ih.c:navi10_ih_irq_init)
             (cntl2 & !(FORCE_TIMEOUT | FORCE_ENABLE)) | 8 | if enable { FORCE_ENABLE } else { 0 };
         Self::update(io, Self::reg(l, RB_CNTL_RING1), THRESHOLD, 0)?;
         Self::update(io, Self::reg(l, RB_CNTL_RING2), THRESHOLD, 0)?;
@@ -511,8 +547,9 @@ impl<I: Io> Engine<I> {
                 io.write_memory(map, offset, 0);
             }
             fence(Ordering::SeqCst);
+            // linux: n/a (MMIO_REG_HOLE_OFFSET write, amdgpu_hdp_generic_flush)
             io.write(0x7f000, 0);
-            io.read(Self::nbio(l, 0xc3));
+            io.read(Self::nbio(l, 0xc3)); // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
             fence(Ordering::SeqCst);
             Ok(())
         })?;
@@ -520,6 +557,7 @@ impl<I: Io> Engine<I> {
         self.memory.publish();
         self.access(|io, l| {
             Self::toggle(io, l, false)?;
+            // linux: n/a (dummy_page_addr >> 8, nbio_v2_3.c:nbio_v2_3_ih_control)
             io.write(Self::nbio(l, INTERRUPT_CNTL2), (dummy >> 8) as u32);
             // Dummy read off with MSI, on without. NONSNOOP stays 0 as Linux.
             Self::update(
@@ -529,6 +567,7 @@ impl<I: Io> Engine<I> {
                 0,
             )?;
             io.write(Self::reg(l, RB_BASE), (address >> 8) as u32);
+            // linux: n/a (literals in navi10_ih.c:navi10_ih_enable_ring)
             io.write(Self::reg(l, RB_BASE_HI), ((address >> 40) & 0xff) as u32);
             Self::update(
                 io,
@@ -542,10 +581,10 @@ impl<I: Io> Engine<I> {
                     | MC_RO
                     | MC_VMID
                     | RPTR_REARM,
-                (4 << 28)
+                (4 << 28) // linux-lit: 28=IH_RB_CNTL__MC_SPACE__SHIFT
                     | OVERFLOW_CLEAR
                     | OVERFLOW_ENABLE
-                    | (RB_SIZE << 1)
+                    | (RB_SIZE << 1) // linux-lit: 1=IH_RB_CNTL__RB_SIZE__SHIFT
                     | WRITEBACK
                     | MC_SNOOP
                     | if msi { RPTR_REARM } else { 0 },
@@ -553,6 +592,7 @@ impl<I: Io> Engine<I> {
             io.write(Self::reg(l, WPTR_ADDR_LO), writeback as u32 & !3);
             io.write(
                 Self::reg(l, WPTR_ADDR_HI),
+                // linux: n/a (literal in navi10_ih.c:navi10_ih_enable_ring)
                 (writeback >> 32) as u32 & 0xffff,
             );
             io.write(Self::reg(l, RB_WPTR), 0);
@@ -578,6 +618,7 @@ impl<I: Io> Engine<I> {
         }
         let wptr = wptr & !RB_OVERFLOW;
         // Resume from the oldest vector not yet overwritten.
+        // linux: n/a (wptr + 32, navi10_ih.c:navi10_ih_get_wptr)
         *rptr = wptr.wrapping_add(32) & MASK;
         let cntl = Self::update(io, Self::reg(l, RB_CNTL), OVERFLOW_CLEAR, OVERFLOW_CLEAR)?;
         io.write(Self::reg(l, RB_CNTL), cntl & !OVERFLOW_CLEAR);
@@ -1305,6 +1346,7 @@ async fn prove(
     let deadline = narf_time::Deadline::after_ms(100);
     loop {
         if let Some(iv) = waiter.try_next().map_err(Error::Closed)? {
+            // linux-lit: 0x0fff_ffff=SDMA_PKT_TRAP_INT_CONTEXT_int_context_mask
             if iv.ring_id == 0 && iv.src_data[0] & 0x0fff_ffff == context {
                 // Allow the MSI write a further 10 ms to be observed.
                 let late = narf_time::Deadline::after_ms(10);

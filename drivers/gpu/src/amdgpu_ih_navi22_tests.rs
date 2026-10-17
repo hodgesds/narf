@@ -636,6 +636,8 @@ kernel_test_in!(
 fn ih_navi22_layout_requires_osssys_5_0_3_and_bounds() -> TestResult {
     let base = || {
         let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+        // The fixture's own OSSSYS block (base 0) is replaced by this one.
+        gpu.ip_blocks.retain(|b| b.hw_id != ip::HW_ID_OSSSYS);
         let mut oss = gpu.ip_blocks[0];
         (oss.hw_id, oss.major, oss.minor, oss.revision) = (ip::HW_ID_OSSSYS, 5, 0, 3);
         oss.base_addrs[0] = 0x10a0;

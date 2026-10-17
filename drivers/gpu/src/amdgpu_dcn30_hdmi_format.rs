@@ -26,60 +26,113 @@ use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // Base index 2. FMT/DPG stride 0x5a, OTG 0x80, ODM 0x10.
+// linux-ctx: hdr=dcn seg=2
+// linux: mmFMT0_FMT_DYNAMIC_EXP_CNTL
 const FMT_DYNAMIC_EXP_CNTL: u64 = 0x183f;
+// linux: mmFMT0_FMT_CONTROL
 const FMT_CONTROL: u64 = 0x1840;
+// linux: mmFMT0_FMT_BIT_DEPTH_CONTROL
 const FMT_BIT_DEPTH_CONTROL: u64 = 0x1841;
+// linux: mmFMT0_FMT_DITHER_RAND_R_SEED; mmFMT0_FMT_DITHER_RAND_G_SEED; mmFMT0_FMT_DITHER_RAND_B_SEED
 const FMT_DITHER_RAND_SEEDS: [u64; 3] = [0x1842, 0x1843, 0x1844];
+// linux: mmFMT0_FMT_CLAMP_CNTL
 const FMT_CLAMP_CNTL: u64 = 0x1845;
+// linux: mmFMT0_FMT_MAP420_MEMORY_CONTROL
 const FMT_MAP420_MEMORY_CONTROL: u64 = 0x1847;
+// linux: mmFMT0_FMT_422_CONTROL
 const FMT_422_CONTROL: u64 = 0x1849;
 /// `opp2_dpg_set_blank_color`'s order: B/Cb, G/Y, R/Cr.
+// linux: mmDPG0_DPG_COLOUR_B_CB
 const DPG_COLOUR_B_CB: u64 = 0x1859;
+// linux: mmDPG0_DPG_COLOUR_G_Y
 const DPG_COLOUR_G_Y: u64 = 0x1858;
+// linux: mmDPG0_DPG_COLOUR_R_CR
 const DPG_COLOUR_R_CR: u64 = 0x1857;
+// linux: mmFMT1_FMT_CONTROL - mmFMT0_FMT_CONTROL
 const FMT_STRIDE: u64 = 0x5a;
+// linux: mmODM0_OPTC_DATA_FORMAT_CONTROL
 const ODM_OPTC_DATA_FORMAT_CONTROL: u64 = 0x1acc;
+// linux: mmODM1_OPTC_DATA_FORMAT_CONTROL - mmODM0_OPTC_DATA_FORMAT_CONTROL
 const ODM_STRIDE: u64 = 0x10;
+// linux: mmOTG0_OTG_H_TIMING_CNTL
 const OTG_H_TIMING_CNTL: u64 = 0x1b2e;
+// linux: mmOTG1_OTG_H_TIMING_CNTL - mmOTG0_OTG_H_TIMING_CNTL
 const OTG_STRIDE: u64 = 0x80;
+// linux-ctx: hdr=dcn seg=3
 // Base index 3. MPCC stride 0x20, MPC output CSC stride 0xd.
+// linux: mmMPCC0_MPCC_MEM_PWR_CTRL
 const MPCC_MEM_PWR_CTRL: u64 = 0x000c;
+// linux: mmMPCC1_MPCC_MEM_PWR_CTRL - mmMPCC0_MPCC_MEM_PWR_CTRL
 const MPCC_STRIDE: u64 = 0x20;
+// linux: mmMPC_OUT_CSC_COEF_FORMAT
 const MPC_OUT_CSC_COEF_FORMAT: u64 = 0x0598;
+// linux: mmMPC_OUT0_CSC_MODE
 const MPC_OUT_CSC_MODE: u64 = 0x0599;
+// linux: mmMPC_OUT0_CSC_C11_C12_A
 const MPC_OUT_CSC_C11_C12_A: u64 = 0x059a;
+// linux: mmMPC_OUT1_CSC_MODE - mmMPC_OUT0_CSC_MODE
 const MPC_OUT_STRIDE: u64 = 0xd;
+// linux-ctx: reset
+// linux: n/a (NARF bound: DCN30 has six OTGs/OPPs/MPCCs)
 const PIPES: u8 = 6;
+// linux: mmOTG5_OTG_H_TIMING_CNTL
 const LAST_2: u32 = (OTG_H_TIMING_CNTL + 5 * OTG_STRIDE) as u32;
+// linux: mmMPC_OUT5_CSC_C33_C34_A
 const LAST_3: u32 = (MPC_OUT_CSC_C11_C12_A + 5 + 5 * MPC_OUT_STRIDE) as u32;
 
+// linux: FMT0_FMT_DYNAMIC_EXP_CNTL__FMT_DYNAMIC_EXP_EN_MASK
 const FMT_DYNAMIC_EXP_EN: u32 = 1 << 0;
+// linux: FMT0_FMT_DYNAMIC_EXP_CNTL__FMT_DYNAMIC_EXP_MODE_MASK
 const FMT_DYNAMIC_EXP_MODE: u32 = 1 << 4;
+// linux: FMT0_FMT_CONTROL__FMT_SPATIAL_DITHER_FRAME_COUNTER_MAX_MASK
 const FMT_SPATIAL_DITHER_FRAME_COUNTER_MAX: u32 = 0xf00;
+// linux: FMT0_FMT_CONTROL__FMT_SPATIAL_DITHER_FRAME_COUNTER_BIT_SWAP_MASK
 const FMT_SPATIAL_DITHER_FRAME_COUNTER_BIT_SWAP: u32 = 0x3000;
+// linux: FMT0_FMT_CONTROL__FMT_PIXEL_ENCODING_MASK
 const FMT_PIXEL_ENCODING: u32 = 0x3_0000;
+// linux: FMT0_FMT_CONTROL__FMT_SUBSAMPLING_MODE_MASK
 const FMT_SUBSAMPLING_MODE: u32 = 0xc_0000;
+// linux: FMT0_FMT_CONTROL__FMT_CBCR_BIT_REDUCTION_BYPASS_MASK
 const FMT_CBCR_BIT_REDUCTION_BYPASS: u32 = 0x20_0000;
+// linux: FMT0_FMT_BIT_DEPTH_CONTROL__FMT_TRUNCATE_EN_MASK | FMT0_FMT_BIT_DEPTH_CONTROL__FMT_TRUNCATE_MODE_MASK | FMT0_FMT_BIT_DEPTH_CONTROL__FMT_TRUNCATE_DEPTH_MASK
 const FMT_TRUNCATE: u32 = 0x1 | 0x2 | 0x30;
+// linux: FMT0_FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_EN_MASK
 const FMT_SPATIAL_DITHER_EN: u32 = 1 << 8;
+// linux: FMT0_FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_MODE_MASK
 const FMT_SPATIAL_DITHER_MODE: u32 = 0x600;
+// linux: FMT0_FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_DEPTH_MASK
 const FMT_SPATIAL_DITHER_DEPTH: u32 = 0x1800;
+// linux: FMT0_FMT_BIT_DEPTH_CONTROL__FMT_FRAME_RANDOM_ENABLE_MASK
 const FMT_FRAME_RANDOM_ENABLE: u32 = 1 << 13;
+// linux: FMT0_FMT_BIT_DEPTH_CONTROL__FMT_RGB_RANDOM_ENABLE_MASK
 const FMT_RGB_RANDOM_ENABLE: u32 = 1 << 14;
+// linux: FMT0_FMT_BIT_DEPTH_CONTROL__FMT_HIGHPASS_RANDOM_ENABLE_MASK
 const FMT_HIGHPASS_RANDOM_ENABLE: u32 = 1 << 15;
+// linux: FMT0_FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_EN_MASK
 const FMT_TEMPORAL_DITHER_EN: u32 = 1 << 16;
+// linux: FMT0_FMT_CLAMP_CNTL__FMT_CLAMP_DATA_EN_MASK
 const FMT_CLAMP_DATA_EN: u32 = 1 << 0;
+// linux: FMT0_FMT_CLAMP_CNTL__FMT_CLAMP_COLOR_FORMAT_MASK
 const FMT_CLAMP_COLOR_FORMAT: u32 = 0x7_0000;
+// linux: FMT0_FMT_MAP420_MEMORY_CONTROL__FMT_MAP420MEM_PWR_FORCE_MASK
 const FMT_MAP420MEM_PWR_FORCE: u32 = 0x3;
+// linux: FMT0_FMT_422_CONTROL__FMT_LEFT_EDGE_EXTRA_PIXEL_COUNT_MASK
 const FMT_LEFT_EDGE_EXTRA_PIXEL_COUNT: u32 = 1 << 0;
+// linux: ODM0_OPTC_DATA_FORMAT_CONTROL__OPTC_DATA_FORMAT_MASK
 const OPTC_DATA_FORMAT: u32 = 0x3;
+// linux: OTG0_OTG_H_TIMING_CNTL__OTG_H_TIMING_DIV_MODE_MASK
 const OTG_H_TIMING_DIV_MODE: u32 = 0x3;
+// linux: MPCC0_MPCC_MEM_PWR_CTRL__MPCC_OGAM_MEM_PWR_DIS_MASK
 const MPCC_OGAM_MEM_PWR_DIS: u32 = 1 << 2;
+// linux: MPCC0_MPCC_MEM_PWR_CTRL__MPCC_OGAM_MEM_PWR_STATE_MASK
 const MPCC_OGAM_MEM_PWR_STATE: u32 = 0x300;
 /// `MPC_OUTPUT_CSC_COEF_A`.
+// linux: MPC_OUTPUT_CSC_COEF_A
 const MPC_OCSC_MODE_COEF_A: u32 = 1;
 /// `REG_WAIT(MPCC_MEM_PWR_CTRL, MPCC_OGAM_MEM_PWR_STATE, 0, 10, 10)`.
+// linux: n/a (REG_WAIT max_try 10, literal in dcn30_mpc.c:mpc3_power_on_ogam_lut)
 const MEM_PWR_POLLS: u32 = 10;
+// linux: n/a (REG_WAIT delay 10 us, literal in dcn30_mpc.c:mpc3_power_on_ogam_lut)
 const MEM_PWR_POLL_US: u64 = 10;
 
 /// `output_csc_matrix` (`dc_hw_sequencer.c`): C11..C34 for
@@ -249,6 +302,7 @@ impl<I: Io> Engine<I> {
         let bits = match spatial {
             Some(depth) => {
                 FMT_SPATIAL_DITHER_EN
+// linux-lit: 11=FMT0_FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_DEPTH__SHIFT
                     | depth << 11
                     | FMT_HIGHPASS_RANDOM_ENABLE
                     | if format.ycbcr420 {
@@ -273,6 +327,7 @@ impl<I: Io> Engine<I> {
         )?;
         // opp1_set_pixel_encoding.
         let encoding = if format.ycbcr420 {
+            // linux-lit: 16=FMT0_FMT_CONTROL__FMT_PIXEL_ENCODING__SHIFT; 18=FMT0_FMT_CONTROL__FMT_SUBSAMPLING_MODE__SHIFT
             2 << 16 | 2 << 18 | FMT_CBCR_BIT_REDUCTION_BYPASS
         } else {
             0
@@ -353,6 +408,7 @@ impl<I: Io> Engine<I> {
             (DPG_COLOUR_G_Y, g),
             (DPG_COLOUR_R_CR, r),
         ] {
+            // linux-lit: 16=DPG0_DPG_COLOUR_B_CB__DPG_COLOUR1_B_CB__SHIFT
             self.write(Bank::Two, self.at(reg, FMT_STRIDE), (c << 6) << 16 | c << 6)?;
         }
         Ok(())
@@ -386,8 +442,8 @@ impl Formatter {
         Ok(Self(Engine::new_with(
             Mmio {
                 regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
-                base2: bank(2, LAST_2)?,
-                base3: bank(3, LAST_3)?,
+                base2: bank(2, LAST_2)?, // linux-lit: 2=mmFMT0_FMT_CONTROL_BASE_IDX
+                base3: bank(3, LAST_3)?, // linux-lit: 3=mmMPC_OUT0_CSC_MODE_BASE_IDX
             },
             authority,
             pipe,

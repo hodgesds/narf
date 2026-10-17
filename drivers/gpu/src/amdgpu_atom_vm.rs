@@ -197,8 +197,8 @@ const DEF_DST: [u8; 8] = [0, 0, 1, 2, 0, 1, 2, 3];
 pub enum AtomError {
     /// Ran past the end of the bytecode buffer without an EOT.
     BytecodeTruncated,
-    /// Opcode byte ≥ `ATOM_OP_CNT` or 0. Linux stops the table there and
-    /// reports success; a misdecoded stream fails here.
+    /// Retained for API compatibility; opcode 0 / `>= ATOM_OP_CNT` ends the
+    /// table with [`Anomaly::BadOpcode`], as in Linux.
     BadOpcode(u8),
     /// Retained for API compatibility; out-of-range PS reads/writes are
     /// [`Anomaly::PsIndex`], as in Linux.
@@ -207,9 +207,10 @@ pub enum AtomError {
     WsIndexOutOfRange,
     /// Retained for API compatibility; see [`Anomaly::FbIndex`].
     FbIndexOutOfRange,
-    /// JUMP target lies outside the table.
+    /// JUMP target outside the table; surfaced as [`Anomaly::JumpTarget`]
+    /// (the table ends) and never returned from `step`.
     BadJumpTarget,
-    /// SWITCH found neither CASE_MAGIC nor CASE_END.
+    /// Retained for API compatibility; see [`Anomaly::BadCase`].
     BadSwitchCase,
     /// Retained for API compatibility; unbound closures read 0xCDCDCDCD.
     RegisterAccessNotBound,
@@ -239,6 +240,16 @@ pub enum Anomaly {
     UndefinedIio(u8),
     /// An IIO program used an unknown opcode or ran off the image.
     BadIio(u8),
+    /// Opcode 0 or `>= ATOM_OP_CNT`: amdgpu_atom_execute_table_locked's
+    /// `else break;` ends the table there and returns 0.
+    BadOpcode(u8),
+    /// atom_op_switch "Bad case": the switch returns and execution resumes
+    /// at the offending byte.
+    BadCase,
+    /// JUMP/SWITCH target outside this table's bytecode (the op site is
+    /// `Machine::last`). Linux would run whatever ROM bytes lie there; NARF
+    /// ends the table instead.
+    JumpTarget,
 }
 
 // ── Hooks ────────────────────────────────────────────────────────
@@ -326,6 +337,9 @@ pub struct Closures<'a> {
     pub table_resolver: TableResolver<'a>,
     /// `udelay`/`msleep` for DELAY_MICROSEC/DELAY_MILLISEC, in microseconds.
     pub delay_us: Box<dyn FnMut(u64) + 'a>,
+    /// Monotonic milliseconds for atom_op_jump's 20 s guard (`jiffies`);
+    /// `None` selects the clockless bounds.
+    pub now_ms: Option<Box<dyn FnMut() -> u64 + 'a>>,
 }
 impl fmt::Debug for Closures<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -345,6 +359,7 @@ impl Default for Closures<'_> {
             port_write: unbound_write(),
             table_resolver: Box::new(|_id| None),
             delay_us: Box::new(|_| {}),
+            now_ms: None,
         }
     }
 }
@@ -372,6 +387,9 @@ impl<'a> Hooks<'a> for Closures<'a> {
     }
     fn delay_us(&mut self, us: u64) {
         (self.delay_us)(us)
+    }
+    fn now_ms(&mut self) -> Option<u64> {
+        self.now_ms.as_mut().map(|now| now())
     }
 }
 
@@ -1271,7 +1289,9 @@ fn op_switch<'a, H: Hooks<'a>>(
             return Ok(());
         }
         if frame.u8_at(*ptr)? != CASE_MAGIC {
-            return Err(AtomError::BadSwitchCase);
+            // pr_info("Bad case"); return -- the next opcode is this byte.
+            state.anomaly(Anomaly::BadCase);
+            return Ok(());
         }
         *ptr += 1;
         let case_val = get_src(state, frame, (attr & 0x38) | ARG_IMM, ptr)?;
@@ -1708,6 +1728,18 @@ impl<'c, 'p> Machine<'c, 'p> {
         }
         result
     }
+    /// Return from the current table (EOT, or one Linux stops early),
+    /// restoring the caller's WS.
+    fn end_frame<'a: 'c, H: Hooks<'a>>(&mut self, state: &mut AtomState<'a, H>) -> Step {
+        if let Some(ws) = self.stack.pop().and_then(|r| r.saved_ws) {
+            state.scratch = ws;
+        }
+        if self.stack.is_empty() {
+            Step::Done
+        } else {
+            Step::Continue
+        }
+    }
     fn step_inner<'a: 'c, H: Hooks<'a>>(
         &mut self,
         state: &mut AtomState<'a, H>,
@@ -1726,10 +1758,19 @@ impl<'c, 'p> Machine<'c, 'p> {
             depth: depth as u32 - 1,
         });
         ptr += 1;
-        if opcode == 0 || opcode >= ATOM_OP_CNT {
-            return Err(AtomError::BadOpcode(opcode));
-        }
-        let op = decode_op(opcode)?;
+        let op = if opcode == 0 || opcode >= ATOM_OP_CNT {
+            None
+        } else {
+            Some(decode_op(opcode)?)
+        };
+        let Some(op) = op else {
+            // atom.c: `if (op < ATOM_OP_CNT && op > 0) ... else break;` --
+            // the table (only this CALLTABLE frame) ends with success.
+            state.anomaly(Anomaly::BadOpcode(opcode));
+            record.ptr = ptr;
+            self.steps += 1;
+            return Ok(self.end_frame(state));
+        };
         let mut frame = Frame {
             code: record.code,
             ps: &mut self.ps[base..],
@@ -1738,7 +1779,15 @@ impl<'c, 'p> Machine<'c, 'p> {
             start: record.start,
             jump: &mut record.jump,
         };
-        let flow = run_op(state, &mut frame, op, &mut ptr)?;
+        let flow = match run_op(state, &mut frame, op, &mut ptr) {
+            Err(AtomError::BadJumpTarget) => {
+                state.anomaly(Anomaly::JumpTarget);
+                record.ptr = ptr;
+                self.steps += 1;
+                return Ok(self.end_frame(state));
+            }
+            flow => flow?,
+        };
         let shift = frame.ps_shift.min(frame.ps.len());
         record.ptr = ptr;
         self.steps += 1;
@@ -1748,16 +1797,7 @@ impl<'c, 'p> Machine<'c, 'p> {
         Ok(match flow {
             Flow::Next => Step::Continue,
             Flow::Delay(us) => Step::Delay(us),
-            Flow::Eot => {
-                if let Some(ws) = self.stack.pop().and_then(|r| r.saved_ws) {
-                    state.scratch = ws;
-                }
-                if self.stack.is_empty() {
-                    Step::Done
-                } else {
-                    Step::Continue
-                }
-            }
+            Flow::Eot => self.end_frame(state),
             Flow::Call(table) => {
                 // `ctx->ps + ctx->ps_shift`, `ctx->ps_size - ctx->ps_shift`.
                 let saved_ws = table

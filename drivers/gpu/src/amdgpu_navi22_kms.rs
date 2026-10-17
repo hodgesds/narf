@@ -28,7 +28,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// (`amdgpu_navi22_modeset`, pipe 0, presentation); CRTCs 1.. light only
 /// as one multi-stream context with CRTC 0 (`amdgpu_navi22_modeset::Group`,
 /// one pipe per stream), at most the shared KMS id scheme's four outputs.
-pub const MAX_CRTCS: usize = 4;
+pub const MAX_CRTCS: usize = 4; // linux: n/a (amdgpu_navi48_kms MAX_OUTPUTS id scheme)
 /// Automatic routing gives the secondary CRTCs the remaining sinks (the
 /// `amdgpu.navi22_multi` opt-in); without it only DRM routes them.
 static AUTO_MULTI: AtomicBool = AtomicBool::new(false);
@@ -37,6 +37,7 @@ pub fn set_auto_multi(on: bool) {
 }
 
 /// DRM_FORMAT_XRGB8888 and ARGB8888: what the native scanout presents.
+// linux: n/a (DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888: fourcc_code() in drm_fourcc.h)
 const PLANE_FORMATS: [u32; 2] = [0x3432_5258, 0x3432_5241];
 
 /// One board connector and its sink as last detected.
@@ -688,6 +689,7 @@ pub fn display_admission(
         fclk_change: false,
         stutter: false,
         watermarks: streams != 0,
+        // linux: n/a (memclk_mhz * 16, dcn30_resource.c dcn30_update_bw_bounding_box)
         min_uclk_mhz: u16::try_from(admitted.soc.dram_speed_mts / 16).unwrap_or(u16::MAX),
         min_fclk_mhz: mhz(admitted.soc.fabric_khz),
         min_dcefclk_mhz: mhz(admitted.plan.clocks.dcfclk_khz),

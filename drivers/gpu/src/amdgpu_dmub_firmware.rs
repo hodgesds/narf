@@ -9,14 +9,15 @@
 use core::ops::Range;
 
 pub const DCN314_FIRMWARE: &str = "amdgpu/dcn_3_1_4_dmcub.bin";
-const HEADER_SIZE: usize = 40;
-const PSP_HEADER_SIZE: usize = 256;
-const META_SIZE: usize = 64;
-const META_MAGIC: u32 = 0x444d_5542;
+const HEADER_SIZE: usize = 40; // linux: sizeof(struct dmcub_firmware_header_v1_0)
+const PSP_HEADER_SIZE: usize = 256; // linux: PSP_HEADER_BYTES_256
+const META_SIZE: usize = 64; // linux: sizeof(union dmub_fw_meta)
+const META_MAGIC: u32 = 0x444d_5542; // linux: DMUB_FW_META_MAGIC
+                                     // linux: n/a (NARF bound on firmware-declared window sizes)
 const MAX_WINDOW_SIZE: usize = 16 * 1024 * 1024;
-const MAX_IMAGE_SIZE: usize = MAX_WINDOW_SIZE + 4096;
-const MAX_VBIOS_SIZE: usize = 1024 * 1024;
-pub const RING_SIZE: u32 = 8192;
+const MAX_IMAGE_SIZE: usize = MAX_WINDOW_SIZE + 4096; // linux: n/a (NARF bound)
+const MAX_VBIOS_SIZE: usize = 1024 * 1024; // linux: n/a (NARF bound)
+pub const RING_SIZE: u32 = 8192; // linux: DMUB_RB_SIZE
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -70,21 +71,29 @@ impl<'a> Image<'a> {
         if bytes.len() < HEADER_SIZE {
             return Err(Error::Truncated);
         }
+        // linux-lit: 4=offsetof(struct common_firmware_header, header_size_bytes)
         if u32_at(bytes, 4) as usize != HEADER_SIZE
+            // linux-lit: 8=offsetof(struct common_firmware_header, header_version_major)
+            // linux-lit: 10=offsetof(struct common_firmware_header, header_version_minor)
             || (u16_at(bytes, 8), u16_at(bytes, 10)) != (1, 0)
         {
             return Err(Error::UnsupportedHeader);
         }
         let size = u32_at(bytes, 0) as usize;
+        // linux-lit: 20=offsetof(struct common_firmware_header, ucode_size_bytes)
         let payload_size = u32_at(bytes, 20) as usize;
+        // linux-lit: 24=offsetof(struct common_firmware_header, ucode_array_offset_bytes)
         let payload_start = u32_at(bytes, 24) as usize;
+        // linux-lit: 32=offsetof(struct dmcub_firmware_header_v1_0, inst_const_bytes)
         let inst_size = u32_at(bytes, 32) as usize;
+        // linux-lit: 36=offsetof(struct dmcub_firmware_header_v1_0, bss_data_bytes)
         let data_size = u32_at(bytes, 36) as usize;
         if size != bytes.len()
             || size > MAX_IMAGE_SIZE
             || payload_start < HEADER_SIZE
             || payload_start.checked_add(payload_size) != Some(size)
             || inst_size.checked_add(data_size) != Some(payload_size)
+            // linux-lit: 256=PSP_FOOTER_BYTES_256
             || inst_size <= PSP_HEADER_SIZE + 256 + META_SIZE
         {
             return Err(Error::InvalidSize);
@@ -98,6 +107,7 @@ impl<'a> Image<'a> {
         // metadata lives 0x24 bytes before the end of BSS/data; in the combined
         // format it precedes the footer, with up to 15 bytes of alignment.
         let mut found = None;
+        // linux-lit: 256=PSP_FOOTER_BYTES_256; 512=2 * PSP_FOOTER_BYTES_256
         for footer in [256, 512] {
             let Some(end) = signed
                 .end
@@ -109,7 +119,7 @@ impl<'a> Image<'a> {
             let meta = if data.is_empty() {
                 (0..16).find_map(|tail| metadata(&bytes[inst_start..end], tail))
             } else {
-                metadata(&bytes[data.clone()], 0x24)
+                metadata(&bytes[data.clone()], 0x24) // linux-lit: 0x24=DMUB_FW_META_OFFSET
             };
             if let Some(meta) = meta {
                 found = Some((end, meta));
@@ -118,14 +128,20 @@ impl<'a> Image<'a> {
         }
         let (inst_end, meta) = found.ok_or(Error::MetadataMissing)?;
         let metadata = Metadata {
+            // linux-lit: 4=offsetof(struct dmub_fw_meta_info, fw_region_size)
             state_size: u32_at(meta, 4),
+            // linux-lit: 8=offsetof(struct dmub_fw_meta_info, trace_buffer_size)
             trace_size: u32_at(meta, 8),
+            // linux-lit: 12=offsetof(struct dmub_fw_meta_info, fw_version)
             version: u32_at(meta, 12),
+            // linux-lit: 20=offsetof(struct dmub_fw_meta_info, shared_state_size)
             shared_state_size: u32_at(meta, 20),
+            // linux-lit: 24=offsetof(struct dmub_fw_meta_info, shared_state_features)
             shared_state_features: u16_at(meta, 24),
+            // linux-lit: 28=offsetof(struct dmub_fw_meta_info, feature_bits)
             feature_bits: u32_at(meta, 28),
         };
-        if meta[16] != 1
+        if meta[16] != 1 // linux-lit: 16=offsetof(struct dmub_fw_meta_info, dal_fw)
             || metadata.state_size == 0
             || metadata.trace_size < 64
             || metadata.state_size as usize > MAX_WINDOW_SIZE
@@ -139,6 +155,7 @@ impl<'a> Image<'a> {
             signed,
             instructions: inst_start..inst_end,
             data,
+            // linux-lit: 16=offsetof(struct common_firmware_header, ucode_version)
             version: u32_at(bytes, 16),
             metadata,
         })
@@ -175,7 +192,10 @@ impl<'a> Image<'a> {
     /// DCN3.0's combined-image layout with cached inbox support. Legacy BSS
     /// and uncached-inbox images require a separate window layout.
     pub fn prepare_dcn30(self, vbios: &'a [u8]) -> Result<Prepared<'a>, Error> {
+        // linux-lit: 12=offsetof(struct common_firmware_header, ip_version_major)
+        // linux-lit: 14=offsetof(struct common_firmware_header, ip_version_minor)
         if (u16_at(self.bytes, 12), u16_at(self.bytes, 14)) != (3, 0)
+            // linux-lit: 0x010a0000=DMUB_FW_VERSION(1, 10, 0)
             || self.metadata.version <= 0x010a_0000
         {
             return Err(Error::UnsupportedLayout);
@@ -215,9 +235,11 @@ impl<'a> Image<'a> {
         }
         let sizes = [
             self.instructions.len(),
+            // linux: n/a (DMUB_STACK_SIZE + DMUB_CONTEXT_SIZE, dmub_srv.c; not in checker set)
             (128 + 512) * 1024, // Linux DMUB_STACK_SIZE + DMUB_CONTEXT_SIZE.
             0,                  // Combined image has no separate CW2 data.
             vbios.len(),
+            // linux: n/a (DMUB_MAILBOX_SIZE = 2 * DMUB_RB_SIZE, dmub_srv.c; not in checker set)
             RING_SIZE as usize * 2,
             self.metadata.trace_size as usize,
             self.metadata.state_size as usize,
@@ -229,7 +251,9 @@ impl<'a> Image<'a> {
             if size > MAX_WINDOW_SIZE {
                 return Err(Error::InvalidSize);
             }
+            // linux: n/a (literal in dmub_srv.c:dmub_srv_calc_region_info, dmub_align(top, 256))
             region.offset = align(end, 256)?;
+            // linux: n/a (literal in dmub_srv.c:dmub_srv_calc_region_info, dmub_align(size, 64))
             region.size = align(size as u32, 64)?;
             end = region
                 .offset
@@ -238,6 +262,7 @@ impl<'a> Image<'a> {
         }
         let layout = Layout {
             regions,
+            // linux: n/a (literal in dmub_srv.c:dmub_srv_calc_region_info, dmub_align(top, 4096))
             size: align(end, 4096)?,
         };
         Ok(Prepared {

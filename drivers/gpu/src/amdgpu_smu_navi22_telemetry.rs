@@ -8,59 +8,88 @@
 //! Pure parsing; the retained SMU owner performs every transfer.
 
 /// `TABLE_SMU_METRICS`, `sizeof(SmuMetricsExternal_t)`.
-pub(crate) const METRICS_TABLE: u32 = 5;
-pub(crate) const METRICS_BYTES: usize = 200;
+pub(crate) const METRICS_TABLE: u32 = 5; // linux: TABLE_SMU_METRICS
+pub(crate) const METRICS_BYTES: usize = 200; // linux: sizeof(SmuMetricsExternal_t)
 /// sienna_cichlid_get_smu_metrics_data: MP1 11.0.11 PMFW from 65.45.0
 /// (0x412D00) reports `SmuMetrics_V2_t`; older PMFW `SmuMetrics_t`.
+// linux: n/a (literal 0x412D00 in sienna_cichlid_ppt.c:sienna_cichlid_get_smu_metrics_data)
 pub(crate) const METRICS_V2_VERSION: u32 = 0x0041_2d00;
 // offsetof(SmuMetrics_t / SmuMetrics_V2_t, ...): identical through
 // TemperaturePlx; the V2 table replaces ThrottlerStatus with AccCnt plus
 // ThrottlingPercentage[THROTTLER_COUNT], which moves the fan fields.
-const CURR_CLOCK: usize = 0; // u32 CurrClock[PPCLK_COUNT]
+// u32 CurrClock[PPCLK_COUNT]
+// linux: offsetof(SmuMetrics_t, CurrClock)
+const CURR_CLOCK: usize = 0;
+// linux: offsetof(SmuMetrics_t, AverageGfxclkFrequencyPreDs)
 const GFX_PRE_DS: usize = 52;
+// linux: offsetof(SmuMetrics_t, AverageGfxclkFrequencyPostDs)
 const GFX_POST_DS: usize = 54;
+// linux: offsetof(SmuMetrics_t, AverageFclkFrequencyPostDs)
 const FCLK_POST_DS: usize = 58;
+// linux: offsetof(SmuMetrics_t, AverageUclkFrequencyPostDs)
 const UCLK_POST_DS: usize = 62;
+// linux: offsetof(SmuMetrics_t, AverageGfxActivity)
 const GFX_ACTIVITY: usize = 64;
+// linux: offsetof(SmuMetrics_t, AverageUclkActivity)
 const UCLK_ACTIVITY: usize = 66;
+// linux: offsetof(SmuMetrics_t, AverageSocketPower)
 const SOCKET_POWER: usize = 72;
+// linux: offsetof(SmuMetrics_t, TemperatureEdge)
 const TEMP_EDGE: usize = 74;
+// linux: offsetof(SmuMetrics_t, TemperatureHotspot)
 const TEMP_HOTSPOT: usize = 76;
+// linux: offsetof(SmuMetrics_t, TemperatureMem)
 const TEMP_MEM: usize = 78;
+// linux: offsetof(SmuMetrics_t, TemperatureVrGfx)
 const TEMP_VR_GFX: usize = 80;
+// linux: offsetof(SmuMetrics_t, TemperatureVrSoc)
 const TEMP_VR_SOC: usize = 86;
+// linux: offsetof(SmuMetrics_t, ThrottlerStatus)
 const V1_THROTTLER_STATUS: usize = 96;
+// linux: offsetof(SmuMetrics_t, CurrFanSpeed)
 const V1_FAN_SPEED: usize = 102;
+// linux: offsetof(SmuMetrics_t, PcieRate)
 const V1_PCIE_RATE: usize = 130;
+// linux: offsetof(SmuMetrics_V2_t, ThrottlingPercentage)
 const V2_THROTTLING: usize = 100;
+// linux: offsetof(SmuMetrics_V2_t, CurrFanSpeed)
 const V2_FAN_SPEED: usize = 122;
+// linux: offsetof(SmuMetrics_V2_t, PcieRate)
 const V2_PCIE_RATE: usize = 150;
+// linux: THROTTLER_COUNT
 pub const THROTTLER_COUNT: usize = 20;
 // PPCLK_e indices.
-const PPCLK_GFXCLK: usize = 0;
-const PPCLK_SOCCLK: usize = 1;
-const PPCLK_UCLK: usize = 2;
-const PPCLK_FCLK: usize = 3;
-const PPCLK_DCEFCLK: usize = 8;
+const PPCLK_GFXCLK: usize = 0; // linux: PPCLK_GFXCLK
+const PPCLK_SOCCLK: usize = 1; // linux: PPCLK_SOCCLK
+const PPCLK_UCLK: usize = 2; // linux: PPCLK_UCLK
+const PPCLK_FCLK: usize = 3; // linux: PPCLK_FCLK
+const PPCLK_DCEFCLK: usize = 8; // linux: PPCLK_DCEFCLK
 /// `SMU_11_0_7_GFX_BUSY_THRESHOLD`: at or below it the post-DS average is used.
-const BUSY_THRESHOLD: u16 = 15;
+const BUSY_THRESHOLD: u16 = 15; // linux: SMU_11_0_7_GFX_BUSY_THRESHOLD
 
 // offsetof(PPTable_t, ...), the 1668-byte table uploaded by the SMU owner.
-const FEATURES_TO_RUN: usize = 4; // u32[2]
-const SOCKET_POWER_LIMIT_AC: usize = 12; // u16[PPT_THROTTLER_COUNT], PPT0 first
+// u32[2]
+// linux: offsetof(PPTable_t, FeaturesToRun)
+const FEATURES_TO_RUN: usize = 4;
+// u16[PPT_THROTTLER_COUNT], PPT0 first
+// linux: offsetof(PPTable_t, SocketPowerLimitAc)
+const SOCKET_POWER_LIMIT_AC: usize = 12;
+// linux: offsetof(PPTable_t, TemperatureLimit)
 const TEMPERATURE_LIMIT: usize = 52; // u16[TEMP_COUNT]: EDGE, HOTSPOT, MEM
-const FAN_MAXIMUM_RPM: usize = 1018;
-pub(crate) const PPTABLE_BYTES: usize = 1668;
+const FAN_MAXIMUM_RPM: usize = 1018; // linux: offsetof(PPTable_t, FanMaximumRpm)
+pub(crate) const PPTABLE_BYTES: usize = 1668; // linux: sizeof(PPTable_t)
 /// Linux smu_v11_0.h `CTF_OFFSET_{EDGE,HOTSPOT,MEM}`.
-const CTF_OFFSET: i32 = 5;
+const CTF_OFFSET: i32 = 5; // linux: CTF_OFFSET_EDGE
 /// smu11_thermal_policy[0] minima: amdgpu reports absolute zero as hysteresis.
+// linux: n/a (smu11_thermal_policy[0] minimum -273150, smu_v11_0.h)
 pub const CRIT_HYST_MILLI: i32 = -273_150;
 /// `FEATURE_FAN_CONTROL_BIT`; `FEATURE_PPT_BIT`.
-pub(crate) const FEATURE_FAN_CONTROL: u64 = 1 << 32;
-pub(crate) const FEATURE_PPT: u64 = 1 << 24;
+pub(crate) const FEATURE_FAN_CONTROL: u64 = 1 << 32; // linux: 1ULL << FEATURE_FAN_CONTROL_BIT
+pub(crate) const FEATURE_PPT: u64 = 1 << 24; // linux: 1ULL << FEATURE_PPT_BIT
 /// `FEATURE_ACDC_BIT` (process_pending_interrupt acknowledges AC/DC only then).
-pub(crate) const FEATURE_ACDC: u64 = 1 << 28;
+pub(crate) const FEATURE_ACDC: u64 = 1 << 28; // linux: 1ULL << FEATURE_ACDC_BIT
 /// `SMU_11_0_7_PP_PLATFORM_CAP_HARDWAREDC`: DC mode signalled by GPIO.
+// linux: n/a (SMU_11_0_7_PP_PLATFORM_CAP_HARDWAREDC = 0x4, smu_v11_0_7_pptable.h; not in checker sets)
 pub(crate) const PLATFORM_CAP_HARDWAREDC: u32 = 0x4;
 
 /// THROTTLER_*_BIT names, in bit order (bit 0 is padding in SMU11).
@@ -147,7 +176,7 @@ impl Metrics {
     /// `b` must hold at least `METRICS_BYTES`.
     pub(crate) fn decode(b: &[u8], layout: Layout) -> Self {
         let temperature = |at: usize| i32::from(u16_at(b, at)) * 1000;
-        let clock = |i: usize| u32_at(b, CURR_CLOCK + 4 * i);
+        let clock = |i: usize| u32_at(b, CURR_CLOCK + 4 * i); // linux-lit: 4=sizeof(uint32_t)
         let gfx_activity = u16_at(b, GFX_ACTIVITY);
         let (throttlers, fan, pcie) = match layout {
             Layout::V1 => (u32_at(b, V1_THROTTLER_STATUS), V1_FAN_SPEED, V1_PCIE_RATE),
@@ -195,14 +224,17 @@ impl Metrics {
 /// `convert_to_vddc` of `SMUSVI0_TEL_PLANE0.SVI0_PLANE0_VDDCOR`, in mV. Linux
 /// truncates the 9-bit field to `uint8_t` before converting; so does this.
 pub(crate) fn vddgfx_mv(tel_plane0: u32) -> u16 {
+    // linux-lit: 0x01ff_0000=SMUSVI0_TEL_PLANE0__SVI0_PLANE0_VDDCOR_MASK; 16=SMUSVI0_TEL_PLANE0__SVI0_PLANE0_VDDCOR__SHIFT
     let vid = ((tel_plane0 & 0x01ff_0000) >> 16) as u8;
-    ((6200 - u32::from(vid) * 25) / 4) as u16
+    ((6200 - u32::from(vid) * 25) / 4) as u16 // linux-lit: 4=SMU11_VOLTAGE_SCALE
 }
 
 /// `smu_v11_0_get_fan_speed_pwm`: `CG_THERMAL_STATUS.FDO_PWM_DUTY` scaled by
 /// `CG_FDO_CTRL1.FMAX_DUTY100` to 0-255. None when FMAX_DUTY100 is zero.
 pub(crate) fn fan_pwm(fdo_ctrl1: u32, thermal_status: u32) -> Option<u8> {
+    // linux-lit: 0xff=CG_FDO_CTRL1__FMAX_DUTY100_MASK
     let duty100 = fdo_ctrl1 & 0xff;
+    // linux-lit: 0x0001_fe00=CG_THERMAL_STATUS__FDO_PWM_DUTY_MASK; 9=CG_THERMAL_STATUS__FDO_PWM_DUTY__SHIFT
     let duty = (thermal_status & 0x0001_fe00) >> 9;
     (duty100 != 0).then(|| (duty * 255 / duty100).min(255) as u8)
 }
@@ -246,6 +278,7 @@ impl Limits {
             return None;
         }
         let limit = |i: usize| i32::from(u16_at(table, TEMPERATURE_LIMIT + 2 * i));
+        // linux-lit: 0=TEMP_EDGE; 1=TEMP_HOTSPOT; 2=TEMP_MEM
         let [edge, hotspot, mem] = [0, 1, 2].map(limit);
         if [edge, hotspot, mem].iter().any(|&c| c == 0 || c >= 255) {
             return None;

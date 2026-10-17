@@ -9,24 +9,29 @@ use alloc::vec::Vec;
 use narf_io::DmaBuffer;
 
 /// gmc_v10_0_mc_init default for GC 10.3.2 (`amdgpu_gart_size == -1`).
-pub const GART_SIZE: u64 = 512 << 20;
-const PAGES: u64 = GART_SIZE / 4096;
-const TABLE: u64 = PAGES * 8; // gart.table_size = num_gpu_pages * 8
+pub const GART_SIZE: u64 = 512 << 20; // linux: n/a (literal 512ULL << 20 in gmc_v10_0_mc_init)
+const PAGES: u64 = GART_SIZE / 4096; // linux: n/a (AMDGPU_GPU_PAGE_SIZE pages)
+const TABLE: u64 = PAGES * 8; // linux: n/a (gart.table_size = num_gpu_pages * 8)
 /// Shared all-invalid PDB2 for unbound user VMIDs, after the GART table.
 const EMPTY_ROOT: u64 = TABLE;
-const BOOT_PAGES: u64 = APERTURE_SIZE / 4096;
+const BOOT_PAGES: u64 = APERTURE_SIZE / 4096; // linux: n/a (NARF boot aperture)
 /// gmc_v10_0_sw_init: dma_set_mask_and_coherent(DMA_BIT_MASK(44)).
+// linux: n/a (DMA_BIT_MASK(44) literal in gmc_v10_0_sw_init)
 pub(super) const DMA_LIMIT: u64 = 1 << 44;
 /// AMDGPU_GMC_HOLE_START: Linux caps MC placement below the hole.
+// linux: n/a (AMDGPU_GMC_HOLE_START, runtime macro on max_level)
 const HOLE_START: u64 = 0x0000_8000_0000_0000;
 /// vm_manager.max_pfn for amdgpu_vm_adjust_size(adev, 256 * 1024, 9, 3, 48).
-pub(super) const MAX_PFN: u64 = 1 << 36;
+pub(super) const MAX_PFN: u64 = 1 << 36; // linux: n/a (amdgpu_vm_adjust_size 48-bit max_pfn)
 /// CONTEXT1_CNTL fields setup_vmid_config sets plus the seven interrupt
 /// enables of `vm_cntx_cntl_vm_fault`; RETRY_OTHER_FAULT is left as read.
+// linux: GCVM_CONTEXT1_CNTL__ENABLE_CONTEXT_MASK | GCVM_CONTEXT1_CNTL__PAGE_TABLE_DEPTH_MASK | GCVM_CONTEXT1_CNTL__PAGE_TABLE_BLOCK_SIZE_MASK | GCVM_CONTEXT1_CNTL__RETRY_PERMISSION_OR_INVALID_PAGE_FAULT_MASK | GCVM_CONTEXT1_CNTL__RANGE_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK | GCVM_CONTEXT1_CNTL__RANGE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT1_CNTL__DUMMY_PAGE_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK | GCVM_CONTEXT1_CNTL__DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT1_CNTL__PDE0_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK | GCVM_CONTEXT1_CNTL__PDE0_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT1_CNTL__VALID_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK | GCVM_CONTEXT1_CNTL__VALID_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT1_CNTL__READ_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK | GCVM_CONTEXT1_CNTL__READ_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT1_CNTL__WRITE_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK | GCVM_CONTEXT1_CNTL__WRITE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT1_CNTL__EXECUTE_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK | GCVM_CONTEXT1_CNTL__EXECUTE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK
 pub(super) const CTX_MASK: u32 = 0x7f_feff;
 /// ENABLE_CONTEXT, PAGE_TABLE_DEPTH=num_level(3), BLOCK_SIZE=block_size-9
 /// (0), RETRY_PERMISSION_OR_INVALID=!noretry (0), all *_ENABLE_DEFAULT.
+// linux: GCVM_CONTEXT1_CNTL__ENABLE_CONTEXT_MASK | (3 << GCVM_CONTEXT1_CNTL__PAGE_TABLE_DEPTH__SHIFT) | GCVM_CONTEXT1_CNTL__RANGE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT1_CNTL__DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT1_CNTL__PDE0_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT1_CNTL__VALID_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT1_CNTL__READ_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT1_CNTL__WRITE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT1_CNTL__EXECUTE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK
 pub(super) const CTX_VALUE: u32 = 0x55_5407;
+// linux: GCVM_CONTEXT1_CNTL__RANGE_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK | GCVM_CONTEXT1_CNTL__DUMMY_PAGE_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK | GCVM_CONTEXT1_CNTL__PDE0_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK | GCVM_CONTEXT1_CNTL__VALID_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK | GCVM_CONTEXT1_CNTL__READ_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK | GCVM_CONTEXT1_CNTL__WRITE_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK | GCVM_CONTEXT1_CNTL__EXECUTE_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK
 pub(super) const CTX_FAULT_IRQS: u32 = 0x2a_aa00;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,6 +210,7 @@ impl<I: Io> Engine<I> {
                     io,
                     map,
                     index as u64,
+                    // linux-lit: 0x61=AMDGPU_PTE_VALID | AMDGPU_PTE_READABLE | AMDGPU_PTE_WRITEABLE
                     geometry.physical(boot + offset) | 0x61,
                 );
             }
@@ -226,6 +232,7 @@ impl<I: Io> Engine<I> {
                 // base unprogrammed until a ring flush; NARF points unbound
                 // contexts at an all-invalid root so stray use only faults.
                 for step in 1..16u32 {
+                    // linux: n/a (VMIDs 1..15, setup_vmid_config i <= 14)
                     pair(io, base, r.pt_base + step * regs::CTX_ADDR_DISTANCE, root);
                     update(
                         io,

@@ -316,3 +316,48 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/atom-vm",
     atom_vm_machine_steps_delays_and_bounds_loops
 );
+
+/// amdgpu_atom_execute_table_locked: an opcode 0 / `>= ATOM_OP_CNT` breaks
+/// out of that table with success (the CALLTABLE caller continues);
+/// atom_op_switch "Bad case" returns and resumes at the offending byte. A
+/// jump outside the table ends it. All three are logged anomalies.
+fn atom_vm_bad_opcode_case_and_jump_end_or_resume_like_linux() -> TestResult {
+    static CALLER: [u8; 10] = [82, 6, 3, 0x05, 0, 7, 0, 0, 0, 91];
+    static CALLEE: [u8; 9] = [127, 3, 0x05, 0, 9, 0, 0, 0, 91];
+    let hooks = TestHooks {
+        tables: vec![(1, table(&CALLER, Some(1))), (6, table(&CALLEE, Some(1)))],
+        ..TestHooks::default()
+    };
+    let mut state = AtomState::with_hooks(4, 4, hooks);
+    if execute_table(&mut state, 1, &mut [0; 4]).is_err()
+        || state.anomalies != 1
+        || state.first_anomaly != Some(Anomaly::BadOpcode(127))
+        || state.scratch.len() != 4
+    {
+        return TestResult::Fail("bad opcode did not end only the callee");
+    }
+    // SWITCH (imm 1) whose first entry is neither CASE_MAGIC nor CASE_END:
+    // the byte there (MOVE WS[0] <- 9) runs next.
+    let code: &[u8] = &[66, 0x05, 1, 0, 0, 0, 3, 0x05, 0, 9, 0, 0, 0, 91];
+    let mut state = AtomState::new(4, 4);
+    if execute_bytes(&mut state, code, &mut [], 0).is_err()
+        || state.scratch[0] != 9
+        || state.first_anomaly != Some(Anomaly::BadCase)
+    {
+        return TestResult::Fail("bad case did not resume at the offending byte");
+    }
+    // JUMP past the table end: the table stops, nothing after it runs.
+    let code: &[u8] = &[67, 0xff, 0x00, 3, 0x05, 0, 9, 0, 0, 0, 91];
+    let mut state = AtomState::new(4, 4);
+    if execute_bytes(&mut state, code, &mut [], 0).is_err()
+        || state.scratch[0] != 0
+        || state.first_anomaly != Some(Anomaly::JumpTarget)
+    {
+        return TestResult::Fail("out-of-table jump not ended as an anomaly");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/atom-vm",
+    atom_vm_bad_opcode_case_and_jump_end_or_resume_like_linux
+);

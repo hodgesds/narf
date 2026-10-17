@@ -176,6 +176,8 @@ fn fixture() -> (Pool, Engine<Fake>, gmc::Aperture, MmioRegion) {
             gc: GC,
             nbio: NBIO,
             hdp: HDP,
+            // The RX 6750 XT: 12272 MiB, below the 12 GiB FB_LOCATION_TOP.
+            vram_size: 12272 << 20,
         },
         memory: pool.reserve(BYTES).unwrap(),
         state: State::Prepared,
@@ -474,4 +476,25 @@ fn sdma_navi22_trap_enables_interrupt_once_after_verified_start() -> TestResult 
 kernel_test_in!(
     "drivers/gpu/sdma-navi22",
     sdma_navi22_trap_enables_interrupt_once_after_verified_start
+);
+
+/// amdgpu_gmc_vram_location: the FB aperture ends at fb_start +
+/// mc_vram_size (MEMSIZE), not at the inherited FB_LOCATION_TOP. The SDMA
+/// buffer must lie inside real VRAM even when TOP claims more.
+fn sdma_navi22_fb_end_follows_memsize_not_fb_top() -> TestResult {
+    let (_pool, mut engine, aperture, target) = fixture();
+    // TOP still says 12 GiB; MEMSIZE covers less than the reserved buffer.
+    engine.layout.vram_size = 0x4000;
+    if run(engine.initialize(aperture, target)) != Err(Error::Invalid) {
+        return TestResult::Fail("buffer beyond MEMSIZE accepted by FB_LOCATION_TOP");
+    }
+    let (_pool, mut engine, aperture, target) = fixture();
+    if run(engine.initialize(aperture, target)).is_err() {
+        return TestResult::Fail("12272 MiB VRAM refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/sdma-navi22",
+    sdma_navi22_fb_end_follows_memsize_not_fb_top
 );

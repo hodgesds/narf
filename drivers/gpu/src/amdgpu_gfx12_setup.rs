@@ -172,12 +172,22 @@ fn constants(io: &mut impl Io, l: Layout, revision: u8) -> Result<(), Error> {
             update(io, l.hyp + 0x2e19 * 4, 0x70, 0x20)?;
         }
         update(io, l.gc + 0xda0 * 4, 0xfff, 0xff)?;
-        // One graphics pipe; only VMID0 exists in the bootstrap. User shader
-        // apertures/traps are configured together with future user VMIDs.
+        // One graphics pipe.
         update(io, l.gc + 0x13bb * 4, 3, 1)?;
         indexed(io, l, |io| {
+            // gfx_v12_0_constants_init: every graphics VMID (0 up to
+            // first_kfd_vmid, 8) gets DEFAULT_SH_MEM_CONFIG (64-bit
+            // addressing, unaligned access, instruction prefetch 3); client
+            // VMIDs also get gmc_v12_0's private (0x1000 << 48) and shared
+            // (0x2000 << 48) apertures in SH_MEM_BASES.
+            for vmid in 0..8 {
+                write(io, l.hyp + 0x900 * 4, vmid << 4)?;
+                write(io, l.hyp + 0x9e4 * 4, 0xc00c)?;
+                if vmid != 0 {
+                    write(io, l.hyp + 0x9e3 * 4, 0x2000 << 16 | 0x1000)?;
+                }
+            }
             write(io, l.hyp + 0x900 * 4, 0)?;
-            write(io, l.hyp + 0x9e4 * 4, 0xc00c)?;
             // No IRQ source is installed; disable inherited GUI-idle interrupts.
             update(io, l.gc + 0x1e0a * 4, 0x003c0000, 0)?;
             // gfx_v12_0_gpu_early_init fixes GC12's context count at eight.

@@ -36,11 +36,11 @@ use crate::{
 
 /// DPCD link-rate codes (`enum dc_link_rate`).
 /// DPCD `DP_FEC_CONFIGURATION`.
-const FEC_CONFIGURATION: u32 = 0x120;
-pub const RBR: u8 = 0x06;
-pub const HBR: u8 = 0x0a;
-pub const HBR2: u8 = 0x14;
-pub const HBR3: u8 = 0x1e;
+const FEC_CONFIGURATION: u32 = 0x120; // linux: DP_FEC_CONFIGURATION
+pub const RBR: u8 = 0x06; // linux: LINK_RATE_LOW
+pub const HBR: u8 = 0x0a; // linux: LINK_RATE_HIGH
+pub const HBR2: u8 = 0x14; // linux: LINK_RATE_HIGH2
+pub const HBR3: u8 = 0x1e; // linux: LINK_RATE_HIGH3
 /// `dcn10_link_encoder_get_max_link_cap` for DCN3.0's DIO (`link_enc_feature`
 /// is HBR3 capable): HBR3 on four lanes.
 pub const ENCODER_MAX: DpLink = DpLink {
@@ -53,63 +53,63 @@ pub const FAIL_SAFE: DpLink = DpLink {
     lanes: 1,
 };
 
-const DPCD_REV: u32 = 0x000;
-const TRAINING_AUX_RD_INTERVAL: u32 = 0x00e;
-const LINK_BW_SET: u32 = 0x100;
-const LANE_COUNT_SET: u32 = 0x101;
-const TRAINING_PATTERN_SET: u32 = 0x102;
-const DOWNSPREAD_CTRL: u32 = 0x107;
-const MAIN_LINK_CHANNEL_CODING_SET: u32 = 0x108;
-const SINK_COUNT: u32 = 0x200;
-const DEVICE_SERVICE_IRQ_VECTOR: u32 = 0x201;
-const LANE0_1_STATUS: u32 = 0x202;
-const SET_POWER: u32 = 0x600;
-const SINK_COUNT_ESI: u32 = 0x2002;
-const DP13_DPCD_REV: u32 = 0x2200;
-const DPRX_FEATURE_ENUMERATION_LIST: u32 = 0x2210;
-const LTTPR_CAPS: u32 = 0xf0000;
-const PHY_REPEATER_MODE: u32 = 0xf0003;
-const PHY_REPEATER_EXTENDED_WAIT_TIMEOUT: u32 = 0xf0005;
-const TOTAL_LTTPR_CNT: u32 = 0xf000a;
-const TRAINING_PATTERN_SET_PHY_REPEATER1: u32 = 0xf0010;
-const TRAINING_AUX_RD_INTERVAL_PHY_REPEATER1: u32 = 0xf0020;
-const LANE0_1_STATUS_PHY_REPEATER1: u32 = 0xf0030;
+const DPCD_REV: u32 = 0x000; // linux: DP_DPCD_REV
+const TRAINING_AUX_RD_INTERVAL: u32 = 0x00e; // linux: DP_TRAINING_AUX_RD_INTERVAL
+const LINK_BW_SET: u32 = 0x100; // linux: DP_LINK_BW_SET
+const LANE_COUNT_SET: u32 = 0x101; // linux: DP_LANE_COUNT_SET
+const TRAINING_PATTERN_SET: u32 = 0x102; // linux: DP_TRAINING_PATTERN_SET
+const DOWNSPREAD_CTRL: u32 = 0x107; // linux: DP_DOWNSPREAD_CTRL
+const MAIN_LINK_CHANNEL_CODING_SET: u32 = 0x108; // linux: DP_MAIN_LINK_CHANNEL_CODING_SET
+const SINK_COUNT: u32 = 0x200; // linux: DP_SINK_COUNT
+const DEVICE_SERVICE_IRQ_VECTOR: u32 = 0x201; // linux: DP_DEVICE_SERVICE_IRQ_VECTOR
+const LANE0_1_STATUS: u32 = 0x202; // linux: DP_LANE0_1_STATUS
+const SET_POWER: u32 = 0x600; // linux: DP_SET_POWER
+const SINK_COUNT_ESI: u32 = 0x2002; // linux: DP_SINK_COUNT_ESI
+const DP13_DPCD_REV: u32 = 0x2200; // linux: DP_DP13_DPCD_REV
+const DPRX_FEATURE_ENUMERATION_LIST: u32 = 0x2210; // linux: DP_DPRX_FEATURE_ENUMERATION_LIST
+const LTTPR_CAPS: u32 = 0xf0000; // linux: DP_LT_TUNABLE_PHY_REPEATER_FIELD_DATA_STRUCTURE_REV
+const PHY_REPEATER_MODE: u32 = 0xf0003; // linux: DP_PHY_REPEATER_MODE
+const PHY_REPEATER_EXTENDED_WAIT_TIMEOUT: u32 = 0xf0005; // linux: DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT
+const TOTAL_LTTPR_CNT: u32 = 0xf000a; // linux: DP_TOTAL_LTTPR_CNT
+const TRAINING_PATTERN_SET_PHY_REPEATER1: u32 = 0xf0010; // linux: DP_TRAINING_PATTERN_SET_PHY_REPEATER1
+const TRAINING_AUX_RD_INTERVAL_PHY_REPEATER1: u32 = 0xf0020; // linux: DP_TRAINING_AUX_RD_INTERVAL_PHY_REPEATER1
+const LANE0_1_STATUS_PHY_REPEATER1: u32 = 0xf0030; // linux: DP_LANE0_1_STATUS_PHY_REPEATER1
 /// `DP_REPEATER_CONFIGURATION_AND_STATUS_SIZE`.
-const REPEATER_SIZE: u32 = 0x50;
-const MODE_TRANSPARENT: u8 = 0x55;
-const MODE_NON_TRANSPARENT: u8 = 0xaa;
-const POWER_D0: u8 = 1;
-const POWER_D3: u8 = 2;
+const REPEATER_SIZE: u32 = 0x50; // linux: DP_REPEATER_CONFIGURATION_AND_STATUS_SIZE
+const MODE_TRANSPARENT: u8 = 0x55; // linux: DP_PHY_REPEATER_MODE_TRANSPARENT
+const MODE_NON_TRANSPARENT: u8 = 0xaa; // linux: DP_PHY_REPEATER_MODE_NON_TRANSPARENT
+const POWER_D0: u8 = 1; // linux: DP_SET_POWER_D0
+const POWER_D3: u8 = 2; // linux: DP_SET_POWER_D3
 /// `LINK_SPREAD_05_DOWNSPREAD_30KHZ`: DCN3.0 links never set `dp_ss_off`.
-const DOWNSPREAD_05: u8 = 0x10;
+const DOWNSPREAD_05: u8 = 0x10; // linux: LINK_SPREAD_05_DOWNSPREAD_30KHZ
 /// `LANE_COUNT_SET` bits.
-const ENHANCED_FRAMING: u8 = 0x80;
-const POST_LT_ADJ_REQ_GRANTED: u8 = 0x20;
+const ENHANCED_FRAMING: u8 = 0x80; // linux: DP_LANE_COUNT_ENHANCED_FRAME_EN
+const POST_LT_ADJ_REQ_GRANTED: u8 = 0x20; // linux: DP_POST_LT_ADJ_REQ_GRANTED
 /// `LANE_ALIGN_STATUS_UPDATED` bits.
-const INTERLANE_ALIGN_DONE: u8 = 0x01;
-const POST_LT_ADJ_REQ_IN_PROGRESS: u8 = 0x02;
+const INTERLANE_ALIGN_DONE: u8 = 0x01; // linux: DP_INTERLANE_ALIGN_DONE
+const POST_LT_ADJ_REQ_IN_PROGRESS: u8 = 0x02; // linux: DP_POST_LT_ADJ_REQ_IN_PROGRESS
 /// `DEVICE_SERVICE_IRQ_VECTOR` bits.
-const AUTOMATED_TEST: u8 = 0x02;
+const AUTOMATED_TEST: u8 = 0x02; // linux: DP_AUTOMATED_TEST_REQUEST
 
 /// `LINK_AUX_DEFAULT_LTTPR_TIMEOUT_PERIOD` / `LINK_AUX_DEFAULT_TIMEOUT_PERIOD`.
-pub const AUX_TIMEOUT_LTTPR_US: u32 = 3200;
-pub const AUX_TIMEOUT_DEFAULT_US: u32 = 552;
+pub const AUX_TIMEOUT_LTTPR_US: u32 = 3200; // linux: LINK_AUX_DEFAULT_LTTPR_TIMEOUT_PERIOD
+pub const AUX_TIMEOUT_DEFAULT_US: u32 = 552; // linux: LINK_AUX_DEFAULT_TIMEOUT_PERIOD
 /// `retrieve_link_cap`'s `read_dpcd_retry_cnt` and `post_oui_delay`.
-const READ_RETRIES: u32 = 20;
-const POST_OUI_DELAY_US: u64 = 30_000;
+const READ_RETRIES: u32 = 20; // linux: n/a (read_dpcd_retry_cnt = 20, literal in link_dp_capability.c:retrieve_link_cap)
+const POST_OUI_DELAY_US: u64 = 30_000; // linux: n/a (post_oui_delay = 30 ms, literal in link_dp_capability.c:retrieve_link_cap)
 /// `wake_up_aux_channel`'s retries, 1 ms apart.
-const WAKE_RETRIES: u32 = 10;
+const WAKE_RETRIES: u32 = 10; // linux: n/a (aux_channel_retry_cnt < 10, literal in link_dp_capability.c:wake_up_aux_channel)
 /// `LINK_TRAINING_MAX_RETRY_COUNT` / `LINK_TRAINING_MAX_CR_RETRY`.
-const MAX_RETRY_COUNT: u32 = 5;
-const MAX_CR_RETRY: u32 = 100;
+const MAX_RETRY_COUNT: u32 = 5; // linux: LINK_TRAINING_MAX_RETRY_COUNT
+const MAX_CR_RETRY: u32 = 100; // linux: LINK_TRAINING_MAX_CR_RETRY
 /// `POST_LT_ADJ_REQ_LIMIT` / `POST_LT_ADJ_REQ_TIMEOUT` (1 ms polls).
-const POST_LT_ADJ_REQ_LIMIT: u32 = 6;
-const POST_LT_ADJ_REQ_TIMEOUT: u32 = 200;
+const POST_LT_ADJ_REQ_LIMIT: u32 = 6; // linux: POST_LT_ADJ_REQ_LIMIT
+const POST_LT_ADJ_REQ_TIMEOUT: u32 = 200; // linux: POST_LT_ADJ_REQ_TIMEOUT
 /// `LINK_TRAINING_ATTEMPTS` (link_dpms.c) and `LINK_TRAINING_RETRY_DELAY`.
-pub const LINK_TRAINING_ATTEMPTS: u32 = 4;
-const RETRY_DELAY_MS: u64 = 50;
+pub const LINK_TRAINING_ATTEMPTS: u32 = 4; // linux: LINK_TRAINING_ATTEMPTS
+const RETRY_DELAY_MS: u64 = 50; // linux: LINK_TRAINING_RETRY_DELAY
 /// `LINK_TRAINING_MAX_VERIFY_RETRY` (link_detection.c).
-pub const MAX_VERIFY_RETRY: u32 = 2;
+pub const MAX_VERIFY_RETRY: u32 = 2; // linux: LINK_TRAINING_MAX_VERIFY_RETRY
 
 /// The board's VBIOS LTTPR policy (`atom_display_controller_info_v4_*`
 /// `display_caps`, read by `dcn30_resource_construct`).
@@ -231,7 +231,9 @@ impl Caps {
     /// DPCD 1.4 repeater block) the chain's. None for caps no link fits.
     pub fn max_link(&self) -> Option<DpLink> {
         let mut rate = self.reported_rate()?.min(ENCODER_MAX.rate);
+        // linux-lit: 0x1f=DP_MAX_LANE_COUNT_MASK
         let mut lanes = (self.dpcd[2] & 0x1f).min(ENCODER_MAX.lanes);
+        // linux-lit: 0x14=DP_DPCD_REV_14
         if let Some(r) = self.lttpr.filter(|r| r.revision >= 0x14) {
             lanes = lanes.min(r.max_lanes);
             if matches!(r.max_rate, RBR | HBR | HBR2 | HBR3) {
@@ -243,8 +245,10 @@ impl Caps {
     /// `decide_eq_training_pattern`: the DCN3.0 DIO is TPS3 and TPS4 capable,
     /// so the sink's support alone chooses, whatever the link rate.
     pub fn eq_pattern(&self) -> Tps {
+        // linux-lit: 0x80=DP_TPS4_SUPPORTED
         if self.dpcd[3] & 0x80 != 0 {
             Tps::Tps4
+        // linux-lit: 0x40=DP_TPS3_SUPPORTED
         } else if self.dpcd[2] & 0x40 != 0 {
             Tps::Tps3
         } else {
@@ -253,6 +257,7 @@ impl Caps {
     }
     /// `MAX_LANE_COUNT.POST_LT_ADJ_REQ_SUPPORTED`.
     fn post_lt_adj_supported(&self) -> bool {
+        // linux-lit: 0x20=DP_POST_LT_ADJ_REQ_SUPPORTED
         self.dpcd[2] & 0x20 != 0
     }
 }
@@ -270,9 +275,13 @@ impl Tps {
     /// `dp_initialize_scrambling_data_symbols`: scrambling off for TPS1..3.
     fn set_byte(self) -> u8 {
         match self {
+            // linux-lit: 0x21=DP_TRAINING_PATTERN_1 | DP_LINK_SCRAMBLING_DISABLE
             Tps::Tps1 => 0x21,
+            // linux-lit: 0x22=DP_TRAINING_PATTERN_2 | DP_LINK_SCRAMBLING_DISABLE
             Tps::Tps2 => 0x22,
+            // linux-lit: 0x23=DP_TRAINING_PATTERN_3 | DP_LINK_SCRAMBLING_DISABLE
             Tps::Tps3 => 0x23,
+            // linux-lit: 0x07=DP_TRAINING_PATTERN_4
             Tps::Tps4 => 0x07,
         }
     }
@@ -393,6 +402,7 @@ pub async fn retrieve_caps<A: Aux + Send>(aux: &mut A, vbios: VbiosLttpr) -> Res
     if lttpr.is_none() {
         aux.set_timeout_us(AUX_TIMEOUT_DEFAULT_US).await?;
     }
+    // linux-lit: 0x80=DP_EXTENDED_RECEIVER_CAP_FIELD_PRESENT
     let ext_caps = dpcd[TRAINING_AUX_RD_INTERVAL as usize] & 0x80 != 0;
     let mut dprx_feature = 0;
     if ext_caps {
@@ -416,6 +426,7 @@ pub async fn retrieve_caps<A: Aux + Send>(aux: &mut A, vbios: VbiosLttpr) -> Res
         }
     }
     // "It is impossible for Sink to report Max Lane Count = 0."
+    // linux-lit: 0x1f=DP_MAX_LANE_COUNT_MASK
     if dpcd[2] & 0x1f == 0 {
         return Err(Error::NoSink);
     }
@@ -449,8 +460,11 @@ impl Training {
     /// `dp_hw_to_dpcd_lane_settings`: TRAINING_LANEx_SET.
     fn lane_set(&self) -> u8 {
         self.swing
+            // linux-lit: 3=DP_TRAIN_PRE_EMPHASIS_SHIFT
             | self.pre << 3
+            // linux-lit: 0x04=DP_TRAIN_MAX_SWING_REACHED
             | if self.swing == 3 { 0x04 } else { 0 }
+            // linux-lit: 0x20=DP_TRAIN_MAX_PRE_EMPHASIS_REACHED
             | if self.pre == 3 { 0x20 } else { 0 }
     }
     fn repeater(&self, hop: u8) -> bool {
@@ -463,6 +477,7 @@ impl Training {
 
 /// `dp_translate_training_aux_read_interval` (the EQ reading).
 fn eq_interval_us(interval: u8) -> u64 {
+    // linux-lit: 0x7f=DP_TRAINING_AUX_RD_MASK
     match interval & 0x7f {
         1 => 4000,
         2 => 8000,
@@ -480,6 +495,7 @@ fn eq_interval_us(interval: u8) -> u64 {
 /// an LTTPR's mandatory 0x4 before that).
 async fn decide_training<A: Aux + Send>(aux: &mut A, caps: &Caps, link: DpLink) -> Training {
     let mut raw = 0u8;
+    // linux-lit: 0x12=DP_DPCD_REV_12
     if caps.rev() >= 0x12 {
         let mut data = [0u8];
         if aux.read(TRAINING_AUX_RD_INTERVAL, &mut data).await.is_ok() {

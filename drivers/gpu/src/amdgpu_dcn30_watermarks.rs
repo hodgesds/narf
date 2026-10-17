@@ -18,27 +18,34 @@ use crate::amdgpu_dcn_clk::Error;
 use core::future::Future;
 
 /// smu11_driver_if_sienna_cichlid.h `TABLE_WATERMARKS`.
+// linux: TABLE_WATERMARKS@dc
 pub const TABLE_WATERMARKS: u32 = 1;
 /// dalsmc.h.
+// linux: DALSMC_MSG_SetDalDramAddrHigh
 pub(crate) const SET_DAL_DRAM_ADDR_HIGH: u32 = 0x5;
+// linux: DALSMC_MSG_SetDalDramAddrLow
 pub(crate) const SET_DAL_DRAM_ADDR_LOW: u32 = 0x6;
+// linux: DALSMC_MSG_TransferTableDram2Smu
 pub(crate) const TRANSFER_TABLE_DRAM2SMU: u32 = 0x8;
 /// `NUM_WM_RANGES` and `WM_COUNT` (WM_SOCCLK, WM_DCEFCLK).
+// linux: NUM_WM_RANGES@dc
 const RANGES: usize = 4;
+// linux: WM_DCEFCLK@dc
 const WM_DCEFCLK: usize = 1;
 /// `WatermarkRowGeneric_t`: four u16 clocks, WmSetting, Flags, Padding[2].
+// linux: sizeof(WatermarkRowGeneric_t)
 const ROW_BYTES: usize = 12;
 /// `sizeof(WatermarksExternal_t)`: `Watermarks_t` (2 x 4 rows) plus
 /// `MmHubPadding[8]`.
-pub const BYTES: usize = 2 * RANGES * ROW_BYTES + 8 * 4;
+pub const BYTES: usize = 2 * RANGES * ROW_BYTES + 8 * 4; // linux: sizeof(WatermarksExternal_t)
 
 /// `WATERMARKS_FLAGS_e`, written to the row's Flags (`pmfw_breakdown.wm_type`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Kind {
-    ClockRange = 0,
-    DummyPstate = 1,
-    Mall = 2,
+    ClockRange = 0,  // linux: WATERMARKS_CLOCK_RANGE@dc
+    DummyPstate = 1, // linux: WATERMARKS_DUMMY_PSTATE@dc
+    Mall = 2,        // linux: WATERMARKS_MALL@dc
 }
 /// One `wm_table.nv_entries[i]` PMFW breakdown (MHz).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,9 +63,9 @@ pub fn navi22_ranges(min_uclk_mhz: u16) -> [Option<Range>; RANGES] {
     let range = |kind| {
         Some(Range {
             min_dcfclk: 0,
-            max_dcfclk: 0xffff,
+            max_dcfclk: 0xffff, // linux: n/a (literal 0xFFFF in dcn30_fpu.c:dcn3_fpu_build_wm_range_table)
             min_uclk: min_uclk_mhz,
-            max_uclk: 0xffff,
+            max_uclk: 0xffff, // linux: n/a (literal 0xFFFF in dcn30_fpu.c:dcn3_fpu_build_wm_range_table)
             kind,
         })
     };
@@ -82,8 +89,8 @@ pub fn encode(ranges: &[Option<Range>; RANGES]) -> [u8; BYTES] {
         {
             row[at * 2..at * 2 + 2].copy_from_slice(&value.to_le_bytes());
         }
-        row[8] = i as u8;
-        row[9] = r.kind as u8;
+        row[8] = i as u8; // linux-lit: 8=offsetof(WatermarkRowGeneric_t, WmSetting)
+        row[9] = r.kind as u8; // linux-lit: 9=offsetof(WatermarkRowGeneric_t, Flags)
     }
     table
 }
@@ -121,10 +128,13 @@ pub(crate) unsafe fn stage(
     nbio: u64,
     table: &[u8; BYTES],
 ) -> Result<(), Error> {
+    // linux: n/a (BAR5 bound: MMIO_REG_HOLE_OFFSET + 4)
     if memory.size() < BYTES as u64 || regs.len < 0x7f004 {
         return Err(Error::Invalid);
     }
     // SAFETY: nbio bounded through REMAP_HDP_MEM_FLUSH_CNTL by the caller.
+    // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
+    // linux: n/a (0x7f000 = MMIO_REG_HOLE_OFFSET, nbio_v2_3.c, 4 KiB pages)
     if unsafe { regs.read32(nbio + 0x12d * 4) } != 0x7f000 {
         return Err(Error::Invalid);
     }
@@ -137,8 +147,9 @@ pub(crate) unsafe fn stage(
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     // SAFETY: verified remap; the MEMSIZE read drains the posted flush.
     unsafe {
+        // linux: n/a (MMIO_REG_HOLE_OFFSET + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL, amdgpu_hdp_generic_flush)
         regs.write32(0x7f000, 0);
-        regs.read32(nbio + 0xc3 * 4);
+        regs.read32(nbio + 0xc3 * 4); // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
     }
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     Ok(())

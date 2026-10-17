@@ -8,34 +8,39 @@ use core::future::Future;
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
+// linux: n/a (mmDAL_MSG_REG 0x1628A, local in dcn30_clk_mgr_smu_msg.c, minus MP1 seg0 0x16000)
 const MESSAGE: u32 = 0x28a;
+// linux: n/a (mmDAL_ARG_REG 0x16273, local in dcn30_clk_mgr_smu_msg.c, minus MP1 seg0 0x16000)
 const ARGUMENT: u32 = 0x273;
+// linux: n/a (mmDAL_RESP_REG 0x16274, local in dcn30_clk_mgr_smu_msg.c, minus MP1 seg0 0x16000)
 const RESPONSE: u32 = 0x274;
 // CLK_REG_LIST_DCN3 selects CLK02, not CLK00 or Navi10's CLK3 bank.
+// linux: n/a (mmCLK02_CLK0_CLK_PLL_REQ 0x17010, absolute, local in dcn30_clk_mgr.h)
 const PLL: u32 = 0x17010;
-const GET_VERSION: u32 = 2;
-const GET_INTERFACE: u32 = 3;
-const GET_HEADER: u32 = 4;
-const HARD_MIN: u32 = 9;
-const DPM_BY_INDEX: u32 = 0xb;
-const DEEP_SLEEP_MIN: u32 = 0xd;
-const DISPLAYS: u32 = 0xe;
-const DF_CSTATE_ALLOW: u32 = 0x10;
+const GET_VERSION: u32 = 2; // linux: DALSMC_MSG_GetSmuVersion
+const GET_INTERFACE: u32 = 3; // linux: DALSMC_MSG_GetDriverIfVersion
+const GET_HEADER: u32 = 4; // linux: DALSMC_MSG_GetMsgHeaderVersion
+const HARD_MIN: u32 = 9; // linux: DALSMC_MSG_SetHardMinByFreq
+const DPM_BY_INDEX: u32 = 0xb; // linux: DALSMC_MSG_GetDpmFreqByIndex
+const DEEP_SLEEP_MIN: u32 = 0xd; // linux: DALSMC_MSG_SetMinDeepSleepDcefclk
+const DISPLAYS: u32 = 0xe; // linux: DALSMC_MSG_NumOfDisplays
+const DF_CSTATE_ALLOW: u32 = 0x10; // linux: DALSMC_MSG_SetExternalClientDfCstateAllow
 /// `DALSMC_MSG_BacoAudioD3PME`.
-const BACO_AUDIO_D3_PME: u32 = 0x11;
+const BACO_AUDIO_D3_PME: u32 = 0x11; // linux: DALSMC_MSG_BacoAudioD3PME
+                                     // linux: n/a (NARF table bound; Linux clk_table holds MAX_NUM_DPM_LVL = 8)
 const LEVELS: usize = 16;
 
 /// PPCLK ids in the DAL interface (MHz). PIXCLK supplies the global DPP clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Clock {
-    Soc = 1,
-    Memory = 2,
-    Fabric = 3,
-    Dcf = 8,
-    Display = 9,
-    Pixel = 10,
-    Phy = 11,
+    Soc = 1,     // linux: PPCLK_SOCCLK@dc
+    Memory = 2,  // linux: PPCLK_UCLK@dc
+    Fabric = 3,  // linux: PPCLK_FCLK@dc
+    Dcf = 8,     // linux: PPCLK_DCEFCLK@dc
+    Display = 9, // linux: PPCLK_DISPCLK@dc
+    Pixel = 10,  // linux: PPCLK_PIXCLK@dc
+    Phy = 11,    // linux: PPCLK_PHYCLK@dc
 }
 const CLOCKS: [Clock; 7] = [
     Clock::Soc,
@@ -82,7 +87,7 @@ impl Levels {
             return Err(Error::Invalid);
         }
         let max = self.range(clock).max_khz();
-        (8..=127)
+        (8..=127) // linux-lit: 8=DENTIST_BASE_DID_1; 127=DENTIST_MAX_DID
             .map(|did| frequency(self.vco_khz, did))
             .find(|&khz| khz <= max)
             .filter(|&khz| khz >= self.range(clock).min_khz())
@@ -109,7 +114,7 @@ impl Levels {
         }
         let range = self.range(clock);
         let requested = khz.max(range.min_khz());
-        (8..=127)
+        (8..=127) // linux-lit: 8=DENTIST_BASE_DID_1; 127=DENTIST_MAX_DID
             .rev()
             .map(|did| (did, frequency(self.vco_khz, did)))
             .find(|&(_, value)| value >= requested && value <= range.max_khz())
@@ -129,15 +134,22 @@ pub struct Plan {
 }
 fn divider(did: u8) -> u32 {
     match did {
-        8..=63 => u32::from(did),
+        8..=63 => u32::from(did), // linux-lit: 8=DENTIST_BASE_DID_1; 63=DENTIST_BASE_DID_2 - 1
+        // linux-lit: 64=DENTIST_BASE_DID_2; 95=DENTIST_BASE_DID_3 - 1
+        // linux-lit: 2=DENTIST_DIVIDER_RANGE_2_STEP
         64..=95 => 64 + 2 * u32::from(did - 64),
+        // linux-lit: 96=DENTIST_BASE_DID_3; 125=DENTIST_BASE_DID_4 - 1
+        // linux-lit: 128=DENTIST_DIVIDER_RANGE_3_START; 4=DENTIST_DIVIDER_RANGE_3_STEP
         96..=125 => 128 + 4 * u32::from(did - 96),
-        126 => 248,
+        126 => 248, // linux-lit: 126=DENTIST_BASE_DID_4; 248=DENTIST_DIVIDER_RANGE_4_START
+        // linux-lit: 127=DENTIST_MAX_DID
+        // linux-lit: 512=DENTIST_DIVIDER_RANGE_4_START + DENTIST_DIVIDER_RANGE_4_STEP
         127 => 512,
         _ => 0,
     }
 }
 fn frequency(vco: u32, did: u8) -> u32 {
+    // linux-lit: 4=DENTIST_DIVIDER_RANGE_SCALE_FACTOR
     (u64::from(vco) * 4 / u64::from(divider(did))) as u32
 }
 fn vco(pll: u32) -> Result<u32, Error> {
@@ -145,8 +157,10 @@ fn vco(pll: u32) -> Result<u32, Error> {
         return Err(Error::DeviceGone);
     }
     // FbMult is an integer in bits 8:0 plus a /65536 fraction in bits 31:16.
+    // linux: n/a (FbMult_int/FbMult_frac masks in dcn30_clk_mgr.h, dfs_ref_freq_khz 100000)
     let khz = (u64::from(pll & 0x1ff) * 100_000 + u64::from(pll >> 16) * 100_000 / 65536) as u32;
     if !(600_000..=6_000_000).contains(&khz) {
+        // linux: n/a (NARF VCO sanity range)
         return Err(Error::Invalid);
     }
     Ok(khz)
@@ -186,9 +200,20 @@ impl Io for Mmio {
     }
     fn idle(&mut self) -> Result<(), Error> {
         for i in 0..6 {
+            // linux: n/a (six OTG/DIG instances)
             for (reg, mask) in [
+                // linux-lit: 0x1b41=mmOTG0_OTG_CONTROL
+                // linux-lit: 0x80=mmOTG1_OTG_CONTROL - mmOTG0_OTG_CONTROL
+                // linux-lit: 1=OTG0_OTG_CONTROL__OTG_MASTER_EN_MASK
                 (0x1b41 + i * 0x80, 1),
+                // linux-lit: 0x1b86=mmOTG0_OTG_CLOCK_CONTROL
+                // linux-lit: 0x80=mmOTG1_OTG_CONTROL - mmOTG0_OTG_CONTROL
+                // linux-lit: 16=OTG0_OTG_CLOCK_CONTROL__OTG_BUSY__SHIFT
                 (0x1b86 + i * 0x80, 1 << 16),
+                // linux-lit: 0x210c=mmDP0_DP_VID_STREAM_CNTL
+                // linux-lit: 0x100=mmDP1_DP_VID_STREAM_CNTL - mmDP0_DP_VID_STREAM_CNTL
+                // linux-lit: 1=DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_ENABLE_MASK
+                // linux-lit: 16=DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_STATUS__SHIFT
                 (0x210c + i * 0x100, 1 | 1 << 16),
             ] {
                 // SAFETY: all six OTGs and DIGs are bounded in the constructor.
@@ -235,6 +260,7 @@ impl<I: Io> Engine<I> {
             .map_err(|_| Error::Revoked)
     }
     async fn settled(&mut self) -> Result<u32, Error> {
+        // linux: n/a (dcn30_smu_wait_for_response: 10 us x 200000)
         let deadline = narf_time::Deadline::after_ms(2000);
         loop {
             let value = self.access(|io| io.read(RESPONSE))?;
@@ -247,6 +273,7 @@ impl<I: Io> Engine<I> {
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
+            // linux: n/a (10 us poll, dcn30_smu_send_msg_with_param)
             narf_time::SleepUntil::new(narf_time::Deadline::after_us(10).as_instant()).await;
         }
     }
@@ -258,6 +285,7 @@ impl<I: Io> Engine<I> {
             io.write(MESSAGE, msg);
         })?;
         let response = self.settled().await?;
+        // linux-lit: 1=DALSMC_Result_OK
         if response != 1 {
             return Err(Error::Rejected(response));
         }
@@ -291,37 +319,54 @@ impl<I: Io> Engine<I> {
         }
         result
     }
+    /// A DAL query whose rejection Linux ignores (dcn30_smu_send_msg_with_param
+    /// leaves the response 0): a rejected message reads as 0, while timeouts,
+    /// device loss and revocation still fail.
+    async fn query_lenient(&mut self, msg: u32, arg: u32) -> Result<u32, Error> {
+        match self.command(msg, arg).await {
+            Err(Error::Rejected(_)) => Ok(0),
+            other => other,
+        }
+    }
+    /// `dcn3_init_clocks`: only the SMU version query decides `smu_present`;
+    /// the driver-interface and message-header checks are logged ("do we
+    /// fail if these fail? ... do we not care to check?"), and
+    /// `dcn3_init_single_clock` records whatever levels PMFW reports (a
+    /// failed query is 0 levels). Unusable ranges are refused later, by the
+    /// clock plan, rather than here.
     async fn start_inner(&mut self) -> Result<Levels, Error> {
         let vco_khz = vco(self.access(|io| io.read(PLL))?)?;
         let firmware = self.command(GET_VERSION, 0).await?;
         // Driver-table versions differ between Navy and Sienna. We record
         // this diagnostic but use only the version-1 scalar DAL protocol.
-        let interface = self.command(GET_INTERFACE, 0).await?;
-        if firmware == 0 || interface == 0 || self.command(GET_HEADER, 0).await? != 1 {
-            return Err(Error::Unsupported);
+        let interface = self.query_lenient(GET_INTERFACE, 0).await?;
+        let header = self.query_lenient(GET_HEADER, 0).await?;
+        if header != 1 {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 DAL msg header version {header} (driver 1), if {interface:#x}"
+            );
         }
         let mut ranges = [Range::default(); 7];
         for (range, clock) in ranges.iter_mut().zip(CLOCKS) {
             let features = self
-                .command(DPM_BY_INDEX, (clock as u32) << 16 | 0xff)
+                .query_lenient(DPM_BY_INDEX, (clock as u32) << 16 | 0xff)
                 .await?;
+            // linux: n/a (1 << 31 fine-grained flag, literal in dcn30_clk_mgr.c:dcn3_init_single_clock)
             range.fine_grained = features & 1 << 31 != 0;
+            // clk_table holds at most LEVELS entries; never index past it.
             range.count = if range.fine_grained {
-                2
+                2 // linux: n/a (num_levels = 2, literal in dcn30_clk_mgr.c:dcn3_init_single_clock)
             } else {
-                features as u8
+                (features as u8).min(LEVELS as u8)
             };
-            if range.count == 0 || usize::from(range.count) > LEVELS {
-                return Err(Error::Invalid);
-            }
             for index in 0..usize::from(range.count) {
                 let value = self
-                    .command(DPM_BY_INDEX, (clock as u32) << 16 | index as u32)
+                    .query_lenient(DPM_BY_INDEX, (clock as u32) << 16 | index as u32)
                     .await?
+                    // linux: n/a (& 0xFFFF, literal in dcn30_clk_mgr.c:dcn3_init_single_clock)
                     & 0xffff;
-                if value == 0 || (index != 0 && value < u32::from(range.mhz[index - 1])) {
-                    return Err(Error::Invalid);
-                }
                 range.mhz[index] = value as u16;
             }
         }
@@ -408,6 +453,7 @@ impl ClockManager {
         if gpu.regs.len < u64::from(PLL + 1) * 4 {
             return Err(Error::Invalid);
         }
+        // linux-lit: 0x260c=mmDP5_DP_VID_STREAM_CNTL
         let dcn = Profile::Navi22.bank(gpu, 2, 0x260c)?;
         // SAFETY: DCCG is retained here; no second divider owner is exposed.
         let dccg = unsafe { Dccg::new(gpu, authority)? };

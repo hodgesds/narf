@@ -1,7 +1,8 @@
 //! Navi48 SDMA0 cold-start and translated VRAM write/copy/fence proof.
 //! Register/packet sources: Linux sdma_v7_0.c, gc_12_0_0_{offset,sh_mask}.h,
-//! sdma_v6_0_0_pkt_open.h. Retained kernel fence/TRAP interrupt proof; no host
-//! DMA, user submissions or recovery.
+//! sdma_v6_0_0_pkt_open.h. Retained kernel fence/TRAP interrupt proof, then
+//! client jobs (`Sdma::submit`): a VM flush, PASID mapping, IBs and a fence
+//! per 256-dword slot. No host DMA or recovery.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip, amdgpu_gmc_navi48 as gmc,
@@ -24,6 +25,16 @@ const MCU_CNTL: u32 = 0x588e; // GC bank one, unlike ring registers
 const RB_CNTL: u32 = 0x80;
 const RB_RPTR: u32 = 0x83;
 const RB_WPTR: u32 = 0x85;
+/// Client jobs' fence (in the ring allocation, past the pointers).
+const JOB_FENCE: u64 = 4160;
+/// The ring: 4 KiB at the allocation's start (RB_SIZE 10).
+const RING_DWORDS: u64 = 1024;
+/// One client job's ring slot.
+const JOB_DWORDS: u64 = 256;
+/// SDMA0's invalidation engine on the GFX hub: amdgpu_gmc_allocate_vm_inv_eng
+/// hands engines out in ring order, the graphics ring 0, the eight compute
+/// rings 1-4 and 7-10 (MES keeps 5 and 6), then SDMA0 11.
+const INV_ENGINE: u32 = 11;
 const PATTERN: [u32; 16] = [
     0x01234567, 0x89abcdef, 0x76543210, 0xfedcba98, 0xaaaaaaaa, 0x55555555, 0xff00ff00, 0x00ff00ff,
     0x00000001, 0x80000000, 0x01010101, 0x10101010, 0x67506750, 0x00220022, 0xdeadbeef, 0xcafebabe,
@@ -69,6 +80,8 @@ struct Layout {
     gc: u64,
     nbio: u64,
     hyp: u64,
+    /// OSSSYS, for the IH VMID LUT a client job maps its PASID in.
+    oss: u64,
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
@@ -96,6 +109,7 @@ impl Layout {
             gc: resolve(ip::HW_ID_GC, &[(12, 0, 1)], 0, 0x1615)?,
             nbio: resolve(ip::HW_ID_NBIF, &[(7, 7, 0), (7, 7, 1), (6, 3, 1)], 2, 0x12d)?,
             hyp: resolve(ip::HW_ID_GC, &[(12, 0, 1)], 1, MCU_CNTL)?,
+            oss: resolve(ip::HW_ID_OSSSYS, &[(7, 0, 0)], 0, 0x1f)?,
         })
     }
 }
@@ -202,6 +216,121 @@ fn interrupt_packets(address: u64) -> [u32; 16] {
 async fn delay(us: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
 }
+/// A client job's 256-dword slot, built with sdma_v7_0's ring functions as
+/// amdgpu_ib_schedule orders them.
+struct Slot {
+    words: [u32; JOB_DWORDS as usize],
+    pos: usize,
+}
+impl Slot {
+    fn push(&mut self, words: &[u32]) -> Result<(), Error> {
+        let end = self.pos + words.len();
+        self.words
+            .get_mut(self.pos..end)
+            .ok_or(Error::Invalid)?
+            .copy_from_slice(words);
+        self.pos = end;
+        Ok(())
+    }
+    /// sdma_v7_0_ring_emit_wreg: REGISTER_WRITE (the SRBM_WRITE opcode).
+    fn wreg(&mut self, reg: u32, value: u32) -> Result<(), Error> {
+        self.push(&[14, reg << 2, value])
+    }
+    /// sdma_v7_0_ring_emit_reg_wait: poll register `reg` until `(value &
+    /// mask) == reference`.
+    fn reg_wait(&mut self, reg: u32, reference: u32, mask: u32) -> Result<(), Error> {
+        self.push(&[8 | 3 << 28, reg << 2, 0, reference, mask, 0xfff << 16 | 10])
+    }
+}
+/// sdma_v7_0's frame for one client job, as amdgpu_vm_flush and
+/// amdgpu_ib_schedule emit it on the ring:
+///
+/// - when `job.flush`, the pipeline sync (sdma_v7_0_ring_emit_pipeline_sync:
+///   poll the fence word until it equals `seq - 1`) and the VM flush
+///   (gmc_v12_0_emit_flush_gpu_tlb on the GFX hub through engine 11:
+///   context page-table base, then invalidate request and ACK wait);
+/// - when `job.map_pasid`, the PASID mapping (IH_VMID_0_LUT + vmid at
+///   OSSSYS dword base `oss`);
+/// - when `job.mem_sync`, a GCR_REQ cache flush (sdma_v7_0_ring_emit_mem_sync);
+/// - each IB as sdma_v7_0_ring_emit_ib: NOPs so the 6-dword INDIRECT packet
+///   ends on an 8-dword boundary (the slot starts on one), the VMID in the
+///   header, a 32-byte aligned base and no CSA;
+/// - the fence (sdma_v7_0_ring_emit_fence: uncached 32-bit FENCE of `seq`
+///   to `fence`), then NOPs (zero) to the slot's end.
+///
+/// LINUX-GAP: no TRAP after the fence; completion is read from the fence.
+fn job_words(
+    job: &crate::amdgpu_gfx12_queue::Job,
+    gc: u32,
+    oss: u32,
+    fence: u64,
+    seq: u32,
+) -> Result<[u32; JOB_DWORDS as usize], Error> {
+    let ibs = &job.ibs[..usize::from(job.ib_count).min(job.ibs.len())];
+    if !(1..16).contains(&job.vmid)
+        || ibs.is_empty()
+        || ibs
+            .iter()
+            .any(|&(at, dwords)| dwords == 0 || dwords > 0xf_ffff || at & 31 != 0)
+    {
+        return Err(Error::Invalid);
+    }
+    let mut slot = Slot {
+        words: [0; JOB_DWORDS as usize],
+        pos: 0,
+    };
+    let vmid = u32::from(job.vmid);
+    if job.flush {
+        slot.push(&[
+            8 | 3 << 28 | 1 << 31,
+            fence as u32 & !3,
+            (fence >> 32) as u32,
+            seq.wrapping_sub(1),
+            u32::MAX,
+            0xfff << 16 | 4,
+        ])?;
+        let hub = &crate::amdgpu_vmhub_regs::GFXHUB_V12_0;
+        let eng = hub.eng_distance * INV_ENGINE;
+        let ctx = hub.ctx_addr_distance * vmid;
+        if hub.semaphore {
+            slot.reg_wait(gc + hub.inv_eng0_sem + eng, 1, 1)?;
+        }
+        slot.wreg(gc + hub.ctx0_pt_base_lo + ctx, job.pd_addr as u32)?;
+        slot.wreg(gc + hub.ctx0_pt_base_hi + ctx, (job.pd_addr >> 32) as u32)?;
+        slot.wreg(
+            gc + hub.inv_eng0_req + eng,
+            crate::amdgpu_vmhub_regs::invalidate_req(job.vmid, 0),
+        )?;
+        slot.reg_wait(gc + hub.inv_eng0_ack + eng, 1 << vmid, 1 << vmid)?;
+        if hub.semaphore {
+            slot.wreg(gc + hub.inv_eng0_sem + eng, 0)?;
+        }
+    }
+    if job.map_pasid {
+        slot.wreg(oss + vmid, u32::from(job.pasid))?;
+    }
+    if job.mem_sync {
+        // sdma_v7_0_ring_emit_mem_sync: GCR_REQ over everything, GL2
+        // written back and GL2/GLM/GL1/GLV/GLK/GLI invalidated.
+        const GCR: u32 = 1 << 14 | 1 << 15 | 1 << 5 | 1 << 9 | 1 << 8 | 1 << 7 | 1;
+        slot.push(&[17, 0, (GCR & 0xffff) << 16, GCR >> 16, 0])?;
+    }
+    for &(at, dwords) in ibs {
+        while (slot.pos + 6) % 8 != 0 {
+            slot.push(&[0])?;
+        }
+        slot.push(&[
+            4 | vmid << 16,
+            at as u32 & !0x1f,
+            (at >> 32) as u32,
+            dwords,
+            0,
+            0,
+        ])?;
+    }
+    slot.push(&[0x30005, fence as u32, (fence >> 32) as u32, seq])?;
+    Ok(slot.words)
+}
 #[derive(Debug)]
 struct Engine<I: Io> {
     io: I,
@@ -211,6 +340,10 @@ struct Engine<I: Io> {
     state: State,
     proof: Option<Proof>,
     interrupt_result: Option<Result<InterruptProof, Error>>,
+    /// Dwords written to the ring by client jobs so far (0: none yet).
+    job_wptr: u64,
+    /// The last client job sequence submitted.
+    job_seq: u32,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -304,7 +437,9 @@ impl<I: Io> Engine<I> {
             // preemption, automatic context switches or indirect buffers.
             update(io, l.gc, 0x0d, 0xf0023f79, 0x40)?;
             update(io, l.gc, RB_CNTL, 0x0f803f3f, 0x00801814)?;
-            update(io, l.gc, 0x89, 0x000f0111, 0)?; // direct packets only
+            // IB_ENABLE, as sdma_v7_0_gfx_resume sets before enabling the
+            // ring: the proofs use direct packets, client jobs IBs.
+            update(io, l.gc, 0x89, 0x000f0111, 1)?;
             io.write(l.gc + 0x96 * 4, 0); // no pending preemption
             io.write(l.gc + 0x9b * 4, 1); // permit pointer rewind
             for reg in [0x83, 0x84, 0x85, 0x86] {
@@ -367,6 +502,59 @@ impl<I: Io> Engine<I> {
             }
             delay(1000).await;
         }
+    }
+    /// Queue one client job after both proofs, in the next 256-dword slot
+    /// if the ring has room: the proofs leave 48 dwords used, so the first
+    /// job pads the ring with NOPs up to its slot. Pointers are bytes and
+    /// 64 bits wide. Returns the job's sequence.
+    fn submit(&mut self, job: crate::amdgpu_gfx12_queue::Job) -> Result<u32, Error> {
+        if self.state != State::InterruptVerified {
+            return Err(Error::Busy);
+        }
+        let l = self.layout;
+        let map = self.memory.mapping();
+        // The interrupt proof left both pointers at 192 bytes.
+        let wptr = self.job_wptr.max(192 / 4);
+        let start = wptr.next_multiple_of(JOB_DWORDS);
+        let next = start + JOB_DWORDS;
+        let seq = self.job_seq.wrapping_add(1);
+        let fence = self.memory.address() + JOB_FENCE;
+        let words = job_words(&job, (l.gc / 4) as u32, (l.oss / 4) as u32, fence, seq)?;
+        self.access(|io| {
+            invalidate(io, l);
+            let rptr = (u64::from(io.read_memory(map, RPTR))
+                | u64::from(io.read_memory(map, RPTR + 4)) << 32)
+                / 4;
+            if rptr > wptr || next - rptr > RING_DWORDS {
+                return Err(Error::Busy);
+            }
+            for dword in wptr..start {
+                io.write_memory(map, dword % RING_DWORDS * 4, 0);
+            }
+            let slot = start % RING_DWORDS * 4;
+            for (i, word) in words.into_iter().enumerate() {
+                io.write_memory(map, slot + i as u64 * 4, word);
+            }
+            let bytes = next * 4;
+            io.write_memory(map, WPTR, bytes as u32);
+            io.write_memory(map, WPTR + 4, (bytes >> 32) as u32);
+            flush(io, l);
+            io.write(l.gc + u64::from(RB_WPTR) * 4, bytes as u32);
+            io.write(l.gc + u64::from(RB_WPTR + 1) * 4, (bytes >> 32) as u32);
+            Ok(())
+        })?;
+        self.job_wptr = next;
+        self.job_seq = seq;
+        Ok(seq)
+    }
+    /// The last client job sequence the fence reached.
+    fn completed_job(&mut self) -> Result<u32, Error> {
+        let l = self.layout;
+        let map = self.memory.mapping();
+        self.access(|io| {
+            invalidate(io, l);
+            Ok(io.read_memory(map, JOB_FENCE))
+        })
     }
     async fn prove_interrupts(
         &mut self,
@@ -506,6 +694,8 @@ impl Sdma {
                 state: State::Prepared,
                 proof: None,
                 interrupt_result: None,
+                job_wptr: 0,
+                job_seq: 0,
             },
         })
     }
@@ -543,6 +733,50 @@ impl Sdma {
     }
     pub fn interrupt_result(&self) -> Option<Result<InterruptProof, Error>> {
         self.engine.interrupt_result
+    }
+    /// Queue a client job (see `job_words`) after both proofs.
+    /// # Safety
+    /// As `amdgpu_gfx12_queue::Queues::submit`: the job's page directory,
+    /// IBs and everything they reach stay mapped and alive until
+    /// `completed_job` passes the returned sequence, its VMID is not moved
+    /// by another ring meanwhile, and no one else writes this ring.
+    pub unsafe fn submit(&mut self, job: crate::amdgpu_gfx12_queue::Job) -> Result<u32, Error> {
+        self.engine.submit(job)
+    }
+    /// The last client job sequence SDMA0 completed.
+    pub fn completed_job(&mut self) -> Result<u32, Error> {
+        self.engine.completed_job()
+    }
+    /// A reader of the client-job fence that needs no access to this owner.
+    pub fn fence_reader(&self) -> FenceReader {
+        FenceReader {
+            regs: self.engine.io.0,
+            authority: self.engine.authority,
+            layout: self.engine.layout,
+            map: self.engine.memory.mapping(),
+        }
+    }
+}
+/// Reads SDMA0's client-job fence without its owner: its own capability,
+/// an HDP flush, then the fence word.
+#[derive(Clone, Copy, Debug)]
+pub struct FenceReader {
+    regs: MmioRegion,
+    authority: Cap<BusDeviceCap, Write>,
+    layout: Layout,
+    map: MmioRegion,
+}
+impl FenceReader {
+    /// The last client job sequence SDMA0 completed.
+    pub fn completed(&self) -> Result<u32, Error> {
+        let mut io = Mmio(self.regs);
+        let (l, map) = (self.layout, self.map);
+        self.authority
+            .invoke(Op(|| {
+                invalidate(&mut io, l);
+                io.read_memory(map, JOB_FENCE)
+            }))
+            .map_err(|_| Error::Revoked)
     }
 }
 #[cfg(feature = "kernel-test")]

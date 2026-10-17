@@ -76,9 +76,11 @@ pub enum State {
     InterruptVerified,
     Failed(Error),
 }
-/// A client job: an IB of `ib_dwords` at `ib` in VMID `vmid`'s address
-/// space, whose page directory is `pd_addr` (the root's entry address with
-/// VALID, as gmc_v12_0_get_vm_pde leaves it).
+/// A client job: IBs in VMID `vmid`'s address space, whose page directory
+/// is `pd_addr` (the root's entry address with VALID, as
+/// gmc_v12_0_get_vm_pde leaves it). `flush` points the VMID's context at
+/// `pd_addr` and invalidates its TLB first; `map_pasid` rewrites its IH LUT
+/// entry (`amdgpu_vmid::VmidManager` decides both).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Job {
     pub vmid: u8,
@@ -89,6 +91,14 @@ pub struct Job {
     /// The job's IBs in order, `(address, dwords)`; `ib_count` are used.
     pub ibs: [(u64, u32); MAX_JOB_IBS],
     pub ib_count: u8,
+    pub flush: bool,
+    pub map_pasid: bool,
+    /// The ring's previous job came from another context
+    /// (`AMDGPU_HAVE_CTX_SWITCH`): CONTEXT_CONTROL reloads state.
+    pub ctx_switch: bool,
+    /// The first IB asked for `AMDGPU_IB_FLAG_EMIT_MEM_SYNC`: invalidate
+    /// and write back the GPU caches before the IBs.
+    pub mem_sync: bool,
 }
 /// IBs one job may carry: all fit one 256-dword slot beside the flush,
 /// PASID mapping and fence.
@@ -107,6 +117,10 @@ impl Job {
             pd_addr,
             ibs: all,
             ib_count: ibs.len() as u8,
+            flush: true,
+            map_pasid: true,
+            ctx_switch: true,
+            mem_sync: false,
         })
     }
     fn ibs(&self) -> &[(u64, u32)] {
@@ -114,15 +128,19 @@ impl Job {
     }
 }
 /// gfx_v12_0's frame for one job on the graphics ring, as amdgpu_vm_flush
-/// and amdgpu_ib_schedule emit it: the VM flush (gmc_v12_0_emit_flush_gpu_tlb
-/// on the GFX hub through the ring's engine, then PFP_SYNC_ME), the PASID
-/// mapping (gmc_v12_0_emit_pasid_mapping: IH_VMID_0_LUT + vmid at OSSSYS
-/// base `oss`), the IBs under the job's VMID, and an interrupting RELEASE_MEM
+/// and amdgpu_ib_schedule emit it: when `job.flush`, a pipeline sync (wait
+/// for the ring's fence to reach `seq - 1`) and the VM flush
+/// (gmc_v12_0_emit_flush_gpu_tlb on the GFX hub through the ring's engine,
+/// then PFP_SYNC_ME); when `job.map_pasid`, the PASID mapping (gmc_v12_0_emit_pasid_mapping: IH_VMID_0_LUT + vmid at OSSSYS
+/// base `oss`); when `job.mem_sync`, ACQUIRE_MEM; on the graphics ring,
+/// CONTEXT_CONTROL (reloading state when `job.ctx_switch`); the IBs under
+/// the job's VMID, and an interrupting RELEASE_MEM
 /// of `seq` to `fence`, NOP-padded to the 256-dword slot.
 ///
 /// On the compute pipe, as gfx_v12_0's compute ring functions: register
-/// writes without the PFP engine select, no PFP_SYNC_ME, the ring's own
-/// invalidation engine, and IBs marked `INDIRECT_BUFFER_VALID`.
+/// writes without the PFP engine select, no PFP_SYNC_ME or CONTEXT_CONTROL,
+/// the ring's own invalidation engine, and IBs marked
+/// `INDIRECT_BUFFER_VALID`.
 fn job_packets(
     pipe: Pipe,
     job: Job,
@@ -145,15 +163,47 @@ fn job_packets(
     let mut words = [0u32; 256];
     let mut b = Pm4Builder::new(&mut words);
     let built = (|| {
-        b.vm_flush(
-            &crate::amdgpu_vmhub_regs::GFXHUB_V12_0,
-            gc,
-            pipe.engine(),
-            job.vmid,
-            job.pd_addr,
-            gfx,
-        )?;
-        b.write_reg(oss + u32::from(job.vmid), u32::from(job.pasid), gfx)?;
+        if job.flush {
+            // amdgpu_vm_flush's pipeline sync: the ring's previous job must
+            // finish before the context moves (gfx_v12_0_ring_emit_pipeline_sync
+            // waits for the last fence written, which init zeroed).
+            b.wait_reg_mem(
+                gfx,
+                true,
+                false,
+                fence as u32,
+                (fence >> 32) as u32,
+                seq.wrapping_sub(1),
+                u32::MAX,
+                4,
+            )?;
+            b.vm_flush(
+                &crate::amdgpu_vmhub_regs::GFXHUB_V12_0,
+                gc,
+                pipe.engine(),
+                job.vmid,
+                job.pd_addr,
+                gfx,
+            )?;
+        }
+        if job.map_pasid {
+            b.write_reg(oss + u32::from(job.vmid), u32::from(job.pasid), gfx)?;
+        }
+        if job.mem_sync {
+            // gfx_v12_0_emit_mem_sync: ACQUIRE_MEM over everything, GL2/GLM
+            // written back and GL2/GLM/GL1/GLV/GLK/GLI invalidated.
+            b.acquire_mem_gfx11(0, 0, 0x00ff_ffff_ffff_ffff, 10, 0xc3b1)?;
+        }
+        if gfx {
+            // gfx_v12_0_ring_emit_cntxcntl: load_enable, plus the global,
+            // per-context and SH register loads on a context switch.
+            let reload = if job.ctx_switch {
+                0x8001 | 0x0100_0000 | 0x1_0002
+            } else {
+                0
+            };
+            b.context_control(0x8000_0000 | reload, 0)?;
+        }
         for &(at, dwords) in job.ibs() {
             if gfx {
                 b.indirect_buffer(at, dwords, job.vmid)?;

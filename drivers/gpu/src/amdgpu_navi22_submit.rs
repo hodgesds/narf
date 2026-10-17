@@ -4,11 +4,19 @@
 //! for GC 10.3.2 (`gfx_v10_0.c`) and SDMA 5.2 (`sdma_v5_2.c`):
 //!
 //! 1. pipeline sync (`emit_pipeline_sync`: wait for the ring's last fence)
-//!    and VM flush (`emit_vm_flush`: write the VMID's page-table base, then
-//!    request and await a legacy invalidation on the ring's invalidation
-//!    engine; PFP_SYNC_ME on the gfx ring) — only the first time a VM
-//!    (VMID + generation) runs on that ring, as `amdgpu_vmid_grab` sets
-//!    `vm_needs_flush` only for a new or changed VMID owner;
+//!    when `amdgpu_ib_schedule` asks for one — the job flushes its VM, or
+//!    its scheduler entity differs from the ring's previous job's
+//!    (`amdgpu_vm_need_pipeline_sync`, `need_ctx_switch`; GC 10.3 has no
+//!    `has_compute_vm_bug`, and dependencies are waited for before
+//!    submission, so no explicit-sync fence reaches the ring);
+//!
+//!    Then the VM flush (`emit_vm_flush`: write the VMID's page-table base,
+//!    then request and await a legacy invalidation on the ring's
+//!    invalidation engine; PFP_SYNC_ME on the gfx ring) when the job's
+//!    `amdgpu_vmid_grab` grant needs one (`amdgpu_vmid::VmidManager`), and
+//!    the PASID mapping (`gmc_v10_0_emit_pasid_mapping`: the GFXHUB
+//!    `IH_VMID_<vmid>_LUT` ← the client's PASID, so its faults' IVs name the
+//!    client) when the grant asks for it;
 //! 2. gfx: CONTEXT_CONTROL (`emit_cntxcntl`, context switch when the client
 //!    context changes) and FRAME_CONTROL start;
 //! 3. the IBs (`emit_ib_gfx` / `_compute` with `vmid << 24`, SDMA
@@ -38,17 +46,24 @@ use alloc::vec::Vec;
 
 /// `mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32` (GC BASE_IDX 0); HI32 is +1,
 /// `ctx_addr_distance` 2.
-const PTB_LO: u32 = 0x1667;
+const PTB_LO: u32 = 0x1667; // linux: mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32@gc
 /// `mmGCVM_INVALIDATE_ENG0_REQ` / `_ACK`, `eng_distance` 1.
-const INV_REQ: u32 = 0x161f;
-const INV_ACK: u32 = 0x1631;
+const INV_REQ: u32 = 0x161f; // linux: mmGCVM_INVALIDATE_ENG0_REQ@gc
+const INV_ACK: u32 = 0x1631; // linux: mmGCVM_INVALIDATE_ENG0_ACK@gc
+/// `mmIH_VMID_0_LUT` (OSSSYS BASE_IDX 0), one register per VMID: the GFXHUB
+/// LUT gmc_v10_0_emit_pasid_mapping writes (`_LUT_MM` is MMHUB's).
+// linux-ctx: hdr=oss seg=0
+pub(crate) const IH_VMID_0_LUT: u32 = 0x0000; // linux: mmIH_VMID_0_LUT@oss
+/// Last OSSSYS register a queue layout must reach: `mmIH_VMID_0_LUT_MM + 15`.
+pub(crate) const IH_VMID_LUT_LAST: u32 = 0x001f; // linux: mmIH_VMID_0_LUT_MM@oss + 15
+                                                 // linux-ctx: reset
 /// `amdgpu_sched_hw_submission` default.
-pub const HW_SUBMISSIONS: u32 = 2;
+pub const HW_SUBMISSIONS: u32 = 2; // linux: n/a (amdgpu_sched_hw_submission module default)
 /// Largest IB count per submission (`AMDGPU_CS_MAX_IBS_PER_SUBMIT`); 16
 /// frames of at most 13 dwords stay far inside one ring half.
-pub const MAX_IBS: usize = 16;
+pub const MAX_IBS: usize = 16; // linux: n/a (NARF bound)
 /// Largest single IB, in dwords (`length_dw` is 20 bits in the packet).
-pub const MAX_IB_DWORDS: u32 = (1 << 20) - 1;
+pub const MAX_IB_DWORDS: u32 = (1 << 20) - 1; // linux: n/a (20-bit IB length_dw)
 
 /// The ring a submission targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,29 +99,32 @@ pub struct Ib {
     pub dwords: u32,
 }
 
-/// The VM a submission runs in.
+/// The VM a submission runs in, as its `amdgpu_vmid_grab` grant decided
+/// (`amdgpu_job::vmid`, `vm_pd_addr`, `pasid`, `vm_needs_flush`, and
+/// `amdgpu_vm_flush`'s `pasid_mapping_needed`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VmRef {
     pub vmid: u8,
-    pub generation: u64,
     /// `amdgpu_gmc_pd_addr(root)`: the value programmed into
     /// `PAGE_TABLE_BASE_ADDR` for this VMID, flags included.
     pub page_table_base: u64,
+    /// The client's PASID, written to the VMID's IH LUT entry.
+    pub pasid: u16,
+    /// Point the VMID's context at `page_table_base` and invalidate it.
+    pub flush: bool,
+    /// Rewrite the VMID's IH LUT entry with `pasid`.
+    pub map_pasid: bool,
 }
 
-/// Per-ring scheduling memory: which VM generations this ring has flushed
-/// and which client context ran last.
+/// Per-ring scheduling memory: which client context (scheduler entity) ran
+/// last (`amdgpu_ring::current_ctx`). 0 is no client context.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RingState {
-    flushed: [u64; 16],
     context: u64,
 }
 impl RingState {
     pub const fn new() -> Self {
-        Self {
-            flushed: [0; 16],
-            context: 0,
-        }
+        Self { context: 0 }
     }
 }
 
@@ -150,6 +168,8 @@ pub(crate) struct Frame<'a> {
     /// Pipeline sync: (ring fence address, last emitted sequence).
     pub sync: Option<(u64, u32)>,
     pub flush: Option<VmRef>,
+    /// IH LUT write: (absolute `IH_VMID_<vmid>_LUT` dword, PASID).
+    pub pasid_map: Option<(u32, u16)>,
     pub vmid: u8,
     pub context_switch: bool,
     pub ibs: &'a [Ib],
@@ -205,6 +225,10 @@ pub(crate) fn encode_cp(l: Layout, f: &Frame<'_>) -> Vec<u32> {
         if gfx {
             w.extend([packet3(PACKET3_PFP_SYNC_ME, 0), 0]);
         }
+    }
+    if let Some((lut, pasid)) = f.pasid_map {
+        // gmc_v10_0_emit_pasid_mapping via gfx_v10_0_ring_emit_wreg.
+        w.extend(cp_wreg(gfx, lut, u32::from(pasid)));
     }
     if gfx {
         // gfx_v10_0_ring_emit_cntxcntl: load_enable, plus the context-switch
@@ -270,6 +294,10 @@ pub(crate) fn encode_sdma(l: Layout, f: &Frame<'_>) -> Vec<u32> {
             (1 << v) | (0x1f << 16),
         ]);
     }
+    if let Some((lut, pasid)) = f.pasid_map {
+        // gmc_v10_0_emit_pasid_mapping via sdma_v5_2_ring_emit_wreg.
+        w.extend(sdma_wreg(lut, u32::from(pasid)));
+    }
     for ib in f.ibs {
         // sdma_v5_2_ring_emit_ib: NOP so the 6-dword packet ends on 8.
         let at = f.wptr + w.len() as u64;
@@ -320,18 +348,19 @@ pub(crate) fn submit<I: Io>(
     if !fence::signaled(completed(hw, queue)?, throttle_seq(queue)) {
         return Err(Error::Busy);
     }
-    let slot = usize::from(vm.vmid);
-    let needs_flush = state.flushed[slot] != vm.generation;
     let fence_address = queue.address(FENCE);
-    let sync = needs_flush.then_some((fence_address, queue.seq));
-    let flush = needs_flush.then_some(vm);
+    // amdgpu_ib_schedule: need_ctx_switch || amdgpu_vm_need_pipeline_sync.
     let context_switch = state.context != context;
+    let sync = (vm.flush || context_switch).then_some((fence_address, queue.seq));
+    let flush = vm.flush.then_some(vm);
     let seq = queue.next_seq();
+    let lut = hw.layout.oss(IH_VMID_0_LUT) + u32::from(vm.vmid);
     let frame = Frame {
         gfx: ring == Ring::Gfx,
         engine: ring.inv_engine(),
         sync,
         flush,
+        pasid_map: vm.map_pasid.then_some((lut, vm.pasid)),
         vmid: vm.vmid,
         context_switch,
         ibs,
@@ -354,7 +383,6 @@ pub(crate) fn submit<I: Io>(
         queue.seq = seq.wrapping_sub(1);
     }
     result?;
-    state.flushed[slot] = vm.generation;
     state.context = context;
     Ok(seq)
 }
@@ -367,13 +395,6 @@ pub(crate) fn throttle_seq(queue: &Queue) -> u32 {
 /// The ring's current fence value (after an HDP read invalidate).
 pub(crate) fn completed<I: Io>(hw: &mut Hw<I>, queue: &Queue) -> Result<u32, Error> {
     hw.access(|io, l| crate::amdgpu_cp_navi22::checked(queue.read(io, l, FENCE)))
-}
-
-/// Forget every flush this ring performed for `vmid` (its VM was destroyed).
-pub fn forget(state: &mut RingState, vmid: u8) {
-    if let Some(slot) = state.flushed.get_mut(usize::from(vmid)) {
-        *slot = 0;
-    }
 }
 
 #[cfg(feature = "kernel-test")]

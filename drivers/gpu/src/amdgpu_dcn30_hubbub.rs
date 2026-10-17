@@ -15,28 +15,42 @@ use crate::{amdgpu::AmdGpu, amdgpu_dcn_profile::Profile, amdgpu_dml30::Watermark
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
-const DF_REQ_OUTSTAND: u64 = 0x0505;
-const SAT_LEVEL: u64 = 0x0506;
-const DRAM_STATE_CNTL: u64 = 0x0508;
+// linux-ctx: hdr=dcn seg=2
+const DF_REQ_OUTSTAND: u64 = 0x0505; // linux: mmDCHUBBUB_ARB_DF_REQ_OUTSTAND
+const SAT_LEVEL: u64 = 0x0506; // linux: mmDCHUBBUB_ARB_SAT_LEVEL
+const DRAM_STATE_CNTL: u64 = 0x0508; // linux: mmDCHUBBUB_ARB_DRAM_STATE_CNTL
 /// `DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A`; each set is five dwords:
 /// urgency, trip to memory, SR enter, SR exit, DRAM clock change.
-const SET_A: u64 = 0x0509;
+const SET_A: u64 = 0x0509; // linux: mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A
+                           // linux: mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_B - mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A
 const SET_STRIDE: u64 = 5;
-const GLOBAL_TIMER_CNTL: u64 = 0x051f;
+const GLOBAL_TIMER_CNTL: u64 = 0x051f; // linux: mmDCHUBBUB_GLOBAL_TIMER_CNTL
 /// `DCHUBBUB_ARB_FRAC_URG_BW_NOM_A`; NOM/FLIP pairs per set.
-const FRAC_NOM_A: u64 = 0x053f;
-const LAST_REG: u32 = (FRAC_NOM_A + 7) as u32;
-// Field masks.
+const FRAC_NOM_A: u64 = 0x053f; // linux: mmDCHUBBUB_ARB_FRAC_URG_BW_NOM_A
+const LAST_REG: u32 = (FRAC_NOM_A + 7) as u32; // linux: mmDCHUBBUB_ARB_FRAC_URG_BW_FLIP_D
+                                               // linux-ctx: reset
+                                               // Field masks.
+                                               // linux: DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A__DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A_MASK
 const URGENCY: u32 = 0x3fff;
+// linux: DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A__DCHUBBUB_ARB_VM_ROW_URGENCY_WATERMARK_A__SHIFT
 const VM_ROW_URGENCY_SHIFT: u32 = 16;
+// linux: DCHUBBUB_ARB_REFCYC_PER_TRIP_TO_MEMORY_A__DCHUBBUB_ARB_REFCYC_PER_TRIP_TO_MEMORY_A_MASK
 const TRIP: u32 = 0x3fff;
+// linux: DCHUBBUB_ARB_ALLOW_SR_ENTER_WATERMARK_A__DCHUBBUB_ARB_ALLOW_SR_ENTER_WATERMARK_A_MASK
 const SR: u32 = 0xffff;
+// linux: DCHUBBUB_ARB_ALLOW_SR_ENTER_WATERMARK_A__DCHUBBUB_ARB_VM_ROW_ALLOW_SR_ENTER_WATERMARK_A__SHIFT
 const VM_ROW_SR_SHIFT: u32 = 16;
+// linux: DCHUBBUB_ARB_FRAC_URG_BW_NOM_A__DCHUBBUB_ARB_FRAC_URG_BW_NOM_A_MASK
 const FRAC: u32 = 0x3ff;
+// linux: DCHUBBUB_ARB_DF_REQ_OUTSTAND__DCHUBBUB_ARB_MIN_REQ_OUTSTAND_MASK
 const MIN_REQ_OUTSTAND: u32 = 0x001f_f000;
+// linux: DCHUBBUB_ARB_DRAM_STATE_CNTL__DCHUBBUB_ARB_ALLOW_SELF_REFRESH_FORCE_VALUE_MASK
 const SELF_REFRESH_FORCE_VALUE: u32 = 1 << 0;
+// linux: DCHUBBUB_ARB_DRAM_STATE_CNTL__DCHUBBUB_ARB_ALLOW_SELF_REFRESH_FORCE_ENABLE_MASK
 const SELF_REFRESH_FORCE_ENABLE: u32 = 1 << 1;
+// linux: DCHUBBUB_GLOBAL_TIMER_CNTL__DCHUBBUB_GLOBAL_TIMER_REFDIV_MASK
 const TIMER_REFDIV: u32 = 0xf;
+// linux: DCHUBBUB_GLOBAL_TIMER_CNTL__DCHUBBUB_GLOBAL_TIMER_ENABLE_MASK
 const TIMER_ENABLE: u32 = 1 << 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,11 +137,13 @@ impl<I: Io> Engine<I> {
         if cntl & TIMER_ENABLE == 0 {
             return Err(Error::Timer);
         }
+        // linux: n/a (ref_div == 2, literal in dcn20_hubbub.c:hubbub2_get_dchub_ref_freq)
         let khz = if cntl & TIMER_REFDIV == 2 {
             dccg_ref_khz / 2
         } else {
             dccg_ref_khz
         };
+        // linux: n/a (40000..60000 kHz, literal in dcn20_hubbub.c:hubbub2_get_dchub_ref_freq)
         if !(40_000..=60_000).contains(&khz) {
             return Err(Error::Timer);
         }
@@ -143,29 +159,42 @@ impl<I: Io> Engine<I> {
             || set.frac_urg_bw_nom > FRAC
             || set.frac_urg_bw_flip > FRAC
             || refclk_khz < 1000
+        // linux: n/a (NARF: 1 MHz floor for refclk_mhz)
         {
             return Err(Error::Invalid);
         }
         for index in 0..4 {
+            // linux: n/a (watermark sets A..D)
             let base = SET_A + index * SET_STRIDE;
             let both = |value: u32, shift: u32| value | value << shift;
             self.set(
                 base,
                 both(set.urgent, VM_ROW_URGENCY_SHIFT),
+                // linux-lit: 16=DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A__DCHUBBUB_ARB_VM_ROW_URGENCY_WATERMARK_A__SHIFT
                 URGENCY | URGENCY << 16,
             )?;
+            // linux-lit: 1=mmDCHUBBUB_ARB_REFCYC_PER_TRIP_TO_MEMORY_A - mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A
             self.set(base + 1, set.urgent_latency, TRIP)?;
+            // linux-lit: 2=mmDCHUBBUB_ARB_ALLOW_SR_ENTER_WATERMARK_A - mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A
             self.set(base + 2, both(set.sr_enter, VM_ROW_SR_SHIFT), u32::MAX)?;
+            // linux-lit: 3=mmDCHUBBUB_ARB_ALLOW_SR_EXIT_WATERMARK_A - mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A
             self.set(base + 3, both(set.sr_exit, VM_ROW_SR_SHIFT), u32::MAX)?;
             self.set(
+                // linux-lit: 4=mmDCHUBBUB_ARB_ALLOW_DRAM_CLK_CHANGE_WATERMARK_A - mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A
                 base + 4,
                 both(set.dram_clock_change, VM_ROW_SR_SHIFT),
                 u32::MAX,
             )?;
+            // linux-lit: 2=mmDCHUBBUB_ARB_FRAC_URG_BW_NOM_B - mmDCHUBBUB_ARB_FRAC_URG_BW_NOM_A
             self.set(FRAC_NOM_A + 2 * index, set.frac_urg_bw_nom, FRAC)?;
+            // linux-lit: 2=mmDCHUBBUB_ARB_FRAC_URG_BW_NOM_B - mmDCHUBBUB_ARB_FRAC_URG_BW_NOM_A
+            // linux-lit: 1=mmDCHUBBUB_ARB_FRAC_URG_BW_FLIP_A - mmDCHUBBUB_ARB_FRAC_URG_BW_NOM_A
             self.set(FRAC_NOM_A + 2 * index + 1, set.frac_urg_bw_flip, FRAC)?;
         }
+        // linux: n/a (60 * refclk_mhz, literal in dcn30_hubbub.c:hubbub3_program_watermarks)
         self.set(SAT_LEVEL, 60 * (refclk_khz / 1000), u32::MAX)?;
+        // linux: n/a (0x1FF, literal in dcn30_hubbub.c:hubbub3_program_watermarks)
+        // linux-lit: 12=DCHUBBUB_ARB_DF_REQ_OUTSTAND__DCHUBBUB_ARB_MIN_REQ_OUTSTAND__SHIFT
         self.update(DF_REQ_OUTSTAND, MIN_REQ_OUTSTAND, 0x1ff << 12)?;
         // hubbub1_allow_self_refresh_control(false): FORCE_ENABLE=1, VALUE=0.
         self.update(

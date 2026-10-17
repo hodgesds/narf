@@ -583,6 +583,34 @@ fn navi22_vram_checks_gmc_dcn_size_and_authority() -> TestResult {
             return TestResult::Fail("inherited DMUB window not protected");
         }
     }
+    // Warm boot after Linux: dm_dmub_sw_init's VRAM|GTT BO landed in GART
+    // (GART: 512M 0x0-0x1FFFFFFF), outside [fb_start, fb_end): no VRAM to
+    // reserve, so the windows are skipped rather than failing the plan.
+    regs[0x1b9] = 0x0010_0000;
+    regs[0x1ba] = 0;
+    regs[0x196] = 0x0020_0000;
+    regs[0x197] = 0;
+    // SAFETY: same RAM-only read fixture.
+    let Ok(plan) = (unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }) else {
+        return TestResult::Fail("GART-resident inherited DMUB windows failed the plan");
+    };
+    if plan
+        .protected()
+        .iter()
+        .filter(|r| r.owner == Owner::Dmub)
+        .count()
+        != 0
+    {
+        return TestResult::Fail("GART DMUB window reserved as VRAM");
+    }
+    // A window straddling the end of VRAM is still refused.
+    let fb_end = GPU_BASE + 12272 * MIB;
+    regs[0x1b9] = (fb_end - 0x4000) as u32;
+    regs[0x1ba] = ((fb_end - 0x4000) >> 32) as u32;
+    // SAFETY: same RAM-only read fixture.
+    if unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }.is_ok() {
+        return TestResult::Fail("DMUB window straddling VRAM end accepted");
+    }
     for reg in [0x1af, 0x1b9, 0x1ba, 0x1a1, 0x196, 0x197, 0x19e] {
         regs[reg] = 0;
     }

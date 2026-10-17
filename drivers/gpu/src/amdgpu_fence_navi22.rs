@@ -25,9 +25,9 @@ pub enum Engine {
     Vcn1,
     Jpeg,
 }
-const ENGINES: usize = 8;
+const ENGINES: usize = 8; // linux: n/a (NARF hook slot count)
 /// Interval between memory samples when no interrupt arrives.
-pub const POLL_US: u64 = 1000;
+pub const POLL_US: u64 = 1000; // linux: n/a (NARF poll policy)
 
 static WAKERS: [IrqSafeSpinLock<Option<Waker>>; ENGINES] =
     [const { IrqSafeSpinLock::new(None) }; ENGINES];

@@ -257,7 +257,7 @@ const STAGES: [Stage; 31] = [
     Stage::ReadTopology,
 ];
 /// INT_CONTEXT of the boot SDMA0 TRAP round trip.
-const TRAP_CONTEXT: u32 = 0x0675_0022;
+const TRAP_CONTEXT: u32 = 0x0675_0022; // linux: n/a (NARF-chosen TRAP INT_CONTEXT tag)
 /// Firmware/power observations, optional VMID0 and SDMA execution proof.
 /// This does not publish acceleration or initialize native display.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -525,6 +525,27 @@ fn dmub_result(result: Result<(), crate::amdgpu_dmub_navi22::Error>) -> Result<(
         }
     }
 }
+/// DmubQuiesce outcome: `Ok(true)` keeps the owner, `Ok(false)` drops it.
+/// dm_dmub_hw_init treats a fused-off DMCUB ("DMUB unsupported on ASIC") as
+/// a board without DMUB, not a failure; VBIOS display tables then run in the
+/// ATOM interpreter. dmub_dcn20_reset already forces a hung DMCUB into
+/// reset, so any other error (readback, device loss) stops the boot.
+fn dmub_quiesce_result(
+    result: Result<(), crate::amdgpu_dmub_navi22::Error>,
+) -> Result<bool, Error> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(crate::amdgpu_dmub_navi22::Error::Unsupported) => {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 DMUB unsupported on ASIC (DMCUB fused off)"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(Error::Dmub(error)),
+    }
+}
 async fn trap_round_trip(
     ih: &mut crate::amdgpu_ih_navi22::Ih,
     sdma: &mut crate::amdgpu_sdma_navi22::Sdma,
@@ -694,7 +715,9 @@ impl Backend for Hardware {
             }
             Stage::DmubQuiesce => {
                 if let Some(dmub) = self.dmub.as_mut() {
-                    dmub.quiesce().await.map_err(Error::Dmub)?;
+                    if !dmub_quiesce_result(dmub.quiesce().await)? {
+                        self.dmub = None;
+                    }
                 }
             }
             Stage::DmubStart => {
@@ -1626,7 +1649,7 @@ impl ColdBoot {
     pub fn reserve_client_vram(
         &mut self,
     ) -> Result<(crate::amdgpu_vram::Reservation, crate::amdgpu_gem::VramHeap), Error> {
-        const ALIGN: u64 = 2 << 20;
+        const ALIGN: u64 = 2 << 20; // linux: n/a (NARF policy, client heap alignment)
         let hw = &mut self.sequence.backend;
         let (fb_base, fb_offset) = hw
             .gmc
@@ -1655,11 +1678,14 @@ impl ColdBoot {
             },
         ))
     }
-    /// Hold one GMC10 context (VMID) for client jobs: its context registers
-    /// carry the 4-level, 48-bit layout every client space shares, and each
-    /// job's ring-side VM flush points it at that job's root.
-    pub async fn reserve_client_vmid(&mut self) -> Result<crate::amdgpu_gmc_navi22::Vm, Error> {
-        self.memory()?.create_vm().await.map_err(Error::MemoryHubs)
+    /// Lend the GFXHUB client VMIDs (1..`first_kfd_vmid`) to per-job client
+    /// submission: their context registers carry the 4-level, 48-bit layout
+    /// every client space shares, and each job's ring-side VM flush points
+    /// its granted VMID at that job's root.
+    pub fn reserve_client_vmids(&mut self) -> Result<crate::amdgpu_gmc_navi22::ClientVmids, Error> {
+        self.memory()?
+            .reserve_client_vmids()
+            .map_err(Error::MemoryHubs)
     }
     /// (last completed, throttle) fence sequences of `ring`.
     pub fn fences(&mut self, ring: crate::amdgpu_navi22_submit::Ring) -> Result<(u32, u32), Error> {
@@ -1711,8 +1737,10 @@ impl ColdBoot {
         }
         h.modeset = None;
         let (vbios, crystal) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
+        let route = crate::amdgpu_navi22_bios::DmubRoute::new(h.dmub.as_mut());
         let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
-            .map_err(|e| Error::Modeset(modeset::Error::Bios(e)))?;
+            .map_err(|e| Error::Modeset(modeset::Error::Bios(e)))?
+            .with_dmub(route.as_ref().map(|r| r as _));
         let board = modeset::Board::from_vbios(vbios, *crystal).map_err(Error::Modeset)?;
         let smu = h.smu.as_mut().ok_or(Error::Invalid)?;
         let display = h.display.as_mut().ok_or(Error::Invalid)?;
@@ -1814,8 +1842,10 @@ impl ColdBoot {
         let pipeline = h.modeset.as_mut().ok_or(Error::Invalid)?;
         let stopped = h.scanout.as_mut().map(|s| s.stop());
         let (vbios, _) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
+        let route = crate::amdgpu_navi22_bios::DmubRoute::new(h.dmub.as_mut());
         let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
-            .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Bios(e)))?;
+            .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Bios(e)))?
+            .with_dmub(route.as_ref().map(|r| r as _));
         let connector = pipeline.connector();
         let display = h.display.as_mut().ok_or(Error::Invalid)?;
         let index = display

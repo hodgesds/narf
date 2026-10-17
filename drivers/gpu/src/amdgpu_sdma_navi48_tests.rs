@@ -9,6 +9,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 const GC: u64 = 0x10000;
 const NBIO: u64 = 0x30000;
 const HYP: u64 = 0x50000;
+const OSS: u64 = 0x70000;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Missing {
     Fence,
@@ -195,11 +196,14 @@ fn fixture() -> (Pool, Engine<Fake>, gmc::Aperture, MmioRegion) {
             gc: GC,
             nbio: NBIO,
             hyp: HYP,
+            oss: OSS,
         },
         memory: pool.reserve(BYTES).unwrap(),
         state: State::Prepared,
         proof: None,
         interrupt_result: None,
+        job_wptr: 0,
+        job_seq: 0,
     };
     (
         pool,
@@ -244,7 +248,7 @@ fn sdma_navi48_executes_translated_packets_and_programs_gc_bank() -> TestResult 
         (0x80, 0x80841815),
         (0x85, 128),
         (0x86, 0),
-        (0x89, 0),
+        (0x89, 1),
         (0x8f, 0),
         (0x9b, 0),
         (0x0d, 0x40),
@@ -424,6 +428,12 @@ fn sdma_navi48_layout_rejects_wrong_versions_and_bank_bounds() -> TestResult {
         sdma.revision = 1;
         sdma.base_addrs[0] = u32::MAX;
         gpu.ip_blocks.push(sdma);
+        // OSSSYS 7.0, for the IH VMID LUT client jobs write.
+        let mut oss = gpu.ip_blocks[0];
+        oss.hw_id = ip::HW_ID_OSSSYS;
+        (oss.major, oss.minor, oss.revision) = (7, 0, 0);
+        oss.base_addrs[0] = 0x12000;
+        gpu.ip_blocks.push(oss);
         gpu
     };
     for case in 0..8 {
@@ -449,6 +459,9 @@ fn sdma_navi48_layout_rejects_wrong_versions_and_bank_bounds() -> TestResult {
         let layout = Layout::resolve(&g).unwrap();
         if layout.gc != GC || layout.hyp != HYP {
             return TestResult::Fail("SDMA7 MCU did not use GC bank one");
+        }
+        if layout.oss != 0x12000 * 4 {
+            return TestResult::Fail("SDMA7 client jobs' OSSSYS bank");
         }
     }
     TestResult::Pass
@@ -697,4 +710,189 @@ fn sdma_navi48_trap_cancellation_quarantines_before_and_after_submission() -> Te
 kernel_test_in!(
     "drivers/gpu/sdma-navi48",
     sdma_navi48_trap_cancellation_quarantines_before_and_after_submission
+);
+
+/// Every word of a client job's frame, against sdma_v7_0's ring functions:
+/// pipeline sync, GFX hub flush through engine 11, LUT write, IBs padded so
+/// each INDIRECT ends on an 8-dword boundary, and an uncached fence.
+fn sdma_navi48_client_job_frame_matches_linux() -> TestResult {
+    use crate::amdgpu_gfx12_queue::Job;
+    let gc = (GC / 4) as u32;
+    let oss = (OSS / 4) as u32;
+    let fence = 0x8_0000_5040;
+    let job = Job::new(
+        3,
+        0x42,
+        0x1_0000_8001,
+        &[(0x2_0000_1000, 64), (0x2_0000_2020, 8)],
+    )
+    .unwrap();
+    let Ok(words) = job_words(&job, gc, oss, fence, 7) else {
+        return TestResult::Fail("frame refused");
+    };
+    let mut want = vec![
+        // Pipeline sync: memory poll, equal, until the fence reads 6.
+        0x8000_0008 | 3 << 28,
+        0x0000_5040,
+        8,
+        6,
+        !0,
+        0x0fff_0004,
+        // Context 3's page-table base (0x168f/0x1690 + 2 * 3).
+        14,
+        (gc + 0x168f + 6) << 2,
+        0x8001,
+        14,
+        (gc + 0x1690 + 6) << 2,
+        1,
+        // Engine 11's request, then its ACK for VMID 3.
+        14,
+        (gc + 0x1647 + 11) << 2,
+        1 << 3 | 0x1f << 19,
+        8 | 3 << 28,
+        (gc + 0x1659 + 11) << 2,
+        0,
+        8,
+        8,
+        0x0fff_000a,
+        // IH_VMID_0_LUT + 3.
+        14,
+        (oss + 3) << 2,
+        0x42,
+    ];
+    // 24 dwords so far: two NOPs end the first INDIRECT at 32.
+    want.extend([0, 0, 4 | 3 << 16, 0x0000_1000, 2, 64, 0, 0]);
+    // The second starts at 32: two NOPs, ending it at 40.
+    want.extend([0; 2]);
+    want.extend([4 | 3 << 16, 0x0000_2020, 2, 8, 0, 0]);
+    want.extend([0x30005, 0x0000_5040, 8, 7]);
+    if words[..want.len()] != want[..] || words[want.len()..].iter().any(|&w| w != 0) {
+        return TestResult::Fail("client job frame");
+    }
+    // A reused VMID: IB and fence only, the IB still 8-dword aligned.
+    let quiet = Job {
+        flush: false,
+        map_pasid: false,
+        ..Job::new(3, 0x42, 0, &[(0x2_0000_1000, 64)]).unwrap()
+    };
+    let words = job_words(&quiet, gc, oss, fence, 7).unwrap();
+    if words[..12]
+        != [
+            0,
+            0,
+            4 | 3 << 16,
+            0x1000,
+            2,
+            64,
+            0,
+            0,
+            0x30005,
+            0x5040,
+            8,
+            7,
+        ]
+    {
+        return TestResult::Fail("reused VMID frame");
+    }
+    // A memory sync: GCR_REQ first, then NOPs aligning the INDIRECT.
+    let synced = Job {
+        mem_sync: true,
+        ..quiet
+    };
+    let words = job_words(&synced, gc, oss, fence, 7).unwrap();
+    if words[..5] != [17, 0, 0xc3a1_0000, 0, 0]
+        || words[5..10] != [0; 5]
+        || words[10] != 4 | 3 << 16
+    {
+        return TestResult::Fail("memory sync frame");
+    }
+    for bad in [
+        Job::new(0, 1, 0, &[(0x1000, 4)]).unwrap(),
+        Job::new(3, 1, 0, &[(0x1010, 4)]).unwrap(),
+        Job::new(3, 1, 0, &[(0x1000, 0)]).unwrap(),
+        Job::new(3, 1, 0, &[(0x1000, 0x10_0000)]).unwrap(),
+    ] {
+        if job_words(&bad, gc, oss, fence, 1).is_ok() {
+            return TestResult::Fail("bad job accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_sdma_navi48",
+    sdma_navi48_client_job_frame_matches_linux
+);
+
+/// Client jobs fill 256-dword slots after the proofs' 48 dwords (the first
+/// pads with NOPs), advance both byte pointers, refuse a job that would
+/// overrun the CP's read pointer, and report the fence.
+fn sdma_navi48_client_jobs_fill_the_ring() -> TestResult {
+    use crate::amdgpu_gfx12_queue::Job;
+    let (_pool, mut e, _aperture, _target) = fixture();
+    let job = Job::new(2, 9, 0x1_0000_8001, &[(0x2_0000_1000, 16)]).unwrap();
+    if e.submit(job) != Err(Error::Busy) {
+        return TestResult::Fail("job before the proofs");
+    }
+    // As the interrupt proof leaves the ring: 192 bytes read and written.
+    e.state = State::InterruptVerified;
+    e.io.complete = false;
+    e.io.memory.fill(0x5a5a_5a5a);
+    e.io.memory[1024..1028].copy_from_slice(&[192, 0, 192, 0]);
+    e.io.memory[(JOB_FENCE / 4) as usize] = 0;
+    if e.submit(job) != Ok(1) {
+        return TestResult::Fail("first job");
+    }
+    let want = job_words(
+        &job,
+        (GC / 4) as u32,
+        (OSS / 4) as u32,
+        0x8_0000_4000 + JOB_FENCE,
+        1,
+    )
+    .unwrap();
+    if e.io.memory[48..256].iter().any(|&w| w != 0)
+        || e.io.memory[256..512] != want[..]
+        || e.io.memory[1026..1028] != [2048, 0]
+        || e.io.regs[&(GC + 0x85 * 4)] != 2048
+        || e.io.regs[&(GC + 0x86 * 4)] != 0
+        || e.io.dirty
+    {
+        return TestResult::Fail("first job's slot and pointers");
+    }
+    // Slots at 512 and 768 fit beside the unread 48..1024; a fourth would
+    // overwrite dwords the engine has not read.
+    for seq in 2..=3 {
+        if e.submit(job) != Ok(seq) {
+            return TestResult::Fail("filling the ring");
+        }
+    }
+    if e.submit(job) != Err(Error::Busy)
+        || e.io.memory[1026] != 4096
+        || e.io.regs[&(GC + 0x85 * 4)] != 4096
+    {
+        return TestResult::Fail("overrun refused without moving a pointer");
+    }
+    // The engine catches up: the next job wraps to slot 0.
+    e.io.memory[1024] = 4096;
+    e.io.memory[(JOB_FENCE / 4) as usize] = 3;
+    if e.completed_job() != Ok(3) || e.submit(job) != Ok(4) || e.io.memory[1026] != 5120 {
+        return TestResult::Fail("wrapped job");
+    }
+    if e.io.memory[..256]
+        != job_words(
+            &job,
+            (GC / 4) as u32,
+            (OSS / 4) as u32,
+            0x8_0000_4000 + JOB_FENCE,
+            4,
+        )
+        .unwrap()[..]
+    {
+        return TestResult::Fail("wrapped slot");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_sdma_navi48",
+    sdma_navi48_client_jobs_fill_the_ring
 );

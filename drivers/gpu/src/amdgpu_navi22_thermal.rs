@@ -24,10 +24,14 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// `AMDGPU_SWCTF_EXTRA_DELAY`.
+// linux: AMDGPU_SWCTF_EXTRA_DELAY
 pub const SWCTF_DELAY_MS: u64 = 50;
 // SMU_IH_INTERRUPT_CONTEXT_ID_* (smu_cmn.h).
+// linux: n/a (SMU_IH_INTERRUPT_CONTEXT_ID_AC = 0x3, smu_cmn.h; not in checker sets)
 pub const CONTEXT_AC: u32 = 0x3;
+// linux: n/a (SMU_IH_INTERRUPT_CONTEXT_ID_DC = 0x4, smu_cmn.h; not in checker sets)
 pub const CONTEXT_DC: u32 = 0x4;
+// linux: n/a (SMU_IH_INTERRUPT_CONTEXT_ID_THERMAL_THROTTLING = 0x7, smu_cmn.h; not in checker sets)
 pub const CONTEXT_THERMAL_THROTTLING: u32 = 0x7;
 /// Every source `smu_v11_0_register_irq_handler` adds.
 pub const SOURCES: [Source; 4] = [
@@ -63,8 +67,8 @@ pub(crate) fn classify(iv: &Iv) -> Action {
     let from = iv.source();
     if from.client == source::client::THM {
         return match iv.src {
-            0 => Action::ConfirmSoftwareCtf,
-            1 => Action::UnderTemperature,
+            0 => Action::ConfirmSoftwareCtf, // linux-lit: 0=THM_11_0__SRCID__THM_DIG_THERM_L2H
+            1 => Action::UnderTemperature,   // linux-lit: 1=THM_11_0__SRCID__THM_DIG_THERM_H2L
             other => Action::UnknownThermal(other),
         };
     }

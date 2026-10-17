@@ -2,7 +2,8 @@
 //! `inv_*` name invalidation engine 17 (the GART/CPU engine); `ctx` and the
 //! page-table registers name context 0. Per-VMID strides match the hub init
 //! functions: `ctx_distance` 1, `ctx_addr_distance` 2 (LO/HI pairs).
-pub(super) const CTX_DISTANCE: u32 = 1;
+pub(super) const CTX_DISTANCE: u32 = 1; // linux: mmGCVM_CONTEXT1_CNTL@gc - mmGCVM_CONTEXT0_CNTL@gc
+                                        // linux: mmGCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32@gc - mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32@gc
 pub(super) const CTX_ADDR_DISTANCE: u32 = 2;
 #[derive(Clone, Copy, Debug)]
 pub(super) struct HubRegs {
@@ -41,69 +42,72 @@ pub(super) struct HubRegs {
     pub inv_sem: u32,
     pub inv_range: u32,
 }
+// linux-ctx: hdr=gc seg=0
 pub(super) const GFX: HubRegs = HubRegs {
-    fb_base: 0x16fc,
-    fb_top: 0x16fd,
-    agp_base: 0x1700,
-    agp_bot: 0x16ff,
-    agp_top: 0x16fe,
-    sys_low: 0x1701,
-    sys_high: 0x1702,
-    sys_default_lo: 0x16e8,
-    sys_default_hi: 0x16e9,
-    l1: 0x1703,
-    l2: 0x15bc,
-    l2_2: 0x15bd,
-    l2_3: 0x15be,
-    l2_4: 0x15d4,
-    l2_5: 0x15dc,
-    fault_lo: 0x15cb,
-    fault_hi: 0x15cc,
-    fault_cntl: 0x15c4,
-    fault_cntl2: 0x15c5,
-    fault_status: 0x15c8,
-    ctx: 0x15fc,
-    pt_base: 0x1667,
-    pt_start: 0x1687,
-    pt_end: 0x16a7,
-    identity_low: 0x15ce,
-    identity_high: 0x15d0,
-    identity_offset: 0x15d2,
-    inv_req: 0x1630,
-    inv_ack: 0x1642,
-    inv_sem: 0x161e,
-    inv_range: 0x1643,
+    fb_base: 0x16fc,         // linux: mmGCMC_VM_FB_LOCATION_BASE
+    fb_top: 0x16fd,          // linux: mmGCMC_VM_FB_LOCATION_TOP
+    agp_base: 0x1700,        // linux: mmGCMC_VM_AGP_BASE
+    agp_bot: 0x16ff,         // linux: mmGCMC_VM_AGP_BOT
+    agp_top: 0x16fe,         // linux: mmGCMC_VM_AGP_TOP
+    sys_low: 0x1701,         // linux: mmGCMC_VM_SYSTEM_APERTURE_LOW_ADDR
+    sys_high: 0x1702,        // linux: mmGCMC_VM_SYSTEM_APERTURE_HIGH_ADDR
+    sys_default_lo: 0x16e8,  // linux: mmGCMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB
+    sys_default_hi: 0x16e9,  // linux: mmGCMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB
+    l1: 0x1703,              // linux: mmGCMC_VM_MX_L1_TLB_CNTL
+    l2: 0x15bc,              // linux: mmGCVM_L2_CNTL
+    l2_2: 0x15bd,            // linux: mmGCVM_L2_CNTL2
+    l2_3: 0x15be,            // linux: mmGCVM_L2_CNTL3
+    l2_4: 0x15d4,            // linux: mmGCVM_L2_CNTL4
+    l2_5: 0x15dc,            // linux: mmGCVM_L2_CNTL5
+    fault_lo: 0x15cb,        // linux: mmGCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32
+    fault_hi: 0x15cc,        // linux: mmGCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32
+    fault_cntl: 0x15c4,      // linux: mmGCVM_L2_PROTECTION_FAULT_CNTL
+    fault_cntl2: 0x15c5,     // linux: mmGCVM_L2_PROTECTION_FAULT_CNTL2
+    fault_status: 0x15c8,    // linux: mmGCVM_L2_PROTECTION_FAULT_STATUS
+    ctx: 0x15fc,             // linux: mmGCVM_CONTEXT0_CNTL
+    pt_base: 0x1667,         // linux: mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32
+    pt_start: 0x1687,        // linux: mmGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32
+    pt_end: 0x16a7,          // linux: mmGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32
+    identity_low: 0x15ce,    // linux: mmGCVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_LO32
+    identity_high: 0x15d0,   // linux: mmGCVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_LO32
+    identity_offset: 0x15d2, // linux: mmGCVM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_LO32
+    inv_req: 0x1630,         // linux: mmGCVM_INVALIDATE_ENG17_REQ
+    inv_ack: 0x1642,         // linux: mmGCVM_INVALIDATE_ENG17_ACK
+    inv_sem: 0x161e,         // linux: mmGCVM_INVALIDATE_ENG17_SEM
+    inv_range: 0x1643,       // linux: mmGCVM_INVALIDATE_ENG0_ADDR_RANGE_LO32
 };
+// linux-ctx: hdr=mmhub seg=0
 pub(super) const MM: HubRegs = HubRegs {
-    fb_base: 0x86c,
-    fb_top: 0x86d,
-    agp_base: 0x870,
-    agp_bot: 0x86f,
-    agp_top: 0x86e,
-    sys_low: 0x871,
-    sys_high: 0x872,
-    sys_default_lo: 0x858,
-    sys_default_hi: 0x859,
-    l1: 0x873,
-    l2: 0x680,
-    l2_2: 0x681,
-    l2_3: 0x682,
-    l2_4: 0x698,
-    l2_5: 0x6a1,
-    fault_lo: 0x68f,
-    fault_hi: 0x690,
-    fault_cntl: 0x688,
-    fault_cntl2: 0x689,
-    fault_status: 0x68c,
-    ctx: 0x6c0,
-    pt_base: 0x72b,
-    pt_start: 0x74b,
-    pt_end: 0x76b,
-    identity_low: 0x692,
-    identity_high: 0x694,
-    identity_offset: 0x696,
-    inv_req: 0x6f4,
-    inv_ack: 0x706,
-    inv_sem: 0x6e2,
-    inv_range: 0x707,
+    fb_base: 0x86c,         // linux: mmMMMC_VM_FB_LOCATION_BASE
+    fb_top: 0x86d,          // linux: mmMMMC_VM_FB_LOCATION_TOP
+    agp_base: 0x870,        // linux: mmMMMC_VM_AGP_BASE
+    agp_bot: 0x86f,         // linux: mmMMMC_VM_AGP_BOT
+    agp_top: 0x86e,         // linux: mmMMMC_VM_AGP_TOP
+    sys_low: 0x871,         // linux: mmMMMC_VM_SYSTEM_APERTURE_LOW_ADDR
+    sys_high: 0x872,        // linux: mmMMMC_VM_SYSTEM_APERTURE_HIGH_ADDR
+    sys_default_lo: 0x858,  // linux: mmMMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB
+    sys_default_hi: 0x859,  // linux: mmMMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB
+    l1: 0x873,              // linux: mmMMMC_VM_MX_L1_TLB_CNTL
+    l2: 0x680,              // linux: mmMMVM_L2_CNTL
+    l2_2: 0x681,            // linux: mmMMVM_L2_CNTL2
+    l2_3: 0x682,            // linux: mmMMVM_L2_CNTL3
+    l2_4: 0x698,            // linux: mmMMVM_L2_CNTL4
+    l2_5: 0x6a1,            // linux: mmMMVM_L2_CNTL5
+    fault_lo: 0x68f,        // linux: mmMMVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32
+    fault_hi: 0x690,        // linux: mmMMVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32
+    fault_cntl: 0x688,      // linux: mmMMVM_L2_PROTECTION_FAULT_CNTL
+    fault_cntl2: 0x689,     // linux: mmMMVM_L2_PROTECTION_FAULT_CNTL2
+    fault_status: 0x68c,    // linux: mmMMVM_L2_PROTECTION_FAULT_STATUS
+    ctx: 0x6c0,             // linux: mmMMVM_CONTEXT0_CNTL
+    pt_base: 0x72b,         // linux: mmMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32
+    pt_start: 0x74b,        // linux: mmMMVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32
+    pt_end: 0x76b,          // linux: mmMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32
+    identity_low: 0x692,    // linux: mmMMVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_LO32
+    identity_high: 0x694,   // linux: mmMMVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_LO32
+    identity_offset: 0x696, // linux: mmMMVM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_LO32
+    inv_req: 0x6f4,         // linux: mmMMVM_INVALIDATE_ENG17_REQ
+    inv_ack: 0x706,         // linux: mmMMVM_INVALIDATE_ENG17_ACK
+    inv_sem: 0x6e2,         // linux: mmMMVM_INVALIDATE_ENG17_SEM
+    inv_range: 0x707,       // linux: mmMMVM_INVALIDATE_ENG0_ADDR_RANGE_LO32
 };
+// linux-ctx: reset

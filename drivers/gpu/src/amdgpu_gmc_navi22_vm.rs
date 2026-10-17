@@ -7,9 +7,15 @@
 //! PDB2 → PDB1 → PDB0 → PTB, 512 entries each, 48-bit space applies.
 //! `translate_further` is never set on GMC10, so PDEs carry no BFS/TF bits.
 //!
-//! Each VM owns its VMID while it lives (Linux grabs VMIDs per submission);
-//! page tables are owned VRAM pages, never client-visible buffers. A VM can
-//! translate only to `Buffer`s explicitly mapped into it.
+//! Each VM owns its VMID while it lives; page tables are owned VRAM pages,
+//! never client-visible buffers. A VM can translate only to `Buffer`s
+//! explicitly mapped into it.
+//!
+//! Client submission (`amdgpu_navi22_cs`) instead grabs VMIDs per job as
+//! Linux does: `reserve_client_vmids` lends it VMIDs 1 up to
+//! `first_kfd_vmid` (8) exclusive, which this owner's own VMs then never
+//! take, and their faults are charged to the PASID the job mapped into the
+//! IH LUT (`amdgpu_vmid::record_fault`) instead of a VM here.
 use super::gart::{dma_range, CTX_FAULT_IRQS, MAX_PFN};
 use super::*;
 use crate::amdgpu_uapi as uapi;
@@ -26,15 +32,18 @@ use narf_io::DmaBuffer;
 
 const GEOMETRY: Layout = Layout::GMC11;
 /// Page-table pages per VM (4 MiB of VRAM): bounds a client's PT footprint.
-const MAX_TABLES: usize = 1024;
+const MAX_TABLES: usize = 1024; // linux: n/a (NARF per-VM PT budget)
 const KNOWN_FLAGS: u32 = uapi::AMDGPU_VM_PAGE_READABLE
     | uapi::AMDGPU_VM_PAGE_WRITEABLE
     | uapi::AMDGPU_VM_PAGE_EXECUTABLE
     | uapi::AMDGPU_VM_MTYPE_MASK
     | uapi::AMDGPU_VM_PAGE_NOALLOC;
+/// gmc_v10_0_sw_init `first_kfd_vmid`: amdgpu_vmid_mgr_init manages GFXHUB
+/// VMIDs 1..first_kfd_vmid for amdgpu jobs; 8..15 stay KFD's.
+pub const FIRST_KFD_VMID: u8 = 8; // linux: n/a (literal in gmc_v10_0.c:gmc_v10_0_sw_init)
 /// AMDGPU_GMC9_FAULT_SOURCE_DATA_{RETRY,WRITE}.
-const FAULT_RETRY: u32 = 0x80;
-const FAULT_WRITE: u32 = 0x20;
+const FAULT_RETRY: u32 = 0x80; // linux: AMDGPU_GMC9_FAULT_SOURCE_DATA_RETRY
+const FAULT_WRITE: u32 = 0x20; // linux: AMDGPU_GMC9_FAULT_SOURCE_DATA_WRITE
 
 #[derive(Debug)]
 pub(super) enum Memory {
@@ -181,6 +190,9 @@ pub struct VmInfo {
 pub struct Fault {
     pub hub: Hub,
     pub vmid: u8,
+    /// The IV's PASID: the IH LUT entry of `vmid` when the fault was raised
+    /// (`amdgpu_iv_entry::pasid`); 0 when none was mapped.
+    pub pasid: u16,
     pub address: u64,
     pub retry: bool,
     pub write: bool,
@@ -188,26 +200,34 @@ pub struct Fault {
 impl Fault {
     /// SOC15_IH_CLIENTID_VMC / _UTCL2; both use source id 0
     /// (VMC_1_0__SRCID__VM_FAULT, UTCL2_1_0__SRCID__FAULT).
-    pub const CLIENT_VMC: u8 = 0x12;
-    pub const CLIENT_UTCL2: u8 = 0x1b;
+    pub const CLIENT_VMC: u8 = 0x12; // linux: SOC15_IH_CLIENTID_VMC
+    pub const CLIENT_UTCL2: u8 = 0x1b; // linux: SOC15_IH_CLIENTID_UTCL2
     /// Adapter for IVs delivered by `ColdBoot::interrupts()` subscriptions to
     /// `ih::source::{VMC_FAULT, UTCL2_FAULT}`.
     pub fn from_iv(iv: &crate::amdgpu_ih_navi22::Iv) -> Option<Self> {
-        Self::decode(iv.client, iv.src, iv.vmid, [iv.src_data[0], iv.src_data[1]])
+        Self::decode(iv.client, iv.src, iv.vmid, [iv.src_data[0], iv.src_data[1]]).map(|fault| {
+            Self {
+                pasid: iv.pasid,
+                ..fault
+            }
+        })
     }
     /// gmc_v10_0_process_interrupt's decode of `src_data[0..2]`.
     pub fn decode(client: u8, source: u8, vmid: u8, data: [u32; 2]) -> Option<Self> {
         let hub = match (client, source) {
-            (Self::CLIENT_VMC, 0) => Hub::Mm,
-            (Self::CLIENT_UTCL2, 0) => Hub::Gfx,
+            (Self::CLIENT_VMC, 0) => Hub::Mm, // linux-lit: 0=VMC_1_0__SRCID__VM_FAULT
+            (Self::CLIENT_UTCL2, 0) => Hub::Gfx, // linux-lit: 0=UTCL2_1_0__SRCID__FAULT
             _ => return None,
         };
         if vmid > 15 {
+            // linux: n/a (16 VMIDs)
             return None;
         }
         Some(Self {
             hub,
             vmid,
+            pasid: 0,
+            // linux: n/a (<< 12, & 0xf << 44 literals in gmc_v10_0_process_interrupt)
             address: u64::from(data[0]) << 12 | u64::from(data[1] & 0xf) << 44,
             retry: data[1] & FAULT_RETRY != 0,
             write: data[1] & FAULT_WRITE != 0,
@@ -232,8 +252,34 @@ pub enum FaultOwner {
         vmid: u8,
         generation: u64,
     },
+    /// A VMID lent to client submission: the fault was charged to the IV's
+    /// PASID (0: the VMID had no client mapped yet, nothing was charged).
+    Client {
+        vmid: u8,
+        pasid: u16,
+    },
     /// No bound VM: a stale VMID or a fault after teardown.
     Unowned,
+}
+
+/// VMIDs `first..=last` lent to per-job client submission
+/// (`Gmc::reserve_client_vmids`), for this memory owner's lifetime. Their
+/// contexts keep the 4-level, 48-bit layout `enable_gart` armed; each job's
+/// ring-side flush points one at the job's root.
+#[derive(Debug)]
+pub struct ClientVmids {
+    first: u8,
+    last: u8,
+    owner: u64,
+}
+impl ClientVmids {
+    pub fn range(&self) -> (u8, u8) {
+        (self.first, self.last)
+    }
+    /// The memory owner that lent them (`Gmc` token).
+    pub fn owner(&self) -> u64 {
+        self.owner
+    }
 }
 
 #[derive(Debug)]
@@ -265,9 +311,11 @@ impl Drop for Space {
 }
 #[derive(Debug)]
 pub(super) struct Vms {
-    slots: [Option<Space>; 16],
+    slots: [Option<Space>; 16], // linux: n/a (16 VMIDs)
     next: u8,
     generation: u64,
+    /// VMIDs lent to client submission, one bit each.
+    lent: u16,
 }
 impl Vms {
     pub(super) fn new() -> Self {
@@ -275,13 +323,18 @@ impl Vms {
             slots: core::array::from_fn(|_| None),
             next: 1,
             generation: 0,
+            lent: 0,
         }
+    }
+    fn is_lent(&self, vmid: u8) -> bool {
+        self.lent & 1 << vmid != 0
     }
     /// Round-robin so a just-freed VMID (and its late faults) is reused last.
     fn free(&mut self) -> Option<u8> {
         for step in 0..15 {
+            // linux: n/a (NARF VMID 1..15 allocator)
             let vmid = (self.next - 1 + step) % 15 + 1;
-            if self.slots[usize::from(vmid)].is_none() {
+            if self.slots[usize::from(vmid)].is_none() && !self.is_lent(vmid) {
                 self.next = vmid % 15 + 1;
                 return Some(vmid);
             }
@@ -301,7 +354,7 @@ fn path(va: u64) -> [u16; 4] {
 /// Tables a map of `[va, end)` would add below `root`.
 fn missing(root: &Table, va: u64, end: u64) -> usize {
     let mut absent = BTreeSet::new();
-    let mut chunk = va & !((2 << 20) - 1);
+    let mut chunk = va & !((2 << 20) - 1); // linux: n/a (2 MiB = one 512-entry PTB)
     while chunk < end {
         let [a, b, c, _] = path(chunk);
         let pdb1 = root.children.get(&a);
@@ -316,7 +369,7 @@ fn missing(root: &Table, va: u64, end: u64) -> usize {
                 absent.insert(key);
             }
         }
-        chunk += 2 << 20;
+        chunk += 2 << 20; // linux: n/a (2 MiB = one 512-entry PTB)
     }
     absent.len()
 }
@@ -417,6 +470,7 @@ impl<I: Io> Engine<I> {
     pub(super) async fn create_vm(&mut self) -> Result<Vm, Error> {
         let geometry = self.user_ready()?;
         let vmid = self.vms.free().ok_or(Error::Exhausted)?;
+        // linux: n/a (4 KiB page-table page)
         let memory = self.pool.reserve(4096).map_err(|_| Error::Allocation)?;
         self.begin()?;
         self.vms.generation += 1;
@@ -468,8 +522,8 @@ impl<I: Io> Engine<I> {
         let space = self.vms.space(vm, self.token)?;
         let end = m.va.checked_add(m.size).ok_or(Error::Invalid)?;
         if m.size == 0
-            || (m.va | m.size | m.offset) % 4096 != 0
-            || end > MAX_PFN << 12
+            || (m.va | m.size | m.offset) % 4096 != 0 // linux: n/a (4 KiB GPU page)
+            || end > MAX_PFN << 12 // linux: n/a (max_pfn << AMDGPU_GPU_PAGE_SHIFT)
             || m.offset
                 .checked_add(m.size)
                 .is_none_or(|e| e > buffer.size())
@@ -533,6 +587,7 @@ impl<I: Io> Engine<I> {
                 };
                 let map = table.memory.mapping();
                 // Stay within this PTB.
+                // linux: n/a (2 MiB = one 512-entry PTB)
                 let stop = end.min((va | ((2 << 20) - 1)) + 1);
                 while va < stop {
                     let index = u64::from(path(va)[3]);
@@ -606,6 +661,26 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
+    /// Lend VMIDs 1..FIRST_KFD_VMID to client submission (amdgpu_vmid_mgr_init's
+    /// GFXHUB range). No I/O: `enable_gart` armed every context on the empty
+    /// root and `destroy_vm` returns contexts to it. Fails with `Busy` while a
+    /// VM of this owner holds one of them or they are already lent.
+    pub(super) fn reserve_client_vmids(&mut self) -> Result<ClientVmids, Error> {
+        self.user_ready()?;
+        let (first, last) = (1, FIRST_KFD_VMID - 1);
+        let mask = (first..=last).fold(0u16, |m, v| m | 1 << v);
+        if self.vms.lent & mask != 0
+            || (first..=last).any(|v| self.vms.slots[usize::from(v)].is_some())
+        {
+            return Err(Error::Busy);
+        }
+        self.vms.lent |= mask;
+        Ok(ClientVmids {
+            first,
+            last,
+            owner: self.token,
+        })
+    }
     pub(super) fn vm_info(&self, vm: &Vm) -> Option<VmInfo> {
         let space = self.vms.space(vm, self.token).ok()?;
         Some(VmInfo {
@@ -625,6 +700,7 @@ impl<I: Io> Engine<I> {
     /// so unexpected) are reported, never recovered.
     pub(super) fn handle_fault(&mut self, fault: Fault) -> Result<FaultOwner, Error> {
         if self.geometry.is_none() || fault.vmid > 15 {
+            // linux: n/a (16 VMIDs)
             return Err(Error::Invalid);
         }
         let (index, r) = match fault.hub {
@@ -634,11 +710,30 @@ impl<I: Io> Engine<I> {
         let base = self.layout.bases[index];
         let status = self.access(|io| {
             let status = checked(io.read(base + u64::from(r.fault_status) * 4))?;
+            // linux-lit: 1=GCVM_L2_PROTECTION_FAULT_CNTL__CLEAR_PROTECTION_FAULT_STATUS_ADDR_MASK
             update(io, base, r.fault_cntl, 1, 1)?;
             Ok(status)
         })?;
         if fault.vmid == 0 {
             return Ok(FaultOwner::Kernel);
+        }
+        if self.vms.is_lent(fault.vmid) {
+            // amdgpu_vm_update_fault_cache(entry->pasid, addr, status, vmhub).
+            crate::amdgpu_vmid::record_fault(
+                fault.pasid,
+                crate::amdgpu_vmid::FaultInfo {
+                    addr: fault.address,
+                    status,
+                    vmhub: match fault.hub {
+                        Hub::Gfx => 0, // linux-lit: 0=AMDGPU_VMHUB_TYPE_GFX
+                        Hub::Mm => 1,  // linux-lit: 1=AMDGPU_VMHUB_TYPE_MM0
+                    },
+                },
+            );
+            return Ok(FaultOwner::Client {
+                vmid: fault.vmid,
+                pasid: fault.pasid,
+            });
         }
         let Some(space) = self.vms.slots[usize::from(fault.vmid)].as_mut() else {
             return Ok(FaultOwner::Unowned);
@@ -671,9 +766,12 @@ impl<I: Io> Engine<I> {
                     io,
                     base,
                     r.fault_cntl,
+                    // linux-lit: 0x3fffe000=GCVM_L2_PROTECTION_FAULT_CNTL__CLIENT_ID_NO_RETRY_FAULT_INTERRUPT_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__OTHER_CLIENT_ID_NO_RETRY_FAULT_INTERRUPT_MASK
                     0x3fff_e000,
+                    // linux-lit: 0x3fffe000=GCVM_L2_PROTECTION_FAULT_CNTL__CLIENT_ID_NO_RETRY_FAULT_INTERRUPT_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__OTHER_CLIENT_ID_NO_RETRY_FAULT_INTERRUPT_MASK
                     if enable { 0x3fff_e000 } else { 0 },
                 )?;
+                // linux: n/a (16 VMID contexts, amdgpu_gmc_set_vm_fault_masks)
                 for context in 0..16 {
                     update(
                         io,

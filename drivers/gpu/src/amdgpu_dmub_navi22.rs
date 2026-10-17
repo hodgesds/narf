@@ -14,15 +14,20 @@ use core::{
 };
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
-const CNTL: u32 = 0x1f6;
+// linux-ctx: hdr=dcn,dmub seg=2
+const CNTL: u32 = 0x1f6; // linux: mmDMCUB_CNTL
+                         // linux: DMCUB_CNTL__DMCUB_SOFT_RESET_MASK
 const RESET: u32 = 1 << 17; // DCN30: CNTL bit 17, NOT DCN31 CNTL2 bit 0
-const ENABLE: u32 = 1 << 16;
+const ENABLE: u32 = 1 << 16; // linux: DMCUB_CNTL__DMCUB_ENABLE_MASK
+                             // linux: mmMMHUBBUB_SOFT_RESET
 const HUB: u32 = 0x341; // DCN31 instead uses 0x342
-const GPINT: u32 = 0x1f8;
-const STOP: u32 = 0x10020000;
-const STATUS: u32 = 0x1e3;
+const GPINT: u32 = 0x1f8; // linux: mmDMCUB_GPINT_DATAIN1
+const STOP: u32 = 0x10020000; // linux: (1 << 28) | (DMUB_GPINT__STOP_FW << 16)
+const STATUS: u32 = 0x1e3; // linux: mmDMCUB_SCRATCH0
+                           // linux: DMCUB_REGION3_CW0_BASE_ADDRESS__DMCUB_REGION3_CW0_BASE_ADDRESS_MASK
 const MASK: u32 = 0x1fffffff;
-const NATIVE_CHANNELS: u8 = 6;
+// linux-ctx: reset
+const NATIVE_CHANNELS: u8 = 6; // linux: n/a (literal in: res_cap_dcn3.num_ddc)
 /// Linux dm_dmub_hw_init never compares the GPINT version reply with the
 /// firmware header on DCN3.0; a mismatch is only reported.
 const STRICT_VERSION: bool = false;
@@ -123,6 +128,8 @@ impl Layout {
         }
         Ok(Self {
             // Highest DCN register used: MMHUBBUB_SOFT_RESET (0x341).
+            // linux-ctx: hdr=dcn,dmub,nbio,hdp
+            // linux-lit: 2=mmDMCUB_CNTL_BASE_IDX
             dcn: bank(gpu, ip::HW_ID_DCN, &[(3, 0, 0)], 2, HUB).map_err(|_| Error::Unsupported)?,
             nbio: bank(
                 gpu,
@@ -136,16 +143,16 @@ impl Layout {
                     (3, 3, 2),
                     (3, 3, 3),
                 ],
-                2,
-                0x12d,
+                2,     // linux: mmREMAP_HDP_MEM_FLUSH_CNTL_BASE_IDX
+                0x12d, // linux: mmREMAP_HDP_MEM_FLUSH_CNTL
             )
             .map_err(|_| Error::Unsupported)?,
             hdp: bank(
                 gpu,
                 ip::HW_ID_HDP,
                 &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
-                0,
-                0xd1,
+                0,    // linux: mmHDP_READ_CACHE_INVALIDATE_BASE_IDX
+                0xd1, // linux: mmHDP_READ_CACHE_INVALIDATE
             )
             .map_err(|_| Error::Unsupported)?,
         })
@@ -203,11 +210,14 @@ fn update(io: &mut impl Io, base: u64, reg: u32, mask: u32, value: u32) -> Resul
     Ok(())
 }
 fn is_reset(io: &mut impl Io, base: u64) -> Result<bool, Error> {
+    // linux-lit: 0x100=MMHUBBUB_SOFT_RESET__DMUIF_SOFT_RESET_MASK
     Ok(read(io, base, CNTL)? & (RESET | ENABLE) == RESET && read(io, base, HUB)? & 0x100 != 0)
 }
 fn is_running(io: &mut impl Io, l: Layout) -> Result<bool, Error> {
     Ok(read(io, l.dcn, CNTL)? & (RESET | ENABLE) == ENABLE
+        // linux-lit: 0x100=MMHUBBUB_SOFT_RESET__DMUIF_SOFT_RESET_MASK
         && read(io, l.dcn, HUB)? & 0x100 == 0
+        // linux-lit: 3=DMUB_FW_BOOT_STATUS_BIT_DAL_FIRMWARE | DMUB_FW_BOOT_STATUS_BIT_MAILBOX_READY
         && read(io, l.dcn, STATUS)? & 3 == 3)
 }
 /// The register half of dmub_dcn20_reset: clear GPINT, assert DMCUB soft
@@ -216,19 +226,22 @@ fn hold_reset(io: &mut impl Io, base: u64) -> Result<(), Error> {
     io.write(base + u64::from(GPINT) * 4, 0);
     update(io, base, CNTL, RESET, RESET)?;
     update(io, base, CNTL, ENABLE, 0)?;
+    // linux-lit: 0x100=MMHUBBUB_SOFT_RESET__DMUIF_SOFT_RESET_MASK
     update(io, base, HUB, 0x100, 0x100)?;
     if !is_reset(io, base)? {
         return Err(Error::Readback);
     }
     // Never touch SEC_CNTL or CW0/CW1: PSP owns their authentication.
+    // linux-lit: 0x1d6=mmDMCUB_INBOX1_WPTR; 0x1d7=mmDMCUB_INBOX1_RPTR; 0x1da=mmDMCUB_OUTBOX0_WPTR
+    // linux-lit: 0x1db=mmDMCUB_OUTBOX0_RPTR; 0x1de=mmDMCUB_OUTBOX1_WPTR; 0x1df=mmDMCUB_OUTBOX1_RPTR
     for reg in [0x1d6, 0x1d7, 0x1da, 0x1db, 0x1de, 0x1df, STATUS] {
         io.write(base + u64::from(reg) * 4, 0);
     }
     Ok(())
 }
 fn invalidate(io: &mut impl Io, l: Layout) {
-    io.write(l.hdp + 0xd1 * 4, 1);
-    io.read(l.hdp + 0xd1 * 4);
+    io.write(l.hdp + 0xd1 * 4, 1); // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+    io.read(l.hdp + 0xd1 * 4); // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
     fence(Ordering::SeqCst);
 }
 async fn tick() {
@@ -267,37 +280,18 @@ impl<I: Io> Engine<I> {
     }
     async fn quiesce_inner(&mut self) -> Result<(), Error> {
         let base = self.layout.dcn;
-        let control = self.access(|io| {
-            if read(io, base, 0xca)? & (1 << 16) == 0 {
-                return Err(Error::Unsupported);
-            }
-            read(io, base, CNTL)
-        })?;
-        if control & RESET == 0 && control & ENABLE != 0 {
-            self.access(|io| {
-                io.write(base + u64::from(GPINT) * 4, STOP);
-                Ok(())
-            })?;
-            let deadline = narf_time::Deadline::after_ms(100);
-            loop {
-                if self.access(|io| {
-                    Ok(read(io, base, GPINT)? == STOP & !(1 << 28)
-                        && read(io, base, 0x1ea)? == 0xdeaddead)
-                })? {
-                    break;
-                }
-                if deadline.expired() {
-                    return Err(Error::StopTimeout);
-                }
-                tick().await;
-            }
+        // dmub_dcn20_is_supported: CC_DC_PIPE_DIS.DC_DMCUB_ENABLE. A fused-off
+        // DMCUB is "DMUB unsupported on ASIC" (dm_dmub_hw_init), not a fault.
+        if self.access(|io| read(io, base, 0xca))? & (1 << 16) == 0 {
+            return Err(Error::Unsupported);
         }
-        self.access(|io| hold_reset(io, base))
+        self.reset().await
     }
-    /// dmub_srv_hw_init begins with `dmub_dcn20_reset` even after PSP loaded
-    /// the firmware: STOP_FW if running, bounded acknowledgement, then a
-    /// forced reset ("in case we timed out, DMCUB is likely hung").
-    async fn reset_after_load(&mut self) -> Result<(), Error> {
+    /// `dmub_dcn20_reset`, used both before PSP replaces CW0/1 and again by
+    /// dmub_srv_hw_init after PSP loaded the firmware: STOP_FW unless held
+    /// in reset, a bounded acknowledgement, clear GPINT, then a forced reset
+    /// ("in case we timed out, DMCUB is likely hung").
+    async fn reset(&mut self) -> Result<(), Error> {
         let base = self.layout.dcn;
         let control = self.access(|io| read(io, base, CNTL))?;
         if control & RESET == 0 {
@@ -308,9 +302,18 @@ impl<I: Io> Engine<I> {
             let deadline = narf_time::Deadline::after_ms(100);
             while !self.access(|io| {
                 Ok(read(io, base, GPINT)? == STOP & !(1 << 28)
+                    // linux-lit: 0x1ea=mmDMCUB_SCRATCH7
+                    // linux-lit: 0xdeaddead=DMUB_GPINT__STOP_FW_RESPONSE
                     && read(io, base, 0x1ea)? == 0xdeaddead)
-            })? && !deadline.expired()
-            {
+            })? {
+                if deadline.expired() {
+                    use core::fmt::Write;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: navi22 DMCUB STOP_FW not acknowledged; forcing reset"
+                    );
+                    break;
+                }
                 tick().await;
             }
         }
@@ -337,9 +340,10 @@ impl<I: Io> Engine<I> {
         let address = self.memory.address();
         let shape = self.prepared.layout;
         if !self.access(|io| is_reset(io, l.dcn))? {
-            self.reset_after_load().await?;
+            self.reset().await?;
         }
         let placement = self.access(|io| {
+            // linux-lit: 0x1ce=mmDMCUB_SEC_CNTL; 16=DMCUB_SEC_CNTL__DMCUB_SEC_RESET__SHIFT
             if !is_reset(io, l.dcn)? || read(io, l.dcn, 0x1ce)? & (1 << 16) != 0 {
                 return Err(Error::Busy);
             }
@@ -356,6 +360,7 @@ impl<I: Io> Engine<I> {
                 || tmr.start >= tmr.end
                 || tmr.end > end
                 || offset.checked_add(end - fb).is_none_or(|v| v > 1 << 48)
+                // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
                 || checked(io.read(l.nbio + 0x12d * 4))? != 0x7f000
             {
                 return Err(Error::Invalid);
@@ -364,15 +369,24 @@ impl<I: Io> Engine<I> {
             // Validate PSP's authenticated instruction and stack windows, but
             // preserve them verbatim. They use GPU-physical VRAM addresses.
             for index in 0..2 {
+                // linux-lit: 0x1a5=mmDMCUB_REGION3_CW0_BASE_ADDRESS
                 let base = read(io, l.dcn, 0x1a5 + index)? & MASK;
+                // linux-lit: 0x1ad=mmDMCUB_REGION3_CW0_TOP_ADDRESS
                 let top = read(io, l.dcn, 0x1ad + index)?;
+                // linux-lit: 0x1b5=mmDMCUB_REGION3_CW0_OFFSET
+                // linux-lit: 2=mmDMCUB_REGION3_CW1_OFFSET - mmDMCUB_REGION3_CW0_OFFSET
                 let low = read(io, l.dcn, 0x1b5 + index * 2)?;
+                // linux-lit: 0x1b6=mmDMCUB_REGION3_CW0_OFFSET_HIGH
+                // linux-lit: 2=mmDMCUB_REGION3_CW1_OFFSET - mmDMCUB_REGION3_CW0_OFFSET
                 let high = read(io, l.dcn, 0x1b6 + index * 2)?;
+                // linux-lit: 0xffffff00=DMCUB_REGION3_CW0_OFFSET__DMCUB_REGION3_CW0_OFFSET_MASK
+                // linux-lit: 0xffff=DMCUB_REGION3_CW0_OFFSET_HIGH__DMCUB_REGION3_CW0_OFFSET_HIGH_MASK
                 let start = u64::from(low & 0xffffff00) | (u64::from(high & 0xffff) << 32);
                 let size = (top & MASK)
                     .checked_sub(base)
                     .and_then(|n| n.checked_add(1))
                     .ok_or(Error::Invalid)?;
+                // linux-lit: 31=DMCUB_REGION3_CW0_TOP_ADDRESS__DMCUB_REGION3_CW0_ENABLE__SHIFT
                 if top & (1 << 31) == 0
                     || base != index << 24
                     || start < physical.start
@@ -404,7 +418,7 @@ impl<I: Io> Engine<I> {
         self.access(|io| {
             fence(Ordering::SeqCst);
             io.write(0x7f000, 0);
-            io.read(l.nbio + 0xc3 * 4);
+            io.read(l.nbio + 0xc3 * 4); // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
             fence(Ordering::SeqCst);
             Ok(())
         })?;
@@ -415,6 +429,9 @@ impl<I: Io> Engine<I> {
             // a fresh firmware-ready publication after releasing this reset.
             io.write(l.dcn + u64::from(STATUS) * 4, 0);
             // CW2/CW7 and uncached region4/6 are unused by this combined image.
+            // linux-lit: 0x1af=mmDMCUB_REGION3_CW2_TOP_ADDRESS
+            // linux-lit: 0x1b4=mmDMCUB_REGION3_CW7_TOP_ADDRESS
+            // linux-lit: 0x1a1=mmDMCUB_REGION4_TOP_ADDRESS; 0x1a3=mmDMCUB_REGION6_TOP_ADDRESS
             for reg in [0x1af, 0x1b4, 0x1a1, 0x1a3] {
                 io.write(l.dcn + reg * 4, 0);
             }
@@ -426,18 +443,28 @@ impl<I: Io> Engine<I> {
             ] {
                 let index = w as u32;
                 let address = placement.address(w);
+                // linux: n/a (DMUB_CW0_BASE + (n << 24) = DMUB_CW3..6_BASE in; not in checker set)
                 let base = 0x60000000 + (index << 24);
                 let size = shape.region(w).size;
                 for (reg, value) in [
+                    // linux-lit: 0x1b5=mmDMCUB_REGION3_CW0_OFFSET
+                    // linux-lit: 2=mmDMCUB_REGION3_CW1_OFFSET - mmDMCUB_REGION3_CW0_OFFSET
                     (0x1b5 + index * 2, address as u32),
+                    // linux-lit: 0x1b6=mmDMCUB_REGION3_CW0_OFFSET_HIGH
+                    // linux-lit: 2=mmDMCUB_REGION3_CW1_OFFSET - mmDMCUB_REGION3_CW0_OFFSET
                     (0x1b6 + index * 2, (address >> 32) as u32),
-                    (0x1a5 + index, base),
+                    (0x1a5 + index, base), // linux-lit: 0x1a5=mmDMCUB_REGION3_CW0_BASE_ADDRESS
+                    // linux-lit: 0x1ad=mmDMCUB_REGION3_CW0_TOP_ADDRESS
+                    // linux-lit: 0x80000000=DMCUB_REGION3_CW0_TOP_ADDRESS__DMCUB_REGION3_CW0_ENABLE_MASK
                     (0x1ad + index, 0x80000000 | ((base + size) & MASK)),
                 ] {
                     io.write(l.dcn + u64::from(reg) * 4, value);
+                    // linux-lit: 0x1a5=mmDMCUB_REGION3_CW0_BASE_ADDRESS
                     let mask = if reg == 0x1a5 + index {
                         MASK
+                    // linux-lit: 0x1ad=mmDMCUB_REGION3_CW0_TOP_ADDRESS
                     } else if reg == 0x1ad + index {
+                        // linux-lit: 0x80000000=DMCUB_REGION3_CW0_TOP_ADDRESS__DMCUB_REGION3_CW0_ENABLE_MASK
                         0x80000000 | MASK
                     } else {
                         u32::MAX
@@ -450,25 +477,30 @@ impl<I: Io> Engine<I> {
             let trace = placement.address(fw::Window::Trace);
             let trace_size = shape.region(fw::Window::Trace).size;
             for (reg, value) in [
-                (0x198, trace as u32),
-                (0x199, (trace >> 32) as u32),
+                (0x198, trace as u32),         // linux-lit: 0x198=mmDMCUB_REGION5_OFFSET
+                (0x199, (trace >> 32) as u32), // linux-lit: 0x199=mmDMCUB_REGION5_OFFSET_HIGH
+                // linux-lit: 0x1a2=mmDMCUB_REGION5_TOP_ADDRESS
+                // linux-lit: 0x80000000=DMCUB_REGION5_TOP_ADDRESS__DMCUB_REGION5_ENABLE_MASK
                 (0x1a2, 0x80000000 | (trace_size - 1)),
-                (0x1d4, 0x64000000),
-                (0x1d5, 8192),
-                (0x1dc, 0x64002000),
-                (0x1dd, 8192),
-                (0x1d8, 0xa0000010),
+                (0x1d4, 0x64000000), // linux-lit: 0x1d4=mmDMCUB_INBOX1_BASE_ADDRESS
+                (0x1d5, 8192),       // linux-lit: 0x1d5=mmDMCUB_INBOX1_SIZE; 8192=DMUB_RB_SIZE
+                (0x1dc, 0x64002000), // linux-lit: 0x1dc=mmDMCUB_OUTBOX1_BASE_ADDRESS
+                (0x1dd, 8192),       // linux-lit: 0x1dd=mmDMCUB_OUTBOX1_SIZE; 8192=DMUB_RB_SIZE
+                (0x1d8, 0xa0000010), // linux-lit: 0x1d8=mmDMCUB_OUTBOX0_BASE_ADDRESS
+                // linux-lit: 0x1d9=mmDMCUB_OUTBOX0_SIZE; 16=TRACE_BUFFER_ENTRY_OFFSET
                 (0x1d9, trace_size - 16),
                 // dmub_dcn20_enable_dmub_boot_options: all-zero on DCN3.0.
-                (0x1f1, 0),
-                (0x1f2, psp_version & 0x001100ff),
+                (0x1f1, 0),                        // linux-lit: 0x1f1=mmDMCUB_SCRATCH14
+                (0x1f2, psp_version & 0x001100ff), // linux-lit: 0x1f2=mmDMCUB_SCRATCH15
             ] {
                 io.write(l.dcn + u64::from(reg) * 4, value);
                 if read(io, l.dcn, reg)? != value {
                     return Err(Error::Readback);
                 }
             }
+            // linux-lit: 0x100=MMHUBBUB_SOFT_RESET__DMUIF_SOFT_RESET_MASK
             update(io, l.dcn, HUB, 0x100, 0)?;
+            // linux-lit: 19=DMCUB_CNTL__DMCUB_TRACEPORT_EN__SHIFT
             update(io, l.dcn, CNTL, ENABLE | (1 << 19), ENABLE | (1 << 19))?;
             update(io, l.dcn, CNTL, RESET, 0)?;
             Ok(())
@@ -478,6 +510,7 @@ impl<I: Io> Engine<I> {
             let status = self.access(|io| {
                 let status = read(io, l.dcn, STATUS)?;
                 let control = read(io, l.dcn, CNTL)?;
+                // linux-lit: 3=DMUB_FW_BOOT_STATUS_BIT_DAL_FIRMWARE | DMUB_FW_BOOT_STATUS_BIT_MAILBOX_READY
                 Ok((status & 3 == 3 && control & (RESET | ENABLE) == ENABLE).then_some(status))
             })?;
             if let Some(boot_status) = status {
@@ -494,6 +527,80 @@ impl<I: Io> Engine<I> {
             }
             tick().await;
         }
+    }
+}
+/// `DMUB_CMD__VBIOS` (dmub_cmd.h `enum dmub_cmd_type` 128) sub-types: the
+/// VBIOS command tables DC sends to DMCUB instead of the ATOM interpreter
+/// when `dc->debug.dmub_command_table` is set (dcn30_resource.c), from
+/// command_table2.c's `*_dmcub` helpers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VbiosCommand {
+    /// `DMUB_CMD__VBIOS_DIGX_ENCODER_CONTROL`: `dig_encoder_control_parameters_v1_5`.
+    DigxEncoderControl = 0, // linux: DMUB_CMD__VBIOS_DIGX_ENCODER_CONTROL
+    /// `DMUB_CMD__VBIOS_DIG1_TRANSMITTER_CONTROL`: the v1.6 parameters or
+    /// `dmub_dig_transmitter_control_data_v1_7`.
+    Dig1TransmitterControl = 1, // linux: DMUB_CMD__VBIOS_DIG1_TRANSMITTER_CONTROL
+    /// `DMUB_CMD__VBIOS_SET_PIXEL_CLOCK`: `set_pixel_clock_parameter_v1_7`.
+    SetPixelClock = 2, // linux: DMUB_CMD__VBIOS_SET_PIXEL_CLOCK
+    /// `DMUB_CMD__VBIOS_ENABLE_DISP_POWER_GATING`:
+    /// `enable_disp_power_gating_parameters_v2_1`.
+    EnableDispPowerGating = 3, // linux: DMUB_CMD__VBIOS_ENABLE_DISP_POWER_GATING
+}
+const DMUB_CMD_VBIOS: u8 = 128; // linux: DMUB_CMD__VBIOS
+/// dc_dmub_srv.c MAX_WAIT_US: dmub_srv_wait_for_idle's bound.
+const VBIOS_WAIT_US: u64 = 100_000; // linux: MAX_WAIT_US@dc
+impl VbiosCommand {
+    /// `sizeof(cmd.X) - sizeof(cmd.X.header)` under dmub_cmd.h's
+    /// `#pragma pack(1)`: the payload union/struct size.
+    pub const fn payload_bytes(self) -> usize {
+        match self {
+            Self::DigxEncoderControl => 12,
+            Self::Dig1TransmitterControl => 60,
+            Self::SetPixelClock => 16,
+            Self::EnableDispPowerGating => 4,
+        }
+    }
+}
+/// The 64-byte `union dmub_rb_cmd` command_table2.c builds: memset 0, then
+/// header.type/sub_type/payload_bytes (ret_status, multi_cmd_pending and
+/// is_reg_based stay 0) and the parameter block after the 4-byte header.
+pub(crate) fn vbios_request(command: VbiosCommand, payload: &[u8]) -> Result<[u8; 64], Error> {
+    let size = command.payload_bytes();
+    if payload.len() != size {
+        return Err(Error::Invalid);
+    }
+    let mut request = [0u8; 64];
+    request[0] = DMUB_CMD_VBIOS;
+    request[1] = command as u8;
+    request[3] = size as u8;
+    request[4..4 + size].copy_from_slice(payload);
+    Ok(request)
+}
+impl<I: Io> Engine<I> {
+    /// `dc_wake_and_execute_dmub_cmd(..., DM_DMUB_WAIT_TYPE_WAIT)`: queue,
+    /// execute, then wait (bounded, 100 ms) for the inbox to drain. Callers
+    /// are the synchronous VBIOS table paths, so the wait polls in place as
+    /// dmub_srv_wait_for_idle does (udelay(1) per poll).
+    fn vbios(&mut self, command: VbiosCommand, payload: &[u8]) -> Result<(), Error> {
+        let request = vbios_request(command, payload)?;
+        self.begin_mailbox()?;
+        let result = (|| {
+            let posted = self.post(&request)?;
+            let deadline = narf_time::Deadline::after_us(VBIOS_WAIT_US);
+            loop {
+                if self.consumed(&request, posted)?.is_some() {
+                    return Ok(());
+                }
+                if deadline.expired() {
+                    return Err(Error::CommandTimeout);
+                }
+                let poll = narf_time::Deadline::after_us(1);
+                while !poll.expired() {
+                    core::hint::spin_loop();
+                }
+            }
+        })();
+        self.finish_mailbox(result)
     }
 }
 #[derive(Debug)]
@@ -533,7 +640,8 @@ impl Dmub {
         })
     }
     /// Stop inherited firmware and hold DCN3.0 reset before PSP replaces CW0/1.
-    /// A missing STOP acknowledgement fails without attempting forced recovery.
+    /// A missing STOP acknowledgement forces the reset (dmub_dcn20_reset);
+    /// `Unsupported` means the DMCUB is fused off (no DMUB on this board).
     pub async fn quiesce(&mut self) -> Result<(), Error> {
         self.engine.quiesce().await
     }
@@ -557,6 +665,17 @@ impl Dmub {
     }
     pub fn state(&self) -> State {
         self.engine.state
+    }
+    /// DC's `dc->ctx->dmub_srv` test: firmware running with an idle mailbox,
+    /// so VBIOS display tables go to DMCUB rather than the ATOM interpreter.
+    pub fn vbios_ready(&self) -> bool {
+        self.engine.state == State::Running && self.engine.mailbox.state == MailboxState::Ready
+    }
+    /// Execute one VBIOS command table on DMCUB (command_table2.c
+    /// `*_dmcub`). `payload` is exactly [`VbiosCommand::payload_bytes`].
+    /// Synchronous and bounded (100 ms); a timeout fails the mailbox.
+    pub fn execute_vbios(&mut self, command: VbiosCommand, payload: &[u8]) -> Result<(), Error> {
+        self.engine.vbios(command, payload)
     }
     pub fn status(&self) -> Option<Status> {
         self.engine.status

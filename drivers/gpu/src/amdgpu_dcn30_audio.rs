@@ -55,121 +55,216 @@ pub enum Reg {
 }
 
 // DCCG audio wall clock, base index 1.
+// linux-ctx: hdr=dcn seg=1
+// linux-lit: 0x00ab=mmDCCG_AUDIO_DTO_SOURCE
 const AUDIO_DTO_SOURCE: Reg = Reg::Bank1(0x00ab);
+// linux-lit: 0x00ac=mmDCCG_AUDIO_DTO0_PHASE
 const AUDIO_DTO0_PHASE: Reg = Reg::Bank1(0x00ac);
+// linux-lit: 0x00ad=mmDCCG_AUDIO_DTO0_MODULE
 const AUDIO_DTO0_MODULE: Reg = Reg::Bank1(0x00ad);
+// linux-lit: 0x00ae=mmDCCG_AUDIO_DTO1_PHASE
 const AUDIO_DTO1_PHASE: Reg = Reg::Bank1(0x00ae);
+// linux-lit: 0x00af=mmDCCG_AUDIO_DTO1_MODULE
 const AUDIO_DTO1_MODULE: Reg = Reg::Bank1(0x00af);
+// linux: DCCG_AUDIO_DTO_SOURCE__DCCG_AUDIO_DTO0_SOURCE_SEL_MASK
 const DTO0_SOURCE_SEL: u32 = 0x7;
+// linux: DCCG_AUDIO_DTO_SOURCE__DCCG_AUDIO_DTO_SEL_MASK
 const DTO_SEL: u32 = 0x30;
+// linux: DCCG_AUDIO_DTO_SOURCE__DCCG_AUDIO_DTO2_USE_512FBR_DTO_MASK
 const DTO2_USE_512FBR_DTO: u32 = 1 << 20;
 /// `get_azalia_clock_info_*`: 24 MHz in 100 Hz units.
+// linux: n/a (literal 24 * 10000 in dce_audio.c:get_azalia_clock_info_hdmi/_dp)
 const DTO_PHASE: u32 = 24 * 10_000;
 /// `dcn3_clk_mgr_construct`'s DPREFCLK: the dump it would refine is never
 /// filled on DCN3.0, and atomfirmware reports no GPU_PLL spread, so
 /// `dce12_get_dp_ref_freq_khz` returns this constant.
+// linux: n/a (literal in dcn30_clk_mgr.c:dcn3_clk_mgr_construct)
 pub const DPREFCLK_KHZ: u32 = 730_000;
-const LAST_BANK1: u32 = 0x00af;
+const LAST_BANK1: u32 = 0x00af; // linux: mmDCCG_AUDIO_DTO1_MODULE
 
 // Azalia, base index 2.
+// linux-ctx: hdr=dcn seg=2
+// linux: mmAZF0ENDPOINT0_AZALIA_F0_CODEC_ENDPOINT_INDEX
 const AZ_ENDPOINT_INDEX: u64 = 0x0386;
+// linux: mmAZF0ENDPOINT1_AZALIA_F0_CODEC_ENDPOINT_INDEX - mmAZF0ENDPOINT0_AZALIA_F0_CODEC_ENDPOINT_INDEX
 const AZ_ENDPOINT_STRIDE: u64 = 6;
+// linux: AZF0ENDPOINT0_AZALIA_F0_CODEC_ENDPOINT_INDEX__AZALIA_ENDPOINT_REG_INDEX_MASK
 const AZ_REG_INDEX: u32 = 0x3fff;
 /// `res_cap_dcn3.num_audio`; the header has an eighth endpoint DC never uses.
+// linux: n/a (res_cap_dcn3.num_audio = 6, literal in dcn30_resource.c)
 pub const ENDPOINTS: u8 = 6;
+// linux-lit: 0x040b=mmAZALIA_F0_CODEC_FUNCTION_PARAMETER_SUPPORTED_SIZE_RATES
 const SUPPORTED_SIZE_RATES: Reg = Reg::Bank2(0x040b);
+// linux-lit: 0x040c=mmAZALIA_F0_CODEC_FUNCTION_PARAMETER_STREAM_FORMATS
 const STREAM_FORMATS: Reg = Reg::Bank2(0x040c);
+// linux-lit: 0x040d=mmAZALIA_F0_CODEC_FUNCTION_PARAMETER_POWER_STATES
 const POWER_STATES: Reg = Reg::Bank2(0x040d);
+// linux: AZALIA_F0_CODEC_FUNCTION_PARAMETER_SUPPORTED_SIZE_RATES__AUDIO_RATE_CAPABILITIES_MASK
 const AUDIO_RATE_CAPABILITIES: u32 = 0xfff;
+// linux: AZALIA_F0_CODEC_FUNCTION_PARAMETER_POWER_STATES__CLKSTOP_MASK | AZALIA_F0_CODEC_FUNCTION_PARAMETER_POWER_STATES__EPSS_MASK
 const CLKSTOP_EPSS: u32 = 0xc000_0000;
 // Endpoint indirect indices (dce_11_0_d.h ixAZALIA_F0_CODEC_PIN_CONTROL_*).
+// linux-ctx: hdr=dcn
+// linux: ixAZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_CHANNEL_SPEAKER
 const AZ_SPEAKER: u32 = 0x25;
+// linux: n/a (ixAZALIA_F0_CODEC_PIN_CONTROL_ACP_DATA = 0x27 in dce_11_0_d.h; absent from dcn_3_0_0 and the checker sets)
 const AZ_ACP: u32 = 0x27;
+// linux: ixAZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR0
 const AZ_DESCRIPTOR0: u32 = 0x28;
+// linux: ixAZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_LIPSYNC
 const AZ_LIPSYNC: u32 = 0x37;
+// linux: ixAZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_HBR
 const AZ_HBR: u32 = 0x38;
+// linux: ixAZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_SINK_INFO0
 const AZ_SINK_INFO0: u32 = 0x3a;
+// linux: ixAZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_HOT_PLUG_CONTROL
 const AZ_HOT_PLUG: u32 = 0x54;
+// linux: ixAZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT
 const AZ_CONFIG_DEFAULT: u32 = 0x56;
+// linux: AZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_HOT_PLUG_CONTROL__CLOCK_GATING_DISABLE_MASK
 const CLOCK_GATING_DISABLE: u32 = 1 << 0;
+// linux: AZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_HOT_PLUG_CONTROL__AUDIO_ENABLED_MASK
 const AUDIO_ENABLED: u32 = 1 << 31;
+// linux: AZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_CHANNEL_SPEAKER__SPEAKER_ALLOCATION_MASK
 const SPEAKER_ALLOCATION: u32 = 0x7f;
+// linux: AZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_CHANNEL_SPEAKER__HDMI_CONNECTION_MASK
 const HDMI_CONNECTION: u32 = 1 << 16;
+// linux: AZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_CHANNEL_SPEAKER__DP_CONNECTION_MASK
 const DP_CONNECTION: u32 = 1 << 17;
 /// EXTRA_CONNECTION_INFO bit 0.
+// linux: 1 << AZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_CHANNEL_SPEAKER__EXTRA_CONNECTION_INFO__SHIFT
 const EXTRA_CONNECTION_INFO0: u32 = 1 << 18;
+// linux: AZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_CHANNEL_SPEAKER__LFE_PLAYBACK_LEVEL_MASK
 const LFE_PLAYBACK_LEVEL: u32 = 0x0300_0000;
+// linux: n/a (AZALIA_F0_CODEC_PIN_CONTROL_ACP_DATA__SUPPORTS_AI_MASK = 0x40 in dce_11_0_sh_mask.h; not in checker sets)
 const SUPPORTS_AI: u32 = 0x40;
+// linux: AZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_HBR__HBR_CAPABLE_MASK
 const HBR_CAPABLE: u32 = 1;
+// linux: AZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT__PORT_CONNECTIVITY__SHIFT
 const PORT_CONNECTIVITY_SHIFT: u32 = 30;
 /// amdgpu_dm's hard-coded `audio_info.port_id` when no container id exists.
+// linux: n/a (literals 0x5558859e / 0xd989449 in dc_stream.c:dc_stream_construct)
 const PORT_ID: [u32; 2] = [0x5558_859e, 0x0d98_9449];
 
 // Timing generator and DIG frontend, base index 2.
+// linux-ctx: hdr=dcn seg=2
+// linux: mmOTG0_OTG_CONTROL
 const OTG_CONTROL: u64 = 0x1b41;
+// linux: mmOTG1_OTG_CONTROL - mmOTG0_OTG_CONTROL
 const OTG_STRIDE: u64 = 0x80;
+// linux: OTG0_OTG_CONTROL__OTG_MASTER_EN_MASK
 const OTG_MASTER_EN: u32 = 1;
+// linux: mmDIG1_DIG_FE_CNTL - mmDIG0_DIG_FE_CNTL
 const STRIDE: u64 = 0x100;
+// linux: mmDIG0_DIG_FE_CNTL
 const DIG_FE_CNTL: u64 = 0x208b;
+// linux: DIG0_DIG_FE_CNTL__DIG_SOURCE_SELECT_MASK
 const DIG_SOURCE_SELECT: u32 = 0x7;
+// linux: mmDIG0_HDMI_AUDIO_PACKET_CONTROL
 const HDMI_AUDIO_PACKET_CONTROL: u64 = 0x2095;
+// linux: mmDIG0_HDMI_ACR_PACKET_CONTROL
 const HDMI_ACR_PACKET_CONTROL: u64 = 0x2096;
+// linux: mmDIG0_HDMI_INFOFRAME_CONTROL0
 const HDMI_INFOFRAME_CONTROL0: u64 = 0x2098;
+// linux: mmDIG0_HDMI_INFOFRAME_CONTROL1
 const HDMI_INFOFRAME_CONTROL1: u64 = 0x2099;
 /// HDMI_ACR_32_0/1, 44_0/1, 48_0/1.
+// linux: mmDIG0_HDMI_ACR_32_0
 const HDMI_ACR_32_0: u64 = 0x20a7;
+// linux: mmDIG0_AFMT_CNTL
 const AFMT_CNTL: u64 = 0x20af;
+// linux: DIG0_HDMI_AUDIO_PACKET_CONTROL__HDMI_AUDIO_DELAY_EN_MASK
 const HDMI_AUDIO_DELAY_EN: u32 = 0x30;
 /// HDMI_ACR_AUDIO_PRIORITY, HDMI_ACR_AUTO_SEND and HDMI_ACR_SOURCE.
+// linux: DIG0_HDMI_ACR_PACKET_CONTROL__HDMI_ACR_AUDIO_PRIORITY_MASK | DIG0_HDMI_ACR_PACKET_CONTROL__HDMI_ACR_AUTO_SEND_MASK | DIG0_HDMI_ACR_PACKET_CONTROL__HDMI_ACR_SOURCE_MASK
 const ACR_CONTROL: u32 = 0x8000_1100;
+// linux: DIG0_HDMI_ACR_PACKET_CONTROL__HDMI_ACR_AUTO_SEND_MASK
 const HDMI_ACR_AUTO_SEND: u32 = 1 << 12;
+// linux: DIG0_HDMI_ACR_32_0__HDMI_ACR_CTS_32_MASK
 const ACR_CTS: u32 = 0xffff_f000;
+// linux: DIG0_HDMI_ACR_32_1__HDMI_ACR_N_32_MASK
 const ACR_N: u32 = 0x000f_ffff;
+// linux: DIG0_HDMI_INFOFRAME_CONTROL0__HDMI_AUDIO_INFO_SEND_MASK
 const HDMI_AUDIO_INFO_SEND: u32 = 1 << 4;
+// linux: DIG0_HDMI_INFOFRAME_CONTROL0__HDMI_AUDIO_INFO_CONT_MASK
 const HDMI_AUDIO_INFO_CONT: u32 = 1 << 5;
+// linux: DIG0_HDMI_INFOFRAME_CONTROL1__HDMI_AUDIO_INFO_LINE_MASK
 const HDMI_AUDIO_INFO_LINE: u32 = 0x3f00;
 /// `VBI_LINE_0 + 2`.
+// linux: n/a (VBI_LINE_0 + 2, local #define in dcn30_dio_stream_encoder.c)
 const AUDIO_INFO_LINE: u32 = 2;
+// linux: DIG0_AFMT_CNTL__AFMT_AUDIO_CLOCK_EN_MASK
 const AFMT_AUDIO_CLOCK_EN: u32 = 1;
 // AFMT instance (per DIG), base index 2.
+// linux: mmAFMT0_AFMT_AUDIO_PACKET_CONTROL2
 const AFMT_AUDIO_PACKET_CONTROL2: u64 = 0x2075;
+// linux: mmAFMT0_AFMT_60958_0
 const AFMT_60958_0: u64 = 0x2078;
+// linux: mmAFMT0_AFMT_60958_1
 const AFMT_60958_1: u64 = 0x2079;
+// linux: mmAFMT0_AFMT_60958_2
 const AFMT_60958_2: u64 = 0x207f;
+// linux: mmAFMT0_AFMT_AUDIO_PACKET_CONTROL
 const AFMT_AUDIO_PACKET_CONTROL: u64 = 0x2082;
+// linux: mmAFMT0_AFMT_INFOFRAME_CONTROL0
 const AFMT_INFOFRAME_CONTROL0: u64 = 0x2083;
+// linux: mmAFMT0_AFMT_AUDIO_SRC_CONTROL
 const AFMT_AUDIO_SRC_CONTROL: u64 = 0x2085;
+// linux: mmAFMT0_AFMT_MEM_PWR
 const AFMT_MEM_PWR: u64 = 0x2087;
+// linux: AFMT0_AFMT_AUDIO_PACKET_CONTROL__AFMT_AUDIO_SAMPLE_SEND_MASK
 const AFMT_AUDIO_SAMPLE_SEND: u32 = 1;
+// linux: AFMT0_AFMT_AUDIO_PACKET_CONTROL__AFMT_60958_CS_UPDATE_MASK
 const AFMT_60958_CS_UPDATE: u32 = 1 << 26;
 /// AFMT_AUDIO_LAYOUT_OVRD and AFMT_60958_OSF_OVRD.
+// linux: AFMT0_AFMT_AUDIO_PACKET_CONTROL2__AFMT_AUDIO_LAYOUT_OVRD_MASK | AFMT0_AFMT_AUDIO_PACKET_CONTROL2__AFMT_60958_OSF_OVRD_MASK
 const AFMT_OVERRIDES: u32 = 0x1000_0001;
+// linux: AFMT0_AFMT_AUDIO_PACKET_CONTROL2__AFMT_AUDIO_CHANNEL_ENABLE_MASK
 const AFMT_AUDIO_CHANNEL_ENABLE: u32 = 0xff00;
+// linux: AFMT0_AFMT_60958_0__AFMT_60958_CS_CHANNEL_NUMBER_L_MASK
 const AFMT_60958_CS_CHANNEL_NUMBER_L: u32 = 0x00f0_0000;
+// linux: AFMT0_AFMT_60958_0__AFMT_60958_CS_CLOCK_ACCURACY_MASK
 const AFMT_60958_CS_CLOCK_ACCURACY: u32 = 0x3000_0000;
+// linux: AFMT0_AFMT_60958_1__AFMT_60958_CS_CHANNEL_NUMBER_R_MASK
 const AFMT_60958_CS_CHANNEL_NUMBER_R: u32 = 0x00f0_0000;
 /// CS channel numbers 2..7 as 3..8.
+// linux: (3 << AFMT0_AFMT_60958_2__AFMT_60958_CS_CHANNEL_NUMBER_2__SHIFT) | (4 << AFMT0_AFMT_60958_2__AFMT_60958_CS_CHANNEL_NUMBER_3__SHIFT) | (5 << AFMT0_AFMT_60958_2__AFMT_60958_CS_CHANNEL_NUMBER_4__SHIFT) | (6 << AFMT0_AFMT_60958_2__AFMT_60958_CS_CHANNEL_NUMBER_5__SHIFT) | (7 << AFMT0_AFMT_60958_2__AFMT_60958_CS_CHANNEL_NUMBER_6__SHIFT) | (8 << AFMT0_AFMT_60958_2__AFMT_60958_CS_CHANNEL_NUMBER_7__SHIFT)
 const AFMT_60958_CHANNELS_2_7: u32 = 0x0087_6543;
+// linux: AFMT0_AFMT_INFOFRAME_CONTROL0__AFMT_AUDIO_INFO_UPDATE_MASK
 const AFMT_AUDIO_INFO_UPDATE: u32 = 1 << 7;
+// linux: AFMT0_AFMT_AUDIO_SRC_CONTROL__AFMT_AUDIO_SRC_SELECT_MASK
 const AFMT_AUDIO_SRC_SELECT: u32 = 0x7;
+// linux: AFMT0_AFMT_MEM_PWR__AFMT_MEM_PWR_FORCE_MASK
 const AFMT_MEM_PWR_FORCE: u32 = 0x30;
 // DP stream encoder secondary data, base index 2.
+// linux: mmDP0_DP_SEC_CNTL
 const DP_SEC_CNTL: u64 = 0x212b;
+// linux: mmDP0_DP_SEC_AUD_N
 const DP_SEC_AUD_N: u64 = 0x2131;
+// linux: mmDP0_DP_SEC_TIMESTAMP
 const DP_SEC_TIMESTAMP: u64 = 0x2135;
+// linux: DP0_DP_SEC_CNTL__DP_SEC_STREAM_ENABLE_MASK
 const DP_SEC_STREAM_ENABLE: u32 = 1;
+// linux: DP0_DP_SEC_CNTL__DP_SEC_ASP_ENABLE_MASK
 const DP_SEC_ASP_ENABLE: u32 = 1 << 4;
 /// DP_SEC_ATP_ENABLE and DP_SEC_AIP_ENABLE.
+// linux: DP0_DP_SEC_CNTL__DP_SEC_ATP_ENABLE_MASK | DP0_DP_SEC_CNTL__DP_SEC_AIP_ENABLE_MASK
 const DP_SEC_ATP_AIP: u32 = 0x1100;
+// linux: DP0_DP_SEC_CNTL__DP_SEC_ACM_ENABLE_MASK
 const DP_SEC_ACM_ENABLE: u32 = 1 << 16;
 /// The DP_SEC_CNTL enables DP audio owns (ASP, ATP, AIP, ACM).
 const DP_SEC_AUDIO: u32 = DP_SEC_ASP_ENABLE | DP_SEC_ATP_AIP | DP_SEC_ACM_ENABLE;
 /// What a running stream's audio leaves set: ASP, ATP, AIP and the master.
 const DP_SEC_AUDIO_LIVE: u32 = DP_SEC_ASP_ENABLE | DP_SEC_ATP_AIP | DP_SEC_STREAM_ENABLE;
+// linux: n/a (DP_SEC_AUD_N__DP_SEC_AUD_N__DEFAULT, local #define in dcn30_dio_stream_encoder.c)
 const DP_SEC_AUD_N_DEFAULT: u32 = 0x8000;
+// linux: n/a (DP_SEC_TIMESTAMP__DP_SEC_TIMESTAMP_MODE__AUTO_CALC, local #define in dcn30_dio_stream_encoder.c)
 const DP_SEC_TIMESTAMP_MODE_AUTO_CALC: u32 = 1;
+// linux: mmDP5_DP_SEC_TIMESTAMP
 const LAST_BANK2: u32 = (DP_SEC_TIMESTAMP + 5 * STRIDE) as u32;
+// linux: n/a (NARF bound: six DIG stream encoders)
 const STREAMS: usize = 6;
+// linux-ctx: reset
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -313,6 +408,7 @@ pub fn plan(
     info: &AudioInfo,
     endpoint: u8,
 ) -> Result<(DisplayAudio, bool), Error> {
+    // linux-lit: 16=DC_MAX_AUDIO_DESC_COUNT
     if info.mode_count == 0 || info.mode_count > 16 {
         return Err(Error::Invalid);
     }
@@ -383,6 +479,7 @@ impl<I: Io> Engine<I> {
         Reg::Bank2(AZ_ENDPOINT_INDEX + u64::from(endpoint) * AZ_ENDPOINT_STRIDE)
     }
     fn az_data(endpoint: u8) -> Reg {
+        // linux-lit: 1=mmAZF0ENDPOINT0_AZALIA_F0_CODEC_ENDPOINT_DATA - mmAZF0ENDPOINT0_AZALIA_F0_CODEC_ENDPOINT_INDEX
         Reg::Bank2(AZ_ENDPOINT_INDEX + 1 + u64::from(endpoint) * AZ_ENDPOINT_STRIDE)
     }
     /// `read_indirect_azalia_reg`: index (REG_SET), then the data port.
@@ -416,11 +513,13 @@ impl<I: Io> Engine<I> {
             return Ok(n);
         }
         self.az_update(0, AZ_HOT_PLUG, CLOCK_GATING_DISABLE, CLOCK_GATING_DISABLE)?;
+        // linux: n/a (AUDIO_RATE_CAPABILITIES 0x70, literal in dce_audio.c:dce_aud_hw_init)
         self.update(SUPPORTED_SIZE_RATES, AUDIO_RATE_CAPABILITIES, 0x70)?;
         self.update(POWER_STATES, CLKSTOP_EPSS, CLKSTOP_EPSS)?;
         self.az_update(0, AZ_HOT_PLUG, CLOCK_GATING_DISABLE, 0)?;
         let mut count = 0;
         while count < ENDPOINTS {
+            // linux: n/a (PORT_CONNECTIVITY == 1, literal in dce_audio.c:dce_aud_endpoint_valid)
             if self.az_read(count, AZ_CONFIG_DEFAULT)? >> PORT_CONNECTIVITY_SHIFT == 1 {
                 break;
             }
@@ -459,10 +558,13 @@ impl<I: Io> Engine<I> {
                 DTO0_SOURCE_SEL | DTO_SEL,
                 u32::from(s.otg),
             )?;
+            // linux: n/a (kHz to 100 Hz; dce_audio.c:get_azalia_clock_info_hdmi)
             self.update(AUDIO_DTO0_MODULE, u32::MAX, s.timing.pixel_clock_khz * 10)?;
             self.update(AUDIO_DTO0_PHASE, u32::MAX, DTO_PHASE)
         } else if lowest(false).is_some() {
+            // linux-lit: 4=DCCG_AUDIO_DTO_SOURCE__DCCG_AUDIO_DTO_SEL__SHIFT
             self.update(AUDIO_DTO_SOURCE, DTO_SEL, 1 << 4)?;
+            // linux: n/a (kHz to 100 Hz, literal * 10 in dce_audio.c:get_azalia_clock_info_dp)
             self.update(AUDIO_DTO1_MODULE, u32::MAX, DPREFCLK_KHZ * 10)?;
             self.update(AUDIO_DTO1_PHASE, u32::MAX, DTO_PHASE)?;
             self.update(AUDIO_DTO_SOURCE, DTO2_USE_512FBR_DTO, DTO2_USE_512FBR_DTO)
@@ -477,6 +579,7 @@ impl<I: Io> Engine<I> {
         self.update(
             dig_reg(dig, AFMT_AUDIO_PACKET_CONTROL2),
             AFMT_AUDIO_CHANNEL_ENABLE,
+            // linux-lit: 8=AFMT0_AFMT_AUDIO_PACKET_CONTROL2__AFMT_AUDIO_CHANNEL_ENABLE__SHIFT
             u32::from(a.channels) << 8,
         )?;
         self.update(dig_reg(dig, AFMT_MEM_PWR), AFMT_MEM_PWR_FORCE, 0)
@@ -496,17 +599,23 @@ impl<I: Io> Engine<I> {
         self.update(
             at(AFMT_60958_0),
             AFMT_60958_CS_CHANNEL_NUMBER_L | AFMT_60958_CS_CLOCK_ACCURACY,
-            1 << 20,
+            1 << 20, // linux-lit: 20=AFMT0_AFMT_60958_0__AFMT_60958_CS_CHANNEL_NUMBER_L__SHIFT
         )?;
+        // linux-lit: 20=AFMT0_AFMT_60958_1__AFMT_60958_CS_CHANNEL_NUMBER_R__SHIFT
         self.update(at(AFMT_60958_1), AFMT_60958_CS_CHANNEL_NUMBER_R, 2 << 20)?;
+        // linux-lit: 0x00ff_ffff=AFMT0_AFMT_60958_2__AFMT_60958_CS_CHANNEL_NUMBER_2_MASK | AFMT0_AFMT_60958_2__AFMT_60958_CS_CHANNEL_NUMBER_3_MASK | AFMT0_AFMT_60958_2__AFMT_60958_CS_CHANNEL_NUMBER_4_MASK | AFMT0_AFMT_60958_2__AFMT_60958_CS_CHANNEL_NUMBER_5_MASK | AFMT0_AFMT_60958_2__AFMT_60958_CS_CHANNEL_NUMBER_6_MASK | AFMT0_AFMT_60958_2__AFMT_60958_CS_CHANNEL_NUMBER_7_MASK
         self.update(at(AFMT_60958_2), 0x00ff_ffff, AFMT_60958_CHANNELS_2_7)?;
+        // linux-lit: 4=DIG0_HDMI_AUDIO_PACKET_CONTROL__HDMI_AUDIO_DELAY_EN__SHIFT
         self.update(at(HDMI_AUDIO_PACKET_CONTROL), HDMI_AUDIO_DELAY_EN, 1 << 4)?;
         self.update(at(HDMI_ACR_PACKET_CONTROL), ACR_CONTROL, HDMI_ACR_AUTO_SEND)?;
         // get_audio_clock_info with requested = calculated pixel clock.
         let nc = otg::acr(TmdsDepth::Bpc8, s.timing.pixel_clock_khz);
         for (i, rate) in nc.chunks_exact(2).enumerate() {
+            // linux-lit: 2=mmDIG0_HDMI_ACR_44_0 - mmDIG0_HDMI_ACR_32_0
             let base = HDMI_ACR_32_0 + 2 * i as u64;
+            // linux-lit: 12=DIG0_HDMI_ACR_32_0__HDMI_ACR_CTS_32__SHIFT
             self.update(at(base), ACR_CTS, rate[1] << 12)?;
+            // linux-lit: 1=mmDIG0_HDMI_ACR_32_1 - mmDIG0_HDMI_ACR_32_0
             self.update(at(base + 1), ACR_N, rate[0])?;
         }
         self.audio_source(s.dig, a)
@@ -527,9 +636,12 @@ impl<I: Io> Engine<I> {
                 | LFE_PLAYBACK_LEVEL,
             u32::from(info.speakers) & SPEAKER_ALLOCATION | connection,
         )?;
+        // linux: n/a (SUPPORTS_AI__SHIFT 6 in dce_11_0_sh_mask.h, not in checker sets; bit 7 is NARF AudioInfo flags)
         self.az_update(e, AZ_ACP, SUPPORTS_AI, u32::from(info.speakers >> 7) << 6)?;
+        // linux-lit: 14=AUDIO_FORMAT_CODE_COUNT
         for code in 1u32..=14 {
             // One-bit audio and DST are never programmed.
+            // linux-lit: 9=AUDIO_FORMAT_CODE_1BITAUDIO; 13=AUDIO_FORMAT_CODE_DST
             if code == 9 || code == 13 {
                 continue;
             }
@@ -538,24 +650,34 @@ impl<I: Io> Engine<I> {
         }
         if ac3 {
             // Global, as Linux's own TODO notes.
+            // linux: n/a (literal 0x05 in dce_audio.c:dce_aud_az_configure)
             self.write(STREAM_FORMATS, 0x05)?;
         }
         self.az_update(e, AZ_HBR, HBR_CAPABLE, u32::from(a.hbr))?;
+        // linux-lit: 0xff=AZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_LIPSYNC__VIDEO_LIPSYNC_MASK
         self.az_update(e, AZ_LIPSYNC, 0xff, u32::from(info.video_latency))?;
+        // linux-lit: 0xff00=AZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_LIPSYNC__AUDIO_LIPSYNC_MASK; 8=AZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_LIPSYNC__AUDIO_LIPSYNC__SHIFT
         self.az_update(e, AZ_LIPSYNC, 0xff00, u32::from(info.audio_latency) << 8)?;
+        // linux-lit: 16=AZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_SINK_INFO0__PRODUCT_ID__SHIFT
         let id = u32::from(info.manufacturer_id) | u32::from(info.product_id) << 16;
         self.az_write(e, AZ_SINK_INFO0, id)?;
         let len = info
             .name
             .iter()
             .position(|b| *b == 0)
+            // linux: n/a (MAX_HW_AUDIO_INFO_DISPLAY_NAME_SIZE_IN_CHARS = 18, include/audio_types.h; not in checker sets)
             .map_or(18, |n| (n + 1).min(18));
+        // linux-lit: 1=ixAZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_SINK_INFO1 - ixAZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_SINK_INFO0
         self.az_write(e, AZ_SINK_INFO0 + 1, len as u32)?;
+        // linux-lit: 2=ixAZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_SINK_INFO2 - ixAZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_SINK_INFO0
         self.az_write(e, AZ_SINK_INFO0 + 2, PORT_ID[0])?;
+        // linux-lit: 3=ixAZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_SINK_INFO3 - ixAZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_SINK_INFO0
         self.az_write(e, AZ_SINK_INFO0 + 3, PORT_ID[1])?;
+        // linux: n/a (four DESCRIPTIONn bytes per SINK_INFO4..8 dword, dce_aud_az_configure)
         for (i, chunk) in info.name.chunks(4).enumerate() {
             let mut b = [0u8; 4];
             b[..chunk.len()].copy_from_slice(chunk);
+            // linux-lit: 4=ixAZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_SINK_INFO4 - ixAZF0ENDPOINT0_AZALIA_F0_CODEC_PIN_CONTROL_SINK_INFO0
             self.az_write(e, AZ_SINK_INFO0 + 4 + i as u32, u32::from_le_bytes(b))?;
         }
         self.az_update(e, AZ_HOT_PLUG, CLOCK_GATING_DISABLE, 0)
@@ -578,6 +700,7 @@ impl<I: Io> Engine<I> {
         self.update(
             at(HDMI_INFOFRAME_CONTROL1),
             HDMI_AUDIO_INFO_LINE,
+            // linux-lit: 8=DIG0_HDMI_INFOFRAME_CONTROL1__HDMI_AUDIO_INFO_LINE__SHIFT
             AUDIO_INFO_LINE << 8,
         )
     }
@@ -644,6 +767,7 @@ impl<I: Io> Engine<I> {
         self.expect(
             at(AFMT_AUDIO_PACKET_CONTROL2),
             AFMT_AUDIO_CHANNEL_ENABLE,
+            // linux-lit: 8=AFMT0_AFMT_AUDIO_PACKET_CONTROL2__AFMT_AUDIO_CHANNEL_ENABLE__SHIFT
             u32::from(a.channels) << 8,
         )?;
         if s.hdmi_signal() {
@@ -655,6 +779,7 @@ impl<I: Io> Engine<I> {
             self.expect(at(HDMI_ACR_PACKET_CONTROL), ACR_CONTROL, HDMI_ACR_AUTO_SEND)?;
         } else {
             self.expect(at(DP_SEC_CNTL), DP_SEC_AUDIO_LIVE, DP_SEC_AUDIO_LIVE)?;
+            // linux-lit: 1=DP0_DP_SEC_TIMESTAMP__DP_SEC_TIMESTAMP_MODE_MASK
             self.expect(at(DP_SEC_TIMESTAMP), 1, DP_SEC_TIMESTAMP_MODE_AUTO_CALC)?;
         }
         if self.az_read(a.endpoint, AZ_HOT_PLUG)? & (AUDIO_ENABLED | CLOCK_GATING_DISABLE)
@@ -845,8 +970,8 @@ impl Audio {
         Ok(Self(Engine::new_with(
             Mmio {
                 regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
-                bank1: bank(1, LAST_BANK1)?,
-                bank2: bank(2, LAST_BANK2)?,
+                bank1: bank(1, LAST_BANK1)?, // linux-lit: 1=mmDCCG_AUDIO_DTO_SOURCE_BASE_IDX
+                bank2: bank(2, LAST_BANK2)?, // linux-lit: 2=mmDIG0_DIG_FE_CNTL_BASE_IDX
             },
             authority,
         )))
