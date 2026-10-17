@@ -178,7 +178,15 @@ impl<I: Io> Engine<I> {
             })?;
             if let Some(version) = version {
                 if version != self.prepared.version {
-                    return Err(Error::Protocol);
+                    if super::STRICT_VERSION {
+                        return Err(Error::Protocol);
+                    }
+                    use core::fmt::Write;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: dmub firmware reports {version:#x}, header {:#x}",
+                        self.prepared.version
+                    );
                 }
                 break;
             }

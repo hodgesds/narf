@@ -141,6 +141,7 @@ pub enum Stage {
     MemoryHubs,
     Gart,
     Interrupts,
+    GoldenSettings,
     SdmaTest,
     InterruptTest,
     DmubStart,
@@ -156,7 +157,7 @@ pub enum Stage {
     Jpeg,
     MediaIbTests,
 }
-const STAGES: [Stage; 29] = [
+const STAGES: [Stage; 30] = [
     Stage::ResetOnInit,
     Stage::MemoryTraining,
     Stage::Sos,
@@ -175,9 +176,11 @@ const STAGES: [Stage; 29] = [
     // Linux enables IH (hw_init phase 1) after COMMON/GMC and before every
     // phase-2 engine. Its VRAM ring needs VMID0, so IH follows MemoryHubs.
     Stage::Interrupts,
+    // gfx_v10_0_hw_init's init_golden_registers: GFX precedes SDMA in the
+    // phase-2 pass, so GC golden settings land before SDMA starts.
+    Stage::GoldenSettings,
     Stage::SdmaTest,
     Stage::InterruptTest,
-    Stage::DmubStart,
     // gfx_v10_0_hw_init / cp_resume, sdma_v5_2_start, amdgpu_ib_ring_tests.
     Stage::Doorbells,
     Stage::GfxSetup,
@@ -188,6 +191,10 @@ const STAGES: [Stage; 29] = [
     Stage::IbTests,
     // Arms EOP/trap interrupts and routes them to fence waiters.
     Stage::FenceInterrupts,
+    // dm_dmub_hw_init. Linux runs it before GFX in the phase-2 pass, but no
+    // queue stage depends on DMUB; here it follows every queue/fence proof
+    // and is non-fatal, so a DMUB failure cannot cost GFX/SDMA/media.
+    Stage::DmubStart,
     // vcn_v3_0_hw_init, jpeg_v3_0_hw_init, then the multimedia part of
     // amdgpu_ib_ring_tests. Linux runs VCN/JPEG hw_init after GFX/SDMA in
     // the same phase-2 pass; here they follow every display, queue and fence
@@ -441,6 +448,24 @@ fn media_result(
         }
     }
 }
+/// Device loss and revoked authority stop the boot; any other DMUB failure
+/// leaves the owner Failed (storage retained) and the boot degraded: the
+/// display paths that need DMUB refuse a non-Running owner.
+fn dmub_result(result: Result<(), crate::amdgpu_dmub_navi22::Error>) -> Result<(), Error> {
+    use crate::amdgpu_dmub_navi22::Error as Dmub;
+    match result {
+        Ok(()) => Ok(()),
+        Err(error @ (Dmub::DeviceGone | Dmub::Revoked)) => Err(Error::Dmub(error)),
+        Err(error) => {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 DmubStart: degraded {error:?}"
+            );
+            Ok(())
+        }
+    }
+}
 async fn trap_round_trip(
     ih: &mut crate::amdgpu_ih_navi22::Ih,
     sdma: &mut crate::amdgpu_sdma_navi22::Sdma,
@@ -617,8 +642,16 @@ impl Backend for Hardware {
                 if let Some(dmub) = self.dmub.as_mut() {
                     // SAFETY: same exclusive GPU; trained VRAM, both hubs and
                     // protected power are ready. PSP/TMR remain retained here.
-                    unsafe { dmub.start(self.psp.as_ref().ok_or(Error::Invalid)?).await }
-                        .map_err(Error::Dmub)?;
+                    let result =
+                        unsafe { dmub.start(self.psp.as_ref().ok_or(Error::Invalid)?).await };
+                    dmub_result(result.map(|_| ()))?;
+                }
+            }
+            Stage::GoldenSettings => {
+                if let Some(queues) = self.queues.as_mut() {
+                    // SAFETY: RLC autoload completed (RlcBoot), no GC client
+                    // runs, and ColdBoot owns the whole GPU.
+                    unsafe { queues.gfx.golden() }.map_err(Error::Queues)?;
                 }
             }
             Stage::SdmaTest => {
