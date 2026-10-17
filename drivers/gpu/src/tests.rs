@@ -10010,8 +10010,24 @@ fn smoke_amdgpu_vm_gem_va_maps_and_validates() -> TestResult {
     if req(u::AMDGPU_VA_OP_REPLACE, RW, BASE_VA + 4096, 0, 4096).is_err() {
         return TestResult::Fail("REPLACE over a live range should succeed");
     }
-    if state.lookup(BASE_VA).is_some() {
-        return TestResult::Fail("REPLACE should have dropped the mapping it covered");
+    // As amdgpu_vm_bo_clear_mappings: REPLACE removes only the range it
+    // covers; the old mapping's ends stay mapped, the right one at its
+    // advanced offset.
+    match (
+        state.lookup(BASE_VA),
+        state.lookup(BASE_VA + 4096),
+        state.lookup(BASE_VA + 8192),
+    ) {
+        (Some(left), Some(new), Some(right))
+            if (left.va, left.size, left.offset) == (BASE_VA, 4096, 0)
+                && (new.va, new.size, new.offset) == (BASE_VA + 4096, 4096, 0)
+                && (right.va, right.size, right.offset) == (BASE_VA + 8192, 8192, 8192) => {}
+        _ => return TestResult::Fail("REPLACE should split the mapping it covered"),
+    }
+    if req(u::AMDGPU_VA_OP_UNMAP, RW, BASE_VA, 0, 4096).is_err()
+        || req(u::AMDGPU_VA_OP_UNMAP, RW, BASE_VA + 8192, 0, 8192).is_err()
+    {
+        return TestResult::Fail("UNMAP of the remainders");
     }
 
     // UNMAP names a mapping exactly; a partial range is EINVAL and an absent
@@ -10096,15 +10112,19 @@ fn smoke_amdgpu_vm_gem_va_maps_and_validates() -> TestResult {
         return TestResult::Fail("a VA map naming a foreign GEM handle must be refused");
     }
 
-    // CLEAR drops whatever intersects, and succeeds on an empty range.
+    // CLEAR removes the range from whatever intersects it, keeping the ends
+    // (amdgpu_vm_bo_clear_mappings), and succeeds on an empty range.
     if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA, 0, 16384).is_err() {
         return TestResult::Fail("re-MAP after the validation cases failed");
     }
     if req(u::AMDGPU_VA_OP_CLEAR, RW, BASE_VA + 4096, 0, 4096).is_err() {
         return TestResult::Fail("CLEAR should succeed");
     }
-    if state.mapping_count() != 0 {
-        return TestResult::Fail("CLEAR should have dropped the intersecting mapping");
+    if state.mapping_count() != 2 || state.lookup(BASE_VA + 4096).is_some() {
+        return TestResult::Fail("CLEAR should have split the intersecting mapping");
+    }
+    if req(u::AMDGPU_VA_OP_CLEAR, RW, BASE_VA, 0, 16384).is_err() || state.mapping_count() != 0 {
+        return TestResult::Fail("CLEAR of the whole span");
     }
     if req(u::AMDGPU_VA_OP_CLEAR, RW, BASE_VA, 0, 4096).is_err() {
         return TestResult::Fail("CLEAR of an empty range should still succeed");
@@ -10880,6 +10900,228 @@ fn smoke_amdgpu_vm_geometry_follows_the_card() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_vm_geometry_follows_the_card
+);
+
+/// GEM_CREATE on an amdgpu open, returning the handle or the error.
+fn gem_create_on(
+    gem: &crate::amdgpu_gem::GemState,
+    bytes: u64,
+    domains: u32,
+) -> Result<u32, narf_filesystem::FsError> {
+    use crate::amdgpu_uapi as u;
+    let mut create = [0u8; 32];
+    create[0..8].copy_from_slice(&bytes.to_le_bytes());
+    create[16..24].copy_from_slice(&(domains as u64).to_le_bytes());
+    crate::amdgpu_gem::dispatch(
+        crate::drm_uapi::DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        create.as_mut_ptr() as usize,
+        gem,
+    )?;
+    Ok(u32::from_le_bytes(create[0..4].try_into().unwrap()))
+}
+
+/// GEM_VA `op` of `size` bytes of `handle` at `offset`, at `va`.
+fn gem_va_on(
+    vm: &crate::amdgpu_vm::VmState,
+    gem: &crate::amdgpu_gem::GemState,
+    op: u32,
+    handle: u32,
+    va: u64,
+    offset: u64,
+    size: u64,
+) -> Result<u64, narf_filesystem::FsError> {
+    use crate::amdgpu_uapi as u;
+    let mut map = [0u8; 40];
+    map[0..4].copy_from_slice(&handle.to_le_bytes());
+    map[8..12].copy_from_slice(&op.to_le_bytes());
+    map[12..16]
+        .copy_from_slice(&(u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE).to_le_bytes());
+    map[16..24].copy_from_slice(&va.to_le_bytes());
+    map[24..32].copy_from_slice(&offset.to_le_bytes());
+    map[32..40].copy_from_slice(&size.to_le_bytes());
+    crate::amdgpu_vm::dispatch(
+        crate::drm_uapi::DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA,
+        map.as_mut_ptr() as usize,
+        vm,
+        gem,
+    )
+}
+
+/// A mapping keeps its buffer alive (Linux's `bo_va` holds the BO): closing
+/// the handle leaves the mapping, its entries and its pages, and the last
+/// reference goes with the mapping. A CLEAR of a mapping's middle splits it
+/// as `amdgpu_vm_bo_clear_mappings` does: the ends stay mapped (the right
+/// one at its advanced offset) and only the cleared entries go.
+fn smoke_amdgpu_vm_mappings_hold_their_buffers() -> TestResult {
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{VmState, GPU_PAGE_SIZE as P, PTE_VALID};
+    let gem = GemState::new();
+    let vm = VmState::new();
+    let Ok(handle) = gem_create_on(&gem, 4 * P, u::AMDGPU_GEM_DOMAIN_GTT) else {
+        return TestResult::Fail("setup: GEM_CREATE");
+    };
+    let va = 0x2_0000_0000u64;
+    if gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_MAP, handle, va, 0, 4 * P).is_err() {
+        return TestResult::Fail("setup: MAP");
+    }
+    let phys = gem.object(handle).unwrap().phys;
+    let mut close = [0u8; 8];
+    close[0..4].copy_from_slice(&handle.to_le_bytes());
+    let _ = crate::amdgpu_gem::dispatch(0x09, close.as_mut_ptr() as usize, &gem);
+    if gem.object(handle).is_some() {
+        return TestResult::Fail("setup: close");
+    }
+    match vm.mapped_object(va) {
+        Some(o) if o.phys == phys && alloc::sync::Arc::strong_count(&o) == 2 => {}
+        _ => return TestResult::Fail("closed handle freed a mapped buffer"),
+    }
+    if vm
+        .leaf_entry(va)
+        .is_none_or(|e| e & PTE_VALID == 0 || e & 0xffff_ffff_f000 != phys)
+    {
+        return TestResult::Fail("mapping lost its entries");
+    }
+    // CLEAR the middle two pages: one-page pieces remain at each end.
+    if gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_CLEAR, 0, va + P, 0, 2 * P).is_err() {
+        return TestResult::Fail("CLEAR");
+    }
+    let (left, right) = (vm.lookup(va), vm.lookup(va + 3 * P));
+    let valid = |a| vm.leaf_entry(a).is_some_and(|e| e & PTE_VALID != 0);
+    match (left, right) {
+        (Some(l), Some(r))
+            if (l.va, l.size, l.offset) == (va, P, 0)
+                && (r.va, r.size, r.offset) == (va + 3 * P, P, 3 * P)
+                && vm.lookup(va + P).is_none()
+                && vm.lookup(va + 2 * P).is_none()
+                && valid(va)
+                && valid(va + 3 * P)
+                && !valid(va + P)
+                && !valid(va + 2 * P)
+                && vm.leaf_entry(va + 3 * P).unwrap() & 0xffff_ffff_f000 == phys + 3 * P => {}
+        _ => return TestResult::Fail("split CLEAR"),
+    }
+    // Both pieces hold the buffer; unmapping both releases it.
+    if gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_UNMAP, 0, va, 0, P).is_err()
+        || gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_UNMAP, 0, va + 3 * P, 0, P).is_err()
+        || vm.mapped_object(va).is_some()
+        || vm.mapped_object(va + 3 * P).is_some()
+        || vm.mapping_count() != 0
+    {
+        return TestResult::Fail("unmapping the pieces");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_vm_mappings_hold_their_buffers
+);
+
+/// On a card with a registered VRAM heap, a buffer allowed in VRAM is a
+/// zeroed pool reservation: the CPU maps its BAR window, and its entries
+/// carry the physical VRAM address (`address - fb_base + fb_offset`)
+/// without SYSTEM or SNOOPED. GTT-only buffers, and VRAM|GTT ones once the
+/// heap is full, are system pages; a VRAM-only buffer then fails.
+fn smoke_amdgpu_gem_places_buffers_in_card_vram() -> TestResult {
+    use crate::amdgpu_gem::{register_vram_heap, unregister_vram_heap, GemState, VramHeap};
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{VmState, GPU_PAGE_SIZE as P, PTE_SNOOPED, PTE_SYSTEM, PTE_VALID};
+    // Four RAM pages stand in for a CPU-visible VRAM window.
+    let Ok(frame) = narf_memory::frame::alloc_pages_on(0, 2) else {
+        return TestResult::Fail("setup: frames");
+    };
+    let phys = frame.start_address().raw();
+    let virt = narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>();
+    // SAFETY: the four pages were just allocated for this test.
+    unsafe { core::ptr::write_bytes(virt, 0xaa, 4 * P as usize) };
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(phys),
+        virt: virt as u64,
+        len: 4 * P,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    let fb_base = 0x80_0000_0000u64;
+    // SAFETY: the window is owned by this test; nothing else uses it.
+    let Ok(pool) = (unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, fb_base) }) else {
+        return TestResult::Fail("setup: pool");
+    };
+    let card = 0x7fff_0000;
+    register_vram_heap(
+        card,
+        VramHeap {
+            pool,
+            fb_base,
+            fb_offset: 0x1_0000_0000,
+        },
+    );
+    let gem = GemState::for_card(card);
+    let vm = VmState::new();
+    let result = (|| {
+        let vram = gem_create_on(&gem, 2 * P, u::AMDGPU_GEM_DOMAIN_VRAM).ok()?;
+        let o = gem.object(vram)?;
+        // SAFETY: the window's first two pages back this buffer.
+        let zeroed = unsafe { core::slice::from_raw_parts(virt, 2 * P as usize) }
+            .iter()
+            .all(|b| *b == 0);
+        if o.system || o.phys != phys || o.gpu != 0x1_0000_0000 || !zeroed {
+            return None;
+        }
+        gem_va_on(
+            &vm,
+            &gem,
+            u::AMDGPU_VA_OP_MAP,
+            vram,
+            0x3_0000_0000,
+            0,
+            2 * P,
+        )
+        .ok()?;
+        let e = vm.leaf_entry(0x3_0000_1000)?;
+        if e & PTE_VALID == 0
+            || e & (PTE_SYSTEM | PTE_SNOOPED) != 0
+            || e & 0xffff_ffff_f000 != 0x1_0000_1000
+        {
+            return None;
+        }
+        // GTT-only stays system memory on this card.
+        let gtt = gem_create_on(&gem, P, u::AMDGPU_GEM_DOMAIN_GTT).ok()?;
+        if !gem.object(gtt)?.system {
+            return None;
+        }
+        // Two pages left: a three-page VRAM|GTT buffer falls back to GTT,
+        // a three-page VRAM-only one fails.
+        let both = gem_create_on(
+            &gem,
+            3 * P,
+            u::AMDGPU_GEM_DOMAIN_VRAM | u::AMDGPU_GEM_DOMAIN_GTT,
+        )
+        .ok()?;
+        if !gem.object(both)?.system
+            || gem_create_on(&gem, 3 * P, u::AMDGPU_GEM_DOMAIN_VRAM)
+                != Err(narf_filesystem::FsError::NoSpace)
+        {
+            return None;
+        }
+        // Unmapped and closed, the reservation returns to the pool.
+        gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_UNMAP, 0, 0x3_0000_0000, 0, 2 * P).ok()?;
+        drop(o);
+        let mut close = [0u8; 8];
+        close[0..4].copy_from_slice(&vram.to_le_bytes());
+        let _ = crate::amdgpu_gem::dispatch(0x09, close.as_mut_ptr() as usize, &gem);
+        let again = gem_create_on(&gem, 4 * P, u::AMDGPU_GEM_DOMAIN_VRAM).ok()?;
+        (!gem.object(again)?.system).then_some(())
+    })();
+    unregister_vram_heap(card);
+    drop(gem);
+    narf_memory::frame::free_pages(frame, 2);
+    if result.is_none() {
+        return TestResult::Fail("VRAM placement");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_gem_places_buffers_in_card_vram
 );
 
 /// `AMDGPU_CS`'s parser against the input a hostile client would send.

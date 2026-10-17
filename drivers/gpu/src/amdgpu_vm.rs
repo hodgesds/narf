@@ -463,11 +463,13 @@ pub const fn strip_hole(va: u64) -> u64 {
 /// `amdgpu_vm.c`: `flags = AMDGPU_PTE_VALID | AMDGPU_PTE_SNOOPED | ...` with
 /// readable/writeable/executable added for a normal mapping.
 pub fn base_flags(system: bool) -> u64 {
-    let mut flags = PTE_VALID | PTE_SNOOPED;
+    // amdgpu_ttm_tt_pte_flags: system pages are SYSTEM and (cached) SNOOPED;
+    // VRAM is neither.
     if system {
-        flags |= PTE_SYSTEM;
+        PTE_VALID | PTE_SYSTEM | PTE_SNOOPED
+    } else {
+        PTE_VALID
     }
-    flags
 }
 
 /// [`PteFormat::Nv10`]'s `pte_flags`, with `bo_uncached` standing for a
@@ -507,6 +509,15 @@ pub struct Mapping {
     pub vm_flags: u32,
 }
 
+/// A recorded mapping and the buffer it maps. The record keeps the buffer
+/// alive (`amdgpu_bo_va` holds its BO in Linux): a client that closes the
+/// handle while the mapping exists must not free pages the tables point at.
+#[derive(Clone, Debug)]
+struct Entry {
+    mapping: Mapping,
+    object: alloc::sync::Arc<crate::amdgpu_gem::GemObject>,
+}
+
 /// Per-open GPU address space.
 ///
 /// Keyed by start address so an overlap check is two neighbour lookups rather
@@ -515,7 +526,7 @@ pub struct Mapping {
 #[derive(Debug)]
 pub struct VmState {
     geometry: Geometry,
-    mappings: IrqSafeSpinLock<Option<BTreeMap<u64, Mapping>>>,
+    mappings: IrqSafeSpinLock<Option<BTreeMap<u64, Entry>>>,
     /// The root page directory and the hierarchy beneath it. `None` until the
     /// first mapping, so an open that never submits allocates nothing.
     root: IrqSafeSpinLock<Option<Node>>,
@@ -563,15 +574,25 @@ impl VmState {
         let map = g.as_ref()?;
         map.range(..=va)
             .next_back()
-            .map(|(_, m)| *m)
+            .map(|(_, e)| e.mapping)
             .filter(|m| va < m.va.saturating_add(m.size))
     }
 
-    fn overlaps(map: &BTreeMap<u64, Mapping>, va: u64, size: u64) -> bool {
+    /// The buffer the mapping covering `va` holds alive, if any.
+    pub fn mapped_object(&self, va: u64) -> Option<alloc::sync::Arc<crate::amdgpu_gem::GemObject>> {
+        let g = self.mappings.lock();
+        g.as_ref()?
+            .range(..=va)
+            .next_back()
+            .filter(|(_, e)| va < e.mapping.va.saturating_add(e.mapping.size))
+            .map(|(_, e)| e.object.clone())
+    }
+
+    fn overlaps(map: &BTreeMap<u64, Entry>, va: u64, size: u64) -> bool {
         let end = va.saturating_add(size);
         // The mapping starting at or before `va`, and the one after it.
         if let Some((_, prev)) = map.range(..=va).next_back() {
-            if va < prev.va.saturating_add(prev.size) {
+            if va < prev.mapping.va.saturating_add(prev.mapping.size) {
                 return true;
             }
         }
@@ -583,7 +604,12 @@ impl VmState {
         false
     }
 
-    fn insert(&self, mapping: Mapping, replace: bool) -> Result<(), FsError> {
+    fn insert(
+        &self,
+        mapping: Mapping,
+        object: alloc::sync::Arc<crate::amdgpu_gem::GemObject>,
+        replace: bool,
+    ) -> Result<(), FsError> {
         let mut g = self.mappings.lock();
         let map = g.get_or_insert_with(BTreeMap::new);
         if replace {
@@ -593,20 +619,55 @@ impl VmState {
             // the op that asks for one to be dropped.
             return Err(FsError::InvalidData);
         }
-        map.insert(mapping.va, mapping);
+        map.insert(mapping.va, Entry { mapping, object });
         Ok(())
     }
 
-    /// Drop every mapping intersecting `[va, va+size)`.
-    fn clear_range(map: &mut BTreeMap<u64, Mapping>, va: u64, size: u64) {
+    /// `amdgpu_vm_bo_clear_mappings`: remove `[va, va+size)` from every
+    /// mapping it intersects. A mapping that reaches past either end keeps
+    /// the remainder, its offset advanced for the right-hand piece, so the
+    /// record still covers every entry left in the tables (the caller
+    /// clears exactly the requested range's entries) and keeps its buffer.
+    fn clear_range(map: &mut BTreeMap<u64, Entry>, va: u64, size: u64) {
         let end = va.saturating_add(size);
         let doomed: Vec<u64> = map
             .iter()
-            .filter(|(_, m)| m.va < end && va < m.va.saturating_add(m.size))
+            .filter(|(_, e)| e.mapping.va < end && va < e.mapping.va.saturating_add(e.mapping.size))
             .map(|(k, _)| *k)
             .collect();
         for k in doomed {
-            map.remove(&k);
+            let Some(Entry { mapping: m, object }) = map.remove(&k) else {
+                continue;
+            };
+            let m_end = m.va.saturating_add(m.size);
+            if m.va < va {
+                let left = Mapping {
+                    size: va - m.va,
+                    ..m
+                };
+                map.insert(
+                    left.va,
+                    Entry {
+                        mapping: left,
+                        object: object.clone(),
+                    },
+                );
+            }
+            if end < m_end {
+                let right = Mapping {
+                    va: end,
+                    size: m_end - end,
+                    offset: m.offset + (end - m.va),
+                    ..m
+                };
+                map.insert(
+                    right.va,
+                    Entry {
+                        mapping: right,
+                        object,
+                    },
+                );
+            }
         }
     }
 
@@ -615,7 +676,7 @@ impl VmState {
         let map = g.get_or_insert_with(BTreeMap::new);
         // UNMAP names an existing mapping exactly; Linux answers -ENOENT when
         // no mapping starts there.
-        match map.get(&va) {
+        match map.get(&va).map(|e| e.mapping) {
             Some(m) if m.size == size => {
                 map.remove(&va);
                 Ok(())
@@ -754,10 +815,11 @@ pub fn dispatch(
                 offset,
                 vm_flags: flags,
             };
-            vm.insert(mapping, replace)?;
+            vm.insert(mapping, object.clone(), replace)?;
             // The buffer's creation flags can force the memory type (and on
-            // GMC 12 set DCC), whatever the mapping asked for.
-            if let Err(error) = vm.materialise(&mapping, object.phys, object.flags) {
+            // GMC 12 set DCC), whatever the mapping asked for; its placement
+            // decides the entry address and whether it is system memory.
+            if let Err(error) = vm.materialise(&mapping, object.gpu, object.system, object.flags) {
                 // Leave neither half-written tables nor a mapping record
                 // claiming translations that do not exist.
                 vm.dematerialise(va, size);
@@ -916,11 +978,17 @@ impl VmState {
     /// hardware to walk. Doing that needs the fragment logic in
     /// `amdgpu_vm_pt_update_range`, and getting it wrong maps more than was
     /// asked for — so the slow, exact form comes first.
-    fn materialise(&self, mapping: &Mapping, phys_base: u64, bo_flags: u64) -> Result<(), FsError> {
+    fn materialise(
+        &self,
+        mapping: &Mapping,
+        phys_base: u64,
+        system: bool,
+        bo_flags: u64,
+    ) -> Result<(), FsError> {
         let geometry = self.geometry;
         let flags = geometry
             .format
-            .pte_flags(base_flags(true), mapping.vm_flags, bo_flags);
+            .pte_flags(base_flags(system), mapping.vm_flags, bo_flags);
         let pages = mapping.size / GPU_PAGE_SIZE;
 
         let mut root_guard = self.root.lock();

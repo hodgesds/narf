@@ -2645,6 +2645,12 @@ released even on timeout; every context is read back. `ClientsReady` keeps
 VMID0 live (`State::vmid0_ready`); failure quarantines the owner. Boot does
 not call it yet; nothing binds a client's page tables to a VMID.
 
+After boot, the platform calls `ColdBoot::publish_client_vram`: half the
+CPU-visible VRAM the driver's pool still has free (2 MiB-aligned, at least
+64 MiB) becomes a separate pool, registered as the Navi48 DRM card's
+`VramHeap` with the GMC's framebuffer geometry. The slice never returns to
+the driver's pool, so clients without eviction cannot starve its owners.
+
 `unsafe amdgpu_ih7::Rings::new` prepares native OSSSYS7.0.0 rings with exact
 GC12/NBIO discovery banks. It rejects inherited enabled rings, enabled host
 delivery or non-idle IH before allocating; preparation never writes hardware.
@@ -3517,6 +3523,23 @@ paths; only the tables differ.
   and release it after the ACK, also on timeout (`TlbInvalidateError::{
   Semaphore, Timeout}`). The firmware-issued invalidate Linux uses once
   KIQ/MES runs is not implemented.
+
+- Placement (`amdgpu_gem`): a card may register a `VramHeap` (its owned
+  pool plus `fb_base`/`fb_offset`); `GemState::for_card` opens then place
+  VRAM-allowed buffers there, zeroed through the BAR, with entries carrying
+  `address - fb_base + fb_offset` and neither SYSTEM nor SNOOPED
+  (`base_flags(false)` is VALID only, as `amdgpu_ttm_tt_pte_flags`). GTT
+  buffers, VRAM|GTT ones when the heap is full, and every buffer on a card
+  without a heap are buddy pages (SYSTEM|SNOOPED, identity IOMMU); a
+  VRAM-only buffer on a full heap is `NoSpace`. `GemObject::{phys, gpu,
+  system}` give the CPU-mapped address, the entry address and the kind.
+- Lifetimes: each VA mapping record holds its buffer (`Arc<GemObject>`, as
+  `amdgpu_bo_va` holds its BO), so `GEM_CLOSE` cannot free pages the tables
+  still point at. CLEAR and REPLACE split partly covered mappings
+  (`amdgpu_vm_bo_clear_mappings`): the remainders keep their records,
+  offsets and entries; only the covered range's entries are cleared.
+  Memory returns when the last reference goes — fences must gate that once
+  a submission path exists.
 
 No client VMID is bound to a submission yet on any generation.
 

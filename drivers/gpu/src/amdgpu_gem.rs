@@ -22,15 +22,21 @@
 //! different lifetimes, and keeping their numbering disjoint is what lets
 //! `GEM_CLOSE` tell which table a handle belongs to without a lookup in both.
 //!
-//! LINUX-GAP: the backing is always physically contiguous system memory from
-//! the buddy allocator, whatever domain the caller asked for. There is no TTM:
-//! no VRAM placement, no eviction, no migration between GTT and VRAM, and no
-//! `GEM_CREATE_VRAM_CONTIGUOUS`/`NO_CPU_ACCESS` distinction. On these APUs
-//! VRAM is carved out of system memory anyway, so the pages are of the right
-//! kind; what is missing is the GPU-side placement a discrete part would need
-//! and the pressure handling any part needs. `preferred_domains` is recorded
-//! and reported back by `GEM_OP` so userspace sees its own request, not a
-//! rewritten one.
+//! ## Placement
+//!
+//! A buffer allowed in VRAM, on a card that registered a [`VramHeap`], is a
+//! reservation in that card's owned VRAM pool: its entries carry the
+//! physical VRAM address (`gmc_v1x_0_get_vm_pde`'s translation) without
+//! SYSTEM, and the CPU maps it through the BAR. Anything else — every APU
+//! buffer, a GTT buffer, or VRAM falling back to GTT when the heap is full —
+//! is physically contiguous system memory from the buddy allocator, which
+//! the GPU reaches as SYSTEM pages (the IOMMU runs identity mappings).
+//!
+//! LINUX-GAP: there is no TTM: no eviction, no migration between GTT and
+//! VRAM, and no `GEM_CREATE_VRAM_CONTIGUOUS`/`NO_CPU_ACCESS` distinction
+//! (every VRAM buffer is contiguous and CPU-visible). `preferred_domains` is
+//! recorded and reported back by `GEM_OP` so userspace sees its own request,
+//! not a rewritten one.
 //!
 //! LINUX-GAP: `GEM_WAIT_IDLE` always reports idle immediately. That is
 //! currently true — there is no submission path, so nothing can be busy — but
@@ -61,6 +67,42 @@ const HANDLE_BASE: u32 = 0x4000_0000;
 const DRM_GEM_CLOSE_NR: u32 = 0x09;
 
 const PAGE_SIZE: u64 = 4096;
+
+/// A discrete card's VRAM that client buffers may take: its owned pool, and
+/// how a pool (GPU framebuffer) address becomes the physical VRAM address
+/// page-table entries carry — `address - fb_base + fb_offset`, as
+/// `gmc_v1x_0_get_vm_pde` subtracts `vram_start` and adds
+/// `vram_base_offset`.
+#[derive(Clone, Debug)]
+pub struct VramHeap {
+    pub pool: crate::amdgpu_vram::Pool,
+    pub fb_base: u64,
+    pub fb_offset: u64,
+}
+
+/// Each DRM card's client VRAM heap, by card index.
+static HEAPS: IrqSafeSpinLock<Vec<(u32, VramHeap)>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Let clients of DRM card `card` place buffers in `heap`, replacing any
+/// earlier heap. Buffers already created keep their placement.
+pub fn register_vram_heap(card: u32, heap: VramHeap) {
+    let mut heaps = HEAPS.lock();
+    heaps.retain(|(c, _)| *c != card);
+    heaps.push((card, heap));
+}
+
+/// Stop placing new buffers of DRM card `card` in VRAM.
+pub fn unregister_vram_heap(card: u32) {
+    HEAPS.lock().retain(|(c, _)| *c != card);
+}
+
+fn vram_heap(card: u32) -> Option<VramHeap> {
+    HEAPS
+        .lock()
+        .iter()
+        .find(|(c, _)| *c == card)
+        .map(|(_, h)| h.clone())
+}
 
 /// `AMDGPU_GEM_DOMAIN_MASK`, from the mirror — it was hand-composed here
 /// until the mirror gained the composite the C header actually defines.
@@ -109,25 +151,58 @@ fn domains_valid(domains: u64) -> bool {
     special & (special - 1) == 0
 }
 
+/// Where a buffer's memory came from, which decides how it is returned.
+#[derive(Debug)]
+enum Backing {
+    /// Buddy pages of this order.
+    System(u8),
+    /// A VRAM pool reservation, held for its drop, which returns it to the
+    /// pool.
+    Vram {
+        _held: crate::amdgpu_vram::Reservation,
+    },
+}
+
 /// One buffer object: a contiguous physical allocation plus what the client
 /// asked for when it created it.
 #[derive(Debug)]
 pub struct GemObject {
+    /// What the CPU maps: the system pages, or the buffer's BAR window.
     pub phys: u64,
+    /// What the GPU's page-table entries carry: the system pages' address,
+    /// or the physical VRAM address.
+    pub gpu: u64,
+    /// The GPU reaches it as system memory (SYSTEM/SNOOPED entries).
+    pub system: bool,
     /// Rounded up to a page, as `bo_size` is reported back.
     pub byte_len: u64,
-    /// Buddy order the allocation came from, needed to free it.
-    order: u8,
+    backing: Backing,
     /// `alignment` as requested, reported back by `GEM_OP`.
     alignment: u64,
     pub preferred_domains: u64,
     pub flags: u64,
 }
 
+impl GemObject {
+    /// Where the buffer lives: `AMDGPU_GEM_DOMAIN_VRAM` or `_GTT`.
+    pub fn domain(&self) -> u32 {
+        if self.system {
+            uapi::AMDGPU_GEM_DOMAIN_GTT
+        } else {
+            uapi::AMDGPU_GEM_DOMAIN_VRAM
+        }
+    }
+}
+
 impl Drop for GemObject {
     fn drop(&mut self) {
-        let frame = narf_memory::PhysFrame::containing(narf_memory::PhysAddr::new(self.phys));
-        narf_memory::frame::free_pages(frame, self.order);
+        // LINUX-GAP: memory returns as soon as the last reference (handle,
+        // CPU mapping or VA mapping) goes. With no submission path nothing
+        // the GPU executes can hold it; fences must gate this once one lands.
+        if let Backing::System(order) = self.backing {
+            let frame = narf_memory::PhysFrame::containing(narf_memory::PhysAddr::new(self.phys));
+            narf_memory::frame::free_pages(frame, order);
+        }
     }
 }
 
@@ -136,6 +211,8 @@ impl Drop for GemObject {
 pub struct GemState {
     objects: IrqSafeSpinLock<Option<BTreeMap<u32, Arc<GemObject>>>>,
     next_handle: AtomicU32,
+    /// The DRM card whose VRAM heap this open may place buffers in.
+    card: Option<u32>,
 }
 
 impl Default for GemState {
@@ -145,10 +222,22 @@ impl Default for GemState {
 }
 
 impl GemState {
+    /// An open with no VRAM heap: every buffer is system memory.
     pub const fn new() -> Self {
         GemState {
             objects: IrqSafeSpinLock::new(None),
             next_handle: AtomicU32::new(HANDLE_BASE),
+            card: None,
+        }
+    }
+
+    /// An open of DRM card `index`, placing VRAM buffers in its heap once
+    /// one is registered.
+    pub const fn for_card(index: u32) -> Self {
+        GemState {
+            objects: IrqSafeSpinLock::new(None),
+            next_handle: AtomicU32::new(HANDLE_BASE),
+            card: Some(index),
         }
     }
 
@@ -256,35 +345,79 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
         return Err(FsError::InvalidData);
     }
 
-    let frame = narf_memory::frame::alloc_pages_on(0, order).map_err(|_| FsError::NoSpace)?;
-    let phys = frame.start_address().raw();
-    // Zero before userspace can see it. This is not optional: the pages come
-    // from the kernel's own allocator and may hold anything.
-    //
-    // SAFETY: the allocation covers `(1 << order)` pages at `phys`, and phys
-    // memory is kernel-mapped at a fixed offset.
-    unsafe {
-        core::ptr::write_bytes(
-            narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
-            0,
-            ((1u64 << order) * PAGE_SIZE) as usize,
-        );
-    }
-
-    let handle = match state.insert(GemObject {
-        phys,
-        byte_len,
-        order,
-        alignment,
-        preferred_domains: domains,
-        flags,
-    }) {
-        Ok(h) => h,
-        Err(error) => {
-            narf_memory::frame::free_pages(frame, order);
-            return Err(error);
+    // VRAM first where the buffer may live there and the card has a heap;
+    // GTT next if it is also allowed (Linux's placement order).
+    let vram = (domains & uapi::AMDGPU_GEM_DOMAIN_VRAM as u64 != 0)
+        .then(|| state.card.and_then(vram_heap))
+        .flatten()
+        .and_then(|heap| {
+            let align = (alignment.max(PAGE_SIZE)).checked_next_power_of_two()?;
+            let reservation = heap.pool.reserve_aligned(byte_len, align).ok()?;
+            Some((heap, reservation))
+        });
+    let object = match vram {
+        Some((heap, reservation)) => {
+            let map = reservation.mapping();
+            // Zero through the BAR before userspace or the GPU can see it:
+            // the pool's previous owner may have left anything.
+            //
+            // SAFETY: the reservation is this buffer's alone and its CPU
+            // mapping covers `reservation.size()` bytes.
+            unsafe { core::ptr::write_bytes(map.virt as *mut u8, 0, reservation.size() as usize) };
+            let gpu = reservation
+                .address()
+                .checked_sub(heap.fb_base)
+                .and_then(|a| a.checked_add(heap.fb_offset))
+                .ok_or(FsError::InvalidData)?;
+            GemObject {
+                phys: map.phys.raw(),
+                gpu,
+                system: false,
+                byte_len,
+                backing: Backing::Vram { _held: reservation },
+                alignment,
+                preferred_domains: domains,
+                flags,
+            }
+        }
+        None if domains & (uapi::AMDGPU_GEM_DOMAIN_GTT | uapi::AMDGPU_GEM_DOMAIN_CPU) as u64
+            == 0
+            && state.card.and_then(vram_heap).is_some() =>
+        {
+            // VRAM only, on a card with VRAM, and none left.
+            return Err(FsError::NoSpace);
+        }
+        None => {
+            let frame =
+                narf_memory::frame::alloc_pages_on(0, order).map_err(|_| FsError::NoSpace)?;
+            let phys = frame.start_address().raw();
+            // Zero before userspace can see it. This is not optional: the
+            // pages come from the kernel's own allocator and may hold
+            // anything.
+            //
+            // SAFETY: the allocation covers `(1 << order)` pages at `phys`,
+            // and phys memory is kernel-mapped at a fixed offset.
+            unsafe {
+                core::ptr::write_bytes(
+                    narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
+                    0,
+                    ((1u64 << order) * PAGE_SIZE) as usize,
+                );
+            }
+            GemObject {
+                phys,
+                gpu: phys,
+                system: true,
+                byte_len,
+                backing: Backing::System(order),
+                alignment,
+                preferred_domains: domains,
+                flags,
+            }
         }
     };
+    // A failed insert drops the object, which returns its memory.
+    let handle = state.insert(object)?;
 
     // `drm_amdgpu_gem_create_out`: handle, _pad.
     let mut out = [0u8; 8];

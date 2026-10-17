@@ -210,6 +210,21 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     if let Some((limits, level)) = boot.power_info() {
         crate::amdgpu_navi48_power::start(limits, level);
     }
+    // Clients' VRAM buffers; without it they fall back to system memory.
+    {
+        use core::fmt::Write as _;
+        let _ = match boot.publish_client_vram() {
+            Ok(bytes) => writeln!(
+                narf_console::Writer,
+                "amdgpu: navi48 client VRAM heap {} MiB",
+                bytes >> 20
+            ),
+            Err(e) => writeln!(
+                narf_console::Writer,
+                "amdgpu: navi48 no client VRAM heap: {e:?}"
+            ),
+        };
+    }
     Ok(report)
 }
 
