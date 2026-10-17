@@ -16,6 +16,9 @@
 
 ## Distilled summaries
 
+- [Navi22 Mesa ABI audit](navi22-mesa-abi.md) — every ioctl/query Mesa 26.2.4
+  and libdrm 2.4.134 issue at init and first submission on GC 10.3.2, the
+  Linux answer, NARF's answer and the owning milestone.
 - [Navi48 display acceptance](navi48-display-acceptance.md) — board/route
   inventory, physical run matrix and required artifacts; no physical passes yet.
 - [Navi48 protected-output requirements](navi48-protected-output.md) — separate

@@ -8486,6 +8486,7 @@ fn smoke_amdgpu_discrete_is_not_an_apu() -> TestResult {
         is_apu: false,
         gc: Some(gc),
         ip_blocks: alloc::vec![ip(HW_ID_GC, 10, 3, 2)],
+        navi22: Default::default(),
     };
 
     // VRAM_GTT reports both, and they differ.
@@ -8495,8 +8496,9 @@ fn smoke_amdgpu_discrete_is_not_an_apu() -> TestResult {
     };
     let vram_size = u64::from_le_bytes(vg[0..8].try_into().unwrap());
     let visible = u64::from_le_bytes(vg[8..16].try_into().unwrap());
-    if vram_size != VRAM {
-        return TestResult::Fail("VRAM_GTT must report the real VRAM size");
+    // Linux reports usable VRAM: real minus pins minus AMDGPU_VM_RESERVED_VRAM.
+    if vram_size != VRAM - (8 << 20) {
+        return TestResult::Fail("VRAM_GTT must report the real VRAM size less the VM reserve");
     }
     if visible != VISIBLE {
         return TestResult::Fail("VRAM_GTT's cpu-accessible size is the aperture, not VRAM");
@@ -8536,7 +8538,10 @@ fn smoke_amdgpu_discrete_is_not_an_apu() -> TestResult {
 
     // The same snapshot as an APU does claim it, so the flag follows the
     // part rather than having been deleted.
+    // Navi 22 cannot be an APU, so the APU twin is a Phoenix.
     let apu = Snapshot {
+        did: 0x15BF,
+        family: Family::Phoenix,
         visible_vram_size: VRAM,
         is_apu: true,
         ..discrete.clone()
@@ -9381,6 +9386,7 @@ fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
         is_apu: true,
         gc: Some(gc),
         ip_blocks: alloc::vec![ip(HW_ID_GC, 11, 0, 1), ip(HW_ID_SDMA0, 6, 0, 1)],
+        navi22: Default::default(),
     };
 
     let decode = |bytes: &[u8]| -> u::DrmAmdgpuInfoDevice {
@@ -9605,7 +9611,8 @@ fn smoke_amdgpu_gem_lifecycle_and_handle_isolation() -> TestResult {
     {
         return TestResult::Fail("GEM_MMAP of a live handle failed");
     }
-    let offset = u64::from_le_bytes(m[8..16].try_into().unwrap());
+    // `union drm_amdgpu_gem_mmap`: out.addr_ptr overlays in at offset 0.
+    let offset = u64::from_le_bytes(m[0..8].try_into().unwrap());
     let frames = match state.mmap_frames(offset, 8192) {
         Ok(f) => f,
         Err(_) => return TestResult::Fail("the GEM_MMAP offset did not resolve to frames"),
@@ -11479,7 +11486,7 @@ fn smoke_amdgpu_cs_parser_rejects_hostile_input() -> TestResult {
     // A dropped ordering constraint is a race, not an error.
     for id in [
         u::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT,
-        u::AMDGPU_CHUNK_ID_FENCE,
+        u::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL,
     ] {
         let mut other = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
         other.header[0] = id;
