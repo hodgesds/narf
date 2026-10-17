@@ -3948,6 +3948,28 @@ change, FRAC_URG_BW nom/flip), `ARB_SAT_LEVEL = 60 * refclk_mhz`,
 `MIN_REQ_OUTSTAND = 0x1ff`, forces self refresh off, and reads every write
 back; values wider than their DCN3.0 field are refused rather than masked.
 
+### Navi 22 multi-stream contexts, ODM, DSC and DP MST
+
+`amdgpu_dcn30_dsc` is the DCN2.0 DSC block as DCN3.0 instantiates it:
+`select(timing, dsc_caps, fec_caps, link_kbps) -> Option<DscConfig>`
+(`compute_config_dcn20`: the 1188/1200 MHz encoder rules), `plan(timing,
+cfg, odm) -> Plan { config, picture, engine, odm }`, `engine_values`, and
+`Dsc::{power, start, stop, optc, encoder, pps, fec_ready, fec_enable}`
+(`dsc2_set_config`/`dsc2_enable`, `dccg` DSC forward, `DOMAIN16+n` power
+gating, `enc3_dp_set_dsc_config`, `optc3_set_dsc_config`,
+`enc3_dp_set_dsc_pps_info_packet`, `enc2_fec_set_ready/enable`);
+`sink_caps(aux)` reads DPCD 0x60 and 0x90. `amdgpu_dcn30_dp_link`'s
+`Source::fec_ready` (default no-op) and `train_with_retries_fec(.., fec)`
+add `dp_set_fec_ready` (DPCD 0x120) to the shared training.
+
+`amdgpu_dcn30_mst` is DCN3.0's 8b/10b MST source: `Source::{allocation(
+transmitter, &[Allocation]), vc_rate(fe, (x, y))}`
+(`dcn10_link_encoder_update_mst_stream_allocation_table`,
+`enc1_stream_encoder_set_throttled_vcp_size`), `NativeAux`, `Link { start,
+add, remove, edid, stop }` over the shared `dp_mst_mgr` sideband manager,
+`budget(pixel_khz, link_kbps) -> Option<(pbn, slots, vc)>` and
+`link_kbps(rate, lanes, fec)`; DIG and VBIOS transmitter mode 5 (DP_MST).
+
 ### Navi 22 VBIOS display command tables
 
 DCN3.0 does not route VBIOS commands through DMUB (`dmub_command_table` is

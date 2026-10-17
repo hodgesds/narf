@@ -466,7 +466,80 @@ pub fn compute_config(
     link: LinkEncoding,
     force: bool,
 ) -> Option<DscConfig> {
-    let enc = enc_caps(max_dispclk_khz);
+    compute_with(
+        enc_caps(max_dispclk_khz),
+        sink,
+        max_dispclk_khz,
+        target_kbps,
+        t,
+        link,
+        force,
+    )
+}
+
+/// `dsc2_get_enc_caps` (DCN2.0, used by DCN3.0): slices 1-4 on one engine
+/// below `DCN20_MAX_PIXEL_CLOCK_Mhz` (1188), two engines (no single slice,
+/// eight slices, twice the throughput) from there, four engines (12 and 16
+/// slices) past twice it.
+fn enc_caps_dcn20(pix_clk_100hz: u32) -> EncCaps {
+    const MAX_PIXEL_100HZ: u32 = 1188 * 10_000;
+    const MAX_DISPLAY_MHZ: u32 = 1200;
+    let mut s = slices(&[1, 2, 3, 4]);
+    let mut mps = MAX_DISPLAY_MHZ;
+    if pix_clk_100hz >= MAX_PIXEL_100HZ {
+        s &= !(1 << 1);
+        s |= 1 << 8;
+        mps = MAX_DISPLAY_MHZ * 2;
+    }
+    if pix_clk_100hz > MAX_PIXEL_100HZ * 2 {
+        s |= 1 << 12 | 1 << 16;
+        mps = MAX_DISPLAY_MHZ * 4;
+    }
+    EncCaps {
+        version: 0x21,
+        slices: s,
+        lb_bit_depth: 13,
+        block_pred: true,
+        color_formats: 0x1f,
+        color_depth: 0x0e,
+        max_slice_width: 5184,
+        bpp_increment_div: 16,
+        max_dsc_throughput_mps: mps,
+    }
+}
+
+/// [`compute_config`] with DCN3.0's encoder (`dsc2_get_enc_caps`). DCN3.0's
+/// clock manager has no `get_max_clock_khz`, so the minimum ODM slice count
+/// is taken from the encoder's total throughput, as
+/// `get_min_dsc_slice_count_for_odm` does without one.
+pub fn compute_config_dcn20(
+    sink: &DscSinkCaps,
+    target_kbps: u32,
+    t: &DscTiming,
+    force: bool,
+) -> Option<DscConfig> {
+    let enc = enc_caps_dcn20(t.pix_clk_100hz);
+    let max_khz = enc.max_dsc_throughput_mps * 1000;
+    compute_with(
+        enc,
+        sink,
+        max_khz,
+        target_kbps,
+        t,
+        LinkEncoding::Dp8b10b,
+        force,
+    )
+}
+
+fn compute_with(
+    enc: EncCaps,
+    sink: &DscSinkCaps,
+    max_dispclk_khz: u32,
+    target_kbps: u32,
+    t: &DscTiming,
+    link: LinkEncoding,
+    force: bool,
+) -> Option<DscConfig> {
     // get_min_dsc_slice_count_for_odm.
     let pic_width = t.h_active;
     let pic_height = t.v_active;

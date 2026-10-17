@@ -79,6 +79,8 @@ pub enum TransmitterMode {
     /// Also what `SIGNAL_TYPE_NONE` maps to (the power-down path).
     Dvi = 2,
     Hdmi = 3,
+    /// `ATOM_TRANSMITTER_DIGMODE_V6_DP_MST`.
+    DpMst = 5,
 }
 
 /// The register bus the interpreter drives.

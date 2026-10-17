@@ -23,8 +23,9 @@
 //!
 //! Deviations, all conservative: an AUX transport failure aborts the
 //! operation (Linux mostly ignores DPCD write status and reads zeros) and the
-//! source is disabled; FEC is never set ready (this owner has no DSC; Linux
-//! trains FEC-capable sinks FEC-ready); the source-specific OUI is not
+//! source is disabled; FEC is set ready only where the caller asks
+//! ([`train_with_retries_fec`], the DSC path; Linux trains every FEC-capable
+//! sink FEC-ready); the source-specific OUI is not
 //! written; no eDP, DPIA, fixed-VS retimer or early-TPS2 paths; an automated
 //! test request is acknowledged but not run.
 use crate::{
@@ -34,6 +35,8 @@ use crate::{
 };
 
 /// DPCD link-rate codes (`enum dc_link_rate`).
+/// DPCD `DP_FEC_CONFIGURATION`.
+const FEC_CONFIGURATION: u32 = 0x120;
 pub const RBR: u8 = 0x06;
 pub const HBR: u8 = 0x0a;
 pub const HBR2: u8 = 0x14;
@@ -311,6 +314,12 @@ pub trait Source: Send {
     fn drive(&mut self, link: DpLink, swing: u8, pre: u8) -> Result<(), Error>;
     /// `disable_link_output` (nothing for an idle DIG).
     fn disable(&mut self) -> Result<(), Error>;
+    /// `link_enc->funcs->fec_set_ready` (`enc2_fec_set_ready`), for a source
+    /// that trains FEC-ready ([`train_with_retries_fec`]).
+    fn fec_ready(&mut self, ready: bool) -> Result<(), Error> {
+        let _ = ready;
+        Ok(())
+    }
 }
 
 async fn write_ignored<A: Aux + Send>(aux: &mut A, address: u32, data: &[u8]) {
@@ -818,11 +827,18 @@ async fn perform<A: Aux + Send, S: Source>(
     caps: &Caps,
     link: DpLink,
     skip_video_pattern: bool,
+    fec: bool,
 ) -> Result<Outcome, Error> {
     let mut lt = decide_training(aux, caps, link).await;
     // dpcd_exit_training_mode: reset previous training states.
     aux.write(TRAINING_PATTERN_SET, &[0]).await?;
     configure_lttpr(aux, &mut lt).await;
+    // dp_set_fec_ready (should_set_fec_ready, for a FEC-capable sink):
+    // FEC_CONFIGURATION.FEC_READY on the sink, then the encoder's shadow.
+    if fec {
+        aux.write(FEC_CONFIGURATION, &[1]).await?;
+        src.fec_ready(true)?;
+    }
     // dpcd_configure_channel_coding: ANSI 8b/10b (absent before DPCD 1.2).
     write_ignored(aux, MAIN_LINK_CHANNEL_CODING_SET, &[1]).await;
     let mut status = train_8b_10b(aux, src, &mut lt).await?;
@@ -870,12 +886,25 @@ pub async fn train_with_retries<A: Aux + Send, S: Source>(
     caps: &Caps,
     link: DpLink,
 ) -> Result<DpLink, Error> {
+    train_with_retries_fec(aux, src, caps, link, false).await
+}
+/// [`train_with_retries`] FEC-ready (`dp_set_fec_ready` before every
+/// attempt) when `fec`: the caller has checked the sink's FEC capability
+/// (`dp_should_enable_fec`). FEC itself is enabled after training by the
+/// caller (`dp_set_fec_enable`).
+pub async fn train_with_retries_fec<A: Aux + Send, S: Source>(
+    aux: &mut A,
+    src: &mut S,
+    caps: &Caps,
+    link: DpLink,
+    fec: bool,
+) -> Result<DpLink, Error> {
     let skip_video_pattern = link.rate != RBR;
     let mut delay_ms = RETRY_DELAY_MS;
     let mut last = Outcome::CrFailLane0;
     for attempt in 0..LINK_TRAINING_ATTEMPTS {
         enable_link_phy(aux, src, link).await?;
-        let outcome = match perform(aux, src, caps, link, skip_video_pattern).await {
+        let outcome = match perform(aux, src, caps, link, skip_video_pattern, fec).await {
             Ok(outcome) => outcome,
             Err(error) => {
                 let _ = disable_link_phy(aux, src).await;
@@ -988,7 +1017,7 @@ async fn verify_once<A: Aux + Send, S: Source>(
     let (mut max, mut cur) = (known, known);
     loop {
         enable_link_phy(aux, src, cur).await?;
-        let status = match perform(aux, src, caps, cur, cur.rate != RBR).await {
+        let status = match perform(aux, src, caps, cur, cur.rate != RBR, false).await {
             Ok(status) => status,
             Err(error) => {
                 let _ = disable_link_phy(aux, src).await;

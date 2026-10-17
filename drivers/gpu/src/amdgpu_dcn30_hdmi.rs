@@ -756,6 +756,8 @@ pub enum DigMode {
     DisplayPort = 0,
     /// `SIGNAL_TYPE_HDMI_TYPE_A`.
     Hdmi = 3,
+    /// `SIGNAL_TYPE_DISPLAY_PORT_MST`.
+    DpMst = 5,
 }
 
 /// One HDMI stream frontend `dig` routed to physical transmitter `transmitter`.
