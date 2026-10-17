@@ -141,6 +141,9 @@ pub(crate) struct Detector<I: Io> {
     /// has passed.
     settling: u8,
     settle_until: Option<narf_time::Deadline>,
+    /// Per connector: the receiver caps a DP sink reported when its link was
+    /// verified, and that `verified_link_cap` (`amdgpu_dcn30_dp_link`).
+    links: [Option<([u8; DPCD_CAPS], crate::amdgpu_navi22_modeset::DpLink)>; ddc::LINES as usize],
 }
 /// How long a freshly enabled HPD block may read disconnected before the
 /// filter has run: the longest connect delay plus margin.
@@ -154,6 +157,7 @@ impl<I: Io> Detector<I> {
             bound: false,
             settling: 0,
             settle_until: None,
+            links: [None; ddc::LINES as usize],
         })
     }
     /// The link-encoder AUX init and HPD filter for every connector. Once.
@@ -481,6 +485,51 @@ impl Display {
     }
 }
 
+/// DP link state and HPD sense for the display monitor
+/// (`amdgpu_navi22_platform`) and the DCN30 link layer.
+impl Display {
+    /// Debounced HPD of connector `index` without the settle wait; None for
+    /// a connector without HPD wiring.
+    pub fn hpd_sense(&mut self, index: usize) -> Result<Option<bool>, Error> {
+        self.0.bind()?;
+        let c = *self.0.connectors.get(index).ok_or(Error::Invalid)?;
+        match c.hpd {
+            Some(hpd) => Ok(Some(ddc::hpd(&mut self.0.engine, hpd)?)),
+            None => Ok(None),
+        }
+    }
+    /// The AUX reply timeout of DP connector `index`'s engine.
+    pub fn aux_timeout(&mut self, index: usize, us: u32) -> Result<(), Error> {
+        self.0.bind()?;
+        let c = *self.0.connectors.get(index).ok_or(Error::Invalid)?;
+        if c.signal != Signal::DisplayPort {
+            return Err(Error::Unsupported);
+        }
+        Ok(ddc::aux_timeout(&mut self.0.engine, c.line, us)?)
+    }
+    /// The verified link of connector `index` while its sink still reports
+    /// the receiver caps it was verified with.
+    pub fn verified_link(
+        &self,
+        index: usize,
+        dpcd: Option<[u8; DPCD_CAPS]>,
+    ) -> Option<crate::amdgpu_navi22_modeset::DpLink> {
+        let (caps, link) = (*self.0.links.get(index)?)?;
+        (Some(caps) == dpcd).then_some(link)
+    }
+    /// Record (or with None, forget) connector `index`'s verified link.
+    pub fn set_verified_link(
+        &mut self,
+        index: usize,
+        dpcd: Option<[u8; DPCD_CAPS]>,
+        link: Option<crate::amdgpu_navi22_modeset::DpLink>,
+    ) {
+        if let Some(slot) = self.0.links.get_mut(index) {
+            *slot = dpcd.zip(link);
+        }
+    }
+}
+
 /// Hotplug wake-ups from the IH HPD service to pollers of [`Display`]:
 /// a version that each HPD/HPD_RX vector bumps, and the tasks waiting for a
 /// newer one. Polling keeps working without it (the wait times out).
@@ -551,6 +600,16 @@ pub struct DisplayAux<'a> {
     pub index: usize,
 }
 impl crate::amdgpu_dcn30_dp::Aux for DisplayAux<'_> {
+    async fn set_timeout_us(&mut self, us: u32) -> Result<(), crate::amdgpu_navi22_modeset::Error> {
+        self.display
+            .aux_timeout(self.index, us)
+            .map_err(|_| crate::amdgpu_navi22_modeset::Error::Aux)
+    }
+    /// HPD low (or unreadable) is a departed sink; unwired HPD is assumed
+    /// connected, as the AUX replies decide then.
+    async fn connected(&mut self) -> bool {
+        !matches!(self.display.hpd_sense(self.index), Ok(Some(false)) | Err(_))
+    }
     async fn read(
         &mut self,
         address: u32,

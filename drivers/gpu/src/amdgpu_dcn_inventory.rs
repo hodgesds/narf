@@ -83,7 +83,6 @@ const HPD_SHIFTS: [u8; 6] = [0, 8, 16, 24, 26, 28];
 
 /// `DIG0_DIG_BE_EN_CNTL`, per-DIG stride 0x100, at DCN base index 2. Bit zero
 /// says the backend is already driving a link.
-// DCN 3.1.4's offset; Navi22 uses DIG_BE_EN_CNTL - 1 (DCN30 mmDIG0_DIG_BE_EN_CNTL).
 // linux: mmDIG0_DIG_BE_EN_CNTL + 1
 const DIG_BE_EN_CNTL: u64 = 0x20b2;
 const DIG_STRIDE: u64 = 0x100; // linux: mmDIG1_DIG_BE_EN_CNTL - mmDIG0_DIG_BE_EN_CNTL
@@ -168,6 +167,8 @@ const DCE_REFCLK_OFFSET: usize = 12;
 // linux: offsetof(struct atom_display_controller_info_v4_1, display_caps)
 const DCE_DISPLAY_CAPS_OFFSET: usize = 4;
 const DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE: u32 = 0x20; // linux: DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE
+                                                      // linux: DCE_INFO_CAPS_VBIOS_LTTPR_TRANSPARENT_ENABLE
+const DCE_INFO_CAPS_VBIOS_LTTPR_TRANSPARENT_ENABLE: u32 = 0x40;
 /// `atom_integrated_system_info_v2_*` field offsets, the same in v2.1 and v2.2.
 const MEMORY_TYPE_OFFSET: usize = 26; // linux: n/a (DCN 3.1.4 path)
 const CHANNEL_COUNT_OFFSET: usize = 27; // linux: n/a (DCN 3.1.4 path)
@@ -616,6 +617,24 @@ pub fn lttpr_non_transparent(vbios: &[u8]) -> Result<bool, Error> {
     let caps = u32::from(u16_at(info, DCE_DISPLAY_CAPS_OFFSET))
         | u32::from(u16_at(info, DCE_DISPLAY_CAPS_OFFSET + 2)) << 16;
     Ok(caps & DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE != 0)
+}
+
+/// `atom_display_controller_info_v4_*.display_caps` as DCN3.0 reads it
+/// (`bios_parser_get_lttpr_interop` / `_get_lttpr_caps`): (VBIOS LTTPR
+/// aware: DCE_INFO_CAPS_VBIOS_LTTPR_TRANSPARENT_ENABLE, non-transparent
+/// wanted: DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE).
+pub fn lttpr_caps(vbios: &[u8]) -> Result<(bool, bool), Error> {
+    let info = table(vbios, TABLE_DCE_INFO)?;
+    header(info, 4, &[1, 2, 3, 4, 5])?;
+    if (u16_at(info, 0) as usize) < DCE_DISPLAY_CAPS_OFFSET + 4 {
+        return Err(Error::Invalid);
+    }
+    let caps = u32::from(u16_at(info, DCE_DISPLAY_CAPS_OFFSET))
+        | u32::from(u16_at(info, DCE_DISPLAY_CAPS_OFFSET + 2)) << 16;
+    Ok((
+        caps & DCE_INFO_CAPS_VBIOS_LTTPR_TRANSPARENT_ENABLE != 0,
+        caps & DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE != 0,
+    ))
 }
 
 /// The memory configuration, from `atom_integrated_system_info_v2_*` for the

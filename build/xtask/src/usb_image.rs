@@ -552,10 +552,10 @@ fn build_decoy_disks(dir: &Path) -> Result<Vec<Decoy>> {
     )?;
 
     // NVMe: 1 MiB GPT | 64 MiB ESP | 96 MiB ext4 | 160 MiB btrfs | slack.
-    // A 16-entry table (4 LBAs) keeps the entry array inside one 4 KiB NVMe
-    // read, so NARF's scanner registers nvme0p1..3 and the boot-only gate is
-    // exercised on partitions, not just the whole disk. (A stock 128-entry
-    // table is not yet partition-scanned on NVMe; see BOOTING_ON_CACHYOS.md.)
+    // A stock 128-entry table (16 KiB of entries, as on the host's
+    // nvme0n1 / nvme1n1), so NARF's scanner must register nvme0p1..3 and
+    // the boot-only gate is exercised on partitions, not just the whole
+    // disk.
     let (esp_at, esp_len) = (MIB, 64 * MIB);
     let (ext_at, ext_len) = (esp_at + esp_len, 96 * MIB);
     let (btr_at, btr_len) = (ext_at + ext_len, 160 * MIB);
@@ -569,7 +569,7 @@ fn build_decoy_disks(dir: &Path) -> Result<Vec<Decoy>> {
     let mut child = sfdisk.spawn().context("spawning sfdisk")?;
     writeln!(
         child.stdin.as_mut().unwrap(),
-        "label: gpt\ntable-length: 16\n\
+        "label: gpt\ntable-length: 128\n\
          start={}, size={}, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name=\"EFI system partition\"\n\
          start={}, size={}, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name=\"decoy-ext4\"\n\
          start={}, size={}, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name=\"decoy-btrfs\"",

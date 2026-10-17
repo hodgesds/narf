@@ -145,6 +145,18 @@ aliases; discovery never validates or mounts the filesystem.
 `partition::discover_volume_uuid` exposes the same bounded read-only probe to
 root-selection code after an encrypted adapter has been opened.
 
+The partition scanner (`partition::scan_and_register_partitions(parent,
+name)`) registers `{name}p{n}` for each MBR or GPT entry. The GPT entry array
+is read through `partition::read_gpt_entry_array(dev, &header)` in
+`GPT_ENTRY_READ_CHUNK_BYTES` (4 KiB) requests, retried one LBA at a time if a
+device refuses a chunk, so a standard 128-entry (16 KiB) table never needs a
+transfer larger than one page. Headers with an entry size other than
+128 × 2^n fail with `GptError::BadEntrySize`; an array larger than
+`GPT_MAX_ENTRY_ARRAY_BYTES` (1 MiB) or past the device's capacity fails with
+`ScanError::EntriesTooLarge`; entries ending past the last LBA are skipped
+(Linux `is_pte_valid`). Each registered partition is logged as
+`block: <disk>: partition <name> at lba <start>, <n> blocks`.
+
 Targeted lookups clone only the matched device `Arc`; they do not allocate an
 owned registry snapshot. The indexed form captures the registration-order index
 and device under the same registry lock so `devfs` can derive a coherent Linux

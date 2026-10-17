@@ -6,8 +6,10 @@
 //! TMDS-type encoder. A connected sink carries its EDID; its modes are the
 //! EDID timings the DCN30 admission accepts (`amdgpu_navi22_modeset::offered`
 //! against the board's SoC inputs), so SETCRTC, atomic commits and TEST_ONLY
-//! checks only ever accept what DML30 admitted. DP ports report their sinks
-//! but offer no mode until the DCN30 DP SST path exists.
+//! checks only ever accept what DML30 admitted. A DP sink's modes are also
+//! bounded by its link (`dp_validate_mode_timing`): the link its last
+//! lighting verified (`amdgpu_dcn30_dp_link::verify_link_cap`), or before
+//! that what its receiver caps allow.
 //!
 //! This module holds what DRM asked for (CRTC on/off, mode, connector) and
 //! what the hardware shows; `amdgpu_navi22_platform`'s display monitor
@@ -42,11 +44,10 @@ pub struct ConnectorState {
     pub unadmitted: bool,
 }
 impl ConnectorState {
-    /// Whether the single-pipe owner can drive this connector.
+    /// Whether the single-pipe owner can drive this connector (HDMI, or
+    /// DP SST through `amdgpu_dcn30_dp_link`).
     pub fn lightable(&self) -> bool {
-        self.port.signal == Signal::Hdmi
-            && self.present
-            && (self.unadmitted || !self.modes.is_empty())
+        self.present && (self.unadmitted || !self.modes.is_empty())
     }
 }
 
@@ -119,6 +120,15 @@ impl Kms {
         reports: &[Report],
         offered: impl Fn(&Port, &[u8]) -> Option<Vec<Timing>>,
     ) {
+        self.reconcile_sinks(reports, |port, sink| offered(port, &sink.edid));
+    }
+    /// `reconcile` with the whole detected sink, which a DP connector's
+    /// offers need (its receiver caps and verified link).
+    pub fn reconcile_sinks(
+        &mut self,
+        reports: &[Report],
+        offered: impl Fn(&Port, &crate::amdgpu_navi22_display::Sink) -> Option<Vec<Timing>>,
+    ) {
         let old = core::mem::take(&mut self.connectors);
         for report in reports {
             let kind = match report.connector.signal {
@@ -129,13 +139,12 @@ impl Kms {
                 Detection::Connected(sink) => (true, sink.edid.clone()),
                 _ => (false, Vec::new()),
             };
-            let (modes, unadmitted) = if present && report.connector.signal == Signal::Hdmi {
-                match offered(&report.connector, &edid) {
+            let (modes, unadmitted) = match &report.detection {
+                Detection::Connected(sink) => match offered(&report.connector, sink) {
                     Some(modes) => (modes, false),
                     None => (Vec::new(), true),
-                }
-            } else {
-                (Vec::new(), false)
+                },
+                _ => (Vec::new(), false),
             };
             let n = self.connectors.len();
             if old
@@ -171,8 +180,15 @@ impl Kms {
         {
             self.crtc.route = None;
         }
+        // As `amdgpu_navi22_modeset::choose`: an HDMI sink first, else the
+        // first DisplayPort one.
         if self.crtc.route.is_none() {
-            self.crtc.route = self.connectors.iter().position(ConnectorState::lightable);
+            let first = |signal| {
+                self.connectors
+                    .iter()
+                    .position(|c| c.port.signal == signal && c.lightable())
+            };
+            self.crtc.route = first(Signal::Hdmi).or_else(|| first(Signal::DisplayPort));
         }
     }
     /// Timings the CRTC can switch `connector` (default: its route) to.
@@ -290,7 +306,7 @@ pub fn publish() {
                 .flatten(),
             offered: if c.lightable() { &c.modes } else { &[] },
             crtc: (route == Some(n)).then_some(0),
-            possible_crtcs: if c.port.signal == Signal::Hdmi { 1 } else { 0 },
+            possible_crtcs: 1,
         })
         .collect();
     let off = kms.crtc.shown.is_some() && !kms.crtc.active;
@@ -359,8 +375,8 @@ pub fn request_display_active(display: u8, active: bool) {
 fn connector_of(kms: &Kms, id: u32) -> Option<usize> {
     crate::amdgpu_navi48_kms::connector_index(id).filter(|&n| n < kms.connectors.len())
 }
-/// Route the CRTC to connector `connector` (KMS id; None: none). Only an
-/// HDMI port can be driven; false for an unknown or undrivable one.
+/// Route the CRTC to connector `connector` (KMS id; None: none). Every
+/// board HDMI and DP port can be driven; false for an unknown one.
 pub fn request_display_route(display: u8, connector: Option<u32>) -> bool {
     if usize::from(display) >= MAX_CRTCS {
         return false;
@@ -368,8 +384,8 @@ pub fn request_display_route(display: u8, connector: Option<u32>) -> bool {
     requested(|k| {
         let target = match connector {
             Some(id) => match connector_of(k, id) {
-                Some(n) if k.connectors[n].port.signal == Signal::Hdmi => Some(n),
-                _ => return false,
+                Some(n) => Some(n),
+                None => return false,
             },
             None => None,
         };

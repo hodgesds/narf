@@ -301,3 +301,48 @@ kernel_test_in!(
     "drivers/gpu/dcn30-hdmi",
     dcn30_hdmi_modeset_ycbcr420_through_otg_fmt_ocsc_and_dpg
 );
+
+/// Unplug teardown (`Pipeline::disable_unplugged`): Linux's
+/// `link_set_dpms_off` still sends the legacy TMDS_Config write to an SCDC
+/// sink, unchecked, before the transmitter stops; a sink without SCDC gets
+/// no DDC traffic.
+fn dcn30_hdmi_unplug_teardown_sends_legacy_scdc_only_to_scdc_sinks() -> TestResult {
+    for scdc in [true, false] {
+        let vram = Vram::new(2 << 20);
+        let blocks = if scdc {
+            vec![vsdb(0, 68), hf_vsdb(120, 0x80)]
+        } else {
+            vec![vsdb(0, 68)]
+        };
+        let mut lit = match light(edid(DTD_640X480, &blocks), 8, &vram) {
+            Ok(l) => l,
+            Err(why) => return TestResult::Fail(why),
+        };
+        let from = lit.bench.log().len();
+        let tables = Tables::new(&lit.image).unwrap();
+        if run(lit.pipeline.disable_unplugged(&tables, &mut lit.sink)).is_err() {
+            return TestResult::Fail("unplugged disable");
+        }
+        let log = lit.bench.log();
+        let legacy = pos(&log, from, |w| w.dword == SCDC_WRITE | 0x20 && w.value == 0);
+        let off = pos(&log, from, |w| {
+            w.dword == MARK + 16 * m::SLOT_TRANSMITTER && (w.value >> 8) & 0xff == 0
+        });
+        let ddc = log[from..]
+            .iter()
+            .any(|w| w.dword & (SCDC_WRITE | SCDC_READ) != 0);
+        let ok = if scdc {
+            legacy.zip(off).is_some_and(|(l, o)| l < o)
+        } else {
+            !ddc && off.is_some()
+        };
+        if !ok {
+            return TestResult::Fail("legacy SCDC on unplug");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_unplug_teardown_sends_legacy_scdc_only_to_scdc_sinks
+);
