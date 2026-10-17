@@ -91,16 +91,16 @@ pub fn drm_version() -> (u32, u32, u32) {
 }
 
 /// `AMDGPU_VM_RESERVED_VRAM`.
-const VM_RESERVED_VRAM: u64 = 8 << 20;
+const VM_RESERVED_VRAM: u64 = 8 << 20; // linux: AMDGPU_VM_RESERVED_VRAM
 /// `F32_CE_PROGRAM_RAM_SIZE` (`gfx_v10_0_sw_init`).
-const CE_RAM_SIZE: u32 = 65536;
+const CE_RAM_SIZE: u32 = 65536; // linux: F32_CE_PROGRAM_RAM_SIZE
 /// `gfx_v10_0_gpu_early_init`.
-const MAX_HW_CONTEXTS: u32 = 8;
+const MAX_HW_CONTEXTS: u32 = 8; // linux: n/a (literal in gfx_v10_0.c:gfx_v10_0_gpu_early_init)
 /// `nv_common_early_init`, GC 10.3.2: `external_rev_id = rev_id + 0x32`.
-const EXTERNAL_REV_OFFSET: u32 = 0x32;
+const EXTERNAL_REV_OFFSET: u32 = 0x32; // linux: n/a (literal in nv.c:nv_common_early_init)
 /// `amdgpu_info_ioctl`: `AMDGPU_GFX_MAX_SE` / `AMDGPU_GFX_MAX_SH_PER_SE`.
-const MMR_MAX_SE: u32 = 4;
-const MMR_MAX_SH: u32 = 2;
+const MMR_MAX_SE: u32 = 4; // linux: AMDGPU_GFX_MAX_SE
+const MMR_MAX_SH: u32 = 2; // linux: AMDGPU_GFX_MAX_SH_PER_SE
 /// `GB_ADDR_CONFIG` dword offset within GC segment 0.
 const GB_ADDR_CONFIG: u32 = 0x13de;
 

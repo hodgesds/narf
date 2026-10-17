@@ -507,6 +507,37 @@ impl ClockManager {
         self.dccg.update_dpp_dto(pipe, khz)
     }
 }
+/// Opt-in power saving (amdgpu_navi22_power_policy): release or restore the
+/// memory/fabric floors `prepare` pinned. `dcn3_update_clocks` sets the UCLK
+/// hard minimum to DML's dramclk when p-state switching is supported and to
+/// the top level when not; the caller passes the admitted value.
+impl ClockManager {
+    pub(crate) async fn hard_min(&mut self, clock: Clock, khz: u32) -> Result<(), Error> {
+        if self.engine.state != State::Configured {
+            return Err(Error::Busy);
+        }
+        if !matches!(clock, Clock::Memory | Clock::Fabric) {
+            return Err(Error::Invalid);
+        }
+        self.engine.floor(clock, khz).await
+    }
+}
+/// `dcn3_notify_wm_ranges`' three DAL messages, and nothing else.
+impl crate::amdgpu_dcn30_watermarks::DalMailbox for ClockManager {
+    async fn dal(&mut self, message: u32, argument: u32) -> Result<u32, Error> {
+        use crate::amdgpu_dcn30_watermarks as wm;
+        if !matches!(
+            message,
+            wm::SET_DAL_DRAM_ADDR_HIGH | wm::SET_DAL_DRAM_ADDR_LOW | wm::TRANSFER_TABLE_DRAM2SMU
+        ) {
+            return Err(Error::Invalid);
+        }
+        if !matches!(self.engine.state, State::Ready | State::Configured) {
+            return Err(Error::Busy);
+        }
+        self.engine.command(message, argument).await
+    }
+}
 /// `dcn3_enable_pme_wa`: wake the Azalia from D3 before its endpoint is
 /// touched. Linux ignores the result (`dcn30_smu_send_msg_with_param`'s
 /// response is not checked there); so does this.

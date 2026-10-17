@@ -3543,17 +3543,46 @@ the old and new IH endpoints close with `DeviceLost`. `recoveries()` counts
 successes; platform `Diagnostics` adds `tdr` and `recovery`. Model-tested only.
 
 `amdgpu_navi22_power_policy::Policy` is the typed hook for the power savings
-Linux enables by default on sienna_cichlid — GFXOFF, clock gating, MMHUB/ATHUB
-power gating, memory (UCLK) and fabric (FCLK) DPM and deep sleep. `requirement`
-states what each needs: SMU feature bits, display admission
-(`DisplayAdmission`: watermark sets/PMFW watermark table, DML DRAM- and
-FCLK-change support, stutter with the deep-sleep DCEFCLK floor, bandwidth
-floors) and driver readiness (GFXOFF-safe GC access, RLC safe mode, validated
-recovery). `Policy::new()`/`Default` disable everything; `request` checks the
-requirements, then refuses with `NotValidated` while `HARDWARE_VALIDATED` is
-false, so `smu_features()` adds no bits and `gfxoff()`/`clock_gating()` stay
-false. Nothing calls it. The DCN-owned `Smu::enable_display_power` remains the
-only path that adds UCLK/FCLK DPM, under its own contract.
+Linux enables by default on sienna_cichlid — GFXOFF, SoC clock gating
+(`ClockGating`: MMHUB/ATHUB/HDP/IH/SDMA/SMUIO), GC clock gating
+(`GfxClockGating`), MMHUB/ATHUB power gating, memory (UCLK) and fabric (FCLK)
+DPM and deep sleep. `requirement` states what each needs: SMU feature bits,
+display admission (`DisplayAdmission`: watermark sets/PMFW watermark table,
+DML DRAM- and FCLK-change support, stutter with the deep-sleep DCEFCLK floor,
+bandwidth floors) and driver readiness (GFXOFF-safe GC access, RLC safe mode,
+validated recovery). `Policy::new()`/`Default` disable everything; `request`
+refuses with `NotValidated` while `HARDWARE_VALIDATED` is false.
+`OptIn::parse(Option<&str>)` reads the `amdgpu.navi22_pg=` value (tokens
+`gfxoff`, `cg`, `gfxcg`, `hubpg`, `memdpm`, `fclkdpm`, `ds`, `wm`; any unknown
+token yields `OptIn::NONE`), and `request_opted_in(feature, admission, driver,
+optin)` opens a gate only for a named feature whose display and driver-software
+prerequisites hold (`NotOptedIn` otherwise), waiving only the hardware
+validation facts. `revoke` closes a gate.
+
+`amdgpu_navi22_power_saving::plan(optin, admission, driver) -> Plan` evaluates
+every feature (pure; `Plan::blocks`, `smu_enable`, per-feature `refusals`);
+`readiness()` reports RLC safe mode implemented, recovery unvalidated and GC
+access GFXOFF-safe only after `amdgpu_navi22_gfxoff::declare_submission_guarded`.
+`amdgpu_navi22_platform::power_saving(value)` (fb calls it only when the boot
+argument is present) runs `ColdBoot::apply_power_saving`: optional PMFW
+watermark upload (`amdgpu_dcn30_watermarks`: `navi22_ranges`, `encode`,
+`notify` over the DAL mailbox, as `dcn3_notify_wm_ranges`), clock gating
+(`amdgpu_navi22_gating::Gating::set_clockgating(gate, Blocks)`, Linux IP order
+common→gmc→ih→gfx→sdma, reverse to ungate, GC under RLC safe mode),
+`Smu::update_gating_features(mask, enable)` (only `GATING_FEATURES`,
+smu_cmn_feature_update_enable_state with running-set and protection checks),
+the initial `DisallowGfxOff`, and UCLK/FCLK hard minimums at the admitted
+floors (`ClockManager::hard_min`). It then starts the GFXOFF controller.
+`remove_power_saving` stops GFXOFF and undoes the rest in reverse;
+`ColdBoot::power_saving()` reports what was applied.
+
+`amdgpu_navi22_gfxoff` mirrors `amdgpu_gfx_off_ctrl`: request count starting
+at 1, `DELAY_MS` (100) before `AllowGfxOff`, cancellation by a disable request,
+`DisallowGfxOff` before the count rises, imbalance refused, failed or cancelled
+disallow terminal. `Reference::acquire().await` is the disable reference every
+GC MMIO path (queue submission, `READ_MMR_REG`, the TDR sampler) holds; it is
+a no-op without the opt-in, and must not be awaited with the platform owner
+lock held. Recovery calls `forget_for_reset`; `status()` is diagnostic.
 
 ### Navi 22 VCN 3.0 and JPEG 3.0
 
@@ -3965,6 +3994,30 @@ TPS1–4, passthrough/video idle, `link_encoder_disable`; MSA, VSC SDP via VPG,
 (`amdgpu_navi22_display::DisplayAux` over native AUX). VBIOS
 `Transmitter { action, transmitter, mode, lanes, hpd, connector, symbol_khz }`
 marshals v1.6/v1.7 (SETUP_VSEMPH via `Tables::transmitter_lane`, HPO 0).
+
+HDMI 2.0 on DCN3.0 (m5hdmi): `hdmi::stream_for(edid, &timing, max_bpc,
+limited, Limits { hdmi6g, max_phy_khz }) -> Option<Stream>` chooses amdgpu_dm's
+format (4:2:0-only modes as 4:2:0; else RGB at the deepest declared depth up to
+`amdgpu.max_bpc`, 2-bpc step-down; else 4:2:0-also) against
+`dcn10_link_encoder_validate_hdmi_output` (600 MHz, HDMI_6GB_EN from
+`amdgpu_dcn_inventory::encoder_caps`) and DML30's `min(600, PHYCLK)`.
+`Stream { format: Format { depth, ycbcr420, limited }, pixel_khz,
+character_100hz, character_khz, scramble: Scramble::{Off, LowRate, Above340},
+scdc, avi, vendor }` carries the halved TMDS pixel clock, `phy_pix_clk`, the
+scrambling decision (> 340 MHz, or LTE_340Mcsc) and the AVI/HDMI-VIC vendor
+InfoFrames. `write_scdc_data(ddc, &stream)` (Sink/Source_Version, TMDS_Config
+0/1/3; fails only a scrambled stream), `read_scdc_data` and
+`write_scdc_legacy(ddc, scdc_present)` (disable/unplug, best effort) speak SCDC
+over `dp::Aux::scdc_read/scdc_write` (default: unsupported;
+`DisplayAux` implements them on the HDMI connector's I2C engine at 0x54).
+`Hdmi::hdmi_stream_attribute(&stream)` programs depth/scrambler/1/4 clock rate,
+`hdmi_info_packets(&stream)` sends AVI (packet 0) and vendor (packet 1) in
+Linux's order; a VPG conflict that never clears is logged, not fatal.
+`unsafe hdmi::Formatter::new(gpu, cap, pipe)` owns the pipe's FMT (dynamic
+expansion, SPATIAL8/10 dither, full-range clamp, 4:2:0 subsampling), OTG 4:2:0
+container (OPTC_DATA_FORMAT, H_TIMING_DIV_MODE), MPC OCSC (sRGB / sRGB limited /
+YCbCr709, coefficient set A) and DPG black. `Pipeline::hdmi_output()` exposes
+the admitted stream to the unplug path.
 
 `amdgpu_navi22_modeset::Resources::acquire(&connector)` is the DCN3.0 pool:
 first free pipe, the preferred DIG FE (= transmitter) or else the last free

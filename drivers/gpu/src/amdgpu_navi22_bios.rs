@@ -126,6 +126,11 @@ impl<'a> Tables<'a> {
             data_table: rom.master_data_table_offset as usize,
         })
     }
+    /// The VBIOS image the tables run from (data tables such as the
+    /// display-object records).
+    pub fn image(&self) -> &'a [u8] {
+        self.bios
+    }
     /// `amdgpu_atom_parse_cmd_header`'s content revision.
     pub fn revision(&self, table: u16) -> Result<u8, Error> {
         let header = self

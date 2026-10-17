@@ -1,15 +1,23 @@
-//! Navi22 power-saving policy hooks. Linux enables GFXOFF, GC/hub clock and
+//! Navi22 power-saving policy. Linux enables GFXOFF, GC/hub clock and
 //! power gating, memory/fabric DPM and deep sleep on sienna_cichlid by
 //! default (`amdgpu_pp_feature_mask`, `adev->cg_flags`/`pg_flags` in nv.c,
 //! `sienna_cichlid_get_allowed_feature_mask`), but on that platform DC has
 //! already admitted every stream: DML validated p-state/stutter support,
 //! HUBBUB watermark sets and the PMFW `TABLE_WATERMARKS` are installed, and
 //! clock floors are requested through `smu_display_clock_voltage_request`.
-//! NARF's DCN3.0 owner does not provide that admission yet, so every feature
-//! here stays disabled. This module only states, as types, what each feature
-//! would need from display admission and from the driver; `request` refuses
-//! everything (`HARDWARE_VALIDATED` is false) after checking the stated
-//! requirements, and the masks it produces add nothing to the boot SMU policy.
+//! This module states, as types, what each feature needs from display
+//! admission and from the driver.
+//!
+//! Nothing is enabled by default: `Policy::new()`/`Default` disable every
+//! feature and `request` refuses everything (`HARDWARE_VALIDATED` is false).
+//! The only way a gate opens is [`Policy::request_opted_in`] with an
+//! explicit [`OptIn`] parsed from the `amdgpu.navi22_pg=` boot argument; it
+//! still enforces every display-admission and driver prerequisite, and only
+//! waives the hardware-validation facts (`HARDWARE_VALIDATED`,
+//! `recovery_validated`) the operator accepted by opting in. The sequences
+//! that then run live in `amdgpu_navi22_gating` (clock gating),
+//! `amdgpu_navi22_gfxoff` (GFXOFF), the SMU owner (feature bits) and
+//! `amdgpu_dcn30_watermarks` (the PMFW watermark table).
 //!
 //! `Smu::enable_display_power` (UCLK/FCLK/SOCCLK/DCEFCLK DPM) is the DCN
 //! owner's own, separately contracted path and is not driven from here.
@@ -37,7 +45,8 @@ pub const SMU_HUB_PG: u64 = bit(40) | bit(41);
 pub enum Feature {
     /// GC power-off between submissions (`smu_v11_0_gfx_off_control`).
     GfxOff,
-    /// GC CGCG/CGLS/MGCG and HDP/MMHUB/ATHUB/IH clock gating (nv.c cg_flags).
+    /// MMHUB/ATHUB/HDP/IH/SDMA/SMUIO clock gating (nv.c cg_flags): the
+    /// non-GC IP blocks of `amdgpu_device_set_cg_state`.
     ClockGating,
     /// MMHUB/ATHUB power gating (`FEATURE_MMHUB_PG/ATHUB_PG`).
     HubPowerGating,
@@ -47,14 +56,18 @@ pub enum Feature {
     FabricDpm,
     /// DS_* clocks and GFX ULV.
     DeepSleep,
+    /// GC MGCG/CGCG/CGLS/3D CGCG (`gfx_v10_0_update_gfx_clock_gating`).
+    /// GC-internal: display fetch does not pass through GC.
+    GfxClockGating,
 }
-pub const FEATURES: [Feature; 6] = [
+pub const FEATURES: [Feature; 7] = [
     Feature::GfxOff,
     Feature::ClockGating,
     Feature::HubPowerGating,
     Feature::MemoryDpm,
     Feature::FabricDpm,
     Feature::DeepSleep,
+    Feature::GfxClockGating,
 ];
 
 /// What the display owner certifies for the current configuration (DML30
@@ -156,6 +169,58 @@ pub const fn requirement(feature: Feature) -> Requirement {
             needs_stutter: true,
             ..none
         },
+        Feature::GfxClockGating => Requirement {
+            needs_rlc_safe_mode: true,
+            ..none
+        },
+    }
+}
+
+/// Features the operator opted into with `amdgpu.navi22_pg=a,b,...`
+/// (tokens `gfxoff`, `cg`, `gfxcg`, `hubpg`, `memdpm`, `fclkdpm`, `ds`, and
+/// `wm` for the PMFW watermark table). Absent or unparsable: nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OptIn {
+    features: u8,
+    /// Upload the PMFW `TABLE_WATERMARKS` (`dcn3_notify_wm_ranges`).
+    pub watermarks: bool,
+}
+impl OptIn {
+    pub const NONE: Self = Self {
+        features: 0,
+        watermarks: false,
+    };
+    /// Parse the boot argument's value. Any unknown or empty token rejects
+    /// the whole list, so a typo never enables a different feature set.
+    pub fn parse(value: Option<&str>) -> Self {
+        let Some(value) = value else {
+            return Self::NONE;
+        };
+        let mut optin = Self::NONE;
+        for token in value.split(',') {
+            let feature = match token.trim() {
+                "gfxoff" => Feature::GfxOff,
+                "cg" => Feature::ClockGating,
+                "gfxcg" => Feature::GfxClockGating,
+                "hubpg" => Feature::HubPowerGating,
+                "memdpm" => Feature::MemoryDpm,
+                "fclkdpm" => Feature::FabricDpm,
+                "ds" => Feature::DeepSleep,
+                "wm" => {
+                    optin.watermarks = true;
+                    continue;
+                }
+                _ => return Self::NONE,
+            };
+            optin.features |= 1 << feature as u8;
+        }
+        optin
+    }
+    pub fn contains(self, feature: Feature) -> bool {
+        self.features & 1 << feature as u8 != 0
+    }
+    pub fn is_empty(self) -> bool {
+        self.features == 0 && !self.watermarks
     }
 }
 
@@ -172,6 +237,8 @@ pub enum Refusal {
     Driver(Feature),
     /// Requirements met, but enabling stays off until validated.
     NotValidated(Feature),
+    /// `request_opted_in` for a feature the boot argument did not name.
+    NotOptedIn(Feature),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,27 +274,8 @@ impl Policy {
         admission: Option<&DisplayAdmission>,
         driver: &DriverReadiness,
     ) -> Result<(), Refusal> {
-        let r = requirement(feature);
-        let display_needed = r.needs_watermarks
-            || r.needs_dram_clock_change
-            || r.needs_fclk_change
-            || r.needs_stutter;
-        if display_needed {
-            let a = admission.ok_or(Refusal::NoAdmission)?;
-            // Retired pipes impose no display constraint.
-            if a.active_streams != 0
-                && ((r.needs_watermarks && !a.watermarks)
-                    || (r.needs_dram_clock_change && !a.dram_clock_change)
-                    || (r.needs_fclk_change && !a.fclk_change)
-                    || (r.needs_stutter && !(a.stutter && a.deep_sleep_dcefclk)))
-            {
-                return Err(Refusal::Display(feature));
-            }
-        }
-        if (r.needs_gfxoff_safe_access && !driver.gfxoff_safe_gc_access)
-            || (r.needs_rlc_safe_mode && !driver.rlc_safe_mode)
-            || !driver.recovery_validated
-        {
+        check(feature, admission, driver)?;
+        if !driver.recovery_validated {
             return Err(Refusal::Driver(feature));
         }
         if !HARDWARE_VALIDATED {
@@ -235,6 +283,27 @@ impl Policy {
         }
         self.gates[feature as usize] = Gate::Allowed;
         Ok(())
+    }
+    /// The explicit opt-in path: `optin` must name `feature`, and every
+    /// display-admission and driver-software prerequisite still applies.
+    /// Only the hardware-validation facts are waived by the opt-in.
+    pub fn request_opted_in(
+        &mut self,
+        feature: Feature,
+        admission: Option<&DisplayAdmission>,
+        driver: &DriverReadiness,
+        optin: OptIn,
+    ) -> Result<(), Refusal> {
+        if !optin.contains(feature) {
+            return Err(Refusal::NotOptedIn(feature));
+        }
+        check(feature, admission, driver)?;
+        self.gates[feature as usize] = Gate::Allowed;
+        Ok(())
+    }
+    /// Close a gate again (the feature was turned off).
+    pub fn revoke(&mut self, feature: Feature) {
+        self.gates[feature as usize] = Gate::Disabled;
     }
     /// SMU feature bits this policy adds to the boot allowed mask.
     pub fn smu_features(&self) -> u64 {
@@ -249,6 +318,38 @@ impl Policy {
     pub fn clock_gating(&self) -> bool {
         self.gate(Feature::ClockGating) == Gate::Allowed
     }
+    pub fn gfx_clock_gating(&self) -> bool {
+        self.gate(Feature::GfxClockGating) == Gate::Allowed
+    }
+}
+
+/// Display and driver-software prerequisites shared by both request paths.
+fn check(
+    feature: Feature,
+    admission: Option<&DisplayAdmission>,
+    driver: &DriverReadiness,
+) -> Result<(), Refusal> {
+    let r = requirement(feature);
+    let display_needed =
+        r.needs_watermarks || r.needs_dram_clock_change || r.needs_fclk_change || r.needs_stutter;
+    if display_needed {
+        let a = admission.ok_or(Refusal::NoAdmission)?;
+        // Retired pipes impose no display constraint.
+        if a.active_streams != 0
+            && ((r.needs_watermarks && !a.watermarks)
+                || (r.needs_dram_clock_change && !a.dram_clock_change)
+                || (r.needs_fclk_change && !a.fclk_change)
+                || (r.needs_stutter && !(a.stutter && a.deep_sleep_dcefclk)))
+        {
+            return Err(Refusal::Display(feature));
+        }
+    }
+    if (r.needs_gfxoff_safe_access && !driver.gfxoff_safe_gc_access)
+        || (r.needs_rlc_safe_mode && !driver.rlc_safe_mode)
+    {
+        return Err(Refusal::Driver(feature));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "kernel-test")]
@@ -368,5 +469,119 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/navi22-power",
         navi22_power_policy_never_enables_and_names_what_is_missing
+    );
+
+    fn navi22_power_policy_opt_in_is_explicit_and_keeps_prerequisites() -> TestResult {
+        // A default boot has no `amdgpu.navi22_pg`: nothing is opted in and
+        // every opted-in request is refused without touching the policy.
+        let none = OptIn::parse(None);
+        if none != OptIn::NONE || !none.is_empty() {
+            return TestResult::Fail("absent boot argument opted in");
+        }
+        for bad in ["", "gfxoff,", "gfxoff,bogus", "GFXOFF", "all", "gfxoff;cg"] {
+            if OptIn::parse(Some(bad)) != OptIn::NONE {
+                return TestResult::Fail("malformed opt-in accepted");
+            }
+        }
+        let ready = DriverReadiness {
+            gfxoff_safe_gc_access: true,
+            rlc_safe_mode: true,
+            recovery_validated: false,
+        };
+        let full = DisplayAdmission {
+            active_streams: 1,
+            dram_clock_change: true,
+            fclk_change: true,
+            stutter: true,
+            watermarks: true,
+            min_uclk_mhz: 1000,
+            min_fclk_mhz: 1200,
+            min_dcefclk_mhz: 600,
+            deep_sleep_dcefclk: true,
+        };
+        let mut policy = Policy::new();
+        for feature in FEATURES {
+            if policy.request_opted_in(feature, Some(&full), &ready, none)
+                != Err(Refusal::NotOptedIn(feature))
+            {
+                return TestResult::Fail("feature allowed without opt-in");
+            }
+        }
+        if policy != Policy::new() {
+            return TestResult::Fail("refused opt-in changed the policy");
+        }
+        let optin = OptIn::parse(Some("gfxoff, cg,gfxcg,hubpg,memdpm,fclkdpm,ds,wm"));
+        if FEATURES.iter().any(|f| !optin.contains(*f)) || !optin.watermarks {
+            return TestResult::Fail("opt-in tokens");
+        }
+        if OptIn::parse(Some("gfxcg")).contains(Feature::ClockGating) {
+            return TestResult::Fail("gfxcg opted into SoC gating");
+        }
+        // The kms admission today: DML DRAM change only, no watermarks.
+        let kms = DisplayAdmission {
+            fclk_change: false,
+            stutter: false,
+            watermarks: false,
+            deep_sleep_dcefclk: false,
+            ..full
+        };
+        for feature in [
+            Feature::ClockGating,
+            Feature::HubPowerGating,
+            Feature::MemoryDpm,
+            Feature::FabricDpm,
+            Feature::DeepSleep,
+        ] {
+            if policy.request_opted_in(feature, Some(&kms), &ready, optin)
+                != Err(Refusal::Display(feature))
+                || policy.request_opted_in(feature, None, &ready, optin)
+                    != Err(Refusal::NoAdmission)
+            {
+                return TestResult::Fail("opt-in bypassed display admission");
+            }
+        }
+        let unsafe_gc = DriverReadiness {
+            gfxoff_safe_gc_access: false,
+            ..ready
+        };
+        let no_safe_mode = DriverReadiness {
+            rlc_safe_mode: false,
+            ..ready
+        };
+        if policy.request_opted_in(Feature::GfxOff, None, &unsafe_gc, optin)
+            != Err(Refusal::Driver(Feature::GfxOff))
+            || policy.request_opted_in(Feature::GfxClockGating, None, &no_safe_mode, optin)
+                != Err(Refusal::Driver(Feature::GfxClockGating))
+        {
+            return TestResult::Fail("opt-in bypassed driver readiness");
+        }
+        if policy != Policy::new() {
+            return TestResult::Fail("refusal changed the policy");
+        }
+        // GC-only features need no display admission.
+        if policy.request_opted_in(Feature::GfxClockGating, None, &ready, optin) != Ok(())
+            || policy.request_opted_in(Feature::GfxOff, None, &ready, optin) != Ok(())
+            || !policy.gfx_clock_gating()
+            || !policy.gfxoff()
+            || policy.clock_gating()
+            || policy.smu_features() != SMU_GFXOFF
+        {
+            return TestResult::Fail("admitted GC features");
+        }
+        policy.revoke(Feature::GfxOff);
+        if policy.gfxoff() || policy.smu_features() != 0 {
+            return TestResult::Fail("revoke");
+        }
+        // The validated path still refuses everything.
+        if policy.request(Feature::GfxClockGating, None, &ready)
+            != Err(Refusal::Driver(Feature::GfxClockGating))
+        {
+            return TestResult::Fail("validated path allowed unvalidated recovery");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi22-power",
+        navi22_power_policy_opt_in_is_explicit_and_keeps_prerequisites
     );
 }

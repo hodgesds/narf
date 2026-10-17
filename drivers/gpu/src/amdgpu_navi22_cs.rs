@@ -37,7 +37,7 @@ use crate::amdgpu_uapi as uapi;
 
 const RINGS: [Ring; 4] = [Ring::Gfx, Ring::Compute, Ring::Sdma(0), Ring::Sdma(1)];
 /// Bound on waiting out the per-ring throttle before giving up with EBUSY.
-const THROTTLE_NS: u64 = 10_000_000_000;
+const THROTTLE_NS: u64 = 10_000_000_000; // linux: n/a (NARF policy)
 
 /// `amdgpu_ctx_get_entity` for this ASIC: gfx ring 0, compute rings 0–3 on
 /// the one kernel compute queue, one entity per SDMA engine.
