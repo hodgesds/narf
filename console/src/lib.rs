@@ -644,7 +644,41 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
         f(msg);
     }
 
+    // Last: the persistent-log sink. It may touch storage and is the only
+    // step that can stall, so the message is already on every screen.
+    run_persist_hook(Some(msg));
+
     narf_arch::halt_forever();
+}
+
+/// Persistent-log flush callback. `Some(text)` on the panic path (the panic
+/// report, which never enters the kernel log store), `None` before a
+/// deliberate reboot or power-off. The hook must bound its own work and must
+/// never block on a lock: on the panic path any other CPU may have died
+/// holding it.
+pub type PersistHook = fn(Option<&[u8]>);
+
+/// Stored as `PersistHook as usize`, like [`FB_HOOK`].
+static PERSIST_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the persistent-log flush hook (one sink; a later call replaces it).
+pub fn set_persist_hook(hook: PersistHook) {
+    PERSIST_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Run the persistent-log flush hook, if installed. Lock-free; re-entry (a
+/// panic inside the hook) is suppressed by the hook slot being taken first.
+pub fn run_persist_hook(msg: Option<&[u8]>) {
+    let h = PERSIST_HOOK.swap(0, Ordering::AcqRel);
+    if h != 0 {
+        // SAFETY: stored as `PersistHook as usize` in `set_persist_hook`.
+        let f: PersistHook = unsafe { core::mem::transmute(h) };
+        f(msg);
+        // A reboot hook that returns may run again on a later transition.
+        if msg.is_none() {
+            PERSIST_HOOK.store(h, Ordering::Release);
+        }
+    }
 }
 
 /// Lock-free string emit used by the CPU trap path. The trap may

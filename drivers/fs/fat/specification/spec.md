@@ -22,6 +22,35 @@ registered constructor with a block source and options, then attach its returned
 
 The driver implements the `FileSystem` trait from `narf-filesystem`.
 
+### Persistent boot log (`bootlog`)
+
+`narf.bootlog=<token>` (8..=64 of `[A-Za-z0-9_-]`; absent or `off` =
+disabled) arms a `Stage::Late` task that appends the kernel log store to
+`/narf-boot-<n>.log` on the boot medium:
+
+```rust
+pub const ARG: &str = "narf.bootlog";
+pub const MARKER_FILE: &str = "NARFLOG.ID";
+pub const MAX_LOG_BYTES: u64 = 4 << 20; pub const MAX_LOGS: u32 = 32;
+pub fn parse_config(value: Option<&str>) -> Result<Config, &'static str>;
+pub fn candidate_allowed(device_name: &str) -> bool;   // usb-msc* only
+pub fn marker_matches(contents: &[u8], token: &str) -> bool;
+pub fn next_log_index<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<u32>;
+pub async fn open_session<B>(volume: &Arc<FatVolume<B>>, token: &str, cap: u64,
+                             header: &[u8]) -> Result<Option<Session>, Error>;
+impl Session { pub async fn append(&mut self, bytes: &[u8]) -> Result<usize, FsError>; }
+pub fn start() -> narf_init::InitResult;               // the initcall
+```
+
+Only USB mass-storage devices are opened, and only a FAT volume whose root
+`NARFLOG.ID` first line equals the token is written; the volume is mounted
+privately, never in the VFS. Each boot creates one file and only appends,
+bounded by `MAX_LOG_BYTES` (a truncation note is written once). Flushes run
+every 1 s for the first minute after arming, then every 5 s; a final flush
+bounded at 3 s runs through `narf_console::set_persist_hook` on panic and
+before reboot/power-off. `narf.bootlog.selftest=panic` panics after the first
+flush (QEMU validation of the panic path only).
+
 ### Key Structs
 
 - `FatFileSystem`: Root structure representing a mounted FAT volume.
