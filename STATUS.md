@@ -899,8 +899,14 @@ does not yet start VCN queues.
 Production cold boot now initializes GC/MMHUB VMID0 with a bounded VRAM-only
 test aperture after the protected power policy is active. Both hubs validate
 idle contexts and matching framebuffer geometry, use owned VRAM page tables
-and fault fallback, and wait for bounded TLB acknowledgements. User VMIDs and
-host DMA stay disabled; failed/cancelled starts retain the backing pages.
+and fault fallback, and wait for bounded TLB acknowledgements. Failed or
+cancelled starts retain the backing pages. A following GART stage repoints
+VMID0 at a 512 MiB VRAM-resident GART (boot pages retained) and arms user
+contexts 1–15 on an empty root. The hub owner binds pinned system DMA pages
+into the GART and creates per-client GMC10 four-level VMs with Linux PDE/PTE
+encodings, engine-17 invalidation on both hubs, and VMC/UTCL2 fault
+attribution; register-model tests cover isolation, timeouts, cancellation and
+revocation. Not hardware-validated; GEM/CS do not use it yet.
 SDMA0 now has a cold-start path on GC 10.3.2 and an owned VRAM ring. Production
 boot runs a translated WRITE/COPY/FENCE test after GMC setup and checks both
 read-pointer paths and all copied words. Reset and completion waits are bounded;

@@ -95,6 +95,7 @@ pub enum Stage {
     RlcBoot,
     PowerSetup,
     MemoryHubs,
+    Gart,
     Interrupts,
     SdmaTest,
     InterruptTest,
@@ -108,7 +109,7 @@ pub enum Stage {
     IbTests,
     FenceInterrupts,
 }
-const STAGES: [Stage; 25] = [
+const STAGES: [Stage; 26] = [
     Stage::ResetOnInit,
     Stage::MemoryTraining,
     Stage::Sos,
@@ -122,6 +123,8 @@ const STAGES: [Stage; 25] = [
     Stage::RlcBoot,
     Stage::PowerSetup,
     Stage::MemoryHubs,
+    // gmc_v10_0_hw_init's gart_enable completes GMC before any engine.
+    Stage::Gart,
     // Linux enables IH (hw_init phase 1) after COMMON/GMC and before every
     // phase-2 engine. Its VRAM ring needs VMID0, so IH follows MemoryHubs.
     Stage::Interrupts,
@@ -597,6 +600,13 @@ impl Backend for Hardware {
                     unsafe { gmc.initialize().await }.map_err(Error::MemoryHubs)?;
                 }
             }
+            Stage::Gart => {
+                if let Some(gmc) = self.gmc.as_mut().filter(|gmc| gmc.gart_prepared()) {
+                    // SAFETY: same exclusive owner; both hubs are Ready and no
+                    // queue runs in any VMID before the SDMA test below.
+                    unsafe { gmc.enable_gart().await }.map_err(Error::MemoryHubs)?;
+                }
+            }
         }
         Ok(())
     }
@@ -775,7 +785,8 @@ impl ColdBoot {
         );
         Ok(())
     }
-    /// Reserve the native VMID0 backing pages before run. Production boot calls
+    /// Reserve the native VMID0 backing pages and the GART table before run.
+    /// Production boot calls
     /// this; explicit firmware-only callers can leave memory hubs untouched.
     /// The whole-GPU ownership contract established by new continues to apply.
     pub fn prepare_memory_hubs(&mut self) -> Result<(), Error> {
@@ -798,7 +809,25 @@ impl ColdBoot {
             }
             .map_err(Error::MemoryHubs)?,
         );
+        if let Some(gmc) = hardware.gmc.as_mut() {
+            gmc.prepare_gart().map_err(Error::MemoryHubs)?;
+        }
         Ok(())
+    }
+    /// The live memory-hub owner (GART, GTT binding, per-client VMs and fault
+    /// attribution) after a completed boot, including after `take_psp`.
+    pub fn memory(&mut self) -> Result<&mut crate::amdgpu_gmc_navi22::Gmc, Error> {
+        if !matches!(
+            self.sequence.state,
+            State::FirmwareReady(_) | State::Released
+        ) {
+            return Err(Error::Busy);
+        }
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(Error::Invalid)?;
+        if gmc.gart().is_none() {
+            return Err(Error::Invalid);
+        }
+        Ok(gmc)
     }
     /// Reserve SDMA0 ring/writeback storage before run, after memory hubs have
     /// been prepared. This performs no I/O and exposes no submission API.

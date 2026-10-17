@@ -3188,6 +3188,62 @@ destination }` address metadata, including after a started failure. Only
 `Ready` confirms both TLB acknowledgements. Keep the owner alive while a
 consumer uses these translations; this stage alone does not prove GPU access.
 
+### Navi 22 GART and per-client GPUVM
+
+`Gmc::prepare_gart()` reserves the 1 MiB VRAM GART table plus one shared
+all-invalid user root page (no I/O). `unsafe enable_gart().await` requires a
+`Ready` hub owner and no running queues: it zeroes the table, carries the two
+boot `Aperture` pages into GART pages 0/1, and repoints VMID0 on both hubs at a
+512 MiB GART (`gmc_v10_0_mc_init` size) starting at the boot aperture, directly
+above VRAM; the range may not cross 4 GiB or reach the MC hole. It then applies
+`setup_vmid_config` to contexts 1–15 (`CONTEXT1_CNTL` 0x555407: depth 3, block
+size 9, no retry, all default-page faults; table range 0..`max_pfn`-1) with
+their base on the empty root, and invalidates VMID0. `gart()` returns
+`GartInfo { start, size, table }` only after success.
+
+`bind_gtt(DmaBuffer, writable).await -> Gtt` maps one pinned contiguous system
+buffer (page aligned, below the 44-bit DMA mask) after the boot pages with
+Linux TT flags VALID|SYSTEM|SNOOPED|EXECUTABLE|READABLE[|WRITEABLE], MTYPE_UC;
+`Gtt::address()` is its VMID0 GPU address. `unbind_gtt(Gtt).await` writes
+invalid entries, invalidates and returns the buffer. A dropped `Gtt` or a
+failed unbind leaks the pages deliberately.
+
+`allocate_vram(size, read_only) -> Buffer` returns zeroed pool VRAM;
+`Buffer::system(DmaBuffer, read_only)` wraps pinned system pages and
+`Buffer::uncached()` forces MTYPE_UC. `create_vm().await -> Vm` binds a free
+VMID (1–15, round robin) to a new zeroed PDB2 root and invalidates it.
+`map(&Vm, Mapping { va, offset, size, flags }, Arc<Buffer>).await` takes
+hole-stripped, page-aligned addresses below 2^48 and `AMDGPU_VM_PAGE_*`/MTYPE
+flags (PRT refused; overlap is `Invalid`). It builds GMC10 four-level tables
+(PDB2→PDB1→PDB0→PTB, 512 entries, PDE = physical | VALID, no BFS/TF) in owned
+VRAM, encodes PTEs as `gmc_v10_0_get_vm_pte` does, and invalidates the VMID on
+both hubs. `unmap(&Vm, va).await` clears an exact mapping and releases its
+buffer only after both ACKs; `destroy_vm(Vm).await` repoints the context to
+the empty root, invalidates, then frees tables and buffers. A VM holds only
+buffers explicitly mapped into it; its tables are never client buffers; each VM
+is capped at 1024 table pages. `vm_info(&Vm)` reports the VMID, generation and
+`page_table_base` a ring flush would program.
+
+Every TLB invalidation uses engine 17 per hub (GFX then MM), HDP flush first,
+MMHUB semaphore around the request, 100 ms bounded waits on `1 << vmid`.
+Entries are 64-bit stores; new tables are zeroed and HDP-flushed before their
+PDE is written. Validation/allocation errors (`Invalid`, `Allocation`,
+`Exhausted`) touch no hardware. After the first hardware access, timeout,
+revocation, removal or cancellation latch `runtime()` at `Failed`/`Busy`: every
+later operation returns `Busy`, the semaphore is not released, and all touched
+buffers/tables are retained.
+
+`Fault::decode(client, source, vmid, src_data)` accepts UTCL2 (0x1b, GFX hub)
+and VMC (0x12, MM hub) source 0, as `gmc_v10_0_process_interrupt` decodes them.
+`handle_fault(Fault)` reads `L2_PROTECTION_FAULT_STATUS`, re-arms it via
+`FAULT_CNTL` bit 0 and returns `FaultOwner::{Kernel, Vm { vmid, generation },
+Unowned}`, recording `FaultInfo` (latest address/status, count) for
+`vm_fault(&Vm)`. Retry faults are reported, never recovered. Fault interrupts
+stay masked until the IH owner calls `set_fault_interrupts(true)`;
+`Fault::from_iv(&ih::Iv)` adapts IVs from `ColdBoot::interrupts()` subscriptions
+to `ih::source::{VMC_FAULT, UTCL2_FAULT}`.
+`ColdBoot::memory()` exposes this owner after `FirmwareReady`/`Released`.
+
 ### Navi 22 SDMA0 execution proof
 
 `unsafe amdgpu_sdma_navi22::Sdma::new(gpu, pci_cap, pool)` validates SDMA 5.2.2,
@@ -3442,7 +3498,7 @@ exclude reset/PM/other clients and retain permanent mappings for the session.
 ring creation → trusted-memory setup → SMC upload → SMU version handshake →
 optional board PowerPlay upload → optional DMUB quiesce → graphics upload/autoload → RLC boot check →
 optional board calibration/protected GFX DPM setup → optional memory hubs →
-optional IH enable → optional SDMA execution test → optional SDMA TRAP
+optional GART → optional IH enable → optional SDMA execution test → optional SDMA TRAP
 interrupt round trip → optional DMUB start.
 Production cold boot emits a serial `start` and terminal `complete` or
 `failed` checkpoint for each stage. A pending/cancelled stage emits no false
@@ -3463,7 +3519,7 @@ every inherited scanout, so a boot framebuffer on this card goes dark. Failure
 or cancellation is terminal for the session. Production boot calls it; the
 explicit firmware-only callers may omit it. `Report::reset` carries the method,
 PMFW version, SOS values before/after and MEMSIZE.
-`ColdBoot::prepare_memory_hubs()` reserves the above VMID0 backing before run;
+`ColdBoot::prepare_memory_hubs()` reserves the above VMID0 backing and GART before run;
 it requires a prepared board power policy and performs no I/O. Production boot
 always calls it. Explicit firmware-only callers may omit this stage.
 `ColdBoot::prepare_sdma()` reserves the SDMA ring/writeback before run and

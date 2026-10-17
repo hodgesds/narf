@@ -1,6 +1,7 @@
-//! Navi22 VMID0 bring-up for an owned VRAM-only test aperture.
-//! Linux gfxhub_v2_1.c / mmhub_v2_0.c / gmc_v10_0.c. No system-memory PTEs,
-//! host DMA, user VMIDs, fault IRQs, clock gating or implicit recovery.
+//! Navi22 memory hubs: VMID0 bring-up for an owned VRAM test aperture, then
+//! the GART (`gart` child) and per-client GPUVM contexts (`vm` child).
+//! Linux gfxhub_v2_1.c / mmhub_v2_0.c / gmc_v10_0.c. No clock gating, KIQ/MES
+//! invalidation, retry-fault recovery or implicit reset.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip,
@@ -9,9 +10,15 @@ use crate::{
 };
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
+#[path = "amdgpu_gmc_navi22_gart.rs"]
+mod gart;
 #[path = "amdgpu_gmc_navi22_regs.rs"]
 mod regs;
+#[path = "amdgpu_gmc_navi22_vm.rs"]
+mod vm;
+pub use gart::{GartInfo, Gtt, GART_SIZE};
 use regs::{HubRegs, GFX, MM};
+pub use vm::{Buffer, Fault, FaultInfo, FaultOwner, Mapping, Vm, VmInfo};
 const BYTES: u64 = 16384; // PT, default page, source page, destination page
 const APERTURE_SIZE: u64 = 2 << 20; // 512 flat PTEs; only two are present
 const LIMIT: u64 = 1 << 48;
@@ -25,6 +32,8 @@ pub enum Error {
     Revoked,
     DeviceGone,
     Timeout,
+    /// No free VMID, GART range or page-table budget.
+    Exhausted,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hub {
@@ -37,6 +46,15 @@ pub enum State {
     Programming,
     Invalidating(Hub),
     Ready,
+    Failed,
+}
+/// Post-boot operation latch. A started GART/VM operation that fails or is
+/// cancelled leaves `Failed`/`Busy`: translations it touched may still be
+/// cached, so every later operation is refused and its memory is retained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Runtime {
+    Idle,
+    Busy,
     Failed,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +106,9 @@ trait Io {
     fn read(&mut self, address: u64) -> u32;
     fn write(&mut self, address: u64, value: u32);
     fn memory(&mut self, map: MmioRegion, offset: u64, value: u32);
+    /// One 64-bit BAR store (Linux `amdgpu_gmc_set_pte_pde` uses writeq), so
+    /// the GPU never observes a torn PTE/PDE.
+    fn memory64(&mut self, map: MmioRegion, offset: u64, value: u64);
 }
 #[derive(Debug)]
 struct Mmio(MmioRegion);
@@ -105,6 +126,20 @@ impl Io for Mmio {
         // SAFETY: initialize bounds every write to its owned BYTES allocation,
         // before publication and inside live authority.
         unsafe { map.write32(offset, value) };
+    }
+    fn memory64(&mut self, map: MmioRegion, offset: u64, value: u64) {
+        // SAFETY: callers bound each 8-byte entry inside an owned, published
+        // or still-private page-table reservation, inside live authority.
+        unsafe { map.write64(offset, value) };
+    }
+}
+/// Store entry `index` of a page table/GART page.
+fn entry<I: Io>(io: &mut I, map: MmioRegion, index: u64, value: u64) {
+    io.memory64(map, index * 8, value);
+}
+fn zero<I: Io>(io: &mut I, map: MmioRegion) {
+    for offset in (0..map.len).step_by(8) {
+        io.memory64(map, offset, 0);
     }
 }
 struct Op<F>(F);
@@ -229,6 +264,24 @@ fn program<I: Io>(
     write(io, r.ctx, 1 | 0x555400);
     Ok(())
 }
+/// Distinguishes owners so a GTT/VM/VRAM handle cannot be replayed against a
+/// different GPU's tables or VMIDs.
+static OWNERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+fn owner_token() -> u64 {
+    OWNERS.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+/// gfxhub_v2_1/mmhub_v2_0_get_invalidate_req(vmid, 0): legacy per-VMID
+/// request invalidating L2 PTE/PDE0-2 and L1 caches, status address kept.
+const fn invalidate_request(vmid: u8) -> u32 {
+    (1 << vmid) | 0xf8_0000
+}
+fn invoke<I: Io, T>(
+    authority: &Cap<BusDeviceCap, Write>,
+    io: &mut I,
+    f: impl FnOnce(&mut I) -> Result<T, Error>,
+) -> Result<T, Error> {
+    authority.invoke(Op(|| f(io))).map_err(|_| Error::Revoked)?
+}
 #[derive(Debug)]
 struct Engine<I: Io> {
     io: I,
@@ -238,13 +291,41 @@ struct Engine<I: Io> {
     vram_size: u64,
     state: State,
     aperture: Option<Aperture>,
+    pool: Pool,
+    token: u64,
+    geometry: Option<Geometry>,
+    gart: Option<gart::Gart>,
+    vms: vm::Vms,
+    runtime: Runtime,
+    fault_irqs: bool,
 }
 impl<I: Io> Engine<I> {
+    fn new(
+        io: I,
+        authority: Cap<BusDeviceCap, Write>,
+        layout: Layout,
+        pool: &Pool,
+        vram_size: u64,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            io,
+            authority,
+            layout,
+            memory: pool.reserve(BYTES).map_err(|_| Error::Allocation)?,
+            vram_size,
+            state: State::Prepared,
+            aperture: None,
+            pool: pool.clone(),
+            token: owner_token(),
+            geometry: None,
+            gart: None,
+            vms: vm::Vms::new(),
+            runtime: Runtime::Idle,
+            fault_irqs: false,
+        })
+    }
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
-        let io = &mut self.io;
-        self.authority
-            .invoke(Op(|| f(io)))
-            .map_err(|_| Error::Revoked)?
+        invoke(&self.authority, &mut self.io, f)
     }
     async fn wait(&mut self, address: u64, mask: u32) -> Result<(), Error> {
         let deadline = narf_time::Deadline::after_ms(100);
@@ -256,6 +337,61 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Timeout);
             }
             narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+        }
+    }
+    /// gmc_v10_0_flush_gpu_tlb(vmid, hub, 0) on engine 17 for each hub, GFX
+    /// then MM: HDP flush, MMHUB-only semaphore acquire (a read returning 1),
+    /// request, ACK bit `1 << vmid`, semaphore release. Linux logs and goes
+    /// on after a timeout; here a timeout fails closed (no release/replay)
+    /// because the invalidation may still be outstanding.
+    async fn flush_tlb(&mut self, vmid: u8, boot: bool) -> Result<(), Error> {
+        let layout = self.layout;
+        for (index, hub, r) in [(0, Hub::Gfx, GFX), (1, Hub::Mm, MM)] {
+            if boot {
+                self.state = State::Invalidating(hub);
+            }
+            let base = layout.bases[index];
+            if hub == Hub::Mm {
+                self.wait(base + u64::from(r.inv_sem) * 4, 1).await?;
+            }
+            self.access(|io| {
+                flush(io, layout.nbio);
+                io.write(base + u64::from(r.inv_req) * 4, invalidate_request(vmid));
+                Ok(())
+            })?;
+            self.wait(base + u64::from(r.inv_ack) * 4, 1 << vmid)
+                .await?;
+            if hub == Hub::Mm {
+                self.access(|io| {
+                    io.write(base + u64::from(r.inv_sem) * 4, 0);
+                    Ok(())
+                })?;
+            }
+        }
+        Ok(())
+    }
+    /// Admit one post-boot operation after its host-only validation and
+    /// allocation succeeded. Only `finish` returns the latch to Idle.
+    fn begin(&mut self) -> Result<(), Error> {
+        if self.state != State::Ready || self.runtime != Runtime::Idle {
+            return Err(Error::Busy);
+        }
+        self.runtime = Runtime::Busy;
+        Ok(())
+    }
+    fn finish<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
+        self.runtime = if result.is_ok() {
+            Runtime::Idle
+        } else {
+            Runtime::Failed
+        };
+        result
+    }
+    fn idle(&self) -> Result<(), Error> {
+        if self.state != State::Ready || self.runtime != Runtime::Idle {
+            Err(Error::Busy)
+        } else {
+            Ok(())
         }
     }
     async fn initialize(&mut self) -> Result<Aperture, Error> {
@@ -320,31 +456,14 @@ impl<I: Io> Engine<I> {
         })?;
         self.memory.publish(); // before either hub can retain a PT/default address
         self.aperture = Some(geometry.aperture);
+        self.geometry = Some(geometry);
         self.access(|io| {
             for (base, r) in layout.bases.into_iter().zip([GFX, MM]) {
                 program(io, base, r, geometry, address)?;
             }
             Ok(())
         })?;
-        for (index, hub, r) in [(0, Hub::Gfx, GFX), (1, Hub::Mm, MM)] {
-            self.state = State::Invalidating(hub);
-            let base = layout.bases[index];
-            if hub == Hub::Mm {
-                self.wait(base + u64::from(r.inv_sem) * 4, 1).await?;
-            }
-            self.access(|io| {
-                flush(io, layout.nbio);
-                io.write(base + u64::from(r.inv_req) * 4, 0xf80001); // VMID0 + all PT caches
-                Ok(())
-            })?;
-            self.wait(base + u64::from(r.inv_ack) * 4, 1).await?;
-            if hub == Hub::Mm {
-                self.access(|io| {
-                    io.write(base + u64::from(r.inv_sem) * 4, 0);
-                    Ok(())
-                })?;
-            }
-        }
+        self.flush_tlb(0, true).await?;
         Ok(geometry.aperture)
     }
 }
@@ -365,15 +484,7 @@ impl Gmc {
     ) -> Result<Self, Error> {
         let layout = Layout::resolve(gpu)?;
         Ok(Self {
-            engine: Engine {
-                io: Mmio(gpu.regs),
-                authority,
-                layout,
-                memory: pool.reserve(BYTES).map_err(|_| Error::Allocation)?,
-                vram_size: gpu.vram.size,
-                state: State::Prepared,
-                aperture: None,
-            },
+            engine: Engine::new(Mmio(gpu.regs), authority, layout, pool, gpu.vram.size)?,
         })
     }
     /// # Safety
@@ -386,8 +497,80 @@ impl Gmc {
     pub fn state(&self) -> State {
         self.engine.state
     }
+    pub fn runtime(&self) -> Runtime {
+        self.engine.runtime
+    }
     pub fn aperture(&self) -> Option<Aperture> {
         self.engine.aperture
+    }
+    /// Reserve the 1 MiB GART table and the shared empty user root before
+    /// any hub programming. No I/O; dropping it unused returns the VRAM.
+    pub fn prepare_gart(&mut self) -> Result<(), Error> {
+        self.engine.prepare_gart()
+    }
+    pub fn gart_prepared(&self) -> bool {
+        self.engine.gart.is_some()
+    }
+    /// Replace the flat VMID0 table with the GART and arm user contexts 1–15
+    /// on an empty root. Requires `Ready`; keeps the boot `Aperture` mapped.
+    /// # Safety
+    /// Same exclusive ownership as `initialize`; no queue may be running in
+    /// any VMID while the VMID0 table base changes.
+    pub async unsafe fn enable_gart(&mut self) -> Result<GartInfo, Error> {
+        self.engine.enable_gart().await
+    }
+    pub fn gart(&self) -> Option<GartInfo> {
+        self.engine.gart.as_ref().and_then(gart::Gart::info)
+    }
+    /// Map one pinned, contiguous system DMA buffer into VMID0's GART.
+    /// The buffer is owned by the returned handle; a dropped handle or a
+    /// failed unbind quarantines the pages because the GPU may still use them.
+    pub async fn bind_gtt(
+        &mut self,
+        buffer: narf_io::DmaBuffer,
+        writable: bool,
+    ) -> Result<Gtt, Error> {
+        self.engine.bind_gtt(buffer, writable).await
+    }
+    /// Clear the GART entries, invalidate both hubs, then return the pages.
+    pub async fn unbind_gtt(&mut self, gtt: Gtt) -> Result<narf_io::DmaBuffer, Error> {
+        self.engine.unbind_gtt(gtt).await
+    }
+    /// Allocate zeroed, CPU-visible VRAM from this owner's pool for user VMs.
+    pub fn allocate_vram(&mut self, size: u64, read_only: bool) -> Result<Buffer, Error> {
+        self.engine.allocate_vram(size, read_only)
+    }
+    pub async fn create_vm(&mut self) -> Result<Vm, Error> {
+        self.engine.create_vm().await
+    }
+    pub async fn map(
+        &mut self,
+        vm: &Vm,
+        mapping: Mapping,
+        buffer: alloc::sync::Arc<Buffer>,
+    ) -> Result<(), Error> {
+        self.engine.map(vm, mapping, buffer).await
+    }
+    pub async fn unmap(&mut self, vm: &Vm, va: u64) -> Result<(), Error> {
+        self.engine.unmap(vm, va).await
+    }
+    pub async fn destroy_vm(&mut self, vm: Vm) -> Result<(), Error> {
+        self.engine.destroy_vm(vm).await
+    }
+    pub fn vm_info(&self, vm: &Vm) -> Option<VmInfo> {
+        self.engine.vm_info(vm)
+    }
+    /// Last fault recorded against this VM (Linux `vm->fault_info`).
+    pub fn vm_fault(&self, vm: &Vm) -> Option<FaultInfo> {
+        self.engine.vm_fault(vm)
+    }
+    /// Interrupt-handler hook for decoded VMC/UTCL2 fault IVs.
+    pub fn handle_fault(&mut self, fault: Fault) -> Result<FaultOwner, Error> {
+        self.engine.handle_fault(fault)
+    }
+    /// gmc_v10_0_vm_fault_interrupt_state. Enable only once an IH owner drains.
+    pub fn set_fault_interrupts(&mut self, enable: bool) -> Result<(), Error> {
+        self.engine.set_fault_interrupts(enable)
     }
     pub(crate) fn test_mapping(&mut self) -> Option<MmioRegion> {
         if self.state() != State::Ready {
@@ -405,3 +588,6 @@ impl Gmc {
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_gmc_navi22_tests.rs"]
 mod tests;
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_gmc_navi22_vm_tests.rs"]
+mod vm_tests;
