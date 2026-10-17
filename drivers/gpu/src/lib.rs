@@ -232,6 +232,7 @@ pub mod amdgpu_navi22_platform;
 pub mod amdgpu_navi22_power;
 pub mod amdgpu_navi22_power_policy;
 pub mod amdgpu_navi22_recovery;
+pub mod amdgpu_navi22_scanout;
 pub mod amdgpu_navi22_tdr;
 pub mod amdgpu_navi22_thermal;
 pub mod amdgpu_navi48_boot;
