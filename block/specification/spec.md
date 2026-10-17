@@ -195,6 +195,24 @@ pub fn registry::format_uuid_bytes(&[u8; 16]) -> String;
 (`pci-<bdf>-nvme-<nsid>`), `-part<N>` for partitions; sysfs exposes `wwid`,
 `nsid`, `eui`, `nguid`, `uuid` and `device/{model,serial,firmware_rev}`.
 
+**Durability (flush / FUA).** `BlockDeviceSync` carries the write-cache
+contract (Linux `REQ_PREFLUSH` / `REQ_FUA`):
+
+```rust
+fn flush(&self) -> Result<(), BlockIoError>;          // default Ok (write-through)
+fn write_fua(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError>;
+                                                       // default: write, then flush
+fn capabilities(&self) -> BlockCaps;                   // { volatile_cache, fua }
+// async: BlockDevice::flush_result() -> Result<(), BlockError> (default: flush + Ok);
+//        BlockOp::Write { fua: true } → write_fua through SyncBlock.
+```
+
+`flush` returns only after every write completed before it is durable.
+`write_fua` makes its own data durable but does not order earlier writes
+(btrfs `write_all_supers`: flush, then the superblock FUA). `PolicyGuard`,
+`PartitionBlockDevice` and `EncryptedBlockDevice` forward all three; the guard
+forwards `flush` even while it refuses writes (a flush carries no data).
+
 Every device entering the registry is wrapped in a
 `disk_policy::PolicyGuard`; `RegisteredBlockDevice::disk` is its physical-disk
 identity (`DiskId`, never reused), shared by a disk and the partitions the

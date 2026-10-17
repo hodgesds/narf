@@ -366,6 +366,10 @@ Limits. Exactly what this does and does not cover:
     Intel ICH9.
   - Probing these disks only reads. Controller setup (NVMe queue creation,
     the AHCI HBA reset and SATA link reset) does not change media.
+  - On reboot and power-off NARF sends every NVMe controller a Flush (when
+    it has a volatile write cache) and then the CC.SHN normal-shutdown
+    notification, as Linux does (`nvme: nvme<C>: flushed ... CC.SHN normal
+    shutdown: Complete`). Neither carries data or changes media contents.
 - **Testing.** This is validated in QEMU (block-layer model tests, a
   two-controller NVMe model and a two-controller QEMU run, ext and btrfs
   read-only mount tests, and the `usb-image --qemu` decoy hashes with two

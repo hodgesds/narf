@@ -158,6 +158,13 @@ enum Cmd {
     /// keystrokes → narf_input ring → /dev/console → sys_read fd 0 →
     /// shell parser → echo built-in → sys_write fd 1 → UART.
     RunInteractive(RunInteractiveArgs),
+    /// NVMe flush + clean-shutdown check: boot with an extra scratch NVMe
+    /// disk (`nvme0`), write a token to it from the shell, `poweroff`, and
+    /// require every controller's `CC.SHN normal shutdown: Complete`; then
+    /// boot again on the same image (QEMU `cache=writeback`, so only a real
+    /// Flush makes the write durable on the host) and read the token back.
+    /// `--cmd` / `--expect` are ignored.
+    NvmePoweroffCheck(RunInteractiveArgs),
     /// Live TCP/UDP/DNS network-stack smoke. Boot with `qemu-net` (statically
     /// configures the virtio NIC with the SLIRP lease) + TCP and UDP QEMU
     /// `hostfwd` rules, round-trip payloads from the host through the guest
@@ -5786,6 +5793,49 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
     if failed > 0 {
         bail!("musl-demo failed ({} errors)", failed);
     }
+    Ok(())
+}
+
+/// `xtask nvme-poweroff-check` (see the `Cmd` doc).
+fn nvme_poweroff_check_cmd(args: &RunInteractiveArgs) -> Result<()> {
+    const TOKEN: &str = "NARF-FLUSH-TOKEN-7";
+    let root = workspace_root()?;
+    let img = root.join("target").join("narf-nvme-flushchk.img");
+    let _ = std::fs::remove_file(&img);
+    std::fs::File::create(&img)?.set_len(64 * 1024)?;
+    let prior = std::env::var("NARF_QEMU_EXTRA").ok();
+    // Listed before the default NVMe disk, so it probes as nvme0.
+    std::env::set_var(
+        "NARF_QEMU_EXTRA",
+        format!(
+            "{} -drive if=none,id=fchk,format=raw,cache=writeback,file={} \
+             -device nvme,drive=fchk,serial=flushchk",
+            prior.clone().unwrap_or_default(),
+            img.display()
+        ),
+    );
+    let result = (|| -> Result<()> {
+        let mut first = args.clone();
+        first.cmd = format!("/bin/echo {TOKEN} > /dev/nvme0n1; poweroff");
+        first.expect = "CC.SHN normal shutdown: Complete".into();
+        println!("xtask nvme-poweroff-check: boot 1 — write the token, poweroff");
+        run_interactive_cmd(&first)?;
+        let bytes = std::fs::read(&img)?;
+        if !bytes.starts_with(TOKEN.as_bytes()) {
+            bail!("the token is not on the host image after poweroff");
+        }
+        let mut second = args.clone();
+        second.cmd = "cat /dev/nvme0n1".into();
+        second.expect = TOKEN.into();
+        println!("xtask nvme-poweroff-check: boot 2 — read the token back");
+        run_interactive_cmd(&second)
+    })();
+    match prior {
+        Some(v) => std::env::set_var("NARF_QEMU_EXTRA", v),
+        None => std::env::remove_var("NARF_QEMU_EXTRA"),
+    }
+    result?;
+    println!("xtask nvme-poweroff-check: ok — flushed write survived poweroff + restart");
     Ok(())
 }
 
@@ -12642,6 +12692,7 @@ fn main() -> Result<()> {
         Cmd::BtrfsCrashSmoke(args) => btrfs_crash::run(&args),
         Cmd::Http3Smoke(args) => http3_smoke::run(&args),
         Cmd::RunInteractive(args) => run_interactive_cmd(&args),
+        Cmd::NvmePoweroffCheck(args) => nvme_poweroff_check_cmd(&args),
         Cmd::NetSmoke(args) => net_smoke_cmd(&args),
         Cmd::E1000ModuleNetSmoke(args) => e1000_module_net_smoke_cmd(&args),
         Cmd::IgbNetSmoke(args) => igb_net_smoke_cmd(&args),
