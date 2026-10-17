@@ -161,7 +161,9 @@ exit status checked (a signal always fails the run):
 | `ffmpeg-vaapi` | ffmpeg's VA hwaccel on `/video/h264.mkv` | any rc, no signal |
 
 `IOCTL …` lines interleaved in the output come from `narf_ioctl_trace.so`
-(LD_PRELOAD on the `drm`, `vk-radv` and `egl-*` steps): one line per DRM
+(LD_PRELOAD on the `drm`, `vk-radv`, `egl-*` and `va` steps). A step
+"crashes" only on a signal exit (129–192); ffmpeg's negative AVERROR exits
+(251–255) are ordinary errors: one line per DRM
 ioctl with the AMDGPU_INFO query decoded and the kernel's answer.
 `MESA_AMD_HOST_CHECK=1 sh REGEN_amd_gl_rootfs.sh` runs the same script in a
 user-namespace chroot on the build host; on a Linux host with an amdgpu GPU
@@ -182,6 +184,15 @@ init fails cleanly, GBM falls back to kms_swrast). The kernel's
 `ld-musl` must be staged for `chroot_run` to exec — on a host without a musl
 package, point `LDMUSL_PATH` at the build root's
 `/lib/ld-musl-x86_64.so.1`.
+
+**Video under QEMU** (2026-10-17, VA-API + Vulkan video build, same
+backend): `MESA-AMD-OK`. `libs` resolves `__vaDriverInit_1_24` in
+`radeonsi_drv_video.so` (libva 2.24); `va` gets `vaInitialize` = 2
+("resource allocation failed") on both render nodes, `amd_va=0`; `vainfo`
+exits 3 and `ffmpeg -hwaccel vaapi` on `/video/h264.mkv` exits 251
+(AVERROR(EIO), "Device creation failed: -5") — clean errors, no signal.
+The image build generated all four reference clips (H.264, HEVC, AV1 via
+Alpine's ffmpeg, JPEG) and their MD5s.
 
 **Same binaries on a Linux host** (`MESA_AMD_HOST_CHECK=1`, amdgpu 3.64,
 Raphael iGPU GC 10.3.6 — not Navi22): `MESA-AMD-HW=amd`. radeonsi

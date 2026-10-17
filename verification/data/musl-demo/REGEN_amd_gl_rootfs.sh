@@ -113,14 +113,16 @@ TRACE=/usr/lib/narf/narf_ioctl_trace.so
 ls -l /dev/dri 2>&1
 FAIL=0
 
-# step <name> <must-succeed:1|0> cmd...  — a signal (rc >= 128) always fails.
+# step <name> <must-succeed:1|0> cmd...  — a signal (rc 129..192, the
+# shell's 128 + signo) always fails; ffmpeg's negative AVERROR exits
+# (251..255) are ordinary errors.
 step() {
     name=$1; must=$2; shift 2
     echo "MESA-AMD-STEP $name begin"
     "$@" > "$name.log" 2>&1
     rc=$?
     cat "$name.log"
-    if [ "$rc" -ge 128 ]; then
+    if [ "$rc" -gt 128 ] && [ "$rc" -le 192 ]; then
         echo "MESA-AMD-STEP $name CRASH rc=$rc"; FAIL=1
     elif [ "$must" = 1 ] && [ "$rc" != 0 ]; then
         echo "MESA-AMD-STEP $name FAIL rc=$rc"; FAIL=1
