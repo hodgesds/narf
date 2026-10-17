@@ -278,8 +278,7 @@ impl WirelessNetIface for Mt76Iface {
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            let _ = bss;
-            let _ = security;
+            let _ = (bss, security);
             Err(WirelessError::NotSupported)
         }
     }
