@@ -257,15 +257,15 @@ fn navi22_hw_ip_and_submission_switch() -> TestResult {
         )
     };
     // The production switch: nothing is advertised.
-    let closed = SUBMISSION == Submission::NotWired
-        && accel(SUBMISSION, &s) == 0
+    let n = Submission::NotWired;
+    let closed = accel(n, &s) == 0
         && [
             uapi::AMDGPU_HW_IP_GFX,
             uapi::AMDGPU_HW_IP_COMPUTE,
             uapi::AMDGPU_HW_IP_DMA,
         ]
         .iter()
-        .all(|&ip| info(SUBMISSION, ip).available_rings == 0 && count(SUBMISSION, ip) == 0);
+        .all(|&ip| info(n, ip).available_rings == 0 && count(n, ip) == 0);
     // Wired with verified queues: Linux's masks min(entities, rings).
     let w = Submission::Wired;
     let d: uapi::DrmAmdgpuInfoDevice =

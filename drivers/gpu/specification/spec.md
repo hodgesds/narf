@@ -92,8 +92,11 @@ boot }` carries the inputs, published by `amdgpu_info::publish_navi22_topology`
 (after a successful cold boot, from `ColdBoot::uapi_versions` and the
 report). Unpublished inputs leave the corresponding fields zero.
 `amdgpu_info_navi22::SUBMISSION` is the single switch for ACCEL_WORKING,
-`available_rings`, HW_IP_COUNT and GANG_SUBMIT; it is `NotWired`, and even
-when wired requires `Boot::queues_verified`.
+`available_rings`, HW_IP_COUNT, GANG_SUBMIT, the DRM minor (3.64.0 vs
+3.0.0) and the render ioctls; it is `Wired`, and still advertises nothing
+unless `Boot::queues_verified`. VIDEO_CAPS returns the Sienna Cichlid
+codec tables for the discovered VCN instances; MAX_IBS reports
+`amdgpu_navi22_submit::MAX_IBS` (16) for advertised rings.
 
 `unsafe amdgpu_gfx10_topology::read(gpu, pci_cap)` requires exclusive GRBM
 selector ownership with RLC booted and GFX powered. It samples the NBIO
@@ -3548,6 +3551,36 @@ Sienna Cichlid `AMDGPU_INFO_VIDEO_CAPS` tables (decode VCN0 with AV1, or VCN1
 when VCN0 is harvested; encode AVC 4096² and HEVC 8192×4352) as
 `DrmAmdgpuInfoVideoCaps`; `None` for an unknown subquery or no VCN. Not yet
 wired into the INFO ioctl.
+
+### Navi 22 client submission and render ABI
+
+`amdgpu_navi22_submit` queues client IBs on the verified kernel queues:
+`Gfx::submit`, `Compute::submit`, `Sdma::submit(instance, ..)` (and
+`ColdBoot::submit(ring, &mut RingState, VmRef, context, &[Ib])`,
+`ColdBoot::fences(ring) -> (completed, throttle)`) emit pipeline sync and a
+ring-side VM flush (PTB write + GFXHUB invalidation on the ring's engine:
+gfx 0, compute 4, SDMA 13/14; PFP_SYNC_ME on gfx) the first time a VM
+generation runs on that ring, CONTEXT_CONTROL/FRAME_CONTROL on gfx, up to 16
+IBs with the VMID, then the ring fence. `validate` refuses VMID 0/>15,
+empty or oversized IB lists, unaligned or zero-length IBs. At most two
+submissions are outstanding per ring; a third returns `Busy` without
+touching the ring.
+
+`amdgpu_navi22_drm::{ioctl, handles, FileState, Device, Platform}` answers,
+for an active Navi 22 (`Platform::active`: bound, queues verified,
+`SUBMISSION` wired), `DRM_IOCTL_AMDGPU_{GEM_CREATE, GEM_MMAP, GEM_VA,
+GEM_WAIT_IDLE, GEM_OP, GEM_METADATA, BO_LIST, CS, WAIT_CS, WAIT_FENCES,
+FENCE_TO_HANDLE}`, `GEM_CLOSE` of its handles (≥ `HANDLE_BASE`), VERSION,
+the render GET_CAPs and DRM syncobjs (binary and timeline: CREATE, DESTROY,
+WAIT, TIMELINE_WAIT, RESET, SIGNAL, TIMELINE_SIGNAL, QUERY, TRANSFER) on both
+amdgpu nodes through `ioctl_user`, plus mmap of its GEM offsets and PRIME
+export/import of same-device BOs. Each open owns one GPUVM created on first
+use and destroyed at close. Timeouts are absolute CLOCK_MONOTONIC; a timed
+out syncobj wait returns `-ETIME`, a CS on a context older than the last
+recovery `-ECANCELED`. `amdgpu_ctx` QUERY_STATE/QUERY_STATE2 report
+recoveries. `drm_ioctl_bridge::get_client` implements `DRM_IOCTL_GET_CLIENT`
+(`drm_getclient`) on primary nodes; render nodes refuse it with EACCES.
+`amdgpu_navi22_platform::{owner, queues_ready}` serialise device access.
 
 ### Navi 22 DCN3.0 DMUB startup
 

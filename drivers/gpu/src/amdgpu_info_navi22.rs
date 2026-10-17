@@ -21,10 +21,8 @@
 //!
 //! [`SUBMISSION`] is the one place that decides whether userspace is told the
 //! GPU accepts work: `ACCEL_WORKING`, every `available_rings` mask,
-//! `HW_IP_COUNT` and `AMDGPU_IDS_FLAGS_GANG_SUBMIT` all derive from it. The
-//! kernel queues exist and pass their ring/IB tests, but `AMDGPU_CS` does not
-//! yet run client IBs on them under per-client VMIDs, so it stays
-//! [`Submission::NotWired`].
+//! `HW_IP_COUNT` and `AMDGPU_IDS_FLAGS_GANG_SUBMIT` all derive from it, as do
+//! the DRM version minor and the native render ioctls (`amdgpu_navi22_drm`).
 //!
 //! LINUX-GAP: `gpu_counter_freq` (VBIOS gfx_info refclk), `vram_type` /
 //! `vram_bit_width` (VBIOS vram_info), memory clocks (SMU UCLK range),
@@ -54,10 +52,15 @@ pub enum Submission {
     Wired,
 }
 
-/// THE switch. Flip to [`Submission::Wired`] only in the change that makes
-/// `AMDGPU_CS` run client IBs on the verified kernel queues with user VMIDs
-/// and fences (plan milestone 8), together with DRM minor 64 on the card.
-pub const SUBMISSION: Submission = Submission::NotWired;
+/// THE switch. `Wired` since `AMDGPU_CS` runs client IBs on the verified
+/// kernel queues under per-client VMIDs with fences (`amdgpu_navi22_drm`,
+/// `amdgpu_navi22_submit`; register-model proof
+/// `navi22_submit_gfx_user_vmid_ib_executes_and_fences`). Even wired,
+/// nothing is advertised unless the cold boot's ring/IB tests passed
+/// ([`Boot::queues_verified`]). Setting it to `NotWired` withdraws
+/// ACCEL_WORKING, every ring mask, HW_IP_COUNT, GANG_SUBMIT, DRM minor 64 and
+/// the render ioctls at once.
+pub const SUBMISSION: Submission = Submission::Wired;
 
 /// `AMDGPU_VM_RESERVED_VRAM`.
 const VM_RESERVED_VRAM: u64 = 8 << 20;
@@ -493,6 +496,36 @@ fn vram_gtt(snap: &Snapshot) -> Vec<u8> {
     })
 }
 
+/// `AMDGPU_INFO_VIDEO_CAPS` (`nv_query_video_codecs`): VCN instances absent
+/// from discovery are harvested. Linux answers it whether or not media rings
+/// run; Mesa only acts on it once VCN rings are advertised (they are not).
+fn video_caps(snap: &Snapshot, kind: u32) -> Result<Vec<u8>, FsError> {
+    let mut harvested = 0u8;
+    for inst in 0..2u8 {
+        if discovery::find_ip(&snap.ip_blocks, discovery::HW_ID_VCN, inst).is_none() {
+            harvested |= 1 << inst;
+        }
+    }
+    crate::amdgpu_video_caps_navi22::caps(kind, harvested)
+        .map(|caps| as_bytes(&caps))
+        .ok_or(FsError::InvalidData)
+}
+
+/// `AMDGPU_INFO_MAX_IBS`: `u32[AMDGPU_HW_IP_NUM]`, the IBs one CS may carry
+/// per ring type; the native queues take `amdgpu_navi22_submit::MAX_IBS`.
+fn max_ibs(published: &Published, submission: Submission) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 * uapi::AMDGPU_HW_IP_NUM as usize);
+    for ip in 0..uapi::AMDGPU_HW_IP_NUM {
+        let n = if available_rings(published, submission, ip) != 0 {
+            crate::amdgpu_navi22_submit::MAX_IBS as u32
+        } else {
+            0
+        };
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+    out
+}
+
 /// The Navi 22 reply, or `None` for a query the generic path answers.
 pub(crate) fn query(
     snap: &Snapshot,
@@ -519,6 +552,8 @@ pub fn query_with(
         uapi::AMDGPU_INFO_FW_VERSION => fw_version(snap, payload),
         uapi::AMDGPU_INFO_READ_MMR_REG => read_mmr_reg(snap, payload),
         uapi::AMDGPU_INFO_MEMORY => Ok(memory(snap)),
+        uapi::AMDGPU_INFO_VIDEO_CAPS => video_caps(snap, payload[0]),
+        uapi::AMDGPU_INFO_MAX_IBS => Ok(max_ibs(&snap.navi22, submission)),
         uapi::AMDGPU_INFO_VRAM_GTT => Ok(vram_gtt(snap)),
         _ => return None,
     })

@@ -44,9 +44,9 @@ const INV_REQ: u32 = 0x161f;
 const INV_ACK: u32 = 0x1631;
 /// `amdgpu_sched_hw_submission` default.
 pub const HW_SUBMISSIONS: u32 = 2;
-/// Largest IB count per submission (`AMDGPU_CS_MAX_IBS_PER_SUBMIT` is 16;
-/// two frames of the 2048-dword ring bound us to fewer).
-pub const MAX_IBS: usize = 4;
+/// Largest IB count per submission (`AMDGPU_CS_MAX_IBS_PER_SUBMIT`); 16
+/// frames of at most 13 dwords stay far inside one ring half.
+pub const MAX_IBS: usize = 16;
 /// Largest single IB, in dwords (`length_dw` is 20 bits in the packet).
 pub const MAX_IB_DWORDS: u32 = (1 << 20) - 1;
 
@@ -100,6 +100,14 @@ pub struct VmRef {
 pub struct RingState {
     flushed: [u64; 16],
     context: u64,
+}
+impl RingState {
+    pub const fn new() -> Self {
+        Self {
+            flushed: [0; 16],
+            context: 0,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments, reason = "mirrors gfx_v10_0_wait_reg_mem")]

@@ -943,7 +943,11 @@ ring and IB/fence tests after `DmubStart`. Navi22 `AMDGPU_INFO` now answers
 DEV_INFO, HW_IP_INFO/COUNT, FW_VERSION, READ_MMR_REG (GB_ADDR_CONFIG) and
 MEMORY as Linux does for GC 10.3.2, from a cold-boot harvest sample, the
 loaded firmware headers and the PCI revision; ACCEL_WORKING and ring masks
-stay behind one switch until CS runs client work (ABI audit:
+sit behind one switch, now wired: client IBs run on the Navi22 kernel queues
+under per-open GPUVM VMIDs (ring-side VM flush, fences, two in flight per
+ring), with native GEM/VA/BO_LIST/CS/WAIT_CS/WAIT_FENCES/FENCE_TO_HANDLE,
+binary and timeline syncobjs, PRIME of Navi22 BOs, DRM 3.64.0 and
+GET_CLIENT, proven in register/fake-device models only (ABI audit:
 `drivers/gpu/research/navi22-mesa-abi.md`). Fences poll with an IH notify hook;
 register models cover encodings, rejection, timeouts and cancellation only.
 Production cold boot now resets a posted card before any firmware stage, as

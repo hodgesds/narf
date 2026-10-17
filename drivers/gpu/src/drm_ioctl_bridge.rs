@@ -5176,3 +5176,35 @@ fn c_str_bytes(buf: &[u8]) -> &[u8] {
     let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     &buf[..n]
 }
+
+/// `DRM_IOWR(0x05, struct drm_client)`: idx i32, auth i32, then pid, uid,
+/// magic and iocs as `unsigned long` — 40 bytes on LP64.
+pub const DRM_IOCTL_GET_CLIENT: u32 = 0xc028_6405;
+
+/// Linux `drm_getclient`, the "hollowed-out" form kept for old tools and for
+/// libdrm's `amdgpu_get_auth`: client 0 is the caller (its authentication,
+/// its pid, `overflowuid`, no magic, no ioctl count); any other index is
+/// EINVAL.
+pub fn get_client(
+    arg: u64,
+    context: &dyn narf_filesystem::IoctlContext,
+    authenticated: bool,
+) -> Result<u64, FsError> {
+    let mut client = [0u8; 40];
+    context
+        .read(arg, &mut client)
+        .map_err(|_| FsError::BadAddress)?;
+    if i32::from_le_bytes(client[0..4].try_into().unwrap()) != 0 {
+        return Err(FsError::InvalidData);
+    }
+    /// `overflowuid` default.
+    const OVERFLOW_UID: u64 = 65534;
+    client[4..8].copy_from_slice(&i32::from(authenticated).to_le_bytes());
+    client[8..16].copy_from_slice(&u64::from(context.process_id()).to_le_bytes());
+    client[16..24].copy_from_slice(&OVERFLOW_UID.to_le_bytes());
+    client[24..40].fill(0);
+    context
+        .write(arg, &client)
+        .map_err(|_| FsError::BadAddress)?;
+    Ok(0)
+}

@@ -231,6 +231,7 @@ pub mod amdgpu_native_kms;
 pub mod amdgpu_navi22_bios;
 pub mod amdgpu_navi22_boot;
 pub mod amdgpu_navi22_display;
+pub mod amdgpu_navi22_drm;
 pub mod amdgpu_navi22_kms;
 pub mod amdgpu_navi22_modeset;
 pub mod amdgpu_navi22_platform;

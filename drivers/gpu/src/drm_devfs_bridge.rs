@@ -136,6 +136,9 @@ pub struct DriCardFile {
     amdgpu_vm: crate::amdgpu_vm::VmState,
     /// Per-open submission contexts (`fpriv->ctx_mgr`).
     amdgpu_ctx: crate::amdgpu_ctx::CtxState,
+    /// Per-open Navi 22 render state (GEM/VA/CS/syncobjs), when that
+    /// device is bound and accelerated.
+    navi22: Arc<crate::amdgpu_navi22_drm::FileState>,
     /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
     client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
     /// Per-open flip-complete queue. The event's opaque `user_data` belongs to
@@ -182,6 +185,7 @@ impl DriCardFile {
             amdgpu_gem: crate::amdgpu_gem::GemState::new(),
             amdgpu_vm: crate::amdgpu_vm::VmState::new(),
             amdgpu_ctx: crate::amdgpu_ctx::CtxState::new(),
+            navi22: Arc::default(),
             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
             events: narf_lib::sync::IrqSafeSpinLock::new(crate::drm::card::DrmEventQueue::new()),
             pending_out_fences: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
@@ -206,6 +210,7 @@ impl DriCardFile {
 
 impl Drop for DriCardFile {
     fn drop(&mut self) {
+        release_navi22(&self.navi22);
         // Quiesce any virtio-gpu host resources this open created (Mesa may
         // build its render context + resources on the card node, not just the
         // render node — see the `virtgpu` field). Mirrors DriRenderFile::drop:
@@ -477,6 +482,26 @@ impl FileOps for DriCardFile {
             {
                 crate::drm_ioctl_bridge::wait_atomic_in_fences(arg, context)?;
             }
+            if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+                if let Some(result) = crate::amdgpu_navi22_drm::ioctl(
+                    &self.navi22,
+                    &self.amdgpu_ctx,
+                    cmd,
+                    arg,
+                    context,
+                )
+                .await
+                {
+                    return result;
+                }
+            }
+            // drm_getclient, which libdrm's amdgpu_get_auth issues on every
+            // primary node before anything else.
+            if cmd == crate::drm_ioctl_bridge::DRM_IOCTL_GET_CLIENT {
+                let authenticated = crate::drm_registry::mode_state(self.index)
+                    .is_some_and(|m| m.lock().is_master(self.open_id));
+                return crate::drm_ioctl_bridge::get_client(arg, context, authenticated);
+            }
             // A blocking vblank wait sleeps until its vblank.
             if crate::drm_ioctl_bridge::is_wait_vblank_ioctl(cmd) {
                 return crate::drm_ioctl_bridge::wait_vblank_for_file(
@@ -514,6 +539,9 @@ impl FileOps for DriCardFile {
                 } else if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
                     // An amdgpu GEM offset, from this open's table only — a
                     // client cannot map a buffer it does not hold a handle to.
+                    if self.navi22.mmap_owner(offset).is_some() {
+                        return self.navi22.mmap_frames(offset, len);
+                    }
                     self.amdgpu_gem.mmap_frames(offset, len)
                 } else {
                     Err(dumb_miss)
@@ -525,6 +553,9 @@ impl FileOps for DriCardFile {
     fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>> {
         if let Some(lease) = retain_dumb_mapping(self.index, offset, len) {
             return Some(lease as Arc<dyn MmapLifetime>);
+        }
+        if let Some(bo) = self.navi22.mmap_owner(offset) {
+            return Some(bo as Arc<dyn MmapLifetime>);
         }
         if crate::drm_registry::driver_name(self.index) != Some("virtio_gpu") {
             return None;
@@ -542,6 +573,9 @@ impl FileOps for DriCardFile {
     }
 
     fn drm_prime_export_file(&self, gem_handle: u32) -> Result<Arc<dyn FileOps>, FsError> {
+        if let Some(file) = navi22_export(&self.navi22, gem_handle) {
+            return Ok(file);
+        }
         let Some(resource) = self.virtgpu.export_resource(gem_handle) else {
             return Err(FsError::Unsupported);
         };
@@ -552,6 +586,9 @@ impl FileOps for DriCardFile {
     }
 
     fn drm_prime_import_file(&self, dmabuf: &Arc<dyn FileOps>) -> Result<u32, FsError> {
+        if let Some(result) = navi22_import(&self.navi22, dmabuf) {
+            return result;
+        }
         let prime = dmabuf
             .as_any()
             .and_then(|any| any.downcast_ref::<VirtGpuPrimeDmaBufFile>())
@@ -799,6 +836,82 @@ impl FileOps for VirtGpuPrimeDmaBufFile {
     }
 }
 
+/// A PRIME dma-buf of a Navi 22 GEM object: CPU-mappable through the
+/// object's frames and keeping the object alive while any mapping or fd
+/// exists. Imports into a Navi 22 open name the same object.
+struct Navi22PrimeDmaBufFile {
+    bo: Arc<crate::amdgpu_gmc_navi22::Buffer>,
+    frames: Vec<u64>,
+    size: u64,
+    inode: narf_filesystem::inode_id::InodeId,
+}
+impl core::fmt::Debug for Navi22PrimeDmaBufFile {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Navi22PrimeDmaBufFile")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+impl FileOps for Navi22PrimeDmaBufFile {
+    fn ino(&self) -> u64 {
+        self.inode.ino
+    }
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        self.inode.attrs()
+    }
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Ok(0) })
+    }
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Err(FsError::InvalidData) })
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            size: self.size,
+            blocks: self.size.div_ceil(512),
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o600,
+            },
+            mtime_cycles: 0,
+        }
+    }
+    fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
+        if offset & 0xfff != 0 || len == 0 || offset.saturating_add(len as u64) > self.size {
+            return Err(FsError::InvalidData);
+        }
+        let first = (offset / 4096) as usize;
+        Ok(self.frames[first..first + (len as u64).div_ceil(4096) as usize].to_vec())
+    }
+    fn mmap_lifetime(&self, _offset: u64, _len: usize) -> Option<Arc<dyn MmapLifetime>> {
+        Some(Arc::clone(&self.bo) as Arc<dyn MmapLifetime>)
+    }
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+}
+fn navi22_export(
+    state: &crate::amdgpu_navi22_drm::FileState,
+    handle: u32,
+) -> Option<Arc<dyn FileOps>> {
+    let (bo, frames, size) = state.export(handle)?;
+    Some(Arc::new(Navi22PrimeDmaBufFile {
+        bo,
+        frames,
+        size,
+        inode: dma_buf_inode(),
+    }))
+}
+fn navi22_import(
+    state: &crate::amdgpu_navi22_drm::FileState,
+    dmabuf: &Arc<dyn FileOps>,
+) -> Option<Result<u32, FsError>> {
+    let prime = dmabuf
+        .as_any()
+        .and_then(|any| any.downcast_ref::<Navi22PrimeDmaBufFile>())?;
+    Some(state.import(Arc::clone(&prime.bo)))
+}
+
 /// A PRIME dma-buf file for `resource`, as `drm_prime_export_file` mints
 /// one, for tests that have no live render-node open.
 #[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
@@ -860,12 +973,23 @@ pub struct DriRenderFile {
     amdgpu_vm: crate::amdgpu_vm::VmState,
     /// Per-open submission contexts (`fpriv->ctx_mgr`).
     amdgpu_ctx: crate::amdgpu_ctx::CtxState,
+    /// Per-open Navi 22 render state (GEM/VA/CS/syncobjs), when that
+    /// device is bound and accelerated.
+    navi22: Arc<crate::amdgpu_navi22_drm::FileState>,
     /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
     client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
 }
 
+/// `amdgpu_driver_postclose_kms`: the VM teardown awaits the device owner,
+/// so it runs as a task after the file is gone.
+fn release_navi22(state: &Arc<crate::amdgpu_navi22_drm::FileState>) {
+    let state = Arc::clone(state);
+    narf_scheduler::spawn(async move { state.release().await });
+}
+
 impl Drop for DriRenderFile {
     fn drop(&mut self) {
+        release_navi22(&self.navi22);
         // Quiesce the host resource before `DmaBuffer::drop` releases its
         // pages. If the device is already gone or rejects teardown, retain
         // the backing instead: a bounded process-exit leak is preferable to a
@@ -1010,7 +1134,7 @@ impl FileOps for DriRenderFile {
         &'a self,
         cmd: u32,
         arg: u64,
-        _context: &'a dyn narf_filesystem::IoctlContext,
+        context: &'a dyn narf_filesystem::IoctlContext,
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
             if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu")
@@ -1018,6 +1142,23 @@ impl FileOps for DriRenderFile {
             {
                 return crate::drm_ioctl_bridge::wait_virtgpu_render(arg as usize, &self.virtgpu)
                     .await;
+            }
+            if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+                if let Some(result) = crate::amdgpu_navi22_drm::ioctl(
+                    &self.navi22,
+                    &self.amdgpu_ctx,
+                    cmd,
+                    arg,
+                    context,
+                )
+                .await
+                {
+                    return result;
+                }
+            }
+            // GET_CLIENT carries no DRM_RENDER_ALLOW (drm_ioctl_permit).
+            if cmd == crate::drm_ioctl_bridge::DRM_IOCTL_GET_CLIENT {
+                return Err(FsError::PermissionDenied);
             }
             self.ioctl(cmd, arg as usize)
         })
@@ -1040,6 +1181,9 @@ impl FileOps for DriRenderFile {
     }
 
     fn drm_prime_export_file(&self, gem_handle: u32) -> Result<Arc<dyn FileOps>, FsError> {
+        if let Some(file) = navi22_export(&self.navi22, gem_handle) {
+            return Ok(file);
+        }
         let Some(resource) = self.virtgpu.export_resource(gem_handle) else {
             return Err(FsError::NotFound);
         };
@@ -1050,6 +1194,9 @@ impl FileOps for DriRenderFile {
     }
 
     fn drm_prime_import_file(&self, dmabuf: &Arc<dyn FileOps>) -> Result<u32, FsError> {
+        if let Some(result) = navi22_import(&self.navi22, dmabuf) {
+            return result;
+        }
         let prime = dmabuf
             .as_any()
             .and_then(|any| any.downcast_ref::<VirtGpuPrimeDmaBufFile>())
@@ -1064,12 +1211,18 @@ impl FileOps for DriRenderFile {
         }
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
             // As on the card node: this open's GEM table and no other.
+            if self.navi22.mmap_owner(offset).is_some() {
+                return self.navi22.mmap_frames(offset, len);
+            }
             return self.amdgpu_gem.mmap_frames(offset, len);
         }
         Err(FsError::Unsupported)
     }
 
     fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>> {
+        if let Some(bo) = self.navi22.mmap_owner(offset) {
+            return Some(bo as Arc<dyn MmapLifetime>);
+        }
         if crate::drm_registry::driver_name(self.index) != Some("virtio_gpu") {
             return None;
         }
@@ -1116,6 +1269,7 @@ impl DirOps for DriDir {
                             amdgpu_gem: crate::amdgpu_gem::GemState::new(),
                             amdgpu_vm: crate::amdgpu_vm::VmState::new(),
                             amdgpu_ctx: crate::amdgpu_ctx::CtxState::new(),
+                            navi22: Arc::default(),
                             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
                         }));
                     }

@@ -297,3 +297,73 @@ once VCN rings are advertised. Both are M10.
 | gpu_counter_freq, vram_type/width, mall_size, pcie_gen/lanes, memory clocks | heuristics only | M9/M10 |
 | SENSOR, VIDEO_CAPS, VCN rings and FW_VERSION(VCN) relevance | HUD, video | M10 |
 | DEV_INFO identity/topology, HW_IP_INFO, FW_VERSION, READ_MMR_REG(GB_ADDR_CONFIG), MEMORY rounding | Mesa init correctness | **this branch** |
+
+## 12. Status on `claude/navi22-uapi`
+
+Implemented (software models only; no physical board run):
+
+| Item | Where | Notes |
+|------|-------|-------|
+| `GET_CLIENT` on primary nodes | `drm_ioctl_bridge::get_client` | `drm_getclient`: idx 0 → auth (current master), pid, `overflowuid`; else EINVAL; render nodes EACCES |
+| `DRM_IOCTL_VERSION` | `amdgpu_navi22_drm::drm_version` | `amdgpu` 3.64.0 while `SUBMISSION` is wired (3.0.0 otherwise); answered on both nodes with or without KMS state, and used by the Navi22 KMS card |
+| `GET_CAP` render caps | `amdgpu_navi22_drm` | DUMB 1, PRIME 3, TIMESTAMP_MONOTONIC 1, SYNCOBJ 1, SYNCOBJ_TIMELINE 1; KMS caps (ADDFB2_MODIFIERS…) stay with the KMS publication |
+| ACCEL_WORKING, DEV_INFO, READ_MMR_REG 0x263e, HW_IP_INFO/COUNT 0–9, FW_VERSION, MEMORY, VRAM_GTT, VIDEO_CAPS (192 B), MAX_IBS (40 B) | `amdgpu_info_navi22` | §3–§8; ACCEL/rings/counts/GANG_SUBMIT follow `SUBMISSION` (now `Wired`) and the cold boot's ring/IB proof |
+| CTX alloc/free/query | `amdgpu_ctx` | priority permits as Linux (HIGH needs CAP_SYS_NICE or master → EACCES); QUERY_STATE/QUERY_STATE2 report recoveries (`UNKNOWN_RESET`, `RESET`+`VRAMLOST`) |
+| GEM_CREATE/MMAP/CLOSE/OP/METADATA/WAIT_IDLE, GEM_VA MAP/UNMAP/CLEAR/REPLACE, BO_LIST | `amdgpu_navi22_drm` | VRAM from the Gmc pool, GTT as contiguous DMA (≤ 4 MiB), per-open GPUVM (VMID for the VM's lifetime), hole-stripped high VAs |
+| CS (IB, BO_HANDLES, FENCE, DEPENDENCIES, SYNCOBJ_IN/OUT, TIMELINE_WAIT/SIGNAL), WAIT_CS, WAIT_FENCES, FENCE_TO_HANDLE (syncobj) | `amdgpu_navi22_drm`, `amdgpu_navi22_submit` | IBs must lie in one mapping of the caller's VM; dependencies awaited before queueing; ECANCELED for pre-recovery contexts |
+| Syncobjs: CREATE/DESTROY/WAIT/TIMELINE_WAIT/RESET/SIGNAL/TIMELINE_SIGNAL/QUERY/TRANSFER | `amdgpu_navi22_drm` | per-open table; timeline points follow `dma_fence_chain`; ETIME on timeout |
+| PRIME export/import of Navi22 BOs | `drm_devfs_bridge` | same-device dma-buf; CPU-mappable; no implicit-sync fences on the dma-buf |
+
+Open gaps for the first hardware run: syncobj fds (`HANDLE_TO_FD`, sync_file
+import/export) and `FENCE_TO_HANDLE` fd forms; implicit sync on dma-bufs;
+GDS/GWS/OA (radeonsi NGG streamout); `GEM_USERPTR`; PRT/sparse (RADV
+sparse binding); `SET_PLACEMENT`; GTT heap size in MEMORY still 0 (GTT BOs
+work, Mesa's budget does not see them); `ADDFB2_MODIFIERS` and modifier
+lists (KMS); TIMESTAMP, SENSOR, GPUVM_FAULT, usage counters; VCN/JPEG user
+submission.
+
+## 13. Native GEM/VA/CS backend design
+
+**Memory.** A GEM object is an `Arc<amdgpu_gmc_navi22::Buffer>`: VRAM from
+the cold-boot owner's exclusive pool (zeroed, CPU-visible through BAR0 —
+ReBAR covers all 12 GiB; with the 256 MiB fallback aperture the Gmc
+allocator decides what stays mappable), or pinned system pages
+(`Buffer::system`, `uncached()` for USWC/coherent flags). The handle table
+and an IRQ-safe handle→object map (for the synchronous mmap path) live in the
+per-open `FileState`; mmaps and dma-bufs retain the `Arc`, so closing a
+handle never frees pages still mapped by the CPU or the GPU (the VM retains
+mapped buffers until its invalidation is acknowledged).
+
+**VA.** Each open gets one `amdgpu_gmc_navi22::Vm` on first use; its VMID
+(1–15) is bound for the VM's lifetime, so there is no per-submission VMID
+grab. GEM_VA validates exactly as `amdgpu_gem_va_ioctl`
+(`amdgpu_vm::validate_va`, 4 KiB alignment, offset+size within the BO, no
+overlap, PRT refused) and forwards hole-stripped `Mapping`s to `Gmc::map` /
+`unmap`, which write GMC10 PTEs, flush HDP and invalidate both hubs' TLBs on
+the CPU (engine 17).
+
+**Submission.** CS parses chunks as `amdgpu_cs_pass1/pass2`, checks each IB
+against the caller's mappings (`amdgpu_cs_find_mapping`), resolves the
+entity (`amdgpu_ctx_get_entity`: gfx ring 0, compute rings 0–3 on the one
+kernel compute queue, SDMA 0/1), waits for dependencies without holding the
+file or device, then calls `ColdBoot::submit` under the platform owner lock.
+`amdgpu_navi22_submit` emits, per Linux, pipeline sync + ring-side VM flush
+(PTB write and invalidation on the ring's own GFXHUB engine) the first time
+a VM generation runs on a ring, CONTEXT_CONTROL/FRAME_CONTROL on gfx, the IBs
+with the VMID, and the ring fence. Two submissions may be outstanding per
+ring (`amdgpu_sched_hw_submission`); a third returns Busy and the CS waits
+for the older fence, then retries. The 32-bit ring fence is extended to the
+64-bit CS handle per ring.
+
+**Fences and syncobjs.** A fence is (ring, 64-bit sequence, recovery epoch).
+It is signalled when the ring's fence reaches the sequence, or when a
+recovery (`amdgpu_navi22_recovery::recoveries`) abandoned it. Waits sample
+under the owner lock every 500 µs (the IH routes EOP/trap interrupts to the
+kernel fence waiters; the render waits do not yet subscribe to them).
+Syncobjs hold timelines of fence sets; CS signals binary syncobjs by
+replacement and timeline points by `add_point`.
+
+**Recovery.** A recovery rebuilds the cold-boot owner, so old VMs, BOs and
+fences are dead: contexts created before it get ECANCELED from CS and
+report `RESET`/`VRAMLOST`; their fences read as signalled; a later use of
+the old VM fails with ENODEV.

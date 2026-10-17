@@ -279,11 +279,26 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     Ok(report)
 }
 
+/// Kernel queues of the retained owner passed their tests (render ABI gate).
+static QUEUES_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub(crate) fn queues_ready() -> bool {
+    QUEUES_READY.load(core::sync::atomic::Ordering::Acquire)
+}
+/// Serialised access to the retained owner for the render ABI
+/// (`amdgpu_navi22_drm`). Never held across a fence wait.
+pub(crate) async fn owner() -> narf_lib::mutex::MutexGuard<'static, Option<boot::ColdBoot>> {
+    OWNER.lock().await
+}
+
 /// Runtime services of a completed (or recovered) owner: PMFW telemetry and
 /// hwmon, then the SMU11 thermal interrupts. They run as executor tasks that
 /// take the owner lock per refresh. Failures are reported, never fatal.
 async fn start_services(boot: &mut boot::ColdBoot) {
     use core::fmt::Write;
+    QUEUES_READY.store(
+        boot.queues_verified(),
+        core::sync::atomic::Ordering::Release,
+    );
     if boot.queues_verified() {
         crate::amdgpu_navi22_tdr::start();
     }
@@ -407,6 +422,7 @@ impl crate::amdgpu_navi22_recovery::Backend for Recovering<'_> {
 pub async unsafe fn recover() -> Result<boot::Report, crate::amdgpu_navi22_recovery::Error> {
     use crate::amdgpu_navi22_recovery::Error;
     let mut recovery = RECOVERY.try_lock().ok_or(Error::Busy)?;
+    QUEUES_READY.store(false, core::sync::atomic::Ordering::Release);
     let device = amdgpu::pci_device().ok_or(Error::Busy)?;
     let mut owner = OWNER.lock().await;
     let mut backend = Recovering {
