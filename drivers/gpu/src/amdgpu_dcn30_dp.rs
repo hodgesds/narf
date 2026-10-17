@@ -15,10 +15,14 @@
 //! DIG, DP and VPG blocks stride 0x100. Link registers are indexed by the
 //! transmitter, stream registers by the DIG frontend.
 //!
-//! Scope: 8b/10b SST, RGB, 6/8/10 bpc, no MST/DSC/FEC/PSR, no LTTPR.
+//! Scope: 8b/10b SST, RGB, 6/8/10 bpc, no MST/DSC/FEC/PSR. The link policy
+//! (capabilities, LTTPR modes, training, fallback, link loss) lives in
+//! `amdgpu_dcn30_dp_link`, driving [`DioSource`].
 use crate::{
-    amdgpu_dcn30_takeover::Regs, amdgpu_dml::Timing, amdgpu_dp_training as training,
-    amdgpu_navi22_modeset::Error,
+    amdgpu_dcn30_dp_link as link_layer,
+    amdgpu_dcn30_takeover::Regs,
+    amdgpu_dml::Timing,
+    amdgpu_navi22_modeset::{DpLink, Error},
 };
 use core::future::Future;
 
@@ -107,6 +111,20 @@ pub trait Aux {
         address: u32,
         data: &[u8],
     ) -> impl Future<Output = Result<(), Error>> + Send;
+    /// `dce_aux_configure_timeout` on this connector's AUX engine (the
+    /// LTTPR or default reply timeout, in microseconds).
+    fn set_timeout_us(&mut self, _us: u32) -> impl Future<Output = Result<(), Error>> + Send {
+        async { Ok(()) }
+    }
+    /// Whether a sink is still connected (debounced HPD): Linux's
+    /// `link->type != dc_connection_none`.
+    fn connected(&mut self) -> impl Future<Output = bool> + Send {
+        async { true }
+    }
+    /// The waits between transactions the link layer prescribes.
+    fn delay_us(&mut self, us: u64) -> impl Future<Output = ()> + Send {
+        sleep_us(us)
+    }
 }
 
 /// Bits per component on a DP RGB stream.
@@ -437,17 +455,16 @@ impl Stream {
     }
 }
 
-/// The source side of 8b/10b training for [`training::train`]: the DIO link
-/// encoder plus the VBIOS transmitter table, driven per Linux
-/// `dp_enable_link_phy` / `dp_set_hw_training_pattern` /
-/// `dp_set_hw_lane_settings` / `dp_disable_link_phy`.
-pub(crate) struct Trainer<'a, A: Aux> {
-    pub(crate) aux: &'a mut A,
+/// The source half of one DIO DP link for `amdgpu_dcn30_dp_link`: the link
+/// encoder plus the VBIOS transmitter table, as Linux's
+/// `dcn20_link_encoder_enable_dp_output` / `dp_set_hw_training_pattern` /
+/// `dcn10_link_encoder_dp_set_lane_settings` /
+/// `dcn10_link_encoder_disable_output` drive them.
+pub(crate) struct DioSource<'a> {
     pub(crate) link: Link,
     pub(crate) phy: &'a mut dyn Phy,
-    pub(crate) settings: Option<training::Settings>,
 }
-/// The VBIOS transmitter calls the trainer needs, bound to one connector.
+/// The VBIOS transmitter calls the link layer needs, bound to one connector.
 pub(crate) trait Phy: Send {
     /// TRANSMITTER ENABLE in DP mode at `rate` x 27 MHz on `lanes` lanes.
     fn enable(&mut self, rate: u8, lanes: u8) -> Result<(), Error>;
@@ -457,66 +474,42 @@ pub(crate) trait Phy: Send {
     /// TRANSMITTER DISABLE in DP mode.
     fn disable(&mut self) -> Result<(), Error>;
 }
-fn transport(error: Error) -> training::Error {
-    match error {
-        Error::Bios(_) | Error::Block(_) | Error::Invalid => training::Error::Source,
-        _ => training::Error::Aux,
+impl link_layer::Source for DioSource<'_> {
+    /// `enc1_configure_encoder`, then TRANSMITTER ENABLE.
+    fn enable(&mut self, link: DpLink) -> Result<(), Error> {
+        self.link.configure(link.lanes)?;
+        self.phy.enable(link.rate, link.lanes)
     }
-}
-impl<A: Aux + Send> training::LinkIo for Trainer<'_, A> {
-    async fn read(&mut self, address: u32, data: &mut [u8]) -> Result<(), training::Error> {
-        self.aux
-            .read(address, data)
-            .await
-            .map_err(|_| training::Error::Aux)
+    fn pattern(&mut self, tps: link_layer::Tps) -> Result<(), Error> {
+        use link_layer::Tps;
+        self.link.training_pattern(match tps {
+            Tps::Tps1 => 0,
+            Tps::Tps2 => 1,
+            Tps::Tps3 => 2,
+            Tps::Tps4 => 3,
+        })
     }
-    async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), training::Error> {
-        self.aux
-            .write(address, data)
-            .await
-            .map_err(|_| training::Error::Aux)
+    fn video(&mut self) -> Result<(), Error> {
+        self.link.passthrough()
     }
-    /// `dp_enable_link_phy` → `dcn10_link_encoder_enable_dp_output`.
-    async fn configure(&mut self, settings: training::Settings) -> Result<(), training::Error> {
-        self.settings = Some(settings);
-        self.link.configure(settings.lanes).map_err(transport)?;
-        self.phy
-            .enable(settings.rate, settings.lanes)
-            .map_err(transport)
-    }
-    async fn pattern(&mut self, pattern: u8) -> Result<(), training::Error> {
-        let index = match pattern {
-            0 => return self.link.passthrough().map_err(transport),
-            1 => 0,
-            2 => 1,
-            3 => 2,
-            7 => 3,
-            _ => return Err(training::Error::Invalid),
-        };
-        self.link.training_pattern(index).map_err(transport)
-    }
-    /// `dcn10_link_encoder_dp_set_lane_settings`: one call per lane with the
-    /// common (`disallow_per_lane_settings`) swing and pre-emphasis.
-    async fn tune(&mut self, lanes: &[u8]) -> Result<(), training::Error> {
-        let settings = self.settings.ok_or(training::Error::Invalid)?;
-        for &set in lanes {
+    /// One SETUP_VSEMPH per lane with the common swing and pre-emphasis.
+    fn drive(&mut self, link: DpLink, swing: u8, pre: u8) -> Result<(), Error> {
+        if swing > 3 || pre > 3 {
+            return Err(Error::Invalid);
+        }
+        for _ in 0..link.lanes {
             self.phy
-                .lane_settings(settings.rate, settings.lanes, set & 0x1b)
-                .map_err(transport)?;
+                .lane_settings(link.rate, link.lanes, swing | pre << 3)?;
         }
         Ok(())
     }
-    /// `dp_disable_link_phy`'s source half: `dcn10_link_encoder_disable_output`
-    /// (only for an enabled DIG), then `link_encoder_disable`.
-    async fn disable(&mut self) -> Result<(), training::Error> {
-        if self.link.enabled().map_err(transport)? {
-            self.phy.disable().map_err(transport)?;
-            self.link.reset().map_err(transport)?;
+    /// `dcn10_link_encoder_disable_output` (only for an enabled DIG), then
+    /// `link_encoder_disable`.
+    fn disable(&mut self) -> Result<(), Error> {
+        if self.link.enabled()? {
+            self.phy.disable()?;
+            self.link.reset()?;
         }
-        self.settings = None;
         Ok(())
-    }
-    async fn delay_us(&mut self, microseconds: u32) {
-        sleep_us(u64::from(microseconds)).await;
     }
 }

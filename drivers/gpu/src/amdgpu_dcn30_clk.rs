@@ -467,6 +467,15 @@ impl ClockManager {
         }
         self.engine.floor(Clock::Phy, khz).await
     }
+    /// `dcn30_notify_link_rate_change` for a link verified before any mode
+    /// is configured (detection's destructive link verification): the
+    /// PHYCLK hard minimum once the owner started.
+    pub async fn link_rate_floor(&mut self, khz: u32) -> Result<(), Error> {
+        if !matches!(self.engine.state, State::Ready | State::Configured) {
+            return Err(Error::Busy);
+        }
+        self.engine.floor(Clock::Phy, khz).await
+    }
     pub fn pipe_clock(&mut self, pipe: u8, khz: u32) -> Result<(), Error> {
         if self.engine.state != State::Configured {
             return Err(Error::Busy);

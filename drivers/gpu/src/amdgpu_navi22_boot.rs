@@ -1564,6 +1564,8 @@ impl ColdBoot {
         let mut pipeline = unsafe { modeset::Pipeline::new(&h.gpu, h.authority, connector, route) }
             .map_err(Error::Modeset)?;
         pipeline.request(want);
+        pipeline.set_lttpr_policy(crate::amdgpu_dcn30_dp_link::VbiosLttpr::from_vbios(vbios));
+        pipeline.assume_link_cap(display.verified_link(index, sink.dpcd));
         let mut aux = crate::amdgpu_navi22_display::DisplayAux { display, index };
         // SAFETY: forwarded; the pool and SMU are this owner's, and the
         // display-power future is polled only by ClockManager::start_with.
@@ -1581,6 +1583,13 @@ impl ColdBoot {
                 )
                 .await
         };
+        // A link that failed to train at its verified setting is verified
+        // again next time.
+        let verified = match result {
+            Err(crate::amdgpu_navi22_modeset::Error::Training(_)) => None,
+            _ => pipeline.link_cap(),
+        };
+        aux.display.set_verified_link(index, sink.dpcd, verified);
         let output = match result {
             Ok(output) => output,
             Err(error) => {
@@ -1732,6 +1741,133 @@ impl ColdBoot {
     ) -> Result<crate::amdgpu_dcn30_cursor::Shown, crate::amdgpu_dcn_clk::Error> {
         let (scanout, pool, flush) = self.presentation()?;
         scanout.set_cursor(pool, image, at, flush)
+    }
+}
+
+/// Hot-plug and DP link maintenance of the lit display (Linux's
+/// `handle_hpd_irq` / `handle_hpd_rx_irq` → `dc_link_detect`,
+/// `dp_handle_link_loss`, and the zero-stream commit after an unplug), for
+/// the display monitor in `amdgpu_navi22_platform`.
+impl ColdBoot {
+    /// Debounced HPD of every board connector, in table order (None: no
+    /// HPD wiring or unreadable).
+    pub fn display_hpd_senses(&mut self) -> alloc::vec::Vec<Option<bool>> {
+        let Ok(display) = self.display_mut() else {
+            return alloc::vec::Vec::new();
+        };
+        (0..display.connectors().len())
+            .map(|i| display.hpd_sense(i).ok().flatten())
+            .collect()
+    }
+    /// Forget connector `index`'s verified DP link (its sink left or
+    /// changed): the next lighting verifies again, as the next long-pulse
+    /// detection does in Linux.
+    pub fn forget_display_link(&mut self, index: usize) {
+        if let Ok(display) = self.display_mut() {
+            display.set_verified_link(index, None, None);
+        }
+    }
+    /// Connector `index`'s verified DP link for a sink reporting `dpcd`.
+    pub fn display_link_cap(
+        &mut self,
+        index: usize,
+        dpcd: Option<[u8; 16]>,
+    ) -> Option<crate::amdgpu_navi22_modeset::DpLink> {
+        self.display_mut().ok()?.verified_link(index, dpcd)
+    }
+    /// The lit pipeline, its connector's index and the VBIOS tables' bytes.
+    fn lit_display(
+        &mut self,
+    ) -> Result<
+        (
+            &mut crate::amdgpu_navi22_modeset::Pipeline,
+            crate::amdgpu_navi22_display::DisplayAux<'_>,
+            &[u8],
+        ),
+        Error,
+    > {
+        let h = &mut self.sequence.backend;
+        let pipeline = h.modeset.as_mut().ok_or(Error::Invalid)?;
+        let (vbios, _) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
+        let connector = pipeline.connector();
+        let display = h.display.as_mut().ok_or(Error::Invalid)?;
+        let index = display
+            .connectors()
+            .iter()
+            .position(|c| *c == connector)
+            .ok_or(Error::Invalid)?;
+        Ok((
+            pipeline,
+            crate::amdgpu_navi22_display::DisplayAux { display, index },
+            vbios.as_slice(),
+        ))
+    }
+    /// Check the lit DP stream's link (an HPD-RX short pulse, or the
+    /// monitor's periodic poll); nothing for HDMI or no stream.
+    pub async fn check_display_link(
+        &mut self,
+    ) -> Result<crate::amdgpu_navi22_modeset::RxEvent, Error> {
+        let (pipeline, mut aux, _) = self.lit_display()?;
+        pipeline
+            .check_dp_link(&mut aux)
+            .await
+            .map_err(Error::Modeset)
+    }
+    /// `dp_handle_link_loss` on the lit DP stream: the link stopped and
+    /// trained again at the same setting while scanout continues. On
+    /// failure the link is down and the caller stops the display
+    /// (`stop_display`); the connector's verified link is forgotten so the
+    /// next lighting falls back from a fresh verification.
+    ///
+    /// # Safety
+    /// As `stop_display`'s exclusions for the display engine; the scanout
+    /// surfaces stay published.
+    pub async unsafe fn retrain_display(
+        &mut self,
+    ) -> Result<crate::amdgpu_navi22_modeset::DpLink, Error> {
+        let (pipeline, mut aux, vbios) = self.lit_display()?;
+        let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
+            .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Bios(e)))?;
+        let result = pipeline.retrain(&tables, &mut aux).await;
+        if result.is_err() {
+            aux.display.set_verified_link(aux.index, None, None);
+        }
+        result.map_err(Error::Modeset)
+    }
+    /// Stop the lit display after its sink left: refused while its HPD is
+    /// high; no AUX/DDC transaction to the sink; surfaces released as in
+    /// `stop_display`.
+    ///
+    /// # Safety
+    /// As `stop_display`.
+    pub async unsafe fn stop_unplugged_display(&mut self) -> Result<(), Error> {
+        {
+            let (_, aux, _) = self.lit_display()?;
+            if aux.display.hpd_sense(aux.index).map_err(Error::Display)? == Some(true) {
+                return Err(Error::Busy);
+            }
+            aux.display.set_verified_link(aux.index, None, None);
+        }
+        let h = &mut self.sequence.backend;
+        let pipeline = h.modeset.as_mut().ok_or(Error::Invalid)?;
+        let stopped = h.scanout.as_mut().map(|s| s.stop());
+        let (vbios, _) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
+        let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
+            .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Bios(e)))?;
+        pipeline
+            .disable_unplugged(&tables)
+            .await
+            .map_err(Error::Modeset)?;
+        // SAFETY: as stop_display: stopped cleanly, CPU views retired.
+        unsafe {
+            if let Some(scanout) = h.scanout.take() {
+                if stopped.is_some_and(|r| r.is_ok()) {
+                    let _ = scanout.release();
+                }
+            }
+            let _ = pipeline.release_scanout();
+        }
+        Ok(())
     }
 }
 
