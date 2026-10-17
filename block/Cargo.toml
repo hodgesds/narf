@@ -8,6 +8,8 @@ description = "NARF block device abstraction"
 
 [dependencies]
 narf-lib = { path = "../lib" }
+narf-boot = { path = "../boot" }
+narf-console = { path = "../console" }
 narf-capabilities = { path = "../capabilities" }
 narf-io = { path = "../io" }
 narf-memory = { path = "../memory" }

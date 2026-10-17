@@ -531,6 +531,9 @@ impl EncryptedBlockDevice {
 }
 
 impl BlockDeviceSync for EncryptedBlockDevice {
+    fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
     fn lba_size(&self) -> u32 {
         self.inner.lba_size().max(self.crypto_sector_size as u32)
     }

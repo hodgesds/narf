@@ -6378,3 +6378,96 @@ kernel_test_in!(
     "filesystem",
     smoke_devfs_provider_live_lookup_and_both_listings
 );
+
+// ── narf.disks=boot-only gating of the boot-time mount walks ───────
+
+/// Under `narf.disks=boot-only` the boot-time walks (root-mount-auto's
+/// `try_mount_root`, efi-system-partition-mount, mnt-mount-ext2's
+/// `automount_devices`) never consider an unidentified disk — not even one
+/// named by an explicit `root=` or carrying the ESP type GUID — and do once
+/// the disk is identified as the boot medium.
+fn smoke_root_mount_boot_only_skips_unidentified_disks() -> TestResult {
+    use crate::root_mount::{
+        automount_devices, try_mount_efi_system_partition, try_mount_root_with, RootMountError,
+    };
+    use crate::root_selector::RootSelector;
+    use crate::MountPoint;
+    use alloc::sync::Arc;
+    use narf_block::disk_policy::{self, DiskPolicy};
+    use narf_capabilities::{Cap, Grant};
+
+    struct Zeros;
+    impl narf_block::BlockDeviceSync for Zeros {
+        fn lba_size(&self) -> u32 {
+            512
+        }
+        fn capacity(&self) -> u64 {
+            64
+        }
+        fn read(&self, _: u64, n: u16, out: &mut [u8]) -> Result<(), narf_block::BlockIoError> {
+            out[..n as usize * 512].fill(0);
+            Ok(())
+        }
+        fn write(&self, _: u64, _: u16, _: &[u8]) -> Result<(), narf_block::BlockIoError> {
+            Ok(())
+        }
+    }
+    let esp_meta = narf_block::registry::PartitionMetadata {
+        gpt_type_guid: alloc::string::String::from(
+            narf_block::registry::GPT_EFI_SYSTEM_PARTITION_TYPE_GUID,
+        ),
+        ..Default::default()
+    };
+    narf_block::register_block_device("dp-fs-disk0", Arc::new(Zeros));
+    narf_block::register_partition_device(
+        "dp-fs-disk0p1",
+        "dp-fs-disk0",
+        Arc::new(Zeros),
+        Some(esp_meta),
+    );
+    let auth: Cap<MountPoint, Grant> = Cap::bootstrap();
+    let selector = RootSelector::ByName(alloc::string::String::from("dp-fs-disk0p1"));
+
+    let result = (|| {
+        disk_policy::__set_policy_for_test(Some(DiskPolicy::BootOnly));
+        let (candidates, skipped) = automount_devices();
+        if candidates.iter().any(|e| e.name.starts_with("dp-fs-disk0")) || skipped < 2 {
+            return Err("automount_devices offered an unidentified disk");
+        }
+        if try_mount_root_with(&auth, Some(&selector)) != Err(RootMountError::BootOnly) {
+            return Err("root= on an unidentified disk must be refused as BootOnly");
+        }
+        match try_mount_efi_system_partition(&auth) {
+            Err(RootMountError::BootOnly) | Err(RootMountError::NoMountable) => {}
+            _ => return Err("an unidentified ESP must never be mounted"),
+        }
+        let disk = narf_block::disk_of("dp-fs-disk0p1").ok_or("test disk missing")?;
+        disk_policy::trust_boot_medium("dp-fs-disk0p1", disk);
+        let (candidates, _) = automount_devices();
+        if candidates
+            .iter()
+            .filter(|e| e.name.starts_with("dp-fs-disk0"))
+            .count()
+            != 2
+        {
+            return Err("the identified boot medium must be offered for mounting");
+        }
+        // Considered now (all zeros: no filesystem), so not BootOnly.
+        if try_mount_root_with(&auth, Some(&selector)) == Err(RootMountError::BootOnly) {
+            return Err("root= on the identified boot medium must be considered");
+        }
+        Ok(())
+    })();
+
+    disk_policy::__set_policy_for_test(None);
+    narf_block::unregister_block_device("dp-fs-disk0p1");
+    narf_block::unregister_block_device("dp-fs-disk0");
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "filesystem/root_selector",
+    smoke_root_mount_boot_only_skips_unidentified_disks
+);

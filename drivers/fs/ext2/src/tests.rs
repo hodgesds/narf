@@ -6502,3 +6502,192 @@ fn smoke_ext2_hardlink() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_hardlink);
+
+// ── Read-only devices are never written (narf.disks=boot-only) ──────
+
+/// In-memory sync disk that counts every write it accepts.
+struct CountingMemDisk {
+    bytes: narf_lib::sync::IrqSafeSpinLock<Vec<u8>>,
+    writes: core::sync::atomic::AtomicUsize,
+}
+
+impl CountingMemDisk {
+    fn new(image: Vec<u8>) -> alloc::sync::Arc<Self> {
+        alloc::sync::Arc::new(Self {
+            bytes: narf_lib::sync::IrqSafeSpinLock::new(image),
+            writes: core::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+    fn writes(&self) -> usize {
+        self.writes.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    fn snapshot(&self) -> Vec<u8> {
+        self.bytes.lock().clone()
+    }
+}
+
+impl narf_block::BlockDeviceSync for CountingMemDisk {
+    fn lba_size(&self) -> u32 {
+        512
+    }
+    fn capacity(&self) -> u64 {
+        self.bytes.lock().len() as u64 / 512
+    }
+    fn read(
+        &self,
+        lba: u64,
+        n_blocks: u16,
+        out: &mut [u8],
+    ) -> Result<(), narf_block::BlockIoError> {
+        let start = lba as usize * 512;
+        let len = n_blocks as usize * 512;
+        let bytes = self.bytes.lock();
+        let src = bytes
+            .get(start..start + len)
+            .ok_or(narf_block::BlockIoError::OutOfRange)?;
+        out.get_mut(..len)
+            .ok_or(narf_block::BlockIoError::BufferTooSmall)?
+            .copy_from_slice(src);
+        Ok(())
+    }
+    fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        self.writes
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let start = lba as usize * 512;
+        let len = n_blocks as usize * 512;
+        let mut bytes = self.bytes.lock();
+        bytes
+            .get_mut(start..start + len)
+            .ok_or(narf_block::BlockIoError::OutOfRange)?
+            .copy_from_slice(&data[..len]);
+        Ok(())
+    }
+}
+
+/// The unclean ext3 fixture with its journal emptied (`s_start == 0`) but the
+/// superblock's `RECOVER` bit still set: the state a writable mount repairs
+/// by rewriting the primary superblock.
+fn build_ext3_stale_recover_image() -> Vec<u8> {
+    let mut img = build_ext3_unclean_image();
+    let incompat = u32::from_le_bytes(img[1024 + 96..1024 + 100].try_into().unwrap());
+    put_u32(
+        &mut img[1024..2048],
+        96,
+        incompat | super::superblock::incompat::RECOVER,
+    );
+    put_u32_be(&mut img[16 * 1024..17 * 1024], 28, 0); // JBD2 s_start = 0
+    img
+}
+
+/// Mount `image` through a real `narf.disks=boot-only` [`PolicyGuard`] on an
+/// untrusted disk. Returns the volume result, the inner disk and the image.
+fn mount_through_boot_only_guard(
+    image: Vec<u8>,
+) -> (
+    Result<
+        alloc::sync::Arc<crate::volume::Ext2Volume<narf_block::SyncBlock>>,
+        narf_filesystem::FsError,
+    >,
+    alloc::sync::Arc<CountingMemDisk>,
+) {
+    use narf_block::disk_policy::{DiskPolicy, PolicyGuard};
+    let disk = CountingMemDisk::new(image);
+    let guard = alloc::sync::Arc::new(PolicyGuard::new(
+        "ext-ro-test",
+        u64::MAX - 0x5afe,
+        disk.clone() as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>,
+    )) as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>;
+    narf_block::disk_policy::__set_policy_for_test(Some(DiskPolicy::BootOnly));
+    let mounted = poll_once(crate::volume::Ext2Volume::mount(
+        narf_block::SyncBlock::new(guard),
+        narf_lib::id::DomainId::DRIVER_0,
+    ))
+    .unwrap_or(Err(narf_filesystem::FsError::InvalidData));
+    (mounted, disk)
+}
+
+/// Positive control: on a writable disk the stale-RECOVER repair really
+/// writes the superblock, so the read-only tests below are meaningful.
+fn smoke_ext3_stale_recover_writable_mount_repairs_superblock() -> TestResult {
+    let disk = CountingMemDisk::new(build_ext3_stale_recover_image());
+    let mounted = poll_once(crate::volume::Ext2Volume::mount(
+        narf_block::SyncBlock::new(
+            disk.clone() as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>
+        ),
+        narf_lib::id::DomainId::DRIVER_0,
+    ));
+    if !matches!(mounted, Some(Ok(_))) {
+        return TestResult::Fail("writable mount of the stale-RECOVER image failed");
+    }
+    let incompat = u32::from_le_bytes(disk.snapshot()[1024 + 96..1024 + 100].try_into().unwrap());
+    if disk.writes() == 0 || incompat & super::superblock::incompat::RECOVER != 0 {
+        return TestResult::Fail("writable mount did not repair the stale RECOVER bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext3_stale_recover_writable_mount_repairs_superblock
+);
+
+/// The same image on a boot-only-guarded (untrusted) disk mounts read-only
+/// with zero writes: the repair is skipped, the bytes are identical and a
+/// create is refused by the volume itself.
+fn smoke_ext3_read_only_device_mount_never_writes() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let image = build_ext3_stale_recover_image();
+    let (mounted, disk) = mount_through_boot_only_guard(image.clone());
+    let create = mounted
+        .as_ref()
+        .ok()
+        .map(|volume| poll_once(volume.root().create("new.txt")));
+    narf_block::disk_policy::__set_policy_for_test(None);
+    let Ok(_volume) = mounted else {
+        return TestResult::Fail("read-only mount of the stale-RECOVER image failed");
+    };
+    if !matches!(create, Some(Some(Err(narf_filesystem::FsError::ReadOnly)))) {
+        return TestResult::Fail("create on a read-only-device mount was not refused");
+    }
+    if disk.writes() != 0 || disk.snapshot() != image {
+        return TestResult::Fail("read-only-device ext3 mount wrote to the disk");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext3_read_only_device_mount_never_writes
+);
+
+/// A dirty journal (needs_recovery, `s_start != 0`) on a read-only device is
+/// replayed into memory only: the replayed directory is visible, nothing is
+/// written.
+fn smoke_ext3_dirty_journal_read_only_replays_in_memory_only() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let mut image = build_ext3_unclean_image();
+    let incompat = u32::from_le_bytes(image[1024 + 96..1024 + 100].try_into().unwrap());
+    put_u32(
+        &mut image[1024..2048],
+        96,
+        incompat | super::superblock::incompat::RECOVER,
+    );
+    let (mounted, disk) = mount_through_boot_only_guard(image.clone());
+    let names = mounted
+        .as_ref()
+        .ok()
+        .and_then(|volume| poll_once(volume.root().enumerate_async(0, 16)).and_then(Result::ok));
+    narf_block::disk_policy::__set_policy_for_test(None);
+    if mounted.is_err() {
+        return TestResult::Fail("dirty-journal read-only mount failed");
+    }
+    if !names.is_some_and(|names| names.iter().any(|(name, _)| name == "REPLAYED")) {
+        return TestResult::Fail("dirty journal was not replayed in memory");
+    }
+    if disk.writes() != 0 || disk.snapshot() != image {
+        return TestResult::Fail("dirty-journal read-only mount wrote to the disk");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext3_dirty_journal_read_only_replays_in_memory_only
+);

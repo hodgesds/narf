@@ -1032,7 +1032,11 @@ DML30-admitted modes, SETCRTC/atomic/TEST_ONLY, disable, vblank, flip
 events) and a monitor that relights after GPU recovery. Register models only.
 For bare-metal runs, `cargo xtask usb-image` builds a UEFI stick whose kernel
 appends its log to `/narf-boot-<n>.log` on that stick (`narf.bootlog=`,
-marker-gated, USB-only, bounded); a secondary card's cold boot keeps the iGPU
+marker-gated, USB-only, bounded) and boots with `narf.disks=boot-only`: every
+other disk is read-only at the block layer (writes refused, logged once) and
+skipped by the boot-time mounts, and ext/btrfs mount a read-only device without
+any repair or log-replay write (`usb-image --qemu` hashes decoy NVMe/SATA disks
+before and after); a secondary card's cold boot keeps the iGPU
 console live and ends with a per-stage summary (see
 [docs/BOOTING_ON_CACHYOS.md](docs/BOOTING_ON_CACHYOS.md#rx-6750-xt-bring-up-boot)).
 DCN3.0 HDMI and DP SST LPCM audio (`amdgpu_dcn30_audio`) follows Linux DC
