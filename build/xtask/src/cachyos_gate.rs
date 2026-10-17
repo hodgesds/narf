@@ -621,6 +621,9 @@ fn verify_restored(dir: &Path, tag: &str) -> Result<()> {
 
 // ── QEMU driver ─────────────────────────────────────────────────────────
 
+/// NARF's first console line.
+const KERNEL_HELLO: &str = "hello from a bare kernel";
+
 const FAIL_MARKERS: &[&str] = &[
     "*** KERNEL PANIC ***",
     "panicked at",
@@ -927,6 +930,8 @@ struct Gate {
     accel: Option<String>,
     /// Milestones of the running row, kept in its detail if it fails.
     progress: Vec<String>,
+    /// Boots that hung before the kernel ran (retried once).
+    prekernel_hangs: Vec<String>,
 }
 
 fn kvm_accel() -> Option<String> {
@@ -1066,6 +1071,35 @@ impl Gate {
             p.name()
         );
         let mut vm = Vm::spawn(self.narf_cmd(), &log, self.args.verbose)?;
+        // Stage watchdog: GRUB must run the bundle stanza and Limine must
+        // hand over to NARF (its first console line) well before the login
+        // timeout. A hang before the kernel runs (firmware/GRUB/Limine) is
+        // retried once and listed in the `boot chain` row; nothing but the
+        // firmware has run, so no disk can have been written.
+        for attempt in 0..2 {
+            let stage = vm
+                .wait_for(&["Booting `NARF'"], Duration::from_secs(120))
+                .map_err(|_| "GRUB never ran the bundle stanza (120 s)")
+                .and_then(|_| {
+                    vm.wait_for(&[KERNEL_HELLO], Duration::from_secs(180))
+                        .map_err(|_| "Limine never handed over to NARF (180 s)")
+                });
+            match stage {
+                Ok(_) => break,
+                Err(why) if attempt == 0 => {
+                    vm.kill();
+                    self.prekernel_hangs
+                        .push(format!("boot {} ({label}): {why}", self.boots));
+                    let retry = self
+                        .logs
+                        .join(format!("{:02}-{label}.retry.serial.log", self.boots));
+                    vm = Vm::spawn(self.narf_cmd(), &retry, self.args.verbose)?;
+                }
+                Err(why) => return Err(vm.err(&format!("{why}, also on the retry"))),
+            }
+        }
+        vm.wait_for(&["disks: POLICY narf.disks="], Duration::from_secs(240))
+            .context("the NARF kernel never printed its disk policy")?;
         let booted = match vm.login(
             &self.args.login_user,
             &self.args.login_password,
@@ -1106,7 +1140,11 @@ impl Gate {
     fn refusal_lines(vm: &Vm) -> Vec<String> {
         vm.text()
             .lines()
-            .filter(|l| l.contains("REFUSING read-write mount"))
+            .filter(|l| {
+                l.contains("REFUSING read-write mount")
+                    || l.contains("ROOT MOUNT FAILED")
+                    || l.contains("systemd_pid1 requested but")
+            })
             .map(|l| l.trim().to_string())
             .collect()
     }
@@ -1861,6 +1899,7 @@ pub fn run(args: &Args) -> Result<()> {
         last_tag: None,
         accel: kvm_accel(),
         progress: Vec::new(),
+        prekernel_hangs: Vec::new(),
     };
     let _ = (&gate.token, &gate.host_uuids);
 
@@ -1913,6 +1952,20 @@ pub fn run(args: &Args) -> Result<()> {
         );
         rows.push(row);
     }
+    rows.push(Row {
+        name: "boot chain".into(),
+        verdict: Verdict::Pass,
+        detail: if gate.prekernel_hangs.is_empty() {
+            format!("{} boots; none hung before the kernel", gate.boots)
+        } else {
+            format!(
+                "{} boots; {} pre-kernel hang(s), each passed on retry:\n{}",
+                gate.boots,
+                gate.prekernel_hangs.len(),
+                gate.prekernel_hangs.join("\n")
+            )
+        },
+    });
     print_table(&rows);
     println!("\nlogs: {}", work.join("logs").display());
     println!("host check logs: {}", work.join("check").display());
