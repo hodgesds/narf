@@ -138,6 +138,10 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
     }
     let authority = amdgpu::pci_authority().ok_or(Error::Authority)?;
     let device = amdgpu::pci_device().ok_or(Error::Authority)?;
+    // pdev->revision (cfg 0x08), the amdgpu.ids key with the device id.
+    if let Ok(class_rev) = narf_bus::pci::read_config32(&authority, &device, 0x08) {
+        crate::amdgpu_info::publish_navi22_pci_revision(class_rev as u8);
+    }
     let identity = crate::amdgpu_power_navi22::Identity::read(&device, &authority)
         .map_err(|error| Error::Firmware(boot::Error::Power(error)))?;
     let registry: Cap<narf_firmware::FirmwareRegistry, Read> =
@@ -265,8 +269,23 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     let mut owner = OWNER.lock().await;
     let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
     let report = boot.run().await?;
+    // AMDGPU_INFO_FW_VERSION and DPM clocks describe what actually loaded.
+    if let Some(firmware) = boot.uapi_versions() {
+        crate::amdgpu_info::publish_navi22_boot(crate::amdgpu_info_navi22::Boot {
+            firmware,
+            smc: report.smu.firmware,
+            gfx_mhz: report.power_status.map(|p| (p.gfx_min_mhz, p.gfx_max_mhz)),
+            queues_verified: report.queues.is_some(),
+        });
+    }
     start_services(boot).await;
     Ok(report)
+}
+
+/// Serialised access to the retained owner for client submission
+/// (`amdgpu_navi22_cs`). Never held across a fence wait.
+pub(crate) async fn owner() -> narf_lib::mutex::MutexGuard<'static, Option<boot::ColdBoot>> {
+    OWNER.lock().await
 }
 
 /// Runtime services of a completed (or recovered) owner: PMFW telemetry and
@@ -274,6 +293,12 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
 /// take the owner lock per refresh. Failures are reported, never fatal.
 async fn start_services(boot: &mut boot::ColdBoot) {
     use core::fmt::Write;
+    // Clients' command submissions and VRAM buffers (generic CS/GEM path).
+    if boot.queues_verified()
+        && crate::amdgpu_info_navi22::submission() == crate::amdgpu_info_navi22::Submission::Wired
+    {
+        crate::amdgpu_navi22_cs::register(boot).await;
+    }
     start_hotplug(boot);
     if boot.queues_verified() {
         crate::amdgpu_navi22_tdr::start();
@@ -424,6 +449,7 @@ impl crate::amdgpu_navi22_recovery::Backend for Recovering<'_> {
 pub async unsafe fn recover() -> Result<boot::Report, crate::amdgpu_navi22_recovery::Error> {
     use crate::amdgpu_navi22_recovery::Error;
     let mut recovery = RECOVERY.try_lock().ok_or(Error::Busy)?;
+    crate::amdgpu_navi22_cs::unregister();
     let device = amdgpu::pci_device().ok_or(Error::Busy)?;
     let mut owner = OWNER.lock().await;
     let mut backend = Recovering {

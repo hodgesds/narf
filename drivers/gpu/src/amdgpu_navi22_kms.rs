@@ -318,7 +318,11 @@ fn with_card(update: impl FnOnce(&mut Card)) {
         Some(state) => update(&mut state.lock()),
         None => {
             // The base amdgpu KMS ABI, as amdgpu_navi48_kms publishes it.
-            let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
+            let mut card = Card::new(
+                "amdgpu",
+                "AMD GPU",
+                crate::amdgpu_info_navi22::drm_version(),
+            );
             update(&mut card);
             crate::drm_registry::attach_mode_state(index, card);
         }

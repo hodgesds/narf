@@ -967,7 +967,16 @@ uses the DCN30 enable register and includes the sixth transmitter. Navi22 kernel
 queues now follow Linux's non-MES GC 10.3 path: BAR2 doorbells, golden/CAM/
 constants/RLC CSB setup, the direct gfx ring with clear-state, KIQ-mapped
 compute (v10 MQD, MAP_QUEUES) and production SDMA on both engines, each with
-ring and IB/fence tests after `DmubStart`. Fences poll with an IH notify hook;
+ring and IB/fence tests after `DmubStart`. Navi22 `AMDGPU_INFO` now answers
+DEV_INFO, HW_IP_INFO/COUNT, FW_VERSION, READ_MMR_REG (GB_ADDR_CONFIG) and
+MEMORY as Linux does for GC 10.3.2, from a cold-boot harvest sample, the
+loaded firmware headers and the PCI revision; ACCEL_WORKING and ring masks
+sit behind one switch, now wired: the card registers a generic
+`amdgpu_cs::Submitter` and client VRAM heap, so the shared CS/GEM/VA path runs
+client IBs on the Navi22 kernel queues (per-job ring-side VM flush, fences,
+two in flight per ring), with user fences, GEM_METADATA, PRIME, DRM 3.64.0 and
+GET_CLIENT; proven in register/fake-engine models only (ABI audit:
+`drivers/gpu/research/navi22-mesa-abi.md`). Fences poll with an IH notify hook;
 register models cover encodings, rejection, timeouts and cancellation only.
 Production cold boot now resets a posted card before any firmware stage, as
 Linux does whenever the VBIOS left SOS running: PMFW (or PSP) mode1 reset,
