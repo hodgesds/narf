@@ -2270,7 +2270,14 @@ fn reconstruct_sparse_fixture(sparse_rel: &str, out: &Path) {
 /// `btrfs check` reports errors.
 fn verify_btrfs_write_interop() -> Result<()> {
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
-    let img = root.join("target").join("narf-nvme-btrfs.img");
+    // The boot-smoke phase's image, then the one the kernel-test phase wrote.
+    for name in ["narf-nvme-btrfs.img", "narf-nvme-btrfs-kernel-test.img"] {
+        verify_btrfs_image(&root.join("target").join(name))?;
+    }
+    Ok(())
+}
+
+fn verify_btrfs_image(img: &Path) -> Result<()> {
     if !img.exists() {
         return Ok(());
     }
@@ -2282,10 +2289,13 @@ fn verify_btrfs_write_interop() -> Result<()> {
         println!("xtask: skipping btrfs write-interop check (btrfs-progs not found)");
         return Ok(());
     }
-    println!("xtask: verifying NARF-written btrfs image with `btrfs check`...");
+    println!(
+        "xtask: verifying NARF-written btrfs image {} with `btrfs check`...",
+        img.display()
+    );
     let out = std::process::Command::new("btrfs")
         .arg("check")
-        .arg(&img)
+        .arg(img)
         .output()
         .context("failed to run `btrfs check`")?;
     let combined = format!(
@@ -2295,7 +2305,7 @@ fn verify_btrfs_write_interop() -> Result<()> {
     );
     if out.status.success() && combined.contains("no error found") {
         println!("xtask: btrfs write-interop OK — NARF-written image is `btrfs check` clean");
-        verify_btrfs_block_group_tree(&img)
+        verify_btrfs_block_group_tree(img)
     } else {
         eprintln!("{combined}");
         bail!("`btrfs check` reported errors on the NARF-written image (write-interop regression)");
@@ -2339,7 +2349,9 @@ fn verify_btrfs_block_group_tree(img: &Path) -> Result<()> {
              {chunk_items} chunks, extent tree must hold none"
         );
     }
-    println!("xtask: block-group tree OK — {bg_items} block groups in tree 11 match the chunk tree");
+    println!(
+        "xtask: block-group tree OK — {bg_items} block groups in tree 11 match the chunk tree"
+    );
     Ok(())
 }
 
@@ -12485,6 +12497,14 @@ fn main() -> Result<()> {
                 // Gate on the kernel-test runner's exit status: a failing
                 // smoke makes the runner exit_kernel(1), which this fails on.
                 run_cmd_inner(&smoke_args, true)?;
+                // Phase 2 rebuilds the NVMe fixture from pristine, so keep the
+                // image the kernel tests themselves wrote (the shared-instance
+                // subvolume writers) for the postflight to check too.
+                let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
+                let _ = std::fs::copy(
+                    root.join("target").join("narf-nvme-btrfs.img"),
+                    root.join("target").join("narf-nvme-btrfs-kernel-test.img"),
+                );
                 if kernel_tests_only {
                     return Ok(());
                 }
