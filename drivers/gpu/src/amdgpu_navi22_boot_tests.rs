@@ -603,3 +603,38 @@ kernel_test_in!(
     "drivers/gpu/navi22-boot",
     navi22_recovery_and_tdr_require_a_completed_recoverable_boot
 );
+
+/// Linux ordering the firmware path must keep: PSP TMR reservation and SMC
+/// precede everything else (SETUP_TMR itself is inside `Smc`, after PMFW),
+/// GC golden settings precede SDMA, and DMUB starts only after every queue
+/// and fence proof, so a DMUB failure cannot cost GFX/SDMA/media.
+fn navi22_stage_order_matches_linux_firmware_path() -> TestResult {
+    let at = |stage| STAGES.iter().position(|s| *s == stage).unwrap();
+    if at(Stage::TrustedMemory) + 1 != at(Stage::Smc)
+        || at(Stage::Smc) >= at(Stage::Graphics)
+        || at(Stage::GoldenSettings) >= at(Stage::SdmaTest)
+        || at(Stage::Interrupts) >= at(Stage::GoldenSettings)
+        || at(Stage::DmubStart) <= at(Stage::IbTests)
+        || at(Stage::DmubStart) <= at(Stage::FenceInterrupts)
+        || at(Stage::DmubStart) >= at(Stage::Media)
+        || at(Stage::DmubQuiesce) >= at(Stage::Graphics)
+    {
+        return TestResult::Fail("firmware stage order diverges from Linux");
+    }
+    use crate::amdgpu_dmub_navi22::Error as Dmub;
+    for error in [Dmub::BootTimeout, Dmub::Invalid, Dmub::Readback, Dmub::Busy] {
+        if dmub_result(Err(error)).is_err() {
+            return TestResult::Fail("ordinary DMUB failure was fatal to the boot");
+        }
+    }
+    for error in [Dmub::DeviceGone, Dmub::Revoked] {
+        if dmub_result(Err(error)) != Err(Error::Dmub(error)) {
+            return TestResult::Fail("device loss during DMUB start ignored");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_stage_order_matches_linux_firmware_path
+);

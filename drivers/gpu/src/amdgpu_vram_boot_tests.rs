@@ -435,9 +435,11 @@ fn navi22_vram_checks_gmc_dcn_size_and_authority() -> TestResult {
     regs[0x16fc] = (GPU_BASE >> 24) as u32;
     regs[0x16fd] = ((GPU_BASE + (12 << 30)) >> 24) as u32 - 1;
     regs[0x16e7] = 0x80;
-    regs[0x475] = regs[0x16fc];
-    regs[0x476] = regs[0x16fd];
-    regs[0x477] = regs[0x16e7];
+    // dcn_3_0_0_offset.h: DCN_VM_FB_LOCATION_BASE/TOP and DCN_VM_FB_OFFSET
+    // are 0x493..0x495 (BASE_IDX 2); 0x475..0x477 is DCN3.1+.
+    regs[0x493] = regs[0x16fc];
+    regs[0x494] = regs[0x16fd];
+    regs[0x495] = regs[0x16e7];
     for pipe in 0..6 {
         regs[0x5f3 + pipe * 0xdc] = 1;
     }
@@ -496,7 +498,7 @@ fn navi22_vram_checks_gmc_dcn_size_and_authority() -> TestResult {
     if unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }.is_err() || regs != before {
         return TestResult::Fail("GMC10/DCN30 inventory modified hardware or rejected a valid map");
     }
-    for reg in [0x15fc, 0x160b, 0x16c0, 0x16cf] {
+    for reg in [0x160b, 0x16cf] {
         regs[reg] = 1;
         // SAFETY: private RAM model; an active inherited VM must prevent allocation.
         if unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }.err() != Some(Error::Busy) {
@@ -504,7 +506,17 @@ fn navi22_vram_checks_gmc_dcn_size_and_authority() -> TestResult {
         }
         regs[reg] = 0;
     }
+    // GOP leaves the kernel context VMID0 enabled; gmc_v10 reprograms it.
+    regs[0x15fc] = 1;
+    regs[0x16c0] = 1;
+    // SAFETY: same RAM-only read fixture.
+    if unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }.is_err() {
+        return TestResult::Fail("GOP-enabled VMID0 refused");
+    }
+    regs[0x15fc] = 0;
+    regs[0x16c0] = 0;
     // The final cursor must be excluded even when caller supplies no clients.
+    regs[0x1dc1] = 1; // OTG5 running
     regs[0xac4] = 1 | (2 << 8);
     regs[0xac5] = 24 * MIB as u32;
     regs[0xac6] = 2;
@@ -519,16 +531,60 @@ fn navi22_vram_checks_gmc_dcn_size_and_authority() -> TestResult {
         return TestResult::Fail("inherited sixth-pipe cursor omitted from automatic exclusions");
     }
     regs[0xac4] = 0;
-    regs[0x477] += 1;
+    regs[0x1dc1] = 0;
+    regs[0x495] += 1;
     // SAFETY: same RAM-only read fixture.
     if unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }.err() != Some(Error::Invalid) {
         return TestResult::Fail("inconsistent GMC/DCN translation accepted");
     }
-    regs[0x477] -= 1;
-    gpu.vram.size -= 16 * MIB;
+    // A DCN3.1 layout read (0x475..0x477) must not be used on DCN3.0.
+    regs[0x495] -= 1;
+    regs[0x477] = 0x7f;
     // SAFETY: same RAM-only read fixture.
-    if unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }.err() != Some(Error::Invalid) {
-        return TestResult::Fail("GMC aperture not checked against physical memory");
+    if unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }.is_err() {
+        return TestResult::Fail("DCN3.1 FB register offsets read on DCN3.0");
+    }
+    regs[0x477] = 0;
+    // Before DC init the display copy may be unprogrammed; Linux never reads it.
+    regs[0x493..0x496].fill(0);
+    // SAFETY: same RAM-only read fixture.
+    if unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }.is_err() {
+        return TestResult::Fail("unprogrammed DCN_VM_FB copy refused");
+    }
+    // Host's Linux log: VRAM 12272M at 0x8000000000-0x82FEFFFFFF. The size
+    // comes from RCC_CONFIG_MEMSIZE, not FB_LOCATION_TOP.
+    gpu.vram.size = 12272 * MIB;
+    regs[0x16fd] = 0x1234;
+    // SAFETY: same RAM-only read fixture.
+    match unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) } {
+        Ok(plan) if plan.vram_size() == 12272 * MIB => {}
+        _ => return TestResult::Fail("12272 MiB VRAM not inventoried from MEMSIZE"),
+    }
+    // GOP-lit DCN3.0: dmub_dcn30_setup_windows' CW2 (direct GPU address) and
+    // the uncached REGION4 inbox are inventoried as DMUB-owned, not refused.
+    regs[0x1af] = (1 << 31) | 0x7fff; // CW2 top
+    regs[0x1a7] = 0;
+    regs[0x1b9] = 40 * MIB as u32;
+    regs[0x1ba] = (GPU_BASE >> 32) as u32;
+    regs[0x1a1] = (1 << 31) | 0x3fff; // REGION4 top (size - 1)
+    regs[0x196] = 48 * MIB as u32;
+    regs[0x197] = (GPU_BASE >> 32) as u32;
+    regs[0x19e] = 1 << 31; // REGION0 has no VRAM offset to inventory
+                           // SAFETY: same RAM-only read fixture.
+    let Ok(plan) = (unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }) else {
+        return TestResult::Fail("GOP DMUB CW2/REGION4/REGION0 refused on DCN3.0");
+    };
+    for range in [40 * MIB..40 * MIB + 0x8000, 48 * MIB..48 * MIB + 0x4000] {
+        if !plan
+            .protected()
+            .iter()
+            .any(|r| r.owner == Owner::Dmub && r.range == range)
+        {
+            return TestResult::Fail("inherited DMUB window not protected");
+        }
+    }
+    for reg in [0x1af, 0x1b9, 0x1ba, 0x1a1, 0x196, 0x197, 0x19e] {
+        regs[reg] = 0;
     }
     cap.revoke();
     gpu.regs.virt = 0;
@@ -633,6 +689,8 @@ fn navi48_vram_checks_gmc12_dcn4_and_training() -> TestResult {
     regs[0x477] = regs[0x15a7];
     for pipe in 0..4 {
         regs[0x5f4 + pipe * 0xdc] = 1;
+        // OTGn_OTG_CONTROL.OTG_MASTER_EN: every timing generator runs.
+        regs[0x1b43 + pipe * 0x80] = 1;
     }
     regs[0x1a3] = (1 << 31) | 0x3fff;
     regs[0x19a] = (40 * MIB) as u32;

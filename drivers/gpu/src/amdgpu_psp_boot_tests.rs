@@ -404,10 +404,16 @@ struct Fake {
     memory: Vec<u32>,
     writes: Vec<(u32, u32)>,
     images: Vec<Vec<u8>>,
+    /// STATUS reads that report DONE with nonzero low bits before settling.
+    busy: usize,
 }
 impl Io for Fake {
     fn read(&mut self, reg: u32) -> u32 {
         match reg {
+            STATUS if self.busy > 0 && !self.writes.is_empty() => {
+                self.busy -= 1;
+                DONE | 0x5
+            }
             STATUS => self.status,
             SOS => {
                 if self.running && !self.frozen {
@@ -472,6 +478,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
         memory: vec![u32::MAX; STAGING_SIZE / 4],
         writes: Vec::new(),
         images: Vec::new(),
+        busy: 0,
     };
     (
         pool,
@@ -480,6 +487,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
             authority: Cap::bootstrap(),
             memory,
             state: State::Prepared,
+            psp11: false,
         },
     )
 }
@@ -610,6 +618,20 @@ fn psp_boot_revocation_rejection_and_absent_device() -> TestResult {
     engine.io.reject = 7;
     if run(engine.load(&image)) != Err(Error::Rejected(7)) || engine.io.writes.len() != 2 {
         return TestResult::Fail("rejected component did not stop the sequence");
+    }
+    // psp_v11_0_wait_for_bootloader masks 0x8000FFFF: DONE with low status
+    // bits is "not ready yet", and the bootloader settles to 0x80000000.
+    let (_, mut engine) = fixture();
+    engine.psp11 = true;
+    engine.io.busy = 3;
+    if run(engine.load(&image)).is_err() || engine.io.busy != 0 {
+        return TestResult::Fail("PSP11 bootloader low status bits treated as rejection");
+    }
+    let (_, mut engine) = fixture();
+    engine.psp11 = true;
+    engine.io.reject = 7;
+    if run(engine.load(&image)) != Err(Error::Rejected(7)) || engine.io.writes.len() != 2 {
+        return TestResult::Fail("persistent PSP11 status did not stop after the deadline");
     }
     for missing_heartbeat in [false, true] {
         let (pool, mut engine) = fixture();

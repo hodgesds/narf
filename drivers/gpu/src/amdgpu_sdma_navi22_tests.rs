@@ -22,6 +22,8 @@ struct Fake {
     progress: Arc<AtomicU32>,
     revoke: Option<(u64, u32, Cap<BusDeviceCap, Write>)>,
     traps: Vec<u32>,
+    /// GPU address of the two translated test pages (the boot aperture).
+    base: u64,
 }
 impl Fake {
     // Minimal independent decoder of the public Navi10 SDMA packet ABI.
@@ -31,11 +33,12 @@ impl Fake {
         assert_eq!(self.regs[&(GC + 0x81 * 4)], 0x08000040);
         assert_eq!(self.regs[&(GC + 0x82 * 4)], 0);
         assert_eq!(self.regs[&(GC + 0x80 * 4)] & 0x0f80323f, 0x801015);
+        let base = self.base;
         let index = |lo: u32, hi: u32| {
             let address = u64::from(lo) | (u64::from(hi) << 32);
-            assert!((0xb_0000_0000..0xb_0000_2000).contains(&address));
+            assert!((base..base + 0x2000).contains(&address));
             assert_eq!(address % 4, 0);
-            ((address - 0xb_0000_0000) / 4) as usize
+            ((address - base) / 4) as usize
         };
         let mut cursor = *self.regs.get(&(GC + 0x83 * 4)).unwrap_or(&0) as usize / 4;
         while cursor < end as usize / 4 {
@@ -166,6 +169,7 @@ fn fixture() -> (Pool, Engine<Fake>, gmc::Aperture, MmioRegion) {
             progress: Arc::new(AtomicU32::new(0)),
             revoke: None,
             traps: Vec::new(),
+            base: 0xb_0000_0000,
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -263,7 +267,10 @@ fn sdma_navi22_rejects_live_queues_and_invalid_memory_before_reset() -> TestResu
                 engine.io.regs.insert(GC + 0xda8 * 4, 1);
             }
             5 => {
-                engine.io.regs.insert(GC + 0x25 * 4, 0);
+                // A boot aperture inside the FB aperture.
+                aperture.start = 0x8_0020_0000;
+                aperture.source = aperture.start;
+                aperture.destination = aperture.start + 4096;
             }
             6 => {
                 engine.io.regs.insert(GC + 0x16fd * 4, u32::MAX);
@@ -291,6 +298,28 @@ fn sdma_navi22_rejects_live_queues_and_invalid_memory_before_reset() -> TestResu
 kernel_test_in!(
     "drivers/gpu/sdma-navi22",
     sdma_navi22_rejects_live_queues_and_invalid_memory_before_reset
+);
+/// Linux puts this board's GART (and so NARF's boot aperture) at MC 0
+/// (`GART: 512M 0x0-0x1FFFFFFF`), below the FB, and sdma_v5_2_start
+/// soft-resets SDMA without requiring SDMA0_STATUS_REG.IDLE first.
+fn sdma_navi22_accepts_linux_gart_aperture_and_busy_engine() -> TestResult {
+    let (_pool, mut engine, _, target) = fixture();
+    engine.io.regs.insert(GC + 0x25 * 4, 0);
+    engine.io.base = 0;
+    let aperture = gmc::Aperture {
+        start: 0,
+        size: 2 << 20,
+        source: 0,
+        destination: 0x1000,
+    };
+    if run(engine.initialize(aperture, target)).is_err() || engine.state != State::Verified {
+        return TestResult::Fail("Linux GART placement or non-idle SDMA0 refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/sdma-navi22",
+    sdma_navi22_accepts_linux_gart_aperture_and_busy_engine
 );
 fn sdma_navi22_cancellation_retains_reset_and_published_ring() -> TestResult {
     for (progress, state) in [

@@ -86,6 +86,102 @@ kernel_test_in!(
     psp_navi22_tmr_embedded_toc_and_address_spaces
 );
 
+/// MP0 11.0.11 has PMFW-centralized C-state management
+/// (psp_check_pmfw_centralized_cstate_management): psp_hw_start sends
+/// LOAD_TOC (psp_tmr_init), then SMC LOAD_IP_FW (psp_load_smu_fw), and only
+/// then SETUP_TMR (psp_tmr_load).
+fn psp_navi22_pmfw_centralized_toc_smc_then_setup_tmr() -> TestResult {
+    let (pool, mut s) = session();
+    let bytes = [0xa5; 16];
+    run(s.engine.start()).unwrap();
+    if run(s.load_smc_centralized(&bytes)) != Err(Error::Busy) {
+        return TestResult::Fail("SMC loaded before LOAD_TOC/TMR reservation");
+    }
+    if run(s.init_tmr(Some(&[0x11, 0x22, 0x33, 0x44]))).is_err()
+        || s.tmr_ready
+        || s.tmr.is_none()
+        || s.engine.io.submissions.len() != 1
+    {
+        return TestResult::Fail("psp_tmr_init sent SETUP_TMR before PMFW");
+    }
+    if run(s.load_smc_centralized(&bytes)).is_err()
+        || s.smc_state != SmcState::Loaded
+        || !s.tmr_ready
+    {
+        return TestResult::Fail("SMC then SETUP_TMR failed");
+    }
+    let ids: Vec<u32> = s.engine.io.submissions.iter().map(|c| c[2]).collect();
+    let smc = s.engine.io.submissions[1];
+    let setup = s.engine.io.submissions[2];
+    if ids != [0x20, 6, 5]
+        || smc[10] != 18
+        || setup[7..13] != [0x100000, 8, 4 << 20, 2, 0x100000, 1]
+    {
+        return TestResult::Fail("Linux LOAD_TOC -> LOAD_IP_FW(SMU) -> SETUP_TMR order");
+    }
+    if run(s.load_smc_centralized(&bytes)) != Err(Error::Busy)
+        || run(s.load_smc(&bytes)) != Err(Error::Busy)
+        || s.engine.io.submissions.len() != 3
+    {
+        return TestResult::Fail("SMC reloaded");
+    }
+    // SAFETY: fake SMU/PSP have no running firmware consumers.
+    unsafe { run(s.stop()) }.unwrap();
+    drop(s);
+    if pool.available() != 16 << 20 {
+        return TestResult::Fail("centralized TMR session leaked memory");
+    }
+    // A rejected SETUP_TMR leaves PMFW loaded but no usable TMR.
+    let (_, mut s) = session();
+    run(s.engine.start()).unwrap();
+    run(s.init_tmr(None)).unwrap();
+    s.engine.io.reject = 9;
+    s.engine.io.reject_command = Some(5);
+    if run(s.load_smc_centralized(&bytes)) != Err(Error::Rejected(9))
+        || s.smc_state != SmcState::Loaded
+        || s.tmr_ready
+    {
+        return TestResult::Fail("failed SETUP_TMR reported a ready TMR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_navi22_pmfw_centralized_toc_smc_then_setup_tmr
+);
+
+/// Linux psp_cmd_submit_buf only warns on nonzero response status on bare
+/// metal and waits ~2 s for the fence; Navi22 sessions do the same except for
+/// DESTROY_TMR, whose refusal must keep the trusted memory.
+fn psp_navi22_nonzero_status_warns_like_linux() -> TestResult {
+    if FENCE_TIMEOUT_MS < 2000 {
+        return TestResult::Fail("PSP fence deadline shorter than psp_cmd_submit_buf");
+    }
+    let (pool, mut s) = session();
+    s.engine.lenient = true;
+    run(s.engine.start()).unwrap();
+    s.engine.io.reject = 0xffff000a;
+    if run(s.init_tmr(Some(&[1, 2, 3, 4]))).is_err() || s.tmr.is_none() {
+        return TestResult::Fail("nonzero LOAD_TOC status aborted the boot");
+    }
+    if run(s.load_smc_centralized(&[1, 2, 3, 4])).is_err() || !s.tmr_ready {
+        return TestResult::Fail("nonzero LOAD_IP_FW/SETUP_TMR status aborted the boot");
+    }
+    // SAFETY: model only; firmware refuses the TMR teardown.
+    if unsafe { run(s.stop()) } != Err(Error::Rejected(0xffff000a)) || s.tmr.is_none() {
+        return TestResult::Fail("refused DESTROY_TMR recycled trusted memory");
+    }
+    drop(s);
+    if pool.available() != (16 << 20) - BUFFER_SIZE - (4 << 20) {
+        return TestResult::Fail("refused teardown released TMR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_navi22_nonzero_status_warns_like_linux
+);
+
 fn psp_navi22_tmr_defaults_bounds_and_rejection() -> TestResult {
     let (_, mut s) = session();
     if run(s.setup_tmr_payload(None)) != Err(Error::Busy) || s.tmr.is_some() {
@@ -477,6 +573,8 @@ fn psp_navi22_constructor_uses_gmc10_and_exact_ip_banks() -> TestResult {
         || mmio.gfx_status_regs != Some(((0x2000 + 0xf40) * 4, (0x4000 + 0x4e8d) * 4))
         || psp.session.fb_base != 0x8_0000_0000
         || psp.session.fb_offset != 0x1_0000_0000
+        || psp.fb_location() != (0x8_0000_0000, 0x1_0000_0000)
+        || !psp.session.engine.lenient
         || regs != before
     {
         return TestResult::Fail("wrong PSP/NBIO/HDP/GMC bank or constructor performed writes");
@@ -612,6 +710,7 @@ fn psp_navi48_gmc12_hdp6_and_target_isolation() -> TestResult {
                 || psp.session.fb_base != 0x8_0000_0000
                 || psp.session.fb_offset != 0x1_0000_0000
                 || psp.session.engine.io.invalidate_reg.is_some()
+                || psp.session.engine.lenient
                 || regs != before
                 || run(psp.setup_tmr(&[])) != Err(Error::Unsupported)
                 || run(psp.load_dmub(&[0; 4])) != Err(Error::Unsupported)

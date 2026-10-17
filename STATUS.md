@@ -1012,6 +1012,14 @@ reproducibly for NARF's musl userspace and stages into a rootfs; the
 decline, software fallback renders) and the same binaries render on a Linux
 amdgpu host ([Mesa AMD](docs/MESA_AMD.md)). libdrm_amdgpu's `GET_CLIENT` on
 primary nodes is the first NARF gap Mesa hits.
+The firmware path now follows Linux on the GOP-booted (SOS not alive) cold
+path: KM-type PSP rings on every PSP generation, LOAD_TOC → SMC → SETUP_TMR
+(PMFW-centralized C-states), DCN3.0's own FB register offsets, Linux's GART
+placement at MC 0 (12272 MiB VRAM model), MEMSIZE-derived FB end, tolerated
+GOP VMID0/DMUB windows/stopped-OTG pipes, an MP1 firmware-ready poll, Linux
+(or longer) PSP/SMU/training deadlines, warn-only PSP status, golden settings
+before SDMA plus the GC 10.3 power brake, and a non-fatal DMUB start after the
+queue stages using the GMC aperture.
 These are software-tested foundations; training resume,
 media submission/DPG, display-aware DPM, user command submission,
 hardware boot and DCN3.0 modesetting remain open. See the

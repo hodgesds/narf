@@ -1,5 +1,6 @@
-//! Phoenix and Navi22 boot VRAM inventory. References: Linux amdgpu_ttm.c,
-//! amdgpu_atomfirmware.c, atomfirmware.h and DCN 3.1.4 register headers.
+//! Phoenix, Navi22 and Navi48 boot VRAM inventory. References: Linux
+//! amdgpu_ttm.c, amdgpu_atomfirmware.c, atomfirmware.h and the DCN 3.1.4,
+//! 3.0.0 and 4.1.0 register headers.
 //! Firmware metadata and explicit boot/client ranges precede allocation.
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -109,19 +110,25 @@ impl Plan {
         if gpu.chip.vid != amdgpu::AMD_VENDOR {
             return Err(Error::Unsupported);
         }
-        let (gc_version, dcn_versions, fb_regs): (_, &[_], _) = match gpu.chip.did {
-            amdgpu::NAVI22 => ((10, 3, 2), &[(3, 0, 0)], [0x16fc, 0x16fd, 0x16e7]),
+        let navi22 = gpu.chip.did == amdgpu::NAVI22;
+        // GC MC_VM_FB_LOCATION_BASE/TOP and MC_VM_FB_OFFSET, then DCN's copy
+        // DCN_VM_FB_LOCATION_BASE/TOP and DCN_VM_FB_OFFSET (BASE_IDX 2):
+        // dcn_3_0_0_offset.h places them at 0x493..0x495, while DCN3.1+ and
+        // DCN4 (dcn_4_1_0_offset.h) moved them to 0x475..0x477.
+        let (gc_version, dcn_versions, fb_regs, dcn_fb): (_, &[_], _, u32) = match gpu.chip.did {
+            amdgpu::NAVI22 => ((10, 3, 2), &[(3, 0, 0)], [0x16fc, 0x16fd, 0x16e7], 0x493),
             amdgpu::NAVI48 => (
                 (12, 0, 1),
                 &[(4, 0, 1), (4, 1, 0)],
                 [0x1614, 0x1615, 0x15a7],
+                0x475,
             ),
             _ => return Err(Error::Unsupported),
         };
         let gc = bank(gpu, ip::HW_ID_GC, &[gc_version], 0, fb_regs[1])
             .map_err(|_| Error::Unsupported)?;
-        let dcn =
-            bank(gpu, ip::HW_ID_DCN, dcn_versions, 2, 0x477).map_err(|_| Error::Unsupported)?;
+        let dcn = bank(gpu, ip::HW_ID_DCN, dcn_versions, 2, dcn_fb + 2)
+            .map_err(|_| Error::Unsupported)?;
         let vbios = gpu.vbios.as_ref().ok_or(Error::MissingVbios)?;
         let inherited = crate::amdgpu_platform::boot_clients(gpu, authority)?;
         authority
@@ -134,14 +141,27 @@ impl Plan {
                         gpu.regs.read32(gc + fb_regs[2] as u64 * 4),
                     ]
                 };
-                for (index, field) in fields.iter().enumerate() {
-                    // DMUB's MC translation uses DCN's copy of these fields.
-                    // An inconsistent display aperture cannot be inventoried.
-                    // SAFETY: DCN's entire FB register triplet is bounded above.
-                    let display = unsafe { gpu.regs.read32(dcn + (0x475 + index as u64) * 4) };
-                    if display == u32::MAX || display & 0xff_ffff != field & 0xff_ffff {
-                        return Err(Error::Invalid);
-                    }
+                // SAFETY: DCN's entire FB register triplet is bounded above.
+                let display: [u32; 3] = core::array::from_fn(|index| unsafe {
+                    gpu.regs
+                        .read32(dcn + (u64::from(dcn_fb) + index as u64) * 4)
+                });
+                if display.contains(&u32::MAX) {
+                    return Err(Error::Invalid);
+                }
+                // Inherited scanout addresses are interpreted through the
+                // display copy. Linux never reads either TOP (gmc_v10_0
+                // derives fb_end from RCC_CONFIG_MEMSIZE) and programs DCN's
+                // copy itself (hubbub3_init_dchub_sys_ctx), so on Navi22 an
+                // unprogrammed (all-zero) copy is accepted and TOP ignored.
+                let compared: &[usize] = if navi22 { &[0, 2] } else { &[0, 1, 2] };
+                let unprogrammed = navi22 && display == [0; 3];
+                if !unprogrammed
+                    && compared
+                        .iter()
+                        .any(|&i| display[i] & 0xff_ffff != fields[i] & 0xff_ffff)
+                {
+                    return Err(Error::Invalid);
                 }
                 let mut plan = snapshot_with_layout(
                     gpu.fb_bar,
@@ -151,6 +171,10 @@ impl Plan {
                     SnapshotLayout {
                         fields,
                         region6: gpu.chip.did == amdgpu::NAVI48,
+                        dcn30: navi22,
+                        // amdgpu_gmc_vram_location: fb_end = fb_start +
+                        // mc_vram_size - 1, mc_vram_size from MEMSIZE.
+                        size: navi22.then_some(gpu.vram.size),
                     },
                     // SAFETY: DCN bank bounds every window register read.
                     |reg| unsafe { gpu.regs.read32(dcn + reg as u64 * 4) },
@@ -356,6 +380,8 @@ fn snapshot_with_fields(
         SnapshotLayout {
             fields,
             region6: false,
+            dcn30: false,
+            size: None,
         },
         read,
     )
@@ -363,6 +389,11 @@ fn snapshot_with_fields(
 struct SnapshotLayout {
     fields: [u32; 3],
     region6: bool,
+    /// DCN3.0 (dmub_dcn30_setup_windows): CW2..CW7 and REGION4..7 carry
+    /// untranslated GPU addresses; REGION0..2 have no VRAM offset at all.
+    dcn30: bool,
+    /// Physical VRAM size; None derives the end from FB_LOCATION_TOP.
+    size: Option<u64>,
 }
 fn snapshot_with_layout(
     mut mapping: MmioRegion,
@@ -377,7 +408,10 @@ fn snapshot_with_layout(
         return Err(Error::Invalid);
     }
     let gpu_base = ((fields[0] & 0xff_ffff) as u64) << 24;
-    let gpu_end = (((fields[1] & 0xff_ffff) as u64) + 1) << 24;
+    let gpu_end = match layout.size {
+        Some(size) => gpu_base.checked_add(size).ok_or(Error::Invalid)?,
+        None => (((fields[1] & 0xff_ffff) as u64) + 1) << 24,
+    };
     let fb_offset = ((fields[2] & 0xff_ffff) as u64) << 24;
     let vram_size = gpu_end
         .checked_sub(gpu_base)
@@ -428,7 +462,14 @@ fn snapshot_with_layout(
             .ok_or(Error::Invalid)?;
         plan.protect_gpu(Owner::OtherClient, range.start, size)?;
     }
-    for reg in [0x19e, 0x19f, 0x1a0, 0x1a4] {
+    // REGION0..2 have no offset register, so they cannot name VRAM; Linux
+    // never programs or reads them. REGION7 is inventoried below on DCN3.0.
+    let refused: &[u32] = if layout.dcn30 {
+        &[]
+    } else {
+        &[0x19e, 0x19f, 0x1a0, 0x1a4]
+    };
+    for &reg in refused {
         let top = read(reg);
         if top == u32::MAX {
             return Err(Error::Invalid);
@@ -445,8 +486,10 @@ fn snapshot_with_layout(
         if top & ENABLE == 0 {
             continue;
         }
-        if matches!(index, 2 | 7) {
+        if matches!(index, 2 | 7) && !layout.dcn30 {
             // This DCN314 path does not implement those window layouts.
+            // DCN3.0 maps CW2 (bss/data) itself and its CW2..CW7 offsets are
+            // plain GPU addresses ("hardwired virtual addressing").
             return Err(Error::Unsupported);
         }
         let base = read(0x1a5 + index);
@@ -472,7 +515,9 @@ fn snapshot_with_layout(
     }
     // Region5 is the trace alias. DCN4 additionally maps shared firmware state
     // into Region6, with a direct GPU offset and inclusive top (dmub_dcn401).
-    for index in 0..3 {
+    // DCN3.0's uncached inbox is Region4 (dmub_dcn30_setup_windows); every
+    // Region4..7 there is a direct GPU offset, so all are inventoried.
+    for index in 0..if layout.dcn30 { 4 } else { 3 } {
         let top = read(0x1a1 + index);
         if top == u32::MAX {
             return Err(Error::Invalid);
@@ -480,7 +525,7 @@ fn snapshot_with_layout(
         if top & ENABLE == 0 {
             continue;
         }
-        if index != 1 && !(index == 2 && layout.region6) {
+        if index != 1 && !(index == 2 && layout.region6) && !layout.dcn30 {
             return Err(Error::Unsupported);
         }
         let low = read(0x196 + index * 2);
