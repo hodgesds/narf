@@ -62,6 +62,14 @@ pub struct Connector {
     pub hpd: Option<u8>,
 }
 impl Connector {
+    /// `connector_obj_id.id` (`grph_object_id.h`): CONNECTOR_ID_HDMI_TYPE_A
+    /// and CONNECTOR_ID_DISPLAY_PORT, as the VBIOS transmitter table takes it.
+    pub fn object_id(&self) -> u8 {
+        match self.signal {
+            Signal::Hdmi => 12,
+            Signal::DisplayPort => 19,
+        }
+    }
     fn from_path(path: Path) -> Option<Self> {
         let signal = match path.connector {
             Kind::HdmiTypeA => Signal::Hdmi,
@@ -128,13 +136,24 @@ pub(crate) struct Detector<I: Io> {
     engine: Engine<I>,
     connectors: Vec<Connector>,
     bound: bool,
+    /// HPD blocks this owner had to switch on, and when: their debounced
+    /// sense reads low until the connect filter (500 ms HDMI, 80 ms DP)
+    /// has passed.
+    settling: u8,
+    settle_until: Option<narf_time::Deadline>,
 }
+/// How long a freshly enabled HPD block may read disconnected before the
+/// filter has run: the longest connect delay plus margin.
+const HPD_SETTLE_MS: u64 = 1000;
+const HPD_SETTLE_POLL_MS: u64 = 10;
 impl<I: Io> Detector<I> {
     pub(crate) fn new_with(engine: Engine<I>, paths: &[Path]) -> Result<Self, Error> {
         Ok(Self {
             engine,
             connectors: connectors(paths)?,
             bound: false,
+            settling: 0,
+            settle_until: None,
         })
     }
     /// The link-encoder AUX init and HPD filter for every connector. Once.
@@ -143,7 +162,12 @@ impl<I: Io> Detector<I> {
             return Ok(());
         }
         for c in self.connectors.clone() {
-            ddc::bind(&mut self.engine, c.line, c.hpd, c.signal)?;
+            if ddc::bind(&mut self.engine, c.line, c.hpd, c.signal)? {
+                self.settling |= 1 << c.hpd.unwrap_or(0);
+            }
+        }
+        if self.settling != 0 {
+            self.settle_until = Some(narf_time::Deadline::after_ms(HPD_SETTLE_MS));
         }
         self.bound = true;
         Ok(())
@@ -154,7 +178,7 @@ impl<I: Io> Detector<I> {
         // A connector without HPD wiring is probed by DDC alone, as Linux
         // does for HPD_SOURCEID_UNKNOWN: a NACK then means disconnected.
         if let Some(hpd) = c.hpd {
-            if !ddc::hpd(&mut self.engine, hpd)? {
+            if !self.sense(hpd).await? {
                 return Ok(Detection::Disconnected);
             }
         }
@@ -175,6 +199,28 @@ impl<I: Io> Detector<I> {
                 error @ (ddc::Error::DeviceGone | ddc::Error::Revoked | ddc::Error::Busy),
             )) => Err(Error::Ddc(error)),
             Err(error) => Ok(Detection::Failed(error)),
+        }
+    }
+    /// Debounced HPD sense; a block this owner just enabled is polled until
+    /// it reads connected or its filter has certainly run (bounded).
+    async fn sense(&mut self, hpd: u8) -> Result<bool, Error> {
+        loop {
+            if ddc::hpd(&mut self.engine, hpd)? {
+                return Ok(true);
+            }
+            let settling = self.settling & 1 << hpd != 0;
+            match self.settle_until {
+                Some(deadline) if settling && !deadline.expired() => {
+                    narf_time::SleepUntil::new(
+                        narf_time::Deadline::after_ms(HPD_SETTLE_POLL_MS).as_instant(),
+                    )
+                    .await;
+                }
+                _ => {
+                    self.settling &= !(1 << hpd);
+                    return Ok(false);
+                }
+            }
         }
     }
     async fn detect_all(&mut self) -> Result<Vec<Report>, Error> {
@@ -386,6 +432,43 @@ impl Display {
         let c = *self.0.connectors.get(index).ok_or(Error::Invalid)?;
         let hpd = c.hpd.ok_or(Error::Unsupported)?;
         Ok(ddc::hpd_ack(&mut self.0.engine, hpd)?)
+    }
+}
+
+/// Native AUX to one DisplayPort connector, for link training.
+#[derive(Debug)]
+pub struct DisplayAux<'a> {
+    pub display: &'a mut Display,
+    pub index: usize,
+}
+impl crate::amdgpu_dcn30_dp::Aux for DisplayAux<'_> {
+    async fn read(
+        &mut self,
+        address: u32,
+        data: &mut [u8],
+    ) -> Result<(), crate::amdgpu_navi22_modeset::Error> {
+        for (i, chunk) in data.chunks_mut(ddc::AUX_MAX_BYTES).enumerate() {
+            let at = address + (i * ddc::AUX_MAX_BYTES) as u32;
+            self.display
+                .dpcd_read(self.index, at, chunk)
+                .await
+                .map_err(|_| crate::amdgpu_navi22_modeset::Error::Aux)?;
+        }
+        Ok(())
+    }
+    async fn write(
+        &mut self,
+        address: u32,
+        data: &[u8],
+    ) -> Result<(), crate::amdgpu_navi22_modeset::Error> {
+        for (i, chunk) in data.chunks(ddc::AUX_MAX_BYTES).enumerate() {
+            let at = address + (i * ddc::AUX_MAX_BYTES) as u32;
+            self.display
+                .dpcd_write(self.index, at, chunk)
+                .await
+                .map_err(|_| crate::amdgpu_navi22_modeset::Error::Aux)?;
+        }
+        Ok(())
     }
 }
 

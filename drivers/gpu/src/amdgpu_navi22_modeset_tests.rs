@@ -1,5 +1,6 @@
 use super::*;
-use alloc::vec;
+use crate::amdgpu_navi22_modeset_model::{self as m, d1, d2, d3, Bench, DpSink, Vram, MARK};
+use alloc::{vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn soc() -> dml30::Soc {
@@ -111,4 +112,914 @@ fn navi22_modeset_test_pattern_draws_eight_bars() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22-modeset",
     navi22_modeset_test_pattern_draws_eight_bars
+);
+
+// ── End-to-end register model ─────────────────────────────────────────
+
+const BOARD: Board = Board {
+    crystal_khz: 100_000,
+    channels: 12,
+    channel_width_bytes: 2,
+};
+const VRAM_BYTES: usize = 2 << 20;
+
+fn run<T>(f: impl Future<Output = T>) -> T {
+    narf_scheduler::block_on_spin(f)
+}
+fn pipeline(bench: &Bench, connector: Connector, route: Route) -> Pipeline {
+    // SAFETY: the bench's model owns every register the pipeline reaches.
+    unsafe { Pipeline::new(&bench.gpu, Cap::bootstrap(), connector, route) }.unwrap()
+}
+fn route(pipe: u8, stream: u8, signal: Signal, pll: u8) -> Route {
+    Route {
+        pipe,
+        stream,
+        clock: match signal {
+            Signal::Hdmi => ClockSource::Pll(pll),
+            Signal::DisplayPort => ClockSource::DpDto,
+        },
+    }
+}
+async fn enable_with<A: Aux + Send>(
+    p: &mut Pipeline,
+    vram: &Vram,
+    tables: &Tables<'_>,
+    sink: &Sink,
+    aux: &mut A,
+) -> Result<Output, Error> {
+    let links = [p.connector()];
+    // SAFETY: model-backed owners and a heap-backed pool.
+    unsafe {
+        p.enable(
+            core::future::ready(Ok(())),
+            &vram.pool,
+            tables,
+            BOARD,
+            &links,
+            sink,
+            aux,
+            test_pattern,
+        )
+        .await
+    }
+}
+
+type Pred<'a> = (&'static str, &'a dyn Fn(&m::Write) -> bool);
+/// Every milestone, in order, each strictly after the previous one.
+fn in_order(log: &[m::Write], from: usize, steps: &[Pred<'_>]) -> Result<usize, &'static str> {
+    let mut at = from;
+    for (name, pred) in steps {
+        match log[at..].iter().position(|w| pred(w)) {
+            Some(i) => at += i + 1,
+            None => return Err(name),
+        }
+    }
+    Ok(at)
+}
+fn is(dword: u32) -> impl Fn(&m::Write) -> bool {
+    move |w: &m::Write| w.dword == dword
+}
+fn set(dword: u32, mask: u32) -> impl Fn(&m::Write) -> bool {
+    move |w: &m::Write| w.dword == dword && w.value & mask != 0
+}
+fn clear(dword: u32, mask: u32) -> impl Fn(&m::Write) -> bool {
+    move |w: &m::Write| w.dword == dword && w.value & mask == 0
+}
+fn table(slot: u32, phy: Option<u8>, action: Option<u8>) -> impl Fn(&m::Write) -> bool {
+    move |w: &m::Write| {
+        w.dword == MARK + 16 * slot
+            && phy.is_none_or(|p| w.value & 0xff == u32::from(p))
+            && action.is_none_or(|a| (w.value >> 8) & 0xff == u32::from(a))
+    }
+}
+fn dal(message: u32) -> impl Fn(&m::Write) -> bool {
+    move |w: &m::Write| w.dword == m::MP1 + 0x28a && w.value == message
+}
+
+/// Linux's global order for one HDMI stream: dcn30_init_hw, prepare
+/// bandwidth, dcn20_enable_stream_timing, link_set_dpms_on, then the front
+/// end under the OTG lock.
+fn hdmi_enable_order(log: &[m::Write], r: Route, tx: u8) -> Result<usize, &'static str> {
+    let (p, f, t) = (u32::from(r.pipe), u32::from(r.stream), u32::from(tx));
+    let ClockSource::Pll(pll) = r.clock else {
+        return Err("route clock");
+    };
+    let resync = [0x40, 0x41, 0x42, 0x43, 0x4c, 0x7e][usize::from(pll)];
+    let plane = |w: &m::Write| p == 5 || w.dword == d2(0x80 + 2 * (2 * p + 1));
+    in_order(
+        log,
+        0,
+        &[
+            ("dccg2_init", &is(d1(0x7b))),
+            ("bios_golden_init", &table(m::SLOT_POWER_GATING, None, None)),
+            ("disable_vga", &is(d1(0x0c))),
+            ("enc3_hw_init TMDS_CTL0", &set(d2(0x20de + t * 0x100), 1)),
+            ("enable_power_gating_plane", &is(d2(0x80))),
+            ("dal start", &dal(2)),
+            ("update_clocks", &dal(0xe)),
+            ("dentist", &is(d1(0x64))),
+            ("program_watermarks", &is(d2(0x509))),
+            ("enable_optc_clock input", &set(d2(0x1acf + p * 0x10), 2)),
+            ("enable_optc_clock otg", &set(d2(0x1b86 + p * 0x80), 1)),
+            (
+                "program_pix_clk SetPixelClock",
+                &table(m::SLOT_PIXEL_CLOCK, None, None),
+            ),
+            ("pixel_clk_resync", &is(d1(resync))),
+            ("program_timing", &is(d2(0x1b2a + p * 0x80))),
+            ("blank_pixel_data(true)", &set(d2(0x1854 + p * 0x5a), 1)),
+            ("enable_crtc", &set(d2(0x1b41 + p * 0x80), 1)),
+            ("dig_connect_to_otg", &is(d2(0x208b + f * 0x100))),
+            ("link_enc setup HDMI", &|w: &m::Write| {
+                w.dword == d2(0x20b0 + t * 0x100) && (w.value >> 16) & 7 == 3
+            }),
+            ("STREAM_SETUP", &|w: &m::Write| {
+                w.dword == MARK + 16 * m::SLOT_STREAM_SETUP && w.value & 0xff == f
+            }),
+            ("hdmi_set_stream_attribute", &is(d2(0x2093 + f * 0x100))),
+            ("AVI InfoFrame", &is(d2(0x2069 + f * 0x100))),
+            (
+                "enable_tmds_output",
+                &table(m::SLOT_TRANSMITTER, Some(tx), Some(1)),
+            ),
+            (
+                "connect_dig_be_to_fe",
+                &set(d2(0x20b0 + t * 0x100), 1 << (8 + f)),
+            ),
+            ("AVMUTE released", &clear(d2(0x209d + f * 0x100), 1)),
+            ("optc3_lock", &set(d2(0x1b8b + p * 0x80), 1)),
+            ("blank_pixel_data(false)", &|w: &m::Write| {
+                w.dword == d2(0x1854 + p * 0x5a) && w.value == 0
+            }),
+            ("power_on_plane", &plane),
+            ("hubp_clk_cntl", &set(d2(0x5f4 + p * 0xdc), 1)),
+            ("update_dpp_dto", &is(d1(0x99 + p))),
+            ("dpp", &is(d2(0xcc5 + p * 0x16b))),
+            ("mpcc", &is(d3(p * 0x20))),
+            ("hubp surface", &is(d2(0x60a + p * 0xdc))),
+            ("hubp set_blank(false)", &clear(d2(0x5f3 + p * 0xdc), 1)),
+            ("optc1_unlock", &|w: &m::Write| {
+                w.dword == d2(0x1b8b + p * 0x80) && w.value == 0
+            }),
+        ],
+    )
+}
+fn hdmi_disable_order(
+    log: &[m::Write],
+    from: usize,
+    r: Route,
+    tx: u8,
+) -> Result<usize, &'static str> {
+    let (p, f, t) = (u32::from(r.pipe), u32::from(r.stream), u32::from(tx));
+    in_order(
+        log,
+        from,
+        &[
+            ("blank_pixel_data(true)", &set(d2(0x1854 + p * 0x5a), 1)),
+            ("mpcc removal", &|w: &m::Write| {
+                w.dword == d3(0x580 + p * 4) && w.value & 0xf == 0xf
+            }),
+            ("hubp blank", &set(d2(0x5f3 + p * 0xdc), 1)),
+            ("set_avmute(true)", &set(d2(0x209d + f * 0x100), 1)),
+            ("stop_hdmi_info_packets", &|w: &m::Write| {
+                w.dword == d2(0x209a + f * 0x100) && w.value == 0
+            }),
+            (
+                "connect_dig_be_to_fe(false)",
+                &clear(d2(0x20b0 + t * 0x100), 1 << (8 + f)),
+            ),
+            (
+                "disable_output",
+                &table(m::SLOT_TRANSMITTER, Some(tx), Some(0)),
+            ),
+            ("disable_crtc", &clear(d2(0x1b41 + p * 0x80), 1)),
+            ("enable_optc_clock(false)", &clear(d2(0x1b86 + p * 0x80), 1)),
+        ],
+    )
+}
+
+fn navi22_modeset_resources_follow_the_dcn30_pool() -> TestResult {
+    let hdmi = m::connector(Signal::Hdmi, 3, 3);
+    let dp = |t| m::connector(Signal::DisplayPort, t, t);
+    let mut pool = Resources::new();
+    // First stream: pipe 0, its preferred engine DIG FE 3, PHY PLL0.
+    if pool.acquire(&hdmi) != Ok(route(0, 3, Signal::Hdmi, 0)) {
+        return TestResult::Fail("first HDMI stream");
+    }
+    // DP on transmitter 3 again: preferred FE taken, so the *last* free
+    // frontend (5), and the DP DTO instead of a PLL.
+    if pool.acquire(&dp(3)) != Ok(route(1, 5, Signal::DisplayPort, 0)) {
+        return TestResult::Fail("fallback stream encoder");
+    }
+    let second_hdmi = pool.acquire(&hdmi);
+    if second_hdmi != Ok(route(2, 4, Signal::Hdmi, 1)) {
+        return TestResult::Fail("second PHY PLL");
+    }
+    for t in [0, 1, 2] {
+        if pool.acquire(&dp(t)).map(|r| r.stream) != Ok(t) {
+            return TestResult::Fail("preferred engines");
+        }
+    }
+    if pool.acquire(&dp(0)) != Err(Error::Busy) {
+        return TestResult::Fail("seventh stream admitted");
+    }
+    pool.release(second_hdmi.unwrap());
+    if pool.acquire(&hdmi) != Ok(route(2, 4, Signal::Hdmi, 1)) {
+        return TestResult::Fail("released resources reused");
+    }
+    // choose: HDMI first, else the first DP sink with EDID and DPCD.
+    let report = |c: Connector, d: Detection| Report {
+        connector: c,
+        detection: d,
+    };
+    let dp_sink = m::sink(Signal::DisplayPort, Some(m::dpcd(0x12)));
+    let mut no_dpcd = dp_sink.clone();
+    no_dpcd.dpcd = None;
+    let reports = [
+        report(dp(0), Detection::Connected(no_dpcd)),
+        report(dp(1), Detection::Connected(dp_sink.clone())),
+        report(hdmi, Detection::Disconnected),
+    ];
+    if choose(&reports).map(|(c, _)| c) != Some(dp(1)) {
+        return TestResult::Fail("DP sink choice");
+    }
+    let mut with_hdmi = reports.to_vec();
+    with_hdmi[2].detection = Detection::Connected(m::sink(Signal::Hdmi, None));
+    if choose(&with_hdmi).map(|(c, _)| c) != Some(hdmi) {
+        return TestResult::Fail("HDMI preference");
+    }
+    // DP DTO: 25.175 MHz is a /1.001 video rate; 148.5 MHz is not in range.
+    if dp_dto(25_175) != (25_200 * 1000, 730_000 * 1001)
+        || dp_dto(148_500) != (148_500_000, 730_000_000)
+    {
+        return TestResult::Fail("dcn3_program_pix_clk DTO");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_modeset_resources_follow_the_dcn30_pool
+);
+
+fn navi22_modeset_hdmi_end_to_end_follows_linux_order() -> TestResult {
+    for revision in [6, 7] {
+        let bench = Bench::new();
+        bench.set(m::MP1 + 0x274, 1);
+        let vram = Vram::new(VRAM_BYTES);
+        let image = m::vbios(revision);
+        let tables = Tables::new(&image).unwrap();
+        let connector = m::connector(Signal::Hdmi, 3, 3);
+        let r = Resources::new().acquire(&connector).unwrap();
+        let mut p = pipeline(&bench, connector, r);
+        let sink = m::sink(Signal::Hdmi, None);
+        let output = match run(enable_with(&mut p, &vram, &tables, &sink, &mut NoAux)) {
+            Ok(o) => o,
+            Err(_) => return TestResult::Fail("HDMI enable"),
+        };
+        if p.state() != State::At(Step::Running)
+            || output.timing.h_active != 640
+            || output.inherited != Inherited::default()
+            || output.link.is_some()
+        {
+            return TestResult::Fail("HDMI output");
+        }
+        let log = bench.log();
+        let enabled = match hdmi_enable_order(&log, r, 3) {
+            Ok(at) => at,
+            Err(name) => return TestResult::Fail(name),
+        };
+        // Live: flushes go through HDP, underflow polling finds none.
+        if p.flush().is_err() || p.check_underflow() != Ok(None) {
+            return TestResult::Fail("live pipeline");
+        }
+        // SetPixelClock carried 25.175 MHz on PLL0 for OTG 0, and the
+        // transmitter table HDMI mode on four lanes.
+        let marker = |slot: u32, i: u32| bench.get(MARK + 16 * slot + i);
+        // The DTD's 2517 x 10 kHz, in 100 Hz units.
+        if marker(m::SLOT_PIXEL_CLOCK, 0) != output.timing.pixel_clock_khz * 10
+            || output.timing.pixel_clock_khz != 25_170
+            || marker(m::SLOT_PIXEL_CLOCK, 1) & 0xff != 20
+            || marker(m::SLOT_TRANSMITTER, 0) >> 16 != 3 | 4 << 8
+        {
+            return TestResult::Fail("VBIOS parameter blocks");
+        }
+        if run(p.disable(&tables, &mut NoAux)).is_err() || p.state() != State::At(Step::Stopped) {
+            return TestResult::Fail("HDMI disable");
+        }
+        let log = bench.log();
+        if let Err(name) = hdmi_disable_order(&log, enabled, r, 3) {
+            return TestResult::Fail(name);
+        }
+        // The PHY PLL is never "powered down" with a zero clock.
+        if log[enabled..]
+            .iter()
+            .any(|w| w.dword == MARK + 16 * m::SLOT_PIXEL_CLOCK)
+        {
+            return TestResult::Fail("SetPixelClock(0) on disable");
+        }
+        // The scanout stays excluded from reuse after the stop.
+        if p.scanout().is_none_or(|s| s.reusable_for_test()) {
+            return TestResult::Fail("scanout released");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_modeset_hdmi_end_to_end_follows_linux_order
+);
+
+fn dp_order(log: &[m::Write], r: Route, tx: u8, rate: u8) -> Result<usize, &'static str> {
+    let (p, f, t) = (u32::from(r.pipe), u32::from(r.stream), u32::from(tx));
+    in_order(
+        log,
+        0,
+        &[
+            ("dccg2_init", &is(d1(0x7b))),
+            ("enc3_hw_init", &set(d2(0x20de + t * 0x100), 1)),
+            ("update_clocks", &dal(0xe)),
+            ("program_watermarks", &is(d2(0x509))),
+            ("enable_optc_clock", &set(d2(0x1b86 + p * 0x80), 1)),
+            ("DP_DTO phase", &is(d1(0x81 + 4 * p))),
+            ("DP_DTO modulo", &is(d1(0x82 + 4 * p))),
+            ("DP_DTO enable", &set(d1(0x80 + 4 * p), 0x10)),
+            ("program_timing", &is(d2(0x1b2a + p * 0x80))),
+            ("enable_crtc", &set(d2(0x1b41 + p * 0x80), 1)),
+            ("dig_connect_to_otg", &is(d2(0x208b + f * 0x100))),
+            ("link_enc setup DP", &|w: &m::Write| {
+                w.dword == d2(0x20b0 + t * 0x100) && (w.value >> 16) & 7 == 0
+            }),
+            ("MSA", &is(d2(0x214c + f * 0x100))),
+            ("update_dp_info_packets", &is(d2(0x212b + f * 0x100))),
+            ("notify_link_rate_change", &|w: &m::Write| {
+                w.dword == m::MP1 + 0x28a && w.value == 9
+            }),
+            (
+                "connect_dig_be_to_fe",
+                &set(d2(0x20b0 + t * 0x100), 1 << (8 + f)),
+            ),
+            ("configure_encoder", &is(d2(0x210b + t * 0x100))),
+            (
+                "enable_dp_output",
+                &table(m::SLOT_TRANSMITTER, Some(tx), Some(1)),
+            ),
+            ("DPCD power D0", &|w: &m::Write| {
+                w.dword == m::AUX_WRITE | 0x600
+            }),
+            ("DPCD link rate", &|w: &m::Write| {
+                w.dword == m::AUX_WRITE | 0x100 && w.value == u32::from(rate)
+            }),
+            ("TPS1", &|w: &m::Write| {
+                w.dword == d2(0x2118 + t * 0x100) && w.value == 0
+            }),
+            (
+                "lane settings",
+                &table(m::SLOT_TRANSMITTER, Some(tx), Some(11)),
+            ),
+            ("lane status", &|w: &m::Write| {
+                w.dword == m::AUX_READ | 0x202
+            }),
+            // TPS3 at HBR2 and above when the sink has it, else TPS2.
+            ("TPS2/3", &|w: &m::Write| {
+                w.dword == d2(0x2118 + t * 0x100) && w.value == if rate >= 20 { 2 } else { 1 }
+            }),
+            ("video idle", &set(d2(0x2113 + t * 0x100), 1 << 28)),
+            ("training complete", &set(d2(0x2108 + t * 0x100), 1 << 4)),
+            ("M/N", &is(d2(0x2112 + f * 0x100))),
+            ("DIG_START pulse", &set(d2(0x208b + f * 0x100), 1 << 10)),
+            ("DP_VID_STREAM_ENABLE", &set(d2(0x210c + f * 0x100), 1)),
+            ("optc3_lock", &set(d2(0x1b8b + p * 0x80), 1)),
+            ("hubp set_blank(false)", &clear(d2(0x5f3 + p * 0xdc), 1)),
+            ("optc1_unlock", &|w: &m::Write| {
+                w.dword == d2(0x1b8b + p * 0x80) && w.value == 0
+            }),
+        ],
+    )
+}
+fn dp_disable_order(
+    log: &[m::Write],
+    from: usize,
+    r: Route,
+    tx: u8,
+) -> Result<usize, &'static str> {
+    let (p, f, t) = (u32::from(r.pipe), u32::from(r.stream), u32::from(tx));
+    in_order(
+        log,
+        from,
+        &[
+            ("blank_pixel_data(true)", &set(d2(0x1854 + p * 0x5a), 1)),
+            ("hubp blank", &set(d2(0x5f3 + p * 0xdc), 1)),
+            ("dp_blank", &clear(d2(0x210c + f * 0x100), 1)),
+            ("DPCD D3", &|w: &m::Write| {
+                w.dword == m::AUX_WRITE | 0x600 && w.value == 2
+            }),
+            (
+                "disable_output",
+                &table(m::SLOT_TRANSMITTER, Some(tx), Some(0)),
+            ),
+            ("link_encoder_disable", &|w: &m::Write| {
+                w.dword == d2(0x2118 + t * 0x100) && w.value == 0
+            }),
+            ("stop_dp_info_packets", &|w: &m::Write| {
+                w.dword == d2(0x212b + f * 0x100) && w.value == 0
+            }),
+            (
+                "connect_dig_be_to_fe(false)",
+                &clear(d2(0x20b0 + t * 0x100), 1 << (8 + f)),
+            ),
+            ("disable_crtc", &clear(d2(0x1b41 + p * 0x80), 1)),
+        ],
+    )
+}
+
+fn navi22_modeset_dp_sst_trains_falls_back_and_follows_linux_order() -> TestResult {
+    for (fail, revision, want) in [(vec![], 0x12, 20), (vec![20], 0x14, 10)] {
+        let bench = Bench::new();
+        bench.set(m::MP1 + 0x274, 1);
+        let vram = Vram::new(VRAM_BYTES);
+        let image = m::vbios(7);
+        let tables = Tables::new(&image).unwrap();
+        let connector = m::connector(Signal::DisplayPort, 1, 1);
+        let r = Resources::new().acquire(&connector).unwrap();
+        let mut p = pipeline(&bench, connector, r);
+        let sink = m::sink(Signal::DisplayPort, Some(m::dpcd(revision)));
+        let mut aux = DpSink::new(bench.model.clone());
+        aux.fail_rates = fail.clone();
+        // DPCD 1.4: SST split SDP and VSC colorimetry.
+        aux.feature = 0x0a;
+        let output = match run(enable_with(&mut p, &vram, &tables, &sink, &mut aux)) {
+            Ok(o) => o,
+            Err(_) => return TestResult::Fail("DP enable"),
+        };
+        if output.link
+            != Some(DpLink {
+                rate: want,
+                lanes: 4,
+            })
+        {
+            return TestResult::Fail("trained link");
+        }
+        let log = bench.log();
+        let enabled = match dp_order(&log, r, 1, want) {
+            Ok(at) => at,
+            Err(name) => return TestResult::Fail(name),
+        };
+        // M/N: 0x8000 x 25175 / (rate x 27000).
+        let m_vid = 0x8000 * output.timing.pixel_clock_khz / (u32::from(want) * 27_000);
+        let f = u32::from(r.stream);
+        if bench.get(d2(0x2112 + f * 0x100)) != m_vid
+            || bench.get(d2(0x2111 + f * 0x100)) != 0x8000
+            || bench.get(d2(0x210b + 0x100)) != 3
+        {
+            return TestResult::Fail("M/N or lane count");
+        }
+        // VSC for colorimetry only on the DPCD 1.4 sink with the cap.
+        let gsp0 = bench.get(d2(0x212b + f * 0x100)) & 1 << 20 != 0;
+        let misc1 = bench.get(d2(0x210e + f * 0x100)) & 0x40 != 0;
+        if gsp0 != (revision == 0x14) || misc1 != (revision == 0x14) {
+            return TestResult::Fail("VSC SDP colorimetry");
+        }
+        // A failed rate was retired (disable_output) before the next one.
+        if !fail.is_empty()
+            && in_order(
+                &log,
+                0,
+                &[
+                    ("first attempt", &|w: &m::Write| {
+                        w.dword == m::AUX_WRITE | 0x100 && w.value == 20
+                    }),
+                    ("disable", &table(m::SLOT_TRANSMITTER, Some(1), Some(0))),
+                    ("fallback", &|w: &m::Write| {
+                        w.dword == m::AUX_WRITE | 0x100 && w.value == 10
+                    }),
+                ],
+            )
+            .is_err()
+        {
+            return TestResult::Fail("rate fallback");
+        }
+        if run(p.disable(&tables, &mut aux)).is_err() {
+            return TestResult::Fail("DP disable");
+        }
+        if let Err(name) = dp_disable_order(&bench.log(), enabled, r, 1) {
+            return TestResult::Fail(name);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_modeset_dp_sst_trains_falls_back_and_follows_linux_order
+);
+
+/// The first write of each enable step in a clean HDMI run, by step.
+fn step_marks(log: &[m::Write], r: Route) -> Vec<(Step, usize)> {
+    let p = u32::from(r.pipe);
+    let f = u32::from(r.stream);
+    let first = |pred: &dyn Fn(&m::Write) -> bool| log.iter().position(|w| pred(w)).unwrap();
+    vec![
+        (Step::InitHw, first(&is(d1(0x7b)))),
+        (Step::Clocks, first(&dal(0xe))),
+        (Step::Watermarks, first(&is(d2(0x509)))),
+        (Step::PixelClock, first(&set(d2(0x1acf + p * 0x10), 2))),
+        (Step::Timing, first(&is(d2(0x1b2a + p * 0x80)))),
+        (Step::Start, first(&set(d2(0x528 + p), 1 << 31))),
+        (Step::Link, first(&is(d2(0x208b + f * 0x100)))),
+        (Step::Plane, first(&is(d2(0x1b92 + p * 0x80)))),
+    ]
+}
+fn clean_marks() -> (Route, Vec<(Step, usize)>) {
+    let bench = Bench::new();
+    bench.set(m::MP1 + 0x274, 1);
+    let vram = Vram::new(VRAM_BYTES);
+    let image = m::vbios(6);
+    let tables = Tables::new(&image).unwrap();
+    let connector = m::connector(Signal::Hdmi, 3, 3);
+    let r = Resources::new().acquire(&connector).unwrap();
+    let mut p = pipeline(&bench, connector, r);
+    run(enable_with(
+        &mut p,
+        &vram,
+        &tables,
+        &m::sink(Signal::Hdmi, None),
+        &mut NoAux,
+    ))
+    .unwrap();
+    (r, step_marks(&bench.log(), r))
+}
+
+fn step_name(step: Step) -> &'static str {
+    match step {
+        Step::InitHw => "InitHw failure not retained",
+        Step::Clocks => "Clocks failure not retained",
+        Step::Watermarks => "Watermarks failure not retained",
+        Step::PixelClock => "PixelClock failure not retained",
+        Step::Timing => "Timing failure not retained",
+        Step::Start => "Start failure not retained",
+        Step::Link => "Link failure not retained",
+        Step::Plane => "Plane failure not retained",
+        _ => "failure not retained",
+    }
+}
+fn navi22_modeset_failure_at_each_step_is_retained_without_retry() -> TestResult {
+    let (r, marks) = clean_marks();
+    for (step, at) in marks {
+        let bench = Bench::new();
+        bench.set(m::MP1 + 0x274, 1);
+        let vram = Vram::new(VRAM_BYTES);
+        let image = m::vbios(6);
+        let tables = Tables::new(&image).unwrap();
+        let mut p = pipeline(&bench, m::connector(Signal::Hdmi, 3, 3), r);
+        // The device drops off the bus right after this step's first write.
+        bench.die_after(at + 1);
+        let sink = m::sink(Signal::Hdmi, None);
+        let result = run(enable_with(&mut p, &vram, &tables, &sink, &mut NoAux));
+        match (result, p.state()) {
+            (Err(error), State::Failed { step: s, error: e }) if s == step && e == error => {}
+            _ => return TestResult::Fail(step_name(step)),
+        }
+        // Owners and the published scanout are kept; nothing is replayed.
+        if step >= Step::Clocks && p.scanout().is_none_or(|s| s.reusable_for_test()) {
+            return TestResult::Fail("scanout released after failure");
+        }
+        bench.revive();
+        let writes = bench.writes();
+        if run(enable_with(&mut p, &vram, &tables, &sink, &mut NoAux)).err() != Some(Error::Busy)
+            || run(p.disable(&tables, &mut NoAux)) != Err(Error::Busy)
+            || bench.writes() != writes
+        {
+            return TestResult::Fail("failed pipeline replayed");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_modeset_failure_at_each_step_is_retained_without_retry
+);
+
+fn navi22_modeset_cancellation_at_each_step_is_retained() -> TestResult {
+    use core::task::{Context, Poll, Waker};
+    let (r, marks) = clean_marks();
+    let mark = |step| marks.iter().find(|(s, _)| *s == step).unwrap().1;
+    let (p0, f) = (u32::from(r.pipe), u32::from(r.stream));
+    // For every step with an await, the acknowledgement withheld so the
+    // bring-up is pending inside it. Watermarks and Timing are synchronous
+    // and cannot be cancelled part-way.
+    let points: [(Step, usize, Option<(u32, u32, u32)>, bool); 7] = [
+        // A live GOP OTG whose blank never latches (dcn20_init_blank).
+        (
+            Step::InitHw,
+            mark(Step::InitHw),
+            Some((d2(0x185b), 1, 1)),
+            true,
+        ),
+        (
+            Step::Clocks,
+            mark(Step::Clocks),
+            Some((m::MP1 + 0x274, u32::MAX, 0)),
+            false,
+        ),
+        (
+            Step::PixelClock,
+            mark(Step::PixelClock),
+            Some((d2(0x1acf + p0 * 0x10), 4, 0)),
+            false,
+        ),
+        (Step::Start, mark(Step::Start), None, false),
+        (
+            Step::Link,
+            mark(Step::Link),
+            Some((d2(0x206c + f * 0x100), 2, 2)),
+            false,
+        ),
+        (
+            Step::Plane,
+            mark(Step::Plane),
+            Some((d2(0x83 + 4 * p0), 0xc000_0000, 0xc000_0000)),
+            false,
+        ),
+        (Step::Verify, 0, None, false),
+    ];
+    for (step, at, stall, gop) in points {
+        let bench = Bench::new();
+        bench.set(m::MP1 + 0x274, 1);
+        if gop {
+            bench.set(d2(0x1b41), 1);
+        }
+        if let Some((dword, mask, forced)) = stall {
+            bench.stall(at, dword, mask, forced);
+        }
+        let vram = Vram::new(VRAM_BYTES);
+        let image = m::vbios(6);
+        let tables = Tables::new(&image).unwrap();
+        let mut p = pipeline(&bench, m::connector(Signal::Hdmi, 3, 3), r);
+        let sink = m::sink(Signal::Hdmi, None);
+        let unlock = |w: &m::Write| w.dword == d2(0x1b8b + p0 * 0x80) && w.value == 0;
+        let mut none = NoAux;
+        {
+            let mut future = core::pin::pin!(enable_with(&mut p, &vram, &tables, &sink, &mut none));
+            let deadline = narf_time::Deadline::after_ms(5000);
+            loop {
+                if let Poll::Ready(_) = future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                {
+                    return TestResult::Fail("finished before the cancellation point");
+                }
+                let reached = if step == Step::Verify {
+                    bench.log().iter().any(unlock)
+                } else {
+                    bench.writes() > at
+                };
+                if reached {
+                    break;
+                }
+                if deadline.expired() {
+                    return TestResult::Fail("cancellation point never reached");
+                }
+            }
+            // Dropped while pending inside the step.
+        }
+        bench.unstall();
+        if p.state() != State::At(step) {
+            return TestResult::Fail("cancelled step not retained");
+        }
+        if run(enable_with(&mut p, &vram, &tables, &sink, &mut NoAux)).err() != Some(Error::Busy) {
+            return TestResult::Fail("cancelled bring-up replayed");
+        }
+        // The retained owner can still retire what started.
+        if run(p.disable(&tables, &mut NoAux)).is_err() || p.state() != State::At(Step::Stopped) {
+            return TestResult::Fail("cancelled pipeline not retired");
+        }
+        if !gop && bench.get(d2(0x1b41 + p0 * 0x80)) & 1 != 0 {
+            return TestResult::Fail("OTG left running");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_modeset_cancellation_at_each_step_is_retained
+);
+
+fn navi22_modeset_models_every_pipe_and_dig_route() -> TestResult {
+    for i in 0..6u8 {
+        for signal in [Signal::Hdmi, Signal::DisplayPort] {
+            let bench = Bench::new();
+            bench.set(m::MP1 + 0x274, 1);
+            let vram = Vram::new(VRAM_BYTES);
+            let image = m::vbios(6);
+            let tables = Tables::new(&image).unwrap();
+            let (pipe, tx) = match signal {
+                Signal::Hdmi => (i, (i + 2) % 6),
+                Signal::DisplayPort => ((i + 3) % 6, i),
+            };
+            let connector = m::connector(signal, tx, tx);
+            // Earlier streams hold the lower pipes and PLLs.
+            let mut pool = Resources::new();
+            for other in 0..pipe {
+                let filler = m::connector(Signal::Hdmi, (tx + 1 + other) % 6, 0);
+                pool.acquire(&filler).unwrap();
+            }
+            let r = pool.acquire(&connector).unwrap();
+            if r.pipe != pipe {
+                return TestResult::Fail("pipe allocation");
+            }
+            let mut p = pipeline(&bench, connector, r);
+            let sink = match signal {
+                Signal::Hdmi => m::sink(Signal::Hdmi, None),
+                Signal::DisplayPort => m::sink(Signal::DisplayPort, Some(m::dpcd(0x12))),
+            };
+            let mut aux = DpSink::new(bench.model.clone());
+            if run(enable_with(&mut p, &vram, &tables, &sink, &mut aux)).is_err() {
+                return TestResult::Fail("route enable");
+            }
+            let log = bench.log();
+            let order = match signal {
+                Signal::Hdmi => hdmi_enable_order(&log, r, tx),
+                Signal::DisplayPort => dp_order(&log, r, tx, 20),
+            };
+            if let Err(name) = order {
+                return TestResult::Fail(name);
+            }
+            // Pipe 5's power domains (10, 11) are never power gated.
+            if log.iter().any(|w| {
+                (w.dword == d2(0x80 + 20) || w.dword == d2(0x80 + 22)) && w.value & 1 << 8 != 0
+            }) {
+                return TestResult::Fail("pipe 5 power gated");
+            }
+            // Nothing landed on another pipe's OTG or another DIG's backend.
+            let other_otg = (0..6u32)
+                .filter(|&o| o != u32::from(pipe))
+                .any(|o| log.iter().any(|w| w.dword == d2(0x1b2a + o * 0x80)));
+            let other_be = (0..6u32)
+                .filter(|&o| o != u32::from(tx))
+                .any(|o| log.iter().any(|w| w.dword == d2(0x20b0 + o * 0x100)));
+            if other_otg || other_be {
+                return TestResult::Fail("write to a foreign instance");
+            }
+            if run(p.disable(&tables, &mut aux)).is_err() {
+                return TestResult::Fail("route disable");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_modeset_models_every_pipe_and_dig_route
+);
+
+fn navi22_modeset_underflow_turns_black_and_quarantines() -> TestResult {
+    let bench = Bench::new();
+    bench.set(m::MP1 + 0x274, 1);
+    let vram = Vram::new(VRAM_BYTES);
+    let image = m::vbios(6);
+    let tables = Tables::new(&image).unwrap();
+    let connector = m::connector(Signal::Hdmi, 3, 3);
+    let r = Resources::new().acquire(&connector).unwrap();
+    let mut p = pipeline(&bench, connector, r);
+    bench.underflow_on_unlock(r.pipe);
+    let sink = m::sink(Signal::Hdmi, None);
+    let expect = Underflow { otg: true, hubp: 0 };
+    let result = run(enable_with(&mut p, &vram, &tables, &sink, &mut NoAux));
+    if result.err() != Some(Error::Underflow(expect))
+        || p.state()
+            != (State::Failed {
+                step: Step::Verify,
+                error: Error::Underflow(expect),
+            })
+        || p.underflow() != Some(expect)
+    {
+        return TestResult::Fail("bring-up underflow");
+    }
+    // Black (DPG on) before anything else after the unlock.
+    let log = bench.log();
+    let unlock = log
+        .iter()
+        .rposition(|w| w.dword == d2(0x1b8b) && w.value == 0)
+        .unwrap();
+    if log[unlock + 1..]
+        .iter()
+        .find(|w| w.dword != d2(0x1857) && w.dword != d2(0x1858) && w.dword != d2(0x1859))
+        .is_none_or(|w| w.dword != d2(0x1854) || w.value & 1 == 0)
+    {
+        return TestResult::Fail("not black first");
+    }
+    // A live pipeline that later underflows is quarantined by the poll.
+    let bench = Bench::new();
+    bench.set(m::MP1 + 0x274, 1);
+    let vram = Vram::new(VRAM_BYTES);
+    let mut p = pipeline(&bench, connector, r);
+    if run(enable_with(&mut p, &vram, &tables, &sink, &mut NoAux)).is_err() {
+        return TestResult::Fail("second enable");
+    }
+    bench.set(d2(0x5f3), 2 << 28);
+    let late = Underflow {
+        otg: false,
+        hubp: 2,
+    };
+    if p.check_underflow() != Ok(Some(late))
+        || p.state() != State::Quarantined(late)
+        || p.flush() != Err(Error::Busy)
+        || bench.get(d2(0x1854)) & 1 == 0
+    {
+        return TestResult::Fail("live underflow quarantine");
+    }
+    if run(p.disable(&tables, &mut NoAux)).is_err() || p.underflow() != Some(late) {
+        return TestResult::Fail("quarantined stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_modeset_underflow_turns_black_and_quarantines
+);
+
+fn navi22_modeset_retires_the_live_gop_stream_like_dcn30_init_hw() -> TestResult {
+    let bench = Bench::new();
+    bench.set(m::MP1 + 0x274, 1);
+    // The GOP: OTG 1 running 1920x1080 through OPP 1, HUBP 1 clocked, DIG
+    // backend 3 enabled in HDMI mode from frontend 1.
+    bench.set(d2(0x1b41 + 0x80), 1);
+    bench.set(d2(0x1acb + 0x10), 1 << 8);
+    bench.set(d2(0x1b2b + 0x80), 2020 | 100 << 16);
+    bench.set(d2(0x1b36 + 0x80), 1100 | 20 << 16);
+    bench.set(d2(0x5f4 + 0xdc), 1);
+    bench.set(d2(0x20b1 + 0x300), 1);
+    bench.set(d2(0x20b0 + 0x300), 3 << 16 | 1 << 9);
+    bench.set(d3(0x20 + 2), 1);
+    let vram = Vram::new(VRAM_BYTES);
+    let image = m::vbios(6);
+    let tables = Tables::new(&image).unwrap();
+    let connector = m::connector(Signal::Hdmi, 3, 3);
+    let r = Resources::new().acquire(&connector).unwrap();
+    let mut p = pipeline(&bench, connector, r);
+    let sink = m::sink(Signal::Hdmi, None);
+    let output = match run(enable_with(&mut p, &vram, &tables, &sink, &mut NoAux)) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("enable over the GOP"),
+    };
+    if output.inherited
+        != (Inherited {
+            otgs: 1 << 1,
+            digs: 1 << 3,
+        })
+    {
+        return TestResult::Fail("inherited state");
+    }
+    let log = bench.log();
+    let order = in_order(
+        &log,
+        0,
+        &[
+            ("golden init", &table(m::SLOT_POWER_GATING, None, None)),
+            ("disable_vga", &is(d1(0x0c))),
+            ("init_blank DPG size", &|w: &m::Write| {
+                w.dword == d2(0x1856 + 0x5a) && w.value == 1080 | 1920 << 16
+            }),
+            ("init_blank DPG", &set(d2(0x1854 + 0x5a), 1)),
+            ("lock", &set(d2(0x1b8b + 0x80), 1)),
+            ("mpc init", &|w: &m::Write| {
+                w.dword == d3(0x20) && w.value == 0xf
+            }),
+            ("opp mux parked", &|w: &m::Write| {
+                w.dword == d3(0x580 + 4) && w.value & 0xf == 0xf
+            }),
+            ("unlock", &|w: &m::Write| {
+                w.dword == d2(0x1b8b + 0x80) && w.value == 0
+            }),
+            ("hubp blank", &set(d2(0x5f3 + 0xdc), 1)),
+            ("hubp clock off", &clear(d2(0x5f4 + 0xdc), 1)),
+            ("dpp power gate", &set(d2(0x80 + 2 * 3), 1 << 8)),
+            ("tg_init", &is(d2(0x1b5b + 0x80))),
+            ("power_down_encoders", &|w: &m::Write| {
+                table(m::SLOT_TRANSMITTER, Some(3), Some(0))(w)
+            }),
+            ("power_down_controllers", &clear(d2(0x1b41 + 0x80), 1)),
+            ("native bring-up", &dal(2)),
+        ],
+    );
+    if let Err(name) = order {
+        return TestResult::Fail(name);
+    }
+    // power_down_encoders sends SIGNAL_TYPE_NONE (DVI digmode 2) for the
+    // HDMI connector object (12).
+    let disable = log
+        .iter()
+        .position(|w| table(m::SLOT_TRANSMITTER, Some(3), Some(0))(w))
+        .unwrap();
+    let connobj = log[disable..]
+        .iter()
+        .find(|w| w.dword == MARK + 16 * m::SLOT_TRANSMITTER + 2)
+        .map(|w| (w.value >> 16) & 0xff);
+    if (log[disable].value >> 16) & 0xff != 2 || connobj != Some(12) {
+        return TestResult::Fail("power-down transmitter parameters");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_modeset_retires_the_live_gop_stream_like_dcn30_init_hw
 );

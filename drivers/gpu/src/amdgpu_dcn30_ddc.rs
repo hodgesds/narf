@@ -26,7 +26,7 @@
 //! leaves a line owned by software. A register read of all ones marks the
 //! owner `Failed` and every later operation is refused.
 use crate::{amdgpu::AmdGpu, amdgpu_dcn_profile::Profile};
-use narf_bus::{BusDeviceCap, MmioRegion};
+use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // ── DP_AUX instance block, stride 0x1c ─────────────────────────────────
@@ -287,7 +287,7 @@ pub(crate) trait Io: Send {
 }
 #[derive(Debug)]
 pub(crate) struct Mmio {
-    regs: MmioRegion,
+    regs: crate::amdgpu_reg_window::Window,
 }
 impl Io for Mmio {
     fn read(&mut self, dword: u64) -> u32 {
@@ -1152,10 +1152,13 @@ impl<I: Io> Engine<I> {
     /// `dal_gpio_open(GPIO_MODE_INTERRUPT)` and `program_hpd_filter`. Linux
     /// leaves `DC_HPD_EN` to the VBIOS transmitter-init table this path does
     /// not run, so an HPD block the firmware left disabled is enabled here.
-    fn bind_hpd(&mut self, index: u8, signal: Signal) -> Result<(), Error> {
+    /// Returns whether HPD had to be switched on here (its debounced sense
+    /// then needs the connect filter's time before it can read connected).
+    fn bind_hpd(&mut self, index: u8, signal: Signal) -> Result<bool, Error> {
         self.update(DC_GPIO_HPD_MASK, HPD_GPIO_MASK[usize::from(index)], 0)?;
         let control = Self::hpd(index, DC_HPD_CONTROL);
-        if self.read(control)? & DC_HPD_EN == 0 {
+        let enabled = self.read(control)? & DC_HPD_EN == 0;
+        if enabled {
             self.update(control, DC_HPD_EN, DC_HPD_EN)?;
         }
         let (connect_ms, disconnect_ms) = match signal {
@@ -1168,7 +1171,7 @@ impl<I: Io> Engine<I> {
             put(0, DC_HPD_CONNECT_INT_DELAY, connect_ms / 10)
                 | put(0, DC_HPD_DISCONNECT_INT_DELAY, disconnect_ms / 10),
         )?;
-        Ok(())
+        Ok(enabled)
     }
     fn hpd_sense(&mut self, index: u8) -> Result<bool, Error> {
         Ok(self.read(Self::hpd(index, DC_HPD_INT_STATUS))? & DC_HPD_SENSE_DELAYED != 0)
@@ -1347,7 +1350,14 @@ impl Ddc {
         let base1 = Profile::Navi22
             .bank(gpu, 1, MICROSECOND_TIME_BASE_DIV as u32)
             .map_err(|_| Error::Unsupported)?;
-        let mut engine = Engine::new_with(Mmio { regs: gpu.regs }, authority, base / 4, base1 / 4);
+        let mut engine = Engine::new_with(
+            Mmio {
+                regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
+            },
+            authority,
+            base / 4,
+            base1 / 4,
+        );
         engine.crystal_khz = crystal_khz;
         Ok(Self(engine))
     }
@@ -1357,7 +1367,7 @@ impl Ddc {
     /// Program a connector's AUX engine (DCN3.0 link-encoder init) and, when it
     /// has one, its HPD block and filter. `hpd` is the zero-based HPD block.
     pub fn bind(&mut self, line: u8, hpd: Option<u8>, signal: Signal) -> Result<(), Error> {
-        bind(&mut self.0, line, hpd, signal)
+        bind(&mut self.0, line, hpd, signal).map(|_| ())
     }
     pub(crate) fn into_engine(self) -> Engine<Mmio> {
         self.0
@@ -1421,7 +1431,7 @@ pub(crate) fn bind<I: Io>(
     line: u8,
     hpd: Option<u8>,
     signal: Signal,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     engine.check(line)?;
     if hpd.is_some_and(|h| h >= LINES) {
         return Err(Error::Invalid);
@@ -1429,11 +1439,11 @@ pub(crate) fn bind<I: Io>(
     // HPD_SOURCEID_UNKNOWN would leave AUX_HPD_SEL pointing at another pin.
     if let Some(index) = hpd {
         engine.bind_aux(line, index)?;
-        engine.bind_hpd(index, signal)?;
+        return engine.bind_hpd(index, signal);
     } else if signal == Signal::DisplayPort {
         return Err(Error::Unsupported);
     }
-    Ok(())
+    Ok(false)
 }
 pub(crate) fn hpd<I: Io>(engine: &mut Engine<I>, index: u8) -> Result<bool, Error> {
     engine.check(index)?;

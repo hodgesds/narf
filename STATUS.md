@@ -983,7 +983,7 @@ unblank. Model-tested per block; never run on hardware.
 These are software-tested foundations; training resume,
 media submission/DPG, display-aware DPM, user command submission,
 hardware boot and DCN3.0 modesetting remain open. See the
-[PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).
+[PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram). The native path now follows Linux's global order end to end (model-tested over one combined register fake, failure/cancellation per step), retires a live GOP stream like `dcn30_init_hw`, enables OPTC/OTG clocks, lights DP SST (native-AUX 8b/10b training with fallback, DP DTO, MSA/VSC) on any of the six pipes/routes, and quarantines underflows black.
 
 1. **Stage 5 laptop proof:** boot from USB on Renoir/Lucienne or Phoenix
    HawkPoint1; exercise native AMDGPU modeset, keyboard and touchpad,
