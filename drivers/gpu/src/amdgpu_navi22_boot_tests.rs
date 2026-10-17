@@ -258,6 +258,7 @@ pub(crate) fn gpu() -> AmdGpu {
             ip(d::HW_ID_SDMA0, (5, 2, 2)),
             ip(d::HW_ID_NBIF, (3, 3, 0)),
             ip(d::HW_ID_HDP, (5, 0, 2)),
+            ip(d::HW_ID_OSSSYS, (5, 0, 3)),
         ],
     }
 }

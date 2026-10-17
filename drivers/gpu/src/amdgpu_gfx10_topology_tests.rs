@@ -144,6 +144,7 @@ fn layout() -> Layout {
         gc: [0x1260 * 4, 0xa000 * 4],
         nbio: 0xd20 * 4,
         hdp: 0xf20 * 4,
+        oss: 0x10a0 * 4,
     }
 }
 struct Fake {

@@ -16,6 +16,7 @@ pub(crate) const GC0: u64 = 0x1260 * 4;
 pub(crate) const GC1: u64 = 0xa000 * 4;
 pub(crate) const NBIO: u64 = 0xd20 * 4;
 pub(crate) const HDP: u64 = 0xf20 * 4;
+pub(crate) const OSS: u64 = 0x10a0 * 4;
 pub(crate) const MC: u64 = 0x8_0040_0000;
 const PHYS: u64 = 0x9000_0000;
 pub(crate) const BAR2: u64 = 0xf000_0000;
@@ -25,6 +26,7 @@ pub(crate) fn layout() -> Layout {
         gc: [GC0, GC1],
         nbio: NBIO,
         hdp: HDP,
+        oss: OSS,
     }
 }
 pub(crate) fn pool(len: u64) -> Pool {
@@ -676,6 +678,7 @@ pub(crate) fn navi22_gpu() -> AmdGpu {
             d::HW_ID_GC => &[0x1260, 0xa000, 0x1c000],
             d::HW_ID_NBIF => &[0, 0x14, 0xd20],
             d::HW_ID_HDP => &[0xf20],
+            d::HW_ID_OSSSYS => &[0x10a0],
             _ => &[],
         };
         b.base_addrs[..bases.len()].copy_from_slice(bases);
