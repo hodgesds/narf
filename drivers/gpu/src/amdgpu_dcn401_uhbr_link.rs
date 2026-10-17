@@ -13,7 +13,7 @@ use super::*;
 pub use dmub::UhbrRate;
 #[path = "amdgpu_dcn401_uhbr_video.rs"]
 pub(in crate::amdgpu_dcn401_otg) mod video;
-pub use video::{UhbrPayload, UhbrVideoRunning};
+pub use video::{uhbr_mst_rate, UhbrPayload, UhbrVideoRunning};
 
 const LINK_CLOCK: u64 = 0x369f;
 const CONTROL: u64 = 0x36b4;
@@ -32,11 +32,13 @@ const EQ_WAIT_LIMIT_US: u64 = 400_000;
 const PATTERN_TIME_US: u64 = 2_500;
 const CDS_WAIT_PER_HOP_US: u64 = 20_000;
 
-/// A 128b/132b link: lane count and per-lane rate.
+/// A 128b/132b link: lane count and per-lane rate, and whether it runs
+/// MST (its streams' payloads then belong to the MST manager).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UhbrSettings {
     pub lanes: u8,
     pub rate: UhbrRate,
+    pub mst: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UhbrLinkTrained {
@@ -322,7 +324,14 @@ impl<I: Io> Engine<I> {
         if !carries(read::<1>(io, path, UHBR_RATES).await?[0]) {
             return Err(Error::Unsupported);
         }
-        if read::<1>(io, path, 0x111).await?[0] & 7 != 0 {
+        // SST: no active MST/up-request owner. MST: the topology manager
+        // set MST_EN first (drm_dp_mst_topology_mgr_set_mst).
+        let mstm = read::<1>(io, path, 0x111).await?[0];
+        if s.mst {
+            if mstm & 1 == 0 {
+                return Err(Error::Invalid);
+            }
+        } else if mstm & 7 != 0 {
             return Err(Error::Busy); // active MST/up-request owner
         }
         // retrieve_link_cap's repeater probe under the LTTPR AUX timeout.
@@ -565,7 +574,7 @@ impl<I: Io> Engine<I> {
             }
         }
     }
-    /// disable_link_dp for 128b/132b: the sink to D3 (unless gone), then
+    /// disable_link_dp for 128b/132b: an SST sink to D3 (unless gone), then
     /// disable_hpo_dp_link_output: the encoder's DPHY and clock off, the
     /// firmware DISABLE, lanes and TX clocks proven off, and the encoder's
     /// SYMCLK32_LE route parked (dccg401_disable_symclk32_le).
@@ -585,11 +594,17 @@ impl<I: Io> Engine<I> {
         if plan.path != path {
             return Err(Error::Invalid);
         }
+        // An attached display never stops the MST link it rides, nor the
+        // owner while another display streams on it.
+        if self.status.mst_owner.is_some() || self.displays.siblings.transmitters & bit(t) != 0 {
+            return Err(Error::Busy);
+        }
         self.uhbr_verify(&plan)?;
         self.status.state = State::StoppingUhbrLink(t);
         let l = self.layout;
         let result = async {
-            if sink {
+            // An idle MST branch stays powered for AUX and up requests.
+            if sink && !plan.settings.mst {
                 write(io, path, 0x600, &mut [2]).await?;
                 self.uhbr_verify(&plan)?;
             }

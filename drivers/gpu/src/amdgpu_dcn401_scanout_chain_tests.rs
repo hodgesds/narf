@@ -697,6 +697,7 @@ fn dcn401_second_display_leaves_the_live_one_alone() -> TestResult {
         transmitters: 1 << t,
         streams: 1 << s,
         hpo: 0,
+        hpo_links: 0,
         frl: false,
         mst: 0,
         live: [None; 4],

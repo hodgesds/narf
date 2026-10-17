@@ -199,8 +199,9 @@ impl UhbrTransport for Sink {
     }
     async fn disable_uhbr(&mut self, path: inventory::Path) -> Result<(), dmub::Error> {
         assert_eq!(path, self.path);
-        // Sink D3 and the encoder stopped before the firmware disable.
-        assert!(self.bytes.get(&0x600) != Some(&1));
+        // SST sink D3 (an MST branch stays powered) and the encoder
+        // stopped before the firmware disable.
+        assert!(self.settings.mst || self.bytes.get(&0x600) != Some(&1));
         self.steps.push(Step::Disable);
         self.event.store(2, Ordering::SeqCst);
         Ok(())
@@ -294,6 +295,7 @@ fn dcn401_uhbr_link_trains_like_linux_128b_132b() -> TestResult {
     let settings = UhbrSettings {
         lanes: 4,
         rate: UhbrRate::Uhbr20,
+        mst: false,
     };
     let (mut e, mut sink) = uhbr_fixture(2, settings);
     sink.status = VecDeque::from([
@@ -369,6 +371,7 @@ fn dcn401_uhbr_link_refusals_exit_training() -> TestResult {
     let settings = UhbrSettings {
         lanes: 2,
         rate: UhbrRate::Uhbr10,
+        mst: false,
     };
     let (mut e, mut sink) = uhbr_fixture(0, settings);
     sink.status = VecDeque::from([status(0, 0, [4, 6, 9, 9]), status(1, 0x10, [4, 6, 9, 9])]);
@@ -407,7 +410,11 @@ kernel_test_in!(
 /// chain without the rate. A chain that carries it is set non-transparent
 /// after its count and transparent mode.
 fn dcn401_uhbr_link_checks_caps_before_the_phy() -> TestResult {
-    let settings = |lanes, rate| UhbrSettings { lanes, rate };
+    let settings = |lanes, rate| UhbrSettings {
+        lanes,
+        rate,
+        mst: false,
+    };
     for (coding, rates, s) in [
         (1u8, 7u8, settings(4, UhbrRate::Uhbr10)),
         (3, 1, settings(4, UhbrRate::Uhbr20)),
@@ -463,6 +470,7 @@ fn dcn401_uhbr_payload_matches_linux_sst_allocation() -> TestResult {
     let s = UhbrSettings {
         lanes: 4,
         rate: UhbrRate::Uhbr10,
+        mst: false,
     };
     match uhbr_payload(&t, 8, s) {
         Some(p) if (p.slots, p.vc_rate, p.hblank_symbols) == (24, 0x2f51_62c1, 105) => {}
@@ -496,6 +504,7 @@ fn dcn401_uhbr_video_starts_and_stops_like_linux() -> TestResult {
     let settings = UhbrSettings {
         lanes: 4,
         rate: UhbrRate::Uhbr10,
+        mst: false,
     };
     let (mut e, mut sink) = uhbr_fixture(p, settings);
     let req = request(pipe);
@@ -603,4 +612,273 @@ fn dcn401_uhbr_video_starts_and_stops_like_linux() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_uhbr_video_starts_and_stops_like_linux
+);
+
+/// allocate_mst_payload's 128b/132b source rate, against Linux's own
+/// fixpt31_32 arithmetic (get_pbn_from_timing over get_pbn_per_slot,
+/// set_throttled_vcp_size's 25-bit Y, set_hpo_dp_hblank_min_symbol_width)
+/// compiled from its source for these timings and links.
+fn dcn401_uhbr_mst_rate_matches_linux() -> TestResult {
+    use crate::amdgpu_dcn401_otg::uhbr_mst_rate;
+    let vectors = [
+        // pixel kHz, h active, h total, rate, lanes, VC rate, width.
+        (594_000, 3840, 4400, UhbrRate::Uhbr10, 4, 0x2f52_a470, 105),
+        (148_500, 1920, 2200, UhbrRate::Uhbr10, 4, 0x0bd4_a91c, 52),
+        (148_500, 1920, 2200, UhbrRate::Uhbr20, 4, 0x05ea_2c59, 52),
+        (533_250, 3840, 4000, UhbrRate::Uhbr13_5, 2, 0x3ef2_8afb, 30),
+        (1_188_000, 3840, 4400, UhbrRate::Uhbr20, 4, 0x2f51_62c1, 104),
+        (241_500, 2560, 2720, UhbrRate::Uhbr10, 1, 0x4cf5_970d, 30),
+    ];
+    for (khz, active, total, rate, lanes, vc, width) in vectors {
+        let mut t = request(0).timing;
+        (t.pixel_clock_khz, t.h_active, t.h_total) = (khz, active, total);
+        let s = UhbrSettings {
+            lanes,
+            rate,
+            mst: true,
+        };
+        if uhbr_mst_rate(&t, 8, s) != Some((vc, width)) {
+            panic!(
+                "{khz} kHz on {lanes} x {rate:?}: {:x?}",
+                uhbr_mst_rate(&t, 8, s)
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dcn401-otg", dcn401_uhbr_mst_rate_matches_linux);
+
+/// A display's timing staged blank on `pipe` beside the live DP DTO.
+fn stage_uhbr_timing(
+    e: &mut Engine<UhbrIo>,
+    pipe: u8,
+) -> Option<crate::amdgpu_dcn401_dccg::Applied> {
+    let req = request(pipe);
+    let c = clock(req);
+    run(e.prepare(req, c)).ok()?;
+    e.io.inner.retiring = [false; 4];
+    run(e.prepare_blank(blank_request(pipe), c)).ok()?;
+    let bank1 = e.layout.dio_clock - 0xa0 * 4;
+    let r = &mut e.io.inner.regs;
+    r.insert(bank1 + (0x80 + 4 * u64::from(pipe)) * 4, 0x1090);
+    *r.entry(bank1 + 0x68 * 4).or_default() |= 4 << (pipe * 3);
+    Some(c)
+}
+/// The clock owner's routes for HPO stream `stream`: DPSTREAMCLK from
+/// `pipe`, SYMCLK32_SE from PHY `p`.
+fn route_uhbr_stream(e: &mut Engine<UhbrIo>, p: u8, stream: u8, pipe: u8) {
+    let r = &mut e.io.inner.regs;
+    let shift = 4 * u32::from(stream);
+    *r.entry(LE_ROOT - (0x66 - 0x4a) * 4).or_default() |= (8 | u32::from(pipe)) << shift;
+    *r.entry(LE_ROOT - 4).or_default() |= (8 | u32::from(p)) << shift;
+}
+
+/// The clock owner parking HPO stream `stream`'s routes after it stops.
+fn unroute_uhbr_stream(e: &mut Engine<UhbrIo>, stream: u8) {
+    let shift = 4 * u32::from(stream);
+    for at in [LE_ROOT - (0x66 - 0x4a) * 4, LE_ROOT - 4] {
+        if let Some(v) = e.io.inner.regs.get_mut(&at) {
+            *v &= !(15 << shift);
+        }
+    }
+}
+/// The MST manager's source half for the selected display's blank stream:
+/// the allocation `table` with ACT, then its recorded VC rate.
+fn uhbr_mst_payload(e: &mut Engine<UhbrIo>, p: u8, table: &[MstAllocation]) -> Result<(), Error> {
+    let v = e.status.uhbr_video_running.ok_or(Error::Invalid)?;
+    run(e.update_uhbr_mst_allocation(p, table))?;
+    let rate = v.payload.vc_rate;
+    run(e.set_uhbr_mst_vc_rate(p, v.stream, (rate >> 25, rate & 0x1ff_ffff)))
+}
+
+/// Two MST streams on one 128b/132b link, as Linux's MST streams share the
+/// HPO link encoder: display 0 trains the link (the manager set MST_EN
+/// first, and the branch stays powered when it stops) and prepares its HPO
+/// stream blank; the payload goes in while it is blank (allocation rows
+/// from slot 0 with ACT, the VC rate and blanking width), then it
+/// unblanks. Display 1 attaches to the running link, maps its own stream
+/// to the same link encoder and joins the allocation. Display 1 leaves in
+/// Linux's order: blank, payload out, stream off, detach; display 0 still
+/// runs, and stops the link last.
+fn dcn401_uhbr_mst_streams_share_one_link() -> TestResult {
+    let (p, s0, p0, s1, p1) = (2u8, 1u8, 1u8, 3u8, 2u8);
+    let settings = UhbrSettings {
+        lanes: 4,
+        rate: UhbrRate::Uhbr10,
+        mst: true,
+    };
+    let (mut e, mut sink) = uhbr_fixture(p, settings);
+    for h in 0..4 {
+        e.io.inner.regs.insert(BASE + (0x5f4 + h * 0xdc) * 4, 3);
+    }
+    // Without MST_EN the branch is no MST sink; SST refuses an MST owner.
+    sink.status = VecDeque::from([status(7, 0xd, [0; 4])]);
+    if run(e.train_uhbr_link(&mut sink, path(p), settings, LINK)) != Err(Error::Invalid) {
+        return TestResult::Fail("MST link without MST_EN");
+    }
+    sink.bytes.insert(0x111, 7);
+    let sst = UhbrSettings {
+        mst: false,
+        ..settings
+    };
+    if run(e.train_uhbr_link(&mut sink, path(p), sst, LINK)) != Err(Error::Busy) {
+        return TestResult::Fail("SST link on an MST branch");
+    }
+    let Some(c0) = stage_uhbr_timing(&mut e, p0) else {
+        return TestResult::Fail("first timing");
+    };
+    if run(e.train_uhbr_link(&mut sink, path(p), settings, LINK)).is_err() {
+        return TestResult::Fail("128b/132b MST training");
+    }
+    route_uhbr_stream(&mut e, p, s0, p0);
+    // The SST start refuses an MST link.
+    if run(e.start_uhbr_video(&mut sink, path(p), s0, p0, c0)) != Err(Error::Invalid) {
+        return TestResult::Fail("SST video on an MST link");
+    }
+    let hpo_at = |s: u8, reg: u64| hpo(s, reg);
+    let ready = match run(e.prepare_uhbr_mst_stream(path(p), s0, p0, c0, 6)) {
+        Ok(ready) => ready,
+        Err(_) => {
+            return TestResult::Fail("first MST stream prepare");
+        }
+    };
+    let regs = |e: &Engine<UhbrIo>, at: u64| e.io.inner.regs.get(&at).copied().unwrap_or(0);
+    if e.status.state != State::UhbrStreamReady(s0)
+        || regs(&e, hpo_at(s0, 0x3685)) & 0x101 != 0
+        || regs(&e, hpo_at(s0, 0x365d)) & 1 != 1
+        || regs(&e, hpo_at(LINK, 0x36bf)) & 0x7f00 != 0
+        || regs(&e, MPC_BASE + (0xe56 + u64::from(s0)) * 4) & 7 != u32::from(LINK)
+    {
+        return TestResult::Fail("prepared blank MST stream");
+    }
+    // Unblanking needs the payload's rate first; a rate other than the
+    // stream's own is refused.
+    if run(e.start_uhbr_mst_video(path(p))).is_ok() {
+        return TestResult::Fail("unblank before the payload");
+    }
+    let rate = ready.payload.vc_rate;
+    if run(e.set_uhbr_mst_vc_rate(p, s0, ((rate >> 25) + 1, 0))) != Err(Error::Invalid) {
+        return TestResult::Fail("foreign VC rate");
+    }
+    if e.status.state != State::UhbrStreamReady(s0) {
+        return TestResult::Fail("refused unblank kept the prepared stream");
+    }
+    let first = [MstAllocation {
+        stream: s0,
+        slots: 6,
+    }];
+    if uhbr_mst_payload(&mut e, p, &first).is_err() || run(e.start_uhbr_mst_video(path(p))).is_err()
+    {
+        return TestResult::Fail("first MST stream");
+    }
+    if regs(&e, hpo_at(LINK, 0x36bf)) & 0x7f07 != u32::from(s0) | 6 << 8
+        || regs(&e, hpo_at(LINK, 0x36b9 + u64::from(s0))) != rate
+        || regs(&e, hpo_at(s0, 0x366b)) != u32::from(ready.payload.hblank_symbols)
+        || regs(&e, hpo_at(s0, 0x3685)) & 0x101 != 0x101
+        || e.status.state != State::UhbrVideoRunning(s0)
+    {
+        return TestResult::Fail("first MST stream running");
+    }
+    if e.select_display(1).is_err()
+        || e.displays.siblings.mst != 1 << p
+        || e.displays.siblings.hpo != 1 << s0
+        || e.displays.siblings.hpo_links != 1 << LINK
+    {
+        return TestResult::Fail("UHBR MST link as sibling");
+    }
+    let Some(c1) = stage_uhbr_timing(&mut e, p1) else {
+        return TestResult::Fail("second timing");
+    };
+    if e.attach_mst_link(p).is_err() {
+        return TestResult::Fail("attach");
+    }
+    route_uhbr_stream(&mut e, p, s1, p1);
+    if e.status.state != State::UhbrLinkTrained(p) || e.status.mst_owner != Some(0) {
+        return TestResult::Fail("attached record");
+    }
+    if run(e.prepare_uhbr_mst_stream(path(p), s1, p1, c1, 6)).is_err() {
+        return TestResult::Fail("second MST stream prepare");
+    }
+    let both = [
+        MstAllocation {
+            stream: s0,
+            slots: 6,
+        },
+        MstAllocation {
+            stream: s1,
+            slots: 6,
+        },
+    ];
+    if uhbr_mst_payload(&mut e, p, &both).is_err() || run(e.start_uhbr_mst_video(path(p))).is_err()
+    {
+        return TestResult::Fail("second MST video");
+    }
+    if regs(&e, hpo_at(LINK, 0x36c0)) & 0x7f07 != u32::from(s1) | 6 << 8
+        || regs(&e, MPC_BASE + (0xe56 + u64::from(s1)) * 4) & 7 != u32::from(LINK)
+        || regs(&e, hpo_at(s1, 0x3685)) & 0x101 != 0x101
+    {
+        return TestResult::Fail("second MST stream running");
+    }
+    // Display 1 leaves: blank, then its payload out (rate zero, its row
+    // gone), and only then its stream.
+    if run(e.blank_uhbr_mst_video(path(p))).is_err()
+        || e.status.state != State::UhbrStreamReady(s1)
+        || regs(&e, hpo_at(s1, 0x3685)) & 0x101 != 0
+    {
+        return TestResult::Fail("blanked second stream");
+    }
+    if run(e.stop_uhbr_mst_stream(path(p))) != Err(Error::Busy) {
+        return TestResult::Fail("stream stopped under its payload");
+    }
+    if run(e.set_uhbr_mst_vc_rate(p, s1, (0, 0))).is_err()
+        || run(e.stop_uhbr_mst_stream(path(p))) != Err(Error::Busy)
+    {
+        return TestResult::Fail("stream stopped under its allocation row");
+    }
+    if run(e.update_uhbr_mst_allocation(p, &both[..1])).is_err()
+        || run(e.stop_uhbr_mst_stream(path(p))).is_err()
+    {
+        return TestResult::Fail("second stream stop");
+    }
+    unroute_uhbr_stream(&mut e, s1);
+    if regs(&e, hpo_at(s1, 0x365d)) & 1 != 0
+        || regs(&e, hpo_at(LINK, 0x36bf)) & 0x7f07 != u32::from(s0) | 6 << 8
+        || regs(&e, hpo_at(LINK, 0x36c0)) & 0x7f00 != 0
+        || e.status.state != State::UhbrLinkTrained(p)
+    {
+        return TestResult::Fail("second stream stopped");
+    }
+    if run(e.stop_uhbr_link(&mut sink, path(p))) != Err(Error::Busy)
+        || e.detach_mst_link(p).is_err()
+    {
+        return TestResult::Fail("attached display and the link");
+    }
+    if e.select_display(0).is_err()
+        || e.status
+            .uhbr_video_running
+            .is_none_or(|v| e.uhbr_video_verify_running(&v).is_err())
+    {
+        return TestResult::Fail("owner's stream after the second left");
+    }
+    if run(e.blank_uhbr_mst_video(path(p))).is_err()
+        || run(e.set_uhbr_mst_vc_rate(p, s0, (0, 0))).is_err()
+        || run(e.update_uhbr_mst_allocation(p, &[])).is_err()
+        || run(e.stop_uhbr_mst_stream(path(p))).is_err()
+    {
+        return TestResult::Fail("owner's stream stop");
+    }
+    unroute_uhbr_stream(&mut e, s0);
+    sink.steps.clear();
+    if run(e.stop_uhbr_link(&mut sink, path(p))).is_err() {
+        return TestResult::Fail("owner stops the link");
+    }
+    // The branch keeps D0 for its manager.
+    if writes(&sink).iter().any(|w| w.0 == 0x600) || !sink.steps.contains(&Step::Disable) {
+        return TestResult::Fail("MST link stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_uhbr_mst_streams_share_one_link
 );

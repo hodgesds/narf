@@ -2225,3 +2225,64 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_odm_plans_take_the_highest_free_pipes
 );
+
+/// An MST branch that codes 128b/132b trains at its verified cap, the best
+/// UHBR rate on every lane (decide_mst_link_settings, then
+/// mst_decide_link_encoding_format): each 2160p60 stream takes 12 of the
+/// link's 64 slots (dm_mst_get_pbn_divider at 4 x UHBR20), its source rate
+/// is the HPO one, and no audio is offered on it yet. The same branch
+/// without UHBR fits one such stream on 4 x HBR2.
+fn navi48_mst_selection_trains_uhbr_when_the_branch_codes_it() -> TestResult {
+    use crate::dp_mst_mgr::Sink;
+    let mut caps = DpCaps {
+        lanes: 4,
+        rate: LinkRate::Hbr2,
+        uhbr: 0b101,
+        fec: false,
+        dsc: None,
+    };
+    let devices = [
+        (Sink { branch: 0, port: 1 }, edid_2160p(), u16::MAX),
+        (Sink { branch: 0, port: 2 }, edid_2160p(), u16::MAX),
+    ];
+    let s = super::super::select_mst(0, caps, &devices, &|_| None);
+    let settings = otg::UhbrSettings {
+        lanes: 4,
+        rate: otg::UhbrRate::Uhbr20,
+        mst: true,
+    };
+    let (vc, _) = otg::uhbr_mst_rate(&s[0].timing, 8, settings).unwrap();
+    if s.len() != 2
+        || s.iter().any(|s| {
+            s.rate != DpRate::Uhbr(otg::UhbrRate::Uhbr20)
+                || s.lanes != 4
+                || s.timing.h_active != 3840
+                || s.audio.is_some()
+                || s.mst.map(|m| (m.slots, m.rate)) != Some((12, (vc >> 25, vc & 0x1ff_ffff)))
+        })
+    {
+        panic!("UHBR MST selections {s:?}");
+    }
+    // 64 slots: five such streams would fit the link, as 63 would not.
+    let t = s[0].timing;
+    let slots = super::super::mst::mst_slots(&t, 4, s[0].rate, false)
+        .unwrap()
+        .1;
+    if super::super::mst::mst_total_slots(s[0].rate) != 64 || slots * 5 > 64 {
+        return TestResult::Fail("UHBR MST slot budget");
+    }
+    caps.uhbr = 0;
+    let legacy = super::super::select_mst(0, caps, &devices, &|_| None);
+    if legacy.iter().filter(|s| s.timing.h_active == 3840).count() != 1
+        || legacy
+            .iter()
+            .any(|s| s.rate != DpRate::Legacy(LinkRate::Hbr2))
+    {
+        panic!("8b/10b MST selections {legacy:?}");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_mst_selection_trains_uhbr_when_the_branch_codes_it
+);

@@ -111,7 +111,7 @@ fn request(protocol: Protocol) -> Request {
         }),
     }
 }
-fn cases() -> [(Protocol, &'static [TeardownStep]); 5] {
+fn cases() -> [(Protocol, &'static [TeardownStep]); 6] {
     use TeardownStep::*;
     [
         (
@@ -133,6 +133,13 @@ fn cases() -> [(Protocol, &'static [TeardownStep]); 5] {
         (
             Protocol::Uhbr,
             &[Audio, Scanout, Video, Link, Timing, Planes],
+        ),
+        // The HPO stream blanks, its payload goes, then the stream stops.
+        (
+            Protocol::UhbrMst,
+            &[
+                Audio, Scanout, Video, Payload, Frontend, Link, Timing, Planes,
+            ],
         ),
         (
             Protocol::Frl,
@@ -541,7 +548,7 @@ kernel_test_in!(
     navi48_activation_abort_quarantines_cancelled_and_failed_native_steps
 );
 
-fn activation_checkpoints() -> [(Protocol, &'static [TeardownStep]); 5] {
+fn activation_checkpoints() -> [(Protocol, &'static [TeardownStep]); 6] {
     use TeardownStep::*;
     [
         (Protocol::Tmds, &[PreLinkScdc, Scdc, Video, Scanout]),
@@ -549,6 +556,10 @@ fn activation_checkpoints() -> [(Protocol, &'static [TeardownStep]); 5] {
         (Protocol::Uhbr, &[Link, Video, Scanout]),
         (Protocol::Frl, &[Scdc, Video, Scanout]),
         (Protocol::Mst, &[Link, Frontend, Payload, Video, Scanout]),
+        (
+            Protocol::UhbrMst,
+            &[Link, Frontend, Payload, Video, Scanout],
+        ),
     ]
 }
 

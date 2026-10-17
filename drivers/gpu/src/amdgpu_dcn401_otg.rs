@@ -30,9 +30,9 @@ pub use link::DpSstDisabled;
 #[path = "amdgpu_dcn401_dp_phy.rs"]
 mod dp_phy;
 pub use dp_phy::{
-    DpDriveSettings, DpFrontendReady, DpFrontendRequest, DpLinkStatus, DpLinkTrained, DpPhyReady,
-    DpPhySettings, DpTrainingError, DpVideoRunning, UhbrLinkTrained, UhbrPayload, UhbrRate,
-    UhbrSettings, UhbrVideoRunning,
+    uhbr_mst_rate, DpDriveSettings, DpFrontendReady, DpFrontendRequest, DpLinkStatus,
+    DpLinkTrained, DpPhyReady, DpPhySettings, DpTrainingError, DpVideoRunning, UhbrLinkTrained,
+    UhbrPayload, UhbrRate, UhbrSettings, UhbrVideoRunning,
 };
 #[path = "amdgpu_dcn401_hpo_link.rs"]
 mod hpo_link;
@@ -147,6 +147,9 @@ pub enum State {
     /// 128b/132b video on HPO stream encoder n: starting, running, stopping.
     StartingUhbrVideo(u8),
     UhbrVideoRunning(u8),
+    /// An MST stream on HPO stream encoder n enabled with its timing
+    /// running blank: prepared for its payload, or blanked after it.
+    UhbrStreamReady(u8),
     /// APG reset in progress; cancellation retains ownership and blocks reuse.
     StartingUhbrAudio(u8),
     StoppingUhbrVideo(u8),
@@ -774,13 +777,16 @@ pub struct Siblings {
     pub det: u8,
     pub transmitters: u8,
     pub streams: u8,
-    /// Displays running 128b/132b: their HPO link and stream encoders (the
-    /// display's own index, like its pipe) and SYMCLK32 routes.
+    /// Displays running 128b/132b: their HPO stream encoders (the
+    /// display's own index, like its pipe) and SYMCLK32_SE routes.
     pub hpo: u8,
+    /// The HPO link encoders (and SYMCLK32_LE routes) those streams ride:
+    /// the display's own, or an MST link's owner's.
+    pub hpo_links: u8,
     /// A display running FRL: the single HPO FRL encoder and its clocks.
     pub frl: bool,
-    /// Transmitters whose running link is 8b/10b MST: others' streams may
-    /// share them.
+    /// Transmitters whose running link is MST (8b/10b or 128b/132b):
+    /// others' streams may share them.
     pub mst: u8,
     pub live: [Option<(u64, bool)>; 4],
 }
@@ -869,17 +875,22 @@ impl Siblings {
             }
             _ => return out,
         };
+        let uhbr_link = s
+            .uhbr_video_running
+            .filter(|v| v.stream == stream)
+            .map(|v| v.link);
         let mst = s.dp_video_running.is_some_and(|v| {
             v.frontend.link.phy.settings.mst && v.frontend.request.stream == stream
-        });
+        }) || uhbr_link.is_some_and(|l| l.settings.mst);
         if let Some(path) = link {
             out.transmitters |= bit(path.transmitter);
             if mst {
                 out.mst |= bit(path.transmitter);
             }
             out.streams |= bit(stream);
-            if uhbr(stream).is_some() {
+            if let Some(l) = uhbr_link {
                 out.hpo |= bit(stream);
+                out.hpo_links |= bit(l.link);
             }
             out.frl |= s.frl_video_running.is_some();
         }
@@ -896,6 +907,7 @@ impl Siblings {
             transmitters: self.transmitters | other.transmitters,
             streams: self.streams | other.streams,
             hpo: self.hpo | other.hpo,
+            hpo_links: self.hpo_links | other.hpo_links,
             frl: self.frl || other.frl,
             mst: self.mst | other.mst,
             live,
@@ -927,15 +939,19 @@ fn held_by_sibling(s: Siblings, l: Layout, at: u64) -> bool {
                 && [0x2094, 0x2095, 0x209b, 0x2122]
                     .iter()
                     .any(|&r| at == dio(r)))
-            // A 128b/132b display's HPO link and stream encoders, and the
-            // SYMCLK32 route registers its nibble shares (each display's own
-            // checks verify the other nibbles).
+            // A 128b/132b display's HPO stream encoder and the link encoder
+            // it rides, and the SYMCLK32 route registers their nibbles share
+            // (each display's own checks verify the other nibbles).
             || (s.hpo & b != 0
-                && ([0x3623, 0x365d, 0x367b, 0x3685, 0x369f, 0x36b4, 0x36b5]
+                && ([0x3623, 0x365d, 0x367b, 0x3685]
                     .iter()
                     .any(|&r| at == stream::DpStream::Hpo(i).at(l, r))
-                    || at == l.link_clock
                     || at == l.link_clock - 4))
+            || (s.hpo_links & b != 0
+                && ([0x369f, 0x36b4, 0x36b5]
+                    .iter()
+                    .any(|&r| at == stream::DpStream::Hpo(i).at(l, r))
+                    || at == l.link_clock))
     })
 }
 /// The records of every display this owner drives. The selected display's

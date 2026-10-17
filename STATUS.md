@@ -783,6 +783,15 @@ gives it a free pipe, and the timing, both OPPs and DSCs, both HUBP/DPP/MPCC
 halves, deadlines, flips and the cursor are programmed across the pair
 (implementation and register models; no hardware run).
 
+DP MST now also runs over 128b/132b links: a branch that codes UHBR trains
+MST at its best UHBR rate (as Linux's decide_mst_link_settings does), streams
+share the owner's HPO link encoder with all 64 slots from slot 0, and each
+stream's HPO encoder is prepared blank, given its payload (SAT rows with ACT,
+the VC rate and blanking width matched against Linux's fixed-point
+arithmetic) and only then unblanked; teardown blanks, removes the payload and
+stops the stream. UHBR MST audio is not offered yet (implementation and
+register models; no hardware run).
+
 Native 8b/10b DP MST now reaches the platform display monitor and KMS for one
 branch, beside every board port: KMS routes any connector (board port or end
 device) to any of the four CRTCs, as SETCRTC/atomic CRTC_ID set it or
@@ -806,7 +815,7 @@ port-bound bandwidth queries. Existing payloads are added back before comparing
 capacity, avoiding relights caused by our own allocations. Capacity changes retire
 old streams before reprobe/re-admission. Every shared path hop constrains payload
 and dark-mode admission; zero PBN rejects new modes. Incomplete resource queries
-retain the session and refuse replay. Mixed MST/SST, UHBR MST and MST DSC
+retain the session and refuse replay. MST DSC and more than one branch
 remain open; no physical validation.
 The MST manager now also exposes bounded idle notification polling over
 DMUB AUX, retains fragmented messages across transaction/poll boundaries and

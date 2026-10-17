@@ -40,6 +40,9 @@ enum Protocol {
     Sst,
     Uhbr,
     Mst,
+    /// MST on a 128b/132b link: the HPO stream blanked for its payload's
+    /// removal, then stopped in place of a DIO frontend.
+    UhbrMst,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,10 +85,12 @@ impl Request {
                 Protocol::Frl
             } else if s.hdmi {
                 Protocol::Tmds
-            } else if s.uhbr() {
-                Protocol::Uhbr
+            } else if s.mst.is_some() && s.uhbr() {
+                Protocol::UhbrMst
             } else if s.mst.is_some() {
                 Protocol::Mst
+            } else if s.uhbr() {
+                Protocol::Uhbr
             } else {
                 Protocol::Sst
             },
@@ -94,6 +99,9 @@ impl Request {
             dsc: s.dsc.is_some(),
             scanout: None,
         }
+    }
+    fn mst(self) -> bool {
+        matches!(self.protocol, Protocol::Mst | Protocol::UhbrMst)
     }
     fn first(self) -> TeardownStep {
         if self.scanout.is_none() {
@@ -111,7 +119,7 @@ impl Request {
             Scanout => Video,
             Video => match self.protocol {
                 Protocol::Tmds | Protocol::Frl => Scdc,
-                Protocol::Mst => Payload,
+                Protocol::Mst | Protocol::UhbrMst => Payload,
                 Protocol::Sst => Frontend,
                 Protocol::Uhbr => Link,
             },
@@ -325,7 +333,7 @@ impl Backend for ColdBoot {
         &mut self.teardowns
     }
     fn completed(&mut self, r: Request) -> Result<(), ModesetError> {
-        if r.protocol == Protocol::Mst {
+        if r.mst() {
             if let Some(link) = self.display_mst(r.port) {
                 link.require_transaction_idle::<super::dmub::Error>()?;
             }
@@ -347,7 +355,7 @@ impl Backend for ColdBoot {
         // Payload transactions span AUX and native source owners. A returned
         // error can leave native state looking settled while remote state is
         // uncertain; no startup checkpoint permits tearing that ownership down.
-        if r.protocol == Protocol::Mst {
+        if r.mst() {
             if let Some(link) = self.display_mst(r.port) {
                 link.require_transaction_idle::<super::dmub::Error>()?;
             }
@@ -369,6 +377,7 @@ impl Backend for ColdBoot {
                     Protocol::Tmds => self.stop_display_hdmi_video(r.port).await?,
                     Protocol::Frl => self.stop_display_frl_video(r.port).await?,
                     Protocol::Uhbr => self.stop_display_uhbr_video(r.port).await?,
+                    Protocol::UhbrMst => self.blank_display_uhbr_mst_video(r.port).await?,
                     Protocol::Sst | Protocol::Mst => self.stop_display_dp_video(r.port).await?,
                 },
                 Scdc | PreLinkScdc => {
@@ -383,6 +392,9 @@ impl Backend for ColdBoot {
                     }
                 }
                 Payload => self.remove_display_mst_payload(r.port, r.pipe).await?,
+                Frontend if r.protocol == Protocol::UhbrMst => {
+                    self.stop_display_uhbr_mst_stream(r.port).await?
+                }
                 Frontend => self.stop_display_dp_frontend(r.port).await?,
                 Link => match r.protocol {
                     Protocol::Tmds => self.stop_display_hdmi_link(r.port).await?,
@@ -391,7 +403,7 @@ impl Backend for ColdBoot {
                         self.stop_display_uhbr_link(r.port, status.unplugged)
                             .await?
                     }
-                    Protocol::Mst => {
+                    Protocol::Mst | Protocol::UhbrMst => {
                         self.finish_mst_stream(r.port, r.pipe, status.unplugged)
                             .await?
                     }

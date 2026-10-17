@@ -52,6 +52,7 @@ mod tests {
                     1350 => UhbrRate::Uhbr13_5,
                     _ => UhbrRate::Uhbr20,
                 },
+                mst: false,
             };
             // The native HBLANK formula, including stream pixel padding; no
             // link-admission precondition for these arithmetic-only vectors.

@@ -1353,9 +1353,16 @@ pub fn select_all(
             depth: otg::ColorDepth::Bpc8,
             // HPO exposes only LPCM rates fitting its blanking budget.
             audio: sink_audio_info(&sink.edid).and_then(|info| match rate {
-                DpRate::Uhbr(rate) => {
-                    otg::uhbr_audio_info(info, &timing, 8, otg::UhbrSettings { lanes, rate })
-                }
+                DpRate::Uhbr(rate) => otg::uhbr_audio_info(
+                    info,
+                    &timing,
+                    8,
+                    otg::UhbrSettings {
+                        lanes,
+                        rate,
+                        mst: false,
+                    },
+                ),
                 _ => Some(info),
             }),
             avi: otg::Avi::default(),
@@ -2433,7 +2440,11 @@ impl ColdBoot {
                 let DpRate::Uhbr(rate) = link else {
                     continue;
                 };
-                let settings = otg::UhbrSettings { lanes, rate };
+                let settings = otg::UhbrSettings {
+                    lanes,
+                    rate,
+                    mst: false,
+                };
                 for attempt in 0..UHBR_TRAINING_ATTEMPTS {
                     if attempt != 0 {
                         let ms = UHBR_RETRY_DELAY_MS * u64::from(attempt);

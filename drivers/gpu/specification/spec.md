@@ -1665,7 +1665,27 @@ GETCONNECTOR and the platform's mode-request gate without setting a CRTC mode
 or framebuffer. A missing EDID suppresses the offered timings. Ordinary MST
 disable retains previously admitted timings without restarting siblings;
 the next configuration/reprobe recomputes admission against remaining resources.
-UHBR MST, DSC on MST and more than one MST branch remain unsupported.
+DSC on MST and more than one MST branch remain unsupported.
+
+An MST branch that codes 128b/132b runs UHBR MST, as Linux's
+decide_mst_link_settings trains MST at the verified cap: the best UHBR rate
+on every lane. Selection then counts all 64 time slots (no MTP header slot,
+drm_dp_mst_update_slots) with dm_mst_get_pbn_divider of that link, and
+payloads start at slot 0 (`MstLink::uhbr`). The first stream trains the link
+with `UhbrSettings::mst` on its own HPO link encoder (training requires the
+manager's MST_EN; stopping leaves the branch in D0); later streams attach to
+the owner's `UhbrLinkTrained` record, and handover/detach follow the 8b/10b
+rules. Each stream uses its own HPO stream encoder in Linux's order:
+`prepare_uhbr_mst_stream` enables and maps it with its timing running blank
+(`State::UhbrStreamReady`), the manager adds the payload through
+`update_uhbr_mst_allocation` (HPO SAT rows with ACT) and `set_uhbr_mst_vc_rate`
+(the recorded `uhbr_mst_rate`: PBN over PBN-per-slot, a 25-bit Y and the
+minimum blanking width, matched against Linux's fixed-point code), then
+`start_uhbr_mst_video` unblanks it. Teardown (`Protocol::UhbrMst`) blanks
+(`blank_uhbr_mst_video`), removes the payload, and only then
+`stop_uhbr_mst_stream` disables the stream, refusing while its VC rate or a
+SAT row remains. `Siblings::hpo` holds stream encoders and `hpo_links` the link
+encoders they ride. UHBR MST audio is refused (`Unsupported`).
 Legacy MST LPCM uses each stream's AFMT and endpoint as described below.
 This path is model-tested only.
 
@@ -2057,7 +2077,7 @@ then may scanout, video and payload retire. The MST activation checkpoint covers
 completed scanout before audio starts. Models cover independent stream/pipe/PHY
 indices, all RGB depths, malformed/stale payloads, failures, endpoint collisions,
 shared DTO and two-stream link handover. 2268 bandwidth vectors match Linux's
-routines. UHBR MST, MST DSC and physical audio acceptance remain outside this
+routines. UHBR MST audio, MST DSC and physical audio acceptance remain outside this
 contract.
 
 `start_display_hdmi_video(port)` starts the blank timing, repeats the FIFO reset

@@ -157,6 +157,68 @@ fn navi48_mst_payloads_like_linux() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/dp-mst", navi48_mst_payloads_like_linux);
 
+/// On a 128b/132b link there is no MTP header slot: the first payload
+/// starts at slot 0 and the link's 64 slots are all the streams'
+/// (drm_dp_mst_update_slots), where 8b/10b would refuse the last one.
+fn navi48_uhbr_mst_payloads_start_at_slot_zero() -> TestResult {
+    let hub = RefCell::new(Hub::new());
+    let mut aux = Aux(&hub);
+    let mut link = MstLink {
+        uhbr: true,
+        ..MstLink::default()
+    };
+    let mut dpcd = [0u8; 16];
+    dpcd[0] = 0x12;
+    run(link.manager.start(&mut aux, &dpcd)).unwrap();
+    link.topology = run(link.manager.probe(&mut aux)).unwrap();
+    let sinks = link.topology.sinks();
+    let mut source = Source {
+        hub: &hub,
+        events: Vec::new(),
+    };
+    let add = |link: &mut MstLink, aux: &mut Aux, source: &mut Source, sink, stream, slots| {
+        run(add_payload(
+            link,
+            aux,
+            source,
+            sink,
+            stream,
+            100,
+            slots,
+            (1, 0),
+        ))
+    };
+    let a = add(&mut link, &mut aux, &mut source, sinks[0], 1, 12).unwrap();
+    let b = add(&mut link, &mut aux, &mut source, sinks[1], 3, 52).unwrap();
+    if (a.start, b.start) != (0, 12) {
+        return TestResult::Fail("128b/132b start slots");
+    }
+    run(remove_payload(&mut link, &mut aux, &mut source, 1, true)).unwrap();
+    if link.payloads[0].start != 0 {
+        return TestResult::Fail("payload moved down to slot 0");
+    }
+    // 52 + 12 fills the link exactly; one more slot is refused.
+    if add(&mut link, &mut aux, &mut source, sinks[0], 1, 12).map(|p| p.start) != Ok(52)
+        || link
+            .payloads
+            .iter()
+            .map(|p| u32::from(p.slots))
+            .sum::<u32>()
+            != 64
+    {
+        return TestResult::Fail("the full 64 slots");
+    }
+    run(remove_payload(&mut link, &mut aux, &mut source, 1, true)).unwrap();
+    if add(&mut link, &mut aux, &mut source, sinks[0], 1, 13).is_ok() {
+        return TestResult::Fail("65 slots");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_uhbr_mst_payloads_start_at_slot_zero
+);
+
 fn navi48_mst_unplug_removes_payload_without_aux() -> TestResult {
     // Every possible AUX operation fails the test: an unplug must only
     // retire source state, without waiting for remote replies or ACT status.

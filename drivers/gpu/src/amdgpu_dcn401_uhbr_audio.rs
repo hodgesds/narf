@@ -66,6 +66,10 @@ impl<I: Io> Engine<I> {
             }
             _ => return Err(Error::Busy),
         }
+        // UHBR MST audio (per-stream APG budgets) is not implemented.
+        if v.link.settings.mst {
+            return Err(Error::Unsupported);
+        }
         if v.link.path != path {
             return Err(Error::Invalid);
         }

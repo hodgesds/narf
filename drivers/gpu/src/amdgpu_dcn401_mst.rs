@@ -1,5 +1,5 @@
-//! Native DCN401 8b/10b MST stream allocation, as Linux's
-//! allocate_mst_payload programs the source:
+//! Native DCN401 MST link sharing (8b/10b and 128b/132b), and 8b/10b MST
+//! stream allocation, as Linux's allocate_mst_payload programs the source:
 //! dcn10_link_encoder_update_mst_stream_allocation_table (the link's VC
 //! payload table, then the allocation change trigger) and
 //! enc1_stream_encoder_set_throttled_vcp_size (each stream's VC rate in
@@ -47,46 +47,88 @@ pub fn vc_rate(stream_kbps: u32, link_kbps: u32) -> Option<(u32, u32)> {
 }
 
 impl<I: Io> Engine<I> {
-    /// Attach the selected display to the running 8b/10b MST link on
-    /// `transmitter` that another display trained (Linux's MST streams
-    /// share their link's encoder): its link record is copied, so this
-    /// display's frontend, video and allocation work on it, but never
+    /// Attach the selected display to the running MST link (8b/10b or
+    /// 128b/132b) on `transmitter` that another display trained (Linux's
+    /// MST streams share their link's encoder): its link record is copied,
+    /// so this display's stream, video and allocation work on it, but never
     /// trains or stops it.
     pub(in crate::amdgpu_dcn401_otg) fn attach_mst_link(
         &mut self,
         transmitter: u8,
-    ) -> Result<DpLinkTrained, Error> {
+    ) -> Result<(), Error> {
         if !self.status.state.reusable() || self.status.mst_owner.is_some() {
             return Err(Error::Busy);
         }
         let selected = self.displays.selected;
+        // The owner's link as it runs, minus its frontend's selection.
         let (owner, link) = (0..4u8)
             .filter(|&k| k != selected)
             .find_map(|k| {
                 let s = &self.displays.parked[usize::from(k)];
-                let link = s.dp_video_running?.frontend.link;
-                (s.mst_owner.is_none()
-                    && link.phy.settings.mst
-                    && link.phy.path.transmitter == transmitter)
-                    .then_some((k, link))
+                if s.mst_owner.is_some() {
+                    return None;
+                }
+                let dp = s
+                    .dp_video_running
+                    .map(|v| v.frontend.link)
+                    .filter(|l| l.phy.settings.mst && l.phy.path.transmitter == transmitter);
+                let uhbr = s
+                    .uhbr_video_running
+                    .map(|v| v.link)
+                    .filter(|l| l.settings.mst && l.path.transmitter == transmitter);
+                match (dp, uhbr) {
+                    (Some(mut l), _) => {
+                        l.phy.controls[1] &= !0x7f00;
+                        Some((k, Ok(l)))
+                    }
+                    (None, Some(l)) => Some((k, Err(l))),
+                    _ => None,
+                }
             })
             .ok_or(Error::Invalid)?;
         if self.displays.siblings.mst & bit(transmitter) == 0 {
             return Err(Error::Invalid);
         }
-        // The owner's link as it runs, minus its frontend's selection.
-        let mut link = link;
-        link.phy.controls[1] &= !0x7f00;
-        self.status.dp_link_trained = Some(link);
         self.status.mst_owner = Some(owner);
-        self.status.state = State::DpLinkTrained(transmitter);
-        if let Err(e) = self.dp_training_verify(link) {
+        let verified = match link {
+            Ok(link) => {
+                self.status.dp_link_trained = Some(link);
+                self.status.state = State::DpLinkTrained(transmitter);
+                self.dp_training_verify(link)
+            }
+            Err(link) => {
+                self.status.uhbr_link = Some(link);
+                self.status.state = State::UhbrLinkTrained(transmitter);
+                self.uhbr_verify_owned(&link, None, None)
+            }
+        };
+        if let Err(e) = verified {
             self.status.dp_link_trained = None;
+            self.status.uhbr_link = None;
             self.status.mst_owner = None;
             self.status.state = State::Ready;
             return Err(e);
         }
-        Ok(link)
+        Ok(())
+    }
+    /// The selected display's MST link record on `transmitter`, while it is
+    /// trained (or attached) with no stream: 8b/10b or 128b/132b.
+    fn idle_mst_link(&self, transmitter: u8) -> bool {
+        let s = &self.status;
+        match s.state {
+            State::DpLinkTrained(t) => {
+                t == transmitter
+                    && s.dp_link_trained
+                        .is_some_and(|l| l.phy.settings.mst && l.phy.path.transmitter == t)
+            }
+            State::UhbrLinkTrained(t) => {
+                t == transmitter
+                    && s.uhbr_video_running.is_none()
+                    && s.uhbr_link
+                        .is_some_and(|l| l.settings.mst && l.path.transmitter == t)
+            }
+            _ => false,
+        }
     }
     /// Detach the selected display from the MST link it rides; its stream
     /// must be stopped. The link keeps running for its owner.
@@ -94,18 +136,18 @@ impl<I: Io> Engine<I> {
         &mut self,
         transmitter: u8,
     ) -> Result<(), Error> {
-        if self.status.state != State::DpLinkTrained(transmitter) || self.status.mst_owner.is_none()
-        {
+        if !self.idle_mst_link(transmitter) || self.status.mst_owner.is_none() {
             return Err(Error::Busy);
         }
         self.status.dp_link_trained = None;
+        self.status.uhbr_link = None;
         self.status.mst_owner = None;
         self.status.state = State::Ready;
         Ok(())
     }
     /// Hand the MST link on `transmitter`, which the selected display
-    /// trained and no longer streams on (its frontend stopped), to
-    /// display `to`, attached to it: `to` owns it from now on, the other
+    /// trained and no longer streams on (its frontend or stream stopped),
+    /// to display `to`, attached to it: `to` owns it from now on, the other
     /// attached displays ride `to`'s link, and the selected display lets it
     /// go, the link left running (Linux's link outlives any one stream).
     pub(in crate::amdgpu_dcn401_otg) fn hand_over_mst_link(
@@ -114,14 +156,7 @@ impl<I: Io> Engine<I> {
         to: u8,
     ) -> Result<(), Error> {
         let selected = self.displays.selected;
-        let ours = self
-            .status
-            .dp_link_trained
-            .is_some_and(|l| l.phy.settings.mst && l.phy.path.transmitter == transmitter);
-        if self.status.state != State::DpLinkTrained(transmitter)
-            || self.status.mst_owner.is_some()
-            || !ours
-        {
+        if !self.idle_mst_link(transmitter) || self.status.mst_owner.is_some() {
             return Err(Error::Busy);
         }
         if to == selected
@@ -139,6 +174,7 @@ impl<I: Io> Engine<I> {
             }
         }
         self.status.dp_link_trained = None;
+        self.status.uhbr_link = None;
         self.status.state = State::Ready;
         Ok(())
     }
@@ -255,10 +291,7 @@ impl Otg {
     /// # Safety
     /// The MST manager allocates this display's payload on the link; the
     /// owner keeps the link running until this display detaches.
-    pub(crate) unsafe fn attach_mst_link(
-        &mut self,
-        transmitter: u8,
-    ) -> Result<DpLinkTrained, Error> {
+    pub(crate) unsafe fn attach_mst_link(&mut self, transmitter: u8) -> Result<(), Error> {
         self.0.attach_mst_link(transmitter)
     }
     /// Hand the selected display's MST link on to display `to`.

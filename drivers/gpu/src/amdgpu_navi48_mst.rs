@@ -69,7 +69,7 @@ pub struct MstPayload {
     pub start: u8,
     pub slots: u8,
     pub pbn: u16,
-    /// The DIO stream encoder carrying it.
+    /// The stream encoder carrying it: DIO on 8b/10b, HPO on 128b/132b.
     pub stream: u8,
 }
 
@@ -86,6 +86,9 @@ pub enum MstPayloadChange {
 pub struct MstLink {
     /// The pipe whose display owns the trained link, while one runs.
     pub owner: Option<u8>,
+    /// The owner's link codes 128b/132b: HPO encoders carry the streams and
+    /// payloads start at slot 0 (drm_dp_mst_update_slots).
+    pub uhbr: bool,
     pub manager: Manager,
     pub topology: Topology,
     pub payloads: Vec<MstPayload>,
@@ -197,8 +200,8 @@ fn table(payloads: &[MstPayload]) -> Vec<otg::MstAllocation> {
         .collect()
 }
 
-/// allocate_mst_payload for DIO `stream` to `sink`: the lowest free VCPI
-/// at the next start slot in the sink's payload table
+/// allocate_mst_payload for stream encoder `stream` to `sink`: the lowest
+/// free VCPI at the next start slot in the sink's payload table
 /// (drm_dp_add_payload_part1), the source table with ACT, ACT handled,
 /// ALLOCATE_PAYLOAD to the sink's branch (drm_dp_add_payload_part2), then
 /// the stream's VC rate.
@@ -234,11 +237,13 @@ pub(crate) async fn add_payload<A: MstAux, S: MstSource>(
     let vcpi = (1..=63u8)
         .find(|v| link.payloads.iter().all(|p| p.vcpi != *v))
         .ok_or(MstFailure::Invalid)?;
-    let start = 1 + link
-        .payloads
-        .iter()
-        .map(|p| u32::from(p.slots))
-        .sum::<u32>();
+    let first = u32::from(!link.uhbr);
+    let start = first
+        + link
+            .payloads
+            .iter()
+            .map(|p| u32::from(p.slots))
+            .sum::<u32>();
     if start + u32::from(slots) > 64 {
         return Err(MstFailure::Invalid);
     }
@@ -276,7 +281,7 @@ pub(crate) async fn add_payload<A: MstAux, S: MstSource>(
     Ok(payload)
 }
 
-/// deallocate_mst_payload for DIO `stream`: VC rate zero, the remote and
+/// deallocate_mst_payload for stream encoder `stream`: VC rate zero, the remote and
 /// DPCD allocations removed (drm_dp_remove_payload_part1, failures
 /// tolerated as Linux does), the source table without it and ACT handled
 /// (unchecked), then later payloads' start slots moved down
@@ -328,26 +333,40 @@ pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
     Ok(())
 }
 
-/// The selected display's source programming on the port's MST link.
+/// The selected display's source programming on the port's MST link: the
+/// DIO link and stream encoders on 8b/10b, the HPO ones on 128b/132b.
 struct OtgSource<'a> {
     otg: &'a mut otg::Otg,
     transmitter: u8,
+    uhbr: bool,
 }
 impl MstSource for OtgSource<'_> {
     async fn allocation(&mut self, table: &[otg::MstAllocation]) -> Result<(), otg::Error> {
         // SAFETY: the table mirrors the sink's payload table.
         unsafe {
-            self.otg
-                .update_mst_allocation(self.transmitter, table)
-                .await
+            if self.uhbr {
+                self.otg
+                    .update_uhbr_mst_allocation(self.transmitter, table)
+                    .await
+            } else {
+                self.otg
+                    .update_mst_allocation(self.transmitter, table)
+                    .await
+            }
         }
     }
     async fn vc_rate(&mut self, stream: u8, rate: (u32, u32)) -> Result<(), otg::Error> {
         // SAFETY: `stream` carries (or carried) a payload on this link.
         unsafe {
-            self.otg
-                .set_mst_vc_rate(self.transmitter, stream, rate)
-                .await
+            if self.uhbr {
+                self.otg
+                    .set_uhbr_mst_vc_rate(self.transmitter, stream, rate)
+                    .await
+            } else {
+                self.otg
+                    .set_mst_vc_rate(self.transmitter, stream, rate)
+                    .await
+            }
         }
     }
 }
@@ -466,11 +485,11 @@ impl ColdBoot {
         };
         topology::read_edid(&mut link.manager, &mut aux, &link.topology, sink).await
     }
-    /// Add DIO stream `stream`'s payload for `sink` (`add_payload`).
+    /// Add stream encoder `stream`'s payload for `sink` (`add_payload`).
     /// Incomplete transactions retain their marker and refuse further changes.
     /// # Safety
-    /// The selected display's frontend on `stream` runs on the port's MST
-    /// link, its video not yet started.
+    /// The selected display's frontend (DIO) or blank stream (HPO) on
+    /// `stream` runs on the port's MST link, its video not yet started.
     pub async unsafe fn add_display_mst_payload(
         &mut self,
         port: usize,
@@ -489,14 +508,16 @@ impl ColdBoot {
         let mut source = OtgSource {
             otg: self.otg.as_mut().map_err(|e| *e)?,
             transmitter,
+            uhbr: link.uhbr,
         };
         add_payload(link, &mut aux, &mut source, sink, stream, pbn, slots, rate).await
     }
-    /// Remove DIO stream `stream`'s payload (`remove_payload`).
+    /// Remove stream encoder `stream`'s payload (`remove_payload`).
     /// Failure/cancellation retains the transaction even if its list entry
     /// has already been removed; that does not prove source/sink completion.
     /// # Safety
-    /// The selected display's video on `stream` is stopped.
+    /// The selected display's video on `stream` is stopped (DIO) or
+    /// blanked (HPO).
     pub async unsafe fn remove_display_mst_payload(
         &mut self,
         port: usize,
@@ -512,6 +533,7 @@ impl ColdBoot {
         let mut source = OtgSource {
             otg: self.otg.as_mut().map_err(|e| *e)?,
             transmitter,
+            uhbr: link.uhbr,
         };
         remove_payload(link, &mut aux, &mut source, stream, connected).await
     }
@@ -542,30 +564,71 @@ impl ColdBoot {
 /// 8-bit RGB, as MST streams are selected (bpp in 1/16).
 const MST_BPP_X16: u32 = 24 * 16;
 
+/// decide_mst_link_settings: an MST link trains at the sink's verified
+/// link cap, its best 128b/132b rate where it codes one (Linux's
+/// mst_decide_link_encoding_format then picks 128b/132b), else its best
+/// 8b/10b link.
+pub(super) fn mst_link(caps: modeset::DpCaps) -> (u8, DpRate) {
+    match caps.uhbr_rates().last() {
+        Some(r) => (caps.lanes, DpRate::Uhbr(r)),
+        None => (caps.lanes, DpRate::Legacy(caps.rate)),
+    }
+}
+
+/// drm_dp_mst_update_slots: the time slots streams may take, 63 after the
+/// 8b/10b MTP header slot, all 64 on 128b/132b.
+pub(super) fn mst_total_slots(rate: DpRate) -> u8 {
+    match rate {
+        DpRate::Legacy(_) => 63,
+        DpRate::Uhbr(_) => 64,
+    }
+}
+
 /// The PBN and time slots of `timing` on an MST link of `lanes` at
 /// `rate`
-/// (drm_dp_calc_pbn_mode, dm_mst_get_pbn_divider,
-/// drm_dp_atomic_find_time_slots); None past the 63 slots.
+/// (drm_dp_calc_pbn_mode, dm_mst_get_pbn_divider of the link's
+/// dc_link_bandwidth_kbps, drm_dp_atomic_find_time_slots); None past the
+/// link's slots.
 pub(super) fn mst_slots(timing: &Timing, lanes: u8, rate: DpRate, fec: bool) -> Option<(u16, u8)> {
-    let DpRate::Legacy(rate) = rate else {
-        return None;
+    let link_kbps = match rate {
+        DpRate::Legacy(r) => modeset::legacy_kbps(lanes, r, fec),
+        DpRate::Uhbr(r) => modeset::uhbr_kbps(lanes, r),
     };
-    let link_kbps = modeset::legacy_kbps(lanes, rate, fec) as u32;
     let pbn = dp_mst::calc_pbn_mode(timing.pixel_clock_khz, MST_BPP_X16);
-    let div = dp_mst::pbn_div(link_kbps);
+    let div = dp_mst::pbn_div(u32::try_from(link_kbps).ok()?);
     if div == 0 {
         return None;
     }
     let slots = dp_mst::time_slots(pbn, div);
-    (slots <= 63 && pbn <= u32::from(u16::MAX)).then_some((pbn as u16, slots as u8))
+    (slots <= u32::from(mst_total_slots(rate)) && pbn <= u32::from(u16::MAX))
+        .then_some((pbn as u16, slots as u8))
+}
+
+/// The source VC rate (X, Y) of an 8-bpc RGB MST stream: Y in 1/2^26 on
+/// 8b/10b (`otg::vc_rate`), 1/2^25 on 128b/132b (`otg::uhbr_mst_rate`).
+fn mst_vc_rate(timing: &Timing, lanes: u8, rate: DpRate, fec: bool) -> Option<(u32, u32)> {
+    match rate {
+        DpRate::Legacy(r) => otg::vc_rate(
+            timing.pixel_clock_khz * 24,
+            modeset::legacy_kbps(lanes, r, fec) as u32,
+        ),
+        DpRate::Uhbr(rate) => {
+            let settings = otg::UhbrSettings {
+                lanes,
+                rate,
+                mst: true,
+            };
+            otg::uhbr_mst_rate(timing, 8, settings).map(|(v, _)| (v >> 25, v & ((1 << 25) - 1)))
+        }
+    }
 }
 
 /// The streams one MST port lights, as amdgpu_dm's MST atomic check
 /// admits them: each end device (in topology order, at most
 /// `MAX_DISPLAYS`) at the timing `want(k)` asks of device k where its EDID
 /// lists it and its payload fits, else the first of its EDID timings that
-/// does, at 8 bpc RGB on the port's maximum 8b/10b link. A payload fits
-/// the slots the earlier streams left of 63 and its port's available PBN
+/// does, at 8 bpc RGB on the port's MST link (`mst_link`). A payload fits
+/// the slots the earlier streams left of the link's and its port's available PBN
 /// (ENUM_PATH_RESOURCES). Devices nothing fits stay dark. `devices` are
 /// each end device, its EDID and available PBN. Zero PBN is exhausted capacity.
 /// The topology modeset additionally enforces every shared upstream hop.
@@ -585,7 +648,8 @@ fn select_mst_with_budget(
     want: &dyn Fn(usize) -> Option<Timing>,
     budget: &dyn Fn(dp_mst_mgr::Sink, &[Selection]) -> u16,
 ) -> Vec<Selection> {
-    let mut free = 63u8;
+    let (lanes, rate) = mst_link(caps);
+    let mut free = mst_total_slots(rate);
     let mut out = Vec::new();
     for (k, (sink, edid, available)) in devices.iter().enumerate() {
         if out.len() == modeset::MAX_DISPLAYS {
@@ -594,7 +658,6 @@ fn select_mst_with_budget(
         let Some(base) = edid.get(..128).and_then(|b| b.try_into().ok()) else {
             continue;
         };
-        let (lanes, rate) = (caps.lanes, DpRate::Legacy(caps.rate));
         let available = (*available).min(budget(*sink, &out));
         let fits = |t: &Timing| {
             mst_slots(t, lanes, rate, caps.fec)
@@ -608,8 +671,7 @@ fn select_mst_with_budget(
         let Some((timing, (pbn, slots))) = chosen else {
             continue;
         };
-        let link_kbps = modeset::legacy_kbps(lanes, caps.rate, caps.fec) as u32;
-        let Some(vc) = otg::vc_rate(timing.pixel_clock_khz * 24, link_kbps) else {
+        let Some(vc) = mst_vc_rate(&timing, lanes, rate, caps.fec) else {
             continue;
         };
         free -= slots;
@@ -623,18 +685,21 @@ fn select_mst_with_budget(
             hdmi: false,
             scdc: false,
             depth: otg::ColorDepth::Bpc8,
-            audio: modeset::sink_audio_info(edid).and_then(|info| {
-                otg::mst_audio_info(
-                    info,
-                    &timing,
-                    8,
-                    otg::DpPhySettings {
-                        lanes,
-                        rate: caps.rate,
-                        mst: true,
-                    },
-                )
-            }),
+            // No audio on 128b/132b MST streams yet.
+            audio: modeset::sink_audio_info(edid)
+                .filter(|_| matches!(rate, DpRate::Legacy(_)))
+                .and_then(|info| {
+                    otg::mst_audio_info(
+                        info,
+                        &timing,
+                        8,
+                        otg::DpPhySettings {
+                            lanes,
+                            rate: caps.rate,
+                            mst: true,
+                        },
+                    )
+                }),
             avi: otg::Avi::default(),
             limited: false,
             ycbcr420: false,
@@ -692,7 +757,8 @@ pub(super) fn dark_mst_modes(
         .iter()
         .filter_map(|s| s.mst)
         .try_fold(0u8, |n, m| n.checked_add(m.slots));
-    let Some(free) = used.and_then(|n| 63u8.checked_sub(n)) else {
+    let (lanes, rate) = mst_link(caps);
+    let Some(free) = used.and_then(|n| mst_total_slots(rate).checked_sub(n)) else {
         return Vec::new();
     };
     let mut joint: Vec<_> = lit.iter().map(modeset::selection_mode).collect();
@@ -701,7 +767,7 @@ pub(super) fn dark_mst_modes(
         if offered.len() == modeset::MAX_MODES {
             break;
         }
-        if !mst_slots(&t, caps.lanes, DpRate::Legacy(caps.rate), caps.fec)
+        if !mst_slots(&t, lanes, rate, caps.fec)
             .is_some_and(|(pbn, slots)| slots <= free && pbn <= available)
         {
             continue;
@@ -893,10 +959,12 @@ impl ColdBoot {
             }
         }
     }
-    /// Start `selection`'s MST stream on staged `pipe` (DIO stream `pipe`):
-    /// the first stream trains the port's MST link at the selected
+    /// Start `selection`'s MST stream on staged `pipe` (stream encoder
+    /// `pipe`): the first stream trains the port's MST link at the selected
     /// setting (no fallback: every payload was sized for it), later ones
-    /// attach to it; then the frontend, payload, video, scanout and LPCM audio.
+    /// attach to it; then the frontend, payload, video, scanout and LPCM
+    /// audio. On a 128b/132b link the HPO stream is prepared blank in place
+    /// of the frontend, and unblanked as its video.
     /// # Safety
     /// As for `start_link`.
     pub(super) async unsafe fn start_mst_stream(
@@ -906,37 +974,35 @@ impl ColdBoot {
         selection: &Selection,
         pipe: u8,
     ) -> Result<otg::ScanoutRunning, ModesetError> {
-        let DpRate::Legacy(rate) = selection.rate else {
-            return Err(ModesetError::Link);
-        };
         let link = self.mst.get(&port).ok_or(MstFailure::Invalid)?;
         link.require_transaction_idle()?;
+        let uhbr = matches!(selection.rate, DpRate::Uhbr(_));
+        if link.owner.is_some() && link.uhbr != uhbr {
+            return Err(ModesetError::Link);
+        }
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
             if link.owner.is_none() {
-                self.enable_display_dp_phy(
-                    port,
-                    otg::DpPhySettings {
-                        lanes: selection.lanes,
-                        rate,
-                        mst: true,
-                    },
-                )
-                .await?;
-                if let Err(e) = self.train_display_dp_link(port, false).await {
-                    let _ = self.stop_display_dp_link(port).await;
-                    return Err(e.into());
-                }
+                self.train_mst_link(port, selection, pipe).await?;
                 if let Some(link) = self.mst.get_mut(&port) {
                     link.owner = Some(pipe);
+                    link.uhbr = uhbr;
                 }
             } else {
                 self.attach_display_mst_link(port)?;
             }
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Link);
-            self.prepare_display_dp_frontend(port, otg::DpFrontendRequest { stream: pipe, pipe })
+            if uhbr {
+                self.prepare_display_uhbr_mst_stream(port, pipe, pipe, stream.slots)
+                    .await?;
+            } else {
+                self.prepare_display_dp_frontend(
+                    port,
+                    otg::DpFrontendRequest { stream: pipe, pipe },
+                )
                 .await?;
+            }
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Frontend);
             self.add_display_mst_payload(
@@ -950,7 +1016,11 @@ impl ColdBoot {
             .await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Payload);
-            self.start_display_dp_video(port).await?;
+            if uhbr {
+                self.start_display_uhbr_mst_video(port).await?;
+            } else {
+                self.start_display_dp_video(port).await?;
+            }
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Video);
             let scanout = self.start_display_scanout(pipe).await?;
@@ -962,7 +1032,56 @@ impl ColdBoot {
             Ok(scanout)
         }
     }
-    /// Finish teardown after video, payload and frontend have stopped:
+    /// Train the port's MST link at `selection`'s setting for the selected
+    /// display: 8b/10b on the DIO, 128b/132b on HPO link encoder `pipe`
+    /// (the display's own, as for SST). A refused link is stopped again.
+    /// # Safety
+    /// As for `start_link`.
+    async unsafe fn train_mst_link(
+        &mut self,
+        port: usize,
+        selection: &Selection,
+        pipe: u8,
+    ) -> Result<(), ModesetError> {
+        let lanes = selection.lanes;
+        // SAFETY: the caller's obligations.
+        unsafe {
+            match selection.rate {
+                DpRate::Legacy(rate) => {
+                    let settings = otg::DpPhySettings {
+                        lanes,
+                        rate,
+                        mst: true,
+                    };
+                    self.enable_display_dp_phy(port, settings).await?;
+                    if let Err(e) = self.train_display_dp_link(port, false).await {
+                        let _ = self.stop_display_dp_link(port).await;
+                        return Err(e.into());
+                    }
+                }
+                DpRate::Uhbr(rate) => {
+                    let settings = otg::UhbrSettings {
+                        lanes,
+                        rate,
+                        mst: true,
+                    };
+                    let transmitter = self.dp_phy_path(port)?.transmitter;
+                    if let Err(e) = self.train_display_uhbr_link(port, settings, pipe).await {
+                        if self
+                            .display_timing_status()
+                            .is_ok_and(|s| s.state == otg::State::UhbrLinkRefused(transmitter))
+                        {
+                            self.stop_display_uhbr_link(port, false).await?;
+                        }
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Finish teardown after video, payload and frontend (or HPO stream)
+    /// have stopped:
     /// an attached display detaches, while the link's owner hands the link to a
     /// remaining stream's display or, the last, stops the link (without
     /// addressing an `unplugged` sink). A connected root keeps its manager
@@ -1001,7 +1120,10 @@ impl ColdBoot {
                 }
                 return Ok(());
             }
-            if unplugged {
+            let uhbr = self.mst.get(&port).is_some_and(|l| l.uhbr);
+            if uhbr {
+                self.stop_display_uhbr_link(port, unplugged).await?;
+            } else if unplugged {
                 self.stop_unplugged_display_dp_link(port).await?;
             } else {
                 self.stop_display_dp_link(port).await?;
@@ -1009,6 +1131,7 @@ impl ColdBoot {
         }
         if let Some(link) = self.mst.get_mut(&port) {
             link.owner = None;
+            link.uhbr = false;
         }
         if unplugged {
             self.forget_unplugged_display_mst(port)?;

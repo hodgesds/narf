@@ -132,6 +132,7 @@ fn standard() -> (Engine<AudioIo>, Sink) {
         UhbrSettings {
             lanes: 4,
             rate: UhbrRate::Uhbr20,
+            mst: false,
         },
     )
 }
@@ -147,8 +148,15 @@ fn dcn401_uhbr_audio_programs_apg_endpoint_and_preserves_video() -> TestResult {
     for rate in UhbrRate::ALL {
         for lanes in [1, 2, 4] {
             for stream in 0..4u8 {
-                let (mut e, mut sink) =
-                    fixture(stream, (stream + 1) % 4, UhbrSettings { lanes, rate });
+                let (mut e, mut sink) = fixture(
+                    stream,
+                    (stream + 1) % 4,
+                    UhbrSettings {
+                        lanes,
+                        rate,
+                        mst: false,
+                    },
+                );
                 let video = e.status.uhbr_video_running;
                 let a = run(e.start_dp_audio(path(2), info())).unwrap();
                 assert_eq!(a.endpoint, stream);

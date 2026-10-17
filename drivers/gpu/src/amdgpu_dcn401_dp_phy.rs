@@ -10,8 +10,9 @@ pub use dmub::{DpPhySettings, UhbrRate};
 #[path = "amdgpu_dcn401_dp_training.rs"]
 pub(super) mod training;
 pub use training::{
-    DpDriveSettings, DpFrontendReady, DpFrontendRequest, DpLinkStatus, DpLinkTrained,
-    DpTrainingError, DpVideoRunning, UhbrLinkTrained, UhbrPayload, UhbrSettings, UhbrVideoRunning,
+    uhbr_mst_rate, DpDriveSettings, DpFrontendReady, DpFrontendRequest, DpLinkStatus,
+    DpLinkTrained, DpTrainingError, DpVideoRunning, UhbrLinkTrained, UhbrPayload, UhbrSettings,
+    UhbrVideoRunning,
 };
 
 const LANES_MASK: u32 = 0x3e3e3e3e;
@@ -116,10 +117,14 @@ impl<I: Io> Engine<I> {
         // Another display's link, unless it is an MST link this display's
         // own (or attached) MST link record shares.
         let shared = s.mst & bit(phy) != 0
-            && self
+            && (self
                 .status
                 .dp_link_trained
-                .is_some_and(|l| l.phy.settings.mst && l.phy.path.transmitter == phy);
+                .is_some_and(|l| l.phy.settings.mst && l.phy.path.transmitter == phy)
+                || self
+                    .status
+                    .uhbr_link
+                    .is_some_and(|l| l.settings.mst && l.path.transmitter == phy));
         if (s.transmitters & bit(phy) != 0 && !shared)
             || frontend.is_some_and(|f| s.streams & bit(f) != 0)
             || timing.is_some_and(|p| s.pipes & bit(p) != 0)
@@ -167,7 +172,9 @@ impl<I: Io> Engine<I> {
         // display's and 128b/132b siblings'.
         let routes = self.read(l.link_clock)?;
         if (0..4u8).any(|i| {
-            hpo != Some(i) && self.displays.siblings.hpo & bit(i) == 0 && routes >> (4 * i) & 8 != 0
+            hpo != Some(i)
+                && self.displays.siblings.hpo_links & bit(i) == 0
+                && routes >> (4 * i) & 8 != 0
         }) {
             return Err(Error::Busy);
         }

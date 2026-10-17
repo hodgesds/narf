@@ -957,6 +957,7 @@ fn dcn401_hdmi_link_starts_beside_another_display() -> TestResult {
         transmitters: 1 << 0,
         streams: 1 << 0,
         hpo: 0,
+        hpo_links: 0,
         frl: false,
         mst: 0,
         live: [None; 4],

@@ -830,7 +830,6 @@ impl ColdBoot {
                 .as_mut()
                 .map_err(|e| *e)?
                 .attach_mst_link(path.transmitter)
-                .map(|_| ())
         }
     }
     /// Detach the selected display from the port's MST link.
@@ -1828,6 +1827,90 @@ impl ColdBoot {
                 .stop_uhbr_video(
                     self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
                     &mut self.sequence.backend.dmub,
+                    path,
+                )
+                .await
+        }
+    }
+    /// Prepare the selected display's MST stream on the port's 128b/132b
+    /// MST link through HPO stream encoder `stream`, from `pipe`'s prepared
+    /// timing, blank, for a payload of `slots`.
+    /// # Safety
+    /// Fulfil `Otg::prepare_uhbr_mst_stream` obligations.
+    pub async unsafe fn prepare_display_uhbr_mst_stream(
+        &mut self,
+        port: usize,
+        stream: u8,
+        pipe: u8,
+        slots: u8,
+    ) -> Result<otg::UhbrVideoRunning, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: retained matching owners; caller excludes external writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .prepare_uhbr_mst_stream(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    path,
+                    stream,
+                    pipe,
+                    slots,
+                )
+                .await
+        }
+    }
+    /// Unblank the selected display's prepared 128b/132b MST stream.
+    /// # Safety
+    /// Fulfil `Otg::start_uhbr_mst_video` obligations.
+    pub async unsafe fn start_display_uhbr_mst_video(
+        &mut self,
+        port: usize,
+    ) -> Result<otg::UhbrVideoRunning, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: the caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .start_uhbr_mst_video(path)
+                .await
+        }
+    }
+    /// Blank the selected display's running 128b/132b MST stream.
+    /// # Safety
+    /// Fulfil `Otg::blank_uhbr_mst_video` obligations.
+    pub async unsafe fn blank_display_uhbr_mst_video(
+        &mut self,
+        port: usize,
+    ) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: the caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .blank_uhbr_mst_video(path)
+                .await
+        }
+    }
+    /// Stop the selected display's blanked 128b/132b MST stream, its
+    /// payload removed.
+    /// # Safety
+    /// Fulfil `Otg::stop_uhbr_mst_stream` obligations.
+    pub async unsafe fn stop_display_uhbr_mst_stream(
+        &mut self,
+        port: usize,
+    ) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: the caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .stop_uhbr_mst_stream(
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
                     path,
                 )
                 .await
