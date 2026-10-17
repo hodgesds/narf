@@ -328,6 +328,14 @@ impl GemState {
         handle >= HANDLE_BASE && self.get(handle).is_some()
     }
 
+    /// The object an `mmap` of `len` bytes at `offset` maps, which the
+    /// mapping holds until it is torn down (`FileOps::mmap_lifetime`), as
+    /// Linux's VMA holds its GEM object.
+    pub fn mapping_object(&self, offset: u64, len: usize) -> Option<Arc<GemObject>> {
+        let handle = u32::try_from(offset >> 12).ok()?;
+        self.get(handle).filter(|o| len as u64 <= o.byte_len)
+    }
+
     /// Resolve an `mmap` offset to the object's physical frames.
     ///
     /// The offset is the handle shifted by the page shift, which is how the

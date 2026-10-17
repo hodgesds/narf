@@ -3545,7 +3545,8 @@ paths; only the tables differ.
   `store_u64` read and write 8 bytes through the kernel's own mapping.
 - Lifetimes: each VA mapping record holds its buffer (`Arc<GemObject>`, as
   `amdgpu_bo_va` holds its BO), so `GEM_CLOSE` cannot free pages the tables
-  still point at. CLEAR and REPLACE split partly covered mappings
+  still point at; a CPU mapping holds it too (`GemState::mapping_object`,
+  the card and render nodes' `mmap_lifetime`), as a VMA holds its object. CLEAR and REPLACE split partly covered mappings
   (`amdgpu_vm_bo_clear_mappings`): the remainders keep their records,
   offsets and entries; only the covered range's entries are cleared.
   Once a job ran in an address space (`VmState::note_job`), what it drops —

@@ -550,6 +550,14 @@ impl FileOps for DriCardFile {
         if let Some(lease) = retain_dumb_mapping(self.index, offset, len) {
             return Some(lease as Arc<dyn MmapLifetime>);
         }
+        if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+            // The mapping holds the buffer: GEM_CLOSE must not free pages a
+            // process still maps.
+            return self
+                .amdgpu_gem
+                .mapping_object(offset, len)
+                .map(|object| object as Arc<dyn MmapLifetime>);
+        }
         if crate::drm_registry::driver_name(self.index) != Some("virtio_gpu") {
             return None;
         }
@@ -1118,6 +1126,13 @@ impl FileOps for DriRenderFile {
     }
 
     fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>> {
+        if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+            // As on the card node: the mapping holds the buffer.
+            return self
+                .amdgpu_gem
+                .mapping_object(offset, len)
+                .map(|object| object as Arc<dyn MmapLifetime>);
+        }
         if crate::drm_registry::driver_name(self.index) != Some("virtio_gpu") {
             return None;
         }

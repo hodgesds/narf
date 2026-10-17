@@ -13008,3 +13008,53 @@ kernel_test_in!(
     "drivers/gpu/amdgpu_gem",
     smoke_amdgpu_gem_metadata_round_trips
 );
+
+/// A CPU mapping holds its buffer (`GemState::mapping_object`, which the
+/// render and card nodes hand the mapping as its lifetime): GEM_CLOSE drops
+/// the handle, but the pages stay until the mapping goes.
+fn smoke_amdgpu_gem_mapping_outlives_gem_close() -> TestResult {
+    use crate::amdgpu_gem::{dispatch, GemState};
+    use crate::amdgpu_uapi as u;
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+    let state = GemState::new();
+    let mut req = [0u8; 32];
+    req[0..8].copy_from_slice(&8192u64.to_le_bytes());
+    req[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        req.as_mut_ptr() as usize,
+        &state,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE");
+    }
+    let handle = u32::from_le_bytes(req[0..4].try_into().unwrap());
+    let offset = u64::from(handle) << 12;
+    if state.mapping_object(offset, 8193).is_some() {
+        return TestResult::Fail("a mapping past the buffer");
+    }
+    let Some(mapping) = state.mapping_object(offset, 8192) else {
+        return TestResult::Fail("the mapping's buffer");
+    };
+    let weak = alloc::sync::Arc::downgrade(&mapping);
+    let mut close = [0u8; 8];
+    close[0..4].copy_from_slice(&handle.to_le_bytes());
+    if dispatch(0x09, close.as_mut_ptr() as usize, &state).is_err()
+        || state.object(handle).is_some()
+    {
+        return TestResult::Fail("GEM_CLOSE");
+    }
+    if weak.upgrade().is_none() {
+        return TestResult::Fail("pages freed under a live mapping");
+    }
+    drop(mapping);
+    if weak.upgrade().is_some() {
+        return TestResult::Fail("pages kept after the mapping went");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_gem",
+    smoke_amdgpu_gem_mapping_outlives_gem_close
+);
