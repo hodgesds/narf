@@ -961,11 +961,14 @@ and logging; mode1 device recovery with a full cold-boot re-init exists behind
 an explicit opt-in API (display stays dark; training boots refuse it).
 GFXOFF, clock/power gating, memory/fabric DPM and deep sleep remain disabled
 behind a typed policy hook that states their display-admission requirements.
+VCN 3.0 now starts both discovered instances after the fence stage (Linux's
+static, power-gating-disabled path with PSP-loaded TMR images, VCPU reset
+retries, decode/encode ring and IB tests, IH-routed fences) plus JPEG 3.0 with
+a ring test; PSP loads one VCN image per unharvested instance (type 13/58)
+from the discovery harvest table, and media failures leave the boot degraded.
 These are software-tested foundations; training resume,
-VCN startup, display-aware DPM,
-hardware boot, general GPU mappings/GFX10 queue initialization, production
-SDMA submissions/interrupts and DCN3.0
-modesetting remain open. See the
+media submission/DPG, display-aware DPM, user command submission,
+hardware boot and DCN3.0 modesetting remain open. See the
 [PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).
 
 1. **Stage 5 laptop proof:** boot from USB on Renoir/Lucienne or Phoenix

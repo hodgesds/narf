@@ -145,6 +145,23 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
     amdgpu::claim_navi22(|gpu| {
         // Validate/copy every file before inspecting hardware or claiming VRAM.
         let mut firmware = boot::Firmware::open(gpu, &registry).map_err(Error::Firmware)?;
+        // amdgpu_discovery_harvest_ip: VCN instances absent from the harvest
+        // table get firmware and an owner. An unreadable table disables
+        // media only; display and queue bring-up do not depend on it.
+        // SAFETY: single-CPU boot under the exclusive claim, same mappings
+        // and index latch probe used for the discovery read.
+        match unsafe { crate::amdgpu_vcn_navi22::Harvest::read(gpu, &authority, identity.revision) }
+        {
+            Ok(harvest) => firmware.harvest_vcn(harvest.0),
+            Err(error) => {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi22 media disabled: harvest {error:?}"
+                );
+                firmware.harvest_vcn(3);
+            }
+        }
         firmware
             .prepare_power(gpu, identity)
             .map_err(Error::Firmware)?;
@@ -198,9 +215,18 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         // a usable BAR2 doorbell page the queue stages are skipped, visibly.
         // SAFETY: boot-time exclusive PCI ownership; BAR2 is otherwise unused.
         match unsafe { crate::amdgpu_cp_navi22::Doorbells::map_navi22(&device) } {
-            Ok(doorbells) => prepared
-                .prepare_queues(doorbells)
-                .map_err(Error::Firmware)?,
+            Ok(doorbells) => {
+                prepared
+                    .prepare_queues(doorbells)
+                    .map_err(Error::Firmware)?;
+                if let Err(error) = prepared.prepare_media(doorbells) {
+                    use core::fmt::Write;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: navi22 media disabled: {error:?}"
+                    );
+                }
+            }
             Err(error) => {
                 use core::fmt::Write;
                 let _ = writeln!(

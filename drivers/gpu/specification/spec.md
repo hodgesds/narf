@@ -3095,8 +3095,12 @@ thermal interrupts or override board frequencies, voltages or fan curves.
 `navy_flounder_{sdma,ce,pfp,me,mec,mec2,rlc,vcn,dmcub}.bin` set through live registry/blob
 capabilities before any device I/O. Device gating requires PCI `1002:73df`,
 GC 10.3.2, MP1 11.0.11, SDMA0 5.2.2 and DCN 3.0.0, with unique instance-zero
-records, plus a single VCN 3.0.0/3.0.64/3.0.192 instance. Other media layouts
-are refused; VCN 3.0.16 uses different firmware and is not Navy Flounder.
+records, plus VCN instance 0 at 3.0.0/3.0.64/3.0.192 and an optional instance 1
+(any VCN 3.0.x, 3.0.1 on Navy Flounder; Linux keys only on instance 0). Duplicate,
+out-of-range or instance-1-only layouts are refused; VCN 3.0.16 uses different
+firmware and is not Navy Flounder. `vcn_instances()` returns the instance mask
+and `harvest_vcn(mask)` removes harvested instances before any device I/O
+(`adev->vcn.harvest_config`).
 Only MEC2 may be absent, and only a registry `NotFound` result is optional;
 signature, parsing, allocation and authority failures propagate. Immutable
 copies outlive the capability invocations. `images()` returns validated views
@@ -3120,7 +3124,10 @@ byte offsets. Upload order is tap-delay sections (v2.4), restore control/GPM/SRM
 IRAM/DRAM, P/V (v2.3), then RLC_G. Empty optional sections are omitted; register
 list metadata is validated but never submitted as firmware. Nonempty P/V fields
 in v2.4 are rejected because Linux does not load them in that revision.
-VCN submits the complete common-header microcode payload as PSP type 13.
+VCN submits the complete common-header microcode payload once per unharvested
+instance, as PSP type 13 (`UCODE_ID_VCN`) for instance 0 and 58
+(`UCODE_ID_VCN1`) for instance 1 (`amdgpu_vcn_setup_ucode`); with both
+harvested no VCN payload is sent. `Image::for_vcn_instances(mask)` selects them.
 DMCUB submits only `inst_const_bytes` as type 51, retaining PSP packaging and
 excluding BSS/data; its instruction/data sizes must exactly cover the payload.
 Both media payloads must end at the declared file boundary.
@@ -3137,7 +3144,7 @@ commands quarantine staging/ring/TMR, and teardown still requires independent
 reset of every firmware consumer before TMR destruction.
 
 `Accepted` means PSP acknowledged autoload and both media uploads.
-`media_firmware()` returns `MediaFirmware { vcn, dmcub }` GPU entry addresses
+`media_firmware()` returns `MediaFirmware { vcn, dmcub, vcn1 }` GPU entry addresses
 from completed PSP replies; each must be dword aligned and inside this
 session's retained TMR. Partial failures retain any earlier valid address for
 diagnostics. These are not CPU pointers or proof that the media engines have
@@ -3471,6 +3478,49 @@ false, so `smu_features()` adds no bits and `gfxoff()`/`clock_gating()` stay
 false. Nothing calls it. The DCN-owned `Smu::enable_display_power` remains the
 only path that adds UCLK/FCLK DPM, under its own contract.
 
+### Navi 22 VCN 3.0 and JPEG 3.0
+
+`amdgpu_discovery::parse_vcn_harvest(blob)` returns the harvested VCN mask from
+the discovery `HARVEST_INFO` table (zero offset: none; bad signature/checksum:
+`BadHarvestTable`). `amdgpu_vcn_navi22::Harvest::navi22(table, revision)` adds
+Linux's Navy Flounder VCN1 quirk (revisions C1/C2/C3/C5/C7/CF/DF);
+`unsafe Harvest::read(gpu, pci_cap, revision)` re-reads the 10 KiB discovery
+copy at boot. The platform applies it to the firmware set; an unreadable table
+disables media only.
+
+`unsafe Media::new(gpu, pci_cap, pool, doorbells, instances, firmware_bytes)`
+resolves each instance's VCN BASE_IDX 0/1 banks from discovery (3.0.0 at
+0x7800/0x7E00, 3.0.1 at 0x7B00/0x12000), GC/NBIO/HDP, and reserves per instance
+the VCPU BO (128 KiB stack, 512 KiB context, 4 KiB fw_shared), 4 KiB decode and
+two encode rings, writeback and IB-test buffers (below 2^40), plus an 8 KiB JPEG
+ring when instance 0 exists. No I/O. Doorbells are 32-bit: decode
+`0x310 + 8i`, encode j `0x312 + j + 8i`, JPEG `0x311`, with NBIO MMSCH0/1
+ranges (size 8). `unsafe start(MediaFirmware, Option<PowerStatus>)` refuses a
+missing per-instance TMR address or a running SMU MM_DPM_PG feature before any
+write, then per instance zeroes the BO, sets fw_shared flags, programs the
+range and runs `vcn_v3_0_start`'s static path with power gating disabled
+(PGFSM all tiles on, no UVD_PG_EN; Linux's default DPG mode is not used),
+MGCG-style clock-gating disable, PSP-TMR cache window 0, VCPU boot with Linux's
+10-reset retry loop (100 × 10 ms samples each), decode RBC and both encode
+rings, then the SCRATCH9 decode and VCN_ENC_CMD_END encode ring tests.
+`unsafe start_jpeg()` honours CC_UVD_HARVESTING, powers UVDJ on and runs
+`jpeg_v3_0_start` plus the JPEG pitch ring test. `test_ib()` runs the decoder
+create/destroy message pair and the encoder session initialize/close pair on
+every started ring and waits (1 s) for the fences; register waits are bounded
+by 100 ms. `unsafe stop()` runs `vcn_v3_0_stop`/`jpeg_v3_0_stop` without
+re-enabling power gating. Each operation has one predecessor state;
+failure, cancellation, revocation and device loss are terminal and retain
+published memory. `status()` returns `Status { state, jpeg, proof }`.
+`route_interrupts(ih, status)` subscribes the started rings' VCN/VCN1
+(client 0x10/0x0e: 124 decode, 119/120 encode) and JPEG (153) sources and
+forwards them to `amdgpu_fence_navi22::Engine::{Vcn0, Vcn1, Jpeg}`.
+
+`amdgpu_video_caps_navi22::{codecs, caps}(kind, harvested)` return Linux's
+Sienna Cichlid `AMDGPU_INFO_VIDEO_CAPS` tables (decode VCN0 with AV1, or VCN1
+when VCN0 is harvested; encode AVC 4096² and HEVC 8192×4352) as
+`DrmAmdgpuInfoVideoCaps`; `None` for an unknown subquery or no VCN. Not yet
+wired into the INFO ioctl.
+
 ### Navi 22 DCN3.0 DMUB startup
 
 `amdgpu_dmub_navi22::Prepared::new(image, vbios, psp_version)` parses the
@@ -3604,7 +3654,9 @@ ring creation → trusted-memory setup → SMC upload → SMU version handshake 
 optional board PowerPlay upload → optional DMUB quiesce → graphics upload/autoload → RLC boot check →
 optional board calibration/protected GFX DPM setup → optional memory hubs →
 optional GART → optional IH enable → optional SDMA execution test → optional SDMA TRAP
-interrupt round trip → optional DMUB start.
+interrupt round trip → optional DMUB start → optional kernel queues → fence
+interrupts → optional VCN start/ring tests (`Media`) → JPEG (`Jpeg`) → VCN IB
+tests (`MediaIbTests`).
 Production cold boot emits a serial `start` and terminal `complete` or
 `failed` checkpoint for each stage. A pending/cancelled stage emits no false
 completion; checkpoints do not run per poll or write training-owned framebuffer
@@ -3648,6 +3700,11 @@ when BAR2 maps. After `DmubStart` the stages `Doorbells`, `GfxSetup`, `Kiq`,
 `nv_common_hw_init`, `gfx_v10_0_hw_init`/`cp_resume`, `sdma_v5_2_start` and
 `amdgpu_ib_ring_tests` order; `Report::queues` is set only when all pass and
 failures are reported as `Error::Queues`.
+`ColdBoot::prepare_media(doorbells)` reserves the VCN/JPEG owner after the
+queues for the firmware set's unharvested VCN mask (nothing when both are
+harvested); `Firmware::harvest_vcn(mask)` applies the mask first. The media
+stages fail the boot only on device loss or revoked authority; every other
+error is printed as `degraded` and the owner retained in `Report::media`.
 `Firmware::prepare_power(gpu, Identity)` prepares the board table before the
 session is constructed; production boot requires it, while explicit
 firmware-only callers may omit it. The bootstrap owner is dropped only
@@ -3663,14 +3720,14 @@ owned by hardware through the underlying owners' existing rules.
 Success returns `Report { reset: Option<reset::Report>, smu: Versions, gfx: GfxBootStatus, power: Option<Info>,
 power_status: Option<PowerStatus>, media_firmware: MediaFirmware,
 memory_aperture: Option<Aperture>, sdma: Option<Proof>, dmub: Option<Status>,
-interrupts: Option<amdgpu_ih_navi22::Status> }`;
+interrupts: Option<amdgpu_ih_navi22::Status>, media: Option<amdgpu_vcn_navi22::Status> }`;
 `power` is populated only when the prepared table was uploaded. The session must
 stay alive, or `take_psp()` can transfer its live ring/TMR owner to subsequent
 GPU initialization after full success; that changes state to `Released` and
 prevents a second transfer/run. `gfx_boot_status()` exposes the retained last
 GC sample before transfer, including on failure. These observations do not set
 `AmdGpu::fw_loaded`. Display-aware memory/link DPM, OS thermal interrupts,
-general GPU mappings/queues, VCN startup and real-card validation remain
+general GPU mappings/queues, media submission and real-card validation remain
 separate work.
 
 `ColdBoot::dmub_hpd`, `dmub_aux` and `dmub_notification` expose the typed runtime

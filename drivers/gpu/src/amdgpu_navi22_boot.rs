@@ -27,6 +27,7 @@ pub enum Error {
     Queues(crate::amdgpu_cp_navi22::Error),
     Reset(crate::amdgpu_reset_navi22::Error),
     Interrupts(crate::amdgpu_ih_navi22::Error),
+    Media(crate::amdgpu_vcn_navi22::Error),
 }
 /// All files are validated and copied before the first device operation.
 #[derive(Debug)]
@@ -50,6 +51,11 @@ impl Firmware {
             power: None,
             dmub: None,
         })
+    }
+    /// Remove harvested VCN instances (`adev->vcn.harvest_config`) before PSP
+    /// receives the graphics set; the media owner follows the same mask.
+    pub fn harvest_vcn(&mut self, harvested: u8) {
+        self.graphics.harvest_vcn(harvested);
     }
     /// Prepare DCN3.0's nonsecure DMUB storage before starting any hardware.
     pub fn prepare_dmub(&mut self, gpu: &AmdGpu) -> Result<(), Error> {
@@ -108,8 +114,11 @@ pub enum Stage {
     SdmaQueues,
     IbTests,
     FenceInterrupts,
+    Media,
+    Jpeg,
+    MediaIbTests,
 }
-const STAGES: [Stage; 26] = [
+const STAGES: [Stage; 29] = [
     Stage::ResetOnInit,
     Stage::MemoryTraining,
     Stage::Sos,
@@ -139,8 +148,16 @@ const STAGES: [Stage; 26] = [
     Stage::GfxRing,
     Stage::SdmaQueues,
     Stage::IbTests,
-    // Last: arms EOP/trap interrupts and routes them to fence waiters.
+    // Arms EOP/trap interrupts and routes them to fence waiters.
     Stage::FenceInterrupts,
+    // vcn_v3_0_hw_init, jpeg_v3_0_hw_init, then the multimedia part of
+    // amdgpu_ib_ring_tests. Linux runs VCN/JPEG hw_init after GFX/SDMA in
+    // the same phase-2 pass; here they follow every display, queue and fence
+    // proof so a media fault cannot delay or alter them, and the IB tests
+    // already have IH-routed fences. Each media stage is non-fatal.
+    Stage::Media,
+    Stage::Jpeg,
+    Stage::MediaIbTests,
 ];
 /// INT_CONTEXT of the boot SDMA0 TRAP round trip.
 const TRAP_CONTEXT: u32 = 0x0675_0022;
@@ -161,6 +178,8 @@ pub struct Report {
     /// Kernel GFX/compute/SDMA ring and IB tests passed.
     pub queues: Option<crate::amdgpu_cp_navi22::QueueProof>,
     pub interrupts: Option<crate::amdgpu_ih_navi22::Status>,
+    /// VCN/JPEG owner state; failures there leave the boot degraded only.
+    pub media: Option<crate::amdgpu_vcn_navi22::Status>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(
@@ -239,6 +258,7 @@ struct Hardware {
     dmub: Option<crate::amdgpu_dmub_navi22::Dmub>,
     queues: Option<Queues>,
     ih: Option<crate::amdgpu_ih_navi22::Ih>,
+    media: Option<crate::amdgpu_vcn_navi22::Media>,
 }
 /// Kernel queue owners, retained through success, failure and cancellation.
 #[derive(Debug)]
@@ -355,6 +375,26 @@ fn fatal(error: Error) -> bool {
                     | ih::Error::Closed(ih::Closed::DeviceLost | ih::Closed::AuthorityRevoked)
             )
     )
+}
+/// Device loss and revoked authority stop the boot; every other media
+/// failure is logged and the owner retained (quarantined), like InterruptTest.
+fn media_result(
+    stage: Stage,
+    result: Result<(), crate::amdgpu_vcn_navi22::Error>,
+) -> Result<(), Error> {
+    use crate::amdgpu_vcn_navi22::Error as Vcn;
+    match result {
+        Ok(()) => Ok(()),
+        Err(error @ (Vcn::DeviceGone | Vcn::Revoked)) => Err(Error::Media(error)),
+        Err(error) => {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 {stage:?}: degraded {error:?}"
+            );
+            Ok(())
+        }
+    }
 }
 async fn trap_round_trip(
     ih: &mut crate::amdgpu_ih_navi22::Ih,
@@ -572,6 +612,45 @@ impl Backend for Hardware {
                     }
                 }
             }
+            Stage::Media => {
+                if let Some(media) = self.media.as_mut() {
+                    let firmware = self.psp.as_ref().ok_or(Error::Invalid)?.media_firmware();
+                    // SAFETY: PSP loaded these VCN images into the retained
+                    // TMR, both hubs and NBIF doorbells are up, and ColdBoot
+                    // owns the whole GPU. Power gating stays disabled.
+                    let result = unsafe { media.start(firmware, self.power_status).await };
+                    media_result(stage, result)?;
+                }
+            }
+            Stage::Jpeg => {
+                if let Some(media) = self.media.as_mut() {
+                    if media.status().jpeg == crate::amdgpu_vcn_navi22::JpegState::Prepared {
+                        // SAFETY: as for Media; JPEG uses VCN0's registers.
+                        let result = unsafe { media.start_jpeg().await };
+                        media_result(stage, result)?;
+                    }
+                }
+            }
+            Stage::MediaIbTests => {
+                if let Some(media) = self.media.as_mut() {
+                    if let Some(ih) = self.ih.as_ref() {
+                        let status = media.status();
+                        if let Err(error) =
+                            crate::amdgpu_vcn_navi22::route_interrupts(&ih.handle(), status)
+                        {
+                            use core::fmt::Write;
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "amdgpu: navi22 MediaIbTests: polling only {error:?}"
+                            );
+                        }
+                    }
+                    if media.status().state == crate::amdgpu_vcn_navi22::State::Running {
+                        let result = media.test_ib().await;
+                        media_result(stage, result)?;
+                    }
+                }
+            }
             Stage::Interrupts => {
                 if let Some(ih) = self.ih.as_mut() {
                     // SAFETY: VMID0 is ready, no engine raises interrupts yet,
@@ -632,6 +711,10 @@ impl Backend for Hardware {
                 .and_then(crate::amdgpu_gmc_navi22::Gmc::aperture),
             queues: self.queues.as_ref().and_then(Queues::proof),
             interrupts: self.ih.as_ref().map(crate::amdgpu_ih_navi22::Ih::status),
+            media: self
+                .media
+                .as_ref()
+                .map(crate::amdgpu_vcn_navi22::Media::status),
         })
     }
 }
@@ -705,6 +788,7 @@ impl ColdBoot {
                     dmub: None,
                     queues: None,
                     ih: None,
+                    media: None,
                 },
                 state: State::Prepared,
             },
@@ -752,6 +836,7 @@ impl ColdBoot {
                     dmub: None,
                     queues: None,
                     ih: None,
+                    media: None,
                 },
                 state: State::Prepared,
             },
@@ -883,6 +968,41 @@ impl ColdBoot {
             }
         };
         h.queues = Some(queues);
+        Ok(())
+    }
+    /// Reserve VCN/JPEG VCPU, ring and IB-test storage for the unharvested
+    /// VCN instances after the kernel queues (their doorbell page). No I/O;
+    /// a set with every VCN instance harvested prepares nothing.
+    pub fn prepare_media(
+        &mut self,
+        doorbells: crate::amdgpu_cp_navi22::Doorbells,
+    ) -> Result<(), Error> {
+        if self.sequence.state != State::Prepared || self.sequence.backend.media.is_some() {
+            return Err(Error::Busy);
+        }
+        let h = &mut self.sequence.backend;
+        if h.gmc.is_none() || h.queues.is_none() {
+            return Err(Error::Invalid);
+        }
+        let instances = h.firmware.graphics.vcn_instances();
+        if instances == 0 {
+            return Ok(());
+        }
+        let bytes = h.firmware.graphics.vcn_size().ok_or(Error::Invalid)?;
+        // SAFETY: forwarded whole-GPU/pool/BAR2 ownership; reservations only.
+        h.media = Some(
+            unsafe {
+                crate::amdgpu_vcn_navi22::Media::new(
+                    &h.gpu,
+                    h.authority,
+                    &h.pool,
+                    doorbells,
+                    instances,
+                    bytes,
+                )
+            }
+            .map_err(Error::Media)?,
+        );
         Ok(())
     }
     /// Reserve the IH ring/writeback and NBIO dummy page before run, after

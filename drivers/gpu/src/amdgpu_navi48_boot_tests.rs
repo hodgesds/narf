@@ -65,6 +65,7 @@ fn report() -> Report {
         media: psp::MediaFirmware {
             vcn: Some(0x800100000),
             dmcub: Some(0x800200000),
+            vcn1: None,
         },
         aperture: gmc::Aperture {
             start: 0xc00000000,

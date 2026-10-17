@@ -20,8 +20,12 @@ pub enum Engine {
     Kiq,
     Sdma0,
     Sdma1,
+    /// VCN instance decode/encode rings (one slot per instance) and JPEG.
+    Vcn0,
+    Vcn1,
+    Jpeg,
 }
-const ENGINES: usize = 5;
+const ENGINES: usize = 8;
 /// Interval between memory samples when no interrupt arrives.
 pub const POLL_US: u64 = 1000;
 
@@ -60,6 +64,9 @@ pub fn notify_all() {
         Engine::Kiq,
         Engine::Sdma0,
         Engine::Sdma1,
+        Engine::Vcn0,
+        Engine::Vcn1,
+        Engine::Jpeg,
     ] {
         notify(engine);
     }

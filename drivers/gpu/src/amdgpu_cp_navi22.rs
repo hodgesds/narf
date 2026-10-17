@@ -101,6 +101,10 @@ impl Doorbells {
     pub fn bus_address(&self) -> u64 {
         self.bus
     }
+    /// The permanent UC mapping, for owners that need 32-bit doorbells (VCN).
+    pub(crate) fn region(&self) -> MmioRegion {
+        self.map
+    }
 }
 
 /// GC BASE_IDX 0/1, NBIO BASE_IDX 2 and HDP bank byte offsets in BAR5.

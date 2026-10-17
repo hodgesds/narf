@@ -226,6 +226,9 @@ pub enum DiscoveryError {
     /// The GC table's `version_major` is one this parser has no field
     /// layout for. v1 (GFX10/11) and v2 (GFX9) are the two Linux defines.
     UnknownGcVersion(u16),
+    /// `table_list[HARVEST_INFO]` names a table whose signature or checksum
+    /// is wrong (Linux `amdgpu_discovery_table_check` refuses the binary).
+    BadHarvestTable,
 }
 
 // ── Output shape ──────────────────────────────────────────────────
@@ -490,6 +493,55 @@ pub fn parse_discovery(blob: &[u8]) -> Result<Vec<IpBlock>, DiscoveryError> {
     }
 
     Ok(blocks)
+}
+
+// ── Harvest table ──────────────────────────────────────────────────
+
+/// `HARVEST_TABLE_SIGNATURE` ("HARV"), discovery.h.
+pub const HARVEST_TABLE_SIGNATURE: u32 = 0x5652_4148;
+/// `sizeof(struct harvest_table)`: 8-byte header + 32 `harvest_info`.
+const HARVEST_TABLE_SIZE: usize = 8 + 32 * 4;
+
+/// Harvested VCN instances as a mask (bit i = instance i), as
+/// `amdgpu_discovery_read_from_harvest_table` builds `vcn.harvest_config`
+/// for every GC >= 10.2 part. A zero table offset means nothing is
+/// harvested (Linux logs and continues). A present table must carry the
+/// harvest signature and checksum (`amdgpu_discovery_table_check`). The
+/// list ends at the first zero `hw_id`. The Navy Flounder revision quirk
+/// (`amdgpu_discovery_harvest_config_quirk`) is applied by the caller.
+pub fn parse_vcn_harvest(blob: &[u8]) -> Result<u8, DiscoveryError> {
+    if blob.len() < BINARY_HEADER_SIZE {
+        return Err(DiscoveryError::Truncated);
+    }
+    if u32_at(blob, 0)? != BINARY_SIGNATURE {
+        return Err(DiscoveryError::BadSignature);
+    }
+    let entry = 12 + TABLE_HARVEST_INFO * 8;
+    let offset = u16_at(blob, entry)? as usize;
+    let checksum = u16_at(blob, entry + 2)?;
+    if offset == 0 {
+        return Ok(0);
+    }
+    let table = blob
+        .get(offset..offset + HARVEST_TABLE_SIZE)
+        .ok_or(DiscoveryError::OffsetOutOfBounds)?;
+    if u32_at(table, 0)? != HARVEST_TABLE_SIGNATURE || sum_bytes(table) != checksum {
+        return Err(DiscoveryError::BadHarvestTable);
+    }
+    let mut mask = 0u8;
+    for i in 0..32 {
+        let at = 8 + i * 4;
+        let hw_id = u16_at(table, at)?;
+        if hw_id == 0 {
+            break;
+        }
+        if hw_id == HW_ID_VCN {
+            // Linux shifts by number_instance unchecked; anything past the
+            // two VCN instances this parser models cannot be represented.
+            mask |= 1u8.checked_shl(u32::from(table[at + 2])).unwrap_or(0);
+        }
+    }
+    Ok(mask)
 }
 
 // ── GC info table ───────────────────────────────────────────────────
