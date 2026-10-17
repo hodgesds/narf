@@ -4582,6 +4582,18 @@ paths; only the tables differ.
   without a heap are buddy pages (SYSTEM|SNOOPED, identity IOMMU); a
   VRAM-only buffer on a full heap is `NoSpace`. `GemObject::{phys, gpu,
   system}` give the CPU-mapped address, the entry address and the kind.
+  A heap may also carry an `UnmappedHeap` (an `UnmappedPool` past the BAR
+  and a `VramClear` engine): a `NO_CPU_ACCESS` VRAM buffer goes there
+  first, falling back to the visible heap. It is cleared by
+  `VramClear::clear(fb-aperture address, bytes)` — clears complete in
+  queue order, and a refused clear fails the create — whose fence becomes
+  the buffer's KERNEL reservation fence. Such a buffer has `phys` 0 and
+  `cpu_visible()` false: `frames`, `mmap_frames`, `load_u64`/`store_u64`
+  refuse it. `GEM_MMAP` of any `NO_CPU_ACCESS` buffer is EPERM
+  (`OperationNotPermitted`), as amdgpu_gem_mmap_ioctl. `GEM_VA` MAP adds
+  the buffer's unsignalled KERNEL fences to its space
+  (`VmState::depend_on`), and `AMDGPU_CS` waits for the space's
+  `VmState::kernel_fences()` before queueing.
 - PRIME (`drm_devfs_bridge::AmdgpuDmaBufFile`): `PRIME_HANDLE_TO_FD` on an
   amdgpu card or render open exports a GEM buffer as a dma-buf that holds
   it (pages outlive every handle while the fd or a mapping of it lives),
@@ -4642,7 +4654,8 @@ paths; only the tables differ.
   the ioctl waits for every unsignalled fence on the reservation of each
   listed BO and of the user-fence BO, except fences of the open's own
   address space (`DrmFence::owner` == `VmState::owner`,
-  `AMDGPU_SYNC_NE_OWNER`) and except on `EXPLICIT_SYNC` buffers; the job
+  `AMDGPU_SYNC_NE_OWNER`); on `EXPLICIT_SYNC` buffers only KERNEL fences
+  are waited for; the job
   then becomes each of those BOs' WRITE fence. A BO the job does not list
   gets no fence, as in Linux.
 - `amdgpu_bo_list`: `dispatch(cmd, arg, &BoListTable, &GemState)` is

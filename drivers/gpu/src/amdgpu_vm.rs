@@ -550,6 +550,24 @@ pub struct VmState {
     /// A card-wide identity for VMID reuse (`amdgpu_vmid::VmidManager`),
     /// never shared with another space; assigned on first use.
     owner: core::sync::atomic::AtomicU64,
+    /// Kernel work mapped buffers wait on (a clear of fresh VRAM), which
+    /// every job in this space waits for: Linux's VM update syncs to its
+    /// BOs' KERNEL fences, and each job to the VM update.
+    kernel_fences: KernelFences,
+}
+
+/// [`VmState`]'s kernel fences (`dyn DrmFence` has no `Debug`).
+struct KernelFences(IrqSafeSpinLock<Vec<alloc::sync::Arc<dyn narf_filesystem::DrmFence>>>);
+impl core::ops::Deref for KernelFences {
+    type Target = IrqSafeSpinLock<Vec<alloc::sync::Arc<dyn narf_filesystem::DrmFence>>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl core::fmt::Debug for KernelFences {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} kernel fences", self.0.lock().len())
+    }
 }
 
 impl Drop for VmState {
@@ -617,6 +635,27 @@ impl VmState {
             .unwrap_or_default()
     }
 
+    /// Make every later job in this space wait for `fences` too.
+    pub fn depend_on(&self, fences: Vec<alloc::sync::Arc<dyn narf_filesystem::DrmFence>>) {
+        if !fences.is_empty() {
+            self.kernel_fences.lock().extend(fences);
+        }
+    }
+
+    /// The kernel fences a job here must still wait for, forgetting those
+    /// that have signalled.
+    pub fn kernel_fences(&self) -> Vec<alloc::sync::Arc<dyn narf_filesystem::DrmFence>> {
+        let held = self.kernel_fences.lock().clone();
+        // Sampled unlocked: a driver fence may take its device's locks.
+        let (done, pending): (Vec<_>, Vec<_>) = held.into_iter().partition(|f| f.is_signalled());
+        if !done.is_empty() {
+            self.kernel_fences
+                .lock()
+                .retain(|f| !done.iter().any(|d| alloc::sync::Arc::ptr_eq(d, f)));
+        }
+        pending
+    }
+
     /// The last job submitted in this space on each ring that ran one.
     pub fn last_jobs(&self) -> Vec<u64> {
         self.last_job
@@ -655,6 +694,7 @@ impl VmState {
             pasid: IrqSafeSpinLock::new(None),
             tlb_seq: core::sync::atomic::AtomicU64::new(0),
             owner: core::sync::atomic::AtomicU64::new(0),
+            kernel_fences: KernelFences(IrqSafeSpinLock::new(Vec::new())),
         }
     }
 
@@ -1005,6 +1045,13 @@ pub fn dispatch(
                 }
                 return Err(error);
             }
+            // Jobs that can now reach the buffer wait for its kernel work.
+            vm.depend_on(
+                object
+                    .dma_buf()
+                    .resv
+                    .fences(narf_filesystem::dma_buf::DmaResvUsage::Kernel),
+            );
         }
         // The buffer outlives its entries: amdgpu_vm_bo_unmap only moves the
         // mapping to the freed list; amdgpu_vm_clear_freed clears the PTEs

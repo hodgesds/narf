@@ -1686,6 +1686,7 @@ impl ColdBoot {
                 pool,
                 fb_base,
                 fb_offset,
+                unmapped: None,
             },
         ))
     }

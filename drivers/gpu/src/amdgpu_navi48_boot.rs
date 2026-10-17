@@ -837,6 +837,7 @@ impl ColdBoot {
                 pool: heap,
                 fb_base: context.fb_base,
                 fb_offset: context.fb_offset,
+                unmapped: None,
             },
         );
         self.client_vram = Some(chunk);

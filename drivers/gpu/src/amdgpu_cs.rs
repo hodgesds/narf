@@ -986,7 +986,7 @@ pub async fn dispatch_async(
     // reservation — the listed BOs and the user fence BO — skipping fences
     // of this address space's own jobs (AMDGPU_SYNC_NE_OWNER) and every
     // fence on an EXPLICIT_SYNC buffer (AMDGPU_SYNC_EXPLICIT; there are no
-    // move fences here). A buffer the job does not list is not synced and
+    // move fences here) except its KERNEL ones. A buffer the job does not list is not synced and
     // gets no fence, as in Linux; VM_ALWAYS_VALID buffers share the root
     // reservation, which holds only this space's jobs.
     let own = vm.owner();
@@ -995,13 +995,13 @@ pub async fn dispatch_async(
         .chain(user_fence.as_ref().map(|(o, _)| o))
         .collect();
     for object in &locked {
-        if object.flags & u64::from(uapi::AMDGPU_GEM_CREATE_EXPLICIT_SYNC) != 0 {
-            continue;
-        }
-        let fences = object
-            .dma_buf()
-            .resv
-            .fences(narf_filesystem::dma_buf::DmaResvUsage::Bookkeep);
+        // An EXPLICIT_SYNC buffer still waits for kernel work on it.
+        let usage = if object.flags & u64::from(uapi::AMDGPU_GEM_CREATE_EXPLICIT_SYNC) != 0 {
+            narf_filesystem::dma_buf::DmaResvUsage::Kernel
+        } else {
+            narf_filesystem::dma_buf::DmaResvUsage::Bookkeep
+        };
+        let fences = object.dma_buf().resv.fences(usage);
         for fence in fences {
             if fence.owner() == Some(own) {
                 continue;
@@ -1009,6 +1009,13 @@ pub async fn dispatch_async(
             while !fence.is_signalled() {
                 nap().await;
             }
+        }
+    }
+    // Kernel work on buffers mapped in this space (a clear of fresh VRAM)
+    // lands before any job here runs, listed or not.
+    for fence in vm.kernel_fences() {
+        while !fence.is_signalled() {
+            nap().await;
         }
     }
     let seq = engine.submit(vm, &submission).await?;

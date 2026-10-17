@@ -32,11 +32,18 @@
 //! is physically contiguous system memory from the buddy allocator, which
 //! the GPU reaches as SYSTEM pages (the IOMMU runs identity mappings).
 //!
+//! A `NO_CPU_ACCESS` buffer goes first to the heap's VRAM past the BAR
+//! ([`UnmappedHeap`]), when the card has some. The CPU cannot clear that, so
+//! the card's engine does ([`VramClear`]), and the clear's fence becomes the
+//! buffer's KERNEL fence: every job that may touch the buffer waits for it
+//! (`amdgpu_cs`, `GEM_VA`), as Linux attaches amdgpu_fill_buffer's fence to
+//! the new BO. Such a buffer has no CPU mapping at all.
+//!
 //! LINUX-GAP: there is no TTM: no eviction, no migration between GTT and
-//! VRAM, and no `GEM_CREATE_VRAM_CONTIGUOUS`/`NO_CPU_ACCESS` distinction
-//! (every VRAM buffer is contiguous and CPU-visible). `preferred_domains` is
-//! recorded and reported back by `GEM_OP` so userspace sees its own request,
-//! not a rewritten one.
+//! VRAM, and no `GEM_CREATE_VRAM_CONTIGUOUS` distinction (every VRAM buffer
+//! is contiguous; only a `NO_CPU_ACCESS` one may be invisible).
+//! `preferred_domains` is recorded and reported back by `GEM_OP` so userspace
+//! sees its own request, not a rewritten one.
 //!
 //! LINUX-GAP: `GEM_WAIT_IDLE` always reports idle immediately. That is
 //! currently true — there is no submission path, so nothing can be busy — but
@@ -77,6 +84,32 @@ pub struct VramHeap {
     pub pool: crate::amdgpu_vram::Pool,
     pub fb_base: u64,
     pub fb_offset: u64,
+    /// The card's VRAM past the CPU-visible BAR, if it has some to give.
+    pub unmapped: Option<UnmappedHeap>,
+}
+
+/// VRAM no CPU mapping reaches, for `NO_CPU_ACCESS` buffers, and the engine
+/// that clears it.
+#[derive(Clone, Debug)]
+pub struct UnmappedHeap {
+    pub pool: crate::amdgpu_vram::UnmappedPool,
+    pub clear: Arc<dyn VramClear>,
+}
+
+/// Clears VRAM the CPU cannot reach.
+pub trait VramClear: Send + Sync + core::fmt::Debug {
+    /// Queue zeroing `bytes` of VRAM at framebuffer-aperture address
+    /// `address`. The fence signals once the zeros have landed; nothing
+    /// may read the range before then. An error queued nothing.
+    ///
+    /// Clears complete in the order they were queued, so a range freed
+    /// before its clear ran is safe to hand out again: its next clear, and
+    /// so its next owner, comes after.
+    fn clear(
+        &self,
+        address: u64,
+        bytes: u64,
+    ) -> Result<Arc<dyn narf_filesystem::DrmFence>, FsError>;
 }
 
 /// Each DRM card's client VRAM heap, by card index.
@@ -160,13 +193,18 @@ enum Backing {
     Vram {
         _held: crate::amdgpu_vram::Reservation,
     },
+    /// VRAM past the BAR, which the CPU cannot reach; returned on drop.
+    Unmapped {
+        _held: crate::amdgpu_vram::UnmappedReservation,
+    },
 }
 
 /// One buffer object: a contiguous physical allocation plus what the client
 /// asked for when it created it.
 #[derive(Debug)]
 pub struct GemObject {
-    /// What the CPU maps: the system pages, or the buffer's BAR window.
+    /// What the CPU maps: the system pages, or the buffer's BAR window
+    /// (0 for a buffer past the BAR, which the CPU cannot map).
     pub phys: u64,
     /// What the GPU's page-table entries carry: the system pages' address,
     /// or the physical VRAM address.
@@ -210,6 +248,7 @@ impl GemObject {
                 narf_memory::PhysAddr::new(self.phys + offset).kernel_mut_ptr::<u8>()
             }
             Backing::Vram { _held } => (_held.mapping().virt + offset) as *mut u8,
+            Backing::Unmapped { .. } => return None,
         })
     }
 
@@ -242,9 +281,17 @@ impl GemObject {
         &self.dma_buf
     }
 
+    /// Whether the CPU can map the buffer (it is not past the BAR).
+    pub fn cpu_visible(&self) -> bool {
+        !matches!(self.backing, Backing::Unmapped { .. })
+    }
+
     /// The physical frames backing `len` bytes from byte `offset`, both
     /// page aligned and inside the buffer, for a CPU mapping.
     pub fn frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
+        if !self.cpu_visible() {
+            return Err(FsError::OperationNotPermitted);
+        }
         let len = len as u64;
         if offset % PAGE_SIZE != 0
             || len == 0
@@ -405,6 +452,9 @@ impl GemState {
         if len as u64 > object.byte_len {
             return Err(FsError::InvalidData);
         }
+        if !object.cpu_visible() {
+            return Err(FsError::OperationNotPermitted);
+        }
         let pages = (len as u64).div_ceil(PAGE_SIZE);
         Ok((0..pages).map(|i| object.phys + i * PAGE_SIZE).collect())
     }
@@ -459,16 +509,58 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
         return Err(FsError::InvalidData);
     }
 
-    // VRAM first where the buffer may live there and the card has a heap;
-    // GTT next if it is also allowed (Linux's placement order).
-    let vram = (domains & uapi::AMDGPU_GEM_DOMAIN_VRAM as u64 != 0)
+    // VRAM first where the buffer may live there and the card has a heap —
+    // past the BAR for a buffer the CPU never touches, where there is room
+    // — then GTT if it is also allowed (Linux's placement order).
+    let heap = (domains & uapi::AMDGPU_GEM_DOMAIN_VRAM as u64 != 0)
         .then(|| state.card.and_then(vram_heap))
-        .flatten()
+        .flatten();
+    let align = alignment
+        .max(PAGE_SIZE)
+        .checked_next_power_of_two()
+        .ok_or(FsError::InvalidData)?;
+    let unmapped = heap
+        .as_ref()
+        .filter(|_| flags & uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS as u64 != 0)
         .and_then(|heap| {
-            let align = (alignment.max(PAGE_SIZE)).checked_next_power_of_two()?;
-            let reservation = heap.pool.reserve_aligned(byte_len, align).ok()?;
-            Some((heap, reservation))
+            let unmapped = heap.unmapped.as_ref()?;
+            let reservation = unmapped.pool.reserve_aligned(byte_len, align).ok()?;
+            Some((heap, unmapped, reservation))
         });
+    if let Some((heap, unmapped, reservation)) = unmapped {
+        let gpu = reservation
+            .address()
+            .checked_sub(heap.fb_base)
+            .and_then(|a| a.checked_add(heap.fb_offset))
+            .ok_or(FsError::InvalidData)?;
+        // Zero it before any job can see it: the pool's previous owner may
+        // have left anything, and only the engine reaches it.
+        let cleared = unmapped
+            .clear
+            .clear(reservation.address(), reservation.size())?;
+        let object = GemObject {
+            phys: 0,
+            gpu,
+            system: false,
+            byte_len,
+            backing: Backing::Unmapped { _held: reservation },
+            alignment,
+            preferred_domains: domains,
+            flags,
+            metadata: IrqSafeSpinLock::new(Metadata::default()),
+            card: state.card,
+            dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+        };
+        object
+            .dma_buf
+            .resv
+            .add_fence(cleared, narf_filesystem::dma_buf::DmaResvUsage::Kernel);
+        return finish_create(state, arg, object);
+    }
+    let vram = heap.and_then(|heap| {
+        let reservation = heap.pool.reserve_aligned(byte_len, align).ok()?;
+        Some((heap, reservation))
+    });
     let object = match vram {
         Some((heap, reservation)) => {
             let map = reservation.mapping();
@@ -536,7 +628,13 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
             }
         }
     };
-    // A failed insert drops the object, which returns its memory.
+    finish_create(state, arg, object)
+}
+
+/// Give a new buffer a handle and report it.
+fn finish_create(state: &GemState, arg: usize, object: GemObject) -> Result<u64, FsError> {
+    // A failed insert drops the object, which returns its memory (a clear
+    // still queued finishes before the range's next clear: `VramClear`).
     let handle = state.insert(object)?;
 
     // `drm_amdgpu_gem_create_out`: handle, _pad.
@@ -555,8 +653,10 @@ fn mmap(state: &GemState, arg: usize) -> Result<u64, FsError> {
     // SAFETY: as above.
     let bytes = unsafe { copy_in(arg, 8)? };
     let handle = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-    if state.get(handle).is_none() {
-        return Err(FsError::InvalidData);
+    let object = state.get(handle).ok_or(FsError::InvalidData)?;
+    // Linux refuses a NO_CPU_ACCESS buffer outright, wherever it landed.
+    if object.flags & uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS as u64 != 0 {
+        return Err(FsError::OperationNotPermitted);
     }
     let mut out = [0u8; 8];
     out[0..8].copy_from_slice(&((handle as u64) << 12).to_le_bytes());

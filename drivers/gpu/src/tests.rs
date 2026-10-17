@@ -11181,6 +11181,7 @@ fn smoke_amdgpu_gem_places_buffers_in_card_vram() -> TestResult {
             pool,
             fb_base,
             fb_offset: 0x1_0000_0000,
+            unmapped: None,
         },
     );
     let gem = GemState::for_card(card);
@@ -11251,6 +11252,187 @@ fn smoke_amdgpu_gem_places_buffers_in_card_vram() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_gem_places_buffers_in_card_vram
+);
+
+/// A fake engine clear for `smoke_amdgpu_gem_places_hidden_buffers_past_the_bar`:
+/// records each clear and hands back one shared, CPU-controlled fence.
+#[derive(Debug)]
+struct FakeVramClear {
+    calls: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>,
+    done: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+    refuse: core::sync::atomic::AtomicBool,
+}
+struct FakeClearFence(alloc::sync::Arc<core::sync::atomic::AtomicBool>);
+impl narf_filesystem::DrmFence for FakeClearFence {
+    fn is_signalled(&self) -> bool {
+        self.0.load(core::sync::atomic::Ordering::Acquire)
+    }
+    fn wait(&self, _: u64) -> bool {
+        self.is_signalled()
+    }
+}
+impl crate::amdgpu_gem::VramClear for FakeVramClear {
+    fn clear(
+        &self,
+        address: u64,
+        bytes: u64,
+    ) -> Result<alloc::sync::Arc<dyn narf_filesystem::DrmFence>, narf_filesystem::FsError> {
+        if self.refuse.load(core::sync::atomic::Ordering::Relaxed) {
+            return Err(narf_filesystem::FsError::NoDevice);
+        }
+        self.calls.lock().push((address, bytes));
+        Ok(alloc::sync::Arc::new(FakeClearFence(self.done.clone())))
+    }
+}
+
+/// A `NO_CPU_ACCESS` VRAM buffer on a card with VRAM past its BAR lands
+/// there: no CPU address or mapping, entries carrying its physical VRAM
+/// address, and the engine's clear as its KERNEL fence, which mapping it
+/// makes every job of the space wait for. Other VRAM buffers stay in the
+/// visible heap, and a hidden one falls back there when the rest is full.
+fn smoke_amdgpu_gem_places_hidden_buffers_past_the_bar() -> TestResult {
+    use crate::amdgpu_gem::{
+        register_vram_heap, unregister_vram_heap, GemState, UnmappedHeap, VramHeap,
+    };
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{VmState, GPU_PAGE_SIZE as P, PTE_SYSTEM, PTE_VALID};
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::dma_buf::DmaResvUsage;
+    let create = |gem: &GemState, bytes: u64, flags: u32| {
+        let mut create = [0u8; 32];
+        create[0..8].copy_from_slice(&bytes.to_le_bytes());
+        create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_VRAM as u64).to_le_bytes());
+        create[24..32].copy_from_slice(&(flags as u64).to_le_bytes());
+        crate::amdgpu_gem::dispatch(
+            crate::drm_uapi::DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+            create.as_mut_ptr() as usize,
+            gem,
+        )
+        .map(|_| u32::from_le_bytes(create[0..4].try_into().unwrap()))
+    };
+    let hidden = u::AMDGPU_GEM_CREATE_NO_CPU_ACCESS;
+    let Ok(frame) = narf_memory::frame::alloc_pages_on(0, 2) else {
+        return TestResult::Fail("setup: frames");
+    };
+    let phys = frame.start_address().raw();
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(phys),
+        virt: narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>() as u64,
+        len: 4 * P,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    let fb_base = 0x80_0000_0000u64;
+    let past = fb_base + 0x1000_0000;
+    // SAFETY: the window is owned by this test; the unmapped range is
+    // bookkeeping only, which nothing but the fake engine "touches".
+    let pools = unsafe {
+        (
+            crate::amdgpu_vram::Pool::from_owned_range(map, fb_base),
+            crate::amdgpu_vram::UnmappedPool::from_owned(past, 4 * P, &[]),
+        )
+    };
+    let (Ok(pool), Ok(unmapped)) = pools else {
+        return TestResult::Fail("setup: pools");
+    };
+    let engine = alloc::sync::Arc::new(FakeVramClear {
+        calls: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+        done: Default::default(),
+        refuse: Default::default(),
+    });
+    let card = 0x7fff_0001;
+    register_vram_heap(
+        card,
+        VramHeap {
+            pool,
+            fb_base,
+            fb_offset: 0x1_0000_0000,
+            unmapped: Some(UnmappedHeap {
+                pool: unmapped.clone(),
+                clear: engine.clone(),
+            }),
+        },
+    );
+    let gem = GemState::for_card(card);
+    let vm = VmState::new();
+    let result = (|| -> Result<(), &'static str> {
+        let h = create(&gem, 2 * P, hidden).map_err(|_| "hidden create")?;
+        let o = gem.object(h).ok_or("hidden object")?;
+        if o.system || o.cpu_visible() || o.phys != 0 || o.gpu != 0x1_1000_0000 {
+            return Err("hidden buffer not past the BAR");
+        }
+        if *engine.calls.lock() != [(past, 2 * P)] || unmapped.available() != 2 * P {
+            return Err("hidden buffer not cleared by the engine");
+        }
+        if o.dma_buf().resv.fences(DmaResvUsage::Kernel).len() != 1 {
+            return Err("clear is not the buffer's kernel fence");
+        }
+        let mut mmap = [0u8; 16];
+        mmap[0..4].copy_from_slice(&h.to_le_bytes());
+        let mapped = crate::amdgpu_gem::dispatch(
+            crate::drm_uapi::DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_MMAP,
+            mmap.as_mut_ptr() as usize,
+            &gem,
+        );
+        if mapped != Err(narf_filesystem::FsError::OperationNotPermitted)
+            || gem.mmap_frames((h as u64) << 12, P as usize).is_ok()
+            || o.frames(0, P as usize).is_ok()
+            || o.load_u64(0).is_some()
+        {
+            return Err("CPU reached a hidden buffer");
+        }
+        gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_MAP, h, 0x3_0000_0000, 0, 2 * P).map_err(|_| "map")?;
+        let e = vm.leaf_entry(0x3_0000_1000).ok_or("entry")?;
+        if e & PTE_VALID == 0 || e & PTE_SYSTEM != 0 || e & 0xffff_ffff_f000 != 0x1_1000_1000 {
+            return Err("hidden entry");
+        }
+        if vm.kernel_fences().len() != 1 {
+            return Err("mapping did not make the space wait for the clear");
+        }
+        engine.done.store(true, Ordering::Release);
+        if !vm.kernel_fences().is_empty()
+            || !o.dma_buf().resv.fences(DmaResvUsage::Kernel).is_empty()
+        {
+            return Err("signalled clear still waited on");
+        }
+        // Without NO_CPU_ACCESS, VRAM stays CPU-visible.
+        let v = create(&gem, P, 0).map_err(|_| "visible create")?;
+        if !gem.object(v).ok_or("visible")?.cpu_visible() || engine.calls.lock().len() != 1 {
+            return Err("CPU-accessible buffer placed past the BAR");
+        }
+        // Too big for what is left past the BAR: the visible heap takes it.
+        let big = create(&gem, 3 * P, hidden).map_err(|_| "fallback create")?;
+        if !gem.object(big).ok_or("fallback")?.cpu_visible() {
+            return Err("hidden buffer did not fall back to the visible heap");
+        }
+        // A clear the engine refuses fails the create and frees the range.
+        engine.refuse.store(true, Ordering::Relaxed);
+        if create(&gem, P, hidden).is_ok() || unmapped.available() != 2 * P {
+            return Err("create survived a refused clear");
+        }
+        engine.refuse.store(false, Ordering::Relaxed);
+        // Unmapped and closed, its range returns.
+        gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_UNMAP, 0, 0x3_0000_0000, 0, 2 * P)
+            .map_err(|_| "unmap")?;
+        drop(o);
+        let mut close = [0u8; 8];
+        close[0..4].copy_from_slice(&h.to_le_bytes());
+        let _ = crate::amdgpu_gem::dispatch(0x09, close.as_mut_ptr() as usize, &gem);
+        if unmapped.available() != 4 * P {
+            return Err("closed hidden buffer kept its range");
+        }
+        Ok(())
+    })();
+    unregister_vram_heap(card);
+    drop(gem);
+    narf_memory::frame::free_pages(frame, 2);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_gem_places_hidden_buffers_past_the_bar
 );
 
 /// `AMDGPU_CS`'s parser against the input a hostile client would send.
