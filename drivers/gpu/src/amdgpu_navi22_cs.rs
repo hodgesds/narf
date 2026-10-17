@@ -4,29 +4,49 @@
 //! (`amdgpu_gem::register_vram_heap`).
 //!
 //! Clients' address spaces are the generic per-open `amdgpu_vm::VmState`
-//! (GMC 11 layout, which GMC 10 shares; tables in system memory). Every job
-//! runs on one GMC10 context held from `amdgpu_gmc_navi22` for client work;
-//! its ring-side VM flush writes the job's root (`VmState::root_pde`) into
-//! that context and invalidates it on the ring's own GFXHUB engine before the
-//! IBs, as Navi48 flushes its client VMID per job. A unique flush generation
-//! per job makes every job flush, which also covers page-table updates
-//! (`GEM_VA`) made since the previous one.
+//! (GMC 11 layout, which GMC 10 shares; tables in system memory). Jobs run
+//! on GFXHUB VMIDs 1–7, the contexts `amdgpu_gmc_navi22` lends for client
+//! work (8–15 stay KFD's, as gmc_v10_0_sw_init sets `first_kfd_vmid` 8 and
+//! amdgpu_vmid_mgr_init manages only VMIDs below it), granted per job by the
+//! generic `amdgpu_vmid::VmidManager` as `amdgpu_vmid_grab` does with
+//! concurrent flushes (every GC 10.3 part):
+//!
+//! - a job first needs some VMID with no unfinished job on any ring, or it
+//!   waits (`amdgpu_vmid_grab_idle`), so one busy client cannot starve the
+//!   others;
+//! - it reuses the most recent VMID its own space used at the same root
+//!   (`amdgpu_vmid_grab_used`) and flushes only when the space removed a
+//!   mapping since that VMID's flush (`VmState::tlb_seq`) or that flush ran
+//!   on another ring and has not completed; otherwise it takes the idle VMID
+//!   and flushes;
+//! - it rewrites the VMID's IH LUT entry (`gmc_v10_0_emit_pasid_mapping`)
+//!   when the VMID last mapped another PASID or that write may not have run,
+//!   so a fault's IV names the client's PASID and reaches its
+//!   `AMDGPU_INFO_GPUVM_FAULT` (`amdgpu_vmid::record_fault`).
+//!
+//! A flush, or a job of another scheduler entity (`(VmState::owner, ctx)`),
+//! makes the ring wait for its previous job first; consecutive jobs of one
+//! entity pipeline. No `AMDGPU_VM_OP_RESERVE_VMID` (`grab_reserved`): there
+//! is no SPM/debugger user.
 //!
 //! Tickets are `ring << 32 | sequence`; the ring index carries the GPU
-//! recovery epoch above its two ring bits, so a ticket from before a
+//! recovery epoch above its three ring-id bits, so a ticket from before a
 //! recovery names a ring no current queue has and reads as complete
 //! (abandoned) instead of being compared with the new queues' sequences.
 //!
-//! LINUX-GAP: one VMID for every client, flushed per job (no
-//! `amdgpu_vmid_grab` reuse); faults on it are attributed to the reserved
-//! context, not to the client's PASID (`AMDGPU_INFO_GPUVM_FAULT` stays
-//! empty). Dependencies wait in the ioctl (generic `dispatch_async`).
+//! A recovery registers a new submitter with a fresh manager, so every VMID
+//! is flushed and remapped before its next use, as `amdgpu_vm_flush` does
+//! after `amdgpu_vmid_had_gpu_reset`.
+//!
+//! LINUX-GAP: `last_flush` / `pasid_mapping` are the job's own fence, not a
+//! separate `hw_vm_fence` emitted after the flush (later, so conservative);
+//! no `ring->vmid_wait` fairness queue (waiters poll). Dependencies wait in
+//! the ioctl (generic `dispatch_async`).
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_filesystem::FsError;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -36,8 +56,11 @@ use crate::amdgpu_navi22_submit::{Ib, Ring, RingState, VmRef};
 use crate::amdgpu_uapi as uapi;
 
 const RINGS: [Ring; 4] = [Ring::Gfx, Ring::Compute, Ring::Sdma(0), Ring::Sdma(1)];
-/// Bound on waiting out the per-ring throttle before giving up with EBUSY.
+/// Bound on waiting out the per-ring throttle or for an idle VMID before
+/// giving up with EBUSY.
 const THROTTLE_NS: u64 = 10_000_000_000; // linux: n/a (NARF policy)
+/// Poll interval while waiting for a fence or an idle VMID.
+const POLL_US: u64 = 100; // linux: n/a (NARF policy)
 
 /// `amdgpu_ctx_get_entity` for this ASIC: gfx ring 0, compute rings 0–3 on
 /// the one kernel compute queue, one entity per SDMA engine.
@@ -58,12 +81,58 @@ pub const fn ring_index(epoch: u64, id: usize) -> u32 {
 }
 /// Whether `ticket` completed, given each ring's completed sequence in
 /// `epoch`. Tickets of another epoch were abandoned by a recovery.
-pub fn job_done(epoch: u64, completed: [u32; RING_IDS], ticket: u64) -> bool {
+/// `completed` holds the first `N` ring ids' sequences (`RING_IDS` in
+/// production); a ring beyond them has completed nothing.
+pub fn job_done<const N: usize>(epoch: u64, completed: [u32; N], ticket: u64) -> bool {
     let index = (ticket >> 32) as u32;
     if index & !7 != ring_index(epoch, 0) {
         return true;
     }
-    crate::amdgpu_fence_navi22::signaled(completed[(index & 7) as usize], ticket as u32)
+    let done = completed.get((index & 7) as usize).copied().unwrap_or(0);
+    crate::amdgpu_fence_navi22::signaled(done, ticket as u32)
+}
+/// The ring's scheduler entity for a job: Linux compares the entity's fence
+/// context (`ring->current_ctx`), one per (open's VM, context) and ring. Low
+/// 32 bits of the never-reused `VmState::owner` above the context id; 0 is
+/// reserved for "none" and never produced (owners start at 1).
+pub const fn entity(owner: u64, ctx_id: u32) -> u64 {
+    owner << 32 | ctx_id as u64
+}
+/// The submission request `amdgpu_vmid_grab` decides on, for a job of `vm`
+/// at root `pd_addr` on ticket ring `ring`.
+pub fn grab_request(
+    vm: &crate::amdgpu_vm::VmState,
+    pd_addr: u64,
+    pasid: crate::amdgpu_vmid::Pasid,
+    ring: u32,
+) -> crate::amdgpu_vmid::GrabRequest {
+    crate::amdgpu_vmid::GrabRequest {
+        owner: vm.owner(),
+        pd_addr,
+        tlb_seq: vm.tlb_seq(),
+        pasid,
+        ring,
+    }
+}
+/// The ring-side VM state of a job granted `grant`.
+pub fn vm_ref(
+    request: &crate::amdgpu_vmid::GrabRequest,
+    grant: crate::amdgpu_vmid::Grant,
+) -> VmRef {
+    VmRef {
+        vmid: grant.vmid,
+        page_table_base: request.pd_addr,
+        pasid: request.pasid,
+        flush: grant.needs_flush,
+        map_pasid: grant.map_pasid,
+    }
+}
+/// A fresh manager over the client VMIDs `amdgpu_gmc_navi22` lent.
+pub fn vmid_manager(
+    lent: &crate::amdgpu_gmc_navi22::ClientVmids,
+) -> crate::amdgpu_vmid::VmidManager {
+    let (first, last) = lent.range();
+    crate::amdgpu_vmid::VmidManager::new(first, last)
 }
 
 /// The Navi 22 queues behind `AMDGPU_CS` on DRM card `card`.
@@ -72,9 +141,11 @@ pub struct Submitter {
     card: u32,
     epoch: u64,
     reader: FenceReader,
-    vmid: u8,
+    /// GFXHUB client VMIDs (gfx, compute and both SDMA engines all
+    /// translate through GFXHUB on GC 10.3). Touched only under the
+    /// platform owner, beside the submission it grants.
+    vmids: IrqSafeSpinLock<crate::amdgpu_vmid::VmidManager>,
     rings: IrqSafeSpinLock<[RingState; 4]>,
-    jobs: AtomicU64,
 }
 
 impl Submitter {
@@ -101,7 +172,7 @@ impl Submitter {
             if narf_time::monotonic_ns() >= deadline_ns {
                 return Ok(false);
             }
-            narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(POLL_US).as_instant()).await;
         }
     }
 }
@@ -153,19 +224,19 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                 })
                 .collect();
             let page_table_base = vm.root_pde().ok_or(FsError::InvalidData)?;
-            let vm_ref = VmRef {
-                vmid: self.vmid,
-                generation: self.jobs.fetch_add(1, Ordering::Relaxed) + 1,
-                page_table_base,
-            };
+            let pasid = vm.pasid().ok_or(FsError::NoSpace)?;
+            let index = ring_index(self.epoch, id);
+            let request = grab_request(vm, page_table_base, pasid, index);
+            let context = entity(request.owner, submission.ctx_id);
             if id >= crate::amdgpu_vcn_navi22_cs::FIRST_ID {
-                let index = u64::from(ring_index(self.epoch, id)) << 32;
-                let seq = crate::amdgpu_vcn_navi22_cs::submit(vm, submission, vm_ref, id, |s| {
-                    self.signalled(index | u64::from(s))
-                })
+                // VCN/JPEG: MMHUB VMIDs of their own (amdgpu_vcn_navi22_cs).
+                let progress = || self.progress();
+                let seq = crate::amdgpu_vcn_navi22_cs::submit(
+                    vm, submission, request, self.epoch, &progress,
+                )
                 .await?;
                 let _ = self.progress();
-                return Ok(index | u64::from(seq));
+                return Ok(u64::from(index) << 32 | u64::from(seq));
             }
             let ring = RINGS[id];
             let deadline = narf_time::monotonic_ns().saturating_add(THROTTLE_NS);
@@ -173,18 +244,33 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                 let throttle = {
                     let mut owner = crate::amdgpu_navi22_platform::owner().await;
                     let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
+                    let completed = self.progress().ok_or(FsError::NoDevice)?;
+                    let epoch = self.epoch;
+                    let done = |t| job_done(epoch, completed, t);
+                    let grant = self.vmids.lock().grab(request, &done);
+                    let Some(grant) = grant else {
+                        // amdgpu_vmid_grab_idle: every client VMID still has
+                        // an unfinished job; wait without the owner.
+                        drop(owner);
+                        if narf_time::monotonic_ns() >= deadline {
+                            return Err(FsError::Busy);
+                        }
+                        narf_time::SleepUntil::new(
+                            narf_time::Deadline::after_us(POLL_US).as_instant(),
+                        )
+                        .await;
+                        continue;
+                    };
                     let result = {
                         let mut rings = self.rings.lock();
-                        boot.submit(
-                            ring,
-                            &mut rings[id],
-                            vm_ref,
-                            u64::from(submission.ctx_id),
-                            &ibs,
-                        )
+                        boot.submit(ring, &mut rings[id], vm_ref(&request, grant), context, &ibs)
                     };
                     match result {
-                        Ok(seq) => break seq,
+                        Ok(seq) => {
+                            let ticket = u64::from(index) << 32 | u64::from(seq);
+                            self.vmids.lock().commit(request, grant, ticket);
+                            break seq;
+                        }
                         Err(crate::amdgpu_navi22_boot::Error::Queues(
                             crate::amdgpu_cp_navi22::Error::Busy,
                         )) => boot.fences(ring).map_err(|_| FsError::NoDevice)?.1,
@@ -195,13 +281,13 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                     }
                 };
                 // Two jobs in flight: wait for the older without the owner.
-                let oldest = u64::from(ring_index(self.epoch, id)) << 32 | u64::from(throttle);
+                let oldest = u64::from(index) << 32 | u64::from(throttle);
                 if !self.wait_for(oldest, deadline).await? {
                     return Err(FsError::Busy);
                 }
             };
             let _ = self.progress();
-            Ok(u64::from(ring_index(self.epoch, id)) << 32 | u64::from(seq))
+            Ok(u64::from(index) << 32 | u64::from(seq))
         })
     }
     fn wait(
@@ -218,8 +304,8 @@ impl crate::amdgpu_cs::Submitter for Submitter {
 static CLIENT_VRAM: IrqSafeSpinLock<
     Option<(crate::amdgpu_vram::Reservation, crate::amdgpu_gem::VramHeap)>,
 > = IrqSafeSpinLock::new(None);
-/// The held client context, kept alive for the owner's lifetime.
-static CLIENT_VM: IrqSafeSpinLock<Option<crate::amdgpu_gmc_navi22::Vm>> =
+/// The client VMIDs lent by the memory owner, kept for its lifetime.
+static CLIENT_VMIDS: IrqSafeSpinLock<Option<crate::amdgpu_gmc_navi22::ClientVmids>> =
     IrqSafeSpinLock::new(None);
 
 /// The DRM card index of the bound Navi 22.
@@ -242,18 +328,19 @@ pub async fn register(boot: &mut crate::amdgpu_navi22_boot::ColdBoot) {
     let Some(reader) = boot.client_fence_reader() else {
         return;
     };
-    let vm = match boot.reserve_client_vmid().await {
-        Ok(vm) => vm,
+    let lent = match boot.reserve_client_vmids() {
+        Ok(lent) => lent,
         Err(error) => {
             let _ = writeln!(
                 narf_console::Writer,
-                "amdgpu: navi22 no client VMID: {error:?}"
+                "amdgpu: navi22 no client VMIDs: {error:?}"
             );
             return;
         }
     };
-    let vmid = vm.vmid();
-    *CLIENT_VM.lock() = Some(vm);
+    let vmids = vmid_manager(&lent);
+    let (first, last) = lent.range();
+    *CLIENT_VMIDS.lock() = Some(lent);
     {
         let mut client = CLIENT_VRAM.lock();
         if client.is_none() {
@@ -271,27 +358,27 @@ pub async fn register(boot: &mut crate::amdgpu_navi22_boot::ColdBoot) {
             crate::amdgpu_gem::register_vram_heap(card, heap.clone());
             let _ = writeln!(
                 narf_console::Writer,
-                "amdgpu: navi22 client VRAM heap {} MiB, VMID {vmid}",
+                "amdgpu: navi22 client VRAM heap {} MiB, VMIDs {first}-{last}",
                 chunk.size() >> 20
             );
         }
     }
-    crate::amdgpu_vcn_navi22_cs::register(boot);
+    crate::amdgpu_vcn_navi22_cs::register(boot, first, last);
     crate::amdgpu_cs::register_submitter(
         card,
         Arc::new(Submitter {
             card,
             epoch: crate::amdgpu_navi22_recovery::recoveries(),
             reader,
-            vmid,
+            vmids: IrqSafeSpinLock::new(vmids),
             rings: IrqSafeSpinLock::new([RingState::new(); 4]),
-            jobs: AtomicU64::new(0),
         }),
     );
 }
 
 /// Stop accepting client work (recovery is about to rebuild the owner). The
-/// held context belonged to the old memory owner and is dropped with it.
+/// lent VMIDs belonged to the old memory owner and are dropped with it; the
+/// next `register` starts a fresh manager (every VMID flushes again).
 pub fn unregister() {
     if let Some(card) = drm_card() {
         crate::amdgpu_cs::unregister_submitter(card);
@@ -299,7 +386,7 @@ pub fn unregister() {
     }
     crate::amdgpu_vcn_navi22_cs::unregister();
     // Its owner is being replaced; the handle must not reach the new one.
-    let _ = CLIENT_VM.lock().take();
+    let _ = CLIENT_VMIDS.lock().take();
 }
 
 #[cfg(feature = "kernel-test")]

@@ -3639,16 +3639,17 @@ harvested) decode is the VCN0 table, AV1 included.
 
 Client media rings (append-only additions, `amdgpu.navi22_accel` only):
 `Media::{client_rings() -> u8, fence_reader() -> MediaFenceReader,
-submit(MediaRing, &mut RingState, VmRef, context, &[Ib], copies),
+submit(MediaRing, VmRef, &[Ib], copies),
 client_fences(MediaRing) -> (completed, throttle)}` (and
 `ColdBoot::{client_media, submit_media, media_fences}`) queue client jobs on
 instance 0's decode ring, both encode rings and the JPEG ring once their ring
 and IB tests passed. `amdgpu_navi22_submit::{MediaRing, encode_media,
-validate_media, MEDIA_MAX_IBS}` frame them as Linux's `amdgpu_ib_schedule`
-does for vcn_v3_0/jpeg_v3_0: when the VM generation is new on the ring,
-(decode/JPEG `insert_start`,) the MMHUB `gmc_v10_0_emit_flush_gpu_tlb`
-(invalidation semaphore acquire, PTB LO/HI, request/ACK, release) and the
-ring's PTB-write wait; then `insert_start`, the IBs under the VMID
+validate_media, media_grant, MEDIA_MAX_IBS}` frame them as Linux's
+`amdgpu_ib_schedule` does for vcn_v3_0/jpeg_v3_0: when the job's MMHUB grant
+flushes, (decode/JPEG `insert_start`,) the MMHUB
+`gmc_v10_0_emit_flush_gpu_tlb` (invalidation semaphore acquire, PTB LO/HI,
+request/ACK, release), the ring's PTB-write wait and, when the grant remaps
+the PASID, the `IH_VMID_<vmid>_LUT_MM` write; then `insert_start`, the IBs under the VMID
 (`vcn_v2_0_dec/enc_ring_emit_ib`, `jpeg_v2_0_dec_ring_emit_ib`), the fence on
 the kernel ring's sequence and `insert_end`/`VCN_ENC_CMD_END`. MMHUB
 invalidation engines follow `amdgpu_gmc_allocate_vm_inv_eng` over ring order
@@ -3656,8 +3657,8 @@ invalidation engines follow `amdgpu_gmc_allocate_vm_inv_eng` over ring order
 a kernel copy (`JPEG_IB_SLOT`, 64 KiB per outstanding job) at VMID 0 with
 data at the client's VMID; the JPEG fence is `JPEG_FENCE` in the JPEG
 reservation. Two jobs outstanding per ring; frames are bounded to half the
-ring. Not emitted: the post-flush VM fence and the IH VMID LUT
-(`emit_pasid_mapping`), both Linux bookkeeping.
+ring. Not emitted: the post-flush VM fence (Linux bookkeeping; the job's own
+fence stands in, as on the kernel queues).
 
 `amdgpu_vcn_navi22_cs::{media_ring, ring_id, completed, rings, register,
 unregister, forget_owner, submit, dec_ib_messages, check_dec_msg,
@@ -3681,27 +3682,45 @@ parsed.
 `amdgpu_navi22_submit` queues client IBs on the verified kernel queues:
 `Gfx::submit`, `Compute::submit`, `Sdma::submit(instance, ..)` (and
 `ColdBoot::submit(ring, &mut RingState, VmRef, context, &[Ib])`,
-`ColdBoot::fences(ring) -> (completed, throttle)`) emit pipeline sync and a
-ring-side VM flush (PTB write + GFXHUB invalidation on the ring's engine:
-gfx 0, compute 4, SDMA 13/14; PFP_SYNC_ME on gfx) the first time a VM
-generation runs on that ring, CONTEXT_CONTROL/FRAME_CONTROL on gfx, up to 16
-IBs with the VMID, then the ring fence. `validate` refuses VMID 0/>15,
+`ColdBoot::fences(ring) -> (completed, throttle)`) emit what the job's VMID
+grant asks for — `VmRef { vmid, page_table_base, pasid, flush, map_pasid }`:
+a ring-side VM flush (PTB write + GFXHUB invalidation on the ring's engine:
+gfx 0, compute 4, SDMA 13/14; PFP_SYNC_ME on gfx) when `flush`, the
+`IH_VMID_<vmid>_LUT` ← PASID write (`gmc_v10_0_emit_pasid_mapping`, at the
+queue layout's OSSSYS base) when `map_pasid` — preceded by a pipeline sync
+when the job flushes or its context differs from the ring's previous job's
+(`RingState`), then CONTEXT_CONTROL/FRAME_CONTROL on gfx, up to 16 IBs with
+the VMID, then the ring fence. `validate` refuses VMID 0/>15,
 empty or oversized IB lists, unaligned or zero-length IBs. At most two
 submissions are outstanding per ring; a third returns `Busy` without
 touching the ring.
 
 `amdgpu_navi22_cs::{register, unregister, Submitter, ring_id, ring_index,
 job_done, drm_card}` plug the card into the generic render path: after a cold
-boot or recovery whose queues are verified, `register` reserves one GMC10
-client context (`ColdBoot::reserve_client_vmid`), registers the card's client
-VRAM heap (`ColdBoot::reserve_client_vram`, retained across recoveries) with
+boot or recovery whose queues are verified, `register` borrows the GFXHUB
+client VMIDs 1–7 (`ColdBoot::reserve_client_vmids` →
+`Gmc::reserve_client_vmids() -> ClientVmids`; 8–15 stay KFD's,
+`FIRST_KFD_VMID`), registers the card's client VRAM heap
+(`ColdBoot::reserve_client_vram`, retained across recoveries) with
 `amdgpu_gem::register_vram_heap`, and an `amdgpu_cs::Submitter` whose jobs run
-on gfx ring 0, the compute queue (rings 0–3) or SDMA 0/1 with a per-job VM
-flush to the open's `VmState` root, and — through `amdgpu_vcn_navi22_cs` —
-on the verified media rings (ids 4–7). Tickets are `ring_index(epoch, id) <<
-32 | seq` with three ring-id bits (`RING_IDS` 8); tickets of an earlier
-recovery epoch read as complete. `amdgpu_vm::VmState` tracks eight ring
-slots. Fences are read
+on gfx ring 0, the compute queue (rings 0–3) or SDMA 0/1 under a VMID granted
+per job by the generic `amdgpu_vmid::VmidManager` (`grab_request`, `vm_ref`,
+`vmid_manager`, `entity` build its inputs): a space reuses its VMID without a
+flush until it removes a mapping or changes root, a job waits (bounded, then
+`EBUSY`) when no VMID is idle, and the LUT entry is rewritten only when the
+VMID last mapped another PASID. `Gmc::handle_fault` charges faults on lent
+VMIDs to the IV's PASID (`Fault::pasid`, `FaultOwner::Client`,
+`amdgpu_vmid::record_fault`), which `AMDGPU_INFO_GPUVM_FAULT` reports. A
+recovery's new submitter starts with a fresh manager, so every VMID flushes
+and remaps again. Media jobs (VCN decode/encode, JPEG) run through
+`amdgpu_vcn_navi22_cs` on ticket ring ids 4–7 under a second, MMHUB
+`VmidManager` over the same lent VMID numbers (`register(boot, first,
+last)`), whose PASID remap is honoured only together with a flush
+(`amdgpu_navi22_submit::media_grant`, as `amdgpu_vm_flush` on rings without
+`emit_pipeline_sync`) and written to `IH_VMID_<vmid>_LUT_MM`. Tickets are
+`ring_index(epoch, id) << 32 | seq` with three ring-id bits (`RING_IDS` 8);
+tickets of an earlier recovery epoch read as complete. `amdgpu_vm::VmState`
+tracks eight ring slots. Fences are read
 by `amdgpu_cp_navi22::FenceReader` (`ColdBoot::client_fence_reader`) without
 the owner. `unregister` runs at the start of recovery.
 
@@ -3712,8 +3731,8 @@ it), `GEM_METADATA`, PRIME export/import of amdgpu GEM objects
 (`GemState::mapping_object`) and implicit sync on `BO_HANDLES`-listed
 buffers, whose fence contexts are the Navi 22 ticket ring indices.
 `HW_IP_INFO` keeps the Navi 22 multi-ring mask (`amdgpu_info_navi22`) while
-the card's submitter serves the IP, and reports 0 otherwise. Navi 22 keeps
-one client VMID flushed per job rather than `amdgpu_vmid` reuse.
+the card's submitter serves the IP, and reports 0 otherwise. Navi 22 shares
+the `amdgpu_vmid` reuse with Navi48.
 `GEM_MMAP` returns its offset at byte 0 of the 8-byte union;
 `drm_ioctl_bridge::{get_client, without_kms}` answer `GET_CLIENT` on primary
 nodes and `VERSION`/`GET_CAP` on amdgpu nodes without KMS state;

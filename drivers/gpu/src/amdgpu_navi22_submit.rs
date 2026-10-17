@@ -4,11 +4,19 @@
 //! for GC 10.3.2 (`gfx_v10_0.c`) and SDMA 5.2 (`sdma_v5_2.c`):
 //!
 //! 1. pipeline sync (`emit_pipeline_sync`: wait for the ring's last fence)
-//!    and VM flush (`emit_vm_flush`: write the VMID's page-table base, then
-//!    request and await a legacy invalidation on the ring's invalidation
-//!    engine; PFP_SYNC_ME on the gfx ring) — only the first time a VM
-//!    (VMID + generation) runs on that ring, as `amdgpu_vmid_grab` sets
-//!    `vm_needs_flush` only for a new or changed VMID owner;
+//!    when `amdgpu_ib_schedule` asks for one — the job flushes its VM, or
+//!    its scheduler entity differs from the ring's previous job's
+//!    (`amdgpu_vm_need_pipeline_sync`, `need_ctx_switch`; GC 10.3 has no
+//!    `has_compute_vm_bug`, and dependencies are waited for before
+//!    submission, so no explicit-sync fence reaches the ring);
+//!
+//!    Then the VM flush (`emit_vm_flush`: write the VMID's page-table base,
+//!    then request and await a legacy invalidation on the ring's
+//!    invalidation engine; PFP_SYNC_ME on the gfx ring) when the job's
+//!    `amdgpu_vmid_grab` grant needs one (`amdgpu_vmid::VmidManager`), and
+//!    the PASID mapping (`gmc_v10_0_emit_pasid_mapping`: the GFXHUB
+//!    `IH_VMID_<vmid>_LUT` ← the client's PASID, so its faults' IVs name the
+//!    client) when the grant asks for it;
 //! 2. gfx: CONTEXT_CONTROL (`emit_cntxcntl`, context switch when the client
 //!    context changes) and FRAME_CONTROL start;
 //! 3. the IBs (`emit_ib_gfx` / `_compute` with `vmid << 24`, SDMA
@@ -42,6 +50,13 @@ const PTB_LO: u32 = 0x1667; // linux: mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32@
 /// `mmGCVM_INVALIDATE_ENG0_REQ` / `_ACK`, `eng_distance` 1.
 const INV_REQ: u32 = 0x161f; // linux: mmGCVM_INVALIDATE_ENG0_REQ@gc
 const INV_ACK: u32 = 0x1631; // linux: mmGCVM_INVALIDATE_ENG0_ACK@gc
+/// `mmIH_VMID_0_LUT` (OSSSYS BASE_IDX 0), one register per VMID: the GFXHUB
+/// LUT gmc_v10_0_emit_pasid_mapping writes (`_LUT_MM` is MMHUB's).
+// linux-ctx: hdr=oss seg=0
+pub(crate) const IH_VMID_0_LUT: u32 = 0x0000; // linux: mmIH_VMID_0_LUT@oss
+/// Last OSSSYS register a queue layout must reach: `mmIH_VMID_0_LUT_MM + 15`.
+pub(crate) const IH_VMID_LUT_LAST: u32 = 0x001f; // linux: mmIH_VMID_0_LUT_MM@oss + 15
+                                                 // linux-ctx: reset
 /// `amdgpu_sched_hw_submission` default.
 pub const HW_SUBMISSIONS: u32 = 2; // linux: n/a (amdgpu_sched_hw_submission module default)
 /// Largest IB count per submission (`AMDGPU_CS_MAX_IBS_PER_SUBMIT`); 16
@@ -84,29 +99,32 @@ pub struct Ib {
     pub dwords: u32,
 }
 
-/// The VM a submission runs in.
+/// The VM a submission runs in, as its `amdgpu_vmid_grab` grant decided
+/// (`amdgpu_job::vmid`, `vm_pd_addr`, `pasid`, `vm_needs_flush`, and
+/// `amdgpu_vm_flush`'s `pasid_mapping_needed`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VmRef {
     pub vmid: u8,
-    pub generation: u64,
     /// `amdgpu_gmc_pd_addr(root)`: the value programmed into
     /// `PAGE_TABLE_BASE_ADDR` for this VMID, flags included.
     pub page_table_base: u64,
+    /// The client's PASID, written to the VMID's IH LUT entry.
+    pub pasid: u16,
+    /// Point the VMID's context at `page_table_base` and invalidate it.
+    pub flush: bool,
+    /// Rewrite the VMID's IH LUT entry with `pasid`.
+    pub map_pasid: bool,
 }
 
-/// Per-ring scheduling memory: which VM generations this ring has flushed
-/// and which client context ran last.
+/// Per-ring scheduling memory: which client context (scheduler entity) ran
+/// last (`amdgpu_ring::current_ctx`). 0 is no client context.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RingState {
-    flushed: [u64; 16],
     context: u64,
 }
 impl RingState {
     pub const fn new() -> Self {
-        Self {
-            flushed: [0; 16],
-            context: 0,
-        }
+        Self { context: 0 }
     }
 }
 
@@ -150,6 +168,8 @@ pub(crate) struct Frame<'a> {
     /// Pipeline sync: (ring fence address, last emitted sequence).
     pub sync: Option<(u64, u32)>,
     pub flush: Option<VmRef>,
+    /// IH LUT write: (absolute `IH_VMID_<vmid>_LUT` dword, PASID).
+    pub pasid_map: Option<(u32, u16)>,
     pub vmid: u8,
     pub context_switch: bool,
     pub ibs: &'a [Ib],
@@ -205,6 +225,10 @@ pub(crate) fn encode_cp(l: Layout, f: &Frame<'_>) -> Vec<u32> {
         if gfx {
             w.extend([packet3(PACKET3_PFP_SYNC_ME, 0), 0]);
         }
+    }
+    if let Some((lut, pasid)) = f.pasid_map {
+        // gmc_v10_0_emit_pasid_mapping via gfx_v10_0_ring_emit_wreg.
+        w.extend(cp_wreg(gfx, lut, u32::from(pasid)));
     }
     if gfx {
         // gfx_v10_0_ring_emit_cntxcntl: load_enable, plus the context-switch
@@ -270,6 +294,10 @@ pub(crate) fn encode_sdma(l: Layout, f: &Frame<'_>) -> Vec<u32> {
             (1 << v) | (0x1f << 16),
         ]);
     }
+    if let Some((lut, pasid)) = f.pasid_map {
+        // gmc_v10_0_emit_pasid_mapping via sdma_v5_2_ring_emit_wreg.
+        w.extend(sdma_wreg(lut, u32::from(pasid)));
+    }
     for ib in f.ibs {
         // sdma_v5_2_ring_emit_ib: NOP so the 6-dword packet ends on 8.
         let at = f.wptr + w.len() as u64;
@@ -320,18 +348,19 @@ pub(crate) fn submit<I: Io>(
     if !fence::signaled(completed(hw, queue)?, throttle_seq(queue)) {
         return Err(Error::Busy);
     }
-    let slot = usize::from(vm.vmid);
-    let needs_flush = state.flushed[slot] != vm.generation;
     let fence_address = queue.address(FENCE);
-    let sync = needs_flush.then_some((fence_address, queue.seq));
-    let flush = needs_flush.then_some(vm);
+    // amdgpu_ib_schedule: need_ctx_switch || amdgpu_vm_need_pipeline_sync.
     let context_switch = state.context != context;
+    let sync = (vm.flush || context_switch).then_some((fence_address, queue.seq));
+    let flush = vm.flush.then_some(vm);
     let seq = queue.next_seq();
+    let lut = hw.layout.oss(IH_VMID_0_LUT) + u32::from(vm.vmid);
     let frame = Frame {
         gfx: ring == Ring::Gfx,
         engine: ring.inv_engine(),
         sync,
         flush,
+        pasid_map: vm.map_pasid.then_some((lut, vm.pasid)),
         vmid: vm.vmid,
         context_switch,
         ibs,
@@ -354,7 +383,6 @@ pub(crate) fn submit<I: Io>(
         queue.seq = seq.wrapping_sub(1);
     }
     result?;
-    state.flushed[slot] = vm.generation;
     state.context = context;
     Ok(seq)
 }
@@ -367,13 +395,6 @@ pub(crate) fn throttle_seq(queue: &Queue) -> u32 {
 /// The ring's current fence value (after an HDP read invalidate).
 pub(crate) fn completed<I: Io>(hw: &mut Hw<I>, queue: &Queue) -> Result<u32, Error> {
     hw.access(|io, l| crate::amdgpu_cp_navi22::checked(queue.read(io, l, FENCE)))
-}
-
-/// Forget every flush this ring performed for `vmid` (its VM was destroyed).
-pub fn forget(state: &mut RingState, vmid: u8) {
-    if let Some(slot) = state.flushed.get_mut(usize::from(vmid)) {
-        *slot = 0;
-    }
 }
 
 // ── Media rings: VCN 3.0 decode/encode and JPEG 3.0 (append-only) ──────
@@ -393,11 +414,13 @@ pub fn forget(state: &mut RingState, vmid: u8) {
 // 3. the job fence (`emit_fence`), then decode/JPEG `insert_end` or the
 //    encoder's VCN_ENC_CMD_END.
 //
-// The flush decision is the kernel queues' (`RingState`, one flush per VM
-// generation per ring). Two omissions, both bookkeeping Linux needs and
-// NARF does not: the VM fence `amdgpu_vm_flush` emits after a flush (it
-// only feeds `id->last_flush`) and the IH VMID LUT write
-// (`emit_pasid_mapping`, fault attribution; owned with the VMID logic).
+// The flush and PASID-mapping decisions are the job's MMHUB
+// `amdgpu_vmid_grab` grant (`VmRef::flush` / `map_pasid`). These rings have
+// no `emit_pipeline_sync`, so `amdgpu_vm_flush` returns early unless the VM
+// flushes: the `IH_VMID_<vmid>_LUT_MM` write (`gmc_v10_0_emit_pasid_mapping`
+// for a non-GFXHUB ring) rides along with a flush only, right after it.
+// Omitted, as on the kernel queues: the separate VM fence `amdgpu_vm_flush`
+// emits after a flush (the job's own fence stands in for `last_flush`).
 
 /// `mmUVD_GP_SCRATCH8_INTERNAL_OFFSET` (vcn_v3_0.c), the decode reg-wait mask.
 pub(crate) const VCN_GP_SCRATCH8: u32 = 0x66; // linux: mmUVD_GP_SCRATCH8_INTERNAL_OFFSET@vcn
@@ -412,20 +435,20 @@ pub(crate) mod jrbc {
     pub const GPCOM_CMD: u32 = 0x4029; // linux: mmUVD_JPEG_GPCOM_CMD_INTERNAL_OFFSET
     pub const GPCOM_DATA0: u32 = 0x402a; // linux: mmUVD_JPEG_GPCOM_DATA0_INTERNAL_OFFSET
     pub const GPCOM_DATA1: u32 = 0x402b; // linux: mmUVD_JPEG_GPCOM_DATA1_INTERNAL_OFFSET
-                                         // linux: mmUVD_LMI_JRBC_RB_MEM_WR_64BIT_BAR_LOW_INTERNAL_OFFSET
+    /// linux: mmUVD_LMI_JRBC_RB_MEM_WR_64BIT_BAR_LOW_INTERNAL_OFFSET
     pub const RB_MEM_WR_LOW: u32 = 0x40ea;
-    // linux: mmUVD_LMI_JRBC_RB_MEM_WR_64BIT_BAR_HIGH_INTERNAL_OFFSET
+    /// linux: mmUVD_LMI_JRBC_RB_MEM_WR_64BIT_BAR_HIGH_INTERNAL_OFFSET
     pub const RB_MEM_WR_HIGH: u32 = 0x40eb;
     pub const IB_VMID: u32 = 0x40cf; // linux: mmUVD_LMI_JRBC_IB_VMID_INTERNAL_OFFSET
     pub const JPEG_VMID: u32 = 0x40d1; // linux: mmUVD_LMI_JPEG_VMID_INTERNAL_OFFSET
-                                       // linux: mmUVD_LMI_JRBC_IB_64BIT_BAR_LOW_INTERNAL_OFFSET
+    /// linux: mmUVD_LMI_JRBC_IB_64BIT_BAR_LOW_INTERNAL_OFFSET
     pub const IB_LOW: u32 = 0x40e8;
-    // linux: mmUVD_LMI_JRBC_IB_64BIT_BAR_HIGH_INTERNAL_OFFSET
+    /// linux: mmUVD_LMI_JRBC_IB_64BIT_BAR_HIGH_INTERNAL_OFFSET
     pub const IB_HIGH: u32 = 0x40e9;
     pub const IB_SIZE: u32 = 0x4082; // linux: mmUVD_JRBC_IB_SIZE_INTERNAL_OFFSET
-                                     // linux: mmUVD_LMI_JRBC_RB_MEM_RD_64BIT_BAR_LOW_INTERNAL_OFFSET
+    /// linux: mmUVD_LMI_JRBC_RB_MEM_RD_64BIT_BAR_LOW_INTERNAL_OFFSET
     pub const RB_MEM_RD_LOW: u32 = 0x40ec;
-    // linux: mmUVD_LMI_JRBC_RB_MEM_RD_64BIT_BAR_HIGH_INTERNAL_OFFSET
+    /// linux: mmUVD_LMI_JRBC_RB_MEM_RD_64BIT_BAR_HIGH_INTERNAL_OFFSET
     pub const RB_MEM_RD_HIGH: u32 = 0x40ed;
     pub const COND_RD_TIMER: u32 = 0x4085; // linux: mmUVD_JRBC_RB_COND_RD_TIMER_INTERNAL_OFFSET
     pub const REF_DATA: u32 = 0x4084; // linux: mmUVD_JRBC_RB_REF_DATA_INTERNAL_OFFSET
@@ -439,6 +462,10 @@ pub(crate) mod jrbc {
     }
 }
 
+/// `mmIH_VMID_0_LUT_MM` (OSSSYS BASE_IDX 0): MMHUB's VMID → PASID LUT.
+// linux-ctx: hdr=oss seg=0
+pub(crate) const IH_VMID_0_LUT_MM: u32 = 0x0010; // linux: mmIH_VMID_0_LUT_MM@oss
+
 /// MMHUB context-0 and invalidation-engine-0 registers (mmhub_2_0_0, base
 /// index 0), with `ctx_addr_distance` 2 and `eng_distance` 1.
 // linux-ctx: hdr=mmhub seg=0
@@ -447,7 +474,8 @@ pub(crate) const MM_PTB_HI: u32 = 0x72c; // linux: mmMMVM_CONTEXT0_PAGE_TABLE_BA
 pub(crate) const MM_INV_SEM: u32 = 0x6d1; // linux: mmMMVM_INVALIDATE_ENG0_SEM
 pub(crate) const MM_INV_REQ: u32 = 0x6e3; // linux: mmMMVM_INVALIDATE_ENG0_REQ
 pub(crate) const MM_INV_ACK: u32 = 0x6f5; // linux: mmMMVM_INVALIDATE_ENG0_ACK
-                                          // linux-ctx: reset
+
+// linux-ctx: reset
 /// `AMDGPU_VMHUB_INV_ENG_BITMAP`: engines 2 and 3 stay with KFD/firmware.
 pub(crate) const INV_ENG_BITMAP: u32 = 0x1fff3; // linux: AMDGPU_VMHUB_INV_ENG_BITMAP@amdgpu
 /// Largest IB count per media job: `amdgpu_ring_max_ibs(VCN_JPEG)`, and the
@@ -514,6 +542,9 @@ pub(crate) struct MediaFrame<'a> {
     pub mmhub: u32,
     pub engine: u32,
     pub flush: Option<VmRef>,
+    /// IH LUT write after the flush: (absolute `IH_VMID_<vmid>_LUT_MM`
+    /// dword, PASID).
+    pub pasid_map: Option<(u32, u16)>,
     pub vmid: u8,
     /// IBs as the engine fetches them: client VAs for VCN, the kernel copies
     /// (VMID 0) for JPEG, whose ring has a `parse_cs`.
@@ -627,6 +658,10 @@ pub(crate) fn encode_media(f: &MediaFrame<'_>) -> Vec<u32> {
         wreg(&mut w, reg(MM_INV_SEM) + f.engine, 0);
         // the ring's own emit_vm_flush tail: wait for the PTB write
         wait(&mut w, reg(MM_PTB_LO) + 2 * v, lo, u32::MAX);
+        if let Some((lut, pasid)) = f.pasid_map {
+            // gmc_v10_0_emit_pasid_mapping through the ring's emit_wreg.
+            wreg(&mut w, lut, u32::from(pasid));
+        }
     }
     media_start(f.ring, &mut w);
     let vmid = u32::from(f.vmid);
@@ -755,14 +790,14 @@ pub fn validate_media(vm: VmRef, ibs: &[Ib]) -> Result<(), Error> {
     Ok(())
 }
 
-/// Whether `ring` must flush `vm` (`amdgpu_vmid_grab`'s `vm_needs_flush`,
-/// as [`submit`] decides it), and the record of having done so.
-pub(crate) fn media_needs_flush(state: &RingState, vm: VmRef) -> bool {
-    state.flushed[usize::from(vm.vmid)] != vm.generation
-}
-pub(crate) fn media_flushed(state: &mut RingState, vm: VmRef, context: u64) {
-    state.flushed[usize::from(vm.vmid)] = vm.generation;
-    state.context = context;
+/// The grant a media ring honours: `amdgpu_vm_flush` on a ring without
+/// `emit_pipeline_sync` emits (and records) the PASID mapping only together
+/// with a VM flush.
+pub fn media_grant(grant: crate::amdgpu_vmid::Grant) -> crate::amdgpu_vmid::Grant {
+    crate::amdgpu_vmid::Grant {
+        map_pasid: grant.map_pasid && grant.needs_flush,
+        ..grant
+    }
 }
 
 #[cfg(feature = "kernel-test")]

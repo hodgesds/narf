@@ -37,7 +37,8 @@ use alloc::vec::Vec;
 use narf_filesystem::FsError;
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::amdgpu_navi22_submit::{Ib, MediaRing, RingState, VmRef};
+use crate::amdgpu_navi22_cs::RING_IDS;
+use crate::amdgpu_navi22_submit::{Ib, MediaRing};
 use crate::amdgpu_uapi as uapi;
 use crate::amdgpu_vcn_navi22::cmd;
 
@@ -287,7 +288,10 @@ pub const FIRST_ID: usize = 4; // linux: n/a (NARF ticket ring id)
 struct Registered {
     rings: u8,
     reader: crate::amdgpu_vcn_navi22::MediaFenceReader,
-    states: [RingState; 4],
+    /// MMHUB client VMIDs: the same lent numbers as GFXHUB's, but MMHUB's
+    /// own contexts and `id_mgr[AMDGPU_MMHUB0(0)]` (VCN and JPEG translate
+    /// through MMHUB). Touched only under the platform owner.
+    vmids: crate::amdgpu_vmid::VmidManager,
     vcn0_harvested: bool,
 }
 static MEDIA: IrqSafeSpinLock<Option<Registered>> = IrqSafeSpinLock::new(None);
@@ -317,8 +321,10 @@ pub fn rings() -> u8 {
 
 /// Offer `boot`'s verified media rings to clients (with the owner held,
 /// from `amdgpu_navi22_cs::register`). Sessions start empty: a recovery
-/// rebuilt the firmware, which lost every session.
-pub fn register(boot: &crate::amdgpu_navi22_boot::ColdBoot) {
+/// rebuilt the firmware, which lost every session. `first..=last` are the
+/// client VMIDs `amdgpu_gmc_navi22` lent; a fresh MMHUB manager flushes and
+/// remaps each before its first media job.
+pub fn register(boot: &crate::amdgpu_navi22_boot::ColdBoot, first: u8, last: u8) {
     use core::fmt::Write;
     *SESSIONS.lock() = Sessions::new();
     let Some((rings, reader)) = boot.client_media() else {
@@ -330,7 +336,7 @@ pub fn register(boot: &crate::amdgpu_navi22_boot::ColdBoot) {
     *MEDIA.lock() = Some(Registered {
         rings,
         reader,
-        states: [RingState::new(); 4],
+        vmids: crate::amdgpu_vmid::VmidManager::new(first, last),
         vcn0_harvested: false,
     });
     crate::amdgpu_info::publish_navi22_media_rings(rings);
@@ -429,16 +435,19 @@ fn claim_sessions(messages: &[Message], owner: u64) -> Result<Option<Sessions>, 
     Ok(Some(before))
 }
 
-/// Queue a validated `AMDGPU_CS` job on media ring id `id` (from
-/// [`ring_id`]) under `vm_ref`, the VM the kernel-queue path chose. Returns
-/// the ring's fence sequence.
+/// Queue a validated `AMDGPU_CS` job on the media ring `request.ring`
+/// names (a ticket ring index from [`ring_id`]), as `amdgpu_vmid_grab` on
+/// MMHUB grants it. `progress` samples every ticket ring's completed
+/// sequence (`amdgpu_navi22_cs`), retiring what completed. Returns the
+/// ring's fence sequence.
 pub async fn submit(
     vm: &crate::amdgpu_vm::VmState,
     submission: &crate::amdgpu_cs::Submission,
-    vm_ref: VmRef,
-    id: usize,
-    wait: impl Fn(u32) -> bool,
+    request: crate::amdgpu_vmid::GrabRequest,
+    epoch: u64,
+    progress: &(dyn Fn() -> Option<[u32; RING_IDS]> + Sync),
 ) -> Result<u32, FsError> {
+    let id = (request.ring & 7) as usize;
     let ring = *MediaRing::ALL
         .get(id.wrapping_sub(FIRST_ID))
         .ok_or(FsError::InvalidData)?;
@@ -462,7 +471,9 @@ pub async fn submit(
             dwords: ib.length_dw,
         })
         .collect();
-    crate::amdgpu_navi22_submit::validate_media(vm_ref, &ibs).map_err(|_| FsError::InvalidData)?;
+    if ibs.is_empty() || ibs.len() > crate::amdgpu_navi22_submit::MEDIA_MAX_IBS {
+        return Err(FsError::InvalidData);
+    }
     let mut copies = Vec::new();
     let mut messages = Vec::new();
     match ring {
@@ -481,7 +492,7 @@ pub async fn submit(
         MediaRing::Enc(_) => {}
     }
     let restore = claim_sessions(&messages, vm.owner())?;
-    let result = queue(ring, vm_ref, submission.ctx_id, &ibs, &copies, &wait).await;
+    let result = queue(ring, request, epoch, progress, &ibs, &copies).await;
     if result.is_err() {
         if let Some(before) = restore {
             *SESSIONS.lock() = before;
@@ -492,48 +503,67 @@ pub async fn submit(
 
 async fn queue(
     ring: MediaRing,
-    vm_ref: VmRef,
-    ctx_id: u32,
+    request: crate::amdgpu_vmid::GrabRequest,
+    epoch: u64,
+    progress: &(dyn Fn() -> Option<[u32; RING_IDS]> + Sync),
     ibs: &[Ib],
     copies: &[Vec<u32>],
-    wait: &impl Fn(u32) -> bool,
 ) -> Result<u32, FsError> {
     use crate::amdgpu_navi22_boot::Error as Boot;
+    use crate::amdgpu_navi22_cs::{job_done, vm_ref};
     use crate::amdgpu_vcn_navi22::Error as Vcn;
     let deadline = narf_time::monotonic_ns().saturating_add(THROTTLE_NS);
+    let ticket = |seq: u32| u64::from(request.ring) << 32 | u64::from(seq);
     loop {
-        let throttle = {
+        let wait_for = {
             let mut owner = crate::amdgpu_navi22_platform::owner().await;
             let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
-            let mut state = {
-                let media = MEDIA.lock();
-                media.as_ref().ok_or(FsError::NoDevice)?.states[ring.index()]
-            };
-            let result =
-                boot.submit_media(ring, &mut state, vm_ref, u64::from(ctx_id), ibs, copies);
-            if result.is_ok() {
-                if let Some(m) = MEDIA.lock().as_mut() {
-                    m.states[ring.index()] = state;
+            let completed = progress().ok_or(FsError::NoDevice)?;
+            let done = |t| job_done(epoch, completed, t);
+            let grant = MEDIA
+                .lock()
+                .as_ref()
+                .ok_or(FsError::NoDevice)?
+                .vmids
+                .grab(request, &done)
+                .map(crate::amdgpu_navi22_submit::media_grant);
+            match grant {
+                // amdgpu_vmid_grab_idle: every MMHUB client VMID still has an
+                // unfinished job; wait without the owner.
+                None => None,
+                Some(grant) => {
+                    match boot.submit_media(ring, vm_ref(&request, grant), ibs, copies) {
+                        Ok(seq) => {
+                            if let Some(m) = MEDIA.lock().as_mut() {
+                                m.vmids.commit(request, grant, ticket(seq));
+                            }
+                            return Ok(seq);
+                        }
+                        Err(Boot::Media(Vcn::Busy)) => match boot.media_fences(ring) {
+                            Ok((_, throttle)) => Some(ticket(throttle)),
+                            Err(_) => return Err(FsError::NoDevice),
+                        },
+                        Err(Boot::Media(Vcn::Invalid | Vcn::Unsupported)) => {
+                            return Err(FsError::InvalidData)
+                        }
+                        Err(_) => return Err(FsError::NoDevice),
+                    }
                 }
-            }
-            match result {
-                Ok(seq) => return Ok(seq),
-                Err(Boot::Media(Vcn::Busy)) => match boot.media_fences(ring) {
-                    Ok((_, throttle)) => throttle,
-                    Err(_) => return Err(FsError::NoDevice),
-                },
-                Err(Boot::Media(Vcn::Invalid | Vcn::Unsupported)) => {
-                    return Err(FsError::InvalidData)
-                }
-                Err(_) => return Err(FsError::NoDevice),
             }
         };
-        // Two jobs in flight: wait for the older without the owner.
-        while !wait(throttle) {
+        // Two jobs in flight (or no idle VMID): wait without the owner.
+        loop {
+            let completed = progress().ok_or(FsError::NoDevice)?;
+            if wait_for.is_some_and(|t| job_done(epoch, completed, t)) {
+                break;
+            }
             if narf_time::monotonic_ns() >= deadline {
                 return Err(FsError::Busy);
             }
             narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
+            if wait_for.is_none() {
+                break;
+            }
         }
     }
 }

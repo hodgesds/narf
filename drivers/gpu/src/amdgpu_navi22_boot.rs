@@ -1674,11 +1674,14 @@ impl ColdBoot {
             },
         ))
     }
-    /// Hold one GMC10 context (VMID) for client jobs: its context registers
-    /// carry the 4-level, 48-bit layout every client space shares, and each
-    /// job's ring-side VM flush points it at that job's root.
-    pub async fn reserve_client_vmid(&mut self) -> Result<crate::amdgpu_gmc_navi22::Vm, Error> {
-        self.memory()?.create_vm().await.map_err(Error::MemoryHubs)
+    /// Lend the GFXHUB client VMIDs (1..`first_kfd_vmid`) to per-job client
+    /// submission: their context registers carry the 4-level, 48-bit layout
+    /// every client space shares, and each job's ring-side VM flush points
+    /// its granted VMID at that job's root.
+    pub fn reserve_client_vmids(&mut self) -> Result<crate::amdgpu_gmc_navi22::ClientVmids, Error> {
+        self.memory()?
+            .reserve_client_vmids()
+            .map_err(Error::MemoryHubs)
     }
     /// (last completed, throttle) fence sequences of `ring`.
     pub fn fences(&mut self, ring: crate::amdgpu_navi22_submit::Ring) -> Result<(u32, u32), Error> {
@@ -1712,16 +1715,12 @@ impl ColdBoot {
     pub fn submit_media(
         &mut self,
         ring: crate::amdgpu_navi22_submit::MediaRing,
-        state: &mut crate::amdgpu_navi22_submit::RingState,
         vm: crate::amdgpu_navi22_submit::VmRef,
-        context: u64,
         ibs: &[crate::amdgpu_navi22_submit::Ib],
         copies: &[alloc::vec::Vec<u32>],
     ) -> Result<u32, Error> {
         let media = self.sequence.backend.media.as_mut().ok_or(Error::Invalid)?;
-        media
-            .submit(ring, state, vm, context, ibs, copies)
-            .map_err(Error::Media)
+        media.submit(ring, vm, ibs, copies).map_err(Error::Media)
     }
     /// (last completed, throttle) fence sequences of client media `ring`.
     pub fn media_fences(

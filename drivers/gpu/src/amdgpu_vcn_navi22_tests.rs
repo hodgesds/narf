@@ -1074,7 +1074,7 @@ kernel_test_in!(
 /// waits for the first (`amdgpu_sched_hw_submission`); JPEG runs from a
 /// kernel copy at VMID 0.
 fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
-    use crate::amdgpu_navi22_submit::{encode_media, Ib, MediaFrame, MediaRing, RingState, VmRef};
+    use crate::amdgpu_navi22_submit::{encode_media, Ib, MediaFrame, MediaRing, VmRef};
     let (pool, mut e) = engine(Model::new(), 1);
     if run(e.start(firmware(1), None)).is_err()
         || run(e.start_jpeg()).is_err()
@@ -1088,35 +1088,30 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
     jpeg_ibs.publish();
     let client = Client {
         mmhub: 0x1a000,
+        oss: 0x10a0,
         instances: 1,
         jpeg_ibs: Some(jpeg_ibs),
     };
-    let vm = |generation| VmRef {
+    // The MMHUB grant: flush (and remap the PASID) or reuse.
+    let vm = |flush| VmRef {
         vmid: 3,
-        generation,
         page_table_base: 0x1_2345_6001,
+        pasid: 0x42,
+        flush,
+        map_pasid: flush,
     };
     let ibs = [Ib {
         va: 0x7000_0010_0000,
         dwords: 16,
     }];
-    let mut state = RingState::new();
     let (base, map, seq0) = {
         let i = e.vcn[0].as_ref().unwrap();
         (i.address(0), i.memory.mapping(), i.dec.seq)
     };
     let mut frames = Vec::new();
-    for generation in [1, 1] {
+    for flush in [true, false] {
         let from = e.vcn[0].as_ref().unwrap().dec.wptr;
-        let Ok(seq) = e.submit_client(
-            &client,
-            MediaRing::Dec,
-            &mut state,
-            vm(generation),
-            1,
-            &ibs,
-            &[],
-        ) else {
+        let Ok(seq) = e.submit_client(&client, MediaRing::Dec, vm(flush), &ibs, &[]) else {
             return TestResult::Fail("decode client job refused");
         };
         let to = e.vcn[0].as_ref().unwrap().dec.wptr;
@@ -1127,7 +1122,8 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
             ring: MediaRing::Dec,
             mmhub: 0x1a000,
             engine: 0,
-            flush: (k == 0).then_some(vm(1)),
+            flush: (k == 0).then_some(vm(true)),
+            pasid_map: (k == 0).then_some((0x10a0 + 0x10 + 3, 0x42)),
             vmid: 3,
             ibs: &ibs,
             fence: base + FENCE[0],
@@ -1151,24 +1147,24 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
         return TestResult::Fail("decode commit: shadow wptr and doorbell");
     }
     // Two outstanding: the third waits for the first fence.
-    let third = e.submit_client(&client, MediaRing::Dec, &mut state, vm(2), 1, &ibs, &[]);
+    let third = e.submit_client(&client, MediaRing::Dec, vm(true), &ibs, &[]);
     if third != Err(Error::Busy) || e.vcn[0].as_ref().unwrap().dec.seq != seq0 + 2 {
         return TestResult::Fail("third outstanding decode job not throttled");
     }
     e.hw.io.put(mc(map, FENCE[0]), seq0 + 1);
     let from = e.vcn[0].as_ref().unwrap().dec.wptr;
-    if e.submit_client(&client, MediaRing::Dec, &mut state, vm(2), 1, &ibs, &[]) != Ok(seq0 + 3) {
+    if e.submit_client(&client, MediaRing::Dec, vm(true), &ibs, &[]) != Ok(seq0 + 3) {
         return TestResult::Fail("decode job after the throttle fence");
     }
     let to = e.vcn[0].as_ref().unwrap().dec.wptr;
-    // New generation: flushed again (insert_start then the semaphore wait).
+    // A flushing grant: insert_start then the semaphore wait.
     let words = e.hw.io.ring(mc(map, DEC_RING), from, to);
     if words.get(4..6) != Some(&[cmd::packet0(cmd::INTERNAL_DATA0), (0x1a000 + 0x6d1) << 2][..]) {
         return TestResult::Fail("new VM generation not flushed");
     }
     // Encode ring 0: MMHUB engine 1, frame starts with the semaphore wait.
     let enc_from = e.vcn[0].as_ref().unwrap().enc[0].wptr;
-    if e.submit_client(&client, MediaRing::Enc(0), &mut state, vm(3), 1, &ibs, &[])
+    if e.submit_client(&client, MediaRing::Enc(0), vm(true), &ibs, &[])
         .is_err()
     {
         return TestResult::Fail("encode client job refused");
@@ -1189,25 +1185,14 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
         (j.memory.address(), j.memory.mapping(), j.ring.wptr)
     };
     let mismatch = [alloc::vec![0x6000_0000, 0]];
-    if e.submit_client(
-        &client,
-        MediaRing::Jpeg,
-        &mut state,
-        vm(3),
-        1,
-        &user,
-        &mismatch,
-    ) != Err(Error::Invalid)
+    if e.submit_client(&client, MediaRing::Jpeg, vm(true), &user, &mismatch) != Err(Error::Invalid)
     {
         return TestResult::Fail("JPEG copy/IB mismatch accepted");
     }
-    let mut jstate = RingState::new();
     let Ok(seq) = e.submit_client(
         &client,
         MediaRing::Jpeg,
-        &mut jstate,
-        vm(3),
-        1,
+        vm(true),
         &user,
         core::slice::from_ref(&copy),
     ) else {
@@ -1258,8 +1243,7 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
         dwords: (JPEG_IB_SLOT / 4 + 2) as u32,
     }];
     let big = [alloc::vec![0u32; huge[0].dwords as usize]];
-    if e.submit_client(&client, MediaRing::Jpeg, &mut state, vm(3), 1, &huge, &big)
-        != Err(Error::Invalid)
+    if e.submit_client(&client, MediaRing::Jpeg, vm(true), &huge, &big) != Err(Error::Invalid)
         || e.jpeg.as_ref().unwrap().ring.wptr != jto
     {
         return TestResult::Fail("oversize JPEG job reached the ring");
@@ -1268,14 +1252,14 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
     if e.submit_client(
         &client,
         MediaRing::Dec,
-        &mut state,
-        VmRef { vmid: 0, ..vm(4) },
-        1,
+        VmRef {
+            vmid: 0,
+            ..vm(true)
+        },
         &ibs,
         &[],
     ) != Err(Error::Invalid)
-        || e.submit_client(&client, MediaRing::Dec, &mut state, vm(4), 1, &[], &[])
-            != Err(Error::Invalid)
+        || e.submit_client(&client, MediaRing::Dec, vm(true), &[], &[]) != Err(Error::Invalid)
     {
         return TestResult::Fail("VMID 0 or empty media job accepted");
     }

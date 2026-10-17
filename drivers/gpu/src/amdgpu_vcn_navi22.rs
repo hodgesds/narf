@@ -1682,7 +1682,7 @@ impl Media {
 // (`route_interrupts`). Instance 1 takes no client work: Linux's
 // `vcn_v3_0_limit_sched` would move every non-H.264/HEVC/VP9 decode to
 // instance 0 anyway, and on this card VCN1 is harvested.
-use crate::amdgpu_navi22_submit::{self as submit, Ib, MediaRing, RingState, VmRef};
+use crate::amdgpu_navi22_submit::{self as submit, Ib, MediaRing, VmRef};
 
 /// One kernel copy slot of a JPEG job's IBs (`amdgpu_jpeg_dec_parse_cs`
 /// validates a copy executed at VMID 0); one slot per outstanding job.
@@ -1695,6 +1695,8 @@ pub(crate) const JPEG_FENCE: u64 = RING_BYTES + 64; // linux: n/a (NARF layout)
 pub(crate) struct Client {
     /// MMHUB segment-0 dword base, for the ring-side VM flush.
     pub mmhub: u32,
+    /// OSSSYS segment-0 dword base, for the MMHUB IH VMID LUT.
+    pub oss: u32,
     /// Unharvested VCN instances (MMHUB invalidation-engine order).
     pub instances: u8,
     /// JPEG IB copies: `HW_SUBMISSIONS` slots of `JPEG_IB_SLOT` bytes.
@@ -1706,6 +1708,15 @@ impl Client {
         let base =
             crate::amdgpu_psp_ring::bank(gpu, ip::HW_ID_MMHUB, &[(2, 1, 0)], 0, submit::MM_PTB_HI)
                 .ok()?;
+        // linux: n/a (OSSSYS 5.0.3 discovery version)
+        let oss = crate::amdgpu_psp_ring::bank(
+            gpu,
+            ip::HW_ID_OSSSYS,
+            &[(5, 0, 3)],
+            0,
+            submit::IH_VMID_LUT_LAST,
+        )
+        .ok()?;
         let jpeg_ibs = if jpeg {
             pool.reserve(JPEG_IB_SLOT * u64::from(submit::HW_SUBMISSIONS))
                 .ok()
@@ -1719,6 +1730,7 @@ impl Client {
         };
         Some(Self {
             mmhub: u32::try_from(base / 4).ok()?,
+            oss: u32::try_from(oss / 4).ok()?,
             instances,
             jpeg_ibs,
         })
@@ -1789,19 +1801,14 @@ impl<I: Io> Engine<I> {
     /// Queue one client job on `ring` (see `amdgpu_navi22_submit`'s media
     /// section). JPEG IBs arrive as validated copies (`copies`, one per IB),
     /// written to a kernel slot and fetched at VMID 0; VCN IBs run from the
-    /// client's VA. `Busy`: two jobs outstanding — wait for the throttle
-    /// sequence of [`Engine::client_fences`] and retry.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one client job's full description"
-    )]
+    /// client's VA. `vm` is the job's MMHUB grant (`media_grant`). `Busy`:
+    /// two jobs outstanding — wait for the throttle sequence of
+    /// [`Engine::client_fences`] and retry.
     pub(crate) fn submit_client(
         &mut self,
         client: &Client,
         ring: MediaRing,
-        state: &mut RingState,
         vm: VmRef,
-        context: u64,
         ibs: &[Ib],
         copies: &[alloc::vec::Vec<u32>],
     ) -> Result<u32, Error> {
@@ -1829,7 +1836,6 @@ impl<I: Io> Engine<I> {
         if !fence::signaled(completed, throttle) {
             return Err(Error::Busy);
         }
-        let needs_flush = submit::media_needs_flush(state, vm);
         let engine = ring.inv_engine(client.instances);
         let (r, map, base, fence_at) = client_ring(&mut self.vcn[0], &mut self.jpeg, ring)?;
         let (fence_address, ring_base) = (base + fence_at, base + r.base);
@@ -1853,7 +1859,11 @@ impl<I: Io> Engine<I> {
             ring,
             mmhub: client.mmhub,
             engine,
-            flush: needs_flush.then_some(vm),
+            flush: vm.flush.then_some(vm),
+            pasid_map: (vm.flush && vm.map_pasid).then_some((
+                client.oss + submit::IH_VMID_0_LUT_MM + u32::from(vm.vmid),
+                vm.pasid,
+            )),
             vmid: vm.vmid,
             ibs: if jpeg_slot.is_some() {
                 &kernel_ibs
@@ -1887,7 +1897,6 @@ impl<I: Io> Engine<I> {
             r.seq = seq.wrapping_sub(1);
         }
         result?;
-        submit::media_flushed(state, vm, context);
         Ok(seq)
     }
 }
@@ -1957,9 +1966,7 @@ impl Media {
     pub fn submit(
         &mut self,
         ring: MediaRing,
-        state: &mut RingState,
         vm: VmRef,
-        context: u64,
         ibs: &[Ib],
         copies: &[alloc::vec::Vec<u32>],
     ) -> Result<u32, Error> {
@@ -1967,8 +1974,7 @@ impl Media {
             return Err(Error::Busy);
         }
         let client = self.client.as_ref().ok_or(Error::Unsupported)?;
-        self.engine
-            .submit_client(client, ring, state, vm, context, ibs, copies)
+        self.engine.submit_client(client, ring, vm, ibs, copies)
     }
     /// (last completed, throttle) sequences of client ring `ring`.
     pub fn client_fences(&mut self, ring: MediaRing) -> Result<(u32, u32), Error> {

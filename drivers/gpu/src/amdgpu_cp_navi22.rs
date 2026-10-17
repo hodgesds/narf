@@ -108,12 +108,15 @@ impl Doorbells {
     }
 }
 
-/// GC BASE_IDX 0/1, NBIO BASE_IDX 2 and HDP bank byte offsets in BAR5.
+/// GC BASE_IDX 0/1, NBIO BASE_IDX 2, HDP and OSSSYS BASE_IDX 0 bank byte
+/// offsets in BAR5.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Layout {
     pub gc: [u64; 2],
     pub nbio: u64,
     pub hdp: u64,
+    /// OSSSYS 5.0.3 segment 0: the IH VMID LUT a client job's flush writes.
+    pub oss: u64,
 }
 impl Layout {
     pub(crate) fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
@@ -154,6 +157,12 @@ impl Layout {
                 0,
                 0xd1, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
             )?,
+            oss: reg(
+                ip::HW_ID_OSSSYS,
+                &[(5, 0, 3)],
+                0,
+                crate::amdgpu_navi22_submit::IH_VMID_LUT_LAST,
+            )?,
         };
         // SET_UCONFIG_REG and the CSB context index are encoded relative to
         // fixed apertures; reject bases that would alias other registers.
@@ -178,6 +187,10 @@ impl Layout {
     }
     pub(crate) fn segment(&self, index: usize) -> u32 {
         (self.gc[index] / 4) as u32
+    }
+    /// SOC15 absolute dword offset of an OSSSYS BASE_IDX 0 register.
+    pub(crate) fn oss(&self, offset: u32) -> u32 {
+        (self.oss / 4) as u32 + offset
     }
     /// `sdma_v5_2_get_reg_offset` for instances 0/1 (non-HYP registers).
     pub(crate) fn sdma(&self, instance: u32, r: Reg) -> u64 {

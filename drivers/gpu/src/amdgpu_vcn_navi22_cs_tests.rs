@@ -4,7 +4,7 @@
 //! from vcn_v2_0.c / jpeg_v2_0.c / gmc_v10_0.c rather than the module's
 //! constants.
 use super::*;
-use crate::amdgpu_navi22_submit::{encode_media, MediaFrame};
+use crate::amdgpu_navi22_submit::{encode_media, Ib, MediaFrame, VmRef};
 use alloc::{vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -269,12 +269,16 @@ kernel_test_in!(
 );
 
 const MMHUB: u32 = 0x1a000;
+/// OSSSYS segment 0 (0x10a0) + mmIH_VMID_0_LUT_MM (0x10) + VMID 3.
+const LUT: u32 = 0x10a0 + 0x10 + 3;
 const PTB: u64 = 0x0000_0001_2345_6001;
 fn vm(vmid: u8) -> VmRef {
     VmRef {
         vmid,
-        generation: 1,
         page_table_base: PTB,
+        pasid: 0x42,
+        flush: true,
+        map_pasid: true,
     }
 }
 
@@ -371,6 +375,7 @@ fn vcn_navi22_cs_media_frames_follow_linux_emit_order() -> TestResult {
         mmhub: MMHUB,
         engine: ring.inv_engine(1),
         flush: flush.then_some(vm(3)),
+        pasid_map: flush.then_some((LUT, 0x42)),
         vmid: 3,
         ibs,
         fence,
@@ -392,6 +397,7 @@ fn vcn_navi22_cs_media_frames_follow_linux_emit_order() -> TestResult {
     let start = [p0(0x10), 0, p0(0x0f), 0x8000_0000 | (0xa << 1)];
     want.extend(start);
     flush(&mut want, dec_wreg, dec_wait, MMHUB, 0, 3, PTB);
+    dec_wreg(&mut want, LUT, 0x42); // gmc_v10_0_emit_pasid_mapping (_LUT_MM)
     want.extend(start);
     for ib in &IBS {
         want.extend([
@@ -434,6 +440,7 @@ fn vcn_navi22_cs_media_frames_follow_linux_emit_order() -> TestResult {
     // Encode ring 0 (MMHUB engine 1): flush, IB, fence + trap, end.
     let mut want = Vec::new();
     flush(&mut want, enc_wreg, enc_wait, MMHUB, 1, 3, PTB);
+    enc_wreg(&mut want, LUT, 0x42);
     for ib in &IBS {
         want.extend([2, 3, ib.va as u32, (ib.va >> 32) as u32, ib.dwords]);
     }
@@ -448,6 +455,7 @@ fn vcn_navi22_cs_media_frames_follow_linux_emit_order() -> TestResult {
     let mut want = Vec::new();
     want.extend(jstart);
     flush(&mut want, jpeg_wreg, jpeg_wait, MMHUB, 5, 3, PTB);
+    jpeg_wreg(&mut want, LUT, 0x42);
     want.extend(jstart);
     for ib in &IBS {
         want.extend([
@@ -548,4 +556,48 @@ fn vcn_navi22_cs_media_ring_routing_follows_amdgpu_ctx() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/vcn-navi22",
     vcn_navi22_cs_media_ring_routing_follows_amdgpu_ctx
+);
+
+/// `amdgpu_vm_flush` on a ring without `emit_pipeline_sync` returns early
+/// unless the VM flushes, so a media grant's PASID remap rides along with a
+/// flush only (and is not recorded as done otherwise).
+fn vcn_navi22_cs_media_grant_maps_pasid_only_with_a_flush() -> TestResult {
+    use crate::amdgpu_navi22_submit::media_grant;
+    use crate::amdgpu_vmid::Grant;
+    let g = |needs_flush, map_pasid| Grant {
+        vmid: 2,
+        needs_flush,
+        map_pasid,
+    };
+    if media_grant(g(false, true)) != g(false, false)
+        || media_grant(g(true, true)) != g(true, true)
+        || media_grant(g(true, false)) != g(true, false)
+    {
+        return TestResult::Fail("PASID mapping without a VM flush on a media ring");
+    }
+    // And the frame carries no LUT write without a flush.
+    let ibs = [Ib {
+        va: 0x1000,
+        dwords: 4,
+    }];
+    let words = encode_media(&MediaFrame {
+        ring: MediaRing::Enc(0),
+        mmhub: MMHUB,
+        engine: 1,
+        flush: None,
+        pasid_map: None,
+        vmid: 2,
+        ibs: &ibs,
+        fence: 0x1000,
+        seq: 1,
+        ring_base: 0,
+    });
+    if words.first() != Some(&2) || words.len() != 5 + 6 {
+        return TestResult::Fail("unflushed encode frame");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn_navi22_cs_media_grant_maps_pasid_only_with_a_flush
 );

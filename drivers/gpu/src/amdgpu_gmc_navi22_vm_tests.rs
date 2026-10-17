@@ -592,3 +592,89 @@ kernel_test_in!(
     "drivers/gpu/gmc-navi22",
     vm_navi22_pte_flags_match_linux_composition
 );
+
+fn vm_navi22_client_vmids_are_lent_and_faults_charge_the_pasid() -> TestResult {
+    let (_pool, mut engine) = ready(1 << 20);
+    // Lent: VMIDs 1..first_kfd_vmid, once; the owner's own VMs skip them.
+    let lent = match engine.reserve_client_vmids() {
+        Ok(lent) => lent,
+        Err(_) => return TestResult::Fail("client VMIDs not lent"),
+    };
+    if lent.range() != (1, FIRST_KFD_VMID - 1)
+        || lent.owner() != engine.token
+        || engine.reserve_client_vmids().err() != Some(Error::Busy)
+    {
+        return TestResult::Fail("lent range or double lend");
+    }
+    let own = run(engine.create_vm()).unwrap();
+    if own.vmid() < FIRST_KFD_VMID {
+        return TestResult::Fail("owner VM took a lent client VMID");
+    }
+    // A UTCL2 fault on lent VMID 3 whose IV names an allocated PASID (the
+    // job's LUT write) is cached for that PASID, as
+    // amdgpu_vm_update_fault_cache, and reaches the space's GPUVM_FAULT.
+    let space = crate::amdgpu_vm::VmState::with_geometry(crate::amdgpu_vm::Geometry::GMC11);
+    let Some(pasid) = space.pasid() else {
+        return TestResult::Fail("no PASID");
+    };
+    let status = 0x0010_0000 | 0x1b << 9 | 3 << 4 | 0x100; // CID, VMID3, MAPPING
+    engine
+        .io
+        .registers
+        .insert(GFX_BASE + u64::from(GFX.fault_status) * 4, status);
+    let address = 0x7f_4321_0000u64;
+    let data = [(address >> 12) as u32, (address >> 44) as u32];
+    let word = u32::from(Fault::CLIENT_UTCL2) | 3 << 24;
+    let iv =
+        crate::amdgpu_ih_navi22::Iv::decode([word, 0, 0, u32::from(pasid), data[0], data[1], 0, 0]);
+    let Some(fault) = Fault::from_iv(&iv) else {
+        return TestResult::Fail("UTCL2 IV rejected");
+    };
+    let cntl = reg(&engine, GFX_BASE, GFX.fault_cntl);
+    if fault.pasid != pasid
+        || engine.handle_fault(fault) != Ok(FaultOwner::Client { vmid: 3, pasid })
+        || reg(&engine, GFX_BASE, GFX.fault_cntl) != cntl | 1
+    {
+        return TestResult::Fail("lent-VMID fault not charged to the IV's PASID");
+    }
+    let info = space.fault();
+    if info.addr != address || info.status != status || info.vmhub != 0 {
+        return TestResult::Fail("GPUVM_FAULT cache");
+    }
+    // MMHUB faults are charged with vmhub MM0; a zero status (a follow-on
+    // fault of the burst) does not replace a useful one.
+    engine
+        .io
+        .registers
+        .insert(MM_BASE + u64::from(MM.fault_status) * 4, 0x55);
+    let mm = Fault {
+        pasid,
+        ..Fault::decode(Fault::CLIENT_VMC, 0, 5, [0x10, 0]).unwrap()
+    };
+    let _ = engine.handle_fault(mm);
+    let after = space.fault();
+    engine
+        .io
+        .registers
+        .insert(MM_BASE + u64::from(MM.fault_status) * 4, 0);
+    let _ = engine.handle_fault(mm);
+    if after.vmhub != 1 || after.status != 0x55 || space.fault() != after {
+        return TestResult::Fail("MMHUB attribution or zero-status replacement");
+    }
+    // No PASID mapped yet (the LUT still reads 0): nothing is charged.
+    let unmapped = Fault { pasid: 0, ..mm };
+    engine
+        .io
+        .registers
+        .insert(MM_BASE + u64::from(MM.fault_status) * 4, 0x66);
+    if engine.handle_fault(unmapped) != Ok(FaultOwner::Client { vmid: 5, pasid: 0 })
+        || space.fault() != after
+    {
+        return TestResult::Fail("fault without a PASID charged");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi22",
+    vm_navi22_client_vmids_are_lent_and_faults_charge_the_pasid
+);

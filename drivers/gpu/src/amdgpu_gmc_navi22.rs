@@ -18,7 +18,9 @@ mod regs;
 mod vm;
 pub use gart::{GartInfo, Gtt, GART_SIZE};
 use regs::{HubRegs, GFX, MM};
-pub use vm::{Buffer, Fault, FaultInfo, FaultOwner, Mapping, Vm, VmInfo};
+pub use vm::{
+    Buffer, ClientVmids, Fault, FaultInfo, FaultOwner, Mapping, Vm, VmInfo, FIRST_KFD_VMID,
+};
 // linux: n/a (NARF boot-aperture size)
 const BYTES: u64 = 16384; // PT, default page, source page, destination page
                           // linux: n/a (NARF policy)
@@ -687,6 +689,12 @@ impl Gmc {
     }
     pub async fn destroy_vm(&mut self, vm: Vm) -> Result<(), Error> {
         self.engine.destroy_vm(vm).await
+    }
+    /// Lend GFXHUB VMIDs 1..`FIRST_KFD_VMID` to per-job client submission
+    /// for this owner's lifetime; this owner's own VMs never take them, and
+    /// their faults are charged to the IV's PASID. Requires the GART armed.
+    pub fn reserve_client_vmids(&mut self) -> Result<ClientVmids, Error> {
+        self.engine.reserve_client_vmids()
     }
     pub fn vm_info(&self, vm: &Vm) -> Option<VmInfo> {
         self.engine.vm_info(vm)
