@@ -857,9 +857,18 @@ fn inventory_encoder_caps_read_the_encoder_record_list() -> TestResult {
     let at = DISPLAY_OBJECT + PATHS_OFFSET + 8;
     image.0[at..at + 2].copy_from_slice(&((list - DISPLAY_OBJECT) as u16).to_le_bytes());
     image.0[list..list + 12].copy_from_slice(&[
-        21, 4, 0, 0, // bracket layout, skipped
-        RECORD_ENCODER_CAP, 6, 0x0c, 0, 0, 0, // HBR2_EN | HDMI6Gbps_EN
-        RECORD_END, 2,
+        21,
+        4,
+        0,
+        0, // bracket layout, skipped
+        RECORD_ENCODER_CAP,
+        6,
+        0x0c,
+        0,
+        0,
+        0, // HBR2_EN | HDMI6Gbps_EN
+        RECORD_END,
+        2,
     ]);
     if encoder_caps(image.bytes(), 0) != Ok(Some(0x0c))
         || encoder_caps(image.bytes(), 3) != Ok(None)
