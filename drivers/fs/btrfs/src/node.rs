@@ -122,7 +122,7 @@ fn glibc_to_kernel_dev(dev: u64) -> u64 {
 /// propagates. Bounded so a persistently-failing op can't loop forever.
 macro_rules! autogrow {
     ($vol:expr, $op:expr) => {{
-        if !$vol.supports_writes() {
+        if !$vol.admits_writes() {
             return Err(FsError::ReadOnly);
         }
         let mut r = $op;
@@ -659,6 +659,47 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 core::sync::atomic::Ordering::Relaxed,
             );
             Ok(written)
+        })
+    }
+
+    /// `ftruncate`/`O_TRUNC` (`btrfs_setattr` with `ATTR_SIZE`).
+    fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            if !self.inode.is_regular() {
+                return Err(FsError::Unsupported);
+            }
+            let vol = self.volume()?;
+            autogrow!(vol, crate::write::truncate_file(&vol, self.ino, len).await)?;
+            self.live_size
+                .store(len, core::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })
+    }
+
+    /// `fallocate(2)` (`btrfs_fallocate`).
+    fn fallocate<'a>(&'a self, mode: u32, offset: u64, len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            if !self.inode.is_regular() {
+                return Err(FsError::Unsupported);
+            }
+            let vol = self.volume()?;
+            autogrow!(
+                vol,
+                crate::write::fallocate_file(&vol, self.ino, mode, offset, len).await
+            )?;
+            if mode & crate::write::FALLOC_FL_KEEP_SIZE == 0 {
+                self.live_size.fetch_max(
+                    offset.saturating_add(len),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            Ok(())
         })
     }
 
@@ -1228,23 +1269,47 @@ impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
     }
 
     fn reconfigure(&self, options: &str) -> Result<(), FsError> {
-        // `systemd-remount-fs` remounts `/` with its fstab options
-        // (`subvol=/@,compress=zstd:1`, ...). Accept what a mount accepts;
-        // like Linux, `subvol=`/`subvolid=` cannot change on remount and are
-        // ignored, everything else replaces the recorded run-time options.
-        let mut parsed = crate::mount_opts::parse(options)?;
-        // A volume made read-only (disk policy, write-safety gate, a second
-        // writer of its fsid) stays read-only: `rw` is refused, not ignored.
-        if options.split(',').any(|o| o == "rw") && self.is_read_only() {
-            return Err(FsError::ReadOnly);
+        self.reconfigure_sb(0, 0, options)
+    }
+
+    /// `mount -o remount` (Linux `btrfs_reconfigure`). `systemd-remount-fs`
+    /// remounts `/` with its fstab options (`subvol=/@,compress=zstd:1`, ...)
+    /// and `systemd-shutdown` remounts it `ro` before poweroff. Accept what a
+    /// mount accepts; like Linux, `subvol=`/`subvolid=` cannot change on
+    /// remount and are ignored, everything else replaces the recorded run-time
+    /// options. `SB_RDONLY` flipping on (in `sb_flags`, or `ro` in the data)
+    /// commits and makes the filesystem read-only (`btrfs_remount_ro`);
+    /// flipping off makes it writable again (`btrfs_remount_rw`), refused
+    /// with `ReadOnly` where a read-write mount would be (disk policy,
+    /// write-safety gate, an aborted transaction).
+    fn reconfigure_sb(&self, sb_flags: u64, sb_mask: u64, options: &str) -> Result<(), FsError> {
+        use narf_filesystem::sb_flags::RDONLY;
+        let mut want_ro = (sb_mask & RDONLY != 0).then_some(sb_flags & RDONLY != 0);
+        for option in options.split(',') {
+            match option {
+                "ro" => want_ro = Some(true),
+                "rw" => want_ro = Some(false),
+                _ => {}
+            }
+        }
+        let rest: alloc::vec::Vec<&str> = options
+            .split(',')
+            .filter(|o| !o.is_empty() && *o != "ro" && *o != "rw")
+            .collect();
+        let mut parsed = crate::mount_opts::parse(&rest.join(","))?;
+        match want_ro {
+            Some(true) if !self.is_read_only() => {
+                narf_scheduler::block_on(self.remount_read_only())?;
+            }
+            Some(false) if self.is_read_only() => {
+                let this = self.self_weak.upgrade().ok_or(FsError::NotFound)?;
+                this.remount_read_write()?;
+            }
+            _ => {}
         }
         let current = self.mount_options();
         parsed.subvol = current.subvol;
-        if parsed.read_only && !self.is_read_only() {
-            // A writable volume cannot be flipped read-only in place yet.
-            return Err(FsError::Unsupported);
-        }
-        parsed.read_only = current.read_only;
+        parsed.read_only = self.is_read_only();
         self.set_mount_options(parsed);
         Ok(())
     }

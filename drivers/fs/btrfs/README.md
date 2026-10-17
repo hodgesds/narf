@@ -88,6 +88,15 @@ real laptop's btrfs root looks like.
   and `mount -t btrfs`, including `subvolid=N` / `subvol=PATH` (ordinary
   directories and nested subvolumes) to root at a specific subvolume. A plain mount honors the on-disk
   **default subvolume** (`ROOT_TREE_DIR`'s "default" entry).
+- **Size and allocation changes**, following Linux. `truncate`/`O_TRUNC`
+  shrinks (trim, delete, inline shorten, zeroed tail) and grows (NO_HOLES:
+  size only; `^no-holes`: hole items). Truncating to the current size drops
+  preallocation past EOF. `fallocate` mode 0 and `KEEP_SIZE` lay PREALLOC
+  extents without csums; `PUNCH_HOLE` and `ZERO_RANGE` are supported; other
+  modes are EOPNOTSUPP. A write into preallocated space converts only its
+  own sectors. Items are trimmed, moved or split in place, and a split adds
+  an `EXTENT_DATA_REF` count. `mount -o remount,ro` commits and makes the
+  whole filesystem read-only; `remount,rw` makes it writable again.
 - **One instance per filesystem** (Linux's one `btrfs_fs_info` per fsid). Every
   mount of an already-mounted fsid, whichever subvolume it selects, is a view
   (`BtrfsVolume`) over one shared `VolCore`. The core holds the devices, the

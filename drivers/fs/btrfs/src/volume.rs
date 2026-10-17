@@ -199,7 +199,7 @@ pub struct BtrfsVolume<B: BlockDevice> {
     view: IrqSafeSpinLock<ViewState>,
     /// This mount was requested read-only. The core may still be writable
     /// through other mounts, as a Linux `ro` bind of a `rw` superblock is.
-    view_read_only: bool,
+    view_read_only: core::sync::atomic::AtomicBool,
     /// The `mount -t btrfs` data options this volume was mounted with
     /// (compression, discard, ...). Recorded so the writer and
     /// `show_options` can honour them; see [`crate::mount_opts`].
@@ -227,6 +227,11 @@ impl<B: BlockDevice> VolCore<B> {
     /// The transaction accumulating operations that have not committed yet.
     pub(crate) fn fs_batch(&self) -> &Mutex<Option<crate::write::FsBatch>> {
         &self.fs_batch
+    }
+
+    /// No mount of this filesystem may write (mounted or remounted ro).
+    pub(crate) fn is_core_read_only(&self) -> bool {
+        self.read_only.load(core::sync::atomic::Ordering::Acquire)
     }
 
     /// The filesystem UUID this instance serves.
@@ -288,6 +293,9 @@ pub struct VolCore<B: BlockDevice> {
     rw_refusal: IrqSafeSpinLock<Option<crate::rw_gate::Refusal>>,
     /// The commit timer (Linux `transaction_kthread`) runs once per core.
     timer_started: core::sync::atomic::AtomicBool,
+    /// A remount to read-only is draining the running transaction: new
+    /// operations are refused while the commit it forces still writes.
+    frozen: core::sync::atomic::AtomicBool,
     devices: IrqSafeSpinLock<BTreeMap<u64, Arc<VolumeDevice<B>>>>,
     state: IrqSafeSpinLock<VolState>,
     /// A stamped superblock image whose commit has completed in memory but
@@ -399,14 +407,69 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// does one whose transaction was aborted.
     pub(crate) fn supports_writes(&self) -> bool {
         !self.core_read_only()
-            && !self.view_read_only
+            && !self.view_read_only()
             && !self.degraded
             && !self.aborted.load(core::sync::atomic::Ordering::Acquire)
             && self.fs_tree_flags() & format::ROOT_SUBVOL_RDONLY == 0
     }
 
-    /// True when the volume was mounted read-only (requested, or a member
-    /// device refuses writes).
+    /// [`Self::supports_writes`] and not being remounted read-only: the check
+    /// an operation passes before it starts. The write funnels keep using
+    /// `supports_writes`, so the draining commit itself can still land.
+    pub(crate) fn admits_writes(&self) -> bool {
+        self.supports_writes() && !self.frozen.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    fn view_read_only(&self) -> bool {
+        self.view_read_only
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// `mount -o remount,ro` (Linux `btrfs_reconfigure` →
+    /// `btrfs_remount_ro`): stop admitting operations, commit the running
+    /// transaction and make its superblock durable (`btrfs_commit_super`),
+    /// then mark the filesystem read-only. The superblock is shared by every
+    /// mount of the filesystem, so they all become read-only, as on Linux.
+    /// The commit timer idles while the filesystem is read-only.
+    pub async fn remount_read_only(&self) -> Result<(), FsError> {
+        use core::sync::atomic::Ordering;
+        if self.core_read_only() {
+            return Ok(());
+        }
+        self.frozen.store(true, Ordering::Release);
+        let result = loop {
+            if let Err(err) = self.sync_to_disk().await {
+                break Err(err);
+            }
+            // Close the window an operation admitted just before the freeze
+            // could still use: flip only with no batch open and nothing
+            // staged, under the lock every new batch must take.
+            let _txn = self.txn_lock().lock().await;
+            let mut batch = self.fs_batch().lock().await;
+            let pending =
+                batch.as_ref().is_some_and(|b| b.has_ops()) || self.staged_super.lock().is_some();
+            if pending {
+                continue;
+            }
+            *batch = None;
+            self.read_only.store(true, Ordering::Release);
+            break Ok(());
+        };
+        self.frozen.store(false, Ordering::Release);
+        result
+    }
+
+    /// `mount -o remount,rw` (`btrfs_remount_rw`): make the filesystem
+    /// writable again, refused (`ReadOnly` → EROFS) exactly where a
+    /// read-write mount would be, and clear this mount's own read-only
+    /// request.
+    pub fn remount_read_write(self: &Arc<Self>) -> Result<(), FsError> {
+        self.make_writable()?;
+        self.view_read_only
+            .store(false, core::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
     /// The data options recorded at mount (see [`crate::mount_opts`]).
     pub fn mount_options(&self) -> crate::mount_opts::MountOptions {
         self.mount_options.lock().clone()
@@ -423,7 +486,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     }
 
     pub fn is_read_only(&self) -> bool {
-        self.core_read_only() || self.view_read_only
+        self.core_read_only() || self.view_read_only()
     }
 
     /// Refuse all further writes, because a transaction was lost after its
@@ -1402,6 +1465,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             rw_refusal: IrqSafeSpinLock::new(None),
             txn_lock: Mutex::new(()),
             timer_started: core::sync::atomic::AtomicBool::new(false),
+            frozen: core::sync::atomic::AtomicBool::new(false),
             devices: IrqSafeSpinLock::new(devices),
             staged_super: IrqSafeSpinLock::new(None),
             staged_count: core::sync::atomic::AtomicUsize::new(0),
@@ -1441,7 +1505,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                 fs_tree_id: 0,
                 root_inode: None,
             }),
-            view_read_only: read_only,
+            view_read_only: core::sync::atomic::AtomicBool::new(read_only),
             mount_options: IrqSafeSpinLock::new(crate::mount_opts::MountOptions::default()),
         })
     }

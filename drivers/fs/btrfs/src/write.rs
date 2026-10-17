@@ -58,6 +58,8 @@ use narf_block::BlockDevice;
 use narf_filesystem::FsError;
 
 use crate::allocator::Allocator;
+
+pub(crate) mod fileops;
 use crate::block_group::{self, BgHome};
 use crate::btree::{
     self, internal_blockptr, internal_child_slot, internal_key, leaf_item_data, leaf_item_key,
@@ -69,6 +71,9 @@ use crate::format::{self, le64, BtrfsKey};
 use crate::inode::InodeItem;
 use crate::roots;
 use crate::volume::{BalanceProfiles, BalanceStats, BtrfsVolume};
+pub use fileops::{
+    fallocate_file, truncate_file, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE,
+};
 
 // Header field offsets rewritten when a node is stamped.
 const HDR_BYTENR: usize = 48;
@@ -984,11 +989,22 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
         file_ranges.push((key.offset, key.offset.saturating_add(file_len)));
     }
 
+    // PREALLOC items are not absorbed: the write carves its sectors out of
+    // them (write-to-convert, Linux `btrfs_mark_extent_written`), leaving the
+    // rest preallocated, so a small write into a large preallocation costs
+    // only its own sectors.
+    let is_prealloc = |body: &[u8]| {
+        body[20] == format::FILE_EXTENT_PREALLOC && le64(body, 21).is_ok_and(|b| b != 0)
+    };
     let mut affected = alloc::vec![false; extents.len()];
     loop {
         let mut widened = false;
         for (i, &(start, finish)) in file_ranges.iter().enumerate() {
-            if affected[i] || start >= rewrite_end || finish <= rewrite_start {
+            if affected[i]
+                || start >= rewrite_end
+                || finish <= rewrite_start
+                || is_prealloc(&extents[i].1)
+            {
                 continue;
             }
             affected[i] = true;
@@ -1105,7 +1121,19 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     // than beside `batch_stage` below is what keeps the refusal free of
     // consequences — by then the data extents have been allocated and written,
     // and a rejection would strand them until the batch commits.
-    let displaced = affected.iter().filter(|hit| **hit).count();
+    let items: Vec<fileops::FileItem> = extents
+        .iter()
+        .map(|(k, b)| fileops::FileItem::decode(*k, b.clone()))
+        .collect::<Result<_, _>>()?;
+    let converted = fileops::carve(
+        &items,
+        rewrite_start,
+        rewrite_end,
+        vol.fs_tree_id(),
+        ino,
+        |i| matches!(i.kind, fileops::Kind::Disk { prealloc: true }),
+    )?;
+    let displaced = affected.iter().filter(|hit| **hit).count() + converted.edits.len();
     let laid_down = rewrite_len.div_ceil(MAX_WRITE_EXTENT) as usize;
     qgroup_begin_op(batch);
     qgroup_reserve(vol, batch, vol.fs_tree_id(), rewrite_len).await?;
@@ -1165,12 +1193,14 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     // ── Path-COW the fs tree: drop only intersected EXTENT_DATA, add the new tiling,
     //    and update the inode (found via a lookup, not a full tree read) —
     //    COWing only the touched paths rather than rebuilding the whole tree. ──
-    let mut edits: Vec<Edit> = Vec::new();
+    let mut edits: Vec<Edit> = converted.edits;
     for (i, (key, _)) in extents.iter().enumerate() {
         if affected[i] {
             edits.push(Edit::Delete(*key));
         }
     }
+    dropped_data.extend(converted.dropped);
+    let removed_nbytes = removed_nbytes + converted.removed_nbytes;
     for (key, body) in &new_eds {
         edits.push(Edit::Upsert(*key, body.clone()));
     }
@@ -1189,7 +1219,7 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     new_inode[24..32].copy_from_slice(&new_nbytes.to_le_bytes()); // nbytes
     edits.push(Edit::Upsert(inode_key, new_inode));
 
-    batch_stage(vol, batch, &edits, dropped_data, new_data).await?;
+    batch_stage_refs(vol, batch, &edits, dropped_data, converted.added, new_data).await?;
     let full = batch.ops >= MAX_BATCH_OPS;
     drop(guard);
     if full {
@@ -1254,6 +1284,10 @@ pub(crate) struct FsBatch {
     alloc: Allocator,
     cow: CowState,
     dropped_data: Vec<DataRefId>,
+    /// Extra references to existing extents: a PREALLOC/REG extent split in
+    /// two by a write-to-convert or a punched hole leaves two file items with
+    /// one backref identity, i.e. an `EXTENT_DATA_REF` count of two.
+    added_data: Vec<DataRefId>,
     new_data: Vec<DataRef>,
     ops: usize,
     /// Raw monotonic cycles at which this transaction opened, for the commit
@@ -1288,6 +1322,13 @@ pub(crate) struct FsBatch {
     /// operation starts, so every failure path is covered without any of them
     /// having to remember, including the ones that return before staging.
     op_reserved: BTreeMap<u64, u64>,
+}
+
+impl FsBatch {
+    /// Whether any operation has been staged into this transaction.
+    pub(crate) fn has_ops(&self) -> bool {
+        self.ops > 0
+    }
 }
 
 /// Open the batch if none is open, and lock it for one operation.
@@ -1334,6 +1375,7 @@ async fn batch_begin<'a, B: BlockDevice + 'static>(
             alloc: Allocator::build(vol).await?,
             cow,
             dropped_data: Vec::new(),
+            added_data: Vec::new(),
             new_data: Vec::new(),
             ops: 0,
             base_root: (fs_root, fs_level),
@@ -1528,6 +1570,9 @@ pub(crate) fn spawn_commit_timer<B: BlockDevice + 'static>(
             };
             // One timer per filesystem, whichever mounts are open: commit as
             // the subvolume the running transaction belongs to.
+            if core.is_core_read_only() {
+                continue; // remounted read-only: nothing may commit
+            }
             let tree = match core.fs_batch().lock().await.as_ref() {
                 Some(batch) => batch.tree_id,
                 None => continue,
@@ -1556,6 +1601,18 @@ async fn batch_stage<B: BlockDevice + 'static>(
     batch: &mut FsBatch,
     edits: &[Edit],
     dropped_data: Vec<DataRefId>,
+    new_data: Vec<DataRef>,
+) -> Result<(), FsError> {
+    batch_stage_refs(vol, batch, edits, dropped_data, Vec::new(), new_data).await
+}
+
+/// [`batch_stage`] that also records added references (extent splits).
+async fn batch_stage_refs<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    batch: &mut FsBatch,
+    edits: &[Edit],
+    dropped_data: Vec<DataRefId>,
+    added_data: Vec<DataRefId>,
     new_data: Vec<DataRef>,
 ) -> Result<(), FsError> {
     // Roll-back point. A failure part-way through `apply_edits` leaves the tree
@@ -1614,7 +1671,17 @@ async fn batch_stage<B: BlockDevice + 'static>(
     // This is the data-side twin of what `PathCow::retire` does for metadata:
     // a block made this transaction and then dropped is removed from `pending`
     // rather than pushed onto `freed`.
+    // Additions first: a split recorded by this operation must be in place
+    // before a drop of one of its pieces can cancel against it.
+    batch.added_data.extend(added_data);
     for id in dropped_data {
+        // A drop of one piece of an extent this batch split cancels the
+        // split's extra reference; only the last piece of an extent born in
+        // this batch cancels the birth.
+        if let Some(extra) = batch.added_data.iter().position(|a| *a == id) {
+            batch.added_data.remove(extra);
+            continue;
+        }
         match batch.new_data.iter().position(|d| d.id.bytenr == id.bytenr) {
             Some(born_here) => {
                 batch.new_data.remove(born_here);
@@ -1729,7 +1796,7 @@ async fn commit_batch_inner<B: BlockDevice + 'static>(
                 level: out.root_level,
             },
             dropped_data: batch.dropped_data,
-            added_data: Vec::new(),
+            added_data: batch.added_data,
             added_meta: Vec::new(),
             dropped_meta: Vec::new(),
             new_data: batch.new_data,
