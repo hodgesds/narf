@@ -28,15 +28,13 @@ pub mod rw_gate {
     pub enum Refusal { Incompat(u64), CompatRo(u64), FreeSpaceTreeInvalid,
         NoFreeSpaceTree, LogTree(u64), ChecksumType(u16), SectorSize(u32),
         NodeSize(u32), ErrorState, SuperFlags(u64), Generation, MultiDevice(u64),
-        BalanceInProgress, ReplaceInProgress, RelocationInProgress, AnotherWriter }
+        BalanceInProgress, ReplaceInProgress, RelocationInProgress }
     pub fn active_profile() -> Profile;
     pub fn check_superblock(sb: &Superblock, super_flags: u64, p: Profile) -> Result<(), Refusal>;
     pub async fn check_trees(vol: &BtrfsVolume<B>) -> Result<(), Refusal>;
-    pub fn claim_writer(fsid: [u8; 16], p: Profile) -> Result<WriterClaim, Refusal>;
     pub fn supported_features(p: Profile) -> (Vec<&str>, Vec<&str>);
     pub fn last_refusal() -> Option<String>;
 }
-BtrfsVolume::mount_devices_claimed(devices, domain, read_only)  // VFS-visible mounts
 FsInstance::always_read_only() for BtrfsVolume == is_read_only()
 pub mod interop { pub fn run(mode: &str) -> InitResult }        // test vehicle
 ```
@@ -49,9 +47,9 @@ Device ownership remains pinned by the returned filesystem instance.
 
 A volume about to be mounted read-write runs `rw_gate` after the chunk map is
 loaded and before anything can write (log replay, the commit timer, any VFS
-operation); a refusal makes it read-only for its lifetime and is logged. At
-most one VFS-visible writable volume exists per fsid (`claim_writer`); a
-read-write `mount -t btrfs` that cannot be honoured returns
+operation), once per shared core (`registry`); a refusal makes the core
+read-only for its lifetime, is logged, and makes later read-write mounts of
+it fail. A read-write `mount -t btrfs` that cannot be honoured returns
 `FsError::ReadOnly` (EROFS). Data extents are allocated only from DATA block
 groups and tree blocks only from METADATA ones. A write through an open file
 uses the inode item from the tree, never the node's cached copy.

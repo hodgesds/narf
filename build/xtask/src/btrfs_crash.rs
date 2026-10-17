@@ -162,7 +162,7 @@ pub fn run(args: &Args) -> Result<()> {
     std::env::set_var("XTASK_QEMU_APPEND", prior_append);
 
     let check = Command::new("btrfs")
-        .args(["check", "--readonly"])
+        .args(["check", "--readonly", "--check-data-csum"])
         .arg(&image)
         .output()
         .context("run host `btrfs check`")?;

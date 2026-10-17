@@ -396,14 +396,22 @@ async fn run_fstab(root: &Arc<dyn DirOps>) -> Result<(), &'static str> {
             return Err("an fstab subvolume mount came up read-only");
         }
         let dir = fs.root();
-        let file = dir.create("narf-fstab.txt").await.map_err(|_| "create in subvolume")?;
+        let file = dir
+            .create("narf-fstab.txt")
+            .await
+            .map_err(|_| "create in subvolume")?;
         write_all(&file, 0, &fstab_marker(subvol))
             .await
             .map_err(|_| "write in subvolume")?;
         mounted.push((subvol, fs));
     }
-    let file = root.create("narf-fstab.txt").await.map_err(|_| "create in @")?;
-    write_all(&file, 0, &fstab_marker("@")).await.map_err(|_| "write in @")?;
+    let file = root
+        .create("narf-fstab.txt")
+        .await
+        .map_err(|_| "create in @")?;
+    write_all(&file, 0, &fstab_marker("@"))
+        .await
+        .map_err(|_| "write in @")?;
     // One sync covers every subvolume: they share one transaction.
     root.syncfs().await.map_err(|_| "syncfs")?;
     for (subvol, fs) in &mounted {

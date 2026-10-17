@@ -439,20 +439,22 @@ grub-image still writes `boot-only`.
   log tree (`log_root == 0`; mount once on Linux to replay a dirty log). Its
   incompat set is limited to `MIXED_BACKREF DEFAULT_SUBVOL COMPRESS_LZO
   COMPRESS_ZSTD BIG_METADATA EXTENDED_IREF SKINNY_METADATA NO_HOLES` and its
-  compat_ro set to `FREE_SPACE_TREE FREE_SPACE_TREE_VALID`.
-- **One writer per filesystem.** Each btrfs mount builds its own volume. Only
-  the first read-write mount of an fsid writes; later read-write mounts fail
-  with `EROFS`, which `mount(8)` retries read-only. Under `root-rw` the claim
-  lasts the boot. In practice `/` (`@`) is writable and the other fstab
-  subvolumes (`/home`, `/var/log`, ...) come up read-only until mounts of one
-  fsid share a volume.
-- **Status on this host: `root-rw` refuses the CachyOS root today.** The root
-  has `BLOCK_GROUP_TREE` (compat_ro `0xb`, incompat `0x371`), and the writer
-  does not maintain the block-group tree yet. The read-write mount is refused
-  by name (`unsupported compat_ro feature(s) for writing: BLOCK_GROUP_TREE`)
-  and the boot stops. `root-ro` works with the read-only BGT support. Compare
-  the gate with the real superblock using `sudo btrfs inspect-internal
-  dump-super /dev/disk/by-uuid/653602c3-cd42-420e-95ef-4c4033d17b56`.
+  compat_ro set to `FREE_SPACE_TREE FREE_SPACE_TREE_VALID BLOCK_GROUP_TREE`.
+- **One writer per filesystem.** Every btrfs mount of an fsid is a view of
+  one shared core: one transaction, one allocator, one superblock commit. So
+  under `root-rw` all seven fstab subvolumes (`/`, `/home`, `/root`, `/srv`,
+  `/var/cache`, `/var/tmp`, `/var/log`) are writable together. The gate
+  runs once per core. A read-write mount of a refused core fails with `EROFS`,
+  which `mount(8)` retries read-only. Every other fsid and device stays
+  read-only at the block layer.
+- **Status on this host.** The CachyOS root has compat_ro `0xb`
+  (`FREE_SPACE_TREE FREE_SPACE_TREE_VALID BLOCK_GROUP_TREE`) and incompat
+  `0x371`, and the writer maintains all of it, block-group tree included, so
+  `root-rw` writes it. The gate refuses only if the superblock read at boot
+  shows a pending log tree (an unclean Linux shutdown), an error flag, or a
+  running balance or replace. Compare with the real superblock using `sudo
+  btrfs inspect-internal dump-super
+  /dev/disk/by-uuid/653602c3-cd42-420e-95ef-4c4033d17b56`.
 - **What the writer does to a CachyOS volume.**
   - New data is written uncompressed, which is valid under
     `compress=zstd:1`.
@@ -469,14 +471,22 @@ grub-image still writes `boot-only`.
 - **Interop test.** `cargo xtask btrfs-rootrw-interop` builds a CachyOS-shaped
   image unprivileged and boots it under `root-rw`. The image has GPT, an ESP,
   btrfs with nodesize 16K, crc32c, FST, no-holes, `--compress zstd:1`, the
-  seven `@` subvolumes and `+C` journals. There is one boot each for `@`
-  (pacman db add and remove, `/etc/hostname` replace, a zstd-file overwrite,
-  an unlink), `@home` and `@log` (journal append, rotate and vacuum). After
-  each boot the test requires host `btrfs check --readonly
+  seven `@` subvolumes and `+C` journals. It is built twice, with the host's
+  exact flags (block-group tree) and without them. Each image gets four
+  boots:
+  - `@`: pacman db add and remove, `/etc/hostname` replace, a zstd-file
+    overwrite, an unlink;
+  - `@home`;
+  - `@log`: journal append, rotate and vacuum;
+  - `fstab`: all six other subvolumes mounted rw through the shared core and
+    written.
+
+  After each boot the test requires host `btrfs check --readonly
   --check-data-csum` to be clean and the GPT and ESP to be byte-identical. At
-  the end, `btrfs restore` content must match. The host-exact BGT image must
-  be refused by name and stay bit-identical. A host `mount -o loop,ro` runs
-  only with passwordless sudo.
+  the end, `btrfs restore` content must match in all seven subvolumes.
+  `--bgt=refused` checks the opposite case (a writer without BGT support).
+  `cargo xtask btrfs-crash-smoke [--bgt]` checks fsync durability across a
+  SIGKILL. A host `mount -o loop,ro` runs only with passwordless sudo.
 - **Before a real `root-rw` boot**, take a read-only snapshot on CachyOS
   (`sudo btrfs subvolume snapshot -r / /.snapshots/pre-narf`) and keep a
   backup of `/home`. Shut NARF down cleanly (`sync`, then power off). Back on
