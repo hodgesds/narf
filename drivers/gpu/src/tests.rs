@@ -11774,19 +11774,28 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
     struct Fake {
         completed: AtomicU64,
         seen: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, u32, Option<u64>)>>,
+        /// The last job's context health, and a job that "hung".
+        health:
+            narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<crate::amdgpu_ctx::Health>>>,
+        hung: AtomicU64,
     }
     impl crate::amdgpu_cs::Submitter for Fake {
         fn submit<'a>(
             &'a self,
             vm: &'a VmState,
             s: &'a crate::amdgpu_cs::Submission,
+            health: &'a alloc::sync::Arc<crate::amdgpu_ctx::Health>,
         ) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<u64, FsError>> + Send + 'a>>
         {
             Box::pin(async move {
+                *self.health.lock() = Some(health.clone());
                 let mut seen = self.seen.lock();
                 seen.push((s.ibs[0].va_start, s.ibs[0].length_dw, vm.root_pde()));
                 Ok(seen.len() as u64)
             })
+        }
+        fn error(&self, seq: u64) -> Option<FsError> {
+            (seq != 0 && self.hung.load(Ordering::SeqCst) == seq).then_some(FsError::TimedOut)
         }
         fn signalled(&self, seq: u64) -> bool {
             self.completed.load(Ordering::SeqCst) >= seq
@@ -11937,6 +11946,8 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
     let fake = alloc::sync::Arc::new(Fake {
         completed: AtomicU64::new(0),
         seen: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+        health: narf_lib::sync::IrqSafeSpinLock::new(None),
+        hung: AtomicU64::new(0),
     });
     register_submitter(card, fake.clone());
     let result = (|| {
@@ -12230,6 +12241,50 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
             ) {
                 return Some("an EXPLICIT_SYNC buffer does not wait");
             }
+        }
+        // The engine gives up on the last job: WAIT_CS reports ETIME, the
+        // context reads as guilty and reset, and refuses further jobs.
+        let last = fake.seen.lock().len() as u64;
+        fake.hung.store(last, Ordering::SeqCst);
+        fake.completed.store(last, Ordering::SeqCst);
+        fake.health.lock().as_ref()?.mark_guilty();
+        let mut w = wait_req(last, ctx_id);
+        if run(wait_cmd, &mut w) != Err(FsError::TimedOut) {
+            return Some("WAIT_CS of a hung job");
+        }
+        for (op, at, want) in [
+            (
+                u::AMDGPU_CTX_OP_QUERY_STATE2,
+                0..8,
+                u64::from(u::AMDGPU_CTX_QUERY2_FLAGS_RESET | u::AMDGPU_CTX_QUERY2_FLAGS_GUILTY),
+            ),
+            (
+                u::AMDGPU_CTX_OP_QUERY_STATE,
+                12..16,
+                u64::from(u::AMDGPU_CTX_UNKNOWN_RESET),
+            ),
+        ] {
+            let mut q = [0u8; core::mem::size_of::<u::DrmAmdgpuCtx>()];
+            q[0..4].copy_from_slice(&op.to_le_bytes());
+            q[8..12].copy_from_slice(&ctx_id.to_le_bytes());
+            ctx_dispatch(
+                DRM_COMMAND_BASE + u::DRM_AMDGPU_CTX,
+                q.as_mut_ptr() as usize,
+                &ctx,
+                false,
+            )
+            .ok()?;
+            let mut got = [0u8; 8];
+            got[..at.len()].copy_from_slice(&q[at]);
+            if u64::from_le_bytes(got) != want {
+                return Some("context state after a hang");
+            }
+        }
+        let mut c = cs_with(&[]);
+        if run(cs_cmd, &mut c.req) != Err(FsError::TimedOut)
+            || fake.seen.lock().len() as u64 != last
+        {
+            return Some("a guilty context submitted again");
         }
         None
     })();
@@ -13537,6 +13592,7 @@ fn smoke_amdgpu_info_available_rings_follow_the_submitter() -> TestResult {
             &'a self,
             _: &'a crate::amdgpu_vm::VmState,
             _: &'a crate::amdgpu_cs::Submission,
+            _: &'a alloc::sync::Arc<crate::amdgpu_ctx::Health>,
         ) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<u64, FsError>> + Send + 'a>>
         {
             Box::pin(async { Err(FsError::Unsupported) })

@@ -4703,6 +4703,24 @@ one-page GEM buffer of the open with the 8 bytes at `offset` inside it
 there by the CPU when a fence read retires the job (`GemObject::store_u64`
 through `defer_until`), never replacing a newer handle of the same ring.
 
+Timeouts (`amdgpu_ring_watch`): `Submitter::submit` takes the submitting
+context's `amdgpu_ctx::Health`. A `RingWatch` per ring follows its jobs;
+the front job's timeout (`JOB_TIMEOUT_NS`, amdgpu's 2 s lockup default)
+counts from when it reached the front, and past it the ring is hung: that
+job's `Submitter::error` is `TimedOut` and its context guilty, each later
+job not yet complete is `Canceled` and its context records that, and the
+ring refuses new jobs (`Canceled`). `Submitter::signalled` then reports
+those jobs ended, so waiters return, but `retire` — what frees their
+memory, page tables and VMIDs — still waits for the hardware fence.
+`AMDGPU_WAIT_CS` of an ended job with an error fails with it
+(amdgpu_cs_wait_ioctl); `AMDGPU_CS` on a context with an error fails with
+it before queueing (amdgpu_ctx_get_entity); `CTX QUERY_STATE2` reports
+RESET, plus GUILTY for `TimedOut`, and `QUERY_STATE` `UNKNOWN_RESET`. The
+Navi48 platform spawns a watchdog that checks its rings every 100 ms while
+its submitter stays registered. A hung ring stays hung (no queue reset
+yet). VRAM clear fences follow SDMA0's hardware fence only, never a
+timeout's verdict.
+
 The Navi48 platform registers both kernel queues as its card's submitter
 after boot: up to eight IBs per submission (`Job::new`, in order in one
 slot), all for the graphics ring or all for the compute ring

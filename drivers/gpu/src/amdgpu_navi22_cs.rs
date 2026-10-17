@@ -191,6 +191,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
         &'a self,
         vm: &'a crate::amdgpu_vm::VmState,
         submission: &'a crate::amdgpu_cs::Submission,
+        _health: &'a alloc::sync::Arc<crate::amdgpu_ctx::Health>,
     ) -> Pin<Box<dyn Future<Output = Result<u64, FsError>> + Send + 'a>> {
         Box::pin(async move {
             let first = submission.ibs.first().ok_or(FsError::InvalidData)?;

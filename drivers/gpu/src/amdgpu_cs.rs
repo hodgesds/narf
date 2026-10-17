@@ -488,14 +488,25 @@ pub fn parse(
 pub trait Submitter: Send + Sync {
     /// Queue `submission` in the address space `vm`; returns its sequence,
     /// which `AMDGPU_CS` hands back as the fence handle.
+    ///
+    /// The job reports a hang or its cancellation to `health`, its
+    /// context's.
     fn submit<'a>(
         &'a self,
         vm: &'a VmState,
         submission: &'a Submission,
+        health: &'a Arc<crate::amdgpu_ctx::Health>,
     ) -> Pin<Box<dyn Future<Output = Result<u64, FsError>> + Send + 'a>>;
-    /// Whether job `ticket` has completed, without waiting or blocking on
-    /// an async owner (job fences in syncobjs ask this).
+    /// Whether job `ticket` has ended — completed, or given up on with an
+    /// [`error`](Self::error) — without waiting or blocking on an async
+    /// owner (job fences in syncobjs ask this). Memory the job may reach is
+    /// released by [`retire`] alone, on true completion.
     fn signalled(&self, ticket: u64) -> bool;
+    /// How job `ticket` ended if not by completing: `TimedOut` when it hung
+    /// its ring, `Canceled` when it was abandoned behind such a job.
+    fn error(&self, _ticket: u64) -> Option<FsError> {
+        None
+    }
     /// The ring index (a ticket's high 32 bits) that runs `ip_type`
     /// instance `ip_instance`, ring `ring`, if this engine has one.
     fn ring_for(&self, ip_type: u32, ip_instance: u32, ring: u32) -> Option<u32>;
@@ -880,6 +891,10 @@ pub async fn dispatch_async(
             Some(ticket) => engine.wait(ticket, timeout).await?,
             None => true,
         };
+        // amdgpu_cs_wait_ioctl: a job that ended with an error reports it.
+        if let Some(error) = job.filter(|_| done).and_then(|t| engine.error(t)) {
+            return Err(error);
+        }
         // `drm_amdgpu_wait_cs_out.status`: 0 completed, 1 still busy.
         // SAFETY: as above; the out arm overlays the first 8 bytes.
         unsafe { copy_out(arg, &u64::from(!done).to_le_bytes())? };
@@ -890,6 +905,12 @@ pub async fn dispatch_async(
     }
     let started = narf_time::monotonic_ns();
     let (submission, bo_list_handle) = validated(arg, vm, ctx)?;
+    // amdgpu_ctx_get_entity: a context whose job hung or was canceled
+    // fails every later submission with that error.
+    let health = ctx.health(submission.ctx_id).ok_or(FsError::InvalidData)?;
+    if let Some(error) = health.error() {
+        return Err(error);
+    }
     // amdgpu_cs_parser_bos: a BO list handle, or the BO_HANDLES chunk, not
     // both (EINVAL); an unknown list is ENOENT. Every listed BO is one this
     // open holds (ENOENT). LINUX-GAP: the list sets no residency.
@@ -1018,7 +1039,7 @@ pub async fn dispatch_async(
             nap().await;
         }
     }
-    let seq = engine.submit(vm, &submission).await?;
+    let seq = engine.submit(vm, &submission, &health).await?;
     note_issued(card, seq);
     // What this space drops from now on waits for this job.
     vm.note_job(seq);

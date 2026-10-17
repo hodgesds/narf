@@ -283,6 +283,7 @@ mod amdgpu_reg_window;
 pub mod amdgpu_reset;
 pub mod amdgpu_reset_navi22;
 pub mod amdgpu_ring;
+pub mod amdgpu_ring_watch;
 pub mod amdgpu_rlc;
 pub mod amdgpu_sdma;
 pub mod amdgpu_sdma_navi22;
