@@ -388,12 +388,12 @@ fn qemu_check(image: &Path, root: &Path, token: Option<&str>, boot_only: bool) -
         let verdict = if &after == hash {
             "unchanged"
         } else {
-            changed.push(decoy.kind.label());
+            changed.push(decoy.name());
             "CHANGED"
         };
         println!(
             "xtask usb-image --qemu: decoy {} sha256 before {hash} after {after}: {verdict}",
-            decoy.kind.label()
+            decoy.name()
         );
         if &after != hash {
             for (offset, len) in changed_ranges(&pristine_path(&decoy.path), &decoy.path)? {
@@ -420,6 +420,18 @@ fn qemu_check(image: &Path, root: &Path, token: Option<&str>, boot_only: bool) -
         }
         println!(
             "xtask usb-image --qemu: decoy internal disks unchanged under narf.disks=boot-only"
+        );
+    } else {
+        // The `--allow-all-disks` control: without the gate NARF's own
+        // mount-time repairs must touch a decoy, or this check could not
+        // have caught a write in the first place.
+        if changed.is_empty() {
+            bail!("--allow-all-disks control changed no decoy: the decoy check is blind");
+        }
+        println!(
+            "xtask usb-image --qemu: control run changed {} decoy(s): {}",
+            changed.len(),
+            changed.join(", ")
         );
     }
     Ok(())
@@ -448,6 +460,20 @@ impl DecoyKind {
 struct Decoy {
     kind: DecoyKind,
     path: PathBuf,
+}
+
+impl Decoy {
+    /// `<kind> <file>`: two NVMe decoys share a kind.
+    fn name(&self) -> String {
+        format!(
+            "{} {}",
+            self.kind.label(),
+            self.path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        )
+    }
 }
 
 const MIB: u64 = 1024 * 1024;
@@ -551,15 +577,42 @@ fn build_decoy_disks(dir: &Path) -> Result<Vec<Decoy>> {
         "internal-disk data NARF must never write\n",
     )?;
 
-    // NVMe: 1 MiB GPT | 64 MiB ESP | 96 MiB ext4 | 160 MiB btrfs | slack.
-    // A stock 128-entry table (16 KiB of entries, as on the host's
-    // nvme0n1 / nvme1n1), so NARF's scanner must register nvme0p1..3 and
-    // the boot-only gate is exercised on partitions, not just the whole
-    // disk.
+    // Two NVMe controllers, as on the host (the data disk and the CachyOS
+    // root disk), each with its own decoy, so the boot-only gate is
+    // exercised on every controller NARF drives, not just the first.
+    let nvme0 = build_nvme_decoy(dir, &content, "decoy-nvme0.img")?;
+    let nvme1 = build_nvme_decoy(dir, &content, "decoy-nvme1.img")?;
+
+    let sata = dir.join("decoy-sata.img");
+    make_ext4(&sata, 64 * MIB, &content)?;
+
+    Ok(vec![
+        Decoy {
+            kind: DecoyKind::Nvme,
+            path: nvme0,
+        },
+        Decoy {
+            kind: DecoyKind::Nvme,
+            path: nvme1,
+        },
+        Decoy {
+            kind: DecoyKind::Sata,
+            path: sata,
+        },
+    ])
+}
+
+/// One NVMe decoy: 1 MiB GPT | 64 MiB ESP | 96 MiB ext4 | 160 MiB btrfs |
+/// slack. A stock 128-entry table (16 KiB of entries, as on the host's
+/// disks), so NARF's scanner must register `nvme<C>n1p1..3` and the
+/// boot-only gate is exercised on partitions, not just the whole disk.
+/// sfdisk / mkfs pick fresh GUIDs and UUIDs per call, so two decoys never
+/// share an identity.
+fn build_nvme_decoy(dir: &Path, content: &Path, file: &str) -> Result<PathBuf> {
     let (esp_at, esp_len) = (MIB, 64 * MIB);
     let (ext_at, ext_len) = (esp_at + esp_len, 96 * MIB);
     let (btr_at, btr_len) = (ext_at + ext_len, 160 * MIB);
-    let nvme = dir.join("decoy-nvme.img");
+    let nvme = dir.join(file);
     sized_file(&nvme, btr_at + btr_len + 2 * MIB)?;
     let mut sfdisk = Command::new("sfdisk");
     sfdisk
@@ -610,34 +663,21 @@ fn build_decoy_disks(dir: &Path) -> Result<Vec<Decoy>> {
         "mcopy decoy ESP file",
     )?;
     let ext = dir.join("decoy-ext4.part");
-    make_ext4(&ext, ext_len, &content)?;
+    make_ext4(&ext, ext_len, content)?;
     splice(&nvme, ext_at, &ext)?;
     let btrfs = dir.join("decoy-btrfs.part");
     sized_file(&btrfs, btr_len)?;
     run_checked(
         Command::new("mkfs.btrfs")
             .args(["-q", "-f", "-L", "DECOYBTRFS", "--rootdir"])
-            .arg(&content)
+            .arg(content)
             .arg(&btrfs),
         "mkfs.btrfs decoy",
     )?;
     splice(&nvme, btr_at, &btrfs)?;
     let _ = std::fs::remove_file(&ext);
     let _ = std::fs::remove_file(&btrfs);
-
-    let sata = dir.join("decoy-sata.img");
-    make_ext4(&sata, 64 * MIB, &content)?;
-
-    Ok(vec![
-        Decoy {
-            kind: DecoyKind::Nvme,
-            path: nvme,
-        },
-        Decoy {
-            kind: DecoyKind::Sata,
-            path: sata,
-        },
-    ])
+    Ok(nvme)
 }
 
 /// Second QEMU boot: append the panic self-test to the image's cmdline.

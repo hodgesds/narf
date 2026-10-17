@@ -229,9 +229,10 @@ cargo xtask disk-write --iso target/narf-x86_64-usb.img \
 ```
 
 `disk-write` refuses non-USB targets, asks for confirmation, and verifies the
-written bytes after a replug. On this host the internal disks are `nvme0n1`
-(CachyOS), `nvme1n1` and the SATA disk `sda`. None of them is ever a valid
-`--device`.
+written bytes after a replug. On this host the internal disks are the two
+NVMe drives (the Sabrent data disk at `04:00.0` and the WD SN770 CachyOS disk
+at `07:00.0`; Linux names them `nvme0n1` / `nvme1n1` in either order, varying
+per boot) and the SATA disk `sda`. None of them is ever a valid `--device`.
 
 **What to expect on screen.** While the card boots, every Navi22 stage prints
 `start`, then `complete` or `failed <error>`. The cold boot ends with
@@ -296,7 +297,8 @@ A fatal CPU exception is not saved.
     `BootOnly` (`/` comes from the initramfs);
   - `efi-system-partition-mount`, which therefore never mounts the CachyOS ESP
     at `/boot`;
-  - `mnt-mount-ext2`, which never mounts `nvme1n1p2` at `/mnt`.
+  - `mnt-mount-ext2`, which never mounts an internal ext4 (such as the
+    Sabrent `nvme0n1p2`) at `/mnt`.
 
   The btrfs member discovery skips unidentified disks too. The btrfs disk
   smokes additionally need `narf.btrfs_smoke`, which only xtask's own test
@@ -310,9 +312,10 @@ A fatal CPU exception is not saved.
   - **FAT:** a mount never writes (there is no dirty-bit or FSInfo update at
     mount). Writes happen only through file operations, which the guard
     refuses.
-- **The NVMe passthrough is closed.** `/dev/nvme0` admin and I/O passthrough
-  ioctls (Format, Sanitize, firmware commit, raw writes) and writes are refused
-  unless the NVMe disk is the stick. Only the namespace-id query is answered.
+- **The NVMe passthrough is closed.** On every controller node `/dev/nvme<C>`,
+  admin and I/O passthrough ioctls (Format, Sanitize, firmware commit, raw
+  writes) and writes are refused unless every namespace of that controller is
+  the stick. Only the namespace-id query is answered.
 
 Limits. Exactly what this does and does not cover:
 
@@ -343,11 +346,19 @@ Limits. Exactly what this does and does not cover:
   superblock repair would still run there. On every other disk the device
   itself is read-only, so this does not arise.
 - **Current hardware coverage on this host.**
-  - NVMe: NARF drives one NVMe controller, the first it enumerates
-    (`04:00.0`, the CachyOS disk `nvme0n1`), as `nvme0`. Its standard
-    128-entry GPT is partition-scanned, so `nvme0p1` (the ESP) and
-    `nvme0p2` (btrfs root) are registered, read-only. The second controller
-    (`07:00.0`, `nvme1n1`) is not driven at all.
+  - NVMe: NARF drives every NVMe controller, numbered in PCI order: on this
+    host `nvme0` is `04:00.0` (Sabrent data disk) and `nvme1` is `07:00.0`
+    (WD SN770, the CachyOS disk). Every active namespace is registered as
+    `nvme<C>n<N>` and partition-scanned, so `nvme0n1p1`, `nvme0n1p2` (ext4
+    data), `nvme1n1p1` (the ESP) and `nvme1n1p2` (btrfs root) are all
+    registered, read-only.
+  - **Names are not identity.** A controller that fails to probe, a moved
+    drive or a firmware that enumerates differently shifts every later name.
+    Identify disks by filesystem UUID or PARTUUID (`/dev/disk/by-uuid`,
+    `/dev/disk/by-partuuid`) or by hardware identity (`/dev/disk/by-id/
+    nvme-<model>_<serial>`, `nvme-<wwid>`, `/dev/disk/by-path/
+    pci-0000:07:00.0-nvme-1`); the boot log prints each namespace's PCI
+    address, model, serial and WWID (`nvme: nvme1 (0000:07:00.0, ...)`).
   - SATA: the AHCI driver binds any AHCI-class controller (`01:06:01`), as
     Linux does, so the AMD 600-series controller (`1022:43f6`) and `sda`
     are driven as `sata0`, with any partitions as `sata0p<n>`, all
@@ -355,8 +366,10 @@ Limits. Exactly what this does and does not cover:
     Intel ICH9.
   - Probing these disks only reads. Controller setup (NVMe queue creation,
     the AHCI HBA reset and SATA link reset) does not change media.
-- **Testing.** This is validated in QEMU (block-layer model tests, ext and
-  btrfs read-only mount tests, and the `usb-image --qemu` decoy hashes). It has
+- **Testing.** This is validated in QEMU (block-layer model tests, a
+  two-controller NVMe model and a two-controller QEMU run, ext and btrfs
+  read-only mount tests, and the `usb-image --qemu` decoy hashes with two
+  NVMe decoys and a SATA decoy). It has
   not been validated on hardware.
 
 ## Storage encryption and LUKS

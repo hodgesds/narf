@@ -56,6 +56,43 @@ multipath / fabrics (defer).
   most `min(max_transfer, 128 KiB scratch)` / `max_transfer` bytes, in units of
   the namespace's LBA size.
 
+- **Multiple controllers** (Linux `nvme_probe` per PCI function). `probe` runs
+  once per NVMe function and installs it as the next instance `nvme<C>` (probe
+  order = PCI enumeration order); each instance owns its BAR mapping, admin and
+  I/O queues, MSI-X vectors, PRP list and 128 KiB DMA scratch behind its own
+  request gate. Re-probing an installed function is a no-op.
+  `controller_count()`, `instance_of(PcieAddr)`, `with_controller_at(instance,
+  f)`, `admin_passthrough_at(instance, ..)`, `remove_controller(instance, cap)
+  -> Option<bool>` (refuse I/O, unregister its block devices and node, then
+  `disable_after_failure`: CC.EN=0 confirmed before DMA is freed, leaked
+  otherwise; re-probe brings it back under the same instance).
+  `with_controller` / `admin_passthrough` / `NvmeBlockSync` /
+  `NvmeBlockDevice` address instance 0.
+- **Namespace scan** (`imp::ns`, Linux `nvme_scan_work`): Active Namespace List
+  (CNS 2) from NVMe 1.1, else `1..=NN`, capped at 1024; Identify Namespace per
+  NSID, skipping NCAP=0 (inactive), NSZE=0 and unusable LBA formats; NGUID /
+  EUI64 from Identify Namespace, overridden by the Namespace Identification
+  Descriptor list (CNS 3, NVMe 1.3+). An error-status completion skips that
+  namespace; a timeout aborts bring-up with the page parked for
+  `disable_after_failure`. `Controller::namespaces()`,
+  `Controller::nvm_io_nsid_at(nsid, ..)`, `IdentifyController::{ver, nn}`.
+- **Block names and identity.** Namespace `k` (0-based, ascending NSID) of
+  controller `C` registers as `nvme<C>n<k+1>` through
+  `narf_block::register_block_device_with_identity` with a
+  `narf_block::DiskIdentity` (`transport "nvme"`, controller PCI address,
+  model/serial/firmware, vendor id, NSID, EUI64/NGUID/UUID), and is
+  partition-scanned (`nvme<C>n<k+1>p<P>`). Every entry is behind the registry's
+  `narf.disks` guard. `NvmeNamespaceBlock::new(instance, nsid)` is the
+  registry device. **Names are not identity**: they shift when a controller is
+  added, removed or fails to probe; consumers identify disks by filesystem
+  UUID / PARTUUID or `DiskIdentity`.
+- `/dev/nvme<C>`: one controller node per instance
+  (`narf_filesystem::devfs::register_nvme_controller(instance, node,
+  namespaces)`); its passthrough (anything but `NVME_IOCTL_ID`) and `write`
+  are allowed only under `narf.disks=all` or when every namespace of that
+  controller is the identified boot medium. Device PM registers `nvme<C>`
+  per instance (`DevicePmOps`).
+
 ## 4. Invariants & safety properties
 
 - PRP / SGL lists validated against the DMA buffer's bounds.

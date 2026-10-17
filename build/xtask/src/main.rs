@@ -1350,6 +1350,7 @@ impl Arch {
                         "-device".into(),
                         "nvme,drive=nvm0,serial=narf".into(),
                     ]);
+                    args.extend(second_nvme_qemu_args());
                     let n1 = legacy_qemu_netdev(profile);
                     // `XTASK_QEMU_IGB=1` swaps the legacy NIC model for QEMU's
                     // `igb` (82576, 0x10C9) so the advanced-descriptor igb
@@ -1596,6 +1597,7 @@ impl Arch {
                         "-device".into(),
                         "nvme,drive=nvm0,serial=narf".into(),
                     ]);
+                    args.extend(second_nvme_qemu_args());
                     let n1 = legacy_qemu_netdev(profile);
                     // `XTASK_QEMU_IGB=1` swaps the legacy NIC model for QEMU's
                     // `igb` (82576, 0x10C9) so the advanced-descriptor igb
@@ -2336,6 +2338,113 @@ fn nvme_image_path() -> PathBuf {
         let img = build_fat12_nvme_image(2048, b"narf\n");
         let _ = std::fs::write(&path, &img);
     }
+    path
+}
+
+/// QEMU arguments for a second NVMe controller (`serial=narf2`), added only
+/// to kernel-test runs: the multi-controller smokes (`drivers/nvme/multi`)
+/// probe it as `nvme1` and check data integrity, distinct identity and
+/// per-controller teardown against two real controllers. Interactive and
+/// distro runs keep a single NVMe disk.
+fn second_nvme_qemu_args() -> Vec<String> {
+    if !KERNEL_TEST_DISK.load(std::sync::atomic::Ordering::Relaxed) {
+        return Vec::new();
+    }
+    vec![
+        "-drive".into(),
+        format!(
+            "if=none,id=nvm1,format=raw,file={}",
+            nvme2_image_path().display()
+        ),
+        "-device".into(),
+        "nvme,drive=nvm1,serial=narf2".into(),
+    ]
+}
+
+/// IEEE 802.3 CRC-32 (the GPT header / entry-array checksum).
+fn gpt_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// A GPT disk image (protective MBR, primary + backup headers with valid
+/// CRCs, 128-entry array) of `sectors` 512-byte sectors holding one Linux
+/// filesystem partition from LBA 2048 to the last usable LBA, with
+/// partition GUID `part_guid` (on-disk byte order) and name `name`.
+fn build_gpt_image(sectors: u64, part_guid: [u8; 16], name: &str) -> Vec<u8> {
+    const SECTOR: usize = 512;
+    let mut img = vec![0u8; sectors as usize * SECTOR];
+    let last = sectors - 1;
+    let entries_lbas = 32u64;
+    let last_usable = last - 1 - entries_lbas;
+    // Protective MBR.
+    img[446 + 4] = 0xEE;
+    img[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
+    img[446 + 12..446 + 16].copy_from_slice(&((last).min(0xFFFF_FFFF) as u32).to_le_bytes());
+    img[510] = 0x55;
+    img[511] = 0xAA;
+    // Entry 0.
+    let mut entries = vec![0u8; 128 * 128];
+    entries[0..16].copy_from_slice(&[
+        0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D,
+        0xE4,
+    ]);
+    entries[16..32].copy_from_slice(&part_guid);
+    entries[32..40].copy_from_slice(&2048u64.to_le_bytes());
+    entries[40..48].copy_from_slice(&last_usable.to_le_bytes());
+    for (i, u) in name.encode_utf16().take(36).enumerate() {
+        entries[56 + 2 * i..58 + 2 * i].copy_from_slice(&u.to_le_bytes());
+    }
+    let entries_crc = gpt_crc32(&entries);
+    let header = |current: u64, backup: u64, entries_lba: u64| {
+        let mut h = vec![0u8; 92];
+        h[0..8].copy_from_slice(b"EFI PART");
+        h[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        h[12..16].copy_from_slice(&92u32.to_le_bytes());
+        h[24..32].copy_from_slice(&current.to_le_bytes());
+        h[32..40].copy_from_slice(&backup.to_le_bytes());
+        h[40..48].copy_from_slice(&34u64.to_le_bytes());
+        h[48..56].copy_from_slice(&last_usable.to_le_bytes());
+        h[56..72].copy_from_slice(b"NARF-NVME2-DISK!");
+        h[72..80].copy_from_slice(&entries_lba.to_le_bytes());
+        h[80..84].copy_from_slice(&128u32.to_le_bytes());
+        h[84..88].copy_from_slice(&128u32.to_le_bytes());
+        h[88..92].copy_from_slice(&entries_crc.to_le_bytes());
+        let crc = gpt_crc32(&h);
+        h[16..20].copy_from_slice(&crc.to_le_bytes());
+        h
+    };
+    let primary = header(1, last, 2);
+    img[SECTOR..SECTOR + 92].copy_from_slice(&primary);
+    img[2 * SECTOR..2 * SECTOR + entries.len()].copy_from_slice(&entries);
+    let backup_entries = (last - entries_lbas) as usize * SECTOR;
+    img[backup_entries..backup_entries + entries.len()].copy_from_slice(&entries);
+    let backup = header(last, 1, last - entries_lbas);
+    img[last as usize * SECTOR..last as usize * SECTOR + 92].copy_from_slice(&backup);
+    img
+}
+
+/// Disposable 16 MiB disk behind the kernel-test run's second NVMe
+/// controller: a GPT with one partition, so the second controller is
+/// partition-scanned too. Rewritten every run (the smokes write to it).
+fn nvme2_image_path() -> PathBuf {
+    let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
+    let path = root.join("target").join("narf-nvme2.img");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let img = build_gpt_image(16 * 1024 * 1024 / 512, *b"narf-nvme2-part1", "narf-nvme2");
+    let _ = std::fs::write(&path, &img);
     path
 }
 

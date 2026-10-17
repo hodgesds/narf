@@ -729,11 +729,11 @@ fn smoke_nvme_write_command() -> TestResult {
 kernel_test_in!("drivers/storage/nvme-e2e", smoke_nvme_write_command);
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ── Smoke 8: NVMe register_block_device ("nvme0n1") ─────────────────────
+// ── Smoke 8: NVMe register_block_device ("nvme90n1") ─────────────────────
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// After a fake bring-up (FakeBlockDevice representing a 4 KiB-sector
-/// NVMe namespace), register it as "nvme0n1" and verify the registry
+/// NVMe namespace), register it as "nvme90n1" and verify the registry
 /// entry round-trips the lba_size and capacity correctly.
 fn smoke_nvme_register_block_device() -> TestResult {
     // Clean slate for this smoke.
@@ -744,26 +744,26 @@ fn smoke_nvme_register_block_device() -> TestResult {
     let lba_size = dev.lba_size();
     let dev_arc: Arc<dyn BlockDeviceSync> = dev;
 
-    register_block_device("nvme0n1", dev_arc);
+    register_block_device("nvme90n1", dev_arc);
 
-    let found = narf_block::registry::find_block_device("nvme0n1");
+    let found = narf_block::registry::find_block_device("nvme90n1");
     let found = match found {
         Some(f) => f,
-        None => return TestResult::Fail("nvme0n1 not found in block registry after register"),
+        None => return TestResult::Fail("nvme90n1 not found in block registry after register"),
     };
 
     if found.lba_size() != lba_size {
-        return TestResult::Fail("nvme0n1: lba_size mismatch in registry");
+        return TestResult::Fail("nvme90n1: lba_size mismatch in registry");
     }
     if found.capacity() != capacity {
-        return TestResult::Fail("nvme0n1: capacity mismatch in registry");
+        return TestResult::Fail("nvme90n1: capacity mismatch in registry");
     }
     // Confirm byte capacity = 4 MiB.
     if found.capacity() * found.lba_size() as u64 != 4 * 1024 * 1024 {
-        return TestResult::Fail("nvme0n1: byte capacity should be 4 MiB");
+        return TestResult::Fail("nvme90n1: byte capacity should be 4 MiB");
     }
 
-    unregister_block_device("nvme0n1");
+    unregister_block_device("nvme90n1");
     TestResult::Pass
 }
 kernel_test_in!("drivers/storage/nvme-e2e", smoke_nvme_register_block_device);
@@ -1316,9 +1316,9 @@ fn write_synthetic_gpt_with_label(buf: &mut [u8], label: &str) {
 // ── Smoke 15: NVMe + GPT partition resolves ("TEST_NVME") ───────────────
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Register a fake NVMe namespace (nvme0n1) backed by a 2 MiB block device
+/// Register a fake NVMe namespace (nvme90n1) backed by a 2 MiB block device
 /// with a synthetic GPT. Register the partition entry ("TEST_NVME") with
-/// PartitionMetadata and verify `find_block_device("nvme0n1p1")` resolves.
+/// PartitionMetadata and verify `find_block_device("nvme90n1p1")` resolves.
 ///
 /// Mirrors the Wave 27 GPT pattern from filesystem/src/e2e_tests.rs.
 fn smoke_nvme_gpt_partition_resolves() -> TestResult {
@@ -1343,9 +1343,9 @@ fn smoke_nvme_gpt_partition_resolves() -> TestResult {
 
     // Register the whole disk.
     let dev_arc: Arc<dyn BlockDeviceSync> = dev.clone();
-    register_block_device("nvme0n1", dev_arc);
+    register_block_device("nvme90n1", dev_arc);
 
-    // Register the partition slice as "nvme0n1p1" with metadata.
+    // Register the partition slice as "nvme90n1p1" with metadata.
     let part_dev: Arc<dyn BlockDeviceSync> = dev.clone();
     let meta = PartitionMetadata {
         gpt_type_guid: String::new(),
@@ -1353,46 +1353,46 @@ fn smoke_nvme_gpt_partition_resolves() -> TestResult {
         partuuid: String::from("11111111-2222-3333-4444-555555555555"),
         fs_uuid: String::new(),
     };
-    register_block_device_with_meta("nvme0n1p1", part_dev, Some(meta));
+    register_block_device_with_meta("nvme90n1p1", part_dev, Some(meta));
 
     // Verify the whole disk is findable.
-    let whole = narf_block::registry::find_block_device("nvme0n1");
+    let whole = narf_block::registry::find_block_device("nvme90n1");
     if whole.is_none() {
-        return TestResult::Fail("nvme0n1 (whole disk) not found in registry");
+        return TestResult::Fail("nvme90n1 (whole disk) not found in registry");
     }
 
     // Verify the partition is findable.
-    let part = narf_block::registry::find_block_device("nvme0n1p1");
+    let part = narf_block::registry::find_block_device("nvme90n1p1");
     if part.is_none() {
-        return TestResult::Fail("nvme0n1p1 partition not found in registry");
+        return TestResult::Fail("nvme90n1p1 partition not found in registry");
     }
 
     // Verify block_devices() snapshot includes the partition with metadata.
     let all = narf_block::registry::block_devices();
     let has_label = all.iter().any(|e| {
-        e.name == "nvme0n1p1"
+        e.name == "nvme90n1p1"
             && e.partition
                 .as_ref()
                 .map(|p| p.partlabel == LABEL)
                 .unwrap_or(false)
     });
     if !has_label {
-        return TestResult::Fail("nvme0n1p1: partlabel 'TEST_NVME' not found in snapshot");
+        return TestResult::Fail("nvme90n1p1: partlabel 'TEST_NVME' not found in snapshot");
     }
 
     let has_partuuid = all.iter().any(|e| {
-        e.name == "nvme0n1p1"
+        e.name == "nvme90n1p1"
             && e.partition
                 .as_ref()
                 .map(|p| !p.partuuid.is_empty())
                 .unwrap_or(false)
     });
     if !has_partuuid {
-        return TestResult::Fail("nvme0n1p1: partuuid should be non-empty");
+        return TestResult::Fail("nvme90n1p1: partuuid should be non-empty");
     }
 
-    unregister_block_device("nvme0n1p1");
-    unregister_block_device("nvme0n1");
+    unregister_block_device("nvme90n1p1");
+    unregister_block_device("nvme90n1");
     TestResult::Pass
 }
 kernel_test_in!(
