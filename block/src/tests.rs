@@ -2591,3 +2591,84 @@ fn poll_ready_block<F: core::future::Future>(fut: F) -> Option<F::Output> {
         Poll::Pending => None,
     }
 }
+
+/// The boot-log stick under the root policies: once its `/NARFLOG.ID`
+/// matched (`trust_boot_medium`), exactly that USB partition is writable —
+/// besides the designated root under root-rw. The stick's whole-disk device,
+/// the root's ESP, other disks, and a non-USB device offered as the "boot
+/// medium" stay refused; removing the stick forgets it.
+fn smoke_block_disk_policy_root_policies_log_stick() -> TestResult {
+    use crate::disk_policy::{self, DiskPolicy};
+    use crate::partition::PartitionBlockDevice;
+    use crate::registry::register_partition_device;
+    use alloc::sync::Arc;
+    let names = [
+        "rp-ls-nvmep1",
+        "rp-ls-nvmep2",
+        "rp-ls-nvme",
+        "usb-msc-rptest0p1",
+        "usb-msc-rptest0",
+    ];
+    let root_arg = alloc::format!("UUID={RP_ROOT_UUID}");
+    let result = (|| {
+        for policy in [DiskPolicy::RootRw, DiskPolicy::RootRo] {
+            rp_reset(Some(policy), Some(Some(&root_arg)));
+            disk_policy::__reset_log_stick_for_test();
+            for name in names {
+                crate::unregister_block_device(name);
+            }
+            rp_register_disk("rp-ls-nvme", "rp-ls-nvmep1", "rp-ls-nvmep2", RP_ROOT_UUID);
+            let stick = Arc::new(VecBlock {
+                data: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+                    alloc::vec![0u8; 128 * 512],
+                )),
+                lba_size: 512,
+            }) as Arc<dyn crate::BlockDeviceSync>;
+            crate::register_block_device("usb-msc-rptest0", stick.clone());
+            register_partition_device(
+                "usb-msc-rptest0p1",
+                "usb-msc-rptest0",
+                Arc::new(PartitionBlockDevice::new(stick, 8, 64)),
+                None,
+            );
+            disk_policy::designate_root("rp-ls-nvmep2", rp_uuid(RP_ROOT_UUID))
+                .map_err(|_| "designation failed")?;
+            if rp_writes("usb-msc-rptest0p1") {
+                return Err("the stick must be read-only before its token matched");
+            }
+            // A non-USB partition offered as the boot medium is not accepted.
+            let esp_disk = crate::disk_of("rp-ls-nvmep1").ok_or("esp disk")?;
+            disk_policy::trust_boot_medium("rp-ls-nvmep1", esp_disk);
+            if rp_writes("rp-ls-nvmep1") || disk_policy::log_stick().is_some() {
+                return Err("a non-USB device must never become the log stick");
+            }
+            let stick_disk = crate::disk_of("usb-msc-rptest0p1").ok_or("stick disk")?;
+            disk_policy::trust_boot_medium("usb-msc-rptest0p1", stick_disk);
+            if !rp_writes("usb-msc-rptest0p1")
+                || !disk_policy::write_allowed("usb-msc-rptest0p1")
+                || disk_policy::log_stick() != Some("usb-msc-rptest0p1")
+            {
+                return Err("the identified log stick partition must be writable");
+            }
+            if rp_writes("usb-msc-rptest0") || rp_writes("rp-ls-nvmep1") || rp_writes("rp-ls-nvme")
+            {
+                return Err("only the stick partition (and the root under root-rw) may be written");
+            }
+            let root_ok = rp_writes("rp-ls-nvmep2");
+            if root_ok != (policy == DiskPolicy::RootRw) {
+                return Err("the root's writability must follow the policy");
+            }
+            crate::unregister_block_device("usb-msc-rptest0p1");
+            if disk_policy::log_stick().is_some() {
+                return Err("an unregistered stick must be forgotten");
+            }
+        }
+        Ok(())
+    })();
+    disk_policy::__reset_log_stick_for_test();
+    rp_finish(&names, result)
+}
+kernel_test_in!(
+    "block/disk_policy",
+    smoke_block_disk_policy_root_policies_log_stick
+);

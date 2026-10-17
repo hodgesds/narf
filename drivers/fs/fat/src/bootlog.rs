@@ -451,9 +451,22 @@ fn header() -> Vec<u8> {
     header.into_bytes()
 }
 
+/// Upper bound on waiting for the root mount before probing (root policies).
+const ROOT_SETTLE_MS: u64 = 300_000;
+
 async fn run(token: String) {
     use narf_console::Writer;
     let header = header();
+    // Under `narf.disks=root-ro|root-rw`, probe the stick only once the root
+    // is mounted (or has failed): the root mount reads every disk to prove
+    // its UUID unique, and must not queue behind the stick's FAT mount. The
+    // log is written retroactively, so nothing is lost by waiting.
+    if narf_block::disk_policy::policy().is_root_policy() {
+        let settle = narf_time::Deadline::after_ms(ROOT_SETTLE_MS);
+        while !narf_block::disk_policy::root_mount_settled() && !settle.expired() {
+            sleep_ms(DISCOVERY_POLL_MS).await;
+        }
+    }
     let deadline = narf_time::Deadline::after_ms(DISCOVERY_MS);
     let mut tried: Vec<&'static str> = Vec::new();
     let armed = 'discover: loop {
@@ -555,8 +568,13 @@ pub fn start() -> narf_init::InitResult {
     };
     let _ = writeln!(
         Writer,
-        "bootlog: waiting up to {} s for the USB boot medium (/{MARKER_FILE})",
-        DISCOVERY_MS / 1000
+        "bootlog: waiting up to {} s for the USB boot medium (/{MARKER_FILE}){}",
+        DISCOVERY_MS / 1000,
+        if narf_block::disk_policy::policy().is_root_policy() {
+            ", after the root is mounted"
+        } else {
+            ""
+        }
     );
     narf_scheduler::spawn_stackful(run(token));
     narf_init::InitResult::Ok
