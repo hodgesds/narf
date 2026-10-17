@@ -3614,6 +3614,16 @@ records the job once the ring accepted it. Navi48 grants VMIDs 1–7 (8–15
 are KFD's, first_kfd_vmid) and sets `Job::flush` / `Job::map_pasid`
 from the grant.
 
+SDMA0 runs client jobs as ring 2 (`AMDGPU_HW_IP_DMA`, instance 0, ring 0)
+through `amdgpu_sdma_navi48::Sdma::submit(Job)`, after both SDMA proofs
+(busy before). Its frame follows sdma_v7_0's ring functions in 256-dword
+slots of the 1024-dword ring: when flushing, a memory POLL_REGMEM pipeline
+sync and the GFX hub flush on invalidation engine 11 (REGISTER_WRITE /
+POLL_REGMEM); the LUT write; INDIRECT packets NOP-aligned to end on 8
+dwords, IBs 32-byte aligned with no CSA; and an uncached FENCE (no TRAP;
+completion is polled through `FenceReader`). The ring is started with
+`IB_ENABLE`, as sdma_v7_0_gfx_resume does.
+
 ### AMD platform VBIOS
 
 `atombios::header::parse_rom_header` and `amdgpu_atombios::Atombios::parse`
