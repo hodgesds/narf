@@ -863,6 +863,13 @@ The verified DMA proof covers only two kernel-owned VRAM pages. The driver
 continues to report acceleration unavailable; model/QEMU tests do not prove
 working silicon, native modesetting or Mesa/Vulkan support.
 
+Navi22 third-review fixes (software-model tested only): DRM ioctl user copies
+apply `access_ok` and fault-guarded copies (EFAULT); NVMe/AHCI bring-up
+failures stop the controller before freeing DMA; AHCI port bring-up is bounded
+per HBA and sets GHC.IE only after the IRQ route; host-install xtask media
+default to `narf.disks=boot-only`; DMUB-routed retrain/unplug tables, a non-IRQ
+DMUB route lock, a TABLE_MS cap, same-EDID HPD long pulses keep the stream.
+
 Current main includes discrete PCIe probe support
 for RX 6750 XT / Navi 22: bounded discovery reads beyond BAR0, separate total
 and CPU-visible VRAM sizes, Resizable BAR-independent APU identity, and the

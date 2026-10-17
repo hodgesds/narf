@@ -4268,7 +4268,9 @@ I2C-over-AUX or the hardware I2C engine. Only owner loss fails the whole probe.
 `Firmware::prepare_display(gpu)` decodes routes before device I/O and
 `ColdBoot::prepare_display()` claims the owner without I/O; both are optional
 for firmware bring-up. `ColdBoot::detect_displays().await` requires
-`FirmwareReady`, and `amdgpu_navi22_platform::detect_displays().await`
+`FirmwareReady` (as does `ColdBoot::detect_display(index).await`, one
+connector's sink read, which the monitor uses for the long-pulse
+`same_edid` check that keeps an unchanged lit stream), and `amdgpu_navi22_platform::detect_displays().await`
 serializes it through the retained owner. The framebuffer boot handoff logs one
 line per connector after a successful firmware run; detection reads sinks only. `dmub_mailbox_state()` also reports failed
 or cancelled transport attempts without accessing hardware.
