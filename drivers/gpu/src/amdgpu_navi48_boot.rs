@@ -469,6 +469,10 @@ pub struct ColdBoot {
     /// The slice of CPU-visible VRAM clients' buffers come from, kept out
     /// of the driver's own pool for good.
     client_vram: Option<crate::amdgpu_vram::Reservation>,
+    /// The heap registered for clients, once published.
+    client_heap: Option<crate::amdgpu_gem::VramHeap>,
+    /// The inventory's VRAM past the BAR, all of it for clients.
+    unmapped_vram: Option<crate::amdgpu_vram::UnmappedPool>,
 }
 impl ColdBoot {
     /// # Safety
@@ -487,6 +491,7 @@ impl ColdBoot {
         pci: narf_bus::BusDevice,
         authority: Cap<BusDeviceCap, Write>,
         pool: &Pool,
+        unmapped: Option<crate::amdgpu_vram::UnmappedPool>,
         mut firmware: Firmware,
         exchange: Option<Training>,
     ) -> Result<Self, Error> {
@@ -601,6 +606,8 @@ impl ColdBoot {
             verified_links: Vec::new(),
             scanned_sinks: Vec::new(),
             client_vram: None,
+            client_heap: None,
+            unmapped_vram: unmapped,
             sequence: Sequence {
                 backend: Hardware {
                     gpu: saved,
@@ -728,6 +735,25 @@ impl ColdBoot {
         // SAFETY: the caller's obligations.
         unsafe { sdma.submit(job) }
     }
+    /// Queue a kernel job of fills and copies on SDMA0 (VMID0 addresses),
+    /// in the client jobs' sequence.
+    /// # Safety
+    /// As `Sdma::submit_kernel`: the platform serializes ring users under
+    /// OWNER, and every range named is client VRAM no one uses until the
+    /// returned sequence completes.
+    pub(crate) unsafe fn submit_client_sdma_kernel(
+        &mut self,
+        ops: &[sdma::KernelOp],
+    ) -> Result<u32, sdma::Error> {
+        let sdma = self
+            .sequence
+            .backend
+            .sdma
+            .as_mut()
+            .ok_or(sdma::Error::Invalid)?;
+        // SAFETY: the caller's obligations.
+        unsafe { sdma.submit_kernel(ops) }
+    }
     /// A reader of SDMA0's client-job fence. Jobs are refused (busy)
     /// until both SDMA proofs pass, which the platform runs after boot.
     pub(crate) fn client_sdma_fence_reader(&self) -> Option<sdma::FenceReader> {
@@ -831,17 +857,47 @@ impl ColdBoot {
             .map_err(|_| Error::Allocation)?;
         // Clients' buffers outlive any one owner here; never recycle it.
         chunk.publish();
-        crate::amdgpu_gem::register_vram_heap(
-            card,
-            crate::amdgpu_gem::VramHeap {
-                pool: heap,
-                fb_base: context.fb_base,
-                fb_offset: context.fb_offset,
-                unmapped: None,
-            },
-        );
+        let heap = crate::amdgpu_gem::VramHeap {
+            pool: heap,
+            fb_base: context.fb_base,
+            fb_offset: context.fb_offset,
+            unmapped: None,
+        };
+        crate::amdgpu_gem::register_vram_heap(card, heap.clone());
+        self.client_heap = Some(heap);
         self.client_vram = Some(chunk);
         Ok(size)
+    }
+    /// Add the VRAM past the BAR to the clients' heap, for `NO_CPU_ACCESS`
+    /// buffers, once SDMA0 runs jobs: `clear` zeroes each buffer there
+    /// before use (`submit_client_sdma_kernel`). Returns its size.
+    pub(crate) fn publish_unmapped_vram(
+        &mut self,
+        clear: alloc::sync::Arc<dyn crate::amdgpu_gem::VramClear>,
+    ) -> Result<u64, Error> {
+        let sdma_ready = self
+            .sequence
+            .backend
+            .sdma
+            .as_ref()
+            .is_some_and(|s| s.state() == sdma::State::InterruptVerified);
+        let card = Self::drm_card().ok_or(Error::Invalid)?;
+        let (Some(heap), Some(pool), true) = (
+            self.client_heap.as_mut(),
+            self.unmapped_vram.as_ref(),
+            sdma_ready,
+        ) else {
+            return Err(Error::Busy);
+        };
+        if heap.unmapped.is_some() {
+            return Err(Error::Busy);
+        }
+        heap.unmapped = Some(crate::amdgpu_gem::UnmappedHeap {
+            pool: pool.clone(),
+            clear,
+        });
+        crate::amdgpu_gem::register_vram_heap(card, heap.clone());
+        Ok(pool.size())
     }
     pub(crate) fn power_info(&self) -> Option<(Option<smu::Limits>, smu::GfxLevel)> {
         let smu = self.sequence.backend.smu.as_ref()?;

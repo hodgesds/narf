@@ -252,7 +252,7 @@ pub enum KernelOp {
 }
 /// Bytes one SDMA7 fill or copy packet moves (`fill_max_bytes`,
 /// `copy_max_bytes`).
-const MAX_PACKET_BYTES: u64 = 1 << 30;
+pub const MAX_PACKET_BYTES: u64 = 1 << 30;
 /// A kernel job's slot: each op as sdma_v7_0_emit_fill_buffer (CONSTANT_FILL
 /// with COMPRESS, dword fill) or sdma_v7_0_emit_copy_buffer (COPY_LINEAR
 /// with CPV, no DCC) in packets of at most 1 GiB, then the uncached fence.

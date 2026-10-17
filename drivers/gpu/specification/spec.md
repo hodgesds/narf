@@ -2690,6 +2690,19 @@ CPU-visible VRAM the driver's pool still has free (2 MiB-aligned, at least
 `VramHeap` with the GMC's framebuffer geometry. The slice never returns to
 the driver's pool, so clients without eviction cannot starve its owners.
 
+The VRAM past a BAR that shows only a prefix of it is clients' whole:
+`prepare` takes `Plan::unmapped_pool` beside `into_pool` (every driver owner
+allocates from the CPU-visible pool) and hands it to `ColdBoot::new`. Once
+SDMA0's interrupt proof passes, the platform calls
+`ColdBoot::publish_unmapped_vram(clear)`, re-registering the clients' heap
+with it as the `UnmappedHeap`. Its `VramClear` queues clears in order; one
+drain task at a time submits the front ones (at most 32 fill packets) as a
+kernel job (`ColdBoot::submit_client_sdma_kernel`) under the platform owner,
+retrying while the ring is full, so clears run and complete in queue
+order. A clear's fence is its job's SDMA ticket, judged by the card's
+submitter; a device that refuses the job for good (or has no owner)
+signals it, as nothing can run there any more.
+
 `unsafe amdgpu_ih7::Rings::new` prepares native OSSSYS7.0.0 rings with exact
 GC12/NBIO discovery banks. It rejects inherited enabled rings, enabled host
 delivery or non-idle IH before allocating; preparation never writes hardware.
