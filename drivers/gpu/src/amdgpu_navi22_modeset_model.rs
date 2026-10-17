@@ -70,6 +70,8 @@ pub(crate) struct State {
     /// `(value & !.2) | .3`: an acknowledgement withheld, so the owner
     /// polling it stays pending there.
     pub stall: Option<(usize, u32, u32, u32)>,
+    /// Caps the DISPCLK and PIXCLK (DPPCLK) DPM maximum, in MHz.
+    pub display_cap_mhz: Option<u32>,
 }
 impl State {
     fn get(&self, dword: u32) -> u32 {
@@ -146,7 +148,7 @@ impl Model {
         if instance(dword, d2(0x1b8b), 0x80, 6).is_some() {
             return (v & !(1 << 8)) | (v & 1) << 8;
         }
-        if let Some(domain) = instance(dword, d2(0x81), 2, 12) {
+        if let Some(domain) = instance(dword, d2(0x81), 2, 22) {
             // DOMAINn_PG_STATUS: off (2) while POWER_GATE is set.
             let gated = s.get(d2(0x80 + 2 * domain)) & 1 << 8 != 0;
             return if gated { 2 << 30 } else { 0 };
@@ -175,7 +177,13 @@ impl Model {
                 3 => 0xe,
                 4 => 1,
                 0xb if arg & 0xff == 0xff => 2,
-                0xb => dpm(arg >> 16)[(arg & 1) as usize],
+                0xb => {
+                    let mut levels = dpm(arg >> 16);
+                    if let (9 | 10, Some(cap)) = (arg >> 16, s.display_cap_mhz) {
+                        levels[1] = cap;
+                    }
+                    levels[(arg & 1) as usize]
+                }
                 9 => arg & 0xffff,
                 _ => 0,
             };
@@ -306,6 +314,9 @@ impl Bench {
     }
     pub fn unstall(&self) {
         self.model.0.lock().stall = None;
+    }
+    pub fn display_cap(&self, mhz: u32) {
+        self.model.0.lock().display_cap_mhz = Some(mhz);
     }
     pub fn underflow_on_unlock(&self, pipe: u8) {
         self.model.0.lock().underflow_on_unlock = Some(pipe);

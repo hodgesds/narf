@@ -181,6 +181,25 @@ impl Soc {
         }
         Ok(soc)
     }
+    /// The bounding-box states up to this (top) one, one per UCLK DPM
+    /// level ascending, as `dcn30_fpu_update_bw_bounding_box` lists them.
+    /// Deviation: Linux pairs each UCLK with the DCFCLK/FCLK that just
+    /// carries its bandwidth (`dcn_bw_get_optimal_dcfclk_fclk_for_uclk`);
+    /// here every state keeps the top DCFCLK, so only the memory floor drops.
+    pub fn states(&self, memory_mhz: &[u16]) -> Vec<Soc> {
+        let mut states: Vec<Soc> = memory_mhz
+            .iter()
+            .map(|&mhz| u32::from(mhz) * 16)
+            .filter(|&mts| mts > 0 && mts < self.dram_speed_mts)
+            .map(|dram_speed_mts| Soc {
+                dram_speed_mts,
+                ..*self
+            })
+            .collect();
+        states.dedup_by_key(|s| s.dram_speed_mts);
+        states.push(*self);
+        states
+    }
 }
 
 /// HUBBUB watermark set, in reference-clock cycles, as `hubbub21_program_*`
@@ -702,6 +721,21 @@ pub fn plan(config: &Config, soc: &Soc) -> Result<Plan, Error> {
         urgent_bandwidth_thousandths: joint.urgent_bandwidth_thousandths,
         cursor: pipe.cursor,
     })
+}
+
+/// The voltage-level search of `dcn30_internal_validate_bw`
+/// (`dcn20_validate_apply_pipe_split_flags` aside): the lowest of `states`
+/// (ascending, as [`Soc::states`] lists them) whose joint plan is
+/// supported, and that plan. Its UCLK is the admission's memory floor.
+pub fn plan_joint_lowest(streams: &[Stream], states: &[Soc]) -> Result<(usize, JointPlan), Error> {
+    let mut last = Error::Unsupported;
+    for (i, soc) in states.iter().enumerate() {
+        match plan_joint(streams, soc) {
+            Ok(plan) => return Ok((i, plan)),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 /// Joint mode support and the performance calculation for every stream of a

@@ -6,7 +6,7 @@
 //! ceilings, a 3650 MHz DENTIST VCO and a 50 MHz DCHUB reference.
 use super::*;
 use crate::amdgpu_dml::{Format, Plane, Timing};
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn soc() -> Soc {
@@ -486,4 +486,35 @@ fn dml30_odm_combines_where_one_pipe_cannot_carry_the_stream() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dml30",
     dml30_odm_combines_where_one_pipe_cannot_carry_the_stream
+);
+
+fn dml30_admits_at_the_lowest_supporting_uclk_state() -> TestResult {
+    let top = soc();
+    let states = top.states(&[96, 456, 456, 772, 1000]);
+    // One state per lower UCLK level ascending, then the top state itself.
+    let mts: Vec<u32> = states.iter().map(|s| s.dram_speed_mts).collect();
+    if mts != vec![1536, 7296, 12_352, 16_000]
+        || states.iter().any(|s| s.dcfclk_khz != top.dcfclk_khz)
+    {
+        return TestResult::Fail("bounding-box states");
+    }
+    let a = stream(config(148_500, 1920, 2200, 88, 44, 1080, 1125, 4));
+    let b = stream(config(533_250, 3840, 4000, 48, 32, 2160, 2222, 3));
+    for set in [vec![a], vec![a, b], vec![b, b, b, b]] {
+        let Ok((i, plan)) = plan_joint_lowest(&set, &states) else {
+            return TestResult::Fail("configuration refused at every state");
+        };
+        // The first state that supports it: every lower one refuses, and
+        // the plan is that state's.
+        if states[..i].iter().any(|s| plan_joint(&set, s).is_ok())
+            || plan_joint(&set, &states[i]).ok() != Some(plan)
+        {
+            return TestResult::Fail("not the lowest supporting state");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dml30",
+    dml30_admits_at_the_lowest_supporting_uclk_state
 );
