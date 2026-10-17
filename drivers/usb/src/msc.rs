@@ -844,6 +844,69 @@ impl UsbMscBlockDevice {
     }
 }
 
+/// Drive one bulk-only transport exchange from a synchronous
+/// `BlockDeviceSync` caller.
+///
+/// Callers include contexts inside an executor poll: the HID supervisor
+/// task scans partitions inline right after binding (`register_msc_block_device`),
+/// and a FAT volume on the stick is driven from kernel tasks and syscalls.
+/// `block_on` panics there by design, so those use `block_on_spin`. That is
+/// safe for this future: every xHCI wait (`await_event`) drains the event
+/// ring itself, self-wakes through `yield_now` and is bounded at 250 ms, so
+/// it needs neither the executor nor an interrupt to make progress. Outside
+/// a poll the cooperative `block_on` keeps its idle behaviour.
+fn sync_bridge<F: core::future::Future>(fut: F) -> F::Output {
+    if narf_scheduler::current_task_id() != narf_scheduler::TaskId::NONE {
+        narf_scheduler::block_on_spin(fut)
+    } else {
+        narf_scheduler::block_on(fut)
+    }
+}
+
+/// Per-device exclusion for one CBW → data → CSW exchange. Two sync callers
+/// on different tasks (the supervisor's partition scan and a FAT volume on
+/// the same stick, say) would otherwise interleave bulk-only-transport
+/// phases on the shared endpoints. Indices past the table are left
+/// unserialised (MSC_DEVICES is a handful of sticks in practice).
+const MSC_IO_SLOTS: usize = 16;
+static MSC_IO_BUSY: [core::sync::atomic::AtomicBool; MSC_IO_SLOTS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MSC_IO_SLOTS];
+/// A holder can be preempted mid-exchange; each of its xHCI waits is bounded
+/// at 250 ms, so a claim that takes longer than this is a dead holder.
+const MSC_IO_CLAIM_MS: u64 = 2_000;
+
+struct MscIoClaim(Option<usize>);
+
+impl MscIoClaim {
+    fn acquire(idx: usize) -> Option<Self> {
+        use core::sync::atomic::Ordering;
+        let Some(busy) = MSC_IO_BUSY.get(idx) else {
+            return Some(Self(None));
+        };
+        let deadline = narf_time::Deadline::after_ms(MSC_IO_CLAIM_MS);
+        loop {
+            if busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(Self(Some(idx)));
+            }
+            if deadline.expired() {
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+impl Drop for MscIoClaim {
+    fn drop(&mut self) {
+        if let Some(idx) = self.0 {
+            MSC_IO_BUSY[idx].store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
     fn lba_size(&self) -> u32 {
         self.lba_size
@@ -872,10 +935,8 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         }
         // Snapshot the (controller, device) handles outside the
         // registry locks so we can drive the async read_blocks via
-        // block_on without holding any IrqSafeSpinLock across the
-        // .await. block_on is legal here because narf_block's
-        // BlockDeviceSync interface is called from sync contexts
-        // (boot path, FS init) that are NOT inside an executor poll.
+        // `sync_bridge` without holding any IrqSafeSpinLock across the
+        // .await (see `sync_bridge` for the in-poll callers).
         let c = match xhci::controller() {
             Some(c) => c,
             None => return Err(narf_block::BlockIoError::DeviceRemoved),
@@ -896,8 +957,10 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             last_lba: 0,
             tag: IrqSafeSpinLock::new(1),
         };
-        let result =
-            narf_scheduler::block_on(async { dev_snapshot.read_blocks(&c, lba32, n_blocks).await });
+        let Some(_claim) = MscIoClaim::acquire(self.idx) else {
+            return Err(narf_block::BlockIoError::DriverError);
+        };
+        let result = sync_bridge(async { dev_snapshot.read_blocks(&c, lba32, n_blocks).await });
         match result {
             Ok(data) => {
                 out[..expected].copy_from_slice(&data);
@@ -940,7 +1003,10 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             last_lba: 0,
             tag: IrqSafeSpinLock::new(1),
         };
-        let result = narf_scheduler::block_on(async {
+        let Some(_claim) = MscIoClaim::acquire(self.idx) else {
+            return Err(narf_block::BlockIoError::DriverError);
+        };
+        let result = sync_bridge(async {
             dev_snapshot
                 .write_blocks(&c, lba32, n_blocks, &data[..expected])
                 .await

@@ -986,6 +986,11 @@ flips completed from EARLIEST_INUSE (pflip/vupdate IH sources armed), a
 256x256 DCN3.0 cursor (opt-in), KMS on the amdgpu card (DP-1..3, HDMI-A-1;
 DML30-admitted modes, SETCRTC/atomic/TEST_ONLY, disable, vblank, flip
 events) and a monitor that relights after GPU recovery. Register models only.
+For bare-metal runs, `cargo xtask usb-image` builds a UEFI stick whose kernel
+appends its log to `/narf-boot-<n>.log` on that stick (`narf.bootlog=`,
+marker-gated, USB-only, bounded); a secondary card's cold boot keeps the iGPU
+console live and ends with a per-stage summary (see
+[docs/BOOTING_ON_CACHYOS.md](docs/BOOTING_ON_CACHYOS.md#rx-6750-xt-bring-up-boot)).
 These are software-tested foundations; training resume,
 media submission/DPG, display-aware DPM, user command submission,
 hardware boot and DCN3.0 modesetting remain open. See the

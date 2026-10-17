@@ -41,10 +41,30 @@ pub(super) fn start() -> InitResult {
     })
     .unwrap_or(false);
     let generation = if navi48 { "navi48" } else { "navi22" };
-    let pause = Pause::new();
+    // The pause exists for one hazard: CPU writers drawing into THIS GPU's
+    // VRAM while training/reset owns it. A boot framebuffer provably outside
+    // the GPU's VRAM aperture (the iGPU GOP console with the discrete card as
+    // a secondary) is not a client of this GPU — the same reasoning that
+    // already resumes it after a failed run when `!affected`. Keeping it live
+    // is what makes every stage checkpoint visible on screen during the
+    // whole cold boot. Unknown geometry or controller data pauses, as before.
+    let console_off_gpu = framebuffer_off_gpu(framebuffer);
+    let mut pause = (!console_off_gpu).then(Pause::new);
+    if console_off_gpu {
+        use core::fmt::Write;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: {generation} boot console is on another device; it stays live"
+        );
+    }
+    let summary_from = narf_console::klog::next_seq();
     // SAFETY: final synchronous boot initcall, before executor/user startup.
-    // No NARF GPU queues/VRAM allocations exist. Console and sleep-pump writes
-    // are stopped above, and the original physical GOP geometry is retained.
+    // No NARF GPU queues/VRAM allocations exist. Every CPU writer that could
+    // reach this GPU's VRAM is stopped: either the console/pumps are paused
+    // above, or the only framebuffer they draw lies outside this GPU's
+    // aperture (checked against the probe's VRAM base/size, the same bounds
+    // `prepare` classifies `affected` with). The physical GOP geometry is
+    // retained.
     let prepared = if navi48 {
         // SAFETY: same final boot handoff and paused writers described above.
         unsafe { navi48::prepare(framebuffer) }.map_err(|e| refused(generation, e))
@@ -54,16 +74,21 @@ pub(super) fn start() -> InitResult {
     };
     let affected = match prepared {
         Ok(None) => {
-            pause.resume();
+            resume(pause);
             return InitResult::NotPresent;
         }
         Err(()) => {
             // Preparation has issued no device writes and owns no hardware.
-            pause.resume();
+            resume(pause);
             return InitResult::Error("AMD PCIe firmware preflight");
         }
         Ok(Some(affected)) => affected,
     };
+    if affected && pause.is_none() {
+        // Cannot happen with consistent geometry; never run training with
+        // the console drawing into the GPU being trained.
+        pause = Some(Pause::new());
+    }
     // The bridge polls only this self-waking/timer-driven future and sleep
     // pumps, not the executor. No spinlock guard is held; spin works even if
     // this boot profile has not enabled interrupts yet.
@@ -92,7 +117,7 @@ pub(super) fn start() -> InitResult {
     };
     if ok || !affected {
         // A secondary GPU cannot affect the boot framebuffer on another BAR.
-        pause.resume();
+        resume(pause.take());
     }
     use core::fmt::Write;
     let _ = writeln!(
@@ -135,6 +160,10 @@ pub(super) fn start() -> InitResult {
     }
     if ok && navi48 && narf_boot::args().has_flag("amdgpu.native_display") {
         native_display();
+    }
+    if !navi48 {
+        // Last, so it also covers the connector and native-display lines.
+        stage_summary(summary_from);
     }
     if ok {
         InitResult::Ok
@@ -183,6 +212,125 @@ fn native_display() {
     // SAFETY: the retained owner is serialized by the platform; only the
     // monitor and the published hooks drive the displays from here on.
     unsafe { navi48::spawn_display_monitor(config) };
+}
+
+fn resume(pause: Option<Pause>) {
+    if let Some(pause) = pause {
+        pause.resume();
+    }
+}
+
+/// True only when the boot framebuffer lies entirely outside the probed
+/// GPU's CPU-visible VRAM aperture. No framebuffer, no controller data or
+/// degenerate geometry all answer `false` (pause, the conservative path).
+fn framebuffer_off_gpu(framebuffer: Option<narf_graphics_driver::generic::GenericFb>) -> bool {
+    let Some(fb) = framebuffer else {
+        return false;
+    };
+    let Some((base, size)) =
+        narf_drivers_gpu::amdgpu::with_controller(|g| (g.vram.base, g.vram.visible_size))
+    else {
+        return false;
+    };
+    off_aperture(
+        fb.addr,
+        u64::from(fb.pitch) * u64::from(fb.height),
+        base,
+        size,
+    )
+}
+
+fn off_aperture(addr: u64, bytes: u64, base: u64, size: u64) -> bool {
+    let (Some(end), Some(aperture_end)) = (addr.checked_add(bytes), base.checked_add(size)) else {
+        return false;
+    };
+    bytes != 0 && size != 0 && (end <= base || addr >= aperture_end)
+}
+
+/// One line per Navi22 cold-boot stage, rebuilt from the checkpoint lines in
+/// the log store, then the display/media/thermal notes, so a single photo of
+/// the screen (or the tail of the persistent log) shows how far the card got.
+/// Printed after the console is back, so it also covers checkpoints drawn
+/// while the console was paused.
+fn stage_summary(from: u64) {
+    use core::fmt::Write;
+    let text = narf_console::klog::text_since(from);
+    let text = core::str::from_utf8(&text).unwrap_or("");
+    let (rows, notes) = summarize_stages(text);
+    if rows.is_empty() {
+        return;
+    }
+    let done = rows.iter().filter(|(_, v)| *v == "ok").count();
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: navi22 stage summary ({done}/{} ok):",
+        rows.len()
+    );
+    for (stage, verdict) in rows {
+        let _ = writeln!(narf_console::Writer, "  navi22 {stage:<16} {verdict}");
+    }
+    for note in notes {
+        let _ = writeln!(narf_console::Writer, "  navi22 {note}");
+    }
+}
+
+/// Non-stage boot lines worth repeating in the summary: per-connector
+/// detection, native scanout, and media/thermal/queue degradations.
+const SUMMARY_NOTES: [&str; 9] = [
+    "HDMI-A-",
+    "DP-",
+    "display",
+    "native HDMI",
+    "media disabled",
+    "thermal",
+    "kernel queues disabled",
+    "PMFW",
+    "EMERGENCY",
+];
+
+/// `(stage, verdict)` per stage in first-seen order — `ok`, `failed <error>`,
+/// `degraded <error>` / `polling only <error>` (sticky over a later
+/// `complete`) or `STARTED (no result)` for a stage that never reported back
+/// — plus the [`SUMMARY_NOTES`] lines in log order.
+fn summarize_stages(text: &str) -> (alloc::vec::Vec<(&str, &str)>, alloc::vec::Vec<&str>) {
+    let mut rows: alloc::vec::Vec<(&str, &str)> = alloc::vec::Vec::new();
+    let mut notes = alloc::vec::Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("amdgpu: navi22 ") else {
+            continue;
+        };
+        if SUMMARY_NOTES.iter().any(|p| rest.starts_with(p)) {
+            notes.push(rest);
+            continue;
+        }
+        let Some((stage, result)) = rest.split_once(": ") else {
+            continue;
+        };
+        if stage.is_empty() || !stage.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let verdict = match result {
+            "start" => "STARTED (no result)",
+            "complete" => "ok",
+            r if r.starts_with("failed")
+                || r.starts_with("degraded")
+                || r.starts_with("polling only") =>
+            {
+                r
+            }
+            _ => continue,
+        };
+        match rows.iter_mut().find(|(s, _)| *s == stage) {
+            Some(row) => {
+                let sticky = row.1.starts_with("degraded") || row.1.starts_with("polling only");
+                if !(sticky && verdict == "ok") {
+                    row.1 = verdict;
+                }
+            }
+            None => rows.push((stage, verdict)),
+        }
+    }
+    (rows, notes)
 }
 
 fn refused(generation: &str, error: impl core::fmt::Debug) {
@@ -342,4 +490,77 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("fb", navi22_pause_blocks_existing_writers_and_console);
+
+    /// The console stays live only for a framebuffer wholly outside the
+    /// GPU's aperture; overlap, touching-inside and degenerate inputs pause.
+    fn navi22_console_off_gpu_classification() -> TestResult {
+        const BASE: u64 = 0x80_0000_0000;
+        const SIZE: u64 = 16 << 30;
+        let fb = 1920 * 4 * 1080;
+        let cases = [
+            // iGPU GOP below and above the discrete aperture.
+            (0xD000_0000, fb, true),
+            (BASE + SIZE, fb, true),
+            (BASE - fb, fb, true),
+            // On the card, straddling either edge.
+            (BASE, fb, false),
+            (BASE + SIZE - fb, fb, false),
+            (BASE - 4096, fb, false),
+            (BASE + SIZE - 4096, fb, false),
+            // Degenerate geometry / overflow.
+            (0xD000_0000, 0, false),
+            (u64::MAX - 10, fb, false),
+        ];
+        for (addr, bytes, off) in cases {
+            if off_aperture(addr, bytes, BASE, SIZE) != off {
+                return TestResult::Fail("framebuffer/aperture classification");
+            }
+        }
+        if off_aperture(0xD000_0000, fb, BASE, 0) || framebuffer_off_gpu(None) {
+            return TestResult::Fail("unknown aperture or framebuffer must pause");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("fb", navi22_console_off_gpu_classification);
+
+    fn navi22_stage_summary_rows() -> TestResult {
+        let log = "\
+amdgpu: navi22 ResetOnInit: start
+amdgpu: navi22 ResetOnInit: complete
+amdgpu: navi22 boot console is on another device; it stays live
+amdgpu: navi22 MemoryTraining: start
+amdgpu: navi22 MemoryTraining: complete
+amdgpu: navi22 kernel queues disabled: doorbells Unmapped
+amdgpu: navi22 Sos: start
+amdgpu: navi22 Sos: failed Psp(Timeout)
+amdgpu: navi22 page faults not reported: Invalid
+amdgpu: navi22 Ring: start
+amdgpu: navi22 FenceInterrupts: start
+amdgpu: navi22 FenceInterrupts: polling only Timeout
+amdgpu: navi22 FenceInterrupts: complete
+amdgpu: navi22 VcnStart: start
+amdgpu: navi22 VcnStart: degraded Ring
+amdgpu: navi22 HDMI-A-1 (ddc 1, hpd Some(0), dig 0): disconnected
+amdgpu: navi22 thermal alert Ctf
+";
+        let (rows, notes) = summarize_stages(log);
+        let want = [
+            ("ResetOnInit", "ok"),
+            ("MemoryTraining", "ok"),
+            ("Sos", "failed Psp(Timeout)"),
+            ("Ring", "STARTED (no result)"),
+            ("FenceInterrupts", "polling only Timeout"),
+            ("VcnStart", "degraded Ring"),
+        ];
+        let want_notes = [
+            "kernel queues disabled: doorbells Unmapped",
+            "HDMI-A-1 (ddc 1, hpd Some(0), dig 0): disconnected",
+            "thermal alert Ctf",
+        ];
+        if rows.as_slice() != want.as_slice() || notes.as_slice() != want_notes.as_slice() {
+            return TestResult::Fail("stage summary rows");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("fb", navi22_stage_summary_rows);
 }
