@@ -1128,6 +1128,10 @@ const MAX_BATCH_OPS: usize = 8;
 #[derive(Debug)]
 pub(crate) struct FsBatch {
     gen: u64,
+    /// The subvolume tree this batch COWs. One core serves every mount of the
+    /// filesystem, so an operation through a mount of another subvolume first
+    /// commits this batch (see [`batch_begin`]).
+    tree_id: u64,
     alloc: Allocator,
     cow: CowState,
     dropped_data: Vec<DataRefId>,
@@ -1176,7 +1180,24 @@ pub(crate) struct FsBatch {
 async fn batch_begin<'a, B: BlockDevice + 'static>(
     vol: &'a BtrfsVolume<B>,
 ) -> Result<narf_lib::mutex::MutexGuard<'a, Option<FsBatch>>, FsError> {
-    let mut guard = vol.fs_batch().lock().await;
+    let mut guard = loop {
+        // Never open a batch while a commit is in flight: its generation and
+        // allocator would come from the superblock and free-space tree that
+        // commit is about to replace.
+        let txn = vol.txn_lock().lock().await;
+        let guard = vol.fs_batch().lock().await;
+        drop(txn);
+        match guard.as_ref() {
+            // The open batch belongs to another mount's subvolume. A batch
+            // COWs exactly one fs tree, so commit it before this operation
+            // starts its own.
+            Some(batch) if batch.tree_id != vol.fs_tree_id() => {
+                drop(guard);
+                flush_batch(vol).await?;
+            }
+            _ => break guard,
+        }
+    };
     if guard.is_none() {
         // The generation the batch commits at. `commit_roots` does not run
         // until the batch closes, so every operation inside it derives the
@@ -1190,6 +1211,7 @@ async fn batch_begin<'a, B: BlockDevice + 'static>(
         let cow = PathCow::new(vol, gen, fs_root, fs_level).await?.suspend().0;
         *guard = Some(FsBatch {
             gen,
+            tree_id: vol.fs_tree_id(),
             alloc: Allocator::build(vol).await?,
             cow,
             dropped_data: Vec::new(),
@@ -1374,16 +1396,25 @@ pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
 /// report it to; it is retried on the next tick, and a failure serious enough
 /// to matter has already taken the filesystem read-only through
 /// `abort_transaction`.
-pub(crate) fn spawn_commit_timer<B: BlockDevice + 'static>(vol: &alloc::sync::Arc<BtrfsVolume<B>>) {
-    let weak = alloc::sync::Arc::downgrade(vol);
+pub(crate) fn spawn_commit_timer<B: BlockDevice + 'static>(
+    core: &alloc::sync::Arc<crate::volume::VolCore<B>>,
+) {
+    let weak = alloc::sync::Arc::downgrade(core);
     narf_scheduler::spawn(async move {
         let tick = commit_interval_cycles();
         loop {
             narf_time::sleep_cycles(tick).await;
-            let Some(vol) = weak.upgrade() else {
+            let Some(core) = weak.upgrade() else {
                 return;
             };
-            let _ = commit_if_stale(&vol).await;
+            // One timer per filesystem, whichever mounts are open: commit as
+            // the subvolume the running transaction belongs to.
+            let tree = match core.fs_batch().lock().await.as_ref() {
+                Some(batch) => batch.tree_id,
+                None => continue,
+            };
+            let view = BtrfsVolume::view_for_tree(&core, tree);
+            let _ = commit_if_stale(&view).await;
         }
     });
 }
@@ -1617,9 +1648,16 @@ async fn flush_batch_from<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     origin: FlushOrigin,
 ) -> Result<(), FsError> {
+    let _txn = vol.txn_lock().lock().await;
     let batch = vol.fs_batch().lock().await.take();
     match batch {
-        Some(batch) => commit_batch(vol, batch, origin).await,
+        Some(batch) if batch.tree_id == vol.fs_tree_id() => commit_batch(vol, batch, origin).await,
+        // Staged through a mount of another subvolume (or the commit timer):
+        // commit it as that subvolume, so its ROOT_ITEM and live root move.
+        Some(batch) => {
+            let owner = BtrfsVolume::view_for_tree(vol.core(), batch.tree_id);
+            commit_batch(&owner, batch, origin).await
+        }
         None => Ok(()),
     }
 }
@@ -4500,6 +4538,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
     for &(owner, root, tree_level) in &extra_roots {
         stamp_root_item_fields(&mut root_logical, owner, root, tree_level, gen)?;
     }
+
     let pending: BTreeMap<u64, Vec<u8>> = fs_nodes.iter().cloned().collect();
     let quota_tree = if txn.skip_qgroup_recount {
         None
@@ -4792,6 +4831,8 @@ async fn commit_txn<B: BlockDevice + 'static>(
     if fs_tree_changed {
         root_updates.push((vol.fs_tree_id(), fs_root_addr, fs_level));
     }
+    // Every other tree this commit moved, for mounts rooted at it.
+    let published_extra: Vec<(u64, u64, u8)> = extra_roots.clone();
     root_updates.extend(extra_roots);
     if old_csum.is_some() {
         root_updates.push((format::CSUM_TREE_OBJECTID, csum_root.0, csum_root.1));
@@ -4916,6 +4957,11 @@ async fn commit_txn<B: BlockDevice + 'static>(
         txn.incompat_flags_add,
     );
     vol.set_superblock_levels(root_root_level, None);
+    for (owner, root, level) in published_extra {
+        if owner != vol.fs_tree_id() {
+            vol.publish_subvol_root(owner, root, level);
+        }
+    }
     // Bound how much a crash discards and how long pinned extents withhold
     // space. `sync_to_disk` is the same path `fsync` takes, so the batch is
     // forced out by exactly one mechanism.
@@ -5686,7 +5732,9 @@ pub(crate) async fn destroy_subvolume<B: BlockDevice + 'static>(
         }
     }
     let (name, child_id, dir_index) = found.ok_or(FsError::NotFound)?;
-    if child_id == vol.fs_tree_id() {
+    // Linux refuses to delete a subvolume some mount is rooted at; with one
+    // core per filesystem that includes every other mount, not just this one.
+    if child_id == vol.fs_tree_id() || vol.subvol_mount_count(child_id) > 0 {
         return Err(FsError::Busy);
     }
     let name_bytes = name.as_bytes();

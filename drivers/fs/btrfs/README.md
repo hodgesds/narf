@@ -88,6 +88,20 @@ real laptop's btrfs root looks like.
   and `mount -t btrfs`, including `subvolid=N` / `subvol=PATH` (ordinary
   directories and nested subvolumes) to root at a specific subvolume. A plain mount honors the on-disk
   **default subvolume** (`ROOT_TREE_DIR`'s "default" entry).
+- **One instance per filesystem** (Linux's one `btrfs_fs_info` per fsid). Every
+  mount of an already-mounted fsid, whichever subvolume it selects, is a view
+  (`BtrfsVolume`) over one shared `VolCore`. The core holds the devices, the
+  superblock, the node cache, the running transaction and its allocator, the
+  pinned extents, the staged superblock and one commit timer (`registry`). A
+  batch belongs to one subvolume: an operation through a mount of another
+  subvolume first commits it, so two subvolume mounts write through one
+  transaction stream. Mounts of the same subvolume share its live root. A
+  mounted subvolume cannot be deleted (`Busy`). A read-only view of a
+  writable core refuses writes, and a read-write mount of a read-only core
+  makes it writable unless a member device or the feature set forbids that.
+  The core is freed when its last mount goes. `compress=` is recorded, but new
+  extents are written uncompressed (Linux permits this), apart from the
+  existing zlib-rewrite path.
 - `BTRFS_IOC_SUBVOL_GETFLAGS` / `BTRFS_IOC_SUBVOL_SETFLAGS` on an explicitly
   mounted subvolume root, including Linux's distinct `BTRFS_SUBVOL_RDONLY` UAPI
   bit and persistent read-only/writable transitions.

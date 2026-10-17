@@ -3110,16 +3110,26 @@ fn smoke_btrfs_registration() -> TestResult {
     if narf_filesystem::lookup_fstype("btrfs").is_none() {
         return TestResult::Fail("btrfs fstype not registered");
     }
-    // The builder rejects write-implying options before touching a device.
+    let request = |options| narf_filesystem::MountRequest {
+        fs_type: "btrfs",
+        source: "/dev/nope",
+        options,
+        uid: 0,
+        gid: 0,
+        umask: 0o022,
+        initial_namespace: true,
+        read_only: false,
+    };
+    // The builder rejects format-affecting options before touching a device.
     if !matches!(
-        crate::btrfs_fstype_builder("/dev/nope", "rw"),
+        crate::btrfs_fstype_builder(&request("nodatacow")),
         Err(FsError::Unsupported)
     ) {
-        return TestResult::Fail("builder should reject rw option");
+        return TestResult::Fail("builder should reject nodatacow");
     }
     // A read-only mount of a missing device fails with NotFound, not a panic.
     if !matches!(
-        crate::btrfs_fstype_builder("/dev/nope", "ro"),
+        crate::btrfs_fstype_builder(&request("ro")),
         Err(FsError::NotFound)
     ) {
         return TestResult::Fail("builder should ENOENT a missing device");
@@ -10967,3 +10977,254 @@ fn smoke_btrfs_block_group_tree_write() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_block_group_tree_write);
+
+// ── One shared instance per filesystem ─────────────────────────────
+
+/// Poll two futures together to completion (no allocation, no executor).
+async fn join2<A: core::future::Future, C: core::future::Future>(
+    a: A,
+    c: C,
+) -> (A::Output, C::Output) {
+    let mut a = core::pin::pin!(a);
+    let mut c = core::pin::pin!(c);
+    let (mut ra, mut rc) = (None, None);
+    core::future::poll_fn(|cx| {
+        if ra.is_none() {
+            if let core::task::Poll::Ready(v) = a.as_mut().poll(cx) {
+                ra = Some(v);
+            }
+        }
+        if rc.is_none() {
+            if let core::task::Poll::Ready(v) = c.as_mut().poll(cx) {
+                rc = Some(v);
+            }
+        }
+        if ra.is_some() && rc.is_some() {
+            core::task::Poll::Ready(())
+        } else {
+            core::task::Poll::Pending
+        }
+    })
+    .await;
+    (ra.unwrap(), rc.unwrap())
+}
+
+/// Write `count` files named `{prefix}-{i}` of 16 KiB each through `dir`.
+async fn write_files(
+    dir: Arc<dyn narf_filesystem::DirOps>,
+    prefix: &str,
+    count: u8,
+) -> Result<(), FsError> {
+    for i in 0..count {
+        let f = dir.create(&alloc::format!("{prefix}-{i}")).await?;
+        let payload = alloc::vec![i ^ prefix.as_bytes()[0]; 16 * 1024];
+        f.write(0, &payload).await?;
+    }
+    Ok(())
+}
+
+/// Check every `{prefix}-{i}` file `write_files` produced.
+fn files_intact(dir: &Arc<dyn narf_filesystem::DirOps>, prefix: &str, count: u8) -> bool {
+    (0..count).all(|i| {
+        let Some(Ok(f)) = poll_once(dir.lookup_async(&alloc::format!("{prefix}-{i}"))) else {
+            return false;
+        };
+        read_all(&f, 16 * 1024 + 16).is_some_and(|got| {
+            got.len() == 16 * 1024 && got.iter().all(|&b| b == i ^ prefix.as_bytes()[0])
+        })
+    })
+}
+
+/// Linux's one-`btrfs_fs_info`-per-filesystem model: subvolume mounts are
+/// views over one instance. Their writes interleave through one transaction
+/// stream (a batch staged through `@home` is committed before `@` stages its
+/// own), a second mount of `@` sees the first's uncommitted writes, a
+/// read-only view cannot write, a mounted subvolume cannot be deleted, and the
+/// whole thing remounts consistently from disk.
+fn smoke_btrfs_shared_instance_views() -> TestResult {
+    use crate::volume::Subvol;
+    use narf_filesystem::FsInstance;
+
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let top = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture did not mount"),
+    };
+    let view = |name: &str, ro: bool| {
+        poll_once(BtrfsVolume::mount_view(
+            top.core(),
+            Some(Subvol::Name(name.into())),
+            ro,
+        ))
+    };
+    let (home, root, root2, srv_ro) = match (
+        view("@home", false),
+        view("@", false),
+        view("@", false),
+        view("@srv", true),
+    ) {
+        (Some(Ok(a)), Some(Ok(b)), Some(Ok(c)), Some(Ok(d))) => (a, b, c, d),
+        _ => return TestResult::Fail("subvolume views did not mount"),
+    };
+    if !Arc::ptr_eq(home.core(), root.core()) || !Arc::ptr_eq(home.core(), top.core()) {
+        return TestResult::Fail("views do not share one instance");
+    }
+    if home.mounted_subvol_id() == root.mounted_subvol_id() {
+        return TestResult::Fail("views did not select distinct subvolumes");
+    }
+    if top.core().subvol_mount_count(root.mounted_subvol_id()) != 2 {
+        return TestResult::Fail("mount count of @ is not 2");
+    }
+
+    // Interleaved and joined writers through two subvolumes of one instance.
+    let joined = poll_once(join2(
+        write_files(home.root(), "h", 12),
+        write_files(root.root(), "r", 12),
+    ));
+    if !matches!(joined, Some((Ok(()), Ok(())))) {
+        return TestResult::Fail("concurrent subvolume writers failed");
+    }
+    for i in 0..4u8 {
+        let a = poll_once(write_files(home.root(), &alloc::format!("hi{i}"), 1));
+        let b = poll_once(write_files(root.root(), &alloc::format!("ri{i}"), 1));
+        if !matches!((a, b), (Some(Ok(())), Some(Ok(())))) {
+            return TestResult::Fail("alternating subvolume writes failed");
+        }
+    }
+    // The second mount of @ sees the first's writes before any sync.
+    if !files_intact(&root2.root(), "r", 12) {
+        return TestResult::Fail("second mount of @ does not see uncommitted writes");
+    }
+    if poll_once(srv_ro.root().create("nope")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("read-only view accepted a write");
+    }
+    let home_parent_busy = poll_once(crate::write::destroy_subvolume(
+        &top,
+        format::FIRST_FREE_OBJECTID,
+        Some("@home"),
+        None,
+    ));
+    if !matches!(home_parent_busy, Some(Err(FsError::Busy))) {
+        return TestResult::Fail("a mounted subvolume was deletable");
+    }
+    // One sync through any view makes every view's writes durable.
+    if poll_once(srv_ro.sync_to_disk()).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("sync through a read-only view failed");
+    }
+    drop((home, root, root2, srv_ro, top));
+
+    let fresh = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("filesystem did not remount after shared writes"),
+    };
+    for (name, prefix) in [("@home", "h"), ("@", "r")] {
+        let v = match poll_once(BtrfsVolume::mount_view(
+            fresh.core(),
+            Some(Subvol::Name(name.into())),
+            true,
+        )) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("remounted subvolume view failed"),
+        };
+        if !files_intact(&v.root(), prefix, 12) {
+            return TestResult::Fail("a subvolume lost writes across remount");
+        }
+        let alt = if prefix == "h" { "hi3" } else { "ri3" };
+        if !files_intact(&v.root(), alt, 1) {
+            return TestResult::Fail("an alternating write was lost across remount");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_shared_instance_views);
+
+/// The same sharing on real (QEMU NVMe) hardware through the registry the
+/// `mount -t btrfs` and root factories use. Two subvolume mounts of xtask's
+/// disposable nvme0 image write concurrently with genuinely asynchronous I/O,
+/// then sync; the xtask postflight runs host `btrfs check` on the result.
+/// Subvolumes are created with NARF's own subvolume-creation path first.
+fn smoke_btrfs_shared_instance_nvme() -> TestResult {
+    use crate::volume::Subvol;
+    use narf_block::fs_detect::{detect_filesystem, FsType};
+    use narf_filesystem::FsInstance;
+
+    // Test-only: mutate only the disk xtask provided for it.
+    if !narf_boot::args().has_flag("narf.btrfs_smoke") {
+        return TestResult::Skip("no disposable btrfs disk (narf.btrfs_smoke)");
+    }
+    let Some(entry) = narf_block::block_devices()
+        .into_iter()
+        .find(|e| matches!(detect_filesystem(&e.dev), Ok(Some(FsType::Btrfs))))
+    else {
+        return TestResult::Skip("no btrfs block device");
+    };
+    let dev = entry.dev.clone();
+    let mount = |subvol: Option<Subvol>| {
+        narf_scheduler::block_on(crate::registry::mount(
+            &dev,
+            crate::discover_members(dev.clone()),
+            subvol,
+            false,
+        ))
+    };
+    let top = match mount(None) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("nvme btrfs did not mount"),
+    };
+    for name in ["narf-sv-a", "narf-sv-b"] {
+        if narf_scheduler::block_on(top.root().lookup_dir_async(name)).is_err()
+            && narf_scheduler::block_on(crate::write::create_subvolume(
+                &top,
+                format::FIRST_FREE_OBJECTID,
+                name,
+                false,
+            ))
+            .is_err()
+        {
+            return TestResult::Fail("subvolume creation on nvme failed");
+        }
+    }
+    let (a, b) = match (
+        mount(Some(Subvol::Name("narf-sv-a".into()))),
+        mount(Some(Subvol::Name("narf-sv-b".into()))),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => return TestResult::Fail("nvme subvolume mounts failed"),
+    };
+    if !Arc::ptr_eq(a.core(), b.core()) || !Arc::ptr_eq(a.core(), top.core()) {
+        return TestResult::Fail("nvme mounts of one fsid are separate instances");
+    }
+    let joined = narf_scheduler::block_on(join2(
+        write_files(a.root(), "a", 16),
+        write_files(b.root(), "b", 16),
+    ));
+    if !matches!(joined, (Ok(()), Ok(()))) {
+        return TestResult::Fail("concurrent nvme subvolume writers failed");
+    }
+    if narf_scheduler::block_on(b.sync_to_disk()).is_err() {
+        return TestResult::Fail("nvme sync failed");
+    }
+    let ok = files_intact_blocking(&a.root(), "a", 16) && files_intact_blocking(&b.root(), "b", 16);
+    if !ok {
+        return TestResult::Fail("nvme subvolume contents wrong after concurrent writes");
+    }
+    TestResult::Pass
+}
+
+/// [`files_intact`] for a device whose I/O completes asynchronously.
+fn files_intact_blocking(dir: &Arc<dyn narf_filesystem::DirOps>, prefix: &str, count: u8) -> bool {
+    (0..count).all(|i| {
+        narf_scheduler::block_on(async {
+            let f = dir.lookup_async(&alloc::format!("{prefix}-{i}")).await?;
+            let mut buf = alloc::vec![0u8; 16 * 1024 + 16];
+            let n = f.read(0, &mut buf).await?;
+            Ok::<_, FsError>(
+                n == 16 * 1024 && buf[..n].iter().all(|&x| x == i ^ prefix.as_bytes()[0]),
+            )
+        })
+        .unwrap_or(false)
+    })
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_shared_instance_nvme);

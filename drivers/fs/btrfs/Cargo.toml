@@ -17,6 +17,7 @@ miniz_oxide = { version = "0.8", default-features = false, features = ["with-all
 ruzstd = { version = "0.8", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 narf-block = { path = "../../../block" }
+narf-boot = { path = "../../../boot", optional = true }
 narf-capabilities = { path = "../../../capabilities" }
 narf-driver-runtime = { path = "../../runtime" }
 narf-filesystem = { path = "../../../filesystem" }
@@ -29,7 +30,7 @@ narf-scheduler = { path = "../../../scheduler" }
 narf-time = { path = "../../../time" }
 
 [features]
-kernel-test = ["dep:narf-kernel-test"]
+kernel-test = ["dep:narf-kernel-test", "dep:narf-boot"]
 
 [lints]
 workspace = true
