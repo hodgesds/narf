@@ -36,6 +36,9 @@ pub enum BlockIoError {
     DriverError,
     /// Device was removed / not bound.
     DeviceRemoved,
+    /// Write refused: the device is read-only under the active
+    /// [`crate::disk_policy`] (`narf.disks=boot-only`).
+    ReadOnly,
 }
 
 /// Synchronous block-device interface usable behind `dyn`.
@@ -48,6 +51,13 @@ pub trait BlockDeviceSync: Send + Sync {
     fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8]) -> Result<(), BlockIoError>;
     /// Write `n_blocks` LBAs starting at `lba` from `data`.
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError>;
+    /// True when every [`Self::write`] would currently be refused (e.g. the
+    /// device is read-only under [`crate::disk_policy`]). Filesystems consult
+    /// it at mount time so a read-only device is mounted without any of the
+    /// metadata repairs a writable mount performs. Wrappers must forward it.
+    fn is_read_only(&self) -> bool {
+        false
+    }
 }
 
 /// Optional per-partition metadata attached to a registered block
@@ -86,7 +96,12 @@ impl PartitionMetadata {
 #[derive(Clone)]
 pub struct RegisteredBlockDevice {
     pub name: &'static str,
+    /// The registered device behind its [`crate::disk_policy::PolicyGuard`].
+    /// Every consumer of the registry writes through the guard.
     pub dev: Arc<dyn BlockDeviceSync>,
+    /// Physical-disk identity shared by a disk and its partitions; the unit
+    /// [`crate::disk_policy::trust_boot_medium`] trusts.
+    pub disk: crate::disk_policy::DiskId,
     /// GPT metadata, if this entry is a partition. `None` for
     /// whole-disk parents and for legacy-MBR partitions.
     pub partition: Option<PartitionMetadata>,
@@ -96,6 +111,7 @@ impl core::fmt::Debug for RegisteredBlockDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RegisteredBlockDevice")
             .field("name", &self.name)
+            .field("disk", &self.disk)
             .field("partition", &self.partition)
             .finish_non_exhaustive()
     }
@@ -119,11 +135,39 @@ pub fn register_block_device_with_meta(
     dev: Arc<dyn BlockDeviceSync>,
     partition: Option<PartitionMetadata>,
 ) {
+    register_entry(name, None, dev, partition);
+}
+
+/// Register partition `name` of the already-registered disk `parent_name`.
+/// The partition shares the parent's [`crate::disk_policy::DiskId`], so the
+/// write policy treats a disk and its partitions as one medium. An
+/// unregistered parent gets a fresh identity (conservative: untrusted).
+pub fn register_partition_device(
+    name: &'static str,
+    parent_name: &str,
+    dev: Arc<dyn BlockDeviceSync>,
+    partition: Option<PartitionMetadata>,
+) {
+    register_entry(name, Some(parent_name), dev, partition);
+}
+
+fn register_entry(
+    name: &'static str,
+    parent_name: Option<&str>,
+    dev: Arc<dyn BlockDeviceSync>,
+    partition: Option<PartitionMetadata>,
+) {
     {
         let mut g = REGISTRY.lock();
+        let disk = parent_name
+            .and_then(|parent| g.iter().find(|e| e.name == parent).map(|e| e.disk))
+            .unwrap_or_else(crate::disk_policy::new_disk_id);
+        let dev = Arc::new(crate::disk_policy::PolicyGuard::new(name, disk, dev))
+            as Arc<dyn BlockDeviceSync>;
         let entry = RegisteredBlockDevice {
             name,
             dev,
+            disk,
             partition,
         };
         if let Some(pos) = g.iter().position(|e| e.name == name) {
@@ -145,6 +189,15 @@ pub fn register_block_device_with_meta(
 /// Snapshot of currently-registered block devices.
 pub fn block_devices() -> Vec<RegisteredBlockDevice> {
     REGISTRY.lock().clone()
+}
+
+/// Disk identity of the registered device `name`.
+pub fn disk_of(name: &str) -> Option<crate::disk_policy::DiskId> {
+    REGISTRY
+        .lock()
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.disk)
 }
 
 /// Number of registered block devices.
@@ -260,6 +313,9 @@ impl BlockDevice for SyncBlock {
     fn capacity_blocks(&self) -> u64 {
         self.0.capacity()
     }
+    fn is_read_only(&self) -> bool {
+        self.0.is_read_only()
+    }
     fn supports(&self, f: BlockFeature) -> bool {
         // Sync trait doesn't expose feature flags. Mirror what
         // RamBlockDevice exports (Flush + WriteZeroes are no-ops on
@@ -314,6 +370,7 @@ impl SyncBlock {
             BlockIoError::BufferTooSmall => BlockError::InvalidRange,
             BlockIoError::DeviceRemoved => BlockError::DeviceRemoved,
             BlockIoError::DriverError => BlockError::IOError,
+            BlockIoError::ReadOnly => BlockError::PermissionDenied,
         };
         match req.op {
             BlockOp::Read => self.0.read(req.lba, blocks, slice).map_err(map_err),

@@ -10382,3 +10382,110 @@ fn smoke_btrfs_link_new_name() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_link_new_name);
+
+// ── Read-only devices are never written (narf.disks=boot-only) ──────
+
+/// Mount `device` behind a real `narf.disks=boot-only` guard on an untrusted
+/// disk.
+fn mount_through_boot_only_guard(
+    device: &Arc<WritableSparseDevice>,
+) -> Result<Arc<BtrfsVolume<narf_block::SyncBlock>>, FsError> {
+    use narf_block::disk_policy::{DiskPolicy, PolicyGuard};
+    let guard = Arc::new(PolicyGuard::new(
+        "btrfs-ro-test",
+        u64::MAX - 0xb7f5,
+        device.clone() as Arc<dyn narf_block::BlockDeviceSync>,
+    )) as Arc<dyn narf_block::BlockDeviceSync>;
+    narf_block::disk_policy::__set_policy_for_test(Some(DiskPolicy::BootOnly));
+    let mounted = poll_once(BtrfsVolume::mount(
+        narf_block::SyncBlock::new(guard),
+        DomainId::DRIVER_0,
+    ))
+    .unwrap_or(Err(FsError::InvalidData));
+    narf_block::disk_policy::__set_policy_for_test(None);
+    mounted
+}
+
+/// A clean volume on a read-only device mounts read-only, refuses writes,
+/// and leaves every byte unchanged.
+fn smoke_btrfs_read_only_device_mount_never_writes() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let device = writable_sparse(FIXTURE_FST_SPARSE);
+    let before = device.overlay.lock().clone();
+    let volume = match mount_through_boot_only_guard(&device) {
+        Ok(volume) => volume,
+        Err(_) => return TestResult::Fail("read-only btrfs mount failed"),
+    };
+    if !volume.is_read_only() {
+        return TestResult::Fail("volume on a read-only device is not read-only");
+    }
+    if !matches!(
+        poll_once(volume.root().create("new.txt")),
+        Some(Err(FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("create on a read-only btrfs mount was not refused");
+    }
+    if *device.overlay.lock() != before {
+        return TestResult::Fail("read-only btrfs mount wrote to the device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_read_only_device_mount_never_writes
+);
+
+/// A pending fsync log tree is never replayed onto a read-only device: the
+/// mount is refused (Linux's `ro` would replay; NARF must not write), and the
+/// log is still there for a later writable mount.
+fn smoke_btrfs_read_only_device_refuses_log_replay() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let device = writable_sparse(FIXTURE_FST_SPARSE);
+    let vol = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let f = match poll_once(vol.root().create("logged.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("sync before logging failed");
+    }
+    let (fs_root, _) = vol.fs_tree_root();
+    let key = BtrfsKey::new(f.ino(), format::INODE_ITEM_KEY, 0);
+    let mut body = match poll_once(btree::find_item(&vol, fs_root, &key)) {
+        Some(Ok(Some(b))) => b,
+        _ => return TestResult::Fail("could not read inode item"),
+    };
+    body[136..144].copy_from_slice(&0x0055_6677u64.to_le_bytes());
+    if !matches!(
+        poll_once(crate::write::write_log(&vol, &[(key, body)])),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("write_log failed");
+    }
+    drop(f);
+    drop(vol);
+    if format::le64(&read_super_at(&device, format::SUPERBLOCK_OFFSET), 96).unwrap_or(0) == 0 {
+        return TestResult::Fail("super.log_root not set after write_log");
+    }
+    let before = device.overlay.lock().clone();
+    if !matches!(
+        mount_through_boot_only_guard(&device),
+        Err(FsError::Unsupported)
+    ) {
+        return TestResult::Fail("read-only mount with a pending log was not refused");
+    }
+    if *device.overlay.lock() != before {
+        return TestResult::Fail("refused read-only mount wrote to the device");
+    }
+    if format::le64(&read_super_at(&device, format::SUPERBLOCK_OFFSET), 96).unwrap_or(0) == 0 {
+        return TestResult::Fail("log pointer lost on a refused read-only mount");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_read_only_device_refuses_log_replay
+);

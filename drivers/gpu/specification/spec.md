@@ -77,6 +77,37 @@ GC version rejects its `DEV_INFO`. This identifies the device; acceleration
 continues to report unavailable. Navi 22 firmware, GMC/GFX10 execution and
 DCN3.0 display bring-up are not enabled by this probe path.
 
+A bound Navi 22's `AMDGPU_INFO` replies come from `amdgpu_info_navi22`
+(`query`, `query_with(snapshot, Submission, query, payload)`), which mirrors
+`amdgpu_kms.c` for this ASIC: DEV_INFO (`chip_rev`/`external_rev = rev + 0x32`,
+`pci_rev`, harvested CU/AO bitmaps, RB and TCC masks, CE RAM, DPM GFXCLK
+range), HW_IP_INFO with IP-block versions (GFX/compute 10.0, SDMA 5.2,
+VCN/JPEG 3.0) plus discovery versions and Linux IB alignments, HW_IP_COUNT,
+FW_VERSION from the loaded file headers and `GetSmuVersion`, READ_MMR_REG for
+GB_ADDR_CONFIG (0x263e; other offsets EFAULT) and MEMORY/VRAM_GTT with the
+8 MiB VM reservation. `Snapshot::navi22: Published { topology, pci_revision,
+boot }` carries the inputs, published by `amdgpu_info::publish_navi22_topology`
+(cold-boot `Stage::ReadTopology`, appended after `FenceInterrupts`),
+`publish_navi22_pci_revision` (platform prepare) and `publish_navi22_boot`
+(after a successful cold boot, from `ColdBoot::uapi_versions` and the
+report). Unpublished inputs leave the corresponding fields zero.
+`amdgpu_info_navi22::SUBMISSION` is the single switch for ACCEL_WORKING,
+`available_rings`, HW_IP_COUNT, GANG_SUBMIT, the DRM minor (3.64.0 vs
+3.0.0) and the render ioctls; it is `Wired`, and still advertises nothing
+unless `Boot::queues_verified`. VIDEO_CAPS returns the Sienna Cichlid
+codec tables for the discovered VCN instances; MAX_IBS reports
+`amdgpu_navi22_submit::MAX_IBS` (16) for advertised rings.
+
+`unsafe amdgpu_gfx10_topology::read(gpu, pci_cap)` requires exclusive GRBM
+selector ownership with RLC booted and GFX powered. It samples the NBIO
+revision strap, GB_ADDR_CONFIG, per-SE/SA fused and user RB/WGP disables and
+the TCC disables, restores SE/SA broadcast within one capability operation,
+and `derive(Limits, &Sample)` reproduces `gfx_v10_0_setup_rb`,
+`gfx_v10_0_get_cu_info` and `gfx_v10_0_get_tcc_info`. A zero or non-256 B
+interleave GB_ADDR_CONFIG, zero CUs/RBs, or GC dimensions beyond the GFX10
+DRM layout are refused; only device loss or revoked authority fails the
+cold-boot stage.
+
 ### Navi 48 PCIe probe (RX 9070 XT)
 
 The next discrete target is Navi48, selected from the September 2026
@@ -3549,6 +3580,43 @@ Sienna Cichlid `AMDGPU_INFO_VIDEO_CAPS` tables (decode VCN0 with AV1, or VCN1
 when VCN0 is harvested; encode AVC 4096² and HEVC 8192×4352) as
 `DrmAmdgpuInfoVideoCaps`; `None` for an unknown subquery or no VCN. Not yet
 wired into the INFO ioctl.
+
+### Navi 22 client submission and render ABI
+
+`amdgpu_navi22_submit` queues client IBs on the verified kernel queues:
+`Gfx::submit`, `Compute::submit`, `Sdma::submit(instance, ..)` (and
+`ColdBoot::submit(ring, &mut RingState, VmRef, context, &[Ib])`,
+`ColdBoot::fences(ring) -> (completed, throttle)`) emit pipeline sync and a
+ring-side VM flush (PTB write + GFXHUB invalidation on the ring's engine:
+gfx 0, compute 4, SDMA 13/14; PFP_SYNC_ME on gfx) the first time a VM
+generation runs on that ring, CONTEXT_CONTROL/FRAME_CONTROL on gfx, up to 16
+IBs with the VMID, then the ring fence. `validate` refuses VMID 0/>15,
+empty or oversized IB lists, unaligned or zero-length IBs. At most two
+submissions are outstanding per ring; a third returns `Busy` without
+touching the ring.
+
+`amdgpu_navi22_cs::{register, unregister, Submitter, ring_id, ring_index,
+job_done, drm_card}` plug the card into the generic render path: after a cold
+boot or recovery whose queues are verified, `register` reserves one GMC10
+client context (`ColdBoot::reserve_client_vmid`), registers the card's client
+VRAM heap (`ColdBoot::reserve_client_vram`, retained across recoveries) with
+`amdgpu_gem::register_vram_heap`, and an `amdgpu_cs::Submitter` whose jobs run
+on gfx ring 0, the compute queue (rings 0–3) or SDMA 0/1 with a per-job VM
+flush to the open's `VmState` root. Tickets are `ring_index(epoch, id) << 32 |
+seq`; tickets of an earlier recovery epoch read as complete. Fences are read
+by `amdgpu_cp_navi22::FenceReader` (`ColdBoot::client_fence_reader`) without
+the owner. `unregister` runs at the start of recovery.
+
+Generic additions used by it: `amdgpu_cs` accepts the `FENCE` chunk
+(`Submission::user_fence`; `retire` writes the job's ticket to the BO);
+`amdgpu_gem` answers `GEM_METADATA`, `GemState::{import, mmap_owner}`,
+`GemObject::write_u64`, and `GEM_MMAP` returns its offset at byte 0 of the
+8-byte union; amdgpu GEM objects export/import as PRIME dma-bufs;
+`drm_ioctl_bridge::{get_client, without_kms}` answer `GET_CLIENT` on primary
+nodes and `VERSION`/`GET_CAP` on amdgpu nodes without KMS state;
+`SYNCOBJ_WAIT` returns `-ETIME` on timeout and `-EINVAL` for an unsubmitted
+syncobj without `WAIT_FOR_SUBMIT`; `amdgpu_ctx` QUERY_STATE/QUERY_STATE2
+report recoveries.
 
 ### Navi 22 DCN3.0 DMUB startup
 
