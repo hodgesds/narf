@@ -161,6 +161,11 @@ pub struct OverlayFs {
     upper: Option<Arc<dyn DirOps>>,
     lowers: Vec<Arc<dyn DirOps>>,
     mount_id: Arc<()>,
+    /// Filesystem instances whose directories are layers here. A layer's
+    /// `DirOps` need not keep its instance alive (btrfs nodes hold only a
+    /// weak volume reference), so an overlay built from `instance.root()`
+    /// owns the instance too.
+    pinned: Vec<Arc<dyn FsInstance>>,
 }
 
 impl fmt::Debug for OverlayFs {
@@ -197,7 +202,15 @@ impl OverlayFs {
             upper,
             lowers,
             mount_id: Arc::new(()),
+            pinned: Vec::new(),
         }
+    }
+
+    /// Keep `instance` alive for as long as this overlay: its root (or a
+    /// directory in it) is one of the layers.
+    pub fn pin_instance(mut self, instance: Arc<dyn FsInstance>) -> Self {
+        self.pinned.push(instance);
+        self
     }
 }
 

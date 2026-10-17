@@ -273,11 +273,16 @@ pub fn tmpfs_overlay_root(lower: Arc<dyn FsInstance>) -> Result<Arc<dyn FsInstan
     let upper_root = upper.root();
     upper_root.set_dir_mode(lower_root.dir_mode());
     upper_root.set_dir_owners(uid, gid);
-    Ok(Arc::new(crate::overlayfs::OverlayFs::new(
-        ROOT_TMPFS_OVERLAY_NAME,
-        upper_root,
-        alloc::vec![lower_root],
-    )))
+    Ok(Arc::new(
+        crate::overlayfs::OverlayFs::new(
+            ROOT_TMPFS_OVERLAY_NAME,
+            upper_root,
+            alloc::vec![lower_root],
+        )
+        // The lower's directories may hold only a weak reference to their
+        // volume (btrfs); the overlay is now the volume's owner.
+        .pin_instance(lower),
+    ))
 }
 
 /// Registered block devices boot-time code may automatically mount, plus the
