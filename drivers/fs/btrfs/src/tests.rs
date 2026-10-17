@@ -3102,12 +3102,13 @@ fn smoke_btrfs_registration() -> TestResult {
     if narf_filesystem::lookup_fstype("btrfs").is_none() {
         return TestResult::Fail("btrfs fstype not registered");
     }
-    // The builder rejects write-implying options before touching a device.
+    // The builder rejects options that would change on-disk state NARF does
+    // not maintain before touching a device.
     if !matches!(
-        crate::btrfs_fstype_builder("/dev/nope", "rw"),
+        crate::btrfs_fstype_builder("/dev/nope", "rw,clear_cache"),
         Err(FsError::Unsupported)
     ) {
-        return TestResult::Fail("builder should reject rw option");
+        return TestResult::Fail("builder should reject clear_cache");
     }
     // A read-only mount of a missing device fails with NotFound, not a panic.
     if !matches!(
@@ -10489,3 +10490,461 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_read_only_device_refuses_log_replay
 );
+
+// ── Read-write safety gate (rw_gate) ───────────────────────────────
+
+/// The laptop fixture's primary superblock (raw 4 KiB), extracted from the
+/// sparse runs without building the 128 MiB image. Its features are the
+/// host CachyOS root's minus BLOCK_GROUP_TREE (incompat 0x373 =
+/// MIXED_BACKREF|DEFAULT_SUBVOL|COMPRESS_ZSTD|BIG_METADATA|EXTENDED_IREF|
+/// SKINNY_METADATA|NO_HOLES, compat_ro FREE_SPACE_TREE|VALID, crc32c,
+/// 4 KiB sectors, 16 KiB nodes, one device).
+fn laptop_raw_superblock() -> Vec<u8> {
+    let (_, runs) = decode_sparse_runs(FIXTURE_LAPTOP_SPARSE);
+    let start = format::SUPERBLOCK_OFFSET;
+    let mut sb = alloc::vec![0u8; format::SUPERBLOCK_SIZE];
+    for (off, bytes) in runs {
+        let end = off + bytes.len() as u64;
+        if end <= start || off >= start + sb.len() as u64 {
+            continue;
+        }
+        let from = start.max(off);
+        let to = end.min(start + sb.len() as u64);
+        sb[(from - start) as usize..(to - start) as usize]
+            .copy_from_slice(&bytes[(from - off) as usize..(to - off) as usize]);
+    }
+    sb
+}
+
+/// Every superblock-level refusal reason, for both profiles.
+fn smoke_btrfs_rw_gate_superblock_refusals() -> TestResult {
+    use crate::rw_gate::{self, check_superblock, Profile, Refusal};
+    let raw = laptop_raw_superblock();
+    let base = match Superblock::decode(&raw) {
+        Ok(sb) => sb,
+        Err(_) => return TestResult::Fail("laptop superblock did not decode"),
+    };
+    let flags = format::le64(&raw, rw_gate::OFF_SUPER_FLAGS).unwrap_or(u64::MAX);
+    if flags != rw_gate::SUPER_FLAG_WRITTEN {
+        return TestResult::Fail("fixture superblock flags are not just WRITTEN");
+    }
+    for profile in [Profile::Default, Profile::RootRw] {
+        if check_superblock(&base, flags, profile).is_err() {
+            return TestResult::Fail("the host-shaped superblock must pass the gate");
+        }
+    }
+    type Mutate = fn(&mut Superblock, &mut u64);
+    // (mutation, Default verdict, RootRw verdict)
+    let cases: &[(&str, Mutate, Option<Refusal>, Option<Refusal>)] = &[
+        (
+            "unknown incompat (EXTENT_TREE_V2)",
+            |sb, _| sb.incompat_flags |= 1 << 13,
+            Some(Refusal::Incompat(1 << 13)),
+            Some(Refusal::Incompat(1 << 13)),
+        ),
+        (
+            "RAID56 outside root-rw",
+            |sb, _| sb.incompat_flags |= format::INCOMPAT_RAID56,
+            None,
+            Some(Refusal::Incompat(format::INCOMPAT_RAID56)),
+        ),
+        (
+            "MIXED_GROUPS outside root-rw",
+            |sb, _| sb.incompat_flags |= format::INCOMPAT_MIXED_GROUPS,
+            None,
+            Some(Refusal::Incompat(format::INCOMPAT_MIXED_GROUPS)),
+        ),
+        (
+            "BLOCK_GROUP_TREE not written yet",
+            |sb, _| sb.compat_ro_flags |= rw_gate::COMPAT_RO_BLOCK_GROUP_TREE,
+            Some(Refusal::CompatRo(rw_gate::COMPAT_RO_BLOCK_GROUP_TREE)),
+            Some(Refusal::CompatRo(rw_gate::COMPAT_RO_BLOCK_GROUP_TREE)),
+        ),
+        (
+            "VERITY",
+            |sb, _| sb.compat_ro_flags |= 1 << 2,
+            Some(Refusal::CompatRo(1 << 2)),
+            Some(Refusal::CompatRo(1 << 2)),
+        ),
+        (
+            "free-space tree not valid",
+            |sb, _| sb.compat_ro_flags &= !format::COMPAT_RO_FREE_SPACE_TREE_VALID,
+            Some(Refusal::FreeSpaceTreeInvalid),
+            Some(Refusal::FreeSpaceTreeInvalid),
+        ),
+        (
+            "no free-space tree",
+            |sb, _| sb.compat_ro_flags = 0,
+            None,
+            Some(Refusal::NoFreeSpaceTree),
+        ),
+        (
+            "pending log tree",
+            |sb, _| sb.log_root = 0x1234_0000,
+            None,
+            Some(Refusal::LogTree(0x1234_0000)),
+        ),
+        (
+            "xxhash64 checksums",
+            |sb, _| sb.csum_type = 1,
+            None,
+            Some(Refusal::ChecksumType(1)),
+        ),
+        (
+            "8 KiB sectors",
+            |sb, _| sb.sectorsize = 8192,
+            None,
+            Some(Refusal::SectorSize(8192)),
+        ),
+        (
+            "odd nodesize",
+            |sb, _| sb.nodesize = 12288,
+            None,
+            Some(Refusal::NodeSize(12288)),
+        ),
+        (
+            "two devices",
+            |sb, _| sb.num_devices = 2,
+            None,
+            Some(Refusal::MultiDevice(2)),
+        ),
+        (
+            "error state",
+            |_, f| *f |= rw_gate::SUPER_FLAG_ERROR,
+            Some(Refusal::ErrorState),
+            Some(Refusal::ErrorState),
+        ),
+        (
+            "seeding",
+            |_, f| *f |= rw_gate::SUPER_FLAG_SEEDING,
+            Some(Refusal::SuperFlags(rw_gate::SUPER_FLAG_SEEDING)),
+            Some(Refusal::SuperFlags(rw_gate::SUPER_FLAG_SEEDING)),
+        ),
+        (
+            "fsid change in progress",
+            |_, f| *f |= rw_gate::SUPER_FLAG_CHANGING_FSID_V2,
+            Some(Refusal::SuperFlags(rw_gate::SUPER_FLAG_CHANGING_FSID_V2)),
+            Some(Refusal::SuperFlags(rw_gate::SUPER_FLAG_CHANGING_FSID_V2)),
+        ),
+        (
+            "csum change in progress",
+            |_, f| *f |= rw_gate::SUPER_FLAG_CHANGING_DATA_CSUM,
+            Some(Refusal::SuperFlags(rw_gate::SUPER_FLAG_CHANGING_DATA_CSUM)),
+            Some(Refusal::SuperFlags(rw_gate::SUPER_FLAG_CHANGING_DATA_CSUM)),
+        ),
+        (
+            "metadump",
+            |_, f| *f |= rw_gate::SUPER_FLAG_METADUMP_V2,
+            Some(Refusal::SuperFlags(rw_gate::SUPER_FLAG_METADUMP_V2)),
+            Some(Refusal::SuperFlags(rw_gate::SUPER_FLAG_METADUMP_V2)),
+        ),
+        (
+            "generation zero",
+            |sb, _| sb.generation = 0,
+            Some(Refusal::Generation),
+            Some(Refusal::Generation),
+        ),
+    ];
+    for (what, mutate, default, root_rw) in cases {
+        let mut sb = base.clone();
+        let mut f = flags;
+        mutate(&mut sb, &mut f);
+        let got_default = check_superblock(&sb, f, Profile::Default).err();
+        let got_root = check_superblock(&sb, f, Profile::RootRw).err();
+        if &got_default != default || &got_root != root_rw {
+            let _ = what;
+            return TestResult::Fail("a gate case returned the wrong verdict");
+        }
+    }
+    // Refusal messages name the bit, as the root-rw failure banner shows it.
+    let msg = alloc::format!("{}", Refusal::CompatRo(rw_gate::COMPAT_RO_BLOCK_GROUP_TREE));
+    if !msg.contains("BLOCK_GROUP_TREE") {
+        return TestResult::Fail("the refusal must name BLOCK_GROUP_TREE");
+    }
+    let (incompat, compat_ro) = rw_gate::supported_features(Profile::RootRw);
+    if incompat
+        != [
+            "MIXED_BACKREF",
+            "DEFAULT_SUBVOL",
+            "COMPRESS_LZO",
+            "COMPRESS_ZSTD",
+            "BIG_METADATA",
+            "EXTENDED_IREF",
+            "SKINNY_METADATA",
+            "NO_HOLES",
+        ]
+        || compat_ro != ["FREE_SPACE_TREE", "FREE_SPACE_TREE_VALID"]
+    {
+        return TestResult::Fail("root-rw feature list changed without updating this test");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rw_gate_superblock_refusals);
+
+/// Mount `image` read-write (checksums verified) and report whether the gate
+/// left it writable, plus the bytes afterwards.
+fn gate_mount(image: Vec<u8>) -> Result<(bool, Vec<u8>), &'static str> {
+    use narf_block::ram::RamBlockDevice;
+    let device = RamBlockDevice::from_image(512, image);
+    let vol = poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0))
+        .ok_or("mount pended")?
+        .map_err(|_| "mount failed")?;
+    let writable = !vol.is_read_only();
+    if !writable {
+        // A refused volume must refuse a write at the VFS layer, too.
+        use narf_filesystem::FsInstance;
+        if !vol.always_read_only() {
+            return Err("a gate-refused volume must report always_read_only");
+        }
+    }
+    drop(vol);
+    Ok((writable, device.snapshot()))
+}
+
+/// Restamp the superblock (all mirrors present in `image`) after an edit.
+fn restamp_superblock(image: &mut [u8], edit: impl Fn(&mut [u8])) {
+    for &off in &format::SUPERBLOCK_MIRROR_OFFSETS {
+        let off = off as usize;
+        if off + format::SUPERBLOCK_SIZE > image.len()
+            || format::le64(image, off + format::SUPERBLOCK_BYTENR_OFFSET) != Ok(off as u64)
+        {
+            continue;
+        }
+        let sb = &mut image[off..off + format::SUPERBLOCK_SIZE];
+        edit(sb);
+        let csum = Superblock::checksum_type(sb).unwrap_or(0);
+        let _ = checksum::stamp_block(csum, sb);
+    }
+}
+
+/// A superblock in the error state is mounted read-only: no byte changes.
+fn smoke_btrfs_rw_gate_error_state_mounts_read_only() -> TestResult {
+    crate::rw_gate::__reset_writers_for_test();
+    let mut image = decode_sparse(FIXTURE_FST_SPARSE);
+    restamp_superblock(&mut image, |sb| {
+        let flags = format::le64(sb, crate::rw_gate::OFF_SUPER_FLAGS).unwrap_or(0)
+            | crate::rw_gate::SUPER_FLAG_ERROR;
+        sb[crate::rw_gate::OFF_SUPER_FLAGS..crate::rw_gate::OFF_SUPER_FLAGS + 8]
+            .copy_from_slice(&flags.to_le_bytes());
+    });
+    let before = image.clone();
+    match gate_mount(image) {
+        Ok((false, after)) if after == before => {}
+        Ok((true, _)) => return TestResult::Fail("an error-state volume was mounted writable"),
+        Ok((false, _)) => return TestResult::Fail("a refused volume was written"),
+        Err(why) => return TestResult::Fail(why),
+    }
+    match crate::rw_gate::last_refusal() {
+        Some(msg) if msg.contains("ERROR") && msg.contains("READ-ONLY") => TestResult::Pass,
+        _ => TestResult::Fail("the refusal must be logged naming the reason"),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_rw_gate_error_state_mounts_read_only
+);
+
+/// Rewrite one key of the tree whose root node is at `logical` (which must
+/// be a leaf) and restamp the node. `pick` returns `(slot, new key,
+/// optional body patch at offset)`.
+fn patch_leaf_key(
+    image: &mut [u8],
+    logical: u64,
+    physical: u64,
+    nodesize: usize,
+    csum_type: u16,
+    pick: impl Fn(&[u8]) -> Option<(usize, BtrfsKey, Option<(usize, u64)>)>,
+) -> Result<(), &'static str> {
+    let _ = logical;
+    let at = physical as usize;
+    let node = image
+        .get_mut(at..at + nodesize)
+        .ok_or("node out of image")?;
+    if btree::level(node) != Ok(0) {
+        return Err("tree root is not a leaf in this fixture");
+    }
+    let (slot, key, patch) = pick(node).ok_or("no slot to patch")?;
+    let item = btree::HEADER_SIZE + slot * (format::DISK_KEY_SIZE + 8);
+    node[item..item + 8].copy_from_slice(&key.objectid.to_le_bytes());
+    node[item + 8] = key.item_type;
+    node[item + 9..item + 17].copy_from_slice(&key.offset.to_le_bytes());
+    if let Some((off, value)) = patch {
+        let (data, _) = btree::leaf_item_span(node, slot).map_err(|_| "item span")?;
+        let start = btree::HEADER_SIZE + data + off;
+        node[start..start + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    checksum::stamp_block(csum_type, node).map_err(|_| "restamp failed")
+}
+
+/// Balance / relocation / device-replace state in the trees refuses the RW
+/// mount (Linux would resume them; NARF cannot).
+fn smoke_btrfs_rw_gate_tree_refusals() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    crate::rw_gate::__reset_writers_for_test();
+    let pristine = decode_sparse(FIXTURE_FST_SPARSE);
+    // Locate the root and dev tree roots through a read-only mount.
+    let probe = match poll_once(BtrfsVolume::mount_devices_read_only(
+        alloc::vec![RamBlockDevice::from_image(512, pristine.clone())],
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("probe mount failed"),
+    };
+    let (root_logical, _) = probe.root_tree_root();
+    let dev_logical = match poll_once(crate::roots::find_root(
+        &*probe,
+        root_logical,
+        format::DEV_TREE_OBJECTID,
+    )) {
+        Some(Ok((addr, _))) => addr,
+        _ => return TestResult::Fail("dev tree root missing"),
+    };
+    let (Ok(root_phys), Ok(dev_phys)) = (
+        probe.map_logical(root_logical),
+        probe.map_logical(dev_logical),
+    ) else {
+        return TestResult::Fail("tree roots did not map");
+    };
+    let nodesize = probe.nodesize();
+    let csum = probe.superblock().csum_type;
+    drop(probe);
+
+    let last_slot = |node: &[u8]| btree::nritems(node).ok().map(|n| n as usize - 1);
+    let cases: [(&str, &str, u64, u64, Option<(usize, u64)>, bool); 3] = [
+        // (what, refusal text, objectid, type<<56|offset, body patch, dev tree)
+        ("balance", "balance", (-4i64) as u64, 248, None, false),
+        ("relocation", "relocation", (-8i64) as u64, 132, None, false),
+        ("replace", "replace", 0, 250, Some((32, 1)), true),
+    ];
+    for (_what, text, objectid, item_type, patch, dev_tree) in cases {
+        let mut image = pristine.clone();
+        let (logical, phys) = if dev_tree {
+            (dev_logical, dev_phys)
+        } else {
+            (root_logical, root_phys)
+        };
+        let result = patch_leaf_key(&mut image, logical, phys, nodesize, csum, |node| {
+            let slot = if dev_tree { 0 } else { last_slot(node)? };
+            Some((slot, BtrfsKey::new(objectid, item_type as u8, 0), patch))
+        });
+        if let Err(why) = result {
+            return TestResult::Fail(why);
+        }
+        let before = image.clone();
+        match gate_mount(image) {
+            Ok((false, after)) if after == before => {}
+            Ok((true, _)) => return TestResult::Fail("in-progress tree state mounted writable"),
+            Ok((false, _)) => return TestResult::Fail("a refused volume was written"),
+            Err(why) => return TestResult::Fail(why),
+        }
+        if !crate::rw_gate::last_refusal().is_some_and(|m| m.contains(text)) {
+            return TestResult::Fail("the tree refusal must be logged naming the reason");
+        }
+    }
+    // The untouched image mounts writable.
+    match gate_mount(pristine) {
+        Ok((true, _)) => TestResult::Pass,
+        _ => TestResult::Fail("the pristine image must mount writable"),
+    }
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rw_gate_tree_refusals);
+
+/// At most one writable volume per fsid: a second read-write mount of the
+/// same filesystem (another fstab subvolume) comes up read-only; once the
+/// writer is gone the fsid can be written again — except under root-rw,
+/// where the first writer's claim lasts the boot.
+fn smoke_btrfs_rw_gate_one_writer_per_fsid() -> TestResult {
+    use crate::rw_gate::{claim_writer, Profile, Refusal};
+    use narf_block::ram::RamBlockDevice;
+    crate::rw_gate::__reset_writers_for_test();
+    let image = decode_sparse(FIXTURE_FST_SPARSE);
+    let mount = |img: Vec<u8>| {
+        poll_once(BtrfsVolume::mount_devices_claimed(
+            alloc::vec![RamBlockDevice::from_image(512, img)],
+            DomainId::DRIVER_0,
+            false,
+        ))
+    };
+    let first = match mount(image.clone()) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("first mount failed"),
+    };
+    let second = match mount(image.clone()) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("second mount failed"),
+    };
+    if first.is_read_only() || !second.is_read_only() {
+        return TestResult::Fail("the second writable mount of one fsid must be read-only");
+    }
+    if !crate::rw_gate::last_refusal().is_some_and(|m| m.contains("another writable mount")) {
+        return TestResult::Fail("the second-writer refusal must be logged");
+    }
+    // A write through the read-only instance is refused.
+    {
+        use narf_filesystem::FsInstance;
+        if !matches!(
+            poll_once(second.root().create("second-writer")),
+            Some(Err(FsError::ReadOnly))
+        ) {
+            return TestResult::Fail("the read-only second instance accepted a write");
+        }
+    }
+    drop(second);
+    drop(first);
+    let third = match mount(image) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("third mount failed"),
+    };
+    if third.is_read_only() {
+        return TestResult::Fail("a released fsid must be writable again (default profile)");
+    }
+    drop(third);
+    // root-rw: the claim is sticky for the boot.
+    let fsid = [0x5Au8; 16];
+    let claim = claim_writer(fsid, Profile::RootRw);
+    drop(claim);
+    let again = claim_writer(fsid, Profile::RootRw);
+    crate::rw_gate::__reset_writers_for_test();
+    match again {
+        Err(Refusal::AnotherWriter) => TestResult::Pass,
+        _ => TestResult::Fail("under root-rw the first writer keeps its fsid for the boot"),
+    }
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rw_gate_one_writer_per_fsid);
+
+/// Mount options a CachyOS fstab and live mount carry are accepted; options
+/// that would change on-disk state NARF does not maintain are refused.
+fn smoke_btrfs_mount_options_installed_root() -> TestResult {
+    let host = "rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=256,subvol=/@";
+    match crate::parse_mount_options(host) {
+        Ok(o) if o.subvol.as_deref() == Some("@") && o.subvolid == Some(256) && !o.read_only => {}
+        _ => return TestResult::Fail("the host's live root mount options must parse"),
+    }
+    match crate::parse_mount_options("subvol=/@home,defaults,noatime,compress=zstd:1") {
+        Ok(o) if o.subvol.as_deref() == Some("@home") => {}
+        _ => return TestResult::Fail("the host's fstab options must parse"),
+    }
+    match crate::parse_mount_options("ro,subvol=/@log") {
+        Ok(o) if o.read_only => {}
+        _ => return TestResult::Fail("ro must parse"),
+    }
+    for bad in [
+        "clear_cache",
+        "space_cache=v1",
+        "space_cache",
+        "nospace_cache",
+        "rescue=usebackuproot",
+        "usebackuproot",
+        "degraded",
+        "device=/dev/sda",
+        "compress=brotli",
+        "commit=x",
+    ] {
+        if crate::parse_mount_options(bad).is_ok() {
+            return TestResult::Fail("a state-changing option must be refused");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_mount_options_installed_root);

@@ -187,8 +187,18 @@ pub struct BtrfsVolume<B: BlockDevice> {
     /// Mounted read-only: requested, or a member device reports
     /// `is_read_only` (`narf.disks=boot-only`). Nothing is ever written —
     /// no log replay (a pending log tree refuses the mount), no commit timer,
-    /// and every device write funnel returns `ReadOnly`.
-    read_only: bool,
+    /// and every device write funnel returns `ReadOnly`. Also set when the
+    /// mount-time write-safety gate ([`crate::rw_gate`]) refuses a
+    /// read-write mount; never cleared.
+    read_only: core::sync::atomic::AtomicBool,
+    /// Raw `flags` word of the selected superblock (for the gate).
+    super_flags: u64,
+    /// Whether a writable mount must hold the fsid's single writer claim
+    /// (every VFS-visible mount; see [`Self::mount_devices_claimed`]).
+    claim_fsid: bool,
+    /// This volume's claim to be the one writer of its fsid; `None` when
+    /// read-only.
+    writer_claim: IrqSafeSpinLock<Option<crate::rw_gate::WriterClaim>>,
     devices: IrqSafeSpinLock<BTreeMap<u64, Arc<VolumeDevice<B>>>>,
     state: IrqSafeSpinLock<VolState>,
     /// A stamped superblock image whose commit has completed in memory but
@@ -299,7 +309,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// A subvolume marked read-only in its root item remains read-only, and so
     /// does one whose transaction was aborted.
     pub(crate) fn supports_writes(&self) -> bool {
-        !self.read_only
+        !self.is_read_only()
             && !self.aborted.load(core::sync::atomic::Ordering::Acquire)
             && self.state.lock().writable_fs_tree
     }
@@ -307,7 +317,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// True when the volume was mounted read-only (requested, or a member
     /// device refuses writes).
     pub fn is_read_only(&self) -> bool {
-        self.read_only
+        self.read_only.load(core::sync::atomic::Ordering::Acquire)
     }
 
     /// Refuse all further writes, because a transaction was lost after its
@@ -1054,7 +1064,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         domain: DomainId,
         verify_checksums: bool,
     ) -> Result<Arc<Self>, FsError> {
-        Self::mount_devices_with(input, domain, verify_checksums, false).await
+        Self::mount_devices_with(input, domain, verify_checksums, false, false).await
     }
 
     /// [`Self::mount_devices_opts`] that never writes to any member (see
@@ -1065,7 +1075,20 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         domain: DomainId,
         verify_checksums: bool,
     ) -> Result<Arc<Self>, FsError> {
-        Self::mount_devices_with(input, domain, verify_checksums, true).await
+        Self::mount_devices_with(input, domain, verify_checksums, true, false).await
+    }
+
+    /// The mount every VFS-visible btrfs mount uses (the root factory and
+    /// `mount -t btrfs`): [`Self::mount_devices_opts`] / read-only, plus the
+    /// one-writer-per-fsid claim ([`crate::rw_gate::claim_writer`]). A
+    /// read-write request whose fsid already has a live writer comes up
+    /// read-only, before anything (log replay included) can write.
+    pub async fn mount_devices_claimed(
+        input: Vec<Arc<B>>,
+        domain: DomainId,
+        read_only: bool,
+    ) -> Result<Arc<Self>, FsError> {
+        Self::mount_devices_with(input, domain, true, read_only, true).await
     }
 
     async fn mount_devices_with(
@@ -1073,6 +1096,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         domain: DomainId,
         verify_checksums: bool,
         read_only_requested: bool,
+        claim_fsid: bool,
     ) -> Result<Arc<Self>, FsError> {
         let source_device = input.first().cloned().ok_or(FsError::NotFound)?;
         let mut scanned = Vec::new();
@@ -1100,7 +1124,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                 cap: register_with_cap(dma),
                 block_size: logical,
             });
-            let mut best: Option<(u64, Superblock, [u8; format::SUPERBLOCK_DEV_ITEM_SIZE])> = None;
+            let mut best: Option<(u64, Superblock, [u8; format::SUPERBLOCK_DEV_ITEM_SIZE], u64)> =
+                None;
             let mut saw_unsupported = false;
             for &offset in &format::SUPERBLOCK_MIRROR_OFFSETS {
                 if offset + format::SUPERBLOCK_SIZE as u64 > capacity {
@@ -1147,25 +1172,26 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                 };
                 if best
                     .as_ref()
-                    .is_none_or(|(_, current, _)| decoded.generation > current.generation)
+                    .is_none_or(|(_, current, _, _)| decoded.generation > current.generation)
                 {
                     let start = format::SUPERBLOCK_DEV_ITEM_OFFSET;
                     let mut dev_item = [0u8; format::SUPERBLOCK_DEV_ITEM_SIZE];
                     dev_item.copy_from_slice(
                         &candidate[start..start + format::SUPERBLOCK_DEV_ITEM_SIZE],
                     );
-                    best = Some((offset, decoded, dev_item));
+                    let flags = format::le64(&candidate, crate::rw_gate::OFF_SUPER_FLAGS)?;
+                    best = Some((offset, decoded, dev_item, flags));
                 }
             }
             match best {
-                Some((offset, superblock, dev_item)) => {
+                Some((offset, superblock, dev_item, flags)) => {
                     let member = Arc::new(VolumeDevice {
                         device,
                         capacity,
                         dev_item: IrqSafeSpinLock::new(dev_item),
                         io,
                     });
-                    scanned.push((member, offset, superblock));
+                    scanned.push((member, offset, superblock, flags));
                 }
                 None if index == 0 && saw_unsupported => return Err(FsError::Unsupported),
                 None if index == 0 => return Err(FsError::InvalidData),
@@ -1175,19 +1201,19 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
         let source_fsid = scanned
             .first()
-            .map(|(_, _, sb)| sb.fsid)
+            .map(|(_, _, sb, _)| sb.fsid)
             .ok_or(FsError::InvalidData)?;
         let source_geometry = scanned
             .first()
-            .map(|(_, _, sb)| (sb.sectorsize, sb.nodesize, sb.csum_type))
+            .map(|(_, _, sb, _)| (sb.sectorsize, sb.nodesize, sb.csum_type))
             .ok_or(FsError::InvalidData)?;
         let mut devices = BTreeMap::new();
-        let mut selected: Option<(u64, u64, Superblock)> = None;
+        let mut selected: Option<(u64, u64, Superblock, u64)> = None;
         let mut min_generation = u64::MAX;
         let mut max_generation = 0u64;
         let mut common_superblock: Option<Superblock> = None;
         let mut inconsistent_members = false;
-        for (member, offset, candidate) in scanned {
+        for (member, offset, candidate, flags) in scanned {
             if candidate.fsid != source_fsid {
                 continue;
             }
@@ -1211,12 +1237,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             }
             if selected
                 .as_ref()
-                .is_none_or(|(_, _, current)| candidate.generation > current.generation)
+                .is_none_or(|(_, _, current, _)| candidate.generation > current.generation)
             {
-                selected = Some((candidate.devid, offset, candidate));
+                selected = Some((candidate.devid, offset, candidate, flags));
             }
         }
-        let (source_devid, source_offset, superblock) = selected.ok_or(FsError::InvalidData)?;
+        let (source_devid, source_offset, superblock, super_flags) =
+            selected.ok_or(FsError::InvalidData)?;
         if devices.len() > superblock.num_devices as usize {
             return Err(FsError::InvalidData);
         }
@@ -1243,7 +1270,10 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             csum_type,
             verify_checksums,
             degraded,
-            read_only,
+            read_only: core::sync::atomic::AtomicBool::new(read_only),
+            super_flags,
+            claim_fsid,
+            writer_claim: IrqSafeSpinLock::new(None),
             devices: IrqSafeSpinLock::new(devices),
             staged_super: IrqSafeSpinLock::new(None),
             staged_count: core::sync::atomic::AtomicUsize::new(0),
@@ -1271,7 +1301,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // Complete the chunk map and locate the FS tree now that the volume can
         // read nodes.
         volume.finish_mount().await?;
-        if !volume.read_only {
+        if !volume.is_read_only() {
             crate::write::spawn_commit_timer(&volume);
         }
         volume.register_sysfs();
@@ -1368,6 +1398,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             }
         }
 
+        // 1b. Before anything can write (log replay below, the commit timer,
+        //     any VFS operation): the read-write safety gate. A refusal makes
+        //     this volume read-only for its lifetime.
+        self.apply_rw_gate().await;
+
         // 2. Find the FS_TREE root item (5, ROOT_ITEM, *) in the root tree and
         //    extract its root node address + level.
         let (fs_root, fs_level, fs_flags) =
@@ -1404,6 +1439,35 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             }
         }
         Ok(())
+    }
+
+    /// Run [`crate::rw_gate`] on a volume about to be mounted read-write and
+    /// claim its fsid; on any refusal, log it and turn the volume read-only.
+    async fn apply_rw_gate(&self) {
+        if self.is_read_only() {
+            return;
+        }
+        let profile = crate::rw_gate::active_profile();
+        let sb = self.superblock();
+        let verdict = match crate::rw_gate::check_superblock(&sb, self.super_flags, profile) {
+            Ok(()) => crate::rw_gate::check_trees(self).await,
+            Err(why) => Err(why),
+        };
+        let verdict = verdict.and_then(|()| {
+            if self.claim_fsid {
+                crate::rw_gate::claim_writer(sb.fsid, profile).map(Some)
+            } else {
+                Ok(None)
+            }
+        });
+        match verdict {
+            Ok(claim) => *self.writer_claim.lock() = claim,
+            Err(why) => {
+                self.read_only
+                    .store(true, core::sync::atomic::Ordering::Release);
+                crate::rw_gate::report(&sb.fsid, profile, &why);
+            }
+        }
     }
 
     /// The objectid of the on-disk default subvolume, from the root tree's
@@ -1476,7 +1540,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         offset: u64,
         src: &[u8],
     ) -> Result<(), FsError> {
-        if self.read_only {
+        if self.is_read_only() {
             return Err(FsError::ReadOnly);
         }
         let member = self.member(devid)?;
@@ -1801,7 +1865,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// Superblock half of [`Self::write_node_root_admin`].
     pub(crate) async fn write_superblock_root_admin(&self, raw: &[u8]) -> Result<(), FsError> {
-        if self.degraded || self.read_only {
+        if self.degraded || self.is_read_only() {
             return Err(FsError::ReadOnly);
         }
         self.write_superblock_unchecked(raw).await

@@ -800,6 +800,117 @@ pub(crate) fn chunk_span_avoiding_supers(mut start: u64, avail_end: u64) -> (u64
 /// Matches btrfs's preference for bounded, contiguous data extents.
 const MAX_WRITE_EXTENT: u64 = 128 * 1024;
 
+/// Csum-tree edits dropping the checksums of the released data extents
+/// `(bytenr, len)` — Linux's `btrfs_del_csums`.
+///
+/// Linux packs the checksums of disk-adjacent extents into one item (up to
+/// a leaf's worth) and splits a large extent's across several, so an
+/// extent's checksums need not start an item, nor fill one. Every item
+/// overlapping a released range is deleted and the sectors it covers outside
+/// every released range are re-inserted as items of their own; deleting only
+/// an item keyed at the extent's `bytenr` would leave checksums for freed
+/// space behind, which `btrfs check` reports and which a later extent
+/// allocated there would contradict.
+async fn csum_release_edits<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    csum_root: u64,
+    released: &[(u64, u64)],
+) -> Result<Vec<Edit>, FsError> {
+    if released.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sectorsize = u64::from(vol.sectorsize());
+    let csum_bytes = crate::checksum::size(vol.csum_type())?;
+    let mut ranges: Vec<(u64, u64)> = released
+        .iter()
+        .map(|&(bytenr, len)| (bytenr, bytenr.saturating_add(len)))
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let csum_key = |offset| {
+        BtrfsKey::new(
+            format::EXTENT_CSUM_OBJECTID,
+            format::EXTENT_CSUM_KEY,
+            offset,
+        )
+    };
+    let is_csum = |k: &BtrfsKey| {
+        k.objectid == format::EXTENT_CSUM_OBJECTID && k.item_type == format::EXTENT_CSUM_KEY
+    };
+    let item_end = |offset: u64, body: &[u8]| -> Result<u64, FsError> {
+        if body.len() % csum_bytes != 0 {
+            return Err(FsError::InvalidData);
+        }
+        Ok(offset + (body.len() / csum_bytes) as u64 * sectorsize)
+    };
+    let mut items: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    for &(start, end) in &merged {
+        if let Some((key, body)) = btree::last_before(vol, csum_root, &csum_key(start + 1)).await? {
+            if is_csum(&key) && item_end(key.offset, &body)? > start {
+                items.insert(key.offset, body);
+            }
+        }
+        let mut cursor = btree::Cursor::seek(vol, csum_root, &csum_key(start)).await?;
+        while let Some((key, body)) = cursor.current()? {
+            if !is_csum(&key) || key.offset >= end {
+                break;
+            }
+            items.entry(key.offset).or_insert_with(|| body.to_vec());
+            cursor.advance().await?;
+        }
+    }
+    let released_at = |addr: u64| {
+        let i = merged.partition_point(|&(start, _)| start <= addr);
+        i > 0 && addr < merged[i - 1].1
+    };
+    let mut edits = Vec::new();
+    for (offset, body) in items {
+        let sectors = (item_end(offset, &body)? - offset) / sectorsize;
+        edits.push(Edit::Delete(csum_key(offset)));
+        let mut i = 0u64;
+        while i < sectors {
+            if released_at(offset + i * sectorsize) {
+                i += 1;
+                continue;
+            }
+            let run = i;
+            while i < sectors && !released_at(offset + i * sectorsize) {
+                i += 1;
+            }
+            let (a, b) = (run as usize * csum_bytes, i as usize * csum_bytes);
+            edits.push(Edit::Upsert(
+                csum_key(offset + run * sectorsize),
+                body[a..b].to_vec(),
+            ));
+        }
+    }
+    Ok(edits)
+}
+
+/// `struct btrfs_inode_item::flags` offset.
+const INODE_ITEM_FLAGS: usize = 64;
+/// `BTRFS_INODE_NODATASUM`.
+const INODE_NODATASUM: u64 = 1 << 0;
+
+/// Whether inode `ino` carries `BTRFS_INODE_NODATASUM` (set with
+/// `NODATACOW` by `chattr +C`).
+async fn inode_nodatasum<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    fs_root: u64,
+    ino: u64,
+) -> Result<bool, FsError> {
+    let body = btree::find_item(vol, fs_root, &BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0))
+        .await?
+        .ok_or(FsError::NotFound)?;
+    Ok(le64(&body, INODE_ITEM_FLAGS)? & INODE_NODATASUM != 0)
+}
+
 /// Write `data` at byte `offset` into file `ino` via COW. Only the sector-aligned
 /// write window and the existing extents it intersects are read, freed and
 /// re-tiled (each new extent is at most [`MAX_WRITE_EXTENT`]); non-overlapping
@@ -942,10 +1053,15 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
             .checked_add(le64(body, 45)?)
             .ok_or(FsError::InvalidData)?;
     }
+    // `chattr +C` files (systemd-journald's journals on btrfs) carry
+    // BTRFS_INODE_NODATASUM: Linux writes their extents with no data
+    // checksums and never compresses them, and `btrfs check` flags a csum
+    // item for such an inode ("odd csum item"). Honour the inode's flag.
+    let nodatasum = inode_nodatasum(vol, fs_root, ino).await?;
     // Preserve an existing zlib policy when the complete replacement window is
     // made solely from zlib extents (plus holes). Mixed-codec/uncompressed
     // windows fall back to ordinary extents.
-    let emit_zlib = saw_zlib && zlib_only;
+    let emit_zlib = saw_zlib && zlib_only && !nodatasum;
 
     // Read-modify-write only the closed-over window. Bytes past the old EOF and
     // implicit/explicit holes remain zero-filled.
@@ -1023,7 +1139,11 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
         let disk_len = payload.len() as u64;
         let e_data = batch.alloc.alloc_data(vol, disk_len)?;
         vol.write_logical(e_data, payload).await?;
-        let csums = crate::csum::compute_csums(vol.csum_type(), payload, sectorsize as usize)?;
+        let csums = if nodatasum {
+            Vec::new()
+        } else {
+            crate::csum::compute_csums(vol.csum_type(), payload, sectorsize as usize)?
+        };
         let file_off = rewrite_start + window_off;
         new_data.push(DataRef {
             id: DataRefId {
@@ -4426,27 +4546,26 @@ async fn commit_txn<B: BlockDevice + 'static>(
     // it back was cheap once nodes were cached; writing it never was.
     // Path-COW touches only the root-to-leaf paths the edits reach, which is
     // what the fs and extent trees beside it already do.
-    let csum_edits: Vec<Edit> = data_changes
-        .released
-        .iter()
-        .map(|&(bytenr, _)| {
-            Edit::Delete(BtrfsKey::new(
-                format::EXTENT_CSUM_OBJECTID,
-                format::EXTENT_CSUM_KEY,
-                bytenr,
-            ))
-        })
-        .chain(txn.new_data.iter().map(|d| {
-            Edit::Upsert(
-                BtrfsKey::new(
-                    format::EXTENT_CSUM_OBJECTID,
-                    format::EXTENT_CSUM_KEY,
-                    d.id.bytenr,
-                ),
-                d.csums.clone(),
-            )
-        }))
-        .collect();
+    let mut csum_edits: Vec<Edit> = match old_csum {
+        Some((csum_root, _)) => csum_release_edits(vol, csum_root, &data_changes.released).await?,
+        None => Vec::new(),
+    };
+    // A `nodatasum` extent has no checksums and gets no (empty) csum item.
+    csum_edits.extend(
+        txn.new_data
+            .iter()
+            .filter(|d| !d.csums.is_empty())
+            .map(|d| {
+                Edit::Upsert(
+                    BtrfsKey::new(
+                        format::EXTENT_CSUM_OBJECTID,
+                        format::EXTENT_CSUM_KEY,
+                        d.id.bytenr,
+                    ),
+                    d.csums.clone(),
+                )
+            }),
+    );
 
     // The fs tree arrives already path-COWed (nodes allocated from `alloc`).
     let c = &txn.fs;

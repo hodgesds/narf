@@ -1176,12 +1176,29 @@ impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
         })
     }
 
+    /// A volume the write-safety gate (or the disk policy) made read-only is
+    /// read-only for every mount of it: the VFS then refuses writes with
+    /// EROFS and reports `ro` in mountinfo.
+    fn always_read_only(&self) -> bool {
+        self.is_read_only()
+    }
+
     fn reconfigure(&self, options: &str) -> Result<(), FsError> {
-        // Read-only volume: accept only `ro`/empty option tokens.
-        for opt in options.split(',').filter(|s| !s.is_empty()) {
-            if opt != "ro" {
+        // The same option set a mount accepts. Asking a read-only volume for
+        // `rw` is refused (it was made read-only for a reason that has not
+        // gone away); a writable volume keeps writing — `ro` on it is
+        // accepted without effect, `sync(2)`/`syncfs` makes it durable.
+        let opts = crate::parse_mount_options(options)?;
+        if opts.subvol.is_some() || opts.subvolid.is_some() {
+            // Linux refuses changing the subvolume on remount.
+            let id_ok = opts.subvolid.is_none_or(|id| id == self.fs_tree_id());
+            if !id_ok {
                 return Err(FsError::Unsupported);
             }
+        }
+        let wants_rw = options.split(',').any(|o| o == "rw");
+        if wants_rw && self.is_read_only() {
+            return Err(FsError::ReadOnly);
         }
         Ok(())
     }
