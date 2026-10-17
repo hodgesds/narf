@@ -4821,7 +4821,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
         stamp_root_item(&mut ri, new, lvl);
         leaf_replace_inplace(&mut root_logical, slot, &ri)?;
     }
-    let (root_root_addr, _) = tree_root_addr(&root_addrs, root_groups.len(), ns);
+    let (root_root_addr, root_root_level) = tree_root_addr(&root_addrs, root_groups.len(), ns);
 
     // Pin everything this transaction freed BEFORE its replacement nodes go
     // out. `pin_down_extent` does the same: a freed block stays unavailable
@@ -4884,6 +4884,9 @@ async fn commit_txn<B: BlockDevice + 'static>(
     let mut raw = vol.read_raw_superblock().await?;
     raw[72..80].copy_from_slice(&gen.to_le_bytes());
     raw[80..88].copy_from_slice(&root_root_addr.to_le_bytes());
+    // `root_level`: the root tree grows a level once it splits (many subvolume
+    // ROOT_ITEMs, small nodes); a stale level makes Linux refuse the mount.
+    raw[format::OFF_ROOT_LEVEL] = root_root_level;
     raw[120..128].copy_from_slice(&bytes_used.to_le_bytes());
     let incompat = le64(&raw, format::OFF_INCOMPAT_FLAGS)? | txn.incompat_flags_add;
     raw[format::OFF_INCOMPAT_FLAGS..format::OFF_INCOMPAT_FLAGS + 8]
@@ -4912,6 +4915,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
         txn.root_flags,
         txn.incompat_flags_add,
     );
+    vol.set_superblock_levels(root_root_level, None);
     // Bound how much a crash discards and how long pinned extents withhold
     // space. `sync_to_disk` is the same path `fsync` takes, so the batch is
     // forced out by exactly one mechanism.
@@ -8711,10 +8715,10 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     }
 
     // ── Root tree: repoint the device/extent/free-space ROOT_ITEMs ─────
-    let (chunk_root_addr, _) = tree_root_addr(&chunk_addrs, chunk_groups.len(), ns);
+    let (chunk_root_addr, chunk_root_level) = tree_root_addr(&chunk_addrs, chunk_groups.len(), ns);
     let (dev_root_addr, dev_lvl) = tree_root_addr(&dev_addrs, dev_groups.len(), ns);
     let (ext_root_addr, ext_lvl) = tree_root_addr(&ext_addrs, ext_groups.len(), ns);
-    let (root_root_addr, _) = tree_root_addr(&root_addrs, root_groups.len(), ns);
+    let (root_root_addr, root_root_level) = tree_root_addr(&root_addrs, root_groups.len(), ns);
     let (fst_root_addr, fst_lvl) = tree_root_addr(&fst_addrs, fst_groups.len(), ns);
     let bgt_root = bgt_final
         .as_ref()
@@ -8764,6 +8768,8 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     raw[72..80].copy_from_slice(&gen.to_le_bytes()); // generation
     raw[80..88].copy_from_slice(&root_root_addr.to_le_bytes()); // root
     raw[88..96].copy_from_slice(&chunk_root_addr.to_le_bytes()); // chunk_root
+    raw[format::OFF_ROOT_LEVEL] = root_root_level;
+    raw[format::OFF_CHUNK_ROOT_LEVEL] = chunk_root_level;
     raw[120..128].copy_from_slice(&bytes_used.to_le_bytes()); // bytes_used
     let total_bytes = member_items.values().try_fold(0u64, |total, item| {
         total
@@ -8836,6 +8842,7 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
         member_items.len() as u64,
         incompat_add,
     );
+    vol.set_superblock_levels(root_root_level, Some(chunk_root_level));
     vol.commit_sys_chunk_array(sys_array)?;
     for relocation in &relocations {
         vol.replace_chunk_item_mapping(relocation.new.logical, &relocation.new.item)?;

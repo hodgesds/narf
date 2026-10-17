@@ -252,8 +252,8 @@ pub(crate) const OFF_SYS_CHUNK_ARRAY_SIZE: usize = 160;
 const OFF_COMPAT_RO_FLAGS: usize = 180;
 pub(crate) const OFF_INCOMPAT_FLAGS: usize = 188;
 const OFF_CSUM_TYPE: usize = 196;
-const OFF_ROOT_LEVEL: usize = 198;
-const OFF_CHUNK_ROOT_LEVEL: usize = 199;
+pub(crate) const OFF_ROOT_LEVEL: usize = 198;
+pub(crate) const OFF_CHUNK_ROOT_LEVEL: usize = 199;
 const OFF_FSID: usize = 32;
 /// Embedded member-specific `struct btrfs_dev_item` in each superblock.
 pub const SUPERBLOCK_DEV_ITEM_OFFSET: usize = 201;

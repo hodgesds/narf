@@ -2055,6 +2055,16 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         g.superblock.incompat_flags |= incompat_flags_add;
     }
 
+    /// Record the root-tree (and, after chunk growth, chunk-tree) root levels
+    /// a commit wrote into the superblock.
+    pub(crate) fn set_superblock_levels(&self, root_level: u8, chunk_root_level: Option<u8>) {
+        let mut g = self.state.lock();
+        g.superblock.root_level = root_level;
+        if let Some(level) = chunk_root_level {
+            g.superblock.chunk_root_level = level;
+        }
+    }
+
     /// Replace the complete cached system chunk array after balance rewrites
     /// one or more SYSTEM mappings.
     pub(crate) fn commit_sys_chunk_array(&self, array: Vec<u8>) -> Result<(), FsError> {
