@@ -35,6 +35,22 @@ pub struct MountRequest<'a> {
     pub read_only: bool,
 }
 
+/// Run a filesystem constructor's mount future to completion, from boot code
+/// or from a `mount(2)` / `fsconfig(FSCONFIG_CMD_CREATE)` syscall.
+///
+/// The halting [`narf_scheduler::block_on`] panics inside an executor poll,
+/// and a syscall is one: systemd's fstab mount units reach the constructors
+/// through `mount(8)`. There the constructor spins
+/// ([`narf_scheduler::block_on_spin`]), as the sync lookups of block-backed
+/// filesystems do. Boot-time callers keep the idling wait.
+pub fn mount_wait<F: core::future::Future>(fut: F) -> F::Output {
+    if narf_scheduler::current_task_id() == narf_scheduler::TaskId::NONE {
+        narf_scheduler::block_on(fut)
+    } else {
+        narf_scheduler::block_on_spin(fut)
+    }
+}
+
 /// Map a device-backed mount `source` onto the block registry: a path whose
 /// last component, after a `/dev/` directory, names a registered device
 /// (`/dev/nvme0p2`, a chrooted `/mnt/dev/nvme0p2`) yields that name. A bare

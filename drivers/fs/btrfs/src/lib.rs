@@ -69,7 +69,7 @@ pub fn register_initcalls() {
 /// block device.
 fn btrfs_factory(dev: Arc<dyn BlockDeviceSync>) -> Result<Arc<dyn FsInstance>, FsError> {
     let devices = discover_members(dev.clone());
-    let volume = narf_scheduler::block_on(registry::mount(&dev, devices, None, false))?;
+    let volume = narf_filesystem::fs_registry::mount_wait(registry::mount(&dev, devices, None, false))?;
     Ok(volume)
 }
 
@@ -99,17 +99,6 @@ pub fn parse_mount_subvol(options: &str) -> Result<Option<volume::Subvol>, FsErr
     Ok(mount_opts::parse(options)?.subvol)
 }
 
-/// Run a mount-time future to completion from either boot code or a
-/// `mount(2)`/`fsconfig` syscall. The halting `block_on` refuses to run inside
-/// an executor poll (a syscall), so a syscall caller spins instead.
-fn wait_mount<F: core::future::Future>(fut: F) -> F::Output {
-    if narf_scheduler::current_task_id() == narf_scheduler::TaskId::NONE {
-        narf_scheduler::block_on(fut)
-    } else {
-        narf_scheduler::block_on_spin(fut)
-    }
-}
-
 /// `mount -t btrfs <source>` constructor. Resolves the source to a registered
 /// block device and honours `subvol=`/`subvolid=`, the recorded data options
 /// and a read-only request (`MS_RDONLY`, `fsconfig(ro)`, or `ro` in the data).
@@ -125,7 +114,7 @@ fn btrfs_fstype_builder(
     // timer, no device write. Every mount of one filesystem is a view over one
     // shared instance (see `registry`), whatever subvolume it selects.
     let read_only = request.read_only || options.read_only;
-    let volume = wait_mount(registry::mount(
+    let volume = narf_filesystem::fs_registry::mount_wait(registry::mount(
         &dev,
         devices,
         options.subvol.clone(),

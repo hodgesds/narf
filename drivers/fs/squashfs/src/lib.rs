@@ -51,7 +51,7 @@ pub fn register_initcalls() {
 fn squashfs_factory(dev: Arc<dyn BlockDeviceSync>) -> Result<Arc<dyn FsInstance>, FsError> {
     let async_dev = SyncBlock::new(dev);
     let volume =
-        narf_scheduler::block_on(volume::SquashfsVolume::mount(async_dev, DomainId::DRIVER_0))?;
+        narf_filesystem::fs_registry::mount_wait(volume::SquashfsVolume::mount(async_dev, DomainId::DRIVER_0))?;
     Ok(volume)
 }
 
