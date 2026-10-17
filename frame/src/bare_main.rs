@@ -3581,6 +3581,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_init::InitResult::NotPresent
             });
 
+            // Runs right after root-mount-auto, whatever it returned: under
+            // `narf.disks=root-ro|root-rw` the boot log waits for this before
+            // probing its USB stick, so the stick's I/O never delays the root.
+            narf_init::register(narf_init::Stage::Late, "root-mount-settled", || {
+                narf_block::disk_policy::mark_root_mount_settled();
+                narf_init::InitResult::Ok
+            });
+
             // Test vehicle for `cargo xtask btrfs-rootrw-interop`: systemd-
             // and pacman-shaped writes on the mounted root, run only when the
             // harness passes `narf.rootrw_interop=<mode>` together with

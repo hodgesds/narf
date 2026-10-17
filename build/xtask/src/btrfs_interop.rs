@@ -28,6 +28,11 @@
 //!    the BGT image to be refused by name and stay bit-identical (a writer
 //!    without block-group-tree support).
 //!
+//! 5. A `narf.disks=root-ro` boot with a `narf.bootlog=` USB stick: the
+//!    stick's log partition (and nothing else) is written, after the root
+//!    mounted, and the root image stays bit-identical (`--bootlog-only` runs
+//!    just this).
+//!
 //! The filesystem UUID is deliberately not the host root's.
 
 use std::io::{BufRead, BufReader, Read};
@@ -69,6 +74,10 @@ pub struct Args {
     /// Expected outcome for the host-exact BLOCK_GROUP_TREE image.
     #[arg(long, value_enum, default_value_t = BgtExpect::Writable)]
     pub bgt: BgtExpect,
+
+    /// Run only the root-ro boot-log stick check.
+    #[arg(long)]
+    pub bootlog_only: bool,
 
     /// Seconds to wait for each boot's verdict.
     #[arg(long, default_value_t = 240)]
@@ -345,10 +354,38 @@ fn btrfs_check(part: &Path) -> Result<()> {
 /// Boot `kernel` on `image` with `cmdline`; return the serial lines once a
 /// verdict line appears (or the timeout passes).
 fn boot(args: &Args, kernel: &Path, image: &Path, cmdline: &str) -> Result<Vec<String>> {
+    let verdicts = [
+        "ROOTRW-INTEROP: PASS",
+        "ROOTRW-INTEROP: FAIL",
+        "ROOTRW-INTEROP: NO-ROOT",
+    ];
+    Ok(
+        boot_with(args, kernel, image, cmdline, &[], &verdicts, 500)?
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect(),
+    )
+}
+
+/// Boot with extra QEMU arguments; stop `grace_ms` after the first line
+/// containing one of `stop`. Each line carries the host seconds since QEMU
+/// started.
+fn boot_with(
+    args: &Args,
+    kernel: &Path,
+    image: &Path,
+    cmdline: &str,
+    extra: &[String],
+    stop: &[&'static str],
+    grace_ms: u64,
+) -> Result<Vec<(f64, String)>> {
     std::env::set_var("NARF_NVME_IMG", image);
     std::env::set_var("XTASK_QEMU_APPEND", cmdline);
     let mut cmd = Command::new(args.build.arch.qemu_bin());
     cmd.args(super::qemu_boot_args(&args.build, kernel)?);
+    cmd.args(extra);
+    let started = std::time::Instant::now();
+    let stop: Vec<&'static str> = stop.to_vec();
     cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
     println!(
         "btrfs-rootrw-interop: boot `{cmdline}` on {}",
@@ -361,13 +398,7 @@ fn boot(args: &Args, kernel: &Path, image: &Path, cmdline: &str) -> Result<Vec<S
     let (lines2, done2) = (lines.clone(), done.clone());
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let verdict = [
-                "ROOTRW-INTEROP: PASS",
-                "ROOTRW-INTEROP: FAIL",
-                "ROOTRW-INTEROP: NO-ROOT",
-            ]
-            .iter()
-            .any(|m| line.contains(m));
+            let verdict = stop.iter().any(|m| line.contains(m));
             if line.contains("ROOTRW-INTEROP: detail") {
                 println!("  | {line}");
             }
@@ -375,6 +406,7 @@ fn boot(args: &Args, kernel: &Path, image: &Path, cmdline: &str) -> Result<Vec<S
                 || line.contains("disks:")
                 || line.contains("btrfs ")
                 || line.contains("root-mount")
+                || line.contains("bootlog:")
             {
                 println!("  | {line}");
             }
@@ -382,7 +414,7 @@ fn boot(args: &Args, kernel: &Path, image: &Path, cmdline: &str) -> Result<Vec<S
                 done2.store(2, Ordering::Release);
             }
             if let Ok(mut g) = lines2.lock() {
-                g.push(line);
+                g.push((started.elapsed().as_secs_f64(), line));
             }
             if verdict {
                 done2.store(1, Ordering::Release);
@@ -399,9 +431,10 @@ fn boot(args: &Args, kernel: &Path, image: &Path, cmdline: &str) -> Result<Vec<S
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    // The workload synced before printing; give QEMU a moment to drain the
-    // last guest writes into the image file, then stop it.
-    std::thread::sleep(Duration::from_millis(500));
+    // The workload synced before printing (or, for the boot log, the next
+    // flushes are due); give QEMU a moment to drain the last guest writes
+    // into the image file, then stop it.
+    std::thread::sleep(Duration::from_millis(grace_ms));
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader.join();
@@ -683,6 +716,161 @@ fn files_expected() -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
+/// A 64 MiB MBR stick with one FAT32 partition carrying `/NARFLOG.ID`.
+fn build_stick(path: &Path, token: &str, work: &Path) -> Result<()> {
+    const MIB: u64 = 1 << 20;
+    let _ = std::fs::remove_file(path);
+    std::fs::File::create(path)?.set_len(64 * MIB)?;
+    let mut sf = Command::new("sfdisk")
+        .args(["--quiet", "--no-reread", "--no-tell-kernel"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .context("spawn sfdisk (stick)")?;
+    std::io::Write::write_all(
+        sf.stdin.as_mut().ok_or_else(|| anyhow!("sfdisk stdin"))?,
+        b"label: dos\nstart=2048, type=c\n",
+    )?;
+    drop(sf.stdin.take());
+    if !sf.wait()?.success() {
+        bail!("btrfs-rootrw-interop: sfdisk (stick) failed");
+    }
+    let spec = format!("{}@@{MIB}", path.display());
+    run(
+        Command::new("mformat")
+            .env("MTOOLS_SKIP_CHECK", "1")
+            .args(["-i", &spec, "-F", "-T"])
+            .arg(((64 - 1) * MIB / 512).to_string())
+            .args(["-H", "2048", "-v", "NARFLOG", "::"]),
+        "mformat (stick)",
+    )?;
+    let id = work.join("NARFLOG.ID");
+    std::fs::write(&id, format!("{token}\n"))?;
+    run(
+        Command::new("mcopy")
+            .env("MTOOLS_SKIP_CHECK", "1")
+            .args(["-i", &spec])
+            .arg(&id)
+            .arg("::/NARFLOG.ID"),
+        "mcopy NARFLOG.ID",
+    )?;
+    Ok(())
+}
+
+/// The boot-log stick under `root-ro`: the stick (and only it) is written,
+/// the root image stays bit-identical, and arming the log does not hold up
+/// mounting the root.
+fn bootlog_boot(args: &Args, kernel: &Path, image: &Path, work: &Path) -> Result<()> {
+    for t in ["mformat", "mcopy", "mdir", "mtype"] {
+        tool(t)?;
+    }
+    let token = "narfinterop0123456789abcdef";
+    let stick = work.join("bootlog-stick.img");
+    build_stick(&stick, token, work)?;
+    let image_before = sha256_whole(image)?;
+    let extra = [
+        "-drive".to_string(),
+        format!("if=none,id=stick,format=raw,file={}", stick.display()),
+        "-device".to_string(),
+        "usb-storage,bus=xhci0.0,drive=stick,removable=on".to_string(),
+    ];
+    let cmdline = format!(
+        "narf.disks=root-ro root=UUID={IMAGE_UUID} rootflags=subvol=/@ narf.bootlog={token}"
+    );
+    // Stop a few flush periods after the log is armed.
+    let lines = boot_with(
+        args,
+        kernel,
+        image,
+        &cmdline,
+        &extra,
+        &["bootlog: saving the kernel log to"],
+        5_000,
+    )?;
+    let find = |needle: &str| lines.iter().find(|(_, l)| l.contains(needle));
+    let Some((armed_at, armed)) = find("bootlog: saving the kernel log to") else {
+        bail!("btrfs-rootrw-interop: the boot log was not armed under root-ro");
+    };
+    if !armed.contains("usb-msc") {
+        bail!("btrfs-rootrw-interop: the boot log armed on a non-USB device: {armed}");
+    }
+    if find("disks: WRITABLE (log stick): usb-msc").is_none() {
+        bail!("btrfs-rootrw-interop: no log-stick banner");
+    }
+    let Some((root_at, _)) = find("root-mount: ") else {
+        bail!("btrfs-rootrw-interop: the root was not mounted");
+    };
+    let started = find("bootlog: waiting up to")
+        .map(|(t, _)| *t)
+        .unwrap_or(0.0);
+    println!(
+        "btrfs-rootrw-interop: bootlog armed {:.1}s, root mounted {:.1}s after the bootlog started",
+        armed_at - started,
+        root_at - started
+    );
+    // Under the root policies the log probes its stick only after the root
+    // mount settled, so the stick's I/O cannot hold up the root.
+    if root_at > armed_at {
+        bail!("btrfs-rootrw-interop: the boot log armed before the root was mounted");
+    }
+    if root_at - started > 30.0 {
+        bail!(
+            "btrfs-rootrw-interop: arming the boot log delayed the root mount ({:.0} s)",
+            root_at - started
+        );
+    }
+    if sha256_whole(image)? != image_before {
+        bail!("btrfs-rootrw-interop: the root-ro boot MODIFIED the root image");
+    }
+    let spec = format!("{}@@{}", stick.display(), 1u64 << 20);
+    let listing = run(
+        Command::new("mdir")
+            .env("MTOOLS_SKIP_CHECK", "1")
+            .args(["-b", "-i", &spec, "::/"]),
+        "mdir (stick)",
+    )?;
+    let Some(log) = listing
+        .lines()
+        .map(|l| l.trim().trim_start_matches("::/").to_string())
+        .find(|l| l.to_ascii_lowercase().starts_with("narf-boot-"))
+    else {
+        bail!("btrfs-rootrw-interop: no narf-boot-*.log on the stick:\n{listing}");
+    };
+    let text = run(
+        Command::new("mtype").env("MTOOLS_SKIP_CHECK", "1").args([
+            "-i",
+            &spec,
+            &format!("::/{log}"),
+        ]),
+        "mtype (log)",
+    )?;
+    for needle in ["disks: WRITABLE (log stick)", "root-mount: "] {
+        if !text.contains(needle) {
+            bail!("btrfs-rootrw-interop: the saved log lacks `{needle}`");
+        }
+    }
+    println!(
+        "btrfs-rootrw-interop: root-ro boot log written to the stick ({log}, {} bytes); root image unchanged",
+        text.len()
+    );
+    Ok(())
+}
+
+fn sha256_whole(path: &Path) -> Result<[u8; 32]> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().into())
+}
+
 /// Must equal `interop::PKG_DESC`.
 fn include_desc() -> Vec<u8> {
     b"%NAME%\nnarf-interop\n\n%VERSION%\n1.0-1\n\n%DESC%\nNARF root-rw interop package\n\n%ARCH%\nx86_64\n"
@@ -707,7 +895,11 @@ pub fn run_cmd(args: &Args) -> Result<()> {
     // Host flags minus BLOCK_GROUP_TREE: the full write test.
     let plain = work.join("interop-nobgt.img");
     build_image(&work, &plain, "free-space-tree,no-holes,^block-group-tree")?;
+    if args.bootlog_only {
+        return bootlog_boot(args, &kernel, &plain, &work);
+    }
     write_boots(args, &kernel, &plain, &work, "no-bgt")?;
+    bootlog_boot(args, &kernel, &plain, &work)?;
 
     // The host's exact flags.
     let bgt = work.join("interop-bgt.img");

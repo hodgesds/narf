@@ -1552,3 +1552,7 @@ argument = "The frame/ edit makes the root-mount-auto Late initcall stop, with a
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The frame/ edit registers one Late initcall (btrfs-rootrw-interop) that is inert unless the narf.rootrw_interop= test argument is present; it then calls narf_drivers_fs_btrfs::interop::run, which performs ordinary VFS file operations on the filesystem already mounted at / and only when narf.disks=root-rw has a designated, writable btrfs root. It adds no authority, memory access, domain transition, trap-path code or TCB member; every write still passes the block-layer disk policy guard."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame/ edit registers one Late initcall (root-mount-settled), right after root-mount-auto, that only stores an atomic flag in narf_block::disk_policy recording that boot-time root mounting finished; the boot log waits on it under narf.disks=root-ro/root-rw before probing its USB stick. It adds no authority, memory access, domain transition, trap-path code or TCB member, and grants no write permission."
