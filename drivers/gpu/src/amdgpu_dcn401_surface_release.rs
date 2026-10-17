@@ -89,12 +89,28 @@ impl Surfaces {
         engine: &mut Engine<I>,
         pipe: u8,
     ) -> Result<u64, Error> {
-        engine.surface_release_preflight(pipe)?;
+        // Every pipe that fetched these surfaces: ODM halves too.
+        let odm = self
+            .0
+            .get(usize::from(pipe))
+            .into_iter()
+            .flatten()
+            .chain(self.1.iter().filter(|s| s.applied.request.pipe == pipe))
+            .filter_map(|s| s.applied.request.odm)
+            .fold(0u8, |m, q| m | bit(q));
+        let preflight = |engine: &mut Engine<I>| {
+            engine.surface_release_preflight(pipe)?;
+            for q in (0..4).filter(|&q| odm & bit(q) != 0) {
+                engine.surface_release_preflight(q)?;
+            }
+            Ok(())
+        };
+        preflight(engine)?;
         // CPU leases drain WC stores on their originating CPUs. HDP/PCIe
         // writes must also finish before another engine can reuse this VRAM.
         let proof = engine
             .flush_surface_writes()
-            .and_then(|()| engine.surface_release_preflight(pipe));
+            .and_then(|()| preflight(engine));
         if let Err(e) = proof {
             engine.status.state = State::Failed(e);
             return Err(e);

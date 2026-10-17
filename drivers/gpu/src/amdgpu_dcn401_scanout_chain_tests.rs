@@ -228,6 +228,7 @@ fn hdmi_mode(pipe: u8, plan: &dml::Plan) -> Mode {
         signal: Signal::Tmds,
         ycbcr420: false,
         dsc: None,
+        odm: None,
         timing: plan.mode.timing,
         sync: plan.sync,
     };
@@ -248,6 +249,7 @@ fn hdmi_mode(pipe: u8, plan: &dml::Plan) -> Mode {
             width: 640,
             height: 480,
             format: SurfaceFormat::Xrgb8888,
+            odm: None,
         },
         // Room for a back buffer of the same geometry.
         bytes: 2 * 640 * 4 * 480,
@@ -714,7 +716,7 @@ fn dcn401_second_display_leaves_the_live_one_alone() -> TestResult {
     if retired.blanked & 1 << p != 0
         || retired.powered_off & 1 << p != 0
         || c.e.io.get(mpcc(p, TOP)) & 0xf != u32::from(p)
-        || c.e.live_fetch_with(p, live.address, false).is_err()
+        || c.e.live_segment(p, live.address, false).is_err()
     {
         return TestResult::Fail("live display's planes touched");
     }
@@ -726,7 +728,7 @@ fn dcn401_second_display_leaves_the_live_one_alone() -> TestResult {
     let idle_release = unsafe { c.surfaces.release(&mut c.e, 0) };
     if sibling_release != Err(Error::Busy)
         || idle_release != Ok(0)
-        || c.e.live_fetch_with(p, live.address, false).is_err()
+        || c.e.live_segment(p, live.address, false).is_err()
     {
         return TestResult::Fail("surface retirement stole a live sibling");
     }

@@ -499,6 +499,7 @@ fn dcn401_frl_controls_bind_live_scanout() -> TestResult {
     let (mut e, mut fw) = live_frl_video();
     let scanout = ScanoutRunning {
         pipe: 1,
+        odm: None,
         stream: 1,
         plan: dml::admit(
             &dml::Soc {

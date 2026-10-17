@@ -1,6 +1,6 @@
-//! Native DCN401 single-pipe DLG/TTU deadlines and DCHUBBUB watermarks from
-//! an admitted `amdgpu_dcn401_dml::Plan`. Linux: hubp401_setup,
-//! hubp401_setup_interdependent, hubp401_program_deadline,
+//! Native DCN401 per-pipe DLG/TTU deadlines (both pipes of an ODM pair)
+//! and DCHUBBUB watermarks from an admitted `amdgpu_dcn401_dml::Plan`.
+//! Linux: hubp401_setup, hubp401_setup_interdependent, hubp401_program_deadline,
 //! hubp401_vready_at_or_After_vsync, hubbub401_program_watermarks,
 //! hubbub1_allow_self_refresh_control and dcn401_program_arbiter.
 //! Fetch stays stopped and routes detached; this is not activation.
@@ -65,8 +65,8 @@ fn vready_after_vsync(plan: &dml::Plan) -> bool {
 /// Per-pipe DLG/TTU fields, `hubp401_program_deadline` then
 /// `hubp401_setup_interdependent` order. VM/PTE/meta/flip/chroma/cursor and
 /// 3D-LUT fields are explicitly zero: none is enabled in the admitted shape.
-fn hubp(plan: &dml::Plan) -> [(u64, u32, u32); 31] {
-    let (d, t) = (plan.dlg, plan.ttu);
+fn hubp(plan: &dml::Plan, d: dml::Dlg) -> [(u64, u32, u32); 31] {
+    let t = plan.ttu;
     let zero23 = 0x7fffff;
     [
         (
@@ -211,28 +211,34 @@ impl<I: Io> Engine<I> {
                 e.update(at, mask, value)
             }
         };
-        // Linux writes the whole register to enter DLG mission mode and never
-        // reads it back; only that bit is required to read back here.
-        let debug = l.hubp(pipe, DEBUG_DB);
-        if verify {
-            if self.read(debug)? & MISSION_MODE == 0 {
-                return Err(Error::Readback(debug));
+        // Every HUBP the surface fetches on: an ODM pipe gets the same
+        // DLG/TTU values but for its own blank end (Plan::pipe_dlg).
+        let pipes: alloc::vec::Vec<u8> = self.fetch_pipes(pipe).collect();
+        for (i, p) in pipes.into_iter().enumerate() {
+            let dlg = plan.pipe_dlg(i as u8).ok_or(Error::Invalid)?;
+            // Linux writes the whole register to enter DLG mission mode and
+            // never reads it back; only that bit is required to read back.
+            let debug = l.hubp(p, DEBUG_DB);
+            if verify {
+                if self.read(debug)? & MISSION_MODE == 0 {
+                    return Err(Error::Readback(debug));
+                }
+            } else {
+                self.access(|io| {
+                    io.write(debug, MISSION_MODE);
+                    Ok(())
+                })?;
             }
-        } else {
-            self.access(|io| {
-                io.write(debug, MISSION_MODE);
-                Ok(())
-            })?;
+            for (r, mask, value) in hubp(plan, dlg).into_iter().chain(hubp_ttu(plan)) {
+                each(self, l.hubp(p, r), mask, value)?;
+            }
+            let vready = if vready_after_vsync(plan) {
+                VREADY_AFTER_VSYNC
+            } else {
+                0
+            };
+            each(self, l.hubp(p, HUBP_CONTROL), VREADY_AFTER_VSYNC, vready)?;
         }
-        for (r, mask, value) in hubp(plan).into_iter().chain(hubp_ttu(plan)) {
-            each(self, l.hubp(pipe, r), mask, value)?;
-        }
-        let vready = if vready_after_vsync(plan) {
-            VREADY_AFTER_VSYNC
-        } else {
-            0
-        };
-        each(self, l.hubp(pipe, HUBP_CONTROL), VREADY_AFTER_VSYNC, vready)?;
         for set in [WM_A, WM_B] {
             for (r, mask, value) in watermark_set(set, &plan.watermarks) {
                 each(self, hubbub(r), mask, value)?;
@@ -268,6 +274,8 @@ pub(super) fn bound(
         )
         && surface.request.width == t.h_active
         && surface.request.height == t.v_active
+        && surface.request.odm == timing.odm
+        && plan.pipes == 1 + u8::from(timing.odm.is_some())
         && u64::from(surface.pitch_bytes) == u64::from(plan.mode.pitch) * 4
         && a.det_bytes == plan.det_bytes
         && clock.request.pipe == a.pipe
@@ -317,14 +325,18 @@ impl Surfaces {
         e.requestor_errors(pipe)?;
         e.status.state = State::PreparingDeadlines(pipe);
         let result = async {
-            // Fetch is stopped and blank; the HUBP clock is enabled only
+            // Fetch is stopped and blank; the HUBP clocks are enabled only
             // around programming, as for the requestor.
-            e.update(e.layout.hubp(pipe, HUBP_CLOCK), 1, 1)?;
-            e.wait(e.layout.hubp(pipe, HUBP_CONTROL), 0x1007, 3, 100_000)
-                .await?;
+            for (p, _, _) in a.surface.request.segments() {
+                e.update(e.layout.hubp(p, HUBP_CLOCK), 1, 1)?;
+                e.wait(e.layout.hubp(p, HUBP_CONTROL), 0x1007, 3, 100_000)
+                    .await?;
+            }
             e.requestor_errors(pipe)?;
             e.deadline_writes(pipe, plan, false)?;
-            e.update(e.layout.hubp(pipe, HUBP_CLOCK), 1, 0)?;
+            for (p, _, _) in a.surface.request.segments() {
+                e.update(e.layout.hubp(p, HUBP_CLOCK), 1, 0)?;
+            }
             if owners()? != current {
                 return Err(Error::Busy);
             }

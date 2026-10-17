@@ -787,13 +787,40 @@ activation, live flips and physical RX 9070 XT validation remain open. Neither
 preparation API starts fetch or publishes an active framebuffer.
 
 `amdgpu_dcn401_dml::admit(&Soc, &Mode) -> Result<Plan, Error>` is the native
-single-pipe scanout admission calculation: Linux DML21's DCN4 mode-support and
+scanout admission calculation: Linux DML21's DCN4 mode-support and
 mode-programming path, evaluated in fixed point with no hardware access. It
 admits only the shape the native path implements: one progressive DP SST
 timing and one unscaled, unrotated, full-frame linear 32-bpp surface (pitch a
-multiple of 64 pixels) on one pipe with the staged 320-KiB DET. GPUVM/HostVM,
-DCC, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback, ODM/MPC combine,
-DSC and immediate flip are excluded rather than approximated.
+multiple of 64 pixels) per pipe with the staged 320-KiB DET. GPUVM/HostVM,
+DCC, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback, MPC combine and
+immediate flip are excluded rather than approximated.
+
+ODM follows DML's `dml2_odm_mode_auto` with dynamic ODM off, limited to
+bypass and 2:1: a stream takes two pipes (two DPP/OPP and, with DSC, two
+DSCs) when its pixel clock exceeds the downspread-limited DISPCLK maximum, its
+DSC line exceeds 5760 pixels or four slices, or its 4:2:0 line exceeds 4096
+pixels. A stream DML would split 3:1 or 4:1 is `Unsupported`; more than four
+pipes in all is `Pipes`. `Plan::pipes` (1 or 2) reports the decision; both
+pipes share every programmed value except the DLG blank end
+(`Plan::odm_refcyc_h_blank_end`, `Plan::pipe_dlg`).
+
+A two-pipe plan is programmed as ODM 2:1 (optc401_set_odm_combine). The
+modeset gives it the highest pipe no display of the configuration uses
+(`modeset::odm_pipes`), a DPP-only clock there (`dccg::PixelClock::OdmSegment`,
+plus its DSCCLK), and lights it with `otg::Request::odm` and
+`otg::SurfaceRequest::odm` naming that pipe. The OTG takes both OPPs as
+segments with the segment width, the line memories decide_odm_mem_bit_map
+picks and H divide-by-two (every horizontal boundary even; at most 8192
+active pixels); each OPP formats and blanks its half at its offset (a 4:2:0
+right half takes one extra left-edge pixel); each segment's DSC compresses
+its half with half the slices while the stream's PPS stays whole-picture.
+The ODM pipe's HUBP fetches the right half of the same surface (viewport X
+offset), its DPP/MPCC/DET/requestor (VTG the master OTG) and DLG/TTU follow,
+and start, flip, stop, underflow recovery and live checks act on both halves
+under the master OTG's one lock. The cursor is placed per segment and
+enabled only on the halves it overlaps (`CursorApplied::shown`). The display
+holds the ODM pipe from staging until retirement (`Siblings::pipes`); its
+teardown stops both DSC clocks. `ScanoutRunning::odm` names the pipe.
 
 `Soc` carries the board state DML depends on: the pinned UCLK, FCLK/DCFCLK DPM
 ranges, minimum SOCCLK, DISPCLK/DPPCLK maxima, the UMC channel count, DENTIST
@@ -813,8 +840,9 @@ DCHUBBUB watermark set Linux programs into sets A and B, arbiter values, DET
 size and stutter reservation. `Error` names the first failing check: invalid
 inputs, unmodeled shape, unavailable clock state, pixel clock, buffers,
 outstanding-request/ROB latency, prefetch, urgent latency hiding, bandwidth,
-GDDR6 temperature-read blackout, or a programmed value outside its dcn_4_1_0
-field (DLG/TTU, watermark, fraction, request-limit and stall fields). The
+GDDR6 temperature-read blackout, a programmed value outside its dcn_4_1_0
+field (DLG/TTU, watermark, fraction, request-limit and stall fields), or
+more pipes than DCN4.0.1 has. The
 result is deterministic and is only a calculation until bound and programmed.
 
 `ColdBoot::display_admission(&Mode)` (and the platform's asynchronous
@@ -1668,7 +1696,9 @@ the VM/row stages sit at their quarter-line minimum here; rejects a DISPCLK
 needing a DFS divider below 2.0; and rejects register-range overflows DML only
 asserts. `tests/dcn401_dml21/check.sh` builds Linux DML21 on the host (stock and
 with that check enabled) and verifies every line of `tests/dcn401_dml21/
-vectors.txt`, which the kernel tests also consume. Plans match exactly except
+vectors.txt` and its multi-stream, 4:2:0, DSC and ODM companions, which the
+kernel tests also consume; for a two-pipe plane it also checks that Linux
+programs the second pipe identically but for the blank end. Plans match exactly except
 for +-1 truncation in deep-sleep DCFCLK and the urgent-bandwidth fractions.
 DPPREFCLK is the DFS output mode programming uses; Linux's informative copy
 can read 1 kHz lower.

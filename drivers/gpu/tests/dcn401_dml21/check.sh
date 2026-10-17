@@ -17,10 +17,18 @@
 #                                    2.0, which the DENTIST cannot produce
 #   <19 inputs> ! <Error> range      Linux plans a DLG/TTU value outside the
 #                                    field width it asserts (asserts are off)
+#   <19 inputs> ! Unsupported odm    Linux plans the stream on three or four
+#                                    ODM pipes, which the port does not admit
+# Both harnesses let DML decide ODM combine (dml2_odm_mode_auto, dynamic ODM
+# off). A plane on n > 1 pipes ends its plan values with "/<n>" and every
+# further pipe's refcyc_h_blank_end, the one register Linux programs
+# differently per pipe (the harness checks the rest are identical).
 # dsc_vectors.txt lines are "<slices> <bpp_x16>" then a multi_vectors.txt
 # line, every stream compressed so (harness_multi.c with DSC set); "! REJECT"
 # asks only that Linux rejects. --generate-dsc rewrites it from the single-
-# and multi-stream inputs.
+# and multi-stream inputs. odm_vectors.txt, odm_dsc_vectors.txt and
+# odm_ycbcr420_vectors.txt are checked as multi_vectors.txt, dsc_vectors.txt
+# and ycbcr420_vectors.txt; their streams need ODM 2:1 on most boards.
 set -euo pipefail
 here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 generate_dsc=0
@@ -69,11 +77,19 @@ if [ $generate_dsc -eq 1 ]; then
 		read -ra a <<< "$line"
 		out=$(DSC="$sl $bp" "$work/strict_multi" "${a[@]:0:9}" "${a[@]:10}")
 		# A plan whose DLG/TTU/watermark value overflows its register field
-		# (Linux only asserts) is the port's Register rejection.
-		if [ "${out%% *}" = PLAN ] && echo "${out#PLAN }" | awk '
+		# (Linux only asserts) is the port's Register rejection; a second
+		# ODM pipe's blank end ("/2 <end>") has the blank end's field.
+		if [ "${out%% *}" = PLAN ] && [[ " $out " == *" /3 "* || " $out " == *" /4 "* ]]; then
+			echo "$sl $bp $line ! Unsupported odm"
+		elif [ "${out%% *}" = PLAN ] && echo "${out#PLAN }" | awk '
 			BEGIN { n = split("13 8192 14 32768 15 262144 16 2097152 17 8192 18 8 19 256 20 128 21 64 22 2097152 23 4194304 24 4194304 25 8192 26 8192 31 16384 32 16777216 33 16 34 8388608 35 8388608 36 16 38 16384 39 65536 40 65536 41 65536 42 65536 43 65536 44 16384 45 16384 46 16384 47 1024 48 1024 49 1024 55 4096 57 134217728", l)
 				for (i = 1; i < n; i += 2) lim[l[i]] = l[i + 1] }
-			{ gsub(/\|/, ""); for (i = 1; i <= NF; i++) if (((i - 1) % 62) in lim && $i + 0 >= lim[(i - 1) % 62] + 0) bad = 1 }
+			{ f = 0
+			  for (i = 1; i <= NF; i++) {
+				if ($i == "|") { f = 0; continue }
+				if ($i == "/2") { if ($(i + 1) + 0 >= 8192) bad = 1; i++; continue }
+				if (f in lim && $i + 0 >= lim[f] + 0) bad = 1
+				f++ } }
 			END { exit !bad }'; then
 			echo "$sl $bp $line ! Register"
 		elif [ "${out%% *}" = PLAN ]; then
@@ -86,6 +102,40 @@ if [ $generate_dsc -eq 1 ]; then
 fi
 
 tolerated=" 3 47 48 49 "
+# plan_matches <planes> <strict output> <want...>: strict Linux plans
+# <planes> planes with these values token for token ("|" between planes,
+# "/2 <end>" after a two-pipe plane), except +-1 on the tolerated fields.
+plan_matches() {
+	local planes=$1 strict=$2 i d field=0 seps=0 got
+	shift 2
+	local want=("$@")
+	[ "${strict%% *}" = PLAN ] || return 1
+	read -ra got <<< "${strict#PLAN }"
+	[ ${#got[@]} -eq ${#want[@]} ] || return 1
+	for i in "${!want[@]}"; do
+		case ${want[i]} in
+		'|')
+			[ "${got[i]}" = '|' ] || return 1
+			field=0 seps=$((seps + 1))
+			continue ;;
+		/*)
+			[ "${got[i]}" = "${want[i]}" ] || return 1
+			field=-1
+			continue ;;
+		esac
+		[[ ${got[i]} =~ ^[0-9]+$ ]] || return 1
+		d=$(( got[i] - want[i] ))
+		if [ $d -ne 0 ] && ! { [ $field -ge 0 ] && [[ $tolerated == *" $field "* ]] && [ ${d#-} -eq 1 ]; }; then
+			return 1
+		fi
+		[ $field -lt 0 ] || field=$((field + 1))
+	done
+	[ $seps -eq $((planes - 1)) ]
+}
+# odm_plan <strict output>: Linux plans some stream on three or four pipes.
+odm_plan() {
+	[ "${1%% *}" = PLAN ] && [[ " $1 " == *" /3 "* || " $1 " == *" /4 "* ]]
+}
 pass=0 fail=0
 while read -r line; do
 	case $line in ''|'#'*) continue ;; esac
@@ -95,22 +145,13 @@ while read -r line; do
 	plain=$("$work/plain" "${inputs[@]}")
 	ok=1
 	if [ "$kind" = "=" ]; then
-		read -ra got <<< "${strict#PLAN }"
-		if [ "${strict%% *}" != PLAN ] || [ ${#got[@]} -ne ${#rest[@]} ]; then
-			ok=0
-		else
-			for i in "${!rest[@]}"; do
-				d=$(( got[i] - rest[i] ))
-				if [ $d -ne 0 ] && ! { [[ $tolerated == *" $i "* ]] && [ ${d#-} -eq 1 ]; }; then
-					ok=0
-				fi
-			done
-		fi
+		plan_matches 1 "$strict" "${rest[@]}" || ok=0
 	else
 		case ${rest[1]:-} in
 		'') [ "$strict" = REJECT ] || ok=0 ;;
 		if0) [ "$strict" = REJECT ] && [ "${plain%% *}" = PLAN ] || ok=0 ;;
 		dfs|range) [ "${strict%% *}" = PLAN ] || ok=0 ;;
+		odm) odm_plan "$strict" || ok=0 ;;
 		*) ok=0 ;;
 		esac
 	fi
@@ -143,19 +184,9 @@ check_multi() {
 		fi
 		ok=1
 		if [ "$kind" = "=" ]; then
-			read -ra got <<< "${strict#PLAN }"
-			got=("${got[@]/|}") want=("${rest[@]/|}")
-			got=(${got[@]}) want=(${want[@]})
-			if [ "${strict%% *}" != PLAN ] || [ ${#got[@]} -ne ${#want[@]} ] || [ ${#got[@]} -ne $((62 * n)) ]; then
-				ok=0
-			else
-				for i in "${!want[@]}"; do
-					d=$(( got[i] - want[i] ))
-					if [ $d -ne 0 ] && ! { [[ $tolerated == *" $((i % 62)) "* ]] && [ ${d#-} -eq 1 ]; }; then
-						ok=0
-					fi
-				done
-			fi
+			plan_matches "$n" "$strict" "${rest[@]}" || ok=0
+		elif [ "${rest[1]:-}" = odm ]; then
+			odm_plan "$strict" || ok=0
 		elif [ "${rest[0]:-}" = Register ]; then
 			[ "${strict%% *}" = PLAN ] || ok=0
 		else
@@ -176,4 +207,7 @@ mfail=0
 check_multi "$here/multi_vectors.txt" || mfail=1
 check_multi "$here/ycbcr420_vectors.txt" FMT420=1 || mfail=1
 check_multi "$here/dsc_vectors.txt" DSC || mfail=1
+check_multi "$here/odm_vectors.txt" || mfail=1
+check_multi "$here/odm_dsc_vectors.txt" DSC || mfail=1
+check_multi "$here/odm_ycbcr420_vectors.txt" FMT420=1 || mfail=1
 [ $fail -eq 0 ] && [ $mfail -eq 0 ]

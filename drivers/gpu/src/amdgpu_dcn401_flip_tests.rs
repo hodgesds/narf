@@ -25,6 +25,7 @@ fn dcn401_flip_requires_live_scanout_and_consistent_reports() -> TestResult {
             width: 1920,
             height: 1080,
             format: SurfaceFormat::Xrgb8888,
+            odm: None,
         },
         address: 0x8_0000_0000,
         pitch_bytes: 7680,

@@ -6,11 +6,23 @@
 //!
 //! The admitted shape is up to four streams with progressive fixed timing,
 //! each with one unscaled, unrotated, full-frame linear XRGB/XBGR8888 plane
-//! in physical VRAM on its own pipe: GPUVM/HostVM, DCC, MALL/SubVP, cursor, tdlut, dynamic
-//! metadata, writeback, ODM/MPC combine and immediate flip are all off; a
-//! 4:4:4 DP stream may use one DSC (ODM bypass).
+//! in physical VRAM: GPUVM/HostVM, DCC, MALL/SubVP, cursor, tdlut, dynamic
+//! metadata, writeback, MPC combine and immediate flip are all off; a 4:4:4
+//! DP stream may use DSC.
+//!
+//! ODM is DML's `dml2_odm_mode_auto` with dynamic ODM off (DecideODMMode),
+//! limited to bypass and 2:1: a stream takes two pipes (DPP + OPP each, one
+//! DSC each) when its pixel clock exceeds the downspread-limited DISPCLK
+//! maximum, its DSC line is wider than 5760 pixels or has more than four
+//! slices, or its 4:2:0 line is wider than 4096 pixels. Each pipe then fetches
+//! half the line at half the pixel clock; ValidateODMMode's even-split, slice
+//! and width limits apply. A stream DML would split 3:1 or 4:1 is rejected,
+//! and so is a configuration needing more than four pipes in all. A two-pipe
+//! [`Plan`] carries both pipes' values: they differ only in the DLG blank end.
+//!
 //! The default 320-KiB DET from the staged requestor is a fixed input for
-//! every pipe rather than DML's own allocation (four pipes fit the CRB). Anything else is rejected, not approximated.
+//! every pipe rather than DML's own allocation (four pipes fit the 1280-KiB
+//! DET pool exactly). Anything else is rejected, not approximated.
 //!
 //! Policy mirrors the native clock owner: memory clock switching is disabled
 //! for the whole scanout, so DML's UCLK pstate strategies are never searched
@@ -31,7 +43,8 @@ use alloc::vec::Vec;
 pub enum Error {
     /// Inputs that cannot describe a real mode or board.
     Invalid,
-    /// A shape outside the admitted single-pipe configuration.
+    /// A shape outside the admitted configuration, including a stream DML
+    /// would split 3:1 or 4:1 or one ODM 2:1 cannot divide evenly.
     Unsupported,
     /// The clock tables cannot supply DML's fabric/DCF state for this UCLK.
     ClockState,
@@ -51,6 +64,9 @@ pub enum Error {
     TempRead,
     /// A DLG/TTU value exceeds the range DML asserts for its register field.
     Register,
+    /// The streams need more than the four DPP/OPP pipes DCN4.0.1 has
+    /// (an ODM 2:1 stream takes two).
+    Pipes,
 }
 
 /// Board and SoC state the calculation depends on. Every field must come
@@ -150,15 +166,53 @@ fn dscce_delay(bpc: u32, bpp: f64, slice_width: u32, slices: u32) -> u32 {
 /// dscComputeDelay for 4:4:4: the DSC wrapper's fixed delay.
 const DSC_WRAPPER_DELAY: u32 = 2 + 16 * 3 + 3 + (1 + 4 * 3) + (3 + 3) + (3 + 3 * 3) + 1;
 
-/// DSCDelayRequirement with one DSC (ODM bypass), in pixels.
-fn dsc_delay(t: &Timing, dsc: Dsc) -> u32 {
+/// DSCDelayRequirement with one DSC per ODM pipe, in pixels: each of the
+/// `odm` DSCs encodes its share of the slices, and their delays add.
+fn dsc_delay(t: &Timing, dsc: Dsc, odm: u32) -> u32 {
     let bpp = f64::from(dsc.bpp_x16) / 16.0;
     let slice_width = ceil_f64(f64::from(t.h_active) / f64::from(dsc.slices)) as u32;
-    let core = dscce_delay(DSC_INPUT_BPC, bpp, slice_width, dsc.slices) + DSC_WRAPPER_DELAY;
+    let core =
+        odm * (dscce_delay(DSC_INPUT_BPC, bpp, slice_width, dsc.slices / odm) + DSC_WRAPPER_DELAY);
     let blank = f64::from(t.h_total - t.h_active);
     let v = (f64::from(core) + blank * ceil_f64(f64::from(core) / f64::from(t.h_active))) as u32;
     let pclk = f64::from(t.pixel_clock_khz) / 1000.0;
     (f64::from(v) * pclk / pclk) as u32
+}
+
+/// DecideODMMode for `dml2_odm_mode_auto` (dynamic ODM off): the fewest
+/// pipes whose DISPCLK (the pixel clock over the pipes; an HDMI 4:2:0
+/// output's TMDS rate is never the larger term) fits `dispclk_ss_khz`, at
+/// least two for a DSC line wider than one DSC takes or a 4:2:0 line wider
+/// than one formatter buffer, and two for more than four DSC slices. 3 stands
+/// for any wider split (3:1 or 4:1), which DML would choose but this port
+/// does not admit.
+fn decide_odm(mode: &Mode, dispclk_ss_khz: u64) -> u32 {
+    let t = &mode.timing;
+    let pclk = u64::from(t.pixel_clock_khz);
+    let fits = |pipes: u32| pclk <= u64::from(pipes) * dispclk_ss_khz;
+    let span = |limit: u32| t.h_active.div_ceil(limit).max(1);
+    let mut odm = if fits(1) {
+        1
+    } else if fits(2) {
+        2
+    } else {
+        3
+    };
+    if mode.dsc.is_some() {
+        odm = odm.max(span(MAX_PIXELS_PER_DSC));
+    }
+    if mode.ycbcr420 {
+        odm = odm.max(span(FMT_420_BUFFER_WIDTH));
+    }
+    if let Some(dsc) = mode.dsc {
+        if odm == 1 && dsc.slices > MAX_SLICES_PER_DSC {
+            odm = 2;
+        }
+        if odm == 2 && dsc.slices > 2 * MAX_SLICES_PER_DSC {
+            odm = 3;
+        }
+    }
+    odm.min(3)
 }
 
 /// Clocks the plan was computed for. DISPCLK, DPPREFCLK and the pipe's DPPCLK
@@ -248,17 +302,33 @@ pub struct Arbiter {
 }
 
 /// A reproducible programming plan for one mode on one board state.
+///
+/// With `pipes == 2` (ODM 2:1) the stream's one OTG drives two OPPs, each fed
+/// by its own DPP/HUBP reading one half of the line. Both pipes run at
+/// `clocks.dppclk_khz` with `det_bytes` of DET and the same `ttu` and `dlg`,
+/// except that the second pipe's `refcyc_h_blank_end` is
+/// `odm_refcyc_h_blank_end` ([`Plan::pipe_dlg`]); Linux DML21 programs no
+/// other per-pipe difference (check.sh verifies every register of the second
+/// pipe against the first).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub mode: Mode,
     pub soc: Soc,
     pub clocks: Clocks,
     pub sync: GlobalSync,
+    /// The first (or only) pipe's DLG.
     pub dlg: Dlg,
     pub ttu: Ttu,
     pub watermarks: Watermarks,
     pub arbiter: Arbiter,
+    /// DET of each of the stream's pipes.
     pub det_bytes: u32,
+    /// DPP/OPP pipes the stream takes: 1 in ODM bypass, 2 in ODM 2:1 combine.
+    /// DML's policy decides it ([`admit_all`]), not the caller.
+    pub pipes: u8,
+    /// The second ODM pipe's `refcyc_h_blank_end`: the blank end moved by
+    /// half the active line. Zero with one pipe.
+    pub odm_refcyc_h_blank_end: u32,
     /// Vertical blank budgeted for self-refresh entry and exit, if any.
     pub stutter_reserved_us: u32,
     /// Every mode admitted together with this one, in admission order; this
@@ -269,6 +339,8 @@ pub struct Plan {
 
 /// Streams admitted together at most: one per pipe.
 pub const MAX_STREAMS: usize = 4;
+/// `max_num_dpp` / `max_num_opp`: pipes every admitted stream shares.
+pub const MAX_PIPES: u32 = 4;
 
 // ── dml2_socbb_dcn401 / dml_dcn4_variant_a_soc_qos_params ──────────────────
 const CHANNEL_BYTES: u64 = 2;
@@ -473,9 +545,13 @@ struct Shape {
     t: Timing,
     pclk: Fx,
     line: Fx,
+    /// Pipes (ODM segments): 1 or 2.
+    odm: u32,
+    /// Each pipe's swath width and its request-rounded width.
     swath: u32,
     swath_ub: u32,
     det_bytes: u32,
+    /// The surface's read bandwidth, over all of its pipes.
     vactive_bw: Fx,
     vblank: u32,
     ycbcr420: bool,
@@ -525,7 +601,9 @@ struct Evaluation {
 }
 
 impl Shape {
-    fn new(mode: &Mode) -> Result<Self, Error> {
+    /// `dispclk_ss_khz` is DML's `max_dispclk_freq_mhz`: the board maximum
+    /// less downspread, which decides ODM combine.
+    fn new(mode: &Mode, dispclk_ss_khz: u64) -> Result<Self, Error> {
         let t = mode.timing;
         if t.pixel_clock_khz == 0
             || t.h_active == 0
@@ -552,40 +630,63 @@ impl Shape {
         {
             return Err(Error::Unsupported);
         }
-        // ValidateODMMode without ODM: a 4:2:0 output passes two pixels per
-        // clock and fits the formatter's 4:2:0 line buffer.
-        if mode.ycbcr420 && (t.h_active % 2 != 0 || t.h_active > FMT_420_BUFFER_WIDTH) {
-            return Err(Error::Unsupported);
-        }
-        // With DSC, ValidateODMMode in bypass (one DSC: at most 5760 pixels
-        // and four slices, dividing the line), the DSC unit/slice checks, and
-        // DSCCLKRequiredMoreThanSupported (a third of the pixel clock).
         if let Some(dsc) = mode.dsc {
             if dsc.bpp_x16 == 0 {
                 return Err(Error::Invalid);
             }
-            if mode.ycbcr420
-                || dsc.slices == 0
-                || dsc.slices > MAX_SLICES_PER_DSC
-                || t.h_active > MAX_PIXELS_PER_DSC
+            if mode.ycbcr420 || dsc.slices == 0 {
+                return Err(Error::Unsupported);
+            }
+        }
+        // Even a 4:1 split cannot bring DISPCLK under the board maximum.
+        if u64::from(t.pixel_clock_khz) > 4 * dispclk_ss_khz {
+            return Err(Error::PixelClock);
+        }
+        let odm = decide_odm(mode, dispclk_ss_khz);
+        // Only bypass and 2:1 are admitted; Linux would split wider.
+        if odm > 2 {
+            return Err(Error::Unsupported);
+        }
+        // ValidateODMMode: each pipe takes an even share of the line (a 4:2:0
+        // output passes two pixels per clock), and fits the formatter's 4:2:0
+        // line buffer.
+        let ppc = if mode.ycbcr420 { 2 } else { 1 };
+        if t.h_active % (odm * ppc) != 0
+            || t.h_active % odm.max(ppc) != 0
+            || (mode.ycbcr420 && t.h_active > odm * FMT_420_BUFFER_WIDTH)
+        {
+            return Err(Error::Unsupported);
+        }
+        // With DSC, ValidateODMMode (one DSC per pipe: at most 5760 pixels
+        // and four slices each, the slices dividing the line and splitting
+        // evenly between the pipes), the DSC unit/slice checks, and
+        // DSCCLKRequiredMoreThanSupported (a third of each pipe's pixels).
+        if let Some(dsc) = mode.dsc {
+            if dsc.slices > odm * MAX_SLICES_PER_DSC
+                || t.h_active > odm * MAX_PIXELS_PER_DSC
                 || t.h_active % dsc.slices != 0
+                || dsc.slices % odm != 0
             {
                 return Err(Error::Unsupported);
             }
-            if f64::from(t.pixel_clock_khz) / 1000.0 / 3.0 / 1.0
+            if f64::from(t.pixel_clock_khz) / 1000.0 / (3.0 * f64::from(odm)) / 1.0
                 > f64::from(MAX_DSCCLK_KHZ) / 1000.0
             {
                 return Err(Error::PixelClock);
             }
         }
+        // CalculateSwathWidth: each pipe fetches its share of the line,
+        // rounded to whole requests within the surface.
+        let swath = t.h_active / odm;
         let w = u64::from(t.h_active);
         let r = u64::from(REQUEST_PIXELS);
-        let swath_ub = ceil_to(w, r).min(ceil_to(w - 1, r) + r) as u32;
+        let swath_ub = ceil_to(w, r).min(ceil_to(u64::from(swath) - 1, r) + r) as u32;
         Ok(Self {
             t,
             pclk: mhz(u64::from(t.pixel_clock_khz)),
             line: q(i64::from(t.h_total) * 1000, i64::from(t.pixel_clock_khz)),
-            swath: t.h_active,
+            odm,
+            swath,
             swath_ub,
             det_bytes: DET_KBYTES * 1024,
             vactive_bw: q(
@@ -594,7 +695,7 @@ impl Shape {
             ),
             vblank: t.v_total - t.v_active,
             ycbcr420: mode.ycbcr420,
-            dsc_delay: mode.dsc.map_or(0, |d| dsc_delay(&t, d)),
+            dsc_delay: mode.dsc.map_or(0, |d| dsc_delay(&t, d, odm)),
         })
     }
     /// `CalculateSwathAndDETConfiguration` support and `PitchSupport`.
@@ -620,14 +721,27 @@ impl Shape {
         Some(time.over(time.minus(urgent)))
     }
     /// `CalculateDCFCLKDeepSleep`'s per-surface term with VRatio 1 and no
-    /// tdlut.
+    /// tdlut: a pipe delivers its swath in `odm` times its share of the line.
     fn deep_sleep_surface(&self) -> Fx {
         let factor = q(DCFCLK_FACTOR_HUNDREDTHS, 100);
         factor
             .times(fx(i64::from(BYTES_PER_PIXEL)))
             .over(fx(64))
             .times(self.pclk)
+            .over(fx(i64::from(self.odm)))
             .max(self.pclk.over(fx(16)))
+    }
+    /// `RequiredDPPCLK` (and this surface's `RequiredDISPCLKPerSurface`): the
+    /// pixel clock over the pipes, in MHz.
+    fn dpp_mhz(&self) -> Fx {
+        q(
+            i64::from(self.t.pixel_clock_khz),
+            1000 * i64::from(self.odm),
+        )
+    }
+    /// The same as DML hands it to DPMM: truncated to kHz.
+    fn dpp_khz(&self) -> u32 {
+        self.t.pixel_clock_khz / self.odm
     }
 }
 
@@ -652,14 +766,16 @@ fn deep_sleep_khz(shapes: &[Shape]) -> u32 {
     let num: u128 = shapes
         .iter()
         .map(|s| {
-            u128::from(s.swath * BYTES_PER_PIXEL) * u128::from(s.t.pixel_clock_khz) * den
+            u128::from(s.t.h_active * BYTES_PER_PIXEL) * u128::from(s.t.pixel_clock_khz) * den
                 / u128::from(s.t.h_total)
         })
         .sum();
     let bw = f * num / (100 * RETURN_BUS_BYTES as u128 * den);
     shapes.iter().fold(8000.max(bw) as u32, |ds, s| {
         let pclk = u64::from(s.t.pixel_clock_khz);
-        let surface = (f as u64 * u64::from(BYTES_PER_PIXEL) * pclk / (100 * 64)).max(pclk / 16);
+        let surface = (f as u64 * u64::from(BYTES_PER_PIXEL) * pclk
+            / (100 * 64 * u64::from(s.odm)))
+        .max(pclk / 16);
         ds.max(surface as u32)
     })
 }
@@ -714,6 +830,13 @@ impl Shape {
                 .plus(fx(DISPCLK_DELAY_CYCLES).times(self.pclk).over(dispclk))
                 .plus(fx(i64::from(self.dsc_delay))),
         ) as u32;
+        // ODM combine adds 18 pixels and every further pipe's recout width.
+        let dst_x = dst_x
+            + if self.odm > 1 {
+                18 + (self.odm - 1) * self.swath
+            } else {
+                0
+            };
         // CalculatePrefetchSchedule: one line after the scaler for a 4:2:0
         // output, then the pixel delay folded into lines.
         let dst_x = dst_x + if self.ycbcr420 { t.h_total } else { 0 };
@@ -722,10 +845,12 @@ impl Shape {
 
         let quarter = l.over(fx(4));
         let sw_bytes = fx(PREFETCH_SOURCE_LINES * i64::from(self.swath_ub * BYTES_PER_PIXEL));
-        // One-to-one schedule.
+        // One-to-one schedule, against this pipe's share of the surface's
+        // active bandwidth.
         let min_lsw_oto = q(PREFETCH_SOURCE_LINES, MAX_VRATIO_PRE_OTO).max(fx(2));
         let bw_oto = self
             .vactive_bw
+            .over(fx(i64::from(self.odm)))
             .max(fx(i64::from(self.swath_ub * BYTES_PER_PIXEL)).over(l))
             .min(sw_bytes.over(min_lsw_oto.times(l)));
         let lsw_oto = ceil_quarter(sw_bytes.over(bw_oto).over(l));
@@ -798,7 +923,8 @@ fn evaluate(
         let a = available(lat_state).urgent[0];
         a[0].min(a[1])
     };
-    let t_arb = fx(shapes.len() as i64 * PIXEL_CHUNK_KBYTES * 1024).over(return_bw);
+    let dpps: i64 = shapes.iter().map(|s| i64::from(s.odm)).sum();
+    let t_arb = fx(dpps * PIXEL_CHUNK_KBYTES * 1024).over(return_bw);
     let outstanding = fx(ROB_KBYTES * 1024 - MAX_OUTSTANDING_REQS * REQUEST_BYTES).over(return_bw);
     let extra = outstanding.plus(t_arb);
     // Deep-sleep DCFCLK is global: every pipe carries the same value.
@@ -824,19 +950,21 @@ fn evaluate(
             .ok_or(Error::UrgentLatencyHiding)?;
         // calculate_peak_bandwidth_required: no flip, VM, cursor or excess
         // vactive fill, and unity DCC/MALL factors for both SDP and DRAM.
+        // Active bandwidth is the surface's; prefetch is per pipe.
+        let pipes = fx(i64::from(shape.odm));
         urgent = urgent.plus(
             shape
                 .vactive_bw
                 .times(burst)
-                .max(pre.prefetch_bw.times(pre_burst))
-                .max(pre.prefetch_bw_max.times(pre_burst))
+                .max(pre.prefetch_bw.times(pre_burst).times(pipes))
+                .max(pre.prefetch_bw_max.times(pre_burst).times(pipes))
                 .max(shape.vactive_bw),
         );
         non_urgent = non_urgent.plus(
             shape
                 .vactive_bw
-                .max(pre.prefetch_bw)
-                .max(pre.prefetch_bw_max),
+                .max(pre.prefetch_bw.times(pipes))
+                .max(pre.prefetch_bw_max.times(pipes)),
         );
         planes[k] = pre;
     }
@@ -959,23 +1087,31 @@ pub fn admit(soc: &Soc, mode: &Mode) -> Result<Plan, Error> {
     Ok(admit_all(soc, &[*mode])?[0])
 }
 
-/// Admit `modes` together, one stream and one pipe each, returning their
-/// plans in order or the first DML check the configuration fails. Every
-/// pipe keeps the fixed DET, and the shared quantities are joint as in DML21:
-/// read and urgent bandwidth sum over the surfaces, extra latency takes one
-/// pixel chunk per DPP, deep-sleep DCFCLK, DISPCLK and DPPREFCLK cover every
-/// pipe, and stutter is budgeted only if every stream's blank allows it.
-/// The global watermarks and arbiter are therefore the same in every plan.
+/// Admit `modes` together, one stream each on one pipe or, where DML's ODM
+/// policy splits it, two ([`Plan::pipes`]), returning their plans in order or
+/// the first DML check the configuration fails. Every pipe keeps the fixed
+/// DET, and the shared quantities are joint as in DML21: read and urgent
+/// bandwidth sum over the surfaces (prefetch over each surface's pipes),
+/// extra latency takes one pixel chunk per DPP, deep-sleep DCFCLK, DISPCLK
+/// and DPPREFCLK cover every pipe, and stutter is budgeted only if every
+/// stream's blank allows it. The global watermarks and arbiter are therefore
+/// the same in every plan.
 pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
     soc.validate()?;
     if modes.is_empty() || modes.len() > MAX_STREAMS {
         return Err(Error::Invalid);
     }
+    // DML's max_dispclk/dppclk_freq_mhz: the board maximums less downspread.
+    let ss = |khz: u32| u64::from(khz) * 10_000 / DOWNSPREAD_TENTHOUSANDTHS as u64;
     let mut shapes = Vec::with_capacity(modes.len());
     for mode in modes {
-        let shape = Shape::new(mode)?;
+        let shape = Shape::new(mode, ss(soc.dispclk_max_khz))?;
         shape.buffers()?;
         shapes.push(shape);
+    }
+    // TotalAvailablePipesSupport: one DPP and OPP per ODM segment.
+    if shapes.iter().map(|s| s.odm).sum::<u32>() > MAX_PIPES {
+        return Err(Error::Pipes);
     }
     let (dcfclk_khz, fclk_khz, bw_kbps) = clock_state(soc)?;
     let state = State {
@@ -990,20 +1126,17 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
         ..state
     };
     let uclk_khz = u64::from(soc.uclk_khz);
-    // Mode support: ODM bypass, one DPP, DISPCLK = DPPCLK = pixel clock per
-    // surface, checked against the downspread-limited maximums. DISPCLK is
-    // the fastest surface's.
-    let ss = |khz: u32| u64::from(khz) * 10_000 / DOWNSPREAD_TENTHOUSANDTHS as u64;
-    let max_pclk_khz = modes
-        .iter()
-        .map(|m| m.timing.pixel_clock_khz)
-        .max()
-        .unwrap_or(0);
-    if u64::from(max_pclk_khz) > ss(soc.dispclk_max_khz)
-        || u64::from(max_pclk_khz) > ss(soc.dppclk_max_khz)
-    {
-        return Err(Error::PixelClock);
+    // Mode support: DISPCLK = DPPCLK = the pixel clock over the stream's
+    // pipes, checked against the downspread-limited maximums. DISPCLK is the
+    // fastest pipe's.
+    for s in &shapes {
+        let pclk = u64::from(s.t.pixel_clock_khz);
+        let odm = u64::from(s.odm);
+        if pclk > odm * ss(soc.dispclk_max_khz) || pclk > odm * ss(soc.dppclk_max_khz) {
+            return Err(Error::PixelClock);
+        }
     }
+    let max_dpp_khz = shapes.iter().map(Shape::dpp_khz).max().unwrap_or(0);
     let ds = deep_sleep(&shapes);
     // Outstanding-request coverage at DML's DCF state.
     let lat = latency(state, uclk_khz);
@@ -1021,13 +1154,13 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
             return Err(Error::Bandwidth);
         }
     }
-    let max_pclk = mhz(u64::from(max_pclk_khz));
+    let max_dpp = shapes.iter().fold(Fx::ZERO, |max, s| max.max(s.dpp_mhz()));
     let support = |reserved_us: i64| -> Result<(), Error> {
         let clk: Vec<PipeClocks> = shapes
             .iter()
             .map(|s| PipeClocks {
-                dpp: s.pclk,
-                disp: max_pclk,
+                dpp: s.dpp_mhz(),
+                disp: max_dpp,
                 deep_sleep: ds,
             })
             .collect();
@@ -1062,7 +1195,7 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
     // of the shared DPPREFCLK.
     let (sp, sp_den) = (DOWNSPREAD_TENTHOUSANDTHS as u128, 10_000u128);
     let (ramp, ramp_den) = ((100 + DISPCLK_RAMP_MARGIN_PERCENT) as u128, 100u128);
-    let req = u128::from(max_pclk_khz);
+    let req = u128::from(max_dpp_khz);
     let disp_max = u128::from(soc.dispclk_max_khz);
     let (mut num, mut den) = (req * sp * ramp, sp_den * ramp_den);
     if num > disp_max * den {
@@ -1077,10 +1210,10 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
     if dispclk_khz > soc.dispclk_max_khz || dpprefclk_khz > soc.dppclk_max_khz {
         return Err(Error::PixelClock);
     }
-    let dppclk_khz: Vec<u32> = modes
+    let dppclk_khz: Vec<u32> = shapes
         .iter()
-        .map(|m| {
-            let own = u128::from(m.timing.pixel_clock_khz);
+        .map(|s| {
+            let own = u128::from(s.dpp_khz());
             let steps = (own * sp * 255).div_ceil(sp_den * u128::from(dpprefclk_khz));
             (u128::from(dpprefclk_khz) * steps / 255) as u32
         })
@@ -1172,8 +1305,15 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
             <= vready_lines * i64::from(t.h_total);
         let keepout = (dram_wm.over(l).ceil() as u32).min(t.v_total - 1);
         // Delivery times are whole pixel counts over the pixel clock: exact.
-        let line_delivery = (i64::from(shape.swath_ub) * ref_khz / pclk_i) as u32;
-        let refcyc_req = (i64::from(REQUEST_PIXELS) * 1024 * ref_khz / pclk_i) as u32;
+        // A pipe delivers its swath in its pipes' share of the line time.
+        let odm = i64::from(shape.odm);
+        let line_delivery = (i64::from(shape.swath_ub) * odm * ref_khz / pclk_i) as u32;
+        let refcyc_req = (i64::from(REQUEST_PIXELS) * odm * 1024 * ref_khz / pclk_i) as u32;
+        // rq_dlg_get_dlg_reg: each further ODM pipe's blank ends its share
+        // of the active line later.
+        let h_blank_end = |pipe: u32| {
+            (i64::from(t.h_blank_end() + pipe * (t.h_active / shape.odm)) * ref_khz / pclk_i) as u32
+        };
         let plan = Plan {
             mode: modes[k],
             soc: *soc,
@@ -1195,7 +1335,7 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
                 pstate_keepout: keepout,
             },
             dlg: Dlg {
-                refcyc_h_blank_end: (i64::from(t.h_blank_end()) * ref_khz / pclk_i) as u32,
+                refcyc_h_blank_end: h_blank_end(0),
                 dlg_vblank_end: t.v_blank_end(),
                 min_dst_y_next_start: (min_next.floor() as u32) * 4,
                 refcyc_per_htotal: (i64::from(t.h_total) * ref_khz * 256 / pclk_i) as u32,
@@ -1226,6 +1366,8 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
             watermarks,
             arbiter,
             det_bytes: shape.det_bytes,
+            pipes: shape.odm as u8,
+            odm_refcyc_h_blank_end: if shape.odm > 1 { h_blank_end(1) } else { 0 },
             stutter_reserved_us: reserved_us as u32,
             streams,
             stream: k as u8,
@@ -1237,6 +1379,18 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
 }
 
 impl Plan {
+    /// The DLG of the stream's pipe `pipe` (0-based, in ODM segment order,
+    /// left to right), or `None` past the stream's pipes.
+    pub fn pipe_dlg(&self, pipe: u8) -> Option<Dlg> {
+        match pipe {
+            0 => Some(self.dlg),
+            1 if self.pipes == 2 => Some(Dlg {
+                refcyc_h_blank_end: self.odm_refcyc_h_blank_end,
+                ..self.dlg
+            }),
+            _ => None,
+        }
+    }
     /// The configuration this plan was admitted in.
     pub fn joint_modes(&self) -> Vec<Mode> {
         self.streams.iter().flatten().copied().collect()
@@ -1256,6 +1410,7 @@ impl Plan {
         let (d, t, w, a) = (&self.dlg, &self.ttu, &self.watermarks, &self.arbiter);
         let limits = [
             (d.refcyc_h_blank_end, 1 << 13),
+            (self.odm_refcyc_h_blank_end, 1 << 13),
             (d.dlg_vblank_end, 1 << 15),
             (d.min_dst_y_next_start, 1 << 18),
             (d.refcyc_per_htotal, 1 << 21),

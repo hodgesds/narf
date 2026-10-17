@@ -83,11 +83,16 @@ impl<I: Io> Engine<I> {
     ) -> Result<(), Error> {
         let l = self.layout;
         for pipe in 0..4 {
-            if let Some(s) = live.filter(|s| s.pipe == pipe) {
+            // The owned live scanout, either of its ODM halves.
+            if let Some(s) = live.filter(|s| s.pipe == pipe || s.odm == Some(pipe)) {
                 if !self.hubp_powered(pipe)? {
                     return Err(Error::Busy);
                 }
-                self.live_fetch(pipe, s.address)?;
+                let cursor = self
+                    .status
+                    .cursor
+                    .is_some_and(|c| c.pipe == s.pipe && c.shown_on(pipe));
+                self.live_segment(pipe, s.address, cursor)?;
                 self.auxiliary_fetchers_stopped(pipe)?;
                 continue;
             }
@@ -96,7 +101,7 @@ impl<I: Io> Engine<I> {
                 if !self.hubp_powered(pipe)? {
                     return Err(Error::Busy);
                 }
-                self.live_fetch_with(pipe, address, cursor)?;
+                self.live_segment(pipe, address, cursor)?;
                 self.auxiliary_fetchers_stopped(pipe)?;
                 continue;
             }

@@ -44,6 +44,10 @@ pub struct SurfaceRequest {
     pub width: u32,
     pub height: u32,
     pub format: SurfaceFormat,
+    /// ODM 2:1: the second pipe, whose HUBP fetches the right half of the
+    /// same surface (and whose DPP/MPCC/DET follow it). Its own timing,
+    /// surface slot and memory stay unused.
+    pub odm: Option<u8>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SurfaceApplied {
@@ -61,6 +65,9 @@ impl SurfaceRequest {
             || self.height == 0
             || self.width > 0x3fff
             || self.height > 0x3fff
+            || self
+                .odm
+                .is_some_and(|q| q >= 4 || q == self.pipe || self.width % 2 != 0)
         {
             return Err(Error::Invalid);
         }
@@ -69,9 +76,29 @@ impl SurfaceRequest {
         Ok((pitch, u64::from(pitch) * u64::from(self.height)))
     }
 }
+impl SurfaceRequest {
+    /// Each ODM segment's pipe, first column and width, the request's own
+    /// pipe first; the whole line on that pipe without ODM.
+    pub(in crate::amdgpu_dcn401_otg) fn segments(
+        self,
+    ) -> impl Iterator<Item = (u8, u32, u32)> + Clone {
+        let width = if self.odm.is_some() {
+            self.width / 2
+        } else {
+            self.width
+        };
+        core::iter::once((self.pipe, 0, width)).chain(self.odm.map(|q| (q, width, width)))
+    }
+    /// Every pipe the surface's fetch occupies, by bit.
+    pub(in crate::amdgpu_dcn401_otg) fn pipe_mask(self) -> u8 {
+        self.segments().fold(0, |m, (p, _, _)| m | bit(p))
+    }
+}
 impl SurfaceApplied {
-    fn registers(self) -> [(u64, u32, u32); 18] {
-        let dimensions = self.request.width | self.request.height << 16;
+    /// One segment's HUBP surface registers: the shared address and pitch,
+    /// with a viewport of that segment's columns (hubp401_set_viewport).
+    fn registers(self, x: u32, width: u32) -> [(u64, u32, u32); 18] {
+        let dimensions = width | self.request.height << 16;
         let crossbar = match self.request.format {
             SurfaceFormat::Xrgb8888 => 0xe00000,
             SurfaceFormat::Xbgr8888 => 0xb00000,
@@ -83,9 +110,9 @@ impl SurfaceApplied {
             (0x5e5, 0xf7f, 8), // RGB8888, no rotation/mirror/alpha plane
             (0x66d, 0xf00000, crossbar),
             (0x5eb, 0x3fff3fff, dimensions),
-            (0x5e9, u32::MAX, 0),
+            (0x5e9, u32::MAX, x),
             (0x5ef, 0x3fff3fff, dimensions),
-            (0x5ee, u32::MAX, 0),
+            (0x5ee, u32::MAX, x),
             (0x5ed, 0x3fff3fff, 0),
             (0x5ec, u32::MAX, 0),
             (0x5f1, 0x3fff3fff, 0),
@@ -142,7 +169,9 @@ impl Surfaces {
         if !engine.status.state.reusable() {
             return Err(Error::Busy);
         }
-        engine.surface_preflight(request.pipe, restage)?;
+        for (p, _, _) in request.segments() {
+            engine.surface_preflight(p, restage)?;
+        }
         // The same geometry reuses the buffers: a console write still in
         // flight to the old scanout can only land on this same surface. A new
         // geometry parks them instead until explicit CPU/hardware retirement
@@ -229,7 +258,9 @@ impl Surfaces {
         }
         engine.flush_surface_writes()?;
         // Recheck after cooperative clearing, before any surface register changes.
-        engine.surface_preflight(surface.applied.request.pipe, restage)?;
+        for (p, _, _) in surface.applied.request.segments() {
+            engine.surface_preflight(p, restage)?;
+        }
         surface.memory.publish();
         engine.program_surface(surface.applied).await
     }
@@ -283,6 +314,18 @@ impl Surfaces {
     }
 }
 impl<I: Io> Engine<I> {
+    /// The pipes `pipe`'s staged surface fetches on: itself, then its ODM
+    /// pipe.
+    pub(in crate::amdgpu_dcn401_otg) fn fetch_pipes(&self, pipe: u8) -> impl Iterator<Item = u8> {
+        let odm = self
+            .status
+            .surfaces
+            .get(usize::from(pipe))
+            .copied()
+            .flatten()
+            .and_then(|a| a.request.odm);
+        core::iter::once(pipe).chain(odm)
+    }
     /// A restaged pipe may still show its previous staged address pending:
     /// those buffers stay owned until a separate, stricter release proof.
     fn surface_preflight(&mut self, pipe: u8, restage: bool) -> Result<(), Error> {
@@ -319,36 +362,39 @@ impl<I: Io> Engine<I> {
     }
     fn verify_surface(&mut self, surface: SurfaceApplied) -> Result<(), Error> {
         let l = self.layout;
-        let p = surface.request.pipe;
-        if !self.hubp_powered(p)? {
-            return Err(Error::Busy);
-        }
-        if self.read(l.hubp(p, 0x5e7))? & 0x180 != 0x80 {
-            return Err(Error::Busy);
-        }
-        for (r, mask, value) in surface.registers() {
-            let at = l.hubp(p, r);
-            if self.read(at)? & mask != value {
-                return Err(Error::Readback(at));
+        for (p, x, width) in surface.request.segments() {
+            if !self.hubp_powered(p)? {
+                return Err(Error::Busy);
+            }
+            if self.read(l.hubp(p, 0x5e7))? & 0x180 != 0x80 {
+                return Err(Error::Busy);
+            }
+            for (r, mask, value) in surface.registers(x, width) {
+                let at = l.hubp(p, r);
+                if self.read(at)? & mask != value {
+                    return Err(Error::Readback(at));
+                }
             }
         }
         Ok(())
     }
     async fn program_surface(&mut self, surface: SurfaceApplied) -> Result<(), Error> {
         let l = self.layout;
-        let p = surface.request.pipe;
-        self.update(l.hubp(p, HUBP_CLOCK), 1, 1)?;
-        self.wait(l.hubp(p, HUBP_CONTROL), 0x1007, 3, 100_000)
-            .await?;
-        for (r, mask, value) in surface.registers() {
-            self.update(l.hubp(p, r), mask, value)?;
+        for (p, x, width) in surface.request.segments() {
+            self.update(l.hubp(p, HUBP_CLOCK), 1, 1)?;
+            self.wait(l.hubp(p, HUBP_CONTROL), 0x1007, 3, 100_000)
+                .await?;
+            for (r, mask, value) in surface.registers(x, width) {
+                self.update(l.hubp(p, r), mask, value)?;
+            }
+            // Address writes may leave a pending flip until timing runs. That
+            // is not an active fetch and must never be treated as flip
+            // completion.
+            self.wait(l.hubp(p, HUBP_CONTROL), 0x1007, 3, 100_000)
+                .await?;
+            self.update(l.hubp(p, HUBP_CLOCK), 1, 0)?;
         }
-        // Address writes may leave a pending flip until timing runs. That is
-        // not an active fetch and must never be treated as flip completion.
-        self.wait(l.hubp(p, HUBP_CONTROL), 0x1007, 3, 100_000)
-            .await?;
-        self.update(l.hubp(p, HUBP_CLOCK), 1, 0)?;
-        self.hubp_tree_stopped(Some(p))?;
+        self.hubp_tree_stopped_mask(surface.request.pipe_mask())?;
         self.verify_surface(surface)
     }
 }

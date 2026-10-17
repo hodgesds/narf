@@ -66,15 +66,23 @@ pub struct BlankRequest {
 impl BlankRequest {
     /// The OPP registers, then for 4:2:0 the 4:2:0 memory's power control
     /// (opp1_program_fmt releases its forced state; RGB leaves it alone).
-    pub(in crate::amdgpu_dcn401_otg) fn registers(
+    /// One ODM segment's OPP (`segment` 0 is the timing's own OPP): the
+    /// pattern generator covers that segment's columns only, at its offset
+    /// within the line (dcn20_blank_pixel_data per ODM slice).
+    pub(in crate::amdgpu_dcn401_otg) fn segment_registers(
         self,
-        t: Timing,
+        plan: Plan,
+        segment: u32,
     ) -> impl Iterator<Item = (u64, u32, u32)> {
-        self.common_registers(t)
+        let width = plan.segment_width();
+        // opp2_get_left_edge_extra_pixel_count: a non-primary OPP's 4:2:0
+        // chroma filter takes one pixel from the left neighbour.
+        let edge = u32::from(self.ycbcr420 && segment > 0);
+        self.common_registers(plan.request.timing, width, segment * width, edge)
             .into_iter()
             .chain(self.ycbcr420.then_some((MAP420, 3, 0)))
     }
-    fn common_registers(self, t: Timing) -> [(u64, u32, u32); 14] {
+    fn common_registers(self, t: Timing, width: u32, x: u32, edge: u32) -> [(u64, u32, u32); 14] {
         // black_color_format: limited black is 0x40 of 10 bits, a YCbCr
         // chroma midpoint 0x200, MSB aligned in both 16-bit colour fields.
         let (red, green, blue) = match (self.ycbcr420, self.limited) {
@@ -90,9 +98,9 @@ impl BlankRequest {
             0
         };
         [
-            // No 4:2:2/4:2:0 chroma filter extra left pixel on the primary
-            // OPP (opp2_get_left_edge_extra_pixel_count).
-            (EDGE, 1, 0),
+            // The 4:2:2/4:2:0 chroma filter's extra left pixel: none on the
+            // primary OPP (opp2_get_left_edge_extra_pixel_count).
+            (EDGE, 1, edge),
             // Explicit truncation, no spatial/temporal dithering or randomization.
             (DEPTH, 0x1ff33, self.depth.truncate()),
             // Clear RGB/YUV offsets as well as the inactive dither seeds.
@@ -110,8 +118,8 @@ impl BlankRequest {
                     1
                 },
             ),
-            (DIMENSIONS, 0x3fff3fff, t.h_active << 16 | t.v_active),
-            (OFFSET, 0x3fff3fff, 0),
+            (DIMENSIONS, 0x3fff3fff, width << 16 | t.v_active),
+            (OFFSET, 0x3fff3fff, x),
             (BLUE, u32::MAX, blue),
             (GREEN, u32::MAX, green),
             (RED, u32::MAX, red),
@@ -166,18 +174,25 @@ impl<I: Io> Engine<I> {
         timing: Applied,
     ) -> Result<BlankApplied, Error> {
         let l = self.layout;
-        let at = |r| l.opp(request.pipe, r);
-        // A digital bypass would bypass this format path. The caller must
-        // retire that configuration before preparing ordinary RGB output.
-        if self.read(at(PIPE))? & 0x10 != 0 {
-            return Err(Error::Busy);
+        let plan = timing.request.plan()?;
+        let mut pending = false;
+        // Every ODM segment's OPP: pipe clock on, then its formatter and
+        // its part of the black pattern (enable_stream_timing's
+        // opp_pipe_clock_control for each OPP head, then blank_pixel_data).
+        for (segment, o) in plan.opps().enumerate() {
+            let at = |r| l.opp(o, r);
+            // A digital bypass would bypass this format path. The caller must
+            // retire that configuration before preparing ordinary RGB output.
+            if self.read(at(PIPE))? & 0x10 != 0 {
+                return Err(Error::Busy);
+            }
+            self.update(at(PIPE), 1, 1)?;
+            self.wait(at(PIPE), 2, 2, 1000).await?;
+            for (r, mask, value) in request.segment_registers(plan, segment as u32) {
+                self.update(at(r), mask, value)?;
+            }
+            pending |= self.read(at(PENDING))? & 1 != 0;
         }
-        self.update(at(PIPE), 1, 1)?;
-        self.wait(at(PIPE), 2, 2, 1000).await?;
-        for (r, mask, value) in request.registers(timing.request.timing) {
-            self.update(at(r), mask, value)?;
-        }
-        let pending = self.read(at(PENDING))? & 1 != 0;
         Ok(BlankApplied {
             request,
             timing,
@@ -195,11 +210,13 @@ impl<I: Io> Engine<I> {
         let timing = self.blank_timing(request, clock)?;
         self.preflight(request.pipe, false)?;
         // Do not overwrite a previous unlatched FMT/DPG transaction.
-        if self.read(self.layout.opp(request.pipe, FMT))? & 0x1000000 != 0
-            || self.read(self.layout.opp(request.pipe, PENDING))? & 1 != 0
-            || self.read(self.layout.opp(request.pipe, PIPE))? & 0x10 != 0
-        {
-            return Err(Error::Busy);
+        for o in timing.request.plan()?.opps() {
+            if self.read(self.layout.opp(o, FMT))? & 0x1000000 != 0
+                || self.read(self.layout.opp(o, PENDING))? & 1 != 0
+                || self.read(self.layout.opp(o, PIPE))? & 0x10 != 0
+            {
+                return Err(Error::Busy);
+            }
         }
         self.status.state = State::PreparingBlank(request.pipe);
         self.status.mpcs[usize::from(request.pipe)] = None;

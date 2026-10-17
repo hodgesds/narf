@@ -72,17 +72,8 @@ impl<I: Io> Engine<I> {
             (l.otg(p, V_CONTROL), 0xffff0013, 0),
             (l.otg(p, CLOCK), 0x113, 0x103),
             (l.odm(p, INPUT_CLOCK), 7, 7),
-            (
-                l.odm(p, SOURCE),
-                0xffff0003,
-                0xfff00000
-                    | if connected {
-                        u32::from(p) << 16
-                    } else {
-                        0xf0000
-                    },
-            ),
-            (l.odm(p, MEMORY), 0xffff, 0),
+            (l.odm(p, SOURCE), 0xffff0003, plan.source(connected)),
+            (l.odm(p, MEMORY), 0xffff, plan.memory()),
             (
                 l.odm(p, FORMAT),
                 0x33,
@@ -90,13 +81,18 @@ impl<I: Io> Engine<I> {
                     | if plan.request.dsc.is_some() { 0x10 } else { 0 },
             ),
             (l.vtg(p), 0xffff7fff, plan.vtg | u32::from(running) << 31),
-            (l.opp(p, PIPE), 0x13, 3),
         ] {
             self.expect(at, mask, value)?;
         }
-        for (r, mask, value) in blank.request.registers(plan.request.timing) {
-            let value = if video && r == DPG { 0 } else { value };
-            self.expect(l.opp(p, r), mask, value)?;
+        if plan.request.odm.is_some() {
+            self.expect(l.odm(p, WIDTH), 0x1fff, plan.segment_width())?;
+        }
+        for (segment, o) in plan.opps().enumerate() {
+            self.expect(l.opp(o, PIPE), 0x13, 3)?;
+            for (r, mask, value) in blank.request.segment_registers(plan, segment as u32) {
+                let value = if video && r == DPG { 0 } else { value };
+                self.expect(l.opp(o, r), mask, value)?;
+            }
         }
         if let Some(cfg) = plan.request.dsc {
             self.dsc_running(&plan.request, &cfg)?;
@@ -111,7 +107,11 @@ impl<I: Io> Engine<I> {
         let l = self.layout;
         let p = blank.request.pipe;
         // Native DCN401 workaround requires VTG before master enable.
-        self.update(l.odm(p, SOURCE), 0xf0000, u32::from(p) << 16)?;
+        let plan = blank.timing.request.plan()?;
+        self.update(l.odm(p, SOURCE), 0xffff0003, plan.source(true))?;
+        if plan.request.odm.is_some() {
+            self.update(l.odm(p, MEMORY), 0xffff, plan.memory())?;
+        }
         self.update(l.vtg(p), 0x80000000, 0x80000000)?;
         self.update(l.otg(p, CONTROL), 0x301, 0x201)?;
         self.wait_blank_frames(blank, timeout_us).await
@@ -128,15 +128,21 @@ impl<I: Io> Engine<I> {
         loop {
             // Recheck each witness together. A cleared pending bit without a
             // current master or a fresh subsequent frame cannot prove blanking.
-            let blocked = if self.read(l.otg(p, CONTROL))? & 0x10001 != 0x10001 {
+            let mut blocked = if self.read(l.otg(p, CONTROL))? & 0x10001 != 0x10001 {
                 Some(l.otg(p, CONTROL))
-            } else if self.read(l.opp(p, PENDING))? & 1 != 0 {
-                Some(l.opp(p, PENDING))
-            } else if self.read(l.opp(p, FMT))? & 0x1000000 != 0 {
-                Some(l.opp(p, FMT))
             } else {
                 None
             };
+            for o in blank.timing.request.plan()?.opps() {
+                if blocked.is_some() {
+                    break;
+                }
+                if self.read(l.opp(o, PENDING))? & 1 != 0 {
+                    blocked = Some(l.opp(o, PENDING));
+                } else if self.read(l.opp(o, FMT))? & 0x1000000 != 0 {
+                    blocked = Some(l.opp(o, FMT));
+                }
+            }
             if blocked.is_some() {
                 before = None;
             } else {

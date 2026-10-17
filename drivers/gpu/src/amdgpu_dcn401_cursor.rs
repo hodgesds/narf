@@ -44,6 +44,14 @@ pub struct CursorApplied {
     pub y: i32,
     /// Programmed enable: false while the image is entirely off screen.
     pub visible: bool,
+    /// The pipes whose cursor is enabled, by bit: with ODM only the halves
+    /// the image overlaps (dcn401_set_cursor_position per ODM pipe).
+    pub shown: u8,
+}
+impl CursorApplied {
+    pub(in crate::amdgpu_dcn401_otg) fn shown_on(self, pipe: u8) -> bool {
+        self.shown & bit(pipe) != 0
+    }
 }
 
 /// What the position registers hold for a placement, following
@@ -120,22 +128,67 @@ impl<I: Io> Engine<I> {
     fn cursor_lock_at(&self, pipe: u8) -> u64 {
         self.layout.mpc_base + (LOCK_SET + u64::from(pipe) * 5) * 4
     }
-    /// Cursor registers latch together at the VUPDATE after the lock drops.
+    /// Cursor registers latch together at the VUPDATE after the locks drop:
+    /// every OPP of `pipe`'s scanout (both ODM halves) is locked across the
+    /// writes.
     fn cursor_locked(
         &mut self,
         pipe: u8,
         writes: impl FnOnce(&mut Self) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        let at = self.cursor_lock_at(pipe);
-        self.update(at, 1, 1)?;
-        let result = writes(self);
+        let locks: alloc::vec::Vec<u64> = self
+            .fetch_pipes(pipe)
+            .map(|p| self.cursor_lock_at(p))
+            .collect();
+        let mut held = 0;
+        let mut result = Ok(());
+        for &at in &locks {
+            result = self.update(at, 1, 1);
+            if result.is_err() {
+                break;
+            }
+            held += 1;
+        }
+        if result.is_ok() {
+            result = writes(self);
+        }
         // Always release: a held cursor lock would freeze cursor latching.
-        self.update(at, 1, 0)?;
+        for &at in locks[..held].iter().rev() {
+            let released = self.update(at, 1, 0);
+            result = result.and(released);
+        }
         result
     }
-    pub(super) fn cursor_attributes(&mut self, a: CursorApplied) -> [(u64, u32, u32); 9] {
+    /// Each pipe of `a`'s scanout with its segment's placement of `a`.
+    fn cursor_segments(&self, a: CursorApplied) -> Result<alloc::vec::Vec<(u8, Placement)>, Error> {
+        let deadlines = self.status.deadlines.ok_or(Error::Invalid)?;
+        let timing = deadlines.plan.mode.timing;
+        let surface = self
+            .status
+            .surfaces
+            .get(usize::from(a.pipe))
+            .copied()
+            .flatten()
+            .ok_or(Error::Invalid)?;
+        Ok(surface
+            .request
+            .segments()
+            .map(|(p, x, width)| {
+                (
+                    p,
+                    placement(
+                        a.x - x as i32,
+                        a.y,
+                        (a.width, a.height),
+                        (width, timing.v_active),
+                        (deadlines.plan.soc.dchub_refclk_khz, timing.pixel_clock_khz),
+                    ),
+                )
+            })
+            .collect())
+    }
+    pub(super) fn cursor_attributes(&mut self, a: CursorApplied, p: u8) -> [(u64, u32, u32); 9] {
         let l = self.layout;
-        let p = a.pipe;
         [
             (l.hubp(p, ADDRESS_HIGH), 0xffff, (a.address >> 32) as u32),
             (l.hubp(p, ADDRESS), u32::MAX, a.address as u32),
@@ -172,35 +225,55 @@ impl<I: Io> Engine<I> {
             (self.cm(pipe, CM_CONTROL), ENABLE, en),
         ]
     }
-    pub(super) fn program_cursor(&mut self, a: CursorApplied, at: Placement) -> Result<(), Error> {
-        let attributes = self.cursor_attributes(a);
-        let position = self.cursor_position(a.pipe, at);
+    pub(super) fn program_cursor(
+        &mut self,
+        a: CursorApplied,
+        segments: &[(u8, Placement)],
+    ) -> Result<(), Error> {
+        let mut writes = alloc::vec::Vec::new();
+        for &(p, at) in segments {
+            writes.extend(self.cursor_attributes(a, p));
+            writes.extend(self.cursor_position(p, at));
+        }
         self.cursor_locked(a.pipe, |e| {
-            for (at, mask, value) in attributes.into_iter().chain(position) {
+            for (at, mask, value) in writes {
                 e.update(at, mask, value)?;
             }
             Ok(())
         })
     }
-    pub(super) fn verify_cursor(&mut self, a: CursorApplied, at: Placement) -> Result<(), Error> {
-        let attributes = self.cursor_attributes(a);
-        let position = self.cursor_position(a.pipe, at);
-        for (at, mask, value) in attributes.into_iter().chain(position) {
-            if self.read(at)? & mask != value {
-                return Err(Error::Readback(at));
+    pub(super) fn verify_cursor(
+        &mut self,
+        a: CursorApplied,
+        segments: &[(u8, Placement)],
+    ) -> Result<(), Error> {
+        for &(p, place) in segments {
+            let attributes = self.cursor_attributes(a, p);
+            let position = self.cursor_position(p, place);
+            for (at, mask, value) in attributes.into_iter().chain(position) {
+                if self.read(at)? & mask != value {
+                    return Err(Error::Readback(at));
+                }
             }
-        }
-        if self.read(self.cursor_lock_at(a.pipe))? & 1 != 0 {
-            return Err(Error::Busy);
+            if self.read(self.cursor_lock_at(p))? & 1 != 0 {
+                return Err(Error::Busy);
+            }
         }
         Ok(())
     }
-    /// Disable both cursor enables; used before the plane stops.
+    /// Disable both cursor enables on every pipe of the scanout; used
+    /// before the plane stops.
     pub(super) fn hide_cursor(&mut self, pipe: u8) -> Result<(), Error> {
-        let (hubp, cm) = (self.layout.hubp(pipe, CONTROL), self.cm(pipe, CM_CONTROL));
+        let at: alloc::vec::Vec<(u64, u64)> = self
+            .fetch_pipes(pipe)
+            .map(|p| (self.layout.hubp(p, CONTROL), self.cm(p, CM_CONTROL)))
+            .collect();
         self.cursor_locked(pipe, |e| {
-            e.update(hubp, ENABLE, 0)?;
-            e.update(cm, ENABLE, 0)
+            for (hubp, cm) in at {
+                e.update(hubp, ENABLE, 0)?;
+                e.update(cm, ENABLE, 0)?;
+            }
+            Ok(())
         })
     }
 }
@@ -272,6 +345,7 @@ impl Surfaces {
             x,
             y,
             visible: false,
+            shown: 0,
         };
         self.place_cursor(e, applied)
     }
@@ -293,24 +367,21 @@ impl Surfaces {
         e: &mut Engine<I>,
         a: CursorApplied,
     ) -> Result<CursorApplied, Error> {
-        let deadlines = e.status.deadlines.ok_or(Error::Invalid)?;
-        let timing = deadlines.plan.mode.timing;
-        let at = placement(
-            a.x,
-            a.y,
-            (a.width, a.height),
-            (timing.h_active, timing.v_active),
-            (deadlines.plan.soc.dchub_refclk_khz, timing.pixel_clock_khz),
-        );
+        let segments = e.cursor_segments(a)?;
+        let shown = segments
+            .iter()
+            .filter(|(_, at)| at.visible)
+            .fold(0, |m, &(p, _)| m | bit(p));
         let a = CursorApplied {
-            visible: at.visible,
+            visible: shown != 0,
+            shown,
             ..a
         };
         e.status.state = State::Cursor(a.pipe);
         e.status.cursor = None;
         match e
-            .program_cursor(a, at)
-            .and_then(|()| e.verify_cursor(a, at))
+            .program_cursor(a, &segments)
+            .and_then(|()| e.verify_cursor(a, &segments))
         {
             Ok(()) => {
                 e.status.cursor = Some(a);

@@ -1,5 +1,7 @@
 //! Native DCN401 Display Stream Compression on a pipe's own DSC (DSC n on
-//! OPP n, no ODM), as Linux's link_set_dsc_on_stream drives it for DP SST:
+//! OPP n; with ODM 2:1 each segment's OPP feeds its own DSC, which
+//! compresses half the line with half the slices), as Linux's
+//! link_set_dsc_on_stream drives it for DP SST:
 //! the DSC power domain (dcn32_dsc_pg_control), dsc_write_to_registers,
 //! dsc401_enable from the OPP, then optc2/3_set_dsc_config. Stop is the
 //! reverse: OPTC DSC off, dsc401_disconnect and dsc401_disable, the domain
@@ -38,17 +40,49 @@ pub(super) fn dsc_timing(t: &Timing) -> DscTiming {
     }
 }
 
-/// dsc401_validate_stream plus this owner's shape: one DSC (at most four
-/// slices) on an 8-bit RGB 8b/10b DP stream.
+/// dsc401_validate_stream plus this owner's shape: one DSC per ODM segment
+/// (at most four slices each, the slices split evenly) on an 8-bit RGB
+/// 8b/10b DP stream. These are the whole picture's registers: the PPS the
+/// sink receives and the OPTC's bytes per pixel and slice width.
 pub(super) fn dsc_registers(request: &Request, cfg: &DscConfig) -> Result<DscRegisters, Error> {
+    let segments = if request.odm.is_some() { 2 } else { 1 };
     if request.signal != Signal::DisplayPort
         || request.ycbcr420
-        || cfg.slices_h > 4
-        || request.timing.h_active > MAX_IMAGE_WIDTH
+        || cfg.slices_h % segments != 0
+        || cfg.slices_h > 4 * segments
+        || request.timing.h_active > MAX_IMAGE_WIDTH * segments
     {
         return Err(Error::Unsupported);
     }
     amdgpu_dsc::prepare(&dsc_timing(&request.timing), cfg).ok_or(Error::Invalid)
+}
+
+/// One segment DSC's registers: Linux's dsc_cfg with pic_width and
+/// num_slices_h divided by the ODM segment count (the whole picture's
+/// without ODM).
+fn segment_registers(request: &Request, cfg: &DscConfig) -> Result<DscRegisters, Error> {
+    let full = dsc_registers(request, cfg)?;
+    if request.odm.is_none() {
+        return Ok(full);
+    }
+    let t = request.timing;
+    let half = Timing {
+        pixel_clock_khz: t.pixel_clock_khz / 2,
+        h_active: t.h_active / 2,
+        h_total: t.h_total / 2,
+        ..t
+    };
+    let cfg = DscConfig {
+        slices_h: cfg.slices_h / 2,
+        ..*cfg
+    };
+    let segment = amdgpu_dsc::prepare(&dsc_timing(&half), &cfg).ok_or(Error::Invalid)?;
+    // Both halves slice the line identically, so the OPTC sees one slice
+    // width and byte rate either way.
+    if segment.slice_width != full.slice_width || segment.bytes_per_pixel != full.bytes_per_pixel {
+        return Err(Error::Invalid);
+    }
+    Ok(segment)
 }
 
 /// dsc_write_to_registers' values for DSC registers 0x00..0x28 (offset,
@@ -189,23 +223,28 @@ impl<I: Io> Engine<I> {
         cfg: &DscConfig,
     ) -> Result<(), Error> {
         let regs = dsc_registers(request, cfg)?;
+        let segment = segment_registers(request, cfg)?;
         let pipe = request.pipe;
-        self.dsc_idle(pipe)?;
-        if !self.dsc_powered(pipe)? {
-            self.dsc_power(pipe, true).await?;
-        }
-        for (reg, value) in dsc_values(&regs) {
-            let at = self.dsc_at(pipe, reg);
-            self.access(|io| {
-                io.write(at, value);
-                Ok(())
-            })?;
-            if self.read(at)? != value {
-                return Err(Error::Readback(at));
+        // Each segment's DSC from its own OPP, the left one (this pipe's)
+        // first, as dcn401_add_dsc_sequence_for_odm_change orders them.
+        for dsc in core::iter::once(pipe).chain(request.odm) {
+            self.dsc_idle(dsc)?;
+            if !self.dsc_powered(dsc)? {
+                self.dsc_power(dsc, true).await?;
             }
+            for (reg, value) in dsc_values(&segment) {
+                let at = self.dsc_at(dsc, reg);
+                self.access(|io| {
+                    io.write(at, value);
+                    Ok(())
+                })?;
+                if self.read(at)? != value {
+                    return Err(Error::Readback(at));
+                }
+            }
+            self.update(self.dsc_at(dsc, TOP_CONTROL), 1, 1)?;
+            self.update(self.dsc_forward_at(dsc), 0x71, 1 | u32::from(dsc) << 4)?;
         }
-        self.update(self.dsc_at(pipe, TOP_CONTROL), 1, 1)?;
-        self.update(self.dsc_forward_at(pipe), 0x71, 1 | u32::from(pipe) << 4)?;
         let l = self.layout;
         self.update(l.odm(pipe, FORMAT), 0x30, 1 << 4)?; // OPTC_DSC_ENABLED_444
         let bytes = l.odm(pipe, BYTES_PER_PIXEL);
@@ -227,17 +266,26 @@ impl<I: Io> Engine<I> {
     /// The running DSC as programmed for `request`.
     pub(super) fn dsc_running(&mut self, request: &Request, cfg: &DscConfig) -> Result<(), Error> {
         let regs = dsc_registers(request, cfg)?;
+        let segment = segment_registers(request, cfg)?;
         let pipe = request.pipe;
-        for (reg, value) in dsc_values(&regs) {
-            let at = self.dsc_at(pipe, reg);
-            if self.read(at)? != value {
-                return Err(Error::Readback(at));
+        for dsc in core::iter::once(pipe).chain(request.odm) {
+            for (reg, value) in dsc_values(&segment) {
+                let at = self.dsc_at(dsc, reg);
+                if self.read(at)? != value {
+                    return Err(Error::Readback(at));
+                }
+            }
+            for (at, mask, value) in [
+                (self.dsc_at(dsc, TOP_CONTROL), 1, 1),
+                (self.dsc_forward_at(dsc), 0x71, 1 | u32::from(dsc) << 4),
+            ] {
+                if self.read(at)? & mask != value {
+                    return Err(Error::Readback(at));
+                }
             }
         }
         let l = self.layout;
         for (at, mask, value) in [
-            (self.dsc_at(pipe, TOP_CONTROL), 1, 1),
-            (self.dsc_forward_at(pipe), 0x71, 1 | u32::from(pipe) << 4),
             (l.odm(pipe, FORMAT), 0x30, 0x10),
             (
                 l.odm(pipe, BYTES_PER_PIXEL),

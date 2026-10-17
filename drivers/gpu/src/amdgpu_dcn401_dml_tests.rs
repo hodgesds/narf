@@ -123,9 +123,10 @@ fn error_name(e: Error) -> &'static str {
         Error::Bandwidth => "Bandwidth",
         Error::TempRead => "TempRead",
         Error::Register => "Register",
+        Error::Pipes => "Pipes",
     }
 }
-fn parse(words: &mut core::str::SplitWhitespace<'_>, out: &mut [u32]) -> bool {
+fn parse<'a>(words: &mut impl Iterator<Item = &'a str>, out: &mut [u32]) -> bool {
     for slot in out.iter_mut() {
         match words.next().and_then(|w| w.parse().ok()) {
             Some(v) => *slot = v,
@@ -133,6 +134,27 @@ fn parse(words: &mut core::str::SplitWhitespace<'_>, out: &mut [u32]) -> bool {
         }
     }
     true
+}
+/// A plane's values end with "/2 <refcyc_h_blank_end>" when DML puts it on
+/// two ODM pipes (check.sh has verified the second pipe's other registers
+/// equal the first's); otherwise the plan must be single-pipe.
+fn pipes_match<'a, I: Iterator<Item = &'a str>>(
+    words: &mut core::iter::Peekable<I>,
+    plan: &Plan,
+) -> bool {
+    if words.next_if_eq(&"/2").is_none() {
+        return plan.pipes == 1 && plan.odm_refcyc_h_blank_end == 0 && plan.pipe_dlg(1).is_none();
+    }
+    let mut end = [0u32; 1];
+    parse(words, &mut end)
+        && plan.pipes == 2
+        && plan.odm_refcyc_h_blank_end == end[0]
+        && plan.pipe_dlg(1)
+            == Some(Dlg {
+                refcyc_h_blank_end: end[0],
+                ..plan.dlg
+            })
+        && plan.pipe_dlg(2).is_none()
 }
 fn reference_1080p() -> (Soc, Mode) {
     inputs(&[
@@ -147,7 +169,7 @@ fn dcn401_dml_matches_linux_dml21_vectors() -> TestResult {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let mut words = line.split_whitespace();
+        let mut words = line.split_whitespace().peekable();
         let mut f = [0u32; 19];
         if !parse(&mut words, &mut f) {
             return TestResult::Fail("malformed vector inputs");
@@ -157,12 +179,15 @@ fn dcn401_dml_matches_linux_dml21_vectors() -> TestResult {
         match words.next() {
             Some("=") => {
                 let mut want = [0u32; 62];
-                if !parse(&mut words, &mut want) || words.next().is_some() {
+                if !parse(&mut words, &mut want) {
                     return TestResult::Fail("malformed vector plan");
                 }
                 let Ok(plan) = result else {
                     return TestResult::Fail("Linux-admitted mode rejected");
                 };
+                if !pipes_match(&mut words, &plan) || words.next().is_some() {
+                    return TestResult::Fail("ODM pipes differ from Linux DML21");
+                }
                 for (i, (&got, &want)) in values(&plan).iter().zip(want.iter()).enumerate() {
                     if got != want && !(TOLERATED.contains(&i) && got.abs_diff(want) == 1) {
                         return TestResult::Fail("plan value differs from Linux DML21");
@@ -294,11 +319,17 @@ fn dcn401_dml_rejects_invalid_and_unmodeled_inputs() -> TestResult {
     if admit(&slow_fabric, &mode) != Err(Error::ClockState) {
         return TestResult::Fail("pruned clock state admitted");
     }
-    // Downspread limits: a pixel clock at the raw maximum is too fast.
+    // Downspread limits: a pixel clock at the raw maximum is too fast for
+    // one pipe, so DML splits it across two.
     let mut fast = mode;
     fast.timing.pixel_clock_khz = soc.dispclk_max_khz;
-    if admit(&soc, &fast) != Err(Error::PixelClock) {
+    if admit(&soc, &fast).map(|p| p.pipes) != Ok(2) {
         return TestResult::Fail("downspread margin ignored");
+    }
+    // Past four pipes' worth of DISPCLK no ODM split can carry it.
+    fast.timing.pixel_clock_khz = 4 * soc.dispclk_max_khz;
+    if admit(&soc, &fast) != Err(Error::PixelClock) {
+        return TestResult::Fail("over-fast pixel clock admitted");
     }
     // Wider than the DCN4 linear swath limit.
     let mut wide = mode;
@@ -323,21 +354,26 @@ const MULTI_VECTORS: &str = include_str!("../tests/dcn401_dml21/multi_vectors.tx
 const YCBCR420_VECTORS: &str = include_str!("../tests/dcn401_dml21/ycbcr420_vectors.txt");
 
 /// Check `vectors` (multi_vectors.txt format) with every stream's 4:2:0
-/// output set to `ycbcr420`; the plan and rejection counts seen.
-fn check_multi_vectors(vectors: &str, ycbcr420: bool) -> Result<(u32, u32), &'static str> {
+/// output set to `ycbcr420`; the plan, rejection and ODM 2:1 plan counts
+/// seen (the last counts configurations with a two-pipe stream).
+fn check_multi_vectors(vectors: &str, ycbcr420: bool) -> Result<(u32, u32, u32), &'static str> {
     check_vectors(vectors, ycbcr420, false)
 }
 
 /// As `check_multi_vectors`; with `dsc` each line starts with the slice
 /// count and compressed bpp every stream takes, and "! REJECT" asks only
 /// that the configuration is rejected.
-fn check_vectors(vectors: &str, ycbcr420: bool, dsc: bool) -> Result<(u32, u32), &'static str> {
-    let (mut plans, mut rejects) = (0, 0);
+fn check_vectors(
+    vectors: &str,
+    ycbcr420: bool,
+    dsc: bool,
+) -> Result<(u32, u32, u32), &'static str> {
+    let (mut plans, mut rejects, mut odm) = (0, 0, 0);
     for line in vectors.lines() {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let mut words = line.split_whitespace();
+        let mut words = line.split_whitespace().peekable();
         let mut d = [0u32; 2];
         if dsc && !parse(&mut words, &mut d) {
             return Err("malformed DSC vector");
@@ -387,6 +423,9 @@ fn check_vectors(vectors: &str, ycbcr420: bool, dsc: bool) -> Result<(u32, u32),
                             return Err("joint plan value differs from Linux DML21");
                         }
                     }
+                    if !pipes_match(&mut words, plan) {
+                        return Err("joint plan ODM pipes differ from Linux DML21");
+                    }
                     if !plan.readmits() || plan.mode != modes[k] || usize::from(plan.stream) != k {
                         return Err("joint plan not reproducible or not bound");
                     }
@@ -395,6 +434,7 @@ fn check_vectors(vectors: &str, ycbcr420: bool, dsc: bool) -> Result<(u32, u32),
                     return Err("joint plan count");
                 }
                 plans += 1;
+                odm += u32::from(got.iter().any(|p| p.pipes == 2));
             }
             Some("!") => {
                 let (Some(name), Err(e)) = (words.next(), result) else {
@@ -408,12 +448,12 @@ fn check_vectors(vectors: &str, ycbcr420: bool, dsc: bool) -> Result<(u32, u32),
             _ => return Err("malformed multi-stream vector kind"),
         }
     }
-    Ok((plans, rejects))
+    Ok((plans, rejects, odm))
 }
 
 fn dcn401_dml_matches_linux_dml21_multi_stream_vectors() -> TestResult {
     match check_multi_vectors(MULTI_VECTORS, false) {
-        Ok((plans, rejects)) if plans >= 150 && rejects >= 20 => TestResult::Pass,
+        Ok((plans, rejects, _)) if plans >= 200 && rejects >= 15 => TestResult::Pass,
         Ok(_) => TestResult::Fail("multi-stream vector file lost coverage"),
         Err(e) => TestResult::Fail(e),
     }
@@ -424,10 +464,10 @@ kernel_test_in!(
 );
 
 /// HDMI YCbCr 4:2:0 outputs: one more line after the scaler, and at most
-/// 4096 even pixels per line without ODM, as DML21 plans them.
+/// 4096 even pixels per line per pipe, as DML21 plans them.
 fn dcn401_dml_matches_linux_dml21_ycbcr420_vectors() -> TestResult {
     match check_multi_vectors(YCBCR420_VECTORS, true) {
-        Ok((plans, rejects)) if plans >= 40 && rejects >= 8 => TestResult::Pass,
+        Ok((plans, rejects, _)) if plans >= 50 && rejects >= 3 => TestResult::Pass,
         Ok(_) => TestResult::Fail("4:2:0 vector file lost coverage"),
         Err(e) => TestResult::Fail(e),
     }
@@ -440,12 +480,12 @@ kernel_test_in!(
 /// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, DSC).
 const DSC_VECTORS: &str = include_str!("../tests/dcn401_dml21/dsc_vectors.txt");
 
-/// DSC streams as DC passes them to DML21: one DSC in ODM bypass (at most
-/// four slices dividing at most 5760 pixels, DSCCLK a third of the pixel
-/// clock), and DSCDelayRequirement after the scaler.
+/// DSC streams as DC passes them to DML21: one DSC per ODM pipe (at most
+/// four slices dividing at most 5760 pixels each, DSCCLK a third of the
+/// pipe's pixels), and DSCDelayRequirement after the scaler.
 fn dcn401_dml_matches_linux_dml21_dsc_vectors() -> TestResult {
     match check_vectors(DSC_VECTORS, false, true) {
-        Ok((plans, rejects)) if plans >= 200 && rejects >= 100 => TestResult::Pass,
+        Ok((plans, rejects, _)) if plans >= 250 && rejects >= 90 => TestResult::Pass,
         Ok(_) => TestResult::Fail("DSC vector file lost coverage"),
         Err(e) => TestResult::Fail(e),
     }
@@ -453,6 +493,178 @@ fn dcn401_dml_matches_linux_dml21_dsc_vectors() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-dml",
     dcn401_dml_matches_linux_dml21_dsc_vectors
+);
+
+/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c).
+const ODM_VECTORS: &str = include_str!("../tests/dcn401_dml21/odm_vectors.txt");
+/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, DSC).
+const ODM_DSC_VECTORS: &str = include_str!("../tests/dcn401_dml21/odm_dsc_vectors.txt");
+/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, FMT420).
+const ODM_YCBCR420_VECTORS: &str = include_str!("../tests/dcn401_dml21/odm_ycbcr420_vectors.txt");
+
+/// ODM 2:1 as DML21's auto policy chooses it: pixel clocks past one pipe's
+/// DISPCLK alone and beside other streams, every pipe's values as Linux
+/// programs them, wider splits and a fifth pipe rejected.
+fn dcn401_dml_matches_linux_dml21_odm_vectors() -> TestResult {
+    match check_vectors(ODM_VECTORS, false, false) {
+        Ok((plans, rejects, odm)) if plans >= 300 && rejects >= 150 && odm >= 150 => {
+            TestResult::Pass
+        }
+        Ok(_) => TestResult::Fail("ODM vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_odm_vectors
+);
+
+/// DSC lines wider than one DSC or with more than four slices, on two pipes.
+fn dcn401_dml_matches_linux_dml21_odm_dsc_vectors() -> TestResult {
+    match check_vectors(ODM_DSC_VECTORS, false, true) {
+        Ok((plans, rejects, odm)) if plans >= 180 && rejects >= 150 && odm >= 150 => {
+            TestResult::Pass
+        }
+        Ok(_) => TestResult::Fail("ODM DSC vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_odm_dsc_vectors
+);
+
+/// 4:2:0 lines wider than one formatter buffer, on two pipes.
+fn dcn401_dml_matches_linux_dml21_odm_ycbcr420_vectors() -> TestResult {
+    match check_vectors(ODM_YCBCR420_VECTORS, true, false) {
+        Ok((plans, rejects, odm)) if plans >= 100 && rejects >= 20 && odm >= 90 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("ODM 4:2:0 vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_odm_ycbcr420_vectors
+);
+
+fn timing(
+    pixel_clock_khz: u32,
+    h_active: u32,
+    h_total: u32,
+    v_active: u32,
+    v_total: u32,
+) -> Timing {
+    Timing {
+        pixel_clock_khz,
+        h_active,
+        h_total,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active,
+        v_total,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    }
+}
+
+fn dcn401_dml_odm_combine_follows_dml_policy() -> TestResult {
+    let (soc, hd) = reference_1080p();
+    // DML's max_dispclk_freq_mhz: 2 GHz less 0.38% downspread.
+    let ss = 1_992_428;
+    let mut uhd = hd;
+    uhd.timing = timing(ss, 3840, 4000, 2160, 2310);
+    uhd.pitch = 3840;
+    // At the downspread maximum one pipe suffices; one kHz more needs two.
+    if admit(&soc, &uhd).map(|p| p.pipes) != Ok(1) {
+        return TestResult::Fail("ODM chosen below the DISPCLK maximum");
+    }
+    uhd.timing.pixel_clock_khz = ss + 1;
+    if admit(&soc, &uhd).map(|p| p.pipes) != Ok(2) {
+        return TestResult::Fail("ODM 2:1 not chosen above the DISPCLK maximum");
+    }
+    // 2160p240: each pipe fetches half the line at half the pixel clock.
+    uhd.timing.pixel_clock_khz = 2_217_600;
+    let Ok(p) = admit(&soc, &uhd) else {
+        return TestResult::Fail("2160p240 rejected");
+    };
+    let half = uhd.timing.pixel_clock_khz / 2;
+    if p.pipes != 2
+        || p.clocks.dispclk_khz < half
+        || p.clocks.dppclk_khz < half
+        || p.clocks.dppclk_khz >= uhd.timing.pixel_clock_khz
+        || p.det_bytes != DET_KBYTES * 1024
+    {
+        return TestResult::Fail("ODM 2:1 clocks or DET");
+    }
+    // The second pipe's blank ends half a line later; nothing else differs.
+    let end = (uhd.timing.h_blank_end() + 1920) * 50_000 / uhd.timing.pixel_clock_khz;
+    match (p.pipe_dlg(0), p.pipe_dlg(1), p.pipe_dlg(2)) {
+        (Some(a), Some(b), None)
+            if a == p.dlg
+                && b.refcyc_h_blank_end == end
+                && b == (Dlg {
+                    refcyc_h_blank_end: end,
+                    ..a
+                }) => {}
+        _ => return TestResult::Fail("second ODM pipe's DLG"),
+    }
+    // Past two pipes' DISPCLK DML would split 3:1, which is not admitted.
+    uhd.timing.pixel_clock_khz = 2 * ss + 1;
+    if admit(&soc, &uhd) != Err(Error::Unsupported) {
+        return TestResult::Fail("3:1 split admitted");
+    }
+    uhd.timing.pixel_clock_khz = 2_217_600;
+    // Four pipes in all: two ODM streams, or one beside two single pipes.
+    let pipes = |modes: &[Mode]| -> Result<Vec<u8>, Error> {
+        Ok(admit_all(&soc, modes)?.iter().map(|p| p.pipes).collect())
+    };
+    if pipes(&[uhd, hd, hd]) != Ok(alloc::vec![2, 1, 1])
+        || pipes(&[hd, uhd]) != Ok(alloc::vec![1, 2])
+    {
+        return TestResult::Fail("ODM stream beside single-pipe streams");
+    }
+    if pipes(&[uhd, hd, hd, hd]) != Err(Error::Pipes) || pipes(&[uhd, uhd, hd]) != Err(Error::Pipes)
+    {
+        return TestResult::Fail("fifth pipe admitted");
+    }
+    // ODM needs an even split of the line.
+    let mut odd = uhd;
+    odd.timing.h_active = 3839;
+    if admit(&soc, &odd) != Err(Error::Unsupported) {
+        return TestResult::Fail("odd line split across two pipes");
+    }
+    // DSC: more than four slices need a second DSC, so a second pipe, even
+    // at a pixel clock one pipe carries; the slices must split evenly.
+    let mut dsc = uhd;
+    dsc.timing = timing(533_250, 3840, 4000, 2160, 2222);
+    dsc.dsc = Some(Dsc {
+        slices: 8,
+        bpp_x16: 128,
+    });
+    if admit(&soc, &dsc).map(|p| p.pipes) != Ok(2) {
+        return TestResult::Fail("eight DSC slices on one pipe");
+    }
+    dsc.dsc = Some(Dsc {
+        slices: 6,
+        bpp_x16: 128,
+    });
+    if admit(&soc, &dsc).map(|p| p.pipes) != Ok(2) {
+        return TestResult::Fail("six DSC slices on one pipe");
+    }
+    dsc.dsc = Some(Dsc {
+        slices: 5,
+        bpp_x16: 128,
+    });
+    if admit(&soc, &dsc).is_ok() {
+        return TestResult::Fail("odd DSC slices split across two pipes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_odm_combine_follows_dml_policy
 );
 
 fn dcn401_dml_joint_plans_share_global_state() -> TestResult {

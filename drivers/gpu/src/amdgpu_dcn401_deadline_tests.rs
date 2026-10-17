@@ -52,6 +52,7 @@ fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Appli
             width: 1920,
             height: 1080,
             format: SurfaceFormat::Xrgb8888,
+            odm: None,
         },
         address: 0x8_0000_0000,
         pitch_bytes: 7680,
@@ -64,6 +65,7 @@ fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Appli
         signal: Signal::DisplayPort,
         ycbcr420: false,
         dsc: None,
+        odm: None,
     };
     let requestor = RequestorApplied {
         pipe,

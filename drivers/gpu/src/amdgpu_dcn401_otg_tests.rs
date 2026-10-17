@@ -397,6 +397,7 @@ fn request(pipe: u8) -> Request {
         signal: Signal::HpoDisplayPort,
         ycbcr420: false,
         dsc: None,
+        odm: None,
         timing: Timing {
             pixel_clock_khz: 148_500,
             h_active: 1920,
@@ -1446,4 +1447,183 @@ fn dcn401_dsc_follows_link_set_dsc_on_stream() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_dsc_follows_link_set_dsc_on_stream
+);
+
+/// ODM 2:1 (optc401_set_odm_combine): both OPPs as segments 0 and 1, the
+/// segment width, decide_odm_mem_bit_map's line memories and the halved
+/// horizontal timing; each OPP formats its half and blanks it at its own
+/// offset (dcn20_blank_pixel_data per slice); each segment's DSC
+/// compresses its half with half the slices, fed from its own OPP, under
+/// one OPTC DSC configuration. Retirement stops both DSCs. Odd horizontal
+/// timing, 4:2:0 halves of a split pixel pair, a self-combine and lines
+/// past two memories are refused. A 4:2:0 right half's OPP takes one extra
+/// left-edge pixel for its chroma filter.
+fn dcn401_odm_combines_two_opps_with_split_dsc() -> TestResult {
+    use crate::amdgpu_dsc::DscConfig;
+    let (pipe, odm) = (0u8, 3u8);
+    let mut req = Request {
+        signal: Signal::DisplayPort,
+        odm: Some(odm),
+        ..request(pipe)
+    };
+    req.timing = Timing {
+        pixel_clock_khz: 2_000_000,
+        h_active: 7680,
+        h_total: 7840,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: 4320,
+        v_total: 4400,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: false,
+    };
+    let cfg = DscConfig {
+        slices_h: 8,
+        slices_v: 4,
+        bpp_x16: 192,
+        block_pred: true,
+        linebuf_depth: 11,
+        version_minor: 2,
+        ycbcr422_simple: false,
+    };
+    req.dsc = Some(cfg);
+    // DISPCLK covers half the pixel clock: each segment's share.
+    let mut odm_clock = clock(req);
+    odm_clock.request.pixel = dccg::PixelClock::DisplayPort {
+        pixel_hz: 2_000_000_000,
+    };
+    odm_clock.global.display_khz = 1_000_000;
+    let mut e = engine();
+    for k in [0u64, 3] {
+        e.io.regs.insert(BASE + (0x89 + 2 * k) * 4, 1); // DSC domains gated
+    }
+    let mut bypass = odm_clock;
+    bypass.request.pipe = pipe;
+    if run(engine().prepare(
+        Request {
+            odm: None,
+            dsc: None,
+            ..req
+        },
+        bypass,
+    )) != Err(Error::Invalid)
+    {
+        return TestResult::Fail("one pipe at twice DISPCLK");
+    }
+    if let Err(err) = run(e.prepare(req, odm_clock)) {
+        panic!("ODM prepare: {err:?}");
+    }
+    let l = e.layout;
+    let r = |e: &Engine<Fake>, at: u64| e.io.regs.get(&at).copied().unwrap_or(0);
+    if r(&e, l.odm(pipe, SOURCE)) != 0xff30_0001
+        || r(&e, l.odm(pipe, WIDTH)) & 0x1fff != 3840
+        || r(&e, l.odm(pipe, MEMORY)) & 0xffff != 0xc3
+        || r(&e, l.otg(pipe, H_TIMING)) & 0x103 != 1
+    {
+        return TestResult::Fail("ODM source, segment width, memories and divide");
+    }
+    // Each half's DSC: 3840 wide, four slices of 960, from its own OPP.
+    let dsc = |e: &Engine<Fake>, k: u64, reg: u64| r(e, BASE + (0x3000 + k * 0x5c + reg) * 4);
+    for k in [0u64, 3] {
+        if dsc(&e, k, 0x14) & 0xffff != 3840
+            || dsc(&e, k, 0x15) & 0xffff != 960
+            || dsc(&e, k, 0xa) >> 4 & 3 != 3
+            || dsc(&e, k, 0) & 1 != 1
+            || r(&e, BASE + (0x1a64 + k) * 4) & 0x71 != (1 | (k as u32) << 4)
+        {
+            return TestResult::Fail("segment DSC");
+        }
+    }
+    if r(&e, l.odm(pipe, FORMAT)) & 0x30 != 0x10 || r(&e, l.odm(pipe, WIDTH)) >> 16 != 960 {
+        return TestResult::Fail("OPTC DSC configuration");
+    }
+    e.dsc_running(&req, &cfg).unwrap();
+    // Both OPPs blank their own half.
+    e.io.retiring = [false; 4];
+    e.io.writes.clear();
+    let a = run(e.prepare_blank(blank_request(pipe), odm_clock)).unwrap();
+    for (o, x) in [(pipe, 0u32), (odm, 3840)] {
+        let at = |reg: u64| BASE + (reg + 0x5a * u64::from(o)) * 4;
+        if r(&e, at(0x188c)) & 1 != 1
+            || r(&e, at(0x1856)) != (3840 << 16 | 4320)
+            || r(&e, at(0x185a)) != x
+            || r(&e, at(0x1854)) & 0x01ff_3171 != 0x1041
+        {
+            return TestResult::Fail("segment OPP blank");
+        }
+    }
+    e.verify_blank(a, req.plan().unwrap(), false).unwrap();
+    // Retirement turns both segment DSCs off.
+    e.io.retiring = [true; 4];
+    run(e.retire(pipe)).unwrap();
+    for k in [0u64, 3] {
+        if r(&e, BASE + (0x1a64 + k) * 4) & 1 != 0 || dsc(&e, k, 0) & 1 != 0 {
+            return TestResult::Fail("segment DSC retirement");
+        }
+    }
+    // One memory pair suffices to 4096 pixels.
+    let mut narrow = request(pipe);
+    narrow.odm = Some(odm);
+    narrow.timing.h_active = 3840;
+    narrow.timing.h_total = 4000;
+    let mut e = engine();
+    run(e.prepare(narrow, clock(narrow))).unwrap();
+    if r(&e, e.layout.odm(pipe, MEMORY)) & 0xffff != 0x41 {
+        return TestResult::Fail("two memories");
+    }
+    // 4:2:0 wider than one formatter: the right OPP filters across the seam.
+    let mut wide420 = narrow;
+    (wide420.signal, wide420.ycbcr420) = (Signal::Tmds, true);
+    (wide420.timing.h_active, wide420.timing.h_total) = (5120, 5500);
+    let mut e = engine();
+    run(e.prepare(wide420, clock(wide420))).unwrap();
+    e.io.retiring = [false; 4];
+    let blank420 = BlankRequest {
+        ycbcr420: true,
+        ..blank_request(pipe)
+    };
+    run(e.prepare_blank(blank420, clock(wide420))).unwrap();
+    let edge = |e: &Engine<Fake>, o: u8| r(e, BASE + (0x1849 + 0x5a * u64::from(o)) * 4) & 1;
+    if edge(&e, pipe) != 0 || edge(&e, odm) != 1 {
+        return TestResult::Fail("4:2:0 left edge pixel");
+    }
+    // Refusals, with no writes.
+    let mut odd = narrow;
+    odd.timing.h_sync_width = 33;
+    let mut wide = narrow;
+    (wide.timing.h_active, wide.timing.h_total) = (8320, 8500);
+    let mut ycbcr = narrow;
+    (ycbcr.signal, ycbcr.ycbcr420) = (Signal::Tmds, true);
+    ycbcr.timing.h_active = 3842; // segments of 1921: half a pixel pair
+    for (bad, want) in [
+        (odd, Error::Unsupported),
+        (wide, Error::Unsupported),
+        (ycbcr, Error::Unsupported),
+        (
+            Request {
+                odm: Some(pipe),
+                ..narrow
+            },
+            Error::Invalid,
+        ),
+        (
+            Request {
+                odm: Some(4),
+                ..narrow
+            },
+            Error::Invalid,
+        ),
+    ] {
+        let mut e = engine();
+        if run(e.prepare(bad, clock(bad))) != Err(want) || !e.io.writes.is_empty() {
+            return TestResult::Fail("refused ODM request");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_odm_combines_two_opps_with_split_dsc
 );

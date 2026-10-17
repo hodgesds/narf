@@ -820,6 +820,7 @@ fn dcn401_dp_audio_programs_dto1_secondary_packets_and_endpoint_like_linux() -> 
         .timing;
     let live = ScanoutRunning {
         pipe,
+        odm: None,
         stream,
         plan: dml::admit(
             &soc,

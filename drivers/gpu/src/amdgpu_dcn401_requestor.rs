@@ -32,7 +32,9 @@ fn allocation(det: u8) -> [u8; 5] {
     }
     sizes
 }
-fn requestor(pipe: u8) -> [(u64, u32, u32); 7] {
+/// One HUBP's requestor, its VTG the timing's own OTG `vtg` (an ODM
+/// pipe's HUBP follows the combined timing).
+fn requestor(vtg: u8) -> [(u64, u32, u32); 7] {
     [
         (0x66d, 0x7ff0, 0),  // packed RGB: no second plane in DET
         (0x620, 0xff, 0x56), // DRQ=2, CRQ/MRQ/PRQ=1
@@ -40,7 +42,7 @@ fn requestor(pipe: u8) -> [(u64, u32, u32); 7] {
         // 1 KiB minimum; no page-table groups for the physical FB aperture.
         (0x5f2, 0x07701f77, 0x1b00),
         (0x5f3, 0x00701f77, 0x1b00),
-        (HUBP_CONTROL, 0x4f0, u32::from(pipe) << 4), // VTG and bounded requests
+        (HUBP_CONTROL, 0x4f0, u32::from(vtg) << 4), // VTG and bounded requests
         (MALL, 0x1f, 8), // no MALL surface/cursor/prefetch; native command type
         (CURSOR, 4, 4),  // DCN4 mandates early cursor requests, even when disabled
     ]
@@ -98,12 +100,16 @@ impl<I: Io> Engine<I> {
     pub(super) fn requestor_errors(&mut self, pipe: u8) -> Result<(), Error> {
         self.requestor_faults(pipe, 0)
     }
-    /// Error/status bits of HUBP_CONTROL other than `tolerated`.
+    /// Error/status bits of HUBP_CONTROL other than `tolerated`, on every
+    /// HUBP `pipe`'s surface fetches on.
     fn requestor_faults(&mut self, pipe: u8, tolerated: u32) -> Result<(), Error> {
         // Keep error/status acknowledgements and timeout IRQ ownership out of
         // the setup RMWs. A pre-existing error requires explicit recovery.
-        if self.read(self.layout.hubp(pipe, HUBP_CONTROL))? & 0xfcf00800 & !tolerated != 0 {
-            return Err(Error::Busy);
+        let pipes: alloc::vec::Vec<u8> = self.fetch_pipes(pipe).collect();
+        for p in pipes {
+            if self.read(self.layout.hubp(p, HUBP_CONTROL))? & 0xfcf00800 & !tolerated != 0 {
+                return Err(Error::Busy);
+            }
         }
         Ok(())
     }
@@ -117,9 +123,9 @@ impl<I: Io> Engine<I> {
     pub(super) fn verify_live_requestor(&mut self, pipe: u8) -> Result<(), Error> {
         self.verify_requestor_with(pipe, HUBP_UNDERFLOW_STATUS)
     }
-    /// This pipe's DET with every other display's.
+    /// This pipe's DET (its ODM pipe's too) with every other display's.
     fn det_pipes(&self, pipe: u8) -> u8 {
-        bit(pipe) | self.displays.siblings.det
+        self.fetch_pipes(pipe).fold(0, |m, p| m | bit(p)) | self.displays.siblings.det
     }
     fn verify_requestor_with(&mut self, pipe: u8, tolerated: u32) -> Result<(), Error> {
         // This pipe's and every other display's DET must stand. A display
@@ -134,10 +140,13 @@ impl<I: Io> Engine<I> {
         if self.read(reserved)? & 0xfff != 256 {
             return Err(Error::Readback(reserved));
         }
-        for (r, mask, value) in requestor(pipe) {
-            let at = self.layout.hubp(pipe, r);
-            if self.read(at)? & mask != value {
-                return Err(Error::Readback(at));
+        let pipes: alloc::vec::Vec<u8> = self.fetch_pipes(pipe).collect();
+        for p in pipes {
+            for (r, mask, value) in requestor(pipe) {
+                let at = self.layout.hubp(p, r);
+                if self.read(at)? & mask != value {
+                    return Err(Error::Readback(at));
+                }
             }
         }
         self.requestor_faults(pipe, tolerated)
@@ -194,14 +203,16 @@ impl Surfaces {
             }
             // Native reservation is pixel_chunk_size / 32 units of 64 bytes.
             e.update(e.layout.base + 0x4c4 * 4, 0xfff, 256)?;
-            e.update(e.layout.hubp(pipe, HUBP_CLOCK), 1, 1)?;
-            e.wait(e.layout.hubp(pipe, HUBP_CONTROL), 0x1007, 3, 100_000)
-                .await?;
-            e.requestor_errors(pipe)?;
-            for (r, mask, value) in requestor(pipe) {
-                e.update(e.layout.hubp(pipe, r), mask, value)?;
+            for (p, _, _) in surface.request.segments() {
+                e.update(e.layout.hubp(p, HUBP_CLOCK), 1, 1)?;
+                e.wait(e.layout.hubp(p, HUBP_CONTROL), 0x1007, 3, 100_000)
+                    .await?;
+                e.requestor_errors(pipe)?;
+                for (r, mask, value) in requestor(pipe) {
+                    e.update(e.layout.hubp(p, r), mask, value)?;
+                }
+                e.update(e.layout.hubp(p, HUBP_CLOCK), 1, 0)?;
             }
-            e.update(e.layout.hubp(pipe, HUBP_CLOCK), 1, 0)?;
             if owners()? != current {
                 return Err(Error::Busy);
             }

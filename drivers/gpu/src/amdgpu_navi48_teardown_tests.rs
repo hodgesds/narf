@@ -98,6 +98,7 @@ fn cancel(f: impl Future) {
 fn request(protocol: Protocol) -> Request {
     Request {
         pipe: 1,
+        odm: None,
         port: 3,
         protocol,
         audio: true,

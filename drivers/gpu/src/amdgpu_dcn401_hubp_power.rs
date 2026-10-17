@@ -34,6 +34,20 @@ impl<I: Io> Engine<I> {
     // Only a caller retaining the selected staged address may tolerate its
     // pending flip. Blank/drain/clock/lock and unrelated pipes stay strict.
     pub(super) fn hubp_tree_stopped(&mut self, staged: Option<u8>) -> Result<(), Error> {
+        // A staged surface's ODM pipe holds the same pending address.
+        let mask = staged.map_or(0, |p| {
+            self.status
+                .surfaces
+                .get(usize::from(p))
+                .copied()
+                .flatten()
+                .map_or(bit(p), |a| bit(p) | a.request.pipe_mask())
+        });
+        self.hubp_tree_stopped_mask(mask)
+    }
+    /// As `hubp_tree_stopped`, tolerating the pending flip of every pipe in
+    /// `staged` (by bit).
+    pub(super) fn hubp_tree_stopped_mask(&mut self, staged: u8) -> Result<(), Error> {
         let l = self.layout;
         for (at, mask) in l.idle {
             if !self.sibling_register(at) && self.read(at)? & mask != 0 {
@@ -66,7 +80,7 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Busy);
             }
             if self.hubp_powered(p)? {
-                self.hubp_transactions_stopped(p, staged == Some(p))?;
+                self.hubp_transactions_stopped(p, staged & bit(p) != 0)?;
             }
         }
         self.fetchers_stopped()

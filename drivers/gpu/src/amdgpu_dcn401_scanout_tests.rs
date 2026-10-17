@@ -13,6 +13,8 @@ struct Hw {
     regs: BTreeMap<u64, u32>,
     layout: Layout,
     pipe: u8,
+    /// An ODM pipe latching with `pipe`'s timing.
+    odm: Option<u8>,
     grant: bool,
     latch: bool,
     underflow_after: Option<usize>,
@@ -26,8 +28,17 @@ impl Hw {
     fn get(&self, at: u64) -> u32 {
         self.regs.get(&at).copied().unwrap_or(0)
     }
+    fn pipes(&self) -> impl Iterator<Item = u8> {
+        core::iter::once(self.pipe).chain(self.odm)
+    }
     fn latch(&mut self) {
-        let (l, p) = (self.layout, self.pipe);
+        let pipes: alloc::vec::Vec<u8> = self.pipes().collect();
+        for p in pipes {
+            self.latch_pipe(p);
+        }
+    }
+    fn latch_pipe(&mut self, p: u8) {
+        let l = self.layout;
         let low = self.get(l.hubp(p, ADDRESS));
         let high = self.get(l.hubp(p, ADDRESS_HIGH));
         self.regs.insert(l.hubp(p, EARLIEST_INUSE), low);
@@ -75,17 +86,20 @@ impl Io for Hw {
                 }
             }
         }
-        if at == l.opp(p, DPG) {
-            self.regs.insert(l.opp(p, DPG_PENDING), 1);
-        }
-        if at == l.hubp(p, ADDRESS) {
-            *self.regs.entry(l.hubp(p, FLIP)).or_default() |= FLIP_PENDING;
-        }
-        if at == l.hubp(p, HUBP_CONTROL) && value & BLANK_EN != 0 {
-            value |= NO_OUTSTANDING;
-        }
-        if at == l.hubp(p, HUBP_CONTROL) && value & HUBP_UNDERFLOW_CLEAR != 0 {
-            value &= !(HUBP_UNDERFLOW | HUBP_UNDERFLOW_CLEAR);
+        let pipes: alloc::vec::Vec<u8> = self.pipes().collect();
+        for q in pipes {
+            if at == l.opp(q, DPG) {
+                self.regs.insert(l.opp(q, DPG_PENDING), 1);
+            }
+            if at == l.hubp(q, ADDRESS) {
+                *self.regs.entry(l.hubp(q, FLIP)).or_default() |= FLIP_PENDING;
+            }
+            if at == l.hubp(q, HUBP_CONTROL) && value & BLANK_EN != 0 {
+                value |= NO_OUTSTANDING;
+            }
+            if at == l.hubp(q, HUBP_CONTROL) && value & HUBP_UNDERFLOW_CLEAR != 0 {
+                value &= !(HUBP_UNDERFLOW | HUBP_UNDERFLOW_CLEAR);
+            }
         }
         if at == self.optc_input() && value & OPTC_UNDERFLOW_CLEAR != 0 {
             value &= !(OPTC_UNDERFLOW | OPTC_UNDERFLOW_CLEAR);
@@ -97,32 +111,38 @@ impl Io for Hw {
     }
 }
 fn staged(pipe: u8) -> Engine<Hw> {
+    staged_odm(pipe, None)
+}
+fn staged_odm(pipe: u8, odm: Option<u8>) -> Engine<Hw> {
     let e = engine();
     let l = e.layout;
     let mut hw = Hw {
         regs: BTreeMap::new(),
         layout: l,
         pipe,
+        odm,
         grant: true,
         latch: true,
         underflow_after: None,
         writes: 0,
         frame: 7,
     };
-    for (at, value) in [
-        (l.hubp(pipe, HUBP_CONTROL), 3 | u32::from(pipe) << 4),
-        (l.hubp(pipe, CURSOR), CURSOR_REQ_MODE),
-        (l.hubp(pipe, ADDRESS), ADDR as u32),
-        (l.hubp(pipe, ADDRESS_HIGH), (ADDR >> 32) as u32),
-        (l.opp(pipe, DPG), BLACK),
-        (l.mpcc(pipe, MPCC_CONTROL), 0xffff_0422),
-        (l.mpcc(pipe, MPC_STATUS), 5),
-        (l.otg(pipe, CONTROL), OTG_MASTER_EN),
-    ] {
-        hw.regs.insert(at, value);
-    }
-    for (at, _) in e.routes(pipe, false) {
-        hw.regs.insert(at, 0xf);
+    hw.regs.insert(l.otg(pipe, CONTROL), OTG_MASTER_EN);
+    for q in core::iter::once(pipe).chain(odm) {
+        for (at, value) in [
+            (l.hubp(q, HUBP_CONTROL), 3 | u32::from(pipe) << 4),
+            (l.hubp(q, CURSOR), CURSOR_REQ_MODE),
+            (l.hubp(q, ADDRESS), ADDR as u32),
+            (l.hubp(q, ADDRESS_HIGH), (ADDR >> 32) as u32),
+            (l.opp(q, DPG), BLACK),
+            (l.mpcc(q, MPCC_CONTROL), 0xffff_0422),
+            (l.mpcc(q, MPC_STATUS), 5),
+        ] {
+            hw.regs.insert(at, value);
+        }
+        for (at, _) in e.routes(q, false) {
+            hw.regs.insert(at, 0xf);
+        }
     }
     Engine {
         io: hw,
@@ -132,9 +152,84 @@ fn staged(pipe: u8) -> Engine<Hw> {
         displays: e.displays,
     }
 }
+/// ODM 2:1: one master lock covers both halves. Start connects each
+/// segment's MPCC to its own OPP, releases both DPGs and unblanks both
+/// HUBPs at one VUPDATE, and completes only once both report the surface
+/// in use; a flip re-addresses both; an underflow on the right half is the
+/// scanout's; stop returns both to staged black.
+fn dcn401_scanout_odm_drives_both_halves_under_one_lock() -> TestResult {
+    let (pipe, q) = (1u8, 3u8);
+    let mut e = staged_odm(pipe, Some(q));
+    let surface = SurfaceApplied {
+        request: SurfaceRequest {
+            pipe,
+            width: 7680,
+            height: 4320,
+            format: SurfaceFormat::Xrgb8888,
+            odm: Some(q),
+        },
+        address: ADDR,
+        pitch_bytes: 7680 * 4,
+        bytes: 7680 * 4 * 4320,
+    };
+    e.status.surfaces[usize::from(pipe)] = Some(surface);
+    let p = Pipe {
+        odm: Some(q),
+        ..target(pipe)
+    };
+    if run(e.start_fetch(p)).is_err() {
+        return TestResult::Fail("ODM start");
+    }
+    let l = e.layout;
+    for s in [pipe, q] {
+        if e.io.get(l.mpcc(s, TOP)) & 0xf != u32::from(s)
+            || e.io.get(l.mpcc(s, OPP_ID)) & 0xf != u32::from(s)
+            || e.io.get(l.out_mux(s)) & 0xf != u32::from(s)
+            || e.io.get(l.opp(s, DPG)) & DPG_FIELDS != 0
+            || e.io.get(l.hubp(s, HUBP_CONTROL)) & BLANK_EN != 0
+        {
+            return TestResult::Fail("segment routes and unblank");
+        }
+    }
+    if e.live_fetch(pipe, ADDR).is_err() {
+        return TestResult::Fail("both halves live");
+    }
+    // A flip re-addresses both halves under the one lock.
+    let back = ADDR + 0x0200_0000;
+    if run(e.flip_to(Pipe { address: back, ..p })).is_err()
+        || e.io.get(l.hubp(q, EARLIEST_INUSE)) != back as u32
+        || e.io.get(l.hubp(pipe, EARLIEST_INUSE)) != back as u32
+    {
+        return TestResult::Fail("ODM flip");
+    }
+    // The right half's underflow belongs to this scanout.
+    *e.io.regs.entry(l.hubp(q, HUBP_CONTROL)).or_default() |= 0x1000_0000;
+    if e.underflow(pipe) != Err(Error::Underflow(l.hubp(q, HUBP_CONTROL))) {
+        return TestResult::Fail("right half underflow");
+    }
+    *e.io.regs.entry(l.hubp(q, HUBP_CONTROL)).or_default() &= !0x1000_0000;
+    if run(e.stop_fetch(Pipe { address: back, ..p })).is_err() {
+        return TestResult::Fail("ODM stop");
+    }
+    for s in [pipe, q] {
+        if e.io.get(l.mpcc(s, TOP)) & 0xf != 0xf
+            || e.io.get(l.opp(s, DPG)) & DPG_FIELDS != BLACK
+            || e.io.get(l.hubp(s, HUBP_CONTROL)) & 3 != 3
+        {
+            return TestResult::Fail("segment back to staged black");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_odm_drives_both_halves_under_one_lock
+);
+
 fn target(pipe: u8) -> Pipe {
     Pipe {
         pipe,
+        odm: None,
         address: ADDR,
         black: BLACK,
         timeout_us: 2000,
@@ -434,9 +529,13 @@ fn dcn401_scanout_cursor_programs_under_its_lock_and_stops_with_fetch() -> TestR
             x: 11, // odd: X starts at bit 15, right after Y
             y: 20,
             visible: true,
+            shown: 1 << pipe,
         };
-        let at = super::cursor::placement(11, 20, (64, 48), (1920, 1080), (100_000, 148_500));
-        if e.program_cursor(a, at).is_err() || e.verify_cursor(a, at).is_err() {
+        let at = [(
+            pipe,
+            super::cursor::placement(11, 20, (64, 48), (1920, 1080), (100_000, 148_500)),
+        )];
+        if e.program_cursor(a, &at).is_err() || e.verify_cursor(a, &at).is_err() {
             return TestResult::Fail("program cursor");
         }
         let l = e.layout;

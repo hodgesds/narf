@@ -128,9 +128,11 @@ impl<I: Io> Engine<I> {
             }
         }
         if w.timing {
-            for (at, mask) in [(l.opp(p, 0x185b), 1), (l.opp(p, 0x1840), 0x1000000)] {
-                if self.read(at)? & mask != 0 {
-                    return Err(Error::Readback(at));
+            for o in w.frontend.blank.timing.request.plan()?.opps() {
+                for (at, mask) in [(l.opp(o, 0x185b), 1), (l.opp(o, 0x1840), 0x1000000)] {
+                    if self.read(at)? & mask != 0 {
+                        return Err(Error::Readback(at));
+                    }
                 }
             }
         }
@@ -439,11 +441,7 @@ impl<I: Io> Engine<I> {
             // After native master-off AND busy-off, restage the single OPP
             // route. No timing enable: the existing frontend owner can now
             // either restart black video or perform its normal link shutdown.
-            self.update(
-                self.layout.odm(frontend.request.pipe, SOURCE),
-                0xf0000,
-                u32::from(frontend.request.pipe) << 16,
-            )?;
+            self.restage_source(frontend.blank.timing.request)?;
             self.dp_video_fifo_ready(w)?;
             self.dp_frontend_settled(w.frontend, true)
         }

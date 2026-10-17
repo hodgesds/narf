@@ -775,6 +775,14 @@ cancellation. The final framebuffer handoff selects Navi48, blocks legacy
 controller/PM access after preparation and quarantines the primary framebuffer
 on incomplete startup. Read-only preparation failures restore CPU writers.
 
+A Navi48 stream too fast for one pipe (pixel clock above the DISPCLK
+maximum) or too wide for one DSC or 4:2:0 formatter now runs on two pipes as
+ODM 2:1: DML21 admission decides it as Linux's auto policy does (matched
+against Linux on new ODM, ODM+DSC and ODM 4:2:0 vector sets), the modeset
+gives it a free pipe, and the timing, both OPPs and DSCs, both HUBP/DPP/MPCC
+halves, deadlines, flips and the cursor are programmed across the pair
+(implementation and register models; no hardware run).
+
 Native 8b/10b DP MST now reaches the platform display monitor and KMS for one
 branch, beside every board port: KMS routes any connector (board port or end
 device) to any of the four CRTCs, as SETCRTC/atomic CRTC_ID set it or

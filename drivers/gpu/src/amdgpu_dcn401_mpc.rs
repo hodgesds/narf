@@ -84,18 +84,24 @@ impl Layout {
         ]
     }
     /// The composition registers, then for a converting stream the output
-    /// CSC load (after the bypass write of its mode, which it replaces).
+    /// CSC load (after the bypass write of its mode, which it replaces), for
+    /// every ODM segment's MPCC and OPP output in turn.
     fn mpc_rgb(self, a: MpcApplied) -> impl Iterator<Item = (u64, u32, u32)> {
-        let p = a.dpp.surface.request.pipe;
+        a.dpp
+            .surface
+            .request
+            .segments()
+            .flat_map(move |(p, _, _)| self.mpc_segment(a, p))
+    }
+    fn mpc_segment(self, a: MpcApplied, p: u8) -> impl Iterator<Item = (u64, u32, u32)> {
         let load = Self::ocsc_matrix(&a).map(|m| self.ocsc_load(p, m));
         let converting = load.is_some();
-        self.mpc_full(a)
+        self.mpc_full(a, p)
             .into_iter()
             .filter(move |&(at, _, _)| !(converting && at == self.ocsc(p)))
             .chain(load.into_iter().flatten())
     }
-    fn mpc_full(self, a: MpcApplied) -> [(u64, u32, u32); 20] {
-        let p = a.dpp.surface.request.pipe;
+    fn mpc_full(self, a: MpcApplied, p: u8) -> [(u64, u32, u32); 20] {
         let denorm = match a.depth {
             ColorDepth::Bpc8 => 2,
             ColorDepth::Bpc10 => 4,
@@ -138,17 +144,14 @@ impl<I: Io> Engine<I> {
             }
         }
         let mut pending = 0;
-        for (bit, (at, mask)) in self
-            .layout
-            .mpc_bypass(a.dpp.surface.request.pipe)
-            .into_iter()
-            .enumerate()
-        {
-            let ocsc = at == self.layout.ocsc(a.dpp.surface.request.pipe);
-            let converting = Layout::ocsc_matrix(&a).is_some();
-            let want = if ocsc && converting { 1 << 7 } else { 0 };
-            if self.read(at)? & mask != want {
-                pending |= 1 << bit;
+        for (p, _, _) in a.dpp.surface.request.segments() {
+            for (bit, (at, mask)) in self.layout.mpc_bypass(p).into_iter().enumerate() {
+                let ocsc = at == self.layout.ocsc(p);
+                let converting = Layout::ocsc_matrix(&a).is_some();
+                let want = if ocsc && converting { 1 << 7 } else { 0 };
+                if self.read(at)? & mask != want {
+                    pending |= 1 << bit;
+                }
             }
         }
         Ok(pending)

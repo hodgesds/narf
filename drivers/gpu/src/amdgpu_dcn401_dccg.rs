@@ -49,6 +49,9 @@ pub enum TmdsDivider {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelClock {
     Disabled,
+    /// The DPP clock of an ODM pipe: its DPP/DSC carry part of another
+    /// pipe's timing, so its own pixel DTO stays off and DTBCLK_P parked.
+    OdmSegment,
     DisplayPort {
         pixel_hz: u64,
     },
@@ -358,6 +361,9 @@ impl<I: Io> Engine<I> {
         ] {
             self.verify(index, mask, value)?;
         }
+        if plan.request.pixel == PixelClock::OdmSegment {
+            return self.verify(pixel, 0x1010, 0);
+        }
         if let PixelClock::Tmds { divider } = plan.request.pixel {
             self.verify(pixel, 0x1010, 0)?;
             let mask = 1 << (5 * pipe);
@@ -510,6 +516,9 @@ impl<I: Io> Engine<I> {
         let plan = self.retained_pipe(pipe, global)?;
         let pixel_hz = match plan.request.pixel {
             PixelClock::DisplayPort { pixel_hz } | PixelClock::HdmiFrl { pixel_hz } => pixel_hz,
+            // An ODM segment's DSC runs with its timing's, whose pixel
+            // clock needed combining in the first place.
+            PixelClock::OdmSegment => u64::MAX,
             _ => return Err(Error::Invalid),
         };
         if self.read(self.layout.reg(DSCCLK_CTRL))? & 1 << pipe != 0 {
@@ -645,7 +654,7 @@ impl<I: Io> Engine<I> {
                 self.update(pixel, 0x1010, 0)?;
                 self.tmds_divider(pipe, divider).await?;
             }
-            PixelClock::Disabled => {
+            PixelClock::Disabled | PixelClock::OdmSegment => {
                 self.update(pixel, 0x1010, 0)?;
                 // Park DTBCLK_P on REFCLK without changing its remembered mux.
                 self.update(DTB_P, 4 << (3 * pipe), 0)?;
@@ -729,6 +738,27 @@ impl Dccg {
             .pipe_clocks_except(regs, held)
             .map_err(Error::Clocks)?;
         self.0.current_pipe_except(pipe, global, held)
+    }
+    /// An ODM pipe's retained DPP-only clock, against the current global
+    /// clocks. Read-only.
+    pub(crate) fn segment_clock(
+        &mut self,
+        regs: MmioRegion,
+        clocks: &mut clocks::ClockManager,
+        pipe: u8,
+        held: &dyn Fn(u64) -> bool,
+    ) -> Result<Applied, Error> {
+        if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
+            return Err(Error::Invalid);
+        }
+        let global = clocks
+            .pipe_clocks_except(regs, held)
+            .map_err(Error::Clocks)?;
+        let plan = self.0.retained_pipe(pipe, global)?;
+        if plan.request.pixel != PixelClock::OdmSegment {
+            return Err(Error::Invalid);
+        }
+        Ok(plan)
     }
     /// Read-only clock validation while the matching display owner retains a
     /// live PHY/frontend. All programming paths still require idle consumers.

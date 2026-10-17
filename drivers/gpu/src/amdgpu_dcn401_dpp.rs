@@ -44,8 +44,10 @@ fn line_buffer(width: u32) -> Result<u8, Error> {
     }
     Err(Error::Unsupported)
 }
-fn registers(a: DppApplied) -> [(u64, u32, u32); 29] {
-    let dimensions = a.surface.request.width | a.surface.request.height << 16;
+/// One ODM segment's DPP (the whole line without ODM): recout and MPC
+/// size cover the segment's columns.
+fn registers(a: DppApplied, width: u32) -> [(u64, u32, u32); 29] {
+    let dimensions = width | a.surface.request.height << 16;
     [
         (FORMAT_CONTROL, 0x3f033111, 0x24000101), // RGB crossbar; EXPANSION_MODE_ZERO = 1
         (0xccf, 0x17f, 8),                        // RGB8888, no separate alpha plane
@@ -116,7 +118,17 @@ impl<I: Io> Engine<I> {
         Ok(pending)
     }
     async fn program_dpp(&mut self, applied: DppApplied) -> Result<(), Error> {
-        let p = applied.surface.request.pipe;
+        for (p, _, width) in applied.surface.request.segments() {
+            self.program_segment_dpp(applied, p, width).await?;
+        }
+        Ok(())
+    }
+    async fn program_segment_dpp(
+        &mut self,
+        applied: DppApplied,
+        p: u8,
+        width: u32,
+    ) -> Result<(), Error> {
         let l = self.layout;
         self.update(l.dpp(p, DPP_CLOCK), 0x10, 0x10)?;
         // Wake native scaler LUT and iSHARP RAM before their programming,
@@ -129,7 +141,7 @@ impl<I: Io> Engine<I> {
         self.wait(l.dpp(p, ISHARP_POWER), 0x30, 0, 1000).await?;
         self.hubp_tree_stopped(Some(p))?;
         self.dpp_stopped(p, true)?;
-        for (r, mask, value) in registers(applied) {
+        for (r, mask, value) in registers(applied, width) {
             self.update(l.dpp(p, r), mask, value)?;
         }
         // Native iSHARP off: leave LUT bank selection alone; no coefficient RAM
@@ -139,20 +151,29 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     pub(super) fn verify_dpp(&mut self, applied: DppApplied) -> Result<(), Error> {
-        let p = applied.surface.request.pipe;
-        self.dpp_stopped(p, false)?;
-        for (r, mask, value) in registers(applied).into_iter().chain([
-            (SCALER_POWER, 7, 4),
-            (SCALER_STATUS, 3, 0),
-            (ISHARP_POWER, 0x37, 4),
-            (0xd55, 0x0ffffa71, 0),
-        ]) {
-            let at = self.layout.dpp(p, r);
-            if self.read(at)? & mask != value {
-                return Err(Error::Readback(at));
+        for (p, _, width) in applied.surface.request.segments() {
+            self.dpp_stopped(p, false)?;
+            for (r, mask, value) in registers(applied, width).into_iter().chain([
+                (SCALER_POWER, 7, 4),
+                (SCALER_STATUS, 3, 0),
+                (ISHARP_POWER, 0x37, 4),
+                (0xd55, 0x0ffffa71, 0),
+            ]) {
+                let at = self.layout.dpp(p, r);
+                if self.read(at)? & mask != value {
+                    return Err(Error::Readback(at));
+                }
             }
         }
         Ok(())
+    }
+    /// Every segment DPP's pending bits, ORed.
+    fn segment_dpp_pending(&mut self, surface: SurfaceRequest) -> Result<u8, Error> {
+        let mut pending = 0;
+        for (p, _, _) in surface.segments() {
+            pending |= self.dpp_pending(p)?;
+        }
+        Ok(pending)
     }
 }
 impl Surfaces {
@@ -179,6 +200,7 @@ impl Surfaces {
         if e.blank_timing(blank.request, clock)? != blank.timing
             || surface.applied.request.width != blank.timing.request.timing.h_active
             || surface.applied.request.height != blank.timing.request.timing.v_active
+            || surface.applied.request.odm != blank.timing.request.odm
             || e.status.memory[slot]
                 != Some(MemoryApplied {
                     pipe,
@@ -194,15 +216,17 @@ impl Surfaces {
         let mut applied = DppApplied {
             surface: surface.applied,
             timing: blank.timing,
-            line_buffer_config: line_buffer(surface.applied.request.width)?,
+            line_buffer_config: line_buffer(plan.segment_width())?,
             pending: 0,
         };
         e.hubp_tree_stopped(Some(pipe))?;
         e.verify_surface(surface.applied)?;
         e.verify_memory(pipe, config)?;
         e.verify_blank(blank, plan, false)?;
-        e.dpp_stopped(pipe, false)?;
-        if e.dpp_pending(pipe)? != 0 {
+        for (p, _, _) in surface.applied.request.segments() {
+            e.dpp_stopped(p, false)?;
+        }
+        if e.segment_dpp_pending(surface.applied.request)? != 0 {
             return Err(Error::Busy);
         }
         e.status.state = State::PreparingDpp(pipe);
@@ -215,7 +239,7 @@ impl Surfaces {
             e.verify_memory(pipe, config)?;
             e.verify_blank(blank, plan, false)?;
             e.verify_dpp(applied)?;
-            e.dpp_pending(pipe)
+            e.segment_dpp_pending(surface.applied.request)
         });
         match result {
             Ok(pending) => {

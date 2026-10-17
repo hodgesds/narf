@@ -502,11 +502,7 @@ impl<I: Io> Engine<I> {
             self.disable(pipe).await?;
             // Restage the OPP route after master and busy are off, as DP
             // SST video stop does.
-            self.update(
-                self.layout.odm(pipe, SOURCE),
-                0xf0000,
-                u32::from(pipe) << 16,
-            )?;
+            self.restage_source(blank.timing.request)?;
             self.uhbr_video_verify(&v.link, stream, blank, false)
         }
         .await;

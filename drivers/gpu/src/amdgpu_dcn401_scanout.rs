@@ -56,6 +56,8 @@ const PSTATE_DISALLOWED: u32 = 0x20;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanoutRunning {
     pub pipe: u8,
+    /// ODM 2:1: the pipe fetching the right half.
+    pub odm: Option<u8>,
     pub stream: u8,
     /// The admitted plan whose deadlines this fetch runs under.
     pub plan: dml::Plan,
@@ -125,11 +127,19 @@ impl ScanoutPosition {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Pipe {
     pub(super) pipe: u8,
+    /// The ODM pipe fetching the right half, under `pipe`'s timing.
+    pub(super) odm: Option<u8>,
     pub(super) address: u64,
     pub(super) black: u32,
     pub(super) timeout_us: u64,
     /// Fail waits on underflow; cleared only while recovering from one.
     pub(super) watch: bool,
+}
+impl Pipe {
+    /// Every pipe whose HUBP/DPP/MPCC/OPP carries this scanout.
+    pub(super) fn pipes(self) -> impl Iterator<Item = u8> + Clone {
+        core::iter::once(self.pipe).chain(self.odm)
+    }
 }
 
 /// Last underflow observed on a live scanout, retained after the bounded
@@ -165,13 +175,16 @@ impl<I: Io> Engine<I> {
         ]
     }
     fn underflow(&mut self, pipe: u8) -> Result<(), Error> {
-        for (at, mask) in [
-            (self.layout.hubp(pipe, HUBP_CONTROL), HUBP_UNDERFLOW),
-            (self.optc_input(pipe), OPTC_UNDERFLOW),
-        ] {
-            if self.read(at)? & mask != 0 {
+        let pipes: alloc::vec::Vec<u8> = self.fetch_pipes(pipe).collect();
+        for p in pipes {
+            let at = self.layout.hubp(p, HUBP_CONTROL);
+            if self.read(at)? & HUBP_UNDERFLOW != 0 {
                 return Err(Error::Underflow(at));
             }
+        }
+        let at = self.optc_input(pipe);
+        if self.read(at)? & OPTC_UNDERFLOW != 0 {
+            return Err(Error::Underflow(at));
         }
         Ok(())
     }
@@ -186,11 +199,17 @@ impl<I: Io> Engine<I> {
             (l.otg(pipe, DOUBLE_BUFFER), OTG_UPDATE_PENDING, 0),
             (l.otg(pipe, PIPE_UPDATE), PIPE_PENDING, 0),
             (self.optc_input(pipe), OPTC_PENDING, 0),
-            (l.opp(pipe, DPG_PENDING), 1, 0),
-            (l.mpcc(pipe, UPDATE_LOCK), 0x70, 0),
             (l.otg(pipe, GSL), 0x8000_000f, 0),
         ] {
             if self.read(at)? & mask != value {
+                return Err(Error::Busy);
+            }
+        }
+        let pipes: alloc::vec::Vec<u8> = self.fetch_pipes(pipe).collect();
+        for p in pipes {
+            if self.read(l.opp(p, DPG_PENDING))? & 1 != 0
+                || self.read(l.mpcc(p, UPDATE_LOCK))? & 0x70 != 0
+            {
                 return Err(Error::Busy);
             }
         }
@@ -200,31 +219,29 @@ impl<I: Io> Engine<I> {
     /// gated, DPP clock gated, all routes detached and the DPG showing black.
     fn staged(&mut self, p: Pipe) -> Result<(), Error> {
         let l = self.layout;
-        for (at, mask, value) in [
-            (
-                l.hubp(p.pipe, HUBP_CONTROL),
-                BLANK_EN | NO_OUTSTANDING | TTU_DISABLE,
-                3,
-            ),
-            (l.hubp(p.pipe, HUBP_CLOCK), 1, 0),
-            (self.dpp_control(p.pipe), DPP_CLOCK_ENABLE, 0),
-            (l.opp(p.pipe, DPG), DPG_FIELDS, p.black),
-            (l.mpcc(p.pipe, MPCC_CONTROL), 3, MPCC_MODE_TOP_ONLY),
-            (l.hubp(p.pipe, CURSOR), CURSOR_REQ_MODE | 1, CURSOR_REQ_MODE),
-            (l.hubp(p.pipe, ADDRESS), u32::MAX, p.address as u32),
-            (
-                l.hubp(p.pipe, ADDRESS_HIGH),
-                0xffff,
-                (p.address >> 32) as u32,
-            ),
-        ] {
-            if self.read(at)? & mask != value {
-                return Err(Error::Readback(at));
+        for q in p.pipes() {
+            for (at, mask, value) in [
+                (
+                    l.hubp(q, HUBP_CONTROL),
+                    BLANK_EN | NO_OUTSTANDING | TTU_DISABLE,
+                    3,
+                ),
+                (l.hubp(q, HUBP_CLOCK), 1, 0),
+                (self.dpp_control(q), DPP_CLOCK_ENABLE, 0),
+                (l.opp(q, DPG), DPG_FIELDS, p.black),
+                (l.mpcc(q, MPCC_CONTROL), 3, MPCC_MODE_TOP_ONLY),
+                (l.hubp(q, CURSOR), CURSOR_REQ_MODE | 1, CURSOR_REQ_MODE),
+                (l.hubp(q, ADDRESS), u32::MAX, p.address as u32),
+                (l.hubp(q, ADDRESS_HIGH), 0xffff, (p.address >> 32) as u32),
+            ] {
+                if self.read(at)? & mask != value {
+                    return Err(Error::Readback(at));
+                }
             }
-        }
-        for (at, value) in self.routes(p.pipe, false) {
-            if self.read(at)? & 0xf != value {
-                return Err(Error::Readback(at));
+            for (at, value) in self.routes(q, false) {
+                if self.read(at)? & 0xf != value {
+                    return Err(Error::Readback(at));
+                }
             }
         }
         Ok(())
@@ -306,14 +323,29 @@ impl<I: Io> Engine<I> {
             (l.otg(pipe, LOCK), LOCK_REQUEST | LOCK_STATUS),
             (l.otg(pipe, DOUBLE_BUFFER), OTG_UPDATE_PENDING),
             (l.otg(pipe, PIPE_UPDATE), PIPE_PENDING),
-            (l.hubp(pipe, FLIP), FLIP_PENDING),
-            (l.mpcc(pipe, UPDATE_LOCK), 0x70),
         ] {
             if self.read(at)? & mask != 0 {
                 return Err(Error::Busy);
             }
         }
+        let pipes: alloc::vec::Vec<u8> = self.fetch_pipes(pipe).collect();
+        for q in pipes {
+            if self.read(l.hubp(q, FLIP))? & FLIP_PENDING != 0
+                || self.read(l.mpcc(q, UPDATE_LOCK))? & 0x70 != 0
+            {
+                return Err(Error::Busy);
+            }
+        }
         self.underflow(pipe)
+    }
+    /// `in_use` for every pipe of the scanout: the first still waiting.
+    fn all_in_use(&mut self, p: Pipe, address: u64) -> Result<Option<u64>, Error> {
+        for q in p.pipes() {
+            if let Some(at) = self.in_use(q, address)? {
+                return Ok(Some(at));
+            }
+        }
+        Ok(None)
     }
     /// Re-address the live fetch under the master-update lock (a VSYNC flip:
     /// the staged flip type is 0) and wait for the HUBP to report the new
@@ -322,10 +354,13 @@ impl<I: Io> Engine<I> {
         let l = self.layout;
         let pipe = p.pipe;
         self.lock(pipe).await?;
-        self.update(l.hubp(pipe, ADDRESS_HIGH), 0xffff, (p.address >> 32) as u32)?;
-        self.update(l.hubp(pipe, ADDRESS), u32::MAX, p.address as u32)?;
+        // Both ODM halves re-address under the one master lock.
+        for q in p.pipes() {
+            self.update(l.hubp(q, ADDRESS_HIGH), 0xffff, (p.address >> 32) as u32)?;
+            self.update(l.hubp(q, ADDRESS), u32::MAX, p.address as u32)?;
+        }
         self.update(l.otg(pipe, LOCK), LOCK_REQUEST, 0)?;
-        self.latched(p, |e| e.in_use(pipe, p.address)).await?;
+        self.latched(p, |e| e.all_in_use(p, p.address)).await?;
         Ok(self.read(l.otg(pipe, FRAME_COUNT))? & FRAME_MASK)
     }
     /// Connect and unblank under one OTG master-update lock so DPG release,
@@ -336,58 +371,74 @@ impl<I: Io> Engine<I> {
         let hubbub = |r: u64| l.base + r * 4;
         // Clocks first, while blanked and detached; Linux never has them gated
         // on a live plane.
-        self.update(l.hubp(pipe, HUBP_CLOCK), 1, 1)?;
-        self.update(self.dpp_control(pipe), DPP_CLOCK_ENABLE, DPP_CLOCK_ENABLE)?;
-        self.wait(l.hubp(pipe, HUBP_CONTROL), 0x1007, 3, 100_000)
-            .await?;
+        for q in p.pipes() {
+            self.update(l.hubp(q, HUBP_CLOCK), 1, 1)?;
+            self.update(self.dpp_control(q), DPP_CLOCK_ENABLE, DPP_CLOCK_ENABLE)?;
+            self.wait(l.hubp(q, HUBP_CONTROL), 0x1007, 3, 100_000)
+                .await?;
+        }
         self.lock(pipe).await?;
         // dcn401_program_front_end_for_ctx forces P-state off across 0->1.
         self.update(hubbub(DRAM_STATE), PSTATE_FORCE, PSTATE_DISALLOWED)?;
         narf_time::SleepUntil::new(narf_time::Deadline::after_us(500).as_instant()).await;
-        self.update(l.opp(pipe, DPG), DPG_FIELDS, 0)?; // video mode
-        for (at, value) in [
-            (l.mpcc(pipe, BOTTOM), 0xf),
-            (l.mpcc(pipe, TOP), u32::from(pipe)),
-            (l.mpcc(pipe, OPP_ID), u32::from(pipe)),
-            (l.mpcc(pipe, UPDATE_LOCK), u32::from(pipe)),
-            (l.out_mux(pipe), u32::from(pipe)),
-        ] {
-            self.update(at, 0xf, value)?;
+        // Each ODM segment's OPP, MPCC tree and HUBP under the one master
+        // lock: they latch together at the combined timing's VUPDATE.
+        for q in p.pipes() {
+            self.update(l.opp(q, DPG), DPG_FIELDS, 0)?; // video mode
+            for (at, value) in [
+                (l.mpcc(q, BOTTOM), 0xf),
+                (l.mpcc(q, TOP), u32::from(q)),
+                (l.mpcc(q, OPP_ID), u32::from(q)),
+                (l.mpcc(q, UPDATE_LOCK), u32::from(q)),
+                (l.out_mux(q), u32::from(q)),
+            ] {
+                self.update(at, 0xf, value)?;
+            }
+            // Re-arm the flip: high half first, the low write publishes it.
+            self.update(l.hubp(q, ADDRESS_HIGH), 0xffff, (p.address >> 32) as u32)?;
+            self.update(l.hubp(q, ADDRESS), u32::MAX, p.address as u32)?;
+            self.update(l.hubp(q, HUBP_CONTROL), BLANK_EN | TTU_DISABLE, 0)?;
         }
-        // Re-arm the flip: high half first, the low write publishes it.
-        self.update(l.hubp(pipe, ADDRESS_HIGH), 0xffff, (p.address >> 32) as u32)?;
-        self.update(l.hubp(pipe, ADDRESS), u32::MAX, p.address as u32)?;
-        self.update(l.hubp(pipe, HUBP_CONTROL), BLANK_EN | TTU_DISABLE, 0)?;
         self.update(l.otg(pipe, LOCK), LOCK_REQUEST, 0)?;
         // dcn401_post_unlock_program_front_end: the new surface is in use only
         // when no flip is pending and EARLIEST_INUSE reports its address. A
         // requested-address readback is not that evidence.
         self.latched(p, |e| {
-            if let Some(at) = e.in_use(pipe, p.address)? {
+            if let Some(at) = e.all_in_use(p, p.address)? {
                 return Ok(Some(at));
             }
             for (at, mask, value) in [
-                (l.opp(pipe, DPG_PENDING), 1, 0),
-                (l.opp(pipe, DPG), DPG_EN, 0),
                 (l.otg(pipe, DOUBLE_BUFFER), OTG_UPDATE_PENDING, 0),
                 (l.otg(pipe, PIPE_UPDATE), PIPE_PENDING, 0),
-                (l.mpcc(pipe, MPC_STATUS), 4, 0), // MPCC no longer DISABLED
             ] {
                 if e.read(at)? & mask != value {
                     return Ok(Some(at));
+                }
+            }
+            for q in p.pipes() {
+                for (at, mask, value) in [
+                    (l.opp(q, DPG_PENDING), 1, 0),
+                    (l.opp(q, DPG), DPG_EN, 0),
+                    (l.mpcc(q, MPC_STATUS), 4, 0), // MPCC no longer DISABLED
+                ] {
+                    if e.read(at)? & mask != value {
+                        return Ok(Some(at));
+                    }
                 }
             }
             Ok(None)
         })
         .await?;
         self.update(hubbub(DRAM_STATE), PSTATE_FORCE, 0)?;
-        for (at, value) in self.routes(pipe, true) {
-            if self.read(at)? & 0xf != value {
-                return Err(Error::Readback(at));
+        for q in p.pipes() {
+            for (at, value) in self.routes(q, true) {
+                if self.read(at)? & 0xf != value {
+                    return Err(Error::Readback(at));
+                }
             }
-        }
-        if self.read(l.hubp(pipe, HUBP_CONTROL))? & (BLANK_EN | TTU_DISABLE) != 0 {
-            return Err(Error::Readback(l.hubp(pipe, HUBP_CONTROL)));
+            if self.read(l.hubp(q, HUBP_CONTROL))? & (BLANK_EN | TTU_DISABLE) != 0 {
+                return Err(Error::Readback(l.hubp(q, HUBP_CONTROL)));
+            }
         }
         self.fresh_frames(p).await
     }
@@ -399,41 +450,53 @@ impl<I: Io> Engine<I> {
         // The cursor is a fetch source too; it latches off with the black.
         self.hide_cursor(pipe)?;
         self.lock(pipe).await?;
-        self.update(l.opp(pipe, DPG), DPG_FIELDS, p.black)?;
-        for (at, value) in self.routes(pipe, false) {
-            self.update(at, 0xf, value)?;
+        for q in p.pipes() {
+            self.update(l.opp(q, DPG), DPG_FIELDS, p.black)?;
+            for (at, value) in self.routes(q, false) {
+                self.update(at, 0xf, value)?;
+            }
         }
         self.update(l.otg(pipe, LOCK), LOCK_REQUEST, 0)?;
         // Black must be on screen before the MPCC may report disconnection.
         self.latched(p, |e| {
-            for (at, mask, value) in [
-                (l.opp(pipe, DPG_PENDING), 1, 0),
-                (l.opp(pipe, DPG), DPG_FIELDS, p.black),
-                (l.otg(pipe, DOUBLE_BUFFER), OTG_UPDATE_PENDING, 0),
-            ] {
-                if e.read(at)? & mask != value {
+            let at = l.otg(pipe, DOUBLE_BUFFER);
+            if e.read(at)? & OTG_UPDATE_PENDING != 0 {
+                return Ok(Some(at));
+            }
+            for q in p.pipes() {
+                for (at, mask, value) in [
+                    (l.opp(q, DPG_PENDING), 1, 0),
+                    (l.opp(q, DPG), DPG_FIELDS, p.black),
+                ] {
+                    if e.read(at)? & mask != value {
+                        return Ok(Some(at));
+                    }
+                }
+                // mpc2_assert_idle_mpcc: DISABLED, or IDLE and not BUSY.
+                let at = l.mpcc(q, MPC_STATUS);
+                let status = e.read(at)?;
+                if status & 2 != 0 || status & 5 == 0 {
                     return Ok(Some(at));
                 }
             }
-            // mpc2_assert_idle_mpcc: DISABLED, or IDLE and not BUSY.
-            let at = l.mpcc(pipe, MPC_STATUS);
-            let status = e.read(at)?;
-            Ok((status & 2 != 0 || status & 5 == 0).then_some(at))
+            Ok(None)
         })
         .await?;
-        // hubp2_set_blank(true): no outstanding requests before blanking.
-        self.wait(
-            l.hubp(pipe, HUBP_CONTROL),
-            NO_OUTSTANDING,
-            NO_OUTSTANDING,
-            100_000,
-        )
-        .await?;
-        self.update(l.hubp(pipe, HUBP_CONTROL), BLANK_EN | TTU_DISABLE, BLANK_EN)?;
-        self.wait(l.hubp(pipe, HUBP_CONTROL), 0x1007, 3, 100_000)
+        for q in p.pipes() {
+            // hubp2_set_blank(true): no outstanding requests before blanking.
+            self.wait(
+                l.hubp(q, HUBP_CONTROL),
+                NO_OUTSTANDING,
+                NO_OUTSTANDING,
+                100_000,
+            )
             .await?;
-        self.update(l.hubp(pipe, HUBP_CLOCK), 1, 0)?;
-        self.update(self.dpp_control(pipe), DPP_CLOCK_ENABLE, 0)?;
+            self.update(l.hubp(q, HUBP_CONTROL), BLANK_EN | TTU_DISABLE, BLANK_EN)?;
+            self.wait(l.hubp(q, HUBP_CONTROL), 0x1007, 3, 100_000)
+                .await?;
+            self.update(l.hubp(q, HUBP_CLOCK), 1, 0)?;
+            self.update(self.dpp_control(q), DPP_CLOCK_ENABLE, 0)?;
+        }
         self.staged(p)
     }
     /// The owned pipe as `start_fetch` left it: unblanked fetch of the owned
@@ -443,15 +506,16 @@ impl<I: Io> Engine<I> {
         pipe: u8,
         address: u64,
     ) -> Result<(), Error> {
-        let cursor = self
-            .status
-            .cursor
-            .is_some_and(|c| c.pipe == pipe && c.visible);
-        self.live_fetch_with(pipe, address, cursor)
+        let cursor = self.status.cursor.filter(|c| c.pipe == pipe);
+        let pipes: alloc::vec::Vec<u8> = self.fetch_pipes(pipe).collect();
+        for q in pipes {
+            self.live_segment(q, address, cursor.is_some_and(|c| c.shown_on(q)))?;
+        }
+        Ok(())
     }
-    /// `live_fetch` with the cursor's visibility given: another display's
-    /// live pipe is checked against that display's records.
-    pub(in crate::amdgpu_dcn401_otg) fn live_fetch_with(
+    /// One HUBP/DPP/MPCC/OPP of a live scanout. Also what another display's
+    /// live pipe is checked against (each of its pipes on its own).
+    pub(in crate::amdgpu_dcn401_otg) fn live_segment(
         &mut self,
         pipe: u8,
         address: u64,
@@ -490,7 +554,10 @@ impl<I: Io> Engine<I> {
     /// hubp2_clear_underflow/optc1_clear_optc_underflow are single strobes.
     pub(super) async fn recover_fetch(&mut self, p: Pipe) -> Result<ScanoutUnderflow, Error> {
         let l = self.layout;
-        let hubp = self.read(l.hubp(p.pipe, HUBP_CONTROL))?;
+        let mut hubp = 0;
+        for q in p.pipes() {
+            hubp |= self.read(l.hubp(q, HUBP_CONTROL))?;
+        }
         let optc = self.read(self.optc_input(p.pipe))?;
         let report = ScanoutUnderflow {
             pipe: p.pipe,
@@ -500,10 +567,11 @@ impl<I: Io> Engine<I> {
             frame: self.read(l.otg(p.pipe, FRAME_COUNT))? & FRAME_MASK,
         };
         self.stop_fetch(Pipe { watch: false, ..p }).await?;
-        for (at, clear) in [
-            (l.hubp(p.pipe, HUBP_CONTROL), HUBP_UNDERFLOW_CLEAR),
-            (self.optc_input(p.pipe), OPTC_UNDERFLOW_CLEAR),
-        ] {
+        let clears = p
+            .pipes()
+            .map(|q| (l.hubp(q, HUBP_CONTROL), HUBP_UNDERFLOW_CLEAR))
+            .chain([(self.optc_input(p.pipe), OPTC_UNDERFLOW_CLEAR)]);
+        for (at, clear) in clears {
             let old = self.read(at)?;
             self.access(|io| {
                 io.write(at, old | clear);
@@ -568,6 +636,7 @@ impl Surfaces {
         }
         Ok(Pipe {
             pipe: d.pipe,
+            odm: surface.request.odm,
             address: surface.address,
             black: 0x41 | blank.request.depth.dpg() << 12,
             timeout_us: blank.timeout_us()?,
@@ -611,6 +680,7 @@ impl Surfaces {
             Ok((frame_before, frame_after)) => {
                 let report = ScanoutRunning {
                     pipe,
+                    odm: p.odm,
                     stream,
                     plan: d.plan,
                     address: p.address,

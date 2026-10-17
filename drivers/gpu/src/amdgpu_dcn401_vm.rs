@@ -134,34 +134,44 @@ impl<I: Io> Engine<I> {
         // Recheck the entire tree after the context wait, before touching a
         // potentially gated HUBP. Only the retained selected flip may be pending.
         self.hubp_tree_stopped(Some(pipe))?;
-        if !self.hubp_powered(pipe)? {
-            return Err(Error::Busy);
-        }
-        self.update(l.hubp(pipe, HUBP_CLOCK), 1, 1)?;
-        self.wait(l.hubp(pipe, HUBP_CONTROL), 0x1007, 3, 100_000)
-            .await?;
-        for (r, mask, value) in pipe_registers(config) {
-            let at = l.hubp(pipe, r);
-            self.access(|io| {
-                io.write(at, value);
-                Ok(())
-            })?;
-            if self.read(at)? & mask != value {
-                return Err(Error::Readback(at));
+        // Every HUBP the surface fetches on, its ODM pipe's too.
+        let pipes: alloc::vec::Vec<u8> = self.fetch_pipes(pipe).collect();
+        for p in pipes {
+            if !self.hubp_powered(p)? {
+                return Err(Error::Busy);
             }
+            self.update(l.hubp(p, HUBP_CLOCK), 1, 1)?;
+            self.wait(l.hubp(p, HUBP_CONTROL), 0x1007, 3, 100_000)
+                .await?;
+            for (r, mask, value) in pipe_registers(config) {
+                let at = l.hubp(p, r);
+                self.access(|io| {
+                    io.write(at, value);
+                    Ok(())
+                })?;
+                if self.read(at)? & mask != value {
+                    return Err(Error::Readback(at));
+                }
+            }
+            self.update(l.hubp(p, HUBP_CLOCK), 1, 0)?;
         }
-        self.update(l.hubp(pipe, HUBP_CLOCK), 1, 0)?;
         Ok(())
     }
     pub(super) fn verify_memory(&mut self, pipe: u8, config: DisplayContext) -> Result<(), Error> {
         let l = self.layout;
-        for (at, mask, value) in global_registers(config)
-            .map(|(r, m, v)| (l.base + r * 4, m, v))
-            .into_iter()
-            .chain(pipe_registers(config).map(|(r, m, v)| (l.hubp(pipe, r), m, v)))
-        {
+        for (r, mask, value) in global_registers(config) {
+            let at = l.base + r * 4;
             if self.read(at)? & mask != value {
                 return Err(Error::Readback(at));
+            }
+        }
+        let pipes: alloc::vec::Vec<u8> = self.fetch_pipes(pipe).collect();
+        for p in pipes {
+            for (r, mask, value) in pipe_registers(config) {
+                let at = l.hubp(p, r);
+                if self.read(at)? & mask != value {
+                    return Err(Error::Readback(at));
+                }
             }
         }
         Ok(())

@@ -52,6 +52,8 @@ struct ScanoutWitness {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Request {
     pipe: u8,
+    /// The ODM pipe carrying the right half, whose DSC clock stops too.
+    odm: Option<u8>,
     port: usize,
     protocol: Protocol,
     audio: bool,
@@ -68,12 +70,13 @@ impl Request {
                 stream: m.scanout.stream,
                 frames: (m.scanout.frame_before, m.scanout.frame_after),
             }),
-            ..Self::activation(m.pipe, &m.selection)
+            ..Self::activation(m.pipe, m.scanout.odm, &m.selection)
         }
     }
-    fn activation(pipe: u8, s: &Selection) -> Self {
+    fn activation(pipe: u8, odm: Option<u8>, s: &Selection) -> Self {
         Self {
             pipe,
+            odm,
             port: s.port,
             protocol: if s.frl.is_some() {
                 Protocol::Frl
@@ -170,9 +173,10 @@ impl Teardowns {
     pub(super) fn begin_activation(
         &mut self,
         pipe: u8,
+        odm: Option<u8>,
         selection: &Selection,
     ) -> Result<(), ModesetError> {
-        self.start_activation(Request::activation(pipe, selection))
+        self.start_activation(Request::activation(pipe, odm, selection))
     }
     /// Record the inverse of a completed startup phase, without a suspension
     /// between its native completion and this checkpoint. PreLinkScdc instead
@@ -397,7 +401,12 @@ impl Backend for ColdBoot {
                     Protocol::Sst => self.stop_display_dp_link(r.port).await?,
                 },
                 Timing => self.retire_display_timing(r.pipe).await?,
-                DscClock => self.stop_display_dscclk(r.pipe)?,
+                DscClock => {
+                    self.stop_display_dscclk(r.pipe)?;
+                    if let Some(q) = r.odm {
+                        self.stop_display_dscclk(q)?;
+                    }
+                }
                 Planes => {
                     self.retire_display_planes().await?;
                 }

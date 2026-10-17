@@ -28,13 +28,14 @@ impl<I: Io> Engine<I> {
         )?;
         let l = self.layout;
         let p = link.request.pipe;
-        for (at, mask, value) in [
-            (l.otg(p, CONTROL), 0x10301, 0x10201),
-            (l.opp(p, 0x185b), 1, 0),
-            (l.opp(p, 0x1840), 0x1000000, 0),
-        ] {
-            if self.read(at)? & mask != value {
-                return Err(Error::Readback(at));
+        if self.read(l.otg(p, CONTROL))? & 0x10301 != 0x10201 {
+            return Err(Error::Readback(l.otg(p, CONTROL)));
+        }
+        for o in link.blank.timing.request.plan()?.opps() {
+            for (at, mask) in [(l.opp(o, 0x185b), 1), (l.opp(o, 0x1840), 0x1000000)] {
+                if self.read(at)? & mask != 0 {
+                    return Err(Error::Readback(at));
+                }
             }
         }
         Ok(())
@@ -109,7 +110,7 @@ impl<I: Io> Engine<I> {
         let p = link.request.pipe;
         self.disable(p).await?;
         // As after DP video: restage the single OPP route with the timing off.
-        self.update(self.layout.odm(p, SOURCE), 0xf0000, u32::from(p) << 16)?;
+        self.restage_source(link.blank.timing.request)?;
         self.verify_blank(link.blank, link.blank.timing.request.plan()?, false)?;
         self.hdmi_link_verify(link, false)?;
         Ok(link)

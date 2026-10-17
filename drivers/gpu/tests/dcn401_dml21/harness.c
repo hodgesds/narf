@@ -3,16 +3,19 @@
  * native admission policy, and prints the values the Rust plan carries.
  *
  * Policy, matching the Rust port:
- *  - one DP SST stream, one unscaled linear 444_32 plane, ODM bypass, one DPP
+ *  - one DP SST stream, one unscaled linear 444_32 plane, DML-decided ODM
+ *    (dml2_odm_mode_auto, dynamic ODM off), no MPC combine
  *    (mpcc_combine_factor 1), no cursor, DCC, GPUVM, writeback or iflip;
- *  - DET fixed at the staged 320 KiB with DET reallocation minimising off;
+ *  - DET fixed at the staged 320 KiB per pipe with DET reallocation
+ *    minimising off;
  *  - DCFCLK/FCLK keep their DPM range, one pinned UCLK level, and PMO never
  *    searches UCLK pstate strategies (switching is disabled natively). PMO's
  *    stutter phase still runs, as it does on Linux.
  *
  * Arguments (kHz unless noted): pclk hact htotal hfp hsync vact vtotal vfp
  * vsync dcfclk_min dcfclk_max fclk_min fclk_max uclk dispclk_max dppclk_max
- * socclk umc_channels pitch_px. Prints "PLAN <values>" or "REJECT".
+ * socclk umc_channels pitch_px. Prints "PLAN <values>" or "REJECT"; a plane
+ * on several ODM pipes appends them as odm_pipes.h describes.
  *
  * DPPREFCLK is reported as the value mode programming used: Linux's
  * populate_informative re-derives it as (unsigned)(GlobalDPPCLK * 1000),
@@ -23,6 +26,7 @@
 #include "dml_top.h"
 #include "dml2_internal_shared_types.h"
 #include "bounding_boxes/dcn4_soc_bb.h"
+#include "odm_pipes.h"
 
 static bool no_uclk_pstate(struct dml2_pmo_init_for_pstate_support_in_out *in_out)
 {
@@ -105,7 +109,7 @@ int main(int argc, char **argv)
 	s->output.output_encoder = dml2_dp;
 	s->output.output_dp_lane_count = 4;
 	s->output.output_disabled = true;
-	s->overrides.odm_mode = dml2_odm_mode_bypass;
+	s->overrides.odm_mode = dml2_odm_mode_auto;
 	s->overrides.disable_dynamic_odm = true;
 	s->overrides.disable_subvp = true;
 	s->overrides.hw.twait_budgeting.fclk_pstate = dml2_twait_budgeting_setting_if_needed;
@@ -176,6 +180,7 @@ int main(int argc, char **argv)
 	printf("PLAN");
 	for (size_t i = 0; i < sizeof(v) / sizeof(v[0]); i++)
 		printf(" %lu", v[i]);
+	print_odm_pipes(&prog.plane_programming[0]);
 	putchar('\n');
 	return 0;
 }

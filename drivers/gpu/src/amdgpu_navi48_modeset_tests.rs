@@ -23,6 +23,7 @@ fn completed_modeset(pipe: u8) -> Modeset {
         plan,
         scanout: otg::ScanoutRunning {
             pipe,
+            odm: None,
             stream: pipe,
             plan,
             address: 0x8_0000_0000 + u64::from(pipe) * 0x1000000,
@@ -52,7 +53,9 @@ fn navi48_completed_modesets_survive_configuration_and_publication_cancellation(
                     local.push(m);
                 }
                 if during_startup {
-                    journal.begin_activation(3, &second.selection).unwrap();
+                    journal
+                        .begin_activation(3, None, &second.selection)
+                        .unwrap();
                 }
                 // Later native startup, or asynchronous platform adoption.
                 core::future::pending::<()>().await;
@@ -732,7 +735,7 @@ fn navi48_dark_sst_modes_use_link_and_joint_display_admission() -> TestResult {
     assert!(sst::dark_modes(&soc, &paths, &device, 8, &[one; 4]).is_empty());
     assert!(sst::dark_modes(
         &dml::Soc {
-            dispclk_max_khz: 50_000,
+            dispclk_max_khz: 30_000,
             ..soc
         },
         &paths,
@@ -913,15 +916,16 @@ fn navi48_modeset_selects_every_sink_and_admits_what_fits() -> TestResult {
         return TestResult::Fail("more than four displays");
     }
     // A slow board carries 1080p60 but not 2160p120 beside it: the second
-    // display stays dark; alone, the 2160p120 one is refused outright.
+    // display stays dark; alone, the 2160p120 one is refused outright (it
+    // would need a 3:1 ODM split of the 500-MHz DISPCLK).
     let soc = dml::Soc {
         umc_channels: 16,
         uclk_khz: 456_000,
         fclk_khz: [300_000, 800_000],
         dcfclk_khz: [200_000, 600_000],
         socclk_khz: 300_000,
-        dispclk_max_khz: 1_000_000,
-        dppclk_max_khz: 1_000_000,
+        dispclk_max_khz: 500_000,
+        dppclk_max_khz: 500_000,
         dentist_vco_khz: 4_500_000,
         dchub_refclk_khz: 50_000,
     };
@@ -1644,8 +1648,9 @@ fn navi48_mst_admits_dark_connector_modes() -> TestResult {
     assert!(dark_mst_modes(&soc, caps, &edid, 1, &[]).is_empty());
     assert!(dark_mst_modes(&soc, caps, &edid, 0, &[]).is_empty());
     assert!(dark_mst_modes(&soc, caps, &[], u16::MAX, &[]).is_empty());
+    // Too slow even for 720p split across two ODM pipes.
     let slow = dml::Soc {
-        dispclk_max_khz: 50_000,
+        dispclk_max_khz: 30_000,
         ..soc
     };
     assert!(dark_mst_modes(&slow, caps, &edid, u16::MAX, &[]).is_empty());
@@ -2197,4 +2202,26 @@ fn navi48_dsc_link_verification_reselects_compressed_geometry() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_dsc_link_verification_reselects_compressed_geometry
+);
+
+/// A two-pipe plan takes the highest pipe no display of the configuration
+/// is on and no earlier ODM display took; one-pipe plans take none.
+fn navi48_odm_plans_take_the_highest_free_pipes() -> TestResult {
+    let one = completed_modeset(0).plan;
+    let two = dml::Plan { pipes: 2, ..one };
+    let got = |plans: &[dml::Plan], pipes: &[u8]| odm_pipes(plans, pipes).ok();
+    if got(&[two], &[0]) != Some(alloc::vec![Some(3)])
+        || got(&[two], &[3]) != Some(alloc::vec![Some(2)])
+        || got(&[one, two, one], &[0, 3, 1]) != Some(alloc::vec![None, Some(2), None])
+        || got(&[one, two, two], &[0, 3, 1]).is_some()
+        || got(&[two, two], &[0, 2]) != Some(alloc::vec![Some(3), Some(1)])
+        || got(&[one, one], &[0, 1]) != Some(alloc::vec![None, None])
+    {
+        return TestResult::Fail("ODM pipe allocation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_odm_plans_take_the_highest_free_pipes
 );

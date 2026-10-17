@@ -1629,6 +1629,27 @@ pub fn pipe_clock_request(pipe: u8, plan: &dml::Plan, selection: &Selection) -> 
     }
 }
 
+/// Each plan's ODM pipe: a 2-pipe plan takes the highest pipe no display of
+/// the configuration is lit on and no other ODM display took. Admission
+/// counts every DPP, so a free pipe exists for each.
+pub fn odm_pipes(plans: &[dml::Plan], pipes: &[u8]) -> Result<Vec<Option<u8>>, ModesetError> {
+    let mut used = pipes.iter().fold(0u8, |m, &p| m | 1 << p);
+    plans
+        .iter()
+        .map(|plan| {
+            if plan.pipes < 2 {
+                return Ok(None);
+            }
+            let q = (0..4u8)
+                .rev()
+                .find(|&q| used & 1 << q == 0)
+                .ok_or(ModesetError::Display(otg::Error::Busy))?;
+            used |= 1 << q;
+            Ok(Some(q))
+        })
+        .collect()
+}
+
 /// The timing a selection's link needs: TMDS, DP through the DIO
 /// encoders, or (for a 128b/132b link) DP through the HPO encoders.
 pub fn timing_request(pipe: u8, plan: &dml::Plan, selection: &Selection) -> otg::Request {
@@ -1647,6 +1668,7 @@ pub fn timing_request(pipe: u8, plan: &dml::Plan, selection: &Selection) -> otg:
         },
         ycbcr420: plan.mode.ycbcr420,
         dsc: selection.dsc,
+        odm: None,
     }
 }
 
@@ -1810,10 +1832,14 @@ impl ColdBoot {
         let soc = self.prepare_configuration(&[selection]).await?;
         refine_dsc(&soc, core::slice::from_mut(&mut selection))?;
         let plans = admit_displays(&soc, &[selection]).map_err(otg::Error::Admission)?;
-        self.prepare_pipes(&[selection], &plans, &[pipe]).await?;
+        let odm = self.prepare_pipes(&[selection], &plans, &[pipe]).await?;
         // SAFETY: the caller's obligations.
-        let mut lit =
-            unsafe { self.light(pipe, selection, plans[0], &mut |_, y, row| fill(y, row)) }.await?;
+        let mut lit = unsafe {
+            self.light(pipe, odm[0], selection, plans[0], &mut |_, y, row| {
+                fill(y, row)
+            })
+        }
+        .await?;
         lit.modes = self.offered_modes(&soc, &[lit], 0, &edid_of(&ports, &paths, &selection));
         self.modesets.retain(lit);
         Ok(lit)
@@ -1943,13 +1969,15 @@ impl ColdBoot {
         refine_dsc(&soc, &mut selections)?;
         let plans = admit_displays(&soc, &selections).map_err(otg::Error::Admission)?;
         selections.truncate(plans.len());
-        self.prepare_pipes(&selections, &plans, &pipes).await?;
+        let odm = self.prepare_pipes(&selections, &plans, &pipes).await?;
         let mut lit = Vec::with_capacity(selections.len());
         let mut failed = None;
-        for ((selection, plan), &pipe) in selections.iter().zip(&plans).zip(&pipes) {
+        for (((selection, plan), &pipe), &odm) in
+            selections.iter().zip(&plans).zip(&pipes).zip(&odm)
+        {
             // SAFETY: the caller's obligations; every earlier display is lit
             // in its own slot and left to it by each step.
-            match unsafe { self.light(pipe, *selection, *plan, &mut fill) }.await {
+            match unsafe { self.light(pipe, odm, *selection, *plan, &mut fill) }.await {
                 Ok(m) => lit.push(m),
                 Err(e) if lit.is_empty() => return Err(e),
                 Err(e) => {
@@ -2004,14 +2032,16 @@ impl ColdBoot {
         Ok(self.display_soc()?)
     }
     /// The configuration's global clocks (one DISPCLK/DPPREFCLK for every
-    /// plan), then each display's pipe clocks on `pipes`, all while every
-    /// display is stopped.
+    /// plan), then each display's pipe clocks on `pipes` (and a DPP-only
+    /// clock on each ODM pipe), all while every display is stopped. Returns
+    /// each display's ODM pipe.
     pub(super) async fn prepare_pipes(
         &mut self,
         selections: &[Selection],
         plans: &[dml::Plan],
         pipes: &[u8],
-    ) -> Result<(), ModesetError> {
+    ) -> Result<Vec<Option<u8>>, ModesetError> {
+        let odm = odm_pipes(plans, pipes)?;
         let mut request = clock_request(&plans[0]);
         request.displays = plans.len() as u8;
         // dcn401_update_clocks: an FRL stream holds DTBCLK at its highest
@@ -2030,7 +2060,20 @@ impl ColdBoot {
                 self.start_display_dscclk(pipe)?;
             }
         }
-        Ok(())
+        for ((s, plan), &q) in selections.iter().zip(plans).zip(&odm) {
+            let Some(q) = q else { continue };
+            self.prepare_display_pipe_clocks(dccg::Request {
+                pipe: q,
+                dpp_khz: plan.clocks.dppclk_khz,
+                pixel: dccg::PixelClock::OdmSegment,
+            })
+            .await
+            .map_err(ModesetError::PipeClocks)?;
+            if s.dsc.is_some() {
+                self.start_display_dscclk(q)?;
+            }
+        }
+        Ok(odm)
     }
     /// Light one admitted display on `pipe` (its display slot too), with its
     /// clocks prepared: surface, timing, OPP, DPP, MPC, requestor and
@@ -2041,14 +2084,15 @@ impl ColdBoot {
     pub(super) async unsafe fn light(
         &mut self,
         pipe: u8,
+        odm: Option<u8>,
         selection: Selection,
         plan: dml::Plan,
         fill: &mut impl FnMut(u8, u32, &mut [u32]),
     ) -> Result<Modeset, ModesetError> {
         self.select_display(pipe)?;
-        self.teardowns.begin_activation(pipe, &selection)?;
+        self.teardowns.begin_activation(pipe, odm, &selection)?;
         // SAFETY: the caller owns this unpublished activation and every writer.
-        match unsafe { self.light_inner(pipe, selection, plan, fill) }.await {
+        match unsafe { self.light_inner(pipe, odm, selection, plan, fill) }.await {
             Ok(m) => {
                 // No await between native completion and retained ownership.
                 // A later pipe or platform adoption can suspend or be dropped.
@@ -2072,6 +2116,7 @@ impl ColdBoot {
     async unsafe fn light_inner(
         &mut self,
         pipe: u8,
+        odm: Option<u8>,
         selection: Selection,
         plan: dml::Plan,
         fill: &mut impl FnMut(u8, u32, &mut [u32]),
@@ -2082,11 +2127,15 @@ impl ColdBoot {
         unsafe {
             self.retire_display_planes().await?;
             self.set_display_hubp_power(pipe, true).await?;
+            if let Some(q) = odm {
+                self.set_display_hubp_power(q, true).await?;
+            }
             self.prepare_display_surface(otg::SurfaceRequest {
                 pipe,
                 width,
                 height,
                 format: otg::SurfaceFormat::Xrgb8888,
+                odm,
             })
             .await?;
             let mut row = alloc::vec![0u32; width as usize];
@@ -2095,8 +2144,11 @@ impl ColdBoot {
                 self.upload_display_surface(pipe, 0, y, &row)?;
             }
             self.prepare_display_memory(pipe).await?;
-            self.prepare_display_timing(timing_request(pipe, &plan, &selection))
-                .await?;
+            self.prepare_display_timing(otg::Request {
+                odm,
+                ..timing_request(pipe, &plan, &selection)
+            })
+            .await?;
             self.prepare_display_blank(otg::BlankRequest {
                 pipe,
                 depth: selection.depth,

@@ -340,11 +340,7 @@ impl<I: Io> Engine<I> {
                 self.update(self.frl_at(reg), u32::MAX, 0)?;
             }
             self.disable(pipe).await?;
-            self.update(
-                self.layout.odm(pipe, super::super::SOURCE),
-                0xf0000,
-                u32::from(pipe) << 16,
-            )?;
+            self.restage_source(blank.timing.request)?;
             self.frl_video_verify(&v.link, blank, false)
         }
         .await;
