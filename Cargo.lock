@@ -1235,6 +1235,7 @@ dependencies = [
  "blake2",
  "miniz_oxide",
  "narf-block",
+ "narf-boot",
  "narf-capabilities",
  "narf-console",
  "narf-driver-runtime",

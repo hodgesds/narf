@@ -149,29 +149,114 @@ struct VolState {
     superblock_source: (u64, u64),
     /// Completed logical→physical chunk map.
     chunk_map: ChunkMap,
-    /// Selected FS-tree objectid and live root node (logical address + level).
-    fs_tree_id: u64,
-    fs_tree_root: u64,
-    fs_tree_level: u8,
-    /// On-disk `btrfs_root_item.flags` for the selected tree.
-    fs_tree_flags: u64,
-    /// Cached root-directory inode (objectid 256), for the sync `root()` path.
-    root_inode: Option<InodeItem>,
-    /// False when the selected root item carries `BTRFS_ROOT_SUBVOL_RDONLY`.
-    writable_fs_tree: bool,
+    /// Live root of every subvolume some mount (or an in-flight commit) has
+    /// selected, keyed by tree objectid. Shared by every mount of the
+    /// filesystem, so a batch staged through one mount of a subvolume is seen
+    /// by every other mount of it, as Linux shares one `btrfs_root` per tree.
+    subvols: BTreeMap<u64, LiveSubvol>,
     /// Highest logical address handed out by a write this session. Seeds the
     /// next write's allocator so successive writes don't collide before the
     /// extent tree records the allocations. Reset to 0 at mount.
     alloc_floor: u64,
 }
 
-/// A mounted btrfs filesystem.
+/// The live state of one subvolume tree, shared by every mount of it.
+#[derive(Copy, Clone, Debug)]
+struct LiveSubvol {
+    root: u64,
+    level: u8,
+    /// On-disk `btrfs_root_item.flags` (`BTRFS_ROOT_SUBVOL_RDONLY`).
+    flags: u64,
+    /// Mounts currently rooted at this subvolume.
+    mounts: usize,
+}
+
+/// Per-mount state: which subvolume this mount exposes.
+#[derive(Debug)]
+struct ViewState {
+    /// Selected FS-tree objectid.
+    fs_tree_id: u64,
+    /// Cached root-directory inode (objectid 256), for the sync `root()` path.
+    root_inode: Option<InodeItem>,
+}
+
+/// A mounted btrfs filesystem as one mount sees it: a subvolume root over the
+/// shared [`VolCore`].
+///
+/// Linux splits the same way: one `btrfs_fs_info` (with its transaction,
+/// allocator, superblock commit and `transaction_kthread`) per filesystem, and
+/// each mount's `sb->s_root` a dentry inside whichever subvolume
+/// `btrfs_get_subvol_root`/`get_tree_subvol` selected. Every mount of one
+/// filesystem therefore shares one writer; [`crate::registry`] hands out
+/// views over a single core per fsid, and the core is freed with its last view.
+///
+/// Dereferences to the core, so filesystem-wide state reads the same through
+/// any view.
 #[derive(Debug)]
 pub struct BtrfsVolume<B: BlockDevice> {
+    core: Arc<VolCore<B>>,
+    pub self_weak: Weak<BtrfsVolume<B>>,
+    view: IrqSafeSpinLock<ViewState>,
+    /// This mount was requested read-only. The core may still be writable
+    /// through other mounts, as a Linux `ro` bind of a `rw` superblock is.
+    view_read_only: bool,
+    /// The `mount -t btrfs` data options this volume was mounted with
+    /// (compression, discard, ...). Recorded so the writer and
+    /// `show_options` can honour them; see [`crate::mount_opts`].
+    mount_options: IrqSafeSpinLock<crate::mount_opts::MountOptions>,
+}
+
+impl<B: BlockDevice> core::ops::Deref for BtrfsVolume<B> {
+    type Target = VolCore<B>;
+    fn deref(&self) -> &VolCore<B> {
+        &self.core
+    }
+}
+
+impl<B: BlockDevice> Drop for BtrfsVolume<B> {
+    fn drop(&mut self) {
+        let id = self.view.lock().fs_tree_id;
+        if let Some(live) = self.core.state.lock().subvols.get_mut(&id) {
+            live.mounts = live.mounts.saturating_sub(1);
+        }
+    }
+}
+
+/// Accessors on the shared core.
+impl<B: BlockDevice> VolCore<B> {
+    /// The transaction accumulating operations that have not committed yet.
+    pub(crate) fn fs_batch(&self) -> &Mutex<Option<crate::write::FsBatch>> {
+        &self.fs_batch
+    }
+
+    /// The filesystem UUID this instance serves.
+    pub fn fsid(&self) -> [u8; 16] {
+        self.state.lock().superblock.fsid
+    }
+
+    /// Whether `devid` is one of this instance's assembled members.
+    pub fn has_member(&self, devid: u64) -> bool {
+        self.devices.lock().contains_key(&devid)
+    }
+
+    /// Mounts currently rooted at subvolume `id`, across every view.
+    pub fn subvol_mount_count(&self, id: u64) -> usize {
+        self.state
+            .lock()
+            .subvols
+            .get(&id)
+            .map_or(0, |live| live.mounts)
+    }
+}
+
+/// The filesystem-wide half of a mount (Linux `btrfs_fs_info`): devices,
+/// superblock, chunk map, node cache, the running transaction and its
+/// allocator, pinned extents, and the commit timer.
+#[derive(Debug)]
+pub struct VolCore<B: BlockDevice> {
     /// Source device passed first at mount. Retained for compatibility with
     /// single-device callers and tests; logical I/O routes through `devices`.
     pub device: Arc<B>,
-    pub self_weak: Weak<BtrfsVolume<B>>,
     /// Immutable geometry (copied out of the superblock so hot reads need no
     /// lock).
     magic: u64,
@@ -187,18 +272,22 @@ pub struct BtrfsVolume<B: BlockDevice> {
     /// Mounted read-only: requested, or a member device reports
     /// `is_read_only` (`narf.disks=boot-only`). Nothing is ever written —
     /// no log replay (a pending log tree refuses the mount), no commit timer,
-    /// and every device write funnel returns `ReadOnly`. Also set when the
-    /// mount-time write-safety gate ([`crate::rw_gate`]) refuses a
-    /// read-write mount; never cleared.
+    /// and every device write funnel returns `ReadOnly`. A later read-write
+    /// mount of the same filesystem may clear it ([`BtrfsVolume::make_writable`]),
+    /// as Linux's `btrfs_reconfigure` flips the superblock to rw.
     read_only: core::sync::atomic::AtomicBool,
-    /// Raw `flags` word of the selected superblock (for the gate).
+    /// Serialises closing a transaction against opening the next one, so a
+    /// new batch never builds its allocator or generation from state an
+    /// in-flight commit is about to change (Linux waits on
+    /// `fs_info->trans_lock`/`TRANS_STATE_COMMIT_START` the same way).
+    txn_lock: Mutex<()>,
+    /// Raw `flags` word of the selected superblock (for [`crate::rw_gate`]).
     super_flags: u64,
-    /// Whether a writable mount must hold the fsid's single writer claim
-    /// (every VFS-visible mount; see [`Self::mount_devices_claimed`]).
-    claim_fsid: bool,
-    /// This volume's claim to be the one writer of its fsid; `None` when
-    /// read-only.
-    writer_claim: IrqSafeSpinLock<Option<crate::rw_gate::WriterClaim>>,
+    /// The write-safety gate's verdict, computed once at mount: `Some` means
+    /// no mount of this core may ever write (see [`crate::rw_gate`]).
+    rw_refusal: IrqSafeSpinLock<Option<crate::rw_gate::Refusal>>,
+    /// The commit timer (Linux `transaction_kthread`) runs once per core.
+    timer_started: core::sync::atomic::AtomicBool,
     devices: IrqSafeSpinLock<BTreeMap<u64, Arc<VolumeDevice<B>>>>,
     state: IrqSafeSpinLock<VolState>,
     /// A stamped superblock image whose commit has completed in memory but
@@ -261,10 +350,6 @@ pub struct BtrfsVolume<B: BlockDevice> {
     /// tree reads and node writes, which is also what serialises the shared
     /// allocator inside it.
     fs_batch: Mutex<Option<crate::write::FsBatch>>,
-    /// The `mount -t btrfs` data options this volume was mounted with
-    /// (compression, discard, ...). Recorded so the writer and
-    /// `show_options` can honour them; see [`crate::mount_opts`].
-    mount_options: IrqSafeSpinLock<crate::mount_opts::MountOptions>,
 }
 
 /// `CAP_SYS_RESOURCE` — see [`BtrfsVolume::quota_override`].
@@ -313,9 +398,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// A subvolume marked read-only in its root item remains read-only, and so
     /// does one whose transaction was aborted.
     pub(crate) fn supports_writes(&self) -> bool {
-        !self.is_read_only()
+        !self.core_read_only()
+            && !self.view_read_only
+            && !self.degraded
             && !self.aborted.load(core::sync::atomic::Ordering::Acquire)
-            && self.state.lock().writable_fs_tree
+            && self.fs_tree_flags() & format::ROOT_SUBVOL_RDONLY == 0
     }
 
     /// True when the volume was mounted read-only (requested, or a member
@@ -332,11 +419,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// Objectid of the mounted subvolume (`5` = the top-level FS tree).
     pub fn mounted_subvol_id(&self) -> u64 {
-        self.state.lock().fs_tree_id
+        self.view.lock().fs_tree_id
     }
 
     pub fn is_read_only(&self) -> bool {
-        self.read_only.load(core::sync::atomic::Ordering::Acquire)
+        self.core_read_only() || self.view_read_only
     }
 
     /// Refuse all further writes, because a transaction was lost after its
@@ -562,6 +649,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                     replacement.capacity,
                     start + offset,
                     &bytes,
+                    false,
                 )
                 .await?;
                 offset += take as u64;
@@ -573,10 +661,18 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let zero = vec![0u8; format::SUPERBLOCK_SIZE];
         for &offset in &format::SUPERBLOCK_MIRROR_OFFSETS {
             if offset + format::SUPERBLOCK_SIZE as u64 <= source.capacity {
-                write_exact_to(&*source.device, &source.io, source.capacity, offset, &zero).await?;
+                write_exact_to(
+                    &*source.device,
+                    &source.io,
+                    source.capacity,
+                    offset,
+                    &zero,
+                    false,
+                )
+                .await?;
             }
         }
-        source.device.flush().await;
+        source.device.flush_result().await.map_err(FsError::Io)?;
         Ok(())
     }
 
@@ -615,30 +711,40 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                     removed.capacity,
                     offset,
                     &zero,
+                    false,
                 )
                 .await?;
             }
         }
-        removed.device.flush().await;
+        removed.device.flush_result().await.map_err(FsError::Io)?;
         Ok(())
     }
 
     /// Objectid of the currently mounted fs tree (`5` for the top-level tree).
     pub(crate) fn fs_tree_id(&self) -> u64 {
-        self.state.lock().fs_tree_id
+        self.view.lock().fs_tree_id
     }
 
     /// On-disk `btrfs_root_item.flags` for the mounted subvolume.
     pub(crate) fn fs_tree_flags(&self) -> u64 {
-        self.state.lock().fs_tree_flags
+        let id = self.fs_tree_id();
+        self.state
+            .lock()
+            .subvols
+            .get(&id)
+            .map_or(0, |live| live.flags)
     }
 
     // ── State snapshots (brief lock, no I/O) ───────────────────────
 
     /// Currently mounted fs-tree/subvolume root `(logical, level)`.
     pub fn fs_tree_root(&self) -> (u64, u8) {
-        let g = self.state.lock();
-        (g.fs_tree_root, g.fs_tree_level)
+        let id = self.fs_tree_id();
+        self.state
+            .lock()
+            .subvols
+            .get(&id)
+            .map_or((0, 0), |live| (live.root, live.level))
     }
 
     /// Root-tree root `(logical, level)` from the live superblock.
@@ -1002,13 +1108,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let root_inode = self
             .load_inode_in(subvol_root, format::FIRST_FREE_OBJECTID)
             .await?;
-        let mut g = self.state.lock();
-        g.fs_tree_id = subvol_id;
-        g.fs_tree_root = subvol_root;
-        g.fs_tree_level = subvol_level;
-        g.fs_tree_flags = subvol_flags;
-        g.root_inode = Some(root_inode);
-        g.writable_fs_tree = !self.degraded && subvol_flags & format::ROOT_SUBVOL_RDONLY == 0;
+        self.select_subvol(subvol_id, subvol_root, subvol_level, subvol_flags);
+        self.view.lock().root_inode = Some(root_inode);
         Ok(())
     }
 
@@ -1083,7 +1184,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         domain: DomainId,
         verify_checksums: bool,
     ) -> Result<Arc<Self>, FsError> {
-        Self::mount_devices_with(input, domain, verify_checksums, false, false).await
+        Self::mount_devices_with(input, domain, verify_checksums, false).await
     }
 
     /// [`Self::mount_devices_opts`] that never writes to any member (see
@@ -1094,20 +1195,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         domain: DomainId,
         verify_checksums: bool,
     ) -> Result<Arc<Self>, FsError> {
-        Self::mount_devices_with(input, domain, verify_checksums, true, false).await
-    }
-
-    /// The mount every VFS-visible btrfs mount uses (the root factory and
-    /// `mount -t btrfs`): [`Self::mount_devices_opts`] / read-only, plus the
-    /// one-writer-per-fsid claim ([`crate::rw_gate::claim_writer`]). A
-    /// read-write request whose fsid already has a live writer comes up
-    /// read-only, before anything (log replay included) can write.
-    pub async fn mount_devices_claimed(
-        input: Vec<Arc<B>>,
-        domain: DomainId,
-        read_only: bool,
-    ) -> Result<Arc<Self>, FsError> {
-        Self::mount_devices_with(input, domain, true, read_only, true).await
+        Self::mount_devices_with(input, domain, verify_checksums, true).await
     }
 
     async fn mount_devices_with(
@@ -1115,7 +1203,6 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         domain: DomainId,
         verify_checksums: bool,
         read_only_requested: bool,
-        claim_fsid: bool,
     ) -> Result<Arc<Self>, FsError> {
         let source_device = input.first().cloned().ok_or(FsError::NotFound)?;
         let mut scanned = Vec::new();
@@ -1301,9 +1388,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let seed = ChunkMap::seed_from_sys_array(&superblock.sys_chunk_array)?;
         seed.map_logical(superblock.chunk_root)?;
 
-        let volume = Arc::new_cyclic(|self_weak| BtrfsVolume {
+        let core = Arc::new(VolCore {
             device: source_device,
-            self_weak: self_weak.clone(),
             magic: superblock.magic,
             nodesize: superblock.nodesize,
             sectorsize: superblock.sectorsize,
@@ -1313,8 +1399,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             degraded,
             read_only: core::sync::atomic::AtomicBool::new(read_only),
             super_flags,
-            claim_fsid,
-            writer_claim: IrqSafeSpinLock::new(None),
+            rw_refusal: IrqSafeSpinLock::new(None),
+            txn_lock: Mutex::new(()),
+            timer_started: core::sync::atomic::AtomicBool::new(false),
             devices: IrqSafeSpinLock::new(devices),
             staged_super: IrqSafeSpinLock::new(None),
             staged_count: core::sync::atomic::AtomicUsize::new(0),
@@ -1325,29 +1412,154 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             aborted: core::sync::atomic::AtomicBool::new(false),
             quota_override: core::sync::atomic::AtomicBool::new(false),
             fs_batch: Mutex::new(None),
-            mount_options: IrqSafeSpinLock::new(crate::mount_opts::MountOptions::default()),
             state: IrqSafeSpinLock::new(VolState {
                 superblock,
                 superblock_source: (source_devid, source_offset),
                 chunk_map: seed,
-                fs_tree_id: format::FS_TREE_OBJECTID,
-                fs_tree_root: 0,
-                fs_tree_level: 0,
-                fs_tree_flags: 0,
-                root_inode: None,
-                writable_fs_tree: !degraded,
+                subvols: BTreeMap::new(),
                 alloc_floor: 0,
             }),
         });
+        let volume = Self::new_view(core, read_only_requested);
 
         // Complete the chunk map and locate the FS tree now that the volume can
         // read nodes.
         volume.finish_mount().await?;
-        if !volume.is_read_only() {
-            crate::write::spawn_commit_timer(&volume);
+        if !volume.core_read_only() {
+            volume.start_commit_timer();
         }
         volume.register_sysfs();
         Ok(volume)
+    }
+
+    /// A fresh mount over `core`, not yet rooted at any subvolume.
+    fn new_view(core: Arc<VolCore<B>>, read_only: bool) -> Arc<Self> {
+        Arc::new_cyclic(|self_weak| BtrfsVolume {
+            core,
+            self_weak: self_weak.clone(),
+            view: IrqSafeSpinLock::new(ViewState {
+                fs_tree_id: 0,
+                root_inode: None,
+            }),
+            view_read_only: read_only,
+            mount_options: IrqSafeSpinLock::new(crate::mount_opts::MountOptions::default()),
+        })
+    }
+
+    /// An internal view of `core` rooted at tree `id`, for work the core does
+    /// on behalf of whichever mount opened it: committing a batch staged
+    /// through another mount, or the commit timer. `id` must be a tracked
+    /// subvolume (every batch's tree is).
+    pub(crate) fn view_for_tree(core: &Arc<VolCore<B>>, id: u64) -> Arc<Self> {
+        let volume = Self::new_view(core.clone(), false);
+        let mut view = volume.view.lock();
+        if let Some(live) = core.state.lock().subvols.get_mut(&id) {
+            live.mounts += 1;
+        }
+        view.fs_tree_id = id;
+        drop(view);
+        volume
+    }
+
+    /// The filesystem-wide state this mount is a view of.
+    pub fn core(&self) -> &Arc<VolCore<B>> {
+        &self.core
+    }
+
+    /// The core itself is read-only (no mount of it may write).
+    pub(crate) fn core_read_only(&self) -> bool {
+        self.read_only.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Serialises closing one transaction against opening the next.
+    pub(crate) fn txn_lock(&self) -> &Mutex<()> {
+        &self.txn_lock
+    }
+
+    /// Start the core's commit timer once.
+    fn start_commit_timer(self: &Arc<Self>) {
+        if !self
+            .timer_started
+            .swap(true, core::sync::atomic::Ordering::AcqRel)
+        {
+            crate::write::spawn_commit_timer(&self.core);
+        }
+    }
+
+    /// Another mount of an already-mounted filesystem (Linux
+    /// `btrfs_get_tree_subvol` finding the existing `fs_info`): a new view over
+    /// the same core, rooted at `subvol` or the default subvolume. Shares the
+    /// running transaction, allocator, superblock commit and commit timer with
+    /// every other mount of `core`.
+    ///
+    /// A read-write request against a core that was mounted read-only makes
+    /// the core writable first ([`Self::make_writable`]).
+    pub async fn mount_view(
+        core: &Arc<VolCore<B>>,
+        subvol: Option<Subvol>,
+        read_only: bool,
+    ) -> Result<Arc<Self>, FsError> {
+        let volume = Self::new_view(core.clone(), read_only);
+        if !read_only {
+            volume.make_writable()?;
+        }
+        volume.select_default_root().await?;
+        if let Some(selector) = &subvol {
+            volume.switch_to_subvol(selector).await?;
+        }
+        Ok(volume)
+    }
+
+    /// Flip a read-only core to read-write, as `btrfs_reconfigure` does when
+    /// any mount of a read-only superblock asks for rw. Refused when a member
+    /// device itself refuses writes, the filesystem is degraded, or the
+    /// superblock carries a compat_ro feature the writer does not maintain.
+    /// A pending tree-log cannot exist here: a read-only mount refuses one.
+    pub(crate) fn make_writable(self: &Arc<Self>) -> Result<(), FsError> {
+        if !self.core_read_only() {
+            return Ok(());
+        }
+        if let Some(why) = self.rw_refusal.lock().clone() {
+            let sb = self.superblock();
+            crate::rw_gate::report(&sb.fsid, crate::rw_gate::active_profile(), &why);
+            return Err(FsError::ReadOnly);
+        }
+        if self.degraded
+            || self.superblock().compat_ro_unwritable() != 0
+            || self.superblock().log_root != 0
+            || self
+                .devices
+                .lock()
+                .values()
+                .any(|member| member.device.is_read_only())
+        {
+            return Err(FsError::ReadOnly);
+        }
+        self.read_only
+            .store(false, core::sync::atomic::Ordering::Release);
+        self.start_commit_timer();
+        Ok(())
+    }
+
+    /// Run [`crate::rw_gate`] once per core and remember the verdict. A
+    /// writable core that is refused turns read-only (logged); a read-only
+    /// one keeps the verdict for [`Self::make_writable`].
+    async fn apply_rw_gate(&self) {
+        let profile = crate::rw_gate::active_profile();
+        let sb = self.superblock();
+        let verdict = match crate::rw_gate::check_superblock(&sb, self.super_flags, profile) {
+            Ok(()) => crate::rw_gate::check_trees(self).await,
+            Err(why) => Err(why),
+        };
+        let Err(why) = verdict else {
+            return;
+        };
+        if !self.core_read_only() {
+            self.read_only
+                .store(true, core::sync::atomic::Ordering::Release);
+            crate::rw_gate::report(&sb.fsid, profile, &why);
+        }
+        *self.rw_refusal.lock() = Some(why);
     }
 
     /// Publish `/sys/fs/btrfs/<uuid>/quota_override`, the control surface
@@ -1456,20 +1668,15 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
         // 1c. Before anything can write (log replay below, the commit timer,
         //     any VFS operation): the read-write safety gate. A refusal makes
-        //     this volume read-only for its lifetime.
+        //     this core read-only for its lifetime, and later read-write
+        //     mounts of it are refused.
         self.apply_rw_gate().await;
 
         // 2. Find the FS_TREE root item (5, ROOT_ITEM, *) in the root tree and
         //    extract its root node address + level.
         let (fs_root, fs_level, fs_flags) =
             crate::roots::find_root_with_flags(self, root_tree, format::FS_TREE_OBJECTID).await?;
-        {
-            let mut g = self.state.lock();
-            g.fs_tree_root = fs_root;
-            g.fs_tree_level = fs_level;
-            g.fs_tree_flags = fs_flags;
-            g.writable_fs_tree = !self.degraded && fs_flags & format::ROOT_SUBVOL_RDONLY == 0;
-        }
+        self.select_subvol(format::FS_TREE_OBJECTID, fs_root, fs_level, fs_flags);
 
         // 2b. Replay a pending fsync tree-log (crash recovery) before anything
         //     reads the fs tree. The replay commits into the fs tree and publishes
@@ -1480,11 +1687,22 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             return Err(FsError::Unsupported);
         }
         crate::write::replay_log(self).await?;
+        self.select_default_root().await
+    }
+
+    /// Root this mount at the top-level tree, cache its root inode, then honour
+    /// the on-disk default subvolume. Steps 3–4 of mount, shared with
+    /// [`Self::mount_view`].
+    async fn select_default_root(self: &Arc<Self>) -> Result<(), FsError> {
+        let (root_tree, _) = self.root_tree_root();
+        let (fs_root, fs_level, fs_flags) =
+            crate::roots::find_root_with_flags(self, root_tree, format::FS_TREE_OBJECTID).await?;
+        self.select_subvol(format::FS_TREE_OBJECTID, fs_root, fs_level, fs_flags);
 
         // 3. Cache the root-directory inode so the synchronous `root()` path has
         //    it without I/O.
         let root_inode = self.load_inode(format::FIRST_FREE_OBJECTID).await?;
-        self.state.lock().root_inode = Some(root_inode);
+        self.view.lock().root_inode = Some(root_inode);
 
         // 4. Honor the on-disk default subvolume, if one is set to a subvolume
         //    other than FS_TREE (an explicit `subvolid=`/`subvol=` overrides this
@@ -1495,35 +1713,6 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             }
         }
         Ok(())
-    }
-
-    /// Run [`crate::rw_gate`] on a volume about to be mounted read-write and
-    /// claim its fsid; on any refusal, log it and turn the volume read-only.
-    async fn apply_rw_gate(&self) {
-        if self.is_read_only() {
-            return;
-        }
-        let profile = crate::rw_gate::active_profile();
-        let sb = self.superblock();
-        let verdict = match crate::rw_gate::check_superblock(&sb, self.super_flags, profile) {
-            Ok(()) => crate::rw_gate::check_trees(self).await,
-            Err(why) => Err(why),
-        };
-        let verdict = verdict.and_then(|()| {
-            if self.claim_fsid {
-                crate::rw_gate::claim_writer(sb.fsid, profile).map(Some)
-            } else {
-                Ok(None)
-            }
-        });
-        match verdict {
-            Ok(claim) => *self.writer_claim.lock() = claim,
-            Err(why) => {
-                self.read_only
-                    .store(true, core::sync::atomic::Ordering::Release);
-                crate::rw_gate::report(&sb.fsid, profile, &why);
-            }
-        }
     }
 
     /// The objectid of the on-disk default subvolume, from the root tree's
@@ -1571,7 +1760,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// Cached root-directory inode (available after mount completes).
     pub fn root_inode(&self) -> Option<InodeItem> {
-        self.state.lock().root_inode
+        self.view.lock().root_inode
     }
 
     /// The session allocation floor — writes seed their allocator from at least
@@ -1596,11 +1785,19 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         offset: u64,
         src: &[u8],
     ) -> Result<(), FsError> {
-        if self.is_read_only() {
+        if self.core_read_only() {
             return Err(FsError::ReadOnly);
         }
         let member = self.member(devid)?;
-        write_exact_to(&*member.device, &member.io, member.capacity, offset, src).await
+        write_exact_to(
+            &*member.device,
+            &member.io,
+            member.capacity,
+            offset,
+            src,
+            false,
+        )
+        .await
     }
 
     /// Write `src` at btrfs *logical* address `logical` (single-chunk range).
@@ -1712,18 +1909,23 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     pub(crate) async fn write_staged_super(&self) -> Result<(), FsError> {
         let staged = self.staged_super.lock().take();
         let Some((raw, root_admin)) = staged else {
-            // Nothing outstanding; the barrier is all that is owed.
-            self.flush().await;
-            return Ok(());
+            // Nothing outstanding; the barrier is all that is owed (fsync of
+            // data already covered by a durable superblock).
+            return self.flush().await;
         };
-        // Every staged commit's nodes were written before this point, so one
-        // barrier covers all of them — the ordering the superblock relies on
-        // is "all tree blocks durable first", not "one flush per commit".
-        self.flush().await;
-        if root_admin {
-            self.write_superblock_root_admin(&raw).await?;
+        // Every staged commit's nodes were written before this point. The
+        // superblock writer issues the one pre-flush that makes them durable
+        // before the FUA primary (`write_all_supers`).
+        let written = if root_admin {
+            self.write_superblock_root_admin(&raw).await
         } else {
-            self.write_superblock(&raw).await?;
+            self.write_superblock(&raw).await
+        };
+        if let Err(error) = written {
+            // Keep the image: it is still what the in-memory trees describe.
+            // The filesystem is now in its error state and takes no writes.
+            *self.staged_super.lock() = Some((raw, root_admin));
+            return Err(error);
         }
         self.staged_count
             .store(0, core::sync::atomic::Ordering::Release);
@@ -1909,11 +2111,17 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// the filesystem. Every copy records its own physical offset in `bytenr@48`
     /// (so its checksum differs), and a real kernel picks the copy with the
     /// newest generation — so all copies must advance together on each commit or
-    /// `btrfs check` reports a mismatch. The primary is written last, after its
-    /// mirrors are durable, so a torn write can never leave the newest primary
-    /// pointing at trees an out-of-date mirror would supersede on recovery.
+    /// `btrfs check` reports a mismatch. The order is Linux `write_all_supers`
+    /// (see [`Self::write_all_supers`]): pre-flush, FUA primary, mirrors.
+    ///
+    /// Gated on the filesystem, not this mount: the superblock is the core's,
+    /// and a commit or `fsync` may reach it through any mount, including a
+    /// read-only view of a writable filesystem.
     pub async fn write_superblock(&self, raw: &[u8]) -> Result<(), FsError> {
-        if !self.supports_writes() {
+        if self.core_read_only()
+            || self.degraded
+            || self.aborted.load(core::sync::atomic::Ordering::Acquire)
+        {
             return Err(FsError::ReadOnly);
         }
         self.write_superblock_unchecked(raw).await
@@ -1921,27 +2129,56 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// Superblock half of [`Self::write_node_root_admin`].
     pub(crate) async fn write_superblock_root_admin(&self, raw: &[u8]) -> Result<(), FsError> {
-        if self.degraded || self.is_read_only() {
+        if self.degraded || self.core_read_only() {
             return Err(FsError::ReadOnly);
         }
         self.write_superblock_unchecked(raw).await
     }
 
     async fn write_superblock_unchecked(&self, raw: &[u8]) -> Result<(), FsError> {
+        let result = self.write_all_supers(raw).await;
+        if result.is_err() {
+            // `btrfs_handle_fs_error` after a failed `write_all_supers`: the
+            // trees in memory are ahead of anything durable, so the only
+            // honest state is the filesystem error state — read-only.
+            self.abort_transaction();
+        }
+        result
+    }
+
+    /// Linux `write_all_supers` (`fs/btrfs/disk-io.c`):
+    ///
+    /// 1. `barrier_all_devices` → `write_dev_flush` / `wait_dev_flush`: a
+    ///    pre-flush on every member, waited for, so every tree and data block
+    ///    of the transaction (all submitted and completed by now) is durable
+    ///    before any superblock names it. A failed flush fails the commit
+    ///    before a single superblock byte is written.
+    /// 2. `write_dev_supers` / `wait_dev_supers`: on each member the primary
+    ///    copy with `REQ_FUA`, then the mirrors without it (they become
+    ///    durable with the next transaction's pre-flush). A failed mirror is
+    ///    tolerated; a failed primary counts against the device, and the
+    ///    commit fails once more devices fail than `num_devices - 1`.
+    async fn write_all_supers(&self, raw: &[u8]) -> Result<(), FsError> {
         if raw.len() != format::SUPERBLOCK_SIZE {
             return Err(FsError::InvalidData);
         }
-        // Mirrors first (highest offset to lowest), primary (offset 0) last,
-        // across every member. Common transaction fields are shared, while the
-        // embedded dev_item remains unique to each device.
+        // Common transaction fields are shared, while the embedded dev_item
+        // remains unique to each device.
         let members: Vec<(u64, Arc<VolumeDevice<B>>)> = self
             .devices
             .lock()
             .iter()
             .map(|(&devid, member)| (devid, member.clone()))
             .collect();
-        for &offset in format::SUPERBLOCK_MIRROR_OFFSETS.iter().rev() {
-            for (devid, member) in &members {
+        for (_, member) in &members {
+            member.device.flush_result().await.map_err(FsError::Io)?;
+        }
+        let max_errors = members.len().saturating_sub(1);
+        let mut errors = 0usize;
+        let mut primary_ok = None;
+        for (devid, member) in &members {
+            let mut device_ok = true;
+            for &offset in &format::SUPERBLOCK_MIRROR_OFFSETS {
                 if offset + format::SUPERBLOCK_SIZE as u64 > member.capacity {
                     continue; // this mirror doesn't fit on this member
                 }
@@ -1952,24 +2189,47 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                 copy[d..d + format::SUPERBLOCK_DEV_ITEM_SIZE]
                     .copy_from_slice(&*member.dev_item.lock());
                 crate::checksum::stamp_block(self.csum_type, &mut copy)?;
-                self.write_physical_on(*devid, offset, &copy).await?;
-                member.device.flush().await; // each copy durable before the next
+                let primary = offset == format::SUPERBLOCK_OFFSET;
+                if self.core_read_only() {
+                    return Err(FsError::ReadOnly);
+                }
+                let written = write_exact_to(
+                    &*member.device,
+                    &member.io,
+                    member.capacity,
+                    offset,
+                    &copy,
+                    primary,
+                )
+                .await;
+                if primary && written.is_err() {
+                    device_ok = false;
+                    break;
+                }
+            }
+            if device_ok {
+                primary_ok.get_or_insert(*devid);
+            } else {
+                errors += 1;
             }
         }
-        let devid = members
-            .first()
-            .map(|(devid, _)| *devid)
-            .ok_or(FsError::NotFound)?;
+        if errors > max_errors {
+            return Err(FsError::Io(BlockError::IOError));
+        }
+        let devid = primary_ok.ok_or(FsError::NotFound)?;
         self.state.lock().superblock_source = (devid, format::SUPERBLOCK_OFFSET);
         Ok(())
     }
 
-    /// Flush the backing device.
-    pub async fn flush(&self) {
+    /// Flush every member's volatile write cache, waiting for completion
+    /// (`blkdev_issue_flush`). The durability barrier of `fsync` and of every
+    /// commit.
+    pub async fn flush(&self) -> Result<(), FsError> {
         let members: Vec<Arc<VolumeDevice<B>>> = self.devices.lock().values().cloned().collect();
         for member in members {
-            member.device.flush().await;
+            member.device.flush_result().await.map_err(FsError::Io)?;
         }
+        Ok(())
     }
 
     /// Read the selected raw superblock and normalize it to primary-copy form.
@@ -2019,7 +2279,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// The transaction accumulating operations that have not committed yet.
     pub(crate) fn fs_batch(&self) -> &Mutex<Option<crate::write::FsBatch>> {
-        &self.fs_batch
+        self.core.fs_batch()
     }
 
     /// Publish an fs-tree root produced *inside* an open batch.
@@ -2039,9 +2299,42 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// `superblock.generation`, because every operation of the batch derives
     /// its generation from that field and they all have to agree.
     pub(crate) fn advance_fs_root(&self, new_fs_root: u64, new_fs_level: u8) {
+        let id = self.fs_tree_id();
+        if let Some(live) = self.state.lock().subvols.get_mut(&id) {
+            live.root = new_fs_root;
+            live.level = new_fs_level;
+        }
+    }
+
+    /// Publish a committed root for a tree other than this mount's (a
+    /// snapshot source or destination, a new subvolume), so mounts of it
+    /// observe the commit. A tree no mount has selected is not tracked.
+    pub(crate) fn publish_subvol_root(&self, id: u64, root: u64, level: u8) {
+        if let Some(live) = self.state.lock().subvols.get_mut(&id) {
+            live.root = root;
+            live.level = level;
+        }
+    }
+
+    /// Re-root this mount at `id`. A subvolume another mount already tracks
+    /// keeps its live root: that one may be newer than the root tree (a batch
+    /// staged through the other mount), and the root tree can never be newer
+    /// than it.
+    fn select_subvol(&self, id: u64, root: u64, level: u8, flags: u64) {
+        let mut view = self.view.lock();
         let mut g = self.state.lock();
-        g.fs_tree_root = new_fs_root;
-        g.fs_tree_level = new_fs_level;
+        let previous = view.fs_tree_id;
+        if let Some(live) = g.subvols.get_mut(&previous) {
+            live.mounts = live.mounts.saturating_sub(1);
+        }
+        let live = g.subvols.entry(id).or_insert(LiveSubvol {
+            root,
+            level,
+            flags,
+            mounts: 0,
+        });
+        live.mounts += 1;
+        view.fs_tree_id = id;
     }
 
     /// After a COW commit, publish the new roots into the live volume so
@@ -2055,15 +2348,22 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         new_fs_tree_flags: Option<u64>,
         incompat_flags_add: u64,
     ) {
+        // Lock order is view before state (see `select_subvol`).
+        let id = self.fs_tree_id();
         let mut g = self.state.lock();
         g.superblock.root = new_root_tree;
         g.superblock.generation = new_generation;
         g.superblock.incompat_flags |= incompat_flags_add;
-        g.fs_tree_root = new_fs_root;
-        g.fs_tree_level = new_fs_level;
+        let live = g.subvols.entry(id).or_insert(LiveSubvol {
+            root: new_fs_root,
+            level: new_fs_level,
+            flags: 0,
+            mounts: 0,
+        });
+        live.root = new_fs_root;
+        live.level = new_fs_level;
         if let Some(flags) = new_fs_tree_flags {
-            g.fs_tree_flags = flags;
-            g.writable_fs_tree = !self.degraded && flags & format::ROOT_SUBVOL_RDONLY == 0;
+            live.flags = flags;
         }
     }
 
@@ -2126,6 +2426,16 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         g.superblock.incompat_flags |= incompat_flags_add;
     }
 
+    /// Record the root-tree (and, after chunk growth, chunk-tree) root levels
+    /// a commit wrote into the superblock.
+    pub(crate) fn set_superblock_levels(&self, root_level: u8, chunk_root_level: Option<u8>) {
+        let mut g = self.state.lock();
+        g.superblock.root_level = root_level;
+        if let Some(level) = chunk_root_level {
+            g.superblock.chunk_root_level = level;
+        }
+    }
+
     /// Replace the complete cached system chunk array after balance rewrites
     /// one or more SYSTEM mappings.
     pub(crate) fn commit_sys_chunk_array(&self, array: Vec<u8>) -> Result<(), FsError> {
@@ -2169,6 +2479,7 @@ async fn write_exact_to<B: BlockDevice + 'static>(
     limit: u64,
     offset: u64,
     src: &[u8],
+    fua: bool,
 ) -> Result<(), FsError> {
     let end = offset
         .checked_add(src.len() as u64)
@@ -2212,7 +2523,7 @@ async fn write_exact_to<B: BlockDevice + 'static>(
         dst[in_block..in_block + copy].copy_from_slice(&src[done..done + copy]);
 
         let write = BlockRequest {
-            op: BlockOp::Write { fua: false },
+            op: BlockOp::Write { fua },
             lba,
             blocks: 1,
             buffer: guard

@@ -459,6 +459,19 @@ impl BlockDeviceSync for PartitionBlockDevice {
         let abs = self.start_lba + lba;
         self.parent.read(abs, n_blocks, out)
     }
+    fn flush(&self) -> Result<(), BlockIoError> {
+        self.parent.flush()
+    }
+    fn capabilities(&self) -> crate::registry::BlockCaps {
+        self.parent.capabilities()
+    }
+    fn write_fua(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
+        let n = n_blocks as u64;
+        if lba.checked_add(n).is_none_or(|end| end > self.sector_count) {
+            return Err(BlockIoError::OutOfRange);
+        }
+        self.parent.write_fua(self.start_lba + lba, n_blocks, data)
+    }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
         let n = n_blocks as u64;
         if lba.checked_add(n).is_none_or(|end| end > self.sector_count) {

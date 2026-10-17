@@ -9,23 +9,15 @@
 //! root mount turns a refusal into a visible boot failure
 //! ([`narf_filesystem::FsInstance::always_read_only`] on the refused volume).
 //!
-//! The gate also enforces **one writable [`crate::volume::BtrfsVolume`] per
-//! fsid** among VFS-visible mounts (the root factory and `mount -t btrfs`,
-//! both through [`crate::volume::BtrfsVolume::mount_devices_claimed`]):
-//! every btrfs mount builds an independent volume (allocator, transid,
-//! superblock image), so two writable instances of one filesystem would each
-//! commit over the other's free space. A later instance of an fsid that
-//! already has a live writer is forced read-only before it can write, and a
-//! read-write `mount(2)` of it fails with EROFS. Under [`Profile::RootRw`]
-//! the claim is never released for the rest of the boot. (Kernel tests that
-//! drive `BtrfsVolume::mount*` directly on a RAM image are not VFS mounts and
-//! hold no claim.)
+//! One filesystem has one writer: every mount of an fsid is a view over the
+//! single shared core ([`crate::registry`]), so the gate runs once per core
+//! and its verdict covers every subvolume mount of it. A read-write mount of
+//! a refused core fails with EROFS ([`crate::volume::BtrfsVolume::make_writable`]).
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_block::BlockDevice;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -81,10 +73,8 @@ const REPLACE_SUSPENDED: u64 = 4;
 /// than mis-edits) a link whose name lives only in an `INODE_EXTREF`.
 pub const WRITER_INCOMPAT: u64 = format::SUPPORTED_INCOMPAT_FLAGS;
 
-/// Compat-ro bits the writer maintains: the free-space tree (and its valid
-/// bit) — [`format::WRITE_SUPPORTED_COMPAT_RO_FLAGS`]. BLOCK_GROUP_TREE joins
-/// it there when the writer maintains that tree; until then a BGT volume
-/// (the CachyOS root) mounts read-only.
+/// Compat-ro bits the writer maintains — [`format::WRITE_SUPPORTED_COMPAT_RO_FLAGS`]:
+/// the free-space tree, its valid bit, and the block-group tree.
 pub const WRITER_COMPAT_RO: u64 = format::WRITE_SUPPORTED_COMPAT_RO_FLAGS;
 
 /// `narf.disks=root-rw`: the narrow incompat set a production root may
@@ -158,8 +148,6 @@ pub enum Refusal {
     ReplaceInProgress,
     /// Reloc roots of an interrupted relocation.
     RelocationInProgress,
-    /// Another writable instance of this fsid is live.
-    AnotherWriter,
 }
 
 fn push_bits(out: &mut String, bits: u64, name: fn(u32) -> Option<&'static str>) {
@@ -216,9 +204,6 @@ impl fmt::Display for Refusal {
             Refusal::BalanceInProgress => f.write_str("a balance is paused or running"),
             Refusal::ReplaceInProgress => f.write_str("a device replace is started or suspended"),
             Refusal::RelocationInProgress => f.write_str("an interrupted relocation is pending"),
-            Refusal::AnotherWriter => {
-                f.write_str("another writable mount of this filesystem is open")
-            }
         }
     }
 }
@@ -389,59 +374,6 @@ pub async fn check_trees<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Resu
         }
     }
     Ok(())
-}
-
-// ── One writer per fsid ─────────────────────────────────────────────
-
-struct Writer {
-    fsid: [u8; 16],
-    token: u64,
-    sticky: bool,
-}
-
-static WRITERS: IrqSafeSpinLock<Vec<Writer>> = IrqSafeSpinLock::new(Vec::new());
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
-
-/// A live writable volume's claim on its fsid. Dropping it (with the
-/// volume) releases the fsid, except under [`Profile::RootRw`], where the
-/// first writer keeps it for the whole boot.
-#[derive(Debug)]
-pub struct WriterClaim {
-    token: u64,
-}
-
-impl Drop for WriterClaim {
-    fn drop(&mut self) {
-        let mut writers = WRITERS.lock();
-        if let Some(pos) = writers
-            .iter()
-            .position(|w| w.token == self.token && !w.sticky)
-        {
-            writers.swap_remove(pos);
-        }
-    }
-}
-
-/// Claim `fsid` for a writable volume; `Err(AnotherWriter)` when another
-/// writer holds it (or, under `root-rw`, ever held it this boot).
-pub fn claim_writer(fsid: [u8; 16], profile: Profile) -> Result<WriterClaim, Refusal> {
-    let mut writers = WRITERS.lock();
-    if writers.iter().any(|w| w.fsid == fsid) {
-        return Err(Refusal::AnotherWriter);
-    }
-    let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-    writers.push(Writer {
-        fsid,
-        token,
-        sticky: profile == Profile::RootRw,
-    });
-    Ok(WriterClaim { token })
-}
-
-/// Test-only: forget every claim, sticky ones included.
-#[doc(hidden)]
-pub fn __reset_writers_for_test() {
-    WRITERS.lock().clear();
 }
 
 // ── Refusal record ──────────────────────────────────────────────────

@@ -29,6 +29,7 @@ mod affected;
 mod bench_stats;
 /// The `bpf-bench` subcommand: boot the suite, harvest the samples, apply §8.
 mod bpf_bench;
+mod btrfs_crash;
 mod btrfs_interop;
 mod cachyos_root;
 mod ci_clippy;
@@ -146,9 +147,13 @@ enum Cmd {
     /// `narf.disks=root-rw` running systemd-/pacman-shaped writes in `@`,
     /// `@home` and `@log`, then require host `btrfs check` clean, `btrfs
     /// restore` content matches and the GPT/ESP untouched. The host-exact
-    /// BLOCK_GROUP_TREE variant must be refused read-write by name and stay
-    /// bit-identical (`--bgt=refused`, until the writer maintains BGT).
+    /// BLOCK_GROUP_TREE variant is written the same way (`--bgt=writable`,
+    /// the default) or must be refused by name and stay bit-identical
+    /// (`--bgt=refused`).
     BtrfsRootrwInterop(btrfs_interop::Args),
+    /// Kill QEMU right after a btrfs `fsync` returns, reboot, and require the
+    /// data back plus a clean host `btrfs check` (commit durability).
+    BtrfsCrashSmoke(btrfs_crash::Args),
     /// Exercise real HTTP/3 from a running CachyOS guest through SLIRP.
     ///
     /// The host runs an in-process QUIC/HTTP/3 fixture. The guest's curl must
@@ -163,6 +168,13 @@ enum Cmd {
     /// keystrokes → narf_input ring → /dev/console → sys_read fd 0 →
     /// shell parser → echo built-in → sys_write fd 1 → UART.
     RunInteractive(RunInteractiveArgs),
+    /// NVMe flush + clean-shutdown check: boot with an extra scratch NVMe
+    /// disk (`nvme0`), write a token to it from the shell, `poweroff`, and
+    /// require every controller's `CC.SHN normal shutdown: Complete`; then
+    /// boot again on the same image (QEMU `cache=writeback`, so only a real
+    /// Flush makes the write durable on the host) and read the token back.
+    /// `--cmd` / `--expect` are ignored.
+    NvmePoweroffCheck(RunInteractiveArgs),
     /// Live TCP/UDP/DNS network-stack smoke. Boot with `qemu-net` (statically
     /// configures the virtio NIC with the SLIRP lease) + TCP and UDP QEMU
     /// `hostfwd` rules, round-trip payloads from the host through the guest
@@ -2445,7 +2457,14 @@ fn reconstruct_sparse_fixture(sparse_rel: &str, out: &Path) {
 /// `btrfs check` reports errors.
 fn verify_btrfs_write_interop() -> Result<()> {
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
-    let img = root.join("target").join("narf-nvme-btrfs.img");
+    // The boot-smoke phase's image, then the one the kernel-test phase wrote.
+    for name in ["narf-nvme-btrfs.img", "narf-nvme-btrfs-kernel-test.img"] {
+        verify_btrfs_image(&root.join("target").join(name))?;
+    }
+    Ok(())
+}
+
+fn verify_btrfs_image(img: &Path) -> Result<()> {
     if !img.exists() {
         return Ok(());
     }
@@ -2457,10 +2476,13 @@ fn verify_btrfs_write_interop() -> Result<()> {
         println!("xtask: skipping btrfs write-interop check (btrfs-progs not found)");
         return Ok(());
     }
-    println!("xtask: verifying NARF-written btrfs image with `btrfs check`...");
+    println!(
+        "xtask: verifying NARF-written btrfs image {} with `btrfs check`...",
+        img.display()
+    );
     let out = std::process::Command::new("btrfs")
         .arg("check")
-        .arg(&img)
+        .arg(img)
         .output()
         .context("failed to run `btrfs check`")?;
     let combined = format!(
@@ -2470,11 +2492,54 @@ fn verify_btrfs_write_interop() -> Result<()> {
     );
     if out.status.success() && combined.contains("no error found") {
         println!("xtask: btrfs write-interop OK — NARF-written image is `btrfs check` clean");
-        Ok(())
+        verify_btrfs_block_group_tree(img)
     } else {
         eprintln!("{combined}");
         bail!("`btrfs check` reported errors on the NARF-written image (write-interop regression)");
     }
+}
+
+/// On a BLOCK_GROUP_TREE image, cross-check with btrfs-progs that every chunk
+/// has its BLOCK_GROUP_ITEM in tree 11 and the extent tree holds none.
+/// No-op for images without the feature.
+fn verify_btrfs_block_group_tree(img: &Path) -> Result<()> {
+    let dump = |args: &[&str]| -> Result<String> {
+        let out = std::process::Command::new("btrfs")
+            .args(["inspect-internal"])
+            .args(args)
+            .arg(img)
+            .output()
+            .context("failed to run `btrfs inspect-internal`")?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let sb = dump(&["dump-super"])?;
+    let compat_ro = sb
+        .lines()
+        .find_map(|line| line.strip_prefix("compat_ro_flags"))
+        .and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0);
+    if compat_ro & (1 << 3) == 0 {
+        return Ok(());
+    }
+    let count = |text: &str, needle: &str| text.matches(needle).count();
+    let bgt = dump(&["dump-tree", "-t", "11"])?;
+    let chunks = dump(&["dump-tree", "-t", "3"])?;
+    let extent = dump(&["dump-tree", "-t", "2"])?;
+    let (bg_items, chunk_items) = (
+        count(&bgt, "BLOCK_GROUP_ITEM"),
+        count(&chunks, "CHUNK_ITEM"),
+    );
+    if bg_items == 0 || bg_items != chunk_items || count(&extent, "BLOCK_GROUP_ITEM") != 0 {
+        eprintln!("{bgt}");
+        bail!(
+            "block-group tree mismatch: {bg_items} BLOCK_GROUP_ITEMs in tree 11, \
+             {chunk_items} chunks, extent tree must hold none"
+        );
+    }
+    println!(
+        "xtask: block-group tree OK — {bg_items} block groups in tree 11 match the chunk tree"
+    );
+    Ok(())
 }
 
 /// The kernel's btrfs read/write smokes mutate whichever btrfs volume they
@@ -2504,7 +2569,16 @@ fn nvme_image_path() -> PathBuf {
         // NVMe hardware, and the written image stays mountable + `btrfs check`-clean
         // for a real Linux kernel. Verify manually with `mount -o loop` + `btrfs
         // check`.
-        reconstruct_sparse_fixture("drivers/fs/btrfs/testdata/fixture-bitmap.img.sparse", &path);
+        //
+        // `XTASK_BTRFS_NVME_FIXTURE=bgt` serves the block-group-tree fixture
+        // instead (the host CachyOS root's feature set: compat_ro 0xb,
+        // non-mixed 4K/16K, zstd, @-subvolumes), so the same write smoke and
+        // `btrfs check` postflight cover BLOCK_GROUP_TREE writes.
+        let fixture = match std::env::var("XTASK_BTRFS_NVME_FIXTURE").as_deref() {
+            Ok("bgt") => "drivers/fs/btrfs/testdata/fixture-bgt.img.sparse",
+            _ => "drivers/fs/btrfs/testdata/fixture-bitmap.img.sparse",
+        };
+        reconstruct_sparse_fixture(fixture, &path);
         return path;
     }
     // `NARF_NVME_IMG` selects an alternate NVMe disk verbatim (e.g. the
@@ -5893,6 +5967,49 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
     if failed > 0 {
         bail!("musl-demo failed ({} errors)", failed);
     }
+    Ok(())
+}
+
+/// `xtask nvme-poweroff-check` (see the `Cmd` doc).
+fn nvme_poweroff_check_cmd(args: &RunInteractiveArgs) -> Result<()> {
+    const TOKEN: &str = "NARF-FLUSH-TOKEN-7";
+    let root = workspace_root()?;
+    let img = root.join("target").join("narf-nvme-flushchk.img");
+    let _ = std::fs::remove_file(&img);
+    std::fs::File::create(&img)?.set_len(64 * 1024)?;
+    let prior = std::env::var("NARF_QEMU_EXTRA").ok();
+    // Listed before the default NVMe disk, so it probes as nvme0.
+    std::env::set_var(
+        "NARF_QEMU_EXTRA",
+        format!(
+            "{} -drive if=none,id=fchk,format=raw,cache=writeback,file={} \
+             -device nvme,drive=fchk,serial=flushchk",
+            prior.clone().unwrap_or_default(),
+            img.display()
+        ),
+    );
+    let result = (|| -> Result<()> {
+        let mut first = args.clone();
+        first.cmd = format!("/bin/echo {TOKEN} > /dev/nvme0n1; poweroff");
+        first.expect = "CC.SHN normal shutdown: Complete".into();
+        println!("xtask nvme-poweroff-check: boot 1 — write the token, poweroff");
+        run_interactive_cmd(&first)?;
+        let bytes = std::fs::read(&img)?;
+        if !bytes.starts_with(TOKEN.as_bytes()) {
+            bail!("the token is not on the host image after poweroff");
+        }
+        let mut second = args.clone();
+        second.cmd = "cat /dev/nvme0n1".into();
+        second.expect = TOKEN.into();
+        println!("xtask nvme-poweroff-check: boot 2 — read the token back");
+        run_interactive_cmd(&second)
+    })();
+    match prior {
+        Some(v) => std::env::set_var("NARF_QEMU_EXTRA", v),
+        None => std::env::remove_var("NARF_QEMU_EXTRA"),
+    }
+    result?;
+    println!("xtask nvme-poweroff-check: ok — flushed write survived poweroff + restart");
     Ok(())
 }
 
@@ -12727,6 +12844,14 @@ fn main() -> Result<()> {
                 // Gate on the kernel-test runner's exit status: a failing
                 // smoke makes the runner exit_kernel(1), which this fails on.
                 run_cmd_inner(&smoke_args, true)?;
+                // Phase 2 rebuilds the NVMe fixture from pristine, so keep the
+                // image the kernel tests themselves wrote (the shared-instance
+                // subvolume writers) for the postflight to check too.
+                let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
+                let _ = std::fs::copy(
+                    root.join("target").join("narf-nvme-btrfs.img"),
+                    root.join("target").join("narf-nvme-btrfs-kernel-test.img"),
+                );
                 if kernel_tests_only {
                     return Ok(());
                 }
@@ -12749,8 +12874,10 @@ fn main() -> Result<()> {
         Cmd::SystemdPid1(args) => systemd_pid1_cmd(&args),
         Cmd::CachyosRootSmoke(args) => cachyos_root::run(&args),
         Cmd::BtrfsRootrwInterop(args) => btrfs_interop::run_cmd(&args),
+        Cmd::BtrfsCrashSmoke(args) => btrfs_crash::run(&args),
         Cmd::Http3Smoke(args) => http3_smoke::run(&args),
         Cmd::RunInteractive(args) => run_interactive_cmd(&args),
+        Cmd::NvmePoweroffCheck(args) => nvme_poweroff_check_cmd(&args),
         Cmd::NetSmoke(args) => net_smoke_cmd(&args),
         Cmd::E1000ModuleNetSmoke(args) => e1000_module_net_smoke_cmd(&args),
         Cmd::IgbNetSmoke(args) => igb_net_smoke_cmd(&args),

@@ -934,19 +934,17 @@ impl DevNvmeCtrlProxy {
 fn nvme_ctrl_writable(ctrl: &NvmeCtrlNode) -> bool {
     match narf_block::disk_policy::policy() {
         narf_block::disk_policy::DiskPolicy::All => true,
-        narf_block::disk_policy::DiskPolicy::BootOnly => {
+        // The root modes restrict writes at least as tightly as boot-only:
+        // a namespace counts only if the policy lets it be written.
+        narf_block::disk_policy::DiskPolicy::BootOnly
+        | narf_block::disk_policy::DiskPolicy::RootRo
+        | narf_block::disk_policy::DiskPolicy::RootRw => {
             !ctrl.namespaces.is_empty()
                 && ctrl
                     .namespaces
                     .iter()
                     .all(|n| narf_block::disk_policy::write_allowed(n))
         }
-        // Raw controller commands address whole namespaces (Format NVM,
-        // Sanitize, Write at any LBA), never one partition, so under the
-        // root policies — where at most one partition is writable — the
-        // controller node is never writable.
-        narf_block::disk_policy::DiskPolicy::RootRo
-        | narf_block::disk_policy::DiskPolicy::RootRw => false,
     }
 }
 

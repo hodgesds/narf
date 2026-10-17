@@ -20,11 +20,12 @@
 //!    compared byte for byte. A `mount -o loop,ro` is attempted only when
 //!    passwordless `sudo -n` is available; otherwise it is skipped with a note
 //!    (unprivileged loop mounts of btrfs are not possible).
-//! 4. The BLOCK_GROUP_TREE variant is booted the same way. Until the writer
-//!    maintains the block-group tree it must be REFUSED read-write — the boot
-//!    names BLOCK_GROUP_TREE in its refusal and the image stays bit-identical
-//!    (`--bgt=refused`, the default). `--bgt=writable` runs the full write
-//!    test on it instead, for when that support lands.
+//! 4. The BLOCK_GROUP_TREE (host-exact) variant gets the same boots and
+//!    checks (`--bgt=writable`, the default). A fourth boot per image
+//!    (`fstab`) mounts the six other subvolumes read-write through the one
+//!    shared core and writes into all seven. `--bgt=refused` instead requires
+//!    the BGT image to be refused by name and stay bit-identical (a writer
+//!    without block-group-tree support).
 //!
 //! The filesystem UUID is deliberately not the host root's.
 
@@ -49,9 +50,10 @@ const ESP_START: u64 = 2048;
 /// What the BLOCK_GROUP_TREE (host-exact) variant must do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum BgtExpect {
-    /// Refused read-write (current writer): the image must stay unchanged.
+    /// Refused read-write (a writer without block-group-tree support): the
+    /// image must stay unchanged.
     Refused,
-    /// Written like the non-BGT variant (once the writer maintains BGT).
+    /// Written like the non-BGT variant (the default).
     Writable,
     /// Do not boot the BGT variant.
     Skip,
@@ -64,7 +66,7 @@ pub struct Args {
     pub build: super::BuildArgs,
 
     /// Expected outcome for the host-exact BLOCK_GROUP_TREE image.
-    #[arg(long, value_enum, default_value_t = BgtExpect::Refused)]
+    #[arg(long, value_enum, default_value_t = BgtExpect::Writable)]
     pub bgt: BgtExpect,
 
     /// Seconds to wait for each boot's verdict.
@@ -535,7 +537,12 @@ fn try_loop_mount(part: &Path, work: &Path) {
 
 fn write_boots(args: &Args, kernel: &Path, image: &Path, work: &Path, label: &str) -> Result<()> {
     let part = work.join(format!("{label}-part.img"));
-    for (subvol, mode) in [("@", "root"), ("@home", "home"), ("@log", "log")] {
+    for (subvol, mode) in [
+        ("@", "root"),
+        ("@home", "home"),
+        ("@log", "log"),
+        ("@", "fstab"),
+    ] {
         let (outside_before, _) = hashes(image)?;
         let lines = boot(args, kernel, image, &cmdline(subvol, mode))?;
         match verdict(&lines) {
@@ -618,6 +625,19 @@ fn write_boots(args: &Args, kernel: &Path, image: &Path, work: &Path, label: &st
         ],
         &[&format!("journal/{MACHINE_ID}/system@old.journal")],
     )?;
+    for subvol in ["@", "@home", "@root", "@srv", "@cache", "@tmp", "@log"] {
+        restore_and_compare(
+            &part,
+            work,
+            &ids,
+            subvol,
+            &[(
+                "narf-fstab.txt",
+                format!("written through the shared core into {subvol}\n").into_bytes(),
+            )],
+            &[],
+        )?;
+    }
     try_loop_mount(&part, work);
     Ok(())
 }

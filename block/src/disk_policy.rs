@@ -707,10 +707,30 @@ impl BlockDeviceSync for PolicyGuard {
     fn is_read_only(&self) -> bool {
         !self.permits_write() || self.inner.is_read_only()
     }
+    /// Forwarded even when writes are refused: a flush carries no data and
+    /// changes no media contents, it only drains the device's own cache.
+    fn flush(&self) -> Result<(), BlockIoError> {
+        self.inner.flush()
+    }
+    fn capabilities(&self) -> crate::registry::BlockCaps {
+        self.inner.capabilities()
+    }
+    fn write_fua(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
+        if self.permits_write() {
+            return self.inner.write_fua(lba, n_blocks, data);
+        }
+        self.refuse(lba, n_blocks)
+    }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
         if self.permits_write() {
             return self.inner.write(lba, n_blocks, data);
         }
+        self.refuse(lba, n_blocks)
+    }
+}
+
+impl PolicyGuard {
+    fn refuse(&self, lba: u64, n_blocks: u16) -> Result<(), BlockIoError> {
         REFUSED.fetch_add(1, Ordering::Relaxed);
         if !self.warned.swap(true, Ordering::Relaxed) {
             let policy = policy();

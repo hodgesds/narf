@@ -18,6 +18,8 @@
 //! - `log` (`@log`): journald: header rewrite and appends on a `chattr +C`
 //!   (`NODATACOW|NODATASUM`) `system.journal`, rotation by rename, a new
 //!   journal, removal of an old archived one.
+//! - `fstab` (`@`): mount the six other CachyOS subvolumes read-write as
+//!   the fstab does — views of one shared core — and write into each.
 
 use alloc::format;
 use alloc::string::String;
@@ -359,6 +361,57 @@ async fn run_log(root: &Arc<dyn DirOps>, machine_id: &str) -> Result<(), &'stati
     Ok(())
 }
 
+/// The CachyOS fstab subvolumes other than `@`, mounted by the `fstab` mode.
+pub const FSTAB_SUBVOLUMES: [&str; 6] = ["@home", "@root", "@srv", "@cache", "@tmp", "@log"];
+
+/// Content the `fstab` mode writes into `<subvolume>/narf-fstab.txt`.
+pub fn fstab_marker(subvol: &str) -> Vec<u8> {
+    format!("written through the shared core into {subvol}\n").into_bytes()
+}
+
+/// `fstab` mode: with `@` at `/`, mount every other CachyOS subvolume
+/// read-write the way systemd's fstab units do (`mount -t btrfs -o
+/// subvol=/@x,defaults,noatime,compress=zstd:1`) — each a view of the one
+/// shared core — and write a file into each, plus one into `@`.
+async fn run_fstab(root: &Arc<dyn DirOps>) -> Result<(), &'static str> {
+    let device = narf_block::disk_policy::designated_root().ok_or("no designated root")?;
+    let source = format!("/dev/{device}");
+    let fstype = narf_filesystem::lookup_fstype("btrfs").ok_or("btrfs fstype missing")?;
+    let mut mounted = Vec::new();
+    for subvol in FSTAB_SUBVOLUMES {
+        let options = format!("subvol=/{subvol},defaults,noatime,compress=zstd:1");
+        let fs = fstype
+            .init(&narf_filesystem::MountRequest {
+                fs_type: "btrfs",
+                source: &source,
+                options: &options,
+                uid: 0,
+                gid: 0,
+                umask: 0o022,
+                initial_namespace: true,
+                read_only: false,
+            })
+            .map_err(|_| "a read-write fstab subvolume mount was refused")?;
+        if fs.always_read_only() {
+            return Err("an fstab subvolume mount came up read-only");
+        }
+        let dir = fs.root();
+        let file = dir.create("narf-fstab.txt").await.map_err(|_| "create in subvolume")?;
+        write_all(&file, 0, &fstab_marker(subvol))
+            .await
+            .map_err(|_| "write in subvolume")?;
+        mounted.push((subvol, fs));
+    }
+    let file = root.create("narf-fstab.txt").await.map_err(|_| "create in @")?;
+    write_all(&file, 0, &fstab_marker("@")).await.map_err(|_| "write in @")?;
+    // One sync covers every subvolume: they share one transaction.
+    root.syncfs().await.map_err(|_| "syncfs")?;
+    for (subvol, fs) in &mounted {
+        expect(&fs.root(), "narf-fstab.txt", &fstab_marker(subvol)).await?;
+    }
+    expect(root, "narf-fstab.txt", &fstab_marker("@")).await
+}
+
 /// Machine id of the interop image (journal directory name).
 pub const MACHINE_ID: &str = "4e415246c4c405ee00000000000000aa";
 
@@ -384,6 +437,7 @@ pub fn run(mode: &str) -> narf_init::InitResult {
             "root" => run_root(&root).await,
             "home" => run_home(&root).await,
             "log" => run_log(&root, MACHINE_ID).await,
+            "fstab" => run_fstab(&root).await,
             _ => Err("unknown mode"),
         }
     });

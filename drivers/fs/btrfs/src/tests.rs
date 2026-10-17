@@ -3120,13 +3120,12 @@ fn smoke_btrfs_registration() -> TestResult {
         initial_namespace: true,
         read_only: false,
     };
-    // The builder rejects options that would change on-disk state NARF does
-    // not maintain before touching a device.
+    // The builder rejects format-affecting options before touching a device.
     if !matches!(
-        crate::btrfs_fstype_builder(&request("rw,clear_cache")),
+        crate::btrfs_fstype_builder(&request("nodatacow")),
         Err(FsError::Unsupported)
     ) {
-        return TestResult::Fail("builder should reject clear_cache");
+        return TestResult::Fail("builder should reject nodatacow");
     }
     // A read-only mount of a missing device fails with NotFound, not a panic.
     if !matches!(
@@ -10851,10 +10850,16 @@ fn smoke_btrfs_rw_gate_superblock_refusals() -> TestResult {
             Some(Refusal::Incompat(format::INCOMPAT_MIXED_GROUPS)),
         ),
         (
-            "BLOCK_GROUP_TREE not written yet",
+            "BLOCK_GROUP_TREE (the host root's exact flags) is written",
             |sb, _| sb.compat_ro_flags |= rw_gate::COMPAT_RO_BLOCK_GROUP_TREE,
-            Some(Refusal::CompatRo(rw_gate::COMPAT_RO_BLOCK_GROUP_TREE)),
-            Some(Refusal::CompatRo(rw_gate::COMPAT_RO_BLOCK_GROUP_TREE)),
+            None,
+            None,
+        ),
+        (
+            "BLOCK_GROUP_TREE without a free-space tree",
+            |sb, _| sb.compat_ro_flags = rw_gate::COMPAT_RO_BLOCK_GROUP_TREE,
+            Some(Refusal::FreeSpaceTreeInvalid),
+            Some(Refusal::FreeSpaceTreeInvalid),
         ),
         (
             "VERITY",
@@ -10962,9 +10967,9 @@ fn smoke_btrfs_rw_gate_superblock_refusals() -> TestResult {
         }
     }
     // Refusal messages name the bit, as the root-rw failure banner shows it.
-    let msg = alloc::format!("{}", Refusal::CompatRo(rw_gate::COMPAT_RO_BLOCK_GROUP_TREE));
-    if !msg.contains("BLOCK_GROUP_TREE") {
-        return TestResult::Fail("the refusal must name BLOCK_GROUP_TREE");
+    let msg = alloc::format!("{}", Refusal::CompatRo(1 << 2));
+    if !msg.contains("VERITY") {
+        return TestResult::Fail("the refusal must name the feature bit");
     }
     let (incompat, compat_ro) = rw_gate::supported_features(Profile::RootRw);
     if incompat
@@ -10978,7 +10983,12 @@ fn smoke_btrfs_rw_gate_superblock_refusals() -> TestResult {
             "SKINNY_METADATA",
             "NO_HOLES",
         ]
-        || compat_ro != ["FREE_SPACE_TREE", "FREE_SPACE_TREE_VALID"]
+        || compat_ro
+            != [
+                "FREE_SPACE_TREE",
+                "FREE_SPACE_TREE_VALID",
+                "BLOCK_GROUP_TREE",
+            ]
     {
         return TestResult::Fail("root-rw feature list changed without updating this test");
     }
@@ -11024,7 +11034,6 @@ fn restamp_superblock(image: &mut [u8], edit: impl Fn(&mut [u8])) {
 
 /// A superblock in the error state is mounted read-only: no byte changes.
 fn smoke_btrfs_rw_gate_error_state_mounts_read_only() -> TestResult {
-    crate::rw_gate::__reset_writers_for_test();
     let mut image = decode_sparse(FIXTURE_FST_SPARSE);
     restamp_superblock(&mut image, |sb| {
         let flags = format::le64(sb, crate::rw_gate::OFF_SUPER_FLAGS).unwrap_or(0)
@@ -11085,7 +11094,6 @@ fn patch_leaf_key(
 /// mount (Linux would resume them; NARF cannot).
 fn smoke_btrfs_rw_gate_tree_refusals() -> TestResult {
     use narf_block::ram::RamBlockDevice;
-    crate::rw_gate::__reset_writers_for_test();
     let pristine = decode_sparse(FIXTURE_FST_SPARSE);
     // Locate the root and dev tree roots through a read-only mount.
     let probe = match poll_once(BtrfsVolume::mount_devices_read_only(
@@ -11163,68 +11171,41 @@ fn smoke_btrfs_rw_gate_tree_refusals() -> TestResult {
 }
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rw_gate_tree_refusals);
 
-/// At most one writable volume per fsid: a second read-write mount of the
-/// same filesystem (another fstab subvolume) comes up read-only; once the
-/// writer is gone the fsid can be written again — except under root-rw,
-/// where the first writer's claim lasts the boot.
-fn smoke_btrfs_rw_gate_one_writer_per_fsid() -> TestResult {
-    use crate::rw_gate::{claim_writer, Profile, Refusal};
-    use narf_block::ram::RamBlockDevice;
-    crate::rw_gate::__reset_writers_for_test();
-    let image = decode_sparse(FIXTURE_FST_SPARSE);
-    let mount = |img: Vec<u8>| {
-        poll_once(BtrfsVolume::mount_devices_claimed(
-            alloc::vec![RamBlockDevice::from_image(512, img)],
-            DomainId::DRIVER_0,
+/// One writer per filesystem: two read-write subvolume mounts of one fsid
+/// (CachyOS's `/` and `/home`) are views of one shared core — both
+/// writable, one transaction — never two independent writers.
+fn smoke_btrfs_rw_gate_one_core_per_fsid() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let dev = writable_sparse(FIXTURE_LAPTOP_SPARSE);
+    let source = dev.clone() as Arc<dyn narf_block::BlockDeviceSync>;
+    let mount = |subvol: &str| {
+        poll_once(crate::registry::mount(
+            &source,
+            alloc::vec![narf_block::SyncBlock::new(source.clone())],
+            Some(crate::volume::Subvol::Name(subvol.into())),
             false,
         ))
     };
-    let first = match mount(image.clone()) {
-        Some(Ok(v)) => v,
-        _ => return TestResult::Fail("first mount failed"),
+    let (Some(Ok(root)), Some(Ok(home))) = (mount("root"), mount("home")) else {
+        return TestResult::Fail("subvolume mounts failed");
     };
-    let second = match mount(image.clone()) {
-        Some(Ok(v)) => v,
-        _ => return TestResult::Fail("second mount failed"),
-    };
-    if first.is_read_only() || !second.is_read_only() {
-        return TestResult::Fail("the second writable mount of one fsid must be read-only");
+    if !Arc::ptr_eq(root.core(), home.core()) {
+        return TestResult::Fail("two mounts of one fsid built two cores (two writers)");
     }
-    if !crate::rw_gate::last_refusal().is_some_and(|m| m.contains("another writable mount")) {
-        return TestResult::Fail("the second-writer refusal must be logged");
+    if root.is_read_only() || home.is_read_only() {
+        return TestResult::Fail("every subvolume mount of a writable core must be writable");
     }
-    // A write through the read-only instance is refused.
-    {
-        use narf_filesystem::FsInstance;
-        if !matches!(
-            poll_once(second.root().create("second-writer")),
-            Some(Err(FsError::ReadOnly))
-        ) {
-            return TestResult::Fail("the read-only second instance accepted a write");
+    for (vol, name) in [(&root, "in-root"), (&home, "in-home")] {
+        if !matches!(poll_once(vol.root().create(name)), Some(Ok(_))) {
+            return TestResult::Fail("a subvolume mount refused a write");
         }
     }
-    drop(second);
-    drop(first);
-    let third = match mount(image) {
-        Some(Ok(v)) => v,
-        _ => return TestResult::Fail("third mount failed"),
-    };
-    if third.is_read_only() {
-        return TestResult::Fail("a released fsid must be writable again (default profile)");
+    if poll_once(root.sync_to_disk()).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("sync failed");
     }
-    drop(third);
-    // root-rw: the claim is sticky for the boot.
-    let fsid = [0x5Au8; 16];
-    let claim = claim_writer(fsid, Profile::RootRw);
-    drop(claim);
-    let again = claim_writer(fsid, Profile::RootRw);
-    crate::rw_gate::__reset_writers_for_test();
-    match again {
-        Err(Refusal::AnotherWriter) => TestResult::Pass,
-        _ => TestResult::Fail("under root-rw the first writer keeps its fsid for the boot"),
-    }
+    TestResult::Pass
 }
-kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rw_gate_one_writer_per_fsid);
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rw_gate_one_core_per_fsid);
 
 /// Mount options a CachyOS fstab and live mount carry are accepted; options
 /// that would change on-disk state NARF does not maintain are refused.
@@ -11412,29 +11393,691 @@ kernel_test_in!(
     smoke_btrfs_allocations_respect_block_group_type
 );
 
-/// The host CachyOS root's exact feature set (BLOCK_GROUP_TREE) is refused
-/// read-write — by name, on the console — until the writer maintains the
-/// block-group tree; nothing is written.
-fn smoke_btrfs_rw_gate_names_block_group_tree() -> TestResult {
-    crate::rw_gate::__reset_writers_for_test();
+/// The host CachyOS root's exact feature set (BLOCK_GROUP_TREE, compat_ro
+/// 0xb, incompat 0x371) passes the write-safety gate in both profiles.
+fn smoke_btrfs_rw_gate_accepts_block_group_tree() -> TestResult {
+    use crate::rw_gate::{check_superblock, Profile, SUPER_FLAG_WRITTEN};
     let dev = writable_sparse(FIXTURE_BGT_SPARSE);
-    if mount_writable(dev.clone()).is_ok() {
-        if crate::rw_gate::WRITER_COMPAT_RO & crate::rw_gate::COMPAT_RO_BLOCK_GROUP_TREE != 0 {
-            return TestResult::Pass; // the writer maintains BGT now
+    let vol = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => {
+            return TestResult::Fail("the BLOCK_GROUP_TREE fixture refused a read-write mount")
         }
-        return TestResult::Fail("a BLOCK_GROUP_TREE volume mounted read-write");
+    };
+    if vol.is_read_only() {
+        return TestResult::Fail("the gate refused the host feature set");
     }
-    if !dev.overlay.lock().is_empty() {
-        return TestResult::Fail("the refused mount wrote to the device");
-    }
-    match crate::rw_gate::last_refusal() {
-        Some(msg) if msg.contains("BLOCK_GROUP_TREE") && msg.contains("REFUSING") => {
-            TestResult::Pass
+    let sb = vol.superblock();
+    for profile in [Profile::Default, Profile::RootRw] {
+        if check_superblock(&sb, SUPER_FLAG_WRITTEN, profile).is_err() {
+            return TestResult::Fail("the host feature set must pass both profiles");
         }
-        _ => TestResult::Fail("the refusal must name BLOCK_GROUP_TREE"),
     }
+    TestResult::Pass
 }
 kernel_test_in!(
     "drivers/fs/btrfs",
-    smoke_btrfs_rw_gate_names_block_group_tree
+    smoke_btrfs_rw_gate_accepts_block_group_tree
+);
+
+/// Block-group-tree writes, as Linux `update_block_group_item` /
+/// `insert_block_group_item` do them: allocation and free update `used` in tree
+/// 11, a chunk allocation inserts its new DATA and METADATA block groups there,
+/// tree 11 is COWed with METADATA_ITEMs owned by root 11, its ROOT_ITEM moves,
+/// the extent tree never gains a block group item, `bytes_used` stays the sum,
+/// and the result remounts (mount re-validates every block group).
+fn smoke_btrfs_block_group_tree_write() -> TestResult {
+    use alloc::format;
+    use narf_filesystem::FsInstance;
+
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("block-group-tree fixture refused a read-write mount"),
+    };
+    if !vol.supports_writes() {
+        return TestResult::Fail("block-group-tree mount is not writable");
+    }
+    let bg_state = |vol: &BtrfsVolume<narf_block::SyncBlock>| {
+        let root_tree = vol.root_tree_root().0;
+        let (bgt, bgt_level) = match poll_once(crate::roots::find_root(
+            vol,
+            root_tree,
+            format::BLOCK_GROUP_TREE_OBJECTID,
+        )) {
+            Some(Ok(r)) => r,
+            _ => return Err("tree 11 root missing"),
+        };
+        let ext = match poll_once(crate::roots::find_root(
+            vol,
+            root_tree,
+            format::EXTENT_TREE_OBJECTID,
+        )) {
+            Some(Ok((r, _))) => r,
+            _ => return Err("extent root missing"),
+        };
+        let bgs = match poll_once(crate::block_group::read_block_groups(vol, bgt)) {
+            Some(Ok(b)) => b,
+            _ => return Err("tree 11 unreadable"),
+        };
+        match poll_once(crate::block_group::read_block_groups(vol, ext)) {
+            Some(Ok(e)) if e.is_empty() => {}
+            _ => return Err("extent tree gained a block group item"),
+        }
+        // The tree-11 root block is accounted to root 11 in the extent tree.
+        match poll_once(btree::find_item(
+            vol,
+            ext,
+            &BtrfsKey::new(bgt, format::METADATA_ITEM_KEY, u64::from(bgt_level)),
+        )) {
+            Some(Ok(Some(body))) if body.len() >= 24 + 9 => {
+                let ref_type = body[24];
+                let ref_root = format::le64(&body, 25).unwrap_or(0);
+                if ref_type != 176 || ref_root != format::BLOCK_GROUP_TREE_OBJECTID {
+                    return Err("tree 11 block not owned by root 11");
+                }
+            }
+            _ => return Err("tree 11 root block has no METADATA_ITEM"),
+        }
+        let used: u64 = bgs
+            .iter()
+            .map(|(_, _, b)| format::le64(b, 0).unwrap_or(0))
+            .sum();
+        // The durable superblock (every caller syncs first).
+        if used != super_bytes_used(&dev) {
+            return Err("bytes_used != sum of tree-11 block group used");
+        }
+        for &(start, len, _) in &bgs {
+            if vol.logical_chunk_remaining(start) != Ok(len) {
+                return Err("a tree-11 block group does not match its chunk");
+            }
+        }
+        Ok((bgt, bgs))
+    };
+    let (bgt0, bgs0) = match bg_state(&vol) {
+        Ok(s) => s,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let data_used = |bgs: &[(u64, u64, Vec<u8>)]| -> u64 {
+        bgs.iter()
+            .filter(|(_, _, b)| format::le64(b, 16).unwrap_or(0) & format::BLOCK_GROUP_DATA != 0)
+            .map(|(_, _, b)| format::le64(b, 0).unwrap_or(0))
+            .sum()
+    };
+    let count = |bgs: &[(u64, u64, Vec<u8>)], kind: u64| {
+        bgs.iter()
+            .filter(|(_, _, b)| format::le64(b, 16).unwrap_or(0) & kind != 0)
+            .count()
+    };
+
+    // 12 MiB of incompressible-ish data overflows the 8 MiB data block group,
+    // forcing a chunk allocation (one new DATA + one new METADATA group).
+    const MIB: usize = 1 << 20;
+    let file = match poll_once(vol.root().create("bgt-big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create on block-group-tree fs failed"),
+    };
+    let mut chunk = alloc::vec![0u8; MIB];
+    for i in 0..12usize {
+        let mut x = (i as u32).wrapping_mul(2_654_435_761) | 1;
+        for b in chunk.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x as u8;
+        }
+        match poll_once(file.write((i * MIB) as u64, &chunk)) {
+            Some(Ok(n)) if n == MIB => {}
+            Some(Err(FsError::NoSpace)) => return TestResult::Fail("12 MiB write hit NoSpace"),
+            _ => return TestResult::Fail("12 MiB write on block-group-tree fs failed"),
+        }
+    }
+    // A write into a non-default subvolume commits through the same trees.
+    if poll_once(vol.sync_to_disk()).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("sync after big write failed");
+    }
+    let (bgt1, bgs1) = match bg_state(&vol) {
+        Ok(s) => s,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if bgt1 == bgt0 {
+        return TestResult::Fail("tree 11 was not COWed by the write");
+    }
+    if count(&bgs1, format::BLOCK_GROUP_DATA) <= count(&bgs0, format::BLOCK_GROUP_DATA)
+        || count(&bgs1, format::BLOCK_GROUP_METADATA) <= count(&bgs0, format::BLOCK_GROUP_METADATA)
+    {
+        return TestResult::Fail("chunk allocation did not add DATA + METADATA groups to tree 11");
+    }
+    let used_after_write = data_used(&bgs1);
+    if used_after_write < data_used(&bgs0) + 12 * MIB as u64 / 2 {
+        return TestResult::Fail("data block group used did not grow with the write");
+    }
+
+    // Free: unlinking the file returns its extents; tree 11's `used` drops.
+    if poll_once(vol.root().unlink("bgt-big.dat")).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("unlink on block-group-tree fs failed");
+    }
+    for i in 0..4 {
+        if !matches!(
+            poll_once(vol.root().create(&format!("bgt-small-{i}.txt"))),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("create after free failed");
+        }
+    }
+    if poll_once(vol.sync_to_disk()).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("sync after unlink failed");
+    }
+    let (_, bgs2) = match bg_state(&vol) {
+        Ok(s) => s,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if data_used(&bgs2) >= used_after_write {
+        return TestResult::Fail("freeing data did not lower tree-11 used");
+    }
+    drop(file);
+    drop(vol);
+
+    // Remount (re-validates every block group against its chunk) and write
+    // into the `@home` subvolume.
+    let vol2 = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("block-group-tree fs did not remount after writes"),
+    };
+    if !dir_names(&vol2.root())
+        .iter()
+        .any(|n| n == "bgt-small-3.txt")
+    {
+        return TestResult::Fail("post-free file lost across remount");
+    }
+    if poll_once(vol2.switch_to_subvol(&crate::volume::Subvol::Name("@home".into())))
+        .is_none_or(|r| r.is_err())
+    {
+        return TestResult::Fail("subvol=@home did not resolve after writes");
+    }
+    let f = match poll_once(vol2.root().create("from-narf.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create in @home failed"),
+    };
+    if !matches!(poll_once(f.write(0, b"narf\n")), Some(Ok(5))) {
+        return TestResult::Fail("write in @home failed");
+    }
+    if poll_once(vol2.sync_to_disk()).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("sync in @home failed");
+    }
+    match bg_state(&vol2) {
+        Ok(_) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_block_group_tree_write);
+
+// ── One shared instance per filesystem ─────────────────────────────
+
+/// Poll two futures together to completion (no allocation, no executor).
+async fn join2<A: core::future::Future, C: core::future::Future>(
+    a: A,
+    c: C,
+) -> (A::Output, C::Output) {
+    let mut a = core::pin::pin!(a);
+    let mut c = core::pin::pin!(c);
+    let (mut ra, mut rc) = (None, None);
+    core::future::poll_fn(|cx| {
+        if ra.is_none() {
+            if let core::task::Poll::Ready(v) = a.as_mut().poll(cx) {
+                ra = Some(v);
+            }
+        }
+        if rc.is_none() {
+            if let core::task::Poll::Ready(v) = c.as_mut().poll(cx) {
+                rc = Some(v);
+            }
+        }
+        if ra.is_some() && rc.is_some() {
+            core::task::Poll::Ready(())
+        } else {
+            core::task::Poll::Pending
+        }
+    })
+    .await;
+    (ra.unwrap(), rc.unwrap())
+}
+
+/// Write `count` files named `{prefix}-{i}` of 16 KiB each through `dir`.
+async fn write_files(
+    dir: Arc<dyn narf_filesystem::DirOps>,
+    prefix: &str,
+    count: u8,
+) -> Result<(), FsError> {
+    for i in 0..count {
+        let f = dir.create(&alloc::format!("{prefix}-{i}")).await?;
+        let payload = alloc::vec![i ^ prefix.as_bytes()[0]; 16 * 1024];
+        f.write(0, &payload).await?;
+    }
+    Ok(())
+}
+
+/// Check every `{prefix}-{i}` file `write_files` produced.
+fn files_intact(dir: &Arc<dyn narf_filesystem::DirOps>, prefix: &str, count: u8) -> bool {
+    (0..count).all(|i| {
+        let Some(Ok(f)) = poll_once(dir.lookup_async(&alloc::format!("{prefix}-{i}"))) else {
+            return false;
+        };
+        read_all(&f, 16 * 1024 + 16).is_some_and(|got| {
+            got.len() == 16 * 1024 && got.iter().all(|&b| b == i ^ prefix.as_bytes()[0])
+        })
+    })
+}
+
+/// Linux's one-`btrfs_fs_info`-per-filesystem model: subvolume mounts are
+/// views over one instance. Their writes interleave through one transaction
+/// stream (a batch staged through `@home` is committed before `@` stages its
+/// own), a second mount of `@` sees the first's uncommitted writes, a
+/// read-only view cannot write, a mounted subvolume cannot be deleted, and the
+/// whole thing remounts consistently from disk.
+fn smoke_btrfs_shared_instance_views() -> TestResult {
+    use crate::volume::Subvol;
+    use narf_filesystem::FsInstance;
+
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let top = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture did not mount"),
+    };
+    let view = |name: &str, ro: bool| {
+        poll_once(BtrfsVolume::mount_view(
+            top.core(),
+            Some(Subvol::Name(name.into())),
+            ro,
+        ))
+    };
+    let (home, root, root2, srv_ro) = match (
+        view("@home", false),
+        view("@", false),
+        view("@", false),
+        view("@srv", true),
+    ) {
+        (Some(Ok(a)), Some(Ok(b)), Some(Ok(c)), Some(Ok(d))) => (a, b, c, d),
+        _ => return TestResult::Fail("subvolume views did not mount"),
+    };
+    if !Arc::ptr_eq(home.core(), root.core()) || !Arc::ptr_eq(home.core(), top.core()) {
+        return TestResult::Fail("views do not share one instance");
+    }
+    if home.mounted_subvol_id() == root.mounted_subvol_id() {
+        return TestResult::Fail("views did not select distinct subvolumes");
+    }
+    if top.core().subvol_mount_count(root.mounted_subvol_id()) != 2 {
+        return TestResult::Fail("mount count of @ is not 2");
+    }
+
+    // Interleaved and joined writers through two subvolumes of one instance.
+    let joined = poll_once(join2(
+        write_files(home.root(), "h", 12),
+        write_files(root.root(), "r", 12),
+    ));
+    if !matches!(joined, Some((Ok(()), Ok(())))) {
+        return TestResult::Fail("concurrent subvolume writers failed");
+    }
+    for i in 0..4u8 {
+        let a = poll_once(write_files(home.root(), &alloc::format!("hi{i}"), 1));
+        let b = poll_once(write_files(root.root(), &alloc::format!("ri{i}"), 1));
+        if !matches!((a, b), (Some(Ok(())), Some(Ok(())))) {
+            return TestResult::Fail("alternating subvolume writes failed");
+        }
+    }
+    // The second mount of @ sees the first's writes before any sync.
+    if !files_intact(&root2.root(), "r", 12) {
+        return TestResult::Fail("second mount of @ does not see uncommitted writes");
+    }
+    if poll_once(srv_ro.root().create("nope")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("read-only view accepted a write");
+    }
+    let home_parent_busy = poll_once(crate::write::destroy_subvolume(
+        &top,
+        format::FIRST_FREE_OBJECTID,
+        Some("@home"),
+        None,
+    ));
+    if !matches!(home_parent_busy, Some(Err(FsError::Busy))) {
+        return TestResult::Fail("a mounted subvolume was deletable");
+    }
+    // One sync through any view makes every view's writes durable.
+    if poll_once(srv_ro.sync_to_disk()).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("sync through a read-only view failed");
+    }
+    drop((home, root, root2, srv_ro, top));
+
+    let fresh = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("filesystem did not remount after shared writes"),
+    };
+    for (name, prefix) in [("@home", "h"), ("@", "r")] {
+        let v = match poll_once(BtrfsVolume::mount_view(
+            fresh.core(),
+            Some(Subvol::Name(name.into())),
+            true,
+        )) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("remounted subvolume view failed"),
+        };
+        if !files_intact(&v.root(), prefix, 12) {
+            return TestResult::Fail("a subvolume lost writes across remount");
+        }
+        let alt = if prefix == "h" { "hi3" } else { "ri3" };
+        if !files_intact(&v.root(), alt, 1) {
+            return TestResult::Fail("an alternating write was lost across remount");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_shared_instance_views);
+
+/// The same sharing on real (QEMU NVMe) hardware through the registry the
+/// `mount -t btrfs` and root factories use. Two subvolume mounts of xtask's
+/// disposable nvme0 image write concurrently with genuinely asynchronous I/O,
+/// then sync; the xtask postflight runs host `btrfs check` on the result.
+/// Subvolumes are created with NARF's own subvolume-creation path first.
+fn smoke_btrfs_shared_instance_nvme() -> TestResult {
+    use crate::volume::Subvol;
+    use narf_block::fs_detect::{detect_filesystem, FsType};
+    use narf_filesystem::FsInstance;
+
+    // Test-only: mutate only the disk xtask provided for it.
+    if !narf_boot::args().has_flag("narf.btrfs_smoke") {
+        return TestResult::Skip("no disposable btrfs disk (narf.btrfs_smoke)");
+    }
+    let Some(entry) = narf_block::block_devices()
+        .into_iter()
+        .find(|e| matches!(detect_filesystem(&e.dev), Ok(Some(FsType::Btrfs))))
+    else {
+        return TestResult::Skip("no btrfs block device");
+    };
+    let dev = entry.dev.clone();
+    let mount = |subvol: Option<Subvol>| {
+        narf_scheduler::block_on(crate::registry::mount(
+            &dev,
+            crate::discover_members(dev.clone()),
+            subvol,
+            false,
+        ))
+    };
+    let top = match mount(None) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("nvme btrfs did not mount"),
+    };
+    for name in ["narf-sv-a", "narf-sv-b"] {
+        if narf_scheduler::block_on(top.root().lookup_dir_async(name)).is_err()
+            && narf_scheduler::block_on(crate::write::create_subvolume(
+                &top,
+                format::FIRST_FREE_OBJECTID,
+                name,
+                false,
+            ))
+            .is_err()
+        {
+            return TestResult::Fail("subvolume creation on nvme failed");
+        }
+    }
+    let (a, b) = match (
+        mount(Some(Subvol::Name("narf-sv-a".into()))),
+        mount(Some(Subvol::Name("narf-sv-b".into()))),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => return TestResult::Fail("nvme subvolume mounts failed"),
+    };
+    if !Arc::ptr_eq(a.core(), b.core()) || !Arc::ptr_eq(a.core(), top.core()) {
+        return TestResult::Fail("nvme mounts of one fsid are separate instances");
+    }
+    let joined = narf_scheduler::block_on(join2(
+        write_files(a.root(), "a", 16),
+        write_files(b.root(), "b", 16),
+    ));
+    if !matches!(joined, (Ok(()), Ok(()))) {
+        return TestResult::Fail("concurrent nvme subvolume writers failed");
+    }
+    if narf_scheduler::block_on(b.sync_to_disk()).is_err() {
+        return TestResult::Fail("nvme sync failed");
+    }
+    let ok = files_intact_blocking(&a.root(), "a", 16) && files_intact_blocking(&b.root(), "b", 16);
+    if !ok {
+        return TestResult::Fail("nvme subvolume contents wrong after concurrent writes");
+    }
+    TestResult::Pass
+}
+
+/// [`files_intact`] for a device whose I/O completes asynchronously.
+fn files_intact_blocking(dir: &Arc<dyn narf_filesystem::DirOps>, prefix: &str, count: u8) -> bool {
+    (0..count).all(|i| {
+        narf_scheduler::block_on(async {
+            let f = dir.lookup_async(&alloc::format!("{prefix}-{i}")).await?;
+            let mut buf = alloc::vec![0u8; 16 * 1024 + 16];
+            let n = f.read(0, &mut buf).await?;
+            Ok::<_, FsError>(
+                n == 16 * 1024 && buf[..n].iter().all(|&x| x == i ^ prefix.as_bytes()[0]),
+            )
+        })
+        .unwrap_or(false)
+    })
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_shared_instance_nvme);
+
+// ── Commit durability: write_all_supers ordering and failure ───────
+
+/// One device operation, as the commit issued it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DevOp {
+    Write { lba: u64, n: u16 },
+    WriteFua { lba: u64, n: u16 },
+    Flush,
+}
+
+/// A volatile-cache, native-FUA device over a [`WritableSparseDevice`] that
+/// records every write, FUA write and flush in order, and can be told to
+/// fail flushes.
+#[derive(Debug)]
+struct RecordingDevice {
+    inner: Arc<WritableSparseDevice>,
+    log: narf_lib::sync::IrqSafeSpinLock<Vec<DevOp>>,
+    fail_flush: core::sync::atomic::AtomicBool,
+}
+
+impl narf_block::BlockDeviceSync for RecordingDevice {
+    fn lba_size(&self) -> u32 {
+        self.inner.lba_size()
+    }
+    fn capacity(&self) -> u64 {
+        self.inner.capacity()
+    }
+    fn read(&self, lba: u64, n: u16, out: &mut [u8]) -> Result<(), narf_block::BlockIoError> {
+        self.inner.read(lba, n, out)
+    }
+    fn write(&self, lba: u64, n: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        self.log.lock().push(DevOp::Write { lba, n });
+        self.inner.write(lba, n, data)
+    }
+    fn write_fua(&self, lba: u64, n: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        self.log.lock().push(DevOp::WriteFua { lba, n });
+        self.inner.write(lba, n, data)
+    }
+    fn flush(&self) -> Result<(), narf_block::BlockIoError> {
+        if self.fail_flush.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(narf_block::BlockIoError::DriverError);
+        }
+        self.log.lock().push(DevOp::Flush);
+        Ok(())
+    }
+    fn capabilities(&self) -> narf_block::BlockCaps {
+        narf_block::BlockCaps {
+            volatile_cache: true,
+            fua: true,
+        }
+    }
+}
+
+fn recording(sparse: &[u8]) -> Arc<RecordingDevice> {
+    Arc::new(RecordingDevice {
+        inner: writable_sparse(sparse),
+        log: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
+        fail_flush: core::sync::atomic::AtomicBool::new(false),
+    })
+}
+
+fn mount_recording(
+    dev: &Arc<RecordingDevice>,
+) -> Result<Arc<BtrfsVolume<narf_block::SyncBlock>>, FsError> {
+    let async_dev = narf_block::SyncBlock::new(dev.clone() as Arc<dyn narf_block::BlockDeviceSync>);
+    poll_once(BtrfsVolume::mount(async_dev, DomainId::DRIVER_0)).ok_or(FsError::InvalidData)?
+}
+
+/// LBA range `[start, end)` of the superblock copy at byte `offset`.
+fn super_lbas(offset: u64) -> (u64, u64) {
+    let start = offset / 512;
+    (start, start + (format::SUPERBLOCK_SIZE as u64) / 512)
+}
+
+/// A commit follows Linux `write_all_supers`: every tree/data block of the
+/// transaction is written first, then a device flush, then the primary
+/// superblock with FUA, then the mirror (plain write), with nothing else
+/// after the flush but `fsync`'s closing barrier.
+fn smoke_btrfs_commit_flush_fua_order() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let dev = recording(FIXTURE_MIRROR_SPARSE);
+    let vol = match mount_recording(&dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("mirror fixture did not mount"),
+    };
+    let f = match poll_once(vol.root().create("ordered.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if !matches!(poll_once(f.write(0, &[0x5a; 20000])), Some(Ok(20000))) {
+        return TestResult::Fail("write failed");
+    }
+    dev.log.lock().clear();
+    if !matches!(poll_once(f.fsync(false)), Some(Ok(()))) {
+        return TestResult::Fail("fsync failed");
+    }
+    let log = dev.log.lock().clone();
+    let (p0, p1) = super_lbas(format::SUPERBLOCK_OFFSET);
+    let (m0, m1) = super_lbas(64 << 20);
+    let is_primary = |lba: u64| (p0..p1).contains(&lba);
+    let is_mirror = |lba: u64| (m0..m1).contains(&lba);
+    let Some(flush_at) = log.iter().position(|op| *op == DevOp::Flush) else {
+        return TestResult::Fail("commit issued no flush");
+    };
+    // Before the flush: the transaction's own blocks, and no superblock.
+    let before = &log[..flush_at];
+    if !before
+        .iter()
+        .any(|op| matches!(op, DevOp::Write { lba, .. } if !is_primary(*lba) && !is_mirror(*lba)))
+    {
+        return TestResult::Fail("no tree/data writes preceded the pre-flush");
+    }
+    if before.iter().any(|op| match op {
+        DevOp::Write { lba, .. } | DevOp::WriteFua { lba, .. } => {
+            is_primary(*lba) || is_mirror(*lba)
+        }
+        DevOp::Flush => false,
+    }) {
+        return TestResult::Fail("a superblock was written before the pre-flush");
+    }
+    // After it: only superblock writes, primary (all FUA) first, then mirror.
+    let after = &log[flush_at + 1..];
+    let mut seen_mirror = false;
+    let mut trailing_flush = false;
+    let mut primary_blocks = 0u64;
+    for op in after {
+        match *op {
+            DevOp::WriteFua { lba, n } if is_primary(lba) && !seen_mirror => {
+                primary_blocks += u64::from(n)
+            }
+            DevOp::Write { lba, .. } if is_mirror(lba) && !trailing_flush => seen_mirror = true,
+            DevOp::Write { lba, .. } if is_primary(lba) => {
+                return TestResult::Fail("primary superblock written without FUA")
+            }
+            DevOp::WriteFua { lba, .. } if is_mirror(lba) => {
+                return TestResult::Fail("mirror superblock written with FUA (Linux does not)")
+            }
+            // `fsync`'s own barrier once the commit is done: it orders
+            // nothing new, but must not come before the mirror.
+            DevOp::Flush if seen_mirror && !trailing_flush => trailing_flush = true,
+            DevOp::Flush => return TestResult::Fail("an extra flush inside the commit"),
+            _ => return TestResult::Fail("a non-superblock write followed the pre-flush"),
+        }
+    }
+    if primary_blocks != p1 - p0 {
+        return TestResult::Fail("primary superblock not fully FUA-written before the mirror");
+    }
+    if !seen_mirror {
+        return TestResult::Fail("mirror superblock not written");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_commit_flush_fua_order);
+
+/// A failed pre-flush fails the commit before any superblock byte moves,
+/// puts the filesystem in its error state (read-only, as
+/// `BTRFS_FS_STATE_ERROR` does), and the image still mounts at the previous
+/// generation.
+fn smoke_btrfs_commit_flush_failure_goes_read_only() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let dev = recording(FIXTURE_MIRROR_SPARSE);
+    let primary_before = read_super_at(&dev.inner, format::SUPERBLOCK_OFFSET);
+    let mirror_before = read_super_at(&dev.inner, 64 << 20);
+    let vol = match mount_recording(&dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("mirror fixture did not mount"),
+    };
+    let f = match poll_once(vol.root().create("lost.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if !matches!(poll_once(f.write(0, b"never durable")), Some(Ok(13))) {
+        return TestResult::Fail("write failed");
+    }
+    dev.fail_flush
+        .store(true, core::sync::atomic::Ordering::Release);
+    if !matches!(poll_once(f.fsync(false)), Some(Err(_))) {
+        return TestResult::Fail("fsync succeeded although the flush failed");
+    }
+    if vol.supports_writes() {
+        return TestResult::Fail("filesystem still writable after a failed commit flush");
+    }
+    if !matches!(
+        poll_once(vol.root().create("after.dat")),
+        Some(Err(FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("a write was accepted after the commit failed");
+    }
+    if read_super_at(&dev.inner, format::SUPERBLOCK_OFFSET) != primary_before
+        || read_super_at(&dev.inner, 64 << 20) != mirror_before
+    {
+        return TestResult::Fail("a superblock changed although the pre-flush failed");
+    }
+    drop((f, vol));
+    dev.fail_flush
+        .store(false, core::sync::atomic::Ordering::Release);
+    let again = match mount_recording(&dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("image no longer mounts after the failed commit"),
+    };
+    let gen = format::le64(&primary_before, 72).unwrap_or(0);
+    if again.superblock().generation != gen {
+        return TestResult::Fail("remount is not at the last durable generation");
+    }
+    if poll_once(again.root().lookup_async("lost.dat")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("data of the failed commit appeared on disk");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_commit_flush_failure_goes_read_only
 );

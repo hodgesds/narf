@@ -2418,3 +2418,176 @@ fn smoke_block_disk_policy_root_refusals() -> TestResult {
     rp_finish(&names, result)
 }
 kernel_test_in!("block/disk_policy", smoke_block_disk_policy_root_refusals);
+// ── Flush / FUA forwarding ─────────────────────────────────────────
+
+/// Disk that records what reaches it: plain writes, FUA writes (with their
+/// absolute LBA) and flushes; reports a volatile cache with native FUA.
+struct FlushProbe {
+    writes: core::sync::atomic::AtomicU64,
+    fua_lba: core::sync::atomic::AtomicU64,
+    fua_writes: core::sync::atomic::AtomicU64,
+    flushes: core::sync::atomic::AtomicU64,
+    fail_flush: bool,
+}
+
+impl FlushProbe {
+    fn new(fail_flush: bool) -> alloc::sync::Arc<Self> {
+        use core::sync::atomic::AtomicU64;
+        alloc::sync::Arc::new(Self {
+            writes: AtomicU64::new(0),
+            fua_lba: AtomicU64::new(u64::MAX),
+            fua_writes: AtomicU64::new(0),
+            flushes: AtomicU64::new(0),
+            fail_flush,
+        })
+    }
+    fn get(c: &core::sync::atomic::AtomicU64) -> u64 {
+        c.load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl crate::BlockDeviceSync for FlushProbe {
+    fn lba_size(&self) -> u32 {
+        512
+    }
+    fn capacity(&self) -> u64 {
+        64
+    }
+    fn read(&self, _lba: u64, _n: u16, _out: &mut [u8]) -> Result<(), crate::BlockIoError> {
+        Ok(())
+    }
+    fn write(&self, _lba: u64, _n: u16, _data: &[u8]) -> Result<(), crate::BlockIoError> {
+        self.writes
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+    fn write_fua(&self, lba: u64, _n: u16, _data: &[u8]) -> Result<(), crate::BlockIoError> {
+        self.fua_lba
+            .store(lba, core::sync::atomic::Ordering::Relaxed);
+        self.fua_writes
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+    fn flush(&self) -> Result<(), crate::BlockIoError> {
+        self.flushes
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if self.fail_flush {
+            Err(crate::BlockIoError::DriverError)
+        } else {
+            Ok(())
+        }
+    }
+    fn capabilities(&self) -> crate::BlockCaps {
+        crate::BlockCaps {
+            volatile_cache: true,
+            fua: true,
+        }
+    }
+}
+
+/// The policy guard and partitions forward flush, FUA writes and the cache
+/// capabilities; the guard forwards flush even while it refuses writes;
+/// SyncBlock carries `fua: true` and flush errors through.
+fn smoke_block_flush_and_fua_forwarding() -> TestResult {
+    use crate::disk_policy::{self, DiskPolicy};
+    use crate::partition::PartitionBlockDevice;
+    use crate::{find_block_device, register_block_device, register_partition_device};
+    use alloc::sync::Arc;
+    let probe = FlushProbe::new(false);
+    let raw: Arc<dyn crate::BlockDeviceSync> = probe.clone();
+    register_block_device("flt-disk0", raw.clone());
+    register_partition_device(
+        "flt-disk0p1",
+        "flt-disk0",
+        Arc::new(PartitionBlockDevice::new(raw, 10, 20)),
+        None,
+    );
+    disk_policy::__set_policy_for_test(Some(DiskPolicy::BootOnly));
+    disk_policy::__reset_trust_for_test();
+    let result = (|| -> Result<(), &'static str> {
+        let disk = find_block_device("flt-disk0").ok_or("disk missing")?;
+        let part = find_block_device("flt-disk0p1").ok_or("partition missing")?;
+        let block = [0u8; 512];
+        // Read-only under boot-only: data writes refused, flush forwarded.
+        if part.write_fua(1, 1, &block).is_ok() || disk.write_fua(1, 1, &block).is_ok() {
+            return Err("guard let a FUA write through on an untrusted disk");
+        }
+        if FlushProbe::get(&probe.fua_writes) != 0 {
+            return Err("a refused FUA write reached the disk");
+        }
+        if disk.flush().is_err() || part.flush().is_err() || FlushProbe::get(&probe.flushes) != 2 {
+            return Err("guard / partition did not forward flush");
+        }
+        let caps = part.capabilities();
+        if !caps.volatile_cache || !caps.fua {
+            return Err("capabilities not forwarded");
+        }
+        // Writable: FUA reaches the disk at the partition-relative offset.
+        disk_policy::__set_policy_for_test(Some(DiskPolicy::All));
+        if part.write_fua(3, 1, &block).is_err()
+            || FlushProbe::get(&probe.fua_writes) != 1
+            || FlushProbe::get(&probe.fua_lba) != 13
+        {
+            return Err("partition FUA write not forwarded at start + lba");
+        }
+        if part.write_fua(20, 1, &block).is_ok() {
+            return Err("partition FUA write past its end accepted");
+        }
+        Ok(())
+    })();
+    disk_policy::__set_policy_for_test(None);
+    crate::unregister_block_device("flt-disk0p1");
+    crate::unregister_block_device("flt-disk0");
+    if let Err(why) = result {
+        return TestResult::Fail(why);
+    }
+    // Default write_fua = write + flush; SyncBlock propagates flush errors.
+    struct Plain(Arc<FlushProbe>);
+    impl crate::BlockDeviceSync for Plain {
+        fn lba_size(&self) -> u32 {
+            512
+        }
+        fn capacity(&self) -> u64 {
+            64
+        }
+        fn read(&self, l: u64, n: u16, o: &mut [u8]) -> Result<(), crate::BlockIoError> {
+            self.0.read(l, n, o)
+        }
+        fn write(&self, l: u64, n: u16, d: &[u8]) -> Result<(), crate::BlockIoError> {
+            self.0.write(l, n, d)
+        }
+        fn flush(&self) -> Result<(), crate::BlockIoError> {
+            self.0.flush()
+        }
+    }
+    let p = FlushProbe::new(false);
+    let plain = Plain(p.clone());
+    if crate::BlockDeviceSync::write_fua(&plain, 0, 1, &[0u8; 512]).is_err()
+        || FlushProbe::get(&p.writes) != 1
+        || FlushProbe::get(&p.flushes) != 1
+        || crate::BlockDeviceSync::capabilities(&plain).fua
+    {
+        return TestResult::Fail("default write_fua is not write + flush");
+    }
+    let failing = crate::SyncBlock::new(FlushProbe::new(true));
+    let r = poll_ready_block(crate::BlockDevice::flush_result(&*failing));
+    if r != Some(Err(crate::BlockError::IOError)) {
+        return TestResult::Fail("SyncBlock::flush_result dropped the flush error");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block/flush", smoke_block_flush_and_fua_forwarding);
+
+fn poll_ready_block<F: core::future::Future>(fut: F) -> Option<F::Output> {
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(|d| RawWaker::new(d, &VTABLE), |_| {}, |_| {}, |_| {});
+    // SAFETY: VTABLE is a valid no-op vtable; the waker never escapes.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = core::pin::pin!(fut);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
+    }
+}

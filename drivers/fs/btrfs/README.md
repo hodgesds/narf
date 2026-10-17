@@ -88,6 +88,20 @@ real laptop's btrfs root looks like.
   and `mount -t btrfs`, including `subvolid=N` / `subvol=PATH` (ordinary
   directories and nested subvolumes) to root at a specific subvolume. A plain mount honors the on-disk
   **default subvolume** (`ROOT_TREE_DIR`'s "default" entry).
+- **One instance per filesystem** (Linux's one `btrfs_fs_info` per fsid). Every
+  mount of an already-mounted fsid, whichever subvolume it selects, is a view
+  (`BtrfsVolume`) over one shared `VolCore`. The core holds the devices, the
+  superblock, the node cache, the running transaction and its allocator, the
+  pinned extents, the staged superblock and one commit timer (`registry`). A
+  batch belongs to one subvolume: an operation through a mount of another
+  subvolume first commits it, so two subvolume mounts write through one
+  transaction stream. Mounts of the same subvolume share its live root. A
+  mounted subvolume cannot be deleted (`Busy`). A read-only view of a
+  writable core refuses writes, and a read-write mount of a read-only core
+  makes it writable unless a member device or the feature set forbids that.
+  The core is freed when its last mount goes. `compress=` is recorded, but new
+  extents are written uncompressed (Linux permits this), apart from the
+  existing zlib-rewrite path.
 - `BTRFS_IOC_SUBVOL_GETFLAGS` / `BTRFS_IOC_SUBVOL_SETFLAGS` on an explicitly
   mounted subvolume root, including Linux's distinct `BTRFS_SUBVOL_RDONLY` UAPI
   bit and persistent read-only/writable transitions.
@@ -157,8 +171,10 @@ than mis-read:
   administration API is synchronous and whole-allocation-class; it returns
   `Busy` when the remaining member count cannot preserve a profile and
   `NoSpace` when no crash-safe destination extents fit.
-- Unknown or unsupported incompat/compat-ro feature flags (including zoned,
-  extent-tree-v2, stripe-tree, verity and block-group-tree).
+- Unknown or unsupported incompat feature flags (including zoned,
+  extent-tree-v2 and stripe-tree) refuse every mount. As in Linux
+  `btrfs_check_features`, a compat_ro flag the writer does not maintain (for
+  example verity) allows a read-only mount and refuses a read-write one.
 - Mutations reached by traversing a child subvolume from its parent (mount that
   child explicitly to write it).
 - A symlink target larger than Linux's inline item bound (Btrfs has no regular-
@@ -261,12 +277,24 @@ has converted it because it grew fragmented. Writes into a bitmap group toggle i
 bits and recompute the group's `extent_count`; the allocator decodes a bitmap into
 free ranges the same as extent items. On such an image **space is reclaimed** —
 the allocator carves each new data extent / tree node from the free-space tree's
-free ranges (first-fit, lowest address first, skipping *system* block groups,
-which are reserved for the chunk tree), so blocks freed by earlier transactions
+free ranges (first-fit, lowest address first; data extents only from DATA block
+groups and tree blocks only from METADATA groups, mixed groups serving both, and
+*system* block groups never, being reserved for the chunk tree), so blocks freed by earlier transactions
 are reused instead of leaked. Blocks freed by the *current* transaction are not
 yet in the tree, so they stay unavailable until it commits — preserving COW.
 (Without a free-space tree the allocator falls back to appending past the
 extent-tree high-water; freed space is then not reused.)
+
+**Block-group tree** (`compat_ro` `BLOCK_GROUP_TREE`, mkfs `-O
+block-group-tree`, the btrfs-progs ≥ 6.19 default) is supported for reads and
+writes. Block group items then live in tree 11 instead of the extent tree; mount
+loads that root, enforces Linux's no-holes + free-space-tree dependency, and
+cross-checks every block group against its chunk. Every `used` update (allocation
+and free), every block group a chunk allocation adds, and balance profile
+rewrites go to tree 11. Tree 11 is path-COWed (or repacked, during chunk growth)
+in the same transaction, its blocks get `METADATA_ITEM`s owned by root 11, and its
+`ROOT_ITEM` moves in the root tree. Linux keeps no backup-root slot for it.
+NARF never deletes block groups, so there is no removal path.
 
 Mount validates every **superblock copy** that fits on every supplied member,
 selects the valid copy with
