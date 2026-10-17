@@ -980,8 +980,10 @@ MEMORY as Linux does for GC 10.3.2, from a cold-boot harvest sample, the
 loaded firmware headers and the PCI revision; ACCEL_WORKING and ring masks
 sit behind one switch, now wired: the card registers a generic
 `amdgpu_cs::Submitter` and client VRAM heap, so the shared CS/GEM/VA path runs
-client IBs on the Navi22 kernel queues (per-job ring-side VM flush, fences,
-two in flight per ring), with user fences, GEM_METADATA, PRIME, DRM 3.64.0 and
+client IBs on the Navi22 kernel queues (per-client GFXHUB VMIDs 1–7 from
+the generic `amdgpu_vmid_grab` manager: flush only when a space's VMID, root
+or TLB sequence changes, PASID→VMID IH LUT writes so faults reach the
+client's GPUVM_FAULT; fences, two in flight per ring), with user fences, GEM_METADATA, PRIME, DRM 3.64.0 and
 GET_CLIENT; proven in register/fake-engine models only (ABI audit:
 `drivers/gpu/research/navi22-mesa-abi.md`). Fences poll with an IH notify hook;
 register models cover encodings, rejection, timeouts and cancellation only.
