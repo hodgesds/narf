@@ -27,27 +27,27 @@ use crate::{
 };
 use alloc::vec::Vec;
 
-const STRIDE: u64 = 0x100;
-const DP_MSE_RATE_CNTL: u64 = 0x2137;
-const DP_MSE_RATE_Y: u32 = 0x03ff_ffff;
-const DP_MSE_RATE_X_SHIFT: u32 = 26;
-const DP_MSE_RATE_UPDATE: u64 = 0x2139;
-const DP_MSE_RATE_UPDATE_PENDING: u32 = 1 << 0;
-const DP_MSE_SAT0: u64 = 0x213a;
-const DP_MSE_SAT1: u64 = 0x213b;
-const DP_MSE_SAT_UPDATE: u64 = 0x213d;
-const SAT_UPDATE: u32 = 0x3;
-const SAT_16_MTP_KEEPOUT: u32 = 1 << 8;
+const STRIDE: u64 = 0x100; // linux: mmDP1_DP_MSE_RATE_CNTL - mmDP0_DP_MSE_RATE_CNTL
+const DP_MSE_RATE_CNTL: u64 = 0x2137; // linux: mmDP0_DP_MSE_RATE_CNTL
+const DP_MSE_RATE_Y: u32 = 0x03ff_ffff; // linux: DP0_DP_MSE_RATE_CNTL__DP_MSE_RATE_Y_MASK
+const DP_MSE_RATE_X_SHIFT: u32 = 26; // linux: DP0_DP_MSE_RATE_CNTL__DP_MSE_RATE_X__SHIFT
+const DP_MSE_RATE_UPDATE: u64 = 0x2139; // linux: mmDP0_DP_MSE_RATE_UPDATE
+const DP_MSE_RATE_UPDATE_PENDING: u32 = 1 << 0; // linux: DP0_DP_MSE_RATE_UPDATE__DP_MSE_RATE_UPDATE_PENDING_MASK
+const DP_MSE_SAT0: u64 = 0x213a; // linux: mmDP0_DP_MSE_SAT0
+const DP_MSE_SAT1: u64 = 0x213b; // linux: mmDP0_DP_MSE_SAT1
+const DP_MSE_SAT_UPDATE: u64 = 0x213d; // linux: mmDP0_DP_MSE_SAT_UPDATE
+const SAT_UPDATE: u32 = 0x3; // linux: DP0_DP_MSE_SAT_UPDATE__DP_MSE_SAT_UPDATE_MASK
+const SAT_16_MTP_KEEPOUT: u32 = 1 << 8; // linux: DP0_DP_MSE_SAT_UPDATE__DP_MSE_16_MTP_KEEPOUT_MASK
 /// `DP_MST_UPDATE_MAX_RETRY` polls, 10 us apart.
-const UPDATE_RETRIES: u32 = 50;
+const UPDATE_RETRIES: u32 = 50; // linux: n/a (DP_MST_UPDATE_MAX_RETRY, dcn10_link_encoder.c)
 /// The highest dword this module touches, for the bank bound.
 pub(crate) const LAST_REG: u32 = (DP_MSE_SAT_UPDATE + 5 * STRIDE) as u32;
 /// `DP_PAYLOAD_ACT_HANDLED` in `DP_PAYLOAD_TABLE_UPDATE_STATUS`.
-const ACT_HANDLED: u8 = 2;
+const ACT_HANDLED: u8 = 2; // linux: DP_PAYLOAD_ACT_HANDLED
 /// Streams the DIO SAT holds.
-pub const MAX_STREAMS: usize = 4;
+pub const MAX_STREAMS: usize = 4; // linux: n/a (four DP_MSE_SAT rows)
 /// `DP_MST_TOTAL_SLOTS` less the 8b/10b MTP header slot.
-pub const SLOTS: u8 = 63;
+pub const SLOTS: u8 = 63; // linux: n/a (DP_MST total 64 slots less the MTP header)
 
 /// One VC payload as the source's table holds it: the DIG frontend (DC's
 /// `stream_enc->id`, ENGINE_ID_DIGA + n) and its time slots.

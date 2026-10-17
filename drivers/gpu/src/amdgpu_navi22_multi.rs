@@ -172,18 +172,18 @@ impl Resources {
 
 // ── ODM combine and MPC rate control (DCN3.0 OPTC/MPC) ─────────────────
 
-const ODM0_OPTC_DATA_SOURCE_SELECT: u64 = 0x1acb;
-const OPTC_SEG0_SHIFT: u32 = 8;
-const OPTC_SEG1_SHIFT: u32 = 12;
-const ODM0_OPTC_WIDTH_CONTROL: u64 = 0x1ace;
-const OPTC_SEGMENT_WIDTH: u32 = 0x1fff;
-const ODM0_OPTC_MEMORY_CONFIG: u64 = 0x1ad0;
-const OTG0_OTG_H_TIMING_CNTL: u64 = 0x1b2e;
+const ODM0_OPTC_DATA_SOURCE_SELECT: u64 = 0x1acb; // linux: mmODM0_OPTC_DATA_SOURCE_SELECT
+const OPTC_SEG0_SHIFT: u32 = 8; // linux: ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG0_SRC_SEL__SHIFT
+const OPTC_SEG1_SHIFT: u32 = 12; // linux: ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG1_SRC_SEL__SHIFT
+const ODM0_OPTC_WIDTH_CONTROL: u64 = 0x1ace; // linux: mmODM0_OPTC_WIDTH_CONTROL
+const OPTC_SEGMENT_WIDTH: u32 = 0x1fff; // linux: ODM0_OPTC_WIDTH_CONTROL__OPTC_SEGMENT_WIDTH_MASK
+const ODM0_OPTC_MEMORY_CONFIG: u64 = 0x1ad0; // linux: mmODM0_OPTC_MEMORY_CONFIG
+const OTG0_OTG_H_TIMING_CNTL: u64 = 0x1b2e; // linux: mmOTG0_OTG_H_TIMING_CNTL
 /// `MPC_OUTn_MUX` (DCN base index 3, stride 4) and its rate control.
-const MPC_OUT0_MUX: u64 = 0x0580;
-const MPC_OUT_STRIDE: u64 = 4;
-const MPC_OUT_RATE_CONTROL_DISABLE: u32 = 1 << 8;
-const MPC_OUT_RATE_CONTROL: u32 = 1 << 9;
+const MPC_OUT0_MUX: u64 = 0x0580; // linux: mmMPC_OUT0_MUX
+const MPC_OUT_STRIDE: u64 = 4; // linux: mmMPC_OUT1_MUX - mmMPC_OUT0_MUX
+const MPC_OUT_RATE_CONTROL_DISABLE: u32 = 1 << 8; // linux: MPC_OUT0_MUX__MPC_OUT_RATE_CONTROL_DISABLE_MASK
+const MPC_OUT_RATE_CONTROL: u32 = 1 << 9; // linux: MPC_OUT0_MUX__MPC_OUT_RATE_CONTROL_MASK
 
 impl Pipeline {
     fn odm_reg(&self, reg: u64) -> u64 {

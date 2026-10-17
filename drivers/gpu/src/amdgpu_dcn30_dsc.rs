@@ -28,78 +28,78 @@ use crate::{
 use alloc::vec::Vec;
 
 // DSC_TOP0 .. DSC_TOP5, 0x5c apart.
-const DSC_BASE: u64 = 0x3000;
-const DSC_STRIDE: u64 = 0x5c;
-const TOP_CONTROL: u64 = 0x0;
-const DSC_CLOCK_EN: u32 = 1 << 0;
-const DEBUG_CONTROL: u64 = 0x1;
-const CIF_CONFIG0: u64 = 0x5;
-const CIF_CONFIG1: u64 = 0x6;
-const CONFIG0: u64 = 0xa;
-const CONFIG1: u64 = 0xb;
-const INTERRUPT_CONTROL_STATUS: u64 = 0xd;
-const PPS_CONFIG0: u64 = 0xe;
+const DSC_BASE: u64 = 0x3000; // linux: mmDSC_TOP0_DSC_TOP_CONTROL
+const DSC_STRIDE: u64 = 0x5c; // linux: mmDSC_TOP1_DSC_TOP_CONTROL - mmDSC_TOP0_DSC_TOP_CONTROL
+const TOP_CONTROL: u64 = 0x0; // linux: mmDSC_TOP0_DSC_TOP_CONTROL - mmDSC_TOP0_DSC_TOP_CONTROL
+const DSC_CLOCK_EN: u32 = 1 << 0; // linux: DSC_TOP0_DSC_TOP_CONTROL__DSC_CLOCK_EN_MASK
+const DEBUG_CONTROL: u64 = 0x1; // linux: mmDSC_TOP0_DSC_DEBUG_CONTROL - mmDSC_TOP0_DSC_TOP_CONTROL
+const CIF_CONFIG0: u64 = 0x5; // linux: mmDSCCIF0_DSCCIF_CONFIG0 - mmDSC_TOP0_DSC_TOP_CONTROL
+const CIF_CONFIG1: u64 = 0x6; // linux: mmDSCCIF0_DSCCIF_CONFIG1 - mmDSC_TOP0_DSC_TOP_CONTROL
+const CONFIG0: u64 = 0xa; // linux: mmDSCC0_DSCC_CONFIG0 - mmDSC_TOP0_DSC_TOP_CONTROL
+const CONFIG1: u64 = 0xb; // linux: mmDSCC0_DSCC_CONFIG1 - mmDSC_TOP0_DSC_TOP_CONTROL
+const INTERRUPT_CONTROL_STATUS: u64 = 0xd; // linux: mmDSCC0_DSCC_INTERRUPT_CONTROL_STATUS - mmDSC_TOP0_DSC_TOP_CONTROL
+const PPS_CONFIG0: u64 = 0xe; // linux: mmDSCC0_DSCC_PPS_CONFIG0 - mmDSC_TOP0_DSC_TOP_CONTROL
 /// `DSCRM0_DSCRM_DSC_FORWARD_CONFIG`; DSCRM n follows.
-const FORWARD: u64 = 0x1a64;
-const FORWARD_EN: u32 = 1 << 0;
-const FORWARD_OPP: u32 = 0x70;
-// DSC power domains 16..21, CONFIG then STATUS.
-const DOMAIN16_PG_CONFIG: u64 = 0x00a1;
-const POWER_GATE: u32 = 1 << 8;
-const PGFSM_PWR_STATUS: u32 = 0xc000_0000;
-const DC_IP_REQUEST_CNTL: u64 = 0x00b2;
-// OPTC (ODM n, stride 0x10) and OTG (stride 0x80).
-const ODM_STRIDE: u64 = 0x10;
-const OPTC_DATA_FORMAT_CONTROL: u64 = 0x1acc;
-const OPTC_DSC_MODE: u32 = 0x30;
-const OPTC_BYTES_PER_PIXEL: u64 = 0x1acd;
-const OPTC_WIDTH_CONTROL: u64 = 0x1ace;
-const OPTC_DSC_SLICE_WIDTH: u32 = 0x1fff_0000;
-const OTG_STRIDE: u64 = 0x80;
-const OTG_V_SYNC_A_CNTL: u64 = 0x1b38;
-const OTG_V_SYNC_MODE: u32 = 1 << 8;
-// DIO frontend / link blocks, stride 0x100.
-const DIO_STRIDE: u64 = 0x100;
-const VPG_GENERIC_PACKET_ACCESS_CTRL: u64 = 0x2068;
-const VPG_GENERIC_PACKET_DATA: u64 = 0x2069;
-const VPG_GSP_IMMEDIATE_UPDATE_CTRL: u64 = 0x206b;
-const VPG_GENERIC_STATUS: u64 = 0x206c;
-const VPG_GENERIC_CONFLICT_OCCURED: u32 = 1 << 1;
-const VPG_GENERIC_CONFLICT_CLR: u32 = 1 << 4;
-const AFMT_CNTL: u64 = 0x20af;
-const AFMT_AUDIO_CLOCK_EN: u32 = 1 << 0;
-const DP_DPHY_CNTL: u64 = 0x2117;
-const DPHY_FEC_EN: u32 = 1 << 4;
-const DPHY_FEC_READY_SHADOW: u32 = 1 << 5;
-const DP_SEC_CNTL: u64 = 0x212b;
-const DP_SEC_STREAM_ENABLE: u32 = 1 << 0;
-const DP_DSC_CNTL: u64 = 0x2152;
-const DP_DSC_MODE: u32 = 0x3;
-const DP_DSC_SLICE_WIDTH: u32 = 0x1fff_0000;
-const DP_SEC_CNTL2: u64 = 0x2153;
-const DP_SEC_GSP11_PPS: u32 = 1 << 28;
-const DP_MSA_VBID_MISC: u64 = 0x215a;
-const DP_VBID6_LINE_REFERENCE: u32 = 1 << 15;
-const DP_VBID6_LINE_NUM: u32 = 0xffff_0000;
-const DP_SEC_METADATA_TRANSMISSION: u64 = 0x215b;
-const DP_DSC_BYTES_PER_PIXEL: u64 = 0x215c;
-const DP_GSP11_CNTL: u64 = 0x2161;
-const DP_SEC_GSP11_ENABLE: u32 = 1 << 4;
-const DP_SEC_GSP11_LINE_NUM: u32 = 0xffff_0000;
+const FORWARD: u64 = 0x1a64; // linux: mmDSCRM0_DSCRM_DSC_FORWARD_CONFIG
+const FORWARD_EN: u32 = 1 << 0; // linux: DSCRM0_DSCRM_DSC_FORWARD_CONFIG__DSCRM_DSC_FORWARD_EN_MASK
+const FORWARD_OPP: u32 = 0x70; // linux: DSCRM0_DSCRM_DSC_FORWARD_CONFIG__DSCRM_DSC_OPP_PIPE_SOURCE_MASK
+                               // DSC power domains 16..21, CONFIG then STATUS.
+const DOMAIN16_PG_CONFIG: u64 = 0x00a1; // linux: mmDOMAIN16_PG_CONFIG
+const POWER_GATE: u32 = 1 << 8; // linux: DOMAIN16_PG_CONFIG__DOMAIN16_POWER_GATE_MASK
+const PGFSM_PWR_STATUS: u32 = 0xc000_0000; // linux: DOMAIN16_PG_STATUS__DOMAIN16_PGFSM_PWR_STATUS_MASK
+const DC_IP_REQUEST_CNTL: u64 = 0x00b2; // linux: mmDC_IP_REQUEST_CNTL
+                                        // OPTC (ODM n, stride 0x10) and OTG (stride 0x80).
+const ODM_STRIDE: u64 = 0x10; // linux: mmODM1_OPTC_DATA_FORMAT_CONTROL - mmODM0_OPTC_DATA_FORMAT_CONTROL
+const OPTC_DATA_FORMAT_CONTROL: u64 = 0x1acc; // linux: mmODM0_OPTC_DATA_FORMAT_CONTROL
+const OPTC_DSC_MODE: u32 = 0x30; // linux: ODM0_OPTC_DATA_FORMAT_CONTROL__OPTC_DSC_MODE_MASK
+const OPTC_BYTES_PER_PIXEL: u64 = 0x1acd; // linux: mmODM0_OPTC_BYTES_PER_PIXEL
+const OPTC_WIDTH_CONTROL: u64 = 0x1ace; // linux: mmODM0_OPTC_WIDTH_CONTROL
+const OPTC_DSC_SLICE_WIDTH: u32 = 0x1fff_0000; // linux: ODM0_OPTC_WIDTH_CONTROL__OPTC_DSC_SLICE_WIDTH_MASK
+const OTG_STRIDE: u64 = 0x80; // linux: mmOTG1_OTG_V_SYNC_A_CNTL - mmOTG0_OTG_V_SYNC_A_CNTL
+const OTG_V_SYNC_A_CNTL: u64 = 0x1b38; // linux: mmOTG0_OTG_V_SYNC_A_CNTL
+const OTG_V_SYNC_MODE: u32 = 1 << 8; // linux: OTG0_OTG_V_SYNC_A_CNTL__OTG_V_SYNC_MODE_MASK
+                                     // DIO frontend / link blocks, stride 0x100.
+const DIO_STRIDE: u64 = 0x100; // linux: mmVPG1_VPG_GENERIC_PACKET_ACCESS_CTRL - mmVPG0_VPG_GENERIC_PACKET_ACCESS_CTRL
+const VPG_GENERIC_PACKET_ACCESS_CTRL: u64 = 0x2068; // linux: mmVPG0_VPG_GENERIC_PACKET_ACCESS_CTRL
+const VPG_GENERIC_PACKET_DATA: u64 = 0x2069; // linux: mmVPG0_VPG_GENERIC_PACKET_DATA
+const VPG_GSP_IMMEDIATE_UPDATE_CTRL: u64 = 0x206b; // linux: mmVPG0_VPG_GSP_IMMEDIATE_UPDATE_CTRL
+const VPG_GENERIC_STATUS: u64 = 0x206c; // linux: mmVPG0_VPG_GENERIC_STATUS
+const VPG_GENERIC_CONFLICT_OCCURED: u32 = 1 << 1; // linux: VPG0_VPG_GENERIC_STATUS__VPG_GENERIC_CONFLICT_OCCURED_MASK
+const VPG_GENERIC_CONFLICT_CLR: u32 = 1 << 4; // linux: VPG0_VPG_GENERIC_STATUS__VPG_GENERIC_CONFLICT_CLR_MASK
+const AFMT_CNTL: u64 = 0x20af; // linux: mmDIG0_AFMT_CNTL
+const AFMT_AUDIO_CLOCK_EN: u32 = 1 << 0; // linux: DIG0_AFMT_CNTL__AFMT_AUDIO_CLOCK_EN_MASK
+const DP_DPHY_CNTL: u64 = 0x2117; // linux: mmDP0_DP_DPHY_CNTL
+const DPHY_FEC_EN: u32 = 1 << 4; // linux: DP0_DP_DPHY_CNTL__DPHY_FEC_EN_MASK
+const DPHY_FEC_READY_SHADOW: u32 = 1 << 5; // linux: DP0_DP_DPHY_CNTL__DPHY_FEC_READY_SHADOW_MASK
+const DP_SEC_CNTL: u64 = 0x212b; // linux: mmDP0_DP_SEC_CNTL
+const DP_SEC_STREAM_ENABLE: u32 = 1 << 0; // linux: DP0_DP_SEC_CNTL__DP_SEC_STREAM_ENABLE_MASK
+const DP_DSC_CNTL: u64 = 0x2152; // linux: mmDP0_DP_DSC_CNTL
+const DP_DSC_MODE: u32 = 0x3; // linux: DP0_DP_DSC_CNTL__DP_DSC_MODE_MASK
+const DP_DSC_SLICE_WIDTH: u32 = 0x1fff_0000; // linux: DP0_DP_DSC_CNTL__DP_DSC_SLICE_WIDTH_MASK
+const DP_SEC_CNTL2: u64 = 0x2153; // linux: mmDP0_DP_SEC_CNTL2
+const DP_SEC_GSP11_PPS: u32 = 1 << 28; // linux: DP0_DP_SEC_CNTL2__DP_SEC_GSP11_PPS_MASK
+const DP_MSA_VBID_MISC: u64 = 0x215a; // linux: mmDP0_DP_MSA_VBID_MISC
+const DP_VBID6_LINE_REFERENCE: u32 = 1 << 15; // linux: DP0_DP_MSA_VBID_MISC__DP_VBID6_LINE_REFERENCE_MASK
+const DP_VBID6_LINE_NUM: u32 = 0xffff_0000; // linux: DP0_DP_MSA_VBID_MISC__DP_VBID6_LINE_NUM_MASK
+const DP_SEC_METADATA_TRANSMISSION: u64 = 0x215b; // linux: mmDP0_DP_SEC_METADATA_TRANSMISSION
+const DP_DSC_BYTES_PER_PIXEL: u64 = 0x215c; // linux: mmDP0_DP_DSC_BYTES_PER_PIXEL
+const DP_GSP11_CNTL: u64 = 0x2161; // linux: mmDP0_DP_GSP11_CNTL
+const DP_SEC_GSP11_ENABLE: u32 = 1 << 4; // linux: DP0_DP_GSP11_CNTL__DP_SEC_GSP11_ENABLE_MASK
+const DP_SEC_GSP11_LINE_NUM: u32 = 0xffff_0000; // linux: DP0_DP_GSP11_CNTL__DP_SEC_GSP11_LINE_NUM_MASK
 /// The highest dword this module touches, for the bank bound.
 pub(crate) const LAST_REG: u32 = (DSC_BASE + 5 * DSC_STRIDE + PPS_CONFIG0 + 22) as u32;
 /// DPCD: DSC caps, FEC capability, FEC configuration, DSC enable.
-pub const DPCD_DSC_SUPPORT: u32 = 0x60;
-pub const DPCD_FEC_CAPABILITY: u32 = 0x90;
-pub const DPCD_FEC_CONFIGURATION: u32 = 0x120;
-pub const DPCD_DSC_ENABLE: u32 = 0x160;
+pub const DPCD_DSC_SUPPORT: u32 = 0x60; // linux: DP_DSC_SUPPORT
+pub const DPCD_FEC_CAPABILITY: u32 = 0x90; // linux: DP_FEC_CAPABILITY
+pub const DPCD_FEC_CONFIGURATION: u32 = 0x120; // linux: DP_FEC_CONFIGURATION
+pub const DPCD_DSC_ENABLE: u32 = 0x160; // linux: DP_DSC_ENABLE
 /// `DC_DP_INFOFRAME_TYPE_PPS`.
-const SDP_TYPE_PPS: u8 = 0x10;
+const SDP_TYPE_PPS: u8 = 0x10; // linux: DC_DP_INFOFRAME_TYPE_PPS
 /// `optc_dsc_mode`.
-const OPTC_DSC_ENABLED_444: u32 = 1;
-const OPTC_DSC_ENABLED_NATIVE_SUBSAMPLED: u32 = 2;
+const OPTC_DSC_ENABLED_444: u32 = 1; // linux: OPTC_DSC_ENABLED_444
+const OPTC_DSC_ENABLED_NATIVE_SUBSAMPLED: u32 = 2; // linux: OPTC_DSC_ENABLED_NATIVE_SUBSAMPLED
 /// `max_image_width` of one DCN2.0 engine.
-pub const MAX_IMAGE_WIDTH: u32 = 5184;
+pub const MAX_IMAGE_WIDTH: u32 = 5184; // linux: n/a (dcn20_dsc.c dsc2_get_enc_caps: max_slice_width 5184)
 
 /// The DSC timing an 8-bpc RGB stream's DSC compresses.
 pub fn dsc_timing(t: &Timing) -> DscTiming {
