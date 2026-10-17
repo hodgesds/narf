@@ -576,6 +576,11 @@ impl VmState {
             .store(seq, core::sync::atomic::Ordering::Release);
     }
 
+    /// The last job submitted in this space (0: none).
+    pub fn last_job(&self) -> u64 {
+        self.last_job.load(core::sync::atomic::Ordering::Acquire)
+    }
+
     /// Free `item` now, or — when a job ran in this space — once the card's
     /// engine has completed the last one (`amdgpu_cs::defer_until`), as
     /// Linux frees page tables and BOs only after the VM's fences.

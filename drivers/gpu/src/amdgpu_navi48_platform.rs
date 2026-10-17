@@ -236,9 +236,9 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
 /// submission, run in the open's address space on client VMID 1, whose
 /// context every job's VM flush points at that space's root first.
 ///
-/// Each job is recorded on its address space (`VmState::note_job`), so the
-/// buffers and page tables it may reach are freed only once the fence
-/// passes; every fence read retires what completed jobs held.
+/// `amdgpu_cs` records each job on its address space, so the buffers and
+/// page tables it may reach are freed only once the fence passes; every
+/// fence read here retires what completed jobs held.
 ///
 /// LINUX-GAP: VMID 1 for every client, always flushed — no per-client VMID
 /// reuse (amdgpu_vmid_grab) and no IH PASID mapping, so a fault is not yet
@@ -292,10 +292,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                 crate::amdgpu_cs::retire(self.card, &|seq| job_done(completed, seq));
             }
             match result {
-                Ok(seq) => {
-                    vm.note_job(u64::from(seq));
-                    Ok(u64::from(seq))
-                }
+                Ok(seq) => Ok(u64::from(seq)),
                 Err(crate::amdgpu_gfx12_queue::Error::Busy) => Err(FsError::Busy),
                 Err(crate::amdgpu_gfx12_queue::Error::Invalid) => Err(FsError::InvalidData),
                 Err(_) => Err(FsError::NoDevice),

@@ -402,22 +402,44 @@ pub fn is_async_ioctl(cmd: u32) -> bool {
     let nr = drm_uapi::ioc_nr(cmd);
     nr == drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_CS
         || nr == drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_WAIT_CS
+        || nr == drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_GEM_WAIT_IDLE
 }
 
-/// `AMDGPU_CS` and `AMDGPU_WAIT_CS` on DRM card `card`, for a card with a
-/// registered submitter; `Unsupported` sends anything else (and a card
-/// without one) to the synchronous [`dispatch`].
+/// `AMDGPU_CS`, `AMDGPU_WAIT_CS` and `AMDGPU_GEM_WAIT_IDLE` on DRM card
+/// `card`, for a card with a registered submitter; `Unsupported` sends
+/// anything else (and a card without one) to the synchronous paths.
 pub async fn dispatch_async(
     card: u32,
     cmd: u32,
     arg: usize,
     vm: &VmState,
+    gem: &crate::amdgpu_gem::GemState,
     ctx: &crate::amdgpu_ctx::CtxState,
 ) -> Result<u64, FsError> {
     let Some(engine) = submitter(card) else {
         return Err(FsError::Unsupported);
     };
     let nr = drm_uapi::ioc_nr(cmd);
+    if nr == drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_GEM_WAIT_IDLE {
+        // `drm_amdgpu_gem_wait_idle_in { handle, flags, timeout }`.
+        // SAFETY: `arg` is the ioctl pointer the trap layer validated.
+        let bytes = unsafe { copy_in(arg, 16)? };
+        let handle = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let timeout = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let object = gem.lookup(handle).ok_or(FsError::InvalidData)?;
+        // LINUX-GAP: Linux waits on the buffer's reservation fences; this
+        // waits for the last job this open submitted, which covers every
+        // use the open made of it but not a job another process (holding
+        // it through PRIME) submitted.
+        let last = vm.last_job();
+        let idle = last == 0 || engine.wait(last, timeout).await?;
+        let mut out = [0u8; 8];
+        out[0..4].copy_from_slice(&u32::from(!idle).to_le_bytes());
+        out[4..8].copy_from_slice(&(object.preferred_domains as u32).to_le_bytes());
+        // SAFETY: as above.
+        unsafe { copy_out(arg, &out)? };
+        return Ok(0);
+    }
     if nr == drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_WAIT_CS {
         // SAFETY: `arg` is the ioctl pointer the trap layer validated.
         let bytes = unsafe { copy_in(arg, 32)? };
@@ -439,6 +461,8 @@ pub async fn dispatch_async(
     }
     let submission = validated(arg, vm, ctx)?;
     let seq = engine.submit(vm, &submission).await?;
+    // What this space drops from now on waits for this job.
+    vm.note_job(seq);
     // `drm_amdgpu_cs_out.handle`.
     // SAFETY: as above.
     unsafe { copy_out(arg, &seq.to_le_bytes())? };

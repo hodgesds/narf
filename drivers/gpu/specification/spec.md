@@ -3550,8 +3550,12 @@ paths; only the tables differ.
   (`dispatch_async`, for card and render nodes) queues a validated
   `AMDGPU_CS` and returns the engine's sequence as the handle, and
   `AMDGPU_WAIT_CS` parks until it completes or the client's absolute
-  monotonic deadline passes (status 0/1). Without one, CS parses and is
-  refused as before. `pm4::Pm4Builder::vm_flush` builds the in-ring VM flush
+  monotonic deadline passes (status 0/1). `AMDGPU_GEM_WAIT_IDLE` there
+  waits for the open's last job (`VmState::last_job`; a buffer another
+  process uses through PRIME is not covered) and reports the buffer's
+  preferred domains. `dispatch_async` notes every submitted job on its
+  address space. Without a submitter, CS parses and is refused as before
+  and GEM_WAIT_IDLE reports idle. `pm4::Pm4Builder::vm_flush` builds the in-ring VM flush
   (shared by GMC 11 and 12).
 
 The Navi48 platform registers the graphics queue as its card's submitter

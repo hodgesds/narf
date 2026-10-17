@@ -495,6 +495,7 @@ impl FileOps for DriCardFile {
                     cmd,
                     arg as usize,
                     &self.amdgpu_vm,
+                    &self.amdgpu_gem,
                     &self.amdgpu_ctx,
                 )
                 .await
@@ -1045,6 +1046,7 @@ impl FileOps for DriRenderFile {
                     cmd,
                     arg as usize,
                     &self.amdgpu_vm,
+                    &self.amdgpu_gem,
                     &self.amdgpu_ctx,
                 )
                 .await

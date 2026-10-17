@@ -269,6 +269,11 @@ impl GemState {
         g.as_mut().is_some_and(|m| m.remove(&handle).is_some())
     }
 
+    /// The open's GEM table entry for `handle`, by its public name.
+    pub(crate) fn lookup(&self, handle: u32) -> Option<Arc<GemObject>> {
+        self.get(handle)
+    }
+
     /// The object named by `handle`, for the VM layer's range checks.
     pub fn object(&self, handle: u32) -> Option<Arc<GemObject>> {
         self.get(handle)
@@ -448,13 +453,13 @@ fn wait_idle(state: &GemState, arg: usize) -> Result<u64, FsError> {
     // SAFETY: as above.
     let bytes = unsafe { copy_in(arg, 16)? };
     let handle = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-    if state.get(handle).is_none() {
-        return Err(FsError::InvalidData);
-    }
-    // `drm_amdgpu_gem_wait_idle_out { status, domain }`: status 0 means the
-    // wait completed rather than timed out. Nothing can be busy — see the
-    // module LINUX-GAP.
-    let out = [0u8; 8];
+    let object = state.get(handle).ok_or(FsError::InvalidData)?;
+    // `drm_amdgpu_gem_wait_idle_out { status, domain }`: status 0 means idle
+    // (1: timed out), domain the buffer's preferred domains. On a card that
+    // runs jobs the `/dev/dri` route answers it from the engine
+    // (`amdgpu_cs::dispatch_async`); here nothing can be busy.
+    let mut out = [0u8; 8];
+    out[4..8].copy_from_slice(&(object.preferred_domains as u32).to_le_bytes());
     // SAFETY: as above.
     unsafe { copy_out(arg, &out)? };
     Ok(0)

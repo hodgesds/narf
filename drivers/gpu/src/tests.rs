@@ -11635,6 +11635,7 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
             cmd,
             arg.as_mut_ptr() as usize,
             &state,
+            &gem,
             &ctx,
         ))
     };
@@ -11671,6 +11672,32 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
         let mut w = wait_req(1, ctx_id + 99);
         if run(wait_cmd, &mut w) != Err(FsError::InvalidData) {
             return Some("WAIT_CS of an unknown context");
+        }
+        // GEM_WAIT_IDLE follows the open's last job (1, now complete), and
+        // reports the buffer's preferred domains.
+        if state.last_job() != 1 {
+            return Some("the CS was recorded on its address space");
+        }
+        let idle_cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_WAIT_IDLE;
+        let idle_req = |h: u32| {
+            let mut w = [0u8; 16];
+            w[0..4].copy_from_slice(&h.to_le_bytes());
+            w
+        };
+        let mut w = idle_req(handle);
+        if run(idle_cmd, &mut w).is_err()
+            || u32::from_le_bytes(w[0..4].try_into().unwrap()) != 0
+            || u32::from_le_bytes(w[4..8].try_into().unwrap()) != u::AMDGPU_GEM_DOMAIN_GTT
+        {
+            return Some("GEM_WAIT_IDLE after the job");
+        }
+        fake.completed.store(0, Ordering::SeqCst);
+        let mut w = idle_req(handle);
+        if run(idle_cmd, &mut w).is_err() || u32::from_le_bytes(w[0..4].try_into().unwrap()) != 1 {
+            return Some("GEM_WAIT_IDLE while the job runs");
+        }
+        if run(idle_cmd, &mut idle_req(handle + 7)) != Err(FsError::InvalidData) {
+            return Some("GEM_WAIT_IDLE of an unknown handle");
         }
         None
     })();
