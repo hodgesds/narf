@@ -233,6 +233,7 @@ pub mod amdgpu_navi22_bios;
 pub mod amdgpu_navi22_boot;
 pub mod amdgpu_navi22_display;
 pub mod amdgpu_navi22_gating;
+pub mod amdgpu_navi22_gfxoff;
 pub mod amdgpu_navi22_kms;
 pub mod amdgpu_navi22_modeset;
 #[cfg(feature = "kernel-test")]
@@ -240,6 +241,7 @@ mod amdgpu_navi22_modeset_model;
 pub mod amdgpu_navi22_platform;
 pub mod amdgpu_navi22_power;
 pub mod amdgpu_navi22_power_policy;
+pub mod amdgpu_navi22_power_saving;
 pub mod amdgpu_navi22_recovery;
 pub mod amdgpu_navi22_scanout;
 pub mod amdgpu_navi22_tdr;

@@ -3495,17 +3495,46 @@ the old and new IH endpoints close with `DeviceLost`. `recoveries()` counts
 successes; platform `Diagnostics` adds `tdr` and `recovery`. Model-tested only.
 
 `amdgpu_navi22_power_policy::Policy` is the typed hook for the power savings
-Linux enables by default on sienna_cichlid — GFXOFF, clock gating, MMHUB/ATHUB
-power gating, memory (UCLK) and fabric (FCLK) DPM and deep sleep. `requirement`
-states what each needs: SMU feature bits, display admission
-(`DisplayAdmission`: watermark sets/PMFW watermark table, DML DRAM- and
-FCLK-change support, stutter with the deep-sleep DCEFCLK floor, bandwidth
-floors) and driver readiness (GFXOFF-safe GC access, RLC safe mode, validated
-recovery). `Policy::new()`/`Default` disable everything; `request` checks the
-requirements, then refuses with `NotValidated` while `HARDWARE_VALIDATED` is
-false, so `smu_features()` adds no bits and `gfxoff()`/`clock_gating()` stay
-false. Nothing calls it. The DCN-owned `Smu::enable_display_power` remains the
-only path that adds UCLK/FCLK DPM, under its own contract.
+Linux enables by default on sienna_cichlid — GFXOFF, SoC clock gating
+(`ClockGating`: MMHUB/ATHUB/HDP/IH/SDMA/SMUIO), GC clock gating
+(`GfxClockGating`), MMHUB/ATHUB power gating, memory (UCLK) and fabric (FCLK)
+DPM and deep sleep. `requirement` states what each needs: SMU feature bits,
+display admission (`DisplayAdmission`: watermark sets/PMFW watermark table,
+DML DRAM- and FCLK-change support, stutter with the deep-sleep DCEFCLK floor,
+bandwidth floors) and driver readiness (GFXOFF-safe GC access, RLC safe mode,
+validated recovery). `Policy::new()`/`Default` disable everything; `request`
+refuses with `NotValidated` while `HARDWARE_VALIDATED` is false.
+`OptIn::parse(Option<&str>)` reads the `amdgpu.navi22_pg=` value (tokens
+`gfxoff`, `cg`, `gfxcg`, `hubpg`, `memdpm`, `fclkdpm`, `ds`, `wm`; any unknown
+token yields `OptIn::NONE`), and `request_opted_in(feature, admission, driver,
+optin)` opens a gate only for a named feature whose display and driver-software
+prerequisites hold (`NotOptedIn` otherwise), waiving only the hardware
+validation facts. `revoke` closes a gate.
+
+`amdgpu_navi22_power_saving::plan(optin, admission, driver) -> Plan` evaluates
+every feature (pure; `Plan::blocks`, `smu_enable`, per-feature `refusals`);
+`readiness()` reports RLC safe mode implemented, recovery unvalidated and GC
+access GFXOFF-safe only after `amdgpu_navi22_gfxoff::declare_submission_guarded`.
+`amdgpu_navi22_platform::power_saving(value)` (fb calls it only when the boot
+argument is present) runs `ColdBoot::apply_power_saving`: optional PMFW
+watermark upload (`amdgpu_dcn30_watermarks`: `navi22_ranges`, `encode`,
+`notify` over the DAL mailbox, as `dcn3_notify_wm_ranges`), clock gating
+(`amdgpu_navi22_gating::Gating::set_clockgating(gate, Blocks)`, Linux IP order
+common→gmc→ih→gfx→sdma, reverse to ungate, GC under RLC safe mode),
+`Smu::update_gating_features(mask, enable)` (only `GATING_FEATURES`,
+smu_cmn_feature_update_enable_state with running-set and protection checks),
+the initial `DisallowGfxOff`, and UCLK/FCLK hard minimums at the admitted
+floors (`ClockManager::hard_min`). It then starts the GFXOFF controller.
+`remove_power_saving` stops GFXOFF and undoes the rest in reverse;
+`ColdBoot::power_saving()` reports what was applied.
+
+`amdgpu_navi22_gfxoff` mirrors `amdgpu_gfx_off_ctrl`: request count starting
+at 1, `DELAY_MS` (100) before `AllowGfxOff`, cancellation by a disable request,
+`DisallowGfxOff` before the count rises, imbalance refused, failed or cancelled
+disallow terminal. `Reference::acquire().await` is the disable reference every
+GC MMIO path (queue submission, `READ_MMR_REG`, the TDR sampler) holds; it is
+a no-op without the opt-in, and must not be awaited with the platform owner
+lock held. Recovery calls `forget_for_reset`; `status()` is diagnostic.
 
 ### Navi 22 VCN 3.0 and JPEG 3.0
 
