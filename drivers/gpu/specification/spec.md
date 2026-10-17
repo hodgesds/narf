@@ -3671,7 +3671,24 @@ PMFW (`Mode1Reset`, PMFW >= 58.26) or else through the PSP
 MMIO while config space is reset — it restores and verifies config space,
 waits up to 2 s for the PSP bootloader (C2PMSG_35 bit 31) and 100 ms for NBIO
 MEMSIZE, and brackets the reset with the ATOM BIOS_SCRATCH_3 engine-hung flag.
-A card without running SOS is left untouched (`Ok(None)`). The reset discards
+A card without running SOS is not reset (`Ok(None)`). Either way the stage then
+posts as `amdgpu_device_need_post`/`amdgpu_device_asic_init` do: BIOS_SCRATCH_7
+at `adev->bios_scratch_reg_offset` (FirmwareInfo `bios_scratch_reg_startaddr`,
+else nbio_2_3 `mmBIOS_SCRATCH_0`) is read; with `ATOM_S7_ASIC_INIT_COMPLETE`
+set nothing is written, otherwise (and always in `Mode::Recovery`, as
+`amdgpu_device_reinit_after_reset`) ATOM `ASIC_Init` runs from the VBIOS copied
+at construction with PS[0]/PS[1] the FirmwareInfo boot-up sclk/mclk dwords,
+the atomfirmware FB scratch size, register accesses through the device
+authority (past BAR5 via PCIE_INDEX2/DATA2) and every DELAY as a cooperative
+sleep, bounded by atom.c's 20 s same-jump guard and 60 s overall. The bit must
+read back set. `Report::post` / `Reset::post()` (`Post`: scratch base,
+SCRATCH_7 before/after, clocks, opcode/read/write counts, DELAY total,
+anomalies) carry the evidence; `Error::Post(PostError)` (NoVbios, Image,
+NoClocks, NoAsicInit, Allocation, Atom { error, site }, Timeout, Incomplete) is
+terminal like every reset error, and `State::Posting` is retained after
+cancellation. The PCI snapshot also keeps MSI address/data/control and the
+MSI-X Message Control plus, when it lives in BAR5, the MSI-X table, restored
+as `pci_restore_msi_state` (masked enable, table, control). The reset discards
 every inherited scanout, so a boot framebuffer on this card goes dark. Failure
 or cancellation is terminal for the session. Production boot calls it; the
 explicit firmware-only callers may omit it. `Report::reset` carries the method,
@@ -3796,6 +3813,20 @@ selects the table start), ID operands read the image, every table execution
 (including each CALLTABLE callee) gets its own zeroed WS from its header
 (`ResolvedTable::ws_dwords`), and DELAY opcodes call `AtomState::delay_us`.
 Unbound, the synthetic-table behaviour is unchanged.
+The VM is generic over `Hooks<'a>` (`reg_read`/`reg_write`, `pll_*`/`mc_*`
+defaulting to zero as SOC15 `cail_*`, `resolve`, `table_absent`, `delay_us`,
+`now_ms`); `AtomState<'a, H = Closures<'a>>` derefs to its hooks, so the
+closure fields keep working. `Machine::start(state, id, ps)` /
+`Machine::from_bytes` + `Machine::step(state) -> Step::{Continue, Delay(us),
+Done}` execute one opcode at a time with an explicit CALLTABLE stack, so async
+callers sleep between opcodes; `execute_table`/`execute_bytes` drive it
+synchronously. IIO (`ATOM_IIO_*`, indexed from data table 23 like
+`atom_index_iio`; read program `port`, write program `0x80|port`) is executed;
+sub-dword destinations keep the raw saved bits; SHL/SHR shift the raw value;
+MUL32/DIV32 are 64-bit; a CALLTABLE to a zero directory entry is a no-op. PS/WS/FB
+range, PCI/SYSIO and undefined-IIO cases continue as in Linux and are counted in
+`AtomState::anomalies`/`first_anomaly`; the same-jump stuck guard is 20 s by
+`now_ms` (65 536 repeats / 1 000 000 opcodes without a clock).
 
 ### Navi 22 native HDMI scanout (opt-in)
 
