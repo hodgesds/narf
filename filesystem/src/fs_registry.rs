@@ -43,7 +43,13 @@ pub struct MountRequest<'a> {
 /// through `mount(8)`. There the constructor spins
 /// ([`narf_scheduler::block_on_spin`]), as the sync lookups of block-backed
 /// filesystems do. Boot-time callers keep the idling wait.
+///
+/// The future is boxed: a syscall runs on the task's 32 KiB kernel stack,
+/// and a filesystem's whole mount state machine (a btrfs mount of a shared
+/// core with its tree walks) pinned inline in the waiting frame overflowed
+/// it.
 pub fn mount_wait<F: core::future::Future>(fut: F) -> F::Output {
+    let fut = alloc::boxed::Box::pin(fut);
     if narf_scheduler::current_task_id() == narf_scheduler::TaskId::NONE {
         narf_scheduler::block_on(fut)
     } else {

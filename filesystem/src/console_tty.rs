@@ -266,8 +266,13 @@ pub fn read_into(buf: &mut [u8]) -> usize {
     if buf.is_empty() {
         return 0;
     }
+    // Unthrottle serial receive: bytes the RX interrupt left in the UART
+    // because the byte ring was full are pulled in now that the reader is
+    // consuming (see `narf_input::refill_byte_ring`).
+    narf_input::refill_byte_ring(narf_console::try_read_byte);
     let mut state = DISCIPLINE.lock();
     pump(&mut state);
+    narf_input::refill_byte_ring(narf_console::try_read_byte);
     if state.readable() == 0 {
         // Distinguish a pending EOF (^D) from "no input yet": consume the
         // EOF latch and report 0 with no parking.

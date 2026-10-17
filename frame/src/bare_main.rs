@@ -5201,6 +5201,13 @@ fn boot_userspace_init() {
         // asserted (which it would until the FIFO drains).
         fn serial_isr() {
             for _ in 0..16 {
+                // Flow control: never pull a byte the ring cannot hold. It
+                // stays in the UART FIFO until the console reader refills
+                // the ring (`narf_input::refill_byte_ring`).
+                if !narf_input::byte_ring_has_room() {
+                    narf_input::note_byte_ring_full();
+                    break;
+                }
                 match narf_console::try_read_byte() {
                     Some(b) => {
                         let _ = narf_input::push_global(narf_input::InputEvent::AsciiByte(b));
