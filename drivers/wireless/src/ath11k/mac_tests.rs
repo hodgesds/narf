@@ -331,6 +331,7 @@ struct World {
     ap: Ap,
     dp_calls: Vec<&'static str>,
     authorized: Option<bool>,
+    sta_wme: Option<bool>,
     pn: Vec<(u32, bool, bool)>,
 }
 
@@ -664,6 +665,9 @@ impl DataPort for FakeDp {
     }
     fn set_authorized(&self, _addr: [u8; 6], authorized: bool) {
         self.0.lock().authorized = Some(authorized);
+    }
+    fn set_sta_wme(&self, _addr: [u8; 6], wme: bool) {
+        self.0.lock().sta_wme = Some(wme);
     }
 }
 

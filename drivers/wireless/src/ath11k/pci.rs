@@ -20,12 +20,10 @@
 //! The same task then runs the WLFW QMI handshake over QRTR
 //! ([`super::wlfw`]) to FW_READY and hands the session to
 //! [`super::core::pci_start`] (QMI firmware start, CE, HTC, WMI to
-//! READY).
-//!
-//! Not yet: DP. Until it lands the device
-//! registers no network interface — a `wlan%d` with a made-up MAC
-//! that "associates" without touching the radio would only mislead
-//! userspace.
+//! READY, the data path), which hands the running device to
+//! [`super::runtime::start_pci`] (mac layer → `wlan%d`,
+//! [`super::iface`]). Everything after probe runs in that spawned task;
+//! a failure latches its step and leaves the rest of the kernel booting.
 //!
 //! Linux references (BSD-3 / dual GPL):
 //! - `drivers/net/wireless/ath/ath11k/pci.c::ath11k_pci_probe`

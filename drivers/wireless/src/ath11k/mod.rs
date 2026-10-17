@@ -21,9 +21,12 @@
 //!
 //! ## Status
 //!
-//! Probe identifies the chip and its firmware directory, allocates
-//! MSI and runs Linux's power-up sequence, then stops: no MHI host, firmware boot, QMI, CE/HTC/WMI transport or
-//! data path yet, so no network interface is registered.
+//! Probe identifies the chip, allocates MSI, runs Linux's power-up and
+//! spawns the bring-up task: MHI (firmware to mission mode), WLFW QMI
+//! to FW_READY, CE / HTC / WMI with the data path ([`runtime`]), the
+//! station mac layer ([`mac`]) and the `wlan%d` netdev ([`iface`]).
+//! Offline-tested end to end; not yet run on silicon
+//! (`drivers/wireless/specification/ath11k.md`).
 //!
 //! ## References
 //!
@@ -41,6 +44,7 @@
 
 extern crate alloc;
 
+pub mod autoconnect;
 pub mod board;
 pub mod ce;
 pub mod core;
@@ -51,6 +55,7 @@ pub mod hal;
 pub mod htc;
 pub mod htt;
 pub mod hw;
+pub mod iface;
 pub mod mac;
 pub mod mac_frame;
 pub mod mac_peer;
@@ -63,6 +68,7 @@ pub mod qmi;
 pub mod qmi_client;
 pub mod qmi_wlfw;
 pub mod qrtr;
+pub mod runtime;
 pub mod tx_hdr;
 pub mod wlfw;
 pub mod wmi;

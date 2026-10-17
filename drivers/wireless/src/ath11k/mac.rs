@@ -113,6 +113,11 @@ pub trait DataPort {
     /// The BSS peer's port is (un)authorized (`peer->is_authorized`):
     /// the DP passes non-EAPOL data only while authorized.
     fn set_authorized(&self, addr: [u8; 6], authorized: bool);
+    /// `sta->sta.wme` from the association response
+    /// (`ieee80211_assoc_config_link`): the data TX path builds QoS Data
+    /// frames (`ieee80211_build_hdr` / `ieee80211_select_queue`) only for
+    /// a WMM AP.
+    fn set_sta_wme(&self, addr: [u8; 6], wme: bool);
 }
 
 // ── Diagnostics ─────────────────────────────────────────────────────
@@ -2251,6 +2256,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         sta.rx_nss = peer::sta_rx_nss(&sta.ht_cap, &sta.vht_cap);
         sta.wme = rie.wmm_param.is_some();
         sta.mfp = false;
+        self.dp.set_sta_wme(bss.bssid, sta.wme);
         {
             let lk = self.link.as_mut().unwrap();
             lk.sta = sta;

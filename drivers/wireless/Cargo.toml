@@ -30,6 +30,7 @@ narf-console      = { path = "../../console" }
 narf-firmware     = { path = "../../firmware" }
 narf-firmware-smbios = { path = "../../firmware/smbios" }
 narf-crypto      = { path = "../../crypto" }
+narf-boot         = { path = "../../boot" }
 narf-init         = { path = "../../init" }
 narf-drivers-sdio = { path = "../sdio" }
 narf-drivers-usb  = { path = "../usb" }

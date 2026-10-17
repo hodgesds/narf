@@ -184,6 +184,10 @@ pub trait QmiFw {
     ) -> impl Future<Output = Result<(), WlfwError>>;
     /// `ath11k_qmi_firmware_stop`: `wlan_mode OFF`, errors only logged.
     fn firmware_stop(&mut self) -> impl Future<Output = ()>;
+    /// Service the QMI transport after bring-up (Linux keeps the QMI
+    /// handle and its QRTR socket alive for later indications). Sync and
+    /// cheap; the default does nothing.
+    fn service(&mut self) {}
 }
 
 impl<P, F, A> QmiFw for wlfw::Wlfw<P, F, A>
@@ -204,6 +208,22 @@ where
                 "qmi failed to send wlan mode off: step {} (-{})",
                 e.step, e.errno
             ));
+        }
+    }
+    fn service(&mut self) {
+        // Late indications (Linux `ath11k_qmi_msg_handlers`): pump the
+        // QRTR link so the IPCR DL buffers are recycled, and log what
+        // arrives (recovery is not ported).
+        self.client.pump();
+        while let Some(i) = self.client.take_inbound() {
+            match i {
+                super::qmi_client::Inbound::Message(m) => log(format_args!(
+                    "qmi: late indication after FW_READY ({} bytes, msg id {:#x})",
+                    m.len(),
+                    m.get(3..5).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
+                )),
+                other => log(format_args!("qmi: late event after FW_READY: {:?}", other)),
+            }
         }
     }
 }
@@ -832,33 +852,55 @@ impl<H: Hif, Q: QmiFw> Ath11kCore<H, Q> {
 
     // ── WMI ───────────────────────────────────────────────────────
 
+    /// One `ath11k_wmi_cmd_send_nowait` attempt on `wmi_ab.wmi[0]`:
+    /// `Err(errno)` — `-EAGAIN` while HTC has no credits, the CE's errno
+    /// when it refuses ([`Self::wmi_send_retryable`] tells whether
+    /// `ath11k_wmi_cmd_send` would retry), `-ENODEV` without a WMI
+    /// endpoint. The runtime's [`super::runtime`] ports use this to wait
+    /// without holding the core.
+    pub fn wmi_cmd_try_send(&mut self, cmd: &WmiCmd) -> Result<(), i32> {
+        let Some(ep) = self.wmi_ep else {
+            return Err(ENODEV);
+        };
+        let payload = cmd.frame();
+        let ret = match self.htc.send(ep.eid, &payload) {
+            Ok(tx) => match self.htc_tx(tx) {
+                Ok(()) => {
+                    self.stats.wmi_cmds += 1;
+                    return Ok(());
+                }
+                Err(e) => e.errno,
+            },
+            Err(HtcError::NoCredits { .. }) => EAGAIN,
+            Err(e) => e.errno(),
+        };
+        Err(ret)
+    }
+
+    /// `ath11k_wmi_cmd_send`'s `wait_event_timeout` condition: with credit
+    /// flow it retries `-EAGAIN`, without it `-ENOBUFS`.
+    pub fn wmi_send_retryable(&self, errno: i32) -> bool {
+        if self.cfg.credit_flow {
+            errno == EAGAIN
+        } else {
+            errno == ENOBUFS
+        }
+    }
+
     /// `ath11k_wmi_cmd_send` on `wmi_ab.wmi[0]`: with credit flow, retry
     /// while HTC has no credits (`-EAGAIN`) for up to 3 s; without it,
     /// retry while the CE ring is full (`-ENOBUFS`).
     pub async fn wmi_cmd_send(&mut self, cmd: &WmiCmd) -> Result<(), TransportError> {
-        let Some(ep) = self.wmi_ep else {
+        if self.wmi_ep.is_none() {
             return Err(TransportError::new(step::NO_WMI_EP, cmd.cmd_id, ENODEV));
-        };
-        let payload = cmd.frame();
+        }
         let deadline = self.hif.now_ms().saturating_add(self.cfg.wmi_send_ms);
-        let credit_flow = self.cfg.credit_flow;
         loop {
-            let ret = match self.htc.send(ep.eid, &payload) {
-                Ok(tx) => match self.htc_tx(tx) {
-                    Ok(()) => {
-                        self.stats.wmi_cmds += 1;
-                        return Ok(());
-                    }
-                    Err(e) => e.errno,
-                },
-                Err(HtcError::NoCredits { .. }) => EAGAIN,
-                Err(e) => e.errno(),
+            let ret = match self.wmi_cmd_try_send(cmd) {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
             };
-            let retry = if credit_flow {
-                ret == EAGAIN
-            } else {
-                ret == ENOBUFS
-            };
+            let retry = self.wmi_send_retryable(ret);
             let now = self.hif.now_ms();
             if !retry || now >= deadline {
                 let st = if ret == EAGAIN {
@@ -1215,9 +1257,13 @@ static CORE: IrqSafeSpinLock<Option<PciCore>> = IrqSafeSpinLock::new(None);
 /// A FW_READY session the core could not start on (CE allocation
 /// failed); parked for the same reason.
 static STRANDED: IrqSafeSpinLock<Option<super::pci::Wlfw>> = IrqSafeSpinLock::new(None);
+/// The DP of a failed bring-up (its rings were programmed into the
+/// hardware; never freed).
+static STRANDED_DP: IrqSafeSpinLock<Option<super::dp_ring::Dp>> = IrqSafeSpinLock::new(None);
 
-/// Hand the ready core to its next owner (scan / connect / data).
-/// `None` until WMI READY; a failed core stays parked.
+/// Take a ready core parked with [`park_core`]. Bring-up hands a ready
+/// core straight to the runtime ([`super::runtime::start_pci`]), so the
+/// slot normally holds only a failed core, which stays parked.
 pub fn take_core() -> Option<PciCore> {
     let mut g = CORE.lock();
     if g.as_ref().is_some_and(|c| c.is_ready()) {
@@ -1282,6 +1328,14 @@ pub async fn pci_start(w: super::pci::Wlfw) {
         }
     };
     ce::install_ce_irq_handlers(params.host_ce_config, msi.config, base_irq, n_vectors);
+    // ath11k_pcic_config_irq's ext part (ath11k_pcic_ext_irq_config).
+    if let Err(e) =
+        super::runtime::install_dp_irq_handlers(params.ring_mask, msi.config, base_irq, n_vectors)
+    {
+        e.report("ath11k DP irq config");
+        *STRANDED.lock() = Some(w);
+        return;
+    }
     let mmio = super::pci::with_controller(|d| d.mmio_bar0);
     let Some(mmio) = mmio else {
         TransportError::new(step::NO_DEVICE, 1, ENODEV).report("ath11k core");
@@ -1303,7 +1357,13 @@ pub async fn pci_start(w: super::pci::Wlfw) {
             return;
         }
     };
-    let _ = core.qmi_firmware_ready(&mut NoDp).await;
+    let mut hooks = super::runtime::DpHooks::new(
+        super::dp_ring::DpHwParams::for_rev(params.hw_rev),
+        params.hw_rev as u32,
+        super::dp_ring::DpRingSizes::LINUX,
+        Some(msi),
+    );
+    let r = core.qmi_firmware_ready(&mut hooks).await;
     let st = core.hif.ce.stats;
     log(format_args!(
         "core: {:?} ce irqs {:?} polled-without-irq {} wmi events {} cmds {} credit waits {}",
@@ -1314,5 +1374,15 @@ pub async fn pci_start(w: super::pci::Wlfw) {
         core.stats.wmi_cmds,
         core.stats.credit_waits
     ));
-    *CORE.lock() = Some(core);
+    match (r, hooks.dp.take()) {
+        // ath11k_core_qmi_firmware_ready succeeded: the runtime takes
+        // the core + DP (ath11k_mac_register → wlan%d).
+        (Ok(()), Some(dp)) => super::runtime::start_pci(core, dp).await,
+        (_, dp) => {
+            // The unwind stopped the firmware (wlan_mode OFF); keep
+            // everything it was given (target memory, programmed rings).
+            *STRANDED_DP.lock() = dp;
+            *CORE.lock() = Some(core);
+        }
+    }
 }

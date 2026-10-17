@@ -281,7 +281,44 @@ static CE_IRQ_PENDING: AtomicU32 = AtomicU32::new(0);
 /// `ATH11K_FLAG_CE_IRQ_ENABLED`.
 static CE_IRQ_ENABLED: AtomicBool = AtomicBool::new(false);
 static CE_IRQS_INSTALLED: AtomicBool = AtomicBool::new(false);
-static CE_WAKER: IrqSafeSpinLock<Option<Waker>> = IrqSafeSpinLock::new(None);
+/// Tasks parked in [`MsiCeIrq::wait`]. After bring-up more than one task
+/// waits on the device (the runtime service loop and a mac-layer
+/// operation polling for its event), so every waiter is kept and woken:
+/// a single slot would leave all but the last to their sleep timeout.
+const CE_WAITERS: usize = 4;
+static CE_WAKER: IrqSafeSpinLock<[Option<Waker>; CE_WAITERS]> =
+    IrqSafeSpinLock::new([const { None }; CE_WAITERS]);
+
+/// Wake every task parked in [`MsiCeIrq::wait`] (CE and DP interrupt
+/// handlers).
+pub(crate) fn wake_waiters() {
+    let taken: [Option<Waker>; CE_WAITERS] = {
+        let mut g = CE_WAKER.lock();
+        core::array::from_fn(|i| g[i].take())
+    };
+    for w in taken.into_iter().flatten() {
+        w.wake();
+    }
+}
+
+fn register_waiter(w: &Waker) {
+    let mut g = CE_WAKER.lock();
+    if g.iter().flatten().any(|o| o.will_wake(w)) {
+        return;
+    }
+    match g.iter_mut().find(|s| s.is_none()) {
+        Some(slot) => *slot = Some(w.clone()),
+        // Full: replace the oldest-registered slot; that task still
+        // wakes on its sleep deadline.
+        None => g[0] = Some(w.clone()),
+    }
+}
+
+/// Some interrupt the device owner services is pending (CE, or a DP
+/// ext group — [`super::runtime::dp_irq_pending`]).
+fn irq_pending() -> bool {
+    CE_IRQ_PENDING.load(Ordering::Acquire) != 0 || super::runtime::dp_irq_pending()
+}
 /// CE interrupts delivered (any CE vector).
 pub static CE_MSI_FIRES: AtomicU64 = AtomicU64::new(0);
 
@@ -294,9 +331,7 @@ fn ce_msi_irq(cookie: u64) -> narf_interrupts::IrqStatus {
     }
     CE_MSI_FIRES.fetch_add(1, Ordering::Relaxed);
     CE_IRQ_PENDING.fetch_or(cookie as u32, Ordering::AcqRel);
-    if let Some(w) = CE_WAKER.lock().take() {
-        w.wake();
-    }
+    wake_waiters();
     narf_interrupts::IrqStatus::Handled
 }
 
@@ -345,12 +380,12 @@ struct CeIrqWait {
 impl Future for CeIrqWait {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if CE_IRQ_PENDING.load(Ordering::Acquire) != 0 {
+        if irq_pending() {
             return Poll::Ready(());
         }
-        *CE_WAKER.lock() = Some(cx.waker().clone());
+        register_waiter(cx.waker());
         // Re-check after publishing the waker.
-        if CE_IRQ_PENDING.load(Ordering::Acquire) != 0 {
+        if irq_pending() {
             return Poll::Ready(());
         }
         Pin::new(&mut self.sleep).poll(cx)
