@@ -106,3 +106,30 @@ blockers; it must flag exactly those lines.
   signature, signer, metadata, length, `NRFW`) and the outputs must be
   identical: versions, every upload's PSP firmware type, file offset and size,
   in upload order.
+
+## Annotating under rustfmt
+
+`cargo fmt` moves comments, so after annotating run `cargo fmt -p
+narf-drivers-gpu` and then the checker again:
+
+* A trailing comment after `{` is moved into the block and then applies to
+  the block's first line. Put that annotation on the line above.
+* A standalone `//` comment directly after a line with a trailing comment is
+  re-indented as a continuation. Use `/// linux:` on items, or move it.
+* Consecutive trailing comments in match arms or argument lists are aligned.
+  That is harmless.
+
+A `linux-lit` literal that no longer appears on its line, or an item count
+that no longer matches, fails the run. A moved annotation is never accepted
+silently.
+
+## Coverage (first run, 2026-10)
+
+59 modules: 2483 values checked against Linux (including 641 registers,
+568 of them resolved to BAR5 addresses; VCN has no discovery base here), 656
+marked `n/a` with a reason, 0 unmapped. Mismatches found: `ENUM_ID_MASK` and
+`OBJECT_TYPE_MASK` in `amdgpu_dcn_inventory.rs` (0x0f00/0xf000, but
+`ObjectID.h` has 0x0700/0x7000; fixed). The firmware diff matched all 69
+records, and all twelve imported payloads are byte-identical to
+`/lib/firmware`.
+`navy_flounder_dmcub.bin` is a symlink to `beige_goby_dmcub.bin` there.

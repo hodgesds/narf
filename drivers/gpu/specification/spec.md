@@ -2970,6 +2970,23 @@ running SOS or availability of graphics acceleration. It does not set
 automatic platform wiring, VRAM training and the remaining IP firmware loads
 remain follow-up work. The PSP11 ring and SMC loader below are explicit APIs.
 
+### Navi 22 Linux conformance harness
+
+`drivers/gpu/tools/navi22-conformance.sh` is a host-side gate and is not part
+of the kernel interface. It exits nonzero on any mismatch. It runs three checks:
+
+* `check_constants.py` evaluates every `// linux:` / `// linux-lit:`
+  annotated constant on the Navi22 path against the Linux header for this
+  card's IP versions. For registers it also checks BASE_IDX, and the segment
+  the code applies, against discovery.
+* `tests/smu11_metrics.c`.
+* A diff between NARF's SOS/SMC/GFX/RLC/SDMA/VCN/DMCUB parsers (compiled on
+  the host) and a C mirror of Linux's `amdgpu_ucode` handling of the real
+  `navy_flounder_*.bin` blobs.
+
+Constants mirrored from Linux on these modules must carry an annotation. See
+`drivers/gpu/research/navi22-conformance.md`.
+
 ### Navi 22 PSP command ring and trusted memory
 
 `unsafe amdgpu_psp_ring::Psp::new_navi22(gpu, pci_cap, pool)` claims the sole
