@@ -45,6 +45,45 @@ fail probe. `HwRev::fw_dir()` = Linux `hw_params.fw.dir`.
 - `pci::{read32, write32}` — Linux-equivalent register access.
 - `pci::{is_probed, with_controller}` — bound-device inspection.
 
+Phase 3 groundwork — pure codecs, no MMIO, not yet wired to MHI:
+
+- `qmi` — QMI wire codec equivalent to `soc/qcom/qmi_encdec.c`:
+  `QmiHeader` (7-byte packed header), `encode_message` /
+  `split_message`, `TlvWriter` + `StructWriter` (encode, enforces
+  `*_MAX_LEN` and ei array/string bounds), `decode_tlvs` +
+  `StructReader` + `tlv_*` helpers (decode: unknown TLV `>= 0x10`
+  skipped, `< 0x10` refused; struct members past the end of a
+  struct TLV read as zero, like Linux), `QmiResponse`
+  (`qmi_response_type_v01`), `QmiError`. Stricter than Linux only
+  where Linux over-reads or desynchronises (truncated TLV, basic
+  TLV length ≠ element size) and on a missing mandatory TLV.
+- `qmi_wlfw` — the WLFW (service `0x45`) messages ath11k uses,
+  byte-identical to the `qmi.c` ei tables: `HostCapReq`,
+  `IndRegisterReq`/`Resp`, `RequestMemInd`, `RespondMemReq`,
+  `CapReq`/`CapResp` (+ `TargetInfo`), `BdfDownloadReq`
+  (+ `bdf_segments`, `bdf_eeprom_request`, `bdf_type_for`),
+  `M3InfoReq`, `WlanIniReq`, `WlanCfgReq` (+ the QCA6390/WCN6855
+  target CE and service maps), `WlanModeReq`, `DeviceInfoReq`/`Resp`,
+  the resp-only responses, and `decode_indication` for
+  REQUEST_MEM / FW_MEM_READY / FW_READY / COLD_BOOT_CAL_DONE /
+  FW_INIT_DONE. Traits `WlfwRequest` (`encode(txn_id)`) and
+  `WlfwMessage` (`decode`, checks header type + msg_id).
+  `wlfw_hw_params(HwRev)` = the `ath11k_hw_params` fields QMI reads;
+  `*::ath11k(..)` constructors set exactly the fields the matching
+  `ath11k_qmi_*_send` sets.
+- `qrtr` — QRTR v1 framing for MHI channels 20/21: `encode_packet`
+  (`qrtr_node_enqueue`, 4-byte zero padding), `decode_packet`
+  (`qrtr_endpoint_post` validation, v1 + v2 headers), `CtrlPkt`
+  (`qrtr_ctrl_pkt`), and `QrtrLink`, a frame-in/frame-out model of
+  the host name service for one endpoint: answers the remote HELLO,
+  learns NEW_SERVER / DEL_SERVER / BYE / DEL_CLIENT, matches
+  registered lookups (`qmi_instance(version, instance)`), frames
+  DATA with Linux's `confirm_rx` / RESUME_TX flow control.
+
+Tests: `qmi_tests.rs` (arch-neutral). WLFW golden vectors were
+produced by running Linux's own `qmi_encdec.c` on the ath11k ei
+tables.
+
 ## 4. Invariants
 
 - The PCI table is exactly Linux's `ath11k_pci_id_table`.

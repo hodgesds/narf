@@ -46,6 +46,9 @@ pub mod hw;
 pub mod mhi;
 pub mod pci;
 pub mod power;
+pub mod qmi;
+pub mod qmi_wlfw;
+pub mod qrtr;
 pub mod wmi;
 
 pub use hw::{
@@ -61,5 +64,7 @@ pub fn register() {
     register_pci_driver();
 }
 
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod qmi_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests;
