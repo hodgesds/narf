@@ -1,5 +1,6 @@
 use super::*;
 use crate::amdgpu_smu_navi48_telemetry::Metrics;
+use alloc::format;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn limits(fan: bool) -> Limits {

@@ -945,6 +945,9 @@ reached through VMID0, MSI-X/MSI delivery with polling fallback, and
 overflow-safe task-context drains. It routes IVs to generation-tagged
 subscribers that receive a terminal error on device loss. Boot enables it
 after the memory hubs and proves delivery with an SDMA0 TRAP.
+PMFW telemetry now uses the retained SMU11 table buffer (V1/V2 metrics by
+PMFW version, Linux-checked layouts) and feeds a read-only hwmon node shared
+with Navi48 (temperatures, fan, power, clocks); fan control stays automatic.
 These are software-tested foundations; training resume,
 VCN startup, display-aware DPM and OS thermal interrupt handling,
 hardware boot, general GPU mappings/GFX10 queue initialization, production

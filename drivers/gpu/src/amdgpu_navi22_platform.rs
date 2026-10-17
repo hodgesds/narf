@@ -34,6 +34,7 @@ pub struct Diagnostics {
     pub training: Option<crate::amdgpu_gddr6::State>,
     pub gfx: Option<crate::amdgpu_psp_ring::GfxBootStatus>,
     pub dmub: Option<crate::amdgpu_dmub_navi22::MailboxState>,
+    pub power: Option<crate::amdgpu_navi22_power::Snapshot>,
 }
 pub fn status() -> Status {
     match OWNER.try_lock() {
@@ -44,6 +45,7 @@ pub fn status() -> Status {
                 training: boot.training_state(),
                 gfx: boot.gfx_boot_status(),
                 dmub: boot.dmub_mailbox_state(),
+                power: crate::amdgpu_navi22_power::snapshot(),
             })
         }),
     }
@@ -213,7 +215,28 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
 /// Continue to satisfy `prepare`'s exclusive hardware ownership contract.
 pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     let mut owner = OWNER.lock().await;
-    owner.as_mut().ok_or(boot::Error::Invalid)?.run().await
+    let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
+    let report = boot.run().await?;
+    start_services(boot);
+    Ok(report)
+}
+
+/// Runtime services of a completed (or recovered) owner: PMFW telemetry and
+/// hwmon. They run as executor tasks that take the owner lock per refresh.
+fn start_services(boot: &mut boot::ColdBoot) {
+    if let Some(limits) = boot.power_limits() {
+        crate::amdgpu_navi22_power::start(Some(limits));
+    }
+}
+
+/// One PMFW telemetry refresh, serialized with every retained owner user.
+pub(crate) async fn power_sample() -> Result<crate::amdgpu_navi22_power::Sample, boot::Error> {
+    let mut owner = OWNER.lock().await;
+    owner
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .power_sample()
+        .await
 }
 
 /// IH dispatch endpoint of the retained owner (see amdgpu_ih_navi22).

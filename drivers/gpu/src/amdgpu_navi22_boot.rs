@@ -955,6 +955,33 @@ impl ColdBoot {
     pub fn dmub_notification(&mut self) -> Result<Option<[u8; 64]>, Error> {
         self.dmub_mut()?.poll_notification().map_err(Error::Dmub)
     }
+    /// Board limits of the retained SMU owner once boot power setup ran.
+    pub fn power_limits(&self) -> Option<smu::Limits> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_)) {
+            return None;
+        }
+        let h = &self.sequence.backend;
+        h.power_status.and(h.smu.as_ref()?.limits())
+    }
+    /// One PMFW telemetry refresh through the retained SMU owner after a
+    /// completed boot. It shares only the PPSMC mailbox and the retained
+    /// transfer buffer, both serialized by the caller's owner lock.
+    pub(crate) async fn power_sample(
+        &mut self,
+    ) -> Result<crate::amdgpu_navi22_power::Sample, Error> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_))
+            || self.sequence.backend.power_status.is_none()
+        {
+            return Err(Error::Busy);
+        }
+        let smu = self.sequence.backend.smu.as_mut().ok_or(Error::Invalid)?;
+        let telemetry = smu.read_telemetry().await;
+        Ok(crate::amdgpu_navi22_power::Sample {
+            protected: telemetry.is_ok_and(|t| smu.protected(t.enabled)),
+            telemetry,
+            limits: smu.limits(),
+        })
+    }
     /// Transfer the live ring/TMR owner after full firmware success. It must
     /// remain alive for subsequent GPU initialization; dropping it quarantines
     /// device-owned VRAM. Reset all consumers before calling its unsafe stop.
