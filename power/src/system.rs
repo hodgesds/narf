@@ -19,6 +19,48 @@
 //! on failure they `halt_forever` rather than letting the caller
 //! limp on with a half-broken transition in flight.
 
+// ── Device shutdown hooks ──────────────────────────────────────────
+
+/// A driver's final quiesce before the platform resets or powers off
+/// (Linux `device_shutdown` → `pci_device_shutdown` → e.g. `nvme_shutdown`).
+/// Runs with the system otherwise idle; it must be bounded and must not
+/// sleep on the scheduler.
+pub type ShutdownHook = fn();
+
+type HookList = alloc::vec::Vec<(&'static str, ShutdownHook)>;
+static SHUTDOWN_HOOKS: narf_lib::sync::IrqSafeSpinLock<HookList> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// Register `hook` under `name` (idempotent on `name`). Hooks run on every
+/// [`reboot`] and [`power_off`], after the persistent-log flush, in reverse
+/// registration order (Linux shuts devices down in reverse probe order).
+pub fn register_shutdown_hook(name: &'static str, hook: ShutdownHook) {
+    let mut g = SHUTDOWN_HOOKS.lock();
+    if let Some(e) = g.iter_mut().find(|(n, _)| *n == name) {
+        e.1 = hook;
+    } else {
+        g.push((name, hook));
+    }
+}
+
+/// Run every registered shutdown hook once (reverse registration order).
+/// Called by [`reboot`] / [`power_off`]; exposed for tests. The list is
+/// copied out first, so no lock is held while a driver runs.
+pub fn run_shutdown_hooks() {
+    let hooks = SHUTDOWN_HOOKS.lock().clone();
+    for (_, hook) in hooks.iter().rev() {
+        hook();
+    }
+}
+
+/// Persistent-log flush, then device shutdown: what every transition
+/// runs before handing the platform its reset / S5 write.
+#[allow(dead_code)]
+fn before_transition() {
+    narf_console::run_persist_hook(None);
+    run_shutdown_hooks();
+}
+
 /// Legacy fallback `\_S5` SLP_TYP values used only when firmware does not
 /// expose an evaluable `\_S5_` package. Real hardware varies; firmware values
 /// always take precedence, including `(0, 0)`.
@@ -43,8 +85,8 @@ const CF9_HARD_RESET: u8 = 0x06;
 /// state we can't recover from).
 #[cfg(target_arch = "x86_64")]
 pub fn reboot() -> ! {
-    // Final persistent-log flush before the platform resets.
-    narf_console::run_persist_hook(None);
+    // Final persistent-log flush, then device shutdown (NVMe CC.SHN, ...).
+    before_transition();
     // SAFETY: both reboot mechanisms hard-reset the platform —
     // they can't safely return.
     // SAFETY: Valid memory or trusted environment
@@ -72,7 +114,7 @@ pub fn reboot() -> ! {
 /// Never returns on success.
 #[cfg(target_arch = "x86_64")]
 pub fn power_off() -> ! {
-    narf_console::run_persist_hook(None);
+    before_transition();
     let (slp_typ_a, slp_typ_b) = select_s5_sleep_types(narf_aml::evaluate_s5());
     // SAFETY: enters S5 — the platform powers off; this call
     // is documented to never return.
@@ -91,7 +133,7 @@ pub fn power_off() -> ! {
 /// aarch64 reboot via PSCI SYSTEM_RESET. Returns `!`.
 #[cfg(target_arch = "aarch64")]
 pub fn reboot() -> ! {
-    narf_console::run_persist_hook(None);
+    before_transition();
     // QEMU/KVM use HVC while bare-metal firmware commonly uses SMC. The
     // architecture PSCI layer owns that selection and the SMCCC clobber set.
     let _ = narf_arch::aarch64::psci::system_reset();
@@ -101,7 +143,7 @@ pub fn reboot() -> ! {
 /// aarch64 power-off via PSCI SYSTEM_OFF.
 #[cfg(target_arch = "aarch64")]
 pub fn power_off() -> ! {
-    narf_console::run_persist_hook(None);
+    before_transition();
     let _ = narf_arch::aarch64::psci::system_off();
     narf_arch::halt_forever();
 }
