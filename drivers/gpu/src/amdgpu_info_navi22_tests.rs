@@ -116,6 +116,7 @@ fn booted(queues_verified: bool) -> Published {
             gfx_mhz: Some((500, 2600)),
             queues_verified,
         }),
+        vcn_harvest: Some(2),
         media_rings: 0,
     }
 }
@@ -443,8 +444,8 @@ kernel_test_in!(
 
 /// The RX 6750 XT's media answers: discovery lists VCN 3.0.0 and 3.0.1, the
 /// harvest table removes VCN1. HW_IP_COUNT is `num_vcn_inst` (2, harvested
-/// included) and the rings follow the verified client media rings and the
-/// switch.
+/// included), the rings follow the verified client media rings and the
+/// switch, and VIDEO_CAPS reports the VCN0 tables (AV1 decode present).
 fn navi22_media_hw_ip_and_video_caps_follow_linux() -> TestResult {
     let mut published = booted(true);
     published.media_rings = 0b1011; // dec, enc0, JPEG
@@ -491,6 +492,39 @@ fn navi22_media_hw_ip_and_video_caps_follow_linux() -> TestResult {
         && info(&partial, w, uapi::AMDGPU_HW_IP_VCN_DEC).available_rings == 1;
     if !wired || !closed || !partial_ok {
         return TestResult::Fail("media HW_IP_INFO/COUNT differ from amdgpu_hw_ip_info");
+    }
+    let caps = |s: &Snapshot, kind| -> uapi::DrmAmdgpuInfoVideoCaps {
+        decode(&ask(s, n, uapi::AMDGPU_INFO_VIDEO_CAPS, [kind, 0, 0, 0]).unwrap())
+    };
+    let av1 = uapi::AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_AV1 as usize;
+    let decode_caps = caps(&s, uapi::AMDGPU_INFO_VIDEO_CAPS_DECODE);
+    let encode_caps = caps(&s, uapi::AMDGPU_INFO_VIDEO_CAPS_ENCODE);
+    let mut vcn0_gone = s.clone();
+    vcn0_gone.navi22.vcn_harvest = Some(1);
+    let mut both = s.clone();
+    both.navi22.vcn_harvest = Some(3);
+    if decode_caps.codec_info[av1].valid != 1
+        || decode_caps
+            .codec_info
+            .iter()
+            .filter(|c| c.valid == 1)
+            .count()
+            != 8
+        || encode_caps
+            .codec_info
+            .iter()
+            .filter(|c| c.valid == 1)
+            .count()
+            != 2
+        || caps(&vcn0_gone, uapi::AMDGPU_INFO_VIDEO_CAPS_DECODE).codec_info[av1].valid != 0
+        || ask(
+            &both,
+            n,
+            uapi::AMDGPU_INFO_VIDEO_CAPS,
+            [uapi::AMDGPU_INFO_VIDEO_CAPS_DECODE, 0, 0, 0],
+        ) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("VIDEO_CAPS ignores the published VCN harvest");
     }
     TestResult::Pass
 }

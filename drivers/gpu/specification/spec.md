@@ -99,7 +99,7 @@ unless `Boot::queues_verified`. Media IPs additionally need
 `amdgpu_vcn_navi22_cs::register`): VCN_DEC/ENC/JPEG report one ring each
 when their rings passed, HW_IP_COUNT(VCN_DEC/ENC) is `num_vcn_inst` (every
 discovered instance, harvested ones included) and JPEG 1. VIDEO_CAPS
-returns the Sienna Cichlid codec tables for the discovered VCN instances; MAX_IBS
+returns the Sienna Cichlid codec tables for the published harvest; MAX_IBS
 reports
 `amdgpu_navi22_submit::MAX_IBS` (16) for advertised rings.
 
@@ -3632,8 +3632,10 @@ forwards them to `amdgpu_fence_navi22::Engine::{Vcn0, Vcn1, Jpeg}`.
 Sienna Cichlid `AMDGPU_INFO_VIDEO_CAPS` tables (decode VCN0 with AV1, or VCN1
 when VCN0 is harvested; encode AVC 4096² and HEVC 8192×4352) as
 `DrmAmdgpuInfoVideoCaps`; `None` for an unknown subquery or no VCN.
-`AMDGPU_INFO_VIDEO_CAPS` answers from them for the VCN instances present in
-discovery.
+`AMDGPU_INFO_VIDEO_CAPS` answers from them with `Published::vcn_harvest`
+(`amdgpu_info::publish_navi22_vcn_harvest`, the harvest the platform read)
+plus every VCN instance absent from discovery: on the RX 6750 XT (VCN1
+harvested) decode is the VCN0 table, AV1 included.
 
 Client media rings (append-only additions, `amdgpu.navi22_accel` only):
 `Media::{client_rings() -> u8, fence_reader() -> MediaFenceReader,

@@ -241,6 +241,9 @@ pub struct Published {
     /// PCI config revision (offset 0x08), `pdev->revision`.
     pub pci_revision: Option<u8>,
     pub boot: Option<Boot>,
+    /// `adev->vcn.harvest_config` (discovery harvest table plus the Navy
+    /// Flounder quirk), published by the platform owner before the boot.
+    pub vcn_harvest: Option<u8>,
     /// Media rings that take client jobs (bit `MediaRing::index()`: dec,
     /// enc0, enc1, JPEG), published by `amdgpu_vcn_navi22_cs::register`.
     pub media_rings: u8,
@@ -551,11 +554,13 @@ fn vram_gtt(snap: &Snapshot) -> Vec<u8> {
     })
 }
 
-/// `AMDGPU_INFO_VIDEO_CAPS` (`nv_query_video_codecs`): VCN instances absent
-/// from discovery are harvested. Linux answers it whether or not media rings
-/// run; Mesa only acts on it once VCN rings are advertised (they are not).
+/// `AMDGPU_INFO_VIDEO_CAPS` (`nv_query_video_codecs`) with this card's
+/// `harvest_config`: the published harvest table (VCN1 harvested on the RX
+/// 6750 XT, so decode reports `sc_video_codecs_decode_vcn0`, AV1 included),
+/// plus every VCN instance absent from discovery. Linux answers it whether
+/// or not media rings run; Mesa acts on it once VCN rings are advertised.
 fn video_caps(snap: &Snapshot, kind: u32) -> Result<Vec<u8>, FsError> {
-    let mut harvested = 0u8;
+    let mut harvested = snap.navi22.vcn_harvest.unwrap_or(0) & 3;
     for inst in 0..2u8 {
         if discovery::find_ip(&snap.ip_blocks, discovery::HW_ID_VCN, inst).is_none() {
             harvested |= 1 << inst;
