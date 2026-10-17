@@ -147,6 +147,9 @@ pub struct BtrfsNode<B: BlockDevice + 'static> {
     tree_id: Option<u64>,
     ino: u64,
     inode: InodeItem,
+    /// The file size as of this node's latest write: `inode` is the item as
+    /// looked up, and `stat` has no tree access.
+    live_size: core::sync::atomic::AtomicU64,
 }
 
 impl<B: BlockDevice + 'static> BtrfsNode<B> {
@@ -161,6 +164,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             tree_root,
             tree_id: None,
             ino,
+            live_size: core::sync::atomic::AtomicU64::new(inode.size),
             inode,
         })
     }
@@ -177,6 +181,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             tree_root: Some(tree_root),
             tree_id: Some(tree_id),
             ino,
+            live_size: core::sync::atomic::AtomicU64::new(inode.size),
             inode,
         })
     }
@@ -624,7 +629,13 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
         Box::pin(async move {
             let vol = self.volume()?;
             let root = self.root(&vol);
-            crate::extent::read_file(&vol, root, self.ino, self.inode.size, offset, buf).await
+            // The size is re-read from the tree: this node's cached inode
+            // predates any write made through it (or through another open
+            // file of the same inode).
+            let size = vol.load_inode_in(root, self.ino).await?.size;
+            self.live_size
+                .store(size, core::sync::atomic::Ordering::Relaxed);
+            crate::extent::read_file(&vol, root, self.ino, size, offset, buf).await
         })
     }
 
@@ -639,10 +650,15 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
-            autogrow!(
+            let written = autogrow!(
                 vol,
                 crate::write::cow_write_file(&vol, self.ino, &self.inode, offset, buf).await
-            )
+            )?;
+            self.live_size.fetch_max(
+                offset.saturating_add(written as u64),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            Ok(written)
         })
     }
 
@@ -660,8 +676,11 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
 
     fn stat(&self) -> Stat {
         Stat {
-            size: self.inode.size,
-            blocks: self.inode.size.div_ceil(512),
+            size: self.live_size.load(core::sync::atomic::Ordering::Relaxed),
+            blocks: self
+                .live_size
+                .load(core::sync::atomic::Ordering::Relaxed)
+                .div_ceil(512),
             mode: Mode {
                 file_type: self.inode.file_type(),
                 perms: self.inode.perms() & 0o777,
@@ -709,8 +728,11 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 gid: self.inode.gid,
                 mode: (self.inode.mode & 0xffff) as u16,
                 ino: self.ino,
-                size: self.inode.size,
-                blocks: self.inode.size.div_ceil(512),
+                size: self.live_size.load(core::sync::atomic::Ordering::Relaxed),
+                blocks: self
+                    .live_size
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    .div_ceil(512),
                 // `btrfs_getattr`: each timespec as stored, otime as btime.
                 atime: ts(self.inode.atime_sec, self.inode.atime_nsec),
                 btime: ts(self.inode.otime_sec, self.inode.otime_nsec),
@@ -791,6 +813,17 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
 impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     fn ino(&self) -> u64 {
         self.ino
+    }
+
+    /// A directory's `fsync`/`syncfs` makes every returned write durable, as
+    /// a file's does (see [`FileOps::fsync`] above): `sync(2)`, `syncfs` on a
+    /// directory fd and `fsync` of a directory after a rename all land here.
+    fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.volume()?.sync_to_disk().await })
+    }
+
+    fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.volume()?.sync_to_disk().await })
     }
 
     fn dcache_identity(&self) -> (usize, u64, u64) {

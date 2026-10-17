@@ -29,6 +29,7 @@ mod affected;
 mod bench_stats;
 /// The `bpf-bench` subcommand: boot the suite, harvest the samples, apply §8.
 mod bpf_bench;
+mod btrfs_interop;
 mod cachyos_root;
 mod ci_clippy;
 mod composition;
@@ -140,6 +141,14 @@ enum Cmd {
     /// Builds `target/narf-cachyos-root.img` unprivileged on first use (see
     /// `verification/data/cachyos-root/REGEN_cachyos_root_image.sh`).
     CachyosRootSmoke(cachyos_root::Args),
+    /// Build a CachyOS-shaped btrfs disk image (host mkfs features, `@`
+    /// subvolumes, zstd, `chattr +C` journals) unprivileged, boot it under
+    /// `narf.disks=root-rw` running systemd-/pacman-shaped writes in `@`,
+    /// `@home` and `@log`, then require host `btrfs check` clean, `btrfs
+    /// restore` content matches and the GPT/ESP untouched. The host-exact
+    /// BLOCK_GROUP_TREE variant must be refused read-write by name and stay
+    /// bit-identical (`--bgt=refused`, until the writer maintains BGT).
+    BtrfsRootrwInterop(btrfs_interop::Args),
     /// Exercise real HTTP/3 from a running CachyOS guest through SLIRP.
     ///
     /// The host runs an in-process QUIC/HTTP/3 fixture. The guest's curl must
@@ -12630,6 +12639,7 @@ fn main() -> Result<()> {
         Cmd::BootSmoke(args) => boot_smoke_cmd(&args),
         Cmd::SystemdPid1(args) => systemd_pid1_cmd(&args),
         Cmd::CachyosRootSmoke(args) => cachyos_root::run(&args),
+        Cmd::BtrfsRootrwInterop(args) => btrfs_interop::run_cmd(&args),
         Cmd::Http3Smoke(args) => http3_smoke::run(&args),
         Cmd::RunInteractive(args) => run_interactive_cmd(&args),
         Cmd::NetSmoke(args) => net_smoke_cmd(&args),

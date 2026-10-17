@@ -899,19 +899,6 @@ const INODE_ITEM_FLAGS: usize = 64;
 /// `BTRFS_INODE_NODATASUM`.
 const INODE_NODATASUM: u64 = 1 << 0;
 
-/// Whether inode `ino` carries `BTRFS_INODE_NODATASUM` (set with
-/// `NODATACOW` by `chattr +C`).
-async fn inode_nodatasum<B: BlockDevice + 'static>(
-    vol: &BtrfsVolume<B>,
-    fs_root: u64,
-    ino: u64,
-) -> Result<bool, FsError> {
-    let body = btree::find_item(vol, fs_root, &BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0))
-        .await?
-        .ok_or(FsError::NotFound)?;
-    Ok(le64(&body, INODE_ITEM_FLAGS)? & INODE_NODATASUM != 0)
-}
-
 /// Write `data` at byte `offset` into file `ino` via COW. Only the sector-aligned
 /// write window and the existing extents it intersects are read, freed and
 /// re-tiled (each new extent is at most [`MAX_WRITE_EXTENT`]); non-overlapping
@@ -947,6 +934,23 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     }
     ensure_private_subvol(vol).await?;
     let (fs_root, _) = vol.fs_tree_root();
+    // The caller's `InodeItem` is the one cached when its VFS node was
+    // looked up. A second write through the same open file would otherwise
+    // see the size from before the first and zero-fill over the bytes it
+    // wrote (every appending writer — journald, pacman, shells — does this).
+    // The tree is authoritative.
+    let fresh = btree::find_item(vol, fs_root, &BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0))
+        .await?
+        .ok_or(FsError::NotFound)?;
+    let inode = &InodeItem::decode(&fresh)?;
+    if !inode.is_regular() {
+        return Err(FsError::Unsupported);
+    }
+    // `chattr +C` files (systemd-journald's journals on btrfs) carry
+    // BTRFS_INODE_NODATASUM: Linux writes their extents with no data
+    // checksums and never compresses them, and `btrfs check` flags a csum
+    // item for such an inode ("odd csum item"). Honour the inode's flag.
+    let nodatasum = le64(&fresh, INODE_ITEM_FLAGS)? & INODE_NODATASUM != 0;
 
     let old_size = inode.size;
     let end = offset
@@ -1054,11 +1058,6 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
             .checked_add(le64(body, 45)?)
             .ok_or(FsError::InvalidData)?;
     }
-    // `chattr +C` files (systemd-journald's journals on btrfs) carry
-    // BTRFS_INODE_NODATASUM: Linux writes their extents with no data
-    // checksums and never compresses them, and `btrfs check` flags a csum
-    // item for such an inode ("odd csum item"). Honour the inode's flag.
-    let nodatasum = inode_nodatasum(vol, fs_root, ino).await?;
     // Preserve an existing zlib policy when the complete replacement window is
     // made solely from zlib extents (plus holes). Mixed-codec/uncompressed
     // windows fall back to ordinary extents.

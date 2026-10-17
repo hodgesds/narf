@@ -11108,7 +11108,14 @@ fn smoke_btrfs_rw_gate_tree_refusals() -> TestResult {
 
     let last_slot = |node: &[u8]| btree::nritems(node).ok().map(|n| n as usize - 1);
     /// (what, refusal text, objectid, item type, body patch, in the dev tree)
-    type Case = (&'static str, &'static str, u64, u8, Option<(usize, u64)>, bool);
+    type Case = (
+        &'static str,
+        &'static str,
+        u64,
+        u8,
+        Option<(usize, u64)>,
+        bool,
+    );
     let cases: [Case; 3] = [
         ("balance", "balance", (-4i64) as u64, 248, None, false),
         ("relocation", "relocation", (-8i64) as u64, 132, None, false),
@@ -11249,3 +11256,50 @@ fn smoke_btrfs_mount_options_installed_root() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_mount_options_installed_root);
+
+/// pacman/journald-shaped small appends to a new file on a host-shaped
+/// (16 KiB nodes, non-mixed, free-space tree) volume read back exactly,
+/// before and after a sync + remount.
+fn smoke_btrfs_small_appends_read_back() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let dev = writable_sparse(FIXTURE_LAPTOP_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("laptop fixture failed to mount writable"),
+    };
+    let want: Vec<u8> = crate::interop::PKG_DESC.to_vec();
+    let file = match poll_once(vol.root().create("desc")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let mut at = 0u64;
+    for chunk in want.chunks(17) {
+        if !matches!(poll_once(file.write(at, chunk)), Some(Ok(n)) if n == chunk.len()) {
+            return TestResult::Fail("append failed");
+        }
+        at += chunk.len() as u64;
+    }
+    match read_all(&file, want.len() + 8) {
+        Some(got) if got == want => {}
+        Some(_) => return TestResult::Fail("appends read back wrong before sync (same handle)"),
+        None => return TestResult::Fail("read failed"),
+    }
+    match poll_once(vol.root().lookup_async("desc")) {
+        Some(Ok(f)) if read_all(&f, want.len() + 8).as_deref() == Some(&want[..]) => {}
+        _ => return TestResult::Fail("appends read back wrong before sync (fresh lookup)"),
+    }
+    let _ = poll_once(vol.sync_to_disk());
+    drop(file);
+    drop(vol);
+    let vol = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount failed"),
+    };
+    match poll_once(vol.root().lookup_async("desc")) {
+        Some(Ok(f)) if read_all(&f, want.len() + 8).as_deref() == Some(&want[..]) => {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("appends read back wrong after remount"),
+    }
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_small_appends_read_back);

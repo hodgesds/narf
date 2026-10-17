@@ -34,6 +34,7 @@ pub mod dir;
 pub mod extent;
 pub mod format;
 pub mod inode;
+pub mod interop;
 pub mod lzo;
 pub mod mount_opts;
 pub mod node;

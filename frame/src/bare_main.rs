@@ -3581,6 +3581,21 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_init::InitResult::NotPresent
             });
 
+            // Test vehicle for `cargo xtask btrfs-rootrw-interop`: systemd-
+            // and pacman-shaped writes on the mounted root, run only when the
+            // harness passes `narf.rootrw_interop=<mode>` together with
+            // `narf.disks=root-rw` against its own disposable image (the
+            // workload refuses any other root). Inert otherwise.
+            narf_init::register_with_budget(
+                narf_init::Stage::Late,
+                "btrfs-rootrw-interop",
+                || match narf_boot::args().value("narf.rootrw_interop") {
+                    Some(mode) => narf_drivers_fs_btrfs::interop::run(mode),
+                    None => narf_init::InitResult::NotPresent,
+                },
+                300_000,
+            );
+
             // Mount the UEFI EFI System Partition before PID 1 starts.  This
             // is selected from the GPT ESP type GUID, never from a volatile
             // device name or an image-specific FAT UUID.  Systemd then sees
