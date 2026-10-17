@@ -363,6 +363,8 @@ struct Hardware {
     /// Presentation of the lit pipe (amdgpu_navi22_scanout), built after it
     /// lights and stopped before the pipeline tears it down.
     scanout: Option<crate::amdgpu_navi22_scanout::Scanout>,
+    /// A multi-stream context (KMS CRTCs 1..), lit instead of `modeset`.
+    group: Option<crate::amdgpu_navi22_modeset::Group>,
     queues: Option<Queues>,
     ih: Option<crate::amdgpu_ih_navi22::Ih>,
     media: Option<crate::amdgpu_vcn_navi22::Media>,
@@ -960,6 +962,7 @@ impl ColdBoot {
                     display_bios: None,
                     modeset: None,
                     scanout: None,
+                    group: None,
                     queues: None,
                     ih: None,
                     media: None,
@@ -1014,6 +1017,7 @@ impl ColdBoot {
                     display_bios: None,
                     modeset: None,
                     scanout: None,
+                    group: None,
                     queues: None,
                     ih: None,
                     media: None,
@@ -1835,6 +1839,110 @@ impl ColdBoot {
             let _ = pipeline.release_scanout();
         }
         Ok(())
+    }
+    /// Light `requests` as one multi-stream context
+    /// (`amdgpu_navi22_modeset::Group`: joint DML30 admission, shared
+    /// clocks, PLL sharing, ODM, DSC and MST), filling stream k's rows with
+    /// `draw(k, y, row)` before fetch. The single-pipe owner must be
+    /// stopped (or never lit); a previous context that stopped or failed is
+    /// dropped. Its scanouts are static: no flips, back buffers or vblank.
+    ///
+    /// # Safety
+    /// As `modeset_display`, for every stream.
+    pub async unsafe fn modeset_group(
+        &mut self,
+        requests: &[crate::amdgpu_navi22_modeset::Request],
+        draw: impl Fn(usize, u32, &mut [u32]),
+    ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_modeset::Output>, Error> {
+        use crate::amdgpu_navi22_modeset::{self as modeset, GroupState, Phase, State as M, Step};
+        self.display_mut()?;
+        let h = &mut self.sequence.backend;
+        let single_dark = h.scanout.is_none()
+            && h.modeset
+                .as_ref()
+                .is_none_or(|p| matches!(p.state(), M::At(Step::Stopped) | M::Failed { .. }));
+        let group_dark = h.group.as_ref().is_none_or(|g| {
+            matches!(
+                g.state(),
+                GroupState::At(Phase::Stopped) | GroupState::Failed { .. }
+            )
+        });
+        if !single_dark || !group_dark {
+            return Err(Error::Busy);
+        }
+        h.modeset = None;
+        h.group = None;
+        let (vbios, crystal) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
+        let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
+            .map_err(|e| Error::Modeset(modeset::Error::Bios(e)))?;
+        let board = modeset::Board::from_vbios(vbios, *crystal).map_err(Error::Modeset)?;
+        let smu = h.smu.as_mut().ok_or(Error::Invalid)?;
+        let display = h.display.as_mut().ok_or(Error::Invalid)?;
+        let links: alloc::vec::Vec<_> = display.connectors().to_vec();
+        // SAFETY: this cold-boot owner holds the whole GPU; the caller's
+        // contract excludes other display clients.
+        let mut group = unsafe { modeset::Group::new(&h.gpu, h.authority, requests) }
+            .map_err(Error::Modeset)?;
+        // SAFETY: forwarded; the pool and SMU are this owner's.
+        let result = unsafe {
+            group
+                .enable(
+                    crate::amdgpu_dcn30_clk::display_power(smu),
+                    &h.pool,
+                    &tables,
+                    board,
+                    &links,
+                    display,
+                    draw,
+                )
+                .await
+        };
+        h.group = Some(group);
+        result.map_err(Error::Modeset)
+    }
+    /// Stop the multi-stream context; on success every scanout returns to
+    /// the pool.
+    ///
+    /// # Safety
+    /// Every CPU writer of its scanouts was withdrawn and its views retired.
+    pub async unsafe fn stop_group(&mut self) -> Result<(), Error> {
+        let h = &mut self.sequence.backend;
+        let group = h.group.as_mut().ok_or(Error::Invalid)?;
+        let (vbios, _) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
+        let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
+            .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Bios(e)))?;
+        let display = h.display.as_mut().ok_or(Error::Invalid)?;
+        group
+            .disable(&tables, display)
+            .await
+            .map_err(Error::Modeset)?;
+        for m in group.members_mut() {
+            // SAFETY: stopped cleanly; the caller retired every CPU view.
+            let _ = unsafe { m.release_scanout() };
+        }
+        Ok(())
+    }
+    /// The running multi-stream context's outputs, in request order.
+    pub fn group_outputs(&self) -> Option<alloc::vec::Vec<crate::amdgpu_navi22_modeset::Output>> {
+        use crate::amdgpu_navi22_modeset::{GroupState, Phase};
+        let g = self.sequence.backend.group.as_ref()?;
+        if g.state() != GroupState::At(Phase::Running) {
+            return None;
+        }
+        g.members().iter().map(|m| m.output()).collect()
+    }
+    /// The multi-stream context's admission, for the power policy.
+    pub fn group(&self) -> Option<&crate::amdgpu_navi22_modeset::Group> {
+        self.sequence.backend.group.as_ref()
+    }
+    /// HDP flush for the context's first scanout (the console's).
+    pub fn flush_group_scanout(&mut self) -> Result<(), Error> {
+        let g = self.sequence.backend.group.as_mut().ok_or(Error::Invalid)?;
+        g.members_mut()
+            .first_mut()
+            .ok_or(Error::Invalid)?
+            .flush()
+            .map_err(Error::Modeset)
     }
     /// The presentation owner of the lit pipe.
     pub fn display_scanout(

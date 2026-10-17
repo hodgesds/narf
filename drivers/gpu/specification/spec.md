@@ -4187,22 +4187,41 @@ prepare_display_back_buffer(), flip_display(), set_display_cursor()}` own
 these. `into_recovery` re-prepares DMUB and the display owner from the
 retained VBIOS/routes so the recovered sequence restarts DMUB.
 
-`amdgpu_navi22_kms` holds DRM state: one CRTC (pipe 0, id 1) and one
-connector per board route (ids per `amdgpu_navi48_kms`); connectors offer
+`amdgpu_navi22_kms` holds DRM state: `MAX_CRTCS` (4, the shared id scheme's
+outputs) CRTCs — CRTC 0 (pipe 0, id 1) the single-pipe owner's, CRTCs 1..3
+(`Kms::secondary`) lit only together with it as one multi-stream context —
+and one connector per board route (ids per `amdgpu_navi48_kms`); connectors offer
 the DML30-admitted timings (`Kms::reconcile_sinks(reports, offered)`), a DP
 sink's bounded by its verified link (`modeset::offered_on(sink, soc, vco,
 verified)`, `dp_validate_mode_timing`; the receiver-caps ceiling until
-verified). Automatic routing takes an HDMI sink first, else the first DP one;
-any board port can be routed.
+verified). Automatic routing takes an HDMI sink first, else the first DP one, for
+CRTC 0; with `set_auto_multi(true)` (fb: the `amdgpu.navi22_multi` flag) each
+remaining lightable connector takes the next free secondary CRTC, otherwise
+only DRM routes them. Every connector may drive every CRTC
+(`possible_crtcs`); routing a connector steals it from another CRTC.
+`crtc_at(d)`, `crtc_of(connector)`, `targets()`, `published_at(d)`,
+`offered_at`/`find_mode_at`, and `next_group(running) -> GroupAction {
+Nothing, Unlight, Light(Vec<(crtc, connector, want)>) }` (a context is wanted
+while a secondary CRTC wants a sink; any change relights it whole; a failed
+attempt waits for the next request, `attempted_group`).
 `request_display_{active,route,mode}`, `request_connector_crtc`,
-`display_offers` (TEST_ONLY/SETCRTC validation), `restore_displays`, `publish`,
-`display_admission(admitted, streams)` (`DisplayAdmission`: DML30 DRAM clock
-change; stutter/FCLK/watermark table/deep sleep false). `amdgpu_native_kms`
+`display_offers` (TEST_ONLY/SETCRTC validation), `restore_displays`, `publish`
+apply to any CRTC. `display_admission(admitted, streams)` (`DisplayAdmission`:
+DML30 DRAM clock change; `watermarks` the HUBBUB half — sets A-D programmed
+from the plan — which power saving ANDs with its PMFW table upload;
+stutter/FCLK/deep sleep false). `amdgpu_native_kms`
 dispatches the DRM bridges to Navi22 once it published, else Navi48.
 `amdgpu_navi22_platform::{modeset_displays(draw), spawn_display_monitor(),
 flip_display(), set_display_cursor(), set_hw_cursor(), present_frame(),
 native_present_ready(), crtc_vblank(), vblank_time(), display_admission(),
-relight_after_recovery()}`: publication withdraws the console and drains
+relight_after_recovery()}`: only CRTC 0 presents and has vblank. Each
+monitor pass first converges the multi-stream context (`converge_group`):
+the single pipe is torn down, then every wanted CRTC lights through
+`ColdBoot::modeset_group(requests, draw)` (stopped by `stop_group()`;
+`group_outputs()`, `group()`, `flush_group_scanout()`), the console follows
+stream 0, the other scanouts are static, and `display_admission` reports the
+context's lowest-state plan; when the context fails CRTC 0 lights alone.
+Publication withdraws the console and drains
 `scanout_access` before any teardown; recovery withdraws and stops the pipe
 before reset and the monitor relights once `recoveries()` increments. The fb
 handoff calls `modeset_displays` and the monitor with `amdgpu.native_display`

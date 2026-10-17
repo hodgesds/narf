@@ -244,7 +244,7 @@ fn navi22_display_admission_reports_only_what_dml30_proved() -> TestResult {
         || d.dram_clock_change != (plan.dram_clock_change != dml30::DramClockChange::Unsupported)
         || d.fclk_change
         || d.stutter
-        || d.watermarks
+        || !d.watermarks
         || d.deep_sleep_dcefclk
         || d.min_uclk_mhz != 1000
         || d.min_fclk_mhz != 1200
@@ -252,7 +252,7 @@ fn navi22_display_admission_reports_only_what_dml30_proved() -> TestResult {
     {
         return TestResult::Fail("admission fields");
     }
-    if display_admission(&a, 0).dram_clock_change {
+    if display_admission(&a, 0).dram_clock_change || display_admission(&a, 0).watermarks {
         return TestResult::Fail("retired pipes claim a p-state guarantee");
     }
     TestResult::Pass
@@ -318,4 +318,74 @@ fn navi22_kms_dp_sinks_offer_their_link_modes() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     navi22_kms_dp_sinks_offer_their_link_modes
+);
+
+fn navi22_kms_secondary_crtcs_light_as_one_context() -> TestResult {
+    let mut r = reports(true, 1);
+    r[0].detection = Detection::Connected(Sink {
+        edid: vec![2; 128],
+        preferred: None,
+        hdmi: false,
+        dpcd: None,
+    });
+    let mut k = Kms::new();
+    k.reconcile(&r, admitted);
+    // Without the opt-in only CRTC 0 routes itself: no context.
+    k.assign_route();
+    if k.crtc.route != Some(3)
+        || k.secondary.iter().any(|c| c.route.is_some())
+        || k.next_group(None) != GroupAction::Nothing
+    {
+        return TestResult::Fail("automatic secondary routing without the opt-in");
+    }
+    // With it, the next free CRTC takes DP-1; CRTC 0 keeps HDMI.
+    set_auto_multi(true);
+    k.assign_route();
+    set_auto_multi(false);
+    if k.secondary[0].route != Some(0) || k.crtc_of(0) != Some(1) || k.crtc_of(3) != Some(0) {
+        return TestResult::Fail("automatic secondary route");
+    }
+    let both = vec![(0, 3, None), (1, 0, None)];
+    if k.next_group(None) != GroupAction::Light(both.clone()) {
+        return TestResult::Fail("two wanted CRTCs not lit together");
+    }
+    // A failed attempt is not retried until something changes.
+    k.attempted_group = Some(both.iter().map(|t| (t.1, t.2)).collect());
+    if k.next_group(None) != GroupAction::Nothing {
+        return TestResult::Fail("failed context retried");
+    }
+    let lit = [(0, 3, hd()), (1, 0, hd())];
+    if k.next_group(Some(&lit)) != GroupAction::Nothing {
+        return TestResult::Fail("running context relit");
+    }
+    // A new mode on one CRTC relights the whole context; CRTC 1 off leaves
+    // CRTC 0 to the single-pipe owner.
+    k.secondary[0].requested = Some(xga());
+    if k.next_group(Some(&lit)) != GroupAction::Unlight {
+        return TestResult::Fail("mode change kept the context");
+    }
+    k.secondary[0].requested = None;
+    k.secondary[0].active = false;
+    if k.next_group(Some(&lit)) != GroupAction::Unlight
+        || k.next_group(None) != GroupAction::Nothing
+    {
+        return TestResult::Fail("context kept without a secondary");
+    }
+    // Each CRTC publishes only its own shown sink.
+    k.secondary[0].active = true;
+    k.secondary[0].shown = Some(([2; 128], hd(), vec![hd()]));
+    if k.published_at(1).map(|s| s.1) != Some(hd()) || k.published_at(2).is_some() {
+        return TestResult::Fail("per-CRTC publication");
+    }
+    // An unplugged secondary sink drops its automatic route.
+    k.reconcile(&reports(true, 1), admitted);
+    k.assign_route();
+    if k.secondary[0].route.is_some() {
+        return TestResult::Fail("route kept to an unplugged sink");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_kms_secondary_crtcs_light_as_one_context
 );
