@@ -993,6 +993,12 @@ hook. The HD-Audio side binds 1002:ab28 (ATI HDMI NS, no snoop); a model of
 the host's six-port R6xx HDMI codec (rev 0x100800) checks that endpoint `e`
 reports jack and ELD on pin `3 + 2e` and routes playback there. Register
 models only.
+Mesa 26.2.4 radeonsi + RADV (ACO-only, llvmpipe fallback kept) now builds
+reproducibly for NARF's musl userspace and stages into a rootfs; the
+`mesa-amd-smoke` passes inside NARF under QEMU with no AMD GPU (clean
+decline, software fallback renders) and the same binaries render on a Linux
+amdgpu host ([Mesa AMD](docs/MESA_AMD.md)). libdrm_amdgpu's `GET_CLIENT` on
+primary nodes is the first NARF gap Mesa hits.
 These are software-tested foundations; training resume,
 media submission/DPG, display-aware DPM, user command submission,
 hardware boot and DCN3.0 modesetting remain open. See the
