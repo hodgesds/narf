@@ -11543,6 +11543,9 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
         fn signalled(&self, seq: u64) -> bool {
             self.completed.load(Ordering::SeqCst) >= seq
         }
+        fn ring_for(&self, ip: u32, _: u32, _: u32) -> Option<u32> {
+            (ip == u::AMDGPU_HW_IP_GFX).then_some(0)
+        }
         fn wait(
             &self,
             seq: u64,
@@ -11710,7 +11713,7 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
         }
         // GEM_WAIT_IDLE follows the open's last job (1, now complete), and
         // reports the buffer's preferred domains.
-        if state.last_job() != 1 {
+        if state.last_jobs() != [1] {
             return Some("the CS was recorded on its address space");
         }
         let idle_cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_WAIT_IDLE;
@@ -11816,6 +11819,14 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
             if run(cs_cmd, &mut c.req) != Err(want) {
                 return Some("bad dependency");
             }
+            // A handle naming another ring's job does not belong to this one.
+            let mut c = cs_with(&[(
+                u::AMDGPU_CHUNK_ID_DEPENDENCIES,
+                dep(u::AMDGPU_HW_IP_GFX, ctx_id, 1 << 32 | 1),
+            )]);
+            if run(cs_cmd, &mut c.req) != Err(FsError::InvalidData) {
+                return Some("dependency on another ring's ticket");
+            }
         }
         None
     })();
@@ -11879,15 +11890,31 @@ fn smoke_amdgpu_vm_holds_job_memory_until_its_fence() -> TestResult {
         if weak.upgrade().is_some() || deferred(card) != 0 {
             return Some("not retired after its job");
         }
+        // Jobs on two rings: a free waits for both rings' last job.
+        let (h, weak) = map_one(&vm, 0x4_0000_0000)?;
+        vm.note_job(7);
+        vm.note_job(1 << 32 | 3);
+        close(h);
+        gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_UNMAP, 0, 0x4_0000_0000, 0, P).ok()?;
+        retire(card, &|t| t >> 32 == 0 && t <= 7);
+        if weak.upgrade().is_none() {
+            return Some("freed before the other ring's job");
+        }
+        retire(card, &|t| {
+            t >> 32 == 0 && t <= 7 || t >> 32 == 1 && (t as u32) <= 3
+        });
+        if weak.upgrade().is_some() {
+            return Some("not freed after both rings' jobs");
+        }
         // A dropped address space with a live mapping waits too.
         let (h, weak) = map_one(&vm, 0x5_0000_0000)?;
-        vm.note_job(6);
+        vm.note_job(8);
         close(h);
         drop(vm);
         if weak.upgrade().is_none() || deferred(card) == 0 {
             return Some("a closed file freed its job's memory");
         }
-        retire(card, &|seq| seq <= 6);
+        retire(card, &|t| t >> 32 == 0 && t <= 8 || t >> 32 == 1);
         if weak.upgrade().is_some() || deferred(card) != 0 {
             return Some("closed file's memory not retired");
         }

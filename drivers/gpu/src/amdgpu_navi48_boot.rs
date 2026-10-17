@@ -700,6 +700,7 @@ impl ColdBoot {
     /// reaches stay alive until `completed_client_job` passes the sequence.
     pub(crate) unsafe fn submit_client_job(
         &mut self,
+        pipe: queues::Pipe,
         job: queues::Job,
     ) -> Result<u32, queues::Error> {
         let queues = self
@@ -709,7 +710,7 @@ impl ColdBoot {
             .as_mut()
             .ok_or(queues::Error::Invalid)?;
         // SAFETY: the caller's obligations.
-        unsafe { queues.submit(job) }
+        unsafe { queues.submit(pipe, job) }
     }
     /// A reader of the graphics ring's job fence that needs no access to
     /// this owner.
@@ -720,15 +721,7 @@ impl ColdBoot {
             .as_ref()
             .map(queues::Queues::fence_reader)
     }
-    /// The last client job sequence the graphics ring completed.
-    pub(crate) fn completed_client_job(&mut self) -> Result<u32, queues::Error> {
-        self.sequence
-            .backend
-            .queues
-            .as_mut()
-            .ok_or(queues::Error::Invalid)?
-            .completed_job()
-    }
+
     /// This GPU's DRM card: the registered Navi48.
     pub(crate) fn drm_card() -> Option<u32> {
         (0..crate::drm_registry::count() as u32).find(|&i| {

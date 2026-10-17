@@ -34,11 +34,14 @@ struct Fake {
     job_ibs: Vec<(u64, u32)>,
 }
 impl Fake {
-    /// The graphics CP running client-job slots from its RPTR to `tail`.
-    fn execute_jobs(&mut self, tail: u64) {
-        let mut rptr = u64::from(self.memory[2560]);
+    /// A CP running client-job slots of `pipe` from its RPTR to `tail`.
+    fn execute_jobs(&mut self, pipe: usize, tail: u64) {
+        let off = pipe * 3072;
+        // Compute rings write registers without the PFP engine select.
+        let write_cmd = if pipe == 0 { 0x4010_0000 } else { 0x0010_0000 };
+        let mut rptr = u64::from(self.memory[off + 2560]);
         while rptr < tail {
-            let slot = (rptr % 1024) as usize;
+            let slot = off + (rptr % 1024) as usize;
             let mut cursor = 0;
             while cursor < 256 {
                 let words = &self.memory[slot + cursor..slot + 256];
@@ -49,7 +52,7 @@ impl Fake {
                 match (header >> 8) & 255 {
                     0x37 => {
                         assert_eq!(length, 5);
-                        assert_eq!(words[1], 0x4010_0000, "PFP register write, confirmed");
+                        assert_eq!(words[1], write_cmd, "confirmed register write");
                         assert_eq!(words[3], 0);
                         self.job_writes.push((words[2], words[4]));
                     }
@@ -80,7 +83,7 @@ impl Fake {
             assert_eq!(cursor, 256, "the job fills its slot exactly");
             rptr += 256;
             // GC12 writes back only the low 32 bits.
-            self.memory[2560] = rptr as u32;
+            self.memory[off + 2560] = rptr as u32;
         }
     }
     fn execute(&mut self, pipe: usize, tail: u32) {
@@ -192,10 +195,14 @@ impl Io for Fake {
     }
     fn doorbell(&mut self, _: MmioRegion, offset: u32, v: u64) {
         if v > 512 {
-            assert_eq!(offset, 0x116, "client jobs ring the graphics queue");
+            let pipe = match offset {
+                0x116 => 0,
+                6 => 1,
+                _ => panic!("wrong CP doorbell"),
+            };
             self.bells.push(offset);
             if self.complete {
-                self.execute_jobs(v);
+                self.execute_jobs(pipe, v);
             }
             return;
         }
@@ -290,8 +297,8 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
         state: State::Prepared,
         proof: None,
         interrupt_result: None,
-        gfx_wptr: 0,
-        gfx_seq: 0,
+        job_wptr: [0; 2],
+        job_seq: [0; 2],
     };
     let mes = FakeMes {
         mapped,
@@ -644,7 +651,7 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
     let (_pool, mut e, mut mes, aperture, target) = fixture();
     run(e.initialize(&mut mes, aperture, target)).unwrap();
     let job = Job::new(3, 0x1234, 0x1_0000_8001, &[(0x2_0000_1000, 64)]).unwrap();
-    if e.submit(job) != Err(Error::Busy) {
+    if e.submit(Pipe::Graphics, job) != Err(Error::Busy) {
         return TestResult::Fail("job before the interrupt proof");
     }
     // As the interrupt proof leaves the graphics ring.
@@ -658,11 +665,11 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
         Job::new(3, 1, 0x1_0000_8001, &[(0x2_0000_1002, 64)]).unwrap(),
         Job { ib_count: 0, ..job },
     ] {
-        if e.submit(bad) != Err(Error::Invalid) || e.io.bells.len() != writes {
+        if e.submit(Pipe::Graphics, bad) != Err(Error::Invalid) || e.io.bells.len() != writes {
             return TestResult::Fail("bad job");
         }
     }
-    if e.submit(job) != Ok(1) || e.completed_job() != Ok(1) {
+    if e.submit(Pipe::Graphics, job) != Ok(1) || e.completed_job(Pipe::Graphics) != Ok(1) {
         return TestResult::Fail("first job");
     }
     let gc = 0x10000 / 4;
@@ -682,7 +689,9 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
     }
     // Four more wrap the ring (slots at 768, 0, 256, 512).
     for seq in 2..=5 {
-        if e.submit(Job { vmid: 5, ..job }) != Ok(seq) || e.completed_job() != Ok(seq) {
+        if e.submit(Pipe::Graphics, Job { vmid: 5, ..job }) != Ok(seq)
+            || e.completed_job(Pipe::Graphics) != Ok(seq)
+        {
             return TestResult::Fail("wrapped jobs");
         }
     }
@@ -699,8 +708,8 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
         (0x3_0000_2000, 48),
     ];
     let multi = Job::new(4, 0x99, 0x1_0000_8001, &three).unwrap();
-    if e.submit(multi) != Ok(6)
-        || e.completed_job() != Ok(6)
+    if e.submit(Pipe::Graphics, multi) != Ok(6)
+        || e.completed_job(Pipe::Graphics) != Ok(6)
         || e.io.job_ibs[5..]
             != [
                 (0x3_0000_0000, 16 | 4 << 24),
@@ -710,15 +719,38 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
     {
         return TestResult::Fail("multi-IB job");
     }
+    // The compute queue: its own ring, fence and engine (1), no PFP.
+    e.io.memory[3072 + 2560] = 512;
+    let syncs = e.io.job_syncs;
+    let writes = e.io.job_writes.len();
+    let compute = Job::new(2, 0x55, 0x1_0000_8001, &[(0x2_0000_4000, 8)]).unwrap();
+    if e.submit(Pipe::Compute, compute) != Ok(1)
+        || e.completed_job(Pipe::Compute) != Ok(1)
+        || e.completed_job(Pipe::Graphics) != Ok(6)
+        || e.io.job_syncs != syncs
+        || e.io.job_writes[writes..]
+            != [
+                (gc + 0x168f + 4, 0x8001),
+                (gc + 0x1690 + 4, 1),
+                (lut + 2, 0x55),
+            ]
+        || e.io.job_waits.last() != Some(&(gc + 0x1648, gc + 0x165a, 0x00f8_0004, 4, 0x43))
+        || e.io.job_ibs.last() != Some(&(0x2_0000_4000, 8 | 1 << 23 | 2 << 24))
+        || e.io.memory[3072 + 2562] != 768
+    {
+        return TestResult::Fail("compute job");
+    }
     // With the CP stalled, four slots fill and a fifth is refused.
     e.io.complete = false;
     for seq in 7..=10 {
-        if e.submit(job) != Ok(seq) {
+        if e.submit(Pipe::Graphics, job) != Ok(seq) {
             return TestResult::Fail("filling the ring");
         }
     }
     let bells = e.io.bells.len();
-    if e.submit(job) != Err(Error::Busy) || e.io.bells.len() != bells || e.completed_job() != Ok(6)
+    if e.submit(Pipe::Graphics, job) != Err(Error::Busy)
+        || e.io.bells.len() != bells
+        || e.completed_job(Pipe::Graphics) != Ok(6)
     {
         return TestResult::Fail("full ring");
     }

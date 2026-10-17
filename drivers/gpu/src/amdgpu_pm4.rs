@@ -499,6 +499,19 @@ impl<'a> Pm4Builder<'a> {
         Ok(())
     }
 
+    /// `gfx_v12_0_ring_emit_ib_compute`: an IB with `INDIRECT_BUFFER_VALID`
+    /// (bit 23) set in its control word, as compute rings require.
+    pub fn indirect_buffer_valid(
+        &mut self,
+        ib: u64,
+        dwords: u32,
+        vmid: u8,
+    ) -> Result<(), Pm4Error> {
+        self.indirect_buffer(ib, dwords, vmid)?;
+        self.out[self.pos - 1] |= 1 << 23;
+        Ok(())
+    }
+
     /// Words written so far.
     pub fn words(&self) -> &[u32] {
         &self.out[..self.pos]

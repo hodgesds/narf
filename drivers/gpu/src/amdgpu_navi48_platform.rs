@@ -235,41 +235,64 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     Ok(report)
 }
 
-/// The Navi48 graphics queue behind AMDGPU_CS: up to eight graphics IBs
-/// per submission, run in the open's address space on client VMID 1, whose
-/// context every job's VM flush points at that space's root first.
+/// The Navi48 kernel queues behind AMDGPU_CS: up to eight IBs per
+/// submission, all for the graphics ring or all for the compute ring, run
+/// in the open's address space on client VMID 1, whose context every job's
+/// VM flush points at that space's root first.
 ///
-/// `amdgpu_cs` records each job on its address space, so the buffers and
-/// page tables it may reach are freed only once the fence passes; every
-/// fence read here retires what completed jobs held.
+/// A job's ticket is its pipe in the high 32 bits and its ring sequence in
+/// the low. `amdgpu_cs` records each job on its address space, so the
+/// buffers and page tables it may reach are freed only once its fence
+/// passes; every fence read here retires what completed jobs held.
 ///
 /// Each job maps VMID 1 to its open's PASID in the IH LUT, so its faults
-/// carry the client's PASID.
+/// carry the client's PASID and reach that open's GPUVM_FAULT query.
 ///
 /// LINUX-GAP: VMID 1 for every client, always flushed — no per-client VMID
-/// reuse (amdgpu_vmid_grab) — and faults are not yet reported per client
-/// (AMDGPU_INFO_GPUVM_FAULT). AMDGPU_INFO keeps reporting acceleration
+/// reuse (amdgpu_vmid_grab). AMDGPU_INFO keeps reporting acceleration
 /// unavailable, so Mesa does not submit here.
 struct Submitter {
     card: u32,
     fence: crate::amdgpu_gfx12_queue::FenceReader,
 }
-/// Whether 32-bit job `seq` is at or before `completed` (sequences wrap).
-fn job_done(completed: u32, seq: u64) -> bool {
-    completed.wrapping_sub(seq as u32) as i32 >= 0
-}
 const CLIENT_VMID: u8 = 1;
-impl crate::amdgpu_cs::Submitter for Submitter {
-    fn signalled(&self, seq: u64) -> bool {
-        match self.fence.completed() {
-            Ok(completed) => {
-                crate::amdgpu_cs::retire(self.card, &|s| job_done(completed, s));
-                job_done(completed, seq)
-            }
-            // A revoked or vanished device makes no more progress; report
-            // done so waiters cannot wedge.
-            Err(_) => true,
+const PIPES: [crate::amdgpu_gfx12_queue::Pipe; 2] = [
+    crate::amdgpu_gfx12_queue::Pipe::Graphics,
+    crate::amdgpu_gfx12_queue::Pipe::Compute,
+];
+/// Whether `ticket` is complete, given each pipe's completed sequence
+/// (32-bit sequences wrap).
+fn job_done(completed: [u32; 2], ticket: u64) -> bool {
+    let pipe = (ticket >> 32) as usize;
+    completed
+        .get(pipe)
+        .is_some_and(|&c| c.wrapping_sub(ticket as u32) as i32 >= 0)
+}
+impl Submitter {
+    /// Both pipes' completed sequences, retiring what completed jobs held.
+    /// None when the device stopped answering.
+    fn progress(&self) -> Option<[u32; 2]> {
+        let mut completed = [0; 2];
+        for (c, pipe) in completed.iter_mut().zip(PIPES) {
+            *c = self.fence.completed(pipe).ok()?;
         }
+        crate::amdgpu_cs::retire(self.card, &|t| job_done(completed, t));
+        Some(completed)
+    }
+}
+impl crate::amdgpu_cs::Submitter for Submitter {
+    fn ring_for(&self, ip_type: u32, ip_instance: u32, ring: u32) -> Option<u32> {
+        match (ip_type, ip_instance, ring) {
+            (crate::amdgpu_uapi::AMDGPU_HW_IP_GFX, 0, 0) => Some(0),
+            (crate::amdgpu_uapi::AMDGPU_HW_IP_COMPUTE, 0, 0) => Some(1),
+            _ => None,
+        }
+    }
+    fn signalled(&self, ticket: u64) -> bool {
+        // A revoked or vanished device makes no more progress; report done
+        // so waiters cannot wedge.
+        self.progress()
+            .is_none_or(|completed| job_done(completed, ticket))
     }
     fn submit<'a>(
         &'a self,
@@ -282,15 +305,19 @@ impl crate::amdgpu_cs::Submitter for Submitter {
     > {
         alloc::boxed::Box::pin(async move {
             use narf_filesystem::FsError;
+            let first = submission.ibs.first().ok_or(FsError::InvalidData)?;
+            let ring = self
+                .ring_for(first.ip_type, first.ip_instance, first.ring)
+                .ok_or(FsError::Unsupported)?;
             if submission.ibs.len() > crate::amdgpu_gfx12_queue::MAX_JOB_IBS
-                || submission.ibs.iter().any(|ib| {
-                    ib.ip_type != crate::amdgpu_uapi::AMDGPU_HW_IP_GFX
-                        || ib.ip_instance != 0
-                        || ib.ring != 0
-                })
+                || submission
+                    .ibs
+                    .iter()
+                    .any(|ib| self.ring_for(ib.ip_type, ib.ip_instance, ib.ring) != Some(ring))
             {
                 return Err(FsError::Unsupported);
             }
+            let pipe = PIPES[ring as usize];
             let ibs: alloc::vec::Vec<(u64, u32)> = submission
                 .ibs
                 .iter()
@@ -306,13 +333,12 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             let mut owner = OWNER.lock().await;
             let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
             // SAFETY: the platform serializes every queue user under OWNER;
-            // the job's lifetime gap is documented above.
-            let result = unsafe { boot.submit_client_job(job) };
-            if let Ok(completed) = boot.completed_client_job() {
-                crate::amdgpu_cs::retire(self.card, &|seq| job_done(completed, seq));
-            }
+            // `amdgpu_cs` holds the job's memory until its fence.
+            let result = unsafe { boot.submit_client_job(pipe, job) };
+            drop(owner);
+            let _ = self.progress();
             match result {
-                Ok(seq) => Ok(u64::from(seq)),
+                Ok(seq) => Ok(u64::from(ring) << 32 | u64::from(seq)),
                 Err(crate::amdgpu_gfx12_queue::Error::Busy) => Err(FsError::Busy),
                 Err(crate::amdgpu_gfx12_queue::Error::Invalid) => Err(FsError::InvalidData),
                 Err(_) => Err(FsError::NoDevice),
@@ -321,7 +347,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
     }
     fn wait(
         &self,
-        seq: u64,
+        ticket: u64,
         deadline_ns: u64,
     ) -> core::pin::Pin<
         alloc::boxed::Box<
@@ -330,11 +356,12 @@ impl crate::amdgpu_cs::Submitter for Submitter {
     > {
         alloc::boxed::Box::pin(async move {
             use narf_filesystem::FsError;
-            let seq = u32::try_from(seq).map_err(|_| FsError::InvalidData)?;
+            if (ticket >> 32) as usize >= PIPES.len() {
+                return Err(FsError::InvalidData);
+            }
             loop {
-                let completed = self.fence.completed().map_err(|_| FsError::NoDevice)?;
-                crate::amdgpu_cs::retire(self.card, &|s| job_done(completed, s));
-                if job_done(completed, u64::from(seq)) {
+                let completed = self.progress().ok_or(FsError::NoDevice)?;
+                if job_done(completed, ticket) {
                     return Ok(true);
                 }
                 if narf_time::monotonic_ns() >= deadline_ns {

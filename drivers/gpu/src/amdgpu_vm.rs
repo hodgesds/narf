@@ -509,6 +509,9 @@ pub struct Mapping {
     pub vm_flags: u32,
 }
 
+/// Rings an address space tracks jobs on (`amdgpu_cs` ticket ring indices).
+const RINGS: usize = 4;
+
 /// A recorded mapping and the buffer it maps. The record keeps the buffer
 /// alive (`amdgpu_bo_va` holds its BO in Linux): a client that closes the
 /// handle while the mapping exists must not free pages the tables point at.
@@ -534,9 +537,10 @@ pub struct VmState {
     tables: IrqSafeSpinLock<u64>,
     /// The DRM card whose engine runs this space's jobs.
     card: Option<u32>,
-    /// The last job submitted in this space (0: none). Memory the GPU may
-    /// still reach is held until the card's engine completes it.
-    last_job: core::sync::atomic::AtomicU64,
+    /// The last job (ticket) submitted in this space on each ring, 0 for
+    /// none. Memory the GPU may still reach is held until the card's engine
+    /// completes all of them.
+    last_job: [core::sync::atomic::AtomicU64; RINGS],
     /// This space's PASID, allocated on first use.
     pasid: IrqSafeSpinLock<Option<crate::amdgpu_vmid::PasidHandle>>,
 }
@@ -573,12 +577,13 @@ impl VmState {
         Self::build(Geometry::for_family(family), Some(index))
     }
 
-    /// Record that job `seq` was submitted in this space: from now on,
-    /// buffers and page tables it drops wait for the card's engine to
-    /// complete `seq` (or a later job) before they are freed.
-    pub fn note_job(&self, seq: u64) {
-        self.last_job
-            .store(seq, core::sync::atomic::Ordering::Release);
+    /// Record that job `ticket` was submitted in this space (its ring is
+    /// `ticket >> 32`, see `amdgpu_cs::Submitter`): from now on, buffers
+    /// and page tables it drops wait for the card's engine to complete it
+    /// (or a later job of the same ring) before they are freed.
+    pub fn note_job(&self, ticket: u64) {
+        let ring = (ticket >> 32) as usize % RINGS;
+        self.last_job[ring].store(ticket, core::sync::atomic::Ordering::Release);
     }
 
     /// This space's PASID — what the IH VMID LUT maps a job's VMID to, so a
@@ -601,19 +606,23 @@ impl VmState {
             .unwrap_or_default()
     }
 
-    /// The last job submitted in this space (0: none).
-    pub fn last_job(&self) -> u64 {
-        self.last_job.load(core::sync::atomic::Ordering::Acquire)
+    /// The last job submitted in this space on each ring that ran one.
+    pub fn last_jobs(&self) -> Vec<u64> {
+        self.last_job
+            .iter()
+            .map(|t| t.load(core::sync::atomic::Ordering::Acquire))
+            .filter(|&t| t != 0)
+            .collect()
     }
 
     /// Free `item` now, or — when a job ran in this space — once the card's
     /// engine has completed the last one (`amdgpu_cs::defer_until`), as
     /// Linux frees page tables and BOs only after the VM's fences.
     fn release<T: Send + Sync + 'static>(&self, item: T) {
-        let seq = self.last_job.load(core::sync::atomic::Ordering::Acquire);
+        let jobs = self.last_jobs();
         match self.card {
-            Some(card) if seq != 0 => {
-                crate::amdgpu_cs::defer_until(card, seq, alloc::boxed::Box::new(item))
+            Some(card) if !jobs.is_empty() => {
+                crate::amdgpu_cs::defer_until(card, jobs, alloc::boxed::Box::new(item))
             }
             _ => drop(item),
         }
@@ -631,7 +640,7 @@ impl VmState {
             root: IrqSafeSpinLock::new(None),
             tables: IrqSafeSpinLock::new(0),
             card,
-            last_job: core::sync::atomic::AtomicU64::new(0),
+            last_job: [const { core::sync::atomic::AtomicU64::new(0) }; RINGS],
             pasid: IrqSafeSpinLock::new(None),
         }
     }

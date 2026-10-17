@@ -414,6 +414,10 @@ pub fn parse(
 
 /// The engine behind a card's command submission. A card registers one
 /// once a queue can run client work; until then CS stays refused.
+///
+/// Jobs are named by tickets: opaque to clients (the CS handle), with the
+/// ring index in the high 32 bits, so tickets of different rings are never
+/// compared.
 pub trait Submitter: Send + Sync {
     /// Queue `submission` in the address space `vm`; returns its sequence,
     /// which `AMDGPU_CS` hands back as the fence handle.
@@ -422,9 +426,12 @@ pub trait Submitter: Send + Sync {
         vm: &'a VmState,
         submission: &'a Submission,
     ) -> Pin<Box<dyn Future<Output = Result<u64, FsError>> + Send + 'a>>;
-    /// Whether sequence `seq` has completed, without waiting or blocking
-    /// on an async owner (job fences in syncobjs ask this).
-    fn signalled(&self, seq: u64) -> bool;
+    /// Whether job `ticket` has completed, without waiting or blocking on
+    /// an async owner (job fences in syncobjs ask this).
+    fn signalled(&self, ticket: u64) -> bool;
+    /// The ring index (a ticket's high 32 bits) that runs `ip_type`
+    /// instance `ip_instance`, ring `ring`, if this engine has one.
+    fn ring_for(&self, ip_type: u32, ip_instance: u32, ring: u32) -> Option<u32>;
     /// Whether sequence `seq` has completed, waiting until monotonic
     /// `deadline_ns` (0: don't wait).
     fn wait(
@@ -499,13 +506,13 @@ impl crate::drm::syncobj::DmaFence for JobFence {
 }
 
 /// Memory a running job may still reach, freed once its card's engine
-/// completes `seq`.
+/// completes every ticket it waits for.
 type Held = Box<dyn core::any::Any + Send + Sync>;
-static DEFERRED: IrqSafeSpinLock<Vec<(u32, u64, Held)>> = IrqSafeSpinLock::new(Vec::new());
+static DEFERRED: IrqSafeSpinLock<Vec<(u32, Vec<u64>, Held)>> = IrqSafeSpinLock::new(Vec::new());
 
-/// Keep `held` until DRM card `card`'s engine completes job `seq`.
-pub fn defer_until(card: u32, seq: u64, held: Held) {
-    DEFERRED.lock().push((card, seq, held));
+/// Keep `held` until DRM card `card`'s engine completes all of `tickets`.
+pub fn defer_until(card: u32, tickets: Vec<u64>, held: Held) {
+    DEFERRED.lock().push((card, tickets, held));
 }
 
 /// Free what card `card` deferred for jobs `done` reports complete. A card's
@@ -516,7 +523,7 @@ pub fn retire(card: u32, done: &dyn Fn(u64) -> bool) {
         let mut freed = Vec::new();
         let mut i = 0;
         while i < deferred.len() {
-            if deferred[i].0 == card && done(deferred[i].1) {
+            if deferred[i].0 == card && deferred[i].1.iter().all(|&t| done(t)) {
                 freed.push(deferred.swap_remove(i).2);
             } else {
                 i += 1;
@@ -568,8 +575,10 @@ pub async fn dispatch_async(
         // waits for the last job this open submitted, which covers every
         // use the open made of it but not a job another process (holding
         // it through PRIME) submitted.
-        let last = vm.last_job();
-        let idle = last == 0 || engine.wait(last, timeout).await?;
+        let mut idle = true;
+        for ticket in vm.last_jobs() {
+            idle &= engine.wait(ticket, timeout).await?;
+        }
         let mut out = [0u8; 8];
         out[0..4].copy_from_slice(&u32::from(!idle).to_le_bytes());
         out[4..8].copy_from_slice(&(object.preferred_domains as u32).to_le_bytes());
@@ -633,8 +642,12 @@ pub async fn dispatch_async(
         if ctx.get(d.ctx_id).is_none() {
             return Err(FsError::InvalidData);
         }
-        if (d.ip_type, d.ip_instance, d.ring) != (uapi::AMDGPU_HW_IP_GFX, 0, 0) {
-            return Err(FsError::Unsupported);
+        let ring = engine
+            .ring_for(d.ip_type, d.ip_instance, d.ring)
+            .ok_or(FsError::Unsupported)?;
+        // A handle names a job of the dependency's own ring.
+        if d.handle != 0 && d.handle >> 32 != u64::from(ring) {
+            return Err(FsError::InvalidData);
         }
         if d.handle != 0 && !d.scheduled {
             after.push(d.handle);

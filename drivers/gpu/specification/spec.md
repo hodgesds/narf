@@ -3570,9 +3570,18 @@ paths; only the tables differ.
   and GEM_WAIT_IDLE reports idle. `pm4::Pm4Builder::vm_flush` builds the in-ring VM flush
   (shared by GMC 11 and 12).
 
-The Navi48 platform registers the graphics queue as its card's submitter
-after boot: up to eight graphics IBs per submission (`Job::new`, in order in
-one slot), run on client VMID 1 with the
+Jobs are named by tickets: the CS handle, opaque to clients, with the ring
+index in its high 32 bits (`Submitter::ring_for` maps an IP/ring to it).
+An address space keeps its last ticket per ring (`VmState::last_jobs`); a
+deferred free waits for all of them, and GEM_WAIT_IDLE for each.
+Dependencies must name a ring the engine serves and a handle of that ring.
+
+The Navi48 platform registers both kernel queues as its card's submitter
+after boot: up to eight IBs per submission (`Job::new`, in order in one
+slot), all for the graphics ring or all for the compute ring
+(`Queues::submit(Pipe, Job)`; the compute frame writes registers without
+the PFP, skips PFP_SYNC_ME, flushes on invalidation engine 1 and marks IBs
+`INDIRECT_BUFFER_VALID`), run on client VMID 1 with the
 open's root page directory (`VmState::root_pde`, GMC 12 only), through
 `amdgpu_gfx12_queue::Queues::submit` — one 256-dword ring slot of VM flush
 (GFX hub, engine 0, PFP_SYNC_ME), IB and interrupting RELEASE_MEM fence;
