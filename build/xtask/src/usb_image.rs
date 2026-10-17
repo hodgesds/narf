@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! /EFI/BOOT/BOOTX64.EFI        Limine
-//! /boot/limine/limine.conf     cmdline: narf.bootlog=<token> log_buf_len=...
+//! /boot/limine/limine.conf     cmdline: narf.disks=boot-only narf.bootlog=<token> ...
 //! /boot/narf-frame             kernel
 //! /boot/initramfs.cpio         init/shell + --initramfs-firmware blobs
 //! /NARFLOG.ID                  <token>
@@ -14,12 +14,16 @@
 //!
 //! The kernel writes `/narf-boot-<n>.log` only to a USB FAT volume whose
 //! `/NARFLOG.ID` matches the token on its command line, i.e. this stick.
+//! `narf.disks=boot-only` (default; `--allow-all-disks` drops it) makes every
+//! other disk read-only at the block layer and excludes it from automatic
+//! mounts, so the machine's internal disks are never written.
 //! Write the file to a stick with `cargo xtask disk-write --iso <image>`.
 //!
 //! `--qemu` boots a copy of the image under OVMF as a USB mass-storage
 //! device (the bare-metal path: xHCI → MSC → FAT), once ending with a shell
 //! `reboot` (final flush) and once with a deliberate panic (panic flush),
-//! then prints the log files read back from the copy.
+//! then prints the log files read back from the copy. Both boots attach
+//! decoy internal disks whose SHA-256 must be unchanged afterwards.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -66,11 +70,22 @@ pub(crate) struct UsbImageArgs {
     #[arg(long, default_value = "8M")]
     pub log_buf_len: String,
 
+    /// Leave `narf.disks=boot-only` off the command line, so disks other
+    /// than the stick are writable and auto-mountable. Never use this on a
+    /// machine whose internal disks hold data you want to keep.
+    #[arg(long)]
+    pub allow_all_disks: bool,
+
     /// Boot a copy of the image under QEMU/OVMF as USB storage and print the
-    /// persistent logs it wrote. Never touches a real device.
+    /// persistent logs it wrote. Never touches a real device. The boots also
+    /// attach decoy internal disks (NVMe: GPT ESP + ext4 + btrfs; SATA:
+    /// whole-disk ext4) and fail if a single byte of them changed.
     #[arg(long)]
     pub qemu: bool,
 }
+
+/// Kernel argument restricting writes and automatic mounts to the stick.
+pub(crate) const BOOT_ONLY_ARG: &str = "narf.disks=boot-only";
 
 fn random_token() -> Result<String> {
     let mut bytes = [0u8; 8];
@@ -231,6 +246,12 @@ pub(crate) fn usb_image_cmd(args: &UsbImageArgs) -> Result<()> {
     mcopy(&out, &initramfs, "/boot/initramfs.cpio")?;
 
     let mut cmdline = staged_cmdline(&stage);
+    // Before everything else the stick carries: the internal disks of the
+    // machine this boots on are read-only and never auto-mounted. The stick
+    // itself becomes writable only once its /NARFLOG.ID matches the token.
+    if !args.allow_all_disks {
+        cmdline.push_str(&format!(" {BOOT_ONLY_ARG}"));
+    }
     if let Some(token) = &token {
         cmdline.push_str(&format!(" narf.bootlog={token}"));
     }
@@ -272,6 +293,11 @@ default_entry: 1
         Some(token) => println!("  persistent boot log: on (token {token})"),
         None => println!("  persistent boot log: off"),
     }
+    if args.allow_all_disks {
+        println!("  disks: ALL writable (--allow-all-disks)");
+    } else {
+        println!("  disks: {BOOT_ONLY_ARG} (internal disks read-only, never auto-mounted)");
+    }
     println!(
         "  write it (USB only, never the NVMe): \
          cargo xtask disk-write --iso {} --device /dev/sdX --fast-wipe",
@@ -279,7 +305,7 @@ default_entry: 1
     );
 
     if args.qemu {
-        qemu_check(&out, &root, token.as_deref())?;
+        qemu_check(&out, &root, token.as_deref(), !args.allow_all_disks)?;
     }
     Ok(())
 }
@@ -293,18 +319,32 @@ enum Ending {
     Panic,
 }
 
-fn qemu_check(image: &Path, root: &Path, token: Option<&str>) -> Result<()> {
+fn qemu_check(image: &Path, root: &Path, token: Option<&str>, boot_only: bool) -> Result<()> {
     if token.is_none() {
         bail!("--qemu checks the persistent log; drop --no-bootlog");
     }
     let copy = root.join("target").join("narf-x86_64-usb-qemu.img");
     std::fs::copy(image, &copy)?;
+    let decoys = build_decoy_disks(&root.join("target").join("usb-image-decoys"))?;
+    let before: Vec<String> = decoys
+        .iter()
+        .map(|d| sha256_file(&d.path))
+        .collect::<Result<_>>()?;
+    for (decoy, hash) in decoys.iter().zip(&before) {
+        // Pristine copy, so a change can be localised afterwards.
+        std::fs::copy(&decoy.path, pristine_path(&decoy.path))?;
+        println!(
+            "xtask usb-image --qemu: decoy {} {} sha256 {hash}",
+            decoy.kind.label(),
+            decoy.path.display()
+        );
+    }
     let mut logs = Vec::new();
     for (n, ending) in [(1, Ending::Reboot), (2, Ending::Panic)] {
         if matches!(ending, Ending::Panic) {
             add_selftest_arg(&copy, root)?;
         }
-        boot_once(&copy, ending)?;
+        boot_once(&copy, &decoys, ending)?;
         let log = root.join("target").join(format!("narf-boot-{n}.qemu.log"));
         let _ = std::fs::remove_file(&log);
         run_checked(
@@ -338,11 +378,266 @@ fn qemu_check(image: &Path, root: &Path, token: Option<&str>) -> Result<()> {
         .arg("::/")
         .output()?;
     println!("{}", String::from_utf8_lossy(&listing.stdout));
-    for log in logs {
+    for log in &logs {
         println!("──── {} ────", log.display());
-        print!("{}", std::fs::read_to_string(&log).unwrap_or_default());
+        print!("{}", std::fs::read_to_string(log).unwrap_or_default());
+    }
+    let mut changed = Vec::new();
+    for (decoy, hash) in decoys.iter().zip(&before) {
+        let after = sha256_file(&decoy.path)?;
+        let verdict = if &after == hash {
+            "unchanged"
+        } else {
+            changed.push(decoy.kind.label());
+            "CHANGED"
+        };
+        println!(
+            "xtask usb-image --qemu: decoy {} sha256 before {hash} after {after}: {verdict}",
+            decoy.kind.label()
+        );
+        if &after != hash {
+            for (offset, len) in changed_ranges(&pristine_path(&decoy.path), &decoy.path)? {
+                println!(
+                    "    changed bytes {offset:#x}..{:#x} (LBA {})",
+                    offset + len,
+                    offset / SECTOR
+                );
+            }
+        }
+    }
+    if boot_only {
+        for log in &logs {
+            let text = std::fs::read_to_string(log).unwrap_or_default();
+            if !text.contains("narf.disks=boot-only") {
+                bail!("{} does not show narf.disks=boot-only", log.display());
+            }
+        }
+        if !changed.is_empty() {
+            bail!(
+                "narf.disks=boot-only boot modified decoy internal disk(s): {}",
+                changed.join(", ")
+            );
+        }
+        println!(
+            "xtask usb-image --qemu: decoy internal disks unchanged under narf.disks=boot-only"
+        );
     }
     Ok(())
+}
+
+// ── Decoy internal disks ─────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug)]
+enum DecoyKind {
+    /// GPT: ESP (FAT32) + ext4 (needs_recovery set) + btrfs, like a
+    /// laptop's CachyOS NVMe.
+    Nvme,
+    /// Whole-disk ext4 without a partition table, on AHCI.
+    Sata,
+}
+
+impl DecoyKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Nvme => "nvme(gpt esp+ext4+btrfs)",
+            Self::Sata => "sata(ext4)",
+        }
+    }
+}
+
+struct Decoy {
+    kind: DecoyKind,
+    path: PathBuf,
+}
+
+const MIB: u64 = 1024 * 1024;
+
+fn pristine_path(path: &Path) -> PathBuf {
+    path.with_extension("img.before")
+}
+
+/// Up to 16 differing 4 KiB-aligned byte ranges between two equal-size files.
+fn changed_ranges(a: &Path, b: &Path) -> Result<Vec<(u64, u64)>> {
+    const BLOCK: usize = 4096;
+    let (a, b) = (std::fs::read(a)?, std::fs::read(b)?);
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for (index, (x, y)) in a.chunks(BLOCK).zip(b.chunks(BLOCK)).enumerate() {
+        if x == y {
+            continue;
+        }
+        let offset = (index * BLOCK) as u64;
+        if let Some((start, len)) = ranges.last_mut() {
+            if *start + *len == offset {
+                *len += BLOCK as u64;
+                continue;
+            }
+        }
+        if ranges.len() == 16 {
+            break;
+        }
+        ranges.push((offset, BLOCK as u64));
+    }
+    Ok(ranges)
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+/// Copy `src` into `disk` at byte `offset` without truncating it.
+fn splice(disk: &Path, offset: u64, src: &Path) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let mut out = std::fs::OpenOptions::new().write(true).open(disk)?;
+    out.seek(SeekFrom::Start(offset))?;
+    let mut input = std::fs::File::open(src)?;
+    std::io::copy(&mut input, &mut out)?;
+    Ok(())
+}
+
+fn sized_file(path: &Path, bytes: u64) -> Result<()> {
+    let _ = std::fs::remove_file(path);
+    std::fs::File::create(path)?.set_len(bytes)?;
+    Ok(())
+}
+
+/// ext4 with a file in it and `needs_recovery` set, as after an unclean
+/// shutdown: any implementation that "recovers" it on mount rewrites the
+/// superblock.
+fn make_ext4(path: &Path, bytes: u64, content: &Path) -> Result<()> {
+    sized_file(path, bytes)?;
+    run_checked(
+        Command::new("mkfs.ext4")
+            .args(["-q", "-F", "-L", "DECOYROOT", "-d"])
+            .arg(content)
+            .arg(path),
+        "mkfs.ext4 decoy",
+    )?;
+    run_checked(
+        Command::new("debugfs")
+            .args(["-w", "-R", "feature needs_recovery"])
+            .arg(path),
+        "debugfs: set needs_recovery on the decoy ext4",
+    )
+}
+
+fn build_decoy_disks(dir: &Path) -> Result<Vec<Decoy>> {
+    for tool in ["mkfs.ext4", "mkfs.btrfs", "debugfs"] {
+        if which(tool).is_none() {
+            bail!("`{tool}` not on $PATH (needed for the --qemu decoy disks)");
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir)?;
+    let content = dir.join("content");
+    std::fs::create_dir_all(content.join("home/user"))?;
+    std::fs::write(
+        content.join("home/user/precious.txt"),
+        "internal-disk data NARF must never write\n",
+    )?;
+
+    // NVMe: 1 MiB GPT | 64 MiB ESP | 96 MiB ext4 | 160 MiB btrfs | slack.
+    // A 16-entry table (4 LBAs) keeps the entry array inside one 4 KiB NVMe
+    // read, so NARF's scanner registers nvme0p1..3 and the boot-only gate is
+    // exercised on partitions, not just the whole disk. (A stock 128-entry
+    // table is not yet partition-scanned on NVMe; see BOOTING_ON_CACHYOS.md.)
+    let (esp_at, esp_len) = (MIB, 64 * MIB);
+    let (ext_at, ext_len) = (esp_at + esp_len, 96 * MIB);
+    let (btr_at, btr_len) = (ext_at + ext_len, 160 * MIB);
+    let nvme = dir.join("decoy-nvme.img");
+    sized_file(&nvme, btr_at + btr_len + 2 * MIB)?;
+    let mut sfdisk = Command::new("sfdisk");
+    sfdisk
+        .args(["--quiet", "--no-reread", "--no-tell-kernel"])
+        .arg(&nvme)
+        .stdin(Stdio::piped());
+    let mut child = sfdisk.spawn().context("spawning sfdisk")?;
+    writeln!(
+        child.stdin.as_mut().unwrap(),
+        "label: gpt\ntable-length: 16\n\
+         start={}, size={}, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name=\"EFI system partition\"\n\
+         start={}, size={}, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name=\"decoy-ext4\"\n\
+         start={}, size={}, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name=\"decoy-btrfs\"",
+        esp_at / SECTOR,
+        esp_len / SECTOR,
+        ext_at / SECTOR,
+        ext_len / SECTOR,
+        btr_at / SECTOR,
+        btr_len / SECTOR,
+    )?;
+    drop(child.stdin.take());
+    let status = child.wait()?;
+    if !status.success() {
+        bail!("sfdisk (decoy GPT) failed with {status}");
+    }
+    let esp_spec = format!("{}@@{esp_at}", nvme.display());
+    run_checked(
+        mtool("mformat")
+            .arg("-i")
+            .arg(&esp_spec)
+            .args(["-F", "-T"])
+            .arg((esp_len / SECTOR).to_string())
+            .arg("-H")
+            .arg((esp_at / SECTOR).to_string())
+            .args(["-v", "DECOYESP", "::"]),
+        "mformat decoy ESP",
+    )?;
+    run_checked(
+        mtool("mmd").arg("-i").arg(&esp_spec).arg("::/EFI"),
+        "mmd decoy ESP /EFI",
+    )?;
+    run_checked(
+        mtool("mcopy")
+            .arg("-i")
+            .arg(&esp_spec)
+            .arg(content.join("home/user/precious.txt"))
+            .arg("::/EFI/precious.txt"),
+        "mcopy decoy ESP file",
+    )?;
+    let ext = dir.join("decoy-ext4.part");
+    make_ext4(&ext, ext_len, &content)?;
+    splice(&nvme, ext_at, &ext)?;
+    let btrfs = dir.join("decoy-btrfs.part");
+    sized_file(&btrfs, btr_len)?;
+    run_checked(
+        Command::new("mkfs.btrfs")
+            .args(["-q", "-f", "-L", "DECOYBTRFS", "--rootdir"])
+            .arg(&content)
+            .arg(&btrfs),
+        "mkfs.btrfs decoy",
+    )?;
+    splice(&nvme, btr_at, &btrfs)?;
+    let _ = std::fs::remove_file(&ext);
+    let _ = std::fs::remove_file(&btrfs);
+
+    let sata = dir.join("decoy-sata.img");
+    make_ext4(&sata, 64 * MIB, &content)?;
+
+    Ok(vec![
+        Decoy {
+            kind: DecoyKind::Nvme,
+            path: nvme,
+        },
+        Decoy {
+            kind: DecoyKind::Sata,
+            path: sata,
+        },
+    ])
 }
 
 /// Second QEMU boot: append the panic self-test to the image's cmdline.
@@ -361,16 +656,46 @@ fn add_selftest_arg(image: &Path, root: &Path) -> Result<()> {
     mcopy(image, &patched, "/boot/limine/limine.conf")
 }
 
-fn boot_once(image: &Path, ending: Ending) -> Result<()> {
+/// Split OVMF code + a fresh writable copy of its variable store.
+///
+/// With only a read-only combined image, OVMF emulates non-volatile
+/// variables by writing `\NvVars` to the first FAT volume it finds — the
+/// decoy ESP — which would make the decoy check report firmware writes as
+/// NARF's. (Real firmware has flash for this; it does not write the ESP.)
+fn ovmf_split(root: &Path) -> Result<(PathBuf, PathBuf)> {
     let ovmf = ovmf_code_path();
-    if !ovmf.is_file() {
-        bail!("OVMF not found at {}", ovmf.display());
+    let dir = ovmf.parent().map(Path::to_path_buf).unwrap_or_default();
+    for (code, vars) in [
+        ("OVMF_CODE.4m.fd", "OVMF_VARS.4m.fd"),
+        ("OVMF_CODE_4M.fd", "OVMF_VARS_4M.fd"),
+        ("OVMF_CODE.fd", "OVMF_VARS.fd"),
+    ] {
+        let (code, vars) = (dir.join(code), dir.join(vars));
+        if code.is_file() && vars.is_file() {
+            let copy = root.join("target").join("narf-usb-qemu-vars.fd");
+            std::fs::copy(&vars, &copy)?;
+            return Ok((code, copy));
+        }
     }
+    bail!(
+        "split OVMF_CODE/OVMF_VARS images not found next to {}",
+        ovmf.display()
+    )
+}
+
+fn boot_once(image: &Path, decoys: &[Decoy], ending: Ending) -> Result<()> {
+    let root = workspace_root()?;
+    let (code, vars) = ovmf_split(&root)?;
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.arg("-drive")
         .arg(format!(
-            "if=pflash,format=raw,readonly=on,file={}",
-            ovmf.display()
+            "if=pflash,format=raw,unit=0,readonly=on,file={}",
+            code.display()
+        ))
+        .arg("-drive")
+        .arg(format!(
+            "if=pflash,format=raw,unit=1,file={}",
+            vars.display()
         ))
         .args(["-machine", "q35", "-cpu", "max", "-smp", "4", "-m", "4096M"])
         .args(["-serial", "stdio", "-display", "none", "-no-reboot"])
@@ -385,6 +710,20 @@ fn boot_once(image: &Path, ending: Ending) -> Result<()> {
             "usb-storage,bus=xhci0.0,drive=narfstick,removable=on,bootindex=0",
         ])
         .args(["-device", "usb-kbd,bus=xhci0.0"]);
+    for (n, decoy) in decoys.iter().enumerate() {
+        cmd.arg("-drive").arg(format!(
+            "if=none,id=decoy{n},format=raw,file={}",
+            decoy.path.display()
+        ));
+        match decoy.kind {
+            DecoyKind::Nvme => {
+                cmd.args(["-device", &format!("nvme,serial=decoy{n},drive=decoy{n}")])
+            }
+            DecoyKind::Sata => cmd
+                .args(["-device", "ahci,id=decoyahci"])
+                .args(["-device", &format!("ide-hd,bus=decoyahci.0,drive=decoy{n}")]),
+        };
+    }
     if let Ok(accel) = std::env::var("XTASK_QEMU_ACCEL") {
         cmd.args(["-accel", &accel]);
     }

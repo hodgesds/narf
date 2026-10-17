@@ -178,7 +178,10 @@ Recipe for the Navi22 (RX 6750 XT, `03:00.0`) bring-up on the Gigabyte B650I
 AORUS ULTRA (BIOS F41). The console lives on the Raphael iGPU (`12:00.0`); the
 6750 XT is a secondary GPU whose cold boot cannot take the screen away. The
 stick saves the NARF kernel log to itself, so a failed boot can be read back
-under CachyOS. Nothing in this recipe writes to the NVMe disks.
+under CachyOS. The stick boots with `narf.disks=boot-only`, which keeps the
+internal disks read-only; see
+[Internal-disk safety](#internal-disk-safety-narfdisksboot-only) for exactly
+what that guarantees.
 
 **Build** (no device access; the importer copies only the Navi22 blobs):
 
@@ -191,11 +194,13 @@ cargo xtask usb-image --initramfs-firmware "amdgpu/navy_flounder*"
 This writes `target/narf-x86_64-usb.img`: an MBR disk with one FAT32 ESP
 (label `NARFBOOT`) holding Limine, the kernel, an initramfs with the
 `navy_flounder` firmware (the Navi22 initcall runs before any root mount) and
-`/NARFLOG.ID`. The kernel command line gets `narf.bootlog=<random token>
-log_buf_len=8M` and no `quiet`. Add arguments with `--cmdline <arg>`
+`/NARFLOG.ID`. The kernel command line gets `narf.disks=boot-only
+narf.bootlog=<random token> log_buf_len=8M` and no `quiet`. Add arguments with `--cmdline <arg>`
 (repeatable); build without the log with `--no-bootlog`. Adding `--qemu` also
 boots a copy of the image under OVMF as QEMU USB storage and prints the logs
-it wrote.
+it wrote; those boots also attach decoy internal disks (an NVMe with a GPT
+ESP, an ext4 marked `needs_recovery` and a btrfs, plus a whole-disk ext4 on
+SATA) and fail unless their SHA-256 is unchanged afterwards.
 
 **BIOS settings:**
 
@@ -265,6 +270,88 @@ after the last boot initcall, including the 6750 XT cold boot. Lines logged
 before then are saved retroactively, but a hang *before* that point leaves
 only the screen. A kernel panic is appended in a final flush bounded at 3 s.
 A fatal CPU exception is not saved.
+
+### Internal-disk safety (`narf.disks=boot-only`)
+
+`cargo xtask usb-image` puts `narf.disks=boot-only` on the command line
+(`--allow-all-disks` leaves it off; never use that on this machine). With it:
+
+- **Every block device is read-only until it is identified as the stick.**
+  The block registry wraps each disk and partition (NVMe, SATA, USB, SD) in a
+  guard that passes reads and refuses writes with an error. The first refusal
+  per device is logged as `disks: refused write to <dev> ...`. The console
+  states the policy at boot:
+  `disks: narf.disks=boot-only: every disk is read-only until identified as
+  the boot medium`.
+- **Only the stick becomes writable.** A USB mass-storage FAT volume whose
+  `/NARFLOG.ID` matches the `narf.bootlog=` token is identified
+  (`disks: usb-msc0p1: identified as the boot medium`). From then on, that
+  stick's partitions are writable, and nothing else is. A device that later
+  appears under the same name starts read-only again. With
+  `narf.bootlog=off`, or a `--no-bootlog` image, nothing is ever identified,
+  so every disk stays read-only, the stick included.
+- **No automatic mount of anything else.** These boot steps skip every
+  unidentified disk and log the skip:
+  - `root-mount-auto`, including an explicit `root=`, which is refused with
+    `BootOnly` (`/` comes from the initramfs);
+  - `efi-system-partition-mount`, which therefore never mounts the CachyOS ESP
+    at `/boot`;
+  - `mnt-mount-ext2`, which never mounts `nvme1n1p2` at `/mnt`.
+
+  The btrfs member discovery skips unidentified disks too. The btrfs disk
+  smokes additionally need `narf.btrfs_smoke`, which only xtask's own test
+  run passes.
+- **Read-only mounts do not write.** An ext2/3/4 or btrfs volume on a
+  read-only device is mounted read-only without a single write:
+  - **ext:** the stale `needs_recovery` superblock repair is skipped. A dirty
+    journal is replayed into memory only.
+  - **btrfs:** a pending fsync log tree refuses the mount instead of being
+    replayed. No commit timer starts.
+  - **FAT:** a mount never writes (there is no dirty-bit or FSInfo update at
+    mount). Writes happen only through file operations, which the guard
+    refuses.
+- **The NVMe passthrough is closed.** `/dev/nvme0` admin and I/O passthrough
+  ioctls (Format, Sanitize, firmware commit, raw writes) and writes are refused
+  unless the NVMe disk is the stick. Only the namespace-id query is answered.
+
+Limits. Exactly what this does and does not cover:
+
+- **Scope.** The guarantee covers what NARF does after the kernel starts.
+  - The UEFI firmware and Limine run first, and they are outside it. Limine
+    only reads.
+  - Under QEMU, OVMF without a writable variable store writes `\NvVars` to
+    the first ESP it finds. `--qemu` gives it one, so the check measures
+    NARF alone.
+- **Which writes are guarded.** The guard sees every write that goes through
+  the block registry: all filesystems, the `/dev/<disk>` block nodes, the
+  boot log and the partition/LUKS layers. A driver writing through a private
+  controller handle would bypass it. An audit of the in-tree storage drivers
+  found no such write on a non-test boot.
+  - NVMe, AHCI, virtio-blk and USB MSC probes only read. Controller setup
+    (queue creation, feature negotiation) does not change media.
+  - Format/Sanitize/firmware/security commands have no in-kernel caller.
+  - Test-only writes exist only in `kernel-test` builds, which usb-image does
+    not use.
+- **Command-line errors.** A misspelled `narf.disks=` value fails closed to
+  `boot-only`. Removing the argument (Limine `e` editor) removes the
+  guarantee.
+- **Reads stay allowed.** The internal disks can still be enumerated,
+  partition-scanned and read, including from the root shell.
+- **Explicit `ro` on the stick.** A userspace `mount -o ro` of the
+  identified stick sets only the VFS read-only flag. ext's mount-time
+  superblock repair would still run there. On every other disk the device
+  itself is read-only, so this does not arise.
+- **Current hardware coverage on this host.**
+  - NVMe partitions are registered only when the GPT entry array fits one
+    4 KiB read. A standard 128-entry GPT, as on `nvme0n1`/`nvme1n1`, is not
+    partition-scanned today, so those partitions do not appear at all.
+  - The AHCI driver binds only Intel ICH9/ICH10 controllers (QEMU q35
+    emulates ICH9), so `sda` on this AMD board is not driven.
+
+  Both would be read-only under `boot-only` if they were.
+- **Testing.** This is validated in QEMU (block-layer model tests, ext and
+  btrfs read-only mount tests, and the `usb-image --qemu` decoy hashes). It has
+  not been validated on hardware.
 
 ## Storage encryption and LUKS
 
