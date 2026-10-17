@@ -478,7 +478,14 @@ fn handle_get_cap(arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctlError> {
         return Err(DrmIoctlError::BadSize);
     }
     let capability = u64::from_le_bytes(arg[0..8].try_into().unwrap());
-    let value = match capability {
+    let value = cap_value(capability);
+    Ok(DrmIoctlResult::GetCap(DrmGetCap { capability, value }))
+}
+
+/// The `DRM_IOCTL_GET_CAP` answer for `capability`, as the card table and
+/// a card without KMS state (`drm_ioctl_bridge::without_kms`) report it.
+pub fn cap_value(capability: u64) -> u64 {
+    match capability {
         drm_cap::DUMB_BUFFER => 1u64, // dumb-buffer alloc supported
         // DRM_PRIME_CAP_EXPORT (1) | DRM_PRIME_CAP_IMPORT (2): both
         // supported via drm/prime.rs PrimeTable.
@@ -492,8 +499,7 @@ fn handle_get_cap(arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctlError> {
         drm_cap::CURSOR_WIDTH => 64,
         drm_cap::CURSOR_HEIGHT => 64,
         _ => 0,
-    };
-    Ok(DrmIoctlResult::GetCap(DrmGetCap { capability, value }))
+    }
 }
 
 fn handle_getresources(card: &Card) -> Result<DrmIoctlResult, DrmIoctlError> {

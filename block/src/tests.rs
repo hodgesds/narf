@@ -1543,3 +1543,163 @@ kernel_test_in!(
     "block/io_scheduler",
     smoke_pluggable_io_scheduler_revoked_cap
 );
+
+// ── block/disk_policy (narf.disks=boot-only) ───────────────────────
+
+fn smoke_block_disk_policy_parse_fails_closed() -> TestResult {
+    use crate::disk_policy::{parse, DiskPolicy};
+    let ok = parse(None) == Ok(DiskPolicy::All)
+        && parse(Some("all")) == Ok(DiskPolicy::All)
+        && parse(Some("boot-only")) == Ok(DiskPolicy::BootOnly)
+        && parse(Some("BOOT-ONLY")) == Ok(DiskPolicy::BootOnly)
+        && parse(Some("boot-onyl")).is_err()
+        && parse(Some("")).is_err();
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("narf.disks= parsing must accept all/boot-only and reject the rest")
+    }
+}
+kernel_test_in!(
+    "block/disk_policy",
+    smoke_block_disk_policy_parse_fails_closed
+);
+
+/// Model of the boot-only guarantee: a registered disk and its partition are
+/// read-only (reads pass, writes return `ReadOnly`, the bytes stay intact)
+/// until the disk is identified as the boot medium; identifying a partition
+/// trusts its whole disk and nothing else; a device re-registered under the
+/// same name starts untrusted again; `All` is a pass-through.
+fn smoke_block_disk_policy_boot_only_enforced_at_registry() -> TestResult {
+    use crate::disk_policy::{self, DiskPolicy};
+    use crate::partition::PartitionBlockDevice;
+    use crate::registry::{find_block_device, register_partition_device};
+    use alloc::sync::Arc;
+
+    let new_disk = |fill: u8| {
+        let data = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(alloc::vec![
+            fill;
+            64 * 512
+        ]));
+        let dev = Arc::new(VecBlock {
+            data: data.clone(),
+            lba_size: 512,
+        }) as Arc<dyn crate::BlockDeviceSync>;
+        (data, dev)
+    };
+    let (stick_bytes, stick) = new_disk(0x11);
+    let (internal_bytes, internal) = new_disk(0x22);
+    crate::register_block_device("dp-test-stick0", stick.clone());
+    register_partition_device(
+        "dp-test-stick0p1",
+        "dp-test-stick0",
+        Arc::new(PartitionBlockDevice::new(stick.clone(), 8, 32)),
+        None,
+    );
+    crate::register_block_device("dp-test-internal0", internal);
+
+    let result = (|| {
+        disk_policy::__set_policy_for_test(Some(DiskPolicy::BootOnly));
+        let refused_before = disk_policy::refused_writes();
+        let payload = [0xAAu8; 512];
+        let mut buf = [0u8; 512];
+        for name in ["dp-test-stick0", "dp-test-stick0p1", "dp-test-internal0"] {
+            let dev = find_block_device(name).ok_or("test device not registered")?;
+            if dev.read(0, 1, &mut buf).is_err() {
+                return Err("boot-only must still allow reads");
+            }
+            if dev.write(0, 1, &payload) != Err(crate::BlockIoError::ReadOnly) {
+                return Err("boot-only must refuse writes to an unidentified disk");
+            }
+            if !dev.is_read_only() || disk_policy::automount_allowed(name) {
+                return Err("an unidentified disk must report read-only and not auto-mount");
+            }
+        }
+        if disk_policy::refused_writes() < refused_before + 3 {
+            return Err("refused writes are not counted");
+        }
+        if stick_bytes.lock().iter().any(|&b| b != 0x11)
+            || internal_bytes.lock().iter().any(|&b| b != 0x22)
+        {
+            return Err("a refused write reached the media");
+        }
+
+        // Identify the stick through its partition (as the bootlog does).
+        let entry = crate::block_devices()
+            .into_iter()
+            .find(|e| e.name == "dp-test-stick0p1")
+            .ok_or("partition entry missing")?;
+        if Some(entry.disk) != crate::disk_of("dp-test-stick0") {
+            return Err("a partition must share its parent's disk identity");
+        }
+        disk_policy::trust_boot_medium(entry.name, entry.disk);
+        for name in ["dp-test-stick0", "dp-test-stick0p1"] {
+            let dev = find_block_device(name).ok_or("test device not registered")?;
+            if dev.write(0, 1, &payload).is_err() || !disk_policy::automount_allowed(name) {
+                return Err("the identified boot medium must be writable");
+            }
+        }
+        let internal = find_block_device("dp-test-internal0").ok_or("internal missing")?;
+        if internal.write(0, 1, &payload).is_ok() || internal_bytes.lock()[0] != 0x22 {
+            return Err("trusting the stick must not trust another disk");
+        }
+
+        // A different device re-registered under the stick's name.
+        let (_, swapped) = new_disk(0x33);
+        crate::register_block_device("dp-test-stick0", swapped);
+        let dev = find_block_device("dp-test-stick0").ok_or("swapped device missing")?;
+        if dev.write(0, 1, &payload).is_ok() || disk_policy::is_boot_medium("dp-test-stick0") {
+            return Err("a device replacing the boot medium's name must start untrusted");
+        }
+
+        disk_policy::__set_policy_for_test(Some(DiskPolicy::All));
+        if internal.write(0, 1, &payload).is_err() || internal_bytes.lock()[0] != 0xAA {
+            return Err("narf.disks=all must pass writes through");
+        }
+        Ok(())
+    })();
+
+    disk_policy::__set_policy_for_test(None);
+    for name in ["dp-test-stick0p1", "dp-test-stick0", "dp-test-internal0"] {
+        crate::unregister_block_device(name);
+    }
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "block/disk_policy",
+    smoke_block_disk_policy_boot_only_enforced_at_registry
+);
+
+/// The async bridge filesystems mount through reports the guard's state and
+/// maps a refused write to `PermissionDenied`.
+fn smoke_block_disk_policy_sync_bridge_reports_read_only() -> TestResult {
+    use crate::disk_policy::{self, DiskPolicy, PolicyGuard};
+    use crate::BlockDevice;
+    use alloc::sync::Arc;
+    let data = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+        alloc::vec![0u8; 8 * 512],
+    ));
+    let inner = Arc::new(VecBlock {
+        data,
+        lba_size: 512,
+    }) as Arc<dyn crate::BlockDeviceSync>;
+    let guard = Arc::new(PolicyGuard::new("dp-bridge", u64::MAX - 0xd15c, inner));
+    let bridge = crate::SyncBlock::new(guard);
+    disk_policy::__set_policy_for_test(Some(DiskPolicy::BootOnly));
+    let ro = bridge.is_read_only();
+    disk_policy::__set_policy_for_test(Some(DiskPolicy::All));
+    let rw = !bridge.is_read_only();
+    disk_policy::__set_policy_for_test(None);
+    if ro && rw {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("SyncBlock must forward the guard's read-only state")
+    }
+}
+kernel_test_in!(
+    "block/disk_policy",
+    smoke_block_disk_policy_sync_bridge_reports_read_only
+);

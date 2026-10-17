@@ -111,6 +111,10 @@ pub enum RootMountError {
     /// The selected root filesystem was found, but construction of its
     /// session-writable tmpfs overlay failed.
     TmpfsOverlay(FsError),
+    /// Every otherwise-eligible device was skipped because
+    /// `narf.disks=boot-only` restricts automatic mounts to the identified
+    /// boot medium (see [`narf_block::disk_policy`]).
+    BootOnly,
 }
 
 /// Policy applied after the selected root filesystem has been constructed but
@@ -144,6 +148,20 @@ pub fn tmpfs_overlay_root(lower: Arc<dyn FsInstance>) -> Result<Arc<dyn FsInstan
         upper_root,
         alloc::vec![lower_root],
     )))
+}
+
+/// Registered block devices boot-time code may automatically mount, plus the
+/// number skipped because `narf.disks=boot-only` restricts automatic mounts
+/// to the identified boot medium ([`narf_block::disk_policy`]).
+pub fn automount_devices() -> (alloc::vec::Vec<narf_block::RegisteredBlockDevice>, usize) {
+    let all = narf_block::block_devices();
+    let total = all.len();
+    let allowed: alloc::vec::Vec<_> = all
+        .into_iter()
+        .filter(|entry| narf_block::disk_policy::automount_allowed(entry.name))
+        .collect();
+    let skipped = total - allowed.len();
+    (allowed, skipped)
 }
 
 /// Walk the block registry and mount the first viable filesystem on /.
@@ -196,7 +214,14 @@ pub fn try_mount_root_with_options(
     let devices = narf_block::block_devices();
     let mut last_error: Option<RootMountError> = None;
     let mut saw_candidate = false;
+    let mut skipped_by_policy = false;
     for entry in &devices {
+        // `narf.disks=boot-only`: never mount (or even LUKS-probe) a disk
+        // other than the identified boot medium, explicit root= included.
+        if !narf_block::disk_policy::automount_allowed(entry.name) {
+            skipped_by_policy = true;
+            continue;
+        }
         let outer_uuid_matches = selector.is_some_and(|selector| match selector {
             crate::root_selector::RootSelector::ByFsUuid(target) => entry
                 .partition
@@ -293,7 +318,9 @@ pub fn try_mount_root_with_options(
             .mount_arc(authority, "/", fs)
             .map_err(|e| RootMountError::FactoryFailed(detect, e))?;
         let device_name = if unlocked_luks {
-            narf_block::register_block_device("cryptroot", dev);
+            // Same disk identity as its container, so the write policy
+            // treats the unlocked view exactly like the medium it lives on.
+            narf_block::register_partition_device("cryptroot", entry.name, dev, None);
             "cryptroot"
         } else {
             entry.name
@@ -310,9 +337,18 @@ pub fn try_mount_root_with_options(
         if let Some(error @ RootMountError::LuksUnlock(_)) = last_error {
             return Err(error);
         }
+        if skipped_by_policy {
+            return Err(RootMountError::BootOnly);
+        }
         return Err(RootMountError::SelectorNoMatch);
     }
-    Err(last_error.unwrap_or(RootMountError::NoMountable))
+    Err(
+        last_error.unwrap_or(if skipped_by_policy && !saw_candidate {
+            RootMountError::BootOnly
+        } else {
+            RootMountError::NoMountable
+        }),
+    )
 }
 
 /// Mount the GPT EFI System Partition at NARF's `/boot` and the installed
@@ -333,6 +369,12 @@ pub fn try_mount_efi_system_partition(
             .as_ref()
             .is_some_and(narf_block::registry::PartitionMetadata::is_efi_system_partition)
         {
+            continue;
+        }
+        // `narf.disks=boot-only`: the machine's own ESP (e.g. the installed
+        // OS's) is never mounted; only the identified boot medium's is.
+        if !narf_block::disk_policy::automount_allowed(entry.name) {
+            last_error = Some(RootMountError::BootOnly);
             continue;
         }
         let dev = entry.dev.clone();

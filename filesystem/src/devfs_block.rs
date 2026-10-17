@@ -237,6 +237,7 @@ impl BlockFile {
             BlockIoError::BufferTooSmall => FsError::Io(BlockError::InvalidRange),
             BlockIoError::DriverError => FsError::Io(BlockError::IOError),
             BlockIoError::DeviceRemoved => FsError::Io(BlockError::DeviceRemoved),
+            BlockIoError::ReadOnly => FsError::ReadOnly,
         }
     }
 

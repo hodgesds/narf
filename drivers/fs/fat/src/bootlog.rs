@@ -249,6 +249,23 @@ async fn root_names<B: BlockDevice + 'static>(
     Ok(names)
 }
 
+/// True when `volume`'s root carries [`MARKER_FILE`] holding `token`. Reads
+/// only; this is how the boot medium is positively identified.
+pub async fn marker_present<B: BlockDevice + 'static>(
+    volume: &Arc<FatVolume<B>>,
+    token: &str,
+) -> Result<bool, FsError> {
+    let root = volume.root();
+    let marker = match root.lookup_async(MARKER_FILE).await {
+        Ok(marker) => marker,
+        Err(FsError::NotFound) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut contents = [0u8; TOKEN_MAX + 8];
+    let n = marker.read(0, &mut contents).await?;
+    Ok(marker_matches(&contents[..n], token))
+}
+
 /// Check `volume` for the boot-medium marker and, when it matches, create
 /// the next log file (header written). `Ok(None)`: not the boot medium.
 pub async fn open_session<B: BlockDevice + 'static>(
@@ -258,14 +275,7 @@ pub async fn open_session<B: BlockDevice + 'static>(
     header: &[u8],
 ) -> Result<Option<Session>, Error> {
     let root = volume.root();
-    let marker = match root.lookup_async(MARKER_FILE).await {
-        Ok(marker) => marker,
-        Err(FsError::NotFound) => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let mut contents = [0u8; TOKEN_MAX + 8];
-    let n = marker.read(0, &mut contents).await?;
-    if !marker_matches(&contents[..n], token) {
+    if !marker_present(volume, token).await? {
         return Ok(None);
     }
     let names = root_names(volume).await?;
@@ -396,8 +406,16 @@ fn persist_hook(msg: Option<&[u8]>) {
     let _ = poll_bounded(flush_live(msg.is_none(), Some(extra)), deadline);
 }
 
-/// Mount `dev` read-write privately (never in the VFS) and try to arm it.
+/// Mount `dev` privately (never in the VFS) and try to arm it.
+///
+/// The mount and the marker check only read. Under `narf.disks=boot-only`
+/// the device is read-only at the block layer until the marker matches;
+/// only then is its disk recorded as the boot medium
+/// ([`narf_block::disk_policy::trust_boot_medium`]) and the log file
+/// created.
 async fn probe(
+    name: &'static str,
+    disk: narf_block::disk_policy::DiskId,
     dev: Arc<dyn narf_block::BlockDeviceSync>,
     token: &str,
     header: &[u8],
@@ -411,6 +429,10 @@ async fn probe(
         narf_lib::id::DomainId::DRIVER_0,
     )
     .await?;
+    if !marker_present(&volume, token).await? {
+        return Ok(None);
+    }
+    narf_block::disk_policy::trust_boot_medium(name, disk);
     open_session(&volume, token, MAX_LOG_BYTES, header).await
 }
 
@@ -440,7 +462,7 @@ async fn run(token: String) {
                 continue;
             }
             tried.push(entry.name);
-            match probe(entry.dev.clone(), &token, &header).await {
+            match probe(entry.name, entry.disk, entry.dev.clone(), &token, &header).await {
                 Ok(Some(session)) => break 'discover Some((entry.name, session)),
                 Ok(None) => {}
                 Err(error) => {
