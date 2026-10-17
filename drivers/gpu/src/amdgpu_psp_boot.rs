@@ -14,10 +14,15 @@ use core::sync::atomic::{fence, Ordering};
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Read, Write};
 
+// linux-ctx: hdr=mp seg=0
+// linux: mmMP0_SMN_C2PMSG_35
 const STATUS: u32 = 0x63;
+// linux: mmMP0_SMN_C2PMSG_36
 const ADDRESS: u32 = 0x64;
+// linux: mmMP0_SMN_C2PMSG_81
 const SOS: u32 = 0x91;
-const DONE: u32 = 1 << 31;
+// linux-ctx: reset
+const DONE: u32 = 1 << 31; // linux: GFX_FLAG_RESPONSE
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -219,6 +224,7 @@ struct Engine<I: Io> {
     psp11: bool,
 }
 /// psp_v11_0_wait_for_bootloader: 20 × psp_wait_for(usec_timeout = 100 ms).
+// linux: n/a (NARF bound: 20 retries x usec_timeout in psp_v11_0_wait_for_bootloader)
 const PSP11_BOOTLOADER_TIMEOUT_MS: u64 = 2000;
 async fn delay(ms: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms).as_instant()).await;
@@ -249,12 +255,14 @@ impl<I: Io> Engine<I> {
                 return Err(Error::DeviceGone);
             }
             if value & DONE != 0 {
+                // linux-lit: 0xffff=GFX_CMD_STATUS_MASK
                 if value & 0xffff == 0 {
                     return Ok(());
                 }
                 // A persistent status at the deadline is still reported as
                 // the bootloader's rejection code for diagnostics.
                 if !self.psp11 || deadline.expired() {
+                    // linux-lit: 0xffff=GFX_CMD_STATUS_MASK
                     return Err(Error::Rejected(value & 0xffff));
                 }
             } else if deadline.expired() {

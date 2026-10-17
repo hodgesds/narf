@@ -6,8 +6,8 @@
 pub const NAVI22_SOS: &str = "amdgpu/navy_flounder_sos.bin";
 pub const PSP14_0_2_SOS: &str = "amdgpu/psp_14_0_2_sos.bin";
 pub const PSP14_0_3_SOS: &str = "amdgpu/psp_14_0_3_sos.bin";
-pub const STAGING_SIZE: usize = 1024 * 1024;
-const MAX_CONTAINER: usize = 8 * STAGING_SIZE;
+pub const STAGING_SIZE: usize = 1024 * 1024; // linux: PSP_1_MEG
+const MAX_CONTAINER: usize = 8 * STAGING_SIZE; // linux: n/a (NARF bound)
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -30,15 +30,15 @@ pub enum Component {
 impl Component {
     pub(crate) const fn command(self) -> u32 {
         match self {
-            Self::KeyDatabase => 0x0008_0000,
-            Self::Spl => 0x1000_0000,
-            Self::SystemDriver => 0x0001_0000,
-            Self::SocDriver => 0x000b_0000,
-            Self::InterfaceDriver => 0x000d_0000,
-            Self::HardwareDebugDriver => 0x000c_0000,
-            Self::RasDriver => 0x000e_0000,
-            Self::IpKeyManager => 0x000f_0000,
-            Self::SecureOs => 0x0002_0000,
+            Self::KeyDatabase => 0x0008_0000, // linux-lit: 0x0008_0000=PSP_BL__LOAD_KEY_DATABASE
+            Self::Spl => 0x1000_0000,         // linux-lit: 0x1000_0000=PSP_BL__LOAD_TOS_SPL_TABLE
+            Self::SystemDriver => 0x0001_0000, // linux-lit: 0x0001_0000=PSP_BL__LOAD_SYSDRV
+            Self::SocDriver => 0x000b_0000,   // linux-lit: 0x000b_0000=PSP_BL__LOAD_SOCDRV
+            Self::InterfaceDriver => 0x000d_0000, // linux-lit: 0x000d_0000=PSP_BL__LOAD_INTFDRV
+            Self::HardwareDebugDriver => 0x000c_0000, // linux-lit: 0x000c_0000=PSP_BL__LOAD_DBGDRV
+            Self::RasDriver => 0x000e_0000,   // linux-lit: 0x000e_0000=PSP_BL__LOAD_RASDRV
+            Self::IpKeyManager => 0x000f_0000, // linux-lit: 0x000f_0000=PSP_BL__LOAD_IPKEYMGRDRV
+            Self::SecureOs => 0x0002_0000,    // linux-lit: 0x0002_0000=PSP_BL__LOAD_SOSDRV
         }
     }
 }
@@ -57,21 +57,30 @@ impl<'a> Image<'a> {
     /// including non-boot TOC/RL/alternate images, must lie in the payload and
     /// not overlap. v1.2's reserved descriptor is deliberately ignored.
     pub fn parse(bytes: &'a [u8]) -> Result<Self, Error> {
+        // linux-lit: 44=sizeof(struct psp_firmware_header_v1_0)
         if bytes.len() < 44 || bytes.len() > MAX_CONTAINER {
             return Err(Error::Invalid);
         }
+        // linux-lit: 10=offsetof(struct common_firmware_header, header_version_minor)
         let minor = u16::from_le_bytes([bytes[10], bytes[11]]);
+        // linux-lit: 8=offsetof(struct common_firmware_header, header_version_major); 12=offsetof(struct common_firmware_header, ip_version_major)
         if bytes[8..10] != [1, 0] || minor > 3 || bytes[12..16] != [11, 0, 0, 0] {
             return Err(Error::Unsupported);
         }
         let header_size = match minor {
+            // linux-lit: 44=sizeof(struct psp_firmware_header_v1_0)
             0 => 44,
+            // linux-lit: 68=sizeof(struct psp_firmware_header_v1_1); 68=sizeof(struct psp_firmware_header_v1_2)
             1 | 2 => 68,
-            _ => 116,
+            _ => 116, // linux-lit: 116=sizeof(struct psp_firmware_header_v1_3)
         };
+        // linux-lit: 24=offsetof(struct common_firmware_header, ucode_array_offset_bytes)
         let start = word(bytes, 24) as usize;
+        // linux-lit: 20=offsetof(struct common_firmware_header, ucode_size_bytes)
         let size = word(bytes, 20) as usize;
+        // linux-lit: 0=offsetof(struct common_firmware_header, size_bytes)
         if word(bytes, 0) as usize != bytes.len()
+            // linux-lit: 4=offsetof(struct common_firmware_header, header_size_bytes)
             || word(bytes, 4) as usize != header_size
             || start < header_size
             || size == 0
@@ -82,6 +91,7 @@ impl<'a> Image<'a> {
         let payload = bytes.get(start..end).ok_or(Error::Invalid)?;
         // [system, SOS, TOC, KDB, SPL, RL, system_aux, SOS_aux].
         let mut ranges = [(0usize, 0usize); 8];
+        // linux-lit: 36=offsetof(struct psp_firmware_header_v1_0, sos.offset_bytes)
         ranges[0] = (0, word(bytes, 36) as usize);
         let descriptors = match minor {
             0 => 1,
@@ -92,7 +102,9 @@ impl<'a> Image<'a> {
             if minor == 2 && i == 1 {
                 continue;
             }
+            // linux-lit: 36=offsetof(struct psp_firmware_header_v1_0, sos.offset_bytes); 12=sizeof(struct psp_fw_legacy_bin_desc)
             let offset = word(bytes, 36 + i * 12) as usize;
+            // linux-lit: 40=offsetof(struct psp_firmware_header_v1_0, sos.size_bytes); 12=sizeof(struct psp_fw_legacy_bin_desc)
             let len = word(bytes, 40 + i * 12) as usize;
             if len > STAGING_SIZE || offset.checked_add(len).is_none_or(|end| end > size) {
                 return Err(Error::Invalid);
@@ -129,6 +141,7 @@ impl<'a> Image<'a> {
                 None,
                 part(1, Component::SecureOs),
             ],
+            // linux-lit: 16=offsetof(struct common_firmware_header, ucode_version)
             version: word(bytes, 16),
             toc: (toc_size != 0).then(|| &payload[toc_offset..toc_offset + toc_size]),
         })

@@ -29,45 +29,65 @@ use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 /// Master data table indices from `atom_master_list_of_data_tables_v2_1`.
+// linux: offsetof(struct atom_master_list_of_data_tables_v2_1, displayobjectinfo) / 2
 const TABLE_DISPLAY_OBJECT_INFO: u16 = 22;
+// linux: offsetof(struct atom_master_list_of_data_tables_v2_1, gpio_pin_lut) / 2
 const TABLE_GPIO_PIN_LUT: u16 = 12;
+// linux: offsetof(struct atom_master_list_of_data_tables_v2_1, dce_info) / 2
 const TABLE_DCE_INFO: u16 = 27;
+// linux: offsetof(struct atom_master_list_of_data_tables_v2_1, integratedsysteminfo) / 2
 const TABLE_INTEGRATED_SYSTEM_INFO: u16 = 30;
 
 /// `atom_display_object_path_v2` is sixteen bytes, and the paths follow the
 /// four-byte common header plus `supporteddevices` and `number_of_path`.
-const PATH_SIZE: usize = 16;
+const PATH_SIZE: usize = 16; // linux: sizeof(struct atom_display_object_path_v2)
+                             // linux: offsetof(struct display_object_info_table_v1_4, display_path)
 const PATHS_OFFSET: usize = 8;
 /// `ObjectID.h` object-id encoding.
+// linux: n/a (amdgpu/ObjectID.h OBJECT_ID_MASK 0x00FF; header not in checker set)
 const OBJECT_ID_MASK: u16 = 0x00ff;
+// linux: n/a (amdgpu/ObjectID.h ENUM_ID_SHIFT 0x08; header not in checker set)
 const ENUM_ID_SHIFT: u32 = 8;
+// linux: n/a (MISMATCH: amdgpu/ObjectID.h ENUM_ID_MASK = 0x0700; header not in checker set)
 const ENUM_ID_MASK: u16 = 0x0f00;
+// linux: n/a (amdgpu/ObjectID.h OBJECT_TYPE_SHIFT 0x0C; header not in checker set)
 const OBJECT_TYPE_SHIFT: u32 = 12;
+// linux: n/a (MISMATCH: amdgpu/ObjectID.h OBJECT_TYPE_MASK = 0x7000; header not in checker set)
 const OBJECT_TYPE_MASK: u16 = 0xf000;
-const TYPE_ENCODER: u16 = 0x02;
-const TYPE_CONNECTOR: u16 = 0x03;
+const TYPE_ENCODER: u16 = 0x02; // linux: OBJECT_TYPE_ENCODER@dc
+const TYPE_CONNECTOR: u16 = 0x03; // linux: OBJECT_TYPE_CONNECTOR@dc
 /// `atom_common_record_header` is two bytes, and `atom_hpd_int_record` adds the
 /// pin id and its plug state. The list ends with a terminator record type.
-const RECORD_HEADER: usize = 2;
-const RECORD_I2C: u8 = 1;
-const RECORD_HPD_INT: u8 = 2;
-const RECORD_CONNECTOR_SPEED: u8 = 4;
-const RECORD_END: u8 = 0xff;
+const RECORD_HEADER: usize = 2; // linux: sizeof(struct atom_common_record_header)
+const RECORD_I2C: u8 = 1; // linux: ATOM_I2C_RECORD_TYPE
+const RECORD_HPD_INT: u8 = 2; // linux: ATOM_HPD_INT_RECORD_TYPE
+const RECORD_CONNECTOR_SPEED: u8 = 4; // linux: ATOM_CONNECTOR_SPEED_UPTO
+const RECORD_END: u8 = 0xff; // linux: ATOM_RECORD_END_TYPE
 /// A connector's record list is short; this only bounds a malformed one.
-const MAX_RECORDS: usize = 64;
+const MAX_RECORDS: usize = 64; // linux: n/a (NARF bound on a malformed record list)
 /// `num_dig_link_enc` for DCN314, and its four tunnelling endpoints.
-pub const DIG_COUNT: u8 = 5;
-pub const DPIA_COUNT: u8 = 4;
+pub const DIG_COUNT: u8 = 5; // linux: n/a (DCN 3.1.4 path)
+pub const DPIA_COUNT: u8 = 4; // linux: n/a (DCN 3.1.4 path)
 /// GPIO ids in the VBIOS are keys into the GPIO LUT, not hardware indices.
 /// Both supported DCN generations use these GPIO registers at base index 2.
-const GPIO_DDC1_A: u32 = 0x28d1;
-const GPIO_HPD_A: u32 = 0x28f5;
+// linux-ctx: hdr=dcn seg=2
+const GPIO_DDC1_A: u32 = 0x28d1; // linux: mmDC_GPIO_DDC1_A
+const GPIO_HPD_A: u32 = 0x28f5; // linux: mmDC_GPIO_HPD_A
+                                // linux: DC_GPIO_HPD_A__DC_GPIO_HPD1_A__SHIFT
+                                // linux: DC_GPIO_HPD_A__DC_GPIO_HPD2_A__SHIFT
+                                // linux: DC_GPIO_HPD_A__DC_GPIO_HPD3_A__SHIFT
+                                // linux: DC_GPIO_HPD_A__DC_GPIO_HPD4_A__SHIFT
+                                // linux: DC_GPIO_HPD_A__DC_GPIO_HPD5_A__SHIFT
+                                // linux: DC_GPIO_HPD_A__DC_GPIO_HPD6_A__SHIFT
 const HPD_SHIFTS: [u8; 6] = [0, 8, 16, 24, 26, 28];
 
 /// `DIG0_DIG_BE_EN_CNTL`, per-DIG stride 0x100, at DCN base index 2. Bit zero
 /// says the backend is already driving a link.
+// DCN 3.1.4's offset; Navi22 uses DIG_BE_EN_CNTL - 1 (DCN30 mmDIG0_DIG_BE_EN_CNTL).
+// linux: mmDIG0_DIG_BE_EN_CNTL + 1
 const DIG_BE_EN_CNTL: u64 = 0x20b2;
-const DIG_STRIDE: u64 = 0x100;
+const DIG_STRIDE: u64 = 0x100; // linux: mmDIG1_DIG_BE_EN_CNTL - mmDIG0_DIG_BE_EN_CNTL
+                               // linux-ctx: reset
 
 /// Routing compatibility does not grant access to DCN3 plane/timing methods.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -114,6 +134,7 @@ impl Routing {
     }
     fn bank(self, gpu: &AmdGpu, last: u32) -> Result<u64, Error> {
         match self {
+            // linux-lit: 2=mmDC_GPIO_HPD_A_BASE_IDX@dcn
             Self::Legacy(p) => p.bank(gpu, 2, last).map_err(|_| Error::Unsupported),
             Self::Navi48 => crate::amdgpu_psp_ring::bank(
                 gpu,
@@ -130,37 +151,39 @@ impl Routing {
             Self::Legacy(Profile::Navi22) => (DIG_BE_EN_CNTL - 1, DIG_STRIDE),
             Self::Legacy(Profile::Dcn314) => (DIG_BE_EN_CNTL, DIG_STRIDE),
             // dcn_4_1_0_offset.h DIG0..3_DIG_BE_EN_CNTL.
-            Self::Navi48 => (0x20bd, 0x124),
+            Self::Navi48 => (0x20bd, 0x124), // linux: n/a (DCN 4.0.1 path)
         }
     }
 }
 /// `atom_dmi_t17_mem_type_def`: DDR5 is 34 and LPDDR5 is 35.
-const MEM_TYPE_DDR5: u8 = 34;
-const MEM_TYPE_LPDDR5: u8 = 35;
+const MEM_TYPE_DDR5: u8 = 34; // linux: n/a (DCN 3.1.4 path)
+const MEM_TYPE_LPDDR5: u8 = 35; // linux: n/a (DCN 3.1.4 path)
 /// Linux derives the channel width from the memory type rather than reading it.
-const DDR5_CHANNEL_WIDTH_BYTES: u32 = 8;
-const LPDDR5_CHANNEL_WIDTH_BYTES: u32 = 4;
+const DDR5_CHANNEL_WIDTH_BYTES: u32 = 8; // linux: n/a (DCN 3.1.4 path)
+const LPDDR5_CHANNEL_WIDTH_BYTES: u32 = 4; // linux: n/a (DCN 3.1.4 path)
 /// `atom_display_controller_info_v4_*` places `dce_refclk_10khz` here, in every
 /// content revision from 4.1 to 4.5.
+// linux: offsetof(struct atom_display_controller_info_v4_1, dce_refclk_10khz)
 const DCE_REFCLK_OFFSET: usize = 12;
+// linux: offsetof(struct atom_display_controller_info_v4_1, display_caps)
 const DCE_DISPLAY_CAPS_OFFSET: usize = 4;
-const DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE: u32 = 0x20;
+const DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE: u32 = 0x20; // linux: DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE
 /// `atom_integrated_system_info_v2_*` field offsets, the same in v2.1 and v2.2.
-const MEMORY_TYPE_OFFSET: usize = 26;
-const CHANNEL_COUNT_OFFSET: usize = 27;
+const MEMORY_TYPE_OFFSET: usize = 26; // linux: n/a (DCN 3.1.4 path)
+const CHANNEL_COUNT_OFFSET: usize = 27; // linux: n/a (DCN 3.1.4 path)
 
 /// The CLK block is absent from the IP discovery table, so Linux hardcodes its
 /// base too (`CLK_BASE` in `dcn314_clk_mgr.c`). This is the one register address
 /// here that discovery cannot confirm, which is why the value it produces is
 /// range-checked before being believed.
-const CLK_BASE_DWORD: u64 = 0x0001_6c00;
-const CLK1_CLK_PLL_REQ: u64 = 0x0237;
+const CLK_BASE_DWORD: u64 = 0x0001_6c00; // linux: n/a (DCN 3.1.4 path)
+const CLK1_CLK_PLL_REQ: u64 = 0x0237; // linux: n/a (DCN 3.1.4 path)
 /// `dfs_ref_freq_khz` for DCN314.
-const DFS_REF_KHZ: u64 = 48_000;
+const DFS_REF_KHZ: u64 = 48_000; // linux: n/a (DCN 3.1.4 path)
 /// The DENTIST VCO is a few GHz; anything outside this cannot be one, and a
 /// register read that produces it is a read of something else.
-const VCO_MIN_KHZ: u32 = 600_000;
-const VCO_MAX_KHZ: u32 = 6_000_000;
+const VCO_MIN_KHZ: u32 = 600_000; // linux: n/a (DCN 3.1.4 path; NARF sanity bound)
+const VCO_MAX_KHZ: u32 = 6_000_000; // linux: n/a (DCN 3.1.4 path; NARF sanity bound)
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -212,13 +235,17 @@ fn u16_at(bytes: &[u8], offset: usize) -> u16 {
 /// revision. A table whose declared size does not match what the directory
 /// gave us is not a table we can read fields out of by offset.
 fn header(table: &[u8], format: u8, content: &[u8]) -> Result<(), Error> {
+    // linux-lit: 4=sizeof(struct atom_common_table_header)
     if table.len() < 4 {
         return Err(Error::Missing);
     }
     let size = u16_at(table, 0) as usize;
+    // linux-lit: 4=sizeof(struct atom_common_table_header)
     if size < 4 || size > table.len() {
         return Err(Error::Invalid);
     }
+    // linux-lit: 2=offsetof(struct atom_common_table_header, format_revision)
+    // linux-lit: 3=offsetof(struct atom_common_table_header, content_revision)
     if table[2] != format || !content.contains(&table[3]) {
         return Err(Error::Unsupported);
     }
@@ -250,9 +277,13 @@ fn transmitter(encoder_objid: u16) -> Result<u8, Error> {
     // UNIPHY (0x1e), UNIPHY1 (0x20) and UNIPHY2 (0x21) each pair two
     // transmitters; UNIPHY3 (0x25) carries only G.
     let (pair, enums) = match encoder_objid & OBJECT_ID_MASK {
+        // linux: n/a (amdgpu/ObjectID.h ENCODER_OBJECT_ID_INTERNAL_UNIPHY 0x1E; not in checker set)
         0x1e => (0, 2),
+        // linux: n/a (amdgpu/ObjectID.h ENCODER_OBJECT_ID_INTERNAL_UNIPHY1 0x20; not in checker set)
         0x20 => (1, 2),
+        // linux: n/a (amdgpu/ObjectID.h ENCODER_OBJECT_ID_INTERNAL_UNIPHY2 0x21; not in checker set)
         0x21 => (2, 2),
+        // linux: n/a (amdgpu/ObjectID.h ENCODER_OBJECT_ID_INTERNAL_UNIPHY3 0x25; not in checker set)
         0x25 => (3, 1),
         _ => return Err(Error::Unsupported),
     };
@@ -270,9 +301,9 @@ fn connector(objid: u16) -> Result<(Connector, u8), Error> {
         return Err(Error::Invalid);
     }
     let kind = match (objid & OBJECT_ID_MASK) as u8 {
-        0x0c => Connector::HdmiTypeA,
-        0x13 => Connector::DisplayPort,
-        0x14 => Connector::EmbeddedDisplayPort,
+        0x0c => Connector::HdmiTypeA, // linux-lit: 0x0c=CONNECTOR_ID_HDMI_TYPE_A
+        0x13 => Connector::DisplayPort, // linux-lit: 0x13=CONNECTOR_ID_DISPLAY_PORT
+        0x14 => Connector::EmbeddedDisplayPort, // linux-lit: 0x14=CONNECTOR_ID_EDP
         other => Connector::Other(other),
     };
     Ok((kind, instance))
@@ -310,7 +341,10 @@ fn wiring(vbios: &[u8], base: usize, offset: u16, paths_end: usize) -> Result<Wi
         }
         let record = vbios.get(at..at + size).ok_or(Error::Invalid)?;
         // atom_connector_speed_record: header, u32 MHz, u16 reserved.
+        // linux-lit: 8=sizeof(struct atom_connector_speed_record)
         if head[0] == RECORD_CONNECTOR_SPEED && size >= 8 && result.speed.is_none() {
+            // linux-lit: 2=offsetof(struct atom_connector_speed_record, connector_max_speed)
+            // linux-lit: 6=offsetof(struct atom_connector_speed_record, reserved)
             result.speed = Some(u32::from_le_bytes(record[2..6].try_into().unwrap()));
         }
         let field = match head[0] {
@@ -319,6 +353,8 @@ fn wiring(vbios: &[u8], base: usize, offset: u16, paths_end: usize) -> Result<Wi
             _ => None,
         };
         if let Some(field) = field {
+            // linux-lit: 4=sizeof(struct atom_hpd_int_record)
+            // linux-lit: 2=offsetof(struct atom_hpd_int_record, pin_id)
             if size < 4 || field.replace(record[2]).is_some() {
                 return Err(Error::Invalid);
             }
@@ -333,14 +369,21 @@ fn wiring(vbios: &[u8], base: usize, offset: u16, paths_end: usize) -> Result<Wi
 fn gpio(vbios: &[u8], uid: u8) -> Result<(u32, u8), Error> {
     let pins = table(vbios, TABLE_GPIO_PIN_LUT)?;
     header(pins, 2, &[1])?;
+    // linux-lit: 4=sizeof(struct atom_common_table_header)
+    // linux-lit: 8=sizeof(struct atom_gpio_pin_assignment)
     if pins.len() < 12 || (pins.len() - 4) % 8 != 0 {
         return Err(Error::Invalid);
     }
+    // linux-lit: 4=sizeof(struct atom_common_table_header)
+    // linux-lit: 8=sizeof(struct atom_gpio_pin_assignment)
+    // linux-lit: 6=offsetof(struct atom_gpio_pin_assignment, gpio_id)
     let mut matches = pins[4..].chunks_exact(8).filter(|pin| pin[6] == uid);
     let pin = matches.next().ok_or(Error::Missing)?;
+    // linux-lit: 4=offsetof(struct atom_gpio_pin_assignment, gpio_bitshift)
     if matches.next().is_some() || pin[4] >= 32 {
         return Err(Error::Invalid);
     }
+    // linux-lit: 4=offsetof(struct atom_gpio_pin_assignment, gpio_bitshift)
     Ok((u32::from_le_bytes(pin[..4].try_into().unwrap()), pin[4]))
 }
 fn aux_channel(vbios: &[u8], uid: u8, dcn: u32, count: u8) -> Result<u8, Error> {
@@ -348,10 +391,12 @@ fn aux_channel(vbios: &[u8], uid: u8, dcn: u32, count: u8) -> Result<u8, Error> 
     let first = dcn.checked_add(GPIO_DDC1_A).ok_or(Error::Invalid)?;
     let relative = register.checked_sub(first).ok_or(Error::Unsupported)?;
     // DC_GPIO_DDCnCLK_A is bit 0. The DATA bit (8) is not a clock pin.
+    // linux-lit: 0=DC_GPIO_DDC1_A__DC_GPIO_DDC1CLK_A__SHIFT@dcn
+    // linux-lit: 4=mmDC_GPIO_DDC2_A@dcn - mmDC_GPIO_DDC1_A@dcn
     if shift != 0 || relative % 4 != 0 || relative / 4 >= u32::from(count) {
         return Err(Error::Unsupported);
     }
-    Ok((relative / 4) as u8)
+    Ok((relative / 4) as u8) // linux-lit: 4=mmDC_GPIO_DDC2_A@dcn - mmDC_GPIO_DDC1_A@dcn
 }
 fn hpd_selector(vbios: &[u8], uid: u8, dcn: u32) -> Result<u8, Error> {
     let (register, shift) = gpio(vbios, uid)?;
@@ -392,6 +437,7 @@ fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, 
     if info.len() < PATHS_OFFSET {
         return Err(Error::Invalid);
     }
+    // linux-lit: 6=offsetof(struct display_object_info_table_v1_4, number_of_path)
     let count = info[6] as usize;
     let declared = u16_at(info, 0) as usize;
     if count == 0 || PATHS_OFFSET + count * PATH_SIZE > declared {
@@ -404,6 +450,7 @@ fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, 
         let Ok((kind, instance)) = connector(u16_at(entry, 0)) else {
             continue;
         };
+        // linux-lit: 4=offsetof(struct atom_display_object_path_v2, encoderobjid)
         let Ok(transmitter) = transmitter(u16_at(entry, 4)) else {
             continue;
         };
@@ -411,12 +458,15 @@ fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, 
         // id cannot be treated as an on-chip transmitter.
         // v1.5 keeps the field positions but replaces extencoderobjid with a
         // reserved USB-C field. It no longer describes an external encoder.
+        // linux-lit: 3=offsetof(struct atom_common_table_header, content_revision)
+        // linux-lit: 6=offsetof(struct atom_display_object_path_v2, extencoderobjid)
         if (info[3] == 4 && u16_at(entry, 6) != 0) || transmitter >= dig_count {
             continue;
         }
         let pins = wiring(
             vbios,
             base,
+            // linux-lit: 2=offsetof(struct atom_display_object_path_v2, disp_recordoffset)
             u16_at(entry, 2),
             base + PATHS_OFFSET + count * PATH_SIZE,
         )?;
@@ -435,6 +485,7 @@ fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, 
             transmitter,
             aux,
             hpd,
+            // linux-lit: 12=offsetof(struct atom_display_object_path_v2, device_tag)
             device_tag: u16_at(entry, 12),
             max_speed_mhz: pins.speed.unwrap_or(0),
         });
@@ -446,14 +497,17 @@ fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, 
 }
 
 /// `atom_master_list_of_data_tables_v2_1::vram_info`.
+// linux: offsetof(struct atom_master_list_of_data_tables_v2_1, vram_info) / 2
 const TABLE_VRAM_INFO: u16 = 28;
 /// `atom_vram_info_header_v2_5`: the four-byte header, eight u16 offsets and
 /// four u8 counts precede `vram_module[0]` (`atom_vram_module_v11`), whose
 /// `channel_num` and `channel_width` sit 14 and 15 bytes in.
+// linux: offsetof(struct atom_vram_info_header_v2_5, vram_module_num)
 const VRAM_MODULE_NUM_OFFSET: usize = 20;
+// linux: offsetof(struct atom_vram_info_header_v2_5, vram_module)
 const VRAM_MODULE0_OFFSET: usize = 24;
-const VRAM_CHANNEL_NUM: usize = 14;
-const VRAM_CHANNEL_WIDTH: usize = 15;
+const VRAM_CHANNEL_NUM: usize = 14; // linux: offsetof(struct atom_vram_module_v11, channel_num)
+const VRAM_CHANNEL_WIDTH: usize = 15; // linux: offsetof(struct atom_vram_module_v11, channel_width)
 
 /// Discrete-GPU DRAM channels as `bios_parser2.c::get_vram_info_v25` reads
 /// them for DML: `(channel_num, (1 << channel_width) / 8 bytes)` of module 0.
@@ -676,7 +730,7 @@ pub unsafe fn transmitter_busy(
     if value == u32::MAX {
         return Err(Error::DeviceGone);
     }
-    Ok(value & 1 != 0)
+    Ok(value & 1 != 0) // linux-lit: 1=DIG0_DIG_BE_EN_CNTL__DIG_ENABLE_MASK@dcn
 }
 
 struct Op<F>(F);

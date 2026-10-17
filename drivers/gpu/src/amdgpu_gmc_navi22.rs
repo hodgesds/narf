@@ -19,12 +19,16 @@ mod vm;
 pub use gart::{GartInfo, Gtt, GART_SIZE};
 use regs::{HubRegs, GFX, MM};
 pub use vm::{Buffer, Fault, FaultInfo, FaultOwner, Mapping, Vm, VmInfo};
+// linux: n/a (NARF boot-aperture size)
 const BYTES: u64 = 16384; // PT, default page, source page, destination page
+                          // linux: n/a (NARF policy)
 const APERTURE_SIZE: u64 = 2 << 20; // 512 flat PTEs; only two are present
-const LIMIT: u64 = 1 << 48;
+const LIMIT: u64 = 1 << 48; // linux: n/a (gmc_v10_0_sw_init mc_mask 0xffffffffffff, 48 bits)
+                            // linux: n/a (literal four_gb in amdgpu_gmc.c:amdgpu_gmc_gart_location)
 const FOUR_GB: u64 = 4 << 30;
 /// AMDGPU_GMC_HOLE_START; gmc_v10 mc_mask is 48 bits, so max_mc_address is
 /// min(mc_mask, HOLE_START - 1).
+// linux: n/a (AMDGPU_GMC_HOLE_START - 1; runtime macro on max_level)
 const MAX_MC_ADDRESS: u64 = 0x0000_7fff_ffff_ffff;
 
 /// amdgpu_gmc_gart_location(AMDGPU_GART_PLACEMENT_BEST_FIT), as called by
@@ -94,14 +98,20 @@ struct Layout {
 }
 /// nbio_v2_3.c smnPCIE_CONFIG_CNTL and its CI_SWUS_MAX_READ_REQUEST_SIZE_MODE
 /// (bit 27) / _PRIV (bits 29:28) fields (nbio_2_3_sh_mask.h).
-const SMN_PCIE_CONFIG_CNTL: u32 = 0x1118_0044;
+const SMN_PCIE_CONFIG_CNTL: u32 = 0x1118_0044; // linux: smnPCIE_CONFIG_CNTL
+                                               // linux: PCIE_CONFIG_CNTL__CI_SWUS_MAX_READ_REQUEST_SIZE_MODE_MASK
 const MAX_READ_REQUEST_MODE: u32 = 1 << 27;
+// linux: PCIE_CONFIG_CNTL__CI_SWUS_MAX_READ_REQUEST_SIZE_PRIV_MASK
 const MAX_READ_REQUEST_PRIV: u32 = 3 << 28;
-const PCIE_INDEX2: u64 = 0xe;
-const PCIE_DATA2: u64 = 0xf;
+// linux-ctx: hdr=nbio seg=0
+const PCIE_INDEX2: u64 = 0xe; // linux: mmPCIE_INDEX2
+const PCIE_DATA2: u64 = 0xf; // linux: mmPCIE_DATA2
+                             // linux-ctx: reset
 /// hdp_5_0_0_offset.h HDP_MISC_CNTL (BASE_IDX 0), FLUSH_INVALIDATE_CACHE bit 0.
-const HDP_MISC_CNTL: u64 = 0xd3;
-const HDP_FLUSH_INVALIDATE_CACHE: u32 = 1;
+// linux-ctx: hdr=hdp seg=0
+const HDP_MISC_CNTL: u64 = 0xd3; // linux: mmHDP_MISC_CNTL
+                                 // linux-ctx: reset
+const HDP_FLUSH_INVALIDATE_CACHE: u32 = 1; // linux: HDP_MISC_CNTL__FLUSH_INVALIDATE_CACHE_MASK
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
         if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
@@ -124,9 +134,12 @@ impl Layout {
         ];
         Ok(Self {
             bases: [
+                // linux-lit: 0x1703=mmGCMC_VM_MX_L1_TLB_CNTL@gc
                 reg(ip::HW_ID_GC, &[(10, 3, 2)], 0, 0x1703)?,
+                // linux-lit: 0x873=mmMMMC_VM_MX_L1_TLB_CNTL
                 reg(ip::HW_ID_MMHUB, &[(2, 1, 0)], 0, 0x873)?,
             ],
+            // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
             nbio: reg(ip::HW_ID_NBIF, &nbif, 2, 0x12d)?,
             pcie: reg(ip::HW_ID_NBIF, &nbif, 0, PCIE_DATA2 as u32)?,
             hdp: reg(
@@ -202,6 +215,8 @@ impl Geometry {
         if fields.contains(&u32::MAX) {
             return Err(Error::DeviceGone);
         }
+        // linux-lit: 0xffffff=GCMC_VM_FB_LOCATION_BASE__FB_BASE_MASK
+        // linux: n/a (FB_OFFSET__FB_OFFSET_MASK also 0xffffff; << 24 literal in gfxhub_v2_1_get_fb_location)
         let [base, offset] = fields.map(|v| u64::from(v & 0xff_ffff) << 24);
         let end = base.checked_add(bytes).ok_or(Error::Invalid)?;
         if bytes == 0
@@ -209,6 +224,7 @@ impl Geometry {
             || allocation < base
             || allocation.checked_add(BYTES).is_none_or(|v| v > end)
             || allocation % 4096 != 0
+        // linux: n/a (NARF 4 KiB alignment check)
         {
             return Err(Error::Invalid);
         }
@@ -244,8 +260,9 @@ fn checked(value: u32) -> Result<u32, Error> {
 }
 fn flush<I: Io>(io: &mut I, nbio: u64) {
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    // linux: n/a (0x7f000 = MMIO_REG_HOLE_OFFSET + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL, nbio_v2_3.c)
     io.write(0x7f000, 0);
-    io.read(nbio + 0xc3 * 4);
+    io.read(nbio + 0xc3 * 4); // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
 /// nbio_v2_3_init_registers (nv_common_hw_init, before any GMC block):
@@ -256,6 +273,7 @@ fn init_nbio<I: Io>(io: &mut I, pcie: u64) -> Result<(), Error> {
     io.write(index, SMN_PCIE_CONFIG_CNTL);
     io.read(index);
     let old = checked(io.read(data))?;
+    // linux-lit: 28=PCIE_CONFIG_CNTL__CI_SWUS_MAX_READ_REQUEST_SIZE_PRIV__SHIFT
     let new = (old & !MAX_READ_REQUEST_PRIV) | MAX_READ_REQUEST_MODE | (1 << 28);
     if new != old {
         io.write(index, SMN_PCIE_CONFIG_CNTL);
@@ -293,6 +311,7 @@ fn program<I: Io>(
     address: u64,
 ) -> Result<(), Error> {
     let write = |io: &mut I, reg, value| io.write(base + u64::from(reg) * 4, value);
+    // linux-lit: 1=AMDGPU_PTE_VALID
     pair(io, base, r.pt_base, g.physical(address) | 1); // valid VRAM PDE, byte address
     pair(io, base, r.pt_start, g.aperture.start >> 12);
     pair(
@@ -302,6 +321,7 @@ fn program<I: Io>(
         (g.aperture.start + g.aperture.size - 1) >> 12,
     );
     write(io, r.agp_base, 0);
+    // linux: n/a (0xffffff = amdgpu_gmc_set_agp_default agp_start 0xffffffffffff >> 24)
     write(io, r.agp_bot, 0xffffff);
     write(io, r.agp_top, 0);
     write(io, r.sys_low, (g.fb >> 18) as u32);
@@ -311,25 +331,46 @@ fn program<I: Io>(
     write(io, r.sys_default_hi, (scratch >> 44) as u32);
     write(io, r.fault_lo, (scratch >> 12) as u32);
     write(io, r.fault_hi, (scratch >> 44) as u32);
+    // linux-lit: 0x40000=GCVM_L2_PROTECTION_FAULT_CNTL2__ACTIVE_PAGE_MIGRATION_PTE_READ_RETRY_MASK
     update(io, base, r.fault_cntl2, 0x40000, 0x40000)?;
     // UC=3. System access mode 3, ADM on, unmapped aperture access off.
+    // linux-lit: 0x3879=GCMC_VM_MX_L1_TLB_CNTL__ENABLE_L1_TLB_MASK | GCMC_VM_MX_L1_TLB_CNTL__SYSTEM_ACCESS_MODE_MASK | GCMC_VM_MX_L1_TLB_CNTL__SYSTEM_APERTURE_UNMAPPED_ACCESS_MASK | GCMC_VM_MX_L1_TLB_CNTL__ENABLE_ADVANCED_DRIVER_MODEL_MASK | GCMC_VM_MX_L1_TLB_CNTL__MTYPE_MASK
+    // linux-lit: 0x1859=GCMC_VM_MX_L1_TLB_CNTL__ENABLE_L1_TLB_MASK | GCMC_VM_MX_L1_TLB_CNTL__SYSTEM_ACCESS_MODE_MASK | GCMC_VM_MX_L1_TLB_CNTL__ENABLE_ADVANCED_DRIVER_MODEL_MASK | (3 << GCMC_VM_MX_L1_TLB_CNTL__MTYPE__SHIFT)
+    // linux: n/a (MTYPE 3 = MTYPE_UC, navi10_enum.h; not in the checker header sets)
     update(io, base, r.l1, 0x3879, 0x1859)?;
     // Default fault page is owned VRAM, so OUT_TO_SYSTEM_MEMORY stays clear.
+    // linux-lit: 0x03fc0903=GCVM_L2_CNTL__ENABLE_L2_CACHE_MASK | GCVM_L2_CNTL__ENABLE_L2_FRAGMENT_PROCESSING_MASK | GCVM_L2_CNTL__L2_PDE0_CACHE_TAG_GENERATION_MODE_MASK | GCVM_L2_CNTL__ENABLE_DEFAULT_PAGE_OUT_TO_SYSTEM_MEMORY_MASK | GCVM_L2_CNTL__PDE_FAULT_CLASSIFICATION_MASK | GCVM_L2_CNTL__CONTEXT1_IDENTITY_ACCESS_MODE_MASK | GCVM_L2_CNTL__IDENTITY_MODE_FRAGMENT_SIZE_MASK
+    // linux-lit: 0x80001=GCVM_L2_CNTL__ENABLE_L2_CACHE_MASK | (1 << GCVM_L2_CNTL__CONTEXT1_IDENTITY_ACCESS_MODE__SHIFT)
     update(io, base, r.l2, 0x03fc0903, 0x80001)?;
+    // linux-lit: 3=GCVM_L2_CNTL2__INVALIDATE_ALL_L1_TLBS_MASK | GCVM_L2_CNTL2__INVALIDATE_L2_CACHE_MASK
     update(io, base, r.l2_2, 3, 3)?;
+    // linux-lit: 0xf803f=GCVM_L2_CNTL3__BANK_SELECT_MASK | GCVM_L2_CNTL3__L2_CACHE_BIGK_FRAGMENT_SIZE_MASK; 15=GCVM_L2_CNTL3__L2_CACHE_BIGK_FRAGMENT_SIZE__SHIFT
+    // linux: n/a (0x80100007 = mmGCVM_L2_CNTL3_DEFAULT, *_default.h not in checker; 9/6 literal in gfxhub_v2_1_init_cache_regs, !translate_further)
     write(io, r.l2_3, (0x80100007 & !0xf803f) | 9 | (6 << 15));
+    // linux-lit: 0xc0=GCVM_L2_CNTL4__VMC_TAP_PDE_REQUEST_PHYSICAL_MASK | GCVM_L2_CNTL4__VMC_TAP_PTE_REQUEST_PHYSICAL_MASK
+    // linux: n/a (0xc1 = mmGCVM_L2_CNTL4_DEFAULT, gc_10_3_0_default.h not in checker)
     write(io, r.l2_4, 0xc1 & !0xc0);
+    // linux-lit: 0x1f=GCVM_L2_CNTL5__L2_CACHE_SMALLK_FRAGMENT_SIZE_MASK
+    // linux: n/a (0x3fe0 = mmGCVM_L2_CNTL5_DEFAULT, gc_10_3_0_default.h not in checker)
     write(io, r.l2_5, 0x3fe0 & !0x1f);
+    // linux: n/a (literal in gfxhub_v2_1_disable_identity_aperture)
     pair(io, base, r.identity_low, 0xf_ffffffff);
     pair(io, base, r.identity_high, 0);
     pair(io, base, r.identity_offset, 0);
     // Invalid translations return the VRAM default page. Leave fault IRQs off
     // until IH has an owner; no retry storm or host-memory fallback.
+    // linux-lit: 0xfffffffc=0xffffffff & ~(GCVM_L2_PROTECTION_FAULT_CNTL__CLEAR_PROTECTION_FAULT_STATUS_ADDR_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__ALLOW_SUBSEQUENT_PROTECTION_FAULT_STATUS_ADDR_UPDATES_MASK)
+    // linux-lit: 0x1ffc=GCVM_L2_PROTECTION_FAULT_CNTL__RANGE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__PDE0_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__PDE1_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__PDE2_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__TRANSLATE_FURTHER_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__NACK_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__VALID_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__READ_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__WRITE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__EXECUTE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK
     update(io, base, r.fault_cntl, 0xffff_fffc, 0x1ffc)?;
     for index in 0..18 {
+        // linux: n/a (literal 18 engines in gfxhub_v2_1_program_invalidation)
+        // linux-lit: 2=mmGCVM_INVALIDATE_ENG1_ADDR_RANGE_LO32 - mmGCVM_INVALIDATE_ENG0_ADDR_RANGE_LO32
+        // linux: n/a (0x1f_ffffffff = LO32 0xffffffff / HI32 0x1f literals in program_invalidation)
         pair(io, base, r.inv_range + index * 2, 0x1f_ffffffff);
     }
     // Only privileged VMID0: flat PT, no retry, default-page fault responses.
+    // linux-lit: 1=GCVM_CONTEXT0_CNTL__ENABLE_CONTEXT_MASK
+    // linux-lit: 0x555400=GCVM_CONTEXT0_CNTL__RANGE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT0_CNTL__DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT0_CNTL__PDE0_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT0_CNTL__VALID_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT0_CNTL__READ_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT0_CNTL__WRITE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK | GCVM_CONTEXT0_CNTL__EXECUTE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK
     write(io, r.ctx, 1 | 0x555400);
     Ok(())
 }
@@ -342,6 +383,7 @@ fn owner_token() -> u64 {
 /// gfxhub_v2_1/mmhub_v2_0_get_invalidate_req(vmid, 0): legacy per-VMID
 /// request invalidating L2 PTE/PDE0-2 and L1 caches, status address kept.
 const fn invalidate_request(vmid: u8) -> u32 {
+    // linux-lit: 0xf80000=GCVM_INVALIDATE_ENG0_REQ__INVALIDATE_L2_PTES_MASK | GCVM_INVALIDATE_ENG0_REQ__INVALIDATE_L2_PDE0_MASK | GCVM_INVALIDATE_ENG0_REQ__INVALIDATE_L2_PDE1_MASK | GCVM_INVALIDATE_ENG0_REQ__INVALIDATE_L2_PDE2_MASK | GCVM_INVALIDATE_ENG0_REQ__INVALIDATE_L1_PTES_MASK
     (1 << vmid) | 0xf8_0000
 }
 fn invoke<I: Io, T>(
@@ -397,7 +439,7 @@ impl<I: Io> Engine<I> {
         invoke(&self.authority, &mut self.io, f)
     }
     async fn wait(&mut self, address: u64, mask: u32) -> Result<(), Error> {
-        let deadline = narf_time::Deadline::after_ms(100);
+        let deadline = narf_time::Deadline::after_ms(100); // linux: n/a (adev->usec_timeout 100 ms)
         loop {
             if self.access(|io| checked(io.read(address)))? & mask == mask {
                 return Ok(());
@@ -405,6 +447,7 @@ impl<I: Io> Engine<I> {
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
+            // linux: n/a (NARF 1 ms poll interval)
             narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
         }
     }
@@ -421,6 +464,7 @@ impl<I: Io> Engine<I> {
             }
             let base = layout.bases[index];
             if hub == Hub::Mm {
+                // linux: n/a (semaphore-acquired bit 0x1, literal in gmc_v10_0_flush_gpu_tlb)
                 self.wait(base + u64::from(r.inv_sem) * 4, 1).await?;
             }
             self.access(|io| {
@@ -481,12 +525,15 @@ impl<I: Io> Engine<I> {
         let address = self.memory.address();
         let size = self.vram_size;
         let geometry = self.access(|io| {
+            // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
+            // linux: n/a (0x7f000 = MMIO_REG_HOLE_OFFSET + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL, nbio_v2_3.c)
             if checked(io.read(layout.nbio + 0x12d * 4))? != 0x7f000 {
                 return Err(Error::Invalid);
             }
             let g = Geometry::new(
                 [
                     io.read(layout.bases[0] + u64::from(GFX.fb_base) * 4),
+                    // linux-lit: 0x16e7=mmGCMC_VM_FB_OFFSET@gc
                     io.read(layout.bases[0] + 0x16e7 * 4),
                 ],
                 size,
@@ -495,6 +542,7 @@ impl<I: Io> Engine<I> {
             for (base, r) in layout.bases.into_iter().zip([GFX, MM]) {
                 // Both hubs must agree on the inherited FB base. TOP is not
                 // read (gmc_v10_0_vram_gtt_location uses MEMSIZE).
+                // linux-lit: 0xffffff=GCMC_VM_FB_LOCATION_BASE__FB_BASE_MASK
                 if u64::from(checked(io.read(base + u64::from(r.fb_base) * 4))? & 0xffffff) << 24
                     != g.fb
                 {
@@ -504,6 +552,8 @@ impl<I: Io> Engine<I> {
                 // gfxhub/mmhub gart_enable reprograms it, as Linux does. A
                 // live user context (1..15) would have unknown tables.
                 for context in 1..16 {
+                    // linux: n/a (VMIDs 1..15, AMDGPU_NUM_VMID 16)
+                    // linux-lit: 1=GCVM_CONTEXT1_CNTL__ENABLE_CONTEXT_MASK
                     if checked(io.read(base + u64::from(r.ctx + context) * 4))? & 1 != 0 {
                         return Err(Error::Busy);
                     }
@@ -517,7 +567,9 @@ impl<I: Io> Engine<I> {
             for offset in (0..BYTES).step_by(4) {
                 io.memory(map, offset, 0);
             }
+            // linux: n/a (NARF test-page layout)
             for (index, offset) in [8192, 12288].into_iter().enumerate() {
+                // linux-lit: 0x61=AMDGPU_PTE_VALID | AMDGPU_PTE_READABLE | AMDGPU_PTE_WRITEABLE
                 let pte = geometry.physical(address + offset) | 0x61; // V/R/W, NC VRAM
                 io.memory(map, index as u64 * 8, pte as u32);
                 io.memory(map, index as u64 * 8 + 4, (pte >> 32) as u32);

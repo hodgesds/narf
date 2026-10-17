@@ -251,6 +251,7 @@ impl Scanout {
         let mut memory = pool.reserve(bytes).map_err(|_| Error::Allocation)?;
         let map = memory.mapping();
         for start in (0..bytes).step_by(65536) {
+            // linux: n/a (NARF clear chunk)
             let end = (start + 65536).min(bytes);
             for offset in (start..end).step_by(4) {
                 // SAFETY: an owned, unpublished reservation's mapping.
@@ -478,11 +479,11 @@ impl Scanout {
 
 /// A cheap identity for an uploaded cursor image (FNV-1a over size and pixels).
 fn image_digest(width: u32, height: u32, pixels: &[u32]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // linux: n/a (FNV-1a offset basis)
     for word in [width, height].iter().chain(pixels) {
         for b in word.to_le_bytes() {
             h ^= u64::from(b);
-            h = h.wrapping_mul(0x0100_0000_01b3);
+            h = h.wrapping_mul(0x0100_0000_01b3); // linux: n/a (FNV-1a prime)
         }
     }
     h | 1

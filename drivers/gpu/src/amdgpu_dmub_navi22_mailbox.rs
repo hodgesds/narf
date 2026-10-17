@@ -2,17 +2,19 @@
 //! The enclosing controller supplies generation-specific reset/coherency.
 use super::*;
 
-const SIZE: u32 = 8192;
-const SLOT: u32 = 64;
-const IN_W: u32 = 0x1d6;
-const IN_R: u32 = 0x1d7;
-const OUT_W: u32 = 0x1de;
-const OUT_R: u32 = 0x1df;
+const SIZE: u32 = 8192; // linux: DMUB_RB_SIZE
+const SLOT: u32 = 64; // linux: DMUB_RB_CMD_SIZE
+                      // linux-ctx: hdr=dcn seg=2
+const IN_W: u32 = 0x1d6; // linux: mmDMCUB_INBOX1_WPTR
+const IN_R: u32 = 0x1d7; // linux: mmDMCUB_INBOX1_RPTR
+const OUT_W: u32 = 0x1de; // linux: mmDMCUB_OUTBOX1_WPTR
+const OUT_R: u32 = 0x1df; // linux: mmDMCUB_OUTBOX1_RPTR
+                          // linux-ctx: reset
 
 /// Firmware's packed dmub_feature_caps bytes. Informational only: no feature
 /// is enabled from these flags. Older firmware leaves the zeroed tail intact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FeatureCaps(pub [u8; 14]);
+pub struct FeatureCaps(pub [u8; 14]); // linux-lit: 14=sizeof(struct dmub_feature_caps)
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MailboxState {
@@ -31,7 +33,7 @@ pub(super) struct Mailbox {
     notifications: bool,
     // Preserve unrelated notifications while waiting for AUX, without heap
     // allocation or unbounded processing of firmware-controlled traffic.
-    events: [[u8; 64]; 16],
+    events: [[u8; 64]; 16], // linux-lit: 64=DMUB_RB_CMD_SIZE
     head: usize,
     len: usize,
 }
@@ -73,7 +75,7 @@ fn pointer(value: u32) -> Result<u32, Error> {
     }
 }
 fn header(kind: u8, length: u8) -> [u8; 64] {
-    let mut command = [0; 64];
+    let mut command = [0; 64]; // linux-lit: 64=DMUB_RB_CMD_SIZE
     command[0] = kind;
     command[3] = length;
     command
@@ -81,9 +83,11 @@ fn header(kind: u8, length: u8) -> [u8; 64] {
 fn valid_header(command: &[u8; 64]) -> bool {
     // One complete memory-based command. No register payloads, batches or
     // reserved header bits. ret_status has command-specific semantics.
+    // linux-lit: 60=DMUB_RB_CMD_SIZE - sizeof(struct dmub_cmd_header)
     command[2] & !1 == 0 && command[3] <= 60
 }
 fn alive(io: &mut impl Io, l: Layout) -> Result<(), Error> {
+    // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL@nbio
     if !is_running(io, l)? || read(io, l.nbio, 0x12d)? != 0x7f000 {
         return Err(Error::Protocol);
     }
@@ -92,7 +96,7 @@ fn alive(io: &mut impl Io, l: Layout) -> Result<(), Error> {
 fn flush(io: &mut impl Io, l: Layout) -> Result<(), Error> {
     fence(Ordering::SeqCst);
     io.write(0x7f000, 0);
-    read(io, l.nbio, 0xc3)?;
+    read(io, l.nbio, 0xc3)?; // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE@nbio
     fence(Ordering::SeqCst);
     Ok(())
 }
@@ -130,14 +134,17 @@ impl<I: Io> Engine<I> {
         self.access(|io| {
             alive(io, l)?;
             for (reg, value, mask) in [
-                (0x1bd, address as u32, u32::MAX),
+                (0x1bd, address as u32, u32::MAX), // linux-lit: 0x1bd=mmDMCUB_REGION3_CW4_OFFSET
+                // linux-lit: 0x1be=mmDMCUB_REGION3_CW4_OFFSET_HIGH
                 (0x1be, (address >> 32) as u32, u32::MAX),
-                (0x1a9, 0x04000000, MASK),
+                (0x1a9, 0x04000000, MASK), // linux-lit: 0x1a9=mmDMCUB_REGION3_CW4_BASE_ADDRESS
+                // linux-lit: 0x1b1=mmDMCUB_REGION3_CW4_TOP_ADDRESS
+                // linux-lit: 31=DMCUB_REGION3_CW4_TOP_ADDRESS__DMCUB_REGION3_CW4_ENABLE__SHIFT
                 (0x1b1, 0x84004000, MASK | (1 << 31)),
-                (0x1d4, 0x64000000, u32::MAX),
-                (0x1d5, SIZE, u32::MAX),
-                (0x1dc, 0x64002000, u32::MAX),
-                (0x1dd, SIZE, u32::MAX),
+                (0x1d4, 0x64000000, u32::MAX), // linux-lit: 0x1d4=mmDMCUB_INBOX1_BASE_ADDRESS
+                (0x1d5, SIZE, u32::MAX),       // linux-lit: 0x1d5=mmDMCUB_INBOX1_SIZE
+                (0x1dc, 0x64002000, u32::MAX), // linux-lit: 0x1dc=mmDMCUB_OUTBOX1_BASE_ADDRESS
+                (0x1dd, SIZE, u32::MAX),       // linux-lit: 0x1dd=mmDMCUB_OUTBOX1_SIZE
                 (IN_W, write, u32::MAX),
                 (IN_R, write, u32::MAX),
                 (OUT_R, read_ptr, u32::MAX),
@@ -162,7 +169,9 @@ impl<I: Io> Engine<I> {
         self.check_mailbox()?;
         let l = self.layout;
         self.access(|io| {
+            // linux-lit: 0x1ea=mmDMCUB_SCRATCH7
             io.write(l.dcn + 0x1ea * 4, 0); // exclude the inherited STOP reply
+                                            // linux-lit: 0x10010000=(1 << 28) | (DMUB_GPINT__GET_FW_VERSION << 16)
             io.write(l.dcn + u64::from(GPINT) * 4, 0x10010000);
             Ok(())
         })?;
@@ -170,8 +179,9 @@ impl<I: Io> Engine<I> {
         loop {
             let version = self.access(|io| {
                 alive(io, l)?;
+                // linux-lit: 0x00010000=DMUB_GPINT__GET_FW_VERSION << 16
                 if read(io, l.dcn, GPINT)? == 0x00010000 {
-                    Ok(Some(read(io, l.dcn, 0x1ea)?))
+                    Ok(Some(read(io, l.dcn, 0x1ea)?)) // linux-lit: 0x1ea=mmDMCUB_SCRATCH7
                 } else {
                     Ok(None)
                 }
@@ -195,11 +205,15 @@ impl<I: Io> Engine<I> {
             }
             tick().await;
         }
+        // linux-lit: 6=DMUB_CMD__QUERY_FEATURE_CAPS
+        // linux-lit: 14=sizeof(struct dmub_cmd_query_feature_caps_data)
         let mut request = header(6, 14); // QUERY_FEATURE_CAPS
         request[2] = 1;
         let reply = self.command(request).await?;
         // Linux dc_dmub_srv_query_caps_cmd: a processed query CLEARS the
         // request's ret_status bit. Unimplemented queries leave it set.
+        // linux-lit: 4=offsetof(struct dmub_rb_cmd_query_feature_caps, query_feature_caps_data)
+        // linux-lit: 18=sizeof(struct dmub_rb_cmd_query_feature_caps)
         let caps = (reply[2] == 0).then(|| FeatureCaps(reply[4..18].try_into().unwrap()));
         self.status.as_mut().ok_or(Error::Invalid)?.capabilities = caps;
         Ok(())
@@ -289,6 +303,7 @@ impl<I: Io> Engine<I> {
     fn notification(event: [u8; 64]) -> Result<[u8; 64], Error> {
         // AUX has no usable request ID. A late/unmatched reply must never be
         // attributed to another transfer, even on the same physical link.
+        // linux-lit: 1=DMUB_OUT_CMD__DP_AUX_REPLY
         if event[0] == 1 {
             Err(Error::Protocol)
         } else {
@@ -312,20 +327,30 @@ impl<I: Io> Engine<I> {
             return Err(Error::Invalid);
         }
         self.begin_mailbox()?;
+        // linux-lit: 82=DMUB_CMD__QUERY_HPD_STATE; 12=sizeof(struct dmub_cmd_hpd_state_query_data)
         let mut request = header(82, 12);
+        // linux-lit: 4=offsetof(struct dmub_rb_cmd_query_hpd_state, data.instance)
         request[4] = instance;
         // Legacy/native AUX channel = 0. A sentinel prevents an unimplemented
         // query from looking like a successful disconnected port.
+        // linux-lit: 12=offsetof(struct dmub_rb_cmd_query_hpd_state, data.status)
+        // linux-lit: 16=sizeof(struct dmub_rb_cmd_query_hpd_state)
         request[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
         let result = async {
             let reply = self.command(request).await?;
+            // linux-lit: 4=offsetof(struct dmub_rb_cmd_query_hpd_state, data.instance)
+            // linux-lit: 8=offsetof(struct dmub_rb_cmd_query_hpd_state, data.ch_type)
+            // linux-lit: 12=offsetof(struct dmub_rb_cmd_query_hpd_state, data.status)
             if reply[4] != instance || reply[8..12] != [0; 4] {
                 return Err(Error::Protocol);
             }
+            // linux-lit: 12=offsetof(struct dmub_rb_cmd_query_hpd_state, data.status)
+            // linux-lit: 16=sizeof(struct dmub_rb_cmd_query_hpd_state)
             let status = u32::from_le_bytes(reply[12..16].try_into().unwrap());
             if status != 0 {
                 return Err(Error::CommandRejected(status));
             }
+            // linux-lit: 5=offsetof(struct dmub_rb_cmd_query_hpd_state, data.result)
             match reply[5] {
                 0 => Ok(false),
                 1 => Ok(true),
@@ -365,8 +390,9 @@ impl<I: Io> Engine<I> {
             self.mailbox.save(Self::notification(event)?)?;
         }
         if !self.mailbox.notifications {
-            let mut enable = header(71, 4);
-            enable[4] = 1;
+            // linux-lit: 4=sizeof(struct dmub_rb_cmd_outbox1_enable) - sizeof(struct dmub_cmd_header)
+            let mut enable = header(71, 4); // linux-lit: 71=DMUB_CMD__OUTBOX1_ENABLE
+            enable[4] = 1; // linux-lit: 4=offsetof(struct dmub_rb_cmd_outbox1_enable, enable)
             self.command(enable).await?;
             self.mailbox.notifications = true;
         }
@@ -376,10 +402,13 @@ impl<I: Io> Engine<I> {
             // Bounded work per poll even if firmware keeps publishing events.
             for _ in 0..16 {
                 let Some(reply) = self.outbox()? else { break };
+                // linux-lit: 1=DMUB_OUT_CMD__DP_AUX_REPLY
                 if reply[0] != 1 {
                     self.mailbox.save(reply)?;
                     continue;
                 }
+                // linux-lit: 28=sizeof(struct dmub_rb_cmd_dp_aux_reply) - sizeof(struct dmub_cmd_header)
+                // linux-lit: 8=offsetof(struct dmub_rb_cmd_dp_aux_reply, control.instance)
                 if reply[1] != 0 || reply[3] != 28 || reply[8] != instance {
                     return Err(Error::Protocol);
                 }

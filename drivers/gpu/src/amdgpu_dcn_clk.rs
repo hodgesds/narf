@@ -16,40 +16,40 @@ use core::{
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
-const MSG: u64 = 0x283; // MP1_SMN_C2PMSG_67
-const PARAM: u64 = 0x293; // MP1_SMN_C2PMSG_83
-const RESPONSE: u64 = 0x29b; // MP1_SMN_C2PMSG_91
+const MSG: u64 = 0x283; // linux: n/a (DCN 3.1.4 path: MP1_SMN_C2PMSG_67)
+const PARAM: u64 = 0x293; // linux: n/a (DCN 3.1.4 path: MP1_SMN_C2PMSG_83)
+const RESPONSE: u64 = 0x29b; // linux: n/a (DCN 3.1.4 path: MP1_SMN_C2PMSG_91)
 
-const MSG_TEST: u32 = 0x01;
-const MSG_GET_VERSION: u32 = 0x02;
-const MSG_SET_DISPCLK: u32 = 0x04;
-const MSG_SET_DPPCLK: u32 = 0x06;
-const MSG_SET_HARD_MIN_DCFCLK: u32 = 0x07;
-const MSG_SET_MIN_DEEP_SLEEP_DCFCLK: u32 = 0x08;
-const MSG_SET_DRAM_ADDR_HIGH: u32 = 0x0e;
-const MSG_SET_DRAM_ADDR_LOW: u32 = 0x0f;
-const MSG_TRANSFER_TABLE_SMU2DRAM: u32 = 0x10;
-const MSG_SET_IDLE_OPTIMIZATIONS: u32 = 0x12;
-const MSG_SET_DTBCLK: u32 = 0x17;
+const MSG_TEST: u32 = 0x01; // linux: n/a (DCN 3.1.4 path)
+const MSG_GET_VERSION: u32 = 0x02; // linux: n/a (DCN 3.1.4 path)
+const MSG_SET_DISPCLK: u32 = 0x04; // linux: n/a (DCN 3.1.4 path)
+const MSG_SET_DPPCLK: u32 = 0x06; // linux: n/a (DCN 3.1.4 path)
+const MSG_SET_HARD_MIN_DCFCLK: u32 = 0x07; // linux: n/a (DCN 3.1.4 path)
+const MSG_SET_MIN_DEEP_SLEEP_DCFCLK: u32 = 0x08; // linux: n/a (DCN 3.1.4 path)
+const MSG_SET_DRAM_ADDR_HIGH: u32 = 0x0e; // linux: n/a (DCN 3.1.4 path)
+const MSG_SET_DRAM_ADDR_LOW: u32 = 0x0f; // linux: n/a (DCN 3.1.4 path)
+const MSG_TRANSFER_TABLE_SMU2DRAM: u32 = 0x10; // linux: n/a (DCN 3.1.4 path)
+const MSG_SET_IDLE_OPTIMIZATIONS: u32 = 0x12; // linux: n/a (DCN 3.1.4 path)
+const MSG_SET_DTBCLK: u32 = 0x17; // linux: n/a (DCN 3.1.4 path)
 
-const STATUS_BUSY: u32 = 0x00;
-const STATUS_OK: u32 = 0x01;
+const STATUS_BUSY: u32 = 0x00; // linux: n/a (DCN 3.1.4 path)
+const STATUS_OK: u32 = 0x01; // linux: n/a (DCN 3.1.4 path)
 
-const TABLE_DPMCLOCKS: u32 = 4;
+const TABLE_DPMCLOCKS: u32 = 4; // linux: n/a (DCN 3.1.4 path)
 /// `DpmClocks314_t`: six 8-entry clock arrays, voltages, four DF p-states,
 /// the enabled-level counts and the GFX clock range.
-const TABLE_SIZE: u64 = 304;
-const LEVELS: usize = 8;
-const DF_PSTATES: usize = 4;
+const TABLE_SIZE: u64 = 304; // linux: n/a (DCN 3.1.4 path)
+const LEVELS: usize = 8; // linux: n/a (DCN 3.1.4 path)
+const DF_PSTATES: usize = 4; // linux: n/a (DCN 3.1.4 path)
 
 /// DCN314 drives DP reference and DTB from a fixed 600 MHz source
 /// (`dcn314_clk_mgr_construct`). Spread spectrum would adjust the DP DTO
 /// source only; this path does not enable it.
-pub const DPREFCLK_KHZ: u32 = 600_000;
-pub const DTBCLK_KHZ: u32 = 600_000;
+pub const DPREFCLK_KHZ: u32 = 600_000; // linux: n/a (DCN 3.1.4 path)
+pub const DTBCLK_KHZ: u32 = 600_000; // linux: n/a (DCN 3.1.4 path)
 /// Linux clamps DPPCLK to 100 MHz to keep an eDP panel plus a 4K monitor from
 /// underflowing when the global clock drops.
-const DPPCLK_FLOOR_KHZ: u32 = 100_000;
+const DPPCLK_FLOOR_KHZ: u32 = 100_000; // linux: n/a (DCN 3.1.4 path)
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {

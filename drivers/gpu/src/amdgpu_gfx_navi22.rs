@@ -26,18 +26,20 @@ pub struct Firmware {
 }
 pub(crate) fn check_device(gpu: &AmdGpu) -> Result<(), Error> {
     crate::amdgpu_smu_navi22::mp1_bank(gpu).map_err(|_| Error::Unsupported)?;
+    // linux: n/a (IP_VERSION(5, 2, 2) = navy_flounder_sdma, amdgpu_ucode.c)
     crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_SDMA0, &[(5, 2, 2)], 0, 0)
         .map_err(|_| Error::Unsupported)?;
     // amdgpu_ucode_ip_version_decode: 3.0.16 is Dimgrey Cavefish, not Navy.
     crate::amdgpu_psp_ring::bank(
         gpu,
         discovery::HW_ID_VCN,
-        &[(3, 0, 0), (3, 0, 64), (3, 0, 192)],
+        &[(3, 0, 0), (3, 0, 64), (3, 0, 192)], // linux: n/a (amdgpu_ucode.c: navy_flounder_vcn)
         0,
         0,
     )
     .map_err(|_| Error::Unsupported)?;
     vcn_instances(gpu)?;
+    // linux: n/a (DCN 3.0.0 discovery version)
     crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, &[(3, 0, 0)], 0, 0)
         .map_err(|_| Error::Unsupported)?;
     Ok(())
@@ -54,6 +56,7 @@ pub(crate) fn vcn_instances(gpu: &AmdGpu) -> Result<u8, Error> {
         .filter(|ip| ip.hw_id == discovery::HW_ID_VCN)
     {
         let bit = 1u8.checked_shl(u32::from(ip.instance)).unwrap_or(0);
+        // linux: n/a (VCN 3.0.x, at most two instances on Navy Flounder)
         if ip.instance > 1 || mask & bit != 0 || (ip.major, ip.minor) != (3, 0) {
             return Err(Error::Unsupported);
         }

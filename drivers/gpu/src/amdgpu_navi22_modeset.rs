@@ -68,72 +68,91 @@ use narf_capabilities::{Cap, Write};
 
 /// DCN3.0 has six pipes (OTG/HUBP/DPP/MPCC/OPP), six DIG frontends and six
 /// combo PHY PLLs (`dcn30_resource.c` `res_cap_dcn3`, `DCN30_CLK_SRC_PLL0..5`).
-pub const PIPES: u8 = 6;
-pub const STREAMS: u8 = 6;
-pub const PLLS: u8 = 6;
+pub const PIPES: u8 = 6; // linux: n/a (dcn30_resource.c res_cap_dcn3.num_timing_generator = 6)
+pub const STREAMS: u8 = 6; // linux: n/a (dcn30_resource.c res_cap_dcn3.num_stream_encoder = 6)
+pub const PLLS: u8 = 6; // linux: n/a (dcn30_resource.c res_cap_dcn3.num_pll = 6)
 /// No scrambling, so no SCDC handshake: HDMI 1.4 rates only.
 pub const MAX_TMDS_KHZ: u32 = hdmi::TMDS_SCRAMBLE_KHZ - 1;
 /// `dcn20_link_encoder_get_max_link_cap`: HBR3 on four lanes.
-pub const MAX_DP_RATE: u8 = 0x1e;
-pub const MAX_DP_LANES: u8 = 4;
-const PITCH_ALIGN: u32 = 256;
-// dccg2_init and the clock source, DCN base index 1 (`dcn_3_0_0_offset.h`).
-const REFCLK_CNTL: u64 = 0x0049;
-const MILLISECOND_TIME_BASE_DIV: u64 = 0x0070;
-const DISPCLK_FREQ_CHANGE_CNTL: u64 = 0x0071;
-const MICROSECOND_TIME_BASE_DIV: u64 = 0x007b;
+pub const MAX_DP_RATE: u8 = 0x1e; // linux: LINK_RATE_HIGH3
+pub const MAX_DP_LANES: u8 = 4; // linux: LANE_COUNT_FOUR
+const PITCH_ALIGN: u32 = 256; // linux: n/a (NARF scanout pitch alignment)
+                              // linux-ctx: hdr=dcn seg=1
+                              // dccg2_init and the clock source, DCN base index 1 (`dcn_3_0_0_offset.h`).
+const REFCLK_CNTL: u64 = 0x0049; // linux: mmREFCLK_CNTL
+const MILLISECOND_TIME_BASE_DIV: u64 = 0x0070; // linux: mmMILLISECOND_TIME_BASE_DIV
+const DISPCLK_FREQ_CHANGE_CNTL: u64 = 0x0071; // linux: mmDISPCLK_FREQ_CHANGE_CNTL
+const MICROSECOND_TIME_BASE_DIV: u64 = 0x007b; // linux: mmMICROSECOND_TIME_BASE_DIV
 /// `OTGn_PIXEL_RATE_CNTL`, `DP_DTOn_PHASE`, `DP_DTOn_MODULO`, stride 4.
-const OTG0_PIXEL_RATE_CNTL: u64 = 0x0080;
-const DP_DTO0_PHASE: u64 = 0x0081;
-const DP_DTO0_MODULO: u64 = 0x0082;
-const DTO_STRIDE: u64 = 4;
-const DP_DTO0_ENABLE: u32 = 1 << 4;
+const OTG0_PIXEL_RATE_CNTL: u64 = 0x0080; // linux: mmOTG0_PIXEL_RATE_CNTL
+const DP_DTO0_PHASE: u64 = 0x0081; // linux: mmDP_DTO0_PHASE
+const DP_DTO0_MODULO: u64 = 0x0082; // linux: mmDP_DTO0_MODULO
+const DTO_STRIDE: u64 = 4; // linux: mmOTG1_PIXEL_RATE_CNTL - mmOTG0_PIXEL_RATE_CNTL
+const DP_DTO0_ENABLE: u32 = 1 << 4; // linux: OTG0_PIXEL_RATE_CNTL__DP_DTO0_ENABLE_MASK
 /// `PHYPLLx_PIXCLK_RESYNC_CNTL` per combo PHY PLL A..F, and its
 /// `PHYPLLA_DCCG_DEEP_COLOR_CNTL` field (the only one in DCN3.0's mask list).
+// linux: mmPHYPLLA_PIXCLK_RESYNC_CNTL; mmPHYPLLB_PIXCLK_RESYNC_CNTL; mmPHYPLLC_PIXCLK_RESYNC_CNTL
+// linux: mmPHYPLLD_PIXCLK_RESYNC_CNTL; mmPHYPLLE_PIXCLK_RESYNC_CNTL; mmPHYPLLF_PIXCLK_RESYNC_CNTL
 const PIXCLK_RESYNC_CNTL: [u64; 6] = [0x0040, 0x0041, 0x0042, 0x0043, 0x004c, 0x007e];
+// linux: PHYPLLA_PIXCLK_RESYNC_CNTL__PHYPLLA_DCCG_DEEP_COLOR_CNTL_MASK
 const DCCG_DEEP_COLOR_CNTL: u32 = 0x30;
 /// `clk_mgr->dprefclk_khz` on DCN3.0: `dcn3_clk_mgr_construct` sets 730 MHz
 /// and `dcn3_dump_clk_registers` never replaces it.
+// linux: n/a (dcn30_clk_mgr.c dcn3_clk_mgr_construct: dprefclk_khz = 730000)
 const DPREFCLK_KHZ: u32 = 730_000;
-const LAST_DCN1: u32 = MICROSECOND_TIME_BASE_DIV as u32;
-// dcn20_dpp_pg_control / dcn20_hubp_pg_control, DCN base index 2: HUBP n is
-// DOMAIN(2n), DPP n DOMAIN(2n + 1); each STATUS follows its CONFIG.
-const DOMAIN0_PG_CONFIG: u64 = 0x0080;
-const DOMAIN_POWER_GATE: u32 = 1 << 8;
+const LAST_DCN1: u32 = MICROSECOND_TIME_BASE_DIV as u32; // linux: mmMICROSECOND_TIME_BASE_DIV
+                                                         // linux-ctx: hdr=dcn seg=2
+                                                         // dcn20_dpp_pg_control / dcn20_hubp_pg_control, DCN base index 2: HUBP n is
+                                                         // DOMAIN(2n), DPP n DOMAIN(2n + 1); each STATUS follows its CONFIG.
+const DOMAIN0_PG_CONFIG: u64 = 0x0080; // linux: mmDOMAIN0_PG_CONFIG
+const DOMAIN_POWER_GATE: u32 = 1 << 8; // linux: DOMAIN0_PG_CONFIG__DOMAIN0_POWER_GATE_MASK
+                                       // linux: DOMAIN0_PG_STATUS__DOMAIN0_PGFSM_PWR_STATUS_MASK
 const DOMAIN_PGFSM_PWR_STATUS: u32 = 0xc000_0000;
-const DC_IP_REQUEST_CNTL: u64 = 0x00b2;
-// HUBP instance block, stride 0xdc.
-const HUBP_STRIDE: u64 = 0xdc;
-const HUBP0_DCHUBP_CNTL: u64 = 0x05f3;
-const HUBP0_HUBP_CLK_CNTL: u64 = 0x05f4;
-const HUBP_CLOCK_ENABLE: u32 = 1 << 0;
+const DC_IP_REQUEST_CNTL: u64 = 0x00b2; // linux: mmDC_IP_REQUEST_CNTL
+                                        // HUBP instance block, stride 0xdc.
+const HUBP_STRIDE: u64 = 0xdc; // linux: mmHUBP1_HUBP_CLK_CNTL - mmHUBP0_HUBP_CLK_CNTL
+const HUBP0_DCHUBP_CNTL: u64 = 0x05f3; // linux: mmHUBP0_DCHUBP_CNTL
+const HUBP0_HUBP_CLK_CNTL: u64 = 0x05f4; // linux: mmHUBP0_HUBP_CLK_CNTL
+const HUBP_CLOCK_ENABLE: u32 = 1 << 0; // linux: HUBP0_HUBP_CLK_CNTL__HUBP_CLOCK_ENABLE_MASK
 /// `HUBPREQn_DCN_CUR0_TTU_CNTL0/1`: REFCYC_PER_REQ_DELIVERY (23 bits),
 /// QoS_LEVEL_FIXED and QoS_RAMP_DISABLE; REFCYC_PER_REQ_DELIVERY_PRE.
-const HUBP0_DCN_CUR0_TTU_CNTL0: u64 = 0x0630;
-const HUBP0_DCN_CUR0_TTU_CNTL1: u64 = 0x0631;
+const HUBP0_DCN_CUR0_TTU_CNTL0: u64 = 0x0630; // linux: mmHUBPREQ0_DCN_CUR0_TTU_CNTL0
+const HUBP0_DCN_CUR0_TTU_CNTL1: u64 = 0x0631; // linux: mmHUBPREQ0_DCN_CUR0_TTU_CNTL1
 /// `DCHUBP_CNTL.HUBP_UNDERFLOW_STATUS` (3 bits) and `HUBP_UNDERFLOW_CLEAR`.
+// linux: HUBP0_DCHUBP_CNTL__HUBP_UNDERFLOW_STATUS_MASK
 const HUBP_UNDERFLOW_STATUS: u32 = 0x7000_0000;
+// linux: HUBP0_DCHUBP_CNTL__HUBP_UNDERFLOW_CLEAR_MASK
 const HUBP_UNDERFLOW_CLEAR: u32 = 0x8000_0000;
 // OTG instance block, stride 0x80.
-const OTG_STRIDE: u64 = 0x80;
-const OTG0_OTG_CLOCK_CONTROL: u64 = 0x1b86;
-const OTG_CLOCK_EN: u32 = 1 << 0;
-const OTG_CLOCK_GATE_DIS: u32 = 1 << 1;
-const OTG_CLOCK_ON: u32 = 1 << 8;
-const OTG0_OTG_MASTER_UPDATE_LOCK: u64 = 0x1b8b;
-const OTG0_OTG_GLOBAL_CONTROL2: u64 = 0x1b92;
+const OTG_STRIDE: u64 = 0x80; // linux: mmOTG1_OTG_CONTROL - mmOTG0_OTG_CONTROL
+const OTG0_OTG_CLOCK_CONTROL: u64 = 0x1b86; // linux: mmOTG0_OTG_CLOCK_CONTROL
+const OTG_CLOCK_EN: u32 = 1 << 0; // linux: OTG0_OTG_CLOCK_CONTROL__OTG_CLOCK_EN_MASK
+const OTG_CLOCK_GATE_DIS: u32 = 1 << 1; // linux: OTG0_OTG_CLOCK_CONTROL__OTG_CLOCK_GATE_DIS_MASK
+const OTG_CLOCK_ON: u32 = 1 << 8; // linux: OTG0_OTG_CLOCK_CONTROL__OTG_CLOCK_ON_MASK
+const OTG0_OTG_MASTER_UPDATE_LOCK: u64 = 0x1b8b; // linux: mmOTG0_OTG_MASTER_UPDATE_LOCK
+const OTG0_OTG_GLOBAL_CONTROL2: u64 = 0x1b92; // linux: mmOTG0_OTG_GLOBAL_CONTROL2
+                                              // linux: OTG0_OTG_MASTER_UPDATE_LOCK__OTG_MASTER_UPDATE_LOCK_MASK
 const OTG_MASTER_UPDATE_LOCK: u32 = 1 << 0;
+// linux: OTG0_OTG_MASTER_UPDATE_LOCK__UPDATE_LOCK_STATUS_MASK
 const UPDATE_LOCK_STATUS: u32 = 1 << 8;
+// linux: OTG0_OTG_GLOBAL_CONTROL2__OTG_MASTER_UPDATE_LOCK_SEL_MASK
 const OTG_MASTER_UPDATE_LOCK_SEL: u32 = 0x0e00_0000;
 // ODM instance block, stride 0x10.
+// linux: mmODM1_OPTC_DATA_SOURCE_SELECT - mmODM0_OPTC_DATA_SOURCE_SELECT
 const ODM_STRIDE: u64 = 0x10;
-const ODM0_OPTC_INPUT_GLOBAL_CONTROL: u64 = 0x1aca;
+const ODM0_OPTC_INPUT_GLOBAL_CONTROL: u64 = 0x1aca; // linux: mmODM0_OPTC_INPUT_GLOBAL_CONTROL
+                                                    // linux: ODM0_OPTC_INPUT_GLOBAL_CONTROL__OPTC_UNDERFLOW_OCCURRED_STATUS_MASK
 const OPTC_UNDERFLOW_OCCURRED_STATUS: u32 = 0x400;
+// linux: ODM0_OPTC_INPUT_GLOBAL_CONTROL__OPTC_UNDERFLOW_CLEAR_MASK
 const OPTC_UNDERFLOW_CLEAR: u32 = 0x1000;
-const ODM0_OPTC_INPUT_CLOCK_CONTROL: u64 = 0x1acf;
+const ODM0_OPTC_INPUT_CLOCK_CONTROL: u64 = 0x1acf; // linux: mmODM0_OPTC_INPUT_CLOCK_CONTROL
+                                                   // linux: ODM0_OPTC_INPUT_CLOCK_CONTROL__OPTC_INPUT_CLK_GATE_DIS_MASK
 const OPTC_INPUT_CLK_GATE_DIS: u32 = 1 << 0;
+// linux: ODM0_OPTC_INPUT_CLOCK_CONTROL__OPTC_INPUT_CLK_EN_MASK
 const OPTC_INPUT_CLK_EN: u32 = 1 << 1;
+// linux: ODM0_OPTC_INPUT_CLOCK_CONTROL__OPTC_INPUT_CLK_ON_MASK
 const OPTC_INPUT_CLK_ON: u32 = 1 << 2;
+// linux-ctx: reset
 /// The last register this owner touches directly in bank 2.
 const LAST_DCN2: u32 = {
     let own = OTG0_OTG_GLOBAL_CONTROL2 as u32 + 5 * OTG_STRIDE as u32;
@@ -146,20 +165,26 @@ const LAST_DCN2: u32 = {
         take
     }
 };
+// linux-ctx: hdr=nbio seg=1
 /// `BIOS_SCRATCH_6` (nbio 2.3, base index 1) and `ATOM_S6_ACC_MODE`.
-const BIOS_SCRATCH_6: u64 = 0x003e;
-const ATOM_S6_ACC_MODE: u32 = 1 << 4;
+const BIOS_SCRATCH_6: u64 = 0x003e; // linux: mmBIOS_SCRATCH_6
+                                    // linux-ctx: reset
+const ATOM_S6_ACC_MODE: u32 = 1 << 4; // linux: ATOM_S6_ACC_MODE
 /// The HDP flush page and NBIO's MEMSIZE read for posting (`hdp_v5_0_flush_hdp`).
+// linux: n/a (MMIO_REG_HOLE_OFFSET 0x80000 - PAGE_SIZE, local in nbio_v2_3.c)
 const HDP_FLUSH: u64 = 0x7f000;
-const NBIO_MEMSIZE: u64 = 0xc3;
+// linux-ctx: hdr=nbio seg=2
+const NBIO_MEMSIZE: u64 = 0xc3; // linux: mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
+                                // linux-ctx: reset
 /// Frames watched for underflow after the front end latches.
-const VERIFY_FRAMES: u32 = 2;
+const VERIFY_FRAMES: u32 = 2; // linux: n/a (NARF policy)
 /// `link_set_dpms_off`'s `msleep(60)` after blanking a non-eDP DP stream.
-const DP_BLANK_SETTLE_US: u64 = 60_000;
+const DP_BLANK_SETTLE_US: u64 = 60_000; // linux: n/a (msleep(60), literal in link_set_dpms_off)
 /// `dp_transition_to_video_idle` without POST_LT_ADJ_REQ: 5 ms of idle.
-const DP_IDLE_US: u64 = 5_000;
+const DP_IDLE_US: u64 = 5_000; // linux: n/a (5 ms, literal in dp_transition_to_video_idle)
 /// `video_optimized_pixel_rates[]` (`dce_clock_source.c`): requested pixel
 /// clock range in kHz, the target rate, and the DTO multiplier/divider.
+// linux: n/a (dce_clock_source.c video_optimized_pixel_rates[], verified row by row)
 const VIDEO_OPTIMIZED_RATES: [(u32, u32, u32, u32, u32); 28] = [
     (25170, 25180, 25200, 1000, 1001),
     (59340, 59350, 59400, 1000, 1001),
@@ -452,7 +477,8 @@ pub(crate) fn select(
 /// code and lane count (`dp_get_max_link_cap`, without LTTPR).
 fn dp_ceiling(caps: &[u8; 16]) -> Result<(u8, u8), Error> {
     let rate = caps[1].min(MAX_DP_RATE);
-    let lanes = (caps[2] & 0x1f).min(MAX_DP_LANES);
+    let lanes = (caps[2] & 0x1f).min(MAX_DP_LANES); // linux-lit: 0x1f=DP_MAX_LANE_COUNT_MASK
+                                                    // linux-lit: 6=DP_LINK_BW_1_62; 10=DP_LINK_BW_2_7; 20=DP_LINK_BW_5_4; 30=DP_LINK_BW_8_1
     if !matches!(rate, 6 | 10 | 20 | 30) || !matches!(lanes, 1 | 2 | 4) {
         return Err(Error::NoSink);
     }
@@ -874,8 +900,11 @@ impl Pipeline {
     /// takeover over every board link.
     async fn init_hw(&mut self, tables: &Tables<'_>, links: &[Connector]) -> Result<(), Error> {
         for (reg, value) in [
+            // linux: n/a (literal in dcn20_dccg.c:dccg2_init)
             (MICROSECOND_TIME_BASE_DIV, 0x0012_0264),
+            // linux: n/a (literal in dcn20_dccg.c:dccg2_init)
             (MILLISECOND_TIME_BASE_DIV, 0x0011_86a0),
+            // linux: n/a (literal in dcn20_dccg.c:dccg2_init)
             (DISPCLK_FREQ_CHANGE_CNTL, 0x0e01_003c),
             (REFCLK_CNTL, 0),
         ] {
@@ -987,13 +1016,16 @@ impl Pipeline {
     async fn power_on_plane(&mut self) -> Result<(), Error> {
         let pipe = u64::from(self.route.pipe);
         let request = self.d2(DC_IP_REQUEST_CNTL);
-        self.regs.write(request, 1)?;
+        self.regs.write(request, 1)?; // linux-lit: 1=DC_IP_REQUEST_CNTL__IP_REQUEST_EN_MASK
         if self.route.pipe != 5 {
+            // linux: n/a (pipe 5 power gating de-featured, dcn20_hwseq.c)
+            // linux-lit: 2=mmDOMAIN1_PG_CONFIG - mmDOMAIN0_PG_CONFIG
             for domain in [2 * pipe + 1, 2 * pipe] {
                 let config = self.d2(DOMAIN0_PG_CONFIG + 2 * domain);
                 self.regs.update(config, DOMAIN_POWER_GATE, 0)?;
                 if !self
                     .regs
+                    // linux-lit: 4=(mmDOMAIN0_PG_STATUS - mmDOMAIN0_PG_CONFIG) * 4
                     .wait(config + 4, DOMAIN_PGFSM_PWR_STATUS, 0, 1, 1000)
                     .await?
                 {
@@ -1017,12 +1049,17 @@ impl Pipeline {
         let hubp = u64::from(self.route.pipe) * HUBP_STRIDE;
         self.regs.write(
             self.d2(HUBP0_DCN_CUR0_TTU_CNTL0 + hubp),
+            // linux-lit: 0x007f_ffff=HUBPREQ0_DCN_CUR0_TTU_CNTL0__REFCYC_PER_REQ_DELIVERY_MASK
             ttu.refcyc_per_req_delivery & 0x007f_ffff
+                // linux-lit: 24=HUBPREQ0_DCN_CUR0_TTU_CNTL0__QoS_LEVEL_FIXED__SHIFT
+                // linux-lit: 0xf=HUBPREQ0_DCN_CUR0_TTU_CNTL0__QoS_LEVEL_FIXED_MASK >> 24
                 | (ttu.qos_level_fixed & 0xf) << 24
+                // linux-lit: 28=HUBPREQ0_DCN_CUR0_TTU_CNTL0__QoS_RAMP_DISABLE__SHIFT
                 | (ttu.qos_ramp_disable & 1) << 28,
         )?;
         self.regs.write(
             self.d2(HUBP0_DCN_CUR0_TTU_CNTL1 + hubp),
+            // linux-lit: 0x007f_ffff=HUBPREQ0_DCN_CUR0_TTU_CNTL1__REFCYC_PER_REQ_DELIVERY_PRE_MASK
             ttu.refcyc_per_req_delivery_pre & 0x007f_ffff,
         )
     }
@@ -1070,6 +1107,7 @@ impl Pipeline {
     fn read_underflow(&mut self) -> Result<Option<Underflow>, Error> {
         let (optc, hubp) = self.underflow_regs();
         let otg = self.regs.read(optc)? & OPTC_UNDERFLOW_OCCURRED_STATUS != 0;
+        // linux-lit: 28=HUBP0_DCHUBP_CNTL__HUBP_UNDERFLOW_STATUS__SHIFT
         let hubp = ((self.regs.read(hubp)? & HUBP_UNDERFLOW_STATUS) >> 28) as u8;
         Ok((otg || hubp != 0).then_some(Underflow { otg, hubp }))
     }
@@ -1377,17 +1415,19 @@ impl Pipeline {
         // DPRX_FEATURE_ENUMERATION_LIST (DPCD 1.4+): SST_SPLIT_SDP_CAP bit 1,
         // VSC_SDP_COLORIMETRY_SUPPORTED bit 3.
         let mut feature = [0u8];
+        // linux-lit: 0x14=DP_DPCD_REV_14
         if caps[0] >= 0x14 {
             aux.read(dp::DPCD_DPRX_FEATURE_ENUMERATION_LIST, &mut feature)
                 .await?;
         }
+        // linux: n/a (1 << 3 = DP_VSC_SDP_EXT_FOR_COLORIMETRY_SUPPORTED)
         let vsc_colorimetry = feature[0] & 1 << 3 != 0;
         let vsc = vsc_colorimetry.then(|| dp::vsc_packet(Depth::Bpc8));
         self.dp_stream.set_stream_attribute(
             timing,
             Depth::Bpc8,
             vsc_colorimetry,
-            feature[0] & 1 << 1 != 0,
+            feature[0] & 1 << 1 != 0, // linux: n/a (1 << 1 = DP_SST_SPLIT_SDP_CAP)
         )?;
         self.dp_stream.update_info_packets(vsc.as_ref()).await?;
         // enable_link_dp: the PHY clock floor (dcn30_notify_link_rate_change,

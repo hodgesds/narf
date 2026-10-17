@@ -30,11 +30,13 @@ const fn codec(codec: u32, max_width: u32, max_height: u32, max_level: u32) -> C
     }
 }
 /// nv.c `sc_video_codecs_encode_array`.
+// linux: n/a (struct initializers: nv.c sc_video_codecs_encode_array)
 pub const ENCODE: [Codec; 2] = [
     codec(AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_MPEG4_AVC, 4096, 4096, 0),
     codec(AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_HEVC, 8192, 4352, 0),
 ];
 /// nv.c `sc_video_codecs_decode_array_vcn0`.
+// linux: n/a (struct initializers: nv.c sc_video_codecs_decode_array_vcn0)
 pub const DECODE_VCN0: [Codec; 8] = [
     codec(AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_MPEG2, 1920, 1088, 3),
     codec(AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_MPEG4, 1920, 1088, 5),
@@ -46,6 +48,7 @@ pub const DECODE_VCN0: [Codec; 8] = [
     codec(AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_AV1, 8192, 4352, 0),
 ];
 /// nv.c `sc_video_codecs_decode_array_vcn1`: VCN1 has no AV1 decoder.
+// linux: n/a (struct initializers: nv.c sc_video_codecs_decode_array_vcn1)
 pub const DECODE_VCN1: [Codec; 7] = [
     DECODE_VCN0[0],
     DECODE_VCN0[1],
@@ -60,11 +63,13 @@ pub const DECODE_VCN1: [Codec; 7] = [
 /// mask. `None` is Linux's -EINVAL: every instance harvested or an unknown
 /// subquery.
 pub fn codecs(kind: u32, harvested: u8) -> Option<&'static [Codec]> {
+    // linux-lit: 3=AMDGPU_VCN_HARVEST_VCN0 | AMDGPU_VCN_HARVEST_VCN1
     if harvested & 3 == 3 {
         return None;
     }
     match kind {
         AMDGPU_INFO_VIDEO_CAPS_ENCODE => Some(&ENCODE),
+        // linux-lit: 1=AMDGPU_VCN_HARVEST_VCN0
         AMDGPU_INFO_VIDEO_CAPS_DECODE if harvested & 1 != 0 => Some(&DECODE_VCN1),
         AMDGPU_INFO_VIDEO_CAPS_DECODE => Some(&DECODE_VCN0),
         _ => None,

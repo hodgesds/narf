@@ -18,16 +18,18 @@
 const fn bit(n: u32) -> u64 {
     1 << n
 }
-pub const SMU_DPM_UCLK: u64 = bit(3);
-pub const SMU_DPM_FCLK: u64 = bit(4);
-pub const SMU_MEM_VDDCI_SCALING: u64 = bit(10);
-pub const SMU_MEM_MVDD_SCALING: u64 = bit(11);
+pub const SMU_DPM_UCLK: u64 = bit(3); // linux-lit: 3=FEATURE_DPM_UCLK_BIT
+pub const SMU_DPM_FCLK: u64 = bit(4); // linux-lit: 4=FEATURE_DPM_FCLK_BIT
+pub const SMU_MEM_VDDCI_SCALING: u64 = bit(10); // linux-lit: 10=FEATURE_MEM_VDDCI_SCALING_BIT
+pub const SMU_MEM_MVDD_SCALING: u64 = bit(11); // linux-lit: 11=FEATURE_MEM_MVDD_SCALING_BIT
 /// DS_GFXCLK, DS_SOCCLK, DS_FCLK, DS_LCLK, DS_DCEFCLK, DS_UCLK, GFX_ULV.
+// linux-lit: 12=FEATURE_DS_GFXCLK_BIT; 13=FEATURE_DS_SOCCLK_BIT; 14=FEATURE_DS_FCLK_BIT; 15=FEATURE_DS_LCLK_BIT; 16=FEATURE_DS_DCEFCLK_BIT; 17=FEATURE_DS_UCLK_BIT; 18=FEATURE_GFX_ULV_BIT
 pub const SMU_DEEP_SLEEP: u64 = bit(12) | bit(13) | bit(14) | bit(15) | bit(16) | bit(17) | bit(18);
-pub const SMU_GFXOFF: u64 = bit(20);
-pub const SMU_BACO: u64 = bit(21);
-pub const SMU_MM_DPM_PG: u64 = bit(22);
+pub const SMU_GFXOFF: u64 = bit(20); // linux-lit: 20=FEATURE_GFXOFF_BIT
+pub const SMU_BACO: u64 = bit(21); // linux-lit: 21=FEATURE_BACO_BIT
+pub const SMU_MM_DPM_PG: u64 = bit(22); // linux-lit: 22=FEATURE_MM_DPM_PG_BIT
 /// MMHUB_PG, ATHUB_PG.
+// linux-lit: 40=FEATURE_MMHUB_PG_BIT; 41=FEATURE_ATHUB_PG_BIT
 pub const SMU_HUB_PG: u64 = bit(40) | bit(41);
 
 /// Policy switches the SMU/RLC could flip once admitted.

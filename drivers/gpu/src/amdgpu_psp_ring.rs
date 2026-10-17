@@ -11,12 +11,21 @@ use core::sync::atomic::{fence, Ordering};
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
+// linux-ctx: hdr=mp seg=0
+// linux: mmMP0_SMN_C2PMSG_64
 const CTRL: u32 = 0x80;
+// linux: mmMP0_SMN_C2PMSG_67
 const WPTR: u32 = 0x83;
+// linux: mmMP0_SMN_C2PMSG_69
 const RING_LO: u32 = 0x85;
+// linux: mmMP0_SMN_C2PMSG_70
 const RING_HI: u32 = 0x86;
+// linux: mmMP0_SMN_C2PMSG_71
 const RING_SIZE: u32 = 0x87;
+// linux: mmMP0_SMN_C2PMSG_81
 const SOS: u32 = 0x91;
+// linux-ctx: reset
+// linux: GFX_FLAG_RESPONSE
 const RESPONSE: u32 = 1 << 31;
 /// psp_v{11_0,13_0,13_0_4,14_0}_ring_create write `ring_type << 16` with
 /// `PSP_RING_TYPE__KM` (2, formerly GPCOM), i.e. GFX_CTRL_CMD_ID_INIT_GPCOM_RING.
@@ -24,11 +33,17 @@ const RESPONSE: u32 = 1 << 31;
 const CREATE: u32 = crate::amdgpu_psp::gfx_ctrl_cmd_id::INIT_GPCOM_RING;
 /// GFX_CTRL_CMD_ID_DESTROY_RINGS (psp_v*_ring_stop).
 const DESTROY: u32 = crate::amdgpu_psp::gfx_ctrl_cmd_id::DESTROY_RINGS;
+// linux: n/a (NARF buffer layout: cmd buffer after the 0x1000-byte KM ring)
 const COMMAND: u64 = 4096;
+// linux: n/a (NARF buffer layout: fence after the PSP_CMD_BUFFER_SIZE cmd buffer)
 const FENCE: u64 = 8192;
+// linux: n/a (NARF buffer layout: ring + cmd + fence)
 const BUFFER_SIZE: u64 = 12288;
+// linux: n/a (MMIO_REG_HOLE_OFFSET = 0x80000 - PAGE_SIZE in nbio_v2_3.c, 4 KiB pages)
 const HDP_HOLE: u64 = 0x7f000;
+// linux: n/a (NARF bound)
 const MAX_IMAGE: usize = 16 * 1024 * 1024;
+// linux: n/a (PSP_TMR_SIZE(adev) = 0x400000 for non-Aldebaran, amdgpu_psp.h)
 const DEFAULT_TMR_SIZE: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,9 +74,13 @@ struct Reply {
 }
 
 /// Linux leaves the size/version and RBI-only header fields zero for GPCOM.
+// linux-lit: 256=sizeof(struct psp_gfx_cmd_resp) / 4
 fn command(id: u32, args: &[u32]) -> [u32; 256] {
+    // linux-lit: 256=sizeof(struct psp_gfx_cmd_resp) / 4
     let mut words = [0; 256];
+    // linux-lit: 2=offsetof(struct psp_gfx_cmd_resp, cmd_id) / 4
     words[2] = id;
+    // linux-lit: 7=offsetof(struct psp_gfx_cmd_resp, cmd) / 4
     words[7..7 + args.len()].copy_from_slice(args);
     words
 }
@@ -120,7 +139,9 @@ impl Io for Mmio {
     fn setup_hdp(&mut self) -> bool {
         // SAFETY: exact supported NBIO bank and the 4 KiB remap hole are bounded.
         unsafe {
+            // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
             self.regs.write32(self.nbio + 0x12d * 4, HDP_HOLE as u32);
+            // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
             self.regs.read32(self.nbio + 0x12d * 4) == HDP_HOLE as u32
         }
     }
@@ -130,6 +151,7 @@ impl Io for Mmio {
         // Linux posts this write by reading MEMSIZE, not the remapped register.
         unsafe {
             self.regs.write32(HDP_HOLE, 0);
+            // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
             self.regs.read32(self.nbio + 0xc3 * 4);
         }
         fence(Ordering::SeqCst);
@@ -171,8 +193,9 @@ struct Engine<I: Io> {
 }
 /// psp_cmd_submit_buf: `psp_timeout` (20000) polls of usleep_range(60, 100),
 /// i.e. up to ~2 s before the fence is declared lost.
+// linux: n/a (NARF bound for psp_cmd_submit_buf's psp_timeout polls)
 const FENCE_TIMEOUT_MS: u64 = 2000;
-const GFX_CMD_ID_DESTROY_TMR: u32 = 7;
+const GFX_CMD_ID_DESTROY_TMR: u32 = 7; // linux: GFX_CMD_ID_DESTROY_TMR
 async fn delay(ms: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms).as_instant()).await;
 }
@@ -195,10 +218,11 @@ impl<I: Io> Engine<I> {
                 return Err(Error::DeviceGone);
             }
             if value & RESPONSE != 0 {
+                // linux-lit: 0xffff=GFX_CMD_STATUS_MASK
                 return if value & 0xffff == 0 {
                     Ok(())
                 } else {
-                    Err(Error::Rejected(value & 0xffff))
+                    Err(Error::Rejected(value & 0xffff)) // linux-lit: 0xffff=GFX_CMD_STATUS_MASK
                 };
             }
             if deadline.expired() {
@@ -236,6 +260,7 @@ impl<I: Io> Engine<I> {
         self.access(|io| {
             io.write(RING_LO, address as u32);
             io.write(RING_HI, (address >> 32) as u32);
+            // linux: n/a (literal ring->ring_size = 0x1000 in amdgpu_psp.c:psp_ring_init)
             io.write(RING_SIZE, 4096);
             io.write(CTRL, CREATE);
         })?;
@@ -254,6 +279,7 @@ impl<I: Io> Engine<I> {
             return Err(Error::Busy);
         }
         let wptr = self.access(|io| io.read(WPTR))?;
+        // linux-lit: 16=sizeof(struct psp_gfx_rb_frame) / 4
         if wptr >= 1024 || wptr % 16 != 0 {
             return Err(Error::Invalid);
         }
@@ -266,17 +292,22 @@ impl<I: Io> Engine<I> {
             for (i, value) in words.iter().enumerate() {
                 io.write_mem(COMMAND + i as u64 * 4, *value);
             }
+            // linux-lit: 16=sizeof(struct psp_gfx_rb_frame) / 4
             let mut frame = [0u32; 16];
+            // linux-lit: 0=offsetof(struct psp_gfx_rb_frame, cmd_buf_addr_lo) / 4
             frame[0] = (address + COMMAND) as u32;
+            // linux-lit: 1=offsetof(struct psp_gfx_rb_frame, cmd_buf_addr_hi) / 4
             frame[1] = ((address + COMMAND) >> 32) as u32;
+            // linux-lit: 3=offsetof(struct psp_gfx_rb_frame, fence_addr_lo) / 4
             frame[3] = (address + FENCE) as u32;
+            // linux-lit: 4=offsetof(struct psp_gfx_rb_frame, fence_addr_hi) / 4
             frame[4] = ((address + FENCE) >> 32) as u32;
-            frame[5] = seq;
+            frame[5] = seq; // linux-lit: 5=offsetof(struct psp_gfx_rb_frame, fence_value) / 4
             for (i, value) in frame.iter().enumerate() {
                 io.write_mem(wptr as u64 * 4 + i as u64 * 4, *value);
             }
             io.flush();
-            io.write(WPTR, (wptr + 16) % 1024);
+            io.write(WPTR, (wptr + 16) % 1024); // linux-lit: 16=sizeof(struct psp_gfx_rb_frame) / 4
         })?;
         let deadline = narf_time::Deadline::after_ms(FENCE_TIMEOUT_MS);
         loop {
@@ -296,10 +327,14 @@ impl<I: Io> Engine<I> {
         let (status, reply) = self.access(|io| {
             io.invalidate();
             (
+                // linux-lit: 864=offsetof(struct psp_gfx_cmd_resp, resp.status)
                 io.read_mem(COMMAND + 864),
                 Reply {
+                    // linux-lit: 872=offsetof(struct psp_gfx_cmd_resp, resp.fw_addr_lo)
                     address: io.read_mem(COMMAND + 872) as u64
+                        // linux-lit: 876=offsetof(struct psp_gfx_cmd_resp, resp.fw_addr_hi)
                         | (io.read_mem(COMMAND + 876) as u64) << 32,
+                    // linux-lit: 880=offsetof(struct psp_gfx_cmd_resp, resp.tmr_size)
                     tmr_size: io.read_mem(COMMAND + 880),
                 },
             )
@@ -433,8 +468,11 @@ impl Layout {
         if [base, top, offset].contains(&u32::MAX) {
             return Err(Error::DeviceGone);
         }
+        // linux-lit: 0xffffff=GCMC_VM_FB_LOCATION_BASE__FB_BASE_MASK
         let fb_base = (base as u64 & 0xffffff) << 24;
+        // linux-lit: 0xffffff=GCMC_VM_FB_LOCATION_TOP__FB_TOP_MASK
         let fb_end = ((top as u64 & 0xffffff) + 1) << 24;
+        // linux-lit: 0xffffff=GCMC_VM_FB_OFFSET__FB_OFFSET_MASK
         let fb_offset = (offset as u64 & 0xffffff) << 24;
         let pool_offset = pool.address().checked_sub(fb_base).ok_or(Error::Invalid)?;
         let mapping = pool.mapping();
@@ -514,8 +552,10 @@ impl Layout {
                 {
                     return Err(Error::Unsupported);
                 }
+                // linux-lit: 0=mmMP0_SMN_C2PMSG_81_BASE_IDX
                 let mp0 = bank(gpu, discovery::HW_ID_MP0, &[(11, 0, 11)], 0, SOS)?;
                 // Navi22's cold-boot SMC path requires this exact MP1 mailbox.
+                // linux-lit: 0=mmMP1_SMN_C2PMSG_90_BASE_IDX; 0x29a=mmMP1_SMN_C2PMSG_90
                 bank(gpu, discovery::HW_ID_MP1, &[(11, 0, 11)], 0, 0x29a)?;
                 bank(gpu, discovery::HW_ID_SDMA0, &[(5, 2, 2)], 0, 0)?;
                 // Linux nv.c uses nbio_v2_3 for these revisions; MEMSIZE and
@@ -532,12 +572,14 @@ impl Layout {
                         (3, 3, 2),
                         (3, 3, 3),
                     ],
-                    2,
-                    0x12d,
+                    2,     // linux-lit: 2=mmREMAP_HDP_MEM_FLUSH_CNTL_BASE_IDX
+                    0x12d, // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
                 )?;
                 // GMC10 location/offset, not DCN314's similarly named registers.
                 // This also pins the GC and works without an active display.
+                // linux-lit: 0=mmGCMC_VM_FB_LOCATION_TOP_BASE_IDX; 0x16fd=mmGCMC_VM_FB_LOCATION_TOP
                 let gc = bank(gpu, discovery::HW_ID_GC, &[(10, 3, 2)], 0, 0x16fd)?;
+                // linux-lit: 0x16fc=mmGCMC_VM_FB_LOCATION_BASE; 0x16fd=mmGCMC_VM_FB_LOCATION_TOP; 0x16e7=mmGCMC_VM_FB_OFFSET
                 (mp0, nbio, gc + 0x16fc * 4, gc + 0x16fd * 4, gc + 0x16e7 * 4)
             }
         };
@@ -553,8 +595,8 @@ impl Layout {
                 (5, 2, 0),
                 (5, 2, 1),
             ],
-            0,
-            0xd1,
+            0,    // linux-lit: 0=mmHDP_READ_CACHE_INVALIDATE_BASE_IDX
+            0xd1, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
         )?;
         let ip = discovery::find_ip(&gpu.ip_blocks, discovery::HW_ID_HDP, 0)
             .ok_or(Error::Unsupported)?;
@@ -563,8 +605,11 @@ impl Layout {
         }
         let gfx_status_regs = if kind == Kind::Navi22 {
             // Linux gc_10_1_0_offset.h: CP_STAT index 0, RLC status index 1.
+            // linux-lit: 0=mmCP_STAT_BASE_IDX; 0xf40=mmCP_STAT
             let cp = bank(gpu, discovery::HW_ID_GC, &[(10, 3, 2)], 0, 0xf40)?;
+            // linux-lit: 1=mmRLC_RLCS_BOOTLOAD_STATUS_BASE_IDX; 0x4e8d=mmRLC_RLCS_BOOTLOAD_STATUS
             let rlc = bank(gpu, discovery::HW_ID_GC, &[(10, 3, 2)], 1, 0x4e8d)?;
+            // linux-lit: 0xf40=mmCP_STAT; 0x4e8d=mmRLC_RLCS_BOOTLOAD_STATUS
             Some((cp + 0xf40 * 4, rlc + 0x4e8d * 4))
         } else {
             None
@@ -573,7 +618,7 @@ impl Layout {
             mp0,
             nbio,
             invalidate_reg: ((ip.major, ip.minor, ip.revision) != (5, 2, 1))
-                .then_some(hdp + 0xd1 * 4),
+                .then_some(hdp + 0xd1 * 4), // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
             fb_base,
             fb_top,
             fb_offset,
@@ -825,7 +870,7 @@ impl Psp {
             return Err(Error::Unsupported);
         }
         self.session
-            .load_ip(signed_instructions, 51)
+            .load_ip(signed_instructions, 51) // linux-lit: 51=GFX_FW_TYPE_DMUB
             .await
             .map(|_| ())
     }
@@ -995,6 +1040,7 @@ impl<I: Io> Session<I> {
             let (address, size) = self.stage(payload).await?;
             let result = self
                 .engine
+                // linux-lit: 0x20=GFX_CMD_ID_LOAD_TOC
                 .submit(&load_command(0x20, address, size, 0))
                 .await;
             self.release_payload();
@@ -1007,6 +1053,7 @@ impl<I: Io> Session<I> {
         }
         let tmr = self
             .pool
+            // linux: n/a (1 << 20 is PSP_TMR_ALIGNMENT, amdgpu_psp.h)
             .reserve_aligned(size, 1 << 20)
             .map_err(|_| Error::Allocation)?;
         tmr.address()
@@ -1029,11 +1076,12 @@ impl<I: Io> Session<I> {
         tmr.publish();
         self.engine
             .submit(&command(
-                5,
+                5, // linux-lit: 5=GFX_CMD_ID_SETUP_TMR
                 &[
                     address as u32,
                     (address >> 32) as u32,
                     size as u32,
+                    // linux: n/a (tmr_flags bitfield.virt_phy_addr = 1, bit 1; amdgpu_psp.c:psp_prep_tmr_cmd_buf)
                     2,
                     physical as u32,
                     (physical >> 32) as u32,
@@ -1058,6 +1106,7 @@ impl<I: Io> Session<I> {
         let (address, size) = self.stage(bytes).await?;
         let result = self
             .engine
+            // linux-lit: 6=GFX_CMD_ID_LOAD_IP_FW
             .submit(&load_command(6, address, size, firmware_type))
             .await;
         self.release_payload();
@@ -1072,7 +1121,7 @@ impl<I: Io> Session<I> {
             return Err(Error::Busy);
         }
         self.smc_state = SmcState::Pending;
-        let result = self.load_ip(bytes, 18).await.map(|_| ()); // GFX_FW_TYPE_SMU
+        let result = self.load_ip(bytes, 18).await.map(|_| ()); // linux-lit: 18=GFX_FW_TYPE_SMU
         self.smc_state = if result.is_ok() {
             SmcState::Loaded
         } else {
@@ -1093,6 +1142,7 @@ impl<I: Io> Session<I> {
             return Err(Error::Busy);
         }
         self.smc_state = SmcState::Pending;
+        // linux-lit: 18=GFX_FW_TYPE_SMU
         let result = self.load_ip_unchecked(bytes, 18).await.map(|_| ());
         self.smc_state = if result.is_ok() {
             SmcState::Loaded
@@ -1163,16 +1213,20 @@ impl<I: Io> Session<I> {
                     .flat_map(|i| i.payloads())
                     .find(|p| p.firmware_type() == kind);
                 let Some(payload) = payload else {
+                    // linux-lit: 22=GFX_FW_TYPE_RLC_RESTORE_LIST_SRM_CNTL; 20=GFX_FW_TYPE_RLC_RESTORE_LIST_GPM_MEM; 21=GFX_FW_TYPE_RLC_RESTORE_LIST_SRM_MEM; 26=GFX_FW_TYPE_RLC_IRAM; 48=GFX_FW_TYPE_RLC_DRAM_BOOT
                     if matches!(kind, 22 | 20 | 21 | 26 | 48) {
                         continue;
                     }
                     return Err(Error::Invalid);
                 };
                 let reply = self.load_ip(payload.bytes(), kind).await?;
+                // linux-lit: 13=GFX_FW_TYPE_VCN; 51=GFX_FW_TYPE_DMUB
                 if matches!(kind, 13 | 51) {
                     self.record_media(reply, kind)?;
                 }
+                // linux-lit: 8=GFX_FW_TYPE_RLC_G
                 if kind == 8 {
+                    // linux-lit: 0x21=GFX_CMD_ID_AUTOLOAD_RLC
                     self.engine.submit(&command(0x21, &[])).await?;
                 }
             }
@@ -1196,7 +1250,7 @@ impl<I: Io> Session<I> {
             return Err(Error::Invalid);
         }
         match kind {
-            13 => self.media_firmware.vcn = Some(reply.address),
+            13 => self.media_firmware.vcn = Some(reply.address), // linux-lit: 13=GFX_FW_TYPE_VCN
             crate::amdgpu_gfx_firmware::VCN1_TYPE => self.media_firmware.vcn1 = Some(reply.address),
             _ => self.media_firmware.dmcub = Some(reply.address),
         }
@@ -1223,6 +1277,7 @@ impl<I: Io> Session<I> {
             if image.source() == crate::amdgpu_gfx_firmware::Source::Rlc {
                 // Linux starts RLC immediately after RLC_G, before the later
                 // VCN and DMCUB uploads. Never delay/replay autoload for media.
+                // linux-lit: 0x21=GFX_CMD_ID_AUTOLOAD_RLC
                 self.engine.submit(&command(0x21, &[])).await?;
             }
         }
@@ -1253,6 +1308,7 @@ impl<I: Io> Session<I> {
             if status.cp_stat == u32::MAX || status.rlc_bootload == u32::MAX {
                 return Err(Error::DeviceGone);
             }
+            // linux-lit: 31=RLC_RLCS_BOOTLOAD_STATUS__BOOTLOAD_COMPLETE__SHIFT
             if status.cp_stat == 0 && status.rlc_bootload & (1 << 31) != 0 {
                 return Ok(status);
             }
@@ -1270,7 +1326,7 @@ impl<I: Io> Session<I> {
             if self.engine.state != State::Ready {
                 return Err(Error::Busy);
             }
-            self.engine.submit(&command(7, &[])).await?;
+            self.engine.submit(&command(7, &[])).await?; // linux-lit: 7=GFX_CMD_ID_DESTROY_TMR
             self.tmr_ready = false;
             if let Some(mut tmr) = self.tmr.take() {
                 // SAFETY: caller stopped all engines; PSP acknowledged TMR release.
@@ -1300,7 +1356,7 @@ pub(crate) fn toc_payload(bytes: &[u8]) -> Result<&[u8], Error> {
         .ok_or(Error::Invalid)?;
     if bytes.len() > MAX_IMAGE + 4096
         || h.size_bytes as usize != bytes.len()
-        || h.header_size_bytes < 44
+        || h.header_size_bytes < 44 // linux-lit: 44=sizeof(struct psp_firmware_header_v1_0)
         || (h.header_version_major, h.header_version_minor) != (1, 0)
         || h.ucode_array_offset_bytes < h.header_size_bytes
         || h.ucode_size_bytes == 0
