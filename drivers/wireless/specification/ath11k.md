@@ -207,6 +207,91 @@ credits, frame }` out.
   Linux reads past a TLV unchecked, NARF rejects ("NARF-stricter" in
   the source).
 
+### 3.3 HAL SRNG (`hal.rs`, Linux `hal.{c,h}`)
+
+Register I/O through `power::ChipIo` (`ath11k_hif_read32/write32`:
+SRNG R0/R2 blocks are windowed, shadow registers direct). Units are
+Linux's: entry size / ring size / HP / TP in 32-bit words.
+
+- `hw::HalRegs` (`qca6390_regs`, `wcn6855_regs`), `HwParams::{regs,
+  host_ce_config, supports_shadow_regs, credit_flow, ring_mask}`,
+  `hw::RING_MASK_QCA6390`, `hw::HW_HAL_PARAMS_QCA6390`.
+- `HalRingType` (21 types), `ring_id::*`, `SRNG_CONFIG_TEMPLATE`
+  (`hw_srng_config_template`), `create_config(&HalRegs)`,
+  `get_ring_id`, `RingRegOffsets` (the `*_OFFSET(ab)` macros).
+- `Hal::new(&HwParams)` = `ath11k_hal_srng_init` (rdp / wrp in DMA32)
+  plus the probe-time shadow assignment; `Hal::srng_setup(io, type,
+  ring_num, mac_id, SrngParams)` = `ath11k_hal_srng_setup` with
+  `src_hw_init` / `dst_hw_init` / `ce_dst_setup` (takes ownership of the
+  ring memory, returns the ring id).
+- Access: `access_begin`, `access_end`, `src_get_next_entry`,
+  `src_reap_next`, `src_get_next_reaped`, `src_peek`, `src_next_peek`,
+  `dst_get_next_entry`, `dst_peek`, `src_num_free`, `dst_num_free`,
+  `desc_rd` / `desc_wr` (entries are word offsets into the ring),
+  `get_hp_addr` / `get_tp_addr` (LMAC), `shadow_update_hp_tp`.
+- CE descriptors: `HalCeSrngSrcDesc` / `DestDesc` / `DstStatusDesc`
+  (16 / 8 / 16 B), `ce_src_desc_words`, `ce_dst_desc_words`,
+  `Hal::ce_{src,dst}_set_desc`, `Hal::ce_dst_status_get_length`
+  (reads and clears the length, as Linux).
+- **Shadow register v2 list for QMI `WLAN_CFG`:**
+  `hal::shadow_reg_v2(&HwParams) -> Option<ShadowConfig>`;
+  `ShadowConfig::as_slice()` is `wlfw_wlan_cfg_req.shadow_reg_v2[]`
+  (`None` ⇒ `shadow_reg_v2_valid = 0`). Same order as Linux
+  `ath11k_ce_get_shadow_config`: non-CE non-LMAC rings by type then
+  ring number, then per CE src / dst / dst-status; each entry is the
+  ring's HP register (SRC) or TP register (= HP + 4, DST). Shadow
+  register *n* is BAR0 `hal_shadow_base_addr + 4n` (`shadow_reg`).
+  WCN6855 (all HW2.x family parts) yields 30 entries:
+  `a3b034 a3b03c a3b044 a3b04c a3b064 a3b028 a3b020 a3b07c a46000
+  a46008 a46010 a46018 a46034 a370b0 a37018 a370c4 a370cc a370d4
+  a370dc a370e4 1b80400 1b83400 1b8340c 1b85400 1b8540c 1b86400
+  1b88400 1b8b400 1b8b40c 1b8e400` (pinned in `hal_tests.rs` as
+  `WCN6855_SHADOW_REG_V2`). `Hal`/`Ce` use exactly this list, so the
+  firmware and the host agree on which shadow register mirrors which
+  ring.
+- `TransportError { step, detail, errno }` + `report()` (latch +
+  console line). Steps: HAL 80–88, CE 90–101 (`hal::step`,
+  `ce::step`).
+
+### 3.4 Copy Engines (`ce.rs`, Linux `ce.{c,h}`, `pcic.c` CE part)
+
+- `CeAttr`, `HOST_CE_CONFIG_QCA6390` (9 CEs), `HOST_CE_CONFIG_QCN9074`.
+- `Ce::alloc(&HwParams, CeMsi, clock)` (HAL init + `ath11k_ce_alloc_pipes`
+  + shadow config), `Ce::shadow_reg_v2()`, `Ce::init_pipes(io)`,
+  `Ce::start(io)` (CE IRQs on + `ath11k_ce_rx_post_buf`), `Ce::stop()`.
+- `Ce::send(io, pipe, &[u8], transfer_id)` = `ath11k_ce_send` (copies
+  into the slot's DMA32 bounce buffer); `Ce::take_rx(pipe)` /
+  `take_rx_any()` / `rx_pending(pipe)`; `Ce::take_tx_done(pipe)` (only
+  without credit flow).
+- Completion: `Ce::per_engine_service(io, ce)`; `Ce::service(io,
+  pending_mask)` = the pending CEs, a poll of every other
+  interrupt-enabled CE (`CeStats::polled_without_irq`), CE4's shadow HP
+  refresh timer and the RX replenish retry; `Ce::wait_and_service` and
+  `Ce::recv(io, irq, pipe, slice_ms, timeout_ms)` (async RX stream)
+  over a `CeIrq` (`MsiCeIrq` on hardware).
+- MSI: `ce_msi_idx`, `ce_ring_msi` (ring MSI address/data),
+  `ce_irq_vector` (`(idx % n) + base_vector` of the "CE" user),
+  `ce_vector_cookie`, `install_ce_irq_handlers` (adds a handler on the
+  CE vectors, no `pci.rs` change), `set_ce_irqs_enabled`
+  (`ATH11K_FLAG_CE_IRQ_ENABLED`). On PCI there is no CE interrupt
+  enable register (`CE_HOST_IE_*` is AHB-only).
+
+### 3.5 DP descriptor layouts (`dp.rs`)
+
+Layouts only (runtime is phase 5): `BufferAddr`, `HalTlvHdr`,
+`RxMpduDesc`, `RxMsduDesc`, `HalReoDestRing` (64 B),
+`HalReoEntranceRing` (32), `HalTclDataCmd` (28; ring entry = TLV +
+28), `HalTclStatusRing` (32), `HalWbmReleaseRing` (32),
+`HalWbmLinkDesc` / `HalWbmBufferRing` (8), `HalRxDescWcn6855` (392,
+`hal_desc_sz`) with the `ath11k_hw_wcn6855_rx_desc_*` accessors, the
+`dp.h` ring sizes. Sizes and offsets are `const` assertions against
+`sizeof` / `offsetof` of the Linux structs.
+
+Tests: `hal_tests.rs`, `ce_tests.rs` (x86_64 kernel tests). The CE
+tests drive a fake chip that only knows what the host programmed
+(ring bases, sizes, pointer addresses, shadow mirroring) and moves data
+through the real DMA32 ring memory.
+
 ## 4. Invariants
 
 - The PCI table is exactly Linux's `ath11k_pci_id_table`.
@@ -224,8 +309,8 @@ card (QEMU emulates none) is exercised once, after phase 8.
 | 1 | MSI vectors, power-up (`soc_global_reset`, LTSSM, L1SS / ASPM handling) (**done**) | `pci.c`, `pcic.c` |
 | 2 | MHI host: context arrays, event rings, BHI SBL (512 KiB) + BHIe full image, EE/state machine to mission mode, IPCR ch 20/21 (**done**, offline) | `mhi.c`, `bus/mhi/host/*` |
 | 3 | QRTR over MHI + QMI encode/decode; WLFW handshake: host cap, ind register, respond mem, target cap, BDF (`board-2.bin` by bus/qmi-chip-id/board-id), M3 (`m3.bin`), regdb, wlan cfg, mode ON (**done** to FW_READY, offline; `firmware_start` waits for the CE shadow list) | `qmi.c`, `net/qrtr`, `soc/qcom/qmi_*` |
-| 4 | Copy Engines + HTC + WMI: service ready, init, ready; MAC from firmware | `ce.c`, `htc.c`, `wmi.c` |
-| 5 | HAL SRNG + DP rings (TCL, REO, WBM, RXDMA refill) | `hal*.c`, `dp.c` |
+| 4 | Copy Engines + HTC + WMI: service ready, init, ready; MAC from firmware (HAL SRNG core, CE pipes, shadow v2 list, HTC/WMI codecs **done, offline**; CE ↔ HTC wiring open) | `hal.c`, `ce.c`, `htc.c`, `wmi.c` |
+| 5 | DP rings (TCL, REO, WBM, RXDMA refill) on the HAL (descriptor layouts **done**) | `hal*.c`, `dp.c` |
 | 6 | Control: pdev/vdev, regulatory, scan → `BssInfo` list | `mac.c`, `wmi.c`, `reg.c` |
 | 7 | Connect: peer, auth/assoc via mgmt TX, EAPOL via `narf-wireless` supplicant, key install | `mac.c`, `wmi.c` |
 | 8 | Data path: TX (TCL → WBM completion), RX (REO dst → `Frame`); register `wlan%d` | `dp_tx.c`, `dp_rx.c` |
@@ -283,6 +368,22 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
 - Open: Linux prefers `firmware-2.bin` (an `amss.bin` IE) over
   `amss.bin` when present (`ath11k_fw_pre_init`); only `amss.bin` is
   loaded today.
+- HAL / CE deviations from Linux (deliberate): ring memory and CE
+  buffers are DMA32 coherent (Linux streams RX/TX skbs under a 36-bit
+  mask); each CE ring slot has a fixed bounce region instead of an skb;
+  `Ce::send` rejects sends over `src_sz_max` and pipes without a source
+  ring; `srng_setup` rejects short ring memory, oversize rings, double
+  setup and a missing shadow slot; CE interrupts are not masked in the
+  handler (MSI is edge; Linux's `disable_irq_nosync` → tasklet →
+  `enable_irq` becomes pending bits + task wake); the RX replenish
+  retry is 50 ms (Linux: 50 jiffies). Register reads ≥ `0xFE0` after
+  `DEVICE_INIT_DONE` would need `mhi_device_get_sync` on Linux
+  (`ath11k_pci_bus_wake_up`); HAL/CE only touch such registers during
+  ring setup, before that flag, and the shadow registers are below it.
+- Open: CE ↔ HTC wiring (feed `Ce::take_rx_any` into `Htc::rx`,
+  `HtcTx` into `Ce::send`), calling `install_ce_irq_handlers` with the
+  probe's `MsiState`, and the order relative to QMI (`Ce::alloc` +
+  `shadow_reg_v2()` before `WLAN_CFG`, `init_pipes` after FW ready).
 - Firmware: `cargo xtask import-firmware --vendor ath11k`
   decompresses the distro `.zst` blobs at image build time. Open:
   whether probe runs before the rootfs firmware scan, i.e. whether
