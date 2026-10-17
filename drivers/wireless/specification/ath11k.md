@@ -1,9 +1,9 @@
 # ath11k — Specification
 
-> Status: **v0.3** — PCI identify, power-up and the MHI host:
-> firmware boots to mission mode and the IPCR channels start
-> (offline-tested only). No control plane (QMI), no data path; no
-> network interface is registered.
+> Status: **v0.4** — PCI identify, power-up, the MHI host (firmware
+> to mission mode, IPCR started) and the WLFW QMI handshake over
+> QRTR to FW_READY (offline-tested only). No CE/HTC/WMI transport,
+> no data path; no network interface is registered.
 >
 > Qualcomm ath11k Wi-Fi 6 / 6E driver for PCIe host-attached
 > silicon (QCA6390 / WCN6855 / QCN9074). Adapted from Linux
@@ -69,8 +69,11 @@ BW scaling, RSC/offload/client-managed rings, EDL.
 - `pci::probe` — identify, power up, spawn the MHI bring-up task.
 - `pci::{read32, write32}` — Linux-equivalent register access.
 - `pci::{is_probed, with_controller}` — bound-device inspection.
-- `pci::{take_mhi, mhi_ready}` — the running MHI controller (IPCR
-  started) for the QRTR layer.
+- `pci::mhi_ready` — MHI reached mission mode with IPCR running.
+- `pci::{take_wlfw, wlfw_ready}` — the [`wlfw::Wlfw`] session parked
+  at FW_READY (owns the MHI controller, target memory, M3 image).
+  The CE/HAL phase takes it and calls `firmware_start(mode,
+  shadow_reg_v2)` once it has built the shadow-register list.
 - `mhi_host::MhiController::{queue_ul, take_dl, poll, wait_and_poll}`
   — IPCR UL send (`mhi_queue_skb(…, MHI_EOT)`) / DL receive.
 - `narf_io::alloc_coherent_masked` (32-bit coherent mask) backs every
@@ -115,6 +118,48 @@ Phase 3 groundwork — pure codecs, no MMIO, not yet wired to MHI:
 Tests: `qmi_tests.rs` (arch-neutral). WLFW golden vectors were
 produced by running Linux's own `qmi_encdec.c` on the ath11k ei
 tables.
+
+### 3.0 QRTR endpoint, QMI client, WLFW handshake
+
+- `qmi_client` — `QrtrPipe` (one QRTR packet per MHI transfer:
+  `send` / `poll` / `recv` / `wait` / `now_ms` / `log`; implemented by
+  `MhiController` over IPCR UL/DL) and `QmiClient<P>`: a `QrtrLink`
+  (local node 1) plus the ath11k QMI handle — client port
+  `QRTR_MIN_EPH_SOCKET` (0x4000), `add_lookup` (local NEW_LOOKUP
+  only), `pump` (DL frames → link; link replies HELLO / RESUME_TX →
+  UL; DATA to the client port → the waiting transaction or the
+  inbound queue), `request::<Req, Resp>(req, timeout)` =
+  `qmi_txn_init` (ids from 0, cyclic to 65534) + send (waits on QRTR
+  flow control) + `qmi_txn_wait` (match by `txn_id` only, decode with
+  the transaction's decoder), `wait_inbound`, `take_inbound`
+  (`ServerArrive` / `ServerExit` / indication bytes).
+- `wlfw` — `Wlfw<P, F: FirmwareLoader, A: DmaAllocator>`, the
+  `ath11k_qmi_driver_event_work` machine: `run_to_fw_ready()` (lookup
+  0x45 v1 ins `qmi_service_ins_id`; SERVER_ARRIVE → ind_register +
+  host_cap; REQUEST_MEM callback → `alloc_target_mem_chunk` (reuse,
+  ≤ 5-segment delayed path) → `respond_fw_mem_request`; FW_MEM_READY →
+  target_cap → regdb (`supports_regdb`, result ignored) → board data
+  (+ caldata for a BIN board) → `m3_info`; FW_READY / FW_INIT_DONE →
+  `FwReadyInfo`), and `firmware_start(mode, shadow_reg_v2)` =
+  wlan_ini (`fw_wmi_diag_event`) → wlan_cfg (QCA6390 CE + service
+  maps, shadow v2 clamped to 36) → wlan_mode. `WlfwConfig::pci(..)`
+  carries `ab->id`, `dev_name` (caldata name) and the timeouts.
+  Kernel impls: `NarfFirmware` (`narf_firmware::open`, no retry —
+  `amss.bin` already proved the store is up), `Dma32`
+  (`alloc_coherent_masked`, 32-bit mask). `step::*` (40–63) name every
+  failure; request failures carry `detail = kind << 16 | value`.
+- `board` — `board_name` (`__ath11k_core_create_board_name`, `%d`
+  ids, 199-byte cap, 40-byte variant), `bdf_search` / `regdb_search`
+  (Linux's fallback order), `fetch_board_data_api_n` (`board-2.bin`
+  magic + IE walk, Linux's never-reset name match and `-EINVAL` /
+  `-ENODATA` cases), `smbios_bdf_ext` (type 0xF8 decoder),
+  `build_board2` (test fixtures).
+
+Tests: `qmi_handshake_tests.rs` — a scripted fake WLFW firmware
+behind a fake pipe runs HELLO → FW_READY → `firmware_start`, every
+request compared byte for byte (encoders + inlined Linux goldens);
+board parser / names / SMBIOS; target memory with fake and real
+DMA32 allocators; negatives for every step.
 
 ### 3.1 HTC (`htc.rs`, Linux `htc.{c,h}`)
 
@@ -178,7 +223,7 @@ card (QEMU emulates none) is exercised once, after phase 8.
 | 0 | PCI identify, correct register access (**done**) | `pci.c`, `pcic.c` |
 | 1 | MSI vectors, power-up (`soc_global_reset`, LTSSM, L1SS / ASPM handling) (**done**) | `pci.c`, `pcic.c` |
 | 2 | MHI host: context arrays, event rings, BHI SBL (512 KiB) + BHIe full image, EE/state machine to mission mode, IPCR ch 20/21 (**done**, offline) | `mhi.c`, `bus/mhi/host/*` |
-| 3 | QRTR over MHI + QMI encode/decode; WLFW handshake: host cap, ind register, respond mem, target cap, BDF (`board-2.bin` by bus/qmi-chip-id/board-id), M3 (`m3.bin`), regdb, wlan cfg, mode ON | `qmi.c`, `net/qrtr`, `soc/qcom/qmi_*` |
+| 3 | QRTR over MHI + QMI encode/decode; WLFW handshake: host cap, ind register, respond mem, target cap, BDF (`board-2.bin` by bus/qmi-chip-id/board-id), M3 (`m3.bin`), regdb, wlan cfg, mode ON (**done** to FW_READY, offline; `firmware_start` waits for the CE shadow list) | `qmi.c`, `net/qrtr`, `soc/qcom/qmi_*` |
 | 4 | Copy Engines + HTC + WMI: service ready, init, ready; MAC from firmware | `ce.c`, `htc.c`, `wmi.c` |
 | 5 | HAL SRNG + DP rings (TCL, REO, WBM, RXDMA refill) | `hal*.c`, `dp.c` |
 | 6 | Control: pdev/vdev, regulatory, scan → `BssInfo` list | `mac.c`, `wmi.c`, `reg.c` |
@@ -206,7 +251,35 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   status line as well as the console.
 - MHI diag steps: `mhi_host::step` (10–35) latch through
   `diag::latch_wifi_error`; the stage moves to `transport` at the
-  first M0 and `fw-boot` at mission mode.
+  first M0 and `fw-boot` at mission mode. QMI steps are `wlfw::step`
+  (40–63), stage `control` from the start of the handshake.
+- HELLO ordering (decided, from Linux): the host never sends first.
+  `qrtr_ns_init` broadcasts its one HELLO from `qrtr_proto_init`
+  (`qrtr.ko` init), before `qcom_mhi_qrtr_probe` registers the
+  endpoint, and `qrtr_endpoint_register` sends nothing; the device's
+  HELLO is answered by `ctrl_cmd_hello` → `say_hello(sq)` (+ no local
+  servers to announce), then the device announces WLFW (NEW_SERVER
+  0x45, instance `1 | 1 << 8`).
+- Shadow registers: `wlan_cfg`'s v2 list comes from
+  `ath11k_hal_srng_shadow_config` + `ath11k_ce_shadow_config`, which
+  need the HAL SRNG tables (`hw_srng_config_template` + the WCN6855
+  register map) the HAL/CE phase ports. The handshake therefore parks
+  at FW_READY and `firmware_start` takes the list as a parameter —
+  sending a guessed list would misprogram the firmware.
+- Board variant: NARF parses no SMBIOS tables at runtime (only tests
+  call `narf_firmware_smbios::parse_stream`, and it drops OEM type
+  0xF8), so `bdf_ext` is empty and the full board name equals the
+  fallback name — what Linux uses when `ath11k_core_check_smbios`
+  finds no `BDF_` string. `board::smbios_bdf_ext` is ready for when
+  the table is retained.
+- NARF-only bounds: Linux waits forever for the WLFW server and for
+  REQUEST_MEM / FW_MEM_READY / FW_READY and for QRTR RESUME_TX, and
+  silently stalls when the memory-request callback cannot allocate;
+  here each wait is bounded (30 s, the 10 s transaction budget for
+  flow control) and fails with its own step.
+- Not ported (unreached on WCN6855 PCIe): fixed memory regions,
+  DEVICE_INFO, `fixed_bdf_addr`, recovery (SERVER_EXIT / a second
+  FW_INIT_DONE end the handshake), FTM, `firmware-N.bin` M3.
 - Open: Linux prefers `firmware-2.bin` (an `amss.bin` IE) over
   `amss.bin` when present (`ath11k_fw_pre_init`); only `amss.bin` is
   loaded today.
