@@ -246,6 +246,12 @@ impl<I: Io> Engine<I> {
         self.state = State::Programmed;
         Ok(())
     }
+    /// `optc1_program_timing` with a TMDS signal: start point and field
+    /// number zero.
+    fn program_tmds_timing(&mut self, timing: &Timing, sync: &GlobalSync) -> Result<(), Error> {
+        self.program_timing(timing, sync)?;
+        self.update(self.otg(OTG_CONTROL), 1 << 12 | 1 << 13, 0)
+    }
     fn otg_vtg(&self) -> u64 {
         let base = if self.profile == Profile::Navi22 {
             0x0528
@@ -374,6 +380,11 @@ impl Otg {
     /// Program the mode and its global sync positions. Refused while running.
     pub fn program_timing(&mut self, timing: &Timing, sync: &GlobalSync) -> Result<(), Error> {
         self.0.program_timing(timing, sync)
+    }
+    /// `optc1_program_timing` for a TMDS (HDMI/DVI) signal, which counts
+    /// from start point 0 rather than DisplayPort's first blank line.
+    pub fn program_tmds_timing(&mut self, timing: &Timing, sync: &GlobalSync) -> Result<(), Error> {
+        self.0.program_tmds_timing(timing, sync)
     }
     pub fn program_global_sync(&mut self, sync: &GlobalSync) -> Result<(), Error> {
         self.0.program_global_sync(sync)

@@ -96,6 +96,9 @@ pub mod source {
     pub mod client {
         pub const IH: u8 = 0x00;
         pub const DCE: u8 = 0x04;
+        /// SOC15_IH_CLIENTID_VCN1 (UVD1) and SOC15_IH_CLIENTID_VCN (UVD).
+        pub const VCN1: u8 = 0x0e;
+        pub const VCN: u8 = 0x10;
         pub const SDMA0: u8 = 0x08;
         pub const SDMA1: u8 = 0x09;
         pub const THM: u8 = 0x0f;
@@ -118,6 +121,14 @@ pub mod source {
     /// the TRAP packet INT_CONTEXT and ring_id 0 is the gfx queue.
     pub const SDMA0_TRAP: Source = s(client::SDMA0, 224);
     pub const SDMA1_TRAP: Source = s(client::SDMA1, 224);
+    /// vcn_v3_0_sw_init: VCN_2_0__SRCID__UVD_SYSTEM_MESSAGE_INTERRUPT (decode)
+    /// and UVD_ENC_GENERAL_PURPOSE + j (encode ring j) per instance client;
+    /// jpeg_v3_0_sw_init: VCN_2_0__SRCID__JPEG_DECODE on the VCN client.
+    pub const VCN0_DEC: Source = s(client::VCN, 124);
+    pub const VCN0_ENC: [Source; 2] = [s(client::VCN, 119), s(client::VCN, 120)];
+    pub const VCN1_DEC: Source = s(client::VCN1, 124);
+    pub const VCN1_ENC: [Source; 2] = [s(client::VCN1, 119), s(client::VCN1, 120)];
+    pub const JPEG_DEC: Source = s(client::VCN, 153);
     /// gmc_v10_0_sw_init: VMC (MMHUB) and UTCL2 (GFXHUB) faults.
     pub const VMC_FAULT: Source = s(client::VMC, 0);
     pub const UTCL2_FAULT: Source = s(client::UTCL2, 0);

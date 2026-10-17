@@ -253,6 +253,12 @@ since boot, as in `dmesg`. The kernel writes only to a USB FAT volume whose
 read-only for one boot, press `e` in the Limine menu and change the argument
 to `narf.bootlog=off`.
 
+An unexpected power-off during bring-up is most likely the Navi22 thermal
+protection (SMU CTF or software-shutdown temperature), which calls the ACPI S5
+power-off on purpose. That path runs the same final flush as `reboot`, so the
+log should end with the `amdgpu: navi22 thermal ...` or `EMERGENCY` line that
+caused it, followed by `[bootlog: final flush before reboot/power-off]`.
+
 Limits: the stick becomes writable only once the USB stack runs, which is
 after the last boot initcall, including the 6750 XT cold boot. Lines logged
 before then are saved retroactively, but a hang *before* that point leaves

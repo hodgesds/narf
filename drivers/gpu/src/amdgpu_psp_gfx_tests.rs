@@ -72,6 +72,7 @@ fn psp_navi22_graphics_order_lengths_and_autoload() -> TestResult {
                 != (MediaFirmware {
                     vcn: Some(0x8_0010_1000),
                     dmcub: Some(0x8_0020_0000),
+                    vcn1: None,
                 })
             || pool.available() != (16 << 20) - BUFFER_SIZE - (4 << 20)
         {
@@ -89,6 +90,48 @@ fn psp_navi22_graphics_order_lengths_and_autoload() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/psp-ring",
     psp_navi22_graphics_order_lengths_and_autoload
+);
+
+/// `amdgpu_vcn_setup_ucode` per unharvested instance: VCN (13) then VCN1
+/// (58), both before DMCUB, each with its own PSP-reported TMR address.
+fn psp_navi22_loads_one_vcn_image_per_unharvested_instance() -> TestResult {
+    for (mask, kinds, vcn, vcn1) in [
+        (3, &[13, 58][..], Some(0x8_0010_1000), Some(0x8_0018_0000)),
+        (2, &[58][..], None, Some(0x8_0018_0000)),
+        (0, &[][..], None, None),
+    ] {
+        let mut firmware = crate::amdgpu_gfx_navi22::tests::fixture_with_vcn(3);
+        firmware.harvest_vcn(!mask & 3);
+        let images = firmware.images().unwrap();
+        let (_pool, mut s) = prepared();
+        if firmware.vcn_instances() != mask || run(s.load_gfx(&images)).is_err() {
+            return TestResult::Fail("harvested VCN set not accepted");
+        }
+        let media: Vec<u32> = s.engine.io.submissions[2..]
+            .iter()
+            .filter(|cmd| cmd[2] == 6 && matches!(cmd[10], 13 | 58 | 51))
+            .map(|cmd| cmd[10])
+            .collect();
+        let mut want = kinds.to_vec();
+        want.push(51);
+        if media != want
+            || s.media_firmware
+                != (MediaFirmware {
+                    vcn,
+                    dmcub: Some(0x8_0020_0000),
+                    vcn1,
+                })
+        {
+            return TestResult::Fail("wrong per-instance VCN upload or TMR address");
+        }
+        // SAFETY: model firmware has no running consumers.
+        unsafe { run(s.stop()) }.unwrap();
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_navi22_loads_one_vcn_image_per_unharvested_instance
 );
 
 fn psp_navi22_graphics_requires_smc_and_complete_set() -> TestResult {

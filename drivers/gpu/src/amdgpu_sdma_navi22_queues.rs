@@ -321,6 +321,17 @@ impl Sdma {
     pub fn proof(&self) -> Proof {
         self.engine.proof
     }
+    /// Fence progress of both engines (hang detection only).
+    pub(crate) fn progress(&mut self) -> Result<[crate::amdgpu_navi22_tdr::Progress; 2], Error> {
+        if self.engine.state != State::Verified {
+            return Err(Error::Busy);
+        }
+        let e = &mut self.engine;
+        Ok([
+            crate::amdgpu_cp_navi22::progress(&mut e.hw, &e.queues[0])?,
+            crate::amdgpu_cp_navi22::progress(&mut e.hw, &e.queues[1])?,
+        ])
+    }
 }
 
 #[cfg(feature = "kernel-test")]

@@ -212,6 +212,13 @@ pub type RegWrite = Box<dyn FnMut(u32, u32)>;
 pub struct ResolvedTable<'a> {
     pub body: &'a [u8],
     pub ps_dwords: usize,
+    /// Absolute image offset of the table's header (`ctx->start`), which
+    /// `SET_DATA_BLOCK 255` selects. Zero when the VM runs without an image.
+    pub start: usize,
+    /// `CU8(base + ATOM_CT_WS_PTR)`: Linux gives every table execution,
+    /// including each CALLTABLE callee, its own zeroed WS of this many
+    /// dwords. `None` keeps the caller's scratch (synthetic tables).
+    pub ws_dwords: Option<usize>,
 }
 
 /// CALLTABLE / SETDATABLOCK resolver: given a sub-table id, return that
@@ -298,6 +305,17 @@ pub struct AtomState<'a> {
 
     /// Sub-table resolver (for CALLTABLE / SETDATABLOCK).
     pub table_resolver: TableResolver<'a>,
+
+    /// The whole VBIOS image and its master data table offset. When bound,
+    /// `SET_DATA_BLOCK` and ID-class operands follow `atom.c` exactly:
+    /// `data_block` is an absolute image offset taken from the master data
+    /// table, and ID reads load from the image. Unbound (empty) keeps the
+    /// table-relative behaviour the synthetic tests use.
+    pub bios: &'a [u8],
+    pub data_table: usize,
+    /// `udelay`/`msleep` for DELAY_MICROSEC/DELAY_MILLISEC, in microseconds.
+    /// Display PLL and PHY tables rely on these for lock time.
+    pub delay_us: Box<dyn FnMut(u64) + 'a>,
 }
 
 impl<'a> fmt::Debug for AtomState<'a> {
@@ -359,6 +377,9 @@ impl<'a> AtomState<'a> {
             last_jump_addr: 0,
             last_jump_count: 0,
             table_resolver: unbound_resolver(),
+            bios: &[],
+            data_table: 0,
+            delay_us: Box::new(|_| {}),
         }
     }
 }
@@ -376,6 +397,8 @@ struct Frame<'b, 'c> {
     ps_shift: usize,
     /// CALLTABLE nesting depth, bounded by [`ATOM_EXECUTE_MAX_DEPTH`].
     depth: u32,
+    /// Absolute image offset of this table's header (`ctx->start`).
+    start: usize,
 }
 
 impl<'b, 'c> Frame<'b, 'c> {
@@ -468,19 +491,26 @@ fn get_src(
             let idx16 = frame.u16_at(*ptr)?;
             *ptr += 2;
             let abs = (idx16 as usize).wrapping_add(state.data_block as usize);
-            if abs + 4 > frame.code.len() {
-                // In Linux this reads from the BIOS image; we
-                // intentionally constrain to the table buffer in
-                // this Stage-9 cut. The full driver upgrade is to
-                // give the VM a borrow on the BIOS image as well.
-                return Err(AtomError::BytecodeTruncated);
+            if !state.bios.is_empty() {
+                // atom.c: U32(idx + gctx->data_block), an image offset.
+                let bytes = state
+                    .bios
+                    .get(abs..abs + 4)
+                    .ok_or(AtomError::BytecodeTruncated)?;
+                val = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            } else {
+                // Without a bound image, constrain to the table buffer
+                // (synthetic tables only).
+                if abs + 4 > frame.code.len() {
+                    return Err(AtomError::BytecodeTruncated);
+                }
+                val = u32::from_le_bytes([
+                    frame.code[abs],
+                    frame.code[abs + 1],
+                    frame.code[abs + 2],
+                    frame.code[abs + 3],
+                ]);
             }
-            val = u32::from_le_bytes([
-                frame.code[abs],
-                frame.code[abs + 1],
-                frame.code[abs + 2],
-                frame.code[abs + 3],
-            ]);
         }
         ARG_FB => {
             let idx = frame.u8_at(*ptr)? as usize;
@@ -838,16 +868,19 @@ fn op_jump(
 }
 
 fn op_delay(
-    _state: &mut AtomState,
+    state: &mut AtomState,
     frame: &Frame,
-    _unit: u8,
+    unit: u8,
     ptr: &mut usize,
 ) -> Result<(), AtomError> {
-    // Linux calls udelay/mdelay/msleep. In NARF kernel we'd hook
-    // through `narf_time` here; for the Stage-9 cut we just step
-    // past the operand byte. Real driver wires a sleep callback.
-    let _count = frame.u8_at(*ptr)?;
+    // `atom_op_delay`: udelay(count) or msleep(count), through the bound hook.
+    let count = u64::from(frame.u8_at(*ptr)?);
     *ptr += 1;
+    (state.delay_us)(if unit == UNIT_MICROSEC {
+        count
+    } else {
+        count * 1000
+    });
     Ok(())
 }
 
@@ -871,13 +904,31 @@ fn op_calltable(
     // window reads the caller's inputs as its own and writes its outputs over
     // them.
     let shift = frame.ps_shift.min(frame.ps.len());
-    run_table(
-        state,
-        sub.body,
-        &mut frame.ps[shift..],
-        sub.ps_dwords,
-        frame.depth + 1,
-    )
+    with_ws(state, sub.ws_dwords, |state| {
+        run_table(
+            state,
+            sub.body,
+            &mut frame.ps[shift..],
+            sub.ps_dwords,
+            frame.depth + 1,
+            sub.start,
+        )
+    })
+}
+
+/// `amdgpu_atom_execute_table_locked`'s per-execution WS allocation.
+fn with_ws<T>(
+    state: &mut AtomState,
+    ws: Option<usize>,
+    run: impl FnOnce(&mut AtomState) -> T,
+) -> T {
+    let Some(ws) = ws else {
+        return run(state);
+    };
+    let saved = core::mem::replace(&mut state.scratch, vec![0u32; ws.max(1)]);
+    let result = run(state);
+    state.scratch = saved;
+    result
 }
 
 fn op_setport(
@@ -930,6 +981,23 @@ fn op_setfbbase(
 fn op_setdatablock(state: &mut AtomState, frame: &Frame, ptr: &mut usize) -> Result<(), AtomError> {
     let idx = frame.u8_at(*ptr)?;
     *ptr += 1;
+    if !state.bios.is_empty() {
+        // atom_op_setdatablock: 0 clears, 255 selects this table's start,
+        // otherwise U16(data_table + 4 + 2 * idx).
+        state.data_block = match idx {
+            0 => 0,
+            255 => u16::try_from(frame.start).map_err(|_| AtomError::BytecodeTruncated)?,
+            _ => {
+                let at = state.data_table + 4 + 2 * idx as usize;
+                let bytes = state
+                    .bios
+                    .get(at..at + 2)
+                    .ok_or(AtomError::BytecodeTruncated)?;
+                u16::from_le_bytes([bytes[0], bytes[1]])
+            }
+        };
+        return Ok(());
+    }
     if idx == 0 {
         state.data_block = 0;
     } else if idx == 255 {
@@ -1349,7 +1417,7 @@ pub fn execute_bytes(
     params: &mut [u32],
     ps_shift: usize,
 ) -> Result<(), AtomError> {
-    run_table(state, code, params, ps_shift, 0)
+    run_table(state, code, params, ps_shift, 0, 0)
 }
 
 fn run_table(
@@ -1358,12 +1426,14 @@ fn run_table(
     params: &mut [u32],
     ps_shift: usize,
     depth: u32,
+    start: usize,
 ) -> Result<(), AtomError> {
     let mut frame = Frame {
         code,
         ps: params,
         ps_shift,
         depth,
+        start,
     };
     let mut ptr = 0usize;
     let mut steps: u32 = 0;
@@ -1417,7 +1487,9 @@ pub fn execute_table(
     // `atom.c:1255` takes the entry table's own declared parameter size, not
     // zero: a zero shift makes every CALLTABLE from this table hand the callee
     // this table's own parameter window.
-    run_table(state, table.body, params, table.ps_dwords, 0)
+    with_ws(state, table.ws_dwords, |state| {
+        run_table(state, table.body, params, table.ps_dwords, 0, table.start)
+    })
 }
 
 #[cfg(test)]

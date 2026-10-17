@@ -164,6 +164,7 @@ fn engine(io: Fake) -> Engine<Fake> {
         io,
         authority: Cap::bootstrap(),
         state: State::Prepared,
+        mode: Mode::OnInit,
     }
 }
 fn run<T>(future: impl Future<Output = T>) -> T {
@@ -375,4 +376,39 @@ fn reset_navi22_cancellation_and_revocation() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     reset_navi22_cancellation_and_revocation
+);
+
+fn reset_navi22_recovery_mode_always_resets() -> TestResult {
+    // Recovery never takes the cold-card shortcut, and runs the same core.
+    let mut e = engine(Fake {
+        sos: 0,
+        ..Fake::posted()
+    });
+    e.mode = Mode::Recovery;
+    match run(e.run()) {
+        Ok(Some(report)) if report.method == Method::Smu && report.sos_before == 0 => {}
+        _ => return TestResult::Fail("recovery skipped or failed the mode1 reset"),
+    }
+    if e.io.events.first() != Some(&Event::Scratch(0x10 | ATOM_S3_ASIC_GUI_ENGINE_HUNG))
+        || !e.io.events.contains(&Event::Restore)
+        || e.io.stray != 0
+    {
+        return TestResult::Fail("recovery reset sequence");
+    }
+    if run(e.run()) != Err(Error::Busy) {
+        return TestResult::Fail("recovery reset replayed");
+    }
+    let mut e = engine(Fake {
+        sos: u32::MAX,
+        ..Fake::posted()
+    });
+    e.mode = Mode::Recovery;
+    if run(e.run()) != Err(Error::DeviceGone) || !e.io.events.is_empty() {
+        return TestResult::Fail("lost device reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    reset_navi22_recovery_mode_always_resets
 );

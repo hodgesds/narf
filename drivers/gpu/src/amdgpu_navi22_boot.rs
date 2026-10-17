@@ -24,9 +24,12 @@ pub enum Error {
     MemoryHubs(crate::amdgpu_gmc_navi22::Error),
     Sdma(crate::amdgpu_sdma_navi22::Error),
     Dmub(crate::amdgpu_dmub_navi22::Error),
+    Display(crate::amdgpu_navi22_display::Error),
+    Modeset(crate::amdgpu_navi22_modeset::Error),
     Queues(crate::amdgpu_cp_navi22::Error),
     Reset(crate::amdgpu_reset_navi22::Error),
     Interrupts(crate::amdgpu_ih_navi22::Error),
+    Media(crate::amdgpu_vcn_navi22::Error),
 }
 /// All files are validated and copied before the first device operation.
 #[derive(Debug)]
@@ -36,6 +39,7 @@ pub struct Firmware {
     graphics: gfx::Firmware,
     power: Option<power::Prepared>,
     dmub: Option<crate::amdgpu_dmub_navi22::Prepared>,
+    display: Option<DisplayPrep>,
 }
 impl Firmware {
     pub fn open(
@@ -49,7 +53,40 @@ impl Firmware {
             graphics: gfx::Firmware::open(gpu, registry).map_err(Error::Graphics)?,
             power: None,
             dmub: None,
+            display: None,
         })
+    }
+    /// Remove harvested VCN instances (`adev->vcn.harvest_config`) before PSP
+    /// receives the graphics set; the media owner follows the same mask.
+    pub fn harvest_vcn(&mut self, harvested: u8) {
+        self.graphics.harvest_vcn(harvested);
+    }
+    /// Decode the board's connector routes (DDC line, HPD, transmitter) from
+    /// the VBIOS before any device write. Optional: firmware bring-up does not
+    /// depend on display routing.
+    pub fn prepare_display(&mut self, gpu: &AmdGpu) -> Result<(), Error> {
+        psp::validate_navi22_layout(gpu).map_err(Error::Psp)?;
+        let vbios = gpu.vbios.as_ref().ok_or(Error::Invalid)?;
+        let inventory =
+            |error| Error::Display(crate::amdgpu_navi22_display::Error::Inventory(error));
+        let paths =
+            crate::amdgpu_dcn_inventory::display_paths(gpu, vbios.bytes()).map_err(inventory)?;
+        // bios_parser2 takes the crystal from dce_refclk_10khz (27 MHz if zero).
+        let crystal =
+            crate::amdgpu_dcn_inventory::dchub_refclk_khz(vbios.bytes()).map_err(inventory)?;
+        // The VBIOS command tables and vram_info are needed after the
+        // controller's own copy becomes inaccessible.
+        let mut bytes = alloc::vec::Vec::new();
+        bytes
+            .try_reserve_exact(vbios.bytes().len())
+            .map_err(|_| Error::Allocation)?;
+        bytes.extend_from_slice(vbios.bytes());
+        self.display = Some(DisplayPrep {
+            paths,
+            crystal,
+            vbios: bytes,
+        });
+        Ok(())
     }
     /// Prepare DCN3.0's nonsecure DMUB storage before starting any hardware.
     pub fn prepare_dmub(&mut self, gpu: &AmdGpu) -> Result<(), Error> {
@@ -80,6 +117,13 @@ impl Firmware {
         Ok(())
     }
 }
+/// VBIOS-derived display inputs, copied before any device write.
+#[derive(Debug)]
+struct DisplayPrep {
+    paths: alloc::vec::Vec<crate::amdgpu_dcn_inventory::Path>,
+    crystal: u32,
+    vbios: alloc::vec::Vec<u8>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     ResetOnInit,
@@ -108,8 +152,11 @@ pub enum Stage {
     SdmaQueues,
     IbTests,
     FenceInterrupts,
+    Media,
+    Jpeg,
+    MediaIbTests,
 }
-const STAGES: [Stage; 26] = [
+const STAGES: [Stage; 29] = [
     Stage::ResetOnInit,
     Stage::MemoryTraining,
     Stage::Sos,
@@ -139,8 +186,16 @@ const STAGES: [Stage; 26] = [
     Stage::GfxRing,
     Stage::SdmaQueues,
     Stage::IbTests,
-    // Last: arms EOP/trap interrupts and routes them to fence waiters.
+    // Arms EOP/trap interrupts and routes them to fence waiters.
     Stage::FenceInterrupts,
+    // vcn_v3_0_hw_init, jpeg_v3_0_hw_init, then the multimedia part of
+    // amdgpu_ib_ring_tests. Linux runs VCN/JPEG hw_init after GFX/SDMA in
+    // the same phase-2 pass; here they follow every display, queue and fence
+    // proof so a media fault cannot delay or alter them, and the IB tests
+    // already have IH-routed fences. Each media stage is non-fatal.
+    Stage::Media,
+    Stage::Jpeg,
+    Stage::MediaIbTests,
 ];
 /// INT_CONTEXT of the boot SDMA0 TRAP round trip.
 const TRAP_CONTEXT: u32 = 0x0675_0022;
@@ -161,6 +216,8 @@ pub struct Report {
     /// Kernel GFX/compute/SDMA ring and IB tests passed.
     pub queues: Option<crate::amdgpu_cp_navi22::QueueProof>,
     pub interrupts: Option<crate::amdgpu_ih_navi22::Status>,
+    /// VCN/JPEG owner state; failures there leave the boot degraded only.
+    pub media: Option<crate::amdgpu_vcn_navi22::Status>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(
@@ -237,8 +294,16 @@ struct Hardware {
     gmc: Option<crate::amdgpu_gmc_navi22::Gmc>,
     sdma: Option<crate::amdgpu_sdma_navi22::Sdma>,
     dmub: Option<crate::amdgpu_dmub_navi22::Dmub>,
+    display: Option<crate::amdgpu_navi22_display::Display>,
+    /// DCN3.0 Linux never routes AUX/HPD through DMUB; only an explicit
+    /// opt-in plus a firmware capability reply re-enables that transport.
+    dmub_aux: bool,
+    /// VBIOS copy and crystal for the native modeset, and its retained owner.
+    display_bios: Option<(alloc::vec::Vec<u8>, u32)>,
+    modeset: Option<crate::amdgpu_navi22_modeset::Pipeline>,
     queues: Option<Queues>,
     ih: Option<crate::amdgpu_ih_navi22::Ih>,
+    media: Option<crate::amdgpu_vcn_navi22::Media>,
 }
 /// Kernel queue owners, retained through success, failure and cancellation.
 #[derive(Debug)]
@@ -355,6 +420,26 @@ fn fatal(error: Error) -> bool {
                     | ih::Error::Closed(ih::Closed::DeviceLost | ih::Closed::AuthorityRevoked)
             )
     )
+}
+/// Device loss and revoked authority stop the boot; every other media
+/// failure is logged and the owner retained (quarantined), like InterruptTest.
+fn media_result(
+    stage: Stage,
+    result: Result<(), crate::amdgpu_vcn_navi22::Error>,
+) -> Result<(), Error> {
+    use crate::amdgpu_vcn_navi22::Error as Vcn;
+    match result {
+        Ok(()) => Ok(()),
+        Err(error @ (Vcn::DeviceGone | Vcn::Revoked)) => Err(Error::Media(error)),
+        Err(error) => {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 {stage:?}: degraded {error:?}"
+            );
+            Ok(())
+        }
+    }
 }
 async fn trap_round_trip(
     ih: &mut crate::amdgpu_ih_navi22::Ih,
@@ -572,6 +657,45 @@ impl Backend for Hardware {
                     }
                 }
             }
+            Stage::Media => {
+                if let Some(media) = self.media.as_mut() {
+                    let firmware = self.psp.as_ref().ok_or(Error::Invalid)?.media_firmware();
+                    // SAFETY: PSP loaded these VCN images into the retained
+                    // TMR, both hubs and NBIF doorbells are up, and ColdBoot
+                    // owns the whole GPU. Power gating stays disabled.
+                    let result = unsafe { media.start(firmware, self.power_status).await };
+                    media_result(stage, result)?;
+                }
+            }
+            Stage::Jpeg => {
+                if let Some(media) = self.media.as_mut() {
+                    if media.status().jpeg == crate::amdgpu_vcn_navi22::JpegState::Prepared {
+                        // SAFETY: as for Media; JPEG uses VCN0's registers.
+                        let result = unsafe { media.start_jpeg().await };
+                        media_result(stage, result)?;
+                    }
+                }
+            }
+            Stage::MediaIbTests => {
+                if let Some(media) = self.media.as_mut() {
+                    if let Some(ih) = self.ih.as_ref() {
+                        let status = media.status();
+                        if let Err(error) =
+                            crate::amdgpu_vcn_navi22::route_interrupts(&ih.handle(), status)
+                        {
+                            use core::fmt::Write;
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "amdgpu: navi22 MediaIbTests: polling only {error:?}"
+                            );
+                        }
+                    }
+                    if media.status().state == crate::amdgpu_vcn_navi22::State::Running {
+                        let result = media.test_ib().await;
+                        media_result(stage, result)?;
+                    }
+                }
+            }
             Stage::Interrupts => {
                 if let Some(ih) = self.ih.as_mut() {
                     // SAFETY: VMID0 is ready, no engine raises interrupts yet,
@@ -632,6 +756,10 @@ impl Backend for Hardware {
                 .and_then(crate::amdgpu_gmc_navi22::Gmc::aperture),
             queues: self.queues.as_ref().and_then(Queues::proof),
             interrupts: self.ih.as_ref().map(crate::amdgpu_ih_navi22::Ih::status),
+            media: self
+                .media
+                .as_ref()
+                .map(crate::amdgpu_vcn_navi22::Media::status),
         })
     }
 }
@@ -703,8 +831,13 @@ impl ColdBoot {
                     gmc: None,
                     sdma: None,
                     dmub: None,
+                    display: None,
+                    dmub_aux: false,
+                    display_bios: None,
+                    modeset: None,
                     queues: None,
                     ih: None,
+                    media: None,
                 },
                 state: State::Prepared,
             },
@@ -750,8 +883,13 @@ impl ColdBoot {
                     gmc: None,
                     sdma: None,
                     dmub: None,
+                    display: None,
+                    dmub_aux: false,
+                    display_bios: None,
+                    modeset: None,
                     queues: None,
                     ih: None,
+                    media: None,
                 },
                 state: State::Prepared,
             },
@@ -885,6 +1023,41 @@ impl ColdBoot {
         h.queues = Some(queues);
         Ok(())
     }
+    /// Reserve VCN/JPEG VCPU, ring and IB-test storage for the unharvested
+    /// VCN instances after the kernel queues (their doorbell page). No I/O;
+    /// a set with every VCN instance harvested prepares nothing.
+    pub fn prepare_media(
+        &mut self,
+        doorbells: crate::amdgpu_cp_navi22::Doorbells,
+    ) -> Result<(), Error> {
+        if self.sequence.state != State::Prepared || self.sequence.backend.media.is_some() {
+            return Err(Error::Busy);
+        }
+        let h = &mut self.sequence.backend;
+        if h.gmc.is_none() || h.queues.is_none() {
+            return Err(Error::Invalid);
+        }
+        let instances = h.firmware.graphics.vcn_instances();
+        if instances == 0 {
+            return Ok(());
+        }
+        let bytes = h.firmware.graphics.vcn_size().ok_or(Error::Invalid)?;
+        // SAFETY: forwarded whole-GPU/pool/BAR2 ownership; reservations only.
+        h.media = Some(
+            unsafe {
+                crate::amdgpu_vcn_navi22::Media::new(
+                    &h.gpu,
+                    h.authority,
+                    &h.pool,
+                    doorbells,
+                    instances,
+                    bytes,
+                )
+            }
+            .map_err(Error::Media)?,
+        );
+        Ok(())
+    }
     /// Reserve the IH ring/writeback and NBIO dummy page before run, after
     /// memory hubs have been prepared. Host vector routing waits for run.
     pub fn prepare_interrupts(&mut self, device: narf_bus::BusDevice) -> Result<(), Error> {
@@ -929,6 +1102,119 @@ impl ColdBoot {
         );
         Ok(())
     }
+    /// Claim the native DDC/AUX/HPD owner for the prepared board routes. No
+    /// I/O; detection runs only after firmware readiness.
+    pub fn prepare_display(&mut self) -> Result<(), Error> {
+        if self.sequence.state != State::Prepared || self.sequence.backend.display.is_some() {
+            return Err(Error::Busy);
+        }
+        let h = &mut self.sequence.backend;
+        let prep = h.firmware.display.take().ok_or(Error::Invalid)?;
+        let (paths, crystal) = (prep.paths, prep.crystal);
+        h.display_bios = Some((prep.vbios, crystal));
+        // SAFETY: this owner holds the whole GPU exclusively; DMUB AUX stays
+        // disabled unless explicitly allowed, so no firmware AUX client exists.
+        h.display = Some(
+            unsafe {
+                crate::amdgpu_navi22_display::Display::new(&h.gpu, h.authority, &paths, crystal)
+            }
+            .map_err(Error::Display)?,
+        );
+        Ok(())
+    }
+    /// Detect every board connector over native AUX/DDC/HPD after the firmware
+    /// sequence. Reads sinks only; no stream or scanout is changed.
+    pub async fn detect_displays(
+        &mut self,
+    ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_display::Report>, Error> {
+        self.display_mut()?
+            .detect_all()
+            .await
+            .map_err(Error::Display)
+    }
+    fn display_mut(&mut self) -> Result<&mut crate::amdgpu_navi22_display::Display, Error> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_)) {
+            return Err(Error::Busy);
+        }
+        self.sequence.backend.display.as_mut().ok_or(Error::Invalid)
+    }
+    pub fn display_connectors(&self) -> Option<&[crate::amdgpu_navi22_display::Connector]> {
+        self.sequence
+            .backend
+            .display
+            .as_ref()
+            .map(crate::amdgpu_navi22_display::Display::connectors)
+    }
+    /// Light the first connected HDMI connector natively with a colour-bar
+    /// test pattern (`amdgpu_navi22_modeset`). Off unless the platform opts in;
+    /// requires firmware readiness, the retained SMU and the display owner.
+    /// The pipeline is retained, lit or failed; there is no retry.
+    ///
+    /// # Safety
+    /// No other display, DMUB or VBIOS client may run, and nothing may write
+    /// the new scanout except through the returned framebuffer.
+    pub async unsafe fn modeset_hdmi(
+        &mut self,
+    ) -> Result<crate::amdgpu_navi22_modeset::Output, Error> {
+        use crate::amdgpu_navi22_display::{Detection, Signal};
+        use crate::amdgpu_navi22_modeset as modeset;
+        if self.sequence.backend.modeset.is_some() {
+            return Err(Error::Busy);
+        }
+        let reports = self.detect_displays().await?;
+        let h = &mut self.sequence.backend;
+        let Some((connector, sink)) = reports.into_iter().find_map(|r| match r.detection {
+            Detection::Connected(sink) if r.connector.signal == Signal::Hdmi => {
+                Some((r.connector, sink))
+            }
+            _ => None,
+        }) else {
+            return Err(Error::Modeset(modeset::Error::NoSink));
+        };
+        let (vbios, crystal) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
+        let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
+            .map_err(|e| Error::Modeset(modeset::Error::Bios(e)))?;
+        let smu = h.smu.as_mut().ok_or(Error::Invalid)?;
+        // SAFETY: this cold-boot owner holds the whole GPU; the caller's
+        // contract excludes other display clients.
+        let mut pipeline = unsafe { modeset::Pipeline::new(&h.gpu, h.authority, connector) }
+            .map_err(Error::Modeset)?;
+        // SAFETY: forwarded; the pool and SMU are this owner's.
+        let result = unsafe {
+            pipeline
+                .enable(
+                    smu,
+                    &h.pool,
+                    &tables,
+                    vbios,
+                    *crystal,
+                    &sink,
+                    modeset::test_pattern,
+                )
+                .await
+        };
+        h.modeset = Some(pipeline);
+        result.map_err(Error::Modeset)
+    }
+    /// HDP flush for CPU writes to the native scanout.
+    pub fn flush_display_scanout(&mut self) -> Result<(), Error> {
+        self.sequence
+            .backend
+            .modeset
+            .as_mut()
+            .ok_or(Error::Invalid)?
+            .flush()
+            .map_err(Error::Modeset)
+    }
+    pub fn modeset_state(&self) -> Option<crate::amdgpu_navi22_modeset::State> {
+        self.sequence.backend.modeset.as_ref().map(|p| p.state())
+    }
+    /// Re-enable the DMUB AUX/HPD transport (Linux `enable_dmub_aux_for_legacy_ddc`).
+    /// It is still refused unless the running firmware answered
+    /// QUERY_FEATURE_CAPS; `dmub_feature_caps` has no AUX bit to check.
+    pub fn allow_dmub_aux(&mut self) {
+        self.sequence.backend.dmub_aux = true;
+    }
     pub fn training_data(&self) -> Option<&[u8]> {
         self.sequence
             .backend
@@ -958,6 +1244,14 @@ impl ColdBoot {
         }
         self.sequence.backend.dmub.as_mut().ok_or(Error::Invalid)
     }
+    fn dmub_aux_mut(&mut self) -> Result<&mut crate::amdgpu_dmub_navi22::Dmub, Error> {
+        let allowed = self.sequence.backend.dmub_aux;
+        let dmub = self.dmub_mut()?;
+        if !allowed || dmub.status().and_then(|s| s.capabilities).is_none() {
+            return Err(Error::Dmub(crate::amdgpu_dmub_navi22::Error::Unsupported));
+        }
+        Ok(dmub)
+    }
     pub fn dmub_mailbox_state(&self) -> Option<crate::amdgpu_dmub_navi22::MailboxState> {
         self.sequence
             .backend
@@ -965,9 +1259,14 @@ impl ColdBoot {
             .as_ref()
             .map(|d| d.mailbox_state())
     }
-    /// Native DCN30 AUX/HPD instance, not a connector index.
+    /// DMUB AUX/HPD transport, refused unless `allow_dmub_aux` was called and
+    /// the firmware reported capabilities. The default path is native
+    /// (`detect_displays`). The instance is the DCN AUX/HPD index.
     pub async fn dmub_hpd(&mut self, instance: u8) -> Result<bool, Error> {
-        self.dmub_mut()?.hpd(instance).await.map_err(Error::Dmub)
+        self.dmub_aux_mut()?
+            .hpd(instance)
+            .await
+            .map_err(Error::Dmub)
     }
     pub async fn dmub_aux(
         &mut self,
@@ -976,13 +1275,162 @@ impl ColdBoot {
         address: u32,
         data: &mut [u8],
     ) -> Result<(), Error> {
-        self.dmub_mut()?
+        self.dmub_aux_mut()?
             .aux(instance, action, address, data)
             .await
             .map_err(Error::Dmub)
     }
     pub fn dmub_notification(&mut self) -> Result<Option<[u8; 64]>, Error> {
         self.dmub_mut()?.poll_notification().map_err(Error::Dmub)
+    }
+    /// Board limits of the retained SMU owner once boot power setup ran.
+    pub fn power_limits(&self) -> Option<smu::Limits> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_)) {
+            return None;
+        }
+        let h = &self.sequence.backend;
+        h.power_status.and(h.smu.as_ref()?.limits())
+    }
+    /// One PMFW telemetry refresh through the retained SMU owner after a
+    /// completed boot. It shares only the PPSMC mailbox and the retained
+    /// transfer buffer, both serialized by the caller's owner lock.
+    pub(crate) async fn power_sample(
+        &mut self,
+    ) -> Result<crate::amdgpu_navi22_power::Sample, Error> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_))
+            || self.sequence.backend.power_status.is_none()
+        {
+            return Err(Error::Busy);
+        }
+        let smu = self.sequence.backend.smu.as_mut().ok_or(Error::Invalid)?;
+        let telemetry = smu.read_telemetry().await;
+        Ok(crate::amdgpu_navi22_power::Sample {
+            protected: telemetry.is_ok_and(|t| smu.protected(t.enabled)),
+            telemetry,
+            limits: smu.limits(),
+        })
+    }
+    /// Arm the SMU11 THM/MP1 alert sources after a completed boot with power
+    /// setup (Linux smu_smc_hw_setup runs after IH hw_init). Returns the
+    /// acknowledge handle the SMU-to-driver handler uses.
+    pub(crate) async fn enable_thermal_alert(
+        &mut self,
+    ) -> Result<(smu::Alert, smu::InterruptAck), Error> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_))
+            || self.sequence.backend.power_status.is_none()
+        {
+            return Err(Error::Busy);
+        }
+        let smu = self.sequence.backend.smu.as_mut().ok_or(Error::Invalid)?;
+        let alert = smu.enable_thermal_alert().await.map_err(Error::Smu)?;
+        Ok((alert, smu.interrupt_ack()))
+    }
+    /// `ReenableAcDcInterrupt` for an AC/DC SMU-to-driver interrupt.
+    pub(crate) async fn reenable_acdc(&mut self) -> Result<(), Error> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_)) {
+            return Err(Error::Busy);
+        }
+        let smu = self.sequence.backend.smu.as_mut().ok_or(Error::Invalid)?;
+        smu.reenable_acdc_interrupt().await.map_err(Error::Smu)
+    }
+    /// Every kernel queue passed its ring and IB tests.
+    pub fn queues_verified(&self) -> bool {
+        matches!(self.sequence.state, State::FirmwareReady(_))
+            && self
+                .sequence
+                .backend
+                .queues
+                .as_ref()
+                .and_then(Queues::proof)
+                .is_some()
+    }
+    /// TDR sample of every verified kernel queue; empty without queues.
+    pub(crate) fn queue_progress(
+        &mut self,
+    ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_tdr::Progress>, Error> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_)) {
+            return Err(Error::Busy);
+        }
+        let mut samples = alloc::vec::Vec::new();
+        let Some(queues) = self.sequence.backend.queues.as_mut() else {
+            return Ok(samples);
+        };
+        if queues.proof().is_none() {
+            return Ok(samples);
+        }
+        samples
+            .try_reserve_exact(5)
+            .map_err(|_| Error::Allocation)?;
+        samples.push(queues.gfx.progress().map_err(Error::Queues)?);
+        samples.extend(queues.compute.progress().map_err(Error::Queues)?);
+        samples.extend(queues.sdma.progress().map_err(Error::Queues)?);
+        Ok(samples)
+    }
+    /// Whether `into_recovery` can rebuild this owner: a completed boot with
+    /// a board power table and IH, and no GDDR6 training to replay (Linux
+    /// replays it as `PSP_MEM_TRAIN_RESUME`; NARF has no short training).
+    pub fn recoverable(&self) -> bool {
+        let h = &self.sequence.backend;
+        matches!(self.sequence.state, State::FirmwareReady(_))
+            && h.training.is_none()
+            && h.firmware.power.is_some()
+            && h.psp.is_some()
+            && h.ih.is_some()
+    }
+    /// Recovery quiesce: bounded `navi10_ih_irq_disable`, after which every
+    /// IH subscriber (fence routing, thermal) has received `Disabled`.
+    ///
+    /// # Safety
+    /// Recovery's contract (`amdgpu_navi22_platform::recover`): this owner is
+    /// about to be reset, and no consumer depends on IH delivery any more.
+    pub(crate) async unsafe fn quiesce_for_reset(&mut self) -> Result<(), Error> {
+        if !self.recoverable() {
+            return Err(Error::Busy);
+        }
+        let ih = self.sequence.backend.ih.as_mut().ok_or(Error::Invalid)?;
+        // SAFETY: forwarded recovery contract; the ring is quarantined.
+        unsafe { ih.disable().await }.map_err(Error::Interrupts)
+    }
+    /// Rebuild a fresh cold-boot owner for `amdgpu_device_gpu_recover`: the
+    /// same GPU snapshot, authority, pool and prepared firmware, a
+    /// `Reset::new_recovery` mode1 reset in `ResetOnInit`, and newly reserved
+    /// memory hubs, SDMA proof, IH and kernel queues (same BAR2 doorbells).
+    /// DMUB is not restarted. Every old owner is dropped without I/O, so its
+    /// published VRAM stays quarantined. No device I/O happens here.
+    ///
+    /// # Safety
+    /// `quiesce_for_reset` completed, `device` is this GPU's PCI function
+    /// and recovery's whole-device contract holds. Run the result once.
+    pub(crate) unsafe fn into_recovery(self, device: narf_bus::BusDevice) -> Result<Self, Error> {
+        if !self.recoverable() {
+            return Err(Error::Busy);
+        }
+        let Hardware {
+            gpu,
+            authority,
+            pool,
+            firmware,
+            queues,
+            ..
+        } = self.sequence.backend;
+        let doorbells = queues.as_ref().map(|q| q.doorbells);
+        drop(queues);
+        // SAFETY: forwarded exclusive whole-GPU contract; the mode1 reset
+        // below runs before any firmware stage touches the device.
+        let mut boot = unsafe { Self::new(&gpu, authority, &pool, firmware) }?;
+        let h = &mut boot.sequence.backend;
+        // SAFETY: forwarded recovery contract; construction has no I/O.
+        h.reset = Some(
+            unsafe { crate::amdgpu_reset_navi22::Reset::new_recovery(&h.gpu, h.authority, device) }
+                .map_err(Error::Reset)?,
+        );
+        boot.prepare_memory_hubs()?;
+        boot.prepare_sdma()?;
+        boot.prepare_interrupts(device)?;
+        if let Some(doorbells) = doorbells {
+            boot.prepare_queues(doorbells)?;
+        }
+        Ok(boot)
     }
     /// Transfer the live ring/TMR owner after full firmware success. It must
     /// remain alive for subsequent GPU initialization; dropping it quarantines

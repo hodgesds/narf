@@ -119,15 +119,20 @@ pub(super) fn start() -> InitResult {
         // A secondary GPU cannot affect the boot framebuffer on another BAR.
         resume(pause.take());
     }
-    if !navi48 {
-        stage_summary(summary_from);
-    }
     use core::fmt::Write;
     let _ = writeln!(
         narf_console::Writer,
         "amdgpu: {generation} framebuffer {}",
         if paused() { "quarantined" } else { "available" }
     );
+    if ok && !navi48 {
+        report_displays();
+        // Off by default until a board validates the path; the same flag
+        // Navi48 uses.
+        if narf_boot::args().has_flag("amdgpu.native_display") {
+            navi22_native_display();
+        }
+    }
     // `amdgpu.max_bpc=10|12`: allow HDMI deep colour, as DRM's max bpc.
     if let Some(bpc) = narf_boot::args()
         .value("amdgpu.max_bpc")
@@ -150,6 +155,10 @@ pub(super) fn start() -> InitResult {
     }
     if ok && navi48 && narf_boot::args().has_flag("amdgpu.native_display") {
         native_display();
+    }
+    if !navi48 {
+        // Last, so it also covers the connector and native-display lines.
+        stage_summary(summary_from);
     }
     if ok {
         InitResult::Ok
@@ -234,36 +243,61 @@ fn off_aperture(addr: u64, bytes: u64, base: u64, size: u64) -> bool {
 }
 
 /// One line per Navi22 cold-boot stage, rebuilt from the checkpoint lines in
-/// the log store, so a single photo of the screen (or the tail of the
-/// persistent log) shows how far the card got. Printed after the console is
-/// back, so it also covers checkpoints drawn while the console was paused.
+/// the log store, then the display/media/thermal notes, so a single photo of
+/// the screen (or the tail of the persistent log) shows how far the card got.
+/// Printed after the console is back, so it also covers checkpoints drawn
+/// while the console was paused.
 fn stage_summary(from: u64) {
     use core::fmt::Write;
     let text = narf_console::klog::text_since(from);
     let text = core::str::from_utf8(&text).unwrap_or("");
-    let rows = summarize_stages(text);
+    let (rows, notes) = summarize_stages(text);
     if rows.is_empty() {
         return;
     }
     let done = rows.iter().filter(|(_, v)| *v == "ok").count();
     let _ = writeln!(
         narf_console::Writer,
-        "amdgpu: navi22 stage summary ({done}/{} complete):",
+        "amdgpu: navi22 stage summary ({done}/{} ok):",
         rows.len()
     );
     for (stage, verdict) in rows {
         let _ = writeln!(narf_console::Writer, "  navi22 {stage:<16} {verdict}");
     }
+    for note in notes {
+        let _ = writeln!(narf_console::Writer, "  navi22 {note}");
+    }
 }
 
-/// `(stage, verdict)` per stage in first-seen order: `ok`, `failed <error>`
-/// or `STARTED (no result)` (a stage that never reported back).
-fn summarize_stages(text: &str) -> alloc::vec::Vec<(&str, &str)> {
+/// Non-stage boot lines worth repeating in the summary: per-connector
+/// detection, native scanout, and media/thermal/queue degradations.
+const SUMMARY_NOTES: [&str; 9] = [
+    "HDMI-A-",
+    "DP-",
+    "display",
+    "native HDMI",
+    "media disabled",
+    "thermal",
+    "kernel queues disabled",
+    "PMFW",
+    "EMERGENCY",
+];
+
+/// `(stage, verdict)` per stage in first-seen order — `ok`, `failed <error>`,
+/// `degraded <error>` / `polling only <error>` (sticky over a later
+/// `complete`) or `STARTED (no result)` for a stage that never reported back
+/// — plus the [`SUMMARY_NOTES`] lines in log order.
+fn summarize_stages(text: &str) -> (alloc::vec::Vec<(&str, &str)>, alloc::vec::Vec<&str>) {
     let mut rows: alloc::vec::Vec<(&str, &str)> = alloc::vec::Vec::new();
+    let mut notes = alloc::vec::Vec::new();
     for line in text.lines() {
         let Some(rest) = line.trim().strip_prefix("amdgpu: navi22 ") else {
             continue;
         };
+        if SUMMARY_NOTES.iter().any(|p| rest.starts_with(p)) {
+            notes.push(rest);
+            continue;
+        }
         let Some((stage, result)) = rest.split_once(": ") else {
             continue;
         };
@@ -273,15 +307,25 @@ fn summarize_stages(text: &str) -> alloc::vec::Vec<(&str, &str)> {
         let verdict = match result {
             "start" => "STARTED (no result)",
             "complete" => "ok",
-            r if r.starts_with("failed") => r,
+            r if r.starts_with("failed")
+                || r.starts_with("degraded")
+                || r.starts_with("polling only") =>
+            {
+                r
+            }
             _ => continue,
         };
         match rows.iter_mut().find(|(s, _)| *s == stage) {
-            Some(row) => row.1 = verdict,
+            Some(row) => {
+                let sticky = row.1.starts_with("degraded") || row.1.starts_with("polling only");
+                if !(sticky && verdict == "ok") {
+                    row.1 = verdict;
+                }
+            }
             None => rows.push((stage, verdict)),
         }
     }
-    rows
+    (rows, notes)
 }
 
 fn refused(generation: &str, error: impl core::fmt::Debug) {
@@ -297,6 +341,88 @@ fn completed(generation: &str, result: impl core::fmt::Debug, status: impl core:
         narf_console::Writer,
         "amdgpu: {generation} firmware {result:?}; retained {status:?}"
     );
+}
+
+/// Opt-in native Navi22 HDMI scanout with a colour-bar test pattern. The
+/// reset-on-init stage already retired the GOP's scanout, so there is no
+/// inherited stream to stop first. On success the published scanout moves
+/// the console; on failure the retained owner reports where it stopped.
+fn navi22_native_display() {
+    use core::fmt::Write;
+    // SAFETY: final synchronous boot initcall after a successful firmware run;
+    // no other display client exists and only the console writes scanout.
+    let lit = narf_scheduler::block_on_spin(unsafe { platform::modeset_hdmi() });
+    let _ = match lit {
+        Ok(out) => writeln!(
+            narf_console::Writer,
+            "amdgpu: navi22 native HDMI {}x{} {} kHz (pm {}, vstartup {}, dispclk {} dppclk {})",
+            out.timing.h_active,
+            out.timing.v_active,
+            out.timing.pixel_clock_khz,
+            out.prefetch_mode,
+            out.v_startup,
+            out.dispclk_khz,
+            out.dppclk_khz
+        ),
+        Err(error) => writeln!(
+            narf_console::Writer,
+            "amdgpu: navi22 native HDMI failed {error:?}; state {:?}",
+            platform::modeset_state()
+        ),
+    };
+}
+
+/// One serial line per board connector from native AUX/DDC/HPD detection, so
+/// the first bare-metal boot shows which sinks and EDIDs were seen. Sink reads
+/// only: no stream, scanout or framebuffer state changes.
+fn report_displays() {
+    use core::fmt::Write;
+    use narf_drivers_gpu::amdgpu_navi22_display::{Detection, Signal};
+    let reports = match narf_scheduler::block_on_spin(platform::detect_displays()) {
+        Ok(reports) => reports,
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 display probe: {error:?}"
+            );
+            return;
+        }
+    };
+    for report in reports {
+        let c = report.connector;
+        let name = match c.signal {
+            Signal::Hdmi => "HDMI-A",
+            Signal::DisplayPort => "DP",
+        };
+        let _ = write!(
+            narf_console::Writer,
+            "amdgpu: navi22 {name}-{} (ddc {}, hpd {:?}, dig {}): ",
+            c.path.connector_instance,
+            c.line,
+            c.hpd,
+            c.path.transmitter
+        );
+        let _ = match report.detection {
+            Detection::Disconnected => writeln!(narf_console::Writer, "disconnected"),
+            Detection::Failed(error) => writeln!(narf_console::Writer, "sink error {error:?}"),
+            Detection::Connected(sink) => match sink.preferred {
+                Some(t) => writeln!(
+                    narf_console::Writer,
+                    "EDID {} bytes, preferred {}x{} {} kHz{}",
+                    sink.edid.len(),
+                    t.h_active,
+                    t.v_active,
+                    t.pixel_clock_khz,
+                    if sink.hdmi { ", HDMI" } else { "" }
+                ),
+                None => writeln!(
+                    narf_console::Writer,
+                    "EDID {} bytes, no preferred timing",
+                    sink.edid.len()
+                ),
+            },
+        };
+    }
 }
 
 #[cfg(feature = "kernel-test")]
@@ -394,15 +520,29 @@ amdgpu: navi22 Sos: start
 amdgpu: navi22 Sos: failed Psp(Timeout)
 amdgpu: navi22 page faults not reported: Invalid
 amdgpu: navi22 Ring: start
+amdgpu: navi22 FenceInterrupts: start
+amdgpu: navi22 FenceInterrupts: polling only Timeout
+amdgpu: navi22 FenceInterrupts: complete
+amdgpu: navi22 VcnStart: start
+amdgpu: navi22 VcnStart: degraded Ring
+amdgpu: navi22 HDMI-A-1 (ddc 1, hpd Some(0), dig 0): disconnected
+amdgpu: navi22 thermal alert Ctf
 ";
-        let rows = summarize_stages(log);
+        let (rows, notes) = summarize_stages(log);
         let want = [
             ("ResetOnInit", "ok"),
             ("MemoryTraining", "ok"),
             ("Sos", "failed Psp(Timeout)"),
             ("Ring", "STARTED (no result)"),
+            ("FenceInterrupts", "polling only Timeout"),
+            ("VcnStart", "degraded Ring"),
         ];
-        if rows.as_slice() != want.as_slice() {
+        let want_notes = [
+            "kernel queues disabled: doorbells Unmapped",
+            "HDMI-A-1 (ddc 1, hpd Some(0), dig 0): disconnected",
+            "thermal alert Ctf",
+        ];
+        if rows.as_slice() != want.as_slice() || notes.as_slice() != want_notes.as_slice() {
             return TestResult::Fail("stage summary rows");
         }
         TestResult::Pass

@@ -7,6 +7,9 @@
 //! else through the PSP (`psp_v11_0_mode1_reset`). The reset loses PCI config
 //! state, including Resizable BAR sizes, so it is cached and restored here
 //! before any MMIO, then the PSP bootloader and NBIO MEMSIZE are awaited.
+//! The same reset core serves post-boot recovery (`Reset::new_recovery`):
+//! `amdgpu_device_gpu_recover` resets unconditionally, without the SOS
+//! sign-of-life decision.
 use crate::{amdgpu::AmdGpu, amdgpu_discovery as discovery};
 use narf_bus::{pci, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
@@ -265,11 +268,20 @@ impl Io for Mmio {
     }
 }
 
+/// Why the reset runs; only reset-on-init may skip a cold card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// `nv_need_reset_on_init`: reset only when SOS is running.
+    OnInit,
+    /// `amdgpu_device_gpu_recover` with AMD_RESET_METHOD_MODE1: always.
+    Recovery,
+}
 #[derive(Debug)]
 struct Engine<I: Io> {
     io: I,
     authority: Cap<BusDeviceCap, Write>,
     state: State,
+    mode: Mode,
 }
 async fn sleep_ms(ms: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms).as_instant()).await;
@@ -396,7 +408,7 @@ impl<I: Io> Engine<I> {
             self.state = State::Failed;
             return Err(Error::DeviceGone);
         }
-        if sos == 0 {
+        if sos == 0 && self.mode == Mode::OnInit {
             self.state = State::NotRequired;
             return Ok(None);
         }
@@ -450,14 +462,36 @@ impl Reset {
                 },
                 authority,
                 state: State::Prepared,
+                mode: Mode::OnInit,
             },
         })
+    }
+    /// The mode1 reset of `amdgpu_device_gpu_recover` for a booted card.
+    /// Constructs register windows only; performs no I/O.
+    ///
+    /// # Safety
+    /// `new`'s exclusive-ownership contract, after recovery has quiesced
+    /// every NARF queue and interrupt source and no SMU mailbox command is
+    /// outstanding: the reset discards all device state, including scanout.
+    pub unsafe fn new_recovery(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        device: BusDevice,
+    ) -> Result<Self, Error> {
+        // SAFETY: forwarded contract; construction performs no I/O.
+        let mut reset = unsafe { Self::new(gpu, authority, device) }?;
+        reset.engine.mode = Mode::Recovery;
+        Ok(reset)
+    }
+    pub fn mode(&self) -> Mode {
+        self.engine.mode
     }
     pub fn state(&self) -> State {
         self.engine.state
     }
-    /// Reset once if SOS is running; `Ok(None)` when the card is already
-    /// cold. Cancellation retains Resetting and refuses replay.
+    /// Reset once if SOS is running (always in `Mode::Recovery`); `Ok(None)`
+    /// when an init-time card is already cold. Cancellation retains
+    /// Resetting and refuses replay.
     pub async fn run(&mut self) -> Result<Option<Report>, Error> {
         self.engine.run().await
     }

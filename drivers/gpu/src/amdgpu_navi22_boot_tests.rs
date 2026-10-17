@@ -7,7 +7,7 @@ use core::{
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-fn report() -> Report {
+pub(crate) fn report() -> Report {
     Report {
         reset: None,
         smu: smu::Versions {
@@ -26,6 +26,7 @@ fn report() -> Report {
         dmub: None,
         queues: None,
         interrupts: None,
+        media: None,
     }
 }
 struct Fake {
@@ -267,6 +268,7 @@ fn firmware() -> Firmware {
         graphics: gfx::tests::fixture(),
         power: None,
         dmub: None,
+        display: None,
     }
 }
 fn navi22_runtime_commands_require_completed_boot_and_retained_tmr() -> TestResult {
@@ -299,6 +301,43 @@ fn navi22_runtime_commands_require_completed_boot_and_retained_tmr() -> TestResu
 kernel_test_in!(
     "drivers/gpu/navi22-boot",
     navi22_runtime_commands_require_completed_boot_and_retained_tmr
+);
+fn navi22_native_display_requires_routes_and_firmware_readiness() -> TestResult {
+    let pool = pool(16 << 20);
+    // SAFETY: constructor performs no I/O on this unmapped fixture.
+    let mut boot = unsafe { ColdBoot::new(&gpu(), Cap::bootstrap(), &pool, firmware()) }.unwrap();
+    // No prepared VBIOS routes: nothing to bind, and nothing claimed.
+    if boot.prepare_display() != Err(Error::Invalid) || boot.display_connectors().is_some() {
+        return TestResult::Fail("display claimed without routes");
+    }
+    for state in [
+        State::Prepared,
+        State::Running(Stage::DmubStart),
+        State::Failed {
+            stage: Stage::DmubStart,
+            error: Error::Invalid,
+        },
+        State::Released,
+    ] {
+        boot.sequence.state = state;
+        if run(boot.detect_displays()).err() != Some(Error::Busy) {
+            return TestResult::Fail("detection before firmware readiness");
+        }
+    }
+    boot.sequence.state = State::FirmwareReady(report());
+    if run(boot.detect_displays()).err() != Some(Error::Invalid) {
+        return TestResult::Fail("detection without an owner");
+    }
+    // Opting into DMUB AUX does not bypass the boot/TMR gate.
+    boot.allow_dmub_aux();
+    if run(boot.dmub_hpd(0)) != Err(Error::Busy) {
+        return TestResult::Fail("DMUB HPD escaped its gate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_native_display_requires_routes_and_firmware_readiness
 );
 fn navi22_boot_outlives_the_controller_lock() -> TestResult {
     fn send_static<T: Send + 'static>(_: &T) {}
@@ -504,4 +543,63 @@ fn navi22_boot_fence_interrupts_map_to_their_engine() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi22-boot",
     navi22_boot_fence_interrupts_map_to_their_engine
+);
+
+fn navi22_recovery_and_tdr_require_a_completed_recoverable_boot() -> TestResult {
+    let pool = pool(16 << 20);
+    let authority = Cap::bootstrap();
+    // SAFETY: constructor performs no I/O; every entry below must refuse
+    // before touching these intentionally unmapped GPU addresses.
+    let mut boot = unsafe { ColdBoot::new(&gpu(), authority, &pool, firmware()) }.unwrap();
+    for state in [
+        State::Prepared,
+        State::Running(Stage::IbTests),
+        State::Failed {
+            stage: Stage::IbTests,
+            error: Error::Invalid,
+        },
+        State::Released,
+    ] {
+        boot.sequence.state = state;
+        if boot.queue_progress().err() != Some(Error::Busy)
+            || boot.recoverable()
+            || boot.queues_verified()
+        {
+            return TestResult::Fail("TDR/recovery escaped the completed-boot gate");
+        }
+    }
+    // Completed, but without board power, PSP and IH (this fixture): no
+    // queues to sample and recovery refused before any I/O.
+    boot.sequence.state = State::FirmwareReady(report());
+    if boot.queue_progress().map(|v| v.len()) != Ok(0) || boot.recoverable() {
+        return TestResult::Fail("unprepared owner sampled or recoverable");
+    }
+    // SAFETY: refused before the IH owner (absent here) is touched.
+    if run(unsafe { boot.quiesce_for_reset() }) != Err(Error::Busy) {
+        return TestResult::Fail("quiesce of an unrecoverable owner");
+    }
+    let addr = narf_bus::PcieAddr::new(0, 3, 0, 0);
+    let device = narf_bus::BusDevice {
+        addr: narf_bus::BusAddr::Pcie(addr),
+        kind: narf_bus::BusKind::Pcie {
+            addr,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+        id: narf_bus::DeviceId {
+            vendor: 0x1002,
+            device: 0x73df,
+            class: 0x030000,
+            subsystem_vendor: 0x1462,
+            subsystem_id: 0x3985,
+        },
+    };
+    // SAFETY: refused before any constructor or I/O runs.
+    if unsafe { boot.into_recovery(device) }.err() != Some(Error::Busy) {
+        return TestResult::Fail("rebuilt an unrecoverable owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_recovery_and_tdr_require_a_completed_recoverable_boot
 );

@@ -951,16 +951,43 @@ reached through VMID0, MSI-X/MSI delivery with polling fallback, and
 overflow-safe task-context drains. It routes IVs to generation-tagged
 subscribers that receive a terminal error on device loss. Boot enables it
 after the memory hubs and proves delivery with an SDMA0 TRAP.
+PMFW telemetry now uses the retained SMU11 table buffer (V1/V2 metrics by
+PMFW version, Linux-checked layouts) and feeds a read-only hwmon node shared
+with Navi48 (temperatures, fan, power, clocks); fan control stays automatic.
+The SMU11 THM L2H/H2L, GPIO19 CTF and SMU-to-driver interrupts are armed and
+handled as smu_v11_0 does, including the delayed SW CTF check and power-off.
+Kernel-queue hang detection (2 s fence-progress timeout per ring) is active
+and logging; mode1 device recovery with a full cold-boot re-init exists behind
+an explicit opt-in API (display stays dark; training boots refuse it).
+GFXOFF, clock/power gating, memory/fabric DPM and deep sleep remain disabled
+behind a typed policy hook that states their display-admission requirements.
+VCN 3.0 now starts both discovered instances after the fence stage (Linux's
+static, power-gating-disabled path with PSP-loaded TMR images, VCPU reset
+retries, decode/encode ring and IB tests, IH-routed fences) plus JPEG 3.0 with
+a ring test; PSP loads one VCN image per unharvested instance (type 13/58)
+from the discovery harvest table, and media failures leave the boot degraded.
+Navi22 display AUX/DDC/HPD is now native, as Linux drives DCN3.0
+(`dc_is_dmub_outbox_supported` is false there): the DCE AUX engine with
+`dce_aux_transfer_with_retries` policy, I2C-over-AUX, the hardware I2C engine
+for HDMI DDC/SCDC, and HPD sense/filter/ack. After firmware readiness the boot
+logs every board connector's HPD state and EDID. DMUB AUX/HPD is refused unless
+explicitly allowed. Register models only; no physical EDID read yet.
+A native DCN3.0 DML port (`amdgpu_dml30`) admits one unscaled linear plane
+and derives DLG/TTU/RQ and HUBBUB watermark values, checked against host
+vectors computed from the Linux DML30 formulas.
+An opt-in (`amdgpu.native_display`) native HDMI TMDS path lights the first
+connected HDMI sink on pipe 0 with a test pattern: DCN init, HUBBUB/DML30
+deadlines, the DAL clocks and the VBIOS PixelClock/STREAM_SETUP/transmitter
+tables (now executed by an `atom.c`-faithful interpreter), then fetch and
+unblank. Model-tested per block; never run on hardware.
 For bare-metal runs, `cargo xtask usb-image` builds a UEFI stick whose kernel
 appends its log to `/narf-boot-<n>.log` on that stick (`narf.bootlog=`,
 marker-gated, USB-only, bounded); a secondary card's cold boot keeps the iGPU
 console live and ends with a per-stage summary (see
 [docs/BOOTING_ON_CACHYOS.md](docs/BOOTING_ON_CACHYOS.md#rx-6750-xt-bring-up-boot)).
 These are software-tested foundations; training resume,
-VCN startup, display-aware DPM and OS thermal interrupt handling,
-hardware boot, general GPU mappings/GFX10 queue initialization, production
-SDMA submissions/interrupts and DCN3.0
-modesetting remain open. See the
+media submission/DPG, display-aware DPM, user command submission,
+hardware boot and DCN3.0 modesetting remain open. See the
 [PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).
 
 1. **Stage 5 laptop proof:** boot from USB on Renoir/Lucienne or Phoenix

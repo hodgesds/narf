@@ -328,8 +328,11 @@ pub struct Psp {
 /// These are GPU addresses, not CPU mappings; consumers must keep TMR alive.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MediaFirmware {
+    /// VCN instance 0 image (`UCODE_ID_VCN`).
     pub vcn: Option<u64>,
     pub dmcub: Option<u64>,
+    /// VCN instance 1 image (`UCODE_ID_VCN1`), absent when harvested.
+    pub vcn1: Option<u64>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -1101,10 +1104,10 @@ impl<I: Io> Session<I> {
         if reply.address % 4 != 0 || offset >= tmr.mapping().len {
             return Err(Error::Invalid);
         }
-        if kind == 13 {
-            self.media_firmware.vcn = Some(reply.address);
-        } else {
-            self.media_firmware.dmcub = Some(reply.address);
+        match kind {
+            13 => self.media_firmware.vcn = Some(reply.address),
+            crate::amdgpu_gfx_firmware::VCN1_TYPE => self.media_firmware.vcn1 = Some(reply.address),
+            _ => self.media_firmware.dmcub = Some(reply.address),
         }
         Ok(())
     }

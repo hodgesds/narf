@@ -193,7 +193,7 @@ pub(in crate::amdgpu_dcn401_otg) fn vendor_infoframe(
 /// the output range (`limited` or full) when the sink can select it, else
 /// stays default. Version 3 for VICs of 128 and up. Returns HB0..HB3 then SB0..SB27, as the nine
 /// VPG_GENERIC_PACKET_DATA words carry them (HB3 and SB28.. stay zero).
-pub(in crate::amdgpu_dcn401_otg) fn avi_infoframe(
+pub(crate) fn avi_infoframe(
     t: &crate::amdgpu_dml::Timing,
     avi: Avi,
     limited: bool,
