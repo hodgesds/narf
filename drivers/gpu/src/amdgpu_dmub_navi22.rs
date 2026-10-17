@@ -484,6 +484,80 @@ impl<I: Io> Engine<I> {
         }
     }
 }
+/// `DMUB_CMD__VBIOS` (dmub_cmd.h `enum dmub_cmd_type` 128) sub-types: the
+/// VBIOS command tables DC sends to DMCUB instead of the ATOM interpreter
+/// when `dc->debug.dmub_command_table` is set (dcn30_resource.c), from
+/// command_table2.c's `*_dmcub` helpers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VbiosCommand {
+    /// `DMUB_CMD__VBIOS_DIGX_ENCODER_CONTROL`: `dig_encoder_control_parameters_v1_5`.
+    DigxEncoderControl = 0,
+    /// `DMUB_CMD__VBIOS_DIG1_TRANSMITTER_CONTROL`: the v1.6 parameters or
+    /// `dmub_dig_transmitter_control_data_v1_7`.
+    Dig1TransmitterControl = 1,
+    /// `DMUB_CMD__VBIOS_SET_PIXEL_CLOCK`: `set_pixel_clock_parameter_v1_7`.
+    SetPixelClock = 2,
+    /// `DMUB_CMD__VBIOS_ENABLE_DISP_POWER_GATING`:
+    /// `enable_disp_power_gating_parameters_v2_1`.
+    EnableDispPowerGating = 3,
+}
+const DMUB_CMD_VBIOS: u8 = 128;
+/// dc_dmub_srv.c MAX_WAIT_US: dmub_srv_wait_for_idle's bound.
+const VBIOS_WAIT_US: u64 = 100_000;
+impl VbiosCommand {
+    /// `sizeof(cmd.X) - sizeof(cmd.X.header)` under dmub_cmd.h's
+    /// `#pragma pack(1)`: the payload union/struct size.
+    pub const fn payload_bytes(self) -> usize {
+        match self {
+            Self::DigxEncoderControl => 12,
+            Self::Dig1TransmitterControl => 60,
+            Self::SetPixelClock => 16,
+            Self::EnableDispPowerGating => 4,
+        }
+    }
+}
+/// The 64-byte `union dmub_rb_cmd` command_table2.c builds: memset 0, then
+/// header.type/sub_type/payload_bytes (ret_status, multi_cmd_pending and
+/// is_reg_based stay 0) and the parameter block after the 4-byte header.
+pub(crate) fn vbios_request(command: VbiosCommand, payload: &[u8]) -> Result<[u8; 64], Error> {
+    let size = command.payload_bytes();
+    if payload.len() != size {
+        return Err(Error::Invalid);
+    }
+    let mut request = [0u8; 64];
+    request[0] = DMUB_CMD_VBIOS;
+    request[1] = command as u8;
+    request[3] = size as u8;
+    request[4..4 + size].copy_from_slice(payload);
+    Ok(request)
+}
+impl<I: Io> Engine<I> {
+    /// `dc_wake_and_execute_dmub_cmd(..., DM_DMUB_WAIT_TYPE_WAIT)`: queue,
+    /// execute, then wait (bounded, 100 ms) for the inbox to drain. Callers
+    /// are the synchronous VBIOS table paths, so the wait polls in place as
+    /// dmub_srv_wait_for_idle does (udelay(1) per poll).
+    fn vbios(&mut self, command: VbiosCommand, payload: &[u8]) -> Result<(), Error> {
+        let request = vbios_request(command, payload)?;
+        self.begin_mailbox()?;
+        let result = (|| {
+            let posted = self.post(&request)?;
+            let deadline = narf_time::Deadline::after_us(VBIOS_WAIT_US);
+            loop {
+                if self.consumed(&request, posted)?.is_some() {
+                    return Ok(());
+                }
+                if deadline.expired() {
+                    return Err(Error::CommandTimeout);
+                }
+                let poll = narf_time::Deadline::after_us(1);
+                while !poll.expired() {
+                    core::hint::spin_loop();
+                }
+            }
+        })();
+        self.finish_mailbox(result)
+    }
+}
 #[derive(Debug)]
 pub struct Dmub {
     engine: Engine<Mmio>,
@@ -546,6 +620,17 @@ impl Dmub {
     }
     pub fn state(&self) -> State {
         self.engine.state
+    }
+    /// DC's `dc->ctx->dmub_srv` test: firmware running with an idle mailbox,
+    /// so VBIOS display tables go to DMCUB rather than the ATOM interpreter.
+    pub fn vbios_ready(&self) -> bool {
+        self.engine.state == State::Running && self.engine.mailbox.state == MailboxState::Ready
+    }
+    /// Execute one VBIOS command table on DMCUB (command_table2.c
+    /// `*_dmcub`). `payload` is exactly [`VbiosCommand::payload_bytes`].
+    /// Synchronous and bounded (100 ms); a timeout fails the mailbox.
+    pub fn execute_vbios(&mut self, command: VbiosCommand, payload: &[u8]) -> Result<(), Error> {
+        self.engine.vbios(command, payload)
     }
     pub fn status(&self) -> Option<Status> {
         self.engine.status

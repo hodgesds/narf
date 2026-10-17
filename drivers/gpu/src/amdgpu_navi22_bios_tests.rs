@@ -252,3 +252,157 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/navi22-bios",
     navi22_bios_refuses_revisions_and_out_of_window_access
 );
+
+/// Records the `DMUB_CMD__VBIOS` commands a table call sends.
+struct Dmcub(narf_lib::sync::IrqSafeSpinLock<Vec<(VbiosCommand, Vec<u8>)>>);
+impl VbiosDmub for Dmcub {
+    fn execute_vbios(
+        &self,
+        command: VbiosCommand,
+        payload: &[u8],
+    ) -> Result<(), crate::amdgpu_dmub_navi22::Error> {
+        if payload.len() != command.payload_bytes() {
+            return Err(crate::amdgpu_dmub_navi22::Error::Invalid);
+        }
+        self.0.lock().push((command, payload.to_vec()));
+        Ok(())
+    }
+}
+
+/// command_table2.c on DCN3.0 (`dmub_command_table`): every display table
+/// becomes a DMUB_CMD__VBIOS command carrying the same parameter struct, the
+/// ATOM interpreter never runs (no register traffic), and table revisions
+/// the interpreter would refuse still go to DMCUB (the `*_fallback` paths).
+fn navi22_bios_tables_go_to_dmub_when_running() -> TestResult {
+    // Rev 6 SetPixelClock, no DIGxEncoderControl, an out-of-window table 76:
+    // all refused by the ATOM path, all fine for DMCUB.
+    let image = image(6);
+    let dmcub = Dmcub(narf_lib::sync::IrqSafeSpinLock::new(Vec::new()));
+    let tables = Tables::new(&image).unwrap().with_dmub(Some(&dmcub));
+    let bus = bus();
+    let clock = PixelClock {
+        otg: 2,
+        pll: 0,
+        transmitter: 3,
+        pixel_khz: 148_500,
+    };
+    let t = Transmitter {
+        action: TransmitterAction::Enable,
+        transmitter: 3,
+        mode: TransmitterMode::Hdmi,
+        lanes: 4,
+        hpd: Some(3),
+        connector: 0,
+        symbol_khz: 148_500,
+    };
+    if !tables.uses_dmub()
+        || tables.pipe_power_gating(bus.clone(), 1, PipeAction::Disable).is_err()
+        || tables.set_pixel_clock(bus.clone(), &clock).is_err()
+        || tables.hdmi_stream_setup(bus.clone(), 1, 148_500).is_err()
+        || tables.transmitter(bus.clone(), &t).is_err()
+    {
+        return TestResult::Fail("DMUB VBIOS command refused");
+    }
+    if !bus.borrow().writes.is_empty() || !bus.borrow().delays.is_empty() {
+        return TestResult::Fail("ATOM interpreter ran with DMUB present");
+    }
+    let sent = dmcub.0.lock();
+    let expect: [(VbiosCommand, Vec<u8>); 4] = [
+        (VbiosCommand::EnableDispPowerGating, vec![1, 0, 0, 0]),
+        (VbiosCommand::SetPixelClock, clock.params().unwrap().to_vec()),
+        (
+            VbiosCommand::DigxEncoderControl,
+            hdmi_stream_setup_params(1, 148_500).unwrap().to_vec(),
+        ),
+        // Table 76 is revision 6 here: the v1.6 struct in the 60-byte union.
+        (VbiosCommand::Dig1TransmitterControl, t.params(6, 0).unwrap().to_vec()),
+    ];
+    if *sent != expect {
+        return TestResult::Fail("DMUB VBIOS payloads differ from command_table2.c");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-bios",
+    navi22_bios_tables_go_to_dmub_when_running
+);
+
+/// dmub_cmd.h: header type DMUB_CMD__VBIOS (128), sub_type 0..3,
+/// payload_bytes = sizeof(cmd) - sizeof(header) under pack(1).
+fn navi22_bios_dmub_vbios_command_layout_matches_dmub_cmd_h() -> TestResult {
+    use crate::amdgpu_dmub_navi22::vbios_request;
+    for (command, sub, size) in [
+        (VbiosCommand::DigxEncoderControl, 0, 12),
+        (VbiosCommand::Dig1TransmitterControl, 1, 60),
+        (VbiosCommand::SetPixelClock, 2, 16),
+        (VbiosCommand::EnableDispPowerGating, 3, 4),
+    ] {
+        let payload: Vec<u8> = (0..size as u8).map(|i| i + 1).collect();
+        let Ok(r) = vbios_request(command, &payload) else {
+            return TestResult::Fail("VBIOS request refused");
+        };
+        if r[..4] != [128, sub, 0, size as u8]
+            || r[4..4 + size] != payload[..]
+            || r[4 + size..].iter().any(|&b| b != 0)
+        {
+            return TestResult::Fail("DMUB_CMD__VBIOS header or payload");
+        }
+        if vbios_request(command, &payload[..size - 1]).is_ok() {
+            return TestResult::Fail("short VBIOS payload accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-bios",
+    navi22_bios_dmub_vbios_command_layout_matches_dmub_cmd_h
+);
+
+/// amdgpu_atomfirmware_allocate_fb_scratch sizes the FB scratch (20 KiB
+/// default, not 16 KiB), and a clocked bus arms atom_op_jump's 20 s guard.
+fn navi22_bios_atom_fallback_uses_fb_scratch_size_and_clock() -> TestResult {
+    let base = image(7);
+    let tables = Tables::new(&base).unwrap();
+    if tables.fb_words != 20 * 1024 / 4 {
+        return TestResult::Fail("ATOM FB scratch is not allocate_fb_scratch's size");
+    }
+    struct Clocked {
+        now: u64,
+        calls: u32,
+    }
+    impl Bus for Clocked {
+        fn read(&mut self, _: u32) -> Option<u32> {
+            Some(0)
+        }
+        fn write(&mut self, _: u32, _: u32) -> bool {
+            true
+        }
+        fn delay_us(&mut self, _: u64) {}
+        fn now_ms(&mut self) -> Option<u64> {
+            self.calls += 1;
+            self.now += 1000;
+            Some(self.now)
+        }
+    }
+    // SetPixelClock replaced by `JUMP_ALWAYS 6` (a self-loop at its start).
+    let mut looped = image(7);
+    table(&mut looped, TABLE_A, 7, 0, 16, &[67, 6, 0, 91]);
+    let tables = Tables::new(&looped).unwrap();
+    let bus = Rc::new(RefCell::new(Clocked { now: 0, calls: 0 }));
+    let clock = PixelClock {
+        otg: 0,
+        pll: 0,
+        transmitter: 0,
+        pixel_khz: 25_175,
+    };
+    if tables.set_pixel_clock(bus.clone(), &clock) != Err(Error::Atom(AtomError::Stuck))
+        || !(20..1000).contains(&bus.borrow().calls)
+    {
+        return TestResult::Fail("20 s ATOM guard not driven by the clock");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-bios",
+    navi22_bios_atom_fallback_uses_fb_scratch_size_and_clock
+);

@@ -1,15 +1,19 @@
 //! The VBIOS command tables Linux DC executes for Navi22 display bring-up.
 //!
-//! DCN3.0 (`dcn30_resource.c`) does not set `debug.dmub_command_table`, so
-//! `command_table2.c` runs these through the ATOM interpreter
-//! (`amdgpu_atom_execute_table`), not DMUB: `enable_disp_power_gating_v2_1`
-//! (`dcn10_bios_golden_init`), `set_pixel_clock_v7` (the PHY PLL for HDMI/DVI,
-//! via `dce112_program_pix_clk`), `encoder_control_digx_v1_5` (STREAM_SETUP from
+//! DCN3.0 sets `debug.dmub_command_table` (`dcn30_resource.c`), so while
+//! DMUB runs `command_table2.c` sends every one of these to DMCUB as a
+//! `DMUB_CMD__VBIOS` command (`*_dmcub`, dmub_cmd.h) instead of running the
+//! ATOM interpreter: `enable_disp_power_gating_v2_1` (`dcn10_bios_golden_init`),
+//! `set_pixel_clock_v7` (the PHY PLL for HDMI/DVI, via
+//! `dce112_program_pix_clk`), `encoder_control_digx_v1_5` (STREAM_SETUP from
 //! `enc3_stream_encoder_hdmi_set_stream_attribute`) and
 //! `transmitter_control_v1_6`/`v1_7` (`dcn10_link_encoder_enable_tmds_output`
-//! and the disable path). Parameter layouts are the `atomfirmware.h` structs,
-//! filled exactly as those functions and the `command_table_helper2_dce112.c`
-//! translations do; the parameter-space sizes are Linux's.
+//! and the disable path). [`Tables::with_dmub`] selects that path; without
+//! a running DMUB the tables run in NARF's ATOM interpreter
+//! (`amdgpu_atom_execute_table`), the logged fallback. Parameter layouts are
+//! the `atomfirmware.h` structs, filled exactly as those functions and the
+//! `command_table_helper2_dce112.c` translations do; the parameter-space
+//! sizes are Linux's.
 //!
 //! Register accesses from the bytecode go to BAR5 by dword index, bounded by
 //! the mapping: an index outside it is recorded and the table fails, rather
@@ -19,6 +23,7 @@
 use crate::{
     amdgpu_atom_vm::{self as vm, AtomError, AtomState, ResolvedTable},
     amdgpu_atombios::{Atombios, ATOM_CT_WS_PTR},
+    amdgpu_dmub_navi22::{Dmub, VbiosCommand},
 };
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::RefCell;
@@ -53,6 +58,8 @@ pub enum Error {
     Atom(AtomError),
     /// The bytecode reached outside the register window or used port I/O.
     Bus,
+    /// DMCUB did not execute the `DMUB_CMD__VBIOS` command.
+    Dmub(crate::amdgpu_dmub_navi22::Error),
 }
 
 /// The action `dcn10_bios_golden_init` passes per pipe.
@@ -87,6 +94,11 @@ pub trait Bus {
     fn write(&mut self, dword: u32, value: u32) -> bool;
     /// `udelay`/`msleep` from DELAY_* opcodes.
     fn delay_us(&mut self, us: u64);
+    /// Monotonic milliseconds for atom_op_jump's 20 s stuck guard; `None`
+    /// keeps the interpreter's clockless repeat bound.
+    fn now_ms(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 /// Pack a little-endian parameter block into the dword PS Linux hands
@@ -103,11 +115,65 @@ pub struct Tables<'a> {
     bios: &'a [u8],
     atom: Atombios<'a>,
     data_table: usize,
+    /// `amdgpu_atomfirmware_allocate_fb_scratch`'s size, in dwords.
+    fb_words: usize,
+    /// The running DMUB the tables go to (`dc->ctx->dmub_srv`).
+    dmub: Option<&'a dyn VbiosDmub>,
+}
+/// Where `DMUB_CMD__VBIOS` commands go: [`DmubRoute`] on hardware.
+pub trait VbiosDmub: Sync {
+    fn execute_vbios(
+        &self,
+        command: VbiosCommand,
+        payload: &[u8],
+    ) -> Result<(), crate::amdgpu_dmub_navi22::Error>;
+}
+/// A running DMUB borrowed for one modeset. The lock only gives the `&self`
+/// table calls exclusive use of the mailbox; it is never contended.
+pub struct DmubRoute<'d>(narf_lib::sync::IrqSafeSpinLock<&'d mut Dmub>);
+impl core::fmt::Debug for DmubRoute<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DmubRoute")
+    }
+}
+impl<'d> DmubRoute<'d> {
+    /// The DMUB path when `dmub` runs with an idle mailbox (DCN3.0's
+    /// `dmub_command_table`); otherwise `None`, logged: the ATOM
+    /// interpreter is the fallback.
+    pub fn new(dmub: Option<&'d mut Dmub>) -> Option<Self> {
+        match dmub {
+            Some(dmub) if dmub.vbios_ready() => {
+                Some(Self(narf_lib::sync::IrqSafeSpinLock::new(dmub)))
+            }
+            _ => {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi22 VBIOS display tables via ATOM interpreter (DMUB not running)"
+                );
+                None
+            }
+        }
+    }
+}
+impl VbiosDmub for DmubRoute<'_> {
+    fn execute_vbios(
+        &self,
+        command: VbiosCommand,
+        payload: &[u8],
+    ) -> Result<(), crate::amdgpu_dmub_navi22::Error> {
+        let mut dmub = self
+            .0
+            .try_lock()
+            .ok_or(crate::amdgpu_dmub_navi22::Error::Busy)?;
+        dmub.execute_vbios(command, payload)
+    }
 }
 impl core::fmt::Debug for Tables<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Tables")
             .field("len", &self.bios.len())
+            .field("dmub", &self.dmub.is_some())
             .finish()
     }
 }
@@ -119,7 +185,24 @@ impl<'a> Tables<'a> {
             bios,
             atom,
             data_table: rom.master_data_table_offset as usize,
+            fb_words: crate::amdgpu_reset_navi22::atom_fb_scratch_bytes(bios).div_ceil(4),
+            dmub: None,
         })
+    }
+    /// Send every table to `dmub` (command_table2.c's `dmub_command_table`
+    /// branches) instead of the ATOM interpreter.
+    pub fn with_dmub(mut self, dmub: Option<&'a dyn VbiosDmub>) -> Self {
+        self.dmub = dmub;
+        self
+    }
+    /// True when the tables go to DMCUB.
+    pub fn uses_dmub(&self) -> bool {
+        self.dmub.is_some()
+    }
+    /// command_table2.c `*_dmcub`; `None` without a DMUB route.
+    fn dmub(&self, command: VbiosCommand, payload: &[u8]) -> Option<Result<(), Error>> {
+        let dmub = self.dmub?;
+        Some(dmub.execute_vbios(command, payload).map_err(Error::Dmub))
     }
     /// `amdgpu_atom_parse_cmd_header`'s content revision.
     pub fn revision(&self, table: u16) -> Result<u8, Error> {
@@ -145,7 +228,7 @@ impl<'a> Tables<'a> {
         params: &mut [u32],
     ) -> Result<(), Error> {
         let faulted = Rc::new(RefCell::new(false));
-        let mut state = AtomState::new(1, 4096);
+        let mut state = AtomState::new(1, self.fb_words);
         state.bios = self.bios;
         state.data_table = self.data_table;
         let atom = &self.atom;
@@ -174,6 +257,10 @@ impl<'a> Tables<'a> {
         });
         let b = bus.clone();
         state.delay_us = Box::new(move |us| b.borrow_mut().delay_us(us));
+        if bus.borrow_mut().now_ms().is_some() {
+            let b = bus.clone();
+            state.now_ms = Some(Box::new(move || b.borrow_mut().now_ms().unwrap_or(0)));
+        }
         state.pll_read = Box::new(|_| 0);
         state.pll_write = Box::new(|_, _| {});
         state.mc_read = Box::new(|_| 0);
@@ -201,8 +288,13 @@ impl<'a> Tables<'a> {
         pipe: u8,
         action: PipeAction,
     ) -> Result<(), Error> {
+        let block = pipe_power_gating_params(pipe, action)?;
+        // enable_disp_power_gating_dmcub sends `ps.param` alone.
+        if let Some(result) = self.dmub(VbiosCommand::EnableDispPowerGating, &block[..4]) {
+            return result;
+        }
         self.require(ENABLE_DISP_POWER_GATING, &[1])?;
-        let mut params = ps(&pipe_power_gating_params(pipe, action)?);
+        let mut params = ps(&block);
         self.execute(bus, ENABLE_DISP_POWER_GATING, &mut params)
     }
     /// `set_pixel_clock_v7` for an HDMI/DVI stream on combo PHY PLL `pll`.
@@ -211,8 +303,12 @@ impl<'a> Tables<'a> {
         bus: Rc<RefCell<B>>,
         clock: &PixelClock,
     ) -> Result<(), Error> {
+        let block = clock.params()?;
+        if let Some(result) = self.dmub(VbiosCommand::SetPixelClock, &block) {
+            return result;
+        }
         self.require(SET_PIXEL_CLOCK, &[7])?;
-        let mut params = ps(&clock.params()?);
+        let mut params = ps(&block);
         self.execute(bus, SET_PIXEL_CLOCK, &mut params)
     }
     /// `encoder_control_digx_v1_5` ENCODER_CONTROL_SETUP for HDMI.
@@ -222,8 +318,12 @@ impl<'a> Tables<'a> {
         dig: u8,
         pixel_khz: u32,
     ) -> Result<(), Error> {
+        let block = hdmi_stream_setup_params(dig, pixel_khz)?;
+        if let Some(result) = self.dmub(VbiosCommand::DigxEncoderControl, &block) {
+            return result;
+        }
         self.require(DIGX_ENCODER_CONTROL, &[5])?;
-        let mut params = ps(&hdmi_stream_setup_params(dig, pixel_khz)?);
+        let mut params = ps(&block);
         self.execute(bus, DIGX_ENCODER_CONTROL, &mut params)
     }
     /// `transmitter_control_v1_6`/`v1_7` as `dcn10_link_encoder_enable_tmds_output`
@@ -243,6 +343,19 @@ impl<'a> Tables<'a> {
         control: &Transmitter,
         lane_set: u8,
     ) -> Result<(), Error> {
+        if self.dmub.is_some() {
+            // init_transmitter_control: crev 6 marshals the v1.6 parameters;
+            // 7, or any other (transmitter_control_fallback), the v1.7 data.
+            // Either sits in the 60-byte dig1_transmitter_control union.
+            let revision = match self.revision(DIG1_TRANSMITTER_CONTROL) {
+                Ok(6) => 6,
+                _ => 7,
+            };
+            let bytes = control.params(revision, lane_set)?;
+            if let Some(result) = self.dmub(VbiosCommand::Dig1TransmitterControl, &bytes) {
+                return result;
+            }
+        }
         let revision = self.require(DIG1_TRANSMITTER_CONTROL, &[6, 7])?;
         let bytes = control.params(revision, lane_set)?;
         // dig_transmitter_control_ps_allocation_v1_6 is 32 bytes; the v1.7
@@ -440,6 +553,9 @@ impl Bus for Mmio {
         while !deadline.expired() {
             core::hint::spin_loop();
         }
+    }
+    fn now_ms(&mut self) -> Option<u64> {
+        Some(narf_time::wall::monotonic_ns() / 1_000_000)
     }
 }
 

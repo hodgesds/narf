@@ -1565,8 +1565,10 @@ impl ColdBoot {
         }
         h.modeset = None;
         let (vbios, crystal) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
+        let route = crate::amdgpu_navi22_bios::DmubRoute::new(h.dmub.as_mut());
         let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
-            .map_err(|e| Error::Modeset(modeset::Error::Bios(e)))?;
+            .map_err(|e| Error::Modeset(modeset::Error::Bios(e)))?
+            .with_dmub(route.as_ref().map(|r| r as _));
         let board = modeset::Board::from_vbios(vbios, *crystal).map_err(Error::Modeset)?;
         let smu = h.smu.as_mut().ok_or(Error::Invalid)?;
         let display = h.display.as_mut().ok_or(Error::Invalid)?;
@@ -1659,8 +1661,10 @@ impl ColdBoot {
         let pipeline = h.modeset.as_mut().ok_or(Error::Invalid)?;
         let stopped = h.scanout.as_mut().map(|s| s.stop());
         let (vbios, _) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
+        let route = crate::amdgpu_navi22_bios::DmubRoute::new(h.dmub.as_mut());
         let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
-            .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Bios(e)))?;
+            .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Bios(e)))?
+            .with_dmub(route.as_ref().map(|r| r as _));
         let connector = pipeline.connector();
         let display = h.display.as_mut().ok_or(Error::Invalid)?;
         let index = display

@@ -586,6 +586,13 @@ impl<'a> Image<'a> {
     }
 }
 
+/// `amdgpu_atomfirmware_allocate_fb_scratch`'s FB scratch size for `bios`
+/// (VRAM_UsageByFirmware v2.1, else the 20 KiB default), shared with the
+/// display-table interpreter (`amdgpu_navi22_bios`).
+pub(crate) fn atom_fb_scratch_bytes(bios: &[u8]) -> usize {
+    Image::parse(bios).map_or(FB_SCRATCH_DEFAULT, |image| image.fb_scratch_bytes())
+}
+
 /// The ATOM `card_info` for ASIC_Init: register callbacks through the
 /// device authority, table resolution from the retained image.
 struct Bus<'h, 'a, I: Io> {

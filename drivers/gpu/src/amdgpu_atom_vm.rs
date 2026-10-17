@@ -337,6 +337,9 @@ pub struct Closures<'a> {
     pub table_resolver: TableResolver<'a>,
     /// `udelay`/`msleep` for DELAY_MICROSEC/DELAY_MILLISEC, in microseconds.
     pub delay_us: Box<dyn FnMut(u64) + 'a>,
+    /// Monotonic milliseconds for atom_op_jump's 20 s guard (`jiffies`);
+    /// `None` selects the clockless bounds.
+    pub now_ms: Option<Box<dyn FnMut() -> u64 + 'a>>,
 }
 impl fmt::Debug for Closures<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -356,6 +359,7 @@ impl Default for Closures<'_> {
             port_write: unbound_write(),
             table_resolver: Box::new(|_id| None),
             delay_us: Box::new(|_| {}),
+            now_ms: None,
         }
     }
 }
@@ -383,6 +387,9 @@ impl<'a> Hooks<'a> for Closures<'a> {
     }
     fn delay_us(&mut self, us: u64) {
         (self.delay_us)(us)
+    }
+    fn now_ms(&mut self) -> Option<u64> {
+        self.now_ms.as_mut().map(|now| now())
     }
 }
 
