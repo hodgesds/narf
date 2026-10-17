@@ -4730,6 +4730,13 @@ POLL_REGMEM); the LUT write; INDIRECT packets NOP-aligned to end on 8
 dwords, IBs 32-byte aligned with no CSA; and an uncached FENCE (no TRAP;
 completion is polled through `FenceReader`). The ring is started with
 `IB_ENABLE`, as sdma_v7_0_gfx_resume does.
+`Sdma::submit_kernel(&[KernelOp])` queues kernel jobs on VMID0
+(framebuffer-aperture) addresses in the same ring, sequence and fence:
+`KernelOp::Fill` as sdma_v7_0_emit_fill_buffer (CONSTANT_FILL, COMPRESS,
+dword fill; dword-aligned, a multiple of 4 bytes) and `KernelOp::Copy` as
+sdma_v7_0_emit_copy_buffer (COPY_LINEAR with CPV, no DCC; non-overlapping),
+split into 1 GiB packets; a job that overflows its 256-dword slot is
+refused.
 
 ### AMD platform VBIOS
 

@@ -896,3 +896,97 @@ kernel_test_in!(
     "drivers/gpu/amdgpu_sdma_navi48",
     sdma_navi48_client_jobs_fill_the_ring
 );
+
+/// Kernel jobs as sdma_v7_0_emit_fill_buffer / emit_copy_buffer write them:
+/// CONSTANT_FILL with COMPRESS and COPY_LINEAR with CPV, split at 1 GiB,
+/// then the fence; empty, misaligned, overlapping or oversized jobs are
+/// refused, and a kernel job takes the next slot and sequence.
+fn sdma_navi48_kernel_jobs_fill_and_copy() -> TestResult {
+    let fence = 0x8_0000_5040;
+    let ops = [
+        KernelOp::Fill {
+            dst: 0x8_1000_0000,
+            bytes: 4096,
+            value: 0,
+        },
+        KernelOp::Copy {
+            src: 0x8_0000_0000,
+            dst: 0x9_0000_0000,
+            bytes: (1 << 30) + 8,
+        },
+    ];
+    let Ok(words) = kernel_words(&ops, fence, 9) else {
+        return TestResult::Fail("kernel frame refused");
+    };
+    let want = [
+        11 | 1 << 16,
+        0x1000_0000,
+        8,
+        0,
+        4095,
+        1 | 1 << 19,
+        (1 << 30) - 1,
+        0,
+        0,
+        8,
+        0,
+        9,
+        0,
+        1 | 1 << 19,
+        7,
+        0,
+        0x4000_0000,
+        8,
+        0x4000_0000,
+        9,
+        0,
+        0x30005,
+        0x5040,
+        8,
+        9,
+    ];
+    if words[..want.len()] != want || words[want.len()..].iter().any(|&w| w != 0) {
+        return TestResult::Fail("kernel frame words");
+    }
+    let fill = |dst, bytes| KernelOp::Fill {
+        dst,
+        bytes,
+        value: 0,
+    };
+    for bad in [
+        &[][..],
+        &[fill(0x1000, 0)],
+        &[fill(0x1002, 4)],
+        &[fill(0x1000, 6)],
+        &[KernelOp::Copy {
+            src: 0x1000,
+            dst: 0x1800,
+            bytes: 0x1000,
+        }],
+        &[fill(0x1000, 4); 51],
+    ] {
+        if kernel_words(bad, fence, 1).is_ok() {
+            return TestResult::Fail("bad kernel job accepted");
+        }
+    }
+    // Shares the ring with client jobs.
+    let (_pool, mut e, _aperture, _target) = fixture();
+    if e.submit_kernel(&ops) != Err(Error::Busy) {
+        return TestResult::Fail("kernel job before the proofs");
+    }
+    e.state = State::InterruptVerified;
+    e.io.complete = false;
+    e.io.memory.fill(0);
+    e.io.memory[1024..1028].copy_from_slice(&[192, 0, 192, 0]);
+    if e.submit_kernel(&ops) != Ok(1)
+        || e.io.memory[256..256 + 21] != want[..21]
+        || e.io.memory[256 + 21..256 + 25] != [0x30005, 0x5040, 8, 1]
+    {
+        return TestResult::Fail("kernel job in the ring");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_sdma_navi48",
+    sdma_navi48_kernel_jobs_fill_and_copy
+);
