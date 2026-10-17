@@ -184,6 +184,39 @@ pub struct GemObject {
 }
 
 impl GemObject {
+    /// The CPU address of byte `offset` of the buffer, if 8 bytes from
+    /// there lie inside it.
+    fn cpu_ptr(&self, offset: u64) -> Option<*mut u8> {
+        if offset.checked_add(8)? > self.byte_len {
+            return None;
+        }
+        Some(match &self.backing {
+            Backing::System(_) => {
+                narf_memory::PhysAddr::new(self.phys + offset).kernel_mut_ptr::<u8>()
+            }
+            Backing::Vram { _held } => (_held.mapping().virt + offset) as *mut u8,
+        })
+    }
+
+    /// The 64-bit value at byte `offset`, read by the CPU.
+    pub fn load_u64(&self, offset: u64) -> Option<u64> {
+        let at = self.cpu_ptr(offset)?;
+        // SAFETY: `cpu_ptr` bounds 8 bytes inside this buffer's kernel
+        // mapping (the direct map, or the reservation's BAR window), live
+        // while `self` is.
+        Some(u64::from_le_bytes(unsafe {
+            core::ptr::read_volatile(at.cast::<[u8; 8]>())
+        }))
+    }
+
+    /// Store `value` at byte `offset` from the CPU.
+    pub fn store_u64(&self, offset: u64, value: u64) -> Option<()> {
+        let at = self.cpu_ptr(offset)?;
+        // SAFETY: as `load_u64`.
+        unsafe { core::ptr::write_volatile(at.cast::<[u8; 8]>(), value.to_le_bytes()) };
+        Some(())
+    }
+
     /// Where the buffer lives: `AMDGPU_GEM_DOMAIN_VRAM` or `_GTT`.
     pub fn domain(&self) -> u32 {
         if self.system {

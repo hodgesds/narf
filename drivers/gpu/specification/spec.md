@@ -3575,6 +3575,11 @@ index in its high 32 bits (`Submitter::ring_for` maps an IP/ring to it).
 An address space keeps its last ticket per ring (`VmState::last_jobs`); a
 deferred free waits for all of them, and GEM_WAIT_IDLE for each.
 Dependencies must name a ring the engine serves and a handle of that ring.
+A `FENCE` chunk (`Submission::user_fence`: handle, offset) names a
+one-page GEM buffer of the open with the 8 bytes at `offset` inside it
+(EINVAL otherwise, as amdgpu_cs_p1_user_fence); the job's handle is stored
+there by the CPU when a fence read retires the job (`GemObject::store_u64`
+through `defer_until`), never replacing a newer handle of the same ring.
 
 The Navi48 platform registers both kernel queues as its card's submitter
 after boot: up to eight IBs per submission (`Job::new`, in order in one

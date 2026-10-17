@@ -11468,12 +11468,9 @@ fn smoke_amdgpu_cs_parser_rejects_hostile_input() -> TestResult {
 
     // ── chunks that are refused rather than ignored ──
     // A dropped ordering constraint is a race, not an error.
-    for id in [
-        u::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT,
-        u::AMDGPU_CHUNK_ID_FENCE,
-    ] {
+    {
         let mut other = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
-        other.header[0] = id;
+        other.header[0] = u::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT;
         if !matches!(run(&other), Err(FsError::Unsupported)) {
             return TestResult::Fail("a synchronisation chunk must be refused, never ignored");
         }
@@ -11827,6 +11824,45 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
             if run(cs_cmd, &mut c.req) != Err(FsError::InvalidData) {
                 return Some("dependency on another ring's ticket");
             }
+        }
+        // A user fence: a one-page buffer gets the job's handle once a
+        // fence read retires the job, never stepping back to an older one.
+        let mut page = [0u8; 32];
+        page[0..8].copy_from_slice(&GPU_PAGE_SIZE.to_le_bytes());
+        page[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+        crate::amdgpu_gem::dispatch(
+            DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+            page.as_mut_ptr() as usize,
+            &gem,
+        )
+        .ok()?;
+        let fence_bo = u32::from_le_bytes(page[0..4].try_into().unwrap());
+        let object = gem.object(fence_bo)?;
+        let fenced =
+            |offset: u32| cs_with(&[(u::AMDGPU_CHUNK_ID_FENCE, alloc::vec![fence_bo, offset])]);
+        let mut first = fenced(16);
+        let mut second = fenced(16);
+        if run(cs_cmd, &mut first.req).is_err() || run(cs_cmd, &mut second.req).is_err() {
+            return Some("CS with a user fence");
+        }
+        let a = u64::from_le_bytes(first.req[0..8].try_into().unwrap());
+        let b = u64::from_le_bytes(second.req[0..8].try_into().unwrap());
+        if object.load_u64(16) != Some(0) {
+            return Some("user fence written before the job retired");
+        }
+        crate::amdgpu_cs::retire(card, &|t| t <= b);
+        if object.load_u64(16) != Some(b) || b != a + 1 {
+            return Some("user fence after both jobs retired");
+        }
+        for (bo, offset) in [(fence_bo, 4089), (handle, 0), (fence_bo + 99, 0)] {
+            let mut c = cs_with(&[(u::AMDGPU_CHUNK_ID_FENCE, alloc::vec![bo, offset])]);
+            if run(cs_cmd, &mut c.req) != Err(FsError::InvalidData) {
+                return Some("bad user fence");
+            }
+        }
+        let mut c = cs_with(&[(u::AMDGPU_CHUNK_ID_FENCE, alloc::vec![fence_bo])]);
+        if run(cs_cmd, &mut c.req) != Err(FsError::InvalidData) {
+            return Some("short fence chunk");
         }
         None
     })();

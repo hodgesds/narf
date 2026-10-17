@@ -59,11 +59,11 @@
 //! client reaches this ioctl at all; it is reachable only by something that
 //! ignored that answer.
 //!
-//! LINUX-GAP: besides IBs, `SYNCOBJ_IN`/`_OUT`, `BO_HANDLES` and the two
-//! dependency chunks are accepted. Timeline syncobjs and `FENCE` each
-//! express a constraint this does not honour yet, and are REFUSED rather than ignored: a client that asked for its work
-//! to wait on a fence and had that silently dropped would get a race, not
-//! an error.
+//! LINUX-GAP: besides IBs, `SYNCOBJ_IN`/`_OUT`, `BO_HANDLES`, `FENCE` (see
+//! `UserFence`) and the two dependency chunks are accepted. Timeline
+//! syncobjs express a constraint this does not honour yet, and are REFUSED
+//! rather than ignored: a client that asked for its work to wait on a fence
+//! and had that silently dropped would get a race, not an error.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -135,6 +135,9 @@ pub struct Submission {
     /// Earlier submissions the job waits for (`AMDGPU_CHUNK_ID_DEPENDENCIES`),
     /// or only needs scheduled (`SCHEDULED_DEPENDENCIES`, `scheduled` set).
     pub dependencies: Vec<Dependency>,
+    /// The user fence (`AMDGPU_CHUNK_ID_FENCE`): a GEM handle and the byte
+    /// offset the job's handle is written at once it completes.
+    pub user_fence: Option<(u32, u32)>,
 }
 
 /// `drm_amdgpu_cs_chunk_dep`: a submission named by its context, ring and
@@ -330,6 +333,7 @@ pub fn parse(
     let mut out_syncobjs = Vec::new();
     let mut bo_handles = None;
     let mut dependencies = Vec::new();
+    let mut user_fence = None;
     for pointer in pointers {
         if pointer == 0 {
             return Err(FsError::BadAddress);
@@ -389,10 +393,19 @@ pub fn parse(
                     });
                 }
             }
+            // `drm_amdgpu_cs_chunk_fence { handle, offset }`; a later chunk
+            // replaces an earlier one, as in Linux.
+            uapi::AMDGPU_CHUNK_ID_FENCE => {
+                // SAFETY: as above.
+                let words = unsafe { read_dwords(chunk_data, length_dw, 64)? };
+                let [handle, offset, ..] = words[..] else {
+                    return Err(FsError::InvalidData);
+                };
+                user_fence = Some((handle, offset));
+            }
             // Refused rather than ignored — see the module LINUX-GAP. A
             // dropped ordering constraint is a race, not an error.
-            uapi::AMDGPU_CHUNK_ID_FENCE
-            | uapi::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT
+            uapi::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT
             | uapi::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL => return Err(FsError::Unsupported),
             _ => return Err(FsError::InvalidData),
         }
@@ -409,6 +422,7 @@ pub fn parse(
         out_syncobjs,
         bo_handles,
         dependencies,
+        user_fence,
     })
 }
 
@@ -502,6 +516,30 @@ impl crate::drm::syncobj::DmaFence for JobFence {
     fn signal(&self) {}
     fn context(&self) -> Option<u64> {
         Some(u64::from(self.card))
+    }
+}
+
+/// A job's user fence: written with the job's handle when the job retires.
+///
+/// LINUX-GAP: Linux has the ring write it (amdgpu_ring_emit_fence after
+/// the IBs); here the CPU stores it when a fence read retires the job, so
+/// a client polling the buffer may see it late and falls back to WAIT_CS,
+/// which retires it.
+struct UserFence {
+    object: Arc<crate::amdgpu_gem::GemObject>,
+    offset: u64,
+    ticket: u64,
+}
+impl Drop for UserFence {
+    fn drop(&mut self) {
+        // Retirement order is not job order: never step a ring's fence
+        // back to an older job.
+        let current = self.object.load_u64(self.offset).unwrap_or(0);
+        let older = current >> 32 == self.ticket >> 32
+            && (self.ticket as u32).wrapping_sub(current as u32) as i32 <= 0;
+        if !older {
+            let _ = self.object.store_u64(self.offset, self.ticket);
+        }
     }
 }
 
@@ -665,9 +703,32 @@ pub async fn dispatch_async(
             narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
         }
     }
+    // amdgpu_cs_p1_user_fence: a one-page buffer of this open, with the
+    // 8-byte fence inside it.
+    let user_fence = match submission.user_fence {
+        Some((handle, offset)) => {
+            let object = gem.lookup(handle).ok_or(FsError::InvalidData)?;
+            if object.byte_len != 4096 || offset > 4096 - 8 {
+                return Err(FsError::InvalidData);
+            }
+            Some((object, u64::from(offset)))
+        }
+        None => None,
+    };
     let seq = engine.submit(vm, &submission).await?;
     // What this space drops from now on waits for this job.
     vm.note_job(seq);
+    if let Some((object, offset)) = user_fence {
+        defer_until(
+            card,
+            alloc::vec![seq],
+            Box::new(UserFence {
+                object,
+                offset,
+                ticket: seq,
+            }),
+        );
+    }
     // amdgpu_cs_post_dependencies: the out syncobjs carry the job's fence.
     if !out.is_empty() {
         let fence: Arc<dyn crate::drm::syncobj::DmaFence> = Arc::new(JobFence {
