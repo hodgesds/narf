@@ -426,3 +426,91 @@ kernel_test_in!(
     "drivers/gpu/psp-ring",
     psp_navi22_media_entry_points_must_belong_to_retained_tmr
 );
+
+fn psp_navi48_graphics_global_order_autoload_and_media() -> TestResult {
+    let firmware = crate::amdgpu_navi48_firmware::fixture();
+    let images = firmware.images().unwrap();
+    let (pool, mut s) = prepared();
+    if run(s.load_gfx12(&images)).is_err() || s.gfx_state != GfxLoadState::Accepted {
+        return TestResult::Fail("GC12 graphics set not accepted");
+    }
+    let submissions = &s.engine.io.submissions[2..];
+    let expected = &crate::amdgpu_navi48_ucode::UPLOAD_ORDER[1..];
+    let types: Vec<_> = submissions
+        .iter()
+        .filter(|c| c[2] == 6)
+        .map(|c| c[10])
+        .collect();
+    let auto = submissions.iter().position(|c| c[2] == 0x21).unwrap();
+    if types != expected
+        || submissions.len() != expected.len() + 1
+        || submissions[auto - 1][10] != 8
+        || submissions[auto + 1][10] != 13
+        || s.engine.io.violation
+        || s.payload.is_some()
+        || s.media_firmware.vcn != Some(0x8_0010_1000)
+        || s.media_firmware.dmcub != Some(0x8_0020_0000)
+        || run(s.load_gfx12(&images)) != Err(Error::Busy)
+    {
+        return TestResult::Fail("GC12 global UCODE order, autoload, media bounds or replay");
+    }
+    // SAFETY: model has no firmware consumers or real GPU memory.
+    unsafe { run(s.stop()) }.unwrap();
+    drop(s);
+    if pool.available() != 16 << 20 {
+        return TestResult::Fail("GC12 verified stop leaked memory");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_navi48_graphics_global_order_autoload_and_media
+);
+
+fn psp_navi48_interrupted_upload_preserves_ownership() -> TestResult {
+    let firmware = crate::amdgpu_navi48_firmware::fixture();
+    let images = firmware.images().unwrap();
+    for kind in [71, 94, 82, 8, 13, 51] {
+        let (pool, mut s) = prepared();
+        s.engine.io.stall_command = Some(6);
+        s.engine.io.stall_type = Some(kind);
+        {
+            let mut future = core::pin::pin!(s.load_gfx12(&images));
+            for _ in 0..50 {
+                if future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready()
+                {
+                    return TestResult::Fail("stalled GC12 upload completed");
+                }
+            }
+        }
+        if s.gfx_state != GfxLoadState::Loading
+            || s.engine.state != State::Pending
+            || s.engine.io.submissions.last().unwrap()[10] != kind
+            || run(s.load_gfx12(&images)) != Err(Error::Busy)
+        {
+            return TestResult::Fail("cancelled GC12 upload lost stage or allowed replay");
+        }
+        drop(s);
+        if pool.available() != (16 << 20) - BUFFER_SIZE - (4 << 20) - 4096 {
+            return TestResult::Fail("cancelled GC12 upload recycled PSP-owned payload/TMR");
+        }
+    }
+    let (_, mut s) = prepared();
+    s.engine.io.reject = 7;
+    s.engine.io.reject_command = Some(6);
+    s.engine.io.reject_type = Some(94);
+    if run(s.load_gfx12(&images)) != Err(Error::Rejected(7))
+        || s.gfx_state != GfxLoadState::Failed
+        || s.engine.io.submissions.iter().any(|c| c[2] == 0x21)
+    {
+        return TestResult::Fail("failed RS64 stack load still started RLC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_navi48_interrupted_upload_preserves_ownership
+);

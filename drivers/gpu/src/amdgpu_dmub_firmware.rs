@@ -190,6 +190,26 @@ impl<'a> Image<'a> {
         {
             return Err(Error::UnsupportedLayout);
         }
+        self.prepare_regions(vbios, 0)
+    }
+
+    /// DCN4.0.1 uses an additional uncached Region6 shared-state allocation.
+    /// Feature blocks are retained and zeroed; preparing them enables no IPS,
+    /// cursor offload or other optional firmware behavior.
+    pub fn prepare_dcn401(self, vbios: &'a [u8]) -> Result<Prepared<'a>, Error> {
+        if (u16_at(self.bytes, 12), u16_at(self.bytes, 14)) != (4, 0)
+            || !self.data.is_empty()
+            || (self.metadata.shared_state_features as u32 + 1) * 256
+                > self.metadata.shared_state_size
+        {
+            return Err(Error::UnsupportedLayout);
+        }
+        // Linux DMUB_FW_HEADER_SHARED_STATE_SIZE: six 256-byte feature blocks.
+        let shared = self.metadata.shared_state_size.max(1536) as usize;
+        self.prepare_regions(vbios, shared)
+    }
+
+    fn prepare_regions(self, vbios: &'a [u8], shared: usize) -> Result<Prepared<'a>, Error> {
         if vbios.is_empty() || vbios.len() > MAX_VBIOS_SIZE {
             return Err(Error::InvalidSize);
         }
@@ -201,8 +221,9 @@ impl<'a> Image<'a> {
             RING_SIZE as usize * 2,
             self.metadata.trace_size as usize,
             self.metadata.state_size as usize,
+            shared,
         ];
-        let mut regions = [Region { offset: 0, size: 0 }; 7];
+        let mut regions = [Region { offset: 0, size: 0 }; 8];
         let mut end = 0;
         for (region, size) in regions.iter_mut().zip(sizes) {
             if size > MAX_WINDOW_SIZE {
@@ -244,6 +265,7 @@ pub enum Window {
     Mailbox,
     Trace,
     State,
+    SharedState,
 }
 
 /// Byte offsets into a caller-owned allocation, not physical GPU addresses.
@@ -255,7 +277,7 @@ pub struct Region {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
-    regions: [Region; 7],
+    regions: [Region; 8],
     size: u32,
 }
 impl Layout {

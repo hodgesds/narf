@@ -970,3 +970,261 @@ test!(alsa_cross_card_suspend_reset_and_xrun_group, {
     );
     assert_eq!(state(p.as_ref(), &m), 2);
 });
+
+/// An HDMI sink's controls the way Linux exposes them: the jack on the CARD
+/// interface, the ELD as volatile read-only bytes on the PCM interface.
+#[derive(Debug)]
+struct HdmiDevice;
+impl PcmDevice for HdmiDevice {
+    fn open(&self, _: bool, _: u32) -> Result<Box<dyn PcmHardware>, SoundError> {
+        Err(SoundError::NoSuchDevice)
+    }
+    fn controls(&self) -> Vec<ControlId> {
+        alloc::vec![
+            ControlId {
+                index: 0,
+                kind: ControlKind::HdmiJack,
+            },
+            ControlId {
+                index: 1,
+                kind: ControlKind::Eld,
+            },
+        ]
+    }
+    fn get_control(&self, id: ControlId) -> Result<ControlValue, SoundError> {
+        Ok(match id.kind {
+            ControlKind::HdmiJack => ControlValue::boolean(true),
+            _ => ControlValue::bytes(&[0x10, 0, 2, 0, 0, 0x10, 0, 1, 9, 7, 7, 0]),
+        })
+    }
+}
+test!(alsa_hdmi_jack_and_eld_controls, {
+    let card = crate::register_hardware_card(
+        crate::CardInfo {
+            index: 0,
+            driver: "alsa-test",
+            id: "HDMI",
+            name: "HDMI ABI test",
+            playback_count: 1,
+            capture_count: 0,
+        },
+        Arc::new(HdmiDevice),
+    );
+    let f = crate::devfs_bridge::SoundControlFile::new(card)
+        .open_instance_checked(true)
+        .unwrap()
+        .unwrap();
+    let m = Memory::new();
+    // Looked up by name and interface, as alsa-lib's hctl does.
+    let mut id = [0u8; 64];
+    put32(&mut id, 4, 3);
+    id[16..19].copy_from_slice(b"ELD");
+    let mut info = alloc::vec![0; 272];
+    info[..64].copy_from_slice(&id);
+    m.put(128, &info);
+    ctl(f.as_ref(), &m, 0x11, 272, 128).unwrap();
+    let bytes = m.bytes.lock()[128..400].to_vec();
+    assert_eq!(get32(&bytes, 0), 2); // numid
+    assert_eq!(get32(&bytes, 64), 4); // SNDRV_CTL_ELEM_TYPE_BYTES
+    assert_eq!(get32(&bytes, 68) & 7, 1 | 4); // READ | VOLATILE
+    assert_eq!(get32(&bytes, 72), 12); // the ELD's length
+    let mut value = alloc::vec![0; 1224];
+    value[..64].copy_from_slice(&id);
+    m.put(2048, &value);
+    ctl(f.as_ref(), &m, 0x12, 1224, 2048).unwrap();
+    assert_eq!(
+        m.bytes.lock()[2048 + 72..2048 + 84],
+        [0x10, 0, 2, 0, 0, 0x10, 0, 1, 9, 7, 7, 0]
+    );
+    assert_eq!(
+        ctl(f.as_ref(), &m, 0x13, 1224, 2048),
+        Err(FsError::OperationNotPermitted)
+    );
+    // The jack is a boolean on CARD; MIXER does not find it.
+    let mut id = [0u8; 64];
+    put32(&mut id, 4, 2);
+    let name = b"HDMI/DP,pcm=0 Jack";
+    id[16..16 + name.len()].copy_from_slice(name);
+    let mut info = alloc::vec![0; 272];
+    info[..64].copy_from_slice(&id);
+    m.put(128, &info);
+    assert_eq!(ctl(f.as_ref(), &m, 0x11, 272, 128), Err(FsError::NotFound));
+    put32(&mut info, 4, 1);
+    m.put(128, &info);
+    ctl(f.as_ref(), &m, 0x11, 272, 128).unwrap();
+    assert_eq!(get32(&m.bytes.lock(), 128 + 64), 1);
+    drop(f);
+    crate::unregister_hardware_card(card);
+});
+
+/// HDMI digital-output controls as Linux's HDA HDMI codec exposes them:
+/// IEC958 status on MIXER (snd_hda_create_dig_out_ctls) and the channel map
+/// on PCM with a TLV callback (snd_hdac_add_chmap_ctls).
+#[derive(Debug)]
+struct DigitalDevice {
+    status: IrqSafeSpinLock<[u8; 24]>,
+    map: IrqSafeSpinLock<[i32; 8]>,
+}
+impl PcmDevice for DigitalDevice {
+    fn open(&self, _: bool, _: u32) -> Result<Box<dyn PcmHardware>, SoundError> {
+        Err(SoundError::NoSuchDevice)
+    }
+    fn controls(&self) -> Vec<ControlId> {
+        alloc::vec![
+            ControlId {
+                index: 0,
+                kind: ControlKind::Iec958Default,
+            },
+            ControlId {
+                index: 1,
+                kind: ControlKind::ChannelMap,
+            },
+            ControlId {
+                index: 2,
+                kind: ControlKind::Iec958ConMask,
+            },
+        ]
+    }
+    fn get_control(&self, id: ControlId) -> Result<ControlValue, SoundError> {
+        Ok(match id.kind {
+            ControlKind::Iec958Default => ControlValue::Iec958(*self.status.lock()),
+            ControlKind::Iec958ConMask => ControlValue::iec958(&[0x0f, 0xff]),
+            _ => ControlValue::integers(&*self.map.lock()),
+        })
+    }
+    fn set_control(&self, id: ControlId, value: ControlValue) -> Result<(), SoundError> {
+        match (id.kind, value) {
+            (ControlKind::Iec958Default, ControlValue::Iec958(status)) => {
+                *self.status.lock() = status;
+            }
+            (ControlKind::ChannelMap, ControlValue::Integers { len: 8, values })
+                if values.iter().all(|v| (0..=36).contains(v)) =>
+            {
+                *self.map.lock() = values;
+            }
+            _ => return Err(SoundError::OutOfRange),
+        }
+        Ok(())
+    }
+    fn control_tlv(&self, _: ControlId) -> Result<Vec<u32>, SoundError> {
+        // One freely swappable stereo map.
+        Ok(alloc::vec![0, 16, 0x102, 8, 3, 4])
+    }
+}
+test!(alsa_iec958_and_channel_map_controls, {
+    let card = crate::register_hardware_card(
+        crate::CardInfo {
+            index: 0,
+            driver: "alsa-test",
+            id: "HDMI",
+            name: "HDMI digital test",
+            playback_count: 1,
+            capture_count: 0,
+        },
+        Arc::new(DigitalDevice {
+            status: IrqSafeSpinLock::new([0; 24]),
+            map: IrqSafeSpinLock::new([3, 4, 0, 0, 0, 0, 0, 0]),
+        }),
+    );
+    let f = crate::devfs_bridge::SoundControlFile::new(card)
+        .open_instance_checked(true)
+        .unwrap()
+        .unwrap();
+    let m = Memory::new();
+    let element = |numid: u32| {
+        let mut b = alloc::vec![0; 272];
+        put32(&mut b, 0, numid);
+        b
+    };
+    // IEC958: SNDRV_CTL_ELEM_TYPE_IEC958, one element, read/write.
+    m.put(128, &element(1));
+    ctl(f.as_ref(), &m, 0x11, 272, 128).unwrap();
+    let element_info = m.bytes.lock()[128..400].to_vec();
+    assert_eq!(get32(&element_info, 4), 2); // MIXER
+    assert_eq!(&element_info[16..39], b"IEC958 Playback Default");
+    assert_eq!(get32(&element_info, 64), 5);
+    assert_eq!(get32(&element_info, 68), 3);
+    assert_eq!(get32(&element_info, 72), 1);
+    // The status bytes lead snd_aes_iec958 in the value union.
+    let mut value = alloc::vec![0; 1224];
+    put32(&mut value, 0, 1);
+    value[72..76].copy_from_slice(&[0x06, 0x82, 0, 0x02]);
+    value[96] = 0xee; // subcode: not part of the status
+    m.put(2048, &value);
+    ctl(f.as_ref(), &m, 0x13, 1224, 2048).unwrap();
+    m.put(2048, &element(1));
+    ctl(f.as_ref(), &m, 0x12, 1224, 2048).unwrap();
+    assert_eq!(
+        m.bytes.lock()[2048 + 72..2048 + 97],
+        [0x06, 0x82, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
+    // The consumer mask is read-only.
+    m.put(128, &element(3));
+    ctl(f.as_ref(), &m, 0x11, 272, 128).unwrap();
+    assert_eq!(get32(&m.bytes.lock(), 128 + 68) & 3, 1);
+    m.put(2048, &element(3));
+    ctl(f.as_ref(), &m, 0x12, 1224, 2048).unwrap();
+    assert_eq!(m.bytes.lock()[2048 + 72..2048 + 74], [0x0f, 0xff]);
+    assert_eq!(
+        ctl(f.as_ref(), &m, 0x13, 1224, 2048),
+        Err(FsError::OperationNotPermitted)
+    );
+    // Channel map: PCM interface, eight integers 0..=SNDRV_CHMAP_LAST,
+    // TLV_READ | TLV_CALLBACK.
+    m.put(128, &element(2));
+    ctl(f.as_ref(), &m, 0x11, 272, 128).unwrap();
+    let element_info = m.bytes.lock()[128..400].to_vec();
+    assert_eq!(get32(&element_info, 4), 3);
+    assert_eq!(&element_info[16..36], b"Playback Channel Map");
+    assert_eq!(get32(&element_info, 64), 2);
+    assert_eq!(get32(&element_info, 68), 3 | 0x10 | 0x1000_0000);
+    assert_eq!(get32(&element_info, 72), 8);
+    assert_eq!(get64(&element_info, 88), 36);
+    let mut value = alloc::vec![0; 1224];
+    put32(&mut value, 0, 2);
+    for (i, v) in [4u64, 3, 0, 0, 0, 0, 0, 7].iter().enumerate() {
+        put64(&mut value, 72 + 8 * i, *v);
+    }
+    m.put(2048, &value);
+    ctl(f.as_ref(), &m, 0x13, 1224, 2048).unwrap();
+    m.put(2048, &element(2));
+    ctl(f.as_ref(), &m, 0x12, 1224, 2048).unwrap();
+    for (i, v) in [4u64, 3, 0, 0, 0, 0, 0, 7].iter().enumerate() {
+        assert_eq!(m.word(2048 + 72 + 8 * i), *v);
+    }
+    put64(&mut value, 72, 37);
+    m.put(2048, &value);
+    assert_eq!(
+        ctl(f.as_ref(), &m, 0x13, 1224, 2048),
+        Err(FsError::InvalidData)
+    );
+    // TLV read: the container; a short buffer is ENOMEM, as Linux's
+    // callback reports it; writes and commands are ENXIO.
+    let mut tlv = [0; 8];
+    put32(&mut tlv, 0, 2);
+    put32(&mut tlv, 4, 16);
+    m.put(4096, &tlv);
+    assert_eq!(
+        ctl(f.as_ref(), &m, 0x1a, 8, 4096),
+        Err(FsError::OutOfMemory)
+    );
+    put32(&mut tlv, 4, 64);
+    m.put(4096, &tlv);
+    ctl(f.as_ref(), &m, 0x1a, 8, 4096).unwrap();
+    let words: Vec<u32> = (0..6)
+        .map(|i| get32(&m.bytes.lock(), 4104 + 4 * i))
+        .collect();
+    assert_eq!(words, [0, 16, 0x102, 8, 3, 4]);
+    assert_eq!(
+        ctl(f.as_ref(), &m, 0x1b, 8, 4096),
+        Err(FsError::NoDeviceAddress)
+    );
+    put32(&mut tlv, 0, 1);
+    m.put(4096, &tlv);
+    assert_eq!(
+        ctl(f.as_ref(), &m, 0x1a, 8, 4096),
+        Err(FsError::NoDeviceAddress)
+    );
+    drop(f);
+    crate::unregister_hardware_card(card);
+});

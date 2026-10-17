@@ -96,7 +96,7 @@ impl FamilyOffsets {
 /// Default-empty so callers without registered offsets fall
 /// back to the compile-time MP0 base in
 /// `Family::mp0_base()`.
-const N_FAMILIES: usize = 6; // Vega / Renoir / Navi1 / Navi2 / Navi3 / Phoenix
+const N_FAMILIES: usize = 7; // Vega / Renoir / Navi1 / Navi2 / Navi3 / Phoenix / Navi4
 
 static REGISTRY: IrqSafeSpinLock<[FamilyOffsets; N_FAMILIES]> =
     IrqSafeSpinLock::new([FamilyOffsets::empty(); N_FAMILIES]);
@@ -109,6 +109,7 @@ fn family_index(f: Family) -> usize {
         Family::Navi2 => 3,
         Family::Navi3 => 4,
         Family::Phoenix => 5,
+        Family::Navi4 => 6,
     }
 }
 

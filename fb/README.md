@@ -40,7 +40,7 @@ device filesystem, and the userspace draw path. A `kernel-test`
 feature lets it suppress live status-panel repaints while a test
 installs a synthetic scanout.
 
-For Navi22, a final synchronous boot initcall pauses the early console and
+For Navi22 and Navi48, a final synchronous boot initcall pauses the early console and
 cached writers while the GPU firmware owner trains GDDR6 and boots firmware.
 It is registered during Subsys so firmware scans and ordinary Late setup run
 first; it completes before executor polling or userspace framebuffer mappings.
@@ -48,3 +48,17 @@ Preflight failures restore access. Once hardware startup begins, a failure on
 the primary GPU leaves framebuffer access unavailable pending recovery; serial
 logging continues. This boot-only handoff cannot revoke runtime mmap writers.
 See the [GPU handoff contract](../drivers/gpu/specification/spec.md#navi-22-boot-ownership-and-framebuffer-handoff).
+Navi48 selects its PSP14/SMU14/GMC12/SDMA7/DCN4 owner and preserves the same
+preflight rollback and primary-framebuffer quarantine behavior.
+
+Runtime generic scanout replacement uses `narf_drivers_gpu::scanout_access`
+epochs. FbWriter drawing, cursor/status views and DRM fallback copies retain
+their mapping until the last CPU access finishes. Navi48 withdrawal and flips
+drain retired epochs before teardown or back-buffer reuse. Leases keep IRQs
+enabled but prevent task preemption until a device-memory fence completes;
+they must not cross a yield or await. Raw framebuffer views require the same
+lease or independent ownership of the backing. A failed boot restoration
+clears the mapping so cached writers become empty. This CPU barrier does not
+prove hardware fetch retirement. Navi48's monitor combines it with native
+fetch/route/power checks and an HDP/PCIe drain before releasing current and
+parked display-only VRAM reservations after successful teardown.

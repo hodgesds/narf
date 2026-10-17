@@ -77,6 +77,2841 @@ GC version rejects its `DEV_INFO`. This identifies the device; acceleration
 continues to report unavailable. Navi 22 firmware, GMC/GFX10 execution and
 DCN3.0 display bring-up are not enabled by this probe path.
 
+### Navi 48 PCIe probe (RX 9070 XT)
+
+The next discrete target is Navi48, selected from the September 2026
+[Steam PC video-card survey](https://store.steampowered.com/hwsurvey/videocard/):
+RX 9070 XT is the leading named AMD card at 1.42%. The larger generic
+"AMD Radeon Graphics" entry does not identify a chip. This selection is a
+dated snapshot, not a permanent popularity claim.
+
+`1002:7550` binds as `Family::Navi4`, `asic="navi48"`. This ID also covers
+RX 9070/GRE; neither SKU nor enabled CU count is inferred from it. Probe uses
+the existing bounded PCIe discovery reader and total/visible VRAM accounting.
+`DEV_INFO` requires exactly one GC0 12.0.1 discovery record and a GC topology
+table, then reports `AMDGPU_FAMILY_GC_12_0_0` (152), eight hardware contexts,
+and GMC12's 48-bit VA geometry. Shader geometry describes discovered maxima;
+the active CU count, CU bitmap and enabled render-backend mask remain zero
+until the cold-boot owner samples harvesting. `ACCEL_WORKING` remains zero.
+
+`unsafe amdgpu_gfx12_topology::read` requires exclusive GRBM selector ownership
+and ready firmware/power. It validates GC12.0.1 banks and discovery dimensions,
+combines fused and inherited software SA/WGP/RB disable masks, and restores
+the previous GRBM selector on success and failure within one capability
+invocation. It never changes harvesting masks. `Topology` reports active CUs,
+shader arrays, enabled RBs and Linux's 4×4 CU bitmap packing (SE4–7 in columns
+2/3). Cold boot publishes this inventory to `DEV_INFO` after initial power
+setup; it does not advertise queues or acceleration.
+
+When VFCT has no image, VBIOS acquisition supports the SMUIO14.0.2 ROM read
+ports (`0xe4/0xe5`, base index zero) only with matching GC12.0.1 and NBIO7.7.0
+or 7.7.1 discovery. The read preserves ROM_INDEX, checks PCI authority per
+chunk and validates the image's PCI identity and ATOM directory. Duplicate,
+unsupported or truncated banks are rejected before MMIO. Probe does not enable
+PCI ROM decoding or use the legacy ROM-version-only fallback for Navi48.
+
+Navi4 has no legacy single firmware image (`ChipInfo::fw_name` is empty).
+Both legacy firmware loaders reject it before registry access. Existing GFX9/11,
+MES11, GMC9/11, DCN2/3, backlight, APU SMU and VCN2–4 entry points refuse Navi4;
+discrete suspend returns `NotImplemented` before changing power state. The
+explicit PSP14 bootstrap below is the first firmware stage; SMU14,
+GMC12/SDMA7 and DCN4 owners are still required for engine startup/modesetting.
+
+### Navi 48 PSP14 secure-OS bootstrap
+
+`amdgpu_psp_boot::Firmware::open` and `unsafe Bootloader::new` also accept
+Navi48 with exactly one GC0 12.0.1 and MP0 14.0.2 or 14.0.3. Discovery selects
+`amdgpu/psp_14_0_2_sos.bin` or `amdgpu/psp_14_0_3_sos.bin`; no revision fallback
+or professional-SKU kicker firmware is used. `Firmware` and `Bootloader`
+retain that target, rejecting a cross-target load before MMIO or state changes.
+
+`amdgpu_psp_firmware::Image::parse_psp14` accepts the PSP14 v2.0 container:
+36-byte header, bounded 16-byte descriptors before the payload, and payload-
+relative component ranges. Duplicate/unknown IDs, overlap, truncation, empty
+components, missing system/SOS and components beyond the 1 MiB staging limit
+are rejected. TOC/RL ranges are validated but are not boot commands. v2.1
+auxiliary-image selection and SPDM remain unsupported. Registry access and
+the retained validated copy use the same capability checks as Navi22.
+
+The owner uploads KDB → SPL → system → SoC → interface → hardware-debug →
+RAS → IP-key-manager → SOS, omitting absent optional components. It uses
+MPASP C2PMSG35/36/81 (`0x63/0x64/0x91`, MP0 bank zero), the aligned GPU staging
+address in MiB, bounded asynchronous waits, and changing SOS heartbeat proof.
+Failure and cancellation prevent replay and quarantine published memory.
+An already running SOS is checked without upload. The caller must supply
+exclusively owned, trained VRAM with correct GMC12 addresses and exclusions;
+use `Plan::read_navi48` for this GPU's inventory. This explicit API does not
+automatically claim the GPU, initialize its GPCOM/TMR, set `fw_loaded`, or
+enable graphics/display engines. Those remain separate bring-up stages.
+
+### Navi 48 PSP ring and GDDR6 training
+
+`unsafe amdgpu_psp_ring::Psp::new_navi48` claims the physical GPU's PSP14
+GPCOM ring after SOS and VRAM training. It requires GC12.0.1, MP0 14.0.2/3,
+NBIO7.7.0/7.7.1 or NBIF6.3.1 and HDP6.0.0/6.0.1/6.1.0/6.1.1/6.4.0.
+Every bank is unique and bounded before device access. GMC12's bank-zero
+`0x1614/0x1615/0x15a7` fields validate GPU addresses against the BAR0-backed
+pool. HDP uses the verified NBIO bank-two flush remap and MEMSIZE posting read;
+HDP6 never receives HDP5's obsolete invalidate-register write.
+
+`setup_tmr_navi48(&Firmware).await` requires the matching PSP14 revision's
+validated SOS container and an embedded TOC. It submits LOAD_TOC, bounds the
+returned size, reserves MiB-aligned trusted memory and submits SETUP_TMR with
+separate GPU and physical addresses. Existing capability checks, fence matching,
+bounded waits and quarantine on cancellation apply. Cross-generation firmware,
+Phoenix DMUB loading and Navi22 graphics operations are rejected. The caller
+must retain TMR and stop all firmware consumers before unsafe teardown.
+
+`unsafe amdgpu_gddr6::Trainer::new_navi48` uses this same exact layout and
+PSP14's C2PMSG35/36 long-training protocol. The exclusive-client and exchange-
+reservation contract of the Navi22 trainer applies. Before sending the command,
+it retains the bottom 32 MiB preimage in system memory; only acknowledged
+completion permits restoration and HDP flush. Runtime policy can disable
+training, and resident SOS skips it. Timeout, cancellation or revocation retains
+the preimage without racing a possibly active PSP writer or allowing replay.
+These are explicit ownership APIs; the Navi48 boot inventory below supplies
+reservations, while automatic cold boot still requires a coordinated owner.
+
+### Navi 48 graphics and media firmware
+
+`amdgpu_navi48_firmware::Firmware::open(gpu, registry, MesMode)` prepares the
+complete mandatory SMU14, SDMA7, GC12 PFP/ME/MEC, MES, IMU, RLC, VCN5 and DCN4
+set through live registry/blob invocations. MP1 14.0.2/3 and SDMA7.0.0/1 select
+revision-specific names. GC12.0.1, one VCN5.0.0 and DCN4.0.1 (including raw
+4.1.0 discovery encoding) are required. Separate and unified MES images are
+explicit choices; missing or invalid files never fall back to another GPU.
+
+`amdgpu_navi48_ucode::Image::parse` validates each IP/header version, complete
+container, aligned bounded nonoverlapping instruction/data regions, RLC
+metadata and entry points. RS64 instruction and stack images are separate;
+PFP/ME each upload two stack copies, MEC four. IMU offsets are payload-relative;
+CP/MES offsets are file-relative. VCN uploads its complete signed payload;
+DMCUB uploads only signed instructions. SMU's trailing PowerPlay metadata stays
+separate. `entry_points()` retains 64-bit CP/MES code/data addresses for queue
+bring-up. Structural parsing does not authenticate firmware.
+
+`Psp::load_smc_navi48` loads the prepared SMU once after TMR setup. The owner
+must complete the SMU board-power stages and stop DMUB before
+`load_gfx_navi48`. The ring captures the GPU's firmware IP target at construction
+and rejects mismatched sets before upload. Graphics uploads follow Linux's
+UCODE_ID order: SDMA, RS64 instructions/stacks, MES pipes, IMU, RLC lists and
+IRAM/DRAM, RLC_G, AUTOLOAD_RLC, then VCN/DMCUB. Media entry points must be aligned
+and within the retained TMR. `wait_gfx_boot_navi48` checks CP idle and GC12's
+bank-one RLC status at `0x4e7c`. Cancellation preserves the in-flight payload,
+ring and TMR and prevents replay. Successful autoload does not initialize
+VMs, interrupts or command queues and does not publish `fw_loaded`.
+
+### Navi 48 boot memory and SMU14 power control
+
+`unsafe amdgpu_vram_boot::Plan::read_navi48` inventories the complete GMC12
+VRAM aperture against DCN4's address translation and the reported physical
+size. It uses four DCN4 scanout/cursor register windows, including 16-bit pitch
+and viewport-start fields, and rejects enabled contexts in GC12/MMHUB4.1.
+Packed linear RGB surfaces are supported; tiled, compressed, protected, YUV or
+VM surfaces reject the inventory. Firmware/ATOM, discovery tail, runtime DB,
+training exchanges, inherited DMUB windows (including DCN4 Region6 shared
+state), boot framebuffer and explicit other clients remain protected before
+CPU-visible BAR clipping. `into_pool` retains the existing unsafe exclusive-
+client contract. The inventory performs no hardware writes.
+
+`unsafe amdgpu_smu_navi48::Smu::after_upload(gpu, pci_cap, pool)` requires
+successfully loaded SMU14 firmware, trained VRAM, retained PSP/TMR and exclusive
+MP1/index/HDP/reset/power ownership. It validates the exact MP1 14.0.2/3 bank-one
+mailbox (`0x82/0x92/0x9a`) and the GMC12/BAR0 pool mapping, then reserves a
+16 KiB transfer buffer without publishing it. `verify().await` requires driver
+interface `0x2e` and a nonzero firmware version.
+
+`read_board().await` obtains TABLE_COMBO_PPTABLE from the running SMU. It checks
+SCPM policy, zeroes/flushed staging, publishes the GPU address, awaits transfer
+completion and validates the 5812-byte format-23 combo's subtable bounds.
+`upload_board().await` sends only its unmodified 4468-byte PPTable to
+TABLE_PPTABLE. The combined driver's 1344-byte prefix is never sent as power
+settings. Board information comes from this GPU's running firmware; no
+Navi22 table layout, reference-board replacement or overdrive is used.
+
+After graphics/RLC boot, `configure_power().await` runs DC BTC, installs a
+board-supported mask for GFX DPM and autonomous thermal/fan/electrical
+protection, enables it and verifies the running mask and GFX frequency range.
+Boot display/memory/link clocks and automatic gating remain excluded until
+native DCN owns their constraints. The owner publishes `PowerStatus` only
+after the whole sequence succeeds. Each operation is single-attempt; timeout,
+cancellation, revocation or an unknown reply prevents reuse. Incomplete SMU
+DMA retains its published buffer. Acknowledged transfer completion alone
+permits reclaiming that buffer. All waits use scheduler time futures, with
+capability revalidation at every command/read/copy chunk.
+
+The internal `Smu::enable_display_power` transition extends the verified mask
+only with UCLK/FCLK/SOCCLK/DCN DPM (bits 3/4/5/7). The board must support all
+four; SCPM is checked again and required autonomous protections must remain
+enabled. Voltage scaling, deep sleep, link DPM, DF C-states and GFXOFF stay
+excluded. It requires retired display consumers and idle engines. Success
+publishes the new `PowerStatus`; partial failure/cancellation retains the
+owner and prevents replay. Only the retained DCN4 clock owner initiates this
+transition, after checking every display consumer.
+
+`read_board` also decodes optional board `Limits` from the combo, following
+Linux `smu_v14_0_2_get_thermal_temperature_range`: CustomSkuTable
+`TemperatureLimit` for edge/hotspot/memory (critical) and that limit plus
+`CTF_OFFSET` 5 °C (emergency), powerplay `software_shutdown_temp` with the
+fan-abnormal offset, `FanMaximumRpm` when `FeaturesToRun` has FAN_CONTROL,
+and the AC PPT0 default. A zero or implausible temperature limit yields no
+limits instead of failing boot. `configure_power` records which autonomous
+protections (THROTTLERS, GTHR, ACDC, VR0HOT, FW_CTF, FAN_CONTROL,
+FAN_ABNORMAL) are running; `protected(enabled)` checks a later mask still
+contains all of them. No narf path disables a protection feature.
+
+`read_telemetry().await` requires configured power and mirrors Linux
+`smu_cmn_get_metrics_table`: it zeroes and flushes the staging buffer,
+transfers TABLE_SMU_METRICS (5) to VRAM, decodes `SmuMetrics_t`
+(`get_smu_metrics_data`: temperatures in millidegrees, busy-threshold GFX/FCLK/
+UCLK averages, `smu_safe_u16_nn` activity, fan PWM percent scaled to 0–255,
+socket/board watts, VDDGFX mV, current clocks, and a throttler bit per nonzero
+`ThrottlingPercentage`), then reads the running feature mask and
+`GetPptLimit` for the AC source. `set_gfx_level(Auto|Low|High)` issues only
+GFXCLK `SetSoftMaxByFreq` then `SetSoftMinByFreq`, as Linux
+`smu_v14_0_set_performance_level` does for GFXCLK (automatic `0xffff`/0
+bounds, `SMU_V14_SOFT_FREQ_ROUND` on manual maxima); display, memory and
+fabric clocks keep their pinned floors. Runtime commands run from
+`PowerReady`/`DisplayPowerReady` through a transient `Runtime` state: a clean
+PMFW rejection restores the previous state as in Linux, while timeout,
+revocation, device loss or cancellation leave the owner unusable.
+
+`unsafe allow_deep_sleep(DeepSleep)` is the SMU side of relaxing the pinned
+policy, following `smu_v14_0_deep_sleep_control`: it extends the allowed mask
+with one board-supported group (DS_GFXCLK+GFX_ULV, or SOCCLK/FCLK/LCLK/DCFCLK/
+UCLK deep sleep after the display power transition), sends
+`EnableSmuFeaturesLow/High` and requires every recorded protection and display
+DPM bit to stay running. Every failure is terminal. It is disabled policy:
+nothing calls it. Memory/fabric deep sleep first needs the display owner to
+recalculate DML admission and watermarks for deep-sleep floors and exit
+latency and to install PMFW watermark ranges through the DAL mailbox; none of
+that exists yet. Layout and message constants are checked against the Linux
+headers by `tests/smu14_metrics.c`; everything is model-tested only.
+
+After a successful retained boot, `amdgpu_navi48_platform::run` starts
+`amdgpu_navi48_power`. It publishes `/sys/class/hwmon/hwmon<N>` (first free N)
+named `amdgpu` and spawns a monitor that refreshes telemetry every second,
+holding the platform owner only for each refresh, like Linux's cached metrics
+table. Attributes follow Linux amdgpu_pm.c for an SMU14.0.2 dGPU: `temp1..3`
+(edge/junction/mem) `_input/_label/_crit/_crit_hyst` (-273150)/`_emergency`;
+with PMFW fan control, read-only `pwm1` (0–255), `pwm1_enable` 2 (automatic),
+`pwm1_min/max`, `fan1_input/min/max`; `in0` (vddgfx, mV); `power1_average`,
+`power1_cap` and `power1_cap_default` in µW labelled PPT; `freq1` (sclk) and
+`freq2` (mclk) in Hz. Linux's smu_v14_0_2 provides no fan-mode or PWM setter,
+so fan control stays automatic. `power1_cap` is read-only, and `power1_input`
+and the overdrive-dependent `power1_cap_min/max` are absent. Values read empty
+until a sample or board limit exists, never as a fake zero. The monitor logs
+throttlers starting and ending, loss of a recorded protection, the first
+failed refresh, and hotspot reaching `software_shutdown_temp`. Linux powers
+off from its THM interrupt at that point; narf only reports it, and PMFW
+hardware CTF remains the protection. A clean PMFW rejection keeps polling; a
+terminal SMU failure stops the monitor. Platform diagnostics carry the latest
+snapshot, and `amdgpu_navi48_platform::set_gfx_level` applies GFX levels under
+the owner lock; no sysfs writer is wired to it yet.
+
+`unsafe amdgpu_dcn401_clk::ClockManager::new` prepares a separate DAL mailbox
+owner without hardware writes. Exact Navi48/GC12/MP1 14.0.2/3/DCN4.0.1 discovery
+is required (the native DCN4.1.0 discovery spelling is also accepted). MP1 bank
+one must agree with Linux's absolute DAL registers `0x1628a/0x16273/0x16274`;
+PPSMC registers and message IDs are never reused. DCN banks two and three bound
+all four OTGs, legacy streams, HPO DP streams/link clocks and the single FRL
+stream. An active or disappearing consumer rejects startup/clock programming
+before any power future is polled or DAL command written. OTG retirement
+requires both the requested and current master-enable bits clear, as well as
+`OTG_BUSY`; an unacknowledged disable is still a live consumer.
+
+`unsafe start(&mut Smu).await` enables the restricted display power policy,
+checks nonzero firmware and DAL driver/header versions 1, and queries native
+SOCCLK/UCLK/FCLK/DISPCLK/DPPCLK/DCFCLK/DTBCLK levels. Fine-grained clocks read two
+endpoints; discrete tables are bounded to eight entries (six for UCLK), with
+nonzero ordered MHz values. These become immutable `Levels` only after the
+entire handshake succeeds. DPREFCLK remains firmware-owned.
+One-level ranges describe fixed clocks; they satisfy admitted requests without
+issuing unsupported DPM-floor or UCLK-switch commands.
+
+`prepare(Request).await` accepts 1–4 displays and bounded, nonzero DISP/DPP/DTB
+rates in kHz. Every consumer must remain retired. It reports the display count,
+pins DCFCLK and UCLK to the reported maxima, disables UCLK switching, and sets
+the requested display clocks, rounding mailbox requests up to MHz. Each floor
+requires both mailbox acceptance and the corresponding bit from
+`ReturnHardMinStatus`; its one-second deadline includes nested mailbox waits.
+DISP/DPP/DTB replies are actual kHz, checked against the requested floor and
+firmware ceiling. `Applied` distinguishes those actual rates from acknowledged
+DCF/UCLK floor requests. FCLK follows DCFCLK on this ASIC; the unsupported
+FCLK-switch message is not sent. This is a conservative pre-modeset policy,
+not active-stream clock scaling or a bandwidth/watermark solution.
+
+`Starting`/`Applying` are set before awaits. Failure records `Failed(Error)`;
+cancellation leaves the in-flight state. Both prevent mailbox replay, and
+partial floors are not rolled back. Historical successful levels/applied state
+remain diagnostic. `ColdBoot::prepare_display_clocks` and its platform wrapper
+serialize both MP1 owners after the three kernel queue proofs have drained;
+`display_clock_status`/platform `display_clocks` expose retained progress.
+The clocks are not changed automatically during firmware boot. Stream retirement,
+mode bandwidth math, link and scanout setup remain prerequisites to native
+modesetting.
+
+`unsafe amdgpu_dcn401_dccg::Dccg::new` retains the native four-pipe DCCG owner
+without register writes. It checks the same display discovery and consumer
+bounds, DCN bank one through `DPPCLK_CTRL`, and the native read-only PLL/DPREF
+aperture. `prepare(&mut ClockManager, Request).await` requires a matching BAR,
+current acknowledged global clocks and all 51 display consumer checks clear.
+`Request` selects a pipe, DPP kHz and disabled, DisplayPort, FRL or TMDS clocks.
+Out-of-range pipes/rates, zero active clocks and oversized DTO ratios fail
+before writes. DPP uses ceil(255 × pipe/global) and the native enable field in
+`DPPCLK_CTRL` (three bits per pipe); the older DTO-enable layout is not used.
+
+DP pixel DTOs derive DPREFCLK from native PLL multiplier and DFS divider
+readback with no guessed fallback. FRL uses acknowledged DTBCLK. Both program
+an integer plus fractional Hz ratio, source mux and required clock gates,
+preserving neighboring fields. TMDS disables DP DTO and selects divide-by-two
+or four. Changed TMDS dividers retrigger DENTIST and await its completion with
+a 100 ms bound, following the native DIG FIFO workaround. This does not
+program an HDMI PLL or turn on transmission.
+Disabled pipes park their DPP and pixel clocks; shared root gates remain on.
+
+Readback verifies every programmed field. Partial failure records a terminal
+`Failed(Error)`; cancellation leaves `Applying`. Neither can replay, and
+historical successful `Applied` entries remain tagged with their global clock
+snapshot. No stream may use a stale snapshot after global clocks change.
+`ColdBoot::prepare_display_pipe_clocks` and the platform wrapper serialize the
+matching owners after drained engine proofs. `display_pipe_clock_status` and
+platform diagnostics expose progress. An uncertain DCCG transition also blocks
+subsequent platform global-clock changes.
+
+`Dccg::route_stream(&mut ClockManager, StreamRoute)` connects one of four HPO
+DP stream clocks or the single FRL stream clock to a prepared pixel pipe;
+`pipe: None` parks that stream on REFCLK. DP and FRL require matching pixel
+signal types and the same current acknowledged global-clock snapshot. Divider,
+source mux and enable readback (including current DPREFCLK for DP) must still
+match the prepared pipe. A mismatch is terminal before any routing writes.
+Routes preserve other stream fields and never change the DTO reference source.
+Every stream remains retired; this does not enable a PHY, encoder or video FIFO.
+
+Before reprogramming a pixel DTO, the owner reads all actual stream-clock muxes
+and parks every route selecting that pipe, including inherited routes without
+software history. Unrelated routes remain intact. Successful parking/routing
+is retained in `Status::routes`; partial failures share the terminal DCCG state.
+`ColdBoot::route_display_stream_clock` and the platform async wrapper serialize
+this operation with clock and engine owners after drained kernel proofs.
+
+`unsafe amdgpu_dcn401_otg::Otg::new` prepares the four native timing generators
+without MMIO writes. It requires the same native discovery, permanent mappings
+and exclusive display/PM/reset ownership; firmware/FAMS timing writers must be
+excluded. `prepare(&mut ClockManager, &mut Dccg, Request).await` programs disabled
+progressive timing with fixed refresh and one OPP per OTG. HDMI TMDS and FRL
+also accept YCbCr 4:2:0: horizontal boundaries must be even and active width
+must fit the 4096-pixel formatter buffer. The OTG divides horizontal timing
+by two and selects 4:2:0 data format. Interlace, ODM combining and VRR are not
+represented by this request. `GlobalSync` supplies
+validated DLG field values (startup/keepout in lines; update/ready in pixels),
+not a bandwidth proof. Totals, porches, sync widths, blanking minima and every
+native field width are checked before writes. Zero vertical front porch is
+rejected instead of silently changing the sink's timing.
+
+Preparation requires matching BAR owners, current acknowledged global clocks,
+the prepared pipe's signal/frequency, and live divider readback. TMDS verifies
+its DPP/DTO-disable/divider state; its PHY PLL remains a separate prerequisite.
+All display consumers must be retired, and the target must have no outstanding
+master-update lock or soft reset. Native ODM/OTG clocks each require hardware
+acknowledgement within 1 ms. Programming establishes ODM bypass, equal fixed
+vertical totals, sync polarity, global-sync/PSTATE keepout and VTG parameters;
+VTG and OTG stay disabled. Odd horizontal boundaries select manual no-divide.
+Both HPO DP and FRL use native output mux 2; mux 1 is reserved. No legacy ODM
+segment-width registers are programmed. Every changed field is read back.
+
+`unsafe retire(pipe).await` requires stopped CPU writers and retained scanout
+surfaces, page tables, HUBP and OPP resources. It first checks that all legacy,
+HPO DP and FRL streams/link clocks are retired. It disconnects all ODM segments,
+clears combining-memory selection, requests OTG disable and disables VTG, then
+waits independently for current master state and busy to clear (150 ms each).
+Once both clear, it restores `OTG_OUT_MUX` to DIO with readback, including
+UHBR/FRL routes. A failed disable leaves the mux unchanged; a failed mux reset
+cannot publish retirement. Clocks remain on. This proves timing retirement only; it cannot authorize memory
+reuse or replace HUBP fetch retirement. Uncertain writes, timeouts or revocation
+record `Failed`; cancellation retains `Preparing(pipe)`/`Retiring(pipe)`. Those
+states block replay and platform clock changes. `Status::pipes` is historical
+programming tagged with its clock snapshot; changing clocks invalidates it.
+
+`ColdBoot::prepare_display_timing`/`unsafe retire_display_timing` and matching
+platform wrappers serialize these operations after the drained kernel proofs.
+`display_timing_status`/platform `display_timing` report retained state. None of
+these operations runs automatically during boot. Plane setup, bandwidth and
+watermarks, link/PHY programming and surface scanout enable remain required.
+
+The same timing owner also exposes
+`prepare_blank(&mut ClockManager, &mut Dccg, BlankRequest).await` for native
+OPP/FMT/DPG preparation. `BlankRequest` selects a prepared pipe and RGB
+`ColorDepth::{Bpc8,Bpc10,Bpc12}`; output is full range. The recorded timing must
+match current readback-checked pipe clocks and fit the DPG's 14-bit active
+dimensions. All consumers remain retired. Inherited digital bypass, pending
+FMT/DPG updates and timing locks reject the request before writes.
+
+Native OPP clock-on acknowledgement is bounded to 1 ms. The formatter disables
+chroma subsampling and dithering, sets 8-bit truncation or native rounded 10-bit
+reduction (none at 12 bits), clears inherited RGB/YUV offsets in the shared
+dither-seed registers, and programs full-range clamping and dynamic expansion.
+DPG stages equal black color values with the prepared active dimensions,
+zero offset and the selected component depth. Every field is read back.
+`BlankApplied::pending` captures DPG's double-buffer state; it is diagnostic,
+not proof that blanking is active. Native blank completion is checked
+after timing enable by `start_blank`. `PreparingBlank(pipe)`/failure block replay and
+platform clock changes; `BlankPrepared` records only successful staging in
+`Status::blanks`. Reprogramming or retiring a pipe clears its staged record.
+`ColdBoot::prepare_display_blank` and the matching platform wrapper retain the
+same clock/PM/timing ownership. They do not enable timing, a plane or a link.
+
+`unsafe start_blank(&mut ClockManager, &mut Dccg, pipe).await` starts that
+prepared internal black pattern on one OTG. It requires stopped CPU scanout
+writers, exclusive fetcher/cursor/metadata ownership and retention of all
+associated surfaces, page tables, HUBP and OPP resources, including inherited
+ones. All other timing generators and every external stream/link clock must
+remain stopped. Each powered HUBP must positively acknowledge no outstanding
+requests, with blank asserted, soft reset clear, fetch clock and cursor disabled,
+and no enabled/queued dynamic-metadata, enabled 3D-LUT fetch or MALL prefetch
+mode. TTU-disable may
+be clear: native DCN401 uses `hubp2_set_blank_regs`, not `hubp1_disconnect`.
+An already powered-off HUBP instead requires a power-gate request with force-on
+clear and PGFSM OFF acknowledgement; its inaccessible registers are skipped.
+Transitional/contradictory power states and zero HUBP reads without power-off
+evidence do not satisfy these conditions. Startup itself does not retire planes;
+it returns `Busy` when those prerequisites are absent.
+
+Startup verifies matching retained timing/blank snapshots, current native DTO
+clocks and live timing/OPP/formatter programming. TMDS returns `Unsupported`
+until a native PHY PLL owner exists. Native sequencing selects the OPP, enables
+VTG first (the DCN401 workaround), then enables OTG at disable point 2. Success
+requires current-master acknowledgement, cleared DPG and FMT double-buffer
+pending bits, and a subsequent fresh 24-bit frame-counter transition (including
+wrap). One shared deadline allows three frame periods plus 5 ms; modes requiring
+more than 1 second are rejected before writes. Final readback rechecks the black
+pattern, timing, stopped fetchers and external consumers.
+
+`BlankRunning` records the staged pattern and two observed frame counts in
+`Status::running_blank`. `RunningBlank(pipe)` blocks preparation and platform
+clock changes until acknowledged `retire(pipe)` clears that record. Only the
+running pipe can be retired in this state. Failure records `Failed`; cancellation
+retains `StartingBlank(pipe)`, preventing replay and ordinary retirement until
+independent reset. No outcome releases scanout allocations. Successful internal
+blank timing proves neither physical link output nor plane/bandwidth readiness.
+`unsafe ColdBoot::start_display_blank` and its platform wrapper preserve the same
+ownership and require the drained GC12/SDMA interrupt proofs; startup remains an
+explicit operation, not part of boot's framebuffer handoff.
+
+`unsafe Otg::retire_planes().await` disconnects all four MPC outputs and MPCCs,
+including inherited cross-routes and blending trees, under the timing owner's
+exclusive display/clock/PM lifetime. The constructor validates native MPC bank 3
+through output mux 3; it still writes nothing. Callers must stop CPU scanout
+writers, exclude firmware/FAMS and every surface/cursor/metadata/LUT, MPC, power
+and timing writer, and retain all associated allocations and translations.
+External streams/link clocks must already be stopped; timing may remain running
+to latch disconnection. Active update locks, pending flips, GSL synchronization,
+MALL prefetch mode, metadata/LUT loads and uncertain power states reject before
+writes. This path does not abort those independent transactions.
+
+Retirement parks output muxes first, then every MPCC top/bottom/OPP/update-lock
+selector, and disables cursors on powered HUBPs. A shared 100 ms deadline bounds
+all drain waits. Each MPCC must acknowledge IDLE or DISABLED with BUSY clear;
+every powered HUBP must acknowledge no outstanding requests before any blanking
+or clock gating. Native HUBP blanking asserts blank and clears TTU-disable;
+MALL selection and surface GSL are cleared. Drain is checked again before fetch
+clocks are disabled, followed by final power/route/lock/consumer readback.
+Already-off HUBPs are identified through native DOMAIN0–3 PGFSM state and are
+never accessed. No power domain is changed and DPP clocks/timing stay retained.
+
+`PlanesRetired::{blanked,powered_off}` reports the two HUBP masks in
+`Status::planes_retired`. Success enters `PlanesRetired`, allowing subsequent
+timing/clock preparation subject to their live checks. This snapshot never
+grants allocation reuse and proves nothing about GPUVM, writeback or other
+engines. Cancellation retains `RetiringPlanes`; errors after writes enter
+`Failed`, blocking replay, timing retirement and clock changes until independent
+reset. `RunningBlank` must first retire its timing before plane retirement.
+`unsafe ColdBoot::retire_display_planes` and the matching platform wrapper
+serialize the operation after drained GC12/SDMA proofs. No automatic firmware
+display takeover or visible link output is introduced.
+
+`unsafe Otg::set_hubp_power(pipe, powered).await` owns native DOMAIN0–3
+power transitions. All four MPC trees must be detached and acknowledge idle
+or disabled; all timing and external consumers must be stopped. Powered HUBPs
+must freshly prove blank, drained, clock-disabled and free of pending flips,
+update/GSL locks, reset, cursor or auxiliary fetch activity. Off domains require
+matching gate request and PGFSM acknowledgement; their registers are inaccessible.
+The operation rejects uncertain inherited state before changing hardware.
+
+The native bank-2 `DC_IP_REQUEST_CNTL` request brackets the PG_CONFIG write and
+1 ms PGFSM wait, preserving its prior request state. The native full PG_CONFIG
+write clears FORCEON. Power-on first acknowledges accessibility, rejects
+unexpected active transactions, enables the fetch clock, waits for drain,
+asserts native blank with TTU-disable clear, clears MALL/GSL and disables the
+fetch clock again. Drain waits are bounded to 100 ms each; power-off requires
+fresh stopped-fetcher evidence before requesting gating. Final checks cover
+every route, consumer and domain. Repeating an acknowledged state is read-only.
+No hardware reset, surface, VM, bandwidth, DPP or scanout setup is implied.
+
+`HubpPower { pipe, powered }` is recorded in `Status::hubp_power[pipe]` as
+historical evidence only. Success enters reusable `HubpPowerChanged`; subsequent
+operations still check live state. A transition invalidates the old selected
+power report and plane-retirement snapshot. Cancellation retains
+`ChangingHubpPower(pipe)`; an error enters `Failed`, blocking replay and clock
+changes. Neither outcome attempts speculative rollback. Callers exclude
+firmware/FAMS and concurrent display/clock/power writers and retain all memory
+and translations even after successful power-off. The matching
+`unsafe ColdBoot::set_display_hubp_power` and platform wrapper serialize this
+under the retained owner after the kernel engine proofs.
+
+`unsafe Otg::prepare_surface(pool, SurfaceRequest).await` stages one retained
+linear framebuffer per HUBP. The pool must belong to this GPU's correctly mapped,
+exclusively owned VRAM; the matching ColdBoot/platform
+`prepare_display_surface` wrappers use the boot owner's validated pool after
+the kernel engine proofs. Requests select pipe 0–3, nonzero 14-bit dimensions
+and packed `SurfaceFormat::{Xrgb8888,Xbgr8888}`. Rows are padded to 256 bytes;
+backing is page-rounded and wholly cleared, including padding. Clearing yields
+between 64 KiB chunks and invokes current authority for each chunk. Native CPU
+HDP flush verifies NBIO's remap, fences stores, writes the flush aperture and
+drains PCIe writes through the native NBIO read before address publication.
+
+Preparation requires a reusable owner, every consumer stopped and MPC route
+detached, and a powered, blank, drained selected HUBP with native 2D tiling
+dimension. Active flips/locks, cursor/metadata/LUT fetches or uncertain power
+reject before allocation or writes. Preconditions are rechecked after clearing.
+The allocation is retained and marked published before register programming;
+the fetch clock is temporarily enabled while blank. Native DCN4 programming
+sets uncompressed RGB8888, pixel pitch minus one, red/blue crossbar, primary and
+secondary viewports, empty chroma viewports, VMID0 and normal non-stereo flip
+controls. It does not touch the obsolete address-config fields. The high GPU
+address precedes the low address which publishes the flip. Final drain, clock
+disable and complete geometry/address/consumer readback are required. Only this
+owned selected flip may remain pending; completion is not fabricated while
+timing is stopped. Drain waits use the normal bounded asynchronous primitive.
+
+`SurfaceApplied::{request,address,pitch_bytes,bytes}` in `Status::surfaces`
+describes staged programming, not an active/latched framebuffer. Success enters
+reusable `SurfacePrepared`; error enters `Failed` and cancellation retains
+`PreparingSurface(pipe)`, blocking replay and clock changes. A HUBP power
+transition invalidates its staged report without releasing its allocation.
+Published backing remains excluded even if the owner is dropped, unless the
+explicit `release_surfaces` protocol below succeeds. Unpublished backing is
+releasable because no address reached hardware.
+
+`unsafe Otg::release_surfaces(pipe)` (ColdBoot
+`release_display_surfaces`) returns the page-rounded bytes reclaimed from that
+pipe's current and parked front/back/cursor reservations. Callers first
+unpublish the CPU scanout and drain its view epochs, exclude raw CPU references,
+firmware/FAMS, GPUVM/writeback and other-engine use of these display-only
+allocations, and retain exclusive display/PM/reset ownership. Inherited ranges
+and another display's reservations are never released.
+
+Release requires `PlanesRetired` with a report covering the pipe, then fresh
+native evidence: disabled timing and non-sibling consumers, detached MPC routes,
+idle MPCCs, no pending flips/updates, blank/drained/clock-disabled powered HUBPs,
+inactive cursor/metadata/LUT/MALL requests, no held cursor lock, and consistent
+power-gate request/PGFSM states. A gated HUBP's registers are not accessed.
+Live siblings must still fetch their own recorded surfaces. Unlike restaging
+retained memory, even the target's pending staged flip prevents reclamation.
+The HDP remap is validated, CPU HDP writes are flushed and PCIe writes drained,
+then the complete hardware/remap check runs again before any reservation can
+be marked reusable. A failure before flushing retains everything without
+writing; a failed flush or post-flush check also records `Failed`.
+
+Success clears the released pipe's surface, memory, DPP, MPC, timing/blank,
+requestor/deadline, scanout and cursor reports before returning reservations to
+their pools. Other displays' records and historical diagnostics remain intact.
+No await or fallible hardware access follows acceptance of the proof; a
+cancelled CPU drain or incomplete hardware retirement cannot release memory.
+Double release returns zero after the same checks. The monitor performs this
+operation under the display owner lock after successful disable, unplug and
+configuration teardown; the low-level stop functions retain their allocations
+until an explicit release. Replug then allocates fresh buffers from the pool.
+Link-loss retraining keeps its existing buffers. Native mapping caches remain
+mapped, but retired CPU views cannot use them. Model tests cover reuse across
+geometries, front/back/cursor and parked reservations, sibling preservation,
+powered-off registers, cancellation, revocation and late hardware changes;
+physical modeset/reclamation testing remains open.
+
+`unsafe Otg::upload_surface(pipe,x,y,pixels)` and the matching
+ColdBoot/platform `upload_display_surface` wrapper upload a bounded visible
+row segment of a staged, stopped surface, rechecking geometry, address, power,
+blanking and consumers and issuing the HDP flush. No CPU pointer escapes.
+Bounds errors or stale configuration reject before memory writes; errors after
+writes invalidate the report and quarantine the owner. All operations exclude
+firmware/FAMS and concurrent display/HDP/clock/power writers and retain inherited
+resources. DML2 request/deadline/watermark calculation, MPC setup, live flips
+and visible scanout activation remain separate work.
+
+`unsafe Otg::prepare_memory(&mut Gmc, pipe).await` configures DCN's physical
+framebuffer aperture and VMID0 for an already staged owned surface. Matching
+ColdBoot/platform `prepare_display_memory(pipe)` wrappers borrow the retained
+GMC and display owners after the kernel engine proofs. GMC's register mapping
+must match; its saved framebuffer geometry, flat VRAM page-table root and test
+aperture must still match both GC12 and MMHUB4.1. The fault monitor's independently
+owned interrupt-enable bits are allowed; translation, default and retry fields
+remain fixed. The complete surface reservation, including padding, must lie in
+the GPU framebuffer aperture. Its address is translated by FB base/offset;
+the two-page GART test mapping does not back the surface.
+
+The entire display tree must be stopped/detached, with the selected HUBP powered,
+blank and drained and its owned surface programming intact. Global native DCN
+FB base/top/offset use 16 MiB units; AGP is disabled with bottom above top.
+VMID0 uses the retained physical VRAM PDE and logical start/end page numbers,
+flat depth and 4 KiB block size. Root high is written before root low, which
+publishes the context last. The native low-bit readiness wait is asynchronous
+and bounded to 50 ms; address bits must also agree. No new PTEs, host mappings
+or user contexts are created. Then the selected HUBP's fetch clock is briefly
+enabled while blank to configure its 256 KiB system aperture and native L1
+control (enabled, system access mode 3, unmapped access and ADM disabled).
+Final checks require clock-off, stopped consumers, the same owned surface,
+complete DCN register readback and a fresh matching GMC configuration.
+
+Success enters reusable `MemoryPrepared` and records `MemoryApplied` in
+`Status::memory[pipe]`: pipe, framebuffer base/inclusive top/physical offset and
+the physical page-directory entry. This is historical setup evidence, never
+fetch, flip or presentation completion. Reprogramming the global aperture clears
+all prior memory reports; a HUBP power transition clears its report. Error
+enters `Failed`; cancellation retains `PreparingMemory(pipe)`. Both quarantine
+the display owner without speculative rollback or releasing either allocation.
+Callers retain GMC, the display owner and every inherited resource and exclude
+firmware/FAMS and concurrent hub/VM/display/clock/reset/power writers. Native
+header checks live in `tests/dcn401_vm.c`; physical card validation remains open.
+
+`unsafe Otg::prepare_dpp(&mut ClockManager, &mut Dccg, &mut Gmc, pipe).await`
+stages native DCN401 processing for the retained full-frame XRGB/XBGR8888
+surface. ColdBoot/platform `prepare_display_dpp(pipe)` wrappers borrow the
+matching retained owners after the kernel engine proofs. It requires the same
+surface and DCN VM setup, current readback-checked clocks, matching stopped
+timing and prepared RGB black OPP, and a disconnected, blank, drained HUBP.
+Source and timing active dimensions must match; no scaling, crop, alpha blend
+or multi-pipe composition is accepted. The selected DPP clock must be disabled,
+resets clear, its cursor disabled with no pending update, and inherited CNVC,
+scaler and CM updates complete. Test clocks and forced/manual line-buffer
+power policy are rejected before writes. Other DPP instances stay untouched.
+
+Preparation temporarily enables the native DPP clock (bit 4, no obsolete rate
+divider), wakes scaler LUT and iSHARP memories with bounded asynchronous waits,
+and rechecks stopped consumers after each wait. Native RGB8888 conversion uses
+zero expansion and an identity CNVC crossbar; red/blue selection remains in the
+HUBP. FCNV bias/scale and HDR multiplication are identity, pre-degamma/post-CSC/
+gamma/keying/de-alpha are bypassed, and the encoded RGB values pass through.
+The unused source alpha is not used by the line buffer; MPC preparation below
+selects opaque blending. Scaler autocal is disabled, recout begins at zero,
+and recout/MPC dimensions match the surface. Native `SCALING_444_BYPASS` (mode 0)
+still configures a floating-point line buffer; mode 6 full bypass is not used.
+Line-buffer configurations 1, 2, then 0 are selected using native capacities
+970, 1290, 3430 and `ceil(width/6)` entries per row, requiring two rows for unity
+scaling. Widths above 10290 reject as unsupported on this single-pipe path.
+Adaptive filtering and iSHARP are disabled without programming coefficient RAM.
+
+Final checks require DPP clock-off, unchanged live owners/surface/timing/VM,
+stopped consumers and full DPP register readback. `DppApplied` records the
+surface, timing, line-buffer configuration and CNVC/scaler/CM pending bits in
+`Status::dpps[pipe]`; success enters reusable `DppPrepared`. Double-buffered
+changes can remain pending while timing is stopped, and no latch/presentation
+completion is inferred. The owner heap-allocates its accumulated status to keep
+per-pipe reports out of nested driver and async owner-move stack frames; the
+public status accessor still returns a historical snapshot by value.
+Repeated preparation rejects while its report exists;
+timing preparation/retirement, HUBP power transitions and global VM preparation
+invalidate dependent reports. Errors enter `Failed`; cancellation retains
+`PreparingDpp(pipe)`, blocking replay/clock changes without speculative rollback.
+All owners and allocations remain retained. Callers exclude firmware/FAMS and
+concurrent display/hub/VM/clock/reset/power writers. `tests/dcn401_dpp.c` checks
+the native header contract. MPC and requestor preparation are described below;
+bandwidth/deadline admission, route activation and physical-card validation
+remain required.
+
+`unsafe Otg::prepare_mpc(&mut clocks, &mut dccg, &mut gmc, pipe)` stages
+opaque full-frame RGB composition for an owned DPP/surface. ColdBoot exposes
+synchronous `prepare_display_mpc(pipe)`; the platform wrapper is asynchronous
+only to acquire its owner mutex. Preparation checks the retained surface, VM,
+DPP, current clock and timing owners, matching OPP format, blank/drained HUBP,
+disabled DPP/fetch clocks, and every disconnected MPC route before writing.
+It programs native top-layer-only mode, global opaque alpha, unity top/bottom
+gains and black background, with stereo disabled. XRGB/XBGR's unused alpha byte
+does not affect coverage. OGAM, its gamut remap, MCM shaper/3D LUT/post-1D LUT,
+both MCM gamut remaps and output CSC are explicitly bypassed. Movable color
+management is placed before blending. Denormalization follows the owned OPP's
+8/10/12-bit depth, with unclipped full-range 12-bit clamp limits. Bypass does
+not write LUT RAM, coefficients, power policy or shared coefficient formats.
+All top/bottom/OPP/update-lock/output selectors remain detached.
+
+Each masked write is checked, followed by complete source/owner and MPC
+readback. `MpcApplied` records the DPP, output depth and nine historical
+non-bypass CURRENT-selector bits in `Status::mpcs[pipe]`. A bypass request
+readback is not a hardware latch: nonzero CURRENT fields are recorded while
+timing is stopped. Success enters reusable `MpcPrepared`; repeated preparation
+rejects until dependent state is invalidated. Timing preparation/retirement,
+OPP preparation, HUBP power transitions and global VM preparation invalidate
+dependent reports. Any programming/readback failure enters sticky `Failed`,
+with no speculative rollback or allocation release.
+
+`unsafe Otg::prepare_requestor(&mut clocks, &mut dccg, &mut gmc, pipe).await`
+stages bounded physical-RGB requests and the native default single-pipe buffer
+allocation after MPC preparation. ColdBoot/platform expose asynchronous
+`prepare_display_requestor(pipe)`. This binds to the same owned surface,
+memory, DPP, MPC, timing and clocks. It partitions DCN401's 21 64-KiB CRB
+segments into five for the selected pipe's DET (320 KiB), zero for other DETs,
+and sixteen for compbuf (1 MiB). The owned pitch must fit at least two rows in
+DET. This is a storage policy, not proof that a mode meets its fetch deadlines.
+
+Preflight rejects inherited in-progress allocations, overcommit, compbuf
+configuration errors, enabled allocation IRQs and pending acknowledgement
+writes. The read-only compbuf DONE status is preserved even when set with its
+IRQ disabled. Every shrinking allocation must acknowledge CURRENT before any
+allocation grows; requested and current totals never exceed the native CRB
+capacity. The driver uses bounded asynchronous waits and rechecks the full
+allocation, retained sources and current owners after each acknowledgement.
+Timeout, cancellation, revocation, removal, late changes and dropped writes
+leave resources retained in `Failed` or `PreparingRequestor(pipe)`; neither
+state permits replay or ordinary clock changes.
+
+The requestor uses native DCN4 six-field RGB/five-field chroma layouts, 8-KiB
+chunks with a 1-KiB minimum, one-line linear swaths and zero VM/PTE groups for
+the physical framebuffer aperture. DET plane-one base is zero. Expansion modes
+are DRQ=2 and PRQ/MRQ/CRQ=1. The selected HUBP uses its matching VTG, bounded
+requests and no MALL surface/cursor/prefetch; the native early cursor-request
+mode is set while the cursor remains disabled. Compbuf reserved space is 256
+units of 64 bytes, from native `pixel_chunk_size / 32`. The HUBP clock is enabled
+only around request programming, with blank/drain rechecked, and disabled again
+before final source and register verification. Existing HUBP allocation,
+timeout and underflow errors and timeout-IRQ ownership reject preparation.
+
+Success enters reusable `RequestorPrepared` and records the surface and byte
+sizes in `Status::requestor`; timing/OPP/MPC changes, HUBP power transitions and
+global VM setup invalidate this shared report. Callers retain all owners and
+inherited resources on every outcome and exclude firmware/FAMS and concurrent
+display/hub/VM/IRQ/clock/reset/power writers. Native header contracts are in
+`tests/dcn401_mpc.c` and `tests/dcn401_requestor.c`; MMIO models cover all four
+pipes, all supported RGB depths, transient buffer usage, delayed CURRENT
+acknowledgements, cancellation, lost writes and stale owners. DLG/TTU and
+watermark calculation/admission, MPC route connection, visible framebuffer
+activation, live flips and physical RX 9070 XT validation remain open. Neither
+preparation API starts fetch or publishes an active framebuffer.
+
+`amdgpu_dcn401_dml::admit(&Soc, &Mode) -> Result<Plan, Error>` is the native
+scanout admission calculation: Linux DML21's DCN4 mode-support and
+mode-programming path, evaluated in fixed point with no hardware access. It
+admits only the shape the native path implements: one progressive DP SST
+timing and one unscaled, unrotated, full-frame linear 32-bpp surface (pitch a
+multiple of 64 pixels) per pipe with the staged 320-KiB DET. GPUVM/HostVM,
+DCC, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback, MPC combine and
+immediate flip are excluded rather than approximated.
+
+ODM follows DML's `dml2_odm_mode_auto` with dynamic ODM off, limited to
+bypass and 2:1: a stream takes two pipes (two DPP/OPP and, with DSC, two
+DSCs) when its pixel clock exceeds the downspread-limited DISPCLK maximum, its
+DSC line exceeds 5760 pixels or four slices, or its 4:2:0 line exceeds 4096
+pixels. A stream DML would split 3:1 or 4:1 is `Unsupported`; more than four
+pipes in all is `Pipes`. `Plan::pipes` (1 or 2) reports the decision; both
+pipes share every programmed value except the DLG blank end
+(`Plan::odm_refcyc_h_blank_end`, `Plan::pipe_dlg`).
+
+A two-pipe plan is programmed as ODM 2:1 (optc401_set_odm_combine). The
+modeset gives it the highest pipe no display of the configuration uses
+(`modeset::odm_pipes`), a DPP-only clock there (`dccg::PixelClock::OdmSegment`,
+plus its DSCCLK), and lights it with `otg::Request::odm` and
+`otg::SurfaceRequest::odm` naming that pipe. The OTG takes both OPPs as
+segments with the segment width, the line memories decide_odm_mem_bit_map
+picks and H divide-by-two (every horizontal boundary even; at most 8192
+active pixels); each OPP formats and blanks its half at its offset (a 4:2:0
+right half takes one extra left-edge pixel); each segment's DSC compresses
+its half with half the slices while the stream's PPS stays whole-picture.
+The ODM pipe's HUBP fetches the right half of the same surface (viewport X
+offset), its DPP/MPCC/DET/requestor (VTG the master OTG) and DLG/TTU follow,
+and start, flip, stop, underflow recovery and live checks act on both halves
+under the master OTG's one lock. The cursor is placed per segment and
+enabled only on the halves it overlaps (`CursorApplied::shown`). The display
+holds the ODM pipe from staging until retirement (`Siblings::pipes`); its
+teardown stops both DSC clocks. `ScanoutRunning::odm` names the pipe.
+
+`Soc` carries the board state DML depends on: the pinned UCLK, FCLK/DCFCLK DPM
+ranges, minimum SOCCLK, DISPCLK/DPPCLK maxima, the UMC channel count, DENTIST
+VCO and DCHUB reference clock. Constants come from `dml2_socbb_dcn401`, the
+DCN4 variant-A QoS table and `dml2_dcn401_max_ip_caps`. The calculation applies
+DCN4's min-clock-table derivation for the single UCLK level, checks bandwidth
+against the maximum clocks and latency/programming at the derived state, and
+reproduces DPMM's DISPCLK/DPPREFCLK/DPPCLK rounding. UCLK switching is
+disabled by native policy, so PMO pstate strategies are never searched; the
+UCLK watermark is still the real blackout-plus-urgent value. PMO's stutter
+phase is kept: 54 us of blank is reserved for self-refresh when the nominal
+blank is at least three times that and the mode still passes.
+
+A `Plan` records its inputs, minimum clocks (DML's DCFCLK/FCLK/UCLK state is
+below the pinned floors), `GlobalSync`, the nonzero HUBP DLG/TTU fields, the
+DCHUBBUB watermark set Linux programs into sets A and B, arbiter values, DET
+size and stutter reservation. `Error` names the first failing check: invalid
+inputs, unmodeled shape, unavailable clock state, pixel clock, buffers,
+outstanding-request/ROB latency, prefetch, urgent latency hiding, bandwidth,
+GDDR6 temperature-read blackout, a programmed value outside its dcn_4_1_0
+field (DLG/TTU, watermark, fraction, request-limit and stall fields), or
+more pipes than DCN4.0.1 has. The
+result is deterministic and is only a calculation until bound and programmed.
+
+`ColdBoot::display_admission(&Mode)` (and the platform's asynchronous
+`display_admission`) builds the `Soc` from live owners and admits the mode
+without writing anything. The started DAL clock owner now also records
+DALSMC `GetNumUmcChannels`, refusing zero or more than 64 channels (Linux
+falls back to VBIOS), and `GetDcModeMaxDpmFreq` for DCFCLK, SOCCLK, DTBCLK,
+DISPCLK and UCLK. As with Linux's `use_clock_dc_limits`, a DC-mode maximum
+below the table maximum caps `Range::max_khz`, and with it the pinned
+DCFCLK/UCLK floors and DISPCLK/DPPCLK/DTBCLK request limits. UCLK is that
+pinned floor. `Dccg::dentist_vco_khz` reads the DENTIST PLL (9.16 FbMult times
+the 100-MHz DFS reference) and refuses a zero VCO rather than assuming
+4.5 GHz. `Otg::admission_soc` derives the DCHUB reference from
+`DCHUBBUB_GLOBAL_TIMER_CNTL` and the VBIOS DCE crystal, which ColdBoot keeps:
+REFDIV 2 halves it. A stopped timer or a reference outside 40-60 MHz is
+unsupported; the timer is never reprogrammed.
+
+`unsafe Otg::prepare_deadlines(&mut clocks, &mut dccg, &mut gmc, pipe, &Plan,
+crystal_khz).await` (ColdBoot/platform `prepare_display_deadlines`) programs
+an admitted plan after requestor preparation. It first re-admits the plan from
+its own inputs and refuses any difference, so an edited or hand-built `Plan`
+is not admission. It then binds the plan to the current owners: the retained
+MPC/DPP/surface/memory/timing sources and requestor allocation verify as for
+the requestor; the timing, global sync and legacy DP SST signal must equal the
+plan; the surface must be full-frame with the plan's pitch and the 320-KiB
+DET; applied DISPCLK, DPPREFCLK and pipe DPPCLK must be at least the plan's;
+the pinned UCLK and DCFCLK floors must equal the ones it assumed; and the live
+DCHUB reference must match. Any mismatch is `Invalid` with no writes.
+
+Programming follows `hubp401_setup`/`setup_interdependent` with fetch
+stopped and the HUBP clock enabled only around the writes. It enters DLG
+mission mode (only that bit must read back, as Linux never reads it), writes
+every nonzero DLG/TTU field and explicitly zeroes the VM/PTE/meta/flip/
+chroma/cursor/3D-LUT fields. `HUBP_VREADY_AT_OR_AFTER_VSYNC` uses Linux's
+hwseq rule, where VREADY before blank start is "before". Watermark sets A and
+B get identical values in the `hubbub401_program_*_watermarks` layout: one
+SR enter/exit pair for all four levels, and the temperature-read watermark in
+both UCLK and FCLK "1" slots. The SDPIF request limit, P-state stall threshold
+and a clear `HW_DEBUG[5]` follow Linux, and USR retraining is not forced.
+Self-refresh is force-disallowed in `DCHUBBUB_ARB_DRAM_STATE_CNTL` until
+stutter is validated, although the plan still budgets its blank. The DCHUB
+pstate force stays released: PMFW keeps UCLK switching disabled, and GDDR6
+temperature reads use the same allow path. Every field is read back after
+the owners are re-verified; `DeadlinesApplied` records the plan and enters
+reusable `DeadlinesPrepared`. Requestor/timing/OPP/MPC/HUBP-power/VM changes
+invalidate it with the requestor report, and failure or cancellation is
+sticky as for the other preparation steps. `tests/dcn401_deadline.c` checks
+the native offsets and masks. Route connection, fetch enable and activation
+remain separate and must rebind the plan.
+
+`unsafe Otg::start_scanout(&mut clocks, &mut dccg, &mut gmc, pipe,
+crystal_khz).await` (ColdBoot/platform `start_display_scanout`) makes the staged
+surface the visible source of a pipe whose legacy DP SST stream is in
+`DpVideoRunning` with the OPP DPG producing black. It rebinds the programmed
+deadlines with DCCG's read-only `retained_timing_clock` (the link is live),
+re-reads the surface, memory, MPC, requestor and DLG/TTU/watermark registers,
+and requires: the matching OTG running with no held lock, GSL or MPCC update
+lock; no OTG, pipe-update, OPTC or DPG transaction pending; no HUBP or OPTC
+underflow; and a blank, drained, clock-gated HUBP with DPP clock gated,
+detached routes and the DPG still black.
+
+Following Linux's plane-enable path, it then ungates the HUBP and DPP clocks,
+takes the OTG master-update lock (selected via `OTG_MASTER_UPDATE_LOCK_SEL`;
+the lock status must assert, where Linux proceeds after 10 us), and forces
+P-state change off for the transition. Under the lock it returns the DPG to
+video mode, inserts MPCC n (bottom none, top DPP n, OPP n, update-lock OPP n,
+output mux), re-arms the surface address (high, then the publishing low) and
+clears `HUBP_BLANK_EN`/`HUBP_TTU_DISABLE`. Releasing the lock latches all of
+it at one VUPDATE. Within a bound of three frames plus 5 ms it waits for
+`dcn401_post_unlock_program_front_end`'s evidence: no flip pending and
+`SURFACE_EARLIEST_INUSE` equal to the owned address (a requested-address
+readback is not presentation), with DPG disabled and its pending bit, the OTG
+update and pipe-update pending bits clear, and the MPCC no longer disabled.
+The P-state force is then released, the routes and unblank are read back, and
+two fresh frame counts must pass without underflow. `ScanoutRunning` records
+the plan, address and frames in `ScanoutRunning(pipe)`.
+
+`unsafe Otg::stop_scanout(...)` reverses it: under the lock the DPG returns to
+the staged black value and every MPCC route detaches; after unlock it waits
+for the black latch and an idle or disabled MPCC, then for
+`HUBP_NO_OUTSTANDING_REQ` before blanking the HUBP, and gates the HUBP and DPP
+clocks only after that. Linux's DET release and power gating are not
+performed: the staged state is re-verified and the owner returns to
+`DpVideoRunning`, so the pipe can start again. Any timeout, underflow,
+readback mismatch, owner change or cancellation after the first write leaves
+`Failed` or the transitional state; nothing is replayed or released, and the
+surface must stay allocated because fetch retirement was not proven.
+`unsafe Otg::check_scanout(...)` is the read-only health check of a live pipe.
+It rebinds the deadlines as above and re-verifies the running DP stream with
+`fetchers_stopped_except`: the owned pipe must show exactly its live fetch
+(HUBP unblanked with TTU enabled and clock on, DPP clock on, DPG fields zero,
+MPCC not disabled, all routes connected, cursor off, requested and
+EARLIEST_INUSE addresses equal to the owned surface), while every other powered
+HUBP must still be stopped and every auxiliary fetcher disabled. The black-video
+OPP verification accepts the DPG in video mode only for that pipe. Mismatches
+are reported without writes. A HUBP or OPTC underflow (on check, or during
+start) records `ScanoutUnderflow` (pipe, address, HUBP status, OPTC bit, frame)
+in `Status::underflow`, runs the stop sequence without failing on the sticky
+status, strobes `HUBP_UNDERFLOW_CLEAR`/`OPTC_UNDERFLOW_CLEAR`, requires the
+status to stay clear with fetch blanked, rebinds the owners and returns to
+`DpVideoRunning`. If that cannot be proven, the pipe is `Failed`. Other start
+failures quarantine without recovery. Rebinding a live pipe tolerates the
+HUBP underflow status bits in the requestor check (they are the scanout's to
+detect and recover); every other requestor error, and an underflow inherited
+by setup, still fails it. Without that, an underflowed live pipe could be
+neither checked nor stopped.
+
+Model coverage runs owner-level start/check/stop over a chain staged by the
+real steps from a DML plan (surface, VMID context, timing, black DPG, DPP, MPC,
+requestor, deadlines, TMDS link and black video) on every pipe with
+independent PHY/stream/pipe routing: delayed VUPDATE latches, lost writes
+(caught by readback), an ungranted lock, a never-latching address, owner
+changes during start and stop, cancellation at the lock wait, transmitter
+clock loss and frozen timing under scanout, and underflow during start and
+while running.
+
+`unsafe ColdBoot::modeset_display(pipe, fill).await` (platform
+`modeset_display`) orchestrates the above on one legacy DP SST or TMDS HDMI
+connector. It scans the routed sinks, selects the first DisplayPort port whose
+sink answered with DPCD and an EDID preferred mode that `timing_from_edid`
+accepts (from the 128-byte base block; extension blocks follow it), and links
+it at the sink's maximum lanes and rate. A sink that cannot carry the mode's
+8-bpc payload is skipped (`ModesetError::Link` if nothing else fits). With no
+such DP sink, the first HDMI port whose EDID carries the HDMI Licensing VSDB
+(`hdmi_caps`; a DVI sink never receives HDMI packets) and whose preferred mode
+`hdmi_fits` is selected (`Selection::hdmi`, zero lanes). `hdmi_caps` reads, as
+DRM does, the VSDB Max_TMDS_Clock and the HF-VSDB or HF-SCDB (extended tag
+0x79) Max_TMDS_Character_Rate and SCDC_Present, honouring DRM's minimum block
+lengths, and the VSDB DC_30bit/DC_36bit deep-colour flags. `hdmi_depth` picks
+the deepest declared depth up to `max_bpc()` whose character clock fits,
+stepping down 2 bpc like amdgpu_dm's stream validation; `max_bpc` defaults to
+8 (amdgpu_dm's `max_requested_bpc`) and the `amdgpu.max_bpc=10|12` boot option
+raises it. The blank is staged at that depth. A character clock fits at or
+below 340 MHz within any declared VSDB maximum, and
+above it (to `TMDS_MAX_KHZ`, 600 MHz) only with SCDC and an HF rate covering
+it. Before the link starts an SCDC sink is configured as Linux's
+`write_scdc_data` does: sink version read, source version 1 written when the
+sink reports 1, then TMDS_Config 3 (scrambling, 1/40 clock) above 340 MHz or 0.
+A scrambled mode's SCDC failure fails the modeset (`ModesetError::Scdc`); the
+legacy write's result is ignored, as in Linux. A normal stop writes
+TMDS_Config 0 after the video stops and before the link stops; an unplug does
+not address the departed sink. Its pipe
+clock is the TMDS divide-by-four rate and its timing `Signal::Tmds`, and the
+link starts with `prepare_hdmi_link` (stream = pipe), `start_hdmi_video` and
+scanout. HDMI has no link status: `check_modeset` reports HPD and scanout
+only, `retrain_modeset` is `Unsupported`, and stop/unplug use
+`stop_hdmi_video` then `stop_hdmi_link`. The monitor enables HPD on every DP
+and HDMI port.
+Training then walks narf's fallback ladder (`link_candidates`), trying only
+settings that carry the mode: the link rate drops first; below RBR the lanes
+halve and the rate restarts at this attempt's starting rate. Legacy DSC also
+walks this ladder while keeping the admitted bpp, PPS, timing and DML plan:
+only settings that carry that compressed payload plus slice overhead after
+FEC are tried. Changing bpp/slice geometry requires a new admission and is
+not done inside link fallback. When every carrying 8b/10b setting of an SST
+sink without 128b/132b caps is refused, `start_link` follows Linux's
+`dp_verify_link_cap`: it trains the rest of the ladder from the sink's caps
+(`verify_ladder`) without a stream, stops the link again and records the first
+setting that trained, else one RBR lane, as the port's `VerifiedLink`
+(`verified_link`), keyed by the sink's scanned DPCD and base EDID. It returns
+`ModesetError::LinkReduced` only when that link is below the caps.
+`ColdBoot::scan_display` applies the record as `display::Sink::verified_link`
+(`apply_verified_links`), so `dp_caps`, selection, offered modes and DSC
+(`dp_dsc`/`refine_dsc`) use the verified link and no 128b/132b; another sink,
+a changed EDID/DPCD, a nonresponding or empty port drops it.
+`modeset_display_mode` and `modeset_displays` select, admit and light again
+(at most `VERIFY_ROUNDS`) when the first display reports `LinkReduced`; a later
+display's reduction is returned in `Configuration::failed`, and the monitor
+leaves that output unconsidered so its next pass relights the configuration.
+`retrain_modeset` journals the published modeset in flight before its first
+stop. Success clears the record. A refused retrain (`Link`, `LinkReduced` or
+a training refusal) whose timing state is again the one recorded after the
+link stopped resumes as ordinary teardown at `TeardownStep::Timing`; the
+monitor then withdraws writers, retires timing/planes, releases surfaces and
+relights against the verified link. Any other failure or a dropped retrain
+stays in flight and blocks replay. A confirmed CR, EQ or
+link-loss failure whose idle exit is proven leaves the owner in
+`DpLinkRefused`, retaining the plan. Only `stop_dp_link` may follow: as in
+Linux's retries, the sink is put in D3 and the PHY disabled before the next
+setting re-enables it. Any other training failure still quarantines. There is no
+alternative-mode fallback yet. The first clock request (clamped to
+each minimum) starts PMFW so admission can read live levels. The admitted
+plan's DISPCLK/DPPREFCLK are then requested, and the pipe DTO gets its DPPCLK
+and pixel clock. Planes are retired, the HUBP is powered and the surface is
+staged and filled row by row by `fill(y, row)` while fetch is stopped. Then
+memory, timing (with the plan's global sync), blank, DPP, MPC, requestor and
+deadlines are prepared before the PHY is enabled, trained, given its frontend
+(stream index = pipe), started on black video and switched to scanout.
+Inherited GOP consumers must already be retired; the clock owners refuse
+otherwise. A returned failure in the per-pipe activation attempts the bounded
+abort described below; uncertain owners stay retained. `stop_modeset`
+reverses a success down to a disabled PHY with timing and planes retired; the
+surface allocation remains bound to its pipe.
+
+HDMI admission honors the sink's Y420VDB across protocol fallback: a 4:2:0-only
+mode uses 4:2:0 over TMDS or FRL. TMDS remains preferred when it carries a mode.
+FRL tries RGB first where allowed, then 4:2:0 for Y420VDB/Y420CMDB modes when
+RGB cannot fit. `HdmiCaps::dc30_420` and `dc36_420` decode HF-VSDB/HF-SCDB
+4:2:0 deep-color flags independently of RGB DC_30bit/DC_36bit. FRL chooses the
+deepest declared 8/10/12-bpc depth up to the requested maximum and the lowest
+carrying rate. `hdmi_output` also takes the sink audio capabilities: FRL
+admission, training fallback and borrow parameters reserve the highest rate and
+channel count of its valid SADs, compressed ones included as Linux
+`get_audio_check` does, with layout 0 at 576 lines or fewer. `Selection::audio`
+keeps valid LPCM and compressed SADs for FRL (`frl_audio_info`; one-bit audio
+and DST dropped, SD LPCM clamped to two channels); sinks without valid LPCM use
+silent video. The FRL endpoint advertises those compressed descriptors and HBR
+from `check_audio_bandwidth_hdmi`'s 8-channel 192-kHz probe.
+TMDS 4:2:0 remains limited to 8 bpc.
+
+`frl_carries`, `frl_link` and `ColdBoot::start_frl` take `ycbcr420` alongside
+`bpc`. The raw bandwidth guard accounts for subsampling, and the Linux FRL
+capacity calculation receives the actual encoding. Training fallback and
+borrow-parameter calculation preserve encoding/depth. DML admission and native
+OTG checks still enforce the single-OPP 4096-pixel 4:2:0 limit; no ODM is added.
+
+Native FRL video derives encoding/depth from its retained blank/timing owner.
+It programs the 4:2:0 pixel format, uncompressed FIFO format and half-width
+active/blank counts, clears stale DSC fields, and sends AVI Y=4:2:0,
+BT.709 colorimetry and limited YCbCr range. Existing OPP subsampling, YCbCr black
+and MPC BT.709 output CSC are reused. The DTB-derived pixel DTO and
+HDMISTREAMCLK retain the full pixel rate, independent of component depth.
+Writes and live format checks reject mismatched encoding, depth, compression
+or width. Startup rechecks the stream, link, clock route and format after its
+final frame wait before publishing running video. Failure after writes retains
+the link and quarantines the video owner. FRL LPCM uses the audio contract
+below; FRL DSC and physical acceptance remain open.
+
+`amdgpu_frl_training::poll_status` handles live SCDC FRL_Start, FLT_Update
+and Source_Test_Update requests as Linux's `hdmi_frl_poll_status_flag` does.
+`FrlStatusIo::current_ffe` supplies the last acknowledged FFE level; requests
+advance it modulo four and apply the source-test de-emphasis/pre-shoot flags.
+LTP3 is left unchanged outside FLT_no_timeout tests. Each W1C acknowledgement
+clears only its handled flag after source work succeeds. An ordinary retrain
+request returns `true` with FLT_Update still pending, so cancellation before
+retirement cannot lose the request. Native DDC failures propagate.
+
+`FrlLinkUp` retains `training` and `lane_set` alongside per-lane patterns.
+Native pattern/FFE controls accept the selected display's stable link or live
+FRL video/scanout, verifying its PHY, encoder, clocks and stream route. Live
+updates keep both retained link/video records consistent. `UpdatingFrlLink`
+holds ownership across a firmware command; cancellation blocks reuse and a
+command/readback failure enters `Failed`. Video, scanout and allocations stay
+retained. `ColdBoot::display_frl_current_ffe` checks ownership/readback before
+returning the acknowledged level. Source tests may leave the link emitting
+patterns while timing and memory fetch remain owned.
+
+`ColdBoot::check_modeset` checks HPD before any FRL SCDC access and returns
+`Health::FrlRetrain` for an ordinary sink retrain request. The platform monitor
+polls at 200 ms while an FRL display is lit (one second otherwise, with HPD IRQ
+wakeups for both). Retraining uses full writer withdrawal and configuration
+retirement before fresh admission and bounded FRL training/rate fallback;
+siblings may briefly blank. This path does not reset quarantined native owners.
+Source-test-only updates preserve the running configuration. Hardware behavior
+remains unvalidated.
+
+`ColdBoot::begin_modeset_teardown(m, unplugged)` records teardown intent without
+hardware access, before an async CPU-writer withdrawal. `stop_modeset` and
+`unplug_modeset` also begin it automatically. Per-pipe progress stays in the
+retained owner across errors and dropped futures. `display_teardown_status`
+returns `TeardownStatus { next: TeardownStep, in_flight, activation, unplugged }`:
+audio, scanout,
+video, protocol-specific SCDC/payload/frontend work, link, timing, optional
+DSC clock, planes, then Complete. Only successful steps advance, with no
+await between completion and recording it. A resume must carry the original
+modeset's scanout address/stream/frame witness and teardown parameters;
+unplug intent can be upgraded but never downgraded. Completed phases are
+not replayed. TMDS/FRL sink cleanup keeps its existing best-effort SCDC policy.
+MST link handover/detach runs only after video, payload and frontend retirement.
+
+The unfinished operation still performs all native state/authority/hardware
+checks. A returned transient preflight rejection can be retried; native failed
+owners remain blocked. Cancellation during CPU withdrawal can resume, since no
+native phase has started. Once a native phase starts, a dropped future leaves
+`in_flight` set and replay is refused, including compound SCDC/MST work without
+a single native completion witness. This does not reset quarantined hardware
+or recover arbitrary partial activation.
+Completed progress is historical, and requires the owner still to be in
+PlanesRetired; fresh CPU/hardware proof remains mandatory for surface release.
+High-level activation/retraining rejects incomplete teardowns, and a new
+activation clears only that pipe's completed progress.
+
+Before per-pipe activation starts (after shared/pipe-clock preparation), the
+owner records an activation with no scanout witness and `in_flight = true`.
+Success clears that record and returns the normal `Modeset`. A returned error
+clears only the in-flight bit and attempts `abort_modeset_activation(pipe)`;
+the original startup error is returned whether cleanup succeeds or fails.
+`display_teardown_status(pipe).activation` identifies unfinished startup
+cleanup, including a failed pipe missing from `Configuration.displays`.
+
+`ColdBoot::display_modesets()` returns the device owner's copies of completed
+Modesets. Each actual startup witness is retained synchronously before another
+pipe can start or platform adoption can suspend. Offered-mode and successful
+retraining updates refresh that record. Successful native stop/unplug removes
+only its pipe; failed/cancelled teardown keeps the handle. These are historical
+ownership records, not fresh link/fetch health or permission to reclaim memory.
+New single/MST/multi-display configurations reject while any record remains.
+This prevents a dropped configuration or exited monitor from losing completed
+streams even if the caller's temporary vector disappears.
+
+At the next monitor pass, missing caller handles are restored from these records
+and scheduled for ordinary teardown, including CPU withdrawal and fresh surface
+release. All conflicting caller records are rejected before copying any handle;
+existing siblings are preserved. Recovery never clears another pipe's pending
+activation, native failed state or cancellation marker. A cancelled native phase
+can still block the entire owner; the retained handles remain available for
+diagnosis and eventual reconciliation/reset.
+
+`ColdBoot::display_sst_outputs()` retains physical DP/HDMI connector EDIDs and
+independent timing lists from the latest `modeset_displays` probe, including
+disabled or unadmitted sinks. Dark timings must pass native link/format/depth/DSC
+selection and full joint DML beside every running stream. Four occupied pipes or
+an already occupied FRL encoder reject another candidate using that resource.
+A preferred mode which cannot fit does not hide fitting EDID alternatives.
+These lists reserve no resources; enable still runs full configuration admission.
+An all-off/no-lightable-mode configuration returns an empty `Configuration` after
+querying board clock limits, without active-display floors, pipe clocks, link
+startup or scanout allocation. Valid EDIDs survive an admission/startup error;
+failed probes do not retain the former monitor's inventory.
+
+KMS publishes a connected dark physical sink's EDID and admitted modes without
+inventing a CRTC mode or framebuffer. Base or extension EDID changes invalidate
+old requested/offered timings. Disable intent survives same-connector replug;
+HPD loss removes the public inventory, and HPD rise on a disabled port requests
+reprobe/re-admission even with no active CRTC. This uses the existing whole
+configuration relight policy, which can briefly blank connected siblings.
+
+Startup checkpoints the inverse of each completed link, frontend, video and
+scanout phase before the next operation can suspend or fail. This covers TMDS,
+legacy DP SST/MST, UHBR and FRL: TMDS/FRL link completion starts cleanup at SCDC,
+DP training at Link, legacy SST frontend at Frontend, and video at Video.
+TMDS/SST/UHBR/FRL scanout completion starts at Scanout, so an audio preflight rejection
+does not strand live fetch. Audio is not stopped unless it actually completed;
+successful audio is the final startup operation and returns a normal Modeset.
+Retraining an already published Modeset does not create or change an activation
+record. UHBR retraining stops audio before scanout and starts it again after
+training/video/scanout, filtering capabilities against the newly trained link.
+
+TMDS also records `TeardownStep::PreLinkScdc` before its first SCDC transaction.
+A returned SCDC error or subsequent native-link preflight rejection therefore
+restores legacy TMDS configuration before retiring timing and planes, without
+attempting to stop a link that never completed startup. The sink write keeps
+the existing best-effort policy; native state and fresh release guards remain
+binding. Completed link startup replaces this obligation with the normal SCDC
+then Link cleanup path. Cancellation still retains `in_flight` and refuses replay.
+
+Native Navi48 protected output remains unsupported. KMS exposes neither Content
+Protection nor HDCP Content Type, and the native owner creates no DTM/HDCP TA
+session. Crypto helpers and HDCP exclusions in retirement safety contracts do
+not authorize protected scanout. Firmware, protocol, credential authorization,
+protected-buffer isolation and end-to-end validation are tracked separately in
+[`navi48-protected-output.md`](../research/navi48-protected-output.md); properties
+must remain absent until a supported authenticated and encrypted path exists.
+
+MST checkpoints trained/attached link ownership at Link, the frontend at
+Frontend, completed payload allocation at Payload and black video at Video.
+Cleanup removes the payload before detaching the frontend/link, preserving
+other streams and handing over shared-link ownership when needed. An incomplete
+payload transaction blocks every cleanup step, even when native state looks
+settled; the retained payload marker described below is independent of the
+per-pipe activation/teardown journal.
+
+The abort unwinds these checkpointed phases through the normal native stop
+operations, then retires timing (including DSC disable), optional DSC clock,
+planes and `TeardownStep::Release`. Without a checkpoint it starts at timing,
+so stopped staging or a training refusal whose link was successfully stopped
+can still be reclaimed. No successful Modeset/scanout witness is manufactured.
+Each stop checks current native ownership and hardware; a previous checkpoint
+cannot override a subsequent operation's failed or in-flight state. A scanout
+underflow whose native recovery returned to black video can unwind from Video.
+Contradictory hardware and failed fresh checks retain the record and uncertain
+allocations.
+Completed phases survive returned errors; success clears the activation only
+after release. The caller must keep the activation unpublished to CPU writers
+and other engines, with the same exclusive ownership as `modeset_display`.
+Both require withdrawal and draining of any CPU views from earlier surface
+incarnations before starting activation, including retained same-geometry
+buffers that a low-level caller chose not to release after its previous stop.
+An unknown/non-activation pipe is Invalid. Dropping startup or an abort phase
+leaves the in-flight marker set and blocks replay, even if the native state
+looks reusable during a compound operation or retry delay. No reset or
+recovery of cancelled startup, incomplete MST payload transactions,
+uncheckpointed active work or shared-clock failure is
+implied. Models cover abort phase faults/cancellation, every supported
+checkpoint's cleanup suffix, sibling isolation and native staged/live retirement
+through fresh release.
+
+The monitor records intent before draining CPU views, publishes the retiring
+CRTC inactive, and retains its Modeset until teardown and surface release both
+succeed. A later pass resumes recorded teardowns before ordinary health checks
+or MST notification service, even if DRM has since asked to reactivate. It
+finishes retirement before considering a fresh relight. Console withdrawal
+never selects another retiring pipe. Errors still stop the spawned monitor;
+explicit resumes and cancellation recovery do not bypass native quarantine.
+Pending activation aborts run before topology/health work, and successful
+cleanup makes the output eligible for relighting. Preferred-mode fallback and
+the benign NoSink/Link path are suppressed while any cleanup remains pending;
+they cannot discard an unfinished activation or silently retry it.
+Models cover every protocol's step ordering, rejection/cancellation at every
+step, request identity, sibling progress and unplug upgrades. Physical
+transition/recovery validation remains open.
+
+Alternative DP timings now carry their actual DSC shape into joint DML
+admission, computed with the board's DISPCLK limit. After link fallback, the
+configuration selection would produce must fit the trained link; advertising
+a smaller bpp which the subsequent selection would not use is not allowed.
+Successful legacy/UHBR retraining re-admits the previous offered timings beside
+the retained sibling streams, always preserving the actual running timing.
+The device's retained Modeset and KMS publication both receive the refreshed
+list. A queued request for a removed timing is discarded; valid requests and
+the running CRTC remain. This neither reallocates scanout nor clears native
+failure/cancellation quarantine.
+
+Before training, the modeset enables the connector's HPD block, as Linux's
+interrupt-mode HPD GPIO and `enable_hpd` do: the pad's DC_GPIO_HPD_MASK bit is
+cleared and DC_HPD_EN set. The board path's one-based selector names
+GPIO_HPD_n, served by block n-1 of DCN401's four. A path without a selector
+still lights. `hpd_sense` reads DC_HPD_SENSE_DELAYED, the debounced bit
+Linux's `dal_hw_hpd_get_value` reads. It is Busy while the pad is GPIO-owned
+or the block disabled. `dp_link_status` reads DPCD 0x202..0x207 over AUX for
+the link the owner carries (trained, frontend, video or scanout state). No
+register is written and the owner state does not change on failure. Following
+`dp_parse_link_loss_status`, a link is locked when every trained lane holds
+CR, EQ and symbol lock with interlane alignment. It counts as lost only when
+it is unlocked and SET_POWER reads D0. `stop_unplugged_dp_link` stops a link
+without the sink D3 write, and only while the debounced HPD is low.
+
+`check_modeset` checks hot-plug first, so an absent sink gets no AUX traffic,
+then lane lock, then the scanout. It reports `Running(frame)`, `Unplugged` or
+`LinkLost`. `retrain_modeset` follows `dp_handle_link_loss`: it stops scanout,
+video, frontend and link (sink D3), then trains again down the fallback ladder
+from the current setting and restarts video and scanout of the retained
+surface. `unplug_modeset` is `stop_modeset` with the unplugged link stop. The
+check/retrain/unplug sequencing is composed from owner operations tested
+individually; no fake covers the composition and no hardware has run it.
+
+A replug is a new `modeset_display` on the torn-down pipe. Surface
+preparation may restage an occupied pipe only right after plane retirement
+(or the HUBP power-up that follows it), with fresh evidence that no HUBP
+fetches. Its own previous staged address may still be pending, because those
+buffers stay owned either way. The same geometry reuses the front, back and
+cursor buffers, re-cleared.
+A new geometry allocates fresh buffers and parks the old surface (front,
+back, cursor) until explicit release.
+A later request for a parked geometry on the same pipe reuses that surface,
+so switching among a sink's offered modes retains at most one surface per
+distinct geometry rather than one per switch. The platform monitor instead
+drains CPU views and calls `release_display_surfaces` after successful teardown,
+so replug and mode changes do not accumulate these allocations. Direct callers
+can retain buffers for reuse until they explicitly perform the same protocol.
+
+`scanout_access::unsafe snapshot(read)` captures a CPU mapping/geometry and
+an epoch lease under the same short IRQ-safe lock that
+`scanout_access::replace(change)` uses to replace it. The returned `View<T>`
+holds no lock while pixels are accessed. It is !Send and holds a scheduler
+preemption guard, with IRQ delivery unchanged; it must not span a yield or
+await. Pointer/framebuffer values must not escape their lease and their
+destructors must not access the mapping. Drop executes MFENCE (x86_64) or
+DSB SY (aarch64), between compiler fences, before releasing the epoch and
+preemption guard. This drains the originating CPU's WC writes and device
+reads; it does not replace HDP/PCIe flush or display fetch retirement.
+
+The fb layer replaces generic mappings through this gate and leases
+`FbWriter` fills/blits, cursor snapshots and status-panel writes. DRM fallback
+copies lease the query hook's mapping through the last copied row, dropping
+the lease before flushing. `query_scanout` alone remains a metadata snapshot,
+not lifetime authority. Raw `FbScanout::framebuffer` callers must use the
+same lease or independently retain the backing; the early boot console
+retains its permanently reserved boot range. Native surfaces are not exposed
+through fbdev mmap. A stale pull adoption revalidates the current publication;
+failed replacement/restoration clears the generic mapping when no boot mapping
+is available, so cached writers see an empty view rather than a dangling one.
+
+`scanout_access::wait_retired().await` cooperatively drains all replaced
+epochs, including earlier flips, without waiting for writers on the current
+mapping. Cancellation retains outstanding epochs. Navi48 withdrawal waits
+after moving/clearing the mapping and before teardown. Both platform flips
+and the presenter publish and drain while still holding the async display
+owner lock, before another presenter can overwrite the former front as its
+back buffer. Back-buffer acquisition and native presentation also drain a
+previous cancelled wait before reuse. This proves CPU access completion only;
+it neither serializes overlapping pixel writers nor authorizes VRAM reuse.
+The legacy DCN314 teardown also drains after withdrawing its shared fb mapping
+and before returning to the caller that owns the scanout reservation.
+Epoch/cancellation and framebuffer-withdrawal regressions run in QEMU on both
+architectures; physical display transitions remain unvalidated.
+
+`amdgpu_navi48_kms` publishes the lit sink as KMS state on the registered
+amdgpu card. KMS state is attached on first publication; until then every
+amdgpu DRM ioctl fails as before. The state is one CRTC (1), one encoder
+(2, TMDS type, as amdgpu_dm reports DP) and one connector (3) whose type is
+the lit sink's (DisplayPort or HDMI-A); an unplug keeps the last type.
+The card's `NativeOutput` carries the sink's base EDID block, which
+GETPROPBLOB returns verbatim, and the exact DRM timing from the DCN
+`Timing`. That timing has the porches and sync widths, rounded refresh, sync
+polarity flags, and type PREFERRED|DRIVER. GETCONNECTOR and GETCRTC report
+it instead of the synthesized timing. The connector also offers every other
+timing in `Modeset::modes`: the sink's EDID modes in Linux's
+drm_edid_connector_add_modes order (`edid_timings`: detailed timings of the
+base block then the CTA-861 extensions, standard timings that VESA DMT
+covers, established timings, then CTA short video descriptors through the
+VIC table; `narf_edid::modes` carries Linux's tables) that fit the trained DP
+link or a TMDS depth and that DML admits at the current clock levels, at
+most sixteen. Interlaced and pixel-repeated modes are left out, as are
+standard timings that need CVT/GTF synthesis. The HDMI AVI InfoFrame still
+sends VIC 0: a CE VIC would make the sink expect limited-range RGB, which the
+pipeline does not output. Only the
+EDID's first timing carries PREFERRED; the running timing is listed first and
+is the CRTC's mode. SETCRTC with a mode is refused (EINVAL) unless the mode's
+clock and geometry equal an offered timing.
+An atomic MODE_ID blob is held to the same gate (`accepts_mode_blob`, at
+check time, so TEST_ONLY probes see it). Cards without native outputs are
+unaffected. A DRM client switching the CRTC off (SETCRTC without a
+framebuffer, or an atomic commit changing ACTIVE) records the request with
+`platform::request_display_active`; KMS shows the CRTC disabled with the sink
+still connected. The display monitor converges on its next pass: off
+withdraws the scanout and native presentation and runs `stop_modeset`, and
+no plugged sink is lit while off; on (SETCRTC with a framebuffer, ACTIVE=1,
+or the last DRM file closing, as drm_fb_helper restores the console) lights
+the sink again through the normal modeset. The request is level-triggered,
+so an off/on pair between passes does nothing. Setting another offered mode
+(SETCRTC, or an atomic commit changing MODE_ID) records it with
+`platform::request_display_mode`. The monitor then withdraws the scanout,
+runs `stop_modeset` and relights through `modeset_display_mode`, which
+selects that timing when the sink lists it and it fits, else the preferred
+one. If the requested mode fails to light, the preferred mode is lit and
+the request cleared. The last DRM file closing returns to the preferred
+mode. Mode changes are therefore asynchronous to the ioctl (the next monitor
+pass, up to a second). The teardown sequence now has its own progress and
+fault/cancellation models; partial activation recovery remains open. Unplug (and `stop_modeset`)
+publish the connector disconnected, with no modes, no EDID, and no mode
+accepted. The CRTC is disabled with its framebuffer cleared, and open
+clients keep their GEM and framebuffer objects. DRM_IOCTL_VERSION reports
+amdgpu 3.0.0, the base ABI with no render feature level. This keeps Mesa's
+radeonsi from driving render ioctls the native driver does not implement.
+Presentation goes through the back buffer and a latched flip (see live
+updates above), and flip events stay software-paced at the real refresh
+rate.
+
+`platform::spawn_display_monitor` runs after the boot-time native modeset
+(`amdgpu.native_display`). It enables HPD on every routed DP port, then runs
+a pass at least once a second. Between passes it waits in
+`amdgpu_navi48_dispatch::wait_hotplug`, which returns early on a DCN HPD or
+HPD-RX vector or lost IH vectors, never sooner than 50 ms after the previous
+pass. After enabling a port's HPD block the monitor arms its interrupt
+(`Otg::enable_hpd_irq`: a stale event acknowledged, DC_HPD_INT_POLARITY set
+away from the current debounced sense, DC_HPD_INT_EN, plus DC_HPD_RX_INT_EN
+for DP, as amdgpu_dm_hpd_init does). On an early wake it acknowledges every
+port's raised event (`ack_hpd_irq`: a plug/unplug edge as Linux's hpd0_ack,
+strobing DC_HPD_INT_ACK and re-arming the opposite polarity; a short pulse
+with DC_HPD_RX_INT_ACK) before the pass reads the sense. The arm/acknowledge
+register sequences are model-tested; delivery of DCN vectors through the IH
+is not proven on hardware, and the once-a-second poll stays the fallback. Each pass is `monitor_display`: with a modeset running it calls
+`check_modeset`. A lost link is retrained with the surface still published.
+On unplug the scanout is withdrawn (the console returns to the boot
+framebuffer) and the modeset is torn down. With no modeset, any routed port
+sensing HPD high is lit by a new `modeset_display`, which publishes the
+surface again. An owner error stops the monitor, leaving the owner where it
+stopped.
+
+The platform `modeset_display` publishes the live surface only after
+activation succeeds, through `amdgpu_dcn_display::publish_external`. The
+published `GenericFb` is the surface's bus-physical BAR address, visible size
+and byte pitch (`Otg::scanout_framebuffer`, which requires `ScanoutRunning`
+for that pipe and the owned surface). The fb layer's existing observer moves
+the console onto it. Adoption maps the published physical range
+(write-combining on x86_64, Device on aarch64) and installs that kernel
+mapping, cached per range and never unmapped. DRM presentation (the existing CPU copy of
+a dumb buffer into the live scanout) reaches an adopted external scanout
+through that mapping: the fb hook reports it with a kernel-virtual base only
+when the console adopted exactly the published surface. Nothing new is offered
+to userspace mmap, and the boot framebuffer keeps its fbdev-only behaviour. The fb layer previously stored
+the physical address itself, which `GenericFb::framebuffer` dereferences, for
+both AMD external scanouts and the boot framebuffer restore. The scanout
+carries a flush: CPU writes through the BAR
+pass HDP, so `GenericScanout::flush` calls `flush_active_scanout`, and the
+platform hook try-locks the owner and issues the native HDP flush
+(`Otg::flush_scanout_writes`). It never waits; a skipped flush still drains,
+only later. The policy is single-buffered front-buffer rendering: tearing is
+possible and no vblank synchronisation is claimed. The platform `stop_modeset`
+withdraws the scanout first, clearing the flush before observers run, so the
+console returns to the boot framebuffer. That range stays excluded from the
+VRAM pool for its lifetime and therefore remains valid memory. Teardown waits
+for leased fb/DRM accesses to finish; the monitor subsequently releases the
+native surface only after the hardware checks above succeed.
+
+Page flips are double-buffered on one pipe. `unsafe Otg::prepare_back_buffer`
+(ColdBoot `prepare_display_back_buffer`) reserves a second allocation of the
+front's geometry, staged or live. It must translate through the FB aperture,
+is cleared and HDP-flushed, and stays retained until explicit surface release.
+`back_framebuffer` exposes its CPU view; raw callers must exclude reclamation
+for the lifetime of their access.
+
+`unsafe Otg::flip` (ColdBoot `flip_display`) requires `ScanoutRunning`. It
+rebinds the deadlines and verifies the live fetch at the current front. It also
+requires no held OTG lock, no OTG, pipe-update or flip pending, no MPCC update
+lock and no underflow. It HDP-flushes the producer's writes and enters
+`Flipping`. Following hubp401_program_surface_flip_and_addr, it writes the back
+address (high, then the publishing low; the staged flip type is VSYNC) under the
+master-update lock. Completion is no flip pending and `SURFACE_EARLIEST_INUSE`
+equal to the new address within the frame-bound timeout, with underflow
+watched. The owners must be unchanged. Then every retained report (surfaces,
+DPP, MPC, requestor, scanout) is retargeted together, the buffers swap, and the
+binding and live fetch are re-verified at the new front. `FlipDone` names the
+new front, the now-reusable back and the frame count. Any failure leaves
+`Failed`, with both buffers retained because which one is still fetched is
+unknown. The platform `flip_display` moves a console that had adopted the old
+front onto the new one and drains CPU views before releasing the owner lock.
+There is no flip interrupt or event queue yet:
+completion is polled.
+
+Live updates have one synchronization policy per writer. The front's
+`upload_surface` stays stopped-only. `unsafe Otg::upload_back_buffer(pipe,
+x, y, pixels)` (ColdBoot `upload_display_back`) writes part of one row of the
+next frame into the back buffer only while the pipe is `ScanoutRunning` on
+its front with a back buffer distinct from it; during `Flipping`, after a
+failure or once stopped it is `Busy`, and bounds are checked per row. No CPU
+pointer escapes, and the writes reach display through `flip`'s HDP flush. The
+kernel console keeps drawing the published front with an HDP flush per
+update (a text console may tear). DRM clients own presentation while they
+hold the display (`fb_take_for_user`). The platform modeset allocates (or
+reuses) the pipe's back buffer. DRM frames for the amdgpu card are handed to
+`amdgpu_navi48_platform::present_frame`, a one-slot mailbox drained by a
+presenter task that copies the newest frame into the back buffer under the
+owner lock and flips. A frame arriving during a copy or flip replaces any
+frame still waiting, and the latest always shows. DRM's rule that a client
+leaves a submitted framebuffer untouched until a later flip completes covers
+the deferred read. A failed flip quarantines the pipe and disables native
+presentation. Without a back buffer, frames fall back to copies onto the
+visible front. Flip-complete events stay software-paced at the refresh
+rate (milestone 5). The presenter glue has no model test; `upload_back` and
+flips over a fully staged chain do.
+
+`unsafe Otg::set_cursor(pool, gmc, pipe, (w, h, pixels), (x, y))` (ColdBoot
+`set_display_cursor`) shows a premultiplied ARGB8888 cursor on a live pipe.
+The size is capped at 64x64, Linux's DCN401 `max_cursor_size`, which also
+keeps it out of MALL; DML21 already budgets a 256-wide ARGB cursor per plane,
+so admission is unchanged. The first call allocates a retained 16 KiB buffer
+inside the FB aperture. Each call rewrites the image there with transparent
+padding and HDP-flushes it; an image change is not tear-free, because the
+buffer is single.
+
+Programming follows dcn10_set_cursor_attribute and dcn401_set_cursor_position
+inside mpc1_cursor_lock (`CUR_VUPDATE_LOCK_SET` of the pipe's OPP, released
+on every path):
+- HUBP: address (high, then low), size, and `CURSOR_CONTROL` with mode 2,
+  pitch 64, lines per chunk by width and `CURSOR_REQ_MODE` 1.
+- `CURSOR_SETTINGS`: full write of 0x300.
+- CM_CUR: mode 2, no expansion or degamma ROM, FP16 1.0 scale, matrix bypass.
+- Position, hotspot and `CURSOR_DST_X_OFFSET`, the latter in DCHUB reference
+  clocks.
+
+Negative origins move into the hotspot. A cursor entirely off screen is
+disabled in both HUBP and CM, and `move_cursor` (or the non-blocking platform
+`try_move_display_cursor`, for pointer pumps) only repositions. The live-fetch
+witness expects exactly the reported cursor enable. Stopping scanout hides the
+cursor under its lock before the plane stops, and drops the report while the
+buffer stays retained. Any readback mismatch quarantines the pipe.
+`tests/dcn401_cursor.c` checks the registers, including the MPC lock bank.
+The platform publishes a cursor hook with the scanout
+(`amdgpu_dcn_display::publish_external_cursor`, cleared on withdrawal before
+observers run). It try-locks the owner, uploads the image once, moves it
+afterwards, and hides it with an off-screen move. When the owner is busy it
+skips the update but still reports the cursor as handled, so the fb layer
+never paints a software sprite into a hardware-cursor surface. The fb cursor
+pump uses it for both the console pointer and a compositor's DRM cursor
+whenever the console adopted exactly the published scanout.
+
+Native 8b/10b MST uses `dp_mst_mgr::Manager` over the port's DMUB AUX channel.
+`ColdBoot::display_mst_capable(port)` checks DPCD revision and MSTM_CAP before
+the platform chooses MST. `start_display_mst` requests/acknowledges receiver
+D0 even for empty branches, enables MST/up requests and clears payload tables
+once, then probes LINK_ADDRESS/ENUM_PATH_RESOURCES depth first;
+`read_display_mst_edid` reads end-device EDIDs through REMOTE_I2C_READ. The
+probe uses an explicit stack so its future can run in the display monitor,
+bounded to 15 route levels and 64 branches. Clean sessions reuse the snapshot;
+dirty sessions can reprobe only after every source owner and payload retires.
+The previous snapshot remains available until probe/EDID completion. An
+incomplete or cancelled probe retains the session and refuses replay until
+physical removal or explicit streamless manager shutdown.
+
+`Manager::poll_up_requests` reads at most eight ready up-request chunks per
+call without waiting for a new notification. It acknowledges only
+UP_REQ_MSG_RDY, leaving down replies and other ESI bits alone. Fragment
+reassembly survives idle poll budgets and down-transaction completion;
+start/stop clear the previous session's fragments and events. Complete
+connection/resource notifications enter `events`, capped at 64. `EventsFull`
+leaves the next branch chunk unacknowledged until the caller drains the queue.
+Down transactions still consume their own replies while that queue is full.
+Truncated bodies fail instead of manufacturing zero-filled status fields.
+An event survives failure to send its sideband ACK after ESI acknowledgement.
+`ColdBoot::poll_display_mst(port)` and `take_display_mst_events(port)` expose
+this service over DMUB AUX. `service_display_mst` drains before/after polling
+and marks known-branch/known-port connection notifications for reprobe. Resource
+notifications on connected output ports coalesce into fresh ENUM_PATH_RESOURCES
+queries; notification PBN values alone never become admission authority. Replies
+must match the requested port and have available PBN no greater than full PBN.
+The driver adds its current payload PBN back to the queried free capacity,
+including descendant streams on a shared branch hop. Its own allocations thus
+do not cause repeated relights. A changed capacity/FEC snapshot requests
+reconfiguration. The monitor stops all streams using their old routes, reprobes,
+then relights enabled outputs. Notifications received during queries/reprobe
+remain queued for the next pass. Unknown branch/port, input-port and disconnected
+resource notices are ignored.
+
+`MstLink::resource_query_pending()` reports an incomplete resource-query batch.
+The marker precedes the first AUX operation and clears only after every response
+has completed. Returned failures and cancellation retain it and the topology,
+payloads and session, refusing subsequent payload/sideband transactions, startup,
+teardown and session disposal. These uncertain queries require future explicit
+reconciliation/reset; an empty source/payload list is not permission to discard
+them. Models inject faults before and after every AUX operation on both active
+and empty sessions.
+
+`MstLink::outputs` reserves four stable slots. `MstOutputId` includes root
+GUID, branch GUID, LCT/RAD and output port; probe vector indices are never
+connector identities. Surviving identities claim their old slots before new
+devices are admitted. Disconnected slots retain their requests for replug;
+new devices use empty slots first, then reclaim absent reservations if full.
+Reassignment resets old DRM requests. Replug of the same endpoint preserves
+CRTC disable; changed EDIDs (including extensions) invalidate cached modes.
+`MstOutput::modes` holds independently admitted timings for a present output
+without a lit stream; reprobe clears the list before new admission. Successful
+configuration refreshes each dark output against the slots left by running
+payloads, its probed available PBN and joint DML admission with all running
+streams. Each candidate is an independent possible addition, not a reservation;
+enabling several connectors still reruns complete configuration admission.
+The list follows EDID order and is bounded to sixteen timings. An all-off
+branch queries the board's DPM limits (starting display power if needed), but
+does not request an active-display count, clock floors, pipe clocks, payloads
+or scanout allocations. Startup failures do not publish new dark-output modes.
+
+`unsafe ColdBoot::modeset_routed(fill, want, pipe_of, mst: Option<MstRoute>)`
+lights board SST/HDMI sinks and one DP port's MST branch as one configuration.
+`MstRoute { port, pipes, want }` names the branch's root port, each end
+device's pipe (`pipes[k]` for `MstLink::outputs[k]`, None dark) and timing
+request. The round validates the route and starts the branch, scans once,
+selects board sinks with the MST root excluded (`select_all`; board port p on
+`pipe_of(p)` at `want(p)`) and the branch's devices, refuses duplicate pipes,
+orders every stream by pipe (admission truncates trailing streams), and runs one
+clock request, `refine_dsc`, joint `admit_displays`, `prepare_pipes` and `light`
+per stream. SST connector inventory (`display_sst_outputs`) excludes the MST
+root; dark end devices are admitted beside every running stream, MST slots
+counted only for MST payloads. `modeset_displays` is `modeset_routed` without a
+route. Each round is retried as described for `LinkReduced`.
+
+`unsafe ColdBoot::modeset_mst_displays(port, fill, want, pipes)` is
+`modeset_routed` with that route and no board pipes. It lights one
+branch's sinks with joint DML admission, 8-bpc RGB and the maximum supported
+8b/10b link. `pipes[k]: Option<u8>` assigns stable output k to a distinct
+display/pipe, or disables it. Disabled, unreadable and unadmitted devices
+leave gaps; their successors never inherit their CRTC or requested mode.
+Each payload must fit the remaining 63 slots and the available PBN of every
+connected hop from the sink to the root, after subtracting selected sibling
+payloads on each shared hop. Missing, cyclic or ambiguous parentage refuses
+admission. Zero PBN is exhausted capacity (including `select_mst` inputs),
+never an unlimited/unknown sentinel. Low-level payload adds recheck path budgets
+before writes; dark-connector mode admission uses the same path accounting.
+Active-stream alternatives remain inside both their allocated slots and PBN.
+Add orders the DPCD payload table, source SAT/ACT, ACT handled,
+ALLOCATE_PAYLOAD and stream VC rate before video. Remove zeroes the VC rate,
+deallocates remotely, updates SAT/ACT and compacts later payload slots. Physical
+root removal skips all remote AUX transactions and waits during removal.
+
+`MstLink::payload_change()` reports `Option<MstPayloadChange>`, whose Adding and
+Removing variants carry the DIO stream index. The marker is recorded before the
+first AUX/source side effect and cleared only after all required steps complete,
+without a suspension between completion and clearing. Returned failures and
+dropped futures retain it, including before an add reaches `payloads.push` or
+after a removal empties that list. It is historical uncertainty, never a retry
+or ownership proof. Another add/remove, startup, modeset teardown (including its
+link handover/detach), clean/dirty topology preparation, notification polling and
+remote EDID reads are refused with Busy while it remains. Session shutdown and
+physical removal cannot discard it merely because source-owner/payload lists are empty.
+Static request rejection before the transaction starts (such as duplicate stream
+or missing payload) leaves it clear and permits a corrected request. The existing
+best-effort remote-removal/ACT-status policy is unchanged; source completion is
+still required. No reconciliation or reset of uncertain payload state is provided.
+Models inject returned errors and deterministic cancellation on both sides of
+every AUX/source operation, checking retained state, no replay or sibling
+mutation, topology/session retention and successful slot compaction.
+
+The first display trains the link; the others attach and own their own
+DIG_FE_MODE=5 frontend selections. When the link owner stops its frontend,
+`hand_over_mst_link` transfers ownership to a remaining attached display.
+Only the last display stops the PHY; a connected root stays in D0 with its
+MST manager enabled, including all-off and empty configurations. Physical
+removal drops the manager after its last source owner/payload retires;
+`forget_unplugged_display_mst` checks HPD low and performs no AUX access.
+Explicit `stop_display_mst` refuses to drop a live owner, payload or incomplete
+payload transaction.
+Source verification accepts sibling routes being released while still rejecting unowned frontend
+selections. Failed transitions retain their owners and allocations.
+
+KMS routing follows Linux: there are four CRTCs (display/pipe k is CRTC id
+1 + 3k) and one connector per board DP/HDMI port (board ordinal n: encoder
+2 + 3n, connector 3 + 3n, all ports, not only four), plus four end-device
+connectors (index 32 + slot) while the first connected MST branch is in use;
+the root's own connector then reports disconnected. Every encoder may drive
+any CRTC (`possible_crtcs` 0xf; `amdgpu_navi48_kms::{RoutedConnector,
+apply_routed, publish_routed, connector_index}`). A CRTC drives at most one
+connector: SETCRTC's single connector (more than one is EINVAL; none keeps the
+routing) or an atomic connector CRTC_ID routes it explicitly
+(`platform::request_display_route`, `request_connector_crtc`), moving the
+connector off its old CRTC and parking a displaced connector so automatic
+routing does not relight it elsewhere. Otherwise plugged, unparked connectors
+take free CRTCs in connector order and keep them while plugged. MODE_ID and
+SETCRTC modes are validated against the connector the CRTC drives after the
+request (`display_offers`). Board SST/HDMI sinks and the branch's end devices
+light as one configuration (`ColdBoot::modeset_routed`); a running display
+whose connector routing changes is relit. The last DRM file closing restores
+automatic routing. An all-off DRM configuration keeps connector identities
+and requests while the branch remains connected; removing the branch (with
+no stream left on it) drops its connectors and their routes. Shared-link loss stops and relights the whole configuration instead
+of invoking the SST retrain path. Downstream changes use the same whole-link
+stop/reprobe/relight sequence, so other streams briefly blank. KMS can publish
+a newly discovered EDID and independently admitted timings as connected with
+its CRTC off (`amdgpu_navi48_kms::Output::{edid, offered}`). These timings reach
+GETCONNECTOR and the platform's mode-request gate without setting a CRTC mode
+or framebuffer. A missing EDID suppresses the offered timings. Ordinary MST
+disable retains previously admitted timings without restarting siblings;
+the next configuration/reprobe recomputes admission against remaining resources.
+DSC on MST and more than one MST branch remain unsupported.
+
+An MST branch that codes 128b/132b runs UHBR MST, as Linux's
+decide_mst_link_settings trains MST at the verified cap: the best UHBR rate
+on every lane. Selection then counts all 64 time slots (no MTP header slot,
+drm_dp_mst_update_slots) with dm_mst_get_pbn_divider of that link, and
+payloads start at slot 0 (`MstLink::uhbr`). The first stream trains the link
+with `UhbrSettings::mst` on its own HPO link encoder (training requires the
+manager's MST_EN; stopping leaves the branch in D0); later streams attach to
+the owner's `UhbrLinkTrained` record, and handover/detach follow the 8b/10b
+rules. Each stream uses its own HPO stream encoder in Linux's order:
+`prepare_uhbr_mst_stream` enables and maps it with its timing running blank
+(`State::UhbrStreamReady`), the manager adds the payload through
+`update_uhbr_mst_allocation` (HPO SAT rows with ACT) and `set_uhbr_mst_vc_rate`
+(the recorded `uhbr_mst_rate`: PBN over PBN-per-slot, a 25-bit Y and the
+minimum blanking width, matched against Linux's fixed-point code), then
+`start_uhbr_mst_video` unblanks it. Teardown (`Protocol::UhbrMst`) blanks
+(`blank_uhbr_mst_video`), removes the payload, and only then
+`stop_uhbr_mst_stream` disables the stream, refusing while its VC rate or a
+SAT row remains. `Siblings::hpo` holds stream encoders and `hpo_links` the link
+encoders they ride. UHBR MST LPCM (`Otg::start_mst_audio` on an HPO stream)
+uses the stream's APG and endpoint as UHBR SST does, with Linux's 128b/132b
+budget (the whole link and the timing's blank width, not the slot share). It
+starts only with the manager's completed `slots`, an acknowledged payload and
+exactly one SAT row naming the stream at those slots, which the running
+audio's checks keep verifying; the plain DP entry refuses it (`Unsupported`).
+Legacy MST LPCM uses each stream's AFMT and endpoint as described below.
+This path is model-tested only.
+
+`unsafe ColdBoot::retire_inherited_display` retires the legacy DP SST output
+the firmware left running. It runs in native dependency order:
+1. Blank every DIO stream (a no-op when already blank).
+2. Disable each board-routed DP backend with a single routed frontend. A port
+   without one is refused in planning before any write, and is skipped only if
+   the owner stays reusable.
+3. Require every active stream to have been found behind a backend, then
+   retire those encoders.
+4. Retire planes and every timing generator still running (`running_timing`,
+   read-only). Idle or soft-reset OTGs are left alone.
+
+HDMI, HPO and MST output are not retired by it; their live state makes it
+fail. The fb boot handoff runs it, followed by `modeset_display(0, black)`,
+only with the `amdgpu.native_display` kernel flag. If the modeset then
+fails, the GOP no longer scans out and the screen stays dark until a later
+modeset; the console's GOP framebuffer remains valid, excluded memory.
+
+`tests/dcn401_scanout.c` checks the native registers, including the MPC block's
+DCN bank 3. Physical presentation on the sink remains unverified.
+
+The port deliberately diverges from Linux where Linux would program something
+the hardware cannot honour: it enforces the Tpre > max(Turg, Ttrip) + Tex
+prefetch check Linux compiles out (`#if 0`), which matters precisely because
+the VM/row stages sit at their quarter-line minimum here; rejects a DISPCLK
+needing a DFS divider below 2.0; and rejects register-range overflows DML only
+asserts. `tests/dcn401_dml21/check.sh` builds Linux DML21 on the host (stock and
+with that check enabled) and verifies every line of `tests/dcn401_dml21/
+vectors.txt` and its multi-stream, 4:2:0, DSC and ODM companions, which the
+kernel tests also consume; for a two-pipe plane it also checks that Linux
+programs the second pipe identically but for the blank end. Plans match exactly except
+for +-1 truncation in deep-sleep DCFCLK and the urgent-bandwidth fractions.
+DPPREFCLK is the DFS output mode programming uses; Linux's informative copy
+can read 1 kHz lower.
+
+`unsafe Otg::blank_dp_stream(DpStream::{Dio,Hpo}(instance)).await` blanks one
+of the four native legacy or four HPO DisplayPort stream encoders. Stream
+instances are independent of OTG/transmitter routing; this operation never
+infers a board route or changes a PHY. Callers must stop CPU scanout writers,
+exclude firmware/FAMS and concurrent display, audio/packet, link, clock and
+power writers, and retain every associated allocation and translation. The
+retained timing owner serializes the operation; active timing/links may remain
+running. Invalid instances, contradictory frontend modes/clock enables and
+incomplete resets reject before writes.
+
+Legacy DP requests VBLANK-deferred disable and waits for both video enable and
+hardware status to clear, including inherited enable-clear/status-set cases.
+Only then may it assert steering-FIFO reset and require reset-done. HPO DP
+likewise waits for video acknowledgement before disabling SDP and the pixel
+and clock-ramp FIFOs, in native order. Video waits have a 150 ms bound and the
+legacy reset acknowledgement has a 1 ms bound. An already blank disabled
+encoder receives no writes. Final readback checks that frontend enables,
+clock selections/enables and reset state were preserved. Stream, link and
+timing clocks remain retained; DIO audio/secondary packets remain unchanged.
+
+Success enters `DpBlanked` and records `DpBlanked::{stream,was_active}` in
+`Status::dp_blanked`. This is historical video-blank evidence only: it does
+not prove sink power-down, PHY/encoder/timing/memory retirement, MST teardown
+or HDMI blanking. Subsequent timing, plane and clock operations still require
+their own live consumer checks. Cancellation leaves `BlankingDp(stream)`;
+errors after beginning the operation enter `Failed`, blocking all reuse until
+independent reset. No outcome permits allocation reuse. `unsafe
+ColdBoot::blank_display_dp_stream` and the platform wrapper require the
+drained GC12/SDMA interrupt proofs and serialize access to the same owner.
+
+`unsafe Otg::retire_dp_encoder(DpStream).await` disables one already blank
+native DP frontend. It checks live hardware rather than trusting a previous
+`DpBlanked` snapshot. Video, secondary packet scheduling, DIO GSP8–11 sends
+and metadata transactions must already be stopped; incomplete FIFO resets
+reject before writes. Callers retain all resources, exclude CPU, firmware/FAMS,
+display/audio/packet/link/clock/power writers, and independently retire sink/MST
+bookkeeping and audio/metadata producers. This API does not perform those steps.
+
+DIO retirement resolves all four backend frontend-selection bitmasks. Every
+backend connected to the selected frontend must be disabled first, preserving
+legacy SST shutdown order; this initial path also requires that for MST. Live
+unrelated outputs are allowed. Unsupported frontend selectors reject before
+writes. Native sequencing disables the pixel FIFO, frontend enable and frontend
+clock request, then waits up to 1 ms for both frontend clock-on witnesses to
+clear. It rechecks packets and routing, clears the pixel input mode, and removes
+only this frontend's bit from each connected backend. Unrelated frontend bits,
+HPD selections, backend enables and clocks remain unchanged. HPO retirement
+requires video, SDP and both FIFOs stopped, then disables SYM32 before its stream
+clock request and waits up to 1 ms for all four clock-on witnesses to clear.
+It leaves the independent stream/link mapping and link encoder untouched.
+
+Success enters `DpEncoderRetired` and records
+`DpEncoderRetired::{stream,detached_backends}` in `Status::dp_encoder_retired`.
+Failure after writes or cancellation retains `Failed` or
+`RetiringDpEncoder(stream)` and blocks reuse until independent reset. No result
+proves PHY, sink, timing, VPG/APG/AFMT, HUBP or memory retirement. Global and pipe
+clock owners now also reject enabled DIO frontends/pixel FIFOs and HPO SYM32
+encoders, plus requested or acknowledged frontend/stream clocks; video blanking
+alone cannot authorize clock changes. `unsafe ColdBoot::retire_display_dp_encoder`
+and its platform wrapper retain the same lifetime and drained GC12/SDMA guards.
+
+`unsafe ColdBoot::disable_display_dp_sst(port: usize).await` and its platform
+wrapper disable an inherited direct external legacy DP SST link before frontend
+retirement. The index selects this owner's validated `display_paths()` inventory;
+no caller-supplied transmitter, AUX or HPD substitution is accepted. The matching
+DMUB and timing owners must be ready and the GC12/SDMA interrupt proofs drained.
+USB-C, ACPI PHY transition interlocks and PHY SSC workarounds are outside this
+initial API: callers must establish that the selected direct port needs none.
+Callers independently stop sink, audio/metadata, HDCP and FEC producers, exclude
+CPU/firmware/FAMS and concurrent display/link/clock/power/reset writers, and retain
+every allocation and translation. eDP, MST, HPO and HDMI shutdown are separate.
+
+Live register preflight requires SST mode on both frontend and backend, one
+valid frontend selected by the actual backend route, and agreement with the
+board's HPD selector. Video, packet and metadata producers must be quiet, FEC
+inactive and reset state settled. A live backend requires its frontend still
+enabled. Independent HPO/FRL link consumers reject conservatively until their
+physical muxes have owners; unrelated legacy outputs may remain active.
+
+The private native DMUB operation sends VBIOS transmitter-control v1.7 DISABLE
+(type 128, subtype 1, 60-byte payload). Physical transmitter and one-based HPD
+come from the retained board path; frontend selection is zero as required by
+the DCE112+ command helper, leaving routing to the driver. Native inbox
+consumption alone is insufficient: the display owner waits up to 100 ms each
+for backend enable and requested/acknowledged backend clocks to clear. It then
+revalidates routing and frontend state, clears training-pattern/training-complete
+and alternate-scrambler state, and rechecks all witnesses. It never directly
+gates backend clocks to manufacture firmware completion. A fully disabled
+backend needs no command or cleanup writes. Frontend/FIFO state and unrelated
+backend routes remain unchanged for the subsequent `retire_display_dp_encoder`.
+
+Success enters `DpSstDisabled`, recording `DpSstDisabled::{path,frontend,
+command_sent}` in `Status::dp_sst_disabled`. This historical evidence covers
+firmware disable and digital backend-off only; it proves neither analog PHY
+power gating nor sink, timing, plane or memory retirement. Errors after starting
+enter `Failed`; cancellation retains `DisablingDpSst(transmitter)`. Both block
+display/clock reuse and raw mailbox/scanner access through the retained owner.
+The mailbox independently quarantines incomplete transport. Global/pipe clock
+guards also reject requested or acknowledged backend clocks even if the backend
+enable bit is already clear. No outcome permits allocation reuse.
+
+`unsafe ColdBoot::retire_display_hpo_link(port: usize).await` and its platform
+wrapper retire one external DP HPO digital link before the separate firmware
+PHY shutdown. The port selects the retained validated board inventory. Native
+PHY mux, independent stream-to-link mapper and PHY-derived root clock fields
+must agree; neither the connector index nor its OTG implies a link instance.
+Shared PHY routes, training/test modes, eDP, incomplete resets, rate/allocation
+updates and mismatched shadow/live allocation rows reject before writes.
+Every mapped stream must have completed video, SDP, FIFO, SYM32 and stream-clock
+retirement. Unrelated active streams remain untouched. Callers independently
+retire sink/MST bookkeeping and audio/metadata/HDCP producers, exclude CPU,
+firmware/FAMS and concurrent display/link/clock/power/reset writers, and retain
+all allocations and translations. The same drained GC12/SDMA guards apply.
+
+The owner clears all six native allocation rows and sends ACT when slots are
+allocated, then requires empty live rows and no pending update within 20 ms.
+The self-clearing ACT request is not a completion witness. Only after drain may
+DPHY disable be requested; enable, reset, scheduler and pending-transaction
+status must clear within 100 ms before link-clock disable. Requested and
+acknowledged link clocks must then clear within 1 ms. Route and stream state
+are rechecked across transitions. An already stopped, empty link receives no
+writes. PHY muxes, stream mapping, PHY output and root clocks remain retained
+for the subsequent firmware PHY shutdown. Global and pipe clock changes reject
+enabled PHY-derived HPO root clocks and outstanding DPHY activity independently
+of the digital link-clock enable bit.
+
+Success enters `HpoLinkRetired`, recording `HpoLinkRetired::{path,link,streams,
+removed_slots}` in `Status::hpo_link_retired`. This is historical digital-link
+evidence only; it proves no PHY, sink, timing, plane or memory retirement.
+Errors after beginning the operation enter `Failed`; cancellation retains
+`RetiringHpoLink(link)`. Both block display/clock reuse and raw mailbox/scanner
+access until independent reset. No outcome permits allocation reuse.
+
+`unsafe ColdBoot::disable_display_hpo_dp(port, DpSignal::{Sst,Mst}).await` and
+its platform wrapper complete the direct external HPO DP transmitter shutdown
+after digital-link retirement. `DpSignal` is exported by
+`amdgpu_dmub_navi48`; callers must supply the inherited link's actual signal,
+retire sink/MST bookkeeping and audio/metadata/HDCP producers, exclude concurrent
+CPU/firmware/FAMS/display/link/clock/power/reset writers, and retain all memory
+and translations. The port must need no USB-C/ACPI PHY interlocks or PHY SSC
+workarounds. eDP and HDMI remain separate. The matching DMUB, board inventory,
+timing and DDC owners must be ready and kernel GC12/SDMA interrupt proofs drained.
+
+Live checks require empty HPO timeslots, stopped digital link and mapped stream
+encoders, consistent PHY/root routing, no other root using this PHY, a disabled
+corresponding legacy backend and no pending PHY request/acknowledgement. The
+historical retirement snapshot is not authority to skip these checks. The native
+DMUB v1.7 HPO DISABLE packet uses the board PHY/HPD and explicit SST/MST mode.
+It preserves the native caller's zero connector-object field and zero-initialized
+HPO engine ID encoding; it never substitutes the selected link index into that
+DISABLE field.
+
+After mailbox consumption the owner waits up to 100 ms for all four RDPCS lanes
+to report DISABLE set and CLK_RDY/DATA_EN/REQ/ACK clear, then up to 100 ms for all
+lane-clock requests and the TX clock request/ON witness to clear. These are
+conservative shutdown acceptance conditions, requiring silicon validation.
+No software write targets PHY lane or TX-clock controls. With routing, digital
+retirement and PHY witnesses rechecked, only the selected SYMCLK32_LE source and
+enable nibble is cleared; other root routes and all PHY muxes remain unchanged.
+Already disabled lanes/clocks skip firmware, and an already parked root receives
+no write. Global and pipe clock guards independently reject native RDPCS lane,
+handshake and transmit-clock activity even when digital link/root enables are off.
+
+Success enters `HpoDpDisabled`, recording `HpoDpDisabled::{path,link,signal,
+command_sent}` in `Status::hpo_dp_disabled`. This historical evidence covers
+lane-disable, TX-clock and root-route readback only, not analog power gating,
+sink power-down or allocation reuse. Failure after starting enters `Failed`;
+cancellation retains `DisablingHpoDp(transmitter)`. Either blocks display/clock
+reuse and raw mailbox/scanner access until independent reset; the mailbox also
+retains its own incomplete-transport quarantine.
+
+`unsafe ColdBoot::retire_display_hdmi_tmds_encoder(stream).await` and the
+serialized platform wrapper retire one of four native TMDS HDMI frontends.
+The caller independently handles sink AVMUTE/blanking quirks, SCDC reset,
+external retimers and audio/metadata/HDCP teardown, excludes CPU/firmware/FAMS
+and concurrent display/link/clock/power writers, and retains all memory and
+translations. Live mode must be HDMI (3), with no frontend/FIFO reset, audio
+clocks, metadata, immediate-packet transaction, DP video or pending/locked HDMI
+buffer. Selected backend routes must be single-frontend TMDS, without reset,
+dual-link or HPO muxing. Unrelated live outputs remain untouched.
+The native sequence clears all 15 generic packet schedules and their line
+fields, waits for every packet-enable buffer and HDMI/VUPDATE buffer to drain,
+resets deep-color/scrambler/clock-rate attributes, and waits for that update.
+It then disables the pixel FIFO, frontend enable and clock request, waits for
+DISPCLK/SYMCLK/TMDS frontend clock-off, clears the input pixel mode and detaches
+only this frontend's routes. Routes, metadata and packet activity are checked
+again after asynchronous waits and at completion. Global/pipe clock guards
+also reject outstanding TMDS frontend clock-on, even after its request clears.
+Backend, PHY and timing clocks are preserved: a TMDS OTG may still consume the
+PHY symclk. No DMUB transmitter-disable command or PHY power transition occurs.
+Success records historical `HdmiTmdsRetired { stream, detached_backends }` in
+`Otg::Status::hdmi_tmds_retired`; it proves neither link nor memory retirement.
+Failure after starting enters `Failed`; cancellation retains
+`RetiringHdmiTmds(stream)`. Both block owner/clock/mailbox reuse until an
+independent reset. TMDS backend/PHY shutdown follows timing-clock retirement
+through the operation below.
+
+`unsafe ColdBoot::prepare_display_hdmi_link(port, HdmiLinkRequest { stream,
+pipe })` and `Otg::prepare_hdmi_link` light one direct TMDS HDMI port for the
+staged black timing of `pipe`, with that timing still stopped. Scope: RGB at
+the blank's 8, 10 or 12 bpc, a pixel clock of at least 25 MHz and a TMDS
+character clock (`HdmiLinkReady::character_khz`, Linux's `phy_pix_clk`: the
+pixel clock ×5/4 or ×6/4, truncated in 100 Hz as `get_norm_pix_clk`) of at most
+`TMDS_MAX_KHZ`, the TMDS divide-by-four pixel divider and the DP DTO off. Planning requires a reusable
+owner, a `Signal::Tmds` blank on `pipe` bound to the retained clock, a stopped
+backend with no frontend, dual link or reset, an idle frontend and FIFO, no
+backend already routed to the stream, no DCCG frontend symclk route, and every
+unrelated consumer, packet/metadata producer and HPO root idle; refusals write
+nothing. The native order is Linux's: DMUB `SET_PIXEL_CLOCK` v1.7 (the
+`dcn3_get_pix_clk_dividers`-scaled clock, COMBO PHY PLL of the transmitter,
+UNIPHY object id, HDMI mode, CRTC `pipe`, XTALIN, deep-colour ratio 0/1/2) and
+the matching PHYPLL `DCCG_DEEP_COLOR_CNTL`; `TMDS_CTL0`; link-encoder setup
+(DIO mux, HPD select, backend mode 3, clock, enable); DMUB `DIGX_ENCODER_CONTROL`
+`STREAM_SETUP` v1.5; HDMI stream attributes (RGB, generic-packet v1, keepout, no
+extra NULL, no scrambling; for 10/12 bpc `HDMI_DEEP_COLOR_DEPTH` 1/2 with
+`HDMI_DEEP_COLOR_ENABLE`; GC every frame with NULL packets; no ACP;
+AVMUTE off) with the frontend's OTG and stereo sources; the AVI InfoFrame as
+Linux's `enc3_update_hdmi_info_packet(0)` writes it (HDMI double buffering
+off, VPG GSP memory woken if gated, conflict clear, nine data words, immediate
+update, generic packet 0 sent every frame on line 2); then the BE←FE route,
+frontend mode 3, clock and enable, stream mapper, one pixel per cycle and the
+native FIFO reset (a RESET_DONE handshake only while the frontend symclk runs,
+else a 10 us settle); finally DMUB transmitter `ENABLE` (HDMI mode, four lanes,
+symclk in 10 kHz). Above `TMDS_SCRAMBLE_KHZ` (340 MHz) HDMI_CONTROL also sets the data scrambler
+and the 1/4-rate clock channel (`HdmiLinkReady::scrambled`); the PHY PLL and
+transmitter still take the full pixel rate. Linux's encoder switches at
+`>= 340 MHz` while its SCDC write switches at `> 340 MHz`; both use `>` here so
+source and sink never disagree. Success needs all four lanes ready, TX clocks
+on, backend
+SYMCLK on and frontend DISPCLK/SYMCLK on: `HdmiLinkReady(transmitter)`. Every
+write first re-verifies the owned registers, routes and consumers. The AVI
+frame carries Linux's fields for RGB (active format valid, both bars, underscan,
+uniform scaling, same-as-picture aspect, ITC, `total + 1` bar ends) with VIC 0
+and default quantization: narf matches no CTA mode, and CTA-861 makes a VIC-0
+format full-range RGB, which is what is sent. No Audio InfoFrame or AFMT audio
+clock is enabled and no DCCG frontend symclk route is programmed, as
+`dcn401_enable_stream` does for TMDS.
+
+`start_display_audio(port, true, AudioInfo)` (`Otg::start_hdmi_audio`)
+programs the display half of HDMI audio on running video or live scanout.
+For TMDS, in Linux's order: the DCCG audio DTO0 (source = OTG, module = pixel
+clock in 100 Hz, phase 24 MHz; DCN401 has no audio DTBCLK DTO), the stream's AFMT audio
+clock, IEC 60958 channel status (channels 1..8, update request), audio delay,
+automatic ACR with hardware CTS and Linux's N/CTS tables (the 36-bpc table at
+12 bpc, the 24-bpc table otherwise, HDMI's "Other" N for unlisted clocks), the
+endpoint→DIG source and channel enables (`speakers_to_channels`), then the
+Azalia endpoint the codec reports as ELD (`dce_aud_az_configure`: speaker
+allocation, HDMI connection, SUPPORTS_AI, per-format descriptors with LPCM
+rates limited by `check_audio_bandwidth_hdmi`, AC-3 stream formats, HBR
+capability, lipsync, vendor/product, Linux's default port ids, the monitor
+name), the Audio InfoFrame on line 2 (built by hardware from the codec's
+channel allocation), `az_enable` and unmuted samples. The endpoint is the
+stream's own; a sink without LPCM is `Unsupported`. `stop_display_audio(port, true)`
+mutes, stops the AFMT clock and Audio InfoFrame and disables the endpoint; HDMI
+video cannot stop while audio runs. Modeset builds `AudioInfo` as
+amdgpu_dm does (`hdmi_audio_info`: SADs at CTA revision 3+, the first 3-byte
+speaker block or FL/FR+FC, the 0xFC name, VSDB latencies), starts audio after
+scanout when the sink declares any mode, and stops it first on stop or unplug.
+The HD-Audio controller and codec that stream samples are separate.
+
+The same HDMI audio entry points dispatch to native FRL when its video is owned.
+FRL programs AFMT4 (no DIO AFMT clock or APG), IEC 60958 channel status, source
+and channels, the lane-character-clock N/CTS table and automatic hardware ACR,
+then the pipe's Azalia HDMI endpoint and sample enable. Only LPCM is advertised;
+HBR is disabled, and SD timings clamp to two channels. The video must already
+reserve exactly the audio packets-per-line and borrow mode that its retained
+LPCM capabilities require. Inherited samples/ACR or an occupied endpoint reject
+before audio programming. `Status::frl_audio` retains the owner through partial
+writes; failure quarantines the display. Startup completes in one poll after
+publication and rechecks video/link/format, AFMT/ACR and the endpoint. Live video
+and source-test checks also verify owned audio. Audio stops before scanout/video:
+mute samples, stop ACR and disable the endpoint, preserving the video-owned
+Audio InfoFrame and AFMT memory state. Failed shutdown retains ownership.
+
+All display audio shares one wall DTO, recomputed on start/stop: the lowest
+HDMI audio pipe wins, using DTO0 from the TMDS pixel clock or DTO1 from DPREFCLK
+for FRL. With no HDMI audio, the lowest legacy/UHBR DP audio pipe uses DTO1; no audio
+leaves the clock unchanged. DCN401 has no audio DTBCLK DTO. Endpoint allocation
+excludes every retained TMDS, FRL, legacy DP and UHBR audio owner. Models cover all
+six FRL rates, RGB/4:2:0 depths, bandwidth admission, partial writes, late drift,
+shared DTO selection and teardown. Physical playback remains unverified.
+
+Legacy DP SST LPCM can run beside DSC on the DIO stream encoder. Modeset keeps
+the sink's audio capabilities for these streams and starts audio after scanout,
+with the same audio-first stop/unplug/retrain ordering as uncompressed DP.
+Startup and live audio verification require fresh PPS packet-size, GSP11
+enable/line, VBID[6] line, AFMT clock and secondary-master readbacks from the
+existing DSC video owner. A DSC request alone does not authorize sharing;
+unexpected audio packet/sample enables still reject before writes.
+Stopping audio disables its samples, packet enables and Azalia endpoint while
+preserving the shared AFMT clock and secondary master for GSP11. PPS data and
+scheduling remain the video owner's until video stops. This extends the
+existing LPCM path; the endpoint also advertises the sink's compressed SADs
+and HBR, as for SST DP without DSC.
+Register/protocol models are not physical image or audible-output acceptance.
+
+`start_display_audio(port, false, AudioInfo)` / `Otg::start_dp_audio` also dispatch
+on owned UHBR SST video or its matching scanout. `Status::uhbr_audio` retains
+the APG/Azalia owner. APG instance and endpoint follow the HPO stream, independent
+of OTG/PHY; the input mux selects that endpoint. Startup programs stream ID 0,
+pair-mode channel enables 0xff, APG memory power, a DP ELD (rate-filtered LPCM,
+compressed SADs unfiltered, HBR from the 8-channel 192-kHz probe),
+ASP/ATP/AIP and SDP master. APG reset assertion and deassertion each wait up to
+10 us through the shared async wait primitive; `StartingUhbrAudio` blocks replay
+and display switching if either wait is cancelled. Before APG enable, fresh
+transport/format/blank-width and audio/endpoint checks must pass. Returned
+failures retain the owner in `Failed`; no uncertain audio/link state is reused.
+
+`uhbr_audio_info` filters the sink's valid LPCM SADs before selection and again
+at the trained link before audio starts. Its blanking budget follows Linux
+`check_audio_bandwidth_dp` in 31.32 fixed point, including SSC removal, SDP and
+main-link overhead and the 1.1 margin. The minimum width is the value actually
+programmed by the native stream owner, including pixel padding, rather than
+`populate_audio_dp_link_info`'s differently scaled derived field. Mono uses the
+stereo layout; 3..8 channels conservatively use the eight-channel layout.
+No remaining rates means silent video without an audio endpoint. Linux-host
+vectors cover this explicit input contract at all UHBR rates/lane counts and
+8/10/12-bpc RGB depths; they do not validate audible output or DSC/MST audio.
+
+Live UHBR checks verify retained MSA/format/blank width and APG/packet/endpoint
+state. Stop disables audio packets and APG, then the endpoint, before scanout
+or video retirement. It preserves the running video's SDP master; video stops
+that path later. Failed shutdown retains ownership. The shared wall DTO includes
+UHBR, with HDMI priority and endpoint collision checks across all transports.
+
+On legacy 8b/10b MST, `start_display_audio(port, false, AudioInfo)` dispatches
+to `Otg::start_mst_audio` only after the manager owns exactly one completed
+payload for the stream. Incomplete payload/resource transactions reject before
+programming. Startup verifies the running RGB 8/10/12-bpc transport (or its
+matching live scanout), completed source SAT/VC updates, slot count and VC rate
+against the retained timing and trained link. SAT rows may move as siblings
+leave, but duplicate, foreign or overallocated rows reject. Other rows must
+belong to frontends on this same MST link. Audio never changes payloads.
+
+`mst_audio_info` filters the remote sink's valid LPCM SADs during selection and
+again at startup. It shares Linux's fixed-point blanking calculation with UHBR,
+using legacy MST's 40-symbol layout, 16-symbol SDP overhead, four-lane AV mapping
+and FEC-removed link budget. Mono uses stereo layout and 3..8 channels use the
+eight-channel layout. No surviving rates means silent video. The per-stream
+DIO AFMT, secondary audio packets and Azalia DP endpoint follow the SST sequence;
+valid compressed SADs pass through unfiltered and HBR follows the same budget's
+8-channel 192-kHz probe, as dce_aud_az_configure does. Shared DTO and endpoint allocation
+include the other display transports.
+
+`Status::dp_audio` and `Status::mst_audio_payload: Option<MstAudioPayload>` retain
+both the audio owner and its source allocation witness (`slots`, packed VC `rate`)
+before the first write. Startup has no suspended wait after this publication.
+Partial startup/shutdown failures retain both records in `Failed`. Live scanout
+verification includes the payload/audio witnesses. Stop verifies transport and
+payload before muting samples, disabling packets/AFMT and the endpoint; only
+then may scanout, video and payload retire. The MST activation checkpoint covers
+completed scanout before audio starts. Models cover independent stream/pipe/PHY
+indices, all RGB depths, malformed/stale payloads, failures, endpoint collisions,
+shared DTO and two-stream link handover. 2268 bandwidth vectors match Linux's
+routines. MST DSC and physical audio acceptance remain outside this
+contract.
+
+`start_display_hdmi_video(port)` starts the blank timing, repeats the FIFO reset
+under live symclk, clears AVMUTE and waits for a fresh frame
+(`HdmiVideoRunning(stream)`); scanout may start from it exactly as from DP video
+and returns to it when stopped. `stop_display_hdmi_video` sets AVMUTE, holds
+three frames (dcn30_set_avmute), stops the timing and restages the OPP route
+(`HdmiLinkReady`). `stop_display_hdmi_link` sends DMUB `DISABLE`, observes the
+backend, lanes and TX clocks off, then stops the FIFO, frontend and its clock,
+detaches the route, stops generic packet 0 and restores the HDMI attribute
+defaults: `HdmiLinkStopped`,
+a reusable state. Failure enters `Failed`. The DMUB VBIOS commands carry Linux's
+`payload_bytes` (12 for DIGX, 16 for transmitter control and SET_PIXEL_CLOCK);
+`drivers/gpu/tests/navi48_vbios_commands.c` pins those layouts.
+
+`unsafe ColdBoot::retire_display_hdmi_frl_encoder().await`, its serialized
+platform wrapper and `Otg::retire_hdmi_frl_encoder` retire the single native
+FRL frontend. The caller independently handles sink AVMUTE/SCDC/retimers and
+audio/ACR/metadata/HDCP teardown, excludes CPU/firmware/FAMS and concurrent
+display/packet/link/clock/power/reset writers, and retains all allocations and
+translations. Live preflight requires settled FIFO/tribyte reset state, no
+immediate packet or HDMI/VUPDATE transaction, quiet native DME4/metadata and
+audio/ACR scheduling, and a valid OTG selector. Active FIFO/tribyte inputs must
+match the enabled native HDMISTREAMCLK route. Enabled streams require all three
+stream-clock acknowledgements; incomplete inherited clock transitions reject.
+
+Native packet retirement clears both generic scheduling registers and all eight
+line/EMP registers, then waits up to 150 ms for HDMI/VUPDATE buffers to drain.
+Unlike TMDS, FRL's packet-14 line register contains no per-packet enable-pending
+status. After fresh packet, routing and producer checks, the FIFO is disabled
+before the tribyte encoder. Pending buffers must drain before disabling the
+stream-clock request and waiting up to 1 ms for DISPCLK, SOCCLK and
+HDMISTREAMCLK acknowledgements to clear. Completion rechecks packets, resets,
+routes and producer state. A fully retired stream is a read-only no-op;
+uncertain work on an already-disabled stream rejects without waking it.
+General-control/AVMUTE configuration, pixel format, clock routing, timing,
+link/PHY and independent AFMT/VPG owners remain untouched. The upstream FIFO
+video-active indication is not interpreted as a downstream clock-off witness.
+
+Success enters `HdmiFrlRetired` and records historical
+`FrlEncoderRetired { pipe, was_active }` in `Status::frl_encoder_retired`.
+The pipe is an OTG selector, never an inferred physical port. No result proves
+link, PHY, sink, timing, AFMT/VPG, HUBP or memory retirement. Failure enters
+`Failed`; cancellation retains `RetiringHdmiFrl`. Both block reuse until an
+independent reset. Shared global/pipe clock guards and legacy DP shutdown now
+also reject outstanding FRL stream-clock acknowledgements, FIFO/tribyte resets
+and digital FRL link enable/reset or requested/acknowledged link clocks.
+
+`unsafe ColdBoot::retire_display_frl_link(port).await`, its serialized platform
+wrapper and `Otg::retire_frl_link` retire the board-routed native FRL digital
+link. Callers fulfil the frontend retirement, sink/SCDC/retimer,
+audio/metadata/HDCP and writer-exclusion obligations above and retain all memory
+and translations. Live preflight requires a fully stopped frontend, a unique
+PHY mux selecting HPO HDMI instance zero, a stopped selected legacy backend,
+and matching character-root and forced PHYD18CLK routes. Enabled links require
+clock-on; reset, calibration, reserved patterns, scrambler bypass and partial
+inherited transitions reject before writes.
+
+The native sequence selects zero training patterns, disables link enable,
+gates its clock request, waits up to 1 ms for clock-off, then restores RC
+compression. Fresh frontend, packet, routing and configuration checks precede
+clock gating, compression cleanup and completion. A fully stopped native link
+is a read-only no-op; incomplete shutdown never wakes or replays the encoder.
+Success enters `FrlLinkRetired` and records historical
+`FrlLinkRetired { path, lanes, was_enabled }` in `Status::frl_link_retired`.
+It preserves PHY output, forced input clocks, character/stream roots, timing
+and other outputs, and proves no PHY, sink or memory retirement. Failure enters
+`Failed`; cancellation retains `RetiringFrlLink(transmitter)`, blocking reuse
+until independent reset. Shared clock guards also reject an enabled FRL
+character-clock root after digital-link retirement.
+
+`unsafe ColdBoot::enable_display_dp_phy(port, DpPhySettings { lanes, rate }).await`,
+its serialized platform wrapper and `Otg::enable_dp_phy` start one untrained
+legacy 8b/10b DP SST PHY. The board path must be direct external DP, without
+USB-C/ACPI interlocks or SSC workarounds. The caller validates board/sink/cable
+limits and excludes sink/audio/metadata/HDCP/FEC producers, firmware/FAMS and
+concurrent display/link/clock/power/reset writers. All allocations/translations
+remain retained. Applied global clocks from the matching retained clock owner
+are mandatory. Supported requests are 1/2/4 lanes at RBR/HBR/HBR2/HBR3.
+
+Live preflight requires stopped outputs, detached selected frontend routing,
+all selected PHY lanes disabled, no lane/TX clock activity, no PHY-fed clock
+consumers and no pending training, test, FEC or panel state. Prepared stopped
+timing may retain clocks only through acknowledged DPREF/DTB pixel DTOs. Native
+setup selects legacy PHY muxing and board HPD, enables DP backend mode/clock/
+backend, writes the lane count and advances the scrambler. Unrelated mux and
+scrambler fields are preserved. Fresh controls and lane-off checks precede the
+firmware command. The native DMUB v1.7 ENABLE packet uses board PHY/HPD, lane
+count and symbol clock in 10 kHz units; its zero-initialized connector and HPO
+fields follow Linux's DP enable caller, independently of the DISABLE packet.
+
+Mailbox consumption is only transport completion. Bounded 100 ms waits require
+exactly the requested number of physical lanes clock-ready without reset,
+disable or REQ/ACK activity, with every unused lane disabled, matching lane/TX
+clock requests and TX clock-on, and backend symclk-on. Physical lane reversal
+is allowed; DATA_EN on used lanes is not a training witness. Fresh final
+control/consumer/lane/clock checks precede `DpPhyReady(transmitter)` and historical
+`Status::dp_phy_ready: Option<DpPhyReady>` containing path, settings and observed
+physical lane mask. This state blocks general display/clock/raw-mailbox reuse.
+It proves no sink power, link training, measured link rate, stream or scanout.
+
+`unsafe ColdBoot::disable_display_dp_phy(port).await` and its platform wrapper
+only stop this owner's matching still-untrained ready PHY. Fresh control and
+lane/clock evidence precede native DMUB DISABLE; independent bounded waits
+require backend, all lanes and TX clocks off before native training/panel
+cleanup. Success enters reusable `DpPhyDisabled`, preserving the historical
+ready record without granting analog power-gating or memory-reuse authority.
+Failures enter `Failed`; cancellation retains `EnablingDpPhy`/`DisablingDpPhy`.
+Incomplete transitions retain all owners and block replay until independent
+recovery; unfinished firmware commands additionally quarantine the mailbox.
+
+`unsafe ColdBoot::train_display_dp_link(port, downspread).await`, its serialized
+platform wrapper and `Otg::train_dp_link` train only the matching retained
+`DpPhyReady` legacy SST link at its current lane count and rate. The caller
+fulfils the PHY operation's direct-port, writer-exclusion and memory-retention
+obligations, excludes fixed-drive retimers, eDP, USB-C and MST/FEC work,
+and supplies the actual board/firmware PHY downspread setting. This boolean
+describes existing SSC; training does not reprogram its source. No automatic
+rate/lane fallback, stream enable or scanout is implied.
+
+Training enters `TrainingDp(transmitter)` before the first AUX transaction.
+It requires DPCD 1.1 or later, requests sink D0, waits at least 1 ms and checks
+power readback, then reads live base/extended capabilities on the board AUX
+channel. Malformed/insufficient lane/rate/coding/framing capabilities, branches,
+enabled MST or FEC-ready sinks reject, before any register write. DP
+repeaters (LTTPRs) are handled as Linux's DCN401 (always VBIOS-LTTPR-aware):
+the AUX engine's reply timeout is set to 3.2 ms (AUX_DPHY_RX_CONTROL1, as
+dce_aux_configure_timeout) before the 10-byte capability block at 0xF0000 is
+read. A NACK is absence and restores the 552-us default; timeout, protocol
+failure and exhausted DEFER are errors. A repeater is present when its count
+is a single bit and its lane count is 1..=4 (the revision is not checked).
+Its maximum rate and lanes bound the link like the sink's. The owner echoes
+TOTAL_LTTPR_CNT and sets transparent mode (0x55). When the VBIOS display caps
+carry DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE (`inventory::lttpr_non_transparent`)
+it switches to non-transparent mode (0xAA), reads each repeater's EQ
+AUX_RD_INTERVAL, and trains each repeater before the sink, farthest first:
+TPS1 CR at the sink's CR interval, TPS4 EQ at the repeater's own interval,
+status and adjust requests from the repeater's 0xF0030/0xF0033 block, and
+"training done" (0) written to its pattern register on success or failure,
+the drive restarting at level 0 for the next hop. The CR interval follows
+get_cr_training_aux_rd_interval: 100 us in non-transparent mode without a
+DPCD interval, and an LTTPR implies the 16-ms interval for pre-1.2 sinks. The
+port scan reads the same capability block (with the boot owner setting the
+long timeout on DP ports beforehand and restoring the default where none
+answered), and the modeset bounds its maximum link by it. Native AUX retries DEFER at most six times with 1 ms delays.
+The owner sets and checks 8b/10b coding, enhanced framing, lane count, link rate
+and sink downspread, without granting post-training adjustment requests.
+
+TPS1 clock recovery and capability-selected TPS2/3/4 equalization program both
+the source's native pattern/complete/bypass/PRBS registers and sink training
+registers. HBR3 requires TPS4 support. Each first pattern update bursts the
+pattern and all active lane settings together. Subsequent updates change only
+lane settings. TPS1/2/3 disable sink scrambling; TPS4 retains it. Native DMUB
+v1.7 drive commands use uniform maximum requested swing/pre-emphasis across
+active lanes, clamp pre-emphasis to `3 - swing`, and follow the native caller's
+zero signal/HPO encoding. DPCD maximum-level flags are separate from the VBIOS
+drive byte. Fresh PHY lane-handshake and source/consumer checks surround drive
+changes and AUX waits. Non-training AUX traffic is excluded during training.
+
+Clock recovery stops after five unchanged swing requests, maximum swing, or
+100 total attempts. Equalization allows six attempts and requires retained CR,
+per-lane EQ/symbol lock and interlane alignment. Native base-DPCD training
+intervals are honored asynchronously, including extended-capability indication
+and interval encodings through 64 ms. Confirmed CR/EQ failure exits to native
+idle when transport and source state remain trustworthy, then quarantines the
+owner; uncertain I/O errors issue no speculative cleanup. Successful training
+disables sink training, programs native source passthrough/idle framing and
+scrambler BS count, and waits 5 ms before fresh sink configuration/power/status
+and source/PHY checks. Post-LT adjustment-in-progress cannot complete training.
+
+Success enters `DpLinkTrained(transmitter)` and records historical
+`Status::dp_link_trained: Option<DpLinkTrained>` with PHY/settings, EQ pattern,
+drive levels, downspread and CR/EQ attempt counts. It blocks general owner,
+clock and raw-mailbox reuse; all frontends, video and scanout remain stopped.
+`unsafe ColdBoot::stop_display_dp_link(port).await` and its platform wrapper
+accept only this matching streamless trained state. SST sink D3 acknowledgement
+precedes firmware PHY disable; idle MST roots retain D0 for notifications.
+Independent backend/lane/TX-clock-off waits and
+native training/panel cleanup. Success returns to reusable `DpPhyDisabled`,
+preserving historical training records without releasing memory. Failure enters
+`Failed`; cancellation retains `TrainingDp` or `StoppingDpLink`. Both retain
+owners and block replay until independent recovery. These are software-model
+proofs, with physical link operation still requiring silicon validation.
+
+`unsafe ColdBoot::prepare_display_dp_frontend(port, DpFrontendRequest { stream,
+pipe }).await`, its serialized platform wrapper and `Otg::prepare_dp_frontend`
+prepare a native legacy SST frontend for the matching trained link and staged
+full-range RGB OPP black pattern. Frontend, OTG and board PHY indices are
+independent; none may be inferred from another. Callers fulfil the training
+operation's topology, external-writer exclusion and resource-retention contract,
+and retain exclusive timing/clock/OPP ownership. Timing and video remain stopped.
+
+Preflight requires the matching `DpLinkTrained`, current applied clock owners,
+live divider/reference readback, matching prepared DP timing/OPP depth and no
+inherited packet/audio/metadata, format-buffer or reset work. Read-only retained
+clock references may validate a live PHY; clock programming and ordinary idle
+references keep their existing all-consumers-stopped checks. A payload ceiling
+uses the actual trained lane count/rate and reduces 8b/10b capacity to 97% when
+FEC runs. Uncompressed RGB uses its component depth; DSC uses the validated
+PPS's bits per pixel and per-slice overhead, so a mode which needs compression
+is not rejected against its uncompressed size. This native DSC path requires
+8-bpc RGB SST and a FEC-trained link; other depths, MST DSC and insufficient
+compressed capacity reject before frontend writes. This is not DML admission
+or a watermark proof.
+Native pixel packing selects 1/2/4/8 pixels per cycle from pixel rate and DPREF.
+
+`PreparingDpFrontend(stream)` is set before the first AUX wait. Fresh sink
+configuration, D0 and per-lane/alignment checks precede writes and completion.
+Setup routes the frontend symbol clock to the actual PHY, selects OTG/stereo
+sources, programs uncompressed 8/10/12-bpc RGB or 8-bpc RGB DSC and native MSA totals,
+starts, sync widths/polarities and active sizes, and disables SDP splitting.
+It connects only this frontend to the trained backend, enables the native
+frontend, waits for DISPCLK/SYMCLK acknowledgement, programs the independent
+contiguous stream mapper, sets pixel packing/read-start level and acknowledges
+both resync FIFO reset transitions before FIFO enable. Source, routes, stopped
+timing and unrelated consumers are rechecked around transitions. No steering
+reset release, M/N generation, video enable, timing start or scanout occurs.
+
+Success enters `DpFrontendReady(stream)` and records historical
+`Status::dp_frontend_ready: Option<DpFrontendReady>` containing the request,
+trained-link snapshot, staged blank timing/depth and pixel packing. This state
+blocks trained-link shutdown and all general owner reuse.
+`unsafe ColdBoot::stop_display_dp_frontend(port).await` and its wrapper accept
+only the matching blank frontend. Native FIFO/frontend/clock disable precedes
+independent clock-off acknowledgement, backend detachment and symbol-clock
+route parking. Fresh restored streamless-link evidence returns the owner to
+`DpLinkTrained`, permitting its existing sink-D3/PHY shutdown. Historical
+frontend records remain, without granting memory reuse. Failure enters `Failed`;
+cancellation retains `PreparingDpFrontend` or `StoppingDpFrontend`. Both prevent
+replay and retain resources until independent recovery.
+
+`unsafe ColdBoot::start_display_dp_video(port).await`, its serialized platform
+wrapper and `Otg::start_dp_video` start native legacy SST RGB black video from
+the matching `DpFrontendReady`. Callers retain the direct-port, exclusive
+clock/timing/OPP/PHY ownership and external-writer exclusion obligations for
+the entire running lifetime. All surfaces, translations and inherited resources
+remain retained. This operation enables no memory fetcher, audio, metadata,
+DSC, MST, UHBR or surface scanout.
+
+Preflight checks current retained clocks, unchanged frontend/link/OPP state,
+stopped HUBPs/cursors/metadata/LUT fetchers and settled power-gating witnesses.
+Powered-off HUBPs remain inaccessible. Non-default M/N dividers or
+double-buffer programming reject before writes. The prepared, stopped
+frontend owns any retained measurement generator and disables it before
+reseeding. `StartingDpVideo(stream)` is
+set before the first AUX wait; live sink configuration, D0 and per-lane/alignment
+checks precede timing startup. Native VTG-before-OTG enable must acknowledge
+master enable, latched OPP/FMT black and fresh frame progress before video setup.
+All unrelated display consumers remain stopped and checked.
+
+Native M/N programming seeds N=32768 and M=floor(N*pixel_kHz/link_symbol_kHz),
+sets N interval for the retained 1/2/4/8-pixel packing and enables automatic
+measurement. M is a seed, not a fixed live completion witness. Video-off
+acknowledgement precedes steering reset; both reset directions acknowledge and
+the native 10 us reset hold is preserved. Steering enable, video enable/defer=2,
+200 us priming, read-start level=7, both resync FIFO reset acknowledgements,
+FIFO enable and 100 us priming precede the final video-enable request. Fresh
+video status, sink revalidation and subsequent frame progress are required.
+Timing/video/frame waits use three mode-derived frame periods plus 5 ms,
+bounded at 1 s; steering and resync reset waits are bounded at 1 ms and 50 ms.
+All waits yield through the existing scheduler/time/transport primitives.
+
+Success enters `DpVideoRunning(stream)` and records historical
+`Status::dp_video_running: Option<DpVideoRunning>` with frontend/link/blank
+identity, initial M/N and two distinct post-enable frame counters (wrap allowed).
+The source and sink witnesses do not prove that the physical display presents
+black. This state blocks ordinary timing retirement, clock programming,
+frontend/link teardown and replay.
+
+`unsafe ColdBoot::stop_display_dp_video(port).await`, its wrapper and
+`Otg::stop_dp_video` accept only that matching live owner. Video disables at
+vertical blank and must acknowledge off while timing/clocks remain available.
+Only then may steering reset/disable and M/N generation stop. Native timing
+shutdown disconnects ODM, clears memory selection and disables master/VTG,
+requiring both master-off and busy-off acknowledgements. Fresh stopped source,
+timing, blank and fetcher checks precede restaging the single OPP route with
+timing still disabled. Success updates the prepared frontend snapshot and
+returns to `DpFrontendReady`, permitting black-video restart or existing
+frontend/link shutdown. No memory or PHY is released. Failure enters `Failed`;
+cancellation retains `StartingDpVideo` or `StoppingDpVideo`. Both quarantine the
+owner, retain completion history and block replay until independent recovery.
+Physical video operation and native surface scanout remain separate work.
+
+`unsafe ColdBoot::disable_display_frl(port).await`, its serialized platform
+wrapper and `Otg::disable_frl` disable a validated direct external HDMI FRL PHY
+after frontend and digital-link retirement. The caller fulfils the same sink,
+SCDC/retimer, audio/metadata/HDCP and writer-exclusion obligations, without ACPI
+PHY interlocks or SSC workarounds, and retains all allocations/translations.
+Live checks require the complete native digital-off state, unique board mux,
+quiet selected legacy backend, no PHY handshake and matching retained root
+routes. Shared HPO link roots, inherited enabled HPO stream roots and frontend
+symclk consumers of this PHY reject before commands. Live timing must use an
+acknowledged DPREFCLK/DTBCLK DTO, without pixel add/drop, reset or buffered timing
+transactions; PHY-fed TMDS timing rejects. Consumer routes and configuration
+are checked again across firmware/hardware waits and root parking.
+
+The native DMUB v1.7 DISABLE packet uses FRL mode 4, HDMI connector ID, board
+PHY/HPD and the zero-initialized caller's HPO encoding. Mailbox consumption
+only completes transport. Independent waits of up to 100 ms each require all
+four RDPCS lanes disabled with CLK_RDY/DATA_EN/REQ/ACK clear, then all lane/TX
+clock requests and TX clock-on clear. Only then is the character-clock root's
+enable/source cleared. The host never writes firmware-owned lane/TX witnesses.
+Inherited fully stopped PHYs skip the command; retained root parking still
+requires fresh consumer checks. Native forced PHY input clocks remain retained,
+as do DTOs, timing and unrelated outputs. This proves no analog power gating,
+sink, memory or translation retirement.
+
+Success enters `FrlDisabled` and records historical
+`FrlDisabled { path, command_sent }` in `Status::frl_disabled`. Failure enters
+`Failed`; cancellation retains `DisablingFrl(transmitter)`. Both prevent owner,
+clock and mailbox reuse until independent reset; unfinished firmware transport
+also retains its own mailbox quarantine.
+
+`unsafe ColdBoot::retire_display_tmds_timing(pipe).await` and its serialized
+platform wrapper break the TMDS timing/PHY-clock shutdown dependency. Unlike
+general timing retirement, this operation allows live TMDS backends and PHYs;
+all frontends, FIFO/stream clocks, HPO/FRL links, audio and metadata must already
+be stopped, and every backend frontend route detached. Live retained outputs
+must have HDMI backend mode and legacy PHY muxing, without pending PHY
+handshakes or backend resets. The operation snapshots backend routing, enable,
+clocks, PHY muxes and lane/clock state across all four transmitters.
+It disconnects the selected ODM inputs, stops OTG/VTG, waits for current-master
+and busy acknowledgements, clears latched input underflow through the native
+W1C command, then gates OTG followed by input clocks and waits for both to stop.
+Retained link state and producer quiescence are rechecked before clock gating
+and after completion. Other timing generators and all backend/PHY clocks remain
+untouched. Pending master/input updates and resets reject before writes.
+Success records `TmdsTimingRetired { pipe, retained_transmitters }` in
+`Otg::Status::tmds_timing_retired`; it retires only that timing/clock consumer,
+never HUBP fetches, PHYs or memory. Failure enters `Failed`; cancellation retains
+`RetiringTmdsTiming(pipe)`. Both prohibit reuse until independent reset. Callers
+must retain all allocations/translations and exclude CPU/firmware/FAMS and
+concurrent display/link/clock/power writers. Future PHY shutdown must check all
+live timing and clock users independently of this historical result.
+
+`unsafe ColdBoot::disable_display_tmds(port).await` and its serialized platform
+wrapper disable a validated direct external HDMI Type-A transmitter through
+native DMUB v1.7 DISABLE. The caller must fulfil the same sink AVMUTE/SCDC,
+retimer, audio/metadata/HDCP and writer-exclusion obligations, without ACPI PHY
+interlocks or SSC workarounds, and retain every allocation and translation.
+Live preflight requires all timing generators, OTG/input clocks and frontend
+producers stopped, all backend frontend routes detached, no HPO/FRL activity,
+no forced PHY input clock, stable TMDS retained outputs and a matching board
+HPD selector. No historical retirement snapshot substitutes for these checks.
+The selected enabled backend must have HDMI mode and a clock request. An
+already-disabled backend is accepted only with clocks off and all lanes
+disabled without data/clock/handshake activity; partial inherited shutdown
+rejects without replaying the native command.
+
+Only frontend symclk routes selecting this PHY are parked, clearing FE enable
+and source while preserving unrelated clock bits and routes. Fresh consumer
+and route checks precede firmware submission. The HDMI command carries native
+HDMI mode, connector ID and the zero-initialized caller's HPO engine encoding.
+After mailbox consumption, four separate waits of up to 100 ms require backend
+disable, backend clock/reset-off, all four RDPCS lanes disabled with
+CLK_RDY/DATA_EN/REQ/ACK clear, and all lane/TX clock requests and TX clock-on
+clear. The host never writes these firmware-owned completion witnesses.
+Completion rechecks consumers, routes, other outputs and the selected hardware
+acknowledgements. Success records historical
+`TmdsDisabled { path, parked_frontends, command_sent }` in
+`Otg::Status::tmds_disabled`; this proves neither analog power gating nor memory
+retirement. Failure enters `Failed`; cancellation retains
+`DisablingTmds(transmitter)`. Both quarantine ownership until independent reset.
+
+`amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
+before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,
+the inventoried pool, trained VRAM or an owned training exchange, and all
+training quiescence obligations. `run().await` retains the trainer, SOS,
+PSP/TMR and SMU owners and executes training → SOS → ring/TMR → SMC → SMU
+version/board transfer → DMUB stop → graphics autoload → RLC readiness →
+RS64 program counters → initial power policy → harvested GC12 topology.
+DCN4 stop requires STOP_FW acknowledgement and PWAIT,
+uses CNTL2 reset, verifies disabled/reset readback and leaves PSP's secure
+windows untouched. Every stage is observable through `State`; failure or
+cancellation prevents replay. The sequence then initializes GMC12 and SDMA7,
+configures GC12/RLC and unhalts RS64, starts unified MES12's firmware queues,
+and starts DMUB with a validated
+version/capability handshake. `MemoryReady` reports firmware/media/power status,
+the VMID0 aperture, verified DMA proof and MES queue report. User queues,
+native display and physical validation remain separate gates;
+`fw_loaded` is not set by this API.
+
+`amdgpu_gfx12_rs64::Rs64` prepares immutable PFP/ME/MEC entry points from the
+exact GC12 firmware set. After PSP authentication and RLC autoload, its one-shot
+`unsafe configure` programs two PFP/ME and four MEC counter banks using dword
+addresses and pulses only the corresponding pipe-reset bits. It first refuses
+busy CP/MES or inherited graphics/compute queues, preserves unrelated controls
+and restores the GRBM selector on errors as well as success. A single live
+capability invocation covers the finite indexed sequence, with write readback.
+Failure prevents replay. `Report::rs64` records completed configuration; this
+does not activate queues, unhalt command processors or prove graphics execution.
+
+`unsafe amdgpu_gfx12_setup::Setup::new` reserves an owned RLC clear-state page.
+After RS64, restricted power, GMC and the SDMA proof, `unsafe initialize().await`
+requires inactive CP/MES queues and applies GC12 golden settings. It reads the
+ASIC strap using the NBIO7.7 or NBIF6.3.1 offset; revision-zero workarounds do
+not affect later revisions. Shader-engine broadcast and queue/VMID selectors
+are restored on every exit. Constants configure VMID0 shader access, the
+single graphics pipe, eight hardware contexts and disabled GUI-idle IRQs.
+The RLC image contains the six GC12 clusters (75 dwords), checked independently
+against Linux's clear-state table by `tests/gfx12_clearstate.c`. Publication
+retains the page through cancellation/failure; the driver programs CSIB and
+enables RLC save/restore before activating four MEC stacks and unhalting PFP/ME.
+An async bounded idle wait must succeed before `Report::setup` becomes valid.
+This stage makes command processors available but publishes no application queue.
+
+`amdgpu_mes12` serializes MES12's 64-dword frames using its eight-byte C
+alignment, separately from MES11's four-byte alignment. It provides bounded
+SET_HW_RSRC/SET_HW_RSRC_1, query-status and native kernel queue map/unmap
+commands, typed completion binding and API-error decoding only after the
+trailing query fence drains. Native MQDs use `v12_compute_mqd`, including
+`DB_UPDATED_MSG_EN`, privileged VMID0 and the MES-owned read pointer. Descriptor,
+ring, EOP and pointer ranges must be aligned, disjoint and within 48 bits;
+resources never delegate VMID0 to the scheduler. `tests/mes12_layout.c` checks
+these offsets against installed Linux headers.
+
+`unsafe amdgpu_mes12_hw::Mes::new` requires exact Navi48 GC12.0.1, MMHUB4.1,
+OSSSYS7 and NBIO7.7/NBIF6.3.1 discovery, matching **unified** MES firmware,
+exclusive GRBM/queue ownership and a permanently mapped, uncached BAR2.
+It reserves 40 KiB of inventoried VRAM for two rings, native descriptors, EOPs,
+pointer/fence slots and separate cleaner-fence pages. `unsafe start().await`
+requires successful PSP/RLC/RS64/GMC setup and the translated DMA proof. It
+refuses inherited MES execution, enables the PCIe aperture, programs soc24
+doorbell ranges and RLC's KIQ selection, starts both firmware pipes, and
+initializes KIQ pipe 1 through MMIO. Live versions must support kernel queue
+mapping and memory write pointers. Separate MES1 PM4 firmware is never sent
+MES API frames.
+
+The owner sends KIQ resource commands, maps scheduler pipe 0 through KIQ,
+configures scheduler resources and aggregated doorbells, then queries its
+status. Every submission is a native frame followed by a query frame; success
+requires the API result, exact query sequence and full read-pointer drain.
+Owned ring slots wrap without exposing caller-supplied addresses. All device
+access batches invoke current PCI authority; finite indexed batches restore
+GRBM before awaiting. Version/command waits have 2.1-second deadlines using
+scheduler timers. Publication quarantines every firmware-visible allocation
+through cancellation or failure and prevents replay. `State`/`Report` expose
+firmware progress, live versions and completed commands, **not** application
+acceleration. No application queue or user VMID is delegated yet. The private
+bootstrap mapping path maps the two owned graphics/compute HQDs through
+**scheduler pipe 0**, following MES12's distinct routing for ordinary kernel
+queues. A mapping failure/cancellation stops further MES commands.
+
+`unsafe amdgpu_gfx12_queue::Queues::new` reserves 24 KiB for native graphics
+and compute MQDs, two 4-KiB command rings, EOP storage and pointer writebacks.
+It requires ownership of gfx/compute pipe 0 queue 0 and doorbells 0x116/6;
+the completed MES owner supplies the same uncached BAR2 mapping. `unsafe
+initialize(mes, gmc).await` requires successful RS64/RLC setup and the matching
+GMC/MES owners. It rejects active inherited HQDs, validates the owned two-page
+VMID0 test aperture, flushes descriptors and commands, then publishes storage
+before asking MES to map either queue. Graphics and compute use their native
+MQD fields: the compute ring enables hardware RPTR writeback and its own
+quantum, rather than inheriting the MES firmware's pointer policy.
+
+Each queue submits a 256-dword-aligned, driver-generated WRITE_DATA sequence
+to one translated test page, followed by a confirmed fence and bounded NOP
+padding. `Proof` requires the fresh engine-specific fence, the full **32-bit**
+GC12 read-pointer drain and every expected data word. No caller command or
+address is accepted. The 2.1-second wait uses scheduler timers and current
+capability checks; cancellation or any failure retains mapped storage and
+prevents replay. The cold-boot coordinator retains these queues and both GMC
+pages, recording the proof before DMUB startup. This proves kernel command
+transport and translated writes, not rendering, shader dispatch or user IBs.
+
+After IH service handoff, `unsafe Queues::prove_interrupts(gmc).await` submits
+one native RELEASE_MEM EOP per retained kernel queue. It verifies that the
+interrupt service enabled the native timestamp/generic sources, then advances
+each ring from 256 to 512 dwords. Success requires
+the fresh confirmed fence, full RPTR drain and exactly one matching IH EOP
+since the pre-submission snapshot. With MSI configured, both submissions must
+also advance the CPU vector's fire count; polling alone returns an
+`InterruptProof` with `msi_verified=false`. Existing/new VM faults, changed
+routing, duplicate EOPs, revoked authority, malformed apertures or a 2.1-second
+timeout cannot report success. No command accepts user addresses or data.
+Cancellation retains the `InterruptSubmitted` state, sources and all backing;
+failure retains `Failed` and its error, and neither permits replay. Success
+records `InterruptVerified`. `interrupt_result` and the original write proof
+remain separate, so the latter cannot imply interrupt delivery.
+
+The platform schedules this second proof as an executor task after boot,
+because framebuffer initialization may run with CPU IRQs masked. The proof
+refuses MSI submission if IRQs are still masked. Diagnostics expose
+`queue_state` and `queue_interrupts` separately from the historical cold-boot
+report; while their owner lock is held, platform status is `Running`.
+
+The read-only `amdgpu_dcn_inventory` routing functions support Navi48 with
+GC12.0.1 and DCN4.0.1 (including raw discovery 4.1.0). ATOM display-object
+tables v1.4/v1.5 supply independently resolved transmitter, AUX and HPD
+identities; v1.5's reserved USB-C word is not treated as an external encoder.
+DCN4 exposes four native AUX/transmitter/frontend instances and no DPIA route
+through this interface. `transmitter_busy` reads DCN4's `0x20bd + n*0x124`
+registers. Ambiguous wiring and unsupported channels are refused; these
+inventory functions do not enable any DCN3 timing/plane/link programming.
+DCE-info v4.5 supplies the unchanged reference-clock field. The DCN4 DMUB
+mailbox likewise refuses native AUX/HPD channel indices outside `0..4`.
+
+`amdgpu_navi48_display::Probe` retains board routing and the native DP/eDP/HDMI
+scan transaction. `scan(&mut Dmub, Option<&mut Ddc>)` reads DP DPCD, uses advertised extended receiver
+caps at `0x2200` when at least as new, then reads complete E-EDID with segment
+pointer writes, 16-byte transfers and STOP at each block. It validates the
+base header and every checksum, bounds EDID at 32 blocks and DEFER at seven
+attempts with scheduler delays, and terminates I2C MOT after recoverable sink
+errors. `Port` preserves independent board identities and per-port errors;
+a NACK is not reported as an HPD disconnect. Fatal transport errors stop the
+scan. Cancellation leaves `State::Scanning` and forbids reuse until reset.
+HDMI paths use the native DDC owner; `Sink::dpcd` is `Some` for DP/eDP and
+`None` for HDMI. A physical channel, transmitter or HPD identifier is never
+substituted for another. Both DP and HDMI routes participate in ambiguity checks.
+
+`unsafe amdgpu_ddc_navi48::Ddc::new(gpu, authority, crystal_khz)` prepares a
+retained owner of DCN4's shared native-I2C arbitrator/buffer and all four DDC
+pin pairs. Exact GC12.0.1 and DCN4.0.1/raw-4.1.0 banks are required; the
+crystal comes from ATOM DCE-info. Preparation performs no device writes.
+`edid(channel).await` refuses inherited SW/DMCU ownership, active hardware
+transactions and autonomous EDID polling before writing. It wakes I2C SRAM,
+enables the selected channel clock, acquires SW arbitration and configures
+100 kHz from the live microsecond/XTAL divider. It saves selected GPIO,
+pad-mux, speed/setup and control fields before altering them. Segment writes
+and 128-byte offset-write/repeated-START/read transactions use the hardware
+FIFO, not AUX. Fresh status reset, SW ownership, idle and DONE are required;
+zero status alone never completes a transfer. Reads validate all EDID blocks
+with the same 32-block limit. Segment-zero NACK is tolerated for older sinks.
+Every hardware wait uses scheduler timers and a 50 ms bound.
+
+Known-terminal NACK and EDID validation errors restore selected pin/config
+fields and release arbitration, including the DCN4 second-DONE workaround.
+SRAM and the selected channel clock remain awake. Timeout, unexpected status,
+revocation and cancellation retain the claim/state and forbid replay until
+independent reset. All MMIO batches invoke the PCI capability. There is no
+Drop-time MMIO, bit-banging fallback, forced takeover or hardware reset.
+
+`ColdBoot` keeps this scanner and any routing-preparation error independently
+of engine startup. `display_paths` and `display_state` expose its inventory
+and diagnostics; `scan_display` requires completed firmware/DMUB startup.
+`amdgpu_navi48_platform` serializes these operations through the retained owner.
+DDC preparation errors are independent of non-display startup. Raw DMUB access
+is refused while a scan/DDC transaction is incomplete or failed, including
+after cancellation, so AUX cannot reuse pins owned by a partial HDMI read.
+This discovery API does not train a link or program a scanout mode.
+
+`unsafe amdgpu_gmc_navi48::Gmc::new` validates GC12.0.1/MMHUB4.1/NBIO banks
+and the pool's BAR0/GPU mapping. `initialize().await` requires retained
+firmware and trained VRAM with both hubs idle. It creates a flat VMID0 table
+mapping only two owned VRAM pages in a 2 MiB aperture above physical VRAM.
+Page-table and fault-default backing also lives in the owned pool; no host
+DMA or user VMIDs are enabled. Both hubs must agree on framebuffer geometry.
+Programming uses the GC12 fault-response fields, disables fault interrupts,
+invalidates engine 17 in both hubs and the MMHUB private cache, and retains
+published backing across errors/cancellation. `Ready` follows both bounded
+acknowledgements, not merely table publication.
+
+`unsafe amdgpu_ih7::Rings::new` prepares native OSSSYS7.0.0 rings with exact
+GC12/NBIO discovery banks. It rejects inherited enabled rings, enabled host
+delivery or non-idle IH before allocating; preparation never writes hardware.
+`initialize(&Gmc)` requires the same GPU's ready VMID0/MMHUB and exclusive
+firmware/reset/source ownership. It publishes retained 256 KiB main and
+16 KiB secondary rings plus a writeback page in owned VRAM, using VMID0 GPU
+addresses rather than host physical DMA. It configures the native register
+order, redirects GC retry vectors to ring1, restores the indexed selector,
+and enables both rings with **host interrupt delivery disabled**.
+
+`drain()` returns an allocation-free `Batch` with at most sixteen `Event`s
+from each ring. `Vector` decodes the native 32-byte IV: client/source/ring/VMID
+and VMID source in dword0, 48-bit timestamp and its source in dwords1–2,
+PASID/node in dword3 and four source payload dwords. SOC21 GC client is `0x0a`.
+Pointers are byte offsets; partial vectors, out-of-range/undefined bits and
+unexpected read pointers are errors. The consumer checks overflow both before
+and after copying, flushes HDP visibility, and acknowledges only complete
+vectors. `Batch::pending` requires another bounded drain after yielding.
+A ring0 overflow (the only ring with WPTR_OVERFLOW_ENABLE) is recovered as
+ih_v7_0_get_wptr does: reading resumes at WPTR + 32, the oldest vector not
+overwritten, and WPTR_OVERFLOW_CLEAR is pulsed (set, then cleared with
+readback) so the next overflow is seen. An overflow that races the copy
+discards the whole batch, leaving ring1 unread, and recovers the same way.
+Either case sets `Batch::lost` and counts `overflows()`. Still overflowing
+right after the clear, four consecutive overflowed drains, or any ring1
+overflow (ring1 drains full instead) fail closed as before.
+Failed draining stops owned writers if authority is still live, retains all
+published memory, and forbids replay; revoked authority performs no MMIO.
+`Report` records addresses, sizes and consumed counts without implying MSI.
+
+Cold boot prepares IH before training and initializes it immediately after
+GMC, before command queues. Standalone `ColdBoot::poll_interrupts` provides
+bounded polling while that object still owns the rings. The platform handoff
+transfers them to the permanent service below after completed boot; subsequent
+direct ColdBoot polling is refused. Source-specific fault recovery and fence
+dispatch remain separate work; receipt of a raw vector never completes a user fence.
+
+`unsafe amdgpu_navi48_msi::Route::new` prepares a checked MSI capability and
+NBIO interrupt-control address without writes/vector allocation. It supports
+32/64-bit MSI with optional masking, bounds the complete capability and rejects
+overlap, inherited enabled MSI/MSI-X, an unposted PCI function or mismatched
+identity. `enable(&mut Rings)` reads the current initialized CPU's actual APIC
+ID, refuses IDs beyond legacy MSI addressing and reserves a fresh vector
+excluding the fixed `0xf0` TLB vector. It installs the named handler before
+programming, selects one message, masks while programming when supported,
+checks readback, disables INTx and enables MSI last. PCI Command writes are
+16-bit so W1C Status is untouched. NBIO7.7 uses bank5 `0x8e11`; NBIF6.3.1 uses
+bank2 `0xf1`. VRAM rings use nonsnoop requests; dummy host reads are explicitly
+disabled rather than supplied an invented DMA address. IH storm controls,
+ring1 self-IV updates and ring0 rearm/delivery are enabled only after PCI setup.
+Every config/register batch invokes current PCI authority. Failed/published
+routes retain their vector/handler until independent quiescence.
+
+`amdgpu_navi48_interrupts` owns the transferred rings, route and native fault
+monitor behind a separate
+async mutex. The final framebuffer handoff starts its executor task; HDMI scans
+and firmware/display owner locks cannot delay its draining. The worker snapshots
+the IRQ counter before draining, releases its lock before all waits/yields, and
+uses a 100 ms watchdog drain in MSI mode. Unsupported/unavailable MSI keeps
+diagnosed polling at 1 ms. Partial setup is disabled where authority permits;
+an IH arming error fails the handoff with its owners retained. ARM hardware MSI
+is explicitly refused until ITS has real ITT backing; register models still
+run on both architectures. Fatal draining disables/masks CPU delivery without
+recycling a possibly in-flight vector.
+
+`amdgpu_navi48_faults` describes VM and command fault diagnostics. The internal
+retained monitor validates exact GC12.0.1/MMHUB4.1 banks without writes during
+boot preparation. Service handoff retains all three owners before enabling
+sources. It requires active, nonretrying VMID0 in both hubs, inactive user
+contexts and no inherited enables in its source masks. It enables the seven
+VM protection-fault classes only for VMID0, plus bad-opcode/privileged-register
+faults for the owned graphics and compute pipes and privileged-instruction
+faults for graphics. It also enables the graphics/compute EOP sources and
+SDMA0 traps after the cold-start copy has drained; queue proofs only read
+those controls, so their setup cannot race fault masking.
+Readback is checked after each write. Default-page policy, user contexts and
+unrelated control bits are preserved; containment leaves EOP enables intact.
+
+GC/client 0x0a and VMC/client 0x12 source zero select their respective VM hub.
+The monitor decodes the IV's 48-bit page address, write/retry flags and retains
+the full VMID/PASID/node/queue payload. It snapshots the selected hub's protection
+latch, including its separate VMID and client, before posting its self-clearing
+acknowledgement. An IV indicating GFX VMID source performs Linux's fast-GRBM
+dummy-read sequence.
+The latch can refer to a concurrent fault, so it is not attributed to the IV's
+process. GC sources 183/184/185 classify bad opcodes, privileged registers and
+privileged instructions using native ME/pipe/queue bits. Other sources remain
+raw diagnostic events; they cause no monitor MMIO.
+
+The first recognized fault masks all owned fault sources and SDMA0 traps and makes the monitor
+`Contained`; this masks reporting and does not establish engine quiescence.
+Already-queued VM faults are still recorded and acknowledged.
+`Status::faults` exposes the count, last typed record, monitor state and any mask
+failure. These survive history consumption and eviction. MMIO/revocation errors
+retain the raw vector, stop owned sources where possible, disable CPU delivery,
+and leave uncertain hardware/storage retained. EOP proofs reject any recognized
+fault or a monitor that is not armed. There is no automatic reset, PTE repair,
+fault replay, user-process termination or reuse of failed allocations.
+
+The monitor also records the remaining GC-client fault sources Linux defines
+for GC12 (irqsrcs_gfx_12_0_0.h): CP reserved-bit, semaphore-wait and general
+protection faults, the twelve SDMA7 error sources (SRBM write, invalid
+doorbell, queue hang, atomic/poll/page timeouts, null page, page fault, VM
+hole, frozen engine and both semaphore timeouts, with SDMA instance and queue
+from the IV ring ID), SQ error words (illegal instruction and memory
+violation with their 21-bit detail) and poison: UTCL2 data poisoning,
+RLC_GC_FED, CP ECC/FUE, SDMA ECC/SRAM ECC, SQ EDC FUE/FED, VCN5 UVD/JPEG
+poison, DF/UMC ECC and NBIF ATHUB error events. These have no latch to read,
+so the full IV is the retained evidence; they contain reporting like the
+existing faults. Only VM, CP privileged/opcode and SDMA0 trap sources are
+actually enabled by the service; the rest are classified if the IP raises
+them.
+
+After a lost batch the service wakes every dispatch owner to re-check its
+fence and runs `sweep`: both hub protection latches are read (GC first
+with its dummy read) and a set latch is recorded as `Kind::Latched` with
+no IV, acknowledged after capture, and contained like an IV-reported fault.
+Its latch VMID is the only context evidence, so the dispatcher faults every
+owner in that VMID. A latch that is non-zero without any fault (for example
+inherited from firmware) would therefore contain the monitor after an
+overflow; this errs towards fault reporting. Vectors in the resumed backlog
+can predate a recovery, but they can only wake owners or fault the current
+generation of the same queue key.
+
+`Status` exposes the IH state/report, MSI setup outcome, receive/eviction counts,
+sticky last VM-fault vector, two kernel EOP counters and an SDMA0 trap counter. EOP classification
+requires SOC21 GC/source 181, VMID/PASID zero and exact ME/pipe/queue identity:
+0/0/0 for graphics or 1/0/0 for compute. Doorbell payload is not used to select
+kernel queues; reserved ring bit 7 is ignored as in Linux. SDMA classification
+requires GC/source 49, VMID/PASID zero and exact instance 0 / queue 0 (ring ID
+zero, including bit 7). User SDMA fence source 70 cannot complete this proof.
+The counters survive
+history consumption/eviction. A 64-entry diagnostic history records complete
+raw events; overwrites increment `evicted` and do not erase sticky fault data.
+Platform `poll_interrupts` consumes up to 32 history entries, independently of
+hardware draining. This history is not an application completion queue.
+Platform diagnostics include this live service state separately from boot's
+startup report. Hardware MSI delivery still requires a physical-card test.
+
+`amdgpu_navi48_sources::classify` is the single, MMIO-free decoder of SOC21
+vectors into typed classes: CP EOP (exact ME/pipe/queue slot plus the
+user-queue doorbell in source data 0), SDMA traps (instance/queue) and SDMA
+user fences (doorbell >> 2), faults, poison, DCN401 display events, SQ
+messages, VCN5 media traps, SMU-owned thermal/SMUIO/MP1 sources, the IH
+self-IV and `Unknown`. Display decoding follows `to_dal_irq_source_dcn401`:
+source 9 with context 0–5 is HPD and 6–11 HPD-RX, plus OTG VSTARTUP (vblank),
+vertical interrupt 0, HUBP flip, VUPDATE-no-lock and the DMCUB outbox.
+
+`amdgpu_navi48_dispatch` delivers classified vectors to registered owners,
+following amdgpu_fence.c. An owner registers a `Key` (CP slot, SDMA
+instance/queue or non-zero user doorbell) with its VMID and PASID and gets a
+`Handle` carrying the slot generation. A vector only wakes the owner: `wait`
+snapshots the endpoint, calls the owner's own memory-fence check, and parks
+until the endpoint changes or a 100 ms watchdog fires (Linux's fallback timer
+role); every wait also takes a mandatory deadline. Completion vectors match
+the exact slot first and then the doorbell, as gfx_v12_0_eop_irq does, and
+must carry the owner's VMID/PASID. Vectors for unregistered, retired or
+mismatched owners, unknown sources, media, power and SQ messages are only
+counted. Per-endpoint statistics separate signal and watchdog wakes and
+count completions first seen by the watchdog, the lost-interrupt evidence
+Linux warns about. Waiter storage is bounded (eight per endpoint); an
+overflowing waiter still completes through the watchdog and is counted.
+
+Faults are delivered to their owners: CP faults by slot and then the
+context-ID doorbell (amdgpu_gfx_handle_priv_fault), SDMA faults by
+instance/queue, and VM and shader faults to every owner of the faulting
+VMID/PASID. The first fault is kept; waiters on a faulted endpoint return
+`Faulted` unless their fence already completed. `unsafe recover` is the
+controlled-recovery step: once the owner has reset or unmapped its queue it
+gets a new generation, and every handle of the faulted generation is `Stale`
+forever. Faults without an owner are counted as unattributed. Poison is
+terminal, as Linux's poison consumption ends in a GPU reset. The interrupt
+service delivers its own failures (all-ones MMIO as `DeviceGone`, overflow,
+protocol, revocation, fault-monitor errors) with `fail_all`: every current
+waiter wakes with `Terminal`, new waits return it without reading memory, and
+registration is refused. The service registers the kernel graphics
+(ME/pipe/queue 0/0/0), compute (1/0/0) and SDMA0 queue-0 owners for VMID0, and
+`Status` exposes them with the dispatch summary. There are no application
+queues yet, so no client registers user doorbells; MES-scheduled user queues,
+queue reset and fault-source re-arming after containment remain open, and
+after the first fault other owners see later faults only as timeouts.
+Everything here is model-tested (fake vectors and a local table driven
+through pending waits); none of it has run on the card.
+
+Display events are counted per DCN401 instance in `DisplayEvents` and are
+never acknowledged by the dispatcher, because the DCN registers belong to the
+display owner (amdgpu_dm acknowledges in `dc_interrupt_ack`). `wait_display`
+takes an interest mask (hot-plug, flip, VUPDATE, vblank, VLINE0, DMUB outbox)
+and the consumer's last-seen version, so an event between two waits is
+reported at once. Overflows and terminal errors wake every display waiter.
+No DCN interrupt source is enabled yet; the flip and vblank paths are still
+polled by their owners.
+
+The worker's `Status::wakes` separates drains after a CPU MSI, MSI wakes
+that found nothing, drains after the 100 ms MSI watchdog, watchdog drains
+that found vectors (a lost or unrearmed MSI) and timer polls without a
+route. On the card, a working MSI route shows `irq` advancing with
+`watchdog_found` staying zero; these counters and the dispatch per-owner
+watchdog completions are the evidence the physical test must collect.
+
+`unsafe amdgpu_sdma_navi48::Sdma::new` selects SDMA7.0.0/1 on GC12.0.1,
+with queue registers in GC bank zero and MCU control in bank one. Its owned
+VRAM ring/writeback allocation is validated against BAR0. `initialize(gmc)`
+requires the same GPU's ready GMC owner and rejects all eight inherited
+SDMA0 queues. Cold start halts the MCU without a GRBM reset, preserves PSP's
+firmware, programs a privileged VMID0 direct ring and submits write, copy
+and uncached fence packets. Success requires matching source/destination
+bytes, fence, hardware read pointer and read-pointer writeback. HDP6 uses
+generic posted-write flushing with no HDP5 invalidate access. A failed or
+cancelled attempt cannot replay and retains its published allocation.
+The cold-boot owner retains GMC and SDMA throughout their consumers' lives.
+
+After service handoff, `unsafe Sdma::prove_interrupts(gmc).await` appends an
+uncached 32-bit fence followed by a native SDMA7 TRAP with zero context, padding
+the second submission to 64 bytes. Preflight requires the original 128-byte
+hardware and writeback pointers, the matching flat aperture, an enabled ring
+and the service-owned trap enable. The separate fence slot is cleared before
+publication; it does not overwrite either GC12 proof. Success requires the
+fresh fence, both hardware and writeback RPTR at 192 bytes, exactly one new
+matching IH trap, and an advancing CPU IRQ count when MSI is configured.
+`InterruptProof::msi_verified` distinguishes actual CPU delivery from polled IH
+observation. Faults, duplicates, routing changes and a one-second timeout fail
+closed. `InterruptSubmitted` is set before the first await; cancellation and
+failure prevent replay and retain published storage. `interrupt_result()`
+retains success/error separately from the initial copy proof.
+
+The platform's post-boot task serializes this proof after both GC12 interrupt
+proofs succeed, with the independent IH consumer still running. Cold-boot
+accessors and platform diagnostics expose `sdma_state` and `sdma_interrupts`.
+This verifies only the owned bootstrap ring; application submissions, SDMA
+fault dispatch, reset and physical interrupt validation remain open.
+
+`amdgpu_dmub_firmware::Image::prepare_dcn401` requires a DCN4 combined image
+and allocates a separate, bounded shared-state region alongside the existing
+instruction/stack/VBIOS/mailbox/trace/state regions. Shared feature counts must
+fit their advertised storage; allocation is at least six 256-byte blocks.
+Older layouts continue rejecting images that require shared state.
+`amdgpu_dmub_navi48::Prepared::new` prepares immutable ordinary RAM with this
+GPU's VBIOS before any hardware write. `unsafe Dmub::new` validates the pool
+mapping and retains all nonsecure storage. `quiesce` requires STOP response,
+GPINT acknowledgement and PWAIT, then holds CNTL2 and DMUIF reset with readback.
+`unsafe start(psp)` verifies both authenticated CW0/CW1 windows lie inside
+this GPU's retained TMR, preserves those windows, uploads nonsecure data and
+programs Region6 shared state plus the cached windows and mailbox registers.
+It requires fresh boot status followed by matching GPINT firmware version and
+feature-capability acknowledgement. Initial boot options disable automatic
+clock/IPS power transitions and skip the inherited panel initialization.
+
+DCN4 reuses the bounded inbox/outbox protocol for `hpd`, `aux` and
+`poll_notification`, with CNTL2 liveness and HDP6 coherency. Timeout, malformed
+reply, cancellation, reset or capability revocation stops further commands;
+published storage remains quarantined until independent recovery. The
+cold-boot firmware bundle includes DMUB preparation, and `ColdBoot::dmub`
+exposes the mailbox only after the complete boot sequence succeeds while
+retaining PSP/TMR. This proves firmware communication, not native scanout.
+
+`unsafe amdgpu_navi48_platform::prepare(physical_boot_framebuffer)` is the
+single-CPU boot handoff. It prepares immutable firmware, inventories VRAM and
+refuses training over live firmware in the overwritten prefix, then claims
+exclusive controller access and retains `ColdBoot` in an async mutex. Errors
+before the claim perform no hardware writes and release all reservations.
+Preparation now selects unified MES and retains the matching PCI function.
+After the DMA proof, startup maps BAR2 as Device memory (failing instead of
+falling back to an unmapped physical address), starts MES12 and records its
+report before starting DMUB. BAR sizing is deferred until after the handoff.
+`unsafe run().await` requires CPU framebuffer writers to remain stopped; its
+owner persists across success, failure and cancellation. `status` exposes the
+stage and successful report without waiting. HPD/AUX/notification wrappers
+serialize access to the live DMUB mailbox. Normal controller and legacy PM
+entry points cannot access either claimed discrete generation; immutable DRM
+discovery remains available and acceleration is still unadvertised.
+
+The final `narf-fb` `amdgpu-discrete-firmware` initcall selects Navi22 or Navi48,
+pauses CPU console/framebuffer writers before preparation, and runs startup
+without a spinlock or executor poll on the stack. A preflight error resumes
+writers. A started failure/cancellation on the primary GPU keeps them stopped;
+an unrelated secondary GPU cannot quarantine another device's framebuffer.
+
 ### Navi 22 PSP secure-OS bootstrap
 
 `amdgpu_psp_boot::Firmware::open(gpu, registry_cap)` selects
@@ -713,7 +3548,7 @@ Navi22 is excluded from the DCN314 USB-C startup path. Its suspend handler
 returns `NotImplemented` before changing PM state or issuing commands; discrete
 GPUs cannot resolve the legacy APU SMU mailbox through `mp1_mailbox_base`.
 
-`narf-fb` registers `amdgpu-navi22-firmware` during Subsys, appending it after
+`narf-fb` registers `amdgpu-discrete-firmware` during Subsys, appending it after
 the statically registered Late firmware scans and framebuffer initialization.
 This synchronous boot call runs before executor polling and userspace mmap.
 It pauses cached writers, scanout/fbdev discovery, drain/cursor/status pumps,
@@ -1211,9 +4046,13 @@ dividers can produce, so a plausible guess at any of them yields a picture that
 tears under load rather than an error. A table that is missing, the wrong
 revision or self-inconsistent fails closed.
 
-`display_paths(gpu, vbios)` walks `display_object_info_table_v1_4`, resolving
-an exact DCN314 or Navi22/DCN3.0 profile from discovery. It decodes each path's
+`display_paths(gpu, vbios)` walks `display_object_info_table_v1_4/v1_5`, resolving
+DCN314, Navi22/DCN3.0 or Navi48/DCN4.0.1 from discovery. It decodes each path's
 connector and UNIPHY transmitter separately from its hardware AUX and HPD lines.
+Object ids are `ObjectID.h` values, as Linux's `bios_parser_common.c` decodes
+them: connectors HDMI-A `0x0c`, DisplayPort `0x13`, eDP `0x14`; encoders UNIPHY
+`0x1e`, UNIPHY1 `0x20`, UNIPHY2 `0x21` (two transmitters each, by enum id) and
+UNIPHY3 `0x25` (transmitter G only). `displayobject.h` numbering is not used.
 Connector record offsets are relative to the display-object table. The I2C and
 HPD record IDs are keys into `atom_gpio_pin_lut_v2_1`; the GPIO register and bit
 are matched against the discovered DCN bank to obtain the AUX channel and
@@ -1239,8 +4078,8 @@ hardware AUX channel. Its transmitter and HPD selector come from that path;
 the caller assigns the stream frontend independently. Shared AUX channels or
 transmitters require a mux/bridge owner and are refused instead of selecting the
 first connector. Only DisplayPort/eDP paths may produce native routes. Profile
-bounds admit all six Navi22 transmitters and frontends. Navi22 rejects DPIA
-routes; the Phoenix profile retains its five DIG candidates.
+bounds admit all six Navi22 or four Navi48 transmitters and frontends. Both
+discrete profiles reject DPIA routes; Phoenix retains its five DIG candidates.
 
 A tunnelled sink has no board-wired transmitter, so it borrows one. All five DIGs
 are candidates, ordered so that transmitters the board wired to no connector come

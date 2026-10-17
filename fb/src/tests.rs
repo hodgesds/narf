@@ -1274,3 +1274,127 @@ fn smoke_fbdev_mmap_frames() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("fb", smoke_fbdev_mmap_frames);
+
+/// An adopted scanout is published by bus-physical address; the installed
+/// view must be its kernel mapping, reused for the same range, never the
+/// physical address itself.
+fn smoke_fb_adopted_scanout_is_installed_through_its_mapping() -> TestResult {
+    use narf_graphics_driver::generic::GenericFb;
+    const PHYS: u64 = 0x7f_0000_0000;
+    const VA: u64 = 0xffff_c000_dead_0000;
+    let fb = GenericFb::new(PHYS, 640, 480, 640 * 4, 32);
+    {
+        let mut maps = crate::ADOPTED_MAPS.lock();
+        let Some(slot) = maps.iter_mut().find(|m| m.is_none()) else {
+            return TestResult::Skip("adoption mapping cache full");
+        };
+        *slot = Some((PHYS, 640 * 480 * 4, VA));
+    }
+    let mapped = crate::map_scanout(fb);
+    let reused = mapped.map(|m| (m.addr, m.width, m.height, m.pitch));
+    let stale_adopted = crate::adopt(fb);
+    crate::ADOPTED_MAPS
+        .lock()
+        .iter_mut()
+        .filter(|m| m.is_some_and(|(p, _, _)| p == PHYS))
+        .for_each(|m| *m = None);
+    if reused != Some((VA, 640, 480, 640 * 4)) {
+        return TestResult::Fail("cached mapping not used for the same range");
+    }
+    if stale_adopted {
+        return TestResult::Fail("withdrawn publication was adopted by a stale pull");
+    }
+    if crate::adopt(GenericFb::new(0, 640, 480, 640 * 4, 32))
+        || crate::adopt(GenericFb::new(PHYS, 0, 480, 640 * 4, 32))
+    {
+        return TestResult::Fail("degenerate scanout adopted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "fb",
+    smoke_fb_adopted_scanout_is_installed_through_its_mapping
+);
+
+/// A cached FbWriter can outlive a display on a headless boot. Withdrawal
+/// must clear its mapping and wait for the view already writing the old one.
+fn smoke_fb_withdrawal_drains_views_and_clears_cached_writers() -> TestResult {
+    use crate::FbScanout;
+    use core::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    use narf_drivers_gpu::scanout_access;
+    use narf_graphics_driver::generic::GenericFb;
+
+    let saved = *crate::GENERIC_FB.lock();
+    let saved_phys = crate::GENERIC_PHYS.load(core::sync::atomic::Ordering::Acquire);
+    let saved_boot = crate::BOOT_GENERIC.lock().take();
+    let mut pixels = alloc::vec![0u32; 16];
+    scanout_access::replace(|| {
+        *crate::GENERIC_FB.lock() = Some(GenericFb::new(pixels.as_mut_ptr() as u64, 4, 4, 16, 32));
+    });
+    let before = narf_scheduler::preempt_count();
+    // SAFETY: the test owns the backing and keeps the lease until writes end.
+    let mut old = unsafe { scanout_access::snapshot(|| crate::GENERIC.framebuffer()) };
+    assert_eq!(narf_scheduler::preempt_count(), before + 1);
+    assert!(!crate::restore_boot_scanout());
+    assert!(crate::generic_phys().is_none());
+    // SAFETY: the withdrawn generic backend returns an empty, bounded view.
+    let empty = unsafe { scanout_access::snapshot(|| crate::GENERIC.framebuffer()) };
+    assert_eq!((empty.width, empty.height), (0, 0));
+    assert!(empty.read_pixel(0, 0).is_none());
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut wait = core::pin::pin!(scanout_access::wait_retired());
+    assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+    old.draw_pixel(1, 1, narf_graphics::Pixel32(0x123456));
+    assert_eq!(pixels[5], 0x123456);
+    drop(old);
+    assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(()));
+    drop(empty);
+    assert_eq!(narf_scheduler::preempt_count(), before);
+    scanout_access::replace(|| {
+        *crate::GENERIC_FB.lock() = saved;
+        crate::GENERIC_PHYS.store(saved_phys, core::sync::atomic::Ordering::Release);
+    });
+    *crate::BOOT_GENERIC.lock() = saved_boot;
+    TestResult::Pass
+}
+kernel_test_in!(
+    "fb",
+    smoke_fb_withdrawal_drains_views_and_clears_cached_writers
+);
+
+/// Without a driver-published external scanout, the DRM blit target stays
+/// exactly what fbdev exposes: the boot framebuffer gains no new route.
+fn smoke_fb_drm_external_geometry_requires_published_scanout() -> TestResult {
+    if narf_drivers_gpu::amdgpu_dcn_display::active_scanout().is_some() {
+        return TestResult::Skip("an external scanout is live");
+    }
+    if crate::external_scanout_geom().is_some() {
+        return TestResult::Fail("blit target without a published scanout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "fb",
+    smoke_fb_drm_external_geometry_requires_published_scanout
+);
+
+/// The hardware-cursor arrow matches the software sprite's bitmap, and no
+/// hardware path is taken unless the console adopted a published scanout.
+fn smoke_fb_hardware_cursor_arrow_and_gating() -> TestResult {
+    let image = crate::cursor::arrow_image();
+    let set = image.iter().filter(|&&p| p == 0xffff_ffff).count();
+    let clear = image.iter().filter(|&&p| p == 0).count();
+    if set == 0 || set + clear != image.len() {
+        return TestResult::Fail("arrow is not opaque white over transparent");
+    }
+    if narf_drivers_gpu::amdgpu_dcn_display::active_scanout().is_none()
+        && crate::cursor::hardware_cursor(Some((10, 10)))
+    {
+        return TestResult::Fail("hardware cursor without an adopted scanout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("fb", smoke_fb_hardware_cursor_arrow_and_gating);

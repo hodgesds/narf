@@ -13,6 +13,18 @@ pub(super) struct Path {
 impl IntelHda {
     pub(super) fn discover_paths(&mut self) {
         for (index, graph) in self.graphs.iter().enumerate() {
+            // GPU HDMI/DP audio: every connected digital port, no analog.
+            if hda_codec::is_ati_hdmi(graph) {
+                if self.stream_counts().1 != 0 {
+                    for nodes in hda_codec::find_digital_output_paths(graph) {
+                        self.outputs.push(Path {
+                            codec: index,
+                            nodes,
+                        });
+                    }
+                }
+                continue;
+            }
             if self.stream_counts().1 != 0 {
                 for pin in &graph.widgets {
                     if pin.ty() != WidgetType::PinComplex
@@ -92,6 +104,11 @@ impl IntelHda {
             } else {
                 graph.afg_nid
             };
+            // atihdmi_probe: ATI converters under-advertise; Linux grants
+            // every rate, S16/S32 and eight channels regardless.
+            if hda_codec::is_ati_hdmi(graph) {
+                continue;
+            }
             let (Ok(pcm), Ok(formats)) = (
                 self.verb(graph.addr, caps_nid, VERB_GET_PARAMETER | 0x0a),
                 self.verb(graph.addr, caps_nid, VERB_GET_PARAMETER | 0x0b),
@@ -110,133 +127,251 @@ impl IntelHda {
         supported
     }
 
-    fn verb(&self, cad: u8, nid: u8, verb: u32) -> Result<u32, HdaError> {
+    pub(super) fn verb(&self, cad: u8, nid: u8, verb: u32) -> Result<u32, HdaError> {
         // SAFETY: this object's lifetime owns the controller and command ring.
         unsafe { self.send_verb(make_verb(cad, nid, verb)) }
     }
     pub(super) fn configure_paths(&self, capture: bool, params: HwParams) -> Result<(), HdaError> {
-        let paths: Vec<&Path> = if capture {
-            self.input.iter().collect()
-        } else {
-            self.outputs.iter().collect()
-        };
-        if paths.is_empty() {
+        if capture {
+            let path = self.input.as_ref().ok_or(HdaError::NoOutputStream)?;
+            return self.configure_path(path, 0, true, params);
+        }
+        if self.outputs.is_empty() {
             return Err(HdaError::NoOutputStream);
         }
-        for path in paths {
-            let graph = &self.graphs[path.codec];
-            let cad = graph.addr;
-            let converter = graph
-                .widget(path.nodes.converter_nid)
-                .ok_or(HdaError::NoCodecs)?;
-            if converter.caps.channels() < params.channels.count() {
-                return Err(HdaError::NoOutputStream);
-            }
-            let caps_nid = if converter.caps.format_override() {
-                converter.nid
+        // Route to the HDMI/DP ports a monitor is on; detach the others'
+        // converters so a port that lost its sink stops taking the stream.
+        self.refresh_hdmi(false)?;
+        let routed = self.routed_outputs();
+        for (index, path) in self.outputs.iter().enumerate() {
+            if routed.contains(&index) {
+                self.configure_path(path, index, false, params)?;
             } else {
-                graph.afg_nid
-            };
+                let graph = &self.graphs[path.codec];
+                self.verb(
+                    graph.addr,
+                    path.nodes.converter_nid,
+                    VERB_SET_CONVERTER_STREAM,
+                )?;
+            }
+        }
+        self.apply_volume(&self.volume.lock())?;
+        self.refresh_jacks()?;
+        Ok(())
+    }
+    /// Power, select, unmute and format one path; `output` indexes
+    /// `self.outputs` for playback.
+    pub(super) fn configure_path(
+        &self,
+        path: &Path,
+        output: usize,
+        capture: bool,
+        params: HwParams,
+    ) -> Result<(), HdaError> {
+        let graph = &self.graphs[path.codec];
+        let cad = graph.addr;
+        let converter = graph
+            .widget(path.nodes.converter_nid)
+            .ok_or(HdaError::NoCodecs)?;
+        let ati = hda_codec::is_ati_hdmi(graph);
+        if !ati && converter.caps.channels() < params.channels.count() {
+            return Err(HdaError::NoOutputStream);
+        }
+        let caps_nid = if converter.caps.format_override() {
+            converter.nid
+        } else {
+            graph.afg_nid
+        };
+        let Some(bits) = Self::pcm_size_bit(params.format) else {
+            return Err(HdaError::NoOutputStream);
+        };
+        if !ati {
             let pcm = self.verb(cad, caps_nid, VERB_GET_PARAMETER | 0x0a)?;
             let formats = self.verb(cad, caps_nid, VERB_GET_PARAMETER | 0x0b)?;
-            let Some(bits) = Self::pcm_size_bit(params.format) else {
-                return Err(HdaError::NoOutputStream);
-            };
             if pcm & (1 << 6) == 0 || pcm & bits == 0 || formats & 1 == 0 {
                 return Err(HdaError::NoOutputStream);
             }
-            self.verb(cad, graph.afg_nid, 0x705 << 8)?;
-            super::runtime::delay_us(1000);
-            let mut nodes = Vec::new();
-            if capture {
-                nodes.push(path.nodes.converter_nid);
-                nodes.extend_from_slice(&path.nodes.chain);
-                nodes.push(path.nodes.pin_nid);
-            } else {
-                nodes.push(path.nodes.pin_nid);
-                nodes.extend_from_slice(&path.nodes.chain);
-                nodes.push(path.nodes.converter_nid);
+        }
+        self.verb(cad, graph.afg_nid, 0x705 << 8)?;
+        super::runtime::delay_us(1000);
+        let mut nodes = Vec::new();
+        if capture {
+            nodes.push(path.nodes.converter_nid);
+            nodes.extend_from_slice(&path.nodes.chain);
+            nodes.push(path.nodes.pin_nid);
+        } else {
+            nodes.push(path.nodes.pin_nid);
+            nodes.extend_from_slice(&path.nodes.chain);
+            nodes.push(path.nodes.converter_nid);
+        }
+        for (position, &nid) in nodes.iter().enumerate() {
+            let widget = graph.widget(nid).ok_or(HdaError::NoCodecs)?;
+            if widget.caps.power_ctrl() {
+                self.verb(cad, nid, 0x705 << 8)?;
             }
-            for (position, &nid) in nodes.iter().enumerate() {
-                let widget = graph.widget(nid).ok_or(HdaError::NoCodecs)?;
-                if widget.caps.power_ctrl() {
-                    self.verb(cad, nid, 0x705 << 8)?;
+            let selected = nodes
+                .get(position + 1)
+                .and_then(|next| widget.connections.iter().position(|n| n == next));
+            if let Some(selected) = selected {
+                if widget.ty() != WidgetType::AudioMixer {
+                    self.verb(cad, nid, (0x701 << 8) | selected as u32)?;
                 }
-                let selected = nodes
-                    .get(position + 1)
-                    .and_then(|next| widget.connections.iter().position(|n| n == next));
-                if let Some(selected) = selected {
-                    if widget.ty() != WidgetType::AudioMixer {
-                        self.verb(cad, nid, (0x701 << 8) | selected as u32)?;
+                if let Some(amp) = widget.in_amp {
+                    if selected > 15 {
+                        return Err(HdaError::NoOutputStream);
                     }
-                    if let Some(amp) = widget.in_amp {
-                        if selected > 15 {
-                            return Err(HdaError::NoOutputStream);
-                        }
-                        // Mute unused mixer inputs to avoid unintended analog loops.
-                        for input in 0..widget.connections.len().min(16) {
-                            let gain = amp.offset.min(amp.num_steps) as u32;
-                            let mute = if input == selected { 0 } else { 0x80 };
-                            self.verb(
-                                cad,
-                                nid,
-                                VERB_SET_AMP_GAIN_MUTE
-                                    | 0x7000
-                                    | ((input as u32) << 8)
-                                    | gain
-                                    | mute,
-                            )?;
-                        }
+                    // Mute unused mixer inputs to avoid unintended analog loops.
+                    for input in 0..widget.connections.len().min(16) {
+                        let gain = amp.offset.min(amp.num_steps) as u32;
+                        let mute = if input == selected { 0 } else { 0x80 };
+                        self.verb(
+                            cad,
+                            nid,
+                            VERB_SET_AMP_GAIN_MUTE | 0x7000 | ((input as u32) << 8) | gain | mute,
+                        )?;
                     }
                 }
-                if let Some(amp) = widget.out_amp {
-                    self.verb(
-                        cad,
-                        nid,
-                        VERB_SET_AMP_GAIN_MUTE | 0xb000 | amp.offset.min(amp.num_steps) as u32,
-                    )?;
-                }
             }
-            let pin = graph.widget(path.nodes.pin_nid).ok_or(HdaError::NoCodecs)?;
-            let caps = pin.pin_caps.unwrap_or(0);
-            if caps & (1 << 16) != 0 {
-                let old = self.verb(cad, pin.nid, 0xf0c << 8)?;
-                self.verb(cad, pin.nid, (0x70c << 8) | (old & 7) | 2)?;
+            if let Some(amp) = widget.out_amp {
+                self.verb(
+                    cad,
+                    nid,
+                    VERB_SET_AMP_GAIN_MUTE | 0xb000 | amp.offset.min(amp.num_steps) as u32,
+                )?;
             }
-            let ctl = if capture {
-                // Prefer 80% VREF, then 50%, only when advertised.
-                0x20 | if caps & (1 << 12) != 0 {
-                    4
-                } else if caps & (1 << 9) != 0 {
-                    1
-                } else {
-                    0
-                }
-            } else if pin.pin_config.is_some_and(|p| p.default_device == 2) {
-                0xc0
+        }
+        let pin = graph.widget(path.nodes.pin_nid).ok_or(HdaError::NoCodecs)?;
+        let caps = pin.pin_caps.unwrap_or(0);
+        if caps & (1 << 16) != 0 {
+            let old = self.verb(cad, pin.nid, 0xf0c << 8)?;
+            self.verb(cad, pin.nid, (0x70c << 8) | (old & 7) | 2)?;
+        }
+        let ctl = if capture {
+            // Prefer 80% VREF, then 50%, only when advertised.
+            0x20 | if caps & (1 << 12) != 0 {
+                4
+            } else if caps & (1 << 9) != 0 {
+                1
             } else {
-                0x40
-            };
-            self.verb(cad, pin.nid, VERB_SET_PIN_WIDGET_CONTROL | ctl)?;
-            self.verb(
-                cad,
-                converter.nid,
-                VERB_SET_CONVERTER_FORMAT
-                    | pack_sdfmt(params.format, params.rate, params.channels) as u32,
-            )?;
-            self.verb(
-                cad,
-                converter.nid,
-                VERB_SET_CONVERTER_STREAM | if capture { 0x20 } else { 0x10 },
-            )?;
+                0
+            }
+        } else if pin.pin_config.is_some_and(|p| p.default_device == 2) {
+            0xc0
+        } else {
+            0x40
+        };
+        self.verb(cad, pin.nid, VERB_SET_PIN_WIDGET_CONTROL | ctl)?;
+        // AC_FMT_TYPE_NON_PCM (snd_hdac_spdif_stream_format).
+        let mut format = pack_sdfmt(params.format, params.rate, params.channels) as u32;
+        if ati {
+            let spk_alloc = self.hdmi_sink(output).map_or(0, |sink| sink.spk_alloc);
+            let channels = params.channels.count();
+            self.ati_hdmi_prepare(graph, &path.nodes, output, channels, spk_alloc)?;
+            if self.hdmi_playback.lock().non_pcm {
+                format |= 0x8000;
+            }
         }
-        if !capture {
-            self.apply_volume(&self.volume.lock())?;
-            self.refresh_jacks()?;
-        }
+        self.verb(cad, converter.nid, VERB_SET_CONVERTER_FORMAT | format)?;
+        self.verb(
+            cad,
+            converter.nid,
+            VERB_SET_CONVERTER_STREAM | if capture { 0x20 } else { 0x10 },
+        )?;
         Ok(())
     }
+    /// Linux atihdmi_init plus snd_hda_hdmi_generic_pcm_prepare and
+    /// atihdmi_setup_stream for one HDMI/DP port: zero downmix, per-channel
+    /// remap mode (rev3+), snd_hda_hdmi_setup_audio_infoframe, then the
+    /// ramp rate (rev3+; none for non-PCM), HBR for non-PCM 8-channel
+    /// streams (atihdmi_pin_hbr_setup) and the converter's DIG1/DIG2
+    /// (snd_hda_spdif_ctls_assign; DIGEN follows "IEC958 Playback Switch").
+    fn ati_hdmi_prepare(
+        &self,
+        graph: &hda_codec::Codec,
+        nodes: &AudioPath,
+        output: usize,
+        channels: u8,
+        spk_alloc: u16,
+    ) -> Result<(), HdaError> {
+        const SET_DOWNMIX_INFO: u32 = 0x772;
+        const GET_HBR_CONTROL: u32 = 0xf7c;
+        const SET_HBR_CONTROL: u32 = 0x77c;
+        const HBR_CAPABLE: u32 = 0x01;
+        const HBR_ENABLE: u32 = 0x10;
+        const SET_MULTICHANNEL_MODE: u32 = 0x789;
+        const SET_RAMP_RATE: u32 = 0x770;
+        if !(2..=8).contains(&channels) {
+            return Err(HdaError::NoOutputStream);
+        }
+        let (cad, pin, cvt) = (graph.addr, nodes.pin_nid, nodes.converter_nid);
+        let rev3 = hda_codec::ati_hdmi_rev3(graph);
+        let pcm = *self.hdmi_playback.lock();
+        self.verb(cad, pin, SET_DOWNMIX_INFO << 8)?;
+        if rev3 {
+            self.verb(cad, pin, (SET_MULTICHANNEL_MODE << 8) | 1)?;
+        }
+        let ca = self.ati_hdmi_infoframe(graph, nodes, channels, spk_alloc, &pcm)?;
+        // hdmi_setup_fake_chmap: the controls describe the primary port.
+        if self.hdmi_primary() == Some(output) {
+            let mut state = self.hdmi_playback.lock();
+            if pcm.non_pcm || !state.chmap_set {
+                state.chmap = super::hdmi::default_chmap(ca);
+            }
+        }
+        if rev3 {
+            let ramp = if pcm.non_pcm { 0 } else { 180 };
+            self.verb(cad, cvt, (SET_RAMP_RATE << 8) | ramp)?;
+        }
+        // is_hbr_format: non-PCM with eight channels.
+        let hbr = pcm.non_pcm && channels == 8;
+        let control = self.verb(cad, pin, GET_HBR_CONTROL << 8)?;
+        if control & HBR_CAPABLE != 0 {
+            let next = if hbr {
+                control | HBR_ENABLE
+            } else {
+                control & !HBR_ENABLE
+            };
+            if next != control {
+                self.verb(cad, pin, (SET_HBR_CONTROL << 8) | (next & 0xff))?;
+            }
+        } else if hbr {
+            return Err(HdaError::NoOutputStream);
+        }
+        self.verb(cad, cvt, (0x70d << 8) | u32::from(pcm.ctls & 0xff))?;
+        self.verb(cad, cvt, (0x70e << 8) | u32::from(pcm.ctls >> 8))?;
+        Ok(())
+    }
+    /// snd_hda_hdmi_setup_audio_infoframe on an ATI port: the CEA channel
+    /// allocation (the user map's, or the sink's for its speakers and for
+    /// non-PCM), the converter's channel count, the slot map and the CA
+    /// the codec puts in the Audio InfoFrame. Returns the CA.
+    pub(super) fn ati_hdmi_infoframe(
+        &self,
+        graph: &hda_codec::Codec,
+        nodes: &AudioPath,
+        channels: u8,
+        spk_alloc: u16,
+        pcm: &super::hdmi::Playback,
+    ) -> Result<u8, HdaError> {
+        const SET_CHANNEL_ALLOCATION: u32 = 0x771;
+        let (cad, pin, cvt) = (graph.addr, nodes.pin_nid, nodes.converter_nid);
+        let rev3 = hda_codec::ati_hdmi_rev3(graph);
+        let ca = super::hdmi::stream_allocation(spk_alloc, channels, pcm);
+        let active = super::hdmi::active_channels(ca);
+        if self.verb(cad, cvt, 0xf2d << 8)? & 0xf != u32::from(active - 1) {
+            self.verb(cad, cvt, (0x72d << 8) | u32::from(active - 1))?;
+        }
+        for entry in super::hdmi::slot_entries(ca, channels, pcm) {
+            if let Some((verb, setup)) = super::hdmi::ati_slot_verb(entry, rev3) {
+                self.verb(cad, pin, (verb << 8) | setup)?;
+            }
+        }
+        self.verb(cad, pin, (SET_CHANNEL_ALLOCATION << 8) | u32::from(ca))?;
+        Ok(ca)
+    }
     pub(super) fn refresh_jacks(&self) -> Result<(), HdaError> {
+        // HDMI/DP sinks come and go whether or not a stream is prepared.
+        self.refresh_hdmi(true)?;
         if !self.streams[0]
             .lock()
             .ring
@@ -330,6 +465,25 @@ impl IntelHda {
                 kind: ControlKind::JackSense,
             });
         }
+        if !self.hdmi.lock().is_empty() {
+            controls.push(ControlId {
+                index: 3,
+                kind: ControlKind::HdmiJack,
+            });
+            controls.push(ControlId {
+                index: 4,
+                kind: ControlKind::Eld,
+            });
+            for (index, kind) in [
+                (5, ControlKind::Iec958ConMask),
+                (6, ControlKind::Iec958ProMask),
+                (7, ControlKind::Iec958Default),
+                (8, ControlKind::Iec958Switch),
+                (9, ControlKind::ChannelMap),
+            ] {
+                controls.push(ControlId { index, kind });
+            }
+        }
         controls
     }
     fn apply_volume(&self, volume: &Volume) -> Result<(), HdaError> {
@@ -391,6 +545,20 @@ impl IntelHda {
                 }
                 Ok(ControlValue::boolean(present))
             }
+            ControlKind::HdmiJack => Ok(ControlValue::boolean(self.hdmi_jack().0)),
+            ControlKind::Eld => Ok(ControlValue::bytes(&self.hdmi_jack().1)),
+            ControlKind::Iec958ConMask => Ok(ControlValue::iec958(&super::hdmi::CON_MASK)),
+            ControlKind::Iec958ProMask => Ok(ControlValue::iec958(&super::hdmi::PRO_MASK)),
+            ControlKind::Iec958Default => Ok(ControlValue::iec958(
+                &self.hdmi_playback.lock().status.to_le_bytes(),
+            )),
+            ControlKind::Iec958Switch => Ok(ControlValue::boolean(
+                self.hdmi_playback.lock().ctls & super::hdmi::DIG1_ENABLE != 0,
+            )),
+            ControlKind::ChannelMap => {
+                let map = self.hdmi_playback.lock().chmap;
+                Ok(ControlValue::integers(&map.map(i32::from)))
+            }
             _ => Err(SoundError::NoSuchControl),
         }
     }
@@ -405,6 +573,22 @@ impl IntelHda {
         };
         if !self.mixer_controls().contains(&id) {
             return Err(SoundError::NoSuchControl);
+        }
+        match (id.kind, value) {
+            (ControlKind::Iec958Default, ControlValue::Iec958(status)) => {
+                return self
+                    .set_spdif_status(status)
+                    .map_err(|_| SoundError::BadState);
+            }
+            (ControlKind::Iec958Switch, ControlValue::Boolean(enable)) => {
+                return self
+                    .set_spdif_enable(enable)
+                    .map_err(|_| SoundError::BadState);
+            }
+            (ControlKind::ChannelMap, ControlValue::Integers { len, values }) => {
+                return self.set_chmap(&values[..usize::from(len)]);
+            }
+            _ => {}
         }
         let mut current = self.volume.lock();
         let mut next = *current;
