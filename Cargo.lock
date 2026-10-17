@@ -1236,6 +1236,7 @@ dependencies = [
  "miniz_oxide",
  "narf-block",
  "narf-capabilities",
+ "narf-console",
  "narf-driver-runtime",
  "narf-filesystem",
  "narf-init",
