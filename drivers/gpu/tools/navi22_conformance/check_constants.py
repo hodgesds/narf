@@ -153,6 +153,7 @@ HEADER_SETS = {
                   AMD + "/display/dc/link/protocols/link_dp_training_8b_10b.h",
                   AMD + "/display/dc/link/protocols/link_dp_training.c",
                   AMD + "/display/dc/link/link_dpms.c", AMD + "/display/dc/link/link_detection.c",
+                  AMD + "/display/dc/dc_dmub_srv.c",
                   "include/drm/drm_edid.h", "include/linux/hdmi.h"]),
 }
 # Lookup priority when a symbol exists in several sets with different values.
