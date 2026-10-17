@@ -1552,3 +1552,7 @@ argument = "The frame/ edit makes the root-mount-auto Late initcall stop, with a
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The frame/ edit registers one Late initcall (btrfs-rootrw-interop) that is inert unless the narf.rootrw_interop= test argument is present; it then calls narf_drivers_fs_btrfs::interop::run, which performs ordinary VFS file operations on the filesystem already mounted at / and only when narf.disks=root-rw has a designated, writable btrfs root. It adds no authority, memory access, domain transition, trap-path code or TCB member; every write still passes the block-layer disk policy guard."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame/ edit only chooses the environment handed to the distro PID 1 that boot-init already spawns: under narf.disks=root-ro or root-rw (an installed system booted from its own root) it omits container=narf, so systemd runs in host mode instead of container mode. The argv, root, pid, address space and loader call are unchanged. It adds no authority, memory access, domain transition, trap-path code or TCB member, and every other systemd_pid1 boot keeps container=narf."

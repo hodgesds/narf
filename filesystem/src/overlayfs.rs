@@ -227,6 +227,26 @@ impl FsInstance for OverlayFs {
     fn name(&self) -> &str {
         self.name
     }
+
+    /// An overlay that owns its lower instance stands in for that filesystem:
+    /// the session-writable root over an installed btrfs root. A remount with
+    /// the installed fstab's options (`systemd-remount-fs` runs `mount -o
+    /// remount /`) is validated and recorded by the lower, which never
+    /// becomes writable through this. Without an owned lower, Linux overlayfs
+    /// accepts no reconfiguration parameters either.
+    fn reconfigure(&self, options: &str) -> Result<(), FsError> {
+        match self.pinned.first() {
+            Some(lower) => lower.reconfigure(options),
+            None => Err(FsError::Unsupported),
+        }
+    }
+
+    fn show_options(&self) -> alloc::string::String {
+        self.pinned
+            .first()
+            .map(|lower| lower.show_options())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
