@@ -99,6 +99,8 @@ struct Fake {
     reads: usize,
     staged: Vec<u8>,
     stage_error: Option<Error>,
+    /// PSP runtime DB SCPM status the staging reports.
+    scpm: u32,
     revoke_on: Option<(u32, Cap<BusDeviceCap, Write>)>,
     running: u64,
     gfx_limits: (u32, u32),
@@ -172,7 +174,7 @@ impl Io for Fake {
         &mut self,
         _memory: &crate::amdgpu_vram::Reservation,
         bytes: &[u8],
-    ) -> Result<(), Error> {
+    ) -> Result<u32, Error> {
         if bytes.len() != crate::amdgpu_power_navi22::SMC_BYTES {
             return Err(Error::Invalid);
         }
@@ -180,7 +182,7 @@ impl Io for Fake {
             return Err(error);
         }
         self.staged.extend_from_slice(bytes);
-        Ok(())
+        Ok(self.scpm)
     }
     fn read(&mut self, register: u32) -> u32 {
         self.reads += 1;
@@ -256,6 +258,7 @@ fn engine() -> Engine<Fake> {
             reads: 0,
             staged: Vec::new(),
             stage_error: None,
+            scpm: 0,
             revoke_on: None,
             running: crate::amdgpu_power_navi22::BootPolicy::from_features(u64::MAX)
                 .unwrap()
@@ -280,6 +283,7 @@ fn engine() -> Engine<Fake> {
         versions: None,
         limits: None,
         protection: None,
+        scpm: false,
     }
 }
 fn run<T>(future: impl Future<Output = T>) -> T {
@@ -658,8 +662,8 @@ fn smu_navi22_power_upload_policy_and_revocation_precede_commands() -> TestResul
             engine.authority.revoke();
             Error::Revoked
         } else {
-            engine.io.stage_error = Some(Error::PowerPolicy(1));
-            Error::PowerPolicy(1)
+            engine.io.stage_error = Some(Error::Invalid);
+            Error::Invalid
         };
         if run(engine.upload(&table, &pool)) != Err(error)
             || !engine.io.writes.is_empty()
@@ -686,7 +690,7 @@ kernel_test_in!(
     smu_navi22_power_upload_policy_and_revocation_precede_commands
 );
 
-fn smu_navi22_scpm_runtime_policy_fails_closed() -> TestResult {
+fn smu_navi22_scpm_runtime_policy_reads_like_psp_sw_init() -> TestResult {
     let mut db = vec![0u8; 64];
     let read = |bytes: &[u8]| {
         power_policy(|offset, out| {
@@ -698,47 +702,74 @@ fn smu_navi22_scpm_runtime_policy_fails_closed() -> TestResult {
             Ok(())
         })
     };
-    if read(&db) != Ok(()) {
-        return TestResult::Fail("absent runtime DB refused");
+    if read(&db) != Ok(0) {
+        return TestResult::Fail("absent runtime DB is not SCPM disabled");
     }
     db[..8].copy_from_slice(&[0xd5, 0xe, 0, 1, 1, 0, 0, 0]);
     db[8..16].copy_from_slice(&[6, 0, 0, 0, 32, 0, 4, 0]);
+    // A nonzero status is scpm_enabled, never an error.
     for policy in [0, 1, 2, u32::MAX] {
         put(&mut db, 32, policy);
-        let want = if policy == 0 {
-            Ok(())
-        } else {
-            Err(Error::PowerPolicy(policy))
-        };
-        if read(&db) != want {
-            return TestResult::Fail("PSP power ownership ignored");
+        if read(&db) != Ok(policy) {
+            return TestResult::Fail("SCPM status misread or treated as fatal");
         }
     }
     // psp_sw_init: a malformed DB/entry is "no SCPM entry", i.e. SCPM
     // disabled and the driver uploads the PPTable. The version is ignored.
     let mut other = db.clone();
     other[2] = 1;
-    if read(&other) != Err(Error::PowerPolicy(u32::MAX)) {
+    if read(&other) != Ok(u32::MAX) {
         return TestResult::Fail("runtime DB version must not be checked");
     }
     for (offset, value) in [(4, 64), (12, 8), (12, 33), (14, 3)] {
         let mut bad = db.clone();
         bad[offset] = value;
-        if read(&bad) != Ok(()) {
+        if read(&bad) != Ok(0) {
             return TestResult::Fail("malformed runtime policy must read as absent");
         }
     }
     db[4] = 2;
     db[16..24].copy_from_slice(&[6, 0, 0, 0, 40, 0, 4, 0]);
     put(&mut db, 40, 0);
-    if read(&db) != Err(Error::PowerPolicy(u32::MAX)) {
+    if read(&db) != Ok(u32::MAX) {
         return TestResult::Fail("duplicate SCPM entries did not use the first");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/smu-navi22",
-    smu_navi22_scpm_runtime_policy_fails_closed
+    smu_navi22_scpm_runtime_policy_reads_like_psp_sw_init
+);
+
+/// smu_smc_hw_setup with scpm_enabled: the driver table location is still
+/// set, but the PPTable transfer and SetAllowedFeaturesMask{High,Low} are
+/// skipped ("not needed and permitted"); the boot continues.
+fn smu_navi22_scpm_skips_pptable_and_allowed_mask() -> TestResult {
+    let mut engine = ready_engine();
+    let pool = power_pool();
+    engine.io.scpm = 1;
+    if run(engine.upload(&vec![0; crate::amdgpu_power_navi22::SMC_BYTES], &pool)).is_err()
+        || !engine.scpm
+        || commands(&engine.io.writes).iter().map(|c| c.0).collect::<Vec<_>>()
+            != [SET_DRIVER_HIGH, SET_DRIVER_LOW]
+    {
+        return TestResult::Fail("SCPM upload sent the PPTable or failed");
+    }
+    engine.power_policy =
+        Some(crate::amdgpu_power_navi22::BootPolicy::from_features(u64::MAX).unwrap());
+    engine.io.writes.clear();
+    if run(engine.configure_power()).is_err()
+        || commands(&engine.io.writes)
+            .iter()
+            .any(|c| c.0 == ALLOWED_HIGH || c.0 == ALLOWED_LOW)
+    {
+        return TestResult::Fail("SCPM boot sent the allowed-feature mask");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    smu_navi22_scpm_skips_pptable_and_allowed_mask
 );
 
 fn uploaded_engine() -> (Engine<Fake>, crate::amdgpu_vram::Pool) {
