@@ -32,6 +32,12 @@ proc-macro2 = "1"
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 sha2 = { version = "0.10", default-features = false }
 ed25519-dalek = { version = "2", default-features = false }
+# Deterministic host-side HTTP/3 fixture for the live CachyOS smoke.  The
+# guest uses its stock curl through SLIRP; this is not linked into NARF.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true

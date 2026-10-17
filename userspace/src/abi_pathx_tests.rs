@@ -65,10 +65,7 @@ fn lstat_owners(path: &[u8]) -> Option<(u32, u32)> {
     {
         return None;
     }
-    Some((
-        u32::from_ne_bytes(buf[28..32].try_into().ok()?),
-        u32::from_ne_bytes(buf[32..36].try_into().ok()?),
-    ))
+    Some((stat_uid(&buf), stat_gid(&buf)))
 }
 
 // ── access (NUL-term path, mode) → 0 / -1 ──────────────────────────
@@ -2320,8 +2317,7 @@ fn smoke_abi_pathx_sysfs_drm_char_symlink_chase() -> TestResult {
             return Err("newfstatat(O_PATH fd, AT_EMPTY_PATH) failed — \
                         chase() cannot fstat the opened DRM char link");
         }
-        // st_mode is a u32 at byte offset 24 of the 144-byte struct stat.
-        let mode = u32::from_ne_bytes([st[24], st[25], st[26], st[27]]);
+        let mode = stat_mode(&st);
         if mode & S_IFMT != S_IFLNK {
             return Err("fstat of the O_PATH|O_NOFOLLOW fd is not S_IFLNK — \
                         chase() sees the DRM char node as a non-symlink");
@@ -2503,7 +2499,7 @@ fn smoke_abi_pathx_sysfs_drm_char_chase_private_mount_ns() -> TestResult {
             if r != Some(0) {
                 return Err("newfstatat(fd, AT_EMPTY_PATH) failed in a private ns");
             }
-            let mode = u32::from_ne_bytes([st[24], st[25], st[26], st[27]]);
+            let mode = stat_mode(&st);
             if mode & S_IFMT != S_IFLNK {
                 return Err("fstat of the O_PATH fd is not S_IFLNK in a private mount namespace");
             }

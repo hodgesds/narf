@@ -9,6 +9,9 @@ pub(super) const HW_BYTES: usize = 608;
 // Interleaved mmap/read/write, planar read/write, pause/resume. No hardware linked-start,
 // or noninterleaved mmap capability is advertised.
 pub(super) const INFO: u32 = 1 | 2 | 0x20 | 0x100 | 0x200 | 0xc0000 | 0x2000_0000;
+/// `SNDRV_PCM_INFO_BATCH | SNDRV_PCM_INFO_BLOCK_TRANSFER`, set per device
+/// for block-granular pointers (Linux `sound/virtio/virtio_pcm.c`).
+pub(super) const INFO_BATCH: u32 = 0x10 | 0x1_0000;
 
 pub(super) fn format_id(format: SampleFormat) -> u32 {
     match format {
@@ -209,7 +212,7 @@ pub(super) fn refine(
     }
     put32(b, 512, 0);
     put32(b, 516, get32(&old, 516) | changed);
-    put32(b, 520, INFO);
+    put32(b, 520, INFO | if caps.batch { INFO_BATCH } else { 0 });
     put32(
         b,
         524,

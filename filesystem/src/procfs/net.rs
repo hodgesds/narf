@@ -68,7 +68,7 @@ pub struct TcbSnapshot {
     pub snd_ssthresh: i32,
     pub uid: u32,
     pub timeout: u32,
-    pub inode: u32,
+    pub inode: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -85,7 +85,7 @@ pub struct UdpSocketSnapshot {
     pub tx_queue: u32,
     pub rx_queue: u32,
     pub uid: u32,
-    pub inode: u32,
+    pub inode: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -96,7 +96,7 @@ pub struct RawSocketSnapshot {
     pub remote_port: u16,
     pub state_code: u8,
     pub uid: u32,
-    pub inode: u32,
+    pub inode: u64,
     /// IPv4 protocol number this raw socket is bound to. For raw
     /// IPPROTO_ICMP this is 1; for AF_PACKET sockets (lifted into
     /// the IPv4 raw view) this is 0xFF as a sentinel.
@@ -336,7 +336,7 @@ pub struct Tcb6Snapshot {
     pub retrnsmt: u32,
     pub uid: u32,
     pub timeout: u32,
-    pub inode: u32,
+    pub inode: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -349,7 +349,7 @@ pub struct Udp6SocketSnapshot {
     pub tx_queue: u32,
     pub rx_queue: u32,
     pub uid: u32,
-    pub inode: u32,
+    pub inode: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -360,7 +360,7 @@ pub struct Raw6SocketSnapshot {
     pub remote_port: u16,
     pub state_code: u8,
     pub uid: u32,
-    pub inode: u32,
+    pub inode: u64,
     pub protocol: u8,
 }
 
