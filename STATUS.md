@@ -980,6 +980,12 @@ connected HDMI sink on pipe 0 with a test pattern: DCN init, HUBBUB/DML30
 deadlines, the DAL clocks and the VBIOS PixelClock/STREAM_SETUP/transmitter
 tables (now executed by an `atom.c`-faithful interpreter), then fetch and
 unblank. Model-tested per block; never run on hardware.
+The lit pipe is presented natively: console/status publication with the
+`scanout_access` withdraw-before-teardown contract, DCN3.0 HUBP VSYNC page
+flips completed from EARLIEST_INUSE (pflip/vupdate IH sources armed), a
+256x256 DCN3.0 cursor (opt-in), KMS on the amdgpu card (DP-1..3, HDMI-A-1;
+DML30-admitted modes, SETCRTC/atomic/TEST_ONLY, disable, vblank, flip
+events) and a monitor that relights after GPU recovery. Register models only.
 These are software-tested foundations; training resume,
 media submission/DPG, display-aware DPM, user command submission,
 hardware boot and DCN3.0 modesetting remain open. See the

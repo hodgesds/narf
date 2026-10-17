@@ -200,15 +200,21 @@ fn completed(generation: &str, result: impl core::fmt::Debug, status: impl core:
     );
 }
 
-/// Opt-in native Navi22 HDMI scanout with a colour-bar test pattern. The
-/// reset-on-init stage already retired the GOP's scanout, so there is no
-/// inherited stream to stop first. On success the published scanout moves
-/// the console; on failure the retained owner reports where it stopped.
+/// Opt-in native Navi22 HDMI scanout, first drawn as a colour-bar test
+/// pattern. On success the published front buffer moves the console (and
+/// the fb status panel) there and the amdgpu card gets native KMS state; the
+/// display monitor then serves DRM modesets, flips and GPU recovery
+/// relights. On failure the retained owner reports where it stopped and the
+/// monitor still publishes the connectors. `amdgpu.navi22_hw_cursor` opts in
+/// to the DCN3.0 hardware cursor.
 fn navi22_native_display() {
     use core::fmt::Write;
+    platform::set_hw_cursor(narf_boot::args().has_flag("amdgpu.navi22_hw_cursor"));
     // SAFETY: final synchronous boot initcall after a successful firmware run;
     // no other display client exists and only the console writes scanout.
-    let lit = narf_scheduler::block_on_spin(unsafe { platform::modeset_hdmi() });
+    let lit = narf_scheduler::block_on_spin(unsafe {
+        platform::modeset_displays(narf_drivers_gpu::amdgpu_navi22_modeset::test_pattern)
+    });
     let _ = match lit {
         Ok(out) => writeln!(
             narf_console::Writer,
@@ -227,6 +233,9 @@ fn navi22_native_display() {
             platform::modeset_state()
         ),
     };
+    // SAFETY: from here on only the monitor and the published hooks drive
+    // the display; the owner lock serializes them.
+    unsafe { platform::spawn_display_monitor() };
 }
 
 /// One serial line per board connector from native AUX/DDC/HPD detection, so

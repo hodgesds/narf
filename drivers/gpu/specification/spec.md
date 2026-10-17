@@ -3833,6 +3833,68 @@ the console. The framebuffer handoff calls it only with the
 `amdgpu_navi48_boot::{edid_timings, hdmi_caps, hdmi_avi, limited_range,
 broadcast_rgb}` and `amdgpu_dcn401_otg::avi_infoframe`.
 
+### Navi 22 native presentation and KMS
+
+Pipeline hooks: `request(Option<Timing>)` makes `enable` light exactly that
+timing (`select_wanted`: it must be in `offered`, else `NoMode` before any
+write); `admitted()` is the retained `Admitted { soc, refclk_khz, plan,
+offered }` (`offered(sink, soc, vco)`: every distinct EDID timing inside the
+TMDS ceiling that DML30 admits); `scanout_address()`/`scanout_mapping()`;
+`unsafe release_scanout()` returns the activation surface after a successful
+`disable`.
+
+`unsafe amdgpu_dcn30_flip::Flip::new(gpu, pci_cap, pipe)` owns a pipe's
+HUBPREQ flip/address/interrupt and OTG status registers (DCN base index 2):
+`program(addr)` is `hubp3_program_surface_flip_and_addr` (VSYNC flip, VMID 0,
+stereo/TMZ off, low address last; 48-bit, 256-byte aligned), `pending()` is
+`hubp2_is_flip_pending` (FLIP_PENDING or EARLIEST_INUSE != requested),
+`wait(timeout_us, wake)` polls it to completion or `Timeout` (the flip stays
+armed), `set_interrupt`/`ack(Interrupt::{Flip, Vupdate, Vblank})` are
+`irq_service_dcn30`'s SURFACE_FLIP_INT_MASK/CLEAR and
+OTG_GLOBAL_SYNC_STATUS VUPDATE_NO_LOCK/VSTARTUP enable/clear, and
+`position()` samples OTG_STATUS_POSITION with a stable 24-bit frame count.
+`unsafe amdgpu_dcn30_cursor::Cursor::new(gpu, pci_cap, pipe)`:
+`show(addr, (w, h), at, viewport, (refclk, pixclk))` programs
+`hubp2_cursor_set_attributes` + `dpp3_set_cursor_attributes` (premultiplied
+ARGB, 256-pixel pitch, no degamma) and the position under
+`mpc1_cursor_lock` (CUR_VUPDATE_LOCK_SET, base index 3); `move_to`, `hide`.
+`placement` follows amdgpu_dm `get_cursor_position` and
+`hubp2_cursor_set_position` (negative origin into the hotspot, 256x256 cap).
+
+`unsafe amdgpu_navi22_scanout::Scanout::new(gpu, pci_cap, pipe, front, map,
+timing, refclk)` adopts the lit surface as buffer 0: `prepare_back(pool,
+flush)` reserves/clears/publishes buffer 1, `upload_back(x, y, row)` writes
+it, `flip(flush)` HDP-flushes, arms and waits up to `flip_timeout_us` (four
+frames + 20 ms, at least 50 ms) for EARLIEST_INUSE, then swaps roles;
+failure enters `State::Failed` with both buffers reserved.
+`enable_interrupts(ih)` subscribes to `source::{pflip, vupdate}(pipe)` and
+then enables them; vectors only shorten the wait. `set_cursor`,
+`move_cursor`, `hide_cursor`, `position()`, `stop()` and `unsafe release()`.
+
+`ColdBoot::{modeset_display(connector, sink, want, draw), stop_display(),
+display_scanout(), display_admitted(), display_output(),
+prepare_display_back_buffer(), flip_display(), set_display_cursor()}` own
+these. `into_recovery` re-prepares DMUB and the display owner from the
+retained VBIOS/routes so the recovered sequence restarts DMUB.
+
+`amdgpu_navi22_kms` holds DRM state: one CRTC (pipe 0, id 1) and one
+connector per board route (ids per `amdgpu_navi48_kms`); HDMI connectors
+offer the DML30-admitted timings, DP ports report sinks without modes.
+`request_display_{active,route,mode}`, `request_connector_crtc`,
+`display_offers` (TEST_ONLY/SETCRTC validation), `restore_displays`, `publish`,
+`display_admission(admitted, streams)` (`DisplayAdmission`: DML30 DRAM clock
+change; stutter/FCLK/watermark table/deep sleep false). `amdgpu_native_kms`
+dispatches the DRM bridges to Navi22 once it published, else Navi48.
+`amdgpu_navi22_platform::{modeset_displays(draw), spawn_display_monitor(),
+flip_display(), set_display_cursor(), set_hw_cursor(), present_frame(),
+native_present_ready(), crtc_vblank(), vblank_time(), display_admission(),
+relight_after_recovery()}`: publication withdraws the console and drains
+`scanout_access` before any teardown; recovery withdraws and stops the pipe
+before reset and the monitor relights once `recoveries()` increments. The fb
+handoff calls `modeset_displays` and the monitor with `amdgpu.native_display`
+(`amdgpu.navi22_hw_cursor` opts into the hardware cursor; display detection
+runs only with `amdgpu.native_display` or `amdgpu.display_probe`).
+
 ### Navi 22 native AUX, DDC and HPD
 
 `unsafe amdgpu_dcn30_ddc::Ddc::new(gpu, pci_cap, crystal_khz)` claims all six DCN3.0 AUX
