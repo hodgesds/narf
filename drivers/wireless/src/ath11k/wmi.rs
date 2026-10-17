@@ -1386,6 +1386,49 @@ pub fn peer_set_param_cmd(
     w.finish(WMI_PEER_SET_PARAM_CMDID, size)
 }
 
+/// `ath11k_wmi_peer_rx_reorder_queue_setup` →
+/// `WMI_PEER_REORDER_QUEUE_SETUP_CMDID` (`struct
+/// wmi_peer_reorder_queue_setup_cmd`, 40 bytes; `queue_no = tid`).
+pub fn peer_rx_reorder_queue_setup_cmd(
+    vdev_id: u32,
+    peer_addr: &[u8; 6],
+    paddr: u64,
+    tid: u8,
+    ba_window_size_valid: u8,
+    ba_window_size: u32,
+) -> WmiCmd {
+    let size = 40;
+    let mut w = W::new(size);
+    w.tlv(WMI_TAG_REORDER_QUEUE_SETUP_CMD, size - TLV_HDR_SIZE);
+    w.u32(vdev_id);
+    w.mac(peer_addr);
+    w.u32(tid as u32);
+    w.u32(paddr as u32);
+    w.u32((paddr >> 32) as u32);
+    w.u32(tid as u32);
+    w.u32(ba_window_size_valid as u32);
+    w.u32(ba_window_size);
+    w.finish(WMI_PEER_REORDER_QUEUE_SETUP_CMDID, size)
+}
+
+/// `ath11k_wmi_rx_reord_queue_remove` →
+/// `WMI_PEER_REORDER_QUEUE_REMOVE_CMDID` (`struct
+/// wmi_peer_reorder_queue_remove_cmd`, 20 bytes). Linux defines it but
+/// never calls it: firmware drops a peer's queues on `PEER_DELETE`.
+pub fn rx_reord_queue_remove_cmd(
+    peer_addr: &[u8; 6],
+    vdev_id: u16,
+    peer_tid_bitmap: u32,
+) -> WmiCmd {
+    let size = 20;
+    let mut w = W::new(size);
+    w.tlv(WMI_TAG_REORDER_QUEUE_REMOVE_CMD, size - TLV_HDR_SIZE);
+    w.u32(vdev_id as u32);
+    w.mac(peer_addr);
+    w.u32(peer_tid_bitmap);
+    w.finish(WMI_PEER_REORDER_QUEUE_REMOVE_CMDID, size)
+}
+
 /// `struct ath11k_ppe_threshold` — copied verbatim (40 bytes) into
 /// `wmi_ppe_threshold`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
