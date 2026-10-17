@@ -122,6 +122,7 @@ mod arch_syscalls {
     pub const SYS_FTRUNCATE: u64 = 77;
     pub const SYS_GETCWD: u64 = 79;
     pub const SYS_CHDIR: u64 = 80;
+    pub const SYS_REBOOT: u64 = 169;
     pub const SYS_RENAME: u64 = 82;
     pub const SYS_MKDIR: u64 = 83;
     pub const SYS_RMDIR: u64 = 84;
@@ -237,6 +238,7 @@ mod arch_syscalls {
     pub const SYS_FALLOCATE: u64 = 47;
     pub const SYS_FACCESSAT: u64 = 48;
     pub const SYS_CHDIR: u64 = 49;
+    pub const SYS_REBOOT: u64 = 142;
     pub const SYS_FCHMOD: u64 = 52;
     pub const SYS_FCHMODAT: u64 = 53;
     pub const SYS_FCHOWNAT: u64 = 54;
@@ -2063,6 +2065,16 @@ pub fn brk(new_break: usize) -> usize {
 /// kernel rejects relative paths until `*at(2)` lands. Returns 0
 /// on success, -1 on error (matching POSIX `chdir(3)` shape).
 #[inline]
+/// `reboot(2)` with `LINUX_REBOOT_MAGIC1/2` and `cmd` (e.g.
+/// `LINUX_REBOOT_CMD_RESTART`). Returns only on failure (negative errno).
+pub fn reboot(cmd: u32) -> i64 {
+    const MAGIC1: u64 = 0xfee1_dead;
+    const MAGIC2: u64 = 672_274_793;
+    // SAFETY: reboot(magic1, magic2, cmd, arg) takes no pointer for the
+    // restart/power-off commands; the kernel validates the magics.
+    unsafe { syscall4(SYS_REBOOT, MAGIC1, MAGIC2, u64::from(cmd), 0) as i64 }
+}
+
 pub fn chdir(path: &str) -> i32 {
     // SAFETY: SYS_CHDIR signature: (path_ptr, path_len). Pointer
     // stays valid across the call because `&str` borrows outlive

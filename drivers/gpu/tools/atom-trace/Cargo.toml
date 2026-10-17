@@ -1,0 +1,15 @@
+# Host-side ATOM interpreter harness: runs a VBIOS command table (ASIC_Init
+# by default) through drivers/gpu/src/amdgpu_atom_vm.rs against a recording
+# fake register bus. Standalone (not a kernel workspace member):
+#   cargo run --release --manifest-path drivers/gpu/tools/atom-trace/Cargo.toml -- navi22.rom
+[package]
+name = "atom-trace"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+# The VM's kernel-test module is never built here.
+kernel-test = []

@@ -3719,6 +3719,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // just the in-kernel RamBlockDevice tests. NotPresent (harmless) when
             // no btrfs device is attached, e.g. interactive/distro boots.
             narf_init::register(narf_init::Stage::Late, "btrfs-disk-smoke", || {
+                // Test-only: never mount a btrfs volume the harness did not
+                // provide (a bare-metal host's root is commonly btrfs).
+                if !narf_boot::args().has_flag("narf.btrfs_smoke") {
+                    return narf_init::InitResult::NotPresent;
+                }
                 use narf_block::fs_detect::{detect_filesystem, FsType};
                 for entry in &narf_block::block_devices() {
                     let dev = entry.dev.clone();
@@ -3788,6 +3793,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // minute, so give it a verification-sized budget instead of emitting
             // the 500 ms default-probe warning on every successful run.
             let btrfs_write_smoke = || {
+                // Test-only: this grows and rewrites the first btrfs volume it
+                // finds. Run it only against xtask's own disposable image.
+                if !narf_boot::args().has_flag("narf.btrfs_smoke") {
+                    return narf_init::InitResult::NotPresent;
+                }
                 use narf_block::fs_detect::{detect_filesystem, FsType};
                 const MARKER: &[u8] = b"NARF-WROTE-THIS!\n";
                 for entry in &narf_block::block_devices() {

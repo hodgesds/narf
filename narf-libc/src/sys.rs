@@ -778,3 +778,18 @@ pub unsafe extern "C" fn dlerror() -> *mut c_char {
         DLERROR_MSG.as_ptr() as *mut c_char
     }
 }
+
+/// glibc `reboot(int howto)`: `RB_AUTOBOOT` (0x01234567) restarts,
+/// `RB_POWER_OFF` (0x4321fedc) powers off. Returns -1 with `errno` on failure.
+///
+/// # Safety
+/// No pointer arguments; `unsafe` only for the C ABI.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reboot(howto: i32) -> i32 {
+    let r = narf_user_runtime::reboot(howto as u32);
+    if r < 0 {
+        crate::errno::set_errno((-r) as i32);
+        return -1;
+    }
+    0
+}

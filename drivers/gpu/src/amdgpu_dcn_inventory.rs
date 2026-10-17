@@ -445,6 +445,38 @@ fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, 
     Ok(paths)
 }
 
+/// `atom_master_list_of_data_tables_v2_1::vram_info`.
+const TABLE_VRAM_INFO: u16 = 28;
+/// `atom_vram_info_header_v2_5`: the four-byte header, eight u16 offsets and
+/// four u8 counts precede `vram_module[0]` (`atom_vram_module_v11`), whose
+/// `channel_num` and `channel_width` sit 14 and 15 bytes in.
+const VRAM_MODULE_NUM_OFFSET: usize = 20;
+const VRAM_MODULE0_OFFSET: usize = 24;
+const VRAM_CHANNEL_NUM: usize = 14;
+const VRAM_CHANNEL_WIDTH: usize = 15;
+
+/// Discrete-GPU DRAM channels as `bios_parser2.c::get_vram_info_v25` reads
+/// them for DML: `(channel_num, (1 << channel_width) / 8 bytes)` of module 0.
+/// Navi2x uses content revision 2.5; any other revision is refused rather
+/// than read at the wrong offsets.
+pub fn vram_channels(vbios: &[u8]) -> Result<(u32, u32), Error> {
+    let info = table(vbios, TABLE_VRAM_INFO)?;
+    header(info, 2, &[5])?;
+    if (u16_at(info, 0) as usize) < VRAM_MODULE0_OFFSET + VRAM_CHANNEL_WIDTH + 1
+        || info[VRAM_MODULE_NUM_OFFSET] == 0
+    {
+        return Err(Error::Invalid);
+    }
+    let module = &info[VRAM_MODULE0_OFFSET..];
+    let channels = u32::from(module[VRAM_CHANNEL_NUM]);
+    let width = module[VRAM_CHANNEL_WIDTH];
+    // CHANNEL_16BIT..CHANNEL_64BIT encode log2 bits: 4, 5 and 6.
+    if channels == 0 || channels > 32 || !(4..=6).contains(&width) {
+        return Err(Error::Invalid);
+    }
+    Ok((channels, (1u32 << width) / 8))
+}
+
 /// The DCHUB reference clock every DLG and TTU field is expressed in, from
 /// `atom_display_controller_info_v4_*`. Linux falls back to 27 MHz when the
 /// table reports zero; that fallback is taken here too, because it is the

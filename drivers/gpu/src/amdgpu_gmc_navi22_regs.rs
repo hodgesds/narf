@@ -1,4 +1,9 @@
 //! Linux gc_10_3_0 and mmhub_2_0_0 register headers, base index zero.
+//! `inv_*` name invalidation engine 17 (the GART/CPU engine); `ctx` and the
+//! page-table registers name context 0. Per-VMID strides match the hub init
+//! functions: `ctx_distance` 1, `ctx_addr_distance` 2 (LO/HI pairs).
+pub(super) const CTX_DISTANCE: u32 = 1;
+pub(super) const CTX_ADDR_DISTANCE: u32 = 2;
 #[derive(Clone, Copy, Debug)]
 pub(super) struct HubRegs {
     pub fb_base: u32,
@@ -20,6 +25,7 @@ pub(super) struct HubRegs {
     pub fault_hi: u32,
     pub fault_cntl: u32,
     pub fault_cntl2: u32,
+    pub fault_status: u32,
     pub ctx: u32,
     pub pt_base: u32,
     pub pt_start: u32,
@@ -52,6 +58,7 @@ pub(super) const GFX: HubRegs = HubRegs {
     fault_hi: 0x15cc,
     fault_cntl: 0x15c4,
     fault_cntl2: 0x15c5,
+    fault_status: 0x15c8,
     ctx: 0x15fc,
     pt_base: 0x1667,
     pt_start: 0x1687,
@@ -84,6 +91,7 @@ pub(super) const MM: HubRegs = HubRegs {
     fault_hi: 0x690,
     fault_cntl: 0x688,
     fault_cntl2: 0x689,
+    fault_status: 0x68c,
     ctx: 0x6c0,
     pt_base: 0x72b,
     pt_start: 0x74b,

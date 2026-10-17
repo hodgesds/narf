@@ -899,8 +899,14 @@ does not yet start VCN queues.
 Production cold boot now initializes GC/MMHUB VMID0 with a bounded VRAM-only
 test aperture after the protected power policy is active. Both hubs validate
 idle contexts and matching framebuffer geometry, use owned VRAM page tables
-and fault fallback, and wait for bounded TLB acknowledgements. User VMIDs and
-host DMA stay disabled; failed/cancelled starts retain the backing pages.
+and fault fallback, and wait for bounded TLB acknowledgements. Failed or
+cancelled starts retain the backing pages. A following GART stage repoints
+VMID0 at a 512 MiB VRAM-resident GART (boot pages retained) and arms user
+contexts 1–15 on an empty root. The hub owner binds pinned system DMA pages
+into the GART and creates per-client GMC10 four-level VMs with Linux PDE/PTE
+encodings, engine-17 invalidation on both hubs, and VMC/UTCL2 fault
+attribution; register-model tests cover isolation, timeouts, cancellation and
+revocation. Not hardware-validated; GEM/CS do not use it yet.
 SDMA0 now has a cold-start path on GC 10.3.2 and an owned VRAM ring. Production
 boot runs a translated WRITE/COPY/FENCE test after GMC setup and checks both
 read-pointer paths and all copied words. Reset and completion waits are bounded;
@@ -945,16 +951,69 @@ Linux does whenever the VBIOS left SOS running: PMFW (or PSP) mode1 reset,
 PCI config restore including Resizable BAR sizes, then bootloader and MEMSIZE
 waits. Without it the sequence would load SMC/graphics/DMCUB over the
 VBIOS-started SOS and PMFW, a state Linux never initializes from.
+`ResetOnInit` then posts as `amdgpu_device_need_post` does: when BIOS_SCRATCH_7
+lacks ATOM_S7_ASIC_INIT_COMPLETE (after a mode1 reset, or on a never-posted
+card; always after a recovery reset) it runs ATOM ASIC_Init from the retained
+VBIOS through the stepped `amdgpu_atom_vm` (now with IIO programs, Linux's
+sub-dword/SHL/SHR/MUL32/DIV32 semantics and cooperative DELAY sleeps) and
+requires the bit afterwards; a GOP-posted card with the bit set is not posted.
+`drivers/gpu/tools/atom-trace` replays ASIC_Init from a dumped ROM on the host.
 OSSSYS 5.0.3 IH ring 0 now follows navi10_ih_irq_init with a VRAM ring
 reached through VMID0, MSI-X/MSI delivery with polling fallback, and
 overflow-safe task-context drains. It routes IVs to generation-tagged
 subscribers that receive a terminal error on device loss. Boot enables it
 after the memory hubs and proves delivery with an SDMA0 TRAP.
+PMFW telemetry now uses the retained SMU11 table buffer (V1/V2 metrics by
+PMFW version, Linux-checked layouts) and feeds a read-only hwmon node shared
+with Navi48 (temperatures, fan, power, clocks); fan control stays automatic.
+The SMU11 THM L2H/H2L, GPIO19 CTF and SMU-to-driver interrupts are armed and
+handled as smu_v11_0 does, including the delayed SW CTF check and power-off.
+Kernel-queue hang detection (2 s fence-progress timeout per ring) is active
+and logging; mode1 device recovery with a full cold-boot re-init exists behind
+an explicit opt-in API (display stays dark; training boots refuse it).
+GFXOFF, clock/power gating, memory/fabric DPM and deep sleep remain disabled
+behind a typed policy hook that states their display-admission requirements.
+VCN 3.0 now starts both discovered instances after the fence stage (Linux's
+static, power-gating-disabled path with PSP-loaded TMR images, VCPU reset
+retries, decode/encode ring and IB tests, IH-routed fences) plus JPEG 3.0 with
+a ring test; PSP loads one VCN image per unharvested instance (type 13/58)
+from the discovery harvest table, and media failures leave the boot degraded.
+Navi22 display AUX/DDC/HPD is now native, as Linux drives DCN3.0
+(`dc_is_dmub_outbox_supported` is false there): the DCE AUX engine with
+`dce_aux_transfer_with_retries` policy, I2C-over-AUX, the hardware I2C engine
+for HDMI DDC/SCDC, and HPD sense/filter/ack. After firmware readiness the boot
+logs every board connector's HPD state and EDID. DMUB AUX/HPD is refused unless
+explicitly allowed. Register models only; no physical EDID read yet.
+A native DCN3.0 DML port (`amdgpu_dml30`) admits one unscaled linear plane
+and derives DLG/TTU/RQ and HUBBUB watermark values, checked against host
+vectors computed from the Linux DML30 formulas.
+An opt-in (`amdgpu.native_display`) native HDMI TMDS path lights the first
+connected HDMI sink on pipe 0 with a test pattern: DCN init, HUBBUB/DML30
+deadlines, the DAL clocks and the VBIOS PixelClock/STREAM_SETUP/transmitter
+tables (now executed by an `atom.c`-faithful interpreter), then fetch and
+unblank. Model-tested per block; never run on hardware.
+For bare-metal runs, `cargo xtask usb-image` builds a UEFI stick whose kernel
+appends its log to `/narf-boot-<n>.log` on that stick (`narf.bootlog=`,
+marker-gated, USB-only, bounded); a secondary card's cold boot keeps the iGPU
+console live and ends with a per-stage summary (see
+[docs/BOOTING_ON_CACHYOS.md](docs/BOOTING_ON_CACHYOS.md#rx-6750-xt-bring-up-boot)).
+DCN3.0 HDMI and DP SST LPCM audio (`amdgpu_dcn30_audio`) follows Linux DC
+(`dce_audio.c`, `dcn30_afmt.c`, `enc3_se_*_audio_*`, `dce110_*_audio_stream`):
+audio wall-clock DTO0/DTO1, AFMT/ACR, the Audio InfoFrame and the Azalia
+endpoint ELD from the EDID, behind a start-after-unblank / stop-before-blank
+hook. The HD-Audio side binds 1002:ab28 (ATI HDMI NS, no snoop); a model of
+the host's six-port R6xx HDMI codec (rev 0x100800) checks that endpoint `e`
+reports jack and ELD on pin `3 + 2e` and routes playback there. Register
+models only.
+Mesa 26.2.4 radeonsi + RADV (ACO-only, llvmpipe fallback kept) now builds
+reproducibly for NARF's musl userspace and stages into a rootfs; the
+`mesa-amd-smoke` passes inside NARF under QEMU with no AMD GPU (clean
+decline, software fallback renders) and the same binaries render on a Linux
+amdgpu host ([Mesa AMD](docs/MESA_AMD.md)). libdrm_amdgpu's `GET_CLIENT` on
+primary nodes is the first NARF gap Mesa hits.
 These are software-tested foundations; training resume,
-VCN startup, display-aware DPM and OS thermal interrupt handling,
-hardware boot, general GPU mappings/GFX10 queue initialization, production
-SDMA submissions/interrupts and DCN3.0
-modesetting remain open. See the
+media submission/DPG, display-aware DPM, user command submission,
+hardware boot and DCN3.0 modesetting remain open. See the
 [PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).
 
 1. **Stage 5 laptop proof:** boot from USB on Renoir/Lucienne or Phoenix

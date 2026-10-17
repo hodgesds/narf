@@ -299,3 +299,20 @@ kernel_test_in!(
     "drivers/gpu/dcn-otg",
     otg_disable_parks_segments_and_waits_for_idle
 );
+
+fn otg_tmds_timing_counts_from_start_point_zero() -> TestResult {
+    let mut otg = engine(0);
+    otg.profile = Profile::Navi22;
+    otg.io.values.resize(0x1e0a, 0);
+    if otg.program_tmds_timing(&timing(), &sync()).is_err()
+        || otg.io.values[OTG_CONTROL as usize] & (1 << 12 | 1 << 13) != 0
+        || otg.state != State::Programmed
+    {
+        return TestResult::Fail("HDMI start point");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-otg",
+    otg_tmds_timing_counts_from_start_point_zero
+);
