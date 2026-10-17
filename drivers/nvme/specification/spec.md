@@ -86,6 +86,16 @@ multipath / fabrics (defer).
   registry device. **Names are not identity**: they shift when a controller is
   added, removed or fails to probe; consumers identify disks by filesystem
   UUID / PARTUUID or `DiskIdentity`.
+- **Flush / FUA / shutdown** (`imp::shutdown`). `IdentifyController::{vwc,
+  rtd3e}`; `Controller::has_volatile_write_cache()`, `flush_nsid(nsid)` (I/O
+  opcode 0x00 when VWC bit 0 is set, else a no-op success; 30 s budget, a
+  timeout marks the controller dead), FUA = Write CDW12 bit 30 (native;
+  `capabilities().fua = true`), `Controller::shutdown()` (flush every
+  namespace, then CC.SHN = normal and wait for CSTS.SHST = complete within
+  `clamp(RTD3E, 5 s, 60 s)`, Linux `nvme_disable_ctrl(shutdown)`; I/O refused
+  afterwards). `shutdown_all_controllers()` is registered as the
+  `narf_power::system` shutdown hook `"nvme"`, run on every reboot /
+  power-off after the persistent-log flush.
 - `/dev/nvme<C>`: one controller node per instance
   (`narf_filesystem::devfs::register_nvme_controller(instance, node,
   namespaces)`); its passthrough (anything but `NVME_IOCTL_ID`) and `write`

@@ -30,8 +30,10 @@ pub mod chardev;
 pub mod mi;
 pub mod ns;
 pub mod prp;
+pub mod shutdown;
 
 mod tests;
+mod tests_flush;
 mod tests_multi;
 
 use core::cell::UnsafeCell;
@@ -436,6 +438,8 @@ pub struct Controller {
     primary_nsid: u32,
     /// The VS register value read at bring-up.
     vs: u32,
+    /// Flush commands completed (see [`Controller::flush_nsid`]).
+    flushes_completed: u64,
 }
 
 impl core::fmt::Debug for Controller {
@@ -497,7 +501,21 @@ impl Queue {
     /// The DMA buffers `sq_buf` / `cq_buf` are still mapped and the
     /// controller is enabled. The caller owns the queue (no other
     /// task posting concurrently — Stage-3 single-threaded).
-    unsafe fn submit_raw(&mut self, bar0: &MmioRegion, mut sqe: Sqe) -> Result<Cqe, NvmeError> {
+    unsafe fn submit_raw(&mut self, bar0: &MmioRegion, sqe: Sqe) -> Result<Cqe, NvmeError> {
+        // SAFETY: forwarded under the caller's contract.
+        unsafe { self.submit_raw_ms(bar0, sqe, CQE_TIMEOUT_MS) }
+    }
+
+    /// [`Self::submit_raw`] with a completion budget of `timeout_ms`.
+    ///
+    /// # Safety
+    /// Same invariants as [`Queue::submit_raw`].
+    unsafe fn submit_raw_ms(
+        &mut self,
+        bar0: &MmioRegion,
+        mut sqe: Sqe,
+        timeout_ms: u64,
+    ) -> Result<Cqe, NvmeError> {
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1);
         // Preserve opcode (low 8 bits) + FUSE/PSDT (bits 8..15) and
@@ -515,7 +533,7 @@ impl Queue {
         }
 
         // SAFETY: cq_buf is a live DMA page sized for self.depth CQEs.
-        let cqe = unsafe { wait_cqe(&self.cq_buf, self.cq_head, self.cq_phase)? };
+        let cqe = unsafe { wait_cqe_ms(&self.cq_buf, self.cq_head, self.cq_phase, timeout_ms)? };
 
         self.cq_head = (self.cq_head + 1) % self.depth;
         if self.cq_head == 0 {
@@ -535,9 +553,23 @@ impl Queue {
     /// # Safety
     /// Same invariants as [`Queue::submit_raw`].
     unsafe fn submit(&mut self, bar0: &MmioRegion, sqe: Sqe) -> Result<Cqe, NvmeError> {
+        // SAFETY: forwarded under the caller's contract.
+        unsafe { self.submit_ms(bar0, sqe, CQE_TIMEOUT_MS) }
+    }
+
+    /// [`Self::submit`] with a completion budget of `timeout_ms`.
+    ///
+    /// # Safety
+    /// Same invariants as [`Queue::submit_raw`].
+    unsafe fn submit_ms(
+        &mut self,
+        bar0: &MmioRegion,
+        sqe: Sqe,
+        timeout_ms: u64,
+    ) -> Result<Cqe, NvmeError> {
         let opcode = (sqe.cdw0 & 0xFF) as u8;
         // SAFETY: forwarded under the caller's `submit` contract.
-        let cqe = unsafe { self.submit_raw(bar0, sqe)? };
+        let cqe = unsafe { self.submit_raw_ms(bar0, sqe, timeout_ms)? };
         let nvme_status = cqe.status >> 1;
         if nvme_status != 0 {
             return Err(NvmeError::CommandFailed {
@@ -568,6 +600,12 @@ pub struct IdentifyController {
     pub ver: u32,
     /// Number of Namespaces (bytes 516..520): the largest valid NSID.
     pub nn: u32,
+    /// RTD3 Entry Latency (bytes 88..92), microseconds; 0 = not reported.
+    /// Bounds the CC.SHN shutdown wait (see [`shutdown::shutdown_timeout_ms`]).
+    pub rtd3e: u32,
+    /// Volatile Write Cache (byte 525): bit 0 = a volatile write cache is
+    /// present, so completed writes are durable only after a Flush.
+    pub vwc: u8,
 }
 
 impl Controller {
@@ -599,6 +637,7 @@ impl Controller {
             namespaces: Vec::new(),
             primary_nsid: DEFAULT_NSID,
             vs: 0,
+            flushes_completed: 0,
         }
     }
 
@@ -627,6 +666,84 @@ impl Controller {
     /// Geometry of namespace `nsid`, if the scan registered it.
     fn ns_geom(&self, nsid: u32) -> Option<ns::NamespaceInfo> {
         self.namespaces.iter().find(|n| n.nsid == nsid).copied()
+    }
+
+    /// Identify Controller VWC bit 0: completed writes may sit in a
+    /// volatile cache until a Flush.
+    pub fn has_volatile_write_cache(&self) -> bool {
+        self.identify
+            .is_some_and(|i| shutdown::has_volatile_write_cache(i.vwc))
+    }
+
+    /// Flush commands that completed successfully on this controller.
+    pub fn flushes_completed(&self) -> u64 {
+        self.flushes_completed
+    }
+
+    /// NVMe Flush (I/O opcode 0x00) of namespace `nsid`; returns once the
+    /// controller completed it, i.e. once every write completed before it
+    /// is on non-volatile media (NVM Command Set 1.0c §3.2.2). Linux
+    /// `nvme_setup_flush`. Without a volatile write cache every completed
+    /// write is already durable and no command is sent (Linux only turns on
+    /// `REQ_PREFLUSH` for a VWC controller). A completion timeout marks the
+    /// controller dead, like every other I/O timeout.
+    pub fn flush_nsid(&mut self, nsid: u32) -> Result<(), NvmeError> {
+        if self.dead {
+            return Err(NvmeError::ControllerDead);
+        }
+        if !self.has_volatile_write_cache() {
+            return Ok(());
+        }
+        if self.io_queues.is_empty() {
+            return Err(NvmeError::NoIoQueue);
+        }
+        let mut sqe = Sqe::zero();
+        sqe.cdw0 = IoOpcode::Flush as u32;
+        sqe.nsid = nsid;
+        // Every I/O path consumes its completion before returning, so all
+        // earlier writes are complete; one Flush on any queue covers them.
+        let qi = self.pick_queue();
+        let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        // SAFETY: the I/O queue and BAR0 are live; a Flush carries no data
+        // pointer.
+        let r = unsafe { io.submit_ms(bar0, sqe, FLUSH_TIMEOUT_MS) };
+        match r {
+            Ok(_) => {
+                self.flushes_completed += 1;
+                Ok(())
+            }
+            Err(e) => {
+                if e == NvmeError::CompletionTimeout {
+                    self.dead = true;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Final quiesce for reboot / power-off (Linux `nvme_shutdown` →
+    /// `nvme_dev_disable(shutdown = true)`): flush every namespace (when
+    /// the controller has a VWC), then CC.SHN = normal and wait for
+    /// CSTS.SHST = complete, bounded by RTD3E clamped to 5..=60 s. The
+    /// controller refuses I/O afterwards. `None` before bring-up.
+    pub fn shutdown(&mut self) -> Option<shutdown::QuiesceReport<NvmeError>> {
+        let regs = BarRegs(*self.bar0_region.as_ref()?);
+        let nsids: Vec<u32> = self.namespaces.iter().map(|n| n.nsid).collect();
+        let vwc = self.identify.map(|i| i.vwc).unwrap_or(0);
+        let timeout = shutdown::shutdown_timeout_ms(self.identify.map(|i| i.rtd3e).unwrap_or(0));
+        let report = shutdown::quiesce(
+            &nsids,
+            vwc,
+            &mut |nsid| self.flush_nsid(nsid),
+            &regs,
+            timeout,
+            &mut |cond, ms| {
+                narf_scheduler::responsive_spin_until(cond, narf_time::Deadline::after_ms(ms))
+            },
+        );
+        self.dead = true;
+        Some(report)
     }
 
     /// Largest data transfer one I/O command may carry, in bytes.
@@ -2288,13 +2405,15 @@ impl Controller {
         len: usize,
     ) -> Result<Sqe, NvmeError> {
         let ns = self.primary_geom();
-        self.build_nvm_sqe_ns(ns, opcode, lba, n_blocks, dma, len)
+        self.build_nvm_sqe_ns(ns, false, opcode, lba, n_blocks, dma, len)
     }
 
     /// [`Self::build_nvm_sqe`] against namespace `ns`.
+    #[allow(clippy::too_many_arguments)]
     fn build_nvm_sqe_ns(
         &mut self,
         ns: ns::NamespaceInfo,
+        fua: bool,
         opcode: u8,
         lba: u64,
         n_blocks: u32,
@@ -2356,17 +2475,24 @@ impl Controller {
         // CDW10/11 = SLBA (64-bit, little-endian split).
         sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
         sqe.cdw11 = (lba >> 32) as u32;
-        // CDW12 bits[15:0] = NLB-1; flags (LR/FUA/PRINFO) zero.
+        // CDW12 bits[15:0] = NLB-1; bit 30 = FUA (NVM Command Set 1.0c
+        // Figure 63: the write is on media before completion), as Linux
+        // `nvme_setup_rw` sets for `REQ_FUA`. LR / PRINFO stay zero.
         sqe.cdw12 = n_blocks - 1;
+        if fua && opcode == IoOpcode::Write as u8 {
+            sqe.cdw12 |= shutdown::CDW12_FUA;
+        }
         Ok(sqe)
     }
 
     /// Polled NVM Read/Write of `n_blocks` LBAs at `lba` into / from the
     /// contiguous DMA range `dma .. dma + len`. A completion timeout
     /// marks the controller dead (see [`NvmeError::ControllerDead`]).
+    #[allow(clippy::too_many_arguments)]
     fn nvm_io_dma(
         &mut self,
         ns: ns::NamespaceInfo,
+        fua: bool,
         opcode: u8,
         lba: u64,
         n_blocks: u32,
@@ -2379,7 +2505,7 @@ impl Controller {
         if n_blocks == 0 {
             return Ok(());
         }
-        let sqe = self.build_nvm_sqe_ns(ns, opcode, lba, n_blocks, dma, len)?;
+        let sqe = self.build_nvm_sqe_ns(ns, fua, opcode, lba, n_blocks, dma, len)?;
         let qi = self.pick_queue();
         let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
@@ -2406,7 +2532,7 @@ impl Controller {
         offset: usize,
     ) -> Result<(), NvmeError> {
         let ns = self.primary_geom();
-        self.nvm_io_ns_at(ns, opcode, lba, n_blocks, buf, offset)
+        self.nvm_io_ns_at(ns, false, opcode, lba, n_blocks, buf, offset)
     }
 
     /// [`Self::nvm_io_at`] against registered namespace `nsid`.
@@ -2420,12 +2546,14 @@ impl Controller {
         offset: usize,
     ) -> Result<(), NvmeError> {
         let ns = self.ns_geom(nsid).ok_or(NvmeError::NamespaceUnusable)?;
-        self.nvm_io_ns_at(ns, opcode, lba, n_blocks, buf, offset)
+        self.nvm_io_ns_at(ns, false, opcode, lba, n_blocks, buf, offset)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn nvm_io_ns_at(
         &mut self,
         ns: ns::NamespaceInfo,
+        fua: bool,
         opcode: u8,
         lba: u64,
         n_blocks: u32,
@@ -2437,6 +2565,7 @@ impl Controller {
         }
         self.nvm_io_dma(
             ns,
+            fua,
             opcode,
             lba,
             n_blocks,
@@ -2625,13 +2754,24 @@ unsafe fn peek_cqe(buf: &DmaBuffer, index: u16) -> Cqe {
     unsafe { core::ptr::read_volatile(base.add(index as usize)) }
 }
 
-/// Spin until CQ entry `index` has the expected phase tag, then
-/// return it.
+/// Default completion budget for admin and read/write commands.
+const CQE_TIMEOUT_MS: u64 = 5_000;
+/// Completion budget for a Flush: draining a large volatile cache can take
+/// far longer than a read; Linux gives every I/O `NVME_IO_TIMEOUT` (30 s).
+const FLUSH_TIMEOUT_MS: u64 = 30_000;
+
+/// Spin until CQ entry `index` has the expected phase tag, then return it;
+/// `CompletionTimeout` after `timeout_ms`.
 ///
 /// # Safety
-/// `buf` must be a live coherent DMA buffer sized for
-/// `ADMIN_Q_DEPTH * 16` bytes; `index < ADMIN_Q_DEPTH`.
-unsafe fn wait_cqe(buf: &DmaBuffer, index: u16, expected_phase: u16) -> Result<Cqe, NvmeError> {
+/// `buf` must be a live coherent DMA buffer sized for at least
+/// `index + 1` 16-byte CQEs.
+unsafe fn wait_cqe_ms(
+    buf: &DmaBuffer,
+    index: u16,
+    expected_phase: u16,
+    timeout_ms: u64,
+) -> Result<Cqe, NvmeError> {
     let base = buf.cpu_ptr::<Cqe>();
     // responsive_spin_until keeps cursor/FB/serial alive on a slow
     // or stuck controller. 5 s wall-clock budget — NVMe admin
@@ -2645,7 +2785,7 @@ unsafe fn wait_cqe(buf: &DmaBuffer, index: u16, expected_phase: u16) -> Result<C
             let cqe = unsafe { core::ptr::read_volatile(base.add(index as usize)) };
             (cqe.status & 1) == (expected_phase & 1)
         },
-        narf_time::Deadline::after_ms(5_000),
+        narf_time::Deadline::after_ms(timeout_ms),
     );
     if !done {
         return Err(NvmeError::CompletionTimeout);
@@ -2691,6 +2831,28 @@ unsafe fn parse_identify(buf: &DmaBuffer) -> IdentifyController {
         ver: unsafe { core::ptr::read_volatile(base.add(80) as *const u32) },
         // SAFETY: as above.
         nn: unsafe { core::ptr::read_volatile(base.add(516) as *const u32) },
+        // SAFETY: bytes 88..92 of the same page, 4-aligned.
+        rtd3e: unsafe { core::ptr::read_volatile(base.add(88) as *const u32) },
+        // SAFETY: byte 525 of the same page.
+        vwc: unsafe { core::ptr::read_volatile(base.add(525)) },
+    }
+}
+
+/// [`shutdown::CtrlRegs`] over a controller's BAR0.
+struct BarRegs(MmioRegion);
+
+impl shutdown::CtrlRegs for BarRegs {
+    fn read_cc(&self) -> u32 {
+        // SAFETY: BAR0 of a controller the caller holds exclusively.
+        unsafe { self.0.read32(REG_CC) }
+    }
+    fn write_cc(&self, v: u32) {
+        // SAFETY: as above.
+        unsafe { self.0.write32(REG_CC, v) }
+    }
+    fn read_csts(&self) -> u32 {
+        // SAFETY: as above.
+        unsafe { self.0.read32(REG_CSTS) }
     }
 }
 
@@ -2897,14 +3059,14 @@ impl BlockDevice for NvmeBlockDevice {
             }
         }
     }
+    /// NVMe Flush of the primary namespace when the controller has a
+    /// volatile write cache (see [`Controller::flush_nsid`]).
     async fn flush(&self) {
-        // Wave-3a: the I/O-queue path is single-threaded behind the
-        // installed slot's `req_gate` and every `read_lba` /
-        // `write_lba` polls its own completion before returning.
-        // There is therefore no
-        // outstanding-write set to drain. When the multi-queue
-        // submission path lands (Wave 3b), this becomes a real Flush
-        // (admin opcode 0x00) on each I/O queue.
+        let _ = nvme_flush_primary();
+    }
+    fn flush_result(&self) -> impl Future<Output = Result<(), BlockError>> + Send {
+        let r = nvme_flush_primary();
+        async move { r }
     }
     async fn discard(&self, _r: LbaRange) {
         // Dataset Management opcode 0x09 with AD=1 lands with the
@@ -2928,9 +3090,10 @@ fn nvme_submit_blocking(
     if req.blocks == 0 {
         return Ok(());
     }
-    let opcode = match req.op {
-        BlockOp::Read => IoOpcode::Read as u8,
-        BlockOp::Write { fua: _ } | BlockOp::WriteZeroes => IoOpcode::Write as u8,
+    let (opcode, fua) = match req.op {
+        BlockOp::Read => (IoOpcode::Read as u8, false),
+        BlockOp::Write { fua } => (IoOpcode::Write as u8, fua),
+        BlockOp::WriteZeroes => (IoOpcode::Write as u8, false),
         BlockOp::Trim => return Ok(()),
     };
     // Interrupts stay enabled for the whole transfer: hold the
@@ -2952,7 +3115,10 @@ fn nvme_submit_blocking(
     let mut done: u32 = 0;
     while done < req.blocks {
         let n = core::cmp::min(per_cmd, req.blocks - done);
-        ctrl.nvm_io_at(
+        let ns = ctrl.primary_geom();
+        ctrl.nvm_io_ns_at(
+            ns,
+            fua,
             opcode,
             req.lba.saturating_add(done as u64),
             n,
@@ -2963,6 +3129,12 @@ fn nvme_submit_blocking(
         done += n;
     }
     Ok(())
+}
+
+fn nvme_flush_primary() -> Result<(), BlockError> {
+    let mut ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
+    let nsid = ctrl.primary_nsid;
+    ctrl.flush_nsid(nsid).map_err(map_nvme_err)
 }
 
 fn map_nvme_err(e: NvmeError) -> BlockError {
@@ -3327,10 +3499,12 @@ fn sync_capacity(instance: u32, nsid: Option<u32>) -> u64 {
 /// Sync read/write of `n_blocks` LBAs of namespace `nsid` on controller
 /// `instance` through the controller's scratch. `write` selects direction;
 /// `data` is the source (write) or destination (read).
+#[allow(clippy::too_many_arguments)]
 fn sync_io(
     instance: u32,
     nsid: Option<u32>,
     write: bool,
+    fua: bool,
     lba: u64,
     n_blocks: u16,
     data: SyncData<'_>,
@@ -3385,6 +3559,7 @@ fn sync_io(
         }
         ctrl.nvm_io_ns_at(
             ns,
+            fua,
             opcode,
             lba.saturating_add(done as u64),
             n as u32,
@@ -3435,30 +3610,23 @@ impl narf_block::BlockDeviceSync for NvmeNamespaceBlock {
     fn capacity(&self) -> u64 {
         sync_capacity(self.instance, Some(self.nsid))
     }
-    fn read(
-        &self,
-        lba: u64,
-        n_blocks: u16,
-        out: &mut [u8],
-    ) -> Result<(), narf_block::BlockIoError> {
-        sync_io(
-            self.instance,
-            Some(self.nsid),
-            false,
-            lba,
-            n_blocks,
-            SyncData::In(out),
-        )
+    fn read(&self, lba: u64, n: u16, out: &mut [u8]) -> Result<(), narf_block::BlockIoError> {
+        let d = SyncData::In(out);
+        sync_io(self.instance, Some(self.nsid), false, false, lba, n, d)
     }
-    fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
-        sync_io(
-            self.instance,
-            Some(self.nsid),
-            true,
-            lba,
-            n_blocks,
-            SyncData::Out(data),
-        )
+    fn write(&self, lba: u64, n: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        let d = SyncData::Out(data);
+        sync_io(self.instance, Some(self.nsid), true, false, lba, n, d)
+    }
+    fn write_fua(&self, lba: u64, n: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        let d = SyncData::Out(data);
+        sync_io(self.instance, Some(self.nsid), true, true, lba, n, d)
+    }
+    fn flush(&self) -> Result<(), narf_block::BlockIoError> {
+        sync_flush(self.instance, Some(self.nsid))
+    }
+    fn capabilities(&self) -> narf_block::BlockCaps {
+        sync_caps(self.instance)
     }
 }
 
@@ -3469,16 +3637,41 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
     fn capacity(&self) -> u64 {
         sync_capacity(0, None)
     }
-    fn read(
-        &self,
-        lba: u64,
-        n_blocks: u16,
-        out: &mut [u8],
-    ) -> Result<(), narf_block::BlockIoError> {
-        sync_io(0, None, false, lba, n_blocks, SyncData::In(out))
+    fn read(&self, lba: u64, n: u16, out: &mut [u8]) -> Result<(), narf_block::BlockIoError> {
+        sync_io(0, None, false, false, lba, n, SyncData::In(out))
     }
-    fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
-        sync_io(0, None, true, lba, n_blocks, SyncData::Out(data))
+    fn write(&self, lba: u64, n: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        sync_io(0, None, true, false, lba, n, SyncData::Out(data))
+    }
+    fn write_fua(&self, lba: u64, n: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        sync_io(0, None, true, true, lba, n, SyncData::Out(data))
+    }
+    fn flush(&self) -> Result<(), narf_block::BlockIoError> {
+        sync_flush(0, None)
+    }
+    fn capabilities(&self) -> narf_block::BlockCaps {
+        sync_caps(0)
+    }
+}
+
+/// Flush namespace `nsid` (`None` = primary) of controller `instance`.
+fn sync_flush(instance: u32, nsid: Option<u32>) -> Result<(), narf_block::BlockIoError> {
+    let slot = slot_of(instance).ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+    let mut ctrl = acquire(slot);
+    if slot.removed.load(Ordering::Acquire) {
+        return Err(narf_block::BlockIoError::DeviceRemoved);
+    }
+    let ns = geom(&ctrl, nsid).ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+    ctrl.flush_nsid(ns.nsid).map_err(map_nvme_sync_err)
+}
+
+/// NVMe Write always supports FUA natively; the cache is volatile when
+/// Identify Controller VWC says so.
+fn sync_caps(instance: u32) -> narf_block::BlockCaps {
+    narf_block::BlockCaps {
+        volatile_cache: with_controller_at(instance, |c| c.has_volatile_write_cache())
+            .unwrap_or(false),
+        fua: true,
     }
 }
 
@@ -3630,6 +3823,52 @@ pub fn remove_controller(instance: u32, cap: &Cap<BusDeviceCap, Write>) -> Optio
     narf_filesystem::devfs::unregister_nvme_controller(instance);
     let mut ctrl = acquire(slot);
     Some(ctrl.disable_after_failure(cap))
+}
+
+/// `narf_power::system` shutdown hook: the final quiesce of every
+/// controller before reboot / power-off (Linux `nvme_shutdown`, run from
+/// `device_shutdown`). Each controller is flushed and sent CC.SHN in
+/// instance order; a controller whose gate stays held (a CPU wedged mid-I/O)
+/// for 2 s is skipped rather than hanging the power-off.
+pub fn shutdown_all_controllers() {
+    use core::fmt::Write as _;
+    let slots: Vec<&'static InstalledController> = CONTROLLERS.lock().clone();
+    for slot in slots {
+        if slot.removed.load(Ordering::Acquire) {
+            continue;
+        }
+        let name = ns::controller_name(slot.instance);
+        let got = narf_scheduler::responsive_spin_until(
+            || {
+                slot.req_gate
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            },
+            narf_time::Deadline::after_ms(2_000),
+        );
+        if !got {
+            let _ = writeln!(narf_console::Writer, "nvme: {name}: busy, shutdown skipped");
+            continue;
+        }
+        let mut ctrl = ControllerGuard { slot };
+        let start = narf_time::wall::monotonic_ns();
+        let Some(report) = ctrl.shutdown() else {
+            continue;
+        };
+        let flushed = report.flushes.iter().filter(|(_, r)| r.is_ok()).count();
+        let failed = report.flushes.len() - flushed;
+        let _ = writeln!(
+            narf_console::Writer,
+            "nvme: {name}: flushed {flushed} namespace(s){} in {} ms; CC.SHN normal shutdown: {:?}",
+            if failed > 0 {
+                alloc::format!(" ({failed} flush failed)")
+            } else {
+                alloc::string::String::new()
+            },
+            narf_time::wall::monotonic_ns().saturating_sub(start) / 1_000_000,
+            report.shutdown
+        );
+    }
 }
 
 /// Per-controller suspend/resume (`DevicePmOps`).
@@ -3832,6 +4071,7 @@ pub static PARAMS: narf_drivers::ParamSlot<NvmeParams> = narf_drivers::ParamSlot
 ///   storage controller; `probe` then filters by subclass+prog_if
 ///   so only true NVMe (`01:08:02`) silicon gets driven.
 pub fn register_pci_driver() {
+    narf_power::system::register_shutdown_hook("nvme", shutdown_all_controllers);
     let exact: &[(&'static str, u16, u16)] = &[
         ("nvme-qemu", QEMU_NVME_VENDOR, QEMU_NVME_DEVICE),
         ("nvme-samsung-pm9a1", SAMSUNG_VENDOR, SAMSUNG_PM9A1),
