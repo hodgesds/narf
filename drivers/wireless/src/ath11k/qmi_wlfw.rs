@@ -215,10 +215,26 @@ pub struct WlfwHwParams {
     pub supports_regdb: bool,
     /// `fw.board_size` — BDF / caldata are truncated to this.
     pub board_size: usize,
+    /// `coldboot_cal_mm` — cold-boot calibration in mission mode
+    /// (`ath11k_core_coldboot_cal_support` with `cold_boot_cal = 1`,
+    /// `ftm_mode = 0`, the module defaults).
+    pub coldboot_cal_mm: bool,
+    /// `coldboot_cal_ftm`.
+    pub coldboot_cal_ftm: bool,
+    /// `cbcal_restart_fw` — FW_READY is ignored; FW_INIT_DONE follows
+    /// a firmware restart.
+    pub cbcal_restart_fw: bool,
+    /// `fixed_mem_region` — target memory from a reserved region
+    /// (AHB parts) instead of `dma_alloc_coherent`.
+    pub fixed_mem_region: bool,
+    /// `hybrid_bus_type` — sends DEVICE_INFO (WCN6750 only).
+    pub hybrid_bus_type: bool,
 }
 
 /// QCA6390 and all WCN6855-family entries in `ath11k_hw_params`
-/// differ only in `supports_regdb` among the fields above.
+/// differ only in `supports_regdb` among the fields above (none of
+/// them does cold-boot calibration: `coldboot_cal_mm` /
+/// `coldboot_cal_ftm` / `cbcal_restart_fw` are all false).
 const QCA6390_FAMILY: WlfwHwParams = WlfwHwParams {
     qmi_service_ins_id: ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_QCA6390,
     m3_fw_support: true,
@@ -231,6 +247,11 @@ const QCA6390_FAMILY: WlfwHwParams = WlfwHwParams {
     fw_wmi_diag_event: true,
     supports_regdb: true,
     board_size: 256 * 1024,
+    coldboot_cal_mm: false,
+    coldboot_cal_ftm: false,
+    cbcal_restart_fw: false,
+    fixed_mem_region: false,
+    hybrid_bus_type: false,
 };
 
 /// `ath11k_hw_params` QMI fields for `rev` (`core.c`).
@@ -255,6 +276,11 @@ pub fn wlfw_hw_params(rev: HwRev) -> Option<WlfwHwParams> {
             fw_wmi_diag_event: false,
             supports_regdb: false,
             board_size: 256 * 1024,
+            coldboot_cal_mm: false,
+            coldboot_cal_ftm: true,
+            cbcal_restart_fw: true,
+            fixed_mem_region: false,
+            hybrid_bus_type: false,
         },
         HwRev::Unknown => return None,
     })

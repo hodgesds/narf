@@ -41,6 +41,7 @@
 
 extern crate alloc;
 
+pub mod board;
 pub mod dp;
 pub mod htc;
 pub mod hw;
@@ -49,8 +50,10 @@ pub mod mhi_host;
 pub mod pci;
 pub mod power;
 pub mod qmi;
+pub mod qmi_client;
 pub mod qmi_wlfw;
 pub mod qrtr;
+pub mod wlfw;
 pub mod wmi;
 pub mod wmi_ids;
 
@@ -69,6 +72,8 @@ pub fn register() {
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod mhi_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod qmi_handshake_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod qmi_tests;
 #[cfg(any(test, feature = "kernel-test"))]

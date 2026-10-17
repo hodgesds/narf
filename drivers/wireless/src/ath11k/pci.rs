@@ -17,7 +17,11 @@
 //! host ([`super::mhi_host`]) loads `amss.bin` over BHI/BHIe, follows
 //! the device to mission mode and starts the IPCR channels 20/21.
 //!
-//! Not yet: QMI, CE/HTC/WMI, DP. Until those land the device
+//! The same task then runs the WLFW QMI handshake over QRTR
+//! ([`super::wlfw`]) to FW_READY and parks the session for the CE
+//! phase ([`take_wlfw`]).
+//!
+//! Not yet: CE/HTC/WMI, DP. Until those land the device
 //! registers no network interface — a `wlan%d` with a made-up MAC
 //! that "associates" without touching the radio would only mislead
 //! userspace.
@@ -36,7 +40,7 @@ extern crate alloc;
 
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
@@ -51,6 +55,7 @@ use super::hw::{
 use super::mhi::{self, ATH11K_AMSS_FILE};
 use super::mhi_host::{self, ControllerParams, MhiBus, MhiController, MhiError, MhiNotify};
 use super::power::{self, ChipIo, PowerUpReport};
+use super::wlfw::{self, WlfwConfig};
 
 /// Failing-step codes latched into `narf_memory::diag` (shown on the
 /// framebuffer status panel as `wifi: <stage> FAILED step=N`).
@@ -308,19 +313,32 @@ impl MhiBus for Bar0Mhi {
     }
 }
 
-/// The MHI controller once the IPCR channels are running, for the QRTR
-/// layer. Take it out ([`take_mhi`]) before driving it from a task —
-/// never hold this lock across an `.await`.
-static MHI: IrqSafeSpinLock<Option<MhiController<Bar0Mhi>>> = IrqSafeSpinLock::new(None);
-
-/// Hand the running MHI controller to its next owner (Phase 3: QRTR).
-pub fn take_mhi() -> Option<MhiController<Bar0Mhi>> {
-    MHI.lock().take()
-}
+/// `true` once MHI reached mission mode and IPCR is running.
+static MHI_UP: AtomicBool = AtomicBool::new(false);
 
 /// `true` once MHI reached mission mode and IPCR is running.
 pub fn mhi_ready() -> bool {
-    MHI.lock().is_some()
+    MHI_UP.load(Ordering::Acquire)
+}
+
+/// The WLFW session over the running MHI controller.
+pub type Wlfw = wlfw::Wlfw<MhiController<Bar0Mhi>, wlfw::NarfFirmware, wlfw::Dma32>;
+
+/// The WLFW session parked at FW_READY: it owns the MHI controller,
+/// the firmware's target memory and the M3 image (which must stay
+/// allocated while the firmware runs). The CE/HAL phase takes it
+/// ([`take_wlfw`]) to send `firmware_start` with the shadow-register
+/// list it builds — never hold this lock across an `.await`.
+static WLFW: IrqSafeSpinLock<Option<Wlfw>> = IrqSafeSpinLock::new(None);
+
+/// Hand the FW_READY session to its next owner.
+pub fn take_wlfw() -> Option<Wlfw> {
+    WLFW.lock().take()
+}
+
+/// `true` once the firmware reported FW_READY.
+pub fn wlfw_ready() -> bool {
+    WLFW.lock().is_some()
 }
 
 /// Firmware lookup retries: probe can run before the rootfs firmware
@@ -392,6 +410,13 @@ pub struct MhiStart {
     pub fw_dir: &'static str,
     /// `nr_irqs` (the "MHI" MSI user's vector count).
     pub nr_irqs: u32,
+    /// `ab->id`: PCI vendor / device / subsystem ids (board names).
+    pub vendor: u16,
+    pub device: u16,
+    pub subsystem_vendor: u16,
+    pub subsystem_device: u16,
+    /// `(domain, bus, slot, function)` — `dev_name()` for caldata.
+    pub pci_addr: (u16, u8, u8, u8),
 }
 
 /// Linux `ath11k_mhi_register` + `ath11k_mhi_start`
@@ -438,12 +463,14 @@ async fn mhi_bring_up(s: MhiStart) -> Result<MhiController<Bar0Mhi>, MhiError> {
     Ok(ctrl)
 }
 
-/// The MHI bring-up task spawned by probe.
+/// The MHI bring-up task spawned by probe: MHI to mission mode, then
+/// the WLFW handshake to FW_READY.
 pub async fn mhi_task(s: MhiStart) {
     use core::fmt::Write as _;
     match mhi_bring_up(s).await {
         Ok(ctrl) => {
-            *MHI.lock() = Some(ctrl);
+            MHI_UP.store(true, Ordering::Release);
+            wlfw_bring_up(ctrl, s).await;
         }
         Err(e) => {
             diag::latch_wifi_error(e.step, e.detail);
@@ -455,6 +482,86 @@ pub async fn mhi_task(s: MhiStart) {
                 e.errno
             );
         }
+    }
+}
+
+/// `dev_name()` of a PCI function: `"%04x:%02x:%02x.%d"`.
+pub fn pci_dev_name(addr: (u16, u8, u8, u8)) -> alloc::string::String {
+    alloc::format!("{:04x}:{:02x}:{:02x}.{}", addr.0, addr.1, addr.2, addr.3)
+}
+
+fn wlfw_fail(e: wlfw::WlfwError) {
+    use core::fmt::Write as _;
+    diag::latch_wifi_error(e.step, e.detail);
+    let _ = writeln!(
+        narf_console::Writer,
+        "  ath11k: QMI handshake failed: step {} detail {:#x} (-{})",
+        e.step,
+        e.detail,
+        e.errno
+    );
+}
+
+/// QRTR + QMI over the running controller: Linux's
+/// `ath11k_qmi_init_service` → driver events → FW_READY.
+async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart) {
+    use core::fmt::Write as _;
+    diag::set_wifi_stage(WifiStage::Control);
+    let Some(fw) = wlfw::NarfFirmware::new() else {
+        return wlfw_fail(wlfw::WlfwError::new(
+            wlfw::step::NO_FW_AUTHORITY,
+            0,
+            wlfw::ENOENT,
+        ));
+    };
+    // NARF parses no SMBIOS tables at runtime, so no type-0xF8
+    // `BDF_<variant>` string reaches here; Linux uses the same
+    // no-variant board name when `ath11k_core_check_smbios` finds none.
+    let Some(cfg) = WlfwConfig::pci(
+        s.hw_rev,
+        s.vendor,
+        s.device,
+        s.subsystem_vendor,
+        s.subsystem_device,
+        pci_dev_name(s.pci_addr),
+        alloc::vec::Vec::new(),
+    ) else {
+        return wlfw_fail(wlfw::WlfwError::new(
+            wlfw::step::UNSUPPORTED,
+            0,
+            wlfw::EOPNOTSUPP,
+        ));
+    };
+    let mut w = match wlfw::Wlfw::new(ctrl, fw, wlfw::Dma32, cfg) {
+        Ok(w) => w,
+        Err(e) => return wlfw_fail(e),
+    };
+    match w.run_to_fw_ready().await {
+        Ok(info) => {
+            let st = w.client.stats;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ath11k: qmi: FW_READY chip_id {:#x} board_id {:#x} soc_id {:#x} \
+                 board {:?} regdb {:?} m3 {:#x}+{} target_mem {} seg (delayed {}) \
+                 qrtr rx {} tx {} bad {}",
+                info.target.chip_id,
+                info.target.board_id,
+                info.target.soc_id,
+                info.board
+                    .as_ref()
+                    .map(|b| (&b.name, b.api, b.bdf_type, b.sent)),
+                info.regdb_sent,
+                info.m3_addr,
+                info.m3_size,
+                info.target_mem.len(),
+                info.mem_delayed_rounds,
+                st.frames_rx,
+                st.frames_tx,
+                st.bad_frames
+            );
+            *WLFW.lock() = Some(w);
+        }
+        Err(e) => wlfw_fail(e),
     }
 }
 
@@ -585,11 +692,22 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
+    let pci_addr = match device.kind {
+        narf_bus::BusKind::Pcie { addr, .. } => {
+            (addr.segment, addr.bus, addr.device, addr.function)
+        }
+        _ => (0, 0, 0, 0),
+    };
     let start = mhi_vectors(&dev.msi).map(|(nr_irqs, _, _)| MhiStart {
         mmio: dev.mmio_bar0,
         hw_rev: dev.hw_rev,
         fw_dir: dev.params.fw_dir,
         nr_irqs,
+        vendor: device.id.vendor,
+        device: device.id.device,
+        subsystem_vendor: device.id.subsystem_vendor,
+        subsystem_device: device.id.subsystem_id,
+        pci_addr,
     });
     *CONTROLLER.lock() = Some(dev);
     match start {
