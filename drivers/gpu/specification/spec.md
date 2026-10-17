@@ -2480,8 +2480,10 @@ After RS64, restricted power, GMC and the SDMA proof, `unsafe initialize().await
 requires inactive CP/MES queues and applies GC12 golden settings. It reads the
 ASIC strap using the NBIO7.7 or NBIF6.3.1 offset; revision-zero workarounds do
 not affect later revisions. Shader-engine broadcast and queue/VMID selectors
-are restored on every exit. Constants configure VMID0 shader access, the
-single graphics pipe, eight hardware contexts and disabled GUI-idle IRQs.
+are restored on every exit. Constants configure shader access for every
+graphics VMID (0–7: DEFAULT_SH_MEM_CONFIG; 1–7 also SH_MEM_BASES with
+gmc_v12_0's private/shared apertures), the single graphics pipe, eight
+hardware contexts and disabled GUI-idle IRQs.
 The RLC image contains the six GC12 clusters (75 dwords), checked independently
 against Linux's clear-state table by `tests/gfx12_clearstate.c`. Publication
 retains the page through cancellation/failure; the driver programs CSIB and
