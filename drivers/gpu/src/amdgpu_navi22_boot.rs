@@ -495,6 +495,25 @@ fn dmub_result(result: Result<(), crate::amdgpu_dmub_navi22::Error>) -> Result<(
         }
     }
 }
+/// DmubQuiesce outcome: `Ok(true)` keeps the owner, `Ok(false)` drops it.
+/// dm_dmub_hw_init treats a fused-off DMCUB ("DMUB unsupported on ASIC") as
+/// a board without DMUB, not a failure; VBIOS display tables then run in the
+/// ATOM interpreter. dmub_dcn20_reset already forces a hung DMCUB into
+/// reset, so any other error (readback, device loss) stops the boot.
+fn dmub_quiesce_result(result: Result<(), crate::amdgpu_dmub_navi22::Error>) -> Result<bool, Error> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(crate::amdgpu_dmub_navi22::Error::Unsupported) => {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 DMUB unsupported on ASIC (DMCUB fused off)"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(Error::Dmub(error)),
+    }
+}
 async fn trap_round_trip(
     ih: &mut crate::amdgpu_ih_navi22::Ih,
     sdma: &mut crate::amdgpu_sdma_navi22::Sdma,
@@ -664,7 +683,9 @@ impl Backend for Hardware {
             }
             Stage::DmubQuiesce => {
                 if let Some(dmub) = self.dmub.as_mut() {
-                    dmub.quiesce().await.map_err(Error::Dmub)?;
+                    if !dmub_quiesce_result(dmub.quiesce().await)? {
+                        self.dmub = None;
+                    }
                 }
             }
             Stage::DmubStart => {

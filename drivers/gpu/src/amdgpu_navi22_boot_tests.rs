@@ -659,3 +659,24 @@ kernel_test_in!(
     "drivers/gpu/navi22-boot",
     navi22_hotplug_is_opt_in_with_the_display
 );
+
+/// A fused-off DMCUB drops the DMUB owner and continues; a readback failure
+/// or device loss still stops the boot at DmubQuiesce.
+fn navi22_dmub_quiesce_tolerates_fused_off_dmcub() -> TestResult {
+    use crate::amdgpu_dmub_navi22::Error as Dmub;
+    if dmub_quiesce_result(Ok(())) != Ok(true)
+        || dmub_quiesce_result(Err(Dmub::Unsupported)) != Ok(false)
+    {
+        return TestResult::Fail("fused-off DMCUB stopped the boot");
+    }
+    for error in [Dmub::Readback, Dmub::DeviceGone, Dmub::Revoked] {
+        if dmub_quiesce_result(Err(error)) != Err(Error::Dmub(error)) {
+            return TestResult::Fail("DMUB reset fault tolerated");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_dmub_quiesce_tolerates_fused_off_dmcub
+);

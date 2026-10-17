@@ -389,10 +389,23 @@ fn dmub_navi22_stop_boot_timeout_readback_and_revocation() -> TestResult {
     for case in 0..4 {
         let (pool, mut engine) = fixture();
         if case == 0 {
+            // dmub_dcn20_reset: an unacknowledged STOP_FW still clears GPINT
+            // and forces the reset ("DMCUB is likely hung").
             engine.io.stop = false;
-            if run(engine.quiesce()) != Err(Error::StopTimeout) || engine.io.writes.len() != 1 {
-                return TestResult::Fail("unacknowledged STOP forced reset");
+            if run(engine.quiesce()).is_err()
+                || engine.state != State::Reset
+                || engine.io.writes.first() != Some(&(DCN + 0x1f8 * 4, 0x10020000))
+                || engine.io.writes.get(1) != Some(&(DCN + 0x1f8 * 4, 0))
+                || engine.io.regs[&(DCN + 0x1f6 * 4)] & 0x30000 != 0x20000
+                || engine.io.regs[&(DCN + 0x341 * 4)] & 0x100 == 0
+            {
+                return TestResult::Fail("unacknowledged STOP did not force the reset");
             }
+            // The forced reset leaves the owner startable, like Linux.
+            if run(engine.start(tmr(), fb())).is_err() {
+                return TestResult::Fail("force-reset DMCUB not startable");
+            }
+            continue;
         } else {
             run(engine.quiesce()).unwrap();
             let error = match case {
@@ -418,7 +431,7 @@ fn dmub_navi22_stop_boot_timeout_readback_and_revocation() -> TestResult {
         }
         let size = engine.memory.size();
         drop(engine);
-        if pool.available() != if case == 0 { size } else { 0 } {
+        if pool.available() != 0 || size == 0 {
             return TestResult::Fail("wrong DMUB storage lifetime after fault");
         }
     }
@@ -561,4 +574,19 @@ fn dmub_navi22_preparation_and_layout_are_generation_specific() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dmub-navi22",
     dmub_navi22_preparation_and_layout_are_generation_specific
+);
+
+/// dm_dmub_hw_init: CC_DC_PIPE_DIS.DC_DMCUB_ENABLE clear means "DMUB
+/// unsupported on ASIC" -- reported as Unsupported without any DMUB write.
+fn dmub_navi22_fused_off_dmcub_is_unsupported_without_writes() -> TestResult {
+    let (_pool, mut engine) = fixture();
+    engine.io.regs.insert(DCN + 0xca * 4, 0);
+    if run(engine.quiesce()) != Err(Error::Unsupported) || !engine.io.writes.is_empty() {
+        return TestResult::Fail("fused-off DMCUB touched or not reported unsupported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi22",
+    dmub_navi22_fused_off_dmcub_is_unsupported_without_writes
 );

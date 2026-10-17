@@ -267,37 +267,18 @@ impl<I: Io> Engine<I> {
     }
     async fn quiesce_inner(&mut self) -> Result<(), Error> {
         let base = self.layout.dcn;
-        let control = self.access(|io| {
-            if read(io, base, 0xca)? & (1 << 16) == 0 {
-                return Err(Error::Unsupported);
-            }
-            read(io, base, CNTL)
-        })?;
-        if control & RESET == 0 && control & ENABLE != 0 {
-            self.access(|io| {
-                io.write(base + u64::from(GPINT) * 4, STOP);
-                Ok(())
-            })?;
-            let deadline = narf_time::Deadline::after_ms(100);
-            loop {
-                if self.access(|io| {
-                    Ok(read(io, base, GPINT)? == STOP & !(1 << 28)
-                        && read(io, base, 0x1ea)? == 0xdeaddead)
-                })? {
-                    break;
-                }
-                if deadline.expired() {
-                    return Err(Error::StopTimeout);
-                }
-                tick().await;
-            }
+        // dmub_dcn20_is_supported: CC_DC_PIPE_DIS.DC_DMCUB_ENABLE. A fused-off
+        // DMCUB is "DMUB unsupported on ASIC" (dm_dmub_hw_init), not a fault.
+        if self.access(|io| read(io, base, 0xca))? & (1 << 16) == 0 {
+            return Err(Error::Unsupported);
         }
-        self.access(|io| hold_reset(io, base))
+        self.reset().await
     }
-    /// dmub_srv_hw_init begins with `dmub_dcn20_reset` even after PSP loaded
-    /// the firmware: STOP_FW if running, bounded acknowledgement, then a
-    /// forced reset ("in case we timed out, DMCUB is likely hung").
-    async fn reset_after_load(&mut self) -> Result<(), Error> {
+    /// `dmub_dcn20_reset`, used both before PSP replaces CW0/1 and again by
+    /// dmub_srv_hw_init after PSP loaded the firmware: STOP_FW unless held
+    /// in reset, a bounded acknowledgement, clear GPINT, then a forced reset
+    /// ("in case we timed out, DMCUB is likely hung").
+    async fn reset(&mut self) -> Result<(), Error> {
         let base = self.layout.dcn;
         let control = self.access(|io| read(io, base, CNTL))?;
         if control & RESET == 0 {
@@ -309,8 +290,15 @@ impl<I: Io> Engine<I> {
             while !self.access(|io| {
                 Ok(read(io, base, GPINT)? == STOP & !(1 << 28)
                     && read(io, base, 0x1ea)? == 0xdeaddead)
-            })? && !deadline.expired()
-            {
+            })? {
+                if deadline.expired() {
+                    use core::fmt::Write;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: navi22 DMCUB STOP_FW not acknowledged; forcing reset"
+                    );
+                    break;
+                }
                 tick().await;
             }
         }
@@ -337,7 +325,7 @@ impl<I: Io> Engine<I> {
         let address = self.memory.address();
         let shape = self.prepared.layout;
         if !self.access(|io| is_reset(io, l.dcn))? {
-            self.reset_after_load().await?;
+            self.reset().await?;
         }
         let placement = self.access(|io| {
             if !is_reset(io, l.dcn)? || read(io, l.dcn, 0x1ce)? & (1 << 16) != 0 {
@@ -533,7 +521,8 @@ impl Dmub {
         })
     }
     /// Stop inherited firmware and hold DCN3.0 reset before PSP replaces CW0/1.
-    /// A missing STOP acknowledgement fails without attempting forced recovery.
+    /// A missing STOP acknowledgement forces the reset (dmub_dcn20_reset);
+    /// `Unsupported` means the DMCUB is fused off (no DMUB on this board).
     pub async fn quiesce(&mut self) -> Result<(), Error> {
         self.engine.quiesce().await
     }
