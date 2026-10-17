@@ -252,8 +252,8 @@ pub(crate) const OFF_SYS_CHUNK_ARRAY_SIZE: usize = 160;
 const OFF_COMPAT_RO_FLAGS: usize = 180;
 pub(crate) const OFF_INCOMPAT_FLAGS: usize = 188;
 const OFF_CSUM_TYPE: usize = 196;
-const OFF_ROOT_LEVEL: usize = 198;
-const OFF_CHUNK_ROOT_LEVEL: usize = 199;
+pub(crate) const OFF_ROOT_LEVEL: usize = 198;
+pub(crate) const OFF_CHUNK_ROOT_LEVEL: usize = 199;
 const OFF_FSID: usize = 32;
 /// Embedded member-specific `struct btrfs_dev_item` in each superblock.
 pub const SUPERBLOCK_DEV_ITEM_OFFSET: usize = 201;
@@ -273,7 +273,7 @@ pub const COMPAT_RO_BLOCK_GROUP_TREE: u64 = 1 << 3;
 pub const SUPPORTED_COMPAT_RO_FLAGS: u64 =
     COMPAT_RO_FREE_SPACE_TREE | COMPAT_RO_FREE_SPACE_TREE_VALID | COMPAT_RO_BLOCK_GROUP_TREE;
 pub const WRITE_SUPPORTED_COMPAT_RO_FLAGS: u64 =
-    COMPAT_RO_FREE_SPACE_TREE | COMPAT_RO_FREE_SPACE_TREE_VALID;
+    COMPAT_RO_FREE_SPACE_TREE | COMPAT_RO_FREE_SPACE_TREE_VALID | COMPAT_RO_BLOCK_GROUP_TREE;
 
 pub const INCOMPAT_MIXED_BACKREF: u64 = 1 << 0;
 pub const INCOMPAT_DEFAULT_SUBVOL: u64 = 1 << 1;

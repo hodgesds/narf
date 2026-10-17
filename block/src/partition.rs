@@ -36,7 +36,7 @@ use crate::BlockIoError;
 /// partition scanner is already registering the child device. It is not a
 /// filesystem or encryption probe: the owning layer still validates and opens
 /// the complete format later. FAT serials use Linux's eight-hex-digit form;
-/// ext, LUKS1, and LUKS2 UUIDs use their canonical forms.
+/// ext, btrfs (`fsid`), LUKS1, and LUKS2 UUIDs use their canonical forms.
 pub fn discover_volume_uuid(dev: &dyn BlockDeviceSync) -> Option<String> {
     let lba_bytes = dev.lba_size() as usize;
     if lba_bytes < 512 {
@@ -74,50 +74,30 @@ pub fn discover_volume_uuid(dev: &dyn BlockDeviceSync) -> Option<String> {
         return None;
     }
     let mut bytes = alloc::vec![0u8; blocks * lba_bytes];
-    if dev.read(0, blocks as u16, &mut bytes).is_err()
-        || bytes.get(1024 + 0x38..1024 + 0x3a) != Some(&[0x53, 0xef][..])
+    if dev.read(0, blocks as u16, &mut bytes).is_ok()
+        && bytes.get(1024 + 0x38..1024 + 0x3a) == Some(&[0x53, 0xef][..])
     {
-        // A btrfs superblock sits at byte 65536: `fsid` at +32, magic
-        // `_BHRfS_M` at +64. This is the `UUID=` Linux's blkid reports for
-        // the volume (`/dev/disk/by-uuid`), and what `root=UUID=` names on an
-        // installed btrfs distro root.
-        return btrfs_fsid(dev, lba_bytes).map(|uuid| format_uuid_bytes(&uuid));
+        let uuid: [u8; 16] = bytes[1024 + 0x68..1024 + 0x68 + 16].try_into().ok()?;
+        return Some(crate::registry::format_uuid_bytes(&uuid));
     }
-    let mut uuid = [0u8; 16];
-    uuid.copy_from_slice(&bytes[1024 + 0x68..1024 + 0x68 + 16]);
-    Some(format_uuid_bytes(&uuid))
-}
 
-/// Byte offset of the primary btrfs superblock.
-const BTRFS_SUPER_OFFSET: usize = 65536;
-
-/// The btrfs `fsid` of `dev`'s primary superblock, when its magic matches.
-/// Only the identification bytes are read; the driver validates the rest.
-fn btrfs_fsid(dev: &dyn BlockDeviceSync, lba_bytes: usize) -> Option<[u8; 16]> {
-    let first = BTRFS_SUPER_OFFSET / lba_bytes;
-    let span = (BTRFS_SUPER_OFFSET + 72).div_ceil(lba_bytes) - first;
-    if (first + span) as u64 > dev.capacity() || span > u16::MAX as usize {
+    // btrfs: the primary superblock is at 64 KiB, `magic` "_BHRfS_M" at
+    // +0x40 and the filesystem `fsid` (what blkid reports as UUID) at +0x20.
+    const BTRFS_SB: usize = 0x1_0000;
+    if BTRFS_SB % lba_bytes != 0 {
         return None;
     }
-    let mut bytes = alloc::vec![0u8; span * lba_bytes];
-    dev.read(first as u64, span as u16, &mut bytes).ok()?;
-    let base = BTRFS_SUPER_OFFSET - first * lba_bytes;
-    if bytes.get(base + 64..base + 72) != Some(b"_BHRfS_M".as_slice()) {
+    let mut sb = alloc::vec![0u8; lba_bytes];
+    dev.read((BTRFS_SB / lba_bytes) as u64, 1, &mut sb).ok()?;
+    if sb.get(0x40..0x48) != Some(b"_BHRfS_M".as_slice()) {
         return None;
     }
-    let mut fsid = [0u8; 16];
-    fsid.copy_from_slice(bytes.get(base + 32..base + 48)?);
-    Some(fsid)
+    let fsid: [u8; 16] = sb.get(0x20..0x30)?.try_into().ok()?;
+    Some(crate::registry::format_uuid_bytes(&fsid))
 }
 
 /// Canonical lowercase 8-4-4-4-12 rendering of a 16-byte UUID.
-pub fn format_uuid_bytes(uuid: &[u8; 16]) -> String {
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
-        uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]
-    )
-}
+pub use crate::registry::format_uuid_bytes;
 
 /// Parse a canonical (hyphenated or not) 32-hex-digit UUID. FAT serials
 /// (`6D89-28C5`) and anything else not exactly 16 bytes return `None`.
@@ -479,6 +459,19 @@ impl BlockDeviceSync for PartitionBlockDevice {
         let abs = self.start_lba + lba;
         self.parent.read(abs, n_blocks, out)
     }
+    fn flush(&self) -> Result<(), BlockIoError> {
+        self.parent.flush()
+    }
+    fn capabilities(&self) -> crate::registry::BlockCaps {
+        self.parent.capabilities()
+    }
+    fn write_fua(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
+        let n = n_blocks as u64;
+        if lba.checked_add(n).is_none_or(|end| end > self.sector_count) {
+            return Err(BlockIoError::OutOfRange);
+        }
+        self.parent.write_fua(self.start_lba + lba, n_blocks, data)
+    }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
         let n = n_blocks as u64;
         if lba.checked_add(n).is_none_or(|end| end > self.sector_count) {
@@ -515,7 +508,7 @@ pub enum ScanError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanReport {
     /// Names registered against the block registry (e.g.
-    /// `["nvme0p1", "nvme0p2"]`).
+    /// `["nvme0n1p1", "nvme0n1p2"]`).
     pub registered: Vec<String>,
     /// True iff the disk was GPT (vs legacy MBR).
     pub is_gpt: bool,

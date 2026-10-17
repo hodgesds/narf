@@ -1966,3 +1966,628 @@ kernel_test_in!(
     "block/disk_policy",
     smoke_block_partition_scanned_gpt_partitions_are_read_only_under_boot_only
 );
+
+// ── block/disk_policy: narf.disks=root-ro|root-rw ───────────────────
+
+const RP_ROOT_UUID: &str = "653602c3-cd42-420e-95ef-4c4033d17b56";
+const RP_OTHER_UUID: &str = "15d044db-0c09-4ec4-a2d6-ccd1f92e4dd6";
+/// Partition layout of the model disk, in 512-byte LBAs.
+const RP_ESP: (u64, u64) = (8, 64);
+const RP_ROOT: (u64, u64) = (80, 160);
+const RP_DISK_LBAS: usize = 256;
+
+type RpBytes = alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u8>>>;
+
+/// Write a btrfs primary-superblock identity (fsid + magic) at partition
+/// byte 65536 of `bytes`, whose partition starts at `start` LBAs.
+fn rp_put_btrfs(bytes: &mut [u8], start: u64, uuid: &str) {
+    let base = start as usize * 512 + 65536;
+    let fsid = crate::partition::parse_uuid(uuid).expect("uuid");
+    bytes[base + 32..base + 48].copy_from_slice(&fsid);
+    bytes[base + 64..base + 72].copy_from_slice(b"_BHRfS_M");
+}
+
+/// A minimal FAT32 boot sector (BPB sanity fields + signature + serial).
+fn rp_put_fat(bytes: &mut [u8], start: u64) {
+    let b = start as usize * 512;
+    bytes[b + 11..b + 13].copy_from_slice(&512u16.to_le_bytes());
+    bytes[b + 13] = 1;
+    bytes[b + 16] = 2;
+    bytes[b + 67..b + 71].copy_from_slice(&0x6D89_28C5u32.to_le_bytes());
+    bytes[b + 82..b + 90].copy_from_slice(b"FAT32   ");
+    bytes[b + 510] = 0x55;
+    bytes[b + 511] = 0xAA;
+}
+
+/// Register a model disk `disk` with an ESP (`{disk}p1`, vfat) and a btrfs
+/// root (`{disk}p2`, `root_uuid`), the WD SN770 layout. Returns its bytes.
+fn rp_register_disk(
+    disk: &'static str,
+    p1: &'static str,
+    p2: &'static str,
+    root_uuid: &str,
+) -> RpBytes {
+    use crate::partition::PartitionBlockDevice;
+    use crate::registry::{register_partition_device, PartitionMetadata};
+    use alloc::sync::Arc;
+    let mut raw = alloc::vec![0u8; RP_DISK_LBAS * 512];
+    rp_put_fat(&mut raw, RP_ESP.0);
+    rp_put_btrfs(&mut raw, RP_ROOT.0, root_uuid);
+    let bytes = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(raw));
+    let whole = Arc::new(VecBlock {
+        data: bytes.clone(),
+        lba_size: 512,
+    }) as Arc<dyn crate::BlockDeviceSync>;
+    crate::register_block_device(disk, whole.clone());
+    let meta = |type_guid: &str, fs_uuid: &str| PartitionMetadata {
+        gpt_type_guid: type_guid.into(),
+        partlabel: alloc::string::String::new(),
+        partuuid: alloc::string::String::new(),
+        fs_uuid: fs_uuid.into(),
+    };
+    register_partition_device(
+        p1,
+        disk,
+        Arc::new(PartitionBlockDevice::new(whole.clone(), RP_ESP.0, RP_ESP.1)),
+        Some(meta(
+            crate::registry::GPT_EFI_SYSTEM_PARTITION_TYPE_GUID,
+            "6D89-28C5",
+        )),
+    );
+    register_partition_device(
+        p2,
+        disk,
+        Arc::new(PartitionBlockDevice::new(whole, RP_ROOT.0, RP_ROOT.1)),
+        Some(meta("0FC63DAF-8483-4772-8E79-3D69D8477DE4", root_uuid)),
+    );
+    bytes
+}
+
+fn rp_reset(policy: Option<crate::disk_policy::DiskPolicy>, root: Option<Option<&str>>) {
+    crate::disk_policy::__reset_root_for_test();
+    crate::disk_policy::__set_policy_for_test(policy);
+    crate::disk_policy::__set_root_arg_for_test(root);
+}
+
+fn rp_writes(name: &str) -> bool {
+    let Some(dev) = crate::registry::find_block_device(name) else {
+        return false;
+    };
+    let mut block = [0u8; 512];
+    if dev.read(1, 1, &mut block).is_err() {
+        return false;
+    }
+    dev.write(1, 1, &block).is_ok()
+}
+
+fn rp_uuid(text: &str) -> [u8; 16] {
+    crate::partition::parse_uuid(text).expect("uuid")
+}
+
+fn rp_finish(names: &[&str], result: Result<(), &'static str>) -> TestResult {
+    rp_reset(None, None);
+    for name in names {
+        crate::unregister_block_device(name);
+    }
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+
+fn smoke_block_disk_policy_parse_root_policies() -> TestResult {
+    use crate::disk_policy::{banner_with_root, parse, DiskPolicy};
+    let ok = parse(Some("root-ro")) == Ok(DiskPolicy::RootRo)
+        && parse(Some("ROOT-RW")) == Ok(DiskPolicy::RootRw)
+        && parse(Some("root")).is_err()
+        && parse(Some("root-rwx")).is_err();
+    let rw = banner_with_root(DiskPolicy::RootRw, true, Some("UUID=653602c3"));
+    let ro = banner_with_root(DiskPolicy::RootRo, true, None);
+    if !ok {
+        return TestResult::Fail("narf.disks= must parse root-ro and root-rw exactly");
+    }
+    if !rw.contains("ONLY") || !rw.contains("UUID=653602c3") || !ro.contains("NOTHING") {
+        return TestResult::Fail("root policy banners must name what is writable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "block/disk_policy",
+    smoke_block_disk_policy_parse_root_policies
+);
+
+/// The production shape: under root-rw, before designation nothing is
+/// writable and only the root=UUID= candidate may auto-mount; after it,
+/// exactly the root partition is writable — not its whole disk, not the ESP
+/// on the same disk (which may auto-mount, read-only), not another disk.
+fn smoke_block_disk_policy_root_rw_only_root_uuid_writable() -> TestResult {
+    use crate::disk_policy::{self, DiskPolicy, PolicyError};
+    let names = [
+        "rp-sn770p1",
+        "rp-sn770p2",
+        "rp-sn770",
+        "rp-sabrentp1",
+        "rp-sabrentp2",
+        "rp-sabrent",
+    ];
+    let root_arg = alloc::format!("UUID={RP_ROOT_UUID}");
+    rp_reset(Some(DiskPolicy::RootRw), Some(Some(&root_arg)));
+    let sn770 = rp_register_disk("rp-sn770", "rp-sn770p1", "rp-sn770p2", RP_ROOT_UUID);
+    let sabrent = rp_register_disk("rp-sabrent", "rp-sabrentp1", "rp-sabrentp2", RP_OTHER_UUID);
+    let result = (|| {
+        for name in names {
+            if rp_writes(name) {
+                return Err("nothing may be writable before the root is designated");
+            }
+        }
+        if !disk_policy::automount_allowed("rp-sn770p2")
+            || disk_policy::automount_allowed("rp-sn770p1")
+            || disk_policy::automount_allowed("rp-sabrentp2")
+            || disk_policy::automount_allowed("rp-sn770")
+        {
+            return Err("before designation only the root=UUID= candidate may auto-mount");
+        }
+        let sabrent_before = sabrent.lock().clone();
+        if disk_policy::designate_root("rp-sabrentp2", rp_uuid(RP_OTHER_UUID))
+            != Err(PolicyError::UuidMismatch)
+        {
+            return Err("a partition not named by root=UUID= must not be designated");
+        }
+        if disk_policy::designate_root("rp-sn770", rp_uuid(RP_ROOT_UUID))
+            != Err(PolicyError::NotAPartition)
+        {
+            return Err("a whole disk must not be designated");
+        }
+        disk_policy::designate_root("rp-sn770p2", rp_uuid(RP_ROOT_UUID))
+            .map_err(|_| "the root=UUID= partition must be designated")?;
+        if !disk_policy::root_writable()
+            || disk_policy::designated_root() != Some("rp-sn770p2")
+            || !disk_policy::write_allowed("rp-sn770p2")
+        {
+            return Err("root-rw must report the designated root writable");
+        }
+        let sn770_before = sn770.lock().clone();
+        if !rp_writes("rp-sn770p2") {
+            return Err("the designated root partition must be writable");
+        }
+        for name in [
+            "rp-sn770",
+            "rp-sn770p1",
+            "rp-sabrent",
+            "rp-sabrentp1",
+            "rp-sabrentp2",
+        ] {
+            if rp_writes(name) || disk_policy::write_allowed(name) {
+                return Err("only the designated root partition may be written");
+            }
+        }
+        // The root write landed inside the root partition, and nothing else
+        // changed (the write rewrote the same bytes, so compare outside it).
+        let after = sn770.lock().clone();
+        let root_bytes = (RP_ROOT.0 as usize * 512)..((RP_ROOT.0 + RP_ROOT.1) as usize * 512);
+        if after[..root_bytes.start] != sn770_before[..root_bytes.start]
+            || after[root_bytes.end..] != sn770_before[root_bytes.end..]
+            || *sabrent.lock() != sabrent_before
+        {
+            return Err("a refused write reached a disk");
+        }
+        if !disk_policy::automount_allowed("rp-sn770p1")
+            || disk_policy::automount_allowed("rp-sabrentp1")
+            || disk_policy::automount_allowed("rp-sabrentp2")
+        {
+            return Err("after designation the root's own ESP may auto-mount, nothing else");
+        }
+        let esp = crate::registry::find_block_device("rp-sn770p1").ok_or("esp missing")?;
+        if !esp.is_read_only() {
+            return Err("the ESP on the root's disk must stay read-only");
+        }
+        if disk_policy::designate_root("rp-sn770p2", rp_uuid(RP_ROOT_UUID))
+            != Err(PolicyError::AlreadyDesignated)
+        {
+            return Err("a second designation must be refused");
+        }
+        Ok(())
+    })();
+    rp_finish(&names, result)
+}
+kernel_test_in!(
+    "block/disk_policy",
+    smoke_block_disk_policy_root_rw_only_root_uuid_writable
+);
+
+/// root-ro: the root is designated and may auto-mount, but nothing is ever
+/// writable, the root included.
+fn smoke_block_disk_policy_root_ro_nothing_writable() -> TestResult {
+    use crate::disk_policy::{self, DiskPolicy};
+    let names = ["rp-ro0p1", "rp-ro0p2", "rp-ro0"];
+    let root_arg = alloc::format!("UUID={RP_ROOT_UUID}");
+    rp_reset(Some(DiskPolicy::RootRo), Some(Some(&root_arg)));
+    let bytes = rp_register_disk("rp-ro0", "rp-ro0p1", "rp-ro0p2", RP_ROOT_UUID);
+    let result = (|| {
+        let pristine = bytes.lock().clone();
+        disk_policy::designate_root("rp-ro0p2", rp_uuid(RP_ROOT_UUID))
+            .map_err(|_| "root-ro must designate the root")?;
+        if disk_policy::root_writable() || disk_policy::write_allowed("rp-ro0p2") {
+            return Err("root-ro must never report the root writable");
+        }
+        for name in names {
+            let dev = crate::registry::find_block_device(name).ok_or("missing")?;
+            if dev.write(1, 1, &[0xA5u8; 512]).is_ok() || !dev.is_read_only() {
+                return Err("root-ro must refuse every write");
+            }
+        }
+        if *bytes.lock() != pristine {
+            return Err("a refused write reached the disk");
+        }
+        if !disk_policy::automount_allowed("rp-ro0p2")
+            || !disk_policy::automount_allowed("rp-ro0p1")
+        {
+            return Err("root-ro must still mount the root and its ESP read-only");
+        }
+        Ok(())
+    })();
+    rp_finish(&names, result)
+}
+kernel_test_in!(
+    "block/disk_policy",
+    smoke_block_disk_policy_root_ro_nothing_writable
+);
+
+/// Identity, not names: the root registered under an arbitrary name is
+/// designated by its UUID; re-registering the designated device (a rename /
+/// re-probe) or a second device appearing with the same UUID (a clone, a
+/// multi-device btrfs member) revokes every root write for the boot.
+fn smoke_block_disk_policy_root_follows_identity_not_names() -> TestResult {
+    use crate::disk_policy::{self, DiskPolicy, PolicyError};
+    use alloc::sync::Arc;
+    let names = [
+        "rp-renamed7n1p1",
+        "rp-renamed7n1p2",
+        "rp-renamed7n1",
+        "rp-clone0p1",
+        "rp-clone0p2",
+        "rp-clone0",
+    ];
+    let root_arg = alloc::format!("UUID={RP_ROOT_UUID}");
+    let result = (|| {
+        // Duplicate UUID before designation: refused as ambiguous.
+        rp_reset(Some(DiskPolicy::RootRw), Some(Some(&root_arg)));
+        rp_register_disk(
+            "rp-renamed7n1",
+            "rp-renamed7n1p1",
+            "rp-renamed7n1p2",
+            RP_ROOT_UUID,
+        );
+        rp_register_disk("rp-clone0", "rp-clone0p1", "rp-clone0p2", RP_ROOT_UUID);
+        if disk_policy::designate_root("rp-renamed7n1p2", rp_uuid(RP_ROOT_UUID))
+            != Err(PolicyError::Ambiguous)
+        {
+            return Err("a UUID carried by two devices must not be designated");
+        }
+        for name in ["rp-clone0p2", "rp-clone0p1", "rp-clone0"] {
+            crate::unregister_block_device(name);
+        }
+        disk_policy::designate_root("rp-renamed7n1p2", rp_uuid(RP_ROOT_UUID))
+            .map_err(|_| "the root must be designated under any name")?;
+        if !rp_writes("rp-renamed7n1p2") {
+            return Err("the designated root must be writable");
+        }
+        // A clone appearing later revokes.
+        rp_register_disk("rp-clone0", "rp-clone0p1", "rp-clone0p2", RP_ROOT_UUID);
+        if rp_writes("rp-renamed7n1p2") || disk_policy::root_writable() {
+            return Err("a second device with the root UUID must revoke root writes");
+        }
+        if disk_policy::designate_root("rp-renamed7n1p2", rp_uuid(RP_ROOT_UUID))
+            != Err(PolicyError::Revoked)
+        {
+            return Err("a revoked designation must not be re-made");
+        }
+        for name in ["rp-clone0p2", "rp-clone0p1", "rp-clone0"] {
+            crate::unregister_block_device(name);
+        }
+
+        // Re-registration of the designated entry (same name, new device).
+        rp_reset(Some(DiskPolicy::RootRw), Some(Some(&root_arg)));
+        disk_policy::designate_root("rp-renamed7n1p2", rp_uuid(RP_ROOT_UUID))
+            .map_err(|_| "fresh designation failed")?;
+        let entry = crate::block_devices()
+            .into_iter()
+            .find(|e| e.name == "rp-renamed7n1p2")
+            .ok_or("root missing")?;
+        crate::registry::register_partition_device(
+            "rp-renamed7n1p2",
+            "rp-renamed7n1",
+            Arc::new(VecBlock {
+                data: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(alloc::vec![0u8; 4096])),
+                lba_size: 512,
+            }),
+            entry.partition.clone(),
+        );
+        if rp_writes("rp-renamed7n1p2") || entry.dev.write(1, 1, &[0u8; 512]).is_ok() {
+            return Err("re-registering the designated device must revoke its writes");
+        }
+        Ok(())
+    })();
+    rp_finish(&names, result)
+}
+kernel_test_in!(
+    "block/disk_policy",
+    smoke_block_disk_policy_root_follows_identity_not_names
+);
+
+/// Refusals: a missing / repeated / malformed root=, the wrong policy, an
+/// ESP, and (root-rw) a non-btrfs root all leave everything read-only.
+fn smoke_block_disk_policy_root_refusals() -> TestResult {
+    use crate::disk_policy::{self, DiskPolicy, PolicyError};
+    use crate::partition::PartitionBlockDevice;
+    use crate::registry::{register_partition_device, PartitionMetadata};
+    use alloc::sync::Arc;
+    let names = ["rp-ref0p1", "rp-ref0p2", "rp-ref0p3", "rp-ref0"];
+    let root_arg = alloc::format!("UUID={RP_ROOT_UUID}");
+    let bytes = rp_register_disk("rp-ref0", "rp-ref0p1", "rp-ref0p2", RP_ROOT_UUID);
+    let result = (|| {
+        let uuid = rp_uuid(RP_ROOT_UUID);
+        // A missing root.
+        rp_reset(Some(DiskPolicy::RootRw), Some(None));
+        if disk_policy::designate_root("rp-ref0p2", uuid) != Err(PolicyError::NoRootUuidArg)
+            || disk_policy::automount_allowed("rp-ref0p2")
+        {
+            return Err("without root=UUID= nothing may be designated or auto-mounted");
+        }
+        rp_reset(Some(DiskPolicy::RootRw), Some(Some("PARTLABEL=root")));
+        if disk_policy::designate_root("rp-ref0p2", uuid) != Err(PolicyError::NoRootUuidArg) {
+            return Err("root= must be a UUID under root policies");
+        }
+        // The wrong policy.
+        for policy in [DiskPolicy::All, DiskPolicy::BootOnly] {
+            rp_reset(Some(policy), Some(Some(&root_arg)));
+            if disk_policy::designate_root("rp-ref0p2", uuid) != Err(PolicyError::NotRootPolicy) {
+                return Err("all/boot-only must refuse a root designation");
+            }
+        }
+        // A root= that names no registered device.
+        rp_reset(Some(DiskPolicy::RootRw), Some(Some(&root_arg)));
+        if disk_policy::designate_root("rp-no-such-dev", uuid) != Err(PolicyError::NoSuchDevice) {
+            return Err("an unregistered name must be refused");
+        }
+        // The partition metadata claims the UUID but the device does not.
+        {
+            let mut b = bytes.lock();
+            let base = RP_ROOT.0 as usize * 512 + 65536;
+            b[base + 32] ^= 0xFF;
+        }
+        if disk_policy::designate_root("rp-ref0p2", uuid) != Err(PolicyError::IdentityMismatch) {
+            return Err("the UUID must be re-read from the device");
+        }
+        {
+            let mut b = bytes.lock();
+            let base = RP_ROOT.0 as usize * 512 + 65536;
+            b[base + 32] ^= 0xFF;
+        }
+        // An ESP-typed partition carrying the UUID.
+        let whole = crate::find_block_device("rp-ref0").ok_or("disk missing")?;
+        let meta = |type_guid: &str| PartitionMetadata {
+            gpt_type_guid: type_guid.into(),
+            partlabel: alloc::string::String::new(),
+            partuuid: alloc::string::String::new(),
+            fs_uuid: RP_ROOT_UUID.into(),
+        };
+        crate::unregister_block_device("rp-ref0p2");
+        register_partition_device(
+            "rp-ref0p3",
+            "rp-ref0",
+            Arc::new(PartitionBlockDevice::new(
+                whole.clone(),
+                RP_ROOT.0,
+                RP_ROOT.1,
+            )),
+            Some(meta(crate::registry::GPT_EFI_SYSTEM_PARTITION_TYPE_GUID)),
+        );
+        if disk_policy::designate_root("rp-ref0p3", uuid) != Err(PolicyError::EfiOrVfat) {
+            return Err("an ESP must never be designated");
+        }
+        crate::unregister_block_device("rp-ref0p3");
+        // root-rw on a non-btrfs filesystem: an ext superblock with the UUID.
+        {
+            let mut b = bytes.lock();
+            let base = RP_ROOT.0 as usize * 512;
+            b[base + 65536 + 64..base + 65536 + 72].fill(0);
+            b[base + 1024 + 0x38..base + 1024 + 0x3a].copy_from_slice(&[0x53, 0xEF]);
+            b[base + 1024 + 0x68..base + 1024 + 0x78].copy_from_slice(&uuid);
+        }
+        register_partition_device(
+            "rp-ref0p2",
+            "rp-ref0",
+            Arc::new(PartitionBlockDevice::new(whole, RP_ROOT.0, RP_ROOT.1)),
+            Some(meta("0FC63DAF-8483-4772-8E79-3D69D8477DE4")),
+        );
+        if disk_policy::designate_root("rp-ref0p2", uuid) != Err(PolicyError::NotBtrfs) {
+            return Err("root-rw must refuse a non-btrfs root");
+        }
+        for name in names {
+            if rp_writes(name) {
+                return Err("a refused designation must leave every disk read-only");
+            }
+        }
+        // root-ro may designate it (it never writes).
+        rp_reset(Some(DiskPolicy::RootRo), Some(Some(&root_arg)));
+        disk_policy::designate_root("rp-ref0p2", uuid)
+            .map_err(|_| "root-ro may mount a non-btrfs root read-only")?;
+        Ok(())
+    })();
+    rp_finish(&names, result)
+}
+kernel_test_in!("block/disk_policy", smoke_block_disk_policy_root_refusals);
+// ── Flush / FUA forwarding ─────────────────────────────────────────
+
+/// Disk that records what reaches it: plain writes, FUA writes (with their
+/// absolute LBA) and flushes; reports a volatile cache with native FUA.
+struct FlushProbe {
+    writes: core::sync::atomic::AtomicU64,
+    fua_lba: core::sync::atomic::AtomicU64,
+    fua_writes: core::sync::atomic::AtomicU64,
+    flushes: core::sync::atomic::AtomicU64,
+    fail_flush: bool,
+}
+
+impl FlushProbe {
+    fn new(fail_flush: bool) -> alloc::sync::Arc<Self> {
+        use core::sync::atomic::AtomicU64;
+        alloc::sync::Arc::new(Self {
+            writes: AtomicU64::new(0),
+            fua_lba: AtomicU64::new(u64::MAX),
+            fua_writes: AtomicU64::new(0),
+            flushes: AtomicU64::new(0),
+            fail_flush,
+        })
+    }
+    fn get(c: &core::sync::atomic::AtomicU64) -> u64 {
+        c.load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl crate::BlockDeviceSync for FlushProbe {
+    fn lba_size(&self) -> u32 {
+        512
+    }
+    fn capacity(&self) -> u64 {
+        64
+    }
+    fn read(&self, _lba: u64, _n: u16, _out: &mut [u8]) -> Result<(), crate::BlockIoError> {
+        Ok(())
+    }
+    fn write(&self, _lba: u64, _n: u16, _data: &[u8]) -> Result<(), crate::BlockIoError> {
+        self.writes
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+    fn write_fua(&self, lba: u64, _n: u16, _data: &[u8]) -> Result<(), crate::BlockIoError> {
+        self.fua_lba
+            .store(lba, core::sync::atomic::Ordering::Relaxed);
+        self.fua_writes
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+    fn flush(&self) -> Result<(), crate::BlockIoError> {
+        self.flushes
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if self.fail_flush {
+            Err(crate::BlockIoError::DriverError)
+        } else {
+            Ok(())
+        }
+    }
+    fn capabilities(&self) -> crate::BlockCaps {
+        crate::BlockCaps {
+            volatile_cache: true,
+            fua: true,
+        }
+    }
+}
+
+/// The policy guard and partitions forward flush, FUA writes and the cache
+/// capabilities; the guard forwards flush even while it refuses writes;
+/// SyncBlock carries `fua: true` and flush errors through.
+fn smoke_block_flush_and_fua_forwarding() -> TestResult {
+    use crate::disk_policy::{self, DiskPolicy};
+    use crate::partition::PartitionBlockDevice;
+    use crate::{find_block_device, register_block_device, register_partition_device};
+    use alloc::sync::Arc;
+    let probe = FlushProbe::new(false);
+    let raw: Arc<dyn crate::BlockDeviceSync> = probe.clone();
+    register_block_device("flt-disk0", raw.clone());
+    register_partition_device(
+        "flt-disk0p1",
+        "flt-disk0",
+        Arc::new(PartitionBlockDevice::new(raw, 10, 20)),
+        None,
+    );
+    disk_policy::__set_policy_for_test(Some(DiskPolicy::BootOnly));
+    disk_policy::__reset_trust_for_test();
+    let result = (|| -> Result<(), &'static str> {
+        let disk = find_block_device("flt-disk0").ok_or("disk missing")?;
+        let part = find_block_device("flt-disk0p1").ok_or("partition missing")?;
+        let block = [0u8; 512];
+        // Read-only under boot-only: data writes refused, flush forwarded.
+        if part.write_fua(1, 1, &block).is_ok() || disk.write_fua(1, 1, &block).is_ok() {
+            return Err("guard let a FUA write through on an untrusted disk");
+        }
+        if FlushProbe::get(&probe.fua_writes) != 0 {
+            return Err("a refused FUA write reached the disk");
+        }
+        if disk.flush().is_err() || part.flush().is_err() || FlushProbe::get(&probe.flushes) != 2 {
+            return Err("guard / partition did not forward flush");
+        }
+        let caps = part.capabilities();
+        if !caps.volatile_cache || !caps.fua {
+            return Err("capabilities not forwarded");
+        }
+        // Writable: FUA reaches the disk at the partition-relative offset.
+        disk_policy::__set_policy_for_test(Some(DiskPolicy::All));
+        if part.write_fua(3, 1, &block).is_err()
+            || FlushProbe::get(&probe.fua_writes) != 1
+            || FlushProbe::get(&probe.fua_lba) != 13
+        {
+            return Err("partition FUA write not forwarded at start + lba");
+        }
+        if part.write_fua(20, 1, &block).is_ok() {
+            return Err("partition FUA write past its end accepted");
+        }
+        Ok(())
+    })();
+    disk_policy::__set_policy_for_test(None);
+    crate::unregister_block_device("flt-disk0p1");
+    crate::unregister_block_device("flt-disk0");
+    if let Err(why) = result {
+        return TestResult::Fail(why);
+    }
+    // Default write_fua = write + flush; SyncBlock propagates flush errors.
+    struct Plain(Arc<FlushProbe>);
+    impl crate::BlockDeviceSync for Plain {
+        fn lba_size(&self) -> u32 {
+            512
+        }
+        fn capacity(&self) -> u64 {
+            64
+        }
+        fn read(&self, l: u64, n: u16, o: &mut [u8]) -> Result<(), crate::BlockIoError> {
+            self.0.read(l, n, o)
+        }
+        fn write(&self, l: u64, n: u16, d: &[u8]) -> Result<(), crate::BlockIoError> {
+            self.0.write(l, n, d)
+        }
+        fn flush(&self) -> Result<(), crate::BlockIoError> {
+            self.0.flush()
+        }
+    }
+    let p = FlushProbe::new(false);
+    let plain = Plain(p.clone());
+    if crate::BlockDeviceSync::write_fua(&plain, 0, 1, &[0u8; 512]).is_err()
+        || FlushProbe::get(&p.writes) != 1
+        || FlushProbe::get(&p.flushes) != 1
+        || crate::BlockDeviceSync::capabilities(&plain).fua
+    {
+        return TestResult::Fail("default write_fua is not write + flush");
+    }
+    let failing = crate::SyncBlock::new(FlushProbe::new(true));
+    let r = poll_ready_block(crate::BlockDevice::flush_result(&*failing));
+    if r != Some(Err(crate::BlockError::IOError)) {
+        return TestResult::Fail("SyncBlock::flush_result dropped the flush error");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block/flush", smoke_block_flush_and_fua_forwarding);
+
+fn poll_ready_block<F: core::future::Future>(fut: F) -> Option<F::Output> {
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(|d| RawWaker::new(d, &VTABLE), |_| {}, |_| {}, |_| {});
+    // SAFETY: VTABLE is a valid no-op vtable; the waker never escapes.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = core::pin::pin!(fut);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
+    }
+}

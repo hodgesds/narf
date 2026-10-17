@@ -59,8 +59,9 @@ pub use noop::NoopScheduler;
 pub use cgroup::{dev_id_from_ptr, install_cgroup_io_hook, IoCgroupHook};
 pub use registry::{
     block_device_count, block_devices, disk_of, find_block_device, find_block_device_indexed,
-    register_block_device, register_partition_device, unregister_block_device, BlockDeviceSync,
-    BlockIoError, RegisteredBlockDevice, SyncBlock,
+    find_by_fs_uuid, find_by_partuuid, find_disk_by_bus_path, identity_of, register_block_device,
+    register_block_device_with_identity, register_partition_device, unregister_block_device,
+    BlockCaps, BlockDeviceSync, BlockIoError, DiskIdentity, RegisteredBlockDevice, SyncBlock,
 };
 
 use core::future::Future;
@@ -94,6 +95,16 @@ pub trait BlockDevice: Send + Sync {
     /// Unsupported/no-op implementations resolve immediately; they must not
     /// return a permanently-pending future.
     fn flush(&self) -> impl Future<Output = ()> + Send;
+    /// [`Self::flush`] that reports failure, for callers that must not
+    /// proceed when the cache did not drain (btrfs `write_dev_flush` fails
+    /// the commit). The default runs `flush` and reports success.
+    fn flush_result(&self) -> impl Future<Output = Result<(), BlockError>> + Send {
+        let f = self.flush();
+        async move {
+            f.await;
+            Ok(())
+        }
+    }
     /// Advise the device that a range of blocks is no longer needed.
     fn discard(&self, range: LbaRange) -> impl Future<Output = ()> + Send;
 

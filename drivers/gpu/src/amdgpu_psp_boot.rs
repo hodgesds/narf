@@ -187,6 +187,9 @@ trait Io {
     fn write(&mut self, reg: u32, value: u32);
     fn write_mem(&mut self, offset: usize, value: u32);
     fn finish_upload(&mut self);
+    /// Monotonic milliseconds: the clock every wait here is bounded on, so a
+    /// model PSP's poll count, not host scheduling, decides its timeouts.
+    fn now_ms(&mut self) -> u64;
 }
 #[derive(Debug)]
 struct Mmio {
@@ -214,6 +217,9 @@ impl Io for Mmio {
         // SAFETY: last dword of the permanently owned, fully written mapping.
         unsafe { self.memory.read32(STAGING_SIZE as u64 - 4) };
         fence(Ordering::SeqCst);
+    }
+    fn now_ms(&mut self) -> u64 {
+        narf_time::wall::monotonic_ns() / 1_000_000
     }
 }
 #[derive(Debug)]
@@ -243,6 +249,9 @@ impl<I: Io> Engine<I> {
             .invoke(Op(|| f(io)))
             .map_err(|_| Error::Revoked)
     }
+    fn expired(&mut self, began: u64, ms: u64) -> bool {
+        self.io.now_ms().saturating_sub(began) >= ms
+    }
     fn heartbeat(&mut self) -> Result<u32, Error> {
         match self.access(|io| io.read(SOS))? {
             u32::MAX => Err(Error::DeviceGone),
@@ -255,7 +264,7 @@ impl<I: Io> Engine<I> {
         } else {
             1000
         };
-        let deadline = narf_time::Deadline::after_ms(timeout);
+        let began = self.io.now_ms();
         loop {
             let value = self.access(|io| io.read(STATUS))?;
             if value == u32::MAX {
@@ -268,11 +277,11 @@ impl<I: Io> Engine<I> {
                 }
                 // A persistent status at the deadline is still reported as
                 // the bootloader's rejection code for diagnostics.
-                if !self.psp11 || deadline.expired() {
+                if !self.psp11 || self.expired(began, timeout) {
                     // linux-lit: 0xffff=GFX_CMD_STATUS_MASK
                     return Err(Error::Rejected(value & 0xffff));
                 }
-            } else if deadline.expired() {
+            } else if self.expired(began, timeout) {
                 return Err(Error::Timeout);
             }
             delay(1).await;
@@ -281,13 +290,13 @@ impl<I: Io> Engine<I> {
     async fn alive(&mut self) -> Result<(), Error> {
         // A nonzero but frozen register is insufficient proof that SOS boots.
         let initial = self.heartbeat()?;
-        let deadline = narf_time::Deadline::after_ms(1000);
+        let began = self.io.now_ms();
         loop {
             let value = self.heartbeat()?;
             if value != 0 && value != initial {
                 return Ok(());
             }
-            if deadline.expired() {
+            if self.expired(began, 1000) {
                 return Err(Error::Timeout);
             }
             delay(1).await;

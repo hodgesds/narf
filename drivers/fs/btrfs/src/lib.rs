@@ -21,7 +21,6 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 use narf_block::{BlockDeviceSync, SyncBlock};
-use narf_driver_runtime::DomainId;
 use narf_filesystem::{FsError, FsInstance};
 
 pub mod allocator;
@@ -29,16 +28,20 @@ pub(crate) mod block_group;
 pub mod btree;
 pub mod checksum;
 pub mod chunk;
+pub mod crash_check;
 pub mod csum;
 pub mod decompress_cache;
 pub mod dir;
 pub mod extent;
 pub mod format;
 pub mod inode;
+pub mod interop;
 pub mod lzo;
 pub mod mount_opts;
 pub mod node;
+pub mod registry;
 pub mod roots;
+pub mod rw_gate;
 pub mod volume;
 pub mod write;
 
@@ -59,22 +62,22 @@ pub fn register_initcalls() {
         register_fstypes();
         InitResult::Ok
     });
+    crash_check::register();
 }
 
 /// Root auto-mount factory: mount the btrfs volume on a synchronously-bridged
 /// block device.
 fn btrfs_factory(dev: Arc<dyn BlockDeviceSync>) -> Result<Arc<dyn FsInstance>, FsError> {
-    let devices = discover_members(dev);
-    let volume = narf_scheduler::block_on(volume::BtrfsVolume::mount_devices(
-        devices,
-        DomainId::DRIVER_0,
-    ))?;
+    let devices = discover_members(dev.clone());
+    let volume = narf_scheduler::block_on(registry::mount(&dev, devices, None, false))?;
     Ok(volume)
 }
 
 /// Put the requested source first, then offer every other registered block
 /// device to the FSID/devid-aware mount path. Foreign filesystems are ignored.
-fn discover_members(source: Arc<dyn BlockDeviceSync>) -> alloc::vec::Vec<Arc<SyncBlock>> {
+pub(crate) fn discover_members(
+    source: Arc<dyn BlockDeviceSync>,
+) -> alloc::vec::Vec<Arc<SyncBlock>> {
     let mut devices = alloc::vec![SyncBlock::new(source.clone())];
     for entry in narf_block::block_devices() {
         // `narf.disks=boot-only`: never pull a disk other than the boot
@@ -117,27 +120,25 @@ fn btrfs_fstype_builder(
     let source = request.source;
     let name = source.strip_prefix("/dev/").unwrap_or(source);
     let dev = narf_block::find_block_device(name).ok_or(FsError::NotFound)?;
-    let devices = discover_members(dev);
+    let devices = discover_members(dev.clone());
     // A read-only request really mounts read-only: no log replay, no commit
-    // timer, no device write.
-    let volume = if request.read_only || options.read_only {
-        wait_mount(async {
-            let volume =
-                volume::BtrfsVolume::mount_devices_read_only(devices, DomainId::DRIVER_0, true)
-                    .await?;
-            if let Some(selector) = &options.subvol {
-                volume.switch_to_subvol(selector).await?;
-            }
-            Ok::<_, FsError>(volume)
-        })?
-    } else {
-        wait_mount(volume::BtrfsVolume::mount_subvol_devices(
-            devices,
-            DomainId::DRIVER_0,
-            true,
-            options.subvol.clone(),
-        ))?
-    };
+    // timer, no device write. Every mount of one filesystem is a view over one
+    // shared instance (see `registry`), whatever subvolume it selects.
+    let read_only = request.read_only || options.read_only;
+    let volume = wait_mount(registry::mount(
+        &dev,
+        devices,
+        options.subvol.clone(),
+        read_only,
+    ))?;
+    // A read-write request that cannot be honoured — the device is read-only
+    // under `narf.disks=`, or the write-safety gate (`rw_gate`) refused — fails
+    // with EROFS rather than handing back a read-only volume behind an `rw`
+    // mount. libmount then retries with MS_RDONLY, as it does for a
+    // write-protected disk on Linux, and mountinfo stays truthful.
+    if !read_only && volume.is_read_only() {
+        return Err(FsError::ReadOnly);
+    }
     volume.set_mount_options(options);
     Ok(volume)
 }

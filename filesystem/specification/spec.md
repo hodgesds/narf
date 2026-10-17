@@ -1470,7 +1470,10 @@ Under `narf.disks=boot-only` (`narf_block::disk_policy`) `try_mount_root*`,
 `try_mount_efi_system_partition` and `root_mount::automount_devices()` (the
 `/mnt` ext walk) consider only the identified boot medium; when that leaves
 nothing they return `RootMountError::BootOnly`. An explicit `root=` naming
-another disk is refused the same way.
+another disk is refused the same way. Under `narf.disks=root-ro|root-rw` they
+consider only the `root=UUID=` candidate, then the designated root
+(`disk_policy::designate_root`, called before the filesystem is built) and
+vfat partitions on its disk; vfat volumes report `always_read_only` there.
 
 `root_mount::try_mount_efi_system_partition()` attaches one FAT filesystem at
 both NARF's `/boot` and `/mnt/boot`, which is visible as `/boot` to the installed

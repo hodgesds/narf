@@ -81,6 +81,9 @@ impl<B: BlockDevice + 'static> FsInstance for FatMount<B> {
     fn name(&self) -> &str {
         self.0.name()
     }
+    fn always_read_only(&self) -> bool {
+        self.0.always_read_only()
+    }
 }
 
 /// FAT Version

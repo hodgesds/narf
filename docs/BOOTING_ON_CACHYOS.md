@@ -229,9 +229,10 @@ cargo xtask disk-write --iso target/narf-x86_64-usb.img \
 ```
 
 `disk-write` refuses non-USB targets, asks for confirmation, and verifies the
-written bytes after a replug. On this host the internal disks are `nvme0n1`
-(CachyOS), `nvme1n1` and the SATA disk `sda`. None of them is ever a valid
-`--device`.
+written bytes after a replug. On this host the internal disks are the two
+NVMe drives (the Sabrent data disk at `04:00.0` and the WD SN770 CachyOS disk
+at `07:00.0`; Linux names them `nvme0n1` / `nvme1n1` in either order, varying
+per boot) and the SATA disk `sda`. None of them is ever a valid `--device`.
 
 **What to expect on screen.** While the card boots, every Navi22 stage prints
 `start`, then `complete` or `failed <error>`. The cold boot ends with
@@ -296,7 +297,8 @@ A fatal CPU exception is not saved.
     `BootOnly` (`/` comes from the initramfs);
   - `efi-system-partition-mount`, which therefore never mounts the CachyOS ESP
     at `/boot`;
-  - `mnt-mount-ext2`, which never mounts `nvme1n1p2` at `/mnt`.
+  - `mnt-mount-ext2`, which never mounts an internal ext4 (such as the
+    Sabrent `nvme0n1p2`) at `/mnt`.
 
   The btrfs member discovery skips unidentified disks too. The btrfs disk
   smokes additionally need `narf.btrfs_smoke`, which only xtask's own test
@@ -310,9 +312,10 @@ A fatal CPU exception is not saved.
   - **FAT:** a mount never writes (there is no dirty-bit or FSInfo update at
     mount). Writes happen only through file operations, which the guard
     refuses.
-- **The NVMe passthrough is closed.** `/dev/nvme0` admin and I/O passthrough
-  ioctls (Format, Sanitize, firmware commit, raw writes) and writes are refused
-  unless the NVMe disk is the stick. Only the namespace-id query is answered.
+- **The NVMe passthrough is closed.** On every controller node `/dev/nvme<C>`,
+  admin and I/O passthrough ioctls (Format, Sanitize, firmware commit, raw
+  writes) and writes are refused unless every namespace of that controller is
+  the stick. Only the namespace-id query is answered.
 
 Limits. Exactly what this does and does not cover:
 
@@ -343,11 +346,19 @@ Limits. Exactly what this does and does not cover:
   superblock repair would still run there. On every other disk the device
   itself is read-only, so this does not arise.
 - **Current hardware coverage on this host.**
-  - NVMe: NARF drives one NVMe controller, the first it enumerates
-    (`04:00.0`, the CachyOS disk `nvme0n1`), as `nvme0`. Its standard
-    128-entry GPT is partition-scanned, so `nvme0p1` (the ESP) and
-    `nvme0p2` (btrfs root) are registered, read-only. The second controller
-    (`07:00.0`, `nvme1n1`) is not driven at all.
+  - NVMe: NARF drives every NVMe controller, numbered in PCI order: on this
+    host `nvme0` is `04:00.0` (Sabrent data disk) and `nvme1` is `07:00.0`
+    (WD SN770, the CachyOS disk). Every active namespace is registered as
+    `nvme<C>n<N>` and partition-scanned, so `nvme0n1p1`, `nvme0n1p2` (ext4
+    data), `nvme1n1p1` (the ESP) and `nvme1n1p2` (btrfs root) are all
+    registered, read-only.
+  - **Names are not identity.** A controller that fails to probe, a moved
+    drive or a firmware that enumerates differently shifts every later name.
+    Identify disks by filesystem UUID or PARTUUID (`/dev/disk/by-uuid`,
+    `/dev/disk/by-partuuid`) or by hardware identity (`/dev/disk/by-id/
+    nvme-<model>_<serial>`, `nvme-<wwid>`, `/dev/disk/by-path/
+    pci-0000:07:00.0-nvme-1`); the boot log prints each namespace's PCI
+    address, model, serial and WWID (`nvme: nvme1 (0000:07:00.0, ...)`).
   - SATA: the AHCI driver binds any AHCI-class controller (`01:06:01`), as
     Linux does, so the AMD 600-series controller (`1022:43f6`) and `sda`
     are driven as `sata0`, with any partitions as `sata0p<n>`, all
@@ -355,9 +366,132 @@ Limits. Exactly what this does and does not cover:
     Intel ICH9.
   - Probing these disks only reads. Controller setup (NVMe queue creation,
     the AHCI HBA reset and SATA link reset) does not change media.
-- **Testing.** This is validated in QEMU (block-layer model tests, ext and
-  btrfs read-only mount tests, and the `usb-image --qemu` decoy hashes). It has
+  - On reboot and power-off NARF sends every NVMe controller a Flush (when
+    it has a volatile write cache) and then the CC.SHN normal-shutdown
+    notification, as Linux does (`nvme: nvme<C>: flushed ... CC.SHN normal
+    shutdown: Complete`). Neither carries data or changes media contents.
+- **Testing.** This is validated in QEMU (block-layer model tests, a
+  two-controller NVMe model and a two-controller QEMU run, ext and btrfs
+  read-only mount tests, and the `usb-image --qemu` decoy hashes with two
+  NVMe decoys and a SATA decoy). It has
   not been validated on hardware.
+
+### Booting the installed root (`narf.disks=root-ro` / `root-rw`)
+
+Two more policies boot the host's own CachyOS root (systemd as PID 1)
+instead of NARF's userspace. Both name the root only by filesystem UUID, never
+by a device name:
+
+```sh
+# Read-only root, writable tmpfs overlay (nothing on any disk is written):
+cargo xtask grub-image --root-policy root-ro \
+  --root-uuid 653602c3-cd42-420e-95ef-4c4033d17b56
+# Real read-write to the btrfs root ONLY:
+cargo xtask grub-image --root-policy root-rw \
+  --root-uuid 653602c3-cd42-420e-95ef-4c4033d17b56
+```
+
+Each command emits `narf.disks=<mode> root=UUID=<uuid> rootflags=subvol=/@
+systemd_pid1` (`--rootflags` changes the subvolume). Without `--root-policy`,
+grub-image still writes `boot-only`.
+
+- **Nothing is writable until the root is designated.** Root mounting
+  matches `root=UUID=` and calls `designate_root` before the filesystem is
+  built. The designation re-reads the UUID from the partition's own
+  superblock and requires exactly one `root=` on the command line. It is
+  refused for a UUID carried by two devices (a cloned disk, a multi-device
+  btrfs), a whole disk, an ESP or vfat partition and, under `root-rw`,
+  anything that is not btrfs. It can happen once per boot. If the root device
+  is removed or re-registered, or a second device with its UUID appears, the
+  designation is revoked and every disk stays read-only for the rest of the
+  boot.
+- **Banners.** At policy resolution:
+  `disks: POLICY narf.disks=root-rw: ONLY the partition whose filesystem UUID
+  matches root=UUID=... will be WRITABLE; every other disk and partition (its
+  ESP included) is read-only`. At designation:
+  `disks: WRITABLE: <dev> (btrfs UUID ...) is the ONLY writable device`.
+  Under `root-ro` the second banner says `designated READ-ONLY ... NOTHING is
+  writable`.
+- **`root-rw` writes exactly one partition.** Only the designated root
+  partition's block-layer guard passes writes. Every other disk and
+  partition is refused: the SN770's whole-disk device and its ESP
+  (`6D89-28C5`, which may be mounted read-only), the Sabrent, `sda`, and the
+  `/dev/nvme<C>` passthrough nodes. vfat filesystems also report themselves
+  read-only to the VFS under both root policies, so they mount `ro`.
+- **The boot stops visibly, never degrades.** A failed `root=` mount under
+  either root policy prints `root-mount: narf.disks=... ROOT MOUNT FAILED:
+  <reason>; NOT falling back` plus the btrfs refusal line. It does not fall
+  back to the initramfs or another disk.
+- **btrfs write-safety gate.** This mirrors Linux `open_ctree` /
+  `btrfs_check_features`. Before anything can write (log replay included),
+  a read-write btrfs mount is refused and logged as
+  `btrfs <uuid>: REFUSING read-write mount: <reason>` when any of these hold:
+  - an incompat or compat_ro bit outside what the writer maintains;
+  - a free-space tree without its valid bit (or BGT without FST);
+  - no free-space tree on non-mixed block groups;
+  - `BTRFS_SUPER_FLAG_ERROR` or any superblock flag besides `WRITTEN`
+    (seeding, metadump, fsid or csum change in progress);
+  - generation 0;
+  - a balance item, reloc roots, or a started or suspended device replace.
+
+  Under `root-rw` the gate also requires one device, crc32c, 4 KiB sectors,
+  a power-of-two nodesize of 4–64 KiB, a valid free-space tree and an empty
+  log tree (`log_root == 0`; mount once on Linux to replay a dirty log). Its
+  incompat set is limited to `MIXED_BACKREF DEFAULT_SUBVOL COMPRESS_LZO
+  COMPRESS_ZSTD BIG_METADATA EXTENDED_IREF SKINNY_METADATA NO_HOLES` and its
+  compat_ro set to `FREE_SPACE_TREE FREE_SPACE_TREE_VALID BLOCK_GROUP_TREE`.
+- **One writer per filesystem.** Every btrfs mount of an fsid is a view of
+  one shared core: one transaction, one allocator, one superblock commit. So
+  under `root-rw` all seven fstab subvolumes (`/`, `/home`, `/root`, `/srv`,
+  `/var/cache`, `/var/tmp`, `/var/log`) are writable together. The gate
+  runs once per core. A read-write mount of a refused core fails with `EROFS`,
+  which `mount(8)` retries read-only. Every other fsid and device stays
+  read-only at the block layer.
+- **Status on this host.** The CachyOS root has compat_ro `0xb`
+  (`FREE_SPACE_TREE FREE_SPACE_TREE_VALID BLOCK_GROUP_TREE`) and incompat
+  `0x371`, and the writer maintains all of it, block-group tree included, so
+  `root-rw` writes it. The gate refuses only if the superblock read at boot
+  shows a pending log tree (an unclean Linux shutdown), an error flag, or a
+  running balance or replace. Compare with the real superblock using `sudo
+  btrfs inspect-internal dump-super
+  /dev/disk/by-uuid/653602c3-cd42-420e-95ef-4c4033d17b56`.
+- **What the writer does to a CachyOS volume.**
+  - New data is written uncompressed, which is valid under
+    `compress=zstd:1`.
+  - Touched zstd/LZO extents are rewritten uncompressed.
+  - `chattr +C` journals (`NODATASUM`) get no checksums.
+  - Freed extents' checksums are removed from Linux's merged csum items.
+  - Data goes to DATA block groups and tree blocks to METADATA ones.
+  - The free-space tree is maintained.
+  - The v1 space cache is invalidated by the generation bump.
+  - `discard=async` is accepted and ignored (NARF never discards).
+  - Options that would change unmaintained state (`clear_cache`,
+    `space_cache=v1`, `nodatasum`, `rescue=`, `degraded`, `device=`) are
+    refused.
+- **Interop test.** `cargo xtask btrfs-rootrw-interop` builds a CachyOS-shaped
+  image unprivileged and boots it under `root-rw`. The image has GPT, an ESP,
+  btrfs with nodesize 16K, crc32c, FST, no-holes, `--compress zstd:1`, the
+  seven `@` subvolumes and `+C` journals. It is built twice, with the host's
+  exact flags (block-group tree) and without them. Each image gets four
+  boots:
+  - `@`: pacman db add and remove, `/etc/hostname` replace, a zstd-file
+    overwrite, an unlink;
+  - `@home`;
+  - `@log`: journal append, rotate and vacuum;
+  - `fstab`: all six other subvolumes mounted rw through the shared core and
+    written.
+
+  After each boot the test requires host `btrfs check --readonly
+  --check-data-csum` to be clean and the GPT and ESP to be byte-identical. At
+  the end, `btrfs restore` content must match in all seven subvolumes.
+  `--bgt=refused` checks the opposite case (a writer without BGT support).
+  `cargo xtask btrfs-crash-smoke [--bgt]` checks fsync durability across a
+  SIGKILL. A host `mount -o loop,ro` runs only with passwordless sudo.
+- **Before a real `root-rw` boot**, take a read-only snapshot on CachyOS
+  (`sudo btrfs subvolume snapshot -r / /.snapshots/pre-narf`) and keep a
+  backup of `/home`. Shut NARF down cleanly (`sync`, then power off). Back on
+  CachyOS, run `sudo btrfs scrub start -B /` and check `dmesg` for btrfs
+  errors.
 
 ## Storage encryption and LUKS
 

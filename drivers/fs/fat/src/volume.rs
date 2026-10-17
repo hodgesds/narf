@@ -482,6 +482,15 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
 }
 
 impl<B: BlockDevice + 'static> FsInstance for FatVolume<B> {
+    /// Under `narf.disks=root-ro|root-rw` every vfat filesystem (the ESP
+    /// included) stays read-only for the whole boot: report it, so the VFS
+    /// refuses writes with EROFS and mountinfo says `ro`. (Under `boot-only`
+    /// the boot medium becomes writable once identified, so the mount-time
+    /// answer would go stale; the block layer guard covers that case.)
+    fn always_read_only(&self) -> bool {
+        narf_block::disk_policy::policy().is_root_policy() && self.device.is_read_only()
+    }
+
     fn root(&self) -> Arc<dyn DirOps> {
         let first_cluster = if self.version == super::FatVersion::Fat32 {
             self.fat32_ext.as_ref().unwrap().root_clus
