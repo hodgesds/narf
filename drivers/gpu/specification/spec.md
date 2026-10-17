@@ -2975,11 +2975,17 @@ payload addresses are GPU MC addresses. TMR's additional physical address is
 the host PCI BAR address is never substituted.
 
 `start().await` uses the same bounded PF GPCOM wire protocol and 20 ms handshake
-as the Phoenix transport. `setup_tmr_navi22(&amdgpu_psp_boot::Firmware).await`
+as the Phoenix transport; every PSP11/13/14 ring is created with
+`PSP_RING_TYPE__KM << 16` (`GFX_CTRL_CMD_ID_INIT_GPCOM_RING`, 0x00020000).
+`setup_tmr_navi22(&amdgpu_psp_boot::Firmware).await` is `psp_tmr_init`: it
 uses `Image::toc()` from the validated SOS container, submits `LOAD_TOC`, and
-allocates the PSP-reported TMR size (nonzero, page-aligned, at most 64 MiB).
+reserves the PSP-reported TMR size (nonzero, page-aligned, at most 64 MiB).
 Containers without a TOC use PSP11's 4 MiB default. TMR allocations are aligned
-to 1 MiB; `SETUP_TMR` carries both GPU and GPU-physical addresses with flags=2.
+to 1 MiB. MP0 11.0.11 has PMFW-centralized C-state management, so `SETUP_TMR`
+(GPU and GPU-physical addresses, flags=2) is sent by `load_smc_navi22` right
+after PMFW loads (`psp_hw_start`). Fence waits are bounded at 2 s
+(`psp_cmd_submit_buf`); on Navi22 a nonzero response status is logged, not
+fatal, except for `DESTROY_TMR`.
 Readiness requires a successful matching-fence completion. TOC staging is
 released only after completion or verified ring destruction; uncertain TMR
 installation retains the reservation and prevents retry. `unsafe stop().await`
@@ -3003,9 +3009,10 @@ of microcode. It exposes `payload()`, `version()` and optional `powerplay()`;
 the SRAM start address is metadata, never a host/GPU DMA address. Structural
 validation does not authenticate the image or select board power policy.
 
-`Psp::load_smc_navi22(&Firmware).await` requires a Navi22 ring with acknowledged
-TMR setup. It stages only the microcode and submits `LOAD_IP_FW` (6), firmware
-type SMU (18), using the GPU address and exact payload length. Matching-fence
+`Psp::load_smc_navi22(&Firmware).await` requires a Navi22 ring with `LOAD_TOC`
+done and the TMR reserved but not yet set up. It stages only the microcode and
+submits `LOAD_IP_FW` (6), firmware type SMU (18), using the GPU address and
+exact payload length, then `SETUP_TMR`. Matching-fence
 completion releases staging; missing completion retains device-owned memory.
 SMC loading is attempted once per session: success, failure or cancellation
 all prevent another upload. Verified stop/reset is required before a new
@@ -3201,8 +3208,12 @@ consumer uses these translations; this stage alone does not prove GPU access.
 all-invalid user root page (no I/O). `unsafe enable_gart().await` requires a
 `Ready` hub owner and no running queues: it zeroes the table, carries the two
 boot `Aperture` pages into GART pages 0/1, and repoints VMID0 on both hubs at a
-512 MiB GART (`gmc_v10_0_mc_init` size) starting at the boot aperture, directly
-above VRAM; the range may not cross 4 GiB or reach the MC hole. It then applies
+512 MiB GART (`gmc_v10_0_mc_init` size) starting at the boot aperture, which
+`Gmc::initialize` already placed at Linux's `amdgpu_gmc_gart_location`
+BEST_FIT start (MC 0 below this board's 0x80_0000_0000 FB); the range may not
+cross 4 GiB, overlap the FB or reach the MC hole. The FB end is
+`fb_start + MEMSIZE`; `FB_LOCATION_TOP` is not consulted and an inherited
+VMID0 context is reprogrammed (contexts 1–15 must be off). It then applies
 `setup_vmid_config` to contexts 1–15 (`CONTEXT1_CNTL` 0x555407: depth 3, block
 size 9, no retry, all default-page faults; table range 0..`max_pfn`-1) with
 their base on the empty root, and invalidates VMID0. `gart()` returns
@@ -3691,11 +3702,18 @@ returns its `Handle`. `Stage::InterruptTest` fails the boot only on device
 loss or revoked authority. Other failures are printed as `degraded` and
 retained in `Report::interrupts` (`Status::proof`); delivery stays on
 watchdog/polling. This places `DmubQuiesce`
-before any PSP DMCUB upload and `DmubStart` after memory-hub/SDMA startup.
-`DmubStart` includes the runtime version/capability handshake above.
+before any PSP DMCUB upload and `DmubStart` after `FenceInterrupts`, before the
+media stages. `DmubStart` (using the GMC-validated `fb_start`/FB offset, as
+`dm_dmub_hw_init`'s `soc_fb_info`) includes the runtime version/capability
+handshake above; it fails the boot only on device loss or revoked authority,
+otherwise it prints `degraded` and the owner stays `Failed`.
+`Stage::GoldenSettings` (after `Interrupts`, before `SdmaTest`) applies
+`Gfx::golden()` (golden_settings_gc_10_3_2) ahead of SDMA as Linux's GFX
+hw_init does; `GfxSetup` then skips them, and `GfxRing` ends with
+`gfx_v10_3_set_power_brake_sequence`.
 `ColdBoot::prepare_queues(doorbells)` reserves the GFX, KIQ/compute and both
 SDMA queue owners after memory hubs and the SDMA proof; production boot calls it
-when BAR2 maps. After `DmubStart` the stages `Doorbells`, `GfxSetup`, `Kiq`,
+when BAR2 maps. After `InterruptTest` the stages `Doorbells`, `GfxSetup`, `Kiq`,
 `ComputeQueues`, `GfxRing`, `SdmaQueues` and `IbTests` follow Linux's
 `nv_common_hw_init`, `gfx_v10_0_hw_init`/`cp_resume`, `sdma_v5_2_start` and
 `amdgpu_ib_ring_tests` order; `Report::queues` is set only when all pass and
