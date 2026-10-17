@@ -11228,3 +11228,221 @@ fn files_intact_blocking(dir: &Arc<dyn narf_filesystem::DirOps>, prefix: &str, c
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_shared_instance_nvme);
+
+// ── Commit durability: write_all_supers ordering and failure ───────
+
+/// One device operation, as the commit issued it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DevOp {
+    Write { lba: u64, n: u16 },
+    WriteFua { lba: u64, n: u16 },
+    Flush,
+}
+
+/// A volatile-cache, native-FUA device over a [`WritableSparseDevice`] that
+/// records every write, FUA write and flush in order, and can be told to
+/// fail flushes.
+#[derive(Debug)]
+struct RecordingDevice {
+    inner: Arc<WritableSparseDevice>,
+    log: narf_lib::sync::IrqSafeSpinLock<Vec<DevOp>>,
+    fail_flush: core::sync::atomic::AtomicBool,
+}
+
+impl narf_block::BlockDeviceSync for RecordingDevice {
+    fn lba_size(&self) -> u32 {
+        self.inner.lba_size()
+    }
+    fn capacity(&self) -> u64 {
+        self.inner.capacity()
+    }
+    fn read(&self, lba: u64, n: u16, out: &mut [u8]) -> Result<(), narf_block::BlockIoError> {
+        self.inner.read(lba, n, out)
+    }
+    fn write(&self, lba: u64, n: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        self.log.lock().push(DevOp::Write { lba, n });
+        self.inner.write(lba, n, data)
+    }
+    fn write_fua(&self, lba: u64, n: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        self.log.lock().push(DevOp::WriteFua { lba, n });
+        self.inner.write(lba, n, data)
+    }
+    fn flush(&self) -> Result<(), narf_block::BlockIoError> {
+        if self.fail_flush.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(narf_block::BlockIoError::DriverError);
+        }
+        self.log.lock().push(DevOp::Flush);
+        Ok(())
+    }
+    fn capabilities(&self) -> narf_block::BlockCaps {
+        narf_block::BlockCaps {
+            volatile_cache: true,
+            fua: true,
+        }
+    }
+}
+
+fn recording(sparse: &[u8]) -> Arc<RecordingDevice> {
+    Arc::new(RecordingDevice {
+        inner: writable_sparse(sparse),
+        log: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
+        fail_flush: core::sync::atomic::AtomicBool::new(false),
+    })
+}
+
+fn mount_recording(
+    dev: &Arc<RecordingDevice>,
+) -> Result<Arc<BtrfsVolume<narf_block::SyncBlock>>, FsError> {
+    let async_dev = narf_block::SyncBlock::new(dev.clone() as Arc<dyn narf_block::BlockDeviceSync>);
+    poll_once(BtrfsVolume::mount(async_dev, DomainId::DRIVER_0)).ok_or(FsError::InvalidData)?
+}
+
+/// LBA range `[start, end)` of the superblock copy at byte `offset`.
+fn super_lbas(offset: u64) -> (u64, u64) {
+    let start = offset / 512;
+    (start, start + (format::SUPERBLOCK_SIZE as u64) / 512)
+}
+
+/// A commit follows Linux `write_all_supers`: every tree/data block of the
+/// transaction is written first, then a device flush, then the primary
+/// superblock with FUA, then the mirror (plain write), with nothing else
+/// after the flush but `fsync`'s closing barrier.
+fn smoke_btrfs_commit_flush_fua_order() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let dev = recording(FIXTURE_MIRROR_SPARSE);
+    let vol = match mount_recording(&dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("mirror fixture did not mount"),
+    };
+    let f = match poll_once(vol.root().create("ordered.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if !matches!(poll_once(f.write(0, &[0x5a; 20000])), Some(Ok(20000))) {
+        return TestResult::Fail("write failed");
+    }
+    dev.log.lock().clear();
+    if !matches!(poll_once(f.fsync(false)), Some(Ok(()))) {
+        return TestResult::Fail("fsync failed");
+    }
+    let log = dev.log.lock().clone();
+    let (p0, p1) = super_lbas(format::SUPERBLOCK_OFFSET);
+    let (m0, m1) = super_lbas(64 << 20);
+    let is_primary = |lba: u64| (p0..p1).contains(&lba);
+    let is_mirror = |lba: u64| (m0..m1).contains(&lba);
+    let Some(flush_at) = log.iter().position(|op| *op == DevOp::Flush) else {
+        return TestResult::Fail("commit issued no flush");
+    };
+    // Before the flush: the transaction's own blocks, and no superblock.
+    let before = &log[..flush_at];
+    if !before
+        .iter()
+        .any(|op| matches!(op, DevOp::Write { lba, .. } if !is_primary(*lba) && !is_mirror(*lba)))
+    {
+        return TestResult::Fail("no tree/data writes preceded the pre-flush");
+    }
+    if before.iter().any(|op| match op {
+        DevOp::Write { lba, .. } | DevOp::WriteFua { lba, .. } => {
+            is_primary(*lba) || is_mirror(*lba)
+        }
+        DevOp::Flush => false,
+    }) {
+        return TestResult::Fail("a superblock was written before the pre-flush");
+    }
+    // After it: only superblock writes, primary (all FUA) first, then mirror.
+    let after = &log[flush_at + 1..];
+    let mut seen_mirror = false;
+    let mut trailing_flush = false;
+    let mut primary_blocks = 0u64;
+    for op in after {
+        match *op {
+            DevOp::WriteFua { lba, n } if is_primary(lba) && !seen_mirror => {
+                primary_blocks += u64::from(n)
+            }
+            DevOp::Write { lba, .. } if is_mirror(lba) && !trailing_flush => seen_mirror = true,
+            DevOp::Write { lba, .. } if is_primary(lba) => {
+                return TestResult::Fail("primary superblock written without FUA")
+            }
+            DevOp::WriteFua { lba, .. } if is_mirror(lba) => {
+                return TestResult::Fail("mirror superblock written with FUA (Linux does not)")
+            }
+            // `fsync`'s own barrier once the commit is done: it orders
+            // nothing new, but must not come before the mirror.
+            DevOp::Flush if seen_mirror && !trailing_flush => trailing_flush = true,
+            DevOp::Flush => return TestResult::Fail("an extra flush inside the commit"),
+            _ => return TestResult::Fail("a non-superblock write followed the pre-flush"),
+        }
+    }
+    if primary_blocks != p1 - p0 {
+        return TestResult::Fail("primary superblock not fully FUA-written before the mirror");
+    }
+    if !seen_mirror {
+        return TestResult::Fail("mirror superblock not written");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_commit_flush_fua_order);
+
+/// A failed pre-flush fails the commit before any superblock byte moves,
+/// puts the filesystem in its error state (read-only, as
+/// `BTRFS_FS_STATE_ERROR` does), and the image still mounts at the previous
+/// generation.
+fn smoke_btrfs_commit_flush_failure_goes_read_only() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let dev = recording(FIXTURE_MIRROR_SPARSE);
+    let primary_before = read_super_at(&dev.inner, format::SUPERBLOCK_OFFSET);
+    let mirror_before = read_super_at(&dev.inner, 64 << 20);
+    let vol = match mount_recording(&dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("mirror fixture did not mount"),
+    };
+    let f = match poll_once(vol.root().create("lost.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if !matches!(poll_once(f.write(0, b"never durable")), Some(Ok(13))) {
+        return TestResult::Fail("write failed");
+    }
+    dev.fail_flush
+        .store(true, core::sync::atomic::Ordering::Release);
+    if !matches!(poll_once(f.fsync(false)), Some(Err(_))) {
+        return TestResult::Fail("fsync succeeded although the flush failed");
+    }
+    if vol.supports_writes() {
+        return TestResult::Fail("filesystem still writable after a failed commit flush");
+    }
+    if !matches!(
+        poll_once(vol.root().create("after.dat")),
+        Some(Err(FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("a write was accepted after the commit failed");
+    }
+    if read_super_at(&dev.inner, format::SUPERBLOCK_OFFSET) != primary_before
+        || read_super_at(&dev.inner, 64 << 20) != mirror_before
+    {
+        return TestResult::Fail("a superblock changed although the pre-flush failed");
+    }
+    drop((f, vol));
+    dev.fail_flush
+        .store(false, core::sync::atomic::Ordering::Release);
+    let again = match mount_recording(&dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("image no longer mounts after the failed commit"),
+    };
+    let gen = format::le64(&primary_before, 72).unwrap_or(0);
+    if again.superblock().generation != gen {
+        return TestResult::Fail("remount is not at the last durable generation");
+    }
+    if poll_once(again.root().lookup_async("lost.dat")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("data of the failed commit appeared on disk");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_commit_flush_failure_goes_read_only
+);

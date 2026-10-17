@@ -7324,7 +7324,7 @@ pub async fn write_log<B: BlockDevice + 'static>(
         .copy_from_slice(&gen.to_le_bytes());
     raw[format::OFF_LOG_ROOT_LEVEL] = log_root_tree_level;
     crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
-    vol.flush().await;
+    vol.flush().await?;
     vol.write_superblock(&raw).await?;
     Ok(())
 }
@@ -7527,7 +7527,7 @@ pub async fn replay_log<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Resul
         .copy_from_slice(&0u64.to_le_bytes());
     raw[format::OFF_LOG_ROOT_LEVEL] = 0;
     crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
-    vol.flush().await;
+    vol.flush().await?;
     vol.write_superblock(&raw).await?;
     vol.clear_log_root();
     Ok(true)
@@ -8880,7 +8880,7 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     raw[sys_at..sys_at + sys_array.len()].copy_from_slice(&sys_array);
     vol.set_device_bytes_used(&dev_used)?;
     crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
-    vol.flush().await;
+    vol.flush().await?;
     vol.write_superblock(&raw).await?;
     vol.commit_chunk_root(
         chunk_root_addr,

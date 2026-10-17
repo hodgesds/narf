@@ -28,6 +28,7 @@ pub(crate) mod block_group;
 pub mod btree;
 pub mod checksum;
 pub mod chunk;
+pub mod crash_check;
 pub mod csum;
 pub mod dir;
 pub mod extent;
@@ -58,6 +59,7 @@ pub fn register_initcalls() {
         register_fstypes();
         InitResult::Ok
     });
+    crash_check::register();
 }
 
 /// Root auto-mount factory: mount the btrfs volume on a synchronously-bridged

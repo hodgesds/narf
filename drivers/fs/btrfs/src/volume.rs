@@ -644,6 +644,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                     replacement.capacity,
                     start + offset,
                     &bytes,
+                    false,
                 )
                 .await?;
                 offset += take as u64;
@@ -655,10 +656,18 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let zero = vec![0u8; format::SUPERBLOCK_SIZE];
         for &offset in &format::SUPERBLOCK_MIRROR_OFFSETS {
             if offset + format::SUPERBLOCK_SIZE as u64 <= source.capacity {
-                write_exact_to(&*source.device, &source.io, source.capacity, offset, &zero).await?;
+                write_exact_to(
+                    &*source.device,
+                    &source.io,
+                    source.capacity,
+                    offset,
+                    &zero,
+                    false,
+                )
+                .await?;
             }
         }
-        source.device.flush().await;
+        source.device.flush_result().await.map_err(FsError::Io)?;
         Ok(())
     }
 
@@ -697,11 +706,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                     removed.capacity,
                     offset,
                     &zero,
+                    false,
                 )
                 .await?;
             }
         }
-        removed.device.flush().await;
+        removed.device.flush_result().await.map_err(FsError::Io)?;
         Ok(())
     }
 
@@ -1730,7 +1740,15 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             return Err(FsError::ReadOnly);
         }
         let member = self.member(devid)?;
-        write_exact_to(&*member.device, &member.io, member.capacity, offset, src).await
+        write_exact_to(
+            &*member.device,
+            &member.io,
+            member.capacity,
+            offset,
+            src,
+            false,
+        )
+        .await
     }
 
     /// Write `src` at btrfs *logical* address `logical` (single-chunk range).
@@ -1842,18 +1860,23 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     pub(crate) async fn write_staged_super(&self) -> Result<(), FsError> {
         let staged = self.staged_super.lock().take();
         let Some((raw, root_admin)) = staged else {
-            // Nothing outstanding; the barrier is all that is owed.
-            self.flush().await;
-            return Ok(());
+            // Nothing outstanding; the barrier is all that is owed (fsync of
+            // data already covered by a durable superblock).
+            return self.flush().await;
         };
-        // Every staged commit's nodes were written before this point, so one
-        // barrier covers all of them — the ordering the superblock relies on
-        // is "all tree blocks durable first", not "one flush per commit".
-        self.flush().await;
-        if root_admin {
-            self.write_superblock_root_admin(&raw).await?;
+        // Every staged commit's nodes were written before this point. The
+        // superblock writer issues the one pre-flush that makes them durable
+        // before the FUA primary (`write_all_supers`).
+        let written = if root_admin {
+            self.write_superblock_root_admin(&raw).await
         } else {
-            self.write_superblock(&raw).await?;
+            self.write_superblock(&raw).await
+        };
+        if let Err(error) = written {
+            // Keep the image: it is still what the in-memory trees describe.
+            // The filesystem is now in its error state and takes no writes.
+            *self.staged_super.lock() = Some((raw, root_admin));
+            return Err(error);
         }
         self.staged_count
             .store(0, core::sync::atomic::Ordering::Release);
@@ -2039,11 +2062,17 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// the filesystem. Every copy records its own physical offset in `bytenr@48`
     /// (so its checksum differs), and a real kernel picks the copy with the
     /// newest generation — so all copies must advance together on each commit or
-    /// `btrfs check` reports a mismatch. The primary is written last, after its
-    /// mirrors are durable, so a torn write can never leave the newest primary
-    /// pointing at trees an out-of-date mirror would supersede on recovery.
+    /// `btrfs check` reports a mismatch. The order is Linux `write_all_supers`
+    /// (see [`Self::write_all_supers`]): pre-flush, FUA primary, mirrors.
+    ///
+    /// Gated on the filesystem, not this mount: the superblock is the core's,
+    /// and a commit or `fsync` may reach it through any mount, including a
+    /// read-only view of a writable filesystem.
     pub async fn write_superblock(&self, raw: &[u8]) -> Result<(), FsError> {
-        if !self.supports_writes() {
+        if self.core_read_only()
+            || self.degraded
+            || self.aborted.load(core::sync::atomic::Ordering::Acquire)
+        {
             return Err(FsError::ReadOnly);
         }
         self.write_superblock_unchecked(raw).await
@@ -2058,20 +2087,49 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     }
 
     async fn write_superblock_unchecked(&self, raw: &[u8]) -> Result<(), FsError> {
+        let result = self.write_all_supers(raw).await;
+        if result.is_err() {
+            // `btrfs_handle_fs_error` after a failed `write_all_supers`: the
+            // trees in memory are ahead of anything durable, so the only
+            // honest state is the filesystem error state — read-only.
+            self.abort_transaction();
+        }
+        result
+    }
+
+    /// Linux `write_all_supers` (`fs/btrfs/disk-io.c`):
+    ///
+    /// 1. `barrier_all_devices` → `write_dev_flush` / `wait_dev_flush`: a
+    ///    pre-flush on every member, waited for, so every tree and data block
+    ///    of the transaction (all submitted and completed by now) is durable
+    ///    before any superblock names it. A failed flush fails the commit
+    ///    before a single superblock byte is written.
+    /// 2. `write_dev_supers` / `wait_dev_supers`: on each member the primary
+    ///    copy with `REQ_FUA`, then the mirrors without it (they become
+    ///    durable with the next transaction's pre-flush). A failed mirror is
+    ///    tolerated; a failed primary counts against the device, and the
+    ///    commit fails once more devices fail than `num_devices - 1`.
+    async fn write_all_supers(&self, raw: &[u8]) -> Result<(), FsError> {
         if raw.len() != format::SUPERBLOCK_SIZE {
             return Err(FsError::InvalidData);
         }
-        // Mirrors first (highest offset to lowest), primary (offset 0) last,
-        // across every member. Common transaction fields are shared, while the
-        // embedded dev_item remains unique to each device.
+        // Common transaction fields are shared, while the embedded dev_item
+        // remains unique to each device.
         let members: Vec<(u64, Arc<VolumeDevice<B>>)> = self
             .devices
             .lock()
             .iter()
             .map(|(&devid, member)| (devid, member.clone()))
             .collect();
-        for &offset in format::SUPERBLOCK_MIRROR_OFFSETS.iter().rev() {
-            for (devid, member) in &members {
+        for (_, member) in &members {
+            member.device.flush_result().await.map_err(FsError::Io)?;
+        }
+        let max_errors = members.len().saturating_sub(1);
+        let mut errors = 0usize;
+        let mut primary_ok = None;
+        for (devid, member) in &members {
+            let mut device_ok = true;
+            for &offset in &format::SUPERBLOCK_MIRROR_OFFSETS {
                 if offset + format::SUPERBLOCK_SIZE as u64 > member.capacity {
                     continue; // this mirror doesn't fit on this member
                 }
@@ -2082,24 +2140,47 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                 copy[d..d + format::SUPERBLOCK_DEV_ITEM_SIZE]
                     .copy_from_slice(&*member.dev_item.lock());
                 crate::checksum::stamp_block(self.csum_type, &mut copy)?;
-                self.write_physical_on(*devid, offset, &copy).await?;
-                member.device.flush().await; // each copy durable before the next
+                let primary = offset == format::SUPERBLOCK_OFFSET;
+                if self.core_read_only() {
+                    return Err(FsError::ReadOnly);
+                }
+                let written = write_exact_to(
+                    &*member.device,
+                    &member.io,
+                    member.capacity,
+                    offset,
+                    &copy,
+                    primary,
+                )
+                .await;
+                if primary && written.is_err() {
+                    device_ok = false;
+                    break;
+                }
+            }
+            if device_ok {
+                primary_ok.get_or_insert(*devid);
+            } else {
+                errors += 1;
             }
         }
-        let devid = members
-            .first()
-            .map(|(devid, _)| *devid)
-            .ok_or(FsError::NotFound)?;
+        if errors > max_errors {
+            return Err(FsError::Io(BlockError::IOError));
+        }
+        let devid = primary_ok.ok_or(FsError::NotFound)?;
         self.state.lock().superblock_source = (devid, format::SUPERBLOCK_OFFSET);
         Ok(())
     }
 
-    /// Flush the backing device.
-    pub async fn flush(&self) {
+    /// Flush every member's volatile write cache, waiting for completion
+    /// (`blkdev_issue_flush`). The durability barrier of `fsync` and of every
+    /// commit.
+    pub async fn flush(&self) -> Result<(), FsError> {
         let members: Vec<Arc<VolumeDevice<B>>> = self.devices.lock().values().cloned().collect();
         for member in members {
-            member.device.flush().await;
+            member.device.flush_result().await.map_err(FsError::Io)?;
         }
+        Ok(())
     }
 
     /// Read the selected raw superblock and normalize it to primary-copy form.
@@ -2349,6 +2430,7 @@ async fn write_exact_to<B: BlockDevice + 'static>(
     limit: u64,
     offset: u64,
     src: &[u8],
+    fua: bool,
 ) -> Result<(), FsError> {
     let end = offset
         .checked_add(src.len() as u64)
@@ -2392,7 +2474,7 @@ async fn write_exact_to<B: BlockDevice + 'static>(
         dst[in_block..in_block + copy].copy_from_slice(&src[done..done + copy]);
 
         let write = BlockRequest {
-            op: BlockOp::Write { fua: false },
+            op: BlockOp::Write { fua },
             lba,
             blocks: 1,
             buffer: guard
