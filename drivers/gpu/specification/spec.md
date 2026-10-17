@@ -289,7 +289,7 @@ that exists yet. Layout and message constants are checked against the Linux
 headers by `tests/smu14_metrics.c`; everything is model-tested only.
 
 After a successful retained boot, `amdgpu_navi48_platform::run` starts
-`amdgpu_navi48_power`. It publishes `/sys/class/hwmon/hwmon<N>` (first free N)
+`amdgpu_navi48_power`. Through the shared `amdgpu_hwmon` it publishes `/sys/class/hwmon/hwmon<N>` (first free N)
 named `amdgpu` and spawns a monitor that refreshes telemetry every second,
 holding the platform owner only for each refresh, like Linux's cached metrics
 table. Attributes follow Linux amdgpu_pm.c for an SMU14.0.2 dGPU: `temp1..3`
@@ -3365,6 +3365,111 @@ the IH hook: an EOP/trap consumer calls them so fence waits re-sample at once;
 without it waits poll every 1 ms. `QueueProof` aggregates the three proofs.
 Clock gating, GFXOFF, the cleaner shader and Linux's second gfx ring are not
 enabled. These are kernel bring-up rings, not a submission API.
+
+### Navi 22 runtime power, thermal and recovery
+
+`amdgpu_smu_navi22_telemetry` decodes the SMU11 (`smu11_driver_if_sienna_cichlid.h`)
+`SmuMetricsExternal_t` (200 bytes, `TABLE_SMU_METRICS` = 5). `Layout::for_firmware`
+selects `SmuMetrics_V2_t` for MP1 11.0.11 PMFW >= `0x412D00` and `SmuMetrics_t`
+otherwise, as `sienna_cichlid_get_smu_metrics_data`; V2 throttling percentages
+fold into the THROTTLER bit mask. `Metrics` carries edge/hotspot/mem/VR
+temperatures (m°C), `CurrFanSpeed`, `AverageSocketPower` (W), the busy-threshold
+(15 %) GFXCLK average, FCLK/UCLK post-DS averages, `CurrClock` entries and
+activity. `Limits::from_table` reads `TemperatureLimit`, `FanMaximumRpm` (only
+with FEATURE_FAN_CONTROL) and `SocketPowerLimitAc[PPT0]` from the uploaded
+1668-byte `PPTable_t`, plus the powerplay header's `software_shutdown_temp`,
+`thermal_controller_type` and HARDWAREDC cap; `*_emergency` adds `CTF_OFFSET`
+(5 °C) and a zero/255 limit is refused. `tests/smu11_metrics.c` checks every
+offset and message against the Linux headers.
+
+After boot power setup, `Smu::read_telemetry().await` zeroes and HDP-flushes the
+retained `DriverDramAddr` buffer, sends `TransferTableSmu2Dram` (0x12, table 5),
+invalidates HDP (`HDP_READ_CACHE_INVALIDATE`) and decodes the table, then reads
+the running features, `GetPptLimit` (0x33, PPT0/AC; the table limit when PPT is
+not running or the query is rejected), `SMUSVI0_TEL_PLANE0` VDDCOR
+(`smu_v11_0_get_gfx_vdd`) and the THM `CG_FDO_CTRL1`/`CG_THERMAL_STATUS` PWM
+duty (`smu_v11_0_get_fan_speed_pwm`). Runtime commands move `PowerReady`/
+`DisplayPowerReady` through `Runtime`: a clean rejection restores the state,
+timeout, revocation, all-ones sensors or cancellation are terminal.
+`Smu::protected(enabled)` checks that the PPT/TDC/VR0HOT/FW_CTF/FAN/THERMAL
+features running at boot still run. `ColdBoot::power_limits()` and
+`power_sample().await` expose this after `FirmwareReady`.
+
+`amdgpu_navi22_platform::run` then starts `amdgpu_navi22_power`: the shared
+`amdgpu_hwmon` node `/sys/class/hwmon/hwmon<N>` named `amdgpu` and a 1 s
+monitor that takes the owner lock per refresh. Attributes are the Linux SMU11
+dGPU set, read-only: `temp1..3` (edge/junction/mem) with crit/crit_hyst
+(-273150)/emergency; with a fan `pwm1` (register duty), `pwm1_enable` 2,
+`pwm1_min/max`, `fan1_input/min/max/target`, `fan1_enable` 0; `in0` vddgfx;
+`power1_average/cap/cap_default` (µW; default is the first PMFW limit, else the
+table's AC limit); `freq1` sclk and `freq2` mclk (Hz). Fan control stays in
+PMFW automatic mode. The monitor logs throttling start/end, lost protection,
+the first failed refresh and hotspot at `software_shutdown_temp`; shutdown
+policy belongs to the thermal interrupts below. Model-tested only.
+
+`Smu::enable_thermal_alert().await` (`ColdBoot::enable_thermal_alert`) follows
+`smu_v11_0_enable_thermal_alert`: with a nonzero `thermal_controller_type` it
+programs `THM_THERMAL_INT_CTRL` (MAX_IH_CREDIT 5, IH_HW_ENA, INTH/INTL and
+TRIGGER unmasked, DIG_THERM_INTH = min(255, `software_shutdown_temp`),
+DIG_THERM_INTL = 0), clears `THM_THERMAL_INT_ENA` (INTH/INTL/TRIGGER_CLR),
+sets `MP1_SMN_IH_SW_INT.ID` 0xFE and unmasks `MP1_SMN_IH_SW_INT_CTRL`; with a
+GPIO-signalled DC cap and FEATURE_ACDC running it sends `ReenableAcDcInterrupt`
+(0x34). It returns `Alert { armed, window, acdc_rearmed }`; `InterruptAck`
+sets `INT_ACK` without the mailbox. After telemetry, `run` subscribes the four
+`smu_v11_0_register_irq_handler` sources (THM 0x0f src 0/1, ROM_SMUIO 0x16 src
+83, MP1 0x1f src 0xfe) *before* arming them and spawns one task per source
+(`amdgpu_navi22_thermal`). L2H waits 50 ms (`AMDGPU_SWCTF_EXTRA_DELAY`),
+re-reads the hotspot and, at or above `software_shutdown_temp` — or with no
+reading or no limit, as `smu_swctf_delayed_work_handler` — logs the SW CTF and
+powers off; H2L only logs; GPIO19 CTF logs and powers off at once; SMU-to-driver
+acknowledges, then AC/DC (3/4) re-arms AC/DC and thermal throttling (7) counts.
+NARF has no userspace poweroff helper or write-back, so `orderly_poweroff(true)`
+reduces to its forced fallback, `narf_power::system::power_off()`.
+`amdgpu_navi22_thermal::status()` (also in platform `Diagnostics::thermal`)
+reports the alert, per-source counters and any shutdown reason.
+
+Hang detection (`amdgpu_navi22_tdr`) follows drm_sched's per-ring job timeout
+with Linux's default `lockup_timeout` of 2 s for every queue. After a boot whose
+queues all verified, a task samples every 250 ms, under the owner lock,
+`Progress { engine, emitted, signaled }` of GFX, KIQ, compute and SDMA0/1
+(`ColdBoot::queue_progress`: the queue's last sequence and its fence writeback
+after an HDP invalidate; an all-ones read-back is device loss). The per-engine
+timer starts when unsignalled work is first seen and restarts on every fence
+advance; a stall past the timeout logs `ring <engine> timeout, signaled seq=…,
+emitted seq=…` once and is retained in `tdr::status()`. Detection is always on;
+recovery is triggered only by `unsafe tdr::set_automatic_recovery(true)` (off by
+default) or an explicit call.
+
+`unsafe amdgpu_navi22_platform::recover().await` is the opt-in
+`amdgpu_device_gpu_recover` for mode1 (`amdgpu_navi22_recovery::Recovery`, state
+stored outside the future). `check` refuses (`Unsupported`, no side effects) a
+boot that needed GDDR6 training (no short-training replay yet) or lacks a board
+table, PSP or IH. Quiesce stops TDR, telemetry and thermal, disables the IH ring
+(every subscriber gets `Disabled`) and calls `amdgpu_fence_navi22::abandon_all`,
+which ends every pending fence wait with its error. Reinitialize consumes the
+owner (`ColdBoot::into_recovery`: same snapshot, authority, pool and prepared
+firmware; old owners dropped without I/O, their VRAM quarantined), prepares a
+`Reset::new_recovery` — the reset-on-init core without the SOS shortcut — plus
+fresh hubs, SDMA proof, IH and queues on the same BAR2 doorbells, stores it,
+and runs the complete cold-boot sequence including ring/IB tests. Restart
+re-arms telemetry, thermal and TDR. DMUB/display are not restarted: the screen
+stays dark until the display owner restarts DMUB and modesets. Any failure or
+cancellation is terminal `Lost`: services stop, fence waits are abandoned and
+the old and new IH endpoints close with `DeviceLost`. `recoveries()` counts
+successes; platform `Diagnostics` adds `tdr` and `recovery`. Model-tested only.
+
+`amdgpu_navi22_power_policy::Policy` is the typed hook for the power savings
+Linux enables by default on sienna_cichlid — GFXOFF, clock gating, MMHUB/ATHUB
+power gating, memory (UCLK) and fabric (FCLK) DPM and deep sleep. `requirement`
+states what each needs: SMU feature bits, display admission
+(`DisplayAdmission`: watermark sets/PMFW watermark table, DML DRAM- and
+FCLK-change support, stutter with the deep-sleep DCEFCLK floor, bandwidth
+floors) and driver readiness (GFXOFF-safe GC access, RLC safe mode, validated
+recovery). `Policy::new()`/`Default` disable everything; `request` checks the
+requirements, then refuses with `NotValidated` while `HARDWARE_VALIDATED` is
+false, so `smu_features()` adds no bits and `gfxoff()`/`clock_gating()` stay
+false. Nothing calls it. The DCN-owned `Smu::enable_display_power` remains the
+only path that adds UCLK/FCLK DPM, under its own contract.
 
 ### Navi 22 DCN3.0 DMUB startup
 

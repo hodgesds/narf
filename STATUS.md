@@ -951,8 +951,18 @@ reached through VMID0, MSI-X/MSI delivery with polling fallback, and
 overflow-safe task-context drains. It routes IVs to generation-tagged
 subscribers that receive a terminal error on device loss. Boot enables it
 after the memory hubs and proves delivery with an SDMA0 TRAP.
+PMFW telemetry now uses the retained SMU11 table buffer (V1/V2 metrics by
+PMFW version, Linux-checked layouts) and feeds a read-only hwmon node shared
+with Navi48 (temperatures, fan, power, clocks); fan control stays automatic.
+The SMU11 THM L2H/H2L, GPIO19 CTF and SMU-to-driver interrupts are armed and
+handled as smu_v11_0 does, including the delayed SW CTF check and power-off.
+Kernel-queue hang detection (2 s fence-progress timeout per ring) is active
+and logging; mode1 device recovery with a full cold-boot re-init exists behind
+an explicit opt-in API (display stays dark; training boots refuse it).
+GFXOFF, clock/power gating, memory/fabric DPM and deep sleep remain disabled
+behind a typed policy hook that states their display-admission requirements.
 These are software-tested foundations; training resume,
-VCN startup, display-aware DPM and OS thermal interrupt handling,
+VCN startup, display-aware DPM,
 hardware boot, general GPU mappings/GFX10 queue initialization, production
 SDMA submissions/interrupts and DCN3.0
 modesetting remain open. See the
