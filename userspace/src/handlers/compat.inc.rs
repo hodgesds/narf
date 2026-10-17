@@ -7554,7 +7554,10 @@ fn live_task_state(task: u64) -> char {
 pub fn proc_thread_stat(tid: u64) -> Option<narf_filesystem::procfs::ThreadStat> {
     const NS_PER_TICK: u64 = 10_000_000;
     let task = task_of_visible_tid(tid)?;
+    let syscall = proc_task_syscall_frame(task);
     Some(narf_filesystem::procfs::ThreadStat {
+        wchan: proc_wchan_of_frame(syscall),
+        syscall,
         comm: proc_comm_of_task(task).unwrap_or_else(|| alloc::format!("task-{tid}")),
         utime_ticks: cpu_time_ns_of(task) / NS_PER_TICK,
         stime_ticks: kern_time_ns_of(task) / NS_PER_TICK,
@@ -7580,12 +7583,7 @@ pub fn proc_sched_snapshot(pid: u64) -> narf_filesystem::procfs::ProcSchedSnapsh
     let task = proc_pid_to_tid(pid);
     let (timeslices, voluntary_switches, involuntary_switches) = crate::task::switch_counts(task);
     let syscall = proc_task_syscall_frame(task);
-    // The handler a parked task is waiting in. A task parked outside a
-    // syscall (or one still running) has no site to name, and Linux prints 0
-    // for exactly that case.
-    let wchan = syscall
-        .and_then(|frame| crate::syscall::syscall_name_of_number(frame[0]))
-        .map(alloc::string::String::from);
+    let wchan = proc_wchan_of_frame(syscall);
     narf_filesystem::procfs::ProcSchedSnapshot {
         run_ns: cpu_time_ns_of(task).saturating_add(kern_time_ns_of(task)),
         timeslices,
@@ -7596,6 +7594,15 @@ pub fn proc_sched_snapshot(pid: u64) -> narf_filesystem::procfs::ProcSchedSnapsh
         syscall,
         wchan,
     }
+}
+
+/// The handler a parked task is waiting in. A task parked outside a syscall
+/// (or one still running) has no site to name, and Linux prints 0 for
+/// exactly that case.
+fn proc_wchan_of_frame(frame: Option<[u64; 9]>) -> Option<alloc::string::String> {
+    frame
+        .and_then(|frame| crate::syscall::syscall_name_of_number(frame[0]))
+        .map(alloc::string::String::from)
 }
 
 /// `kernel/sched/syscalls.c::task_current_syscall()` — the syscall frame of a

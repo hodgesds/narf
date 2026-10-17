@@ -387,6 +387,10 @@ wrapping SEEK_CUR, `EINVAL` otherwise). `unsigned_offsets()` (default
 `false`) is Linux `FOP_UNSIGNED_OFFSET`: `rw_verify_area` then admits a
 position at or past `LLONG_MAX` (`EOVERFLOW` only when the count would
 wrap), as `/proc/<pid>/mem` addresses kernel-half virtual addresses.
+`/proc/<pid>/task/<tid>/` serves `comm`, `mem`, `stat`, `syscall` and
+`wchan`; the last two describe that thread, from the `syscall` frame and
+`wchan` name the thread-stat hook's `ThreadStat` carries. `wchan` has no
+trailing newline, as Linux `proc_pid_wchan`.
 `/proc/<pid>/mem` and `/proc/<pid>/task/<tid>/mem` are 0600 nodes whose
 `open_instance_checked` calls the hook installed by
 `procfs::install_proc_mem_hook(fn(pid) -> Result<Arc<dyn ProcMemAccess>, FsError>)`
