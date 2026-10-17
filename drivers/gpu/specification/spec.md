@@ -4646,7 +4646,9 @@ paths; only the tables differ.
   the buffer's one shared reservation (`GemObject::dma_buf`).
   `PRIME_FD_TO_HANDLE` on an open of the same card imports it as the handle
   that open already has for the buffer or a new one (`GemState::import`);
-  another card's buffer is EINVAL (no foreign dma-buf attach yet).
+  another card's buffer is EINVAL (no foreign dma-buf attach yet). A
+  `VM_ALWAYS_VALID` buffer is not exported (EPERM, as
+  amdgpu_gem_prime_export): it belongs to its open's address space.
 - Metadata (`amdgpu_gem`, `GEM_METADATA`): each `GemObject` keeps its
   tiling flags and an opaque blob of at most 256 bytes with its flags, so
   every handle to the buffer sees what its exporter set (SET; an empty blob

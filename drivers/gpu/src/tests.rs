@@ -13733,7 +13733,28 @@ fn smoke_amdgpu_gem_prime_export_import() -> TestResult {
     let Some(object) = exporter.object(handle) else {
         return TestResult::Fail("setup: object");
     };
-    let file = crate::drm_devfs_bridge::amdgpu_dma_buf_file(object.clone());
+    let Ok(file) = crate::drm_devfs_bridge::amdgpu_dma_buf_file(object.clone()) else {
+        return TestResult::Fail("export");
+    };
+    // A VM_ALWAYS_VALID buffer stays in its open (amdgpu_gem_prime_export).
+    let mut local = [0u8; 32];
+    local[0..8].copy_from_slice(&4096u64.to_le_bytes());
+    local[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    local[24..32].copy_from_slice(&(u::AMDGPU_GEM_CREATE_VM_ALWAYS_VALID as u64).to_le_bytes());
+    let local_object = dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        local.as_mut_ptr() as usize,
+        &exporter,
+    )
+    .ok()
+    .and_then(|_| exporter.object(u32::from_le_bytes(local[0..4].try_into().unwrap())));
+    if local_object
+        .map(crate::drm_devfs_bridge::amdgpu_dma_buf_file)
+        .map(|r| r.err())
+        != Some(Some(narf_filesystem::FsError::OperationNotPermitted))
+    {
+        return TestResult::Fail("a VM_ALWAYS_VALID buffer was exported");
+    }
     let weak = alloc::sync::Arc::downgrade(&object);
     drop(object);
     let mut close = [0u8; 8];
