@@ -1062,6 +1062,16 @@ deep colour (`amdgpu.max_bpc`, FMT SPATIAL8/10 dither), YCbCr 4:2:0 for
 Y420VDB/CMDB modes (OTG container, FMT, YCbCr709 OCSC, DPG black), Broadcast
 RGB limited (OCSC), CTA VIC/HDMI-VIC vendor InfoFrames and HDMI_6GB_EN from the
 VBIOS encoder caps. Register/DDC models only.
+Navi22 multi-display (`amdgpu_navi22_multi`): up to four KMS CRTCs light as
+one DC context — joint DML30 admission of every stream (`plan_joint`, at the
+lowest supporting UCLK state; 234 host vectors from Linux's own DML30 C,
+single/multi-stream, cursor, ODM, DSC), clocks and watermarks once, PHY PLL
+sharing for identical HDMI timings, ODM 2:1 where one pipe cannot carry a
+stream, DSC with FEC on DP SST (`amdgpu_dcn30_dsc`, training through the
+shared DP link layer) and 8b/10b DP MST through the shared sideband manager
+(`amdgpu_dcn30_mst`). Secondary CRTCs route automatically only with
+`amdgpu.navi22_multi`; only CRTC 0 presents (the others show static scanouts).
+Register models only; never run on hardware.
 For bare-metal runs, `cargo xtask usb-image` builds a UEFI stick whose kernel
 appends its log to `/narf-boot-<n>.log` on that stick (`narf.bootlog=`,
 marker-gated, USB-only, bounded) and boots with `narf.disks=boot-only`: every

@@ -1,7 +1,8 @@
 //! The native Navi22 display as DRM KMS state on the amdgpu card, after
 //! `amdgpu_navi48_kms` (whose CRTC/encoder/connector id scheme and DRM wire
-//! forms this reuses): one CRTC per lit pipe (the single-pipe HDMI owner
-//! lights pipe 0, CRTC id 1), and one connector per board port in VBIOS
+//! forms this reuses): one CRTC per lit pipe (the single-pipe owner lights
+//! pipe 0, CRTC id 1; CRTCs 1..3 light with it as one multi-stream context,
+//! `amdgpu_navi22_modeset::Group`), and one connector per board port in VBIOS
 //! route order (DP-1..3 and HDMI-A-1 on the RX 6750 XT), each with its own
 //! TMDS-type encoder. A connected sink carries its EDID; its modes are the
 //! EDID timings the DCN30 admission accepts (`amdgpu_navi22_modeset::offered`
@@ -23,8 +24,17 @@ use crate::drm::ioctl::DrmModeModeInfo;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-/// Pipes this owner can light (`amdgpu_navi22_modeset` drives pipe 0).
-pub const MAX_CRTCS: usize = 1; // linux: n/a (NARF policy: one CRTC)
+/// CRTCs published: CRTC 0 is the single-pipe owner's
+/// (`amdgpu_navi22_modeset`, pipe 0, presentation); CRTCs 1.. light only
+/// as one multi-stream context with CRTC 0 (`amdgpu_navi22_modeset::Group`,
+/// one pipe per stream), at most the shared KMS id scheme's four outputs.
+pub const MAX_CRTCS: usize = 4; // linux: n/a (amdgpu_navi48_kms MAX_OUTPUTS id scheme)
+/// Automatic routing gives the secondary CRTCs the remaining sinks (the
+/// `amdgpu.navi22_multi` opt-in); without it only DRM routes them.
+static AUTO_MULTI: AtomicBool = AtomicBool::new(false);
+pub fn set_auto_multi(on: bool) {
+    AUTO_MULTI.store(on, Ordering::Release);
+}
 
 /// DRM_FORMAT_XRGB8888 and ARGB8888: what the native scanout presents.
 // linux: n/a (DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888: fourcc_code() in drm_fourcc.h)
@@ -95,7 +105,18 @@ pub enum Action {
     },
 }
 
-/// Connectors and the CRTC, under one lock.
+/// The multi-stream context's next step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupAction {
+    Nothing,
+    /// Tear the lit context down (a CRTC changed, or none but CRTC 0 is
+    /// wanted any more).
+    Unlight,
+    /// Light every (CRTC, connector, requested mode) together.
+    Light(Vec<(usize, usize, Option<Timing>)>),
+}
+
+/// Connectors and the CRTCs, under one lock.
 #[derive(Debug)]
 pub struct Kms {
     pub connectors: Vec<ConnectorState>,
@@ -103,6 +124,10 @@ pub struct Kms {
     /// The (route, want) the monitor last tried to light, so a sink that
     /// failed is not relit every pass; cleared by any new request.
     pub attempted: Option<(usize, Option<Timing>)>,
+    /// CRTCs 1.. (lit only with CRTC 0, as one multi-stream context).
+    pub secondary: [CrtcState; MAX_CRTCS - 1],
+    /// The multi-stream context the monitor last tried, as `attempted`.
+    pub attempted_group: Option<Vec<(usize, Option<Timing>)>>,
 }
 impl Kms {
     pub const fn new() -> Self {
@@ -110,6 +135,8 @@ impl Kms {
             connectors: Vec::new(),
             crtc: CrtcState::new(),
             attempted: None,
+            secondary: [const { CrtcState::new() }; MAX_CRTCS - 1],
+            attempted_group: None,
         }
     }
     /// Replace the inventory with a detection. `offered` computes a sink's
@@ -167,6 +194,7 @@ impl Kms {
             self.crtc.route = None;
             self.crtc.explicit = false;
         }
+        self.reconcile_secondary(&old);
     }
     /// Automatic routing: an unrouted CRTC takes the first lightable sink.
     pub fn assign_route(&mut self) {
@@ -183,17 +211,24 @@ impl Kms {
         // As `amdgpu_navi22_modeset::choose`: an HDMI sink first, else the
         // first DisplayPort one.
         if self.crtc.route.is_none() {
+            let held = |n: usize| self.secondary.iter().any(|c| c.route == Some(n));
             let first = |signal| {
-                self.connectors
-                    .iter()
-                    .position(|c| c.port.signal == signal && c.lightable())
+                (0..self.connectors.len()).find(|&n| {
+                    let c = &self.connectors[n];
+                    c.port.signal == signal && c.lightable() && !held(n)
+                })
             };
             self.crtc.route = first(Signal::Hdmi).or_else(|| first(Signal::DisplayPort));
         }
+        self.assign_secondary();
     }
     /// Timings the CRTC can switch `connector` (default: its route) to.
     pub fn offered(&self, connector: Option<usize>) -> &[Timing] {
-        let Some(c) = connector.or(self.crtc.route) else {
+        self.offered_at(0, connector)
+    }
+    /// Timings CRTC `d` can switch `connector` (default: its route) to.
+    pub fn offered_at(&self, d: usize, connector: Option<usize>) -> &[Timing] {
+        let Some(c) = connector.or(self.crtc_at(d).and_then(|c| c.route)) else {
             return &[];
         };
         match self.connectors.get(c) {
@@ -202,6 +237,14 @@ impl Kms {
         }
     }
     pub fn find_mode(&self, connector: Option<usize>, mode: &DrmModeModeInfo) -> Option<Timing> {
+        self.find_mode_at(0, connector, mode)
+    }
+    pub fn find_mode_at(
+        &self,
+        d: usize,
+        connector: Option<usize>,
+        mode: &DrmModeModeInfo,
+    ) -> Option<Timing> {
         let geometry = |w: &DrmModeModeInfo| {
             (
                 w.clock,
@@ -209,7 +252,7 @@ impl Kms {
                 [w.vdisplay, w.vsync_start, w.vsync_end, w.vtotal],
             )
         };
-        self.offered(connector)
+        self.offered_at(d, connector)
             .iter()
             .copied()
             .find(|t| geometry(&crate::amdgpu_navi48_kms::timing_wire(t)) == geometry(mode))
@@ -249,6 +292,137 @@ impl Kms {
         .then_some(c.shown.as_ref())
         .flatten()
     }
+    /// CRTC `d` (0: the single-pipe owner's).
+    pub fn crtc_at(&self, d: usize) -> Option<&CrtcState> {
+        match d {
+            0 => Some(&self.crtc),
+            _ => self.secondary.get(d - 1),
+        }
+    }
+    pub fn crtc_at_mut(&mut self, d: usize) -> Option<&mut CrtcState> {
+        match d {
+            0 => Some(&mut self.crtc),
+            _ => self.secondary.get_mut(d - 1),
+        }
+    }
+    /// The CRTC routed to connector `n`.
+    pub fn crtc_of(&self, n: usize) -> Option<usize> {
+        (0..MAX_CRTCS).find(|&d| self.crtc_at(d).is_some_and(|c| c.route == Some(n)))
+    }
+    /// `reconcile_sinks` for CRTCs 1..: routes to vanished connectors drop,
+    /// and a changed EDID voids the requested mode.
+    fn reconcile_secondary(&mut self, old: &[ConnectorState]) {
+        let connectors = &self.connectors;
+        for c in &mut self.secondary {
+            match c.route {
+                Some(r) if r >= connectors.len() => {
+                    c.route = None;
+                    c.explicit = false;
+                    c.requested = None;
+                    c.shown = None;
+                }
+                Some(r)
+                    if old.get(r).is_some_and(|o| {
+                        o.port == connectors[r].port && o.edid != connectors[r].edid
+                    }) =>
+                {
+                    c.requested = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    /// Automatic routing for CRTCs 1.. (as `amdgpu_navi48`'s): an
+    /// automatically routed CRTC drops a sink it can no longer light, or
+    /// one CRTC 0 took; with the opt-in, each lightable connector without a
+    /// CRTC takes the first free one. DRM's routes stay.
+    fn assign_secondary(&mut self) {
+        let lead = self.crtc.route;
+        for c in &mut self.secondary {
+            if !c.explicit
+                && c.route.is_some_and(|r| {
+                    lead == Some(r)
+                        || !self
+                            .connectors
+                            .get(r)
+                            .is_some_and(ConnectorState::lightable)
+                })
+            {
+                c.route = None;
+            }
+        }
+        if !AUTO_MULTI.load(Ordering::Acquire) {
+            return;
+        }
+        for n in 0..self.connectors.len() {
+            if !self.connectors[n].lightable() || self.crtc_of(n).is_some() {
+                continue;
+            }
+            if let Some(c) = self
+                .secondary
+                .iter_mut()
+                .find(|c| c.route.is_none() && !c.explicit)
+            {
+                c.route = Some(n);
+            }
+        }
+    }
+    /// Every CRTC that should show a sink: (CRTC, connector, requested mode).
+    pub fn targets(&self) -> Vec<(usize, usize, Option<Timing>)> {
+        (0..MAX_CRTCS)
+            .filter_map(|d| {
+                let c = self.crtc_at(d)?;
+                let r = c.route?;
+                (c.active
+                    && self
+                        .connectors
+                        .get(r)
+                        .is_some_and(ConnectorState::lightable))
+                .then_some((d, r, c.requested))
+            })
+            .collect()
+    }
+    /// The next multi-stream step given the lit context's (CRTC, connector,
+    /// timing) per stream. A context is wanted while a CRTC other than 0
+    /// should show a sink; it relights whole on any change, as the group
+    /// has no incremental add.
+    pub fn next_group(&self, running: Option<&[(usize, usize, Timing)]>) -> GroupAction {
+        let targets = self.targets();
+        let wanted = targets.iter().any(|t| t.0 != 0);
+        match (running, wanted) {
+            (Some(_), false) => GroupAction::Unlight,
+            (Some(lit), true) => {
+                let same = lit.len() == targets.len()
+                    && lit
+                        .iter()
+                        .zip(&targets)
+                        .all(|(l, t)| l.0 == t.0 && l.1 == t.1 && t.2.is_none_or(|w| w == l.2));
+                if same {
+                    GroupAction::Nothing
+                } else {
+                    GroupAction::Unlight
+                }
+            }
+            (None, true) => {
+                let key: Vec<_> = targets.iter().map(|t| (t.1, t.2)).collect();
+                if self.attempted_group.as_ref() == Some(&key) {
+                    GroupAction::Nothing
+                } else {
+                    GroupAction::Light(targets)
+                }
+            }
+            (None, false) => GroupAction::Nothing,
+        }
+    }
+    /// The sink CRTC `d` shows to DRM: while on and routed to a sink.
+    pub fn published_at(&self, d: usize) -> Option<&([u8; 128], Timing, Vec<Timing>)> {
+        let c = self.crtc_at(d)?;
+        (c.active
+            && c.route
+                .is_some_and(|r| self.connectors.get(r).is_some_and(|x| x.present)))
+        .then_some(c.shown.as_ref())
+        .flatten()
+    }
 }
 impl Default for Kms {
     fn default() -> Self {
@@ -279,12 +453,14 @@ pub fn crtc_display(crtc_id: u32) -> Option<u8> {
     crate::amdgpu_navi48_kms::crtc_display(crtc_id).filter(|&d| usize::from(d) < MAX_CRTCS)
 }
 
-/// Publish the connectors and CRTC on the registered amdgpu card.
+/// Publish the connectors and CRTCs on the registered amdgpu card: every
+/// connector may drive every CRTC (one DIG per stream, any pipe), as DC's
+/// `possible_crtcs`.
 pub fn publish() {
     let kms = KMS.lock();
     let crtcs: Vec<Option<crate::amdgpu_navi48_kms::Sink>> = (0..MAX_CRTCS)
-        .map(|_| {
-            kms.published()
+        .map(|d| {
+            kms.published_at(d)
                 .map(|(edid, timing, offered)| crate::amdgpu_navi48_kms::Sink {
                     edid,
                     timing,
@@ -292,7 +468,6 @@ pub fn publish() {
                 })
         })
         .collect();
-    let route = kms.crtc.route;
     let connectors: Vec<crate::amdgpu_navi48_kms::RoutedConnector> = kms
         .connectors
         .iter()
@@ -305,17 +480,22 @@ pub fn publish() {
                 .then(|| c.edid.get(..128).and_then(|e| e.try_into().ok()))
                 .flatten(),
             offered: if c.lightable() { &c.modes } else { &[] },
-            crtc: (route == Some(n)).then_some(0),
-            possible_crtcs: 1,
+            crtc: kms.crtc_of(n),
+            possible_crtcs: (1 << MAX_CRTCS) - 1,
         })
         .collect();
-    let off = kms.crtc.shown.is_some() && !kms.crtc.active;
+    let off: Vec<usize> = (0..MAX_CRTCS)
+        .filter(|&d| {
+            kms.crtc_at(d)
+                .is_some_and(|c| c.shown.is_some() && !c.active)
+        })
+        .collect();
     with_card(|card| {
         crate::amdgpu_navi48_kms::apply_routed(card, &crtcs, &connectors);
         card.vblank_source = Some(crate::amdgpu_navi22_platform::crtc_vblank);
         card.plane_formats = Some(&PLANE_FORMATS);
-        if off {
-            crate::amdgpu_navi48_kms::set_crtc_active(card, 0, false);
+        for &d in &off {
+            crate::amdgpu_navi48_kms::set_crtc_active(card, d, false);
         }
     });
     ACTIVE.store(true, Ordering::Release);
@@ -354,6 +534,7 @@ fn requested(update: impl FnOnce(&mut Kms) -> bool) -> bool {
         let ok = update(&mut kms);
         if ok {
             kms.attempted = None;
+            kms.attempted_group = None;
         }
         ok
     };
@@ -364,21 +545,24 @@ fn requested(update: impl FnOnce(&mut Kms) -> bool) -> bool {
 }
 /// Record DRM's CRTC on/off request.
 pub fn request_display_active(display: u8, active: bool) {
-    if usize::from(display) < MAX_CRTCS {
-        requested(|k| {
-            k.crtc.active = active;
+    requested(|k| match k.crtc_at_mut(usize::from(display)) {
+        Some(c) => {
+            c.active = active;
             true
-        });
-    }
+        }
+        None => false,
+    });
 }
 /// The connector index behind a KMS connector id, if it exists.
 fn connector_of(kms: &Kms, id: u32) -> Option<usize> {
     crate::amdgpu_navi48_kms::connector_index(id).filter(|&n| n < kms.connectors.len())
 }
 /// Route the CRTC to connector `connector` (KMS id; None: none). Every
-/// board HDMI and DP port can be driven; false for an unknown one.
+/// board HDMI and DP port can be driven by every CRTC; another CRTC
+/// driving that connector loses it. False for an unknown one.
 pub fn request_display_route(display: u8, connector: Option<u32>) -> bool {
-    if usize::from(display) >= MAX_CRTCS {
+    let d = usize::from(display);
+    if d >= MAX_CRTCS {
         return false;
     }
     requested(|k| {
@@ -389,12 +573,25 @@ pub fn request_display_route(display: u8, connector: Option<u32>) -> bool {
             },
             None => None,
         };
-        if k.crtc.route != target {
-            k.crtc.requested = None;
-            k.crtc.shown = None;
+        if let Some(n) = target {
+            for other in (0..MAX_CRTCS).filter(|&o| o != d) {
+                if let Some(c) = k.crtc_at_mut(other).filter(|c| c.route == Some(n)) {
+                    c.route = None;
+                    c.explicit = true;
+                    c.requested = None;
+                    c.shown = None;
+                }
+            }
         }
-        k.crtc.route = target;
-        k.crtc.explicit = true;
+        let Some(c) = k.crtc_at_mut(d) else {
+            return false;
+        };
+        if c.route != target {
+            c.requested = None;
+            c.shown = None;
+        }
+        c.route = target;
+        c.explicit = true;
         true
     })
 }
@@ -406,9 +603,9 @@ pub fn request_connector_crtc(connector: u32, display: Option<u8>) -> bool {
             let Some(n) = connector_of(k, connector) else {
                 return false;
             };
-            if k.crtc.route == Some(n) {
-                k.crtc.route = None;
-                k.crtc.explicit = true;
+            if let Some(c) = k.crtc_of(n).and_then(|d| k.crtc_at_mut(d)) {
+                c.route = None;
+                c.explicit = true;
             }
             true
         }),
@@ -418,7 +615,8 @@ pub fn request_connector_crtc(connector: u32, display: Option<u8>) -> bool {
 /// `connector`, a KMS id, when the same request routes it there). This is
 /// the TEST_ONLY / SETCRTC validation.
 pub fn display_offers(display: u8, connector: Option<u32>, mode: &DrmModeModeInfo) -> bool {
-    if usize::from(display) >= MAX_CRTCS {
+    let d = usize::from(display);
+    if d >= MAX_CRTCS {
         return false;
     }
     let kms = KMS.lock();
@@ -429,44 +627,55 @@ pub fn display_offers(display: u8, connector: Option<u32>, mode: &DrmModeModeInf
         },
         None => None,
     };
-    kms.find_mode(target, mode).is_some()
+    kms.find_mode_at(d, target, mode).is_some()
 }
 /// Record the mode DRM set (one of the offered timings; None: preferred).
 pub fn request_display_mode(display: u8, mode: Option<&DrmModeModeInfo>) -> bool {
-    if usize::from(display) >= MAX_CRTCS {
+    let d = usize::from(display);
+    if d >= MAX_CRTCS {
         return false;
     }
-    requested(|k| match mode {
-        None => {
-            k.crtc.requested = None;
-            true
-        }
-        Some(m) => match k.find_mode(None, m) {
-            Some(t) => {
-                k.crtc.requested = Some(t);
+    requested(|k| {
+        let want = match mode {
+            None => None,
+            Some(m) => match k.find_mode_at(d, None, m) {
+                Some(t) => Some(t),
+                None => return false,
+            },
+        };
+        match k.crtc_at_mut(d) {
+            Some(c) => {
+                c.requested = want;
                 true
             }
             None => false,
-        },
+        }
     })
 }
 /// Console defaults (on, preferred mode, automatic routing), as
 /// drm_fb_helper restores the console on lastclose.
 pub fn restore_displays() {
     requested(|k| {
-        k.crtc.active = true;
-        k.crtc.requested = None;
-        k.crtc.explicit = false;
+        for d in 0..MAX_CRTCS {
+            if let Some(c) = k.crtc_at_mut(d) {
+                c.active = true;
+                c.requested = None;
+                c.explicit = false;
+            }
+        }
         true
     });
 }
 
 /// `DisplayAdmission` of an admitted DML30 plan on `streams` lit pipes, for
-/// `amdgpu_navi22_power_policy` (which still refuses every feature). DML30
-/// answers DRAM clock change support; this owner keeps stutter off, does not
-/// evaluate FCLK switching, installs no PMFW `TABLE_WATERMARKS` and requests
-/// no deep-sleep floor, so those stay false. The floors are what the plan was
-/// computed at (the board's pinned maximum levels).
+/// `amdgpu_navi22_power_policy`. DML30 answers DRAM clock change support;
+/// `watermarks` is the HUBBUB half (sets A-D programmed from the plan:
+/// `hubbub3_program_watermarks`), which the power-saving path ANDs with its
+/// PMFW `TABLE_WATERMARKS` upload. This owner keeps stutter off, does not
+/// evaluate FCLK switching and requests no deep-sleep floor, so those stay
+/// false. The floors are the state the plan was computed at: the board's
+/// top state for one stream, the lowest supporting UCLK state for a
+/// multi-stream context (`dml30::plan_joint_lowest`).
 pub fn display_admission(
     admitted: &crate::amdgpu_navi22_modeset::Admitted,
     streams: u8,
@@ -479,7 +688,7 @@ pub fn display_admission(
             && admitted.plan.dram_clock_change != DramClockChange::Unsupported,
         fclk_change: false,
         stutter: false,
-        watermarks: false,
+        watermarks: streams != 0,
         // linux: n/a (memclk_mhz * 16, dcn30_resource.c dcn30_update_bw_bounding_box)
         min_uclk_mhz: u16::try_from(admitted.soc.dram_speed_mts / 16).unwrap_or(u16::MAX),
         min_fclk_mhz: mhz(admitted.soc.fabric_khz),

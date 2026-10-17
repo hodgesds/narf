@@ -101,6 +101,8 @@ pub enum TransmitterMode {
     /// Also what `SIGNAL_TYPE_NONE` maps to (the power-down path).
     Dvi = 2, // linux-lit: 2=ATOM_TRANSMITTER_DIGMODE_V6_DVI
     Hdmi = 3,        // linux-lit: 3=ATOM_TRANSMITTER_DIGMODE_V6_HDMI
+    /// `ATOM_TRANSMITTER_DIGMODE_V6_DP_MST`.
+    DpMst = 5, // linux-lit: 5=ATOM_TRANSMITTER_DIGMODE_V6_DP_MST
 }
 
 /// The register bus the interpreter drives.

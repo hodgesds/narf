@@ -306,6 +306,14 @@ impl<I: Io> Engine<I> {
     /// `hubp3_program_surface_config` for a linear RGB surface with no DCC, plus
     /// the primary surface address.
     fn program_surface(&mut self, surface: &Surface) -> Result<(), Error> {
+        self.program_surface_at(surface, 0)
+    }
+    /// [`Engine::program_surface`] with the viewport starting `x` pixels into
+    /// the surface (`hubp1_set_viewport`), as an ODM slice's pipe fetches.
+    fn program_surface_at(&mut self, surface: &Surface, x: u32) -> Result<(), Error> {
+        if x > 0x3fff || x.saturating_add(surface.viewport_width) > surface.pitch {
+            return Err(Error::Invalid);
+        }
         if surface.pitch == 0
             || surface.pitch < surface.viewport_width
             || surface.viewport_width == 0
@@ -327,7 +335,7 @@ impl<I: Io> Engine<I> {
         self.update(DCSURF_TILING_CONFIG, 0x1f, SW_MODE_LINEAR)?;
         // The pitch register holds one less, and there is no meta pitch.
         self.set(DCSURF_SURFACE_PITCH, surface.pitch - 1)?;
-        self.set(DCSURF_PRI_VIEWPORT_START, 0)?;
+        self.set(DCSURF_PRI_VIEWPORT_START, x)?;
         self.set(
             DCSURF_PRI_VIEWPORT_DIMENSION,
             // linux-lit: 16=HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION__PRI_VIEWPORT_HEIGHT__SHIFT
@@ -446,6 +454,25 @@ impl Hubp {
         self.0.program_pacing(registers)?;
         self.0.program_vready(registers)?;
         self.0.program_surface(surface)
+    }
+    /// [`Hubp::program`] for an ODM slice: the surface fetched from `x`.
+    pub fn program_at(
+        &mut self,
+        surface: &Surface,
+        registers: &Registers,
+        x: u32,
+    ) -> Result<(), Error> {
+        self.0.program_pacing(registers)?;
+        self.0.program_vready(registers)?;
+        self.0.program_surface_at(surface, x)
+    }
+    /// `hubp2_vtg_sel`: the OTG whose timing this HUBP fetches for
+    /// (`DCHUBP_CNTL.HUBP_VTG_SEL`).
+    pub fn select_vtg(&mut self, otg: u8) -> Result<(), Error> {
+        if otg >= self.0.profile.pipes() {
+            return Err(Error::Invalid);
+        }
+        self.0.update(DCHUBP_CNTL, 0xf0, u32::from(otg) << 4)
     }
     /// Blank the pipe, waiting (bounded, then logged) for its outstanding
     /// requests to retire.

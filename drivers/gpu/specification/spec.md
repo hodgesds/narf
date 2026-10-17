@@ -3930,28 +3930,57 @@ DMUB (`dc_is_dmub_outbox_supported` is false outside DCN3.1 DPIA/GC11 unless
 
 ### Navi 22 DCN3.0 mode math
 
-`amdgpu_dml30::plan(&Config, &Soc) -> Result<Plan, Error>` is the DCN3.0
-`display_mode_vba_30.c` performance calculation plus `display_rq_dlg_calc_30.c`
-encoding for one unscaled linear RGB plane on one pipe (GPUVM/HostVM, DCC,
-dynamic metadata, cursor, writeback, ODM/MPC split off), with `dcn3_0_ip` /
-`dcn3_0_soc` constants (184 KiB DET, 84 PTE requests, 191-cycle ping, 404 us
-p-state, 15.5/20 us self refresh, fabric-adjusted urgent latency) in
-`amdgpu_dml::Fx` fixed point. `Soc` carries the board's DCFCLK/fabric/SOCCLK,
-`memclk*16` DRAM rate, VBIOS channel count/width, clock ceilings, DENTIST VCO
-and DCHUB reference. It tries prefetch modes 0..2 and VStartup from 13 to
-`vtotal - vactive - 1` with Linux's bandwidth, urgent-burst, two-line and
-VRatio<=4 checks, and returns `Plan { prefetch_mode, geometry, clocks,
-watermarks, prefetch, registers: amdgpu_dml_regs::Registers, hubbub:
-WatermarkSet (refclk cycles, `convert_and_clamp`), dram_clock_change,
-urgent_bandwidth_thousandths }`. Register fields are Linux's `(unsigned int)`
-truncations and are refused (not wrapped) when they exceed the DCN3.0 mask.
-Out-of-scope planes, PHY/display-clock overruns and unschedulable blanks fail
-before any hardware is touched. Host vectors from a double transliteration of
-the Linux formulas are checked to one LSB.
+`amdgpu_dml30::plan_joint(&[Stream], &Soc) -> Result<JointPlan, Error>` is the
+DCN3.0 admission of a whole context (one to six streams, one unscaled linear
+RGB plane each; GPUVM/HostVM, DCC, dynamic metadata, writeback and MPC combine
+off): `dml30_ModeSupportAndSystemConfigurationFull`'s ODM choice per stream
+(`Odm::TwoToOne` when one pipe's DISPCLK exceeds the DFS-rounded ceiling or a
+DSC line is wider than 5184; 4:1, odd widths and more than six pipes are
+refused), ROB and vertical-active bandwidth support (60% SDP / 40% DRAM), then
+`display_mode_vba_30.c`'s performance calculation across every plane — one
+DISPCLK and one DPPCLK DFS step (each plane its 1/255 DPPCLK share), the summed
+read bandwidth, deep-sleep DCFCLK over all planes, extra latency per active
+DPP, one VStartup search (each plane capped at its own MaxVStartupLines), the
+multi-plane DRAM clock change margin (SynchronizedVBlank false: no OTG sync)
+and stutter critical plane, one watermark set, DSC delay (`dscceComputeDelay`)
+and ODM after-scaler allowance — and `display_rq_dlg_calc_30.c` per pipe (an
+ODM slice's viewport, swath and blank end). `Stream { config, dsc:
+Option<Dsc { slices, bits_per_pixel_x16 }>, phy_khz }` (`Stream::tmds(config)`
+for 8-bpc TMDS); `JointPlan { prefetch_mode, clocks, watermarks, hubbub,
+dram_clock_change, urgent_bandwidth_thousandths, planes: Vec<PlanePlan { odm,
+geometry, prefetch, dppclk_khz, dsc_delay, pipes: [Option<PipePlan {
+viewport_x, viewport_width, registers, cursor }>; 2] }> }`. The prefetch-mode
+policy is `dcn30_internal_validate_bw`'s: mode 0, then mode 1 when mode 0 fails
+or leaves the DRAM clock change unsupported; never mode 2. Without p-state
+support the set A p-state watermark is 0 (`dcn30_fpu_calculate_wm_and_dlg`).
+A top DCFCLK below `dcn3_0_soc.min_dcfclk` (500 MHz) is refused.
+`plan(&Config, &Soc) -> Result<Plan, Error>` is the one-stream, one-pipe form
+(`Plan { prefetch_mode, geometry, clocks, watermarks, prefetch, registers:
+amdgpu_dml_regs::Registers, hubbub: WatermarkSet, dram_clock_change,
+urgent_bandwidth_thousandths, cursor }`; a stream needing ODM is
+`Unsupported` there). `dcn3_0_ip` / `dcn3_0_soc` constants (184 KiB DET per
+pipe, 84 PTE requests, 191-cycle ping, 404 us p-state, 15.5/20 us self refresh,
+fabric-adjusted urgent latency) in `amdgpu_dml::Fx` fixed point. Register
+fields are Linux's `(unsigned int)` truncations and are refused (not wrapped)
+when they exceed the DCN3.0 mask; everything fails before hardware is touched.
+`drivers/gpu/tests/navi22_dml30/check.sh <linux>` compiles Linux's own
+`display_mode_vba.c`, `dcn30/display_mode_vba_30.c`,
+`dcn30/display_rq_dlg_calc_30.c` and `calcs/dcn_calc_math.c` on the host and
+runs them under the same policy (`harness.c`, with DCN30's
+`OutputBppPerState[k][VoltageLevel]` DSC-delay index swap corrected) over
+`vectors.txt` (234 single- and multi-stream, cursor, ODM, DSC and rejection
+cases); `dml30_matches_linux_dml_vectors` checks the port against the same
+file within one LSB (two, upward, on deep-sleep DCFCLK).
 
 `Soc::from_board(levels, channels, width, dchub_refclk)` builds the top
 bounding-box state from the DAL DPM table (DCFCLK doubling as fabric clock,
 `memclk*16`, DENTIST-reachable DISP/DPP ceilings, PHY ceiling, VCO).
+`Soc::states(memory_mhz) -> Vec<Soc>` lists one state per lower UCLK level
+ascending, then the top one (deviation: every state keeps the top DCFCLK,
+where Linux pairs each UCLK with `dcn_bw_get_optimal_dcfclk_fclk_for_uclk`'s);
+`plan_joint_lowest(&[Stream], &[Soc]) -> Result<(usize, JointPlan), Error>`
+is `dcn30_internal_validate_bw`'s voltage-level search: the lowest supporting
+state and its plan.
 `amdgpu_dcn_inventory::vram_channels(vbios)` reads `vram_info` v2.5 module 0
 (`channel_num`, `(1 << channel_width) / 8` bytes) as `get_vram_info_v25` does;
 other revisions are refused.
@@ -3964,6 +3993,56 @@ identically (data/VM-row urgency, trip to memory, SR enter/exit, DRAM clock
 change, FRAC_URG_BW nom/flip), `ARB_SAT_LEVEL = 60 * refclk_mhz`,
 `MIN_REQ_OUTSTAND = 0x1ff`, forces self refresh off, and reads every write
 back; values wider than their DCN3.0 field are refused rather than masked.
+
+### Navi 22 multi-stream contexts, ODM, DSC and DP MST
+
+`amdgpu_navi22_modeset::Resources` is the DCN3.0 pool for several streams:
+`acquire_stream(connector, timing, Odm, dsc) -> Lease { route, odm_pipe, dsc }`
+takes the next pipe, its preferred frontend, a PHY PLL shared with an
+identical synchronizable HDMI timing (`resource_find_used_clk_src_for_sharing`,
+`resource_are_streams_timing_synchronizable`; refcounted, freed by its last
+sharer) or the DP DTO, the ODM secondary pipe from the top of the pool
+(`dcn30_find_split_pipe`) and DSC n for pipe n; `release_stream(&Lease)`.
+`admit(requests, extras, states, vco) -> (Vec<StreamPlan>, JointPlan, Soc)`
+chooses each `Request { link, connector, sink, want, mst }` stream (HDMI by
+`select_hdmi`, DP SST within its verified link by `dp_link::decide_link_settings`
+/ `bandwidth_kbps`, with DSC (`amdgpu_dcn30_dsc::select`) when the
+uncompressed stream does not fit and the sink has DSC and FEC, MST slots
+within one link) and plans them jointly at the lowest supporting state.
+`unsafe Group::new(gpu, cap, &[Request])`, `unsafe enable(power, pool,
+tables, board, links, aux: impl Links, draw(k, y, row)) -> Vec<Output>` and
+`disable(tables, aux)` light the context as `dc_commit_state`:
+`dcn30_init_hw` and the clocks/watermarks once, per stream
+`dcn20_enable_stream_timing` (ODM 2:1 by `optc3_set_odm_combine` after the
+timing), `link_set_dpms_on` (HDMI; DP SST; DP SST with DSC: engines, encoder
+and OPTC config, FEC-ready training through
+`amdgpu_dcn30_dp_link::train_with_retries_fec`, FEC on, DPCD 0x160, PPS on
+VPG generic 11..14; DP MST: the shared link trained once in MST mode, the
+stream's SAT row, ACT, ALLOCATE_PAYLOAD and VC rate), then every front end
+under its OTG lock (`hubp.select_vtg`, an ODM slice's viewport at its offset).
+`leases()`, `plans()`, `joint()`, `members()`, `state() -> GroupState`.
+Pipeline additions: `set_odm_combine`, `set_odm_bypass`,
+`mpc_rate_control_off`; `Hubp::{program_at, select_vtg}`.
+
+`amdgpu_dcn30_dsc` is the DCN2.0 DSC block as DCN3.0 instantiates it:
+`select(timing, dsc_caps, fec_caps, link_kbps) -> Option<DscConfig>`
+(`compute_config_dcn20`: the 1188/1200 MHz encoder rules), `plan(timing,
+cfg, odm) -> Plan { config, picture, engine, odm }`, `engine_values`, and
+`Dsc::{power, start, stop, optc, encoder, pps, fec_ready, fec_enable}`
+(`dsc2_set_config`/`dsc2_enable`, `dccg` DSC forward, `DOMAIN16+n` power
+gating, `enc3_dp_set_dsc_config`, `optc3_set_dsc_config`,
+`enc3_dp_set_dsc_pps_info_packet`, `enc2_fec_set_ready/enable`);
+`sink_caps(aux)` reads DPCD 0x60 and 0x90. `amdgpu_dcn30_dp_link`'s
+`Source::fec_ready` (default no-op) and `train_with_retries_fec(.., fec)`
+add `dp_set_fec_ready` (DPCD 0x120) to the shared training.
+
+`amdgpu_dcn30_mst` is DCN3.0's 8b/10b MST source: `Source::{allocation(
+transmitter, &[Allocation]), vc_rate(fe, (x, y))}`
+(`dcn10_link_encoder_update_mst_stream_allocation_table`,
+`enc1_stream_encoder_set_throttled_vcp_size`), `NativeAux`, `Link { start,
+add, remove, edid, stop }` over the shared `dp_mst_mgr` sideband manager,
+`budget(pixel_khz, link_kbps) -> Option<(pbn, slots, vc)>` and
+`link_kbps(rate, lanes, fec)`; DIG and VBIOS transmitter mode 5 (DP_MST).
 
 ### Navi 22 VBIOS display command tables
 
@@ -4166,22 +4245,41 @@ prepare_display_back_buffer(), flip_display(), set_display_cursor()}` own
 these. `into_recovery` re-prepares DMUB and the display owner from the
 retained VBIOS/routes so the recovered sequence restarts DMUB.
 
-`amdgpu_navi22_kms` holds DRM state: one CRTC (pipe 0, id 1) and one
-connector per board route (ids per `amdgpu_navi48_kms`); connectors offer
+`amdgpu_navi22_kms` holds DRM state: `MAX_CRTCS` (4, the shared id scheme's
+outputs) CRTCs — CRTC 0 (pipe 0, id 1) the single-pipe owner's, CRTCs 1..3
+(`Kms::secondary`) lit only together with it as one multi-stream context —
+and one connector per board route (ids per `amdgpu_navi48_kms`); connectors offer
 the DML30-admitted timings (`Kms::reconcile_sinks(reports, offered)`), a DP
 sink's bounded by its verified link (`modeset::offered_on(sink, soc, vco,
 verified)`, `dp_validate_mode_timing`; the receiver-caps ceiling until
-verified). Automatic routing takes an HDMI sink first, else the first DP one;
-any board port can be routed.
+verified). Automatic routing takes an HDMI sink first, else the first DP one, for
+CRTC 0; with `set_auto_multi(true)` (fb: the `amdgpu.navi22_multi` flag) each
+remaining lightable connector takes the next free secondary CRTC, otherwise
+only DRM routes them. Every connector may drive every CRTC
+(`possible_crtcs`); routing a connector steals it from another CRTC.
+`crtc_at(d)`, `crtc_of(connector)`, `targets()`, `published_at(d)`,
+`offered_at`/`find_mode_at`, and `next_group(running) -> GroupAction {
+Nothing, Unlight, Light(Vec<(crtc, connector, want)>) }` (a context is wanted
+while a secondary CRTC wants a sink; any change relights it whole; a failed
+attempt waits for the next request, `attempted_group`).
 `request_display_{active,route,mode}`, `request_connector_crtc`,
-`display_offers` (TEST_ONLY/SETCRTC validation), `restore_displays`, `publish`,
-`display_admission(admitted, streams)` (`DisplayAdmission`: DML30 DRAM clock
-change; stutter/FCLK/watermark table/deep sleep false). `amdgpu_native_kms`
+`display_offers` (TEST_ONLY/SETCRTC validation), `restore_displays`, `publish`
+apply to any CRTC. `display_admission(admitted, streams)` (`DisplayAdmission`:
+DML30 DRAM clock change; `watermarks` the HUBBUB half — sets A-D programmed
+from the plan — which power saving ANDs with its PMFW table upload;
+stutter/FCLK/deep sleep false). `amdgpu_native_kms`
 dispatches the DRM bridges to Navi22 once it published, else Navi48.
 `amdgpu_navi22_platform::{modeset_displays(draw), spawn_display_monitor(),
 flip_display(), set_display_cursor(), set_hw_cursor(), present_frame(),
 native_present_ready(), crtc_vblank(), vblank_time(), display_admission(),
-relight_after_recovery()}`: publication withdraws the console and drains
+relight_after_recovery()}`: only CRTC 0 presents and has vblank. Each
+monitor pass first converges the multi-stream context (`converge_group`):
+the single pipe is torn down, then every wanted CRTC lights through
+`ColdBoot::modeset_group(requests, draw)` (stopped by `stop_group()`;
+`group_outputs()`, `group()`, `flush_group_scanout()`), the console follows
+stream 0, the other scanouts are static, and `display_admission` reports the
+context's lowest-state plan; when the context fails CRTC 0 lights alone.
+Publication withdraws the console and drains
 `scanout_access` before any teardown; recovery withdraws and stops the pipe
 before reset and the monitor relights once `recoveries()` increments. The fb
 handoff calls `modeset_displays` and the monitor with `amdgpu.native_display`
