@@ -78,7 +78,7 @@ fn sha256_file(path: &Path) -> Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-fn ensure_image(root: &Path, rebuild: bool) -> Result<PathBuf> {
+pub(crate) fn ensure_image(root: &Path, rebuild: bool) -> Result<PathBuf> {
     let image = root.join(IMAGE);
     if image.exists() && !rebuild {
         return Ok(image);
