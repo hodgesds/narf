@@ -69,10 +69,13 @@ impl Io for Fake {
                         0
                     };
                 self.memory[(COMMAND / 4) as usize + 220] = self.tmr_size;
-                if id == 6 && matches!(kind, 13 | 51) {
-                    let address = self
-                        .media_address
-                        .unwrap_or(self.tmr_address + if kind == 13 { 0x1000 } else { 0x100000 });
+                if id == 6 && matches!(kind, 13 | 51 | 58) {
+                    let offset = match kind {
+                        13 => 0x1000,
+                        58 => 0x80000,
+                        _ => 0x100000,
+                    };
+                    let address = self.media_address.unwrap_or(self.tmr_address + offset);
                     self.memory[(COMMAND / 4) as usize + 218] = address as u32;
                     self.memory[(COMMAND / 4) as usize + 219] = (address >> 32) as u32;
                 }

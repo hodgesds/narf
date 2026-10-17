@@ -4,6 +4,8 @@
 
 const MAX_CONTAINER: usize = 4 << 20;
 const MAX_PAYLOAD: usize = 2 << 20;
+/// `GFX_FW_TYPE_VCN1` (psp_gfx_if.h).
+pub(crate) const VCN1_TYPE: u32 = 58;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -266,6 +268,27 @@ impl<'a> Image<'a> {
             });
             self.count += 1;
         }
+    }
+    /// `amdgpu_vcn_setup_ucode`: Linux registers one PSP upload of the shared
+    /// VCN image per unharvested instance, `UCODE_ID_VCN` (GFX_FW_TYPE_VCN,
+    /// 13) for instance 0 and `UCODE_ID_VCN1` (GFX_FW_TYPE_VCN1, 58) for
+    /// instance 1. `mask` bit i selects instance i; other sources are refused.
+    pub(crate) fn for_vcn_instances(mut self, mask: u8) -> Result<Self, Error> {
+        if self.source != Source::Vcn || mask & !3 != 0 || self.count != 1 {
+            return Err(Error::Invalid);
+        }
+        let bytes = self.payloads[0].take().ok_or(Error::Invalid)?.bytes;
+        self.count = 0;
+        for (instance, kind) in [(0, 13), (1, VCN1_TYPE)] {
+            if mask & (1 << instance) != 0 {
+                self.payloads[self.count] = Some(Payload {
+                    bytes,
+                    firmware_type: kind,
+                });
+                self.count += 1;
+            }
+        }
+        Ok(self)
     }
     pub fn source(&self) -> Source {
         self.source
