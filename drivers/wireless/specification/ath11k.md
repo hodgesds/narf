@@ -84,10 +84,11 @@ Phase 3 groundwork — pure codecs, no MMIO, not yet wired to MHI:
   `*_MAX_LEN` and ei array/string bounds), `decode_tlvs` +
   `StructReader` + `tlv_*` helpers (decode: unknown TLV `>= 0x10`
   skipped, `< 0x10` refused; struct members past the end of a
-  struct TLV read as zero, like Linux), `QmiResponse`
+  struct TLV read as zero, like Linux; a missing mandatory TLV
+  leaves its default, like Linux), `QmiResponse`
   (`qmi_response_type_v01`), `QmiError`. Stricter than Linux only
   where Linux over-reads or desynchronises (truncated TLV, basic
-  TLV length ≠ element size) and on a missing mandatory TLV.
+  TLV length ≠ element size).
 - `qmi_wlfw` — the WLFW (service `0x45`) messages ath11k uses,
   byte-identical to the `qmi.c` ei tables: `HostCapReq`,
   `IndRegisterReq`/`Resp`, `RequestMemInd`, `RespondMemReq`,
