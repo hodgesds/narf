@@ -61,6 +61,54 @@ fn mes12_kernel_packets_obey_eight_byte_c_layout() -> TestResult {
     ) {
         return TestResult::Fail("MES12 REMOVE_QUEUE uses wrong status/tail alignment");
     }
+    // MESAPI__RESET: a graphics queue as a legacy HQD (LP fields from 9,
+    // 8-byte MQD at 12 and write pointer at 16), a compute queue by
+    // doorbell; the status lands at 28 either way.
+    let gfx = KernelQueue {
+        kind: QueueType::Graphics,
+        pipe: 0,
+        queue: 0,
+        doorbell: 0x116,
+        ..queue()
+    };
+    let mut p = reset_kernel_queue(gfx, 5).unwrap();
+    p.bind_completion(0x432100002008, 1).unwrap();
+    if !matches(
+        &p,
+        &[
+            (0, 0x40081),
+            (1, 8),
+            (9, 0),
+            (11, 5),
+            (12, 0x1000),
+            (13, 0x1234),
+            (14, 0x116),
+            (16, 0x4008),
+            (17, 0x1234),
+            (28, 0x2008),
+            (29, 0x4321),
+            (30, 1),
+        ],
+    ) {
+        return TestResult::Fail("MES12 RESET of a legacy graphics queue");
+    }
+    let mut p = reset_kernel_queue(queue(), 5).unwrap();
+    p.bind_completion(0x432100002008, 1).unwrap();
+    if !matches(
+        &p,
+        &[
+            (0, 0x40081),
+            (1, 1),
+            (4, 0x174),
+            (8, 1),
+            (28, 0x2008),
+            (29, 0x4321),
+            (30, 1),
+        ],
+    ) || reset_kernel_queue(gfx, 16).is_ok()
+    {
+        return TestResult::Fail("MES12 RESET of a queue by doorbell");
+    }
     let mut p = resources_1(0x123400005000).unwrap();
     p.bind_completion(0x432100002008, 1).unwrap();
     if !matches(

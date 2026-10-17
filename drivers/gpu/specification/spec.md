@@ -4717,9 +4717,20 @@ memory, page tables and VMIDs — still waits for the hardware fence.
 it before queueing (amdgpu_ctx_get_entity); `CTX QUERY_STATE2` reports
 RESET, plus GUILTY for `TimedOut`, and `QUERY_STATE` `UNKNOWN_RESET`. The
 Navi48 platform spawns a watchdog that checks its rings every 100 ms while
-its submitter stays registered. A hung ring stays hung (no queue reset
-yet). VRAM clear fences follow SDMA0's hardware fence only, never a
-timeout's verdict.
+its submitter stays registered. A hung graphics ring is recovered as
+gfx_v12_0_reset_kgq: `Mes::reset_kernel_queue(queue, vmid)` sends MES12
+RESET (`amdgpu_mes12::reset_kernel_queue`: `reset_legacy_gfx` with the
+HQD's pipe, queue, VMID, MQD, doorbell and write pointer; other queues by
+doorbell with `reset_queue_only`), then `Queues::submit_fence` queues a
+fence-only slot as the ring test, which needs a free slot and must land
+within 100 ms (`ColdBoot::recover_client_ring`). Only then does
+`RingWatch::recovered` let the ring take jobs again; the hung and canceled
+jobs keep their errors (`RingWatch::error` remembers the last hang), and
+their memory is retired by the test fence, the first proof the CP moved
+past them. Innocent jobs are not re-emitted, and the compute and SDMA
+rings stay hung once hung (Linux resets a compute kernel queue by MMIO
+and remaps it). VRAM clear fences follow SDMA0's hardware fence only,
+never a timeout's verdict.
 
 The Navi48 platform registers both kernel queues as its card's submitter
 after boot: up to eight IBs per submission (`Job::new`, in order in one

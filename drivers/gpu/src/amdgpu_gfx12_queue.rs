@@ -218,6 +218,20 @@ fn job_packets(
     built.map_err(|_| Error::Invalid)?;
     Ok(words)
 }
+/// A slot that only writes `seq` to `fence` (the job frame's RELEASE_MEM),
+/// padded with one NOP.
+fn fence_packets(fence: u64, seq: u32) -> Result<[u32; 256], Error> {
+    use crate::amdgpu_pm4::Pm4Builder;
+    let mut words = [0u32; 256];
+    let mut b = Pm4Builder::new(&mut words);
+    let built = (|| {
+        b.release_mem_fence(fence, u64::from(seq), false, true)?;
+        let used = b.words().len();
+        b.nop(256 - used - 1)
+    })();
+    built.map_err(|_| Error::Invalid)?;
+    Ok(words)
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Proof {
     pub graphics_fence: u32,
@@ -683,6 +697,24 @@ impl<I: Io> Engine<I> {
     /// sequence on that ring; `completed_job` reports when its fence
     /// passes it.
     fn submit(&mut self, pipe: Pipe, job: Job) -> Result<u32, Error> {
+        let (gc, oss) = ((self.layout.gc / 4) as u32, (self.layout.oss / 4) as u32);
+        self.submit_slot(pipe, |fence, seq| {
+            job_packets(pipe, job, gc, oss, fence, seq)
+        })
+    }
+    /// Queue a slot of nothing but the next sequence's fence on `pipe`: the
+    /// ring test after a reset (amdgpu_ring_test_ring). Once the fence
+    /// passes it, the CP has moved past every earlier slot.
+    fn submit_fence(&mut self, pipe: Pipe) -> Result<u32, Error> {
+        self.submit_slot(pipe, fence_packets)
+    }
+    /// Write the slot `build` makes for the next sequence and its fence
+    /// address onto `pipe`'s ring, after both proofs, if the slot is free.
+    fn submit_slot(
+        &mut self,
+        pipe: Pipe,
+        build: impl FnOnce(u64, u32) -> Result<[u32; 256], Error>,
+    ) -> Result<u32, Error> {
         if self.state != State::InterruptVerified {
             return Err(Error::Busy);
         }
@@ -694,7 +726,7 @@ impl<I: Io> Engine<I> {
         let wptr = self.job_wptr[i].max(512);
         let seq = self.job_seq[i].wrapping_add(1);
         let fence = self.memory.address() + base + JOB_FENCE;
-        let words = job_packets(pipe, job, (l.gc / 4) as u32, (l.oss / 4) as u32, fence, seq)?;
+        let words = build(fence, seq)?;
         self.access(|io| {
             flush(io, l);
             let rptr = u64::from(io.memory_read(map, base + RPTR));
@@ -823,6 +855,27 @@ impl Queues {
         self.0.submit(pipe, job)
     }
     /// The last client job sequence `pipe`'s ring completed.
+    /// Queue the ring test after a reset (see `Engine::submit_fence`).
+    /// # Safety
+    /// As `submit`.
+    pub unsafe fn submit_fence(&mut self, pipe: Pipe) -> Result<u32, Error> {
+        self.0.submit_fence(pipe)
+    }
+    /// `pipe`'s queue as MES maps (and resets) it.
+    pub fn kernel_queue(&self, pipe: Pipe) -> api::KernelQueue {
+        let m = qmem(self.0.memory.address(), pipe.index());
+        api::KernelQueue {
+            kind: match pipe {
+                Pipe::Graphics => api::QueueType::Graphics,
+                Pipe::Compute => api::QueueType::Compute,
+            },
+            pipe: 0,
+            queue: 0,
+            doorbell: m.doorbell,
+            mqd: m.descriptor,
+            write_pointer: m.write_pointer,
+        }
+    }
     pub fn completed_job(&mut self, pipe: Pipe) -> Result<u32, Error> {
         self.0.completed_job(pipe)
     }

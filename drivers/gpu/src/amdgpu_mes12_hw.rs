@@ -532,6 +532,28 @@ impl<I: Io> Engine<I> {
         };
         result
     }
+    async fn reset_kernel_queue(&mut self, queue: api::KernelQueue, vmid: u8) -> Result<(), Error> {
+        if self.state != State::Ready {
+            return Err(Error::Busy);
+        }
+        let doorbell = match queue.kind {
+            api::QueueType::Graphics => 0x116,
+            api::QueueType::Compute => 6,
+            _ => return Err(Error::Invalid),
+        };
+        if queue.pipe != 0 || queue.queue != 0 || queue.doorbell != doorbell {
+            return Err(Error::Invalid);
+        }
+        let packet = api::reset_kernel_queue(queue, vmid).map_err(|_| Error::Invalid)?;
+        let result = self.submit(0, packet).await;
+        // A rejected reset leaves MES answering; one it never completed
+        // does not.
+        self.state = match result {
+            Ok(()) | Err(Error::FirmwareRejected(_)) => State::Ready,
+            Err(e) => State::Failed(e),
+        };
+        result
+    }
 }
 #[derive(Debug)]
 pub struct Mes(Engine<Mmio>);
@@ -668,6 +690,20 @@ impl Mes {
         queue: api::KernelQueue,
     ) -> Result<(), Error> {
         self.0.map_bootstrap_queue(queue).await
+    }
+    /// Reset one of the two bootstrap kernel queues, mapped as
+    /// `map_bootstrap_queue` mapped it, whose job on VMID `vmid` hung
+    /// (amdgpu_mes_reset_legacy_queue). The queue stays mapped.
+    /// # Safety
+    /// As `map_bootstrap_queue`: the caller owns that HQD and serializes
+    /// every user of it, and keeps all memory its jobs may reach until a
+    /// later fence on it proves the CP has moved past them.
+    pub(crate) async unsafe fn reset_kernel_queue(
+        &mut self,
+        queue: api::KernelQueue,
+        vmid: u8,
+    ) -> Result<(), Error> {
+        self.0.reset_kernel_queue(queue, vmid).await
     }
 }
 

@@ -7,14 +7,16 @@
 //! longer than [`JOB_TIMEOUT_NS`] the ring is hung: that job ends with
 //! `TimedOut` (`-ETIME`) and its context becomes guilty; every job queued
 //! behind it ends with `Canceled` (`-ECANCELED`) and its context records
-//! that. A hung ring takes no new jobs until it is recovered.
+//! that. A hung ring takes no new jobs until it is [`recovered`]
+//! (`RingWatch::recovered`), and those jobs keep their errors after it.
 //!
 //! An error ends a job for its waiters only. What the job may still touch
 //! — its buffers, page tables and VMID — is released by the hardware fence
-//! alone, so memory never returns while a hung engine could reach it.
+//! alone, so memory never returns while a hung engine could reach it; a
+//! recovery proves the engine let go by a later fence on the same ring.
 //!
-//! LINUX-GAP: Linux resets the ring (through MES on GFX12) and re-runs the
-//! innocent jobs; until that exists here a hung ring stays hung.
+//! LINUX-GAP: Linux re-runs the innocent jobs after a ring reset; here
+//! they stay canceled.
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -36,12 +38,16 @@ fn reached(completed: u32, seq: u32) -> bool {
 /// One ring's jobs in flight and whether it hung.
 #[derive(Debug, Default)]
 pub struct RingWatch {
-    /// Submitted, not yet seen complete, oldest first.
-    pending: VecDeque<(u32, Arc<Health>)>,
+    /// Submitted, not yet seen complete, oldest first: sequence, VMID and
+    /// context health.
+    pending: VecDeque<(u32, u8, Arc<Health>)>,
     /// When the front job became the front, in monotonic ns.
     front_since: u64,
-    /// The job that hung the ring, once it has.
-    hung: Option<u32>,
+    /// The ring hung and has not been recovered.
+    hung: bool,
+    /// The last hang's jobs: the one that timed out and the last one
+    /// canceled behind it.
+    failed: Option<(u32, u32)>,
 }
 
 impl RingWatch {
@@ -49,21 +55,23 @@ impl RingWatch {
         Self {
             pending: VecDeque::new(),
             front_since: 0,
-            hung: None,
+            hung: false,
+            failed: None,
         }
     }
 
     /// Whether new jobs must be refused (`Canceled`), as the ring hung.
     pub fn refusing(&self) -> Option<FsError> {
-        self.hung.map(|_| FsError::Canceled)
+        self.hung.then_some(FsError::Canceled)
     }
 
-    /// Job `seq` of a context with `health` went onto the ring at `now`.
-    pub fn submitted(&mut self, seq: u32, health: Arc<Health>, now: u64) {
+    /// Job `seq` on VMID `vmid` of a context with `health` went onto the
+    /// ring at `now`.
+    pub fn submitted(&mut self, seq: u32, vmid: u8, health: Arc<Health>, now: u64) {
         if self.pending.is_empty() {
             self.front_since = now;
         }
-        self.pending.push_back((seq, health));
+        self.pending.push_back((seq, vmid, health));
     }
 
     /// Whether any job is still in flight.
@@ -72,40 +80,49 @@ impl RingWatch {
     }
 
     /// Forget the jobs up to `completed`; if the front job has now been
-    /// there past the timeout, hang the ring and return that job.
-    pub fn check(&mut self, completed: u32, now: u64) -> Option<u32> {
-        let front = self.pending.front().map(|(seq, _)| *seq);
+    /// there past the timeout, hang the ring and return that job's
+    /// sequence and VMID.
+    pub fn check(&mut self, completed: u32, now: u64) -> Option<(u32, u8)> {
+        let front = self.pending.front().map(|(seq, ..)| *seq);
         while self
             .pending
             .front()
-            .is_some_and(|(seq, _)| reached(completed, *seq))
+            .is_some_and(|(seq, ..)| reached(completed, *seq))
         {
             self.pending.pop_front();
         }
-        let (seq, health) = self.pending.front()?;
-        if front != Some(*seq) {
+        let &(seq, vmid, ref health) = self.pending.front()?;
+        if front != Some(seq) {
             self.front_since = now;
             return None;
         }
-        if self.hung.is_some() || now.saturating_sub(self.front_since) <= JOB_TIMEOUT_NS {
+        if self.hung || now.saturating_sub(self.front_since) <= JOB_TIMEOUT_NS {
             return None;
         }
         health.mark_guilty();
-        for (_, behind) in self.pending.iter().skip(1) {
+        for (_, _, behind) in self.pending.iter().skip(1) {
             behind.mark_canceled();
         }
-        self.hung = Some(*seq);
-        self.hung
+        let last = self.pending.back().map_or(seq, |(s, ..)| *s);
+        self.hung = true;
+        self.failed = Some((seq, last));
+        Some((seq, vmid))
     }
 
-    /// How job `seq` ended, if it did not complete normally: the job that
-    /// hung the ring timed out, and each later one that has not completed
-    /// was canceled.
-    pub fn error(&self, seq: u32, completed: u32) -> Option<FsError> {
-        let hung = self.hung?;
+    /// The ring was reset and a later fence on it proved the engine moved
+    /// past every job it held: take jobs again.
+    pub fn recovered(&mut self) {
+        self.hung = false;
+        self.pending.clear();
+    }
+
+    /// How job `seq` ended, if the last hang ended it: the job that hung
+    /// the ring timed out, and those queued behind it were canceled.
+    pub fn error(&self, seq: u32) -> Option<FsError> {
+        let (hung, last) = self.failed?;
         if seq == hung {
             Some(FsError::TimedOut)
-        } else if seq.wrapping_sub(hung) as i32 > 0 && !reached(completed, seq) {
+        } else if seq.wrapping_sub(hung) as i32 > 0 && last.wrapping_sub(seq) as i32 >= 0 {
             Some(FsError::Canceled)
         } else {
             None
@@ -121,7 +138,8 @@ mod tests {
     const S: u64 = 1_000_000_000;
 
     /// The front job times out counted from when it reached the front; it
-    /// is guilty, the jobs behind it canceled, and the ring refuses more.
+    /// is guilty, the jobs behind it canceled, and the ring refuses more
+    /// until it is recovered; the errors outlive the recovery.
     fn ring_watch_times_out_the_front_job() -> TestResult {
         let (a, b, c) = (
             Arc::new(Health::default()),
@@ -133,20 +151,20 @@ mod tests {
             return TestResult::Fail("idle ring hung");
         }
         // Sequences straddle the 32-bit wrap.
-        w.submitted(u32::MAX, a.clone(), 0);
-        w.submitted(0, b.clone(), S);
-        w.submitted(1, c.clone(), S);
+        w.submitted(u32::MAX, 1, a.clone(), 0);
+        w.submitted(0, 2, b.clone(), S);
+        w.submitted(1, 3, c.clone(), S);
         if w.check(u32::MAX - 1, JOB_TIMEOUT_NS).is_some() {
             return TestResult::Fail("hung at exactly the timeout");
         }
         // The first job completes late; the second's clock starts now.
         if w.check(u32::MAX, 3 * S).is_some()
             || w.check(u32::MAX, 3 * S + JOB_TIMEOUT_NS).is_some()
-            || w.error(0, u32::MAX).is_some()
+            || w.error(0).is_some()
         {
             return TestResult::Fail("timeout not counted from reaching the front");
         }
-        if w.check(u32::MAX, 3 * S + JOB_TIMEOUT_NS + 1) != Some(0) {
+        if w.check(u32::MAX, 3 * S + JOB_TIMEOUT_NS + 1) != Some((0, 2)) {
             return TestResult::Fail("front job past its timeout did not hang");
         }
         if a.error().is_some()
@@ -155,21 +173,35 @@ mod tests {
         {
             return TestResult::Fail("context health after a hang");
         }
-        if w.error(u32::MAX, u32::MAX).is_some()
-            || w.error(0, u32::MAX) != Some(FsError::TimedOut)
-            || w.error(1, u32::MAX) != Some(FsError::Canceled)
+        if w.error(u32::MAX).is_some()
+            || w.error(0) != Some(FsError::TimedOut)
+            || w.error(1) != Some(FsError::Canceled)
+            || w.error(2).is_some()
             || w.refusing() != Some(FsError::Canceled)
         {
             return TestResult::Fail("job errors after a hang");
         }
-        // A hang is reported once, and the guilty job keeps its error even
-        // if it finally completes; a canceled job that completes does not.
-        if w.check(1, 10 * S).is_some()
-            || w.error(0, 1) != Some(FsError::TimedOut)
-            || w.error(1, 1).is_some()
+        // A hang is reported once.
+        if w.check(u32::MAX, 20 * S).is_some() || !w.busy() {
+            return TestResult::Fail("hang reported twice");
+        }
+        // Recovery takes jobs again and keeps the errors; a later job
+        // times out afresh.
+        w.recovered();
+        if w.refusing().is_some()
             || w.busy()
+            || w.error(0) != Some(FsError::TimedOut)
+            || w.error(1) != Some(FsError::Canceled)
         {
-            return TestResult::Fail("errors after the hung jobs completed");
+            return TestResult::Fail("errors after recovery");
+        }
+        let d = Arc::new(Health::default());
+        w.submitted(3, 4, d.clone(), 30 * S);
+        if w.check(2, 30 * S + JOB_TIMEOUT_NS + 1) != Some((3, 4))
+            || d.error() != Some(FsError::TimedOut)
+            || w.error(1).is_some()
+        {
+            return TestResult::Fail("hang after recovery");
         }
         // Guilt is not downgraded by a later cancellation.
         b.mark_canceled();

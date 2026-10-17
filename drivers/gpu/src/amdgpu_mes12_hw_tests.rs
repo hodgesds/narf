@@ -96,6 +96,21 @@ impl Fake {
                     self.active[0] = true;
                     38
                 }
+                // RESET: a legacy graphics HQD by its fields, any other
+                // kernel queue by doorbell.
+                8 => {
+                    if words[8] == 0 {
+                        assert_eq!(&words[1..2], &[8]);
+                        assert_eq!(&words[9..11], &[0, 0]);
+                        assert!(words[11] < 16);
+                        assert_eq!(ptr(12), GPU + 4096);
+                        assert_eq!(words[14], 0x116);
+                        assert_eq!(ptr(16), GPU + 12296);
+                    } else {
+                        assert_eq!((words[1], words[4], words[8]), (1, 6, 1));
+                    }
+                    28
+                }
                 11 => 2,
                 _ => panic!("unexpected MES12 opcode"),
             };
@@ -487,3 +502,35 @@ kernel_test_in!(
     "drivers/gpu/mes12",
     mes12_hw_maps_bootstrap_kernel_queues_on_scheduler_pipe
 );
+
+/// A hung bootstrap queue is reset on the scheduler pipe (opcode 8); a
+/// firmware rejection leaves MES ready, and only the two bootstrap HQDs
+/// may be named.
+fn mes12_hw_resets_bootstrap_kernel_queues() -> TestResult {
+    let (_, mut e) = fixture();
+    let mut q = api::KernelQueue {
+        kind: api::QueueType::Graphics,
+        pipe: 0,
+        queue: 0,
+        doorbell: 0x116,
+        mqd: GPU + 4096,
+        write_pointer: GPU + 12296,
+    };
+    assert_eq!(run(e.reset_kernel_queue(q, 3)), Err(Error::Busy));
+    run(e.start()).unwrap();
+    assert_eq!(run(e.reset_kernel_queue(q, 3)), Ok(()));
+    assert_eq!(e.io.frames.last(), Some(&(0, 8)));
+    q.doorbell = 6;
+    assert_eq!(run(e.reset_kernel_queue(q, 3)), Err(Error::Invalid));
+    q.kind = api::QueueType::Compute;
+    assert_eq!(run(e.reset_kernel_queue(q, 16)), Err(Error::Invalid));
+    assert_eq!(e.state, State::Ready);
+    e.io.reject = true;
+    assert!(matches!(
+        run(e.reset_kernel_queue(q, 3)),
+        Err(Error::FirmwareRejected(_))
+    ));
+    assert_eq!(e.state, State::Ready);
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/mes12", mes12_hw_resets_bootstrap_kernel_queues);

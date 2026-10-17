@@ -274,7 +274,9 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
 /// A watchdog (`watchdog`) times out a ring's front job after
 /// `amdgpu_ring_watch::JOB_TIMEOUT_NS`: it ends with ETIME, the jobs behind
 /// it with ECANCELED, and the ring takes no more. Their memory still waits
-/// for the hardware fence.
+/// for the hardware fence. The graphics ring is then reset through MES and
+/// tested (`ColdBoot::recover_client_ring`); once the test's fence lands
+/// it takes jobs again. The compute and SDMA rings stay hung.
 ///
 /// AMDGPU_INFO keeps reporting acceleration unavailable, so Mesa does not
 /// submit here.
@@ -324,8 +326,10 @@ impl Submitter {
         crate::amdgpu_cs::retire(self.card, &|t| job_done(completed, t));
         Some(completed)
     }
-    /// Time out the front job of every ring that has held it too long.
-    fn watch(&self) {
+    /// Time out the front job of every ring that has held it too long,
+    /// and recover the rings that can be.
+    async fn watch(&self) {
+        use core::fmt::Write as _;
         if !self.watch.lock().iter().any(|w| w.busy()) {
             return;
         }
@@ -335,21 +339,49 @@ impl Submitter {
         let now = narf_time::monotonic_ns();
         for (ring, &done) in completed.iter().enumerate() {
             let hung = self.watch.lock()[ring].check(done, now);
-            if let Some(seq) = hung {
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "amdgpu: navi48 ring {ring} timeout, signaled seq={}, job {seq} hung; ring stopped",
-                    done
-                );
+            let Some((seq, vmid)) = hung else {
+                continue;
+            };
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi48 ring {ring} timeout, signaled seq={}, job {seq} hung",
+                done
+            );
+            let recovered = match PIPES.get(ring) {
+                Some(&pipe) => {
+                    let mut owner = OWNER.lock().await;
+                    match owner.as_mut() {
+                        // SAFETY: OWNER serializes the queues and MES; every
+                        // job on the ring holds its memory until its fence,
+                        // which only the ring test's proves passed.
+                        Some(boot) => unsafe { boot.recover_client_ring(pipe, vmid) }.await,
+                        None => Err(crate::amdgpu_gfx12_queue::Error::DeviceGone),
+                    }
+                }
+                None => Err(crate::amdgpu_gfx12_queue::Error::Unsupported),
+            };
+            match recovered {
+                Ok(test) => {
+                    self.watch.lock()[ring].recovered();
+                    let _ = self.progress();
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: navi48 ring {ring} reset succeeded (test fence {test})"
+                    );
+                }
+                Err(e) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: navi48 ring {ring} reset failed ({e:?}); ring stopped"
+                    );
+                }
             }
         }
     }
     /// How job `ticket` ended if not by completing (see `RingWatch`).
-    fn job_error(&self, ticket: u64, completed: [u32; RINGS]) -> Option<narf_filesystem::FsError> {
+    fn job_error(&self, ticket: u64) -> Option<narf_filesystem::FsError> {
         let ring = (ticket >> 32) as usize;
-        let done = *completed.get(ring)?;
-        self.watch.lock()[ring].error(ticket as u32, done)
+        self.watch.lock().get(ring)?.error(ticket as u32)
     }
 }
 
@@ -363,7 +395,7 @@ async fn watchdog(submitter: Arc<Submitter>) {
         if !current.is_some_and(|c| Arc::ptr_eq(&c, &ours)) {
             return;
         }
-        submitter.watch();
+        submitter.watch().await;
     }
 }
 impl crate::amdgpu_cs::Submitter for Submitter {
@@ -380,12 +412,11 @@ impl crate::amdgpu_cs::Submitter for Submitter {
     fn signalled(&self, ticket: u64) -> bool {
         // A revoked or vanished device makes no more progress; report done
         // so waiters cannot wedge.
-        self.progress().is_none_or(|completed| {
-            job_done(completed, ticket) || self.job_error(ticket, completed).is_some()
-        })
+        self.progress()
+            .is_none_or(|completed| job_done(completed, ticket) || self.job_error(ticket).is_some())
     }
     fn error(&self, ticket: u64) -> Option<narf_filesystem::FsError> {
-        self.job_error(ticket, self.progress()?)
+        self.job_error(ticket)
     }
     fn submit<'a>(
         &'a self,
@@ -483,6 +514,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                     self.contexts.lock()[ring as usize] = entity;
                     self.watch.lock()[ring as usize].submitted(
                         seq,
+                        job.vmid,
                         health.clone(),
                         narf_time::monotonic_ns(),
                     );
@@ -509,7 +541,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             }
             loop {
                 let completed = self.progress().ok_or(FsError::NoDevice)?;
-                if job_done(completed, ticket) || self.job_error(ticket, completed).is_some() {
+                if job_done(completed, ticket) || self.job_error(ticket).is_some() {
                     return Ok(true);
                 }
                 if narf_time::monotonic_ns() >= deadline_ns {

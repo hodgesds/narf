@@ -719,6 +719,48 @@ impl ColdBoot {
         // SAFETY: the caller's obligations.
         unsafe { queues.submit(pipe, job) }
     }
+    /// Recover the graphics ring after its job on VMID `vmid` hung, as
+    /// gfx_v12_0_reset_kgq does: MES resets the legacy HQD in place, then
+    /// a fence-only slot tests the ring (amdgpu_ring_test_ring). Once that
+    /// fence lands the CP has moved past every earlier slot, so the hung
+    /// and abandoned jobs' fences read complete through it. Returns that
+    /// fence's sequence. LINUX-GAP: the jobs behind the hung one are not
+    /// re-emitted, and the compute ring (an MMIO dequeue and remap in
+    /// Linux) has no reset yet.
+    /// # Safety
+    /// As `submit_client_job`, and every job on the ring keeps what it
+    /// reaches until this returns Ok.
+    pub(crate) async unsafe fn recover_client_ring(
+        &mut self,
+        pipe: queues::Pipe,
+        vmid: u8,
+    ) -> Result<u32, queues::Error> {
+        if pipe != queues::Pipe::Graphics {
+            return Err(queues::Error::Unsupported);
+        }
+        let hardware = &mut self.sequence.backend;
+        let queues = hardware.queues.as_mut().ok_or(queues::Error::Invalid)?;
+        let mes = hardware.mes.as_mut().ok_or(queues::Error::Invalid)?;
+        // SAFETY: the platform serializes both queues and MES under its
+        // owner; the caller keeps the ring's jobs' memory until Ok.
+        unsafe { mes.reset_kernel_queue(queues.kernel_queue(pipe), vmid) }
+            .await
+            .map_err(queues::Error::Mes)?;
+        // SAFETY: as above; the slot reaches only the queue's own fence.
+        let seq = unsafe { queues.submit_fence(pipe) }?;
+        // amdgpu's usec_timeout for a ring test.
+        let deadline = narf_time::Deadline::after_us(100_000);
+        loop {
+            let done = queues.completed_job(pipe)?;
+            if done.wrapping_sub(seq) as i32 >= 0 {
+                return Ok(seq);
+            }
+            if deadline.expired() {
+                return Err(queues::Error::Timeout);
+            }
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(50).as_instant()).await;
+        }
+    }
     /// Queue a client job on SDMA0 (see `sdma::Sdma::submit`).
     /// # Safety
     /// As `submit_client_job`.

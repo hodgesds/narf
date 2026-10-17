@@ -825,6 +825,30 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
     {
         return TestResult::Fail("full ring");
     }
+    // The ring test after a reset needs a free slot too: the CP must have
+    // let go of the stalled jobs first.
+    if e.submit_fence(Pipe::Graphics) != Err(Error::Busy) {
+        return TestResult::Fail("ring test on a ring the CP never drained");
+    }
+    // A reset that dropped the stalled slots (RPTR caught up): the test is
+    // a fence of the next sequence and nothing else.
+    e.io.memory[2560] = e.job_wptr[0] as u32;
+    e.io.complete = true;
+    let (ibs, writes, waits) = (
+        e.io.job_ibs.len(),
+        e.io.job_writes.len(),
+        e.io.job_waits.len(),
+    );
+    if e.submit_fence(Pipe::Graphics) != Ok(11)
+        || e.completed_job(Pipe::Graphics) != Ok(11)
+        || (
+            e.io.job_ibs.len(),
+            e.io.job_writes.len(),
+            e.io.job_waits.len(),
+        ) != (ibs, writes, waits)
+    {
+        return TestResult::Fail("ring test slot");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
