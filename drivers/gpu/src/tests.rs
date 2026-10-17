@@ -13477,6 +13477,94 @@ kernel_test_in!(
     smoke_amdgpu_gem_metadata_round_trips
 );
 
+/// Sparse binding as RADV drives it: a PRT range with no buffer (handle 0),
+/// whose entries carry PRT without VALID; REPLACE commits a buffer into
+/// part of it and REPLACE with PRT decommits it again; CLEAR drops it. A
+/// non-PRT map still needs a buffer.
+fn smoke_amdgpu_vm_prt_ranges_back_sparse_binding() -> TestResult {
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, VmState, GPU_PAGE_SIZE as P, PTE_PRT, PTE_VALID};
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+    let gem = GemState::new();
+    let state = VmState::new();
+    let va_op = |op: u32, flags: u32, handle: u32, va: u64, size: u64| {
+        let mut r = [0u8; 40];
+        r[0..4].copy_from_slice(&handle.to_le_bytes());
+        r[8..12].copy_from_slice(&op.to_le_bytes());
+        r[12..16].copy_from_slice(&flags.to_le_bytes());
+        r[16..24].copy_from_slice(&va.to_le_bytes());
+        r[32..40].copy_from_slice(&size.to_le_bytes());
+        vm::dispatch(
+            DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA,
+            r.as_mut_ptr() as usize,
+            &state,
+            &gem,
+        )
+    };
+    const BASE: u64 = 0x5_0000_0000;
+    const RW: u32 = u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE;
+    let prt = |va| {
+        state
+            .leaf_entry(va)
+            .is_some_and(|e| e & PTE_PRT != 0 && e & PTE_VALID == 0)
+    };
+    let result = (|| -> Result<(), &'static str> {
+        if va_op(u::AMDGPU_VA_OP_MAP, RW, 0, BASE, 4 * P).is_ok() {
+            return Err("a non-PRT map without a buffer");
+        }
+        va_op(u::AMDGPU_VA_OP_MAP, u::AMDGPU_VM_PAGE_PRT, 0, BASE, 4 * P).map_err(|_| "PRT map")?;
+        if !(0..4).all(|i| prt(BASE + i * P)) || state.mapped_object(BASE).is_some() {
+            return Err("PRT entries");
+        }
+        let h = gem_create_on(&gem, 2 * P, u::AMDGPU_GEM_DOMAIN_GTT).map_err(|_| "create")?;
+        let o = gem.object(h).ok_or("object")?;
+        va_op(u::AMDGPU_VA_OP_REPLACE, RW, h, BASE + P, 2 * P).map_err(|_| "commit")?;
+        for i in 1..3 {
+            let e = state.leaf_entry(BASE + i * P).ok_or("committed entry")?;
+            if e & PTE_VALID == 0
+                || e & PTE_PRT != 0
+                || Some(e & 0xffff_ffff_f000) != o.gpu_at((i - 1) * P)
+            {
+                return Err("committed pages");
+            }
+        }
+        if !prt(BASE) || !prt(BASE + 3 * P) || state.mapped_object(BASE + P).is_none() {
+            return Err("PRT edges around a commit");
+        }
+        va_op(
+            u::AMDGPU_VA_OP_REPLACE,
+            u::AMDGPU_VM_PAGE_PRT,
+            0,
+            BASE + P,
+            2 * P,
+        )
+        .map_err(|_| "decommit")?;
+        if !(0..4).all(|i| prt(BASE + i * P)) || state.mapped_object(BASE + P).is_some() {
+            return Err("decommitted pages");
+        }
+        va_op(u::AMDGPU_VA_OP_CLEAR, 0, 0, BASE, 4 * P).map_err(|_| "clear")?;
+        if (0..4).any(|i| {
+            state
+                .leaf_entry(BASE + i * P)
+                .is_some_and(|e| e != 0 && e & PTE_PRT != 0)
+        }) || state.lookup(BASE).is_some()
+            || state.table_count() != 0
+        {
+            return Err("cleared range");
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_vm_prt_ranges_back_sparse_binding
+);
+
 /// GTT buffers are buddy chunks covering exactly their pages: three pages
 /// are two chunks, 33 MiB (past the allocator's 32 MiB blocks) works, and
 /// the frames, the GPU entries and CPU access agree page by page. Usage

@@ -4631,6 +4631,12 @@ paths; only the tables differ.
   the buffer's unsignalled KERNEL fences to its space
   (`VmState::depend_on`), and `AMDGPU_CS` waits for the space's
   `VmState::kernel_fences()` before queueing.
+- PRT (`GEM_VA` with `AMDGPU_VM_PAGE_PRT`): MAP/REPLACE record a range
+  with no buffer (the handle is not looked up, as amdgpu_gem_va_ioctl maps
+  it through `prt_va`) whose entries carry PRT without VALID; REPLACE with
+  a buffer commits pages into it and REPLACE with PRT decommits them;
+  UNMAP/CLEAR drop it. `VmState::mapped_object` is None there. This is
+  what RADV's sparse binding and radeonsi's sparse buffers use.
 - PRIME (`drm_devfs_bridge::AmdgpuDmaBufFile`): `PRIME_HANDLE_TO_FD` on an
   amdgpu card or render open exports a GEM buffer as a dma-buf that holds
   it (pages outlive every handle while the fd or a mapping of it lives),
