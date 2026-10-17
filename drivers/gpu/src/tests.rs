@@ -11469,7 +11469,6 @@ fn smoke_amdgpu_cs_parser_rejects_hostile_input() -> TestResult {
     // ── chunks that are refused rather than ignored ──
     // A dropped ordering constraint is a race, not an error.
     for id in [
-        u::AMDGPU_CHUNK_ID_DEPENDENCIES,
         u::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT,
         u::AMDGPU_CHUNK_ID_FENCE,
     ] {
@@ -11797,6 +11796,26 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
         let mut c = cs_with(&[(u::AMDGPU_CHUNK_ID_BO_HANDLES, bad)]);
         if run(cs_cmd, &mut c.req) != Err(FsError::NotFound) {
             return Some("BO list naming a foreign handle");
+        }
+        // DEPENDENCIES on completed jobs pass; a foreign context or another
+        // engine is refused.
+        let dep =
+            |ip: u32, ctx: u32, h: u64| alloc::vec![ip, 0, 0, ctx, h as u32, (h >> 32) as u32];
+        let mut c = cs_with(&[(
+            u::AMDGPU_CHUNK_ID_DEPENDENCIES,
+            dep(u::AMDGPU_HW_IP_GFX, ctx_id, 2),
+        )]);
+        if run(cs_cmd, &mut c.req).is_err() {
+            return Some("CS after a completed dependency");
+        }
+        for (ip, cx, want) in [
+            (u::AMDGPU_HW_IP_GFX, ctx_id + 99, FsError::InvalidData),
+            (u::AMDGPU_HW_IP_COMPUTE, ctx_id, FsError::Unsupported),
+        ] {
+            let mut c = cs_with(&[(u::AMDGPU_CHUNK_ID_DEPENDENCIES, dep(ip, cx, 1))]);
+            if run(cs_cmd, &mut c.req) != Err(want) {
+                return Some("bad dependency");
+            }
         }
         None
     })();

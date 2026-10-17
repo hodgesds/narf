@@ -59,10 +59,9 @@
 //! client reaches this ioctl at all; it is reachable only by something that
 //! ignored that answer.
 //!
-//! LINUX-GAP: besides IBs, only `SYNCOBJ_IN`/`_OUT` and `BO_HANDLES`
-//! chunks are accepted. `DEPENDENCIES`, `SCHEDULED_DEPENDENCIES`, timeline
-//! syncobjs and `FENCE` each express a constraint this does not honour yet,
-//! and are REFUSED rather than ignored: a client that asked for its work
+//! LINUX-GAP: besides IBs, `SYNCOBJ_IN`/`_OUT`, `BO_HANDLES` and the two
+//! dependency chunks are accepted. Timeline syncobjs and `FENCE` each
+//! express a constraint this does not honour yet, and are REFUSED rather than ignored: a client that asked for its work
 //! to wait on a fence and had that silently dropped would get a race, not
 //! an error.
 
@@ -133,6 +132,21 @@ pub struct Submission {
     pub out_syncobjs: Vec<u32>,
     /// The BO list (`AMDGPU_CHUNK_ID_BO_HANDLES`), at most one per job.
     pub bo_handles: Option<Vec<u32>>,
+    /// Earlier submissions the job waits for (`AMDGPU_CHUNK_ID_DEPENDENCIES`),
+    /// or only needs scheduled (`SCHEDULED_DEPENDENCIES`, `scheduled` set).
+    pub dependencies: Vec<Dependency>,
+}
+
+/// `drm_amdgpu_cs_chunk_dep`: a submission named by its context, ring and
+/// handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dependency {
+    pub ip_type: u32,
+    pub ip_instance: u32,
+    pub ring: u32,
+    pub ctx_id: u32,
+    pub handle: u64,
+    pub scheduled: bool,
 }
 
 /// Bound on one chunk's syncobjs: far beyond what Mesa sends.
@@ -315,6 +329,7 @@ pub fn parse(
     let mut in_syncobjs = Vec::new();
     let mut out_syncobjs = Vec::new();
     let mut bo_handles = None;
+    let mut dependencies = Vec::new();
     for pointer in pointers {
         if pointer == 0 {
             return Err(FsError::BadAddress);
@@ -359,11 +374,24 @@ pub fn parse(
                 let words = unsafe { read_dwords(chunk_data, length_dw, 64)? };
                 bo_handles = Some(parse_bo_handles(&words)?);
             }
+            // amdgpu_cs_p2_dependencies: `length_dw * 4 / 24` entries.
+            uapi::AMDGPU_CHUNK_ID_DEPENDENCIES | uapi::AMDGPU_CHUNK_ID_SCHEDULED_DEPENDENCIES => {
+                // SAFETY: as above.
+                let words = unsafe { read_dwords(chunk_data, length_dw, MAX_SYNCOBJS * 6)? };
+                for d in words.chunks_exact(6) {
+                    dependencies.push(Dependency {
+                        ip_type: d[0],
+                        ip_instance: d[1],
+                        ring: d[2],
+                        ctx_id: d[3],
+                        handle: u64::from(d[4]) | u64::from(d[5]) << 32,
+                        scheduled: chunk_id == uapi::AMDGPU_CHUNK_ID_SCHEDULED_DEPENDENCIES,
+                    });
+                }
+            }
             // Refused rather than ignored — see the module LINUX-GAP. A
             // dropped ordering constraint is a race, not an error.
             uapi::AMDGPU_CHUNK_ID_FENCE
-            | uapi::AMDGPU_CHUNK_ID_DEPENDENCIES
-            | uapi::AMDGPU_CHUNK_ID_SCHEDULED_DEPENDENCIES
             | uapi::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT
             | uapi::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL => return Err(FsError::Unsupported),
             _ => return Err(FsError::InvalidData),
@@ -380,6 +408,7 @@ pub fn parse(
         in_syncobjs,
         out_syncobjs,
         bo_handles,
+        dependencies,
     })
 }
 
@@ -594,6 +623,26 @@ pub async fn dispatch_async(
         let table = syncobjs.lock();
         if out.iter().any(|&h| table.get(h).is_err()) {
             return Err(FsError::NotFound);
+        }
+    }
+    // Each dependency names a context this open owns and the engine's ring
+    // (the only one here); handle 0 names nothing. A scheduled dependency
+    // is met by any earlier job of this single in-order ring.
+    let mut after = Vec::new();
+    for d in &submission.dependencies {
+        if ctx.get(d.ctx_id).is_none() {
+            return Err(FsError::InvalidData);
+        }
+        if (d.ip_type, d.ip_instance, d.ring) != (uapi::AMDGPU_HW_IP_GFX, 0, 0) {
+            return Err(FsError::Unsupported);
+        }
+        if d.handle != 0 && !d.scheduled {
+            after.push(d.handle);
+        }
+    }
+    for handle in after {
+        while !engine.signalled(handle) {
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
         }
     }
     // LINUX-GAP: Linux's scheduler holds the job until these signal and
