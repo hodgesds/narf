@@ -3583,8 +3583,10 @@ slot), all for the graphics ring or all for the compute ring
 the PFP, skips PFP_SYNC_ME, flushes on invalidation engine 1 and marks IBs
 `INDIRECT_BUFFER_VALID`), run on a GFX hub VMID from 1–7 with the
 open's root page directory (`VmState::root_pde`, GMC 12 only), through
-`amdgpu_gfx12_queue::Queues::submit` — one 256-dword ring slot of VM flush
-(GFX hub, engine 0, PFP_SYNC_ME), IB and interrupting RELEASE_MEM fence;
+`amdgpu_gfx12_queue::Queues::submit` — one 256-dword ring slot of pipeline
+sync (wait for the ring's previous fence) and VM flush (GFX hub, the ring's
+engine, PFP_SYNC_ME) when the grant asks for a flush, IBs and an
+interrupting RELEASE_MEM fence;
 `Busy` when the 1024-dword ring is full. A job also maps its VMID to its
 open's PASID in the IH VMID LUT (OSSSYS `IH_VMID_0_LUT + vmid`, after the
 flush, as gmc_v12_0_emit_pasid_mapping), so a fault carries the client's

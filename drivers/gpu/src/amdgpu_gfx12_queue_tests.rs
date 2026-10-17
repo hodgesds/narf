@@ -31,6 +31,8 @@ struct Fake {
     job_writes: Vec<(u32, u32)>,
     job_waits: Vec<(u32, u32, u32, u32, u32)>,
     job_syncs: u32,
+    /// Pipeline syncs: (fence address, sequence waited for).
+    job_pipeline_syncs: Vec<(u64, u32)>,
     job_ibs: Vec<(u64, u32)>,
 }
 impl Fake {
@@ -55,6 +57,19 @@ impl Fake {
                         assert_eq!(words[1], write_cmd, "confirmed register write");
                         assert_eq!(words[3], 0);
                         self.job_writes.push((words[2], words[4]));
+                    }
+                    0x3c if words[1] & 0x10 != 0 => {
+                        // A pipeline sync: on the ring's own engine, equal,
+                        // the whole fence word, poll interval 4.
+                        let pfp = if pipe == 0 { 0x100 } else { 0 };
+                        assert_eq!(
+                            (length, words[1], words[5], words[6]),
+                            (7, 0x13 | pfp, !0, 4)
+                        );
+                        let address = u64::from(words[2]) | u64::from(words[3]) << 32;
+                        // Jobs run to completion here, so the wait is met.
+                        assert_eq!(self.memory[((address - GPU) / 4) as usize], words[4]);
+                        self.job_pipeline_syncs.push((address, words[4]));
                     }
                     0x3c => {
                         assert_eq!((length, words[6]), (7, 0x20));
@@ -283,6 +298,7 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
             job_writes: Vec::new(),
             job_waits: Vec::new(),
             job_syncs: 0,
+            job_pipeline_syncs: Vec::new(),
             job_ibs: Vec::new(),
         },
         authority: Cap::bootstrap(),
@@ -682,6 +698,7 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
         ]
         || e.io.job_waits != [(gc + 0x1647, gc + 0x1659, 0x00f8_0008, 8, 0x143)]
         || e.io.job_syncs != 1
+        || e.io.job_pipeline_syncs != [(GPU + 10496, 0)]
         || e.io.job_ibs != [(0x2_0000_1000, 64 | 3 << 24)]
         || e.io.memory[2562] != 768
     {
@@ -737,11 +754,13 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
         || e.io.job_waits.last() != Some(&(gc + 0x1648, gc + 0x165a, 0x00f8_0004, 4, 0x43))
         || e.io.job_ibs.last() != Some(&(0x2_0000_4000, 8 | 1 << 23 | 2 << 24))
         || e.io.memory[3072 + 2562] != 768
+        || e.io.job_pipeline_syncs.last() != Some(&(GPU + 12288 + 10496, 0))
     {
         return TestResult::Fail("compute job");
     }
     // A reused VMID: no flush and no LUT write, only the IB and fence.
     let (writes, waits) = (e.io.job_writes.len(), e.io.job_waits.len());
+    let pipeline_syncs = e.io.job_pipeline_syncs.len();
     let reused = Job {
         flush: false,
         map_pasid: false,
@@ -751,6 +770,7 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
         || e.completed_job(Pipe::Compute) != Ok(2)
         || e.io.job_writes.len() != writes
         || e.io.job_waits.len() != waits
+        || e.io.job_pipeline_syncs.len() != pipeline_syncs
         || e.io.job_ibs.last() != Some(&(0x2_0000_4000, 8 | 1 << 23 | 2 << 24))
     {
         return TestResult::Fail("job on a reused VMID");

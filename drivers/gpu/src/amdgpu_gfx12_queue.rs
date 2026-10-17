@@ -120,9 +120,10 @@ impl Job {
     }
 }
 /// gfx_v12_0's frame for one job on the graphics ring, as amdgpu_vm_flush
-/// and amdgpu_ib_schedule emit it: the VM flush (gmc_v12_0_emit_flush_gpu_tlb
-/// on the GFX hub through the ring's engine, then PFP_SYNC_ME), the PASID
-/// mapping (gmc_v12_0_emit_pasid_mapping: IH_VMID_0_LUT + vmid at OSSSYS
+/// and amdgpu_ib_schedule emit it: when `job.flush`, a pipeline sync (wait
+/// for the ring's fence to reach `seq - 1`) and the VM flush
+/// (gmc_v12_0_emit_flush_gpu_tlb on the GFX hub through the ring's engine,
+/// then PFP_SYNC_ME); when `job.map_pasid`, the PASID mapping (gmc_v12_0_emit_pasid_mapping: IH_VMID_0_LUT + vmid at OSSSYS
 /// base `oss`), the IBs under the job's VMID, and an interrupting RELEASE_MEM
 /// of `seq` to `fence`, NOP-padded to the 256-dword slot.
 ///
@@ -152,6 +153,19 @@ fn job_packets(
     let mut b = Pm4Builder::new(&mut words);
     let built = (|| {
         if job.flush {
+            // amdgpu_vm_flush's pipeline sync: the ring's previous job must
+            // finish before the context moves (gfx_v12_0_ring_emit_pipeline_sync
+            // waits for the last fence written, which init zeroed).
+            b.wait_reg_mem(
+                gfx,
+                true,
+                false,
+                fence as u32,
+                (fence >> 32) as u32,
+                seq.wrapping_sub(1),
+                u32::MAX,
+                4,
+            )?;
             b.vm_flush(
                 &crate::amdgpu_vmhub_regs::GFXHUB_V12_0,
                 gc,
