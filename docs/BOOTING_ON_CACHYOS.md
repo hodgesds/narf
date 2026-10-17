@@ -230,11 +230,12 @@ written bytes after a replug. On this host the internal disks are `nvme0n1`
 
 **What to expect on screen.** While the card boots, every Navi22 stage prints
 `start`, then `complete` or `failed <error>`. The cold boot ends with
-`amdgpu: navi22 stage summary (N/26 complete):` followed by one line per
-stage. If the screen stops changing, photograph it; the last `start` line
+`amdgpu: navi22 stage summary (N/M ok):` followed by one line per
+stage, then the connector (EDID/HPD), media and thermal notes. If the screen stops changing, photograph it; the last `start` line
 names the stage that hung. Shortly after the shell appears, the console shows
 `bootlog: saving the kernel log to usb-msc0p1:/narf-boot-<n>.log`. To finish,
-type `reboot` in the NARF shell, which flushes the log one last time.
+log in (`root` / `narf`) and type `reboot` (or `poweroff`) in the NARF
+shell, which flushes the log one last time.
 Otherwise wait at least five seconds after the last line before powering off.
 
 **Retrieve the log** after booting back into CachyOS:
