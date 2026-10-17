@@ -426,6 +426,46 @@ struct GrubImageArgs {
     /// `rootflags=` for the installed root (the btrfs subvolume of `/`).
     #[arg(long, default_value = "subvol=/@", requires = "root_policy")]
     rootflags: String,
+
+    /// Persistent boot log: add `narf.bootlog=<token>`, so NARF writes its
+    /// kernel log to the USB FAT stick whose `/NARFLOG.ID` first line is the
+    /// token (8-64 characters of `[A-Za-z0-9_-]`, e.g. 32 hex digits). Under
+    /// the root policies that stick is the only writable device besides the
+    /// root.
+    #[arg(long, value_name = "TOKEN")]
+    bootlog_token: Option<String>,
+}
+
+/// `narf.bootlog=` token rules (`drivers/fs/fat/src/bootlog.rs::parse_config`).
+fn check_bootlog_token(token: &str) -> Result<()> {
+    if !(8..=64).contains(&token.len())
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("--bootlog-token must be 8..=64 characters of [A-Za-z0-9_-]");
+    }
+    Ok(())
+}
+
+/// `cmdline` with `narf.bootlog=<token>` appended when `--bootlog-token` is
+/// given (refused when the line already names one).
+fn with_bootlog_token(cmdline: String, grub: &GrubImageArgs) -> Result<String> {
+    let Some(token) = &grub.bootlog_token else {
+        return Ok(cmdline);
+    };
+    check_bootlog_token(token)?;
+    if cmdline
+        .split_whitespace()
+        .any(|a| a.starts_with("narf.bootlog="))
+    {
+        bail!("--bootlog-token: the command line already carries narf.bootlog=");
+    }
+    Ok(if cmdline.is_empty() {
+        format!("narf.bootlog={token}")
+    } else {
+        format!("{cmdline} narf.bootlog={token}")
+    })
 }
 
 /// `narf.disks=` root policies `xtask grub-image --root-policy` emits.
@@ -468,6 +508,10 @@ fn canonical_fs_uuid(uuid: &str) -> Result<String> {
 /// [`cmdline_with_disk_policy`]. A root policy refuses a base line that
 /// already names a disk policy or a root, rather than emitting two.
 fn grub_image_cmdline(cmdline: &str, grub: &GrubImageArgs) -> Result<String> {
+    with_bootlog_token(grub_image_policy_cmdline(cmdline, grub)?, grub)
+}
+
+fn grub_image_policy_cmdline(cmdline: &str, grub: &GrubImageArgs) -> Result<String> {
     let Some(policy) = grub.root_policy else {
         return Ok(cmdline_with_disk_policy(cmdline, grub.allow_all_disks));
     };
@@ -535,7 +579,26 @@ fn limine_conf_with_cmdline(conf: &str, apply: impl Fn(&str) -> Result<String>) 
         .lines()
         .any(|l| l.trim_start().starts_with("kernel_cmdline:"));
     let mut out = String::with_capacity(conf.len() + 32);
+    // Entry options (`path:`, `module_path:`, ...) belong indented under
+    // their `/Entry` line; an unindented one (staged configs lost the
+    // `module_path:` indent) is re-indented, or Limine reads it as a global
+    // option and boots without the initramfs module.
+    let mut in_entry = false;
     for line in conf.lines() {
+        let fixed;
+        let line = if line.starts_with('/') {
+            in_entry = true;
+            line
+        } else if in_entry
+            && !line.is_empty()
+            && !line.starts_with(char::is_whitespace)
+            && line.contains(':')
+        {
+            fixed = format!("    {line}");
+            fixed.as_str()
+        } else {
+            line
+        };
         let trimmed = line.trim_start();
         let indent = &line[..line.len() - trimmed.len()];
         if let Some(rest) = trimmed.strip_prefix("kernel_cmdline:") {
@@ -594,6 +657,43 @@ mod disk_policy_tests {
             panic!("grub-image")
         };
         args
+    }
+
+    #[test]
+    fn grub_image_bootlog_token_and_entry_indentation() {
+        const UUID: &str = "653602c3-cd42-420e-95ef-4c4033d17b56";
+        let tok = "0123456789abcdef0123456789abcdef";
+        let rw = grub(&[
+            "--root-policy",
+            "root-rw",
+            "--root-uuid",
+            UUID,
+            "--bootlog-token",
+            tok,
+        ]);
+        assert_eq!(
+            grub_image_cmdline("", &rw).unwrap(),
+            format!(
+                "narf.disks=root-rw root=UUID={UUID} rootflags=subvol=/@ systemd_pid1 narf.bootlog={tok}"
+            )
+        );
+        let plain = grub(&["--bootlog-token", tok]);
+        assert_eq!(
+            grub_image_cmdline("", &plain).unwrap(),
+            format!("narf.disks=boot-only narf.bootlog={tok}")
+        );
+        assert!(grub_image_cmdline(&format!("narf.bootlog={tok}"), &plain).is_err());
+        assert!(grub_image_cmdline("", &grub(&["--bootlog-token", "short"])).is_err());
+        assert!(grub_image_cmdline("", &grub(&["--bootlog-token", "bad token!"])).is_err());
+        // The staged config's unindented module_path is put back under its entry.
+        let staged = "timeout: 5\n\n/NARF\n    protocol: multiboot2\n    path: boot():/boot/narf-frame\nmodule_path: boot():/boot/initramfs.cpio\n    module_string: initramfs\n";
+        let got = limine_conf_with_cmdline(staged, |cl| grub_image_cmdline(cl, &rw)).unwrap();
+        assert!(got.starts_with("timeout: 5\n"));
+        assert!(got.contains("\n    module_path: boot():/boot/initramfs.cpio\n"));
+        assert!(got.contains(&format!(
+            "\n    kernel_cmdline: narf.disks=root-rw root=UUID={UUID}"
+        )));
+        assert!(!got.lines().any(|l| l.starts_with("module_path")));
     }
 
     #[test]
@@ -11257,8 +11357,7 @@ interface_resolution: 1024x768
 /NARF
     protocol: multiboot2
     path: boot():/boot/narf-frame
-{kernel_cmdline}\
-    module_path: boot():/boot/initramfs.cpio
+{kernel_cmdline}    module_path: boot():/boot/initramfs.cpio
     module_string: initramfs
 "
     );

@@ -1640,7 +1640,9 @@ fn build_stick(path: &Path, token: &str, dir: &Path) -> Result<()> {
     )
 }
 
-/// `limine.conf` with `narf.bootlog=<token>` added to each command line.
+/// `limine.conf` with `narf.bootlog=<token>` added to each command line
+/// (only for re-tokenising an already built bundle with `--skip-build`; a
+/// fresh bundle gets it from `grub-image --bootlog-token`).
 fn with_bootlog(conf: &str, token: &str) -> String {
     conf.lines()
         .map(|l| {
@@ -1689,6 +1691,7 @@ fn stage_bundle(
         }),
         root_uuid: Some(uuid.to_string()),
         rootflags: "subvol=/@".to_string(),
+        bootlog_token: Some(token.to_string()),
     };
     super::grub_image_cmd(&grub)?;
     let bundle = root.join("target/grub-x86_64");
@@ -1701,9 +1704,11 @@ fn stage_bundle(
             .arg(out.join("esp")),
         "stage the bundle ESP",
     )?;
-    let conf_path = out.join("esp/boot/limine/limine.conf");
-    let conf = with_bootlog(&std::fs::read_to_string(&conf_path)?, token);
-    std::fs::write(&conf_path, &conf)?;
+    // `--bootlog-token` put `narf.bootlog=` on the command line already.
+    let conf = std::fs::read_to_string(out.join("esp/boot/limine/limine.conf"))?;
+    if !conf.contains(&format!("narf.bootlog={token}")) {
+        bail!("grub-image --bootlog-token did not reach limine.conf");
+    }
     let stanza = std::fs::read_to_string(bundle.join("grub.cfg"))?;
     std::fs::write(out.join("grub/bundle-grub.cfg"), &stanza)?;
     let cfg = out.join("grub/grub.cfg");

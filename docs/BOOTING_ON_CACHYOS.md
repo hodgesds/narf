@@ -393,7 +393,9 @@ cargo xtask grub-image --root-policy root-rw \
 
 Each command emits `narf.disks=<mode> root=UUID=<uuid> rootflags=subvol=/@
 systemd_pid1` (`--rootflags` changes the subvolume). Without `--root-policy`,
-grub-image still writes `boot-only`.
+grub-image still writes `boot-only`. `--bootlog-token <token>` adds
+`narf.bootlog=<token>` (8-64 characters of `[A-Za-z0-9_-]`) for the
+persistent boot log described below.
 
 - **Nothing is writable until the root is designated.** Root mounting
   matches `root=UUID=` and calls `designate_root` before the filesystem is
@@ -418,6 +420,15 @@ grub-image still writes `boot-only`.
   (`6D89-28C5`, which may be mounted read-only), the Sabrent, `sda`, and the
   `/dev/nvme<C>` passthrough nodes. vfat filesystems also report themselves
   read-only to the VFS under both root policies, so they mount `ro`.
+- **The boot-log stick is the one exception, under both policies.** With
+  `narf.bootlog=<token>`, the USB mass-storage FAT partition whose
+  `/NARFLOG.ID` first line is the token becomes writable, and nothing else on
+  that stick or any other disk does. A stick on the root's own disk is never
+  accepted. The console then prints `disks: WRITABLE (log stick):
+  usb-msc0p1 ...`. A failed root-ro/root-rw boot still leaves its log. Under
+  the root policies the log probes the stick only after root mounting has
+  finished, so the stick's I/O never delays the root. Lines from before then
+  are saved retroactively.
 - **The boot stops visibly, never degrades.** A failed `root=` mount under
   either root policy prints `root-mount: narf.disks=... ROOT MOUNT FAILED:
   <reason>; NOT falling back` plus the btrfs refusal line. It does not fall

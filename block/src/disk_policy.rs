@@ -203,7 +203,16 @@ pub fn init_from_cmdline() -> DiskPolicy {
     // a glance whether the internal disks are protected.
     let root = root_arg_text();
     let explicit = !matches!(value, Ok(None));
-    framed(&banner_with_root(policy, explicit, root.as_deref()));
+    let mut line = banner_with_root(policy, explicit, root.as_deref());
+    let bootlog = narf_boot::args()
+        .value("narf.bootlog")
+        .is_some_and(|v| !v.is_empty() && v != "off");
+    if policy.is_root_policy() && bootlog {
+        line.push_str(
+            "; plus the boot-log USB stick partition once its /NARFLOG.ID matches narf.bootlog= (the log stick)",
+        );
+    }
+    framed(&line);
     policy
 }
 
@@ -283,6 +292,10 @@ fn disk_trusted(disk: DiskId) -> bool {
 /// only do this after matching a boot-specific secret on the medium (the
 /// `/NARFLOG.ID` token) — never from a name, size or label alone.
 pub fn trust_boot_medium(device_name: &str, disk: DiskId) {
+    if policy().is_root_policy() {
+        trust_log_stick(device_name, disk);
+        return;
+    }
     let newly = {
         let mut trusted = TRUSTED.lock();
         if trusted.contains(&disk) {
@@ -298,6 +311,101 @@ pub fn trust_boot_medium(device_name: &str, disk: DiskId) {
             "disks: {device_name}: identified as the boot medium; its disk is writable"
         );
     }
+}
+
+// ── The boot-log stick under root-ro / root-rw ──────────────────────
+
+/// Registry entry of the boot-log stick partition (0 = none): under the root
+/// policies the one device writable besides the designated root.
+static LOG_STICK_DEV: AtomicU64 = AtomicU64::new(0);
+/// That entry's disk, so a stick that turns out to be the root's own disk is
+/// never writable through this rule.
+static LOG_STICK_DISK: AtomicU64 = AtomicU64::new(0);
+/// The designated root's disk (0 = none), for the check above.
+static DESIGNATED_DISK: AtomicU64 = AtomicU64::new(0);
+
+/// Under `root-ro`/`root-rw`, [`trust_boot_medium`] trusts only the one
+/// registry entry it names, and only a USB mass-storage one: the FAT
+/// volume whose `/NARFLOG.ID` matched the `narf.bootlog=` token. Its disk's
+/// other partitions, and every other disk, stay read-only. At most one stick
+/// per boot; it is forgotten if that entry is unregistered or replaced.
+fn trust_log_stick(device_name: &str, disk: DiskId) {
+    let Some(entry) = entry_named(device_name) else {
+        return;
+    };
+    // A partition of a USB mass-storage disk, or the whole disk of an
+    // unpartitioned ("superfloppy") stick whose FAT volume carried the token.
+    let usb_partition = entry.disk == disk
+        && entry.name.starts_with("usb-msc")
+        && entry
+            .parent
+            .is_none_or(|parent| parent.starts_with("usb-msc"));
+    let root_disk = DESIGNATED_DISK.load(Ordering::Acquire);
+    if !usb_partition || (root_disk != 0 && root_disk == disk) {
+        let _ = writeln!(
+            narf_console::Writer,
+            "disks: {device_name}: not accepted as the boot-log stick under {ARG}={} \
+             (only a USB mass-storage partition off the root's disk is)",
+            policy().as_str()
+        );
+        return;
+    }
+    if LOG_STICK_DEV
+        .compare_exchange(0, entry.dev_id, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    LOG_STICK_DISK.store(disk, Ordering::Release);
+    framed(&alloc::format!(
+        "disks: WRITABLE (log stick): {device_name} — the boot-log USB stick whose /NARFLOG.ID \
+         matches narf.bootlog= ({ARG}={}); nothing else on that stick or any other disk",
+        policy().as_str()
+    ));
+}
+
+/// The boot-log stick partition guard `dev` may be written.
+fn log_stick_writable(dev: DevId) -> bool {
+    let stick = LOG_STICK_DEV.load(Ordering::Acquire);
+    let root_disk = DESIGNATED_DISK.load(Ordering::Acquire);
+    stick != 0
+        && stick == dev
+        && (root_disk == 0 || root_disk != LOG_STICK_DISK.load(Ordering::Acquire))
+}
+
+/// Set once boot-time root mounting has finished (mounted or failed).
+static ROOT_MOUNT_SETTLED: AtomicBool = AtomicBool::new(false);
+
+/// Record that boot-time root mounting finished. Under the root policies the
+/// boot log probes the USB stick only after this, so the stick's I/O never
+/// competes with designating and mounting the root.
+pub fn mark_root_mount_settled() {
+    ROOT_MOUNT_SETTLED.store(true, Ordering::Release);
+}
+
+/// Whether [`mark_root_mount_settled`] ran.
+pub fn root_mount_settled() -> bool {
+    ROOT_MOUNT_SETTLED.load(Ordering::Acquire)
+}
+
+/// The registry name of the boot-log stick, if one is identified.
+pub fn log_stick() -> Option<&'static str> {
+    let dev = LOG_STICK_DEV.load(Ordering::Acquire);
+    (dev != 0)
+        .then(|| {
+            crate::registry::block_devices()
+                .into_iter()
+                .find(|e| e.dev_id == dev)
+                .map(|e| e.name)
+        })
+        .flatten()
+}
+
+/// Test-only: forget the boot-log stick.
+#[doc(hidden)]
+pub fn __reset_log_stick_for_test() {
+    LOG_STICK_DEV.store(0, Ordering::Release);
+    LOG_STICK_DISK.store(0, Ordering::Release);
 }
 
 /// True when `device_name`'s disk was identified as the boot medium.
@@ -399,6 +507,7 @@ pub fn __set_root_arg_for_test(value: Option<Option<&str>>) {
 pub fn __reset_root_for_test() {
     *DESIGNATED.lock() = None;
     DESIGNATED_DEV.store(0, Ordering::Release);
+    DESIGNATED_DISK.store(0, Ordering::Release);
     REVOKED.store(false, Ordering::Release);
 }
 
@@ -426,7 +535,7 @@ fn revoke(reason: &str) {
     }
     DESIGNATED_DEV.store(0, Ordering::Release);
     framed(&alloc::format!(
-        "disks: ROOT DESIGNATION REVOKED ({reason}): every disk is read-only for the rest of this boot"
+        "disks: ROOT DESIGNATION REVOKED ({reason}): every disk (but an identified boot-log stick) is read-only for the rest of this boot"
     ));
 }
 
@@ -504,6 +613,7 @@ pub fn designate_root(device_name: &str, fs_uuid: [u8; 16]) -> Result<(), Policy
             uuid: fs_uuid,
         });
     }
+    DESIGNATED_DISK.store(entry.disk, Ordering::Release);
     DESIGNATED_DEV.store(entry.dev_id, Ordering::Release);
     // A device registered between the snapshot above and the store was not
     // checked by `note_registered` against this designation: check again.
@@ -536,6 +646,9 @@ pub fn designate_root(device_name: &str, fs_uuid: [u8; 16]) -> Result<(), Policy
 /// entry it replaced under the same name). Revokes the designation when the
 /// designated device was replaced or another device carries its UUID.
 pub(crate) fn note_registered(entry: &RegisteredBlockDevice, replaced: Option<DevId>) {
+    if let Some(old) = replaced {
+        forget_log_stick(old);
+    }
     let Some(designated) = DESIGNATED.lock().clone() else {
         return;
     };
@@ -551,8 +664,22 @@ pub(crate) fn note_registered(entry: &RegisteredBlockDevice, replaced: Option<De
 
 /// Registry hook: the device `dev` was unregistered.
 pub(crate) fn note_unregistered(dev: DevId) {
+    forget_log_stick(dev);
     if dev != 0 && DESIGNATED_DEV.load(Ordering::Acquire) == dev {
         revoke("the designated root device was removed");
+    }
+}
+
+fn forget_log_stick(dev: DevId) {
+    if dev != 0
+        && LOG_STICK_DEV
+            .compare_exchange(dev, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        let _ = writeln!(
+            narf_console::Writer,
+            "disks: the boot-log stick was removed; it is read-only if it returns"
+        );
     }
 }
 
@@ -624,8 +751,11 @@ pub fn write_allowed(device_name: &str) -> bool {
     match policy() {
         DiskPolicy::All => true,
         DiskPolicy::BootOnly => is_boot_medium(device_name),
-        DiskPolicy::RootRo => false,
-        DiskPolicy::RootRw => entry_named(device_name).is_some_and(|e| dev_writable(e.dev_id)),
+        DiskPolicy::RootRo => {
+            entry_named(device_name).is_some_and(|e| log_stick_writable(e.dev_id))
+        }
+        DiskPolicy::RootRw => entry_named(device_name)
+            .is_some_and(|e| dev_writable(e.dev_id) || log_stick_writable(e.dev_id)),
     }
 }
 
@@ -688,8 +818,8 @@ impl PolicyGuard {
         match policy() {
             DiskPolicy::All => true,
             DiskPolicy::BootOnly => disk_trusted(self.disk),
-            DiskPolicy::RootRo => false,
-            DiskPolicy::RootRw => dev_writable(self.dev),
+            DiskPolicy::RootRo => log_stick_writable(self.dev),
+            DiskPolicy::RootRw => dev_writable(self.dev) || log_stick_writable(self.dev),
         }
     }
 }

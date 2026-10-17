@@ -237,6 +237,8 @@ pub mod disk_policy {
     pub fn designate_root(device_name: &str, fs_uuid: [u8; 16]) -> Result<(), PolicyError>;
     pub fn designated_root() -> Option<&'static str>;
     pub fn root_writable() -> bool;
+    pub fn log_stick() -> Option<&'static str>;     // boot-log stick under root policies
+    pub fn mark_root_mount_settled(); pub fn root_mount_settled() -> bool;
     pub fn automount_allowed(device_name: &str) -> bool;
     pub fn write_allowed(device_name: &str) -> bool;
     pub fn refused_writes() -> u64;
@@ -268,7 +270,11 @@ the boot if that entry is unregistered or replaced or another device carrying
 the UUID registers. `automount_allowed` admits only the `root=UUID=` candidate
 (before designation), the designated root, and vfat partitions on its disk.
 Both modes print a framed banner at policy resolution and at designation
-naming the writable device and UUID.
+naming the writable device and UUID. Under both modes `trust_boot_medium`
+(the bootlog's `/NARFLOG.ID` token match) makes exactly the named USB
+mass-storage entry writable, never one on the root's disk; it is forgotten
+when that entry goes away. The boot log probes only after
+`mark_root_mount_settled`.
 
 ### 3.6 Encrypted-device stacking
 
