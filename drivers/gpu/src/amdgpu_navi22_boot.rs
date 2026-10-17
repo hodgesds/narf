@@ -137,6 +137,32 @@ impl Firmware {
         Ok(())
     }
 }
+impl Firmware {
+    /// Prepare the display inputs and DMUB storage again for a recovered
+    /// owner, from the VBIOS copy and routes the first boot retained (the
+    /// controller's own VBIOS is no longer reachable).
+    fn restore_display(
+        &mut self,
+        vbios: alloc::vec::Vec<u8>,
+        crystal: u32,
+        paths: alloc::vec::Vec<crate::amdgpu_dcn_inventory::Path>,
+    ) -> Result<(), Error> {
+        self.dmub = Some(
+            crate::amdgpu_dmub_navi22::Prepared::new(
+                self.graphics.dmcub_bytes().map_err(Error::Graphics)?,
+                &vbios,
+                self.sos.image().map_err(Error::Sos)?.version(),
+            )
+            .map_err(Error::Dmub)?,
+        );
+        self.display = Some(DisplayPrep {
+            paths,
+            crystal,
+            vbios,
+        });
+        Ok(())
+    }
+}
 /// VBIOS-derived display inputs, copied before any device write.
 #[derive(Debug)]
 struct DisplayPrep {
@@ -326,6 +352,9 @@ struct Hardware {
     /// VBIOS copy and crystal for the native modeset, and its retained owner.
     display_bios: Option<(alloc::vec::Vec<u8>, u32)>,
     modeset: Option<crate::amdgpu_navi22_modeset::Pipeline>,
+    /// Presentation of the lit pipe (amdgpu_navi22_scanout), built after it
+    /// lights and stopped before the pipeline tears it down.
+    scanout: Option<crate::amdgpu_navi22_scanout::Scanout>,
     queues: Option<Queues>,
     ih: Option<crate::amdgpu_ih_navi22::Ih>,
     media: Option<crate::amdgpu_vcn_navi22::Media>,
@@ -882,6 +911,7 @@ impl ColdBoot {
                     dmub_aux: false,
                     display_bios: None,
                     modeset: None,
+                    scanout: None,
                     queues: None,
                     ih: None,
                     media: None,
@@ -934,6 +964,7 @@ impl ColdBoot {
                     dmub_aux: false,
                     display_bios: None,
                     modeset: None,
+                    scanout: None,
                     queues: None,
                     ih: None,
                     media: None,
@@ -1446,7 +1477,10 @@ impl ColdBoot {
     /// same GPU snapshot, authority, pool and prepared firmware, a
     /// `Reset::new_recovery` mode1 reset in `ResetOnInit`, and newly reserved
     /// memory hubs, SDMA proof, IH and kernel queues (same BAR2 doorbells).
-    /// DMUB is not restarted. Every old owner is dropped without I/O, so its
+    /// With the first boot's display routes, DMUB storage and the native
+    /// display owner are prepared again, so the run restarts DMUB as cold
+    /// boot did; the modeset is the platform's (`amdgpu_navi22_kms`).
+    /// Every old owner is dropped without I/O, so its
     /// published VRAM stays quarantined. No device I/O happens here.
     ///
     /// # Safety
@@ -1460,10 +1494,21 @@ impl ColdBoot {
             gpu,
             authority,
             pool,
-            firmware,
+            mut firmware,
             queues,
+            display,
+            display_bios,
             ..
         } = self.sequence.backend;
+        // Linux's DM resume re-lights the display: DMUB restarts in the
+        // recovered sequence exactly as on cold boot (amdgpu_navi22_kms).
+        let relight = match (display, display_bios) {
+            (Some(display), Some((vbios, crystal))) => {
+                let paths = display.connectors().iter().map(|c| c.path).collect();
+                firmware.restore_display(vbios, crystal, paths).is_ok()
+            }
+            _ => false,
+        };
         let doorbells = queues.as_ref().map(|q| q.doorbells);
         drop(queues);
         // SAFETY: forwarded exclusive whole-GPU contract; the mode1 reset
@@ -1478,6 +1523,10 @@ impl ColdBoot {
         boot.prepare_memory_hubs()?;
         boot.prepare_sdma()?;
         boot.prepare_interrupts(device)?;
+        if relight {
+            boot.prepare_dmub()?;
+            boot.prepare_display()?;
+        }
         if let Some(doorbells) = doorbells {
             boot.prepare_queues(doorbells)?;
         }
@@ -1542,6 +1591,191 @@ impl ColdBoot {
             Ring::Sdma(i) => queues.sdma.fences(i),
         }
         .map_err(Error::Queues)
+    }
+
+    // ── Native display presentation (amdgpu_navi22_kms) ────────────────
+    /// Light `connector` with `sink` at `want` (None: its preferred mode),
+    /// filling rows with `draw` before fetch starts, then adopt the pipe for
+    /// presentation (back buffer on demand, flips, cursor, vblank) and arm
+    /// its pflip/vupdate interrupts. A previous pipeline that stopped or
+    /// failed is dropped (a failed one keeps its surface quarantined); a
+    /// running one refuses. Failure retains the new pipeline for diagnosis.
+    ///
+    /// # Safety
+    /// As `modeset_hdmi`; any previous presentation was stopped through
+    /// `stop_display`, and every CPU view of its surfaces has retired.
+    pub async unsafe fn modeset_display(
+        &mut self,
+        connector: crate::amdgpu_navi22_display::Connector,
+        sink: &crate::amdgpu_navi22_display::Sink,
+        want: Option<crate::amdgpu_dml::Timing>,
+        draw: impl Fn(u32, &mut [u32]),
+    ) -> Result<crate::amdgpu_navi22_modeset::Output, Error> {
+        use crate::amdgpu_navi22_modeset::{self as modeset, State as M, Step};
+        self.display_mut()?;
+        let h = &mut self.sequence.backend;
+        if h.scanout.is_some()
+            || h.modeset
+                .as_ref()
+                .is_some_and(|p| !matches!(p.state(), M::At(Step::Stopped) | M::Failed { .. }))
+        {
+            return Err(Error::Busy);
+        }
+        h.modeset = None;
+        let (vbios, crystal) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
+        let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
+            .map_err(|e| Error::Modeset(modeset::Error::Bios(e)))?;
+        let smu = h.smu.as_mut().ok_or(Error::Invalid)?;
+        // SAFETY: this cold-boot owner holds the whole GPU; the caller's
+        // contract excludes other display clients.
+        let mut pipeline = unsafe { modeset::Pipeline::new(&h.gpu, h.authority, connector) }
+            .map_err(Error::Modeset)?;
+        pipeline.request(want);
+        // SAFETY: forwarded; the pool and SMU are this owner's.
+        let result = unsafe {
+            pipeline
+                .enable(smu, &h.pool, &tables, vbios, *crystal, sink, draw)
+                .await
+        };
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                h.modeset = Some(pipeline);
+                return Err(Error::Modeset(error));
+            }
+        };
+        let adopted = (|| {
+            let address = pipeline.scanout_address()?;
+            let map = pipeline.scanout_mapping()?;
+            let refclk = pipeline.admitted()?.refclk_khz;
+            Some((address, map, refclk))
+        })();
+        h.modeset = Some(pipeline);
+        let (address, map, refclk) = adopted.ok_or(Error::Invalid)?;
+        let front = crate::amdgpu_navi22_scanout::Surface {
+            address,
+            fb: output.scanout,
+        };
+        // SAFETY: the pipeline just lit pipe 0 with this surface and both
+        // owners live in this cold-boot owner, serialized by its caller.
+        let mut scanout = unsafe {
+            crate::amdgpu_navi22_scanout::Scanout::new(
+                &h.gpu,
+                h.authority,
+                0,
+                front,
+                map,
+                output.timing,
+                refclk,
+            )
+        }
+        .map_err(|e| Error::Modeset(modeset::Error::Block(e)))?;
+        if let Some(ih) = h.ih.as_ref().map(crate::amdgpu_ih_navi22::Ih::handle) {
+            if let Err(error) = scanout.enable_interrupts(&ih) {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi22 flip interrupts unavailable ({error:?}); polling"
+                );
+            }
+        }
+        h.scanout = Some(scanout);
+        Ok(output)
+    }
+    /// Stop presenting and tear the lit pipe down. On success both scanout
+    /// surfaces return to the pool; on failure everything stays reserved.
+    ///
+    /// # Safety
+    /// Every CPU writer of the scanout has been withdrawn and its views
+    /// retired (`scanout_access::wait_retired`); no other display client.
+    pub async unsafe fn stop_display(&mut self) -> Result<(), Error> {
+        let h = &mut self.sequence.backend;
+        let pipeline = h.modeset.as_mut().ok_or(Error::Invalid)?;
+        let stopped = h.scanout.as_mut().map(|s| s.stop());
+        let (vbios, _) = h.display_bios.as_ref().ok_or(Error::Invalid)?;
+        let tables = crate::amdgpu_navi22_bios::Tables::new(vbios)
+            .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Bios(e)))?;
+        pipeline.disable(&tables).await.map_err(Error::Modeset)?;
+        // SAFETY: the pipeline stopped cleanly (HUBP drained and blanked, OTG
+        // off) and the caller retired every CPU view.
+        unsafe {
+            if let Some(scanout) = h.scanout.take() {
+                if stopped.is_some_and(|r| r.is_ok()) {
+                    let _ = scanout.release();
+                }
+            }
+            let _ = pipeline.release_scanout();
+        }
+        Ok(())
+    }
+    /// The presentation owner of the lit pipe.
+    pub fn display_scanout(
+        &mut self,
+    ) -> Result<&mut crate::amdgpu_navi22_scanout::Scanout, crate::amdgpu_dcn_clk::Error> {
+        self.sequence
+            .backend
+            .scanout
+            .as_mut()
+            .ok_or(crate::amdgpu_dcn_clk::Error::Invalid)
+    }
+    pub fn display_scanout_ref(&self) -> Option<&crate::amdgpu_navi22_scanout::Scanout> {
+        self.sequence.backend.scanout.as_ref()
+    }
+    /// The DCN30 admission of the lit (or last attempted) sink.
+    pub fn display_admitted(&self) -> Option<&crate::amdgpu_navi22_modeset::Admitted> {
+        self.sequence.backend.modeset.as_ref()?.admitted()
+    }
+    pub fn display_output(&self) -> Option<crate::amdgpu_navi22_modeset::Output> {
+        self.sequence.backend.modeset.as_ref()?.output()
+    }
+    /// Split borrows for presentation: the scanout, the pool and the
+    /// pipeline's HDP flush.
+    #[allow(clippy::type_complexity, reason = "a split borrow of three owners")]
+    fn presentation(
+        &mut self,
+    ) -> Result<
+        (
+            &mut crate::amdgpu_navi22_scanout::Scanout,
+            &Pool,
+            impl FnMut() -> Result<(), crate::amdgpu_dcn_clk::Error> + '_,
+        ),
+        crate::amdgpu_dcn_clk::Error,
+    > {
+        use crate::amdgpu_dcn_clk::Error as E;
+        let h = &mut self.sequence.backend;
+        let scanout = h.scanout.as_mut().ok_or(E::Invalid)?;
+        let pipeline = h.modeset.as_mut().ok_or(E::Invalid)?;
+        let flush = move || {
+            pipeline.flush().map_err(|e| match e {
+                crate::amdgpu_navi22_modeset::Error::Block(e) => e,
+                crate::amdgpu_navi22_modeset::Error::Unsupported => E::Unsupported,
+                _ => E::Busy,
+            })
+        };
+        Ok((scanout, &h.pool, flush))
+    }
+    /// Reserve and clear the back buffer of the lit pipe.
+    pub async fn prepare_display_back_buffer(
+        &mut self,
+    ) -> Result<crate::amdgpu_navi22_scanout::Surface, crate::amdgpu_dcn_clk::Error> {
+        let (scanout, pool, flush) = self.presentation()?;
+        scanout.prepare_back(pool, flush).await
+    }
+    /// Flip the lit pipe to its back buffer (HDP flush first).
+    pub async fn flip_display(
+        &mut self,
+    ) -> Result<crate::amdgpu_navi22_scanout::FlipDone, crate::amdgpu_dcn_clk::Error> {
+        let (scanout, _, flush) = self.presentation()?;
+        scanout.flip(flush).await
+    }
+    /// Show (upload once) a premultiplied ARGB cursor image on the lit pipe.
+    pub fn set_display_cursor(
+        &mut self,
+        image: (u32, u32, &[u32]),
+        at: (i32, i32),
+    ) -> Result<crate::amdgpu_dcn30_cursor::Shown, crate::amdgpu_dcn_clk::Error> {
+        let (scanout, pool, flush) = self.presentation()?;
+        scanout.set_cursor(pool, image, at, flush)
     }
 }
 

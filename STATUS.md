@@ -992,6 +992,12 @@ connected HDMI sink on pipe 0 with a test pattern: DCN init, HUBBUB/DML30
 deadlines, the DAL clocks and the VBIOS PixelClock/STREAM_SETUP/transmitter
 tables (now executed by an `atom.c`-faithful interpreter), then fetch and
 unblank. Model-tested per block; never run on hardware.
+The lit pipe is presented natively: console/status publication with the
+`scanout_access` withdraw-before-teardown contract, DCN3.0 HUBP VSYNC page
+flips completed from EARLIEST_INUSE (pflip/vupdate IH sources armed), a
+256x256 DCN3.0 cursor (opt-in), KMS on the amdgpu card (DP-1..3, HDMI-A-1;
+DML30-admitted modes, SETCRTC/atomic/TEST_ONLY, disable, vblank, flip
+events) and a monitor that relights after GPU recovery. Register models only.
 For bare-metal runs, `cargo xtask usb-image` builds a UEFI stick whose kernel
 appends its log to `/narf-boot-<n>.log` on that stick (`narf.bootlog=`,
 marker-gated, USB-only, bounded); a secondary card's cold boot keeps the iGPU

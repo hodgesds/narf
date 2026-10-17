@@ -353,6 +353,7 @@ impl crate::amdgpu_navi22_recovery::Backend for Recovering<'_> {
         crate::amdgpu_navi22_thermal::stop();
         crate::amdgpu_navi22_power::stop(None);
         let boot = self.owner.as_mut().ok_or(boot::Error::Invalid)?;
+        withdraw_for_reset(boot).await;
         if let Some(ih) = boot.interrupts() {
             self.interrupts.push(ih);
         }
@@ -376,6 +377,7 @@ impl crate::amdgpu_navi22_recovery::Backend for Recovering<'_> {
         if let Some(boot) = self.owner.as_mut() {
             start_services(boot).await;
         }
+        relight_after_recovery();
     }
     fn lose(&mut self) {
         crate::amdgpu_navi22_tdr::stop();
@@ -392,8 +394,9 @@ impl crate::amdgpu_navi22_recovery::Backend for Recovering<'_> {
 /// triggered automatically unless `amdgpu_navi22_tdr::set_automatic_recovery`
 /// was enabled. Quiesces the services and IH, abandons every fence wait,
 /// mode1-resets the ASIC and re-runs the complete cold-boot bring-up on a
-/// fresh owner, then restarts telemetry, thermal and TDR. The display stays
-/// dark until its owner restarts DMUB and modesets. Failure or cancellation
+/// fresh owner (DMUB restarted as on cold boot), then restarts telemetry,
+/// thermal and TDR. The native display is withdrawn and stopped first and,
+/// once `recoveries()` increments, relit by the display monitor. Failure or cancellation
 /// reports the device lost to every waiter. Not hardware-validated.
 ///
 /// # Safety
@@ -574,6 +577,601 @@ pub async fn dmub_notification() -> Result<Option<[u8; 64]>, boot::Error> {
         .as_mut()
         .ok_or(boot::Error::Invalid)?
         .dmub_notification()
+}
+
+// ── Native display: publication, flips, cursor and KMS ──────────────────
+//
+// The lit pipe's front buffer is the console's external scanout (CPU writes
+// plus the HDP flush hook) and the KMS CRTC's primary plane. DRM frames are
+// copied into the back buffer and flipped at VUPDATE; the console follows the
+// front. Every teardown first withdraws the publication and waits for the
+// retired CPU views (`scanout_access`), then stops presentation, then the
+// pipeline. The display monitor converges the hardware to `amdgpu_navi22_kms`.
+
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+type ScanError = crate::amdgpu_dcn_clk::Error;
+
+/// Hardware cursor opt-in (`amdgpu.navi22_hw_cursor`): DML30 here does not
+/// budget a cursor yet (Linux always budgets a 256-wide ARGB cursor), so the
+/// default stays the software sprite.
+static HW_CURSOR: AtomicBool = AtomicBool::new(false);
+pub fn set_hw_cursor(enabled: bool) {
+    HW_CURSOR.store(enabled, Ordering::Release);
+}
+
+/// Cursor hook published with the scanout: upload once, then move; hide with
+/// an off-screen move. Never waits for the owner. False (software sprite)
+/// while the hardware cursor is not enabled or nothing is lit.
+fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bool {
+    if !HW_CURSOR.load(Ordering::Acquire) {
+        return false;
+    }
+    let Some(mut owner) = OWNER.try_lock() else {
+        return true;
+    };
+    let Some(boot) = owner.as_mut() else {
+        return false;
+    };
+    let (w, h, _) = image;
+    let Ok(scanout) = boot.display_scanout() else {
+        return false;
+    };
+    let shown = scanout
+        .cursor()
+        .is_some_and(|c| (c.width, c.height) == (w, h));
+    // A failure leaves the cursor hidden; the pointer just stops.
+    let _ = match (shown, position) {
+        (false, None) => return true,
+        (true, at) => scanout.move_cursor(at.unwrap_or((-(w as i32), -(h as i32)))),
+        (false, Some(at)) => boot.set_display_cursor(image, at),
+    };
+    true
+}
+
+/// Put the console on the lit pipe's front buffer, or withdraw it.
+fn publish_console(boot: &boot::ColdBoot) {
+    match boot.display_scanout_ref().map(|s| s.front().fb) {
+        Some(fb) => {
+            crate::amdgpu_dcn_display::publish_external(Some(fb), Some(flush_scanout));
+            crate::amdgpu_dcn_display::publish_external_cursor(Some(scanout_cursor));
+        }
+        None => crate::amdgpu_dcn_display::publish_external(None, None),
+    }
+}
+
+/// Stop presenting on the lit pipe: no more native frames, the console off
+/// its buffers, and every retired CPU view drained.
+async fn withdraw(boot: &boot::ColdBoot) {
+    PRESENT.native.store(false, Ordering::Release);
+    if let Some(s) = boot.display_scanout_ref() {
+        let ours = |addr| {
+            [Some(s.front()), s.back()]
+                .iter()
+                .flatten()
+                .any(|b| b.fb.addr == addr)
+        };
+        if crate::amdgpu_dcn_display::active_scanout().is_some_and(|fb| ours(fb.addr)) {
+            crate::amdgpu_dcn_display::publish_external(None, None);
+        }
+    }
+    crate::scanout_access::wait_retired().await;
+}
+
+/// `Sink` view of a detected EDID for the mode checks (only the EDID is read).
+fn sink_of(edid: &[u8]) -> crate::amdgpu_navi22_display::Sink {
+    crate::amdgpu_navi22_display::Sink {
+        edid: edid.to_vec(),
+        preferred: None,
+        hdmi: true,
+        dpcd: None,
+    }
+}
+
+/// Detect, route and light the CRTC per `amdgpu_navi22_kms`, filling rows
+/// with `draw` before fetch, then present: back buffer, vblank, console, KMS.
+/// # Safety
+/// As for `modeset_displays`.
+async unsafe fn light(
+    boot: &mut boot::ColdBoot,
+    draw: impl Fn(u32, &mut [u32]),
+) -> Result<crate::amdgpu_navi22_modeset::Output, boot::Error> {
+    use crate::amdgpu_navi22_display::Detection;
+    use crate::amdgpu_navi22_kms::{Action, KMS};
+    use crate::amdgpu_navi22_modeset::{offered, Error as M};
+    let reports = boot.detect_displays().await?;
+    let admission =
+        |b: &boot::ColdBoot| b.display_admitted().map(|a| (a.soc, a.soc.dentist_vco_khz));
+    let soc = admission(boot);
+    let action = {
+        let mut kms = KMS.lock();
+        kms.reconcile(&reports, |_, edid| {
+            soc.map(|(soc, vco)| offered(&sink_of(edid), &soc, vco))
+        });
+        kms.assign_route();
+        let action = kms.next(None);
+        if let Action::Light { route, want } = action {
+            kms.attempted = Some((route, want));
+        }
+        action
+    };
+    let Action::Light { route, want } = action else {
+        crate::amdgpu_navi22_kms::publish();
+        return Err(boot::Error::Modeset(M::NoSink));
+    };
+    let (connector, sink) = match reports.get(route).map(|r| (&r.connector, &r.detection)) {
+        Some((c, Detection::Connected(sink))) => (*c, sink.clone()),
+        _ => return Err(boot::Error::Modeset(M::NoSink)),
+    };
+    // SAFETY: the caller's obligations.
+    let result = unsafe { boot.modeset_display(connector, &sink, want, draw) }.await;
+    // Admission inputs exist now (lit or not): offer what they admit.
+    let soc = admission(boot);
+    {
+        let mut kms = KMS.lock();
+        kms.reconcile(&reports, |_, edid| {
+            soc.map(|(soc, vco)| offered(&sink_of(edid), &soc, vco))
+        });
+        kms.crtc.shown = None;
+        if let Ok(output) = result.as_ref() {
+            let edid = sink
+                .edid
+                .get(..128)
+                .and_then(|e| <[u8; 128]>::try_from(e).ok());
+            if let Some(edid) = edid {
+                let offered = kms.connectors[route].modes.clone();
+                kms.crtc.shown = Some((edid, output.timing, offered));
+            }
+        }
+    }
+    let output = match result {
+        Ok(output) => output,
+        Err(error) => {
+            crate::amdgpu_navi22_kms::publish();
+            return Err(error);
+        }
+    };
+    // Without a back buffer (allocation failed) DRM frames fall back to
+    // copies onto the visible front.
+    let back = boot.prepare_display_back_buffer().await;
+    PRESENT.native.store(back.is_ok(), Ordering::Release);
+    restart_vblank();
+    publish_console(boot);
+    crate::amdgpu_navi22_kms::publish();
+    Ok(output)
+}
+
+/// Withdraw and tear the lit pipe down.
+/// # Safety
+/// As for `modeset_displays`.
+async unsafe fn unlight(boot: &mut boot::ColdBoot) -> Result<(), boot::Error> {
+    withdraw(boot).await;
+    // SAFETY: the publication is withdrawn and every CPU view retired.
+    let result = unsafe { boot.stop_display() }.await;
+    crate::amdgpu_navi22_kms::KMS.lock().crtc.shown = None;
+    crate::amdgpu_navi22_kms::publish();
+    result
+}
+
+/// Light the board's HDMI sink per KMS (preferred mode, automatic route on
+/// first use), filling rows with `draw` before fetch starts, and publish it:
+/// the console on its front buffer, KMS on the amdgpu card.
+///
+/// # Safety
+/// Boot-time or monitor context after a successful `run`; no other display
+/// client, and no CPU writer of the scanout except through the publication.
+pub async unsafe fn modeset_displays(
+    draw: impl Fn(u32, &mut [u32]),
+) -> Result<crate::amdgpu_navi22_modeset::Output, boot::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
+    // SAFETY: forwarded; serialized by the owner mutex.
+    unsafe { light(boot, draw) }.await
+}
+
+/// Poll period of the display monitor; DRM requests and recoveries wake it
+/// within `MONITOR_STEP_MS`.
+const MONITOR_MS: u64 = 1000;
+const MONITOR_STEP_MS: u64 = 50;
+static MONITOR: AtomicBool = AtomicBool::new(false);
+/// Recoveries the display was last lit after.
+static RELIT: AtomicU64 = AtomicU64::new(0);
+
+/// One monitor pass: after a recovery, light the new owner; otherwise apply
+/// the next KMS convergence step (tear down, then light on the next pass).
+/// # Safety
+/// As for `modeset_displays`.
+async unsafe fn monitor_pass() {
+    use crate::amdgpu_navi22_kms::{Action, KMS};
+    use core::fmt::Write;
+    let recoveries = crate::amdgpu_navi22_recovery::recoveries();
+    let mut owner = OWNER.lock().await;
+    let Some(boot) = owner.as_mut() else {
+        return;
+    };
+    if RELIT.swap(recoveries, Ordering::AcqRel) != recoveries {
+        // The recovered owner has a fresh DCN (and restarted DMUB): nothing
+        // shows, and the last attempt does not apply.
+        let mut kms = KMS.lock();
+        kms.crtc.shown = None;
+        kms.attempted = None;
+    }
+    let running = boot.display_output().and_then(|o| {
+        boot.display_scanout_ref()?;
+        let kms = KMS.lock();
+        let route = kms.connectors.iter().position(|c| c.port == o.connector)?;
+        Some((route, o.timing))
+    });
+    let action = KMS.lock().next(running);
+    let result = match action {
+        Action::Nothing => return,
+        // SAFETY: serialized by the owner lock; the monitor is the only
+        // display client after boot.
+        Action::Unlight => unsafe { unlight(boot) }.await.map(|()| None),
+        // SAFETY: as above.
+        Action::Light { .. } => unsafe { light(boot, |_, row| row.fill(0)) }.await.map(Some),
+    };
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: navi22 display {action:?}: {:?}",
+        result.map(|o| o.map(|o| (o.timing.h_active, o.timing.v_active)))
+    );
+    // A teardown is followed at once by any relight it was for.
+    if action == Action::Unlight {
+        crate::amdgpu_navi22_kms::wake();
+    }
+}
+
+/// Start the display monitor (once): it converges DRM's requests, relights
+/// after a GPU recovery, and runs until the owner disappears.
+/// # Safety
+/// As for `modeset_displays`; from here on only the monitor and the
+/// published hooks drive the display.
+pub unsafe fn spawn_display_monitor() {
+    if MONITOR.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    RELIT.store(
+        crate::amdgpu_navi22_recovery::recoveries(),
+        Ordering::Release,
+    );
+    narf_scheduler::spawn(async {
+        loop {
+            let mut waited = 0;
+            while waited < MONITOR_MS
+                && !crate::amdgpu_navi22_kms::take_pending()
+                && RELIT.load(Ordering::Acquire) == crate::amdgpu_navi22_recovery::recoveries()
+            {
+                narf_time::SleepUntil::new(
+                    narf_time::Deadline::after_ms(MONITOR_STEP_MS).as_instant(),
+                )
+                .await;
+                waited += MONITOR_STEP_MS;
+            }
+            // SAFETY: the monitor's contract, accepted at spawn.
+            unsafe { monitor_pass() }.await;
+        }
+    });
+}
+
+/// Called by the recovery path once the new owner runs: the monitor relights
+/// the display (DMUB was restarted by the recovered sequence) as soon as
+/// `amdgpu_navi22_recovery::recoveries()` has incremented.
+pub fn relight_after_recovery() {
+    crate::amdgpu_navi22_kms::wake();
+}
+
+/// Before a reset: withdraw the scanout from every CPU writer and stop the
+/// pipe (best effort; the reset clears DCN either way), as amdgpu_dm commits
+/// zero streams in `dm_suspend` during GPU reset.
+async fn withdraw_for_reset(boot: &mut boot::ColdBoot) {
+    withdraw(boot).await;
+    if boot.display_output().is_some() {
+        // SAFETY: withdrawn and drained above; recovery excludes others.
+        let _ = unsafe { boot.stop_display() }.await;
+    }
+    crate::amdgpu_navi22_kms::KMS.lock().crtc.shown = None;
+    crate::amdgpu_navi22_kms::publish();
+}
+
+/// The DCN30 admission of the lit configuration for the power policy
+/// (`amdgpu_navi22_power_policy`); None while busy or nothing is lit.
+pub fn display_admission() -> Option<crate::amdgpu_navi22_power_policy::DisplayAdmission> {
+    let owner = OWNER.try_lock()?;
+    let boot = owner.as_ref()?;
+    let streams = u8::from(boot.display_output().is_some());
+    Some(crate::amdgpu_navi22_kms::display_admission(
+        boot.display_admitted()?,
+        streams,
+    ))
+}
+
+/// Show a premultiplied ARGB8888 cursor (at most 256x256) on the lit pipe.
+pub async fn set_display_cursor(
+    image: (u32, u32, &[u32]),
+    at: (i32, i32),
+) -> Result<crate::amdgpu_dcn30_cursor::Shown, ScanError> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner.as_mut().ok_or(ScanError::Busy)?;
+    boot.set_display_cursor(image, at)
+}
+
+/// Flip the lit pipe to its back buffer; a console on the old front follows.
+/// # Safety
+/// The back buffer holds the complete next frame and no CPU writer touches
+/// it until the next flip.
+pub async unsafe fn flip_display() -> Result<crate::amdgpu_navi22_scanout::FlipDone, ScanError> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner.as_mut().ok_or(ScanError::Busy)?;
+    let before = boot.display_scanout()?.front().fb;
+    let done = boot.flip_display().await?;
+    follow_flip(before, boot.display_scanout()?.front().fb).await;
+    Ok(done)
+}
+
+/// Follow a flip while still holding OWNER: retired CPU views must finish
+/// before the former front is overwritten as the back buffer.
+async fn follow_flip(before: GenericFb, after: GenericFb) {
+    if crate::amdgpu_dcn_display::active_scanout().is_some_and(|fb| fb.addr == before.addr) {
+        crate::amdgpu_dcn_display::publish_external(Some(after), Some(flush_scanout));
+        crate::amdgpu_dcn_display::publish_external_cursor(Some(scanout_cursor));
+    }
+    crate::scanout_access::wait_retired().await;
+}
+
+// ── Vblank clock (DRM's 64-bit count from the 24-bit OTG frame count) ──
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VblankClock {
+    raw: Option<u32>,
+    time: crate::drm::card::VblankTime,
+    read_ns: u64,
+}
+static VBLANK: narf_lib::sync::IrqSafeSpinLock<Option<VblankClock>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Fold a reading into the clock: the wrapped 24-bit difference advances
+/// the 64-bit count; the first reading after a relight counts one past the
+/// last known vblank (amdgpu_navi48_platform's clock, same OTG semantics).
+fn extend_vblank(
+    clock: Option<VblankClock>,
+    phase: crate::amdgpu_dcn401_otg::VblankPhase,
+    read_ns: u64,
+) -> VblankClock {
+    let mask = crate::amdgpu_dcn30_flip::FRAME_MASK;
+    let count = match clock {
+        Some(VblankClock {
+            raw: Some(raw),
+            time,
+            ..
+        }) => time.count + u64::from(phase.count.wrapping_sub(raw) & mask),
+        Some(VblankClock {
+            raw: None, time, ..
+        }) => time.count + 1,
+        None => u64::from(phase.count),
+    };
+    let at = |offset: i64| read_ns.saturating_add_signed(offset);
+    VblankClock {
+        raw: Some(phase.count),
+        time: crate::drm::card::VblankTime {
+            count,
+            start_ns: at(phase.start_ns),
+            ns: at(phase.end_ns),
+            period_ns: phase.period_ns,
+        },
+        read_ns,
+    }
+}
+/// A recent reading carried forward whole periods while the owner is busy.
+fn extrapolate_vblank(clock: VblankClock, now: u64) -> Option<crate::drm::card::VblankTime> {
+    let t = clock.time;
+    if now.saturating_sub(clock.read_ns) > 1_000_000_000 || t.period_ns == 0 {
+        return None;
+    }
+    let periods = now.saturating_sub(t.start_ns) / t.period_ns;
+    Some(crate::drm::card::VblankTime {
+        count: t.count + periods,
+        start_ns: t.start_ns + periods * t.period_ns,
+        ns: t.ns + periods * t.period_ns,
+        period_ns: t.period_ns,
+    })
+}
+fn read_vblank(boot: &mut boot::ColdBoot) -> Option<crate::drm::card::VblankTime> {
+    let scanout = boot.display_scanout().ok()?;
+    let timing = scanout.timing();
+    let position = scanout.position().ok()?;
+    let read_ns = narf_time::wall::monotonic_ns();
+    let phase = crate::amdgpu_navi22_scanout::vblank_phase(position, &timing)?;
+    let mut clock = VBLANK.lock();
+    let next = extend_vblank(*clock, phase, read_ns);
+    *clock = Some(next);
+    Some(next.time)
+}
+fn restart_vblank() {
+    if let Some(clock) = VBLANK.lock().as_mut() {
+        clock.raw = None;
+    }
+}
+/// The hardware vblank clock of the lit pipe, read now or carried forward.
+pub fn vblank_time() -> Option<crate::drm::card::VblankTime> {
+    if let Some(mut owner) = OWNER.try_lock() {
+        return read_vblank(owner.as_mut()?);
+    }
+    let clock = (*VBLANK.lock())?;
+    extrapolate_vblank(clock, narf_time::wall::monotonic_ns())
+}
+/// `drm::card::VblankSource` for the native CRTC.
+pub fn crtc_vblank(crtc_id: u32) -> Option<crate::drm::card::VblankTime> {
+    crate::amdgpu_navi22_kms::crtc_display(crtc_id)?;
+    vblank_time()
+}
+
+// ── DRM presentation (mailbox of one frame, copied then flipped) ────────
+
+struct PresentSlot {
+    native: AtomicBool,
+    presenting: AtomicBool,
+    next: narf_lib::sync::IrqSafeSpinLock<Option<Frame>>,
+}
+static PRESENT: PresentSlot = PresentSlot {
+    native: AtomicBool::new(false),
+    presenting: AtomicBool::new(false),
+    next: narf_lib::sync::IrqSafeSpinLock::new(None),
+};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Frame {
+    phys: u64,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    ticket: Option<u64>,
+}
+
+/// Whether `present_frame` would present through a hardware flip now.
+pub fn native_present_ready(display: u8) -> bool {
+    usize::from(display) < crate::amdgpu_navi22_kms::MAX_CRTCS
+        && PRESENT.native.load(Ordering::Acquire)
+}
+
+/// Complete flip-complete events up to `ticket`: in the vblank the flip
+/// latched in, or now in the last known vblank when it did not flip.
+fn complete_flip(display: u8, ticket: Option<u64>, latched: Option<crate::drm::card::VblankTime>) {
+    use crate::drm::card::{flips, FlipStamp};
+    let Some(ticket) = ticket else {
+        return;
+    };
+    let mut log = flips(display).lock();
+    match latched {
+        Some(t) => log.complete(
+            ticket,
+            FlipStamp {
+                ns: t.ns,
+                sequence: t.count as u32,
+            },
+        ),
+        None => {
+            let sequence = log.last().map_or(0, |s| s.sequence);
+            let ns = narf_time::wall::monotonic_ns();
+            log.complete(ticket, FlipStamp { ns, sequence });
+        }
+    }
+}
+
+/// Queue a DRM client's XRGB8888 frame (a kernel-mapped dumb buffer) for
+/// tear-free presentation: the presenter copies it into the back buffer and
+/// flips at the next VUPDATE. A newer frame replaces a waiting one; its
+/// `ticket` completes when the flip latches, or at once when the frame is
+/// replaced, refused or fails. False when native presentation is not
+/// available (the caller then copies onto the visible front).
+pub fn present_frame(
+    display: u8,
+    phys: u64,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    ticket: Option<u64>,
+) -> bool {
+    if !native_present_ready(display)
+        || width == 0
+        || height == 0
+        || pitch < width.saturating_mul(4)
+    {
+        complete_flip(display, ticket, None);
+        return false;
+    }
+    {
+        let mut next = PRESENT.next.lock();
+        let ticket = ticket.max(next.and_then(|f| f.ticket));
+        *next = Some(Frame {
+            phys,
+            pitch,
+            width,
+            height,
+            ticket,
+        });
+    }
+    if !PRESENT.presenting.swap(true, Ordering::AcqRel) {
+        narf_scheduler::spawn(presenter());
+    }
+    true
+}
+
+async fn presenter() {
+    use core::fmt::Write;
+    loop {
+        let Some(frame) = PRESENT.next.lock().take() else {
+            PRESENT.presenting.store(false, Ordering::Release);
+            if PRESENT.next.lock().is_some() && !PRESENT.presenting.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            return;
+        };
+        if !PRESENT.native.load(Ordering::Acquire) {
+            complete_flip(0, frame.ticket, None);
+            continue;
+        }
+        let result = {
+            let mut owner = OWNER.lock().await;
+            match owner.as_mut() {
+                // SAFETY: the owner lock serializes display writers; the
+                // dumb buffer stays valid under DRM's buffer rules.
+                Some(boot) => match unsafe { present_native(boot, frame) }.await {
+                    Ok((before, after)) => {
+                        let latched = read_vblank(boot);
+                        follow_flip(before, after).await;
+                        Ok(latched)
+                    }
+                    Err(e) => Err(e),
+                },
+                None => Err(ScanError::Busy),
+            }
+        };
+        match result {
+            Ok(latched) => complete_flip(0, frame.ticket, latched),
+            Err(e) => {
+                complete_flip(0, frame.ticket, None);
+                // A failed flip quarantines presentation; later frames use
+                // the fallback copy.
+                PRESENT.native.store(false, Ordering::Release);
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi22 native present disabled: {e:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Copy `frame` into the back buffer, then flip to it. Returns the front
+/// before and after.
+/// # Safety
+/// The caller holds the owner lock; `frame` names a mapped dumb buffer.
+async unsafe fn present_native(
+    boot: &mut boot::ColdBoot,
+    frame: Frame,
+) -> Result<(GenericFb, GenericFb), ScanError> {
+    // A cancelled presenter may have left the old front's views draining.
+    crate::scanout_access::wait_retired().await;
+    let scanout = boot.display_scanout()?;
+    let back = scanout.back().ok_or(ScanError::Invalid)?.fb;
+    let width = frame.width.min(back.width);
+    for y in 0..frame.height.min(back.height) {
+        let at = frame.phys + u64::from(y) * u64::from(frame.pitch);
+        // SAFETY: a kernel-mapped dumb buffer row of at least `width`
+        // pixels (pitch >= 4 * width was checked when queued).
+        let row = unsafe {
+            core::slice::from_raw_parts(
+                narf_memory::PhysAddr::new(at).kernel_ptr::<u32>(),
+                width as usize,
+            )
+        };
+        boot.display_scanout()?.upload_back(0, y, row)?;
+        if y % 64 == 63 {
+            narf_scheduler::yield_now().await;
+        }
+    }
+    let before = boot.display_scanout()?.front().fb;
+    boot.flip_display().await?;
+    Ok((before, boot.display_scanout()?.front().fb))
 }
 
 #[cfg(feature = "kernel-test")]
