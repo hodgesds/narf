@@ -454,6 +454,17 @@ fn reset_navi22_failures_are_terminal() -> TestResult {
     if run(e.run()) != Err(Error::Timeout) || e.state != State::Failed {
         return TestResult::Fail("bootloader wait lacked a bound");
     }
+    // A bootloader that needs ~2.5 s after the reset (one poll per ms) is
+    // inside psp_v11_0_wait_for_bootloader's 20 x usec_timeout polls; the
+    // old 2 s bound failed it.
+    let mut e = engine(Fake {
+        bootloader_polls: 2500,
+        ..Fake::posted()
+    });
+    if BOOTLOADER_MS < crate::amdgpu_psp_boot::PSP11_BOOTLOADER_TIMEOUT_MS || run(e.run()).is_err()
+    {
+        return TestResult::Fail("post-reset bootloader wait shorter than Linux's PSP11 bound");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
