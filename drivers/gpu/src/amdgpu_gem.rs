@@ -43,9 +43,8 @@
 //! it will become a lie the moment `AMDGPU_CS` lands, and it is the one call
 //! here that must be revisited then rather than extended.
 //!
-//! LINUX-GAP: `GEM_USERPTR` (pinning host pages into the GPU address space),
-//! `GEM_METADATA` (the tiling descriptor a DRI client passes to its peer) and
-//! `GEM_LIST_HANDLES` are not implemented and return EINVAL.
+//! LINUX-GAP: `GEM_USERPTR` (pinning host pages into the GPU address space)
+//! and `GEM_LIST_HANDLES` are not implemented and return EINVAL.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -181,6 +180,17 @@ pub struct GemObject {
     alignment: u64,
     pub preferred_domains: u64,
     pub flags: u64,
+    /// `GEM_METADATA`: what a DRI client tells its peer about the buffer,
+    /// kept with the buffer so every handle to it sees the same.
+    metadata: IrqSafeSpinLock<Metadata>,
+}
+
+/// `amdgpu_bo_user`'s tiling flags and opaque metadata blob.
+#[derive(Debug, Default)]
+struct Metadata {
+    tiling: u64,
+    flags: u64,
+    data: Vec<u8>,
 }
 
 impl GemObject {
@@ -416,6 +426,7 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
                 alignment,
                 preferred_domains: domains,
                 flags,
+                metadata: IrqSafeSpinLock::new(Metadata::default()),
             }
         }
         None if domains & (uapi::AMDGPU_GEM_DOMAIN_GTT | uapi::AMDGPU_GEM_DOMAIN_CPU) as u64
@@ -451,6 +462,7 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
                 alignment,
                 preferred_domains: domains,
                 flags,
+                metadata: IrqSafeSpinLock::new(Metadata::default()),
             }
         }
     };
@@ -569,6 +581,54 @@ pub fn dispatch(cmd: u32, arg: usize, state: &GemState) -> Result<u64, FsError> 
         uapi::DRM_AMDGPU_GEM_MMAP => mmap(state, arg),
         uapi::DRM_AMDGPU_GEM_WAIT_IDLE => wait_idle(state, arg),
         uapi::DRM_AMDGPU_GEM_OP => op(state, arg),
+        uapi::DRM_AMDGPU_GEM_METADATA => metadata(state, arg),
         _ => Err(FsError::Unsupported),
+    }
+}
+
+/// `amdgpu_gem_metadata_ioctl` on `drm_amdgpu_gem_metadata` { handle, op,
+/// data { flags, tiling_info, data_size_bytes, data[64] } } (288 bytes).
+/// SET stores the tiling flags and up to 256 bytes of metadata (none
+/// clears it); GET returns them, leaving the rest of `data` as passed. An
+/// unknown op does nothing and succeeds, as in Linux.
+fn metadata(state: &GemState, arg: usize) -> Result<u64, FsError> {
+    const SIZE: usize = 288;
+    // SAFETY: `arg` is the ioctl pointer the trap layer validated; copy_in
+    // bounds the read and SMAP-brackets it.
+    let mut bytes = unsafe { copy_in(arg, SIZE)? };
+    let field = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let (handle, op) = (field(0), field(4));
+    let object = state.lookup(handle).ok_or(FsError::NotFound)?;
+    match op {
+        uapi::AMDGPU_GEM_METADATA_OP_SET_METADATA => {
+            let size = field(24) as usize;
+            if size > 256 {
+                return Err(FsError::InvalidData);
+            }
+            let mut m = object.metadata.lock();
+            m.tiling = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+            // amdgpu_bo_set_metadata: an empty blob clears the blob but
+            // keeps the old flags.
+            if size == 0 {
+                m.data.clear();
+            } else {
+                m.flags = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                m.data = bytes[28..28 + size].to_vec();
+            }
+            Ok(0)
+        }
+        uapi::AMDGPU_GEM_METADATA_OP_GET_METADATA => {
+            {
+                let m = object.metadata.lock();
+                bytes[8..16].copy_from_slice(&m.flags.to_le_bytes());
+                bytes[16..24].copy_from_slice(&m.tiling.to_le_bytes());
+                bytes[24..28].copy_from_slice(&(m.data.len() as u32).to_le_bytes());
+                bytes[28..28 + m.data.len()].copy_from_slice(&m.data);
+            }
+            // SAFETY: as above.
+            unsafe { copy_out(arg, &bytes)? };
+            Ok(0)
+        }
+        _ => Ok(0),
     }
 }

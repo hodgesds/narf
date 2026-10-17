@@ -12925,3 +12925,86 @@ kernel_test_in!(
     "drivers/gpu/amdgpu_vmid",
     smoke_amdgpu_vmid_grab_reuses_and_flushes_like_linux
 );
+
+/// GEM_METADATA follows amdgpu_gem_metadata_ioctl: SET stores the tiling
+/// flags and a blob of at most 256 bytes on the buffer, GET returns them
+/// and leaves the rest of the data array alone, an empty SET clears the
+/// blob but keeps its flags, and an unknown handle is ENOENT.
+fn smoke_amdgpu_gem_metadata_round_trips() -> TestResult {
+    use crate::amdgpu_gem::{dispatch, GemState};
+    use crate::amdgpu_uapi as u;
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+    use narf_filesystem::FsError;
+    let state = GemState::new();
+    let mut req = [0u8; 32];
+    req[0..8].copy_from_slice(&4096u64.to_le_bytes());
+    req[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        req.as_mut_ptr() as usize,
+        &state,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE");
+    }
+    let handle = u32::from_le_bytes(req[0..4].try_into().unwrap());
+    let cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_METADATA;
+    let request = |handle: u32, op: u32, flags: u64, tiling: u64, data: &[u8], size: u32| {
+        let mut r = [0u8; 288];
+        r[0..4].copy_from_slice(&handle.to_le_bytes());
+        r[4..8].copy_from_slice(&op.to_le_bytes());
+        r[8..16].copy_from_slice(&flags.to_le_bytes());
+        r[16..24].copy_from_slice(&tiling.to_le_bytes());
+        r[24..28].copy_from_slice(&size.to_le_bytes());
+        r[28..28 + data.len()].copy_from_slice(data);
+        r
+    };
+    let (set, get) = (
+        u::AMDGPU_GEM_METADATA_OP_SET_METADATA,
+        u::AMDGPU_GEM_METADATA_OP_GET_METADATA,
+    );
+    let blob = [7u8, 6, 5, 4, 3, 2, 1, 0, 9, 9];
+    let mut r = request(handle, set, 0x11, 0xabcd_0000_1234, &blob, 10);
+    if dispatch(cmd, r.as_mut_ptr() as usize, &state) != Ok(0) {
+        return TestResult::Fail("SET_METADATA");
+    }
+    let mut r = request(handle, get, 0, 0, &[0xee; 256], 0);
+    if dispatch(cmd, r.as_mut_ptr() as usize, &state) != Ok(0)
+        || r[8..16] != 0x11u64.to_le_bytes()
+        || r[16..24] != 0xabcd_0000_1234u64.to_le_bytes()
+        || r[24..28] != 10u32.to_le_bytes()
+        || r[28..38] != blob
+        || r[38..284].iter().any(|&b| b != 0xee)
+    {
+        return TestResult::Fail("GET_METADATA");
+    }
+    // An empty blob clears it, keeping the flags; the tiling is replaced.
+    let mut r = request(handle, set, 0x99, 5, &[], 0);
+    let mut g = request(handle, get, 0, 0, &[], 0);
+    if dispatch(cmd, r.as_mut_ptr() as usize, &state) != Ok(0)
+        || dispatch(cmd, g.as_mut_ptr() as usize, &state) != Ok(0)
+        || g[8..16] != 0x11u64.to_le_bytes()
+        || g[16..24] != 5u64.to_le_bytes()
+        || g[24..28] != 0u32.to_le_bytes()
+    {
+        return TestResult::Fail("clearing the blob");
+    }
+    let mut big = request(handle, set, 0, 0, &[], 257);
+    if dispatch(cmd, big.as_mut_ptr() as usize, &state) != Err(FsError::InvalidData) {
+        return TestResult::Fail("a blob past 256 bytes");
+    }
+    let mut other = request(handle, 3, 0, 0, &[], 0);
+    if dispatch(cmd, other.as_mut_ptr() as usize, &state) != Ok(0) {
+        return TestResult::Fail("an unknown op does nothing, as in Linux");
+    }
+    let mut missing = request(handle + 1, get, 0, 0, &[], 0);
+    if dispatch(cmd, missing.as_mut_ptr() as usize, &state) != Err(FsError::NotFound) {
+        return TestResult::Fail("an unknown handle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_gem",
+    smoke_amdgpu_gem_metadata_round_trips
+);

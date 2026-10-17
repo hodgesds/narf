@@ -3536,6 +3536,13 @@ paths; only the tables differ.
   without a heap are buddy pages (SYSTEM|SNOOPED, identity IOMMU); a
   VRAM-only buffer on a full heap is `NoSpace`. `GemObject::{phys, gpu,
   system}` give the CPU-mapped address, the entry address and the kind.
+- Metadata (`amdgpu_gem`, `GEM_METADATA`): each `GemObject` keeps its
+  tiling flags and an opaque blob of at most 256 bytes with its flags, so
+  every handle to the buffer sees what its exporter set (SET; an empty blob
+  clears the blob and keeps its flags) and GET returns them, leaving the
+  rest of `data` as passed. Unknown ops succeed doing nothing and unknown
+  handles are ENOENT, as amdgpu_gem_metadata_ioctl. `GemObject::load_u64` /
+  `store_u64` read and write 8 bytes through the kernel's own mapping.
 - Lifetimes: each VA mapping record holds its buffer (`Arc<GemObject>`, as
   `amdgpu_bo_va` holds its BO), so `GEM_CLOSE` cannot free pages the tables
   still point at. CLEAR and REPLACE split partly covered mappings
