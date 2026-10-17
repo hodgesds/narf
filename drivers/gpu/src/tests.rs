@@ -12052,6 +12052,15 @@ fn smoke_amdgpu_vm_holds_job_memory_until_its_fence() -> TestResult {
         if weak.upgrade().is_none() || deferred(card) == 0 {
             return Some("a job's buffer freed under it");
         }
+        // amdgpu_vm_clear_freed before the BO reference: the entries are
+        // invalid while the buffer is still held for the job.
+        if vm
+            .leaf_entry(0x4_0000_0000)
+            .is_some_and(|e| e & crate::amdgpu_vm::PTE_VALID != 0)
+            || vm.tlb_seq() != 2
+        {
+            return Some("unmapped buffer still translated while held");
+        }
         retire(card, &|seq| seq <= 4);
         if weak.upgrade().is_none() {
             return Some("retired before its job completed");
