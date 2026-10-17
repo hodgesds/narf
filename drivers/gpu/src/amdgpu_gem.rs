@@ -43,9 +43,8 @@
 //! it will become a lie the moment `AMDGPU_CS` lands, and it is the one call
 //! here that must be revisited then rather than extended.
 //!
-//! LINUX-GAP: `GEM_USERPTR` (pinning host pages into the GPU address space),
-//! `GEM_METADATA` (the tiling descriptor a DRI client passes to its peer) and
-//! `GEM_LIST_HANDLES` are not implemented and return EINVAL.
+//! LINUX-GAP: `GEM_USERPTR` (pinning host pages into the GPU address space)
+//! and `GEM_LIST_HANDLES` are not implemented and return EINVAL.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -181,9 +180,86 @@ pub struct GemObject {
     alignment: u64,
     pub preferred_domains: u64,
     pub flags: u64,
+    /// `GEM_METADATA`: what a DRI client tells its peer about the buffer,
+    /// kept with the buffer so every handle to it sees the same.
+    metadata: IrqSafeSpinLock<Metadata>,
+    /// The DRM card whose open created it (None outside a card).
+    card: Option<u32>,
+    /// The reservation and name every PRIME export of it shares, as Linux
+    /// keeps one dma_buf per GEM object.
+    dma_buf: Arc<narf_filesystem::dma_buf::DmaBufObject>,
+}
+
+/// `amdgpu_bo_user`'s tiling flags and opaque metadata blob.
+#[derive(Debug, Default)]
+struct Metadata {
+    tiling: u64,
+    flags: u64,
+    data: Vec<u8>,
 }
 
 impl GemObject {
+    /// The CPU address of byte `offset` of the buffer, if 8 bytes from
+    /// there lie inside it.
+    fn cpu_ptr(&self, offset: u64) -> Option<*mut u8> {
+        if offset.checked_add(8)? > self.byte_len {
+            return None;
+        }
+        Some(match &self.backing {
+            Backing::System(_) => {
+                narf_memory::PhysAddr::new(self.phys + offset).kernel_mut_ptr::<u8>()
+            }
+            Backing::Vram { _held } => (_held.mapping().virt + offset) as *mut u8,
+        })
+    }
+
+    /// The 64-bit value at byte `offset`, read by the CPU.
+    pub fn load_u64(&self, offset: u64) -> Option<u64> {
+        let at = self.cpu_ptr(offset)?;
+        // SAFETY: `cpu_ptr` bounds 8 bytes inside this buffer's kernel
+        // mapping (the direct map, or the reservation's BAR window), live
+        // while `self` is.
+        Some(u64::from_le_bytes(unsafe {
+            core::ptr::read_volatile(at.cast::<[u8; 8]>())
+        }))
+    }
+
+    /// Store `value` at byte `offset` from the CPU.
+    pub fn store_u64(&self, offset: u64, value: u64) -> Option<()> {
+        let at = self.cpu_ptr(offset)?;
+        // SAFETY: as `load_u64`.
+        unsafe { core::ptr::write_volatile(at.cast::<[u8; 8]>(), value.to_le_bytes()) };
+        Some(())
+    }
+
+    /// The DRM card whose open created the buffer.
+    pub fn card(&self) -> Option<u32> {
+        self.card
+    }
+
+    /// The reservation and name its PRIME exports share.
+    pub fn dma_buf(&self) -> &Arc<narf_filesystem::dma_buf::DmaBufObject> {
+        &self.dma_buf
+    }
+
+    /// The physical frames backing `len` bytes from byte `offset`, both
+    /// page aligned and inside the buffer, for a CPU mapping.
+    pub fn frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
+        let len = len as u64;
+        if offset % PAGE_SIZE != 0
+            || len == 0
+            || len % PAGE_SIZE != 0
+            || offset
+                .checked_add(len)
+                .is_none_or(|end| end > self.byte_len)
+        {
+            return Err(FsError::InvalidData);
+        }
+        Ok((0..len / PAGE_SIZE)
+            .map(|i| self.phys + offset + i * PAGE_SIZE)
+            .collect())
+    }
+
     /// Where the buffer lives: `AMDGPU_GEM_DOMAIN_VRAM` or `_GTT`.
     pub fn domain(&self) -> u32 {
         if self.system {
@@ -242,6 +318,10 @@ impl GemState {
     }
 
     fn insert(&self, object: GemObject) -> Result<u32, FsError> {
+        self.insert_shared(Arc::new(object))
+    }
+
+    fn insert_shared(&self, object: Arc<GemObject>) -> Result<u32, FsError> {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         // Wrapping back into the dumb-handle space would make two different
         // objects answer to one number. Refuse instead.
@@ -249,9 +329,26 @@ impl GemState {
             return Err(FsError::NoSpace);
         }
         let mut g = self.objects.lock();
-        g.get_or_insert_with(BTreeMap::new)
-            .insert(handle, Arc::new(object));
+        g.get_or_insert_with(BTreeMap::new).insert(handle, object);
         Ok(handle)
+    }
+
+    /// `drm_gem_prime_fd_to_handle` for a buffer another open of the same
+    /// card exported: the handle this open already has for it, or a new
+    /// one. A buffer of another card is refused (`InvalidData`).
+    pub fn import(&self, object: &Arc<GemObject>) -> Result<u32, FsError> {
+        if object.card != self.card {
+            return Err(FsError::InvalidData);
+        }
+        let existing = self.objects.lock().as_ref().and_then(|m| {
+            m.iter()
+                .find(|(_, o)| Arc::ptr_eq(o, object))
+                .map(|(h, _)| *h)
+        });
+        match existing {
+            Some(handle) => Ok(handle),
+            None => self.insert_shared(Arc::clone(object)),
+        }
     }
 
     fn get(&self, handle: u32) -> Option<Arc<GemObject>> {
@@ -283,6 +380,14 @@ impl GemState {
     /// an amdgpu handle from a dumb one without consulting both.
     pub fn owns(&self, handle: u32) -> bool {
         handle >= HANDLE_BASE && self.get(handle).is_some()
+    }
+
+    /// The object an `mmap` of `len` bytes at `offset` maps, which the
+    /// mapping holds until it is torn down (`FileOps::mmap_lifetime`), as
+    /// Linux's VMA holds its GEM object.
+    pub fn mapping_object(&self, offset: u64, len: usize) -> Option<Arc<GemObject>> {
+        let handle = u32::try_from(offset >> 12).ok()?;
+        self.get(handle).filter(|o| len as u64 <= o.byte_len)
     }
 
     /// Resolve an `mmap` offset to the object's physical frames.
@@ -383,6 +488,9 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
                 alignment,
                 preferred_domains: domains,
                 flags,
+                metadata: IrqSafeSpinLock::new(Metadata::default()),
+                card: state.card,
+                dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
             }
         }
         None if domains & (uapi::AMDGPU_GEM_DOMAIN_GTT | uapi::AMDGPU_GEM_DOMAIN_CPU) as u64
@@ -418,6 +526,9 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
                 alignment,
                 preferred_domains: domains,
                 flags,
+                metadata: IrqSafeSpinLock::new(Metadata::default()),
+                card: state.card,
+                dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
             }
         }
     };
@@ -536,6 +647,54 @@ pub fn dispatch(cmd: u32, arg: usize, state: &GemState) -> Result<u64, FsError> 
         uapi::DRM_AMDGPU_GEM_MMAP => mmap(state, arg),
         uapi::DRM_AMDGPU_GEM_WAIT_IDLE => wait_idle(state, arg),
         uapi::DRM_AMDGPU_GEM_OP => op(state, arg),
+        uapi::DRM_AMDGPU_GEM_METADATA => metadata(state, arg),
         _ => Err(FsError::Unsupported),
+    }
+}
+
+/// `amdgpu_gem_metadata_ioctl` on `drm_amdgpu_gem_metadata` { handle, op,
+/// data { flags, tiling_info, data_size_bytes, data[64] } } (288 bytes).
+/// SET stores the tiling flags and up to 256 bytes of metadata (none
+/// clears it); GET returns them, leaving the rest of `data` as passed. An
+/// unknown op does nothing and succeeds, as in Linux.
+fn metadata(state: &GemState, arg: usize) -> Result<u64, FsError> {
+    const SIZE: usize = 288;
+    // SAFETY: `arg` is the ioctl pointer the trap layer validated; copy_in
+    // bounds the read and SMAP-brackets it.
+    let mut bytes = unsafe { copy_in(arg, SIZE)? };
+    let field = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let (handle, op) = (field(0), field(4));
+    let object = state.lookup(handle).ok_or(FsError::NotFound)?;
+    match op {
+        uapi::AMDGPU_GEM_METADATA_OP_SET_METADATA => {
+            let size = field(24) as usize;
+            if size > 256 {
+                return Err(FsError::InvalidData);
+            }
+            let mut m = object.metadata.lock();
+            m.tiling = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+            // amdgpu_bo_set_metadata: an empty blob clears the blob but
+            // keeps the old flags.
+            if size == 0 {
+                m.data.clear();
+            } else {
+                m.flags = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                m.data = bytes[28..28 + size].to_vec();
+            }
+            Ok(0)
+        }
+        uapi::AMDGPU_GEM_METADATA_OP_GET_METADATA => {
+            {
+                let m = object.metadata.lock();
+                bytes[8..16].copy_from_slice(&m.flags.to_le_bytes());
+                bytes[16..24].copy_from_slice(&m.tiling.to_le_bytes());
+                bytes[24..28].copy_from_slice(&(m.data.len() as u32).to_le_bytes());
+                bytes[28..28 + m.data.len()].copy_from_slice(&m.data);
+            }
+            // SAFETY: as above.
+            unsafe { copy_out(arg, &bytes)? };
+            Ok(0)
+        }
+        _ => Ok(0),
     }
 }

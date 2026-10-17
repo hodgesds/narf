@@ -17,15 +17,14 @@
 //! query is indistinguishable from an unsupported one, and never a zero that
 //! userspace would believe.
 //!
-//! LINUX-GAP: `ACCEL_WORKING` reports **false**. Not because the pieces are
-//! absent — `AMDGPU_CS` parses and validates, the rings and their doorbells
-//! exist, the MQDs are built and written, the page tables are materialised —
-//! but because the MES has not been brought up, so no queue is registered with
-//! the firmware and no submitted work executes. That is the honest answer and it is also the
-//! useful one: Mesa declines the device cleanly at initialisation instead of
-//! coming up and failing at first draw. Flipping this flag is the milestone
-//! marker for the last link in the submission path landing, and the reason it
-//! is still a gap is in `amdgpu_cs`.
+//! LINUX-GAP: `ACCEL_WORKING` reports **false**. On a card that registers a
+//! submitter (Navi48) the pieces exist — `AMDGPU_CS` queues jobs on the
+//! kernel graphics, compute and SDMA rings with per-client VMIDs, and
+//! `HW_IP_INFO` reports those rings — but none of it has run on hardware
+//! yet, and rendering also needs eviction and invisible VRAM. Reporting
+//! false keeps Mesa declining the device cleanly at initialisation instead
+//! of coming up and failing at first draw; flipping it is the marker for
+//! the submission path proving itself on silicon.
 //!
 //! LINUX-GAP: the queries that need subsystems this driver has not built are
 //! refused rather than guessed — TIMESTAMP (no GFX clock-counter read),
@@ -281,10 +280,10 @@ fn vram_gtt(snap: &Snapshot) -> Vec<u8> {
 
 /// `AMDGPU_INFO_HW_IP_INFO` → `struct drm_amdgpu_info_hw_ip`.
 ///
-/// `available_rings` is a bitmask of usable rings and it is **zero** for every
-/// IP, which is the truth: no ring has been brought up. Linux returns success
-/// with a zero mask for an IP that exists but has no ring, so userspace reads
-/// this as "present, unusable" rather than as an error.
+/// `available_rings` is a bitmask of usable rings; it is zero here, and
+/// `dispatch_for` sets it from the open's card (`available_rings`). Linux
+/// returns success with a zero mask for an IP that exists but has no ring,
+/// so userspace reads that as "present, unusable" rather than as an error.
 fn hw_ip_info(snap: &Snapshot, ip_type: u32) -> Result<Vec<u8>, FsError> {
     let hw_id = hw_id_for_ip_type(ip_type).ok_or(FsError::InvalidData)?;
     let mut info = uapi::DrmAmdgpuInfoHwIp::default();
@@ -295,11 +294,20 @@ fn hw_ip_info(snap: &Snapshot, ip_type: u32) -> Result<Vec<u8>, FsError> {
         // and compute rings.
         info.ib_start_alignment = 32;
         info.ib_size_alignment = 32;
-        // `available_rings` stays zero — see the doc comment.
+        // `available_rings` is the open's card's (`dispatch_for`).
         info.ip_discovery_version =
             u32::from(block.major) << 16 | u32::from(block.minor) << 8 | u32::from(block.revision);
     }
     Ok(as_bytes(&info))
+}
+
+/// The rings of `ip_type` instance `ip_instance` that DRM card `card` runs
+/// jobs on, as `amdgpu_hw_ip_info` sets a bit per ready ring: bit 0 when
+/// the card's registered submitter serves that IP's ring 0.
+pub fn available_rings(card: Option<u32>, ip_type: u32, ip_instance: u32) -> u32 {
+    card.and_then(crate::amdgpu_cs::submitter)
+        .and_then(|engine| engine.ring_for(ip_type, ip_instance, 0))
+        .map_or(0, |_| 1)
 }
 
 /// `AMDGPU_HW_IP_*` → the discovery table's `HW_ID_*`.
@@ -395,6 +403,15 @@ pub fn dispatch_for(
             out.extend_from_slice(&f.status.to_le_bytes());
             out.extend_from_slice(&f.vmhub.to_le_bytes());
             out
+        }
+        // amdgpu_hw_ip_info: the rings the open's card can run its jobs on.
+        (uapi::AMDGPU_INFO_HW_IP_INFO, Some(vm)) => {
+            let mut reply = query(which, payload)?;
+            let rings = available_rings(vm.card(), payload[0], payload[1]);
+            if let Some(field) = reply.get_mut(24..28) {
+                field.copy_from_slice(&rings.to_le_bytes());
+            }
+            reply
         }
         _ => query(which, payload)?,
     };
