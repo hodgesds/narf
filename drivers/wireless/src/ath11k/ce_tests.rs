@@ -109,7 +109,7 @@ struct DevCe {
     status_hp: u32,
 }
 
-struct FakeChip {
+pub(super) struct FakeChip {
     regs: RefCell<BTreeMap<u32, u32>>,
     ops: RefCell<Vec<Op>>,
     /// Shadow register n mirrors into `shadow[n]` (the QMI list).
@@ -119,7 +119,7 @@ struct FakeChip {
 }
 
 impl FakeChip {
-    fn new(shadow: &[u32]) -> Self {
+    pub(super) fn new(shadow: &[u32]) -> Self {
         let chip = FakeChip {
             regs: RefCell::new(BTreeMap::new()),
             ops: RefCell::new(Vec::new()),
@@ -145,7 +145,7 @@ impl FakeChip {
     fn clear(&self) {
         self.ops.borrow_mut().clear();
     }
-    fn take_pending(&self) -> u32 {
+    pub(super) fn take_pending(&self) -> u32 {
         self.pending.replace(0)
     }
     /// (base, size in words) from BASE_LSB / BASE_MSB at `r0`.
@@ -163,7 +163,7 @@ impl FakeChip {
     /// The target drains CE `ce`'s source ring up to the host HP:
     /// `(meta, payload)` per descriptor; TP written back through the
     /// programmed TP address.
-    fn target_consume(&self, ce: u32) -> Vec<(u32, Vec<u8>)> {
+    pub(super) fn target_consume(&self, ce: u32) -> Vec<(u32, Vec<u8>)> {
         let r0 = CE_SRC0 + ce * STRIDE;
         let (base, size) = self.ring(r0);
         let hp = self.reg(r0 + 0x400);
@@ -192,7 +192,7 @@ impl FakeChip {
     /// The target copies `data` into the next posted buffer of CE `ce`
     /// and reports `len` (default `data.len()`) in a status descriptor.
     /// `false` when no buffer is posted or the status ring is full.
-    fn target_deliver(&self, ce: u32, data: &[u8], len: Option<u32>) -> bool {
+    pub(super) fn target_deliver(&self, ce: u32, data: &[u8], len: Option<u32>) -> bool {
         let d0 = CE_DST0 + ce * STRIDE;
         let (dbase, dsize) = self.ring(d0);
         let host_hp = self.reg(d0 + 0x400);

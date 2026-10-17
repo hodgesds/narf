@@ -43,6 +43,7 @@ extern crate alloc;
 
 pub mod board;
 pub mod ce;
+pub mod core;
 pub mod dp;
 pub mod hal;
 pub mod htc;
@@ -74,6 +75,8 @@ pub fn register() {
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod ce_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod core_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod hal_tests;
 #[cfg(any(test, feature = "kernel-test"))]

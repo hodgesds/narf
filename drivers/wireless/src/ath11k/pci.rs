@@ -18,10 +18,11 @@
 //! the device to mission mode and starts the IPCR channels 20/21.
 //!
 //! The same task then runs the WLFW QMI handshake over QRTR
-//! ([`super::wlfw`]) to FW_READY and parks the session for the CE
-//! phase ([`take_wlfw`]).
+//! ([`super::wlfw`]) to FW_READY and hands the session to
+//! [`super::core::pci_start`] (QMI firmware start, CE, HTC, WMI to
+//! READY).
 //!
-//! Not yet: CE/HTC/WMI, DP. Until those land the device
+//! Not yet: DP. Until it lands the device
 //! registers no network interface — a `wlan%d` with a made-up MAC
 //! that "associates" without touching the radio would only mislead
 //! userspace.
@@ -324,21 +325,49 @@ pub fn mhi_ready() -> bool {
 /// The WLFW session over the running MHI controller.
 pub type Wlfw = wlfw::Wlfw<MhiController<Bar0Mhi>, wlfw::NarfFirmware, wlfw::Dma32>;
 
-/// The WLFW session parked at FW_READY: it owns the MHI controller,
-/// the firmware's target memory and the M3 image (which must stay
-/// allocated while the firmware runs). The CE/HAL phase takes it
-/// ([`take_wlfw`]) to send `firmware_start` with the shadow-register
-/// list it builds — never hold this lock across an `.await`.
-static WLFW: IrqSafeSpinLock<Option<Wlfw>> = IrqSafeSpinLock::new(None);
-
-/// Hand the FW_READY session to its next owner.
-pub fn take_wlfw() -> Option<Wlfw> {
-    WLFW.lock().take()
+/// What `ath11k_pci_aspm_restore` needs: the function, the Link
+/// Control saved before ASPM was disabled, and whether more than one
+/// MSI vector was granted (`ATH11K_FLAG_MULTI_MSI_VECTORS`). `Some` ⇔
+/// `ATH11K_PCI_ASPM_RESTORE` is set.
+struct AspmRestore {
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    link_ctl: u16,
+    multi_msi: bool,
 }
 
-/// `true` once the firmware reported FW_READY.
-pub fn wlfw_ready() -> bool {
-    WLFW.lock().is_some()
+static ASPM_RESTORE: IrqSafeSpinLock<Option<AspmRestore>> = IrqSafeSpinLock::new(None);
+
+/// `ath11k_pci_start`'s ASPM half: restore the saved ASPM bits
+/// (`test_and_clear_bit(ATH11K_PCI_ASPM_RESTORE)`), except with a single
+/// MSI vector, where Linux leaves ASPM off ("MHI register reading in M2
+/// causes system hang").
+pub fn aspm_restore() {
+    use core::fmt::Write as _;
+    let Some(a) = ASPM_RESTORE.lock().take() else {
+        return;
+    };
+    if !a.multi_msi {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath11k: leaving PCI ASPM disabled to avoid MHI M2 problems"
+        );
+        *ASPM_RESTORE.lock() = Some(a);
+        return;
+    }
+    let lnkctl = narf_bus::pci_express::LNKCTL_ASPMC;
+    let r = narf_bus::pci_express::clear_and_set_link_control(
+        &a.cap,
+        &a.device,
+        lnkctl,
+        a.link_ctl & lnkctl,
+    );
+    let _ = writeln!(
+        narf_console::Writer,
+        "  ath11k: ASPM restored (link_ctl {:#06x}): {}",
+        a.link_ctl,
+        if r.is_ok() { "ok" } else { "failed" }
+    );
 }
 
 /// Firmware lookup retries: probe can run before the rootfs firmware
@@ -558,7 +587,8 @@ async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart) {
                 st.frames_tx,
                 st.bad_frames
             );
-            *WLFW.lock() = Some(w);
+            // Linux: ath11k_core_qmi_firmware_ready.
+            super::core::pci_start(w).await;
         }
         Err(e) => wlfw_fail(e),
     }
@@ -708,6 +738,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         subsystem_device: device.id.subsystem_id,
         pci_addr,
     });
+    if let Some(link_ctl) = dev.saved_link_ctl {
+        *ASPM_RESTORE.lock() = Some(AspmRestore {
+            device,
+            cap,
+            link_ctl,
+            multi_msi: dev.msi.n_vectors > 1,
+        });
+    }
     *CONTROLLER.lock() = Some(dev);
     match start {
         Some(s) => {

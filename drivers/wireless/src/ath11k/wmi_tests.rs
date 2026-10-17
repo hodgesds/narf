@@ -29,7 +29,7 @@ macro_rules! ensure {
 }
 
 /// Little-endian words → bytes.
-fn le(ws: &[u32]) -> Vec<u8> {
+pub(super) fn le(ws: &[u32]) -> Vec<u8> {
     let mut v = Vec::with_capacity(ws.len() * 4);
     for w in ws {
         v.extend_from_slice(&w.to_le_bytes());
@@ -38,24 +38,24 @@ fn le(ws: &[u32]) -> Vec<u8> {
 }
 
 /// `[cmd_id] ++ body` — what `ath11k_wmi_cmd_send_nowait` hands HTC.
-fn frame(id: u32, body: &[u32]) -> Vec<u8> {
+pub(super) fn frame(id: u32, body: &[u32]) -> Vec<u8> {
     let mut v = le(&[id]);
     v.extend_from_slice(&le(body));
     v
 }
 
 /// Test-side TLV (firmware direction): header `(tag << 16) | len`.
-fn tlv(tag: u16, value: &[u8]) -> Vec<u8> {
+pub(super) fn tlv(tag: u16, value: &[u8]) -> Vec<u8> {
     let mut v = le(&[((tag as u32) << 16) | value.len() as u32]);
     v.extend_from_slice(value);
     v
 }
 
-fn cat(parts: &[Vec<u8>]) -> Vec<u8> {
+pub(super) fn cat(parts: &[Vec<u8>]) -> Vec<u8> {
     parts.iter().flat_map(|p| p.iter().copied()).collect()
 }
 
-fn event(id: u32, tlvs: &[Vec<u8>]) -> Vec<u8> {
+pub(super) fn event(id: u32, tlvs: &[Vec<u8>]) -> Vec<u8> {
     let mut v = le(&[id]);
     v.extend_from_slice(&cat(tlvs));
     v
@@ -527,7 +527,7 @@ kernel_test_in!(
 /// `struct wmi_resource_config` for WCN6855 (`ath11k_init_wmi_config_qca6390`
 /// with num_vdevs = 2 + 1, num_rf_chains = 2, REG_CC_EXT advertised),
 /// hand-filled field by field from hw.c / wmi.c.
-fn wcn6855_resource_config_words() -> Vec<u32> {
+pub(super) fn wcn6855_resource_config_words() -> Vec<u32> {
     vec![
         0x004b_0120, // tlv: RESOURCE_CONFIG, 292 - 4
         3,           // num_vdevs = hw_params.num_vdevs (2 + 1)
@@ -1609,7 +1609,7 @@ kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_wmi_encoders_reparse);
 
 // ── SERVICE_READY / AVAILABLE ───────────────────────────────────────
 
-fn service_ready_fixed(num_rf_chains: u32) -> Vec<u8> {
+pub(super) fn service_ready_fixed(num_rf_chains: u32) -> Vec<u8> {
     let mut w = vec![0u32; 32];
     w[0] = 0x0100_0042; // fw_build_vers
     w[9] = num_rf_chains; // @36
@@ -1743,7 +1743,7 @@ fn hal_reg(phy_id: u32, lo2: u32, hi2: u32, lo5: u32, hi5: u32) -> Vec<u8> {
 
 /// WCN6855-shaped SERVICE_READY_EXT: SINGLE (phy 0, 2G+5G) and DBS
 /// (phy 0 = 2G, phy 1 = 5G) modes, two phys.
-fn svc_rdy_ext_payload() -> Vec<u8> {
+pub(super) fn svc_rdy_ext_payload() -> Vec<u8> {
     cat(&[
         tlv(WMI_TAG_SERVICE_READY_EXT_EVENT, &[0; 76]),
         tlv(WMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS, &le(&[2, 0])),
@@ -2078,7 +2078,7 @@ fn rule(start: u32, end: u32, bw: u32, pwr: u32, gain: u32, flags: u32) -> Vec<u
     )
 }
 
-fn ext_rule(start: u32, end: u32, bw: u32, pwr: u32, psd: u32) -> Vec<u8> {
+pub(super) fn ext_rule(start: u32, end: u32, bw: u32, pwr: u32, psd: u32) -> Vec<u8> {
     tlv(
         WMI_TAG_REGULATORY_RULE_EXT_STRUCT,
         &le(&[start | end << 16, bw | pwr << 16, 0, psd]),
@@ -2169,7 +2169,7 @@ kernel_test_in!(
     smoke_ath11k_wmi_reg_chan_list_decode
 );
 
-fn ext_fixed(n2: u32, n5: u32, n6_ap_lpi: u32, n6_cl_lpi_def: u32) -> Vec<u32> {
+pub(super) fn ext_fixed(n2: u32, n5: u32, n6_ap_lpi: u32, n6_cl_lpi_def: u32) -> Vec<u32> {
     let mut w = vec![0u32; 78];
     w[0] = 0; // status PASS
     w[2] = 0x0000_4544; // "DE"
