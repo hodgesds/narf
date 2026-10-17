@@ -1544,3 +1544,7 @@ argument = "The frame/ edit only gates two existing Late initcalls (btrfs-disk-s
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The frame/ edit only resolves the narf.disks= policy before PCIe storage drivers bind and makes the efi-system-partition-mount and mnt-mount-ext2 Late initcalls skip block devices that narf_block::disk_policy does not allow to be auto-mounted (under narf.disks=boot-only: every disk except the one identified as the boot medium). It only narrows which existing mounts run; it adds no authority, memory access, domain transition, trap-path code or TCB member, and the default (argument absent) behaviour is unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame/ edit makes the root-mount-auto Late initcall stop, with a framed console banner naming the failure (and the btrfs write-safety gate's last refusal), instead of falling back to the initramfs or a registry walk when an explicit root= fails under narf.disks=root-ro or root-rw. It only removes a fallback mount under the two root disk policies; it adds no authority, memory access, domain transition, trap-path code or TCB member, and the behaviour under narf.disks=all/boot-only (and with the argument absent) is unchanged. Which device may be written stays decided by narf_block::disk_policy outside the TCB."

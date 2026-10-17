@@ -3513,6 +3513,28 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 "  root-mount: cmdline root= selector failed: {:?}",
                                 e
                             );
+                            // `narf.disks=root-ro|root-rw` boots exactly the
+                            // installed root or nothing: a refused designation
+                            // or a btrfs write-safety refusal must stop the
+                            // boot visibly, never degrade to another root.
+                            let policy = narf_block::disk_policy::policy();
+                            if policy.is_root_policy() {
+                                let rule = "  root-mount: ==========================================================";
+                                let _ = writeln!(console::Writer, "{rule}");
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  root-mount: narf.disks={} ROOT MOUNT FAILED: {:?}; NOT falling back",
+                                    policy.as_str(),
+                                    e
+                                );
+                                if let Some(why) = narf_drivers_fs_btrfs::rw_gate::last_refusal() {
+                                    let _ = writeln!(console::Writer, "  root-mount: {why}");
+                                }
+                                let _ = writeln!(console::Writer, "{rule}");
+                                return narf_init::InitResult::Error(
+                                    "narf.disks root policy: installed root not mounted",
+                                );
+                            }
                             // Fall through to initramfs/walk fallbacks
                             // so a typoed root= still boots into a shell
                             // rather than panicking the kernel.
