@@ -1465,6 +1465,12 @@ returns `FsError::ReadOnly`.
 
 ### 3.12 EFI System Partition bootstrap mount
 
+Under `narf.disks=boot-only` (`narf_block::disk_policy`) `try_mount_root*`,
+`try_mount_efi_system_partition` and `root_mount::automount_devices()` (the
+`/mnt` ext walk) consider only the identified boot medium; when that leaves
+nothing they return `RootMountError::BootOnly`. An explicit `root=` naming
+another disk is refused the same way.
+
 `root_mount::try_mount_efi_system_partition()` attaches one FAT filesystem at
 both NARF's `/boot` and `/mnt/boot`, which is visible as `/boot` to the installed
 CachyOS PID 1 rooted at `/mnt`. It does so only when the registered GPT

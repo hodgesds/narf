@@ -1194,7 +1194,12 @@ fn handle_syncobj(nr: u32, arg: usize, state: &VirtGpuRenderState) -> Result<u64
             // arrive with a fence already present; an overlapping wait on an
             // unbound object remains retryable rather than holding the table
             // lock across the producer.
+            // drm_syncobj_array_wait_timeout: an unsubmitted syncobj is
+            // -EINVAL unless the caller asked to wait for submission.
             if fences.iter().any(Option::is_none) {
+                if flags & WAIT_FOR_SUBMIT == 0 {
+                    return Err(FsError::InvalidData);
+                }
                 return Err(FsError::WouldBlock);
             }
             let now = narf_time::wall::monotonic_ns();
@@ -1217,7 +1222,10 @@ fn handle_syncobj(nr: u32, arg: usize, state: &VirtGpuRenderState) -> Result<u64
                     unsafe { copy_out(arg + 24, &first.to_le_bytes())? };
                     Ok(0)
                 }
-                Err(_) => Err(FsError::WouldBlock), // → EAGAIN
+                // Linux's timed-out wait is -ETIME, which RADV maps to
+                // VK_TIMEOUT (any other error is device loss). ETIME has no
+                // FsError; the raw negative return carries it.
+                Err(_) => Ok((-62i64) as u64),
             }
         }
         // HANDLE_TO_FD (0xc1) / FD_TO_HANDLE (0xc2): fence-fd export/import needs
@@ -5197,4 +5205,95 @@ fn handle_generic(
 fn c_str_bytes(buf: &[u8]) -> &[u8] {
     let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     &buf[..n]
+}
+
+/// `DRM_IOWR(0x05, struct drm_client)`: idx i32, auth i32, then pid, uid,
+/// magic and iocs as `unsigned long` — 40 bytes on LP64.
+pub const DRM_IOCTL_GET_CLIENT: u32 = 0xc028_6405;
+
+/// Linux `drm_getclient`, the "hollowed-out" form kept for old tools and for
+/// libdrm's `amdgpu_get_auth`: client 0 is the caller (its authentication,
+/// its pid, `overflowuid`, no magic, no ioctl count); any other index is
+/// EINVAL.
+pub fn get_client(
+    arg: u64,
+    context: &dyn narf_filesystem::IoctlContext,
+    authenticated: bool,
+) -> Result<u64, FsError> {
+    let mut client = [0u8; 40];
+    context
+        .read(arg, &mut client)
+        .map_err(|_| FsError::BadAddress)?;
+    if i32::from_le_bytes(client[0..4].try_into().unwrap()) != 0 {
+        return Err(FsError::InvalidData);
+    }
+    /// `overflowuid` default.
+    const OVERFLOW_UID: u64 = 65534;
+    client[4..8].copy_from_slice(&i32::from(authenticated).to_le_bytes());
+    client[8..16].copy_from_slice(&u64::from(context.process_id()).to_le_bytes());
+    client[16..24].copy_from_slice(&OVERFLOW_UID.to_le_bytes());
+    client[24..40].fill(0);
+    context
+        .write(arg, &client)
+        .map_err(|_| FsError::BadAddress)?;
+    Ok(0)
+}
+
+/// `DRM_IOCTL_VERSION` and `DRM_IOCTL_GET_CAP` for an amdgpu card that has
+/// no KMS state attached (no native display publication yet): libdrm's
+/// `amdgpu_device_initialize` dereferences `drmGetVersion`'s result, so the
+/// render node must answer even without a display owner. `None` for any
+/// other ioctl or a card with KMS state (the card's own table answers).
+pub fn without_kms(card_index: u32, cmd: u32, arg: usize) -> Option<Result<u64, FsError>> {
+    if crate::drm_registry::driver_name(card_index) != Some("amdgpu")
+        || crate::drm_registry::mode_state(card_index).is_some()
+        || (cmd >> 8) & 0xff != u32::from(b'd')
+    {
+        return None;
+    }
+    match drm_uapi::ioc_nr(cmd) {
+        0x00 => Some(amdgpu_version(card_index, arg)),
+        0x0c => Some((|| {
+            // SAFETY: `arg` is the ioctl struct pointer; 16 bytes.
+            let mut b = unsafe { copy_in(arg, 16)? };
+            let cap = u64::from_le_bytes(b[0..8].try_into().unwrap());
+            let value = crate::drm::ioctl::cap_value(cap);
+            b[8..16].copy_from_slice(&value.to_le_bytes());
+            // SAFETY: as above.
+            unsafe { copy_out(arg, &b)? };
+            Ok(0)
+        })()),
+        _ => None,
+    }
+}
+
+/// `struct drm_version` for the amdgpu driver: `amdgpu`, `20150101`,
+/// `AMD GPU`, `KMS_DRIVER_*` — 3.64.0 on a Navi 22 whose submission path is
+/// wired, the base 3.0.0 otherwise.
+fn amdgpu_version(card_index: u32, arg: usize) -> Result<u64, FsError> {
+    // SAFETY: `arg` is the ioctl struct pointer; drm_version is 64 bytes.
+    let mut b = unsafe { copy_in(arg, 64)? };
+    let navi22 = crate::drm_registry::pci_id(card_index)
+        == Some((crate::amdgpu::AMD_VENDOR, crate::amdgpu::NAVI22));
+    let (major, minor, patch) = if navi22 {
+        crate::amdgpu_info_navi22::drm_version()
+    } else {
+        (3, 0, 0)
+    };
+    b[0..4].copy_from_slice(&(major as i32).to_le_bytes());
+    b[4..8].copy_from_slice(&(minor as i32).to_le_bytes());
+    b[8..12].copy_from_slice(&(patch as i32).to_le_bytes());
+    for (i, text) in [&b"amdgpu"[..], b"20150101", b"AMD GPU"].iter().enumerate() {
+        let at = 16 + i * 16;
+        let cap = u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) as usize;
+        let ptr = u64::from_le_bytes(b[at + 8..at + 16].try_into().unwrap()) as usize;
+        if ptr != 0 && cap != 0 {
+            // SAFETY: the caller's own buffer of `cap` bytes.
+            unsafe { copy_out(ptr, &text[..text.len().min(cap)])? };
+        }
+        b[at..at + 8].copy_from_slice(&(text.len() as u64).to_le_bytes());
+    }
+    // SAFETY: as above.
+    unsafe { copy_out(arg, &b)? };
+    Ok(0)
 }

@@ -166,6 +166,10 @@ impl Firmware {
                 .map_err(|_| Error::Revoked)??,
         })
     }
+    /// The validated container, for header version words.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
     pub fn image(&self) -> Result<Image<'_>, Error> {
         self.target.parse(&self.bytes)
     }

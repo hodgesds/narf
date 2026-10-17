@@ -150,6 +150,38 @@ owned registry snapshot. The indexed form captures the registration-order index
 and device under the same registry lock so `devfs` can derive a coherent Linux
 minor number across concurrent hot-unplug.
 
+Every device entering the registry is wrapped in a
+`disk_policy::PolicyGuard`; `RegisteredBlockDevice::disk` is its physical-disk
+identity (`DiskId`, never reused), shared by a disk and the partitions the
+scanner registers through `register_partition_device(name, parent_name, dev,
+meta)` (and by `cryptroot`, registered against its container).
+
+```rust
+pub mod disk_policy {
+    pub const ARG: &str = "narf.disks";            // all | boot-only
+    pub enum DiskPolicy { All, BootOnly }
+    pub fn parse(value: Option<&str>) -> Result<DiskPolicy, &'static str>;
+    pub fn policy() -> DiskPolicy;                  // lazily from the cmdline
+    pub fn init_from_cmdline() -> DiskPolicy;       // unknown value: BootOnly
+    pub fn trust_boot_medium(device_name: &str, disk: DiskId);
+    pub fn is_boot_medium(device_name: &str) -> bool;
+    pub fn automount_allowed(device_name: &str) -> bool;
+    pub fn write_allowed(device_name: &str) -> bool;
+    pub fn refused_writes() -> u64;
+    pub struct PolicyGuard; // impl BlockDeviceSync
+}
+pub fn disk_of(name: &str) -> Option<DiskId>;
+// BlockDeviceSync::is_read_only / BlockDevice::is_read_only (default false)
+```
+
+Under `BootOnly` a guard passes reads and returns `BlockIoError::ReadOnly`
+for every write (first refusal per device logged) unless its disk was passed
+to `trust_boot_medium`, which callers do only after matching a boot-specific
+secret on the medium (the bootlog's `/NARFLOG.ID` token), using the `DiskId`
+from the same registry snapshot they read the proof from. `is_read_only`
+reports the guard's state through `SyncBlock` so filesystems mount a read-only
+device without writing. `All` (the default) is a pass-through.
+
 ### 3.6 Encrypted-device stacking
 
 `EncryptedBlockDevice` wraps an `Arc<dyn BlockDeviceSync>` and exposes the

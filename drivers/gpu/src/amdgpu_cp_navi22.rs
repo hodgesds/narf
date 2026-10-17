@@ -664,6 +664,52 @@ pub(crate) async fn ib_test<I: Io>(hw: &mut Hw<I>, queue: &mut Queue) -> Result<
     })
 }
 
+/// Lock-free reader of the kernel queues' fence writeback (gfx, compute,
+/// SDMA0, SDMA1), for client job completion without the boot owner. Each
+/// sample invalidates the HDP read cache first, as `Queue::read` does; both
+/// operations are idempotent and safe concurrently with the owner's MMIO.
+#[derive(Clone, Copy, Debug)]
+pub struct FenceReader {
+    regs: MmioRegion,
+    hdp_invalidate: u64,
+    slots: [MmioRegion; 4],
+    authority: Cap<BusDeviceCap, Write>,
+}
+impl FenceReader {
+    /// The last sequence ring `ring` (0 gfx, 1 compute, 2/3 SDMA) wrote.
+    pub fn completed(&self, ring: usize) -> Result<u32, Error> {
+        let slot = *self.slots.get(ring).ok_or(Error::Invalid)?;
+        let (regs, hdp) = (self.regs, self.hdp_invalidate);
+        self.authority
+            .invoke(Op(|| {
+                // SAFETY: the HDP invalidate register lies in the BAR5 bank
+                // Layout bounded; the slot is the queue's permanent, published
+                // writeback reservation, whose FENCE dword is in bounds.
+                unsafe {
+                    regs.write32(hdp, 1);
+                    regs.read32(hdp);
+                    barrier(Ordering::SeqCst);
+                    checked(slot.read32(FENCE))
+                }
+            }))
+            .map_err(|_| Error::Revoked)?
+    }
+}
+impl Gfx {
+    pub(crate) fn fence_map(&self) -> MmioRegion {
+        self.engine.queue.map()
+    }
+    /// A [`FenceReader`] over this owner's registers and `slots`.
+    pub(crate) fn fence_reader(&self, slots: [MmioRegion; 4]) -> FenceReader {
+        FenceReader {
+            regs: self.engine.hw.io.regs,
+            hdp_invalidate: self.engine.hw.layout.hdp + 0xd1 * 4,
+            slots,
+            authority: self.engine.hw.authority,
+        }
+    }
+}
+
 /// Evidence from every Navi22 kernel queue after the cold-boot IB tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QueueProof {
@@ -1060,6 +1106,39 @@ impl Gfx {
     }
     pub fn state(&self) -> GfxState {
         self.engine.state
+    }
+    /// Queue client IBs under a user VMID (`amdgpu_navi22_submit`); only on
+    /// a ring whose ring and IB tests passed. `Busy` means two submissions
+    /// are outstanding: wait for [`Gfx::throttle_seq`] and retry.
+    pub fn submit(
+        &mut self,
+        state: &mut crate::amdgpu_navi22_submit::RingState,
+        vm: crate::amdgpu_navi22_submit::VmRef,
+        context: u64,
+        ibs: &[crate::amdgpu_navi22_submit::Ib],
+    ) -> Result<u32, Error> {
+        if self.engine.state != GfxState::Verified {
+            return Err(Error::Busy);
+        }
+        let e = &mut self.engine;
+        crate::amdgpu_navi22_submit::submit(
+            &mut e.hw,
+            &mut e.queue,
+            state,
+            crate::amdgpu_navi22_submit::Ring::Gfx,
+            vm,
+            context,
+            ibs,
+        )
+    }
+    /// Last fence sequence the ring wrote, and the one a new submission
+    /// must wait for.
+    pub fn fences(&mut self) -> Result<(u32, u32), Error> {
+        let e = &mut self.engine;
+        Ok((
+            crate::amdgpu_navi22_submit::completed(&mut e.hw, &e.queue)?,
+            crate::amdgpu_navi22_submit::throttle_seq(&e.queue),
+        ))
     }
     pub fn proof(&self) -> GfxProof {
         self.engine.proof

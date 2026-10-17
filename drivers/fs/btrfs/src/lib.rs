@@ -74,6 +74,11 @@ fn btrfs_factory(dev: Arc<dyn BlockDeviceSync>) -> Result<Arc<dyn FsInstance>, F
 fn discover_members(source: Arc<dyn BlockDeviceSync>) -> alloc::vec::Vec<Arc<SyncBlock>> {
     let mut devices = alloc::vec![SyncBlock::new(source.clone())];
     for entry in narf_block::block_devices() {
+        // `narf.disks=boot-only`: never pull a disk other than the boot
+        // medium into a volume as a member.
+        if !narf_block::disk_policy::automount_allowed(entry.name) {
+            continue;
+        }
         if !Arc::ptr_eq(&source, &entry.dev) {
             devices.push(SyncBlock::new(entry.dev));
         }
@@ -118,6 +123,20 @@ fn btrfs_fstype_builder(source: &str, options: &str) -> Result<Arc<dyn FsInstanc
     let name = source.strip_prefix("/dev/").unwrap_or(source);
     let dev = narf_block::find_block_device(name).ok_or(FsError::NotFound)?;
     let devices = discover_members(dev);
+    // `ro` in the data string really mounts read-only: no log replay, no
+    // commit timer, no device write.
+    if options.split(',').any(|option| option == "ro") {
+        let volume = narf_scheduler::block_on(async {
+            let volume =
+                volume::BtrfsVolume::mount_devices_read_only(devices, DomainId::DRIVER_0, true)
+                    .await?;
+            if let Some(selector) = &subvol {
+                volume.switch_to_subvol(selector).await?;
+            }
+            Ok::<_, FsError>(volume)
+        })?;
+        return Ok(volume);
+    }
     let volume = narf_scheduler::block_on(volume::BtrfsVolume::mount_subvol_devices(
         devices,
         DomainId::DRIVER_0,

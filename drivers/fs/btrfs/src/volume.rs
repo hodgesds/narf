@@ -184,6 +184,11 @@ pub struct BtrfsVolume<B: BlockDevice> {
     verify_checksums: bool,
     /// Missing members make a redundant array readable but never writable.
     degraded: bool,
+    /// Mounted read-only: requested, or a member device reports
+    /// `is_read_only` (`narf.disks=boot-only`). Nothing is ever written —
+    /// no log replay (a pending log tree refuses the mount), no commit timer,
+    /// and every device write funnel returns `ReadOnly`.
+    read_only: bool,
     devices: IrqSafeSpinLock<BTreeMap<u64, Arc<VolumeDevice<B>>>>,
     state: IrqSafeSpinLock<VolState>,
     /// A stamped superblock image whose commit has completed in memory but
@@ -294,8 +299,15 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// A subvolume marked read-only in its root item remains read-only, and so
     /// does one whose transaction was aborted.
     pub(crate) fn supports_writes(&self) -> bool {
-        !self.aborted.load(core::sync::atomic::Ordering::Acquire)
+        !self.read_only
+            && !self.aborted.load(core::sync::atomic::Ordering::Acquire)
             && self.state.lock().writable_fs_tree
+    }
+
+    /// True when the volume was mounted read-only (requested, or a member
+    /// device refuses writes).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Refuse all further writes, because a transaction was lost after its
@@ -1042,6 +1054,26 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         domain: DomainId,
         verify_checksums: bool,
     ) -> Result<Arc<Self>, FsError> {
+        Self::mount_devices_with(input, domain, verify_checksums, false).await
+    }
+
+    /// [`Self::mount_devices_opts`] that never writes to any member (see
+    /// [`BtrfsVolume::is_read_only`]). A volume with a pending fsync log tree
+    /// is refused with `Unsupported` rather than mounted without its log.
+    pub async fn mount_devices_read_only(
+        input: Vec<Arc<B>>,
+        domain: DomainId,
+        verify_checksums: bool,
+    ) -> Result<Arc<Self>, FsError> {
+        Self::mount_devices_with(input, domain, verify_checksums, true).await
+    }
+
+    async fn mount_devices_with(
+        input: Vec<Arc<B>>,
+        domain: DomainId,
+        verify_checksums: bool,
+        read_only_requested: bool,
+    ) -> Result<Arc<Self>, FsError> {
         let source_device = input.first().cloned().ok_or(FsError::NotFound)?;
         let mut scanned = Vec::new();
         for (index, device) in input.into_iter().enumerate() {
@@ -1194,6 +1226,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             || min_generation != max_generation
             || inconsistent_members;
         let csum_type = superblock.csum_type;
+        let read_only =
+            read_only_requested || devices.values().any(|member| member.device.is_read_only());
 
         // Seed the chunk map so the chunk tree is reachable by logical address.
         let seed = ChunkMap::seed_from_sys_array(&superblock.sys_chunk_array)?;
@@ -1209,6 +1243,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             csum_type,
             verify_checksums,
             degraded,
+            read_only,
             devices: IrqSafeSpinLock::new(devices),
             staged_super: IrqSafeSpinLock::new(None),
             staged_count: core::sync::atomic::AtomicUsize::new(0),
@@ -1236,7 +1271,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // Complete the chunk map and locate the FS tree now that the volume can
         // read nodes.
         volume.finish_mount().await?;
-        crate::write::spawn_commit_timer(&volume);
+        if !volume.read_only {
+            crate::write::spawn_commit_timer(&volume);
+        }
         volume.register_sysfs();
         Ok(volume)
     }
@@ -1439,6 +1476,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         offset: u64,
         src: &[u8],
     ) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         let member = self.member(devid)?;
         write_exact_to(&*member.device, &member.io, member.capacity, offset, src).await
     }
@@ -1761,7 +1801,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// Superblock half of [`Self::write_node_root_admin`].
     pub(crate) async fn write_superblock_root_admin(&self, raw: &[u8]) -> Result<(), FsError> {
-        if self.degraded {
+        if self.degraded || self.read_only {
             return Err(FsError::ReadOnly);
         }
         self.write_superblock_unchecked(raw).await

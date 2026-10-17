@@ -15,12 +15,11 @@
 //! priority is recorded and reported back rather than acted on. It becomes real
 //! when there is a ring to queue against.
 //!
-//! LINUX-GAP: `QUERY_STATE` / `QUERY_STATE2` always report no hangs, no reset
-//! and no VRAM loss. That is currently true — nothing can hang a GPU that
-//! cannot be submitted to — and it is the honest answer rather than a stub,
-//! but it becomes a lie the moment a submission can time out, and it is the
-//! call to revisit then. `AMDGPU_CTX_QUERY2_FLAGS_RAS_CE` / `_RAS_UE` are never
-//! set either: there is no RAS error-counter plumbing.
+//! `QUERY_STATE` / `QUERY_STATE2` report a GPU recovery completed since the
+//! context was created (`amdgpu_navi22_recovery::recoveries`): QUERY_STATE
+//! answers `UNKNOWN_RESET` once per reset, QUERY_STATE2 sets `RESET` and
+//! `VRAMLOST` (the recovery is a mode1 reset). LINUX-GAP: no hang count, no
+//! `GUILTY` attribution, no `RESET_IN_PROGRESS`, and no RAS CE/UE counters.
 //!
 //! LINUX-GAP: `SET_STABLE_PSTATE` validates and records, but does not reach the
 //! SMU. Pinning the shader clock is what `AMDGPU_CTX_STABLE_PSTATE_PEAK` asks
@@ -50,6 +49,17 @@ pub struct Context {
     pub priority: i32,
     /// `AMDGPU_CTX_STABLE_PSTATE_*` as last set.
     pub stable_pstate: u32,
+    /// GPU recoveries completed when the context was created
+    /// (`ctx->reset_counter` / `vram_lost_counter`).
+    pub reset_epoch: u64,
+    /// Recoveries already reported by `QUERY_STATE` (`reset_counter_query`).
+    pub reset_queried: u64,
+}
+
+/// GPU recoveries completed since boot. Only Navi 22 has a recovery owner;
+/// every other device reads a counter that never moves.
+pub fn recoveries() -> u64 {
+    crate::amdgpu_navi22_recovery::recoveries()
 }
 
 /// Per-open context table (`fpriv->ctx_mgr`).
@@ -99,6 +109,8 @@ impl CtxState {
             Context {
                 priority,
                 stable_pstate: uapi::AMDGPU_CTX_STABLE_PSTATE_NONE,
+                reset_epoch: recoveries(),
+                reset_queried: recoveries(),
             },
         );
         Ok(id)
@@ -110,6 +122,20 @@ impl CtxState {
             Some(_) => Ok(()),
             None => Err(FsError::NotFound),
         }
+    }
+
+    fn query_reset(&self, id: u32) -> Result<u32, FsError> {
+        let mut g = self.contexts.lock();
+        let ctx = g
+            .as_mut()
+            .and_then(|m| m.get_mut(&id))
+            .ok_or(FsError::NotFound)?;
+        let now = recoveries();
+        if ctx.reset_queried == now {
+            return Ok(uapi::AMDGPU_CTX_NO_RESET);
+        }
+        ctx.reset_queried = now;
+        Ok(uapi::AMDGPU_CTX_UNKNOWN_RESET)
     }
 
     fn set_pstate(&self, id: u32, pstate: u32) -> Result<(), FsError> {
@@ -207,15 +233,31 @@ pub fn dispatch(cmd: u32, arg: usize, state: &CtxState, is_master: bool) -> Resu
             state.free(ctx_id)?;
             return Ok(0);
         }
-        uapi::AMDGPU_CTX_OP_QUERY_STATE | uapi::AMDGPU_CTX_OP_QUERY_STATE2 => {
+        uapi::AMDGPU_CTX_OP_QUERY_STATE => {
+            if flags != 0 {
+                return Err(FsError::InvalidData);
+            }
+            // amdgpu_ctx_query: UNKNOWN_RESET once per new reset, then NO_RESET.
+            let status = state.query_reset(ctx_id)?;
+            // `out.state { flags u64, hangs u32, reset_status u32 }`.
+            out[12..16].copy_from_slice(&status.to_le_bytes());
+        }
+        uapi::AMDGPU_CTX_OP_QUERY_STATE2 => {
             if flags != 0 {
                 return Err(FsError::InvalidData);
             }
             // The context must exist — a query naming nothing is ENOENT, not
             // a zeroed answer that reads as "healthy".
-            state.get(ctx_id).ok_or(FsError::NotFound)?;
-            // `out.state { flags u64, hangs u32, reset_status u32 }`, all zero:
-            // no reset, no hang, no VRAM loss. See the module LINUX-GAP.
+            let ctx = state.get(ctx_id).ok_or(FsError::NotFound)?;
+            // amdgpu_ctx_query2: a recovery since creation reset the GPU and,
+            // being a mode1 reset, lost VRAM. Guilt is not attributed.
+            let mut f = 0u64;
+            if ctx.reset_epoch != recoveries() {
+                f |= u64::from(
+                    uapi::AMDGPU_CTX_QUERY2_FLAGS_RESET | uapi::AMDGPU_CTX_QUERY2_FLAGS_VRAMLOST,
+                );
+            }
+            out[0..8].copy_from_slice(&f.to_le_bytes());
         }
         uapi::AMDGPU_CTX_OP_GET_STABLE_PSTATE => {
             if flags != 0 {

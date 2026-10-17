@@ -538,7 +538,28 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Mount an ext2 volume. Reads the superblock at byte offset
     /// 1024 (in 512-byte sectors that's LBA 2), validates the
     /// `0xEF53` magic, then loads the block group descriptor table.
+    ///
+    /// A device that reports [`BlockDevice::is_read_only`] is mounted as by
+    /// [`Self::mount_read_only`].
     pub async fn mount(device: Arc<B>, domain: DomainId) -> Result<Arc<Self>, FsError> {
+        Self::mount_with(device, domain, false).await
+    }
+
+    /// Mount without writing a single byte to `device`, ever: the stale
+    /// `RECOVER`/`ORPHAN_PRESENT` superblock repair a writable mount performs
+    /// is skipped, a dirty journal is replayed into memory only (the
+    /// existing read-side override map), and every later write is refused
+    /// with [`FsError::ReadOnly`].
+    pub async fn mount_read_only(device: Arc<B>, domain: DomainId) -> Result<Arc<Self>, FsError> {
+        Self::mount_with(device, domain, true).await
+    }
+
+    async fn mount_with(
+        device: Arc<B>,
+        domain: DomainId,
+        read_only_requested: bool,
+    ) -> Result<Arc<Self>, FsError> {
+        let read_only_requested = read_only_requested || device.is_read_only();
         let lbs = device.logical_block_size() as usize;
         if lbs == 0 || 1024 % lbs != 0 && lbs % 1024 != 0 {
             // The driver assumes the device's logical block size is
@@ -661,7 +682,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 } else {
                     true
                 };
-                if journal_clean && orphan_clean {
+                if journal_clean && orphan_clean && !read_only_requested {
                     superblock.feature_incompat &= !super::superblock::incompat::RECOVER;
                     superblock.feature_ro_compat &= !super::superblock::ro_compat::ORPHAN_PRESENT;
                     sb_bytes[96..100].copy_from_slice(&superblock.feature_incompat.to_le_bytes());
@@ -673,7 +694,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
         }
 
-        let read_only = !superblock.write_features_supported();
+        let read_only = read_only_requested || !superblock.write_features_supported();
 
         let page_cache = Arc::new(PageCache::new());
         let volume = Arc::new_cyclic(|self_weak| Ext2Volume {

@@ -27,9 +27,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::registry::{
-    register_block_device, register_block_device_with_meta, BlockDeviceSync, PartitionMetadata,
-};
+use crate::registry::{register_partition_device, BlockDeviceSync, PartitionMetadata};
 use crate::BlockIoError;
 
 /// Best-effort volume UUID discovery used for `/dev/disk/by-uuid`.
@@ -424,6 +422,9 @@ impl BlockDeviceSync for PartitionBlockDevice {
         let abs = self.start_lba + lba;
         self.parent.write(abs, n_blocks, data)
     }
+    fn is_read_only(&self) -> bool {
+        self.parent.is_read_only()
+    }
 }
 
 /// Errors during partition scanning.
@@ -511,7 +512,7 @@ pub fn scan_and_register_partitions(
                 partuuid: format_guid(&p.partition_guid),
                 fs_uuid: discover_volume_uuid(sub.as_ref()).unwrap_or_default(),
             };
-            register_block_device_with_meta(static_name, sub, Some(meta));
+            register_partition_device(static_name, parent_name, sub, Some(meta));
             registered.push(name);
         }
         Ok(ScanReport {
@@ -531,7 +532,7 @@ pub fn scan_and_register_partitions(
                 p.start_lba as u64,
                 p.sector_count as u64,
             )) as Arc<dyn BlockDeviceSync>;
-            register_block_device(static_name, sub);
+            register_partition_device(static_name, parent_name, sub, None);
             registered.push(name);
         }
         Ok(ScanReport {
