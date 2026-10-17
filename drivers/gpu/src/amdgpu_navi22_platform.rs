@@ -173,8 +173,15 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
             }
         }
         .map_err(Error::Firmware)?;
+        // Linux resets every posted discrete Navi before loading firmware.
+        // SAFETY: probe's PCI function for this GPU; its config space is
+        // claimed along with the exclusive MMIO ownership transferred below.
+        unsafe { prepared.prepare_reset(device) }.map_err(Error::Firmware)?;
         prepared.prepare_memory_hubs().map_err(Error::Firmware)?;
         prepared.prepare_sdma().map_err(Error::Firmware)?;
+        prepared
+            .prepare_interrupts(device)
+            .map_err(Error::Firmware)?;
         prepared.prepare_dmub().map_err(Error::Firmware)?;
         // Kernel queues are optional for the firmware/display path: without
         // a usable BAR2 doorbell page the queue stages are skipped, visibly.
@@ -207,6 +214,11 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
 pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     let mut owner = OWNER.lock().await;
     owner.as_mut().ok_or(boot::Error::Invalid)?.run().await
+}
+
+/// IH dispatch endpoint of the retained owner (see amdgpu_ih_navi22).
+pub async fn interrupts() -> Option<crate::amdgpu_ih_navi22::Handle> {
+    OWNER.lock().await.as_ref()?.interrupts()
 }
 
 /// Serialized native HPD query. Requires the completed, retained cold boot.

@@ -20,6 +20,7 @@ const RESET_SDMA0: u32 = 1 << 23;
 const RB_CNTL: u32 = 0x80;
 const RB_RPTR: u32 = 0x83;
 const RB_WPTR: u32 = 0x85;
+const TRAP_END: u32 = 192; // first submission plus one 16-dword TRAP block
 const PATTERN: [u32; 16] = [
     0x01234567, 0x89abcdef, 0x76543210, 0xfedcba98, 0xaaaaaaaa, 0x55555555, 0xff00ff00, 0x00ff00ff,
     0x00000001, 0x80000000, 0x01010101, 0x10101010, 0x67506750, 0x00220022, 0xdeadbeef, 0xcafebabe,
@@ -195,6 +196,7 @@ struct Engine<I: Io> {
     memory: Reservation,
     state: State,
     proof: Option<Proof>,
+    trapped: bool,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -359,6 +361,55 @@ impl<I: Io> Engine<I> {
         }
     }
 }
+impl<I: Io> Engine<I> {
+    /// sdma_v5_2_ring_emit_fence's FLAG_INT tail: SDMA_OP_TRAP with an
+    /// INT_CONTEXT, after setting SDMA0_CNTL.TRAP_ENABLE
+    /// (sdma_v5_2_set_trap_irq_state). Single use, never replayed.
+    async fn trap(&mut self, context: u32) -> Result<(), Error> {
+        if self.state != State::Verified || self.trapped {
+            return Err(Error::Busy);
+        }
+        self.trapped = true;
+        let result = self.trap_inner(context).await;
+        if result.is_err() {
+            self.state = State::Failed;
+        }
+        result
+    }
+    async fn trap_inner(&mut self, context: u32) -> Result<(), Error> {
+        let l = self.layout;
+        let map = self.memory.mapping();
+        self.access(|io| {
+            io.write_memory(map, 128, 6);
+            io.write_memory(map, 132, context & 0x0fff_ffff);
+            for offset in (136..u64::from(TRAP_END)).step_by(4) {
+                io.write_memory(map, offset, 0); // NOP padding
+            }
+            update(io, l.gc, 0x1c, 1, 1)?;
+            io.write_memory(map, WPTR, TRAP_END);
+            flush(io, l);
+            io.write(l.gc + u64::from(RB_WPTR) * 4, TRAP_END);
+            io.write(l.gc + u64::from(RB_WPTR + 1) * 4, 0);
+            Ok(())
+        })?;
+        let deadline = narf_time::Deadline::after_ms(100);
+        loop {
+            let done = self.access(|io| {
+                invalidate(io, l);
+                let lo = checked(io.read(l.gc + u64::from(RB_RPTR) * 4))?;
+                checked(io.read(l.gc + u64::from(RB_RPTR + 1) * 4))?;
+                Ok(lo == TRAP_END && io.read_memory(map, RPTR) == TRAP_END)
+            })?;
+            if done {
+                return Ok(());
+            }
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            delay(1000).await;
+        }
+    }
+}
 #[derive(Debug)]
 pub struct Sdma {
     engine: Engine<Mmio>,
@@ -381,6 +432,7 @@ impl Sdma {
                 memory: pool.reserve(BYTES).map_err(|_| Error::Allocation)?,
                 state: State::Prepared,
                 proof: None,
+                trapped: false,
             },
         })
     }
@@ -399,6 +451,11 @@ impl Sdma {
     }
     pub fn proof(&self) -> Option<Proof> {
         self.engine.proof
+    }
+    /// Raise one SDMA0 TRAP interrupt after a verified start. Needs no new
+    /// safety contract: it only appends to this owner's verified ring.
+    pub(crate) async fn trap(&mut self, context: u32) -> Result<(), Error> {
+        self.engine.trap(context).await
     }
 }
 #[cfg(feature = "kernel-test")]

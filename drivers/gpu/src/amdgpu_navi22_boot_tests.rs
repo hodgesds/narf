@@ -9,6 +9,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn report() -> Report {
     Report {
+        reset: None,
         smu: smu::Versions {
             firmware: 0x413f00,
             interface: 0xe,
@@ -24,6 +25,7 @@ fn report() -> Report {
         sdma: None,
         dmub: None,
         queues: None,
+        interrupts: None,
     }
 }
 struct Fake {

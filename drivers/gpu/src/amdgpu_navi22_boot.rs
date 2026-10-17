@@ -1,6 +1,8 @@
 //! Ordered cold-boot firmware bring-up for Navi22. The caller supplies an
-//! exclusive pool and trained VRAM or an explicit training inventory. No implicit reset, pool carving, platform
-//! initcall, modeset or acceleration publication happens here.
+//! exclusive pool and trained VRAM or an explicit training inventory. The
+//! only reset is the explicitly prepared reset-on-init of a posted card (Linux
+//! `nv_need_reset_on_init`). No pool carving, platform initcall, modeset or
+//! acceleration publication happens here.
 use crate::{
     amdgpu::AmdGpu, amdgpu_gddr6 as gddr6, amdgpu_gfx_navi22 as gfx, amdgpu_power_navi22 as power,
     amdgpu_psp_boot as sos, amdgpu_psp_ring as psp, amdgpu_smu_navi22 as smu, amdgpu_vram::Pool,
@@ -23,6 +25,8 @@ pub enum Error {
     Sdma(crate::amdgpu_sdma_navi22::Error),
     Dmub(crate::amdgpu_dmub_navi22::Error),
     Queues(crate::amdgpu_cp_navi22::Error),
+    Reset(crate::amdgpu_reset_navi22::Error),
+    Interrupts(crate::amdgpu_ih_navi22::Error),
 }
 /// All files are validated and copied before the first device operation.
 #[derive(Debug)]
@@ -78,6 +82,7 @@ impl Firmware {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
+    ResetOnInit,
     MemoryTraining,
     Sos,
     Ring,
@@ -90,7 +95,9 @@ pub enum Stage {
     RlcBoot,
     PowerSetup,
     MemoryHubs,
+    Interrupts,
     SdmaTest,
+    InterruptTest,
     DmubStart,
     Doorbells,
     GfxSetup,
@@ -100,7 +107,8 @@ pub enum Stage {
     SdmaQueues,
     IbTests,
 }
-const STAGES: [Stage; 21] = [
+const STAGES: [Stage; 24] = [
+    Stage::ResetOnInit,
     Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
@@ -113,7 +121,11 @@ const STAGES: [Stage; 21] = [
     Stage::RlcBoot,
     Stage::PowerSetup,
     Stage::MemoryHubs,
+    // Linux enables IH (hw_init phase 1) after COMMON/GMC and before every
+    // phase-2 engine. Its VRAM ring needs VMID0, so IH follows MemoryHubs.
+    Stage::Interrupts,
     Stage::SdmaTest,
+    Stage::InterruptTest,
     Stage::DmubStart,
     // gfx_v10_0_hw_init / cp_resume, sdma_v5_2_start, amdgpu_ib_ring_tests.
     Stage::Doorbells,
@@ -124,10 +136,14 @@ const STAGES: [Stage; 21] = [
     Stage::SdmaQueues,
     Stage::IbTests,
 ];
+/// INT_CONTEXT of the boot SDMA0 TRAP round trip.
+const TRAP_CONTEXT: u32 = 0x0675_0022;
 /// Firmware/power observations, optional VMID0 and SDMA execution proof.
 /// This does not publish acceleration or initialize native display.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Report {
+    /// Present when SOS was running and the ASIC was reset before bring-up.
+    pub reset: Option<crate::amdgpu_reset_navi22::Report>,
     pub smu: smu::Versions,
     pub gfx: psp::GfxBootStatus,
     pub power: Option<power::Info>,
@@ -138,8 +154,13 @@ pub struct Report {
     pub dmub: Option<crate::amdgpu_dmub_navi22::Status>,
     /// Kernel GFX/compute/SDMA ring and IB tests passed.
     pub queues: Option<crate::amdgpu_cp_navi22::QueueProof>,
+    pub interrupts: Option<crate::amdgpu_ih_navi22::Status>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boot state snapshots remain Copy and allocation-free"
+)]
 pub enum State {
     Prepared,
     Running(Stage),
@@ -198,6 +219,8 @@ struct Hardware {
     authority: Cap<BusDeviceCap, Write>,
     pool: Pool,
     firmware: Firmware,
+    reset: Option<crate::amdgpu_reset_navi22::Reset>,
+    reset_report: Option<crate::amdgpu_reset_navi22::Report>,
     training: Option<gddr6::Trainer>,
     bootstrap: Option<sos::Bootloader>,
     psp: Option<psp::Psp>,
@@ -209,6 +232,7 @@ struct Hardware {
     sdma: Option<crate::amdgpu_sdma_navi22::Sdma>,
     dmub: Option<crate::amdgpu_dmub_navi22::Dmub>,
     queues: Option<Queues>,
+    ih: Option<crate::amdgpu_ih_navi22::Ih>,
 }
 /// Kernel queue owners, retained through success, failure and cancellation.
 #[derive(Debug)]
@@ -262,6 +286,39 @@ impl Queues {
             })
     }
 }
+/// Device loss and revoked authority stop the boot; any other failure of the
+/// diagnostic round trip leaves IH enabled with watchdog/polling delivery.
+fn fatal(error: Error) -> bool {
+    use crate::{amdgpu_ih_navi22 as ih, amdgpu_sdma_navi22 as sdma};
+    matches!(
+        error,
+        Error::Sdma(sdma::Error::DeviceGone | sdma::Error::Revoked)
+            | Error::Interrupts(
+                ih::Error::DeviceGone
+                    | ih::Error::Revoked
+                    | ih::Error::Closed(ih::Closed::DeviceLost | ih::Closed::AuthorityRevoked)
+            )
+    )
+}
+async fn trap_round_trip(
+    ih: &mut crate::amdgpu_ih_navi22::Ih,
+    sdma: &mut crate::amdgpu_sdma_navi22::Sdma,
+) -> Result<(), Error> {
+    use crate::amdgpu_ih_navi22 as ih_mod;
+    let mut waiter = ih
+        .handle()
+        .subscribe(ih_mod::source::SDMA0_TRAP)
+        .map_err(Error::Interrupts)?;
+    let interrupts = ih.interrupts();
+    if let Err(error) = sdma.trap(TRAP_CONTEXT).await {
+        ih.record_proof(ih_mod::Error::Source);
+        return Err(Error::Sdma(error));
+    }
+    ih.prove(&mut waiter, TRAP_CONTEXT, interrupts)
+        .await
+        .map_err(Error::Interrupts)?;
+    Ok(())
+}
 impl Backend for Hardware {
     fn progress(&mut self, stage: Stage, result: Option<Result<(), Error>>) {
         use core::fmt::Write;
@@ -278,6 +335,11 @@ impl Backend for Hardware {
     }
     async fn step(&mut self, stage: Stage) -> Result<(), Error> {
         match stage {
+            Stage::ResetOnInit => {
+                if let Some(reset) = self.reset.as_mut() {
+                    self.reset_report = reset.run().await.map_err(Error::Reset)?;
+                }
+            }
             Stage::MemoryTraining => {
                 if let Some(training) = self.training.as_mut() {
                     training.run().await.map_err(Error::Training)?;
@@ -431,6 +493,27 @@ impl Backend for Hardware {
                         .map_err(Error::Queues)?;
                 }
             }
+            Stage::Interrupts => {
+                if let Some(ih) = self.ih.as_mut() {
+                    // SAFETY: VMID0 is ready, no engine raises interrupts yet,
+                    // and this owner holds the PCI function exclusively.
+                    unsafe { ih.initialize().await }.map_err(Error::Interrupts)?;
+                }
+            }
+            Stage::InterruptTest => {
+                if let (Some(ih), Some(sdma)) = (self.ih.as_mut(), self.sdma.as_mut()) {
+                    if let Err(error) = trap_round_trip(ih, sdma).await {
+                        if fatal(error) {
+                            return Err(error);
+                        }
+                        use core::fmt::Write;
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "amdgpu: navi22 InterruptTest: degraded {error:?}"
+                        );
+                    }
+                }
+            }
             Stage::MemoryHubs => {
                 if let Some(gmc) = self.gmc.as_mut() {
                     // SAFETY: firmware/RLC are ready, VRAM is trained, queues
@@ -443,6 +526,7 @@ impl Backend for Hardware {
     }
     fn report(&self) -> Result<Report, Error> {
         Ok(Report {
+            reset: self.reset_report,
             smu: self.versions.ok_or(Error::Invalid)?,
             gfx: self.gfx_status.ok_or(Error::Invalid)?,
             power: self.firmware.power.as_ref().map(power::Prepared::info),
@@ -461,6 +545,7 @@ impl Backend for Hardware {
                 .as_ref()
                 .and_then(crate::amdgpu_gmc_navi22::Gmc::aperture),
             queues: self.queues.as_ref().and_then(Queues::proof),
+            interrupts: self.ih.as_ref().map(crate::amdgpu_ih_navi22::Ih::status),
         })
     }
 }
@@ -520,6 +605,8 @@ impl ColdBoot {
                     authority,
                     pool: pool.clone(),
                     firmware,
+                    reset: None,
+                    reset_report: None,
                     training: None,
                     bootstrap: Some(bootstrap),
                     psp: None,
@@ -531,6 +618,7 @@ impl ColdBoot {
                     sdma: None,
                     dmub: None,
                     queues: None,
+                    ih: None,
                 },
                 state: State::Prepared,
             },
@@ -564,6 +652,8 @@ impl ColdBoot {
                     authority,
                     pool: pool.clone(),
                     firmware,
+                    reset: None,
+                    reset_report: None,
                     training: Some(training),
                     bootstrap: None,
                     psp: None,
@@ -575,6 +665,7 @@ impl ColdBoot {
                     sdma: None,
                     dmub: None,
                     queues: None,
+                    ih: None,
                 },
                 state: State::Prepared,
             },
@@ -586,6 +677,27 @@ impl ColdBoot {
             .training
             .as_ref()
             .map(gddr6::Trainer::state)
+    }
+    /// Reset a posted card before any firmware stage, as Linux does whenever
+    /// the VBIOS left SOS running. Production boot calls this; without it the
+    /// sequence loads firmware over the inherited SOS/PMFW (test callers).
+    /// Performs no I/O; `run` decides from the live SOS sign of life.
+    ///
+    /// # Safety
+    /// `new`'s ownership contract, plus `Reset::new`'s: `device` is this GPU's
+    /// PCI function and its config space has no other user. The reset discards
+    /// every inherited scanout, so a boot framebuffer on this card goes dark.
+    pub unsafe fn prepare_reset(&mut self, device: narf_bus::BusDevice) -> Result<(), Error> {
+        if self.sequence.state != State::Prepared || self.sequence.backend.reset.is_some() {
+            return Err(Error::Busy);
+        }
+        let h = &mut self.sequence.backend;
+        // SAFETY: forwarded exclusive GPU/config-space ownership; no I/O here.
+        h.reset = Some(
+            unsafe { crate::amdgpu_reset_navi22::Reset::new(&h.gpu, h.authority, device) }
+                .map_err(Error::Reset)?,
+        );
+        Ok(())
     }
     /// Reserve the native VMID0 backing pages before run. Production boot calls
     /// this; explicit firmware-only callers can leave memory hubs untouched.
@@ -667,6 +779,32 @@ impl ColdBoot {
         };
         h.queues = Some(queues);
         Ok(())
+    }
+    /// Reserve the IH ring/writeback and NBIO dummy page before run, after
+    /// memory hubs have been prepared. Host vector routing waits for run.
+    pub fn prepare_interrupts(&mut self, device: narf_bus::BusDevice) -> Result<(), Error> {
+        if self.sequence.state != State::Prepared || self.sequence.backend.ih.is_some() {
+            return Err(Error::Busy);
+        }
+        let h = &mut self.sequence.backend;
+        if h.gmc.is_none() {
+            return Err(Error::Invalid);
+        }
+        // SAFETY: forwarded whole-GPU/pool/PCI ownership; no I/O here.
+        h.ih = Some(
+            unsafe { crate::amdgpu_ih_navi22::Ih::new(&h.gpu, h.authority, &h.pool, device) }
+                .map_err(Error::Interrupts)?,
+        );
+        Ok(())
+    }
+    /// IH dispatch endpoint, valid from preparation onward; waiters receive
+    /// a terminal error if the ring never starts or the device is lost.
+    pub fn interrupts(&self) -> Option<crate::amdgpu_ih_navi22::Handle> {
+        self.sequence
+            .backend
+            .ih
+            .as_ref()
+            .map(crate::amdgpu_ih_navi22::Ih::handle)
     }
     /// Reserve DCN3.0 DMUB backing. Firmware preparation and memory hubs must
     /// precede this call; quiesce/start remain part of the ordered run.
