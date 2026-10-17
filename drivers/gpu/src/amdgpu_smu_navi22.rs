@@ -31,6 +31,26 @@ const MAX_DPM_FREQ: u32 = 0x1e;
 const TRANSFER_TO_DRIVER: u32 = 0x12;
 const GET_PPT_LIMIT: u32 = 0x33;
 const REENABLE_ACDC_INTERRUPT: u32 = 0x34;
+// smu_v11_0_7_ppsmc.h runtime feature and GFXOFF messages.
+const ENABLE_FEATURES_LOW: u32 = 0x8;
+const ENABLE_FEATURES_HIGH: u32 = 0x9;
+const DISABLE_FEATURES_LOW: u32 = 0xa;
+const DISABLE_FEATURES_HIGH: u32 = 0xb;
+const ALLOW_GFXOFF: u32 = 0x28;
+const DISALLOW_GFXOFF: u32 = 0x29;
+/// The only feature bits the opt-in power-saving path may switch at runtime
+/// (amdgpu_navi22_power_policy): UCLK/FCLK DPM with memory rail scaling,
+/// DS_* and GFX ULV, GFXOFF and MMHUB/ATHUB PG. Never a protection bit.
+pub(crate) const GATING_FEATURES: u64 = {
+    use crate::amdgpu_navi22_power_policy as p;
+    p::SMU_DPM_UCLK
+        | p::SMU_DPM_FCLK
+        | p::SMU_MEM_VDDCI_SCALING
+        | p::SMU_MEM_MVDD_SCALING
+        | p::SMU_DEEP_SLEEP
+        | p::SMU_GFXOFF
+        | p::SMU_HUB_PG
+};
 pub const DRIVER_INTERFACE: u32 = 0x0e;
 /// smu_v11_0.h: `MP1_Public | (smnMP1_FIRMWARE_FLAGS & 0xffffffff)`, read
 /// through the NBIO PCIe index/data pair (nbio_v2_3 PCIE_INDEX2/PCIE_DATA2,
@@ -414,6 +434,8 @@ struct Engine<I: Io> {
     limits: Option<Limits>,
     /// PROTECTION features running when boot power configuration completed.
     protection: Option<u64>,
+    /// Opt-in gating bits added to the allowed mask at runtime.
+    gating_allowed: u64,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> T) -> Result<T, Error> {
@@ -724,6 +746,69 @@ impl<I: Io> Engine<I> {
         self.end_runtime(resume, &result);
         result
     }
+    /// `smu_cmn_feature_update_enable_state`: Enable/DisableSmuFeatures
+    /// Low then High with `mask`. Linux allowed these bits at boot; NARF's
+    /// boot policy did not, so an enable first re-sends the allowed mask with
+    /// them added (as the display transition does). The running set is read
+    /// back: the change must have taken effect and every boot protection
+    /// feature must still run.
+    async fn update_features(&mut self, mask: u64, enable: bool) -> Result<u64, Error> {
+        if mask == 0 || mask & !GATING_FEATURES != 0 {
+            return Err(Error::Invalid);
+        }
+        let policy = self.power_policy.ok_or(Error::Invalid)?;
+        let resume = self.begin_runtime()?;
+        let result = async {
+            let base = if resume == State::DisplayPowerReady {
+                policy.display_allowed().map_err(|_| Error::Unsupported)?
+            } else {
+                policy.allowed()
+            };
+            let allowed = base | self.gating_allowed | mask;
+            if enable {
+                self.command(ALLOWED_HIGH, (allowed >> 32) as u32).await?;
+                self.command(ALLOWED_LOW, allowed as u32).await?;
+                self.command(ENABLE_FEATURES_LOW, mask as u32).await?;
+                self.command(ENABLE_FEATURES_HIGH, (mask >> 32) as u32)
+                    .await?;
+            } else {
+                self.command(DISABLE_FEATURES_LOW, mask as u32).await?;
+                self.command(DISABLE_FEATURES_HIGH, (mask >> 32) as u32)
+                    .await?;
+            }
+            let running = self.running().await?;
+            let changed = if enable {
+                running & mask == mask
+            } else {
+                running & mask == 0
+            };
+            if !changed || !self.protected(running) {
+                return Err(Error::Features {
+                    allowed,
+                    enabled: running,
+                });
+            }
+            if enable {
+                self.gating_allowed |= mask;
+            }
+            Ok(running)
+        }
+        .await;
+        self.end_runtime(resume, &result);
+        result
+    }
+    /// `smu_v11_0_gfx_off_control`: AllowGfxOff / DisallowGfxOff, only once
+    /// the opt-in enabled FEATURE_GFXOFF through `update_features`.
+    async fn gfx_off_control(&mut self, allow: bool) -> Result<(), Error> {
+        if self.gating_allowed & crate::amdgpu_navi22_power_policy::SMU_GFXOFF == 0 {
+            return Err(Error::Invalid);
+        }
+        let resume = self.begin_runtime()?;
+        let message = if allow { ALLOW_GFXOFF } else { DISALLOW_GFXOFF };
+        let result = self.command(message, 0).await.map(|_| ());
+        self.end_runtime(resume, &result);
+        result
+    }
     async fn enable_display_power(&mut self) -> Result<(), Error> {
         if self.state == State::DisplayPowerReady {
             return self.access(|_| ());
@@ -877,6 +962,7 @@ impl Smu {
                 versions: None,
                 limits: None,
                 protection: None,
+                gating_allowed: 0,
             },
         })
     }
@@ -951,6 +1037,28 @@ impl Smu {
     /// Re-arm AC/DC notification after an AC/DC SMU-to-driver interrupt.
     pub async fn reenable_acdc_interrupt(&mut self) -> Result<(), Error> {
         self.engine.reenable_acdc().await
+    }
+    /// Switch opt-in power-saving feature bits (`GATING_FEATURES` only),
+    /// returning the running set. Rejection leaves the owner reusable.
+    ///
+    /// # Safety
+    /// `amdgpu_navi22_power_policy` admitted every feature these bits belong
+    /// to (display admission and driver readiness) under the explicit opt-in,
+    /// and the DCN owner holds whatever floors that admission assumed.
+    pub(crate) async unsafe fn update_gating_features(
+        &mut self,
+        mask: u64,
+        enable: bool,
+    ) -> Result<u64, Error> {
+        self.engine.update_features(mask, enable).await
+    }
+    /// AllowGfxOff/DisallowGfxOff for `amdgpu_navi22_gfxoff`.
+    pub(crate) async fn gfx_off_control(&mut self, allow: bool) -> Result<(), Error> {
+        self.engine.gfx_off_control(allow).await
+    }
+    /// Opt-in bits enabled at runtime through `update_gating_features`.
+    pub fn gating_features(&self) -> u64 {
+        self.engine.gating_allowed
     }
     /// The SMU-to-driver acknowledge register handle.
     pub fn interrupt_ack(&self) -> InterruptAck {
