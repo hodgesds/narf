@@ -814,3 +814,37 @@ kernel_test_in!(
     "drivers/gpu/dcn-inventory",
     inventory_reads_the_connector_speed_record
 );
+
+fn inventory_reads_discrete_vram_channels_from_vram_info_v25() -> TestResult {
+    const VRAM: usize = 0x870;
+    let mut image = Image::new();
+    image.point(TABLE_VRAM_INFO, VRAM);
+    let size = 64u16;
+    image.0[VRAM..VRAM + 2].copy_from_slice(&size.to_le_bytes());
+    image.0[VRAM + 2] = 2;
+    image.0[VRAM + 3] = 5;
+    image.0[VRAM + VRAM_MODULE_NUM_OFFSET] = 1;
+    // Navi22: twelve channels of CHANNEL_16BIT (log2 16 = 4).
+    image.0[VRAM + VRAM_MODULE0_OFFSET + VRAM_CHANNEL_NUM] = 12;
+    image.0[VRAM + VRAM_MODULE0_OFFSET + VRAM_CHANNEL_WIDTH] = 4;
+    if vram_channels(image.bytes()) != Ok((12, 2)) {
+        return TestResult::Fail("vram_info v2.5 channels");
+    }
+    image.0[VRAM + VRAM_MODULE0_OFFSET + VRAM_CHANNEL_WIDTH] = 9;
+    if vram_channels(image.bytes()) != Err(Error::Invalid) {
+        return TestResult::Fail("absurd channel width");
+    }
+    image.0[VRAM + 3] = 6;
+    if vram_channels(image.bytes()) != Err(Error::Unsupported) {
+        return TestResult::Fail("other vram_info revision read");
+    }
+    image.unpoint(TABLE_VRAM_INFO);
+    if vram_channels(image.bytes()) != Err(Error::Missing) {
+        return TestResult::Fail("absent vram_info");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-inventory",
+    inventory_reads_discrete_vram_channels_from_vram_info_v25
+);

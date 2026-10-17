@@ -166,6 +166,9 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
             .prepare_power(gpu, identity)
             .map_err(Error::Firmware)?;
         firmware.prepare_dmub(gpu).map_err(Error::Firmware)?;
+        // Display routing is diagnostic for firmware bring-up: a board whose
+        // connector table cannot be read still runs the firmware sequence.
+        let display = firmware.prepare_display(gpu);
         let end = gpu
             .vram
             .base
@@ -211,6 +214,13 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
             .prepare_interrupts(device)
             .map_err(Error::Firmware)?;
         prepared.prepare_dmub().map_err(Error::Firmware)?;
+        if let Err(error) = display.and_then(|()| prepared.prepare_display()) {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 display routes: {error:?}"
+            );
+        }
         // Kernel queues are optional for the firmware/display path: without
         // a usable BAR2 doorbell page the queue stages are skipped, visibly.
         // SAFETY: boot-time exclusive PCI ownership; BAR2 is otherwise unused.
@@ -479,7 +489,49 @@ pub async fn interrupts() -> Option<crate::amdgpu_ih_navi22::Handle> {
     OWNER.lock().await.as_ref()?.interrupts()
 }
 
-/// Serialized native HPD query. Requires the completed, retained cold boot.
+/// Detect every board connector over the native DCN3.0 AUX/DDC/HPD path.
+/// Requires the completed, retained cold boot; reads sinks only.
+pub async fn detect_displays(
+) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_display::Report>, boot::Error> {
+    let mut owner = OWNER.lock().await;
+    owner
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .detect_displays()
+        .await
+}
+
+/// The retained native modeset's state, for diagnostics.
+pub fn modeset_state() -> Option<crate::amdgpu_navi22_modeset::State> {
+    OWNER.try_lock()?.as_ref()?.modeset_state()
+}
+
+/// Best effort: a busy owner skips the flush and buffered writes drain later.
+fn flush_scanout() {
+    if let Some(mut owner) = OWNER.try_lock() {
+        if let Some(boot) = owner.as_mut() {
+            let _ = boot.flush_display_scanout();
+        }
+    }
+}
+
+/// Opt-in native HDMI scanout (`amdgpu.native_display`): light the first
+/// connected HDMI sink with a test pattern and publish it as the external
+/// scanout, which moves the console there. The pipeline is retained.
+///
+/// # Safety
+/// Boot-time, after a successful `run`; no other display client, and no CPU
+/// writer of the new scanout except through the published framebuffer.
+pub async unsafe fn modeset_hdmi() -> Result<crate::amdgpu_navi22_modeset::Output, boot::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
+    // SAFETY: forwarded unchanged; serialized by the owner mutex.
+    let output = unsafe { boot.modeset_hdmi().await }?;
+    crate::amdgpu_dcn_display::publish_external(Some(output.scanout), Some(flush_scanout));
+    Ok(output)
+}
+
+/// Serialized DMUB HPD query, refused unless DMUB AUX was explicitly allowed.
 pub async fn dmub_hpd(instance: u8) -> Result<bool, boot::Error> {
     let mut owner = OWNER.lock().await;
     owner
@@ -488,7 +540,8 @@ pub async fn dmub_hpd(instance: u8) -> Result<bool, boot::Error> {
         .dmub_hpd(instance)
         .await
 }
-/// Serialized native AUX/I2C-over-AUX transaction, at most 16 bytes.
+/// Serialized DMUB AUX/I2C-over-AUX transaction, at most 16 bytes. Refused
+/// unless DMUB AUX was explicitly allowed; native AUX is the default.
 pub async fn dmub_aux(
     instance: u8,
     action: u8,

@@ -966,6 +966,20 @@ static, power-gating-disabled path with PSP-loaded TMR images, VCPU reset
 retries, decode/encode ring and IB tests, IH-routed fences) plus JPEG 3.0 with
 a ring test; PSP loads one VCN image per unharvested instance (type 13/58)
 from the discovery harvest table, and media failures leave the boot degraded.
+Navi22 display AUX/DDC/HPD is now native, as Linux drives DCN3.0
+(`dc_is_dmub_outbox_supported` is false there): the DCE AUX engine with
+`dce_aux_transfer_with_retries` policy, I2C-over-AUX, the hardware I2C engine
+for HDMI DDC/SCDC, and HPD sense/filter/ack. After firmware readiness the boot
+logs every board connector's HPD state and EDID. DMUB AUX/HPD is refused unless
+explicitly allowed. Register models only; no physical EDID read yet.
+A native DCN3.0 DML port (`amdgpu_dml30`) admits one unscaled linear plane
+and derives DLG/TTU/RQ and HUBBUB watermark values, checked against host
+vectors computed from the Linux DML30 formulas.
+An opt-in (`amdgpu.native_display`) native HDMI TMDS path lights the first
+connected HDMI sink on pipe 0 with a test pattern: DCN init, HUBBUB/DML30
+deadlines, the DAL clocks and the VBIOS PixelClock/STREAM_SETUP/transmitter
+tables (now executed by an `atom.c`-faithful interpreter), then fetch and
+unblank. Model-tested per block; never run on hardware.
 These are software-tested foundations; training resume,
 media submission/DPG, display-aware DPM, user command submission,
 hardware boot and DCN3.0 modesetting remain open. See the

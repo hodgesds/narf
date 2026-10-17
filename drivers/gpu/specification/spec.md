@@ -3732,7 +3732,146 @@ separate work.
 
 `ColdBoot::dmub_hpd`, `dmub_aux` and `dmub_notification` expose the typed runtime
 operations only after `FirmwareReady` and while PSP/TMR remains retained.
-They refuse access after `take_psp()`. `dmub_mailbox_state()` also reports failed
+They refuse access after `take_psp()`. `dmub_hpd`/`dmub_aux` additionally
+return `Dmub(Unsupported)` unless `allow_dmub_aux()` was called and the running
+firmware answered QUERY_FEATURE_CAPS: Linux never routes DCN3.0 AUX/HPD through
+DMUB (`dc_is_dmub_outbox_supported` is false outside DCN3.1 DPIA/GC11 unless
+`enable_dmub_aux_for_legacy_ddc`), and `dmub_feature_caps` has no AUX bit.
+
+### Navi 22 DCN3.0 mode math
+
+`amdgpu_dml30::plan(&Config, &Soc) -> Result<Plan, Error>` is the DCN3.0
+`display_mode_vba_30.c` performance calculation plus `display_rq_dlg_calc_30.c`
+encoding for one unscaled linear RGB plane on one pipe (GPUVM/HostVM, DCC,
+dynamic metadata, cursor, writeback, ODM/MPC split off), with `dcn3_0_ip` /
+`dcn3_0_soc` constants (184 KiB DET, 84 PTE requests, 191-cycle ping, 404 us
+p-state, 15.5/20 us self refresh, fabric-adjusted urgent latency) in
+`amdgpu_dml::Fx` fixed point. `Soc` carries the board's DCFCLK/fabric/SOCCLK,
+`memclk*16` DRAM rate, VBIOS channel count/width, clock ceilings, DENTIST VCO
+and DCHUB reference. It tries prefetch modes 0..2 and VStartup from 13 to
+`vtotal - vactive - 1` with Linux's bandwidth, urgent-burst, two-line and
+VRatio<=4 checks, and returns `Plan { prefetch_mode, geometry, clocks,
+watermarks, prefetch, registers: amdgpu_dml_regs::Registers, hubbub:
+WatermarkSet (refclk cycles, `convert_and_clamp`), dram_clock_change,
+urgent_bandwidth_thousandths }`. Register fields are Linux's `(unsigned int)`
+truncations and are refused (not wrapped) when they exceed the DCN3.0 mask.
+Out-of-scope planes, PHY/display-clock overruns and unschedulable blanks fail
+before any hardware is touched. Host vectors from a double transliteration of
+the Linux formulas are checked to one LSB.
+
+`Soc::from_board(levels, channels, width, dchub_refclk)` builds the top
+bounding-box state from the DAL DPM table (DCFCLK doubling as fabric clock,
+`memclk*16`, DENTIST-reachable DISP/DPP ceilings, PHY ceiling, VCO).
+`amdgpu_dcn_inventory::vram_channels(vbios)` reads `vram_info` v2.5 module 0
+(`channel_num`, `(1 << channel_width) / 8` bytes) as `get_vram_info_v25` does;
+other revisions are refused.
+
+`unsafe amdgpu_dcn30_hubbub::Hubbub::new(gpu, pci_cap)` owns the DCN3.0
+arbiter. `dchub_refclk_khz(dccg_ref)` mirrors `hubbub2_get_dchub_ref_freq`
+but refuses a disabled global timer or a reference outside 40–60 MHz.
+`unsafe program(&WatermarkSet, refclk)` (no HUBP fetching) writes sets A–D
+identically (data/VM-row urgency, trip to memory, SR enter/exit, DRAM clock
+change, FRAC_URG_BW nom/flip), `ARB_SAT_LEVEL = 60 * refclk_mhz`,
+`MIN_REQ_OUTSTAND = 0x1ff`, forces self refresh off, and reads every write
+back; values wider than their DCN3.0 field are refused rather than masked.
+
+### Navi 22 VBIOS display command tables
+
+DCN3.0 does not route VBIOS commands through DMUB (`dmub_command_table` is
+unset for `dcn30_resource.c`), so `amdgpu_navi22_bios::Tables::new(vbios)` runs
+them on the ATOM interpreter. `pipe_power_gating(bus, pipe, Init|Disable|Enable)`
+(EnableDispPowerGating v2.1), `set_pixel_clock(bus, &PixelClock { otg, pll,
+transmitter, pixel_khz })` (v1.7, combo PHY PLL, UNIPHY encoder object, HDMI
+mode, XTALIN reference), `hdmi_stream_setup(bus, dig, pixel_khz)`
+(DIGxEncoderControl v1.5 STREAM_SETUP) and `transmitter(bus, &Transmitter)`
+(DIG1TransmitterControl v1.6/1.7, as `dcn10_link_encoder_enable_tmds_output`)
+fill the `atomfirmware.h` blocks exactly as `command_table2.c` does and refuse
+other table revisions. `Bus` (BAR5 dword `Mmio`, bounded by the mapping)
+carries register access and DELAY; an out-of-window access or port I/O fails
+the table with `Error::Bus`.
+
+`amdgpu_atom_vm` now follows `atom.c` when `AtomState::bios`/`data_table` are
+bound: `SET_DATA_BLOCK` takes absolute offsets from the master data table (255
+selects the table start), ID operands read the image, every table execution
+(including each CALLTABLE callee) gets its own zeroed WS from its header
+(`ResolvedTable::ws_dwords`), and DELAY opcodes call `AtomState::delay_us`.
+Unbound, the synthetic-table behaviour is unchanged.
+
+### Navi 22 native HDMI scanout (opt-in)
+
+`unsafe amdgpu_dcn30_hdmi::Hdmi::new(gpu, pci_cap, dig, transmitter)` owns one
+DIG frontend/VPG and backend: `check_idle` (refuses a live backend), `route(otg)`
+(`dcn10_link_encoder_setup(HDMI)`, `connect_dig_be_to_fe`,
+`enc1_dig_connect_to_otg`), `stream_attribute(khz)` (the register half of
+`enc3_stream_encoder_hdmi_set_stream_attribute`: RGB, 8 bpc, no scrambling —
+refused at or above 340 MHz — GC/NULL every frame, ACP off, AVMUTE released),
+`info_packets(&avi)` (VPG generic packet 0 with immediate update, GENERIC0 on
+line 2, packets 1–6 off; a pending VPG conflict fails) and `stop()`.
+`Otg::program_tmds_timing` is `optc1_program_timing` with start point 0.
+
+`unsafe amdgpu_navi22_modeset::Pipeline::new(gpu, pci_cap, connector)` claims
+pipe 0 (OTG/HUBP/DPP/MPCC/OPP), the DAL clock owner, HUBBUB and the
+connector's DIG. `unsafe enable(smu, pool, tables, vbios, crystal, sink, draw)`
+starts the DAL clocks, runs `dccg2_init` and (outside accelerated mode)
+`dcn10_bios_golden_init`, builds `dml30::Soc` from the board, `select`s the
+first EDID timing under the unscrambled TMDS and VSDB ceilings that DML30
+admits (with the CTA AVI InfoFrame; DVI sinks are refused), reserves,
+draws, HDP-flushes and publishes the scanout, programs HUBBUB, DISPCLK/DPPCLK
+and the DPP DTO, VBIOS SetPixelClock on combo PHY PLL 0, OTG timing/global
+sync, powers on DPP0/HUBP0 (`power_on_plane_resources`, HUBP clock), programs
+DPP/MPCC/OPP blanked and HUBP blanked, starts the OTG, then
+`enable_link_hdmi` (route, VBIOS STREAM_SETUP, attributes, AVI, VBIOS
+transmitter ENABLE) and finally unblanks HUBP then OPP. Any failure records
+`State::Failed { step, error }`, tears down in reverse and keeps the
+reservation published. `disable(tables)` is the same reverse order;
+`flush()` HDP-flushes CPU writes. `ColdBoot::modeset_hdmi()` (after
+`FirmwareReady`) lights the first connected HDMI sink with `test_pattern`
+and retains the pipeline; `amdgpu_navi22_platform::modeset_hdmi()` also
+publishes the scanout through `amdgpu_dcn_display::publish_external`, moving
+the console. The framebuffer handoff calls it only with the
+`amdgpu.native_display` kernel argument (the Navi48 flag). It reuses
+`amdgpu_navi48_boot::{edid_timings, hdmi_caps, hdmi_avi, limited_range,
+broadcast_rgb}` and `amdgpu_dcn401_otg::avi_infoframe`.
+
+### Navi 22 native AUX, DDC and HPD
+
+`unsafe amdgpu_dcn30_ddc::Ddc::new(gpu, pci_cap, crystal_khz)` claims all six DCN3.0 AUX
+engines and DDC pads, the shared hardware I2C engine and all six HPD blocks
+(Navi22 profile only; DCN base index 2 bounded to `DC_GPIO_AUX_CTRL_5`, base
+index 1 to `MICROSECOND_TIME_BASE_DIV`). `bind(line, hpd, Signal)` performs the
+AUX half of `enc3_hw_init` (`AUX_DPHY_RX_CONTROL0` 0x103d1110, TX 0x21c7a,
+`AUX_HPD_SEL`, quarter receive window), a 552 us AUX timeout, opens the HPD pin
+in interrupt mode, enables `DC_HPD_EN` if firmware left it clear and programs
+`program_hpd_filter` delays (HDMI 500/100 ms, DP 80/0 ms); a DP line without
+HPD is refused. `hpd`/`hpd_raw` read `DC_HPD_SENSE_DELAYED`/`DC_HPD_SENSE`;
+`hpd_ack` mirrors `hpd0_ack` (ack, then arm the opposite polarity);
+`hpd_rx_ack`/`hpd_interrupt` program the IH-facing bits. `aux(line, AuxRequest)`
+is `dce_aux_transfer_with_retries` over `dce_aux_transfer_raw` (7 attempts, DEFER
+budget, 3 timeouts, 2 invalid replies, ACKM status polling, NACK/HPD-loss
+terminal); `dpcd_read`/`dpcd_write` bound payloads to 16 bytes. `i2c(line, Mode,
+messages)` is `link_query_ddc_data`: I2C-over-AUX in 16-byte MOT chunks, or one
+hardware I2C command (`dcn2_i2c_hw_construct`: 538-byte buffer, setup limit 3,
+100 kHz from `MICROSECOND_TIME_BASE_DIV`, or from the VBIOS crystal
+(`dce_refclk_10khz`) when a reset DCN has not been through `dccg2_init`;
+≤256 bytes per message). Pads are
+opened/closed exactly as `dal_ddc_open`/`dal_ddc_close` per transaction.
+DMCU/hardware-owned engines return `Engine`; every wait is bounded; a dropped
+future releases arbitration and restores pads synchronously; an all-ones read
+returns `DeviceGone` and leaves the owner `Failed`.
+
+`amdgpu_navi22_display::Display` binds every HDMI/DP VBIOS path (DDC line and
+HPD from the record list/GPIO LUT; a shared line or HPD is refused) and
+`detect(index)`/`detect_all()` return `Disconnected`, `Connected(Sink { edid,
+preferred, hdmi, dpcd })` or per-connector `Failed(error)`: HPD first, the 16-byte
+DPCD receiver capability field for DP, then a checksummed EDID (base plus up to
+four extensions, E-DDC segment pointer past block 1, four tries per block) over
+I2C-over-AUX or the hardware I2C engine. Only owner loss fails the whole probe.
+`Firmware::prepare_display(gpu)` decodes routes before device I/O and
+`ColdBoot::prepare_display()` claims the owner without I/O; both are optional
+for firmware bring-up. `ColdBoot::detect_displays().await` requires
+`FirmwareReady`, and `amdgpu_navi22_platform::detect_displays().await`
+serializes it through the retained owner. The framebuffer boot handoff logs one
+line per connector after a successful firmware run; detection reads sinks only. `dmub_mailbox_state()` also reports failed
 or cancelled transport attempts without accessing hardware.
 
 ### Navi 22 boot ownership and framebuffer handoff

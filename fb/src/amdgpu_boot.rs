@@ -100,6 +100,14 @@ pub(super) fn start() -> InitResult {
         "amdgpu: {generation} framebuffer {}",
         if paused() { "quarantined" } else { "available" }
     );
+    if ok && !navi48 {
+        report_displays();
+        // Off by default until a board validates the path; the same flag
+        // Navi48 uses.
+        if narf_boot::args().has_flag("amdgpu.native_display") {
+            navi22_native_display();
+        }
+    }
     // `amdgpu.max_bpc=10|12`: allow HDMI deep colour, as DRM's max bpc.
     if let Some(bpc) = narf_boot::args()
         .value("amdgpu.max_bpc")
@@ -185,6 +193,88 @@ fn completed(generation: &str, result: impl core::fmt::Debug, status: impl core:
         narf_console::Writer,
         "amdgpu: {generation} firmware {result:?}; retained {status:?}"
     );
+}
+
+/// Opt-in native Navi22 HDMI scanout with a colour-bar test pattern. The
+/// reset-on-init stage already retired the GOP's scanout, so there is no
+/// inherited stream to stop first. On success the published scanout moves
+/// the console; on failure the retained owner reports where it stopped.
+fn navi22_native_display() {
+    use core::fmt::Write;
+    // SAFETY: final synchronous boot initcall after a successful firmware run;
+    // no other display client exists and only the console writes scanout.
+    let lit = narf_scheduler::block_on_spin(unsafe { platform::modeset_hdmi() });
+    let _ = match lit {
+        Ok(out) => writeln!(
+            narf_console::Writer,
+            "amdgpu: navi22 native HDMI {}x{} {} kHz (pm {}, vstartup {}, dispclk {} dppclk {})",
+            out.timing.h_active,
+            out.timing.v_active,
+            out.timing.pixel_clock_khz,
+            out.prefetch_mode,
+            out.v_startup,
+            out.dispclk_khz,
+            out.dppclk_khz
+        ),
+        Err(error) => writeln!(
+            narf_console::Writer,
+            "amdgpu: navi22 native HDMI failed {error:?}; state {:?}",
+            platform::modeset_state()
+        ),
+    };
+}
+
+/// One serial line per board connector from native AUX/DDC/HPD detection, so
+/// the first bare-metal boot shows which sinks and EDIDs were seen. Sink reads
+/// only: no stream, scanout or framebuffer state changes.
+fn report_displays() {
+    use core::fmt::Write;
+    use narf_drivers_gpu::amdgpu_navi22_display::{Detection, Signal};
+    let reports = match narf_scheduler::block_on_spin(platform::detect_displays()) {
+        Ok(reports) => reports,
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 display probe: {error:?}"
+            );
+            return;
+        }
+    };
+    for report in reports {
+        let c = report.connector;
+        let name = match c.signal {
+            Signal::Hdmi => "HDMI-A",
+            Signal::DisplayPort => "DP",
+        };
+        let _ = write!(
+            narf_console::Writer,
+            "amdgpu: navi22 {name}-{} (ddc {}, hpd {:?}, dig {}): ",
+            c.path.connector_instance,
+            c.line,
+            c.hpd,
+            c.path.transmitter
+        );
+        let _ = match report.detection {
+            Detection::Disconnected => writeln!(narf_console::Writer, "disconnected"),
+            Detection::Failed(error) => writeln!(narf_console::Writer, "sink error {error:?}"),
+            Detection::Connected(sink) => match sink.preferred {
+                Some(t) => writeln!(
+                    narf_console::Writer,
+                    "EDID {} bytes, preferred {}x{} {} kHz{}",
+                    sink.edid.len(),
+                    t.h_active,
+                    t.v_active,
+                    t.pixel_clock_khz,
+                    if sink.hdmi { ", HDMI" } else { "" }
+                ),
+                None => writeln!(
+                    narf_console::Writer,
+                    "EDID {} bytes, no preferred timing",
+                    sink.edid.len()
+                ),
+            },
+        };
+    }
 }
 
 #[cfg(feature = "kernel-test")]

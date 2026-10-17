@@ -2635,10 +2635,10 @@ mod modeset;
 #[path = "amdgpu_navi48_teardown.rs"]
 mod teardown;
 pub use modeset::{
-    broadcast_rgb, frl_audio, frl_cap, frl_carries, frl_enabled, frl_link, limited_range, max_bpc,
-    set_broadcast_rgb, set_frl, set_max_bpc, Configuration, FrlRate, Health, InheritedRetired,
-    Modeset, ModesetError, MstRoute, MstStream, Selection, SstOutput, BROADCAST_RGB_AUTO,
-    BROADCAST_RGB_FULL, BROADCAST_RGB_LIMITED,
+    broadcast_rgb, edid_timings, frl_audio, frl_cap, frl_carries, frl_enabled, frl_link, hdmi_avi,
+    hdmi_caps, limited_range, max_bpc, set_broadcast_rgb, set_frl, set_max_bpc, Configuration,
+    FrlRate, HdmiCaps, Health, InheritedRetired, Modeset, ModesetError, MstRoute, MstStream,
+    Selection, SstOutput, BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL, BROADCAST_RGB_LIMITED,
 };
 pub use teardown::{TeardownStatus, TeardownStep};
 #[cfg(feature = "kernel-test")]
