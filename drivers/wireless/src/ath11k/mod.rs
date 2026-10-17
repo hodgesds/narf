@@ -47,6 +47,7 @@ pub mod core;
 pub mod dp;
 pub mod hal;
 pub mod htc;
+pub mod htt;
 pub mod hw;
 pub mod mhi;
 pub mod mhi_host;
@@ -79,6 +80,8 @@ pub mod ce_tests;
 pub mod core_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod hal_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod htt_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod mhi_tests;
 #[cfg(any(test, feature = "kernel-test"))]
