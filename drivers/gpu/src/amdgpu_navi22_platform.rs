@@ -318,6 +318,9 @@ async fn start_services(boot: &mut boot::ColdBoot) {
 /// display monitor. Without an IH ring or display owner, polling alone runs.
 fn start_hotplug(boot: &mut boot::ColdBoot) {
     use core::fmt::Write;
+    if !display_engines_requested() {
+        return;
+    }
     match boot.arm_display_hpd() {
         Ok(subscription) => {
             narf_scheduler::spawn(crate::amdgpu_navi22_display::serve_hpd(
@@ -337,6 +340,17 @@ fn start_hotplug(boot: &mut boot::ColdBoot) {
             );
         }
     }
+}
+
+/// Display-engine opt-in (`amdgpu.native_display` / `amdgpu.display_probe`,
+/// set by fb before `run`). Arming HPD programs the HPD/AUX/DDC engines, so
+/// a firmware-only boot (the default) leaves them as the GOP left them.
+static DISPLAY_ENGINES: AtomicBool = AtomicBool::new(false);
+pub fn set_display_engines(enabled: bool) {
+    DISPLAY_ENGINES.store(enabled, Ordering::Release);
+}
+pub(crate) fn display_engines_requested() -> bool {
+    DISPLAY_ENGINES.load(Ordering::Acquire)
 }
 
 /// TDR sample of every verified kernel queue, serialized with the owner.

@@ -638,3 +638,24 @@ kernel_test_in!(
     "drivers/gpu/navi22-boot",
     navi22_stage_order_matches_linux_firmware_path
 );
+
+/// HPD arming programs the HPD/AUX/DDC engines; a default firmware-only boot
+/// (neither `amdgpu.native_display` nor `amdgpu.display_probe`) must not.
+fn navi22_hotplug_is_opt_in_with_the_display() -> TestResult {
+    use crate::amdgpu_navi22_platform as platform;
+    let before = platform::display_engines_requested();
+    if before {
+        return TestResult::Fail("display engines armed without an opt-in flag");
+    }
+    platform::set_display_engines(true);
+    let armed = platform::display_engines_requested();
+    platform::set_display_engines(before);
+    if !armed || platform::display_engines_requested() {
+        return TestResult::Fail("display opt-in not honoured");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_hotplug_is_opt_in_with_the_display
+);

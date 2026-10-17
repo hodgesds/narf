@@ -99,6 +99,10 @@ pub(super) fn start() -> InitResult {
         completed(generation, result, navi48::status());
         result.is_ok()
     } else {
+        let args = narf_boot::args();
+        platform::set_display_engines(
+            args.has_flag("amdgpu.native_display") || args.has_flag("amdgpu.display_probe"),
+        );
         // SAFETY: the retained prepared owner and paused CPU writers persist.
         let result = narf_scheduler::block_on_spin(unsafe { platform::run() });
         completed(generation, result, platform::status());
