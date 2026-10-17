@@ -229,6 +229,10 @@ impl Drop for DriCardFile {
         // kernel console (no-op if a DRM client never took it over).
         if LIVE_CARD_FILES.fetch_sub(1, core::sync::atomic::Ordering::AcqRel) == 1 {
             narf_console::fb_release_from_user();
+            // As drm_fb_helper restores the console on lastclose: a native
+            // display a client switched off lights again for the console,
+            // in the sink's preferred mode.
+            crate::amdgpu_navi48_platform::restore_displays();
         }
     }
 }
@@ -472,6 +476,15 @@ impl FileOps for DriCardFile {
                     .is_some_and(|state| state.lock().is_master(self.open_id))
             {
                 crate::drm_ioctl_bridge::wait_atomic_in_fences(arg, context)?;
+            }
+            // A blocking vblank wait sleeps until its vblank.
+            if crate::drm_ioctl_bridge::is_wait_vblank_ioctl(cmd) {
+                return crate::drm_ioctl_bridge::wait_vblank_for_file(
+                    self.index,
+                    arg as usize,
+                    &self.events,
+                )
+                .await;
             }
             self.ioctl(cmd, arg as usize)
         })

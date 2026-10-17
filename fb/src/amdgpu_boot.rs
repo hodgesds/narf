@@ -1,7 +1,8 @@
-//! Boot-only CPU framebuffer handoff for Navi22 GDDR6 training. This is not a
+//! Boot-only CPU framebuffer handoff for discrete AMD GDDR6 training. This is not a
 //! runtime pause API: mmap writers cannot be stopped by a software flag.
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_drivers_gpu::amdgpu_navi22_platform as platform;
+use narf_drivers_gpu::amdgpu_navi48_platform as navi48;
 use narf_init::InitResult;
 
 static PAUSED: AtomicBool = AtomicBool::new(false);
@@ -35,25 +36,31 @@ pub(super) fn start() -> InitResult {
         return InitResult::NotPresent;
     }
     let framebuffer = *super::BOOT_GENERIC.lock();
+    let navi48 = narf_drivers_gpu::amdgpu::with_controller(|g| {
+        g.chip.did == narf_drivers_gpu::amdgpu::NAVI48
+    })
+    .unwrap_or(false);
+    let generation = if navi48 { "navi48" } else { "navi22" };
     let pause = Pause::new();
     // SAFETY: final synchronous boot initcall, before executor/user startup.
     // No NARF GPU queues/VRAM allocations exist. Console and sleep-pump writes
     // are stopped above, and the original physical GOP geometry is retained.
-    let prepared = unsafe { platform::prepare(framebuffer) };
+    let prepared = if navi48 {
+        // SAFETY: same final boot handoff and paused writers described above.
+        unsafe { navi48::prepare(framebuffer) }.map_err(|e| refused(generation, e))
+    } else {
+        // SAFETY: same final boot handoff and paused writers described above.
+        unsafe { platform::prepare(framebuffer) }.map_err(|e| refused(generation, e))
+    };
     let affected = match prepared {
         Ok(None) => {
             pause.resume();
             return InitResult::NotPresent;
         }
-        Err(error) => {
+        Err(()) => {
             // Preparation has issued no device writes and owns no hardware.
             pause.resume();
-            use core::fmt::Write;
-            let _ = writeln!(
-                narf_console::Writer,
-                "amdgpu: navi22 preflight refused: {error:?}"
-            );
-            return InitResult::Error("Navi22 firmware preflight");
+            return InitResult::Error("AMD PCIe firmware preflight");
         }
         Ok(Some(affected)) => affected,
     };
@@ -61,26 +68,115 @@ pub(super) fn start() -> InitResult {
     // pumps, not the executor. No spinlock guard is held; spin works even if
     // this boot profile has not enabled interrupts yet.
     // SAFETY: all CPU writers remain paused until successful terminal return.
-    let result = narf_scheduler::block_on_spin(unsafe { platform::run() });
-    if result.is_ok() || !affected {
+    let ok = if navi48 {
+        // SAFETY: the retained prepared owner and paused CPU writers persist.
+        let result = narf_scheduler::block_on_spin(unsafe { navi48::run() });
+        completed(generation, result, navi48::status());
+        result.is_ok()
+    } else {
+        // SAFETY: the retained prepared owner and paused CPU writers persist.
+        let result = narf_scheduler::block_on_spin(unsafe { platform::run() });
+        completed(generation, result, platform::status());
+        result.is_ok()
+    };
+    if ok || !affected {
         // A secondary GPU cannot affect the boot framebuffer on another BAR.
         pause.resume();
     }
     use core::fmt::Write;
     let _ = writeln!(
         narf_console::Writer,
-        "amdgpu: navi22 firmware {:?}; retained {:?}; framebuffer {}",
-        result,
-        platform::status(),
+        "amdgpu: {generation} framebuffer {}",
         if paused() { "quarantined" } else { "available" }
     );
-    if result.is_ok() {
+    if ok && !navi48 {
         report_displays();
     }
-    match result {
-        Ok(_) => InitResult::Ok,
-        Err(_) => InitResult::Error("Navi22 firmware startup (owner retained)"),
+    // `amdgpu.max_bpc=10|12`: allow HDMI deep colour, as DRM's max bpc.
+    if let Some(bpc) = narf_boot::args()
+        .value("amdgpu.max_bpc")
+        .and_then(|v| v.parse::<u8>().ok())
+    {
+        navi48::set_max_bpc(bpc);
     }
+    // `amdgpu.dcfeaturemask`: bit 0x400 (Linux's DC_FRL_MASK)
+    // enables HDMI FRL when TMDS cannot carry a mode. Decimal or 0x hex.
+    if let Some(mask) = narf_boot::args()
+        .value("amdgpu.dcfeaturemask")
+        .and_then(
+            |v| match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                None => v.parse::<u32>().ok(),
+            },
+        )
+    {
+        navi48::set_frl(mask & 0x400 != 0);
+    }
+    if ok && navi48 && narf_boot::args().has_flag("amdgpu.native_display") {
+        native_display();
+    }
+    if ok {
+        InitResult::Ok
+    } else {
+        InitResult::Error("AMD PCIe firmware startup (owner retained)")
+    }
+}
+
+/// Opt-in (`amdgpu.native_display`) native Navi48 scanout: retire the GOP's
+/// DP SST output and light every connected sink natively, the console on
+/// the first (DP before HDMI). Off by
+/// default until a board has validated the path. On success the published
+/// scanout moves the console through the external-scanout observer; on
+/// failure the owner stays where it stopped and the boot console remains on
+/// the GOP framebuffer, which stays excluded from GPU allocations.
+fn native_display() {
+    use core::fmt::Write;
+    // SAFETY: final synchronous boot initcall, before executor/user startup.
+    // Only the boot console writes the GOP framebuffer, whose memory the
+    // owner never allocates; retirement stops its scanout role only.
+    let retired = narf_scheduler::block_on_spin(unsafe { navi48::retire_inherited_display() });
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: navi48 inherited display {retired:?}"
+    );
+    if retired.is_err() {
+        return;
+    }
+    // SAFETY: as above; the inherited consumers are now retired.
+    let lit =
+        narf_scheduler::block_on_spin(unsafe { navi48::modeset_displays(|_, _, row| row.fill(0)) });
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: navi48 native modeset {lit:?}"
+    );
+    use narf_drivers_gpu::amdgpu_navi48_boot::{Configuration, ModesetError};
+    let config = match lit {
+        Ok(config) => config,
+        // Nothing lightable yet: the monitor lights a sink plugged later.
+        Err(ModesetError::NoSink | ModesetError::Link) => Configuration {
+            displays: alloc::vec::Vec::new(),
+            failed: None,
+        },
+        Err(_) => return,
+    };
+    // SAFETY: the retained owner is serialized by the platform; only the
+    // monitor and the published hooks drive the displays from here on.
+    unsafe { navi48::spawn_display_monitor(config) };
+}
+
+fn refused(generation: &str, error: impl core::fmt::Debug) {
+    use core::fmt::Write;
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: {generation} preflight refused: {error:?}"
+    );
+}
+fn completed(generation: &str, result: impl core::fmt::Debug, status: impl core::fmt::Debug) {
+    use core::fmt::Write;
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: {generation} firmware {result:?}; retained {status:?}"
+    );
 }
 
 /// One serial line per board connector from native AUX/DDC/HPD detection, so

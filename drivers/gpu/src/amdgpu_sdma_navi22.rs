@@ -108,6 +108,11 @@ trait Io {
     fn write(&mut self, address: u64, value: u32);
     fn read_memory(&mut self, map: MmioRegion, offset: u64) -> u32;
     fn write_memory(&mut self, map: MmioRegion, offset: u64, value: u32);
+    /// Hardware reset settling time. Models may yield deterministically so
+    /// cancellation tests need not win a 50-us scheduling window under QEMU.
+    async fn reset_delay(&mut self) {
+        delay(50).await;
+    }
 }
 #[derive(Debug)]
 struct Mmio(MmioRegion);
@@ -269,14 +274,14 @@ impl<I: Io> Engine<I> {
             checked(io.read(l.gc + u64::from(RESET) * 4))?;
             Ok(())
         })?;
-        delay(50).await;
+        self.io.reset_delay().await;
         self.state = State::ResetReleased;
         self.access(|io| {
             update(io, l.gc, RESET, RESET_SDMA0, 0)?;
             checked(io.read(l.gc + u64::from(RESET) * 4))?;
             Ok(())
         })?;
-        delay(50).await;
+        self.io.reset_delay().await;
         self.state = State::Programming;
         let map = self.memory.mapping();
         let words = packets(aperture);

@@ -246,10 +246,10 @@ impl VirtioSoundPci {
 
         // Set up four virtqueues: 0=control, 1=event, 2=tx, 3=rx.
         // Each gets a 4 KiB coherent buffer for descriptor + ring
-        // storage. Stage-4: queue depth 4 per queue — virtio-sound
-        // spec's minimum + matches balloon's stub footprint. Real
-        // playback wants tx depth 32+, but that's a tx-data-plane
-        // concern that lands with the unified DmaBuffer surface.
+        // storage. The ALSA playback path keeps the whole ring in flight
+        // as 3-descriptor messages, so tx gets the deepest queue that
+        // still fits one page (128 entries = 42 messages); the others
+        // stay at 4.
         let mut setup_q = |idx: u16| -> Result<(VirtqueueLayout, DmaBuffer), VirtioPciError> {
             // SAFETY: identity-mapped MMIO.
             let qmax = unsafe {
@@ -259,7 +259,7 @@ impl VirtioSoundPci {
             if qmax == 0 {
                 return Err(VirtioPciError::QueueTooSmall);
             }
-            let qsize = 4u16.min(qmax);
+            let qsize = if idx == 2 { 128u16 } else { 4 }.min(qmax);
             let buf = alloc_coherent(4096, DomainId::DRIVER_0)
                 .map_err(|_| VirtioPciError::BarMapFailed)?;
             let layout = VirtqueueLayout::new(qsize, buf.dma_addr().raw())
@@ -450,6 +450,17 @@ impl VirtioSoundPci {
             q.free_chain(head);
         }
         Ok(status)
+    }
+
+    /// Notify the device that the tx queue has new buffers.
+    fn kick_tx(&self) {
+        // SAFETY: identity-mapped notify region captured at probe.
+        unsafe {
+            self.notify.write16(
+                self.notify_off_multiplier as u64 * self.queue_notify_off[2] as u64,
+                2,
+            );
+        }
     }
 
     /// Run SET_PARAMS + PREPARE + START on stream id 0 if not
@@ -940,6 +951,12 @@ pub fn play_buffer_phys(
 ) -> Result<(), VirtioPciError> {
     let c = probed().ok_or(VirtioPciError::NoQueues)?;
     c.play_buffer_phys(params, payload_phys, payload_len)
+}
+
+/// Sound-registry card index of the probed controller.
+#[doc(hidden)]
+pub fn __card_index_for_test() -> Option<u32> {
+    *CARD_INDEX.lock()
 }
 
 #[doc(hidden)]

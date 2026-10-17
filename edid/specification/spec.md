@@ -64,7 +64,9 @@ document was consulted.**
   - Data Block Collection iterator, decoding:
     - Audio Data Block → Short Audio Descriptors (format / channels
       / sample-rates bitmap / format-dependent byte).
-    - Video Data Block → Short Video Descriptors (VIC + native flag).
+    - Video Data Block → Short Video Descriptors (VIC + native flag,
+      decoded as Linux `svd_to_vic`: only 1..=64 and 129..=192 carry
+      the native bit, so VICs 65..=127 and 193.. are kept intact).
     - Vendor Specific Data Block → IEEE OUI + raw payload, with
       HDMI Licensing OUI (0x000C03) and HDMI Forum OUI (0xC45DD8)
       detection.
@@ -89,6 +91,17 @@ document was consulted.**
   frame encode/decode (header-only polling messages + full
   header+opcode+operand frames, capped at the spec 16-byte CEC
   message size). Builders for the most common messages.
+
+### Stage-4 (landed)
+
+- Fixed mode tables (`modes`), generated from Linux `drm_edid.c`:
+  CTA-861 VICs 1..=127 and 193..=219, VESA DMT, established timings
+  I/II plus the manufacturer bit. `cea_mode(vic)`,
+  `established_modes(t1, t2, mfg)` (`add_established_modes` bit
+  order), `standard_mode(b0, b1, revision)` (`drm_mode_std`'s
+  size/aspect/refresh decode, DMT lookup only) and `find_dmt` (with
+  Linux's reduced-blanking test). `FixedMode::detailed` converts to a
+  `DetailedTiming`. CVT/GTF synthesis is not implemented.
 
 ### Out of scope (deferred)
 

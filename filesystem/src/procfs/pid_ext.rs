@@ -572,11 +572,16 @@ fn render_stack(_pid: u64) -> String {
 /// that exists in neither kernel, reported for tasks blocked in `poll`,
 /// `read` or `futex`. `ps -o wchan` and anything else keyed on this file was
 /// being told the same wrong thing about every sleeper.
+///
+/// No trailing newline: `proc_pid_wchan` emits the bare symbol (or `0`).
+/// procps prints the file verbatim into the WCHAN column, so a newline split
+/// every `ps -o wchan` row in two.
 fn render_wchan(pid: u64) -> String {
-    match super::hook_sched_snapshot(pid).wchan {
-        Some(name) => format!("{}\n", name),
-        None => "0\n".to_string(),
-    }
+    format_wchan(super::hook_sched_snapshot(pid).wchan)
+}
+
+fn format_wchan(name: Option<String>) -> String {
+    name.unwrap_or_else(|| "0".to_string())
 }
 
 /// `/proc/<pid>/syscall` — the syscall the task is blocked in.
@@ -593,8 +598,17 @@ fn render_wchan(pid: u64) -> String {
 /// non-running state, so a debugger could never see what a hung process was
 /// waiting on.
 fn render_syscall(pid: u64) -> String {
-    let sched = super::hook_sched_snapshot(pid);
-    match sched.syscall {
+    format_syscall(super::hook_sched_snapshot(pid).syscall, || {
+        task_info(pid, super::TaskInfoQuery::Basic)
+            .map(|i| i.state)
+            .unwrap_or('R')
+    })
+}
+
+/// `proc_pid_syscall`'s three shapes; `state` is consulted only for a task
+/// with no parked frame.
+fn format_syscall(frame: Option<[u64; 9]>, state: impl FnOnce() -> char) -> String {
+    match frame {
         Some(frame) => format!(
             "{} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}\n",
             frame[0] as i64,
@@ -608,10 +622,7 @@ fn render_syscall(pid: u64) -> String {
             frame[8]
         ),
         None => {
-            let state = task_info(pid, super::TaskInfoQuery::Basic)
-                .map(|i| i.state)
-                .unwrap_or('R');
-            if state == 'R' {
+            if state() == 'R' {
                 "running\n".to_string()
             } else {
                 "-1 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x0\n".to_string()
@@ -1252,6 +1263,55 @@ impl FileOps for ProcTaskTidStat {
     }
 }
 
+/// `/proc/<pid>/task/<tid>/{syscall,wchan}` — what THIS thread is blocked
+/// in (`tid_base_stuff` lists both). A multithreaded process parks each
+/// thread in its own syscall; the process-level files only describe the
+/// leader, so a debugger looking for the stuck thread needs these.
+#[derive(Debug)]
+struct ProcTaskTidSyscall {
+    pid: u64,
+    tid: u64,
+    ino: u64,
+    wchan: bool,
+}
+
+impl FileOps for ProcTaskTidSyscall {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        super::proc_attrs()
+    }
+    fn owners(&self) -> (u32, u32) {
+        super::task_file_owners(self.pid)
+    }
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            let Some(thread) = super::hook_thread_stat(self.tid) else {
+                // Thread gone: same zero-length read as task/<tid>/stat.
+                return Ok(0);
+            };
+            let text = if self.wchan {
+                format_wchan(thread.wchan)
+            } else {
+                format_syscall(thread.syscall, || thread.state)
+            };
+            slice_read(text.as_bytes(), offset, buf)
+        })
+    }
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode::FILE_RO,
+            mtime_cycles: 0,
+        }
+    }
+}
+
 impl DirOps for ProcTaskTidDir {
     fn ino(&self) -> u64 {
         self.ino
@@ -1278,14 +1338,24 @@ impl DirOps for ProcTaskTidDir {
                 pid: self.pid,
                 ino: proc_pid_ino(self.ino, name),
             })),
+            "syscall" | "wchan" => Some(Arc::new(ProcTaskTidSyscall {
+                pid: self.pid,
+                tid: self.tid,
+                ino: proc_pid_ino(self.ino, name),
+                wchan: name == "wchan",
+            })),
             _ => None,
         }
     }
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
-        Box::new(["comm", "mem", "stat"].into_iter().map(|name| DirEntry {
-            name: name.into(),
-            file_type: FileType::File,
-        }))
+        Box::new(
+            ["comm", "mem", "stat", "syscall", "wchan"]
+                .into_iter()
+                .map(|name| DirEntry {
+                    name: name.into(),
+                    file_type: FileType::File,
+                }),
+        )
     }
 }
 
@@ -1472,7 +1542,7 @@ fn smoke_sched_files_report_the_tasks_accounting() -> TestResult {
     if !sched.contains("se.sum_exec_runtime                :        1234.567890") {
         return TestResult::Fail("sched should report sum_exec_runtime in ms");
     }
-    if wchan != "read\n" {
+    if wchan != "read" {
         return TestResult::Fail("wchan should name the syscall the task is parked in");
     }
     if syscall != "0 0x4 0x1000 0x200 0x0 0x0 0x0 0x7ffff000 0x401000\n" {
@@ -1503,7 +1573,7 @@ fn smoke_syscall_and_wchan_for_a_running_task() -> TestResult {
     let syscall = render_syscall(1);
     super::__test_sched_snapshot_hook_restore(prev);
 
-    if wchan != "0\n" {
+    if wchan != "0" {
         return TestResult::Fail("wchan for an unparked task should be '0'");
     }
     if syscall != "running\n" {
@@ -1514,6 +1584,79 @@ fn smoke_syscall_and_wchan_for_a_running_task() -> TestResult {
 kernel_test_in!(
     "filesystem/procfs/pid_ext",
     smoke_syscall_and_wchan_for_a_running_task
+);
+
+/// Thread 7 is parked in `futex(0x1000, 128, 0)`; thread 8 sleeps outside a
+/// syscall. Each `task/<tid>/{syscall,wchan}` must describe ITS thread.
+fn test_thread_stat(tid: u64) -> Option<super::ThreadStat> {
+    let parked = tid == 7;
+    (tid == 7 || tid == 8).then(|| super::ThreadStat {
+        comm: alloc::string::String::from("worker"),
+        utime_ticks: 0,
+        stime_ticks: 0,
+        state: 'S',
+        tgid: Some(1),
+        syscall: parked.then_some([202, 0x1000, 128, 0, 0, 0, 0, 0x7fff_e000, 0x0040_2000]),
+        wchan: parked.then(|| alloc::string::String::from("futex")),
+    })
+}
+
+/// `tid_base_stuff` lists `syscall` and `wchan` per thread: a multithreaded
+/// process parks each thread in its own syscall, and the process-level files
+/// only describe the leader. These used to be ENOENT under `task/<tid>/`.
+fn smoke_task_tid_syscall_and_wchan_describe_the_thread() -> TestResult {
+    use super::poll_once;
+    let prev = super::__test_thread_stat_hook_swap(Some(test_thread_stat));
+    let read = |tid: u64, name: &str| -> Option<alloc::string::String> {
+        let dir = ProcTaskTidDir {
+            pid: 1,
+            tid,
+            ino: 99,
+        };
+        let f = dir.lookup(name)?;
+        let mut buf = [0u8; 160];
+        match poll_once(f.read(0, &mut buf)) {
+            Some(Ok(n)) => Some(alloc::string::String::from_utf8_lossy(&buf[..n]).into_owned()),
+            _ => None,
+        }
+    };
+    let listed = ProcTaskTidDir {
+        pid: 1,
+        tid: 7,
+        ino: 99,
+    }
+    .iter()
+    .filter(|e| e.name == "syscall" || e.name == "wchan")
+    .count();
+    let parked_syscall = read(7, "syscall");
+    let parked_wchan = read(7, "wchan");
+    let idle_syscall = read(8, "syscall");
+    let idle_wchan = read(8, "wchan");
+    let gone = read(9, "syscall");
+    super::__test_thread_stat_hook_restore(prev);
+
+    if listed != 2 {
+        return TestResult::Fail("task/<tid>/ must list syscall and wchan");
+    }
+    if parked_syscall.as_deref() != Some("202 0x1000 0x80 0x0 0x0 0x0 0x0 0x7fffe000 0x402000\n") {
+        return TestResult::Fail("task/<tid>/syscall must report the thread's own frame");
+    }
+    if parked_wchan.as_deref() != Some("futex") {
+        return TestResult::Fail("task/<tid>/wchan must name the thread's syscall");
+    }
+    if idle_syscall.as_deref() != Some("-1 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x0\n")
+        || idle_wchan.as_deref() != Some("0")
+    {
+        return TestResult::Fail("a thread blocked outside a syscall reads -1 / 0");
+    }
+    if gone.as_deref() != Some("") {
+        return TestResult::Fail("a vanished thread's syscall file reads empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_task_tid_syscall_and_wchan_describe_the_thread
 );
 
 /// Smoke: `render_limits` has exactly 17 lines (header + 16 resources).
@@ -1611,13 +1754,13 @@ kernel_test_in!(
 );
 
 /// Smoke: `render_wchan` for an unknown pid (no task-info hook)
-/// returns "0\n" because the fallback state is 'R'.
+/// returns "0" (no newline, as Linux) because the fallback state is 'R'.
 fn smoke_wchan_unknown_pid_returns_zero() -> TestResult {
     let out = render_wchan(u64::MAX);
-    if out == "0\n" {
+    if out == "0" {
         TestResult::Pass
     } else {
-        TestResult::Fail("render_wchan for unknown pid should be '0\\n'")
+        TestResult::Fail("render_wchan for unknown pid should be '0' with no newline")
     }
 }
 kernel_test_in!(

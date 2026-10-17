@@ -339,6 +339,36 @@ pub(super) async fn element(
     })();
     Some(result)
 }
+/// A driver control's TLV: only a read of a `has_tlv` control, computed
+/// like a Linux TLV callback (snd_ctl_tlv_ioctl; ENOMEM when the caller's
+/// buffer is short, as hdmi_chmap_ctl_tlv returns).
+fn native_tlv(
+    c: &Control,
+    nr: u8,
+    num: u32,
+    len: usize,
+    arg: u64,
+    ctx: &dyn IoctlContext,
+) -> Result<u64, FsError> {
+    let mx = crate::mixer(c.card).map_err(sound_error)?;
+    let Some(id) = mx
+        .list_controls()
+        .into_iter()
+        .find(|id| id.index + 1 == num)
+    else {
+        return Err(FsError::NotFound);
+    };
+    if nr != 0x1a || !id.kind.has_tlv() {
+        return Err(FsError::NoDeviceAddress);
+    }
+    let words = mx.control_tlv(id).map_err(sound_error)?;
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+    if len < bytes.len() {
+        return Err(FsError::OutOfMemory);
+    }
+    ctx.write(arg.checked_add(8).ok_or(FsError::BadAddress)?, &bytes)?;
+    Ok(0)
+}
 pub(super) async fn tlv(
     c: &Control,
     nr: u8,
@@ -361,12 +391,8 @@ pub(super) async fn tlv(
     let Some(e) = elements.iter_mut().find(|e| {
         e.card == c.card && num >= get32(&e.info, 0) && num - get32(&e.info, 0) < e.count
     }) else {
-        let ids = crate::mixer(c.card).map_err(sound_error)?.list_controls();
-        return Err(if ids.iter().any(|id| id.index + 1 == num) {
-            FsError::NoDeviceAddress
-        } else {
-            FsError::NotFound
-        });
+        drop(elements);
+        return native_tlv(c, nr, num, len, arg, ctx);
     };
     let access = match nr {
         0x1a => 16,

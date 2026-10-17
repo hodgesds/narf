@@ -18,6 +18,10 @@ pub(crate) struct Ring {
     pub prepared: bool,
     pub xrun: bool,
     pub free_running: bool,
+    /// The controller does not snoop CPU caches (AMD GPU HD-Audio):
+    /// every CPU write the device reads, and every device write the CPU
+    /// reads, needs explicit cache maintenance.
+    pub noncoherent: bool,
 }
 
 impl Ring {
@@ -61,9 +65,21 @@ impl Ring {
             prepared: false,
             xrun: false,
             free_running: false,
+            noncoherent: false,
         })
     }
 
+    /// Write back (and drop) the cached ring bytes `start..start + len`,
+    /// modulo the ring, when the controller does not snoop.
+    pub fn sync(&self, start: usize, len: usize) {
+        if !self.noncoherent || len == 0 {
+            return;
+        }
+        let start = start % self.bytes;
+        let first = len.min(self.bytes - start);
+        self.data.sync(start, first);
+        self.data.sync(0, len.min(self.bytes) - first);
+    }
     /// Caller has stopped DMA before resetting software ownership.
     pub fn reset(&mut self) {
         // SAFETY: caller established quiescence, buffer is exclusively owned.
@@ -76,6 +92,10 @@ impl Ring {
         self.prepared = true;
         self.xrun = false;
         fence(Ordering::Release);
+        if self.noncoherent {
+            self.data.sync(0, self.bytes);
+            self.bdl.sync(0, 4096);
+        }
     }
 
     pub fn write(&mut self, input: &[u8]) -> Result<usize, SoundError> {
@@ -104,6 +124,7 @@ impl Ring {
             }
         }
         fence(Ordering::Release);
+        self.sync(offset, n);
         self.application += n as u64;
         Ok(n)
     }
@@ -124,6 +145,7 @@ impl Ring {
             }
         }
         fence(Ordering::Release);
+        self.sync(offset, input.len());
         Ok(())
     }
 
@@ -141,6 +163,7 @@ impl Ring {
         }
         let n = output.len().min(available as usize);
         let offset = (self.application % self.bytes as u64) as usize;
+        self.sync(offset, n);
         fence(Ordering::Acquire);
         // SAFETY: only completed capture slots are read, through volatile DMA pointers.
         unsafe {

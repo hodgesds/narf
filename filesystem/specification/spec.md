@@ -276,6 +276,8 @@ pub trait DirOps {
 pub trait FileOps {
     fn ioctl_user(&self, cmd: u32, arg: u64, ctx: &dyn IoctlContext) -> FsFuture<'_, u64>;
     fn has_flush(&self) -> bool;
+    fn anon_name(&self) -> Option<&'static str>; // anon_inodefs name, e.g. "[eventfd]"
+    fn internal_name(&self) -> Option<String>;   // unlinked internal-mount name, e.g. "memfd:x"
     fn poll_readiness(&self) -> u32;
     fn poll_readiness_at(&self, offset: u64) -> u32;
     fn poll_edge_token(&self) -> (u64, u64);
@@ -386,6 +388,10 @@ wrapping SEEK_CUR, `EINVAL` otherwise). `unsigned_offsets()` (default
 `false`) is Linux `FOP_UNSIGNED_OFFSET`: `rw_verify_area` then admits a
 position at or past `LLONG_MAX` (`EOVERFLOW` only when the count would
 wrap), as `/proc/<pid>/mem` addresses kernel-half virtual addresses.
+`/proc/<pid>/task/<tid>/` serves `comm`, `mem`, `stat`, `syscall` and
+`wchan`; the last two describe that thread, from the `syscall` frame and
+`wchan` name the thread-stat hook's `ThreadStat` carries. `wchan` has no
+trailing newline, as Linux `proc_pid_wchan`.
 `/proc/<pid>/mem` and `/proc/<pid>/task/<tid>/mem` are 0600 nodes whose
 `open_instance_checked` calls the hook installed by
 `procfs::install_proc_mem_hook(fn(pid) -> Result<Arc<dyn ProcMemAccess>, FsError>)`
@@ -475,6 +481,20 @@ lock. `validate_mmap` runs before VMA mutation and returns effective protections
 or a device error; only Unsupported from mmap_backing selects generic file
 fallback. `mmap_max_prot` defaults to RWX and constrains later mprotect calls,
 including after fd close, fork and mapping splits. Overlay forwards these hooks.
+
+`FileOps::anon_name()` names an `anon_inodefs` file as Linux's
+`anon_inode_getfile(name, ...)` does (`[eventfd]`, `[timerfd]`, `[eventpoll]`,
+`inotify`, ...); it defaults to `None`. A pathless fd's `/proc/<pid>/fd/<n>`
+link reads `anon_inode:<name>`, or `socket:[ino]` / `pipe:[ino]` for files on
+the sockfs / pipefs pseudo superblocks, and never begins with `/`.
+
+`FileOps::internal_name()` is the dentry name of a file created unlinked on
+a kernel-internal mount: `memfd:<name>` for `memfd_create`, `secretmem` for
+`memfd_secret`. It defaults to `None`. `/proc/<pid>/fd/<n>` and
+`/proc/<pid>/maps` render it as Linux's `d_path` does,
+`/<name> (deleted)`. That text is display-only: the fd-path helpers that
+exec and open re-resolve still report no `/` path for such a file, so
+fexecve of `/proc/self/fd/N` runs the fd's bytes.
 
 `FileOps::mmap_is_ram()` defaults to false. A true implementation promises
 that both mmap backing methods expose ordinary allocator frames retired via
@@ -1373,8 +1393,12 @@ values that have no authoritative NARF provider remain absent rather than
 fabricated measurements.
 `/proc/net/tcp` rows follow Linux `get_tcp4_sock` column order through the
 congestion-window and slow-start-threshold tail. Timer, probe, RTO, delayed-ACK,
-and congestion values come from the TCP snapshot hook; identity values remain
-zero until an authoritative socket-owner provider is installed.
+and congestion values come from the TCP snapshot hook. The uid and inode
+columns of `/proc/net/{tcp,tcp6,udp,udp6}` are the owning socket's `sk_uid`
+(creator fsuid) and sockfs inode — the inode `/proc/<pid>/fd/<n>` names as
+`socket:[ino]`; a TCB that outlives its socket, and kernel-internal endpoints,
+report zero. `/proc/net/udp` lists user AF_INET datagram sockets alongside the
+kernel's own UDP endpoints.
 `/proc/net/sockstat` and `sockstat6` expose Linux's line and field names and
 derive protocol in-use, TIME-WAIT, and allocation counts from the same
 namespace-scoped socket snapshots as the protocol tables.

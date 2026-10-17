@@ -937,3 +937,71 @@ pub fn with_setup_strict(body: impl FnOnce() -> Result<(), &'static str>) -> Tes
         Err(msg) => TestResult::Fail(msg),
     }
 }
+
+/// Bytes `stat`/`fstat`/`newfstatat` write: the x86_64 uapi `struct stat`
+/// is 144 bytes, the asm-generic one arm64 uses is 128.
+#[cfg(target_arch = "x86_64")]
+pub const STAT_SIZE: usize = 144;
+#[cfg(target_arch = "aarch64")]
+pub const STAT_SIZE: usize = 128;
+
+fn stat_u32_at(sb: &[u8], off: usize) -> u32 {
+    u32::from_ne_bytes([sb[off], sb[off + 1], sb[off + 2], sb[off + 3]])
+}
+
+/// `st_mode` of a raw `struct stat` buffer (x86_64 @24, arm64 @16).
+pub fn stat_mode(sb: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        stat_u32_at(sb, 24)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        stat_u32_at(sb, 16)
+    }
+}
+
+/// `st_nlink` of a raw `struct stat` buffer (x86_64 u64 @16, arm64 u32 @20).
+pub fn stat_nlink(sb: &[u8]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        u64::from(stat_u32_at(sb, 16)) | (u64::from(stat_u32_at(sb, 20)) << 32)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        u64::from(stat_u32_at(sb, 20))
+    }
+}
+
+/// `st_uid` of a raw `struct stat` buffer (x86_64 @28, arm64 @24).
+pub fn stat_uid(sb: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        stat_u32_at(sb, 28)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        stat_u32_at(sb, 24)
+    }
+}
+
+/// `st_gid` of a raw `struct stat` buffer (x86_64 @32, arm64 @28).
+pub fn stat_gid(sb: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        stat_u32_at(sb, 32)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        stat_u32_at(sb, 28)
+    }
+}
+
+/// `st_rdev` of a raw `struct stat` buffer (x86_64 @40, arm64 @32).
+pub fn stat_rdev(sb: &[u8]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    let off = 40;
+    #[cfg(target_arch = "aarch64")]
+    let off = 32;
+    u64::from(stat_u32_at(sb, off)) | (u64::from(stat_u32_at(sb, off + 4)) << 32)
+}

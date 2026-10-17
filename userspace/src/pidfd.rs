@@ -253,6 +253,9 @@ impl FileOps for PidFdFile {
     fn ino(&self) -> u64 {
         self.state.ino
     }
+    fn anon_name(&self) -> Option<&'static str> {
+        Some("[pidfd]")
+    }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
         narf_filesystem::InodeAttrs {

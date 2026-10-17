@@ -7618,6 +7618,29 @@ kernel_test_in!(
     smoke_tcp_zero_window_reopens_after_single_byte_read
 );
 
+/// Linux `tcp_may_update_window` treats an advancing ACK as authoritative
+/// even when the peer's SEG.SEQ is older than SND.WL1, while a same-sequence
+/// advertisement may only enlarge the window or close it.  This matters when
+/// ACKs and reverse-direction payload cross in a full-duplex stream.
+fn smoke_tcp_send_window_update_matches_linux() -> TestResult {
+    use crate::tcp::core::may_update_send_window;
+
+    if !may_update_send_window(100, 500, 101, 499, 4096, 1024) {
+        return TestResult::Fail("advancing ACK with older SEG.SEQ did not update send window");
+    }
+    if may_update_send_window(100, 500, 100, 500, 4096, 1024) {
+        return TestResult::Fail("same-SEG.SEQ stale smaller window replaced the current window");
+    }
+    if !may_update_send_window(100, 500, 100, 500, 4096, 8192) {
+        return TestResult::Fail("same-SEG.SEQ larger window was rejected");
+    }
+    if !may_update_send_window(100, 500, 100, 500, 4096, 0) {
+        return TestResult::Fail("same-SEG.SEQ zero window was rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_send_window_update_matches_linux);
+
 fn smoke_tcp_sendbuf_full_slices() -> TestResult {
     use crate::tcp::socket_buf::SendBuf;
     let mut s = SendBuf::new(1024, 0);

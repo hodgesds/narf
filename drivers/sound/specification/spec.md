@@ -44,8 +44,11 @@ teardown emits REMOVE events. Repeated bridge initialization is idempotent.
 `default_params(capture)`, side-effect-free `capabilities(capture)`, and mixer
 `controls/control_info/get_control/set_control`. `PcmCapabilities` describes
 finite format/rate/channel sets, period-frame and period-count bounds, buffer
-byte bounds and period-byte alignment. The default restricts negotiation to
-the backend's default configuration; native backends override it.
+byte bounds, period-byte alignment, and `batch` — set when the pointer moves
+in whole transfer blocks (virtio-snd message completions), which makes
+HW_PARAMS report `SNDRV_PCM_INFO_BATCH | SNDRV_PCM_INFO_BLOCK_TRANSFER` so
+PipeWire keeps an extra period of headroom. The default restricts negotiation
+to the backend's default configuration; native backends override it.
 `PcmHardware: Send + Debug` is an exclusive lease with `configure(HwParams)`,
 `prepare`, `start`, `stop`, `pointer` (cumulative frames), `write`, `read`
 (byte counts), and `drain`. Its Drop must stop DMA or retain its storage.
@@ -120,7 +123,23 @@ element locks, subscriptions and 72-byte coalesced events, plus PCM device
 enumeration/info and power-state queries. Control values and ranges come from
 the backend. An unowned unlock is EINVAL, another file's lock is EPERM, and a
 duplicate lock is EBUSY. Unknown controls return ENOENT. Native controls without
-TLV metadata return ENXIO for TLV requests.
+TLV metadata return ENXIO for TLV requests. A native control whose
+`ControlKind::has_tlv` (the channel map) reports TLV_READ | TLV_CALLBACK and
+answers TLV_READ from `PcmDevice::control_tlv` (`Mixer::control_tlv`), with
+ENOMEM for a short buffer as Linux's callbacks return; its TLV_WRITE and
+TLV_COMMAND are ENXIO.
+
+Native controls live on the interface Linux uses for them: HDMI/DP jacks
+(`HDMI/DP,pcm=N Jack`) on CARD, `ELD` on PCM as a read-only volatile BYTES
+element whose count is the current ELD length (at most 128 bytes),
+`Playback Channel Map` on PCM as eight INTEGER elements in 0..=36
+(`SNDRV_CHMAP_*`, `ControlValue::Integers`), and everything else on MIXER:
+`IEC958 Playback {Con Mask, Pro Mask, Default}` are IEC958 elements whose
+24 status bytes lead the value union (`ControlValue::Iec958`; subcode bytes are
+not carried, the masks are read-only) and `IEC958 Playback Switch` is Boolean.
+Name lookups match the interface. A backend reports values it
+changed on its own (jack sense, ELD) through `control_changed`; byte controls
+notify VALUE|INFO.
 
 ELEM_ADD/REPLACE/REMOVE support Boolean, integer, integer64, enumerated, bytes
 and IEC958 user controls, including multiple indexed elements and nested enum

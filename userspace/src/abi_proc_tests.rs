@@ -3863,8 +3863,7 @@ fn smoke_abi_proc_task_magic_links_are_followable() -> TestResult {
     {
         return TestResult::Fail("stat(/proc/self/root) must succeed");
     }
-    // x86_64 struct stat: st_mode is the u32 at offset 24.
-    let mode = u32::from_ne_bytes([st[24], st[25], st[26], st[27]]);
+    let mode = stat_mode(&st);
     if mode & S_IFMT != S_IFDIR {
         return TestResult::Fail("stat(/proc/self/root) must report S_IFDIR");
     }
@@ -3885,7 +3884,7 @@ fn smoke_abi_proc_task_magic_links_are_followable() -> TestResult {
     {
         return TestResult::Fail("lstat(/proc/self/root) must succeed");
     }
-    let lmode = u32::from_ne_bytes([lst[24], lst[25], lst[26], lst[27]]);
+    let lmode = stat_mode(&lst);
     if lmode & S_IFMT != S_IFLNK {
         return TestResult::Fail("lstat(/proc/self/root) must still report S_IFLNK");
     }

@@ -924,8 +924,7 @@ pub fn dbg_park_census(tag: &str) {
                 // named a socket, a timerfd, or an inotify.
                 // NOT `type_name_of_val(&*e.ops)`: `ops` is a `dyn FileOps`,
                 // and that returns the TRAIT object's name — every fd comes
-                // back "FileOps". (`/proc/<pid>/fd`'s `anon_inode:[…]` link
-                // has the same defect for the same reason.) `stat().file_type`
+                // back "FileOps". `stat().file_type`
                 // is the real discriminator: Socket vs Fifo vs Special is
                 // exactly the distinction a starved poller turns on.
                 // `rdy` = the fd's CURRENT poll_readiness (POLL_* bits). This

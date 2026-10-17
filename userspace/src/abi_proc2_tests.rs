@@ -1225,6 +1225,163 @@ fn smoke_abi_proc2_anon_fd_readlink_nonempty() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_anon_fd_readlink_nonempty);
 
+// Pathless fds readlink to what Linux's pseudo-filesystem d_dname produces:
+// `anon_inode:<name>` for anon_inodefs files, `pipe:[ino]` / `socket:[ino]`
+// for pipefs / sockfs with the inode fstat reports. Every one of these used to
+// read `anon_inode:[FileOps]` (the trait object's name), so lsof / `ss -p`
+// could not tie a socket to its process and an eventfd was indistinguishable
+// from a timerfd.
+fn smoke_abi_proc2_pathless_fd_links_name_the_file() -> TestResult {
+    with_procfs(FAKE_TASK, "fdlinks", &["fdlinks"], 0, |base| {
+        let readlink = |fd: u32| -> Result<alloc::string::String, &'static str> {
+            let link = alloc::format!("{}/{}/fd/{}\0", base, FAKE_TASK, fd);
+            let mut buf = [0u8; 128];
+            match call_readlink(
+                link.as_ptr() as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            ) {
+                Some(n) if n > 0 => {
+                    Ok(alloc::string::String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+                }
+                _ => Err("readlink of /proc/<pid>/fd/<n> failed"),
+            }
+        };
+        let ino = |fd: u32| {
+            crate::fd::with_table(FAKE_TASK, |t| t.get(fd).map(|e| e.ops.ino()))
+                .flatten()
+                .unwrap_or(0)
+        };
+        let fd = |r: Option<i64>, what: &'static str| match r {
+            Some(fd) if fd >= 0 => Ok(fd as u32),
+            _ => Err(what),
+        };
+        let efd = fd(call(Syscall::Eventfd.raw(), a1(0, 0)), "eventfd")?;
+        if readlink(efd)? != "anon_inode:[eventfd]" {
+            return Err("eventfd link should be anon_inode:[eventfd]");
+        }
+        let tfd = fd(
+            call(Syscall::TimerfdCreate.raw(), a1(1, 0)),
+            "timerfd_create",
+        )?;
+        if readlink(tfd)? != "anon_inode:[timerfd]" {
+            return Err("timerfd link should be anon_inode:[timerfd]");
+        }
+        let epfd = fd(call(Syscall::EpollCreate.raw(), a0(0)), "epoll_create1")?;
+        if readlink(epfd)? != "anon_inode:[eventpoll]" {
+            return Err("epoll link should be anon_inode:[eventpoll]");
+        }
+        let mut pipefd = [0i32; 2];
+        if call(Syscall::Pipe2.raw(), a1(pipefd.as_mut_ptr() as u64, 0)) != Some(0) {
+            return Err("pipe2");
+        }
+        let (r, w) = (pipefd[0] as u32, pipefd[1] as u32);
+        let pipe_link = alloc::format!("pipe:[{}]", ino(r));
+        if ino(r) == 0 || readlink(r)? != pipe_link || readlink(w)? != pipe_link {
+            return Err("both pipe ends should link to pipe:[<shared ino>]");
+        }
+        let sfd = fd(call(Syscall::SocketOpen.raw(), a2(1, 1, 0)), "socket")?;
+        if ino(sfd) == 0 || readlink(sfd)? != alloc::format!("socket:[{}]", ino(sfd)) {
+            return Err("socket link should be socket:[<ino>]");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_pathless_fd_links_name_the_file
+);
+
+/// A memfd is an unlinked file on the internal `shm_mnt`, named
+/// `memfd:<name>` (`mm/memfd.c::memfd_alloc_file`), so readlink of its fd
+/// gives `d_path`'s `/memfd:<name> (deleted)`; `memfd_secret` gives
+/// `/secretmem (deleted)`. That text begins with `/` but names nothing, so
+/// the fd-path helpers fexecve and open consult must still report no
+/// reopenable path for it, or exec'ing `/proc/self/fd/N` would look the text
+/// up instead of running the fd's bytes.
+fn smoke_abi_proc2_memfd_fd_link_is_memfd_name_deleted() -> TestResult {
+    with_procfs(FAKE_TASK, "memfdlink", &["memfdlink"], 0, |base| {
+        let readlink = |fd: u32| -> Result<alloc::string::String, &'static str> {
+            let link = alloc::format!("{}/{}/fd/{}\0", base, FAKE_TASK, fd);
+            let mut buf = [0u8; 128];
+            match call_readlink(
+                link.as_ptr() as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            ) {
+                Some(n) if n > 0 => {
+                    Ok(alloc::string::String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+                }
+                _ => Err("readlink of /proc/<pid>/fd/<n> failed"),
+            }
+        };
+        let mfd = match call(
+            Syscall::MemfdCreate.raw(),
+            a1(c"narf-test".as_ptr() as u64, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("memfd_create"),
+        };
+        if readlink(mfd)? != "/memfd:narf-test (deleted)" {
+            return Err("memfd link should be /memfd:<name> (deleted)");
+        }
+        if crate::handlers::fd_path_for_task(FAKE_TASK, mfd).is_some_and(|p| p.starts_with('/')) {
+            return Err("a memfd must not report a reopenable / path to exec and open");
+        }
+        let sfd = match call(Syscall::MemfdSecret.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("memfd_secret"),
+        };
+        if readlink(sfd)? != "/secretmem (deleted)" {
+            return Err("memfd_secret link should be /secretmem (deleted)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_memfd_fd_link_is_memfd_name_deleted
+);
+
+// A descriptor number freed without close(2) — CLOEXEC at exec, close_range,
+// a CLONE_FILES sibling — used to keep its fd→path row, so the next file
+// installed at that number readlinked to the OLD file (a pipe end reading
+// `/dev/null`). Installing a file must start it with no inherited identity.
+fn smoke_abi_proc2_reused_fd_drops_stale_path() -> TestResult {
+    with_procfs(FAKE_TASK, "stalefd", &["stalefd"], 0, |base| {
+        let ev = match call(Syscall::Eventfd.raw(), a1(0, 0)) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("eventfd setup"),
+        };
+        // Free the slot the way exec's CLOEXEC sweep does: the table drops
+        // the file, the side table keeps a row.
+        crate::mqueue::register_fd_path(FAKE_TASK, ev, "/dev/null", None);
+        crate::fd::with_table(FAKE_TASK, |t| t.close(ev));
+        let mut pipefd = [0i32; 2];
+        if call(Syscall::Pipe2.raw(), a1(pipefd.as_mut_ptr() as u64, 0)) != Some(0) {
+            return Err("pipe2");
+        }
+        if pipefd[0] as u32 != ev {
+            return Err("pipe2 did not reuse the lowest free descriptor");
+        }
+        let link = alloc::format!("{}/{}/fd/{}\0", base, FAKE_TASK, ev);
+        let mut buf = [0u8; 64];
+        let n = match call_readlink(
+            link.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        ) {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("readlink of the reused fd failed"),
+        };
+        if !buf[..n].starts_with(b"pipe:[") {
+            return Err("a reused fd must not readlink to the previous file's path");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_reused_fd_drops_stale_path);
+
 fn smoke_abi_proc2_fdinfo_uses_live_fd_metadata() -> TestResult {
     with_procfs(FAKE_TASK, "fdinfoproc", &["fdinfoproc"], 0, |base| {
         let auth = bootstrap_mount_authority();
@@ -3164,6 +3321,47 @@ kernel_test_in!(
     smoke_abi_proc2_maps_file_mmap_reports_provenance
 );
 
+/// `show_map_vma` prints a memfd mapping's `d_path`, `/memfd:<name>
+/// (deleted)`, after its dev and inode — the memfd has no open path.
+fn smoke_abi_proc2_maps_memfd_mmap_names_the_memfd() -> TestResult {
+    with_thread_group(false, |v| {
+        let fd = match call(
+            Syscall::MemfdCreate.raw(),
+            a1(c"narf-maps".as_ptr() as u64, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("memfd_create"),
+        };
+        let result = (|| {
+            if call(Syscall::Ftruncate.raw(), a1(fd, 0x1000)) != Some(0) {
+                return Err("ftruncate of the memfd failed");
+            }
+            let base = maps_map_private(fd, 0x1000, 0)?;
+            set_task(TG_THREAD_TASK);
+            let maps = tg_read(&alloc::format!("{}/self/maps", v.base));
+            set_task(FAKE_TASK);
+            let _ = call(Syscall::Munmap.raw(), a1(base, 0x1000));
+            let prefix = alloc::format!("{:016x}-{:016x} r--p 00000000 ", base, base + 0x1000);
+            let line = maps?
+                .lines()
+                .find(|l| l.starts_with(&prefix))
+                .map(alloc::string::String::from)
+                .ok_or("the memfd mapping is missing from /proc/self/maps")?;
+            if line.ends_with(" /memfd:narf-maps (deleted)") {
+                Ok(())
+            } else {
+                Err("a memfd mapping should be named /memfd:<name> (deleted)")
+            }
+        })();
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_maps_memfd_mmap_names_the_memfd
+);
+
 /// Punching the middle page out of a file mapping leaves two VMAs; Linux's
 /// `__split_vma` advances the tail's `vm_pgoff`, so each half reports the
 /// file offset of its own first byte, with the same dev/inode/pathname.
@@ -3242,17 +3440,12 @@ kernel_test_in!(
     smoke_abi_proc2_maps_anonymous_mmap_has_no_provenance
 );
 
-/// `stat(path)` → `Ok(st_nlink)`. x86_64 `struct stat` has a 64-bit
-/// `st_nlink` third; the generic (aarch64) layout has a 32-bit one after
-/// `st_mode`.
+/// `stat(path)` → `Ok(st_nlink)`.
 fn tg_stat_nlink(path: &str) -> Result<u64, Option<i64>> {
     let p = alloc::format!("{}\0", path);
-    let mut sb = [0u64; 32];
+    let mut sb = [0u8; STAT_SIZE];
     match call_stat(p.as_ptr() as u64, sb.as_mut_ptr() as u64) {
-        #[cfg(target_arch = "x86_64")]
-        Some(0) => Ok(sb[2]),
-        #[cfg(not(target_arch = "x86_64"))]
-        Some(0) => Ok(sb[2] >> 32),
+        Some(0) => Ok(stat_nlink(&sb)),
         other => Err(other),
     }
 }
@@ -3688,7 +3881,7 @@ fn proc_dirfd_survives_chroot_into(target: &[u8]) -> TestResult {
             }
             const S_IFMT: u32 = 0o170000;
             const S_IFDIR: u32 = 0o040000;
-            let mode = u32::from_ne_bytes(st[24..28].try_into().unwrap_or_default());
+            let mode = stat_mode(&st);
             if mode & S_IFMT != S_IFDIR {
                 return Err("the followed fd link did not describe the open directory");
             }

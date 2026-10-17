@@ -2084,3 +2084,77 @@ kernel_test_in!(
     "syscall_abi/socket_errno",
     smoke_abi_socket_errno_bind_connect_precedence
 );
+
+// ──────────────────────── /proc/net socket identity ────────────────────────
+
+/// `/proc/net/{udp,tcp}` rows carry the owning socket's uid and sockfs inode
+/// (Linux `sock_i_uid` / `sock_i_ino`), the same inode `/proc/<pid>/fd/<n>`
+/// names as `socket:[ino]`; `ss -p` and lsof join on it. Every row used to
+/// report 0/0, and user AF_INET datagram sockets were missing from
+/// `/proc/net/udp` entirely. A TCB that outlives its socket reports 0/0.
+fn smoke_abi_socket_proc_net_rows_carry_socket_identity() -> TestResult {
+    with_setup(|| {
+        let task = crate::handlers::current_task_id();
+        let prev = crate::handlers::current_fsuid();
+        // A non-root creator, so the uid column cannot pass by defaulting to 0.
+        crate::handlers::__test_set_fsids(task, 4242, 4242);
+        let result = proc_net_identity_rows(task);
+        crate::handlers::__test_set_fsids(task, prev, prev);
+        result
+    })
+}
+
+fn proc_net_identity_rows(task: u64) -> Result<(), &'static str> {
+    let ino = |fd: u64| {
+        crate::fd::with_table(task, |t| t.get(fd as u32).map(|e| e.ops.ino()))
+            .flatten()
+            .unwrap_or(0)
+    };
+    // Ephemeral ports, and rows matched by inode: a fixed port can still be
+    // held by a socket another test in the suite left open.
+    let udp = open(AF_INET, SOCK_DGRAM, 0)?;
+    if bind(udp, &sin(AF_INET, 0, 0)) != Some(0) {
+        close(udp);
+        return Err("udp bind setup failed");
+    }
+    let udp_ino = ino(udp);
+    let row = crate::socket::udp_snapshot_in(0)
+        .into_iter()
+        .find(|u| u.inode == udp_ino);
+    close(udp);
+    let row = row.ok_or("bound AF_INET datagram socket missing from /proc/net/udp")?;
+    if udp_ino == 0 || row.uid != 4242 || row.local_port == 0 {
+        return Err("/proc/net/udp row must carry the socket's uid, inode and port");
+    }
+
+    let tcp = open(AF_INET, SOCK_STREAM, 0)?;
+    if bind(tcp, &sin(AF_INET, 0, 0)) != Some(0) || listen(tcp) != Some(0) {
+        close(tcp);
+        return Err("tcp bind/listen setup failed");
+    }
+    let tcp_ino = ino(tcp);
+    let found = narf_net::tcp::core::snapshot_in(0)
+        .into_iter()
+        .find_map(|t| {
+            crate::handlers::tcb_socket(t.id)
+                .filter(|(_, inode)| *inode == tcp_ino)
+                .map(|owner| (t.id, owner))
+        });
+    let Some((id, (uid, _))) = found else {
+        close(tcp);
+        return Err("wildcard listener TCB must carry the socket's inode");
+    };
+    if tcp_ino == 0 || uid != 4242 {
+        close(tcp);
+        return Err("/proc/net/tcp row must carry the listener's uid");
+    }
+    close(tcp);
+    if crate::handlers::tcb_socket(id).is_some() {
+        return Err("closing the socket must drop the TCB's socket identity");
+    }
+    Ok(())
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_proc_net_rows_carry_socket_identity
+);

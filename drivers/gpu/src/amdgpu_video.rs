@@ -77,6 +77,7 @@ impl VcnVersion {
             // Vega has no VCN — it carries the older VCE / UVD
             // blocks; this scaffold doesn't cover them.
             Family::Vega => None,
+            Family::Navi4 => None, // VCN5 requires its own queue/firmware owner.
             Family::Navi1 => Some(VcnVersion::V2_0),
         }
     }

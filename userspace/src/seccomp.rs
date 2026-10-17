@@ -808,6 +808,9 @@ impl FileOps for UserNotifListener {
     fn ino(&self) -> u64 {
         narf_filesystem::inode_id::anon_inode().ino
     }
+    fn anon_name(&self) -> Option<&'static str> {
+        Some("seccomp notify")
+    }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
         narf_filesystem::inode_id::anon_inode().attrs()

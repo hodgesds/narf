@@ -57,7 +57,7 @@ An unmodified alsa-lib probe exercises HDA/VirtIO playback and HDA capture
 through those syscalls, including linked pause, boundary-mode playback and
 user controls with TLV/events. The implemented ALSA contract is listed in
 [sound §3.1](drivers/sound/specification/spec.md#31-linux-alsa-pcm-and-control-abi).
-SoundWire, HDMI/DP audio, vendor smart-amplifier quirks and system power-transition
+SoundWire, vendor smart-amplifier quirks and system power-transition
 reinitialization remain open. See
 [audio's implemented contract](audio/specification/spec.md).
 
@@ -268,6 +268,573 @@ interfaces and limits.
 
 ## Current work
 
+The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
+leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
+`1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
+separate physical/CPU-visible VRAM accounting and SMUIO14 ROM access. Legacy
+APU/engine/display paths refuse this generation before touching hardware.
+
+Implemented: GDDR6 training; PSP14 SOS/GPCOM/TMR; mandatory graphics/media
+firmware parsing, upload and autoload; GC12 RS64 counter programming and pipe
+reset with inherited-queue exclusion; SMU14 board-table transfer and initial
+GFX/thermal policy; GC12 harvested CU/SA/RB inventory and device-query reporting;
+GMC12/MMHUB4.1 owned VMID0 translations; SDMA7 translated
+VRAM write/copy/fence verification; and DCN4 DMUB shared state, authenticated
+window validation, startup and version/capability/HPD/AUX mailbox support.
+GC12 setup now retains the native RLC clear-state image, applies ASIC-revision
+golden settings, configures VMID0 shader/context controls and starts RS64
+processors with inactive-queue checks and bounded idle confirmation.
+DCN4 board routing reads ATOM v1.4/v1.5, preserves distinct AUX/HPD/transmitter
+identities and bounds the four channels using DCN4 backend register geometry.
+The retained owner supports native DP/eDP DPCD/extended-capability and complete
+segmented EDID discovery, including bounded DEFER retries, per-port errors and
+cancellation quarantine. HDMI now reads complete segmented EDID through DCN4's
+native I2C arbitrator/FIFO with board-resolved DDC pins, 100 kHz clock setup,
+fresh completion checks and bounded waits. Terminal sink errors restore pins
+and release ownership; uncertain failure/cancellation blocks reuse and raw AUX.
+Native link/scanout programming remains open.
+The retained DCN4 clock owner now validates its separate DAL mailbox, queries
+native clock ranges and applies checked DISP/DPP/DTB floors with both mailbox
+and per-clock completion acknowledgements. It pins DCF/UCLK conservatively,
+disables UCLK switching, preserves thermal protection and rejects every live
+legacy/HPO/FRL display consumer before changing DPM, including timing generators
+whose disable request is not yet acknowledged. Partial transitions and
+cancellation retain state without replay. Platform clock preparation is
+serialized after the kernel engine proofs. Native DCCG now prepares all four
+DPP dividers, DPREF-derived DP pixel DTOs, DTB-derived FRL DTOs, and TMDS
+dividers with the bounded DENTIST FIFO workaround. Matching global clocks,
+retired consumers and readback are required; partial failures retain ownership
+and block global-clock changes. Native HPO DP/FRL stream-clock routing now
+requires matching current pipe clocks and divider readback, preserving each
+DTO's reference. Reprogramming a pipe first parks all actual routes feeding
+from it, including inherited routes. Native OTG now prepares disabled fixed
+progressive RGB timing on all four pipes, with matching live pipe clocks,
+clock-on acknowledgements, native HPO routing, odd-timing divider handling and
+PSTATE/global-sync fields. Timing retirement disconnects ODM and requires both
+current-master and busy acknowledgements. Partial/cancelled transitions retain
+ownership and block clock changes; timing retirement never releases scanout
+memory. The retained timing owner also stages native OPP full-range RGB
+formatting at 8/10/12 bpc and a black DPG pattern, clears inherited color offsets,
+and requires OPP clock acknowledgement. It records pending double-buffer state
+without claiming active blanking while timing is disabled. An explicit internal
+black-timing start now requires positive stopped-fetcher witnesses on every
+HUBP and live clock/timing/formatter readback. Native VTG-before-OTG sequencing
+waits for current-master acknowledgement, blank-buffer latching and a fresh
+frame-counter transition under one bounded deadline. Running timing blocks
+clock changes until acknowledged retirement; failure/cancellation quarantine
+the owner and retain every scanout allocation. TMDS still needs a native PHY
+PLL proof. Native inherited-plane retirement now disconnects all MPC routes,
+waits for MPCC/HUBP drain, blanks powered planes and disables their fetch clocks.
+Already-off HUBPs require native PGFSM acknowledgement and remain untouched.
+Blank startup accepts native TTU behavior and checks the independent 3D-LUT
+fetcher. Pending flips, synchronization, metadata/LUT loads and uncertain power
+states block retirement before writes; failure/cancellation retain resources.
+Native HUBP DOMAIN0–3 power transitions now require a fully stopped, detached
+display tree. The retained owner brackets each gate request with DC IP request
+ownership and waits for PGFSM acknowledgement before touching a powered-on
+HUBP. It initializes that HUBP to blank/drained readiness with its fetch clock
+disabled; power-off requires fresh drain evidence. Pending fetch transactions,
+uncertain power, lost writes and cancellation block reuse. All backing memory
+stays retained. Surface/VM/bandwidth preparation and framebuffer scanout remain
+open; these power transitions still require validation on the physical card.
+Native DCN4 surface staging now allocates and retains linear XRGB/XBGR8888
+framebuffers, clears row/page padding cooperatively, and programs native pitch,
+format, crossbar and viewport fields. Address publication follows an HDP flush
+and writes the high address before the low flip trigger. Fetch stays blank and
+drained; a pending flip is not reported as completed scanout. Bounded row uploads
+check live configuration and flush CPU writes. Partial failures retain published
+backing and block reuse.
+Native DCN4 memory preparation now binds framebuffer base/top/offset and VMID0
+to the retained GMC owner, checking both memory hubs before and after setup.
+It uses the owned physical VRAM page-table root, disables AGP, waits for native
+context readiness, and configures the selected blank HUBP's system aperture
+and L1 translation. All scanout backing stays owned; lost writes, revocation,
+timeouts, changed geometry and cancellation cannot report readiness. Fetch
+remains stopped.
+Native DCN4 DPP preparation now stages unscaled full-frame RGB conversion,
+identity color processing and the unity-scaling line buffer against retained
+surface, VM, clock and timing owners. Scaler/iSHARP memory wake waits are bounded;
+pending double-buffer updates are recorded without claiming a latch. DPP clock
+and HUBP fetch remain disabled and MPC stays detached. Lost writes, revoked
+authority, stale configuration and cancellation quarantine the owner. Native
+bandwidth/deadline/watermark programming, MPC route activation, visible framebuffer
+activation and physical-card validation remain open.
+Native opaque RGB MPC preparation now binds to the retained surface/DPP/VM and
+timing owners, selects global opaque alpha and unity gains, bypasses inherited
+output and movable color transforms, and matches the OPP output depth. Current
+color selectors are recorded without claiming they latched; routes stay detached.
+Native requestor preparation stages bounded physical-RGB fetch geometry and
+partitions the 21-segment display return buffer into the native 320-KiB DET
+default plus 1-MiB compbuf. Shrinks acknowledge CURRENT before any growth;
+timeouts, cancellation, stale owners and lost writes retain every allocation
+and quarantine the owner. All four pipes use native DCN4 request fields,
+8-KiB chunks, no MALL, and disabled fetch after setup. This establishes storage
+and request geometry; DLG/TTU/watermarks and visible scanout are still pending.
+Native single-pipe scanout admission ports Linux DML21's DCN4 mode-support
+and mode-programming path to fixed point for the implemented shape (one DP SST
+timing, one full-frame linear 32-bpp surface, 320-KiB DET, UCLK switching
+disabled, Linux's stutter blank reservation kept). It derives DISPCLK/DPPCLK
+minimums, global sync, HUBP DLG/TTU values, watermarks and arbiter values, or
+names the failing check. A host harness builds Linux DML21 and verifies 126
+shared vectors, which kernel tests also check; three deliberate divergences
+reject modes Linux would program beyond hardware limits. Plans are not yet
+bound to live owners or programmed, and board inputs are not yet read from PMFW.
+Admission inputs now come from the live board: PMFW UMC channel count and
+DC-mode clock caps (which also cap the pinned floors), the DENTIST VCO, and the
+DCHUB reference from the global timer and VBIOS crystal. Deadline preparation
+re-admits a plan, binds it to the current timing, sync, signal, surface, DET,
+clocks and reference, then programs and reads back HUBP DLG/TTU fields, both
+DCHUBBUB watermark sets and arbiter state with fetch stopped. Self-refresh is
+force-disallowed; UCLK switching stays disabled in PMFW. Route connection,
+fetch enable and visible activation remain open.
+Native single-pipe scanout start/stop now runs on the black DP SST stream:
+under one OTG master-update lock it releases the DPG, connects the MPCC route,
+re-arms the address and unblanks the HUBP, then requires EARLIEST_INUSE to
+report the owned surface, cleared pending bits and two fresh frames without
+underflow. Stop returns to black, detaches, waits for MPCC idle and drained
+requests before blanking and gating clocks, and re-verifies the staged pipe so
+it can restart. A read-only health check recognises exactly the owned live
+fetch while every other HUBP stays stopped; underflow is recorded and returns
+the pipe to black through the same drain, or quarantines it if that cannot be
+proven. These paths are model-tested only; no sink has shown the image.
+`ColdBoot::modeset_display` now chains EDID/DPCD sink selection, admission,
+clocks, surface fill and every preparation through DP training to visible
+scanout, with `stop_modeset` reversing it. Only the selection is model-tested;
+the chain itself still needs a board, and inherited GOP retirement is separate.
+A successful platform modeset publishes the live surface as the external
+scanout; the console adopts it and flushes CPU writes through HDP via a
+published, non-blocking hook. Stop withdraws it before any teardown.
+Live pipes can now flip between two owned buffers: the back address is
+written under the OTG lock and the flip completes only when EARLIEST_INUSE
+reports it, after which every retained report moves to the new front.
+`amdgpu.native_display` opts the boot handoff into retiring the GOP's DP SST
+output and running the native modeset; it is off by default because no board
+has validated it.
+Adopting an external scanout (DCN314 or Navi48), or restoring the boot
+framebuffer, now installs a kernel mapping of the published physical range
+instead of dereferencing the physical address.
+DRM clients' presented frames now reach an adopted Navi48/DCN314 scanout
+through that mapping (CPU copy, then the published HDP flush).
+A native 64x64 premultiplied ARGB hardware cursor can be shown and moved on a
+live Navi48 pipe, programmed under the cursor VUPDATE lock as Linux does.
+The fb pointer (console and compositor) uses it on an adopted Navi48 scanout
+instead of compositing a sprite.
+DP link training now falls back: a cleanly refused link is stopped (sink D3,
+PHY off), and the modeset retries lower rates, then fewer lanes.
+A running Navi48 modeset can now be checked. HPD comes from the debounced
+DCN401 HPD block, and lane lock is read from the sink. A lost link retrains,
+and an unplugged sink is torn down without AUX to it. With the opt-in native
+display, a 1 s monitor retrains, tears down and relights on replug.
+CPU scanout leases now let withdrawal
+wait for fb drawing, cursor/status access and DRM fallback copies. Publication
+and the writer drain stay under the display owner lock across flips, preventing
+reuse of the former front while a CPU view remains. IRQ delivery stays enabled
+during drawing, with preemption pinned until the CPU memory fence and lease
+release. Cancellation retains pending epochs. After successful teardown, the
+monitor now releases the pipe's current and parked front/back/cursor buffers
+through `release_display_surfaces`: fresh fetch/route/power/transaction checks,
+HDP/PCIe drain, a second check and dependent-report invalidation precede reuse.
+Other displays remain owned; failures retain reservations. Replug allocates
+fresh buffers without accumulating geometry-specific VRAM. Low-level callers
+can still retain buffers until explicit release, and link retraining keeps its
+surfaces. Reclamation is model-tested; physical transitions remain unvalidated.
+Teardown now checkpoints completed native steps in the retained owner, allowing
+the same modeset to resume a preflight rejection without replaying prior audio,
+scanout or link work. Intent is recorded before CPU withdrawal; the monitor
+finishes interrupted retirement before reactivation and publishes the CRTC
+inactive meanwhile. Cancelled CPU drains can resume, but cancellation inside
+a native phase blocks replay even when that phase spans several owners.
+Native failure guards still block uncertain operations; arbitrary partial
+activation and physical recovery validation remain open. Per-pipe startup now
+records an unpublished activation before staging. A returned failure attempts
+timing/DSC/plane retirement and fresh surface release when native owners prove
+the output stopped; completed cleanup steps survive preflight rejection.
+Pending cleanup blocks relighting/preferred-mode fallback and is retried before
+monitor topology work. TMDS, legacy DP SST/MST, UHBR and FRL startup now checkpoint
+completed link/frontend/video/scanout phases, so a later preflight rejection
+unwinds the completed work before timing/plane retirement and fresh release.
+This includes audio rejection after live fetch and scanout underflow recovered
+to black video. MST also checkpoints payload completion before video, retaining
+shared-link ownership until payload/frontend cleanup completes. A separate MST
+payload-transaction marker survives failure/cancellation before or after list
+updates; it blocks replay, teardown and session loss while ownership is uncertain.
+TMDS records sink cleanup before the first SCDC transaction, so a returned
+failure before native-link completion restores legacy sink configuration and
+retires staging without inventing a link owner. Timing retirement also resets
+the UHBR/FRL output mux to DIO only after master/busy clear, with readback before
+retirement is published. Native failure guards remain binding; cancelled startup,
+uncertain MST payload transactions, uncheckpointed active work and
+shared-clock recovery remain open, with uncertain memory retained.
+The device owner now also retains every completed Modeset through later-pipe
+startup, asynchronous platform adoption and failed/cancelled teardown. A dropped
+configuration or exited monitor cannot lose those live stream handles. The next
+monitor pass restores missing handles and schedules normal withdrawal/retirement,
+rejecting conflicting incarnations before changing caller records. New
+configurations remain blocked until these streams stop. Native cancellation
+quarantine and fresh surface-release checks remain binding.
+Live FRL monitoring now handles SCDC FRL_Start, FLT_Update and Source_Test_Update
+at a 200 ms fallback cadence. Source-test patterns/FFE updates preserve owned
+video/fetch; interrupted firmware work quarantines the display. Ordinary
+retrain requests stay pending until full configuration retirement and fresh
+admission/training, including supported rate fallback. Physical FRL transitions
+and source-test acceptance remain unvalidated. Native FRL now also supports
+YCbCr 4:2:0 at sink-declared 8/10/12-bpc depths, with format-aware capacity and
+training fallback, half-width encoder counts, AVI colorimetry and shared OPP/MPC
+subsampling/BT.709 conversion. The pixel DTO keeps the full pixel rate; live
+format checks reject stale compression or encoding state. Y420VDB modes stay
+4:2:0, and Y420CMDB modes use RGB when it fits. The single-OPP 4096-pixel limit
+remains; FRL DSC and physical transitions are still open.
+FRL now carries LPCM through AFMT4, lane-rate ACR and the pipe's Azalia endpoint.
+Admission/training reserve the sink's supported LPCM bandwidth; SD timings use
+layout 0. Audio starts after scanout and stops before it, preserving the
+video-owned InfoFrame. Fresh register checks and retained owners prevent reuse
+after partial failures. Shared audio DTO selection includes FRL on DPREFCLK.
+Register/protocol tests cover all six rates, RGB/4:2:0 depths, bandwidth limits,
+clock sharing and failed teardown; audible output remains unverified.
+HDCP/protected output is tracked separately in
+`drivers/gpu/research/navi48-protected-output.md`, including TA firmware,
+protocol, credential authorization, isolation and physical acceptance gates.
+It remains unsupported and unadvertised; existing crypto helpers and retirement
+exclusions do not implement protected scanout.
+The board/monitor acceptance ledger is
+`drivers/gpu/research/navi48-display-acceptance.md`. It separates software models
+from physical boot/hotplug/modeset/disable evidence. No board routes or physical
+passes have been supplied; eDP/USB-C applicability remains undetermined.
+Physical DP/HDMI connectors now retain EDIDs and independently admitted modes
+while disabled or unadmitted. Link selection and full joint DML bound these
+lists, including fitting alternatives to an unsupported preferred mode. Empty
+configurations query board limits without active floors or stream allocation.
+KMS publishes dark sinks without a CRTC mode, invalidates replacement EDIDs and
+reprobes disabled ports on HPD rise. This still uses whole-configuration relights.
+The lit Navi48 display is published as DRM KMS state on the amdgpu card, with
+the sink's real EDID and exact timing (disconnected on unplug). SETCRTC
+accepts only that timing, and the base amdgpu DRM version 3.0.0 claims no
+render ABI. Flip events remain software-paced.
+Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
+acknowledgement before resetting or disabling FIFOs. It handles inherited
+disable-in-progress state, keeps timing and link clocks available for PHY
+retirement, and quarantines the owner on timeout, failure or cancellation.
+Native DP frontend retirement now shuts down blank DIO/HPO encoders and waits
+for their clock-off witnesses. DIO retirement checks real backend routes,
+requires connected backends stopped and removes only the selected frontend
+bits; unrelated live outputs stay untouched. Clock programming now rejects
+enabled frontends/FIFOs and outstanding frontend/stream clocks even when video
+is blank. Active packet/metadata work blocks retirement, and partial failures
+or cancellation retain all resources. Direct external legacy DP SST now has a
+board-routed DMUB v1.7 transmitter-disable path. It preserves the frontend until
+firmware clears backend enable and clock-on witnesses, then clears training and
+panel state. Invalid routes, active packet/FEC work and independent HPO/FRL links
+reject before commands. Failure/cancellation retain display and transport
+ownership and block reuse; backend clocks independently block clock programming.
+This proves digital backend-off, not analog PHY power gating. Native HPO digital
+link retirement now resolves the board PHY mux, independent stream mappings and
+root-clock source, requires all mapped streams stopped, drains all six timeslot
+rows with ACT and waits for DPHY and link-clock shutdown acknowledgements.
+Ambiguous routes, active work and unsupported modes reject before writes;
+partial failures and cancellation quarantine the owner. A separate direct HPO
+DP PHY shutdown now sends native DMUB v1.7 DISABLE with explicit SST/MST signal,
+requires all four lanes disabled with data/clock/handshake activity clear and
+TX-clock-off readback, then parks only the selected root-clock route. Shared
+PHY/root routes and live digital work reject before commands. Failure or
+cancellation retains ownership; lane/TX activity independently blocks global
+and pipe clock changes. These checks still require silicon validation and do
+not prove analog power gating. Native TMDS HDMI frontend retirement now clears
+all 15 generic packet schedules, acknowledges their buffered updates, resets
+stream attributes and stops the FIFO/frontend with DISPCLK/SYMCLK/TMDS clock-off
+witnesses before disconnecting selected routes. Live audio/metadata, ambiguous
+routing and pending transactions reject before writes; failures and cancellation
+quarantine the owner. Backend/PHY/OTG clocks stay retained for the TMDS timing
+symclk dependency. A separate TMDS timing-retirement operation now requires
+all frontends detached, validates stable TMDS backend/PHY state, stops one OTG,
+clears latched underflow and acknowledges its OTG/input clocks off. It preserves
+other timing generators and every PHY; fresh consumer checks remain mandatory
+before transmitter shutdown. Failure/cancellation retain and quarantine the owner.
+Direct external TMDS transmitter shutdown now checks all timing and frontend
+consumers stopped, parks only frontend symclk routes using the selected PHY,
+and sends the native HDMI DMUB DISABLE command. Independent hardware witnesses
+must acknowledge backend, all four lanes and TX clocks stopped; mailbox
+consumption alone cannot complete shutdown. Already-disabled backends require
+complete off readback without replay. Other outputs stay retained, late route
+or consumer changes fail, and failure/cancellation block owner reuse. This
+proves digital/lane/clock shutdown, not analog power gating or memory retirement.
+Native TMDS HDMI startup now exists for one 8-bpc RGB stream up to 340 MHz:
+DMUB SET_PIXEL_CLOCK for the transmitter's PHY PLL, link-encoder setup, the
+DIGX stream setup and HDMI stream attributes, frontend routing and FIFO, then
+the DMUB transmitter ENABLE with lane, TX-clock and clock-on witnesses. Black
+video starts and stops with AVMUTE handling, scanout runs on HDMI video, and the
+link stops back to a reusable owner. The AVI InfoFrame (Linux's RGB fields,
+VIC 0) is sent as VPG generic packet 0. Modeset now lights an HDMI sink (HDMI
+VSDB required, at most 340 MHz) when no DP sink answers, with HPD polling,
+unplug teardown, replug and an HDMI-A KMS connector. Sink selection also parsed
+the whole multi-block EDID as one base block, so a monitor with any extension
+(nearly all) was never selected; it now parses the base block. HDMI 2.0
+modes above 340 MHz (e.g. 4K60) now run scrambled when the EDID declares SCDC
+and a covering HF rate: native DDC gained SCDC register reads/writes, the sink
+is configured before the link starts and returned to legacy on stop. HDMI deep
+colour (10/12 bpc RGB, opt-in with `amdgpu.max_bpc`) scales the TMDS character
+clock as Linux does. HDMI audio's display half (audio DTO, ACR, AFMT channel
+status, Azalia endpoint/ELD, Audio InfoFrame) is programmed after scanout for
+sinks declaring audio. The native HD-Audio runtime now binds Linux's ATI
+HDMI NS controller IDs (through 0xab40) with snooping off: CORB, RIRB, BDL
+and sample rings get explicit cache maintenance. The ATI HDMI codec
+(0x1002aa01) is driven like Linux's atihdmi for LPCM up to 7.1: zero downmix,
+per-channel remap (rev3+), the CEA channel allocation for the sink's speakers,
+channel count, slot map and allocation (which feeds the hardware Audio
+InfoFrame), ramp rate, HBR off and converter DIGEN. The codec's ELD is
+rebuilt as Linux's get_eld_ati does and exposed as the `ELD` control with an
+`HDMI/DP,pcm=0 Jack`; pin sense is polled, playback routes to the ports with
+a valid ELD and is limited to their channels/sample sizes/shared rates
+(44.1–192 kHz), and a port that gains a sink mid-stream is set up again.
+Linux's IEC958 Playback Con/Pro Mask, Default and Switch controls and the
+`Playback Channel Map` control (with its CHMAP TLV) are exposed: the AES0
+non-audio bit makes the next prepare IEC 61937 passthrough (stream-order
+slots, no ramp, HBR for 8-channel non-PCM, TYPE bit in converter and SDnFMT),
+and user channel maps choose the CA and slot map under hdmi_chmap_ctl_put's
+state rules (pairwise validation before codec rev3).
+Legacy DP SST LPCM now shares the DIO stream with DSC PPS. Startup and live
+checks require fresh PPS/clock/master witnesses, and audio stop preserves those
+video-owned resources while disabling audio packets and the endpoint. Modeset
+keeps DSC sink audio capabilities and uses normal audio-first teardown/retrain.
+UHBR SST now carries LPCM through the HPO stream's APG and Azalia endpoint.
+LPCM rate filtering uses Linux's fixed-point blanking budget with the native
+programmed minimum width; selection and training fallback keep only supported
+rates. Reset assertion/deassertion use bounded async waits, retain cancelled
+owners, and recheck transport/audio before APG enable. Audio-first teardown and
+retrain preserve video ownership; shared DTO and endpoint checks include UHBR.
+Models cover all stream instances, rates and lane counts, reset timeout/cancel,
+partial writes, late drift, clock sharing and shutdown; 1701 arithmetic vectors
+match the Linux routines under that native-width contract.
+Legacy MST now carries LPCM through each stream's DIO AFMT and DP endpoint.
+Remote EDID rates are filtered by Linux's blanking budget (2268 reference
+vectors); startup requires a completed manager payload and fresh SAT/VC and
+transport witnesses. Partial writes and failed shutdown retain audio/payload
+ownership. Models cover independent routes, all RGB depths, stale allocations,
+endpoint collisions, shared DTO and two-stream link-owner handover. Teardown
+stops audio before scanout/video and payload removal.
+Every native endpoint (TMDS, FRL, legacy/UHBR DP SST, legacy/UHBR MST) advertises
+the sink's valid compressed SADs and HBR from Linux's 8-channel 192-kHz
+bandwidth probe; FRL reserves the highest SAD rate/channels like
+get_audio_check. UHBR MST LPCM uses the stream's HPO APG and, as Linux
+does, the 128b/132b SST budget (whole link, timing blank), started only on a
+completed manager payload whose SAT row stays a witness; physical
+audio is untested. FRL LPCM and HDMI 4:2:0 have model coverage
+as described above. None of it has run on hardware.
+Native FRL frontend retirement now drains all generic packet schedules through
+the actual HDMI/VUPDATE buffer status, disables FIFO then tribyte encoding and
+requires all three stream clocks off. Native DME4, immediate packets, audio/ACR,
+reset state and input/clock routes are checked before writes and across waits.
+Already-retired streams stay untouched; failures and cancellation quarantine
+ownership. Link/PHY/timing, general-control configuration and independent
+AFMT/VPG owners remain retained. Shared clock guards now include FRL clock-on
+and reset state plus digital-link enable/reset/clock activity.
+Native FRL digital-link retirement now resolves the unique board PHY route,
+requires a stopped frontend and matching character/forced-clock routes, selects
+zero training patterns and disables the link with acknowledged clock-off before
+restoring compression. Partial inherited shutdown, shared routing and late
+producer/configuration changes reject; failure/cancellation quarantine ownership.
+PHY output, root clocks, timing and unrelated outputs stay retained. The FRL
+character-clock root independently blocks shared clock changes after link stop.
+Direct external FRL PHY shutdown now uses the native firmware FRL mode and
+requires all four lane-disable and TX-clock-off witnesses before parking the
+character-clock root. Shared PHY clock consumers, unacknowledged DTOs, TMDS
+timing and pending transitions reject before commands. Live DTB/DPREF timing,
+forced input clocks and other outputs remain retained. Already-stopped PHYs
+skip firmware replay; late changes, failure and cancellation quarantine the
+owner. This proves lane/clock shutdown, not analog power gating or memory reuse.
+Direct external legacy DP SST now has a native untrained PHY enable operation
+with 1/2/4 lanes at RBR through HBR3, after matching applied display clocks.
+Native backend setup and board HPD/mux routing precede firmware ENABLE.
+Independent physical lane, TX-clock and backend-clock witnesses are required;
+lane reversal is supported and unused lanes must remain disabled. A matching
+shutdown operation verifies this owner's unchanged untrained PHY and waits for
+backend/lane/clock stop before cleanup. Active consumers, stale routes and
+incomplete hardware transitions reject; cancellation/failure retain ownership
+and block replay. Model tests cover routes, rates, lane mappings and failures.
+Native direct DP SST training now requests and verifies sink D0, reads live
+base/extended capabilities and drives source TPS1/TPS2/3/4 plus matching sink
+training over the board AUX channel. Firmware applies uniform clamped voltage/
+pre-emphasis requests; bounded CR/EQ loops require every active lane and interlane
+alignment. Source/PHY checks and fresh sink configuration/power/link status after
+5 ms of native idle prevent stale completion. Matching trained-link shutdown
+acknowledges sink D3 before PHY retirement. Cancellation/failure retain ownership
+and block replay; known CR/EQ failures exit training when transport remains sound.
+Model tests cover routing, patterns, rates, lane counts, adjustment/retry limits,
+every await cancellation, lost writes and late changes. No native scanout or
+silicon validation is claimed. Automatic rate/lane fallback, LTTPRs, MST/FEC,
+fixed-drive retimers and board-specific SSC control remain open.
+Native blank legacy DP frontend setup now uses independent OTG/frontend/PHY
+routes, RGB MSA attributes at 8/10/12 bpc, DPREF-derived pixel packing and native
+frontend/FIFO reset acknowledgements. It checks retained live clock references,
+source/OPP state and fresh sink lock before reporting readiness. Matching
+frontend shutdown waits for clocks off before detaching routes and returning
+to the trained link; cancellation/failure retain ownership and block replay.
+The native frontend payload guard now accounts for DSC's compressed bits per
+pixel and slice overhead instead of rejecting it as uncompressed RGB. Actual
+trained rate/lanes and FEC's capacity reduction bound both kinds of stream;
+DSC requires the supported 8-bpc RGB SST/FEC path. A native regression exercises
+DSC fitting one RBR lane when RGB does not, including the FEC capacity boundary.
+Legacy DSC training can now fall back among rate/lane settings that carry its
+unchanged admitted PPS and bpp. Alternative DP modes carry DSC into joint DML
+with real board limits and must fit the trained link after fallback. Retraining
+refreshes retained and published mode lists beside current siblings and drops
+invalid queued requests. When no link carrying the staged PPS trains, the
+port's link is verified like Linux's dp_verify_link_cap and the configuration
+is selected and admitted again against it, so DSC bpp/slices are recomputed
+for the reduced link. A refused link-loss retrain is journaled and retired
+through ordinary teardown, then relit against the verified link (model-tested).
+Native legacy DP black video now starts the matching staged OTG/OPP pattern,
+requires fresh frame progress, seeds M/N and follows steering/video/resync FIFO
+startup with native priming delays and independent acknowledgements. Fresh sink
+lock, source/route/clock checks and subsequent frame progress precede completion.
+All memory fetchers stay stopped. Matching shutdown waits for video-off before
+steering reset and native timing retirement, then returns to the prepared
+frontend for restart or link shutdown. Failure/cancellation quarantine the
+owner and retain resources. Model coverage includes all independent routes,
+lost acknowledgements, stalled frames, late changes and every async phase.
+Physical output remains unvalidated; native surface scanout remains open.
+eDP, remaining sink/MST/audio teardown and USB-C/ACPI PHY interlocks still need
+their sequences. Remaining PHY/link and plane programming, surface scanout
+enable, active-stream transitions, bandwidth/watermarks and complete native
+modesetting remain open. Implemented paths have model tests, not silicon validation.
+MES12 now has separate eight-byte-aligned command and MQD builders, kernel queue
+map/unmap packets and two-fence completion/error decoding, checked against Linux
+C layouts. Its retained unified-firmware owner starts both pipes, configures
+PCIe BAR2 doorbells, maps the scheduler through KIQ and verifies native command
+completion plus full ring drain. The boot sequence includes this firmware-queue
+handshake; it grants no application queues or user VMIDs yet. Native kernel
+graphics and compute MQDs now map through the scheduler and execute bounded
+WRITE_DATA proofs into the two owned translated VRAM pages, requiring confirmed
+fences, complete 32-bit RPTR drain and all expected data words. Cancellation
+and failure retain all published queue memory and prevent replay.
+Native OSSSYS7 interrupt rings now retain their own VRAM, reject inherited
+writers before training, and initialize after GMC. Bounded fair draining
+decodes full SOC21 vectors, handles wraparound and detects overflow before
+acknowledging entries; errors quarantine backing and stop owned writers when
+authority permits. The final boot handoff now transfers IH to an independent
+async service, so display work cannot block draining. A checked x86 MSI route
+uses the actual APIC ID, enables delivery after handler/config readback, and
+retains uncertain routes/vectors. The service snapshots IRQ counts before
+draining and uses a watchdog; unsupported routing uses timer-driven polling.
+ARM hardware MSI awaits real ITS ITT backing. Bounded diagnostic history records
+evictions and sticky VM-fault data; it does not complete user fences.
+An executor task now follows boot with native graphics/compute RELEASE_MEM
+proofs, requiring a fresh fence, full RPTR drain and exactly one matching
+kernel-context EOP vector per queue. Configured MSI additionally requires CPU
+delivery for each proof; polling is reported separately. Faults, cancellation
+and missing evidence leave retained diagnostic state and prevent replay.
+This path has software models; physical MSI delivery remains unverified.
+After both GC12 proofs drain, the same executor task now verifies SDMA0's native
+fence/TRAP path. It requires fresh fence memory, matching hardware/writeback
+RPTRs, exactly one kernel SDMA0/queue0 trap and CPU delivery for configured MSI.
+The service owns SDMA trap enables and masks them after recognized faults;
+raw-history eviction cannot erase the completion count. Diagnostics retain
+the separate SDMA interrupt result, including failure/cancellation state.
+Negative models cover missing evidence, wrong contexts, revoked authority and
+cancelled submissions; this adds no application submission or recovery API.
+The independent service now arms native VMID0 protection faults in both hubs
+and the owned graphics/compute command exception sources. It decodes VM fault
+addresses and queue identities, snapshots hub status before acknowledgement,
+and masks owned sources after a fault. Typed diagnostics survive raw-history
+eviction, and VM or command faults prevent the EOP proof from succeeding.
+Setup/MMIO/revocation failures retain uncertain owners and mask CPU delivery
+where possible. No fault replay, automatic reset or allocation reuse is implied.
+A typed SOC21 decoder now covers every GC12 completion, fault and poison
+source, DCN401 display events, VCN5 media and SMU sources. A dispatch table
+wakes registered owners (CP slot, SDMA queue or user doorbell, with VMID/PASID
+and a generation) so they re-check their own fences; a 100 ms watchdog bounds
+lost interrupts and is counted separately. Faults go to the owning queue or
+context, `recover` starts a new generation after the owner resets its queue,
+and poison or service failure (including device removal) releases every
+waiter with a terminal error. Kernel queues are registered; there are no
+application owners yet. Model-tested only.
+IH ring0 overflow is now recovered as Linux does (resume after WPTR, pulse
+the overflow clear). A batch racing an overflow is discarded, all owners are
+woken to re-check their fences, and both VM fault latches are swept so a
+fault whose vector was overwritten is still captured and attributed.
+Overflow storms and ring1 overflow still fail closed.
+The interrupt worker now counts MSI, empty-MSI, watchdog, watchdog-with-work
+and polled drains separately, the evidence a physical MSI test needs. DCN401
+hot-plug, flip, VUPDATE, vblank, VLINE and DMUB vectors are counted per
+instance for the display owner, and the native display monitor now waits on
+hot-plug vectors with its 1 s poll as fallback; it arms each lightable
+port's DCN HPD (and DP HPD-RX) interrupt and acknowledges raised ones like
+Linux's hpd0_ack.
+The retained SMU14 owner now reads PMFW telemetry (Linux's SMU14.0.2 metrics
+table: edge/hotspot/memory/VR temperatures, fan RPM/PWM, socket/board power,
+VDDGFX, current clocks, activity and throttler status), the running feature
+mask and PPT limit, and decodes board thermal/fan/power limits. Throttlers,
+firmware CTF and fan control stay PMFW-owned; protection loss is detectable.
+GFXCLK performance levels use PMFW soft limits only, leaving display clocks
+pinned. Deep sleep has an SMU-side, disabled-by-default hook: memory/fabric
+low power still needs display admission/watermark recalculation first.
+After boot, a 1 s monitor publishes this as a Linux-shaped `amdgpu` hwmon
+device (temperatures with critical/emergency limits, read-only automatic fan
+PWM/RPM, VDDGFX, power and PPT cap, sclk/mclk) and logs throttling, lost
+protection and software-shutdown temperatures. Narf reports, not powers off.
+Model-tested only; nothing here has run on an RX 9070 XT.
+The boot coordinator retains all hardware owners through failures and
+cancellation. The final framebuffer handoff selects Navi48, blocks legacy
+controller/PM access after preparation and quarantines the primary framebuffer
+on incomplete startup. Read-only preparation failures restore CPU writers.
+
+A Navi48 stream too fast for one pipe (pixel clock above the DISPCLK
+maximum) or too wide for one DSC or 4:2:0 formatter now runs on two pipes as
+ODM 2:1: DML21 admission decides it as Linux's auto policy does (matched
+against Linux on new ODM, ODM+DSC and ODM 4:2:0 vector sets), the modeset
+gives it a free pipe, and the timing, both OPPs and DSCs, both HUBP/DPP/MPCC
+halves, deadlines, flips and the cursor are programmed across the pair
+(implementation and register models; no hardware run).
+
+DP MST now also runs over 128b/132b links: a branch that codes UHBR trains
+MST at its best UHBR rate (as Linux's decide_mst_link_settings does), streams
+share the owner's HPO link encoder with all 64 slots from slot 0, and each
+stream's HPO encoder is prepared blank, given its payload (SAT rows with ACT,
+the VC rate and blanking width matched against Linux's fixed-point
+arithmetic) and only then unblanked; teardown blanks, removes the payload and
+stops the stream. Its LPCM rides the stream's HPO APG once the payload
+completed (implementation and register models; no hardware run).
+
+Native 8b/10b DP MST now reaches the platform display monitor and KMS for one
+branch, beside every board port: KMS routes any connector (board port or end
+device) to any of the four CRTCs, as SETCRTC/atomic CRTC_ID set it or
+automatically in connector order, and board sinks and end devices light as
+one jointly admitted configuration. End-device EDIDs feed
+joint mode admission and per-stream payload allocation. Disabling the display
+that trained the link transfers ownership to a surviving stream; only the
+last stops the PHY. Disabled, unreadable or unadmitted devices leave output
+gaps, and switching every CRTC off keeps them off. Shared-link loss relights
+the configuration. Downstream hotplug now stops payloads using the old routes,
+reprobes and relights, retaining output slots by root/branch GUID, route and
+port across branch reordering and removal/replug. All-off and empty branches
+keep their managers enabled; physical removal drops them without AUX waits.
+Changed EDIDs invalidate stale modes. New disabled monitors now publish their
+EDID and independently admitted timings without starting a stream: remaining
+MST slots, path PBN and joint DML bound the offered modes. All-off branches query
+board clock limits without installing clock floors or allocating scanout, and
+KMS keeps the CRTC mode unset until enabled. Ordinary disables retain admitted
+modes without restarting siblings. Resource notifications now trigger fresh,
+port-bound bandwidth queries. Existing payloads are added back before comparing
+capacity, avoiding relights caused by our own allocations. Capacity changes retire
+old streams before reprobe/re-admission. Every shared path hop constrains payload
+and dark-mode admission; zero PBN rejects new modes. Incomplete resource queries
+retain the session and refuse replay. MST DSC and more than one branch
+remain open; no physical validation.
+The MST manager now also exposes bounded idle notification polling over
+DMUB AUX, retains fragmented messages across transaction/poll boundaries and
+applies queue backpressure. Connection notices drive topology reconciliation
+in the display monitor. Probes have depth/branch limits and retain incomplete
+sessions after cancellation instead of allowing replay.
+
+Still open: physical MSI delivery verification, queue reset and fault-source
+re-arming after containment, GC12 rendering and shader
+dispatch, production GPU VM and userspace submission, VCN5 video queues, native DCN4 clock/bandwidth/link
+and scanout programming, THM/SMU thermal interrupts and software-CTF shutdown,
+memory/fabric DPM relaxation (display admission/watermark rework first),
+reset/suspend/resume, and physical RX 9070 XT testing.
+The verified DMA proof covers only two kernel-owned VRAM pages. The driver
+continues to report acceleration unavailable; model/QEMU tests do not prove
+working silicon, native modesetting or Mesa/Vulkan support.
+
 Current main includes discrete PCIe probe support
 for RX 6750 XT / Navi 22: bounded discovery reads beyond BAR0, separate total
 and CPU-visible VRAM sizes, Resizable BAR-independent APU identity, and the
@@ -362,7 +929,12 @@ revocation, cancellation and divider completion. GDDR6 mode calculations and
 full modeset coordination are still pending. Native routing now resolves
 AUX and HPD independently through the board GPIO LUT, follows display-table
 relative record offsets, and rejects ambiguous routes. The Navi22 backend probe
-uses the DCN30 enable register and includes the sixth transmitter.
+uses the DCN30 enable register and includes the sixth transmitter. Navi22 kernel
+queues now follow Linux's non-MES GC 10.3 path: BAR2 doorbells, golden/CAM/
+constants/RLC CSB setup, the direct gfx ring with clear-state, KIQ-mapped
+compute (v10 MQD, MAP_QUEUES) and production SDMA on both engines, each with
+ring and IB/fence tests after `DmubStart`. Fences poll with an IH notify hook;
+register models cover encodings, rejection, timeouts and cancellation only.
 Production cold boot now resets a posted card before any firmware stage, as
 Linux does whenever the VBIOS left SOS running: PMFW (or PSP) mode1 reset,
 PCI config restore including Resizable BAR sizes, then bootloader and MEMSIZE

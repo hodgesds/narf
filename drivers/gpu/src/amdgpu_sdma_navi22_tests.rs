@@ -81,6 +81,9 @@ impl Fake {
     }
 }
 impl Io for Fake {
+    async fn reset_delay(&mut self) {
+        narf_scheduler::yield_now().await;
+    }
     fn read(&mut self, address: u64) -> u32 {
         *self.regs.get(&address).unwrap_or(&0)
     }

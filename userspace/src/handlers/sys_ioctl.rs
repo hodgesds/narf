@@ -620,6 +620,9 @@ impl narf_filesystem::FileOps for DrmSyncFile {
     fn ino(&self) -> u64 {
         narf_filesystem::inode_id::anon_inode().ino
     }
+    fn anon_name(&self) -> Option<&'static str> {
+        Some("sync_file")
+    }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
         narf_filesystem::inode_id::anon_inode().attrs()
@@ -1763,10 +1766,16 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             // the generic unknown-ioctl ENOTTY translation.
             const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010_640d;
             const DRM_IOCTL_MODE_ATOMIC: u32 = 0xc038_64bc;
+            // WAIT_VBLANK, CRTC_GET_SEQUENCE, CRTC_QUEUE_SEQUENCE on a card
+            // without vblank support (drm_dev_has_vblank).
+            const DRM_IOCTL_VBLANK: [u32; 3] = [0xc018_643a, 0xc018_643b, 0xc018_643c];
             // SIOCETHTOOL: a command the device's driver does not implement
             // is `__dev_ethtool`'s -EOPNOTSUPP, not an unknown ioctl.
             const SIOCETHTOOL: u32 = 0x8946;
-            if cmd == DRM_IOCTL_SET_CLIENT_CAP || cmd == DRM_IOCTL_MODE_ATOMIC || cmd == SIOCETHTOOL
+            if cmd == DRM_IOCTL_SET_CLIENT_CAP
+                || cmd == DRM_IOCTL_MODE_ATOMIC
+                || DRM_IOCTL_VBLANK.contains(&cmd)
+                || cmd == SIOCETHTOOL
             {
                 ctx.set_return(errno_ret(EOPNOTSUPP));
                 return;

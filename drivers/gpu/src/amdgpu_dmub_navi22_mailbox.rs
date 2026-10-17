@@ -1,5 +1,5 @@
-//! Owned DCN30 inbox1/outbox1 transport. ABI: Linux dmub_cmd.h,
-//! dmub_srv.c, dmub_dcn20.c; PCIe coherency: amdgpu/hdp_v5_0.c.
+//! Owned DCN inbox1/outbox1 transport. ABI: Linux dmub_cmd.h and dmub_srv.c.
+//! The enclosing controller supplies generation-specific reset/coherency.
 use super::*;
 
 const SIZE: u32 = 8192;
@@ -84,11 +84,7 @@ fn valid_header(command: &[u8; 64]) -> bool {
     command[2] & !1 == 0 && command[3] <= 60
 }
 fn alive(io: &mut impl Io, l: Layout) -> Result<(), Error> {
-    if read(io, l.dcn, CNTL)? & (RESET | ENABLE) != ENABLE
-        || read(io, l.dcn, HUB)? & 0x100 != 0
-        || read(io, l.dcn, STATUS)? & 3 != 3
-        || read(io, l.nbio, 0x12d)? != 0x7f000
-    {
+    if !is_running(io, l)? || read(io, l.nbio, 0x12d)? != 0x7f000 {
         return Err(Error::Protocol);
     }
     Ok(())
@@ -101,9 +97,7 @@ fn flush(io: &mut impl Io, l: Layout) -> Result<(), Error> {
     Ok(())
 }
 fn download(io: &mut impl Io, l: Layout, map: MmioRegion, offset: u64) -> [u8; 64] {
-    io.write(l.hdp + 0xd1 * 4, 1);
-    io.read(l.hdp + 0xd1 * 4);
-    fence(Ordering::SeqCst);
+    invalidate(io, l);
     let mut reply = [0; 64];
     for (i, word) in reply.chunks_exact_mut(4).enumerate() {
         word.copy_from_slice(&io.download(map, offset + (i * 4) as u64).to_le_bytes());
@@ -111,14 +105,14 @@ fn download(io: &mut impl Io, l: Layout, map: MmioRegion, offset: u64) -> [u8; 6
     reply
 }
 impl<I: Io> Engine<I> {
-    fn begin_mailbox(&mut self) -> Result<(), Error> {
+    pub(super) fn begin_mailbox(&mut self) -> Result<(), Error> {
         if self.state != State::Running || self.mailbox.state != MailboxState::Ready {
             return Err(Error::Busy);
         }
         self.mailbox.state = MailboxState::InFlight;
         Ok(())
     }
-    fn finish_mailbox<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
+    pub(super) fn finish_mailbox<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
         self.mailbox.state = match &result {
             Ok(_) | Err(Error::CommandRejected(_) | Error::Aux(_)) => MailboxState::Ready,
             _ => MailboxState::Failed,
@@ -204,7 +198,7 @@ impl<I: Io> Engine<I> {
     }
     // Private raw transport: only typed, bounded requests below can reach it.
     // The outer operation holds InFlight across both inbox and AUX completion.
-    async fn command(&mut self, request: [u8; 64]) -> Result<[u8; 64], Error> {
+    pub(super) async fn command(&mut self, request: [u8; 64]) -> Result<[u8; 64], Error> {
         if !valid_header(&request) {
             return Err(Error::Invalid);
         }
@@ -306,7 +300,7 @@ impl<I: Io> Engine<I> {
         self.finish_mailbox(result)
     }
     pub(super) async fn hpd(&mut self, instance: u8) -> Result<bool, Error> {
-        if instance >= 6 {
+        if instance >= NATIVE_CHANNELS {
             return Err(Error::Invalid);
         }
         self.begin_mailbox()?;
@@ -341,7 +335,7 @@ impl<I: Io> Engine<I> {
         data: &mut [u8],
     ) -> Result<(), Error> {
         use crate::amdgpu_dmub::{aux_command, Channel};
-        if instance >= 6 {
+        if instance >= NATIVE_CHANNELS {
             return Err(Error::Invalid);
         }
         let request = aux_command(Channel::Legacy, instance, action, address, data)
@@ -400,7 +394,7 @@ impl Dmub {
     pub fn mailbox_state(&self) -> MailboxState {
         self.engine.mailbox.state
     }
-    /// Query a native DCN30 AUX/HPD instance (0..6), not a connector index.
+    /// Query a native AUX/HPD instance within this generation's channel count.
     pub async fn hpd(&mut self, instance: u8) -> Result<bool, Error> {
         self.engine.hpd(instance).await
     }

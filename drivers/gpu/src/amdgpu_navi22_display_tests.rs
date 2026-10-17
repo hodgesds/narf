@@ -14,6 +14,7 @@ fn path(connector: Kind, transmitter: u8, aux: Option<u8>, hpd: u8) -> Path {
         aux,
         hpd,
         device_tag: 0,
+        max_speed_mhz: 0,
     }
 }
 /// The MSI RX 6750 XT shape: three DP and one HDMI, one DDC/HPD each.

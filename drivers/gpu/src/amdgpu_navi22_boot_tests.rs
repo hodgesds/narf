@@ -24,6 +24,7 @@ fn report() -> Report {
         memory_aperture: None,
         sdma: None,
         dmub: None,
+        queues: None,
         interrupts: None,
     }
 }
@@ -482,4 +483,63 @@ fn navi22_boot_preflight_and_real_backend_revocation() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi22-boot",
     navi22_boot_preflight_and_real_backend_revocation
+);
+fn navi22_boot_queue_preparation_requires_hubs_and_sdma() -> TestResult {
+    let pool = pool(16 << 20);
+    let authority = Cap::bootstrap();
+    let doorbells = crate::amdgpu_cp_navi22::tests::doorbells();
+    // SAFETY: bookkeeping-only constructor; no I/O happens in this test.
+    let mut boot = unsafe { ColdBoot::new(&gpu(), authority, &pool, firmware()) }.unwrap();
+    let available = pool.available();
+    if boot.prepare_queues(doorbells) != Err(Error::Invalid)
+        || boot.sequence.backend.queues.is_some()
+        || pool.available() != available
+    {
+        return TestResult::Fail("queues prepared without VMID0 hubs and SDMA proof");
+    }
+    boot.sequence.state = State::Running(Stage::Kiq);
+    if boot.prepare_queues(doorbells) != Err(Error::Busy) {
+        return TestResult::Fail("queues prepared during a run");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_boot_queue_preparation_requires_hubs_and_sdma
+);
+
+fn navi22_boot_fence_interrupts_map_to_their_engine() -> TestResult {
+    use crate::{amdgpu_fence_navi22::Engine, amdgpu_ih_navi22::Iv};
+    let iv = |client, src, ring_id| Iv {
+        client,
+        src,
+        ring_id,
+        vmid: 0,
+        vmid_src: false,
+        timestamp: 0,
+        timestamp_src: false,
+        pasid: 0,
+        node_id: 0,
+        src_data: [0; 4],
+    };
+    // ring_id = queue << 4 | me << 2 | pipe (gfx_v10_0_eop_irq).
+    for (entry, expected) in [
+        (iv(0x14, 181, 0x00), Some(Engine::Gfx)),
+        (iv(0x14, 181, 0x04), Some(Engine::Compute)),
+        (iv(0x14, 181, 0x09), Some(Engine::Kiq)),
+        (iv(0x14, 181, 0x0c), None),
+        (iv(0x08, 224, 0), Some(Engine::Sdma0)),
+        (iv(0x09, 224, 0), Some(Engine::Sdma1)),
+        (iv(0x14, 184, 0), None),
+        (iv(0x08, 0, 0), None),
+    ] {
+        if fence_engine(&entry) != expected {
+            return TestResult::Fail("IH entry routed to the wrong fence engine");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_boot_fence_interrupts_map_to_their_engine
 );

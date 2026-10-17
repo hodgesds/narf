@@ -866,6 +866,9 @@ pub struct SocketFile {
     /// (each end of a socketpair, each accepted connection) its own
     /// `new_inode_pseudo(sock_mnt->mnt_sb)` numbered by `get_next_ino`.
     inode: narf_filesystem::inode_id::InodeId,
+    /// `sk->sk_uid`: the creator's fsuid (Linux `sock_init_data` →
+    /// `current_fsuid()`). The uid column of `/proc/net/{tcp,udp}*`.
+    sk_uid: u32,
     /// Back-reference to this socket's own Arc (set by `Arc::new_cyclic` in
     /// `new`). `FileOps::read`/`write` only receive `&self`, but the
     /// per-family dispatchers need `&Arc<Self>` (bind registration holds
@@ -1683,10 +1686,32 @@ pub struct Udp6SocketSnapshot {
     pub state_code: u8,
     pub tx_queue: u32,
     pub rx_queue: u32,
+    pub uid: u32,
+    pub inode: u64,
 }
 
 pub fn udp6_snapshot_in(net_ns_id: u64) -> Vec<Udp6SocketSnapshot> {
     inet6_dgram::snapshot_in(net_ns_id)
+}
+
+/// One user AF_INET datagram socket for `/proc/net/udp`.
+#[derive(Clone, Debug)]
+pub struct UdpSocketSnapshot {
+    pub local_addr: [u8; 4],
+    pub local_port: u16,
+    pub remote_addr: [u8; 4],
+    pub remote_port: u16,
+    pub state_code: u8,
+    pub tx_queue: u32,
+    pub rx_queue: u32,
+    pub uid: u32,
+    pub inode: u64,
+}
+
+/// Bound user AF_INET datagram sockets. Kernel-internal UDP endpoints
+/// (DHCP, DNS) live in `narf_net::udp_sock` and are listed separately.
+pub fn udp_snapshot_in(net_ns_id: u64) -> Vec<UdpSocketSnapshot> {
+    inet_dgram::snapshot_in(net_ns_id)
 }
 
 fn map_admin_ioctl_error(error: narf_net::AdminError) -> FsError {
@@ -1756,7 +1781,10 @@ struct NetlinkUserPacket {
 }
 
 impl SocketFile {
+    /// Called at every point a socket is wired to a kernel TCB (listen,
+    /// accept, connect), so it also records the TCB's socket identity.
     fn apply_tcp_options_to_tcb(&self, id: u32) {
+        crate::handlers::set_tcb_socket(id, self.sk_uid, self.inode.ino);
         let opts = self.options.lock();
         let int_opts = [
             (narf_net::tcp_stack::TCP_NODELAY, opts.tcp_nodelay as i32),
@@ -1935,6 +1963,7 @@ impl SocketFile {
             kind,
             protocol,
             inode: narf_filesystem::inode_id::PseudoFs::Sock.new_inode(),
+            sk_uid: crate::handlers::current_fsuid(),
             self_weak: self_weak.clone(),
             state: IrqSafeSpinLock::new(state),
             options: IrqSafeSpinLock::new(SockOptions::default()),
@@ -5385,9 +5414,31 @@ impl SocketFile {
                     return result;
                 }
                 let dest_portid = self.ensure_netlink_portid();
+                let udp4: Vec<_> = udp_snapshot_in(self.net_ns_id())
+                    .into_iter()
+                    .map(|socket| {
+                        // inet_diag_sockid carries IPv4 in the first word.
+                        let widen = |addr: [u8; 4]| {
+                            let mut out = [0; 16];
+                            out[..4].copy_from_slice(&addr);
+                            out
+                        };
+                        narf_net::netlink_diag::UdpDiagRecord {
+                            state: socket.state_code,
+                            local_addr: widen(socket.local_addr),
+                            local_port: socket.local_port,
+                            remote_addr: widen(socket.remote_addr),
+                            remote_port: socket.remote_port,
+                            tx_queue: socket.tx_queue,
+                            rx_queue: socket.rx_queue,
+                            uid: socket.uid,
+                            inode: socket.inode,
+                        }
+                    })
+                    .collect();
                 let udp6: Vec<_> = udp6_snapshot_in(self.net_ns_id())
                     .into_iter()
-                    .map(|socket| narf_net::netlink_diag::Udp6DiagRecord {
+                    .map(|socket| narf_net::netlink_diag::UdpDiagRecord {
                         state: socket.state_code,
                         local_addr: socket.local_addr,
                         local_port: socket.local_port,
@@ -5395,12 +5446,19 @@ impl SocketFile {
                         remote_port: socket.remote_port,
                         tx_queue: socket.tx_queue,
                         rx_queue: socket.rx_queue,
+                        uid: socket.uid,
+                        inode: socket.inode,
                     })
                     .collect();
-                let mut replies = match narf_net::netlink_diag::build_replies_in_with_udp6(
+                let user = narf_net::netlink_diag::UserSockets {
+                    udp4: &udp4,
+                    udp6: &udp6,
+                    tcp_identity: crate::handlers::tcb_socket,
+                };
+                let mut replies = match narf_net::netlink_diag::build_replies_in_with(
                     self.net_ns_id(),
                     buf,
-                    &udp6,
+                    &user,
                 ) {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
@@ -9358,6 +9416,26 @@ impl Drop for SocketFile {
         if let SocketState::Packet { sock } = &*self.state.lock() {
             sock.release();
         }
+        // An explicit close(2) calls `unregister`, which closes an
+        // InetWired TCB. Process exit instead releases the fd table directly,
+        // so the last SocketFile reference reaches this Drop implementation
+        // without that call. Keep the two paths equivalent: otherwise a peer
+        // FIN moves an exited process's connection to CLOSE-WAIT forever,
+        // gradually exhausting long-lived clients' connection pools.
+        let wired_tcb = match &*self.state.lock() {
+            SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
+                Some(*tcb_id)
+            }
+            _ => None,
+        };
+        if let Some(id) = wired_tcb {
+            let zero_linger = {
+                let opts = self.options.lock();
+                opts.linger_on && opts.linger_sec == 0
+            };
+            let _ = narf_net::tcp_stack::close_linger(id, zero_linger);
+            crate::handlers::clear_tcb_owner(id);
+        }
         // Closing this endpoint deads BOTH directions of the connection:
         // - `tx` (this end writes, the PEER reads) → close surfaces EOF to the
         //   peer's read (any buffered bytes still drain first, then EOF).
@@ -11206,6 +11284,44 @@ kernel_test_in!(
     "userspace/socket",
     smoke_wired_tcp_send_backpressure_drives_readiness
 );
+
+/// Process exit drops its fd table instead of issuing `close(2)` one fd at a
+/// time. The final SocketFile drop must therefore close an off-box TCP TCB
+/// too; otherwise a peer FIN leaves a permanent CLOSE-WAIT entry after every
+/// short-lived process.
+fn smoke_wired_tcp_drop_closes_tcb() -> TestResult {
+    use narf_net::tcp::core::{__install_test_tcb, __with_tcb, remove_tcb};
+    use narf_net::tcp_stack::{release, TcpState};
+
+    let id = __install_test_tcb(
+        [10, 0, 2, 15],
+        31_125,
+        [10, 0, 2, 2],
+        5201,
+        TcpState::Established,
+    );
+    {
+        let socket = SocketFile::new(AF_INET, SOCK_STREAM);
+        *socket.state.lock() = SocketState::InetWired {
+            tcb_id: id,
+            peer_addr: u32::from_be_bytes([10, 0, 2, 2]),
+            peer_port: 5201,
+        };
+    }
+
+    let result = match __with_tcb(id, |t| (t.state, t.fin_sent, t.orphan)) {
+        Some((TcpState::FinWait1, true, true)) => TestResult::Pass,
+        Some((TcpState::Established, _, _)) => {
+            TestResult::Fail("last SocketFile drop left wired TCP established")
+        }
+        Some(_) => TestResult::Fail("last SocketFile drop did not start an orphaned TCP close"),
+        None => TestResult::Fail("last SocketFile drop removed its TCB unexpectedly"),
+    };
+    remove_tcb(id);
+    release(id);
+    result
+}
+kernel_test_in!("userspace/socket", smoke_wired_tcp_drop_closes_tcb);
 
 /// The durable-wake migration: a group-2 broadcast must fire the subscriber's
 /// ARMED `uevent_readiness` cell directly (Readiness::set -> wake_by_ref), not

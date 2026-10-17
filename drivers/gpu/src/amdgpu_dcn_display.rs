@@ -241,6 +241,48 @@ pub(crate) fn swap_scanout_observer_for_test(
     *OBSERVER.lock() = observer;
     previous
 }
+/// Makes CPU writes to the active scanout visible to display fetch, for owners
+/// whose CPU path is buffered (Navi48 BAR writes pass through HDP).
+pub type ScanoutFlush = fn();
+static FLUSH: IrqSafeSpinLock<Option<ScanoutFlush>> = IrqSafeSpinLock::new(None);
+/// Best effort: the owner's flush may be skipped while it is busy, in which
+/// case buffered writes still drain on their own, just not promptly.
+pub fn flush_active_scanout() {
+    let flush = *FLUSH.lock();
+    if let Some(flush) = flush {
+        flush();
+    }
+}
+/// Shows the pointer image at a screen position (None hides it) on the
+/// active scanout's hardware cursor. Returns false only when the owner has no
+/// hardware cursor for it; a busy owner skips the update and returns true, so
+/// the caller never paints a software sprite into a hardware-cursor surface.
+pub type ScanoutCursor = fn(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bool;
+static CURSOR: IrqSafeSpinLock<Option<ScanoutCursor>> = IrqSafeSpinLock::new(None);
+/// The active scanout's hardware cursor, if its owner published one.
+pub fn active_scanout_cursor() -> Option<ScanoutCursor> {
+    *CURSOR.lock()
+}
+/// Attach a hardware cursor to the currently published external scanout.
+pub(crate) fn publish_external_cursor(cursor: Option<ScanoutCursor>) {
+    if ACTIVE.lock().is_some() {
+        *CURSOR.lock() = cursor;
+    }
+}
+/// Publish a scanout owned outside this module, with its flush. Clearing the
+/// flush (and cursor) first detaches the hooks before notifying the fb layer.
+/// Callers still retain the backing and drain scanout_access's retired CPU
+/// views before teardown or buffer reuse; notification alone is not a barrier.
+pub(crate) fn publish_external(scanout: Option<GenericFb>, flush: Option<ScanoutFlush>) {
+    if scanout.is_none() {
+        *FLUSH.lock() = None;
+        *CURSOR.lock() = None;
+        publish(None);
+    } else {
+        publish(scanout);
+        *FLUSH.lock() = flush;
+    }
+}
 #[cfg(feature = "kernel-test")]
 pub(crate) fn publish_for_test(scanout: Option<GenericFb>) {
     publish(scanout);
@@ -620,6 +662,7 @@ impl Pipeline {
         }
         self.streaming = false;
         publish(None);
+        crate::scanout_access::wait_retired().await;
         first
     }
     /// Take the stream down. The scanout is safe to release once this returns.

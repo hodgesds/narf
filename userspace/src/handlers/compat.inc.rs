@@ -2485,7 +2485,7 @@ fn do_execve_resolved(
             // Only an ABSOLUTE filesystem path is exec'able by re-reading the FS.
             // A pathless/anonymous fd (a memfd — systemd seals its sd-executor
             // into a memfd and fexecve's /proc/self/fd/N — whose recorded "path"
-            // is the "anon_inode:[FileOps]" placeholder) must be exec'd from the
+            // is an `anon_inode:` link, never a `/` path) must be exec'd from the
             // fd's own bytes instead.
             let fs_path = fd_path_string_of(t, n).filter(|p| p.starts_with('/'));
             if let Some(real) = fs_path {
@@ -7554,7 +7554,10 @@ fn live_task_state(task: u64) -> char {
 pub fn proc_thread_stat(tid: u64) -> Option<narf_filesystem::procfs::ThreadStat> {
     const NS_PER_TICK: u64 = 10_000_000;
     let task = task_of_visible_tid(tid)?;
+    let syscall = proc_task_syscall_frame(task);
     Some(narf_filesystem::procfs::ThreadStat {
+        wchan: proc_wchan_of_frame(syscall),
+        syscall,
         comm: proc_comm_of_task(task).unwrap_or_else(|| alloc::format!("task-{tid}")),
         utime_ticks: cpu_time_ns_of(task) / NS_PER_TICK,
         stime_ticks: kern_time_ns_of(task) / NS_PER_TICK,
@@ -7580,12 +7583,7 @@ pub fn proc_sched_snapshot(pid: u64) -> narf_filesystem::procfs::ProcSchedSnapsh
     let task = proc_pid_to_tid(pid);
     let (timeslices, voluntary_switches, involuntary_switches) = crate::task::switch_counts(task);
     let syscall = proc_task_syscall_frame(task);
-    // The handler a parked task is waiting in. A task parked outside a
-    // syscall (or one still running) has no site to name, and Linux prints 0
-    // for exactly that case.
-    let wchan = syscall
-        .and_then(|frame| crate::syscall::syscall_name_of_number(frame[0]))
-        .map(alloc::string::String::from);
+    let wchan = proc_wchan_of_frame(syscall);
     narf_filesystem::procfs::ProcSchedSnapshot {
         run_ns: cpu_time_ns_of(task).saturating_add(kern_time_ns_of(task)),
         timeslices,
@@ -7596,6 +7594,15 @@ pub fn proc_sched_snapshot(pid: u64) -> narf_filesystem::procfs::ProcSchedSnapsh
         syscall,
         wchan,
     }
+}
+
+/// The handler a parked task is waiting in. A task parked outside a syscall
+/// (or one still running) has no site to name, and Linux prints 0 for
+/// exactly that case.
+fn proc_wchan_of_frame(frame: Option<[u64; 9]>) -> Option<alloc::string::String> {
+    frame
+        .and_then(|frame| crate::syscall::syscall_name_of_number(frame[0]))
+        .map(alloc::string::String::from)
 }
 
 /// `kernel/sched/syscalls.c::task_current_syscall()` — the syscall frame of a
@@ -8428,20 +8435,52 @@ fn fd_path_string_of(pid: u64, n: u32) -> Option<alloc::string::String> {
             return Some(strip_chroot_prefix(tid, &path));
         }
     }
-    crate::fd::with_table(tid, |table| {
-        let entry = table.get(n)?;
-        let name = core::any::type_name_of_val(&*entry.ops);
-        let short = name.rsplit("::").next().unwrap_or(name);
-        Some(alloc::format!("anon_inode:[{}]", short))
-    })
-    .flatten()
+    crate::fd::with_table(tid, |table| Some(pathless_fd_link(&*table.get(n)?.ops))).flatten()
+}
+
+/// `/proc/<pid>/fd/<n>` target of an fd with no recorded path — what Linux's
+/// pseudo-filesystem `d_dname` produces: `socket:[ino]` (sockfs),
+/// `pipe:[ino]` (pipefs), `anon_inode:<name>` (anon_inodefs, e.g.
+/// `anon_inode:[eventfd]`). `lsof`/`ss -p` match sockets by that inode, and
+/// tools tell eventfds from timerfds by the name.
+///
+/// Never starts with `/`: fexecve via `/proc/self/fd/N` uses that to decide
+/// between re-resolving a path and exec'ing the fd's own bytes.
+fn pathless_fd_link(ops: &dyn narf_filesystem::FileOps) -> alloc::string::String {
+    use narf_filesystem::inode_id::PseudoFs;
+    if let Some(name) = ops.anon_name() {
+        return alloc::format!("anon_inode:{name}");
+    }
+    let dev = ops.inode_attrs().dev;
+    if dev != 0 && dev == PseudoFs::Sock.dev() {
+        return alloc::format!("socket:[{}]", ops.ino());
+    }
+    if dev != 0 && dev == PseudoFs::Pipe.dev() {
+        return alloc::format!("pipe:[{}]", ops.ino());
+    }
+    // Types not yet given an identity keep the non-empty placeholder. A
+    // memfd lands here too: its `/memfd:<name> (deleted)` link is rendered
+    // only by `fd_path_of`, because callers of this treat a `/` as a path to
+    // reopen.
+    "anon_inode:[FileOps]".into()
+}
+
+/// `d_path` of a file created unlinked on a kernel-internal mount
+/// ([`narf_filesystem::FileOps::internal_name`]): `/memfd:<name> (deleted)`.
+pub(crate) fn internal_file_path(ops: &dyn narf_filesystem::FileOps) -> Option<alloc::string::String> {
+    ops.internal_name().map(|name| alloc::format!("/{name} (deleted)"))
 }
 
 pub fn fd_path_of(pid: u64, n: u32) -> Option<narf_filesystem::procfs::ProcFdSnapshot> {
     let tid = proc_pid_to_tid(pid);
-    let (pos, flags, ino) = crate::fd::with_table(tid, |table| {
+    let (pos, flags, ino, internal) = crate::fd::with_table(tid, |table| {
         let entry = table.get(n)?;
-        Some((table.offset(n)?, table.status_flags(n)?, entry.ops.ino()))
+        Some((
+            table.offset(n)?,
+            table.status_flags(n)?,
+            entry.ops.ino(),
+            internal_file_path(&*entry.ops),
+        ))
     })
     .flatten()?;
     // Preferred: the real backing path recorded at open() time (the same
@@ -8449,8 +8488,17 @@ pub fn fd_path_of(pid: u64, n: u32) -> Option<narf_filesystem::procfs::ProcFdSna
     // readlinks to — musl's realpath() opens O_PATH then readlinks here.
     // Report it chroot-relative so a chrooted process (e.g. udev in a
     // distro chroot) can re-open the link target in its own namespace.
+    //
+    // A memfd's link is what Linux readlink shows, `/memfd:<name> (deleted)`.
+    // It is display-only: the path helpers the exec and open paths consult
+    // (`fd_path_string_of`, `fd_path_for_task`) keep reporting no `/` path
+    // for it, so fexecve still runs the fd's own bytes rather than looking
+    // the text up as a file.
     Some(narf_filesystem::procfs::ProcFdSnapshot {
-        path: fd_path_string_of(pid, n)?,
+        path: match internal {
+            Some(path) => path,
+            None => fd_path_string_of(pid, n)?,
+        },
         info: narf_filesystem::procfs::ProcFdInfo {
             pos,
             flags,
@@ -8469,13 +8517,7 @@ pub(crate) fn fd_path_for_task(task: u64, n: u32) -> Option<alloc::string::Strin
     if let Some(p) = crate::mqueue::fd_path(task, n) {
         return Some(strip_chroot_prefix(task, &p));
     }
-    crate::fd::with_table(task, |t| {
-        let entry = t.get(n)?;
-        let name = core::any::type_name_of_val(&*entry.ops);
-        let short = name.rsplit("::").next().unwrap_or(name);
-        Some(alloc::format!("anon_inode:[{}]", short))
-    })
-    .flatten()
+    crate::fd::with_table(task, |t| Some(pathless_fd_link(&*t.get(n)?.ops))).flatten()
 }
 
 /// Strip the task's chroot prefix from a host-absolute path, yielding the

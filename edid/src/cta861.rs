@@ -87,8 +87,10 @@ impl CtaCaps {
     }
 }
 
-/// One Short Video Descriptor (SVD). 1 byte: bit 7 = native flag,
-/// bits 6..0 = VIC (Video Identification Code from CTA-861-G Tables 4..6).
+/// One Short Video Descriptor (SVD). 1 byte: for 1..=64 and 129..=192,
+/// bit 7 is the native flag and bits 6..0 the VIC; every other value is the
+/// VIC itself (CTA-861-F 7.5.1; Linux `svd_to_vic`), so VICs 65..=127 and
+/// 193.. never carry the native flag.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ShortVideoDescriptor {
     pub vic: u8,
@@ -97,9 +99,10 @@ pub struct ShortVideoDescriptor {
 
 impl ShortVideoDescriptor {
     pub fn parse(b: u8) -> Self {
+        let flagged = (1..=64).contains(&b) || (129..=192).contains(&b);
         Self {
-            vic: b & 0x7F,
-            native: (b & 0x80) != 0,
+            vic: if flagged { b & 0x7F } else { b },
+            native: (129..=192).contains(&b),
         }
     }
 }
