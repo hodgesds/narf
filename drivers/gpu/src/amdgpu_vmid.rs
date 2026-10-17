@@ -78,6 +78,31 @@ impl VmHub {
 /// scheduler can evict + remint VMIDs while PASIDs are stable.
 pub type Pasid = u16;
 
+/// The PASIDs in use, one bit each (`amdgpu_pasid_alloc`'s IDA, 16 bits).
+static PASIDS: narf_lib::sync::IrqSafeSpinLock<[u64; 1024]> =
+    narf_lib::sync::IrqSafeSpinLock::new([0; 1024]);
+
+/// An allocated PASID, returned when dropped (`amdgpu_pasid_free`).
+#[derive(Debug)]
+pub struct PasidHandle(Pasid);
+impl PasidHandle {
+    /// The lowest free PASID, 0 excepted.
+    pub fn alloc() -> Option<Self> {
+        let mut used = PASIDS.lock();
+        let pasid = (1..=u16::MAX).find(|&p| used[usize::from(p) / 64] & 1 << (p % 64) == 0)?;
+        used[usize::from(pasid) / 64] |= 1 << (pasid % 64);
+        Some(Self(pasid))
+    }
+    pub fn get(&self) -> Pasid {
+        self.0
+    }
+}
+impl Drop for PasidHandle {
+    fn drop(&mut self) {
+        PASIDS.lock()[usize::from(self.0) / 64] &= !(1 << (self.0 % 64));
+    }
+}
+
 // ── Per-VMID state ───────────────────────────────────────────────
 
 /// State of one VMID slot.

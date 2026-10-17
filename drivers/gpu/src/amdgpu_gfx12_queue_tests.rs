@@ -282,6 +282,7 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
         layout: Layout {
             gc: 0x10000,
             hyp: 0x40000,
+            oss: 0x70000,
             nbio: 0x60000,
         },
         doorbells: map,
@@ -644,6 +645,7 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
     run(e.initialize(&mut mes, aperture, target)).unwrap();
     let job = Job {
         vmid: 3,
+        pasid: 0x1234,
         pd_addr: 0x1_0000_8001,
         ib: 0x2_0000_1000,
         ib_dwords: 64,
@@ -675,7 +677,13 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
         return TestResult::Fail("first job");
     }
     let gc = 0x10000 / 4;
-    if e.io.job_writes != [(gc + 0x168f + 6, 0x8001), (gc + 0x1690 + 6, 1)]
+    let lut = 0x70000 / 4;
+    if e.io.job_writes
+        != [
+            (gc + 0x168f + 6, 0x8001),
+            (gc + 0x1690 + 6, 1),
+            (lut + 3, 0x1234),
+        ]
         || e.io.job_waits != [(gc + 0x1647, gc + 0x1659, 0x00f8_0008, 8, 0x143)]
         || e.io.job_syncs != 1
         || e.io.job_ibs != [(0x2_0000_1000, 64 | 3 << 24)]

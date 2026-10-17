@@ -62,15 +62,20 @@ pub enum State {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Job {
     pub vmid: u8,
+    /// The client's PASID, mapped to `vmid` in the IH VMID LUT so a fault
+    /// names the client.
+    pub pasid: u16,
     pub pd_addr: u64,
     pub ib: u64,
     pub ib_dwords: u32,
 }
-/// gfx_v12_0's frame for one job on the graphics ring: the VM flush
-/// (gmc_v12_0_emit_flush_gpu_tlb on the GFX hub through the ring's engine,
-/// then PFP_SYNC_ME), the IB under the job's VMID, and an interrupting
-/// RELEASE_MEM of `seq` to `fence`, NOP-padded to the 256-dword slot.
-fn job_packets(job: Job, gc: u32, fence: u64, seq: u32) -> Result<[u32; 256], Error> {
+/// gfx_v12_0's frame for one job on the graphics ring, as amdgpu_vm_flush
+/// and amdgpu_ib_schedule emit it: the VM flush (gmc_v12_0_emit_flush_gpu_tlb
+/// on the GFX hub through the ring's engine, then PFP_SYNC_ME), the PASID
+/// mapping (gmc_v12_0_emit_pasid_mapping: IH_VMID_0_LUT + vmid at OSSSYS
+/// base `oss`), the IB under the job's VMID, and an interrupting RELEASE_MEM
+/// of `seq` to `fence`, NOP-padded to the 256-dword slot.
+fn job_packets(job: Job, gc: u32, oss: u32, fence: u64, seq: u32) -> Result<[u32; 256], Error> {
     use crate::amdgpu_pm4::Pm4Builder;
     if !(1..16).contains(&job.vmid)
         || job.ib_dwords == 0
@@ -90,6 +95,7 @@ fn job_packets(job: Job, gc: u32, fence: u64, seq: u32) -> Result<[u32; 256], Er
             job.pd_addr,
             true,
         )?;
+        b.write_reg(oss + u32::from(job.vmid), u32::from(job.pasid), true)?;
         b.indirect_buffer(job.ib, job.ib_dwords, job.vmid)?;
         b.release_mem_fence(fence, u64::from(seq), false, true)?;
         let used = b.words().len();
@@ -131,6 +137,8 @@ fn interrupt_packets(address: u64, pipe: usize) -> [u32; 256] {
 #[derive(Clone, Copy, Debug)]
 struct Layout {
     gc: u64,
+    /// OSSSYS 7.0 bank 0 (the IH VMID LUTs).
+    oss: u64,
     hyp: u64,
     nbio: u64,
 }
@@ -146,6 +154,8 @@ impl Layout {
             gc: bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, 0x1fab)
                 .map_err(|_| Error::Unsupported)?,
             hyp: bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 1, 0x900)
+                .map_err(|_| Error::Unsupported)?,
+            oss: bank(gpu, ip::HW_ID_OSSSYS, &[(7, 0, 0)], 0, 0x1f)
                 .map_err(|_| Error::Unsupported)?,
             nbio: bank(
                 gpu,
@@ -568,7 +578,7 @@ impl<I: Io> Engine<I> {
         let wptr = self.gfx_wptr.max(512);
         let seq = self.gfx_seq.wrapping_add(1);
         let fence = self.memory.address() + JOB_FENCE;
-        let words = job_packets(job, (l.gc / 4) as u32, fence, seq)?;
+        let words = job_packets(job, (l.gc / 4) as u32, (l.oss / 4) as u32, fence, seq)?;
         self.access(|io| {
             flush(io, l);
             let rptr = u64::from(io.memory_read(map, RPTR));

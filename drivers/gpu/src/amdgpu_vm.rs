@@ -537,6 +537,8 @@ pub struct VmState {
     /// The last job submitted in this space (0: none). Memory the GPU may
     /// still reach is held until the card's engine completes it.
     last_job: core::sync::atomic::AtomicU64,
+    /// This space's PASID, allocated on first use.
+    pasid: IrqSafeSpinLock<Option<crate::amdgpu_vmid::PasidHandle>>,
 }
 
 impl Drop for VmState {
@@ -544,7 +546,10 @@ impl Drop for VmState {
     fn drop(&mut self) {
         let root = self.root.lock().take();
         let mappings = self.mappings.lock().take();
-        self.release((root, mappings));
+        // The PASID too: a fault from a job still running must not be
+        // charged to the next space given the same PASID.
+        let pasid = self.pasid.lock().take();
+        self.release((root, mappings, pasid));
     }
 }
 
@@ -574,6 +579,16 @@ impl VmState {
     pub fn note_job(&self, seq: u64) {
         self.last_job
             .store(seq, core::sync::atomic::Ordering::Release);
+    }
+
+    /// This space's PASID — what the IH VMID LUT maps a job's VMID to, so a
+    /// fault names its client — allocated on first use.
+    pub fn pasid(&self) -> Option<crate::amdgpu_vmid::Pasid> {
+        let mut pasid = self.pasid.lock();
+        if pasid.is_none() {
+            *pasid = crate::amdgpu_vmid::PasidHandle::alloc();
+        }
+        pasid.as_ref().map(crate::amdgpu_vmid::PasidHandle::get)
     }
 
     /// The last job submitted in this space (0: none).
@@ -607,6 +622,7 @@ impl VmState {
             tables: IrqSafeSpinLock::new(0),
             card,
             last_job: core::sync::atomic::AtomicU64::new(0),
+            pasid: IrqSafeSpinLock::new(None),
         }
     }
 

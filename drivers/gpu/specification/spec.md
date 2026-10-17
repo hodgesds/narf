@@ -3563,10 +3563,15 @@ after boot: one graphics IB per submission, run on client VMID 1 with the
 open's root page directory (`VmState::root_pde`, GMC 12 only), through
 `amdgpu_gfx12_queue::Queues::submit` — one 256-dword ring slot of VM flush
 (GFX hub, engine 0, PFP_SYNC_ME), IB and interrupting RELEASE_MEM fence;
-`Busy` when the 1024-dword ring is full. Each job is noted on its address
-space and every fence read retires completed jobs' deferred frees. VMID
-reuse and IH PASID mapping are not implemented, and `AMDGPU_INFO` still
-reports acceleration unavailable.
+`Busy` when the 1024-dword ring is full. Each job also maps VMID 1 to its
+open's PASID in the IH VMID LUT (OSSSYS `IH_VMID_0_LUT + vmid`, after the
+flush, as gmc_v12_0_emit_pasid_mapping), so a fault carries the client's
+PASID; `VmState::pasid` allocates one per address space
+(`amdgpu_vmid::PasidHandle`) and releases it through the deferred list.
+Each job is noted on its address space and every fence read retires
+completed jobs' deferred frees. VMID reuse and per-client fault reports
+are not implemented, and `AMDGPU_INFO` still reports acceleration
+unavailable.
 
 ### AMD platform VBIOS
 

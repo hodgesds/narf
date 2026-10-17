@@ -240,9 +240,12 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
 /// page tables it may reach are freed only once the fence passes; every
 /// fence read here retires what completed jobs held.
 ///
+/// Each job maps VMID 1 to its open's PASID in the IH LUT, so its faults
+/// carry the client's PASID.
+///
 /// LINUX-GAP: VMID 1 for every client, always flushed — no per-client VMID
-/// reuse (amdgpu_vmid_grab) and no IH PASID mapping, so a fault is not yet
-/// attributed to its client. AMDGPU_INFO keeps reporting acceleration
+/// reuse (amdgpu_vmid_grab) — and faults are not yet reported per client
+/// (AMDGPU_INFO_GPUVM_FAULT). AMDGPU_INFO keeps reporting acceleration
 /// unavailable, so Mesa does not submit here.
 struct Submitter {
     card: u32,
@@ -279,6 +282,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             let pd_addr = vm.root_pde().ok_or(FsError::InvalidData)?;
             let job = crate::amdgpu_gfx12_queue::Job {
                 vmid: CLIENT_VMID,
+                pasid: vm.pasid().ok_or(FsError::NoSpace)?,
                 pd_addr,
                 ib: ib.va_start,
                 ib_dwords: ib.length_dw,
