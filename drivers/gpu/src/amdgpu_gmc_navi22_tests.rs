@@ -1,16 +1,18 @@
 use super::*;
-use alloc::{collections::BTreeMap, vec, vec::Vec};
+use alloc::{collections::BTreeMap, vec::Vec};
 use core::{
     future::Future,
     task::{Context, Waker},
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
-struct Fake {
-    registers: BTreeMap<u64, u32>,
-    writes: Vec<(u64, u32)>,
-    memory: Vec<u32>,
-    stall: Option<u64>,
-    revoke_on: Option<(u64, Cap<BusDeviceCap, Write>)>,
+pub(super) struct Fake {
+    pub(super) registers: BTreeMap<u64, u32>,
+    pub(super) writes: Vec<(u64, u32)>,
+    /// Fake VRAM keyed by BAR-physical byte address.
+    pub(super) memory: BTreeMap<u64, u32>,
+    pub(super) stall: Option<u64>,
+    pub(super) revoke_on: Option<(u64, Cap<BusDeviceCap, Write>)>,
+    pub(super) stores: usize,
 }
 impl Io for Fake {
     fn read(&mut self, address: u64) -> u32 {
@@ -23,20 +25,63 @@ impl Io for Fake {
     fn write(&mut self, address: u64, value: u32) {
         self.writes.push((address, value));
         self.registers.insert(address, value);
+        // A released MMHUB semaphore reads 1 (acquired) on the next sample.
+        if address == 0x20000 + u64::from(MM.inv_sem) * 4 && value == 0 {
+            self.registers.insert(address, 1);
+        }
+        // Engine-17 model: a request acknowledges exactly its VMID bits.
+        for (base, r) in [(0x10000, GFX), (0x20000, MM)] {
+            if address == base + u64::from(r.inv_req) * 4 {
+                self.registers
+                    .insert(base + u64::from(r.inv_ack) * 4, value & 0xffff);
+            }
+        }
         if let Some((when, cap)) = self.revoke_on {
             if address == when {
                 cap.revoke();
             }
         }
     }
-    fn memory(&mut self, _: MmioRegion, offset: u64, value: u32) {
-        self.memory[offset as usize / 4] = value;
+    fn memory(&mut self, map: MmioRegion, offset: u64, value: u32) {
+        assert!(offset + 4 <= map.len);
+        self.memory.insert(map.phys.raw() + offset, value);
+    }
+    fn memory64(&mut self, map: MmioRegion, offset: u64, value: u64) {
+        assert!(offset % 8 == 0 && offset + 8 <= map.len);
+        let address = map.phys.raw() + offset;
+        self.stores += 1;
+        // Sparse: zero is the default, so megabyte table clears stay cheap.
+        for (address, half) in [(address, value as u32), (address + 4, (value >> 32) as u32)] {
+            if half == 0 {
+                self.memory.remove(&address);
+            } else {
+                self.memory.insert(address, half);
+            }
+        }
     }
 }
-fn run<T>(future: impl Future<Output = T>) -> T {
+impl Fake {
+    pub(super) fn word(&self, phys: u64) -> u32 {
+        self.memory.get(&phys).copied().unwrap_or(0)
+    }
+}
+pub(super) fn run<T>(future: impl Future<Output = T>) -> T {
     narf_scheduler::block_on_spin(future)
 }
-fn fixture() -> (Pool, Engine<Fake>) {
+pub(super) const BAR: u64 = 0x9000_0000;
+pub(super) const VRAM: u64 = 0x8_0000_4000;
+/// BAR-physical address of a GPU physical address: fb 0x8_0000_0000 and
+/// FB_OFFSET 0x1_0000_0000 put VRAM byte `VRAM` at physical 0x1_0000_4000.
+pub(super) fn bar(physical: u64) -> u64 {
+    physical - 0x1_0000_4000 + BAR
+}
+pub(super) fn fixture() -> (Pool, Engine<Fake>) {
+    fixture_sized(BYTES)
+}
+pub(super) fn fixture_sized(len: u64) -> (Pool, Engine<Fake>) {
+    fixture_with(len, &[])
+}
+pub(super) fn fixture_with(len: u64, protected: &[core::ops::Range<u64>]) -> (Pool, Engine<Fake>) {
     let layout = Layout {
         bases: [0x10000, 0x20000],
         nbio: 0x30000,
@@ -51,28 +96,22 @@ fn fixture() -> (Pool, Engine<Fake>) {
     registers.insert(0x10000 + 0x16e7 * 4, 0x100);
     registers.insert(0x30000 + 0x12d * 4, 0x7f000);
     let map = MmioRegion {
-        phys: narf_memory::PhysAddr::new(0x90000000),
+        phys: narf_memory::PhysAddr::new(BAR),
         virt: 0,
-        len: BYTES,
+        len,
         kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
     };
     // SAFETY: Fake owns all memory accesses; mapping is never dereferenced.
-    let pool = unsafe { Pool::from_owned_range(map, 0x8_0000_4000) }.unwrap();
-    let engine = Engine {
-        io: Fake {
-            registers,
-            writes: Vec::new(),
-            memory: vec![u32::MAX; BYTES as usize / 4],
-            stall: None,
-            revoke_on: None,
-        },
-        authority: Cap::bootstrap(),
-        layout,
-        memory: pool.reserve(BYTES).unwrap(),
-        vram_size: 12 << 30,
-        state: State::Prepared,
-        aperture: None,
+    let pool = unsafe { Pool::from_owned_aperture(map, VRAM, protected) }.unwrap();
+    let fake = Fake {
+        registers,
+        writes: Vec::new(),
+        memory: BTreeMap::new(),
+        stall: None,
+        revoke_on: None,
+        stores: 0,
     };
+    let engine = Engine::new(fake, Cap::bootstrap(), layout, &pool, 12 << 30).unwrap();
     (pool, engine)
 }
 fn gmc_navi22_uses_vram_physical_ptes_and_bounds_vmid0() -> TestResult {
@@ -80,8 +119,11 @@ fn gmc_navi22_uses_vram_physical_ptes_and_bounds_vmid0() -> TestResult {
     let aperture = run(engine.initialize()).unwrap();
     if aperture.start != 0xb_0000_0000
         || aperture.destination != aperture.source + 4096
-        || engine.io.memory[..4] != [0x6061, 1, 0x7061, 1]
-        || engine.io.memory[4..].iter().any(|v| *v != 0)
+        || (0..4)
+            .map(|i| engine.io.word(BAR + i * 4))
+            .ne([0x6061, 1, 0x7061, 1])
+        || engine.io.memory.len() != BYTES as usize / 4
+        || engine.io.memory.iter().skip(4).any(|(_, v)| *v != 0)
     {
         return TestResult::Fail("PTE encoded CPU BAR/GMC address or mapped unowned pages");
     }
@@ -169,7 +211,7 @@ fn gmc_navi22_preflight_refuses_active_hubs_bad_geometry_and_revocation() -> Tes
         }
         if run(engine.initialize()).is_ok()
             || !engine.io.writes.is_empty()
-            || engine.io.memory.iter().any(|v| *v != u32::MAX)
+            || !engine.io.memory.is_empty()
         {
             return TestResult::Fail("bad preflight touched registers or VRAM");
         }
