@@ -817,7 +817,7 @@ impl<I: Io> Engine<I> {
         info: AudioInfo,
     ) -> Result<DisplayAudio, Error> {
         if self.status.uhbr_video_running.is_some() {
-            return self.start_uhbr_audio(path, info).await;
+            return self.start_uhbr_audio(path, info, None).await;
         }
         if self.status.dp_audio.is_some() {
             return Err(Error::Busy);

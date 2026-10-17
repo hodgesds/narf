@@ -685,21 +685,30 @@ fn select_mst_with_budget(
             hdmi: false,
             scdc: false,
             depth: otg::ColorDepth::Bpc8,
-            // No audio on 128b/132b MST streams yet.
-            audio: modeset::sink_audio_info(edid)
-                .filter(|_| matches!(rate, DpRate::Legacy(_)))
-                .and_then(|info| {
-                    otg::mst_audio_info(
-                        info,
-                        &timing,
-                        8,
-                        otg::DpPhySettings {
-                            lanes,
-                            rate: caps.rate,
-                            mst: true,
-                        },
-                    )
-                }),
+            // LPCM rates the stream's blanking carries: on 8b/10b its share
+            // of the MTP, on 128b/132b the whole link as for SST.
+            audio: modeset::sink_audio_info(edid).and_then(|info| match rate {
+                DpRate::Legacy(_) => otg::mst_audio_info(
+                    info,
+                    &timing,
+                    8,
+                    otg::DpPhySettings {
+                        lanes,
+                        rate: caps.rate,
+                        mst: true,
+                    },
+                ),
+                DpRate::Uhbr(rate) => otg::uhbr_audio_info(
+                    info,
+                    &timing,
+                    8,
+                    otg::UhbrSettings {
+                        lanes,
+                        rate,
+                        mst: true,
+                    },
+                ),
+            }),
             avi: otg::Avi::default(),
             limited: false,
             ycbcr420: false,

@@ -611,10 +611,12 @@ transport witnesses. Partial writes and failed shutdown retain audio/payload
 ownership. Models cover independent routes, all RGB depths, stale allocations,
 endpoint collisions, shared DTO and two-stream link-owner handover. Teardown
 stops audio before scanout/video and payload removal.
-Every native endpoint (TMDS, FRL, legacy/UHBR DP SST, legacy MST) advertises
+Every native endpoint (TMDS, FRL, legacy/UHBR DP SST, legacy/UHBR MST) advertises
 the sink's valid compressed SADs and HBR from Linux's 8-channel 192-kHz
 bandwidth probe; FRL reserves the highest SAD rate/channels like
-get_audio_check. UHBR MST audio remains open; physical
+get_audio_check. UHBR MST LPCM uses the stream's HPO APG and, as Linux
+does, the 128b/132b SST budget (whole link, timing blank), started only on a
+completed manager payload whose SAT row stays a witness; physical
 audio is untested. FRL LPCM and HDMI 4:2:0 have model coverage
 as described above. None of it has run on hardware.
 Native FRL frontend retirement now drains all generic packet schedules through
@@ -789,8 +791,8 @@ share the owner's HPO link encoder with all 64 slots from slot 0, and each
 stream's HPO encoder is prepared blank, given its payload (SAT rows with ACT,
 the VC rate and blanking width matched against Linux's fixed-point
 arithmetic) and only then unblanked; teardown blanks, removes the payload and
-stops the stream. UHBR MST audio is not offered yet (implementation and
-register models; no hardware run).
+stops the stream. Its LPCM rides the stream's HPO APG once the payload
+completed (implementation and register models; no hardware run).
 
 Native 8b/10b DP MST now reaches the platform display monitor and KMS for one
 branch, beside every board port: KMS routes any connector (board port or end

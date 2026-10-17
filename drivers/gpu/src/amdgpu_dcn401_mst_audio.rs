@@ -138,6 +138,11 @@ impl<I: Io> Engine<I> {
         info: AudioInfo,
         slots: u8,
     ) -> Result<DisplayAudio, Error> {
+        // 128b/132b MST: the HPO stream's APG, budgeted as Linux budgets
+        // 128b/132b SST.
+        if self.status.uhbr_video_running.is_some() {
+            return self.start_uhbr_audio(path, info, Some(slots)).await;
+        }
         if self.status.dp_audio.is_some() || self.status.mst_audio_payload.is_some() {
             return Err(Error::Busy);
         }
@@ -227,7 +232,8 @@ impl<I: Io> Engine<I> {
     }
 }
 impl Otg {
-    /// Start LPCM on the selected MST stream's completed payload.
+    /// Start LPCM on the selected MST stream's completed payload (DIO on
+    /// 8b/10b, the HPO stream's APG on 128b/132b).
     /// # Safety
     /// The manager has completed the sink/source payload transaction and owns
     /// `slots` for this stream. Exclude other payload/audio/video writers, as

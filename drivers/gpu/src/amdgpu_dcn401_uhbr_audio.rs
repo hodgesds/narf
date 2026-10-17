@@ -66,10 +66,6 @@ impl<I: Io> Engine<I> {
             }
             _ => return Err(Error::Busy),
         }
-        // UHBR MST audio (per-stream APG budgets) is not implemented.
-        if v.link.settings.mst {
-            return Err(Error::Unsupported);
-        }
         if v.link.path != path {
             return Err(Error::Invalid);
         }
@@ -123,6 +119,9 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Readback(at(r)));
             }
         }
+        if v.link.settings.mst {
+            self.uhbr_mst_audio_payload(v)?;
+        }
         if self.az_read(a.endpoint, AZ_HOT_PLUG)? & (AUDIO_ENABLED | CLOCK_GATING_DISABLE)
             != AUDIO_ENABLED
         {
@@ -130,15 +129,48 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
+    /// An MST stream's audio rides its completed payload: the unblanked
+    /// stream acknowledged by the manager, with exactly one allocation row
+    /// on its link encoder naming it at its recorded slots.
+    fn uhbr_mst_audio_payload(&mut self, v: &UhbrVideoRunning) -> Result<(), Error> {
+        let l = self.layout;
+        let sat = |vc: u64| DpStream::Hpo(v.link.link).at(l, 0x36bf + vc);
+        let mut rows = 0;
+        for vc in 0..4 {
+            let row = self.read(sat(vc))?;
+            if row & 0x7f00 != 0 && row & 7 == u32::from(v.stream) {
+                if row >> 8 & 0x7f != u32::from(v.payload.slots) {
+                    return Err(Error::Readback(sat(vc)));
+                }
+                rows += 1;
+            }
+        }
+        if rows != 1 || !v.acknowledged {
+            return Err(Error::Readback(sat(0)));
+        }
+        Ok(())
+    }
+    /// LPCM on the running 128b/132b stream: SST (`mst` None), or an MST
+    /// stream whose manager payload of `mst` slots completed. Linux budgets
+    /// both against the whole link and the timing's blank width.
     pub(super) async fn start_uhbr_audio(
         &mut self,
         path: Path,
         info: AudioInfo,
+        mst: Option<u8>,
     ) -> Result<DisplayAudio, Error> {
         if self.status.uhbr_audio.is_some() {
             return Err(Error::Busy);
         }
         let v = self.uhbr_audio_video(path)?;
+        match mst {
+            // MST needs a completed manager payload as well as running video.
+            None if v.link.settings.mst => return Err(Error::Unsupported),
+            Some(_) if !v.link.settings.mst => return Err(Error::Invalid),
+            Some(slots) if slots != v.payload.slots => return Err(Error::Invalid),
+            Some(_) => self.uhbr_mst_audio_payload(&v)?,
+            None => {}
+        }
         let t = v.timing.blank.timing.request.timing;
         let info = uhbr_audio_info(info, &t, bpc(&v), v.link.settings).ok_or(Error::Unsupported)?;
         let (descriptors, ac3, _) = descriptors(&info, &t, None);

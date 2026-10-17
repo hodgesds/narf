@@ -2230,8 +2230,9 @@ kernel_test_in!(
 /// UHBR rate on every lane (decide_mst_link_settings, then
 /// mst_decide_link_encoding_format): each 2160p60 stream takes 12 of the
 /// link's 64 slots (dm_mst_get_pbn_divider at 4 x UHBR20), its source rate
-/// is the HPO one, and no audio is offered on it yet. The same branch
-/// without UHBR fits one such stream on 4 x HBR2.
+/// is the HPO one, and its LPCM is filtered as Linux budgets 128b/132b SST
+/// (the whole link, the timing's blank). The same branch without UHBR fits
+/// one such stream on 4 x HBR2.
 fn navi48_mst_selection_trains_uhbr_when_the_branch_codes_it() -> TestResult {
     use crate::dp_mst_mgr::Sink;
     let mut caps = DpCaps {
@@ -2241,9 +2242,12 @@ fn navi48_mst_selection_trains_uhbr_when_the_branch_codes_it() -> TestResult {
         fec: false,
         dsc: None,
     };
+    // Stereo and 8ch LPCM at every sample rate.
+    const AUDIO: &[u8] = &[0x26, 0x09, 0x7f, 7, 0x0f, 0x7f, 7];
+    let edid = with_blocks(edid_2160p(), &[AUDIO]);
     let devices = [
-        (Sink { branch: 0, port: 1 }, edid_2160p(), u16::MAX),
-        (Sink { branch: 0, port: 2 }, edid_2160p(), u16::MAX),
+        (Sink { branch: 0, port: 1 }, edid.clone(), u16::MAX),
+        (Sink { branch: 0, port: 2 }, edid.clone(), u16::MAX),
     ];
     let s = super::super::select_mst(0, caps, &devices, &|_| None);
     let settings = otg::UhbrSettings {
@@ -2252,12 +2256,15 @@ fn navi48_mst_selection_trains_uhbr_when_the_branch_codes_it() -> TestResult {
         mst: true,
     };
     let (vc, _) = otg::uhbr_mst_rate(&s[0].timing, 8, settings).unwrap();
+    let audio =
+        sink_audio_info(&edid).and_then(|a| otg::uhbr_audio_info(a, &s[0].timing, 8, settings));
     if s.len() != 2
         || s.iter().any(|s| {
             s.rate != DpRate::Uhbr(otg::UhbrRate::Uhbr20)
                 || s.lanes != 4
                 || s.timing.h_active != 3840
-                || s.audio.is_some()
+                || audio.is_none()
+                || s.audio != audio
                 || s.mst.map(|m| (m.slots, m.rate)) != Some((12, (vc >> 25, vc & 0x1ff_ffff)))
         })
     {

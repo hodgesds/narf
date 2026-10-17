@@ -1685,7 +1685,12 @@ minimum blanking width, matched against Linux's fixed-point code), then
 (`blank_uhbr_mst_video`), removes the payload, and only then
 `stop_uhbr_mst_stream` disables the stream, refusing while its VC rate or a
 SAT row remains. `Siblings::hpo` holds stream encoders and `hpo_links` the link
-encoders they ride. UHBR MST audio is refused (`Unsupported`).
+encoders they ride. UHBR MST LPCM (`Otg::start_mst_audio` on an HPO stream)
+uses the stream's APG and endpoint as UHBR SST does, with Linux's 128b/132b
+budget (the whole link and the timing's blank width, not the slot share). It
+starts only with the manager's completed `slots`, an acknowledged payload and
+exactly one SAT row naming the stream at those slots, which the running
+audio's checks keep verifying; the plain DP entry refuses it (`Unsupported`).
 Legacy MST LPCM uses each stream's AFMT and endpoint as described below.
 This path is model-tested only.
 
@@ -2077,7 +2082,7 @@ then may scanout, video and payload retire. The MST activation checkpoint covers
 completed scanout before audio starts. Models cover independent stream/pipe/PHY
 indices, all RGB depths, malformed/stale payloads, failures, endpoint collisions,
 shared DTO and two-stream link handover. 2268 bandwidth vectors match Linux's
-routines. UHBR MST audio, MST DSC and physical audio acceptance remain outside this
+routines. MST DSC and physical audio acceptance remain outside this
 contract.
 
 `start_display_hdmi_video(port)` starts the blank timing, repeats the FIFO reset

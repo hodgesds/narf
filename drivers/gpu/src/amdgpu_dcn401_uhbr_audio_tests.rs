@@ -95,6 +95,9 @@ fn fixture(stream: u8, pipe: u8, settings: UhbrSettings) -> (Engine<AudioIo>, Si
         e.io.inner.regs.insert(BASE + (0x5f4 + h * 0xdc) * 4, 3);
     }
     sink.status = VecDeque::from([status(7, 0xd, [0; 4])]);
+    if settings.mst {
+        sink.bytes.insert(0x111, 7); // the manager's MST_EN
+    }
     run(e.train_uhbr_link(&mut sink, path(p), settings, LINK)).unwrap();
     let shift = 4 * u32::from(stream);
     e.io.inner
@@ -103,7 +106,15 @@ fn fixture(stream: u8, pipe: u8, settings: UhbrSettings) -> (Engine<AudioIo>, Si
     e.io.inner
         .regs
         .insert(LE_ROOT - 4, (8 | u32::from(p)) << shift);
-    run(e.start_uhbr_video(&mut sink, path(p), stream, pipe, c)).unwrap();
+    if settings.mst {
+        // The MST manager's half: blank stream, payload with ACT, unblank.
+        run(e.prepare_uhbr_mst_stream(path(p), stream, pipe, c, 6)).unwrap();
+        let table = [MstAllocation { stream, slots: 6 }];
+        super::uhbr_mst_payload(&mut e, p, &table).unwrap();
+        run(e.start_uhbr_mst_video(path(p))).unwrap();
+    } else {
+        run(e.start_uhbr_video(&mut sink, path(p), stream, pipe, c)).unwrap();
+    }
     (
         Engine {
             io: AudioIo {
@@ -494,4 +505,67 @@ fn dcn401_uhbr_audio_filters_capabilities_and_binds_scanout() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-uhbr-audio",
     dcn401_uhbr_audio_filters_capabilities_and_binds_scanout
+);
+
+/// LPCM on a 128b/132b MST stream rides its completed payload, as legacy
+/// MST audio does: the SST entry refuses it, a slot count other than the
+/// stream's or a SAT row that disagrees is refused before any write, and
+/// the running audio's checks include the stream's allocation row. The
+/// APG, endpoint and packets are the SST ones, budgeted as Linux budgets
+/// 128b/132b SST (the whole link and the timing's blank).
+fn dcn401_uhbr_mst_audio_rides_a_completed_payload() -> TestResult {
+    let settings = UhbrSettings {
+        lanes: 4,
+        rate: UhbrRate::Uhbr20,
+        mst: true,
+    };
+    let (mut e, _sink) = fixture(2, 1, settings);
+    let p = path(2);
+    if run(e.start_dp_audio(p, info())) != Err(Error::Unsupported)
+        || run(e.start_mst_audio(p, info(), 7)) != Err(Error::Invalid)
+    {
+        return TestResult::Fail("MST audio without its payload");
+    }
+    let sat = hpo(LINK, 0x36bf);
+    let row = e.io.inner.inner.regs[&sat];
+    e.io.inner.inner.regs.insert(sat, row & !0x7f00 | 5 << 8);
+    let writes = e.io.writes.len();
+    if run(e.start_mst_audio(p, info(), 6)) != Err(Error::Readback(sat))
+        || e.io.writes.len() != writes
+        || e.status.uhbr_audio.is_some()
+    {
+        return TestResult::Fail("disagreeing allocation row");
+    }
+    e.io.inner.inner.regs.insert(sat, row);
+    let a = match run(e.start_mst_audio(p, info(), 6)) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("MST audio start"),
+    };
+    let v = e.status.uhbr_video_running.unwrap();
+    let t = v.timing.blank.timing.request.timing;
+    if a.endpoint != 2
+        || Some(a.info) != uhbr_audio_info(info(), &t, 8, settings)
+        || reg(&e, 2, 0x3631) & 1 != 1
+        || reg(&e, 2, 0x367c) & 0x1f != 7
+        || e.uhbr_audio_verify(&v, &a).is_err()
+    {
+        return TestResult::Fail("MST stream audio");
+    }
+    // Losing the stream's allocation row breaks the audio's witness.
+    e.io.inner.inner.regs.insert(sat, 0);
+    if e.uhbr_audio_verify(&v, &a).is_ok() {
+        return TestResult::Fail("audio without an allocation row");
+    }
+    e.io.inner.inner.regs.insert(sat, row);
+    if run(e.stop_dp_audio(p)).is_err()
+        || e.status.uhbr_audio.is_some()
+        || e.uhbr_audio_quiet(2).is_err()
+    {
+        return TestResult::Fail("MST audio stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_uhbr_mst_audio_rides_a_completed_payload
 );

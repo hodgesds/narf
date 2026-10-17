@@ -2073,13 +2073,20 @@ impl ColdBoot {
     ) -> Result<otg::DisplayAudio, otg::Error> {
         let path = self.dp_phy_path(port)?;
         let otg = self.otg.as_mut().map_err(|e| *e)?;
+        let status = otg.status();
+        let mst_stream = status
+            .dp_video_running
+            .filter(|v| v.frontend.link.phy.settings.mst)
+            .map(|v| v.frontend.request.stream)
+            .or(status
+                .uhbr_video_running
+                .filter(|v| v.link.settings.mst)
+                .map(|v| v.stream));
         let mst_slots = if !hdmi {
-            otg.status()
-                .dp_video_running
-                .filter(|v| v.frontend.link.phy.settings.mst)
-                .map(|v| {
+            mst_stream
+                .map(|stream| {
                     let link = self.mst.get(&port).ok_or(otg::Error::Invalid)?;
-                    link.audio_slots(v.frontend.request.stream)
+                    link.audio_slots(stream)
                 })
                 .transpose()?
         } else {
