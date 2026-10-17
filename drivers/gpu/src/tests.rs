@@ -11470,11 +11470,8 @@ fn smoke_amdgpu_cs_parser_rejects_hostile_input() -> TestResult {
     // A dropped ordering constraint is a race, not an error.
     for id in [
         u::AMDGPU_CHUNK_ID_DEPENDENCIES,
-        u::AMDGPU_CHUNK_ID_SYNCOBJ_IN,
-        u::AMDGPU_CHUNK_ID_SYNCOBJ_OUT,
         u::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT,
         u::AMDGPU_CHUNK_ID_FENCE,
-        u::AMDGPU_CHUNK_ID_BO_HANDLES,
     ] {
         let mut other = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
         other.header[0] = id;
@@ -11543,6 +11540,9 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
                 seen.push((s.ibs[0].va_start, s.ibs[0].length_dw, vm.root_pde()));
                 Ok(seen.len() as u64)
             })
+        }
+        fn signalled(&self, seq: u64) -> bool {
+            self.completed.load(Ordering::SeqCst) >= seq
         }
         fn wait(
             &self,
@@ -11629,6 +11629,41 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
         w
     };
     let card = 0x7ffe_0000;
+    let syncobjs = narf_lib::sync::IrqSafeSpinLock::new(crate::drm::syncobj::SyncObjTable::new());
+    // A CS of the IB chunk plus `extra` chunks (id, body), in the real
+    // three-level layout; the storage lives as long as the request.
+    struct Cs {
+        _bodies: alloc::vec::Vec<alloc::vec::Vec<u32>>,
+        _headers: alloc::vec::Vec<[u32; 4]>,
+        _pointers: alloc::vec::Vec<u64>,
+        req: [u8; 24],
+    }
+    let cs_with = |extra: &[(u32, alloc::vec::Vec<u32>)]| -> Box<Cs> {
+        let mut bodies = alloc::vec![body.to_vec()];
+        bodies.extend(extra.iter().map(|(_, b)| b.clone()));
+        let ids: alloc::vec::Vec<u32> = core::iter::once(u::AMDGPU_CHUNK_ID_IB)
+            .chain(extra.iter().map(|(id, _)| *id))
+            .collect();
+        let headers: alloc::vec::Vec<[u32; 4]> = bodies
+            .iter()
+            .zip(&ids)
+            .map(|(b, id)| {
+                let at = b.as_ptr() as u64;
+                [*id, b.len() as u32, at as u32, (at >> 32) as u32]
+            })
+            .collect();
+        let pointers: alloc::vec::Vec<u64> = headers.iter().map(|h| h.as_ptr() as u64).collect();
+        let mut req = [0u8; 24];
+        req[0..4].copy_from_slice(&ctx_id.to_le_bytes());
+        req[8..12].copy_from_slice(&(pointers.len() as u32).to_le_bytes());
+        req[16..24].copy_from_slice(&(pointers.as_ptr() as u64).to_le_bytes());
+        Box::new(Cs {
+            _bodies: bodies,
+            _headers: headers,
+            _pointers: pointers,
+            req,
+        })
+    };
     let run = |cmd: u32, arg: &mut [u8]| {
         narf_scheduler::block_on_spin(dispatch_async(
             card,
@@ -11637,6 +11672,7 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
             &state,
             &gem,
             &ctx,
+            &syncobjs,
         ))
     };
     if run(cs_cmd, &mut cs.clone()) != Err(FsError::Unsupported) {
@@ -11698,6 +11734,69 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
         }
         if run(idle_cmd, &mut idle_req(handle + 7)) != Err(FsError::InvalidData) {
             return Some("GEM_WAIT_IDLE of an unknown handle");
+        }
+        // SYNCOBJ_OUT carries the job's fence; SYNCOBJ_IN needs a fence that
+        // exists (and here is signalled); unknown syncobjs are refused.
+        let (out_h, done_h, empty_h) = {
+            let mut t = syncobjs.lock();
+            let flags = crate::drm::syncobj::SYNCOBJ_CREATE_SIGNALED;
+            (
+                t.create(0).unwrap_or(0),
+                t.create(flags).unwrap_or(0),
+                t.create(0).unwrap_or(0),
+            )
+        };
+        let mut c = cs_with(&[
+            (u::AMDGPU_CHUNK_ID_SYNCOBJ_IN, alloc::vec![done_h]),
+            (u::AMDGPU_CHUNK_ID_SYNCOBJ_OUT, alloc::vec![out_h]),
+        ]);
+        if run(cs_cmd, &mut c.req).is_err()
+            || u64::from_le_bytes(c.req[0..8].try_into().unwrap()) != 2
+        {
+            return Some("CS with syncobjs");
+        }
+        let signalled = || {
+            syncobjs
+                .lock()
+                .get(out_h)
+                .map(|o| o.is_signalled())
+                .unwrap_or(false)
+        };
+        if signalled() {
+            return Some("out syncobj signalled before its job");
+        }
+        fake.completed.store(2, Ordering::SeqCst);
+        if !signalled() {
+            return Some("out syncobj follows its job");
+        }
+        for (chunk, handle, want) in [
+            (u::AMDGPU_CHUNK_ID_SYNCOBJ_IN, empty_h, FsError::InvalidData),
+            (u::AMDGPU_CHUNK_ID_SYNCOBJ_IN, 0x7777, FsError::NotFound),
+            (u::AMDGPU_CHUNK_ID_SYNCOBJ_OUT, 0x7777, FsError::NotFound),
+        ] {
+            let mut c = cs_with(&[(chunk, alloc::vec![handle])]);
+            if run(cs_cmd, &mut c.req) != Err(want) {
+                return Some("bad syncobj");
+            }
+        }
+        // BO_HANDLES: every listed BO must be this open's.
+        let list = |bo: u32| {
+            let entries = Box::new([bo, 0u32]);
+            let at = entries.as_ptr() as u64;
+            (
+                entries,
+                alloc::vec![0u32, 0, 1, 8, at as u32, (at >> 32) as u32],
+            )
+        };
+        let (_keep, good) = list(handle);
+        let mut c = cs_with(&[(u::AMDGPU_CHUNK_ID_BO_HANDLES, good)]);
+        if run(cs_cmd, &mut c.req).is_err() {
+            return Some("CS with a BO list");
+        }
+        let (_keep, bad) = list(handle + 7);
+        let mut c = cs_with(&[(u::AMDGPU_CHUNK_ID_BO_HANDLES, bad)]);
+        if run(cs_cmd, &mut c.req) != Err(FsError::NotFound) {
+            return Some("BO list naming a foreign handle");
         }
         None
     })();

@@ -612,6 +612,29 @@ impl<I: Io> Engine<I> {
         })
     }
 }
+/// Reads the graphics queue's job fence without the queue's owner: its
+/// own capability, an HDP flush, then the fence word. Concurrent flushes
+/// and reads are harmless, so syncobj fences can poll it from anywhere.
+#[derive(Clone, Copy, Debug)]
+pub struct FenceReader {
+    regs: MmioRegion,
+    authority: Cap<BusDeviceCap, Write>,
+    layout: Layout,
+    map: MmioRegion,
+}
+impl FenceReader {
+    /// The last client job sequence the graphics ring completed.
+    pub fn completed(&self) -> Result<u32, Error> {
+        let mut io = Mmio(self.regs);
+        let (l, map) = (self.layout, self.map);
+        self.authority
+            .invoke(Op(|| {
+                flush(&mut io, l);
+                io.memory_read(map, JOB_FENCE)
+            }))
+            .map_err(|_| Error::Revoked)
+    }
+}
 #[derive(Debug)]
 pub struct Queues(Engine<Mmio>);
 impl Queues {
@@ -686,6 +709,15 @@ impl Queues {
     /// The last client job sequence the graphics ring completed.
     pub fn completed_job(&mut self) -> Result<u32, Error> {
         self.0.completed_job()
+    }
+    /// A reader of the job fence that needs no access to this owner.
+    pub fn fence_reader(&self) -> FenceReader {
+        FenceReader {
+            regs: self.0.io.0,
+            authority: self.0.authority,
+            layout: self.0.layout,
+            map: self.0.memory.mapping(),
+        }
     }
 }
 #[cfg(feature = "kernel-test")]

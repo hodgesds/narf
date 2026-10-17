@@ -3554,7 +3554,15 @@ paths; only the tables differ.
   waits for the open's last job (`VmState::last_job`; a buffer another
   process uses through PRIME is not covered) and reports the buffer's
   preferred domains. `dispatch_async` notes every submitted job on its
-  address space. Without a submitter, CS parses and is refused as before
+  address space. `AMDGPU_CHUNK_ID_SYNCOBJ_IN`/`_OUT` and `BO_HANDLES` are
+  accepted: in-syncobjs must hold a fence (EINVAL without, ENOENT unknown)
+  and are waited for before queueing — the ioctl waits, where Linux's
+  scheduler would hold the job; out-syncobjs get the job's `JobFence`
+  (signalled through `Submitter::signalled`); every listed BO must be the
+  open's (ENOENT), with no residency or implicit sync. amdgpu opens now
+  route the DRM syncobj ioctls (0xbf..=0xc5) to their own table
+  (`drm_ioctl_bridge::dispatch_syncobj`). `DEPENDENCIES`, timeline syncobjs
+  and `FENCE` chunks are still refused. Without a submitter, CS parses and is refused as before
   and GEM_WAIT_IDLE reports idle. `pm4::Pm4Builder::vm_flush` builds the in-ring VM flush
   (shared by GMC 11 and 12).
 

@@ -409,6 +409,11 @@ impl FileOps for DriCardFile {
         // and Linux serves it from both (the INFO ioctl carries neither
         // DRM_AUTH nor DRM_MASTER in amdgpu's table).
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+            // DRM syncobjs, in this open's table (the one CS signals).
+            if let Some(result) = crate::drm_ioctl_bridge::dispatch_syncobj(cmd, arg, &self.virtgpu)
+            {
+                return result;
+            }
             match crate::amdgpu_gem::dispatch(cmd, arg, &self.amdgpu_gem) {
                 Err(FsError::Unsupported) => {}
                 result => return result,
@@ -497,6 +502,7 @@ impl FileOps for DriCardFile {
                     &self.amdgpu_vm,
                     &self.amdgpu_gem,
                     &self.amdgpu_ctx,
+                    self.virtgpu.syncobjs(),
                 )
                 .await
                 {
@@ -984,6 +990,11 @@ impl FileOps for DriRenderFile {
         // Unimplemented commands return `Unsupported` and fall through to the
         // generic DRM path, as the virtio-gpu dispatcher above does.
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+            // DRM syncobjs, in this open's table (the one CS signals).
+            if let Some(result) = crate::drm_ioctl_bridge::dispatch_syncobj(cmd, arg, &self.virtgpu)
+            {
+                return result;
+            }
             match crate::amdgpu_gem::dispatch(cmd, arg, &self.amdgpu_gem) {
                 Err(FsError::Unsupported) => {}
                 result => return result,
@@ -1048,6 +1059,7 @@ impl FileOps for DriRenderFile {
                     &self.amdgpu_vm,
                     &self.amdgpu_gem,
                     &self.amdgpu_ctx,
+                    self.virtgpu.syncobjs(),
                 )
                 .await
                 {

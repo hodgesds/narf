@@ -211,8 +211,11 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
         crate::amdgpu_navi48_power::start(limits, level);
     }
     // Clients' command submissions run on the graphics queue.
-    if let Some(card) = boot::ColdBoot::drm_card() {
-        crate::amdgpu_cs::register_submitter(card, alloc::sync::Arc::new(Submitter { card }));
+    if let (Some(card), Some(fence)) = (boot::ColdBoot::drm_card(), boot.client_fence_reader()) {
+        crate::amdgpu_cs::register_submitter(
+            card,
+            alloc::sync::Arc::new(Submitter { card, fence }),
+        );
     }
     // Clients' VRAM buffers; without it they fall back to system memory.
     {
@@ -249,6 +252,7 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
 /// unavailable, so Mesa does not submit here.
 struct Submitter {
     card: u32,
+    fence: crate::amdgpu_gfx12_queue::FenceReader,
 }
 /// Whether 32-bit job `seq` is at or before `completed` (sequences wrap).
 fn job_done(completed: u32, seq: u64) -> bool {
@@ -256,6 +260,17 @@ fn job_done(completed: u32, seq: u64) -> bool {
 }
 const CLIENT_VMID: u8 = 1;
 impl crate::amdgpu_cs::Submitter for Submitter {
+    fn signalled(&self, seq: u64) -> bool {
+        match self.fence.completed() {
+            Ok(completed) => {
+                crate::amdgpu_cs::retire(self.card, &|s| job_done(completed, s));
+                job_done(completed, seq)
+            }
+            // A revoked or vanished device makes no more progress; report
+            // done so waiters cannot wedge.
+            Err(_) => true,
+        }
+    }
     fn submit<'a>(
         &'a self,
         vm: &'a crate::amdgpu_vm::VmState,
@@ -316,11 +331,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             use narf_filesystem::FsError;
             let seq = u32::try_from(seq).map_err(|_| FsError::InvalidData)?;
             loop {
-                let completed = {
-                    let mut owner = OWNER.lock().await;
-                    let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
-                    boot.completed_client_job().map_err(|_| FsError::NoDevice)?
-                };
+                let completed = self.fence.completed().map_err(|_| FsError::NoDevice)?;
                 crate::amdgpu_cs::retire(self.card, &|s| job_done(completed, s));
                 if job_done(completed, u64::from(seq)) {
                     return Ok(true);

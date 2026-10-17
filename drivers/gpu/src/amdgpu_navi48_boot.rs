@@ -711,6 +711,15 @@ impl ColdBoot {
         // SAFETY: the caller's obligations.
         unsafe { queues.submit(job) }
     }
+    /// A reader of the graphics ring's job fence that needs no access to
+    /// this owner.
+    pub(crate) fn client_fence_reader(&self) -> Option<queues::FenceReader> {
+        self.sequence
+            .backend
+            .queues
+            .as_ref()
+            .map(queues::Queues::fence_reader)
+    }
     /// The last client job sequence the graphics ring completed.
     pub(crate) fn completed_client_job(&mut self) -> Result<u32, queues::Error> {
         self.sequence

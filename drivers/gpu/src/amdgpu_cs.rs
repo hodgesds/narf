@@ -59,14 +59,12 @@
 //! client reaches this ioctl at all; it is reachable only by something that
 //! ignored that answer.
 //!
-//! LINUX-GAP: only `AMDGPU_CHUNK_ID_IB` is accepted. The dependency and
-//! synchronisation chunks — `DEPENDENCIES`, `SYNCOBJ_IN`/`_OUT`,
-//! `SYNCOBJ_TIMELINE_WAIT`/`_SIGNAL`, `SCHEDULED_DEPENDENCIES` — each express
-//! an ordering constraint against other submissions, and there is no
-//! scheduler to order against. They are REFUSED rather than ignored: a client
-//! that asked for its work to wait on a fence and had that silently dropped
-//! would get a race, not an error. `BO_HANDLES` and `FENCE` are refused for
-//! the same reason.
+//! LINUX-GAP: besides IBs, only `SYNCOBJ_IN`/`_OUT` and `BO_HANDLES`
+//! chunks are accepted. `DEPENDENCIES`, `SCHEDULED_DEPENDENCIES`, timeline
+//! syncobjs and `FENCE` each express a constraint this does not honour yet,
+//! and are REFUSED rather than ignored: a client that asked for its work
+//! to wait on a fence and had that silently dropped would get a race, not
+//! an error.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -129,6 +127,46 @@ pub struct Ib {
 pub struct Submission {
     pub ctx_id: u32,
     pub ibs: Vec<Ib>,
+    /// Syncobjs whose fences the job waits for (`AMDGPU_CHUNK_ID_SYNCOBJ_IN`).
+    pub in_syncobjs: Vec<u32>,
+    /// Syncobjs that get the job's fence (`AMDGPU_CHUNK_ID_SYNCOBJ_OUT`).
+    pub out_syncobjs: Vec<u32>,
+    /// The BO list (`AMDGPU_CHUNK_ID_BO_HANDLES`), at most one per job.
+    pub bo_handles: Option<Vec<u32>>,
+}
+
+/// Bound on one chunk's syncobjs: far beyond what Mesa sends.
+const MAX_SYNCOBJS: u32 = 1024;
+/// Bound on a BO list's entries (`AMDGPU_BO_LIST_MAX_PRIORITY` aside, Linux
+/// bounds it by `INT_MAX / info_size`; this caps the copy).
+const MAX_BO_HANDLES: u32 = 1 << 16;
+
+/// `amdgpu_cs_p1_bo_handles`: a `drm_amdgpu_bo_list_in` { operation,
+/// list_handle, bo_number, bo_info_size, bo_info_ptr } whose entries each
+/// begin with a GEM handle (`drm_amdgpu_bo_list_entry`).
+fn parse_bo_handles(words: &[u32]) -> Result<Vec<u32>, FsError> {
+    if words.len() < 6 {
+        return Err(FsError::InvalidData);
+    }
+    let (count, size) = (words[2], words[3]);
+    let pointer = u64::from(words[4]) | u64::from(words[5]) << 32;
+    if count > MAX_BO_HANDLES || (count != 0 && size < 4) || size > 64 {
+        return Err(FsError::InvalidData);
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if pointer == 0 {
+        return Err(FsError::BadAddress);
+    }
+    let bytes = count as usize * size as usize;
+    // SAFETY: `pointer` is the client's entry array; `copy_in` bounds-checks
+    // `bytes` (itself bounded above) and SMAP-brackets the read.
+    let raw = unsafe { copy_in(pointer as usize, bytes)? };
+    Ok(raw
+        .chunks_exact(size as usize)
+        .map(|e| u32::from_le_bytes(e[0..4].try_into().unwrap()))
+        .collect())
 }
 
 /// How many IBs one ring type accepts (`amdgpu_ring_max_ibs`).
@@ -274,6 +312,9 @@ pub fn parse(
         .collect();
 
     let mut ibs: Vec<Ib> = Vec::new();
+    let mut in_syncobjs = Vec::new();
+    let mut out_syncobjs = Vec::new();
+    let mut bo_handles = None;
     for pointer in pointers {
         if pointer == 0 {
             return Err(FsError::BadAddress);
@@ -299,13 +340,29 @@ pub fn parse(
                 }
                 ibs.push(ib);
             }
+            // `drm_amdgpu_cs_chunk_sem`: one syncobj handle per dword.
+            uapi::AMDGPU_CHUNK_ID_SYNCOBJ_IN | uapi::AMDGPU_CHUNK_ID_SYNCOBJ_OUT => {
+                // SAFETY: as above.
+                let handles = unsafe { read_dwords(chunk_data, length_dw, MAX_SYNCOBJS)? };
+                if chunk_id == uapi::AMDGPU_CHUNK_ID_SYNCOBJ_IN {
+                    in_syncobjs.extend(handles);
+                } else {
+                    out_syncobjs.extend(handles);
+                }
+            }
+            uapi::AMDGPU_CHUNK_ID_BO_HANDLES => {
+                // Only a single BO list is allowed, as in Linux.
+                if bo_handles.is_some() {
+                    return Err(FsError::InvalidData);
+                }
+                // SAFETY: as above.
+                let words = unsafe { read_dwords(chunk_data, length_dw, 64)? };
+                bo_handles = Some(parse_bo_handles(&words)?);
+            }
             // Refused rather than ignored — see the module LINUX-GAP. A
             // dropped ordering constraint is a race, not an error.
             uapi::AMDGPU_CHUNK_ID_FENCE
             | uapi::AMDGPU_CHUNK_ID_DEPENDENCIES
-            | uapi::AMDGPU_CHUNK_ID_BO_HANDLES
-            | uapi::AMDGPU_CHUNK_ID_SYNCOBJ_IN
-            | uapi::AMDGPU_CHUNK_ID_SYNCOBJ_OUT
             | uapi::AMDGPU_CHUNK_ID_SCHEDULED_DEPENDENCIES
             | uapi::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT
             | uapi::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL => return Err(FsError::Unsupported),
@@ -317,7 +374,13 @@ pub fn parse(
     if ibs.is_empty() {
         return Err(FsError::InvalidData);
     }
-    Ok(Submission { ctx_id, ibs })
+    Ok(Submission {
+        ctx_id,
+        ibs,
+        in_syncobjs,
+        out_syncobjs,
+        bo_handles,
+    })
 }
 
 /// The engine behind a card's command submission. A card registers one
@@ -330,6 +393,9 @@ pub trait Submitter: Send + Sync {
         vm: &'a VmState,
         submission: &'a Submission,
     ) -> Pin<Box<dyn Future<Output = Result<u64, FsError>> + Send + 'a>>;
+    /// Whether sequence `seq` has completed, without waiting or blocking
+    /// on an async owner (job fences in syncobjs ask this).
+    fn signalled(&self, seq: u64) -> bool;
     /// Whether sequence `seq` has completed, waiting until monotonic
     /// `deadline_ns` (0: don't wait).
     fn wait(
@@ -360,6 +426,47 @@ fn submitter(card: u32) -> Option<Arc<dyn Submitter>> {
         .iter()
         .find(|(c, _)| *c == card)
         .map(|(_, s)| s.clone())
+}
+
+/// A job's completion as a dma-fence, for the syncobjs a submission
+/// signals (`AMDGPU_CHUNK_ID_SYNCOBJ_OUT`).
+pub struct JobFence {
+    engine: Arc<dyn Submitter>,
+    card: u32,
+    seq: u64,
+}
+impl core::fmt::Debug for JobFence {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("JobFence")
+            .field("card", &self.card)
+            .field("seq", &self.seq)
+            .finish()
+    }
+}
+impl crate::drm::syncobj::DmaFence for JobFence {
+    fn is_signalled(&self) -> bool {
+        self.engine.signalled(self.seq)
+    }
+    fn wait(&self, timeout_ns: u64) -> bool {
+        let deadline = narf_time::monotonic_ns().saturating_add(timeout_ns);
+        loop {
+            if self.engine.signalled(self.seq) {
+                return true;
+            }
+            if narf_time::monotonic_ns() >= deadline {
+                return false;
+            }
+            narf_scheduler::block_on_spin(narf_time::SleepUntil::new(
+                narf_time::Deadline::after_us(50).as_instant(),
+            ));
+        }
+    }
+    /// Only the engine signals a job; a CPU signal is ignored, as a
+    /// dma-fence from a driver's ring is not CPU-signallable.
+    fn signal(&self) {}
+    fn context(&self) -> Option<u64> {
+        Some(u64::from(self.card))
+    }
 }
 
 /// Memory a running job may still reach, freed once its card's engine
@@ -415,6 +522,7 @@ pub async fn dispatch_async(
     vm: &VmState,
     gem: &crate::amdgpu_gem::GemState,
     ctx: &crate::amdgpu_ctx::CtxState,
+    syncobjs: &IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>,
 ) -> Result<u64, FsError> {
     let Some(engine) = submitter(card) else {
         return Err(FsError::Unsupported);
@@ -460,9 +568,58 @@ pub async fn dispatch_async(
         return Err(FsError::Unsupported);
     }
     let submission = validated(arg, vm, ctx)?;
+    // amdgpu_bo_list_create: every listed BO is one this open holds.
+    // LINUX-GAP: the list sets no residency (nothing is evicted) and no
+    // implicit sync (no reservation fences are attached to the BOs).
+    if let Some(handles) = &submission.bo_handles {
+        if handles.iter().any(|&h| gem.lookup(h).is_none()) {
+            return Err(FsError::NotFound);
+        }
+    }
+    // amdgpu_cs_p2_syncobj_in: each named syncobj's fence, which must exist.
+    let fences = if submission.in_syncobjs.is_empty() {
+        Vec::new()
+    } else {
+        syncobjs
+            .lock()
+            .snapshot_fences(&submission.in_syncobjs)
+            .map_err(|_| FsError::NotFound)?
+    };
+    let mut waits = Vec::new();
+    for fence in fences {
+        waits.push(fence.ok_or(FsError::InvalidData)?);
+    }
+    let out: Vec<u32> = submission.out_syncobjs.clone();
+    if !out.is_empty() {
+        let table = syncobjs.lock();
+        if out.iter().any(|&h| table.get(h).is_err()) {
+            return Err(FsError::NotFound);
+        }
+    }
+    // LINUX-GAP: Linux's scheduler holds the job until these signal and
+    // the ioctl returns at once; here the ioctl waits before queueing.
+    for fence in waits {
+        while !fence.is_signalled() {
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
+        }
+    }
     let seq = engine.submit(vm, &submission).await?;
     // What this space drops from now on waits for this job.
     vm.note_job(seq);
+    // amdgpu_cs_post_dependencies: the out syncobjs carry the job's fence.
+    if !out.is_empty() {
+        let fence: Arc<dyn crate::drm::syncobj::DmaFence> = Arc::new(JobFence {
+            engine: engine.clone(),
+            card,
+            seq,
+        });
+        let mut table = syncobjs.lock();
+        for h in out {
+            if let Ok(obj) = table.get_mut(h) {
+                obj.replace_fence(fence.clone());
+            }
+        }
+    }
     // `drm_amdgpu_cs_out.handle`.
     // SAFETY: as above.
     unsafe { copy_out(arg, &seq.to_le_bytes())? };
