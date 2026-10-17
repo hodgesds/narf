@@ -385,6 +385,45 @@ timeout or corrupted data prevents replay. Ring/writeback memory is published
 before reset and retained on every started path; no destructor resets hardware.
 This is one boot execution test, not a general submission or acceleration API.
 
+### Navi 22 OSSSYS 5.0.3 interrupt ring and dispatch
+
+`unsafe amdgpu_ih_navi22::Ih::new(gpu, pci_cap, pool, bus_device)` validates
+OSSSYS 5.0.3, NBIO and HDP 5.0 banks and reserves a 256 KiB VRAM ring plus a
+writeback page and a host NBIO dummy page, without I/O. Only RB0 exists, as in
+Linux for navy_flounder. `unsafe initialize().await` requires ready GMC VMID0.
+It routes MSI-X entry 0, else MSI, else polling (`Delivery`). Then it follows
+`navi10_ih_irq_init`: it disables the ring (inherited enables are recorded in
+`Status::inherited`), runs nbio_v2_3 `ih_control`, and programs
+base/`IH_RB_CNTL` (MC_SPACE 4, 2^16-dword ring, writeback, overflow
+enable/clear, snoop, RPTR_REARM only with MSI) and the OSSSYS 5.0 WPTR_ADDR
+HI/LO (offsets swapped vs 4.0). It zeroes the pointers, disables the
+IH doorbell and NBIO doorbell range, then enables ring/interrupt and the
+5.0.3 self-IV wptr timeout. The ring is in VRAM through the VMID0 system
+aperture, not GTT; rptr goes through `IH_RB_RPTR` because BAR2 is not mapped.
+`unsafe disable().await` mirrors `navi10_ih_irq_disable` with a 1 ms settle.
+It masks the vector and closes every waiter with `Closed::Disabled`; it does
+not reuse the ring.
+
+`Ih::handle()` returns a cloneable `Handle`. `subscribe(Source{client,src})`
+claims the only route for that pair, before or after enable (a second owner
+gets `Busy`). It returns a generation-tagged `Subscription` with a 64-IV
+mailbox that drops the oldest entry when full (`lost()`). `try_next()` and
+`wait().await` deliver queued IVs before a terminal `Closed`
+(`Revoked`, `Disabled`, `DeviceLost`, `AuthorityRevoked`, `Failed`).
+`revoke(source)` retires the current generation; a stale handle never sees a
+newer owner's IVs. `close(reason)` lets other owners report device loss.
+`drain()` runs `navi10_ih_get_wptr` (writeback, register on RB_OVERFLOW,
+resume at wptr+32, clear pulse) and decodes up to 8×32 SOC15 IVs per call
+(`Iv`, with `cp_queue`, `page_fault`, `hpd` helpers). It skips client ids
+≥ 0x20, all-ones and misaligned entries as malformed and writes the rptr back.
+It runs in task context only: the IRQ handler records a count, and waiters
+drain on wake or on a watchdog (10 ms with MSI, 1 ms polling).
+All-ones registers or revoked authority close every waiter. `Stats` exposes
+interrupts, drained, unhandled, malformed, overflows, dropped, unsignalled
+(found without an interrupt) and watchdog counts. `source::*` holds the GFX
+EOP/fault, SDMA traps, VMC/UTCL2 faults, DCN vblank (VSTARTUP)/vupdate/pflip/
+HPD/DMUB-outbox and SMU11 thermal/CTF/MP1 ids.
+
 ### Navi 22 DCN3.0 DMUB startup
 
 `amdgpu_dmub_navi22::Prepared::new(image, vbios, psp_version)` parses the
