@@ -946,6 +946,13 @@ Linux does whenever the VBIOS left SOS running: PMFW (or PSP) mode1 reset,
 PCI config restore including Resizable BAR sizes, then bootloader and MEMSIZE
 waits. Without it the sequence would load SMC/graphics/DMCUB over the
 VBIOS-started SOS and PMFW, a state Linux never initializes from.
+`ResetOnInit` then posts as `amdgpu_device_need_post` does: when BIOS_SCRATCH_7
+lacks ATOM_S7_ASIC_INIT_COMPLETE (after a mode1 reset, or on a never-posted
+card; always after a recovery reset) it runs ATOM ASIC_Init from the retained
+VBIOS through the stepped `amdgpu_atom_vm` (now with IIO programs, Linux's
+sub-dword/SHL/SHR/MUL32/DIV32 semantics and cooperative DELAY sleeps) and
+requires the bit afterwards; a GOP-posted card with the bit set is not posted.
+`drivers/gpu/tools/atom-trace` replays ASIC_Init from a dumped ROM on the host.
 OSSSYS 5.0.3 IH ring 0 now follows navi10_ih_irq_init with a VRAM ring
 reached through VMID0, MSI-X/MSI delivery with polling fallback, and
 overflow-safe task-context drains. It routes IVs to generation-tagged
