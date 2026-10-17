@@ -59,8 +59,9 @@ pub use noop::NoopScheduler;
 pub use cgroup::{dev_id_from_ptr, install_cgroup_io_hook, IoCgroupHook};
 pub use registry::{
     block_device_count, block_devices, disk_of, find_block_device, find_block_device_indexed,
-    register_block_device, register_partition_device, unregister_block_device, BlockDeviceSync,
-    BlockIoError, RegisteredBlockDevice, SyncBlock,
+    find_by_fs_uuid, find_by_partuuid, find_disk_by_bus_path, identity_of, register_block_device,
+    register_block_device_with_identity, register_partition_device, unregister_block_device,
+    BlockDeviceSync, BlockIoError, DiskIdentity, RegisteredBlockDevice, SyncBlock,
 };
 
 use core::future::Future;

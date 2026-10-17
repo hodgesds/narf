@@ -36,7 +36,7 @@ use crate::BlockIoError;
 /// partition scanner is already registering the child device. It is not a
 /// filesystem or encryption probe: the owning layer still validates and opens
 /// the complete format later. FAT serials use Linux's eight-hex-digit form;
-/// ext, LUKS1, and LUKS2 UUIDs use their canonical forms.
+/// ext, btrfs (`fsid`), LUKS1, and LUKS2 UUIDs use their canonical forms.
 pub fn discover_volume_uuid(dev: &dyn BlockDeviceSync) -> Option<String> {
     let lba_bytes = dev.lba_size() as usize;
     if lba_bytes < 512 {
@@ -74,17 +74,26 @@ pub fn discover_volume_uuid(dev: &dyn BlockDeviceSync) -> Option<String> {
         return None;
     }
     let mut bytes = alloc::vec![0u8; blocks * lba_bytes];
-    if dev.read(0, blocks as u16, &mut bytes).is_err()
-        || bytes.get(1024 + 0x38..1024 + 0x3a) != Some(&[0x53, 0xef][..])
+    if dev.read(0, blocks as u16, &mut bytes).is_ok()
+        && bytes.get(1024 + 0x38..1024 + 0x3a) == Some(&[0x53, 0xef][..])
     {
+        let uuid: [u8; 16] = bytes[1024 + 0x68..1024 + 0x68 + 16].try_into().ok()?;
+        return Some(crate::registry::format_uuid_bytes(&uuid));
+    }
+
+    // btrfs: the primary superblock is at 64 KiB, `magic` "_BHRfS_M" at
+    // +0x40 and the filesystem `fsid` (what blkid reports as UUID) at +0x20.
+    const BTRFS_SB: usize = 0x1_0000;
+    if BTRFS_SB % lba_bytes != 0 {
         return None;
     }
-    let uuid = &bytes[1024 + 0x68..1024 + 0x68 + 16];
-    Some(format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
-        uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]
-    ))
+    let mut sb = alloc::vec![0u8; lba_bytes];
+    dev.read((BTRFS_SB / lba_bytes) as u64, 1, &mut sb).ok()?;
+    if sb.get(0x40..0x48) != Some(b"_BHRfS_M".as_slice()) {
+        return None;
+    }
+    let fsid: [u8; 16] = sb.get(0x20..0x30)?.try_into().ok()?;
+    Some(crate::registry::format_uuid_bytes(&fsid))
 }
 
 // ── Common signatures ──────────────────────────────────────────────
@@ -464,7 +473,7 @@ pub enum ScanError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanReport {
     /// Names registered against the block registry (e.g.
-    /// `["nvme0p1", "nvme0p2"]`).
+    /// `["nvme0n1p1", "nvme0n1p2"]`).
     pub registered: Vec<String>,
     /// True iff the disk was GPT (vs legacy MBR).
     pub is_gpt: bool,
