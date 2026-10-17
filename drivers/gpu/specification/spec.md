@@ -3569,9 +3569,13 @@ flush, as gmc_v12_0_emit_pasid_mapping), so a fault carries the client's
 PASID; `VmState::pasid` allocates one per address space
 (`amdgpu_vmid::PasidHandle`) and releases it through the deferred list.
 Each job is noted on its address space and every fence read retires
-completed jobs' deferred frees. VMID reuse and per-client fault reports
-are not implemented, and `AMDGPU_INFO` still reports acceleration
-unavailable.
+completed jobs' deferred frees. The fault monitor charges each VM fault to
+the IV's PASID (`amdgpu_vmid::record_fault`: address from the IV, the hub's
+protection-fault status, GFX 0 / MM 1; a zero status never replaces a
+useful one; faults for freed PASIDs are dropped), and
+`AMDGPU_INFO_GPUVM_FAULT` (`amdgpu_info::dispatch_for`) answers from the
+open's PASID. VMID reuse is not implemented, and `AMDGPU_INFO` still
+reports acceleration unavailable.
 
 ### AMD platform VBIOS
 

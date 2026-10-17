@@ -591,6 +591,16 @@ impl VmState {
         pasid.as_ref().map(crate::amdgpu_vmid::PasidHandle::get)
     }
 
+    /// The last VM fault charged to this space's PASID (zeros for none or
+    /// no PASID yet), for `AMDGPU_INFO_GPUVM_FAULT`.
+    pub fn fault(&self) -> crate::amdgpu_vmid::FaultInfo {
+        self.pasid
+            .lock()
+            .as_ref()
+            .map(|p| crate::amdgpu_vmid::fault(p.get()))
+            .unwrap_or_default()
+    }
+
     /// The last job submitted in this space (0: none).
     pub fn last_job(&self) -> u64 {
         self.last_job.load(core::sync::atomic::Ordering::Acquire)
