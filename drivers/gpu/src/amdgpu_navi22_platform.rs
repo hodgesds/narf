@@ -271,6 +271,7 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
 /// take the owner lock per refresh. Failures are reported, never fatal.
 async fn start_services(boot: &mut boot::ColdBoot) {
     use core::fmt::Write;
+    start_hotplug(boot);
     if boot.queues_verified() {
         crate::amdgpu_navi22_tdr::start();
     }
@@ -304,6 +305,32 @@ async fn start_services(boot: &mut boot::ColdBoot) {
             let _ = writeln!(
                 narf_console::Writer,
                 "amdgpu: navi22 thermal alert failed: {error:?}"
+            );
+        }
+    }
+}
+
+/// HPD over the IH ring (amdgpu_navi22_display::serve_hpd): each vector is
+/// acknowledged under the owner lock, then wakes the hotplug pollers and the
+/// display monitor. Without an IH ring or display owner, polling alone runs.
+fn start_hotplug(boot: &mut boot::ColdBoot) {
+    use core::fmt::Write;
+    match boot.arm_display_hpd() {
+        Ok(subscription) => {
+            narf_scheduler::spawn(crate::amdgpu_navi22_display::serve_hpd(
+                subscription,
+                |hpd| async move {
+                    if let Some(boot) = OWNER.lock().await.as_mut() {
+                        let _ = boot.display_hpd(hpd);
+                    }
+                    crate::amdgpu_navi22_kms::wake();
+                },
+            ));
+        }
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 HPD interrupts unavailable ({error:?}); polling"
             );
         }
     }

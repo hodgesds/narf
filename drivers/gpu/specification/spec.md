@@ -4001,6 +4001,20 @@ serializes it through the retained owner. The framebuffer boot handoff logs one
 line per connector after a successful firmware run; detection reads sinks only. `dmub_mailbox_state()` also reports failed
 or cancelled transport attempts without accessing hardware.
 
+HPD over the IH ring: `Display::arm_hpd_interrupts()` is `amdgpu_dm_hpd_init`
+over DCN3.0's irq service (every HPD/HPD_RX source acked and disabled, then
+HPD on per wired connector and HPD_RX on for DP; `hpd0_ack` re-arms the
+opposite polarity), `hpd_event(instance, rx)` is `dc_interrupt_ack` and
+returns the connector index. `ColdBoot::arm_display_hpd()` subscribes to
+`amdgpu_ih_navi22::source::DCN_HPD` before arming and returns the
+subscription; `ColdBoot::display_hpd(Hpd)` acknowledges one vector.
+`amdgpu_navi22_display::serve_hpd(sub, ack)` drives them and bumps
+`HOTPLUG` (`version`, `notify`, `wait(&mut since, period_ms)` with a 50 ms
+floor), and the platform's runtime services spawn it and wake the display
+monitor; without an IH ring polling runs alone. A freshly enabled HPD block
+is polled up to 1 s for its connect filter before detection reports
+`Disconnected`.
+
 ### Navi 22 boot ownership and framebuffer handoff
 
 `amdgpu_navi22_platform::start_fault_service().await` runs once after a

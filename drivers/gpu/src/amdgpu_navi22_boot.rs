@@ -1690,6 +1690,32 @@ impl ColdBoot {
     }
 }
 
+/// IH-driven HPD (`amdgpu_dm_hpd_init` / `dm_irq_handler`) for the native
+/// display owner.
+impl ColdBoot {
+    /// Subscribe to the DCN HPD source, then arm every connector's HPD (and
+    /// DP HPD_RX) interrupt. Polling detection keeps working without it.
+    pub fn arm_display_hpd(&mut self) -> Result<crate::amdgpu_ih_navi22::Subscription, Error> {
+        let ih = self.interrupts().ok_or(Error::Invalid)?;
+        let subscription = ih
+            .subscribe(crate::amdgpu_ih_navi22::source::DCN_HPD)
+            .map_err(|_| Error::Busy)?;
+        self.display_mut()?
+            .arm_hpd_interrupts()
+            .map_err(Error::Display)?;
+        Ok(subscription)
+    }
+    /// Acknowledge one HPD/HPD_RX vector; returns the connector index.
+    pub fn display_hpd(
+        &mut self,
+        hpd: crate::amdgpu_ih_navi22::Hpd,
+    ) -> Result<Option<usize>, Error> {
+        self.display_mut()?
+            .hpd_event(hpd.instance, hpd.rx)
+            .map_err(Error::Display)
+    }
+}
+
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi22_boot_tests.rs"]
 pub(crate) mod tests;

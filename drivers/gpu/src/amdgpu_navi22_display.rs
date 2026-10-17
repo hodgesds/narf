@@ -223,6 +223,41 @@ impl<I: Io> Detector<I> {
             }
         }
     }
+    /// `amdgpu_dm_hpd_init` over DCN3.0's irq service: every HPD and HPD_RX
+    /// source set off (ack, then the enable cleared), then HPD on for every
+    /// connector with an HPD block and HPD_RX on for DisplayPort ones. The
+    /// owner binds (AUX init, HPD filter) first. Call after subscribing to
+    /// the IH source, so the first edge cannot be lost.
+    pub(crate) fn arm_hpd(&mut self) -> Result<(), Error> {
+        self.bind()?;
+        for index in 0..ddc::LINES {
+            ddc::hpd_irq_set(&mut self.engine, index, false, false)?;
+            ddc::hpd_irq_set(&mut self.engine, index, true, false)?;
+        }
+        for c in self.connectors.clone() {
+            if let Some(hpd) = c.hpd {
+                ddc::hpd_irq_set(&mut self.engine, hpd, false, true)?;
+                if c.signal == Signal::DisplayPort {
+                    ddc::hpd_irq_set(&mut self.engine, hpd, true, true)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    /// One IH HPD vector (`amdgpu_dm_irq_handler`'s `dc_interrupt_ack`):
+    /// acknowledge it — re-arming the opposite polarity for HPD — and return
+    /// the connector it belongs to.
+    pub(crate) fn hpd_event(&mut self, instance: u8, rx: bool) -> Result<Option<usize>, Error> {
+        if instance >= ddc::LINES {
+            return Err(Error::Invalid);
+        }
+        if rx {
+            ddc::hpd_rx_ack(&mut self.engine, instance)?;
+        } else {
+            ddc::hpd_ack(&mut self.engine, instance)?;
+        }
+        Ok(self.connectors.iter().position(|c| c.hpd == Some(instance)))
+    }
     async fn detect_all(&mut self) -> Result<Vec<Report>, Error> {
         let mut reports = Vec::new();
         reports
@@ -428,10 +463,82 @@ impl Display {
         )
         .await?)
     }
+    /// `amdgpu_dm_hpd_init` over DCN3.0's irq service (see
+    /// [`Detector::arm_hpd`]). Call after subscribing to the IH source.
+    pub fn arm_hpd_interrupts(&mut self) -> Result<(), Error> {
+        self.0.arm_hpd()
+    }
+    /// One IH HPD vector, acknowledged; returns the connector it belongs to.
+    pub fn hpd_event(&mut self, instance: u8, rx: bool) -> Result<Option<usize>, Error> {
+        self.0.hpd_event(instance, rx)
+    }
     pub fn hpd_ack(&mut self, index: usize) -> Result<bool, Error> {
         let c = *self.0.connectors.get(index).ok_or(Error::Invalid)?;
         let hpd = c.hpd.ok_or(Error::Unsupported)?;
         Ok(ddc::hpd_ack(&mut self.0.engine, hpd)?)
+    }
+}
+
+/// Hotplug wake-ups from the IH HPD service to pollers of [`Display`]:
+/// a version that each HPD/HPD_RX vector bumps, and the tasks waiting for a
+/// newer one. Polling keeps working without it (the wait times out).
+#[derive(Debug)]
+pub struct Hotplug(narf_lib::sync::IrqSafeSpinLock<(u64, Vec<core::task::Waker>)>);
+pub static HOTPLUG: Hotplug = Hotplug(narf_lib::sync::IrqSafeSpinLock::new((0, Vec::new())));
+/// A level-triggered source that is not acked would re-fire at once; never
+/// return to a poller more often than this.
+pub const HOTPLUG_MIN_MS: u64 = 50;
+impl Hotplug {
+    pub fn version(&self) -> u64 {
+        self.0.lock().0
+    }
+    pub fn notify(&self) {
+        let wakers = {
+            let mut s = self.0.lock();
+            s.0 += 1;
+            core::mem::take(&mut s.1)
+        };
+        wakers.into_iter().for_each(core::task::Waker::wake);
+    }
+    /// Sleep up to `period_ms`, returning early (not before
+    /// [`HOTPLUG_MIN_MS`]) once the version moved past `since`, which is
+    /// updated. Returns whether an HPD event woke it.
+    pub async fn wait(&self, since: &mut u64, period_ms: u64) -> bool {
+        let floor = narf_time::Deadline::after_ms(HOTPLUG_MIN_MS.min(period_ms));
+        let deadline = narf_time::Deadline::after_ms(period_ms);
+        let mut sleep = core::pin::pin!(narf_time::SleepUntil::new(deadline.as_instant()));
+        let woke = core::future::poll_fn(|cx| {
+            {
+                let mut s = self.0.lock();
+                if s.0 != *since {
+                    *since = s.0;
+                    return core::task::Poll::Ready(true);
+                }
+                if !s.1.iter().any(|w| w.will_wake(cx.waker())) {
+                    s.1.push(cx.waker().clone());
+                }
+            }
+            sleep.as_mut().poll(cx).map(|()| false)
+        })
+        .await;
+        narf_time::SleepUntil::new(floor.as_instant()).await;
+        woke
+    }
+}
+use core::future::Future as _;
+
+/// The IH HPD service body: for every DCN HPD/HPD_RX vector, `ack` it on
+/// the display owner, then wake hotplug pollers. Ends when the subscription
+/// closes (device loss, recovery); polling then carries on alone.
+pub async fn serve_hpd<F: core::future::Future<Output = ()>>(
+    mut subscription: crate::amdgpu_ih_navi22::Subscription,
+    mut ack: impl FnMut(crate::amdgpu_ih_navi22::Hpd) -> F,
+) {
+    while let Ok(iv) = subscription.wait().await {
+        if let Some(hpd) = iv.hpd() {
+            ack(hpd).await;
+            HOTPLUG.notify();
+        }
     }
 }
 

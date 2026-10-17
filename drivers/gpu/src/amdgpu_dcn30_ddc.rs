@@ -193,6 +193,7 @@ const DC_HPD_INT_ACK: u32 = 1 << 0;
 const DC_HPD_INT_POLARITY: u32 = 1 << 8;
 const DC_HPD_INT_EN: u32 = 1 << 16;
 const DC_HPD_RX_INT_ACK: u32 = 1 << 20;
+const DC_HPD_RX_INT_EN: u32 = 1 << 24;
 const DC_HPD_EN: u32 = 1 << 28;
 const DC_HPD_CONNECT_INT_DELAY: u32 = 0x0000_00ff;
 const DC_HPD_DISCONNECT_INT_DELAY: u32 = 0x0ff0_0000;
@@ -1200,6 +1201,15 @@ impl<I: Io> Engine<I> {
         )?;
         Ok(())
     }
+    /// `dal_irq_service_set_generic` for `DC_HPD_RX_INT_EN`.
+    fn hpd_rx_interrupt(&mut self, index: u8, enable: bool) -> Result<(), Error> {
+        self.update(
+            Self::hpd(index, DC_HPD_INT_CONTROL),
+            DC_HPD_RX_INT_EN,
+            if enable { DC_HPD_RX_INT_EN } else { 0 },
+        )?;
+        Ok(())
+    }
     /// `dal_irq_service_set_generic` for `DC_HPD_INT_EN`.
     fn hpd_interrupt(&mut self, index: u8, enable: bool) -> Result<(), Error> {
         self.update(
@@ -1452,6 +1462,27 @@ pub(crate) fn hpd<I: Io>(engine: &mut Engine<I>, index: u8) -> Result<bool, Erro
 pub(crate) fn hpd_ack<I: Io>(engine: &mut Engine<I>, index: u8) -> Result<bool, Error> {
     engine.check(index)?;
     engine.hpd_ack(index)
+}
+pub(crate) fn hpd_rx_ack<I: Io>(engine: &mut Engine<I>, index: u8) -> Result<(), Error> {
+    engine.check(index)?;
+    engine.hpd_rx_ack(index)
+}
+/// `dal_irq_service_set(source, enable)`: the source's ack (`hpd0_ack`, with
+/// its polarity re-arm, for HPD; the generic ack for HPD_RX), then its enable.
+pub(crate) fn hpd_irq_set<I: Io>(
+    engine: &mut Engine<I>,
+    index: u8,
+    rx: bool,
+    enable: bool,
+) -> Result<(), Error> {
+    engine.check(index)?;
+    if rx {
+        engine.hpd_rx_ack(index)?;
+        engine.hpd_rx_interrupt(index, enable)
+    } else {
+        engine.hpd_ack(index)?;
+        engine.hpd_interrupt(index, enable)
+    }
 }
 pub(crate) async fn dpcd<I: Io>(
     engine: &mut Engine<I>,
