@@ -9416,6 +9416,26 @@ impl Drop for SocketFile {
         if let SocketState::Packet { sock } = &*self.state.lock() {
             sock.release();
         }
+        // An explicit close(2) calls `unregister`, which closes an
+        // InetWired TCB. Process exit instead releases the fd table directly,
+        // so the last SocketFile reference reaches this Drop implementation
+        // without that call. Keep the two paths equivalent: otherwise a peer
+        // FIN moves an exited process's connection to CLOSE-WAIT forever,
+        // gradually exhausting long-lived clients' connection pools.
+        let wired_tcb = match &*self.state.lock() {
+            SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
+                Some(*tcb_id)
+            }
+            _ => None,
+        };
+        if let Some(id) = wired_tcb {
+            let zero_linger = {
+                let opts = self.options.lock();
+                opts.linger_on && opts.linger_sec == 0
+            };
+            let _ = narf_net::tcp_stack::close_linger(id, zero_linger);
+            crate::handlers::clear_tcb_owner(id);
+        }
         // Closing this endpoint deads BOTH directions of the connection:
         // - `tx` (this end writes, the PEER reads) → close surfaces EOF to the
         //   peer's read (any buffered bytes still drain first, then EOF).
@@ -11264,6 +11284,44 @@ kernel_test_in!(
     "userspace/socket",
     smoke_wired_tcp_send_backpressure_drives_readiness
 );
+
+/// Process exit drops its fd table instead of issuing `close(2)` one fd at a
+/// time. The final SocketFile drop must therefore close an off-box TCP TCB
+/// too; otherwise a peer FIN leaves a permanent CLOSE-WAIT entry after every
+/// short-lived process.
+fn smoke_wired_tcp_drop_closes_tcb() -> TestResult {
+    use narf_net::tcp::core::{__install_test_tcb, __with_tcb, remove_tcb};
+    use narf_net::tcp_stack::{release, TcpState};
+
+    let id = __install_test_tcb(
+        [10, 0, 2, 15],
+        31_125,
+        [10, 0, 2, 2],
+        5201,
+        TcpState::Established,
+    );
+    {
+        let socket = SocketFile::new(AF_INET, SOCK_STREAM);
+        *socket.state.lock() = SocketState::InetWired {
+            tcb_id: id,
+            peer_addr: u32::from_be_bytes([10, 0, 2, 2]),
+            peer_port: 5201,
+        };
+    }
+
+    let result = match __with_tcb(id, |t| (t.state, t.fin_sent, t.orphan)) {
+        Some((TcpState::FinWait1, true, true)) => TestResult::Pass,
+        Some((TcpState::Established, _, _)) => {
+            TestResult::Fail("last SocketFile drop left wired TCP established")
+        }
+        Some(_) => TestResult::Fail("last SocketFile drop did not start an orphaned TCP close"),
+        None => TestResult::Fail("last SocketFile drop removed its TCB unexpectedly"),
+    };
+    remove_tcb(id);
+    release(id);
+    result
+}
+kernel_test_in!("userspace/socket", smoke_wired_tcp_drop_closes_tcb);
 
 /// The durable-wake migration: a group-2 broadcast must fire the subscriber's
 /// ARMED `uevent_readiness` cell directly (Readiness::set -> wake_by_ref), not
