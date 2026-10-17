@@ -382,14 +382,6 @@ impl Hdmi {
     pub fn stop_info_packets(&mut self) -> Result<(), Error> {
         self.0.stop_info_packets()
     }
-    /// The HDMI audio hook: where Linux's `enable_audio_stream`
-    /// (`enc3_se_hdmi_audio_setup` / the AFMT Audio InfoFrame and the
-    /// Azalia endpoint) runs in `link_set_dpms_on`, after the link is up and
-    /// before AVMUTE is released. No audio endpoint is owned yet, so it
-    /// sends nothing; the DCN30 audio owner fills it in.
-    pub fn audio_infoframe(&mut self, _pixel_khz: u32) -> Result<(), Error> {
-        Ok(())
-    }
 }
 
 #[cfg(feature = "kernel-test")]

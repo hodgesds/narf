@@ -21,6 +21,8 @@ const DPM_BY_INDEX: u32 = 0xb;
 const DEEP_SLEEP_MIN: u32 = 0xd;
 const DISPLAYS: u32 = 0xe;
 const DF_CSTATE_ALLOW: u32 = 0x10;
+/// `DALSMC_MSG_BacoAudioD3PME`.
+const BACO_AUDIO_D3_PME: u32 = 0x11;
 const LEVELS: usize = 16;
 
 /// PPCLK ids in the DAL interface (MHz). PIXCLK supplies the global DPP clock.
@@ -472,6 +474,15 @@ impl ClockManager {
         self.dccg.update_dpp_dto(pipe, khz)
     }
 }
+/// `dcn3_enable_pme_wa`: wake the Azalia from D3 before its endpoint is
+/// touched. Linux ignores the result (`dcn30_smu_send_msg_with_param`'s
+/// response is not checked there); so does this.
+impl crate::amdgpu_dcn30_audio::AzaliaWake for ClockManager {
+    async fn wake_azalia(&mut self) {
+        let _ = self.engine.command(BACO_AUDIO_D3_PME, 0).await;
+    }
+}
+
 /// `smu_v11_0` display power through the retained SMU owner, with its errors
 /// in this module's terms.
 ///

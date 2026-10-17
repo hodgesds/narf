@@ -42,6 +42,7 @@
 //! reservation and the step that failed. Nothing is retried or reset.
 use crate::{
     amdgpu::AmdGpu,
+    amdgpu_dcn30_audio::{Audio, AudioStream},
     amdgpu_dcn30_clk::{Clock, ClockManager},
     amdgpu_dcn30_dp::{self as dp, Aux, Depth},
     amdgpu_dcn30_hdmi::{self as hdmi, DigMode, Hdmi},
@@ -106,6 +107,10 @@ const HUBP_STRIDE: u64 = 0xdc;
 const HUBP0_DCHUBP_CNTL: u64 = 0x05f3;
 const HUBP0_HUBP_CLK_CNTL: u64 = 0x05f4;
 const HUBP_CLOCK_ENABLE: u32 = 1 << 0;
+/// `HUBPREQn_DCN_CUR0_TTU_CNTL0/1`: REFCYC_PER_REQ_DELIVERY (23 bits),
+/// QoS_LEVEL_FIXED and QoS_RAMP_DISABLE; REFCYC_PER_REQ_DELIVERY_PRE.
+const HUBP0_DCN_CUR0_TTU_CNTL0: u64 = 0x0630;
+const HUBP0_DCN_CUR0_TTU_CNTL1: u64 = 0x0631;
 /// `DCHUBP_CNTL.HUBP_UNDERFLOW_STATUS` (3 bits) and `HUBP_UNDERFLOW_CLEAR`.
 const HUBP_UNDERFLOW_STATUS: u32 = 0x7000_0000;
 const HUBP_UNDERFLOW_CLEAR: u32 = 0x8000_0000;
@@ -608,7 +613,9 @@ fn config(timing: &Timing, vco_khz: u32) -> Config {
             v_taps: 1,
         },
         dentist_vco_khz: vco_khz,
-        cursors: 0,
+        // dcn20_populate_dml_pipes_from_context budgets DCN30's one cursor
+        // for every graphics plane, shown or not.
+        cursors: 1,
     }
 }
 /// One frame of `timing`, rounded up, in microseconds.
@@ -697,6 +704,8 @@ pub struct Pipeline {
     dig: Hdmi,
     dp_link: dp::Link,
     dp_stream: dp::Stream,
+    /// The stream's audio (Azalia endpoint, wall clock, AFMT/DP packets).
+    audio: Audio,
     /// DCN base indices 1–3 and NBIO base indices 1 and 2, as byte offsets.
     dcn1: u64,
     dcn2: u64,
@@ -796,6 +805,7 @@ impl Pipeline {
                 dig: Hdmi::new(gpu, authority, route.stream, transmitter)?,
                 dp_link: dp::Link::new(regs, dcn2, transmitter)?,
                 dp_stream: dp::Stream::new(regs, dcn2, route.stream)?,
+                audio: Audio::new(gpu, authority).map_err(|_| Error::Unsupported)?,
                 dcn1,
                 dcn2,
                 dcn3,
@@ -997,6 +1007,25 @@ impl Pipeline {
         self.regs
             .update(clock, HUBP_CLOCK_ENABLE, HUBP_CLOCK_ENABLE)
     }
+    /// `hubp2_program_deadline`'s cursor half: the cursor's request pacing
+    /// from the plan, so a cursor shown later fetches on the budget the
+    /// watermarks were computed with.
+    fn program_cursor_ttu(&mut self, ttu: Option<dml30::CursorTtu>) -> Result<(), Error> {
+        let Some(ttu) = ttu else {
+            return Ok(());
+        };
+        let hubp = u64::from(self.route.pipe) * HUBP_STRIDE;
+        self.regs.write(
+            self.d2(HUBP0_DCN_CUR0_TTU_CNTL0 + hubp),
+            ttu.refcyc_per_req_delivery & 0x007f_ffff
+                | (ttu.qos_level_fixed & 0xf) << 24
+                | (ttu.qos_ramp_disable & 1) << 28,
+        )?;
+        self.regs.write(
+            self.d2(HUBP0_DCN_CUR0_TTU_CNTL1 + hubp),
+            ttu.refcyc_per_req_delivery_pre & 0x007f_ffff,
+        )
+    }
     fn otg_reg(&self, reg: u64) -> u64 {
         self.d2(reg + u64::from(self.route.pipe) * OTG_STRIDE)
     }
@@ -1187,8 +1216,15 @@ impl Pipeline {
         );
         self.scanout = Some(reservation);
 
-        // prepare_bandwidth: clocks, then watermarks with every pipe idle.
+        // dc_commit_state_no_check: dce110_enable_accelerated_mode
+        // (bios_set_scratch_acc_mode_change), so a later init skips golden
+        // init; then prepare_bandwidth: clocks, then watermarks.
         self.at(Step::Clocks);
+        self.regs.update(
+            self.nbio1 + BIOS_SCRATCH_6 * 4,
+            ATOM_S6_ACC_MODE,
+            ATOM_S6_ACC_MODE,
+        )?;
         let clocks = levels
             .plan(
                 plan.clocks.dispclk_khz,
@@ -1242,9 +1278,11 @@ impl Pipeline {
             .program(Format::Rgb32, timing.h_active, timing.v_active)?;
         self.mpc.mux_plane(pipe, pipe)?;
         self.hubp.program(&surface, &plan.registers)?;
+        self.program_cursor_ttu(plan.cursor)?;
         self.hubp.unblank().await?;
         self.clear_underflow()?;
         self.unlock()?;
+        self.start_audio(&timing, sink).await;
         // Bounded watch: an underflow goes black and quarantines the pipe.
         self.at(Step::Verify);
         sleep_us(frame_us(&timing) * u64::from(VERIFY_FRAMES)).await;
@@ -1263,6 +1301,30 @@ impl Pipeline {
             inherited: self.inherited,
             scanout: fb,
         })
+    }
+    /// The stream's audio once pixels flow (`dce110_enable_audio_stream`
+    /// and its setup half, as the DCN30 audio owner orders them). Audio never
+    /// fails the display: an error is logged and the stream stays lit.
+    async fn start_audio(&mut self, timing: &Timing, sink: &Sink) {
+        let (otg, dig) = (self.route.pipe, self.route.stream);
+        let stream = match self.connector.signal {
+            Signal::Hdmi => AudioStream::hdmi(otg, dig, *timing),
+            Signal::DisplayPort => AudioStream::dp(otg, dig, *timing),
+        };
+        // SAFETY: the stream is live and stays live until tear_down stops
+        // its audio first; this pipeline owns the DIG and the endpoints.
+        let result = unsafe {
+            self.audio
+                .start_for_sink(stream, &sink.edid, &mut self.clocks)
+                .await
+        };
+        if let Err(error) = result {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 audio on DIG {dig} unavailable ({error:?}); display unaffected"
+            );
+        }
     }
     /// `link_set_dpms_on` for HDMI.
     async fn link_hdmi(
@@ -1297,7 +1359,6 @@ impl Pipeline {
         // dcn20_enable_stream: setup_dio_stream_encoder, update_info_frame.
         self.dig.connect_be_to_fe(true)?;
         self.dig.info_packets(avi).await?;
-        self.dig.audio_infoframe(timing.pixel_clock_khz)?;
         self.dig.set_avmute(false)?;
         Ok(())
     }
@@ -1406,6 +1467,18 @@ impl Pipeline {
         aux: &mut A,
     ) -> Result<(), Error> {
         let reached = self.reached;
+        // Audio first, before the stream blanks (dce110_disable_audio_stream);
+        // logged, never fatal to the display teardown.
+        let dig = self.route.stream;
+        if reached >= Step::Plane && self.audio.record(dig).is_some() {
+            if let Err(error) = self.audio.stop(dig, &mut self.clocks).await {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi22 audio stop on DIG {dig} failed ({error:?})"
+                );
+            }
+        }
         let mut first = Ok(());
         let mut record = |r: Result<(), Error>| {
             if first.is_ok() {

@@ -371,7 +371,9 @@ fn navi22_modeset_hdmi_end_to_end_follows_linux_order() -> TestResult {
         let connector = m::connector(Signal::Hdmi, 3, 3);
         let r = Resources::new().acquire(&connector).unwrap();
         let mut p = pipeline(&bench, connector, r);
-        let sink = m::sink(Signal::Hdmi, None);
+        // The v1.7 pass also carries LPCM audio.
+        let audio = revision == 7;
+        let sink = m::sink_audio(Signal::Hdmi, None, audio);
         let output = match run(enable_with(&mut p, &vram, &tables, &sink, &mut NoAux)) {
             Ok(o) => o,
             Err(_) => return TestResult::Fail("HDMI enable"),
@@ -388,6 +390,23 @@ fn navi22_modeset_hdmi_end_to_end_follows_linux_order() -> TestResult {
             Ok(at) => at,
             Err(name) => return TestResult::Fail(name),
         };
+        // Audio starts once pixels flow: the PME wake (DALSMC 0x11), then
+        // AFMT audio samples on this frontend.
+        let afmt = d2(0x2082 + u32::from(r.stream) * 0x100);
+        let started = in_order(
+            &log,
+            0,
+            &[
+                ("unlock before audio", &|w: &m::Write| {
+                    w.dword == d2(0x1b8b) && w.value == 0
+                }),
+                ("PME wake", &dal(0x11)),
+                ("audio samples", &set(afmt, 1)),
+            ],
+        );
+        if started.is_ok() != audio {
+            return TestResult::Fail("audio start");
+        }
         // Live: flushes go through HDP, underflow polling finds none.
         if p.flush().is_err() || p.check_underflow() != Ok(None) {
             return TestResult::Fail("live pipeline");
@@ -409,6 +428,20 @@ fn navi22_modeset_hdmi_end_to_end_follows_linux_order() -> TestResult {
         let log = bench.log();
         if let Err(name) = hdmi_disable_order(&log, enabled, r, 3) {
             return TestResult::Fail(name);
+        }
+        // Audio is muted before the stream blanks.
+        if audio
+            && in_order(
+                &log,
+                enabled,
+                &[
+                    ("audio muted", &clear(afmt, 1)),
+                    ("then blank", &set(d2(0x1854), 1)),
+                ],
+            )
+            .is_err()
+        {
+            return TestResult::Fail("audio stop order");
         }
         // The PHY PLL is never "powered down" with a zero clock.
         if log[enabled..]

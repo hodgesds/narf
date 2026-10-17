@@ -381,6 +381,11 @@ const DTD_640X480: [u8; 18] = [
 /// An HDMI sink (CTA block with the HDMI VSDB) or a DP sink (base block
 /// only) whose preferred mode is 640x480.
 pub(crate) fn sink(signal: Signal, dpcd: Option<[u8; 16]>) -> Sink {
+    sink_audio(signal, dpcd, false)
+}
+/// [`sink`], optionally with a CTA audio data block (2-channel LPCM, 32–48
+/// kHz, 16–24 bit) after the HDMI VSDB.
+pub(crate) fn sink_audio(signal: Signal, dpcd: Option<[u8; 16]>, audio: bool) -> Sink {
     let blocks = if signal == Signal::Hdmi { 2 } else { 1 };
     let mut e = vec![0u8; 128 * blocks];
     e[..8].copy_from_slice(&[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
@@ -396,6 +401,12 @@ pub(crate) fn sink(signal: Signal, dpcd: Option<[u8; 16]>) -> Sink {
         ext[5..8].copy_from_slice(&[0x03, 0x0c, 0x00]);
         ext[8] = 0x10;
         ext[2] = 10;
+        if audio {
+            ext[3] = 0x40;
+            ext[10] = 1 << 5 | 3;
+            ext[11..14].copy_from_slice(&[0x09, 0x07, 0x07]);
+            ext[2] = 14;
+        }
     }
     checksum(&mut e);
     Sink {

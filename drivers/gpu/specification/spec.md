@@ -3868,6 +3868,14 @@ Failure records `State::Failed { step, error }` and undoes only started steps
 `disable(tables, aux)` retires it. `check_underflow()` turns an OTG/HUBP
 underflow black and sets `State::Quarantined`. `ColdBoot::modeset_hdmi()`
 detects, `choose`s, acquires a route and lights with `test_pattern`.
+The pipeline budgets DCN30's one 256-wide 32-bpp cursor in DML30 as
+`dcn20_populate_dml_pipes_from_context` does (`Config::cursors` ≤ 1: CNVC
+cursor DPPCLK delay, cursor bandwidth and urgent burst in the prefetch and
+urgent-fraction checks, `Plan::cursor` = `calculate_ttu_cursor`) and programs
+`DCN_CUR0_TTU_CNTL0/1` with the HUBP. After the front end latches it starts
+the stream's audio through `amdgpu_dcn30_audio::Audio::start_for_sink`
+(`ClockManager` implements `AzaliaWake` with DALSMC 0x11); teardown stops it
+first; audio errors are logged and never fail the display.
 Kernel-test builds route every display owner's `amdgpu_reg_window::Window`
 through one attachable register model (`amdgpu_navi22_modeset_model`).
 
