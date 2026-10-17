@@ -4822,6 +4822,11 @@ stays available to other allocations.
 permanent aperture-relative exclusions. Ranges are checked, rounded outward
 to pages, sorted and merged; dropping an allocation never removes a protected
 range. The same unsafe ownership contract applies to the remaining memory.
+`amdgpu_vram::UnmappedPool::from_owned(gpu_address, len, protected)` is the
+same allocator for VRAM no CPU mapping reaches: `reserve_aligned` hands out
+`UnmappedReservation`s (GPU address and size only), returned on drop, so
+their holder keeps them until the GPU can no longer reach them and has the
+GPU clear them before a client sees them.
 
 `amdgpu_vram_boot::Plan::read` snapshots the DCN314 FB base/top/offset through
 live PCI authority and builds a read-only VRAM inventory. It requires the
@@ -4837,6 +4842,9 @@ the inverse MC translation; other supported windows use GPU addresses.
 
 The plan preserves full-aperture offsets even when BAR0 is smaller than VRAM.
 `Plan::into_pool` clips exclusions to the visible mapping before allocation.
+`unsafe Plan::unmapped_pool()` (called first) returns the VRAM above the
+visible mapping, less every protected range there, as an `UnmappedPool`, or
+`None` when the BAR shows all of VRAM; the same ownership contract applies.
 It is unsafe: the caller must have included all other scanouts, cursors,
 PSP/GART buffers and existing pools, own the unprotected memory, and serialize
 future GPU reconfiguration. An inventory alone is not ownership authority.

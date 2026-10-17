@@ -43,7 +43,31 @@ fn navi22_vram_training_reservations_survive_bar_clipping() -> TestResult {
             );
         }
         let exclusions = plan.protected.clone();
-        // SAFETY: model-only allocator; no hardware memory is accessed.
+        // SAFETY: model-only allocators; no hardware memory is accessed.
+        let unmapped = unsafe { plan.unmapped_pool() }.unwrap();
+        match (&unmapped, visible == size) {
+            (None, true) => {}
+            (Some(p), false) if p.address() == GPU_BASE + visible && p.size() == size - visible => {
+                let mut held = Vec::new();
+                while let Ok(r) = p.reserve_aligned(64 * MIB, MIB) {
+                    held.push(r);
+                }
+                while let Ok(r) = p.reserve_aligned(MIB, MIB) {
+                    held.push(r);
+                }
+                if held.iter().any(|r| {
+                    let start = r.address() - GPU_BASE;
+                    exclusions
+                        .iter()
+                        .any(|e| start < e.range.end && e.range.start < start + r.size())
+                }) || held.iter().map(|r| r.size()).sum::<u64>() == 0
+                {
+                    return TestResult::Fail("unmapped VRAM overlapped firmware memory");
+                }
+            }
+            _ => return TestResult::Fail("unmapped VRAM not the range past the BAR"),
+        }
+        // SAFETY: as above.
         let pool = unsafe { plan.into_pool() }.unwrap();
         let mut allocations = Vec::new();
         while let Ok(r) = pool.reserve(MIB) {
