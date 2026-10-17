@@ -580,14 +580,19 @@ pub async unsafe fn retire_inherited_display(
 
 // ── Native displays ──────────────────────────────────────────────────
 //
-// Output k is the k-th lightable board port (DisplayPort or HDMI, the
-// first four); it is always lit on pipe k, which is also its display slot
-// in the owner and its CRTC in KMS. The console runs on the first display
-// of the configuration (DP before HDMI); DRM clients present per display.
+// Connectors: every lightable board port (DisplayPort or HDMI) in board
+// order and, while a DP port's MST branch is in use, that branch's four
+// end-device slots (the root's own connector then reports nothing, as
+// amdgpu_dm's MST root). Display k is pipe k, its owner slot and CRTC k.
+// Each CRTC is routed to at most one connector: as DRM set it (SETCRTC's
+// connector, an atomic connector CRTC_ID), else automatically to plugged
+// connectors in connector order. The console runs on the first lit
+// display; DRM clients present per display.
 
 type Timing = crate::amdgpu_dml::Timing;
 type Modeset = crate::amdgpu_navi48_boot::Modeset;
 type ModesetError = crate::amdgpu_navi48_boot::ModesetError;
+type ConnectorType = crate::drm::card::ConnectorType;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// Pipe of the console's display, for the cursor hook.
@@ -598,52 +603,100 @@ pub fn console_pipe() -> u8 {
     CURSOR_PIPE.load(Ordering::Acquire)
 }
 
-/// The outputs in order: (display-path index, connector type). The
-/// lightable board ports; while a DP port's MST branch is lit, its end
-/// devices instead, `MAX_OUTPUTS` outputs on that port.
-static OUTPUTS: narf_lib::sync::IrqSafeSpinLock<Vec<(usize, crate::drm::card::ConnectorType)>> =
-    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
-
-/// The initial MST configuration dedicates all four outputs to one branch.
-fn mst_output_port(outputs: &[(usize, crate::drm::card::ConnectorType)]) -> Option<usize> {
-    let first = *outputs.first()?;
-    (outputs.len() == crate::amdgpu_navi48_kms::MAX_OUTPUTS
-        && first.1 == crate::drm::card::ConnectorType::DisplayPort
-        && outputs.iter().all(|o| *o == first))
-    .then_some(first.0)
+/// What a connector drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    /// A board DP or HDMI port (display-path index).
+    Board(usize),
+    /// End device `slot` (`MstLink::outputs`) behind board DP port `port`.
+    Mst(usize, u8),
 }
 
-fn lightable_outputs(boot: &boot::ColdBoot) -> Vec<(usize, crate::drm::card::ConnectorType)> {
-    use crate::amdgpu_dcn_inventory::Connector;
-    use crate::drm::card::ConnectorType;
-    let Ok(paths) = boot.display_paths() else {
-        return Vec::new();
-    };
-    paths
-        .iter()
-        .enumerate()
-        .filter_map(|(port, p)| match p.connector {
-            Connector::DisplayPort => Some((port, ConnectorType::DisplayPort)),
-            Connector::HdmiTypeA => Some((port, ConnectorType::HdmiA)),
-            _ => None,
-        })
-        .take(crate::amdgpu_navi48_kms::MAX_OUTPUTS)
-        .collect()
+/// KMS index of an MST end device's connector: past any board port.
+const MST_INDEX: usize = 32;
+
+/// One connector and its sink as last discovered.
+#[derive(Debug)]
+struct ConnectorState {
+    target: Target,
+    kind: ConnectorType,
+    /// KMS object index: board ordinal, or `MST_INDEX` + slot.
+    index: usize,
+    present: bool,
+    /// DRM detached it from its CRTC: automatic routing leaves it dark.
+    parked: bool,
+    edid: Vec<u8>,
+    /// Admitted timings for routing it to a CRTC that does not show it.
+    modes: Vec<Timing>,
+    mst_id: Option<boot::MstOutputId>,
+    last_hpd: Option<bool>,
+}
+impl ConnectorState {
+    fn new(target: Target, kind: ConnectorType, index: usize) -> Self {
+        Self {
+            target,
+            kind,
+            index,
+            present: false,
+            parked: false,
+            edid: Vec::new(),
+            modes: Vec::new(),
+            mst_id: None,
+            last_hpd: None,
+        }
+    }
+    /// A board sink's discovery; true when its EDID changed.
+    fn reconcile_sst(&mut self, output: Option<&boot::SstOutput>) -> bool {
+        self.present = output.is_some();
+        self.modes.clear();
+        let Some(output) = output else {
+            return false;
+        };
+        let changed = self.edid != output.edid;
+        if changed {
+            self.edid.clone_from(&output.edid);
+        }
+        self.modes.clone_from(&output.modes);
+        changed
+    }
+    fn observe_sst_hpd(&mut self, present: bool) -> bool {
+        let reprobe = present && !self.last_hpd.unwrap_or(self.present);
+        self.last_hpd = Some(present);
+        if !present {
+            self.reconcile_sst(None);
+        }
+        reprobe
+    }
+    /// An end device's discovery: (another device took the slot, its EDID
+    /// changed). A new device starts unparked.
+    fn reconcile_mst(&mut self, output: Option<&boot::MstOutput>) -> (bool, bool) {
+        let id = output.map(|o| o.id);
+        let reset = self.mst_id != id;
+        if reset {
+            *self = Self::new(self.target, self.kind, self.index);
+            self.mst_id = id;
+        }
+        self.present = output.is_some_and(|o| o.sink.is_some());
+        self.modes.clear();
+        let mut changed = false;
+        // Never advertise the old monitor's modes after a different or
+        // unreadable EDID appears.
+        if let Some(output) = output.filter(|_| self.present) {
+            self.modes.clone_from(&output.modes);
+            if self.edid != output.edid {
+                changed = true;
+                self.edid.clone_from(&output.edid);
+            }
+        }
+        (reset, changed)
+    }
 }
 
-/// The pipe (output) of board port `port`.
-fn pipe_of(port: usize) -> Option<u8> {
-    OUTPUTS
-        .lock()
-        .iter()
-        .position(|&(p, _)| p == port)
-        .map(|k| k as u8)
-}
-
-/// What DRM asked of one output and what it shows: a CRTC switched off
-/// keeps its sink published (connected), as Linux keeps a disabled
+/// What DRM asked of one CRTC and what it shows: a CRTC switched off keeps
+/// its connector published (connected), as Linux keeps a disabled
 /// connector's modes.
-struct OutputState {
+#[derive(Debug)]
+struct CrtcState {
     /// DRM wants the CRTC on (SETCRTC with a framebuffer, atomic ACTIVE=1).
     active: bool,
     /// A recorded teardown stays inactive even if DRM requests on meanwhile.
@@ -652,116 +705,192 @@ struct OutputState {
     requested: Option<Timing>,
     /// The lit sink: EDID, running timing and every offered timing.
     shown: Option<([u8; 128], Timing, Vec<Timing>)>,
-    mst_id: Option<boot::MstOutputId>,
-    mst_present: bool,
-    mst_edid: Vec<u8>,
-    mst_modes: Vec<Timing>,
-    sst_present: bool,
-    sst_edid: Vec<u8>,
-    sst_modes: Vec<Timing>,
-    last_hpd: Option<bool>,
+    /// The connector this CRTC drives.
+    route: Option<Target>,
+    /// DRM chose `route` (including none): automatic routing leaves it.
+    explicit: bool,
 }
-impl OutputState {
+impl CrtcState {
     const fn new() -> Self {
         Self {
             active: true,
             retiring: false,
             requested: None,
             shown: None,
-            mst_id: None,
-            mst_present: false,
-            mst_edid: Vec::new(),
-            mst_modes: Vec::new(),
-            sst_present: false,
-            sst_edid: Vec::new(),
-            sst_modes: Vec::new(),
-            last_hpd: None,
-        }
-    }
-
-    fn reconcile_sst(&mut self, output: Option<&boot::SstOutput>) {
-        self.sst_present = output.is_some();
-        self.sst_modes.clear();
-        if !self.active {
-            self.shown = None;
-        }
-        if let Some(output) = output {
-            if self.sst_edid != output.edid {
-                self.shown = None;
-                self.requested = None;
-                self.sst_edid.clone_from(&output.edid);
-            }
-            self.sst_modes.clone_from(&output.modes);
-        } else {
-            self.shown = None;
-        }
-    }
-
-    fn observe_sst_hpd(&mut self, present: bool) -> bool {
-        let reprobe = present && !self.last_hpd.unwrap_or(self.sst_present);
-        self.last_hpd = Some(present);
-        if !present {
-            self.reconcile_sst(None);
-        }
-        reprobe
-    }
-
-    fn reconcile_mst(&mut self, output: Option<&boot::MstOutput>) {
-        let id = output.map(|o| o.id);
-        if self.mst_id != id {
-            *self = Self::new();
-            self.mst_id = id;
-        }
-        self.mst_present = output.is_some_and(|o| o.sink.is_some());
-        self.mst_modes.clear();
-        if !self.active {
-            self.shown = None;
-        }
-        // Preserve disabled requests at this connector, but never advertise
-        // the old monitor's modes after a different/unreadable EDID appears.
-        if let Some(output) = output.filter(|_| self.mst_present) {
-            self.mst_modes.clone_from(&output.modes);
-            if self.mst_edid != output.edid {
-                self.shown = None;
-                self.requested = None;
-                self.mst_edid.clone_from(&output.edid);
-            }
-        }
-    }
-
-    fn published(&self) -> Option<&([u8; 128], Timing, Vec<Timing>)> {
-        if self.mst_id.is_some() && (!self.mst_present || !self.active) {
-            None
-        } else {
-            self.shown.as_ref()
+            route: None,
+            explicit: false,
         }
     }
     fn retrained(&mut self, edid: [u8; 128], timing: Timing, offered: Vec<Timing>) {
         // A lower trained link can invalidate alternatives and queued requests.
         // Keep the actual running timing and update KMS without re-adopting VRAM.
         self.requested = self.requested.filter(|t| offered.contains(t));
-        self.sst_modes.clone_from(&offered);
         self.shown = Some((edid, timing, offered));
     }
     fn published_active(&self) -> bool {
         self.active && !self.retiring
     }
-    fn offered(&self) -> &[Timing] {
-        if let Some((_, _, offered)) = self
-            .shown
-            .as_ref()
-            .filter(|_| self.mst_id.is_none() || self.mst_present)
-        {
-            offered
-        } else if self.mst_present {
-            &self.mst_modes
-        } else if self.sst_present {
-            &self.sst_modes
-        } else {
-            &[]
+}
+
+/// The connectors and CRTCs, under one lock.
+#[derive(Debug)]
+struct Outputs {
+    connectors: Vec<ConnectorState>,
+    crtcs: [CrtcState; 4],
+}
+impl Outputs {
+    const fn new() -> Self {
+        Self {
+            connectors: Vec::new(),
+            crtcs: [const { CrtcState::new() }; 4],
         }
     }
-    fn find_mode(&self, mode: &crate::drm::ioctl::DrmModeModeInfo) -> Option<Timing> {
+    fn connector(&self, target: Target) -> Option<&ConnectorState> {
+        self.connectors.iter().find(|c| c.target == target)
+    }
+    fn connector_mut(&mut self, target: Target) -> Option<&mut ConnectorState> {
+        self.connectors.iter_mut().find(|c| c.target == target)
+    }
+    fn routed(&self, k: usize) -> Option<&ConnectorState> {
+        self.crtcs[k].route.and_then(|t| self.connector(t))
+    }
+    /// The CRTC routed to `target`.
+    fn crtc_of(&self, target: Target) -> Option<usize> {
+        self.crtcs.iter().position(|c| c.route == Some(target))
+    }
+    /// Replace the connector set, keeping the discovery of every connector
+    /// that remains. Routes to vanished connectors are dropped.
+    fn reshape(&mut self, shape: &[(Target, ConnectorType, usize)]) {
+        let old = core::mem::take(&mut self.connectors);
+        self.connectors = shape
+            .iter()
+            .map(|&(target, kind, index)| {
+                old.iter()
+                    .position(|c| c.target == target)
+                    .map(|i| &old[i])
+                    .map_or_else(
+                        || ConnectorState::new(target, kind, index),
+                        |c| ConnectorState {
+                            target,
+                            kind,
+                            index,
+                            present: c.present,
+                            parked: c.parked,
+                            edid: c.edid.clone(),
+                            modes: c.modes.clone(),
+                            mst_id: c.mst_id,
+                            last_hpd: c.last_hpd,
+                        },
+                    )
+            })
+            .collect();
+        for k in 0..4 {
+            if self.crtcs[k]
+                .route
+                .is_some_and(|t| self.connector(t).is_none())
+            {
+                self.drop_route(k);
+            }
+        }
+    }
+    fn drop_route(&mut self, k: usize) {
+        let c = &mut self.crtcs[k];
+        c.route = None;
+        c.explicit = false;
+        c.requested = None;
+        c.shown = None;
+    }
+    /// A connector's sink changed: requests for the old one are void; a
+    /// new device in an MST slot also forgets the CRTC's off request.
+    fn invalidate(&mut self, target: Target, reset: bool) {
+        if let Some(k) = self.crtc_of(target) {
+            let c = &mut self.crtcs[k];
+            c.requested = None;
+            c.shown = None;
+            if reset {
+                c.active = true;
+            }
+        }
+    }
+    /// Automatic routing: a CRTC DRM did not route drops a connector whose
+    /// sink left; each plugged, unparked connector without a CRTC takes the
+    /// first such free CRTC. Running displays keep their CRTCs.
+    fn assign_routes(&mut self) {
+        for k in 0..4 {
+            let c = &self.crtcs[k];
+            if c.explicit {
+                continue;
+            }
+            if c.route
+                .is_some_and(|t| !self.connector(t).is_some_and(|x| x.present))
+            {
+                self.drop_route(k);
+            }
+        }
+        for n in 0..self.connectors.len() {
+            let x = &self.connectors[n];
+            if !x.present || x.parked || self.crtc_of(x.target).is_some() {
+                continue;
+            }
+            let target = x.target;
+            if let Some(c) = self
+                .crtcs
+                .iter_mut()
+                .find(|c| c.route.is_none() && !c.explicit)
+            {
+                c.route = Some(target);
+            }
+        }
+    }
+    /// DRM routed CRTC k to `target` (None: no connector). Another CRTC
+    /// driving that connector loses it; a connector left without a CRTC is
+    /// parked so automatic routing does not light it elsewhere.
+    fn route(&mut self, k: usize, target: Option<Target>) {
+        let old = self.crtcs[k].route;
+        if let Some(t) = target {
+            if let Some(j) = self.crtc_of(t).filter(|&j| j != k) {
+                self.drop_route(j);
+                self.crtcs[j].explicit = true;
+            }
+            if let Some(x) = self.connector_mut(t) {
+                x.parked = false;
+            }
+        }
+        if old != target {
+            if let Some(x) = old.and_then(|t| self.connector_mut(t)) {
+                x.parked = true;
+            }
+            let c = &mut self.crtcs[k];
+            c.route = target;
+            c.requested = None;
+            c.shown = None;
+        }
+        self.crtcs[k].explicit = true;
+    }
+    /// The sink CRTC k shows to DRM: while on and its connector has a sink.
+    fn published(&self, k: usize) -> Option<&([u8; 128], Timing, Vec<Timing>)> {
+        let c = &self.crtcs[k];
+        (c.active && self.routed(k).is_some_and(|x| x.present))
+            .then_some(c.shown.as_ref())
+            .flatten()
+    }
+    /// Timings a CRTC can switch `target` (default: its route) to.
+    fn offered(&self, k: usize, target: Option<Target>) -> &[Timing] {
+        let target = target.or(self.crtcs[k].route);
+        let Some(x) = target.and_then(|t| self.connector(t)).filter(|x| x.present) else {
+            return &[];
+        };
+        match &self.crtcs[k].shown {
+            Some((_, _, offered)) if self.crtcs[k].route == Some(x.target) => offered,
+            _ => &x.modes,
+        }
+    }
+    fn find_mode(
+        &self,
+        k: usize,
+        target: Option<Target>,
+        mode: &crate::drm::ioctl::DrmModeModeInfo,
+    ) -> Option<Timing> {
         let geometry = |w: &crate::drm::ioctl::DrmModeModeInfo| {
             (
                 w.clock,
@@ -769,48 +898,107 @@ impl OutputState {
                 [w.vdisplay, w.vsync_start, w.vsync_end, w.vtotal],
             )
         };
-        self.offered()
+        self.offered(k, target)
             .iter()
             .copied()
             .find(|t| geometry(&crate::amdgpu_navi48_kms::timing_wire(t)) == geometry(mode))
     }
+    /// The connector behind a KMS connector id.
+    fn target_of_id(&self, connector_id: u32) -> Option<Target> {
+        let n = crate::amdgpu_navi48_kms::connector_index(connector_id)?;
+        self.connectors
+            .iter()
+            .find(|c| c.index == n)
+            .map(|c| c.target)
+    }
+    /// The MST root port, while its branch's connectors exist.
+    fn mst_port(&self) -> Option<usize> {
+        self.connectors.iter().find_map(|c| match c.target {
+            Target::Mst(port, _) => Some(port),
+            Target::Board(_) => None,
+        })
+    }
 }
-static OUTPUT_STATE: narf_lib::sync::IrqSafeSpinLock<[OutputState; 4]> =
-    narf_lib::sync::IrqSafeSpinLock::new([const { OutputState::new() }; 4]);
+static OUTPUTS: narf_lib::sync::IrqSafeSpinLock<Outputs> =
+    narf_lib::sync::IrqSafeSpinLock::new(Outputs::new());
 
-/// Publish every output on the amdgpu card's KMS state; a shown sink whose
-/// CRTC DRM switched off stays connected with its CRTC off.
-fn publish_outputs() {
-    let outputs = OUTPUTS.lock().clone();
-    let state = OUTPUT_STATE.lock();
-    let sinks: Vec<_> = outputs
+/// The connector set: every lightable board port, then `mst`'s four
+/// end-device slots.
+fn connector_shape(
+    boot: &boot::ColdBoot,
+    mst: Option<usize>,
+) -> Vec<(Target, ConnectorType, usize)> {
+    use crate::amdgpu_dcn_inventory::Connector;
+    let Ok(paths) = boot.display_paths() else {
+        return Vec::new();
+    };
+    let mut shape: Vec<_> = paths
         .iter()
         .enumerate()
-        .map(|(k, &(_, kind))| (kind, state[k].published(), state[k].published_active()))
+        .filter_map(|(port, p)| match p.connector {
+            Connector::DisplayPort => Some((port, ConnectorType::DisplayPort)),
+            Connector::HdmiTypeA => Some((port, ConnectorType::HdmiA)),
+            _ => None,
+        })
+        .enumerate()
+        .map(|(n, (port, kind))| (Target::Board(port), kind, n))
         .collect();
-    let kms: Vec<crate::amdgpu_navi48_kms::Output> = sinks
-        .iter()
-        .enumerate()
-        .map(|(k, &(kind, shown, _))| crate::amdgpu_navi48_kms::Output {
-            kind,
-            offered: state[k].offered(),
-            edid: if state[k].mst_present {
-                state[k].mst_edid.get(..128).and_then(|e| e.try_into().ok())
-            } else if state[k].sst_present {
-                state[k].sst_edid.get(..128).and_then(|e| e.try_into().ok())
-            } else {
-                None
-            },
-            sink: shown.map(|(edid, timing, offered)| crate::amdgpu_navi48_kms::Sink {
-                edid,
-                timing,
-                offered,
-            }),
+    if let Some(port) = mst {
+        for slot in 0..crate::amdgpu_navi48_kms::MAX_OUTPUTS as u8 {
+            shape.push((
+                Target::Mst(port, slot),
+                ConnectorType::DisplayPort,
+                MST_INDEX + usize::from(slot),
+            ));
+        }
+    }
+    shape
+}
+
+/// The board DP/HDMI ports.
+fn board_ports(boot: &boot::ColdBoot) -> Vec<usize> {
+    connector_shape(boot, None)
+        .into_iter()
+        .filter_map(|(t, _, _)| match t {
+            Target::Board(port) => Some(port),
+            Target::Mst(..) => None,
+        })
+        .collect()
+}
+
+/// Publish every connector and CRTC on the amdgpu card's KMS state; a
+/// shown sink whose CRTC DRM switched off stays connected with its CRTC off.
+fn publish_outputs() {
+    let outputs = OUTPUTS.lock();
+    let crtcs: Vec<Option<crate::amdgpu_navi48_kms::Sink>> = (0..4)
+        .map(|k| {
+            outputs
+                .published(k)
+                .map(|(edid, timing, offered)| crate::amdgpu_navi48_kms::Sink {
+                    edid,
+                    timing,
+                    offered,
+                })
         })
         .collect();
-    crate::amdgpu_navi48_kms::publish(&kms);
-    for (k, &(_, shown, active)) in sinks.iter().enumerate() {
-        if shown.is_some() && !active {
+    let connectors: Vec<crate::amdgpu_navi48_kms::RoutedConnector> = outputs
+        .connectors
+        .iter()
+        .map(|c| crate::amdgpu_navi48_kms::RoutedConnector {
+            index: c.index,
+            kind: c.kind,
+            edid: c
+                .present
+                .then(|| c.edid.get(..128).and_then(|e| e.try_into().ok()))
+                .flatten(),
+            offered: if c.present { &c.modes } else { &[] },
+            crtc: outputs.crtc_of(c.target),
+            possible_crtcs: 0xf,
+        })
+        .collect();
+    crate::amdgpu_navi48_kms::publish_routed(&crtcs, &connectors);
+    for (k, sink) in crtcs.iter().enumerate() {
+        if sink.is_some() && !outputs.crtcs[k].published_active() {
             crate::amdgpu_navi48_kms::set_active(k, false);
         }
     }
@@ -877,9 +1065,9 @@ async unsafe fn adopt(boot: &mut boot::ColdBoot, m: &Modeset) {
     restart_vblank(pipe);
     let s = &m.selection;
     let offered: Vec<Timing> = m.modes.iter().flatten().copied().collect();
-    if let Some(o) = OUTPUT_STATE.lock().get_mut(usize::from(pipe)) {
-        o.shown = Some((s.edid, s.timing, offered));
-        o.retiring = false;
+    if let Some(c) = OUTPUTS.lock().crtcs.get_mut(usize::from(pipe)) {
+        c.shown = Some((s.edid, s.timing, offered));
+        c.retiring = false;
     }
 }
 
@@ -923,16 +1111,19 @@ async unsafe fn light_displays(
     boot: &mut boot::ColdBoot,
     fill: impl FnMut(u8, u32, &mut [u32]),
 ) -> Result<crate::amdgpu_navi48_boot::Configuration, ModesetError> {
-    use crate::drm::card::ConnectorType;
     if pending_display_work(boot) {
         return Err(crate::amdgpu_dcn401_otg::Error::Busy.into());
     }
-    // The first plugged DP port whose sink is an MST branch lights its end
-    // devices, one output each; the other ports stay dark meanwhile.
-    let board = lightable_outputs(boot);
+    // The first plugged DP port whose sink is an MST branch adds its end
+    // devices' connectors; every other board port stays a connector too.
     let mut mst = None;
-    for &(port, kind) in &board {
-        if kind != ConnectorType::DisplayPort {
+    for port in board_ports(boot) {
+        if boot
+            .display_paths()
+            .ok()
+            .and_then(|p| p.get(port))
+            .is_none_or(|p| p.connector != crate::amdgpu_dcn_inventory::Connector::DisplayPort)
+        {
             continue;
         }
         // HPD may still be disabled on cold boot; sense refuses such a
@@ -950,76 +1141,89 @@ async unsafe fn light_displays(
             break;
         }
     }
-    let shape = match mst {
-        Some(port) => {
-            alloc::vec![(port, ConnectorType::DisplayPort); crate::amdgpu_navi48_kms::MAX_OUTPUTS]
-        }
-        None => board,
-    };
-    let reshaped = {
-        let mut outputs = OUTPUTS.lock();
-        let reshaped = *outputs != shape;
-        *outputs = shape;
-        reshaped
-    };
-    if reshaped {
-        // Other outputs: DRM's requests were the old ones'.
-        for o in OUTPUT_STATE.lock().iter_mut() {
-            *o = OutputState::new();
-        }
-    }
+    let shape = connector_shape(boot, mst);
+    OUTPUTS.lock().reshape(&shape);
     if let Some(port) = mst {
         boot.start_display_mst(port).await?;
-        let link = boot.display_mst(port).ok_or(boot::MstFailure::Invalid)?;
-        for (state, output) in OUTPUT_STATE.lock().iter_mut().zip(&link.outputs) {
-            state.reconcile_mst(output.as_ref());
-        }
+        reconcile_mst_outputs(boot, port);
         // Clear old CRTC/framebuffer bindings for removed/reassigned monitors
         // before a newly lit sink can inherit the slot's DRM framebuffer.
         publish_outputs();
     }
-    let wants: Vec<(bool, Option<Timing>)> = {
-        let mut state = OUTPUT_STATE.lock();
-        // What this lighting lights is shown afresh; an output DRM switched
-        // off keeps its sink published.
-        for o in state.iter_mut().filter(|o| o.active) {
-            o.shown = None;
+    // Routes and requests as this lighting sees them.
+    let (routes, wants) = {
+        let mut outputs = OUTPUTS.lock();
+        if let Some(port) = mst {
+            // The MST root's own connector carries no sink meanwhile.
+            if let Some(root) = outputs.connector_mut(Target::Board(port)) {
+                root.reconcile_sst(None);
+            }
         }
-        state.iter().map(|o| (o.active, o.requested)).collect()
+        outputs.assign_routes();
+        // What this lighting lights is shown afresh; a CRTC DRM switched
+        // off keeps its connector published.
+        for c in outputs.crtcs.iter_mut().filter(|c| c.active) {
+            c.shown = None;
+        }
+        let routes: [Option<Target>; 4] = core::array::from_fn(|k| {
+            let c = &outputs.crtcs[k];
+            c.route.filter(|_| c.active)
+        });
+        let wants: [Option<Timing>; 4] = core::array::from_fn(|k| outputs.crtcs[k].requested);
+        (routes, wants)
     };
-    let want = |port: usize| pipe_of(port).and_then(|k| wants[usize::from(k)].1);
-    let pipe = |port: usize| pipe_of(port).filter(|&k| wants[usize::from(k)].0);
-    let result = if let Some(port) = mst {
-        // End device k stays on output k, including gaps for disabled or
-        // unreadable devices. Compacting would move another monitor here.
-        let pipes: Vec<Option<u8>> = (0..4u8)
-            .map(|k| wants[usize::from(k)].0.then_some(k))
-            .collect();
-        let want = |k: usize| wants[k].1;
-        // SAFETY: the caller's obligations.
-        unsafe { boot.modeset_mst_displays(port, fill, want, &pipes) }.await
-    } else {
-        // SAFETY: the caller's obligations.
-        unsafe { boot.modeset_displays(fill, want, pipe) }.await
+    let crtc_of = |t: Target| routes.iter().position(|r| *r == Some(t));
+    let pipe = |port: usize| crtc_of(Target::Board(port)).map(|k| k as u8);
+    let want = |port: usize| crtc_of(Target::Board(port)).and_then(|k| wants[k]);
+    let mst_pipes: Vec<Option<u8>> = (0..crate::amdgpu_navi48_kms::MAX_OUTPUTS as u8)
+        .map(|slot| {
+            mst.and_then(|port| crtc_of(Target::Mst(port, slot)))
+                .map(|k| k as u8)
+        })
+        .collect();
+    let mst_want = |slot: usize| {
+        mst.and_then(|port| crtc_of(Target::Mst(port, slot as u8)))
+            .and_then(|k| wants[k])
     };
-    if mst.is_none() {
-        let outputs = OUTPUTS.lock().clone();
-        for (k, &(port, _)) in outputs.iter().enumerate() {
+    let route = mst.map(|port| boot::MstRoute {
+        port,
+        // End device k stays on its connector, including gaps for disabled
+        // or unreadable devices: compacting would move another monitor.
+        pipes: &mst_pipes,
+        want: &mst_want,
+    });
+    // SAFETY: the caller's obligations.
+    let result = unsafe { boot.modeset_routed(fill, want, pipe, route) }.await;
+    {
+        let mut outputs = OUTPUTS.lock();
+        for c in &mut outputs.crtcs {
+            c.retiring = false;
+        }
+        let ports = board_ports(boot);
+        for port in ports {
             let hpd = boot.display_hpd(port).ok();
-            let mut state = OUTPUT_STATE.lock();
-            state[k].reconcile_sst(boot.display_sst_outputs().iter().find(|o| o.port == port));
-            state[k].last_hpd = hpd;
+            let sst = boot.display_sst_outputs().iter().find(|o| o.port == port);
+            let Some(x) = outputs.connector_mut(Target::Board(port)) else {
+                continue;
+            };
+            let changed = if Some(port) == mst {
+                x.reconcile_sst(None)
+            } else {
+                x.reconcile_sst(sst)
+            };
+            x.last_hpd = hpd;
+            if changed {
+                outputs.invalidate(Target::Board(port), false);
+            }
         }
-        // Even a failed preferred-mode activation leaves a valid connector
-        // inventory. It must not publish the former monitor's modes.
-        publish_outputs();
     }
+    if let Some(port) = mst {
+        reconcile_mst_outputs(boot, port);
+    }
+    // Even a failed preferred-mode activation leaves a valid connector
+    // inventory. It must not publish the former monitor's modes.
+    publish_outputs();
     let config = result?;
-    if let Some(link) = mst.and_then(|port| boot.display_mst(port)) {
-        for (state, output) in OUTPUT_STATE.lock().iter_mut().zip(&link.outputs) {
-            state.reconcile_mst(output.as_ref());
-        }
-    }
     for m in &config.displays {
         // SAFETY: as above.
         unsafe { adopt(boot, m) }.await;
@@ -1027,6 +1231,38 @@ async unsafe fn light_displays(
     publish_console(boot, config.displays.first().map(|m| m.pipe));
     publish_outputs();
     Ok(config)
+}
+
+/// Bring the branch's end-device connectors up to date.
+fn reconcile_mst_outputs(boot: &boot::ColdBoot, port: usize) {
+    let Some(link) = boot.display_mst(port) else {
+        return;
+    };
+    let mut outputs = OUTPUTS.lock();
+    for (slot, output) in link.outputs.iter().enumerate() {
+        let target = Target::Mst(port, slot as u8);
+        let Some(x) = outputs.connector_mut(target) else {
+            continue;
+        };
+        let (reset, changed) = x.reconcile_mst(output.as_ref());
+        if reset || changed {
+            outputs.invalidate(target, reset);
+        }
+    }
+}
+
+/// The connector a running modeset drives.
+fn target_of(boot: &boot::ColdBoot, m: &Modeset) -> Option<Target> {
+    let port = m.selection.port;
+    let Some(stream) = m.selection.mst else {
+        return Some(Target::Board(port));
+    };
+    let link = boot.display_mst(port)?;
+    let slot = link
+        .outputs
+        .iter()
+        .position(|o| o.as_ref().is_some_and(|o| o.sink == Some(stream.sink)))?;
+    Some(Target::Mst(port, slot as u8))
 }
 
 /// Allocate the back buffer of a staged or live pipe and return its CPU view.
@@ -1453,8 +1689,50 @@ pub enum MonitorStep {
 /// the display monitor converges the hardware to it on its next pass, so a
 /// quick off/on pair does nothing.
 pub fn request_display_active(display: u8, active: bool) {
-    if let Some(o) = OUTPUT_STATE.lock().get_mut(usize::from(display)) {
-        o.active = active;
+    if let Some(c) = OUTPUTS.lock().crtcs.get_mut(usize::from(display)) {
+        c.active = active;
+    }
+}
+
+/// Record DRM's routing of CRTC `display` to the connector with KMS id
+/// `connector` (None: no connector), as SETCRTC's connector list or an
+/// atomic connector CRTC_ID sets it. Any encoder may drive any CRTC; a
+/// connector moved here leaves its old CRTC. The monitor relights when a
+/// running display's connector changes. False for an unknown connector.
+pub fn request_display_route(display: u8, connector: Option<u32>) -> bool {
+    let mut outputs = OUTPUTS.lock();
+    let k = usize::from(display);
+    if k >= 4 {
+        return false;
+    }
+    let target = match connector {
+        Some(id) => match outputs.target_of_id(id) {
+            Some(t) => Some(t),
+            None => return false,
+        },
+        None => None,
+    };
+    if outputs.crtcs[k].route != target || !outputs.crtcs[k].explicit {
+        outputs.route(k, target);
+    }
+    true
+}
+
+/// Record DRM's routing of the connector with KMS id `connector` to CRTC
+/// `display` (None: detached from every CRTC).
+pub fn request_connector_crtc(connector: u32, display: Option<u8>) -> bool {
+    match display {
+        Some(display) => request_display_route(display, Some(connector)),
+        None => {
+            let mut outputs = OUTPUTS.lock();
+            let Some(target) = outputs.target_of_id(connector) else {
+                return false;
+            };
+            if let Some(k) = outputs.crtc_of(target) {
+                outputs.route(k, None);
+            }
+            true
+        }
     }
 }
 
@@ -1465,46 +1743,65 @@ pub fn request_broadcast_rgb(value: u8) {
     crate::amdgpu_navi48_boot::set_broadcast_rgb(value);
 }
 
-/// Whether display `display` offers `mode` (one of its published timings).
-pub fn display_offers(display: u8, mode: &crate::drm::ioctl::DrmModeModeInfo) -> bool {
-    OUTPUT_STATE
-        .lock()
-        .get(usize::from(display))
-        .is_some_and(|o| o.find_mode(mode).is_some())
+/// Whether display `display` offers `mode` on its routed connector, or on
+/// `connector` (a KMS id) when the same request routes it there.
+pub fn display_offers(
+    display: u8,
+    connector: Option<u32>,
+    mode: &crate::drm::ioctl::DrmModeModeInfo,
+) -> bool {
+    let outputs = OUTPUTS.lock();
+    let k = usize::from(display);
+    if k >= 4 {
+        return false;
+    }
+    let target = match connector {
+        Some(id) => match outputs.target_of_id(id) {
+            Some(t) => Some(t),
+            None => return false,
+        },
+        None => None,
+    };
+    outputs.find_mode(k, target, mode).is_some()
 }
 
 /// Record the mode a DRM client set on display `display` (SETCRTC or an
-/// atomic MODE_ID), which must be one of that display's offered timings;
+/// atomic MODE_ID), which must be one of its connector's offered timings;
 /// `None` returns it to its preferred mode. Returns false for a mode the
-/// display does not offer.
+/// display does not offer. Route first when the same request routes it.
 pub fn request_display_mode(
     display: u8,
     mode: Option<&crate::drm::ioctl::DrmModeModeInfo>,
 ) -> bool {
-    let mut state = OUTPUT_STATE.lock();
-    let Some(o) = state.get_mut(usize::from(display)) else {
+    let mut outputs = OUTPUTS.lock();
+    let k = usize::from(display);
+    if k >= 4 {
         return false;
-    };
+    }
     let Some(m) = mode else {
-        o.requested = None;
+        outputs.crtcs[k].requested = None;
         return true;
     };
-    let found = o.find_mode(m);
-    match found {
+    match outputs.find_mode(k, None, m) {
         Some(t) => {
-            o.requested = Some(t);
+            outputs.crtcs[k].requested = Some(t);
             true
         }
         None => false,
     }
 }
 
-/// Every display back to the console's defaults (on, preferred mode), as
-/// drm_fb_helper restores the console on lastclose.
+/// Every display back to the console's defaults (on, preferred mode,
+/// automatic routing), as drm_fb_helper restores the console on lastclose.
 pub fn restore_displays() {
-    for o in OUTPUT_STATE.lock().iter_mut() {
-        o.active = true;
-        o.requested = None;
+    let mut outputs = OUTPUTS.lock();
+    for c in outputs.crtcs.iter_mut() {
+        c.active = true;
+        c.requested = None;
+        c.explicit = false;
+    }
+    for x in outputs.connectors.iter_mut() {
+        x.parked = false;
     }
 }
 
@@ -1542,17 +1839,33 @@ fn pending_display_work(boot: &boot::ColdBoot) -> bool {
         })
 }
 
-/// Physical HPD describes the root only. MST output presence comes from the
-/// retained downstream snapshot, including when no stream is running.
-fn output_present(boot: &mut boot::ColdBoot, port: usize, slot: usize, mst: bool) -> bool {
-    boot.display_hpd(port) == Ok(true)
-        && (!mst
-            || boot.display_mst(port).is_some_and(|l| {
-                l.outputs
-                    .get(slot)
-                    .and_then(Option::as_ref)
-                    .is_some_and(|o| o.sink.is_some())
-            }))
+/// Whether CRTC k's routed connector has a sink: board sinks by HPD, end
+/// devices by the retained downstream snapshot (physical HPD describes the
+/// root only), including when no stream is running.
+fn routed_present(boot: &mut boot::ColdBoot, outputs: &Outputs, k: usize) -> bool {
+    match outputs.crtcs[k].route {
+        Some(Target::Board(port)) => {
+            boot.display_hpd(port) == Ok(true) && outputs.mst_port() != Some(port)
+        }
+        Some(Target::Mst(port, slot)) => {
+            boot.display_hpd(port) == Ok(true)
+                && boot.display_mst(port).is_some_and(|l| {
+                    l.outputs
+                        .get(usize::from(slot))
+                        .and_then(Option::as_ref)
+                        .is_some_and(|o| o.sink.is_some())
+                })
+        }
+        None => false,
+    }
+}
+
+/// CRTCs DRM wants on whose connectors have sinks.
+fn wanted_mask(boot: &mut boot::ColdBoot) -> u8 {
+    let outputs = OUTPUTS.lock();
+    (0..4)
+        .filter(|&k| outputs.crtcs[k].active && routed_present(boot, &outputs, k))
+        .fold(0, |acc, k| acc | 1 << k)
 }
 
 /// Record before the CPU drain, then finish native retirement and release.
@@ -1566,8 +1879,10 @@ async unsafe fn retire_monitored_display(
     unplugged: bool,
 ) -> Result<(), ModesetError> {
     let m = displays.lit[usize::from(pipe)].ok_or(crate::amdgpu_dcn401_otg::Error::Invalid)?;
+    // Before teardown can change the branch's payload records.
+    let target = target_of(boot, &m);
     boot.begin_modeset_teardown(&m, unplugged)?;
-    OUTPUT_STATE.lock()[usize::from(pipe)].retiring = true;
+    OUTPUTS.lock().crtcs[usize::from(pipe)].retiring = true;
     publish_outputs();
     withdraw(boot, pipe, &displays.lit).await;
     // SAFETY: CPU views drained and OWNER excludes native producers. The
@@ -1584,26 +1899,21 @@ async unsafe fn retire_monitored_display(
     // A request to reactivate during withdrawal is a new lighting attempt.
     displays.considered &= !(1 << pipe);
     {
-        let mut state = OUTPUT_STATE.lock();
-        let output = &mut state[usize::from(pipe)];
-        if m.selection.mst.is_some() {
-            // A disable need not relight surviving streams. Retain the modes
-            // already admitted beside them, without retaining a CRTC mode.
-            // The next configuration/reprobe recomputes independent admission.
-            output.mst_modes = if unplugged {
-                Vec::new()
+        let mut outputs = OUTPUTS.lock();
+        outputs.crtcs[usize::from(pipe)].shown = None;
+        // A disable need not relight siblings. Retain the modes already
+        // admitted beside them, without a CRTC mode; the next configuration
+        // or reprobe recomputes independent admission.
+        if let Some(x) = target.and_then(|t| outputs.connector_mut(t)) {
+            if unplugged {
+                // An end device's presence follows the branch snapshot.
+                if matches!(x.target, Target::Board(_)) {
+                    x.present = false;
+                }
+                x.modes.clear();
             } else {
-                m.modes.iter().flatten().copied().collect()
-            };
-            output.shown = None;
-        } else {
-            output.sst_modes = if unplugged {
-                output.sst_present = false;
-                Vec::new()
-            } else {
-                m.modes.iter().flatten().copied().collect()
-            };
-            output.shown = None;
+                x.modes = m.modes.iter().flatten().copied().collect();
+            }
         }
     }
     publish_outputs();
@@ -1648,31 +1958,29 @@ pub async unsafe fn monitor_displays(
             displays.considered &= !(1 << pipe);
         }
     }
-    // Keep a connected branch's output identities and DRM requests even
-    // when every CRTC is off. Only its physical removal restores board ports.
-    let mst_port = mst_output_port(&OUTPUTS.lock());
-    if displays.lit.iter().all(Option::is_none)
-        && mst_port.is_some_and(|p| boot.display_hpd(p) == Ok(false))
-    {
-        boot.forget_unplugged_display_mst(mst_port.unwrap())?;
-        let board = lightable_outputs(boot);
-        let mut outputs = OUTPUTS.lock();
-        if *outputs != board {
-            *outputs = board;
-            drop(outputs);
-            for o in OUTPUT_STATE.lock().iter_mut() {
-                *o = OutputState::new();
-            }
+    // Keep a connected branch's connectors and DRM requests even when its
+    // CRTCs are off. Only the root's physical removal drops them, once no
+    // stream on that branch remains.
+    let mst_port = OUTPUTS.lock().mst_port();
+    if let Some(port) = mst_port.filter(|&p| boot.display_hpd(p) == Ok(false)) {
+        let streaming = displays
+            .lit
+            .iter()
+            .flatten()
+            .any(|m| m.selection.port == port && m.selection.mst.is_some());
+        if !streaming {
+            boot.forget_unplugged_display_mst(port)?;
+            let shape = connector_shape(boot, None);
+            OUTPUTS.lock().reshape(&shape);
             displays.considered = 0;
             publish_outputs();
         }
     }
-    let outputs = OUTPUTS.lock().clone();
-    let wants: Vec<(bool, Option<Timing>)> = OUTPUT_STATE
-        .lock()
-        .iter()
-        .map(|o| (o.active, o.requested))
-        .collect();
+    let mst_port = OUTPUTS.lock().mst_port();
+    let wants: [(bool, Option<Timing>); 4] = {
+        let outputs = OUTPUTS.lock();
+        core::array::from_fn(|k| (outputs.crtcs[k].active, outputs.crtcs[k].requested))
+    };
     let limited =
         crate::amdgpu_navi48_boot::limited_range(crate::amdgpu_navi48_boot::broadcast_rgb());
     let pending_mask = (0..4u8)
@@ -1681,24 +1989,26 @@ pub async unsafe fn monitor_displays(
         })
         .fold(0u8, |mask, p| mask | (1 << p));
     let mut relight = false;
-    if mst_port.is_none() {
-        for (k, &(port, _)) in outputs.iter().enumerate() {
-            if let Ok(present) = boot.display_hpd(port) {
-                let mut state = OUTPUT_STATE.lock();
-                let o = &mut state[k];
-                // A disabled port still needs a new EDID/admission snapshot
-                // when HPD rises. Physical removal needs no AUX transaction.
-                relight |= o.observe_sst_hpd(present);
+    for port in board_ports(boot) {
+        if Some(port) == mst_port {
+            continue;
+        }
+        if let Ok(present) = boot.display_hpd(port) {
+            let mut outputs = OUTPUTS.lock();
+            // A disabled port still needs a new EDID/admission snapshot
+            // when HPD rises. Physical removal needs no AUX transaction.
+            if let Some(x) = outputs.connector_mut(Target::Board(port)) {
+                relight |= x.observe_sst_hpd(present);
             }
         }
-        publish_outputs();
     }
+    publish_outputs();
     if let Some(port) = mst_port {
         if pending_mask == 0
             && boot.display_hpd(port) == Ok(true)
             && boot.display_mst(port).is_some()
         {
-            relight = boot.service_display_mst(port).await?;
+            relight |= boot.service_display_mst(port).await?;
         }
     }
     for k in monitor_order(pending_mask) {
@@ -1721,7 +2031,13 @@ pub async unsafe fn monitor_displays(
         }
         let preferred = m.modes.iter().flatten().next().copied();
         let desired = wants[usize::from(k)].1.or(preferred);
-        if desired.is_some_and(|d| d != m.selection.timing) || limited != m.selection.limited {
+        // DRM moved this CRTC to another connector (or another connector
+        // here): a configuration change like a mode request.
+        let rerouted = target_of(boot, &m) != OUTPUTS.lock().crtcs[usize::from(k)].route;
+        if rerouted
+            || desired.is_some_and(|d| d != m.selection.timing)
+            || limited != m.selection.limited
+        {
             relight = true;
             continue;
         }
@@ -1765,11 +2081,18 @@ pub async unsafe fn monitor_displays(
                     continue;
                 }
                 displays.lit[usize::from(k)] = Some(m);
-                OUTPUT_STATE.lock()[usize::from(k)].retrained(
-                    m.selection.edid,
-                    m.selection.timing,
-                    m.modes.into_iter().flatten().collect(),
-                );
+                {
+                    let offered: Vec<Timing> = m.modes.into_iter().flatten().collect();
+                    let mut outputs = OUTPUTS.lock();
+                    if let Some(x) = target_of(boot, &m).and_then(|t| outputs.connector_mut(t)) {
+                        x.modes.clone_from(&offered);
+                    }
+                    outputs.crtcs[usize::from(k)].retrained(
+                        m.selection.edid,
+                        m.selection.timing,
+                        offered,
+                    );
+                }
                 steps.push(MonitorStep::Retrained(k));
             }
             Health::Unplugged => {
@@ -1779,13 +2102,10 @@ pub async unsafe fn monitor_displays(
             }
         }
     }
-    // Sinks to light: plugged on an output DRM has not switched off.
-    let mut wanted = 0u8;
-    for (k, &(port, _)) in outputs.iter().enumerate() {
-        if wants[k].0 && output_present(boot, port, k, mst_output_port(&outputs).is_some()) {
-            wanted |= 1 << k;
-        }
-    }
+    // Sinks to light: a plugged connector, routed (automatically for a new
+    // sink) to a CRTC DRM has not switched off.
+    OUTPUTS.lock().assign_routes();
+    let wanted = wanted_mask(boot);
     let lit_mask = displays
         .lit
         .iter()
@@ -1821,8 +2141,8 @@ pub async unsafe fn monitor_displays(
                     &mut narf_console::Writer,
                     format_args!("amdgpu: navi48 mode switch failed: {e:?}\n"),
                 );
-                for o in OUTPUT_STATE.lock().iter_mut() {
-                    o.requested = None;
+                for c in OUTPUTS.lock().crtcs.iter_mut() {
+                    c.requested = None;
                 }
                 // SAFETY: as above.
                 Some(unsafe { light_displays(boot, fill) }.await?)
@@ -1848,19 +2168,8 @@ pub async unsafe fn monitor_displays(
                 count += 1;
             }
         }
-        // Every plugged output the lighting saw, on its outputs (an MST
-        // branch's replace the board's).
-        let outputs = OUTPUTS.lock().clone();
-        let state = OUTPUT_STATE.lock();
-        displays.considered = outputs
-            .iter()
-            .enumerate()
-            .filter(|&(k, &(port, _))| {
-                state[k].active
-                    && output_present(boot, port, k, mst_output_port(&outputs).is_some())
-            })
-            .fold(0, |acc, (k, _)| acc | 1 << k);
-        drop(state);
+        // Every wanted CRTC the lighting saw, lit or left dark.
+        displays.considered = wanted_mask(boot);
         if reduced {
             displays.considered = displays
                 .lit
@@ -1898,8 +2207,8 @@ pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configura
         {
             let mut owner = OWNER.lock().await;
             if let Some(boot) = owner.as_mut() {
-                // Every board port, whatever the outputs are now.
-                let ports: Vec<usize> = lightable_outputs(boot).iter().map(|&(p, _)| p).collect();
+                // Every board port, whatever the connectors are now.
+                let ports = board_ports(boot);
                 for port in ports {
                     // SAFETY: board-routed selectors; no GPIO user of HPD pins.
                     if unsafe { boot.enable_display_hpd(port) }.is_ok() {
@@ -1908,14 +2217,8 @@ pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configura
                         let _ = unsafe { boot.enable_display_hpd_irq(port) };
                     }
                 }
-                // Bits describe current outputs, which can be MST devices
-                // rather than board-port ordinals.
-                let outputs = OUTPUTS.lock().clone();
-                for (k, &(port, _)) in outputs.iter().enumerate() {
-                    if output_present(boot, port, k, mst_output_port(&outputs).is_some()) {
-                        displays.considered |= 1 << k;
-                    }
-                }
+                // Bits are CRTCs, whose connectors can be MST devices.
+                displays.considered |= wanted_mask(boot);
             }
         }
         let mut hotplug = None;
@@ -2308,8 +2611,8 @@ mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    fn navi48_dark_sst_connector_preserves_disable_and_invalidates_replacement() -> TestResult {
-        let timing = Timing {
+    fn hd() -> Timing {
+        Timing {
             pixel_clock_khz: 148500,
             h_active: 1920,
             h_total: 2200,
@@ -2321,38 +2624,57 @@ mod tests {
             v_sync_width: 5,
             h_sync_positive: true,
             v_sync_positive: true,
-        };
+        }
+    }
+    fn board(n: usize) -> (Target, ConnectorType, usize) {
+        (Target::Board(n), ConnectorType::DisplayPort, n)
+    }
+
+    fn navi48_dark_sst_connector_preserves_disable_and_invalidates_replacement() -> TestResult {
+        let timing = hd();
+        let target = Target::Board(2);
         let mut output = boot::SstOutput {
             port: 2,
             edid: alloc::vec![0; 256],
             modes: alloc::vec![timing],
         };
-        let mut state = OutputState::new();
-        state.active = false;
-        state.reconcile_sst(Some(&output));
-        assert!(state.sst_present && state.published().is_none());
-        assert!(!state.published_active());
+        let mut o = Outputs::new();
+        o.reshape(&[(target, ConnectorType::DisplayPort, 0)]);
+        o.crtcs[0].active = false;
+        assert!(o
+            .connector_mut(target)
+            .unwrap()
+            .reconcile_sst(Some(&output)));
+        o.assign_routes();
+        assert_eq!(o.crtcs[0].route, Some(target));
+        assert!(o.connector(target).unwrap().present && o.published(0).is_none());
+        assert!(!o.crtcs[0].published_active());
         let wire = crate::amdgpu_navi48_kms::timing_wire(&timing);
-        assert_eq!(state.find_mode(&wire), Some(timing));
-        state.requested = Some(timing);
-        assert!(!state.observe_sst_hpd(true));
-        assert!(!state.observe_sst_hpd(false));
-        assert!(!state.sst_present && state.offered().is_empty());
-        assert_eq!(state.requested, Some(timing));
-        assert!(state.observe_sst_hpd(true));
-        assert!(!state.observe_sst_hpd(true));
-        state.reconcile_sst(Some(&output));
-        assert!(!state.active && state.published().is_none());
-        assert_eq!(state.requested, Some(timing));
-        assert_eq!(state.find_mode(&wire), Some(timing));
+        assert_eq!(o.find_mode(0, None, &wire), Some(timing));
+        o.crtcs[0].requested = Some(timing);
+        let x = o.connector_mut(target).unwrap();
+        assert!(!x.observe_sst_hpd(true));
+        assert!(!x.observe_sst_hpd(false));
+        assert!(!o.connector(target).unwrap().present && o.offered(0, None).is_empty());
+        assert_eq!(o.crtcs[0].requested, Some(timing));
+        let x = o.connector_mut(target).unwrap();
+        assert!(x.observe_sst_hpd(true));
+        assert!(!x.observe_sst_hpd(true));
+        assert!(!x.reconcile_sst(Some(&output)));
+        assert!(!o.crtcs[0].active && o.published(0).is_none());
+        assert_eq!(o.crtcs[0].requested, Some(timing));
+        assert_eq!(o.find_mode(0, None, &wire), Some(timing));
         // Extension changes invalidate requests even with an identical base.
         output.edid[128] = 1;
         output.modes.clear();
-        state.reconcile_sst(Some(&output));
-        assert!(state.sst_present && !state.active);
-        assert!(state.requested.is_none() && state.offered().is_empty());
-        let mut initially_absent = OutputState::new();
-        initially_absent.active = false;
+        assert!(o
+            .connector_mut(target)
+            .unwrap()
+            .reconcile_sst(Some(&output)));
+        o.invalidate(target, false);
+        assert!(o.connector(target).unwrap().present && !o.crtcs[0].active);
+        assert!(o.crtcs[0].requested.is_none() && o.offered(0, None).is_empty());
+        let mut initially_absent = ConnectorState::new(target, ConnectorType::DisplayPort, 0);
         assert!(initially_absent.observe_sst_hpd(true));
         assert!(!initially_absent.observe_sst_hpd(true));
         TestResult::Pass
@@ -2363,34 +2685,25 @@ mod tests {
     );
 
     fn navi48_retraining_refreshes_published_modes_and_drops_invalid_requests() -> TestResult {
-        let timing = Timing {
-            pixel_clock_khz: 148500,
-            h_active: 1920,
-            h_total: 2200,
-            h_front_porch: 88,
-            h_sync_width: 44,
-            v_active: 1080,
-            v_total: 1125,
-            v_front_porch: 4,
-            v_sync_width: 5,
-            h_sync_positive: true,
-            v_sync_positive: true,
-        };
+        let timing = hd();
         let faster = Timing {
             pixel_clock_khz: 594000,
             ..timing
         };
-        let mut state = OutputState::new();
-        state.shown = Some(([1; 128], timing, alloc::vec![timing, faster]));
-        state.requested = Some(faster);
-        state.retrained([1; 128], timing, alloc::vec![timing]);
-        assert_eq!(state.offered(), &[timing]);
-        assert_eq!(state.sst_modes, [timing]);
-        assert!(state.requested.is_none() && state.published_active());
-        assert_eq!(state.published().unwrap().1, timing);
-        state.requested = Some(timing);
-        state.retrained([1; 128], timing, alloc::vec![timing]);
-        assert_eq!(state.requested, Some(timing));
+        let mut o = Outputs::new();
+        o.reshape(&[board(0)]);
+        o.connectors[0].present = true;
+        o.assign_routes();
+        let c = &mut o.crtcs[0];
+        c.shown = Some(([1; 128], timing, alloc::vec![timing, faster]));
+        c.requested = Some(faster);
+        c.retrained([1; 128], timing, alloc::vec![timing]);
+        assert_eq!(o.offered(0, None), &[timing]);
+        assert!(o.crtcs[0].requested.is_none() && o.crtcs[0].published_active());
+        assert_eq!(o.published(0).unwrap().1, timing);
+        o.crtcs[0].requested = Some(timing);
+        o.crtcs[0].retrained([1; 128], timing, alloc::vec![timing]);
+        assert_eq!(o.crtcs[0].requested, Some(timing));
         TestResult::Pass
     }
     kernel_test_in!(
@@ -2412,65 +2725,155 @@ mod tests {
             edid: alloc::vec![0; 256],
             modes: Vec::new(),
         };
-        let timing = Timing {
-            pixel_clock_khz: 148500,
-            h_active: 1920,
-            h_total: 2200,
-            h_front_porch: 88,
-            h_sync_width: 44,
-            v_active: 1080,
-            v_total: 1125,
-            v_front_porch: 4,
-            v_sync_width: 5,
-            h_sync_positive: true,
-            v_sync_positive: true,
-        };
-        let mut state = OutputState::new();
+        let timing = hd();
+        let target = Target::Mst(0, 1);
+        let mut o = Outputs::new();
+        o.reshape(&[(target, ConnectorType::DisplayPort, MST_INDEX + 1)]);
         output.modes.push(timing);
-        state.reconcile_mst(Some(&output));
-        state.shown = Some(([0; 128], timing, alloc::vec![timing]));
-        state.requested = Some(timing);
-        state.active = false;
+        let reconcile = |o: &mut Outputs, output: &boot::MstOutput| {
+            let (reset, changed) = o.connector_mut(target).unwrap().reconcile_mst(Some(output));
+            if reset || changed {
+                o.invalidate(target, reset);
+            }
+        };
+        reconcile(&mut o, &output);
+        o.assign_routes();
+        o.crtcs[0].shown = Some(([0; 128], timing, alloc::vec![timing]));
+        o.crtcs[0].requested = Some(timing);
+        o.crtcs[0].active = false;
         let mut considered = 0;
         // Downstream disconnect drives a reprobe even with no wanted CRTC.
         assert!(needs_relight(true, 0, 0, &mut considered));
         output.sink = None;
         output.edid.clear();
-        state.reconcile_mst(Some(&output));
-        assert!(state.published().is_none());
-        assert!(state.offered().is_empty());
-        assert!(!state.active);
-        assert_eq!(state.requested, Some(timing));
+        reconcile(&mut o, &output);
+        assert!(o.published(0).is_none());
+        assert!(o.offered(0, None).is_empty());
+        assert!(!o.crtcs[0].active);
+        assert_eq!(o.crtcs[0].requested, Some(timing));
+        // DRM's explicit routing survives the device leaving.
+        o.route(0, Some(target));
+        o.assign_routes();
+        assert_eq!(o.crtcs[0].route, Some(target));
         // The same connector and EDID return with a different branch index.
         output.sink = Some(crate::dp_mst_mgr::Sink { branch: 2, port: 3 });
         output.edid.resize(256, 0);
-        state.reconcile_mst(Some(&output));
-        assert!(state.published().is_none());
-        assert_eq!(state.offered(), &[timing]);
+        reconcile(&mut o, &output);
+        assert!(o.published(0).is_none());
+        o.crtcs[0].shown = None;
+        assert_eq!(o.offered(0, None), &[timing]);
         let wire = crate::amdgpu_navi48_kms::timing_wire(&timing);
-        assert_eq!(state.find_mode(&wire), Some(timing));
-        assert!(!state.active);
-        assert_eq!(state.requested, Some(timing));
+        assert_eq!(o.find_mode(0, None, &wire), Some(timing));
+        assert!(!o.crtcs[0].active);
+        o.crtcs[0].requested = Some(timing);
         assert!(!needs_relight(false, 0, 0, &mut considered));
-        state.active = true;
-        assert_eq!(state.find_mode(&wire), Some(timing));
+        o.crtcs[0].active = true;
         assert!(needs_relight(false, 1, 0, &mut considered));
         // A different monitor on this connector retains disabled state but
         // loses stale modes. Reassigning the slot resets old DRM requests.
-        state.active = false;
+        o.crtcs[0].active = false;
         output.edid[128] = 1; // same base block, changed extension modes
         output.modes.clear(); // a reprobe invalidates admission too
-        state.reconcile_mst(Some(&output));
-        assert!(!state.active && state.shown.is_none() && state.requested.is_none());
-        assert!(state.find_mode(&wire).is_none());
+        reconcile(&mut o, &output);
+        assert!(!o.crtcs[0].active && o.crtcs[0].shown.is_none());
+        assert!(o.crtcs[0].requested.is_none());
+        assert!(o.find_mode(0, None, &wire).is_none());
         output.id.branch = [3; 16];
-        state.reconcile_mst(Some(&output));
-        assert!(state.active && state.shown.is_none() && state.requested.is_none());
+        reconcile(&mut o, &output);
+        assert!(o.crtcs[0].active && o.crtcs[0].requested.is_none());
         TestResult::Pass
     }
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi48",
         navi48_mst_disabled_connector_survives_hotplug
+    );
+
+    /// Linux-style routing: connectors (board ports beside an MST branch's
+    /// end devices) take CRTCs automatically in connector order and keep
+    /// them while plugged; DRM routes any connector to any CRTC, moving it
+    /// off its old CRTC and parking a displaced one; reshaping drops routes
+    /// to vanished connectors; restore returns to automatic routing.
+    fn navi48_outputs_route_connectors_to_any_crtc() -> TestResult {
+        let shape = [
+            board(0),
+            (Target::Board(1), ConnectorType::HdmiA, 1),
+            (Target::Mst(0, 0), ConnectorType::DisplayPort, MST_INDEX),
+            (Target::Mst(0, 1), ConnectorType::DisplayPort, MST_INDEX + 1),
+            (Target::Mst(0, 2), ConnectorType::DisplayPort, MST_INDEX + 2),
+        ];
+        let mut o = Outputs::new();
+        o.reshape(&shape);
+        for t in [Target::Board(1), Target::Mst(0, 0), Target::Mst(0, 2)] {
+            o.connector_mut(t).unwrap().present = true;
+        }
+        o.assign_routes();
+        let routes = |o: &Outputs| o.crtcs.iter().map(|c| c.route).collect::<Vec<_>>();
+        assert_eq!(
+            routes(&o),
+            [
+                Some(Target::Board(1)),
+                Some(Target::Mst(0, 0)),
+                Some(Target::Mst(0, 2)),
+                None
+            ]
+        );
+        // A new end device takes the free CRTC; running ones keep theirs.
+        o.connector_mut(Target::Mst(0, 1)).unwrap().present = true;
+        o.assign_routes();
+        assert_eq!(o.crtcs[3].route, Some(Target::Mst(0, 1)));
+        // KMS ids: board ordinals, MST slots past them.
+        let id = crate::amdgpu_navi48_kms::connector_id;
+        assert_eq!(o.target_of_id(id(1)), Some(Target::Board(1)));
+        assert_eq!(o.target_of_id(id(MST_INDEX + 2)), Some(Target::Mst(0, 2)));
+        assert_eq!(o.target_of_id(id(7)), None);
+        // DRM moves the HDMI sink to CRTC 3: CRTC 0 is left explicitly
+        // empty and CRTC 3's end device parked, so neither is refilled.
+        o.crtcs[3].requested = Some(hd());
+        o.route(3, Some(Target::Board(1)));
+        o.assign_routes();
+        assert_eq!(
+            routes(&o),
+            [
+                None,
+                Some(Target::Mst(0, 0)),
+                Some(Target::Mst(0, 2)),
+                Some(Target::Board(1))
+            ]
+        );
+        assert!(o.crtcs[0].explicit && o.crtcs[3].explicit);
+        assert!(o.crtcs[3].requested.is_none(), "old connector's mode kept");
+        assert!(o.connector(Target::Mst(0, 1)).unwrap().parked);
+        // A timing is validated on the connector the request routes to.
+        let wire = crate::amdgpu_navi48_kms::timing_wire(&hd());
+        o.connector_mut(Target::Mst(0, 1)).unwrap().modes = alloc::vec![hd()];
+        assert!(o.find_mode(3, None, &wire).is_none());
+        assert_eq!(o.find_mode(3, Some(Target::Mst(0, 1)), &wire), Some(hd()));
+        // An unplugged automatic route is dropped; an explicit one stays.
+        o.connector_mut(Target::Mst(0, 0)).unwrap().present = false;
+        o.connector_mut(Target::Board(1)).unwrap().present = false;
+        o.assign_routes();
+        assert_eq!(o.crtcs[1].route, None);
+        assert_eq!(o.crtcs[3].route, Some(Target::Board(1)));
+        // The branch leaves: its connectors and routes go.
+        o.reshape(&shape[..2]);
+        assert!(o
+            .crtcs
+            .iter()
+            .all(|c| !matches!(c.route, Some(Target::Mst(..)))));
+        assert_eq!(o.mst_port(), None);
+        // Console restore: automatic routing again.
+        for c in o.crtcs.iter_mut() {
+            c.explicit = false;
+        }
+        o.connector_mut(Target::Board(1)).unwrap().present = true;
+        o.crtcs[3].route = None;
+        o.assign_routes();
+        assert_eq!(o.crtcs[0].route, Some(Target::Board(1)));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_outputs_route_connectors_to_any_crtc
     );
 
     /// A frame the native display cannot take still completes its
@@ -2578,7 +2981,7 @@ mod tests {
     );
 
     fn navi48_monitor_finishes_retirement_before_reactivation() -> TestResult {
-        let mut output = OutputState::new();
+        let mut output = CrtcState::new();
         output.active = false;
         output.retiring = true;
         // DRM asks to reactivate while CPU withdrawal or native stop waits.

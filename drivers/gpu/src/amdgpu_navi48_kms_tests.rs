@@ -492,3 +492,84 @@ kernel_test_in!(
     "drivers/gpu/navi48-kms",
     navi48_kms_publishes_an_output_per_port
 );
+
+/// Routed outputs: four CRTCs, one encoder per connector able to drive
+/// any CRTC, an MST end device's connector past the board ones. A
+/// connector shows its routed CRTC's sink; an unrouted one its discovered
+/// EDID and admitted timings. Rerouting keeps every object id.
+fn navi48_kms_routes_connectors_to_any_crtc() -> TestResult {
+    let t = cea_1080p();
+    let edid_a = [0xa; 128];
+    let edid_m = [0xe; 128];
+    let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
+    let crtcs = [None, None, lit(&edid_m, &t, &[]), None];
+    let mut connectors = [
+        RoutedConnector {
+            index: 0,
+            kind: ConnectorType::DisplayPort,
+            edid: None,
+            offered: &[],
+            crtc: None,
+            possible_crtcs: 0xf,
+        },
+        RoutedConnector {
+            index: 1,
+            kind: ConnectorType::HdmiA,
+            edid: Some(&edid_a),
+            offered: core::slice::from_ref(&t),
+            crtc: None,
+            possible_crtcs: 0xf,
+        },
+        RoutedConnector {
+            index: 33,
+            kind: ConnectorType::DisplayPort,
+            edid: Some(&edid_m),
+            offered: &[],
+            crtc: Some(2),
+            possible_crtcs: 0xf,
+        },
+    ];
+    apply_routed(&mut card, &crtcs, &connectors);
+    assert_eq!(
+        (card.crtcs.len(), card.encoders.len(), card.connectors.len()),
+        (4, 3, 3)
+    );
+    let ids: alloc::vec::Vec<u32> = card.connectors.iter().map(|c| c.id).collect();
+    assert_eq!(ids, [3, 6, 102]);
+    assert_eq!(connector_index(102), Some(33));
+    assert!(card.encoders.iter().all(|e| e.possible_crtcs == 0xf));
+    let encoder_crtc = |card: &Card, i: usize| card.encoder(encoder_id(i)).unwrap().crtc_id;
+    assert_eq!(encoder_crtc(&card, 33), Some(crtc_id(2)));
+    assert_eq!(encoder_crtc(&card, 1), None);
+    assert!(card.crtc(crtc_id(2)).unwrap().mode.is_some());
+    assert!(card.crtc(crtc_id(0)).unwrap().mode.is_none());
+    let mst = card.connector(102).unwrap();
+    assert_eq!(mst.status, ConnectorStatus::Connected);
+    assert_eq!(mst.modes.len(), 1);
+    assert_eq!(card.native_output(102).and_then(|n| n.edid), Some(edid_m));
+    // Dark but discovered: connected with its admitted timing.
+    let hdmi = card.connector(6).unwrap();
+    assert_eq!(hdmi.status, ConnectorStatus::Connected);
+    assert_eq!(hdmi.connector_type_id, 1);
+    assert_eq!(hdmi.modes.len(), 1);
+    assert_eq!(
+        card.connector(3).unwrap().status,
+        ConnectorStatus::Disconnected
+    );
+    // Route the HDMI sink to CRTC 0 beside the end device: ids stay, the
+    // framebuffer binding on the untouched CRTC survives.
+    card.crtc_mut(crtc_id(2)).unwrap().primary_fb = Some(7);
+    connectors[1].crtc = Some(0);
+    let crtcs = [lit(&edid_a, &t, &[]), None, lit(&edid_m, &t, &[]), None];
+    apply_routed(&mut card, &crtcs, &connectors);
+    let after: alloc::vec::Vec<u32> = card.connectors.iter().map(|c| c.id).collect();
+    assert_eq!(after, [3, 6, 102]);
+    assert_eq!(encoder_crtc(&card, 1), Some(crtc_id(0)));
+    assert!(card.crtc(crtc_id(0)).unwrap().mode.is_some());
+    assert_eq!(card.crtc(crtc_id(2)).unwrap().primary_fb, Some(7));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-kms",
+    navi48_kms_routes_connectors_to_any_crtc
+);

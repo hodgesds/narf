@@ -1609,11 +1609,26 @@ payload transaction.
 Source verification accepts sibling routes being released while still rejecting unowned frontend
 selections. Failed transitions retain their owners and allocations.
 
-The platform chooses the first connected MST branch and dedicates four KMS
-outputs to its end devices, leaving other board ports dark. Output k uses
-pipe/CRTC k; an all-off DRM configuration keeps those identities and requests
-while the branch remains connected. Removing the branch restores board-port
-outputs. Shared-link loss stops and relights the whole configuration instead
+KMS routing follows Linux: there are four CRTCs (display/pipe k is CRTC id
+1 + 3k) and one connector per board DP/HDMI port (board ordinal n: encoder
+2 + 3n, connector 3 + 3n, all ports, not only four), plus four end-device
+connectors (index 32 + slot) while the first connected MST branch is in use;
+the root's own connector then reports disconnected. Every encoder may drive
+any CRTC (`possible_crtcs` 0xf; `amdgpu_navi48_kms::{RoutedConnector,
+apply_routed, publish_routed, connector_index}`). A CRTC drives at most one
+connector: SETCRTC's single connector (more than one is EINVAL; none keeps the
+routing) or an atomic connector CRTC_ID routes it explicitly
+(`platform::request_display_route`, `request_connector_crtc`), moving the
+connector off its old CRTC and parking a displaced connector so automatic
+routing does not relight it elsewhere. Otherwise plugged, unparked connectors
+take free CRTCs in connector order and keep them while plugged. MODE_ID and
+SETCRTC modes are validated against the connector the CRTC drives after the
+request (`display_offers`). Board SST/HDMI sinks and the branch's end devices
+light as one configuration (`ColdBoot::modeset_routed`); a running display
+whose connector routing changes is relit. The last DRM file closing restores
+automatic routing. An all-off DRM configuration keeps connector identities
+and requests while the branch remains connected; removing the branch (with
+no stream left on it) drops its connectors and their routes. Shared-link loss stops and relights the whole configuration instead
 of invoking the SST retrain path. Downstream changes use the same whole-link
 stop/reprobe/relight sequence, so other streams briefly blank. KMS can publish
 a newly discovered EDID and independently admitted timings as connected with
@@ -1622,7 +1637,7 @@ GETCONNECTOR and the platform's mode-request gate without setting a CRTC mode
 or framebuffer. A missing EDID suppresses the offered timings. Ordinary MST
 disable retains previously admitted timings without restarting siblings;
 the next configuration/reprobe recomputes admission against remaining resources.
-Simultaneous MST/SST ports, UHBR MST and DSC on MST remain unsupported.
+UHBR MST, DSC on MST and more than one MST branch remain unsupported.
 Legacy MST LPCM uses each stream's AFMT and endpoint as described below.
 This path is model-tested only.
 

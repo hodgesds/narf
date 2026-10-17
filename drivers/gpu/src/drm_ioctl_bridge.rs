@@ -3902,15 +3902,12 @@ fn handle_atomic(
                                     crate::drm::ioctl::DrmModeModeInfo::from_bytes(mode)
                                 {
                                     // On the native card, a timing this
-                                    // CRTC's own display offers.
+                                    // CRTC's connector offers: checked once
+                                    // every connector routing is parsed.
                                     if crate::drm_registry::driver_name(card_index)
                                         == Some("amdgpu")
-                                        && !crate::amdgpu_navi48_kms::crtc_display(object_id)
-                                            .is_some_and(|d| {
-                                                crate::amdgpu_navi48_platform::display_offers(
-                                                    d, &wire,
-                                                )
-                                            })
+                                        && crate::amdgpu_navi48_kms::crtc_display(object_id)
+                                            .is_none()
                                     {
                                         return Err(FsError::InvalidData);
                                     }
@@ -3998,6 +3995,22 @@ fn handle_atomic(
             return Err(FsError::InvalidData);
         }
         check_native_atomic(&card, &state)?;
+        // A native MODE_ID is a timing of the connector the CRTC drives
+        // after this commit: one routed to it here, else its current one.
+        if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
+            for (crtc_id, wire) in &native_modes {
+                let connector = state
+                    .connectors
+                    .iter()
+                    .find(|c| c.crtc_id == Some(*crtc_id))
+                    .map(|c| c.id);
+                if !crate::amdgpu_navi48_kms::crtc_display(*crtc_id).is_some_and(|d| {
+                    crate::amdgpu_navi48_platform::display_offers(d, connector, wire)
+                }) {
+                    return Err(FsError::InvalidData);
+                }
+            }
+        }
 
         // Linux reserves one event for every CRTC participating in the atomic
         // state before committing. PAGE_FLIP_EVENT with no CRTC is EINVAL;
@@ -4031,6 +4044,20 @@ fn handle_atomic(
             }
             let amdgpu = crate::drm_registry::driver_name(card_index) == Some("amdgpu");
             if amdgpu {
+                // Routing first: a mode is checked against the connector the
+                // CRTC drives. Any encoder may drive any native CRTC.
+                for c in &state.connectors {
+                    let current = card
+                        .connector(c.id)
+                        .ok()
+                        .and_then(|x| x.encoder_id)
+                        .and_then(|id| card.encoder(id).ok())
+                        .and_then(|e| e.crtc_id);
+                    if current != c.crtc_id {
+                        let display = c.crtc_id.and_then(crate::amdgpu_navi48_kms::crtc_display);
+                        crate::amdgpu_navi48_platform::request_connector_crtc(c.id, display);
+                    }
+                }
                 for crtc in &state.crtcs {
                     let Some(display) = crate::amdgpu_navi48_kms::crtc_display(crtc.id) else {
                         continue;
@@ -4541,6 +4568,14 @@ fn handle_setcrtc(
     let src_pitch: u32;
     let src_w: u32;
     let src_h: u32;
+    // SETCRTC's single connector id, read before any card lock is held.
+    let setcrtc_connector = if req.count_connectors == 1 && req.set_connectors_ptr != 0 {
+        // SAFETY: a user pointer to count_connectors (one) u32 ids.
+        let ids = unsafe { copy_in(req.set_connectors_ptr as usize, 4)? };
+        Some(u32::from_le_bytes(ids[..4].try_into().unwrap()))
+    } else {
+        None
+    };
     {
         let mut card = mode_state.lock();
 
@@ -4548,6 +4583,20 @@ fn handle_setcrtc(
         let native_display = (crate::drm_registry::driver_name(card_index) == Some("amdgpu"))
             .then(|| crate::amdgpu_navi48_kms::crtc_display(req.crtc_id))
             .flatten();
+        // The connector SETCRTC routes the native CRTC to: one at most (no
+        // cloning); none keeps the current routing.
+        let native_connector = if native_display.is_some() && req.count_connectors != 0 {
+            if req.count_connectors != 1 || req.set_connectors_ptr == 0 {
+                return Err(FsError::InvalidData);
+            }
+            let id = setcrtc_connector.ok_or(FsError::InvalidData)?;
+            if card.connector(id).is_err() {
+                return Err(FsError::InvalidData);
+            }
+            Some(id)
+        } else {
+            None
+        };
         let mut native_wire = None;
         if req.mode_valid != 0 {
             let m = req.mode;
@@ -4572,10 +4621,10 @@ fn handle_setcrtc(
                 return Err(FsError::InvalidData);
             }
             // On the native card, a timing this CRTC's own display offers.
-            if native_display
-                .is_some_and(|d| !crate::amdgpu_navi48_platform::display_offers(d, &wire))
-                || (crate::drm_registry::driver_name(card_index) == Some("amdgpu")
-                    && native_display.is_none())
+            if native_display.is_some_and(|d| {
+                !crate::amdgpu_navi48_platform::display_offers(d, native_connector, &wire)
+            }) || (crate::drm_registry::driver_name(card_index) == Some("amdgpu")
+                && native_display.is_none())
             {
                 return Err(FsError::InvalidData);
             }
@@ -4611,6 +4660,9 @@ fn handle_setcrtc(
         // offered timing is a native modeset the display monitor runs (the
         // current one leaves it as it is).
         if let Some(display) = native_display {
+            if let Some(id) = native_connector {
+                crate::amdgpu_navi48_platform::request_display_route(display, Some(id));
+            }
             if let Some(wire) = native_wire.as_ref() {
                 crate::amdgpu_navi48_platform::request_display_mode(display, Some(wire));
             }

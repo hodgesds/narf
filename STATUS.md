@@ -776,7 +776,10 @@ controller/PM access after preparation and quarantines the primary framebuffer
 on incomplete startup. Read-only preparation failures restore CPU writers.
 
 Native 8b/10b DP MST now reaches the platform display monitor and KMS for one
-branch (up to four outputs, other board ports dark). End-device EDIDs feed
+branch, beside every board port: KMS routes any connector (board port or end
+device) to any of the four CRTCs, as SETCRTC/atomic CRTC_ID set it or
+automatically in connector order, and board sinks and end devices light as
+one jointly admitted configuration. End-device EDIDs feed
 joint mode admission and per-stream payload allocation. Disabling the display
 that trained the link transfers ownership to a surviving stream; only the
 last stops the PHY. Disabled, unreadable or unadmitted devices leave output
