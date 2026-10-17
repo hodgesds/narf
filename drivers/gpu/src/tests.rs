@@ -11864,6 +11864,108 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
         if run(cs_cmd, &mut c.req) != Err(FsError::InvalidData) {
             return Some("short fence chunk");
         }
+        // Implicit sync. A job that lists a buffer becomes its writer, in
+        // the graphics ring's own fence context.
+        let shared = gem.object(handle)?;
+        let resv = &shared.dma_buf().resv;
+        let use_read = narf_filesystem::dma_buf::DmaResvUsage::Read;
+        let (_keep, listed) = list(handle);
+        let mut c = cs_with(&[(u::AMDGPU_CHUNK_ID_BO_HANDLES, listed.clone())]);
+        if run(cs_cmd, &mut c.req).is_err() {
+            return Some("CS listing a buffer");
+        }
+        let writer = u64::from_le_bytes(c.req[0..8].try_into().unwrap());
+        let own = resv.fences(use_read);
+        if own.len() != 1
+            || own[0].context() != Some(u64::from(card) << 32)
+            || own[0].seqno() != writer
+        {
+            return Some("the job is the buffer's writer");
+        }
+        // Another context's fence on the buffer holds the next listing job
+        // back; the ring's own unfinished job does not.
+        struct Gate(core::sync::atomic::AtomicBool);
+        impl narf_filesystem::DrmFence for Gate {
+            fn is_signalled(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+            fn wait(&self, _: u64) -> bool {
+                self.is_signalled()
+            }
+            fn context(&self) -> Option<u64> {
+                Some(0xdead)
+            }
+        }
+        let gate = alloc::sync::Arc::new(Gate(core::sync::atomic::AtomicBool::new(false)));
+        resv.add_fence(gate.clone(), narf_filesystem::dma_buf::DmaResvUsage::Write);
+        let seen = fake.seen.lock().len();
+        let mut c = cs_with(&[(u::AMDGPU_CHUNK_ID_BO_HANDLES, listed.clone())]);
+        {
+            let mut job = core::pin::pin!(dispatch_async(
+                card,
+                cs_cmd,
+                c.req.as_mut_ptr() as usize,
+                &state,
+                &gem,
+                &ctx,
+                &syncobjs,
+            ));
+            let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+            if core::future::Future::poll(job.as_mut(), &mut cx).is_ready()
+                || fake.seen.lock().len() != seen
+            {
+                return Some("a job ran before the buffer's other writer");
+            }
+            // GEM_WAIT_IDLE sees the pending writer too.
+            let mut w = idle_req(handle);
+            if run(idle_cmd, &mut w).is_err()
+                || u32::from_le_bytes(w[0..4].try_into().unwrap()) != 1
+            {
+                return Some("GEM_WAIT_IDLE with a pending reservation fence");
+            }
+            gate.0.store(true, Ordering::SeqCst);
+            if narf_scheduler::block_on_spin(job).is_err() || fake.seen.lock().len() != seen + 1 {
+                return Some("the job after the other writer signalled");
+            }
+        }
+        // EXPLICIT_SYNC buffers skip the wait.
+        let mut create = [0u8; 32];
+        create[0..8].copy_from_slice(&GPU_PAGE_SIZE.to_le_bytes());
+        create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+        create[24..32]
+            .copy_from_slice(&u64::from(u::AMDGPU_GEM_CREATE_EXPLICIT_SYNC).to_le_bytes());
+        crate::amdgpu_gem::dispatch(
+            DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+            create.as_mut_ptr() as usize,
+            &gem,
+        )
+        .ok()?;
+        let explicit = u32::from_le_bytes(create[0..4].try_into().unwrap());
+        let closed = alloc::sync::Arc::new(Gate(core::sync::atomic::AtomicBool::new(false)));
+        gem.object(explicit)?
+            .dma_buf()
+            .resv
+            .add_fence(closed, narf_filesystem::dma_buf::DmaResvUsage::Write);
+        let (_keep, listed) = list(explicit);
+        let mut c = cs_with(&[(u::AMDGPU_CHUNK_ID_BO_HANDLES, listed)]);
+        {
+            let mut job = core::pin::pin!(dispatch_async(
+                card,
+                cs_cmd,
+                c.req.as_mut_ptr() as usize,
+                &state,
+                &gem,
+                &ctx,
+                &syncobjs,
+            ));
+            let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+            if !matches!(
+                core::future::Future::poll(job.as_mut(), &mut cx),
+                core::task::Poll::Ready(Ok(_))
+            ) {
+                return Some("an EXPLICIT_SYNC buffer does not wait");
+            }
+        }
         None
     })();
     unregister_submitter(card);

@@ -515,7 +515,32 @@ impl crate::drm::syncobj::DmaFence for JobFence {
     /// dma-fence from a driver's ring is not CPU-signallable.
     fn signal(&self) {}
     fn context(&self) -> Option<u64> {
-        Some(u64::from(self.card))
+        Some(JobFence::context_of(self.card, (self.seq >> 32) as u32))
+    }
+}
+impl JobFence {
+    /// A ring's fence context: its card and ring, as Linux gives each
+    /// scheduler ring its own context. Tickets of one ring are ordered.
+    fn context_of(card: u32, ring: u32) -> u64 {
+        u64::from(card) << 32 | u64::from(ring)
+    }
+}
+/// A job as a reservation fence (implicit sync on shared buffers).
+impl narf_filesystem::DrmFence for JobFence {
+    fn is_signalled(&self) -> bool {
+        self.engine.signalled(self.seq)
+    }
+    fn wait(&self, timeout_ms: u64) -> bool {
+        crate::drm::syncobj::DmaFence::wait(self, timeout_ms.saturating_mul(1_000_000))
+    }
+    fn context(&self) -> Option<u64> {
+        Some(JobFence::context_of(self.card, (self.seq >> 32) as u32))
+    }
+    fn seqno(&self) -> u64 {
+        self.seq
+    }
+    fn driver_name(&self) -> &str {
+        "amdgpu"
     }
 }
 
@@ -609,13 +634,26 @@ pub async fn dispatch_async(
         let handle = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
         let timeout = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
         let object = gem.lookup(handle).ok_or(FsError::InvalidData)?;
-        // LINUX-GAP: Linux waits on the buffer's reservation fences; this
-        // waits for the last job this open submitted, which covers every
-        // use the open made of it but not a job another process (holding
-        // it through PRIME) submitted.
+        // Linux waits on the buffer's reservation (dma_resv_wait_timeout,
+        // READ usage): every job that listed it, from any open sharing it
+        // through PRIME. LINUX-GAP: jobs that did not list it leave no
+        // fence there, so this also waits for this open's last jobs.
         let mut idle = true;
         for ticket in vm.last_jobs() {
             idle &= engine.wait(ticket, timeout).await?;
+        }
+        for fence in object
+            .dma_buf()
+            .resv
+            .fences(narf_filesystem::dma_buf::DmaResvUsage::Read)
+        {
+            while idle && !fence.is_signalled() {
+                if narf_time::monotonic_ns() >= timeout {
+                    idle = false;
+                    break;
+                }
+                narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
+            }
         }
         let mut out = [0u8; 8];
         out[0..4].copy_from_slice(&u32::from(!idle).to_le_bytes());
@@ -645,13 +683,14 @@ pub async fn dispatch_async(
     }
     let submission = validated(arg, vm, ctx)?;
     // amdgpu_bo_list_create: every listed BO is one this open holds.
-    // LINUX-GAP: the list sets no residency (nothing is evicted) and no
-    // implicit sync (no reservation fences are attached to the BOs).
-    if let Some(handles) = &submission.bo_handles {
-        if handles.iter().any(|&h| gem.lookup(h).is_none()) {
-            return Err(FsError::NotFound);
-        }
-    }
+    // LINUX-GAP: the list sets no residency (nothing is evicted).
+    let listed: Vec<Arc<crate::amdgpu_gem::GemObject>> = match &submission.bo_handles {
+        Some(handles) => handles
+            .iter()
+            .map(|&h| gem.lookup(h).ok_or(FsError::NotFound))
+            .collect::<Result<_, _>>()?,
+        None => Vec::new(),
+    };
     // amdgpu_cs_p2_syncobj_in: each named syncobj's fence, which must exist.
     let fences = if submission.in_syncobjs.is_empty() {
         Vec::new()
@@ -715,9 +754,53 @@ pub async fn dispatch_async(
         }
         None => None,
     };
+    // amdgpu_cs_sync_rings: implicit sync on each listed buffer's
+    // reservation, unless it was created EXPLICIT_SYNC.
+    // LINUX-GAP: Linux skips fences its own VM produced (NE_OWNER); this
+    // skips only the target ring's own fences, which run in order anyway,
+    // and waits for the rest — the same order, sometimes later.
+    if let Some(ring) = submission
+        .ibs
+        .first()
+        .and_then(|ib| engine.ring_for(ib.ip_type, ib.ip_instance, ib.ring))
+    {
+        let own = JobFence::context_of(card, ring);
+        for object in &listed {
+            if object.flags & u64::from(uapi::AMDGPU_GEM_CREATE_EXPLICIT_SYNC) != 0 {
+                continue;
+            }
+            let fences = object
+                .dma_buf()
+                .resv
+                .fences(narf_filesystem::dma_buf::DmaResvUsage::Read);
+            for fence in fences {
+                if fence.context() == Some(own) {
+                    continue;
+                }
+                while !fence.is_signalled() {
+                    narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant())
+                        .await;
+                }
+            }
+        }
+    }
     let seq = engine.submit(vm, &submission).await?;
     // What this space drops from now on waits for this job.
     vm.note_job(seq);
+    // amdgpu_cs_submit: the job is each listed buffer's writer.
+    if !listed.is_empty() {
+        let fence: Arc<dyn narf_filesystem::DrmFence> = Arc::new(JobFence {
+            engine: engine.clone(),
+            card,
+            seq,
+        });
+        for object in &listed {
+            object
+                .dma_buf()
+                .resv
+                .add_fence(fence.clone(), narf_filesystem::dma_buf::DmaResvUsage::Write);
+        }
+    }
     if let Some((object, offset)) = user_fence {
         defer_until(
             card,

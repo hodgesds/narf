@@ -3569,22 +3569,26 @@ paths; only the tables differ.
   `AMDGPU_CS` and returns the engine's sequence as the handle, and
   `AMDGPU_WAIT_CS` parks until it completes or the client's absolute
   monotonic deadline passes (status 0/1). `AMDGPU_GEM_WAIT_IDLE` there
-  waits for the open's last job (`VmState::last_job`; a buffer another
-  process uses through PRIME is not covered) and reports the buffer's
-  preferred domains. `dispatch_async` notes every submitted job on its
+  waits for the open's last jobs (`VmState::last_jobs`) and the buffer's
+  reservation fences (any open's jobs that listed it) and reports the
+  buffer's preferred domains. `dispatch_async` notes every submitted job on its
   address space. `AMDGPU_CHUNK_ID_SYNCOBJ_IN`/`_OUT` and `BO_HANDLES` are
   accepted: in-syncobjs must hold a fence (EINVAL without, ENOENT unknown)
   and are waited for before queueing — the ioctl waits, where Linux's
   scheduler would hold the job; out-syncobjs get the job's `JobFence`
   (signalled through `Submitter::signalled`); every listed BO must be the
-  open's (ENOENT), with no residency or implicit sync. amdgpu opens now
+  open's (ENOENT), with no residency. Implicit sync (amdgpu_cs_sync_rings /
+  amdgpu_cs_submit): before queueing, the ioctl waits for every unsignalled
+  fence on each listed BO's reservation (`GemObject::dma_buf`) except the
+  target ring's own (`JobFence` context: card << 32 | ring) and except on
+  `EXPLICIT_SYNC` buffers; the job then becomes each listed BO's WRITE
+  fence. amdgpu opens now
   route the DRM syncobj ioctls (0xbf..=0xc5) to their own table
   (`drm_ioctl_bridge::dispatch_syncobj`). `DEPENDENCIES` name a context
   the open owns (EINVAL otherwise) on the engine's ring (others
   `Unsupported`) and are waited for before queueing; `SCHEDULED_DEPENDENCIES`
   are validated only, as every earlier job of the single in-order ring is
-  already scheduled. Timeline syncobjs and `FENCE` chunks are still
-  refused. Without a submitter, CS parses and is refused as before
+  already scheduled. Timeline syncobjs are still refused. Without a submitter, CS parses and is refused as before
   and GEM_WAIT_IDLE reports idle. `pm4::Pm4Builder::vm_flush` builds the in-ring VM flush
   (shared by GMC 11 and 12).
 
