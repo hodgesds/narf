@@ -143,6 +143,10 @@ pub(super) fn start() -> InitResult {
         if native || narf_boot::args().has_flag("amdgpu.display_probe") {
             report_displays();
         }
+        // `amdgpu.navi22_multi`: light every connected sink (KMS CRTCs 1..).
+        narf_drivers_gpu::amdgpu_navi22_kms::set_auto_multi(
+            narf_boot::args().has_flag("amdgpu.navi22_multi"),
+        );
         if native {
             navi22_native_display();
         }

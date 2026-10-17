@@ -490,8 +490,9 @@ pub fn cap_value(capability: u64) -> u64 {
         // DRM_PRIME_CAP_EXPORT (1) | DRM_PRIME_CAP_IMPORT (2): both
         // supported via drm/prime.rs PrimeTable.
         drm_cap::PRIME => 3,
-        // SYNCOBJ (timeline=0) — drm/syncobj.rs implements binary
-        // syncobjs; timelines are deferred.
+        // SYNCOBJ_TIMELINE is per driver (`DRIVER_SYNCOBJ_TIMELINE`): 0
+        // here (virtio-gpu, KMS-only cards); amdgpu answers 1
+        // (`drm_ioctl_bridge::amdgpu_cap_value`).
         drm_cap::SYNCOBJ => 1,
         drm_cap::SYNCOBJ_TIMELINE => 0,
         drm_cap::TIMESTAMP_MONOTONIC => 1,

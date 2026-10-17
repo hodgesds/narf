@@ -277,6 +277,12 @@ pub struct Resources {
     pipes: u8,
     streams: u8,
     plls: u8,
+    /// Multi-stream (`acquire_stream`): streams sharing each PHY PLL beyond
+    /// its first (`resource_reference_clock_source`), the timing a shared
+    /// PLL runs, and the DSC engines in use.
+    pll_sharers: [u8; PLLS as usize],
+    pll_timing: [Option<Timing>; PLLS as usize],
+    dscs: u8,
 }
 fn first_free(used: u8, count: u8) -> Option<u8> {
     (0..count).find(|i| used & 1 << i == 0)
@@ -287,6 +293,9 @@ impl Resources {
             pipes: 0,
             streams: 0,
             plls: 0,
+            pll_sharers: [0; PLLS as usize],
+            pll_timing: [None; PLLS as usize],
+            dscs: 0,
         }
     }
     /// `resource_map_pool_resources` for one SST stream on `connector`:
@@ -331,7 +340,9 @@ impl Resources {
         self.pipes &= !(1 << route.pipe);
         self.streams &= !(1 << route.stream);
         if let ClockSource::Pll(pll) = route.clock {
-            self.plls &= !(1 << pll);
+            if !self.unshare_pll(pll) {
+                self.plls &= !(1 << pll);
+            }
         }
     }
 }
@@ -979,7 +990,10 @@ impl Pipeline {
                         pll,
                         transmitter: self.connector.path.transmitter,
                         pixel_100hz: self.hdmi.map_or(pixel_khz * 10, |s| s.character_100hz),
-                        deep_color: self.hdmi.map_or(0, |s| s.format.depth.code() as u8),
+                        // dce112_program_pix_clk never sets bp_pc_params.color_depth:
+                        // the table gets DEEPCOLOR_RATIO_DIS and the deep-colour DTO is
+                        // the resync below (dce112_program_pixel_clk_resync).
+                        deep_color: 0, // linux: PIXEL_CLOCK_V7_DEEPCOLOR_RATIO_DIS
                     },
                 )?;
                 let resync = self.d1(PIXCLK_RESYNC_CNTL[usize::from(pll)]);
@@ -1316,6 +1330,7 @@ impl Pipeline {
         self.dpp
             .program(Format::Rgb32, timing.h_active, timing.v_active)?;
         self.mpc.mux_plane(pipe, pipe)?;
+        self.hubp.select_vtg(pipe)?;
         self.hubp.program(&surface, &plan.registers)?;
         self.program_cursor_ttu(plan.cursor)?;
         self.hubp.unblank().await?;
@@ -2045,6 +2060,10 @@ impl Pipeline {
         &mut self.clocks
     }
 }
+
+#[path = "amdgpu_navi22_multi.rs"]
+mod multi;
+pub use multi::*;
 
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi22_modeset_tests.rs"]

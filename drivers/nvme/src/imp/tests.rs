@@ -2528,3 +2528,77 @@ fn smoke_nvme_multipage_io_qemu() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_multipage_io_qemu);
+
+/// Linux `nvme_create_cq`: `vector = dev->num_vecs == 1 ? 0 : qid`. A
+/// one-entry MSI-X table must put the first I/O CQ on IV 0; IV 1 is an
+/// Invalid Interrupt Vector there and Create I/O CQ fails.
+fn smoke_nvme_single_msix_entry_uses_iv0() -> TestResult {
+    use super::first_io_cq_vector;
+    if first_io_cq_vector(1) != 0 || first_io_cq_vector(0) != 0 {
+        return TestResult::Fail("one-entry MSI-X table must use IV 0 for the I/O CQ");
+    }
+    if first_io_cq_vector(2) != 1 || first_io_cq_vector(64) != 1 {
+        return TestResult::Fail("multi-entry table keeps IV = qid");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_single_msix_entry_uses_iv0);
+
+/// A bring-up that fails after CC.EN=1 (here: Identify Controller) must
+/// leave the controller stopped before its queues are freed — Linux
+/// `nvme_dev_disable` → `nvme_disable_ctrl`, `pci_free_irq_vectors`,
+/// `pci_disable_device`: CC.EN=0, CSTS.RDY=0, MSI-X off, bus mastering off.
+/// Before the fix the error path returned with CC.EN=1 and the live
+/// controller's ASQ/ACQ/Identify pages already back in the allocator.
+fn smoke_nvme_failed_bring_up_disables_controller() -> TestResult {
+    use super::{Controller, NvmeError, CC_EN, CSTS_RDY, FAIL_IDENTIFY_FOR_TEST, REG_CC, REG_CSTS};
+    use core::sync::atomic::Ordering;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, map_bar, BusKind};
+    // SAFETY: ECAM is identity-mapped; bus::init is idempotent.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let Some(dev) = devices().iter().copied().find(|d| {
+        matches!(d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    }) else {
+        return TestResult::Skip("no QEMU NVMe controller in this flavour");
+    };
+    let authority = bootstrap_registry_authority();
+    let Ok((_handle, dev_cap)) = claim_device_cap(&authority, dev.addr) else {
+        return TestResult::Fail("claim_device_cap failed for NVMe");
+    };
+    let mut ctrl = Controller::from_device(dev);
+    FAIL_IDENTIFY_FOR_TEST.store(true, Ordering::Release);
+    let r = ctrl.bring_up(&dev_cap);
+    FAIL_IDENTIFY_FOR_TEST.store(false, Ordering::Release);
+    if !matches!(r, Err(NvmeError::IdentifyFailed { .. })) {
+        return TestResult::Fail("injected Identify failure did not fail bring_up");
+    }
+    // SAFETY: BAR0 of the claimed QEMU NVMe; aligned register reads.
+    let Ok(bar) = (unsafe { map_bar(&dev, 0) }) else {
+        return TestResult::Fail("map BAR0");
+    };
+    // SAFETY: as above.
+    let (cc, csts) = unsafe { (bar.read32(REG_CC), bar.read32(REG_CSTS)) };
+    let cmd = narf_bus::pci::read_command(&dev_cap, &dev).unwrap_or(0xffff);
+    let msix_on = narf_bus::msix::enable_msix(&dev_cap, &dev)
+        .map(|t| t.is_enabled())
+        .unwrap_or(false);
+    let ok = cc & CC_EN == 0
+        && csts & CSTS_RDY == 0
+        && cmd & narf_bus::pci::cmd::BUS_MASTER == 0
+        && !msix_on
+        && !ctrl.is_ready();
+    // Leave the device as the other smokes expect: brought up.
+    let mut again = Controller::from_device(dev);
+    if again.bring_up(&dev_cap).is_err() {
+        return TestResult::Fail("controller did not come back after the failed bring-up");
+    }
+    if !ok {
+        return TestResult::Fail("failed bring-up left the controller live (EN/RDY/BME/MSI-X)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvme",
+    smoke_nvme_failed_bring_up_disables_controller
+);

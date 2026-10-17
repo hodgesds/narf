@@ -136,6 +136,8 @@ pub struct DriCardFile {
     amdgpu_vm: crate::amdgpu_vm::VmState,
     /// Per-open submission contexts (`fpriv->ctx_mgr`).
     amdgpu_ctx: crate::amdgpu_ctx::CtxState,
+    /// Per-open BO lists (`fpriv->bo_list_handles`).
+    amdgpu_bo_lists: crate::amdgpu_bo_list::BoListTable,
     /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
     client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
     /// Per-open flip-complete queue. The event's opaque `user_data` belongs to
@@ -182,6 +184,7 @@ impl DriCardFile {
             amdgpu_gem: crate::amdgpu_gem::GemState::for_card(index),
             amdgpu_vm: crate::amdgpu_vm::VmState::for_card(index),
             amdgpu_ctx: crate::amdgpu_ctx::CtxState::new(),
+            amdgpu_bo_lists: crate::amdgpu_bo_list::BoListTable::new(),
             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
             events: narf_lib::sync::IrqSafeSpinLock::new(crate::drm::card::DrmEventQueue::new()),
             pending_out_fences: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
@@ -410,8 +413,12 @@ impl FileOps for DriCardFile {
         // DRM_AUTH nor DRM_MASTER in amdgpu's table).
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
             // DRM syncobjs, in this open's table (the one CS signals).
-            if let Some(result) = crate::drm_ioctl_bridge::dispatch_syncobj(cmd, arg, &self.virtgpu)
+            if let Some(result) =
+                crate::drm_ioctl_bridge::dispatch_syncobj(cmd, arg, &self.virtgpu, true)
             {
+                return result;
+            }
+            if let Some(result) = crate::drm_ioctl_bridge::amdgpu_get_cap(cmd, arg) {
                 return result;
             }
             match crate::amdgpu_gem::dispatch(cmd, arg, &self.amdgpu_gem) {
@@ -419,6 +426,11 @@ impl FileOps for DriCardFile {
                 result => return result,
             }
             match crate::amdgpu_vm::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_gem) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+            match crate::amdgpu_bo_list::dispatch(cmd, arg, &self.amdgpu_bo_lists, &self.amdgpu_gem)
+            {
                 Err(FsError::Unsupported) => {}
                 result => return result,
             }
@@ -485,6 +497,22 @@ impl FileOps for DriCardFile {
             {
                 crate::drm_ioctl_bridge::wait_atomic_in_fences(arg, context)?;
             }
+            // DRM syncobjs from a user open: fd export/import and waits
+            // that park this syscall. amdgpu has timelines, virtio-gpu not.
+            let driver = crate::drm_registry::driver_name(self.index);
+            if matches!(driver, Some("amdgpu") | Some("virtio_gpu")) {
+                if let Some(result) = crate::drm_ioctl_bridge::dispatch_syncobj_user(
+                    cmd,
+                    arg as usize,
+                    &self.virtgpu,
+                    driver == Some("amdgpu"),
+                    context,
+                )
+                .await
+                {
+                    return result;
+                }
+            }
             // drm_getclient, which libdrm's amdgpu_get_auth issues on every
             // primary node before anything else.
             if cmd == crate::drm_ioctl_bridge::DRM_IOCTL_GET_CLIENT {
@@ -505,17 +533,15 @@ impl FileOps for DriCardFile {
             if crate::drm_registry::driver_name(self.index) == Some("amdgpu")
                 && crate::amdgpu_cs::is_async_ioctl(cmd)
             {
-                match crate::amdgpu_cs::dispatch_async(
-                    self.index,
-                    cmd,
-                    arg as usize,
-                    &self.amdgpu_vm,
-                    &self.amdgpu_gem,
-                    &self.amdgpu_ctx,
-                    self.virtgpu.syncobjs(),
-                )
-                .await
-                {
+                let open = crate::amdgpu_cs::CsOpen {
+                    vm: &self.amdgpu_vm,
+                    gem: &self.amdgpu_gem,
+                    ctx: &self.amdgpu_ctx,
+                    syncobjs: self.virtgpu.syncobjs(),
+                    bo_lists: &self.amdgpu_bo_lists,
+                    files: Some(context),
+                };
+                match crate::amdgpu_cs::dispatch_async(self.index, cmd, arg as usize, &open).await {
                     Err(FsError::Unsupported) => {}
                     result => return result,
                 }
@@ -987,6 +1013,8 @@ pub struct DriRenderFile {
     amdgpu_vm: crate::amdgpu_vm::VmState,
     /// Per-open submission contexts (`fpriv->ctx_mgr`).
     amdgpu_ctx: crate::amdgpu_ctx::CtxState,
+    /// Per-open BO lists (`fpriv->bo_list_handles`).
+    amdgpu_bo_lists: crate::amdgpu_bo_list::BoListTable,
     /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
     client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
 }
@@ -1094,8 +1122,12 @@ impl FileOps for DriRenderFile {
         // generic DRM path, as the virtio-gpu dispatcher above does.
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
             // DRM syncobjs, in this open's table (the one CS signals).
-            if let Some(result) = crate::drm_ioctl_bridge::dispatch_syncobj(cmd, arg, &self.virtgpu)
+            if let Some(result) =
+                crate::drm_ioctl_bridge::dispatch_syncobj(cmd, arg, &self.virtgpu, true)
             {
+                return result;
+            }
+            if let Some(result) = crate::drm_ioctl_bridge::amdgpu_get_cap(cmd, arg) {
                 return result;
             }
             match crate::amdgpu_gem::dispatch(cmd, arg, &self.amdgpu_gem) {
@@ -1103,6 +1135,11 @@ impl FileOps for DriRenderFile {
                 result => return result,
             }
             match crate::amdgpu_vm::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_gem) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+            match crate::amdgpu_bo_list::dispatch(cmd, arg, &self.amdgpu_bo_lists, &self.amdgpu_gem)
+            {
                 Err(FsError::Unsupported) => {}
                 result => return result,
             }
@@ -1145,9 +1182,25 @@ impl FileOps for DriRenderFile {
         &'a self,
         cmd: u32,
         arg: u64,
-        _context: &'a dyn narf_filesystem::IoctlContext,
+        context: &'a dyn narf_filesystem::IoctlContext,
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
+            // DRM syncobjs from a user open: fd export/import and waits
+            // that park this syscall. amdgpu has timelines, virtio-gpu not.
+            let driver = crate::drm_registry::driver_name(self.index);
+            if matches!(driver, Some("amdgpu") | Some("virtio_gpu")) {
+                if let Some(result) = crate::drm_ioctl_bridge::dispatch_syncobj_user(
+                    cmd,
+                    arg as usize,
+                    &self.virtgpu,
+                    driver == Some("amdgpu"),
+                    context,
+                )
+                .await
+                {
+                    return result;
+                }
+            }
             if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu")
                 && crate::drm_ioctl_bridge::is_virtgpu_wait_ioctl(cmd)
             {
@@ -1158,17 +1211,15 @@ impl FileOps for DriRenderFile {
             if crate::drm_registry::driver_name(self.index) == Some("amdgpu")
                 && crate::amdgpu_cs::is_async_ioctl(cmd)
             {
-                match crate::amdgpu_cs::dispatch_async(
-                    self.index,
-                    cmd,
-                    arg as usize,
-                    &self.amdgpu_vm,
-                    &self.amdgpu_gem,
-                    &self.amdgpu_ctx,
-                    self.virtgpu.syncobjs(),
-                )
-                .await
-                {
+                let open = crate::amdgpu_cs::CsOpen {
+                    vm: &self.amdgpu_vm,
+                    gem: &self.amdgpu_gem,
+                    ctx: &self.amdgpu_ctx,
+                    syncobjs: self.virtgpu.syncobjs(),
+                    bo_lists: &self.amdgpu_bo_lists,
+                    files: Some(context),
+                };
+                match crate::amdgpu_cs::dispatch_async(self.index, cmd, arg as usize, &open).await {
                     Err(FsError::Unsupported) => {}
                     result => return result,
                 }
@@ -1290,6 +1341,7 @@ impl DirOps for DriDir {
                             amdgpu_gem: crate::amdgpu_gem::GemState::for_card(idx),
                             amdgpu_vm: crate::amdgpu_vm::VmState::for_card(idx),
                             amdgpu_ctx: crate::amdgpu_ctx::CtxState::new(),
+                            amdgpu_bo_lists: crate::amdgpu_bo_list::BoListTable::new(),
                             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
                         }));
                     }

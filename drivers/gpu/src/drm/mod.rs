@@ -23,7 +23,6 @@
 //! ## Deferred
 //!
 //! - DRM leases (sub-master delegation).
-//! - syncobj timelines beyond binary signal/wait.
 //! - AMD/NV-specific scheduler hardware integration (these slot in
 //!   under the [`scheduler::Sched`] front-end as JobPayload backends).
 
@@ -36,6 +35,7 @@ pub mod prime;
 pub mod render_node;
 pub mod scheduler;
 pub mod syncobj;
+pub mod syncobj_ioctl;
 
 pub use atomic::{AtomicError, AtomicState, ConnectorState, CrtcState, PlaneState};
 pub use card::{Card, CardError, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder};

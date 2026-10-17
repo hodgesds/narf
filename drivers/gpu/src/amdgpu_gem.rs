@@ -335,9 +335,13 @@ impl GemState {
 
     /// `drm_gem_prime_fd_to_handle` for a buffer another open of the same
     /// card exported: the handle this open already has for it, or a new
-    /// one. A buffer of another card is refused (`InvalidData`).
+    /// one. A buffer of another card is refused (`InvalidData`), as is one
+    /// not created on any card: Linux takes the native path only when
+    /// `obj->dev == dev` (`amdgpu_gem_prime_import`; card indices are never
+    /// reused, so the index is the device), and NARF has no attachment path
+    /// for a foreign buffer.
     pub fn import(&self, object: &Arc<GemObject>) -> Result<u32, FsError> {
-        if object.card != self.card {
+        if object.card.is_none() || object.card != self.card {
             return Err(FsError::InvalidData);
         }
         let existing = self.objects.lock().as_ref().and_then(|m| {

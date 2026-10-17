@@ -863,6 +863,13 @@ The verified DMA proof covers only two kernel-owned VRAM pages. The driver
 continues to report acceleration unavailable; model/QEMU tests do not prove
 working silicon, native modesetting or Mesa/Vulkan support.
 
+Navi22 third-review fixes (software-model tested only): DRM ioctl user copies
+apply `access_ok` and fault-guarded copies (EFAULT); NVMe/AHCI bring-up
+failures stop the controller before freeing DMA; AHCI port bring-up is bounded
+per HBA and sets GHC.IE only after the IRQ route; host-install xtask media
+default to `narf.disks=boot-only`; DMUB-routed retrain/unplug tables, a non-IRQ
+DMUB route lock, a TABLE_MS cap, same-EDID HPD long pulses keep the stream.
+
 Current main includes discrete PCIe probe support
 for RX 6750 XT / Navi 22: bounded discovery reads beyond BAR0, separate total
 and CPU-visible VRAM sizes, Resizable BAR-independent APU identity, and the
@@ -978,7 +985,12 @@ the generic `amdgpu_vmid_grab` manager: flush only when a space's VMID, root
 or TLB sequence changes, PASID→VMID IH LUT writes so faults reach the
 client's GPUVM_FAULT; fences, two in flight per ring), with user fences, GEM_METADATA, PRIME, DRM 3.64.0 and
 GET_CLIENT; proven in register/fake-engine models only (ABI audit:
-`drivers/gpu/research/navi22-mesa-abi.md`). Fences poll with an IH notify hook;
+`drivers/gpu/research/navi22-mesa-abi.md`). The generic sync ABI (shared with
+Navi48) now matches Linux: timeline syncobjs (`DRM_CAP_SYNCOBJ_TIMELINE` = 1,
+TIMELINE_WAIT/QUERY/TRANSFER/TIMELINE_SIGNAL/EVENTFD, CS timeline chunks),
+syncobj and sync_file fds, WAIT_FENCES, FENCE_TO_HANDLE, BO_LIST and
+Linux's implicit-sync rules (model-tested against Navi22- and Navi48-shaped
+engines). Fences poll with an IH notify hook;
 register models cover encodings, rejection, timeouts and cancellation only.
 Production cold boot now resets a posted card before any firmware stage, as
 Linux does whenever the VBIOS left SOS running: PMFW (or PSP) mode1 reset,
@@ -1058,6 +1070,16 @@ deep colour (`amdgpu.max_bpc`, FMT SPATIAL8/10 dither), YCbCr 4:2:0 for
 Y420VDB/CMDB modes (OTG container, FMT, YCbCr709 OCSC, DPG black), Broadcast
 RGB limited (OCSC), CTA VIC/HDMI-VIC vendor InfoFrames and HDMI_6GB_EN from the
 VBIOS encoder caps. Register/DDC models only.
+Navi22 multi-display (`amdgpu_navi22_multi`): up to four KMS CRTCs light as
+one DC context — joint DML30 admission of every stream (`plan_joint`, at the
+lowest supporting UCLK state; 234 host vectors from Linux's own DML30 C,
+single/multi-stream, cursor, ODM, DSC), clocks and watermarks once, PHY PLL
+sharing for identical HDMI timings, ODM 2:1 where one pipe cannot carry a
+stream, DSC with FEC on DP SST (`amdgpu_dcn30_dsc`, training through the
+shared DP link layer) and 8b/10b DP MST through the shared sideband manager
+(`amdgpu_dcn30_mst`). Secondary CRTCs route automatically only with
+`amdgpu.navi22_multi`; only CRTC 0 presents (the others show static scanouts).
+Register models only; never run on hardware.
 For bare-metal runs, `cargo xtask usb-image` builds a UEFI stick whose kernel
 appends its log to `/narf-boot-<n>.log` on that stick (`narf.bootlog=`,
 marker-gated, USB-only, bounded) and boots with `narf.disks=boot-only`: every

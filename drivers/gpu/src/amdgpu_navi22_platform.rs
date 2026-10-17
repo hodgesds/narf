@@ -797,6 +797,7 @@ async unsafe fn light(
     {
         let mut kms = KMS.lock();
         kms.crtc.shown = None;
+        *LIT_SINK.lock() = result.is_ok().then(|| (route, sink.clone()));
         if let Ok(output) = result.as_ref() {
             let edid = sink
                 .edid
@@ -868,6 +869,29 @@ static LONG_PULSES: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8:
 /// Each board connector's debounced HPD at the last detection or pass.
 static SENSES: narf_lib::sync::IrqSafeSpinLock<[Option<bool>; 6]> =
     narf_lib::sync::IrqSafeSpinLock::new([None; 6]);
+/// The route and sink the lit pipe was lit for, for the long-pulse
+/// `same_edid` check.
+static LIT_SINK: narf_lib::sync::IrqSafeSpinLock<
+    Option<(usize, crate::amdgpu_navi22_display::Sink)>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// `detect_link_and_local_sink`'s `same_edid`: after a long pulse with HPD
+/// still high, a sink whose EDID (and, for DP, receiver capabilities) reads
+/// back unchanged is the same sink, and the lit stream is kept
+/// (`link_disconnect_remap(prev_sink)`). Anything else — a different EDID or
+/// DPCD, a disconnect, a sink that cannot be read — is a new sink.
+pub(crate) fn long_pulse_keeps_stream(
+    lit: &crate::amdgpu_navi22_display::Sink,
+    now: &crate::amdgpu_navi22_display::Detection,
+) -> bool {
+    match now {
+        crate::amdgpu_navi22_display::Detection::Connected(sink) => {
+            sink.edid == lit.edid && sink.dpcd == lit.dpcd
+        }
+        _ => false,
+    }
+}
+
 fn note_hpd_pulse(hpd: crate::amdgpu_ih_navi22::Hpd) {
     if !hpd.rx && hpd.instance < 8 {
         LONG_PULSES.fetch_or(1 << hpd.instance, Ordering::AcqRel);
@@ -938,18 +962,35 @@ async unsafe fn monitor_hotplug(
     //    again (EDID inventory for dark connectors too). A pulsed lit sink
     //    that is still present is a new sink: stop it so the next pass
     //    lights it from a fresh detection and link verification.
-    let changed: alloc::vec::Vec<usize> = {
-        let last = *SENSES.lock();
-        (0..senses.len().min(6))
-            .filter(|&i| {
-                let pulsed = ports
-                    .get(i)
-                    .and_then(|c| c.hpd)
-                    .is_some_and(|h| long & 1 << h != 0);
-                senses[i].is_some() && (senses[i] != last[i] || pulsed)
-            })
-            .collect()
-    };
+    let last = *SENSES.lock();
+    let mut changed: alloc::vec::Vec<usize> = (0..senses.len().min(6))
+        .filter(|&i| {
+            let pulsed = ports
+                .get(i)
+                .and_then(|c| c.hpd)
+                .is_some_and(|h| long & 1 << h != 0);
+            senses[i].is_some() && (senses[i] != last[i] || pulsed)
+        })
+        .collect();
+    // A long pulse on the lit connector with HPD still high (a sink's own
+    // re-assert, or one queued while `light` trained the link) is first
+    // checked as dc_link_detect does: an unchanged EDID/DPCD keeps the
+    // stream instead of tearing it down.
+    if let Some((route, _)) = running {
+        let lit = LIT_SINK.lock().clone().filter(|(r, _)| *r == route);
+        if let Some((_, lit)) = lit {
+            if changed.contains(&route)
+                && senses.get(route) == Some(&Some(true))
+                && last[route] == Some(true)
+            {
+                if let Ok(now) = boot.detect_display(route).await {
+                    if long_pulse_keeps_stream(&lit, &now) {
+                        changed.retain(|&i| i != route);
+                    }
+                }
+            }
+        }
+    }
     if let Some(&first) = changed.first() {
         for &i in &changed {
             boot.forget_display_link(i);
@@ -1041,6 +1082,10 @@ async unsafe fn monitor_pass() {
         let _ = writeln!(narf_console::Writer, "amdgpu: navi22 display {step:?}");
         return;
     }
+    // SAFETY: as below; a lit or wanted multi-stream context owns the pass.
+    if unsafe { converge_group(boot, running) }.await {
+        return;
+    }
     let action = KMS.lock().next(running);
     let result = match action {
         Action::Nothing => return,
@@ -1059,6 +1104,201 @@ async unsafe fn monitor_pass() {
     if action == Action::Unlight {
         crate::amdgpu_navi22_kms::wake();
     }
+}
+
+// ── Multi-stream contexts (KMS CRTCs 1..) ───────────────────────────────
+
+/// The lit context as KMS sees it: (CRTC, connector, timing) per stream,
+/// CRTC k showing stream k.
+fn group_running(
+    boot: &boot::ColdBoot,
+) -> Option<alloc::vec::Vec<(usize, usize, crate::amdgpu_dml::Timing)>> {
+    let outputs = boot.group_outputs()?;
+    let crtcs = GROUP_CRTCS.lock();
+    let kms = crate::amdgpu_navi22_kms::KMS.lock();
+    outputs
+        .iter()
+        .zip(crtcs.iter())
+        .map(|(o, &d)| {
+            let n = kms.connectors.iter().position(|c| c.port == o.connector)?;
+            Some((d, n, o.timing))
+        })
+        .collect()
+}
+/// The CRTC each stream of the lit context shows.
+static GROUP_CRTCS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<usize>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// One monitor step for the multi-stream context, ahead of the single-pipe
+/// owner's: while a CRTC other than 0 wants a sink, CRTC 0's single pipe is
+/// torn down and every wanted CRTC lights together (`dc_commit_state` of
+/// the whole context: `ColdBoot::modeset_group`); any change relights the
+/// whole context. True while the context owns the display (lit, or this
+/// pass worked on it); false hands the pass to the single-pipe owner, also
+/// after a context failed to light (CRTC 0 then lights alone).
+/// # Safety
+/// As `modeset_displays`, with OWNER held.
+async unsafe fn converge_group(
+    boot: &mut boot::ColdBoot,
+    single: Option<(usize, crate::amdgpu_dml::Timing)>,
+) -> bool {
+    use crate::amdgpu_navi22_display::Detection;
+    use crate::amdgpu_navi22_kms::{GroupAction, KMS};
+    use core::fmt::Write;
+    let running = group_running(boot);
+    let action = {
+        let mut kms = KMS.lock();
+        kms.assign_route();
+        kms.next_group(running.as_deref())
+    };
+    let targets = match action {
+        GroupAction::Nothing => return running.is_some(),
+        GroupAction::Unlight => {
+            // SAFETY: the caller's obligations.
+            let r = unsafe { unlight_group(boot) }.await;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 displays Unlight: {r:?}"
+            );
+            crate::amdgpu_navi22_kms::wake();
+            return true;
+        }
+        GroupAction::Light(targets) => targets,
+    };
+    if single.is_some() || boot.display_output().is_some() {
+        // SAFETY: the caller's obligations; the next pass lights the group.
+        let r = unsafe { unlight(boot) }.await;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: navi22 display Unlight for group: {r:?}"
+        );
+        crate::amdgpu_navi22_kms::wake();
+        return true;
+    }
+    let reports = match boot.detect_displays().await {
+        Ok(reports) => reports,
+        Err(_) => return false,
+    };
+    reconcile_displays(boot, &reports);
+    let board: alloc::vec::Vec<_> = boot
+        .display_connectors()
+        .map(<[_]>::to_vec)
+        .unwrap_or_default();
+    let mut requests = alloc::vec::Vec::new();
+    for &(_, n, want) in &targets {
+        let Some(report) = reports.get(n) else {
+            return false;
+        };
+        let Detection::Connected(sink) = &report.detection else {
+            return false;
+        };
+        let Some(link) = board.iter().position(|c| *c == report.connector) else {
+            return false;
+        };
+        requests.push(crate::amdgpu_navi22_modeset::Request {
+            link,
+            connector: report.connector,
+            sink: sink.clone(),
+            want,
+            mst: None,
+        });
+    }
+    KMS.lock().attempted_group = Some(targets.iter().map(|t| (t.1, t.2)).collect());
+    // SAFETY: the caller's obligations; the single pipe is dark.
+    let result = unsafe { boot.modeset_group(&requests, |_, _, row| row.fill(0)) }.await;
+    reconcile_displays(boot, &reports);
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: navi22 displays Light x{}: {:?}",
+        requests.len(),
+        result.as_ref().map(alloc::vec::Vec::len)
+    );
+    let outputs = match result {
+        Ok(outputs) => outputs,
+        Err(_) => {
+            // CRTC 0 may light alone again.
+            KMS.lock().attempted = None;
+            crate::amdgpu_navi22_kms::publish();
+            crate::amdgpu_navi22_kms::wake();
+            return false;
+        }
+    };
+    *GROUP_CRTCS.lock() = targets.iter().map(|t| t.0).collect();
+    {
+        let mut kms = KMS.lock();
+        for (&(d, n, _), (o, r)) in targets.iter().zip(outputs.iter().zip(&requests)) {
+            let edid = r
+                .sink
+                .edid
+                .get(..128)
+                .and_then(|e| <[u8; 128]>::try_from(e).ok());
+            let offered = kms
+                .connectors
+                .get(n)
+                .map(|c| c.modes.clone())
+                .unwrap_or_default();
+            if let Some(c) = kms.crtc_at_mut(d) {
+                c.shown = edid.map(|e| (e, o.timing, offered));
+            }
+        }
+    }
+    // The console follows the first stream (CRTC 0's); the other scanouts
+    // are static.
+    if let Some(o) = outputs.first() {
+        crate::amdgpu_dcn_display::publish_external(Some(o.scanout), Some(flush_group));
+    }
+    crate::amdgpu_navi22_kms::publish();
+    true
+}
+
+/// Best effort, as `flush_scanout`, for the context's console scanout.
+fn flush_group() {
+    if let Some(mut owner) = OWNER.try_lock() {
+        if let Some(boot) = owner.as_mut() {
+            let _ = boot.flush_group_scanout();
+        }
+    }
+}
+
+/// Withdraw the console from the context's scanouts and stop it.
+/// # Safety
+/// As `modeset_displays`, with OWNER held.
+async unsafe fn unlight_group(boot: &mut boot::ColdBoot) -> Result<(), boot::Error> {
+    let Some(outputs) = boot.group_outputs() else {
+        return Ok(());
+    };
+    if crate::amdgpu_dcn_display::active_scanout()
+        .is_some_and(|fb| outputs.iter().any(|o| o.scanout.addr == fb.addr))
+    {
+        crate::amdgpu_dcn_display::publish_external(None, None);
+    }
+    crate::scanout_access::wait_retired().await;
+    // SAFETY: withdrawn and retired above.
+    let result = unsafe { boot.stop_group() }.await;
+    GROUP_CRTCS.lock().clear();
+    {
+        let mut kms = crate::amdgpu_navi22_kms::KMS.lock();
+        for d in 0..crate::amdgpu_navi22_kms::MAX_CRTCS {
+            if let Some(c) = kms.crtc_at_mut(d) {
+                c.shown = None;
+            }
+        }
+    }
+    crate::amdgpu_navi22_kms::publish();
+    result
+}
+
+/// The lit context's admission: its lowest supporting state's plan for
+/// every stream (each member holds the same joint clocks and floors).
+fn group_admission(
+    boot: &boot::ColdBoot,
+) -> Option<crate::amdgpu_navi22_power_policy::DisplayAdmission> {
+    let group = boot.group()?;
+    let streams = u8::try_from(boot.group_outputs()?.len()).ok()?;
+    let admitted = group.members().first()?.admitted()?;
+    Some(crate::amdgpu_navi22_kms::display_admission(
+        admitted, streams,
+    ))
 }
 
 /// Start the display monitor (once): it converges DRM's requests, relights
@@ -1104,6 +1344,8 @@ pub fn relight_after_recovery() {
 /// pipe (best effort; the reset clears DCN either way), as amdgpu_dm commits
 /// zero streams in `dm_suspend` during GPU reset.
 async fn withdraw_for_reset(boot: &mut boot::ColdBoot) {
+    // SAFETY: recovery excludes every other display client.
+    let _ = unsafe { unlight_group(boot) }.await;
     withdraw(boot).await;
     if boot.display_output().is_some() {
         // SAFETY: withdrawn and drained above; recovery excludes others.
@@ -1118,6 +1360,9 @@ async fn withdraw_for_reset(boot: &mut boot::ColdBoot) {
 pub fn display_admission() -> Option<crate::amdgpu_navi22_power_policy::DisplayAdmission> {
     let owner = OWNER.try_lock()?;
     let boot = owner.as_ref()?;
+    if let Some(a) = group_admission(boot) {
+        return Some(a);
+    }
     let streams = u8::from(boot.display_output().is_some());
     Some(crate::amdgpu_navi22_kms::display_admission(
         boot.display_admitted()?,
@@ -1241,7 +1486,7 @@ pub fn vblank_time() -> Option<crate::drm::card::VblankTime> {
 }
 /// `drm::card::VblankSource` for the native CRTC.
 pub fn crtc_vblank(crtc_id: u32) -> Option<crate::drm::card::VblankTime> {
-    crate::amdgpu_navi22_kms::crtc_display(crtc_id)?;
+    crate::amdgpu_navi22_kms::crtc_display(crtc_id).filter(|&d| d == 0)?;
     vblank_time()
 }
 
@@ -1268,8 +1513,8 @@ struct Frame {
 
 /// Whether `present_frame` would present through a hardware flip now.
 pub fn native_present_ready(display: u8) -> bool {
-    usize::from(display) < crate::amdgpu_navi22_kms::MAX_CRTCS
-        && PRESENT.native.load(Ordering::Acquire)
+    // Only CRTC 0 presents (the secondary CRTCs show static scanouts).
+    display == 0 && PRESENT.native.load(Ordering::Acquire)
 }
 
 /// Complete flip-complete events up to `ticket`: in the vblank the flip
@@ -1582,5 +1827,43 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi22",
         navi22_training_refuses_live_firmware_in_overwritten_prefix
+    );
+
+    /// A long HPD pulse whose sink reads back the same EDID (and DPCD) keeps
+    /// the lit stream, as `detect_link_and_local_sink`'s `same_edid` does;
+    /// every pulse used to tear the display down and relight it.
+    fn navi22_long_pulse_same_edid_keeps_the_stream() -> TestResult {
+        use crate::amdgpu_navi22_display::{Detection, Error as D, Sink};
+        let lit = Sink {
+            edid: alloc::vec![0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 1, 2],
+            preferred: None,
+            hdmi: true,
+            dpcd: None,
+        };
+        let dp = Sink {
+            dpcd: Some([0x12; 16]),
+            ..lit.clone()
+        };
+        let mut other_edid = lit.clone();
+        other_edid.edid[9] = 3;
+        let mut other_dpcd = dp.clone();
+        other_dpcd.dpcd = Some([0x14; 16]);
+        if !long_pulse_keeps_stream(&lit, &Detection::Connected(lit.clone()))
+            || !long_pulse_keeps_stream(&dp, &Detection::Connected(dp.clone()))
+        {
+            return TestResult::Fail("unchanged sink after a long pulse was torn down");
+        }
+        if long_pulse_keeps_stream(&lit, &Detection::Connected(other_edid))
+            || long_pulse_keeps_stream(&dp, &Detection::Connected(other_dpcd))
+            || long_pulse_keeps_stream(&lit, &Detection::Disconnected)
+            || long_pulse_keeps_stream(&lit, &Detection::Failed(D::Invalid))
+        {
+            return TestResult::Fail("a changed or unreadable sink kept the old stream");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22",
+        navi22_long_pulse_same_edid_keeps_the_stream
     );
 }

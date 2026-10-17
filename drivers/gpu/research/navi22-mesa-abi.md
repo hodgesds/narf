@@ -68,10 +68,10 @@ with ACCEL_WORKING and `available_rings`, once milestone 8 lands.
 |-----------|-------|----------|---------------|-------|
 | `DRM_IOCTL_VERSION` | `amdgpu` 3.64.0 | major==3, minor≥54; minor≥55 GPUVM_FAULT, ≥59 zero-VRAM default | Navi22: none (no mode_state). Navi48: 3.0.0 | M4 (card), M9 (minor) |
 | `GET_CAP SYNCOBJ` | 1 | binary syncobj | 1 (generic table) | — |
-| `GET_CAP SYNCOBJ_TIMELINE` | 1 | Vulkan timeline semaphores / radeonsi timeline fences | 0 | M8 |
+| `GET_CAP SYNCOBJ_TIMELINE` | 1 | Vulkan timeline semaphores / radeonsi timeline fences | 1 on amdgpu (`drm_ioctl_bridge::amdgpu_cap_value`); 0 on virtio-gpu, as Linux | done (sync) |
 | `GET_CAP ADDFB2_MODIFIERS` | 1 | `kernel_has_modifiers` | 0 | M4/M5 |
 | `GET_CAP PRIME` | 3 | dma-buf export/import | 3 | — |
-| `SYNCOBJ_{CREATE,DESTROY,WAIT,TIMELINE_WAIT,QUERY,TRANSFER,FD_TO_HANDLE,HANDLE_TO_FD,SIGNAL,RESET}` | yes | init (radeonsi), every fence | only on the virtio-gpu render state (`handle_syncobj`); amdgpu nodes have none | M8 |
+| `SYNCOBJ_{CREATE,DESTROY,WAIT,TIMELINE_WAIT,QUERY,TRANSFER,FD_TO_HANDLE,HANDLE_TO_FD,SIGNAL,RESET,TIMELINE_SIGNAL,EVENTFD}` | yes | init (radeonsi), every fence; EVENTFD: KWin explicit sync | all on amdgpu nodes (`drm::syncobj_ioctl`), Linux errnos; timeline payloads are `dma_fence_chain`s (`drm::syncobj::FenceChain`); fds via `IoctlContext` (opaque `syncobj_file`, `EXPORT/IMPORT_SYNC_FILE`) | done (sync) |
 | `PRIME_HANDLE_TO_FD` / `FD_TO_HANDLE` | yes | WSI, DRI3 | generic PRIME table, not wired to amdgpu GEM | M8 |
 | `GEM_CLOSE` | yes | every BO | `amdgpu_gem` | — |
 | sysfs PCI info (`drmGetDevice2`) | yes | RADV required | `drm_sysfs_bridge` | — |
@@ -277,12 +277,12 @@ userspace).
 | GEM_OP GET_GEM_CREATE_INFO | import path | returns size/alignment/domains/flags | implemented | — |
 | GEM_WAIT_IDLE | BO idle waits | waits on the BO's reservation fences | always idle | M8 |
 | GEM_USERPTR | `EXT_external_memory_host`, radeonsi userptr | pins user pages into GTT | EINVAL | M8 (needs GART) |
-| BO_LIST | not used (radeonsi/RADV use the BO_HANDLES chunk) | — | not dispatched | — |
+| BO_LIST | not used (radeonsi/RADV use the BO_HANDLES chunk) | `amdgpu_bo_list_ioctl` | CREATE/UPDATE/DESTROY with Linux errnos (`amdgpu_bo_list`); CS accepts `bo_list_handle` | done (sync) |
 | CTX ALLOC/FREE | per context, priority LOW/NORMAL/HIGH (HIGH needs `CAP_SYS_NICE` or master ⇒ EACCES, radeonsi retries NORMAL) | | implemented (bookkeeping) | — |
 | CTX QUERY_STATE2 | robustness, reset status (`RESET`, `RESET_IN_PROGRESS`, `GUILTY`, `VRAMLOST`) | | always "no reset" | M10 |
 | CTX SET/GET_STABLE_PSTATE | profiling only | SMU | recorded, not applied | M10 |
-| CS | chunks IB (flags PREAMBLE, PREEMPT, TC_WB_NOT_INVALIDATE), BO_HANDLES, FENCE (user fence BO), SYNCOBJ_IN/OUT, SYNCOBJ_TIMELINE_WAIT/SIGNAL; radeonsi also uses a temporary context for a NOP probe (`BO_HANDLES`+`IB`) | `amdgpu_cs_ioctl` | parses IB chunks, refuses the rest, returns ENODEV | M8 (§11) |
-| WAIT_CS, WAIT_FENCES, FENCE_TO_HANDLE | `ac_drm_cs_query_fence_status` (WAIT_CS), sync_file export | per-context fence seq | not dispatched | M8 |
+| CS | chunks IB (flags PREAMBLE, PREEMPT, TC_WB_NOT_INVALIDATE), BO_HANDLES, FENCE (user fence BO), SYNCOBJ_IN/OUT, SYNCOBJ_TIMELINE_WAIT/SIGNAL; radeonsi also uses a temporary context for a NOP probe (`BO_HANDLES`+`IB`) | `amdgpu_cs_ioctl` | every listed chunk accepted with Linux errnos (§12); CP_GFX_SHADOW (gfx11) EINVAL | done (uapi, sync) |
+| WAIT_CS, WAIT_FENCES, FENCE_TO_HANDLE | `ac_drm_cs_query_fence_status` (WAIT_CS), sync_file export | per-context fence seq | WAIT_CS resolves the IP/ring and refuses never-emitted handles (EINVAL); WAIT_FENCES all/any with `amdgpu_gem_timeout`; FENCE_TO_HANDLE SYNCOBJ / SYNCOBJ_FD / SYNC_FILE_FD | done (sync) |
 | SCHED (override priority) | compositors only | master | not dispatched | — |
 | USERQ / USERQ_SIGNAL / USERQ_WAIT | only with `AMD_USERQ` and a non-zero `userq_ip_mask` | gfx11+ | not dispatched | — (gfx10 has no user queues) |
 
@@ -313,7 +313,7 @@ kernel queues pass their ring/IB tests. Implemented (software models only):
 |------|-------|-------|
 | `GET_CLIENT` on primary nodes | `drm_ioctl_bridge::get_client` | `drm_getclient`: idx 0 → auth (current master), pid, `overflowuid`; else EINVAL; render nodes EACCES |
 | `DRM_IOCTL_VERSION` | `amdgpu_info_navi22::drm_version`, `drm_ioctl_bridge::without_kms` | `amdgpu` 3.64.0 on Navi22 while `SUBMISSION` is wired; answered on both nodes even before a KMS owner attaches state (libdrm dereferences the result) |
-| `GET_CAP` without KMS state | `drm_ioctl_bridge::without_kms` | the generic table (`drm::ioctl::cap_value`): SYNCOBJ 1, SYNCOBJ_TIMELINE 0, PRIME 3 |
+| `GET_CAP` without KMS state | `drm_ioctl_bridge::without_kms` | the amdgpu table (`drm_ioctl_bridge::amdgpu_cap_value`): SYNCOBJ 1, SYNCOBJ_TIMELINE 1, PRIME 3 |
 | ACCEL_WORKING, DEV_INFO, READ_MMR_REG 0x263e, HW_IP_INFO/COUNT 0–9, FW_VERSION, MEMORY, VRAM_GTT, VIDEO_CAPS (192 B), MAX_IBS (40 B) | `amdgpu_info_navi22` | §3–§8; ACCEL/rings/counts/GANG_SUBMIT follow `SUBMISSION` (wired) and the cold boot's ring/IB proof |
 | CTX | `amdgpu_ctx` | priority permits as Linux (HIGH needs CAP_SYS_NICE or master → EACCES); QUERY_STATE/QUERY_STATE2 report GPU recoveries (`UNKNOWN_RESET`, `RESET`+`VRAMLOST`) |
 | GEM_CREATE (VRAM heap / system), GEM_MMAP, GEM_VA, GEM_WAIT_IDLE, GEM_OP, GEM_CLOSE | generic `amdgpu_gem` / `amdgpu_vm` | Navi22 registers its heap from the cold-boot pool; GEM_MMAP's out arm fixed to offset 0 of the 8-byte union |
@@ -321,11 +321,15 @@ kernel queues pass their ring/IB tests. Implemented (software models only):
 | PRIME export/import of amdgpu GEM objects | `drm_devfs_bridge` (`AmdgpuDmaBufFile`) | same-driver dma-buf with a shared reservation; jobs listing it in BO_HANDLES fence it (implicit sync) |
 | CS: IB, BO_HANDLES, SYNCOBJ_IN/OUT, DEPENDENCIES, FENCE | generic `amdgpu_cs` + `amdgpu_navi22_cs` | user fence (4 KiB BO) written by the CPU when the job retires; IBs on gfx ring 0, compute 0–3 (one queue), SDMA 0/1 |
 | WAIT_CS, SYNCOBJ_* (binary) | generic | SYNCOBJ_WAIT timeout now `-ETIME`, unsubmitted without WAIT_FOR_SUBMIT `-EINVAL` (Linux) |
+| Timeline syncobjs, `DRM_CAP_SYNCOBJ_TIMELINE` = 1 | `drm::syncobj` (`FenceChain`, `find_seqno`, `query_point`), `drm::syncobj_ioctl` | TIMELINE_WAIT (WAIT_FOR_SUBMIT / WAIT_AVAILABLE), QUERY (LAST_SUBMITTED), TRANSFER, TIMELINE_SIGNAL; unordered points start a new run as `dma_fence_chain_init`; waits park the syscall for an interruptible re-execution |
+| Syncobj / sync_file fds | `drm::syncobj_ioctl` | HANDLE_TO_FD / FD_TO_HANDLE opaque fds name the same object across opens; EXPORT_SYNC_FILE / IMPORT_SYNC_FILE (with TIMELINE points); a job's sync_file leaf is the job itself (`poll`, FILE_INFO, MERGE from the syscall layer's `DrmSyncFile`); dma-buf EXPORT/IMPORT_SYNC_FILE on amdgpu dma-bufs reach the shared reservation |
+| SYNCOBJ_EVENTFD | `drm::syncobj_ioctl` | a watcher task signals the eventfd when the point is available / signalled |
+| CS `SYNCOBJ_TIMELINE_WAIT` / `_SIGNAL` | generic `amdgpu_cs` | one post-dependency chunk; unknown out-syncobj EINVAL; WAIT_FOR_SUBMIT waits up to 5 s (ETIME); dependencies on never-emitted jobs EINVAL |
+| WAIT_FENCES, FENCE_TO_HANDLE, BO_LIST | generic `amdgpu_cs`, `amdgpu_bo_list` | Linux semantics and errnos; answered with or without a card engine |
+| Implicit sync | generic `amdgpu_cs` | as `amdgpu_cs_sync_rings`: listed BOs and the user-fence BO, skipping the open's own jobs (`AMDGPU_SYNC_NE_OWNER`) and EXPLICIT_SYNC BOs; unlisted BOs get no fence; GEM_WAIT_IDLE waits for the space's jobs only on VM_ALWAYS_VALID BOs (the root reservation) |
 
-Open gaps for the first hardware run: timeline syncobjs (cap 0, Linux 1;
-Mesa falls back to binary SYNCOBJ_OUT), syncobj fds and sync_file
-import/export, WAIT_FENCES / FENCE_TO_HANDLE, BO_LIST ioctl (Mesa uses the
-BO_HANDLES chunk), implicit sync for buffers not listed in BO_HANDLES, GDS/GWS/OA, GEM_USERPTR,
+Open gaps for the first hardware run: fence errors (`fence->error` after
+a GPU reset is not reported by WAIT_CS/WAIT_FENCES), GDS/GWS/OA, GEM_USERPTR,
 PRT/sparse, SET_PLACEMENT, GTT heap size in MEMORY (0), ADDFB2_MODIFIERS and
 modifier lists (KMS), TIMESTAMP/SENSOR/GPUVM_FAULT/usage counters, one
 client VMID for all clients (no per-client fault attribution). VCN/JPEG user

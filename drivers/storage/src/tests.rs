@@ -2058,6 +2058,184 @@ kernel_test_in!(
     smoke_ahci_hba_init_restores_firmware_config
 );
 
+/// Port-level AHCI register model: PxCMD.CR follows ST and FR follows FRE
+/// (the engines stop at once) except on `stuck` ports, whose CR stays set
+/// once set; `stick_on_start` ports latch CR the moment ST is written.
+/// PxSSTS reads DET = 3 on `present` ports, whose PxTFD is BSY forever
+/// unless `ready` (then 0x50). PxCI clears on write (the command
+/// "completes"). `comresets` counts PxSCTL.DET = 1 writes per port.
+struct PortModel {
+    regs: core::cell::RefCell<alloc::vec::Vec<u32>>,
+    stuck: u32,
+    stick_on_start: u32,
+    present: u32,
+    ready: u32,
+    comresets: core::cell::RefCell<[u32; 32]>,
+}
+
+impl PortModel {
+    fn new(present: u32) -> Self {
+        Self {
+            regs: core::cell::RefCell::new(alloc::vec![0u32; 0x1100 / 4]),
+            stuck: 0,
+            stick_on_start: 0,
+            present,
+            ready: 0,
+            comresets: core::cell::RefCell::new([0; 32]),
+        }
+    }
+    fn get(&self, off: u64) -> u32 {
+        self.regs.borrow()[(off / 4) as usize]
+    }
+    fn set(&self, off: u64, v: u32) {
+        self.regs.borrow_mut()[(off / 4) as usize] = v;
+    }
+}
+
+const fn m_port(n: u32, reg: u64) -> u64 {
+    0x100 + n as u64 * 0x80 + reg
+}
+
+impl crate::ahci::AhciRegs for PortModel {
+    fn read32(&self, off: u64) -> u32 {
+        if off >= 0x100 {
+            let n = ((off - 0x100) / 0x80) as u32;
+            match (off - 0x100) % 0x80 {
+                0x28 if self.present & (1 << n) != 0 => return 0x123,
+                0x20 if self.present & (1 << n) != 0 => {
+                    return if self.ready & (1 << n) != 0 {
+                        0x50
+                    } else {
+                        0x80
+                    };
+                }
+                _ => {}
+            }
+        }
+        self.get(off)
+    }
+    fn write32(&self, off: u64, v: u32) {
+        if off >= 0x100 {
+            let n = ((off - 0x100) / 0x80) as u32;
+            match (off - 0x100) % 0x80 {
+                0x18 => {
+                    let old = self.get(off);
+                    let stuck = self.stuck & (1 << n) != 0
+                        || (self.stick_on_start & (1 << n) != 0 && (v | old) & 1 != 0);
+                    let mut cr = if v & 1 != 0 { 1 << 15 } else { 0 };
+                    if stuck && (old & (1 << 15) != 0 || v & 1 != 0) {
+                        cr = 1 << 15;
+                    }
+                    let fr = if v & (1 << 4) != 0 { 1 << 14 } else { 0 };
+                    let fr = if stuck && old & (1 << 14) != 0 {
+                        1 << 14
+                    } else {
+                        fr
+                    };
+                    self.set(off, (v & !((1 << 15) | (1 << 14))) | cr | fr);
+                    return;
+                }
+                0x2C if v & 0xF == 1 => self.comresets.borrow_mut()[n as usize] += 1,
+                0x38 => return, // PxCI: completes immediately
+                _ => {}
+            }
+        }
+        self.set(off, v);
+    }
+}
+
+/// One HBA's port bring-up is bounded as a whole: six ports that report a
+/// device (DET = 3) but never clear BSY used to cost ~13 s each, serially
+/// (~80 s). Under the HBA-wide budget the bring-up ends shortly after it,
+/// later ports are classified without a COMRESET, and every port still
+/// gets its PxIE programmed.
+fn smoke_ahci_port_bring_up_is_bounded_per_hba() -> TestResult {
+    use crate::ahci::{bring_up_ports, PortKind};
+    let m = PortModel::new(0x3F);
+    let limit = narf_time::Deadline::after_ms(3_000);
+    let ports = bring_up_ports(&m, 0, 0x3F, Some((0x10_0000, 0x10_0400)), 400);
+    if limit.expired() {
+        return TestResult::Fail("six never-ready ports outlived the HBA bring-up budget");
+    }
+    // Port 0 was reset and never became ready; the rest were classified from
+    // their registers alone (DET = 3, no signature), never as a disk.
+    if ports.len() != 6
+        || ports[0].kind != PortKind::None
+        || ports.iter().any(|p| p.kind == PortKind::Sata)
+    {
+        return TestResult::Fail("never-ready ports must not classify as disks");
+    }
+    if m.comresets.borrow()[0] != 1 || m.comresets.borrow()[5] != 0 {
+        return TestResult::Fail("ports past the budget must not be COMRESET");
+    }
+    if (0..6).any(|n| m.get(m_port(n, 0x14)) == 0) {
+        return TestResult::Fail("every port must get its PxIE programmed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_port_bring_up_is_bounded_per_hba
+);
+
+/// IDENTIFY DEVICE on a port whose engine will not stop must fail without
+/// touching PxCLB / PxFB (the old code ignored the `port_idle` failure and
+/// pointed a running engine at a fresh page). When the final stop fails the
+/// call fails too, and the page the HBA may still write is never freed.
+fn smoke_ahci_identify_refuses_a_running_port() -> TestResult {
+    use crate::ahci::{identify_device, AhciError};
+    let mut m = PortModel::new(0b1);
+    m.stuck = 0b1;
+    m.set(m_port(0, 0x18), (1 << 15) | 1); // ST + CR, never drains
+    m.set(m_port(0, 0x00), 0xDEAD_0000);
+    m.set(m_port(0, 0x08), 0xBEEF_0000);
+    // SAFETY: a register model; the call fails before any DMA is set up.
+    let r = unsafe { identify_device(&m, 1 << 31, 0) };
+    if r != Err(AhciError::PortIdleTimeout) {
+        return TestResult::Fail("identify on a port that will not stop must fail");
+    }
+    if m.get(m_port(0, 0x00)) != 0xDEAD_0000 || m.get(m_port(0, 0x08)) != 0xBEEF_0000 {
+        return TestResult::Fail("CLB/FB reprogrammed under a running engine");
+    }
+    let mut m = PortModel::new(0b1);
+    m.ready = 0b1;
+    m.stick_on_start = 0b1;
+    // SAFETY: a register model standing in for the HBA; the scratch page is
+    // a real coherent allocation the model never writes.
+    let r = unsafe { identify_device(&m, 1 << 31, 0) };
+    if r != Err(AhciError::PortIdleTimeout) {
+        return TestResult::Fail("a failed final stop must fail identify (page kept)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_identify_refuses_a_running_port
+);
+
+/// GHC.IE is the HBA's master interrupt gate and must stay clear until the
+/// ISR is installed and routed (it was set at the end of bring-up, before
+/// `probe` had any vector).
+fn smoke_ahci_ghc_ie_waits_for_the_irq_route() -> TestResult {
+    use crate::ahci::{hba_enable_irq, hba_finish_init, AhciRegs};
+    let m = PortModel::new(0);
+    m.set(0x04, (1 << 31) | (1 << 1)); // firmware left IE set
+    m.set(0x08, 0b101);
+    hba_finish_init(&m);
+    if m.read32(0x04) != 1 << 31 {
+        return TestResult::Fail("bring-up must leave GHC.AE set and GHC.IE clear");
+    }
+    hba_enable_irq(&m);
+    if m.read32(0x04) != (1 << 31) | (1 << 1) {
+        return TestResult::Fail("hba_enable_irq must set GHC.IE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_ghc_ie_waits_for_the_irq_route
+);
+
 fn smoke_ahci_link_debounce_matches_libata() -> TestResult {
     use crate::ahci::sata_link_debounce;
     use core::cell::Cell;

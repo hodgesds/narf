@@ -148,6 +148,7 @@ pub mod amdgpu_atom_gpiopin;
 pub mod amdgpu_atom_vm;
 pub mod amdgpu_atombios;
 pub mod amdgpu_backlight;
+pub mod amdgpu_bo_list;
 pub mod amdgpu_bringup;
 pub mod amdgpu_clearstate;
 pub mod amdgpu_clearstate_gfx10;
@@ -165,9 +166,11 @@ pub mod amdgpu_dcn30_cursor;
 pub mod amdgpu_dcn30_ddc;
 pub mod amdgpu_dcn30_dp;
 pub mod amdgpu_dcn30_dp_link;
+pub mod amdgpu_dcn30_dsc;
 pub mod amdgpu_dcn30_flip;
 pub mod amdgpu_dcn30_hdmi;
 pub mod amdgpu_dcn30_hubbub;
+pub mod amdgpu_dcn30_mst;
 pub mod amdgpu_dcn30_takeover;
 pub mod amdgpu_dcn30_watermarks;
 pub mod amdgpu_dcn401_clk;
@@ -356,6 +359,9 @@ mod atomic_e2e_tests;
 
 #[cfg(feature = "kernel-test")]
 mod drm_ioctl_smokes;
+
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+mod drm_sync_tests;
 
 /// Stage::Subsys initcalls — register every GPU driver with the
 /// bus match table. Stage::Late initcalls hook DP Alt Mode →

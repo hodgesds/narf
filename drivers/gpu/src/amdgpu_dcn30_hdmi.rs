@@ -447,21 +447,21 @@ pub fn stream_for(
 
 /// `write_scdc_data` before the TMDS link starts: nothing for a sink
 /// without SCDC; else read Sink_Version, answer version 1 with
-/// Source_Version 1, then write TMDS_Config. A scrambled stream the sink was
-/// not told about cannot display, so its failures fail the link; Linux
-/// ignores the legacy write's result, and so does this.
+/// Source_Version 1, then write TMDS_Config. Linux (`link_ddc.c`) checks
+/// none of these transfers: a failed Sink_Version read leaves its
+/// `sink_version = 0` (so no Source_Version) and TMDS_Config is written
+/// regardless, as here. A scrambled stream the sink was not told about
+/// cannot display, so a failed TMDS_Config write fails the link; the legacy
+/// (unscrambled) write's result is ignored, as in Linux.
 pub async fn write_scdc_data<A: Aux>(ddc: &mut A, stream: &Stream) -> Result<(), Error> {
     if !stream.scdc {
         return Ok(());
     }
     let config = stream.scramble.tmds_config();
-    let result: Result<(), LinkError> = async {
-        if ddc.scdc_read(scdc::SINK_VERSION).await? == 1 {
-            ddc.scdc_write(scdc::SOURCE_VERSION, 1).await?;
-        }
-        ddc.scdc_write(scdc::TMDS_CONFIG, config).await
+    if ddc.scdc_read(scdc::SINK_VERSION).await.unwrap_or(0) == 1 {
+        let _ = ddc.scdc_write(scdc::SOURCE_VERSION, 1).await;
     }
-    .await;
+    let result: Result<(), LinkError> = ddc.scdc_write(scdc::TMDS_CONFIG, config).await;
     match result {
         Err(_) if config != 0 => Err(Error::Scdc),
         _ => Ok(()),
@@ -816,6 +816,8 @@ pub enum DigMode {
     DisplayPort = 0,
     /// `SIGNAL_TYPE_HDMI_TYPE_A`.
     Hdmi = 3, // linux: n/a (DIG_MODE 3, literal in dcn10_link_encoder.c:dcn10_link_encoder_setup)
+    /// `SIGNAL_TYPE_DISPLAY_PORT_MST`.
+    DpMst = 5, // linux: n/a (DIG_MODE 5, dcn10_link_encoder_setup for SIGNAL_TYPE_DISPLAY_PORT_MST)
 }
 
 /// One HDMI stream frontend `dig` routed to physical transmitter `transmitter`.

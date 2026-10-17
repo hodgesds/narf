@@ -222,6 +222,12 @@ pub enum AdminOpcode {
 }
 
 fn nvme_admin_irq() {}
+
+/// Test hook: make the next [`Controller::bring_up`] fail its Identify
+/// Controller command after CC.EN=1, as a controller that rejects or never
+/// completes it would. Only the in-kernel smokes set it.
+#[doc(hidden)]
+pub static FAIL_IDENTIFY_FOR_TEST: AtomicBool = AtomicBool::new(false);
 fn nvme_io_irq() {}
 
 #[non_exhaustive]
@@ -415,6 +421,11 @@ pub struct Controller {
     /// targets, so later I/O is refused with
     /// [`NvmeError::ControllerDead`].
     dead: bool,
+    /// DMA pages a failed bring-up command handed the controller (an
+    /// Identify target, an I/O CQ/SQ named by a failed Create). They are
+    /// released only by [`Controller::disable_after_failure`], and only
+    /// once CC.EN=0 / CSTS.RDY=0 confirms the controller stopped.
+    in_flight_dma: Vec<DmaBuffer>,
 }
 
 impl core::fmt::Debug for Controller {
@@ -570,6 +581,7 @@ impl Controller {
             ns_usable: false,
             prp_list: None,
             dead: false,
+            in_flight_dma: Vec::new(),
         }
     }
 
@@ -774,18 +786,52 @@ impl Controller {
             bar0.write32(REG_CC, cc);
         }
 
+        // From here the controller owns ASQ/ACQ and may DMA to them (and to
+        // any Identify page below). Park every piece of that state in `self`
+        // so a failure can stop the controller before anything is freed:
+        // Linux `nvme_reset_work` → `nvme_dev_disable` → `nvme_disable_ctrl`
+        // on an init error, never a bare free under CC.EN=1.
+        self.admin = Some(Queue {
+            sq_buf,
+            cq_buf,
+            qid: 0,
+            depth: ADMIN_Q_DEPTH,
+            sq_tail: 0,
+            cq_head: 0,
+            cq_phase: 1, // first valid CQE has phase = 1
+            db_stride: caps.doorbell_stride(),
+            next_cid: 0,
+        });
+        self.bar0_region = Some(bar0);
+        if let Err(e) = self.bring_up_enabled(cap, &device, caps, ready_ms) {
+            self.disable_after_failure(cap);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Steps 6–8 of [`Self::bring_up`], run with CC.EN=1 and the admin
+    /// queue already parked in `self`. Any DMA page handed to the
+    /// controller by a command that then fails goes to `in_flight_dma`.
+    fn bring_up_enabled(
+        &mut self,
+        cap: &Cap<BusDeviceCap, Write>,
+        device: &BusDevice,
+        caps: NvmeCaps,
+        ready_ms: u64,
+    ) -> Result<(), NvmeError> {
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
         // ── 6. Wait for CSTS.RDY = 1 ──────────────────────────────
-        wait_csts(&bar0, ready_ms, |s| (s & CSTS_RDY) != 0)?;
+        wait_csts(bar0, ready_ms, |s| (s & CSTS_RDY) != 0)?;
 
         // ── 6a. Enable MSI-X ──────────────────────────────────────
-        let mut msix = narf_bus::msix::enable_msix(cap, &device).ok();
-        let mut irq_vector = None;
-        if let Some(table) = msix.as_mut() {
+        self.msix = narf_bus::msix::enable_msix(cap, device).ok();
+        if let Some(table) = self.msix.as_mut() {
             if let Ok(v) = narf_interrupts::vector::alloc() {
                 // Program MSI-X slot 0 for Admin queue.
                 // Target the BSP (apic_id=0) for now.
                 // SAFETY: `table` was just obtained from `enable_msix(cap,
-                // &device)` for this device, so we hold its BAR exclusively
+                // device)` for this device, so we hold its BAR exclusively
                 // via the `&mut` borrow of `self.msix` (no other writer to
                 // the MSI-X table). `v` came from `narf_interrupts::vector::
                 // alloc()`, so slot 0 is a valid, owned vector index, and
@@ -796,22 +842,11 @@ impl Controller {
                     let _ = table.program_vector(0, 0, v);
                     let _ = table.enable();
                 }
-                irq_vector = Some(v);
+                self.irq_vector = Some(v);
                 narf_interrupts::install_handler(v, nvme_admin_irq);
             }
         }
-
-        let mut admin = Queue {
-            sq_buf,
-            cq_buf,
-            qid: 0,
-            depth: ADMIN_Q_DEPTH,
-            sq_tail: 0,
-            cq_head: 0,
-            cq_phase: 1, // first valid CQE has phase = 1
-            db_stride: caps.doorbell_stride(),
-            next_cid: 0,
-        };
+        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
 
         // ── 7. IDENTIFY CONTROLLER ────────────────────────────────
         let id_buf =
@@ -821,13 +856,22 @@ impl Controller {
         sqe.nsid = 0;
         sqe.prp1 = id_buf.dma_addr().raw();
         sqe.cdw10 = 1; // CNS = 1: Identify Controller
-                       // SAFETY: queue is live; bar0 is identity-mapped MMIO.
-        match unsafe { admin.submit(&bar0, sqe) } {
+        if FAIL_IDENTIFY_FOR_TEST.swap(false, Ordering::AcqRel) {
+            self.in_flight_dma.push(id_buf);
+            return Err(NvmeError::IdentifyFailed { status: 0x0006 });
+        }
+        // SAFETY: queue is live; bar0 is identity-mapped MMIO.
+        match unsafe { admin.submit(bar0, sqe) } {
             Ok(_) => {}
-            Err(NvmeError::CommandFailed { status, .. }) => {
-                return Err(NvmeError::IdentifyFailed { status })
+            Err(e) => {
+                // The controller may still write the page (a timed-out
+                // command is not cancelled by giving up on it).
+                self.in_flight_dma.push(id_buf);
+                return Err(match e {
+                    NvmeError::CommandFailed { status, .. } => NvmeError::IdentifyFailed { status },
+                    e => e,
+                });
             }
-            Err(e) => return Err(e),
         }
         // SAFETY: id_buf is a live, identity-mapped DMA page.
         let id = unsafe { parse_identify(&id_buf) };
@@ -844,7 +888,10 @@ impl Controller {
         sqe.prp1 = ns_buf.dma_addr().raw();
         sqe.cdw10 = 0; // CNS = 0: Identify Namespace
                        // SAFETY: same queue + bar.
-        let _ = unsafe { admin.submit(&bar0, sqe)? };
+        if let Err(e) = unsafe { admin.submit(bar0, sqe) } {
+            self.in_flight_dma.push(ns_buf);
+            return Err(e);
+        }
         // SAFETY: ns_buf is a live identity-mapped DMA page.
         let fmt = unsafe { parse_identify_namespace(&ns_buf) };
         drop(ns_buf);
@@ -861,11 +908,75 @@ impl Controller {
         self.ns_usable = fmt.usable;
         self.prp_list = Some(prp_list);
         self.dead = false;
-        self.admin = Some(admin);
-        self.bar0_region = Some(bar0);
-        self.msix = msix;
-        self.irq_vector = irq_vector;
         Ok(())
+    }
+
+    /// Stop a controller whose bring-up failed after CC.EN=1, then release
+    /// what it could DMA to. Linux `nvme_dev_disable(dev, false)`:
+    /// `nvme_disable_ctrl` (clear CC.EN, `nvme_wait_ready` for CSTS.RDY=0
+    /// bounded by CAP.TO), `pci_free_irq_vectors` (MSI-X off, vectors
+    /// released) and `pci_disable_device` (bus mastering off), and only then
+    /// `nvme_free_queues`.
+    ///
+    /// When RDY never drops (or CSTS reads all-ones: the function is gone)
+    /// the controller cannot be shown to be idle, so every DMA page it was
+    /// given — admin and I/O queues, the PRP list, any Identify target — is
+    /// leaked with `mem::forget` rather than returned to the allocator.
+    /// Returns `true` when the controller was confirmed stopped.
+    pub fn disable_after_failure(&mut self, cap: &Cap<BusDeviceCap, Write>) -> bool {
+        let timeout_ms = self.caps.map(|c| c.ready_timeout_ms()).unwrap_or(500);
+        let stopped = match self.bar0_region.as_ref() {
+            Some(bar) => {
+                // SAFETY: BAR0 is this controller's identity-mapped MMIO and
+                // `&mut self` excludes every other submitter.
+                unsafe {
+                    let cc = bar.read32(REG_CC);
+                    bar.write32(REG_CC, cc & !CC_EN);
+                }
+                narf_scheduler::responsive_spin_until(
+                    || {
+                        // SAFETY: as above.
+                        let csts = unsafe { bar.read32(REG_CSTS) };
+                        csts != u32::MAX && csts & CSTS_RDY == 0
+                    },
+                    narf_time::Deadline::after_ms(timeout_ms),
+                )
+            }
+            // CC.EN was never written: nothing was handed to the device.
+            None => true,
+        };
+        if let Some(mut table) = self.msix.take() {
+            // SAFETY: this controller owns the function's MSI-X capability;
+            // the controller is disabled (or abandoned) so no source fires.
+            unsafe { table.disable() };
+        }
+        for v in self
+            .irq_vector
+            .take()
+            .into_iter()
+            .chain(self.io_irq_vectors.drain(..))
+        {
+            narf_interrupts::dispatch::clear_handler(v);
+            let _ = narf_interrupts::vector::free(v);
+        }
+        if let Some(device) = self.device {
+            let _ = narf_bus::pci::clear_command(cap, &device, narf_bus::pci::cmd::BUS_MASTER);
+        }
+        let admin = self.admin.take();
+        let io = core::mem::take(&mut self.io_queues);
+        let prp_list = self.prp_list.take();
+        let pages = core::mem::take(&mut self.in_flight_dma);
+        self.io_queue_locks.clear();
+        self.dead = true;
+        if stopped {
+            drop((admin, io, prp_list, pages));
+        } else {
+            core::mem::forget(admin);
+            core::mem::forget(io);
+            core::mem::forget(prp_list);
+            core::mem::forget(pages);
+        }
+        stopped
     }
 
     /// Create a single I/O queue pair (qid=1, depth=`IO_Q_DEPTH`)
@@ -883,7 +994,15 @@ impl Controller {
         let mut ien = 0u32;
         let mut irq_vec = None;
         if let Some(table) = self.msix.as_mut() {
-            if let Ok(v) = narf_interrupts::vector::alloc() {
+            if first_io_cq_vector(table.size()) == 0 {
+                // A one-entry table: the I/O CQ shares entry 0 with the
+                // admin queue (Linux `nvme_create_cq`: `vector =
+                // dev->num_vecs == 1 ? 0 : qid`). Naming IV 1 here would be
+                // an Invalid Interrupt Vector and fail Create I/O CQ.
+                if self.irq_vector.is_some() {
+                    ien = 1;
+                }
+            } else if let Ok(v) = narf_interrupts::vector::alloc() {
                 // Use MSI-X slot 1 for the first I/O queue.
                 // SAFETY: `table` is this device's MSI-X table from
                 // `enable_msix`, held exclusively here via the `&mut` borrow
@@ -923,8 +1042,16 @@ impl Controller {
         sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
         sqe.cdw11 = ((iv as u32) << 16) | (ien << 1) | 1;
         // SAFETY: queue + bar live; CQ buffer is fresh DMA.
-        unsafe {
-            admin.submit(bar0, sqe)?;
+        if let Err(e) = unsafe { admin.submit(bar0, sqe) } {
+            // The controller may have created the CQ (or still be working
+            // on the command): the page stays out of the allocator until
+            // `disable_after_failure` confirms CC.EN=0.
+            self.in_flight_dma.push(cq_buf);
+            self.in_flight_dma.push(sq_buf);
+            if let Some(v) = irq_vec {
+                self.io_irq_vectors.push(v);
+            }
+            return Err(e);
         }
 
         // Create I/O SQ (admin opcode 0x01).
@@ -937,8 +1064,13 @@ impl Controller {
         sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
         sqe.cdw11 = ((IO_QID as u32) << 16) | 1;
         // SAFETY: queue + bar live.
-        unsafe {
-            admin.submit(bar0, sqe)?;
+        if let Err(e) = unsafe { admin.submit(bar0, sqe) } {
+            self.in_flight_dma.push(cq_buf);
+            self.in_flight_dma.push(sq_buf);
+            if let Some(v) = irq_vec {
+                self.io_irq_vectors.push(v);
+            }
+            return Err(e);
         }
 
         // Stash the new IoQueue. Drop replaces any prior set.
@@ -2322,6 +2454,17 @@ impl Controller {
 
 // ── helpers ─────────────────────────────────────────────────────────
 
+/// MSI-X table entry for the first I/O CQ: Linux `nvme_create_cq` uses
+/// `vector = dev->num_vecs == 1 ? 0 : qid`, so a one-entry table shares
+/// entry 0 with the admin queue.
+pub fn first_io_cq_vector(msix_table_size: u16) -> u16 {
+    if msix_table_size <= 1 {
+        0
+    } else {
+        IO_QID
+    }
+}
+
 /// Bounded poll for a `CSTS` predicate. Wall-clock-bounded at
 /// `timeout_ms`, which bring-up derives from CAP.TO like Linux
 /// `nvme_wait_ready` (NVMe 1.4 §3.1.5: the CSTS.RDY transition is
@@ -3014,10 +3157,14 @@ pub fn probe(
         return Ok(());
     }
     let mut ctrl = Controller::from_device(device);
+    // `bring_up` stops the controller itself on a failure after CC.EN=1.
     if ctrl.bring_up(&cap).is_err() {
         return Err(narf_bus::ProbeError::BadDevice);
     }
     if ctrl.create_io_queue().is_err() {
+        // Linux `nvme_reset_work` → `nvme_dev_disable`: stop the live
+        // controller before its queues go back to the allocator.
+        ctrl.disable_after_failure(&cap);
         return Err(narf_bus::ProbeError::BadDevice);
     }
     install_controller(ctrl);

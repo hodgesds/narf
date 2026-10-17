@@ -1292,6 +1292,16 @@ fn smu_navi22_gating_features_follow_smu_cmn() -> TestResult {
     {
         return TestResult::Fail("disable protocol");
     }
+    // EnableSmuFeaturesLow accepted, High rejected: the Low half may now
+    // run, so it is recorded for the opt-in's removal; the High half is not.
+    let (mut half, _pool2) = powered_engine(0x413f00);
+    half.io.reject = Some((ENABLE_FEATURES_HIGH, 0xfe));
+    if run(half.update_features(SMU_GFXOFF | SMU_HUB_PG, true)) != Err(Error::Rejected(0xfe))
+        || half.gating_allowed != SMU_GFXOFF & 0xffff_ffff
+        || SMU_HUB_PG & 0xffff_ffff != 0
+    {
+        return TestResult::Fail("Low bits enabled before a High failure were not recorded");
+    }
     // A clean PMFW rejection leaves the owner usable.
     e.io.reject = Some((ENABLE_FEATURES_LOW, 0xfe));
     if run(e.update_features(SMU_DEEP_SLEEP, true)) != Err(Error::Rejected(0xfe))
