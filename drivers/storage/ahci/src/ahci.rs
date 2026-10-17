@@ -94,14 +94,14 @@ fn with_ahci_scratch<R>(f: impl FnOnce(&DmaBuffer) -> R) -> Option<R> {
 /// SAFETY: callers serialise on per-port busy registers; the
 /// returned phys is stable for the controller's lifetime.
 fn ahci_scratch_phys() -> u64 {
-    let base = with_ahci_scratch(|b| b.dma_addr().raw()).unwrap_or(0);
+    let phys = with_ahci_scratch(|b| b.dma_addr().raw()).unwrap_or(0);
     // An HBA without CAP.S64A drops the upper address dwords (Linux sets a
     // 32-bit DMA mask for it), so a scratch above 4 GiB would send the
     // device's DMA somewhere else entirely. Refuse instead.
-    if !AHCI_S64A.load(Ordering::Acquire) && base.saturating_add(4096) > (1u64 << 32) {
+    if !AHCI_S64A.load(Ordering::Acquire) && phys.saturating_add(4096) > (1u64 << 32) {
         return 0;
     }
-    base
+    phys
 }
 
 /// CAP.S64A of the installed HBA (64-bit DMA addressing). Set by
