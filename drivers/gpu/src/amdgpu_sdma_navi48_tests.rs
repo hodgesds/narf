@@ -794,6 +794,18 @@ fn sdma_navi48_client_job_frame_matches_linux() -> TestResult {
     {
         return TestResult::Fail("reused VMID frame");
     }
+    // A memory sync: GCR_REQ first, then NOPs aligning the INDIRECT.
+    let synced = Job {
+        mem_sync: true,
+        ..quiet
+    };
+    let words = job_words(&synced, gc, oss, fence, 7).unwrap();
+    if words[..5] != [17, 0, 0xc3a1_0000, 0, 0]
+        || words[5..10] != [0; 5]
+        || words[10] != 4 | 3 << 16
+    {
+        return TestResult::Fail("memory sync frame");
+    }
     for bad in [
         Job::new(0, 1, 0, &[(0x1000, 4)]).unwrap(),
         Job::new(3, 1, 0, &[(0x1010, 4)]).unwrap(),

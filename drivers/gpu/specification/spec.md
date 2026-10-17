@@ -3592,7 +3592,11 @@ the PFP, skips PFP_SYNC_ME, flushes on invalidation engine 1 and marks IBs
 open's root page directory (`VmState::root_pde`, GMC 12 only), through
 `amdgpu_gfx12_queue::Queues::submit` — one 256-dword ring slot of pipeline
 sync (wait for the ring's previous fence) and VM flush (GFX hub, the ring's
-engine, PFP_SYNC_ME) when the grant asks for a flush, IBs and an
+engine, PFP_SYNC_ME) when the grant asks for a flush, the LUT write, an
+ACQUIRE_MEM when the first IB carries `AMDGPU_IB_FLAG_EMIT_MEM_SYNC`
+(`Job::mem_sync`; GCR_REQ on SDMA), CONTEXT_CONTROL on the graphics ring
+(state reloads when `Job::ctx_switch`: the ring's previous job came from
+another `(owner, ctx_id)`, Linux's scheduler entity), IBs and an
 interrupting RELEASE_MEM fence;
 `Busy` when the 1024-dword ring is full. A job also maps its VMID to its
 open's PASID in the IH VMID LUT (OSSSYS `IH_VMID_0_LUT + vmid`, after the

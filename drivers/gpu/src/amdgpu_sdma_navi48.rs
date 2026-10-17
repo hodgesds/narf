@@ -251,6 +251,7 @@ impl Slot {
 ///   context page-table base, then invalidate request and ACK wait);
 /// - when `job.map_pasid`, the PASID mapping (IH_VMID_0_LUT + vmid at
 ///   OSSSYS dword base `oss`);
+/// - when `job.mem_sync`, a GCR_REQ cache flush (sdma_v7_0_ring_emit_mem_sync);
 /// - each IB as sdma_v7_0_ring_emit_ib: NOPs so the 6-dword INDIRECT packet
 ///   ends on an 8-dword boundary (the slot starts on one), the VMID in the
 ///   header, a 32-byte aligned base and no CSA;
@@ -307,6 +308,12 @@ fn job_words(
     }
     if job.map_pasid {
         slot.wreg(oss + vmid, u32::from(job.pasid))?;
+    }
+    if job.mem_sync {
+        // sdma_v7_0_ring_emit_mem_sync: GCR_REQ over everything, GL2
+        // written back and GL2/GLM/GL1/GLV/GLK/GLI invalidated.
+        const GCR: u32 = 1 << 14 | 1 << 15 | 1 << 5 | 1 << 9 | 1 << 8 | 1 << 7 | 1;
+        slot.push(&[17, 0, (GCR & 0xffff) << 16, GCR >> 16, 0])?;
     }
     for &(at, dwords) in ibs {
         while (slot.pos + 6) % 8 != 0 {

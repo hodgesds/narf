@@ -93,6 +93,12 @@ pub struct Job {
     pub ib_count: u8,
     pub flush: bool,
     pub map_pasid: bool,
+    /// The ring's previous job came from another context
+    /// (`AMDGPU_HAVE_CTX_SWITCH`): CONTEXT_CONTROL reloads state.
+    pub ctx_switch: bool,
+    /// The first IB asked for `AMDGPU_IB_FLAG_EMIT_MEM_SYNC`: invalidate
+    /// and write back the GPU caches before the IBs.
+    pub mem_sync: bool,
 }
 /// IBs one job may carry: all fit one 256-dword slot beside the flush,
 /// PASID mapping and fence.
@@ -113,6 +119,8 @@ impl Job {
             ib_count: ibs.len() as u8,
             flush: true,
             map_pasid: true,
+            ctx_switch: true,
+            mem_sync: false,
         })
     }
     fn ibs(&self) -> &[(u64, u32)] {
@@ -124,12 +132,15 @@ impl Job {
 /// for the ring's fence to reach `seq - 1`) and the VM flush
 /// (gmc_v12_0_emit_flush_gpu_tlb on the GFX hub through the ring's engine,
 /// then PFP_SYNC_ME); when `job.map_pasid`, the PASID mapping (gmc_v12_0_emit_pasid_mapping: IH_VMID_0_LUT + vmid at OSSSYS
-/// base `oss`), the IBs under the job's VMID, and an interrupting RELEASE_MEM
+/// base `oss`); when `job.mem_sync`, ACQUIRE_MEM; on the graphics ring,
+/// CONTEXT_CONTROL (reloading state when `job.ctx_switch`); the IBs under
+/// the job's VMID, and an interrupting RELEASE_MEM
 /// of `seq` to `fence`, NOP-padded to the 256-dword slot.
 ///
 /// On the compute pipe, as gfx_v12_0's compute ring functions: register
-/// writes without the PFP engine select, no PFP_SYNC_ME, the ring's own
-/// invalidation engine, and IBs marked `INDIRECT_BUFFER_VALID`.
+/// writes without the PFP engine select, no PFP_SYNC_ME or CONTEXT_CONTROL,
+/// the ring's own invalidation engine, and IBs marked
+/// `INDIRECT_BUFFER_VALID`.
 fn job_packets(
     pipe: Pipe,
     job: Job,
@@ -177,6 +188,21 @@ fn job_packets(
         }
         if job.map_pasid {
             b.write_reg(oss + u32::from(job.vmid), u32::from(job.pasid), gfx)?;
+        }
+        if job.mem_sync {
+            // gfx_v12_0_emit_mem_sync: ACQUIRE_MEM over everything, GL2/GLM
+            // written back and GL2/GLM/GL1/GLV/GLK/GLI invalidated.
+            b.acquire_mem_gfx11(0, 0, 0x00ff_ffff_ffff_ffff, 10, 0xc3b1)?;
+        }
+        if gfx {
+            // gfx_v12_0_ring_emit_cntxcntl: load_enable, plus the global,
+            // per-context and SH register loads on a context switch.
+            let reload = if job.ctx_switch {
+                0x8001 | 0x0100_0000 | 0x1_0002
+            } else {
+                0
+            };
+            b.context_control(0x8000_0000 | reload, 0)?;
         }
         for &(at, dwords) in job.ibs() {
             if gfx {

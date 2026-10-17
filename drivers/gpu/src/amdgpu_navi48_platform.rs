@@ -218,6 +218,7 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
                 card,
                 fence,
                 sdma_fence: boot.client_sdma_fence_reader(),
+                contexts: narf_lib::sync::IrqSafeSpinLock::new([(0, 0); RINGS]),
                 vmids: narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_vmid::VmidManager::new(
                     CLIENT_VMIDS.0,
                     CLIENT_VMIDS.1,
@@ -270,6 +271,10 @@ struct Submitter {
     sdma_fence: Option<crate::amdgpu_sdma_navi48::FenceReader>,
     /// Touched only under OWNER, beside the submission it grants.
     vmids: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_vmid::VmidManager>,
+    /// Each ring's last job's context, `(VmState::owner, ctx_id)`: the
+    /// scheduler entity Linux compares for AMDGPU_HAVE_CTX_SWITCH. Touched
+    /// only under OWNER.
+    contexts: narf_lib::sync::IrqSafeSpinLock<[(u64, u32); RINGS]>,
 }
 /// Client VMIDs on the GFX hub: 1 up to first_kfd_vmid (8) exclusive.
 const CLIENT_VMIDS: (u8, u8) = (1, 7);
@@ -362,6 +367,9 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             };
             let mut job = crate::amdgpu_gfx12_queue::Job::new(0, pasid, pd_addr, &ibs)
                 .ok_or(FsError::InvalidData)?;
+            // amdgpu_ib_schedule asks the first IB.
+            job.mem_sync = first.flags & crate::amdgpu_uapi::AMDGPU_IB_FLAG_EMIT_MEM_SYNC != 0;
+            let entity = (request.owner, submission.ctx_id);
             let result = loop {
                 let mut owner = OWNER.lock().await;
                 let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
@@ -378,6 +386,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                 job.vmid = grant.vmid;
                 job.flush = grant.needs_flush;
                 job.map_pasid = grant.map_pasid;
+                job.ctx_switch = self.contexts.lock()[ring as usize] != entity;
                 let result = match PIPES.get(ring as usize) {
                     // SAFETY: the platform serializes every queue user under
                     // OWNER; `amdgpu_cs` holds the job's memory until its
@@ -404,6 +413,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                 if let Ok(seq) = result {
                     let ticket = u64::from(ring) << 32 | u64::from(seq);
                     self.vmids.lock().commit(request, grant, ticket);
+                    self.contexts.lock()[ring as usize] = entity;
                 }
                 break result;
             };
