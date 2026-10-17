@@ -2642,8 +2642,9 @@ owned root page whose entries are GMC 12's invalid directory pattern, so a
 VMID no submission has flushed faults instead of translating. One request
 invalidates all fifteen per hub on engine 17, the MMHUB semaphore held and
 released even on timeout; every context is read back. `ClientsReady` keeps
-VMID0 live (`State::vmid0_ready`); failure quarantines the owner. Boot does
-not call it yet; nothing binds a client's page tables to a VMID.
+VMID0 live (`State::vmid0_ready`); failure quarantines the owner. The cold
+boot's memory-translation stage runs it right after `initialize`, before any
+queue exists.
 
 After boot, the platform calls `ColdBoot::publish_client_vram`: half the
 CPU-visible VRAM the driver's pool still has free (2 MiB-aligned, at least
@@ -3541,7 +3542,23 @@ paths; only the tables differ.
   Memory returns when the last reference goes — fences must gate that once
   a submission path exists.
 
-No client VMID is bound to a submission yet on any generation.
+- Submission (`amdgpu_cs`): a card registers a `Submitter`
+  (`register_submitter`); on such a card the `/dev/dri` ioctl route
+  (`dispatch_async`, for card and render nodes) queues a validated
+  `AMDGPU_CS` and returns the engine's sequence as the handle, and
+  `AMDGPU_WAIT_CS` parks until it completes or the client's absolute
+  monotonic deadline passes (status 0/1). Without one, CS parses and is
+  refused as before. `pm4::Pm4Builder::vm_flush` builds the in-ring VM flush
+  (shared by GMC 11 and 12).
+
+The Navi48 platform registers the graphics queue as its card's submitter
+after boot: one graphics IB per submission, run on client VMID 1 with the
+open's root page directory (`VmState::root_pde`, GMC 12 only), through
+`amdgpu_gfx12_queue::Queues::submit` — one 256-dword ring slot of VM flush
+(GFX hub, engine 0, PFP_SYNC_ME), IB and interrupting RELEASE_MEM fence;
+`Busy` when the 1024-dword ring is full. VMID reuse, IH PASID mapping and
+holding a job's buffers until its fence are not implemented, and
+`AMDGPU_INFO` still reports acceleration unavailable.
 
 ### AMD platform VBIOS
 

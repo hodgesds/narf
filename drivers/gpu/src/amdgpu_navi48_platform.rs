@@ -210,6 +210,10 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     if let Some((limits, level)) = boot.power_info() {
         crate::amdgpu_navi48_power::start(limits, level);
     }
+    // Clients' command submissions run on the graphics queue.
+    if let Some(card) = boot::ColdBoot::drm_card() {
+        crate::amdgpu_cs::register_submitter(card, alloc::sync::Arc::new(Submitter));
+    }
     // Clients' VRAM buffers; without it they fall back to system memory.
     {
         use core::fmt::Write as _;
@@ -226,6 +230,92 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
         };
     }
     Ok(report)
+}
+
+/// The Navi48 graphics queue behind AMDGPU_CS: one graphics IB per
+/// submission, run in the open's address space on client VMID 1, whose
+/// context every job's VM flush points at that space's root first.
+///
+/// LINUX-GAP: VMID 1 for every client, always flushed — no per-client VMID
+/// reuse (amdgpu_vmid_grab) and no IH PASID mapping, so a fault is not yet
+/// attributed to its client. The buffers a job reaches are not held until
+/// its fence passes; a client that unmaps them mid-job can have their
+/// memory reused under the GPU. AMDGPU_INFO keeps reporting acceleration
+/// unavailable, so Mesa does not submit here.
+struct Submitter;
+const CLIENT_VMID: u8 = 1;
+impl crate::amdgpu_cs::Submitter for Submitter {
+    fn submit<'a>(
+        &'a self,
+        vm: &'a crate::amdgpu_vm::VmState,
+        submission: &'a crate::amdgpu_cs::Submission,
+    ) -> core::pin::Pin<
+        alloc::boxed::Box<
+            dyn core::future::Future<Output = Result<u64, narf_filesystem::FsError>> + Send + 'a,
+        >,
+    > {
+        alloc::boxed::Box::pin(async move {
+            use narf_filesystem::FsError;
+            let [ib] = submission.ibs.as_slice() else {
+                return Err(FsError::Unsupported);
+            };
+            if ib.ip_type != crate::amdgpu_uapi::AMDGPU_HW_IP_GFX
+                || ib.ip_instance != 0
+                || ib.ring != 0
+            {
+                return Err(FsError::Unsupported);
+            }
+            if vm.geometry() != crate::amdgpu_vm::Geometry::GMC12 {
+                return Err(FsError::InvalidData);
+            }
+            let pd_addr = vm.root_pde().ok_or(FsError::InvalidData)?;
+            let job = crate::amdgpu_gfx12_queue::Job {
+                vmid: CLIENT_VMID,
+                pd_addr,
+                ib: ib.va_start,
+                ib_dwords: ib.length_dw,
+            };
+            let mut owner = OWNER.lock().await;
+            let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
+            // SAFETY: the platform serializes every queue user under OWNER;
+            // the job's lifetime gap is documented above.
+            match unsafe { boot.submit_client_job(job) } {
+                Ok(seq) => Ok(u64::from(seq)),
+                Err(crate::amdgpu_gfx12_queue::Error::Busy) => Err(FsError::Busy),
+                Err(crate::amdgpu_gfx12_queue::Error::Invalid) => Err(FsError::InvalidData),
+                Err(_) => Err(FsError::NoDevice),
+            }
+        })
+    }
+    fn wait(
+        &self,
+        seq: u64,
+        deadline_ns: u64,
+    ) -> core::pin::Pin<
+        alloc::boxed::Box<
+            dyn core::future::Future<Output = Result<bool, narf_filesystem::FsError>> + Send + '_,
+        >,
+    > {
+        alloc::boxed::Box::pin(async move {
+            use narf_filesystem::FsError;
+            let seq = u32::try_from(seq).map_err(|_| FsError::InvalidData)?;
+            loop {
+                let completed = {
+                    let mut owner = OWNER.lock().await;
+                    let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
+                    boot.completed_client_job().map_err(|_| FsError::NoDevice)?
+                };
+                // Sequences wrap: done when `completed` is at or past `seq`.
+                if completed.wrapping_sub(seq) as i32 >= 0 {
+                    return Ok(true);
+                }
+                if narf_time::monotonic_ns() >= deadline_ns {
+                    return Ok(false);
+                }
+                narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
+            }
+        })
+    }
 }
 
 /// One PMFW telemetry refresh, serialized with every retained owner user.

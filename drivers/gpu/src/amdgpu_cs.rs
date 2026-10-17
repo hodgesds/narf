@@ -30,7 +30,13 @@
 //!
 //! ## What this does not do
 //!
-//! LINUX-GAP: a validated submission is **not queued**. The pieces it would
+//! A card whose queue can run client work registers a [`Submitter`]; on
+//! such a card the `/dev/dri` ioctl route ([`dispatch_async`]) queues a
+//! validated submission and returns its sequence as the fence handle, and
+//! `AMDGPU_WAIT_CS` parks until that sequence completes or the client's
+//! deadline passes. The Navi48 graphics queue is the first such engine.
+//!
+//! LINUX-GAP: on a card without one, a validated submission is **not queued**. The pieces it would
 //! need now all exist separately — the GFX11 and compute queue descriptors
 //! (`amdgpu_mqd`), the ring with its doorbell and writeback slots
 //! (`amdgpu_ring`), the MES `ADD_QUEUE` transport in both its process and its
@@ -62,7 +68,12 @@
 //! would get a race, not an error. `BO_HANDLES` and `FENCE` are refused for
 //! the same reason.
 
+use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
+use narf_lib::sync::IrqSafeSpinLock;
 
 use narf_filesystem::FsError;
 
@@ -309,16 +320,102 @@ pub fn parse(
     Ok(Submission { ctx_id, ibs })
 }
 
-/// `DRM_IOCTL_AMDGPU_CS` for one open.
-pub fn dispatch(
+/// The engine behind a card's command submission. A card registers one
+/// once a queue can run client work; until then CS stays refused.
+pub trait Submitter: Send + Sync {
+    /// Queue `submission` in the address space `vm`; returns its sequence,
+    /// which `AMDGPU_CS` hands back as the fence handle.
+    fn submit<'a>(
+        &'a self,
+        vm: &'a VmState,
+        submission: &'a Submission,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, FsError>> + Send + 'a>>;
+    /// Whether sequence `seq` has completed, waiting until monotonic
+    /// `deadline_ns` (0: don't wait).
+    fn wait(
+        &self,
+        seq: u64,
+        deadline_ns: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, FsError>> + Send + '_>>;
+}
+
+static SUBMITTERS: IrqSafeSpinLock<Vec<(u32, Arc<dyn Submitter>)>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+/// Let DRM card `card`'s clients submit through `submitter`.
+pub fn register_submitter(card: u32, submitter: Arc<dyn Submitter>) {
+    let mut s = SUBMITTERS.lock();
+    s.retain(|(c, _)| *c != card);
+    s.push((card, submitter));
+}
+
+/// Stop accepting submissions for DRM card `card`.
+pub fn unregister_submitter(card: u32) {
+    SUBMITTERS.lock().retain(|(c, _)| *c != card);
+}
+
+fn submitter(card: u32) -> Option<Arc<dyn Submitter>> {
+    SUBMITTERS
+        .lock()
+        .iter()
+        .find(|(c, _)| *c == card)
+        .map(|(_, s)| s.clone())
+}
+
+/// Whether `cmd` is `AMDGPU_CS` or `AMDGPU_WAIT_CS`, which may park.
+pub fn is_async_ioctl(cmd: u32) -> bool {
+    let nr = drm_uapi::ioc_nr(cmd);
+    nr == drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_CS
+        || nr == drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_WAIT_CS
+}
+
+/// `AMDGPU_CS` and `AMDGPU_WAIT_CS` on DRM card `card`, for a card with a
+/// registered submitter; `Unsupported` sends anything else (and a card
+/// without one) to the synchronous [`dispatch`].
+pub async fn dispatch_async(
+    card: u32,
     cmd: u32,
     arg: usize,
     vm: &VmState,
     ctx: &crate::amdgpu_ctx::CtxState,
 ) -> Result<u64, FsError> {
-    if drm_uapi::ioc_nr(cmd) != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_CS {
+    let Some(engine) = submitter(card) else {
+        return Err(FsError::Unsupported);
+    };
+    let nr = drm_uapi::ioc_nr(cmd);
+    if nr == drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_WAIT_CS {
+        // SAFETY: `arg` is the ioctl pointer the trap layer validated.
+        let bytes = unsafe { copy_in(arg, 32)? };
+        let handle = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        // amdgpu_gem_timeout: an absolute monotonic deadline in ns.
+        let timeout = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let ctx_id = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
+        if ctx.get(ctx_id).is_none() {
+            return Err(FsError::InvalidData);
+        }
+        let done = handle == 0 || engine.wait(handle, timeout).await?;
+        // `drm_amdgpu_wait_cs_out.status`: 0 completed, 1 still busy.
+        // SAFETY: as above; the out arm overlays the first 8 bytes.
+        unsafe { copy_out(arg, &u64::from(!done).to_le_bytes())? };
+        return Ok(0);
+    }
+    if nr != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_CS {
         return Err(FsError::Unsupported);
     }
+    let submission = validated(arg, vm, ctx)?;
+    let seq = engine.submit(vm, &submission).await?;
+    // `drm_amdgpu_cs_out.handle`.
+    // SAFETY: as above.
+    unsafe { copy_out(arg, &seq.to_le_bytes())? };
+    Ok(0)
+}
+
+/// The `drm_amdgpu_cs` request at `arg`, read and validated.
+fn validated(
+    arg: usize,
+    vm: &VmState,
+    ctx: &crate::amdgpu_ctx::CtxState,
+) -> Result<Submission, FsError> {
     // `union drm_amdgpu_cs`: in { ctx_id, bo_list_handle, num_chunks, flags,
     // chunks } is 24 bytes and larger than out { handle }.
     // SAFETY: `arg` is the ioctl pointer the trap layer validated (or
@@ -329,7 +426,6 @@ pub fn dispatch(
     let num_chunks = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     let flags = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
     let chunks_ptr = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-
     // No submission flags are defined, so any is a client expecting something
     // this does not do.
     if flags != 0 {
@@ -341,8 +437,20 @@ pub fn dispatch(
     if bo_list_handle != 0 {
         return Err(FsError::Unsupported);
     }
+    parse(ctx_id, num_chunks, chunks_ptr, vm, ctx)
+}
 
-    let submission = parse(ctx_id, num_chunks, chunks_ptr, vm, ctx)?;
+/// `DRM_IOCTL_AMDGPU_CS` for one open.
+pub fn dispatch(
+    cmd: u32,
+    arg: usize,
+    vm: &VmState,
+    ctx: &crate::amdgpu_ctx::CtxState,
+) -> Result<u64, FsError> {
+    if drm_uapi::ioc_nr(cmd) != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_CS {
+        return Err(FsError::Unsupported);
+    }
+    let submission = validated(arg, vm, ctx)?;
     let _ = submission;
 
     // Parsed and valid — and refused, because there is no engine reading a

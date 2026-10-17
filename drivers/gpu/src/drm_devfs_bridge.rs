@@ -486,6 +486,23 @@ impl FileOps for DriCardFile {
                 )
                 .await;
             }
+            // amdgpu CS and WAIT_CS park on a card whose queue runs them.
+            if crate::drm_registry::driver_name(self.index) == Some("amdgpu")
+                && crate::amdgpu_cs::is_async_ioctl(cmd)
+            {
+                match crate::amdgpu_cs::dispatch_async(
+                    self.index,
+                    cmd,
+                    arg as usize,
+                    &self.amdgpu_vm,
+                    &self.amdgpu_ctx,
+                )
+                .await
+                {
+                    Err(FsError::Unsupported) => {}
+                    result => return result,
+                }
+            }
             self.ioctl(cmd, arg as usize)
         })
     }
@@ -1018,6 +1035,23 @@ impl FileOps for DriRenderFile {
             {
                 return crate::drm_ioctl_bridge::wait_virtgpu_render(arg as usize, &self.virtgpu)
                     .await;
+            }
+            // amdgpu CS and WAIT_CS park on a card whose queue runs them.
+            if crate::drm_registry::driver_name(self.index) == Some("amdgpu")
+                && crate::amdgpu_cs::is_async_ioctl(cmd)
+            {
+                match crate::amdgpu_cs::dispatch_async(
+                    self.index,
+                    cmd,
+                    arg as usize,
+                    &self.amdgpu_vm,
+                    &self.amdgpu_ctx,
+                )
+                .await
+                {
+                    Err(FsError::Unsupported) => {}
+                    result => return result,
+                }
             }
             self.ioctl(cmd, arg as usize)
         })

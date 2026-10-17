@@ -313,6 +313,11 @@ impl Backend for Hardware {
                 );
                 // SAFETY: same retained owners and exclusive hub access.
                 unsafe { self.gmc.as_mut().unwrap().initialize().await }.map_err(Error::Gmc)?;
+                // Client VMIDs 1..15 at an empty root, before any queue runs,
+                // for submissions' in-ring VM flushes to point at a client.
+                // SAFETY: the same owners; no queue exists yet.
+                unsafe { self.gmc.as_mut().unwrap().prepare_client_contexts().await }
+                    .map_err(Error::Gmc)?;
             }
             Stage::ReadTopology => {
                 // SAFETY: firmware/power are ready; no concurrent index user,
@@ -689,6 +694,39 @@ impl ColdBoot {
     /// Run from an executor task after service handoff, with all kernel queues,
     /// test pages and reset/PM still exclusively owned. Masked CPU IRQs cause
     /// the MSI proof to fail before submission.
+    /// Queue a client job on the graphics ring (`Queues::submit`).
+    /// # Safety
+    /// As for `Queues::submit`: the job's page directory, IB and what it
+    /// reaches stay alive until `completed_client_job` passes the sequence.
+    pub(crate) unsafe fn submit_client_job(
+        &mut self,
+        job: queues::Job,
+    ) -> Result<u32, queues::Error> {
+        let queues = self
+            .sequence
+            .backend
+            .queues
+            .as_mut()
+            .ok_or(queues::Error::Invalid)?;
+        // SAFETY: the caller's obligations.
+        unsafe { queues.submit(job) }
+    }
+    /// The last client job sequence the graphics ring completed.
+    pub(crate) fn completed_client_job(&mut self) -> Result<u32, queues::Error> {
+        self.sequence
+            .backend
+            .queues
+            .as_mut()
+            .ok_or(queues::Error::Invalid)?
+            .completed_job()
+    }
+    /// This GPU's DRM card: the registered Navi48.
+    pub(crate) fn drm_card() -> Option<u32> {
+        (0..crate::drm_registry::count() as u32).find(|&i| {
+            crate::drm_registry::pci_id(i)
+                == Some((crate::amdgpu::AMD_VENDOR, crate::amdgpu::NAVI48))
+        })
+    }
     pub(crate) async unsafe fn prove_queue_interrupts(
         &mut self,
     ) -> Result<queues::InterruptProof, queues::Error> {
@@ -755,12 +793,7 @@ impl ColdBoot {
         if size < 64 << 20 {
             return Err(Error::Allocation);
         }
-        let card = (0..crate::drm_registry::count() as u32)
-            .find(|&i| {
-                crate::drm_registry::pci_id(i)
-                    == Some((crate::amdgpu::AMD_VENDOR, crate::amdgpu::NAVI48))
-            })
-            .ok_or(Error::Invalid)?;
+        let card = Self::drm_card().ok_or(Error::Invalid)?;
         let mut chunk = hw
             .pool
             .reserve_aligned(size, ALIGN)

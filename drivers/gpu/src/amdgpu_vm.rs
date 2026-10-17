@@ -961,6 +961,12 @@ const MAX_TABLES: u64 = 4096;
 impl VmState {
     /// Physical address of the root page directory, for
     /// `VM_CONTEXTn_PAGE_TABLE_BASE_ADDR`. `None` until something is mapped.
+    /// The page-directory base a VM flush writes for this address space:
+    /// the root as a directory entry (system memory, VALID|SYSTEM|SNOOPED).
+    pub fn root_pde(&self) -> Option<u64> {
+        make_pde(self.root_phys()?).ok()
+    }
+
     pub fn root_phys(&self) -> Option<u64> {
         self.root.lock().as_ref().map(|n| n.table.phys)
     }

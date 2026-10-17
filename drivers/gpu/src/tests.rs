@@ -11510,6 +11510,181 @@ kernel_test_in!(
     smoke_amdgpu_cs_parser_rejects_hostile_input
 );
 
+/// AMDGPU_CS and WAIT_CS on a card with a registered submitter: a valid
+/// submission reaches the engine in the open's address space and its
+/// sequence comes back as the handle; WAIT_CS reports busy until the engine
+/// completes it (a zero deadline does not wait), handle 0 is idle, and an
+/// unknown context is refused. Without a submitter the async route
+/// declines, leaving the synchronous refusal in place.
+fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
+    use crate::amdgpu_cs::{dispatch_async, register_submitter, unregister_submitter};
+    use crate::amdgpu_ctx::{dispatch as ctx_dispatch, CtxState};
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, VmState, GPU_PAGE_SIZE};
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+    use alloc::boxed::Box;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_filesystem::FsError;
+
+    struct Fake {
+        completed: AtomicU64,
+        seen: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, u32, Option<u64>)>>,
+    }
+    impl crate::amdgpu_cs::Submitter for Fake {
+        fn submit<'a>(
+            &'a self,
+            vm: &'a VmState,
+            s: &'a crate::amdgpu_cs::Submission,
+        ) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<u64, FsError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let mut seen = self.seen.lock();
+                seen.push((s.ibs[0].va_start, s.ibs[0].length_dw, vm.root_pde()));
+                Ok(seen.len() as u64)
+            })
+        }
+        fn wait(
+            &self,
+            seq: u64,
+            _deadline: u64,
+        ) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<bool, FsError>> + Send + '_>>
+        {
+            Box::pin(async move { Ok(self.completed.load(Ordering::SeqCst) >= seq) })
+        }
+    }
+
+    let gem = GemState::new();
+    let state = VmState::new();
+    let ctx = CtxState::new();
+    let mut ctx_req = [0u8; core::mem::size_of::<u::DrmAmdgpuCtx>()];
+    ctx_req[0..4].copy_from_slice(&u::AMDGPU_CTX_OP_ALLOC_CTX.to_le_bytes());
+    if ctx_dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_CTX,
+        ctx_req.as_mut_ptr() as usize,
+        &ctx,
+        false,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: context");
+    }
+    let ctx_id = u32::from_le_bytes(ctx_req[0..4].try_into().unwrap());
+    const IB_VA: u64 = 0x2_0000_0000;
+    let mut create = [0u8; 32];
+    create[0..8].copy_from_slice(&(2 * GPU_PAGE_SIZE).to_le_bytes());
+    create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if crate::amdgpu_gem::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        create.as_mut_ptr() as usize,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE");
+    }
+    let handle = u32::from_le_bytes(create[0..4].try_into().unwrap());
+    let mut m = [0u8; 40];
+    m[0..4].copy_from_slice(&handle.to_le_bytes());
+    m[8..12].copy_from_slice(&u::AMDGPU_VA_OP_MAP.to_le_bytes());
+    m[12..16].copy_from_slice(
+        &(u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_EXECUTABLE).to_le_bytes(),
+    );
+    m[16..24].copy_from_slice(&IB_VA.to_le_bytes());
+    m[32..40].copy_from_slice(&(2 * GPU_PAGE_SIZE).to_le_bytes());
+    if vm::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA,
+        m.as_mut_ptr() as usize,
+        &state,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: MAP");
+    }
+    // One IB chunk of 256 bytes at IB_VA, behind the real three-level layout.
+    let mut body = [0u32; 8];
+    body[2] = IB_VA as u32;
+    body[3] = (IB_VA >> 32) as u32;
+    body[4] = 256;
+    body[5] = u::AMDGPU_HW_IP_GFX;
+    let body_ptr = body.as_ptr() as u64;
+    let header = [
+        u::AMDGPU_CHUNK_ID_IB,
+        8,
+        body_ptr as u32,
+        (body_ptr >> 32) as u32,
+    ];
+    let pointers = [header.as_ptr() as u64];
+    let mut cs = [0u8; 24];
+    cs[0..4].copy_from_slice(&ctx_id.to_le_bytes());
+    cs[8..12].copy_from_slice(&1u32.to_le_bytes());
+    cs[16..24].copy_from_slice(&(pointers.as_ptr() as u64).to_le_bytes());
+    let cs_cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_CS;
+    let wait_cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_WAIT_CS;
+    let wait_req = |handle: u64, ctx_id: u32| {
+        let mut w = [0u8; 32];
+        w[0..8].copy_from_slice(&handle.to_le_bytes());
+        w[28..32].copy_from_slice(&ctx_id.to_le_bytes());
+        w
+    };
+    let card = 0x7ffe_0000;
+    let run = |cmd: u32, arg: &mut [u8]| {
+        narf_scheduler::block_on_spin(dispatch_async(
+            card,
+            cmd,
+            arg.as_mut_ptr() as usize,
+            &state,
+            &ctx,
+        ))
+    };
+    if run(cs_cmd, &mut cs.clone()) != Err(FsError::Unsupported) {
+        return TestResult::Fail("no submitter: the async route declines");
+    }
+    let fake = alloc::sync::Arc::new(Fake {
+        completed: AtomicU64::new(0),
+        seen: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+    });
+    register_submitter(card, fake.clone());
+    let result = (|| {
+        if run(cs_cmd, &mut cs).is_err() || u64::from_le_bytes(cs[0..8].try_into().unwrap()) != 1 {
+            return Some("CS handle");
+        }
+        if fake.seen.lock().as_slice() != [(IB_VA, 64, state.root_pde())]
+            || state.root_pde().is_none()
+        {
+            return Some("the engine saw the submission");
+        }
+        let mut w = wait_req(1, ctx_id);
+        if run(wait_cmd, &mut w).is_err() || u64::from_le_bytes(w[0..8].try_into().unwrap()) != 1 {
+            return Some("WAIT_CS busy");
+        }
+        fake.completed.store(1, Ordering::SeqCst);
+        let mut w = wait_req(1, ctx_id);
+        if run(wait_cmd, &mut w).is_err() || u64::from_le_bytes(w[0..8].try_into().unwrap()) != 0 {
+            return Some("WAIT_CS completed");
+        }
+        let mut w = wait_req(0, ctx_id);
+        if run(wait_cmd, &mut w).is_err() || u64::from_le_bytes(w[0..8].try_into().unwrap()) != 0 {
+            return Some("WAIT_CS of handle 0");
+        }
+        let mut w = wait_req(1, ctx_id + 99);
+        if run(wait_cmd, &mut w) != Err(FsError::InvalidData) {
+            return Some("WAIT_CS of an unknown context");
+        }
+        None
+    })();
+    unregister_submitter(card);
+    if let Some(why) = result {
+        return TestResult::Fail(why);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_cs",
+    smoke_amdgpu_cs_submits_through_a_card_submitter
+);
+
 /// The GFX11 queue descriptor, field by field against `gfx_v11_0_gfx_mqd_init`.
 ///
 /// Every index was generated by compiling `v11_structs.h` on the build host
