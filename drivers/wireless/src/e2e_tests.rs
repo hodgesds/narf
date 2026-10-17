@@ -153,11 +153,13 @@ fn smoke_e2e_mt7921_mcu_init_sequence_layout() -> TestResult {
     if seq[0] != 0 {
         return TestResult::Fail("PM_STATE_CTRL pm_state should be ACTIVE");
     }
-    // UNI DEV_INFO_UPDATE: own MAC starts at PM + RA + UNI hdr (4) +
-    // ACTIVE TLV hdr (4) + active(1) + link_idx(1) = +10 inside the UNI body.
+    // UNI DEV_INFO_UPDATE (Linux mt76_connac_mcu_uni_add_dev dev_req):
+    // hdr { omac_idx, band_idx, pad[2] } then the DEV_INFO_ACTIVE TLV
+    // { tag: u16, len: u16, active, link_idx, omac_addr[6] } — own MAC
+    // at +10 inside the UNI body.
     let uni_off = PM_STATE_CTRL_SIZE + INIT_RA_CFG_SIZE;
-    let mac_off = uni_off + 10;
-    if seq[mac_off..mac_off + 6] != cfg.own_mac {
+    let mac_off = uni_off + 4 /*hdr*/ + 4 /*TLV tag+len*/ + 2 /*active, link_idx*/;
+    if seq.get(mac_off..mac_off + 6) != Some(&cfg.own_mac[..]) {
         return TestResult::Fail("UNI DEV_INFO_UPDATE didn't carry own_mac");
     }
     TestResult::Pass
