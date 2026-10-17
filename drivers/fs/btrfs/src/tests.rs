@@ -10774,7 +10774,7 @@ fn smoke_btrfs_block_group_tree_read() -> TestResult {
         Some(Ok(crate::allocator::Allocator::Reclaim { ranges })) => {
             if ranges
                 .iter()
-                .any(|&(r, _)| sys.iter().any(|&(s, l)| r >= s && r < s + l))
+                .any(|&(r, _, _)| sys.iter().any(|&(s, l)| r >= s && r < s + l))
             {
                 return TestResult::Fail("allocator offered system block group space");
             }
@@ -10869,10 +10869,19 @@ fn smoke_btrfs_rw_gate_superblock_refusals() -> TestResult {
             Some(Refusal::FreeSpaceTreeInvalid),
         ),
         (
-            "no free-space tree",
+            "no free-space tree on non-mixed block groups",
             |sb, _| sb.compat_ro_flags = 0,
-            None,
             Some(Refusal::NoFreeSpaceTree),
+            Some(Refusal::NoFreeSpaceTree),
+        ),
+        (
+            "no free-space tree, mixed block groups",
+            |sb, _| {
+                sb.compat_ro_flags = 0;
+                sb.incompat_flags |= format::INCOMPAT_MIXED_GROUPS;
+            },
+            None,
+            Some(Refusal::Incompat(format::INCOMPAT_MIXED_GROUPS)),
         ),
         (
             "pending log tree",
@@ -11303,3 +11312,129 @@ fn smoke_btrfs_small_appends_read_back() -> TestResult {
     }
 }
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_small_appends_read_back);
+
+/// On a non-mixed volume (every real install), data extents land only in
+/// DATA block groups and tree blocks only in METADATA ones — what `btrfs
+/// check` reports as "type mismatch with chunk" otherwise.
+fn smoke_btrfs_allocations_respect_block_group_type() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let dev = writable_sparse(FIXTURE_LAPTOP_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("laptop fixture failed to mount writable"),
+    };
+    for i in 0..24u32 {
+        let name = alloc::format!("typed-{i:02}");
+        let Some(Ok(file)) = poll_once(vol.root().create(&name)) else {
+            return TestResult::Fail("create failed");
+        };
+        let body = crate::interop::pattern(i, 20_000 + i as usize * 1000);
+        if !matches!(poll_once(file.write(0, &body)), Some(Ok(_))) {
+            return TestResult::Fail("write failed");
+        }
+    }
+    let _ = poll_once(vol.sync_to_disk());
+    drop(vol);
+    let vol = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount failed"),
+    };
+    let (root_tree, _) = vol.root_tree_root();
+    let Some(Ok((ext, _))) = poll_once(crate::roots::find_root(
+        &*vol,
+        root_tree,
+        format::EXTENT_TREE_OBJECTID,
+    )) else {
+        return TestResult::Fail("extent tree root missing");
+    };
+    let bg_tree = match poll_once(crate::block_group::bg_home(&*vol, root_tree)) {
+        Some(Ok(home)) => home.scan_root(ext),
+        _ => return TestResult::Fail("block group home"),
+    };
+    let Some(Ok(groups)) = poll_once(crate::block_group::read_block_groups(&*vol, bg_tree)) else {
+        return TestResult::Fail("block groups unreadable");
+    };
+    let flags_at = |addr: u64| {
+        groups
+            .iter()
+            .find(|(s, l, _)| addr >= *s && addr < s + l)
+            .and_then(|(_, _, b)| format::le64(b, 16).ok())
+    };
+    let Some(Ok(mut cursor)) = poll_once(btree::Cursor::seek(&*vol, ext, &BtrfsKey::new(0, 0, 0)))
+    else {
+        return TestResult::Fail("extent tree unreadable");
+    };
+    let (mut data, mut meta) = (0usize, 0usize);
+    loop {
+        let (key, body) = match cursor.current() {
+            Ok(Some((k, b))) => (k, b.to_vec()),
+            Ok(None) => break,
+            Err(_) => return TestResult::Fail("extent tree walk"),
+        };
+        // EXTENT_ITEM flags@16: DATA = 1, TREE_BLOCK = 2.
+        let tree_block = match key.item_type {
+            format::METADATA_ITEM_KEY => Some(true),
+            format::EXTENT_ITEM_KEY => Some(format::le64(&body, 16).unwrap_or(0) & 2 != 0),
+            _ => None,
+        };
+        if let Some(tree_block) = tree_block {
+            let Some(flags) = flags_at(key.objectid) else {
+                return TestResult::Fail("an extent lies outside every block group");
+            };
+            // Chunk-tree blocks legitimately live in the SYSTEM group.
+            let want = if tree_block {
+                meta += 1;
+                format::BLOCK_GROUP_METADATA | format::BLOCK_GROUP_SYSTEM
+            } else {
+                data += 1;
+                format::BLOCK_GROUP_DATA
+            };
+            if flags & want == 0 {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  typed-alloc: {key:?} tree_block={tree_block} in block group flags {flags:#x}"
+                );
+                return TestResult::Fail("an extent was placed in a block group of the wrong type");
+            }
+        }
+        if poll_once(cursor.advance()).is_none_or(|r| r.is_err()) {
+            return TestResult::Fail("extent tree advance");
+        }
+    }
+    if data < 24 || meta == 0 {
+        return TestResult::Fail("the walk did not see the new extents");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_allocations_respect_block_group_type
+);
+
+/// The host CachyOS root's exact feature set (BLOCK_GROUP_TREE) is refused
+/// read-write — by name, on the console — until the writer maintains the
+/// block-group tree; nothing is written.
+fn smoke_btrfs_rw_gate_names_block_group_tree() -> TestResult {
+    crate::rw_gate::__reset_writers_for_test();
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    if mount_writable(dev.clone()).is_ok() {
+        if crate::rw_gate::WRITER_COMPAT_RO & crate::rw_gate::COMPAT_RO_BLOCK_GROUP_TREE != 0 {
+            return TestResult::Pass; // the writer maintains BGT now
+        }
+        return TestResult::Fail("a BLOCK_GROUP_TREE volume mounted read-write");
+    }
+    if !dev.overlay.lock().is_empty() {
+        return TestResult::Fail("the refused mount wrote to the device");
+    }
+    match crate::rw_gate::last_refusal() {
+        Some(msg) if msg.contains("BLOCK_GROUP_TREE") && msg.contains("REFUSING") => {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("the refusal must name BLOCK_GROUP_TREE"),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_rw_gate_names_block_group_tree
+);

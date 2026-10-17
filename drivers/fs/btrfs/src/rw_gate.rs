@@ -132,7 +132,9 @@ pub enum Refusal {
     /// A free-space tree without its valid bit, or a block-group tree
     /// without a free-space tree: Linux rebuilds/refuses; NARF cannot.
     FreeSpaceTreeInvalid,
-    /// `root-rw` requires a valid free-space tree (`space_cache=v2`).
+    /// No free-space tree: required under `root-rw`, and on any volume whose
+    /// block groups are not mixed (the fallback allocator cannot keep data
+    /// and metadata apart there).
     NoFreeSpaceTree,
     /// A non-empty fsync log tree that Linux would replay first.
     LogTree(u64),
@@ -194,9 +196,9 @@ impl fmt::Display for Refusal {
             Refusal::FreeSpaceTreeInvalid => f.write_str(
                 "free-space tree not marked valid (or block-group tree without free-space tree)",
             ),
-            Refusal::NoFreeSpaceTree => {
-                f.write_str("no valid free-space tree (space_cache=v2 required)")
-            }
+            Refusal::NoFreeSpaceTree => f.write_str(
+                "no free-space tree (space_cache=v2 required unless every block group is mixed)",
+            ),
             Refusal::LogTree(at) => write!(
                 f,
                 "non-empty fsync log tree at {at:#x} (needs Linux log replay; mount it once on Linux)"
@@ -325,6 +327,12 @@ pub fn check_superblock(
     if fst != fst_valid || (bgt && !fst) {
         return Err(Refusal::FreeSpaceTreeInvalid);
     }
+    // Without a free-space tree the allocator only appends past the extent
+    // tree's high-water mark, which keeps data and tree blocks in their own
+    // block groups only when every group is mixed.
+    if !fst && sb.incompat_flags & format::INCOMPAT_MIXED_GROUPS == 0 {
+        return Err(Refusal::NoFreeSpaceTree);
+    }
     if profile == Profile::RootRw {
         if sb.compat_ro_flags & ROOT_RW_REQUIRED_COMPAT_RO != ROOT_RW_REQUIRED_COMPAT_RO {
             return Err(Refusal::NoFreeSpaceTree);
@@ -445,11 +453,26 @@ pub fn last_refusal() -> Option<String> {
     LAST_REFUSAL.lock().clone()
 }
 
-/// Log a refusal and remember it.
+/// Log a refusal (the volume is mounted read-only instead) and remember it.
 pub(crate) fn report(fsid: &[u8; 16], profile: Profile, why: &Refusal) {
+    report_with(fsid, profile, why, "mounting READ-ONLY");
+}
+
+/// Log a refusal of a read-write mount request that fails outright (Linux's
+/// `btrfs_check_features` -EINVAL for an unwritable compat_ro feature; the
+/// caller may retry read-only) and remember it.
+pub(crate) fn report_refused_mount(fsid: &[u8; 16], profile: Profile, why: &Refusal) {
+    report_with(
+        fsid,
+        profile,
+        why,
+        "the read-write mount fails (read-only is allowed)",
+    );
+}
+
+fn report_with(fsid: &[u8; 16], profile: Profile, why: &Refusal, outcome: &str) {
     let fsid = narf_block::partition::format_uuid_bytes(fsid);
-    let mut line =
-        alloc::format!("btrfs {fsid}: REFUSING read-write mount: {why}; mounting READ-ONLY");
+    let mut line = alloc::format!("btrfs {fsid}: REFUSING read-write mount: {why}; {outcome}");
     if profile == Profile::RootRw {
         let (incompat, compat_ro) = supported_features(profile);
         let _ = write!(

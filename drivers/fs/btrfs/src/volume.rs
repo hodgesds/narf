@@ -1278,6 +1278,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // by `Superblock::decode`. A compat_ro bit the writer does not maintain
         // permits a read-only mount and refuses a read-write one.
         if !read_only && superblock.compat_ro_unwritable() != 0 {
+            // Named on the console (and kept for the root-rw failure banner):
+            // the operator must see *which* feature stopped the write mount.
+            crate::rw_gate::report_refused_mount(
+                &superblock.fsid,
+                crate::rw_gate::active_profile(),
+                &crate::rw_gate::Refusal::CompatRo(superblock.compat_ro_unwritable()),
+            );
             return Err(FsError::Unsupported);
         }
         // Linux's artificial dependency: block-group-tree requires no-holes

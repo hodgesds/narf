@@ -434,8 +434,12 @@ fn subvol_ids(part: &Path) -> Result<Vec<(u64, String)>> {
     let mut pending: Option<u64> = None;
     for line in text.lines() {
         let line = line.trim();
-        // item N key (5 ROOT_REF 256) itemoff ... ; then "... name @"
-        if let Some(rest) = line.split_once("key (5 ROOT_REF ").map(|(_, r)| r) {
+        // `item N key (FS_TREE ROOT_REF 256) ...` then `root ref key ... name @`
+        let rest = line
+            .split_once("key (5 ROOT_REF ")
+            .or_else(|| line.split_once("key (FS_TREE ROOT_REF "))
+            .map(|(_, r)| r);
+        if let Some(rest) = rest {
             pending = rest.split(')').next().and_then(|n| n.trim().parse().ok());
         } else if let (Some(id), Some(name)) = (pending, line.split_once("name ").map(|(_, n)| n)) {
             out.push((id, name.trim().to_string()));
