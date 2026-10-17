@@ -2618,16 +2618,19 @@ fn nvme_image_path() -> PathBuf {
 /// probe it as `nvme1` and check data integrity, distinct identity and
 /// per-controller teardown against two real controllers. Interactive and
 /// distro runs keep a single NVMe disk.
+///
+/// `NARF_NVME2_IMG` attaches the named image as that second controller on any
+/// run (`cachyos-root-smoke` puts the root there, behind a decoy on the
+/// first, like the host's two NVMe disks).
 fn second_nvme_qemu_args() -> Vec<String> {
-    if !KERNEL_TEST_DISK.load(std::sync::atomic::Ordering::Relaxed) {
-        return Vec::new();
-    }
+    let path = match std::env::var_os("NARF_NVME2_IMG") {
+        Some(path) => PathBuf::from(path),
+        None if KERNEL_TEST_DISK.load(std::sync::atomic::Ordering::Relaxed) => nvme2_image_path(),
+        None => return Vec::new(),
+    };
     vec![
         "-drive".into(),
-        format!(
-            "if=none,id=nvm1,format=raw,file={}",
-            nvme2_image_path().display()
-        ),
+        format!("if=none,id=nvm1,format=raw,file={}", path.display()),
         "-device".into(),
         "nvme,drive=nvm1,serial=narf2".into(),
     ]
