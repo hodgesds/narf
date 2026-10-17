@@ -67,53 +67,53 @@ use super::htt::{self, HttT2h, HttTarget, RxRingTlvFilter};
 use super::hw::{rbm, HwHalParams, HwParams, HwRev, RingMask, HW_HAL_PARAMS_QCA6390};
 use super::power::ChipIo;
 
-// ── diag steps (DP 110–134, 142–149; HTT 135–141 in `htt::step`) ──
+// ── diag steps (DP 200–216; HTT 220–225 in `htt::step`) ──
 
 pub mod step {
     /// `ath11k_hal_srng_setup` failed under `ath11k_dp_srng_setup`
     /// (detail = ring type << 24 | ring_num << 16 | HAL step).
-    pub const SRNG_SETUP: u32 = 110;
+    pub const SRNG_SETUP: u32 = 200;
     /// Ring memory allocation failed (detail = ring type << 24 | bytes
     /// >> 8, truncated).
-    pub const RING_ALLOC: u32 = 111;
+    pub const RING_ALLOC: u32 = 201;
     /// More link-descriptor banks than `DP_LINK_DESC_BANKS_MAX` (detail =
     /// banks).
-    pub const LINK_DESC_BANKS: u32 = 112;
+    pub const LINK_DESC_BANKS: u32 = 202;
     /// Link-descriptor bank allocation failed (detail = bank).
-    pub const LINK_DESC_ALLOC: u32 = 113;
+    pub const LINK_DESC_ALLOC: u32 = 203;
     /// The idle list needs the scatter-buffer path (not ported; detail =
     /// idle-list bytes).
-    pub const SCATTER_UNSUPPORTED: u32 = 114;
+    pub const SCATTER_UNSUPPORTED: u32 = 204;
     /// "Not a valid ring type in dp" (detail = ring type).
-    pub const BAD_RING_TYPE: u32 = 115;
+    pub const BAD_RING_TYPE: u32 = 205;
     /// `pdev_alloc` / `pdev_reo_setup` called twice (detail = which).
-    pub const ALREADY_SET_UP: u32 = 116;
+    pub const ALREADY_SET_UP: u32 = 206;
     /// A data-path call on a ring that is not set up (detail = which).
-    pub const NOT_SET_UP: u32 = 117;
+    pub const NOT_SET_UP: u32 = 207;
     /// `ath11k_dp_tx`: no free TX descriptor id (`-ENOSPC`; detail =
     /// ring).
-    pub const TX_IDR_FULL: u32 = 118;
+    pub const TX_IDR_FULL: u32 = 208;
     /// `ath11k_dp_tx`: TCL ring full (`-ENOMEM`, `desc_na`; detail =
     /// ring).
-    pub const TX_RING_FULL: u32 = 119;
+    pub const TX_RING_FULL: u32 = 209;
     /// `ath11k_dp_tx`: not a data frame without HW 802.11 encap
     /// (`-EOPNOTSUPP`; detail = frame control).
-    pub const TX_NOT_DATA: u32 = 120;
+    pub const TX_NOT_DATA: u32 = 210;
     /// `ath11k_dp_tx`: raw / 802.3 encap (`-EINVAL`; detail = encap).
-    pub const TX_BAD_ENCAP: u32 = 121;
+    pub const TX_BAD_ENCAP: u32 = 211;
     /// `ath11k_dp_tx` after a crash flush (`-ESHUTDOWN`).
-    pub const TX_SHUTDOWN: u32 = 122;
+    pub const TX_SHUTDOWN: u32 = 212;
     /// TX bounce buffer allocation failed (`-ENOMEM`; detail = len).
-    pub const TX_DMA: u32 = 123;
+    pub const TX_DMA: u32 = 213;
     /// NARF-stricter: frame shorter than its 802.11 header, or longer
     /// than `HAL_TCL_DATA_CMD_INFO1_DATA_LEN` (detail = len).
-    pub const TX_FRAME_LEN: u32 = 124;
+    pub const TX_FRAME_LEN: u32 = 214;
     /// Link descriptor address outside every bank (NARF-stricter;
     /// detail = bank).
-    pub const LINK_DESC_LOOKUP: u32 = 142;
+    pub const LINK_DESC_LOOKUP: u32 = 215;
     /// `ath11k_dp_rx_link_desc_return`: SW2WBM release ring full
     /// (`-ENOBUFS`).
-    pub const LINK_DESC_RETURN: u32 = 143;
+    pub const LINK_DESC_RETURN: u32 = 216;
 }
 
 /// Linux `-EOPNOTSUPP`.

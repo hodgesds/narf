@@ -467,6 +467,213 @@ fn smoke_ath11k_msi_user_assignment() -> TestResult {
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_msi_user_assignment);
 
+// ── Failure-step codes: one namespace across every layer ───────────
+
+fn smoke_ath11k_step_codes_unique_and_in_range() -> TestResult {
+    // The framebuffer panel shows only `wifi: <stage> FAILED step=N`,
+    // so a code shared by two layers makes a bare-metal failure
+    // ambiguous. Each layer owns a disjoint range (mac reserves
+    // 150–199); every constant must be unique and inside its range.
+    // Add new `step` constants here.
+    let layers: &[(&str, u32, u32, &[u32])] = &[
+        (
+            "pci",
+            1,
+            9,
+            &[
+                super::pci::step::BAR0_MAP,
+                super::pci::step::LINK_DOWN,
+                super::pci::step::UNSUPPORTED_SOC,
+                super::pci::step::NO_HW_PARAMS,
+                super::pci::step::MSI_UNAVAILABLE,
+            ],
+        ),
+        (
+            "mhi_host",
+            10,
+            39,
+            &[
+                super::mhi_host::step::NO_DMA_MEMORY,
+                super::mhi_host::step::BHI_OFFSET_RANGE,
+                super::mhi_host::step::BHIE_OFFSET_RANGE,
+                super::mhi_host::step::POWER_UP_BAD_EE,
+                super::mhi_host::step::SYSERR_RESET_TIMEOUT,
+                super::mhi_host::step::NO_FIRMWARE_IMAGE,
+                super::mhi_host::step::BHI_ERROR,
+                super::mhi_host::step::BHI_TIMEOUT,
+                super::mhi_host::step::BHIE_ERROR,
+                super::mhi_host::step::BHIE_TIMEOUT,
+                super::mhi_host::step::MHI_RESET_TIMEOUT,
+                super::mhi_host::step::READY_TIMEOUT,
+                super::mhi_host::step::CHDB_RANGE,
+                super::mhi_host::step::ERDB_RANGE,
+                super::mhi_host::step::SYS_ERR,
+                super::mhi_host::step::MISSION_BAD_EE,
+                super::mhi_host::step::M0_TIMEOUT,
+                super::mhi_host::step::POWER_UP_TIMEOUT,
+                super::mhi_host::step::CHAN_START,
+                super::mhi_host::step::CHAN_WRONG_EE,
+                super::mhi_host::step::FW_NOT_FOUND,
+                super::mhi_host::step::PM_TRANSITION,
+                super::mhi_host::step::EVENT_RING_RP,
+                super::mhi_host::step::DL_QUEUE,
+                super::mhi_host::step::BAD_CONFIG,
+                super::mhi_host::step::REG_ACCESS,
+            ],
+        ),
+        (
+            "wlfw",
+            40,
+            79,
+            &[
+                super::wlfw::step::NO_FW_AUTHORITY,
+                super::wlfw::step::SERVER_TIMEOUT,
+                super::wlfw::step::SERVER_EXIT,
+                super::wlfw::step::IND_REGISTER,
+                super::wlfw::step::HOST_CAP,
+                super::wlfw::step::MEM_REQUEST_TIMEOUT,
+                super::wlfw::step::TARGET_MEM_ALLOC,
+                super::wlfw::step::RESPOND_MEM,
+                super::wlfw::step::MEM_READY_TIMEOUT,
+                super::wlfw::step::TARGET_CAP,
+                super::wlfw::step::BDF_FETCH,
+                super::wlfw::step::BDF_DOWNLOAD,
+                super::wlfw::step::CALDATA_FETCH,
+                super::wlfw::step::CALDATA_DOWNLOAD,
+                super::wlfw::step::M3_LOAD,
+                super::wlfw::step::M3_ALLOC,
+                super::wlfw::step::M3_INFO,
+                super::wlfw::step::FW_READY_TIMEOUT,
+                super::wlfw::step::WLAN_INI,
+                super::wlfw::step::WLAN_CFG,
+                super::wlfw::step::WLAN_MODE,
+                super::wlfw::step::COLDBOOT_MODE,
+                super::wlfw::step::FW_RESTART,
+                super::wlfw::step::UNSUPPORTED,
+            ],
+        ),
+        (
+            "hal",
+            80,
+            89,
+            &[
+                super::hal::step::NO_DMA_MEMORY,
+                super::hal::step::BAD_RING_NUM,
+                super::hal::step::RING_ID_RANGE,
+                super::hal::step::SHADOW_FULL,
+                super::hal::step::NO_SHADOW_REG,
+                super::hal::step::BAD_RING_SIZE,
+                super::hal::step::NO_REGS,
+                super::hal::step::RING_MEM_SIZE,
+                super::hal::step::RING_IN_USE,
+            ],
+        ),
+        (
+            "ce",
+            90,
+            119,
+            &[
+                super::ce::step::ALLOC_SRC_RING,
+                super::ce::step::ALLOC_DST_RING,
+                super::ce::step::ALLOC_STATUS_RING,
+                super::ce::step::ALLOC_TX_BUF,
+                super::ce::step::ALLOC_RX_BUF,
+                super::ce::step::INIT_RING,
+                super::ce::step::BAD_PIPE,
+                super::ce::step::OVERSIZE,
+                super::ce::step::RING_FULL,
+                super::ce::step::SHUTDOWN,
+                super::ce::step::RX_BAD_LEN,
+                super::ce::step::RX_POST,
+            ],
+        ),
+        (
+            "core",
+            120,
+            149,
+            &[
+                super::core::step::UNSUPPORTED,
+                super::core::step::NO_DEVICE,
+                super::core::step::HTC_INIT,
+                super::core::step::HTC_READY_TIMEOUT,
+                super::core::step::HTC_BAD_READY,
+                super::core::step::HTT_CONNECT,
+                super::core::step::HTT_CONNECT_TIMEOUT,
+                super::core::step::WMI_CONNECT,
+                super::core::step::WMI_CONNECT_TIMEOUT,
+                super::core::step::HTC_START,
+                super::core::step::SERVICE_READY_TIMEOUT,
+                super::core::step::SERVICE_READY_DECODE,
+                super::core::step::WMI_INIT,
+                super::core::step::WMI_SEND_CREDITS,
+                super::core::step::WMI_SEND,
+                super::core::step::READY_TIMEOUT,
+                super::core::step::READY_DECODE,
+                super::core::step::NO_WMI_EP,
+                super::core::step::EVENT_TIMEOUT,
+                super::core::step::HTT_SEND,
+            ],
+        ),
+        (
+            "dp_ring",
+            200,
+            219,
+            &[
+                super::dp_ring::step::SRNG_SETUP,
+                super::dp_ring::step::RING_ALLOC,
+                super::dp_ring::step::LINK_DESC_BANKS,
+                super::dp_ring::step::LINK_DESC_ALLOC,
+                super::dp_ring::step::SCATTER_UNSUPPORTED,
+                super::dp_ring::step::BAD_RING_TYPE,
+                super::dp_ring::step::ALREADY_SET_UP,
+                super::dp_ring::step::NOT_SET_UP,
+                super::dp_ring::step::TX_IDR_FULL,
+                super::dp_ring::step::TX_RING_FULL,
+                super::dp_ring::step::TX_NOT_DATA,
+                super::dp_ring::step::TX_BAD_ENCAP,
+                super::dp_ring::step::TX_SHUTDOWN,
+                super::dp_ring::step::TX_DMA,
+                super::dp_ring::step::TX_FRAME_LEN,
+                super::dp_ring::step::LINK_DESC_LOOKUP,
+                super::dp_ring::step::LINK_DESC_RETURN,
+            ],
+        ),
+        (
+            "htt",
+            220,
+            229,
+            &[
+                super::htt::step::RING_TYPE,
+                super::htt::step::RING_ID,
+                super::htt::step::NO_RING,
+                super::htt::step::T2H_TRUNCATED,
+                super::htt::step::VERSION,
+                super::htt::step::VERSION_TIMEOUT,
+            ],
+        ),
+    ];
+    let mut seen: Vec<u32> = Vec::new();
+    for &(_name, lo, hi, codes) in layers {
+        for &c in codes {
+            if c < lo || c > hi {
+                return TestResult::Fail("ath11k step code outside its layer's range");
+            }
+            if seen.contains(&c) {
+                return TestResult::Fail("ath11k step code used by two constants");
+            }
+            seen.push(c);
+        }
+    }
+    if seen.contains(&0) {
+        return TestResult::Fail("step 0 means no failure and must not be a code");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_step_codes_unique_and_in_range
+);
+
 // Suppress the unused-import warning when the `Vec` import isn't
 // used by any helper above (compiler can't tell from the macro
 // expansion).

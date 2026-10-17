@@ -44,25 +44,25 @@ use super::hal::{
     HAL_ADDR_LSB_REG_MASK, HAL_ADDR_MSB_REG_SHIFT, HAL_SRNG_RINGS_PER_LMAC,
 };
 
-// ── diag steps (HTT 135–141; DP rings use 110–134, 142–149) ───────
+// ── diag steps (HTT 220–225; DP rings use 200–216) ───────
 
 pub mod step {
     /// `ath11k_dp_tx_get_ring_id_type`: ring type the DP never
     /// configures over HTT (detail = ring type).
-    pub const RING_TYPE: u32 = 135;
+    pub const RING_TYPE: u32 = 220;
     /// RXDMA_BUF ring id outside the pdev's two buffer rings (only
     /// without `rx_mac_buf_ring`; detail = ring id).
-    pub const RING_ID: u32 = 136;
+    pub const RING_ID: u32 = 221;
     /// The ring id names no set-up HAL ring (detail = ring id).
-    pub const NO_RING: u32 = 137;
+    pub const NO_RING: u32 = 222;
     /// T2H message shorter than its type needs (detail = type << 16 |
     /// len).
-    pub const T2H_TRUNCATED: u32 = 138;
+    pub const T2H_TRUNCATED: u32 = 223;
     /// VERSION_CONF major is not `HTT_TARGET_VERSION_MAJOR` (detail =
     /// major << 8 | minor).
-    pub const VERSION: u32 = 140;
+    pub const VERSION: u32 = 224;
     /// No VERSION_CONF within `HTT_TARGET_VERSION_TIMEOUT_MS`.
-    pub const VERSION_TIMEOUT: u32 = 141;
+    pub const VERSION_TIMEOUT: u32 = 225;
 }
 
 /// Linux `-ETIMEDOUT`, `-EOPNOTSUPP`.
