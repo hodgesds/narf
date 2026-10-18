@@ -1719,10 +1719,8 @@ async fn commit_batch_inner<B: BlockDevice + 'static>(
 /// the staged-superblock quota calls `sync_to_disk`, which comes straight back
 /// here. Releasing first also lets a concurrent operation open the next batch
 /// instead of blocking behind this one's I/O.
-pub(crate) async fn flush_batch<B: BlockDevice + 'static>(
-    vol: &BtrfsVolume<B>,
-) -> Result<(), FsError> {
-    flush_batch_from(vol, FlushOrigin::Elsewhere).await
+pub(crate) fn flush_batch<'a, B: BlockDevice + 'static>(vol: &'a BtrfsVolume<B>) -> BoxFut<'a, ()> {
+    Box::pin(flush_batch_from(vol, FlushOrigin::Elsewhere))
 }
 
 async fn flush_batch_from<B: BlockDevice + 'static>(
@@ -4955,7 +4953,29 @@ pub(crate) async fn quota_status<B: BlockDevice + 'static>(
 /// block set and the free-space leaf count stop changing. Only the converged
 /// round is written. Fixed set of block groups (no chunk allocation here — the
 /// caller grows and retries on `NoSpace`).
-async fn commit_txn<B: BlockDevice + 'static>(
+/// A boxed future: keeps the large commit/flush state machines off the
+/// polling task's stack.
+///
+/// A caller that awaits an `async fn` inline reserves room for the callee's
+/// whole state machine in its own poll frame, and every level of a nested
+/// chain (a mount's `switch_to_subvol` flushing a batch that commits, say)
+/// reserves its own — several 9 KiB futures deep is past a 32 KiB kernel
+/// task stack. Returning the big ones boxed leaves each caller holding a
+/// pointer; the state machine is built inside the short-lived wrapper frame
+/// and moved to the heap.
+pub(crate) type BoxFut<'a, T> =
+    core::pin::Pin<Box<dyn core::future::Future<Output = Result<T, FsError>> + Send + 'a>>;
+
+fn commit_txn<'a, B: BlockDevice + 'static>(
+    vol: &'a BtrfsVolume<B>,
+    gen: u64,
+    alloc: Allocator,
+    txn: Txn,
+) -> BoxFut<'a, ()> {
+    Box::pin(commit_txn_inner(vol, gen, alloc, txn))
+}
+
+async fn commit_txn_inner<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     gen: u64,
     mut alloc: Allocator,

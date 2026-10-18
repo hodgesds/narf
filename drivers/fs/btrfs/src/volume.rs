@@ -2195,9 +2195,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.flush().await
     }
 
-    pub async fn sync_to_disk(&self) -> Result<(), FsError> {
-        crate::write::flush_batch(self).await?;
-        self.write_staged_super().await
+    pub fn sync_to_disk(&self) -> crate::write::BoxFut<'_, ()> {
+        alloc::boxed::Box::pin(async move {
+            crate::write::flush_batch(self).await?;
+            self.write_staged_super().await
+        })
     }
 
     /// Push the staged superblock, if any, through to the device — the second
