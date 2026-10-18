@@ -675,6 +675,7 @@ fn write_boots(args: &Args, kernel: &Path, image: &Path, work: &Path, label: &st
             .collect::<Vec<_>>(),
         &["narf-sizes/after-ro"],
     )?;
+    check_attrs(&part, &ids)?;
     for subvol in ["@", "@home", "@root", "@srv", "@cache", "@tmp", "@log"] {
         restore_and_compare(
             &part,
@@ -713,7 +714,50 @@ fn files_expected() -> Vec<(&'static str, Vec<u8>)> {
         ("punch.bin", punch),
         ("zero.bin", zero),
         ("after-rw.txt", b"rw again\n".to_vec()),
+        ("attrs.txt", b"attrs\n".to_vec()),
     ]
+}
+
+/// The `files` mode's chmod/chown/utimensat, read back from the on-disk
+/// INODE_ITEM with `btrfs inspect-internal dump-tree` (`btrfs restore`
+/// cannot restore owners unprivileged). Must equal `interop::ATTRS`.
+fn check_attrs(part: &Path, ids: &[(u64, String)]) -> Result<()> {
+    let id = ids
+        .iter()
+        .find(|(_, n)| n == "@")
+        .map(|(id, _)| *id)
+        .ok_or_else(|| anyhow!("@ not found"))?;
+    let text = run(
+        Command::new("btrfs")
+            .args(["inspect-internal", "dump-tree", "-t", &id.to_string()])
+            .arg(part),
+        "btrfs dump-tree @",
+    )?;
+    let lines: Vec<&str> = text.lines().collect();
+    let ino = lines
+        .windows(2)
+        .find(|w| w[0].contains("INODE_REF") && w[1].trim().ends_with("name: attrs.txt"))
+        .and_then(|w| w[0].split("key (").nth(1))
+        .and_then(|k| k.split_whitespace().next())
+        .ok_or_else(|| anyhow!("attrs.txt INODE_REF not found"))?
+        .to_string();
+    let at = lines
+        .iter()
+        .position(|l| l.contains(&format!("key ({ino} INODE_ITEM 0) itemoff")))
+        .ok_or_else(|| anyhow!("attrs.txt INODE_ITEM not found"))?;
+    let block = lines[at..(at + 8).min(lines.len())].join("\n");
+    for want in [
+        "mode 100640 ",
+        "uid 1000 gid 1000",
+        "atime 1700000000.123456789",
+        "mtime 1600000000.987654321",
+    ] {
+        if !block.contains(want) {
+            bail!("btrfs-rootrw-interop: attrs.txt inode lacks `{want}`:\n{block}");
+        }
+    }
+    println!("btrfs-rootrw-interop: chmod/chown/utimensat on disk match (inode {ino})");
+    Ok(())
 }
 
 /// A 64 MiB MBR stick with one FAT32 partition carrying `/NARFLOG.ID`.

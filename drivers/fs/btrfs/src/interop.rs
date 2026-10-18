@@ -393,8 +393,19 @@ pub fn files_expected() -> Vec<(&'static str, Vec<u8>)> {
         ("punch.bin", punch),
         ("zero.bin", zero),
         ("after-rw.txt", b"rw again\n".to_vec()),
+        ("attrs.txt", b"attrs\n".to_vec()),
     ]
 }
+
+/// What `files` sets on `narf-sizes/attrs.txt` (chmod, chown, utimensat):
+/// `(mode, uid, gid, atime_ns, mtime_ns)`.
+pub const ATTRS: (u32, u32, u32, u64, u64) = (
+    0o100640,
+    1000,
+    1000,
+    1_700_000_000_123_456_789,
+    1_600_000_000_987_654_321,
+);
 
 /// `files` mode (`@`): the size and allocation calls pacman, journald,
 /// editors and systemd make: `O_TRUNC` rewrite, `ftruncate` shrink and grow,
@@ -483,6 +494,24 @@ async fn run_files(
         return Err("COLLAPSE_RANGE was not refused");
     }
     root.syncfs().await.map_err(|_| "syncfs")?;
+    // systemd-sysusers / ldconfig / update-done: chmod, chown, utimensat.
+    let a = dir
+        .create("attrs.txt")
+        .await
+        .map_err(|_| "create attrs.txt")?;
+    write_all(&a, 0, b"attrs\n")
+        .await
+        .map_err(|_| "write attrs.txt")?;
+    let (mode, uid, gid, atime, mtime) = ATTRS;
+    a.set_perms((mode & 0o7777) as u16)
+        .await
+        .map_err(|_| "chmod")?;
+    a.set_owners(uid, gid).await.map_err(|_| "chown")?;
+    a.set_times(Some(atime), Some(mtime))
+        .map_err(|_| "utimensat")?;
+    if a.owners() != (uid, gid) || u32::from(a.stat().mode.perms) != mode & 0o777 {
+        return Err("chmod/chown not visible through stat");
+    }
     // systemd-shutdown: remount / read-only; nothing may write; then rw.
     use narf_filesystem::sb_flags::RDONLY;
     fs.reconfigure_sb(RDONLY, RDONLY, "")

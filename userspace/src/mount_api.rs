@@ -385,7 +385,10 @@ pub(crate) fn reconfigure_super(
     // devpts remount with no options resets every option to its default
     // (`devpts_reconfigure`). A filesystem with no reconfigure op ignores an
     // empty parameter list; given parameters it rejects them.
-    match fs.reconfigure_sb(sb_flags, sb_mask, fs_options) {
+    let outcome =
+        crate::handlers::poll_blocking(fs.reconfigure_sb_async(sb_flags, sb_mask, fs_options))
+            .unwrap_or(Err(FsError::Busy));
+    match outcome {
         Ok(()) => {}
         Err(FsError::Unsupported) if fs_options.is_empty() => {}
         Err(FsError::NoSpace) => return Err(ENOSPC),

@@ -75,6 +75,9 @@ const FIXTURE_LAPTOP_SPARSE: &[u8] = include_bytes!("../testdata/fixture-laptop.
 /// with the `@`, `@home`, `@root`, `@srv`, `@cache`, `@tmp`, `@log` subvolumes.
 const FIXTURE_BGT_SPARSE: &[u8] = include_bytes!("../testdata/fixture-bgt.img.sparse");
 
+/// 4 KiB nodes; the `@` fs tree is three levels deep (root at level 2).
+const FIXTURE_TALL_SPARSE: &[u8] = include_bytes!("../testdata/fixture-tall.img.sparse");
+
 /// Same small mixed layout as the primary fixture but WITH a free-space tree
 /// (`space_cache=v2`); exercises the write path's free-space-tree maintenance.
 const FIXTURE_FST_SPARSE: &[u8] = include_bytes!("../testdata/fixture-fst.img.sparse");
@@ -12755,3 +12758,698 @@ fn smoke_btrfs_bgt_many_small_files_rw() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_bgt_many_small_files_rw);
+
+/// The many-small-files pattern of `cachyos-root-smoke --rw` against
+/// whatever large btrfs image xtask serves on nvme0
+/// (`XTASK_BTRFS_NVME_IMAGE`, with `narf.btrfs_bigtree` on the command line):
+/// a fresh directory under `@` receives hundreds of files, directories,
+/// writes, renames and unlinks through the VFS, then everything is read back
+/// after a sync. Skipped unless asked for.
+fn smoke_btrfs_bigtree_nvme() -> TestResult {
+    use core::fmt::Write as _;
+    use narf_block::fs_detect::{detect_filesystem, FsType};
+    if !narf_boot::args().has_flag("narf.btrfs_bigtree") {
+        return TestResult::Skip("no large btrfs image (narf.btrfs_bigtree)");
+    }
+    let Some(entry) = narf_block::block_devices()
+        .into_iter()
+        .find(|e| matches!(detect_filesystem(&e.dev), Ok(Some(FsType::Btrfs))))
+    else {
+        return TestResult::Skip("no btrfs block device");
+    };
+    let dev = entry.dev.clone();
+    let vol = match narf_scheduler::block_on(crate::registry::mount(
+        &dev,
+        crate::discover_members(dev.clone()),
+        Some(crate::volume::Subvol::Name("@".into())),
+        false,
+    )) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("large image did not mount @"),
+    };
+    let report = |what: &str, e: FsError| {
+        let _ = writeln!(narf_console::Writer, "bigtree: {what}: {e:?}");
+    };
+    match narf_scheduler::block_on(bigtree_workload(&vol, report)) {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs/bigtree", smoke_btrfs_bigtree_nvme);
+
+/// Hundreds of creates, mkdirs, writes, renames and unlinks in fresh
+/// directories, then a sync and a full read-back.
+async fn bigtree_workload<B: narf_block::BlockDevice + 'static>(
+    vol: &Arc<BtrfsVolume<B>>,
+    report: impl Fn(&str, FsError),
+) -> Result<(), &'static str> {
+    use narf_filesystem::FsInstance;
+    let root = vol.root();
+    let top = root.mkdir("narf-bigtree").await.map_err(|e| {
+        report("mkdir narf-bigtree", e);
+        "mkdir top"
+    })?;
+    let many = top.mkdir("many").await.map_err(|e| {
+        report("mkdir many", e);
+        "mkdir many"
+    })?;
+    for i in 0..400u32 {
+        let name = alloc::format!("f{i}");
+        let f = many.create(&name).await.map_err(|e| {
+            report(&name, e);
+            "create in a fresh directory failed"
+        })?;
+        // `printf ... > f`: open(O_CREAT|O_TRUNC) truncates the new file.
+        f.truncate(0).await.map_err(|e| {
+            report("O_TRUNC", e);
+            "O_TRUNC of a new file failed"
+        })?;
+        let body = alloc::format!("narf {i}\n");
+        f.write(0, body.as_bytes()).await.map_err(|e| {
+            report(&name, e);
+            "small write failed"
+        })?;
+    }
+    for d in 0..40u32 {
+        let dir = top.mkdir(&alloc::format!("d{d}")).await.map_err(|e| {
+            report("mkdir d", e);
+            "mkdir d"
+        })?;
+        for i in 0..10u32 {
+            let f = dir.create(&alloc::format!("g{i}")).await.map_err(|e| {
+                report("create g", e);
+                "create g"
+            })?;
+            let len = 1000 + (d * 10 + i) as usize * 37;
+            f.write(0, &crate::interop::pattern(d * 10 + i, len))
+                .await
+                .map_err(|e| {
+                    report("write g", e);
+                    "write g"
+                })?;
+        }
+    }
+    for i in (0..400u32).step_by(3) {
+        many.rename(&alloc::format!("f{i}"), &alloc::format!("r{i}"))
+            .await
+            .map_err(|e| {
+                report("rename", e);
+                "rename"
+            })?;
+    }
+    for i in (1..400u32).step_by(3) {
+        many.unlink(&alloc::format!("f{i}")).await.map_err(|e| {
+            report("unlink", e);
+            "unlink"
+        })?;
+    }
+    vol.sync_to_disk().await.map_err(|e| {
+        report("sync", e);
+        "sync"
+    })?;
+    for i in 0..400u32 {
+        let name = match i % 3 {
+            0 => alloc::format!("r{i}"),
+            1 => continue,
+            _ => alloc::format!("f{i}"),
+        };
+        let f = many
+            .lookup_async(&name)
+            .await
+            .map_err(|_| "a file is missing after sync")?;
+        let mut buf = [0u8; 32];
+        let n = f.read(0, &mut buf).await.map_err(|_| "read-back")?;
+        if buf[..n] != *alloc::format!("narf {i}\n").as_bytes() {
+            return Err("small file content wrong");
+        }
+    }
+    for d in 0..40u32 {
+        let dir = top
+            .lookup_dir_async(&alloc::format!("d{d}"))
+            .await
+            .map_err(|_| "dir missing")?;
+        for i in 0..10u32 {
+            let f = dir
+                .lookup_async(&alloc::format!("g{i}"))
+                .await
+                .map_err(|_| "g missing")?;
+            let len = 1000 + (d * 10 + i) as usize * 37;
+            let mut buf = alloc::vec![0u8; len + 16];
+            let n = f.read(0, &mut buf).await.map_err(|_| "read g")?;
+            if buf[..n] != crate::interop::pattern(d * 10 + i, len)[..] {
+                return Err("g content wrong");
+            }
+        }
+    }
+    let _ = root;
+    Ok(())
+}
+
+/// Writers racing each other and the commit timer through the VFS of one
+/// filesystem: two tasks create, write, rename and unlink files in the same
+/// directory (and one in a second subvolume) while a third keeps committing
+/// as the transaction kthread would. Every operation must succeed and the
+/// result must read back exactly. On a device with genuinely asynchronous I/O
+/// the futures interleave at every await, which is what exposes an operation
+/// that reads tree state outside the lock under which it stages its edits.
+async fn racing_writers<B: narf_block::BlockDevice + 'static>(
+    vol: &Arc<BtrfsVolume<B>>,
+    other: Option<&Arc<BtrfsVolume<B>>>,
+    tag: &str,
+    report: &dyn Fn(&str, FsError),
+) -> Result<(), &'static str> {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_filesystem::FsInstance;
+    let dir = vol
+        .root()
+        .mkdir(&alloc::format!("race-{tag}"))
+        .await
+        .map_err(|e| {
+            report("mkdir race", e);
+            "mkdir race dir"
+        })?;
+    let done = AtomicU32::new(0);
+    let writer = |prefix: &'static str| {
+        let dir = dir.clone();
+        let done = &done;
+        async move {
+            let r: Result<(), &'static str> = async {
+                for i in 0..120u32 {
+                    let name = alloc::format!("{prefix}{i}");
+                    let f = dir.create(&name).await.map_err(|e| {
+                        report(&name, e);
+                        "racing create failed"
+                    })?;
+                    f.truncate(0).await.map_err(|e| {
+                        report(&name, e);
+                        "racing O_TRUNC failed"
+                    })?;
+                    let body = alloc::format!("{prefix} {i}\n");
+                    f.write(0, body.as_bytes()).await.map_err(|e| {
+                        report(&name, e);
+                        "racing write failed"
+                    })?;
+                    if i % 4 == 3 {
+                        dir.rename(&name, &alloc::format!("{prefix}r{i}"))
+                            .await
+                            .map_err(|e| {
+                                report("rename", e);
+                                "racing rename failed"
+                            })?;
+                    }
+                    if i % 4 == 2 {
+                        dir.unlink(&name).await.map_err(|e| {
+                            report("unlink", e);
+                            "racing unlink failed"
+                        })?;
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            done.fetch_add(1, Ordering::AcqRel);
+            r
+        }
+    };
+    let other_writer = async {
+        if let Some(o) = other {
+            let d = o
+                .root()
+                .mkdir(&alloc::format!("race-{tag}"))
+                .await
+                .map_err(|_| "mkdir in second subvolume")?;
+            for i in 0..60u32 {
+                let f = d
+                    .create(&alloc::format!("o{i}"))
+                    .await
+                    .map_err(|_| "create in second subvolume")?;
+                f.write(0, &crate::interop::pattern(i, 3000))
+                    .await
+                    .map_err(|_| "write in second subvolume")?;
+            }
+        }
+        done.fetch_add(1, Ordering::AcqRel);
+        Ok::<(), &'static str>(())
+    };
+    let committer = async {
+        crate::write::__test_set_commit_interval_cycles(0);
+        while done.load(Ordering::Acquire) < 3 {
+            let _ = crate::write::commit_if_stale(vol).await;
+            narf_scheduler::yield_now().await;
+        }
+        crate::write::__test_set_commit_interval_cycles(u64::MAX);
+    };
+    let ((a, b), (c, ())) = join2(
+        join2(writer("a"), writer("b")),
+        join2(other_writer, committer),
+    )
+    .await;
+    a?;
+    b?;
+    c?;
+    vol.sync_to_disk().await.map_err(|_| "sync")?;
+    for prefix in ["a", "b"] {
+        for i in 0..120u32 {
+            let name = match i % 4 {
+                2 => continue,
+                3 => alloc::format!("{prefix}r{i}"),
+                _ => alloc::format!("{prefix}{i}"),
+            };
+            let f = dir
+                .lookup_async(&name)
+                .await
+                .map_err(|_| "a racing file is missing")?;
+            let mut buf = [0u8; 32];
+            let n = f.read(0, &mut buf).await.map_err(|_| "read")?;
+            if buf[..n] != *alloc::format!("{prefix} {i}\n").as_bytes() {
+                return Err("racing file content wrong");
+            }
+        }
+    }
+    let names = dir.enumerate_async(0, 1000).await.map_err(|_| "readdir")?;
+    if names.len() != 180 {
+        return Err("racing directory has the wrong number of entries");
+    }
+    Ok(())
+}
+
+/// [`racing_writers`] on xtask's NVMe btrfs disk (real asynchronous I/O).
+fn smoke_btrfs_racing_writers_nvme() -> TestResult {
+    use core::fmt::Write as _;
+    use narf_block::fs_detect::{detect_filesystem, FsType};
+    let args = narf_boot::args();
+    if !args.has_flag("narf.btrfs_smoke") && !args.has_flag("narf.btrfs_bigtree") {
+        return TestResult::Skip("no disposable btrfs disk");
+    }
+    let Some(entry) = narf_block::block_devices()
+        .into_iter()
+        .find(|e| matches!(detect_filesystem(&e.dev), Ok(Some(FsType::Btrfs))))
+    else {
+        return TestResult::Skip("no btrfs block device");
+    };
+    let dev = entry.dev.clone();
+    let big = args.has_flag("narf.btrfs_bigtree");
+    let mount = |subvol: Option<&str>| {
+        narf_scheduler::block_on(crate::registry::mount(
+            &dev,
+            crate::discover_members(dev.clone()),
+            subvol.map(|s| crate::volume::Subvol::Name(s.into())),
+            false,
+        ))
+    };
+    let (vol, other) = if big {
+        match (mount(Some("@")), mount(Some("@home"))) {
+            (Ok(a), Ok(b)) => (a, Some(b)),
+            _ => return TestResult::Fail("large image subvolumes did not mount"),
+        }
+    } else {
+        match mount(None) {
+            Ok(a) => (a, None),
+            Err(_) => return TestResult::Fail("nvme btrfs did not mount"),
+        }
+    };
+    let report = |what: &str, e: FsError| {
+        let _ = writeln!(narf_console::Writer, "racing: {what}: {e:?}");
+    };
+    match narf_scheduler::block_on(racing_writers(&vol, other.as_ref(), "nvme", &report)) {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs/race", smoke_btrfs_racing_writers_nvme);
+
+/// Two writers on two other CPUs creating, writing, renaming and unlinking
+/// in ONE directory of one filesystem at the same time, while a third CPU
+/// commits as the transaction kthread does. This is the shape of a booting
+/// systemd (many units writing in parallel) that made `create` fail with
+/// `InvalidData` on the CachyOS root: each operation chose its new inode
+/// number and directory index from the tree before taking the batch lock, so
+/// two CPUs could pick the same ones.
+fn smoke_btrfs_racing_writers_smp() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_filesystem::FsInstance;
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    static FAILED: AtomicU32 = AtomicU32::new(0);
+    static STARTED: AtomicU32 = AtomicU32::new(0);
+    if narf_lib::smp::cpu_count() < 5 {
+        return TestResult::Skip("needs five CPUs");
+    }
+    DONE.store(0, Ordering::Release);
+    FAILED.store(0, Ordering::Release);
+    STARTED.store(0, Ordering::Release);
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture did not mount"),
+    };
+    let dir = match poll_once(vol.root().mkdir("smp-race")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    const PER: u32 = 150;
+    // Stable files a reader on a fourth CPU keeps reading while the writers
+    // restructure the same directory's leaves: a reader takes no lock, so the
+    // tree it walks must never be rewritten under it.
+    for i in 0..24u32 {
+        let f = match poll_once(dir.create(&alloc::format!("s{i}"))) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("create stable file failed"),
+        };
+        if !matches!(
+            poll_once(f.write(0, &crate::interop::pattern(i, 5000))),
+            Some(Ok(5000))
+        ) {
+            return TestResult::Fail("write stable file failed");
+        }
+    }
+    {
+        let dir = dir.clone();
+        narf_scheduler::spawn_stackful_pinned(
+            async move {
+                let mut rounds = 0u32;
+                while DONE.load(Ordering::Acquire) < 3 || rounds == 0 {
+                    for i in 0..24u32 {
+                        let ok = async {
+                            let f = dir.lookup_async(&alloc::format!("s{i}")).await?;
+                            let mut buf = alloc::vec![0u8; 5016];
+                            let n = f.read(0, &mut buf).await?;
+                            Ok::<bool, FsError>(buf[..n] == crate::interop::pattern(i, 5000)[..])
+                        }
+                        .await;
+                        if !matches!(ok, Ok(true)) {
+                            use core::fmt::Write as _;
+                            let _ = writeln!(narf_console::Writer, "smp race reader s{i}: {ok:?}");
+                            FAILED.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    rounds += 1;
+                    narf_scheduler::yield_now().await;
+                }
+                DONE.fetch_add(1, Ordering::AcqRel);
+            },
+            4,
+        );
+    }
+    for (cpu, prefix) in [(1u32, "a"), (2, "b")] {
+        let dir = dir.clone();
+        narf_scheduler::spawn_stackful_pinned(
+            async move {
+                STARTED.fetch_add(1, Ordering::AcqRel);
+                for i in 0..PER {
+                    let name = alloc::format!("{prefix}{i}");
+                    let ok = async {
+                        let f = dir.create(&name).await.map_err(|e| ("create", e))?;
+                        f.truncate(0).await.map_err(|e| ("truncate", e))?;
+                        f.write(0, alloc::format!("{prefix} {i}\n").as_bytes())
+                            .await
+                            .map_err(|e| ("write", e))?;
+                        if i % 4 == 3 {
+                            dir.rename(&name, &alloc::format!("{prefix}r{i}"))
+                                .await
+                                .map_err(|e| ("rename", e))?;
+                        }
+                        if i % 4 == 2 {
+                            dir.unlink(&name).await.map_err(|e| ("unlink", e))?;
+                        }
+                        Ok::<(), (&'static str, FsError)>(())
+                    }
+                    .await;
+                    if let Err((step, e)) = ok {
+                        use core::fmt::Write as _;
+                        let _ = writeln!(narf_console::Writer, "smp race {name} {step}: {e:?}");
+                        FAILED.fetch_add(1, Ordering::AcqRel);
+                        break;
+                    }
+                }
+                DONE.fetch_add(1, Ordering::AcqRel);
+            },
+            cpu,
+        );
+    }
+    {
+        let vol = vol.clone();
+        narf_scheduler::spawn_stackful_pinned(
+            async move {
+                crate::write::__test_set_commit_interval_cycles(0);
+                while DONE.load(Ordering::Acquire) < 2 {
+                    let _ = crate::write::commit_if_stale(&vol).await;
+                    narf_scheduler::yield_now().await;
+                }
+                crate::write::__test_set_commit_interval_cycles(u64::MAX);
+                DONE.fetch_add(1, Ordering::AcqRel);
+            },
+            3,
+        );
+    }
+    let mut spins = 0u64;
+    while DONE.load(Ordering::Acquire) < 4 && spins < 20_000_000_000 {
+        core::hint::spin_loop();
+        spins += 1;
+    }
+    if DONE.load(Ordering::Acquire) < 4 {
+        return TestResult::Fail("racing writers did not finish");
+    }
+    if FAILED.load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("a racing operation failed");
+    }
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("sync failed");
+    }
+    let check = |vol: &SyncVol| -> Result<(), &'static str> {
+        let dir = match poll_once(vol.root().lookup_dir_async("smp-race")) {
+            Some(Ok(d)) => d,
+            _ => return Err("race dir missing"),
+        };
+        for prefix in ["a", "b"] {
+            for i in 0..PER {
+                let name = match i % 4 {
+                    2 => continue,
+                    3 => alloc::format!("{prefix}r{i}"),
+                    _ => alloc::format!("{prefix}{i}"),
+                };
+                let f = match poll_once(dir.lookup_async(&name)) {
+                    Some(Ok(f)) => f,
+                    _ => return Err("a racing file is missing"),
+                };
+                if read_all(&f, 64) != Some(alloc::format!("{prefix} {i}\n").into_bytes()) {
+                    return Err("racing file content wrong");
+                }
+            }
+        }
+        let kept = 2 * (0..PER).filter(|i| i % 4 != 2).count() + 24;
+        match poll_once(dir.enumerate_async(0, 4096)) {
+            Some(Ok(e)) if e.len() == kept => Ok(()),
+            _ => Err("racing directory has the wrong entries"),
+        }
+    };
+    if let Err(e) = check(&vol) {
+        return TestResult::Fail(e);
+    }
+    match mount_writable(dev) {
+        Ok(fresh) => match check(&fresh) {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        },
+        Err(_) => TestResult::Fail("remount after racing writers failed"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs/race", smoke_btrfs_racing_writers_smp);
+
+/// Hundreds of creates, mkdirs, writes, renames and unlinks on a tree whose
+/// root is at level 2 (splits under internal nodes, path re-searches after
+/// COW), with the result checked after a sync and after a remount.
+fn smoke_btrfs_tall_tree_many_files() -> TestResult {
+    use core::fmt::Write as _;
+    let dev = writable_sparse(FIXTURE_TALL_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("tall fixture did not mount"),
+    };
+    if poll_once(vol.switch_to_subvol(&crate::volume::Subvol::Name("@".into())))
+        .is_none_or(|r| r.is_err())
+    {
+        return TestResult::Fail("subvol @ did not resolve");
+    }
+    if vol.fs_tree_root().1 < 2 {
+        return TestResult::Fail("fixture @ tree is not level 2");
+    }
+    let report = |what: &str, e: FsError| {
+        let _ = writeln!(narf_console::Writer, "tall: {what}: {e:?}");
+    };
+    match poll_once(bigtree_workload(&vol, report)) {
+        Some(Ok(())) => {}
+        Some(Err(why)) => return TestResult::Fail(why),
+        None => return TestResult::Fail("workload did not complete"),
+    }
+    let fresh = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount failed"),
+    };
+    if poll_once(fresh.switch_to_subvol(&crate::volume::Subvol::Name("@".into())))
+        .is_none_or(|r| r.is_err())
+    {
+        return TestResult::Fail("subvol @ after remount");
+    }
+    use narf_filesystem::FsInstance;
+    let top = match poll_once(fresh.root().lookup_dir_async("narf-bigtree")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("workload dir missing after remount"),
+    };
+    let many = match poll_once(top.lookup_dir_async("many")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("many missing after remount"),
+    };
+    let expected = (0..400u32).filter(|i| i % 3 != 1).count();
+    match poll_once(many.enumerate_async(0, 4096)) {
+        Some(Ok(e)) if e.len() == expected => TestResult::Pass,
+        _ => TestResult::Fail("directory entries wrong after remount"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_tall_tree_many_files);
+
+/// `exclude_super_stripes`: a chunk whose physical stripe covers the 64 MiB
+/// superblock copy has the containing stripe window excluded, at the logical
+/// address that maps there; the primary at 64 KiB lies before every chunk.
+fn smoke_btrfs_super_stripe_exclusion() -> TestResult {
+    let mut map = ChunkMap::new();
+    // 32 MiB at logical 100 MiB, physical 50 MiB: the 64 MiB copy sits
+    // 14 MiB into it.
+    map.add_entry(100 << 20, 32 << 20, 1, 50 << 20);
+    // A chunk nowhere near a copy.
+    map.add_entry(200 << 20, 8 << 20, 1, 300 << 20);
+    let got = map.super_stripe_exclusions(&format::SUPERBLOCK_MIRROR_OFFSETS);
+    if got != alloc::vec![((114u64 << 20), 64 * 1024u64)] {
+        return TestResult::Fail("super stripe not reverse-mapped to its logical window");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_super_stripe_exclusion);
+
+/// chmod / chown / utimensat through the node (`btrfs_setattr`): the file
+/// type never changes, chown kills set-uid (and group-exec set-gid) on a
+/// file, explicit times land exactly, ctime and the inode sequence advance,
+/// writes and truncates move mtime, and it all survives a remount.
+fn smoke_btrfs_setattr_model() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture did not mount"),
+    };
+    let f = match poll_once(vol.root().create("attrs.bin")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let ino = f.ino();
+    let raw = |vol: &SyncVol| {
+        let (root, _) = vol.fs_tree_root();
+        poll_once(btree::find_item(
+            vol,
+            root,
+            &BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0),
+        ))
+        .and_then(|r| r.ok())
+        .flatten()
+        .unwrap_or_default()
+    };
+    let mode = |b: &[u8]| format::le32(b, 52).unwrap_or(0);
+    let seq = |b: &[u8]| format::le64(b, 72).unwrap_or(0);
+    let time = |b: &[u8], off: usize| {
+        (
+            format::le64(b, off).unwrap_or(0) as i64,
+            format::le32(b, off + 8).unwrap_or(0),
+        )
+    };
+    let before = raw(&vol);
+    if !matches!(poll_once(f.set_perms(0o6755)), Some(Ok(()))) {
+        return TestResult::Fail("chmod failed");
+    }
+    let after_chmod = raw(&vol);
+    if mode(&after_chmod) != 0o100000 | 0o6755 || f.stat().mode.perms != 0o755 {
+        return TestResult::Fail("chmod did not set exactly the permission bits");
+    }
+    if seq(&after_chmod) <= seq(&before) {
+        return TestResult::Fail("chmod did not advance the inode sequence");
+    }
+    if !matches!(poll_once(f.set_owners(1000, 1000)), Some(Ok(()))) {
+        return TestResult::Fail("chown failed");
+    }
+    let after_chown = raw(&vol);
+    if format::le32(&after_chown, 44) != Ok(1000)
+        || format::le32(&after_chown, 48) != Ok(1000)
+        || f.owners() != (1000, 1000)
+    {
+        return TestResult::Fail("chown did not set uid/gid");
+    }
+    // 06755 has group-exec, so chown clears both set-uid and set-gid.
+    if mode(&after_chown) != 0o100755 {
+        return TestResult::Fail("chown did not kill set-uid/set-gid");
+    }
+    let at = 1_700_000_000_123_456_789u64;
+    let mt = 1_600_000_000_987_654_321u64;
+    if f.set_times(Some(at), Some(mt)).is_err() {
+        return TestResult::Fail("utimensat failed");
+    }
+    let after_times = raw(&vol);
+    if time(&after_times, 112) != (1_700_000_000, 123_456_789)
+        || time(&after_times, 136) != (1_600_000_000, 987_654_321)
+    {
+        return TestResult::Fail("utimensat times not exact");
+    }
+    // atime OMIT: only mtime moves.
+    if f.set_times(None, Some(mt + 1)).is_err()
+        || time(&raw(&vol), 112) != (1_700_000_000, 123_456_789)
+    {
+        return TestResult::Fail("UTIME_OMIT changed atime");
+    }
+    let clock = crate::write::wall_now();
+    if let Some(now) = clock {
+        if time(&after_times, 124) < (now.0 - 5, 0) {
+            return TestResult::Fail("ctime did not move to now");
+        }
+        if !matches!(poll_once(f.write(0, b"data")), Some(Ok(4))) {
+            return TestResult::Fail("write failed");
+        }
+        if time(&raw(&vol), 136) < (now.0 - 5, 0) {
+            return TestResult::Fail("write did not move mtime");
+        }
+    }
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("sync failed");
+    }
+    let fresh = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount failed"),
+    };
+    let persisted = raw(&fresh);
+    if mode(&persisted) != 0o100755
+        || format::le32(&persisted, 44) != Ok(1000)
+        || time(&persisted, 112) != (1_700_000_000, 123_456_789)
+    {
+        return TestResult::Fail("attributes did not survive a remount");
+    }
+    // A directory keeps its S_ISGID through chown (Linux keeps it on dirs).
+    let d = match poll_once(fresh.root().mkdir("sgid-dir")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    let dnode = match poll_once(fresh.root().lookup_async("sgid-dir")) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("lookup dir failed"),
+    };
+    let _ = d;
+    if !matches!(poll_once(dnode.set_perms(0o2775)), Some(Ok(())))
+        || !matches!(poll_once(dnode.set_owners(5, 5)), Some(Ok(())))
+        || dnode.stat().mode.perms & 0o7777 != 0o775
+    {
+        return TestResult::Fail("directory chmod/chown failed");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_setattr_model);

@@ -37,6 +37,12 @@ pub struct Args {
     #[arg(long)]
     pub bgt: bool,
 
+    /// Use the tall fixture (4 KiB nodes, `@` fs tree three levels deep)
+    /// and work inside `@`: the large-tree variant, where node splits under
+    /// internal roots and the commit's multi-leaf fixed point are exercised.
+    #[arg(long, conflicts_with = "bgt")]
+    pub tall: bool,
+
     /// Seconds each boot may take to reach its marker.
     #[arg(long, default_value_t = 300)]
     pub timeout_secs: u64,
@@ -106,7 +112,9 @@ pub fn run(args: &Args) -> Result<()> {
     }
     let root = super::workspace_root()?;
     let image: PathBuf = root.join("target").join("narf-btrfs-crash.img");
-    let fixture = if args.bgt {
+    let fixture = if args.tall {
+        "drivers/fs/btrfs/testdata/fixture-tall.img.sparse"
+    } else if args.bgt {
         "drivers/fs/btrfs/testdata/fixture-bgt.img.sparse"
     } else {
         "drivers/fs/btrfs/testdata/fixture-bitmap.img.sparse"
@@ -117,8 +125,13 @@ pub fn run(args: &Args) -> Result<()> {
     }
     std::env::set_var("NARF_NVME_IMG", &image);
     let prior_append = std::env::var("XTASK_QEMU_APPEND").unwrap_or_default();
+    let subvol = if args.tall {
+        "narf.btrfs_crash_subvol=@"
+    } else {
+        ""
+    };
     let with = |flag: &str| {
-        [prior_append.as_str(), flag]
+        [prior_append.as_str(), subvol, flag]
             .iter()
             .filter(|s| !s.is_empty())
             .copied()

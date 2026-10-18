@@ -286,6 +286,15 @@ pub struct VolCore<B: BlockDevice> {
     /// in-flight commit is about to change (Linux waits on
     /// `fs_info->trans_lock`/`TRANS_STATE_COMMIT_START` the same way).
     txn_lock: Mutex<()>,
+    /// Serialises mutating operations on the filesystem, from their first
+    /// tree read to their staging. Every operation computes its edits (the new
+    /// inode number, the directory index, the extents a write displaces) from
+    /// the tree as it reads it; another CPU's operation staging in between
+    /// would make those edits collide (two inodes with one number, one
+    /// directory index for two names). Linux holds the parent directory's
+    /// `i_rwsem` and the btree path locks for the same span; one lock per
+    /// filesystem is the coarse equivalent.
+    op_lock: Mutex<()>,
     /// Raw `flags` word of the selected superblock (for [`crate::rw_gate`]).
     super_flags: u64,
     /// The write-safety gate's verdict, computed once at mount: `Some` means
@@ -437,6 +446,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             return Ok(());
         }
         self.frozen.store(true, Ordering::Release);
+        // Wait out any operation admitted before the freeze; none can start
+        // after it.
+        let _ops = self.op_lock.lock().await;
         let result = loop {
             if let Err(err) = self.sync_to_disk().await {
                 break Err(err);
@@ -833,6 +845,16 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.state.lock().chunk_map.map_logical_copies(logical)
     }
 
+    /// Logical ranges the allocator must never hand out because a
+    /// superblock copy lives under them (see
+    /// [`ChunkMap::super_stripe_exclusions`]).
+    pub(crate) fn super_stripe_exclusions(&self) -> Vec<(u64, u64)> {
+        self.state
+            .lock()
+            .chunk_map
+            .super_stripe_exclusions(&format::SUPERBLOCK_MIRROR_OFFSETS)
+    }
+
     /// Logical bytes left in the containing chunk/block group.
     pub(crate) fn logical_chunk_remaining(&self, logical: u64) -> Result<u64, FsError> {
         self.state.lock().chunk_map.chunk_remaining(logical)
@@ -1045,6 +1067,23 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// level. Callers that need to mutate a node still take `read_node` and
     /// get their own copy.
     pub async fn read_node_shared(&self, logical: u64) -> Result<Arc<Vec<u8>>, FsError> {
+        // A block of the running batch is rewritten in place at the same
+        // address by later operations, and another CPU can read it from the
+        // device in the middle of that write (a reader takes no operation
+        // lock). The torn image fails its checksum; by the time the read is
+        // retried the writer has finished and published the new bytes in the
+        // cache. A block that is genuinely bad fails every attempt.
+        let mut last = FsError::InvalidData;
+        for _ in 0..3 {
+            match self.read_node_attempt(logical).await {
+                Ok(node) => return Ok(node),
+                Err(error) => last = error,
+            }
+        }
+        Err(last)
+    }
+
+    async fn read_node_attempt(&self, logical: u64) -> Result<Arc<Vec<u8>>, FsError> {
         // Serve from the node cache when nothing has written this address
         // since it was filled. A hit skips both the device read and the
         // full-node checksum verification; the clone is a memcpy against an
@@ -1157,8 +1196,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // ROOT_ITEM named by `fs_tree_id`. Re-rooting with one open would
         // commit the previous subvolume's tree into the new subvolume's root
         // item. Log replay walks several roots in a row and is the path that
-        // reaches this.
-        crate::write::flush_batch(self).await?;
+        // reaches this. The commit waits for any running operation of
+        // another mount (see `op_lock`).
+        {
+            let _op = self.op_lock().lock().await;
+            crate::write::flush_batch(self).await?;
+        }
         let (root_tree, _) = self.root_tree_root();
         let (subvol_id, subvol_root, subvol_level, subvol_flags) = match sel {
             Subvol::Id(n) => {
@@ -1464,6 +1507,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             super_flags,
             rw_refusal: IrqSafeSpinLock::new(None),
             txn_lock: Mutex::new(()),
+            op_lock: Mutex::new(()),
             timer_started: core::sync::atomic::AtomicBool::new(false),
             frozen: core::sync::atomic::AtomicBool::new(false),
             devices: IrqSafeSpinLock::new(devices),
@@ -1533,6 +1577,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// The core itself is read-only (no mount of it may write).
     pub(crate) fn core_read_only(&self) -> bool {
         self.read_only.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Held across one mutating operation (see the field).
+    pub(crate) fn op_lock(&self) -> &Mutex<()> {
+        &self.op_lock
     }
 
     /// Serialises closing one transaction against opening the next.
@@ -1957,6 +2006,14 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// `smoke_btrfs_fsync_survives_a_later_crash` holds this to account: it
     /// fsyncs, crashes the following commit, and requires the fsynced data
     /// back. Deferring commits without doing the work here turns that red.
+    /// [`Self::sync_to_disk`] from outside any operation (`fsync`, `syncfs`):
+    /// waits for the running operation, so the commit it forces cannot land
+    /// between another CPU's tree reads and its staging.
+    pub async fn sync_to_disk_exclusive(&self) -> Result<(), FsError> {
+        let _op = self.op_lock().lock().await;
+        self.sync_to_disk().await
+    }
+
     pub async fn sync_to_disk(&self) -> Result<(), FsError> {
         crate::write::flush_batch(self).await?;
         self.write_staged_super().await

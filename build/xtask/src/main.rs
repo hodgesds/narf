@@ -2657,6 +2657,11 @@ fn verify_btrfs_block_group_tree(img: &Path) -> Result<()> {
 /// find, so they run only with `narf.btrfs_smoke`, which xtask passes solely
 /// when it serves its own disposable `narf-nvme-btrfs.img` on nvme0.
 fn btrfs_smoke_bootarg() -> &'static str {
+    // A caller-supplied image (`XTASK_BTRFS_NVME_IMAGE`) is not xtask's
+    // disposable fixture: the boot-time read/write smokes stay off it.
+    if std::env::var_os("XTASK_BTRFS_NVME_IMAGE").is_some() {
+        return "";
+    }
     if KERNEL_TEST_DISK.load(std::sync::atomic::Ordering::Relaxed) {
         "narf.btrfs_smoke"
     } else {
@@ -2685,6 +2690,18 @@ fn nvme_image_path() -> PathBuf {
         // instead (the host CachyOS root's feature set: compat_ro 0xb,
         // non-mixed 4K/16K, zstd, @-subvolumes), so the same write smoke and
         // `btrfs check` postflight cover BLOCK_GROUP_TREE writes.
+        // `XTASK_BTRFS_NVME_IMAGE=<file>` serves a sparse copy of a raw
+        // btrfs image instead (a large real-world tree, e.g. the CachyOS
+        // root partition); the original is never written.
+        if let Some(src) = std::env::var_os("XTASK_BTRFS_NVME_IMAGE") {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::process::Command::new("cp")
+                .args(["--reflink=auto", "--sparse=always"])
+                .arg(&src)
+                .arg(&path)
+                .status();
+            return path;
+        }
         let fixture = match std::env::var("XTASK_BTRFS_NVME_FIXTURE").as_deref() {
             Ok("bgt") => "drivers/fs/btrfs/testdata/fixture-bgt.img.sparse",
             _ => "drivers/fs/btrfs/testdata/fixture-bitmap.img.sparse",

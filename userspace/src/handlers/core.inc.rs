@@ -8570,7 +8570,7 @@ pub(crate) fn do_utimes(
             // Filesystems without `set_times` keep the lenient accept: the
             // path was validated, and there is no store to update.
             XattrTarget::File(file) => {
-                let _ = file.set_times(atime, mtime);
+                let _ = poll_blocking(file.set_times_async(atime, mtime));
                 is_dir = file.as_dir().is_some();
             }
             XattrTarget::Dir(_) => is_dir = true,
@@ -8612,7 +8612,7 @@ fn utimes_fd(
     }
     if let XattrTarget::File(ops) = target {
         // set_times is lenient — unsupported FileOps → 0.
-        let _ = ops.set_times(atime, mtime);
+        let _ = poll_blocking(ops.set_times_async(atime, mtime));
     }
     // inotify: a timestamp change is IN_ATTRIB on the fd's file.
     crate::mqueue::notify_attrib_fd(task, fd);

@@ -164,8 +164,12 @@ pub enum Allocator {
     /// restricts each allocation to space_info of its type. SYSTEM groups
     /// (reserved for the chunk tree) are never offered.
     Reclaim { ranges: Vec<(u64, u64, u64)> },
-    /// Append past the extent-tree high-water (no free-space tree present).
-    Bump { next: u64 },
+    /// Append past the extent-tree high-water (no free-space tree present),
+    /// stepping over `excluded` (superblock-covered) logical ranges.
+    Bump {
+        next: u64,
+        excluded: Vec<(u64, u64)>,
+    },
 }
 
 impl Allocator {
@@ -189,6 +193,8 @@ impl Allocator {
             // range can fall in the middle of a free one, so this subtracts
             // rather than filters — keeping the surviving fragments usable
             // instead of discarding a whole free extent.
+            // Superblock copies under a chunk are never allocatable.
+            let ranges = subtract_pinned(ranges, &vol.super_stripe_exclusions());
             let ranges = subtract_pinned(ranges, &vol.pinned_ranges())
                 .into_iter()
                 .filter_map(|(start, len)| {
@@ -205,7 +211,10 @@ impl Allocator {
             return Ok(Allocator::Reclaim { ranges });
         }
         let hw = extent_high_water(vol, ext).await?.max(vol.alloc_floor());
-        Ok(Allocator::Bump { next: hw })
+        Ok(Allocator::Bump {
+            next: hw,
+            excluded: vol.super_stripe_exclusions(),
+        })
     }
 
     /// Allocate `len` bytes aligned to `align` from a block group whose flags
@@ -249,8 +258,14 @@ impl Allocator {
             // continuity is not required: the volume I/O layer splits RAID0/10/
             // 5/6 extents at stripe boundaries. An unmapped address (the cursor
             // ran past the last chunk) is out of space, not a lookup error.
-            Allocator::Bump { next } => {
-                let start = align_up(*next, align);
+            Allocator::Bump { next, excluded } => {
+                let mut start = align_up(*next, align);
+                while let Some(&(s, l)) = excluded
+                    .iter()
+                    .find(|&&(s, l)| start < s + l && start + size > s)
+                {
+                    start = align_up(s + l, align);
+                }
                 let remaining = vol
                     .logical_chunk_remaining(start)
                     .map_err(|_| FsError::NoSpace)?;
@@ -298,7 +313,7 @@ impl Allocator {
     /// so no cross-write floor is needed).
     pub fn floor(&self) -> Option<u64> {
         match self {
-            Allocator::Bump { next } => Some(*next),
+            Allocator::Bump { next, .. } => Some(*next),
             Allocator::Reclaim { .. } => None,
         }
     }
