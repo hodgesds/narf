@@ -58,12 +58,15 @@ pub const fn hw_queue(ac: u16) -> usize {
     ac as usize % (ATH11K_HW_MAX_QUEUES - 1)
 }
 
-/// One queued frame: the Ethernet frame from the stack and its
-/// `CHECKSUM_PARTIAL` flag (`skb->ip_summed`).
+/// One queued frame: the Ethernet frame from the stack, its
+/// `CHECKSUM_PARTIAL` flag (`skb->ip_summed`) and, when the sender asked
+/// for the TX status, its ack id (`IEEE80211_TX_CTL_REQ_TX_STATUS` +
+/// `info->status_data` from `ieee80211_store_ack_skb`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Queued {
     pub eth: Vec<u8>,
     pub csum_partial: bool,
+    pub ack_id: Option<u32>,
 }
 
 /// Counters.
@@ -188,6 +191,18 @@ impl TxQueues {
         (1 << hw_queue(0)) | (1 << hw_queue(1)) | (1 << hw_queue(2)) | (1 << hw_queue(3))
     }
 
+    /// Take any queued frame (for a purge that reports each one).
+    pub fn take_any(&mut self) -> Option<Queued> {
+        for q in self.q.iter_mut() {
+            if let Some(f) = q.pop_front() {
+                self.backlog_bytes -= f.eth.len();
+                self.stats.purged += 1;
+                return Some(f);
+            }
+        }
+        None
+    }
+
     /// `ieee80211_purge_sta_txqs`: drop every queued frame; returns how
     /// many.
     pub fn purge(&mut self) -> u32 {
@@ -198,5 +213,62 @@ impl TxQueues {
         self.backlog_bytes = 0;
         self.stats.purged += n;
         n
+    }
+}
+
+// ── TX status (`ieee80211_tx_status_ext` inputs) ─────────────────────
+
+/// `ieee80211_store_ack_skb`: ack ids are `idr_alloc(.., 1, 0x2000)`.
+pub const ACK_ID_START: u32 = 1;
+pub const ACK_ID_END: u32 = 0x2000;
+
+/// What mac80211 learns about one transmitted MSDU.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TxStatus {
+    /// `IEEE80211_TX_STAT_ACK`.
+    pub acked: bool,
+    /// Freed without a status (`ieee80211_free_txskb`: no vif, no peer /
+    /// station, refused before TCL, purged) — reported as not acked
+    /// (`ieee80211_report_used_skb(.., dropped = true)`).
+    pub dropped: bool,
+    /// `info->status.ack_signal` (dBm) when
+    /// `IEEE80211_TX_STATUS_ACK_SIGNAL_VALID`.
+    pub ack_signal: Option<i32>,
+}
+
+impl TxStatus {
+    pub const DROPPED: TxStatus = TxStatus {
+        acked: false,
+        dropped: true,
+        ack_signal: None,
+    };
+}
+
+/// The status of one completion, as `ath11k_dp_tx_htt_tx_complete_buf`
+/// (firmware release: `ts->acked` = HTT_TX_COMP_STATUS_OK) and
+/// `ath11k_dp_tx_complete_msdu` (TQM release: FRAME_ACKED) build it.
+/// Neither path sees `IEEE80211_TX_CTL_NO_ACK` here (a station's frames
+/// go to the BSSID, never a group address). The ack signal is
+/// `ack_rssi` (+ `ATH11K_DEFAULT_NOISE_FLOOR` unless the firmware has
+/// `WMI_TLV_SERVICE_HW_DB2DBM_CONVERSION_SUPPORT`). `vif` false
+/// (`skb_cb->vif` cleared by `ath11k_mac_vif_unref`) or `sta` false
+/// (`ath11k_peer_find_by_id` → no peer / `peer->sta`) frees the frame
+/// instead: dropped.
+pub fn tx_status(acked: bool, ack_rssi: u8, db2dbm: bool, vif: bool, sta: bool) -> TxStatus {
+    if !vif || !sta {
+        return TxStatus::DROPPED;
+    }
+    let ack_signal = acked.then(|| {
+        let s = ack_rssi as i32;
+        if db2dbm {
+            s
+        } else {
+            s + super::wmi::ATH11K_DEFAULT_NOISE_FLOOR
+        }
+    });
+    TxStatus {
+        acked,
+        dropped: false,
+        ack_signal,
     }
 }

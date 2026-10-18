@@ -1894,7 +1894,7 @@ pub(super) fn wbm_tqm(
 
 /// FW (HTT) release entry: status in info0 12:9, ack rssi in info1
 /// 31:24, peer id + VALID in info2.
-fn wbm_htt(desc_id: u32, status: u32, rssi: u32, peer: Option<u32>) -> [u32; 8] {
+pub(super) fn wbm_htt(desc_id: u32, status: u32, rssi: u32, peer: Option<u32>) -> [u32; 8] {
     let mut w = [0u32; 8];
     w[1] = (3 << 8) | (desc_id << 11);
     w[2] = 3 | (status << 9);

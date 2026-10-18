@@ -681,7 +681,7 @@ step starts with `Rt::service()`:
    fallback); RX MSDUs are classified (multicast echo of our SA dropped,
    unicast not to us dropped, EAPOL → `eapol_rx`, data → `data_rx` only
    while authorized), `reo_status` → `dp.reo_status_handler`, TX
-   completions counted (buffers freed in the DP);
+   completions to the TX status (buffers freed in the DP);
 4. `dp.service_shadow_timers`, the 10 ms monitor-status reap timer
    (armed by `mon_status_default(true)`), `qmi.service()` every 100 ms.
 
@@ -765,6 +765,24 @@ ring selection is `ath11k_dp_tx`'s (`ring_selector` =
 one TCL data ring (TCL 0 / WBM 0 / SW0), so every frame uses ring 0 and a
 full IDR fails at once (`ring_map == BIT(1) - 1`). The descriptor pool id
 is the AC.
+
+**TX status** (`txq::tx_status`, `Rt::tx_status_one`): every WBM
+completion `Dp::tx_completion_handler` returns gets the status
+`ath11k_dp_tx_htt_tx_complete_buf` (firmware release, the EAPOL /
+null-data path: ACK = HTT_TX_COMP OK; DROP / TTL = no ACK) or
+`ath11k_dp_tx_complete_msdu` (TQM: ACK = FRAME_ACKED) builds — ack signal
+= `ack_rssi` + `ATH11K_DEFAULT_NOISE_FLOOR` unless
+`WMI_TLV_SERVICE_HW_DB2DBM_CONVERSION_SUPPORT`; no vif or no peer station
+for `peer_id` = freed (dropped); REINJECT / INSPECT releases carry no
+status (`ath11k_dp_tx_free_txbuf`). mac80211's side (`__ieee80211_tx_status`):
+`tx_status_{acked,noack,dropped}` counters and the station's
+`last_ack_signal` / `last_ack_ms`; a frame sent with
+`IEEE80211_TX_CTL_REQ_TX_STATUS` (`Rt::tx_enqueue_status`, ack id from
+`idr_alloc(.., 1, 0x2000)` as `ieee80211_store_ack_skb`) has its status
+queued for its sender (`ieee80211_report_ack_skb`; refused, overlimit,
+purged or interface-down frames report dropped).
+`Shared::send_eth_tx_status(eth, timeout)` is the consumer entry point
+(control-port TX with a cookie / the mlme probe's TX status).
 
 **Netdev** (`iface::Ath11kNetdev`): `narf_net::Interface` (name from
 `reserve_name("wlan%d")`, MAC from WMI READY, MTU 1500, `link_up` =
@@ -1044,6 +1062,17 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   RX checksum verdict reaches frame-ring consumers only. Whether the TCL
   engine uses the seed or recomputes the pseudo-header on native-wifi
   frames is hardware-only (Linux passes the same seed).
+- TX status, left open: NARF has no consumer that waits for an ACK yet.
+  The in-kernel 4-way handshake sends M2 / M4 without asking (Linux
+  installs the PTK without waiting too); mac80211's connection monitor
+  (`ieee80211_mgd_probe_ap` nullfunc probing after `ieee80211_beacon_loss`,
+  completed by `ieee80211_sta_tx_notify`) is not ported — beacon loss is
+  ath11k's own 3 s `connection_loss_work` (mac.rs); nl80211 has no
+  `CONTROL_PORT_FRAME` / `cfg80211_control_port_tx_status`, and no station
+  dump to show the status statistics. Each would call
+  `send_eth_tx_status`. Rate / retry statistics (`ath11k_dp_tx_update_txcompl`,
+  `ieee80211_rate_status`) are not reported; low-ACK kickout stays the
+  firmware's (`REPORTS_LOW_ACK`).
 - Integration deviations from Linux (deliberate): `ndo_open` is
   asynchronous (`set_link_state` sets `IFF_UP` and returns; a failed open
   takes the interface down again, where Linux's `dev_open` fails without
@@ -1051,8 +1080,7 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   bring-up waits on the device; the TX
   queues are one FIFO per AC, not one TXQ per TID with mac80211's airtime
   round robin and fq_codel (one station; the AC order and stop reasons are
-  Linux's), no A-MSDU / fast-xmit header cache, no TX status
-  reporting; ADDBA from the AP is not answered (no
+  Linux's), no A-MSDU / fast-xmit header cache; ADDBA from the AP is not answered (no
   `ath11k_mac_op_ampdu_action`; the AP falls back to non-aggregated
   traffic, REO queues stay at BA window 1); management frames and data
   keep separate sequence counters (mac80211 shares

@@ -53,7 +53,7 @@ use super::hw::{MsiConfig, RingMask, ATH11K_EXT_IRQ_GRP_NUM_MAX};
 use super::mac::{DataPort, DeviceCaps, WmiPort};
 use super::power::ChipIo;
 use super::tx_hdr::{self, SeqState, StaTx};
-use super::txq::{self, Queued, TxQueues};
+use super::txq::{self, Queued, TxQueues, TxStatus};
 use super::wmi::{self, ServiceReady, WmiCmd};
 
 /// Failing-step codes for the integration (250–269).
@@ -413,6 +413,9 @@ pub struct LinkState {
     pub seq: SeqState,
     /// Received EAPOL frames (802.3) for the supplicant.
     pub eapol_rx: VecDeque<Vec<u8>>,
+    /// `sta->deflink.status_stats.last_ack_signal` / `last_ack` (ms).
+    pub last_ack_signal: Option<i32>,
+    pub last_ack_ms: Option<u64>,
     /// Received data frames (Ethernet II) for the interface, with
     /// `ath11k_dp_rx_h_csum_offload`'s verdict (`CHECKSUM_UNNECESSARY`).
     pub data_rx: VecDeque<(Vec<u8>, bool)>,
@@ -440,6 +443,10 @@ pub struct RtStats {
     /// Frames dropped from the TX queues (`fq` overlimit, purge).
     pub tx_queue_dropped: u32,
     pub tx_completed: u32,
+    /// `ieee80211_tx_status_ext` outcomes of completed MSDUs.
+    pub tx_status_acked: u32,
+    pub tx_status_noack: u32,
+    pub tx_status_dropped: u32,
     pub mgmt_tx: u32,
     pub mgmt_tx_done: u32,
     pub mgmt_tx_unknown: u32,
@@ -463,6 +470,11 @@ pub struct Rt<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     pub mgmt: MgmtTx,
     /// The station's per-AC TX queues + hardware queue stop reasons.
     pub txq: TxQueues,
+    /// `local->ack_status_frames`: ack id → the TX descriptor's MSDU id
+    /// once on TCL (WCN6855 has one TCL ring, so the MSDU id names it).
+    pub ack_frames: Idr<Option<u32>>,
+    /// Statuses waiting for their requester (`ieee80211_report_ack_skb`).
+    pub ack_status: VecDeque<(u32, TxStatus)>,
     pub stats: RtStats,
     /// `mon_reap_timer` armed (next expiry).
     pub mon_reap_at: Option<u64>,
@@ -496,6 +508,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
             },
             mgmt: MgmtTx::default(),
             txq: TxQueues::default(),
+            ack_frames: Idr::default(),
+            ack_status: VecDeque::new(),
             stats: RtStats::default(),
             mon_reap_at: None,
             qmi_service_at: 0,
@@ -609,10 +623,12 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
         for m in out.rx {
             self.rx_msdu(m);
         }
-        // Buffers are released inside the completion handler
-        // (`ath11k_dp_tx_free_txbuf`); mac80211 status reporting has no
-        // consumer here.
+        // Buffers are released inside the completion handler; each MSDU's
+        // status goes to ieee80211_tx_status_ext.
         self.stats.tx_completed += out.tx_done.len() as u32;
+        for c in &out.tx_done {
+            self.tx_status_one(c, now);
+        }
         if !out.reo_status.is_empty() {
             self.stats.reo_status += out.reo_status.len() as u32;
             let hif = &mut self.core.hif;
@@ -740,19 +756,94 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
         }
     }
 
+    /// One completion's status (`ath11k_dp_tx_htt_tx_complete_buf` /
+    /// `ath11k_dp_tx_complete_msdu`, [`txq::tx_status`]) into mac80211's
+    /// `__ieee80211_tx_status`: the station's ack statistics and, for a
+    /// frame whose sender asked, `ieee80211_report_ack_skb`.
+    fn tx_status_one(&mut self, c: &super::dp_ring::TxCompletion, now: u64) {
+        let sta = self
+            .dp
+            .peer_by_id(c.peer_id)
+            .is_some_and(|p| self.link.bss == Some(p.addr));
+        let db2dbm = self
+            .core
+            .svc_map
+            .test(super::wmi_ids::WMI_TLV_SERVICE_HW_DB2DBM_CONVERSION_SUPPORT);
+        let st = txq::tx_status(c.acked, c.ack_rssi, db2dbm, self.link.vif.is_some(), sta);
+        if st.dropped {
+            self.stats.tx_status_dropped += 1;
+        } else if st.acked {
+            self.stats.tx_status_acked += 1;
+            self.link.last_ack_ms = Some(now);
+            self.link.last_ack_signal = st.ack_signal;
+        } else {
+            self.stats.tx_status_noack += 1;
+        }
+        let ack_id = self
+            .ack_frames
+            .ids()
+            .find(|&id| self.ack_frames.find(id) == Some(&Some(c.msdu_id)));
+        if let Some(id) = ack_id {
+            self.ack_frames.remove(id);
+            self.ack_status.push_back((id, st));
+        }
+    }
+
+    /// `ieee80211_report_used_skb(.., dropped = true)` for a frame whose
+    /// sender asked for the status and that never reached TCL.
+    fn ack_dropped(&mut self, ack_id: Option<u32>) {
+        if let Some(id) = ack_id {
+            if self.ack_frames.remove(id).is_some() {
+                self.ack_status.push_back((id, TxStatus::DROPPED));
+            }
+        }
+    }
+
     /// `ieee80211_subif_start_xmit` up to the TXQ: drop when there is no
     /// station to send to (`ieee80211_build_hdr` without a chanctx /
     /// `sta`), else `ieee80211_select_queue` with `sta->sta.wme` and
     /// `ieee80211_queue_skb` into that AC (`fq` overlimit drops counted).
     pub fn tx_enqueue(&mut self, eth: Vec<u8>, csum_partial: bool) -> Result<(), i32> {
+        self.tx_enqueue_ack(eth, csum_partial, None)
+    }
+
+    fn tx_enqueue_ack(
+        &mut self,
+        eth: Vec<u8>,
+        csum_partial: bool,
+        ack_id: Option<u32>,
+    ) -> Result<(), i32> {
         if self.link.vif.is_none() || self.link.bss.is_none() {
             self.stats.tx_failed += 1;
+            self.ack_dropped(ack_id);
             return Err(ENOTCONN);
         }
         let (_, ac) = tx_hdr::select_queue(&eth, self.link.wme);
-        let dropped = self.txq.enqueue(ac, Queued { eth, csum_partial });
+        let dropped = self.txq.enqueue(
+            ac,
+            Queued {
+                eth,
+                csum_partial,
+                ack_id,
+            },
+        );
         self.stats.tx_queue_dropped += dropped.len() as u32;
+        for d in dropped {
+            self.ack_dropped(d.ack_id);
+        }
         Ok(())
+    }
+
+    /// As [`Self::tx_enqueue`] with `IEEE80211_TX_CTL_REQ_TX_STATUS`
+    /// (`ieee80211_store_ack_skb`): returns the ack id the status is
+    /// reported under ([`Self::ack_status`]).
+    pub fn tx_enqueue_status(&mut self, eth: Vec<u8>) -> Result<u32, i32> {
+        let id = self
+            .ack_frames
+            .alloc(None, txq::ACK_ID_START, txq::ACK_ID_END)
+            .map_err(|_| ENOSPC)?;
+        self.tx_enqueue_ack(eth, false, Some(id))?;
+        Ok(id)
     }
 
     /// `ieee80211_handle_wake_tx_queue`: hand every frame whose hardware
@@ -764,8 +855,18 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
     pub fn tx_push(&mut self) -> u32 {
         let mut sent = 0;
         while let Some((_, f)) = self.txq.dequeue() {
-            if self.tx_eth(&f.eth, f.csum_partial).is_ok() {
-                sent += 1;
+            match self.tx_eth(&f.eth, f.csum_partial) {
+                Ok(desc_id) => {
+                    sent += 1;
+                    if let Some(id) = f.ack_id {
+                        let msdu =
+                            super::hal::field_get(super::dp_ring::DP_TX_DESC_ID_MSDU_ID, desc_id);
+                        if let Some(slot) = self.ack_frames.find_mut(id) {
+                            *slot = Some(msdu);
+                        }
+                    }
+                }
+                Err(_) => self.ack_dropped(f.ack_id),
             }
         }
         sent
@@ -783,9 +884,14 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
         self.tx_push()
     }
 
-    /// `ieee80211_purge_sta_txqs`.
+    /// `ieee80211_purge_sta_txqs` (each purged frame freed:
+    /// `ieee80211_free_txskb`).
     pub fn purge_txqs(&mut self) -> u32 {
-        let n = self.txq.purge();
+        let mut n = 0;
+        while let Some(f) = self.txq.take_any() {
+            self.ack_dropped(f.ack_id);
+            n += 1;
+        }
         self.stats.tx_queue_dropped += n;
         n
     }
@@ -1003,6 +1109,33 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         g.tx_push();
         g.service();
         r
+    }
+
+    /// Send an Ethernet frame asking for its TX status and wait ≤
+    /// `timeout_ms` for it (`ieee80211_tx_control_port` with a cookie →
+    /// `cfg80211_control_port_tx_status`, the mlme probe's
+    /// `ieee80211_sta_tx_notify`). `Err(ETIMEDOUT)` frees the ack id.
+    pub async fn send_eth_tx_status(&self, eth: &[u8], timeout_ms: u32) -> Result<TxStatus, i32> {
+        let id = {
+            let mut g = self.lock().await;
+            let id = g.tx_enqueue_status(eth.to_vec())?;
+            g.tx_push();
+            g.service();
+            id
+        };
+        let r = self
+            .wait_until(timeout_ms, |rt| {
+                let i = rt.ack_status.iter().position(|(a, _)| *a == id)?;
+                rt.ack_status.remove(i).map(|(_, s)| s)
+            })
+            .await;
+        match r {
+            Some(s) => Ok(s),
+            None => {
+                self.lock().await.ack_frames.remove(id);
+                Err(ETIMEDOUT)
+            }
+        }
     }
 
     /// `ieee80211_flush_queues(local, sdata, drop)` for the station vif:

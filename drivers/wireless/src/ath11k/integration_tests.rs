@@ -46,7 +46,7 @@ use super::ce_tests::{phys_rd32, phys_read, phys_wr32, phys_write, FakeChip};
 use super::core::{Ath11kCore, CeHif, CoreHooks, CoreState, QmiFw};
 use super::core_tests::{self, Fw, Script, CTRL_DL, FW_MAC, HTT_EID, WMI_DL, WMI_EID};
 use super::dp_ring::{self, buf_addr_get, DpHwParams, DpRingSizes};
-use super::dp_tests::{good_rxd, reo_dest, rx_desc_bytes, wbm_tqm, FIRST, LAST, SMALL};
+use super::dp_tests::{good_rxd, reo_dest, rx_desc_bytes, wbm_htt, wbm_tqm, FIRST, LAST, SMALL};
 use super::hal::TransportError;
 use super::hal_tests::wcn6855;
 use super::htc::{self, HtcHdr};
@@ -330,6 +330,30 @@ struct TclTx {
     frame: Vec<u8>,
 }
 
+/// A WBM2SW0 release: TQM (reason, peer id; ack rssi 40) or firmware
+/// (`HAL_WBM_REL_HTT_TX_COMP_STATUS_*`, ack rssi, peer id if valid).
+#[derive(Copy, Clone, Debug)]
+enum TxRel {
+    Tqm {
+        reason: u32,
+        peer: u32,
+    },
+    Htt {
+        status: u32,
+        rssi: u32,
+        peer: Option<u32>,
+    },
+}
+
+impl Default for TxRel {
+    fn default() -> Self {
+        TxRel::Tqm {
+            reason: 0,
+            peer: AP_PEER_ID as u32,
+        }
+    }
+}
+
 struct DevState {
     fw: Fw,
     world: World,
@@ -349,6 +373,8 @@ struct DevState {
     mute_dp_irq: bool,
     /// `rx_attention.info1` of every RX descriptor (checksum-fail bits).
     rx_attn1: u32,
+    /// How the device releases transmitted MSDUs on WBM2SW0.
+    tx_rel: TxRel,
     peers: Vec<(u32, [u8; 6], u16)>,
 }
 
@@ -384,6 +410,7 @@ impl Dev {
                 dp_pending: 0,
                 mute_dp_irq: false,
                 rx_attn1: 0,
+                tx_rel: TxRel::default(),
                 peers: Vec::new(),
             }),
         })
@@ -508,7 +535,11 @@ impl Dev {
                     st.world.on_eth(&eth);
                 }
             }
-            if wbm.produce(c, &wbm_tqm(desc_id, 0, 1, 1, 40, AP_PEER_ID as u32, 0)) {
+            let rel = match st.tx_rel {
+                TxRel::Tqm { reason, peer } => wbm_tqm(desc_id, reason, 1, 1, 40, peer, 0),
+                TxRel::Htt { status, rssi, peer } => wbm_htt(desc_id, status, rssi, peer),
+            };
+            if wbm.produce(c, &rel) {
                 st.dp_pending |= 1 << 0;
             }
         }
@@ -2066,6 +2097,7 @@ fn smoke_ath11k_txq_queues() -> TestResult {
     let q = |b: u8| Queued {
         eth: vec![b; 6],
         csum_partial: false,
+        ack_id: None,
     };
     check(|| {
         ensure!(
@@ -2389,3 +2421,212 @@ kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_ath11k_int_open_from_control_op
 );
+
+// ── TX status ─────────────────────────────────────────────────────
+
+/// `ath11k_dp_tx_htt_tx_complete_buf` / `ath11k_dp_tx_complete_msdu`
+/// status rules: ACK + `ack_rssi + ATH11K_DEFAULT_NOISE_FLOOR` (-95)
+/// unless the firmware converts to dBm itself; no ACK without a signal;
+/// freed (dropped) without a vif or a peer station.
+fn smoke_ath11k_tx_status_rules() -> TestResult {
+    use super::txq::{tx_status, TxStatus};
+    check(|| {
+        let acked = |s: Option<i32>| TxStatus {
+            acked: true,
+            dropped: false,
+            ack_signal: s,
+        };
+        ensure!(
+            tx_status(true, 40, false, true, true) == acked(Some(-55)),
+            "acked, rssi 40 + noise floor"
+        );
+        ensure!(
+            tx_status(true, 40, true, true, true) == acked(Some(40)),
+            "HW_DB2DBM_CONVERSION_SUPPORT: rssi already dBm"
+        );
+        ensure!(
+            tx_status(false, 40, false, true, true)
+                == TxStatus {
+                    acked: false,
+                    dropped: false,
+                    ack_signal: None,
+                },
+            "no ACK: no signal"
+        );
+        ensure!(
+            tx_status(true, 40, false, false, true) == TxStatus::DROPPED
+                && tx_status(true, 40, false, true, false) == TxStatus::DROPPED,
+            "no vif / no peer station: ieee80211_free_txskb"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_tx_status_rules);
+
+/// TX status end to end: a frame sent asking for its status gets it from
+/// the WBM release the device writes — TQM FRAME_ACKED (ACK, -55 dBm),
+/// TQM REMOVE_TX (no ACK), firmware HTT_TX_COMP OK / DROP / TTL (the
+/// EAPOL / null-data path), an invalid or unknown peer id (dropped), a
+/// REINJECT release (no status at all, as Linux: the wait times out and
+/// the ack id is freed); a purged or interface-down frame reports
+/// dropped; frames without a request only feed the counters.
+fn smoke_ath11k_int_tx_status() -> TestResult {
+    use super::dp_ring::{htt_comp, tqm};
+    use super::txq::{reason, TxQueues, TxStatus};
+    check(|| {
+        let u = up(wpa2_cfg())?;
+        connect(&u)?;
+        let eth = ipv4_frame(&GW, &OWN, 0, &[1]);
+        let ack = |s: i32| TxStatus {
+            acked: true,
+            dropped: false,
+            ack_signal: Some(s),
+        };
+        let noack = TxStatus {
+            acked: false,
+            dropped: false,
+            ack_signal: None,
+        };
+        let peer = AP_PEER_ID as u32;
+        let cases: [(&str, TxRel, Result<TxStatus, i32>); 8] = [
+            (
+                "TQM acked",
+                TxRel::Tqm {
+                    reason: tqm::FRAME_ACKED,
+                    peer,
+                },
+                Ok(ack(-55)),
+            ),
+            (
+                "TQM removed",
+                TxRel::Tqm {
+                    reason: tqm::CMD_REMOVE_TX,
+                    peer,
+                },
+                Ok(noack),
+            ),
+            (
+                "HTT OK",
+                TxRel::Htt {
+                    status: htt_comp::OK,
+                    rssi: 30,
+                    peer: Some(peer),
+                },
+                Ok(ack(-65)),
+            ),
+            (
+                "HTT DROP",
+                TxRel::Htt {
+                    status: htt_comp::DROP,
+                    rssi: 30,
+                    peer: Some(peer),
+                },
+                Ok(noack),
+            ),
+            (
+                "HTT TTL",
+                TxRel::Htt {
+                    status: htt_comp::TTL,
+                    rssi: 30,
+                    peer: Some(peer),
+                },
+                Ok(noack),
+            ),
+            (
+                "HTT invalid peer",
+                TxRel::Htt {
+                    status: htt_comp::OK,
+                    rssi: 30,
+                    peer: None,
+                },
+                Ok(TxStatus::DROPPED),
+            ),
+            (
+                "TQM unknown peer",
+                TxRel::Tqm {
+                    reason: tqm::FRAME_ACKED,
+                    peer: 99,
+                },
+                Ok(TxStatus::DROPPED),
+            ),
+            (
+                "HTT REINJECT",
+                TxRel::Htt {
+                    status: htt_comp::REINJ,
+                    rssi: 0,
+                    peer: Some(peer),
+                },
+                Err(runtime::ETIMEDOUT),
+            ),
+        ];
+        for (what, rel, want) in cases {
+            u.dev.st.borrow_mut().tx_rel = rel;
+            if run(u.shared.send_eth_tx_status(&eth, 200)) != want {
+                return Err(what);
+            }
+        }
+        u.dev.st.borrow_mut().tx_rel = TxRel::default();
+        {
+            let g = run(u.shared.lock());
+            ensure!(
+                g.ack_frames.is_empty() && g.ack_status.is_empty(),
+                "every ack id resolved or freed"
+            );
+            ensure!(
+                g.link.last_ack_signal == Some(-65) && g.link.last_ack_ms.is_some(),
+                "last_ack_signal from the last ACK"
+            );
+        }
+        let before = run(u.shared.lock()).stats;
+        ensure!(narf_net::iface::send_on(u.name, &eth).is_ok(), "plain send");
+        let mut u = u;
+        let f = u.tx_cons.try_recv().ok().flatten().ok_or("TX ring")?;
+        ensure!(run(u.netdev.tx_one(&f)).is_ok(), "queued");
+        pump(&u, 3);
+        let g = run(u.shared.lock());
+        ensure!(
+            g.stats.tx_status_acked == before.tx_status_acked + 1 && g.ack_status.is_empty(),
+            "a plain frame's status only counts"
+        );
+        drop(g);
+
+        // Purged before TCL → dropped.
+        let id = {
+            let mut g = run(u.shared.lock());
+            g.stop_queues(TxQueues::vif_queues(), reason::DRIVER);
+            let id = g.tx_enqueue_status(eth.clone()).map_err(|_| "enqueue")?;
+            g.purge_txqs();
+            g.wake_queues(TxQueues::vif_queues(), reason::DRIVER);
+            id
+        };
+        ensure!(
+            run(u.shared.lock())
+                .ack_status
+                .pop_front()
+                .is_some_and(|(i, s)| i == id && s == TxStatus::DROPPED),
+            "purged: dropped"
+        );
+        // Interface down with a frame waiting → dropped.
+        let id = {
+            let mut g = run(u.shared.lock());
+            g.stop_queues(TxQueues::vif_queues(), reason::DRIVER);
+            g.tx_enqueue_status(eth.clone()).map_err(|_| "enqueue")?
+        };
+        ensure!(narf_net::iface::set_link_state(u.name, false), "down");
+        pump(&u, 1);
+        let mut g = run(u.shared.lock());
+        ensure!(
+            g.ack_status
+                .pop_front()
+                .is_some_and(|(i, s)| i == id && s == TxStatus::DROPPED)
+                && g.ack_frames.is_empty(),
+            "interface down: dropped"
+        );
+        ensure!(
+            g.tx_enqueue_status(eth.clone()) == Err(runtime::ENOTCONN) && g.ack_frames.is_empty(),
+            "no station: refused, ack id freed"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_tx_status);

@@ -294,6 +294,12 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
             // ath11k_dp_vdev_tx_attach state) goes with the vif.
             g.mgmt = super::runtime::MgmtTx::default();
             g.link.vif = None;
+            // ieee80211_do_stop frees what is still waiting for a status.
+            let pending: Vec<u32> = g.ack_frames.ids().collect();
+            for id in pending {
+                g.ack_frames.remove(id);
+                g.ack_status.push_back((id, super::txq::TxStatus::DROPPED));
+            }
         }
         m.stop().await;
     }
