@@ -49,6 +49,7 @@ pub mod board;
 pub mod ce;
 pub mod core;
 pub mod dp;
+pub mod dp_frag;
 pub mod dp_peer;
 pub mod dp_ring;
 pub mod hal;

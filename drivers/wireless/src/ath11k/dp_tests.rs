@@ -1271,7 +1271,8 @@ fn smoke_ath11k_dp_rx_negatives() -> TestResult {
     let mut mic = good_rxd(msdu.len(), 1);
     mic.attn1 = 1 << 28;
     deliver(&r.io, &mut refill, &mut reo, &mic, &msdu);
-    // Raw decap: not station decap.
+    // Raw decap (only reassembled fragments arrive raw on a station):
+    // ath11k_dp_rx_h_undecap_raw drops the FCS, then 802.11 → 802.3.
     deliver(
         &r.io,
         &mut refill,
@@ -1284,7 +1285,10 @@ fn smoke_ath11k_dp_rx_negatives() -> TestResult {
 
     let (n, rx) = r.dp.process_rx(&mut r.hal, &r.io, 0, 64);
     let s = &r.dp.stats;
-    check!(rx.is_empty(), "nothing delivered");
+    check!(
+        rx.len() == 1 && rx[0].decap == 0 && rx[0].frame.len() == ETH_HLEN + 20 - 4,
+        "only the raw MPDU delivered, FCS trimmed"
+    );
     // Entries skipped for their cookie or push reason are not counted.
     check!(n == 7, "seven MSDUs reaped");
     check!(
@@ -1296,7 +1300,7 @@ fn smoke_ath11k_dp_rx_negatives() -> TestResult {
     check!(s.rx_msdu_len_err == 1, "msdu len err");
     check!(s.rx_invalid_len == 1, "invalid msdu len");
     check!(s.rx_fcs_err == 1 && s.rx_mic_err == 1, "FCS / MIC");
-    check!(s.rx_decap_unsupported == 2, "raw decap + short header");
+    check!(s.rx_decap_unsupported == 1, "short header");
     check!(
         refill.pending(&r.io) == 15,
         "every reaped buffer replenished"
@@ -1567,7 +1571,9 @@ fn smoke_ath11k_dp_reo_exception_drop() -> TestResult {
         exc.produce(&r.io, &ent(l1, 0, 0, false)),
         "msdu buffer type"
     );
-    // A single-MSDU fragment: dropped too (no defragmentation).
+    // A single-MSDU fragment after a dropped entry: Linux's `drop` stays
+    // set for the rest of the pass, so it is freed and its link
+    // descriptor not returned (quirk kept).
     let (_, c3) = fw_take(&r.io, &mut refill);
     let l3 = fill_link_desc(&r.io, &mut idle, &[c3], 4);
     check!(exc.produce(&r.io, &ent(l3, 0, 1, true)), "fragment");
@@ -1583,23 +1589,35 @@ fn smoke_ath11k_dp_reo_exception_drop() -> TestResult {
         s.reo_err_parse == 1 && s.invalid_rbm == 1,
         "parse / rbm errors"
     );
-    check!(s.rx_err_frags_dropped == 1, "fragment dropped");
+    check!(
+        s.rx_err_frags_dropped == 0,
+        "the fragment never reached reassembly"
+    );
     let cook = |i: u32| buf_addr_get(refill.entry(i)[0], refill.entry(i)[1]).1;
     check!(cook(15) == c1 && cook(0) == c3, "freed MSDU ids reposted");
     check!(r.dp.rx_buf(c2).is_some(), "bad-rbm MSDU not touched");
     let a = sw2wbm.consume(&r.io).unwrap();
     let b = sw2wbm.consume(&r.io).unwrap();
-    let c = sw2wbm.consume(&r.io).unwrap();
     check!(
-        a[..2] == l1
-            && a[2] == 0x44
-            && b[..2] == l2
-            && b[2] == 0x4c
-            && c[..2] == l3
-            && c[2] == 0x44,
-        "PUT_IN_IDLE, REL_MSDU (0x4c), PUT_IN_IDLE"
+        a[..2] == l1 && a[2] == 0x44 && b[..2] == l2 && b[2] == 0x4c,
+        "PUT_IN_IDLE, REL_MSDU (0x4c)"
     );
-    check!(sw2wbm.consume(&r.io).is_none(), "three returns");
+    check!(sw2wbm.consume(&r.io).is_none(), "two returns");
+
+    // A lone fragment in a new pass reaches ath11k_dp_rx_frag_h_mpdu,
+    // which refuses it (no descriptor of a known peer): freed, link
+    // descriptor returned PUT_IN_IDLE.
+    let (pa4, c4) = fw_take(&r.io, &mut refill);
+    phys_write(pa4, &rx_desc_bytes(&good_rxd(30, 0)));
+    let l4 = fill_link_desc(&r.io, &mut idle, &[c4], 4);
+    check!(exc.produce(&r.io, &ent(l4, 0, 1, true)), "lone fragment");
+    check!(r.dp.process_rx_err(&mut r.hal, &r.io, 64) == 1, "reaped");
+    check!(
+        r.dp.stats.rx_err_frags_dropped == 1,
+        "refused by frag_h_mpdu"
+    );
+    let c = sw2wbm.consume(&r.io).unwrap();
+    check!(c[..2] == l4 && c[2] == 0x44, "returned PUT_IN_IDLE");
     TestResult::Pass
 }
 kernel_test_in!(
@@ -2220,3 +2238,429 @@ fn smoke_ath11k_dp_decap_helpers() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_dp_decap_helpers);
+
+// ── RX fragment reassembly (dp_frag) ──────────────────────────────
+
+const SW2REO_R0: u32 = 0x00a3_81ec;
+const SW2REO_HP: u32 = 0x00a3_b028;
+/// The AP's peer id for the reassembly tests.
+const FRAG_PEER: u16 = 3;
+const FRAG_SEQ: u32 = 5;
+/// `queue_addr_lo` / `queue_addr_hi` of the exception entries.
+const FRAG_QLO: u32 = 0xabcd_0000;
+const FRAG_QHI: u32 = 0x01;
+/// REO destination indication in the MSDU link entry.
+const FRAG_DEST: u32 = 2;
+
+/// A rig with the AP mapped (HTT PEER_MAP) and its REO queues set up
+/// (`ath11k_dp_peer_setup`, so `dp_setup_done`), CCMP on the peer.
+fn frag_rig() -> Rig {
+    let mut r = rig(SMALL);
+    let mut m = Vec::new();
+    m.extend_from_slice(&(3u32 | (FRAG_PEER as u32) << 16).to_le_bytes());
+    m.extend_from_slice(&[BSSID[0], BSSID[1], BSSID[2], BSSID[3]]);
+    m.extend_from_slice(&[BSSID[4], BSSID[5], 0, 0]);
+    r.dp.htt_t2h_msg_handler(&m).expect("peer map");
+    let (mut op, _) = r.dp.peer_setup_begin(0, BSSID, 0);
+    while r
+        .dp
+        .peer_setup_next(&mut r.hal, &r.io, &mut op, 0)
+        .expect("peer setup")
+        .is_some()
+    {}
+    r.dp.set_peer_sec_type(FRAG_PEER, enc::CCMP_128, enc::CCMP_128);
+    r
+}
+
+/// Fragment `frag` of sequence `seq` as the hardware hands it over raw
+/// and decrypted: 802.11 header (data | FromDS | Protected, More
+/// Fragments unless `last`), CCMP header with PN `pn`, `body`, the 8-byte
+/// MIC, the FCS.
+fn raw_frag(seq: u32, frag: u8, last: bool, pn: u8, body: &[u8]) -> Vec<u8> {
+    let mut f = vec![0x08, if last { 0x42 } else { 0x46 }, 0, 0];
+    f.extend_from_slice(&STA);
+    f.extend_from_slice(&BSSID);
+    f.extend_from_slice(&SRC);
+    f.extend_from_slice(&((seq << 4) as u16 | frag as u16).to_le_bytes());
+    f.extend_from_slice(&[pn, 0, 0, 0x20, 0, 0, 0, 0]);
+    f.extend_from_slice(body);
+    f.extend_from_slice(&[0x4d; 8]); // MIC
+    f.extend_from_slice(&[0xfc, 0xfc, 0xfc, 0xfc]); // FCS
+    f
+}
+
+/// The fragment's RX descriptor: raw decap, CCMP decrypted OK, TID 0,
+/// sequence `seq`, peer `FRAG_PEER`, MPDU sequence / frame-control valid.
+fn frag_desc(len: usize, seq: u32, mcbc: bool) -> Vec<u8> {
+    let mut b = rx_desc_bytes(&Rxd {
+        first: true,
+        last: true,
+        msdu_len: len as u32,
+        decap: 0,
+        enc_valid: true,
+        enc_type: enc::CCMP_128,
+        seq,
+        sw_peer_id: FRAG_PEER,
+        attn1: if mcbc { 1 << 2 } else { 0 },
+        ..Rxd::default()
+    });
+    // mpdu_start.info1 @ 188: MPDU_FCTRL_VALID (0) | MPDU_SEQ_CTRL_VALID (6)
+    let v = u32::from_le_bytes([b[188], b[189], b[190], b[191]]) | 1 | 1 << 6;
+    put32(&mut b, 188, v);
+    b
+}
+
+/// Firmware side: a fragment in the next refill buffer, its MSDU link
+/// descriptor (REO destination `FRAG_DEST`) from the idle list, and the
+/// REO exception entry (FRAG_FLAG, error detected, link buffer type).
+fn frag_entry(
+    r: &Rig,
+    refill: &mut DevRing,
+    idle: &mut DevRing,
+    exc: &mut DevRing,
+    mpdu: &[u8],
+    seq: u32,
+    mcbc: bool,
+) -> [u32; 2] {
+    let (pa, cookie) = fw_take(&r.io, refill);
+    let mut buf = frag_desc(mpdu.len(), seq, mcbc);
+    buf.extend_from_slice(mpdu);
+    phys_write(pa, &buf);
+    let w = idle.consume(&r.io).expect("idle link descriptor");
+    let (lpa, _, _) = buf_addr_get(w[0], w[1]);
+    let mut b = vec![0u8; 128];
+    put32(&mut b, 32, pa as u32);
+    put32(
+        &mut b,
+        36,
+        ((pa >> 32) as u32 & 0xff) | (4 << 8) | (cookie << 11),
+    );
+    put32(&mut b, 40, FRAG_DEST << 17);
+    phys_write(lpa, &b);
+    let mut e = [0u32; 16];
+    e[0] = w[0];
+    e[1] = w[1];
+    e[2] = 1 << 20 | FRAG_SEQ << 8;
+    e[3] = FRAG_PEER as u32;
+    e[6] = FRAG_QLO;
+    e[7] = FRAG_QHI | (1 << 8); // buffer type link desc, push ERR_DETECTED
+    assert!(exc.produce(&r.io, &e));
+    [w[0], w[1]]
+}
+
+fn body0() -> Vec<u8> {
+    vec![0xaa, 0xaa, 0x03, 0, 0, 0, 0x08, 0x00, 1, 2, 3, 4]
+}
+
+/// The reassembled MPDU (`ath11k_dp_rx_h_defrag`, CCMP): fragment 0's
+/// header (More Fragments cleared) + IV, both bodies, the last
+/// fragment's MIC + FCS.
+fn defragged() -> Vec<u8> {
+    let mut f = raw_frag(FRAG_SEQ, 0, true, 0x10, &body0());
+    f.truncate(24 + 8 + 12);
+    f.extend_from_slice(&[5, 6, 7, 8]);
+    f.extend_from_slice(&[0x4d; 8]);
+    f.extend_from_slice(&[0xfc; 4]);
+    f
+}
+
+fn smoke_ath11k_dp_defrag_reinject_golden() -> TestResult {
+    let mut r = frag_rig();
+    let mut refill = lmac(&r.msgs[0]);
+    let mut idle = umac_src(&r.io, WBM_IDLE_R0, WBM_IDLE_HP);
+    let mut exc = umac_dst(&r.io, REO2TCL_R0, REO2TCL_TP);
+    let mut sw2wbm = umac_src(&r.io, SW2WBM_R0, SW2WBM_HP);
+    let mut reinj = umac_src(&r.io, SW2REO_R0, SW2REO_HP);
+    let mut reo = umac_dst(&r.io, REO2SW1_R0, REO2SW1_TP);
+    r.dp.now_ms = 1000;
+    let f0 = raw_frag(FRAG_SEQ, 0, false, 0x10, &body0());
+    let f1 = raw_frag(FRAG_SEQ, 1, true, 0x11, &[5, 6, 7, 8]);
+    let l0 = frag_entry(&r, &mut refill, &mut idle, &mut exc, &f0, FRAG_SEQ, false);
+    check!(
+        r.dp.process_rx_err(&mut r.hal, &r.io, 64) == 1,
+        "frag 0 reaped"
+    );
+    let t = &r.dp.peer_rx.peer(0, &BSSID).unwrap().rx_tid[0];
+    check!(
+        t.rx_frag_bitmap == 1 && t.cur_sn == FRAG_SEQ as u16 && t.frag_timer == Some(3000),
+        "frag 0 held, 2 s timer armed"
+    );
+    check!(
+        sw2wbm.consume(&r.io).is_none(),
+        "frag 0's link descriptor kept"
+    );
+    let l1 = frag_entry(&r, &mut refill, &mut idle, &mut exc, &f1, FRAG_SEQ, false);
+    check!(
+        r.dp.process_rx_err(&mut r.hal, &r.io, 64) == 1,
+        "frag 1 reaped"
+    );
+    let ret = sw2wbm.consume(&r.io).expect("frag 1's link descriptor");
+    check!(
+        ret[..2] == l1 && ret[2] == 0x44,
+        "frag 1 returned PUT_IN_IDLE"
+    );
+    check!(
+        sw2wbm.consume(&r.io).is_none(),
+        "frag 0's link descriptor reused"
+    );
+    check!(r.dp.stats.rx_defrag_reinjected == 1, "reinjected");
+    let t = &r.dp.peer_rx.peer(0, &BSSID).unwrap().rx_tid[0];
+    check!(
+        t.rx_frags.is_empty() && t.rx_frag_bitmap == 0 && t.dst_ring_desc.is_none(),
+        "state cleared"
+    );
+    // hal_reo_entrance_ring: frag 0's link descriptor (rbm
+    // WBM_IDLE_DESC_LIST = 1, cookie = bank), MSDU count 1 | seq 5 |
+    // VALID_PN (24) | VALID_SA (25) | VALID_DA (27) | RAW_MPDU (30),
+    // meta data + queue address from the exception entry, dest ind 2.
+    let e = reinj.consume(&r.io).expect("reinject entry");
+    let link = [l0[0], (l0[1] & !(7 << 8)) | (1 << 8)];
+    check!(
+        e[..2] == link
+            && e[2] == 1 | FRAG_SEQ << 8 | 1 << 24 | 1 << 25 | 1 << 27 | 1 << 30
+            && e[3] == FRAG_PEER as u32
+            && e[4] == FRAG_QLO
+            && e[5] == FRAG_QHI | FRAG_DEST << 22
+            && e[6] == 0
+            && e[7] == 0,
+        "reinject entry golden"
+    );
+    // The MSDU link entry now names the reassembled buffer: FIRST | LAST
+    // | length << 3 | dest << 17 | VALID_SA (23) | VALID_DA (25).
+    let want = defragged();
+    let (lpa, _, _) = buf_addr_get(l0[0], l0[1]);
+    let mut ld = [0u8; 48];
+    phys_read(lpa, &mut ld);
+    let w = |i: usize| u32::from_le_bytes([ld[i * 4], ld[i * 4 + 1], ld[i * 4 + 2], ld[i * 4 + 3]]);
+    check!(
+        w(10) == 1 | 2 | (want.len() as u32) << 3 | FRAG_DEST << 17 | 1 << 23 | 1 << 25
+            && w(11) == 0,
+        "MSDU link entry golden"
+    );
+    let (bpa, cookie, mgr) = buf_addr_get(w(8), w(9));
+    check!(
+        mgr == rbm::SW1_BM && cookie >> 18 == 0,
+        "rx_buf_rbm, pdev 0"
+    );
+    let mut buf = vec![0u8; DESC_SZ + want.len()];
+    phys_read(bpa, &mut buf);
+    let mut desc = frag_desc(want.len(), FRAG_SEQ, false);
+    check!(buf[DESC_SZ..] == want[..], "reassembled MPDU golden");
+    desc[104..108].copy_from_slice(&(want.len() as u32).to_le_bytes());
+    check!(
+        buf[..DESC_SZ] == desc[..],
+        "descriptor with the MSDU length rewritten"
+    );
+
+    // The REO delivers it on REO2SW1 (routing): a raw, decrypted MPDU →
+    // FCS, MIC, IV stripped (ath11k_dp_rx_h_undecap_raw) → Ethernet II.
+    check!(
+        reo.produce(
+            &r.io,
+            &reo_dest(
+                bpa,
+                cookie,
+                FIRST | LAST | (want.len() as u32) << 3,
+                1,
+                0,
+                FRAG_PEER as u32
+            )
+        ),
+        "REO dest entry"
+    );
+    let (n, out) = r.dp.process_rx(&mut r.hal, &r.io, 0, 64);
+    check!(n == 1 && out.len() == 1, "delivered");
+    let mut eth = STA.to_vec();
+    eth.extend_from_slice(&SRC);
+    eth.extend_from_slice(&[0x08, 0x00, 1, 2, 3, 4, 5, 6, 7, 8]);
+    check!(
+        out[0].frame == eth && out[0].decrypted && out[0].decap == 0,
+        "Ethernet II golden"
+    );
+    check!(
+        r.dp.rx_buf(cookie).is_none(),
+        "the reinjected buffer left the IDR"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_dp_defrag_reinject_golden
+);
+
+fn smoke_ath11k_dp_defrag_negatives() -> TestResult {
+    let mut r = frag_rig();
+    let mut refill = lmac(&r.msgs[0]);
+    let mut idle = umac_src(&r.io, WBM_IDLE_R0, WBM_IDLE_HP);
+    let mut exc = umac_dst(&r.io, REO2TCL_R0, REO2TCL_TP);
+    let mut sw2wbm = umac_src(&r.io, SW2WBM_R0, SW2WBM_HP);
+    let mut reinj = umac_src(&r.io, SW2REO_R0, SW2REO_HP);
+    let f0 = raw_frag(FRAG_SEQ, 0, false, 0x10, &body0());
+    let f1 = raw_frag(FRAG_SEQ, 1, true, 0x11, &[5, 6, 7, 8]);
+    macro_rules! feed {
+        ($f:expr, $seq:expr, $mc:expr) => {{
+            let l = frag_entry(&r, &mut refill, &mut idle, &mut exc, &$f, $seq, $mc);
+            r.dp.process_rx_err(&mut r.hal, &r.io, 64);
+            l
+        }};
+    }
+
+    // Out of order: frag 1 first, then 0 → sorted, reinjected as the
+    // in-order golden.
+    let l1 = feed!(f1, FRAG_SEQ, false);
+    let ret = sw2wbm.consume(&r.io).unwrap();
+    check!(ret[..2] == l1, "frag 1's link descriptor returned at once");
+    feed!(f0, FRAG_SEQ, false);
+    check!(
+        r.dp.stats.rx_defrag_reinjected == 1,
+        "out-of-order set reinjected"
+    );
+    let e = reinj.consume(&r.io).expect("reinject entry");
+    let (lpa, _, _) = buf_addr_get(e[0], e[1]);
+    let mut ld = [0u8; 40];
+    phys_read(lpa, &mut ld);
+    let (bpa, _, _) = buf_addr_get(
+        u32::from_le_bytes([ld[32], ld[33], ld[34], ld[35]]),
+        u32::from_le_bytes([ld[36], ld[37], ld[38], ld[39]]),
+    );
+    let want = defragged();
+    let mut buf = vec![0u8; want.len()];
+    phys_read(bpa + DESC_SZ as u64, &mut buf);
+    check!(buf == want, "sorted reassembly");
+
+    // A PN gap (0x10 → 0x12): the set is dropped, both link descriptors
+    // returned, nothing reinjected.
+    let l0 = feed!(f0, FRAG_SEQ, false);
+    let l1 = feed!(
+        raw_frag(FRAG_SEQ, 1, true, 0x12, &[5, 6, 7, 8]),
+        FRAG_SEQ,
+        false
+    );
+    let a = sw2wbm.consume(&r.io).unwrap();
+    let b = sw2wbm.consume(&r.io).unwrap();
+    check!(a[..2] == l1 && b[..2] == l0, "frag 1 then frag 0 returned");
+    check!(
+        r.dp.stats.rx_defrag_dropped == 1 && reinj.consume(&r.io).is_none(),
+        "PN gap: dropped, not reinjected"
+    );
+
+    // A duplicate fragment: refused, its own link descriptor returned.
+    let l0 = feed!(f0, FRAG_SEQ, false);
+    let d0 = feed!(f0, FRAG_SEQ, false);
+    let a = sw2wbm.consume(&r.io).unwrap();
+    check!(
+        a[..2] == d0 && r.dp.stats.rx_err_frags_dropped == 1,
+        "duplicate refused"
+    );
+    // A new sequence number flushes the held set (frag 0 returned).
+    let l0b = feed!(raw_frag(6, 0, false, 0x20, &body0()), 6, false);
+    let a = sw2wbm.consume(&r.io).unwrap();
+    check!(a[..2] == l0, "old set flushed on a new sequence");
+    check!(
+        r.dp.peer_rx.peer(0, &BSSID).unwrap().rx_tid[0].cur_sn == 6,
+        "new cur_sn"
+    );
+    // The fragment timer: nothing before 2 s, the set dropped at 2 s.
+    let armed = r.dp.peer_rx.peer(0, &BSSID).unwrap().rx_tid[0]
+        .frag_timer
+        .unwrap();
+    r.dp.service_frag_timers(&mut r.hal, &r.io, armed - 1);
+    check!(sw2wbm.consume(&r.io).is_none(), "not yet");
+    r.dp.service_frag_timers(&mut r.hal, &r.io, armed);
+    let a = sw2wbm.consume(&r.io).unwrap();
+    check!(
+        a[..2] == l0b && r.dp.stats.rx_defrag_timeout == 1,
+        "timer expiry drops the set"
+    );
+
+    // Group-addressed and unfragmented MPDUs are refused.
+    let m = feed!(f0, FRAG_SEQ, true);
+    let a = sw2wbm.consume(&r.io).unwrap();
+    check!(a[..2] == m, "multicast fragment refused");
+    let mut whole = raw_frag(FRAG_SEQ, 0, true, 0x10, &body0());
+    whole[1] = 0x42;
+    let w = feed!(whole, FRAG_SEQ, false);
+    let a = sw2wbm.consume(&r.io).unwrap();
+    check!(a[..2] == w, "unfragmented MPDU refused");
+
+    // ath11k_peer_frags_flush (pairwise key install): held set dropped.
+    let l0 = feed!(f0, FRAG_SEQ, false);
+    r.dp.peer_frags_flush(&mut r.hal, &r.io, 0, &BSSID);
+    let a = sw2wbm.consume(&r.io).unwrap();
+    let t = &r.dp.peer_rx.peer(0, &BSSID).unwrap().rx_tid[0];
+    check!(
+        a[..2] == l0 && t.rx_frags.is_empty() && t.frag_timer.is_none(),
+        "flush returns frag 0, timer stopped"
+    );
+
+    // A mapped peer without its data path set up: refused.
+    let mut m = Vec::new();
+    m.extend_from_slice(&(3u32 | 7u32 << 16).to_le_bytes());
+    m.extend_from_slice(&[SRC[0], SRC[1], SRC[2], SRC[3], SRC[4], SRC[5], 0, 0]);
+    r.dp.htt_t2h_msg_handler(&m).expect("peer map");
+    let (pa, cookie) = fw_take(&r.io, &mut refill);
+    let mut buf = frag_desc(f0.len(), FRAG_SEQ, false);
+    buf[186..188].copy_from_slice(&7u16.to_le_bytes());
+    buf.extend_from_slice(&f0);
+    phys_write(pa, &buf);
+    let before = r.dp.stats.rx_err_frags_dropped;
+    let _ = cookie;
+    // (no peer_rx entry exists for peer 7: ENOENT)
+    let w = idle.consume(&r.io).unwrap();
+    let (lpa, _, _) = buf_addr_get(w[0], w[1]);
+    let mut b = vec![0u8; 128];
+    put32(&mut b, 32, pa as u32);
+    put32(&mut b, 36, (4 << 8) | (cookie << 11));
+    phys_write(lpa, &b);
+    let mut e = [0u32; 16];
+    e[0] = w[0];
+    e[1] = w[1];
+    e[2] = 1 << 20;
+    e[7] = 1 << 8;
+    check!(exc.produce(&r.io, &e), "entry");
+    r.dp.process_rx_err(&mut r.hal, &r.io, 64);
+    let a = sw2wbm.consume(&r.io).unwrap();
+    check!(
+        a[..2] == [w[0], w[1]] && r.dp.stats.rx_err_frags_dropped == before + 1,
+        "peer without a data path refused"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_dp_defrag_negatives);
+
+/// `ath11k_dp_rx_h_undecap_raw` + the crypto lengths, against literals.
+fn smoke_ath11k_dp_undecap_raw() -> TestResult {
+    use super::dp_frag::{crypto_icv_len, crypto_mic_len, crypto_param_len, undecap_raw};
+    check!(
+        crypto_mic_len(enc::CCMP_128) == 8
+            && crypto_mic_len(enc::GCMP_128) == 16
+            && crypto_mic_len(enc::TKIP_MIC) == 0
+            && crypto_param_len(enc::CCMP_128) == 8
+            && crypto_param_len(enc::TKIP_MIC) == 8
+            && crypto_param_len(enc::OPEN) == 0
+            && crypto_icv_len(enc::TKIP_MIC) == 4
+            && crypto_icv_len(enc::CCMP_128) == 0,
+        "ath11k_dp_rx_crypto_*_len"
+    );
+    let f = raw_frag(1, 0, true, 9, &[1, 2]);
+    let mut hdr = f[..24].to_vec();
+    hdr.extend_from_slice(&[1, 2]);
+    check!(
+        undecap_raw(&f, enc::CCMP_128, true, false).as_deref() == Some(&hdr[..]),
+        "decrypted unicast: FCS, MIC, IV stripped"
+    );
+    check!(
+        undecap_raw(&f, enc::OPEN, false, false).as_deref() == Some(&f[..f.len() - 4]),
+        "not decrypted: FCS only"
+    );
+    check!(
+        undecap_raw(&f, enc::CCMP_128, true, true).is_none(),
+        "decrypted group frame keeps its IV for mac80211"
+    );
+    check!(
+        undecap_raw(&f[..3], enc::OPEN, false, false).is_none(),
+        "short"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_dp_undecap_raw);

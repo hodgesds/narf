@@ -492,6 +492,7 @@ pub enum SyncOp {
     PeerCleanup { vdev_id: u32, addr: [u8; 6] },
     SetAuthorized { addr: [u8; 6], on: bool },
     StaWme { addr: [u8; 6], wme: bool },
+    FragsFlush { vdev_id: u32, addr: [u8; 6] },
 }
 
 fn is_multicast(a: &[u8]) -> bool {
@@ -573,6 +574,11 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
                 if self.link.bss == Some(addr) {
                     self.link.wme = wme;
                 }
+            }
+            SyncOp::FragsFlush { vdev_id, addr } => {
+                let hif = &mut self.core.hif;
+                self.dp
+                    .peer_frags_flush(&mut hif.ce.hal, &hif.io, vdev_id as u8, &addr);
             }
         }
     }
@@ -670,6 +676,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
         self.core.drain_rx();
         self.route_htt();
 
+        self.dp.now_ms = now;
         let mask = *self.dp.cfg.hw.ring_mask;
         let pending = self.core.hif.irq.take_dp_pending();
         for grp in 0..ATH11K_EXT_IRQ_GRP_NUM_MAX {
@@ -701,6 +708,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
         {
             let hif = &mut self.core.hif;
             self.dp.service_shadow_timers(&mut hif.ce.hal, &hif.io, now);
+            self.dp.service_frag_timers(&mut hif.ce.hal, &hif.io, now);
         }
         // ath11k_dp_service_mon_ring (non-full-monitor: status rings).
         if let Some(at) = self.mon_reap_at {
@@ -1466,6 +1474,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
 
     fn set_sta_wme(&self, addr: [u8; 6], wme: bool) {
         self.0.push_op(SyncOp::StaWme { addr, wme });
+    }
+
+    fn peer_frags_flush(&self, vdev_id: u32, addr: [u8; 6]) {
+        self.0.push_op(SyncOp::FragsFlush { vdev_id, addr });
     }
 
     async fn ampdu_rx_start(

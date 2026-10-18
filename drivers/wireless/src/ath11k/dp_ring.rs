@@ -18,7 +18,7 @@
 //! | [`Dp::tx`] | `ath11k_dp_tx` (+ `ath11k_hal_tx_cmd_desc_setup`) |
 //! | [`Dp::tx_completion_handler`] | `ath11k_dp_tx_completion_handler` |
 //! | [`Dp::process_rx`] | `ath11k_dp_process_rx` (+ `process_msdu`, `msdu_coalesce`, `h_mpdu`) |
-//! | [`Dp::process_rx_err`] | `ath11k_dp_process_rx_err` (fragments dropped) |
+//! | [`Dp::process_rx_err`] | `ath11k_dp_process_rx_err` (fragments to [`super::dp_frag`]) |
 //! | [`Dp::rx_process_wbm_err`] | `ath11k_dp_rx_process_wbm_err` (+ `h_null_q_desc`) |
 //! | [`Dp::process_rxdma_err`] | `ath11k_dp_process_rxdma_err` |
 //! | [`Dp::process_reo_status`] | `ath11k_dp_process_reo_status` |
@@ -44,7 +44,7 @@
 //! deliver.
 //!
 //! Not ported: the WBM idle-list scatter setup (needs > 2 MiB of idle
-//! entries; WCN6855 needs 256 KiB), RX defragmentation, monitor rings, PPDU / peer stats, TX
+//! entries; WCN6855 needs 256 KiB), monitor rings, PPDU / peer stats, TX
 //! rate statistics, ring teardown (`ath11k_dp_free`).
 
 #![allow(dead_code)]
@@ -611,6 +611,9 @@ pub struct DpSrng {
 pub struct RxBuf {
     pub mem: DmaMem,
     pub paddr: u64,
+    /// A reassembled MPDU reinjected through the REO (`rxcb->is_frag`):
+    /// its length (descriptor + MPDU).
+    pub frag_len: Option<u32>,
 }
 
 /// `struct dp_rxdma_ring`.
@@ -663,13 +666,25 @@ pub struct LinkDescBank {
 impl LinkDescBank {
     /// Word `i` of the 128-byte link descriptor at device address `pa`,
     /// if it lies in this bank.
-    fn rd(&self, pa: u64, i: u32) -> Option<u32> {
+    pub(super) fn rd(&self, pa: u64, i: u32) -> Option<u32> {
         let off = pa.checked_sub(self.paddr)?;
         let byte = off + self.align_bytes as u64 + i as u64 * 4;
         if byte + 4 > self.mem.len() as u64 || off % 4 != 0 {
             return None;
         }
         Some(self.mem.rd32((byte / 4) as usize))
+    }
+
+    /// Write word `i` of the link descriptor at `pa` (the defrag
+    /// reinjection rewrites its first MSDU entry).
+    pub(super) fn wr(&self, pa: u64, i: u32, v: u32) -> Option<()> {
+        let off = pa.checked_sub(self.paddr)?;
+        let byte = off + self.align_bytes as u64 + i as u64 * 4;
+        if byte + 4 > self.mem.len() as u64 || off % 4 != 0 {
+            return None;
+        }
+        self.mem.wr32((byte / 4) as usize, v);
+        Some(())
     }
 }
 
@@ -725,7 +740,16 @@ pub struct DpStats {
     pub rx_decrypt_err: u32,
     pub rx_delivered: u32,
     pub rx_buf_alloc_fail: u32,
+    /// Fragments refused by `ath11k_dp_rx_frag_h_mpdu` (freed, link
+    /// descriptor returned).
     pub rx_err_frags_dropped: u32,
+    /// Reassembled MPDUs reinjected into the REO.
+    pub rx_defrag_reinjected: u32,
+    /// Complete fragment sets dropped (PN gap, reassembly / reinjection
+    /// failure).
+    pub rx_defrag_dropped: u32,
+    /// Incomplete sets dropped by the fragment timer.
+    pub rx_defrag_timeout: u32,
     pub wbm_err_parse: u32,
     pub reo_err_parse: u32,
     pub link_desc_lookup_fail: u32,
@@ -972,6 +996,8 @@ pub struct Dp {
     pub stats: DpStats,
     /// Per-peer REO queues + pending REO commands (`dp_peer`).
     pub peer_rx: super::dp_peer::DpPeerRx,
+    /// The service pass's clock (ms; `jiffies` for the fragment timer).
+    pub now_ms: u64,
 }
 
 fn dp_err(step: u32, detail: u32, errno: i32) -> TransportError {
@@ -1299,6 +1325,8 @@ struct RxSkb {
     mac_id: u8,
     err_rel_src: u32,
     err_code: u32,
+    /// `rxcb->is_frag`: a reassembled MPDU back from the REO.
+    is_frag: bool,
 }
 
 impl RxSkb {
@@ -1314,6 +1342,7 @@ impl RxSkb {
             mac_id,
             err_rel_src: 0,
             err_code: 0,
+            is_frag: false,
         }
     }
 }
@@ -1562,6 +1591,7 @@ impl Dp {
             crash_flush: false,
             stats: DpStats::default(),
             peer_rx: super::dp_peer::DpPeerRx::default(),
+            now_ms: 0,
         })
     }
 
@@ -2007,10 +2037,15 @@ impl Dp {
                     }
                 };
             let paddr = mem.paddr();
-            let buf_id = match rx_ring
-                .bufs
-                .alloc(RxBuf { mem, paddr }, 1, rx_ring.bufs_max * 3 + 1)
-            {
+            let buf_id = match rx_ring.bufs.alloc(
+                RxBuf {
+                    mem,
+                    paddr,
+                    frag_len: None,
+                },
+                1,
+                rx_ring.bufs_max * 3 + 1,
+            ) {
                 Ok(b) => b,
                 Err(_) => break,
             };
@@ -2042,12 +2077,21 @@ impl Dp {
 
     /// Take the refill-ring buffer `buf_id` (`idr_find` + `idr_remove` +
     /// `dma_unmap_single`), returning its full contents.
-    fn take_rx_buf(&mut self, buf_id: u32) -> Option<Vec<u8>> {
+    pub(super) fn take_rx_buf(&mut self, buf_id: u32) -> Option<Vec<u8>> {
+        self.take_rx_buf_frag(buf_id).map(|(d, _)| d)
+    }
+
+    /// [`Self::take_rx_buf`] + whether it is a reinjected reassembled
+    /// MPDU (`rxcb->is_frag`; its exact length is returned).
+    fn take_rx_buf_frag(&mut self, buf_id: u32) -> Option<(Vec<u8>, bool)> {
         let pdev = self.pdev.as_mut()?;
         let b = pdev.rx_refill_buf_ring.bufs.remove(buf_id)?;
-        let mut data = vec![0u8; DP_RX_BUFFER_SIZE as usize];
+        let len = b
+            .frag_len
+            .map_or(DP_RX_BUFFER_SIZE as usize, |l| l as usize);
+        let mut data = vec![0u8; len];
         b.mem.read_bytes(0, &mut data);
-        Some(data)
+        Some((data, b.frag_len.is_some()))
     }
 
     /// Posted RX buffer `buf_id` of the refill ring (tests / device
@@ -2400,7 +2444,7 @@ impl Dp {
                 if buf_id == 0 {
                     continue;
                 }
-                let Some(data) = self.take_rx_buf(buf_id) else {
+                let Some((data, is_frag)) = self.take_rx_buf_frag(buf_id) else {
                     self.stats.rx_invalid_cookie += 1;
                     continue;
                 };
@@ -2411,6 +2455,7 @@ impl Dp {
                     continue;
                 }
                 let mut skb = RxSkb::new(data, mac_id);
+                skb.is_frag = is_frag;
                 let msdu_info = d[4];
                 skb.is_first_msdu = msdu_info & RX_MSDU_DESC_INFO0_FIRST_MSDU_IN_MPDU != 0;
                 skb.is_last_msdu = msdu_info & RX_MSDU_DESC_INFO0_LAST_MSDU_IN_MPDU != 0;
@@ -2509,7 +2554,10 @@ impl Dp {
         let msdu_len = rxd.msdu_len() as usize;
         let l3pad = lrxd.l3_pad_bytes() as usize;
 
-        let payload: Vec<u8> = if !first.is_continuation {
+        let payload: Vec<u8> = if first.is_frag {
+            // skb_pull(msdu, hal_rx_desc_sz): the whole reassembled MPDU.
+            first.data[desc_sz..].to_vec()
+        } else if !first.is_continuation {
             if msdu_len + desc_sz > bufsz {
                 return Err(RxDrop::InvalidLen);
             }
@@ -2634,6 +2682,12 @@ impl Dp {
 
         let decap_ty = rxd.decap_type();
         let frame = match decap_ty {
+            // ath11k_dp_rx_h_undecap_raw (a single-MSDU MPDU only), then
+            // mac80211's 802.11 → 802.3.
+            decap::RAW if skb.is_first_msdu && skb.is_last_msdu => {
+                super::dp_frag::undecap_raw(&payload, enctype, decrypted, is_mcbc)
+                    .and_then(|f| nwifi_to_eth(&f))
+            }
             decap::NATIVE_WIFI => nwifi_to_eth(&payload),
             decap::ETHERNET2_DIX => (payload.len() >= ETH_HLEN).then(|| payload.clone()),
             decap::IEEE8023 => ieee8023_to_eth(&payload),
@@ -2725,15 +2779,19 @@ impl Dp {
         r
     }
 
-    /// Linux `ath11k_dp_process_rx_err` (REO exception ring). Fragments
-    /// are not reassembled: every MSDU is dropped and its link
-    /// descriptor returned (Linux drops all but single-MSDU fragments).
+    /// Linux `ath11k_dp_process_rx_err` (REO exception ring): a
+    /// single-MSDU fragment goes to the reassembly
+    /// ([`Dp::rx_err_buf`] → [`Dp::frag_h_mpdu`]); everything else is
+    /// dropped and its link descriptor returned. Linux quirk kept: `drop`
+    /// is not reset per entry, so once a pass dropped an entry, the
+    /// fragments after it are freed too (their link descriptors not
+    /// returned).
     pub fn process_rx_err(&mut self, hal: &mut Hal, io: &impl ChipIo, budget: u32) -> u32 {
         let id = self.reo_except_ring.ring_id;
         let quota = budget;
         let mut budget = budget;
         let mut tot_n_bufs_reaped = 0u32;
-        let mut returns: Vec<([u32; 2], u32)> = Vec::new();
+        let mut drop = false;
 
         hal.access_begin(id);
         while budget > 0 {
@@ -2763,22 +2821,21 @@ impl Dp {
             };
             if rbm_v != rbm::WBM_IDLE_DESC_LIST && rbm_v != rbm::SW1_BM && rbm_v != rbm::SW3_BM {
                 self.stats.invalid_rbm += 1;
-                returns.push(([d[0], d[1]], HAL_WBM_REL_BM_ACT_REL_MSDU));
+                let _ = self.link_desc_return(hal, io, [d[0], d[1]], HAL_WBM_REL_BM_ACT_REL_MSDU);
                 continue;
             }
             let is_frag = d[2] & RX_MPDU_DESC_INFO0_FRAG_FLAG != 0;
-            // Fragment reassembly (ath11k_dp_rx_frag_h_mpdu) is not
-            // ported: its failure path (free + PUT_IN_IDLE) is taken.
-            returns.push(([d[0], d[1]], HAL_WBM_REL_BM_ACT_PUT_IN_IDLE));
-            if is_frag && cookies.len() <= 1 {
-                self.stats.rx_err_frags_dropped += 1;
+            // "Process only rx fragments with one msdu per link desc
+            // below, and drop msdu's indicated due to error reasons."
+            if !is_frag || cookies.len() > 1 {
+                drop = true;
+                let _ =
+                    self.link_desc_return(hal, io, [d[0], d[1]], HAL_WBM_REL_BM_ACT_PUT_IN_IDLE);
             }
             for c in cookies {
                 let buf_id = field_get(DP_RXDMA_BUF_COOKIE_BUF_ID, c);
-                if self.take_rx_buf(buf_id).is_some() {
+                if self.rx_err_buf(hal, io, &d, buf_id, drop) {
                     tot_n_bufs_reaped += 1;
-                } else {
-                    self.stats.rx_invalid_cookie += 1;
                 }
             }
             if tot_n_bufs_reaped >= quota {
@@ -2789,11 +2846,6 @@ impl Dp {
         }
         hal.access_end(io, id);
 
-        // Linux returns each link descriptor inside the reap loop (the
-        // SW2WBM ring has its own lock); the order is preserved.
-        for (b, act) in returns {
-            let _ = self.link_desc_return(hal, io, b, act);
-        }
         if tot_n_bufs_reaped != 0 {
             self.replenish_refill(hal, io, tot_n_bufs_reaped);
         }
@@ -3107,7 +3159,15 @@ impl Dp {
                 let new = mem.ok().and_then(|mem| {
                     let p = mem.paddr();
                     ring.bufs
-                        .alloc(RxBuf { mem, paddr: p }, 0, ring.bufs_max)
+                        .alloc(
+                            RxBuf {
+                                mem,
+                                paddr: p,
+                                frag_len: None,
+                            },
+                            0,
+                            ring.bufs_max,
+                        )
                         .ok()
                         .map(|i| (i, p))
                 });

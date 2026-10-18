@@ -118,6 +118,9 @@ pub trait DataPort {
     /// frames (`ieee80211_build_hdr` / `ieee80211_select_queue`) only for
     /// a WMM AP.
     fn set_sta_wme(&self, addr: [u8; 6], wme: bool);
+    /// `ath11k_peer_frags_flush` (`ath11k_mac_op_set_key` with a
+    /// station: before a pairwise key install).
+    fn peer_frags_flush(&self, vdev_id: u32, addr: [u8; 6]);
     /// `ath11k_mac_op_ampdu_action(IEEE80211_AMPDU_RX_START)` →
     /// `ath11k_dp_rx_ampdu_start`: the TID's REO queue with the
     /// negotiated window and SSN (`ath11k_peer_rx_tid_setup`) and its
@@ -2994,6 +2997,11 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             key_data: key.to_vec(),
             ..Default::default()
         };
+        if pairwise {
+            // "flush the fragments cache during key (re)install" (the
+            // pairwise key comes with `sta`; a group key does not).
+            self.dp.peer_frags_flush(vdev_id, addr);
+        }
         self.install_key_cmd(&arg).await?;
         if let Err(e) = self
             .dp

@@ -1078,12 +1078,19 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   makes Linux's `PTR_ALIGN` a no-op, and slack would double every
   power-of-two ring); RX is delivered as Ethernet II, not rebuilt
   802.11 (native-wifi → DA / SA / SNAP type; Ethernet-II passthrough;
-  802.3 + SNAP → Ethernet II; raw decap dropped); MPDUs with FCS,
+  802.3 + SNAP → Ethernet II; raw → `ath11k_dp_rx_h_undecap_raw` then
+  802.11 → 802.3 for unicast, a decrypted group raw MPDU (Linux keeps its
+  IV for mac80211) dropped); MPDUs with FCS,
   TKIP-MIC or decrypt errors are dropped in the DP (mac80211 drops or
   reports them; NARF has no TKIP countermeasures); multicast PN is not
-  checked by the host (Linux leaves it to mac80211); REO-exception
-  fragments are dropped (no defragmentation) and their link descriptor
-  returned; monitor-status buffers are recycled unparsed (no RSSI /
+  checked by the host (Linux leaves it to mac80211); the defrag
+  reinjection allocates its buffer id from 1 (Linux `idr_alloc(.., 0,
+  ..)` returns id 0, which `ath11k_dp_process_rx` skips as invalid: the
+  first reassembled MPDU would be lost); TKIP fragment sets are dropped
+  after reassembly (no Michael MIC, `ath11k_dp_rx_h_verify_tkip_mic`);
+  the pairwise-key fragment flush (`ath11k_peer_frags_flush`) is a
+  queued sync op applied at the install command's runtime lock;
+  monitor-status buffers are recycled unparsed (no RSSI /
   rate stats); `Dp` keeps the peer table HTT maps
   (`ath11k_peer_map_event`) itself. NARF-stricter: truncated HTT T2H
   messages, link descriptors outside every bank, an L3 pad that runs
@@ -1094,11 +1101,14 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   ORs into the recycled SW2WBM entry's `info0`;
   `ath11k_dp_process_rxdma_err` returns processed + 1; a continuation
   buffer reaped when the ring ends mid-MPDU with no complete MSDU is
-  stranded (removed from the IDR, not reposted) as in Linux.
+  stranded (removed from the IDR, not reposted) as in Linux;
+  `ath11k_dp_process_rx_err`'s `drop` is not reset per entry, so after a
+  dropped exception entry the later fragments of that pass are freed
+  without returning their link descriptors; the defrag keeps
+  `is_decrypted` across fragments.
 - DP not ported: WBM idle scatter list (dead for WBM_IDLE_LINK: > 2 MiB
   of 8-byte entries needs > 8 banks, which `ath11k_dp_link_desc_setup`
-  rejects first), fragment reassembly (`ath11k_peer_rx_frag_setup` is its
-  peer lookup + `dp_setup_done` only), monitor / full-monitor rings, PPDU / peer TX-RX
+  rejects first), monitor / full-monitor rings, PPDU / peer TX-RX
   statistics, ring teardown (`ath11k_dp_free`; a failed `Dp::alloc`
   leaves its rings in the HAL, so a retry needs a new `Hal`).
 - Integration (decided, §3.11): HTT T2H from the HTC HTT endpoint (and
@@ -1179,6 +1189,18 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   kept: `ath11k_dp_rx_ampdu_stop` REO-updates `peer->rx_tid` (TID 0's
   queue) to window 1 whichever TID stops, then sends the WMI for the
   stopped TID.
+- RX defragmentation (`dp_frag.rs`, done): single-MSDU fragments from
+  the REO exception ring → `ath11k_dp_process_rx_err_buf` →
+  `ath11k_dp_rx_frag_h_mpdu` (per peer / TID, sorted by fragment number,
+  a new sequence flushes, fragment 0's ring entry kept, the others' link
+  descriptors returned, 2 s `frag_timer` from the service pass), on a
+  complete set `defrag_validate_incr_pn` (CCMP / GCMP consecutive PNs),
+  `ath11k_dp_rx_h_defrag` + `_undecap_frag` and
+  `ath11k_dp_rx_h_defrag_reo_reinject` (fragment 0's MSDU link rewritten,
+  the MPDU on SW2REO with its REO queue); the REO returns it raw on a
+  destination ring (`rxcb->is_frag`). `ath11k_peer_frags_flush` runs
+  before a pairwise key install; `ath11k_peer_rx_tid_cleanup` drops held
+  fragments. No step codes (Linux only warns).
 - Peer REO integration (done): the runtime ports call §3.10's steps at
   the Linux call sites (`station_add` → `peer_setup`, `station_remove`
   → `peer_cleanup`, `set_key` → `pn_replay_config`, `ampdu_action`

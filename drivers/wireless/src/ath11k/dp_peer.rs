@@ -39,9 +39,10 @@
 //! - NARF-stricter: a TID above `HAL_DESC_REO_NON_QOS_TID` is refused
 //!   (Linux indexes `peer->rx_tid[]` out of bounds).
 //!
-//! Fragment reassembly is not ported (the DP drops fragments), so
-//! `ath11k_peer_rx_frag_setup` reduces to its peer lookup and
-//! `dp_setup_done`; `ath11k_dp_rx_frags_cleanup` has nothing to free.
+//! Fragment reassembly lives in [`super::dp_frag`]; its per-TID state is
+//! in [`RxTid`]. `ath11k_peer_rx_frag_setup` is its peer lookup and
+//! `dp_setup_done` (no Michael MIC transform: TKIP fragments are
+//! dropped).
 
 #![allow(dead_code)]
 
@@ -708,7 +709,7 @@ pub struct RxTidData {
     pub mem: Option<DmaMem>,
 }
 
-/// `struct dp_rx_tid` (fragment fields omitted: fragments are dropped).
+/// `struct dp_rx_tid`.
 #[derive(Debug, Default)]
 pub struct RxTid {
     pub tid: u8,
@@ -717,6 +718,17 @@ pub struct RxTid {
     pub ba_win_sz: u32,
     pub active: bool,
     mem: Option<DmaMem>,
+    /// `rx_frags`: the fragments held (RX descriptor + raw MPDU), in
+    /// fragment-number order.
+    pub rx_frags: Vec<Vec<u8>>,
+    /// `cur_sn` / `last_frag_no` / `rx_frag_bitmap`.
+    pub cur_sn: u16,
+    pub last_frag_no: u8,
+    pub rx_frag_bitmap: u16,
+    /// `dst_ring_desc`: fragment 0's REO exception ring entry.
+    pub dst_ring_desc: Option<[u32; 16]>,
+    /// `frag_timer` expiry (ms), when armed.
+    pub frag_timer: Option<u64>,
 }
 
 impl RxTid {
@@ -1278,7 +1290,8 @@ impl Dp {
     fn rx_tid_cleanup(&mut self, hal: &mut Hal, io: &impl ChipIo, pi: usize, now_ms: u64) {
         for tid in 0..NUM_RX_TIDS as u8 {
             self.rx_tid_delete(hal, io, pi, tid, now_ms);
-            // ath11k_dp_rx_frags_cleanup: no fragments are kept.
+            self.frags_cleanup(hal, io, pi, tid as usize, true);
+            self.peer_rx.peers[pi].rx_tid[tid as usize].frag_timer = None;
         }
     }
 

@@ -682,6 +682,7 @@ impl DataPort for FakeDp {
     fn set_sta_wme(&self, _addr: [u8; 6], wme: bool) {
         self.0.lock().sta_wme = Some(wme);
     }
+    fn peer_frags_flush(&self, _vdev_id: u32, _addr: [u8; 6]) {}
     fn ampdu_rx_start(
         &self,
         _vdev_id: u32,
