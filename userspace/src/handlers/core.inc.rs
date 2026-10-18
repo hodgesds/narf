@@ -3579,19 +3579,25 @@ fn stat_linux_fd(ctx: &mut dyn TrapContext, n: u32, out_ptr: *mut linux_compat::
     // inside the closure self-deadlocks when `/proc/self/fd/N` names a procfs
     // node. See sys_fstat_linux.
     let ops = fd::with_table(task, |t| t.get(n).map(|e| e.ops.clone()));
-    let (s, (uid, gid), rdev, ino, attrs) = match ops {
-        Some(Some(ops)) => (
-            ops.stat(),
-            ops.owners(),
-            ops.rdev(),
-            ops.ino(),
-            ops.inode_attrs(),
-        ),
-        _ => {
-            ctx.set_return(errno_ret(EBADF));
-            return;
-        }
-    };
+    match ops {
+        Some(Some(ops)) => stat_linux_ops(ctx, &ops, out_ptr),
+        _ => ctx.set_return(errno_ret(EBADF)),
+    }
+}
+
+/// `cp_new_stat` of an already-resolved file object.
+fn stat_linux_ops(
+    ctx: &mut dyn TrapContext,
+    ops: &Arc<dyn narf_filesystem::FileOps>,
+    out_ptr: *mut linux_compat::Stat,
+) {
+    let (s, (uid, gid), rdev, ino, attrs) = (
+        ops.stat(),
+        ops.owners(),
+        ops.rdev(),
+        ops.ino(),
+        ops.inode_attrs(),
+    );
     if out_ptr.is_null() {
         ctx.set_return(errno_ret(EFAULT));
         return;
@@ -3687,6 +3693,21 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     let path_owned = dir_named.unwrap_or_else(|| resolve_cwd_path(task, raw));
     let _ = (); // silence unused-binding lint when both arms drop the value
     let path: &str = &path_owned;
+    // A FOLLOWED `/proc/<pid>/ns/<flavour>` magic link lands on the nsfs
+    // inode, whose st_ino is the namespace's inum (`proc_ns_get_link` ->
+    // `ns_get_path`). systemd's `namespace_is_init` compares exactly that
+    // against PROC_PID_INIT_INO. Describing the procfs link node instead made
+    // every boot "Detected virtualization container-other", which starts
+    // console-getty competing with getty@tty1 for the one console.
+    #[cfg(feature = "container")]
+    if follow_final {
+        let proc_prefix = apply_chroot("/proc");
+        if let Some(nsfd) = proc_namespace_fd_from_path(task, path, &proc_prefix) {
+            let ops: Arc<dyn narf_filesystem::FileOps> = nsfd;
+            stat_linux_ops(ctx, &ops, out_ptr);
+            return;
+        }
+    }
     // `resolve_absolute` splits an absolute path into (mount, rel).
     // For a path that IS the mount point itself (`/bin`, `/dev`,
     // `/tmp`, …) rel is empty and `resolve(_, "")` rejects with
@@ -16359,7 +16380,19 @@ pub fn set_controlling_tty(
 /// `TIOCSCTTY`-on-console hook (installed in `boot_init`): record the boot
 /// console as the calling task's controlling terminal.
 fn console_tiocsctty() {
-    set_controlling_tty_console(current_task_id());
+    let task = current_task_id();
+    set_controlling_tty_console(task);
+    // `tiocsctty` -> `__proc_set_tty`: `tty->pgrp = task_pgrp(current)`.
+    // The new controlling session's process group becomes the console's
+    // foreground group. Without this the console kept whatever foreground
+    // group an earlier session left behind, so the getty that systemd made
+    // the console's controlling process (setsid + TIOCSCTTY, StandardInput=
+    // tty) was a *background* reader: its first read raised SIGTTIN, it
+    // stopped at "login:" and no keystroke ever reached it.
+    let pgrp = read_pgid(task);
+    if pgrp != 0 {
+        narf_filesystem::console_tty::set_fg_pgrp(pgrp);
+    }
 }
 
 /// `TIOCNOTTY`-on-console hook: detach the calling task's controlling tty.

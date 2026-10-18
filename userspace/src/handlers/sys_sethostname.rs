@@ -40,13 +40,19 @@ pub(crate) fn sys_sethostname(ctx: &mut dyn TrapContext) {
             }
         }
     };
-    // Wave-72: if caller has an explicit UTS NS, write there; else fall
-    // through to the global hostname slot.
+    // Write to the SAME UTS namespace `uname(2)` reads back
+    // (`current_uts_ns`: the task's own ns, or the global one when it has
+    // none), as setdomainname does. Writing only the flat `HOSTNAME` slot
+    // for a task without an explicit ns meant uname kept reporting the boot
+    // default: systemd PID 1 logged "Hostname set to <cachyos-narf>" while
+    // agetty, journald and every process saw "narf".
     #[cfg(feature = "container")]
     {
         let task = current_task_id();
-        if let Some(ns) = crate::namespaces::uts_ns_of(task) {
-            ns.set_hostname(&s);
+        let own_ns = crate::namespaces::uts_ns_of(task).is_some();
+        crate::namespaces::current_uts_ns(task).set_hostname(&s);
+        if own_ns {
+            // A private UTS namespace never changes the host's name.
             ctx.set_return(SyscallReturn::ok(0));
             return;
         }

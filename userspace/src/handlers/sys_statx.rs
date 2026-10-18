@@ -223,7 +223,28 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
                 follow_final = false;
             }
         }
-        let st = stat_ino_path_dir_aware_ext(&path_owned, follow_final);
+        // A followed `/proc/<pid>/ns/<flavour>` link describes the nsfs
+        // inode (see `stat_linux_path`).
+        #[cfg(feature = "container")]
+        let ns_stat = if follow_final {
+            let proc_prefix = apply_chroot("/proc");
+            proc_namespace_fd_from_path(task, &path_owned, &proc_prefix).map(|nsfd| {
+                let (uid, gid) = narf_filesystem::FileOps::owners(&*nsfd);
+                (
+                    narf_filesystem::FileOps::stat(&*nsfd),
+                    narf_filesystem::FileOps::ino(&*nsfd),
+                    narf_filesystem::FileOps::rdev(&*nsfd),
+                    uid,
+                    gid,
+                    narf_filesystem::FileOps::inode_attrs(&*nsfd),
+                )
+            })
+        } else {
+            None
+        };
+        #[cfg(not(feature = "container"))]
+        let ns_stat = None;
+        let st = ns_stat.or_else(|| stat_ino_path_dir_aware_ext(&path_owned, follow_final));
         let is_mount_root = current_path_is_mount_root(&path_owned);
         let mnt = current_mount_id_at(&path_owned);
         (st, mnt, is_mount_root, path_owned)

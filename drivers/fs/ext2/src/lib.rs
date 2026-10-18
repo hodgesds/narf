@@ -93,8 +93,10 @@ fn ext_factory(
     // SyncBlock::new returns Arc<SyncBlock> — exactly the
     // `Arc<B: BlockDevice>` shape Ext2Volume::mount expects.
     let async_dev = SyncBlock::new(dev);
-    let volume =
-        narf_scheduler::block_on(volume::Ext2Volume::mount(async_dev, DomainId::DRIVER_0))?;
+    let volume = narf_filesystem::fs_registry::mount_wait(volume::Ext2Volume::mount(
+        async_dev,
+        DomainId::DRIVER_0,
+    ))?;
     Ok(volume as Arc<dyn narf_filesystem::FsInstance>)
 }
 

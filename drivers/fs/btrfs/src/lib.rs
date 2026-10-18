@@ -30,6 +30,7 @@ pub mod checksum;
 pub mod chunk;
 pub mod crash_check;
 pub mod csum;
+pub mod decompress_cache;
 pub mod dir;
 pub mod extent;
 pub mod format;
@@ -68,7 +69,8 @@ pub fn register_initcalls() {
 /// block device.
 fn btrfs_factory(dev: Arc<dyn BlockDeviceSync>) -> Result<Arc<dyn FsInstance>, FsError> {
     let devices = discover_members(dev.clone());
-    let volume = narf_scheduler::block_on(registry::mount(&dev, devices, None, false))?;
+    let volume =
+        narf_filesystem::fs_registry::mount_wait(registry::mount(&dev, devices, None, false))?;
     Ok(volume)
 }
 
@@ -113,7 +115,7 @@ fn btrfs_fstype_builder(
     // timer, no device write. Every mount of one filesystem is a view over one
     // shared instance (see `registry`), whatever subvolume it selects.
     let read_only = request.read_only || options.read_only;
-    let volume = narf_scheduler::block_on(registry::mount(
+    let volume = narf_filesystem::fs_registry::mount_wait(registry::mount(
         &dev,
         devices,
         options.subvol.clone(),

@@ -134,7 +134,10 @@ fn fat_factory(dev: Arc<dyn narf_block::BlockDeviceSync>) -> Result<Arc<dyn FsIn
     // SyncBlock::new returns Arc<SyncBlock> — exactly the
     // `Arc<B: BlockDevice>` shape FatVolume::mount expects.
     let async_dev = SyncBlock::new(dev);
-    let vol = narf_scheduler::block_on(volume::FatVolume::mount(async_dev, DomainId::DRIVER_0))?;
+    let vol = narf_filesystem::fs_registry::mount_wait(volume::FatVolume::mount(
+        async_dev,
+        DomainId::DRIVER_0,
+    ))?;
     Ok(vol as Arc<dyn FsInstance>)
 }
 
@@ -160,7 +163,7 @@ fn build_named(
         .unwrap_or(request.source);
     let dev = narf_block::find_block_device(name).ok_or(narf_filesystem::FsError::NotFound)?;
     let async_dev = narf_block::SyncBlock::new(dev);
-    let vol = narf_scheduler::block_on(volume::FatVolume::mount_with_opts(
+    let vol = narf_filesystem::fs_registry::mount_wait(volume::FatVolume::mount_with_opts(
         async_dev,
         DomainId::DRIVER_0,
         opts,

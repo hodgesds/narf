@@ -5201,6 +5201,13 @@ fn boot_userspace_init() {
         // asserted (which it would until the FIFO drains).
         fn serial_isr() {
             for _ in 0..16 {
+                // Flow control: never pull a byte the ring cannot hold. It
+                // stays in the UART FIFO until the console reader refills
+                // the ring (`narf_input::refill_byte_ring`).
+                if !narf_input::byte_ring_has_room() {
+                    narf_input::note_byte_ring_full();
+                    break;
+                }
                 match narf_console::try_read_byte() {
                     Some(b) => {
                         let _ = narf_input::push_global(narf_input::InputEvent::AsciiByte(b));
@@ -5345,17 +5352,34 @@ fn boot_userspace_init() {
         // units (e.g. the narf_net_check network acceptance gate) still
         // trigger.
         let proc_cmdline = alloc::format!("SYSTEMD_PROC_CMDLINE={}", narf_boot::cmdline());
-        let envp = [
+        // `container=narf` runs systemd in container mode, which the generated
+        // QEMU distro images rely on. An installed system booted from its own
+        // root (`narf.disks=root-ro|root-rw`) is the machine's OS, not a
+        // container: in container mode systemd reports "container-other",
+        // getty-generator starts console-getty next to getty@tty1 (two
+        // gettys reading one console), and units conditioned on
+        // ConditionVirtualization=!container are skipped.
+        let installed_root = narf_block::disk_policy::policy().is_root_policy();
+        let envp_container = [
             "container=narf",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             proc_cmdline.as_str(),
         ];
+        let envp_host = [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            proc_cmdline.as_str(),
+        ];
+        let envp: &[&str] = if installed_root {
+            &envp_host
+        } else {
+            &envp_container
+        };
         // SAFETY: boot has the loader's identity mapping and frame allocator.
         let proc = match unsafe {
             narf_userspace::process::load_user_process_from_path(
                 path,
                 &argv,
-                &envp,
+                envp,
                 &[],
                 Some(root),
                 narf_userspace::alloc_pid(),

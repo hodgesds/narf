@@ -334,6 +334,49 @@ struct RootHashes {
     outside: String,
 }
 
+/// Disk state captured after a boot's bundle install and immediately before
+/// QEMU starts: the baseline every "did NARF write?" check compares against.
+#[derive(Clone, Debug)]
+struct PreBoot {
+    /// Whole-image SHA-256 of the root NVMe image (GPT, ESP and btrfs).
+    whole: String,
+    hashes: RootHashes,
+    sb: SuperInfo,
+    /// [`InstallLedger`] position of the snapshot.
+    seq: u64,
+}
+
+/// Orders bundle installs against the pre-boot snapshot. Installing the
+/// bundle rewrites ESP files, so an install between the snapshot and the
+/// boot (or between the snapshot and the post-boot comparison) would be
+/// reported as NARF writing the disk, or would hide a real write.
+#[derive(Debug, Default)]
+struct InstallLedger {
+    installs: u64,
+}
+
+impl InstallLedger {
+    fn installed(&mut self) {
+        self.installs += 1;
+    }
+
+    /// Position to record in a [`PreBoot`] snapshot.
+    fn snapshot(&self) -> u64 {
+        self.installs
+    }
+
+    /// Fail if a bundle install happened after the snapshot at `seq`.
+    fn verify(&self, seq: u64) -> Result<()> {
+        if self.installs != seq {
+            bail!(
+                "gate bug: {} bundle install(s) after the pre-boot snapshot",
+                self.installs - seq
+            );
+        }
+        Ok(())
+    }
+}
+
 fn root_hashes(d: &RootDisk) -> Result<RootHashes> {
     let size = std::fs::metadata(&d.path)?.len();
     let end = d.root.start + d.root.len;
@@ -932,6 +975,9 @@ struct Gate {
     progress: Vec<String>,
     /// Boots that hung before the kernel ran (retried once).
     prekernel_hangs: Vec<String>,
+    installs: InstallLedger,
+    /// Baseline of the current boot (see [`PreBoot`]).
+    preboot: Option<PreBoot>,
 }
 
 fn kvm_accel() -> Option<String> {
@@ -967,7 +1013,8 @@ impl Gate {
     /// Install `p`'s bundle (GRUB + the bundle's ESP tree) on the root
     /// disk's ESP. The ESP is part of the "outside the btrfs partition"
     /// hash, so this happens only between boots.
-    fn install_bundle(&self, p: Policy) -> Result<()> {
+    fn install_bundle(&mut self, p: Policy) -> Result<()> {
+        self.installs.installed();
         let spec = format!("{}@@{}", self.disk.path.display(), self.disk.esp.start);
         let mt = |tool: &str| {
             let mut c = Command::new(tool);
@@ -1060,7 +1107,14 @@ impl Gate {
 
     /// Boot NARF under `p` up to a logged-in shell.
     fn boot_narf(&mut self, p: Policy, label: &str) -> Result<(Vm, Duration)> {
+        // Exactly one install per boot, then the baseline, then QEMU.
         self.install_bundle(p)?;
+        self.preboot = Some(PreBoot {
+            whole: sha256_file(&self.disk.path)?,
+            hashes: root_hashes(&self.disk)?,
+            sb: self.disk.sb()?,
+            seq: self.installs.snapshot(),
+        });
         self.boots += 1;
         let log = self
             .logs
@@ -1116,6 +1170,16 @@ impl Gate {
         };
         println!("cachyos-gate:   login after {:.0}s", booted.as_secs_f64());
         Ok((vm, booted))
+    }
+
+    /// The current boot's pre-boot baseline, checked against the ledger.
+    fn baseline(&self) -> Result<PreBoot> {
+        let pre = self
+            .preboot
+            .clone()
+            .ok_or_else(|| anyhow!("gate bug: no pre-boot snapshot"))?;
+        self.installs.verify(pre.seq)?;
+        Ok(pre)
     }
 
     fn decoy_unchanged(&self) -> Result<()> {
@@ -1178,6 +1242,9 @@ impl Gate {
         tag: Option<&str>,
         before_outside: &str,
     ) -> Result<String> {
+        if let Some(pre) = &self.preboot {
+            self.installs.verify(pre.seq)?;
+        }
         let sb = self.disk.sb()?;
         if sb.log_root != 0 {
             bail!(
@@ -1205,16 +1272,16 @@ impl Gate {
     // ── rows ──
 
     fn row_ro(&mut self) -> Result<String> {
-        self.install_bundle(Policy::Ro)?;
-        let before = sha256_file(&self.disk.path)?;
-        let sb0 = self.disk.sb()?;
         let (mut vm, booted) = self.boot_narf(Policy::Ro, "root-ro")?;
+        let pre = self.baseline()?;
+        let (before, sb0) = (pre.whole.clone(), pre.sb);
         let rw = Self::root_is_rw(&mut vm)?;
         // The overlay takes the writes; the disk must not.
         let (secs, notes) = Self::workload(&mut vm, "ro")?;
         let stick = vm.text().contains("bootlog: saving the kernel log to");
         let status = vm.poweroff(Duration::from_secs(300))?;
         drop(vm);
+        self.installs.verify(pre.seq)?;
         let after = sha256_file(&self.disk.path)?;
         let sb1 = self.disk.sb()?;
         if after != before {
@@ -1239,9 +1306,8 @@ impl Gate {
     }
 
     fn row_rw(&mut self) -> Result<String> {
-        self.install_bundle(Policy::Rw)?;
-        let before = root_hashes(&self.disk)?;
         let (mut vm, booted) = self.boot_narf(Policy::Rw, "root-rw")?;
+        let before = self.baseline()?.hashes;
         let refusals = Self::refusal_lines(&vm);
         if !Self::root_is_rw(&mut vm)? {
             bail!(
@@ -1269,9 +1335,9 @@ impl Gate {
     /// mounted read-write (and the shell is ready in `vm`), Ok(false) when
     /// it correctly refused because of a log tree (the image untouched).
     fn crash_followup(&mut self, label: &str) -> Result<(Vm, bool)> {
-        let sb = self.disk.sb()?;
-        let before = root_hashes(&self.disk)?;
         let (mut vm, _) = self.boot_narf(Policy::Rw, label)?;
+        let pre = self.baseline()?;
+        let (sb, before) = (pre.sb, pre.hashes);
         let rw = Self::root_is_rw(&mut vm)?;
         let refusals = Self::refusal_lines(&vm);
         if sb.log_root != 0 && rw {
@@ -1377,9 +1443,8 @@ impl Gate {
         let mut gens = Vec::new();
         let mut boot_secs = Vec::new();
         for i in 1..=self.args.cycles {
-            self.install_bundle(Policy::Rw)?;
-            let before = root_hashes(&self.disk)?;
             let (mut vm, booted) = self.boot_narf(Policy::Rw, &format!("cycle{i}"))?;
+            let before = self.baseline()?.hashes;
             if !Self::root_is_rw(&mut vm)? {
                 bail!(
                     "cycle {i}: / not read-write: {}",
@@ -1519,9 +1584,8 @@ impl Gate {
         );
 
         // Round trip: NARF reads Linux's writes, writes again.
-        self.install_bundle(Policy::Rw)?;
-        let before = root_hashes(&self.disk)?;
         let (mut vm, _) = self.boot_narf(Policy::Rw, "roundtrip")?;
+        let before = self.baseline()?.hashes;
         if !Self::root_is_rw(&mut vm)? {
             bail!(
                 "NARF refused RW on the Linux-written image: {}",
@@ -1899,6 +1963,8 @@ pub fn run(args: &Args) -> Result<()> {
         host,
         host_uuids,
         boots: 0,
+        installs: InstallLedger::default(),
+        preboot: None,
         workload_secs: 0.0,
         rng: seed | 1,
         last_tag: None,
@@ -1991,6 +2057,17 @@ fn seed_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn install_after_snapshot_is_refused() {
+        let mut ledger = InstallLedger::default();
+        ledger.installed();
+        let seq = ledger.snapshot();
+        assert!(ledger.verify(seq).is_ok());
+        // The old row_ro bug: install, hash, then boot_narf installed again.
+        ledger.installed();
+        assert!(ledger.verify(seq).is_err());
+    }
     use super::*;
 
     #[test]

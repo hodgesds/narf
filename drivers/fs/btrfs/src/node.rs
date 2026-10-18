@@ -879,8 +879,19 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         true
     }
 
-    fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
-        None
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        // Lookups are async (tree reads), but the synchronous VFS API must
+        // still resolve real entries: OverlayFS consults its lower layers
+        // through it (the session-writable root over a read-only btrfs root),
+        // as do bind-mount source resolution and exec path checks. Same
+        // bridge as ext's: re-entrancy-safe, never halts, and the block
+        // device's completion still arrives.
+        narf_scheduler::block_on_spin(self.lookup_async(name)).ok()
+    }
+
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+        // See `lookup`.
+        narf_scheduler::block_on_spin(self.lookup_dir_async(name)).ok()
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
@@ -1288,7 +1299,7 @@ impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
         let mut parsed = crate::mount_opts::parse(&rest.join(","))?;
         match want_ro {
             Some(true) if !self.is_read_only() => {
-                narf_scheduler::block_on(self.remount_read_only())?;
+                narf_filesystem::fs_registry::mount_wait(self.remount_read_only())?;
             }
             Some(false) if self.is_read_only() => {
                 let this = self.self_weak.upgrade().ok_or(FsError::NotFound)?;

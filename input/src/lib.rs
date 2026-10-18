@@ -1118,6 +1118,48 @@ pub fn pop_scroll() -> Option<ScrollEvent> {
     }
 }
 
+/// Serial receive flow control. A serial producer that finds the byte ring
+/// full stops draining the UART and calls [`note_byte_ring_full`]. The bytes
+/// stay in the UART's receive FIFO (QEMU then stops feeding it, and real
+/// hardware asserts flow control or overruns in hardware rather than losing
+/// bytes silently in the kernel). The console reader calls
+/// [`refill_byte_ring`] after it consumes input. This is the n_tty
+/// throttle/unthrottle pair: without it, pasting or typing a burst longer
+/// than the ring while the reader was busy silently dropped characters.
+static BYTE_RING_THROTTLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Whether the byte ring can take another serial byte.
+pub fn byte_ring_has_room() -> bool {
+    BYTE_RING
+        .lock()
+        .as_ref()
+        .is_some_and(|r| r.len() < r.capacity())
+}
+
+/// A serial producer left bytes in the device because the ring was full.
+pub fn note_byte_ring_full() {
+    BYTE_RING_THROTTLED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Move bytes the producer left behind into the ring while it has room,
+/// pulling them with `read_byte`. A no-op unless a producer throttled.
+pub fn refill_byte_ring(mut read_byte: impl FnMut() -> Option<u8>) {
+    if !BYTE_RING_THROTTLED.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    while byte_ring_has_room() {
+        match read_byte() {
+            Some(b) => {
+                let _ = push_global(InputEvent::AsciiByte(b));
+            }
+            None => return,
+        }
+    }
+    // Still full: whatever is left stays in the device for the next read.
+    note_byte_ring_full();
+}
+
 /// Number of ASCII bytes currently queued in the BYTE_RING. Best-
 /// effort snapshot; the count can change immediately. Surfaced for
 /// FIONREAD: userspace queries "how many bytes can I read without
