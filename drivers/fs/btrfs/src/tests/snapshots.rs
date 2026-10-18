@@ -353,6 +353,24 @@ fn smoke_btrfs_write_shared_with_linux_snapshots() -> TestResult {
         if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
             return TestResult::Fail("second commit failed");
         }
+        // Then empty the big directory: the tree shrinks, merging and
+        // collapsing nodes whose children the snapshots still share.
+        let pkg = poll_once(root.lookup_dir_async("usr"))
+            .and_then(Result::ok)
+            .and_then(|usr| poll_once(usr.lookup_dir_async("lib")).and_then(Result::ok))
+            .and_then(|lib| poll_once(lib.lookup_dir_async("pkg")).and_then(Result::ok));
+        let Some(pkg) = pkg else {
+            return TestResult::Fail("usr/lib/pkg missing");
+        };
+        for i in 0..900 {
+            let _ = poll_once(pkg.unlink(&alloc::format!("f{i}")));
+        }
+        if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+            return TestResult::Fail("commit after emptying the directory failed");
+        }
+        if let Err(why) = check_ref_counts(&vol) {
+            return TestResult::Fail(why);
+        }
     }
     let vol = match mount_id(&dev, ROOT_SV) {
         Ok(v) => v,
@@ -364,8 +382,7 @@ fn smoke_btrfs_write_shared_with_linux_snapshots() -> TestResult {
     let Some(after) = contents(&dev, ROOT_SV) else {
         return TestResult::Fail("@ unreadable after the writes");
     };
-    if after.get("/usr/lib/pkg/f3").map(Vec::as_slice) != Some(b"narf rewrote 3\n".as_slice())
-        || after.contains_key("/usr/lib/pkg/f2")
+    if after.keys().any(|k| k.starts_with("/usr/lib/pkg/"))
         || after.get("/usr/lib/data5.txt").map(Vec::len) != Some(100)
     {
         return TestResult::Fail("@ does not hold what NARF wrote");

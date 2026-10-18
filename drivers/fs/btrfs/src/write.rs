@@ -2683,6 +2683,19 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
             self.retire(root, root_level)?;
             root = child;
             root_level -= 1;
+            // A committed block promoted to root of a subvolume tree is COWed
+            // first, as Linux `balance_level` does: a root block is never
+            // shared, and this one may be (or may name its children through
+            // parent refs).
+            if self.state.shared.is_some() && !self.state.pending.contains_key(&root) {
+                let cbuf = self.read(root).await?;
+                self.update_ref_for_cow(root, &cbuf, false).await?;
+                let copy = self.store(alloc, (*cbuf).clone(), root_level)?;
+                if self.frees_committed(root)? {
+                    self.state.freed.push((root, root_level));
+                }
+                root = copy;
+            }
         }
 
         self.state.root = root;

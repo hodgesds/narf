@@ -652,7 +652,11 @@ sync
 [ -d /.snapshots ] || btrfs subvolume create /.snapshots
 mkdir -p /.snapshots/1
 btrfs subvolume snapshot -r / /.snapshots/1/snapshot
-btrfs subvolume snapshot -r /home /home/.narf-snap-home
+dev=$(findmnt -no SOURCE / | sed 's/\[.*//')
+mkdir -p /run/narf-top
+mount -o subvolid=5 "$dev" /run/narf-top
+btrfs subvolume snapshot -r /run/narf-top/@home /run/narf-top/@home/.narf-snap-home
+umount /run/narf-top
 for i in $(seq 1 3 300); do echo "linux round2 $i" >> $D/s$i; done
 dd if=/dev/urandom of=$D/blob bs=1M count=1 seek=2 conv=notrunc status=none
 sync
@@ -661,8 +665,6 @@ btrfs subvolume snapshot -r / /.snapshots/2/snapshot
 mkdir -p /.snapshots/3
 btrfs subvolume snapshot / /.snapshots/3/snapshot
 echo "written after the snapshot" > /.snapshots/3/snapshot/narf-snap/after-snap
-dev=$(findmnt -no SOURCE / | sed 's/\[.*//')
-mkdir -p /run/narf-top
 mount -o subvolid=5 "$dev" /run/narf-top
 btrfs subvolume snapshot -r /run/narf-top/@ /run/narf-top/.narf-pre-rw-@
 umount /run/narf-top
