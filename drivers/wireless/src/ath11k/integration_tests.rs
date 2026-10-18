@@ -1160,8 +1160,10 @@ fn smoke_ath11k_int_bring_up_to_netdev() -> TestResult {
             !info.hw_caps.ht_supported
                 && info.hw_caps.ht_supported == nd.radio().ht
                 && info.hw_caps.vht_supported == nd.radio().vht
-                && !info.hw_caps.he_supported,
-            "HT / VHT from the firmware caps, no HE"
+                && info.hw_caps.he_supported
+                && nd.radio().he,
+            "HT / VHT from the firmware caps; HE on every supported band \
+             (ath11k_mac_copy_he_cap sets has_he unconditionally)"
         );
         let g = run(u.shared.lock());
         ensure!(g.link.vif.is_some(), "DP vdev TX attach");
@@ -4453,3 +4455,312 @@ fn smoke_ath11k_int_sae_negatives() -> TestResult {
     })
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_sae_negatives);
+
+// ── HE (802.11ax) ─────────────────────────────────────────────────
+
+/// WCN6855-like 2.4 GHz HE caps in SERVICE_READY_EXT words
+/// (`he_cap_info_2G`, `_ext`, `he_cap_phy_info_2G[3]`, `he_ppet2G`):
+/// MAC [01 0f 00 18 00 00], PHY [22 00 40 00 01 07 80 00 c0 00 00],
+/// PPE thresholds for 1 NSS, RU 0, PPET16 2 / PPET8 1 (0x0a).
+fn he_band_cap(b: &mut super::wmi::BandCap) {
+    b.he_cap_info = [0x1800_0F01, 0];
+    b.he_cap_phy_info = [0x0040_0022, 0x0080_0701, 0x0000_00C0];
+    b.he_ppet = super::wmi::PpeThreshold {
+        numss_m1: 0,
+        ru_bit_mask: 1,
+        ppet16_ppet8_ru3_ru0: [0x0A, 0, 0, 0, 0, 0, 0, 0],
+    };
+}
+
+/// AP HE Capabilities element: TWT responder; 40 MHz in 2.4 GHz, full
+/// UL MU-MIMO, SU / MU beamformer; MCS 0-11 for 2 NSS; no PPE.
+const AP_HE_CAP: [u8; 24] = [
+    0xFF, 22, 35, 0x04, 0, 0, 0, 0, 0, 0x02, 0x00, 0x40, 0x80, 0x02, 0, 0, 0, 0, 0, 0, 0xFA, 0xFF,
+    0xFA, 0xFF,
+];
+/// AP HE Operation: default PE duration 4, BSS color 5; basic MCS 0-7 for
+/// 1 NSS.
+const AP_HE_OPER: [u8; 9] = [0xFF, 7, 36, 0x04, 0x00, 0x00, 0x05, 0xFC, 0xFF];
+/// Spatial Reuse Parameter Set: SRG information present, SRG OBSS PD min
+/// 2 / max 10, two 8-octet bitmaps.
+fn ap_he_spr() -> Vec<u8> {
+    let mut v = vec![0xFF, 20, 39, 0x08, 2, 10];
+    v.extend_from_slice(&[0; 16]);
+    v
+}
+
+/// `ath11k_mac_copy_he_cap` (STA) + `ath11k_mac_set_hemcsmap` +
+/// `ath11k_gen_ppe_thresh` and mac80211's `ieee80211_put_he_cap` /
+/// `ieee80211_get_adjusted_he_cap` per connection width, the PPE /
+/// MCS-size rules, `ieee80211_verify_*_he_mcs_support`, the MCS
+/// intersection and `ath11k_peer_assoc_h_he` / `_h_phymode` — every
+/// expected byte worked out from the Linux code by hand.
+fn smoke_ath11k_he_caps_and_peer_assoc() -> TestResult {
+    use super::mac::he;
+    use super::mac_peer::{self as peer, StaBw, Width};
+    check(|| {
+        let mut pdev = super::wmi::PdevCap {
+            tx_chain_mask: 3,
+            rx_chain_mask: 3,
+            ..Default::default()
+        };
+        he_band_cap(&mut pdev.band_2g);
+        let own = he::own_he_cap(&pdev, &pdev.band_2g, 2, 2);
+        // MAC1 & TF_MAC_PAD_DUR, TWT_REQ set / TWT_RES clear; PHY5 sounding
+        // dimensions = num_tx - 1; PHY9 |= TX_1024_QAM < 242-tone RU.
+        ensure!(
+            own.mac == [0x03, 0x0C, 0x00, 0x18, 0x00, 0x00],
+            "own MAC caps"
+        );
+        ensure!(
+            own.phy == [0x22, 0x00, 0x40, 0x00, 0x01, 0x01, 0x80, 0x00, 0xC0, 0x04, 0x00],
+            "own PHY caps"
+        );
+        ensure!(own.mcs == [0xFFFA; 6], "2-chain MCS 0-11 maps");
+        // val 0x0a → swapped 0x11, emitted MSB first from bit 7.
+        ensure!(own.ppe[..2] == [0x08, 0x11], "PPE thresholds");
+        let e40 = he::put_he_cap(&own, Width::W40);
+        let mut want = vec![0xFF, 24, 35, 0x03, 0x0C, 0x00, 0x18, 0x00, 0x00];
+        want.extend_from_slice(&[
+            0x22, 0x00, 0x40, 0x00, 0x01, 0x01, 0x80, 0x00, 0x40, 0x04, 0x00,
+        ]);
+        want.extend_from_slice(&[0xFA, 0xFF, 0xFA, 0xFF, 0x08, 0x11]);
+        ensure!(
+            e40 == want,
+            "HE Capabilities element at 40 MHz (DCM RU ≤ 484)"
+        );
+        let e20 = he::put_he_cap(&own, Width::W20);
+        ensure!(
+            e20[3 + 6] == 0x20 && e20[3 + 6 + 8] == 0x00,
+            "20 MHz: no 40 MHz bit, RU 242"
+        );
+        // 1 RU x 1 NSS = 13 bits; 4 RUs x 8 NSS = 199 bits.
+        ensure!(
+            he::ppe_size(0x08, &own.phy) == 2 && he::ppe_size(0x7F, &own.phy) == 25,
+            "PPE size"
+        );
+        // The AP side.
+        let ap = he::parse_he_cap(&AP_HE_CAP[3..]).ok_or("parse AP HE cap")?;
+        let op = he::HeOper::parse(&AP_HE_OPER[3..]).ok_or("parse HE oper")?;
+        ensure!(
+            op.bss_color() == 5 && !op.bss_color_disabled(),
+            "BSS color 5"
+        );
+        ensure!(he::he_mcs_ok(&own, &ap, &op), "basic MCS supported");
+        let three_nss = he::HeOper {
+            mcs_nss_set: 0xFFC0,
+            ..op
+        };
+        ensure!(
+            !he::he_mcs_ok(&own, &ap, &three_nss),
+            "3-NSS basic set refused"
+        );
+        let sta_he = he::sta_he_cap(&own, &ap);
+        ensure!(
+            sta_he.mcs[0] == 0xFFFA && sta_he.mcs[1] == 0xFFFA,
+            "intersection"
+        );
+        ensure!(
+            he::he_cap_rx_bw(&sta_he, super::mac_frame::Band::Ghz2) == 40
+                && he::he_rx_nss(&sta_he) == 2,
+            "40 MHz, 2 NSS"
+        );
+        ensure!(he::sta_hemu_mode(&own, &sta_he) == 0x75, "HEMU mode");
+        // PPE decode of [0x08, 0x11] (ath11k_peer_assoc_h_he).
+        let mut with_ppe = sta_he.clone();
+        with_ppe.phy[6] |= 0x80;
+        with_ppe.ppe = vec![0x08, 0x11];
+        let ht = peer::StaHtCap {
+            ht_supported: true,
+            cap: 0x016E,
+            rx_mask: [0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let sta = peer::ApSta {
+            addr: BSSID,
+            ht_cap: ht,
+            supp_rates: 0xFFF,
+            bandwidth: Some(StaBw::Bw40),
+            rx_nss: 2,
+            ..Default::default()
+        };
+        let aphe = peer::ApHe {
+            cap: with_ppe,
+            oper_params: op.params,
+        };
+        let a = peer::peer_assoc_prepare(&peer::PeerAssocInput {
+            vdev_id: 0,
+            aid: 1,
+            assoc_capability: 0x0431,
+            listen_interval: 5,
+            def: peer::ChanDef {
+                freq: 2437,
+                band: super::mac_frame::Band::Ghz2,
+                width: Width::W40,
+                center_freq1: 2447,
+            },
+            sta: &sta,
+            he: Some(&aphe),
+            rsn: false,
+            wpa: false,
+        });
+        ensure!(
+            a.peer_phymode == super::wmi::phy_mode::MODE_11AX_HE40_2G,
+            "HE40 2G"
+        );
+        ensure!(
+            a.he_flag && a.twt_responder && !a.twt_requester,
+            "HE / TWT flags"
+        );
+        ensure!(a.peer_he_ops == 0x0000_0004, "he_oper.params & 0xffffff");
+        ensure!(
+            a.peer_he_cap_macinfo == [4, 0]
+                && a.peer_he_cap_phyinfo == [0x8040_0002, 0x0080_0002, 0],
+            "HE cap words"
+        );
+        ensure!(
+            a.peer_he_mcs == [(0xFFFA, 0xFFFA)] && a.peer_nss == 2,
+            "80 MHz MCS set, NSS"
+        );
+        ensure!(
+            a.peer_ppet.numss_m1 == 0
+                && a.peer_ppet.ru_bit_mask == 1
+                && a.peer_ppet.ppet16_ppet8_ru3_ru0[0] == 34,
+            "PPET decode"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_he_caps_and_peer_assoc
+);
+
+/// An HE AP (2.4 GHz HT40, Open): the HE Capabilities element after HT
+/// (no VHT on 2.4 GHz) and before WMM, `WMI_VDEV_PARAM_SET_HEMU_MODE`
+/// right before WMI_PEER_ASSOC (`ath11k_bss_assoc`), the peer's HE fields
+/// at the `wmi_peer_assoc_complete_cmd` offsets, OBSS spatial reuse from
+/// the AP's SR element, then the STA arm of `BSS_CHANGED_HE_BSS_COLOR`
+/// (BSS color change enable, collision detection 10 s / 200 ms scan) —
+/// command words from the Linux structs.
+fn smoke_ath11k_int_he_connect() -> TestResult {
+    check(|| {
+        let mut b = beacon_sec(&BSSID, SSID, 6, None);
+        b.extend_from_slice(&AP_HE_CAP);
+        b.extend_from_slice(&AP_HE_OPER);
+        let mut extra = AP_HE_CAP.to_vec();
+        extra.extend_from_slice(&AP_HE_OPER);
+        extra.extend_from_slice(&ap_he_spr());
+        let cfg = FwCfg {
+            beacons: vec![(6, 50, b)],
+            assoc_extra: extra,
+            ..FwCfg::default()
+        };
+        let u = up_caps(cfg, |c| {
+            he_band_cap(&mut c.pdev.band_2g);
+            // The fake firmware reports no HT; HE needs HT (WMI_HT_CAP_*:
+            // ENABLED | HT20_SGI | DYNAMIC_SMPS | TX_STBC | RX_STBC_1SS |
+            // LDPC | HT40_SGI | RX_LDPC).
+            c.pdev.band_2g.ht_cap_info = 0x185F;
+            c.pdev.tx_chain_mask = 3;
+            c.pdev.rx_chain_mask = 3;
+            c.pdev.tx_chain_mask_shift = 0;
+        })?;
+        scan6(&u)?;
+        let req = AssociateRequest {
+            bssid: BSSID,
+            ssid: SSID.to_vec(),
+            channel: 6,
+            security: SecurityConfig::Open,
+        };
+        let (r, err, _, _) = latched(|| run(u.netdev.associate(req)));
+        ensure!(r.is_ok() && err == 0, "HE associate");
+        let st = u.dev.st.borrow();
+        let assoc = st.world.mgmt.iter().find(|f| f[0] == 0x00).unwrap();
+        let he_at = assoc.windows(3).position(|w| w == [0xFF, 24, 35]);
+        let ht_at = assoc.windows(2).position(|w| w == [0x2D, 26]);
+        let wmm_at = assoc.windows(4).position(|w| w == [0xDD, 0x07, 0x00, 0x50]);
+        ensure!(
+            matches!((ht_at, he_at, wmm_at), (Some(a), Some(b), Some(c)) if a < b && b < c),
+            "HE cap between HT and WMM"
+        );
+        let wmi = &st.wmi;
+        let pa = wmi
+            .iter()
+            .position(|c| c.cmd_id == wmi::WMI_PEER_ASSOC_CMDID)
+            .ok_or("peer assoc")?;
+        let hemu = &wmi[pa - 1];
+        ensure!(
+            hemu.cmd_id == wmi::WMI_VDEV_SET_PARAM_CMDID
+                && rd32(&hemu.buf, 8) == 0x8002
+                && rd32(&hemu.buf, 12) == 0x75,
+            "HEMU_MODE 0x75 before PEER_ASSOC"
+        );
+        let b = &wmi[pa].buf;
+        ensure!(
+            rd32(b, 24) & 0x400 != 0 && rd32(b, 24) & 0x0080_0000 != 0,
+            "WMI_PEER_HE | TWT_RESP"
+        );
+        // ath11k_peer_assoc_h_phymode for the link's width (the fake
+        // firmware's regulatory rules decide 20 / 40 MHz).
+        let w = run(u.netdev.mac.lock()).link().map(|l| l.def.width);
+        let want = if w == Some(super::mac_peer::Width::W40) {
+            super::wmi::phy_mode::MODE_11AX_HE40_2G
+        } else {
+            super::wmi::phy_mode::MODE_11AX_HE20_2G
+        };
+        ensure!(rd32(b, 60) == want, "peer_phymode HE20/40_2G");
+        ensure!(
+            rd32(b, 124) == 4 && rd32(b, 128) == 4,
+            "peer_he_cap_info, peer_he_ops"
+        );
+        ensure!(
+            rd32(b, 132) == 0x8040_0002 && rd32(b, 136) == 2,
+            "peer_he_cap_phy"
+        );
+        let spr = wmi
+            .iter()
+            .find(|c| c.cmd_id == wmi::WMI_PDEV_OBSS_PD_SPATIAL_REUSE_CMDID)
+            .ok_or("obss spr")?;
+        // wmi_obss_spatial_reuse_params_cmd: tlv | pdev 0 | enable | min | max | vdev.
+        ensure!(
+            rd32(&spr.buf, 8) == 1 && rd32(&spr.buf, 12) == 2 && rd32(&spr.buf, 16) == 10,
+            "OBSS PD from the SR element"
+        );
+        let bc = wmi
+            .iter()
+            .position(|c| c.cmd_id == wmi::WMI_BSS_COLOR_CHANGE_ENABLE_CMDID)
+            .ok_or("bss color enable")?;
+        ensure!(
+            rd32(&wmi[bc].buf, 4) == 0 && rd32(&wmi[bc].buf, 8) == 1,
+            "vdev 0, enable 1"
+        );
+        let cc = &wmi[bc + 1];
+        ensure!(
+            cc.cmd_id == wmi::WMI_OBSS_COLOR_COLLISION_DET_CONFIG_CMDID
+                && (4..32)
+                    .step_by(4)
+                    .map(|o| rd32(&cc.buf, o))
+                    .eq([0u32, 0, 1, 0, 10_000, 200, 0]),
+            "collision detection config"
+        );
+        drop(st);
+        // A non-HE AP: no HE element, HEMU or BSS color commands.
+        let u2 = up_caps(wpa2_cfg(), |c| he_band_cap(&mut c.pdev.band_2g))?;
+        connect(&u2)?;
+        let st = u2.dev.st.borrow();
+        ensure!(
+            !st.wmi
+                .iter()
+                .any(|c| c.cmd_id == wmi::WMI_BSS_COLOR_CHANGE_ENABLE_CMDID),
+            "no HE without an HE AP"
+        );
+        let assoc = st.world.mgmt.iter().find(|f| f[0] == 0x00).unwrap();
+        ensure!(
+            !assoc.windows(3).any(|w| w[0] == 0xFF && w[2] == 35),
+            "no HE cap"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_he_connect);

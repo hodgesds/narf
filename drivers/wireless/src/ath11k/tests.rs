@@ -682,6 +682,7 @@ fn smoke_ath11k_step_codes_unique_and_in_range() -> TestResult {
                 super::mac::step::SAE_COMMIT,
                 super::mac::step::SAE_CONFIRM,
                 super::mac::step::SAE_TIMEOUT,
+                super::mac::step::HE_PARAM,
             ],
         ),
         (

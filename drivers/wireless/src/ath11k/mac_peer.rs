@@ -376,6 +376,7 @@ pub enum ConnMode {
     Legacy,
     Ht,
     Vht,
+    He,
 }
 
 /// `cfg80211_chandef_usable` for the flags NARF tracks: every 20 MHz
@@ -604,6 +605,14 @@ pub struct ApSta {
     pub rx_nss: u8,
     pub wme: bool,
     pub mfp: bool,
+}
+
+/// The HE side of the AP station (`link_sta->pub->he_cap`) and
+/// `bss_conf.he_oper.params`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ApHe {
+    pub cap: super::mac::he::StaHeCap,
+    pub oper_params: u32,
 }
 
 /// `ieee80211_ht_cap_ie_to_sta_ht_cap`.
@@ -908,6 +917,8 @@ pub struct PeerAssocInput<'a> {
     pub listen_interval: u32,
     pub def: ChanDef,
     pub sta: &'a ApSta,
+    /// HE (`sta->deflink.he_cap.has_he`).
+    pub he: Option<&'a ApHe>,
     /// The BSS carries an RSN or WPA element (`ath11k_peer_assoc_h_crypto`).
     pub rsn: bool,
     pub wpa: bool,
@@ -949,52 +960,76 @@ pub fn peer_assoc_prepare(p: &PeerAssocInput<'_>) -> PeerAssocParams {
     }
     // h_phymode (before HT/VHT in Linux)
     let bw = sta.bandwidth.unwrap_or(StaBw::Bw20);
-    a.peer_phymode = match p.def.band {
-        Band::Ghz2 => {
-            if sta.vht_cap.vht_supported {
-                if bw == StaBw::Bw40 {
-                    phy_mode::MODE_11AC_VHT40
+    let he = p.he.filter(|h| h.cap.has_he);
+    a.peer_phymode = match (p.def.band, he) {
+        // ath11k_peer_assoc_h_phymode: HE first.
+        (Band::Ghz2, Some(_)) => match bw {
+            StaBw::Bw80 => phy_mode::MODE_11AX_HE80_2G,
+            StaBw::Bw40 => phy_mode::MODE_11AX_HE40_2G,
+            _ => phy_mode::MODE_11AX_HE20_2G,
+        },
+        // ath11k_mac_get_phymode_he
+        (_, Some(h)) => match bw {
+            StaBw::Bw160 => {
+                if h.cap.phy[0] & super::mac::he::cap::PHY0_80PLUS80_MHZ_IN_5G != 0
+                    && h.cap.phy[0] & super::mac::he::cap::PHY0_160MHZ_IN_5G == 0
+                {
+                    phy_mode::MODE_11AX_HE80_80
                 } else {
-                    phy_mode::MODE_11AC_VHT20
+                    phy_mode::MODE_11AX_HE160
                 }
-            } else if sta.ht_cap.ht_supported {
-                if bw == StaBw::Bw40 {
-                    phy_mode::MODE_11NG_HT40
-                } else {
-                    phy_mode::MODE_11NG_HT20
-                }
-            } else if sta.supp_rates >> 4 != 0 {
-                phy_mode::MODE_11G
-            } else {
-                phy_mode::MODE_11B
             }
-        }
-        _ => {
-            if sta.vht_cap.vht_supported {
-                match bw {
-                    StaBw::Bw160 => {
-                        if sta.vht_cap.cap & vht::SUPP_CHAN_WIDTH_MASK
-                            == vht::SUPP_CHAN_WIDTH_160_80PLUS80MHZ
-                        {
-                            phy_mode::MODE_11AC_VHT80_80
-                        } else {
-                            phy_mode::MODE_11AC_VHT160
-                        }
+            StaBw::Bw80 => phy_mode::MODE_11AX_HE80,
+            StaBw::Bw40 => phy_mode::MODE_11AX_HE40,
+            StaBw::Bw20 => phy_mode::MODE_11AX_HE20,
+        },
+        _ => match p.def.band {
+            Band::Ghz2 => {
+                if sta.vht_cap.vht_supported {
+                    if bw == StaBw::Bw40 {
+                        phy_mode::MODE_11AC_VHT40
+                    } else {
+                        phy_mode::MODE_11AC_VHT20
                     }
-                    StaBw::Bw80 => phy_mode::MODE_11AC_VHT80,
-                    StaBw::Bw40 => phy_mode::MODE_11AC_VHT40,
-                    StaBw::Bw20 => phy_mode::MODE_11AC_VHT20,
-                }
-            } else if sta.ht_cap.ht_supported {
-                if bw >= StaBw::Bw40 {
-                    phy_mode::MODE_11NA_HT40
+                } else if sta.ht_cap.ht_supported {
+                    if bw == StaBw::Bw40 {
+                        phy_mode::MODE_11NG_HT40
+                    } else {
+                        phy_mode::MODE_11NG_HT20
+                    }
+                } else if sta.supp_rates >> 4 != 0 {
+                    phy_mode::MODE_11G
                 } else {
-                    phy_mode::MODE_11NA_HT20
+                    phy_mode::MODE_11B
                 }
-            } else {
-                phy_mode::MODE_11A
             }
-        }
+            _ => {
+                if sta.vht_cap.vht_supported {
+                    match bw {
+                        StaBw::Bw160 => {
+                            if sta.vht_cap.cap & vht::SUPP_CHAN_WIDTH_MASK
+                                == vht::SUPP_CHAN_WIDTH_160_80PLUS80MHZ
+                            {
+                                phy_mode::MODE_11AC_VHT80_80
+                            } else {
+                                phy_mode::MODE_11AC_VHT160
+                            }
+                        }
+                        StaBw::Bw80 => phy_mode::MODE_11AC_VHT80,
+                        StaBw::Bw40 => phy_mode::MODE_11AC_VHT40,
+                        StaBw::Bw20 => phy_mode::MODE_11AC_VHT20,
+                    }
+                } else if sta.ht_cap.ht_supported {
+                    if bw >= StaBw::Bw40 {
+                        phy_mode::MODE_11NA_HT40
+                    } else {
+                        phy_mode::MODE_11NA_HT20
+                    }
+                } else {
+                    phy_mode::MODE_11A
+                }
+            }
+        },
     };
     // h_ht
     let h = &sta.ht_cap;
@@ -1078,6 +1113,10 @@ pub fn peer_assoc_prepare(p: &PeerAssocInput<'_>) -> PeerAssocParams {
             a.peer_vht_caps &= !vht::MU_BEAMFORMEE_CAPABLE;
         }
     }
+    // h_he (default bitrate mask: every HE MCS allowed)
+    if let Some(h) = he {
+        peer_assoc_h_he(&mut a, sta, &h.cap, h.oper_params, bw);
+    }
     // h_qos (STA vdev)
     if sta.wme {
         a.is_wme_set = true;
@@ -1094,6 +1133,90 @@ pub fn peer_assoc_prepare(p: &PeerAssocInput<'_>) -> PeerAssocParams {
     }
     a.is_assoc = true;
     a
+}
+
+/// `ath11k_peer_assoc_h_he` with the default bitrate mask (`he_mcs` all
+/// ones: `ath11k_peer_assoc_h_he_limit` leaves the maps as they are) and
+/// no 160 MHz (no `peer_bw_rxnss_override`).
+fn peer_assoc_h_he(
+    a: &mut PeerAssocParams,
+    sta: &ApSta,
+    h: &super::mac::he::StaHeCap,
+    oper: u32,
+    bw: StaBw,
+) {
+    use super::mac::he::{cap, HE_MCS_NOT_SUPPORTED};
+    a.he_flag = true;
+    let support_160 = h.phy[0] & cap::PHY0_160MHZ_IN_5G != 0;
+    let top = |m: u16| {
+        (0..8u32)
+            .rev()
+            .find(|&i| (m >> (2 * i)) & 3 != HE_MCS_NOT_SUPPORTED)
+            .map_or(9, |i| i + 1)
+    };
+    let rx_mcs_80 = top(h.mcs[0]);
+    let rx_mcs_160 = if support_160 { top(h.mcs[2]) } else { 9 };
+    let max_nss = if support_160 {
+        rx_mcs_80.min(rx_mcs_160)
+    } else {
+        rx_mcs_80
+    };
+    a.peer_nss = (sta.rx_nss as u32).min(max_nss);
+    let mut mac = [0u8; 8];
+    mac[..6].copy_from_slice(&h.mac);
+    a.peer_he_cap_macinfo = [
+        u32::from_le_bytes(mac[..4].try_into().unwrap()),
+        u32::from_le_bytes(mac[4..].try_into().unwrap()),
+    ];
+    let mut phy = [0u8; 12];
+    phy[..11].copy_from_slice(&h.phy);
+    for i in 0..3 {
+        a.peer_he_cap_phyinfo[i] = u32::from_le_bytes(phy[4 * i..4 * i + 4].try_into().unwrap());
+    }
+    a.peer_he_ops = oper & 0xff_ffff;
+    let ampdu_factor = ((h.mac[3] & cap::MAC3_MAX_AMPDU_LEN_EXP_MASK) >> 3) as u32;
+    if ampdu_factor != 0 {
+        if sta.vht_cap.vht_supported {
+            a.peer_max_mpdu = (1 << (20 + ampdu_factor)) - 1;
+        } else if sta.ht_cap.ht_supported {
+            a.peer_max_mpdu = (1 << (16 + ampdu_factor)) - 1;
+        }
+    }
+    if h.phy[6] & cap::PHY6_PPE_THRESHOLD_PRESENT != 0 && !h.ppe.is_empty() {
+        let p = &mut a.peer_ppet;
+        p.numss_m1 = (h.ppe[0] & 7) as u32;
+        p.ru_bit_mask = ((h.ppe[0] & 0x78) >> 3) as u32;
+        let mut bit = 7usize;
+        for nss in 0..=(p.numss_m1 as usize) {
+            for ru in 0..4 {
+                if p.ru_bit_mask & (1 << ru) == 0 {
+                    continue;
+                }
+                let mut val = 0u32;
+                for _ in 0..6 {
+                    val >>= 1;
+                    val |=
+                        ((h.ppe.get(bit / 8).copied().unwrap_or(0) as u32 >> (bit % 8)) & 1) << 5;
+                    bit += 1;
+                }
+                p.ppet16_ppet8_ru3_ru0[nss] |= val << (ru * 6);
+            }
+        }
+    }
+    if h.mac[0] & cap::MAC0_TWT_RES != 0 {
+        a.twt_responder = true;
+    }
+    if h.mac[0] & cap::MAC0_TWT_REQ != 0 {
+        a.twt_requester = true;
+    }
+    // WMI_HECAP_TXRX_MCS_NSS_IDX_80 only: 160 / 80+80 sets need
+    // IEEE80211_STA_RX_BW_160, which NARF's 80 MHz channel layer never sets.
+    let _ = bw;
+    a.peer_he_mcs.clear();
+    a.peer_he_mcs.push((h.mcs[0] as u32, h.mcs[1] as u32));
+    // The NSS loop over he_tx_mcs: he_mcs_mask[i] is set for every i with
+    // the default mask, so max_nss = NL80211_HE_NSS_MAX (8).
+    a.peer_nss = (sta.rx_nss as u32).min(8);
 }
 
 /// `ath11k_mac_set_txbf_conf` value (`None` ⇔ no command).

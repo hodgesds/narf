@@ -714,6 +714,33 @@ updates), `handle_event(frame)`, `connected_bssid()`.
   drivers never do; wpa_supplicant runs SAE through
   `NL80211_CMD_AUTHENTICATE` there, which NARF's ath11k has no path for
   yet), so SAE is reached from the in-kernel `associate` (autoconnect).
+- HE (`mac/he.rs`): own HE capabilities per band = `ath11k_mac_copy_he_cap`
+  for a STA (SERVICE_READY_EXT `he_cap_info` / `he_cap_phy_info` / PPET:
+  MAC1 masked to TF MAC padding, sounding dimensions = tx chains - 1,
+  TWT requester not responder, TX 1024-QAM < 242-tone RU) +
+  `ath11k_mac_set_hemcsmap` (MCS 0-11 per enabled chain; the rx map shifts
+  by `tx_chain_mask_shift`, as Linux) + `ath11k_gen_ppe_thresh`; `has_he`
+  on every supported band, as Linux (so `HwCaps.he_supported`). HE mode
+  (`ConnMode::He`) when the AP has HE Capabilities + Operation (and VHT on
+  5 GHz) and `ieee80211_verify_{peer,sta}_he_mcs_support` pass; the
+  Association Request carries `ieee80211_put_he_cap` (adjusted to the
+  connection width: DCM max RU, 40 / 160 bits, sounding / STBC above 80
+  MHz) after VHT (`before_he[]` split). At association success
+  `ieee80211_he_cap_ie_to_sta_he_cap` (MCS intersection, 160 / 80+80
+  disabled) from the response, HE bandwidth / NSS; `ath11k_bss_assoc`
+  sends `WMI_VDEV_PARAM_SET_HEMU_MODE` (`ath11k_mac_vif_recalc_sta_he_txbf`)
+  before PEER_ASSOC, whose HE fields follow `ath11k_peer_assoc_h_he`
+  (`WMI_PEER_HE`, TWT flags, MAC / PHY words, `he_oper.params & 0xffffff`,
+  PPET, the 80 MHz MCS set) and `ath11k_mac_get_phymode_he` /
+  `MODE_11AX_HE*_2G`; OBSS spatial reuse from the AP's SR element
+  (`ieee80211_he_spr_ie_to_bss_conf`); then `BSS_CHANGED_HE_BSS_COLOR`'s
+  STA arm (BSS color change enable, collision detection 10 s / 200 ms
+  scan). Step 276 `HE_PARAM` (console; Linux warns). Not done: 6 GHz
+  association (HE 6 GHz capability, regulatory connectivity element,
+  power rules), 160 / 80+80 MHz, TWT (`BSS_CHANGED_TWT` →
+  `WMI_TWT_ENABLE`), HE operation's VHT info as a 5 GHz width source;
+  `ath11k_mac_config_obss_pd` is AP-only (mac80211 never signals
+  `BSS_CHANGED_HE_OBSS_PD` for a station).
 - PMF / 802.11w (`MfpState`): ath11k returns 1 from `ath11k_mac_op_set_key`
   for AES-CMAC, so BIP is mac80211 software on WCN6855 too: the IGTK (M3 /
   Group 1/2, IPN as `rx_pn`) never reaches the firmware. Receive (from the
@@ -987,7 +1014,7 @@ purged or interface-down frames report dropped).
 `reserve_name("wlan%d")`, MAC from WMI READY, MTU 1500, `link_up` =
 associated + authorized, RX / TX frame rings) and
 `narf_wireless::WirelessNetIface` (`get_wireless_info` from the wiphy
-channels (2.4 / 5 GHz, enabled only) + own HT / VHT caps, HE false;
+channels (2.4 / 5 GHz, enabled only) + own HT / VHT / HE caps;
 `scan`, `associate`, `disassociate` lock the mac layer (async mutex
 across the operation); `set_config` accepts only the current channel;
 `supports_handshake_offload`, `reports_disconnect_events`).
@@ -1163,8 +1190,9 @@ operations refused) and the reset gate.
 - The driver never reports a wireless capability it does not have:
   `wlan%d` is registered only after the core, the data path and the mac
   layer (`ath11k_mac_register`) are up, and opens (pdev start + station
-  vif) only on `IFF_UP`; HE / 6 GHz association / WPA3 are
-  not advertised (HwCaps.he false, bands 2.4 / 5 GHz).
+  vif) only on `IFF_UP`; 6 GHz association and SAE offload are not
+  advertised (bands 2.4 / 5 GHz; `supports_sae_offload` false, as for every
+  mac80211 driver); HE is (and is used on 2.4 / 5 GHz).
 - No lock is held across an `.await`: `Shared::rt` is taken for
   synchronous steps only (a recovery moves the runtime out of the slot
   instead of holding it); the mac-layer mutex is held across a control
@@ -1427,7 +1455,8 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   rewrites the sequence number; Linux sends the same); PEER_MAP v1 with
   no AST (WCN6855 `htt_peer_map_v2 = false`); monitor-status rings
   filling and being reaped; REO status delivery for the PN updates;
-  the HE-capable firmware associating with an HT/VHT-only Association
+  the HE PEER_ASSOC / HEMU / BSS color commands against the real firmware
+  and HE rates on air; the HE-capable firmware associating with an HT/VHT-only Association
   Request; 5 GHz DFS / passive channels in the scan list; the board-2.bin
   variant and regdb for the P14s Gen 5 (17aa:9309); link-loss detection
   timing (beacon miss → 3 s); DMA32 memory pressure with the Linux ring
@@ -1475,17 +1504,16 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   `regdb.bin`) load once the MHI image proved the store is up. An ISO /
   initramfs-only image
   needs `--initramfs-firmware "ath11k/WCN6855/hw2.1/*"`.
-- Mac layer scope (decided): HT + 5 GHz VHT only, no HE in the
-  Association Request (the chip is HE-capable; mac80211's HE paths,
-  6 GHz association and >80 MHz are therefore unreachable), so phymodes
-  are 11NG/11NA/11AC. Scan covers 2.4/5/6 GHz; `BssInfo` lists 2.4/5
+- Mac layer scope (decided): HT, 5 GHz VHT and HE on 2.4 / 5 GHz up to
+  80 MHz (phymodes 11NG / 11NA / 11AC / 11AX HE20-80); 6 GHz association
+  and > 80 MHz stay unreachable. Scan covers 2.4/5/6 GHz; `BssInfo` lists 2.4/5
   GHz only (`narf_wireless` uses bare channel numbers).
 - Mac layer, open vs Linux (each is a deliberate simplification or an
   unverified detail, see `mac.rs` comments): probe-request elements
   approximate `ieee80211_build_preq_ies`; the SME adds only the RSN
   element (wpa_supplicant also adds Extended Capabilities); no Country /
   Power Constraint handling (`ap_power_level`), no TPC / 6 GHz power
-  envelope, no HE txbf / BSS colour / TWT; association comeback
+  envelope, no TWT; association comeback
   (status 30) is a reject; PTK rekey, roaming,
   GTK rekey offload and CSA are not implemented; kickout is treated as
   link loss (Linux reports low-ack to userspace); deauth reason after a

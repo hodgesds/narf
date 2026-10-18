@@ -242,6 +242,8 @@ pub(super) struct FwCfg {
     pub(super) sta_ies: Option<Vec<u8>>,
     /// The AP does SAE (hostapd `handle_auth_sae`).
     pub(super) sae: Option<SaeAp>,
+    /// Elements appended to the Association Response (HE, ...).
+    pub(super) assoc_extra: Vec<u8>,
 }
 
 /// The fake AP's SAE behaviour.
@@ -280,6 +282,7 @@ impl Default for FwCfg {
             igtk: None,
             sta_ies: None,
             sae: None,
+            assoc_extra: Vec::new(),
         }
     }
 }
@@ -549,8 +552,9 @@ impl World {
             }
             frame::stype::ASSOC_REQ => {
                 if let Some(st) = cfg.assoc_status {
-                    self.events
-                        .push_back(mgmt_rx_event(6, 60, 2437, 0, &assoc_resp(st)));
+                    let mut r = assoc_resp(st);
+                    r.extend_from_slice(&cfg.assoc_extra);
+                    self.events.push_back(mgmt_rx_event(6, 60, 2437, 0, &r));
                     if st == 0 && cfg.eapol && cfg.send_m1 {
                         // hostapd picks the descriptor version of the AKM
                         // in the station's RSNE.
@@ -2334,6 +2338,7 @@ fn smoke_ath11k_mac_peer_assoc_prepare() -> TestResult {
         sta.wme = true;
         let p = peer::peer_assoc_prepare(&peer::PeerAssocInput {
             vdev_id: 0,
+            he: None,
             aid: 1,
             assoc_capability: 0x0431,
             listen_interval: 5,
@@ -2368,6 +2373,7 @@ fn smoke_ath11k_mac_peer_assoc_prepare() -> TestResult {
             },
             ..peer::PeerAssocInput {
                 vdev_id: 0,
+                he: None,
                 aid: 2,
                 assoc_capability: 1,
                 listen_interval: 5,
@@ -2393,6 +2399,7 @@ fn smoke_ath11k_mac_peer_assoc_prepare() -> TestResult {
             sta: &z,
             ..peer::PeerAssocInput {
                 vdev_id: 0,
+                he: None,
                 aid: 1,
                 assoc_capability: 1,
                 listen_interval: 5,
@@ -2501,6 +2508,7 @@ fn smoke_ath11k_mac_vht80_chandef() -> TestResult {
         sta.rx_nss = peer::sta_rx_nss(&sta.ht_cap, &sta.vht_cap);
         let p = peer::peer_assoc_prepare(&peer::PeerAssocInput {
             vdev_id: 0,
+            he: None,
             aid: 3,
             assoc_capability: 0x0011,
             listen_interval: 5,

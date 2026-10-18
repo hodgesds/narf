@@ -90,6 +90,8 @@ pub struct RadioInfo {
     pub bands: Vec<(u32, Vec<u32>)>,
     pub ht: bool,
     pub vht: bool,
+    /// HE capabilities on 2.4 / 5 GHz (`ath11k_mac_setup_he_cap`).
+    pub he: bool,
 }
 
 impl RadioInfo {
@@ -118,6 +120,7 @@ impl RadioInfo {
             bands,
             ht: own.ht_2g.ht_supported || own.ht_5g.ht_supported,
             vht: own.vht_5g.vht_supported,
+            he: m.own_he(Band::Ghz2).is_some() || m.own_he(Band::Ghz5).is_some(),
         }
     }
 }
@@ -715,9 +718,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
             hw_caps: HwCaps {
                 ht_supported: self.radio.ht,
                 vht_supported: self.radio.vht,
-                // The firmware is HE-capable; the mac layer associates
-                // HT / VHT only (ath11k.md §8).
-                he_supported: false,
+                // HE association on 2.4 / 5 GHz (ath11k.md §3.9).
+                he_supported: self.radio.he,
                 eht_supported: false,
             },
         }

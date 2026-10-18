@@ -39,6 +39,7 @@ use narf_wireless::{AssociateRequest, BssInfo, ScanRequest, WirelessError};
 use super::mac_frame::{self as frame, capab, eid, freq_band, Band, ParsedIes};
 use super::mac_peer::{self as peer, ApSta, ChanDef, ConnMode, OwnCaps, SmpsMode, Width};
 use super::mac_reg::{chan_flag, RegState, RegUpdate, VdevKind, Wiphy};
+pub mod he;
 pub mod sae;
 pub mod sec;
 use super::wmi::{self, *};
@@ -218,6 +219,9 @@ pub mod step {
     pub const SAE_CONFIRM: u32 = 274;
     /// No SAE answer after `IEEE80211_AUTH_MAX_TRIES` (detail = tries).
     pub const SAE_TIMEOUT: u32 = 275;
+    /// An HE vdev command failed (detail 0 HEMU_MODE, 1 BSS color change
+    /// enable, 2 OBSS color collision config); Linux only warns.
+    pub const HE_PARAM: u32 = 276;
 }
 
 /// Linux errnos used here (positive).
@@ -574,6 +578,9 @@ pub struct Link {
     pub ba_rx_token: [u8; 16],
     /// The negotiated RSN (AKM, PMF); `None` for Open.
     pub rsn: Option<RsnPlan>,
+    /// HE: the AP's HE station capabilities and operation (set at
+    /// association success when the connection is HE).
+    pub he: Option<peer::ApHe>,
 }
 
 /// Completions (`reinit_completion` → event → `complete`).
@@ -662,6 +669,9 @@ pub struct Mac<P: WmiPort, D: DataPort> {
     sup: Option<Supplicant>,
     /// 802.11w host state (software BIP keys, management PNs, SA Query).
     mfp: MfpState,
+    /// Our HE capabilities per band (`ar->mac.iftype[band][STATION]`):
+    /// 2.4 GHz, 5 GHz.
+    own_he: [Option<he::StaHeCap>; 2],
 }
 
 /// What `__cfg80211_disconnected` reports to nl80211 for a lost or
@@ -727,6 +737,15 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         initial_reg: Option<&RegInfo>,
     ) -> Self {
         let own = peer::own_caps(&caps.pdev);
+        // ath11k_mac_setup_he_cap
+        let he_for = |bit: u32, b: &BandCap| {
+            (caps.pdev.supported_bands & bit != 0)
+                .then(|| he::own_he_cap(&caps.pdev, b, own.num_tx_chains, own.num_rx_chains))
+        };
+        let own_he = [
+            he_for(WMI_HOST_WLAN_2G_CAP, &caps.pdev.band_2g),
+            he_for(WMI_HOST_WLAN_5G_CAP, &caps.pdev.band_5g),
+        ];
         let mut wiphy = Wiphy::new(
             caps.pdev.supported_bands,
             &caps.hal_reg_cap,
@@ -784,6 +803,29 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             disconnect: None,
             sup: None,
             mfp: MfpState::default(),
+            own_he,
+        }
+    }
+
+    /// `ieee80211_determine_ap_chan`'s HE check plus
+    /// `ieee80211_verify_peer_he_mcs_support` / `_sta_he_mcs_support`.
+    fn he_ok(&self, band: Band, ies: &ParsedIes) -> bool {
+        let (Some(own), Some(c), Some(o)) = (
+            self.own_he(band),
+            ies.he_cap.as_deref().and_then(he::parse_he_cap),
+            ies.he_oper.as_deref().and_then(he::HeOper::parse),
+        ) else {
+            return false;
+        };
+        he::he_mcs_ok(own, &c, &o)
+    }
+
+    /// Our HE capabilities on `band` (`None` on 6 GHz: not associated).
+    pub fn own_he(&self, band: Band) -> Option<&he::StaHeCap> {
+        match band {
+            Band::Ghz2 => self.own_he[0].as_ref(),
+            Band::Ghz5 => self.own_he[1].as_ref(),
+            Band::Ghz6 => None,
         }
     }
 
@@ -2175,6 +2217,15 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             ies.vht_cap.as_ref(),
             ies.vht_oper.as_ref(),
         );
+        // ieee80211_determine_ap_chan: HE when the AP has HE capabilities
+        // and operation (and VHT on 5 GHz), we have HE on the band, and
+        // ieee80211_verify_{peer,sta}_he_mcs_support pass.
+        let mut mode = mode;
+        if (mode == ConnMode::Vht || (band == Band::Ghz2 && mode == ConnMode::Ht))
+            && self.he_ok(band, ies)
+        {
+            mode = ConnMode::He;
+        }
         let (_, basic) = peer::rates_to_mask(band, &ies.rates);
         let (supp, _) = peer::rates_to_mask(band, &ies.rates);
         self.link = Some(Link {
@@ -2203,6 +2254,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             ba_rx_valid: 0,
             ba_rx_token: [0; 16],
             rsn: rsn.as_ref().map(|(p, _)| p.clone()),
+            he: None,
         });
         self.mfp = MfpState::default();
         // ── ieee80211_prep_connection ──
@@ -2552,7 +2604,12 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         if let Some(p) = rsn {
             extra.extend_from_slice(&sec::assoc_ies(p, &bss.ies));
         }
+        // ieee80211_put_he_cap for an HE connection.
+        let he_cap = (mode >= ConnMode::He)
+            .then(|| self.own_he(band).map(|h| he::put_he_cap(h, def.width)))
+            .flatten();
         frame::AssocReqParams {
+            he_cap,
             own: self.caps.mac_addr,
             bssid: bss.bssid,
             ssid: ssid.to_vec(),
@@ -2642,6 +2699,35 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         }
         sta.bandwidth = Some(peer::sta_bandwidth(&sta.ht_cap, &sta.vht_cap, &l.def));
         sta.rx_nss = peer::sta_rx_nss(&sta.ht_cap, &sta.vht_cap);
+        // ieee80211_assoc_config_link: ieee80211_he_cap_ie_to_sta_he_cap
+        // when the response has HE operation + capabilities.
+        let mut ap_he = None;
+        if let (true, Some(own), Some(c), Some(o)) = (
+            l.mode >= ConnMode::He,
+            self.own_he(band),
+            rie.he_cap.as_deref().and_then(he::parse_he_cap),
+            rie.he_oper.as_deref().and_then(he::HeOper::parse),
+        ) {
+            let cap = he::sta_he_cap(own, &c);
+            // _ieee80211_sta_cap_rx_bw / ieee80211_sta_init_nss with HE.
+            let cap_bw = match he::he_cap_rx_bw(&cap, band) {
+                160 => peer::StaBw::Bw160,
+                80 => peer::StaBw::Bw80,
+                40 => peer::StaBw::Bw40,
+                _ => peer::StaBw::Bw20,
+            };
+            let chan_bw = match l.def.width {
+                Width::W20NoHt | Width::W20 => peer::StaBw::Bw20,
+                Width::W40 => peer::StaBw::Bw40,
+                Width::W80 => peer::StaBw::Bw80,
+            };
+            sta.bandwidth = Some(cap_bw.min(chan_bw));
+            sta.rx_nss = sta.rx_nss.max(he::he_rx_nss(&cap)).max(1);
+            ap_he = Some(peer::ApHe {
+                cap,
+                oper_params: o.params,
+            });
+        }
         sta.wme = rie.wmm_param.is_some();
         // ieee80211_assoc_success: WLAN_STA_MFP from assoc_data->use_mfp.
         sta.mfp = l.rsn.as_ref().is_some_and(|r| r.mfp);
@@ -2649,6 +2735,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         {
             let lk = self.link.as_mut().unwrap();
             lk.sta = sta;
+            lk.he = ap_he.clone();
             lk.assoc = true;
             lk.basic_rates = if basic != 0 { basic } else { lk.basic_rates };
         }
@@ -2699,7 +2786,31 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                 .await;
         }
         self.bss_erp_changed(cts_c, slot_c, pre_c).await;
-        self.bss_assoc(bss, bss_ies, a.capab_info, aid).await
+        self.bss_assoc(bss, bss_ies, a.capab_info, aid, rie.he_spr.as_deref())
+            .await?;
+        // BSS_CHANGED_HE_BSS_COLOR (STA arm of ath11k_mac_bss_info_changed),
+        // after BSS_CHANGED_ASSOC.
+        if let Some(o) = rie.he_oper.as_deref().and_then(he::HeOper::parse) {
+            if ap_he.is_some() && !o.bss_color_disabled() {
+                let _ = self
+                    .cmd(
+                        bss_color_change_enable_cmd(vdev_id, true),
+                        step::HE_PARAM,
+                        1,
+                        "bss color change enable",
+                    )
+                    .await;
+                let _ = self
+                    .cmd(
+                        obss_color_collision_cfg_cmd(vdev_id, 0, 10_000, true),
+                        step::HE_PARAM,
+                        2,
+                        "obss color collision cfg",
+                    )
+                    .await;
+            }
+        }
+        Ok(())
     }
 
     /// `ath11k_bss_assoc`.
@@ -2709,10 +2820,25 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         ies: &ParsedIes,
         capab_info: u16,
         aid: u16,
+        he_spr: Option<&[u8]>,
     ) -> Result<(), MacError> {
         let vdev_id = self.vif.as_ref().unwrap().vdev_id;
         let l = self.link.clone().unwrap();
+        // ath11k_mac_vif_recalc_sta_he_txbf
+        if let (Some(h), Some(own)) = (l.he.as_ref(), self.own_he(l.def.band)) {
+            let m = he::sta_hemu_mode(own, &h.cap);
+            let c = vdev_set_param_cmd(vdev_id, WMI_VDEV_PARAM_SET_HEMU_MODE, m);
+            if self
+                .cmd(c, step::HE_PARAM, 0, "vdev HE MU mode")
+                .await
+                .is_err()
+            {
+                // "failed to recalc he txbf": ath11k_bss_assoc returns.
+                return Ok(());
+            }
+        }
         let arg = peer::peer_assoc_prepare(&peer::PeerAssocInput {
+            he: l.he.as_ref(),
             vdev_id,
             aid,
             assoc_capability: capab_info,
@@ -2767,10 +2893,16 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                 .cmd(c, step::PEER_AUTHORIZE, 1, "authorize bss peer")
                 .await;
         }
-        // he_obss_pd is all-zero without HE.
+        // bss_conf.he_obss_pd from the Spatial Reuse Parameter Set
+        // (ieee80211_he_spr_ie_to_bss_conf; all-zero without HE).
+        let (en, min, max) = if l.he.is_some() {
+            he::spr_obss_pd(he_spr)
+        } else {
+            (0, 0, 0)
+        };
         let _ = self
             .cmd(
-                obss_spr_cmd(vdev_id, 0, 0, 0),
+                obss_spr_cmd(vdev_id, en, min, max),
                 step::PEER_ASSOC,
                 3,
                 "obss spr",

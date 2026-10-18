@@ -421,6 +421,11 @@ pub struct ParsedIes {
     pub rsn: Option<Vec<u8>>,
     /// RSNXE (`WLAN_EID_RSNX`, 244) body.
     pub rsnxe: Option<Vec<u8>>,
+    /// HE Capabilities / HE Operation / Spatial Reuse Parameter Set
+    /// extension elements (data after the extension id).
+    pub he_cap: Option<Vec<u8>>,
+    pub he_oper: Option<Vec<u8>>,
+    pub he_spr: Option<Vec<u8>>,
     /// WPA (Microsoft OUI type 1) vendor element body.
     pub wpa: Option<Vec<u8>>,
     pub wmm_param: Option<WmmParam>,
@@ -465,6 +470,15 @@ impl ParsedIes {
                 eid::VHT_OPERATION if p.vht_oper.is_none() => p.vht_oper = VhtOperIe::parse(e.data),
                 eid::RSN if p.rsn.is_none() => p.rsn = Some(e.data.to_vec()),
                 eid::RSNX if p.rsnxe.is_none() => p.rsnxe = Some(e.data.to_vec()),
+                eid::EXTENSION if !e.data.is_empty() => {
+                    let d = Some(e.data[1..].to_vec());
+                    match e.data[0] {
+                        35 if p.he_cap.is_none() => p.he_cap = d,
+                        36 if p.he_oper.is_none() => p.he_oper = d,
+                        39 if p.he_spr.is_none() => p.he_spr = d,
+                        _ => {}
+                    }
+                }
                 eid::VENDOR_SPECIFIC if e.data.len() >= 4 && e.data[0..3] == OUI_MICROSOFT => {
                     match e.data[3] {
                         OUI_TYPE_MICROSOFT_WPA if p.wpa.is_none() => p.wpa = Some(e.data.to_vec()),
@@ -870,6 +884,23 @@ pub const BEFORE_VHT: &[u8] = &[
     eid::INTERWORKING,
 ];
 
+/// `before_he[]` of `ieee80211_add_before_he_elems`.
+pub const BEFORE_HE: &[u8] = &[
+    eid::OPMODE_NOTIF,
+    eid::EXTENSION,
+    14, // FUTURE_CHAN_GUIDANCE
+    eid::EXTENSION,
+    4, // FILS_SESSION
+    eid::EXTENSION,
+    12, // FILS_PUBLIC_KEY
+    eid::EXTENSION,
+    3, // FILS_KEY_CONFIRM
+    eid::EXTENSION,
+    5, // FILS_HLP_CONTAINER
+    eid::EXTENSION,
+    6, // FILS_IP_ADDR_ASSIGN
+];
+
 /// What `ieee80211_send_assoc` / `ieee80211_add_link_elems` need for a
 /// non-MLO (Re)Association Request.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -894,6 +925,8 @@ pub struct AssocReqParams {
     pub supported_channels: Vec<u8>,
     pub ht_cap: Option<HtCapIe>,
     pub vht_cap: Option<VhtCapIe>,
+    /// The HE Capabilities element (`ieee80211_put_he_cap`), whole.
+    pub he_cap: Option<Vec<u8>>,
     /// `Some(qos_info)` when `assoc_data->wmm`.
     pub wmm_qos_info: Option<u8>,
     /// `assoc_data->ie`: the SME's elements (RSN, ...).
@@ -955,6 +988,12 @@ pub fn build_assoc_req(p: &AssocReqParams) -> Vec<u8> {
     offset = next;
     if let Some(vht) = &p.vht_cap {
         vht.put(&mut f);
+    }
+    let next = ie_split(ies, BEFORE_HE, offset);
+    f.extend_from_slice(&ies[offset..next]);
+    offset = next;
+    if let Some(he) = &p.he_cap {
+        f.extend_from_slice(he);
     }
     let next = ie_split_vendor(ies, offset);
     f.extend_from_slice(&ies[offset..next]);

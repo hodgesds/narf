@@ -3993,6 +3993,41 @@ pub fn obss_spr_cmd(vdev_id: u32, enable: u32, min_offset: i32, max_offset: i32)
     )
 }
 
+/// `ath11k_wmi_send_bss_color_change_enable_cmd` (`struct
+/// wmi_bss_color_change_enable_params_cmd`: vdev_id, enable).
+pub fn bss_color_change_enable_cmd(vdev_id: u32, enable: bool) -> WmiCmd {
+    simple_cmd(
+        WMI_BSS_COLOR_CHANGE_ENABLE_CMDID,
+        WMI_TAG_BSS_COLOR_CHANGE_ENABLE,
+        &[vdev_id, enable as u32],
+    )
+}
+
+/// `ath11k_wmi_send_obss_color_collision_cfg_cmd` (`struct
+/// wmi_obss_color_collision_cfg_params_cmd`: vdev_id, flags 0, evt_type
+/// DETECTION / DISABLE, current_bss_color, detection_period_ms,
+/// `ATH11K_BSS_COLOR_COLLISION_SCAN_PERIOD_MS`, free_slot_expiry 0).
+pub fn obss_color_collision_cfg_cmd(
+    vdev_id: u32,
+    bss_color: u8,
+    period_ms: u32,
+    enable: bool,
+) -> WmiCmd {
+    simple_cmd(
+        WMI_OBSS_COLOR_COLLISION_DET_CONFIG_CMDID,
+        WMI_TAG_OBSS_COLOR_COLLISION_DET_CONFIG,
+        &[
+            vdev_id,
+            0,
+            enable as u32,
+            bss_color as u32,
+            period_ms,
+            200,
+            0,
+        ],
+    )
+}
+
 /// `ath11k_reg_11d_new_cc_event` (`WMI_11D_NEW_COUNTRY_EVENTID`): the
 /// two alpha2 bytes of `wmi_11d_new_cc_ev.new_alpha2`. A missing TLV is
 /// `-EPROTO` as in Linux.
