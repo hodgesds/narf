@@ -2278,6 +2278,12 @@ pub(crate) struct CowState {
     /// In-place editing means one block can be rewritten by many operations;
     /// this keeps the batch from re-writing the whole path every time.
     dirty: BTreeSet<u64>,
+    /// Blocks of `pending` that a previous operation of the batch already
+    /// published (its root went live through `advance_fs_root`). Readers on
+    /// other CPUs walk that tree without any lock, so those blocks are never
+    /// rewritten in place again: the next operation COWs them to fresh
+    /// addresses and drops them (never committed, so nothing is freed).
+    sealed: BTreeSet<u64>,
     freed: Vec<(u64, u8)>,
     root: u64,
     root_level: u8,
@@ -2341,6 +2347,7 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
                 header,
                 pending: BTreeMap::new(),
                 dirty: BTreeSet::new(),
+                sealed: BTreeSet::new(),
                 freed: Vec::new(),
                 root,
                 root_level,
@@ -2365,6 +2372,9 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
     /// next operation touched rather than the whole accumulated path.
     pub(crate) fn suspend(mut self) -> (CowState, Vec<(u64, Vec<u8>, u8)>) {
         let dirty = core::mem::take(&mut self.state.dirty);
+        // Everything pending is about to be published to readers.
+        let published: Vec<u64> = self.state.pending.keys().copied().collect();
+        self.state.sealed.extend(published);
         let out: Vec<(u64, Vec<u8>, u8)> = dirty
             .into_iter()
             .filter_map(|addr| {
@@ -2391,6 +2401,7 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
     /// Retire the block at `addr`: if it was made this txn, drop it (never
     /// committed); otherwise record it as a freed committed block.
     fn retire(&mut self, addr: u64, level: u8) {
+        self.state.sealed.remove(&addr);
         if self.state.pending.remove(&addr).is_none() {
             self.state.freed.push((addr, level));
         } else {
@@ -2444,7 +2455,8 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
             self.retire(old_addr, level); // an emptied non-root node: drop it
             return Ok(Vec::new());
         }
-        let reuse = self.state.pending.contains_key(&old_addr);
+        let in_batch = self.state.pending.contains_key(&old_addr);
+        let reuse = in_batch && !self.state.sealed.contains(&old_addr);
         let mut ptrs = Vec::with_capacity(bufs.len());
         for (i, buf) in bufs.into_iter().enumerate() {
             let key = Self::first_key(&buf)?;
@@ -2459,7 +2471,10 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
             };
             ptrs.push((key, addr, self.gen));
         }
-        if !reuse {
+        if in_batch && !reuse {
+            // A published batch block: replaced, never committed, not freed.
+            self.retire(old_addr, level);
+        } else if !reuse {
             self.state.freed.push((old_addr, level)); // a committed block is replaced
         }
         Ok(ptrs)

@@ -13093,8 +13093,8 @@ fn smoke_btrfs_racing_writers_smp() -> TestResult {
     static DONE: AtomicU32 = AtomicU32::new(0);
     static FAILED: AtomicU32 = AtomicU32::new(0);
     static STARTED: AtomicU32 = AtomicU32::new(0);
-    if narf_lib::smp::cpu_count() < 4 {
-        return TestResult::Skip("needs four CPUs");
+    if narf_lib::smp::cpu_count() < 5 {
+        return TestResult::Skip("needs five CPUs");
     }
     DONE.store(0, Ordering::Release);
     FAILED.store(0, Ordering::Release);
@@ -13109,6 +13109,49 @@ fn smoke_btrfs_racing_writers_smp() -> TestResult {
         _ => return TestResult::Fail("mkdir failed"),
     };
     const PER: u32 = 150;
+    // Stable files a reader on a fourth CPU keeps reading while the writers
+    // restructure the same directory's leaves: a reader takes no lock, so the
+    // tree it walks must never be rewritten under it.
+    for i in 0..24u32 {
+        let f = match poll_once(dir.create(&alloc::format!("s{i}"))) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("create stable file failed"),
+        };
+        if !matches!(
+            poll_once(f.write(0, &crate::interop::pattern(i, 5000))),
+            Some(Ok(5000))
+        ) {
+            return TestResult::Fail("write stable file failed");
+        }
+    }
+    {
+        let dir = dir.clone();
+        narf_scheduler::spawn_stackful_pinned(
+            async move {
+                let mut rounds = 0u32;
+                while DONE.load(Ordering::Acquire) < 3 || rounds == 0 {
+                    for i in 0..24u32 {
+                        let ok = async {
+                            let f = dir.lookup_async(&alloc::format!("s{i}")).await?;
+                            let mut buf = alloc::vec![0u8; 5016];
+                            let n = f.read(0, &mut buf).await?;
+                            Ok::<bool, FsError>(buf[..n] == crate::interop::pattern(i, 5000)[..])
+                        }
+                        .await;
+                        if !matches!(ok, Ok(true)) {
+                            use core::fmt::Write as _;
+                            let _ = writeln!(narf_console::Writer, "smp race reader s{i}: {ok:?}");
+                            FAILED.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    rounds += 1;
+                    narf_scheduler::yield_now().await;
+                }
+                DONE.fetch_add(1, Ordering::AcqRel);
+            },
+            4,
+        );
+    }
     for (cpu, prefix) in [(1u32, "a"), (2, "b")] {
         let dir = dir.clone();
         narf_scheduler::spawn_stackful_pinned(
@@ -13161,11 +13204,11 @@ fn smoke_btrfs_racing_writers_smp() -> TestResult {
         );
     }
     let mut spins = 0u64;
-    while DONE.load(Ordering::Acquire) < 3 && spins < 20_000_000_000 {
+    while DONE.load(Ordering::Acquire) < 4 && spins < 20_000_000_000 {
         core::hint::spin_loop();
         spins += 1;
     }
-    if DONE.load(Ordering::Acquire) < 3 {
+    if DONE.load(Ordering::Acquire) < 4 {
         return TestResult::Fail("racing writers did not finish");
     }
     if FAILED.load(Ordering::Acquire) != 0 {
@@ -13195,7 +13238,7 @@ fn smoke_btrfs_racing_writers_smp() -> TestResult {
                 }
             }
         }
-        let kept = 2 * (0..PER).filter(|i| i % 4 != 2).count();
+        let kept = 2 * (0..PER).filter(|i| i % 4 != 2).count() + 24;
         match poll_once(dir.enumerate_async(0, 4096)) {
             Some(Ok(e)) if e.len() == kept => Ok(()),
             _ => Err("racing directory has the wrong entries"),
