@@ -1183,3 +1183,23 @@ fn smoke_btrfs_root_rw_metadata_reserve() -> TestResult {
     }
 }
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_root_rw_metadata_reserve);
+
+/// The free-space tree's leaf count is made monotone late in the commit fixed
+/// point by padding its tiling: the padded groups still cover every item, in
+/// order, with no empty leaf, and a tiling of single items cannot be padded.
+fn smoke_btrfs_fst_pad_groups() -> TestResult {
+    let mut g = alloc::vec![(0usize, 7usize), (7, 9), (9, 30)];
+    crate::write::pad_groups(&mut g, 6);
+    let contiguous = g.windows(2).all(|w| w[0].1 == w[1].0);
+    if g.len() != 6 || g[0].0 != 0 || g[5].1 != 30 || !contiguous || g.iter().any(|&(s, e)| e <= s)
+    {
+        return TestResult::Fail("padded tiling is not a cover of the items");
+    }
+    let mut ones = alloc::vec![(0usize, 1usize), (1, 2)];
+    crate::write::pad_groups(&mut ones, 5);
+    if ones != [(0, 1), (1, 2)] {
+        return TestResult::Fail("single-item groups were split");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_fst_pad_groups);

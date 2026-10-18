@@ -1543,9 +1543,13 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
             + added_data.len()
             + state.pending.len()
             + state.freed.len();
-        if batch.alloc.free_bytes(format::BLOCK_GROUP_METADATA) < commit_meta_reserve(vol, changes)
-        {
+        let free = batch.alloc.free_bytes(format::BLOCK_GROUP_METADATA);
+        let need = commit_meta_reserve(vol, changes);
+        if free < need {
             batch.alloc = snapshot_alloc;
+            META_RESERVE_REFUSAL.store(true, core::sync::atomic::Ordering::Relaxed);
+            META_RESERVE_FREE.store(free, core::sync::atomic::Ordering::Relaxed);
+            META_RESERVE_NEED.store(need, core::sync::atomic::Ordering::Relaxed);
             return Err(FsError::NoSpace);
         }
     }
@@ -1610,16 +1614,28 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
 /// Metadata bytes a batch commit with `changes` reference/block changes is
 /// allowed to need, and so must find free: a fixed floor for the trees every
 /// commit path-COWs (root, extent, csum, free-space, block-group: a few
-/// root-to-leaf paths each), plus two blocks per change (the extent-tree leaf
-/// its item lands in, and a csum or free-space leaf), each change touching at
-/// most one fresh leaf per tree.
+/// root-to-leaf paths each, and the repacked free-space tree), plus one block
+/// per four changes for the extent/csum leaves they land in. An estimate,
+/// not a bound: a commit that still runs out aborts the filesystem
+/// read-only, which loses the batch but never writes an inconsistent tree.
 pub(crate) fn commit_meta_reserve<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     changes: usize,
 ) -> u64 {
     const FLOOR_BLOCKS: u64 = 256;
-    (vol.nodesize() as u64).saturating_mul(FLOOR_BLOCKS.saturating_add(2 * changes as u64))
+    // Changes cluster: a run of new data extents or freed blocks lands in
+    // adjacent extent/csum items, a couple of hundred to a leaf. One fresh
+    // leaf per four changes still covers changes scattered four to a leaf.
+    (vol.nodesize() as u64).saturating_mul(FLOOR_BLOCKS.saturating_add(changes as u64 / 4))
 }
+
+/// Set when batch staging refused an operation for the commit reserve, so the
+/// growth that follows allocates METADATA (not DATA); with the free/needed
+/// figures for its log line. Consumed by [`root_rw_grow`].
+static META_RESERVE_REFUSAL: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static META_RESERVE_FREE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static META_RESERVE_NEED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Who asked for the batch to be committed, which decides what a failed commit
 /// costs.
@@ -2862,6 +2878,23 @@ fn group_items<B: BlockDevice + 'static>(
     }
     groups.push((start, n)); // final (possibly empty) leaf
     Ok(groups)
+}
+
+/// Split `groups` (from [`group_items`]) until there are `target` of them,
+/// halving the group with the most items each time. A subset of a group fits
+/// wherever the group did, so the result is still a valid tiling, just with
+/// emptier leaves. Stops early when every group is down to one item.
+pub(crate) fn pad_groups(groups: &mut Vec<(usize, usize)>, target: usize) {
+    while groups.len() < target {
+        let Some((i, &(s, e))) = groups.iter().enumerate().max_by_key(|&(_, &(s, e))| e - s) else {
+            return;
+        };
+        if e - s < 2 {
+            return;
+        }
+        let mid = s + (e - s) / 2;
+        groups.splice(i..=i, [(s, mid), (mid, e)]);
+    }
 }
 
 /// btrfs caps tree height (`BTRFS_MAX_LEVEL`): leaves are level 0, the root at
@@ -5308,6 +5341,7 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     // bounded and monotonic on supported trees, but the 12-round historical cap
     // cut off a real 14-round convergence during the NVMe late-init smoke.
     const MAX_FIXED_POINT_ROUNDS: usize = 64;
+    const FST_MONOTONE_AFTER_ROUND: usize = 8;
     for round in 0..MAX_FIXED_POINT_ROUNDS {
         COMMIT_ROUND.store(round as u32, core::sync::atomic::Ordering::Relaxed);
         commit_phase(2);
@@ -5413,7 +5447,17 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
                     let (s, l) = bg_of(&bgs, b).ok_or(FsError::InvalidData)?;
                     fst_mark_free(&mut ff, ss, s, l, b, l2)?;
                 }
-                let g = group_items(vol, &ff)?;
+                let mut g = group_items(vol, &ff)?;
+                // The leaf count feeds back into the allocation (its blocks
+                // are this round's), and the allocation into the free-space
+                // extents (a hole filled or split): near a leaf boundary the
+                // two can alternate forever, N leaves -> N+1 -> N. After a few
+                // rounds the count is only allowed to grow, padding with
+                // emptier leaves when fewer would do, so the sequence is
+                // monotone and bounded and the fixed point settles.
+                if round >= FST_MONOTONE_AFTER_ROUND && g.len() < fst_leaves {
+                    pad_groups(&mut g, fst_leaves);
+                }
                 (Some(ff), Some(g))
             }
             None => (None, None),
@@ -8982,23 +9026,36 @@ pub(crate) async fn alloc_chunk<B: BlockDevice + 'static>(
 }
 
 /// `root-rw` growth for an operation that failed with `NoSpace`: allocate the
-/// chunk type that ran short. METADATA when free metadata is below twice the
-/// commit reserve ([`commit_meta_reserve`]: the operation was most likely
-/// refused for the reserve), else DATA, falling back to METADATA. `NoSpace`
-/// when the device has no room for the chunk.
+/// chunk type that ran short. METADATA when staging refused the operation for
+/// the commit reserve ([`commit_meta_reserve`]) or free metadata is below
+/// twice its floor, else DATA, falling back to METADATA. `NoSpace` when the
+/// device has no room for the chunk.
 pub(crate) fn root_rw_grow<'a, B: BlockDevice + 'static>(
     vol: &'a BtrfsVolume<B>,
 ) -> BoxFut<'a, ()> {
     Box::pin(async move {
-        let meta_short = match Allocator::build(vol).await {
-            Ok(a) => {
-                a.free_bytes(format::BLOCK_GROUP_METADATA)
-                    < commit_meta_reserve(vol, 0).saturating_mul(2)
-            }
-            Err(_) => false,
-        };
+        use core::sync::atomic::Ordering;
+        let refused = META_RESERVE_REFUSAL.swap(false, Ordering::Relaxed);
+        let meta_short = refused
+            || match Allocator::build(vol).await {
+                Ok(a) => {
+                    a.free_bytes(format::BLOCK_GROUP_METADATA)
+                        < commit_meta_reserve(vol, 0).saturating_mul(2)
+                }
+                Err(_) => false,
+            };
         if meta_short {
-            return alloc_chunk(vol, format::BLOCK_GROUP_METADATA).await;
+            let grown = alloc_chunk(vol, format::BLOCK_GROUP_METADATA).await;
+            if refused && grown.is_ok() {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "btrfs: grew METADATA: {} KiB were free, a commit may need {} KiB",
+                    META_RESERVE_FREE.load(Ordering::Relaxed) >> 10,
+                    META_RESERVE_NEED.load(Ordering::Relaxed) >> 10
+                );
+            }
+            return grown;
         }
         match alloc_chunk(vol, format::BLOCK_GROUP_DATA).await {
             Err(FsError::NoSpace) => alloc_chunk(vol, format::BLOCK_GROUP_METADATA).await,

@@ -86,8 +86,9 @@ space allocates one SINGLE/DUP chunk by path COW instead
 btrfs `total_bytes`) of the type that ran short (`write::root_rw_grow`),
 and a device with no hole left is ENOSPC. A batch never stages an operation
 that would leave less free metadata than its own commit may need
-(`write::commit_meta_reserve`: a 256-block floor plus two blocks per
-reference/block change), so a commit never fails for space. NARF's own
+(`write::commit_meta_reserve`: a 256-block floor plus one block per four
+reference/block changes), so a commit does not run out of space; one that
+still does aborts read-only. NARF's own
 shared-root snapshot ioctl is refused, and full qgroups
 are left inconsistent with a rescan pending instead of being recounted. The
 last view of a writable core commits what it holds.
