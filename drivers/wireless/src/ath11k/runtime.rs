@@ -435,6 +435,9 @@ pub struct RtStats {
     pub rx_dropped_unauth: u32,
     pub rx_dropped_not_ours: u32,
     pub rx_dropped_echo: u32,
+    /// EAPOL to neither our address nor the PAE group address
+    /// (`ieee80211_frame_allowed`).
+    pub rx_dropped_eapol_da: u32,
     pub rx_dropped_short: u32,
     pub rx_queue_full: u32,
     pub tx_data: u32,
@@ -494,6 +497,10 @@ pub enum SyncOp {
 fn is_multicast(a: &[u8]) -> bool {
     a[0] & 1 != 0
 }
+
+/// `pae_group_addr` of `ieee80211_frame_allowed` (IEEE 802.1X PAE group
+/// address 01-80-C2-00-00-03).
+pub const PAE_GROUP_ADDR: [u8; 6] = [0x01, 0x80, 0xC2, 0x00, 0x00, 0x03];
 
 impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
     /// A runtime over a ready core and its DP.
@@ -582,7 +589,13 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
 
     /// Classify one delivered MSDU (mac80211 RX for a station:
     /// `ieee80211_accept_frame`, `ieee80211_data_to_8023`'s echo check,
-    /// the control port, `ieee80211_802_1x_port_control`).
+    /// `ieee80211_frame_allowed` — EAPOL only to our address or the PAE
+    /// group address, whatever its protection; everything else through
+    /// `ieee80211_802_1x_port_control` — then
+    /// `ieee80211_deliver_skb_to_local_stack`: the control port protocol
+    /// goes to the supplicant (`control_port_over_nl80211`), the rest to
+    /// the stack). Which EAPOL source the supplicant accepts is its own
+    /// rule (wpa_supplicant's `last_eapol_matches_bssid`; `mac.rs`).
     fn rx_msdu(&mut self, m: RxMsdu) {
         let csum_ok = m.csum_ok;
         let f = m.frame;
@@ -602,6 +615,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
             return;
         }
         if u16::from_be_bytes([f[12], f[13]]) == ETH_P_PAE {
+            if da != own && da != PAE_GROUP_ADDR {
+                self.stats.rx_dropped_eapol_da += 1;
+                return;
+            }
             self.stats.rx_eapol += 1;
             if self.link.eapol_rx.len() >= EAPOL_QUEUE_MAX {
                 self.link.eapol_rx.pop_front();

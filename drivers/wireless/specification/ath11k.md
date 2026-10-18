@@ -678,9 +678,11 @@ step starts with `Rt::service()`:
 3. every DP group with rings: `dp.service_srng(grp, 64)` (re-polled
    while it uses the whole budget, ≤ 8 rounds), work on a group whose MSI
    did not fire is counted (`dp_polled_without_irq`, the poll
-   fallback); RX MSDUs are classified (multicast echo of our SA dropped,
-   unicast not to us dropped, EAPOL → `eapol_rx`, data → `data_rx` only
-   while authorized), `reo_status` → `dp.reo_status_handler`, TX
+   fallback); RX MSDUs are classified (unicast not to us dropped,
+   multicast echo of our SA dropped, EAPOL → `eapol_rx` only to our
+   address or the PAE group address 01-80-C2-00-00-03 as
+   `ieee80211_frame_allowed` (`rx_dropped_eapol_da` otherwise), data →
+   `data_rx` only while authorized), `reo_status` → `dp.reo_status_handler`, TX
    completions to the TX status (buffers freed in the DP);
 4. `dp.service_shadow_timers`, the 10 ms monitor-status reap timer
    (armed by `mon_status_default(true)`), `qmi.service()` every 100 ms.
@@ -1097,9 +1099,7 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   Linux's), no A-MSDU / fast-xmit header cache; ADDBA from the AP is not answered (no
   `ath11k_mac_op_ampdu_action`; the AP falls back to non-aggregated
   traffic, REO queues stay at BA window 1); EAPOL
-  after the 4-way handshake (group rekey) is queued and never consumed; a
-  multicast EAPOL or one from a non-AP SA is not filtered beyond
-  mac80211's address checks.
+  after the 4-way handshake (group rekey) is queued and never consumed.
 - Open (control path): userspace Wi-Fi control over nl80211 needs a
   launcher that grants the `wlan%d` interface to the supplicant /
   manager task (`network_daemon::prepare`); until one exists the

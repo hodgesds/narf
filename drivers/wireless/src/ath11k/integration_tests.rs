@@ -1399,6 +1399,55 @@ kernel_test_in!(
     smoke_ath11k_int_unauthorized_and_disconnect
 );
 
+/// `ieee80211_frame_allowed` for EAPOL: to our address or the PAE group
+/// address (01-80-C2-00-00-03) it reaches the supplicant queue, before
+/// and after authorization; to the broadcast or another group address it
+/// is dropped; unicast to another station is not ours at all.
+fn smoke_ath11k_int_eapol_filter() -> TestResult {
+    use super::mac_frame as frame;
+    check(|| {
+        let u = up(wpa2_cfg())?;
+        let pdu = [0x02, 0x03, 0x00, 0x00];
+        let feed = |da: &[u8; 6]| {
+            u.dev
+                .st
+                .borrow_mut()
+                .rx_queue
+                .push_back(frame::eapol_eth(da, &BSSID, &pdu));
+            pump(&u, 3);
+        };
+        let other = [0x00, 0x03, 0x7F, 0x99, 0x99, 0x99];
+        feed(&[0xff; 6]);
+        feed(&[0x01, 0x00, 0x5e, 0x00, 0x00, 0x01]);
+        feed(&other);
+        {
+            let g = run(u.shared.lock());
+            ensure!(
+                g.stats.rx_dropped_eapol_da == 2 && g.stats.rx_dropped_not_ours == 1,
+                "group EAPOL dropped, foreign unicast not ours"
+            );
+            ensure!(
+                g.link.eapol_rx.is_empty() && g.stats.rx_eapol == 0,
+                "nothing queued for the supplicant"
+            );
+        }
+        feed(&super::runtime::PAE_GROUP_ADDR);
+        feed(&OWN);
+        let g = run(u.shared.lock());
+        ensure!(
+            g.stats.rx_eapol == 2 && g.link.eapol_rx.len() == 2,
+            "PAE group and unicast EAPOL queued"
+        );
+        ensure!(
+            g.link.eapol_rx[0][..6] == super::runtime::PAE_GROUP_ADDR,
+            "PAE group frame delivered as received"
+        );
+        ensure!(RX_SEEN.lock().is_empty(), "EAPOL never reaches the stack");
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_eapol_filter);
+
 /// PEER_STA_KICKOUT for the AP: the runtime loop's mac housekeeping
 /// tears the link down and drops the carrier.
 fn smoke_ath11k_int_link_loss() -> TestResult {
