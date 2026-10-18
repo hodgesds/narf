@@ -336,6 +336,20 @@ impl Allocator {
         self.alloc(vol, len, s, format::BLOCK_GROUP_DATA)
     }
 
+    /// Bytes still free in block groups of `kind`; `u64::MAX` for the bump
+    /// allocator, which does not know (it is never used under `root-rw`,
+    /// which requires a free-space tree).
+    pub fn free_bytes(&self, kind: u64) -> u64 {
+        match self {
+            Allocator::Reclaim { ranges } => ranges
+                .iter()
+                .filter(|&&(_, _, flags)| flags & kind != 0)
+                .map(|&(_, len, _)| len)
+                .sum(),
+            Allocator::Bump { .. } => u64::MAX,
+        }
+    }
+
     /// Snapshot the allocator's free state so the commit's metadata fixed point
     /// can re-hand-out the same addresses each round ([`Allocator::restore`]).
     pub fn snapshot(&self) -> Allocator {

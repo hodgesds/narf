@@ -1525,6 +1525,30 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
         return Err(e);
     }
     let (state, dirty) = cow.suspend();
+    // Keep back the metadata the batch's own commit will need. Linux reserves
+    // it before a transaction may start (`btrfs_start_transaction`'s
+    // `num_items` reservation, backed by the global block reserve); a commit
+    // that finds no room for its extent/csum/root/free-space blocks can only
+    // abort, and then every operation the batch already reported successful
+    // is lost. So an operation that would leave less than the commit's
+    // estimated need fails here with `NoSpace` — before it is staged, so
+    // nothing is lost — and `autogrow!` allocates a METADATA chunk (or the
+    // caller gets ENOSPC on a full device) instead.
+    if crate::rw_gate::active_profile() == crate::rw_gate::Profile::RootRw {
+        let changes = batch.new_data.len()
+            + batch.dropped_data.len()
+            + batch.added_data.len()
+            + new_data.len()
+            + dropped_data.len()
+            + added_data.len()
+            + state.pending.len()
+            + state.freed.len();
+        if batch.alloc.free_bytes(format::BLOCK_GROUP_METADATA) < commit_meta_reserve(vol, changes)
+        {
+            batch.alloc = snapshot_alloc;
+            return Err(FsError::NoSpace);
+        }
+    }
     for (addr, mut buf, _lvl) in dirty {
         let written = match stamp_node(&mut buf, addr, batch.gen, vol.csum_type()) {
             Ok(()) => vol.write_node(addr, &buf).await,
@@ -1581,6 +1605,20 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
     }
     batch.ops += 1;
     Ok(())
+}
+
+/// Metadata bytes a batch commit with `changes` reference/block changes is
+/// allowed to need, and so must find free: a fixed floor for the trees every
+/// commit path-COWs (root, extent, csum, free-space, block-group: a few
+/// root-to-leaf paths each), plus two blocks per change (the extent-tree leaf
+/// its item lands in, and a csum or free-space leaf), each change touching at
+/// most one fresh leaf per tree.
+pub(crate) fn commit_meta_reserve<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    changes: usize,
+) -> u64 {
+    const FLOOR_BLOCKS: u64 = 256;
+    (vol.nodesize() as u64).saturating_mul(FLOOR_BLOCKS.saturating_add(2 * changes as u64))
 }
 
 /// Who asked for the batch to be committed, which decides what a failed commit
@@ -8941,6 +8979,32 @@ pub(crate) async fn alloc_chunk<B: BlockDevice + 'static>(
     kind: u64,
 ) -> Result<(), FsError> {
     chunk_alloc::alloc_chunk(vol, kind).await
+}
+
+/// `root-rw` growth for an operation that failed with `NoSpace`: allocate the
+/// chunk type that ran short. METADATA when free metadata is below twice the
+/// commit reserve ([`commit_meta_reserve`]: the operation was most likely
+/// refused for the reserve), else DATA, falling back to METADATA. `NoSpace`
+/// when the device has no room for the chunk.
+pub(crate) fn root_rw_grow<'a, B: BlockDevice + 'static>(
+    vol: &'a BtrfsVolume<B>,
+) -> BoxFut<'a, ()> {
+    Box::pin(async move {
+        let meta_short = match Allocator::build(vol).await {
+            Ok(a) => {
+                a.free_bytes(format::BLOCK_GROUP_METADATA)
+                    < commit_meta_reserve(vol, 0).saturating_mul(2)
+            }
+            Err(_) => false,
+        };
+        if meta_short {
+            return alloc_chunk(vol, format::BLOCK_GROUP_METADATA).await;
+        }
+        match alloc_chunk(vol, format::BLOCK_GROUP_DATA).await {
+            Err(FsError::NoSpace) => alloc_chunk(vol, format::BLOCK_GROUP_METADATA).await,
+            other => other,
+        }
+    })
 }
 
 /// Grow the filesystem by allocating either one mixed block group or one DATA

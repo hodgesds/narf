@@ -135,20 +135,13 @@ macro_rules! autogrow {
         let mut tries = 0u32;
         // Under `narf.disks=root-rw` the whole-tree-repacking growth path is
         // never used on a production root; a chunk is allocated the way
-        // Linux allocates one instead (`write::alloc_chunk`, path COW only),
-        // DATA first, then METADATA, and a device with no room left is
+        // Linux allocates one instead (`write::root_rw_grow`, path COW only),
+        // of the type that ran short, and a device with no room left is
         // ENOSPC.
         let root_rw = crate::rw_gate::active_profile() == crate::rw_gate::Profile::RootRw;
         while tries < 4 && matches!(r, Err(FsError::NoSpace)) {
             if root_rw {
-                let data = crate::write::alloc_chunk(&$vol, format::BLOCK_GROUP_DATA).await;
-                let meta = match data {
-                    Err(FsError::NoSpace) => {
-                        crate::write::alloc_chunk(&$vol, format::BLOCK_GROUP_METADATA).await
-                    }
-                    other => other,
-                };
-                meta?;
+                crate::write::root_rw_grow(&$vol).await?;
             } else {
                 crate::write::grow_add_chunk(&$vol).await?;
             }

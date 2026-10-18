@@ -1126,3 +1126,60 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_root_rw_write_allocates_chunk
 );
+
+/// Metadata-heavy writes under `root-rw` until the 32 MiB metadata group
+/// would run out: the batch must keep back what its own commit needs, so the
+/// operation that would eat into it fails *before* staging, a METADATA chunk
+/// is allocated, and no commit ever fails for space. (Before the reserve, a
+/// commit found the metadata groups full and aborted the filesystem with
+/// operations it had already acknowledged.)
+fn smoke_btrfs_root_rw_metadata_reserve() -> TestResult {
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev) {
+        Ok(v) if v.supports_writes() => v,
+        _ => return TestResult::Fail("bgt fixture did not mount writable"),
+    };
+    let Ok((_, _, chunks0, _)) = chunk_accounting(&vol) else {
+        return TestResult::Fail("accounting unreadable");
+    };
+    narf_block::disk_policy::__set_policy_for_test(Some(
+        narf_block::disk_policy::DiskPolicy::RootRw,
+    ));
+    let result = (|| {
+        let body: Vec<u8> = alloc::vec![0x6d; 3000];
+        for i in 0..9000u32 {
+            let name = alloc::format!("m{i}");
+            let f = match poll_once(vol.root().create(&name)) {
+                Some(Ok(f)) => f,
+                Some(Err(FsError::NoSpace)) => return Err("ENOSPC although the device has room"),
+                _ => return Err("create failed (aborted?)"),
+            };
+            match poll_once(f.write(0, &body)) {
+                Some(Ok(n)) if n == body.len() => {}
+                Some(Err(FsError::NoSpace)) => return Err("ENOSPC although the device has room"),
+                _ => return Err("write failed (aborted?)"),
+            }
+        }
+        match poll_once(vol.sync_to_disk()) {
+            Some(Ok(())) => Ok(()),
+            _ => Err("sync failed"),
+        }
+    })();
+    narf_block::disk_policy::__set_policy_for_test(None);
+    if let Err(why) = result {
+        return TestResult::Fail(why);
+    }
+    if !vol.admits_writes() {
+        return TestResult::Fail("the filesystem aborted");
+    }
+    match chunk_accounting(&vol) {
+        Ok((ext, used, chunks, _)) if ext == used && chunks > chunks0 => {}
+        Ok(_) => return TestResult::Fail("no chunk allocated, or accounting inconsistent"),
+        Err(why) => return TestResult::Fail(why),
+    }
+    match super::snapshots::check_ref_counts(&vol) {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_root_rw_metadata_reserve);
