@@ -4486,6 +4486,7 @@ impl MountNamespace {
             root,
             fs_name: String::from(mount.fs.name()),
             backing_identity: mount.fs.backing_identity(),
+            source: mount.fs.clone(),
         }) as Arc<dyn FsInstance>)
     }
 
@@ -4795,6 +4796,11 @@ struct BindMount {
     root: Arc<dyn DirOps>,
     fs_name: String,
     backing_identity: usize,
+    /// The filesystem this view is of. A bind mount shares the source's
+    /// superblock on Linux, so a remount through it reconfigures the source
+    /// (`systemd-remount-fs` remounts the installed root through the
+    /// `/mnt` bind PID 1 is rooted at).
+    source: Arc<dyn FsInstance>,
 }
 
 impl fmt::Debug for BindMount {
@@ -4817,6 +4823,15 @@ impl FsInstance for BindMount {
     }
     fn backing_identity(&self) -> usize {
         self.backing_identity
+    }
+    fn reconfigure(&self, options: &str) -> Result<(), FsError> {
+        self.source.reconfigure(options)
+    }
+    fn reconfigure_sb(&self, sb_flags: u64, sb_mask: u64, options: &str) -> Result<(), FsError> {
+        self.source.reconfigure_sb(sb_flags, sb_mask, options)
+    }
+    fn show_options(&self) -> String {
+        self.source.show_options()
     }
 }
 
@@ -4897,6 +4912,7 @@ fn build_bind_fs(
             root: source_root_dir,
             fs_name,
             backing_identity: source_fs.backing_identity(),
+            source: source_fs.clone(),
         }));
     }
     let mut dir = source_root_dir;
@@ -4915,6 +4931,7 @@ fn build_bind_fs(
                     root: d,
                     fs_name,
                     backing_identity: source_fs.backing_identity(),
+                    source: source_fs.clone(),
                 }));
             }
         }
@@ -4930,6 +4947,7 @@ fn build_bind_fs(
             root: d,
             fs_name,
             backing_identity: source_fs.backing_identity(),
+            source: source_fs.clone(),
         }));
     }
     Err(FsError::NotFound)
@@ -5457,6 +5475,7 @@ impl VfsRegistry {
             root,
             fs_name: String::from(mount.fs.name()),
             backing_identity: mount.fs.backing_identity(),
+            source: mount.fs.clone(),
         }) as Arc<dyn FsInstance>)
     }
 
