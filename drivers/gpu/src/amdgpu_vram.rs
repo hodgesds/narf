@@ -115,6 +115,10 @@ impl Pool {
                 .map(|r| r.end - r.start)
                 .sum::<u64>()
     }
+    /// The whole aperture, protected ranges included.
+    pub fn size(&self) -> u64 {
+        self.0.mapping.len
+    }
     pub(crate) fn mapping(&self) -> MmioRegion {
         self.0.mapping
     }

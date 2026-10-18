@@ -515,6 +515,42 @@ fn memory_info(snap: &Snapshot) -> Vec<u8> {
     })
 }
 
+/// `AMDGPU_INFO_MEMORY` for a card with a client VRAM heap, as
+/// amdgpu_info_ioctl reports it: total VRAM is the hardware's, usable VRAM
+/// what clients may take (the heap; the rest is the driver's, Linux's
+/// pinned and reserved VRAM), usage what they hold now. CPU-accessible VRAM
+/// is the BAR, of which clients may take the heap's visible pool.
+fn memory_info_heap(snap: &Snapshot, heap: crate::amdgpu_gem::HeapUsage) -> Vec<u8> {
+    let usable = heap.visible.0 + heap.unmapped.0;
+    let gtt = crate::amdgpu_gem::gtt_limit();
+    let info = |total: u64, usable: u64, usage: u64| uapi::DrmAmdgpuHeapInfo {
+        total_heap_size: total,
+        usable_heap_size: usable,
+        heap_usage: usage,
+        max_allocation: usable / 4 * 3,
+    };
+    as_bytes(&uapi::DrmAmdgpuMemoryInfo {
+        vram: info(snap.vram_size, usable, heap.visible.1 + heap.unmapped.1),
+        cpu_accessible_vram: info(
+            snap.visible_vram_size,
+            heap.visible.0.min(usable),
+            heap.visible.1,
+        ),
+        gtt: info(gtt, gtt, crate::amdgpu_gem::gtt_used()),
+    })
+}
+
+/// `AMDGPU_INFO_VRAM_GTT` for a card with a client VRAM heap: the usable
+/// sizes, as amdgpu_info_ioctl subtracts pinned and reserved VRAM.
+fn vram_gtt_heap(heap: crate::amdgpu_gem::HeapUsage) -> Vec<u8> {
+    let usable = heap.visible.0 + heap.unmapped.0;
+    as_bytes(&uapi::DrmAmdgpuInfoVramGtt {
+        vram_size: usable,
+        vram_cpu_accessible_size: heap.visible.0.min(usable),
+        gtt_size: crate::amdgpu_gem::gtt_limit(),
+    })
+}
+
 /// `AMDGPU_INFO_VRAM_GTT` → the older three-u64 form of the same thing.
 fn vram_gtt(snap: &Snapshot) -> Vec<u8> {
     as_bytes(&uapi::DrmAmdgpuInfoVramGtt {
@@ -586,6 +622,14 @@ fn answers_navi22(snap: &Snapshot) -> bool {
     snap.family == Family::Navi2
         && snap.did == u32::from(crate::amdgpu::NAVI22)
         && family_id(snap).is_some()
+}
+
+/// The client VRAM heap of `vm`'s card, unless Navi 22 answers for it.
+fn card_heap(vm: &crate::amdgpu_vm::VmState) -> Option<crate::amdgpu_gem::HeapUsage> {
+    if snapshot().is_some_and(|snap| answers_navi22(&snap)) {
+        return None;
+    }
+    vm.card().and_then(crate::amdgpu_gem::vram_heap_usage)
 }
 
 /// [`query`] against an explicit device description.
@@ -667,6 +711,19 @@ pub fn dispatch_for(
             out.extend_from_slice(&f.status.to_le_bytes());
             out.extend_from_slice(&f.vmhub.to_le_bytes());
             out
+        }
+        // The open's card's client VRAM heap, where it has one; Navi 22
+        // answers its own.
+        (uapi::AMDGPU_INFO_MEMORY | uapi::AMDGPU_INFO_VRAM_GTT, Some(vm))
+            if card_heap(vm).is_some() =>
+        {
+            let snap = snapshot().ok_or(FsError::NotFound)?;
+            let heap = card_heap(vm).ok_or(FsError::NotFound)?;
+            if which == uapi::AMDGPU_INFO_MEMORY {
+                memory_info_heap(&snap, heap)
+            } else {
+                vram_gtt_heap(heap)
+            }
         }
         // amdgpu_hw_ip_info: the rings the open's card can run its jobs on.
         (uapi::AMDGPU_INFO_HW_IP_INFO, Some(vm)) => {
@@ -793,6 +850,42 @@ mod topology_tests {
         "drivers/gpu/gfx12",
         gfx12_dev_info_uses_harvesting_without_claiming_acceleration
     );
+
+    /// MEMORY and VRAM_GTT for a card with a client heap: hardware totals,
+    /// the heap as usable, its allocations as usage.
+    fn info_memory_reports_the_card_heap() -> TestResult {
+        let gpu = crate::amdgpu_navi48_firmware::tests::gpu();
+        let mut snap = Snapshot::from_gpu(&gpu);
+        snap.vram_size = 16 << 30;
+        snap.visible_vram_size = 256 << 20;
+        let heap = crate::amdgpu_gem::HeapUsage {
+            visible: (192 << 20, 8 << 20),
+            unmapped: ((15 << 30) + (512 << 20), 1 << 30),
+        };
+        let bytes = memory_info_heap(&snap, heap);
+        // SAFETY: exact-sized POD reply; byte vectors need not be aligned.
+        let m: uapi::DrmAmdgpuMemoryInfo =
+            unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast()) };
+        let usable = (15 << 30) + (704 << 20);
+        let bytes = vram_gtt_heap(heap);
+        // SAFETY: as above.
+        let v: uapi::DrmAmdgpuInfoVramGtt =
+            unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast()) };
+        if m.vram.total_heap_size != 16 << 30
+            || m.vram.usable_heap_size != usable
+            || m.vram.heap_usage != (1 << 30) + (8 << 20)
+            || m.vram.max_allocation != usable / 4 * 3
+            || m.cpu_accessible_vram.total_heap_size != 256 << 20
+            || m.cpu_accessible_vram.usable_heap_size != 192 << 20
+            || m.cpu_accessible_vram.heap_usage != 8 << 20
+            || m.gtt.total_heap_size != crate::amdgpu_gem::gtt_limit()
+            || (v.vram_size, v.vram_cpu_accessible_size) != (usable, 192 << 20)
+        {
+            return TestResult::Fail("MEMORY / VRAM_GTT from the card's client heap");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/gfx12", info_memory_reports_the_card_heap);
 
     /// What Mesa's ac_query_gpu_info cannot start without on GFX12: the
     /// CP firmware versions, and `GB_ADDR_CONFIG` at dword 0x263e (GC

@@ -4636,6 +4636,15 @@ paths; only the tables differ.
   entry addresses and the kind; `gpu_at(offset)` and `frames` give any
   page, and GEM_VA writes each entry through `gpu_at`. `AMDGPU_INFO_MEMORY`
   and `VRAM_GTT` report that limit as the GTT heap, with its usage.
+  `vram_heap_usage(card)` gives a registered heap's `HeapUsage { visible,
+  unmapped }` as (size, used) bytes (`Pool::size` / `available`). On an
+  open whose card has a heap (Navi 22 still answers its own),
+  `AMDGPU_INFO_MEMORY` reports total VRAM as the hardware's, usable VRAM as
+  the heap (visible + unmapped; the rest is the driver's, Linux's pinned
+  and reserved VRAM), usage as its allocations, CPU-accessible usable as
+  the visible pool with its usage, and each `max_allocation` as 3/4 of
+  usable; `VRAM_GTT` reports the usable sizes. Without one, both report
+  the hardware sizes as before.
   A heap may also carry an `UnmappedHeap` (an `UnmappedPool` past the BAR
   and a `VramClear` engine): a `NO_CPU_ACCESS` VRAM buffer goes there
   first, falling back to the visible heap. It is cleared by

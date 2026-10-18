@@ -11208,6 +11208,15 @@ fn smoke_amdgpu_gem_places_buffers_in_card_vram() -> TestResult {
         if o.system || o.phys != phys || o.gpu != 0x1_0000_0000 || !zeroed {
             return None;
         }
+        // MEMORY's usage: two of the heap's four pages are taken.
+        if crate::amdgpu_gem::vram_heap_usage(card)
+            != Some(crate::amdgpu_gem::HeapUsage {
+                visible: (4 * P, 2 * P),
+                unmapped: (0, 0),
+            })
+        {
+            return None;
+        }
         gem_va_on(
             &vm,
             &gem,

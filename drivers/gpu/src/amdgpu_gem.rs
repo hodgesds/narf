@@ -130,6 +130,27 @@ pub fn unregister_vram_heap(card: u32) {
     HEAPS.lock().retain(|(c, _)| *c != card);
 }
 
+/// A card's client VRAM heap in bytes: `(size, used)` of its CPU-visible
+/// pool and of its pool past the BAR (0, 0 without one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapUsage {
+    pub visible: (u64, u64),
+    pub unmapped: (u64, u64),
+}
+
+/// What DRM card `card`'s client VRAM heap holds, if it has one.
+pub fn vram_heap_usage(card: u32) -> Option<HeapUsage> {
+    let heap = vram_heap(card)?;
+    let visible = heap.pool.size();
+    let unmapped = heap.unmapped.as_ref().map_or((0, 0), |u| {
+        (u.pool.size(), u.pool.size() - u.pool.available())
+    });
+    Some(HeapUsage {
+        visible: (visible, visible - heap.pool.available()),
+        unmapped,
+    })
+}
+
 fn vram_heap(card: u32) -> Option<VramHeap> {
     HEAPS
         .lock()
