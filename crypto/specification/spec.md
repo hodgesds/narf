@@ -72,6 +72,7 @@ stricter whole-encryption-sector rule before calling these primitives.
 | XOF       | SHAKE-128, SHAKE-256              |
 | Stream    | ChaCha20 (via AEAD, not standalone exposed) |
 | Disk      | AES-256-XTS, 512-byte data units, `plain64` little-endian sector tweak |
+| Key wrap  | AES Key Wrap, 128-bit KEK (`aes_kw::aes_wrap` / `aes_unwrap`, RFC 3394; IEEE 802.11 EAPOL-Key Key Data) |
 
 Post-quantum: algorithm choice left as an open question (§8).
 

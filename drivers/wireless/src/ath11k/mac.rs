@@ -32,7 +32,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::future::Future;
 
-use narf_wireless::eapol::{HmacPrimitive, KeyFrame, Supplicant};
+use narf_wireless::eapol::{GroupKeyError, GroupKeyFail, HmacPrimitive, KeyFrame, Supplicant};
 use narf_wireless::rsn::{self, RsnIe, Suite};
 use narf_wireless::{AssociateRequest, BssInfo, ScanRequest, SecurityConfig, WirelessError};
 
@@ -496,6 +496,10 @@ pub enum LinkLoss {
     BeaconLoss,
     /// Deauthentication (`true`) / Disassociation from the AP, reason.
     Deauth { deauth: bool, reason: u16 },
+    /// The supplicant gave up on the association
+    /// (`wpa_sm_deauthenticate(sm, reason)`, e.g. a failed Group Key
+    /// Handshake); `detail` is the [`step::EAPOL_GTK`] detail.
+    Supplicant { reason: u16, detail: u32 },
 }
 
 /// The association in progress / established.
@@ -600,6 +604,9 @@ pub struct Mac<P: WmiPort, D: DataPort> {
     mlme_target: Option<[u8; 6]>,
     /// The last disconnection, as cfg80211 reports it.
     disconnect: Option<Disconnect>,
+    /// The RSN supplicant of the association after its 4-way handshake
+    /// (PTK, replay counter, GTK in use) for the Group Key Handshake.
+    sup: Option<Supplicant>,
 }
 
 /// What `__cfg80211_disconnected` reports to nl80211 for a lost or
@@ -628,6 +635,12 @@ impl LinkLoss {
             },
             LinkLoss::Kickout | LinkLoss::BeaconLoss => Disconnect {
                 reason: frame::WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY,
+                from_ap: false,
+            },
+            // wpa_supplicant_deauthenticate → cfg80211_mlme_deauth: the
+            // Deauthentication mac80211 sends carries the reason.
+            LinkLoss::Supplicant { reason, .. } => Disconnect {
+                reason,
                 from_ap: false,
             },
         }
@@ -714,6 +727,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             link: None,
             mlme_target: None,
             disconnect: None,
+            sup: None,
         }
     }
 
@@ -830,6 +844,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         }
         self.release_mgmt_tx();
         self.run_deferred().await;
+        self.rx_eapol().await;
         let now = self.wmi.now_ms();
         if let Some(l) = self.link.as_mut() {
             if let Some(d) = l.conn_loss_deadline {
@@ -848,18 +863,114 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                         step::LINK_DEAUTH_RX,
                         ((deauth as u32) << 16) | reason as u32,
                     ),
+                    LinkLoss::Supplicant { detail, .. } => (step::EAPOL_GTK, detail),
                 };
                 MacError::new(s, d, errno::ENOLINK).report("link");
                 // __ieee80211_disconnect: WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY;
-                // a deauth / disassoc from the AP is not answered.
+                // the supplicant's deauth carries its reason; a deauth /
+                // disassoc from the AP is not answered.
                 let send_deauth = !matches!(loss, LinkLoss::Deauth { .. });
-                self.teardown(send_deauth, frame::WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY)
-                    .await;
+                let reason = match loss {
+                    LinkLoss::Supplicant { reason, .. } => reason,
+                    _ => frame::WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY,
+                };
+                self.teardown(send_deauth, reason).await;
                 self.disconnect = Some(loss.disconnect());
                 narf_memory::diag::set_wifi_stage(narf_memory::diag::WifiStage::Scan);
             }
         }
         loss
+    }
+
+    /// EAPOL received after the association completed: wpa_supplicant's
+    /// `wpa_supplicant_rx_eapol` → `wpa_sm_rx_eapol` for the Group Key
+    /// Handshake ([`Supplicant::process_group_m1`]: replay / MIC / key
+    /// data checks, `wpa_supplicant_process_1_of_2`), the new GTK
+    /// installed with its key index (`ath11k_mac_op_set_key(SET_KEY,
+    /// group)` → `ath11k_install_key(WMI_KEY_GROUP)` + the PN config) and
+    /// message 2/2 sent. Frames whose source is not the AP are not
+    /// processed (wpa_supplicant delays them once the authenticator was
+    /// seen to use the BSSID: `last_eapol_matches_bssid`); without RSN
+    /// (`key_mgmt == NONE`) EAPOL is ignored. A failed handshake
+    /// deauthenticates with `WLAN_REASON_UNSPECIFIED`
+    /// ([`LinkLoss::Supplicant`]). PMF is not negotiated (`sta.mfp` is
+    /// false), so an IGTK KDE is ignored, as `ieee80211w_set_keys`.
+    async fn rx_eapol(&mut self) {
+        while let Some(eth) = self.dp.recv_eapol(0).await {
+            let Some(l) = self.link.as_ref() else {
+                continue;
+            };
+            if !l.authorized || l.loss.is_some() || self.sup.is_none() {
+                continue;
+            }
+            let aa = l.bss.bssid;
+            let Some((src, pdu)) = frame::parse_eapol_eth(&eth) else {
+                continue;
+            };
+            if src != aa {
+                continue;
+            }
+            // PSK: 16-byte MIC; CCMP-128 group cipher (`connect` accepts
+            // no other).
+            let r = self
+                .sup
+                .as_mut()
+                .unwrap()
+                .process_group_m1(pdu, 16, 16, None);
+            let m1 = match r {
+                Ok(m) => m,
+                // "goto out": dropped, the association stays.
+                Err(GroupKeyError::Drop(_)) => continue,
+                Err(GroupKeyError::Fail(f)) => {
+                    let n = match f {
+                        GroupKeyFail::Before4Way => 1,
+                        GroupKeyFail::KeyData => 2,
+                        GroupKeyFail::GtkUnencrypted => 3,
+                        GroupKeyFail::NoGtk => 4,
+                        GroupKeyFail::GtkKdeLength => 5,
+                        GroupKeyFail::GtkCipherLength => 6,
+                    };
+                    self.supplicant_deauth(0x100 | n);
+                    return;
+                }
+            };
+            if let Some(g) = m1.gtk.as_ref() {
+                // wpa_supplicant_install_gtk → wpa_sm_set_key(GROUP_RX).
+                if self.install_key(aa, g.key_id, &g.key, false).await.is_err() {
+                    self.supplicant_deauth(0x200);
+                    return;
+                }
+                if let Some(s) = self.sup.as_mut() {
+                    s.group_keys_installed(Some(&g.key), None);
+                }
+                if let Some(l) = self.link.as_mut() {
+                    l.gtk_idx = Some(g.key_id);
+                }
+            }
+            let own = self.caps.mac_addr;
+            if self
+                .dp
+                .send_eth(&frame::eapol_eth(&aa, &own, &m1.reply))
+                .await
+                .is_err()
+            {
+                self.supplicant_deauth(0x300);
+                return;
+            }
+        }
+    }
+
+    /// `wpa_sm_deauthenticate(sm, WLAN_REASON_UNSPECIFIED)`: the link is
+    /// torn down by [`Mac::poll`] with that reason.
+    fn supplicant_deauth(&mut self, detail: u32) {
+        if let Some(l) = self.link.as_mut() {
+            if l.loss.is_none() {
+                l.loss = Some(LinkLoss::Supplicant {
+                    reason: frame::WLAN_REASON_UNSPECIFIED,
+                    detail,
+                });
+            }
+        }
     }
 
     /// `ath11k_wmi_tlv_op_rx` for the events the mac layer owns.
@@ -2652,6 +2763,10 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         let (gidx, gk) = gtk;
         self.install_key(aa, gidx, &gk, false).await?;
         self.link.as_mut().unwrap().gtk_idx = Some(gidx);
+        // wpa_supplicant_install_gtk records sm->gtk; the supplicant
+        // stays for the Group Key Handshake.
+        sup.group_keys_installed(Some(&gk), None);
+        self.sup = Some(sup);
         Ok(())
     }
 
@@ -2880,6 +2995,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         vm.ps = false;
         self.link = None;
         self.mlme_target = None;
+        self.sup = None;
     }
 
     /// `ath11k_mac_vdev_stop`.

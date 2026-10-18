@@ -375,6 +375,13 @@ pub struct Supplicant {
     pub ptk: Option<Ptk>,
     pub aa: [u8; 6],
     pub sa: [u8; 6],
+    /// `sm->rx_replay_counter_set`: a MIC-verified frame set
+    /// [`Supplicant::last_replay_counter`].
+    pub rx_replay_counter_set: bool,
+    /// The GTK / IGTK in use (`sm->gtk` / `sm->igtk`), for the
+    /// key-reinstallation check.
+    pub gtk: Option<Vec<u8>>,
+    pub igtk: Option<Vec<u8>>,
 }
 
 impl Supplicant {
@@ -387,6 +394,9 @@ impl Supplicant {
             ptk: None,
             aa,
             sa,
+            rx_replay_counter_set: false,
+            gtk: None,
+            igtk: None,
         }
     }
 
@@ -470,7 +480,10 @@ impl Supplicant {
             self.state = FourWayState::Failed;
             return Err(FourWayError::BadM3);
         }
+        // The caller verified M3's MIC (wpa_supplicant_verify_eapol_key_mic
+        // records the counter).
         self.last_replay_counter = m3.replay_counter;
+        self.rx_replay_counter_set = true;
 
         // M4: ACK clear, MIC set, Install clear, key_data empty.
         let mic_len = m3.key_mic.len();
@@ -482,4 +495,700 @@ impl Supplicant {
         self.state = FourWayState::PtkDone;
         Ok(Some(m4))
     }
+}
+
+// ── Group Key Handshake (Supplicant side, IEEE 802.11-2020 §12.7.7) ──
+//
+// The supplicant half of wpa_supplicant's `wpa_sm_rx_eapol` for a
+// group-key frame after the 4-Way Handshake, then
+// `wpa_supplicant_process_1_of_2` / `wpa_supplicant_rsn_process_1_of_2`
+// and `wpa_supplicant_send_2_of_2` (hostap `src/rsn_supp/wpa.c`), with
+// the Key Data parsed by the rules of `wpa_parse_kde_ies`
+// (`src/common/wpa_common.c`). RSN only (no WPA1, no FILS / AEAD AKMs,
+// no OCV, no MLO).
+
+/// `wpa_eapol_key_mic` for the Key Descriptor Versions a PSK / 802.1X
+/// AKM uses: HMAC-SHA1-128 (version 2) and AES-128-CMAC (version 3),
+/// truncated to `mic_len`. `None` for any other version or a KCK of the
+/// wrong length.
+pub fn eapol_key_mic(ver: u16, kck: &[u8], pdu: &[u8], mic_len: usize) -> Option<Vec<u8>> {
+    match ver {
+        KI_VERSION_HMAC_SHA1_AES if mic_len <= 20 => {
+            Some(narf_crypto::pbkdf2_sha1::hmac_sha1(kck, pdu)[..mic_len].to_vec())
+        }
+        KI_VERSION_AES_128_CMAC if mic_len <= 16 => {
+            let k: &[u8; 16] = kck.try_into().ok()?;
+            Some(narf_crypto::cmac_aes128::cmac_aes128_truncated(
+                k, pdu, mic_len,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Key Information bits 5:4 — Key Index (`WPA_KEY_INFO_KEY_INDEX_MASK`).
+pub const KI_KEY_INDEX_MASK: u16 = 0x0030;
+/// `WPA_KEY_INFO_TYPE_HMAC_MD5_RC4`.
+pub const KI_VERSION_HMAC_MD5_RC4: u16 = 0x01;
+/// wpa_supplicant's `DEFAULT_EAPOL_VERSION` (the 802.1X version of the
+/// frames it sends).
+pub const WPAS_EAPOL_VERSION: u8 = 1;
+/// `WPA_GTK_MAX_LEN`.
+pub const WPA_GTK_MAX_LEN: usize = 32;
+/// `WPA_IGTK_KDE_PREFIX_LEN` (Key ID 2 + IPN 6).
+pub const WPA_IGTK_KDE_PREFIX_LEN: usize = 8;
+/// `RSN_KEY_DATA_GROUPKEY` / `RSN_KEY_DATA_IGTK` (00-0F-AC:1 / :9).
+const KDE_GROUPKEY: [u8; 4] = [0x00, 0x0F, 0xAC, 1];
+const KDE_IGTK: [u8; 4] = [0x00, 0x0F, 0xAC, 9];
+
+/// Why a frame was dropped without an answer (wpa_supplicant `goto out`
+/// in `wpa_sm_rx_eapol`; the association stays).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GroupKeyDrop {
+    /// Shorter than an EAPOL-Key frame.
+    TooShort,
+    /// Not an EAPOL-Key frame.
+    NotKey,
+    /// Body length larger than the frame or smaller than the key header.
+    BadLength,
+    /// Descriptor Type is not RSN.
+    BadDescriptor,
+    /// Key Data Length past the body.
+    KeyDataOverflow,
+    /// "EAPOL-Key Replay Counter did not increase".
+    Replay,
+    /// SMK bit.
+    Smk,
+    /// No Key Ack.
+    NoAck,
+    /// Request bit.
+    Request,
+    /// Key Descriptor Version not 2 (or the CCMP interop version 3).
+    BadVersion,
+    /// A pairwise frame (PTK rekey: not handled here).
+    Pairwise,
+    /// "EAPOL-Key (Group) without Mic/Encr bit".
+    NoMic,
+    /// "Invalid EAPOL-Key MIC" / no PTK to verify it with.
+    BadMic,
+    /// Encrypted Key Data without the MIC bit.
+    EncryptedUnauthenticated,
+    /// "Unsupported AES-WRAP len" / "AES unwrap failed".
+    Decrypt,
+}
+
+/// Why `process_1_of_2` failed: wpa_supplicant then deauthenticates
+/// with `WLAN_REASON_UNSPECIFIED` (`wpa_sm_deauthenticate`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GroupKeyFail {
+    /// "Group Key Handshake started prior to completion of 4-way".
+    Before4Way,
+    /// Key Data underflow (`wpa_parse_kde_ies` returned -1).
+    KeyData,
+    /// "GTK KDE in unencrypted key data".
+    GtkUnencrypted,
+    /// "No GTK KDE in Group Key msg 1/2".
+    NoGtk,
+    /// "Invalid GTK KDE length".
+    GtkKdeLength,
+    /// `wpa_supplicant_check_group_cipher`: key length ≠ the cipher's.
+    GtkCipherLength,
+}
+
+/// A group-key frame was not processed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GroupKeyError {
+    Drop(GroupKeyDrop),
+    Fail(GroupKeyFail),
+}
+
+/// A GTK to install (`struct wpa_gtk_data` + the RSC).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gtk {
+    pub key_id: u8,
+    /// The KDE's Tx bit after `wpa_supplicant_gtk_tx_bit_workaround`
+    /// (always false with a pairwise key).
+    pub tx: bool,
+    pub key: Vec<u8>,
+    /// Key RSC of the message (`key_rsc_len` = 6 for CCMP / GCMP).
+    pub rsc: [u8; 8],
+}
+
+/// An IGTK to install (`struct wpa_igtk_kde`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Igtk {
+    pub key_id: u16,
+    pub ipn: [u8; 6],
+    pub key: Vec<u8>,
+}
+
+/// A processed Group Key message 1/2.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupKeyM1 {
+    /// The GTK to install; `None` when it is the GTK already in use
+    /// ("Not reinstalling already in-use GTK").
+    pub gtk: Option<Gtk>,
+    /// The IGTK (PMF only): `Some(Ok(None))` = already in use,
+    /// `Some(Err(()))` = invalid KDE ("Failed to configure IGTK", not
+    /// fatal), `None` = none sent / PMF off.
+    pub igtk: Option<Result<Option<Igtk>, ()>>,
+    /// The Group Key message 2/2 PDU (802.1X header + body, MIC set).
+    pub reply: Vec<u8>,
+}
+
+/// `(GTK KDE data, IGTK KDE data)`.
+type GroupKdes<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
+
+/// `wpa_parse_kde_ies`'s GTK / IGTK (the data after the KDE selector).
+fn parse_group_kdes(buf: &[u8]) -> Result<GroupKdes<'_>, ()> {
+    let (mut gtk, mut igtk) = (None, None);
+    let mut pos = 0usize;
+    while buf.len() - pos > 1 {
+        if buf[pos] == 0xdd && (pos == buf.len() - 1 || buf[pos + 1] == 0) {
+            break; // padding
+        }
+        let dlen = 2 + buf[pos + 1] as usize;
+        if dlen > buf.len() - pos {
+            return Err(()); // "EAPOL-Key Key Data underflow"
+        }
+        if buf[pos] == 0xdd && buf[pos + 1] as usize >= 4 {
+            let sel = &buf[pos + 2..pos + 6];
+            let left = &buf[pos + 6..pos + dlen];
+            if left.len() > 2 && sel == KDE_GROUPKEY {
+                gtk = Some(left);
+            } else if left.len() > 2 && sel == KDE_IGTK {
+                igtk = Some(left);
+            }
+        }
+        pos += dlen;
+    }
+    Ok((gtk, igtk))
+}
+
+impl Supplicant {
+    /// wpa_supplicant's `wpa_sm_rx_eapol` for a group-key EAPOL-Key frame
+    /// (`pdu` = 802.1X header + body) after the 4-Way Handshake, then
+    /// `wpa_supplicant_process_1_of_2` and `wpa_supplicant_send_2_of_2`.
+    ///
+    /// `mic_len` is the AKM's (16 for PSK), `group_key_len` the group
+    /// cipher's key length (16 for CCMP-128), `mgmt_group_key_len` the
+    /// IGTK length when PMF is negotiated (`None` = no PMF: an IGTK KDE
+    /// is ignored, as `ieee80211w_set_keys`).
+    ///
+    /// MICs are [`eapol_key_mic`]; Key Data is unwrapped with
+    /// `narf_crypto::aes_kw::aes_unwrap` (KEK of the PTK).
+    ///
+    /// On success the replay counter has advanced; the caller installs
+    /// [`GroupKeyM1::gtk`] (and the IGTK), then calls
+    /// [`Supplicant::group_keys_installed`] and transmits
+    /// [`GroupKeyM1::reply`]. If the install fails, wpa_supplicant
+    /// deauthenticates (`WLAN_REASON_UNSPECIFIED`), as for
+    /// [`GroupKeyError::Fail`].
+    pub fn process_group_m1(
+        &mut self,
+        pdu: &[u8],
+        mic_len: usize,
+        group_key_len: usize,
+        mgmt_group_key_len: Option<usize>,
+    ) -> Result<GroupKeyM1, GroupKeyError> {
+        use GroupKeyDrop as D;
+        use GroupKeyError::{Drop, Fail};
+        // 95 bytes of fixed fields minus the MIC, + MIC + Key Data Length.
+        let keyhdrlen = 77 + mic_len + 2;
+        if pdu.len() < 4 + keyhdrlen {
+            return Err(Drop(D::TooShort));
+        }
+        let plen = u16::from_be_bytes([pdu[2], pdu[3]]) as usize;
+        if pdu[1] != EapolType::EapolKey as u8 {
+            return Err(Drop(D::NotKey));
+        }
+        if plen > pdu.len() - 4 || plen < keyhdrlen {
+            return Err(Drop(D::BadLength));
+        }
+        // The 802.1X data only (trailing bytes ignored).
+        let mut tmp = pdu[..4 + plen].to_vec();
+        let body = 4;
+        if tmp[body] != KEY_DESCRIPTOR_RSN && tmp[body] != KEY_DESCRIPTOR_WPA_LEGACY {
+            return Err(Drop(D::BadDescriptor));
+        }
+        let mic_off = body + 77;
+        let kdl_off = mic_off + mic_len;
+        let mut key_data_len = u16::from_be_bytes([tmp[kdl_off], tmp[kdl_off + 1]]) as usize;
+        if key_data_len > plen - keyhdrlen {
+            return Err(Drop(D::KeyDataOverflow));
+        }
+        let mut rc = [0u8; 8];
+        rc.copy_from_slice(&tmp[body + 5..body + 13]);
+        let replay_counter = u64::from_be_bytes(rc);
+        if self.rx_replay_counter_set && replay_counter <= self.last_replay_counter {
+            return Err(Drop(D::Replay));
+        }
+        let key_info = u16::from_be_bytes([tmp[body + 1], tmp[body + 2]]);
+        if key_info & KI_SMK_MESSAGE != 0 {
+            return Err(Drop(D::Smk));
+        }
+        if key_info & KI_KEY_ACK == 0 {
+            return Err(Drop(D::NoAck));
+        }
+        if key_info & KI_REQUEST != 0 {
+            return Err(Drop(D::Request));
+        }
+        if tmp[body] != KEY_DESCRIPTOR_RSN {
+            // "RSN: Unsupported EAPOL-Key type" (WPA1 is not supported).
+            return Err(Drop(D::BadDescriptor));
+        }
+        let ver = key_info & KI_VERSION_MASK;
+        // PSK + CCMP: version 2, or 3 by the interoperability workaround
+        // ("allow incorrect ... but stronger"); RC4 needs TKIP.
+        if ver != KI_VERSION_HMAC_SHA1_AES && ver != KI_VERSION_AES_128_CMAC {
+            return Err(Drop(D::BadVersion));
+        }
+        if key_info & KI_KEY_TYPE_PAIRWISE != 0 {
+            return Err(Drop(D::Pairwise));
+        }
+        // wpa_supplicant_verify_eapol_key_mic
+        if key_info & KI_KEY_MIC != 0 {
+            let Some(ptk) = self.ptk.as_ref() else {
+                return Err(Drop(D::BadMic));
+            };
+            let got = tmp[mic_off..mic_off + mic_len].to_vec();
+            tmp[mic_off..mic_off + mic_len].fill(0);
+            match eapol_key_mic(ver, &ptk.kck, &tmp, mic_len) {
+                Some(m) if m == got => {}
+                _ => return Err(Drop(D::BadMic)),
+            }
+            tmp[mic_off..mic_off + mic_len].copy_from_slice(&got);
+            self.last_replay_counter = replay_counter;
+            self.rx_replay_counter_set = true;
+        }
+        let kd_off = kdl_off + 2;
+        let mut key_data = tmp[kd_off..kd_off + key_data_len].to_vec();
+        if key_info & KI_ENCRYPTED_KEY_DATA != 0 {
+            if key_info & KI_KEY_MIC == 0 {
+                return Err(Drop(D::EncryptedUnauthenticated));
+            }
+            // wpa_supplicant_decrypt_key_data (AES-WRAP for versions 2/3).
+            let Some(ptk) = self.ptk.as_ref() else {
+                return Err(Drop(D::Decrypt));
+            };
+            if key_data_len < 8 || key_data_len % 8 != 0 {
+                return Err(Drop(D::Decrypt));
+            }
+            key_data_len -= 8;
+            let kek: Option<&[u8; 16]> = ptk.kek.as_slice().try_into().ok();
+            match kek.and_then(|k| narf_crypto::aes_kw::aes_unwrap(k, &key_data)) {
+                Some(k) if k.len() == key_data_len => key_data = k,
+                _ => return Err(Drop(D::Decrypt)),
+            }
+        }
+        if key_info & KI_KEY_MIC == 0 {
+            return Err(Drop(D::NoMic));
+        }
+
+        // wpa_supplicant_process_1_of_2
+        if self.state != FourWayState::PtkDone {
+            return Err(Fail(GroupKeyFail::Before4Way));
+        }
+        let (gtk, igtk) = parse_group_kdes(&key_data).map_err(|_| Fail(GroupKeyFail::KeyData))?;
+        if gtk.is_some() && key_info & KI_ENCRYPTED_KEY_DATA == 0 {
+            return Err(Fail(GroupKeyFail::GtkUnencrypted));
+        }
+        let Some(gtk) = gtk else {
+            return Err(Fail(GroupKeyFail::NoGtk));
+        };
+        if gtk.len() < 2 || gtk.len() - 2 > WPA_GTK_MAX_LEN {
+            return Err(Fail(GroupKeyFail::GtkKdeLength));
+        }
+        if gtk.len() - 2 != group_key_len {
+            return Err(Fail(GroupKeyFail::GtkCipherLength));
+        }
+        let mut rsc = [0u8; 8];
+        rsc.copy_from_slice(&tmp[body + 61..body + 69]);
+        let new_gtk = Gtk {
+            key_id: gtk[0] & 0x3,
+            // wpa_supplicant_gtk_tx_bit_workaround: a pairwise key is in use.
+            tx: false,
+            key: gtk[2..].to_vec(),
+            rsc,
+        };
+        // ieee80211w_set_keys
+        let igtk = match (mgmt_group_key_len, igtk) {
+            (Some(klen), Some(i)) => Some(if i.len() != WPA_IGTK_KDE_PREFIX_LEN + klen {
+                Err(())
+            } else {
+                let key_id = u16::from_le_bytes([i[0], i[1]]);
+                let key = i[8..].to_vec();
+                if self.igtk.as_deref() == Some(&key[..]) {
+                    Ok(None)
+                } else if key_id > 4095 {
+                    Err(())
+                } else {
+                    let mut ipn = [0u8; 6];
+                    ipn.copy_from_slice(&i[2..8]);
+                    Ok(Some(Igtk { key_id, ipn, key }))
+                }
+            }),
+            _ => None,
+        };
+        // wpa_supplicant_install_gtk: "Detect possible key reinstallation".
+        let gtk = (self.gtk.as_deref() != Some(&new_gtk.key[..])).then_some(new_gtk);
+
+        // wpa_supplicant_send_2_of_2
+        let mut reply = KeyFrame::empty(mic_len);
+        reply.descriptor_type = KEY_DESCRIPTOR_RSN;
+        reply.key_information = (key_info & KI_KEY_INDEX_MASK) | ver | KI_SECURE | KI_KEY_MIC;
+        reply.key_length = 0;
+        reply.replay_counter = replay_counter;
+        let body_bytes = reply.encode();
+        let mut out = Vec::with_capacity(4 + body_bytes.len());
+        EapolHeader {
+            version: WPAS_EAPOL_VERSION,
+            packet_type: EapolType::EapolKey as u8,
+            body_length: body_bytes.len() as u16,
+        }
+        .encode(&mut out);
+        out.extend_from_slice(&body_bytes);
+        let kck = &self.ptk.as_ref().expect("PTK verified above").kck;
+        let m = eapol_key_mic(ver, kck, &out, mic_len).ok_or(Drop(D::BadVersion))?;
+        out[4 + 77..4 + 77 + mic_len].copy_from_slice(&m);
+        Ok(GroupKeyM1 {
+            gtk,
+            igtk,
+            reply: out,
+        })
+    }
+
+    /// Record the keys the driver accepted (`sm->gtk` / `sm->igtk`), for
+    /// the key-reinstallation check of the next Group Key message.
+    pub fn group_keys_installed(&mut self, gtk: Option<&[u8]>, igtk: Option<&[u8]>) {
+        if let Some(g) = gtk {
+            self.gtk = Some(g.to_vec());
+        }
+        if let Some(i) = igtk {
+            self.igtk = Some(i.to_vec());
+        }
+    }
+}
+
+// ── Tests (Group Key Handshake) ─────────────────────────────────────
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod group_tests {
+    use super::*;
+    use alloc::vec;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    struct Sha1;
+    impl HmacPrimitive for Sha1 {
+        fn out_len(&self) -> usize {
+            20
+        }
+        fn mac(&self, key: &[u8], data: &[u8]) -> Vec<u8> {
+            narf_crypto::pbkdf2_sha1::hmac_sha1(key, data).to_vec()
+        }
+    }
+
+    const AA: [u8; 6] = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+    const SA: [u8; 6] = [0x00, 0x03, 0x7F, 0x12, 0x34, 0x56];
+    const OLD_GTK: [u8; 16] = [0x7C; 16];
+    const NEW_GTK: [u8; 16] = [0x3D; 16];
+    const RSC: [u8; 8] = [0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0x00, 0x00];
+
+    fn ptk() -> Ptk {
+        derive_ptk(&Sha1, &[0x5A; 32], &AA, &SA, &[0x11; 32], &[0x22; 32], 16)
+    }
+
+    /// A supplicant right after a 4-way handshake whose M3 had replay
+    /// counter 2 and carried `OLD_GTK`.
+    fn done() -> Supplicant {
+        let mut s = Supplicant::new(AA, SA, [0x22; 32]);
+        s.state = FourWayState::PtkDone;
+        s.ptk = Some(ptk());
+        s.last_replay_counter = 2;
+        s.rx_replay_counter_set = true;
+        s.group_keys_installed(Some(&OLD_GTK), None);
+        s
+    }
+
+    /// `GTK KDE`: dd len 00-0f-ac:1 | KeyID/Tx | reserved | GTK.
+    fn gtk_kde(key_id: u8, gtk: &[u8]) -> Vec<u8> {
+        let mut v = vec![
+            0xDD,
+            (6 + gtk.len()) as u8,
+            0x00,
+            0x0F,
+            0xAC,
+            0x01,
+            key_id,
+            0x00,
+        ];
+        v.extend_from_slice(gtk);
+        v
+    }
+
+    /// The authenticator's Group Key message 1/2 (hostapd field order):
+    /// Key Info `ki`, replay counter `rc`, Key RSC, `kd` (wrapped with
+    /// the KEK when `ki` has Encrypted Key Data; padded with `dd 00…`
+    /// to 8 bytes first), MIC with the KCK when `ki` has Key MIC.
+    fn gm1(ki: u16, rc: u64, kd: &[u8]) -> Vec<u8> {
+        let p = ptk();
+        let mut k = KeyFrame::empty(16);
+        k.key_information = ki;
+        k.key_length = 0;
+        k.replay_counter = rc;
+        k.key_rsc = RSC;
+        k.key_data = if ki & KI_ENCRYPTED_KEY_DATA != 0 {
+            let mut d = kd.to_vec();
+            if d.len() % 8 != 0 || d.len() < 16 {
+                d.push(0xDD);
+                while d.len() % 8 != 0 || d.len() < 16 {
+                    d.push(0);
+                }
+            }
+            let kek: [u8; 16] = p.kek.as_slice().try_into().unwrap();
+            narf_crypto::aes_kw::aes_wrap(&kek, &d).unwrap()
+        } else {
+            kd.to_vec()
+        };
+        let mut b = k.into_eapol();
+        if ki & KI_KEY_MIC != 0 {
+            let ver = ki & KI_VERSION_MASK;
+            // RC4 (version 1) has no MIC primitive here: any bytes do.
+            let m = eapol_key_mic(ver, &p.kck, &b, 16).unwrap_or_else(|| vec![0; 16]);
+            b[81..97].copy_from_slice(&m);
+        }
+        b
+    }
+
+    /// ver 2 | Key MIC | Secure | Key Ack | Encrypted Key Data, group.
+    const GM1_KI: u16 = 0x1382;
+
+    fn smoke_eapol_group_rekey_2_of_2_golden() -> TestResult {
+        let mut s = done();
+        let f = gm1(GM1_KI, 3, &gtk_kde(2, &NEW_GTK));
+        let r = match s.process_group_m1(&f, 16, 16, None) {
+            Ok(r) => r,
+            Err(_) => return TestResult::Fail("GM1 rejected"),
+        };
+        let want_gtk = Gtk {
+            key_id: 2,
+            tx: false,
+            key: NEW_GTK.to_vec(),
+            rsc: RSC,
+        };
+        if r.gtk != Some(want_gtk) || r.igtk.is_some() {
+            return TestResult::Fail("GTK idx 2 + RSC from the frame, no IGTK");
+        }
+        // wpa_supplicant_send_2_of_2 (RSN, PSK, ver 2): 802.1X version 1
+        // (DEFAULT_EAPOL_VERSION), type 3, length 95; descriptor 2; Key
+        // Info = rx key index (0) | ver 2 | Secure | Key MIC = 0x0302;
+        // Key Length 0; replay counter copied (3); nonce / IV / RSC /
+        // reserved zero; MIC; Key Data Length 0.
+        let mut g = vec![0x01, 0x03, 0x00, 0x5F, 0x02, 0x03, 0x02, 0x00, 0x00];
+        g.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 3]);
+        g.extend_from_slice(&[0u8; 32 + 16 + 8 + 8]);
+        g.extend_from_slice(&[0u8; 16]);
+        g.extend_from_slice(&[0x00, 0x00]);
+        let p = ptk();
+        let mic = narf_crypto::pbkdf2_sha1::hmac_sha1(&p.kck, &g);
+        g[81..97].copy_from_slice(&mic[..16]);
+        if r.reply != g {
+            return TestResult::Fail("2/2 golden");
+        }
+        if s.last_replay_counter != 3 {
+            return TestResult::Fail("replay counter advanced to 3");
+        }
+        s.group_keys_installed(Some(&NEW_GTK), None);
+        if s.gtk.as_deref() != Some(&NEW_GTK[..]) {
+            return TestResult::Fail("installed GTK recorded");
+        }
+        // The same GTK again (retransmitted with a new counter): not
+        // reinstalled, still answered.
+        let f = gm1(GM1_KI, 4, &gtk_kde(2, &NEW_GTK));
+        match s.process_group_m1(&f, 16, 16, None) {
+            Ok(r) if r.gtk.is_none() && r.reply[16] == 4 => {}
+            _ => return TestResult::Fail("reinstall suppressed, 2/2 sent"),
+        }
+        // AES-128-CMAC descriptor version 3 (interop workaround).
+        let mut s = done();
+        let f = gm1(0x1383, 3, &gtk_kde(1, &NEW_GTK));
+        match s.process_group_m1(&f, 16, 16, None) {
+            Ok(r) => {
+                let mut z = r.reply.clone();
+                z[81..97].fill(0);
+                let k: [u8; 16] = ptk().kck.as_slice().try_into().unwrap();
+                let m = narf_crypto::cmac_aes128::cmac_aes128(&k, &z);
+                if r.reply[6] != 0x03 || r.reply[81..97] != m {
+                    return TestResult::Fail("ver 3: 0x0303 + CMAC MIC");
+                }
+            }
+            Err(_) => return TestResult::Fail("ver 3 GM1 rejected"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/eapol", smoke_eapol_group_rekey_2_of_2_golden);
+
+    fn smoke_eapol_group_rekey_drops() -> TestResult {
+        use GroupKeyDrop as D;
+        let kd = gtk_kde(2, &NEW_GTK);
+        let mut bad_mic = gm1(GM1_KI, 3, &kd);
+        bad_mic[90] ^= 1;
+        // Corrupt the wrapped key data, then re-MIC so only the unwrap
+        // fails.
+        let mut bad_wrap = gm1(GM1_KI, 3, &kd);
+        bad_wrap[100] ^= 1;
+        bad_wrap[81..97].fill(0);
+        let m = eapol_key_mic(2, &ptk().kck, &bad_wrap, 16).unwrap();
+        bad_wrap[81..97].copy_from_slice(&m);
+        let short = gm1(GM1_KI, 3, &kd)[..98].to_vec();
+        let mut not_key = gm1(GM1_KI, 3, &kd);
+        not_key[1] = 0;
+        let mut long_len = gm1(GM1_KI, 3, &kd);
+        long_len[2..4].copy_from_slice(&0x0400u16.to_be_bytes());
+        let mut wpa1 = gm1(GM1_KI, 3, &kd);
+        wpa1[4] = KEY_DESCRIPTOR_WPA_LEGACY;
+        let mut other_desc = gm1(GM1_KI, 3, &kd);
+        other_desc[4] = 7;
+        let mut kd_over = gm1(GM1_KI, 3, &kd);
+        kd_over[97..99].copy_from_slice(&0x0100u16.to_be_bytes());
+        let cases: Vec<(Vec<u8>, D, &'static str)> = vec![
+            (short, D::TooShort, "too short"),
+            (not_key, D::NotKey, "EAP packet is not a key frame"),
+            (long_len, D::BadLength, "body length past the frame"),
+            (other_desc, D::BadDescriptor, "unknown descriptor"),
+            (kd_over, D::KeyDataOverflow, "key data overflow"),
+            (
+                gm1(GM1_KI, 2, &kd),
+                D::Replay,
+                "replay counter not increased",
+            ),
+            (gm1(GM1_KI, 1, &kd), D::Replay, "replay counter went back"),
+            (gm1(GM1_KI | KI_SMK_MESSAGE, 3, &kd), D::Smk, "SMK bit"),
+            (gm1(GM1_KI & !KI_KEY_ACK, 3, &kd), D::NoAck, "no Key Ack"),
+            (gm1(GM1_KI | KI_REQUEST, 3, &kd), D::Request, "Request bit"),
+            (wpa1, D::BadDescriptor, "WPA1 descriptor"),
+            (
+                gm1(
+                    (GM1_KI & !KI_VERSION_MASK) | KI_VERSION_HMAC_MD5_RC4,
+                    3,
+                    &kd,
+                ),
+                D::BadVersion,
+                "RC4 descriptor version without TKIP",
+            ),
+            (
+                gm1(GM1_KI | KI_KEY_TYPE_PAIRWISE, 3, &kd),
+                D::Pairwise,
+                "pairwise frame",
+            ),
+            (bad_mic, D::BadMic, "MIC mismatch"),
+            (
+                gm1(GM1_KI & !KI_KEY_MIC, 3, &kd),
+                D::EncryptedUnauthenticated,
+                "encrypted Key Data without MIC",
+            ),
+            (bad_wrap, D::Decrypt, "AES unwrap integrity failure"),
+            (
+                gm1(KI_VERSION_HMAC_SHA1_AES | KI_SECURE | KI_KEY_ACK, 3, &kd),
+                D::NoMic,
+                "group frame without MIC / Encr",
+            ),
+        ];
+        for (f, d, what) in cases {
+            let mut s = done();
+            let r = s.process_group_m1(&f, 16, 16, None);
+            if r != Err(GroupKeyError::Drop(d)) {
+                return TestResult::Fail(what);
+            }
+            // Nothing is installed; a MIC-verified frame that failed
+            // its unwrap still advanced the counter, as wpa_supplicant.
+            let rc = if d == D::Decrypt { 3 } else { 2 };
+            if s.last_replay_counter != rc || s.gtk.as_deref() != Some(&OLD_GTK[..]) {
+                return TestResult::Fail("dropped frame: supplicant state");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/eapol", smoke_eapol_group_rekey_drops);
+
+    fn smoke_eapol_group_rekey_failures_and_igtk() -> TestResult {
+        use GroupKeyFail as F;
+        // process_1_of_2 failures → wpa_sm_deauthenticate. The MIC was
+        // good, so the counter has advanced (wpa_supplicant order).
+        let fail = |s: &mut Supplicant, f: &[u8], want: F| {
+            s.process_group_m1(f, 16, 16, None) == Err(GroupKeyError::Fail(want))
+                && s.last_replay_counter == 3
+        };
+        let mut s = done();
+        s.state = FourWayState::WaitM3;
+        if !fail(
+            &mut s,
+            &gm1(GM1_KI, 3, &gtk_kde(1, &NEW_GTK)),
+            F::Before4Way,
+        ) {
+            return TestResult::Fail("before the 4-way completed");
+        }
+        // Only an RSN element in the key data (no GTK KDE).
+        let rsn = [0x30, 0x02, 0x01, 0x00];
+        if !fail(&mut done(), &gm1(GM1_KI, 3, &rsn), F::NoGtk) {
+            return TestResult::Fail("no GTK KDE");
+        }
+        // A KDE claiming more bytes than present (underflow).
+        let mut under = gtk_kde(1, &NEW_GTK);
+        under[1] = 40;
+        if !fail(&mut done(), &gm1(GM1_KI, 3, &under), F::KeyData) {
+            return TestResult::Fail("key data underflow");
+        }
+        // A 32-byte GTK for a CCMP-128 group cipher.
+        let long = gm1(GM1_KI, 3, &gtk_kde(1, &[0x44; 32]));
+        if !fail(&mut done(), &long, F::GtkCipherLength) {
+            return TestResult::Fail("GTK length != cipher");
+        }
+        // A GTK KDE with only the KeyID byte + 1.
+        let tiny = [0xDD, 0x07, 0x00, 0x0F, 0xAC, 0x01, 0x01, 0x00, 0x55];
+        if !fail(&mut done(), &gm1(GM1_KI, 3, &tiny), F::GtkCipherLength) {
+            return TestResult::Fail("1-byte GTK");
+        }
+        // GTK KDE in clear Key Data.
+        let clear = gm1(GM1_KI & !KI_ENCRYPTED_KEY_DATA, 3, &gtk_kde(1, &NEW_GTK));
+        if !fail(&mut done(), &clear, F::GtkUnencrypted) {
+            return TestResult::Fail("GTK in unencrypted key data");
+        }
+
+        // IGTK KDE: dd 1c 00-0f-ac:9 | KeyID 4 (LE) | IPN | IGTK.
+        let mut kd = gtk_kde(1, &NEW_GTK);
+        let ipn = [1, 2, 3, 4, 5, 6];
+        let igtk = [0x9E; 16];
+        kd.extend_from_slice(&[0xDD, 28, 0x00, 0x0F, 0xAC, 0x09, 0x04, 0x00]);
+        kd.extend_from_slice(&ipn);
+        kd.extend_from_slice(&igtk);
+        let f = gm1(GM1_KI, 3, &kd);
+        let want = Igtk {
+            key_id: 4,
+            ipn,
+            key: igtk.to_vec(),
+        };
+        match done().process_group_m1(&f, 16, 16, Some(16)) {
+            Ok(r) if r.igtk == Some(Ok(Some(want))) && r.gtk.is_some() => {}
+            _ => return TestResult::Fail("IGTK with PMF"),
+        }
+        match done().process_group_m1(&f, 16, 16, None) {
+            Ok(r) if r.igtk.is_none() => {}
+            _ => return TestResult::Fail("IGTK ignored without PMF"),
+        }
+        // A 32-byte IGTK cipher negotiated: the 16-byte KDE is invalid,
+        // which is not fatal ("Failed to configure IGTK").
+        match done().process_group_m1(&f, 16, 16, Some(32)) {
+            Ok(r) if r.igtk == Some(Err(())) && r.gtk.is_some() => {}
+            _ => return TestResult::Fail("bad IGTK KDE length is not fatal"),
+        }
+        let mut s = done();
+        s.group_keys_installed(None, Some(&igtk));
+        match s.process_group_m1(&f, 16, 16, Some(16)) {
+            Ok(r) if r.igtk == Some(Ok(None)) => {}
+            _ => return TestResult::Fail("IGTK reinstall suppressed"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/eapol", smoke_eapol_group_rekey_failures_and_igtk);
 }

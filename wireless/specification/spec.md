@@ -146,8 +146,25 @@ elements through `WirelessNetIface::scan_information_elements`.
 Interface and wiphy queries are namespace-filtered; events use the same
 namespace and cannot follow an interface across a namespace move.
 Drivers that implement `reports_disconnect_events()` emit link-loss and
-local-teardown notifications themselves through `notify_disconnect`, so
-the control bridge does not emit a second local-disconnect event.
+local-teardown notifications themselves through
+`notify_disconnect(name, reason, from_ap)` (`nl80211_send_disconnected`:
+`REASON_CODE` omitted when 0, `DISCONNECTED_BY_AP` when the AP sent the
+Deauthentication / Disassociation), so the control bridge does not emit a
+second local-disconnect event.
+
+### 3.5 EAPOL supplicant (`eapol.rs`)
+
+`Supplicant` runs the 4-way handshake (`handle`) and, once it completed,
+the Group Key Handshake: `process_group_m1(pdu, mic_len, group_key_len,
+mgmt_group_key_len)` applies wpa_supplicant's `wpa_sm_rx_eapol` checks
+(length, descriptor, replay counter, SMK / Ack / Request bits, descriptor
+version 2 or 3, MIC by `eapol_key_mic`, AES-unwrapped Key Data) and
+`wpa_supplicant_process_1_of_2` (GTK KDE, length = group cipher key
+length, IGTK KDE only with PMF, key-reinstallation check), and returns the
+keys plus the 2/2 PDU (802.1X version 1, Key Info = key index | version |
+Secure | MIC). `GroupKeyError::Drop` = ignore the frame,
+`GroupKeyError::Fail` = deauthenticate (`WLAN_REASON_UNSPECIFIED`). The
+caller installs the keys, then calls `group_keys_installed`.
 
 The connect profile requires a scanned BSSID, SSID and 2.4/5 GHz frequency.
 Open networks need no key. WPA2 requires a 32-byte PMK, WPA version 2,

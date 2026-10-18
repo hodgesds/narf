@@ -545,6 +545,22 @@ updates), `handle_event(frame)`, `connected_bssid()`.
   element must equal the beacon's, GTK from the KDE; PTK then GTK via
   `WMI_VDEV_INSTALL_KEY` (CCMP, pairwise / group flags) and
   `WMI_PEER_AUTHORIZE`.
+- Group rekey (`Mac::poll` → `rx_eapol`): EAPOL received while
+  authorized goes to the association's supplicant (kept after the 4-way
+  with its PTK, replay counter and GTK in use):
+  `Supplicant::process_group_m1` (shared `narf_wireless::eapol`, from
+  wpa_supplicant `wpa_sm_rx_eapol` / `wpa_supplicant_process_1_of_2` /
+  `wpa_supplicant_send_2_of_2`; MIC by Key Descriptor Version, Key Data
+  via `narf_crypto::aes_kw`) → the new GTK through `install_key(bssid,
+  key_id, gtk, group)` (`ath11k_mac_op_set_key` → `ath11k_install_key`
+  `WMI_KEY_GROUP` + PN config), `gtk_idx` updated, message 2/2 over the
+  data path. Frames not from the AP, replays, bad MICs are dropped
+  (wpa_supplicant `goto out` / `last_eapol_matches_bssid`); an in-use GTK
+  is not reinstalled (KRACK check) but answered; a failed handshake (no
+  GTK, bad GTK length, before the 4-way, install / TX failure) latches
+  `step::EAPOL_GTK` detail `0x101..0x106` / `0x200` / `0x300` and
+  deauthenticates with reason 1 (`wpa_sm_deauthenticate`,
+  `LinkLoss::Supplicant`).
 - Diagnostics: `mac::step` 150–199, one console line per failure;
   stage `scan` on a scan / link loss, `connected` after authorization.
 - `wmi.rs` additions: `scan_prob_req_oui_cmd`,
@@ -1098,8 +1114,14 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   round robin and fq_codel (one station; the AC order and stop reasons are
   Linux's), no A-MSDU / fast-xmit header cache; ADDBA from the AP is not answered (no
   `ath11k_mac_op_ampdu_action`; the AP falls back to non-aggregated
-  traffic, REO queues stay at BA window 1); EAPOL
-  after the 4-way handshake (group rekey) is queued and never consumed.
+  traffic, REO queues stay at BA window 1); no PTK rekey (a pairwise
+  EAPOL-Key after the handshake is dropped; wpa_supplicant would run a
+  new 4-way handshake); PMF is not negotiated, so an IGTK KDE in a Group
+  Key message is ignored (`ieee80211w_set_keys`; ath11k would leave BIP
+  to mac80211's software crypto anyway); EAPOL frames the station sends
+  carry 802.1X version 3 for the 4-way handshake (the shared supplicant)
+  and version 1 for Group Key 2/2 (wpa_supplicant's
+  `DEFAULT_EAPOL_VERSION`).
 - Open (control path): userspace Wi-Fi control over nl80211 needs a
   launcher that grants the `wlan%d` interface to the supplicant /
   manager task (`network_daemon::prepare`); until one exists the
@@ -1162,7 +1184,7 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   element (wpa_supplicant also adds Extended Capabilities); no Country /
   Power Constraint handling (`ap_power_level`), no TPC / 6 GHz power
   envelope, no HE txbf / BSS colour / TWT; association comeback
-  (status 30) is a reject; WPA3-SAE, PMF/BIP, group rekey, roaming,
+  (status 30) is a reject; WPA3-SAE, PMF/BIP, PTK rekey, roaming,
   GTK rekey offload and CSA are not implemented; kickout is treated as
   link loss (Linux reports low-ack to userspace); deauth reason after a
   failed 4-way is 3 (17 for an RSN mismatch); the 11d "fin" path and the

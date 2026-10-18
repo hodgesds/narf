@@ -1400,9 +1400,10 @@ kernel_test_in!(
 );
 
 /// `ieee80211_frame_allowed` for EAPOL: to our address or the PAE group
-/// address (01-80-C2-00-00-03) it reaches the supplicant queue, before
-/// and after authorization; to the broadcast or another group address it
-/// is dropped; unicast to another station is not ours at all.
+/// address (01-80-C2-00-00-03) it reaches the supplicant queue,
+/// whatever the port state; to the broadcast or another group address it
+/// is dropped; unicast to another station is not ours at all. (Before
+/// the association the supplicant ignores what is queued.)
 fn smoke_ath11k_int_eapol_filter() -> TestResult {
     use super::mac_frame as frame;
     check(|| {
@@ -1414,7 +1415,12 @@ fn smoke_ath11k_int_eapol_filter() -> TestResult {
                 .borrow_mut()
                 .rx_queue
                 .push_back(frame::eapol_eth(da, &BSSID, &pdu));
-            pump(&u, 3);
+            // Runtime passes only (no mac housekeeping, which would
+            // consume the supplicant queue).
+            for _ in 0..3 {
+                run(u.shared.take_rx());
+                run(u.shared.irq.wait(10));
+            }
         };
         let other = [0x00, 0x03, 0x7F, 0x99, 0x99, 0x99];
         feed(&[0xff; 6]);
@@ -1447,6 +1453,169 @@ fn smoke_ath11k_int_eapol_filter() -> TestResult {
     })
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_eapol_filter);
+
+/// The AP's Group Key message 1/2 (hostapd field order: RSN descriptor,
+/// Key Info `ki`, replay counter `rc`, Key RSC, the GTK KDE for `idx`
+/// AES-wrapped with the PTK's KEK, HMAC-SHA1-128 MIC with its KCK), as
+/// an 802.3 frame from `src` to the station. `kd` replaces the KDE when
+/// given.
+fn group_m1(u: &Up, src: &[u8; 6], rc: u64, idx: u8, gtk: &[u8; 16], kd: Option<&[u8]>) -> Vec<u8> {
+    let (kck, kek) = {
+        let st = u.dev.st.borrow();
+        let p = st.world.ap.ptk.as_ref().expect("AP PTK after the 4-way");
+        let kek: [u8; 16] = p.kek.as_slice().try_into().unwrap();
+        (p.kck.clone(), kek)
+    };
+    let mut plain = match kd {
+        Some(k) => k.to_vec(),
+        None => {
+            let mut v = vec![0xdd, 22, 0x00, 0x0f, 0xac, 0x01, idx, 0x00];
+            v.extend_from_slice(gtk);
+            v
+        }
+    };
+    if plain.len() % 8 != 0 || plain.len() < 16 {
+        plain.push(0xdd);
+        while plain.len() % 8 != 0 || plain.len() < 16 {
+            plain.push(0);
+        }
+    }
+    let wrapped = narf_crypto::aes_kw::aes_wrap(&kek, &plain).unwrap();
+    let mut f = vec![0x02, 0x03];
+    f.extend_from_slice(&((95 + wrapped.len()) as u16).to_be_bytes());
+    f.push(0x02);
+    f.extend_from_slice(&0x1382u16.to_be_bytes());
+    f.extend_from_slice(&[0, 0]);
+    f.extend_from_slice(&rc.to_be_bytes());
+    f.extend_from_slice(&[0u8; 32 + 16]);
+    f.extend_from_slice(&[0x07, 0, 0, 0, 0, 0, 0, 0]); // Key RSC
+    f.extend_from_slice(&[0u8; 8 + 16]);
+    f.extend_from_slice(&(wrapped.len() as u16).to_be_bytes());
+    f.extend_from_slice(&wrapped);
+    let mic = narf_crypto::pbkdf2_sha1::hmac_sha1(&kck, &f);
+    f[81..97].copy_from_slice(&mic[..16]);
+    super::mac_frame::eapol_eth(&OWN, src, &f)
+}
+
+/// EAPOL frames the station sent after `from` (TCL ring, native wifi →
+/// the EAPOL PDU after the RFC 1042 SNAP).
+fn eapol_tx(u: &Up, from: usize) -> Vec<Vec<u8>> {
+    u.dev.st.borrow().tcl_tx[from..]
+        .iter()
+        .filter(|t| t.frame.len() > 32 && t.frame[30..32] == [0x88, 0x8e])
+        .map(|t| t.frame[32..].to_vec())
+        .collect()
+}
+
+/// Group rekey after the 4-way handshake (wpa_supplicant
+/// `wpa_supplicant_process_1_of_2` / `_send_2_of_2` through the shared
+/// supplicant): the new GTK is installed at its key index
+/// (`ath11k_mac_op_set_key` → `WMI_VDEV_INSTALL_KEY` group), message 2/2
+/// goes back through the TCL ring; replays, bad MICs and frames from
+/// another source are dropped; a message without a GTK deauthenticates
+/// with reason 1.
+fn smoke_ath11k_int_group_rekey() -> TestResult {
+    use super::mac::step;
+    check(|| {
+        let u = up(wpa2_cfg())?;
+        connect(&u)?;
+        const NEW_GTK: [u8; 16] = [0x3d; 16];
+        let keys = |u: &Up| {
+            u.dev
+                .st
+                .borrow()
+                .wmi
+                .iter()
+                .filter(|c| c.cmd_id == wmi::WMI_VDEV_INSTALL_KEY_CMDID)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        ensure!(keys(&u).len() == 2, "PTK + GTK from the 4-way");
+        let tcl0 = u.dev.st.borrow().tcl_tx.len();
+        let m1 = group_m1(&u, &BSSID, 3, 2, &NEW_GTK, None);
+        u.dev.st.borrow_mut().rx_queue.push_back(m1.clone());
+        let (_, err, _, _) = latched(|| pump(&u, 5));
+        ensure!(err == 0, "rekey latches nothing");
+        let k = keys(&u);
+        let want = wmi::vdev_install_key_cmd(&wmi::VdevInstallKeyArg {
+            vdev_id: 0,
+            macaddr: BSSID,
+            key_idx: 2,
+            key_flags: wmi::WMI_KEY_GROUP,
+            key_cipher: wmi::cipher::AES_CCM,
+            key_data: NEW_GTK.to_vec(),
+            ..Default::default()
+        });
+        ensure!(
+            k.len() == 3 && k[2].buf == want.buf,
+            "new GTK installed at index 2 for the BSS peer (group)"
+        );
+        // wpa_supplicant_send_2_of_2: 802.1X v1, Key, 95; RSN; Key Info
+        // 0x0302 (ver 2 | MIC | Secure); Key Length 0; replay 3; zeros;
+        // MIC; Key Data Length 0.
+        let tx = eapol_tx(&u, tcl0);
+        ensure!(tx.len() == 1, "one 2/2");
+        let mut g = vec![0x01, 0x03, 0x00, 0x5f, 0x02, 0x03, 0x02, 0x00, 0x00];
+        g.extend_from_slice(&3u64.to_be_bytes());
+        g.extend_from_slice(&[0u8; 32 + 16 + 8 + 8 + 16 + 2]);
+        let kck = u.dev.st.borrow().world.ap.ptk.as_ref().unwrap().kck.clone();
+        let mic = narf_crypto::pbkdf2_sha1::hmac_sha1(&kck, &g);
+        g[81..97].copy_from_slice(&mic[..16]);
+        ensure!(tx[0] == g, "2/2 golden, MIC by the AP's KCK");
+        ensure!(
+            run(u.netdev.mac.lock()).link().and_then(|l| l.gtk_idx) == Some(2),
+            "GTK index 2 in use"
+        );
+
+        // Replay of the same message, a bad MIC, a foreign source: dropped.
+        let mut bad = group_m1(&u, &BSSID, 4, 1, &[0x55; 16], None);
+        bad[14 + 85] ^= 1;
+        let foreign = group_m1(&u, &GW, 5, 1, &[0x55; 16], None);
+        for f in [m1, bad, foreign] {
+            u.dev.st.borrow_mut().rx_queue.push_back(f);
+        }
+        pump(&u, 5);
+        ensure!(keys(&u).len() == 3, "nothing installed");
+        ensure!(eapol_tx(&u, tcl0).len() == 1, "nothing answered");
+        ensure!(u.netdev.link_up(), "still associated");
+
+        // The same GTK again with a fresh counter: answered, not
+        // reinstalled (wpa_supplicant_install_gtk's KRACK check).
+        let again = group_m1(&u, &BSSID, 6, 2, &NEW_GTK, None);
+        u.dev.st.borrow_mut().rx_queue.push_back(again);
+        pump(&u, 5);
+        ensure!(keys(&u).len() == 3, "in-use GTK not reinstalled");
+        let tx = eapol_tx(&u, tcl0);
+        ensure!(tx.len() == 2 && tx[1][16] == 6, "2/2 for replay counter 6");
+
+        // No GTK KDE (only an RSN element): deauthenticate, reason 1.
+        let rsn_only = [0x30, 0x02, 0x01, 0x00];
+        let nogtk = group_m1(&u, &BSSID, 7, 0, &NEW_GTK, Some(&rsn_only));
+        u.dev.st.borrow_mut().rx_queue.push_back(nogtk);
+        let (_, err, detail, _) = latched(|| pump(&u, 5));
+        ensure!(
+            err == step::EAPOL_GTK && detail == 0x104,
+            "EAPOL_GTK 0x104 (no GTK KDE) latched"
+        );
+        ensure!(!u.netdev.link_up(), "carrier off");
+        ensure!(
+            *DISC_SEEN.lock() == [(1, false)],
+            "nl80211: reason 1, locally generated"
+        );
+        ensure!(
+            u.dev
+                .st
+                .borrow()
+                .world
+                .mgmt
+                .last()
+                .is_some_and(|f| f[0] == 0xc0 && f[24..26] == [1, 0]),
+            "Deauthentication reason 1 (UNSPECIFIED) sent"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_group_rekey);
 
 /// PEER_STA_KICKOUT for the AP: the runtime loop's mac housekeeping
 /// tears the link down and drops the carrier.
