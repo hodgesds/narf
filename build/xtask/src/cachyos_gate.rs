@@ -809,6 +809,62 @@ impl Vm {
         )
     }
 
+    /// Like [`Self::wait_for`] but ignores [`FAIL_MARKERS`]: for driving the
+    /// emergency shell itself.
+    fn wait_raw(&mut self, pat: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            {
+                let g = self.buf.lock().unwrap();
+                let hay = &g[self.cursor.min(g.len())..];
+                if let Some(pos) = find(hay, pat.as_bytes()) {
+                    self.cursor += pos + pat.len();
+                    return true;
+                }
+            }
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// After systemd fell back to emergency mode, log in to the maintenance
+    /// shell and collect why the root's device unit never appeared (udev's
+    /// record of the partition, the by-uuid links, the device unit, the
+    /// relevant journal). Best effort; returns the cleaned transcript.
+    fn emergency_diagnostics(&mut self, password: &str) -> Option<String> {
+        if !self.text().contains("You are in emergency mode") {
+            return None;
+        }
+        self.cursor = 0;
+        if !self.wait_raw("root password for maintenance", Duration::from_secs(60))
+            && !self.wait_raw("Press Enter", Duration::from_secs(5))
+        {
+            return None;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        self.send(&format!("{password}\n")).ok()?;
+        std::thread::sleep(Duration::from_secs(3));
+        let start = self.buf.lock().unwrap().len();
+        let dev =
+            "dev-disk-by\\x2duuid-c4c405ee\\x2d0000\\x2d4a11\\x2d9e57\\x2d00000000c0de.device";
+        let script = format!(
+            "export SYSTEMD_COLORS=0 PAGER=cat; stty -echo; \
+             udevadm info -q all -n /dev/nvme1n1p2; ls -l /dev/disk/by-uuid/; \
+             systemctl status --no-pager {dev}; \
+             systemctl status --no-pager sys-devices-virtual-block-nvme1n1p2.device; \
+             ls -l /run/udev/data/ | head -n 40; \
+             journalctl -b --no-pager -o short-monotonic | grep -iE 'nvme1n1p2|udevd|sd-device|btrfs' | tail -n 40; \
+             echo NARF-GATE-DIAG-$((1+1))-END\n"
+        );
+        self.send(&script).ok()?;
+        self.wait_raw("NARF-GATE-DIAG-2-END", Duration::from_secs(120));
+        let g = self.buf.lock().unwrap();
+        Some(strip_escapes(&g[start.min(g.len())..]))
+    }
+
     /// Wait for one of `pats` after the cursor; moves the cursor past it.
     fn wait_for(&mut self, pats: &[&str], timeout: Duration) -> Result<usize> {
         let deadline = Instant::now() + timeout;
@@ -1210,6 +1266,16 @@ impl Gate {
         ) {
             Ok(b) => b,
             Err(e) => {
+                if let Some(diag) = vm.emergency_diagnostics(&self.args.login_password) {
+                    let path = self
+                        .logs
+                        .join(format!("{:02}-{label}.emergency.txt", self.boots));
+                    let _ = std::fs::write(&path, &diag);
+                    eprintln!(
+                        "cachyos-gate: emergency-mode diagnostics in {}",
+                        path.display()
+                    );
+                }
                 let refusals = Self::refusal_lines(&vm);
                 if refusals.is_empty() {
                     return Err(e);
