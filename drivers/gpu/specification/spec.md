@@ -142,7 +142,12 @@ runs (8 on Navi48, `MAX_JOB_IBS`) and 0 for the rest.
 ten (kHz), from `amdgpu_info::reference_clock_10khz(vbios, navi)`:
 smu_info v3/v4 `core_refclk_10khz` (byte 16), replaced on Navi and later by
 gfx_info v3.x/v2.2+ timer reference (byte 40), as
-amdgpu_atomfirmware_get_clock_info; 0 without a VBIOS. On Navi48,
+amdgpu_atomfirmware_get_clock_info; 0 without a VBIOS.
+`DEV_INFO.vram_type` / `vram_bit_width` are `Snapshot::{vram_type,
+vram_bit_width}`, from `amdgpu_info::umc_vram(vbios)` on discrete Navi4
+parts only (amdgpu_gmc_get_vram_info's GC 12.0.x arm): umc_info (master
+data table 24) v4.0 `vram_type` (byte 26, mapped to `AMDGPU_VRAM_TYPE_*`)
+and `channel_num << channel_width` (bytes 64, 65); 0 elsewhere. On Navi48,
 `TIMESTAMP` returns SMUIO 14.0.2's GOLDEN_TSC counter
 (`amdgpu_smuio14::ClockReader`, upper-lower-upper with a re-read when the
 upper half moved), published at the topology stage; elsewhere EINVAL.

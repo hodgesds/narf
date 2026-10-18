@@ -8488,6 +8488,8 @@ fn smoke_amdgpu_discrete_is_not_an_apu() -> TestResult {
         ip_blocks: alloc::vec![ip(HW_ID_GC, 10, 3, 2)],
         navi22: Default::default(),
         reference_clock_10khz: 0,
+        vram_type: 0,
+        vram_bit_width: 0,
     };
 
     // VRAM_GTT reports both, and they differ.
@@ -9390,6 +9392,8 @@ fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
         navi22: Default::default(),
         // 100 MHz, the usual SOC reference.
         reference_clock_10khz: 10_000,
+        vram_type: u::AMDGPU_VRAM_TYPE_GDDR6,
+        vram_bit_width: 256,
     };
 
     let decode = |bytes: &[u8]| -> u::DrmAmdgpuInfoDevice {
@@ -9417,6 +9421,9 @@ fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
     let d = decode(&bytes);
     if d.device_id != 0x15BF {
         return TestResult::Fail("DEV_INFO did not report the PCI device id");
+    }
+    if d.vram_type != u::AMDGPU_VRAM_TYPE_GDDR6 || d.vram_bit_width != 256 {
+        return TestResult::Fail("vram_type / vram_bit_width are the snapshot's");
     }
     if d.gpu_counter_freq != 100_000 {
         return TestResult::Fail("gpu_counter_freq must be the reference clock in kHz");

@@ -97,6 +97,8 @@ fn snap(published: Published) -> Snapshot {
         ],
         navi22: published,
         reference_clock_10khz: 0,
+        vram_type: 0,
+        vram_bit_width: 0,
     }
 }
 fn booted(queues_verified: bool) -> Published {

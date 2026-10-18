@@ -34,11 +34,13 @@
 //! `gpu_counter_freq` is the VBIOS reference clock amdgpu_atomfirmware
 //! reads (smu_info, overridden by gfx_info on Navi and later), times ten.
 //!
+//! `vram_type` / `vram_bit_width` come from the VBIOS umc_info table on
+//! discrete GC 12 parts, as amdgpu_gmc_get_vram_info reads them; other parts
+//! report 0.
+//!
 //! LINUX-GAP: clocks (`max/min_engine_clock`, `max/min_memory_clock`)
-//! need an SMU metrics read, and `vram_type` /
-//! `vram_bit_width` need the GMC memory configuration. Both exist elsewhere in
-//! the tree — `amdgpu_smu`, and the platform inventory's memory type and
-//! channel count — but are not plumbed to this ioctl yet; they are zero, not
+//! need an SMU metrics read. That exists elsewhere in the tree
+//! (`amdgpu_smu`) but is not plumbed to this ioctl yet; they are zero, not
 //! invented.
 
 use alloc::vec;
@@ -117,6 +119,10 @@ pub struct Snapshot {
     /// The GPU timestamp counter's reference clock in 10 kHz units (see
     /// [`reference_clock_10khz`]); 0 when the VBIOS does not say.
     pub reference_clock_10khz: u32,
+    /// `AMDGPU_VRAM_TYPE_*` and the memory bus width in bits (see
+    /// [`umc_vram`]); 0 where the VBIOS is not read for them.
+    pub vram_type: u32,
+    pub vram_bit_width: u32,
 }
 
 /// Navi 22 topology, PCI revision and boot observations, published by the
@@ -181,12 +187,45 @@ pub fn reference_clock_10khz(vbios: &[u8], navi: bool) -> Option<u32> {
     clock
 }
 
+/// amdgpu_atomfirmware_get_umc_info, which amdgpu_gmc_get_vram_info uses on
+/// discrete GC 12.0.x: umc_info v4.0's `vram_type` (byte 26) as an
+/// `AMDGPU_VRAM_TYPE_*`, and `channel_num << channel_width` (bytes 64, 65)
+/// as the bus width in bits.
+pub fn umc_vram(vbios: &[u8]) -> Option<(u32, u32)> {
+    use crate::atombios::{header::parse_rom_header, tables::MasterDataTable};
+    let header = parse_rom_header(vbios).ok()?;
+    let tables = MasterDataTable::parse(vbios, &header).ok()?;
+    let umc = tables.table_slice(24)?;
+    if umc.get(2..4)? != [4, 0] {
+        return None;
+    }
+    // convert_atom_mem_type_to_vram_type, dGPU arm.
+    let vram_type = match *umc.get(26)? {
+        0x50 => uapi::AMDGPU_VRAM_TYPE_GDDR5,
+        0x60 | 0x61 | 0x80 => uapi::AMDGPU_VRAM_TYPE_HBM,
+        0x70 => uapi::AMDGPU_VRAM_TYPE_GDDR6,
+        0x81 => uapi::AMDGPU_VRAM_TYPE_HBM3E,
+        _ => uapi::AMDGPU_VRAM_TYPE_UNKNOWN,
+    };
+    let (channels, width) = (u32::from(*umc.get(64)?), u32::from(*umc.get(65)?));
+    Some((vram_type, channels.checked_shl(width).unwrap_or(0)))
+}
+
 fn snapshot() -> Option<Snapshot> {
     crate::amdgpu::info_snapshot()
 }
 
 impl Snapshot {
     pub(crate) fn from_gpu(gpu: &crate::amdgpu::AmdGpu) -> Self {
+        // amdgpu_gmc_get_vram_info reads umc_info on discrete GC 12.0.x.
+        // LINUX-GAP: other parts' vram_info / integrated_system_info are not
+        // read; they report 0.
+        let (vram_type, vram_bit_width) = gpu
+            .vbios
+            .as_ref()
+            .filter(|_| gpu.chip.family == Family::Navi4 && !gpu.is_apu())
+            .and_then(|v| umc_vram(v.bytes()))
+            .unwrap_or((0, 0));
         Self {
             did: gpu.chip.did as u32,
             family: gpu.chip.family,
@@ -209,6 +248,8 @@ impl Snapshot {
                     reference_clock_10khz(v.bytes(), navi)
                 })
                 .unwrap_or(0),
+            vram_type,
+            vram_bit_width,
         }
     }
 }
@@ -376,6 +417,8 @@ fn dev_info_topology(
         num_hw_gfx_contexts: GFX_HW_CONTEXTS,
         // amdgpu_asic_get_xclk (10 kHz) * 10: kHz, Mesa's clock_crystal_freq.
         gpu_counter_freq: snap.reference_clock_10khz.saturating_mul(10),
+        vram_type: snap.vram_type,
+        vram_bit_width: snap.vram_bit_width,
         // FUSION means the GPU shares the CPU's memory — an APU. It used to
         // be claimed unconditionally, on the premise that "every part this
         // driver supports is an APU". A discrete card is not, and userspace
@@ -807,4 +850,35 @@ mod topology_tests {
         "drivers/gpu/gfx12",
         info_reference_clock_follows_atomfirmware
     );
+
+    /// umc_info v4.0 gives the memory type and the bus width; other
+    /// revisions and malformed widths give nothing to report.
+    fn info_umc_vram_follows_atomfirmware() -> TestResult {
+        let image = |revision: [u8; 2], kind: u8, channels: u8, width: u8| {
+            let mut b = alloc::vec![0u8; 1024];
+            b[..2].copy_from_slice(&[0x55, 0xaa]);
+            b[0x48..0x4a].copy_from_slice(&0x80u16.to_le_bytes());
+            b[0x80..0x88].copy_from_slice(&[40, 0, 2, 1, b'A', b'T', b'O', b'M']);
+            b[0xa0..0xa2].copy_from_slice(&0xc0u16.to_le_bytes());
+            // Master data table v2.1 with 34 entries; umc_info is 24.
+            b[0xc0..0xc4].copy_from_slice(&[72, 0, 2, 1]);
+            b[0xf4..0xf6].copy_from_slice(&0x200u16.to_le_bytes());
+            b[0x200..0x204].copy_from_slice(&[88, 0, revision[0], revision[1]]);
+            b[0x200 + 26] = kind;
+            b[0x200 + 64] = channels;
+            b[0x200 + 65] = width;
+            b
+        };
+        if umc_vram(&image([4, 0], 0x70, 16, 4)) != Some((uapi::AMDGPU_VRAM_TYPE_GDDR6, 256))
+            || umc_vram(&image([4, 0], 0x81, 8, 7)) != Some((uapi::AMDGPU_VRAM_TYPE_HBM3E, 1024))
+            || umc_vram(&image([4, 0], 0x33, 4, 4)) != Some((uapi::AMDGPU_VRAM_TYPE_UNKNOWN, 64))
+            || umc_vram(&image([4, 0], 0x70, 16, 40)) != Some((uapi::AMDGPU_VRAM_TYPE_GDDR6, 0))
+            || umc_vram(&image([3, 3], 0x70, 16, 4)).is_some()
+            || umc_vram(&[0; 64]).is_some()
+        {
+            return TestResult::Fail("umc_info VRAM type/width");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/gfx12", info_umc_vram_follows_atomfirmware);
 }
