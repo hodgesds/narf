@@ -37,15 +37,26 @@ const CTRL_ATTR_MCAST_GRP_NAME: u16 = 1;
 const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
 const NLA_F_NESTED: u16 = 1 << 15;
 const NLA_TYPE_MASK: u16 = !(3 << 14);
+/// `GENL_ADMIN_PERM`: the op needs `netlink_capable(skb, CAP_NET_ADMIN)` —
+/// CAP_NET_ADMIN in the initial user namespace.
+pub const GENL_ADMIN_PERM: u32 = 0x01;
 const GENL_CMD_CAP_DO: u32 = 1 << 1;
 const GENL_CMD_CAP_DUMP: u32 = 1 << 2;
+/// `GENL_UNS_ADMIN_PERM`: the op needs
+/// `netlink_ns_capable(skb, net->user_ns, CAP_NET_ADMIN)` — CAP_NET_ADMIN
+/// over the user namespace owning the socket's network namespace.
+pub const GENL_UNS_ADMIN_PERM: u32 = 0x10;
 const CTRL_MCAST_GRP_NOTIFY: u32 = 16;
+const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
 const EINVAL: i32 = 22;
 const EOPNOTSUPP: i32 = 95;
 const NLMSGERR_ATTR_MSG: u16 = 1;
 
-/// One command advertised by a registered generic-netlink family.
+/// One command advertised by a registered generic-netlink family. `flags`
+/// carries the Linux op flags verbatim — `GENL_CMD_CAP_DO` / `_DUMP` and the
+/// permission bits [`GENL_ADMIN_PERM`] / [`GENL_UNS_ADMIN_PERM`] — and is what
+/// `CTRL_ATTR_OP_FLAGS` reports, as `ctrl_fill_info` does.
 #[derive(Copy, Clone, Debug)]
 pub struct GenlOperation {
     pub command: u8,
@@ -70,12 +81,37 @@ pub struct GenlReply {
 /// netlink framing to each returned response.
 pub type GenlHandler = fn(command: u8, attrs: &[u8], dump: bool) -> Result<Vec<GenlReply>, i32>;
 
-/// Authority is supplied by the socket's kernel-held delegation, never
-/// decoded from an attribute or inferred from a userspace UID.
+/// Who sent a request. Authority comes from the socket layer — the sender's
+/// and the socket opener's capabilities, or the socket's kernel-held
+/// delegated handle — never from an attribute or a userspace UID.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RequestContext<'a> {
     pub net_ns_id: u64,
+    /// NARF's delegated, interface-bound admin handle (a stack daemon's
+    /// grant). Authorises mutations of exactly its one interface.
     pub admin: Option<&'a crate::AdminHandle>,
+    /// `netlink_capable(skb, CAP_NET_ADMIN)`: the socket's opener (its
+    /// `f_cred`) and the sending task both hold CAP_NET_ADMIN in the initial
+    /// user namespace.
+    pub init_net_admin: bool,
+    /// `netlink_ns_capable(skb, net->user_ns, CAP_NET_ADMIN)`: opener and
+    /// sender both hold CAP_NET_ADMIN over the user namespace that owns the
+    /// socket's network namespace.
+    pub net_admin: bool,
+    /// Set by the generic-netlink layer before a family handler runs: the
+    /// sender passed the Linux permission check of the dispatched op's flags
+    /// (always true for an op without `GENL_*ADMIN_PERM`). A handler that
+    /// finds it false was reached on the strength of `admin` alone and must
+    /// check that the handle covers the object it changes.
+    pub capable: bool,
+}
+
+impl RequestContext<'_> {
+    /// `genl_family_rcv_msg`'s permission check for an op with `flags`.
+    pub fn capable_for(&self, flags: u32) -> bool {
+        (flags & GENL_ADMIN_PERM == 0 || self.init_net_admin)
+            && (flags & GENL_UNS_ADMIN_PERM == 0 || self.net_admin)
+    }
 }
 
 pub type ContextHandler = fn(u8, &[u8], bool, RequestContext<'_>) -> Result<Vec<GenlReply>, i32>;
@@ -314,13 +350,25 @@ fn build_one(request: &[u8], context: RequestContext<'_>) -> Result<Vec<Vec<u8>>
         } else {
             GENL_CMD_CAP_DO
         };
-        if !family
+        let Some(op) = family
             .operations
             .iter()
-            .any(|op| op.command == command && op.flags & wanted != 0)
-        {
+            .find(|op| op.command == command && op.flags & wanted != 0)
+            .copied()
+        else {
             return Ok(vec![error(EOPNOTSUPP, seq, request)]);
+        };
+        // Then the op's permission flags, before any attribute is parsed or
+        // the family's pre_doit resolves an object: GENL_ADMIN_PERM needs
+        // `netlink_capable`, GENL_UNS_ADMIN_PERM `netlink_ns_capable` over
+        // the socket's namespace, each -EPERM. NARF's delegated per-interface
+        // handle is the alternative; the handler confirms it covers the
+        // object (`RequestContext::capable` tells it which applied).
+        let capable = context.capable_for(op.flags);
+        if !capable && context.admin.is_none() {
+            return Ok(vec![error(EPERM, seq, request)]);
         }
+        let context = RequestContext { capable, ..context };
         let contextual = CONTEXT_HANDLERS
             .lock()
             .iter()
@@ -547,9 +595,16 @@ mod authority_tests {
             cap_ack: true,
         };
         let errno = |admin, net_ns_id| {
-            let replies =
-                build_replies_with_context(&request, options, RequestContext { net_ns_id, admin })
-                    .unwrap();
+            let replies = build_replies_with_context(
+                &request,
+                options,
+                RequestContext {
+                    net_ns_id,
+                    admin,
+                    ..RequestContext::default()
+                },
+            )
+            .unwrap();
             i32::from_ne_bytes(replies[0][16..20].try_into().unwrap())
         };
         let cap = Cap::<crate::AdminCap, Invoke>::bootstrap();
@@ -566,6 +621,203 @@ mod authority_tests {
     kernel_test_in!(
         "net/netlink_generic",
         smoke_generic_netlink_explicit_authority
+    );
+
+    /// Commands of the permission-test family, one per Linux op-flag class.
+    const PERM_FAMILY: u16 = 0x3e;
+    const OPEN_CMD: u8 = 1;
+    const ADMIN_CMD: u8 = 2;
+    const UNS_CMD: u8 = 3;
+    const DUMP_ONLY_CMD: u8 = 4;
+    static PERM_HANDLER_RUNS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    /// Records that it ran and what the layer told it about the sender.
+    fn perm_handle(
+        _: u8,
+        _: &[u8],
+        _: bool,
+        context: RequestContext<'_>,
+    ) -> Result<Vec<GenlReply>, i32> {
+        PERM_HANDLER_RUNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if context.capable {
+            Ok(Vec::new())
+        } else {
+            // Reached on a delegated handle alone.
+            Err(EINVAL)
+        }
+    }
+
+    fn perm_errno(command: u8, flags: u16, context: RequestContext<'_>) -> (i32, u32) {
+        const OPS: &[GenlOperation] = &[
+            GenlOperation {
+                command: OPEN_CMD,
+                flags: GENL_CMD_CAP_DO,
+            },
+            GenlOperation {
+                command: ADMIN_CMD,
+                flags: GENL_CMD_CAP_DO | GENL_ADMIN_PERM,
+            },
+            GenlOperation {
+                command: UNS_CMD,
+                flags: GENL_CMD_CAP_DO | GENL_UNS_ADMIN_PERM,
+            },
+            GenlOperation {
+                command: DUMP_ONLY_CMD,
+                flags: GENL_CMD_CAP_DUMP | GENL_UNS_ADMIN_PERM,
+            },
+        ];
+        let _ = register_family(GenlFamily {
+            id: PERM_FAMILY,
+            name: "narf-perm-test",
+            version: 1,
+            max_attr: 0,
+            operations: OPS,
+            groups: &[],
+            handler: unsupported_control,
+        });
+        let _ = register_context_handler(PERM_FAMILY, perm_handle);
+        let before = PERM_HANDLER_RUNS.load(core::sync::atomic::Ordering::Relaxed);
+        let request = frame(PERM_FAMILY, flags, 91, &[command, 1, 0, 0]);
+        let options = ReplyOptions {
+            ext_ack: false,
+            cap_ack: true,
+        };
+        let replies = build_replies_with_context(&request, options, context).unwrap();
+        let errno = i32::from_ne_bytes(replies[0][16..20].try_into().unwrap());
+        let runs = PERM_HANDLER_RUNS.load(core::sync::atomic::Ordering::Relaxed) - before;
+        (errno, runs)
+    }
+
+    /// `genl_family_rcv_msg`: op lookup (-EOPNOTSUPP), then GENL_ADMIN_PERM
+    /// against the initial user namespace and GENL_UNS_ADMIN_PERM against the
+    /// socket's (-EPERM), and only then the family's handler.
+    fn smoke_generic_netlink_op_permission_flags() -> TestResult {
+        const DO_ACK: u16 = 5; // NLM_F_REQUEST | NLM_F_ACK
+        const DUMP: u16 = 1 | NLM_F_DUMP;
+        let nobody = RequestContext::default();
+        let root = RequestContext {
+            init_net_admin: true,
+            net_admin: true,
+            ..RequestContext::default()
+        };
+        // CAP_NET_ADMIN only inside a child user namespace that owns the
+        // socket's network namespace.
+        let child_ns_root = RequestContext {
+            net_ns_id: 7,
+            net_admin: true,
+            ..RequestContext::default()
+        };
+        let cases: &[(&'static str, u8, u16, RequestContext<'_>, i32, u32)] = &[
+            (
+                "no-flag op without a capability",
+                OPEN_CMD,
+                DO_ACK,
+                nobody,
+                0,
+                1,
+            ),
+            (
+                "ADMIN_PERM op without a capability",
+                ADMIN_CMD,
+                DO_ACK,
+                nobody,
+                -EPERM,
+                0,
+            ),
+            (
+                "UNS_ADMIN_PERM op without a capability",
+                UNS_CMD,
+                DO_ACK,
+                nobody,
+                -EPERM,
+                0,
+            ),
+            (
+                "ADMIN_PERM op with CAP_NET_ADMIN",
+                ADMIN_CMD,
+                DO_ACK,
+                root,
+                0,
+                1,
+            ),
+            (
+                "UNS_ADMIN_PERM op with CAP_NET_ADMIN",
+                UNS_CMD,
+                DO_ACK,
+                root,
+                0,
+                1,
+            ),
+            (
+                "ADMIN_PERM op, child-userns capability",
+                ADMIN_CMD,
+                DO_ACK,
+                child_ns_root,
+                -EPERM,
+                0,
+            ),
+            (
+                "UNS_ADMIN_PERM op, child-userns capability",
+                UNS_CMD,
+                DO_ACK,
+                child_ns_root,
+                0,
+                1,
+            ),
+            // Unknown command and wrong do/dump kind: -EOPNOTSUPP precedes
+            // the permission check.
+            (
+                "unknown command without a capability",
+                9,
+                DO_ACK,
+                nobody,
+                -EOPNOTSUPP,
+                0,
+            ),
+            (
+                "dump-only op sent as do",
+                DUMP_ONLY_CMD,
+                DO_ACK,
+                nobody,
+                -EOPNOTSUPP,
+                0,
+            ),
+            (
+                "dump-only op dumped without a capability",
+                DUMP_ONLY_CMD,
+                DUMP,
+                nobody,
+                -EPERM,
+                0,
+            ),
+        ];
+        for (what, command, flags, context, want, runs) in cases {
+            let (errno, ran) = perm_errno(*command, *flags, *context);
+            // Each case names itself: a wrong errno, or a handler that ran
+            // when the layer should have refused first.
+            if errno != *want || ran != *runs {
+                return TestResult::Fail(what);
+            }
+        }
+        // A delegated handle passes the layer without a capability; the
+        // handler is told the capability check did not apply.
+        let cap = Cap::<crate::AdminCap, Invoke>::bootstrap();
+        let admin = crate::AdminHandle::new(cap, "lo".into());
+        let delegated = RequestContext {
+            admin: Some(&admin),
+            ..RequestContext::default()
+        };
+        if perm_errno(ADMIN_CMD, DO_ACK, delegated) != (-EINVAL, 1)
+            || perm_errno(OPEN_CMD, DO_ACK, delegated) != (0, 1)
+        {
+            return TestResult::Fail("delegated handle lost or mislabelled at the genl layer");
+        }
+        cap.revoke();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "net/netlink_generic",
+        smoke_generic_netlink_op_permission_flags
     );
 }
 

@@ -9842,6 +9842,159 @@ fn smoke_abi_netlink_generic_socket_open() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_generic_socket_open);
 
+/// nl80211 commands follow Linux `genl_family_rcv_msg`: the op lookup
+/// (-EOPNOTSUPP), then the op's permission flag — `GENL_ADMIN_PERM` is
+/// `netlink_capable` (CAP_NET_ADMIN in the initial user namespace),
+/// `GENL_UNS_ADMIN_PERM` is `netlink_ns_capable(net->user_ns)` — each -EPERM,
+/// and only then `nl80211_pre_doit`'s device lookup (-ENODEV). Both the
+/// socket's opener and the sender must be capable. Commands without a flag
+/// (GET_INTERFACE, GET_SCAN …) need nothing. NARF used to refuse every
+/// mutating command without a delegated per-interface handle, so iw,
+/// wpa_supplicant and NetworkManager (root, CAP_NET_ADMIN) all got EPERM.
+fn smoke_abi_nl80211_command_permissions() -> TestResult {
+    with_setup(|| {
+        const NL80211: u16 = 0x13;
+        const GET_INTERFACE: u8 = 5;
+        const TRIGGER_SCAN: u8 = 33; // GENL_UNS_ADMIN_PERM
+        const EXTERNAL_AUTH: u8 = 127; // GENL_ADMIN_PERM
+        const CAP_NET_ADMIN_BIT: u64 = 1 << 12;
+        const FULL: u64 = crate::handlers::CAP_FULL_SET;
+        const MISSING_IFINDEX: u32 = 0x7fff_0000;
+        // One nl80211 request naming a device that does not exist, so a
+        // request that clears the permission check stops at -ENODEV.
+        let request = |command: u8, flags: u16, seq: u32| {
+            let mut m = [0u8; 28];
+            m[0..4].copy_from_slice(&28u32.to_ne_bytes());
+            m[4..6].copy_from_slice(&NL80211.to_ne_bytes());
+            m[6..8].copy_from_slice(&flags.to_ne_bytes());
+            m[8..12].copy_from_slice(&seq.to_ne_bytes());
+            m[16] = command;
+            m[17] = 1;
+            m[20..22].copy_from_slice(&8u16.to_ne_bytes());
+            m[22..24].copy_from_slice(&3u16.to_ne_bytes()); // NL80211_ATTR_IFINDEX
+            m[24..28].copy_from_slice(&MISSING_IFINDEX.to_ne_bytes());
+            m
+        };
+        let ack_errno = |fd: u64, command: u8, seq: u32| -> Result<i64, &'static str> {
+            let req = request(command, NLM_F_REQUEST | NLM_F_ACK, seq);
+            if netlink_send(fd, &req).ok_or("send")? != req.len() as i64 {
+                return Err("nl80211 send failed");
+            }
+            let mut ack = [0u8; 256];
+            let n = netlink_recv(fd, &mut ack).ok_or("recv")?;
+            if n < (NLMSG_HDRLEN + 4) as i64 || nlmsg_type_of(&ack) != NLMSG_ERROR {
+                return Err("nl80211 command did not get an NLMSG_ERROR ack");
+            }
+            Ok(i64::from(i32::from_ne_bytes(
+                ack[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap(),
+            )))
+        };
+        let caps = |effective: u64| crate::handlers::__test_set_caps(FAKE_TASK, effective, FULL);
+        let restore = crate::handlers::__test_caps_reset;
+
+        let result = (|| {
+            caps(FULL);
+            let fd = open_netlink(NETLINK_GENERIC)?;
+            // CAP_NET_ADMIN: both flag classes clear the permission check
+            // and reach the device lookup.
+            if ack_errno(fd, TRIGGER_SCAN, 401)? != ENODEV {
+                return Err("CAP_NET_ADMIN TRIGGER_SCAN did not reach the device lookup");
+            }
+            if ack_errno(fd, EXTERNAL_AUTH, 402)? != ENODEV {
+                return Err("CAP_NET_ADMIN EXTERNAL_AUTH did not reach the device lookup");
+            }
+            // The sender drops CAP_NET_ADMIN: -EPERM, before the lookup.
+            caps(FULL & !CAP_NET_ADMIN_BIT);
+            if ack_errno(fd, TRIGGER_SCAN, 403)? != EPERM {
+                return Err("TRIGGER_SCAN without CAP_NET_ADMIN must be EPERM before ENODEV");
+            }
+            if ack_errno(fd, EXTERNAL_AUTH, 404)? != EPERM {
+                return Err("EXTERNAL_AUTH without CAP_NET_ADMIN must be EPERM");
+            }
+            // An unknown command is -EOPNOTSUPP even unprivileged: the op
+            // lookup precedes the permission check.
+            if ack_errno(fd, 0xfe, 405)? != EOPNOTSUPP {
+                return Err("unknown nl80211 command must be EOPNOTSUPP before EPERM");
+            }
+            // A flagless op needs no capability: the dump completes.
+            let mut dump = [0u8; 20];
+            dump[..20].copy_from_slice(&request(GET_INTERFACE, NLM_F_REQUEST_DUMP, 406)[..20]);
+            dump[0..4].copy_from_slice(&20u32.to_ne_bytes());
+            if netlink_send(fd, &dump).ok_or("dump send")? != 20 {
+                return Err("GET_INTERFACE dump send failed");
+            }
+            let mut reply = [0u8; 512];
+            let mut done = false;
+            for _ in 0..MAX_DUMP_MESSAGES {
+                let n = netlink_recv(fd, &mut reply).ok_or("dump recv")?;
+                if n < NLMSG_HDRLEN as i64 {
+                    return Err("GET_INTERFACE dump ended without NLMSG_DONE");
+                }
+                match nlmsg_type_of(&reply) {
+                    NLMSG_DONE => {
+                        done = true;
+                        break;
+                    }
+                    NLMSG_ERROR => return Err("unprivileged GET_INTERFACE dump was refused"),
+                    _ => {}
+                }
+            }
+            if !done {
+                return Err("GET_INTERFACE dump did not terminate");
+            }
+            // Joining nl80211's event groups needs no capability (no group
+            // carries GENL_MCAST_CAP_*): `genl_bind` admits anyone.
+            for group in [17u32, 18, 19] {
+                netlink_set_u32(fd, NETLINK_ADD_MEMBERSHIP, group)?;
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd));
+
+            // Opened without CAP_NET_ADMIN, sent with it: the opener's
+            // credential is half of `netlink_capable` — still -EPERM.
+            let fd = open_netlink(NETLINK_GENERIC)?;
+            caps(FULL);
+            if ack_errno(fd, TRIGGER_SCAN, 407)? != EPERM {
+                return Err("a socket opened without CAP_NET_ADMIN triggered a scan");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd));
+
+            // Namespace scoping exists only in `--features container` builds.
+            #[cfg(feature = "container")]
+            {
+                const CLONE_NEWUSER: u64 = 0x1000_0000;
+                const CLONE_NEWNET: u64 = 0x4000_0000;
+                if call(Syscall::Unshare.raw(), a0(CLONE_NEWUSER)) != Some(0) {
+                    return Err("unshare(CLONE_NEWUSER)");
+                }
+                // CAP_NET_ADMIN in a child user namespace does not govern the
+                // initial network namespace.
+                let fd = open_netlink(NETLINK_GENERIC)?;
+                if ack_errno(fd, TRIGGER_SCAN, 408)? != EPERM {
+                    return Err("child-userns CAP_NET_ADMIN scanned the initial netns");
+                }
+                let _ = call(Syscall::Close.raw(), a0(fd));
+                // In a network namespace that child user namespace owns:
+                // GENL_UNS_ADMIN_PERM passes, GENL_ADMIN_PERM never does.
+                if call(Syscall::Unshare.raw(), a0(CLONE_NEWNET)) != Some(0) {
+                    return Err("unshare(CLONE_NEWNET)");
+                }
+                let fd = open_netlink(NETLINK_GENERIC)?;
+                if ack_errno(fd, TRIGGER_SCAN, 409)? != ENODEV {
+                    return Err("UNS_ADMIN_PERM refused the namespace owner");
+                }
+                if ack_errno(fd, EXTERNAL_AUTH, 410)? != EPERM {
+                    return Err("ADMIN_PERM accepted a child-userns capability");
+                }
+                let _ = call(Syscall::Close.raw(), a0(fd));
+            }
+            Ok(())
+        })();
+        restore();
+        result
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_nl80211_command_permissions);
+
 fn smoke_abi_netlink_generic_batched_requests() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_GENERIC)?;

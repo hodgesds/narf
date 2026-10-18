@@ -358,92 +358,49 @@ fn handle_in(command: u8, attrs: &[u8], dump: bool, namespace: u64) -> Result<Ve
     }
 }
 
-const OPERATIONS: &[GenlOperation] = &[
+/// One `nl80211_ops` / `nl80211_small_ops` entry: the command, whether it
+/// has a doit / dumpit, and its Linux permission flag (`.flags`).
+const fn op(command: u8, kinds: u32, perm: u32) -> GenlOperation {
     GenlOperation {
-        command: 32,
-        flags: GENL_CMD_CAP_DUMP,
-    },
-    GenlOperation {
-        command: 33,
-        flags: GENL_CMD_CAP_DO,
-    },
-    GenlOperation {
-        command: 46,
-        flags: GENL_CMD_CAP_DO,
-    },
-    GenlOperation {
-        command: 48,
-        flags: GENL_CMD_CAP_DO,
-    },
-    GenlOperation {
-        command: NL80211_CMD_GET_WIPHY,
-        flags: GENL_CMD_CAP_DO | GENL_CMD_CAP_DUMP,
-    },
-    GenlOperation {
-        command: NL80211_CMD_GET_INTERFACE,
-        flags: GENL_CMD_CAP_DO | GENL_CMD_CAP_DUMP,
-    },
-    GenlOperation {
-        command: NL80211_CMD_GET_PROTOCOL_FEATURES,
-        flags: GENL_CMD_CAP_DO,
-    },
-    // Userspace-SME MLME + management-frame commands. Presence in the family
-    // op table is required before the context handler is reached; per-wiphy
-    // capability (supports_userspace_mlme) is enforced there.
-    GenlOperation {
-        command: 37, // AUTHENTICATE
-        flags: GENL_CMD_CAP_DO,
-    },
-    GenlOperation {
-        command: 38, // ASSOCIATE
-        flags: GENL_CMD_CAP_DO,
-    },
-    GenlOperation {
-        command: 39, // DEAUTHENTICATE
-        flags: GENL_CMD_CAP_DO,
-    },
-    GenlOperation {
-        command: 40, // DISASSOCIATE
-        flags: GENL_CMD_CAP_DO,
-    },
-    GenlOperation {
-        command: 58, // REGISTER_FRAME
-        flags: GENL_CMD_CAP_DO,
-    },
-    GenlOperation {
-        command: 59, // FRAME
-        flags: GENL_CMD_CAP_DO,
-    },
-    GenlOperation {
-        command: 127, // EXTERNAL_AUTH
-        flags: GENL_CMD_CAP_DO,
-    },
-    // Access-Point mode commands. Per-wiphy AP capability (supports_ap) is
-    // enforced in the context handler.
-    GenlOperation {
-        command: 14, // SET_BEACON
-        flags: GENL_CMD_CAP_DO,
-    },
-    GenlOperation {
-        command: 15, // START_AP
-        flags: GENL_CMD_CAP_DO,
-    },
-    GenlOperation {
-        command: 16, // STOP_AP
-        flags: GENL_CMD_CAP_DO,
-    },
-    GenlOperation {
-        command: 18, // SET_STATION
-        flags: GENL_CMD_CAP_DO,
-    },
-    GenlOperation {
-        command: 19, // NEW_STATION
-        flags: GENL_CMD_CAP_DO,
-    },
-    GenlOperation {
-        command: 20, // DEL_STATION
-        flags: GENL_CMD_CAP_DO,
-    },
+        command,
+        flags: kinds | perm,
+    }
+}
+const DO: u32 = GENL_CMD_CAP_DO;
+const DUMP: u32 = GENL_CMD_CAP_DUMP;
+/// No `.flags`: anyone may send it.
+const OPEN: u32 = 0;
+const UNS: u32 = narf_net::netlink_generic::GENL_UNS_ADMIN_PERM;
+const ADMIN: u32 = narf_net::netlink_generic::GENL_ADMIN_PERM;
+
+/// The commands NARF implements, each with the `.flags` Linux gives it in
+/// `net/wireless/nl80211.c`. The generic-netlink layer enforces the
+/// permission bit before the handler runs, and reports the whole word in
+/// `CTRL_ATTR_OP_FLAGS`. Per-wiphy support (userspace MLME, AP mode) is
+/// checked by the handler after the permission check, as cfg80211 does.
+pub(crate) const OPERATIONS: &[GenlOperation] = &[
+    op(NL80211_CMD_GET_WIPHY, DO | DUMP, OPEN),
+    op(NL80211_CMD_GET_INTERFACE, DO | DUMP, OPEN),
+    op(NL80211_CMD_GET_PROTOCOL_FEATURES, DO, OPEN),
+    op(32, DUMP, OPEN), // GET_SCAN
+    op(33, DO, UNS),    // TRIGGER_SCAN
+    op(46, DO, UNS),    // CONNECT
+    op(48, DO, UNS),    // DISCONNECT
+    // Userspace-SME MLME + management-frame commands.
+    op(37, DO, UNS),    // AUTHENTICATE
+    op(38, DO, UNS),    // ASSOCIATE
+    op(39, DO, UNS),    // DEAUTHENTICATE
+    op(40, DO, UNS),    // DISASSOCIATE
+    op(58, DO, UNS),    // REGISTER_FRAME
+    op(59, DO, UNS),    // FRAME
+    op(127, DO, ADMIN), // EXTERNAL_AUTH
+    // Access-Point mode commands.
+    op(14, DO, UNS), // SET_BEACON
+    op(15, DO, UNS), // START_AP
+    op(16, DO, UNS), // STOP_AP
+    op(18, DO, UNS), // SET_STATION
+    op(19, DO, UNS), // NEW_STATION
+    op(20, DO, UNS), // DEL_STATION
 ];
 const GROUPS: &[GenlMulticastGroup] = &[
     GenlMulticastGroup {

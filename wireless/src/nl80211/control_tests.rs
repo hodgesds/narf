@@ -4,6 +4,9 @@ use narf_ipc::{Consumer, Producer};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 
+#[path = "permission_tests.rs"]
+mod permission;
+
 struct InterfaceStub {
     name: &'static str,
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -199,7 +202,8 @@ fn smoke_nl80211_authority_and_scan_completion() -> TestResult {
             false,
             RequestContext {
                 net_ns_id: 0,
-                admin: Some(&wrong)
+                admin: Some(&wrong),
+                ..RequestContext::default()
             }
         ),
         Err(EPERM)
@@ -525,6 +529,7 @@ fn smoke_nl80211_supplicant_interop() -> TestResult {
     let ctx = RequestContext {
         net_ns_id: 0,
         admin: None,
+        ..RequestContext::default()
     };
 
     // 1. CTRL_CMD_GETFAMILY("nl80211"): family id + scan/mlme group resolution.
@@ -1044,6 +1049,7 @@ fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
     let ctx = RequestContext {
         net_ns_id: 0,
         admin: Some(&admin),
+        ..RequestContext::default()
     };
 
     // GET_WIPHY advertises the userspace-SME commands wpa_supplicant keys off.
@@ -1105,6 +1111,7 @@ fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
         let pctx = RequestContext {
             net_ns_id: 0,
             admin: Some(&plain_admin),
+            ..RequestContext::default()
         };
         let mut a = Vec::new();
         push_attr(&mut a, 3, &plain_index.to_ne_bytes());
@@ -1409,6 +1416,7 @@ fn smoke_nl80211_ap_mode() -> TestResult {
     let ctx = RequestContext {
         net_ns_id: 0,
         admin: Some(&admin),
+        ..RequestContext::default()
     };
 
     // GET_WIPHY advertises AP iftype and the AP commands; GET_INTERFACE reports
@@ -1524,6 +1532,7 @@ fn smoke_nl80211_ap_mode() -> TestResult {
         let pctx = RequestContext {
             net_ns_id: 0,
             admin: Some(&padmin),
+            ..RequestContext::default()
         };
         let mut a = Vec::new();
         push_attr(&mut a, 3, &pidx.to_ne_bytes());

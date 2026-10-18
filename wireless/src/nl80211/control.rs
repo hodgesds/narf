@@ -1,5 +1,12 @@
-//! Native station operations behind Linux messages. Mutations require
-//! a live, interface-bound admin handle supplied by the socket layer.
+//! Native station operations behind Linux messages.
+//!
+//! Permission follows Linux generic netlink: every mutating command here is
+//! `GENL_UNS_ADMIN_PERM` (or `GENL_ADMIN_PERM`) in `nl80211_ops`, checked by
+//! the generic-netlink layer against the sender before this handler runs.
+//! A sender that passed it acts on any interface of its network namespace,
+//! as cfg80211 does; one that did not reached here only because its socket
+//! carries NARF's delegated interface-bound handle, which must then cover
+//! the interface the request names ([`authority`]).
 
 use super::*;
 use alloc::{string::String, sync::Arc};
@@ -161,6 +168,33 @@ fn frequency(channel: u32) -> u32 {
 
 fn authorized(admin: &narf_net::AdminHandle, iface: &dyn crate::WirelessNetIface, ns: u64) -> bool {
     admin.authorize_interface(iface.name(), ns).is_ok()
+}
+
+/// The handle a mutating request acts with on `iface`, or -EPERM.
+///
+/// A sender that passed the op's Linux permission check
+/// ([`RequestContext::capable`]) acts with the kernel-held handle of the
+/// interface — the request already resolved it within the sender's own
+/// namespace (`nl80211_pre_doit` → `__cfg80211_wdev_from_attrs(sock_net)`).
+/// Otherwise the socket's delegated handle must be bound to this interface.
+/// Either way the handle stays revocable: a namespace move or interface
+/// removal during the asynchronous operation is caught by [`authorized`].
+fn authority(
+    context: &RequestContext<'_>,
+    iface: &dyn crate::WirelessNetIface,
+) -> Result<narf_net::AdminHandle, i32> {
+    if let Some(admin) = context
+        .admin
+        .filter(|admin| authorized(admin, iface, context.net_ns_id))
+    {
+        return Ok(admin.clone());
+    }
+    if context.capable {
+        return narf_net::kernel_admin(iface.name())
+            .filter(|admin| authorized(admin, iface, context.net_ns_id))
+            .ok_or(ENODEV);
+    }
+    Err(EPERM)
 }
 
 fn parse_operation(
@@ -359,11 +393,7 @@ pub(super) fn handle(
     if dump {
         return Err(EOPNOTSUPP);
     }
-    let admin = context
-        .admin
-        .filter(|admin| authorized(admin, iface.as_ref(), context.net_ns_id))
-        .ok_or(EPERM)?
-        .clone();
+    let admin = authority(&context, iface.as_ref())?;
     let operation = parse_operation(
         command,
         &attrs,
@@ -541,10 +571,7 @@ fn mlme_handle(
                 && super::in_namespace(iface.as_ref(), context.net_ns_id)
         })
         .ok_or(ENODEV)?;
-    let _admin = context
-        .admin
-        .filter(|admin| authorized(admin, iface.as_ref(), context.net_ns_id))
-        .ok_or(EPERM)?;
+    let _admin = authority(&context, iface.as_ref())?;
     // cfg80211 rejects these on a driver that offloads its SME (-EOPNOTSUPP
     // before the op is attempted).
     if !iface.supports_userspace_mlme() {
@@ -687,10 +714,7 @@ fn ap_handle(
                 && super::in_namespace(iface.as_ref(), context.net_ns_id)
         })
         .ok_or(ENODEV)?;
-    let _admin = context
-        .admin
-        .filter(|admin| authorized(admin, iface.as_ref(), context.net_ns_id))
-        .ok_or(EPERM)?;
+    let _admin = authority(&context, iface.as_ref())?;
     if !iface.supports_ap() {
         return Err(EOPNOTSUPP);
     }
