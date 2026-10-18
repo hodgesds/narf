@@ -60,6 +60,11 @@ pub struct Args {
     #[arg(long)]
     pub no_login: bool,
 
+    /// Leave the guest running after the report instead of powering it off
+    /// through systemd (the run then ends by killing QEMU).
+    #[arg(long)]
+    pub no_poweroff: bool,
+
     /// Seconds to wait for the login prompt.
     #[arg(long, default_value_t = 300)]
     pub timeout: u64,
@@ -80,9 +85,16 @@ const CHECK_COMMANDS: &[&str] = &[
     "echo NARF-VIRT $(systemd-detect-virt)",
     "mkdir -p /narf-smoke && echo ok > /narf-smoke/probe && sync /narf-smoke/probe && echo NARF-WRITE-ROOT $(cat /narf-smoke/probe)",
     "echo ok > /home/narf-smoke-probe && echo NARF-WRITE-HOME ok || echo NARF-WRITE-HOME refused",
+    "mkdir -p /narf-smoke/many; n=0; for i in $(seq 1 60); do printf 'narf %d\\n' $i > /narf-smoke/many/f$i || break; n=$i; done; echo NARF-MANY-FILES $n",
     "ls /var/log/journal 2>/dev/null | head -n 3 | sed 's/^/NARF-JOURNAL /'",
     "udevadm info -q property -n /dev/disk/by-uuid/c4c405ee-0000-4a11-9e57-00000000c0de | grep -E 'DEVNAME|ID_FS_TYPE|BTRFS|SYSTEMD_READY'",
     "for u in $(systemctl --no-legend --plain --failed | cut -d' ' -f1); do echo NARF-UNIT $u; journalctl -b --no-pager -o cat -n 8 -u $u; done",
+    "/usr/lib/systemd/systemd-remount-fs 2>&1 | head -n 5 | sed 's/^/NARF-REMOUNT-FS /'",
+    "systemd-sysusers 2>&1 | head -n 3 | sed 's/^/NARF-SYSUSERS /'",
+    "/usr/lib/systemd/systemd-random-seed save 2>&1 | head -n 3 | sed 's/^/NARF-RANDOM-SEED /'",
+    "ldconfig 2>&1 | head -n 3 | sed 's/^/NARF-LDCONFIG /'",
+    "journalctl -b --no-pager -o cat _SYSTEMD_UNIT=systemd-sysusers.service | head -n 3 | sed 's/^/NARF-JOURNAL-UNIT /'",
+    "timeout 5 /usr/lib/systemd/systemd-oomd 2>&1 | head -n 5 | sed 's/^/NARF-OOMD /'",
     "journalctl -b --no-pager -p warning -o cat | tail -n 40",
     "echo NARF-CACHYOS-ROOT-$((40+2))-DONE",
 ];
@@ -297,6 +309,67 @@ fn boot_and_login(args: &Args) -> Result<()> {
         }
         wait_for(&[DONE_MARKER], mark, 180, &mut serial)?;
         print_report(&serial[mark..]);
+        if args.no_poweroff {
+            return Ok(());
+        }
+        // A clean shutdown is part of the contract: systemd-shutdown remounts
+        // / read-only, syncs, and NARF powers off (NVMe CC.SHN on the way).
+        let mark = serial.len();
+        type_slowly(&mut stdin, "systemctl poweroff")?;
+        let deadline = Instant::now() + Duration::from_secs(240);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            if let Some(hit) = PANIC_MARKERS.iter().find(|m| serial[mark..].contains(*m)) {
+                bail!("kernel panic during shutdown ({hit:?})");
+            }
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(bytes) => serial.push_str(&String::from_utf8_lossy(&bytes)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    exited = true;
+                    break;
+                }
+            }
+        }
+        if !exited {
+            bail!("the guest did not power off within 240 s");
+        }
+        let shutdown = strip_escapes(&serial[mark..]);
+        // Errors: anything that could leave the root inconsistent. systemd-
+        // shutdown's final read-only remount of / must succeed and both NVMe
+        // controllers must complete the CC.SHN normal shutdown.
+        let errors: Vec<&str> = shutdown
+            .lines()
+            .filter(|l| l.contains("Failed to remount") || l.contains("Failed to finalize"))
+            .collect();
+        // Warnings: a unit that could not unmount early (systemd-shutdown
+        // retries every mount after killing the remaining processes).
+        let warnings: Vec<&str> = shutdown
+            .lines()
+            .filter(|l| l.contains("FAILED") || l.contains("Failed unmounting"))
+            .collect();
+        println!("\nxtask cachyos-root-smoke: powered off");
+        for line in &warnings {
+            println!("  shutdown warning: {}", line.trim());
+        }
+        for line in &errors {
+            println!("  shutdown ERROR: {}", line.trim());
+        }
+        let shn = shutdown
+            .lines()
+            .filter(|l| l.contains("CC.SHN normal shutdown: Complete"))
+            .count();
+        if !errors.is_empty() {
+            bail!("unclean shutdown ({} error line(s))", errors.len());
+        }
+        if shn < 2 {
+            bail!("only {shn} of 2 NVMe controllers completed CC.SHN");
+        }
+        if !shutdown.contains("Remounting '/' read-only")
+            && !shutdown.contains("All filesystems unmounted")
+        {
+            bail!("systemd-shutdown never finalized the filesystems");
+        }
         Ok(())
     })();
     let _ = child.kill();

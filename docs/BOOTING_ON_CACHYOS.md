@@ -13,7 +13,7 @@ additional boot target, not currently a drop-in replacement for
 | Boot the NARF ISO or a NARF USB image on a spare machine | Supported, hardware coverage varies |
 | Install the native Arch package on a legacy-BIOS GRUB system | Implemented; GRUB searches for the kernel on either common `/boot` layout |
 | Install the native Arch package on a UEFI GRUB system | Implemented through a package-owned Limine EFI payload |
-| Boot the installed CachyOS root and its systemd/KDE session under NARF | Not yet a supported workflow |
+| Boot the installed CachyOS root to a console login under NARF | Experimental: `narf.disks=root-ro` (see [Booting the installed CachyOS root](#booting-the-installed-cachyos-root)); KDE not yet |
 | Boot an encrypted CachyOS root | Not yet supported by the native-package workflow |
 | Use CachyOS Limine, systemd-boot, or rEFInd | Implemented through native registration, BLS, or EFI discovery |
 | Boot a signed native package with Secure Boot enabled | Implemented; the enforced chain and tamper rejection are OVMF-gated, while physical firmware still needs validation |
@@ -982,32 +982,142 @@ gets in the way of the serial login, run `sudo ln -sfn
 /usr/lib/systemd/system/multi-user.target
 /mnt/narf-gatec/@/etc/systemd/system/default.target` in step 5.
 
-## Why the installed CachyOS root is not ready yet
+## Booting the installed CachyOS root
 
-CachyOS recommends Btrfs and normally uses an `@` root subvolume plus separate
-subvolumes for `/home`, `/root`, `/srv`, and parts of `/var`; it also enables
-Zstd compression by default. See the CachyOS
-[filesystem layout](https://wiki.cachyos.org/installation/filesystem/).
-NARF has Btrfs read/write and compressed-extent coverage, but the supported
-distro-PID1 gate currently uses a purpose-built ext-family Fedora image mounted
-at `/mnt`. It is not yet wired to CachyOS's Btrfs subvolume/fstab layout.
+NARF can boot the CachyOS installation on the WD SN770 (`07:00.0`, btrfs root
+`653602c3-cd42-420e-95ef-4c4033d17b56`) with the installed systemd as PID 1,
+mount its fstab, and reach a getty login on `tty1`. GRUB's default entry stays
+CachyOS. NARF is a one-shot entry chosen from the boot menu, so rolling back
+means rebooting and taking the default entry.
 
-Other blockers to a drop-in `linux-cachyos` replacement are:
+### Command lines
 
-- the release package is not built with and configured for the full
-  `boot-init`/systemd/cgroup distro path;
-- CachyOS's mkinitcpio image is a Linux boot artifact and cannot simply be
-  handed to NARF as a replacement driver environment;
-- Linux DKMS and prebuilt modules, including CachyOS's NVIDIA and ZFS modules,
-  do not use NARF's module ABI;
-- the stock CachyOS rootfs has no dedicated NARF acceptance gate yet;
-- native GPU, Wi-Fi, input, NVMe, suspend/resume, and platform support still
-  need machine-specific silicon validation.
+First trial, read-only:
 
-The minimum credible “CachyOS under NARF” gate is a disposable CachyOS image
-booted in QEMU with systemd as PID 1, networking, persistent storage, udev,
-login, and a clean shutdown marker. Bare-metal testing should follow only
-after that gate passes and the target machine's drivers are validated.
+```text
+root=UUID=653602c3-cd42-420e-95ef-4c4033d17b56 rootflags=subvol=/@ systemd_pid1 narf.disks=root-ro systemd.unit=multi-user.target
+```
+
+Read-write, after the root-ro trial worked:
+
+```text
+root=UUID=653602c3-cd42-420e-95ef-4c4033d17b56 rootflags=subvol=/@ systemd_pid1 narf.disks=root-rw systemd.unit=multi-user.target
+```
+
+`cargo xtask grub-image --root-policy root-ro|root-rw --root-uuid <uuid>`
+writes the first four tokens (see
+[Booting the installed root](#booting-the-installed-root-narfdisksroot-ro--root-rw)).
+Add `systemd.unit=multi-user.target` yourself for the first trials: the host
+defaults to `graphical.target` (plasmalogin), and the KDE session is not part
+of this recipe. `rootflags=subvol=@` (no slash) and `rootflags=subvolid=256`
+are accepted too. `ro` / `rw` on the command line follow Linux: the last one
+wins. Under `root-ro` the root is always read-only. Under `root-rw` it is
+mounted writable unless the command line says `ro`.
+
+### What happens
+
+- **Root.** `root=UUID=` is matched against the btrfs fsid of every
+  partition on both NVMe controllers, by identity and never by position.
+  The matched partition is designated (`designate_root`) before the
+  filesystem is built. Its `@` subvolume is then mounted through the same
+  constructor `mount -t btrfs -o subvol=/@` uses, read-only under
+  `root-ro`.
+  - `root-ro`: systemd gets a writable tmpfs overlay over the read-only
+    root. Everything it writes (journal, `/etc/machine-id`, `/var/lib`)
+    lives in RAM and is gone at power-off. No byte reaches any disk.
+  - `root-rw`: no overlay. `/` is the real `@` subvolume, written in place.
+- **systemd runs in host mode, not container mode**
+  (`systemd-detect-virt` prints the hypervisor or `none`), and its fstab
+  units do the rest:
+  - `/home`, `/root`, `/srv`, `/var/cache`, `/var/tmp` and `/var/log` are
+    btrfs subvolume mounts of the same filesystem, with the fstab options
+    (`noatime,compress=zstd:1`). Under `root-ro` the kernel answers a
+    writable mount of a read-only disk with `EROFS`, so `mount(8)` retries
+    read-only, as for a write-protected disk on Linux. Under `root-rw` they
+    are writable views of one shared btrfs instance.
+  - `/boot/efi`: the ESP (`6D89-28C5`) is checked by `fsck.vfat` and
+    mounted read-only. NARF never writes it, under either policy.
+  - `/tmp` is tmpfs.
+- **udev.** udev sees the NVMe partitions, their filesystem UUIDs, input and
+  DRM devices. `/dev/btrfs-control` answers udev's btrfs readiness check, so
+  `dev-disk-by\x2duuid-…​.device` appears.
+- **Logging.** journald logs to `/run/log/journal` under `root-ro`. Under
+  `root-rw` it logs persistently to `/var/log/journal` (the `@log`
+  subvolume).
+- **Login.** getty@tty1 shows `<hostname> login:` on the framebuffer
+  console. Log in with your normal user or root password (PAM, from the
+  installed `/etc/shadow`). The USB keyboard is the input.
+
+### What fails, and why that is harmless
+
+The QEMU acceptance run (`cargo xtask cachyos-root-smoke`, below) boots a
+stock CachyOS `base` install. Under `root-ro` it reaches
+`systemctl is-system-running` = `running` with no failed units. Expect the
+host to add failures from the packages it has on top of `base`:
+
+| Unit | When | Why | Effect |
+| --- | --- | --- | --- |
+| `systemd-sysusers`, `systemd-random-seed`, `ldconfig`, `systemd-update-done`, `systemd-journal-catalog-update` | `root-rw` only | NARF's btrfs does not yet implement `chmod`/`chown`/`utimensat` on files (`Operation not supported`) | Each is a first-boot or maintenance task. They retry on the next boot. `/etc/ld.so.cache` and the random seed keep their previous contents. |
+| `ananicy-cpp.service` | sometimes | it cannot create its cgroups (`Read-only file system`) | No automatic nice/ionice rules. |
+| `dev-zram0.swap`, `systemd-zram-setup@zram0` | always (not counted as failed) | no zram driver, and Linux modules cannot load | No compressed swap. |
+| `systemd-modules-load` messages | always | Linux `.ko` modules do not load under NARF (`Failed to find module`) | The unit succeeds; each module is skipped. |
+| `[FAILED] Failed unmounting /root` at power-off | when a shell still has its cwd in `/root` | the unit-level unmount races the session's processes | systemd-shutdown unmounts it in its final pass, then remounts `/` read-only and syncs. |
+
+Nothing here blocks `multi-user.target`. Under `root-rw` the system reports
+`degraded`. KDE, NetworkManager, Wi-Fi, Bluetooth and sound are not part of
+this recipe.
+
+Power-off is clean in both modes. `systemctl poweroff` runs:
+
+1. systemd-shutdown remounts `/` read-only;
+2. it syncs;
+3. NARF flushes both NVMe controllers;
+4. NARF completes `CC.SHN` (`nvme: nvme1: … CC.SHN normal shutdown: Complete`).
+
+### Before a real root-rw boot
+
+- Boot `root-ro` first and confirm the login prompt.
+- Take a read-only snapshot on CachyOS:
+  `sudo btrfs subvolume snapshot -r / /.snapshots/pre-narf`. Keep a backup of
+  `/home`.
+- In NARF, shut down cleanly (`systemctl poweroff`).
+- Back on CachyOS, run `sudo btrfs scrub start -B /` and
+  `sudo btrfs check --readonly` from a live medium if anything looks wrong.
+
+### Rollback
+
+GRUB's default entry is CachyOS, so a reboot without touching the menu goes
+back to Linux. After a `root-ro` boot nothing needs undoing. After a
+`root-rw` boot, a `btrfs subvolume snapshot` taken before is the rollback
+point. NARF writes nothing outside the root partition: not the ESP, the
+Sabrent or `sda`.
+
+### QEMU rehearsal (no root needed, no host disk touched)
+
+```sh
+cargo xtask cachyos-root-smoke          # root-ro, image SHA-256 must be unchanged
+cargo xtask cachyos-root-smoke --rw     # root-rw on a scratch copy
+cargo xtask cachyos-gate --cases ro,rw  # the same through OVMF -> GRUB -> Limine
+```
+
+`cachyos-root-smoke` builds `target/narf-cachyos-root.img` on first use
+(`verification/data/cachyos-root/REGEN_cachyos_root_image.sh`). The script
+installs CachyOS `base`, `cachyos-settings` and the CachyOS keyrings and
+mirror lists with pacman, inside a user namespace, from the host's own
+repositories and package cache. It copies only the host's public keyring
+and mirror lists and writes nothing outside `target/`. The image has the
+host root's layout: a GPT ESP plus btrfs with nodesize 16K, block-group
+tree, free-space tree, no-holes, zstd and the seven `@` subvolumes, and the
+host's fstab with image-only UUIDs. It is attached behind a decoy disk as the
+second NVMe controller. The smoke then:
+
+1. boots the bare-metal command line;
+2. waits for `cachyos-narf login:`;
+3. logs in as `root`/`narf` over the console;
+4. prints the failed units with their journals, the fstab mounts and
+   udev's view of the root;
+5. checks the decoy disk (and, under root-ro, the root image) is
+   byte-identical.
 
 ## Open implementation work
 
@@ -1015,7 +1125,7 @@ The UEFI packaging path is now implemented, but these deployment items remain:
 
 | Item | Needed before calling it supported |
 | --- | --- |
-| CachyOS root acceptance | Build a disposable CachyOS image and gate systemd PID 1, udev, networking, persistent writes, login, and clean shutdown in QEMU. |
+| CachyOS root acceptance | Done for root-ro (`cachyos-root-smoke`, `cachyos-gate` row 1) including login and clean shutdown; root-rw needs btrfs chmod/chown/utimes and the gate's rw rows; networking remains. |
 | Encrypted root boot | Build/stage a NARF initramfs, add credential policy and kernel arguments, and provide an interactive or distribution-managed unlock path. |
 | CachyOS Btrfs layout | Gate the default `@` subvolume layout, Zstd, fstab-generated mounts, snapshots, and shutdown/recovery behavior. |
 | Secure Boot key lifecycle | A deploying distribution or administrator must own enrollment, rotation, revocation, recovery, and signing-key custody; NARF deliberately does not automate firmware key changes. |
