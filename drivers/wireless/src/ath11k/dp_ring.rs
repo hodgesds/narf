@@ -1463,7 +1463,8 @@ impl Dp {
     /// rings (`ath11k_dp_srng_common_cleanup`), the REO command lists with
     /// their queue descriptors (`ath11k_dp_reo_cmd_list_cleanup`; NARF's
     /// stranded descriptors go too: the device that might have used them
-    /// was reset) and the pending TX buffers
+    /// was reset; the per-TID fragment buffers and frag timers go with
+    /// the peer state) and the pending TX buffers
     /// (`ath11k_dp_tx_pending_cleanup`). A pdev or REO destination ring
     /// still set up is released first. Afterwards the HAL holds none of
     /// this DP's rings.

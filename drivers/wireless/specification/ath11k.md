@@ -10,7 +10,7 @@
 > hook, RX drain), the capability registry and `narf_wireless`. Scan,
 > Open / WPA2-PSK (CCMP) connect with EAPOL over the DP rings, data TX
 > (Ethernet → native-wifi 802.11) and RX (native-wifi → Ethernet II),
-> disconnect and link loss run against a composed fake device
+> disconnect, link loss and firmware crash recovery run against a composed fake device
 > (`integration_tests.rs`). Unverified until the QCNFA765 boots: §8
 > "Unverified until hardware".
 >
@@ -81,9 +81,19 @@ the previous reason was EE_RDDM; SYS_ERROR queues it too, once per run
 of consecutive SYS_ERRORs (§8);
 `take_reset_request` hands it to the core once (`FwNotice::Reset`).
 `mhi_pm_st_worker` items queued after mission mode are logged and
-dropped. Not ported: the RDDM ramdump image, MHI-core SYS_ERR recovery
-(`mhi_pm_sys_error_transition`), M3 suspend/resume, BW scaling,
-RSC/offload/client-managed rings, EDL.
+dropped. `power_down()` = `mhi_power_down(graceful)` (SHUTDOWN_PROCESS,
+EE DISABLE, `mhi_pm_disable_transition`: MHI RESET + INTVEC re-program +
+READY wait — failures only logged, as Linux —, IPCR channels dropped
+without the RESET command, event / command rings reset, DISABLE) +
+`mhi_unprepare_after_power_down` (BHIe table, contexts, per-boot state
+freed); `power_cycle()` = `ath11k_hif_power_down` + `ath11k_hif_power_up`:
+`MhiBus::hif_power(Down)` (ASPM restore, force wake, MSI off),
+`power_down`, `hif_power(Reset)` (`ath11k_pci_sw_reset(false)`),
+`hif_power(Up)` (window 0, `sw_reset(true)`, ASPM off, MSI on), then
+`prepare_for_power_up` + `sync_power_up` (the kept image downloaded
+again) + IPCR (`QrtrPipe::power_cycle`). Not ported: the RDDM ramdump
+image, MHI-core SYS_ERR recovery (`mhi_pm_sys_error_transition`), M3
+suspend/resume, BW scaling, RSC/offload/client-managed rings, EDL.
 
 ## 3. Public interface
 
@@ -422,7 +432,11 @@ HE caps for the mac layer, HAL reg caps), `dma_ring_caps`, `ready` +
   runtime calls it on the transport's interrupt or every 100 ms.
   `FwNotice`: `Reset(MhiNotify)` (`reset_work`), `ServerExit`
   (`ATH11K_QMI_EVENT_SERVER_EXIT`), `Restart` (FW_INIT_DONE with
-  REGISTERED → `restart_work`).
+  REGISTERED → `restart_work`). `QmiFw::recover(power_cycle)` (default
+  unsupported; `Wlfw`: `QrtrPipe::power_cycle` + `endpoint_reset` when
+  asked, then `run_to_fw_restart`). `Ath11kCore::into_parts()` gives the
+  HIF, QMI session and config back for a restart (`ath11k_wmi_detach`;
+  HTC / WMI state dropped, rebuilt by `Ath11kCore::new`).
 - Steps (`core::step`, 120–139): UNSUPPORTED 120, NO_DEVICE 121,
   HTC_INIT 122, HTC_READY_TIMEOUT 123, HTC_BAD_READY 124, HTT_CONNECT
   125, HTT_CONNECT_TIMEOUT 126, WMI_CONNECT 127, WMI_CONNECT_TIMEOUT
@@ -983,7 +997,51 @@ SRING_SETUP_SEND 253 (detail = index << 16 | core step), DP_IRQ_CONFIG
 254 (no "DP" MSI user), MAC_CAPS 255 (detail bits 1 EXT, 2 READY, 4 no
 pdev), NET_REGISTER 256 (console only; detail 1 no authority, 2
 revoked, 3 duplicate), IF_DOWN_VDEV_DELETE 257 (console only, Linux
-warns; detail = errno).
+warns; detail = errno), RECOVERY_LIMIT 258 (reset declined; detail =
+failures in a row), RECOVERY_FW 259 (power cycle / QMI handshake; detail
+= inner step << 16 | detail), RECOVERY_CORE 260 (restart bring-up; the
+core's own step latches first), RECOVERY_MAC 261 (open path after the
+restart; detail 1, 3 caps).
+
+**Firmware crash recovery** (Linux `ath11k_core_reset`,
+`ath11k_core_restart`, `ath11k_core_reconfigure_on_crash`,
+`ath11k_core_pre_reconfigure_recovery`,
+`ath11k_core_post_reconfigure_recovery`):
+
+1. Detection, in `Rt::service` from `QmiFw::service`: MHI EE_RDDM /
+   SYS_ERROR (`FwNotice::Reset`), SERVER_EXIT, FW_INIT_DONE / FW_READY
+   while registered (`Restart`). `Rt::fw_notify`: a reset passes
+   `ath11k_core_reset`'s gate first (`fail_cont_count` ≥ 5, or ≥ 3 inside
+   `reset_fail_timeout` (20 s) → declined, RECOVERY_LIMIT); then
+   `pre_reconfigure_recovery`: CRASH_FLUSH (Rt, CE, DP), queues stopped
+   (`txq::reason::DRIVER`), TX-status frames dropped, management TX IDR
+   freed, station data state cleared, `fw_crash_counter`++, panel stage
+   `recovery` (`diag::note_wifi_crash`). From here `wait_until` returns at
+   once, `wmi_send` and `tx_eth` fail with `-ESHUTDOWN`: every control
+   operation in flight ends.
+2. The runtime loop takes the notice (`Shared::take_fw_notice`) and runs
+   `Ath11kNetdev::recover`: carrier off, the mac-layer mutex taken,
+   `Shared::recover_device(notice)`: the `Rt` leaves the slot (`lock`
+   callers wait; nothing is held across the awaits), DP + CE interrupts
+   off, `QmiFw::recover(power_cycle = Reset)` (§2.3 power cycle, QMI to
+   FW_INIT_DONE), then the reconfigure — after the device reset, so no
+   freed memory is still in use: `dp.pdev_free`, `ce.cleanup_pipes`,
+   `into_parts` (WMI / HTC detach), `dp.pdev_reo_cleanup`, `dp.free`,
+   `hal.srng_clear`, CRASH_FLUSH cleared, `Ath11kCore::new` +
+   `qmi_firmware_ready(DpHooks)` over the same transport (new CE / HTC /
+   WMI / DP; the TX queues and pending statuses carried over), the new
+   `Rt` back in the slot.
+3. `post_reconfigure_recovery` / `ieee80211_restart_hw`: a new mac layer
+   from the new capabilities (`Mac::config()` kept); if the interface was
+   open, the open path again (`ath11k_mac_op_start` + `add_interface`);
+   `reconfig_complete` (`fail_cont_count` = 0, queues woken,
+   `diag::note_wifi_recovered`); then a directed scan + `associate` with
+   the last association's parameters (mac80211 would restore the
+   association instead, §8); if that fails the command-line autoconnect
+   keeps retrying.
+4. A failure latches its step, parks what the firmware was given and
+   marks the device dead: control operations fail with `HardwareError`,
+   `lock` callers park forever, the runtime loop ends.
 
 Tests: `integration_tests.rs` — one composed fake device: `core_tests`'
 `Fw` behind `ce_tests`' `FakeChip` (HTC / WMI through the real CE
@@ -1007,7 +1065,14 @@ failures (latched step, firmware stopped, unwound), missing caps, the
 `tx_hdr` goldens (non-QoS, QoS, DSCP table, IPv6, EAPOL, port control, the shared management / non-QoS sequence counter over the device,
 bridge tunnel, 802.3 length frames), and the autoconnect parameters
 (parse / rejects, the IEEE 802.11 Annex J.4.2 PBKDF2 vector, BSS
-choice, a directed-scan connect on the fake device).
+choice, a directed-scan connect on the fake device). Recovery: transport
+servicing on IRQ / poll; crash → recover → reconnected on the composed
+fake (RDDM while connected with WPA2: power cycle of the device model,
+the bring-up HTT sequence again, the same ring ids, carrier off → on,
+4-way again, data on the new TCL ring, panel counters); CRASH_FLUSH
+semantics + a SERVER_EXIT recovery without power cycle (queues stopped
+then woken); firmware / restart failures (latched, dead, control
+operations refused) and the reset gate.
 
 ## 4. Invariants
 
@@ -1036,8 +1101,13 @@ choice, a directed-scan connect on the fake device).
   vif) only on `IFF_UP`; HE / 6 GHz association / WPA3 are
   not advertised (HwCaps.he false, bands 2.4 / 5 GHz).
 - No lock is held across an `.await`: `Shared::rt` is taken for
-  synchronous steps only; the mac-layer mutex is held across a control
-  operation and never taken by the runtime loop unless free.
+  synchronous steps only (a recovery moves the runtime out of the slot
+  instead of holding it); the mac-layer mutex is held across a control
+  operation (a recovery is one) and never taken by the runtime loop
+  unless free.
+- Memory the firmware may DMA into is freed only after the device was
+  reset or restarted its firmware (recovery), or never (failed bring-up /
+  failed recovery: parked).
 - Bring-up never blocks or panics the init path: probe spawns the MHI
   task, which runs everything after; failures latch a step and park the
   objects the firmware may still use.
@@ -1058,7 +1128,7 @@ card (QEMU emulates none) is exercised once, after phase 8.
 | 6 | Control: pdev/vdev, regulatory, scan → `BssInfo` list, over the runtime ports (**done, offline**) | `mac.c`, `wmi.c`, `reg.c` |
 | 7 | Connect: peer, auth/assoc via mgmt TX, EAPOL via `narf-wireless` supplicant over the DP rings, key install + PN config (**done, offline** for Open + WPA2-PSK/CCMP; SAE open) | `mac.c`, `wmi.c`, `dp_rx.c` |
 | 8 | Data path: TX (Ethernet → native-wifi 802.11 → TCL → WBM completion), RX (REO dst → Ethernet II → stack / RX ring); `wlan%d` registered with `narf_net` + `narf_wireless` (**done, offline**; first hardware run pending) | `mac80211/tx.c`, `dp_tx.c`, `dp_rx.c` |
-| 9 | Power: PS, suspend/resume, firmware crash recovery | `core.c`, `mac.c` |
+| 9 | Power: PS, suspend/resume; firmware crash recovery (**done, offline**: MHI RDDM / SYS_ERR + QMI late events → reset / restart, power cycle, reconfigure, mac restart, reconnect) | `core.c`, `mac.c`, `mhi.c`, `qmi.c` |
 
 ## 6. Dependencies
 
@@ -1078,7 +1148,10 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   full hardware bring-up at the end by booting NARF bare-metal on
   the QCNFA765 laptop (`docs/BOOTING_ON_CACHYOS.md`). No serial
   there, so every bring-up stage reports to a pinned framebuffer
-  status line as well as the console.
+  status line as well as the console. A firmware crash shows as stage
+  `recovery` and `fw-crash=N recovered=M` on that line
+  (`diag::note_wifi_crash` / `note_wifi_recovered`,
+  `fb::status::wifi_line`).
 - MHI diag steps: `mhi_host::step` (10–35) latch through
   `diag::latch_wifi_error`; the stage moves to `transport` at the
   first M0 and `fw-boot` at mission mode. QMI steps are `wlfw::step`
@@ -1157,9 +1230,27 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   `ath11k_core_reset` like EE_RDDM. During bring-up a SYS_ERR still fails
   the bring-up (Linux's `reset_work` ignores an unregistered device).
 - Core after bring-up: `ATH11K_FLAG_*` crypto / raw mode are not modelled (HW
-  crypto, native-wifi encap / decap as in the INIT resource config);
-  firmware crash recovery (`ath11k_core_reconfigure_on_crash`) is not
-  ported.
+  crypto, native-wifi encap / decap as in the INIT resource config).
+- Recovery deviations from Linux (deliberate): no coredump
+  (`ath11k_coredump_collect`, no RDDM image); `reset_count` /
+  `reset_complete` (a second reset work racing the first) and the
+  `recovery_start` wait are not modelled — one runtime task runs one
+  recovery at a time and later notices are dropped while one is pending;
+  WMI / HTC timeouts do not trigger recovery (Linux's do not either:
+  CRASH_FLUSH only shortens them); the mac layer is rebuilt and NARF
+  associates again over the air with the last parameters, where
+  mac80211's `ieee80211_reconfig` restores the station, keys and BSS
+  state in the restarted firmware without new frames — so the old mac
+  layer (its supplicant / rekey state, RX BA sessions, scan table) is
+  dropped whole rather than torn down session by session: no DELBA is
+  sent (Linux's `ieee80211_reconfig` tears the BA sessions down with
+  AGG_STOP_LOCAL_REQUEST and a DELBA; NARF's reassociation resets the
+  AP's BA state instead), the per-TID REO / fragment state and frag
+  timers go with `Dp::free`, and cfg80211 sees a disconnect (reason 1,
+  as `ieee80211_sta_connection_lost`) then a new connection; a failed
+  recovery leaves the device dead until the next boot (Linux waits for
+  another crash event); the `fail_cont_count` gate counts failed
+  recoveries (Linux counts resets that did not complete within 20 s).
 - DP deviations from Linux (deliberate): RX buffers, TX bounce buffers
   and ring memory are DMA32 coherent `DmaMem`s (Linux streams skbs);
   rings are allocated with no 7-byte slack (the page-aligned allocator
@@ -1247,6 +1338,13 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   launcher that grants the `wlan%d` interface to the supplicant /
   manager task (`network_daemon::prepare`); until one exists the
   `ath11k.*` command-line autoconnect is the only trigger.
+- Unverified until hardware (recovery): that the WCN6855 firmware enters
+  RDDM (or reports SYS_ERR) on a crash and comes back after the
+  `sw_reset` power cycle with a fresh QRTR HELLO; that it sends
+  FW_INIT_DONE (not only FW_READY) after the restart; that the target
+  re-initialises its LMAC ring pointer words (Linux's srng setup does not
+  clear them; the fake firmware does); MSI / ASPM behaviour across the
+  cycle; the reconnect timing.
 - Unverified until hardware (the first bare-metal run answers these):
   the real firmware's HTC credit size vs `max_msg_len` (one WMI credit
   with shadow registers — a command larger than one credit would stall

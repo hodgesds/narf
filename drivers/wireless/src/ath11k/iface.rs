@@ -22,6 +22,14 @@
 //! Control operations (`scan`, `associate`, `disassociate`) lock the mac
 //! layer (an async mutex held across their awaits, like mac80211's
 //! `wiphy` mutex); each port call they make services the device itself.
+//!
+//! Firmware crash recovery ([`Ath11kNetdev::recover`]) is one more such
+//! operation, run by the runtime loop when the transport reported a
+//! crash: carrier off, the device recovered
+//! ([`super::runtime::Shared::recover_device`]), then what
+//! `ath11k_core_post_reconfigure_recovery` → `ieee80211_restart_hw` does
+//! for the station (mac layer restarted: `ath11k_mac_op_start` +
+//! `ath11k_mac_op_add_interface`) and a reconnect to the last network.
 
 extern crate alloc;
 
@@ -37,9 +45,11 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::iface::{HwCaps, WirelessBand, WirelessIfaceInfo, WirelessModes};
 use narf_wireless::{
-    AssociateRequest, BssInfo, ScanRequest, WirelessConfig, WirelessError, WirelessNetIface,
+    AssociateRequest, BssInfo, ScanRequest, SecurityConfig, WirelessConfig, WirelessError,
+    WirelessNetIface,
 };
 
+use super::core::FwNotice;
 use super::mac::{channel_number_freq, Disconnect, Mac};
 use super::mac_frame::{self as frame, freq_band, Band};
 use super::mac_reg::chan_flag;
@@ -131,6 +141,25 @@ pub struct Ath11kNetdev<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
     rx_prod: IrqSafeSpinLock<Option<Producer<Frame, RX_RING_N>>>,
     pub stats: NetdevStats,
+    /// The network of the last successful `associate` (cleared by
+    /// `disassociate`): where a recovery reconnects.
+    last_assoc: IrqSafeSpinLock<Option<AssociateRequest>>,
+}
+
+/// `AssociateRequest` is not `Clone`.
+fn copy_request(r: &AssociateRequest) -> AssociateRequest {
+    AssociateRequest {
+        bssid: r.bssid,
+        ssid: r.ssid.clone(),
+        channel: r.channel,
+        security: match &r.security {
+            SecurityConfig::Open => SecurityConfig::Open,
+            SecurityConfig::Wpa2 { psk } => SecurityConfig::Wpa2 { psk: *psk },
+            SecurityConfig::Wpa3 { password } => SecurityConfig::Wpa3 {
+                password: password.clone(),
+            },
+        },
+    }
 }
 
 /// Counters.
@@ -145,6 +174,10 @@ pub struct NetdevStats {
     /// [`super::tx_offload::csum_partial_prepare`]).
     pub tx_offload_refused: AtomicU32,
     pub link_losses: AtomicU32,
+    /// Firmware recoveries run / completed / reconnected after.
+    pub recoveries: AtomicU32,
+    pub recovered: AtomicU32,
+    pub reconnects: AtomicU32,
 }
 
 fn alloc_frame(bytes: &[u8]) -> Option<Frame> {
@@ -183,6 +216,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
                 tx_ring: IrqSafeSpinLock::new(Some(tx_prod)),
                 rx_prod: IrqSafeSpinLock::new(Some(rx_prod)),
                 stats: NetdevStats::default(),
+                last_assoc: IrqSafeSpinLock::new(None),
             },
             tx_cons,
         )
@@ -464,6 +498,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
     pub async fn service_once(&self) -> usize {
         let frames = self.shared.take_rx().await;
         let n = self.deliver(frames);
+        if let Some(notice) = self.shared.take_fw_notice().await {
+            self.recover(notice).await;
+            return n;
+        }
         if let Some(mut m) = self.mac.try_lock() {
             self.sync_admin(&mut m).await;
             if m.poll().await.is_some() {
@@ -487,11 +525,117 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         n
     }
 
-    /// The runtime loop task.
+    /// The runtime loop task (ends when a recovery failed: the device is
+    /// gone).
     pub async fn run(self: Arc<Self>) {
         loop {
             self.service_once().await;
+            if self.shared.is_dead() {
+                return;
+            }
             self.shared.irq.wait(self.shared.slice_ms).await;
+        }
+    }
+
+    /// Firmware crash recovery for the station (Linux `ath11k_core_reset`
+    /// / `ath11k_core_restart`, then `ath11k_core_post_reconfigure_recovery`
+    /// → `ath11k_core_halt` + `ieee80211_restart_hw`): the link goes down,
+    /// the mac layer is locked (operations in flight end: CRASH_FLUSH
+    /// fails their waits), the device is recovered, and the mac layer is
+    /// rebuilt from the new capabilities and started with its station
+    /// vif. mac80211 then restores the association; NARF associates again
+    /// with the last network's parameters (and the command-line
+    /// autoconnect keeps retrying if that fails). `true` when the device
+    /// came back.
+    pub async fn recover(&self, notice: FwNotice) -> bool {
+        use core::fmt::Write as _;
+        self.stats.recoveries.fetch_add(1, Ordering::Relaxed);
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath11k: {}: firmware crashed ({:?}), recovering",
+            self.name,
+            notice
+        );
+        // The association does not survive here (it is made again
+        // below): cfg80211 hears the loss as mac80211's
+        // `ieee80211_sta_connection_lost(sdata, WLAN_REASON_UNSPECIFIED,
+        // false)` would report it.
+        self.link_down(Some(Disconnect {
+            reason: frame::WLAN_REASON_UNSPECIFIED,
+            from_ap: false,
+        }));
+        let mut m = self.mac.lock().await;
+        let dev = match self.shared.recover_device(notice).await {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        // ath11k_core_halt + ieee80211_restart_hw → drv_start +
+        // drv_add_interface on the rebuilt mac layer.
+        // The interface was open: mac80211's reconfig brings the hardware
+        // and the station vif back the way `ieee80211_do_open` did.
+        let was_open = m.vif().is_some();
+        let mut mac = Mac::new(
+            Port(self.shared.clone()),
+            Port(self.shared.clone()),
+            dev.caps,
+            m.config(),
+            dev.reg_info.as_deref(),
+        );
+        let opened = if was_open {
+            self.do_open(&mut mac).await
+        } else {
+            Ok(())
+        };
+        *m = mac;
+        drop(m);
+        if opened.is_err() {
+            super::hal::TransportError::new(super::runtime::step::RECOVERY_MAC, 1, 5)
+                .report("ath11k recovery: mac");
+            self.shared.park(alloc::boxed::Box::new(()));
+            return false;
+        }
+        // ath11k_mac_op_reconfig_complete.
+        self.shared.reconfig_complete().await;
+        narf_memory::diag::note_wifi_recovered();
+        self.stats.recovered.fetch_add(1, Ordering::Relaxed);
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath11k: {}: firmware recovered",
+            self.name
+        );
+        let last = self.last_assoc.lock().as_ref().map(copy_request);
+        if let Some(req) = last {
+            self.reconnect(req).await;
+        }
+        true
+    }
+
+    /// Associate again after a recovery: a scan directed at the network
+    /// on its channel (the new mac layer has no BSS table), then the
+    /// association.
+    async fn reconnect(&self, req: AssociateRequest) {
+        use core::fmt::Write as _;
+        let scan = ScanRequest {
+            ssids: alloc::vec![req.ssid.clone()],
+            channels: alloc::vec![req.channel],
+            active: true,
+        };
+        let r = match self.scan(scan).await {
+            Ok(_) => self.associate(req).await,
+            Err(e) => Err(e),
+        };
+        match r {
+            Ok(()) => {
+                self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  ath11k: {}: reconnect after recovery failed: {:?}",
+                    self.name,
+                    e
+                );
+            }
         }
     }
 
@@ -580,6 +724,9 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
     }
 
     async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+        if self.shared.is_dead() {
+            return Err(WirelessError::HardwareError);
+        }
         let mut m = self.mac.lock().await;
         // nl80211 refuses a scan on a down interface (-ENETDOWN).
         if !self.sync_admin(&mut m).await {
@@ -589,6 +736,9 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
     }
 
     async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError> {
+        if self.shared.is_dead() {
+            return Err(WirelessError::HardwareError);
+        }
         let mut m = self.mac.lock().await;
         if !self.sync_admin(&mut m).await {
             return Err(WirelessError::HardwareError);
@@ -596,12 +746,20 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
         m.associate(&req).await?;
         let b = m.connected_bssid();
         drop(m);
+        if b.is_some() {
+            *self.last_assoc.lock() = Some(copy_request(&req));
+        }
         // ieee80211_set_associated → netif_carrier_on.
         self.set_link(b.is_some(), b, req.channel);
         Ok(())
     }
 
     async fn disassociate(&self) -> Result<(), WirelessError> {
+        *self.last_assoc.lock() = None;
+        if self.shared.is_dead() {
+            self.set_link(false, None, 0);
+            return Err(WirelessError::HardwareError);
+        }
         let mut m = self.mac.lock().await;
         // ieee80211_set_disassoc: "drop any frame before deauth/disassoc".
         if m.link().is_some() {

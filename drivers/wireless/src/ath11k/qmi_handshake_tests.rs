@@ -394,6 +394,15 @@ impl QrtrPipe for FakePipe {
     fn log(&self, args: core::fmt::Arguments<'_>) {
         self.logs.borrow_mut().push(format!("{}", args));
     }
+    fn power_cycle(
+        &mut self,
+    ) -> impl Future<Output = Result<(), super::mhi_host::MhiError>> + Send {
+        // The device boots its firmware again and says HELLO.
+        let s = self.fw.s.clone();
+        self.fw = FakeFw::new(s);
+        self.logs.borrow_mut().push(String::from("power cycle"));
+        core::future::ready(Ok(()))
+    }
 }
 
 #[derive(Default)]
@@ -2333,4 +2342,54 @@ fn smoke_wlfw_service_reports_notices() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_wlfw_service_reports_notices
+);
+
+fn smoke_wlfw_recover_with_power_cycle() -> TestResult {
+    run_test(|| {
+        use super::core::QmiFw;
+        let (board, regdb, m3) = (elf_blob(100, 1), [3u8; 9], [1u8; 8]);
+        let (mut w, info) = ready_wlfw(&board, &regdb, &m3)?;
+        let next = w.client.next_txn_id();
+        // ath11k_core_reset: power cycle, endpoint reset, handshake.
+        block(QmiFw::recover(&mut w, true)).map_err(|_| "recover(power_cycle)")?;
+        ensure!(
+            w.client
+                .pipe
+                .logs
+                .borrow()
+                .iter()
+                .any(|l| l == "power cycle"),
+            "pipe power-cycled"
+        );
+        let want = expected_sequence_from(
+            next,
+            1,
+            &info.target_mem,
+            &regdb,
+            &board,
+            0xff,
+            info.m3_addr,
+            8,
+        );
+        ensure!(w.client.pipe.fw.reqs == want, "handshake on the new boot");
+        // Without a power cycle (SERVER_EXIT seen): the firmware restarts
+        // itself.
+        fw_restarts(&mut w.client.pipe.fw);
+        ensure!(
+            QmiFw::service(&mut w) == Some(super::core::FwNotice::ServerExit),
+            "notice"
+        );
+        block(QmiFw::recover(&mut w, false)).map_err(|_| "recover()")?;
+        // The handshake fails: the error comes back with its step.
+        w.client.pipe.fw.s.overrides = vec![(QMI_WLANFW_HOST_CAP_REQ_V01, 0, Reply::Fail(3))];
+        let e = block(QmiFw::recover(&mut w, true))
+            .err()
+            .ok_or("host_cap refused")?;
+        ensure!(e.step == step::HOST_CAP, "HOST_CAP step");
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_wlfw_recover_with_power_cycle
 );

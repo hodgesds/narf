@@ -767,6 +767,11 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         self.disconnect.take()
     }
 
+    /// The configuration the layer was built with (a restart reuses it).
+    pub fn config(&self) -> MacConfig {
+        self.cfg
+    }
+
     pub fn wiphy(&self) -> &Wiphy {
         &self.wiphy
     }

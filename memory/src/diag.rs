@@ -138,6 +138,11 @@ pub enum WifiStage {
     Scan = 8,
     /// Associated + keys installed.
     Connected = 9,
+    /// Firmware crashed; the driver is resetting and re-initialising
+    /// the device (ath11k `ath11k_core_reset` / `ath11k_core_restart`).
+    /// The stage moves back to the bring-up stages as the device
+    /// returns.
+    Recovery = 10,
 }
 
 impl WifiStage {
@@ -153,6 +158,7 @@ impl WifiStage {
             WifiStage::DataPath => "data-path",
             WifiStage::Scan => "scan",
             WifiStage::Connected => "connected",
+            WifiStage::Recovery => "recovery",
         }
     }
 
@@ -168,6 +174,7 @@ impl WifiStage {
             7 => WifiStage::DataPath,
             8 => WifiStage::Scan,
             9 => WifiStage::Connected,
+            10 => WifiStage::Recovery,
             _ => WifiStage::None,
         }
     }
@@ -179,6 +186,24 @@ static WIFI_ERR: AtomicU32 = AtomicU32::new(0);
 /// Driver-defined detail word (typically the register value that
 /// made the step fail).
 static WIFI_DETAIL: AtomicU32 = AtomicU32::new(0);
+/// Firmware crashes the Wi-Fi driver started a recovery for, and how
+/// many of those recoveries completed.
+static WIFI_CRASHES: AtomicU32 = AtomicU32::new(0);
+static WIFI_RECOVERED: AtomicU32 = AtomicU32::new(0);
+
+/// IRQ-safe: a Wi-Fi firmware crash was detected and recovery started
+/// (also sets [`WifiStage::Recovery`]).
+#[inline]
+pub fn note_wifi_crash() {
+    WIFI_CRASHES.fetch_add(1, Ordering::AcqRel);
+    set_wifi_stage(WifiStage::Recovery);
+}
+
+/// IRQ-safe: a Wi-Fi firmware recovery completed.
+#[inline]
+pub fn note_wifi_recovered() {
+    WIFI_RECOVERED.fetch_add(1, Ordering::AcqRel);
+}
 
 /// IRQ-safe: record that Wi-Fi bring-up reached `stage`.
 #[inline]
@@ -269,6 +294,10 @@ pub struct Snapshot {
     pub wifi_stage: WifiStage,
     pub wifi_err: u32,
     pub wifi_detail: u32,
+    /// Firmware crashes a recovery was started for.
+    pub wifi_crashes: u32,
+    /// Recoveries that completed.
+    pub wifi_recovered: u32,
 }
 
 pub fn snapshot() -> Snapshot {
@@ -286,6 +315,8 @@ pub fn snapshot() -> Snapshot {
         wifi_stage: WifiStage::from_u8(WIFI_STAGE.load(Ordering::Acquire)),
         wifi_err: WIFI_ERR.load(Ordering::Acquire),
         wifi_detail: WIFI_DETAIL.load(Ordering::Acquire),
+        wifi_crashes: WIFI_CRASHES.load(Ordering::Acquire),
+        wifi_recovered: WIFI_RECOVERED.load(Ordering::Acquire),
     }
 }
 
@@ -306,4 +337,6 @@ pub fn __reset_for_test() {
     WIFI_STAGE.store(WifiStage::None as u8, Ordering::Release);
     WIFI_ERR.store(0, Ordering::Release);
     WIFI_DETAIL.store(0, Ordering::Release);
+    WIFI_CRASHES.store(0, Ordering::Release);
+    WIFI_RECOVERED.store(0, Ordering::Release);
 }

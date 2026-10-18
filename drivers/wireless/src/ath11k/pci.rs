@@ -53,7 +53,9 @@ use super::hw::{
     QCOM_VENDOR,
 };
 use super::mhi::{self, ATH11K_AMSS_FILE};
-use super::mhi_host::{self, ControllerParams, MhiBus, MhiController, MhiError, MhiNotify};
+use super::mhi_host::{
+    self, ControllerParams, HifPower, MhiBus, MhiController, MhiError, MhiNotify,
+};
 use super::power::{self, ChipIo, PowerUpReport};
 use super::wlfw::{self, WlfwConfig};
 
@@ -274,6 +276,38 @@ impl MhiBus for Bar0Mhi {
     fn irqs_pending(&self) -> bool {
         MHI_IRQ_PENDING.load(Ordering::Acquire) != 0
     }
+    fn hif_power(&self, step: HifPower) {
+        use core::fmt::Write as _;
+        let io = Bar0Io(&self.mmio);
+        match step {
+            // ath11k_pci_power_down: "restore aspm in case firmware
+            // bootup fails", force wake, MSI off (then ath11k_mhi_stop).
+            HifPower::Down => {
+                pci_aspm_restore();
+                power::force_wake(&io);
+                msi_set(false);
+            }
+            // clear_bit(DEVICE_INIT_DONE) + ath11k_pci_sw_reset(ab, false).
+            HifPower::Reset => {
+                let _ = power::sw_reset(&io, false, None);
+            }
+            // ath11k_pci_power_up up to ath11k_mhi_start.
+            HifPower::Up => {
+                *WINDOW.lock() = 0;
+                let l1ss = with_controller(|d| d.params.fix_l1ss).flatten();
+                let report = power::sw_reset(&io, true, l1ss.as_ref());
+                if let Some(reg) = report.l1ss_failed_reg {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  ath11k: warning: failed to set pcie link register {:#010x}",
+                        reg
+                    );
+                }
+                pci_aspm_disable();
+                msi_set(true);
+            }
+        }
+    }
     fn wait_irq(&self, ms: u32) -> impl Future<Output = ()> + Send {
         MhiIrqWait {
             sleep: narf_time::SleepUntil::new(
@@ -327,49 +361,98 @@ pub fn mhi_ready() -> bool {
 /// The WLFW session over the running MHI controller.
 pub type Wlfw = wlfw::Wlfw<MhiController<Bar0Mhi>, wlfw::NarfFirmware, wlfw::Dma32>;
 
-/// What `ath11k_pci_aspm_restore` needs: the function, the Link
-/// Control saved before ASPM was disabled, and whether more than one
-/// MSI vector was granted (`ATH11K_FLAG_MULTI_MSI_VECTORS`). `Some` ⇔
-/// `ATH11K_PCI_ASPM_RESTORE` is set.
+/// What `ath11k_pci_aspm_disable` / `_restore` need: the function, the
+/// Link Control saved when ASPM was disabled (`ab_pci->link_ctl`),
+/// `ATH11K_PCI_ASPM_RESTORE`, and whether more than one MSI vector was
+/// granted (`ATH11K_FLAG_MULTI_MSI_VECTORS`).
 struct AspmRestore {
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
     link_ctl: u16,
     multi_msi: bool,
+    /// `ATH11K_PCI_ASPM_RESTORE`.
+    restore: bool,
 }
 
 static ASPM_RESTORE: IrqSafeSpinLock<Option<AspmRestore>> = IrqSafeSpinLock::new(None);
 
-/// `ath11k_pci_start`'s ASPM half: restore the saved ASPM bits
-/// (`test_and_clear_bit(ATH11K_PCI_ASPM_RESTORE)`), except with a single
-/// MSI vector, where Linux leaves ASPM off ("MHI register reading in M2
-/// causes system hang").
-pub fn aspm_restore() {
+/// `ath11k_pci_aspm_restore`: if `ATH11K_PCI_ASPM_RESTORE` was set
+/// (`test_and_clear_bit`), put the saved ASPM bits back.
+fn pci_aspm_restore() {
     use core::fmt::Write as _;
-    let Some(a) = ASPM_RESTORE.lock().take() else {
+    let Some(mut a) = ASPM_RESTORE.lock().take() else {
         return;
     };
-    if !a.multi_msi {
+    if a.restore {
+        a.restore = false;
+        let lnkctl = narf_bus::pci_express::LNKCTL_ASPMC;
+        let r = narf_bus::pci_express::clear_and_set_link_control(
+            &a.cap,
+            &a.device,
+            lnkctl,
+            a.link_ctl & lnkctl,
+        );
         let _ = writeln!(
             narf_console::Writer,
-            "  ath11k: leaving PCI ASPM disabled to avoid MHI M2 problems"
+            "  ath11k: ASPM restored (link_ctl {:#06x}): {}",
+            a.link_ctl,
+            if r.is_ok() { "ok" } else { "failed" }
         );
-        *ASPM_RESTORE.lock() = Some(a);
-        return;
     }
-    let lnkctl = narf_bus::pci_express::LNKCTL_ASPMC;
-    let r = narf_bus::pci_express::clear_and_set_link_control(
+    *ASPM_RESTORE.lock() = Some(a);
+}
+
+/// `ath11k_pci_aspm_disable`: save Link Control, clear L0s / L1, set
+/// `ATH11K_PCI_ASPM_RESTORE`.
+fn pci_aspm_disable() {
+    let Some(mut a) = ASPM_RESTORE.lock().take() else {
+        return;
+    };
+    if let Ok(cur) = narf_bus::pci_express::clear_and_set_link_control(
         &a.cap,
         &a.device,
-        lnkctl,
-        a.link_ctl & lnkctl,
-    );
-    let _ = writeln!(
-        narf_console::Writer,
-        "  ath11k: ASPM restored (link_ctl {:#06x}): {}",
-        a.link_ctl,
-        if r.is_ok() { "ok" } else { "failed" }
-    );
+        narf_bus::pci_express::LNKCTL_ASPMC,
+        0,
+    ) {
+        a.link_ctl = cur;
+        a.restore = true;
+    }
+    *ASPM_RESTORE.lock() = Some(a);
+}
+
+/// `ath11k_pci_msi_enable` / `_disable` (`ath11k_pci_msi_config`).
+fn msi_set(enable: bool) {
+    with_controller(|d| {
+        // SAFETY: the bound device's cfg space belongs to this driver
+        // (probe claimed it); the MSI capability was set up by
+        // `alloc_msi` and is only toggled here and at power-up.
+        let r = unsafe {
+            if enable {
+                narf_bus::msi::enable(&d.msi.bus_cfg)
+            } else {
+                narf_bus::msi::disable(&d.msi.bus_cfg)
+            }
+        };
+        let _ = r;
+    });
+}
+
+/// `ath11k_pci_start`'s ASPM half: `ath11k_pci_aspm_restore`, except
+/// with a single MSI vector, where Linux leaves ASPM off ("MHI register
+/// reading in M2 causes system hang").
+pub fn aspm_restore() {
+    use core::fmt::Write as _;
+    let multi = ASPM_RESTORE.lock().as_ref().map(|a| a.multi_msi);
+    match multi {
+        None => {}
+        Some(false) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ath11k: leaving PCI ASPM disabled to avoid MHI M2 problems"
+            );
+        }
+        Some(true) => pci_aspm_restore(),
+    }
 }
 
 /// Firmware lookup retries: probe can run before the rootfs firmware
@@ -797,6 +880,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             cap,
             link_ctl,
             multi_msi: dev.msi.n_vectors > 1,
+            restore: true,
         });
     }
     *CONTROLLER.lock() = Some(dev);

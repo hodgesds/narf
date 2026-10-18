@@ -82,7 +82,28 @@ pub mod step {
     /// Interface down (`ieee80211_do_stop`) could not delete the vdev
     /// (console only, Linux warns; detail = the errno).
     pub const IF_DOWN_VDEV_DELETE: u32 = 257;
+    /// `ath11k_core_reset` declined a reset after repeated failed
+    /// recoveries (`ATH11K_RESET_MAX_FAIL_COUNT_*`; detail = failures in a
+    /// row).
+    pub const RECOVERY_LIMIT: u32 = 258;
+    /// Recovery: the power cycle or the QMI handshake to FW_INIT_DONE
+    /// failed (detail = inner step << 16 | inner detail & 0xffff).
+    pub const RECOVERY_FW: u32 = 259;
+    /// Recovery: `ath11k_core_qmi_firmware_ready` failed on the restarted
+    /// firmware (detail = core step << 16 | detail & 0xffff).
+    pub const RECOVERY_CORE: u32 = 260;
+    /// Recovery: the mac layer did not come back (detail 1 the open path
+    /// — `ath11k_mac_op_start` + `add_interface` — failed, 3 device caps).
+    pub const RECOVERY_MAC: u32 = 261;
 }
+
+/// `ATH11K_RESET_MAX_FAIL_COUNT_FIRST`.
+pub const ATH11K_RESET_MAX_FAIL_COUNT_FIRST: u32 = 3;
+/// `ATH11K_RESET_MAX_FAIL_COUNT_FINAL`.
+pub const ATH11K_RESET_MAX_FAIL_COUNT_FINAL: u32 = 5;
+/// `ATH11K_RESET_FAIL_TIMEOUT_HZ` (20 s).
+pub const ATH11K_RESET_FAIL_TIMEOUT_MS: u64 = 20_000;
+pub const ESHUTDOWN: i32 = 108;
 
 pub const ETIMEDOUT: i32 = 110;
 pub const ENOSPC: i32 = 28;
@@ -454,6 +475,21 @@ pub struct RtStats {
     pub mgmt_tx_done: u32,
     pub mgmt_tx_unknown: u32,
     pub reo_status: u32,
+    /// `ab->stats.fw_crash_counter`.
+    pub fw_crash_counter: u32,
+    /// Recoveries that brought the device back.
+    pub recoveries: u32,
+}
+
+/// `ath11k_core_reset`'s bookkeeping (`fail_cont_count`,
+/// `reset_fail_timeout`), kept across recoveries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResetState {
+    /// Recoveries that failed in a row.
+    pub fail_cont_count: u32,
+    /// No further reset before this (ms) once `fail_cont_count` reached
+    /// `ATH11K_RESET_MAX_FAIL_COUNT_FIRST`.
+    pub reset_fail_timeout: u64,
 }
 
 /// `ar->txmgmt_idr` + `num_pending_mgmt_tx`.
@@ -485,6 +521,10 @@ pub struct Rt<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     /// A firmware crash / restart the transport reported, not yet acted
     /// on.
     pub fw_notice: Option<FwNotice>,
+    /// `ATH11K_FLAG_CRASH_FLUSH`: waits end, WMI / DP sends fail with
+    /// `-ESHUTDOWN` until the restart.
+    pub crash_flush: bool,
+    pub reset: ResetState,
 }
 
 /// A synchronous port call, applied at the next locked step.
@@ -525,6 +565,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
             mon_reap_at: None,
             qmi_service_at: 0,
             fw_notice: None,
+            crash_flush: false,
+            reset: ResetState::default(),
         }
     }
 
@@ -736,11 +778,62 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
         }
     }
 
-    /// Record what the transport reported (the first one wins until it is
-    /// handled).
+    /// What the transport reported, as Linux handles it at once: a reset
+    /// request goes through `ath11k_core_reset`'s failure gate; then
+    /// CRASH_FLUSH + RECOVERY and `ath11k_core_pre_reconfigure_recovery`
+    /// (for SERVER_EXIT that is the QMI event work's; for a reset the
+    /// reset work's first step). The recovery itself runs from the
+    /// runtime loop ([`Shared::take_fw_notice`]). While one is pending,
+    /// further notices are dropped.
     fn fw_notify(&mut self, n: FwNotice) {
-        log(format_args!("firmware notice: {:?}", n));
-        self.fw_notice.get_or_insert(n);
+        if self.fw_notice.is_some() {
+            return;
+        }
+        if let FwNotice::Reset(_) = n {
+            let fails = self.reset.fail_cont_count;
+            let now = self.now_ms();
+            if fails >= ATH11K_RESET_MAX_FAIL_COUNT_FINAL
+                || (fails >= ATH11K_RESET_MAX_FAIL_COUNT_FIRST
+                    && now < self.reset.reset_fail_timeout)
+            {
+                TransportError::new(step::RECOVERY_LIMIT, fails, ETIMEDOUT)
+                    .report("ath11k reset (too many failed recoveries)");
+                return;
+            }
+        }
+        log(format_args!("firmware crashed: {:?}, recovering", n));
+        self.fw_notice = Some(n);
+        self.pre_reconfigure_recovery();
+    }
+
+    /// Linux `ath11k_core_pre_reconfigure_recovery` (+ setting
+    /// `ATH11K_FLAG_CRASH_FLUSH`): `fw_crash_counter`++, queues stopped
+    /// (TX fails with `-ESHUTDOWN`), every waiter released (the mac
+    /// layer's event / peer / EAPOL waits end, WMI sends stop retrying),
+    /// pending management frames freed
+    /// (`ath11k_mac_tx_mgmt_pending_free`), the station data state dropped
+    /// with the firmware's peer. Nothing is freed that the hardware may
+    /// still use: rings and buffers wait for the restart.
+    pub fn pre_reconfigure_recovery(&mut self) {
+        self.crash_flush = true;
+        self.core.hif.ce.crash_flush = true;
+        self.dp.crash_flush = true;
+        self.stats.fw_crash_counter += 1;
+        // ieee80211_stop_queues (woken by the restart's reconfig).
+        self.stop_queues(TxQueues::vif_queues(), txq::reason::DRIVER);
+        // ath11k_mac_drain_tx: frames waiting for a TX status are dropped.
+        let pending: Vec<u32> = self.ack_frames.ids().collect();
+        for id in pending {
+            self.ack_frames.remove(id);
+            self.ack_status.push_back((id, TxStatus::DROPPED));
+        }
+        self.mgmt = MgmtTx::default();
+        let own = self.link.own;
+        self.link = LinkState {
+            own,
+            ..LinkState::default()
+        };
+        diag::note_wifi_crash();
     }
 
     /// Transmit an Ethernet frame on the station vif: mac80211's
@@ -750,6 +843,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
     /// frame, [`super::tx_offload::csum_partial_prepare`]). Returns the
     /// TX descriptor id.
     pub fn tx_eth(&mut self, eth: &[u8], csum_partial: bool) -> Result<u32, i32> {
+        if self.crash_flush {
+            // ath11k_dp_tx: "if (unlikely(CRASH_FLUSH)) return -ESHUTDOWN".
+            return Err(ESHUTDOWN);
+        }
         let (Some(vif), Some(bssid)) = (self.link.vif, self.link.bss) else {
             // ieee80211_build_hdr: no chanctx / not associated.
             return Err(ENOTCONN);
@@ -992,10 +1089,45 @@ pub fn device_caps<H: Hif, Q: QmiFw>(
     .ok_or(TransportError::new(step::MAC_CAPS, 4, ENODEV))
 }
 
+/// [`Shared::lock`]'s guard: the runtime, present (a recovery that owns it
+/// makes `lock` wait instead).
+#[allow(missing_debug_implementations)]
+pub struct RtGuard<'a, Io: RtIo, Irq: DpIrq, Q: RtQmi>(MutexGuard<'a, Option<Rt<Io, Irq, Q>>>);
+
+impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> core::ops::Deref for RtGuard<'_, Io, Irq, Q> {
+    type Target = Rt<Io, Irq, Q>;
+    fn deref(&self) -> &Rt<Io, Irq, Q> {
+        match self.0.as_ref() {
+            Some(rt) => rt,
+            // RtGuard is only built over a present runtime and the slot
+            // only changes through the mutex it holds.
+            None => unreachable!("RtGuard over an empty runtime slot"),
+        }
+    }
+}
+
+impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> core::ops::DerefMut for RtGuard<'_, Io, Irq, Q> {
+    fn deref_mut(&mut self) -> &mut Rt<Io, Irq, Q> {
+        match self.0.as_mut() {
+            Some(rt) => rt,
+            None => unreachable!("RtGuard over an empty runtime slot"),
+        }
+    }
+}
+
+/// A recovered device: what `ath11k_mac_register` / `ieee80211_restart_hw`
+/// rebuild the mac layer from.
+#[allow(missing_debug_implementations)]
+pub struct Recovered {
+    pub caps: DeviceCaps,
+    pub reg_info: Option<alloc::boxed::Box<wmi::RegInfo>>,
+}
+
 /// The runtime as tasks share it.
 #[allow(missing_debug_implementations)]
 pub struct Shared<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
-    pub rt: Mutex<Rt<Io, Irq, Q>>,
+    /// `None` while a recovery owns the runtime ([`Self::recover_device`]).
+    pub rt: Mutex<Option<Rt<Io, Irq, Q>>>,
     /// The interrupt source, outside the lock (waits never hold it).
     pub irq: Irq,
     pub clock: fn() -> u64,
@@ -1007,6 +1139,11 @@ pub struct Shared<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     pub wmi_send_ms: u64,
     pub slice_ms: u32,
     ops: IrqSafeSpinLock<VecDeque<SyncOp>>,
+    /// A recovery failed: the device is gone until the next probe.
+    dead: AtomicBool,
+    /// What a failed recovery left (the firmware was given its memory and
+    /// rings; never freed).
+    parked: IrqSafeSpinLock<Vec<alloc::boxed::Box<dyn core::any::Any + Send>>>,
 }
 
 impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
@@ -1016,7 +1153,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         let max_msg_len = rt.core.wmi_ep.map_or(0, |e| e.max_msg_len);
         let wmi_send_ms = rt.core.cfg.wmi_send_ms;
         Arc::new(Shared {
-            rt: Mutex::new(rt),
+            rt: Mutex::new(Some(rt)),
             irq,
             clock,
             rng,
@@ -1024,7 +1161,152 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             wmi_send_ms,
             slice_ms: SERVICE_SLICE_MS,
             ops: IrqSafeSpinLock::new(VecDeque::new()),
+            dead: AtomicBool::new(false),
+            parked: IrqSafeSpinLock::new(Vec::new()),
         })
+    }
+
+    /// A recovery failed; nothing will bring the device back.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+
+    /// Give up on the device, keeping what the firmware was given.
+    pub fn park(&self, what: alloc::boxed::Box<dyn core::any::Any + Send>) {
+        self.parked.lock().push(what);
+        self.dead.store(true, Ordering::Release);
+    }
+
+    /// The firmware notice to recover from, once (the runtime loop's
+    /// `ath11k_core_reset` / `restart_work` trigger).
+    pub async fn take_fw_notice(&self) -> Option<FwNotice> {
+        let mut g = self.lock().await;
+        g.fw_notice.take()
+    }
+
+    /// Linux `ath11k_mac_op_reconfig_complete` on a reset: the recovery
+    /// succeeded, `fail_cont_count` = 0.
+    pub async fn reconfig_complete(&self) {
+        let mut g = self.lock().await;
+        g.reset.fail_cont_count = 0;
+        g.stats.recoveries += 1;
+        // ieee80211_reconfig → ieee80211_wake_queues_by_reason(DRIVER).
+        g.wake_queues(TxQueues::vif_queues(), txq::reason::DRIVER);
+    }
+
+    /// A recovery attempt failed (`ath11k_core_reset`'s
+    /// `fail_cont_count` / `reset_fail_timeout`); the runtime, if present,
+    /// remembers it.
+    fn recovery_failed(rt: &mut Rt<Io, Irq, Q>) {
+        rt.reset.fail_cont_count += 1;
+        rt.reset.reset_fail_timeout = rt.now_ms() + ATH11K_RESET_FAIL_TIMEOUT_MS;
+    }
+
+    /// The device half of a recovery: `ath11k_core_reset` (interrupts off,
+    /// `ath11k_hif_power_down` + `ath11k_hif_power_up` for a reset), the
+    /// QMI event work to FW_INIT_DONE, then `ath11k_core_restart` →
+    /// `ath11k_core_reconfigure_on_crash` — after the device was reset or
+    /// restarted its firmware, so nothing freed here is still used by the
+    /// hardware: `ath11k_dp_pdev_free`, `ath11k_ce_cleanup_pipes`,
+    /// `ath11k_wmi_detach`, `ath11k_dp_pdev_reo_cleanup`, `ath11k_dp_free`,
+    /// `ath11k_hal_srng_clear`, CRASH_FLUSH cleared and
+    /// `ath11k_core_qmi_firmware_ready` over the same transport and QMI
+    /// session (new DP, HTC, WMI). The runtime is taken out of the slot
+    /// for the whole of it (no lock is held across the awaits; `lock`
+    /// callers wait). On failure the step is latched, what the firmware
+    /// was given is parked and the device is marked dead.
+    pub async fn recover_device(&self, notice: FwNotice) -> Result<Recovered, TransportError> {
+        let taken = self.rt.lock().await.take();
+        let Some(mut rt) = taken else {
+            return Err(TransportError::new(step::RECOVERY_CORE, 0, ENODEV));
+        };
+        // ath11k_hif_irq_disable + ath11k_hif_ce_irq_disable.
+        set_dp_irqs_enabled(false);
+        ce::set_ce_irqs_enabled(false);
+        let power_cycle = matches!(notice, FwNotice::Reset(_));
+        if let Err(e) = rt.core.qmi.recover(power_cycle).await {
+            let te = TransportError::new(
+                step::RECOVERY_FW,
+                (e.step & 0xffff) << 16 | (e.detail & 0xffff),
+                e.errno,
+            );
+            te.report("ath11k recovery: firmware");
+            Self::recovery_failed(&mut rt);
+            self.park(alloc::boxed::Box::new(rt));
+            return Err(te);
+        }
+        // restart_work → ath11k_core_reconfigure_on_crash.
+        let Rt {
+            core,
+            mut dp,
+            txq,
+            ack_status,
+            stats,
+            reset,
+            ..
+        } = rt;
+        let (dp_cfg, sizes, msi) = (dp.cfg, dp.sizes, dp.msi());
+        let (mut hif, qmi, cfg) = core.into_parts();
+        dp.pdev_free(&mut hif.ce.hal);
+        hif.ce.cleanup_pipes();
+        dp.pdev_reo_cleanup(&mut hif.ce.hal);
+        dp.free(&mut hif.ce.hal);
+        hif.ce.hal.srng_clear();
+        hif.ce.crash_flush = false;
+        let mut core = match Ath11kCore::new(hif, qmi, cfg) {
+            Ok(c) => c,
+            Err((e, hif, qmi)) => {
+                let te = TransportError::new(
+                    step::RECOVERY_CORE,
+                    (e.step & 0xffff) << 16 | (e.detail & 0xffff),
+                    e.errno,
+                );
+                te.report("ath11k recovery: core");
+                self.park(alloc::boxed::Box::new((hif, qmi)));
+                return Err(te);
+            }
+        };
+        let mut hooks = DpHooks::new(Some(dp_cfg), 0, sizes, msi);
+        let r = core.qmi_firmware_ready(&mut hooks).await;
+        let dp = hooks.dp.take();
+        let (core, dp) = match (r, dp) {
+            (Ok(()), Some(dp)) => (core, dp),
+            (r, dp) => {
+                let e = r
+                    .err()
+                    .unwrap_or(TransportError::new(step::DP_MISSING, 0, ENODEV));
+                let te = TransportError::new(
+                    step::RECOVERY_CORE,
+                    (e.step & 0xffff) << 16 | (e.detail & 0xffff),
+                    e.errno,
+                );
+                te.report("ath11k recovery: core");
+                self.park(alloc::boxed::Box::new((core, dp)));
+                return Err(te);
+            }
+        };
+        let mut rt = Rt::new(core, dp);
+        // mac80211's queues (still stopped for the driver) and the
+        // statuses not yet reported survive the restart.
+        rt.txq = txq;
+        rt.ack_status = ack_status;
+        rt.stats = stats;
+        rt.reset = reset;
+        let r = match rt.device_caps() {
+            Ok(caps) => Ok(Recovered {
+                caps,
+                reg_info: rt.core.reg_info.clone(),
+            }),
+            Err(e) => {
+                TransportError::new(step::RECOVERY_MAC, 3, e.errno).report("ath11k recovery: caps");
+                Err(e)
+            }
+        };
+        if r.is_err() {
+            Self::recovery_failed(&mut rt);
+        }
+        *self.rt.lock().await = Some(rt);
+        r
     }
 
     pub fn now_ms(&self) -> u64 {
@@ -1040,22 +1322,36 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         core::mem::take(&mut *self.ops.lock())
     }
 
-    /// Lock the runtime and apply the queued synchronous calls.
-    pub async fn lock(&self) -> MutexGuard<'_, Rt<Io, Irq, Q>> {
-        let mut g = self.rt.lock().await;
-        for op in self.take_ops() {
-            g.apply(op);
+    /// Lock the runtime and apply the queued synchronous calls. While a
+    /// recovery owns the runtime this waits for it (on a dead device,
+    /// forever: nothing will come back).
+    pub async fn lock(&self) -> RtGuard<'_, Io, Irq, Q> {
+        loop {
+            {
+                let mut g = self.rt.lock().await;
+                if let Some(rt) = g.as_mut() {
+                    for op in self.take_ops() {
+                        rt.apply(op);
+                    }
+                    return RtGuard(g);
+                }
+            }
+            if self.is_dead() {
+                core::future::pending::<()>().await;
+            }
+            self.irq.wait(self.slice_ms).await;
         }
-        g
     }
 
-    /// [`Self::lock`] without waiting (sync callers: the netdev drain hook).
-    pub fn try_lock(&self) -> Option<MutexGuard<'_, Rt<Io, Irq, Q>>> {
+    /// [`Self::lock`] without waiting (sync callers: the netdev drain
+    /// hook); `None` while busy or recovering.
+    pub fn try_lock(&self) -> Option<RtGuard<'_, Io, Irq, Q>> {
         let mut g = self.rt.try_lock()?;
+        let rt = g.as_mut()?;
         for op in self.take_ops() {
-            g.apply(op);
+            rt.apply(op);
         }
-        Some(g)
+        Some(RtGuard(g))
     }
 
     /// Service the device until `f` yields or `timeout_ms` passes (0 =
@@ -1067,13 +1363,18 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     ) -> Option<T> {
         let deadline = self.now_ms().saturating_add(timeout_ms as u64);
         loop {
-            let r = {
+            let (r, flushed) = {
                 let mut g = self.lock().await;
                 g.service();
-                f(&mut g)
+                (f(&mut g), g.crash_flush)
             };
             if r.is_some() {
                 return r;
+            }
+            // ath11k_core_pre_reconfigure_recovery completes every
+            // waiter: none outlives a crash.
+            if flushed {
+                return None;
             }
             let now = self.now_ms();
             if now >= deadline {
@@ -1100,6 +1401,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
                 g.service();
                 match g.core.wmi_cmd_try_send(cmd) {
                     Ok(()) => Try::Done,
+                    // "if (ret && CRASH_FLUSH) ret = -ESHUTDOWN"
+                    Err(_) if g.crash_flush => Try::Fail(ESHUTDOWN),
                     Err(e) if g.core.wmi_send_retryable(e) => Try::Retry(e),
                     Err(e) => Try::Fail(e),
                 }

@@ -738,6 +738,10 @@ fn smoke_ath11k_step_codes_unique_and_in_range() -> TestResult {
                 super::runtime::step::MAC_CAPS,
                 super::runtime::step::NET_REGISTER,
                 super::runtime::step::IF_DOWN_VDEV_DELETE,
+                super::runtime::step::RECOVERY_LIMIT,
+                super::runtime::step::RECOVERY_FW,
+                super::runtime::step::RECOVERY_CORE,
+                super::runtime::step::RECOVERY_MAC,
             ],
         ),
     ];

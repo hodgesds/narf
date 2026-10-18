@@ -54,7 +54,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::future::Future;
 
-use super::mhi_host::{MhiBus, MhiController, MhiNotify, POLL_INTERVAL_MS};
+use super::mhi_host::{MhiBus, MhiController, MhiError, MhiNotify, POLL_INTERVAL_MS};
 use super::qmi::{split_message, QmiError, QmiHeader, QMI_HEADER_SIZE, QMI_RESPONSE};
 use super::qmi_wlfw::{WlfwMessage, WlfwRequest};
 use super::qrtr::{
@@ -92,6 +92,16 @@ pub trait QrtrPipe {
     fn take_reset_request(&mut self) -> Option<MhiNotify> {
         None
     }
+    /// `ath11k_hif_power_down` + `ath11k_hif_power_up` (the device is
+    /// reset and its firmware booted again; the endpoint comes back
+    /// waiting for the device's HELLO). The default cannot.
+    fn power_cycle(&mut self) -> impl Future<Output = Result<(), MhiError>> + Send {
+        core::future::ready(Err(MhiError::new(
+            super::mhi_host::step::BAD_CONFIG,
+            0xffff,
+            super::mhi_host::errno::ENODEV,
+        )))
+    }
 }
 
 impl<B: MhiBus + Send> QrtrPipe for MhiController<B> {
@@ -121,6 +131,9 @@ impl<B: MhiBus + Send> QrtrPipe for MhiController<B> {
     }
     fn take_reset_request(&mut self) -> Option<MhiNotify> {
         MhiController::take_reset_request(self)
+    }
+    fn power_cycle(&mut self) -> impl Future<Output = Result<(), MhiError>> + Send {
+        MhiController::power_cycle(self)
     }
 }
 

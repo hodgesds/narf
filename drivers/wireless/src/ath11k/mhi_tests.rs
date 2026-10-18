@@ -153,6 +153,10 @@ struct Dev {
     bhie_vec: Vec<(u64, u64)>,
     ul_rx: Vec<Vec<u8>>,
     wake_writes: Vec<u64>,
+    /// `MhiBus::hif_power` steps, in order.
+    hif: Vec<HifPower>,
+    /// BHI downloads seen.
+    bhi_loads: u32,
 }
 
 struct FakeMhi {
@@ -314,6 +318,7 @@ impl FakeMhi {
                 Self::ctxt_base(d, b.bhi_off + BHI_IMGADDR_LOW, b.bhi_off + BHI_IMGADDR_HIGH);
             let size = Self::reg(d, b.bhi_off + BHI_IMGSIZE) as usize;
             d.bhi_image = phys_read(addr, size);
+            d.bhi_loads += 1;
             match b.bhi {
                 Xfer::Success => {
                     d.regs
@@ -522,6 +527,23 @@ impl MhiBus for FakeMhi {
     }
     fn irqs_pending(&self) -> bool {
         self.d.borrow().irqs != 0
+    }
+    fn hif_power(&self, step: HifPower) {
+        let d = &mut *self.d.borrow_mut();
+        d.hif.push(step);
+        if step == HifPower::Reset {
+            // ath11k_pci_sw_reset: the SoC restarts in PBL, MHI in RESET,
+            // and forgets every ring position.
+            d.regs.insert(self.beh.bhi_off + BHI_EXECENV, MhiEe::PBL.0);
+            d.regs.insert(MHISTATUS, 0);
+            d.regs.insert(MHICTRL, 0);
+            d.ev_db = [0; 2];
+            d.ev_pending = Default::default();
+            d.cmd_dev_rp = 0;
+            d.chan_dev_rp.clear();
+            d.chan_db.clear();
+            d.irqs = 0;
+        }
     }
     fn wait_irq(&self, ms: u32) -> impl Future<Output = ()> + Send {
         let d = &mut *self.d.borrow_mut();
@@ -2317,3 +2339,113 @@ kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_mhi_runtime_crash_requests_reset
 );
+
+// ── power cycle (ath11k_core_reset) ──────────────────────────────
+
+fn smoke_mhi_power_cycle_reboots_firmware() -> TestResult {
+    let mut h = match booted() {
+        Some(h) => h,
+        None => return TestResult::Fail("boot + IPCR start failed"),
+    };
+    // A crash first: the request is pending when the reset starts.
+    raise_intvec(&h, (0xff << 8) | MHISTATUS_SYSERR_MASK, MhiEe::RDDM);
+    h.service();
+    check!(h.ee == MhiEe::RDDM, "crashed into RDDM");
+    let w0 = h.bus.writes().len();
+    let r = run(h.power_cycle());
+    check!(r.is_ok(), "power cycle reaches mission mode with IPCR");
+    let d = h.bus.d.borrow();
+    check!(
+        d.hif == [HifPower::Down, HifPower::Reset, HifPower::Up],
+        "ath11k_pci_power_down then ath11k_pci_power_up"
+    );
+    check!(d.bhi_loads == 2, "firmware downloaded again over BHI");
+    drop(d);
+    let w = h.bus.writes();
+    // mhi_pm_disable_transition: MHI RESET, then INTVEC re-programmed.
+    let reset = w[w0..]
+        .iter()
+        .position(|&(a, v)| a == MHICTRL && v & MHICTRL_RESET_MASK != 0)
+        .map(|i| i + w0);
+    check!(reset.is_some(), "MHI RESET requested");
+    let reset = reset.unwrap();
+    check!(
+        w[reset + 1..].first() == Some(&(BHI + BHI_INTVEC, 0)),
+        "INTVEC re-programmed after the reset"
+    );
+    check!(h.ee.in_mission_mode(), "mission mode again");
+    check!(h.pm_state == pm::M0, "M0");
+    check!(
+        h.channel_state(20) == Some(ch_state::ENABLED)
+            && h.channel_state(21) == Some(ch_state::ENABLED),
+        "IPCR started again"
+    );
+    check!(h.free_desc_count(21) == 0, "DL buffers queued again");
+    check!(
+        h.take_reset_request().is_none(),
+        "old crash request dropped"
+    );
+    check!(h.failure.is_none(), "no failure");
+    // QRTR traffic flows on the new rings.
+    check!(h.queue_ul(b"after").is_ok(), "UL after the power cycle");
+    h.service();
+    check!(
+        h.bus.d.borrow().ul_rx.last().map(|v| v.as_slice()) == Some(&b"after"[..]),
+        "UL delivered"
+    );
+    check!(h.bus.send_dl(21, b"down", ccs::EOT), "DL buffer posted");
+    h.service();
+    check!(
+        h.take_dl().map(|p| p.data) == Some(b"down".to_vec()),
+        "DL delivered"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_mhi_power_cycle_reboots_firmware
+);
+
+fn smoke_mhi_power_down_states() -> TestResult {
+    // Powered down twice: the second is "Already powered down".
+    let mut h = match booted() {
+        Some(h) => h,
+        None => return TestResult::Fail("boot + IPCR start failed"),
+    };
+    run(h.power_down());
+    check!(h.pm_state == pm::DISABLE, "PM DISABLE");
+    check!(h.ee == MhiEe::DISABLE_TRANSITION, "EE DISABLE");
+    check!(h.ctxt_addrs().is_none(), "contexts freed");
+    check!(h.channel_state(20) == Some(ch_state::DISABLED), "IPCR down");
+    check!(h.fbc_table().is_none(), "BHIe table freed");
+    let n = h.bus.writes().len();
+    run(h.power_down());
+    check!(
+        h.bus.writes().len() == n,
+        "second power down touches nothing"
+    );
+    // A device that never clears MHI RESET: logged, power-down goes on.
+    let beh = Behaviour {
+        reset_clears: false,
+        ..Behaviour::default()
+    };
+    let (mut h, r) = boot(beh, firmware(ATH11K_SBL_SIZE + 4096, false));
+    check!(r.is_ok(), "boot");
+    run(h.power_down());
+    check!(
+        h.bus.logged("device failed to clear MHI Reset"),
+        "reset timeout logged"
+    );
+    check!(h.pm_state == pm::DISABLE, "still DISABLE");
+    // A firmware image that fails BHI after the reset: the power cycle
+    // reports it.
+    let mut h = match booted() {
+        Some(h) => h,
+        None => return TestResult::Fail("boot"),
+    };
+    h.bus.beh.bhi = Xfer::Error(7);
+    let r = run(h.power_cycle());
+    check!(r.is_err(), "power-up failure surfaces");
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_mhi_power_down_states);

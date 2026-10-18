@@ -1398,3 +1398,45 @@ fn smoke_fb_hardware_cursor_arrow_and_gating() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("fb", smoke_fb_hardware_cursor_arrow_and_gating);
+
+fn smoke_fb_status_wifi_line() -> TestResult {
+    use narf_memory::diag::{snapshot, WifiStage};
+    let mut d = snapshot();
+    d.wifi_stage = WifiStage::DataPath;
+    d.wifi_err = 0;
+    d.wifi_detail = 0;
+    d.wifi_crashes = 0;
+    d.wifi_recovered = 0;
+    if crate::status::wifi_line(&d) != "wifi: data-path" {
+        return TestResult::Fail("plain stage line");
+    }
+    d.wifi_stage = WifiStage::Recovery;
+    d.wifi_crashes = 1;
+    if crate::status::wifi_line(&d) != "wifi: recovery fw-crash=1 recovered=0" {
+        return TestResult::Fail("recovery in progress");
+    }
+    d.wifi_stage = WifiStage::Connected;
+    d.wifi_recovered = 1;
+    if crate::status::wifi_line(&d) != "wifi: connected fw-crash=1 recovered=1" {
+        return TestResult::Fail("recovered and reconnected");
+    }
+    d.wifi_stage = WifiStage::Recovery;
+    d.wifi_crashes = 2;
+    d.wifi_err = 258;
+    d.wifi_detail = 0x1e;
+    if crate::status::wifi_line(&d)
+        != "wifi: recovery FAILED step=258 detail=0x0000001e fw-crash=2 recovered=1"
+    {
+        return TestResult::Fail("failed recovery");
+    }
+    d.wifi_crashes = 0;
+    d.wifi_stage = WifiStage::Control;
+    if crate::status::wifi_line(&d) != "wifi: control FAILED step=258 detail=0x0000001e" {
+        return TestResult::Fail("bring-up failure without a crash");
+    }
+    if WifiStage::from_u8(10) != WifiStage::Recovery || WifiStage::Recovery.as_str() != "recovery" {
+        return TestResult::Fail("Recovery stage encoding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("fb", smoke_fb_status_wifi_line);

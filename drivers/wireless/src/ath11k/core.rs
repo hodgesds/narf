@@ -214,6 +214,14 @@ pub trait QmiFw {
     fn irq_pending(&self) -> bool {
         false
     }
+    /// The firmware half of a recovery, up to the point Linux queues
+    /// `restart_work`: with `power_cycle` (`ath11k_core_reset`)
+    /// `ath11k_hif_power_down` + `ath11k_hif_power_up` first; then the QMI
+    /// event work until FW_INIT_DONE / FW_READY. The default cannot
+    /// recover.
+    fn recover(&mut self, _power_cycle: bool) -> impl Future<Output = Result<(), WlfwError>> {
+        async { Err(WlfwError::new(wlfw::step::UNSUPPORTED, 1, EOPNOTSUPP)) }
+    }
 }
 
 impl<P, F, A> QmiFw for wlfw::Wlfw<P, F, A>
@@ -255,6 +263,18 @@ where
     }
     fn irq_pending(&self) -> bool {
         self.client.pipe.irqs_pending()
+    }
+    async fn recover(&mut self, power_cycle: bool) -> Result<(), WlfwError> {
+        if power_cycle {
+            self.client
+                .pipe
+                .power_cycle()
+                .await
+                .map_err(|e| WlfwError::new(e.step, e.detail, e.errno))?;
+            // qcom_mhi_qrtr_remove + qcom_mhi_qrtr_probe.
+            self.endpoint_reset();
+        }
+        self.run_to_fw_restart().await
     }
 }
 
@@ -540,6 +560,16 @@ impl<H: Hif, Q: QmiFw> Ath11kCore<H, Q> {
     /// `true` once WMI READY arrived and every hook ran.
     pub fn is_ready(&self) -> bool {
         self.state == CoreState::Ready
+    }
+
+    /// The transport, the QMI session and the configuration back, for a
+    /// restart (`ath11k_core_reconfigure_on_crash`): everything else —
+    /// HTC and its endpoints, WMI (`ath11k_wmi_detach`), the service maps
+    /// and capabilities, queued events — is dropped. The next
+    /// [`Self::new`] runs `ath11k_wmi_attach` + `ath11k_htc_init` again,
+    /// as `ath11k_core_start` does.
+    pub fn into_parts(self) -> (H, Q, CoreConfig) {
+        (self.hif, self.qmi, self.cfg)
     }
 
     // ── RX dispatch ───────────────────────────────────────────────

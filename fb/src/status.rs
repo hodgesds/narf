@@ -90,10 +90,37 @@ fn change_signature() -> u64 {
     mix(&mut h, diag.first_pf_seen as u64);
     mix(&mut h, diag.wifi_stage as u64);
     mix(&mut h, diag.wifi_err as u64);
+    mix(&mut h, diag.wifi_crashes as u64);
+    mix(&mut h, diag.wifi_recovered as u64);
     for b in diag.phase.as_str().bytes() {
         mix(&mut h, b as u64);
     }
     h
+}
+
+/// The panel's Wi-Fi line: furthest stage reached + the first failing
+/// step (driver-defined code + detail word), and the firmware crash /
+/// recovery counts once a crash happened. Bare-metal laptops have no
+/// serial, so this is how a stuck firmware boot or a crash loop is
+/// located.
+pub fn wifi_line(diag: &narf_memory::diag::Snapshot) -> alloc::string::String {
+    let mut s = if diag.wifi_err != 0 {
+        format!(
+            "wifi: {} FAILED step={} detail={:#010x}",
+            diag.wifi_stage.as_str(),
+            diag.wifi_err,
+            diag.wifi_detail,
+        )
+    } else {
+        format!("wifi: {}", diag.wifi_stage.as_str())
+    };
+    if diag.wifi_crashes != 0 {
+        s.push_str(&format!(
+            " fw-crash={} recovered={}",
+            diag.wifi_crashes, diag.wifi_recovered
+        ));
+    }
+    s
 }
 
 /// Paint the status panel into the bottom of the active FB. Best-
@@ -327,19 +354,7 @@ pub fn paint(fb: &FbWriter) {
         )
     };
 
-    // Wi-Fi bring-up: furthest stage reached + the first failing step
-    // (driver-defined code + detail word). Bare-metal laptops have no
-    // serial, so this is how a stuck firmware boot is located.
-    let wifi_line = if diag.wifi_err != 0 {
-        format!(
-            "wifi: {} FAILED step={} detail={:#010x}",
-            diag.wifi_stage.as_str(),
-            diag.wifi_err,
-            diag.wifi_detail,
-        )
-    } else {
-        format!("wifi: {}", diag.wifi_stage.as_str())
-    };
+    let wifi_line = wifi_line(&diag);
 
     let header = [
         diag_line.as_str(),

@@ -55,6 +55,7 @@ use super::hw::{HwRev, MSI_CONFIG_ONE, MSI_CONFIG_QCA6390, RING_MASK_QCA6390};
 use super::iface::{Ath11kNetdev, Sinks};
 use super::mac::{Mac, MacConfig};
 use super::mac_tests::{beacon, FwCfg, World, BSSID, OWN, PMK, SSID};
+use super::mhi_host::MhiNotify;
 use super::power::ChipIo;
 use super::runtime::{self, DpHooks, DpIrq, Port, Rt, Shared};
 use super::tx_hdr::{self, SeqState, StaTx};
@@ -184,6 +185,12 @@ struct TestQmi {
     notice: Option<FwNotice>,
     /// `irq_pending` answers.
     irq: bool,
+    /// `recover(power_cycle)` calls.
+    recovers: Vec<bool>,
+    /// What `recover` returns.
+    recover_fail: Option<WlfwError>,
+    /// The device model a power cycle resets.
+    dev: Option<Arc<Dev>>,
 }
 
 impl QmiFw for TestQmi {
@@ -204,6 +211,18 @@ impl QmiFw for TestQmi {
     }
     fn irq_pending(&self) -> bool {
         self.irq
+    }
+    async fn recover(&mut self, power_cycle: bool) -> Result<(), WlfwError> {
+        self.recovers.push(power_cycle);
+        if let Some(e) = self.recover_fail {
+            return Err(e);
+        }
+        if power_cycle {
+            if let Some(d) = &self.dev {
+                d.power_cycle();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -386,6 +405,8 @@ struct DevState {
     /// How the device releases transmitted MSDUs on WBM2SW0.
     tx_rel: TxRel,
     peers: Vec<(u32, [u8; 6], u16)>,
+    /// Power cycles since the rig was built.
+    boots: u32,
 }
 
 struct Dev {
@@ -422,6 +443,7 @@ impl Dev {
                 rx_attn1: 0,
                 tx_rel: TxRel::default(),
                 peers: Vec::new(),
+                boots: 0,
             }),
         })
     }
@@ -633,6 +655,39 @@ impl Dev {
         st.rings.lmac[0] = refill;
     }
 
+    /// SoC reset + firmware boot (`ath11k_hif_power_down` /
+    /// `ath11k_hif_power_up`): the target forgets every ring, peer and
+    /// pending message; the firmware's HTC / WMI script starts over. The
+    /// access point keeps running.
+    fn power_cycle(&self) {
+        let mut st = self.st.borrow_mut();
+        let script = st.fw.s.clone();
+        st.fw = Fw::new(script);
+        // The rebooted firmware starts its LMAC ring pointers at 0 (the
+        // host does not clear them: Linux's srng setup leaves LMAC
+        // rdp / wrp words alone).
+        for r in st.rings.lmac.iter() {
+            if r.hw_ptr != 0 {
+                phys_wr32(r.hw_ptr, 0);
+            }
+        }
+        st.rings = Rings::default();
+        st.peers.clear();
+        st.dp_pending = 0;
+        st.rx_queue.clear();
+        st.world.events.clear();
+        st.world.eapol_rx.clear();
+        st.boots += 1;
+        drop(st);
+        self.chip().device_reset();
+        // The SoC reset clears the UMAC ring registers: the rings are
+        // learned again once the host programs them.
+        for r0 in [TCL1_R0, WBM2SW0_R0, REO2SW1_R0, REO_CMD_R0, REO_STATUS_R0] {
+            self.chip().write32(r0, 0);
+            self.chip().write32(r0 + 4, 0);
+        }
+    }
+
     /// What the target does between two host waits.
     fn step(&self) {
         let mut st = self.st.borrow_mut();
@@ -745,7 +800,11 @@ fn rig(script: Script, cfg: FwCfg, sizes: DpRingSizes) -> (TCore, DpHooks, Arc<D
         on_start: noop,
         clock,
     };
-    let core = match Ath11kCore::new(hif, TestQmi::default(), core_tests::cfg()) {
+    let qmi = TestQmi {
+        dev: Some(dev.clone()),
+        ..TestQmi::default()
+    };
+    let core = match Ath11kCore::new(hif, qmi, core_tests::cfg()) {
         Ok(c) => c,
         Err(_) => panic!("Ath11kCore::new"),
     };
@@ -3441,4 +3500,301 @@ fn smoke_ath11k_int_fw_transport_service() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_ath11k_int_fw_transport_service
+);
+
+// ── firmware crash recovery ───────────────────────────────────────
+
+/// Raise a transport notice the next runtime pass picks up.
+fn crash(u: &Up, n: FwNotice) {
+    let mut g = run(u.shared.lock());
+    g.core.qmi.notice = Some(n);
+    g.core.qmi.irq = true;
+}
+
+fn htt_types(u: &Up) -> Vec<u8> {
+    u.dev.st.borrow().htt_h2t.iter().map(|m| m[0]).collect()
+}
+
+/// The whole crash → recover → reconnected path on the composed fake:
+/// MHI RDDM (`ath11k_mhi_op_status_cb` → `reset_work`) while connected
+/// with WPA2; `ath11k_core_reset` (CRASH_FLUSH, pre-reconfigure, power
+/// cycle of the device model, QMI to FW_INIT_DONE), `restart_work` →
+/// `ath11k_core_reconfigure_on_crash` (DP / CE / HAL torn down after the
+/// reset, QMI firmware start, CE / HTC / WMI / DP again), the mac layer
+/// restarted, the 4-way handshake again and data through the new rings.
+fn smoke_ath11k_int_crash_recover_reconnect() -> TestResult {
+    check(|| {
+        let mut u = up(wpa2_cfg())?;
+        connect(&u)?;
+        ensure!(u.netdev.link_up(), "connected before the crash");
+        let rings = run(u.shared.lock()).core.hif.ce.hal.srng_ids();
+        let htt_before = htt_types(&u);
+        LINK_SEEN.lock().clear();
+        DISC_SEEN.lock().clear();
+        crash(&u, FwNotice::Reset(MhiNotify::EeRddm));
+        let (snap, err, _, stage) = latched(|| {
+            pump(&u, 1);
+            narf_memory::diag::snapshot()
+        });
+        ensure!(err == 0, "nothing latched");
+        ensure!(
+            snap.wifi_crashes == 1 && snap.wifi_recovered == 1,
+            "panel: fw-crash=1 recovered=1"
+        );
+        ensure!(
+            stage == narf_memory::diag::WifiStage::Connected,
+            "stage back to connected"
+        );
+        // ath11k_core_reset's half: one power cycle, then the restart.
+        {
+            let g = run(u.shared.lock());
+            ensure!(g.core.qmi.recovers == [true], "recover(power_cycle)");
+            ensure!(g.core.qmi.starts == 2, "QMI firmware start again");
+            ensure!(g.stats.fw_crash_counter == 1, "fw_crash_counter");
+            ensure!(g.stats.recoveries == 1, "recovery counted");
+            ensure!(g.reset.fail_cont_count == 0, "reconfig complete");
+            ensure!(!g.crash_flush && g.fw_notice.is_none(), "flags cleared");
+            ensure!(g.core.is_ready(), "core ready on the new firmware");
+            ensure!(
+                g.core.hif.ce.hal.srng_ids() == rings,
+                "the same rings set up again"
+            );
+            ensure!(g.link.authorized && g.link.ptk, "station authorized again");
+        }
+        ensure!(u.dev.st.borrow().boots == 1, "device power-cycled once");
+        // The new firmware saw the bring-up HTT sequence again.
+        let htt = htt_types(&u);
+        ensure!(
+            htt[..htt_before.len()] == htt_before[..]
+                && htt[htt_before.len()..].starts_with(&[0x0, 0xb, 0xb, 0xb, 0xb, 0xb, 0xb, 0xb]),
+            "VERSION_REQ + 7 SRING_SETUP after the reset"
+        );
+        // Carrier: off for the recovery, on after the reconnect.
+        ensure!(*LINK_SEEN.lock() == [false, true], "carrier off, then on");
+        ensure!(
+            *DISC_SEEN.lock() == [(1, false)],
+            "disconnect reported as a connection loss (reason 1)"
+        );
+        ensure!(
+            u.netdev.link_up() && u.netdev.connected_bssid() == Some(BSSID),
+            "reconnected to the AP"
+        );
+        ensure!(
+            u.netdev.stats.recovered.load(Ordering::Relaxed) == 1
+                && u.netdev.stats.reconnects.load(Ordering::Relaxed) == 1,
+            "netdev counters"
+        );
+        ensure!(
+            u.dev.st.borrow().world.ap.m4_ok,
+            "4-way handshake completed again"
+        );
+        // Data through the rebuilt DP rings.
+        let before = u.dev.st.borrow().tcl_tx.len();
+        let eth = ipv4_frame(&GW, &OWN, 0, &[7, 7]);
+        ensure!(
+            narf_net::iface::send_on(u.name, &eth).is_ok(),
+            "send after recovery"
+        );
+        let f = u
+            .tx_cons
+            .try_recv()
+            .ok()
+            .flatten()
+            .ok_or("frame on the TX ring")?;
+        run(u.netdev.tx_one(&f)).map_err(|_| "TX after recovery")?;
+        pump(&u, 2);
+        ensure!(
+            u.dev.st.borrow().tcl_tx.len() == before + 1,
+            "data frame on the new TCL ring"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_int_crash_recover_reconnect
+);
+
+/// Between the crash report and the recovery (CRASH_FLUSH): WMI sends
+/// fail with `-ESHUTDOWN` without waiting, waits end at once, data TX is
+/// refused, management frames in flight are freed; then a SERVER_EXIT
+/// recovery (the firmware restarted itself: no power cycle).
+fn smoke_ath11k_int_crash_flush_and_server_exit() -> TestResult {
+    check(|| {
+        let u = up(wpa2_cfg())?;
+        connect(&u)?;
+        // The firmware restarts on its own (its state is gone).
+        u.dev.power_cycle();
+        {
+            let mut g = run(u.shared.lock());
+            g.core.qmi.notice = Some(FwNotice::ServerExit);
+            g.core.qmi.irq = true;
+            let (_, _, _, stage) = latched(|| g.service());
+            ensure!(
+                stage == narf_memory::diag::WifiStage::Recovery,
+                "panel: recovery"
+            );
+            ensure!(g.crash_flush, "CRASH_FLUSH set");
+            ensure!(
+                (0..3).all(|q| g.txq.stop_reasons(q) & (1 << super::txq::reason::DRIVER) != 0),
+                "ieee80211_stop_queues (DRIVER)"
+            );
+            ensure!(
+                g.fw_notice == Some(FwNotice::ServerExit),
+                "notice kept for the runtime loop"
+            );
+            ensure!(
+                g.mgmt.pending == 0 && g.mgmt.bufs.is_empty(),
+                "mgmt TX freed"
+            );
+            ensure!(
+                g.link.bss.is_none() && !g.link.authorized,
+                "station data state dropped"
+            );
+            ensure!(
+                g.tx_eth(&ipv4_frame(&GW, &OWN, 0, &[1]), false) == Err(runtime::ESHUTDOWN),
+                "ath11k_dp_tx: -ESHUTDOWN"
+            );
+            // A second notice while one is pending is dropped.
+            g.core.qmi.notice = Some(FwNotice::Restart);
+            g.core.qmi.irq = true;
+            g.service();
+            ensure!(g.fw_notice == Some(FwNotice::ServerExit), "first kept");
+        }
+        let t0 = NOW.load(Ordering::Relaxed);
+        let cmd = WmiCmd {
+            cmd_id: wmi::WMI_PDEV_SET_PARAM_CMDID,
+            buf: vec![0; 16],
+        };
+        ensure!(
+            run(u.shared.wmi_send(&cmd)) == Err(runtime::ESHUTDOWN),
+            "WMI send: -ESHUTDOWN"
+        );
+        ensure!(
+            run(u.shared.wait_until(5_000, |_| None::<()>)).is_none(),
+            "wait released"
+        );
+        ensure!(
+            NOW.load(Ordering::Relaxed) - t0 < 100,
+            "no wait outlives the crash"
+        );
+        let (_, err, _, stage) = latched(|| pump(&u, 1));
+        ensure!(err == 0, "recovered without error");
+        ensure!(
+            stage == narf_memory::diag::WifiStage::Connected,
+            "reconnected"
+        );
+        let g = run(u.shared.lock());
+        ensure!(g.core.qmi.recovers == [false], "no power cycle");
+        ensure!(
+            (0..3).all(|q| g.txq.stop_reasons(q) == 0),
+            "queues woken by the reconfig"
+        );
+        ensure!(u.netdev.connected_bssid() == Some(BSSID), "link back");
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_int_crash_flush_and_server_exit
+);
+
+/// Recovery failures latch their step on the panel, park what the
+/// firmware was given and leave the device dead (control operations
+/// fail, the runtime loop ends); `ath11k_core_reset`'s failure gate
+/// declines a reset after too many failed recoveries.
+fn smoke_ath11k_int_recovery_failures() -> TestResult {
+    check(|| {
+        // The QMI handshake after the power cycle fails.
+        let u = up(wpa2_cfg())?;
+        run(u.shared.lock()).core.qmi.recover_fail =
+            Some(WlfwError::new(super::wlfw::step::SERVER_TIMEOUT, 1, 110));
+        crash(&u, FwNotice::Reset(MhiNotify::SysError));
+        let (_, err, detail, stage) = latched(|| pump(&u, 1));
+        ensure!(err == runtime::step::RECOVERY_FW, "RECOVERY_FW latched");
+        ensure!(
+            detail == (super::wlfw::step::SERVER_TIMEOUT << 16) | 1,
+            "detail = inner step / detail"
+        );
+        ensure!(
+            stage == narf_memory::diag::WifiStage::Recovery,
+            "stage stays recovery"
+        );
+        ensure!(u.shared.is_dead(), "device dead");
+        ensure!(u.shared.try_lock().is_none(), "runtime parked");
+        ensure!(
+            run(u.netdev.scan(ScanRequest {
+                ssids: Vec::new(),
+                channels: vec![6],
+                active: false,
+            }))
+            .is_err(),
+            "control operations fail"
+        );
+        ensure!(!u.netdev.link_up(), "carrier off");
+        drop(u);
+
+        // The restarted firmware never sends HTC READY.
+        let u = up(wpa2_cfg())?;
+        u.dev.st.borrow_mut().fw.s.send_ready = false;
+        crash(&u, FwNotice::Reset(MhiNotify::EeRddm));
+        // The core's own step latches first (first failure wins); the
+        // recovery's RECOVERY_CORE line follows on the console.
+        let (_, err, _, stage) = latched(|| pump(&u, 1));
+        ensure!(
+            err == super::core::step::HTC_READY_TIMEOUT,
+            "the restart's failing step latched"
+        );
+        ensure!(
+            stage != narf_memory::diag::WifiStage::Connected,
+            "not connected"
+        );
+        ensure!(u.shared.is_dead(), "dead after a failed restart");
+        drop(u);
+
+        // ath11k_core_reset's gate: FINAL failures in a row → ignored.
+        let u = up(wpa2_cfg())?;
+        {
+            let mut g = run(u.shared.lock());
+            g.reset.fail_cont_count = runtime::ATH11K_RESET_MAX_FAIL_COUNT_FINAL;
+        }
+        crash(&u, FwNotice::Reset(MhiNotify::EeRddm));
+        let (_, err, detail, _) = latched(|| pump(&u, 1));
+        ensure!(
+            err == runtime::step::RECOVERY_LIMIT && detail == 5,
+            "RECOVERY_LIMIT"
+        );
+        {
+            let mut g = run(u.shared.lock());
+            ensure!(
+                g.fw_notice.is_none() && !g.crash_flush && g.core.qmi.recovers.is_empty(),
+                "no reset"
+            );
+            // FIRST failures: declined inside the fail timeout, allowed
+            // after it.
+            g.reset.fail_cont_count = runtime::ATH11K_RESET_MAX_FAIL_COUNT_FIRST;
+            g.reset.reset_fail_timeout = NOW.load(Ordering::Relaxed) + 1_000;
+        }
+        crash(&u, FwNotice::Reset(MhiNotify::EeRddm));
+        let (_, err, _, _) = latched(|| pump(&u, 1));
+        ensure!(err == runtime::step::RECOVERY_LIMIT, "inside the timeout");
+        NOW.fetch_add(2_000, Ordering::Relaxed);
+        crash(&u, FwNotice::Reset(MhiNotify::EeRddm));
+        let (_, err, _, stage) = latched(|| pump(&u, 1));
+        ensure!(err == 0, "after the timeout: recovered");
+        ensure!(
+            stage == narf_memory::diag::WifiStage::DataPath,
+            "not connected before: data-path"
+        );
+        let g = run(u.shared.lock());
+        ensure!(
+            g.reset.fail_cont_count == 0 && g.core.qmi.recovers == [true],
+            "reset ran, fail count cleared"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_int_recovery_failures
 );

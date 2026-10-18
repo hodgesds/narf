@@ -216,12 +216,30 @@ pub trait MhiBus {
     fn irqs_pending(&self) -> bool {
         false
     }
+    /// The PCI side of `ath11k_pci_power_down` / `ath11k_pci_power_up`
+    /// around the MHI stop / start ([`MhiController::power_cycle`]).
+    fn hif_power(&self, _step: HifPower) {}
     /// `get_random_u32_inclusive(1, max)`.
     fn random_nonzero(&self, max: u32) -> u32;
     /// `status_cb` and milestones.
     fn notify(&self, _ev: MhiNotify) {}
     /// One console line.
     fn log(&self, _args: fmt::Arguments<'_>) {}
+}
+
+/// The PCI steps of an `ath11k_hif_power_down` + `ath11k_hif_power_up`
+/// cycle, in the order [`MhiController::power_cycle`] runs them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HifPower {
+    /// Before `ath11k_mhi_stop`: `ath11k_pci_aspm_restore`,
+    /// `ath11k_pci_force_wake`, `ath11k_pci_msi_disable`.
+    Down,
+    /// After it: `ath11k_pci_sw_reset(ab, false)`.
+    Reset,
+    /// `ath11k_pci_power_up` before `ath11k_mhi_start`:
+    /// `register_window = 0`, `ath11k_pci_sw_reset(ab, true)`,
+    /// `ath11k_pci_aspm_disable`, `ath11k_pci_msi_enable`.
+    Up,
 }
 
 /// `mhi_controller` fields ath11k fills in `ath11k_mhi_register` /
@@ -2608,6 +2626,146 @@ impl<B: MhiBus> MhiController<B> {
     /// `true` while an MHI interrupt waits to be serviced.
     pub fn irqs_pending(&self) -> bool {
         self.bus.irqs_pending()
+    }
+
+    // ── power down / power cycle (pm.c, init.c) ──────────────────
+
+    /// `mhi_power_down(mhi_cntrl, true)` (`__mhi_power_down` + the
+    /// DISABLE_DESTROY_DEVICE transition, `mhi_pm_disable_transition`)
+    /// followed by `mhi_unprepare_after_power_down` — ath11k's
+    /// `ath11k_mhi_stop` outside suspend.
+    pub async fn power_down(&mut self) {
+        if self.pm_state != pm::DISABLE {
+            // "If it's not a graceful shutdown, force MHI to linkdown
+            // state" — ath11k's is graceful.
+            let cur = self.tryset_pm_state(pm::SHUTDOWN_PROCESS);
+            if cur != pm::SHUTDOWN_PROCESS {
+                mlog!(
+                    self,
+                    "mhi: failed to move to state: {} from: {}",
+                    pm::name(pm::SHUTDOWN_PROCESS),
+                    pm::name(cur)
+                );
+                self.pm_state = pm::LD_ERR_FATAL_DETECT;
+            }
+            // "mark device inactive to avoid any further host processing"
+            self.ee = MhiEe::DISABLE_TRANSITION;
+            self.dev_state = MhiState::RESET;
+            self.disable_transition().await;
+        }
+        self.unprepare_after_power_down();
+    }
+
+    /// `mhi_pm_disable_transition(mhi_cntrl, destroy_device = true)`.
+    async fn disable_transition(&mut self) {
+        mlog!(
+            self,
+            "mhi: processing disable transition with PM state: {}",
+            pm::name(self.pm_state)
+        );
+        // "Trigger MHI RESET so that the device will not access host
+        // memory" (never skipped: NARF has no RDDM image).
+        if !pm::in_fatal_state(self.pm_state) {
+            self.set_mhi_state(MhiState::RESET);
+            let t = self.params.timeout_ms;
+            if self
+                .poll_reg_field(0, MHICTRL, MHICTRL_RESET_MASK, 0, POLL_INTERVAL_MS, t)
+                .await
+                .is_err()
+            {
+                mlog!(self, "mhi: device failed to clear MHI Reset");
+            }
+            // "Device will clear BHI_INTVEC as a part of RESET
+            // processing, hence re-program it"
+            self.write_reg(self.bhi, BHI_INTVEC, 0);
+            if !self.get_exec_env().in_pbl()
+                && self
+                    .poll_reg_field(0, MHISTATUS, MHISTATUS_READY_MASK, 1, POLL_INTERVAL_MS, t)
+                    .await
+                    .is_err()
+            {
+                mlog!(self, "mhi: device failed to enter READY state");
+            }
+        }
+        // mhi_destroy_device → qcom_mhi_qrtr_remove: qrtr_endpoint_unregister
+        // + mhi_unprepare_from_transfer. The channel RESET command is not
+        // sent (`mhi_device_get_sync` fails in SHUTDOWN_PROCESS: "Failed to
+        // reset channel, still resetting"); the host state is dropped.
+        for ci in [self.ipcr_ul.take(), self.ipcr_dl.take()]
+            .into_iter()
+            .flatten()
+        {
+            self.chans[ci].ch_state = ch_state::DISABLED;
+            if !self.chans[ci].offload_ch {
+                self.deinit_chan_ctxt(ci);
+            }
+        }
+        self.rx.clear();
+        // "Reset the ev rings and cmd rings"
+        if let (Some(ring), Some(ctxt)) = (self.cmd_ring.as_mut(), self.cmd_ctxt.as_ref()) {
+            ring.rp = 0;
+            ring.wp = 0;
+            let base = ctxt.rd64(CTXT_RBASE);
+            ctxt.wr64(CTXT_RP, base);
+            ctxt.wr64(CTXT_WP, base);
+        }
+        for i in 0..self.events.len() {
+            if self.events[i].offload_ev {
+                continue;
+            }
+            if let (Some(ring), Some(ctxt)) = (self.events[i].ring.as_mut(), self.er_ctxt.as_ref())
+            {
+                ring.rp = 0;
+                ring.wp = 0;
+                let off = i * CTXT_SIZE;
+                let base = ctxt.rd64(off + CTXT_RBASE);
+                ctxt.wr64(off + CTXT_RP, base);
+                ctxt.wr64(off + CTXT_WP, base);
+            }
+        }
+        let cur = self.tryset_pm_state(pm::DISABLE);
+        if cur != pm::DISABLE {
+            mlog!(
+                self,
+                "mhi: error moving from PM state: {} to: {}",
+                pm::name(cur),
+                pm::name(pm::DISABLE)
+            );
+        }
+    }
+
+    /// `mhi_unprepare_after_power_down`: the BHIe table goes, the context
+    /// arrays and rings are freed. NARF also forgets the controller's
+    /// per-boot state (wake vote, latched failure, queued transitions, a
+    /// pending reset request) so the next power-up starts clean.
+    fn unprepare_after_power_down(&mut self) {
+        self.fbc_image = None;
+        self.bhi = 0;
+        self.bhie = 0;
+        self.deinit_dev_ctxt();
+        self.wake_set = false;
+        self.dev_wake = 0;
+        self.pending_pkts = 0;
+        self.failure = None;
+        self.transitions.clear();
+        self.reset_request = None;
+    }
+
+    /// `ath11k_hif_power_down(ab, false)` + `ath11k_hif_power_up(ab)` on
+    /// PCI, the reset half of `ath11k_core_reset`: the PCI steps
+    /// ([`MhiBus::hif_power`]) around `ath11k_mhi_stop` and
+    /// `ath11k_mhi_start` (`mhi_prepare_for_power_up` +
+    /// `mhi_sync_power_up`, the firmware image downloaded again), then the
+    /// QRTR client's `mhi_prepare_for_transfer` on IPCR.
+    pub async fn power_cycle(&mut self) -> Result<(), MhiError> {
+        mlog!(self, "mhi: power cycle");
+        self.bus.hif_power(HifPower::Down);
+        self.power_down().await;
+        self.bus.hif_power(HifPower::Reset);
+        self.bus.hif_power(HifPower::Up);
+        self.prepare_for_power_up()?;
+        self.sync_power_up().await?;
+        self.prepare_for_transfer("IPCR").await
     }
 
     /// Wait up to `ms` for traffic, then service the rings.
