@@ -79,6 +79,9 @@ pub mod step {
     /// (detail: 1 no authority, 2 revoked, 3 duplicate name). Not fatal:
     /// the kernel stack path (`narf_net::iface`) is registered.
     pub const NET_REGISTER: u32 = 256;
+    /// Interface down (`ieee80211_do_stop`) could not delete the vdev
+    /// (console only, Linux warns; detail = the errno).
+    pub const IF_DOWN_VDEV_DELETE: u32 = 257;
 }
 
 pub const ETIMEDOUT: i32 = 110;
@@ -1321,11 +1324,12 @@ pub type PciShared = Shared<super::core::Bar0, MsiCeIrq, super::pci::Wlfw>;
 static STRANDED_RT: IrqSafeSpinLock<Option<Arc<PciShared>>> = IrqSafeSpinLock::new(None);
 
 /// After `ath11k_core_qmi_firmware_ready`: `ath11k_mac_register` (the
-/// mac layer from the bring-up events), then what opening the netdev
-/// does in Linux (`ath11k_mac_op_start`, `ath11k_mac_op_add_interface`
-/// via `ieee80211_do_open`), then the netdev and its tasks. Failures are
-/// latched by the layer that failed; nothing here panics or blocks the
-/// caller (it runs in the probe-spawned MHI task).
+/// mac layer from the bring-up events), then the netdev and its tasks.
+/// The hardware starts when the interface goes up (`ieee80211_do_open`
+/// → `ath11k_mac_op_start` + `ath11k_mac_op_add_interface`, in
+/// [`super::iface`]). Failures are latched by the layer that failed;
+/// nothing here panics or blocks the caller (it runs in the
+/// probe-spawned MHI task).
 pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
     let rt = Rt::new(core, dp);
     let caps = match rt.device_caps() {
@@ -1338,22 +1342,17 @@ pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
     };
     let initial_reg = rt.core.reg_info.clone();
     let shared = Shared::new(rt, narf_crypto::fill_random_bytes);
-    let mut mac = super::mac::Mac::new(
+    let mac = super::mac::Mac::new(
         Port(shared.clone()),
         Port(shared.clone()),
         caps.clone(),
         super::mac::MacConfig::wcn6855(),
         initial_reg.as_deref(),
     );
-    // Both latch + print their own step on failure.
-    if mac.start().await.is_err() || mac.add_interface().await.is_err() {
-        *STRANDED_RT.lock() = Some(shared);
-        return;
-    }
     let m = caps.mac_addr;
     let name = super::iface::register_pci(shared, mac, m);
     log(format_args!(
-        "{}: registered, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (data path up, vif 0)",
+        "{}: registered, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (data path up; starts on IFF_UP)",
         name, m[0], m[1], m[2], m[3], m[4], m[5]
     ));
 }

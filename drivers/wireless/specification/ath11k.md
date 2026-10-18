@@ -783,15 +783,33 @@ the runtime loop (`service_once`: service + deliver RX to the RX ring and
 operation holds the mac layer → carrier off on link loss; sleep ≤ 10 ms
 on the device interrupts) and the TX pump (TX ring → TXQs → TCL). The
 stack's send hook only queues on the TX ring (sync, no runtime lock).
-Carrier changes go to `narf_net::iface::set_link_state` (+
-`nl80211::notify_disconnect` when going down).
+Carrier changes go to `narf_net::iface::set_link_metadata` (+
+`nl80211::notify_disconnect` when going down); `IFF_UP` is the stack's.
+
+**Open / stop** (`ieee80211_do_open` / `ieee80211_do_stop`):
+`register_pci` installs `narf_net::iface::set_open_stop(name, hook)`;
+the hook (sync, lock-free) records the requested `IFF_UP`
+(`request_admin`), and whichever task next holds the mac layer — the
+runtime loop, or a scan / associate / disassociate — applies it
+(`sync_admin`). Open: `ath11k_mac_op_start` when not started, then
+`ath11k_mac_op_add_interface` (a failed add_interface stops again,
+`err_stop`); a failure (latched by the mac step) brings the interface
+back down through `set_link_state(name, false)`. Stop: if associated,
+`ieee80211_flush_queues(drop)` + the deauth with reason 3
+(`cfg80211_leave`), carrier off, TXQs purged,
+`ath11k_mac_op_remove_interface` (11d scan stop, VDEV_DELETE + wait ≤ 5 s
+for VDEV_DELETE_RESP; a failure is only logged, step 257), the vif's
+management TX IDR and DP vif state dropped, `ath11k_mac_op_stop`
+(monitor-status filter off, state OFF, scan timeout / 11d PREPARING
+cleared, `num_pending_mgmt_tx = 0`). Scan / associate on a down
+interface return `HardwareError` (nl80211's `-ENETDOWN`). The command-line
+autoconnect sets `IFF_UP` before its first attempt, as `ip link set up`
+precedes wpa_supplicant.
 
 `start_pci(core, dp)`: `Rt::new` → `device_caps` (SERVICE_READY /
 EXT / READY; `step::MAC_CAPS`) → `Mac::new(Port, Port, caps,
 MacConfig::wcn6855(), core.reg_info)` (`ath11k_mac_register`) →
-`mac.start()` + `mac.add_interface()` (what `ieee80211_do_open` does in
-Linux when userspace raises the interface; NARF does it at
-registration) → `register_pci`. Failures latch their layer's step; the
+`register_pci` (down; the hardware starts on `IFF_UP`). Failures latch their layer's step; the
 runtime is parked (`STRANDED_RT`), nothing panics, the init path never
 waits on it (all of it runs in the probe-spawned MHI task).
 
@@ -814,7 +832,8 @@ DP_MISSING 251 (hook 1 / 2 / 3), HTT_VER_SEND 252 (detail = core step),
 SRING_SETUP_SEND 253 (detail = index << 16 | core step), DP_IRQ_CONFIG
 254 (no "DP" MSI user), MAC_CAPS 255 (detail bits 1 EXT, 2 READY, 4 no
 pdev), NET_REGISTER 256 (console only; detail 1 no authority, 2
-revoked, 3 duplicate).
+revoked, 3 duplicate), IF_DOWN_VDEV_DELETE 257 (console only, Linux
+warns; detail = errno).
 
 Tests: `integration_tests.rs` — one composed fake device: `core_tests`'
 `Fw` behind `ce_tests`' `FakeChip` (HTC / WMI through the real CE
@@ -863,7 +882,8 @@ choice, a directed-scan connect on the fake device).
 - The PCI table is exactly Linux's `ath11k_pci_id_table`.
 - The driver never reports a wireless capability it does not have:
   `wlan%d` is registered only after the core, the data path and the mac
-  layer (start + station vif) are up; HE / 6 GHz association / WPA3 are
+  layer (`ath11k_mac_register`) are up, and opens (pdev start + station
+  vif) only on `IFF_UP`; HE / 6 GHz association / WPA3 are
   not advertised (HwCaps.he false, bands 2.4 / 5 GHz).
 - No lock is held across an `.await`: `Shared::rt` is taken for
   synchronous steps only; the mac-layer mutex is held across a control
@@ -1024,9 +1044,11 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   RX checksum verdict reaches frame-ring consumers only. Whether the TCL
   engine uses the seed or recomputes the pseudo-header on native-wifi
   frames is hardware-only (Linux passes the same seed).
-- Integration deviations from Linux (deliberate): `ath11k_mac_op_start`
-  + `add_interface` run at registration, not on `ip link set up`
-  (NARF's stack has no ndo_open hook for this driver); the TX
+- Integration deviations from Linux (deliberate): `ndo_open` is
+  asynchronous (`set_link_state` sets `IFF_UP` and returns; a failed open
+  takes the interface down again, where Linux's `dev_open` fails without
+  setting it), because the hook runs in the caller's syscall and the WMI
+  bring-up waits on the device; the TX
   queues are one FIFO per AC, not one TXQ per TID with mac80211's airtime
   round robin and fq_codel (one station; the AC order and stop reasons are
   Linux's), no A-MSDU / fast-xmit header cache, no TX status

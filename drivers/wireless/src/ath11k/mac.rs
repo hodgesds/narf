@@ -356,6 +356,8 @@ pub mod timeout {
     pub const EAPOL: u32 = 10_000;
     /// `ATH11K_CONNECTION_LOSS_HZ`.
     pub const CONNECTION_LOSS: u32 = 3000;
+    /// `ATH11K_VDEV_DELETE_TIMEOUT_HZ`.
+    pub const VDEV_DELETE: u32 = 5000;
     /// `IEEE80211_SCAN_RESULT_EXPIRE` (cfg80211 BSS expiry).
     pub const BSS_EXPIRE: u64 = 30_000;
 }
@@ -998,6 +1000,64 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             self.pdev_param(WMI_PDEV_PARAM_IDLE_PS_CONFIG, 1).await?;
         }
         Ok(())
+    }
+
+    /// `ar->state != ATH11K_STATE_OFF` (`ath11k_mac_op_start` ran).
+    pub fn is_started(&self) -> bool {
+        self.started
+    }
+
+    /// `ath11k_mac_op_stop`: the monitor-status filter off (a failure is
+    /// only logged, "failed to clear rx_filter for monitor status ring"),
+    /// `ATH11K_STATE_OFF`, the scan timeout cancelled, an 11d scan still
+    /// PREPARING back to IDLE. The pending management TX count is the
+    /// runtime's (`atomic_set(&ar->num_pending_mgmt_tx, 0)` there).
+    pub async fn stop(&mut self) {
+        if !self.started {
+            return;
+        }
+        if let Err(e) = self.dp.mon_status_default(false).await {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ath11k: mac: failed to clear rx_filter for monitor status ring: (-{})",
+                e
+            );
+        }
+        self.started = false;
+        self.scan.deadline = None;
+        if self.state_11d == State11d::Preparing {
+            self.state_11d = State11d::Idle;
+        }
+    }
+
+    /// `ath11k_mac_op_remove_interface` for the station vif (after
+    /// `ieee80211_do_stop` disconnected it): `ath11k_mac_11d_scan_stop`,
+    /// `ath11k_mac_vdev_delete` (WMI_VDEV_DELETE_CMDID, wait ≤
+    /// `ATH11K_VDEV_DELETE_TIMEOUT_HZ` for WMI_VDEV_DELETE_RESP_EVENTID);
+    /// the vif is gone either way (`err_vdev_del` continues). Linux only
+    /// warns: a failure's errno is returned for the caller to log.
+    pub async fn remove_interface(&mut self) -> Result<(), i32> {
+        let Some(v) = self.vif.clone() else {
+            return Ok(());
+        };
+        // The only vif is a station (WMI_VDEV_TYPE_STA).
+        self.scan_11d_stop().await;
+        self.pending.vdev_deleted = None;
+        let r = match self.wmi.send(vdev_delete_cmd(v.vdev_id as u8)).await {
+            Err(e) => Err(e),
+            Ok(()) => {
+                let id = v.vdev_id;
+                self.wait_for(timeout::VDEV_DELETE, |m| {
+                    (m.pending.vdev_deleted == Some(id)).then_some(())
+                })
+                .await
+                .ok_or(errno::ETIMEDOUT)
+            }
+        };
+        self.pending.vdev_deleted = None;
+        self.vif = None;
+        r
     }
 
     /// `ath11k_reg_update_chan_list` → `ath11k_wmi_send_scan_chan_list_cmd`.

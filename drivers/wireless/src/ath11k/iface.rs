@@ -58,9 +58,13 @@ pub type RtMac<Io, Irq, Q> = Mac<Port<Io, Irq, Q>, Port<Io, Irq, Q>>;
 pub struct Sinks {
     /// `netif_receive_skb` (`narf_net::iface::on_rx_frame_from`).
     pub rx: fn(&str, &mut [u8]),
-    /// Carrier on / off (`narf_net::iface::set_link_state`, plus the
-    /// nl80211 disconnect event when going down).
+    /// Carrier on / off (`netif_carrier_on/off`:
+    /// `narf_net::iface::set_link_metadata`, plus the nl80211 disconnect
+    /// event when going down).
     pub link: fn(&str, bool),
+    /// `IFF_UP` changed by the driver itself: an open that failed brings
+    /// the interface back down (`narf_net::iface::set_link_state`).
+    pub admin: fn(&str, bool),
 }
 
 /// What `get_wireless_info` reports, captured from the mac layer at
@@ -115,6 +119,8 @@ pub struct Ath11kNetdev<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     radio: RadioInfo,
     sinks: Sinks,
     up: AtomicBool,
+    /// `IFF_UP` as the stack last requested it (`ndo_open` / `ndo_stop`).
+    admin_up: AtomicBool,
     /// bit 63 = associated, low 48 bits = BSSID (LE).
     bssid: AtomicU64,
     channel: AtomicU32,
@@ -167,6 +173,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
                 radio,
                 sinks,
                 up: AtomicBool::new(false),
+                admin_up: AtomicBool::new(false),
                 bssid: AtomicU64::new(0),
                 channel: AtomicU32::new(0),
                 rx_ring: IrqSafeSpinLock::new(Some(rx_cons)),
@@ -201,6 +208,94 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         if was != up {
             (self.sinks.link)(self.name, up);
         }
+    }
+
+    /// The stack's `ndo_open` / `ndo_stop` (`narf_net::iface::set_open_stop`):
+    /// record `IFF_UP`. Sync and lock-free (it runs in the caller's
+    /// syscall); the runtime loop, or the next control operation, applies
+    /// it under the mac layer ([`Self::sync_admin`]).
+    pub fn request_admin(&self, up: bool) {
+        self.admin_up.store(up, Ordering::Release);
+    }
+
+    /// `IFF_UP` as requested.
+    pub fn admin_up(&self) -> bool {
+        self.admin_up.load(Ordering::Acquire)
+    }
+
+    /// Bring the mac layer to the requested administrative state, holding
+    /// it. `true` while the interface is open (hardware started, station
+    /// vif added).
+    pub async fn sync_admin(&self, m: &mut RtMac<Io, Irq, Q>) -> bool {
+        let want = self.admin_up();
+        let open = m.vif().is_some();
+        if want && !open {
+            if self.do_open(m).await.is_err() {
+                // dev_open failed: the device stays down.
+                self.admin_up.store(false, Ordering::Release);
+                (self.sinks.admin)(self.name, false);
+                return false;
+            }
+            return true;
+        }
+        if !want && open {
+            self.do_stop(m).await;
+            return false;
+        }
+        open
+    }
+
+    /// `ieee80211_do_open` for the station vif: `drv_start`
+    /// (`ath11k_mac_op_start`) when the hardware is not running
+    /// (`local->open_count == 0`), then `drv_add_interface`; a failed
+    /// add_interface stops the hardware again (`err_stop`). Each step
+    /// latches its own mac step on failure. The carrier stays off until
+    /// association.
+    async fn do_open(&self, m: &mut RtMac<Io, Irq, Q>) -> Result<(), super::mac::MacError> {
+        let started_here = !m.is_started();
+        if started_here {
+            m.start().await?;
+        }
+        if let Err(e) = m.add_interface().await {
+            if started_here {
+                m.stop().await;
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// `dev_close` for the station: NETDEV_GOING_DOWN (`cfg80211_leave` →
+    /// `cfg80211_disconnect(WLAN_REASON_DEAUTH_LEAVING)`, carrier off),
+    /// then `ieee80211_do_stop` (TXQs purged, `drv_remove_interface` →
+    /// `ath11k_mac_op_remove_interface`, the vif's management TX IDR
+    /// entries freed, `drv_stop` → `ath11k_mac_op_stop` with
+    /// `num_pending_mgmt_tx = 0`).
+    async fn do_stop(&self, m: &mut RtMac<Io, Irq, Q>) {
+        if m.link().is_some() {
+            self.shared.flush_queues(true).await;
+            let _ = m.disassociate().await;
+        }
+        self.set_link(false, None, 0);
+        self.shared.lock().await.purge_txqs();
+        if let Err(e) = m.remove_interface().await {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ath11k: {}: failed to delete vdev: (-{}) (step {})",
+                self.name,
+                e,
+                super::runtime::step::IF_DOWN_VDEV_DELETE
+            );
+        }
+        {
+            let mut g = self.shared.lock().await;
+            // ath11k_mac_vif_txmgmt_idr_remove; the ath11k_vif (and its
+            // ath11k_dp_vdev_tx_attach state) goes with the vif.
+            g.mgmt = super::runtime::MgmtTx::default();
+            g.link.vif = None;
+        }
+        m.stop().await;
     }
 
     /// The stack's send hook (`ieee80211_subif_start_xmit`): queue an
@@ -346,6 +441,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         let frames = self.shared.take_rx().await;
         let n = self.deliver(frames);
         if let Some(mut m) = self.mac.try_lock() {
+            self.sync_admin(&mut m).await;
             if m.poll().await.is_some() {
                 self.stats.link_losses.fetch_add(1, Ordering::Relaxed);
                 // ieee80211_set_disassoc → ieee80211_flush_queues(drop).
@@ -455,11 +551,18 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
 
     async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
         let mut m = self.mac.lock().await;
+        // nl80211 refuses a scan on a down interface (-ENETDOWN).
+        if !self.sync_admin(&mut m).await {
+            return Err(WirelessError::HardwareError);
+        }
         m.scan(&req).await
     }
 
     async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError> {
         let mut m = self.mac.lock().await;
+        if !self.sync_admin(&mut m).await {
+            return Err(WirelessError::HardwareError);
+        }
         m.associate(&req).await?;
         let b = m.connected_bssid();
         drop(m);
@@ -523,10 +626,21 @@ fn pci_drain() -> bool {
 }
 
 fn pci_link(name: &str, up: bool) {
-    narf_net::iface::set_link_state(name, up);
+    // netif_carrier_on / netif_carrier_off (IFF_UP is the stack's).
+    narf_net::iface::set_link_metadata(name, up, None, None);
     if !up {
         // WLAN_REASON_DEAUTH_LEAVING (cfg80211_disconnected).
         narf_wireless::nl80211::notify_disconnect(name, 3);
+    }
+}
+
+fn pci_admin(name: &str, up: bool) {
+    narf_net::iface::set_link_state(name, up);
+}
+
+fn pci_open_stop(_name: &str, up: bool) {
+    if let Some(dev) = ACTIVE.lock().clone() {
+        dev.request_admin(up);
     }
 }
 
@@ -577,6 +691,7 @@ pub fn register_pci(
         Sinks {
             rx: narf_net::iface::on_rx_frame_from,
             link: pci_link,
+            admin: pci_admin,
         },
     );
     let dev = Arc::new(dev);
@@ -585,7 +700,9 @@ pub fn register_pci(
     narf_net::iface::set_driver_info(name, "ath11k_pci", None, alloc::string::String::new());
     // ath11k_mac_register: hw->netdev_features = NETIF_F_HW_CSUM.
     narf_net::iface::set_offloads(name, super::tx_offload::OFFLOADS);
-    narf_net::iface::set_link_state(name, false);
+    // register_netdevice: down, no carrier; IFF_UP opens the hardware.
+    narf_net::iface::set_link_metadata(name, false, None, None);
+    narf_net::iface::set_open_stop(name, pci_open_stop);
     narf_net::iface::install_rx_drain(pci_drain);
     match narf_net::trusted_net_authority().and_then(|a| a.derive().ok()) {
         Some(authority) => {
@@ -627,6 +744,8 @@ pub fn register_pci(
                 name,
                 cfg
             );
+            // Like `ip link set wlan0 up` before wpa_supplicant connects.
+            narf_net::iface::set_link_state(name, true);
             narf_scheduler::spawn(super::autoconnect::run(dev, cfg));
         }
         Ok(None) => {}

@@ -427,6 +427,12 @@ impl World {
                     ));
                 }
             }
+            WMI_VDEV_DELETE_CMDID => {
+                self.events.push_back(event(
+                    WMI_VDEV_DELETE_RESP_EVENTID,
+                    &[tlv(WMI_TAG_VDEV_DELETE_RESP_EVENT, &le(&[w(1)]))],
+                ));
+            }
             WMI_VDEV_STOP_CMDID => {
                 self.events.push_back(event(
                     WMI_VDEV_STOPPED_EVENTID,

@@ -196,7 +196,15 @@ queue length, group/link mode, protocol/dormant/testing state, alias, physical
 carrier, driver-reported speed/duplex, carrier transition counts, and the
 complete `rtnl_link_stats64` counter set. `set_link_state` changes only
 administrative `IFF_UP`; a driver publishes an authoritative PHY sample with
-`set_link_metadata(name, carrier, speed_mbps, duplex)`. Common ingress and
+`set_link_metadata(name, carrier, speed_mbps, duplex)`. A driver whose
+hardware must be started on `IFF_UP` (`ndo_open` / `ndo_stop`) installs
+`iface::set_open_stop(name, hook: fn(&str, bool)) -> bool` after `register`
+(registration clears it); `set_link_state` calls the hook on every real
+transition, with the registry lock released and before NETDEV_UP / NETDEV_DOWN.
+The hook runs in the caller's context and must not block, so an asynchronous
+open completes in the driver's own task, which brings the interface back down
+with `set_link_state(name, false)` if it fails (Linux `dev_open` fails
+synchronously and never sets `IFF_UP`). Common ingress and
 egress paths update packet/byte/multicast/drop counters once, and procfs,
 sysfs, and rtnetlink consume the same snapshots rather than constructing
 compatibility-only values.

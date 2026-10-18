@@ -737,6 +737,7 @@ fn smoke_ath11k_step_codes_unique_and_in_range() -> TestResult {
                 super::runtime::step::DP_IRQ_CONFIG,
                 super::runtime::step::MAC_CAPS,
                 super::runtime::step::NET_REGISTER,
+                super::runtime::step::IF_DOWN_VDEV_DELETE,
             ],
         ),
     ];

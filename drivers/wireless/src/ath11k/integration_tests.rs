@@ -746,6 +746,16 @@ fn link_sink(_name: &str, up: bool) {
     LINK_SEEN.lock().push(up);
 }
 
+fn admin_sink(name: &str, up: bool) {
+    narf_net::iface::set_link_state(name, up);
+}
+
+fn test_open_stop(_name: &str, up: bool) {
+    if let Some(dev) = TEST_DEV.lock().clone() {
+        dev.request_admin(up);
+    }
+}
+
 fn test_send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let dev = TEST_DEV.lock().clone().ok_or(())?;
     dev.queue_tx(bytes, meta)
@@ -766,9 +776,28 @@ impl Drop for Up {
     }
 }
 
-/// `start_pci` for the test device: core + DP up, mac start + vif,
-/// netdev registered with the stack under a `wlan%d` name.
+/// `start_pci` + `ip link set up` for the test device: [`up_down`],
+/// then IFF_UP through the stack (`ndo_open` → mac start + vif on the
+/// next runtime pass).
 fn up(cfg: FwCfg) -> Result<Up, &'static str> {
+    let u = up_down(cfg)?;
+    ensure!(narf_net::iface::set_link_state(u.name, true), "IFF_UP");
+    let (_, err, _, _) = latched(|| pump(&u, 1));
+    ensure!(err == 0, "mac start over the runtime");
+    ensure!(
+        run(u.netdev.mac.lock())
+            .vif()
+            .is_some_and(|v| v.vdev_id == 0),
+        "vif 0"
+    );
+    LINK_SEEN.lock().clear();
+    Ok(u)
+}
+
+/// `start_pci` for the test device: core + DP up, the mac layer
+/// registered, the netdev registered with the stack under a `wlan%d`
+/// name, still down (hardware not started).
+fn up_down(cfg: FwCfg) -> Result<Up, &'static str> {
     let (mut core, mut hooks, dev) = rig(script(), cfg, SIZES);
     let (r, err, _, stage) = bring_up(&mut core, &mut hooks);
     ensure!(r.is_ok() && err == 0, "bring-up with the DP");
@@ -781,16 +810,13 @@ fn up(cfg: FwCfg) -> Result<Up, &'static str> {
     let caps = rt.device_caps().map_err(|_| "device caps")?;
     let reg = rt.core.reg_info.clone();
     let shared = Shared::new(rt, test_rng);
-    let mut mac = Mac::new(
+    let mac = Mac::new(
         Port(shared.clone()),
         Port(shared.clone()),
         caps.clone(),
         MacConfig::wcn6855(),
         reg.as_deref(),
     );
-    let (r, err, _, _) = latched(|| run(mac.start()));
-    ensure!(r.is_ok() && err == 0, "mac start over the runtime");
-    ensure!(run(mac.add_interface()) == Ok(0), "vif 0");
     let name = narf_net::iface::reserve_name("wlan%d");
     let (nd, tx_cons) = Ath11kNetdev::new(
         name,
@@ -800,12 +826,14 @@ fn up(cfg: FwCfg) -> Result<Up, &'static str> {
         Sinks {
             rx: rx_sink,
             link: link_sink,
+            admin: admin_sink,
         },
     );
     let netdev = Arc::new(nd);
     *TEST_DEV.lock() = Some(netdev.clone());
     narf_net::iface::register(name, caps.mac_addr, test_send);
     narf_net::iface::set_offloads(name, super::tx_offload::OFFLOADS);
+    narf_net::iface::set_open_stop(name, test_open_stop);
     RX_SEEN.lock().clear();
     LINK_SEEN.lock().clear();
     Ok(Up {
@@ -974,8 +1002,8 @@ fn smoke_ath11k_int_bring_up_to_netdev() -> TestResult {
         drop(st);
         let snap = narf_net::iface::lookup(u.name).ok_or("registered with the stack")?;
         ensure!(
-            snap.mac == FW_MAC && !snap.link_up,
-            "MAC from WMI READY, carrier off"
+            snap.mac == FW_MAC && snap.link_up && !snap.carrier,
+            "MAC from WMI READY, IFF_UP, carrier off"
         );
         ensure!(u.name.starts_with("wlan"), "wlan%d name");
         let nd = &u.netdev;
@@ -2214,3 +2242,150 @@ fn smoke_ath11k_int_tx_ac_priority() -> TestResult {
     })
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_tx_ac_priority);
+
+// ── ndo_open / ndo_stop ───────────────────────────────────────────
+
+/// `ieee80211_do_open` / `ieee80211_do_stop` on IFF_UP: registered down
+/// with the hardware not started (no WMI after bring-up, scan refused as
+/// nl80211's -ENETDOWN); `set_link_state(up)` starts the pdev
+/// (`ath11k_mac_op_start`: PMF_QOS first) and creates the vdev; down
+/// while associated sends the Deauthentication (reason 3,
+/// `cfg80211_leave`), drops the carrier, deletes the vdev (VDEV_DELETE,
+/// answered) and turns the monitor-status filter off (`op_stop`); a
+/// second up restarts everything and connects again; repeated or
+/// unchanged requests send nothing.
+fn smoke_ath11k_int_open_stop() -> TestResult {
+    check(|| {
+        let u = up_down(wpa2_cfg())?;
+        let wmi_len = |u: &Up| u.dev.st.borrow().wmi.len();
+        let n0 = wmi_len(&u);
+        pump(&u, 2);
+        ensure!(
+            wmi_len(&u) == n0 && run(u.netdev.mac.lock()).vif().is_none(),
+            "down: hardware not started"
+        );
+        ensure!(
+            run(u.netdev.scan(ScanRequest {
+                ssids: Vec::new(),
+                channels: vec![6],
+                active: false,
+            }))
+            .err()
+                == Some(narf_wireless::WirelessError::HardwareError),
+            "scan on a down interface refused"
+        );
+        ensure!(
+            !narf_net::iface::set_link_state("wlan-none", true),
+            "unknown"
+        );
+
+        ensure!(narf_net::iface::set_link_state(u.name, true), "IFF_UP");
+        ensure!(u.netdev.admin_up(), "ndo_open reached the driver");
+        let (_, err, _, _) = latched(|| pump(&u, 1));
+        ensure!(err == 0, "open latched nothing");
+        let opened = |u: &Up, from: usize| -> Vec<u32> {
+            u.dev.st.borrow().wmi[from..]
+                .iter()
+                .map(|c| c.cmd_id)
+                .collect()
+        };
+        let cmds = opened(&u, n0);
+        ensure!(
+            cmds.first() == Some(&wmi::WMI_PDEV_SET_PARAM_CMDID)
+                && cmds.contains(&wmi::WMI_VDEV_CREATE_CMDID),
+            "op_start then add_interface"
+        );
+        ensure!(
+            run(u.shared.lock()).link.vif.is_some(),
+            "ath11k_dp_vdev_tx_attach"
+        );
+        let n1 = wmi_len(&u);
+        ensure!(narf_net::iface::set_link_state(u.name, true), "again");
+        pump(&u, 2);
+        ensure!(wmi_len(&u) == n1, "IFF_UP twice: nothing new");
+
+        connect(&u)?;
+        ensure!(u.netdev.link_up(), "carrier on");
+        let n2 = wmi_len(&u);
+        let htt0 = u.dev.st.borrow().htt_h2t.len();
+        ensure!(narf_net::iface::set_link_state(u.name, false), "IFF_DOWN");
+        ensure!(!u.netdev.admin_up(), "ndo_stop reached the driver");
+        let (_, err, _, _) = latched(|| pump(&u, 1));
+        ensure!(err == 0, "stop latched nothing");
+        let cmds = opened(&u, n2);
+        let st = u.dev.st.borrow();
+        ensure!(
+            st.world
+                .mgmt
+                .last()
+                .is_some_and(|f| f[0] == 0xc0 && f[24..26] == [3, 0]),
+            "Deauthentication, reason 3 (DEAUTH_LEAVING)"
+        );
+        ensure!(
+            cmds.contains(&wmi::WMI_PEER_DELETE_CMDID)
+                && cmds.last() == Some(&wmi::WMI_VDEV_DELETE_CMDID),
+            "peer gone, then the vdev deleted"
+        );
+        ensure!(
+            st.htt_h2t.len() > htt0,
+            "op_stop: monitor-status RX filter cleared over HTT"
+        );
+        drop(st);
+        ensure!(
+            !u.netdev.link_up() && *LINK_SEEN.lock() == [true, false],
+            "carrier off"
+        );
+        ensure!(
+            run(u.netdev.mac.lock()).vif().is_none() && !run(u.netdev.mac.lock()).is_started(),
+            "vif removed, hardware stopped"
+        );
+        let g = run(u.shared.lock());
+        ensure!(
+            g.link.vif.is_none() && g.mgmt.pending == 0 && g.txq.is_empty(),
+            "DP vif state, mgmt IDR and TXQs cleared"
+        );
+        drop(g);
+        let n3 = wmi_len(&u);
+        ensure!(narf_net::iface::set_link_state(u.name, false), "down again");
+        pump(&u, 2);
+        ensure!(wmi_len(&u) == n3, "IFF_DOWN twice: nothing new");
+
+        // Up again: started from scratch, connects.
+        ensure!(narf_net::iface::set_link_state(u.name, true), "IFF_UP");
+        let (_, err, _, _) = latched(|| pump(&u, 1));
+        ensure!(err == 0, "reopen");
+        let cmds = opened(&u, n3);
+        ensure!(
+            cmds.first() == Some(&wmi::WMI_PDEV_SET_PARAM_CMDID)
+                && cmds.contains(&wmi::WMI_VDEV_CREATE_CMDID),
+            "restarted"
+        );
+        connect(&u)?;
+        ensure!(u.netdev.link_up(), "connected after reopen");
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_open_stop);
+
+/// The open runs from whichever task holds the mac layer first: a
+/// control operation right after IFF_UP (autoconnect's scan, before any
+/// runtime pass) opens the interface itself, then connects.
+fn smoke_ath11k_int_open_from_control_op() -> TestResult {
+    use super::autoconnect::{attempt, AutoCfg};
+    check(|| {
+        let u = up_down(wpa2_cfg())?;
+        ensure!(narf_net::iface::set_link_state(u.name, true), "IFF_UP");
+        let cfg = AutoCfg {
+            ssid: Some(SSID.to_vec()),
+            pmk: Some(PMK),
+        };
+        let (r, err, _, _) = latched(|| run(attempt(u.netdev.as_ref(), &cfg)));
+        ensure!(r == Ok(Some(BSSID)) && err == 0, "opened and connected");
+        ensure!(u.netdev.link_up(), "carrier on");
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_int_open_from_control_op
+);
