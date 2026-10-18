@@ -80,8 +80,10 @@ read-only otherwise. A ROOT_ITEM's generation changes only when its root
 block moves. A superblock copy and every tree node reach the device as one
 request. Lock-free readers verify each child against its parent pointer
 (generation, level, first key) and retry from the live root. Under
-`narf.disks=root-rw` no chunk is ever allocated or relocated (a full root is
-ENOSPC), NARF's own shared-root snapshot ioctl is refused, and full qgroups
+`narf.disks=root-rw` the whole-tree growth/balance path never runs; a full
+space allocates one SINGLE/DUP chunk by path COW instead
+(`write::alloc_chunk`, Linux `btrfs_alloc_chunk`, placed below the device's
+btrfs `total_bytes`), and a device with no hole left is ENOSPC; NARF's own shared-root snapshot ioctl is refused, and full qgroups
 are left inconsistent with a rescan pending instead of being recounted. The
 last view of a writable core commits what it holds.
 

@@ -642,15 +642,18 @@ fn smoke_btrfs_root_rw_never_grows() -> TestResult {
         narf_block::disk_policy::DiskPolicy::RootRw,
     ));
     let grow = poll_once(crate::write::grow_add_chunk(&vol));
-    let balance = poll_once(vol.balance_profiles(crate::volume::BalanceProfiles::default()));
+    let balance = poll_once(vol.balance_profiles(crate::volume::BalanceProfiles {
+        data: Some(crate::chunk::ChunkProfile::Dup),
+        ..Default::default()
+    }));
     narf_block::disk_policy::__set_policy_for_test(None);
+    // The whole-tree-repacking grow and balance never run on a production
+    // root (`alloc_chunk` grows it instead).
     if !matches!(grow, Some(Err(FsError::NoSpace))) {
-        return TestResult::Fail("chunk growth ran under root-rw");
+        return TestResult::Fail("whole-tree chunk growth ran under root-rw");
     }
-    // An empty profile set is a no-op either way; it must not have failed
-    // by writing.
-    if !matches!(balance, Some(Ok(_)) | Some(Err(FsError::Unsupported))) {
-        return TestResult::Fail("balance did something unexpected under root-rw");
+    if !matches!(balance, Some(Err(FsError::Unsupported))) {
+        return TestResult::Fail("balance ran under root-rw");
     }
     TestResult::Pass
 }
@@ -950,3 +953,176 @@ fn smoke_btrfs_truncate_inline_file_to_zero() -> TestResult {
     }
 }
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_truncate_inline_file_to_zero);
+
+// ── Incremental chunk allocation (root-rw growth) ───────────────────
+
+/// Sum of the device's DEV_EXTENT lengths, the dev_item's `bytes_used`, and
+/// the number of chunks / block groups, through the live trees.
+fn chunk_accounting(vol: &Vol) -> Result<(u64, u64, usize, usize), &'static str> {
+    let sb = vol.superblock();
+    let mut chunks = 0usize;
+    let mut dev_used = 0u64;
+    let Some(Ok(mut c)) = poll_once(btree::Cursor::seek(
+        &**vol,
+        sb.chunk_root,
+        &BtrfsKey::new(0, 0, 0),
+    )) else {
+        return Err("chunk tree unreadable");
+    };
+    while let Ok(Some((key, body))) = c.current() {
+        if key.item_type == format::CHUNK_ITEM_KEY {
+            chunks += 1;
+        }
+        if key.item_type == format::DEV_ITEM_KEY {
+            dev_used = le64(body, 16).unwrap_or(0);
+        }
+        if poll_once(c.advance()).is_none_or(|r| r.is_err()) {
+            return Err("chunk tree walk");
+        }
+    }
+    let (root_tree, _) = vol.root_tree_root();
+    let Some(Ok((dev_root, _))) = poll_once(crate::roots::find_root(
+        &**vol,
+        root_tree,
+        format::DEV_TREE_OBJECTID,
+    )) else {
+        return Err("dev tree");
+    };
+    let mut extents = 0u64;
+    let Some(Ok(mut c)) = poll_once(btree::Cursor::seek(
+        &**vol,
+        dev_root,
+        &BtrfsKey::new(0, 0, 0),
+    )) else {
+        return Err("dev tree unreadable");
+    };
+    while let Ok(Some((key, body))) = c.current() {
+        if key.item_type == format::DEV_EXTENT_KEY {
+            extents += le64(body, 24).unwrap_or(0);
+        }
+        if poll_once(c.advance()).is_none_or(|r| r.is_err()) {
+            return Err("dev tree walk");
+        }
+    }
+    let groups = match poll_once(crate::block_group::live_block_groups(&**vol)) {
+        Some(Ok(g)) => g.len(),
+        _ => return Err("block groups unreadable"),
+    };
+    Ok((extents, dev_used, chunks, groups))
+}
+
+/// `write::alloc_chunk` adds a DATA and a METADATA chunk by path COW: chunk
+/// item + dev_item bytes_used in the chunk tree, dev extents, block group,
+/// free space; the new space is then usable and everything survives a
+/// remount with consistent accounting and references.
+fn smoke_btrfs_incremental_chunk_alloc() -> TestResult {
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) if v.supports_writes() => v,
+        _ => return TestResult::Fail("bgt fixture did not mount writable"),
+    };
+    let Ok((ext0, used0, chunks0, groups0)) = chunk_accounting(&vol) else {
+        return TestResult::Fail("accounting unreadable");
+    };
+    if ext0 != used0 {
+        return TestResult::Fail("fixture's dev_item bytes_used differs from its extents");
+    }
+    for kind in [format::BLOCK_GROUP_DATA, format::BLOCK_GROUP_METADATA] {
+        if !matches!(
+            poll_once(crate::write::alloc_chunk(&vol, kind)),
+            Some(Ok(()))
+        ) {
+            return TestResult::Fail("alloc_chunk failed");
+        }
+    }
+    match chunk_accounting(&vol) {
+        Ok((ext, used, chunks, groups))
+            if ext == used && chunks == chunks0 + 2 && groups == groups0 + 2 && ext > ext0 => {}
+        Ok(_) => return TestResult::Fail("chunk/dev/block-group accounting is inconsistent"),
+        Err(why) => return TestResult::Fail(why),
+    }
+    // Fill well past the space the fixture had.
+    let f = match poll_once(vol.root().create("grown.bin")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let data: Vec<u8> = (0..24u32 << 20).map(|i| (i % 251) as u8).collect();
+    if !matches!(poll_once(f.write(0, &data)), Some(Ok(n)) if n == data.len()) {
+        return TestResult::Fail("write into the new chunk failed");
+    }
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("sync failed");
+    }
+    drop(f);
+    drop(vol);
+    let vol = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount after chunk allocation failed"),
+    };
+    if let Err(why) = super::snapshots::check_ref_counts(&vol) {
+        return TestResult::Fail(why);
+    }
+    match chunk_accounting(&vol) {
+        Ok((ext, used, chunks, _)) if ext == used && chunks == chunks0 + 2 => {}
+        _ => return TestResult::Fail("accounting lost across the remount"),
+    }
+    let f = match poll_once(vol.root().lookup_async("grown.bin")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("grown.bin lost"),
+    };
+    match read_all(&f, data.len() + 1) {
+        Some(got) if got == data => TestResult::Pass,
+        _ => TestResult::Fail("grown.bin content wrong"),
+    }
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_incremental_chunk_alloc);
+
+/// Under root-rw a full data space grows by `alloc_chunk` (never the
+/// whole-tree grow): a write larger than the free data space succeeds.
+fn smoke_btrfs_root_rw_write_allocates_chunk() -> TestResult {
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev) {
+        Ok(v) if v.supports_writes() => v,
+        _ => return TestResult::Fail("bgt fixture did not mount writable"),
+    };
+    let Ok((_, _, chunks0, _)) = chunk_accounting(&vol) else {
+        return TestResult::Fail("accounting unreadable");
+    };
+    narf_block::disk_policy::__set_policy_for_test(Some(
+        narf_block::disk_policy::DiskPolicy::RootRw,
+    ));
+    let result = (|| {
+        let f = poll_once(vol.root().create("big-under-root-rw.bin"))
+            .and_then(Result::ok)
+            .ok_or("create failed")?;
+        let chunk: Vec<u8> = alloc::vec![0x5a; 1 << 20];
+        for i in 0..96u64 {
+            match poll_once(f.write(i << 20, &chunk)) {
+                Some(Ok(n)) if n == chunk.len() => {}
+                Some(Err(FsError::NoSpace)) => return Err("ENOSPC although the device has room"),
+                _ => return Err("write failed"),
+            }
+        }
+        match poll_once(vol.sync_to_disk()) {
+            Some(Ok(())) => Ok(()),
+            _ => Err("sync failed"),
+        }
+    })();
+    narf_block::disk_policy::__set_policy_for_test(None);
+    if let Err(why) = result {
+        return TestResult::Fail(why);
+    }
+    match chunk_accounting(&vol) {
+        Ok((ext, used, chunks, _)) if ext == used && chunks > chunks0 => {}
+        Ok(_) => return TestResult::Fail("no chunk allocated, or accounting inconsistent"),
+        Err(why) => return TestResult::Fail(why),
+    }
+    match super::snapshots::check_ref_counts(&vol) {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_root_rw_write_allocates_chunk
+);

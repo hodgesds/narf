@@ -59,6 +59,7 @@ use narf_filesystem::FsError;
 
 use crate::allocator::Allocator;
 
+mod chunk_alloc;
 pub(crate) mod fileops;
 use crate::block_group::{self, BgHome};
 use crate::btree::{
@@ -1676,6 +1677,7 @@ async fn commit_batch_inner<B: BlockDevice + 'static>(
         batch.gen,
         batch.alloc,
         Txn {
+            chunk_alloc: None,
             fs: FsCommit {
                 // Empty, not missing: every one of these nodes was written by
                 // `batch_stage`. `new_blocks` below is what the commit needs —
@@ -1874,6 +1876,8 @@ struct Txn {
     /// Incompatibility bits made durable by this transaction. Bits are
     /// monotonic; in particular SIMPLE_QUOTA survives quota disable.
     incompat_flags_add: u64,
+    /// A new chunk this transaction allocates ([`chunk_alloc`]).
+    chunk_alloc: Option<chunk_alloc::ChunkAlloc>,
 }
 
 /// Persist replacement on-disk flags for the explicitly mounted subvolume.
@@ -1901,6 +1905,7 @@ pub(crate) async fn set_subvol_flags<B: BlockDevice + 'static>(
         gen,
         alloc,
         Txn {
+            chunk_alloc: None,
             fs: FsCommit {
                 nodes: Vec::new(),
                 new_blocks: Vec::new(),
@@ -2185,6 +2190,8 @@ pub(crate) struct CowState {
     /// with snapshots, so every committed block's COW follows Linux
     /// `update_ref_for_cow`.
     shared: Option<SharedCow>,
+    /// The chunk tree: new blocks come from the SYSTEM block groups.
+    system: bool,
 }
 
 /// Snapshot-aware COW state of one subvolume tree (see [`crate::backref`]).
@@ -2266,8 +2273,22 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
                 root,
                 root_level,
                 shared: None,
+                system: false,
             },
         })
+    }
+
+    /// [`Self::new`] for the chunk tree, whose blocks must live in a SYSTEM
+    /// block group (pass an [`Allocator::build_system`] allocator).
+    pub(crate) async fn new_system(
+        vol: &'a BtrfsVolume<B>,
+        gen: u64,
+        root: u64,
+        root_level: u8,
+    ) -> Result<Self, FsError> {
+        let mut cow = Self::new(vol, gen, root, root_level).await?;
+        cow.state.system = true;
+        Ok(cow)
     }
 
     /// [`Self::new`] for subvolume tree `tree_id`, whose blocks may be shared
@@ -2475,7 +2496,11 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
         if let Some(shared) = &self.state.shared {
             normalize_cow_header(&mut buf, shared.tree_id);
         }
-        let addr = alloc.alloc_node(self.vol)?;
+        let addr = if self.state.system {
+            alloc.alloc_system_node(self.vol)?
+        } else {
+            alloc.alloc_node(self.vol)?
+        };
         self.state
             .pending
             .insert(addr, (alloc::sync::Arc::new(buf), level));
@@ -3128,6 +3153,7 @@ async fn ensure_private_subvol<B: BlockDevice + 'static>(
         gen,
         alloc,
         Txn {
+            chunk_alloc: None,
             fs: FsCommit {
                 nodes,
                 new_blocks: new_meta
@@ -4469,6 +4495,7 @@ async fn commit_qgroup_edits<B: BlockDevice + 'static>(
         gen,
         alloc,
         Txn {
+            chunk_alloc: None,
             fs: unchanged_fs_commit(vol),
             dropped_data: Vec::new(),
             added_data: Vec::new(),
@@ -4592,6 +4619,7 @@ async fn quota_enable_mode<B: BlockDevice + 'static>(
         gen,
         alloc,
         Txn {
+            chunk_alloc: None,
             fs: unchanged_fs_commit(vol),
             dropped_data: Vec::new(),
             added_data: Vec::new(),
@@ -4677,6 +4705,7 @@ pub(crate) async fn quota_disable<B: BlockDevice + 'static>(
         gen,
         alloc,
         Txn {
+            chunk_alloc: None,
             fs: unchanged_fs_commit(vol),
             dropped_data: Vec::new(),
             added_data: Vec::new(),
@@ -4984,7 +5013,27 @@ async fn commit_txn<B: BlockDevice + 'static>(
     // (objectid 11) on a `BLOCK_GROUP_TREE` filesystem. Path COW touches only
     // the leaves the edits reach in either.
     let bg_home = block_group::bg_home(vol, root_tree).await?;
-    let bgs = block_group::read_block_groups(vol, bg_home.scan_root(old_ext)).await?;
+    let mut bgs = block_group::read_block_groups(vol, bg_home.scan_root(old_ext)).await?;
+    let mut fst_base = fst_base;
+    if let Some(chunk) = &txn.chunk_alloc {
+        // The new group is empty: one free extent spanning it, in extent
+        // form (`add_new_free_space` + `add_block_group_free_space`).
+        bgs.push((chunk.logical, chunk.length, chunk.bg_item.clone()));
+        bgs.sort_by_key(|&(start, _, _)| start);
+        let fst = fst_base.as_mut().ok_or(FsError::NoSpace)?;
+        let mut info = alloc::vec![0u8; 8];
+        info[0..4].copy_from_slice(&1u32.to_le_bytes());
+        leaf_insert_sorted(
+            fst,
+            &BtrfsKey::new(chunk.logical, format::FREE_SPACE_INFO_KEY, chunk.length),
+            &info,
+        )?;
+        leaf_insert_sorted(
+            fst,
+            &BtrfsKey::new(chunk.logical, format::FREE_SPACE_EXTENT_KEY, chunk.length),
+            &[],
+        )?;
+    }
 
     // csum tree: drop freed extents' csums, add new extents' csums.
     // Csum-tree edits, as a list rather than a whole-tree rewrite.
@@ -5039,6 +5088,17 @@ async fn commit_txn<B: BlockDevice + 'static>(
     }
     fs_freed.extend(txn.retired_meta.iter().copied());
     fs_freed.extend(meta_changes.released.iter().copied());
+    if let Some(chunk) = &txn.chunk_alloc {
+        fs_new_meta.extend(
+            chunk
+                .chunk
+                .new_blocks
+                .iter()
+                .map(|&(a, l)| (a, format::CHUNK_TREE_OBJECTID, l)),
+        );
+        fs_nodes.extend(chunk.chunk.nodes.clone());
+        fs_freed.extend(chunk.chunk.freed.iter().copied());
+    }
     let simple_deltas = match quota_mode {
         QuotaMode::Simple { enable_gen } => {
             simple_quota_deltas(
@@ -5271,6 +5331,13 @@ async fn commit_txn<B: BlockDevice + 'static>(
         // `update_block_group_item` writes to `btrfs_block_group_root()`: on a
         // block-group-tree filesystem the BLOCK_GROUP_ITEM rewrites go to tree
         // 11, never into the extent tree.
+        let mut ext_edits = ext_edits;
+        if let Some(chunk) = &txn.chunk_alloc {
+            ext_edits.push(Edit::Upsert(
+                BtrfsKey::new(chunk.logical, format::BLOCK_GROUP_ITEM_KEY, chunk.length),
+                chunk.bg_item.clone(),
+            ));
+        }
         let (ext_edits, bg_edits) = split_block_group_edits(ext_edits, bg_home);
         let ext_out = PathCow::new(vol, gen, old_ext, old_ext_level)
             .await?
@@ -5500,8 +5567,19 @@ async fn commit_txn<B: BlockDevice + 'static>(
     let incompat = le64(&raw, format::OFF_INCOMPAT_FLAGS)? | txn.incompat_flags_add;
     raw[format::OFF_INCOMPAT_FLAGS..format::OFF_INCOMPAT_FLAGS + 8]
         .copy_from_slice(&incompat.to_le_bytes());
+    if let Some(chunk) = &txn.chunk_alloc {
+        raw[88..96].copy_from_slice(&chunk.chunk.root.to_le_bytes());
+        raw[format::OFF_CHUNK_ROOT_LEVEL] = chunk.chunk.level;
+        raw[164..172].copy_from_slice(&gen.to_le_bytes()); // chunk_root_generation
+    }
     refresh_super_backups(&mut raw, &root_logical, old_gen)?;
     crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
+    if let Some(chunk) = &txn.chunk_alloc {
+        // The superblock copies carry each member's embedded dev_item.
+        vol.set_device_bytes_used(&chunk.dev_bytes_used)?;
+        vol.add_chunk_item_mapping(chunk.logical, &chunk.chunk_item)?;
+        vol.set_chunk_root(chunk.chunk.root, chunk.chunk.level);
+    }
     // Stage rather than write. The tree blocks are already out and
     // `commit_roots` below advances the in-memory roots, so readers see this
     // commit immediately; only durability is deferred. A crash before the
@@ -6065,6 +6143,7 @@ pub(crate) async fn create_subvolume_with_qgroup<B: BlockDevice + 'static>(
         gen,
         alloc,
         Txn {
+            chunk_alloc: None,
             fs: parent_commit,
             dropped_data: Vec::new(),
             added_data: Vec::new(),
@@ -6323,6 +6402,7 @@ pub(crate) async fn create_snapshot_with_qgroup<B: BlockDevice + 'static>(
         gen,
         alloc,
         Txn {
+            chunk_alloc: None,
             fs: parent_commit,
             dropped_data: Vec::new(),
             added_data: parent_added_data,
@@ -6597,6 +6677,7 @@ pub(crate) async fn destroy_subvolume<B: BlockDevice + 'static>(
         gen,
         alloc,
         Txn {
+            chunk_alloc: None,
             fs: parent_commit,
             dropped_data,
             added_data: Vec::new(),
@@ -8771,6 +8852,15 @@ async fn copy_chunk_to_relocation<B: BlockDevice + 'static>(
     Ok(())
 }
 
+/// Allocate one DATA or METADATA chunk incrementally (Linux
+/// `btrfs_alloc_chunk`; see [`chunk_alloc`]).
+pub(crate) async fn alloc_chunk<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    kind: u64,
+) -> Result<(), FsError> {
+    chunk_alloc::alloc_chunk(vol, kind).await
+}
+
 /// Grow the filesystem by allocating either one mixed block group or one DATA
 /// and one METADATA block group using the existing per-type RAID profiles. The
 /// transaction threads every new stripe through the chunk tree (`CHUNK_ITEM` +
@@ -8818,10 +8908,10 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     // the trees rewritten here, and its pinned extents are still withheld.
     // An empty batch left by `batch_gen` is discarded by the flush as well.
     //
-    // Never on a production root (`narf.disks=root-rw`): growing allocates
-    // chunks and balancing relocates them, both whole-tree rewrites of the
-    // chunk/device/extent trees this writer keeps for small test images. A
-    // full root is ENOSPC there, as on Linux before a balance.
+    // Never on a production root (`narf.disks=root-rw`): this growth and
+    // balance are whole-tree rewrites of the chunk/device/extent trees, kept
+    // for small test images. A production root grows by `alloc_chunk`
+    // (path COW, as Linux allocates a chunk) and balances under Linux.
     if crate::rw_gate::active_profile() == crate::rw_gate::Profile::RootRw {
         return Err(if profiles.is_none() && evacuate.is_none() {
             FsError::NoSpace

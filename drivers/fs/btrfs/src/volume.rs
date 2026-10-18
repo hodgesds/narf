@@ -2721,6 +2721,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// Record the root-tree (and, after chunk growth, chunk-tree) root levels
     /// a commit wrote into the superblock.
+    /// Publish a chunk-tree root a commit moved (chunk allocation).
+    pub(crate) fn set_chunk_root(&self, root: u64, level: u8) {
+        let mut g = self.state.lock();
+        g.superblock.chunk_root = root;
+        g.superblock.chunk_root_level = level;
+    }
+
     pub(crate) fn set_superblock_levels(&self, root_level: u8, chunk_root_level: Option<u8>) {
         let mut g = self.state.lock();
         g.superblock.root_level = root_level;
