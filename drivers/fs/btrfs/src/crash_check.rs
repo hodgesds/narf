@@ -46,10 +46,15 @@ pub fn register() {
         };
         let dev = entry.dev.clone();
         let members = crate::discover_members(dev.clone());
+        // `narf.btrfs_crash_subvol=@`: work inside a subvolume (the tall
+        // fixture's three-level `@` tree) instead of the default one.
+        let subvol = narf_boot::args()
+            .value("narf.btrfs_crash_subvol")
+            .map(|s| crate::volume::Subvol::Name(s.into()));
         match mode {
             "write" => {
                 let result = narf_scheduler::block_on(async {
-                    let vol = crate::registry::mount(&dev, members, None, false).await?;
+                    let vol = crate::registry::mount(&dev, members, subvol.clone(), false).await?;
                     let root = vol.root();
                     let file = root.create(FILE).await?;
                     let data: alloc::vec::Vec<u8> = (0..LEN).map(pattern).collect();
@@ -83,7 +88,7 @@ pub fn register() {
             "verify" => {
                 let verdict = narf_scheduler::block_on(async {
                     let vol: Arc<crate::volume::BtrfsVolume<narf_block::SyncBlock>> =
-                        crate::registry::mount(&dev, members, None, true).await?;
+                        crate::registry::mount(&dev, members, subvol.clone(), true).await?;
                     let file = vol.root().lookup_async(FILE).await?;
                     let mut buf = alloc::vec![0u8; LEN + 16];
                     let n = file.read(0, &mut buf).await?;
