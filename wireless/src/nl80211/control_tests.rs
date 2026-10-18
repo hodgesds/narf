@@ -6,6 +6,8 @@ use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 
 #[path = "permission_tests.rs"]
 mod permission;
+#[path = "supplicant_e2e_tests.rs"]
+mod supplicant_e2e;
 
 struct InterfaceStub {
     name: &'static str,
@@ -246,7 +248,7 @@ fn smoke_nl80211_authority_and_scan_completion() -> TestResult {
         .results
         .clone();
     if cached.len() != 1
-        || !scan_reply(index, &cached[0].0, &cached[0].1)
+        || !scan_reply(index, &cached[0].0, &cached[0].1, false)
             .attrs
             .windows(4)
             .any(|b| b == b"test")

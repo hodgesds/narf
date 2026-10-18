@@ -22,6 +22,7 @@ const NL80211_ATTR_IFTYPE: u16 = 5;
 const NL80211_ATTR_MAC: u16 = 6;
 const NL80211_ATTR_SUPPORTED_IFTYPES: u16 = 32;
 const NL80211_ATTR_SUPPORTED_COMMANDS: u16 = 50;
+const NL80211_ATTR_WDEV: u16 = 153;
 const NL80211_ATTR_PROTOCOL_FEATURES: u16 = 173;
 const NLA_F_NESTED: u16 = 1 << 15;
 const NL80211_IFTYPE_STATION: u32 = 2;
@@ -31,6 +32,7 @@ const NL80211_IFTYPE_P2P_CLIENT: u32 = 8;
 const GENL_CMD_CAP_DO: u32 = 1 << 1;
 const GENL_CMD_CAP_DUMP: u32 = 1 << 2;
 const ENODEV: i32 = 19;
+const EINVAL: i32 = 22;
 const EOPNOTSUPP: i32 = 95;
 
 /// `NL80211_ATTR_REASON_CODE`.
@@ -216,6 +218,8 @@ fn wiphy_attrs(
         33, // TRIGGER_SCAN
         46, // CONNECT
         48, // DISCONNECT
+        6,  // SET_INTERFACE
+        17, // GET_STATION
     ];
     // A userspace-SME driver additionally advertises the low-level MLME /
     // management-frame commands wpa_supplicant uses when it runs its own SME.
@@ -264,50 +268,100 @@ fn in_namespace(iface: &dyn crate::WirelessNetIface, namespace: u64) -> bool {
         == namespace
 }
 
+fn u32_of(raw: &[u8]) -> Result<u32, i32> {
+    raw.try_into().map(u32::from_ne_bytes).map_err(|_| EINVAL)
+}
+
+/// `nl80211_pre_doit` for `NL80211_FLAG_NEED_WIPHY`
+/// (`__cfg80211_rdev_from_attrs`): the wiphy named by `NL80211_ATTR_WIPHY`,
+/// `NL80211_ATTR_WDEV` or the netdev `NL80211_ATTR_IFINDEX` — wpa_supplicant
+/// asks by ifindex. None of them is -EINVAL; a netdev that is not wireless,
+/// or names disagreeing on the wiphy, -EINVAL; nothing found, or a wiphy in
+/// another namespace, -ENODEV. NARF hands out no wdev identifiers, so a
+/// `NL80211_ATTR_WDEV` never names one.
+fn wiphy_from_attrs(
+    interfaces: &[alloc::sync::Arc<dyn crate::WirelessNetIface>],
+    attrs: &[u8],
+    namespace: u64,
+) -> Result<usize, i32> {
+    let by_index = find_attr(attrs, NL80211_ATTR_WIPHY)
+        .map(u32_of)
+        .transpose()?;
+    let wdev = find_attr(attrs, NL80211_ATTR_WDEV);
+    let ifindex = find_attr(attrs, NL80211_ATTR_IFINDEX)
+        .map(u32_of)
+        .transpose()?;
+    if by_index.is_none() && wdev.is_none() && ifindex.is_none() {
+        return Err(EINVAL);
+    }
+    let mut wiphy = by_index
+        .map(|index| index as usize)
+        .filter(|index| *index < interfaces.len());
+    if let Some(ifindex) = ifindex {
+        if let Some(name) = narf_net::netlink_route::iface_name_for_index(ifindex)
+            .filter(|name| narf_net::iface::lookup_in(namespace, name).is_some())
+        {
+            let from_netdev = interfaces
+                .iter()
+                .position(|iface| iface.name() == name)
+                .ok_or(EINVAL)?;
+            if wiphy.is_some_and(|wiphy| wiphy != from_netdev) {
+                return Err(EINVAL);
+            }
+            wiphy = Some(from_netdev);
+        }
+    }
+    let wiphy = wiphy.ok_or(ENODEV)?;
+    if !in_namespace(interfaces[wiphy].as_ref(), namespace) {
+        return Err(ENODEV);
+    }
+    Ok(wiphy)
+}
+
 fn handle_in(command: u8, attrs: &[u8], dump: bool, namespace: u64) -> Result<Vec<GenlReply>, i32> {
     let interfaces = crate::registry::list();
     let replies: Vec<GenlReply> = match command {
-        NL80211_CMD_GET_WIPHY => interfaces
-            .iter()
-            .enumerate()
-            .filter(|(_, iface)| in_namespace(iface.as_ref(), namespace))
-            .filter(|(index, _iface)| {
-                dump || find_attr(attrs, NL80211_ATTR_WIPHY).is_some_and(|raw| {
-                    raw.len() == 4
-                        && u32::from_ne_bytes(raw.try_into().unwrap_or([0; 4])) == *index as u32
-                }) || find_attr(attrs, NL80211_ATTR_WIPHY_NAME).is_some_and(|raw| {
-                    raw.strip_suffix(&[0]).unwrap_or(raw) == alloc::format!("phy{index}").as_bytes()
+        NL80211_CMD_GET_WIPHY => {
+            let wanted = if dump {
+                None
+            } else {
+                Some(wiphy_from_attrs(&interfaces, attrs, namespace)?)
+            };
+            interfaces
+                .iter()
+                .enumerate()
+                .filter(|(_, iface)| in_namespace(iface.as_ref(), namespace))
+                .filter(|(index, _iface)| wanted.is_none_or(|wanted| wanted == *index))
+                .map(|(index, iface)| {
+                    let mut attrs = wiphy_attrs(
+                        index as u32,
+                        &iface.get_wireless_info(),
+                        Some(iface.as_ref()),
+                    );
+                    let psk = iface.supports_handshake_offload();
+                    let sae = iface.supports_sae_offload();
+                    if psk || sae {
+                        // CCMP (00-0F-AC:4) is the pairwise cipher for both
+                        // WPA2-PSK and WPA3-SAE Personal.
+                        push_attr(&mut attrs, 57, &0x000fac04u32.to_ne_bytes());
+                        // NL80211_ATTR_EXT_FEATURES is a little-endian bitmap:
+                        // bit 15 = 4WAY_HANDSHAKE_STA_PSK, bit 38 = SAE_OFFLOAD.
+                        let mut ext = alloc::vec![0u8; if sae { 5 } else { 2 }];
+                        if psk {
+                            ext[1] |= 0x80; // bit 15
+                        }
+                        if sae {
+                            ext[4] |= 0x40; // bit 38
+                        }
+                        push_attr(&mut attrs, 217, &ext);
+                    }
+                    GenlReply {
+                        command: NL80211_CMD_NEW_WIPHY,
+                        attrs,
+                    }
                 })
-            })
-            .map(|(index, iface)| {
-                let mut attrs = wiphy_attrs(
-                    index as u32,
-                    &iface.get_wireless_info(),
-                    Some(iface.as_ref()),
-                );
-                let psk = iface.supports_handshake_offload();
-                let sae = iface.supports_sae_offload();
-                if psk || sae {
-                    // CCMP (00-0F-AC:4) is the pairwise cipher for both
-                    // WPA2-PSK and WPA3-SAE Personal.
-                    push_attr(&mut attrs, 57, &0x000fac04u32.to_ne_bytes());
-                    // NL80211_ATTR_EXT_FEATURES is a little-endian bitmap:
-                    // bit 15 = 4WAY_HANDSHAKE_STA_PSK, bit 38 = SAE_OFFLOAD.
-                    let mut ext = alloc::vec![0u8; if sae { 5 } else { 2 }];
-                    if psk {
-                        ext[1] |= 0x80; // bit 15
-                    }
-                    if sae {
-                        ext[4] |= 0x40; // bit 38
-                    }
-                    push_attr(&mut attrs, 217, &ext);
-                }
-                GenlReply {
-                    command: NL80211_CMD_NEW_WIPHY,
-                    attrs,
-                }
-            })
-            .collect(),
+                .collect()
+        }
         NL80211_CMD_GET_INTERFACE => interfaces
             .iter()
             .enumerate()
@@ -382,10 +436,12 @@ pub(crate) const OPERATIONS: &[GenlOperation] = &[
     op(NL80211_CMD_GET_WIPHY, DO | DUMP, OPEN),
     op(NL80211_CMD_GET_INTERFACE, DO | DUMP, OPEN),
     op(NL80211_CMD_GET_PROTOCOL_FEATURES, DO, OPEN),
-    op(32, DUMP, OPEN), // GET_SCAN
-    op(33, DO, UNS),    // TRIGGER_SCAN
-    op(46, DO, UNS),    // CONNECT
-    op(48, DO, UNS),    // DISCONNECT
+    op(6, DO, UNS),          // SET_INTERFACE
+    op(17, DO | DUMP, OPEN), // GET_STATION
+    op(32, DUMP, OPEN),      // GET_SCAN
+    op(33, DO, UNS),         // TRIGGER_SCAN
+    op(46, DO, UNS),         // CONNECT
+    op(48, DO, UNS),         // DISCONNECT
     // Userspace-SME MLME + management-frame commands.
     op(37, DO, UNS),    // AUTHENTICATE
     op(38, DO, UNS),    // ASSOCIATE
@@ -402,11 +458,11 @@ pub(crate) const OPERATIONS: &[GenlOperation] = &[
     op(19, DO, UNS), // NEW_STATION
     op(20, DO, UNS), // DEL_STATION
 ];
+/// `nl80211_mcgrps`, in Linux's order. None carries `GENL_MCAST_CAP_*`, so
+/// `genl_bind` lets any socket join any of them. NARF publishes on config,
+/// scan and mlme; regulatory, vendor and nan exist so tools that join them
+/// (iw's event listener, wpa_supplicant) resolve every name Linux offers.
 const GROUPS: &[GenlMulticastGroup] = &[
-    GenlMulticastGroup {
-        name: "mlme",
-        id: 19,
-    },
     GenlMulticastGroup {
         name: "config",
         id: 17,
@@ -414,6 +470,22 @@ const GROUPS: &[GenlMulticastGroup] = &[
     GenlMulticastGroup {
         name: "scan",
         id: 18,
+    },
+    GenlMulticastGroup {
+        name: "regulatory",
+        id: 20,
+    },
+    GenlMulticastGroup {
+        name: "mlme",
+        id: 19,
+    },
+    GenlMulticastGroup {
+        name: "vendor",
+        id: 21,
+    },
+    GenlMulticastGroup {
+        name: "nan",
+        id: 22,
     },
 ];
 

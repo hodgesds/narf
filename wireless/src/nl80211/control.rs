@@ -21,11 +21,15 @@ mod tests;
 const EINVAL: i32 = 22;
 const EPERM: i32 = 1;
 const EBUSY: i32 = 16;
+const ENOENT: i32 = 2;
 const SCAN: u8 = 33;
 const GET_SCAN: u8 = 32;
 const CONNECT: u8 = 46;
 const ROAM: u8 = 47;
 const DISCONNECT: u8 = 48;
+const PORT_AUTHORIZED: u8 = 125;
+const SET_INTERFACE: u8 = 6;
+const GET_STATION: u8 = 17;
 // Userspace-SME MLME command numbers (nl80211_commands).
 const AUTHENTICATE: u8 = 37;
 const ASSOCIATE: u8 = 38;
@@ -197,6 +201,134 @@ fn authority(
     Err(EPERM)
 }
 
+/// Attributes NARF's CONNECT accepts. Beyond the ones that select the
+/// network and credential, these are what wpa_supplicant and NetworkManager
+/// send on every connect (`nl80211_connect_common`): advisory hints and
+/// capability overrides cfg80211 passes to the driver, and the control-port
+/// settings an offloading driver already honours. [`connect_side_attrs`]
+/// validates them as `nl80211_connect` / `nl80211_crypto_settings` do.
+const CONNECT_ATTRS: &[u16] = &[
+    3,   // IFINDEX
+    6,   // MAC (BSSID)
+    31,  // HT_CAPABILITY
+    38,  // WIPHY_FREQ
+    42,  // IE
+    52,  // SSID
+    53,  // AUTH_TYPE
+    66,  // USE_MFP
+    68,  // CONTROL_PORT
+    70,  // PRIVACY
+    73,  // CIPHER_SUITES_PAIRWISE
+    74,  // CIPHER_SUITE_GROUP
+    75,  // WPA_VERSIONS
+    76,  // AKM_SUITES
+    79,  // PREV_BSSID
+    102, // CONTROL_PORT_ETHERTYPE
+    103, // CONTROL_PORT_NO_ENCRYPT
+    148, // HT_CAPABILITY_MASK
+    152, // BG_SCAN_PERIOD
+    157, // VHT_CAPABILITY
+    176, // VHT_CAPABILITY_MASK
+    200, // MAC_HINT
+    201, // WIPHY_FREQ_HINT
+    204, // SOCKET_OWNER
+    254, // PMK (PSK 4-way handshake offload)
+    261, // EXTERNAL_AUTH_SUPPORT
+    277, // SAE_PASSWORD (SAE offload)
+    298, // SAE_PWE
+    315, // MLO_SUPPORT
+];
+
+/// `nl80211_connect`'s checks of the advisory attributes. The hints
+/// (MAC_HINT, WIPHY_FREQ_HINT, BG_SCAN_PERIOD, PREV_BSSID), the HT/VHT
+/// override masks and MLO_SUPPORT only steer driver BSS selection and are
+/// not acted on; CONTROL_PORT is what an offloading driver does anyway (no
+/// data before the 4-way handshake completes).
+fn connect_side_attrs(attrs: &[(u16, &[u8])]) -> Result<(), i32> {
+    for kind in [200u16, 79] {
+        if attr(attrs, kind).is_some_and(|b| b.len() != 6) {
+            return Err(EINVAL);
+        }
+    }
+    if let Some(freq) = u32_attr(attrs, 201)? {
+        channel(freq)?;
+    }
+    // An HT/VHT capability override needs its mask (-EINVAL).
+    if attr(attrs, 31).is_some() && attr(attrs, 148).is_none()
+        || attr(attrs, 157).is_some() && attr(attrs, 176).is_none()
+    {
+        return Err(EINVAL);
+    }
+    // EXTERNAL_AUTH_SUPPORT needs SOCKET_OWNER (-EINVAL).
+    if attr(attrs, 261).is_some() && attr(attrs, 204).is_none() {
+        return Err(EINVAL);
+    }
+    // Without WIPHY_FLAG_CONTROL_PORT_PROTOCOL only ETH_P_PAE is accepted.
+    if u16_attr(attrs, 102)?.is_some_and(|proto| proto != 0x888e) {
+        return Err(EINVAL);
+    }
+    Ok(())
+}
+
+/// The information elements wpa_supplicant puts in a WPA2-PSK CONNECT's
+/// NL80211_ATTR_IE: the RSN element it will advertise plus extended
+/// capabilities, RSNXE and vendor elements. The offloading driver builds
+/// its own RSN element (CCMP, PSK, no MFP), so a requested RSN element must
+/// describe exactly that suite; other elements are accepted but not
+/// forwarded. A second RSN element, or an MFP-required one, is refused.
+fn psk_association_ies(ie: &[u8]) -> Result<(), i32> {
+    let ies = elements(ie)?;
+    let mut rsn = ies.iter().filter(|(id, _)| *id == 48);
+    let Some((_, body)) = rsn.next() else {
+        return Ok(());
+    };
+    if rsn.next().is_some() {
+        return Err(EOPNOTSUPP);
+    }
+    let rsn = crate::rsn::RsnIe::decode_body(body).ok_or(EINVAL)?;
+    let ccmp = crate::rsn::Suite::standard(crate::rsn::CIPHER_CCMP_128);
+    if rsn.group_cipher != ccmp
+        || rsn.pairwise_ciphers != [ccmp]
+        || rsn.akms != [crate::rsn::Suite::standard(crate::rsn::AKM_PSK)]
+        || rsn.rsn_capabilities & crate::rsn::RSN_CAP_MFP_REQUIRED != 0
+    {
+        return Err(EOPNOTSUPP);
+    }
+    Ok(())
+}
+
+/// Split an information-element list (`validate_ie_attr`: well-formed
+/// element TLVs, else -EINVAL).
+fn elements(mut ie: &[u8]) -> Result<Vec<(u8, &[u8])>, i32> {
+    let mut out = Vec::new();
+    while !ie.is_empty() {
+        if ie.len() < 2 || ie.len() < 2 + ie[1] as usize {
+            return Err(EINVAL);
+        }
+        let len = ie[1] as usize;
+        out.push((ie[0], &ie[2..2 + len]));
+        ie = &ie[2 + len..];
+    }
+    Ok(out)
+}
+
+/// `nl80211_check_scan_flags`: flags that need a wiphy feature NARF never
+/// advertises are -EOPNOTSUPP (LOW_PRIORITY, RANDOM_ADDR and the
+/// ext-feature-gated bits 4..=12); FLUSH, AP and COLOCATED_6GHZ need none.
+/// FLUSH is what NARF always does — a scan replaces the cached results.
+/// FREQ_KHZ is refused because the frequency list would then be in kHz,
+/// which this handler does not decode.
+fn scan_flags(flags: u32) -> Result<(), i32> {
+    const LOW_PRIORITY: u32 = 1 << 0;
+    const RANDOM_ADDR: u32 = 1 << 3;
+    const FEATURE_GATED: u32 = 0x1ff0; // bits 4..=12
+    const FREQ_KHZ: u32 = 1 << 13;
+    if flags & (LOW_PRIORITY | RANDOM_ADDR | FEATURE_GATED | FREQ_KHZ) != 0 {
+        return Err(EOPNOTSUPP);
+    }
+    Ok(())
+}
+
 fn parse_operation(
     command: u8,
     attrs: &[(u16, &[u8])],
@@ -204,9 +336,9 @@ fn parse_operation(
     sae_offload: bool,
 ) -> Result<Operation, i32> {
     let allowed: &[u16] = match command {
-        SCAN => &[3, 44, 45],
-        // 254 = NL80211_ATTR_PMK (PSK offload), 277 = NL80211_ATTR_SAE_PASSWORD.
-        CONNECT => &[3, 6, 38, 42, 52, 53, 66, 70, 73, 74, 75, 76, 254, 277],
+        // 158 = NL80211_ATTR_SCAN_FLAGS, 42 = NL80211_ATTR_IE (probe IEs).
+        SCAN => &[3, 42, 44, 45, 158],
+        CONNECT => CONNECT_ATTRS,
         DISCONNECT => &[3, 54],
         _ => return Err(EOPNOTSUPP),
     };
@@ -215,6 +347,12 @@ fn parse_operation(
     }
     match command {
         SCAN => {
+            // wiphy max_scan_ie_len is 0 (NL80211_ATTR_MAX_SCAN_IE_LEN):
+            // nl80211_trigger_scan refuses longer extra IEs with -EINVAL.
+            if attr(attrs, 42).is_some_and(|ie| !ie.is_empty()) {
+                return Err(EINVAL);
+            }
+            scan_flags(u32_attr(attrs, 158)?.unwrap_or(0))?;
             let ssids = attr(attrs, 45)
                 .map(attributes)
                 .transpose()?
@@ -249,6 +387,7 @@ fn parse_operation(
             }))
         }
         CONNECT => {
+            connect_side_attrs(attrs)?;
             let ssid = attr(attrs, 52).ok_or(EINVAL)?;
             if ssid.is_empty() || ssid.len() > 32 {
                 return Err(EINVAL);
@@ -297,18 +436,11 @@ fn parse_operation(
                     return Err(EOPNOTSUPP);
                 }
                 if let Some(ie) = attr(attrs, 42) {
-                    let rsn = crate::rsn::RsnIe::wpa2_psk_ccmp().encode_body();
-                    if !ie.is_empty()
-                        && (ie.len() != rsn.len() + 2
-                            || ie[..2] != [48, rsn.len() as u8]
-                            || ie[2..] != rsn)
-                    {
-                        return Err(EOPNOTSUPP);
-                    }
+                    psk_association_ies(ie)?;
                 }
                 Credential::Psk(Zeroizing::new(pmk.try_into().map_err(|_| EINVAL)?))
             } else {
-                // Open: no security negotiation, no MFP, no extra RSN IE.
+                // Open: no security negotiation, no MFP, no RSN element.
                 if auth != 0
                     || mfp != 0
                     || attr(attrs, 70).is_some()
@@ -316,7 +448,10 @@ fn parse_operation(
                     || attr(attrs, 76).is_some()
                     || attr(attrs, 73).is_some()
                     || attr(attrs, 74).is_some()
-                    || attr(attrs, 42).is_some_and(|ie| !ie.is_empty())
+                    || attr(attrs, 42)
+                        .map(elements)
+                        .transpose()?
+                        .is_some_and(|ies| ies.iter().any(|(id, _)| *id == 48))
                 {
                     return Err(EOPNOTSUPP);
                 }
@@ -363,6 +498,9 @@ pub(super) fn handle(
     ) {
         return ap_handle(command, bytes, context);
     }
+    if matches!(command, SET_INTERFACE | GET_STATION) {
+        return interface_handle(command, bytes, dump, context);
+    }
     if !matches!(command, SCAN | GET_SCAN | CONNECT | DISCONNECT) {
         return super::handle_in(command, bytes, dump, context.net_ns_id);
     }
@@ -379,6 +517,7 @@ pub(super) fn handle(
         if !dump {
             return Err(EOPNOTSUPP);
         }
+        let connected = iface.connected_bssid();
         let cache = CACHE.lock();
         let results = cache
             .iter()
@@ -387,7 +526,7 @@ pub(super) fn handle(
             .unwrap_or_default();
         return Ok(results
             .iter()
-            .map(|(bss, ies)| scan_reply(index, bss, ies))
+            .map(|(bss, ies)| scan_reply(index, bss, ies, connected == Some(bss.bssid)))
             .collect());
     }
     if dump {
@@ -428,6 +567,113 @@ pub(super) fn handle(
         execute(iface, admin, namespace, index, operation).await;
     });
     Ok(Vec::new()) // generic netlink emits the requested ACK
+}
+
+/// The netdev a request names by NL80211_ATTR_IFINDEX in the sender's
+/// namespace (`nl80211_pre_doit` with NEED_NETDEV): missing -EINVAL, not a
+/// wireless netdev of this namespace -ENODEV.
+fn netdev_from_attrs(
+    attrs: &[(u16, &[u8])],
+    namespace: u64,
+) -> Result<(u32, Arc<dyn crate::WirelessNetIface>), i32> {
+    let index = u32_attr(attrs, 3)?.ok_or(EINVAL)?;
+    let iface = crate::registry::list()
+        .into_iter()
+        .find(|iface| {
+            narf_net::netlink_route::ifindex_for_name(iface.name()) == Some(index)
+                && super::in_namespace(iface.as_ref(), namespace)
+        })
+        .ok_or(ENODEV)?;
+    Ok((index, iface))
+}
+
+/// NL80211_CMD_SET_INTERFACE and NL80211_CMD_GET_STATION.
+///
+/// SET_INTERFACE (`nl80211_set_interface`): the IFTYPE policy (> MAX is
+/// -EINVAL) runs before the device lookup; MESH_ID on a non-mesh type and
+/// MNTR_FLAGS on a non-monitor type are -EINVAL; 4ADDR and any real type
+/// change are -EOPNOTSUPP, the `cfg80211_change_iface` answer for a wiphy
+/// without `change_virtual_intf` — no NARF driver switches type at runtime.
+/// Setting the current type is a successful no-op, which is what
+/// wpa_supplicant's `nl80211_set_mode(STATION)` does at startup.
+///
+/// GET_STATION (`nl80211_get_station` / `nl80211_dump_station`): a station
+/// interface's one station is its AP. A do needs NL80211_ATTR_MAC (-EINVAL)
+/// and is -ENOENT for any other peer (mac80211 `sta_info_get_bss`).
+/// STA_INFO carries only what NARF knows: the signal of the AP's last scan
+/// record.
+fn interface_handle(
+    command: u8,
+    bytes: &[u8],
+    dump: bool,
+    context: RequestContext<'_>,
+) -> Result<Vec<GenlReply>, i32> {
+    let attrs = attributes(bytes)?;
+    match command {
+        SET_INTERFACE => {
+            const NL80211_IFTYPE_MAX: u32 = 12;
+            let iftype = u32_attr(&attrs, 5)?;
+            if iftype.is_some_and(|t| t > NL80211_IFTYPE_MAX) {
+                return Err(EINVAL);
+            }
+            let (_, iface) = netdev_from_attrs(&attrs, context.net_ns_id)?;
+            let _admin = authority(&context, iface.as_ref())?;
+            let current = iface.current_iftype();
+            let new = iftype.unwrap_or(current);
+            // NL80211_ATTR_MESH_ID needs a mesh point on both sides.
+            const MESH_POINT: u32 = 7;
+            if attr(&attrs, 24).is_some() && (new != MESH_POINT || current != MESH_POINT) {
+                return Err(EINVAL);
+            }
+            // NL80211_ATTR_4ADDR: enabling it needs WIPHY_FLAG_4ADDR_STATION
+            // (`nl80211_valid_4addr`); clearing it is a change.
+            let four_addr = attr(&attrs, 83);
+            if four_addr.is_some_and(|b| b.first().is_some_and(|v| *v != 0)) {
+                return Err(EOPNOTSUPP);
+            }
+            // NL80211_ATTR_MNTR_FLAGS needs a monitor interface.
+            const MONITOR: u32 = 6;
+            if attr(&attrs, 23).is_some() && new != MONITOR {
+                return Err(EINVAL);
+            }
+            if four_addr.is_some() || new != current {
+                return Err(EOPNOTSUPP);
+            }
+            Ok(Vec::new())
+        }
+        GET_STATION => {
+            let (index, iface) = netdev_from_attrs(&attrs, context.net_ns_id)?;
+            let wanted = if dump {
+                None
+            } else {
+                Some(mac_attr(&attrs, 6)?.ok_or(EINVAL)?)
+            };
+            let peer = iface.connected_bssid();
+            let Some(peer) = peer.filter(|peer| wanted.is_none_or(|w| w == *peer)) else {
+                return if dump { Ok(Vec::new()) } else { Err(ENOENT) };
+            };
+            let signal = CACHE
+                .lock()
+                .iter()
+                .find(|c| c.name == iface.name() && c.namespace == context.net_ns_id)
+                .and_then(|c| c.results.iter().find(|(bss, _)| bss.bssid == peer))
+                .map(|(bss, _)| bss.rssi);
+            let mut info = Vec::new();
+            if let Some(signal) = signal {
+                push_attr(&mut info, 7, &[signal as u8]); // NL80211_STA_INFO_SIGNAL
+            }
+            let mut attrs = Vec::new();
+            push_attr(&mut attrs, 3, &index.to_ne_bytes());
+            push_attr(&mut attrs, 6, &peer);
+            push_attr(&mut attrs, 46, &0u32.to_ne_bytes()); // NL80211_ATTR_GENERATION
+            push_attr(&mut attrs, 21 | NLA_F_NESTED, &info); // NL80211_ATTR_STA_INFO
+            Ok(alloc::vec![GenlReply {
+                command: NEW_STATION,
+                attrs,
+            }])
+        }
+        _ => Err(EOPNOTSUPP),
+    }
 }
 
 /// Reject any attribute outside the per-command allowlist, so an ambiguous or
@@ -824,6 +1070,8 @@ async fn execute(
     let mut attrs = Vec::new();
     push_attr(&mut attrs, 3, &index.to_ne_bytes());
     let live = authorized(&admin, iface.as_ref(), ns);
+    // The peer whose controlled port opened with this connect.
+    let mut port_authorized = None;
     let (command, group) = match operation {
         Operation::Scan(request) => {
             let result = if live {
@@ -936,8 +1184,20 @@ async fn execute(
                 let _ = iface.disassociate().await;
             }
             let status: u16 = if result.is_ok() && still_live { 0 } else { 1 };
+            if let Some(index) = wiphy_index(iface.as_ref()) {
+                push_attr(&mut attrs, 1, &index.to_ne_bytes()); // NL80211_ATTR_WIPHY
+            }
             if let Some(address) = selected.map(|b| b.bssid).or(bssid) {
                 push_attr(&mut attrs, 6, &address);
+                // The offloading driver completed the 4-way handshake (or
+                // SAE + 4-way) before associate() returned: the port is
+                // authorized, which cfg80211 reports as a separate
+                // NL80211_CMD_PORT_AUTHORIZED (`cfg80211_port_authorized`)
+                // after the connect result — the event wpa_supplicant waits
+                // for with WPA_DRIVER_FLAGS_4WAY_HANDSHAKE_PSK.
+                if status == 0 && akm != Akm::Open {
+                    port_authorized = Some(address);
+                }
             }
             push_attr(&mut attrs, 72, &status.to_ne_bytes());
             // A successful move to a new BSS is a ROAM event; a fresh
@@ -964,6 +1224,40 @@ async fn execute(
     // interface state into the previous namespace's event listeners.
     if super::in_namespace(iface.as_ref(), ns) {
         publish_event(NL80211_FAMILY_ID, group, ns, GenlReply { command, attrs });
+        if let Some(peer) = port_authorized {
+            publish_event(
+                NL80211_FAMILY_ID,
+                19,
+                ns,
+                port_authorized_event(iface.as_ref(), index, peer),
+            );
+        }
+    }
+}
+
+/// The wiphy index nl80211 reports for `iface` (its registry position).
+fn wiphy_index(iface: &dyn crate::WirelessNetIface) -> Option<u32> {
+    crate::registry::list()
+        .iter()
+        .position(|known| known.name() == iface.name())
+        .map(|index| index as u32)
+}
+
+/// `nl80211_send_port_authorized`: WIPHY, IFINDEX, MAC (the AP).
+fn port_authorized_event(
+    iface: &dyn crate::WirelessNetIface,
+    index: u32,
+    peer: [u8; 6],
+) -> GenlReply {
+    let mut attrs = Vec::new();
+    if let Some(wiphy) = wiphy_index(iface) {
+        push_attr(&mut attrs, 1, &wiphy.to_ne_bytes());
+    }
+    push_attr(&mut attrs, 3, &index.to_ne_bytes());
+    push_attr(&mut attrs, 6, &peer);
+    GenlReply {
+        command: PORT_AUTHORIZED,
+        attrs,
     }
 }
 
@@ -989,11 +1283,21 @@ fn select_bss<'a>(
         .cloned()
 }
 
-fn scan_reply(index: u32, bss: &crate::BssInfo, information_elements: &[u8]) -> GenlReply {
+fn scan_reply(
+    index: u32,
+    bss: &crate::BssInfo,
+    information_elements: &[u8],
+    associated: bool,
+) -> GenlReply {
     let mut attrs = Vec::new();
     push_attr(&mut attrs, 3, &index.to_ne_bytes());
     let mut nested = Vec::new();
     push_attr(&mut nested, 1, &bss.bssid);
+    if associated {
+        // NL80211_BSS_STATUS = NL80211_BSS_STATUS_ASSOCIATED: `iw link` and
+        // wpa_supplicant's nl80211_get_assoc_freq find the current BSS by it.
+        push_attr(&mut nested, 9, &1u32.to_ne_bytes());
+    }
     push_attr(&mut nested, 2, &frequency(bss.channel).to_ne_bytes());
     push_attr(&mut nested, 7, &(i32::from(bss.rssi) * 100).to_ne_bytes());
     let private = !matches!(bss.security, crate::scan::BssSecurity::Open);
