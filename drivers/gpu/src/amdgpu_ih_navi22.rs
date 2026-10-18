@@ -739,6 +739,7 @@ impl Hub {
         }
     }
     /// Minimal IRQ-context work: record and leave decoding to task context.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     fn record_interrupt(&self) {
         self.interrupts.fetch_add(1, Ordering::Relaxed);
         self.pending.store(true, Ordering::Release);
@@ -1104,6 +1105,7 @@ impl Drop for Next<'_> {
     }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn interrupt(cookie: u64) -> narf_interrupts::IrqStatus {
     // SAFETY: the cookie is a Hub inside an Arc whose clone was leaked when
     // the handler was installed; it is never freed.
@@ -1113,6 +1115,7 @@ fn interrupt(cookie: u64) -> narf_interrupts::IrqStatus {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 enum Route {
     None,
     MsiX(narf_bus::MsixTable),
@@ -1122,7 +1125,9 @@ enum Route {
 /// Exclusive IH ring owner.
 pub struct Ih {
     shared: Arc<Shared<Mmio>>,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     device: BusDevice,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     authority: Cap<BusDeviceCap, Write>,
     // Never freed: NBIO may hold its address until reset.
     _dummy: core::mem::ManuallyDrop<narf_io::DmaBuffer>,

@@ -14,6 +14,7 @@ pub use scan::{rx_frame, ScanBss, ScanReport};
 #[path = "station_join.rs"]
 mod join;
 pub use join::to_ethernet;
+#[cfg(target_arch = "x86_64")]
 pub(super) use join::{extract_eapol, wrap_eapol_frame};
 
 #[cfg(target_arch = "x86_64")]
