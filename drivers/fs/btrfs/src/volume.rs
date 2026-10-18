@@ -1335,18 +1335,40 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             let _op = self.op_lock().lock().await;
             crate::write::flush_batch(self).await?;
         }
-        let (root_tree, _) = self.root_tree_root();
-        let (subvol_id, subvol_root, subvol_level, subvol_flags) = match sel {
-            Subvol::Id(n) => {
-                let (bytenr, level, flags) =
-                    crate::roots::find_root_with_flags(self, root_tree, *n).await?;
-                (*n, bytenr, level, flags)
+        // The resolution reads the root tree (and the trees on the path)
+        // without the operation lock, as any reader does. Every commit
+        // re-packs the root tree, so a commit landing meanwhile (another
+        // mount's writes, the commit timer) can free and reuse the blocks of
+        // the root tree sampled here: the reads then fail their parent
+        // checks (`btree::verify_child`). Retry from the new root, as the
+        // VFS read paths do; a failure against an unchanged root is real.
+        let mut attempt = 0;
+        let (subvol_id, subvol_root, subvol_level, subvol_flags, root_inode) = loop {
+            let (root_tree, _) = self.root_tree_root();
+            let resolved = async {
+                let (id, root, level, flags) = match sel {
+                    Subvol::Id(n) => {
+                        let (bytenr, level, flags) =
+                            crate::roots::find_root_with_flags(self, root_tree, *n).await?;
+                        (*n, bytenr, level, flags)
+                    }
+                    Subvol::Name(path) => self.resolve_subvol_path(root_tree, path).await?,
+                };
+                let inode = self
+                    .load_inode_in(root, format::FIRST_FREE_OBJECTID)
+                    .await?;
+                Ok::<_, FsError>((id, root, level, flags, inode))
             }
-            Subvol::Name(path) => self.resolve_subvol_path(root_tree, path).await?,
+            .await;
+            match resolved {
+                Err(FsError::InvalidData)
+                    if attempt < 4 && self.root_tree_root().0 != root_tree =>
+                {
+                    attempt += 1;
+                }
+                other => break other?,
+            }
         };
-        let root_inode = self
-            .load_inode_in(subvol_root, format::FIRST_FREE_OBJECTID)
-            .await?;
         self.select_subvol(subvol_id, subvol_root, subvol_level, subvol_flags);
         self.view.lock().root_inode = Some(root_inode);
         Ok(())

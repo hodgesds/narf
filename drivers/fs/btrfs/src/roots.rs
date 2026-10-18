@@ -39,7 +39,20 @@ pub async fn find_root_with_flags<B: BlockDevice + 'static>(
     // Root items are keyed (objectid, ROOT_ITEM_KEY, offset); the live root of a
     // tree is the first such item in key order.
     let start = BtrfsKey::new(objectid, format::ROOT_ITEM_KEY, 0);
-    let cursor = btree::Cursor::seek(vol, root_tree, &start).await?;
+    // A lock-free caller's root tree can be freed and reused by a commit
+    // while it reads (every commit re-packs the root tree): the parent
+    // checks then fail. Retry from the live root tree in that case only.
+    let mut root_tree = root_tree;
+    let mut attempt = 0;
+    let cursor = loop {
+        match btree::Cursor::seek(vol, root_tree, &start).await {
+            Err(FsError::InvalidData) if attempt < 4 && vol.root_tree_root().0 != root_tree => {
+                root_tree = vol.root_tree_root().0;
+                attempt += 1;
+            }
+            other => break other?,
+        }
+    };
     match cursor.current()? {
         Some((key, body)) if key.objectid == objectid && key.item_type == format::ROOT_ITEM_KEY => {
             let (bytenr, level) = decode_root_item(body)?;
