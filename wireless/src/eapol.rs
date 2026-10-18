@@ -49,6 +49,13 @@
 
 use alloc::vec::Vec;
 
+mod rsna;
+pub use rsna::{
+    key_ver_allowed, wpa_eapol_key_mic, wpa_pmk_to_ptk, EapolRx, EapolRxError, KeyMgmt,
+    PairwiseFail, PairwiseM1, PairwiseM3, RsnaParams, KI_VERSION_AKM_DEFINED,
+    WLAN_REASON_IE_IN_4WAY_DIFFERS,
+};
+
 // ── EAPOL header constants ─────────────────────────────────────────
 pub const EAPOL_PROTOCOL_VERSION: u8 = 3;
 
@@ -382,6 +389,17 @@ pub struct Supplicant {
     /// key-reinstallation check.
     pub gtk: Option<Vec<u8>>,
     pub igtk: Option<Vec<u8>>,
+    /// The negotiated AKM (`sm->key_mgmt`); PSK unless [`Self::with_rsna`].
+    pub key_mgmt: KeyMgmt,
+    /// The association's RSN parameters ([`Self::with_rsna`]).
+    pub rsna: Option<RsnaParams>,
+    /// `sm->tptk`: the PTK derived from the last message 1/4, until a
+    /// message 3/4 MIC verifies with it.
+    pub tptk: Option<Ptk>,
+    /// `sm->renew_snonce`.
+    pub renew_snonce: bool,
+    /// `sm->ptk.installed`.
+    pub ptk_installed: bool,
 }
 
 impl Supplicant {
@@ -397,6 +415,11 @@ impl Supplicant {
             rx_replay_counter_set: false,
             gtk: None,
             igtk: None,
+            key_mgmt: KeyMgmt::Psk,
+            rsna: None,
+            tptk: None,
+            renew_snonce: false,
+            ptk_installed: false,
         }
     }
 
@@ -575,6 +598,11 @@ pub enum GroupKeyDrop {
     EncryptedUnauthenticated,
     /// "Unsupported AES-WRAP len" / "AES unwrap failed".
     Decrypt,
+    /// "Discard unencrypted EAPOL-Key msg 1/4 when TK is set and PMF is
+    /// enabled".
+    Unencrypted,
+    /// "Discard EAPOL-Key msg 1/4 with invalid IEs/KDEs".
+    KeyData,
 }
 
 /// Why `process_1_of_2` failed: wpa_supplicant then deauthenticates
@@ -687,109 +715,39 @@ impl Supplicant {
     pub fn process_group_m1(
         &mut self,
         pdu: &[u8],
-        mic_len: usize,
+        _mic_len: usize,
+        group_key_len: usize,
+        mgmt_group_key_len: Option<usize>,
+    ) -> Result<GroupKeyM1, GroupKeyError> {
+        let f = self.front(pdu).map_err(GroupKeyError::Drop)?;
+        if f.key_info & KI_KEY_TYPE_PAIRWISE != 0 {
+            return Err(GroupKeyError::Drop(GroupKeyDrop::Pairwise));
+        }
+        if f.key_info & KI_KEY_MIC == 0 {
+            return Err(GroupKeyError::Drop(GroupKeyDrop::NoMic));
+        }
+        self.process_1_of_2(&f, group_key_len, mgmt_group_key_len)
+    }
+
+    /// `wpa_supplicant_process_1_of_2` + `wpa_supplicant_send_2_of_2` on a
+    /// frame that passed [`Self::front`] (MIC verified, Key Data decrypted).
+    fn process_1_of_2(
+        &mut self,
+        f: &rsna::Front,
         group_key_len: usize,
         mgmt_group_key_len: Option<usize>,
     ) -> Result<GroupKeyM1, GroupKeyError> {
         use GroupKeyDrop as D;
         use GroupKeyError::{Drop, Fail};
-        // 95 bytes of fixed fields minus the MIC, + MIC + Key Data Length.
-        let keyhdrlen = 77 + mic_len + 2;
-        if pdu.len() < 4 + keyhdrlen {
-            return Err(Drop(D::TooShort));
-        }
-        let plen = u16::from_be_bytes([pdu[2], pdu[3]]) as usize;
-        if pdu[1] != EapolType::EapolKey as u8 {
-            return Err(Drop(D::NotKey));
-        }
-        if plen > pdu.len() - 4 || plen < keyhdrlen {
-            return Err(Drop(D::BadLength));
-        }
-        // The 802.1X data only (trailing bytes ignored).
-        let mut tmp = pdu[..4 + plen].to_vec();
+        let (tmp, key_info, ver, replay_counter) = (&f.tmp, f.key_info, f.ver, f.replay_counter);
+        let key_data = &f.key_data[..];
         let body = 4;
-        if tmp[body] != KEY_DESCRIPTOR_RSN && tmp[body] != KEY_DESCRIPTOR_WPA_LEGACY {
-            return Err(Drop(D::BadDescriptor));
-        }
-        let mic_off = body + 77;
-        let kdl_off = mic_off + mic_len;
-        let mut key_data_len = u16::from_be_bytes([tmp[kdl_off], tmp[kdl_off + 1]]) as usize;
-        if key_data_len > plen - keyhdrlen {
-            return Err(Drop(D::KeyDataOverflow));
-        }
-        let mut rc = [0u8; 8];
-        rc.copy_from_slice(&tmp[body + 5..body + 13]);
-        let replay_counter = u64::from_be_bytes(rc);
-        if self.rx_replay_counter_set && replay_counter <= self.last_replay_counter {
-            return Err(Drop(D::Replay));
-        }
-        let key_info = u16::from_be_bytes([tmp[body + 1], tmp[body + 2]]);
-        if key_info & KI_SMK_MESSAGE != 0 {
-            return Err(Drop(D::Smk));
-        }
-        if key_info & KI_KEY_ACK == 0 {
-            return Err(Drop(D::NoAck));
-        }
-        if key_info & KI_REQUEST != 0 {
-            return Err(Drop(D::Request));
-        }
-        if tmp[body] != KEY_DESCRIPTOR_RSN {
-            // "RSN: Unsupported EAPOL-Key type" (WPA1 is not supported).
-            return Err(Drop(D::BadDescriptor));
-        }
-        let ver = key_info & KI_VERSION_MASK;
-        // PSK + CCMP: version 2, or 3 by the interoperability workaround
-        // ("allow incorrect ... but stronger"); RC4 needs TKIP.
-        if ver != KI_VERSION_HMAC_SHA1_AES && ver != KI_VERSION_AES_128_CMAC {
-            return Err(Drop(D::BadVersion));
-        }
-        if key_info & KI_KEY_TYPE_PAIRWISE != 0 {
-            return Err(Drop(D::Pairwise));
-        }
-        // wpa_supplicant_verify_eapol_key_mic
-        if key_info & KI_KEY_MIC != 0 {
-            let Some(ptk) = self.ptk.as_ref() else {
-                return Err(Drop(D::BadMic));
-            };
-            let got = tmp[mic_off..mic_off + mic_len].to_vec();
-            tmp[mic_off..mic_off + mic_len].fill(0);
-            match eapol_key_mic(ver, &ptk.kck, &tmp, mic_len) {
-                Some(m) if m == got => {}
-                _ => return Err(Drop(D::BadMic)),
-            }
-            tmp[mic_off..mic_off + mic_len].copy_from_slice(&got);
-            self.last_replay_counter = replay_counter;
-            self.rx_replay_counter_set = true;
-        }
-        let kd_off = kdl_off + 2;
-        let mut key_data = tmp[kd_off..kd_off + key_data_len].to_vec();
-        if key_info & KI_ENCRYPTED_KEY_DATA != 0 {
-            if key_info & KI_KEY_MIC == 0 {
-                return Err(Drop(D::EncryptedUnauthenticated));
-            }
-            // wpa_supplicant_decrypt_key_data (AES-WRAP for versions 2/3).
-            let Some(ptk) = self.ptk.as_ref() else {
-                return Err(Drop(D::Decrypt));
-            };
-            if key_data_len < 8 || key_data_len % 8 != 0 {
-                return Err(Drop(D::Decrypt));
-            }
-            key_data_len -= 8;
-            let kek: Option<&[u8; 16]> = ptk.kek.as_slice().try_into().ok();
-            match kek.and_then(|k| narf_crypto::aes_kw::aes_unwrap(k, &key_data)) {
-                Some(k) if k.len() == key_data_len => key_data = k,
-                _ => return Err(Drop(D::Decrypt)),
-            }
-        }
-        if key_info & KI_KEY_MIC == 0 {
-            return Err(Drop(D::NoMic));
-        }
-
+        let mic_len = self.key_mgmt.mic_len();
         // wpa_supplicant_process_1_of_2
         if self.state != FourWayState::PtkDone {
             return Err(Fail(GroupKeyFail::Before4Way));
         }
-        let (gtk, igtk) = parse_group_kdes(&key_data).map_err(|_| Fail(GroupKeyFail::KeyData))?;
+        let (gtk, igtk) = parse_group_kdes(key_data).map_err(|_| Fail(GroupKeyFail::KeyData))?;
         if gtk.is_some() && key_info & KI_ENCRYPTED_KEY_DATA == 0 {
             return Err(Fail(GroupKeyFail::GtkUnencrypted));
         }
@@ -849,7 +807,7 @@ impl Supplicant {
         .encode(&mut out);
         out.extend_from_slice(&body_bytes);
         let kck = &self.ptk.as_ref().expect("PTK verified above").kck;
-        let m = eapol_key_mic(ver, kck, &out, mic_len).ok_or(Drop(D::BadVersion))?;
+        let m = wpa_eapol_key_mic(self.key_mgmt, ver, kck, &out).ok_or(Drop(D::BadVersion))?;
         out[4 + 77..4 + 77 + mic_len].copy_from_slice(&m);
         Ok(GroupKeyM1 {
             gtk,
@@ -1101,8 +1059,14 @@ mod group_tests {
                 return TestResult::Fail(what);
             }
             // Nothing is installed; a MIC-verified frame that failed
-            // its unwrap still advanced the counter, as wpa_supplicant.
-            let rc = if d == D::Decrypt { 3 } else { 2 };
+            // its unwrap, or a MIC-verified pairwise frame (which
+            // wpa_sm_rx_eapol verifies before dispatching to the 4-way),
+            // still advanced the counter, as wpa_supplicant.
+            let rc = if d == D::Decrypt || d == D::Pairwise {
+                3
+            } else {
+                2
+            };
             if s.last_replay_counter != rc || s.gtk.as_deref() != Some(&OLD_GTK[..]) {
                 return TestResult::Fail("dropped frame: supplicant state");
             }
