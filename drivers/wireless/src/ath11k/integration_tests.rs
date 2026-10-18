@@ -787,6 +787,12 @@ fn test_open_stop(_name: &str, up: bool) {
     }
 }
 
+static DISC_SEEN: IrqSafeSpinLock<Vec<(u16, bool)>> = IrqSafeSpinLock::new(Vec::new());
+
+fn disc_sink(_name: &str, d: super::mac::Disconnect) {
+    DISC_SEEN.lock().push((d.reason, d.from_ap));
+}
+
 fn test_send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let dev = TEST_DEV.lock().clone().ok_or(())?;
     dev.queue_tx(bytes, meta)
@@ -858,6 +864,7 @@ fn up_down(cfg: FwCfg) -> Result<Up, &'static str> {
             rx: rx_sink,
             link: link_sink,
             admin: admin_sink,
+            disconnected: disc_sink,
         },
     );
     let netdev = Arc::new(nd);
@@ -867,6 +874,7 @@ fn up_down(cfg: FwCfg) -> Result<Up, &'static str> {
     narf_net::iface::set_open_stop(name, test_open_stop);
     RX_SEEN.lock().clear();
     LINK_SEEN.lock().clear();
+    DISC_SEEN.lock().clear();
     Ok(Up {
         dev,
         shared,
@@ -1353,6 +1361,10 @@ fn smoke_ath11k_int_unauthorized_and_disconnect() -> TestResult {
         ensure!(r.is_ok(), "disassociate");
         ensure!(!u.netdev.link_up(), "carrier off");
         ensure!(*LINK_SEEN.lock() == [true, false], "carrier on, then off");
+        ensure!(
+            *DISC_SEEN.lock() == [(3, false)],
+            "nl80211: local disconnect, reason 3 (DEAUTH_LEAVING)"
+        );
         ensure!(u.netdev.connected_bssid().is_none(), "no BSSID");
         let st = u.dev.st.borrow();
         ensure!(
@@ -1410,6 +1422,10 @@ fn smoke_ath11k_int_link_loss() -> TestResult {
         ensure!(!u.netdev.link_up(), "carrier off");
         ensure!(*LINK_SEEN.lock() == [true, false], "carrier on, then off");
         ensure!(
+            *DISC_SEEN.lock() == [(4, false)],
+            "nl80211: local deauth, reason 4 (DISASSOC_DUE_TO_INACTIVITY)"
+        );
+        ensure!(
             u.netdev.stats.link_losses.load(Ordering::Relaxed) == 1,
             "one link loss"
         );
@@ -1418,6 +1434,117 @@ fn smoke_ath11k_int_link_loss() -> TestResult {
     })
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_link_loss);
+
+/// The reason cfg80211 reports when the association goes away
+/// (`__cfg80211_disconnected` → `nl80211_send_disconnected`): a
+/// Deauthentication / Disassociation from the AP gives its reason code
+/// and `DISCONNECTED_BY_AP`; a local disconnect gives the reason of the
+/// frame mac80211 sent (3); beacon / connection loss reason 4. The
+/// nl80211 attributes are pinned as bytes.
+fn smoke_ath11k_int_disconnect_reason() -> TestResult {
+    use super::mac_frame as frame;
+    use super::mac_tests::mgmt_rx_event;
+    check(|| {
+        // nl80211 attribute bytes (native endian; x86_64 LE): ifindex 5,
+        // REASON_CODE (54) = 7, DISCONNECTED_BY_AP (71) flag.
+        let a = narf_wireless::nl80211::disconnect_attrs(5, 7, true);
+        ensure!(
+            a == [
+                8, 0, 3, 0, 5, 0, 0, 0, // IFINDEX
+                6, 0, 54, 0, 7, 0, 0, 0, // REASON_CODE + pad
+                4, 0, 71, 0, // DISCONNECTED_BY_AP
+            ],
+            "disconnect attrs from the AP"
+        );
+        ensure!(
+            narf_wireless::nl80211::disconnect_attrs(5, 0, false) == [8, 0, 3, 0, 5, 0, 0, 0],
+            "reason 0 omitted, no flag for a local disconnect"
+        );
+
+        for (stype, reason) in [(frame::stype::DEAUTH, 7u16), (frame::stype::DISASSOC, 8)] {
+            let u = up(wpa2_cfg())?;
+            connect(&u)?;
+            let mut f = frame::mgmt_hdr(stype, &OWN, &BSSID, &BSSID);
+            f.extend_from_slice(&reason.to_le_bytes());
+            u.dev
+                .st
+                .borrow_mut()
+                .world
+                .events
+                .push_back(mgmt_rx_event(6, 60, 2437, 0, &f));
+            let (_, err, _, _) = latched(|| pump(&u, 5));
+            ensure!(err == super::mac::step::LINK_DEAUTH_RX, "deauth RX latched");
+            ensure!(!u.netdev.link_up(), "carrier off");
+            ensure!(
+                *DISC_SEEN.lock() == [(reason, true)],
+                "nl80211: the AP's reason, DISCONNECTED_BY_AP"
+            );
+            ensure!(
+                u.dev
+                    .st
+                    .borrow()
+                    .world
+                    .mgmt
+                    .last()
+                    .is_some_and(|f| f[0] != 0xc0),
+                "a deauth from the AP is not answered"
+            );
+        }
+
+        // A deauth for another BSSID or another station is ignored.
+        let u = up(wpa2_cfg())?;
+        connect(&u)?;
+        let other = [0x02, 0x99, 0x99, 0x99, 0x99, 0x99];
+        let mut f = frame::mgmt_hdr(frame::stype::DEAUTH, &other, &BSSID, &BSSID);
+        f.extend_from_slice(&7u16.to_le_bytes());
+        u.dev
+            .st
+            .borrow_mut()
+            .world
+            .events
+            .push_back(mgmt_rx_event(6, 60, 2437, 0, &f));
+        pump(&u, 5);
+        ensure!(
+            u.netdev.link_up() && DISC_SEEN.lock().is_empty(),
+            "deauth to another DA ignored"
+        );
+
+        // Beacon loss: WMI_ROAM BEACON_MISS, no beacon for 3 s.
+        let w = |v: u32| v.to_le_bytes();
+        let mut roam = Vec::new();
+        for v in [0u32, super::mac::WMI_ROAM_REASON_BEACON_MISS, 0] {
+            roam.extend_from_slice(&w(v));
+        }
+        u.dev.st.borrow_mut().world.events.push_back(wmi_event(
+            wmi::WMI_ROAM_EVENTID,
+            &[tlv(wmi::WMI_TAG_ROAM_EVENT, &roam)],
+        ));
+        let (_, err, _, _) = latched(|| pump(&u, 400));
+        ensure!(
+            err == super::mac::step::LINK_BEACON_LOSS,
+            "beacon loss latched"
+        );
+        ensure!(
+            *DISC_SEEN.lock() == [(4, false)],
+            "nl80211: reason 4, locally generated"
+        );
+        ensure!(
+            u.dev
+                .st
+                .borrow()
+                .world
+                .mgmt
+                .last()
+                .is_some_and(|f| f[0] == 0xc0 && f[24..26] == [4, 0]),
+            "Deauthentication reason 4 sent"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_int_disconnect_reason
+);
 
 /// PEER_MAP never arrives: the connect fails with the mac step, the
 /// carrier stays off.

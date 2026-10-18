@@ -40,7 +40,7 @@ use narf_wireless::{
     AssociateRequest, BssInfo, ScanRequest, WirelessConfig, WirelessError, WirelessNetIface,
 };
 
-use super::mac::{channel_number_freq, Mac};
+use super::mac::{channel_number_freq, Disconnect, Mac};
 use super::mac_frame::{self as frame, freq_band, Band};
 use super::mac_reg::chan_flag;
 use super::runtime::{DpIrq, Port, RtIo, RtQmi, Shared};
@@ -59,12 +59,15 @@ pub struct Sinks {
     /// `netif_receive_skb` (`narf_net::iface::on_rx_frame_from`).
     pub rx: fn(&str, &mut [u8]),
     /// Carrier on / off (`netif_carrier_on/off`:
-    /// `narf_net::iface::set_link_metadata`, plus the nl80211 disconnect
-    /// event when going down).
+    /// `narf_net::iface::set_link_metadata`).
     pub link: fn(&str, bool),
     /// `IFF_UP` changed by the driver itself: an open that failed brings
     /// the interface back down (`narf_net::iface::set_link_state`).
     pub admin: fn(&str, bool),
+    /// The association went away while the carrier was on:
+    /// `cfg80211_disconnected` → `nl80211::notify_disconnect(name,
+    /// reason, from_ap)`.
+    pub disconnected: fn(&str, Disconnect),
 }
 
 /// What `get_wireless_info` reports, captured from the mac layer at
@@ -189,6 +192,20 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         &self.radio
     }
 
+    /// Carrier down with the reason cfg80211 reports (`None` when the
+    /// mac layer recorded none: a local disconnect).
+    fn link_down(&self, why: Option<Disconnect>) {
+        let was = self.link_up();
+        self.set_link(false, None, 0);
+        if was {
+            let d = why.unwrap_or(Disconnect {
+                reason: frame::WLAN_REASON_DEAUTH_LEAVING,
+                from_ap: false,
+            });
+            (self.sinks.disconnected)(self.name, d);
+        }
+    }
+
     fn set_link(&self, up: bool, bssid: Option<[u8; 6]>, channel: u32) {
         match bssid {
             Some(b) if up => {
@@ -276,7 +293,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
             self.shared.flush_queues(true).await;
             let _ = m.disassociate().await;
         }
-        self.set_link(false, None, 0);
+        let why = m.take_disconnect();
+        self.link_down(why);
         self.shared.lock().await.purge_txqs();
         if let Err(e) = m.remove_interface().await {
             use core::fmt::Write as _;
@@ -454,10 +472,16 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
                 self.shared.lock().await.purge_txqs();
             }
             let linked = m.connected_bssid();
+            let why = if linked.is_none() {
+                m.take_disconnect()
+            } else {
+                None
+            };
             drop(m);
             if linked.is_none() && self.link_up() {
-                // ieee80211_set_disassoc → netif_carrier_off.
-                self.set_link(false, None, 0);
+                // ieee80211_set_disassoc → netif_carrier_off, then
+                // cfg80211_disconnected.
+                self.link_down(why);
             }
         }
         n
@@ -584,8 +608,9 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
             self.shared.flush_queues(true).await;
         }
         let r = m.disassociate().await;
+        let why = m.take_disconnect();
         drop(m);
-        self.set_link(false, None, 0);
+        self.link_down(why);
         r
     }
 
@@ -634,10 +659,10 @@ fn pci_drain() -> bool {
 fn pci_link(name: &str, up: bool) {
     // netif_carrier_on / netif_carrier_off (IFF_UP is the stack's).
     narf_net::iface::set_link_metadata(name, up, None, None);
-    if !up {
-        // WLAN_REASON_DEAUTH_LEAVING (cfg80211_disconnected).
-        narf_wireless::nl80211::notify_disconnect(name, 3);
-    }
+}
+
+fn pci_disconnected(name: &str, d: Disconnect) {
+    narf_wireless::nl80211::notify_disconnect(name, d.reason, d.from_ap);
 }
 
 fn pci_admin(name: &str, up: bool) {
@@ -698,6 +723,7 @@ pub fn register_pci(
             rx: narf_net::iface::on_rx_frame_from,
             link: pci_link,
             admin: pci_admin,
+            disconnected: pci_disconnected,
         },
     );
     let dev = Arc::new(dev);

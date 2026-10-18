@@ -33,24 +33,45 @@ const GENL_CMD_CAP_DUMP: u32 = 1 << 2;
 const ENODEV: i32 = 19;
 const EOPNOTSUPP: i32 = 95;
 
-/// Report a driver's completed link-down transition. Called after dropping
-/// any network-registry lock; no device state is queried by the socket sink.
-pub fn notify_disconnect(name: &str, reason: u16) {
+/// `NL80211_ATTR_REASON_CODE`.
+const NL80211_ATTR_REASON_CODE: u16 = 54;
+/// `NL80211_ATTR_DISCONNECTED_BY_AP`.
+const NL80211_ATTR_DISCONNECTED_BY_AP: u16 = 71;
+
+/// Report a driver's completed link-down transition
+/// (`nl80211_send_disconnected` from `__cfg80211_disconnected`): the
+/// reason code (omitted when 0) and, when the AP sent the
+/// Deauthentication / Disassociation, the `DISCONNECTED_BY_AP` flag.
+/// Called after dropping any network-registry lock; no device state is
+/// queried by the socket sink.
+pub fn notify_disconnect(name: &str, reason: u16, from_ap: bool) {
     let Some(index) = narf_net::netlink_route::ifindex_for_name(name) else {
         return;
     };
     let Some(iface) = narf_net::iface::lookup(name) else {
         return;
     };
-    let mut attrs = Vec::new();
-    push_attr(&mut attrs, 3, &index.to_ne_bytes());
-    push_attr(&mut attrs, 54, &reason.to_ne_bytes());
+    let attrs = disconnect_attrs(index, reason, from_ap);
     narf_net::netlink_generic::publish_event(
         NL80211_FAMILY_ID,
         19,
         iface.net_ns_id,
         GenlReply { command: 48, attrs },
     );
+}
+
+/// The attributes of `NL80211_CMD_DISCONNECT` (`nl80211_send_disconnected`
+/// order: ifindex, reason code if non-zero, the by-AP flag).
+pub fn disconnect_attrs(ifindex: u32, reason: u16, from_ap: bool) -> Vec<u8> {
+    let mut attrs = Vec::new();
+    push_attr(&mut attrs, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    if reason != 0 {
+        push_attr(&mut attrs, NL80211_ATTR_REASON_CODE, &reason.to_ne_bytes());
+    }
+    if from_ap {
+        push_attr(&mut attrs, NL80211_ATTR_DISCONNECTED_BY_AP, &[]);
+    }
+    attrs
 }
 
 fn align(len: usize) -> usize {

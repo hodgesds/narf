@@ -807,8 +807,16 @@ the runtime loop (`service_once`: service + deliver RX to the RX ring and
 operation holds the mac layer → carrier off on link loss; sleep ≤ 10 ms
 on the device interrupts) and the TX pump (TX ring → TXQs → TCL). The
 stack's send hook only queues on the TX ring (sync, no runtime lock).
-Carrier changes go to `narf_net::iface::set_link_metadata` (+
-`nl80211::notify_disconnect` when going down); `IFF_UP` is the stack's.
+Carrier changes go to `narf_net::iface::set_link_metadata`; `IFF_UP` is
+the stack's. When the carrier drops, the reason cfg80211 would report
+(`__cfg80211_disconnected`) goes to `nl80211::notify_disconnect(name,
+reason, from_ap)` (`Sinks::disconnected`, from `Mac::take_disconnect`): a
+Deauthentication / Disassociation from the AP → its reason code +
+`NL80211_ATTR_DISCONNECTED_BY_AP`; beacon / connection loss (and kickout,
+see §8) → 4 (`WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY`,
+`__ieee80211_disconnect`), locally generated; `disassociate` and the
+stop path → 3 (`DEAUTH_LEAVING`), locally generated. The reason
+attribute is omitted for 0, as `nl80211_send_disconnected`.
 
 **Open / stop** (`ieee80211_do_open` / `ieee80211_do_stop`):
 `register_pci` installs `narf_net::iface::set_open_stop(name, hook)`;
@@ -1089,8 +1097,7 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   Linux's), no A-MSDU / fast-xmit header cache; ADDBA from the AP is not answered (no
   `ath11k_mac_op_ampdu_action`; the AP falls back to non-aggregated
   traffic, REO queues stay at BA window 1); EAPOL
-  after the 4-way handshake (group rekey) is queued and never consumed;
-  carrier-off reports reason 3 to nl80211 whatever the cause; a
+  after the 4-way handshake (group rekey) is queued and never consumed; a
   multicast EAPOL or one from a non-AP SA is not filtered beyond
   mac80211's address checks.
 - Open (control path): userspace Wi-Fi control over nl80211 needs a

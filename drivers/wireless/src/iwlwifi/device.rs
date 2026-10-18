@@ -195,7 +195,7 @@ impl Device {
             self.bssid.store(0, Ordering::Release);
         }
         if was_up && !up {
-            narf_wireless::nl80211::notify_disconnect(self.name(), 1);
+            narf_wireless::nl80211::notify_disconnect(self.name(), 1, false);
         }
     }
 

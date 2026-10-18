@@ -598,6 +598,40 @@ pub struct Mac<P: WmiPort, D: DataPort> {
     hw_rate_code: u32,
     link: Option<Link>,
     mlme_target: Option<[u8; 6]>,
+    /// The last disconnection, as cfg80211 reports it.
+    disconnect: Option<Disconnect>,
+}
+
+/// What `__cfg80211_disconnected` reports to nl80211 for a lost or
+/// dropped association: the reason code of the Deauthentication /
+/// Disassociation frame (received, or the one mac80211 built and sent)
+/// and whether it came from the AP (`from_ap = !ether_addr_equal(mgmt->sa,
+/// dev_addr)` in `cfg80211_process_deauth` / `_disassoc`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Disconnect {
+    pub reason: u16,
+    pub from_ap: bool,
+}
+
+impl LinkLoss {
+    /// The disconnection cfg80211 reports for this loss: a frame from the
+    /// AP carries its own reason (`ieee80211_rx_mgmt_deauth` /
+    /// `_disassoc` → `cfg80211_rx_mlme_mgmt`); a beacon / connection loss
+    /// is a locally generated Deauthentication with
+    /// `WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY` (`__ieee80211_disconnect`
+    /// → `cfg80211_tx_mlme_mgmt`); NARF tears a kickout down the same way.
+    pub fn disconnect(&self) -> Disconnect {
+        match *self {
+            LinkLoss::Deauth { reason, .. } => Disconnect {
+                reason,
+                from_ap: true,
+            },
+            LinkLoss::Kickout | LinkLoss::BeaconLoss => Disconnect {
+                reason: frame::WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY,
+                from_ap: false,
+            },
+        }
+    }
 }
 
 impl<P: WmiPort, D: DataPort> core::fmt::Debug for Mac<P, D> {
@@ -679,7 +713,14 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             hw_rate_code: 0,
             link: None,
             mlme_target: None,
+            disconnect: None,
         }
+    }
+
+    /// The last disconnection (taken): set when [`Mac::poll`] tears a
+    /// lost link down and by [`Mac::disassociate`].
+    pub fn take_disconnect(&mut self) -> Option<Disconnect> {
+        self.disconnect.take()
     }
 
     pub fn wiphy(&self) -> &Wiphy {
@@ -814,6 +855,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                 let send_deauth = !matches!(loss, LinkLoss::Deauth { .. });
                 self.teardown(send_deauth, frame::WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY)
                     .await;
+                self.disconnect = Some(loss.disconnect());
                 narf_memory::diag::set_wifi_stage(narf_memory::diag::WifiStage::Scan);
             }
         }
@@ -2757,6 +2799,11 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             return Ok(());
         }
         self.teardown(true, frame::WLAN_REASON_DEAUTH_LEAVING).await;
+        // cfg80211_disconnect → ieee80211_mgd_deauth → the frame we sent.
+        self.disconnect = Some(Disconnect {
+            reason: frame::WLAN_REASON_DEAUTH_LEAVING,
+            from_ap: false,
+        });
         Ok(())
     }
 

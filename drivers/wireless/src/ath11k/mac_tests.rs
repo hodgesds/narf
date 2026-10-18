@@ -340,7 +340,7 @@ type Shared = Arc<IrqSafeSpinLock<World>>;
 struct FakeWmi(Shared);
 struct FakeDp(Shared);
 
-fn mgmt_rx_event(chan: u32, snr: u32, freq: u32, status: u32, f: &[u8]) -> Vec<u8> {
+pub(super) fn mgmt_rx_event(chan: u32, snr: u32, freq: u32, status: u32, f: &[u8]) -> Vec<u8> {
     let mut hdr = le(&[chan, snr, 0, 0, f.len() as u32, status]);
     hdr.extend_from_slice(&le(&[0, 0, 0, 0, 0, 0, 0, 0, 0, PDEV, freq]));
     let mut fr = f.to_vec();
