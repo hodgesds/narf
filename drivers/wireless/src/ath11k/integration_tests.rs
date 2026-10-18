@@ -1706,6 +1706,107 @@ fn smoke_ath11k_int_tx_hdr_golden() -> TestResult {
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_tx_hdr_golden);
 
+/// `ieee80211_tx_h_sequence`: management frames, non-QoS data and
+/// group-addressed QoS data share `sdata->sequence_number`; unicast QoS
+/// data uses `sta->tid_seq[tid]`; control frames and QoS Null keep their
+/// sequence control. Over the device: the authentication, association
+/// and deauthentication frames the firmware receives carry 0x000, 0x010,
+/// 0x020 (EAPOL to the WMM AP is QoS data on TID 7), and the counter
+/// survives the disconnect (the vif outlives the AP's `sta_info`).
+fn smoke_ath11k_int_mgmt_seq_shared() -> TestResult {
+    use super::mac_frame as frame;
+    check(|| {
+        let mut seq = SeqState::default();
+        // Open System Authentication, sequence control 0 from the builder.
+        let mut auth = frame::build_auth_open(&OWN, &BSSID);
+        tx_hdr::tx_h_sequence(&mut auth, &mut seq);
+        let mut g = vec![0xb0, 0x00, 0x00, 0x00];
+        g.extend_from_slice(&BSSID);
+        g.extend_from_slice(&OWN);
+        g.extend_from_slice(&BSSID);
+        g.extend_from_slice(&[0x00, 0x00]);
+        g.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x00, 0x00]);
+        ensure!(auth == g, "auth golden: seq 0");
+        // Non-QoS data continues the same counter: 0x010.
+        let eth = ipv4_frame(&GW, &OWN, 0, &[1]);
+        let d = tx_hdr::build_sta_data(&eth, &sta(false, true, false), &mut seq)
+            .map_err(|_| "build")?;
+        ensure!(d.frame[22..24] == [0x10, 0x00], "non-QoS data: 0x010");
+        // The next management frame: 0x020.
+        let mut deauth = frame::build_deauth(&OWN, &BSSID, 3);
+        tx_hdr::tx_h_sequence(&mut deauth, &mut seq);
+        ensure!(deauth[22..24] == [0x20, 0x00], "deauth: 0x020");
+        // Unicast QoS data: TID 5's own counter; the vif counter stays.
+        let mut q = vec![0x88, 0x01, 0, 0];
+        q.extend_from_slice(&BSSID);
+        q.extend_from_slice(&OWN);
+        q.extend_from_slice(&GW);
+        q.extend_from_slice(&[0xff, 0xff, 0x05, 0x00]);
+        tx_hdr::tx_h_sequence(&mut q, &mut seq);
+        ensure!(
+            q[22..24] == [0x00, 0x00] && seq.tid[5] == 0x10 && seq.global == 0x30,
+            "QoS unicast: tid_seq[5]"
+        );
+        // Group-addressed QoS data: the vif counter (802.11-2012 9.3.2.10).
+        let mut gq = q.clone();
+        gq[4..10].copy_from_slice(&[0xff; 6]);
+        tx_hdr::tx_h_sequence(&mut gq, &mut seq);
+        ensure!(gq[22..24] == [0x30, 0x00], "group QoS: 0x030");
+        // QoS Null (FC 0x00c8) and a control frame (PS-Poll, FC 0x00a4)
+        // are left alone.
+        let mut qn = q.clone();
+        qn[0] = 0xc8;
+        qn[22..24].copy_from_slice(&[0xab, 0xcd]);
+        tx_hdr::tx_h_sequence(&mut qn, &mut seq);
+        let mut ctl = vec![0xa4, 0x00, 0x01, 0xc0];
+        ctl.extend_from_slice(&BSSID);
+        ctl.extend_from_slice(&OWN);
+        ctl.extend_from_slice(&[0u8; 10]);
+        let ctl0 = ctl.clone();
+        tx_hdr::tx_h_sequence(&mut ctl, &mut seq);
+        ensure!(
+            qn[22..24] == [0xab, 0xcd] && ctl == ctl0 && seq.global == 0x40,
+            "QoS Null / control untouched"
+        );
+        // sta_info freed: tid_seq goes, sdata->sequence_number stays.
+        seq.sta_destroyed();
+        ensure!(seq.tid == [0; 16] && seq.global == 0x40, "sta destroyed");
+        // u16 wrap (frag bits stay 0).
+        seq.global = 0xfff0;
+        let mut w = frame::build_deauth(&OWN, &BSSID, 3);
+        tx_hdr::tx_h_sequence(&mut w, &mut seq);
+        ensure!(w[22..24] == [0xf0, 0xff] && seq.global == 0, "wrap");
+
+        // Over the device.
+        let u = up(wpa2_cfg())?;
+        connect(&u)?;
+        let (r, _, _, _) = latched(|| run(u.netdev.disassociate()));
+        ensure!(r.is_ok(), "disassociate");
+        let st = u.dev.st.borrow();
+        let seqs: Vec<(u8, [u8; 2])> = st
+            .world
+            .mgmt
+            .iter()
+            .map(|f| (f[0], [f[22], f[23]]))
+            .collect();
+        ensure!(
+            seqs == [
+                (0xb0, [0x00, 0x00]),
+                (0x00, [0x10, 0x00]),
+                (0xc0, [0x20, 0x00])
+            ],
+            "auth 0x000, assoc 0x010, deauth 0x020"
+        );
+        drop(st);
+        ensure!(
+            run(u.shared.lock()).link.seq.global == 0x30,
+            "vif counter survives the AP's sta_info"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_mgmt_seq_shared);
+
 // ── command-line autoconnect (bring-up aid) ───────────────────────
 
 /// `ath11k.*` parameters: parse, key derivation, rejects.

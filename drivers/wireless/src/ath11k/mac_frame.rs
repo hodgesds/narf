@@ -635,8 +635,9 @@ pub fn parse_deauth_disassoc(f: &[u8]) -> Option<(MgmtHdr, bool, u16)> {
 
 /// The 24-byte header mac80211 writes: frame control, duration 0
 /// (ath11k has `HAS_RATE_CONTROL`, so `ieee80211_duration` returns 0),
-/// DA / SA / BSSID, sequence control 0 (the firmware assigns sequence
-/// numbers: `hw_params.support_fw_mac_sequence`).
+/// DA / SA / BSSID, sequence control 0 (mac80211's TX path stamps
+/// `sdata->sequence_number` on the way to the driver:
+/// `runtime::Rt::mgmt_tx_prepare` → `tx_hdr::tx_h_sequence`).
 pub fn mgmt_hdr(fc: u16, da: &[u8; 6], sa: &[u8; 6], bssid: &[u8; 6]) -> Vec<u8> {
     let mut f = Vec::with_capacity(64);
     f.extend_from_slice(&fc.to_le_bytes());

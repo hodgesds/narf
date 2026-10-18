@@ -712,7 +712,13 @@ group), 0]` for a WMM AP, + Protected once the PTK is installed; addr1
 BSSID, addr2 the Ethernet SA, addr3 the DA; seq from `tid_seq[tid]`
 (QoS) or the vif counter (`ieee80211_xmit_fast_finish`); RFC 1042 SNAP,
 bridge-tunnel for IPX / AARP, no encapsulation for 802.3 length frames;
-`-EPERM` for unicast before authorization unless our own EAPOL). Then
+`-EPERM` for unicast before authorization unless our own EAPOL).
+Management frames get their sequence number on the way to WMI
+(`Rt::mgmt_tx_prepare` → `tx_hdr::tx_h_sequence` =
+`ieee80211_tx_h_sequence`): management, non-QoS data and group QoS data
+share `SeqState::global` (`sdata->sequence_number`, kept for the vif's
+lifetime), unicast QoS data uses `tid[]` (`sta->tid_seq`, cleared with the
+AP's peer); control frames and QoS Null keep theirs. Then
 `Dp::tx(NativeWifi, priority = tid, queue = AC, ring 0, csum_partial)`
 strips the QoS control (`ath11k_dp_tx_encap_nwifi`). RX: the
 vdev RX decap is NATIVE_WIFI and `dp_ring` decaps native-wifi to
@@ -872,7 +878,7 @@ fallback with every DP interrupt lost, unauthorized RX drop, disconnect
 kickout link loss through the runtime loop, PEER_MAP timeout, DP
 unsupported / DP alloc / HTT version timeout / SRING_SETUP send
 failures (latched step, firmware stopped, unwound), missing caps, the
-`tx_hdr` goldens (non-QoS, QoS, DSCP table, IPv6, EAPOL, port control,
+`tx_hdr` goldens (non-QoS, QoS, DSCP table, IPv6, EAPOL, port control, the shared management / non-QoS sequence counter over the device,
 bridge tunnel, 802.3 length frames), and the autoconnect parameters
 (parse / rejects, the IEEE 802.11 Annex J.4.2 PBKDF2 vector, BSS
 choice, a directed-scan connect on the fake device).
@@ -1082,9 +1088,7 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   round robin and fq_codel (one station; the AC order and stop reasons are
   Linux's), no A-MSDU / fast-xmit header cache; ADDBA from the AP is not answered (no
   `ath11k_mac_op_ampdu_action`; the AP falls back to non-aggregated
-  traffic, REO queues stay at BA window 1); management frames and data
-  keep separate sequence counters (mac80211 shares
-  `sdata->sequence_number` between non-QoS data and management); EAPOL
+  traffic, REO queues stay at BA window 1); EAPOL
   after the 4-way handshake (group rekey) is queued and never consumed;
   carrier-off reports reason 3 to nl80211 whatever the cause; a
   multicast EAPOL or one from a non-AP SA is not filtered beyond

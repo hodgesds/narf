@@ -9,6 +9,7 @@
 //! | [`classify8021d`] | `net/wireless/util.c::cfg80211_classify8021d` (no QoS map, no VLAN offload) |
 //! | [`select_queue`] | `net/mac80211/wme.c::ieee80211_select_queue` (+ `ieee80211_downgrade_queue` without ACM / TSPEC / reserved TID) |
 //! | [`build_sta_data`] | `net/mac80211/tx.c::ieee80211_build_hdr` (`NL80211_IFTYPE_STATION`, no TDLS / 4-addr), `ieee80211_set_qos_hdr`, the sequence number of `ieee80211_xmit_fast_finish` / `ieee80211_tx_h_sequence`, `ieee80211_tx_set_protected` (CCMP with a hardware key) |
+//! | [`tx_h_sequence`] | `net/mac80211/tx.c::ieee80211_tx_h_sequence` (management frames on the vif's counter) |
 //!
 //! The result is the 802.11 frame mac80211 hands to `ath11k_dp_tx`;
 //! [`super::dp_ring::Dp::tx`] then applies `ath11k_dp_tx_encap_nwifi`
@@ -154,12 +155,82 @@ pub struct StaTx {
     pub protected: bool,
 }
 
-/// mac80211 sequence counters: `sdata->sequence_number` (non-QoS) and
-/// `sta->tid_seq[]` (QoS data).
+/// mac80211 sequence counters: `sdata->sequence_number` (management
+/// frames, non-QoS data and group-addressed QoS data; lives as long as
+/// the interface) and `sta->tid_seq[]` (unicast QoS data; freed with the
+/// AP's `sta_info`, i.e. [`SeqState::sta_destroyed`]).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct SeqState {
     pub global: u16,
     pub tid: [u16; 16],
+}
+
+impl SeqState {
+    /// `sta_info` freed (disassociation / peer unmap): its `tid_seq[]`
+    /// goes with it; `sdata->sequence_number` stays.
+    pub fn sta_destroyed(&mut self) {
+        self.tid = [0; 16];
+    }
+
+    /// `ieee80211_tx_next_seq(sta, tid)`.
+    fn next_tid(&mut self, tid: u8) -> u16 {
+        let s = &mut self.tid[tid as usize & 0xf];
+        let v = *s;
+        *s = (v + 0x10) & IEEE80211_SCTL_SEQ;
+        v
+    }
+
+    /// `sdata->sequence_number` (+= 0x10, `u16` wrap).
+    fn next_global(&mut self) -> u16 {
+        let v = self.global;
+        self.global = self.global.wrapping_add(0x10);
+        v
+    }
+}
+
+pub const IEEE80211_FCTL_FTYPE: u16 = 0x000c;
+pub const IEEE80211_FTYPE_CTL: u16 = 0x0004;
+pub const IEEE80211_FCTL_STYPE: u16 = 0x00f0;
+/// `IEEE80211_STYPE_QOS_NULLFUNC`.
+pub const IEEE80211_STYPE_QOS_NULLFUNC: u16 = 0x00c0;
+/// `IEEE80211_QOS_CTL_TID_MASK`.
+pub const IEEE80211_QOS_CTL_TID_MASK: u8 = 0x0f;
+
+/// `net/mac80211/tx.c::ieee80211_tx_h_sequence` on an 802.11 frame
+/// mac80211 hands to the driver (station vif, `tx->sta` = the AP, no
+/// MLO): control frames, frames shorter than a 24-byte header and QoS
+/// Null keep their sequence control; QoS data to a unicast receiver takes
+/// `sta->tid_seq[tid]`; everything else (management, non-QoS data,
+/// group-addressed QoS data) takes `sdata->sequence_number`, which
+/// management frames and non-QoS data therefore share.
+pub fn tx_h_sequence(frame: &mut [u8], seq: &mut SeqState) {
+    if frame.len() < 2 {
+        return;
+    }
+    let fc = u16::from_le_bytes([frame[0], frame[1]]);
+    if fc & IEEE80211_FCTL_FTYPE == IEEE80211_FTYPE_CTL {
+        return;
+    }
+    if frame.len() < 24 {
+        return;
+    }
+    let is_data = fc & IEEE80211_FCTL_FTYPE == IEEE80211_FTYPE_DATA;
+    let is_qos = is_data && fc & IEEE80211_STYPE_QOS_DATA != 0;
+    if is_data && fc & IEEE80211_FCTL_STYPE == IEEE80211_STYPE_QOS_NULLFUNC {
+        return;
+    }
+    let v = if !is_qos || is_multicast(&frame[4..10]) {
+        seq.next_global()
+    } else {
+        // ieee80211_get_tid: the QoS control after the 24- (or 30-)
+        // byte header.
+        let qos_off = if fc & 0x0300 == 0x0300 { 30 } else { 24 };
+        let Some(&q) = frame.get(qos_off) else {
+            return;
+        };
+        seq.next_tid(q & IEEE80211_QOS_CTL_TID_MASK)
+    };
+    frame[22..24].copy_from_slice(&v.to_le_bytes());
 }
 
 /// A built frame.
@@ -204,14 +275,9 @@ pub fn build_sta_data(eth: &[u8], sta: &StaTx, seq: &mut SeqState) -> Result<Bui
     }
     // ieee80211_xmit_fast_finish / ieee80211_tx_h_sequence.
     let seq_ctrl = if sta.wme && !multicast {
-        let s = &mut seq.tid[tid as usize & 0xf];
-        let v = *s;
-        *s = (v + 0x10) & IEEE80211_SCTL_SEQ;
-        v
+        seq.next_tid(tid)
     } else {
-        let v = seq.global;
-        seq.global = seq.global.wrapping_add(0x10);
-        v
+        seq.next_global()
     };
 
     let (encaps, skip): (&[u8], usize) = if ethertype == ETH_P_AARP || ethertype == ETH_P_IPX {

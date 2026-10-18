@@ -898,12 +898,17 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
 
     /// `ath11k_mac_mgmt_tx` + the first half of `ath11k_mac_mgmt_tx_wmi`:
     /// a TX buffer id and DMA copy of `frame`, and the
-    /// `WMI_MGMT_TX_SEND_CMDID` to send.
+    /// `WMI_MGMT_TX_SEND_CMDID` to send. The frame first gets the
+    /// sequence number mac80211's TX path gives it
+    /// ([`tx_hdr::tx_h_sequence`]: the vif counter non-QoS data uses).
     pub fn mgmt_tx_prepare(&mut self, vdev_id: u32, frame: &[u8]) -> Result<(u32, WmiCmd), i32> {
         if self.mgmt.pending >= ATH11K_TX_MGMT_NUM_PENDING_MAX {
             // "mgmt tx queue is full"
             return Err(ENOSPC);
         }
+        let mut frame = frame.to_vec();
+        tx_hdr::tx_h_sequence(&mut frame, &mut self.link.seq);
+        let frame = &frame[..];
         let mut mem = DmaMem::alloc(frame.len().max(4), 4).map_err(|_| EIO)?;
         mem.write_bytes(0, frame);
         let paddr = mem.paddr();
@@ -1310,7 +1315,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
                             rt.link.authorized = false;
                             rt.link.ptk = false;
                             rt.link.wme = false;
-                            rt.link.seq = SeqState::default();
+                            rt.link.seq.sta_destroyed();
                         }
                         Some(())
                     }
