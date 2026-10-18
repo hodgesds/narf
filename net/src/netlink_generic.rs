@@ -624,7 +624,8 @@ mod authority_tests {
     );
 
     /// Commands of the permission-test family, one per Linux op-flag class.
-    const PERM_FAMILY: u16 = 0x3e;
+    // Distinct from every other test family id (0x30, 0x3d, errno tests 0x3e).
+    const PERM_FAMILY: u16 = 0x3c;
     const OPEN_CMD: u8 = 1;
     const ADMIN_CMD: u8 = 2;
     const UNS_CMD: u8 = 3;
