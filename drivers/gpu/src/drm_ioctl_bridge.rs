@@ -1929,6 +1929,7 @@ pub(crate) mod kernel_test_buffers {
 
     /// While alive, the DRM copy helpers apply the production predicate on
     /// the CPU that created it, except for the one stand-in buffer.
+    // The guard is only opened by the x86_64-only DRM smokes.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) struct StrictUserCopies {
         cpu: usize,
