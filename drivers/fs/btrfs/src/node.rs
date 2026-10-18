@@ -132,12 +132,57 @@ macro_rules! autogrow {
         }
         let mut r = $op;
         let mut tries = 0u32;
-        while tries < 4 && matches!(r, Err(FsError::NoSpace)) {
+        // Under `narf.disks=root-rw` a full filesystem is ENOSPC, as on
+        // Linux: never allocate chunks (or relocate) on a production root.
+        let may_grow = crate::rw_gate::active_profile() != crate::rw_gate::Profile::RootRw;
+        while may_grow && tries < 4 && matches!(r, Err(FsError::NoSpace)) {
             crate::write::grow_add_chunk(&$vol).await?;
             tries += 1;
             r = $op;
         }
         r
+    }};
+}
+
+/// Run a filesystem-wide administrative mutation `$op` that does not go
+/// through [`autogrow!`]: gated by [`BtrfsVolume::admits_admin_writes`] before
+/// and after taking the operation lock, exactly as `autogrow!` gates ordinary
+/// writes, then serialised with them.
+macro_rules! admin_op {
+    ($vol:expr, $op:expr) => {{
+        if !$vol.admits_admin_writes() {
+            return Err(FsError::ReadOnly);
+        }
+        let _op = $vol.op_lock().lock().await;
+        if !$vol.admits_admin_writes() {
+            return Err(FsError::ReadOnly);
+        }
+        $op
+    }};
+}
+
+/// Run the lock-free read `$body` against `$root`, the root `$node` samples,
+/// and retry it from the tree's current root if it failed with `InvalidData`
+/// while the root moved underneath it: a block of the sampled tree was freed
+/// and reused (Linux `verify_parent_transid` and a fresh search). A failure
+/// against an unchanged root is real corruption and is returned.
+macro_rules! with_root_retry {
+    ($node:expr, $vol:expr, |$root:ident| $body:expr) => {{
+        let mut $root = $node.root(&$vol);
+        let mut tries = 0u32;
+        loop {
+            match $body {
+                Err(FsError::InvalidData) if tries < 4 => {
+                    let fresh = $node.fresh_root(&$vol).await?;
+                    if fresh == $root {
+                        break Err(FsError::InvalidData);
+                    }
+                    $root = fresh;
+                    tries += 1;
+                }
+                other => break other,
+            }
+        }
     }};
 }
 
@@ -331,10 +376,10 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                     } else {
                         disk_flags &= !format::ROOT_SUBVOL_RDONLY;
                     }
-                    {
-                        let _op = vol.op_lock().lock().await;
-                        crate::write::set_subvol_flags(&vol, disk_flags).await
-                    }?;
+                    // Clearing RDONLY is the point of this ioctl, so the
+                    // subvolume's own flag cannot gate it; everything else
+                    // that makes a filesystem unwritable does.
+                    admin_op!(vol, crate::write::set_subvol_flags(&vol, disk_flags).await)?;
                     Ok(FsIoctlReply {
                         result: 0,
                         output: Vec::new(),
@@ -428,10 +473,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                     let command = u64::from_ne_bytes(input[0..8].try_into().unwrap());
                     match command {
                         1 => autogrow!(vol, crate::write::quota_enable(&vol).await)?,
-                        2 => {
-                            let _op = vol.op_lock().lock().await;
-                            crate::write::quota_disable(&vol).await?
-                        }
+                        2 => admin_op!(vol, crate::write::quota_disable(&vol).await)?,
                         4 => autogrow!(vol, crate::write::quota_enable_simple(&vol).await)?,
                         _ => return Err(FsError::InvalidData),
                     }
@@ -449,10 +491,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                     let create = u64::from_ne_bytes(input[0..8].try_into().unwrap());
                     let id = u64::from_ne_bytes(input[8..16].try_into().unwrap());
                     match create {
-                        0 => {
-                            let _op = vol.op_lock().lock().await;
-                            crate::write::qgroup_destroy_admin(&vol, id).await?
-                        }
+                        0 => admin_op!(vol, crate::write::qgroup_destroy_admin(&vol, id).await)?,
                         1 => autogrow!(vol, crate::write::qgroup_create_admin(&vol, id).await)?,
                         _ => return Err(FsError::InvalidData),
                     }
@@ -537,6 +576,19 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             if self.tree_root.is_some() || self.inode().file_type() != FileType::Dir {
                 return Err(FsError::ReadOnly);
             }
+            // NARF's O(1) snapshot shares the source's ROOT block between two
+            // root items. Linux never shares a root block (it copies the root
+            // and adds a reference to each child, `btrfs_copy_root`) and never
+            // treats one as shared (`btrfs_block_can_be_shared`), so a Linux
+            // kernel writing either subvolume afterwards would free blocks the
+            // other still uses. Never create that shape on a production root:
+            // snapper/snap-pac then fail cleanly (EOPNOTSUPP, nothing
+            // created) and pacman carries on.
+            if !crate::write::SNAPSHOTS_LINUX_SHAPED
+                && crate::rw_gate::active_profile() == crate::rw_gate::Profile::RootRw
+            {
+                return Err(FsError::Unsupported);
+            }
             let source = source
                 .as_any()
                 .and_then(|a| a.downcast_ref::<BtrfsNode<B>>())
@@ -580,6 +632,21 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
         self.tree_root.unwrap_or_else(|| vol.fs_tree_root().0)
     }
 
+    /// The tree's root as of now, for a read that found a block which no
+    /// longer belongs to the root it sampled (see [`btree::verify_child`]).
+    async fn fresh_root(&self, vol: &BtrfsVolume<B>) -> Result<u64, FsError> {
+        match self.tree_id {
+            None => Ok(vol.fs_tree_root().0),
+            Some(id) => match vol.live_subvol_root(id) {
+                Some(root) => Ok(root),
+                None => {
+                    let (root_tree, _) = vol.root_tree_root();
+                    Ok(crate::roots::find_root(vol, root_tree, id).await?.0)
+                }
+            },
+        }
+    }
+
     /// Resolve a name to its directory entry via the CRC32C-hashed `DIR_ITEM`.
     async fn find_child(&self, name: &str) -> Result<BtrfsDirEntry, FsError> {
         let vol = self.volume()?;
@@ -588,8 +655,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             format::DIR_ITEM_KEY,
             u64::from(name_hash(name.as_bytes())),
         );
-        let body = btree::find_item(&*vol, self.root(&vol), &key)
-            .await?
+        let body = with_root_retry!(self, vol, |root| btree::find_item(&*vol, root, &key).await)?
             .ok_or(FsError::NotFound)?;
         decode_dir_items(&body)?
             .into_iter()
@@ -608,7 +674,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
         match entry.location.item_type {
             format::INODE_ITEM_KEY => {
                 let ino = entry.child_objectid();
-                let child = vol.load_inode_in(self.root(vol), ino).await?;
+                let child = with_root_retry!(self, vol, |root| vol.load_inode_in(root, ino).await)?;
                 // Inherit this node's tree (default or a pinned subvolume).
                 match (self.tree_root, self.tree_id) {
                     (Some(root), Some(id)) => Ok(BtrfsNode::new_in_subvolume(
@@ -664,14 +730,20 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let vol = self.volume()?;
-            let root = self.root(&vol);
-            // The size is re-read from the tree: this node's cached inode
-            // predates any write made through it (or through another open
-            // file of the same inode).
-            let size = vol.load_inode_in(root, self.ino).await?.size;
-            self.live_size
-                .store(size, core::sync::atomic::Ordering::Relaxed);
-            crate::extent::read_file(&vol, root, self.ino, size, offset, buf).await
+            with_root_retry!(self, vol, |root| {
+                // The size is re-read from the tree: this node's cached inode
+                // predates any write made through it (or through another open
+                // file of the same inode).
+                match vol.load_inode_in(root, self.ino).await {
+                    Ok(inode) => {
+                        self.live_size
+                            .store(inode.size, core::sync::atomic::Ordering::Relaxed);
+                        crate::extent::read_file(&vol, root, self.ino, inode.size, offset, buf)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+            })
         })
     }
 
@@ -900,9 +972,9 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 format::XATTR_ITEM_KEY,
                 u64::from(name_hash(name.as_bytes())),
             );
-            let body = btree::find_item(&*vol, self.root(&vol), &key)
-                .await?
-                .ok_or(FsError::NotFound)?;
+            let body = with_root_retry!(self, vol, |root| btree::find_item(&*vol, root, &key)
+                .await)?
+            .ok_or(FsError::NotFound)?;
             decode_dir_items(&body)?
                 .into_iter()
                 .find(|e| e.name == name)
@@ -914,8 +986,9 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
         Box::pin(async move {
             let vol = self.volume()?;
-            let root = self.root(&vol);
-            let items = btree::collect_for(&*vol, root, self.ino, format::XATTR_ITEM_KEY).await?;
+            let items = with_root_retry!(self, vol, |root| {
+                btree::collect_for(&*vol, root, self.ino, format::XATTR_ITEM_KEY).await
+            })?;
             // Linux listxattr format: NUL-terminated names concatenated.
             let mut out = Vec::new();
             for (_key, body) in &items {
@@ -941,8 +1014,12 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         Box::pin(async move { self.volume()?.sync_to_disk_exclusive().await })
     }
 
+    /// `syncfs(2)`, and the generic `sync(2)` / pre-shutdown sync of every
+    /// mounted filesystem: commit the running transaction, write the
+    /// superblock (pre-flush, FUA primary, mirrors), then flush once more so
+    /// the mirror copies are durable too before the caller powers off.
     fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
-        Box::pin(async move { self.volume()?.sync_to_disk_exclusive().await })
+        Box::pin(async move { self.volume()?.sync_fs().await })
     }
 
     fn dcache_identity(&self) -> (usize, u64, u64) {
@@ -1004,9 +1081,10 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     ) -> FsFuture<'a, Vec<(String, FileType)>> {
         Box::pin(async move {
             let vol = self.volume()?;
-            let root = self.root(&vol);
             // DIR_INDEX gives stable readdir order.
-            let items = btree::collect_for(&*vol, root, self.ino, format::DIR_INDEX_KEY).await?;
+            let items = with_root_retry!(self, vol, |root| {
+                btree::collect_for(&*vol, root, self.ino, format::DIR_INDEX_KEY).await
+            })?;
             let mut out = Vec::new();
             for (_key, body) in items.iter().skip(cursor).take(max) {
                 for entry in decode_dir_items(body)? {

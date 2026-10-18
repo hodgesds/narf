@@ -192,12 +192,39 @@ fn leaf_delete(buf: &mut [u8], slot: usize) -> Result<(), FsError> {
     Ok(())
 }
 
-/// Insert `(key, body)` into a leaf at its sorted position (the key must be
-/// absent). Convenience over [`leaf_insert`] that finds the slot.
-fn leaf_insert_sorted(buf: &mut [u8], key: &BtrfsKey, body: &[u8]) -> Result<(), FsError> {
+/// Insert `(key, body)` into an oversized logical leaf at its sorted position
+/// (the key must be absent). Convenience over [`leaf_insert`] that finds the
+/// slot.
+///
+/// Logical leaves (whole trees read by [`read_fs_oversized`] and re-tiled into
+/// real nodes later) are sized with some headroom, but how much a commit adds
+/// depends on the commit: freeing blocks scattered across a fragmented block
+/// group adds one free-space extent per hole. A full logical leaf therefore
+/// grows to fit instead of failing the commit with `NoSpace`.
+fn leaf_insert_sorted(buf: &mut Vec<u8>, key: &BtrfsKey, body: &[u8]) -> Result<(), FsError> {
     let n = nritems(buf)? as usize;
     let slot = leaf_lower_bound(buf, n, key)?;
-    leaf_insert(buf, slot, key, body)
+    match leaf_insert(buf, slot, key, body) {
+        Err(FsError::NoSpace) => {
+            grow_logical_leaf(buf, LEAF_ITEM_SIZE + body.len())?;
+            leaf_insert(buf, slot, key, body)
+        }
+        other => other,
+    }
+}
+
+/// Re-pack logical leaf `buf` with at least `need` more free bytes (and at
+/// least doubled headroom, so a run of inserts grows it O(log n) times).
+fn grow_logical_leaf(buf: &mut Vec<u8>, need: usize) -> Result<(), FsError> {
+    let items = leaf_items(buf)?;
+    let refs: Vec<(BtrfsKey, &[u8])> = items.iter().map(|(k, b)| (*k, b.as_slice())).collect();
+    let capacity = buf
+        .len()
+        .checked_add(need.max(buf.len()).max(64 * 1024))
+        .ok_or(FsError::NoSpace)?;
+    let grown = pack_leaf(&buf[..HEADER_SIZE], &refs, capacity);
+    *buf = grown;
+    Ok(())
 }
 
 /// Stamp a node buffer with `addr`, `gen`, and the filesystem's selected
@@ -647,7 +674,7 @@ fn fst_bitmap_recount(
 /// this clears the range's bits; in an extent-mode one it carves the range out of
 /// the `FREE_SPACE_EXTENT` that contains it (leaving up to two remainders).
 fn fst_mark_used(
-    fst_leaf: &mut [u8],
+    fst_leaf: &mut Vec<u8>,
     sectorsize: u64,
     bg_start: u64,
     bg_len: u64,
@@ -698,7 +725,7 @@ fn fst_mark_used(
 /// same block group `[bg_start, bg_start+bg_len)` (free extents never span a
 /// block-group boundary, so a neighbour in an adjacent group must not be merged).
 fn fst_mark_free(
-    fst_leaf: &mut [u8],
+    fst_leaf: &mut Vec<u8>,
     sectorsize: u64,
     bg_start: u64,
     bg_len: u64,
@@ -1329,6 +1356,11 @@ impl FsBatch {
     /// Whether any operation has been staged into this transaction.
     pub(crate) fn has_ops(&self) -> bool {
         self.ops > 0
+    }
+
+    /// The subvolume tree this batch COWs.
+    pub(crate) fn tree_id(&self) -> u64 {
+        self.tree_id
     }
 }
 
@@ -2639,6 +2671,25 @@ pub(crate) async fn tree_blocks<B: BlockDevice + 'static>(
     read_fs_oversized(vol, root).await.map(|(_, blocks)| blocks)
 }
 
+/// Test-only: a tree read as one oversized logical leaf.
+#[cfg(feature = "kernel-test")]
+pub(crate) async fn __test_read_oversized<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    root: u64,
+) -> Result<Vec<u8>, FsError> {
+    read_fs_oversized(vol, root).await.map(|(leaf, _)| leaf)
+}
+
+/// Test-only: [`leaf_insert_sorted`].
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_leaf_insert_sorted(
+    buf: &mut Vec<u8>,
+    key: &BtrfsKey,
+    body: &[u8],
+) -> Result<(), FsError> {
+    leaf_insert_sorted(buf, key, body)
+}
+
 async fn read_fs_oversized<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     fs_root: u64,
@@ -3066,6 +3117,206 @@ async fn ensure_private_subvol<B: BlockDevice + 'static>(
         },
     )
     .await
+}
+
+/// Node header `flags` field; its top byte is the backref revision.
+const HDR_FLAGS: usize = 56;
+/// `BTRFS_HEADER_FLAG_RELOC`: written by tree relocation.
+const HEADER_FLAG_RELOC: u64 = 1 << 1;
+/// `BTRFS_MIXED_BACKREF_REV`: the only backref revision the writer emits.
+const MIXED_BACKREF_REV: u64 = 1;
+/// `BTRFS_TREE_RELOC_OBJECTID`.
+const TREE_RELOC_OBJECTID: u64 = (-8i64) as u64;
+
+/// Whether the committed tree block described by `body` (its extent item,
+/// skinny or not) and `header` (its node header) may be freed outright: it is
+/// referenced exactly once, by one inline `TREE_BLOCK_REF`, carries no
+/// `FULL_BACKREF`, and was not written by relocation. Anything else means
+/// another tree (a snapshot, a reloc tree) may still point at it, or that its
+/// children's backrefs name it, and freeing it would let its space be reused
+/// under that reader.
+///
+/// `full_backref_released` is the caller's statement that it has already
+/// moved the block's children off their `FULL_BACKREF` refs (Linux
+/// `update_ref_for_cow`'s `refs == 1` branch: `btrfs_inc_ref(cow)` then
+/// `btrfs_dec_ref(buf, full_backref)`), which is the only way such a block
+/// becomes freeable. Pure: the unit of the refusal tests.
+pub(crate) fn check_freeable_tree_block(
+    body: &[u8],
+    non_skinny: bool,
+    header: &[u8],
+    full_backref_released: bool,
+) -> Result<(), &'static str> {
+    let refs = le64(body, 0).map_err(|_| "short extent item")?;
+    let flags = le64(body, 16).map_err(|_| "short extent item")?;
+    if flags & EXTENT_FLAG_TREE_BLOCK == 0 {
+        return Err("extent item is not a tree block");
+    }
+    if refs != 1 {
+        return Err("tree block has more than one reference");
+    }
+    if flags & crate::rw_gate::BLOCK_FLAG_FULL_BACKREF != 0 && !full_backref_released {
+        return Err("tree block uses FULL_BACKREF");
+    }
+    let at = if non_skinny {
+        24 + format::DISK_KEY_SIZE + 1
+    } else {
+        24
+    };
+    if body.len() != at + 9 || body[at] != TREE_BLOCK_REF_KEY {
+        return Err("tree block's only reference is not one inline TREE_BLOCK_REF");
+    }
+    let hflags = le64(header, HDR_FLAGS).map_err(|_| "short node header")?;
+    let owner = le64(header, HDR_OWNER).map_err(|_| "short node header")?;
+    if hflags >> 56 < MIXED_BACKREF_REV {
+        return Err("tree block uses the old backref revision");
+    }
+    if (hflags & HEADER_FLAG_RELOC != 0 || owner == TREE_RELOC_OBJECTID) && !full_backref_released {
+        return Err("tree block was written by relocation");
+    }
+    Ok(())
+}
+
+/// Defence in depth before a commit writes anything: every committed tree
+/// block it is about to free must be [`check_freeable_tree_block`]. A failure
+/// aborts the transaction (the filesystem turns read-only) without a single
+/// block or superblock written, because the alternative is returning a block
+/// a snapshot still uses to the allocator.
+///
+/// `effective` holds pre-free extent-item bodies the transaction itself
+/// already rewrote (e.g. a `TREE_BLOCK_REF` it moved onto the block); those
+/// take precedence over the committed extent tree. `full_released` names the
+/// `FULL_BACKREF` blocks whose children's refs the transaction moved.
+pub(crate) async fn verify_freed_tree_blocks<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    extent_root: u64,
+    freed: &[(u64, u8)],
+    effective: &BTreeMap<u64, Vec<u8>>,
+    full_released: &BTreeSet<u64>,
+) -> Result<(), FsError> {
+    let mut seen = BTreeSet::new();
+    for &(addr, lvl) in freed {
+        if !seen.insert(addr) {
+            continue;
+        }
+        let (body, non_skinny) = match effective.get(&addr) {
+            Some(body) => (Some(body.clone()), false),
+            None => match btree::find_item(
+                vol,
+                extent_root,
+                &BtrfsKey::new(addr, format::METADATA_ITEM_KEY, u64::from(lvl)),
+            )
+            .await?
+            {
+                Some(body) => (Some(body), false),
+                None => (
+                    btree::find_item(
+                        vol,
+                        extent_root,
+                        &BtrfsKey::new(addr, format::EXTENT_ITEM_KEY, vol.nodesize() as u64),
+                    )
+                    .await?,
+                    true,
+                ),
+            },
+        };
+        let verdict = match body {
+            None => Err("tree block has no extent item"),
+            Some(body) => {
+                let header = vol.read_node_shared(addr).await?;
+                check_freeable_tree_block(&body, non_skinny, &header, full_released.contains(&addr))
+            }
+        };
+        if let Err(why) = verdict {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "btrfs: ABORTING transaction before any write: refusing to free tree block \
+                 {addr:#x} (level {lvl}): {why}; the filesystem is now read-only"
+            );
+            vol.abort_transaction();
+            return Err(FsError::InvalidData);
+        }
+    }
+    Ok(())
+}
+
+/// `btrfs_super_block::super_roots`: four 168-byte `btrfs_root_backup`s
+/// right after the system chunk array.
+const SUPER_ROOTS_OFFSET: usize = format::SYS_CHUNK_ARRAY_OFFSET + 2048;
+const ROOT_BACKUP_SIZE: usize = 168;
+const NUM_BACKUP_ROOTS: usize = 4;
+/// `btrfs_super_block::uuid_tree_generation`.
+const SUPER_UUID_TREE_GENERATION: usize = 563;
+/// `btrfs_super_block::chunk_root_generation`.
+const SUPER_CHUNK_ROOT_GENERATION: usize = 164;
+
+/// `(bytenr, generation, level)` of tree `id`'s ROOT_ITEM in a logical
+/// root-tree leaf, if present.
+fn root_item_triple(root_logical: &[u8], id: u64) -> Option<(u64, u64, u8)> {
+    let slot = leaf_find_by_type(root_logical, id, format::ROOT_ITEM_KEY).ok()??;
+    let item = leaf_item_data(root_logical, slot).ok()?;
+    Some((
+        le64(item, 176).ok()?,
+        le64(item, 160).ok()?,
+        *item.get(238)?,
+    ))
+}
+
+/// The superblock fields Linux refreshes on every commit that NARF's raw
+/// superblock rewrite would otherwise leave stale: one rotating
+/// `super_roots` backup slot (`backup_super_roots`) and
+/// `uuid_tree_generation` (`update_super_roots`, which advances it with the
+/// generation while it was current at mount — otherwise the next Linux mount
+/// would needlessly rescan the UUID tree). `raw` already carries the new
+/// `generation`/`root`/`root_level`/`bytes_used`; `old_gen` is the
+/// generation it replaces.
+fn refresh_super_backups(raw: &mut [u8], root_logical: &[u8], old_gen: u64) -> Result<(), FsError> {
+    let gen = le64(raw, 72)?;
+    if le64(raw, SUPER_UUID_TREE_GENERATION)? == old_gen {
+        raw[SUPER_UUID_TREE_GENERATION..SUPER_UUID_TREE_GENERATION + 8]
+            .copy_from_slice(&gen.to_le_bytes());
+    }
+    // `find_newest_super_backup`: the slot holding the generation being
+    // replaced; the next one is overwritten (slot 0 when none matches).
+    let mut next = 0usize;
+    for i in 0..NUM_BACKUP_ROOTS {
+        let at = SUPER_ROOTS_OFFSET + i * ROOT_BACKUP_SIZE;
+        if le64(raw, at + 8)? == old_gen {
+            next = (i + 1) % NUM_BACKUP_ROOTS;
+            break;
+        }
+    }
+    let at = SUPER_ROOTS_OFFSET + next * ROOT_BACKUP_SIZE;
+    let mut b = [0u8; ROOT_BACKUP_SIZE];
+    let put = |b: &mut [u8; ROOT_BACKUP_SIZE], off: usize, v: u64| {
+        b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    };
+    put(&mut b, 0, le64(raw, 80)?);
+    put(&mut b, 8, gen);
+    b[152] = raw[format::OFF_ROOT_LEVEL];
+    put(&mut b, 16, le64(raw, 88)?);
+    put(&mut b, 24, le64(raw, SUPER_CHUNK_ROOT_GENERATION)?);
+    b[153] = raw[format::OFF_CHUNK_ROOT_LEVEL];
+    for (id, off, level_at) in [
+        (format::EXTENT_TREE_OBJECTID, 32usize, 154usize),
+        (format::FS_TREE_OBJECTID, 48, 155),
+        (format::DEV_TREE_OBJECTID, 64, 156),
+        (format::CSUM_TREE_OBJECTID, 80, 157),
+    ] {
+        if let Some((bytenr, root_gen, level)) = root_item_triple(root_logical, id) {
+            put(&mut b, off, bytenr);
+            put(&mut b, off + 8, root_gen);
+            b[level_at] = level;
+        }
+    }
+    put(&mut b, 96, le64(raw, 112)?);
+    put(&mut b, 104, le64(raw, 120)?);
+    put(&mut b, 112, le64(raw, 136)?);
+    raw.get_mut(at..at + ROOT_BACKUP_SIZE)
+        .ok_or(FsError::InvalidData)?
+        .copy_from_slice(&b);
+    Ok(())
 }
 
 /// Sum every block group's `used` — the definition of the superblock's
@@ -3518,7 +3769,7 @@ async fn qgroup_root_extents<B: BlockDevice + 'static>(
     Ok(extents)
 }
 
-fn apply_logical_edits(logical: &mut [u8], edits: &[Edit]) -> Result<(), FsError> {
+fn apply_logical_edits(logical: &mut Vec<u8>, edits: &[Edit]) -> Result<(), FsError> {
     for edit in edits {
         match edit {
             Edit::Upsert(key, body) => match leaf_find(logical, key)? {
@@ -5090,6 +5341,17 @@ async fn commit_txn<B: BlockDevice + 'static>(
     }
     let (root_root_addr, root_root_level) = tree_root_addr(&root_addrs, root_groups.len(), ns);
 
+    // Nothing has been written yet: refuse to free a block anything else may
+    // still reference (Linux `update_ref_for_cow`), aborting instead.
+    verify_freed_tree_blocks(
+        vol,
+        old_ext,
+        &freed_meta,
+        &BTreeMap::new(),
+        &BTreeSet::new(),
+    )
+    .await?;
+
     // Pin everything this transaction freed BEFORE its replacement nodes go
     // out. `pin_down_extent` does the same: a freed block stays unavailable
     // until a superblock that no longer references it is durable, so a crash
@@ -5149,6 +5411,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
     let bytes_used = total_block_group_used(vol, bgt_root.unwrap_or(ext_root)).await?;
 
     let mut raw = vol.read_raw_superblock().await?;
+    let old_gen = le64(&raw, 72)?;
     raw[72..80].copy_from_slice(&gen.to_le_bytes());
     raw[80..88].copy_from_slice(&root_root_addr.to_le_bytes());
     // `root_level`: the root tree grows a level once it splits (many subvolume
@@ -5158,6 +5421,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
     let incompat = le64(&raw, format::OFF_INCOMPAT_FLAGS)? | txn.incompat_flags_add;
     raw[format::OFF_INCOMPAT_FLAGS..format::OFF_INCOMPAT_FLAGS + 8]
         .copy_from_slice(&incompat.to_le_bytes());
+    refresh_super_backups(&mut raw, &root_logical, old_gen)?;
     crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
     // Stage rather than write. The tree blocks are already out and
     // `commit_roots` below advances the in-memory roots, so readers see this
@@ -5746,6 +6010,11 @@ pub(crate) async fn create_subvolume_with_qgroup<B: BlockDevice + 'static>(
     .await?;
     Ok(new_id)
 }
+
+/// Whether [`create_snapshot_with_qgroup`] produces the snapshot shape Linux
+/// itself writes (a copied root with per-child references). Until it does,
+/// snapshot creation is refused under `narf.disks=root-rw`.
+pub(crate) const SNAPSHOTS_LINUX_SHAPED: bool = false;
 
 /// Create a point-in-time subvolume snapshot below the parent inode.
 ///
@@ -8467,6 +8736,18 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     // growth has just used, its uncommitted fs-tree blocks are invisible to
     // the trees rewritten here, and its pinned extents are still withheld.
     // An empty batch left by `batch_gen` is discarded by the flush as well.
+    //
+    // Never on a production root (`narf.disks=root-rw`): growing allocates
+    // chunks and balancing relocates them, both whole-tree rewrites of the
+    // chunk/device/extent trees this writer keeps for small test images. A
+    // full root is ENOSPC there, as on Linux before a balance.
+    if crate::rw_gate::active_profile() == crate::rw_gate::Profile::RootRw {
+        return Err(if profiles.is_none() && evacuate.is_none() {
+            FsError::NoSpace
+        } else {
+            FsError::Unsupported
+        });
+    }
     vol.sync_to_disk().await?;
     let sb = vol.superblock();
     let (root_tree, _) = vol.root_tree_root();
@@ -8543,9 +8824,21 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
 
     // Per-member physical high-water + a chunk_tree_uuid template from device
     // extents. DEV_EXTENT keys use the member devid as their objectid.
-    let capacities: BTreeMap<u64, u64> = vol.member_capacities().into_iter().collect();
     let member_items: BTreeMap<u64, [u8; format::SUPERBLOCK_DEV_ITEM_SIZE]> =
         vol.member_dev_items().into_iter().collect();
+    // Place chunks only inside the btrfs device's own `total_bytes`, never
+    // merely inside whatever the partition behind it offers.
+    let capacities: BTreeMap<u64, u64> = vol
+        .member_capacities()
+        .into_iter()
+        .map(|(devid, capacity)| {
+            let total = member_items
+                .get(&devid)
+                .and_then(|item| le64(item, 8).ok())
+                .unwrap_or(0);
+            (devid, capacity.min(total))
+        })
+        .collect();
     let eligible_members: Vec<(u64, [u8; format::SUPERBLOCK_DEV_ITEM_SIZE])> = member_items
         .iter()
         .filter(|(devid, _)| Some(**devid) != evacuate)
@@ -9109,6 +9402,18 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
         fst_groups,
     } = grown.ok_or(FsError::NoSpace)?;
 
+    // Every block freed here belongs to a tree nothing else shares (chunk,
+    // device, extent, root, free-space, block-group); confirm it against the
+    // committed extent tree before anything is written.
+    verify_freed_tree_blocks(
+        vol,
+        old_ext,
+        &freed_meta,
+        &BTreeMap::new(),
+        &BTreeSet::new(),
+    )
+    .await?;
+
     // ── Block-group `used`: charge each new block, uncharge each freed one ──
     let mut bgt_final = bgt_base;
     {
@@ -9175,6 +9480,7 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     let bytes_used =
         total_block_group_used(vol, bgt_root.map_or(ext_root_addr, |(addr, _)| addr)).await?;
     let mut raw = vol.read_raw_superblock().await?;
+    let old_gen = le64(&raw, 72)?;
     raw[72..80].copy_from_slice(&gen.to_le_bytes()); // generation
     raw[80..88].copy_from_slice(&root_root_addr.to_le_bytes()); // root
     raw[88..96].copy_from_slice(&chunk_root_addr.to_le_bytes()); // chunk_root
@@ -9241,6 +9547,7 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     raw[sys_at..sys_at + format::SYS_CHUNK_ARRAY_SIZE].fill(0);
     raw[sys_at..sys_at + sys_array.len()].copy_from_slice(&sys_array);
     vol.set_device_bytes_used(&dev_used)?;
+    refresh_super_backups(&mut raw, &root_logical, old_gen)?;
     crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
     vol.flush().await?;
     vol.write_superblock(&raw).await?;

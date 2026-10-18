@@ -45,6 +45,10 @@ pub fn register() {
             return narf_init::InitResult::Error("no btrfs device");
         };
         let dev = entry.dev.clone();
+        if !crate::harness::device_is_disposable(&dev, "btrfs-crash-check", false) {
+            let _ = writeln!(Serial, "{FAIL} (not a disposable harness image)");
+            return narf_init::InitResult::Error("btrfs crash check refused the device");
+        }
         let members = crate::discover_members(dev.clone());
         // `narf.btrfs_crash_subvol=@`: work inside a subvolume (the tall
         // fixture's three-level `@` tree) instead of the default one.

@@ -3798,6 +3798,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     if !matches!(detect_filesystem(&dev), Ok(Some(FsType::Btrfs))) {
                         continue;
                     }
+                    // Only xtask's own fixture, and never the cmdline root.
+                    if !narf_drivers_fs_btrfs::harness::device_is_disposable(
+                        &dev,
+                        "btrfs-disk-smoke",
+                        false,
+                    ) {
+                        continue;
+                    }
                     let factory = match narf_filesystem::root_mount::lookup_factory(FsType::Btrfs) {
                         Some(f) => f,
                         None => break,
@@ -3871,6 +3879,15 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 for entry in &narf_block::block_devices() {
                     let dev = entry.dev.clone();
                     if !matches!(detect_filesystem(&dev), Ok(Some(FsType::Btrfs))) {
+                        continue;
+                    }
+                    // This grows and rewrites the filesystem: only xtask's
+                    // own fixture (harness fsid), never the cmdline root.
+                    if !narf_drivers_fs_btrfs::harness::device_is_disposable(
+                        &dev,
+                        "btrfs-write-smoke",
+                        false,
+                    ) {
                         continue;
                     }
                     let factory = match narf_filesystem::root_mount::lookup_factory(FsType::Btrfs) {

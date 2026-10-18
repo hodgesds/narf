@@ -17,6 +17,8 @@ use crate::chunk::ChunkMap;
 use crate::format::{self, BtrfsKey, Superblock};
 use crate::volume::BtrfsVolume;
 
+mod safety;
+
 // ── Shared test harness ────────────────────────────────────────────
 
 /// Primary fixture in the compact `NARFBTR1` sparse encoding produced by

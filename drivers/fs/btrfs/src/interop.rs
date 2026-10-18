@@ -627,6 +627,18 @@ pub fn run(mode: &str) -> narf_init::InitResult {
         line("NO-ROOT (no writable btrfs root under narf.disks=root-rw)");
         return narf_init::InitResult::NotPresent;
     };
+    // `root_writable()` alone would let a stray `narf.rootrw_interop=` run
+    // this workload on a real root: require the harness image's fsid as the
+    // `root=UUID=` the root was mounted from.
+    let root_uuid = crate::harness::cmdline_root_uuid();
+    let verdict = match root_uuid.as_deref() {
+        Some(uuid) => crate::harness::check_disposable(uuid, None, true),
+        None => Err("root= is not a UUID= naming the harness image"),
+    };
+    if let Err(why) = verdict {
+        line(&format!("REFUSED ({why})"));
+        return narf_init::InitResult::Error("btrfs root-rw interop refused a non-harness root");
+    }
     let root = fs.root();
     let result = narf_scheduler::block_on(async {
         match mode {

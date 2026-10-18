@@ -62,6 +62,32 @@ pub struct BalanceStats {
 struct VolumeIo {
     cap: Cap<DmaBuffer, Write>,
     block_size: usize,
+    /// Bytes in the scratch buffer: a whole number of blocks, at least one
+    /// superblock and one maximum-size tree node.
+    len: usize,
+}
+
+/// Scratch transfer size per member. A superblock copy (4 KiB) and every tree
+/// node (at most 64 KiB) then go to the device as ONE request: on a 512-byte
+/// LBA namespace a block-at-a-time writer turned the FUA primary superblock
+/// into eight separate FUA writes, any prefix of which a power cut could leave
+/// on disk as a torn, checksum-failing primary.
+const SCRATCH_BYTES: usize = 64 * 1024;
+
+/// The scratch length for a device of `block_size`-byte blocks.
+fn scratch_len(block_size: usize) -> usize {
+    (SCRATCH_BYTES / block_size).max(1) * block_size
+}
+
+/// Allocate one member's scratch I/O state.
+fn new_volume_io(block_size: usize, domain: DomainId) -> Result<VolumeIo, FsError> {
+    let len = scratch_len(block_size);
+    let dma = alloc_coherent(len, domain).map_err(|_| FsError::Io(BlockError::IOError))?;
+    Ok(VolumeIo {
+        cap: register_with_cap(dma),
+        block_size,
+        len,
+    })
 }
 
 /// One member device, with geometry and scratch I/O state local to that
@@ -219,6 +245,10 @@ impl<B: BlockDevice> Drop for BtrfsVolume<B> {
         if let Some(live) = self.core.state.lock().subvols.get_mut(&id) {
             live.mounts = live.mounts.saturating_sub(1);
         }
+        // The last view of the core: nothing else can commit for it now.
+        if Arc::strong_count(&self.core) == 1 {
+            (self.core.last_view_dropped)(&self.core);
+        }
     }
 }
 
@@ -367,6 +397,91 @@ pub struct VolCore<B: BlockDevice> {
     /// tree reads and node writes, which is also what serialises the shared
     /// allocator inside it.
     fs_batch: Mutex<Option<crate::write::FsBatch>>,
+    /// Run when the last mount (view) of this core drops: commits whatever a
+    /// writable core still holds (see [`commit_on_last_drop`]). A function
+    /// pointer because `Drop` cannot carry the `'static` bound committing
+    /// needs; it is instantiated where the core is built.
+    last_view_dropped: fn(&Arc<VolCore<B>>),
+    /// The drop-time commit has been started once; a failed one is not
+    /// retried by every internal view that drops after it.
+    drop_commit_tried: core::sync::atomic::AtomicBool,
+}
+
+/// Whether a core still holds work no superblock on disk describes: a batch
+/// with staged operations, or a committed transaction whose superblock is
+/// only staged. A batch lock held by someone else counts as dirty.
+fn core_is_dirty<B: BlockDevice>(core: &VolCore<B>) -> Option<u64> {
+    let staged = core.staged_super.lock().is_some();
+    let batch_tree = match core.fs_batch.try_lock() {
+        Some(guard) => guard
+            .as_ref()
+            .filter(|batch| batch.has_ops())
+            .map(|batch| batch.tree_id()),
+        None => Some(format::FS_TREE_OBJECTID),
+    };
+    match (batch_tree, staged) {
+        (Some(tree), _) => Some(tree),
+        (None, true) => Some(format::FS_TREE_OBJECTID),
+        (None, false) => None,
+    }
+}
+
+/// The last mount of a writable filesystem went away (umount, a dropped
+/// internal mount): make everything it accepted durable instead of silently
+/// discarding the open batch and the staged superblock with the core (Linux
+/// `close_ctree` → `btrfs_commit_super`).
+///
+/// Drop cannot block, so the commit runs on an internal view of the core:
+/// polled once in place — on a synchronous block device with nothing else
+/// holding the locks that completes it — and otherwise handed to the
+/// executor, which keeps the core alive until it is done. A failure is
+/// logged and leaves the filesystem in its error state; it is never retried
+/// in a loop.
+fn commit_on_last_drop<B: BlockDevice + 'static>(core: &Arc<VolCore<B>>) {
+    use core::fmt::Write as _;
+    if core.is_core_read_only() || core.aborted.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let Some(tree) = core_is_dirty(core) else {
+        return;
+    };
+    if core
+        .drop_commit_tried
+        .swap(true, core::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
+    let view = BtrfsVolume::view_for_tree(core, tree);
+    let mut commit: core::pin::Pin<
+        alloc::boxed::Box<dyn core::future::Future<Output = ()> + Send>,
+    > = alloc::boxed::Box::pin(async move {
+        if let Err(error) = view.sync_to_disk().await {
+            let _ = writeln!(
+                    narf_console::Writer,
+                    "btrfs: commit at last unmount FAILED ({error:?}); the filesystem stays at its last durable generation"
+                );
+        }
+    });
+    let waker = noop_waker();
+    let mut cx = core::task::Context::from_waker(&waker);
+    if commit.as_mut().poll(&mut cx).is_pending() {
+        narf_scheduler::spawn(commit);
+    }
+}
+
+/// A waker that does nothing, for the single in-place poll above.
+fn noop_waker() -> core::task::Waker {
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    fn raw() -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VTABLE)
+    }
+    unsafe fn clone(_: *const ()) -> RawWaker {
+        raw()
+    }
+    unsafe fn noop(_: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    // SAFETY: the vtable never dereferences the (null) data pointer.
+    unsafe { Waker::from_raw(raw()) }
 }
 
 /// `CAP_SYS_RESOURCE` — see [`BtrfsVolume::quota_override`].
@@ -427,6 +542,19 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// `supports_writes`, so the draining commit itself can still land.
     pub(crate) fn admits_writes(&self) -> bool {
         self.supports_writes() && !self.frozen.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The gate for administrative writers that may legitimately run on a
+    /// subvolume marked read-only (`BTRFS_IOC_SUBVOL_SETFLAGS` clearing that
+    /// very flag, qgroup/quota administration): everything
+    /// [`Self::admits_writes`] requires except the subvolume's `RDONLY` flag.
+    pub(crate) fn admits_admin_writes(&self) -> bool {
+        use core::sync::atomic::Ordering;
+        !self.core_read_only()
+            && !self.view_read_only()
+            && !self.degraded
+            && !self.aborted.load(Ordering::Acquire)
+            && !self.frozen.load(Ordering::Acquire)
     }
 
     fn view_read_only(&self) -> bool {
@@ -559,6 +687,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.set_quota_override(on);
     }
 
+    /// The write-safety gate's refusal, if it refused this core.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn rw_refusal(&self) -> Option<crate::rw_gate::Refusal> {
+        self.rw_refusal.lock().clone()
+    }
+
     /// Whether a transaction has been aborted on this volume.
     #[cfg(feature = "kernel-test")]
     pub(crate) fn transaction_aborted(&self) -> bool {
@@ -613,16 +747,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if capacity <= 1024 * 1024 || capacity % u64::from(self.sectorsize) != 0 {
             return Err(FsError::InvalidData);
         }
-        let dma =
-            alloc_coherent(logical, self.domain).map_err(|_| FsError::Io(BlockError::IOError))?;
+        let io = new_volume_io(logical, self.domain)?;
         Ok(Arc::new(VolumeDevice {
             device,
             capacity,
             dev_item: IrqSafeSpinLock::new(dev_item),
-            io: Mutex::new(VolumeIo {
-                cap: register_with_cap(dma),
-                block_size: logical,
-            }),
+            io: Mutex::new(io),
         }))
     }
 
@@ -691,6 +821,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     pub async fn replace_device(&self, devid: u64, target: Arc<B>) -> Result<(), FsError> {
         if !self.supports_writes() {
             return Err(FsError::ReadOnly);
+        }
+        if crate::rw_gate::active_profile() == crate::rw_gate::Profile::RootRw {
+            return Err(FsError::Unsupported);
         }
         let source = self.member(devid)?;
         if self
@@ -1330,12 +1463,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                 }
                 continue;
             }
-            let dma =
-                alloc_coherent(logical, domain).map_err(|_| FsError::Io(BlockError::IOError))?;
-            let io = Mutex::new(VolumeIo {
-                cap: register_with_cap(dma),
-                block_size: logical,
-            });
+            let io = Mutex::new(new_volume_io(logical, domain)?);
             let mut best: Option<(u64, Superblock, [u8; format::SUPERBLOCK_DEV_ITEM_SIZE], u64)> =
                 None;
             let mut saw_unsupported = false;
@@ -1520,6 +1648,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             aborted: core::sync::atomic::AtomicBool::new(false),
             quota_override: core::sync::atomic::AtomicBool::new(false),
             fs_batch: Mutex::new(None),
+            last_view_dropped: commit_on_last_drop::<B>,
+            drop_commit_tried: core::sync::atomic::AtomicBool::new(false),
             state: IrqSafeSpinLock::new(VolState {
                 superblock,
                 superblock_source: (source_devid, source_offset),
@@ -2014,6 +2144,18 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.sync_to_disk().await
     }
 
+    /// `syncfs`: [`Self::sync_to_disk_exclusive`] plus a trailing device
+    /// flush, so the superblock mirrors (written without FUA) are durable as
+    /// well. Safe from a pre-shutdown hook while the block devices still run:
+    /// it waits for the running operation, takes no IRQ-masking lock across
+    /// I/O, and on a read-only or aborted filesystem only flushes.
+    pub async fn sync_fs(&self) -> Result<(), FsError> {
+        if !self.core_read_only() && !self.aborted.load(core::sync::atomic::Ordering::Acquire) {
+            self.sync_to_disk_exclusive().await?;
+        }
+        self.flush().await
+    }
+
     pub async fn sync_to_disk(&self) -> Result<(), FsError> {
         crate::write::flush_batch(self).await?;
         self.write_staged_super().await
@@ -2140,7 +2282,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         logical: u64,
         buf: &[u8],
     ) -> Result<(), FsError> {
-        if self.degraded {
+        // Root-admin skips only the subvolume's own RDONLY flag; a read-only
+        // or aborted filesystem takes no writes from anyone.
+        if self.degraded
+            || self.core_read_only()
+            || self.aborted.load(core::sync::atomic::Ordering::Acquire)
+        {
             return Err(FsError::ReadOnly);
         }
         let epoch = self.write_logical_unchecked(logical, buf).await?;
@@ -2257,7 +2404,10 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// Superblock half of [`Self::write_node_root_admin`].
     pub(crate) async fn write_superblock_root_admin(&self, raw: &[u8]) -> Result<(), FsError> {
-        if self.degraded || self.core_read_only() {
+        if self.degraded
+            || self.core_read_only()
+            || self.aborted.load(core::sync::atomic::Ordering::Acquire)
+        {
             return Err(FsError::ReadOnly);
         }
         self.write_superblock_unchecked(raw).await
@@ -2306,9 +2456,19 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let mut primary_ok = None;
         for (devid, member) in &members {
             let mut device_ok = true;
+            // Linux `write_dev_supers`: a mirror is written only below the
+            // device's btrfs `total_bytes` (`commit_total_bytes`), never merely
+            // because the partition behind it is larger.
+            let dev_total = format::le64(&*member.dev_item.lock(), 8).unwrap_or(0);
+            let fits_below = dev_total.min(member.capacity);
             for &offset in &format::SUPERBLOCK_MIRROR_OFFSETS {
-                if offset + format::SUPERBLOCK_SIZE as u64 > member.capacity {
+                if offset + format::SUPERBLOCK_SIZE as u64 >= fits_below
+                    && offset != format::SUPERBLOCK_OFFSET
+                {
                     continue; // this mirror doesn't fit on this member
+                }
+                if offset + format::SUPERBLOCK_SIZE as u64 > member.capacity {
+                    continue;
                 }
                 let mut copy = raw.to_vec();
                 let b = format::SUPERBLOCK_BYTENR_OFFSET;
@@ -2432,6 +2592,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             live.root = new_fs_root;
             live.level = new_fs_level;
         }
+    }
+
+    /// The live root of subvolume `id` when some mount tracks it.
+    pub(crate) fn live_subvol_root(&self, id: u64) -> Option<u64> {
+        self.state.lock().subvols.get(&id).map(|live| live.root)
     }
 
     /// Publish a committed root for a tree other than this mount's (a
@@ -2599,8 +2764,29 @@ fn same_common_superblock(left: &Superblock, right: &Superblock) -> bool {
         && left.sys_chunk_array == right.sys_chunk_array
 }
 
-/// Write `src` at physical byte offset `offset`, one logical block at a time,
-/// reading-modifying-writing any partial leading/trailing block.
+/// The run of whole device blocks the next request covers, starting at byte
+/// `absolute` and wanting `remaining` bytes: `(lba, blocks, offset of
+/// `absolute` within the run, bytes of the caller's range inside the run)`.
+/// Pure: the unit of the request-shape tests.
+pub(crate) fn io_run(
+    absolute: u64,
+    remaining: usize,
+    block_size: usize,
+    scratch: usize,
+) -> (u64, usize, usize, usize) {
+    let bs = block_size as u64;
+    let lba = absolute / bs;
+    let in_run = (absolute % bs) as usize;
+    let copy = remaining.min(scratch - in_run);
+    let blocks = (in_run + copy).div_ceil(block_size);
+    (lba, blocks, in_run, copy)
+}
+
+/// Write `src` at physical byte offset `offset` in as few requests as the
+/// scratch buffer allows (one per 64 KiB run of whole blocks), reading and
+/// merging the existing contents only when the range starts or ends inside a
+/// block. A superblock copy or a tree node is therefore a single request,
+/// whatever the device's logical block size.
 async fn write_exact_to<B: BlockDevice + 'static>(
     device: &B,
     io: &Mutex<VolumeIo>,
@@ -2620,18 +2806,17 @@ async fn write_exact_to<B: BlockDevice + 'static>(
         let absolute = offset + done as u64;
         let guard = io.lock().await;
         let block_size = guard.block_size;
-        let lba = absolute / block_size as u64;
-        let in_block = (absolute % block_size as u64) as usize;
-        let copy = (src.len() - done).min(block_size - in_block);
-        let partial = in_block != 0 || copy < block_size;
+        let (lba, blocks, in_run, copy) = io_run(absolute, src.len() - done, block_size, guard.len);
+        let run_bytes = blocks * block_size;
+        let partial = in_run != 0 || copy != run_bytes;
 
-        // For a partial block, fetch existing contents first so untouched bytes
+        // For a partial run, fetch existing contents first so untouched bytes
         // are preserved.
         if partial {
             let read = BlockRequest {
                 op: BlockOp::Read,
                 lba,
-                blocks: 1,
+                blocks: blocks as u32,
                 buffer: guard
                     .cap
                     .derive::<Read>()
@@ -2646,14 +2831,15 @@ async fn write_exact_to<B: BlockDevice + 'static>(
             .buffer()
             .ok_or(FsError::Io(BlockError::PermissionDenied))?;
         // SAFETY: `guard` serialises all submissions on this registered coherent
-        // buffer of `block_size` bytes; we hold a strong Arc for the copy.
-        let dst = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), block_size) };
-        dst[in_block..in_block + copy].copy_from_slice(&src[done..done + copy]);
+        // buffer of `guard.len >= run_bytes` bytes; we hold a strong Arc for the
+        // copy.
+        let dst = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), run_bytes) };
+        dst[in_run..in_run + copy].copy_from_slice(&src[done..done + copy]);
 
         let write = BlockRequest {
             op: BlockOp::Write { fua },
             lba,
-            blocks: 1,
+            blocks: blocks as u32,
             buffer: guard
                 .cap
                 .derive::<Read>()
@@ -2668,9 +2854,8 @@ async fn write_exact_to<B: BlockDevice + 'static>(
     Ok(())
 }
 
-/// Read `dst.len()` bytes at physical byte offset `offset`, one logical block at
-/// a time through the volume's serialised scratch buffer. Copied from the
-/// squashfs driver's byte-range reader.
+/// Read `dst.len()` bytes at physical byte offset `offset`, one scratch-sized
+/// run of whole blocks per request through the volume's serialised buffer.
 async fn read_exact_from<B: BlockDevice + 'static>(
     device: &B,
     io: &Mutex<VolumeIo>,
@@ -2689,12 +2874,11 @@ async fn read_exact_from<B: BlockDevice + 'static>(
         let absolute = offset + done as u64;
         let guard = io.lock().await;
         let block_size = guard.block_size;
-        let lba = absolute / block_size as u64;
-        let in_block = (absolute % block_size as u64) as usize;
+        let (lba, blocks, in_run, copy) = io_run(absolute, dst.len() - done, block_size, guard.len);
         let request = BlockRequest {
             op: BlockOp::Read,
             lba,
-            blocks: 1,
+            blocks: blocks as u32,
             buffer: guard
                 .cap
                 .derive::<Read>()
@@ -2706,12 +2890,11 @@ async fn read_exact_from<B: BlockDevice + 'static>(
         let buffer = guard
             .buffer()
             .ok_or(FsError::Io(BlockError::PermissionDenied))?;
-        let copy = (dst.len() - done).min(block_size - in_block);
         // SAFETY: `guard` serialises all submissions on this registered coherent
-        // buffer, which is `block_size` bytes and stays registered until the
-        // volume drops.
-        let source = unsafe { core::slice::from_raw_parts(buffer.as_ptr(), block_size) };
-        dst[done..done + copy].copy_from_slice(&source[in_block..in_block + copy]);
+        // buffer, which is `guard.len >= blocks * block_size` bytes and stays
+        // registered until the volume drops.
+        let source = unsafe { core::slice::from_raw_parts(buffer.as_ptr(), blocks * block_size) };
+        dst[done..done + copy].copy_from_slice(&source[in_run..in_run + copy]);
         done += copy;
         drop(guard);
     }

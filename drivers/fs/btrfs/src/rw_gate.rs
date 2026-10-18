@@ -148,6 +148,27 @@ pub enum Refusal {
     ReplaceInProgress,
     /// Reloc roots of an interrupted relocation.
     RelocationInProgress,
+    /// A subvolume has been snapshotted (`last_snapshot != 0`): its tree
+    /// blocks may be shared with a snapshot, and the writer would have to
+    /// follow Linux `update_ref_for_cow` to COW them without freeing blocks
+    /// the snapshot still uses.
+    Snapshotted {
+        /// The subvolume's tree id.
+        root: u64,
+        /// Its `btrfs_root_item::last_snapshot` generation.
+        last_snapshot: u64,
+    },
+    /// A deleted subvolume whose tree Linux has not finished dropping (an
+    /// orphan root item, `refs == 0`, or a `drop_progress` key).
+    DeadRoot(u64),
+    /// A tree block whose backrefs the writer does not maintain: more than
+    /// one reference, `FULL_BACKREF`, a shared-block or keyed backref.
+    SharedTreeBlock {
+        bytenr: u64,
+        refs: u64,
+        flags: u64,
+        why: &'static str,
+    },
 }
 
 fn push_bits(out: &mut String, bits: u64, name: fn(u32) -> Option<&'static str>) {
@@ -204,6 +225,29 @@ impl fmt::Display for Refusal {
             Refusal::BalanceInProgress => f.write_str("a balance is paused or running"),
             Refusal::ReplaceInProgress => f.write_str("a device replace is started or suspended"),
             Refusal::RelocationInProgress => f.write_str("an interrupted relocation is pending"),
+            Refusal::Snapshotted {
+                root,
+                last_snapshot,
+            } => write!(
+                f,
+                "subvolume {root} has snapshots (last_snapshot gen {last_snapshot}); \
+                 its tree blocks may be shared and the writer does not yet maintain \
+                 shared-block backrefs"
+            ),
+            Refusal::DeadRoot(root) => write!(
+                f,
+                "deleted subvolume {root} is still being dropped (mount it once on Linux)"
+            ),
+            Refusal::SharedTreeBlock {
+                bytenr,
+                refs,
+                flags,
+                why,
+            } => write!(
+                f,
+                "tree block {bytenr:#x} refs {refs} flags {flags:#x}: {why}; \
+                 the writer does not yet maintain shared-block backrefs"
+            ),
         }
     }
 }
@@ -371,6 +415,202 @@ pub async fn check_trees<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Resu
                 }
             }
             Err(_) => return Err(Refusal::ReplaceInProgress),
+        }
+    }
+    check_sharing(vol).await
+}
+
+// ── Shared tree blocks ──────────────────────────────────────────────
+
+/// `BTRFS_ORPHAN_OBJECTID`: orphan items in the root tree name deleted
+/// subvolumes whose trees are still being dropped.
+const ORPHAN_OBJECTID: u64 = (-5i64) as u64;
+/// `BTRFS_ORPHAN_ITEM_KEY`.
+const ORPHAN_ITEM_KEY: u8 = 48;
+/// `btrfs_root_item` field offsets.
+const ROOT_ITEM_BYTENR: usize = 176;
+const ROOT_ITEM_LAST_SNAPSHOT: usize = 200;
+const ROOT_ITEM_REFS: usize = 216;
+const ROOT_ITEM_DROP_PROGRESS: usize = 220;
+const ROOT_ITEM_DROP_LEVEL: usize = 237;
+/// Extent-item flags (`BTRFS_EXTENT_FLAG_*`, `BTRFS_BLOCK_FLAG_FULL_BACKREF`).
+pub const EXTENT_FLAG_DATA: u64 = 1 << 0;
+pub const EXTENT_FLAG_TREE_BLOCK: u64 = 1 << 1;
+pub const BLOCK_FLAG_FULL_BACKREF: u64 = 1 << 8;
+/// Backref key types (inline type bytes and keyed item types).
+pub const TREE_BLOCK_REF_KEY: u8 = 176;
+pub const EXTENT_DATA_REF_KEY: u8 = 178;
+pub const SHARED_BLOCK_REF_KEY: u8 = 182;
+pub const SHARED_DATA_REF_KEY: u8 = 184;
+
+/// Whether the writer maintains Linux's shared-tree-block backrefs
+/// (`update_ref_for_cow`). Until it does, any sharing is refused here.
+pub const WRITER_HANDLES_SHARED_TREES: bool = false;
+
+fn is_fs_tree(id: u64) -> bool {
+    id == format::FS_TREE_OBJECTID
+        || (format::FIRST_FREE_OBJECTID..=format::LAST_FREE_OBJECTID).contains(&id)
+}
+
+/// What one subvolume ROOT_ITEM says about sharing. Pure: the unit of the
+/// root-item refusal tests.
+pub fn check_root_item(id: u64, body: &[u8]) -> Result<(), Refusal> {
+    if !is_fs_tree(id) {
+        return Ok(());
+    }
+    let le64 = |off: usize| format::le64(body, off).unwrap_or(u64::MAX);
+    if body.len() <= ROOT_ITEM_DROP_LEVEL {
+        // An old (pre-v2) root item is still long enough for these fields;
+        // anything shorter is not a root item NARF can judge.
+        return Err(Refusal::DeadRoot(id));
+    }
+    let refs = format::le32(body, ROOT_ITEM_REFS).unwrap_or(0);
+    if refs == 0 || le64(ROOT_ITEM_DROP_PROGRESS) != 0 || body[ROOT_ITEM_DROP_LEVEL] != 0 {
+        return Err(Refusal::DeadRoot(id));
+    }
+    let last_snapshot = le64(ROOT_ITEM_LAST_SNAPSHOT);
+    if last_snapshot != 0 && !WRITER_HANDLES_SHARED_TREES {
+        return Err(Refusal::Snapshotted {
+            root: id,
+            last_snapshot,
+        });
+    }
+    Ok(())
+}
+
+/// What one tree-block extent item says about sharing. `inline` is the body
+/// after `btrfs_extent_item` (and `tree_block_info` for a non-skinny item);
+/// `root_holders` is how many ROOT_ITEMs name this block as their root
+/// (NARF's own O(1) snapshot shares a root block between root items, which
+/// the writer privatises before the first mutation). Pure.
+pub fn check_tree_block_item(
+    bytenr: u64,
+    refs: u64,
+    flags: u64,
+    inline: &[u8],
+    root_holders: u64,
+) -> Result<(), Refusal> {
+    let refuse = |why| {
+        Err(Refusal::SharedTreeBlock {
+            bytenr,
+            refs,
+            flags,
+            why,
+        })
+    };
+    if WRITER_HANDLES_SHARED_TREES {
+        return Ok(());
+    }
+    if flags & BLOCK_FLAG_FULL_BACKREF != 0 {
+        return refuse("FULL_BACKREF");
+    }
+    let mut pos = 0usize;
+    let mut counted = 0u64;
+    while pos < inline.len() {
+        let size = match inline[pos] {
+            TREE_BLOCK_REF_KEY => 9,
+            SHARED_BLOCK_REF_KEY => return refuse("shared-block backref"),
+            _ => return refuse("unexpected inline backref"),
+        };
+        if pos + size > inline.len() {
+            return refuse("truncated inline backref");
+        }
+        counted += 1;
+        pos += size;
+    }
+    if counted != refs {
+        return refuse("keyed backref");
+    }
+    if refs > 1 && refs != root_holders {
+        return refuse("shared below a subvolume root");
+    }
+    Ok(())
+}
+
+/// Refuse a read-write mount while any tree block is (or may be) shared in a
+/// way the writer does not maintain. Linux `btrfs_block_can_be_shared` /
+/// `update_ref_for_cow` decide per COW whether a block is shared with a
+/// snapshot; until NARF follows them, the gate fails closed on every sign of
+/// sharing: a snapshotted or half-deleted subvolume, and any tree block in a
+/// metadata block group with more than one reference (other than NARF's own
+/// shared subvolume root), `FULL_BACKREF`, or a shared/keyed backref.
+pub async fn check_sharing<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<(), Refusal> {
+    let fail = |_| Refusal::SharedTreeBlock {
+        bytenr: 0,
+        refs: 0,
+        flags: 0,
+        why: "extent/root tree unreadable",
+    };
+    let (root_tree, _) = vol.root_tree_root();
+    let mut holders: alloc::collections::BTreeMap<u64, u64> = alloc::collections::BTreeMap::new();
+    {
+        let mut cursor = crate::btree::Cursor::seek(vol, root_tree, &BtrfsKey::new(0, 0, 0))
+            .await
+            .map_err(fail)?;
+        while let Some((key, body)) = cursor.current().map_err(fail)? {
+            if key.objectid == ORPHAN_OBJECTID && key.item_type == ORPHAN_ITEM_KEY {
+                return Err(Refusal::DeadRoot(key.offset));
+            }
+            if key.item_type == format::ROOT_ITEM_KEY {
+                check_root_item(key.objectid, body)?;
+                if is_fs_tree(key.objectid) {
+                    let at = format::le64(body, ROOT_ITEM_BYTENR).map_err(fail)?;
+                    *holders.entry(at).or_insert(0) += 1;
+                }
+            }
+            cursor.advance().await.map_err(fail)?;
+        }
+    }
+    let (extent_root, _) = crate::roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
+        .await
+        .map_err(fail)?;
+    let bg_tree = crate::block_group::bg_home(vol, root_tree)
+        .await
+        .map_err(fail)?
+        .scan_root(extent_root);
+    let groups = crate::block_group::read_block_groups(vol, bg_tree)
+        .await
+        .map_err(fail)?;
+    for (start, len, body) in groups {
+        let bg_flags = format::le64(&body, 16).map_err(fail)?;
+        if bg_flags & (format::BLOCK_GROUP_METADATA | format::BLOCK_GROUP_SYSTEM) == 0 {
+            continue;
+        }
+        let end = start.saturating_add(len);
+        let mut cursor = crate::btree::Cursor::seek(vol, extent_root, &BtrfsKey::new(start, 0, 0))
+            .await
+            .map_err(fail)?;
+        while let Some((key, body)) = cursor.current().map_err(fail)? {
+            if key.objectid >= end {
+                break;
+            }
+            match key.item_type {
+                format::METADATA_ITEM_KEY | format::EXTENT_ITEM_KEY => {
+                    let refs = format::le64(body, 0).map_err(fail)?;
+                    let flags = format::le64(body, 16).map_err(fail)?;
+                    if flags & EXTENT_FLAG_TREE_BLOCK != 0 {
+                        // A non-skinny item carries `tree_block_info` (key + level).
+                        let inline_at = if key.item_type == format::EXTENT_ITEM_KEY {
+                            24 + format::DISK_KEY_SIZE + 1
+                        } else {
+                            24
+                        };
+                        let inline = body.get(inline_at..).unwrap_or(&[]);
+                        let held = holders.get(&key.objectid).copied().unwrap_or(0);
+                        check_tree_block_item(key.objectid, refs, flags, inline, held)?;
+                    }
+                }
+                TREE_BLOCK_REF_KEY | SHARED_BLOCK_REF_KEY if !WRITER_HANDLES_SHARED_TREES => {
+                    return Err(Refusal::SharedTreeBlock {
+                        bytenr: key.objectid,
+                        refs: 0,
+                        flags: 0,
+                        why: "keyed tree-block backref",
+                    });
+                }
+                _ => {}
+            }
+            cursor.advance().await.map_err(fail)?;
         }
     }
     Ok(())

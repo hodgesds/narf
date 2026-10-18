@@ -34,6 +34,7 @@ pub mod decompress_cache;
 pub mod dir;
 pub mod extent;
 pub mod format;
+pub mod harness;
 pub mod inode;
 pub mod interop;
 pub mod lzo;

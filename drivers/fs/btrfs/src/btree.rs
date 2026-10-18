@@ -79,6 +79,55 @@ pub fn internal_blockptr(buf: &[u8], i: usize) -> Result<u64, FsError> {
     le64(buf, off)
 }
 
+/// Generation recorded in internal child pointer `i` (`btrfs_key_ptr::generation`).
+pub fn internal_ptr_gen(buf: &[u8], i: usize) -> Result<u64, FsError> {
+    let off = HEADER_SIZE + i * KEY_PTR_SIZE + DISK_KEY_SIZE + 8;
+    le64(buf, off)
+}
+
+/// Linux `verify_parent_transid` + `btrfs_verify_level_key`: the child a
+/// parent pointer leads to must carry the generation the pointer records, sit
+/// exactly one level below the parent, and begin with the pointer's key.
+///
+/// A lock-free reader descending a tree it sampled before a commit can reach a
+/// block that commit freed and a later one reused; the block's own bytenr and
+/// checksum are then perfectly valid, and only these cross-checks against the
+/// parent reveal that it now belongs to another tree. A mismatch is reported
+/// as `InvalidData`, and readers retry from the current root.
+pub fn verify_child(parent: &[u8], slot: usize, child: &[u8]) -> Result<(), FsError> {
+    let want_gen = internal_ptr_gen(parent, slot)?;
+    if le64(child, 80)? != want_gen {
+        return Err(FsError::InvalidData);
+    }
+    let parent_level = level(parent)?;
+    if parent_level == 0 || level(child)? != parent_level - 1 {
+        return Err(FsError::InvalidData);
+    }
+    if nritems(child)? > 0 {
+        let first = if level(child)? == 0 {
+            leaf_item_key(child, 0)?
+        } else {
+            internal_key(child, 0)?
+        };
+        if first != internal_key(parent, slot)? {
+            return Err(FsError::InvalidData);
+        }
+    }
+    Ok(())
+}
+
+/// Read the child at `slot` of internal node `parent`, verified by
+/// [`verify_child`].
+pub async fn read_child<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    parent: &[u8],
+    slot: usize,
+) -> Result<Vec<u8>, FsError> {
+    let child = vol.read_node(internal_blockptr(parent, slot)?).await?;
+    verify_child(parent, slot, &child)?;
+    Ok(child)
+}
+
 /// First leaf slot whose key is `>= target` (an insertion point in `0..=n`).
 pub fn leaf_lower_bound(buf: &[u8], n: usize, target: &BtrfsKey) -> Result<usize, FsError> {
     let (mut lo, mut hi) = (0usize, n);
@@ -131,9 +180,9 @@ impl<'v, B: BlockDevice + 'static> Cursor<'v, B> {
         target: &BtrfsKey,
     ) -> Result<Cursor<'v, B>, FsError> {
         let mut path: Vec<(Vec<u8>, usize)> = Vec::new();
-        let mut node_logical = root;
+        let mut next = vol.read_node(root).await?;
         for _ in 0..=MAX_LEVEL {
-            let buf = vol.read_node(node_logical).await?;
+            let buf = core::mem::take(&mut next);
             let n = nritems(&buf)? as usize;
             if level(&buf)? == 0 {
                 let slot = leaf_lower_bound(&buf, n, target)?;
@@ -148,7 +197,7 @@ impl<'v, B: BlockDevice + 'static> Cursor<'v, B> {
                 return Err(FsError::InvalidData);
             }
             let slot = internal_child_slot(&buf, n, target)?;
-            node_logical = internal_blockptr(&buf, slot)?;
+            next = read_child(vol, &buf, slot).await?;
             path.push((buf, slot));
         }
         Err(FsError::InvalidData)
@@ -197,14 +246,13 @@ impl<'v, B: BlockDevice + 'static> Cursor<'v, B> {
             if slot + 1 >= n {
                 continue;
             }
-            let mut child = {
+            let mut cbuf = {
                 let (buf, _) = &self.path[idx - 1];
-                internal_blockptr(buf, slot + 1)?
+                read_child(self.vol, buf, slot + 1).await?
             };
             self.path[idx - 1].1 = slot + 1;
             // Descend to the leftmost leaf of the sibling subtree.
             for _ in 0..=MAX_LEVEL {
-                let cbuf = self.vol.read_node(child).await?;
                 if level(&cbuf)? == 0 {
                     self.path.push((cbuf, 0));
                     return Ok(());
@@ -212,9 +260,9 @@ impl<'v, B: BlockDevice + 'static> Cursor<'v, B> {
                 if nritems(&cbuf)? == 0 {
                     return Err(FsError::InvalidData);
                 }
-                let next = internal_blockptr(&cbuf, 0)?;
+                let next = read_child(self.vol, &cbuf, 0).await?;
                 self.path.push((cbuf, 0));
-                child = next;
+                cbuf = next;
             }
             return Err(FsError::InvalidData);
         }
@@ -249,9 +297,9 @@ pub async fn last_before<B: BlockDevice + 'static>(
 ) -> Result<Option<(BtrfsKey, Vec<u8>)>, FsError> {
     // Descend, remembering each internal node and the child slot taken.
     let mut path: Vec<(Vec<u8>, usize)> = Vec::new();
-    let mut node = root;
+    let mut next = vol.read_node(root).await?;
     let leaf = loop {
-        let buf = vol.read_node(node).await?;
+        let buf = core::mem::take(&mut next);
         if level(&buf)? == 0 {
             break buf;
         }
@@ -260,7 +308,7 @@ pub async fn last_before<B: BlockDevice + 'static>(
             return Err(FsError::InvalidData);
         }
         let slot = internal_child_slot(&buf, n, ceiling)?;
-        node = internal_blockptr(&buf, slot)?;
+        next = read_child(vol, &buf, slot).await?;
         path.push((buf, slot));
     };
     // The last slot in this leaf with key < ceiling, if any.
@@ -279,9 +327,8 @@ pub async fn last_before<B: BlockDevice + 'static>(
         if slot == 0 {
             continue;
         }
-        let mut child = internal_blockptr(&buf, slot - 1)?;
+        let mut cbuf = read_child(vol, &buf, slot - 1).await?;
         let last_leaf = loop {
-            let cbuf = vol.read_node(child).await?;
             let cn = nritems(&cbuf)? as usize;
             if cn == 0 {
                 return Err(FsError::InvalidData);
@@ -289,7 +336,7 @@ pub async fn last_before<B: BlockDevice + 'static>(
             if level(&cbuf)? == 0 {
                 break cbuf;
             }
-            child = internal_blockptr(&cbuf, cn - 1)?;
+            cbuf = read_child(vol, &cbuf, cn - 1).await?;
         };
         let cn = nritems(&last_leaf)? as usize;
         return Ok(Some((
