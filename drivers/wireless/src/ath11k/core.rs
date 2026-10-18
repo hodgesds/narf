@@ -65,6 +65,7 @@ use super::htc::{
     self, svc_id, Htc, HtcConfig, HtcConnected, HtcError, HtcReady, HtcRxKind, HtcTx,
 };
 use super::hw::{HwParams, HwRev};
+use super::mhi_host::MhiNotify;
 use super::power::ChipIo;
 use super::qmi_wlfw::{ATH11K_FIRMWARE_MODE_NORMAL, ATH11K_FIRMWARE_MODE_OFF};
 use super::wlfw::{self, WlfwError};
@@ -174,6 +175,22 @@ pub trait Hif {
     fn now_ms(&self) -> u64;
 }
 
+/// What the firmware transport reported after bring-up
+/// ([`QmiFw::service`]), in Linux's terms.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FwNotice {
+    /// `ath11k_mhi_op_status_cb` queued `reset_work` (MHI_CB_EE_RDDM, or
+    /// MHI_CB_SYS_ERROR, spec §8): `ath11k_core_reset`.
+    Reset(MhiNotify),
+    /// `ATH11K_QMI_EVENT_SERVER_EXIT`: CRASH_FLUSH + RECOVERY and
+    /// `ath11k_core_pre_reconfigure_recovery`; the firmware announces
+    /// itself again and the handshake reruns.
+    ServerExit,
+    /// FW_INIT_DONE (or FW_READY) with `ATH11K_FLAG_REGISTERED` set:
+    /// `queue_work(restart_work)`.
+    Restart,
+}
+
 /// The QMI half of firmware start/stop.
 pub trait QmiFw {
     /// `ath11k_qmi_firmware_start(ab, mode)`.
@@ -184,10 +201,19 @@ pub trait QmiFw {
     ) -> impl Future<Output = Result<(), WlfwError>>;
     /// `ath11k_qmi_firmware_stop`: `wlan_mode OFF`, errors only logged.
     fn firmware_stop(&mut self) -> impl Future<Output = ()>;
-    /// Service the QMI transport after bring-up (Linux keeps the QMI
-    /// handle and its QRTR socket alive for later indications). Sync and
-    /// cheap; the default does nothing.
-    fn service(&mut self) {}
+    /// Service the transport after bring-up (Linux keeps the MHI
+    /// controller's interrupts, the QMI handle and its QRTR socket alive):
+    /// MHI state changes / SYS_ERR / RDDM, QMI indications. Returns a
+    /// crash or restart the runtime must act on. Sync and cheap; the
+    /// default reports nothing.
+    fn service(&mut self) -> Option<FwNotice> {
+        None
+    }
+    /// The transport has an interrupt waiting (service it now rather than
+    /// at the next periodic pass).
+    fn irq_pending(&self) -> bool {
+        false
+    }
 }
 
 impl<P, F, A> QmiFw for wlfw::Wlfw<P, F, A>
@@ -210,11 +236,13 @@ where
             ));
         }
     }
-    fn service(&mut self) {
-        // Late indications (Linux `ath11k_qmi_msg_handlers`): pump the
-        // QRTR link so the IPCR DL buffers are recycled, and log what
-        // arrives (recovery is not ported).
+    fn service(&mut self) -> Option<FwNotice> {
+        // The MHI interrupt work (mhi_intvec_threaded_handler, the event
+        // ring tasklets: M0 / M1 / M3, SYS_ERR, RDDM), then the QRTR link
+        // so the IPCR DL buffers are recycled.
+        self.client.pipe.service();
         self.client.pump();
+        // Late indications (Linux `ath11k_qmi_msg_handlers`): logged.
         while let Some(i) = self.client.take_inbound() {
             match i {
                 super::qmi_client::Inbound::Message(m) => log(format_args!(
@@ -225,6 +253,11 @@ where
                 other => log(format_args!("qmi: late event after FW_READY: {:?}", other)),
             }
         }
+        // ath11k_mhi_op_status_cb → queue_work(reset_work).
+        self.client.pipe.take_reset_request().map(FwNotice::Reset)
+    }
+    fn irq_pending(&self) -> bool {
+        self.client.pipe.irqs_pending()
     }
 }
 

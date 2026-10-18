@@ -42,7 +42,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::diag::{self, WifiStage};
 
 use super::ce::{self, CeIrq, CeMsi, MsiCeIrq};
-use super::core::{Ath11kCore, CeHif, CoreHooks, Hif, QmiFw};
+use super::core::{Ath11kCore, CeHif, CoreHooks, FwNotice, Hif, QmiFw};
 use super::dp_ring::{
     enc, DpHwParams, DpRingSizes, DpServiceOutput, Idr, RxMsdu, TxEncap, TxMeta, VifTx,
 };
@@ -482,6 +482,9 @@ pub struct Rt<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     /// `mon_reap_timer` armed (next expiry).
     pub mon_reap_at: Option<u64>,
     qmi_service_at: u64,
+    /// A firmware crash / restart the transport reported, not yet acted
+    /// on.
+    pub fw_notice: Option<FwNotice>,
 }
 
 /// A synchronous port call, applied at the next locked step.
@@ -521,6 +524,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
             stats: RtStats::default(),
             mon_reap_at: None,
             qmi_service_at: 0,
+            fw_notice: None,
         }
     }
 
@@ -722,10 +726,21 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
                 self.mon_reap_at = Some(now + ATH11K_MON_TIMER_INTERVAL);
             }
         }
-        if now >= self.qmi_service_at {
-            self.core.qmi.service();
+        // The MHI controller + QMI handle: on their interrupt, else every
+        // QMI_SERVICE_MS (the poll fallback).
+        if self.core.qmi.irq_pending() || now >= self.qmi_service_at {
+            if let Some(n) = self.core.qmi.service() {
+                self.fw_notify(n);
+            }
             self.qmi_service_at = now + QMI_SERVICE_MS;
         }
+    }
+
+    /// Record what the transport reported (the first one wins until it is
+    /// handled).
+    fn fw_notify(&mut self, n: FwNotice) {
+        log(format_args!("firmware notice: {:?}", n));
+        self.fw_notice.get_or_insert(n);
     }
 
     /// Transmit an Ethernet frame on the station vif: mac80211's

@@ -43,7 +43,7 @@ use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessNetIf
 
 use super::ce::{self, Ce, CeIrq, CeMsi};
 use super::ce_tests::{phys_rd32, phys_read, phys_wr32, phys_write, FakeChip};
-use super::core::{Ath11kCore, CeHif, CoreHooks, CoreState, QmiFw};
+use super::core::{Ath11kCore, CeHif, CoreHooks, CoreState, FwNotice, QmiFw};
 use super::core_tests::{self, Fw, Script, CTRL_DL, FW_MAC, HTT_EID, WMI_DL, WMI_EID};
 use super::dp_ring::{self, buf_addr_get, DpHwParams, DpRingSizes};
 use super::dp_tests::{good_rxd, reo_dest, rx_desc_bytes, wbm_htt, wbm_tqm, FIRST, LAST, SMALL};
@@ -172,13 +172,18 @@ impl ChipIo for Io {
     fn restore_window(&self) {}
 }
 
-/// QMI half of firmware start / stop (counts only).
+/// QMI half of firmware start / stop (counts only), and the transport
+/// notices the runtime polls for.
 #[derive(Default)]
 struct TestQmi {
     starts: u32,
     stops: u32,
     services: u32,
     fail: Option<WlfwError>,
+    /// Reported by the next `service` (a crash / restart).
+    notice: Option<FwNotice>,
+    /// `irq_pending` answers.
+    irq: bool,
 }
 
 impl QmiFw for TestQmi {
@@ -192,8 +197,13 @@ impl QmiFw for TestQmi {
     async fn firmware_stop(&mut self) {
         self.stops += 1;
     }
-    fn service(&mut self) {
+    fn service(&mut self) -> Option<FwNotice> {
         self.services += 1;
+        self.irq = false;
+        self.notice.take()
+    }
+    fn irq_pending(&self) -> bool {
+        self.irq
     }
 }
 
@@ -3390,3 +3400,45 @@ fn smoke_ath11k_int_tx_status() -> TestResult {
     })
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_tx_status);
+
+/// After bring-up the transport is serviced from the runtime: on its
+/// interrupt at once, else every `QMI_SERVICE_MS`; what it reports (a
+/// crash or restart) is recorded for the recovery.
+fn smoke_ath11k_int_fw_transport_service() -> TestResult {
+    check(|| {
+        let u = up(FwCfg::default())?;
+        let mut g = run(u.shared.lock());
+        g.service();
+        let base = g.core.qmi.services;
+        // Within QMI_SERVICE_MS and no interrupt: not serviced.
+        NOW.fetch_add(10, Ordering::Relaxed);
+        g.service();
+        ensure!(g.core.qmi.services == base, "no interrupt: periodic only");
+        // An MHI interrupt: serviced on the next pass.
+        g.core.qmi.irq = true;
+        NOW.fetch_add(10, Ordering::Relaxed);
+        g.service();
+        ensure!(g.core.qmi.services == base + 1, "serviced on its IRQ");
+        // The periodic fallback.
+        NOW.fetch_add(runtime::QMI_SERVICE_MS, Ordering::Relaxed);
+        g.service();
+        ensure!(g.core.qmi.services == base + 2, "QMI_SERVICE_MS poll");
+        ensure!(g.fw_notice.is_none(), "nothing reported yet");
+        // A crash, then a second notice: the first is kept.
+        g.core.qmi.notice = Some(FwNotice::Reset(super::mhi_host::MhiNotify::EeRddm));
+        g.core.qmi.irq = true;
+        g.service();
+        g.core.qmi.notice = Some(FwNotice::ServerExit);
+        g.core.qmi.irq = true;
+        g.service();
+        ensure!(
+            g.fw_notice == Some(FwNotice::Reset(super::mhi_host::MhiNotify::EeRddm)),
+            "first notice recorded"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_int_fw_transport_service
+);

@@ -271,6 +271,9 @@ impl MhiBus for Bar0Mhi {
     fn take_irqs(&self) -> u32 {
         MHI_IRQ_PENDING.swap(0, Ordering::AcqRel)
     }
+    fn irqs_pending(&self) -> bool {
+        MHI_IRQ_PENDING.load(Ordering::Acquire) != 0
+    }
     fn wait_irq(&self, ms: u32) -> impl Future<Output = ()> + Send {
         MhiIrqWait {
             sleep: narf_time::SleepUntil::new(

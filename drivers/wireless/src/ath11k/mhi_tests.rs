@@ -520,6 +520,9 @@ impl MhiBus for FakeMhi {
     fn take_irqs(&self) -> u32 {
         core::mem::take(&mut self.d.borrow_mut().irqs)
     }
+    fn irqs_pending(&self) -> bool {
+        self.d.borrow().irqs != 0
+    }
     fn wait_irq(&self, ms: u32) -> impl Future<Output = ()> + Send {
         let d = &mut *self.d.borrow_mut();
         d.ops.push(Op::Wait(ms));
@@ -2120,3 +2123,197 @@ fn smoke_mhi_msi_vector_layout() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_mhi_msi_vector_layout);
+
+// ── after mission mode (the runtime's MHI service) ───────────────
+
+fn raise_intvec(h: &Host, mhistatus: u32, ee: MhiEe) {
+    let d = &mut *h.bus.d.borrow_mut();
+    d.regs.insert(MHISTATUS, mhistatus);
+    d.regs.insert(BHI + BHI_EXECENV, ee.0);
+    d.irqs |= 1;
+}
+
+fn smoke_mhi_runtime_state_changes() -> TestResult {
+    let mut h = match booted() {
+        Some(h) => h,
+        None => return TestResult::Fail("boot + IPCR start failed"),
+    };
+    h.service();
+    check!(h.take_reset_request().is_none(), "quiet device: no reset");
+    check!(!h.irqs_pending(), "nothing pending");
+
+    // The device enters M1: mhi_pm_m1_transition moves the host to M2
+    // (MHICTRL.MHISTATE = M2) and, with no wake vote or pending packet,
+    // reports MHI_CB_IDLE.
+    let w0 = h.bus.writes().len();
+    h.bus
+        .post_ctrl(MhiRingElement::state_change_event(MhiState::M1.0));
+    check!(h.irqs_pending(), "event-ring MSI pending");
+    h.service();
+    check!(
+        h.pm_state == pm::M2 && h.dev_state == MhiState::M2,
+        "M1 → M2"
+    );
+    let m2 = h.bus.writes()[w0..]
+        .iter()
+        .any(|&(a, v)| a == MHICTRL && field_get(MHICTRL_MHISTATE_MASK, v) == MhiState::M2.0);
+    check!(m2, "host writes MHISTATE M2");
+    check!(
+        h.bus.d.borrow().notes.last() == Some(&MhiNotify::Idle),
+        "MHI_CB_IDLE"
+    );
+    check!(h.take_reset_request().is_none(), "M2 is no crash");
+
+    // Back to M0 (device-initiated): mhi_pm_m0_transition.
+    let m0 = h.stats.m0_entries;
+    h.bus
+        .post_ctrl(MhiRingElement::state_change_event(MhiState::M0.0));
+    h.service();
+    check!(
+        h.pm_state == pm::M0 && h.stats.m0_entries == m0 + 1,
+        "M2 → M0"
+    );
+    check!(h.dev_wake_count() == 0, "M0 entry balances its wake vote");
+
+    // A UL send from M2 rings the channel doorbell (db_access has M2).
+    h.bus
+        .post_ctrl(MhiRingElement::state_change_event(MhiState::M1.0));
+    h.service();
+    check!(h.pm_state == pm::M2, "M2 again");
+    check!(h.queue_ul(b"hello").is_ok(), "UL in M2");
+    h.service();
+    check!(
+        h.bus.d.borrow().ul_rx.last().map(|v| v.as_slice()) == Some(&b"hello"[..]),
+        "UL reached the device from M2"
+    );
+
+    // An EE event re-announcing mission mode: the st_worker item is
+    // dropped, not run.
+    h.bus.post_ctrl(MhiRingElement::ee_event(MhiEe::AMSS.0));
+    h.service();
+    check!(h.pending_transitions() == 0, "transition dropped");
+    check!(
+        h.bus.logged("after mission mode ignored"),
+        "dropped transition logged"
+    );
+    check!(h.take_reset_request().is_none(), "no reset for it");
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_mhi_runtime_state_changes);
+
+fn smoke_mhi_runtime_crash_requests_reset() -> TestResult {
+    let syserr = (0xff << 8) | MHISTATUS_SYSERR_MASK;
+    // SYS_ERR in mission mode (intvec): MHI_CB_SYS_ERROR → reset.
+    let mut h = match booted() {
+        Some(h) => h,
+        None => return TestResult::Fail("boot + IPCR start failed"),
+    };
+    raise_intvec(&h, syserr, MhiEe::AMSS);
+    check!(h.irqs_pending(), "BHI / intvec MSI pending");
+    h.service();
+    check!(h.pm_state == pm::SYS_ERR_DETECT, "SYS_ERR_DETECT");
+    check!(
+        h.take_reset_request() == Some(MhiNotify::SysError),
+        "SYS_ERROR queues reset_work"
+    );
+    check!(h.take_reset_request().is_none(), "taken once");
+    check!(
+        h.bus.logged("firmware crashed: MHI_CB_SYS_ERROR"),
+        "ath11k_warn line"
+    );
+    // Another MSI while still in SYS_ERR: no second request.
+    raise_intvec(&h, syserr, MhiEe::AMSS);
+    h.service();
+    check!(
+        h.take_reset_request().is_none(),
+        "consecutive SYS_ERROR not queued"
+    );
+    // In SYS_ERR_DETECT the control ring is not processed
+    // (MHI_EVENT_ACCESS_INVALID), so an RDDM EE event is not seen there.
+    h.bus.post_ctrl(MhiRingElement::ee_event(MhiEe::RDDM.0));
+    h.service();
+    check!(h.ee != MhiEe::RDDM, "ctrl ring idle in SYS_ERR_DETECT");
+    // The device enters RDDM and raises the intvec: MHI_CB_EE_RDDM
+    // queues a reset (the previous reason was SYS_ERROR), EE = RDDM.
+    raise_intvec(&h, syserr, MhiEe::RDDM);
+    h.service();
+    check!(h.ee == MhiEe::RDDM, "EE RDDM");
+    check!(
+        h.take_reset_request() == Some(MhiNotify::EeRddm),
+        "EE_RDDM queues reset_work"
+    );
+    // "do not queue again for consecutive RDDM event"
+    raise_intvec(&h, syserr, MhiEe::RDDM);
+    h.service();
+    check!(
+        h.take_reset_request().is_none(),
+        "consecutive RDDM not queued"
+    );
+    check!(
+        h.bus
+            .logged("do not queue again for consecutive RDDM event"),
+        "consecutive RDDM logged"
+    );
+
+    // The RDDM EE event on the control ring while in M0: EE_RDDM.
+    let mut h = match booted() {
+        Some(h) => h,
+        None => return TestResult::Fail("boot + IPCR start failed"),
+    };
+    h.bus.post_ctrl(MhiRingElement::ee_event(MhiEe::RDDM.0));
+    h.service();
+    check!(
+        h.take_reset_request() == Some(MhiNotify::EeRddm) && h.ee == MhiEe::RDDM,
+        "RDDM EE event → EE_RDDM"
+    );
+
+    // SYS_ERR with the EE already RDDM (intvec): EE_RDDM, no SYS_ERROR.
+    let mut h = match booted() {
+        Some(h) => h,
+        None => return TestResult::Fail("boot + IPCR start failed"),
+    };
+    raise_intvec(&h, syserr, MhiEe::RDDM);
+    h.service();
+    check!(
+        h.take_reset_request() == Some(MhiNotify::EeRddm) && h.ee == MhiEe::RDDM,
+        "intvec RDDM → EE_RDDM"
+    );
+    check!(
+        !h.bus.d.borrow().notes.contains(&MhiNotify::SysError),
+        "RDDM is not a SYS_ERROR"
+    );
+
+    // Not active (dev_state below M0): the RDDM intvec is ignored, as
+    // Linux's mhi_is_active() check.
+    let mut h = match booted() {
+        Some(h) => h,
+        None => return TestResult::Fail("boot + IPCR start failed"),
+    };
+    h.dev_state = MhiState::READY;
+    raise_intvec(&h, syserr, MhiEe::RDDM);
+    h.service();
+    check!(h.take_reset_request().is_none(), "inactive: no RDDM");
+    check!(h.ee != MhiEe::RDDM, "EE untouched");
+
+    // A fatal error in PBL: MHI_CB_FATAL_ERROR then the SYS_ERR handler.
+    let mut h = match booted() {
+        Some(h) => h,
+        None => return TestResult::Fail("boot + IPCR start failed"),
+    };
+    raise_intvec(&h, syserr, MhiEe::PBL);
+    h.service();
+    let notes = h.bus.d.borrow().notes.clone();
+    check!(
+        notes.ends_with(&[MhiNotify::FatalError, MhiNotify::SysError]),
+        "FATAL_ERROR, SYS_ERROR"
+    );
+    check!(
+        h.take_reset_request() == Some(MhiNotify::SysError),
+        "PBL crash → reset"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_mhi_runtime_crash_requests_reset
+);

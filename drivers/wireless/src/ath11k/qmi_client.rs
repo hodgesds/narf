@@ -54,7 +54,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::future::Future;
 
-use super::mhi_host::{MhiBus, MhiController, POLL_INTERVAL_MS};
+use super::mhi_host::{MhiBus, MhiController, MhiNotify, POLL_INTERVAL_MS};
 use super::qmi::{split_message, QmiError, QmiHeader, QMI_HEADER_SIZE, QMI_RESPONSE};
 use super::qmi_wlfw::{WlfwMessage, WlfwRequest};
 use super::qrtr::{
@@ -78,6 +78,20 @@ pub trait QrtrPipe {
     fn now_ms(&self) -> u64;
     /// One console line.
     fn log(&self, _args: fmt::Arguments<'_>) {}
+    /// The transport after bring-up (the MHI controller's interrupt work
+    /// and state changes, [`MhiController::service`]).
+    fn service(&mut self) {
+        self.poll()
+    }
+    /// An interrupt is waiting to be serviced.
+    fn irqs_pending(&self) -> bool {
+        false
+    }
+    /// A crash the transport reported (`ath11k_mhi_op_status_cb` →
+    /// `reset_work`), once.
+    fn take_reset_request(&mut self) -> Option<MhiNotify> {
+        None
+    }
 }
 
 impl<B: MhiBus + Send> QrtrPipe for MhiController<B> {
@@ -98,6 +112,15 @@ impl<B: MhiBus + Send> QrtrPipe for MhiController<B> {
     }
     fn log(&self, args: fmt::Arguments<'_>) {
         self.bus.log(args)
+    }
+    fn service(&mut self) {
+        MhiController::service(self)
+    }
+    fn irqs_pending(&self) -> bool {
+        MhiController::irqs_pending(self)
+    }
+    fn take_reset_request(&mut self) -> Option<MhiNotify> {
+        MhiController::take_reset_request(self)
     }
 }
 

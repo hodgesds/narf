@@ -69,8 +69,21 @@ command ring and `mhi_prepare_for_transfer` with QRTR's buffer policy
 config's 2 s). One async task (`pci::mhi_task`) owns the controller;
 every wait services the MHI interrupt work and also polls the event
 rings each 25 ms slice, counting events that arrived without an MSI.
-Not ported: RDDM, SYS_ERR recovery, power-down, M3 suspend/resume,
-BW scaling, RSC/offload/client-managed rings, EDL.
+After mission mode the runtime keeps servicing the controller
+(`MhiController::service`, through `QrtrPipe::service` from
+`QmiFw::service`): on an MHI MSI (`MhiBus::irqs_pending`) at the next
+runtime pass, else every 100 ms — the intvec handler (SYS_ERR, RDDM),
+the control ring (M0, M1 → M2 + MHI_CB_IDLE, M3, EE events, command
+completions) and IPCR. `status_cb` is ath11k's
+`ath11k_mhi_op_status_cb`: EE_RDDM (intvec with the EE already RDDM
+while `mhi_is_active`, or the RDDM EE event) queues `reset_work` unless
+the previous reason was EE_RDDM; SYS_ERROR queues it too, once per run
+of consecutive SYS_ERRORs (§8);
+`take_reset_request` hands it to the core once (`FwNotice::Reset`).
+`mhi_pm_st_worker` items queued after mission mode are logged and
+dropped. Not ported: the RDDM ramdump image, MHI-core SYS_ERR recovery
+(`mhi_pm_sys_error_transition`), M3 suspend/resume, BW scaling,
+RSC/offload/client-managed rings, EDL.
 
 ## 3. Public interface
 
@@ -376,8 +389,12 @@ HE caps for the mac layer, HAL reg caps), `dma_ring_caps`, `ready` +
 - `wmi_cmd_try_send(&WmiCmd) -> Result<(), errno>` (one
   `ath11k_wmi_cmd_send_nowait` attempt) + `wmi_send_retryable(errno)`
   for callers that wait outside the core (the runtime ports).
-- `QmiFw::service()` (default no-op; `Wlfw`: QRTR pump + log late
-  indications) — the runtime calls it every 100 ms.
+- `QmiFw::service() -> Option<FwNotice>` (default none; `Wlfw`: MHI
+  service + QRTR pump + late indications) and `irq_pending()` — the
+  runtime calls it on the transport's interrupt or every 100 ms.
+  `FwNotice`: `Reset(MhiNotify)` (`reset_work`), `ServerExit`
+  (`ATH11K_QMI_EVENT_SERVER_EXIT`), `Restart` (FW_INIT_DONE with
+  REGISTERED → `restart_work`).
 - Steps (`core::step`, 120–139): UNSUPPORTED 120, NO_DEVICE 121,
   HTC_INIT 122, HTC_READY_TIMEOUT 123, HTC_BAD_READY 124, HTT_CONNECT
   125, HTT_CONNECT_TIMEOUT 126, WMI_CONNECT 127, WMI_CONNECT_TIMEOUT
@@ -740,7 +757,9 @@ step starts with `Rt::service()`:
    `data_rx` only while authorized), `reo_status` → `dp.reo_status_handler`, TX
    completions to the TX status (buffers freed in the DP);
 4. `dp.service_shadow_timers`, the 10 ms monitor-status reap timer
-   (armed by `mon_status_default(true)`), `qmi.service()` every 100 ms.
+   (armed by `mon_status_default(true)`), `qmi.service()` on the MHI
+   interrupt or every 100 ms; a reported crash is kept in
+   `Rt::fw_notice` (first one wins).
 
 `Port` (`Arc<Shared>`) implements `mac::WmiPort` (`send` =
 `ath11k_wmi_cmd_send` with credit / CE-full retry for 3 s;
@@ -1084,6 +1103,12 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   failing with EXT2 still arriving — goes on without the ext caps);
   `wmi_cmd_wait` / event queues are NARF API, Linux uses per-event
   completions.
+- MHI crash policy (deliberate): NARF allocates no RDDM image (4 MiB of
+  DMA32 with no dump consumer) and does not port the MHI core's own
+  SYS_ERR recovery, so a SYS_ERR after mission mode — which Linux, with
+  ath11k's RDDM image, leaves to the RDDM entry that follows — queues
+  `ath11k_core_reset` like EE_RDDM. During bring-up a SYS_ERR still fails
+  the bring-up (Linux's `reset_work` ignores an unregistered device).
 - Core after bring-up: the QRTR link over MHI is pumped every 100 ms
   (`QmiFw::service`), so late QMI messages are drained and logged, not
   acted on; `ATH11K_FLAG_*` crypto / raw mode are not modelled (HW

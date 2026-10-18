@@ -40,13 +40,22 @@
 //!   `qcom_mhi_qrtr_ul_callback` (the buffer policy of the IPCR
 //!   client, so Phase 3 only has to parse QRTR packets).
 //!
+//! After mission mode the controller keeps being serviced
+//! ([`MhiController::service`], from the runtime): state changes (M0 /
+//! M1 → M2 / M3), SYS_ERR and RDDM go through `status_cb`, and ath11k's
+//! `ath11k_mhi_op_status_cb` policy ([`MhiController::take_reset_request`])
+//! turns a crash into a request for `ath11k_core_reset`.
+//!
 //! Deliberately not ported (station bring-up does not need them):
-//! RDDM (ramdump table + `mhi_rddm_prepare` + `mhi_download_rddm_image`),
-//! SYS_ERR *recovery* (`mhi_pm_sys_error_transition` — a SYS_ERR is
-//! reported and ends bring-up), power-down / `mhi_pm_disable_transition`,
-//! suspend / resume (M3 entry), bandwidth scaling (BW_REQ is logged),
-//! RSC / coalesced channels, bounce buffers, offload and
-//! client-managed event rings, EDL images, `mhi_soc_reset`.
+//! the RDDM ramdump (`rddm_image`, `mhi_rddm_prepare`,
+//! `mhi_download_rddm_image`; the RDDM *event* is handled as Linux does
+//! with an image allocated), SYS_ERR *recovery* by the MHI core
+//! (`mhi_pm_sys_error_transition`: during bring-up a SYS_ERR is reported
+//! and ends bring-up; after it, the SYS_ERR is handed to ath11k's reset
+//! instead, see [`MhiController::take_reset_request`]), suspend / resume
+//! (M3 entry), bandwidth scaling (BW_REQ is logged), RSC / coalesced
+//! channels, bounce buffers, offload and client-managed event rings, EDL
+//! images, `mhi_soc_reset`.
 //!
 //! ## Concurrency model
 //!
@@ -202,6 +211,11 @@ pub trait MhiBus {
     fn sleep(&self, ms: u32) -> impl Future<Output = ()> + Send;
     /// Monotonic milliseconds.
     fn now_ms(&self) -> u64;
+    /// `true` while an MHI interrupt is waiting for [`Self::take_irqs`]
+    /// (the runtime services the controller on it).
+    fn irqs_pending(&self) -> bool {
+        false
+    }
     /// `get_random_u32_inclusive(1, max)`.
     fn random_nonzero(&self, max: u32) -> u32;
     /// `status_cb` and milestones.
@@ -538,6 +552,11 @@ pub struct MhiController<B: MhiBus> {
     rx: VecDeque<DlPacket>,
     ipcr_ul: Option<usize>,
     ipcr_dl: Option<usize>,
+    /// `ab_pci->mhi_pre_cb`: the previous `status_cb` reason.
+    pre_cb: Option<MhiNotify>,
+    /// `queue_work(ab->workqueue_aux, &ab->reset_work)` from
+    /// `ath11k_mhi_op_status_cb`, not yet taken.
+    reset_request: Option<MhiNotify>,
 }
 
 impl<B: MhiBus> fmt::Debug for MhiController<B> {
@@ -712,6 +731,8 @@ impl<B: MhiBus> MhiController<B> {
             rx: VecDeque::new(),
             ipcr_ul: None,
             ipcr_dl: None,
+            pre_cb: None,
+            reset_request: None,
         })
     }
 
@@ -733,6 +754,49 @@ impl<B: MhiBus> MhiController<B> {
             self.failure = Some(e);
         }
         e
+    }
+
+    /// `mhi_cntrl->status_cb(mhi_cntrl, cb)` = ath11k's
+    /// `ath11k_mhi_op_status_cb`: SYS_ERROR and EE_RDDM are firmware
+    /// crashes; EE_RDDM queues `reset_work` unless the previous reason
+    /// was EE_RDDM too ("do not queue again for consecutive RDDM event").
+    ///
+    /// NARF deviation (no RDDM image, no MHI-core SYS_ERR recovery): a
+    /// SYS_ERROR queues the reset as well — with Linux's RDDM image the
+    /// device's RDDM entry that follows would — once per run of
+    /// consecutive SYS_ERRORs (the intvec handler sees every MSI while
+    /// the device sits in SYS_ERR).
+    fn status_cb(&mut self, cb: MhiNotify) {
+        self.bus.notify(cb);
+        match cb {
+            MhiNotify::SysError => {
+                mlog!(self, "firmware crashed: MHI_CB_SYS_ERROR");
+                if self.pre_cb != Some(MhiNotify::SysError) {
+                    self.reset_request.get_or_insert(cb);
+                }
+            }
+            MhiNotify::EeRddm => {
+                mlog!(self, "firmware crashed: MHI_CB_EE_RDDM");
+                if self.pre_cb == Some(MhiNotify::EeRddm) {
+                    mlog!(self, "do not queue again for consecutive RDDM event");
+                } else {
+                    self.reset_request.get_or_insert(cb);
+                }
+            }
+            _ => {}
+        }
+        self.pre_cb = Some(cb);
+    }
+
+    /// The crash `ath11k_mhi_op_status_cb` queued `reset_work` for, once
+    /// (`ath11k_core_reset` takes it).
+    pub fn take_reset_request(&mut self) -> Option<MhiNotify> {
+        self.reset_request.take()
+    }
+
+    /// `mhi_is_active`: `M0 <= dev_state <= M3_FAST`.
+    fn is_active(&self) -> bool {
+        self.dev_state.0 >= MhiState::M0.0 && self.dev_state.0 <= MhiState::M3_FAST.0
     }
 
     // ── register helpers (main.c) ────────────────────────────────
@@ -1209,10 +1273,15 @@ impl<B: MhiBus> MhiController<B> {
         }
         match ee {
             MhiEe::RDDM => {
-                // No RDDM image: Linux does nothing more here.
+                // "proceed if power down is not already in progress"
+                // (ath11k sets rddm_size, so Linux has an RDDM image).
+                if self.is_active() {
+                    self.status_cb(MhiNotify::EeRddm);
+                    self.ee = ee;
+                }
             }
             MhiEe::PBL | MhiEe::EDL | MhiEe::PTHRU => {
-                self.bus.notify(MhiNotify::FatalError);
+                self.status_cb(MhiNotify::FatalError);
                 self.ee = ee;
                 self.sys_err_handler(ee);
             }
@@ -1224,7 +1293,7 @@ impl<B: MhiBus> MhiController<B> {
     /// `DEV_ST_TRANSITION_SYS_ERR` (recovery); bring-up instead stops
     /// here and reports.
     fn sys_err_handler(&mut self, ee: MhiEe) {
-        self.bus.notify(MhiNotify::SysError);
+        self.status_cb(MhiNotify::SysError);
         let st = self.read_reg(0, MHISTATUS);
         mlog!(
             self,
@@ -1385,7 +1454,7 @@ impl<B: MhiBus> MhiController<B> {
             pkt::BW_REQ_EVENT => {
                 let (speed, width) = (el.ev_linkspeed(), el.ev_linkwidth());
                 mlog!(self, "mhi: BW_REQ speed={} width={}", speed, width);
-                self.bus.notify(MhiNotify::BwReq { speed, width });
+                self.status_cb(MhiNotify::BwReq { speed, width });
             }
             pkt::STATE_CHANGE_EVENT => {
                 let new_state = MhiState(el.ev_state());
@@ -1421,7 +1490,7 @@ impl<B: MhiBus> MhiController<B> {
                     MhiEe::WFW | MhiEe::AMSS => Some(DevStTransition::MissionMode),
                     MhiEe::FP => Some(DevStTransition::Fp),
                     MhiEe::RDDM => {
-                        self.bus.notify(MhiNotify::EeRddm);
+                        self.status_cb(MhiNotify::EeRddm);
                         self.ee = event;
                         None
                     }
@@ -1602,7 +1671,7 @@ impl<B: MhiBus> MhiController<B> {
                 self.wake_get(true);
                 self.wake_put(true);
             } else {
-                self.bus.notify(MhiNotify::Idle);
+                self.status_cb(MhiNotify::Idle);
             }
         }
     }
@@ -1720,7 +1789,7 @@ impl<B: MhiBus> MhiController<B> {
         }
         self.ee = ee;
         mlog!(self, "mhi: EE {} ({:#x})", ee.name(), ee.0);
-        self.bus.notify(MhiNotify::EeMissionMode);
+        self.status_cb(MhiNotify::EeMissionMode);
         // "Force MHI to be in M0 state before continuing"
         if let Err(e) = self.device_get_sync().await {
             return Err(self.fail(e));
@@ -2513,6 +2582,32 @@ impl<B: MhiBus> MhiController<B> {
     /// MHI vectors itself).
     pub fn poll(&mut self) {
         self.service_interrupts();
+    }
+
+    /// The controller after mission mode, from the runtime (on an MHI
+    /// interrupt, and every 100 ms otherwise): the intvec handler (SYS_ERR,
+    /// RDDM), the control event ring (M0 / M1 → M2 / M3 state changes, EE
+    /// events, command completions) and the IPCR rings. A crash shows up
+    /// in [`Self::take_reset_request`].
+    ///
+    /// `mhi_pm_st_worker` items queued now (an EE event re-announcing
+    /// mission mode, an FP image) are logged and dropped: the device is
+    /// already in mission mode and a re-boot goes through
+    /// `ath11k_core_reset`'s power cycle.
+    pub fn service(&mut self) {
+        self.service_interrupts();
+        while let Some(st) = self.transitions.pop_front() {
+            mlog!(
+                self,
+                "mhi: state transition {:?} after mission mode ignored",
+                st
+            );
+        }
+    }
+
+    /// `true` while an MHI interrupt waits to be serviced.
+    pub fn irqs_pending(&self) -> bool {
+        self.bus.irqs_pending()
     }
 
     /// Wait up to `ms` for traffic, then service the rings.
