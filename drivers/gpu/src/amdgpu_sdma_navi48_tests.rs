@@ -33,6 +33,8 @@ struct Fake {
     signals: Arc<[AtomicU32; 2]>,
     omit: Option<Missing>,
     overshoot: bool,
+    /// The engine completes a queue reset request.
+    reset_clears: bool,
 }
 impl Fake {
     // Minimal independent decoder of the public SDMA6/7 SDMA packet ABI.
@@ -119,6 +121,9 @@ impl Io for Fake {
             self.dirty = false;
             self.invalidated = true;
         }
+        if address == GC + 0x6c * 4 && self.reset_clears {
+            self.regs.insert(address, 0);
+        }
         if address == HYP + 0x588e * 4 {
             self.progress
                 .store(if value & 1 == 0 { 2 } else { 1 }, Ordering::SeqCst);
@@ -190,6 +195,7 @@ fn fixture() -> (Pool, Engine<Fake>, gmc::Aperture, MmioRegion) {
             signals: Arc::new([AtomicU32::new(5), AtomicU32::new(7)]),
             omit: None,
             overshoot: false,
+            reset_clears: true,
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -989,4 +995,58 @@ fn sdma_navi48_kernel_jobs_fill_and_copy() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu_sdma_navi48",
     sdma_navi48_kernel_jobs_fill_and_copy
+);
+
+/// sdma_v7_0_reset_queue: SDMA0_QUEUE_RESET_REQ until the engine clears it,
+/// then the ring programmed again with both pointers (and their
+/// writebacks) at the software write pointer, enabled and unhalted; the
+/// ring test is a fence-only slot past the skipped ones. A request the
+/// engine never completes fails the reset.
+fn sdma_navi48_reset_resumes_past_the_queued_slots() -> TestResult {
+    use crate::amdgpu_gfx12_queue::Job;
+    let (_pool, mut e, _aperture, _target) = fixture();
+    if run(e.reset_ring()) != Err(Error::Busy) {
+        return TestResult::Fail("reset before the proofs");
+    }
+    e.state = State::InterruptVerified;
+    e.io.complete = false;
+    e.io.memory.fill(0);
+    e.io.memory[1024..1028].copy_from_slice(&[192, 0, 192, 0]);
+    let job = Job::new(2, 9, 0x1_0000_8001, &[(0x2_0000_1000, 16)]).unwrap();
+    if e.submit(job) != Ok(1) {
+        return TestResult::Fail("hung job");
+    }
+    e.io.writes.clear();
+    if run(e.reset_ring()) != Ok(()) {
+        return TestResult::Fail("reset");
+    }
+    let reg = |e: &Engine<Fake>, r: u64| e.io.regs[&(GC + r * 4)];
+    if e.io.writes.first() != Some(&(GC + 0x6c * 4, 1))
+        || [0x83, 0x84, 0x85, 0x86].map(|r| reg(&e, r)) != [2048, 0, 2048, 0]
+        || e.io.memory[1024..1028] != [2048, 0, 2048, 0]
+        || reg(&e, 0x80) & 1 != 1
+        || reg(&e, 0x89) & 1 != 1
+        || e.io.regs[&(HYP + 0x588e * 4)] & 3 != 0
+        || reg(&e, 0x9b) != 0
+    {
+        return TestResult::Fail("ring programmed past the skipped slot");
+    }
+    let fence = 0x8_0000_4000 + JOB_FENCE;
+    if e.submit_fence() != Ok(2)
+        || e.io.memory[512..516] != [0x30005, fence as u32, (fence >> 32) as u32, 2]
+        || e.io.memory[516..768].iter().any(|&w| w != 0)
+        || reg(&e, 0x85) != 3072
+    {
+        return TestResult::Fail("ring test slot");
+    }
+    e.io.reset_clears = false;
+    e.io.regs.insert(GC + 0x6c * 4, 0);
+    if run(e.reset_ring()) != Err(Error::Timeout) {
+        return TestResult::Fail("a reset the engine never completes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_sdma_navi48",
+    sdma_navi48_reset_resumes_past_the_queued_slots
 );

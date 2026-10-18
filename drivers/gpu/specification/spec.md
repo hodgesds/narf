@@ -4799,9 +4799,19 @@ PACKET3(NOP, 0x3fff), read and write pointers 0) and
 `resume_all`) follows on every path, and the same ring test closes it. A
 failed suspend does not stop the reset (Linux would ask MES for other hung
 queues; there are none), and an HQD that never goes idle fails it without
-Linux's MEC pipe reset. Innocent jobs are not re-emitted, and the SDMA
-ring stays hung once hung. VRAM clear fences follow SDMA0's hardware fence
-only, never a timeout's verdict.
+Linux's MEC pipe reset. A hung SDMA0 ring is recovered as
+sdma_v7_0_reset_queue (`ColdBoot::recover_client_sdma`):
+`Sdma::reset_ring` writes SDMA0_QUEUE_RESET_REQ bit 0 and waits up to 100
+ms for the engine to clear it, then programs the ring as
+sdma_v7_0_gfx_resume_instance(restore) with both pointers and their
+writebacks at the software write pointer, so the engine resumes past every
+queued slot; `Sdma::submit_fence` is the ring test. Before the test,
+`recover_client_sdma`'s `skipped` hook learns the sequence the engine
+completed, and the platform puts every VRAM clear its ring held past it
+back at the front of the clear queue, unsignalled (`ClearState::requeue`),
+so a clear's fence never reads complete off the test's fence. Innocent
+client jobs are not re-emitted. VRAM clear fences follow SDMA0's hardware
+fence only, never a timeout's verdict.
 
 The Navi48 platform registers both kernel queues as its card's submitter
 after boot: up to eight IBs per submission (`Job::new`, in order in one

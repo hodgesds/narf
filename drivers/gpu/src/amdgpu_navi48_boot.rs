@@ -810,6 +810,47 @@ impl ColdBoot {
             narf_time::SleepUntil::new(narf_time::Deadline::after_us(50).as_instant()).await;
         }
     }
+    /// Recover SDMA0's ring after a job on it hung, as sdma_v7_0_reset_queue:
+    /// the MMIO queue reset and the ring programmed again past its queued
+    /// slots (`sdma::Sdma::reset_ring`), then a fence-only slot tests it,
+    /// landing within 100 ms. Before the test, `skipped` learns the last
+    /// sequence the engine completed: every slot past it was skipped, and
+    /// will read complete through the test's fence. Returns that fence's
+    /// sequence.
+    ///
+    /// LINUX-GAP: Linux re-emits the skipped jobs that did not hang; here
+    /// only the caller's kernel work runs again (`skipped`), and client
+    /// jobs stay canceled.
+    /// # Safety
+    /// As `submit_client_sdma_job`, and every job on the ring keeps what it
+    /// reaches until this returns Ok. Work that must not be skipped is
+    /// queued again by `skipped` before its fence can be trusted.
+    pub(crate) async unsafe fn recover_client_sdma(
+        &mut self,
+        skipped: impl FnOnce(u32),
+    ) -> Result<u32, sdma::Error> {
+        let sdma = self
+            .sequence
+            .backend
+            .sdma
+            .as_mut()
+            .ok_or(sdma::Error::Invalid)?;
+        // SAFETY: the caller's obligations.
+        unsafe { sdma.reset_ring() }.await?;
+        skipped(sdma.completed_job()?);
+        // SAFETY: as above; the slot reaches only the ring's own fence.
+        let seq = unsafe { sdma.submit_fence() }?;
+        let deadline = narf_time::Deadline::after_us(100_000);
+        loop {
+            if sdma.completed_job()?.wrapping_sub(seq) as i32 >= 0 {
+                return Ok(seq);
+            }
+            if deadline.expired() {
+                return Err(sdma::Error::Timeout);
+            }
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(50).as_instant()).await;
+        }
+    }
     /// Queue a client job on SDMA0 (see `sdma::Sdma::submit`).
     /// # Safety
     /// As `submit_client_job`.

@@ -2,7 +2,8 @@
 //! Register/packet sources: Linux sdma_v7_0.c, gc_12_0_0_{offset,sh_mask}.h,
 //! sdma_v6_0_0_pkt_open.h. Retained kernel fence/TRAP interrupt proof, then
 //! client jobs (`Sdma::submit`): a VM flush, PASID mapping, IBs and a fence
-//! per 256-dword slot. No host DMA or recovery.
+//! per 256-dword slot, and a hung ring's reset (`Sdma::reset_ring`). No
+//! host DMA.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip, amdgpu_gmc_navi48 as gmc,
@@ -25,6 +26,8 @@ const MCU_CNTL: u32 = 0x588e; // GC bank one, unlike ring registers
 const RB_CNTL: u32 = 0x80;
 const RB_RPTR: u32 = 0x83;
 const RB_WPTR: u32 = 0x85;
+/// `SDMA0_QUEUE_RESET_REQ` (GC segment 0): one bit per queue.
+const QUEUE_RESET_REQ: u32 = 0x6c;
 /// Client jobs' fence (in the ring allocation, past the pointers).
 const JOB_FENCE: u64 = 4160;
 /// The ring: 4 KiB at the allocation's start (RB_SIZE 10).
@@ -212,6 +215,45 @@ fn interrupt_packets(address: u64) -> [u32; 16] {
         0,
     ]);
     words
+}
+/// The ring as sdma_v7_0_gfx_resume_instance programs it, with both
+/// pointers at `pointer` bytes: ring at `address`, its pointer writebacks
+/// past it, MMIO write pointer, watchdog, UTCL1 policy, the engine
+/// unhalted and the ring and IBs enabled.
+fn program_ring<I: Io>(io: &mut I, l: Layout, address: u64, pointer: u64) -> Result<(), Error> {
+    update(io, l.gc, RB_CNTL, 0x0f803f3f, 0x00801814)?;
+    // IB_ENABLE, as sdma_v7_0_gfx_resume sets before enabling the ring:
+    // the proofs use direct packets, client jobs IBs.
+    update(io, l.gc, 0x89, 0x000f0111, 1)?;
+    io.write(l.gc + 0x96 * 4, 0); // no pending preemption
+    io.write(l.gc + 0x9b * 4, 1); // permit pointer rewind
+    for reg in [0x83, 0x85] {
+        io.write(l.gc + reg * 4, pointer as u32);
+        io.write(l.gc + (reg + 1) * 4, (pointer >> 32) as u32);
+    }
+    for (hi, lo, value) in [(0x88, 0x87, address + RPTR), (0x99, 0x98, address + WPTR)] {
+        io.write(l.gc + hi * 4, (value >> 32) as u32);
+        io.write(l.gc + lo * 4, value as u32);
+    }
+    io.write(l.gc + 0x81 * 4, (address >> 8) as u32);
+    io.write(l.gc + 0x82 * 4, (address >> 40) as u32);
+    update(io, l.gc, 0x8f, 1 << 28, 0)?; // MMIO pointer, no BAR2 doorbell
+    io.write(l.gc + 0x9b * 4, 0);
+    update(io, l.gc, 0x2b, 0xff, 1)?; // queue watchdog: 100ms
+    update(io, l.gc, 0x35, 0x61f, (3 << 9) | 9)?;
+    update(io, l.gc, 0x38, !0xff0fff, 0xe000)?; // default read/write policy
+    update(io, l.hyp, MCU_CNTL, 3, 0)?;
+    update(io, l.gc, RB_CNTL, 1, 1)
+}
+/// A slot of nothing but the fence of `seq` (the ring test after a reset,
+/// amdgpu_ring_test_ring).
+fn fence_words(fence: u64, seq: u32) -> Result<[u32; JOB_DWORDS as usize], Error> {
+    let mut slot = Slot {
+        words: [0; JOB_DWORDS as usize],
+        pos: 0,
+    };
+    slot.push(&[0x30005, fence as u32, (fence >> 32) as u32, seq])?;
+    Ok(slot.words)
 }
 async fn delay(us: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
@@ -510,29 +552,7 @@ impl<I: Io> Engine<I> {
             // Only one privileged direct ring, VMID0. No traps, paging IRQs,
             // preemption, automatic context switches or indirect buffers.
             update(io, l.gc, 0x0d, 0xf0023f79, 0x40)?;
-            update(io, l.gc, RB_CNTL, 0x0f803f3f, 0x00801814)?;
-            // IB_ENABLE, as sdma_v7_0_gfx_resume sets before enabling the
-            // ring: the proofs use direct packets, client jobs IBs.
-            update(io, l.gc, 0x89, 0x000f0111, 1)?;
-            io.write(l.gc + 0x96 * 4, 0); // no pending preemption
-            io.write(l.gc + 0x9b * 4, 1); // permit pointer rewind
-            for reg in [0x83, 0x84, 0x85, 0x86] {
-                io.write(l.gc + reg * 4, 0);
-            }
-            for (hi, lo, value) in [(0x88, 0x87, address + RPTR), (0x99, 0x98, address + WPTR)] {
-                io.write(l.gc + hi * 4, (value >> 32) as u32);
-                io.write(l.gc + lo * 4, value as u32);
-            }
-            io.write(l.gc + 0x81 * 4, (address >> 8) as u32);
-            io.write(l.gc + 0x82 * 4, (address >> 40) as u32);
-            update(io, l.gc, 0x8f, 1 << 28, 0)?; // MMIO pointer, no BAR2 doorbell
-            io.write(l.gc + 0x9b * 4, 0);
-            update(io, l.gc, 0x2b, 0xff, 1)?; // queue watchdog: 100ms
-            update(io, l.gc, 0x35, 0x61f, (3 << 9) | 9)?;
-            update(io, l.gc, 0x38, !0xff0fff, 0xe000)?; // default read/write policy
-            update(io, l.hyp, MCU_CNTL, 3, 0)?;
-            update(io, l.gc, RB_CNTL, 1, 1)?;
-            Ok(())
+            program_ring(io, l, address, 0)
         })?;
         self.state = State::Submitted;
         self.access(|io| {
@@ -635,6 +655,52 @@ impl<I: Io> Engine<I> {
         self.job_wptr = next;
         self.job_seq = seq;
         Ok(seq)
+    }
+    /// sdma_v7_0_reset_queue for the ring: the MMIO queue reset
+    /// (mes_v12_0_reset_queue_mmio: SDMA0_QUEUE_RESET_REQ bit 0, which the
+    /// engine clears within amdgpu's usec_timeout), then the ring
+    /// programmed again as sdma_v7_0_gfx_resume_instance(restore) does,
+    /// both pointers at the software write pointer, so the engine resumes
+    /// past every queued slot. The read pointer writeback is set there too,
+    /// as nothing writes it before the engine runs.
+    async fn reset_ring(&mut self) -> Result<(), Error> {
+        if self.state != State::InterruptVerified {
+            return Err(Error::Busy);
+        }
+        let l = self.layout;
+        self.access(|io| {
+            io.write(l.gc + u64::from(QUEUE_RESET_REQ) * 4, 1);
+            Ok(())
+        })?;
+        let deadline = narf_time::Deadline::after_us(100_000);
+        loop {
+            let pending = self.access(|io| {
+                Ok(checked(io.read(l.gc + u64::from(QUEUE_RESET_REQ) * 4))? & 1 != 0)
+            })?;
+            if !pending {
+                break;
+            }
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            delay(50).await;
+        }
+        let (address, map) = (self.memory.address(), self.memory.mapping());
+        let pointer = self.job_wptr.max(192 / 4) * 4;
+        self.access(|io| {
+            for at in [RPTR, WPTR] {
+                io.write_memory(map, at, pointer as u32);
+                io.write_memory(map, at + 4, (pointer >> 32) as u32);
+            }
+            flush(io, l);
+            program_ring(io, l, address, pointer)
+        })
+    }
+    /// Queue a fence-only slot of the next sequence: the ring test after
+    /// `reset_ring`. Once it lands the engine has moved past every earlier
+    /// slot.
+    fn submit_fence(&mut self) -> Result<u32, Error> {
+        self.submit_slot(fence_words)
     }
     /// The last client job sequence the fence reached.
     fn completed_job(&mut self) -> Result<u32, Error> {
@@ -842,6 +908,19 @@ impl Sdma {
         self.engine.submit_kernel(ops)
     }
     /// The last client job sequence SDMA0 completed.
+    /// Reset the hung ring (see `Engine::reset_ring`).
+    /// # Safety
+    /// Every job on the ring keeps the memory it reaches until a later
+    /// fence on it lands, and the platform serializes the ring's users.
+    pub async unsafe fn reset_ring(&mut self) -> Result<(), Error> {
+        self.engine.reset_ring().await
+    }
+    /// Queue the ring test after a reset (see `Engine::submit_fence`).
+    /// # Safety
+    /// As `submit`.
+    pub unsafe fn submit_fence(&mut self) -> Result<u32, Error> {
+        self.engine.submit_fence()
+    }
     pub fn completed_job(&mut self) -> Result<u32, Error> {
         self.engine.completed_job()
     }
