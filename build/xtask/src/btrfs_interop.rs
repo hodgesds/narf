@@ -169,9 +169,14 @@ fn stage(dir: &Path) -> Result<()> {
         .map(|i| b"narf root-rw interop line\n"[i % 26])
         .collect();
     write(&at.join("usr/share/narf/compressible.txt"), &text)?;
+    // Large and incompressible: mkfs sizes the data chunk around it, and the
+    // `root` mode's unlink then leaves that much allocated-but-free data
+    // space. Under `narf.disks=root-rw` NARF never allocates a chunk (a full
+    // root is ENOSPC), so the later modes (journald's 8 MiB KEEP_SIZE
+    // preallocation) need the room a lived-in root has.
     write(
         &at.join("usr/share/narf/delete-me.bin"),
-        &pattern(5, 300 * 1024),
+        &pattern(5, 48 << 20),
     )?;
     for sub in [
         "home",

@@ -808,3 +808,124 @@ fn smoke_btrfs_commit_updates_backup_roots() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_commit_updates_backup_roots);
+
+// ── Regressions from the CachyOS gate ───────────────────────────────
+
+/// Every ROOT_ITEM's generation must equal its root block's header
+/// generation (`verify_parent_transid` on the root).
+fn root_items_match_root_blocks(vol: &Vol) -> Result<(), &'static str> {
+    let (root_tree, _) = vol.root_tree_root();
+    let Some(Ok(mut cursor)) = poll_once(btree::Cursor::seek(
+        &**vol,
+        root_tree,
+        &BtrfsKey::new(0, 0, 0),
+    )) else {
+        return Err("root tree unreadable");
+    };
+    let mut checks = Vec::new();
+    while let Ok(Some((key, body))) = cursor.current() {
+        if key.item_type == format::ROOT_ITEM_KEY && body.len() >= 239 {
+            checks.push((le64(body, 176).unwrap(), le64(body, 160).unwrap()));
+        }
+        if poll_once(cursor.advance()).is_none_or(|r| r.is_err()) {
+            return Err("root tree walk failed");
+        }
+    }
+    for (bytenr, gen) in checks {
+        let Some(Ok(node)) = poll_once(vol.read_node(bytenr)) else {
+            return Err("a root block is unreadable");
+        };
+        if le64(&node, 80).ok() != Some(gen) {
+            return Err("a ROOT_ITEM generation does not match its root block");
+        }
+    }
+    Ok(())
+}
+
+/// Releasing a data extent with no checksums (preallocated space) path-COWs
+/// the csum tree with nothing to edit: its root does not move, so its
+/// ROOT_ITEM must keep its generation. Bumping it alone produced a
+/// `parent transid verify failed` image in the root-rw interop run.
+fn smoke_btrfs_unmoved_root_keeps_generation() -> TestResult {
+    let dev = writable_sparse(FIXTURE_MIRROR_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) if v.supports_writes() => v,
+        _ => return TestResult::Fail("mirror fixture did not mount writable"),
+    };
+    let root = vol.root();
+    let f = match poll_once(root.create("prealloc.bin")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if !matches!(
+        poll_once(f.fallocate(crate::write::FALLOC_FL_KEEP_SIZE, 0, 256 * 1024)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("fallocate failed");
+    }
+    drop(f);
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("first sync failed");
+    }
+    if !matches!(poll_once(root.unlink("prealloc.bin")), Some(Ok(()))) {
+        return TestResult::Fail("unlink failed");
+    }
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("second sync failed");
+    }
+    if let Err(why) = root_items_match_root_blocks(&vol) {
+        return TestResult::Fail(why);
+    }
+    // And from disk, through a fresh mount.
+    drop(root);
+    drop(vol);
+    match mount_writable(dev) {
+        Ok(v) => match root_items_match_root_blocks(&v) {
+            Ok(()) => TestResult::Pass,
+            Err(why) => TestResult::Fail(why),
+        },
+        Err(_) => TestResult::Fail("remount failed"),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_unmoved_root_keeps_generation
+);
+
+/// `O_TRUNC` of a small file Linux stored inline (most of a real root's
+/// small files) must succeed: the inline item is deleted, never carved.
+fn smoke_btrfs_truncate_inline_file_to_zero() -> TestResult {
+    let dev = writable_sparse(FIXTURE_MIRROR_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) if v.supports_writes() => v,
+        _ => return TestResult::Fail("mirror fixture did not mount writable"),
+    };
+    let f = match poll_once(vol.root().lookup_async("hello.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("hello.txt missing"),
+    };
+    if !matches!(poll_once(f.truncate(0)), Some(Ok(()))) {
+        return TestResult::Fail("truncating an inline file to zero failed");
+    }
+    if !matches!(poll_once(f.write(0, b"rewritten\n")), Some(Ok(10))) {
+        return TestResult::Fail("rewrite after truncate failed");
+    }
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("sync failed");
+    }
+    drop(f);
+    drop(vol);
+    let vol = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount failed"),
+    };
+    let f = match poll_once(vol.root().lookup_async("hello.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("hello.txt gone after remount"),
+    };
+    match read_all(&f, 64) {
+        Some(got) if got == b"rewritten\n" => TestResult::Pass,
+        _ => TestResult::Fail("rewritten content lost"),
+    }
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_truncate_inline_file_to_zero);

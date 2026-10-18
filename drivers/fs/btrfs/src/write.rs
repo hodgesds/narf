@@ -1782,7 +1782,17 @@ async fn commit_batch<B: BlockDevice + 'static>(
     let base_root = batch.base_root;
     let silent_losses = origin.silent_losses(batch.ops);
     let result = commit_batch_inner(vol, batch).await;
-    if result.is_err() {
+    if let Err(error) = &result {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "btrfs: transaction commit failed ({error:?}); {}",
+            if silent_losses > 0 {
+                "aborting: the filesystem is now read-only"
+            } else {
+                "the operation that filled it fails"
+            }
+        );
         if silent_losses > 0 {
             // Operations in this batch were reported successful and are now
             // gone, with no caller left to tell. `abort_transaction` explains
@@ -3708,6 +3718,10 @@ fn stamp_root_item_fields(
     if item.len() < 239 {
         return Err(FsError::InvalidData);
     }
+    // An unmoved root keeps its generation (see `commit_txn`).
+    if le64(&item, 176)? == bytenr {
+        return Ok(());
+    }
     item[160..168].copy_from_slice(&gen.to_le_bytes());
     item[176..184].copy_from_slice(&bytenr.to_le_bytes());
     item[238] = tree_level;
@@ -5296,7 +5310,14 @@ async fn commit_txn<B: BlockDevice + 'static>(
     } = done.ok_or(FsError::NoSpace)?;
 
     // ── Root tree: repoint each COWed tree's ROOT_ITEM, then pack it. ───
+    // A tree whose root did not move (a csum-tree COW with nothing to edit,
+    // say) keeps its ROOT_ITEM: bumping `generation` alone would name a root
+    // block whose header still carries the old one, which every reader
+    // rejects as a parent-transid mismatch.
     let stamp_root_item = |ri: &mut [u8], bytenr: u64, tree_level: u8| {
+        if le64(ri, 176).ok() == Some(bytenr) {
+            return;
+        }
         ri[160..168].copy_from_slice(&gen.to_le_bytes());
         ri[176..184].copy_from_slice(&bytenr.to_le_bytes());
         ri[238] = tree_level;
