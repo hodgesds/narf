@@ -389,6 +389,34 @@ fn root_hashes(d: &RootDisk) -> Result<RootHashes> {
     })
 }
 
+/// Standard base64 (RFC 4648, with padding), wrapped at `width` characters
+/// per line, each line newline-terminated, as `base64 -d` reads it.
+fn base64_lines(data: &[u8], width: usize) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut flat = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                flat.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                flat.push('=');
+            }
+        }
+    }
+    let mut out = String::with_capacity(flat.len() + flat.len() / width + 1);
+    for line in flat.as_bytes().chunks(width.max(4)) {
+        out.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+        out.push('\n');
+    }
+    out
+}
+
 /// `cp --reflink=auto --sparse=always`.
 fn copy_image(from: &Path, to: &Path) -> Result<()> {
     let _ = std::fs::remove_file(to);
@@ -886,17 +914,38 @@ impl Vm {
         }
     }
 
-    /// Put `body` at `path` in the guest (heredoc over the console).
+    /// Put `body` at `path` in the guest, verified.
+    ///
+    /// The console is the only channel into the guest, and typed text is not
+    /// guaranteed to arrive intact: a byte lost or reordered anywhere (QEMU's
+    /// chardev, the UART, the console line discipline, a process that read
+    /// the tty in between) corrupts a shell script silently, which then fails
+    /// in confusing ways (`unexpected EOF while looking for matching '"'`).
+    /// So the body travels base64-encoded (only `[A-Za-z0-9+/=]` and
+    /// newlines, nothing the shell or the line discipline interprets), is
+    /// decoded into a temporary file, and only replaces `path` after its
+    /// SHA-256 matches. A mismatch is retyped, up to three times.
     fn put_file(&mut self, path: &str, body: &str) -> Result<()> {
-        let mut s = format!("cat > {path} <<'NARF_GATE_EOF'\n");
-        s.push_str(body);
-        s.push_str("NARF_GATE_EOF\n");
-        self.send(&s)?;
-        let (rc, _) = self.run(&format!("test -s {path}"), Duration::from_secs(60))?;
-        if rc != 0 {
-            bail!("could not write {path} in the guest");
+        let want = hex(&Sha256::digest(body.as_bytes()));
+        let encoded = base64_lines(body.as_bytes(), 76);
+        let tmp = format!("{path}.narf-xfer");
+        for attempt in 1..=3 {
+            let mut s = format!("base64 -d > {tmp} <<'NARF_GATE_EOF'\n");
+            s.push_str(&encoded);
+            s.push_str("NARF_GATE_EOF\n");
+            self.send(&s)?;
+            let (rc, out) = self.run(&format!("sha256sum {tmp}"), Duration::from_secs(60))?;
+            if rc == 0 && out.contains(&want) {
+                let (rc, _) = self.run(&format!("mv -f {tmp} {path}"), Duration::from_secs(60))?;
+                if rc == 0 {
+                    return Ok(());
+                }
+            }
+            eprintln!(
+                "cachyos-gate: {path}: transfer {attempt} did not verify (rc {rc}); retyping"
+            );
         }
-        Ok(())
+        bail!("could not transfer {path} to the guest intact (3 attempts)")
     }
 
     fn poweroff(&mut self, timeout: Duration) -> Result<ExitStatus> {
@@ -2057,6 +2106,19 @@ fn seed_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn base64_matches_rfc4648() {
+        assert_eq!(super::base64_lines(b"", 76), "");
+        assert_eq!(super::base64_lines(b"f", 76), "Zg==\n");
+        assert_eq!(super::base64_lines(b"fo", 76), "Zm8=\n");
+        assert_eq!(super::base64_lines(b"foo", 76), "Zm9v\n");
+        assert_eq!(super::base64_lines(b"foobar", 4), "Zm9v\nYmFy\n");
+        assert_eq!(
+            super::base64_lines(b"set -u\nT=\"$1\"\n", 76),
+            "c2V0IC11ClQ9IiQxIgo=\n"
+        );
+    }
 
     #[test]
     fn install_after_snapshot_is_refused() {
