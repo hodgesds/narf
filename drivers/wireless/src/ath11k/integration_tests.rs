@@ -1537,7 +1537,7 @@ fn smoke_ath11k_int_eapol_filter() -> TestResult {
             "PAE group and unicast EAPOL queued"
         );
         ensure!(
-            g.link.eapol_rx[0][..6] == super::runtime::PAE_GROUP_ADDR,
+            g.link.eapol_rx[0].0[..6] == super::runtime::PAE_GROUP_ADDR,
             "PAE group frame delivered as received"
         );
         ensure!(RX_SEEN.lock().is_empty(), "EAPOL never reaches the stack");
@@ -4764,3 +4764,137 @@ fn smoke_ath11k_int_he_connect() -> TestResult {
     })
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_he_connect);
+
+// ── PTK rekey ─────────────────────────────────────────────────────
+
+/// The authenticator's message 1/4 (ver 2: Pairwise | Ack) with `rc` /
+/// `anonce`, as hostapd sends it for a PTK rekey.
+fn rekey_m1(rc: u64, anonce: [u8; 32]) -> Vec<u8> {
+    let mut k = narf_wireless::eapol::KeyFrame::empty(16);
+    k.key_information = 0x008A;
+    k.key_length = 16;
+    k.replay_counter = rc;
+    k.key_nonce = anonce;
+    let mut b = k.into_eapol();
+    b[0] = 2;
+    super::mac_frame::eapol_eth(&OWN, &BSSID, &b)
+}
+
+fn install_keys(u: &Up) -> Vec<WmiCmd> {
+    u.dev
+        .st
+        .borrow()
+        .wmi
+        .iter()
+        .filter(|c| c.cmd_id == wmi::WMI_VDEV_INSTALL_KEY_CMDID)
+        .cloned()
+        .collect()
+}
+
+/// A PTK rekey the AP starts after association (wpa_supplicant
+/// `wpa_supplicant_process_1_of_4` while completed → M2 with Secure;
+/// `_3_of_4` → M4; mac80211 `ieee80211_key_replace` →
+/// `ieee80211_pairwise_rekey` for PTK0 on ath11k): the running RX BA
+/// session stopped with a DELBA (recipient, reason 36) before the old PTK
+/// is disabled (WMI_VDEV_INSTALL_KEY, WMI_CIPHER_NONE) and the new one
+/// installed (AES-CCM, the authenticator's new TK); the unchanged GTK is
+/// not reinstalled; the retransmitted M3 that follows is answered with
+/// another M4 and no key command; a rekey M3 with a bad MIC changes
+/// nothing.
+fn smoke_ath11k_int_ptk_rekey() -> TestResult {
+    check(|| {
+        let mut cfg = wpa2_cfg();
+        cfg.m3_repeat = true;
+        // HT, so the AP's ADDBA starts an RX BA session.
+        let u = up_caps(cfg, |c| c.pdev.band_2g.ht_cap_info = 0x185F)?;
+        connect(&u)?;
+        inject(&u, &addba_req(7, 1, 0, 64, 0, 10));
+        pump(&u, 3);
+        let anonce2 = [0x44u8; 32];
+        let keys0 = install_keys(&u).len();
+        let (mgmt0, eth0) = {
+            let mut st = u.dev.st.borrow_mut();
+            st.world.ap.anonce = Some(anonce2);
+            st.world.eapol_rx.push_back(rekey_m1(5, anonce2));
+            (st.world.mgmt.len(), st.tcl_tx.len())
+        };
+        pump(&u, 10);
+        ensure!(u.netdev.link_up(), "still associated");
+        let eap = eapol_tx(&u, eth0);
+        ensure!(eap.len() == 3, "M2, M4, M4 for the retransmission");
+        // 802.1X v1 | type 3 | len | desc 2 | key info ver 2 | Pairwise |
+        // MIC | Secure (a PTK is set) | key length 0 | RC 5.
+        ensure!(
+            eap[0][5..7] == [0x03, 0x0A] && eap[0][9..17] == 5u64.to_be_bytes(),
+            "rekey M2"
+        );
+        ensure!(
+            eap[1][9..17] == 6u64.to_be_bytes() && eap[2][9..17] == 7u64.to_be_bytes(),
+            "M4s echo their M3s"
+        );
+        {
+            let st = u.dev.st.borrow();
+            ensure!(
+                st.world.ap.m2_mic_ok && st.world.ap.m4_ok,
+                "MICs with the new PTK"
+            );
+            let delba = st.world.mgmt[mgmt0..]
+                .iter()
+                .find(|f| f.len() >= 30 && f[0] == 0xD0 && f[24] == 3 && f[25] == 2)
+                .ok_or("DELBA")?;
+            // params = initiator 0 << 11 | tid 0 << 12; reason 36.
+            ensure!(
+                delba[26..30] == [0x00, 0x00, 36, 0],
+                "DELBA params / reason"
+            );
+        }
+        let keys = install_keys(&u);
+        let new = &keys[keys0..];
+        ensure!(
+            new.len() == 2,
+            "DISABLE old + SET new; GTK unchanged; no reinstall"
+        );
+        // wmi_vdev_install_key_cmd: tlv | vdev_id | peer_macaddr (8) |
+        // key_idx | key_flags | key_cipher | key_len ...
+        ensure!(
+            rd32(&new[0].buf, 16) == 0 && rd32(&new[0].buf, 20) == 0 && rd32(&new[0].buf, 24) == 0,
+            "old PTK: idx 0, WMI_KEY_PAIRWISE (0), WMI_CIPHER_NONE"
+        );
+        ensure!(
+            rd32(&new[1].buf, 20) == 0 && rd32(&new[1].buf, 24) == 4,
+            "new PTK: WMI_KEY_PAIRWISE, WMI_CIPHER_AES_CCM (4)"
+        );
+        let tk = u.dev.st.borrow().world.ap.ptk.as_ref().unwrap().tk.clone();
+        ensure!(new[1].buf.windows(16).any(|w| w == &tk[..]), "the new TK");
+        // The DELBA went out before the old key was disabled.
+        ensure!(
+            {
+                let st = u.dev.st.borrow();
+                let di = st.wmi.iter().position(|c| *c == new[0]).unwrap();
+                st.wmi[..di].iter().any(|c| {
+                    c.cmd_id == wmi::WMI_MGMT_TX_SEND_CMDID
+                        && c.buf.len() > 66
+                        && c.buf[64] == 3
+                        && c.buf[65] == 2
+                })
+            },
+            "DELBA before DISABLE_KEY"
+        );
+
+        // A rekey whose M3 MIC is bad: dropped, no key change.
+        {
+            let mut st = u.dev.st.borrow_mut();
+            let mut c = st.world.cfg();
+            c.bad_m3_mic = true;
+            c.m3_repeat = false;
+            st.world.cfg = Some(c);
+            st.world.ap.anonce = Some([0x55; 32]);
+            st.world.eapol_rx.push_back(rekey_m1(9, [0x55; 32]));
+        }
+        pump(&u, 10);
+        ensure!(u.netdev.link_up(), "bad rekey M3 ignored");
+        ensure!(install_keys(&u).len() == keys.len(), "no key command");
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_ptk_rekey);

@@ -433,7 +433,9 @@ pub struct LinkState {
     pub ptk: bool,
     pub seq: SeqState,
     /// Received EAPOL frames (802.3) for the supplicant.
-    pub eapol_rx: VecDeque<Vec<u8>>,
+    /// EAPOL frames as 802.3 with whether the MPDU was decrypted
+    /// (`enum frame_encryption` for wpa_supplicant).
+    pub eapol_rx: VecDeque<(Vec<u8>, bool)>,
     /// `sta->deflink.status_stats.last_ack_signal` / `last_ack` (ms).
     pub last_ack_signal: Option<i32>,
     pub last_ack_ms: Option<u64>,
@@ -650,6 +652,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
     /// rule (wpa_supplicant's `last_eapol_matches_bssid`; `mac.rs`).
     fn rx_msdu(&mut self, m: RxMsdu) {
         let csum_ok = m.csum_ok;
+        let decrypted = m.decrypted;
         let f = m.frame;
         if f.len() < ETH_HLEN {
             self.stats.rx_dropped_short += 1;
@@ -675,7 +678,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
             if self.link.eapol_rx.len() >= EAPOL_QUEUE_MAX {
                 self.link.eapol_rx.pop_front();
             }
-            self.link.eapol_rx.push_back(f);
+            self.link.eapol_rx.push_back((f, decrypted));
         } else if self.link.authorized {
             if self.link.data_rx.len() >= RX_QUEUE_MAX {
                 self.stats.rx_queue_full += 1;
@@ -1777,7 +1780,11 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
             .unwrap_or(Err(EIO))
     }
 
-    async fn recv_eapol(&self, timeout_ms: u32) -> Option<Vec<u8>> {
+    async fn flush_tx(&self) {
+        self.0.flush_queues(false).await;
+    }
+
+    async fn recv_eapol(&self, timeout_ms: u32) -> Option<(Vec<u8>, bool)> {
         self.0
             .wait_until(timeout_ms, |rt| rt.link.eapol_rx.pop_front())
             .await

@@ -446,7 +446,6 @@ pub fn assoc_ies(plan: &RsnPlan, bss_ies: &[u8]) -> Vec<u8> {
 
 use narf_wireless::eapol::{
     EapolRx, EapolRxError, GroupKeyDrop, GroupKeyFail, PairwiseFail, RsnaParams, Supplicant,
-    KI_KEY_TYPE_PAIRWISE,
 };
 
 use super::{errno, fail, step, timeout, DataPort, LinkLoss, Mac, MacError, ScanBss, WmiPort};
@@ -523,7 +522,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                 return fail(s, sup.state as u32, errno::ETIMEDOUT, what);
             }
             let slice = ((deadline - now) as u32).min(50);
-            let Some(eth) = self.dp.recv_eapol(slice).await else {
+            let Some((eth, encrypted)) = self.dp.recv_eapol(slice).await else {
                 continue;
             };
             let Some((src, pdu)) = frame::parse_eapol_eth(&eth) else {
@@ -534,7 +533,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             }
             let mut fresh = [0u8; 32];
             self.wmi.random_bytes(&mut fresh);
-            match sup.rx_eapol(pdu, false, fresh) {
+            match sup.rx_eapol(pdu, encrypted, fresh) {
                 Ok(EapolRx::Pairwise1(m2)) => {
                     let f = frame::eapol_eth(&aa, &own, &m2.reply);
                     if let Err(e) = self.dp.send_eth(&f).await {
@@ -597,8 +596,12 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
     /// is not the AP are not processed (`last_eapol_matches_bssid`);
     /// without RSN EAPOL is ignored. A failed handshake deauthenticates
     /// with `WLAN_REASON_UNSPECIFIED` ([`LinkLoss::Supplicant`]).
+    ///
+    /// A pairwise message 1/4 is a PTK rekey (`wpa_supplicant_process_1_of_4`
+    /// while completed): message 2/4 goes back, message 3/4 is answered and
+    /// the new TK installed as mac80211 replaces a PTK0 ([`Self::ptk_rekey`]).
     pub(super) async fn rx_eapol(&mut self) {
-        while let Some(eth) = self.dp.recv_eapol(0).await {
+        while let Some((eth, encrypted)) = self.dp.recv_eapol(0).await {
             let Some(l) = self.link.as_ref() else {
                 continue;
             };
@@ -612,16 +615,42 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             if src != aa {
                 continue;
             }
-            // A pairwise EAPOL-Key (PTK rekey) is not handled here.
-            if pdu.len() >= 7 && u16::from_be_bytes([pdu[5], pdu[6]]) & KI_KEY_TYPE_PAIRWISE != 0 {
-                continue;
-            }
             let mut fresh = [0u8; 32];
             self.wmi.random_bytes(&mut fresh);
-            let r = self.sup.as_mut().unwrap().rx_eapol(pdu, true, fresh);
+            let r = self.sup.as_mut().unwrap().rx_eapol(pdu, encrypted, fresh);
+            let own = self.caps.mac_addr;
             let m1 = match r {
                 Ok(EapolRx::Group1(m)) => m,
-                Ok(_) | Err(EapolRxError::Drop(_)) | Err(EapolRxError::Pairwise { .. }) => continue,
+                Ok(EapolRx::Pairwise1(m2)) => {
+                    // wpa_supplicant_send_2_of_4 ("goto failed" on a TX error).
+                    let f = frame::eapol_eth(&aa, &own, &m2.reply);
+                    if self.dp.send_eth(&f).await.is_err() {
+                        self.supplicant_deauth(step::PTK_REKEY, 1);
+                        return;
+                    }
+                    continue;
+                }
+                Ok(EapolRx::Pairwise3(m3)) => {
+                    if let Err(d) = self.ptk_rekey(aa, &m3).await {
+                        self.supplicant_deauth(step::PTK_REKEY, d);
+                        return;
+                    }
+                    continue;
+                }
+                Err(EapolRxError::Pairwise { reason, why }) => {
+                    let (s, d) = pairwise_fail_step(why);
+                    if let Some(l) = self.link.as_mut() {
+                        if l.loss.is_none() {
+                            l.loss = Some(LinkLoss::Supplicant {
+                                reason,
+                                step: s,
+                                detail: d,
+                            });
+                        }
+                    }
+                    return;
+                }
+                Err(EapolRxError::Drop(_)) => continue,
                 Err(EapolRxError::Group(f)) => {
                     let n = match f {
                         GroupKeyFail::Before4Way => 1,
@@ -657,7 +686,6 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                     }
                 }
             }
-            let own = self.caps.mac_addr;
             if self
                 .dp
                 .send_eth(&frame::eapol_eth(&aa, &own, &m1.reply))
@@ -668,6 +696,93 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                 return;
             }
         }
+    }
+
+    /// Message 3/4 of a PTK rekey: message 4/4 first (wpa_supplicant
+    /// sends it under the old key), then `wpa_supplicant_install_ptk` →
+    /// `ieee80211_add_key` → `ieee80211_key_replace` for PTK0 without
+    /// Extended Key ID on ath11k (hardware crypto, `AMPDU_AGGREGATION`, no
+    /// `NL80211_EXT_FEATURE_CAN_REPLACE_PTK0`): `ieee80211_pairwise_rekey`
+    /// tears the RX BA sessions down with a DELBA each
+    /// (`ieee80211_sta_tear_down_BA_sessions(AGG_STOP_LOCAL_REQUEST)`,
+    /// `WLAN_REASON_QSTA_LEAVE_QBSS`) and flushes the queues
+    /// (`ieee80211_flush_queues(.., false)`); the old key is disabled
+    /// (`ath11k_mac_op_set_key(DISABLE_KEY)`: cipher NONE + PN config off),
+    /// the new one installed (`SET_KEY`: fragment flush, install, PN config
+    /// = the REO PN reset) and made the TX key (`_ieee80211_set_tx_key`;
+    /// the management PNs restart with it). A retransmitted 3/4 only gets
+    /// its 4/4 (no TK: "Do not re-install same PTK"). Then a new GTK /
+    /// IGTK from the message, as after the first 4-way. `Err` = detail.
+    async fn ptk_rekey(
+        &mut self,
+        aa: [u8; 6],
+        m3: &narf_wireless::eapol::PairwiseM3,
+    ) -> Result<(), u32> {
+        let own = self.caps.mac_addr;
+        if self
+            .dp
+            .send_eth(&frame::eapol_eth(&aa, &own, &m3.reply))
+            .await
+            .is_err()
+        {
+            return Err(2);
+        }
+        if let Some(tk) = m3.tk.as_ref() {
+            for tid in 0..16 {
+                self.stop_rx_ba_session(
+                    tid,
+                    frame::WLAN_BACK_RECIPIENT,
+                    frame::WLAN_REASON_QSTA_LEAVE_QBSS,
+                    true,
+                )
+                .await;
+            }
+            self.dp.flush_tx().await;
+            let vdev_id = self.vif.as_ref().map_or(0, |v| v.vdev_id);
+            let old = super::VdevInstallKeyArg {
+                vdev_id,
+                macaddr: aa,
+                key_idx: 0,
+                key_flags: super::WMI_KEY_PAIRWISE,
+                key_cipher: super::cipher::NONE,
+                ..Default::default()
+            };
+            if self.install_key_cmd(&old).await.is_err() {
+                return Err(3);
+            }
+            let _ = self
+                .dp
+                .rx_pn_replay_config(vdev_id, aa, super::cipher::AES_CCM, true, false)
+                .await;
+            if self.install_key(aa, 0, tk, true).await.is_err() {
+                return Err(4);
+            }
+            if let Some(s) = self.sup.as_mut() {
+                s.pairwise_key_installed();
+            }
+            self.mfp.mgmt_rx_pn = 0;
+            self.mfp.mgmt_tx_pn = 0;
+        }
+        if let Some(g) = m3.gtk.as_ref() {
+            if self.install_key(aa, g.key_id, &g.key, false).await.is_err() {
+                return Err(5);
+            }
+            if let Some(l) = self.link.as_mut() {
+                l.gtk_idx = Some(g.key_id);
+            }
+            if let Some(s) = self.sup.as_mut() {
+                s.group_keys_installed(Some(&g.key), None);
+            }
+        }
+        if let Some(i) = m3.igtk.as_ref() {
+            if !self.mfp.install_igtk(i.key_id, &i.key, i.ipn) {
+                return Err(6);
+            }
+            if let Some(s) = self.sup.as_mut() {
+                s.group_keys_installed(None, Some(&i.key));
+            }
+        }
+        Ok(())
     }
 
     /// mac80211's MFP receive path for a robust frame from our AP while

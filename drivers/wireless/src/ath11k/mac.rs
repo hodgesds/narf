@@ -111,9 +111,12 @@ pub trait DataPort {
     ) -> impl Future<Output = Result<(), i32>> + Send;
     /// Transmit an 802.3 frame (EAPOL; the DP encapsulates it).
     fn send_eth(&self, frame: &[u8]) -> impl Future<Output = Result<(), i32>> + Send;
-    /// The next received EAPOL frame as 802.3 (`ETH_P_PAE`), waiting at
-    /// most `timeout_ms`.
-    fn recv_eapol(&self, timeout_ms: u32) -> impl Future<Output = Option<Vec<u8>>> + Send;
+    /// The next received EAPOL frame as 802.3 (`ETH_P_PAE`) and whether
+    /// it arrived decrypted, waiting at most `timeout_ms`.
+    fn recv_eapol(&self, timeout_ms: u32) -> impl Future<Output = Option<(Vec<u8>, bool)>> + Send;
+    /// `ieee80211_flush_queues(local, sdata, false)`: wait for the pending
+    /// TX (`ath11k_mac_op_flush`).
+    fn flush_tx(&self) -> impl Future<Output = ()> + Send;
     /// The BSS peer's port is (un)authorized (`peer->is_authorized`):
     /// the DP passes non-EAPOL data only while authorized.
     fn set_authorized(&self, addr: [u8; 6], authorized: bool);
@@ -222,6 +225,10 @@ pub mod step {
     /// An HE vdev command failed (detail 0 HEMU_MODE, 1 BSS color change
     /// enable, 2 OBSS color collision config); Linux only warns.
     pub const HE_PARAM: u32 = 276;
+    /// A PTK rekey failed after message 1/4 or 3/4 (detail 1 M2 TX, 2 M4
+    /// TX, 3 old-key DISABLE, 4 new PTK install, 5 GTK, 6 IGTK):
+    /// deauthenticated with `WLAN_REASON_UNSPECIFIED`.
+    pub const PTK_REKEY: u32 = 277;
 }
 
 /// Linux errnos used here (positive).
@@ -1115,7 +1122,13 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
     /// `__ieee80211_stop_rx_ba_session`: `IEEE80211_AMPDU_RX_STOP` to the
     /// driver (a failure is only logged), and a DELBA when we end the
     /// session ourselves (`initiator == WLAN_BACK_RECIPIENT && tx`).
-    async fn stop_rx_ba_session(&mut self, tid: u16, initiator: u16, reason: u16, tx: bool) {
+    pub(super) async fn stop_rx_ba_session(
+        &mut self,
+        tid: u16,
+        initiator: u16,
+        reason: u16,
+        tx: bool,
+    ) {
         let Some(l) = self.link.as_mut() else {
             return;
         };
@@ -2917,7 +2930,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
 
     /// `ath11k_mac_op_set_key(SET_KEY, CCMP)` → `ath11k_install_key` +
     /// `ath11k_dp_peer_rx_pn_replay_config`.
-    async fn install_key(
+    pub(super) async fn install_key(
         &mut self,
         addr: [u8; 6],
         idx: u8,
@@ -2956,7 +2969,10 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
     }
 
     /// `ath11k_install_key` body: command + `install_key_done`.
-    async fn install_key_cmd(&mut self, arg: &VdevInstallKeyArg) -> Result<(), MacError> {
+    pub(super) async fn install_key_cmd(
+        &mut self,
+        arg: &VdevInstallKeyArg,
+    ) -> Result<(), MacError> {
         self.pending.install_key = None;
         let c = vdev_install_key_cmd(arg);
         self.cmd(c, step::KEY_INSTALL, arg.key_idx, "install key")

@@ -594,7 +594,8 @@ mac layer sees the MGMT_TX_COMPLETION), `now_ms()`, `max_msg_len()`
 timeout)` (HTT PEER_MAP / UNMAP), `peer_setup` / `peer_cleanup`,
 `rx_pn_replay_config(vdev, addr, cipher, pairwise, install)`,
 `send_eth(frame)` / `recv_eapol(timeout)` (EAPOL as 802.3,
-`ETH_P_PAE`), `set_authorized(addr, on)` (port control for data),
+`ETH_P_PAE`, with whether the MPDU was decrypted), `flush_tx()`
+(`ieee80211_flush_queues(.., false)`), `set_authorized(addr, on)` (port control for data),
 `set_sta_wme(addr, wme)` (`sta->sta.wme` from the association
 response: the TX path builds QoS Data only for a WMM AP).
 
@@ -655,8 +656,23 @@ updates), `handle_event(frame)`, `connected_bssid()`.
   DELBA) before the keys go. BAR is handled by the REO in hardware (ath11k
   never sees BARs; mac80211's BAR path is unreached). A recipient DELBA
   (`ieee80211_send_delba`, `frame::build_delba`) is sent only for a
-  locally stopped session (`initiator == RECIPIENT && tx`), which no NARF
-  path does (Linux: PTK rekey / suspend teardown, not ported).
+  locally stopped session (`initiator == RECIPIENT && tx`): the PTK rekey's
+  `ieee80211_sta_tear_down_BA_sessions(AGG_STOP_LOCAL_REQUEST)` (reason 36;
+  suspend teardown is not ported).
+- PTK rekey (`Mac::ptk_rekey`): a pairwise message 1/4 after the 4-way
+  (`Supplicant::rx_eapol`: new TPTK, M2 with Secure, the renewed SNonce;
+  an unencrypted M1 with PMF and a TK set is dropped) and its 3/4 (MIC
+  with the new TPTK, which then becomes the PTK) → M4 under the old key,
+  then mac80211's PTK0 replacement for ath11k (`ieee80211_key_replace` →
+  `ieee80211_pairwise_rekey`: no Extended Key ID, HW crypto,
+  `AMPDU_AGGREGATION`, no `CAN_REPLACE_PTK0`): every RX BA session stopped
+  with a DELBA, `ieee80211_flush_queues(false)`, `DISABLE_KEY` of the old
+  PTK (cipher NONE + PN config off), `SET_KEY` of the new (fragment flush,
+  install, PN config = REO PN reset), management PNs restarted
+  (`_ieee80211_set_tx_key`); a retransmitted 3/4 only gets its 4/4. A new
+  GTK / IGTK in the 3/4 is installed; an unchanged one is not. A failure
+  deauthenticates (reason 1; 17 for an RSNE / RSNXE mismatch), step 277
+  `PTK_REKEY` (detail 1 M2 TX, 2 M4 TX, 3 DISABLE, 4 SET, 5 GTK, 6 IGTK).
 - Group rekey (`Mac::poll` → `rx_eapol`): EAPOL received while
   authorized goes to the association's supplicant (kept after the 4-way
   with its PTK, replay counter and GTK in use):
@@ -1419,9 +1435,9 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   bring-up waits on the device; the TX
   queues are one FIFO per AC, not one TXQ per TID with mac80211's airtime
   round robin and fq_codel (one station; the AC order and stop reasons are
-  Linux's), no A-MSDU / fast-xmit header cache; no PTK rekey (a pairwise
-  EAPOL-Key after the handshake is dropped; wpa_supplicant would run a
-  new 4-way handshake); EAPOL frames carry 802.1X version 1
+  Linux's), no A-MSDU / fast-xmit header cache; a PTK rekey runs inside
+  one runtime step, so mac80211's `WLAN_STA_BLOCK_BA` window (ADDBA refused
+  between teardown and the new key) has nothing to block; EAPOL frames carry 802.1X version 1
   (wpa_supplicant's `DEFAULT_EAPOL_VERSION`); PMF policy is optional for
   PSK (NetworkManager / iwd; standalone wpa_supplicant defaults to
   `pmf=0`); only BIP-CMAC-128 (no BIP-GMAC / CMAC-256), no beacon
@@ -1514,7 +1530,7 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   element (wpa_supplicant also adds Extended Capabilities); no Country /
   Power Constraint handling (`ap_power_level`), no TPC / 6 GHz power
   envelope, no TWT; association comeback
-  (status 30) is a reject; PTK rekey, roaming,
+  (status 30) is a reject; roaming,
   GTK rekey offload and CSA are not implemented; kickout is treated as
   link loss (Linux reports low-ack to userspace); deauth reason after a
   4-way timeout is 3, after a failed message 3/4 1 (17 for an RSNE / RSNXE

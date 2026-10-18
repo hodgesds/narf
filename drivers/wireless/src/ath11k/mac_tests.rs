@@ -244,6 +244,8 @@ pub(super) struct FwCfg {
     pub(super) sae: Option<SaeAp>,
     /// Elements appended to the Association Response (HE, ...).
     pub(super) assoc_extra: Vec<u8>,
+    /// Retransmit M3 once (next replay counter) right after it.
+    pub(super) m3_repeat: bool,
 }
 
 /// The fake AP's SAE behaviour.
@@ -283,6 +285,7 @@ impl Default for FwCfg {
             sta_ies: None,
             sae: None,
             assoc_extra: Vec::new(),
+            m3_repeat: false,
         }
     }
 }
@@ -345,6 +348,10 @@ pub(super) struct Ap {
     pub(super) pmk: Option<[u8; 32]>,
     /// The AKM the station chose (from its M2 RSNE).
     pub(super) km: Option<eapol::KeyMgmt>,
+    /// The ANonce of the handshake in progress (`None` = [`ANONCE`]).
+    pub(super) anonce: Option<[u8; 32]>,
+    /// The replay counter of the last M3 (M4 echoes it).
+    pub(super) m3_rc: u64,
     pub(super) ptk: Option<eapol::Ptk>,
     /// The AP's SAE session and the SAE frames the station sent
     /// (transaction, status, body).
@@ -664,14 +671,15 @@ impl World {
         zeroed[EAPOL_MIC_OFFSET..EAPOL_MIC_OFFSET + 16].fill(0);
         let ki = k.key_information & !eapol::KI_VERSION_MASK;
         let ver = k.key_information & eapol::KI_VERSION_MASK;
-        if ki == 0x0108 && k.key_nonce != [0; 32] {
+        if ki & !eapol::KI_SECURE == 0x0108 && k.key_nonce != [0; 32] {
             // M2: AKM from the station's RSNE (suite at offset 18 of the body).
             let km = (k.key_data.len() >= 22 && k.key_data[0] == 0x30)
                 .then(|| eapol::KeyMgmt::from_suite_type(k.key_data[19]))
                 .flatten()
                 .unwrap_or(eapol::KeyMgmt::Psk);
             let pmk = self.ap.pmk.unwrap_or(PMK);
-            let ptk = eapol::wpa_pmk_to_ptk(km, &pmk, &BSSID, &OWN, &ANONCE, &k.key_nonce, 16);
+            let anonce = self.ap.anonce.unwrap_or(ANONCE);
+            let ptk = eapol::wpa_pmk_to_ptk(km, &pmk, &BSSID, &OWN, &anonce, &k.key_nonce, 16);
             self.ap.m2_mic_ok = ver == km.key_info_version()
                 && eapol::wpa_eapol_key_mic(km, ver, &ptk.kck, &zeroed).as_deref()
                     == Some(&pdu[EAPOL_MIC_OFFSET..EAPOL_MIC_OFFSET + 16]);
@@ -698,25 +706,32 @@ impl World {
             }
             let mut kek = [0u8; 16];
             kek.copy_from_slice(&ptk.kek);
-            let mut m3 = KeyFrame::empty(16);
-            m3.key_information = 0x13C8 | km.key_info_version();
-            m3.key_length = 16;
-            m3.replay_counter = 2;
-            m3.key_nonce = ANONCE;
-            m3.key_data = aes_key_wrap(&kek, &kd);
-            let mut b = m3.into_eapol();
-            let mut mic = [0u8; 16];
-            mic.copy_from_slice(
-                &eapol::wpa_eapol_key_mic(km, km.key_info_version(), &ptk.kck, &b).unwrap(),
-            );
-            if cfg.bad_m3_mic {
-                mic[0] ^= 0x01;
+            // M3, then (m3_repeat) its retransmission with the next counter.
+            for rep in 0..=(cfg.m3_repeat as u64) {
+                let mut m3 = KeyFrame::empty(16);
+                m3.key_information = 0x13C8 | km.key_info_version();
+                m3.key_length = 16;
+                m3.replay_counter = k.replay_counter + 1 + rep;
+                m3.key_nonce = anonce;
+                self.ap.m3_rc = m3.replay_counter;
+                m3.key_data = aes_key_wrap(&kek, &kd);
+                let mut b = m3.into_eapol();
+                let mut mic = [0u8; 16];
+                mic.copy_from_slice(
+                    &eapol::wpa_eapol_key_mic(km, km.key_info_version(), &ptk.kck, &b).unwrap(),
+                );
+                if cfg.bad_m3_mic {
+                    mic[0] ^= 0x01;
+                }
+                b[EAPOL_MIC_OFFSET..EAPOL_MIC_OFFSET + 16].copy_from_slice(&mic);
+                self.eapol_rx.push_back(frame::eapol_eth(&OWN, &BSSID, &b));
             }
-            b[EAPOL_MIC_OFFSET..EAPOL_MIC_OFFSET + 16].copy_from_slice(&mic);
-            self.eapol_rx.push_back(frame::eapol_eth(&OWN, &BSSID, &b));
             self.ap.ptk = Some(ptk);
             self.ap.km = Some(km);
-        } else if ki == 0x0308 && k.replay_counter == 2 {
+        } else if ki == 0x0308
+            && k.key_nonce == [0; 32]
+            && k.replay_counter >= self.ap.m3_rc - cfg.m3_repeat as u64
+        {
             if let (Some(ptk), Some(km)) = (&self.ap.ptk, self.ap.km) {
                 self.ap.m4_ok = eapol::wpa_eapol_key_mic(km, ver, &ptk.kck, &zeroed).as_deref()
                     == Some(&pdu[EAPOL_MIC_OFFSET..EAPOL_MIC_OFFSET + 16]);
@@ -815,13 +830,21 @@ impl DataPort for FakeDp {
         self.0.lock().on_eth(f);
         core::future::ready(Ok(()))
     }
-    fn recv_eapol(&self, timeout_ms: u32) -> impl Future<Output = Option<Vec<u8>>> + Send {
+    fn recv_eapol(&self, timeout_ms: u32) -> impl Future<Output = Option<(Vec<u8>, bool)>> + Send {
         let mut w = self.0.lock();
         let e = w.eapol_rx.pop_front();
         if e.is_none() {
             w.now += timeout_ms as u64;
         }
-        core::future::ready(e)
+        // Encrypted once the PTK is in (the fake AP never sends otherwise).
+        let enc =
+            w.pn.iter()
+                .any(|&(_, pairwise, install)| pairwise && install);
+        core::future::ready(e.map(|f| (f, enc)))
+    }
+    fn flush_tx(&self) -> impl Future<Output = ()> + Send {
+        self.0.lock().dp_calls.push("flush");
+        core::future::ready(())
     }
     fn set_authorized(&self, _addr: [u8; 6], authorized: bool) {
         self.0.lock().authorized = Some(authorized);
