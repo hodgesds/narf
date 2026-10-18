@@ -87,7 +87,7 @@ const CHECK_COMMANDS: &[&str] = &[
     "echo ok > /home/narf-smoke-probe && echo NARF-WRITE-HOME ok || echo NARF-WRITE-HOME refused",
     "mkdir -p /narf-smoke/many; n=0; for i in $(seq 1 60); do printf 'narf %d\\n' $i > /narf-smoke/many/f$i || break; n=$i; done; echo NARF-MANY-FILES $n",
     "ls /var/log/journal 2>/dev/null | head -n 3 | sed 's/^/NARF-JOURNAL /'",
-    "udevadm info -q property -n /dev/disk/by-uuid/c4c405ee-0000-4a11-9e57-00000000c0de | grep -E 'DEVNAME|ID_FS_TYPE|BTRFS|SYSTEMD_READY'",
+    "udevadm info -q property -n /dev/nvme1n1p2 | grep -E 'DEVNAME|DEVLINKS|ID_FS|BTRFS|SYSTEMD|TAGS|USEC' | sed 's/^/NARF-UDEV /'",
     "for u in $(systemctl --no-legend --plain --failed | cut -d' ' -f1); do echo NARF-UNIT $u; journalctl -b --no-pager -o cat -n 8 -u $u; done",
     "/usr/lib/systemd/systemd-remount-fs 2>&1 | head -n 5 | sed 's/^/NARF-REMOUNT-FS /'",
     "systemd-sysusers 2>&1 | head -n 3 | sed 's/^/NARF-SYSUSERS /'",
@@ -96,6 +96,8 @@ const CHECK_COMMANDS: &[&str] = &[
     "journalctl -b --no-pager -o cat _SYSTEMD_UNIT=systemd-sysusers.service | head -n 3 | sed 's/^/NARF-JOURNAL-UNIT /'",
     "timeout 5 /usr/lib/systemd/systemd-oomd 2>&1 | head -n 5 | sed 's/^/NARF-OOMD /'",
     "journalctl -b --no-pager -p warning -o cat | tail -n 40",
+    "sed 's/^/NARF-MI /' /proc/1/mountinfo",
+    "journalctl -b --no-pager -o cat _PID=1 | grep -iE 'mountinfo|libmount|mount table|monitor' | tail -n 25 | sed 's/^/NARF-PID1 /'",
     "echo NARF-CACHYOS-ROOT-$((40+2))-DONE",
 ];
 

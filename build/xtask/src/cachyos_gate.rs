@@ -389,6 +389,34 @@ fn root_hashes(d: &RootDisk) -> Result<RootHashes> {
     })
 }
 
+/// Standard base64 (RFC 4648, with padding), wrapped at `width` characters
+/// per line, each line newline-terminated, as `base64 -d` reads it.
+fn base64_lines(data: &[u8], width: usize) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut flat = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                flat.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                flat.push('=');
+            }
+        }
+    }
+    let mut out = String::with_capacity(flat.len() + flat.len() / width + 1);
+    for line in flat.as_bytes().chunks(width.max(4)) {
+        out.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+        out.push('\n');
+    }
+    out
+}
+
 /// `cp --reflink=auto --sparse=always`.
 fn copy_image(from: &Path, to: &Path) -> Result<()> {
     let _ = std::fs::remove_file(to);
@@ -781,6 +809,62 @@ impl Vm {
         )
     }
 
+    /// Like [`Self::wait_for`] but ignores [`FAIL_MARKERS`]: for driving the
+    /// emergency shell itself.
+    fn wait_raw(&mut self, pat: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            {
+                let g = self.buf.lock().unwrap();
+                let hay = &g[self.cursor.min(g.len())..];
+                if let Some(pos) = find(hay, pat.as_bytes()) {
+                    self.cursor += pos + pat.len();
+                    return true;
+                }
+            }
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// After systemd fell back to emergency mode, log in to the maintenance
+    /// shell and collect why the root's device unit never appeared (udev's
+    /// record of the partition, the by-uuid links, the device unit, the
+    /// relevant journal). Best effort; returns the cleaned transcript.
+    fn emergency_diagnostics(&mut self, password: &str) -> Option<String> {
+        if !self.text().contains("You are in emergency mode") {
+            return None;
+        }
+        self.cursor = 0;
+        if !self.wait_raw("root password for maintenance", Duration::from_secs(60))
+            && !self.wait_raw("Press Enter", Duration::from_secs(5))
+        {
+            return None;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        self.send(&format!("{password}\n")).ok()?;
+        std::thread::sleep(Duration::from_secs(3));
+        let start = self.buf.lock().unwrap().len();
+        let dev =
+            "dev-disk-by\\x2duuid-c4c405ee\\x2d0000\\x2d4a11\\x2d9e57\\x2d00000000c0de.device";
+        let script = format!(
+            "export SYSTEMD_COLORS=0 PAGER=cat; stty -echo; \
+             udevadm info -q all -n /dev/nvme1n1p2; ls -l /dev/disk/by-uuid/; \
+             systemctl status --no-pager {dev}; \
+             systemctl status --no-pager sys-devices-virtual-block-nvme1n1p2.device; \
+             ls -l /run/udev/data/ | head -n 40; \
+             journalctl -b --no-pager -o short-monotonic | grep -iE 'nvme1n1p2|udevd|sd-device|btrfs' | tail -n 40; \
+             echo NARF-GATE-DIAG-$((1+1))-END\n"
+        );
+        self.send(&script).ok()?;
+        self.wait_raw("NARF-GATE-DIAG-2-END", Duration::from_secs(120));
+        let g = self.buf.lock().unwrap();
+        Some(strip_escapes(&g[start.min(g.len())..]))
+    }
+
     /// Wait for one of `pats` after the cursor; moves the cursor past it.
     fn wait_for(&mut self, pats: &[&str], timeout: Duration) -> Result<usize> {
         let deadline = Instant::now() + timeout;
@@ -886,17 +970,38 @@ impl Vm {
         }
     }
 
-    /// Put `body` at `path` in the guest (heredoc over the console).
+    /// Put `body` at `path` in the guest, verified.
+    ///
+    /// The console is the only channel into the guest, and typed text is not
+    /// guaranteed to arrive intact: a byte lost or reordered anywhere (QEMU's
+    /// chardev, the UART, the console line discipline, a process that read
+    /// the tty in between) corrupts a shell script silently, which then fails
+    /// in confusing ways (`unexpected EOF while looking for matching '"'`).
+    /// So the body travels base64-encoded (only `[A-Za-z0-9+/=]` and
+    /// newlines, nothing the shell or the line discipline interprets), is
+    /// decoded into a temporary file, and only replaces `path` after its
+    /// SHA-256 matches. A mismatch is retyped, up to three times.
     fn put_file(&mut self, path: &str, body: &str) -> Result<()> {
-        let mut s = format!("cat > {path} <<'NARF_GATE_EOF'\n");
-        s.push_str(body);
-        s.push_str("NARF_GATE_EOF\n");
-        self.send(&s)?;
-        let (rc, _) = self.run(&format!("test -s {path}"), Duration::from_secs(60))?;
-        if rc != 0 {
-            bail!("could not write {path} in the guest");
+        let want = hex(&Sha256::digest(body.as_bytes()));
+        let encoded = base64_lines(body.as_bytes(), 76);
+        let tmp = format!("{path}.narf-xfer");
+        for attempt in 1..=3 {
+            let mut s = format!("base64 -d > {tmp} <<'NARF_GATE_EOF'\n");
+            s.push_str(&encoded);
+            s.push_str("NARF_GATE_EOF\n");
+            self.send(&s)?;
+            let (rc, out) = self.run(&format!("sha256sum {tmp}"), Duration::from_secs(60))?;
+            if rc == 0 && out.contains(&want) {
+                let (rc, _) = self.run(&format!("mv -f {tmp} {path}"), Duration::from_secs(60))?;
+                if rc == 0 {
+                    return Ok(());
+                }
+            }
+            eprintln!(
+                "cachyos-gate: {path}: transfer {attempt} did not verify (rc {rc}); retyping"
+            );
         }
-        Ok(())
+        bail!("could not transfer {path} to the guest intact (3 attempts)")
     }
 
     fn poweroff(&mut self, timeout: Duration) -> Result<ExitStatus> {
@@ -1161,6 +1266,16 @@ impl Gate {
         ) {
             Ok(b) => b,
             Err(e) => {
+                if let Some(diag) = vm.emergency_diagnostics(&self.args.login_password) {
+                    let path = self
+                        .logs
+                        .join(format!("{:02}-{label}.emergency.txt", self.boots));
+                    let _ = std::fs::write(&path, &diag);
+                    eprintln!(
+                        "cachyos-gate: emergency-mode diagnostics in {}",
+                        path.display()
+                    );
+                }
                 let refusals = Self::refusal_lines(&vm);
                 if refusals.is_empty() {
                     return Err(e);
@@ -2057,6 +2172,19 @@ fn seed_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn base64_matches_rfc4648() {
+        assert_eq!(super::base64_lines(b"", 76), "");
+        assert_eq!(super::base64_lines(b"f", 76), "Zg==\n");
+        assert_eq!(super::base64_lines(b"fo", 76), "Zm8=\n");
+        assert_eq!(super::base64_lines(b"foo", 76), "Zm9v\n");
+        assert_eq!(super::base64_lines(b"foobar", 4), "Zm9v\nYmFy\n");
+        assert_eq!(
+            super::base64_lines(b"set -u\nT=\"$1\"\n", 76),
+            "c2V0IC11ClQ9IiQxIgo=\n"
+        );
+    }
 
     #[test]
     fn install_after_snapshot_is_refused() {

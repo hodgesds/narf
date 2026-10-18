@@ -878,3 +878,46 @@ kernel_test_in!(
     "filesystem/devfs_block",
     smoke_devfs_block_large_request_short_count
 );
+
+// ── /dev/btrfs-control: BTRFS_IOC_DEVICES_READY ─────────────────────────
+
+/// A fake disk whose primary btrfs superblock (64 KiB) carries `fsid` and
+/// `num_devices`.
+fn fake_btrfs_member(fsid: [u8; 16], num_devices: u64) -> Arc<FakeBlockDevice> {
+    let dev = FakeBlockDevice::new(256, 512); // 128 KiB
+    let mut sb = vec![0u8; 4096];
+    sb[0x20..0x30].copy_from_slice(&fsid);
+    sb[0x40..0x48].copy_from_slice(b"_BHRfS_M");
+    sb[0x88..0x90].copy_from_slice(&num_devices.to_le_bytes());
+    let _ = dev.write(65536 / 512, 8, &sb);
+    dev
+}
+
+fn smoke_btrfs_control_devices_ready() -> TestResult {
+    use crate::devfs_misc::btrfs_devices_ready;
+    let snap = narf_block::registry::__snapshot_for_test();
+    let single = [0x11u8; 16];
+    let multi = [0x22u8; 16];
+    narf_block::registry::register_block_device("narfbtrfs1p2", fake_btrfs_member(single, 1));
+    narf_block::registry::register_block_device("narfbtrfs2a", fake_btrfs_member(multi, 2));
+    let single_ready = btrfs_devices_ready("/dev/narfbtrfs1p2");
+    let half = btrfs_devices_ready("/dev/narfbtrfs2a");
+    narf_block::registry::register_block_device("narfbtrfs2b", fake_btrfs_member(multi, 2));
+    let whole = btrfs_devices_ready("/mnt/dev/narfbtrfs2a");
+    let not_btrfs = btrfs_devices_ready("/dev/narf-no-such");
+    narf_block::registry::__restore_for_test(snap);
+    if single_ready != Ok(0) {
+        return TestResult::Fail("a single-device btrfs must always be ready");
+    }
+    if half != Ok(1) {
+        return TestResult::Fail("one of two members present must be not-ready");
+    }
+    if whole != Ok(0) {
+        return TestResult::Fail("both members present must be ready");
+    }
+    if not_btrfs.is_ok() {
+        return TestResult::Fail("an unknown device must be an error, not an answer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs_block", smoke_btrfs_control_devices_ready);
