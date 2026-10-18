@@ -262,6 +262,10 @@ unsafe fn init_lapic_xapic() {
 /// the dispatch table is global, but each AP DOES need its
 /// own LVT_ERROR programmed (handled in init_ap).
 fn install_apic_diag_handlers() {
+    // A panic NMIs every other CPU to a halt before printing (see
+    // `panic_stop`); its NMI handler and the console hook go in with the
+    // BSP's LAPIC, which is what sends those NMIs.
+    super::panic_stop::install();
     crate::dispatch::install(super::super::VECTOR_APIC_ERROR, apic_error_handler);
     crate::dispatch::install(super::super::VECTOR_SPURIOUS, apic_spurious_handler);
 }

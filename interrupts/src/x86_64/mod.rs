@@ -4,6 +4,7 @@ pub mod apic;
 pub mod hpet_clockevent;
 pub mod hpet_oneshot;
 pub mod ipi;
+pub mod panic_stop;
 pub mod timer_pump;
 
 pub use apic::{eoi, init_bsp, self_ipi, start_timer, stop_timer, timer_ticks};
