@@ -69,7 +69,8 @@ pub fn register_initcalls() {
 /// block device.
 fn btrfs_factory(dev: Arc<dyn BlockDeviceSync>) -> Result<Arc<dyn FsInstance>, FsError> {
     let devices = discover_members(dev.clone());
-    let volume = narf_filesystem::fs_registry::mount_wait(registry::mount(&dev, devices, None, false))?;
+    let volume =
+        narf_filesystem::fs_registry::mount_wait(registry::mount(&dev, devices, None, false))?;
     Ok(volume)
 }
 
