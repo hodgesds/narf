@@ -39,6 +39,7 @@ use narf_wireless::{AssociateRequest, BssInfo, ScanRequest, WirelessError};
 use super::mac_frame::{self as frame, capab, eid, freq_band, Band, ParsedIes};
 use super::mac_peer::{self as peer, ApSta, ChanDef, ConnMode, OwnCaps, SmpsMode, Width};
 use super::mac_reg::{chan_flag, RegState, RegUpdate, VdevKind, Wiphy};
+pub mod sae;
 pub mod sec;
 use super::wmi::{self, *};
 use sec::{Credential, MfpRx, MfpState, RsnPlan};
@@ -204,6 +205,19 @@ pub mod step {
     /// wpa_supplicant's SA Query timed out (`sme_check_sa_query_timeout`):
     /// deauthenticated with `WLAN_REASON_PREV_AUTH_NOT_VALID`.
     pub const SA_QUERY_TIMEOUT: u32 = 270;
+    /// No SAE PWE (hunting and pecking found none).
+    pub const SAE_PWE: u32 = 271;
+    /// The AP refused SAE (status code ≠ 0 / 126; detail = status), or
+    /// kept asking for anti-clogging tokens.
+    pub const SAE_REJECTED: u32 = 272;
+    /// The AP's Commit was unusable (`sme_sae_auth` returns -1; detail
+    /// 1 token group, 2 token container, 3 confirm first, 4 status for
+    /// the wrong PWE mode, 5 `sae_parse_commit` / `sae_process_commit`).
+    pub const SAE_COMMIT: u32 = 273;
+    /// The AP's Confirm did not verify (`sae_check_confirm`).
+    pub const SAE_CONFIRM: u32 = 274;
+    /// No SAE answer after `IEEE80211_AUTH_MAX_TRIES` (detail = tries).
+    pub const SAE_TIMEOUT: u32 = 275;
 }
 
 /// Linux errnos used here (positive).
@@ -2119,14 +2133,6 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                 )
             }
         };
-        if matches!(rsn, Some((_, Credential::Sae(_)))) {
-            return fail(
-                step::CONNECT_UNSUPPORTED,
-                sec::refuse::NO_SAE,
-                errno::EOPNOTSUPP,
-                "connect (SAE not implemented)",
-            );
-        }
         if self.scan.state != ScanState::Idle {
             // ieee80211_prep_connection: "Cancel scan to ensure that
             // nothing interferes with connection".
@@ -2235,7 +2241,18 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         self.station_add(bss.bssid, &def).await?;
         // ── ieee80211_mgd_auth ──
         self.mlme_target = Some(bss.bssid);
-        self.authenticate(bss.bssid).await?;
+        // Open System, or SAE whose PMK feeds the 4-way handshake.
+        let mut pmk = None;
+        match rsn.as_ref() {
+            Some((plan, Credential::Sae(pw))) => {
+                pmk = Some(self.sae_authenticate(bss, plan, pw).await?);
+            }
+            Some((_, Credential::Pmk(p))) => {
+                pmk = Some(*p);
+                self.authenticate(bss.bssid).await?;
+            }
+            None => self.authenticate(bss.bssid).await?,
+        }
         // ── ieee80211_mgd_assoc ──
         let plan = rsn.as_ref().map(|(p, _)| p.clone());
         let resp = self.associate_frames(bss, ies, ssid, plan.as_ref()).await?;
@@ -2247,11 +2264,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         }
         self.assoc_success(bss, ies, &resp).await?;
         // ── wpa_supplicant ──
-        if let Some((plan, cred)) = rsn {
-            let pmk = match cred {
-                Credential::Pmk(p) => p,
-                Credential::Sae(_) => unreachable!("refused above"),
-            };
+        if let (Some((plan, _)), Some(pmk)) = (rsn, pmk) {
             self.rsna_4way(bss, &plan, &pmk).await?;
         }
         self.authorize().await?;
@@ -2379,6 +2392,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         tx_step: u32,
         timeout_step: u32,
         what: &str,
+        response_ms: u32,
         matches: fn(&[u8]) -> bool,
     ) -> Result<Vec<u8>, MacError> {
         let vdev_id = self.vif.as_ref().unwrap().vdev_id;
@@ -2418,7 +2432,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                 return Ok(r);
             }
             if acked == Some(true) {
-                if let Some(r) = self.wait_for(timeout::MLME_RESPONSE, take_resp).await {
+                if let Some(r) = self.wait_for(response_ms, take_resp).await {
                     return Ok(r);
                 }
             }
@@ -2437,10 +2451,17 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         let own = self.caps.mac_addr;
         let f = frame::build_auth_open(&own, &bssid);
         let resp = self
-            .mlme_exchange(&f, step::AUTH_TX, step::AUTH_TIMEOUT, "authenticate", |r| {
-                frame::parse_auth(r)
-                    .is_some_and(|a| a.alg == frame::WLAN_AUTH_OPEN && a.transaction == 2)
-            })
+            .mlme_exchange(
+                &f,
+                step::AUTH_TX,
+                step::AUTH_TIMEOUT,
+                "authenticate",
+                timeout::MLME_RESPONSE,
+                |r| {
+                    frame::parse_auth(r)
+                        .is_some_and(|a| a.alg == frame::WLAN_AUTH_OPEN && a.transaction == 2)
+                },
+            )
             .await?;
         let a = frame::parse_auth(&resp).unwrap();
         if a.status != frame::WLAN_STATUS_SUCCESS {
@@ -2560,9 +2581,14 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         let p = self.assoc_request_params(bss, ies, ssid, rsn);
         let f = frame::build_assoc_req(&p);
         let resp = self
-            .mlme_exchange(&f, step::ASSOC_TX, step::ASSOC_TIMEOUT, "associate", |r| {
-                frame::parse_assoc_resp(r).is_some_and(|a| !a.reassoc)
-            })
+            .mlme_exchange(
+                &f,
+                step::ASSOC_TX,
+                step::ASSOC_TIMEOUT,
+                "associate",
+                timeout::MLME_RESPONSE,
+                |r| frame::parse_assoc_resp(r).is_some_and(|a| !a.reassoc),
+            )
             .await?;
         let a = frame::parse_assoc_resp(&resp).unwrap();
         if a.status != frame::WLAN_STATUS_SUCCESS {

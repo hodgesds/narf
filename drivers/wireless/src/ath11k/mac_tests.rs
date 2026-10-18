@@ -240,6 +240,22 @@ pub(super) struct FwCfg {
     pub(super) igtk: Option<(u16, [u8; 6], [u8; 16])>,
     /// Our RSNE (+ RSNXE) the AP expects in M2 (`None` = [`STA_RSN_IE`]).
     pub(super) sta_ies: Option<Vec<u8>>,
+    /// The AP does SAE (hostapd `handle_auth_sae`).
+    pub(super) sae: Option<SaeAp>,
+}
+
+/// The fake AP's SAE behaviour.
+#[derive(Clone, Debug, Default)]
+pub(super) struct SaeAp {
+    pub(super) password: Vec<u8>,
+    /// H2E (Commit status 126) instead of hunting and pecking.
+    pub(super) h2e: bool,
+    /// Ask for this anti-clogging token first (status 76).
+    pub(super) token: Option<Vec<u8>>,
+    /// Answer the Commit with this status instead.
+    pub(super) reject: Option<u16>,
+    /// Corrupt the AP's Confirm.
+    pub(super) bad_confirm: bool,
 }
 
 impl Default for FwCfg {
@@ -263,6 +279,7 @@ impl Default for FwCfg {
             ap_sec_ies: None,
             igtk: None,
             sta_ies: None,
+            sae: None,
         }
     }
 }
@@ -326,6 +343,10 @@ pub(super) struct Ap {
     /// The AKM the station chose (from its M2 RSNE).
     pub(super) km: Option<eapol::KeyMgmt>,
     pub(super) ptk: Option<eapol::Ptk>,
+    /// The AP's SAE session and the SAE frames the station sent
+    /// (transaction, status, body).
+    pub(super) sae: Option<narf_wireless::sae::SaeSession>,
+    pub(super) sae_rx: Vec<(u16, u16, Vec<u8>)>,
     pub(super) m2_mic_ok: bool,
     pub(super) m2_rsn_ok: bool,
     pub(super) m4_ok: bool,
@@ -515,6 +536,9 @@ impl World {
         ));
         let fc = u16::from_le_bytes([f[0], f[1]]);
         match fc & 0xFC {
+            frame::stype::AUTH if f.len() >= 30 && f[24] == 3 && cfg.sae.is_some() => {
+                self.on_sae(f, cfg.sae.clone().unwrap());
+            }
             frame::stype::AUTH => {
                 if let Some(st) = cfg.auth_status {
                     let mut r = frame::mgmt_hdr(frame::stype::AUTH, &OWN, &BSSID, &BSSID);
@@ -541,6 +565,83 @@ impl World {
             _ => {}
         }
         desc
+    }
+
+    /// hostapd `handle_auth_sae` for the station's Commit / Confirm.
+    fn on_sae(&mut self, f: &[u8], cfg: SaeAp) {
+        use narf_wireless::sae::SaeSession;
+        let trans = u16::from_le_bytes([f[26], f[27]]);
+        let status = u16::from_le_bytes([f[28], f[29]]);
+        let body = f[30..].to_vec();
+        self.ap.sae_rx.push((trans, status, body.clone()));
+        let reply = |w: &mut World, trans: u16, status: u16, data: &[u8]| {
+            let mut r = frame::mgmt_hdr(frame::stype::AUTH, &OWN, &BSSID, &BSSID);
+            r.extend_from_slice(&[3, 0]);
+            r.extend_from_slice(&trans.to_le_bytes());
+            r.extend_from_slice(&status.to_le_bytes());
+            r.extend_from_slice(data);
+            w.events.push_back(mgmt_rx_event(6, 60, 2437, 0, &r));
+        };
+        match trans {
+            1 => {
+                if let Some(st) = cfg.reject {
+                    reply(self, 1, st, &19u16.to_le_bytes());
+                    return;
+                }
+                let mut commit = body.clone();
+                if let Some(tok) = &cfg.token {
+                    let has = if cfg.h2e {
+                        body.len() == 98 + 3 + tok.len() && body[101..] == tok[..]
+                    } else {
+                        body.len() == 98 + tok.len() && body[2..2 + tok.len()] == tok[..]
+                    };
+                    if !has {
+                        let mut d = 19u16.to_le_bytes().to_vec();
+                        if cfg.h2e {
+                            d.extend_from_slice(&[0xFF, 1 + tok.len() as u8, 93]);
+                        }
+                        d.extend_from_slice(tok);
+                        reply(self, 1, 76, &d);
+                        return;
+                    }
+                    commit = if cfg.h2e {
+                        body[..98].to_vec()
+                    } else {
+                        let mut c = body[..2].to_vec();
+                        c.extend_from_slice(&body[2 + tok.len()..]);
+                        c
+                    };
+                }
+                let mut ap = if cfg.h2e {
+                    SaeSession::new_h2e_bytes(SSID, &cfg.password, BSSID, OWN)
+                } else {
+                    SaeSession::new_hunt_and_peck(&cfg.password, BSSID, OWN)
+                }
+                .with_test_seed([0x77; 64]);
+                let own = ap.build_commit();
+                if ap.on_commit(&commit).is_err() {
+                    return;
+                }
+                reply(self, 1, if cfg.h2e { 126 } else { 0 }, &own);
+                self.ap.sae = Some(ap);
+            }
+            2 => {
+                let Some(mut ap) = self.ap.sae.take() else {
+                    return;
+                };
+                let mut confirm = ap.build_confirm();
+                // hostapd silently discards a Confirm that does not verify.
+                if ap.on_confirm(&body).is_err() {
+                    return;
+                }
+                if cfg.bad_confirm {
+                    confirm[5] ^= 1;
+                }
+                self.ap.pmk = ap.pmk().copied();
+                reply(self, 2, 0, &confirm);
+            }
+            _ => {}
+        }
     }
 
     /// The authenticator (hostapd `wpa_auth`): M2 → M3, M4 → done, with

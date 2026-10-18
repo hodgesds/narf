@@ -688,6 +688,32 @@ updates), `handle_event(frame)`, `connected_bssid()`.
   PTK, GTK (WMI) and IGTK (software). `sta->mfp` → `WMI_PEER_PMF` in
   PEER_ASSOC (`ath11k_peer_assoc_h_crypto`; the vdev-start PMF flag stays
   clear, as ath11k leaves `arg.pmf_enabled` unset for a STA).
+- WPA3-SAE (`mac/sae.rs`, wpa_supplicant `sme_send_authentication` /
+  `sme_sae_auth` over mac80211 `ieee80211_auth` / `ieee80211_rx_mgmt_auth`):
+  `SecurityConfig::Wpa3 { password }` to an AP with AKM 8 (WPA3-only or
+  transition) authenticates with algorithm 3 on the shared
+  `narf_wireless::sae::SaeSession` (IEEE 802.11-2020 Annex J.10 pinned):
+  H2E (Commit status 126) when the AP's RSNXE has `SAE_H2E`, else hunting
+  and pecking (status 0) — wpa_supplicant `sae_pwe=2`; group 19 only;
+  each frame gets `IEEE80211_AUTH_MAX_TRIES` tries (TX status ≤ 500 ms,
+  then `IEEE80211_AUTH_TIMEOUT_SAE` 2 s); an anti-clogging request (76)
+  resends the same scalar / element with the token (inline, or an
+  Anti-Clogging Token Container for H2E; NARF bounds it to 3 rounds);
+  77 / other statuses end the attempt; a reflected Commit is ignored;
+  Confirm (transaction 2) then the PMK feeds the AKM-8 4-way (descriptor
+  version 0, AES-CMAC MICs, KDF-SHA256 PTK). The Association Request
+  carries our RSNE (AKM 8, MFPC | MFPR, BIP-CMAC-128) and RSNXE (`SAE_H2E`,
+  after HE as `ieee80211_send_assoc` sorts it); no PMKID
+  (`sae_pmkid_in_assoc=0`). Steps 271 `SAE_PWE`, 272 `SAE_REJECTED`
+  (detail = status), 273 `SAE_COMMIT`, 274 `SAE_CONFIRM`, 275
+  `SAE_TIMEOUT`. A firmware recovery reconnects with the kept
+  `AssociateRequest`, so the SAE password / PMF / HE state are rebuilt
+  from it. Not done: SAE-PK, password identifiers, groups 20 / 21, FT-SAE
+  (needs FT authentication: MDE / FTE, R0KH / R1KH). nl80211: ath11k does
+  not advertise `NL80211_EXT_FEATURE_SAE_OFFLOAD` (upstream mac80211
+  drivers never do; wpa_supplicant runs SAE through
+  `NL80211_CMD_AUTHENTICATE` there, which NARF's ath11k has no path for
+  yet), so SAE is reached from the in-kernel `associate` (autoconnect).
 - PMF / 802.11w (`MfpState`): ath11k returns 1 from `ath11k_mac_op_set_key`
   for AES-CMAC, so BIP is mac80211 software on WCN6855 too: the IGTK (M3 /
   Group 1/2, IPN as `rx_pn`) never reaches the firmware. Receive (from the
@@ -1024,7 +1050,7 @@ channel, results printed), `ath11k.ssid=<ssid>` (active scan directed at
 the SSID, strongest matching 2.4 / 5 GHz BSS, connect; retried every
 10 s while disconnected — link loss reconnects — giving up after 6
 failures in a row), `ath11k.psk=<64 hex>` (PMK) or
-`ath11k.passphrase=<8..63>` (PMK = PBKDF2-SHA1(passphrase, SSID, 4096));
+`ath11k.passphrase=<8..63>` (SAE with it as the password when the AP offers AKM 8 — WPA3-only or transition, `autoconnect::associate_request` reads the scan RSNE —, else PSK with PMK = PBKDF2-SHA1(passphrase, SSID, 4096));
 no key = Open; `%XX` escapes (the command line splits on whitespace).
 A malformed set is reported and ignored. The key is visible in
 `/proc/cmdline` — bring-up only.

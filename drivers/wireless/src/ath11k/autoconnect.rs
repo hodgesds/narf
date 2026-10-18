@@ -13,7 +13,7 @@
 //! | `ath11k.scan=1` | one scan once `wlan%d` is up; every BSS is printed |
 //! | `ath11k.ssid=<ssid>` | scan (active, directed at the SSID) and connect to the strongest matching 2.4 / 5 GHz BSS; reconnect after link loss |
 //! | `ath11k.psk=<64 hex>` | WPA2-PSK with this PMK |
-//! | `ath11k.passphrase=<8..63 chars>` | WPA2-PSK, PMK = PBKDF2-SHA1(passphrase, SSID, 4096) |
+//! | `ath11k.passphrase=<8..63 chars>` | WPA3-SAE with this password when the AP offers SAE (WPA3-only or transition: wpa_supplicant's AKM preference), else WPA2-PSK with PMK = PBKDF2-SHA1(passphrase, SSID, 4096) |
 //!
 //! Neither key → Open. `%XX` in a value is a hex escape (e.g. `%20` for
 //! a space; the command line splits on whitespace). Bring-up only: the
@@ -34,6 +34,8 @@ pub struct AutoCfg {
     pub ssid: Option<Vec<u8>>,
     /// WPA2-PSK PMK; `None` = Open.
     pub pmk: Option<[u8; 32]>,
+    /// The passphrase (`ath11k.passphrase`): the SAE password.
+    pub passphrase: Option<Vec<u8>>,
 }
 
 impl core::fmt::Debug for AutoCfg {
@@ -41,6 +43,7 @@ impl core::fmt::Debug for AutoCfg {
         f.debug_struct("AutoCfg")
             .field("ssid", &self.ssid)
             .field("wpa2", &self.pmk.is_some())
+            .field("sae", &self.passphrase.is_some())
             .finish()
     }
 }
@@ -100,6 +103,7 @@ pub fn parse(cmdline: &str) -> Result<Option<AutoCfg>, CfgError> {
         }
         None => None,
     };
+    let mut passphrase = None;
     let pmk = match (args.value("ath11k.psk"), args.value("ath11k.passphrase")) {
         (Some(hex), _) => {
             let h = hex.as_bytes();
@@ -123,7 +127,9 @@ pub fn parse(cmdline: &str) -> Result<Option<AutoCfg>, CfgError> {
             let Some(s) = ssid.as_deref() else {
                 return Err(CfgError::KeyWithoutSsid);
             };
-            Some(narf_crypto::pbkdf2_sha1::wpa2_pmk(&p, s))
+            let pmk = narf_crypto::pbkdf2_sha1::wpa2_pmk(&p, s);
+            passphrase = Some(p);
+            Some(pmk)
         }
         (None, None) => None,
     };
@@ -134,7 +140,11 @@ pub fn parse(cmdline: &str) -> Result<Option<AutoCfg>, CfgError> {
     if ssid.is_none() && !scan {
         return Ok(None);
     }
-    Ok(Some(AutoCfg { ssid, pmk }))
+    Ok(Some(AutoCfg {
+        ssid,
+        pmk,
+        passphrase,
+    }))
 }
 
 /// The strongest BSS advertising `ssid` with the security the key
@@ -189,16 +199,55 @@ pub fn scan_request(cfg: &AutoCfg) -> ScanRequest {
     }
 }
 
-/// The association for `bss`.
-pub fn associate_request(cfg: &AutoCfg, bss: &BssInfo) -> AssociateRequest {
+/// [`pick`] for `cfg`: with a passphrase a WPA3 (SAE-only) BSS fits too.
+pub fn pick_for(bss: &[BssInfo], ssid: &[u8], cfg: &AutoCfg) -> Option<BssInfo> {
+    if cfg.passphrase.is_none() {
+        return pick(bss, ssid, cfg.pmk.is_some());
+    }
+    let wpa3 = bss
+        .iter()
+        .filter(|b| b.ssid == ssid && matches!(b.security, BssSecurity::Wpa3))
+        .max_by_key(|b| b.rssi);
+    let wpa2 = pick(bss, ssid, true);
+    match (wpa3, wpa2) {
+        (Some(a), Some(b)) if b.rssi >= a.rssi => Some(b),
+        (Some(a), _) => Some(BssInfo {
+            bssid: a.bssid,
+            ssid: a.ssid.clone(),
+            channel: a.channel,
+            rssi: a.rssi,
+            security: a.security,
+        }),
+        (None, b) => b,
+    }
+}
+
+/// Whether the BSS elements carry an RSNE offering AKM 8 (SAE).
+fn offers_sae(ies: &[u8]) -> bool {
+    super::mac_frame::find_elem(ies, super::mac_frame::eid::RSN)
+        .and_then(narf_wireless::rsn::RsnIe::decode_body)
+        .is_some_and(|r| {
+            r.akms.contains(&narf_wireless::rsn::Suite::standard(
+                narf_wireless::rsn::AKM_SAE,
+            ))
+        })
+}
+
+/// The association for `bss` (`ies` = its scan elements): SAE with the
+/// passphrase when the AP offers AKM 8, else PSK with the PMK, else Open.
+pub fn associate_request(cfg: &AutoCfg, bss: &BssInfo, ies: Option<&[u8]>) -> AssociateRequest {
+    let security = match (&cfg.passphrase, cfg.pmk) {
+        (Some(p), _) if ies.is_some_and(offers_sae) => SecurityConfig::Wpa3 {
+            password: p.clone(),
+        },
+        (_, Some(psk)) => SecurityConfig::Wpa2 { psk },
+        _ => SecurityConfig::Open,
+    };
     AssociateRequest {
         bssid: bss.bssid,
         ssid: bss.ssid.clone(),
         channel: bss.channel,
-        security: match cfg.pmk {
-            Some(psk) => SecurityConfig::Wpa2 { psk },
-            None => SecurityConfig::Open,
-        },
+        security,
     }
 }
 
@@ -235,7 +284,7 @@ pub async fn attempt<I: narf_wireless::WirelessNetIface + ?Sized>(
     let Some(ssid) = cfg.ssid.as_deref() else {
         return Ok(None);
     };
-    let Some(b) = pick(&bss, ssid, cfg.pmk.is_some()) else {
+    let Some(b) = pick_for(&bss, ssid, cfg) else {
         log(format_args!(
             "{}: autoconnect: no {} BSS for the SSID",
             name,
@@ -243,7 +292,9 @@ pub async fn attempt<I: narf_wireless::WirelessNetIface + ?Sized>(
         ));
         return Err(WirelessError::InvalidArgs);
     };
-    dev.associate(associate_request(cfg, &b)).await?;
+    let ies = dev.scan_information_elements(b.bssid);
+    dev.associate(associate_request(cfg, &b, ies.as_deref()))
+        .await?;
     let m = b.bssid;
     log(format_args!(
         "{}: autoconnect: connected to {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ch {}",

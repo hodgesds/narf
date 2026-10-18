@@ -2554,7 +2554,8 @@ fn smoke_ath11k_int_autoconnect_cmdline() -> TestResult {
             parse("ath11k.scan=1")
                 == Ok(Some(AutoCfg {
                     ssid: None,
-                    pmk: None
+                    pmk: None,
+                    passphrase: None,
                 })),
             "scan only"
         );
@@ -2562,7 +2563,8 @@ fn smoke_ath11k_int_autoconnect_cmdline() -> TestResult {
             parse("ath11k.ssid=narf-ap")
                 == Ok(Some(AutoCfg {
                     ssid: Some(SSID.to_vec()),
-                    pmk: None
+                    pmk: None,
+                    passphrase: None,
                 })),
             "open network"
         );
@@ -2572,7 +2574,8 @@ fn smoke_ath11k_int_autoconnect_cmdline() -> TestResult {
             parse(&line)
                 == Ok(Some(AutoCfg {
                     ssid: Some(SSID.to_vec()),
-                    pmk: Some(PMK)
+                    pmk: Some(PMK),
+                    passphrase: None,
                 })),
             "WPA2 with a PMK"
         );
@@ -2587,9 +2590,10 @@ fn smoke_ath11k_int_autoconnect_cmdline() -> TestResult {
             parse("ath11k.passphrase=password ath11k.ssid=IEEE")
                 == Ok(Some(AutoCfg {
                     ssid: Some(b"IEEE".to_vec()),
-                    pmk: Some(want)
+                    pmk: Some(want),
+                    passphrase: Some(b"password".to_vec()),
                 })),
-            "passphrase → PBKDF2-SHA1 PMK"
+            "passphrase → PBKDF2-SHA1 PMK + the SAE password"
         );
         ensure!(
             unescape("my%20net") == Some(b"my net".to_vec()) && unescape("bad%2").is_none(),
@@ -2656,6 +2660,7 @@ fn smoke_ath11k_int_autoconnect_attempt() -> TestResult {
         let cfg = AutoCfg {
             ssid: Some(SSID.to_vec()),
             pmk: Some(PMK),
+            passphrase: None,
         };
         let (r, err, _, stage) = latched(|| run(attempt(u.netdev.as_ref(), &cfg)));
         ensure!(r == Ok(Some(BSSID)) && err == 0, "connected");
@@ -2677,6 +2682,7 @@ fn smoke_ath11k_int_autoconnect_attempt() -> TestResult {
         let wrong = AutoCfg {
             ssid: Some(b"nope".to_vec()),
             pmk: None,
+            passphrase: None,
         };
         let (r, _, _, _) = latched(|| run(attempt(u.netdev.as_ref(), &wrong)));
         ensure!(r.is_err(), "no matching BSS → error, no association");
@@ -3243,6 +3249,7 @@ fn smoke_ath11k_int_open_from_control_op() -> TestResult {
         let cfg = AutoCfg {
             ssid: Some(SSID.to_vec()),
             pmk: Some(PMK),
+            passphrase: None,
         };
         let (r, err, _, _) = latched(|| run(attempt(u.netdev.as_ref(), &cfg)));
         ensure!(r == Ok(Some(BSSID)) && err == 0, "opened and connected");
@@ -4115,3 +4122,334 @@ kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_ath11k_int_pmf_sa_query_timeout
 );
+
+// ── WPA3-SAE ──────────────────────────────────────────────────────
+
+/// WPA3-only AP RSNE: CCMP, AKM SAE, MFPC | MFPR | 16 PTKSA (0x00cc).
+const AP_RSNE_SAE: [u8; 22] = [
+    0x30, 0x14, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00,
+    0x00, 0x0F, 0xAC, 0x08, 0xCC, 0x00,
+];
+/// Transition AP RSNE: AKMs PSK + SAE, MFPC | 16 PTKSA (0x008c).
+const AP_RSNE_TRANS: [u8; 26] = [
+    0x30, 0x18, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x02, 0x00,
+    0x00, 0x0F, 0xAC, 0x02, 0x00, 0x0F, 0xAC, 0x08, 0x8C, 0x00,
+];
+/// RSNXE: field length 0 | SAE H2E (bit 5) — hostapd and our own.
+const RSNXE_H2E: [u8; 3] = [0xF4, 0x01, 0x20];
+/// Our RSNE with SAE (`wpa_gen_wpa_ie_rsn`, PMF required): MFPC | MFPR |
+/// 16 PTKSA, PMKID count 0, BIP-CMAC-128.
+const STA_RSNE_SAE: [u8; 28] = [
+    0x30, 0x1A, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00,
+    0x00, 0x0F, 0xAC, 0x08, 0xCC, 0x00, 0x00, 0x00, 0x00, 0x0F, 0xAC, 0x06,
+];
+const SAE_PW: &[u8] = b"wpa3-narf-pass";
+
+fn sae_cfg(ap_rsne: &[u8], rsnxe: bool, sae: super::mac_tests::SaeAp) -> FwCfg {
+    let mut sec = ap_rsne.to_vec();
+    if rsnxe {
+        sec.extend_from_slice(&RSNXE_H2E);
+    }
+    let mut sta = STA_RSNE_SAE.to_vec();
+    sta.extend_from_slice(&RSNXE_H2E);
+    FwCfg {
+        beacons: vec![(6, 50, beacon_sec(&BSSID, SSID, 6, Some(&sec)))],
+        eapol: true,
+        ap_sec_ies: Some(sec),
+        igtk: Some((4, IGTK_IPN, IGTK)),
+        sta_ies: Some(sta),
+        sae: Some(sae),
+        ..FwCfg::default()
+    }
+}
+
+fn sae_req() -> AssociateRequest {
+    AssociateRequest {
+        bssid: BSSID,
+        ssid: SSID.to_vec(),
+        channel: 6,
+        security: SecurityConfig::Wpa3 {
+            password: SAE_PW.to_vec(),
+        },
+    }
+}
+
+/// `ieee80211_send_auth` for SAE with the IEEE 802.11-2020 Annex J.10
+/// Commit (hunting and pecking, fixed rand / mask; the vector hostap's
+/// `sae_tests` checks): FC b0 00, DA / BSSID = the AP, algorithm 3,
+/// transaction 1, status 0, group 19 || scalar || element. And
+/// `sme_sae_auth`'s anti-clogging token extraction (legacy inline / H2E
+/// container, malformed containers refused).
+fn smoke_ath11k_sae_frames_golden() -> TestResult {
+    use super::mac::sae::{anti_clogging_token, build_auth_sae};
+    check(|| {
+        let a1 = [0x4d, 0x3f, 0x2f, 0xff, 0xe3, 0x87];
+        let a2 = [0xa5, 0xd8, 0xaa, 0x95, 0x8e, 0x3c];
+        let rand = [
+            0x99, 0x24, 0x65, 0xfd, 0x3d, 0xaa, 0x3c, 0x60, 0xaa, 0x65, 0x65, 0xb7, 0xf6, 0x2a,
+            0x2a, 0x7f, 0x2e, 0x12, 0xdd, 0x12, 0xf1, 0x98, 0xfa, 0xf4, 0xfb, 0xed, 0x89, 0xd7,
+            0xff, 0x1a, 0xce, 0x94,
+        ];
+        let mask = [
+            0x95, 0x07, 0xa9, 0x0f, 0x77, 0x7a, 0x04, 0x4d, 0x6a, 0x08, 0x30, 0xb9, 0x1e, 0xa3,
+            0xd5, 0xdd, 0x70, 0xbe, 0xce, 0x44, 0xe1, 0xac, 0xff, 0xb8, 0x69, 0x83, 0xb5, 0xe1,
+            0xbf, 0x9f, 0xb3, 0x22,
+        ];
+        let j10_commit: [u8; 98] = [
+            0x13, 0x00, 0x2e, 0x2c, 0x0f, 0x0d, 0xb5, 0x24, 0x40, 0xad, 0x14, 0x6d, 0x96, 0x71,
+            0x14, 0xce, 0x00, 0x5c, 0xe1, 0xea, 0xb0, 0xaa, 0x2c, 0x2e, 0x5c, 0x28, 0x71, 0xb7,
+            0x74, 0xf6, 0xc2, 0x57, 0x5c, 0x65, 0xd5, 0xad, 0x9e, 0x00, 0x82, 0x97, 0x07, 0xaa,
+            0x36, 0xba, 0x8b, 0x85, 0x97, 0x38, 0xfc, 0x96, 0x1d, 0x08, 0x24, 0x35, 0x05, 0xf4,
+            0x7c, 0x03, 0x53, 0x76, 0xd7, 0xac, 0x4b, 0xc8, 0xd7, 0xb9, 0x50, 0x83, 0xbf, 0x43,
+            0x82, 0x7d, 0x0f, 0xc3, 0x1e, 0xd7, 0x78, 0xdd, 0x36, 0x71, 0xfd, 0x21, 0xa4, 0x6d,
+            0x10, 0x91, 0xd6, 0x4b, 0x6f, 0x9a, 0x1e, 0x12, 0x72, 0x62, 0x13, 0x25, 0xdb, 0xe1,
+        ];
+        let mut s = narf_wireless::sae::SaeSession::new_hunt_and_peck(b"mekmitasdigoat", a1, a2)
+            .with_test_rand_mask(rand, mask);
+        let body = s.build_commit();
+        let f = build_auth_sae(&a1, &a2, 1, 0, &body);
+        let mut want = vec![0xB0, 0x00, 0x00, 0x00];
+        want.extend_from_slice(&a2);
+        want.extend_from_slice(&a1);
+        want.extend_from_slice(&a2);
+        want.extend_from_slice(&[0, 0, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00]);
+        want.extend_from_slice(&j10_commit);
+        ensure!(f == want, "SAE Commit frame (J.10)");
+        ensure!(
+            anti_clogging_token(&[19, 0, 1, 2, 3], false) == Some(vec![1, 2, 3])
+                && anti_clogging_token(&[19, 0, 0xFF, 4, 93, 1, 2, 3], true) == Some(vec![1, 2, 3])
+                && anti_clogging_token(&[19, 0, 0xFF, 9, 93, 1], true).is_none()
+                && anti_clogging_token(&[19, 0, 0xDD, 4, 93, 1, 2, 3], true).is_none(),
+            "anti-clogging tokens"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_sae_frames_golden);
+
+/// WPA3-only AP with H2E and an anti-clogging token: Commit (status 126)
+/// → 76 + token container → the same scalar / element again with the
+/// container → AP Commit → Confirm (transaction 2) → association with
+/// our RSNE (AKM 8, MFPC | MFPR, BIP) and RSNXE (H2E) after HE / before
+/// WMM → the AKM-8 4-way handshake (descriptor version 0, AES-CMAC) with
+/// the SAE PMK, IGTK, WMI_PEER_PMF.
+fn smoke_ath11k_int_sae_h2e_connect() -> TestResult {
+    check(|| {
+        let token = vec![0xA5, 0x5A, 0x01];
+        let cfg = sae_cfg(
+            &AP_RSNE_SAE,
+            true,
+            super::mac_tests::SaeAp {
+                password: SAE_PW.to_vec(),
+                h2e: true,
+                token: Some(token.clone()),
+                ..Default::default()
+            },
+        );
+        let u = up(cfg)?;
+        scan6(&u)?;
+        let (r, err, _, stage) = latched(|| run(u.netdev.associate(sae_req())));
+        ensure!(r.is_ok() && err == 0, "SAE associate");
+        ensure!(
+            stage == narf_memory::diag::WifiStage::Connected,
+            "connected"
+        );
+        let st = u.dev.st.borrow();
+        let rx = &st.world.ap.sae_rx;
+        ensure!(rx.len() == 3, "commit, commit + token, confirm");
+        ensure!(
+            rx[0].0 == 1 && rx[0].1 == 126 && rx[0].2.len() == 98,
+            "H2E commit"
+        );
+        ensure!(
+            rx[1].0 == 1
+                && rx[1].1 == 126
+                && rx[1].2[..98] == rx[0].2[..]
+                && rx[1].2[98..] == [0xFF, 4, 93, 0xA5, 0x5A, 0x01],
+            "same commit + token container"
+        );
+        ensure!(
+            rx[2].0 == 2 && rx[2].1 == 0 && rx[2].2[..2] == [1, 0],
+            "confirm, send-confirm 1"
+        );
+        ensure!(st.world.ap.pmk.is_some(), "AP accepted");
+        ensure!(
+            st.world.ap.km == Some(narf_wireless::eapol::KeyMgmt::Sae)
+                && st.world.ap.m2_mic_ok
+                && st.world.ap.m2_rsn_ok
+                && st.world.ap.m4_ok,
+            "AKM-8 4-way with the SAE PMK"
+        );
+        let assoc = st.world.mgmt.iter().find(|f| f[0] == 0x00).unwrap();
+        let mut ies = STA_RSNE_SAE.to_vec();
+        ies.extend_from_slice(&RSNXE_H2E);
+        let rsn_at = assoc
+            .windows(STA_RSNE_SAE.len())
+            .position(|w| w == STA_RSNE_SAE);
+        let rsnx_at = assoc.windows(3).position(|w| w == RSNXE_H2E);
+        let wmm_at = assoc.windows(4).position(|w| w == [0xDD, 0x07, 0x00, 0x50]);
+        ensure!(
+            matches!((rsn_at, rsnx_at, wmm_at), (Some(a), Some(b), Some(c)) if a < b && b < c),
+            "RSNE before HT, RSNXE after the capabilities, before WMM"
+        );
+        let pa = st
+            .wmi
+            .iter()
+            .find(|c| c.cmd_id == wmi::WMI_PEER_ASSOC_CMDID)
+            .unwrap();
+        ensure!(rd32(&pa.buf, 24) & 0x0800_0000 != 0, "WMI_PEER_PMF");
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_sae_h2e_connect);
+
+/// Transition mode without an RSNXE: a password picks SAE (wpa_supplicant's
+/// AKM order) with hunting and pecking (Commit status 0), the legacy
+/// inline token; the autoconnect `ath11k.passphrase=` picks SAE for this
+/// AP and PSK for a PSK-only one.
+fn smoke_ath11k_int_sae_transition_hunt_and_peck() -> TestResult {
+    use super::autoconnect::{associate_request, pick_for, AutoCfg};
+    check(|| {
+        let mut cfg = sae_cfg(
+            &AP_RSNE_TRANS,
+            false,
+            super::mac_tests::SaeAp {
+                password: SAE_PW.to_vec(),
+                h2e: false,
+                token: Some(vec![7, 7]),
+                ..Default::default()
+            },
+        );
+        cfg.sta_ies = Some(STA_RSNE_SAE.iter().copied().chain(RSNXE_H2E).collect());
+        let u = up(cfg)?;
+        let list = scan6(&u)?;
+        let ac = AutoCfg {
+            ssid: Some(SSID.to_vec()),
+            pmk: Some(PMK),
+            passphrase: Some(SAE_PW.to_vec()),
+        };
+        let b = pick_for(&list, SSID, &ac).ok_or("pick")?;
+        let req = associate_request(
+            &ac,
+            &b,
+            u.netdev.scan_information_elements(BSSID).as_deref(),
+        );
+        ensure!(
+            matches!(&req.security, SecurityConfig::Wpa3 { password } if password == SAE_PW),
+            "passphrase → SAE for a transition AP"
+        );
+        let (r, err, _, _) = latched(|| run(u.netdev.associate(req)));
+        ensure!(r.is_ok() && err == 0, "transition SAE associate");
+        let st = u.dev.st.borrow();
+        let rx = &st.world.ap.sae_rx;
+        ensure!(
+            rx.len() == 3
+                && rx[0].1 == 0
+                && rx[1].2[..2] == [19, 0]
+                && rx[1].2[2..4] == [7, 7]
+                && rx[1].2[4..] == rx[0].2[2..],
+            "hunting-and-pecking commit, inline token"
+        );
+        ensure!(st.world.ap.m4_ok, "4-way done");
+        drop(st);
+        // A PSK-only AP's elements: the passphrase falls back to PSK.
+        let psk_only = beacon(&BSSID, SSID, 6, true);
+        let req = associate_request(&ac, &b, Some(&psk_only[36..]));
+        ensure!(
+            matches!(req.security, SecurityConfig::Wpa2 { psk } if psk == PMK),
+            "PSK-only AP → PSK"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_int_sae_transition_hunt_and_peck
+);
+
+/// SAE failures (`sme_sae_auth` → `wpas_connection_failed`): a rejecting
+/// AP (status 1; 77 = group not supported, no other group to try), a
+/// Confirm that does not verify, an AP that never answers (3 tries of
+/// the Commit, `IEEE80211_AUTH_MAX_TRIES`), and SAE asked of a PSK-only
+/// AP; nothing is associated, no key installed.
+fn smoke_ath11k_int_sae_negatives() -> TestResult {
+    use super::mac::step;
+    check(|| {
+        let cases: [(super::mac_tests::SaeAp, u32, u32); 3] = [
+            (
+                super::mac_tests::SaeAp {
+                    reject: Some(1),
+                    ..Default::default()
+                },
+                step::SAE_REJECTED,
+                1,
+            ),
+            (
+                super::mac_tests::SaeAp {
+                    reject: Some(77),
+                    ..Default::default()
+                },
+                step::SAE_REJECTED,
+                77,
+            ),
+            (
+                super::mac_tests::SaeAp {
+                    password: SAE_PW.to_vec(),
+                    h2e: true,
+                    bad_confirm: true,
+                    ..Default::default()
+                },
+                step::SAE_CONFIRM,
+                0,
+            ),
+        ];
+        for (sae, s, d) in cases {
+            let u = up(sae_cfg(&AP_RSNE_SAE, true, sae))?;
+            scan6(&u)?;
+            let (r, err, detail, _) = latched(|| run(u.netdev.associate(sae_req())));
+            ensure!(r.is_err() && err == s && detail == d, "SAE failure step");
+            ensure!(
+                !u.dev.st.borrow().world.mgmt.iter().any(|f| f[0] == 0x00),
+                "no association request"
+            );
+        }
+        // Silent AP: wrong password on the AP side means no Confirm.
+        let u = up(sae_cfg(
+            &AP_RSNE_SAE,
+            true,
+            super::mac_tests::SaeAp {
+                password: b"other-password".to_vec(),
+                h2e: true,
+                ..Default::default()
+            },
+        ))?;
+        scan6(&u)?;
+        let (r, err, detail, _) = latched(|| run(u.netdev.associate(sae_req())));
+        ensure!(
+            r.is_err() && err == step::SAE_TIMEOUT && detail == 3,
+            "no Confirm: SAE timeout after 3 tries"
+        );
+        let n = u
+            .dev
+            .st
+            .borrow()
+            .world
+            .ap
+            .sae_rx
+            .iter()
+            .filter(|f| f.0 == 2)
+            .count();
+        ensure!(n == 3, "the Confirm sent 3 times");
+        drop(u);
+        // SAE asked of a PSK-only AP.
+        let u = up(wpa2_cfg())?;
+        scan6(&u)?;
+        let (r, err, detail, _) = latched(|| run(u.netdev.associate(sae_req())));
+        ensure!(
+            r.is_err() && err == step::CONNECT_UNSUPPORTED && detail == 3,
+            "no AKM 8"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_sae_negatives);
