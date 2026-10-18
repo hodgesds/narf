@@ -5041,6 +5041,9 @@ pub(crate) type BoxFut<'a, T> =
 /// it reached (`COMMIT_ROUND`), for the log line a failed commit prints.
 static COMMIT_PHASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static COMMIT_ROUND: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Which parts of the last fixed-point round differed from the round before
+/// (bits: extent new/freed/root, block-group new/freed/root, FST leaves).
+static COMMIT_UNSETTLED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn commit_phase(phase: u32) {
     COMMIT_PHASE.store(phase, core::sync::atomic::Ordering::Relaxed);
@@ -5068,8 +5071,9 @@ fn commit_txn<'a, B: BlockDevice + 'static>(
             };
             let _ = writeln!(
                 narf_console::Writer,
-                "btrfs: commit of generation {gen} failed ({error:?}) at {phase}, round {}",
-                COMMIT_ROUND.load(core::sync::atomic::Ordering::Relaxed)
+                "btrfs: commit of generation {gen} failed ({error:?}) at {phase}, round {} (unsettled {:#x})",
+                COMMIT_ROUND.load(core::sync::atomic::Ordering::Relaxed),
+                COMMIT_UNSETTLED.load(core::sync::atomic::Ordering::Relaxed)
             );
         }
         result
@@ -5528,13 +5532,15 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
         let mut pb_freed = prev_bgt_freed.clone();
         pb_new.sort_unstable();
         pb_freed.sort_unstable();
-        let converged = cur_ext_new == p_new
-            && cur_ext_freed == p_freed
-            && ext_out.root_addr == prev_ext_root
-            && cur_bgt_new == pb_new
-            && cur_bgt_freed == pb_freed
-            && cur_bgt_root == prev_bgt_root
-            && fst_lv == fst_leaves;
+        let unsettled = u32::from(cur_ext_new != p_new)
+            | u32::from(cur_ext_freed != p_freed) << 1
+            | u32::from(ext_out.root_addr != prev_ext_root) << 2
+            | u32::from(cur_bgt_new != pb_new) << 3
+            | u32::from(cur_bgt_freed != pb_freed) << 4
+            | u32::from(cur_bgt_root != prev_bgt_root) << 5
+            | u32::from(fst_lv != fst_leaves) << 6;
+        COMMIT_UNSETTLED.store(unsettled, core::sync::atomic::Ordering::Relaxed);
+        let converged = unsettled == 0;
         if converged {
             // A converged round repeats the previous one's allocations, so a
             // collision here would be two trees on one block: refuse it.
