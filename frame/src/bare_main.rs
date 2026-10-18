@@ -3010,16 +3010,18 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_spi::register_initcalls();
             // Bridge: ACPI power-button events (delivered by the
             // SCI dispatcher in narf-drivers-platform::ec) into
-            // the system-power surface. Subscribers run in SCI
-            // IRQ context — `system::power_off` is a never-
-            // returns terminal action, so calling it directly
-            // from the IRQ is safe (any locks held elsewhere
-            // become moot once the platform powers off).
+            // the input layer, as Linux `acpi_button_notify` does:
+            // the press is reported as KEY_POWER on the "Power
+            // Button" input device and logind performs the orderly
+            // shutdown. With no reader on that device (no logind),
+            // narf_power queues an orderly kernel power-off that a
+            // task-context worker runs (sync every filesystem, then
+            // the device shutdown hooks). Never a power-off from the
+            // notifying context: it runs under the subscriber lock.
             #[cfg(target_arch = "x86_64")]
             narf_drivers_platform::ec::subscribe_platform_event(|event| {
                 if event == narf_drivers_platform::ec::PlatformEvent::PowerButton {
-                    let _ = writeln!(console::Writer, "  acpi: power button → entering S5");
-                    narf_power::system::power_off();
+                    let _ = narf_power::button::report_power_button();
                 }
             });
             narf_graphics_driver::register_initcalls();

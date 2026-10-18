@@ -17188,7 +17188,7 @@ pub(crate) use {
     handler_sys_statfs::sys_statfs,
     handler_sys_symlink::{symlink_absolute, sys_symlink},
     handler_sys_symlinkat::sys_symlinkat,
-    handler_sys_sync::sys_sync,
+    handler_sys_sync::{pre_shutdown_sync, sync_all_blocking, sys_sync},
     handler_sys_sync_file_range::sys_sync_file_range,
     handler_sys_syncfs::sys_syncfs,
     handler_sys_sysinfo::sys_sysinfo,

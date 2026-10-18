@@ -1561,3 +1561,7 @@ argument = "The frame/ edit registers one Late initcall (root-mount-settled), ri
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The frame/ edit makes the serial RX interrupt handler stop draining the UART when the console byte ring is full (narf_input::byte_ring_has_room), recording the throttle so the console reader refills the ring later. It only stops reading device input early; it adds no authority, memory access, domain transition or TCB member, and the handler's bounded 16-byte loop is unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame/ edit (bare_main.rs) replaces the ACPI power-button platform-event subscriber's direct narf_power::system::power_off() call with narf_power::button::report_power_button(), which reports KEY_POWER on an evdev input device and, when no reader has that device open, only records an orderly power-off request for a task-context worker in narf-power. The subscriber no longer powers the machine off from under the SCI subscriber spinlock, so the filesystem sync and device shutdown hooks run from task context. It adds no authority, memory access, domain transition, trap-path code or TCB member; the panic-time CPU stop lives in interrupts/ and console/, outside the TCB."

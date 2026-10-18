@@ -205,6 +205,33 @@ evaluated. PM1 writes preserve every non-sleep control bit. On aarch64,
 SMC conduit. Both entry points halt forever if the platform call unexpectedly
 returns.
 
+Before the platform call every transition runs, in this order
+(`system::before_transition`): (1) the pre-shutdown filesystem sync
+(`install_pre_shutdown_sync(fn())`, installed by `narf_userspace`:
+`narf_filesystem::sync_all::sync_all`, i.e. every mounted filesystem's
+`syncfs`, then one flush per disk this boot may have written); (2) the
+persistent-log flush; (3) the device shutdown hooks
+(`register_shutdown_hook`, reverse registration order; NVMe Flush + CC.SHN).
+A transition requested from interrupt context is refused and turned into an
+orderly power-off request; a second concurrent transition parks.
+`power_off_synced() -> !` skips step (1) for a caller that already synced.
+
+```rust
+// orderly: Linux orderly_poweroff / hw_protection_shutdown
+pub fn orderly::orderly_poweroff(reason: OrderlyReason, sync_budget_ms: Option<u64>) -> bool; // IRQ-safe
+pub fn orderly::hw_protection_shutdown(reason: &str, ms_until_forced: u64);
+// button: ACPI power button as an input device (Linux acpi_button)
+pub fn button::report_power_button() -> PressOutcome;
+```
+
+The orderly worker (spawned by a Stage::Late initcall) syncs every filesystem
+from task context, bounded by the request's budget (default 60 s), then calls
+`power_off_synced`. `hw_protection_shutdown` additionally arms a forced
+power-off if no transition has started within twice the budget. The ACPI
+power button reports `KEY_POWER` press + release on its own evdev device;
+with no reader open on it (no logind) it requests the orderly power-off. No
+power-off ever runs in the notifying (IRQ / SCI subscriber) context.
+
 **Why two quiesce variants.** A driver that has only a single
 `quiesce` method must conservatively assume power loss, which means
 running the full save sequence on every retention-class suspend —

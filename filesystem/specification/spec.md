@@ -118,6 +118,23 @@ The upper inherits the lower root's owner and mode, is limited by the normal
 tmpfs policy (half of managed RAM by default), and is discarded at shutdown.
 `RootMountError::TmpfsOverlay` reports failure to construct that session view.
 
+### 3.0c System-wide sync
+
+`all_mounted_filesystems() -> Vec<Arc<dyn FsInstance>>` lists every
+filesystem mounted in the initial table or in any live private mount
+namespace, one per superblock (`backing_identity`; directory-rooted mounts
+win over file-rooted ones). `sync_all::sync_all() -> impl Future<Output =
+SyncReport>` is Linux `ksys_sync`: `syncfs` each of them, then
+`flush_block_devices()` — one flush per disk that has an entry the
+`narf.disks` policy lets write (a read-only disk received no write from this
+boot). `sync(2)` and the pre-shutdown step of every reboot / power-off use it.
+
+`/dev` block nodes (`BlockFile`) split a request into device calls of at
+most `max_chunk_lbas(block_size)` LBAs (≤ 65 535, ≤ 1 MiB) and return the
+short count when a later chunk fails. `efivarfs` is read-only (EROFS, mounted
+`ro`) under `narf.disks=root-ro`, and under `root-rw` / `boot-only` unless
+`narf.efivars_rw` is given (`efivarfs::efivars_writable`).
+
 ### 3.1 Path and node types
 
 ```rust

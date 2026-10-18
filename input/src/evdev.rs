@@ -521,6 +521,10 @@ pub struct DeviceNode {
     pub push_count: AtomicU32,
     /// Count of dropped events (diagnostic).
     pub drop_count: AtomicU32,
+    /// Open [`Reader`]s. A power button with no reader has no userspace
+    /// consumer (no logind), which is when the kernel falls back to an
+    /// orderly power-off itself.
+    readers: AtomicU32,
     /// Alt / SysRq held on THIS keyboard — Linux keeps them in the per-handle
     /// `struct sysrq_state`, so a modifier held on one keyboard never arms
     /// another.
@@ -622,6 +626,7 @@ impl DeviceNode {
             readiness: Readiness::new(0),
             push_count: AtomicU32::new(0),
             drop_count: AtomicU32::new(0),
+            readers: AtomicU32::new(0),
             sysrq: SysrqState::new(),
         }
     }
@@ -674,6 +679,12 @@ impl DeviceNode {
     /// `true` while the device is registered.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    /// Number of [`Reader`]s currently open on this device (Linux: the
+    /// `evdev->client_list` length).
+    pub fn reader_count(&self) -> u32 {
+        self.readers.load(Ordering::Acquire)
     }
 
     /// Allocate a waker slot for a new Reader and return its index.
@@ -734,6 +745,7 @@ impl core::fmt::Debug for Reader {
 impl Reader {
     fn new(node: Arc<DeviceNode>) -> Self {
         let waker_slot = node.alloc_waker_slot();
+        node.readers.fetch_add(1, Ordering::AcqRel);
         Self { node, waker_slot }
     }
 
@@ -784,6 +796,12 @@ impl Reader {
     /// Remove this task's poll/epoll registration from the device cell.
     pub fn disarm_readiness(&self, task_id: u64) {
         self.node.readiness.disarm(task_id);
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.node.readers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

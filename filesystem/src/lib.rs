@@ -99,6 +99,7 @@ pub mod posix_acl;
 pub mod procfs;
 pub mod root_mount;
 pub mod root_selector;
+pub mod sync_all;
 pub mod sysfs;
 pub mod uevent;
 pub mod vt;
@@ -4181,6 +4182,62 @@ pub struct MountNamespace {
     store: MountStore,
 }
 
+/// Every private mount namespace still alive, weakly. `sync(2)` and the
+/// pre-shutdown sync walk every superblock in the system (Linux
+/// `iterate_supers` over the global `super_blocks` list), not just the ones
+/// reachable from the initial namespace: a filesystem mounted only inside an
+/// `unshare(CLONE_NEWNS)` sandbox has dirty state too. Dead entries are pruned
+/// on every insert and every walk.
+static PRIVATE_MOUNT_NS: IrqSafeSpinLock<Vec<alloc::sync::Weak<MountNamespace>>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+fn note_private_mount_ns(ns: &Arc<MountNamespace>) {
+    let mut g = PRIVATE_MOUNT_NS.lock();
+    g.retain(|w| w.strong_count() > 0);
+    g.push(Arc::downgrade(ns));
+}
+
+/// Every filesystem instance mounted anywhere — the initial mount table plus
+/// every live private mount namespace — deduplicated by
+/// [`FsInstance::backing_identity`] (one entry per superblock: a bind mount
+/// and its source are the same filesystem). Directory-rooted mounts are listed
+/// before file-rooted ones, so when a superblock is reachable both ways the
+/// kept entry is the one whose root directory can answer `syncfs`.
+///
+/// The `Arc`s are cloned out under each table's lock and the locks dropped
+/// before returning, so the caller may block on the filesystems.
+pub fn all_mounted_filesystems() -> Vec<Arc<dyn FsInstance>> {
+    let mut all: Vec<Arc<dyn FsInstance>> =
+        REGISTRY.inner.lock().iter().map(|m| m.fs.clone()).collect();
+    let private: Vec<Arc<MountNamespace>> = {
+        let mut g = PRIVATE_MOUNT_NS.lock();
+        g.retain(|w| w.strong_count() > 0);
+        g.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    for ns in private {
+        all.extend(ns.store().inner.lock().iter().map(|m| m.fs.clone()));
+    }
+    dedupe_superblocks(all)
+}
+
+/// The dedupe rule of [`all_mounted_filesystems`], separated for tests.
+pub fn dedupe_superblocks(all: Vec<Arc<dyn FsInstance>>) -> Vec<Arc<dyn FsInstance>> {
+    let (mut dirs, files): (Vec<_>, Vec<_>) =
+        all.into_iter().partition(|fs| fs.root_file().is_none());
+    dirs.extend(files);
+    let mut seen: Vec<usize> = Vec::new();
+    let mut out = Vec::new();
+    for fs in dirs {
+        let id = fs.backing_identity();
+        if seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
+        out.push(fs);
+    }
+    out
+}
+
 /// `MNT_NS_INIT_ID` (`include/uapi/linux/nsfs.h:78`) — the initial mount
 /// namespace's reserved id.
 ///
@@ -4300,6 +4357,7 @@ impl MountNamespace {
             owner_id,
             Arc::downgrade(&ns) as alloc::sync::Weak<dyn NsObject>,
         );
+        note_private_mount_ns(&ns);
         ns
     }
 
