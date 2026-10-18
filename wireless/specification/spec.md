@@ -152,8 +152,9 @@ network namespace. The socket layer supplies both verdicts in
 
 | Command | Linux flag | NARF check |
 |---|---|---|
-| GET_WIPHY, GET_INTERFACE, GET_SCAN, GET_STATION, GET_PROTOCOL_FEATURES | none | none |
+| GET_WIPHY, GET_INTERFACE, GET_SCAN, GET_STATION, GET_PROTOCOL_FEATURES, GET_REG, GET_POWER_SAVE | none | none |
 | TRIGGER_SCAN, CONNECT, DISCONNECT, SET_INTERFACE | `GENL_UNS_ADMIN_PERM` | `net_admin` or delegated handle |
+| SET_KEY, NEW_KEY, DEL_KEY, SET_PMKSA, DEL_PMKSA, FLUSH_PMKSA, CONTROL_PORT_FRAME, SET_POWER_SAVE | `GENL_UNS_ADMIN_PERM` | `net_admin` or delegated handle |
 | AUTHENTICATE, ASSOCIATE, DEAUTHENTICATE, DISASSOCIATE, REGISTER_FRAME, FRAME | `GENL_UNS_ADMIN_PERM` | `net_admin` or delegated handle |
 | SET_BEACON, START_AP, STOP_AP, NEW/SET/DEL_STATION | `GENL_UNS_ADMIN_PERM` | `net_admin` or delegated handle |
 | EXTERNAL_AUTH | `GENL_ADMIN_PERM` | `init_net_admin` or delegated handle |
@@ -181,11 +182,18 @@ FREQ_KHZ with -EOPNOTSUPP, probe IEs past the advertised maximum of 0 with
 always send (`MAC_HINT`, `WIPHY_FREQ_HINT`, `BG_SCAN_PERIOD`, `PREV_BSSID`,
 HT/VHT capability + mask, `CONTROL_PORT`, `CONTROL_PORT_ETHERTYPE` = ETH_P_PAE,
 `CONTROL_PORT_NO_ENCRYPT`, `SOCKET_OWNER`, `EXTERNAL_AUTH_SUPPORT`, `SAE_PWE`,
-`MLO_SUPPORT`) with `nl80211_connect`'s checks; hints and overrides steer
-nothing. For the PMK path the RSN element in `NL80211_ATTR_IE` must describe
-CCMP/PSK without MFP-required; other elements are accepted and not forwarded.
-`CONTROL_PORT_OVER_NL80211` is -EOPNOTSUPP (the ext feature is not
-advertised), so EAPOL never reaches userspace. A successful offloaded
+`MLO_SUPPORT`, `CONTROL_PORT_OVER_NL80211`, `CONTROL_PORT_NO_PREAUTH`) with
+`nl80211_connect` / `nl80211_crypto_settings`' checks; hints and overrides
+steer nothing. `USE_MFP` is `enum nl80211_mfp` (REQUIRED = 1; OPTIONAL = 2
+needs `NL80211_EXT_FEATURE_MFP_OPTIONAL`, which no NARF wiphy — like
+mac80211 — has: -EOPNOTSUPP). A PMK needs `4WAY_HANDSHAKE_STA_PSK` and a SAE
+password `SAE_OFFLOAD` (-EINVAL otherwise); pairwise / group ciphers must be
+wiphy cipher suites (-EINVAL). `CONTROL_PORT_OVER_NL80211` needs
+`SOCKET_OWNER` (-EINVAL), then the ext feature (-EOPNOTSUPP). For the PMK
+path the RSN element in `NL80211_ATTR_IE` must describe CCMP/PSK without
+MFP-required; every element is carried in `AssociateRequest::ie`, and an
+offloading driver replaces RSNE / RSNXE with its own and forwards the rest
+(`ieee80211_mgd_assoc`). A successful offloaded
 WPA2-PSK / SAE connect emits `CONNECT` (with `WIPHY`, `MAC`, `STATUS_CODE`)
 and then `PORT_AUTHORIZED` (`cfg80211_port_authorized`), which wpa_supplicant
 waits for under `WPA_DRIVER_FLAGS_4WAY_HANDSHAKE_PSK`. `GET_SCAN` marks the
@@ -193,20 +201,127 @@ associated BSS with `NL80211_BSS_STATUS_ASSOCIATED`; `GET_STATION` reports the
 AP (do needs `MAC`, -ENOENT for another peer) with the signal of its last scan
 record only.
 
-**WPA2-PSK with wpa_supplicant / NetworkManager** therefore runs on the
-handshake-offload path every NARF station driver implements (ath11k, iwlwifi,
-mt7921): wpa_supplicant derives the PMK and passes it in `CONNECT`, the
-driver's in-kernel supplicant runs the 4-way and group-key handshakes and
-rekeys. There is no external-supplicant driver mode: `NEW_KEY` / `SET_KEY` /
-`DEL_KEY`, `SET_PMKSA` / `FLUSH_PMKSA`, `SET_STATION(AUTHORIZED)` on a station,
-`CONTROL_PORT_FRAME` and EAPOL delivery to `PF_PACKET` are not implemented
-(-EOPNOTSUPP; wpa_supplicant ignores each on this path). They are what
-802.1X/EAP (WPA-Enterprise) or a supplicant-run 4-way handshake would need: a
-`WirelessNetIface` mode that hands EAPOL frames to the netdev RX ring and
-transmits them unencrypted before authorization, a key-install method, and
-an authorize-port method, with the driver's in-kernel supplicant (including
-its group rekey) disabled for that association. `SOCKET_OWNER` is accepted
-but closing the owner socket does not disconnect.
+**Two driver modes.** A handshake-offloading driver (iwlwifi, mt7921)
+advertises `4WAY_HANDSHAKE_STA_PSK` (and `SAE_OFFLOAD`): wpa_supplicant derives
+the PMK and passes it in CONNECT, the driver's in-kernel supplicant runs the
+4-way and group-key handshakes and rekeys, then PORT_AUTHORIZED. An
+**external-supplicant** driver (`supports_external_supplicant()`, ath11k —
+the mac80211 model) runs no supplicant: wpa_supplicant does the handshake
+itself, which is also what 802.1X/EAP (WPA-Enterprise) needs. A driver that
+also runs its SME in userspace (`supports_userspace_mlme()`) advertises
+AUTHENTICATE / ASSOCIATE and `NL80211_FEATURE_SAE` and never the handshake
+offloads (wpa_supplicant with `WPA_DRIVER_FLAGS_SME` passes no PMK yet, with
+`4WAY_HANDSHAKE_STA_PSK`, ignores EAPOL), so wpa_supplicant runs SAE in
+userspace over AUTHENTICATE as on Linux. The external mode is:
+
+- **Association.** CONNECT with a protected network and neither PMK nor SAE
+  password (Open System auth only), or the AUTHENTICATE / ASSOCIATE pair,
+  becomes `SecurityConfig::External(ExternalSecurity { use_mfp, privacy,
+  control_port })` / `MlmeAssocRequest { control_port, privacy, .. }`; the
+  supplicant's RSNE / RSNXE travel in the elements. With
+  NL80211_ATTR_CONTROL_PORT the port stays closed after association
+  (`IEEE80211_STA_CONTROL_PORT`); without it the AP is authorized at once.
+  The interface counts as connected (`connected_bssid`, `wdev->connected`)
+  from association on.
+- **Keys.** NEW_KEY / SET_KEY / DEL_KEY follow `nl80211_parse_key` (nested
+  `NL80211_ATTR_KEY` or the old attributes, the policies' -ERANGE bounds),
+  `cfg80211_validate_key_settings` (pairwise index 0 — no Extended Key ID —,
+  group 0..=5 with AES-CMAC advertised, AES-CMAC index 4/5, key / RSC
+  lengths, the wiphy's cipher suites CCMP + AES-CMAC; -EINVAL),
+  `nl80211_key_allowed` (-ENOLINK unless connected), no MLO link
+  (-EINVAL), then `WirelessNetIface::add_key` / `del_key` (mac80211:
+  -ENOENT for a peer that is not the associated AP or a key that is not
+  installed; a group key with a MAC -ENOENT). SET_KEY sets default /
+  default-management keys (accepted, no driver call, as mac80211's
+  `set_default_key`); `KEY_MODE = SET_TX` is -EINVAL (no Extended Key ID).
+- **Port.** SET_STATION on a station interface is `ieee80211_change_station`
+  for the AP (`CFG80211_STA_AP_STA`): MAC required (-EINVAL), STA_FLAGS2
+  (short -ERANGE, the invalid bit -EINVAL) or the old STA_FLAGS, -ENOENT for
+  another peer, any flag but AUTHORIZED, a listen interval, an AID, rates or
+  capabilities -EINVAL; then `set_port_authorized`.
+- **PMKSA.** SET / DEL / FLUSH_PMKSA check their attributes (PMKID -EINVAL /
+  short -ERANGE, MAC or the FILS triple -EINVAL) and then are -EOPNOTSUPP:
+  mac80211 has no PMKSA operations; the supplicant keeps its cache.
+- **EAPOL.** Received control-port frames go to the connection owner as a
+  unicast NL80211_CMD_CONTROL_PORT_FRAME (WIPHY, IFINDEX, WDEV, MAC = source,
+  CONTROL_PORT_ETHERTYPE, CONTROL_PORT_NO_ENCRYPT when not decrypted, FRAME
+  = the PDU after the Ethernet header; `rx_control_port`, -ENOENT /
+  dropped without an owner) when the association asked for
+  CONTROL_PORT_OVER_NL80211 (pre-authentication frames too unless
+  CONTROL_PORT_NO_PREAUTH), else up the netdev with the destination set to
+  our address, where a PF_PACKET socket on ETH_P_PAE (wpa_supplicant's
+  `l2_packet`) reads it. CONTROL_PORT_FRAME TX (`nl80211_tx_control_port`:
+  the ext feature -EOPNOTSUPP, FRAME / MAC / ETHERTYPE -EINVAL, not
+  connected -ENOTCONN; the driver: a protocol other than the association's
+  or ETH_P_PREAUTH -EINVAL) returns a cookie in the extended ACK
+  (`NLMSGERR_ATTR_COOKIE`) unless DONT_WAIT_FOR_ACK. EAPOL sent through the
+  netdev passes the closed port; frames leave unprotected until a pairwise
+  key is installed.
+- **Ordering.** The netlink syscall cannot wait for the device: these
+  methods are synchronous, validate what mac80211 rejects before the driver,
+  and the driver applies them on its own task strictly in request order
+  (key installs, authorization, control-port TX), so M4 leaves before the
+  PTK it precedes and data before the keys requested ahead of it.
+
+**Connection owner.** `SOCKET_OWNER` on CONNECT / ASSOCIATE makes the
+sender's port (`RequestContext::portid`) the connection owner
+(`conn_owner_nlportid`): ASSOCIATE, DEAUTHENTICATE, DISASSOCIATE and
+DISCONNECT from another socket are -EPERM, a failed connect result or a
+disconnect clears it, CONTROL_PORT_FRAME RX is unicast to it, and closing
+that socket (`NETLINK_URELEASE`, `narf_net::netlink_generic::notify_release`
+from the socket layer) disconnects the interface
+(`cfg80211_autodisconnect_wk`, reason DEAUTH_LEAVING).
+
+**Userspace SME.** AUTHENTICATE follows `nl80211_authenticate`
+(NEED_NETDEV_UP -ENETDOWN; MAC, AUTH_TYPE, SSID, WIPHY_FREQ -EINVAL; a WEP
+key -EINVAL; no driver op -EOPNOTSUPP; AUTH_TYPE past SAE -EINVAL — FILS and
+EPPKE are not advertised; SAE without AUTH_DATA or AUTH_DATA without SAE
+-EINVAL, AUTH_DATA shorter than 4 -ERANGE; LOCAL_STATE_CHANGE a no-op; the
+BSS must be in the scan results, -ENOENT; already connected to it
+-EALREADY). The driver's answer is published as NL80211_CMD_AUTHENTICATE
+(WIPHY, IFINDEX, FRAME) or, on timeout, with TIMED_OUT + MAC. ASSOCIATE
+follows `nl80211_associate` (owner -EPERM, SSID -EINVAL, a
+non-inheritance element -EINVAL, USE_MFP other than NO / REQUIRED -EINVAL,
+HT/VHT overrides without masks -EINVAL, MAC + WIPHY_FREQ -EINVAL, the
+scan entry -ENOENT, crypto settings, connected to another BSS -EALREADY);
+the response is published as NL80211_CMD_ASSOCIATE (FRAME, REQ_IE = the
+SME's elements) followed by the CONNECT result. DEAUTHENTICATE /
+DISASSOCIATE need MAC and a non-zero REASON_CODE (-EINVAL); DISASSOCIATE
+while not connected to that BSS is -ENOTCONN. A driver that reports its own
+disconnects publishes DEAUTHENTICATE / DISASSOCIATE with the frame and then
+DISCONNECT for every loss (`notify_mlme_disconnect`; wpa_supplicant's SME
+ignores DISCONNECT and acts on the DEAUTHENTICATE frame).
+
+**Other commands.** GET_REG returns the global domain (the installed
+deployment policy, else cfg80211's `world_regdom`), or with WIPHY that
+wiphy's own (`regulatory_domain()`); the dump lists the global domain then
+each wiphy domain with WIPHY and WIPHY_SELF_MANAGED_REG. SET_POWER_SAVE /
+GET_POWER_SAVE need `power_save_default()` (mac80211's `set_power_mgmt`,
+else -EOPNOTSUPP), keep `wdev->ps` (on by default,
+CONFIG_CFG80211_DEFAULT_PS) and call the driver only on a change; PS_STATE
+missing -EINVAL, past ENABLED -ERANGE. GET_INTERFACE carries
+NL80211_ATTR_WDEV (`wiphy << 32 | 1`). GET_STATION's STA_INFO carries what
+`station_info()` tracks (signal, average / ACK signal, TX / RX bitrate with
+`nl80211_put_sta_rate`'s attributes, packet counters), the scan record's
+signal otherwise.
+
+Driver coverage: ath11k implements the external mode, the userspace SME,
+power save, its regulatory domain and STA_INFO signal. iwlwifi and mt7921
+stay handshake-offload drivers: their firmware paths run the handshake
+themselves, so they do not claim `supports_external_supplicant()` (NEW_KEY
+and the other external commands are -EOPNOTSUPP from nl80211, and a
+`SecurityConfig::External` reaching them is `WirelessError::NotSupported`);
+they ignore `AssociateRequest::ie` (their firmware builds the Association
+Request) and have no SET_POWER_SAVE.
+
+Deviations kept: CONTROL_PORT_OVER_NL80211_TX_STATUS is not advertised (no
+CONTROL_PORT_FRAME_TX_STATUS; wpa_supplicant uses it only as an AP); a
+NEW_KEY whose firmware install fails is reported to the caller as success
+(the driver applies it after the syscall returned); the ASSOCIATE event's
+REQ_IE is userspace's elements, not the whole frame body mac80211 built;
+reassociation (PREV_BSSID) through the userspace SME is not implemented;
+NARF's older attribute helpers answer a short fixed-size attribute with
+-EINVAL where the policy says -ERANGE (the new commands use -ERANGE).
 
 Mutating requests validate attributes, reserve one operation per interface,
 then run the native async method in the executor. Netlink ACK acknowledges

@@ -21,6 +21,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
@@ -248,6 +249,7 @@ pub fn associate_request(cfg: &AutoCfg, bss: &BssInfo, ies: Option<&[u8]>) -> As
         ssid: bss.ssid.clone(),
         channel: bss.channel,
         security,
+        ie: Vec::new(),
     }
 }
 
@@ -273,8 +275,25 @@ pub fn report(name: &str, bss: &[BssInfo]) {
     }
 }
 
+/// An interface the autoconnect associates in the kernel's own name: a
+/// firmware recovery restores such a connection by itself, unlike one
+/// userspace asked for over nl80211.
+#[async_trait::async_trait]
+pub trait KernelConnect: narf_wireless::WirelessNetIface {
+    async fn associate_kernel(&self, req: AssociateRequest) -> Result<(), WirelessError>;
+}
+
+#[async_trait::async_trait]
+impl<Io: super::runtime::RtIo, Irq: super::runtime::DpIrq, Q: super::runtime::RtQmi> KernelConnect
+    for super::iface::Ath11kNetdev<Io, Irq, Q>
+{
+    async fn associate_kernel(&self, req: AssociateRequest) -> Result<(), WirelessError> {
+        super::iface::Ath11kNetdev::associate_kernel(self, req).await
+    }
+}
+
 /// One attempt: scan, report, pick, associate. `Ok(None)` = scan only.
-pub async fn attempt<I: narf_wireless::WirelessNetIface + ?Sized>(
+pub async fn attempt<I: KernelConnect + ?Sized>(
     dev: &I,
     cfg: &AutoCfg,
 ) -> Result<Option<[u8; 6]>, WirelessError> {
@@ -293,7 +312,7 @@ pub async fn attempt<I: narf_wireless::WirelessNetIface + ?Sized>(
         return Err(WirelessError::InvalidArgs);
     };
     let ies = dev.scan_information_elements(b.bssid);
-    dev.associate(associate_request(cfg, &b, ies.as_deref()))
+    dev.associate_kernel(associate_request(cfg, &b, ies.as_deref()))
         .await?;
     let m = b.bssid;
     log(format_args!(
@@ -312,10 +331,7 @@ pub const MAX_FAILURES: u32 = 6;
 /// [`RETRY_MS`] while not connected (link loss reconnects), until
 /// [`MAX_FAILURES`] attempts in a row failed. Scan-only configurations
 /// run once.
-pub async fn run<I: narf_wireless::WirelessNetIface + ?Sized>(
-    dev: alloc::sync::Arc<I>,
-    cfg: AutoCfg,
-) {
+pub async fn run<I: KernelConnect + ?Sized>(dev: alloc::sync::Arc<I>, cfg: AutoCfg) {
     let mut failures = 0;
     loop {
         if dev.connected_bssid().is_none() {

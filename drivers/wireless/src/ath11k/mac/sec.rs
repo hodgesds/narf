@@ -132,6 +132,9 @@ pub fn select_rsn(
         SecurityConfig::Wpa3 { password } => {
             (&[KeyMgmt::Sae][..], Credential::Sae(password.clone()))
         }
+        // The supplicant in userspace chose the suites (its RSNE rides in
+        // the association's elements).
+        SecurityConfig::External(_) => return Ok(None),
     };
     let body = ies.rsn.as_deref().ok_or(refuse::RSN)?;
     let r = RsnIe::decode_body(body).ok_or(refuse::RSN)?;
@@ -605,6 +608,14 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             let Some(l) = self.link.as_ref() else {
                 continue;
             };
+            if let Some(e) = l.external {
+                // ieee80211_deliver_skb_to_local_stack for the control
+                // port protocol: userspace's supplicant gets it.
+                if l.assoc && l.loss.is_none() {
+                    self.queue_control_port_rx(eth, encrypted, e.control_port);
+                }
+                continue;
+            }
             if !l.authorized || l.loss.is_some() || self.sup.is_none() {
                 continue;
             }

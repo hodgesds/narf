@@ -1346,9 +1346,15 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   `recovery_start` wait are not modelled — one runtime task runs one
   recovery at a time and later notices are dropped while one is pending;
   WMI / HTC timeouts do not trigger recovery (Linux's do not either:
-  CRASH_FLUSH only shortens them); the mac layer is rebuilt and NARF
-  associates again over the air with the last parameters, where
-  mac80211's `ieee80211_reconfig` restores the station, keys and BSS
+  CRASH_FLUSH only shortens them); the mac layer is rebuilt and, for a
+  connection the kernel itself made (the command-line autoconnect,
+  `Ath11kNetdev::associate_kernel`, `ConnectOrigin::Kernel`), NARF
+  associates again over the air with the last parameters. A connection
+  userspace asked for (nl80211 CONNECT, ASSOCIATE, any external-supplicant
+  association: `ConnectOrigin::Nl80211`) is not restored: cfg80211 hears
+  the loss (DEAUTHENTICATE + DISCONNECT, reason 1) and wpa_supplicant
+  reconnects, as when mac80211's `ieee80211_reconfig` cannot restore it.
+  Linux's reconfig restores the station, keys and BSS
   state in the restarted firmware without new frames — so the old mac
   layer (its supplicant / rekey state, RX BA sessions, scan table) is
   dropped whole rather than torn down session by session: no DELBA is
@@ -1444,13 +1450,41 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   protection (BIGTK), no OCV; a group-addressed robust frame naming an
   IGTK index we do not hold is dropped.
 - Control path: userspace drives the station over nl80211 with Linux's
-  permission model (`wireless/` spec §3.4). `iw dev wlan0 scan` / `link`
-  / `connect <open ssid>` work for a CAP_NET_ADMIN sender; wpa_supplicant
-  `-Dnl80211` (and NetworkManager through it) does WPA2-PSK on the
-  handshake-offload path — PMK in CONNECT, this driver's in-kernel
-  supplicant runs the 4-way / group-key handshakes, CONNECT then
-  PORT_AUTHORIZED reported. Open: no external-supplicant mode (EAPOL to
-  userspace, NEW_KEY install), so 802.1X/EAP networks still need it.
+  permission model (`wireless/` spec §3.4), as mac80211 offers ath11k on
+  Linux: SME and supplicant in userspace (`supports_userspace_mlme`,
+  `supports_external_supplicant`; no handshake offload is advertised, so
+  wpa_supplicant uses `WPA_DRIVER_FLAGS_SME`). AUTHENTICATE (Open, or SAE
+  with AUTH_DATA = transaction | status | body, `mac/ext.rs`
+  `Mac::sme_authenticate` = `ieee80211_mgd_auth`) / ASSOCIATE
+  (`Mac::sme_associate` = `ieee80211_mgd_assoc`: userspace's elements as
+  given, `ieee80211_send_assoc` ordering, the port closed while
+  NL80211_ATTR_CONTROL_PORT is set) / DEAUTHENTICATE / DISASSOCIATE each
+  report the peer's or our frame as cfg80211 does; CONNECT without a PMK
+  (`SecurityConfig::External`) runs the same through the driver's SME.
+  EAPOL (`Mac::take_control_port_rx`) goes to the connection owner as
+  CONTROL_PORT_FRAME, or up the netdev with DA = our address
+  (PF_PACKET / l2_packet); TX goes through CONTROL_PORT_FRAME or the
+  netdev, protected only once a PTK is in. Keys come from NEW_KEY
+  (`Mac::ext_add_key` → the same `install_key` / PTK replacement path
+  the in-kernel supplicant and PTK rekey use, AES-CMAC kept in software
+  BIP, KRACK re-installs ignored), DEL_KEY, and the port opens on
+  SET_STATION AUTHORIZED (`Mac::ext_set_authorized`); the in-kernel
+  supplicant and its group / PTK rekey never run for such an
+  association. These calls arrive in the netlink syscall, which cannot
+  wait for the firmware: `Ath11kNetdev` validates them synchronously
+  (mac80211's -ENOENT / -EINVAL), then the runtime loop applies them in
+  order (`ExtOp`), so a key's WMI install failure is only latched, not
+  returned (Linux returns it from NEW_KEY). The in-kernel 4-way handshake
+  remains for the autoconnect. Power save follows `ieee80211_set_power_mgmt`
+  (`Mac::set_power_save`: `wdev->ps` on by default, WMI PS mode
+  disabled / inactivity time + enabled once authorized with a beacon);
+  GET_REG reports the self-managed wiphy's `Regd`; STA_INFO carries the
+  AP's last management-frame signal (no rate statistics: ath11k's PPDU
+  stats are not parsed). Unverified until hardware / real binaries:
+  wpa_supplicant, NetworkManager and eapol_test against a real AP, SAE
+  anti-clogging / group 20-21 over the userspace SME, EAP-TLS / PEAP
+  timing, and the firmware's handling of the userspace-built
+  Authentication frames.
 - Unverified until hardware (recovery): that the WCN6855 firmware enters
   RDDM (or reports SYS_ERR) on a crash and comes back after the
   `sw_reset` power cycle with a fresh QRTR HELLO; that it sends
@@ -1526,8 +1560,11 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   GHz only (`narf_wireless` uses bare channel numbers).
 - Mac layer, open vs Linux (each is a deliberate simplification or an
   unverified detail, see `mac.rs` comments): probe-request elements
-  approximate `ieee80211_build_preq_ies`; the SME adds only the RSN
-  element (wpa_supplicant also adds Extended Capabilities); no Country /
+  approximate `ieee80211_build_preq_ies`; the offloading SME builds its own
+  RSN element (and RSNXE for SAE) and forwards userspace's other
+  elements (Extended Capabilities, vendor elements) in their order, with
+  `WLAN_EXT_CAPA3_MULTI_BSSID_SUPPORT` set for an HE association
+  (`SUPPORTS_ONLY_HE_MULTI_BSSID`); no Country /
   Power Constraint handling (`ap_power_level`), no TPC / 6 GHz power
   envelope, no TWT; association comeback
   (status 30) is a reject; roaming,

@@ -34,11 +34,12 @@ use core::future::Future;
 
 use narf_wireless::eapol::{HmacPrimitive, Supplicant};
 use narf_wireless::rsn::{self, RsnIe, Suite};
-use narf_wireless::{AssociateRequest, BssInfo, ScanRequest, WirelessError};
+use narf_wireless::{AssociateRequest, BssInfo, ScanRequest, SecurityConfig, WirelessError};
 
 use super::mac_frame::{self as frame, capab, eid, freq_band, Band, ParsedIes};
 use super::mac_peer::{self as peer, ApSta, ChanDef, ConnMode, OwnCaps, SmpsMode, Width};
 use super::mac_reg::{chan_flag, RegState, RegUpdate, VdevKind, Wiphy};
+pub mod ext;
 pub mod he;
 pub mod sae;
 pub mod sec;
@@ -588,6 +589,16 @@ pub struct Link {
     /// HE: the AP's HE station capabilities and operation (set at
     /// association success when the connection is HE).
     pub he: Option<peer::ApHe>,
+    /// The association's supplicant runs in userspace
+    /// (`SecurityConfig::External` or the userspace SME): no in-kernel
+    /// 4-way / group handshake, keys from `NEW_KEY`, the port opened by
+    /// `SET_STATION`, EAPOL handed up ([`Mac::take_control_port_rx`]).
+    pub external: Option<narf_wireless::ExternalSecurity>,
+    /// `ieee80211_mark_sta_auth` happened (the AP station is AUTH).
+    pub authenticated: bool,
+    /// The signal (dBm) of the last management frame from the AP
+    /// (`sta->deflink.rx_stats.last_signal`).
+    pub last_signal: Option<i32>,
 }
 
 /// Completions (`reinit_completion` → event → `complete`).
@@ -679,6 +690,12 @@ pub struct Mac<P: WmiPort, D: DataPort> {
     /// Our HE capabilities per band (`ar->mac.iftype[band][STATION]`):
     /// 2.4 GHz, 5 GHz.
     own_he: [Option<he::StaHeCap>; 2],
+    /// Keys userspace installed for an external-supplicant association.
+    ext_keys: ext::ExtKeys,
+    /// Control-port frames for userspace ([`Mac::take_control_port_rx`]).
+    ctrl_rx: Vec<ext::ControlPortRx>,
+    /// `sdata->u.mgd.powersave` (`wdev->ps`).
+    powersave: bool,
 }
 
 /// What `__cfg80211_disconnected` reports to nl80211 for a lost or
@@ -690,6 +707,30 @@ pub struct Mac<P: WmiPort, D: DataPort> {
 pub struct Disconnect {
     pub reason: u16,
     pub from_ap: bool,
+    /// A Deauthentication (`true`) or a Disassociation.
+    pub deauth: bool,
+    /// The AP the frame was exchanged with (zero when unknown).
+    pub bssid: [u8; 6],
+}
+
+impl Disconnect {
+    /// The frame cfg80211 reports with it (`nl80211_send_deauth` /
+    /// `_disassoc`): received from the AP (DA = us, SA = BSSID) or the one
+    /// mac80211 sent (DA = BSSID, SA = us).
+    pub fn frame(&self, own: &[u8; 6]) -> Vec<u8> {
+        let st = if self.deauth {
+            frame::stype::DEAUTH
+        } else {
+            frame::stype::DISASSOC
+        };
+        let mut f = if self.from_ap {
+            frame::mgmt_hdr(st, own, &self.bssid, &self.bssid)
+        } else {
+            frame::mgmt_hdr(st, &self.bssid, own, &self.bssid)
+        };
+        f.extend_from_slice(&self.reason.to_le_bytes());
+        f
+    }
 }
 
 impl LinkLoss {
@@ -699,21 +740,27 @@ impl LinkLoss {
     /// is a locally generated Deauthentication with
     /// `WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY` (`__ieee80211_disconnect`
     /// → `cfg80211_tx_mlme_mgmt`); NARF tears a kickout down the same way.
-    pub fn disconnect(&self) -> Disconnect {
+    pub fn disconnect(&self, bssid: [u8; 6]) -> Disconnect {
         match *self {
-            LinkLoss::Deauth { reason, .. } => Disconnect {
+            LinkLoss::Deauth { deauth, reason } => Disconnect {
                 reason,
                 from_ap: true,
+                deauth,
+                bssid,
             },
             LinkLoss::Kickout | LinkLoss::BeaconLoss => Disconnect {
                 reason: frame::WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY,
                 from_ap: false,
+                deauth: true,
+                bssid,
             },
             // wpa_supplicant_deauthenticate → cfg80211_mlme_deauth: the
             // Deauthentication mac80211 sends carries the reason.
             LinkLoss::Supplicant { reason, .. } => Disconnect {
                 reason,
                 from_ap: false,
+                deauth: true,
+                bssid,
             },
         }
     }
@@ -811,6 +858,9 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             sup: None,
             mfp: MfpState::default(),
             own_he,
+            ext_keys: ext::ExtKeys::default(),
+            ctrl_rx: Vec::new(),
+            powersave: cfg.powersave,
         }
     }
 
@@ -851,6 +901,12 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         &self.wiphy
     }
 
+    /// The regulatory domain in force (`wiphy->regd` of the self-managed
+    /// wiphy).
+    pub fn regd(&self) -> super::mac_reg::Regd {
+        self.reg.current()
+    }
+
     pub fn own_caps(&self) -> &OwnCaps {
         &self.own
     }
@@ -876,9 +932,11 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
     }
 
     pub fn connected_bssid(&self) -> Option<[u8; 6]> {
+        // `wdev->connected`: an offloaded association once the handshake
+        // completed, an external-supplicant one from association on.
         self.link
             .as_ref()
-            .filter(|l| l.authorized && l.loss.is_none())
+            .filter(|l| (l.authorized || l.external.is_some() && l.assoc) && l.loss.is_none())
             .map(|l| l.bss.bssid)
     }
 
@@ -965,7 +1023,12 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         }
         let loss = self.link.as_ref().and_then(|l| l.loss);
         if let Some(loss) = loss {
-            if self.link.as_ref().is_some_and(|l| l.authorized) {
+            let bssid = self.link.as_ref().map_or([0; 6], |l| l.bss.bssid);
+            if self
+                .link
+                .as_ref()
+                .is_some_and(|l| l.authorized || l.external.is_some() && l.assoc)
+            {
                 let (s, d) = match loss {
                     LinkLoss::Kickout => (step::LINK_KICKOUT, 0),
                     LinkLoss::BeaconLoss => (step::LINK_BEACON_LOSS, 0),
@@ -985,7 +1048,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                     _ => frame::WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY,
                 };
                 self.teardown(send_deauth, reason).await;
-                self.disconnect = Some(loss.disconnect());
+                self.disconnect = Some(loss.disconnect(bssid));
                 narf_memory::diag::set_wifi_stage(narf_memory::diag::WifiStage::Scan);
             }
         }
@@ -1748,6 +1811,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                             // ath11k_mac_handle_beacon: cancel connection_loss_work
                             l.conn_loss_deadline = None;
                             l.have_beacon = true;
+                            l.last_signal = Some(st.signal);
                         }
                     }
                 }
@@ -2176,7 +2240,12 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             );
         };
         let ies = bss.parsed();
-        // wpa_supplicant_set_suites (AKM, ciphers, PMF).
+        let external = match &req.security {
+            SecurityConfig::External(e) => Some(*e),
+            _ => None,
+        };
+        // wpa_supplicant_set_suites (AKM, ciphers, PMF); an external
+        // supplicant chose them itself (its RSNE is in `req.ie`).
         let rsn = match sec::select_rsn(&ies, bss.capability, &req.security) {
             Ok(r) => r,
             Err(d) => {
@@ -2193,7 +2262,9 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             // nothing interferes with connection".
             self.scan_abort().await;
         }
-        let r = self.join(&bss, &ies, &req.ssid, rsn).await;
+        let r = self
+            .join(&bss, &ies, &req.ssid, rsn, external, &req.ie)
+            .await;
         if r.is_err() {
             let (assoc, reason) = self
                 .link
@@ -2210,6 +2281,66 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         ies: &ParsedIes,
         ssid: &[u8],
         rsn: Option<(RsnPlan, Credential)>,
+        external: Option<narf_wireless::ExternalSecurity>,
+        user_ies: &[u8],
+    ) -> Result<(), MacError> {
+        self.prep_connection(bss, ies, rsn.as_ref().map(|(p, _)| p.clone()), external)
+            .await?;
+        // ── ieee80211_mgd_auth ──
+        // Open System, or SAE whose PMK feeds the 4-way handshake.
+        let mut pmk = None;
+        match rsn.as_ref() {
+            Some((plan, Credential::Sae(pw))) => {
+                pmk = Some(self.sae_authenticate(bss, plan, pw).await?);
+            }
+            Some((_, Credential::Pmk(p))) => {
+                pmk = Some(*p);
+                self.authenticate(bss.bssid).await?;
+            }
+            None => self.authenticate(bss.bssid).await?,
+        }
+        self.link.as_mut().unwrap().authenticated = true;
+        // ── ieee80211_mgd_assoc ──
+        let plan = rsn.as_ref().map(|(p, _)| p.clone());
+        let resp = self
+            .associate_frames(bss, ies, ssid, plan.as_ref(), user_ies)
+            .await?;
+        if rsn.is_none() && external.is_none_or(|e| !e.control_port.enabled) {
+            // !IEEE80211_STA_CONTROL_PORT: ieee80211_assoc_success moves the
+            // AP to AUTHORIZED before BSS_CHANGED_ASSOC (ath11k only sets
+            // peer->is_authorized; ath11k_bss_assoc then authorizes).
+            self.link.as_mut().unwrap().authorized = true;
+        }
+        self.assoc_success(bss, ies, &resp).await?;
+        if external.is_some() {
+            // The supplicant is userspace's: the port opens on SET_STATION
+            // (or now, without a control port).
+            if self.link.as_ref().unwrap().authorized {
+                self.authorize().await?;
+                self.setup_ps().await;
+            }
+            narf_memory::diag::set_wifi_stage(narf_memory::diag::WifiStage::Connected);
+            return Ok(());
+        }
+        // ── wpa_supplicant ──
+        if let (Some((plan, _)), Some(pmk)) = (rsn, pmk) {
+            self.rsna_4way(bss, &plan, &pmk).await?;
+        }
+        self.authorize().await?;
+        self.setup_ps().await;
+        narf_memory::diag::set_wifi_stage(narf_memory::diag::WifiStage::Connected);
+        Ok(())
+    }
+
+    /// `ieee80211_prep_connection`: the link state, channel context, vdev,
+    /// BSS parameters and the AP's station entry (`sta_info_insert` →
+    /// `ath11k_mac_station_add`).
+    pub(super) async fn prep_connection(
+        &mut self,
+        bss: &ScanBss,
+        ies: &ParsedIes,
+        rsn: Option<RsnPlan>,
+        external: Option<narf_wireless::ExternalSecurity>,
     ) -> Result<(), MacError> {
         let vdev_id = self.vif.as_ref().unwrap().vdev_id;
         let band = freq_band(bss.freq);
@@ -2266,8 +2397,11 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             deauth_reason: frame::WLAN_REASON_DEAUTH_LEAVING,
             ba_rx_valid: 0,
             ba_rx_token: [0; 16],
-            rsn: rsn.as_ref().map(|(p, _)| p.clone()),
+            rsn,
             he: None,
+            external,
+            authenticated: false,
+            last_signal: None,
         });
         self.mfp = MfpState::default();
         // ── ieee80211_prep_connection ──
@@ -2304,37 +2438,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         }
         // sta_info_insert → ath11k_mac_station_add
         self.station_add(bss.bssid, &def).await?;
-        // ── ieee80211_mgd_auth ──
         self.mlme_target = Some(bss.bssid);
-        // Open System, or SAE whose PMK feeds the 4-way handshake.
-        let mut pmk = None;
-        match rsn.as_ref() {
-            Some((plan, Credential::Sae(pw))) => {
-                pmk = Some(self.sae_authenticate(bss, plan, pw).await?);
-            }
-            Some((_, Credential::Pmk(p))) => {
-                pmk = Some(*p);
-                self.authenticate(bss.bssid).await?;
-            }
-            None => self.authenticate(bss.bssid).await?,
-        }
-        // ── ieee80211_mgd_assoc ──
-        let plan = rsn.as_ref().map(|(p, _)| p.clone());
-        let resp = self.associate_frames(bss, ies, ssid, plan.as_ref()).await?;
-        if rsn.is_none() {
-            // !IEEE80211_STA_CONTROL_PORT: ieee80211_assoc_success moves the
-            // AP to AUTHORIZED before BSS_CHANGED_ASSOC (ath11k only sets
-            // peer->is_authorized; ath11k_bss_assoc then authorizes).
-            self.link.as_mut().unwrap().authorized = true;
-        }
-        self.assoc_success(bss, ies, &resp).await?;
-        // ── wpa_supplicant ──
-        if let (Some((plan, _)), Some(pmk)) = (rsn, pmk) {
-            self.rsna_4way(bss, &plan, &pmk).await?;
-        }
-        self.authorize().await?;
-        self.setup_ps().await;
-        narf_memory::diag::set_wifi_stage(narf_memory::diag::WifiStage::Connected);
         Ok(())
     }
 
@@ -2547,6 +2651,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         ies: &ParsedIes,
         ssid: &[u8],
         rsn: Option<&RsnPlan>,
+        user_ies: &[u8],
     ) -> frame::AssocReqParams {
         let band = freq_band(bss.freq);
         let def = self.link.as_ref().map_or(
@@ -2611,11 +2716,21 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             (true, Some(own), Some(ap)) => Some(peer::assoc_vht_cap(own, ap)),
             _ => None,
         };
-        // The SME's elements (wpa_supplicant `sme.assoc_req_ie`): RSNE,
-        // then the RSNXE (it sorts after HE in ieee80211_send_assoc).
-        let mut extra = Vec::new();
-        if let Some(p) = rsn {
-            extra.extend_from_slice(&sec::assoc_ies(p, &bss.ies));
+        // The SME's elements (`assoc_data->ie`): an external supplicant's
+        // as given; for the offloads ours (RSNE, RSNXE: they sort as
+        // ieee80211_send_assoc places them) merged with the non-RSN ones
+        // userspace passed in NL80211_ATTR_IE.
+        let external = self.link.as_ref().is_some_and(|l| l.external.is_some());
+        let mut extra = if external {
+            user_ies.to_vec()
+        } else {
+            ext::merge_sme_ies(rsn.map(|p| sec::assoc_ies(p, &bss.ies)), user_ies)
+        };
+        // SUPPORTS_ONLY_HE_MULTI_BSSID (WCN6855 supports_multi_bssid): an
+        // HE association sets WLAN_EXT_CAPA3_MULTI_BSSID_SUPPORT in the
+        // SME's Extended Capabilities.
+        if mode >= ConnMode::He {
+            ext::set_ext_capa_bit(&mut extra, 2, 1 << 6);
         }
         // ieee80211_put_he_cap for an HE connection.
         let he_cap = (mode >= ConnMode::He)
@@ -2647,18 +2762,10 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         ies: &ParsedIes,
         ssid: &[u8],
         rsn: Option<&RsnPlan>,
+        user_ies: &[u8],
     ) -> Result<Vec<u8>, MacError> {
-        let p = self.assoc_request_params(bss, ies, ssid, rsn);
-        let f = frame::build_assoc_req(&p);
         let resp = self
-            .mlme_exchange(
-                &f,
-                step::ASSOC_TX,
-                step::ASSOC_TIMEOUT,
-                "associate",
-                timeout::MLME_RESPONSE,
-                |r| frame::parse_assoc_resp(r).is_some_and(|a| !a.reassoc),
-            )
+            .associate_exchange(bss, ies, ssid, rsn, user_ies)
             .await?;
         let a = frame::parse_assoc_resp(&resp).unwrap();
         if a.status != frame::WLAN_STATUS_SUCCESS {
@@ -2670,6 +2777,29 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             );
         }
         Ok(resp)
+    }
+
+    /// The (Re)Association Request / Response exchange; the response
+    /// whatever its status.
+    pub(super) async fn associate_exchange(
+        &mut self,
+        bss: &ScanBss,
+        ies: &ParsedIes,
+        ssid: &[u8],
+        rsn: Option<&RsnPlan>,
+        user_ies: &[u8],
+    ) -> Result<Vec<u8>, MacError> {
+        let p = self.assoc_request_params(bss, ies, ssid, rsn, user_ies);
+        let f = frame::build_assoc_req(&p);
+        self.mlme_exchange(
+            &f,
+            step::ASSOC_TX,
+            step::ASSOC_TIMEOUT,
+            "associate",
+            timeout::MLME_RESPONSE,
+            |r| frame::parse_assoc_resp(r).is_some_and(|a| !a.reassoc),
+        )
+        .await
     }
 
     /// `ieee80211_assoc_success`: the AP station's capabilities, QoS
@@ -2743,7 +2873,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         }
         sta.wme = rie.wmm_param.is_some();
         // ieee80211_assoc_success: WLAN_STA_MFP from assoc_data->use_mfp.
-        sta.mfp = l.rsn.as_ref().is_some_and(|r| r.mfp);
+        sta.mfp = l.rsn.as_ref().is_some_and(|r| r.mfp) || l.external.is_some_and(|e| e.use_mfp);
         self.dp.set_sta_wme(bss.bssid, sta.wme);
         {
             let lk = self.link.as_mut().unwrap();
@@ -3023,7 +3153,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
     /// once the AP is authorized and a beacon was seen
     /// (`ieee80211_powersave_allowed`).
     async fn setup_ps(&mut self) {
-        if !self.cfg.supports_sta_ps || !self.cfg.powersave {
+        if !self.cfg.supports_sta_ps || !self.powersave {
             return;
         }
         let ok = self
@@ -3080,11 +3210,14 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         if self.link.is_none() {
             return Ok(());
         }
+        let bssid = self.link.as_ref().map_or([0; 6], |l| l.bss.bssid);
         self.teardown(true, frame::WLAN_REASON_DEAUTH_LEAVING).await;
         // cfg80211_disconnect → ieee80211_mgd_deauth → the frame we sent.
         self.disconnect = Some(Disconnect {
             reason: frame::WLAN_REASON_DEAUTH_LEAVING,
             from_ap: false,
+            deauth: true,
+            bssid,
         });
         Ok(())
     }
@@ -3177,6 +3310,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         self.mlme_target = None;
         self.sup = None;
         self.mfp = MfpState::default();
+        self.ext_keys = ext::ExtKeys::default();
     }
 
     /// `ath11k_mac_vdev_stop`.

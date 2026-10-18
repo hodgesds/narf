@@ -2,6 +2,10 @@
 
 mod control;
 
+pub use control::station::{
+    control_port_over_nl80211, notify_mlme_disconnect, notify_mlme_frame, rx_control_port,
+};
+
 extern crate alloc;
 
 use alloc::vec::Vec;
@@ -117,6 +121,12 @@ fn interface_attrs(index: u32, info: &crate::WirelessIfaceInfo, iftype: u32) -> 
     push_attr(&mut attrs, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
     named_attr(&mut attrs, NL80211_ATTR_IFNAME, &info.base_name);
     push_attr(&mut attrs, NL80211_ATTR_IFTYPE, &iftype.to_ne_bytes());
+    // nl80211_send_iface: NL80211_ATTR_WDEV = wdev_id(wdev) (u64).
+    push_attr(
+        &mut attrs,
+        NL80211_ATTR_WDEV,
+        &control::station::wdev_id(index).to_ne_bytes(),
+    );
     push_attr(&mut attrs, NL80211_ATTR_MAC, &info.base_mac);
     attrs
 }
@@ -234,6 +244,14 @@ fn wiphy_attrs(
             127, // EXTERNAL_AUTH
         ]);
     }
+    // An external-supplicant driver has `add_key` (CMD(add_key, NEW_KEY)).
+    if iface.is_some_and(|iface| iface.supports_external_supplicant()) {
+        command_list.push(11); // NEW_KEY
+    }
+    // `set_power_mgmt`.
+    if iface.is_some_and(|iface| iface.power_save_default().is_some()) {
+        command_list.push(61); // SET_POWER_SAVE
+    }
     // An AP-capable driver advertises the beacon + station-table commands.
     if iface.is_some_and(|iface| iface.supports_ap()) {
         command_list.extend_from_slice(&[
@@ -255,6 +273,45 @@ fn wiphy_attrs(
         &commands,
     );
     attrs
+}
+
+/// A wiphy's ciphers and the features wpa_supplicant keys its driver
+/// mode off (`wpa_driver_nl80211_get_info`): `NL80211_ATTR_CIPHER_SUITES`,
+/// `NL80211_ATTR_FEATURE_FLAGS` (SAE with userspace MLME) and
+/// `NL80211_ATTR_EXT_FEATURES` (a little-endian bitmap). A driver whose SME
+/// runs in userspace never advertises the handshake offloads: with
+/// `WPA_DRIVER_FLAGS_SME` wpa_supplicant passes no PMK, yet with
+/// `4WAY_HANDSHAKE_STA_PSK` it would also ignore EAPOL.
+fn wiphy_security_attrs(attrs: &mut Vec<u8>, iface: &dyn crate::WirelessNetIface) {
+    let suites = control::station::cipher_suites(iface);
+    if !suites.is_empty() {
+        let raw: Vec<u8> = suites.iter().flat_map(|c| c.to_ne_bytes()).collect();
+        push_attr(attrs, 57, &raw);
+    }
+    let sme = iface.supports_userspace_mlme();
+    let external = iface.supports_external_supplicant();
+    if sme && external {
+        // NL80211_FEATURE_SAE: SAE over AUTHENTICATE.
+        push_attr(attrs, 143, &(1u32 << 5).to_ne_bytes());
+    }
+    let mut bits: Vec<u32> = Vec::new();
+    if iface.supports_handshake_offload() && !sme {
+        bits.push(15); // 4WAY_HANDSHAKE_STA_PSK
+    }
+    if iface.supports_sae_offload() && !sme {
+        bits.push(38); // SAE_OFFLOAD
+    }
+    if external {
+        bits.push(26); // CONTROL_PORT_OVER_NL80211
+        bits.push(42); // CONTROL_PORT_NO_PREAUTH
+    }
+    if let Some(max) = bits.iter().max() {
+        let mut ext = alloc::vec![0u8; (*max as usize) / 8 + 1];
+        for bit in bits {
+            ext[bit as usize / 8] |= 1 << (bit % 8);
+        }
+        push_attr(attrs, 217, &ext);
+    }
 }
 
 fn handle(command: u8, attrs: &[u8], dump: bool) -> Result<Vec<GenlReply>, i32> {
@@ -368,23 +425,7 @@ fn handle_in(command: u8, attrs: &[u8], dump: bool, namespace: u64) -> Result<Ve
                         &iface.get_wireless_info(),
                         Some(iface.as_ref()),
                     );
-                    let psk = iface.supports_handshake_offload();
-                    let sae = iface.supports_sae_offload();
-                    if psk || sae {
-                        // CCMP (00-0F-AC:4) is the pairwise cipher for both
-                        // WPA2-PSK and WPA3-SAE Personal.
-                        push_attr(&mut attrs, 57, &0x000fac04u32.to_ne_bytes());
-                        // NL80211_ATTR_EXT_FEATURES is a little-endian bitmap:
-                        // bit 15 = 4WAY_HANDSHAKE_STA_PSK, bit 38 = SAE_OFFLOAD.
-                        let mut ext = alloc::vec![0u8; if sae { 5 } else { 2 }];
-                        if psk {
-                            ext[1] |= 0x80; // bit 15
-                        }
-                        if sae {
-                            ext[4] |= 0x40; // bit 38
-                        }
-                        push_attr(&mut attrs, 217, &ext);
-                    }
+                    wiphy_security_attrs(&mut attrs, iface.as_ref());
                     GenlReply {
                         command: NL80211_CMD_NEW_WIPHY,
                         attrs,
@@ -487,6 +528,17 @@ pub(crate) const OPERATIONS: &[GenlOperation] = &[
     op(18, DO, UNS), // SET_STATION
     op(19, DO, UNS), // NEW_STATION
     op(20, DO, UNS), // DEL_STATION
+    // External-supplicant station commands.
+    op(10, DO, UNS),         // SET_KEY
+    op(11, DO, UNS),         // NEW_KEY
+    op(12, DO, UNS),         // DEL_KEY
+    op(52, DO, UNS),         // SET_PMKSA
+    op(53, DO, UNS),         // DEL_PMKSA
+    op(54, DO, UNS),         // FLUSH_PMKSA
+    op(129, DO, UNS),        // CONTROL_PORT_FRAME
+    op(61, DO, UNS),         // SET_POWER_SAVE
+    op(62, DO, OPEN),        // GET_POWER_SAVE
+    op(31, DO | DUMP, OPEN), // GET_REG
 ];
 /// `nl80211_mcgrps`, in Linux's order. None carries `GENL_MCAST_CAP_*`, so
 /// `genl_bind` lets any socket join any of them. NARF publishes on config,
@@ -532,6 +584,8 @@ pub fn register() -> bool {
     if registered {
         let _ =
             narf_net::netlink_generic::register_context_handler(NL80211_FAMILY_ID, control::handle);
+        // nl80211_netlink_notifier.
+        narf_net::netlink_generic::register_release_notifier(control::station::release);
     }
     registered
 }

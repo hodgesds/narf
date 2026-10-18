@@ -862,8 +862,31 @@ fn test_open_stop(_name: &str, up: bool) {
 
 static DISC_SEEN: IrqSafeSpinLock<Vec<(u16, bool)>> = IrqSafeSpinLock::new(Vec::new());
 
-fn disc_sink(_name: &str, d: super::mac::Disconnect) {
+fn disc_sink(name: &str, d: super::mac::Disconnect, own: &[u8; 6]) {
     DISC_SEEN.lock().push((d.reason, d.from_ap));
+    MLME_SEEN.lock().push(d.frame(own));
+    // What the hardware netdev does: the nl80211 DEAUTHENTICATE /
+    // DISASSOCIATE + DISCONNECT pair.
+    narf_wireless::nl80211::notify_mlme_disconnect(name, &d.frame(own), *own);
+}
+
+/// Deauthentication / Disassociation frames reported to cfg80211.
+static MLME_SEEN: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
+
+fn mlme_tx_sink(name: &str, f: &[u8]) {
+    MLME_SEEN.lock().push(f.to_vec());
+    narf_wireless::nl80211::notify_mlme_frame(name, f);
+}
+
+/// Control-port frames handed to cfg80211: (src, proto, PDU, unencrypted).
+type CtrlRx = ([u8; 6], u16, Vec<u8>, bool);
+static CTRL_SEEN: IrqSafeSpinLock<Vec<CtrlRx>> = IrqSafeSpinLock::new(Vec::new());
+
+fn control_port_sink(name: &str, src: [u8; 6], proto: u16, pdu: &[u8], unencrypted: bool) -> bool {
+    CTRL_SEEN
+        .lock()
+        .push((src, proto, pdu.to_vec(), unencrypted));
+    narf_wireless::nl80211::rx_control_port(name, src, proto, pdu, unencrypted)
 }
 
 fn test_send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
@@ -955,6 +978,8 @@ fn up_down_caps(
             link: link_sink,
             admin: admin_sink,
             disconnected: disc_sink,
+            mlme_tx: mlme_tx_sink,
+            control_port: control_port_sink,
         },
     );
     let netdev = Arc::new(nd);
@@ -988,6 +1013,7 @@ fn wpa2_req() -> AssociateRequest {
         ssid: SSID.to_vec(),
         channel: 6,
         security: SecurityConfig::Wpa2 { psk: PMK },
+        ie: Vec::new(),
     }
 }
 
@@ -1002,7 +1028,7 @@ fn scan6(u: &Up) -> Result<Vec<narf_wireless::BssInfo>, &'static str> {
 
 fn connect(u: &Up) -> R {
     scan6(u)?;
-    let (r, err, _, stage) = latched(|| run(u.netdev.associate(wpa2_req())));
+    let (r, err, _, stage) = latched(|| run(u.netdev.associate_kernel(wpa2_req())));
     ensure!(r.is_ok() && err == 0, "WPA2 associate");
     ensure!(
         stage == narf_memory::diag::WifiStage::Connected,
@@ -4173,6 +4199,7 @@ fn sae_req() -> AssociateRequest {
         security: SecurityConfig::Wpa3 {
             password: SAE_PW.to_vec(),
         },
+        ie: Vec::new(),
     }
 }
 
@@ -4672,6 +4699,7 @@ fn smoke_ath11k_int_he_connect() -> TestResult {
             ssid: SSID.to_vec(),
             channel: 6,
             security: SecurityConfig::Open,
+            ie: Vec::new(),
         };
         let (r, err, _, _) = latched(|| run(u.netdev.associate(req)));
         ensure!(r.is_ok() && err == 0, "HE associate");
@@ -4898,3 +4926,6 @@ fn smoke_ath11k_int_ptk_rekey() -> TestResult {
     })
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_ptk_rekey);
+
+#[path = "supplicant_tests.rs"]
+mod supplicant;

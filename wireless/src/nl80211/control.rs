@@ -18,10 +18,19 @@ use zeroize::Zeroizing;
 #[path = "control_tests.rs"]
 mod tests;
 
+#[path = "station.rs"]
+pub(super) mod station;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "station_tests.rs"]
+mod station_tests;
+
 const EINVAL: i32 = 22;
 const EPERM: i32 = 1;
 const EBUSY: i32 = 16;
 const ENOENT: i32 = 2;
+const ERANGE: i32 = 34;
+const EALREADY: i32 = 114;
 const SCAN: u8 = 33;
 const GET_SCAN: u8 = 32;
 const CONNECT: u8 = 46;
@@ -77,6 +86,10 @@ enum Operation {
         bssid: Option<[u8; 6]>,
         channel: Option<u32>,
         cred: Credential,
+        /// NL80211_ATTR_IE (the SME's association elements).
+        ie: Vec<u8>,
+        /// The sender, when NL80211_ATTR_SOCKET_OWNER was set.
+        owner: Option<u32>,
     },
     Disconnect,
 }
@@ -88,6 +101,8 @@ enum Credential {
     Open,
     Psk(Zeroizing<[u8; 32]>),
     Sae(Zeroizing<Vec<u8>>),
+    /// No PMK / SAE password: the supplicant runs in userspace.
+    External(crate::ExternalSecurity),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -95,6 +110,8 @@ enum Akm {
     Open,
     Psk,
     Sae,
+    /// Any protected BSS (the supplicant chose the AKM).
+    Rsn,
 }
 
 impl Credential {
@@ -103,6 +120,7 @@ impl Credential {
             Credential::Open => Akm::Open,
             Credential::Psk(_) => Akm::Psk,
             Credential::Sae(_) => Akm::Sae,
+            Credential::External(_) => Akm::Rsn,
         }
     }
 }
@@ -234,7 +252,9 @@ const CONNECT_ATTRS: &[u16] = &[
     204, // SOCKET_OWNER
     254, // PMK (PSK 4-way handshake offload)
     261, // EXTERNAL_AUTH_SUPPORT
+    264, // CONTROL_PORT_OVER_NL80211
     277, // SAE_PASSWORD (SAE offload)
+    286, // CONTROL_PORT_NO_PREAUTH
     298, // SAE_PWE
     315, // MLO_SUPPORT
 ];
@@ -263,9 +283,60 @@ fn connect_side_attrs(attrs: &[(u16, &[u8])]) -> Result<(), i32> {
     if attr(attrs, 261).is_some() && attr(attrs, 204).is_none() {
         return Err(EINVAL);
     }
-    // Without WIPHY_FLAG_CONTROL_PORT_PROTOCOL only ETH_P_PAE is accepted.
-    if u16_attr(attrs, 102)?.is_some_and(|proto| proto != 0x888e) {
-        return Err(EINVAL);
+    Ok(())
+}
+
+/// The control-port part of `nl80211_crypto_settings`: without
+/// WIPHY_FLAG_CONTROL_PORT_PROTOCOL only ETH_P_PAE (-EINVAL), and
+/// CONTROL_PORT_OVER_NL80211 (`validate_pae_over_nl80211`) needs
+/// SOCKET_OWNER (-EINVAL) and the ext feature (-EOPNOTSUPP).
+fn control_port(attrs: &[(u16, &[u8])], over_nl80211_ok: bool) -> Result<crate::ControlPort, i32> {
+    let mut port = crate::ControlPort {
+        enabled: attr(attrs, 68).is_some(),
+        ..crate::ControlPort::default()
+    };
+    if let Some(proto) = u16_attr(attrs, 102)? {
+        if proto != crate::ETH_P_PAE {
+            return Err(EINVAL);
+        }
+        port.no_encrypt = attr(attrs, 103).is_some();
+    }
+    if attr(attrs, 264).is_some() {
+        if attr(attrs, 204).is_none() {
+            return Err(EINVAL);
+        }
+        if !over_nl80211_ok {
+            return Err(EOPNOTSUPP);
+        }
+        port.over_nl80211 = true;
+        port.no_preauth = attr(attrs, 286).is_some();
+    }
+    Ok(port)
+}
+
+/// The ciphers / AKMs of `nl80211_crypto_settings` against the wiphy's
+/// cipher suites (`cfg80211_supported_cipher_suite`, -EINVAL).
+fn crypto_suites(attrs: &[(u16, &[u8])], suites: &[u32]) -> Result<(), i32> {
+    if let Some(raw) = attr(attrs, 73) {
+        if raw.len() % 4 != 0 || raw.len() > 4 {
+            return Err(EINVAL); // cipher_limit 1
+        }
+        for c in raw.chunks_exact(4) {
+            if !suites.contains(&u32::from_ne_bytes(c.try_into().unwrap())) {
+                return Err(EINVAL);
+            }
+        }
+    }
+    if let Some(group) = u32_attr(attrs, 74)? {
+        if !suites.contains(&group) {
+            return Err(EINVAL);
+        }
+    }
+    if let Some(raw) = attr(attrs, 76) {
+        // NL80211_MAX_NR_AKM_SUITES (max_num_akm_suites default).
+        if raw.len() % 4 != 0 || raw.len() / 4 > 2 {
+            return Err(EINVAL);
+        }
     }
     Ok(())
 }
@@ -329,12 +400,50 @@ fn scan_flags(flags: u32) -> Result<(), i32> {
     Ok(())
 }
 
+/// What a wiphy offers the CONNECT parser.
+#[derive(Clone, Copy, Default)]
+struct ConnectCaps {
+    psk_offload: bool,
+    sae_offload: bool,
+    external: bool,
+}
+
+impl ConnectCaps {
+    fn of(iface: &dyn crate::WirelessNetIface) -> Self {
+        ConnectCaps {
+            psk_offload: iface.supports_handshake_offload(),
+            sae_offload: iface.supports_sae_offload(),
+            external: iface.supports_external_supplicant(),
+        }
+    }
+}
+
+#[allow(dead_code)]
 fn parse_operation(
     command: u8,
     attrs: &[(u16, &[u8])],
     psk_offload: bool,
     sae_offload: bool,
 ) -> Result<Operation, i32> {
+    parse_operation_caps(
+        command,
+        attrs,
+        ConnectCaps {
+            psk_offload,
+            sae_offload,
+            external: false,
+        },
+        0,
+    )
+}
+
+fn parse_operation_caps(
+    command: u8,
+    attrs: &[(u16, &[u8])],
+    caps: ConnectCaps,
+    portid: u32,
+) -> Result<Operation, i32> {
+    let (psk_offload, sae_offload) = (caps.psk_offload, caps.sae_offload);
     let allowed: &[u16] = match command {
         // 158 = NL80211_ATTR_SCAN_FLAGS, 42 = NL80211_ATTR_IE (probe IEs).
         SCAN => &[3, 42, 44, 45, 158],
@@ -388,6 +497,7 @@ fn parse_operation(
         }
         CONNECT => {
             connect_side_attrs(attrs)?;
+            let port = control_port(attrs, caps.external)?;
             let ssid = attr(attrs, 52).ok_or(EINVAL)?;
             if ssid.is_empty() || ssid.len() > 32 {
                 return Err(EINVAL);
@@ -400,9 +510,36 @@ fn parse_operation(
             }
             let channel = u32_attr(attrs, 38)?.map(channel).transpose()?;
             // 53 = NL80211_ATTR_AUTH_TYPE (0 = OPEN_SYSTEM, 4 = SAE),
-            // 66 = NL80211_ATTR_USE_MFP (2 = REQUIRED).
+            // 66 = NL80211_ATTR_USE_MFP (enum nl80211_mfp: NO 0, REQUIRED 1,
+            // OPTIONAL 2). OPTIONAL needs NL80211_EXT_FEATURE_MFP_OPTIONAL,
+            // which no NARF wiphy has (mac80211 does not set it either).
             let auth = u32_attr(attrs, 53)?.unwrap_or(0);
             let mfp = u32_attr(attrs, 66)?.unwrap_or(0);
+            if mfp > 2 {
+                return Err(ERANGE);
+            }
+            if mfp == 2 {
+                return Err(EOPNOTSUPP);
+            }
+            let suites: &[u32] = if caps.external {
+                &[crate::CIPHER_SUITE_CCMP, crate::CIPHER_SUITE_AES_CMAC]
+            } else if psk_offload || sae_offload {
+                &[crate::CIPHER_SUITE_CCMP]
+            } else {
+                &[]
+            };
+            crypto_suites(attrs, suites)?;
+            // nl80211_crypto_settings: a PMK needs 32 octets and the
+            // 4WAY_HANDSHAKE_STA_PSK ext feature, a SAE password the
+            // SAE_OFFLOAD ext feature (-EINVAL).
+            if let Some(pmk) = attr(attrs, 254) {
+                if pmk.len() != 32 || !psk_offload {
+                    return Err(EINVAL);
+                }
+            }
+            if attr(attrs, 277).is_some() && !sae_offload {
+                return Err(EINVAL);
+            }
             // CCMP (00-0F-AC:4) pairwise+group are required for every offload
             // suite this profile accepts.
             let ccmp = u32_attr(attrs, 73)? == Some(0x000fac04)
@@ -412,7 +549,7 @@ fn parse_operation(
                 // (00-0F-AC:8), CCMP, and mandatory management-frame protection.
                 if !sae_offload
                     || auth != 4
-                    || mfp != 2
+                    || mfp != 1
                     || !ccmp
                     || u32_attr(attrs, 75)? != Some(2)
                     || u32_attr(attrs, 76)? != Some(0x000fac08)
@@ -439,6 +576,27 @@ fn parse_operation(
                     psk_association_ies(ie)?;
                 }
                 Credential::Psk(Zeroizing::new(pmk.try_into().map_err(|_| EINVAL)?))
+            } else if caps.external
+                && (attr(attrs, 70).is_some()
+                    || u32_attr(attrs, 75)?.unwrap_or(0) != 0
+                    || attr(attrs, 76).is_some()
+                    || attr(attrs, 73).is_some()
+                    || attr(attrs, 42)
+                        .map(elements)
+                        .transpose()?
+                        .is_some_and(|ies| ies.iter().any(|(id, _)| *id == 48)))
+            {
+                // No PMK / SAE password on a protected network: the
+                // supplicant runs the handshake. Open System only: SAE over
+                // CONNECT would need the external-auth flow.
+                if auth != 0 {
+                    return Err(EOPNOTSUPP);
+                }
+                Credential::External(crate::ExternalSecurity {
+                    use_mfp: mfp == 1,
+                    privacy: true,
+                    control_port: port,
+                })
             } else {
                 // Open: no security negotiation, no MFP, no RSN element.
                 if auth != 0
@@ -457,15 +615,24 @@ fn parse_operation(
                 }
                 Credential::Open
             };
+            if let Some(ie) = attr(attrs, 42) {
+                elements(ie)?;
+            }
             Ok(Operation::Connect {
                 ssid: ssid.to_vec(),
                 bssid,
                 channel,
                 cred,
+                ie: attr(attrs, 42).unwrap_or(&[]).to_vec(),
+                owner: attr(attrs, 204).is_some().then_some(portid),
             })
         }
         DISCONNECT => {
             if attr(attrs, 54).is_some_and(|b| b.len() != 2) {
+                return Err(EINVAL);
+            }
+            // "Reason Code 0 is reserved" (default DEAUTH_LEAVING).
+            if u16_attr(attrs, 54)? == Some(0) {
                 return Err(EINVAL);
             }
             Ok(Operation::Disconnect)
@@ -491,6 +658,24 @@ pub(super) fn handle(
             | EXTERNAL_AUTH
     ) {
         return mlme_handle(command, bytes, context);
+    }
+    if matches!(
+        command,
+        station::NEW_KEY
+            | station::SET_KEY
+            | station::DEL_KEY
+            | station::SET_PMKSA
+            | station::DEL_PMKSA
+            | station::FLUSH_PMKSA
+            | station::CONTROL_PORT_FRAME
+            | station::SET_POWER_SAVE
+            | station::GET_POWER_SAVE
+    ) || command == SET_STATION && station_iface(bytes, context.net_ns_id)
+    {
+        return station_handle(command, bytes, context);
+    }
+    if command == station::GET_REG {
+        return station::get_reg(bytes, dump, context.net_ns_id);
     }
     if matches!(
         command,
@@ -533,11 +718,14 @@ pub(super) fn handle(
         return Err(EOPNOTSUPP);
     }
     let admin = authority(&context, iface.as_ref())?;
-    let operation = parse_operation(
+    if command == DISCONNECT {
+        station::check_owner(iface.name(), context.portid)?;
+    }
+    let operation = parse_operation_caps(
         command,
         &attrs,
-        iface.supports_handshake_offload(),
-        iface.supports_sae_offload(),
+        ConnectCaps::of(iface.as_ref()),
+        context.portid,
     )?;
     let name = String::from(iface.name());
     {
@@ -562,11 +750,67 @@ pub(super) fn handle(
     }
     let guard = OperationGuard(name);
     let namespace = context.net_ns_id;
+    match &operation {
+        // nl80211_connect: `if (!err && SOCKET_OWNER) conn_owner_nlportid =
+        // snd_portid` — before any EAPOL of the association can arrive.
+        Operation::Connect {
+            owner, cred, bssid, ..
+        } => {
+            if let Some(portid) = owner {
+                station::set_owner(iface.name(), namespace, *portid, *bssid);
+            }
+            let over = matches!(cred, Credential::External(e) if e.control_port.over_nl80211);
+            station::set_control_port(iface.name(), namespace, over);
+        }
+        // cfg80211_disconnect: the owner goes first.
+        Operation::Disconnect => station::clear_owner(iface.name()),
+        Operation::Scan(_) => {}
+    }
     narf_scheduler::spawn(async move {
         let _guard = guard;
         execute(iface, admin, namespace, index, operation).await;
     });
     Ok(Vec::new()) // generic netlink emits the requested ACK
+}
+
+/// Does SET_STATION name a station-type interface (the external-supplicant
+/// port authorization) rather than an AP's station table?
+fn station_iface(bytes: &[u8], namespace: u64) -> bool {
+    attributes(bytes)
+        .ok()
+        .and_then(|attrs| netdev_from_attrs(&attrs, namespace).ok())
+        .is_some_and(|(_, iface)| matches!(iface.current_iftype(), 2 | 8))
+}
+
+/// The external-supplicant station commands: `nl80211_pre_doit`
+/// (NEED_NETDEV / NEED_NETDEV_UP: -EINVAL / -ENODEV / -ENETDOWN), the
+/// delegated-handle check for the mutating ones, then the command.
+fn station_handle(
+    command: u8,
+    bytes: &[u8],
+    context: RequestContext<'_>,
+) -> Result<Vec<GenlReply>, i32> {
+    let attrs = attributes(bytes)?;
+    let (_, iface) = netdev_from_attrs(&attrs, context.net_ns_id)?;
+    if command == station::GET_POWER_SAVE {
+        return station::power_save(command, iface, &attrs, context.net_ns_id);
+    }
+    if command != station::SET_POWER_SAVE {
+        station::netdev_up(iface.as_ref())?;
+    }
+    let _admin = authority(&context, iface.as_ref())?;
+    match command {
+        station::NEW_KEY => station::new_key(iface, &attrs),
+        station::SET_KEY => station::set_key(iface, &attrs),
+        station::DEL_KEY => station::del_key(iface, &attrs),
+        SET_STATION => station::set_station(iface, &attrs),
+        station::SET_PMKSA | station::DEL_PMKSA | station::FLUSH_PMKSA => {
+            station::pmksa(command, iface.as_ref(), &attrs)
+        }
+        station::CONTROL_PORT_FRAME => station::tx_control_port(iface, &attrs, &context),
+        station::SET_POWER_SAVE => station::power_save(command, iface, &attrs, context.net_ns_id),
+        _ => Err(EOPNOTSUPP),
+    }
 }
 
 /// The netdev a request names by NL80211_ATTR_IFINDEX in the sender's
@@ -659,9 +903,12 @@ fn interface_handle(
                 .and_then(|c| c.results.iter().find(|(bss, _)| bss.bssid == peer))
                 .map(|(bss, _)| bss.rssi);
             let mut info = Vec::new();
-            if let Some(signal) = signal {
+            let tracked = iface.station_info().unwrap_or_default();
+            // The driver's last-frame signal, else the AP's scan record.
+            if let Some(signal) = tracked.signal_dbm.or(signal) {
                 push_attr(&mut info, 7, &[signal as u8]); // NL80211_STA_INFO_SIGNAL
             }
+            sta_info_attrs(&mut info, &tracked);
             let mut attrs = Vec::new();
             push_attr(&mut attrs, 3, &index.to_ne_bytes());
             push_attr(&mut attrs, 6, &peer);
@@ -673,6 +920,66 @@ fn interface_handle(
             }])
         }
         _ => Err(EOPNOTSUPP),
+    }
+}
+
+/// `nl80211_put_sta_rate`: BITRATE (u16, when it fits), BITRATE32, then
+/// the MCS / width / GI attributes of the rate's kind.
+fn put_sta_rate(out: &mut Vec<u8>, kind: u16, r: &crate::RateInfo) {
+    let mut rate = Vec::new();
+    if r.bitrate_100kbps > 0 {
+        if r.bitrate_100kbps <= u16::MAX as u32 {
+            push_attr(&mut rate, 1, &(r.bitrate_100kbps as u16).to_ne_bytes());
+        }
+        push_attr(&mut rate, 5, &r.bitrate_100kbps.to_ne_bytes());
+    }
+    match r.width_mhz {
+        40 => push_attr(&mut rate, 3, &[]),
+        80 => push_attr(&mut rate, 8, &[]),
+        160 => push_attr(&mut rate, 9, &[]),
+        _ => {}
+    }
+    if let Some(mcs) = r.ht_mcs {
+        push_attr(&mut rate, 2, &[mcs]);
+        if r.short_gi {
+            push_attr(&mut rate, 4, &[]);
+        }
+    } else if let Some((mcs, nss)) = r.vht_mcs {
+        push_attr(&mut rate, 6, &[mcs]);
+        push_attr(&mut rate, 7, &[nss]);
+        if r.short_gi {
+            push_attr(&mut rate, 4, &[]);
+        }
+    } else if let Some((mcs, nss, gi)) = r.he_mcs {
+        push_attr(&mut rate, 13, &[mcs]);
+        push_attr(&mut rate, 14, &[nss]);
+        push_attr(&mut rate, 15, &[gi]);
+    }
+    push_attr(out, kind | NLA_F_NESTED, &rate);
+}
+
+/// The STA_INFO members a driver tracks (`nl80211_send_station`).
+fn sta_info_attrs(info: &mut Vec<u8>, s: &crate::StationInfo) {
+    if let Some(v) = s.rx_packets {
+        push_attr(info, 9, &v.to_ne_bytes());
+    }
+    if let Some(v) = s.tx_packets {
+        push_attr(info, 10, &v.to_ne_bytes());
+    }
+    if let Some(v) = s.tx_failed {
+        push_attr(info, 12, &v.to_ne_bytes());
+    }
+    if let Some(v) = s.signal_avg_dbm {
+        push_attr(info, 13, &[v as u8]);
+    }
+    if let Some(r) = s.tx_bitrate.as_ref() {
+        put_sta_rate(info, 8, r);
+    }
+    if let Some(r) = s.rx_bitrate.as_ref() {
+        put_sta_rate(info, 14, r);
+    }
+    if let Some(v) = s.ack_signal_dbm {
+        push_attr(info, 34, &[v as u8]);
     }
 }
 
@@ -715,12 +1022,30 @@ fn publish_mlme_frame(
     command: u8,
     frame: &[u8],
 ) {
+    publish_mlme_frame_ie(iface, ns, index, command, frame, &[]);
+}
+
+/// `nl80211_send_mlme_event`: WIPHY, IFINDEX, FRAME, REQ_IE (when given).
+fn publish_mlme_frame_ie(
+    iface: &dyn crate::WirelessNetIface,
+    ns: u64,
+    index: u32,
+    command: u8,
+    frame: &[u8],
+    req_ie: &[u8],
+) {
     if !super::in_namespace(iface, ns) {
         return;
     }
     let mut attrs = Vec::new();
+    if let Some(wiphy) = wiphy_index(iface) {
+        push_attr(&mut attrs, 1, &wiphy.to_ne_bytes());
+    }
     push_attr(&mut attrs, 3, &index.to_ne_bytes());
     push_attr(&mut attrs, 51, frame); // NL80211_ATTR_FRAME
+    if !req_ie.is_empty() {
+        push_attr(&mut attrs, 77, req_ie); // NL80211_ATTR_REQ_IE
+    }
     publish_event(NL80211_FAMILY_ID, 19, ns, GenlReply { command, attrs });
 }
 
@@ -751,23 +1076,64 @@ enum MlmeExec {
 async fn run_mlme(iface: Arc<dyn crate::WirelessNetIface>, ns: u64, index: u32, exec: MlmeExec) {
     match exec {
         MlmeExec::Authenticate(request) => {
-            if let Ok(frame) = iface.mlme_authenticate(request).await {
-                publish_mlme_frame(iface.as_ref(), ns, index, AUTHENTICATE, &frame);
+            let peer = request.peer;
+            match iface.mlme_authenticate(request).await {
+                // cfg80211_rx_mlme_mgmt → nl80211_send_rx_auth.
+                Ok(frame) => publish_mlme_frame(iface.as_ref(), ns, index, AUTHENTICATE, &frame),
+                // cfg80211_auth_timeout.
+                Err(crate::WirelessError::Timeout) => {
+                    publish_mlme_timeout(iface.as_ref(), ns, index, AUTHENTICATE, peer)
+                }
+                Err(_) => {}
             }
         }
         MlmeExec::Associate(request) => {
-            if let Ok(frame) = iface.mlme_associate(request).await {
-                publish_mlme_frame(iface.as_ref(), ns, index, ASSOCIATE, &frame);
+            let peer = request.peer;
+            let req_ie = request.ie.clone();
+            match iface.mlme_associate(request).await {
+                // cfg80211_rx_assoc_resp: the frame (+ REQ_IE), then the
+                // connect result from its status code.
+                Ok(frame) => {
+                    publish_mlme_frame_ie(iface.as_ref(), ns, index, ASSOCIATE, &frame, &req_ie);
+                    let status = frame
+                        .get(26..28)
+                        .map_or(1, |s| u16::from_le_bytes([s[0], s[1]]));
+                    let resp_ie = frame.get(30..).unwrap_or(&[]);
+                    if status != 0 {
+                        station::clear_owner(iface.name());
+                    }
+                    publish_connect_result(
+                        iface.as_ref(),
+                        ns,
+                        index,
+                        peer,
+                        status,
+                        &req_ie,
+                        resp_ie,
+                    );
+                }
+                Err(crate::WirelessError::Timeout) => {
+                    publish_mlme_timeout(iface.as_ref(), ns, index, ASSOCIATE, peer)
+                }
+                // cfg80211_abandon_assoc: no event.
+                Err(_) => {}
             }
         }
         MlmeExec::Deauthenticate { peer, reason } => {
+            // A driver that reports its own disconnects emits the
+            // DEAUTHENTICATE + DISCONNECT pair of its teardown
+            // ([`station::notify_mlme_disconnect`]) itself.
             if let Ok(frame) = iface.mlme_deauthenticate(peer, reason).await {
-                publish_mlme_frame(iface.as_ref(), ns, index, DEAUTHENTICATE, &frame);
+                if !iface.reports_disconnect_events() {
+                    publish_mlme_frame(iface.as_ref(), ns, index, DEAUTHENTICATE, &frame);
+                }
             }
         }
         MlmeExec::Disassociate { peer, reason } => {
             if let Ok(frame) = iface.mlme_disassociate(peer, reason).await {
-                publish_mlme_frame(iface.as_ref(), ns, index, DISASSOCIATE, &frame);
+                if !iface.reports_disconnect_events() {
+                    publish_mlme_frame(iface.as_ref(), ns, index, DISASSOCIATE, &frame);
+                }
             }
         }
         MlmeExec::MgmtTx { cookie, request } => {
@@ -818,12 +1184,20 @@ fn mlme_handle(
         })
         .ok_or(ENODEV)?;
     let _admin = authority(&context, iface.as_ref())?;
+    let ns = context.net_ns_id;
+    if matches!(
+        command,
+        AUTHENTICATE | ASSOCIATE | DEAUTHENTICATE | DISASSOCIATE
+    ) {
+        // NL80211_FLAG_NEED_NETDEV_UP; each op then checks its driver op.
+        station::netdev_up(iface.as_ref())?;
+        return sme_command(command, iface, index, &attrs, &context);
+    }
     // cfg80211 rejects these on a driver that offloads its SME (-EOPNOTSUPP
     // before the op is attempted).
     if !iface.supports_userspace_mlme() {
         return Err(EOPNOTSUPP);
     }
-    let ns = context.net_ns_id;
     match command {
         REGISTER_FRAME => {
             reject_unknown(&attrs, &[3, 91, 101])?;
@@ -879,67 +1253,281 @@ fn mlme_handle(
             ));
             Ok(Vec::new())
         }
+        AUTHENTICATE | ASSOCIATE | DEAUTHENTICATE | DISASSOCIATE => {
+            sme_command(command, iface, index, &attrs, &context)
+        }
+        _ => Err(EOPNOTSUPP),
+    }
+}
+
+/// The scan-cache entry `cfg80211_get_bss(chan, bssid, ssid, ESS,
+/// PRIVACY_ANY)` finds (-ENOENT when there is none).
+fn cached_bss(
+    iface: &dyn crate::WirelessNetIface,
+    ns: u64,
+    bssid: [u8; 6],
+    channel: u32,
+    ssid: &[u8],
+) -> Result<crate::BssInfo, i32> {
+    CACHE
+        .lock()
+        .iter()
+        .find(|c| c.name == iface.name() && c.namespace == ns)
+        .and_then(|c| {
+            c.results
+                .iter()
+                .find(|(b, _)| b.bssid == bssid && b.channel == channel && b.ssid == ssid)
+        })
+        .map(|(b, _)| b.clone())
+        .ok_or(ENOENT)
+}
+
+/// The userspace-SME MLME commands, in `nl80211_authenticate` /
+/// `nl80211_associate` / `nl80211_deauthenticate` /
+/// `nl80211_disassociate` order (+ `cfg80211_mlme_*`); the frame exchange
+/// then runs asynchronously and reports as cfg80211 does.
+fn sme_command(
+    command: u8,
+    iface: Arc<dyn crate::WirelessNetIface>,
+    index: u32,
+    attrs: &[(u16, &[u8])],
+    context: &RequestContext<'_>,
+) -> Result<Vec<GenlReply>, i32> {
+    let ns = context.net_ns_id;
+    let has_op = iface.supports_userspace_mlme();
+    let station = matches!(iface.current_iftype(), 2 | 8);
+    let own = iface.mac();
+    match command {
         AUTHENTICATE => {
-            reject_unknown(&attrs, &[3, 6, 38, 42, 52, 53, 156])?;
-            let peer = require_peer(&attrs)?;
-            // nl80211_auth_type: OPEN(0)..SAE(4) are the values this stack maps.
-            let auth_type = u32_attr(&attrs, 53)?.unwrap_or(0);
-            if auth_type > 4 {
+            // NL80211_ATTR_AUTH_DATA = NLA_POLICY_MIN_LEN(4).
+            if attr(attrs, 156).is_some_and(|d| d.len() < 4) {
+                return Err(ERANGE);
+            }
+            if attr(attrs, 6).is_none()
+                || attr(attrs, 53).is_none()
+                || attr(attrs, 52).is_none()
+                || attr(attrs, 38).is_none()
+            {
                 return Err(EINVAL);
             }
-            let ssid = attr(&attrs, 52).unwrap_or(&[]);
+            // A WEP key (nl80211_parse_key) needs a WEP cipher suite, which
+            // no NARF wiphy has.
+            if attr(attrs, 80).is_some() || attr(attrs, 8).is_some() {
+                return Err(EINVAL);
+            }
+            if !has_op || !station {
+                return Err(EOPNOTSUPP);
+            }
+            let peer = mac_attr(attrs, 6)?.ok_or(EINVAL)?;
+            let channel = channel(u32_attr(attrs, 38)?.ok_or(EINVAL)?)?;
+            let ssid = attr(attrs, 52).unwrap_or(&[]);
             if ssid.len() > 32 {
                 return Err(EINVAL);
             }
-            let channel = u32_attr(&attrs, 38)?.map(channel).transpose()?.unwrap_or(0);
+            // nl80211_valid_auth_type: 0..=NL80211_AUTHTYPE_MAX (8); SAE
+            // needs NL80211_FEATURE_SAE (set with userspace MLME), FILS
+            // (5..=7) NL80211_EXT_FEATURE_FILS_STA and EPPKE (8) its ext
+            // feature, neither of which NARF advertises.
+            let auth_type = u32_attr(attrs, 53)?.ok_or(EINVAL)?;
+            if auth_type > 4 {
+                return Err(EINVAL);
+            }
+            let auth_data = attr(attrs, 156);
+            if auth_type == 4 && auth_data.is_none() {
+                return Err(EINVAL);
+            }
+            if auth_data.is_some() && auth_type != 4 {
+                return Err(EINVAL);
+            }
+            // "we no longer track auth state": a local state change is a
+            // successful no-op.
+            if attr(attrs, 95).is_some() {
+                return Ok(Vec::new());
+            }
+            if attr(attrs, 313).is_some() {
+                return Err(EINVAL); // no WIPHY_FLAG_SUPPORTS_MLO
+            }
+            cached_bss(iface.as_ref(), ns, peer, channel, ssid)?;
+            // cfg80211_mlme_auth.
+            if iface.connected_bssid() == Some(peer) {
+                return Err(EALREADY);
+            }
+            if peer == own {
+                return Err(EINVAL);
+            }
             let request = crate::MlmeAuthRequest {
                 peer,
                 ssid: ssid.to_vec(),
                 channel,
                 auth_type,
-                auth_data: attr(&attrs, 156).unwrap_or(&[]).to_vec(),
+                auth_data: auth_data.unwrap_or(&[]).to_vec(),
+                ie: attr(attrs, 42).unwrap_or(&[]).to_vec(),
             };
             narf_scheduler::spawn(run_mlme(iface, ns, index, MlmeExec::Authenticate(request)));
             Ok(Vec::new())
         }
         ASSOCIATE => {
-            reject_unknown(&attrs, &[3, 6, 38, 42, 52, 66, 73, 74, 75, 76, 79])?;
-            let peer = require_peer(&attrs)?;
-            let ssid = attr(&attrs, 52).ok_or(EINVAL)?;
-            if ssid.is_empty() || ssid.len() > 32 {
+            station::check_owner(iface.name(), context.portid)?;
+            let ssid = attr(attrs, 52).ok_or(EINVAL)?;
+            if !has_op || !station {
+                return Err(EOPNOTSUPP);
+            }
+            let ie = attr(attrs, 42).unwrap_or(&[]);
+            let ies = elements(ie)?;
+            // WLAN_EID_EXT_NON_INHERITANCE: "non-inheritance makes no sense".
+            if ies
+                .iter()
+                .any(|(id, b)| *id == 255 && b.first() == Some(&56))
+            {
                 return Err(EINVAL);
             }
-            let channel = u32_attr(&attrs, 38)?.map(channel).transpose()?.unwrap_or(0);
-            let prev_bssid = mac_attr(&attrs, 79)?;
-            if prev_bssid.is_some_and(|b| b[0] & 1 != 0 || b == [0; 6]) {
+            let use_mfp = match u32_attr(attrs, 66)? {
+                None | Some(0) => false,
+                Some(1) => true,
+                Some(2) => return Err(EINVAL),
+                Some(_) => return Err(ERANGE),
+            };
+            let prev_bssid = mac_attr(attrs, 79)?;
+            if attr(attrs, 31).is_some() && attr(attrs, 148).is_none()
+                || attr(attrs, 157).is_some() && attr(attrs, 176).is_none()
+            {
                 return Err(EINVAL);
             }
+            if attr(attrs, 313).is_some() || attr(attrs, 312).is_some() {
+                return Err(EINVAL); // MLO without WIPHY_FLAG_SUPPORTS_MLO
+            }
+            // nl80211_assoc_bss.
+            let (Some(peer), Some(freq)) = (mac_attr(attrs, 6)?, u32_attr(attrs, 38)?) else {
+                return Err(EINVAL);
+            };
+            let channel = channel(freq)?;
+            if ssid.len() > 32 {
+                return Err(EINVAL);
+            }
+            let bss = cached_bss(iface.as_ref(), ns, peer, channel, ssid)?;
+            // nl80211_crypto_settings.
+            let port = control_port(attrs, iface.supports_external_supplicant())?;
+            crypto_suites(attrs, station::cipher_suites(iface.as_ref()))?;
+            // cfg80211_mlme_assoc.
+            if let Some(current) = iface.connected_bssid() {
+                if prev_bssid != Some(current) {
+                    return Err(EALREADY);
+                }
+            }
+            if peer == own {
+                return Err(EINVAL);
+            }
+            if attr(attrs, 204).is_some() {
+                station::set_owner(iface.name(), ns, context.portid, Some(peer));
+            }
+            station::set_control_port(iface.name(), ns, port.over_nl80211);
             let request = crate::MlmeAssocRequest {
                 peer,
                 ssid: ssid.to_vec(),
                 channel,
-                ie: attr(&attrs, 42).unwrap_or(&[]).to_vec(),
+                ie: ie.to_vec(),
                 prev_bssid,
-                use_mfp: u32_attr(&attrs, 66)? == Some(2),
+                use_mfp,
+                control_port: port,
+                privacy: !matches!(bss.security, crate::scan::BssSecurity::Open),
             };
             narf_scheduler::spawn(run_mlme(iface, ns, index, MlmeExec::Associate(request)));
             Ok(Vec::new())
         }
-        DEAUTHENTICATE | DISASSOCIATE => {
-            reject_unknown(&attrs, &[3, 6, 54])?;
-            let peer = require_peer(&attrs)?;
-            // Default reason 3 = STA is leaving (IEEE 802.11 reason code).
-            let reason = u16_attr(&attrs, 54)?.unwrap_or(3);
+        _ => {
+            // DEAUTHENTICATE / DISASSOCIATE.
+            station::check_owner(iface.name(), context.portid)?;
+            let peer = mac_attr(attrs, 6)?.ok_or(EINVAL)?;
+            let reason = u16_attr(attrs, 54)?.ok_or(EINVAL)?;
+            if !has_op || !station {
+                return Err(EOPNOTSUPP);
+            }
+            if reason == 0 {
+                return Err(EINVAL); // "Reason Code 0 is reserved"
+            }
+            let local_state_change = attr(attrs, 95).is_some();
+            let connected = iface.connected_bssid();
             let exec = if command == DEAUTHENTICATE {
+                // cfg80211_mlme_deauth.
+                if local_state_change && connected != Some(peer) {
+                    return Ok(Vec::new());
+                }
+                let target = station::with_wdev(iface.name(), ns, |w| w.disconnect_bssid);
+                if target == peer || connected == Some(peer) {
+                    station::clear_owner(iface.name());
+                }
                 MlmeExec::Deauthenticate { peer, reason }
             } else {
+                // cfg80211_mlme_disassoc.
+                if connected != Some(peer) {
+                    return Err(station::ENOTCONN);
+                }
                 MlmeExec::Disassociate { peer, reason }
             };
             narf_scheduler::spawn(run_mlme(iface, ns, index, exec));
             Ok(Vec::new())
         }
-        _ => Err(EOPNOTSUPP),
     }
+}
+
+/// `nl80211_send_mlme_timeout`: WIPHY, IFINDEX, TIMED_OUT, MAC.
+fn publish_mlme_timeout(
+    iface: &dyn crate::WirelessNetIface,
+    ns: u64,
+    index: u32,
+    command: u8,
+    peer: [u8; 6],
+) {
+    if !super::in_namespace(iface, ns) {
+        return;
+    }
+    let mut attrs = Vec::new();
+    if let Some(wiphy) = wiphy_index(iface) {
+        push_attr(&mut attrs, 1, &wiphy.to_ne_bytes());
+    }
+    push_attr(&mut attrs, 3, &index.to_ne_bytes());
+    push_attr(&mut attrs, 65, &[]); // NL80211_ATTR_TIMED_OUT
+    push_attr(&mut attrs, 6, &peer);
+    publish_event(NL80211_FAMILY_ID, 19, ns, GenlReply { command, attrs });
+}
+
+/// `nl80211_send_connect_result` for an association the userspace SME
+/// completed (`cfg80211_rx_assoc_resp` → `__cfg80211_connect_result`):
+/// WIPHY, IFINDEX, MAC, STATUS_CODE, REQ_IE, RESP_IE.
+fn publish_connect_result(
+    iface: &dyn crate::WirelessNetIface,
+    ns: u64,
+    index: u32,
+    peer: [u8; 6],
+    status: u16,
+    req_ie: &[u8],
+    resp_ie: &[u8],
+) {
+    if !super::in_namespace(iface, ns) {
+        return;
+    }
+    let mut attrs = Vec::new();
+    if let Some(wiphy) = wiphy_index(iface) {
+        push_attr(&mut attrs, 1, &wiphy.to_ne_bytes());
+    }
+    push_attr(&mut attrs, 3, &index.to_ne_bytes());
+    push_attr(&mut attrs, 6, &peer);
+    push_attr(&mut attrs, 72, &status.to_ne_bytes());
+    if !req_ie.is_empty() {
+        push_attr(&mut attrs, 77, req_ie);
+    }
+    if !resp_ie.is_empty() {
+        push_attr(&mut attrs, 78, resp_ie);
+    }
+    publish_event(
+        NL80211_FAMILY_ID,
+        19,
+        ns,
+        GenlReply {
+            command: CONNECT,
+            attrs,
+        },
+    );
 }
 
 /// Access-Point configuration path: START_AP / STOP_AP / SET_BEACON and the
@@ -1107,6 +1695,8 @@ async fn execute(
             bssid,
             channel,
             cred,
+            ie,
+            owner: _,
         } => {
             let akm = cred.akm();
             let mut selected = None;
@@ -1160,12 +1750,14 @@ async fn execute(
                     Credential::Sae(password) => crate::SecurityConfig::Wpa3 {
                         password: (**password).clone(),
                     },
+                    Credential::External(e) => crate::SecurityConfig::External(*e),
                 };
                 let request = crate::AssociateRequest {
                     ssid,
                     bssid: bss.bssid,
                     channel: bss.channel,
                     security,
+                    ie,
                 };
                 // Already associated to a different BSS of this ESS → roam
                 // (reassociate) rather than a fresh connect.
@@ -1195,11 +1787,15 @@ async fn execute(
                 // NL80211_CMD_PORT_AUTHORIZED (`cfg80211_port_authorized`)
                 // after the connect result — the event wpa_supplicant waits
                 // for with WPA_DRIVER_FLAGS_4WAY_HANDSHAKE_PSK.
-                if status == 0 && akm != Akm::Open {
+                if status == 0 && matches!(akm, Akm::Psk | Akm::Sae) {
                     port_authorized = Some(address);
                 }
             }
             push_attr(&mut attrs, 72, &status.to_ne_bytes());
+            if status != 0 {
+                // __cfg80211_connect_result failure: owner cleared.
+                station::clear_owner(iface.name());
+            }
             // A successful move to a new BSS is a ROAM event; a fresh
             // association is a CONNECT. Failures report as CONNECT(status!=0).
             let command = if roaming && result.is_ok() {
@@ -1277,6 +1873,7 @@ fn select_bss<'a>(
                     Akm::Open => matches!(b.security, crate::scan::BssSecurity::Open),
                     Akm::Psk => matches!(b.security, crate::scan::BssSecurity::Wpa2),
                     Akm::Sae => matches!(b.security, crate::scan::BssSecurity::Wpa3),
+                    Akm::Rsn => !matches!(b.security, crate::scan::BssSecurity::Open),
                 }
         })
         .max_by_key(|b| b.rssi)

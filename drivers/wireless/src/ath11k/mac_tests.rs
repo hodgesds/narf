@@ -2101,7 +2101,7 @@ fn smoke_ath11k_mac_auth_assoc_frames() -> TestResult {
             .unwrap()
             .unwrap()
             .0;
-        let p = m.assoc_request_params(&bss, &ies, SSID, Some(&plan));
+        let p = m.assoc_request_params(&bss, &ies, SSID, Some(&plan), &[]);
         let f = frame::build_assoc_req(&p);
         // Without a link mac80211's conn bw_limit is 20 MHz: 40 MHz and
         // SGI40 are cleared (0x19e7 → 0x19a5). The HT40 request is
@@ -2589,6 +2589,7 @@ fn wpa2_req() -> AssociateRequest {
         ssid: SSID.to_vec(),
         channel: 6,
         security: SecurityConfig::Wpa2 { psk: PMK },
+        ie: Vec::new(),
     }
 }
 
@@ -2816,6 +2817,7 @@ fn smoke_ath11k_mac_connect_open_and_disconnect() -> TestResult {
             ssid: b"open".to_vec(),
             channel: 1,
             security: SecurityConfig::Open,
+            ie: Vec::new(),
         };
         // Answer as BSSID2.
         let r = block(async {
@@ -2875,6 +2877,7 @@ fn open_req() -> AssociateRequest {
         ssid: SSID.to_vec(),
         channel: 6,
         security: SecurityConfig::Open,
+        ie: Vec::new(),
     }
 }
 

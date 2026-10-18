@@ -45,8 +45,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::iface::{HwCaps, WirelessBand, WirelessIfaceInfo, WirelessModes};
 use narf_wireless::{
-    AssociateRequest, BssInfo, ScanRequest, SecurityConfig, WirelessConfig, WirelessError,
-    WirelessNetIface,
+    AssociateRequest, BssInfo, KeyParams, MlmeAssocRequest, MlmeAuthRequest, ScanRequest,
+    SecurityConfig, WirelessConfig, WirelessError, WirelessNetIface,
 };
 
 use super::core::FwNotice;
@@ -75,9 +75,51 @@ pub struct Sinks {
     /// the interface back down (`narf_net::iface::set_link_state`).
     pub admin: fn(&str, bool),
     /// The association went away while the carrier was on:
-    /// `cfg80211_disconnected` → `nl80211::notify_disconnect(name,
-    /// reason, from_ap)`.
-    pub disconnected: fn(&str, Disconnect),
+    /// `cfg80211_process_deauth` / `_disassoc` with the frame
+    /// ([`Disconnect::frame`], our address given) →
+    /// `nl80211::notify_mlme_disconnect`.
+    pub disconnected: fn(&str, Disconnect, &[u8; 6]),
+    /// A Deauthentication sent with no connection to report
+    /// (`cfg80211_tx_mlme_mgmt` for an authentication in progress):
+    /// `nl80211::notify_mlme_frame`.
+    pub mlme_tx: fn(&str, &[u8]),
+    /// `cfg80211_rx_control_port(name, src, proto, pdu, unencrypted)`;
+    /// `false` = no owner to take it (the frame is dropped).
+    pub control_port: fn(&str, [u8; 6], u16, &[u8], bool) -> bool,
+}
+
+/// Who asked for the association a recovery would restore: the
+/// command-line autoconnect (in-kernel: NARF reconnects by itself) or an
+/// nl80211 CONNECT (userspace: cfg80211 reports the loss and the
+/// supplicant reconnects, as when mac80211's `ieee80211_reconfig` cannot
+/// restore the association).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectOrigin {
+    Kernel,
+    Nl80211,
+}
+
+/// An external-supplicant operation, applied in order on the runtime
+/// loop under the mac layer (the netlink caller cannot wait).
+#[derive(Clone, PartialEq, Eq)]
+enum ExtOp {
+    AddKey(KeyParams),
+    DelKey {
+        idx: u8,
+        pairwise: bool,
+    },
+    Authorize(bool),
+    /// A control-port frame (802.3).
+    Tx(Vec<u8>),
+    PowerSave(bool),
+}
+
+/// What nl80211 may already know synchronously about the keys
+/// (mac80211's key table): which are installed.
+#[derive(Clone, Copy, Debug, Default)]
+struct KeyBook {
+    ptk: bool,
+    group: [bool; 6],
 }
 
 /// What `get_wireless_info` reports, captured from the mac layer at
@@ -145,8 +187,17 @@ pub struct Ath11kNetdev<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     rx_prod: IrqSafeSpinLock<Option<Producer<Frame, RX_RING_N>>>,
     pub stats: NetdevStats,
     /// The network of the last successful `associate` (cleared by
-    /// `disassociate`): where a recovery reconnects.
-    last_assoc: IrqSafeSpinLock<Option<AssociateRequest>>,
+    /// `disassociate`) and who asked for it: where a kernel-originated
+    /// connection reconnects after a recovery.
+    last_assoc: IrqSafeSpinLock<Option<(AssociateRequest, ConnectOrigin)>>,
+    ext_ops: IrqSafeSpinLock<alloc::collections::VecDeque<ExtOp>>,
+    keys: IrqSafeSpinLock<KeyBook>,
+    /// The association's control port: EtherType, and whether
+    /// pre-authentication frames go to nl80211 (`over_nl80211 &&
+    /// !no_preauth`) — bit 16.
+    ctrl_port: AtomicU32,
+    /// `wdev->ps` as requested.
+    ps: AtomicBool,
 }
 
 /// `AssociateRequest` is not `Clone`.
@@ -161,7 +212,9 @@ fn copy_request(r: &AssociateRequest) -> AssociateRequest {
             SecurityConfig::Wpa3 { password } => SecurityConfig::Wpa3 {
                 password: password.clone(),
             },
+            SecurityConfig::External(e) => SecurityConfig::External(*e),
         },
+        ie: r.ie.clone(),
     }
 }
 
@@ -220,6 +273,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
                 rx_prod: IrqSafeSpinLock::new(Some(rx_prod)),
                 stats: NetdevStats::default(),
                 last_assoc: IrqSafeSpinLock::new(None),
+                ext_ops: IrqSafeSpinLock::new(alloc::collections::VecDeque::new()),
+                keys: IrqSafeSpinLock::new(KeyBook::default()),
+                ctrl_port: AtomicU32::new(0),
+                ps: AtomicBool::new(true),
             },
             tx_cons,
         )
@@ -233,13 +290,21 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
     /// mac layer recorded none: a local disconnect).
     fn link_down(&self, why: Option<Disconnect>) {
         let was = self.link_up();
+        let bssid = self.connected_bssid().unwrap_or([0; 6]);
         self.set_link(false, None, 0);
         if was {
             let d = why.unwrap_or(Disconnect {
                 reason: frame::WLAN_REASON_DEAUTH_LEAVING,
                 from_ap: false,
+                deauth: true,
+                bssid,
             });
-            (self.sinks.disconnected)(self.name, d);
+            let d = if d.bssid == [0; 6] {
+                Disconnect { bssid, ..d }
+            } else {
+                d
+            };
+            (self.sinks.disconnected)(self.name, d, &self.mac_addr);
         }
     }
 
@@ -256,6 +321,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
             _ => {
                 self.bssid.store(0, Ordering::Release);
                 self.channel.store(0, Ordering::Release);
+                // The station entry and its keys are gone.
+                *self.keys.lock() = KeyBook::default();
+                self.ext_ops.lock().clear();
+                self.ctrl_port.store(0, Ordering::Release);
             }
         }
         let was = self.up.swap(up, Ordering::AcqRel);
@@ -478,7 +547,24 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
 
     fn deliver(&self, frames: Vec<(Vec<u8>, bool)>) -> usize {
         let n = frames.len();
+        let preauth_up = self.ctrl_port.load(Ordering::Acquire) & (1 << 16) != 0;
         for (mut f, csum_ok) in frames {
+            // ieee80211_deliver_skb_to_local_stack: ETH_P_PREAUTH over
+            // nl80211 unless CONTROL_PORT_NO_PREAUTH.
+            if preauth_up
+                && f.len() >= 14
+                && u16::from_be_bytes([f[12], f[13]]) == narf_wireless::ETH_P_PREAUTH
+            {
+                let src: [u8; 6] = f[6..12].try_into().unwrap();
+                (self.sinks.control_port)(
+                    self.name,
+                    src,
+                    narf_wireless::ETH_P_PREAUTH,
+                    &f[14..],
+                    false,
+                );
+                continue;
+            }
             if let Some(p) = self.rx_prod.lock().as_mut() {
                 if let Some(mut fr) = alloc_frame(&f) {
                     // ath11k_dp_rx_h_csum_offload → the ring's RxMeta.
@@ -507,7 +593,13 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         }
         if let Some(mut m) = self.mac.try_lock() {
             self.sync_admin(&mut m).await;
-            if m.poll().await.is_some() {
+            self.run_ext_ops(&mut m).await;
+            let loss = m.poll().await;
+            let ctrl = m.take_control_port_rx();
+            if !ctrl.is_empty() {
+                self.deliver_control_port(ctrl);
+            }
+            if loss.is_some() {
                 self.stats.link_losses.fetch_add(1, Ordering::Relaxed);
                 // ieee80211_set_disassoc → ieee80211_flush_queues(drop).
                 self.shared.lock().await.purge_txqs();
@@ -526,6 +618,129 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
             }
         }
         n
+    }
+
+    /// Apply the queued external-supplicant operations in order
+    /// (key installs, port authorization, control-port frames, power
+    /// save), each the way mac80211's synchronous call would.
+    async fn run_ext_ops(&self, m: &mut RtMac<Io, Irq, Q>) {
+        loop {
+            let Some(op) = self.ext_ops.lock().pop_front() else {
+                return;
+            };
+            match op {
+                ExtOp::AddKey(k) => {
+                    let _ = m.ext_add_key(&k).await;
+                }
+                ExtOp::DelKey { idx, pairwise } => {
+                    let _ = m.ext_del_key(idx, pairwise).await;
+                }
+                ExtOp::Authorize(on) => {
+                    let _ = m.ext_set_authorized(on).await;
+                }
+                ExtOp::Tx(eth) => {
+                    // ieee80211_tx_control_port → the TXQs; built (and
+                    // protected or not) by the PTK state at this point.
+                    let _ = self.shared.tx_frames(alloc::vec![(eth, false)]).await;
+                }
+                ExtOp::PowerSave(on) => m.set_power_save(on).await,
+            }
+        }
+    }
+
+    /// Received control-port frames: to the owner over nl80211, or up the
+    /// netdev (PF_PACKET sockets on ETH_P_PAE) as any received frame.
+    fn deliver_control_port(&self, frames: Vec<super::mac::ext::ControlPortRx>) {
+        let mut up = Vec::new();
+        for f in frames {
+            if f.over_nl80211 {
+                let src: [u8; 6] = f.eth[6..12].try_into().unwrap();
+                let proto = u16::from_be_bytes([f.eth[12], f.eth[13]]);
+                (self.sinks.control_port)(self.name, src, proto, &f.eth[14..], !f.decrypted);
+            } else {
+                up.push((f.eth, false));
+            }
+        }
+        if !up.is_empty() {
+            self.deliver(up);
+        }
+    }
+
+    fn queue_ext(&self, op: ExtOp) {
+        // The runtime loop applies it at its next step (≤ one slice).
+        self.ext_ops.lock().push_back(op);
+    }
+
+    /// `associate` for the in-kernel autoconnect: a recovery reconnects
+    /// this one by itself.
+    pub async fn associate_kernel(&self, req: AssociateRequest) -> Result<(), WirelessError> {
+        self.associate_from(req, ConnectOrigin::Kernel).await
+    }
+
+    async fn associate_from(
+        &self,
+        req: AssociateRequest,
+        origin: ConnectOrigin,
+    ) -> Result<(), WirelessError> {
+        if self.shared.is_dead() {
+            return Err(WirelessError::HardwareError);
+        }
+        let mut m = self.mac.lock().await;
+        if !self.sync_admin(&mut m).await {
+            return Err(WirelessError::HardwareError);
+        }
+        m.associate(&req).await?;
+        let b = m.connected_bssid();
+        drop(m);
+        if let SecurityConfig::External(e) = &req.security {
+            self.set_control_port(e.control_port);
+        }
+        if b.is_some() {
+            // An external supplicant's association is userspace's to
+            // restore.
+            let origin = if matches!(req.security, SecurityConfig::External(_)) {
+                ConnectOrigin::Nl80211
+            } else {
+                origin
+            };
+            *self.last_assoc.lock() = Some((copy_request(&req), origin));
+        }
+        // ieee80211_set_associated → netif_carrier_on.
+        self.set_link(b.is_some(), b, req.channel);
+        Ok(())
+    }
+
+    /// `ieee80211_mgd_deauth` / `_disassoc` for the userspace SME.
+    async fn sme_leave(
+        &self,
+        peer: [u8; 6],
+        reason: u16,
+        deauth: bool,
+    ) -> Result<Vec<u8>, WirelessError> {
+        *self.last_assoc.lock() = None;
+        let mut m = self.mac.lock().await;
+        if m.link().is_some_and(|l| l.assoc) {
+            self.shared.flush_queues(true).await;
+        }
+        let r = m.sme_deauthenticate(peer, reason, deauth).await;
+        let why = m.take_disconnect();
+        drop(m);
+        let frame = r.map_err(|e| e.wireless())?;
+        if why.is_some() && self.link_up() {
+            // DEAUTHENTICATE / DISASSOCIATE + DISCONNECT.
+            self.link_down(why);
+        } else {
+            (self.sinks.mlme_tx)(self.name, &frame);
+        }
+        Ok(frame)
+    }
+
+    fn set_control_port(&self, port: narf_wireless::ControlPort) {
+        let preauth = port.over_nl80211 && !port.no_preauth;
+        self.ctrl_port.store(
+            port.ethertype as u32 | if preauth { 1 << 16 } else { 0 },
+            Ordering::Release,
+        );
     }
 
     /// The runtime loop task (ends when a recovery failed: the device is
@@ -566,6 +781,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         self.link_down(Some(Disconnect {
             reason: frame::WLAN_REASON_UNSPECIFIED,
             from_ap: false,
+            deauth: true,
+            bssid: [0; 6],
         }));
         let mut m = self.mac.lock().await;
         let dev = match self.shared.recover_device(notice).await {
@@ -606,8 +823,11 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
             "  ath11k: {}: firmware recovered",
             self.name
         );
-        let last = self.last_assoc.lock().as_ref().map(copy_request);
-        if let Some(req) = last {
+        // Only an in-kernel connection is restored here; userspace heard
+        // the loss above and reconnects itself.
+        let last = self.last_assoc.lock().take();
+        if let Some((req, ConnectOrigin::Kernel)) = last {
+            *self.last_assoc.lock() = Some((copy_request(&req), ConnectOrigin::Kernel));
             self.reconnect(req).await;
         }
         true
@@ -624,7 +844,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
             active: true,
         };
         let r = match self.scan(scan).await {
-            Ok(_) => self.associate(req).await,
+            Ok(_) => self.associate_kernel(req).await,
             Err(e) => Err(e),
         };
         match r {
@@ -684,12 +904,194 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Interface for Ath11kNetdev<Io, Irq, Q> {
 #[async_trait]
 impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, Q> {
     fn supports_handshake_offload(&self) -> bool {
-        // The mac layer runs the WPA2-PSK 4-way handshake from the PSK.
+        // Like ath11k on Linux (mac80211 with its SME in userspace), no
+        // offload is advertised: wpa_supplicant runs SME and supplicant.
+        // The mac layer's own 4-way handshake serves the in-kernel
+        // autoconnect (`associate_kernel`).
+        false
+    }
+
+    fn supports_userspace_mlme(&self) -> bool {
+        true
+    }
+
+    fn supports_external_supplicant(&self) -> bool {
         true
     }
 
     fn reports_disconnect_events(&self) -> bool {
         true
+    }
+
+    async fn mlme_authenticate(&self, req: MlmeAuthRequest) -> Result<Vec<u8>, WirelessError> {
+        if self.shared.is_dead() {
+            return Err(WirelessError::HardwareError);
+        }
+        let mut m = self.mac.lock().await;
+        if !self.sync_admin(&mut m).await {
+            return Err(WirelessError::HardwareError);
+        }
+        let r = m.sme_authenticate(&req).await;
+        let why = m.take_disconnect();
+        drop(m);
+        if why.is_some() {
+            // A new authentication left the old association.
+            self.link_down(why);
+        }
+        r.map_err(|e| e.wireless())
+    }
+
+    async fn mlme_associate(&self, req: MlmeAssocRequest) -> Result<Vec<u8>, WirelessError> {
+        if self.shared.is_dead() {
+            return Err(WirelessError::HardwareError);
+        }
+        let mut m = self.mac.lock().await;
+        let r = m.sme_associate(&req).await;
+        let b = m.connected_bssid();
+        drop(m);
+        let frame = r.map_err(|e| e.wireless())?;
+        if b.is_some() {
+            self.set_control_port(req.control_port);
+            *self.last_assoc.lock() = None;
+            // ieee80211_set_associated → netif_carrier_on.
+            self.set_link(true, b, req.channel);
+        }
+        Ok(frame)
+    }
+
+    async fn mlme_deauthenticate(
+        &self,
+        peer: [u8; 6],
+        reason: u16,
+    ) -> Result<Vec<u8>, WirelessError> {
+        self.sme_leave(peer, reason, true).await
+    }
+
+    async fn mlme_disassociate(
+        &self,
+        peer: [u8; 6],
+        reason: u16,
+    ) -> Result<Vec<u8>, WirelessError> {
+        self.sme_leave(peer, reason, false).await
+    }
+
+    fn add_key(&self, key: KeyParams) -> Result<(), i32> {
+        let ap = self.connected_bssid();
+        if key.pairwise && (ap.is_none() || key.peer != ap) {
+            return Err(super::mac::errno::ENOENT);
+        }
+        if ap.is_none() {
+            return Err(super::mac::errno::ENOENT);
+        }
+        match key.cipher {
+            narf_wireless::CIPHER_SUITE_CCMP | narf_wireless::CIPHER_SUITE_AES_CMAC => {}
+            _ => return Err(super::mac::errno::EOPNOTSUPP),
+        }
+        {
+            let mut book = self.keys.lock();
+            if key.pairwise {
+                book.ptk = true;
+            } else if let Some(s) = book.group.get_mut(key.idx as usize) {
+                *s = true;
+            }
+        }
+        self.queue_ext(ExtOp::AddKey(key));
+        Ok(())
+    }
+
+    fn del_key(&self, idx: u8, pairwise: bool, peer: Option<[u8; 6]>) -> Result<(), i32> {
+        let ap = self.connected_bssid();
+        if pairwise && (ap.is_none() || peer != ap) {
+            return Err(super::mac::errno::ENOENT);
+        }
+        {
+            let mut book = self.keys.lock();
+            let slot = if pairwise {
+                Some(&mut book.ptk)
+            } else {
+                book.group.get_mut(idx as usize)
+            };
+            match slot {
+                Some(s) if *s => *s = false,
+                _ => return Err(super::mac::errno::ENOENT),
+            }
+        }
+        self.queue_ext(ExtOp::DelKey { idx, pairwise });
+        Ok(())
+    }
+
+    fn set_port_authorized(&self, peer: [u8; 6], authorized: bool) -> Result<(), i32> {
+        if self.connected_bssid() != Some(peer) {
+            return Err(super::mac::errno::ENOENT);
+        }
+        self.queue_ext(ExtOp::Authorize(authorized));
+        Ok(())
+    }
+
+    fn tx_control_port(
+        &self,
+        dest: [u8; 6],
+        proto: u16,
+        frame: Vec<u8>,
+        _no_encrypt: bool,
+    ) -> Result<(), i32> {
+        let ctrl = self.ctrl_port.load(Ordering::Acquire);
+        // "Only accept CONTROL_PORT_PROTOCOL configured in
+        // CONNECT/ASSOCIATE or Pre-Authentication".
+        let configured = (ctrl & 0xffff) as u16;
+        if proto != configured && proto != narf_wireless::ETH_P_PREAUTH || ctrl == 0 {
+            return Err(super::mac::errno::EINVAL);
+        }
+        let mut eth = Vec::with_capacity(14 + frame.len());
+        eth.extend_from_slice(&dest);
+        eth.extend_from_slice(&self.mac_addr);
+        eth.extend_from_slice(&proto.to_be_bytes());
+        eth.extend_from_slice(&frame);
+        self.queue_ext(ExtOp::Tx(eth));
+        Ok(())
+    }
+
+    fn power_save_default(&self) -> Option<bool> {
+        // mac80211's set_power_mgmt; SUPPORTS_PS on WCN6855.
+        Some(true)
+    }
+
+    fn set_power_save(&self, enabled: bool) -> Result<(), i32> {
+        self.ps.store(enabled, Ordering::Release);
+        self.queue_ext(ExtOp::PowerSave(enabled));
+        Ok(())
+    }
+
+    fn regulatory_domain(&self) -> Option<narf_wireless::RegDomainInfo> {
+        let r = self.mac.try_lock()?.regd();
+        Some(narf_wireless::RegDomainInfo {
+            alpha2: r.alpha2,
+            dfs_region: r.dfs_region as u8,
+            // ath11k_mac_register: REGULATORY_WIPHY_SELF_MANAGED.
+            self_managed: true,
+            rules: r
+                .rules
+                .iter()
+                .map(|x| narf_wireless::RegRuleInfo {
+                    flags: x.flags,
+                    start_khz: x.start * 1000,
+                    end_khz: x.end * 1000,
+                    max_bw_khz: x.max_bw * 1000,
+                    max_antenna_gain_mbi: x.max_antenna_gain * 100,
+                    max_eirp_mbm: x.max_eirp * 100,
+                    dfs_cac_ms: x.dfs_cac_ms,
+                })
+                .collect(),
+        })
+    }
+
+    fn station_info(&self) -> Option<narf_wireless::StationInfo> {
+        let m = self.mac.try_lock()?;
+        let l = m.link()?;
+        Some(narf_wireless::StationInfo {
+            signal_dbm: l.last_signal.map(|s| s.clamp(-128, 127) as i8),
+            ..Default::default()
+        })
     }
 
     fn scan_information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
@@ -738,22 +1140,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
     }
 
     async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError> {
-        if self.shared.is_dead() {
-            return Err(WirelessError::HardwareError);
-        }
-        let mut m = self.mac.lock().await;
-        if !self.sync_admin(&mut m).await {
-            return Err(WirelessError::HardwareError);
-        }
-        m.associate(&req).await?;
-        let b = m.connected_bssid();
-        drop(m);
-        if b.is_some() {
-            *self.last_assoc.lock() = Some(copy_request(&req));
-        }
-        // ieee80211_set_associated → netif_carrier_on.
-        self.set_link(b.is_some(), b, req.channel);
-        Ok(())
+        // nl80211 CONNECT: userspace's connection.
+        self.associate_from(req, ConnectOrigin::Nl80211).await
     }
 
     async fn disassociate(&self) -> Result<(), WirelessError> {
@@ -821,8 +1209,16 @@ fn pci_link(name: &str, up: bool) {
     narf_net::iface::set_link_metadata(name, up, None, None);
 }
 
-fn pci_disconnected(name: &str, d: Disconnect) {
-    narf_wireless::nl80211::notify_disconnect(name, d.reason, d.from_ap);
+fn pci_disconnected(name: &str, d: Disconnect, own: &[u8; 6]) {
+    narf_wireless::nl80211::notify_mlme_disconnect(name, &d.frame(own), *own);
+}
+
+fn pci_mlme_tx(name: &str, frame: &[u8]) {
+    narf_wireless::nl80211::notify_mlme_frame(name, frame);
+}
+
+fn pci_control_port(name: &str, src: [u8; 6], proto: u16, pdu: &[u8], unencrypted: bool) -> bool {
+    narf_wireless::nl80211::rx_control_port(name, src, proto, pdu, unencrypted)
 }
 
 fn pci_admin(name: &str, up: bool) {
@@ -884,6 +1280,8 @@ pub fn register_pci(
             link: pci_link,
             admin: pci_admin,
             disconnected: pci_disconnected,
+            mlme_tx: pci_mlme_tx,
+            control_port: pci_control_port,
         },
     );
     let dev = Arc::new(dev);

@@ -647,6 +647,9 @@ impl WirelessNetIface for Device {
             narf_wireless::SecurityConfig::Open => AuthMethod::Open,
             narf_wireless::SecurityConfig::Wpa2 { psk } => AuthMethod::Wpa2Psk(psk),
             narf_wireless::SecurityConfig::Wpa3 { password } => AuthMethod::Wpa3Sae { password },
+            // No external-supplicant mode (the MLD firmware path runs the
+            // handshake itself; nl80211 never builds this for it).
+            narf_wireless::SecurityConfig::External(_) => return Err(WirelessError::NotSupported),
         };
         if request.ssid.len() > 32 || request.bssid[0] & 1 != 0 {
             return Err(WirelessError::InvalidArgs);
@@ -736,6 +739,9 @@ impl WirelessNetIface for Device {
             narf_wireless::SecurityConfig::Open => AuthMethod::Open,
             narf_wireless::SecurityConfig::Wpa2 { psk } => AuthMethod::Wpa2Psk(psk),
             narf_wireless::SecurityConfig::Wpa3 { password } => AuthMethod::Wpa3Sae { password },
+            // No external-supplicant mode (the MLD firmware path runs the
+            // handshake itself; nl80211 never builds this for it).
+            narf_wireless::SecurityConfig::External(_) => return Err(WirelessError::NotSupported),
         };
         let mut state = self.state.lock().await;
         // Roaming requires an existing association to reassociate away from.

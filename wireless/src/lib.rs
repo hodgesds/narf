@@ -231,19 +231,264 @@ pub trait WirelessNetIface: Interface {
     fn del_station(&self, _mac: Option<[u8; 6]>, _reason: u16) -> Result<(), WirelessError> {
         Err(WirelessError::NotSupported)
     }
+
+    // ── External-supplicant station mode ──────────────────────────────
+    //
+    // The mac80211 contract a userspace supplicant drives when the driver
+    // does not offload the handshake: keys (`ieee80211_add_key` /
+    // `_del_key` → `drv_set_key`), port authorization
+    // (`ieee80211_change_station` with AUTHORIZED) and the control port
+    // (`ieee80211_tx_control_port`, `cfg80211_rx_control_port`). Errors are
+    // positive Linux errnos, reported to userspace as they are. All default
+    // to -EOPNOTSUPP (`rdev->ops->add_key` etc. absent).
+    //
+    // These run in the caller's netlink syscall, which cannot wait for the
+    // device: the driver validates synchronously (the errors mac80211
+    // returns before `drv_set_key`), then applies the operation in order on
+    // its own task — every key install, authorization and control-port
+    // frame of an interface in the order requested, so data never leaves
+    // an authorized port before the keys requested ahead of it are in.
+
+    /// The driver implements [`SecurityConfig::External`] associations and
+    /// the operations below: nl80211 advertises NEW_KEY / SET_KEY /
+    /// DEL_KEY, SET_STATION, CONTROL_PORT_FRAME and
+    /// `NL80211_EXT_FEATURE_CONTROL_PORT_OVER_NL80211`.
+    fn supports_external_supplicant(&self) -> bool {
+        false
+    }
+
+    /// Install a key (`ieee80211_add_key` → `drv_set_key(SET_KEY)`).
+    /// -ENOENT when `peer` is not an associated station
+    /// (`sta_info_get_bss` + `WLAN_STA_ASSOC`).
+    fn add_key(&self, _key: KeyParams) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
+    /// Remove a key (`ieee80211_del_key`: -ENOENT when there is none).
+    fn del_key(&self, _idx: u8, _pairwise: bool, _peer: Option<[u8; 6]>) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
+    /// `ieee80211_change_station` for the AP's station entry: only
+    /// AUTHORIZED may change (`CFG80211_STA_AP_STA`). -ENOENT for another
+    /// peer; authorizing before association is -EINVAL
+    /// (`sta_info_move_state`).
+    fn set_port_authorized(&self, _peer: [u8; 6], _authorized: bool) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
+    /// `ieee80211_tx_control_port`: send `frame` (the PDU after the
+    /// Ethernet header) to `dest` with EtherType `proto`; `no_encrypt`
+    /// sends it without protection (`IEEE80211_TX_INTFL_DONT_ENCRYPT`).
+    fn tx_control_port(
+        &self,
+        _dest: [u8; 6],
+        _proto: u16,
+        _frame: Vec<u8>,
+        _no_encrypt: bool,
+    ) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
+    // ── Power save, regulatory, station info ──────────────────────────
+
+    /// The driver has `set_power_mgmt` (`SUPPORTS_PS`): the current
+    /// `wdev->ps` default (`WIPHY_FLAG_PS_ON_BY_DEFAULT`). `None` = no
+    /// power-save support (SET/GET_POWER_SAVE -EOPNOTSUPP).
+    fn power_save_default(&self) -> Option<bool> {
+        None
+    }
+
+    /// `ieee80211_set_power_mgmt(enabled)`.
+    fn set_power_save(&self, _enabled: bool) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
+    /// The wiphy's own regulatory domain (`get_wiphy_regdom`), if any.
+    fn regulatory_domain(&self) -> Option<RegDomainInfo> {
+        None
+    }
+
+    /// What the driver tracks about the AP (`ieee80211_sta_set_sinfo`).
+    fn station_info(&self) -> Option<StationInfo> {
+        None
+    }
 }
+
+/// `EOPNOTSUPP`.
+pub const EOPNOTSUPP: i32 = 95;
 
 pub struct AssociateRequest {
     pub bssid: [u8; 6],
     pub ssid: Vec<u8>,
     pub channel: u32,
     pub security: SecurityConfig,
+    /// The SME's elements for the (Re)Association Request
+    /// (`NL80211_ATTR_IE` of CONNECT / ASSOCIATE): what mac80211's
+    /// `ieee80211_mgd_assoc` copies into `assoc_data->ie` and
+    /// `ieee80211_send_assoc` splits around its own elements. An offloading
+    /// driver that builds its own RSNE / RSNXE drops those two from here;
+    /// for [`SecurityConfig::External`] they are the supplicant's and go
+    /// out as given.
+    pub ie: Vec<u8>,
 }
 
 pub enum SecurityConfig {
     Open,
-    Wpa2 { psk: [u8; 32] },
-    Wpa3 { password: Vec<u8> },
+    Wpa2 {
+        psk: [u8; 32],
+    },
+    Wpa3 {
+        password: Vec<u8>,
+    },
+    /// The supplicant runs in userspace (wpa_supplicant without the 4-way
+    /// handshake offload: WPA2/WPA3 with its own 4-way, 802.1X/EAP): the
+    /// driver associates with the RSN elements in
+    /// [`AssociateRequest::ie`], does not run its in-kernel supplicant or
+    /// rekey, hands EAPOL to userspace (control port) and transmits it
+    /// unencrypted until a pairwise key is in, takes keys from
+    /// [`WirelessNetIface::add_key`] and opens the port on
+    /// [`WirelessNetIface::set_port_authorized`].
+    External(ExternalSecurity),
+}
+
+/// What the SME asked for in an external-supplicant association
+/// (`struct cfg80211_crypto_settings` + `assoc_data->use_mfp`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExternalSecurity {
+    /// `NL80211_ATTR_USE_MFP` = `NL80211_MFP_REQUIRED` (`sta->mfp`).
+    pub use_mfp: bool,
+    /// `NL80211_ATTR_PRIVACY` or an RSNE in the elements: the BSS is
+    /// protected.
+    pub privacy: bool,
+    pub control_port: ControlPort,
+}
+
+/// `cfg80211_crypto_settings` control-port fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlPort {
+    /// `NL80211_ATTR_CONTROL_PORT` (`IEEE80211_STA_CONTROL_PORT`): the
+    /// port stays closed after association until userspace authorizes it;
+    /// without it mac80211 authorizes the AP at association.
+    pub enabled: bool,
+    /// `control_port_ethertype` (host order; ETH_P_PAE).
+    pub ethertype: u16,
+    /// `control_port_no_encrypt`.
+    pub no_encrypt: bool,
+    /// `control_port_over_nl80211`: EAPOL goes to the connection owner as
+    /// NL80211_CMD_CONTROL_PORT_FRAME instead of the netdev.
+    pub over_nl80211: bool,
+    /// `control_port_no_preauth`: RSN pre-authentication frames
+    /// (ETH_P_PREAUTH) stay on the netdev.
+    pub no_preauth: bool,
+}
+
+impl Default for ControlPort {
+    fn default() -> Self {
+        ControlPort {
+            enabled: false,
+            ethertype: ETH_P_PAE,
+            no_encrypt: false,
+            over_nl80211: false,
+            no_preauth: false,
+        }
+    }
+}
+
+/// `ETH_P_PAE`.
+pub const ETH_P_PAE: u16 = 0x888e;
+/// `ETH_P_PREAUTH`.
+pub const ETH_P_PREAUTH: u16 = 0x88c7;
+
+/// A key from NL80211_CMD_NEW_KEY (`struct key_params` + index / type /
+/// peer), validated by nl80211 (`cfg80211_validate_key_settings`).
+#[derive(Clone, PartialEq, Eq)]
+pub struct KeyParams {
+    pub idx: u8,
+    pub pairwise: bool,
+    /// The peer (`NL80211_ATTR_MAC`): the AP for a pairwise key, `None` for
+    /// a group key.
+    pub peer: Option<[u8; 6]>,
+    /// `WLAN_CIPHER_SUITE_*` (00-0F-AC:n as a u32).
+    pub cipher: u32,
+    pub key: Vec<u8>,
+    /// Receive sequence counter (RSC / IPN), 6 octets little-endian, or
+    /// empty.
+    pub seq: Vec<u8>,
+}
+
+impl core::fmt::Debug for KeyParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Never print key material.
+        f.debug_struct("KeyParams")
+            .field("idx", &self.idx)
+            .field("pairwise", &self.pairwise)
+            .field("peer", &self.peer)
+            .field("cipher", &self.cipher)
+            .finish()
+    }
+}
+
+/// `WLAN_CIPHER_SUITE_CCMP`.
+pub const CIPHER_SUITE_CCMP: u32 = 0x000f_ac04;
+/// `WLAN_CIPHER_SUITE_AES_CMAC` (BIP-CMAC-128).
+pub const CIPHER_SUITE_AES_CMAC: u32 = 0x000f_ac06;
+
+/// A regulatory domain as nl80211 reports it (`struct ieee80211_regdomain`:
+/// kHz, mBi, mBm, `NL80211_RRF_*`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegDomainInfo {
+    pub alpha2: [u8; 2],
+    /// `enum nl80211_dfs_regions`.
+    pub dfs_region: u8,
+    /// The wiphy manages its own regulatory domain
+    /// (`REGULATORY_WIPHY_SELF_MANAGED`).
+    pub self_managed: bool,
+    pub rules: Vec<RegRuleInfo>,
+}
+
+/// `struct ieee80211_reg_rule`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegRuleInfo {
+    pub flags: u32,
+    pub start_khz: u32,
+    pub end_khz: u32,
+    pub max_bw_khz: u32,
+    pub max_antenna_gain_mbi: u32,
+    pub max_eirp_mbm: u32,
+    pub dfs_cac_ms: u32,
+}
+
+/// A bitrate as `struct rate_info` carries it for STA_INFO.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RateInfo {
+    /// The rate in 100 kb/s (`cfg80211_calculate_bitrate`).
+    pub bitrate_100kbps: u32,
+    /// HT MCS index (`RATE_INFO_FLAGS_MCS`).
+    pub ht_mcs: Option<u8>,
+    /// VHT MCS / NSS (`RATE_INFO_FLAGS_VHT_MCS`).
+    pub vht_mcs: Option<(u8, u8)>,
+    /// HE MCS / NSS / GI (`RATE_INFO_FLAGS_HE_MCS`).
+    pub he_mcs: Option<(u8, u8, u8)>,
+    /// Channel width in MHz (20, 40, 80, 160).
+    pub width_mhz: u16,
+    pub short_gi: bool,
+}
+
+/// What the driver tracks about its AP for NL80211_CMD_GET_STATION.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StationInfo {
+    /// `NL80211_STA_INFO_SIGNAL` (dBm), last received frame.
+    pub signal_dbm: Option<i8>,
+    /// `NL80211_STA_INFO_SIGNAL_AVG` (dBm).
+    pub signal_avg_dbm: Option<i8>,
+    /// `NL80211_STA_INFO_ACK_SIGNAL` (dBm).
+    pub ack_signal_dbm: Option<i8>,
+    pub tx_bitrate: Option<RateInfo>,
+    pub rx_bitrate: Option<RateInfo>,
+    pub rx_packets: Option<u32>,
+    pub tx_packets: Option<u32>,
+    pub tx_failed: Option<u32>,
 }
 
 pub struct WirelessConfig {
@@ -257,8 +502,14 @@ pub struct MlmeAuthRequest {
     pub peer: [u8; 6],
     pub ssid: Vec<u8>,
     pub channel: u32,
+    /// `enum nl80211_auth_type`.
     pub auth_type: u32,
+    /// NL80211_ATTR_AUTH_DATA: for SAE the transaction sequence number and
+    /// status code (2 + 2 octets, little-endian) then the body
+    /// (`ieee80211_mgd_auth`).
     pub auth_data: Vec<u8>,
+    /// NL80211_ATTR_IE: elements appended to the Authentication frame.
+    pub ie: Vec<u8>,
 }
 
 /// A userspace-SME (Re)Association request (NL80211_CMD_ASSOCIATE). A set
@@ -270,6 +521,10 @@ pub struct MlmeAssocRequest {
     pub ie: Vec<u8>,
     pub prev_bssid: Option<[u8; 6]>,
     pub use_mfp: bool,
+    /// The control-port settings of `nl80211_crypto_settings`.
+    pub control_port: ControlPort,
+    /// The BSS is protected (its scan entry has Privacy / an RSNE).
+    pub privacy: bool,
 }
 
 /// A management frame to transmit (NL80211_CMD_FRAME). `channel` 0 means the
@@ -319,6 +574,11 @@ pub mod registry {
 
     pub fn list() -> Vec<Arc<dyn WirelessNetIface>> {
         REGISTRY.lock().clone()
+    }
+
+    /// Remove the interface named `name` (its netdev went away).
+    pub fn unregister(name: &str) {
+        REGISTRY.lock().retain(|i| i.name() != name);
     }
 }
 
@@ -469,6 +729,7 @@ mod tests {
                 ssid: alloc::vec![b'T', b'e', b's', b't'],
                 channel: 1,
                 security: SecurityConfig::Open,
+                ie: Vec::new(),
             };
             m.associate(req).await.expect("associate failed");
             if m.is_associated.load(Ordering::SeqCst) {

@@ -231,6 +231,9 @@ impl WirelessNetIface for Mt76Iface {
                 crate::mt7921::association::Security::Wpa2Psk { psk }
             }
             narf_wireless::SecurityConfig::Wpa3 { .. } => return Err(WirelessError::NotSupported),
+            // No external-supplicant mode: mt7921's firmware path runs the
+            // handshake from the PMK (nl80211 never builds this for it).
+            narf_wireless::SecurityConfig::External(_) => return Err(WirelessError::NotSupported),
         };
         let bss = self
             .scan_cache
@@ -502,6 +505,7 @@ mod tests {
             ssid: Vec::new(),
             channel: 6,
             security: narf_wireless::SecurityConfig::Open,
+            ie: Vec::new(),
         };
         let err = narf_scheduler::block_on_spin(iface.associate(bad_req));
         if err != Err(WirelessError::InvalidArgs) {
@@ -512,6 +516,7 @@ mod tests {
             ssid: b"narf".to_vec(),
             channel: 6,
             security: narf_wireless::SecurityConfig::Open,
+            ie: Vec::new(),
         };
         let err = narf_scheduler::block_on_spin(iface.associate(req));
         if err != Err(WirelessError::InvalidArgs) {

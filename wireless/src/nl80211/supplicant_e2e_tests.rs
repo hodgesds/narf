@@ -477,9 +477,14 @@ fn smoke_nl80211_wpa_supplicant_wpa2_psk_end_to_end() -> TestResult {
     let mut pae_over_nl = ifindex_attr(ifindex);
     push_attr(&mut pae_over_nl, 52, AP_SSID);
     push_attr(&mut pae_over_nl, 264, &[]);
+    // validate_pae_over_nl80211: SOCKET_OWNER first (-EINVAL), then the
+    // CONTROL_PORT_OVER_NL80211 ext feature (-EOPNOTSUPP).
+    let mut owned_pae = pae_over_nl.clone();
+    push_attr(&mut owned_pae, 204, &[]);
     if connect_operation(&no_mask).err() != Some(EINVAL)
         || connect_operation(&ethertype).err() != Some(EINVAL)
-        || connect_operation(&pae_over_nl).err() != Some(EOPNOTSUPP)
+        || connect_operation(&pae_over_nl).err() != Some(EINVAL)
+        || connect_operation(&owned_pae).err() != Some(EOPNOTSUPP)
     {
         return TestResult::Fail("CONNECT override / control-port errnos");
     }
