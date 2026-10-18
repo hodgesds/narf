@@ -12287,3 +12287,209 @@ kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_inet6_dgram_recvmsg_tclass_cmsg
 );
+
+// ── Generic netlink: unicast to a port, NETLINK_URELEASE, nl80211 ───
+
+/// `getsockname` of a netlink socket: its `nl_pid`.
+fn netlink_portid(fd: u64) -> Result<u32, &'static str> {
+    let mut out = [0u8; 12];
+    let mut len = (out.len() as u32).to_ne_bytes();
+    if call(
+        Syscall::SocketGetSockName.raw(),
+        a2(fd, out.as_mut_ptr() as u64, len.as_mut_ptr() as u64),
+    ) != Some(0)
+    {
+        return Err("getsockname(AF_NETLINK) failed");
+    }
+    Ok(u32::from_ne_bytes(out[4..8].try_into().unwrap()))
+}
+
+/// One generic-netlink request (`CTRL_CMD_GETFAMILY` for "nl80211"):
+/// assigns the socket's port id (`netlink_autobind`) and installs the
+/// kernel's generic sinks.
+fn genl_ping(fd: u64) -> Result<(), &'static str> {
+    let mut req = [0u8; 32];
+    req[0..4].copy_from_slice(&32u32.to_ne_bytes());
+    req[4..6].copy_from_slice(&16u16.to_ne_bytes());
+    req[6..8].copy_from_slice(&1u16.to_ne_bytes());
+    req[16] = 3;
+    req[17] = 2;
+    req[20..22].copy_from_slice(&12u16.to_ne_bytes());
+    req[22..24].copy_from_slice(&2u16.to_ne_bytes());
+    req[24..32].copy_from_slice(b"nl80211\0");
+    if netlink_send(fd, &req) != Some(32) {
+        return Err("GETFAMILY send");
+    }
+    let mut buf = [0u8; 2048];
+    while netlink_recv(fd, &mut buf).is_some_and(|n| n > 0) {}
+    Ok(())
+}
+
+/// `genlmsg_unicast` (nl80211's CONTROL_PORT_FRAME to the connection
+/// owner) reaches exactly the socket bound to the port: `nlmsg_pid` 0
+/// (kernel origin), `nl_groups` 0 in the source address; another socket
+/// gets nothing, and a port no socket holds is -ECONNREFUSED.
+fn smoke_abi_netlink_generic_unicast_to_port() -> TestResult {
+    use narf_net::netlink_generic::{unicast_event, GenlReply};
+    with_setup(|| {
+        let a = open_netlink(NETLINK_GENERIC)?;
+        let b = open_netlink(NETLINK_GENERIC)?;
+        genl_ping(a)?;
+        genl_ping(b)?;
+        let port_a = netlink_portid(a)?;
+        let port_b = netlink_portid(b)?;
+        if port_a == 0 || port_b == 0 || port_a == port_b {
+            return Err("autobound port ids");
+        }
+        if unicast_event(
+            0x13,
+            0,
+            port_a,
+            GenlReply {
+                command: 129,
+                attrs: alloc::vec![8, 0, 51, 0, 1, 3, 0, 0],
+            },
+        )
+        .is_err()
+        {
+            return Err("unicast to a bound port failed");
+        }
+        let mut buf = [0u8; 256];
+        let mut from = [0u8; 12];
+        let mut from_len = (from.len() as u32).to_ne_bytes();
+        let mut args = a3(a, buf.as_mut_ptr() as u64, buf.len() as u64, MSG_DONTWAIT);
+        args.arg4 = from.as_mut_ptr() as u64;
+        args.arg5 = from_len.as_mut_ptr() as u64;
+        let n = call(Syscall::SocketRecv.raw(), args).ok_or("recv status")?;
+        if n != 28
+            || nlmsg_type_of(&buf) != 0x13
+            || buf[12..16] != [0; 4]
+            || buf[16] != 129
+            || buf[20..28] != [8, 0, 51, 0, 1, 3, 0, 0]
+        {
+            return Err("unicast message layout");
+        }
+        if u32::from_ne_bytes(from[4..8].try_into().unwrap()) != 0
+            || u32::from_ne_bytes(from[8..12].try_into().unwrap()) != 0
+        {
+            return Err("unicast source is not the kernel, no group");
+        }
+        if netlink_recv(b, &mut buf) != Some(-11) {
+            return Err("the other socket received the unicast");
+        }
+        let gone = port_a.wrapping_add(port_b).wrapping_add(0x10_0000);
+        if unicast_event(
+            0x13,
+            0,
+            gone,
+            GenlReply {
+                command: 129,
+                attrs: alloc::vec::Vec::new(),
+            },
+        ) != Err(111)
+        {
+            return Err("unicast to a missing port not ECONNREFUSED");
+        }
+        let _ = call(Syscall::Close.raw(), a0(a));
+        let _ = call(Syscall::Close.raw(), a0(b));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_generic_unicast_to_port
+);
+
+static RELEASED_PORTS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u32>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+fn record_release(_ns: u64, portid: u32) {
+    RELEASED_PORTS.lock().push(portid);
+}
+
+/// close(2) of a bound NETLINK_GENERIC socket runs the NETLINK_URELEASE
+/// notifiers with its port (what nl80211 disconnects the connection owner
+/// on); a socket that never got a port id notifies nothing.
+fn smoke_abi_netlink_generic_close_notifies_release() -> TestResult {
+    with_setup(|| {
+        narf_net::netlink_generic::register_release_notifier(record_release);
+        RELEASED_PORTS.lock().clear();
+        let unbound = open_netlink(NETLINK_GENERIC)?;
+        let _ = call(Syscall::Close.raw(), a0(unbound));
+        if !RELEASED_PORTS.lock().is_empty() {
+            return Err("an unbound socket's close notified");
+        }
+        let fd = open_netlink(NETLINK_GENERIC)?;
+        genl_ping(fd)?;
+        let port = netlink_portid(fd)?;
+        if call(Syscall::Close.raw(), a0(fd)) != Some(0) {
+            return Err("close");
+        }
+        if *RELEASED_PORTS.lock() != [port] {
+            return Err("close did not notify NETLINK_URELEASE with the port");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_generic_close_notifies_release
+);
+
+/// nl80211 through the socket: GET_REG (no permission needed) returns the
+/// global regulatory domain; NEW_KEY from an unprivileged task is the
+/// generic layer's -EPERM; an unknown interface is -ENODEV once allowed.
+fn smoke_abi_nl80211_get_reg_and_key_errnos() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_GENERIC)?;
+        let req = |cmd: u8, attrs: &[u8], seq: u32| {
+            let mut m = alloc::vec::Vec::new();
+            m.extend_from_slice(&((20 + attrs.len()) as u32).to_ne_bytes());
+            m.extend_from_slice(&0x13u16.to_ne_bytes());
+            m.extend_from_slice(&5u16.to_ne_bytes());
+            m.extend_from_slice(&seq.to_ne_bytes());
+            m.extend_from_slice(&0u32.to_ne_bytes());
+            m.extend_from_slice(&[cmd, 1, 0, 0]);
+            m.extend_from_slice(attrs);
+            m
+        };
+        let m = req(31, &[], 7);
+        if netlink_send(fd, &m) != Some(m.len() as i64) {
+            return Err("GET_REG send");
+        }
+        let mut buf = [0u8; 1024];
+        let n = netlink_recv(fd, &mut buf).ok_or("GET_REG recv")?;
+        if n < 24 || nlmsg_type_of(&buf) != 0x13 || buf[16] != 31 {
+            return Err("GET_REG reply");
+        }
+        if !window_contains(&buf[..n as usize], &[7, 0, 33, 0, b'0', b'0', 0]) {
+            return Err("GET_REG lacks REG_ALPHA2 \"00\"");
+        }
+        while netlink_recv(fd, &mut buf).is_some_and(|n| n > 0) {}
+        // NEW_KEY with IFINDEX 0x7fff: the permission check comes first.
+        let mut attrs = alloc::vec::Vec::new();
+        attrs.extend_from_slice(&8u16.to_ne_bytes());
+        attrs.extend_from_slice(&3u16.to_ne_bytes());
+        attrs.extend_from_slice(&0x7fffu32.to_ne_bytes());
+        let m = req(11, &attrs, 8);
+        const CAP_NET_ADMIN_BIT: u64 = 1 << 12;
+        const FULL: u64 = crate::handlers::CAP_FULL_SET;
+        crate::handlers::__test_set_caps(FAKE_TASK, FULL & !CAP_NET_ADMIN_BIT, FULL);
+        let sent = netlink_send(fd, &m);
+        let n = netlink_recv(fd, &mut buf).ok_or("NEW_KEY recv")?;
+        crate::handlers::__test_caps_reset();
+        if sent != Some(m.len() as i64)
+            || n < 20
+            || nlmsg_type_of(&buf) != 2
+            || i32::from_ne_bytes(buf[16..20].try_into().unwrap()) != -1
+        {
+            return Err("unprivileged NEW_KEY not EPERM");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_nl80211_get_reg_and_key_errnos
+);
