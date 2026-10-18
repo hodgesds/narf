@@ -57,6 +57,12 @@ pub enum Case {
     /// The host's Linux kernel boots the NARF-written root, writes, scrubs;
     /// then NARF boots it again.
     Linux,
+    /// Linux takes snapper-style snapshots of `@` (nested `.snapshots`,
+    /// divergent rounds, a writable one, a top-level one, `@home`) and
+    /// balances; NARF then writes the shared root, every snapshot must stay
+    /// byte-identical and the image check-clean; Linux deletes a snapshot
+    /// and scrubs; NARF writes again.
+    Snapshots,
 }
 
 #[derive(clap::Args, Clone)]
@@ -80,7 +86,7 @@ pub struct Args {
         long,
         value_enum,
         value_delimiter = ',',
-        default_value = "ro,rw,crash,cycles,linux"
+        default_value = "ro,rw,crash,cycles,linux,snapshots"
     )]
     pub cases: Vec<Case>,
 
@@ -553,6 +559,76 @@ impl HostCheck {
         Ok(out_dir)
     }
 
+    /// `btrfs restore` of `regex` from subvolume `id` into a fresh directory.
+    fn restore_id(&self, id: u64, regex: &str, label: &str) -> Result<PathBuf> {
+        let out_dir = self.dir.join(format!("restore-{label}"));
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir)?;
+        let out = Command::new("btrfs")
+            .args(["restore", "-r", &id.to_string(), "--path-regex", regex])
+            .arg(self.part_file())
+            .arg(&out_dir)
+            .output()?;
+        if !out.status.success() {
+            bail!(
+                "btrfs restore -r {id} failed ({}): {}",
+                out.status,
+                tail(&String::from_utf8_lossy(&out.stderr), 8)
+            );
+        }
+        Ok(out_dir)
+    }
+
+    /// Snapshot subvolumes of the extracted partition: their ROOT_ITEM key
+    /// offset is the creating transaction (plain subvolumes carry 0).
+    fn snapshot_ids(&self) -> Result<Vec<u64>> {
+        let out = Command::new("btrfs")
+            .args(["inspect-internal", "dump-tree", "-t", "root"])
+            .arg(self.part_file())
+            .output()?;
+        let mut ids = Vec::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let Some(rest) = line.split(" key (").nth(1) else {
+                continue;
+            };
+            let mut f = rest.split([' ', ')']);
+            let (Some(id), Some("ROOT_ITEM"), Some(off)) = (f.next(), f.next(), f.next()) else {
+                continue;
+            };
+            if let (Ok(id), Ok(off)) = (id.parse::<u64>(), off.parse::<u64>()) {
+                if id >= 256 && off != 0 && !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// `path -> sha256` of a snapshot's checked paths (see [`SNAP_REGEX`]).
+    fn snapshot_manifest(&self, id: u64) -> Result<std::collections::BTreeMap<String, String>> {
+        let dir = self.restore_id(id, SNAP_REGEX, &format!("snap{id}"))?;
+        let mut out = std::collections::BTreeMap::new();
+        let mut todo = vec![dir.clone()];
+        while let Some(d) = todo.pop() {
+            for entry in std::fs::read_dir(&d)? {
+                let entry = entry?;
+                let path = entry.path();
+                let ft = entry.file_type()?;
+                if ft.is_dir() {
+                    todo.push(path);
+                } else if ft.is_file() {
+                    let rel = path.strip_prefix(&dir)?.display().to_string();
+                    out.insert(rel, sha256_file(&path)?);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        if out.is_empty() {
+            bail!("snapshot {id} restored no files");
+        }
+        Ok(out)
+    }
+
     /// The image's `/etc/fstab`, via `btrfs restore`.
     fn fstab(&self, d: &RootDisk) -> Result<String> {
         extract_part(&d.path, &d.root, &self.part_file())?;
@@ -560,6 +636,56 @@ impl HostCheck {
         std::fs::read_to_string(dir.join("etc/fstab")).context("the image has no /etc/fstab")
     }
 }
+
+/// What the snapshot row compares in each snapshot: its own tree, the gate
+/// and snapshot workloads' files, two system files, `@home`'s gate files.
+const SNAP_REGEX: &str = "^/(|narf-snap(|/.*)|narf-gate(|-.*|/.*)|etc(|/hostname|/fstab))$";
+
+/// Linux side of the snapshot row: what snapper + snap-pac + a balance leave.
+const SNAP_SCRIPT: &str = r#"set -eux
+D=/narf-snap
+mkdir -p $D
+for i in $(seq 1 300); do echo "linux base $i" > $D/s$i; done
+dd if=/dev/urandom of=$D/blob bs=1M count=8 status=none
+cp --reflink=always $D/blob $D/blob-reflink
+sync
+[ -d /.snapshots ] || btrfs subvolume create /.snapshots
+mkdir -p /.snapshots/1
+btrfs subvolume snapshot -r / /.snapshots/1/snapshot
+btrfs subvolume snapshot -r /home /home/.narf-snap-home
+for i in $(seq 1 3 300); do echo "linux round2 $i" >> $D/s$i; done
+dd if=/dev/urandom of=$D/blob bs=1M count=1 seek=2 conv=notrunc status=none
+sync
+mkdir -p /.snapshots/2
+btrfs subvolume snapshot -r / /.snapshots/2/snapshot
+mkdir -p /.snapshots/3
+btrfs subvolume snapshot / /.snapshots/3/snapshot
+echo "written after the snapshot" > /.snapshots/3/snapshot/narf-snap/after-snap
+dev=$(findmnt -no SOURCE / | sed 's/\[.*//')
+mkdir -p /run/narf-top
+mount -o subvolid=5 "$dev" /run/narf-top
+btrfs subvolume snapshot -r /run/narf-top/@ /run/narf-top/.narf-pre-rw-@
+umount /run/narf-top
+btrfs balance start -m /
+btrfs balance start -dlimit=2 /
+sync
+btrfs subvolume list /
+echo NARF-SNAP-DONE
+"#;
+
+/// NARF side: rewrite, truncate, delete and overwrite files the snapshots
+/// share with `@` (on top of the gate workload, which replaces /narf-gate).
+const SNAP_NARF_SCRIPT: &str = r#"set -u
+D=/narf-snap
+for i in $(seq 1 2 300); do printf 'narf rewrote %d
+' $i > $D/s$i || exit 21; done
+for i in $(seq 2 10 300); do rm -f $D/s$i || exit 22; done
+dd if=/dev/zero of=$D/blob bs=1M count=2 seek=1 conv=notrunc status=none || exit 23
+truncate -s 4096 $D/blob-reflink || exit 24
+for i in $(seq 1 50); do echo "narf new $i" > $D/n$i || exit 25; done
+sync -f $D || exit 26
+echo NARF-SNAP-WRITES-DONE
+"#;
 
 fn tail(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -1726,6 +1852,125 @@ impl Gate {
     }
 }
 
+impl Gate {
+    fn snapshot_manifests(
+        &self,
+        label: &str,
+    ) -> Result<std::collections::BTreeMap<u64, std::collections::BTreeMap<String, String>>> {
+        self.host.check(&self.disk, label, true)?;
+        let mut all = std::collections::BTreeMap::new();
+        for id in self.host.snapshot_ids()? {
+            all.insert(id, self.host.snapshot_manifest(id)?);
+        }
+        Ok(all)
+    }
+
+    fn snapshots_unchanged(
+        &self,
+        label: &str,
+        before: &std::collections::BTreeMap<u64, std::collections::BTreeMap<String, String>>,
+    ) -> Result<usize> {
+        self.host.check(&self.disk, label, true)?;
+        let now = self.host.snapshot_ids()?;
+        let mut compared = 0;
+        for (id, want) in before {
+            if !now.contains(id) {
+                continue; // deleted on purpose
+            }
+            let got = self.host.snapshot_manifest(*id)?;
+            if &got != want {
+                let diff: Vec<&String> = want
+                    .keys()
+                    .chain(got.keys())
+                    .filter(|k| want.get(*k) != got.get(*k))
+                    .take(4)
+                    .collect();
+                bail!("snapshot {id} CHANGED after {label}: {diff:?}");
+            }
+            compared += 1;
+        }
+        Ok(compared)
+    }
+
+    fn narf_snapshot_round(&mut self, label: &str, tag: &str) -> Result<()> {
+        let (mut vm, _) = self.boot_narf(Policy::Rw, label)?;
+        let before = self.baseline()?.hashes;
+        if !Self::root_is_rw(&mut vm)? {
+            bail!(
+                "NARF refused RW on the snapshotted root: {}",
+                Self::refusal_lines(&vm).join(" | ")
+            );
+        }
+        vm.put_file("/run/narf-snap-narf.sh", SNAP_NARF_SCRIPT)?;
+        let (rc, out) = vm.run("bash /run/narf-snap-narf.sh", Duration::from_secs(1800))?;
+        if rc != 0 || !out.contains("NARF-SNAP-WRITES-DONE") {
+            bail!(
+                "NARF writes over shared files failed (rc {rc}): {}",
+                tail(&out, 6)
+            );
+        }
+        Self::workload(&mut vm, tag)?;
+        vm.poweroff(Duration::from_secs(300))?;
+        drop(vm);
+        self.verify_clean(label, Some(tag), &before.outside)?;
+        Ok(())
+    }
+
+    fn row_snapshots(&mut self) -> Result<String> {
+        let mut notes = Vec::new();
+        let mut vm = self.boot_linux("snap-linux")?;
+        vm.put_file("/run/narf-snap.sh", SNAP_SCRIPT)?;
+        let (rc, out) = vm.run("bash /run/narf-snap.sh", Duration::from_secs(3600))?;
+        if rc != 0 || !out.contains("NARF-SNAP-DONE") {
+            bail!("Linux snapshot script failed (rc {rc}): {}", tail(&out, 10));
+        }
+        vm.poweroff(Duration::from_secs(300))?;
+        drop(vm);
+        let before = self.snapshot_manifests("snap-linux")?;
+        if before.len() < 5 {
+            bail!("expected at least 5 snapshots, found {}", before.len());
+        }
+        notes.push(format!(
+            "Linux: {} snapshots (nested .snapshots, rw one written after, top-level, @home), balance -m/-d; check clean",
+            before.len()
+        ));
+        self.progress.push("Linux snapshots made".into());
+
+        self.narf_snapshot_round("snap-narf1", "snap1")?;
+        let n = self.snapshots_unchanged("snap-narf1", &before)?;
+        notes.push(format!(
+            "NARF rw over shared @: check+csum clean, restore verified, {n} snapshots byte-identical"
+        ));
+        self.progress.push("NARF round 1 clean".into());
+
+        // Linux drops a snapshot (walks every ref NARF changed) and scrubs.
+        let mut vm = self.boot_linux("snap-linux-delete")?;
+        let (rc, out) = vm.run(
+            "btrfs subvolume delete /.snapshots/1/snapshot && btrfs subvolume sync / && btrfs scrub start -B /",
+            Duration::from_secs(1800),
+        )?;
+        if rc != 0 || !out.contains("no errors found") {
+            bail!(
+                "Linux snapshot delete/scrub failed (rc {rc}): {}",
+                tail(&out, 8)
+            );
+        }
+        vm.poweroff(Duration::from_secs(300))?;
+        drop(vm);
+        let n = self.snapshots_unchanged("snap-linux-delete", &before)?;
+        notes.push(format!(
+            "Linux deleted snapshot 1 + scrub clean; check clean; {n} snapshots identical"
+        ));
+
+        self.narf_snapshot_round("snap-narf2", "snap2")?;
+        let n = self.snapshots_unchanged("snap-narf2", &before)?;
+        notes.push(format!(
+            "NARF round 2: check+csum clean, {n} snapshots byte-identical"
+        ));
+        Ok(notes.join("\n"))
+    }
+}
+
 // ── Setup ───────────────────────────────────────────────────────────────
 
 fn build_decoy(path: &Path, dir: &Path) -> Result<()> {
@@ -2057,7 +2302,10 @@ pub fn run(args: &Args) -> Result<()> {
     .ok_or_else(|| anyhow!("split OVMF CODE/VARS not found next to {}", ovmf.display()))?;
     let ovmf_vars = work.join("OVMF_VARS.fd");
     std::fs::copy(&vars, &ovmf_vars)?;
-    if args.cases.contains(&Case::Linux) || args.cases.contains(&Case::Crash) {
+    if args.cases.contains(&Case::Linux)
+        || args.cases.contains(&Case::Crash)
+        || args.cases.contains(&Case::Snapshots)
+    {
         std::fs::copy(&args.linux_kernel, work.join("vmlinuz"))
             .with_context(|| format!("copy the Linux kernel {}", args.linux_kernel.display()))?;
     }
@@ -2110,6 +2358,7 @@ pub fn run(args: &Args) -> Result<()> {
             Case::Crash => (format!("3 crash x{}", args.crash_runs), gate.row_crash()),
             Case::Cycles => (format!("4 cycles x{}", args.cycles), gate.row_cycles()),
             Case::Linux => ("5 linux interop".to_string(), gate.row_linux()),
+            Case::Snapshots => ("6 snapshots".to_string(), gate.row_snapshots()),
         };
         let row = match r {
             Ok(detail) => Row {
