@@ -1519,6 +1519,11 @@ pub(crate) fn __test_set_commit_interval_cycles(cycles: u64) {
 pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
 ) -> Result<(), FsError> {
+    // The timer runs beside operations on other CPUs. Committing between an
+    // operation's tree reads and its staging would hand it a tree that moved
+    // (a fresh root with no METADATA_ITEM yet, a closed batch), so it waits
+    // for the operation to finish (`op_lock`).
+    let _op = vol.op_lock().lock().await;
     let stale = {
         let guard = vol.fs_batch().lock().await;
         match guard.as_ref() {
@@ -4860,6 +4865,21 @@ async fn commit_txn<B: BlockDevice + 'static>(
         for &(a, l) in &prev_bgt_new {
             new_meta.push((a, format::BLOCK_GROUP_TREE_OBJECTID, l));
         }
+        // The previous round's extent/block-group-tree blocks were allocated
+        // AFTER that round's csum/root/free-space blocks, but this round's are
+        // allocated (from the same restored base) BEFORE the extent tree is
+        // COWed again — so before convergence, a block this round gave the csum
+        // tree can be one the extent tree held last round. Recording it twice
+        // would mark it used twice in the free-space tree (a hard error) and
+        // charge its block group twice; one record per address is right for
+        // this round, and the converged round never has a collision (every
+        // allocation then repeats the previous round's exactly).
+        let before = new_meta.len();
+        {
+            let mut seen = BTreeSet::new();
+            new_meta.retain(|&(a, _, _)| seen.insert(a));
+        }
+        let collided = new_meta.len() != before;
 
         let mut freed_meta: Vec<(u64, u8)> = fs_freed.clone();
         freed_meta.extend(root_old.iter().copied());
@@ -4961,6 +4981,11 @@ async fn commit_txn<B: BlockDevice + 'static>(
             && cur_bgt_root == prev_bgt_root
             && fst_lv == fst_leaves;
         if converged {
+            // A converged round repeats the previous one's allocations, so a
+            // collision here would be two trees on one block: refuse it.
+            if collided {
+                return Err(FsError::InvalidData);
+            }
             let csum_root = csum_out
                 .as_ref()
                 .map_or((0, 0), |out| (out.root_addr, out.root_level));
@@ -8294,6 +8319,13 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     profiles: Option<BalanceProfiles>,
     evacuate: Option<u64>,
 ) -> Result<BalanceStats, FsError> {
+    // Chunk growth is its own transaction over the committed trees. Close the
+    // running batch first and make its superblock durable: otherwise the
+    // batch's allocator (built before the growth) keeps handing out space the
+    // growth has just used, its uncommitted fs-tree blocks are invisible to
+    // the trees rewritten here, and its pinned extents are still withheld.
+    // An empty batch left by `batch_gen` is discarded by the flush as well.
+    vol.sync_to_disk().await?;
     let sb = vol.superblock();
     let (root_tree, _) = vol.root_tree_root();
     let old_chunk = sb.chunk_root;
@@ -8546,18 +8578,21 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
             system_chunk.logical + system_chunk.length,
         )
     } else {
-        let mut arena = None;
+        let mut free = Vec::new();
         for slot in 0..nritems(&fst_base0)? as usize {
             let key = leaf_item_key(&fst_base0, slot)?;
             if key.item_type == format::FREE_SPACE_EXTENT_KEY
                 && key.objectid >= system_chunk.logical
                 && key.objectid < system_chunk.logical + system_chunk.length
             {
-                arena = Some((key.objectid, key.objectid.saturating_add(key.offset)));
-                break;
+                free.push((key.objectid, key.offset));
             }
         }
-        arena.ok_or(FsError::NoSpace)?
+        // Never place chunk-tree blocks over a superblock copy.
+        let free = crate::allocator::subtract_pinned(free, &vol.super_stripe_exclusions());
+        free.first()
+            .map(|&(s, l)| (s, s.saturating_add(l)))
+            .ok_or(FsError::NoSpace)?
     };
     let new_limit = meta_chunk.logical + meta_chunk.length;
 

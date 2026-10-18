@@ -25,6 +25,7 @@
 #                            (space_cache=v2); exercises the write path's
 #                            free-space-tree maintenance
 #   fixture-bgt.img.sparse   block-group-tree + CachyOS subvolume layout
+#   fixture-tall.img.sparse  4K nodes, @ fs tree three levels deep
 #   fixture-raid{0,1,1c3,1c4,10,5,6}-N.img.sparse  genuine multi-device members;
 #                            RAID6 uses RAID6 for metadata as well as data so
 #                            two-member degraded recovery is testable
@@ -526,6 +527,30 @@ btrfs inspect-internal dump-super "$imgbgt" | grep -q 'compat_ro_flags.*0xb' \
     || { echo "fixture-bgt lacks block-group-tree" >&2; exit 1; }
 sparse_encode "$imgbgt" fixture-bgt.img.sparse
 rm -rf "$bgtstage" "$imgbgt"
+
+# A TALL tree: 4 KiB nodes, single metadata, 1800 empty files in @ so the
+# @ fs tree is three levels deep (root at level 2) and the extent and root
+# trees are two, in under 1 MiB of payload. The many-small-files writer bugs
+# a one-level fixture cannot reach (node splits under an internal root,
+# path re-search after COW) are exercised here.
+tallstage="$(mktemp -d)"
+imgtall="$(mktemp)"
+mkdir -p "$tallstage/@/usr/lib" "$tallstage/@home"
+python3 -c "
+import os
+for d in range(12):
+    p='$tallstage/@/usr/lib/d%02d'%d; os.makedirs(p)
+    for i in range(150): open(p+'/f%03d'%i,'w').close()
+"
+truncate -s 256M "$imgtall"
+mkfs.btrfs --csum crc32c --nodesize 4096 --sectorsize 4096 -m single -d single \
+    -O block-group-tree,free-space-tree,no-holes --subvol rw:@ --subvol rw:@home \
+    --rootdir "$tallstage" "$imgtall" >/dev/null
+btrfs check --readonly "$imgtall" >/dev/null
+btrfs inspect-internal dump-tree -t 257 "$imgtall" | grep -qm1 '^node .* level 2' \
+    || { echo "fixture-tall: @ tree is not three levels deep" >&2; exit 1; }
+sparse_encode "$imgtall" fixture-tall.img.sparse
+rm -rf "$tallstage" "$imgtall"
 
 for profile in raid0 raid1 raid10 raid5 raid6; do
     generate_raid_fixture "$profile"

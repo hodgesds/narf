@@ -125,6 +125,11 @@ macro_rules! autogrow {
         if !$vol.admits_writes() {
             return Err(FsError::ReadOnly);
         }
+        // One mutating operation at a time, from its first read to staging.
+        let _op = $vol.op_lock().lock().await;
+        if !$vol.admits_writes() {
+            return Err(FsError::ReadOnly);
+        }
         let mut r = $op;
         let mut tries = 0u32;
         while tries < 4 && matches!(r, Err(FsError::NoSpace)) {
@@ -304,7 +309,10 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                     } else {
                         disk_flags &= !format::ROOT_SUBVOL_RDONLY;
                     }
-                    crate::write::set_subvol_flags(&vol, disk_flags).await?;
+                    {
+                        let _op = vol.op_lock().lock().await;
+                        crate::write::set_subvol_flags(&vol, disk_flags).await
+                    }?;
                     Ok(FsIoctlReply {
                         result: 0,
                         output: Vec::new(),
@@ -398,7 +406,10 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                     let command = u64::from_ne_bytes(input[0..8].try_into().unwrap());
                     match command {
                         1 => autogrow!(vol, crate::write::quota_enable(&vol).await)?,
-                        2 => crate::write::quota_disable(&vol).await?,
+                        2 => {
+                            let _op = vol.op_lock().lock().await;
+                            crate::write::quota_disable(&vol).await?
+                        }
                         4 => autogrow!(vol, crate::write::quota_enable_simple(&vol).await)?,
                         _ => return Err(FsError::InvalidData),
                     }
@@ -416,7 +427,10 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                     let create = u64::from_ne_bytes(input[0..8].try_into().unwrap());
                     let id = u64::from_ne_bytes(input[8..16].try_into().unwrap());
                     match create {
-                        0 => crate::write::qgroup_destroy_admin(&vol, id).await?,
+                        0 => {
+                            let _op = vol.op_lock().lock().await;
+                            crate::write::qgroup_destroy_admin(&vol, id).await?
+                        }
                         1 => autogrow!(vol, crate::write::qgroup_create_admin(&vol, id).await)?,
                         _ => return Err(FsError::InvalidData),
                     }
@@ -712,7 +726,7 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     /// (The tree-log is only used to *replay* a crashed volume's log on mount,
     /// not to defer writes, so it plays no part here.)
     fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
-        Box::pin(async move { self.volume()?.sync_to_disk().await })
+        Box::pin(async move { self.volume()?.sync_to_disk_exclusive().await })
     }
 
     fn stat(&self) -> Stat {
@@ -860,11 +874,11 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     /// a file's does (see [`FileOps::fsync`] above): `sync(2)`, `syncfs` on a
     /// directory fd and `fsync` of a directory after a rename all land here.
     fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
-        Box::pin(async move { self.volume()?.sync_to_disk().await })
+        Box::pin(async move { self.volume()?.sync_to_disk_exclusive().await })
     }
 
     fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
-        Box::pin(async move { self.volume()?.sync_to_disk().await })
+        Box::pin(async move { self.volume()?.sync_to_disk_exclusive().await })
     }
 
     fn dcache_identity(&self) -> (usize, u64, u64) {
