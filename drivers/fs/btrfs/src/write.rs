@@ -7471,9 +7471,20 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
         format::DIR_ITEM_KEY,
         u64::from(name_hash(old_bytes)),
     );
-    let old_di_body = btree::find_item(vol, fs_root, &old_di_key)
-        .await?
-        .ok_or(FsError::NotFound)?;
+    let old_di_body = match btree::find_item(vol, fs_root, &old_di_key).await? {
+        Some(body) => body,
+        None => {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "btrfs: rename source {old_name:?} not found in dir {parent_ino} \
+                 (tree {} root {fs_root:#x}, live {:#x})",
+                vol.fs_tree_id(),
+                vol.fs_tree_root().0
+            );
+            return Err(FsError::NotFound);
+        }
+    };
     let entry = find_dir_item(&old_di_body, old_name)?;
     if entry.location.item_type != format::INODE_ITEM_KEY {
         return Err(FsError::Unsupported); // subvolume mount point

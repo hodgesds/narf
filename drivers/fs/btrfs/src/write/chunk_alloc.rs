@@ -266,6 +266,18 @@ pub(crate) async fn alloc_chunk<B: BlockDevice + 'static>(
         .await?
         .apply(&mut alloc, &dev_edits)
         .await?;
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "btrfs: allocating a {} chunk: logical {logical:#x} len {size:#x} at {offsets:x?}",
+            if kind == format::BLOCK_GROUP_DATA {
+                "DATA"
+            } else {
+                "METADATA"
+            }
+        );
+    }
     let mut dev_bytes_used = BTreeMap::new();
     dev_bytes_used.insert(devid, bytes_used);
     commit_txn(
