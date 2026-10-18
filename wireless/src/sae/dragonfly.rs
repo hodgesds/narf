@@ -45,6 +45,9 @@ pub enum SaeError {
     InvalidParameters,
     /// State machine ran out of `sync` retries (§12.4.8.6.4).
     TooManySyncRetries,
+    /// The peer's Commit equals ours (hostap `SAE_SILENTLY_DISCARD`:
+    /// "Drop commit message due to reflection attack").
+    Reflection,
 }
 
 /// SAE state (§12.4.8.6).
@@ -435,11 +438,9 @@ pub fn derive_pwe<G: HuntAndPeck>(
 // iwlwifi/mvm/sae.c and hostapd/wpa_supplicant src/common/sae.c
 // implement the same flow. NARF is GPL-2.0-or-later post 2026-05-20.
 
-use narf_crypto::hkdf::{hkdf_expand, hkdf_extract, hmac_sha256};
-use narf_crypto::p256::field::Fp;
+use narf_crypto::hkdf::{hkdf_expand, hkdf_extract};
 use narf_crypto::p256::point::{scalar_mul, AffinePoint};
 use narf_crypto::p256::scalar::Scalar;
-use narf_crypto::p256::CURVE_B;
 
 /// SAE group running over NIST P-256 (group 19). Implements both
 /// `HuntAndPeck` (for the password-element derivation) and `EccGroup`
@@ -526,121 +527,24 @@ fn group_random_scalar(test_seed: Option<&[u8; 64]>, info: &[u8]) -> Scalar {
 }
 
 impl HuntAndPeck for P256Group {
-    /// 802.11-2020 §12.4.4.2.2 hash-to-element (per RFC 7664 §3.2.1).
-    ///
-    /// Loop invariant per §12.4.4.2.2 NOTE: we run a fixed number of
-    /// iterations (`iteration_floor()`, default 40) regardless of when
-    /// the first valid candidate is found. After the loop we return
-    /// the first saved PWE; if none was saved we fall back to an
-    /// error.
-    ///
-    /// Algorithm:
-    /// ```text
-    ///   found = 0
-    ///   for counter = 1 to k:
-    ///       pwd_seed = HMAC-SHA256(max(MAC_A,MAC_B) || min(...), pw || counter)
-    ///       pwd_value = HKDF-Expand(pwd_seed, "SAE Hunting and Pecking", 32)
-    ///       if pwd_value < p AND (pwd_value^3 − 3*pwd_value + b) is a QR:
-    ///           if found == 0:
-    ///               save_x = pwd_value
-    ///               save_seed_lsb = pwd_seed[0] & 1
-    ///               found = 1
-    ///       (loop continues regardless)
-    ///   if found:
-    ///       y = sqrt(save_x^3 − 3*save_x + b)
-    ///       if LSB(y) != save_seed_lsb: y = p − y
-    ///       PWE = (save_x, y)
-    /// ```
+    /// 802.11-2020 §12.4.4.2.2 hunting and pecking, as hostap
+    /// `sae_derive_pwe_ecc` ([`super::pt::pwe_hunt_and_peck`]): pwd-seed
+    /// = HMAC-SHA256(MAX(addr) || MIN(addr), password || counter),
+    /// pwd-value = KDF-256(pwd-seed, "SAE Hunting and Pecking", p), at
+    /// least 40 rounds, y parity from pwd-seed\[31\]. The counter is the
+    /// round whose candidate was kept.
     fn hunt_and_peck(
         &mut self,
         password: &[u8],
         sta_a: &[u8; 6],
         sta_b: &[u8; 6],
     ) -> Result<(Vec<u8>, u32), SaeError> {
-        let max_iter = self.iteration_floor();
-        // Salt: max(MAC_a, MAC_b) || min(MAC_a, MAC_b) — already
-        // canonicalised by `derive_pwe`'s call to `order_mac_pair`,
-        // but H2P is also reached directly through this trait so we
-        // re-canonicalise here as a belt-and-braces.
-        let (high, low) = if sta_a > sta_b {
-            (sta_a, sta_b)
-        } else {
-            (sta_b, sta_a)
-        };
-        let mut salt = [0u8; 12];
-        salt[..6].copy_from_slice(high);
-        salt[6..].copy_from_slice(low);
-
-        let mut saved_x: Option<Fp> = None;
-        let mut saved_seed_lsb: u8 = 0;
-        // Constant-iteration loop — we keep going even after `found`
-        // flips so timing reveals only the (public) iteration floor.
-        let mut found_counter: u32 = 0;
-        for counter in 1u8..=(max_iter as u8) {
-            // pwd-seed = HMAC-SHA256(salt, password || counter)
-            let mut ikm = Vec::with_capacity(password.len() + 1);
-            ikm.extend_from_slice(password);
-            ikm.push(counter);
-            let pwd_seed = hmac_sha256(&salt, &ikm);
-
-            // pwd-value = HKDF-Expand(pwd-seed, "SAE Hunting and Pecking", 32)
-            let pwd_value = hkdf_expand(&pwd_seed, b"SAE Hunting and Pecking", 32);
-            let mut pv = [0u8; 32];
-            pv.copy_from_slice(&pwd_value);
-
-            // Try to interpret as an X candidate. `Fp::from_bytes_be`
-            // rejects values >= p, returning None — we treat None as
-            // "candidate fails", same as a non-QR x.
-            let candidate = Fp::from_bytes_be(&pv);
-            let is_valid = match candidate {
-                Some(x) => {
-                    let rhs = curve_rhs(&x);
-                    rhs.is_quadratic_residue()
-                }
-                None => false,
-            };
-            if is_valid && saved_x.is_none() {
-                saved_x = candidate;
-                saved_seed_lsb = pwd_seed[0] & 1;
-                found_counter = counter as u32;
-            }
-            // Loop continues regardless (constant-time discipline).
-            let _ = is_valid; // silence dead-store in release builds
-        }
-
-        let x = saved_x.ok_or(SaeError::TooManySyncRetries)?;
-        // Solve y^2 = x^3 - 3x + b for y.
-        let rhs = curve_rhs(&x);
-        let mut y = rhs.sqrt();
-        // Pick the y whose LSB matches the saved seed's LSB
-        // (§12.4.4.2.2 step 9 — RFC 7664 §3.2.1 step 18).
-        if y.lsb() != saved_seed_lsb {
-            y = y.neg();
-        }
-        let pwe = AffinePoint {
-            x,
-            y,
-            infinity: false,
-        };
-        // Cache the resolved PWE so `make_commit` doesn't have to
-        // re-run the hash-to-element loop on the same inputs.
+        let (pwe, round) = super::pt::pwe_hunt_and_peck(password, sta_a, sta_b)
+            .ok_or(SaeError::TooManySyncRetries)?;
         self.pwe = Some(pwe);
-
-        // Encode as X || Y (64 bytes) for the trait surface. Real
-        // callers (i.e. `make_commit`) ignore the encoded form and
-        // pull `self.pwe` directly.
         let enc = pwe.to_encoded().ok_or(SaeError::InvalidParameters)?;
-        Ok((enc.to_vec(), found_counter))
+        Ok((enc.to_vec(), round as u32))
     }
-}
-
-/// Compute the curve right-hand-side `x^3 - 3x + b` (a = -3 for P-256).
-fn curve_rhs(x: &Fp) -> Fp {
-    let x2 = x.square();
-    let x3 = x2.mul(x);
-    let three_x = x.add(x).add(x);
-    let b = Fp::from_limbs(CURVE_B);
-    x3.sub(&three_x).add(&b)
 }
 
 impl EccGroup for P256Group {

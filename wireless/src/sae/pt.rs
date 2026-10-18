@@ -17,124 +17,195 @@
 //!
 //! ## Two-step derivation (PT then PWE)
 //!
-//! H2E splits the PWE derivation into two halves so the expensive
-//! hash-to-curve work is amortised across every peer:
+//! H2E splits the PWE derivation so the expensive hash-to-curve work
+//! is done once per `(ssid, password)`; hostap `sae_derive_pt_ecc` and
+//! `sae_derive_pwe_from_pt_ecc`, IEEE 802.11-2020 §12.4.4.2.3:
 //!
 //! ```text
-//!   PT  = hash_to_curve(  password || ssid  ,  H2E_DST  )
-//!   val = HKDF-Expand(  H( max(MAC) || min(MAC) )  ,  "SAE PT-to-PWE"  ,  32 ) mod (n − 1)
-//!   PWE = (val + 1) ·  PT                                                  (scalar mul)
+//!   PT  = SSWU(HKDF-Expand(pwd-seed, "…u1 P1", 48) mod p)
+//!       + SSWU(HKDF-Expand(pwd-seed, "…u2 P2", 48) mod p),
+//!         pwd-seed = HKDF-Extract(ssid, password [|| identifier])
+//!   PWE = (H(0^32, MAX(MAC) || MIN(MAC)) mod (r - 1) + 1) · PT
 //! ```
 //!
-//! - `PT` only depends on `(ssid, password)`. The supplicant computes
-//!   it once at network-add time and caches it.
-//! - `PWE` depends on the specific `(STA-A, STA-B)` MAC pair. It's
-//!   one scalar multiplication on the cached PT, no field-iteration
-//!   loop.
+//! This is not RFC 9380 `hash_to_curve` (no `expand_message_xmd`, no
+//! DST); only the SSWU map is shared. Pinned to the IEEE 802.11-2020
+//! Annex J.10 PT/PWE vector (`smoke_sae_h2e_pwe_ieee_j10_vector`).
 //!
-//! The derivation here is taken from IEEE 802.11-2020 §12.4.4.2.3
-//! (steps 1–7); the inner DST and KDF labels match what hostap's
-//! `src/common/sae.c` (`sae_h2e_pt_curve` and `sae_derive_pwe_h2e`)
-//! ships. NARF is GPL-2.0-or-later post 2026-05-20, so the structure
-//! can be (and is) cited directly. The code is independently written.
+//! [`pwe_hunt_and_peck`] is the §12.4.4.2.2 loop (hostap
+//! `sae_derive_pwe_ecc`).
 //!
-//! ## Domain Separation Tag
-//!
-//! IEEE 802.11-2020 §12.4.4.2.3 step 1 wires the DST through
-//! RFC 9380 hash-to-curve. The published tag is the ASCII string
-//! `"SAE-H2E-1.0"` per the spec's draft and hostap's implementation.
-//! The DST canonicalises ASCII identifiers to enforce a unique
-//! group/algorithm slot per RFC 9380 §3.1's discipline.
-
 use alloc::vec::Vec;
 
-use narf_crypto::hkdf::{hkdf_expand, hkdf_extract};
-use narf_crypto::p256::p256_hash_to_curve;
+use narf_crypto::hkdf::{hkdf_expand, hkdf_extract, hmac_sha256};
+use narf_crypto::p256::field::Fp;
+use narf_crypto::p256::hash_to_curve::{map_to_curve_sswu, os2ip_mod_p};
 use narf_crypto::p256::point::{scalar_mul, AffinePoint};
 use narf_crypto::p256::scalar::Scalar;
-use narf_crypto::sha256::Sha256;
 
-/// Domain Separation Tag for SAE Hash-to-Element on P-256.
-/// IEEE 802.11-2020 §12.4.4.2.3 step 1 + RFC 9380 §3.1. Public
-/// constant — callers can match against it when verifying interop
-/// against hostap traces.
-pub const SAE_H2E_DST_P256: &[u8] = b"SAE-H2E-1.0 P256";
-
-/// Convenience: the SAE H2E DST as a byte slice. Matches what hostap
-/// puts on the wire when negotiating SAE Status 126.
-pub fn sae_h2e_dst() -> &'static [u8] {
-    SAE_H2E_DST_P256
-}
-
-/// Derive the SAE Password Token per IEEE 802.11-2020 §12.4.4.2.3
-/// steps 1–4. Cacheable per (ssid, password, optional identifier).
+/// The SAE Password Token for group 19, as hostap `sae_derive_pt_ecc`
+/// (IEEE 802.11-2020 §12.4.4.2.3):
 ///
-/// The H2E spec optionally folds in an "identifier" string — used by
-/// SAE-PK (Public Key) so the same password can be associated with
-/// multiple per-AP identities. WPA3-Personal-Plain leaves it `None`.
+/// ```text
+///   pwd-seed  = HKDF-Extract(ssid, password [|| identifier])
+///   pwd-value = HKDF-Expand(pwd-seed, "SAE Hash to Element u1 P1", 48)
+///   u1        = pwd-value mod p;  P1 = SSWU(u1)
+///   pwd-value = HKDF-Expand(pwd-seed, "SAE Hash to Element u2 P2", 48)
+///   u2        = pwd-value mod p;  P2 = SSWU(u2)
+///   PT        = P1 + P2
+/// ```
+///
+/// (`len = olen(p) + ceil(olen(p)/2)` = 48; SSWU with Z = -10 is
+/// `narf_crypto::p256::hash_to_curve::map_to_curve_sswu`, hostap `sswu`.)
+/// `identifier` is the SAE Password Identifier.
 pub fn pt_h2e(ssid: &str, password: &str, identifier: Option<&str>) -> AffinePoint {
-    // Per §12.4.4.2.3 step 2: pwd-seed = HKDF-Extract(ssid, password || identifier)
-    // Note IEEE-2020 specifies HKDF-Extract uses the SSID as the salt and the
-    // (password || identifier) as the IKM. The output PRK is then fed into
-    // hash_to_curve as the message.
-    let mut ikm: Vec<u8> = Vec::with_capacity(password.len() + identifier.map_or(0, |s| s.len()));
-    ikm.extend_from_slice(password.as_bytes());
-    if let Some(id) = identifier {
-        ikm.extend_from_slice(id.as_bytes());
-    }
-    let pwd_seed = hkdf_extract(Some(ssid.as_bytes()), &ikm);
-    // Step 3-4: PT = hash_to_curve(pwd_seed, DST).
-    p256_hash_to_curve(&pwd_seed, SAE_H2E_DST_P256)
+    pt_h2e_bytes(
+        ssid.as_bytes(),
+        password.as_bytes(),
+        identifier.map(str::as_bytes),
+    )
 }
 
-/// Derive the SAE Password Element from a cached PT and the
-/// per-handshake `(MAC_A, MAC_B)` pair, per IEEE 802.11-2020
-/// §12.4.4.2.3 steps 5–7.
-///
-/// The MAC pair is canonicalised so both peers compute the same PWE
-/// regardless of which one is the supplicant: the larger
-/// (lexicographically) MAC always sorts first into the hash input.
-///
-/// `val` is the scalar `(HKDF-derived 256-bit integer mod (n − 1)) + 1`
-/// — the `+1` step keeps `val` in `[1, n)`, which the spec requires so
-/// `val · PT` is never the point at infinity.
-pub fn pwe_from_pt(pt: AffinePoint, mac_a: &[u8; 6], mac_b: &[u8; 6]) -> AffinePoint {
-    // Canonical MAC pair ordering (§12.4.4.2.3 step 5): the higher MAC
-    // sorts first. Match `dragonfly::order_mac_pair`.
-    let (high, low) = if mac_a > mac_b {
-        (mac_a, mac_b)
-    } else {
-        (mac_b, mac_a)
+/// [`pt_h2e`] over raw octets (SSIDs and passwords need not be UTF-8).
+pub fn pt_h2e_bytes(ssid: &[u8], password: &[u8], identifier: Option<&[u8]>) -> AffinePoint {
+    let mut ikm: Vec<u8> = Vec::with_capacity(password.len() + identifier.map_or(0, |s| s.len()));
+    ikm.extend_from_slice(password);
+    if let Some(id) = identifier {
+        ikm.extend_from_slice(id);
+    }
+    // sae_pwd_seed: hkdf_extract(hash_len, ssid, ssid_len, password [|| id])
+    let pwd_seed = hkdf_extract(Some(ssid), &ikm);
+    let point = |label: &[u8]| {
+        let pwd_value = hkdf_expand(&pwd_seed, label, 48);
+        let u = os2ip_mod_p(&pwd_value);
+        map_to_curve_sswu(&u)
     };
+    let p1 = point(b"SAE Hash to Element u1 P1");
+    let p2 = point(b"SAE Hash to Element u2 P2");
+    p1.to_projective().add_mixed(&p2).to_affine()
+}
 
-    // Step 6: salt = SHA-256(high || low).
-    let mut salt_in: Vec<u8> = Vec::with_capacity(12);
-    salt_in.extend_from_slice(high);
-    salt_in.extend_from_slice(low);
-    let mut h = Sha256::new();
-    h.update(&salt_in);
-    let salt = h.finalize();
+/// `MAX(STA-A-MAC, STA-B-MAC) || MIN(STA-A-MAC, STA-B-MAC)` (hostap
+/// `sae_max_min_addr` / `sae_pwd_seed_key`).
+fn max_min(a: &[u8; 6], b: &[u8; 6]) -> [u8; 12] {
+    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+    let mut out = [0u8; 12];
+    out[..6].copy_from_slice(hi);
+    out[6..].copy_from_slice(lo);
+    out
+}
 
-    // Step 7a: val_bytes = HKDF-Expand(SHA-256(salt) PRK-like, "SAE PT-to-PWE", 32).
-    // We use the SAE label spec calls for. The "PT-to-PWE" label is from
-    // hostap's `sae_derive_pwe_h2e` — it's a hostap-coined label that the
-    // SAE spec leaves under-specified; using the same one keeps
-    // interoperability easy.
-    let val_bytes = hkdf_expand(&salt, b"SAE PT-to-PWE", 32);
-    let mut val_be = [0u8; 32];
-    val_be.copy_from_slice(&val_bytes);
-    // Step 7b: val = (val_bytes mod (n − 1)) + 1.
-    // `Scalar::from_bytes_be_reduce` reduces mod n; we then bump by 1
-    // (this is equivalent to "mod n" giving a value in [0, n) and then
-    // shifting to [1, n] — close enough to "mod (n − 1) + 1" that the
-    // resulting val is uniformly distributed across [1, n − 1) plus a
-    // tiny edge term at `n`. The cryptographic impact is negligible;
-    // matches hostap.
-    let val_mod_n = Scalar::from_bytes_be_reduce(&val_be);
-    let val = val_mod_n.add(&Scalar::ONE);
+/// `x mod (r - 1) + 1` for a 32-octet big-endian `x` (`r` = the P-256
+/// group order): `2^256 < 2 (r - 1)`, so one conditional subtraction
+/// reduces. The result is in `[1, r - 1]`.
+fn mod_order_minus_one_plus_one(x: &[u8; 32]) -> Scalar {
+    let rm1 = Scalar::ZERO.sub(&Scalar::ONE).to_bytes_be();
+    let mut v = *x;
+    if v >= rm1 {
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let d = v[i] as i16 - rm1[i] as i16 - borrow;
+            v[i] = d.rem_euclid(256) as u8;
+            borrow = (d < 0) as i16;
+        }
+    }
+    Scalar::from_bytes_be(&v)
+        .expect("value below r - 1")
+        .add(&Scalar::ONE)
+}
 
-    // Step 7c: PWE = val · PT.
+/// The PWE from a cached PT, as hostap `sae_derive_pwe_from_pt_ecc`
+/// (IEEE 802.11-2020 §12.4.4.2.3):
+///
+/// ```text
+///   val = H(0^32, MAX(STA-A-MAC, STA-B-MAC) || MIN(STA-A-MAC, STA-B-MAC))
+///   val = val mod (r - 1) + 1
+///   PWE = val · PT
+/// ```
+///
+/// (`H` = HKDF-Extract / HMAC-SHA256 keyed with 32 zero octets.)
+pub fn pwe_from_pt(pt: AffinePoint, mac_a: &[u8; 6], mac_b: &[u8; 6]) -> AffinePoint {
+    let addrs = max_min(mac_a, mac_b);
+    let hash = hkdf_extract(Some(&[0u8; 32]), &addrs);
+    let val = mod_order_minus_one_plus_one(&hash);
     scalar_mul(&val, &pt)
+}
+
+/// The hunting-and-pecking PWE for group 19, as hostap
+/// `sae_derive_pwe_ecc` + `sae_test_pwd_seed_ecc` (IEEE 802.11-2020
+/// §12.4.4.2.2):
+///
+/// ```text
+///   for counter = 1, 2, … (at least k = 40 rounds, until found):
+///     pwd-seed  = HMAC-SHA256(MAX(addr) || MIN(addr), password || counter)
+///     pwd-value = KDF-256(pwd-seed, "SAE Hunting and Pecking", p)
+///     first pwd-value < p with x³ - 3x + b a quadratic residue → x,
+///       its seed's parity (pwd-seed[31] & 1) → y parity
+///   y = sqrt(x³ - 3x + b), negated when its LSB ≠ the saved parity
+/// ```
+///
+/// Every round runs whatever was found (hostap's constant-iteration
+/// loop; the stub password after `found` only changes which bytes are
+/// hashed). Returns the PWE and the round that found it; `None` if no
+/// candidate within 200 rounds (hostap's "SAE: Failed to find PWE").
+pub fn pwe_hunt_and_peck(
+    password: &[u8],
+    mac_a: &[u8; 6],
+    mac_b: &[u8; 6],
+) -> Option<(AffinePoint, u8)> {
+    let addrs = max_min(mac_a, mac_b);
+    let prime = Fp::ZERO.sub(&Fp::ONE).to_bytes_be();
+    // p = (p - 1) + 1 as big-endian bytes.
+    let mut p_bytes = prime;
+    for i in (0..32).rev() {
+        let (v, c) = p_bytes[i].overflowing_add(1);
+        p_bytes[i] = v;
+        if !c {
+            break;
+        }
+    }
+    let mut found: Option<(Fp, u8, u8)> = None;
+    let mut counter: u8 = 1;
+    loop {
+        if counter > 200 {
+            return None;
+        }
+        let mut msg = Vec::with_capacity(password.len() + 1);
+        msg.extend_from_slice(password);
+        msg.push(counter);
+        let pwd_seed = hmac_sha256(&addrs, &msg);
+        let v = super::session::kdf_sha256(&pwd_seed, b"SAE Hunting and Pecking", &p_bytes, 32);
+        let mut x = [0u8; 32];
+        x.copy_from_slice(&v);
+        if let Some(xf) = Fp::from_bytes_be(&x) {
+            if found.is_none() && curve_rhs(&xf).is_quadratic_residue() {
+                found = Some((xf, pwd_seed[31] & 1, counter));
+            }
+        }
+        if found.is_some() && counter >= 40 {
+            break;
+        }
+        counter += 1;
+    }
+    let (x, odd, round) = found?;
+    let mut y = curve_rhs(&x).sqrt();
+    if y.lsb() != odd {
+        y = y.neg();
+    }
+    let pwe = AffinePoint {
+        x,
+        y,
+        infinity: false,
+    };
+    Some((pwe, round))
+}
+
+/// `x³ - 3x + b` (P-256).
+fn curve_rhs(x: &Fp) -> Fp {
+    let x3 = x.square().mul(x);
+    let three_x = x.add(x).add(x);
+    x3.sub(&three_x)
+        .add(&Fp::from_limbs(narf_crypto::p256::CURVE_B))
 }
 
 /// Validate that a candidate PWE is structurally usable: on-curve and
