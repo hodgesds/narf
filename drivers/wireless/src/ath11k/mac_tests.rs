@@ -333,6 +333,8 @@ pub(super) struct World {
     pub(super) authorized: Option<bool>,
     pub(super) sta_wme: Option<bool>,
     pub(super) pn: Vec<(u32, bool, bool)>,
+    /// `(start, tid, buf_size, ssn)` per ampdu_action.
+    pub(super) ampdu: Vec<(bool, u8, u16, u16)>,
 }
 
 type Shared = Arc<IrqSafeSpinLock<World>>;
@@ -679,6 +681,26 @@ impl DataPort for FakeDp {
     }
     fn set_sta_wme(&self, _addr: [u8; 6], wme: bool) {
         self.0.lock().sta_wme = Some(wme);
+    }
+    fn ampdu_rx_start(
+        &self,
+        _vdev_id: u32,
+        _addr: [u8; 6],
+        tid: u8,
+        buf_size: u16,
+        ssn: u16,
+    ) -> impl Future<Output = Result<(), i32>> + Send {
+        self.0.lock().ampdu.push((true, tid, buf_size, ssn));
+        core::future::ready(Ok(()))
+    }
+    fn ampdu_rx_stop(
+        &self,
+        _vdev_id: u32,
+        _addr: [u8; 6],
+        tid: u8,
+    ) -> impl Future<Output = Result<(), i32>> + Send {
+        self.0.lock().ampdu.push((false, tid, 0, 0));
+        core::future::ready(Ok(()))
     }
 }
 

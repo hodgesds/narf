@@ -1467,6 +1467,67 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
     fn set_sta_wme(&self, addr: [u8; 6], wme: bool) {
         self.0.push_op(SyncOp::StaWme { addr, wme });
     }
+
+    async fn ampdu_rx_start(
+        &self,
+        vdev_id: u32,
+        addr: [u8; 6],
+        tid: u8,
+        buf_size: u16,
+        ssn: u16,
+    ) -> Result<(), i32> {
+        // ath11k_dp_rx_ampdu_start: ath11k_peer_rx_tid_setup(.., tid,
+        // buf_size, ssn, arsta->pn_type); arsta->pn_type is WPA once a
+        // CCMP / TKIP / GCMP pairwise key is installed.
+        let setup = {
+            let mut g = self.0.lock().await;
+            let now = g.now_ms();
+            let pn = if g.link.ptk {
+                super::dp_peer::HalPnType::Wpa
+            } else {
+                super::dp_peer::HalPnType::None
+            };
+            let rt = &mut *g;
+            let hif = &mut rt.core.hif;
+            rt.dp
+                .ampdu_start(
+                    &mut hif.ce.hal,
+                    &hif.io,
+                    vdev_id as u8,
+                    &addr,
+                    tid,
+                    buf_size,
+                    ssn,
+                    pn,
+                    now,
+                )
+                .map_err(|e| e.errno)?
+        };
+        if let Err(e) = self.0.wmi_send(&setup.cmd).await {
+            // "failed to setup rx reorder queue": ath11k_dp_rx_tid_mem_free.
+            let mut g = self.0.lock().await;
+            g.dp.rx_tid_wmi_failed(vdev_id as u8, &addr, &setup);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    async fn ampdu_rx_stop(&self, vdev_id: u32, addr: [u8; 6], tid: u8) -> Result<(), i32> {
+        let cmd = {
+            let mut g = self.0.lock().await;
+            let now = g.now_ms();
+            let rt = &mut *g;
+            let hif = &mut rt.core.hif;
+            rt.dp
+                .ampdu_stop(&mut hif.ce.hal, &hif.io, vdev_id as u8, &addr, tid, now)
+                .map_err(|e| e.errno)?
+        };
+        match cmd {
+            // "failed to send wmi to delete rx tid".
+            Some(c) => self.0.wmi_send(&c).await,
+            None => Ok(()),
+        }
+    }
 }
 
 // ── PCI: from a ready core to `wlan%d` ────────────────────────────

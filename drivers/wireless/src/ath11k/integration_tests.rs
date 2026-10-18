@@ -817,7 +817,15 @@ impl Drop for Up {
 /// then IFF_UP through the stack (`ndo_open` → mac start + vif on the
 /// next runtime pass).
 fn up(cfg: FwCfg) -> Result<Up, &'static str> {
-    let u = up_down(cfg)?;
+    up_caps(cfg, |_| {})
+}
+
+/// [`up`] with the mac layer's device capabilities adjusted first.
+fn up_caps(
+    cfg: FwCfg,
+    adjust: impl FnOnce(&mut super::mac::DeviceCaps),
+) -> Result<Up, &'static str> {
+    let u = up_down_caps(cfg, adjust)?;
     ensure!(narf_net::iface::set_link_state(u.name, true), "IFF_UP");
     let (_, err, _, _) = latched(|| pump(&u, 1));
     ensure!(err == 0, "mac start over the runtime");
@@ -835,6 +843,14 @@ fn up(cfg: FwCfg) -> Result<Up, &'static str> {
 /// registered, the netdev registered with the stack under a `wlan%d`
 /// name, still down (hardware not started).
 fn up_down(cfg: FwCfg) -> Result<Up, &'static str> {
+    up_down_caps(cfg, |_| {})
+}
+
+/// [`up_down`] with the mac layer's device capabilities adjusted first.
+fn up_down_caps(
+    cfg: FwCfg,
+    adjust: impl FnOnce(&mut super::mac::DeviceCaps),
+) -> Result<Up, &'static str> {
     let (mut core, mut hooks, dev) = rig(script(), cfg, SIZES);
     let (r, err, _, stage) = bring_up(&mut core, &mut hooks);
     ensure!(r.is_ok() && err == 0, "bring-up with the DP");
@@ -844,7 +860,8 @@ fn up_down(cfg: FwCfg) -> Result<Up, &'static str> {
     );
     let dp = hooks.dp.take().ok_or("hooks keep the DP")?;
     let rt = Rt::new(core, dp);
-    let caps = rt.device_caps().map_err(|_| "device caps")?;
+    let mut caps = rt.device_caps().map_err(|_| "device caps")?;
+    adjust(&mut caps);
     let reg = rt.core.reg_info.clone();
     let shared = Shared::new(rt, test_rng);
     let mac = Mac::new(
@@ -1616,6 +1633,303 @@ fn smoke_ath11k_int_group_rekey() -> TestResult {
     })
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_group_rekey);
+
+/// An ADDBA Request from the AP (`struct ieee80211_mgmt` u.action
+/// u.addba_req): category 3, action 0, token, capab = policy << 1 | tid
+/// << 2 | buf << 6, timeout, start sequence << 4.
+fn addba_req(token: u8, policy: u16, tid: u16, buf: u16, timeout: u16, ssn: u16) -> Vec<u8> {
+    let mut f = super::mac_frame::mgmt_hdr(super::mac_frame::stype::ACTION, &OWN, &BSSID, &BSSID);
+    f.extend_from_slice(&[3, 0, token]);
+    f.extend_from_slice(&(policy << 1 | tid << 2 | buf << 6).to_le_bytes());
+    f.extend_from_slice(&timeout.to_le_bytes());
+    f.extend_from_slice(&(ssn << 4).to_le_bytes());
+    f
+}
+
+/// A DELBA from the AP: params = initiator << 11 | tid << 12, reason.
+fn delba_from_ap(tid: u16, initiator: u16, reason: u16) -> Vec<u8> {
+    let mut f = super::mac_frame::mgmt_hdr(super::mac_frame::stype::ACTION, &OWN, &BSSID, &BSSID);
+    f.extend_from_slice(&[3, 2]);
+    f.extend_from_slice(&(initiator << 11 | tid << 12).to_le_bytes());
+    f.extend_from_slice(&reason.to_le_bytes());
+    f
+}
+
+/// The ADDBA Response mac80211 sends (`ieee80211_send_addba_resp` via
+/// `ieee80211_mgmt_ba`), written out from the field order: action
+/// header to the AP, sequence control `seq`, category 3, action 1,
+/// token, status, capab = A-MSDU (1) | policy 1 << 1 | tid << 2 | buf <<
+/// 6, timeout.
+fn addba_resp_golden(
+    seq: u16,
+    token: u8,
+    status: u16,
+    tid: u16,
+    buf: u16,
+    timeout: u16,
+) -> Vec<u8> {
+    let mut g = vec![0xd0, 0x00, 0x00, 0x00];
+    g.extend_from_slice(&BSSID);
+    g.extend_from_slice(&OWN);
+    g.extend_from_slice(&BSSID);
+    g.extend_from_slice(&seq.to_le_bytes());
+    g.extend_from_slice(&[0x03, 0x01, token]);
+    g.extend_from_slice(&status.to_le_bytes());
+    g.extend_from_slice(&(1 | 1 << 1 | tid << 2 | buf << 6).to_le_bytes());
+    g.extend_from_slice(&timeout.to_le_bytes());
+    g
+}
+
+/// RX Block Ack: mac80211's `ieee80211_process_addba_request` /
+/// `__ieee80211_start_rx_ba_session` (HT AP, `SUPPORTS_REORDERING_BUFFER`)
+/// → `ath11k_dp_rx_ampdu_start` (REO UPDATE of the TID's queue with the
+/// window + SSN, `WMI_PEER_REORDER_QUEUE_SETUP`) → ADDBA Response; DELBA
+/// from the originator → `ath11k_dp_rx_ampdu_stop` (window 1); the
+/// declines mac80211 answers with; the sessions torn down on disconnect
+/// without a DELBA.
+fn smoke_ath11k_int_rx_ba_session() -> TestResult {
+    use super::mac_tests::mgmt_rx_event;
+    check(|| {
+        // An HT-capable 2.4 GHz radio (the bring-up fixture's SERVICE_READY
+        // has HT off; mac80211 declines BA sessions without HT).
+        let u = up_caps(wpa2_cfg(), |c| {
+            c.pdev.band_2g.ht_cap_info = 0x185f;
+        })?;
+        connect(&u)?;
+        ensure!(
+            run(u.netdev.mac.lock())
+                .link()
+                .is_some_and(|l| l.sta.ht_cap.ht_supported),
+            "HT association"
+        );
+        let rx = |u: &Up, f: Vec<u8>| {
+            u.dev
+                .st
+                .borrow_mut()
+                .world
+                .events
+                .push_back(mgmt_rx_event(6, 60, 2437, 0, &f));
+            pump(u, 3);
+        };
+        let reorder = |u: &Up, from: usize| -> Vec<WmiCmd> {
+            u.dev.st.borrow().wmi[from..]
+                .iter()
+                .filter(|c| c.cmd_id == wmi::WMI_PEER_REORDER_QUEUE_SETUP_CMDID)
+                .cloned()
+                .collect()
+        };
+        let tid_q = |u: &Up, tid: usize| {
+            let g = run(u.shared.lock());
+            let t = &g.dp.peer_rx.peer(0, &BSSID).expect("AP rx peer").rx_tid[tid];
+            (t.paddr, t.ba_win_sz)
+        };
+        let mgmt = |u: &Up| u.dev.st.borrow().world.mgmt.clone();
+        // auth 0x000, assoc 0x010 before.
+        let (w0, r0, m0) = {
+            let st = u.dev.st.borrow();
+            (st.wmi.len(), st.reo_cmds, st.world.mgmt.len())
+        };
+        ensure!(m0 == 2, "auth + assoc sent");
+        let (pa0, win) = tid_q(&u, 0);
+        ensure!(win == 1, "TID 0 at window 1 after peer setup");
+
+        rx(&u, addba_req(5, 1, 0, 64, 0, 0x123));
+        ensure!(
+            mgmt(&u)[2] == addba_resp_golden(0x0020, 5, 0, 0, 64, 0),
+            "ADDBA Response golden (success, window 64)"
+        );
+        ensure!(
+            u.dev.st.borrow().reo_cmds == r0 + 1,
+            "one REO UPDATE_RX_QUEUE"
+        );
+        let want = wmi::peer_rx_reorder_queue_setup_cmd(0, &BSSID, pa0, 0, 1, 64);
+        let got = reorder(&u, w0);
+        ensure!(
+            got.len() == 1 && got[0] == want,
+            "REORDER_QUEUE_SETUP tid 0 window 64"
+        );
+        ensure!(tid_q(&u, 0) == (pa0, 64), "TID 0 queue at window 64");
+
+        // The same token again: tid_rx is NULL (REORDERING_BUFFER), so
+        // the "updated AddBA Req" is declined; nothing reprogrammed.
+        rx(&u, addba_req(5, 1, 0, 64, 0, 0x200));
+        ensure!(
+            mgmt(&u)[3] == addba_resp_golden(0x0030, 5, 37, 0, 64, 0),
+            "same token: REQUEST_DECLINED"
+        );
+        ensure!(u.dev.st.borrow().reo_cmds == r0 + 1, "no REO command");
+
+        // Declines: TID 9 (TSPEC), delayed BA, a window over 64 (HT),
+        // and buffer 0 → 64 on a fresh TID with a new token.
+        rx(&u, addba_req(6, 1, 9, 64, 0, 0));
+        rx(&u, addba_req(7, 0, 1, 64, 0, 0));
+        rx(&u, addba_req(8, 1, 1, 128, 0, 0));
+        let m = mgmt(&u);
+        ensure!(
+            m[4] == addba_resp_golden(0x0040, 6, 37, 9, 64, 0)
+                && m[5] == addba_resp_golden(0x0050, 7, 38, 1, 64, 0)
+                && m[6] == addba_resp_golden(0x0060, 8, 38, 1, 128, 0),
+            "TID 9 declined; policy 0 / window 128 INVALID_QOS_PARAM"
+        );
+        ensure!(
+            u.dev.st.borrow().reo_cmds == r0 + 1,
+            "declines program nothing"
+        );
+        rx(&u, addba_req(9, 1, 5, 0, 100, 7));
+        ensure!(
+            mgmt(&u)[7] == addba_resp_golden(0x0070, 9, 0, 5, 64, 100),
+            "buffer 0 → 64, the timeout echoed"
+        );
+        ensure!(tid_q(&u, 5).1 == 64, "TID 5 at window 64");
+
+        // A new token on an active TID: the old session stops (REO update
+        // of TID 0's queue — Linux's peer->rx_tid quirk — + WMI window 1)
+        // and the new one starts.
+        let w1 = u.dev.st.borrow().wmi.len();
+        rx(&u, addba_req(10, 1, 5, 32, 0, 9));
+        ensure!(
+            mgmt(&u)[8] == addba_resp_golden(0x0080, 10, 0, 5, 32, 0),
+            "new token accepted"
+        );
+        let (pa5, win5) = tid_q(&u, 5);
+        let got = reorder(&u, w1);
+        ensure!(
+            got.len() == 2
+                && got[0] == wmi::peer_rx_reorder_queue_setup_cmd(0, &BSSID, pa5, 5, 1, 1)
+                && got[1] == wmi::peer_rx_reorder_queue_setup_cmd(0, &BSSID, pa5, 5, 1, 32)
+                && win5 == 32,
+            "RX_STOP (window 1) then RX_START (window 32) for TID 5"
+        );
+        ensure!(
+            tid_q(&u, 0).1 == 1,
+            "the stop's REO update hit TID 0 (Linux quirk)"
+        );
+
+        // DELBA from the originator for TID 5: stopped, no answer.
+        let (w2, m2) = (u.dev.st.borrow().wmi.len(), mgmt(&u).len());
+        rx(&u, delba_from_ap(5, 1, 37));
+        let got = reorder(&u, w2);
+        ensure!(
+            got.len() == 1
+                && got[0] == wmi::peer_rx_reorder_queue_setup_cmd(0, &BSSID, pa5, 5, 1, 1),
+            "DELBA: TID 5 back to window 1"
+        );
+        ensure!(mgmt(&u).len() == m2, "no frame in answer to a DELBA");
+        // A DELBA addressed to our (non-existent) TX session, a DELBA for
+        // a TID without a session, a short ADDBA, and one from another
+        // source: ignored.
+        let w3 = u.dev.st.borrow().wmi.len();
+        rx(&u, delba_from_ap(0, 0, 37));
+        rx(&u, delba_from_ap(3, 1, 37));
+        let mut short = addba_req(11, 1, 2, 64, 0, 0);
+        short.truncate(32);
+        rx(&u, short);
+        let mut foreign = addba_req(12, 1, 2, 64, 0, 0);
+        foreign[10..16].copy_from_slice(&GW);
+        rx(&u, foreign);
+        ensure!(
+            reorder(&u, w3).is_empty() && mgmt(&u).len() == m2,
+            "nothing programmed or answered"
+        );
+
+        // TID 6 session, then disconnect: AGG_STOP_DESTROY_STA stops the
+        // sessions still valid (TIDs 0 and 6, window 1) without a DELBA;
+        // then the deauth.
+        rx(&u, addba_req(13, 1, 6, 64, 0, 0));
+        let (pa6, _) = tid_q(&u, 6);
+        let (w4, m4) = (u.dev.st.borrow().wmi.len(), mgmt(&u).len());
+        let (r, _, _, _) = latched(|| run(u.netdev.disassociate()));
+        ensure!(r.is_ok(), "disassociate");
+        let got = reorder(&u, w4);
+        ensure!(
+            got.len() == 2
+                && got[0] == wmi::peer_rx_reorder_queue_setup_cmd(0, &BSSID, pa0, 0, 1, 1)
+                && got[1] == wmi::peer_rx_reorder_queue_setup_cmd(0, &BSSID, pa6, 6, 1, 1),
+            "teardown: RX_STOP for TIDs 0 and 6"
+        );
+        let m = mgmt(&u);
+        ensure!(
+            m.len() == m4 + 1 && m[m4][0] == 0xc0,
+            "only the Deauthentication, no DELBA"
+        );
+        // Without HT (the default fixture): declined, nothing programmed.
+        drop(u);
+        {
+            let v = up(wpa2_cfg())?;
+            connect(&v)?;
+            let r0 = v.dev.st.borrow().reo_cmds;
+            rx(&v, addba_req(1, 1, 0, 64, 0, 0));
+            ensure!(
+                mgmt(&v)[2] == addba_resp_golden(0x0020, 1, 37, 0, 64, 0)
+                    && v.dev.st.borrow().reo_cmds == r0,
+                "no HT: REQUEST_DECLINED"
+            );
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_rx_ba_session);
+
+/// `ieee80211_send_delba` (recipient, reason QSTA_TIMEOUT) and the ADDBA
+/// / DELBA parsers against literal frames.
+fn smoke_ath11k_int_back_frames_golden() -> TestResult {
+    use super::mac_frame as frame;
+    check(|| {
+        // DA = AP, SA = us, BSSID = AP; category 3, action 2, params
+        // tid 3 << 12 | recipient (0) << 11 = 0x3000, reason 39.
+        let mut g = vec![0xd0, 0x00, 0x00, 0x00];
+        g.extend_from_slice(&BSSID);
+        g.extend_from_slice(&OWN);
+        g.extend_from_slice(&BSSID);
+        g.extend_from_slice(&[0x00, 0x00, 0x03, 0x02, 0x00, 0x30, 0x27, 0x00]);
+        ensure!(
+            frame::build_delba(&OWN, &BSSID, &BSSID, 3, frame::WLAN_BACK_RECIPIENT, 39) == g,
+            "DELBA golden"
+        );
+        let mut i = g.clone();
+        i[27] |= 0x08; // initiator bit 11
+        ensure!(
+            frame::parse_delba(&i) == Some((3, 1)),
+            "DELBA parse (initiator)"
+        );
+        ensure!(frame::parse_delba(&g[..28]).is_none(), "short DELBA");
+        let r = addba_req(0x42, 1, 7, 64, 0x1234, 0xabc);
+        ensure!(
+            r[24..33] == [0x03, 0x00, 0x42, 0x1e, 0x10, 0x34, 0x12, 0xc0, 0xab],
+            "ADDBA Request literal"
+        );
+        ensure!(
+            frame::parse_addba_req(&r)
+                == Some(frame::AddbaReq {
+                    dialog_token: 0x42,
+                    timeout: 0x1234,
+                    ssn: 0xabc,
+                    policy: 1,
+                    tid: 7,
+                    buf_size: 64,
+                }),
+            "ADDBA Request parse"
+        );
+        ensure!(frame::parse_addba_req(&r[..32]).is_none(), "short ADDBA");
+        let mut wrong = r.clone();
+        wrong[25] = 1;
+        ensure!(
+            frame::parse_addba_req(&wrong).is_none(),
+            "not an ADDBA Request"
+        );
+        ensure!(
+            frame::build_addba_resp(&OWN, &BSSID, &BSSID, 7, 0x42, 0, 1, 64, 0x1234)
+                == addba_resp_golden(0, 0x42, 0, 7, 64, 0x1234),
+            "ADDBA Response builder golden"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_int_back_frames_golden
+);
 
 /// PEER_STA_KICKOUT for the AP: the runtime loop's mac housekeeping
 /// tears the link down and drops the carrier.

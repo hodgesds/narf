@@ -118,6 +118,26 @@ pub trait DataPort {
     /// frames (`ieee80211_build_hdr` / `ieee80211_select_queue`) only for
     /// a WMM AP.
     fn set_sta_wme(&self, addr: [u8; 6], wme: bool);
+    /// `ath11k_mac_op_ampdu_action(IEEE80211_AMPDU_RX_START)` →
+    /// `ath11k_dp_rx_ampdu_start`: the TID's REO queue with the
+    /// negotiated window and SSN (`ath11k_peer_rx_tid_setup`) and its
+    /// `WMI_PEER_REORDER_QUEUE_SETUP_CMDID`. `Err` = positive errno.
+    fn ampdu_rx_start(
+        &self,
+        vdev_id: u32,
+        addr: [u8; 6],
+        tid: u8,
+        buf_size: u16,
+        ssn: u16,
+    ) -> impl Future<Output = Result<(), i32>> + Send;
+    /// `ath11k_mac_op_ampdu_action(IEEE80211_AMPDU_RX_STOP)` →
+    /// `ath11k_dp_rx_ampdu_stop`.
+    fn ampdu_rx_stop(
+        &self,
+        vdev_id: u32,
+        addr: [u8; 6],
+        tid: u8,
+    ) -> impl Future<Output = Result<(), i32>> + Send;
 }
 
 // ── Diagnostics ─────────────────────────────────────────────────────
@@ -524,6 +544,10 @@ pub struct Link {
     /// Reason code of the Deauthentication sent if the join fails after
     /// association.
     pub deauth_reason: u16,
+    /// `sta->ampdu_mlme.agg_session_valid` (RX BA sessions, bit = TID).
+    pub ba_rx_valid: u16,
+    /// `sta->ampdu_mlme.tid_rx_token[]`.
+    pub ba_rx_token: [u8; 16],
 }
 
 /// Completions (`reinit_completion` → event → `complete`).
@@ -538,6 +562,9 @@ struct Pending {
     mgmt_tx: Vec<MgmtTxCompl>,
     /// Auth / (re)assoc responses from the target BSSID.
     mlme_rx: VecDeque<Vec<u8>>,
+    /// Block Ack action frames from the AP (`ieee80211_rx_h_action` →
+    /// the interface work queue).
+    back_rx: VecDeque<Vec<u8>>,
     /// `ab->new_alpha2` waiting for `ath11k_update_11d`.
     new_alpha2: Option<[u8; 2]>,
     /// `ath11k_regd_update_work` queued (new regd → chan list).
@@ -973,6 +1000,150 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         }
     }
 
+    /// `ieee80211_iface_process_skb` for the queued Block Ack frames.
+    async fn process_back(&mut self) {
+        while let Some(f) = self.pending.back_rx.pop_front() {
+            if self.link.is_none() {
+                continue;
+            }
+            match f[frame::MGMT_HDR_LEN + 1] {
+                frame::WLAN_ACTION_ADDBA_REQ => {
+                    if let Some(r) = frame::parse_addba_req(&f) {
+                        self.start_rx_ba_session(&r).await;
+                    }
+                }
+                frame::WLAN_ACTION_DELBA => {
+                    // ieee80211_process_delba: the AP stopping its TX
+                    // session stops our RX session; a DELBA for one of
+                    // our TX sessions finds none (ath11k declines TX
+                    // aggregation: the firmware does it).
+                    if let Some((tid, initiator)) = frame::parse_delba(&f) {
+                        if initiator == frame::WLAN_BACK_INITIATOR {
+                            self.stop_rx_ba_session(tid, frame::WLAN_BACK_INITIATOR, 0, true)
+                                .await;
+                        }
+                    }
+                }
+                // ieee80211_process_addba_resp: no TX session to match.
+                _ => {}
+            }
+        }
+    }
+
+    /// `__ieee80211_start_rx_ba_session(sta, …, tx = true)` for an ADDBA
+    /// Request, with ath11k's `SUPPORTS_REORDERING_BUFFER` (no mac80211
+    /// reorder buffer, so no session timer; the driver does the
+    /// reordering in the REO) and an HT / VHT AP (`max_buf_size =
+    /// IEEE80211_MAX_AMPDU_BUF_HT`; `max_rx_aggregation_subframes =
+    /// IEEE80211_MAX_AMPDU_BUF_HE`), then `ieee80211_send_addba_resp`.
+    async fn start_rx_ba_session(&mut self, r: &frame::AddbaReq) {
+        let Some(l) = self.link.as_ref() else {
+            return;
+        };
+        let (addr, bssid, ht) = (l.bss.bssid, l.bss.bssid, l.sta.ht_cap.ht_supported);
+        let tid = r.tid;
+        let mut buf_size = r.buf_size;
+        let mut status = frame::WLAN_STATUS_REQUEST_DECLINED;
+        'end: {
+            // IEEE80211_FIRST_TSPEC_TSID
+            if tid >= 8 {
+                break 'end;
+            }
+            // "erroneously requests BA session on tid %d w/o HT"
+            if !ht {
+                break 'end;
+            }
+            // IEEE80211_MAX_AMPDU_BUF_HT; delayed BA needs S1G here.
+            if r.policy != 1 || buf_size > 0x40 {
+                status = frame::WLAN_STATUS_INVALID_QOS_PARAM;
+                break 'end;
+            }
+            if buf_size == 0 {
+                buf_size = 0x40;
+            }
+            // sta->sta.max_rx_aggregation_subframes (0x100) never clamps
+            // below 0x40.
+            buf_size = buf_size.min(0x100);
+            let l = self.link.as_ref().unwrap();
+            if l.ba_rx_valid & (1 << tid) != 0 {
+                if l.ba_rx_token[tid as usize] == r.dialog_token {
+                    // "updated AddBA Req": tid_rx is NULL with
+                    // SUPPORTS_REORDERING_BUFFER, so the timeout compare
+                    // fails and the update is declined.
+                    status = frame::WLAN_STATUS_REQUEST_DECLINED;
+                    break 'end;
+                }
+                // "unexpected AddBA Req": delete the existing session.
+                self.stop_rx_ba_session(
+                    tid,
+                    frame::WLAN_BACK_RECIPIENT,
+                    frame::WLAN_STATUS_UNSPECIFIED_QOS,
+                    false,
+                )
+                .await;
+            }
+            let vdev_id = self.vif.as_ref().unwrap().vdev_id;
+            if self
+                .dp
+                .ampdu_rx_start(vdev_id, addr, tid as u8, buf_size, r.ssn)
+                .await
+                .is_ok()
+            {
+                status = frame::WLAN_STATUS_SUCCESS;
+            }
+        }
+        if status == frame::WLAN_STATUS_SUCCESS {
+            if let Some(l) = self.link.as_mut() {
+                l.ba_rx_valid |= 1 << tid;
+                l.ba_rx_token[tid as usize] = r.dialog_token;
+            }
+        }
+        let own = self.caps.mac_addr;
+        let f = frame::build_addba_resp(
+            &own,
+            &addr,
+            &bssid,
+            tid,
+            r.dialog_token,
+            status,
+            1,
+            buf_size,
+            r.timeout,
+        );
+        self.tx_mgmt_nowait(&f).await;
+    }
+
+    /// `__ieee80211_stop_rx_ba_session`: `IEEE80211_AMPDU_RX_STOP` to the
+    /// driver (a failure is only logged), and a DELBA when we end the
+    /// session ourselves (`initiator == WLAN_BACK_RECIPIENT && tx`).
+    async fn stop_rx_ba_session(&mut self, tid: u16, initiator: u16, reason: u16, tx: bool) {
+        let Some(l) = self.link.as_mut() else {
+            return;
+        };
+        if tid >= 16 || l.ba_rx_valid & (1 << tid) == 0 {
+            return;
+        }
+        l.ba_rx_valid &= !(1 << tid);
+        let addr = l.bss.bssid;
+        let vdev_id = self.vif.as_ref().unwrap().vdev_id;
+        // "HW problem - can not stop rx aggregation": logged only.
+        let _ = self.dp.ampdu_rx_stop(vdev_id, addr, tid as u8).await;
+        if initiator == frame::WLAN_BACK_RECIPIENT && tx {
+            let own = self.caps.mac_addr;
+            let f = frame::build_delba(&own, &addr, &addr, tid, frame::WLAN_BACK_RECIPIENT, reason);
+            self.tx_mgmt_nowait(&f).await;
+        }
+    }
+
+    /// `ieee80211_tx_skb` without a TX status wait: the completion is
+    /// released by [`Self::release_mgmt_tx`].
+    async fn tx_mgmt_nowait(&mut self, f: &[u8]) {
+        let Some(vdev_id) = self.vif.as_ref().map(|v| v.vdev_id) else {
+            return;
+        };
+        let _ = self.wmi.mgmt_tx(vdev_id, f).await;
+    }
+
     /// `ath11k_wmi_tlv_op_rx` for the events the mac layer owns.
     pub fn handle_event(&mut self, ev: &[u8]) {
         let Ok((id, payload)) = split_event(ev) else {
@@ -1069,6 +1240,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
     /// `ath11k_reg_notifier` (driver) → `ath11k_reg_update_chan_list(ar,
     /// true)` → `ath11k_regd_update_chan_list_work`.
     async fn run_deferred(&mut self) {
+        self.process_back().await;
         if let Some(cc) = self.pending.new_alpha2.take() {
             self.alpha2 = cc;
             let c = set_current_country_cmd(self.caps.pdev_id, [cc[0], cc[1], 0]);
@@ -1565,6 +1737,32 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                     self.pending.mlme_rx.push_back(m.frame.to_vec());
                 }
             }
+            frame::stype::ACTION => {
+                // ieee80211_rx_h_action, WLAN_CATEGORY_BACK: from our AP's
+                // station entry (`sta_info_get_bss(sdata, mgmt->sa)`), to
+                // us; the action code present and its fixed fields long
+                // enough, else "invalid".
+                let f = m.frame;
+                let Some(l) = self.link.as_ref() else {
+                    return;
+                };
+                if hdr.sa != l.bss.bssid
+                    || hdr.da != own
+                    || f.len() < frame::IEEE80211_MIN_ACTION_SIZE + 1
+                    || f[frame::MGMT_HDR_LEN] != frame::WLAN_CATEGORY_BACK
+                {
+                    return;
+                }
+                let need = match f[frame::MGMT_HDR_LEN + 1] {
+                    frame::WLAN_ACTION_ADDBA_REQ => frame::ADDBA_REQ_LEN,
+                    frame::WLAN_ACTION_ADDBA_RESP => frame::ADDBA_RESP_LEN,
+                    frame::WLAN_ACTION_DELBA => frame::DELBA_LEN,
+                    _ => return,
+                };
+                if f.len() >= frame::IEEE80211_MIN_ACTION_SIZE + need {
+                    self.pending.back_rx.push_back(f.to_vec());
+                }
+            }
             frame::stype::DEAUTH | frame::stype::DISASSOC => {
                 if let Some((h, deauth, reason)) = frame::parse_deauth_disassoc(m.frame) {
                     if let Some(l) = self.link.as_mut() {
@@ -2053,6 +2251,8 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             operating_11g: band == Band::Ghz2 && supp >> 4 != 0,
             basic_rates: basic,
             deauth_reason: frame::WLAN_REASON_DEAUTH_LEAVING,
+            ba_rx_valid: 0,
+            ba_rx_token: [0; 16],
         });
         // ── ieee80211_prep_connection ──
         // ieee80211_link_use_channel → ath11k_mac_op_assign_vif_chanctx
@@ -2939,6 +3139,19 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         }
         if l.authorized {
             self.dp.set_authorized(bssid, false);
+        }
+        // __sta_info_destroy_part1 → ieee80211_sta_tear_down_BA_sessions(
+        // AGG_STOP_DESTROY_STA): every RX session stopped, no DELBA.
+        if l.peer_created {
+            for tid in 0..16 {
+                self.stop_rx_ba_session(
+                    tid,
+                    frame::WLAN_BACK_RECIPIENT,
+                    frame::WLAN_REASON_QSTA_LEAVE_QBSS,
+                    false,
+                )
+                .await;
+            }
         }
         // sta flush: AUTHORIZED → … → NONE, ieee80211_free_sta_keys
         // (DISABLE_KEY for the pairwise key; the group DISABLE_KEY is

@@ -545,6 +545,30 @@ updates), `handle_event(frame)`, `connected_bssid()`.
   element must equal the beacon's, GTK from the KDE; PTK then GTK via
   `WMI_VDEV_INSTALL_KEY` (CCMP, pairwise / group flags) and
   `WMI_PEER_AUTHORIZE`.
+- RX Block Ack (`mgmt_rx` ACTION → `pending.back_rx` →
+  `run_deferred` → `process_back`, as `ieee80211_rx_h_action` → the
+  interface work): BACK frames from our AP to us with the action's fixed
+  fields present. ADDBA Request → `__ieee80211_start_rx_ba_session` with
+  ath11k's `SUPPORTS_REORDERING_BUFFER` (no mac80211 reorder buffer and so
+  no session timer: the timeout is only echoed) and no HE: TID ≥ 8 or a
+  non-HT AP → 37 (`REQUEST_DECLINED`); policy ≠ 1 or window > 64 → 38
+  (`INVALID_QOS_PARAM`); window 0 → 64; the same dialog token on a valid
+  session → 37 (the timeout compare needs a `tid_rx`); a new token stops
+  the old session first; else `DataPort::ampdu_rx_start` =
+  `ath11k_dp_rx_ampdu_start` (`ath11k_peer_rx_tid_setup`: REO UPDATE with
+  window + SSN, `WMI_PEER_REORDER_QUEUE_SETUP`, `pn_type` WPA once the PTK
+  is in) → 0. The ADDBA Response (`ieee80211_send_addba_resp`: A-MSDU
+  bit set, policy 1, no ADDBA Extension) goes out on WMI without a TX
+  status wait. DELBA from the originator → `__ieee80211_stop_rx_ba_session`
+  → `ampdu_rx_stop` = `ath11k_dp_rx_ampdu_stop` (window 1; Linux's TID 0
+  REO-update quirk kept), no answer; a DELBA for a TX session finds none
+  (TX aggregation is the firmware's: `-EOPNOTSUPP`), ADDBA Responses are
+  ignored. Teardown stops every session (`AGG_STOP_DESTROY_STA`, no
+  DELBA) before the keys go. BAR is handled by the REO in hardware (ath11k
+  never sees BARs; mac80211's BAR path is unreached). A recipient DELBA
+  (`ieee80211_send_delba`, `frame::build_delba`) is sent only for a
+  locally stopped session (`initiator == RECIPIENT && tx`), which no NARF
+  path does (Linux: PTK rekey / suspend teardown, not ported).
 - Group rekey (`Mac::poll` → `rx_eapol`): EAPOL received while
   authorized goes to the association's supplicant (kept after the 4-way
   with its PTK, replay counter and GTK in use):
@@ -1112,9 +1136,7 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   bring-up waits on the device; the TX
   queues are one FIFO per AC, not one TXQ per TID with mac80211's airtime
   round robin and fq_codel (one station; the AC order and stop reasons are
-  Linux's), no A-MSDU / fast-xmit header cache; ADDBA from the AP is not answered (no
-  `ath11k_mac_op_ampdu_action`; the AP falls back to non-aggregated
-  traffic, REO queues stay at BA window 1); no PTK rekey (a pairwise
+  Linux's), no A-MSDU / fast-xmit header cache; no PTK rekey (a pairwise
   EAPOL-Key after the handshake is dropped; wpa_supplicant would run a
   new 4-way handshake); PMF is not negotiated, so an IGTK KDE in a Group
   Key message is ignored (`ieee80211w_set_keys`; ath11k would leave BIP
@@ -1159,7 +1181,8 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   stopped TID.
 - Peer REO integration (done): the runtime ports call §3.10's steps at
   the Linux call sites (`station_add` → `peer_setup`, `station_remove`
-  → `peer_cleanup`, `set_key` → `pn_replay_config`) and every service
+  → `peer_cleanup`, `set_key` → `pn_replay_config`, `ampdu_action`
+  RX_START / RX_STOP → `ampdu_start` / `ampdu_stop`) and every service
   pass feeds `DpServiceOutput::reo_status` to `reo_status_handler`.
 - Firmware (decided): `cargo xtask import-firmware --vendor ath11k`
   decompresses the distro `.zst` blobs at image build time and now

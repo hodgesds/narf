@@ -668,6 +668,134 @@ pub fn build_deauth(own: &[u8; 6], bssid: &[u8; 6], reason: u16) -> Vec<u8> {
     f
 }
 
+// ── Block Ack action frames (`include/linux/ieee80211.h`) ──────────
+
+/// `WLAN_CATEGORY_BACK`.
+pub const WLAN_CATEGORY_BACK: u8 = 3;
+/// `WLAN_ACTION_ADDBA_REQ` / `_RESP` / `WLAN_ACTION_DELBA`.
+pub const WLAN_ACTION_ADDBA_REQ: u8 = 0;
+pub const WLAN_ACTION_ADDBA_RESP: u8 = 1;
+pub const WLAN_ACTION_DELBA: u8 = 2;
+/// `IEEE80211_MIN_ACTION_SIZE` (header + category).
+pub const IEEE80211_MIN_ACTION_SIZE: usize = MGMT_HDR_LEN + 1;
+/// `sizeof(mgmt->u.action.u.addba_req)` / `addba_resp` / `delba`.
+pub const ADDBA_REQ_LEN: usize = 8;
+pub const ADDBA_RESP_LEN: usize = 8;
+pub const DELBA_LEN: usize = 5;
+pub const IEEE80211_ADDBA_PARAM_AMSDU_MASK: u16 = 0x0001;
+pub const IEEE80211_ADDBA_PARAM_POLICY_MASK: u16 = 0x0002;
+pub const IEEE80211_ADDBA_PARAM_TID_MASK: u16 = 0x003C;
+pub const IEEE80211_ADDBA_PARAM_BUF_SIZE_MASK: u16 = 0xFFC0;
+pub const IEEE80211_DELBA_PARAM_TID_MASK: u16 = 0xF000;
+pub const IEEE80211_DELBA_PARAM_INITIATOR_MASK: u16 = 0x0800;
+/// `enum ieee80211_back_parties`.
+pub const WLAN_BACK_RECIPIENT: u16 = 0;
+pub const WLAN_BACK_INITIATOR: u16 = 1;
+/// `WLAN_STATUS_UNSPECIFIED_QOS` / `REQUEST_DECLINED` / `INVALID_QOS_PARAM`.
+pub const WLAN_STATUS_UNSPECIFIED_QOS: u16 = 32;
+pub const WLAN_STATUS_REQUEST_DECLINED: u16 = 37;
+pub const WLAN_STATUS_INVALID_QOS_PARAM: u16 = 38;
+/// `WLAN_REASON_QSTA_LEAVE_QBSS`.
+pub const WLAN_REASON_QSTA_LEAVE_QBSS: u16 = 36;
+
+/// `mgmt->u.action.u.addba_req` as `ieee80211_process_addba_request`
+/// extracts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddbaReq {
+    pub dialog_token: u8,
+    pub timeout: u16,
+    /// `start_seq_num >> 4`.
+    pub ssn: u16,
+    pub policy: u16,
+    pub tid: u16,
+    pub buf_size: u16,
+}
+
+/// Parse an ADDBA Request action frame (`ieee80211_rx_h_action`: `len <
+/// IEEE80211_MIN_ACTION_SIZE + sizeof(addba_req)` is invalid).
+pub fn parse_addba_req(f: &[u8]) -> Option<AddbaReq> {
+    if f.len() < IEEE80211_MIN_ACTION_SIZE + ADDBA_REQ_LEN
+        || f[MGMT_HDR_LEN] != WLAN_CATEGORY_BACK
+        || f[MGMT_HDR_LEN + 1] != WLAN_ACTION_ADDBA_REQ
+    {
+        return None;
+    }
+    let b = &f[MGMT_HDR_LEN + 2..];
+    let capab = u16::from_le_bytes([b[1], b[2]]);
+    Some(AddbaReq {
+        dialog_token: b[0],
+        timeout: u16::from_le_bytes([b[3], b[4]]),
+        ssn: u16::from_le_bytes([b[5], b[6]]) >> 4,
+        policy: (capab & IEEE80211_ADDBA_PARAM_POLICY_MASK) >> 1,
+        tid: (capab & IEEE80211_ADDBA_PARAM_TID_MASK) >> 2,
+        buf_size: (capab & IEEE80211_ADDBA_PARAM_BUF_SIZE_MASK) >> 6,
+    })
+}
+
+/// Parse a DELBA action frame: `(tid, initiator)`
+/// (`ieee80211_process_delba`).
+pub fn parse_delba(f: &[u8]) -> Option<(u16, u16)> {
+    if f.len() < IEEE80211_MIN_ACTION_SIZE + DELBA_LEN
+        || f[MGMT_HDR_LEN] != WLAN_CATEGORY_BACK
+        || f[MGMT_HDR_LEN + 1] != WLAN_ACTION_DELBA
+    {
+        return None;
+    }
+    let params = u16::from_le_bytes([f[MGMT_HDR_LEN + 2], f[MGMT_HDR_LEN + 3]]);
+    Some((
+        (params & IEEE80211_DELBA_PARAM_TID_MASK) >> 12,
+        (params & IEEE80211_DELBA_PARAM_INITIATOR_MASK) >> 11,
+    ))
+}
+
+/// `ieee80211_send_addba_resp` (`ieee80211_mgmt_ba`: DA = the
+/// originator, SA = us, BSSID = the AP for a station): A-MSDU in A-MPDU
+/// is advertised (`SUPPORTS_AMSDU_IN_AMPDU`, which ath11k sets); no
+/// ADDBA Extension element (that needs HE).
+#[allow(clippy::too_many_arguments)] // the frame's fields
+pub fn build_addba_resp(
+    own: &[u8; 6],
+    da: &[u8; 6],
+    bssid: &[u8; 6],
+    tid: u16,
+    dialog_token: u8,
+    status: u16,
+    policy: u16,
+    buf_size: u16,
+    timeout: u16,
+) -> Vec<u8> {
+    let mut f = mgmt_hdr(stype::ACTION, da, own, bssid);
+    f.push(WLAN_CATEGORY_BACK);
+    f.push(WLAN_ACTION_ADDBA_RESP);
+    f.push(dialog_token);
+    f.extend_from_slice(&status.to_le_bytes());
+    let capab = (IEEE80211_ADDBA_PARAM_AMSDU_MASK & 1)
+        | ((policy << 1) & IEEE80211_ADDBA_PARAM_POLICY_MASK)
+        | ((tid << 2) & IEEE80211_ADDBA_PARAM_TID_MASK)
+        | ((buf_size << 6) & IEEE80211_ADDBA_PARAM_BUF_SIZE_MASK);
+    f.extend_from_slice(&capab.to_le_bytes());
+    f.extend_from_slice(&timeout.to_le_bytes());
+    f
+}
+
+/// `ieee80211_send_delba`: params = initiator << 11 | tid << 12.
+pub fn build_delba(
+    own: &[u8; 6],
+    da: &[u8; 6],
+    bssid: &[u8; 6],
+    tid: u16,
+    initiator: u16,
+    reason: u16,
+) -> Vec<u8> {
+    let mut f = mgmt_hdr(stype::ACTION, da, own, bssid);
+    f.push(WLAN_CATEGORY_BACK);
+    f.push(WLAN_ACTION_DELBA);
+    let params = (initiator << 11) | (tid << 12);
+    f.extend_from_slice(&params.to_le_bytes());
+    f.extend_from_slice(&reason.to_le_bytes());
+    f
+}
+
 /// `ieee80211_id_in_list`: `ids` may contain `EXTENSION, ext_id` pairs.
 fn id_in_list(ids: &[u8], id: u8, ext: Option<u8>) -> bool {
     let mut i = 0;
