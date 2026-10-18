@@ -1989,3 +1989,79 @@ fn smoke_wlfw_txn_ids_and_lookup() -> TestResult {
     })
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_wlfw_txn_ids_and_lookup);
+
+/// `firmware-2.bin` with `(id, data)` IEs, written out from `fw.h`.
+fn firmware_n(ies: &[(u32, &[u8])]) -> Vec<u8> {
+    let mut v = b"QCOM-ATH11K-FW\0\0".to_vec();
+    for (id, data) in ies {
+        v.extend_from_slice(&id.to_le_bytes());
+        v.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        v.extend_from_slice(data);
+        while v.len() % 4 != 0 {
+            v.push(0);
+        }
+    }
+    v
+}
+
+fn smoke_wlfw_m3_from_firmware_n() -> TestResult {
+    run_test(|| {
+        // ath11k_qmi_m3_load: the M3 IE of firmware-2.bin, no m3.bin.
+        let m3 = bin_blob(3_000, 7);
+        let file = firmware_n(&[(super::fw::ie::AMSS_IMAGE, &[1, 2, 3]), (3, &m3)]);
+        let (api, refused) = super::fw::FwApi::pre_init(|_| Ok(file.clone()));
+        ensure!(refused.is_none() && api.api_version == 2, "fw api 2");
+        let mut f = standard_files(&elf_blob(100, 1), &[3; 9], &[1; 8]);
+        f.files.remove("ath11k/WCN6855/hw2.1/m3.bin");
+        let mut w = wlfw(Script::wcn6855(), f);
+        w.fw_api = api;
+        let info = block(w.run_to_fw_ready()).map_err(|_| "FW_READY with the M3 IE")?;
+        let mem = w.m3.as_ref().ok_or("m3 memory")?;
+        ensure!(mem.data == m3, "DMA copy of the M3 IE");
+        ensure!(
+            info.m3_size == 3_000 && info.m3_addr == mem.addr,
+            "m3 size / address"
+        );
+        ensure!(
+            !w.fw.requested.iter().any(|p| p.ends_with("m3.bin")),
+            "m3.bin not requested"
+        );
+        let fw = &w.client.pipe.fw;
+        let i = fw
+            .msg_ids()
+            .iter()
+            .position(|&id| id == QMI_WLANFW_M3_INFO_REQ_V01)
+            .ok_or("m3_info sent")?;
+        let txn = u16::from_le_bytes([fw.reqs[i][1], fw.reqs[i][2]]);
+        ensure!(
+            fw.reqs[i]
+                == enc(
+                    &M3InfoReq {
+                        addr: mem.addr,
+                        size: 3_000
+                    },
+                    txn
+                ),
+            "m3_info names the IE copy"
+        );
+
+        // An empty M3 IE is not used: m3.bin is requested (and missing).
+        let file = firmware_n(&[(3, &[])]);
+        let (api, _) = super::fw::FwApi::pre_init(|_| Ok(file.clone()));
+        let mut f = standard_files(&elf_blob(100, 1), &[3; 9], &[1; 8]);
+        f.files.remove("ath11k/WCN6855/hw2.1/m3.bin");
+        let mut w = wlfw(Script::wcn6855(), f);
+        w.fw_api = api;
+        let e = block(w.run_to_fw_ready()).err().ok_or("must fail")?;
+        ensure!(
+            e.step == step::M3_LOAD && e.errno == ENOENT,
+            "empty M3 IE falls back to m3.bin"
+        );
+        ensure!(
+            w.fw.requested.last().map(String::as_str) == Some("ath11k/WCN6855/hw2.1/m3.bin"),
+            "m3.bin requested"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_wlfw_m3_from_firmware_n);

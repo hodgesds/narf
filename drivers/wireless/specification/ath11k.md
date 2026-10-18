@@ -168,12 +168,27 @@ tables.
   `build_board2` (test fixtures). `pci::wlfw_bring_up` passes
   `check_smbios().bdf_ext` into `WlfwConfig::pci`, so the full board
   name carries `,variant=<v>` exactly as `__ath11k_core_create_board_name`.
+- `fw` — `firmware-N.bin` (Linux `fw.{c,h}`): `parse_api_n`
+  (`ath11k_fw_request_firmware_api_n`: `"QCOM-ATH11K-FW\0"` padded to 4,
+  then `{__le32 id, __le32 len, data}` IEs padded to 4; TIMESTAMP only
+  when 4 bytes, FEATURES over `ATH11K_FW_FEATURE_COUNT` (0) bits,
+  AMSS_IMAGE, M3_IMAGE, unknown ids skipped; `FwError` = Linux's four
+  `-EINVAL` cases), `FwApi::pre_init` (`ath11k_fw_pre_init`: API 2 when
+  `firmware-2.bin` loads and parses, else API 1, never fatal), `amss()` /
+  `m3()` (non-empty IE or `None`). `pci::load_firmware` runs `pre_init`
+  then picks the MHI image as `ath11k_mhi_register` (AMSS IE, else
+  `amss.bin`), both inside the 60 s store retry; `Wlfw::fw_api` holds the
+  container for `ath11k_qmi_m3_load` (M3 IE, else `m3.bin`).
 
-Tests: `qmi_handshake_tests.rs` — a scripted fake WLFW firmware
+Tests: `fw_tests.rs` — containers written out byte by byte from `fw.h`
+(every IE kind, padding, duplicates, every refusal, the `len > 8` loop
+bound, an unpadded last IE, empty IEs) and the API choice;
+`qmi_handshake_tests.rs` — a scripted fake WLFW firmware
 behind a fake pipe runs HELLO → FW_READY → `firmware_start`, every
 request compared byte for byte (encoders + inlined Linux goldens);
 board parser / names / SMBIOS; target memory with fake and real
-DMA32 allocators; negatives for every step.
+DMA32 allocators; the M3 IE path (`m3_info` names the IE copy, no
+`m3.bin` request; an empty IE falls back); negatives for every step.
 
 ### 3.1 HTC (`htc.rs`, Linux `htc.{c,h}`)
 
@@ -987,8 +1002,9 @@ card (QEMU emulates none) is exercised once, after phase 8.
 ## 6. Dependencies
 
 `narf-bus` (BAR, MSI), `narf-io` (coherent DMA), `narf-firmware`
-(`amss.bin`, `m3.bin`, `board-2.bin`, `regdb.bin` — distro packages
-ship them `.zst`-compressed), `narf-wireless` (iface trait, EAPOL /
+(`firmware-2.bin` or `amss.bin` + `m3.bin`, `board-2.bin`, `regdb.bin`
+— distro packages ship them `.zst`-compressed), `narf-wireless` (iface
+trait, EAPOL /
 SAE, registry), `narf-net` (frame rings).
 
 ## 7. Stage assignment
@@ -1036,10 +1052,12 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   flow control) and fails with its own step.
 - Not ported (unreached on WCN6855 PCIe): fixed memory regions,
   DEVICE_INFO, `fixed_bdf_addr`, recovery (SERVER_EXIT / a second
-  FW_INIT_DONE end the handshake), FTM, `firmware-N.bin` M3.
-- Open: Linux prefers `firmware-2.bin` (an `amss.bin` IE) over
-  `amss.bin` when present (`ath11k_fw_pre_init`); only `amss.bin` is
-  loaded today.
+  FW_INIT_DONE end the handshake), FTM.
+- `firmware-2.bin` (decided, `fw.rs`): preferred over `amss.bin` /
+  `m3.bin` exactly as `ath11k_fw_pre_init`; NARF-only, it is re-tried
+  with `amss.bin` while the firmware store fills (Linux requests it once
+  at probe). The container bytes are copied out of the store and kept
+  for the device's lifetime (`ab->fw.fw`).
 - HAL / CE deviations from Linux (deliberate): ring memory and CE
   buffers are DMA32 coherent (Linux streams RX/TX skbs under a 36-bit
   mask); each CE ring slot has a fixed bounce region instead of an skb;
@@ -1213,10 +1231,11 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   to skip links, leaving `hw2.1/amss.bin` absent). Probe
   (`pci-probe-all`, `Stage::Device`) runs before the rootfs firmware
   scan (`firmware-scan-rootfs`, `Stage::Late` after `root-mount-auto`);
-  the MHI task retries `amss.bin` for 60 s, so a partitioned root works
-  without `--initramfs-firmware` when the root mounts within that
-  window; the later blobs (`m3.bin`, `board-2.bin`, `regdb.bin`) load
-  once `amss.bin` proved the store is up. An ISO / initramfs-only image
+  the MHI task retries `firmware-2.bin` / `amss.bin` for 60 s, so a
+  partitioned root works without `--initramfs-firmware` when the root
+  mounts within that window; the later blobs (`m3.bin`, `board-2.bin`,
+  `regdb.bin`) load once the MHI image proved the store is up. An ISO /
+  initramfs-only image
   needs `--initramfs-firmware "ath11k/WCN6855/hw2.1/*"`.
 - Mac layer scope (decided): HT + 5 GHz VHT only, no HE in the
   Association Request (the chip is HE-capable; mac80211's HE paths,

@@ -23,7 +23,8 @@
 //!   / `ath11k_qmi_respond_fw_mem_request`, `ath11k_qmi_event_load_bdf`,
 //!   `ath11k_qmi_request_target_cap`, `ath11k_qmi_load_bdf_qmi`,
 //!   `ath11k_qmi_load_file_target_mem`, `ath11k_qmi_m3_load`,
-//!   `ath11k_qmi_wlanfw_m3_info_send`, `ath11k_qmi_process_coldboot_calibration`,
+//!   `ath11k_qmi_wlanfw_m3_info_send` (M3 from `firmware-N.bin` when it
+//!   carries one, [`super::fw`]), `ath11k_qmi_process_coldboot_calibration`,
 //!   `ath11k_qmi_firmware_start`, `ath11k_qmi_wlanfw_wlan_ini_send`,
 //!   `ath11k_qmi_wlanfw_wlan_cfg_send`, `ath11k_qmi_wlanfw_mode_send`;
 //! - `core.c`: `ath11k_core_fetch_bdf`, `ath11k_core_fetch_regdb`,
@@ -35,7 +36,7 @@
 //! (`hybrid_bus_type`), the `fixed_bdf_addr` ioremap path of
 //! `load_file_target_mem`, `ath11k_qmi_fwreset_from_cold_boot`, FTM
 //! mode, recovery (`SERVER_EXIT` / a second FW_INIT_DONE end the
-//! handshake with an error here), `firmware-N.bin` M3 (only `m3.bin`).
+//! handshake with an error here).
 //!
 //! Where Linux waits for an indication with no timeout (server
 //! arrival, REQUEST_MEM, FW_MEM_READY, FW_READY) or stalls silently
@@ -57,6 +58,7 @@ use super::board::{
     ATH11K_BD_IE_BOARD_DATA, ATH11K_BD_IE_BOARD_NAME, ATH11K_BOARD_API2_FILE,
     ATH11K_DEFAULT_CAL_FILE, ATH11K_M3_FILE,
 };
+use super::fw::FwApi;
 use super::hw::HwRev;
 use super::qmi::{QmiResponse, QMI_RESULT_SUCCESS_V01};
 use super::qmi_client::{Inbound, QmiClient, QrtrPipe, TxnError};
@@ -332,6 +334,8 @@ pub struct Wlfw<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> {
     pub registered: bool,
     pub board_choice: Option<BoardChoice>,
     pub regdb_sent: Option<usize>,
+    /// `ab->fw` (`ath11k_fw_pre_init`): the M3 IE of `firmware-N.bin`.
+    pub fw_api: FwApi,
     phase: Phase,
 }
 
@@ -365,6 +369,7 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
             registered: false,
             board_choice: None,
             regdb_sent: None,
+            fw_api: FwApi::api1(),
             phase: Phase::Server,
         })
     }
@@ -821,19 +826,30 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
         self.load_bdf_qmi(false).await
     }
 
-    /// `ath11k_qmi_m3_load`.
+    /// `ath11k_qmi_m3_load`: the DMA copy is made once ("m3 firmware
+    /// buffer is already available"), from the `firmware-N.bin` M3 IE
+    /// when it is non-empty, else from `m3.bin`.
     fn m3_load(&mut self) -> Result<(), WlfwError> {
         if self.m3.is_some() {
             return Ok(());
         }
-        let path = self.fw_path(ATH11K_M3_FILE);
-        let blob = self.fw.request(&path).map_err(|e| {
-            self.log(format_args!("failed to load {}: -{}", path, e));
-            WlfwError::new(step::M3_LOAD, e as u32, e)
-        })?;
-        let data = blob.as_ref();
+        let blob;
+        let data: &[u8] = match self.fw_api.m3() {
+            // "firmware-N.bin had a m3 firmware file so use that"
+            Some(m3) => m3,
+            None => {
+                let path = self.fw_path(ATH11K_M3_FILE);
+                blob = self.fw.request(&path).map_err(|e| {
+                    self.client
+                        .pipe
+                        .log(format_args!("failed to load {}: -{}", path, e));
+                    WlfwError::new(step::M3_LOAD, e as u32, e)
+                })?;
+                blob.as_ref()
+            }
+        };
         let Some(mut mem) = self.dma.alloc_coherent(data.len()) else {
-            self.log(format_args!(
+            self.client.pipe.log(format_args!(
                 "failed to allocate memory for M3 with size {}",
                 data.len()
             ));

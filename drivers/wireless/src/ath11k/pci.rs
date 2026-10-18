@@ -47,6 +47,7 @@ use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::diag::{self, WifiStage};
 
+use super::fw::{FwApi, ATH11K_FW_API2_FILE};
 use super::hw::{
     self, name_for, refine_hw_rev, ChipInfo, HwParams, HwRev, ALL_DEV_IDS, MSI_CONFIG_ONE,
     QCOM_VENDOR,
@@ -374,17 +375,37 @@ pub fn aspm_restore() {
 const FW_WAIT_MS: u64 = 60_000;
 const FW_RETRY_MS: u64 = 500;
 
-/// Linux `request_firmware(ath11k/<fw_dir>/amss.bin)`.
-async fn load_amss(fw_dir: &str) -> Result<alloc::vec::Vec<u8>, MhiError> {
+/// One `firmware_request_nowarn(ath11k/<fw_dir>/<file>)` (`Err` =
+/// positive errno).
+fn request_fw(
+    auth: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+    fw_dir: &str,
+    file: &str,
+) -> Result<alloc::vec::Vec<u8>, i32> {
+    let name = alloc::format!("ath11k/{}/{}", fw_dir, file);
+    let cap = narf_firmware::open(&name, auth).map_err(|e| match e {
+        narf_firmware::FirmwareError::NotFound => wlfw::ENOENT,
+        narf_firmware::FirmwareError::OutOfMemory => wlfw::ENOMEM,
+        _ => wlfw::EINVAL,
+    })?;
+    let view = narf_firmware::view_of(&cap).map_err(|_| wlfw::EINVAL)?;
+    Ok(view.bytes.to_vec())
+}
+
+/// The MHI image and `ab->fw`: `ath11k_fw_pre_init` (`firmware-2.bin`;
+/// `ath11k_core_pre_init` runs it before `ath11k_mhi_register`), then the
+/// image `ath11k_mhi_register` picks — the container's AMSS IE when it is
+/// non-empty, else `request_firmware(ath11k/<fw_dir>/amss.bin)`. Both are
+/// retried together while the store fills (spec §8).
+async fn load_firmware(fw_dir: &str) -> Result<(alloc::vec::Vec<u8>, FwApi), MhiError> {
     use core::fmt::Write as _;
-    let name = alloc::format!("ath11k/{}/{}", fw_dir, ATH11K_AMSS_FILE);
     let auth = match narf_firmware::trusted_loader_authority().and_then(|a| a.derive().ok()) {
         Some(a) => a,
         None => {
             let _ = writeln!(
                 narf_console::Writer,
-                "  ath11k: no firmware authority for {}",
-                name
+                "  ath11k: no firmware authority for ath11k/{}",
+                fw_dir
             );
             return Err(MhiError::new(
                 mhi_host::step::FW_NOT_FOUND,
@@ -394,27 +415,56 @@ async fn load_amss(fw_dir: &str) -> Result<alloc::vec::Vec<u8>, MhiError> {
         }
     };
     let start = narf_time::wall::monotonic_ns() / 1_000_000;
+    let mut reported = false;
     loop {
-        match narf_firmware::open(&name, &auth) {
-            Ok(cap) => {
-                let view = narf_firmware::view_of(&cap).map_err(|_| {
-                    MhiError::new(mhi_host::step::FW_NOT_FOUND, 2, mhi_host::errno::EIO)
-                })?;
+        let (api, refused) = FwApi::pre_init(|file| request_fw(&auth, fw_dir, file));
+        if let (Some(e), false) = (refused, reported) {
+            // ath11k_fw_request_firmware_api_n's ath11k_err; pre_init
+            // still succeeds, with api 1.
+            reported = true;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ath11k: ath11k/{}/{}: {:?} (-{}), using fw api 1",
+                fw_dir,
+                ATH11K_FW_API2_FILE,
+                e,
+                e.errno()
+            );
+        }
+        if let Some(img) = api.amss() {
+            // "use MHI firmware file from firmware-N.bin"
+            let img = img.to_vec();
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ath11k: firmware ath11k/{}/{} (fw api 2: amss {} bytes, m3 {} bytes)",
+                fw_dir,
+                ATH11K_FW_API2_FILE,
+                img.len(),
+                api.m3().map_or(0, |m| m.len())
+            );
+            return Ok((img, api));
+        }
+        // "use the old separate mhi.bin MHI firmware file"
+        match request_fw(&auth, fw_dir, ATH11K_AMSS_FILE) {
+            Ok(bytes) => {
                 let _ = writeln!(
                     narf_console::Writer,
-                    "  ath11k: firmware {} ({} bytes)",
-                    name,
-                    view.bytes.len()
+                    "  ath11k: firmware ath11k/{}/{} ({} bytes, fw api {})",
+                    fw_dir,
+                    ATH11K_AMSS_FILE,
+                    bytes.len(),
+                    api.api_version
                 );
-                return Ok(view.bytes.to_vec());
+                return Ok((bytes, api));
             }
             Err(e) => {
                 let now = narf_time::wall::monotonic_ns() / 1_000_000;
                 if now.saturating_sub(start) >= FW_WAIT_MS {
                     let _ = writeln!(
                         narf_console::Writer,
-                        "  ath11k: firmware {} not found: {:?}",
-                        name,
+                        "  ath11k: firmware ath11k/{}/{} not found (-{})",
+                        fw_dir,
+                        ATH11K_AMSS_FILE,
                         e
                     );
                     return Err(MhiError::new(
@@ -449,14 +499,14 @@ pub struct MhiStart {
 /// Linux `ath11k_mhi_register` + `ath11k_mhi_start`
 /// (`mhi_prepare_for_power_up` + `mhi_sync_power_up`), then the QRTR
 /// MHI client's `mhi_prepare_for_transfer` on IPCR.
-async fn mhi_bring_up(s: MhiStart) -> Result<MhiController<Bar0Mhi>, MhiError> {
+async fn mhi_bring_up(s: MhiStart) -> Result<(MhiController<Bar0Mhi>, FwApi), MhiError> {
     use core::fmt::Write as _;
     let cfg = mhi::config_for(s.hw_rev).ok_or(MhiError::new(
         mhi_host::step::BAD_CONFIG,
         0,
         mhi_host::errno::EINVAL,
     ))?;
-    let fw = load_amss(s.fw_dir).await?;
+    let (fw, api) = load_firmware(s.fw_dir).await?;
     let params = ControllerParams::ath11k(s.mmio.len.min(u32::MAX as u64) as u32, s.nr_irqs);
     let mut ctrl = MhiController::new(Bar0Mhi { mmio: s.mmio }, cfg, params)?;
     ctrl.prepare_for_power_up()?;
@@ -487,7 +537,7 @@ async fn mhi_bring_up(s: MhiStart) -> Result<MhiController<Bar0Mhi>, MhiError> {
             "  ath11k: warning: MHI events arrived without MSI; running on polling"
         );
     }
-    Ok(ctrl)
+    Ok((ctrl, api))
 }
 
 /// The MHI bring-up task spawned by probe: MHI to mission mode, then
@@ -495,9 +545,9 @@ async fn mhi_bring_up(s: MhiStart) -> Result<MhiController<Bar0Mhi>, MhiError> {
 pub async fn mhi_task(s: MhiStart) {
     use core::fmt::Write as _;
     match mhi_bring_up(s).await {
-        Ok(ctrl) => {
+        Ok((ctrl, api)) => {
             MHI_UP.store(true, Ordering::Release);
-            wlfw_bring_up(ctrl, s).await;
+            wlfw_bring_up(ctrl, s, api).await;
         }
         Err(e) => {
             diag::latch_wifi_error(e.step, e.detail);
@@ -531,7 +581,7 @@ fn wlfw_fail(e: wlfw::WlfwError) {
 
 /// QRTR + QMI over the running controller: Linux's
 /// `ath11k_qmi_init_service` → driver events → FW_READY.
-async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart) {
+async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart, api: FwApi) {
     use core::fmt::Write as _;
     diag::set_wifi_stage(WifiStage::Control);
     let Some(fw) = wlfw::NarfFirmware::new() else {
@@ -562,6 +612,8 @@ async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart) {
         Ok(w) => w,
         Err(e) => return wlfw_fail(e),
     };
+    // ab->fw (ath11k_qmi_m3_load takes the M3 IE from it).
+    w.fw_api = api;
     match w.run_to_fw_ready().await {
         Ok(info) => {
             let st = w.client.stats;

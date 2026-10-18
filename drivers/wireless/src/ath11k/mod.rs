@@ -52,6 +52,7 @@ pub mod dp;
 pub mod dp_frag;
 pub mod dp_peer;
 pub mod dp_ring;
+pub mod fw;
 pub mod hal;
 pub mod htc;
 pub mod htt;
@@ -98,6 +99,8 @@ pub mod core_tests;
 pub mod dp_peer_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod dp_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod fw_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod hal_tests;
 #[cfg(any(test, feature = "kernel-test"))]
