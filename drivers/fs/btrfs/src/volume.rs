@@ -1959,7 +1959,24 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// the on-disk default subvolume. Steps 3–4 of mount, shared with
     /// [`Self::mount_view`].
     async fn select_default_root(self: &Arc<Self>) -> Result<(), FsError> {
-        let (root_tree, _) = self.root_tree_root();
+        // A lock-free read of the root tree, which a concurrent commit may
+        // re-pack and reuse (see `switch_to_subvol`): retry from the live
+        // root tree when that is what failed.
+        let mut attempt = 0;
+        loop {
+            let (root_tree, _) = self.root_tree_root();
+            match self.select_default_root_from(root_tree).await {
+                Err(FsError::InvalidData)
+                    if attempt < 4 && self.root_tree_root().0 != root_tree =>
+                {
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn select_default_root_from(self: &Arc<Self>, root_tree: u64) -> Result<(), FsError> {
         let (fs_root, fs_level, fs_flags) =
             crate::roots::find_root_with_flags(self, root_tree, format::FS_TREE_OBJECTID).await?;
         self.select_subvol(format::FS_TREE_OBJECTID, fs_root, fs_level, fs_flags);
