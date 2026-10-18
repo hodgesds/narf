@@ -1217,6 +1217,7 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
         .and_then(|n| n.checked_add(rewrite_len))
         .ok_or(FsError::InvalidData)?;
     new_inode[24..32].copy_from_slice(&new_nbytes.to_le_bytes()); // nbytes
+    touch_times(&mut new_inode, true); // `file_update_time`
     edits.push(Edit::Upsert(inode_key, new_inode));
 
     batch_stage_refs(vol, batch, &edits, dropped_data, converted.added, new_data).await?;
@@ -5183,6 +5184,126 @@ async fn commit_txn<B: BlockDevice + 'static>(
 
 // ── Namespace mutations (create / unlink) ──────────────────────────
 
+/// `btrfs_inode_item` timespec offsets: atime, ctime, mtime.
+const INODE_ATIME: usize = 112;
+const INODE_CTIME: usize = 124;
+const INODE_MTIME: usize = 136;
+
+/// The wall clock as a `btrfs_timespec`, or `None` while it is unset (no RTC
+/// read yet), in which case timestamps are left as they are.
+pub(crate) fn wall_now() -> Option<(i64, u32)> {
+    let w = narf_time::now_wall();
+    (w.secs > 0).then_some((w.secs, w.nanos))
+}
+
+fn put_time(item: &mut [u8], off: usize, (secs, nanos): (i64, u32)) {
+    item[off..off + 8].copy_from_slice(&secs.to_le_bytes());
+    item[off + 8..off + 12].copy_from_slice(&nanos.to_le_bytes());
+}
+
+/// `file_update_time` / `inode_set_ctime_current`: stamp ctime (and mtime)
+/// with the wall clock in a raw inode item.
+pub(crate) fn touch_times(item: &mut [u8], mtime: bool) {
+    if let Some(now) = wall_now() {
+        put_time(item, INODE_CTIME, now);
+        if mtime {
+            put_time(item, INODE_MTIME, now);
+        }
+    }
+}
+
+/// One `setattr` (chmod / chown / utimensat). `None` leaves a field alone.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AttrChange {
+    /// New permission and special bits (the low 12 of `st_mode`).
+    pub perms: Option<u16>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    /// Wall-clock nanoseconds since the epoch.
+    pub atime_ns: Option<u64>,
+    pub mtime_ns: Option<u64>,
+}
+
+/// Apply `change` to inode `ino` (`btrfs_setattr` -> `setattr_copy` ->
+/// `btrfs_update_inode`): mode keeps its `S_IFMT`, a chown kills `S_ISUID`
+/// (and a group-executable `S_ISGID`) on a non-directory, ctime moves to now,
+/// `transid` and `sequence` advance. Returns the new inode.
+pub async fn set_inode_attrs<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    ino: u64,
+    change: AttrChange,
+) -> Result<InodeItem, FsError> {
+    with_space_retry(vol, || set_inode_attrs_once(vol, ino, change)).await
+}
+
+async fn set_inode_attrs_once<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    ino: u64,
+    change: AttrChange,
+) -> Result<InodeItem, FsError> {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFDIR: u32 = 0o040000;
+    const S_ISUID: u32 = 0o4000;
+    const S_ISGID: u32 = 0o2000;
+    const S_IXGRP: u32 = 0o0010;
+    ensure_private_subvol(vol).await?;
+    let (fs_root, _) = vol.fs_tree_root();
+    let key = BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0);
+    let mut item = btree::find_item(vol, fs_root, &key)
+        .await?
+        .ok_or(FsError::NotFound)?;
+    let full = {
+        let mut guard = batch_begin(vol).await?;
+        let batch = guard.as_mut().ok_or(FsError::InvalidData)?;
+        let gen = batch.gen;
+        let mut mode = format::le32(&item, 52)?;
+        if let Some(perms) = change.perms {
+            mode = (mode & S_IFMT) | (u32::from(perms) & 0o7777);
+        }
+        if change.uid.is_some() || change.gid.is_some() {
+            if let Some(uid) = change.uid {
+                item[44..48].copy_from_slice(&uid.to_le_bytes());
+            }
+            if let Some(gid) = change.gid {
+                item[48..52].copy_from_slice(&gid.to_le_bytes());
+            }
+            if mode & S_IFMT != S_IFDIR {
+                mode &= !S_ISUID;
+                if mode & S_IXGRP != 0 {
+                    mode &= !S_ISGID;
+                }
+            }
+        }
+        item[52..56].copy_from_slice(&mode.to_le_bytes());
+        let ts = |ns: u64| ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as u32);
+        if let Some(ns) = change.atime_ns {
+            put_time(&mut item, INODE_ATIME, ts(ns));
+        }
+        if let Some(ns) = change.mtime_ns {
+            put_time(&mut item, INODE_MTIME, ts(ns));
+        }
+        touch_times(&mut item, false);
+        item[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
+        let seq = le64(&item, 72)?;
+        item[72..80].copy_from_slice(&(seq + 1).to_le_bytes()); // sequence
+        qgroup_begin_op(batch);
+        qgroup_reserve_meta(vol, batch, vol.fs_tree_id(), 1).await?;
+        batch_stage(
+            vol,
+            batch,
+            &[Edit::Upsert(key, item.clone())],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await?;
+        batch.ops >= MAX_BATCH_OPS
+    };
+    if full {
+        flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
+    }
+    InodeItem::decode(&item)
+}
+
 /// Build a fresh 160-byte `btrfs_inode_item`.
 #[allow(clippy::too_many_arguments)]
 fn inode_item(
@@ -6291,8 +6412,14 @@ async fn create_node<B: BlockDevice + 'static>(
     .await?
     .ok_or(FsError::NotFound)?;
     let psize = le64(&pinode, 16)?;
-    let ptime_sec = le64(&pinode, 136)? as i64;
-    let ptime_nsec = format::le32(&pinode, 144)?;
+    // A new inode is stamped "now" and so are its parent's mtime/ctime
+    // (`btrfs_create_new_inode`, `btrfs_add_link`). Without a wall clock the
+    // parent's mtime stands in, as before.
+    let (ptime_sec, ptime_nsec) = match wall_now() {
+        Some(now) => now,
+        None => (le64(&pinode, 136)? as i64, format::le32(&pinode, 144)?),
+    };
+    touch_times(&mut pinode, true);
     pinode[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
                                                        // btrfs directory `i_size` counts each entry's name twice (DIR_ITEM +
                                                        // DIR_INDEX) — see `btrfs_add_link` (`i_size + name->len * 2`).

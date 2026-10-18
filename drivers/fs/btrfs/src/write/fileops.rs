@@ -323,6 +323,7 @@ async fn stage<B: BlockDevice + 'static>(
     mut extra: Vec<Edit>,
     prealloc: &[(u64, u64)],
     new_size: Option<u64>,
+    touch_mtime: bool,
 ) -> Result<(), FsError> {
     let ss = u64::from(vol.sectorsize());
     let root = vol.fs_tree_id();
@@ -394,6 +395,9 @@ async fn stage<B: BlockDevice + 'static>(
             .and_then(|n| n.checked_add(added_nbytes))
             .ok_or(FsError::InvalidData)?;
         inode[24..32].copy_from_slice(&nbytes.to_le_bytes());
+        // ctime always (fallocate, truncate); mtime when the size or the data
+        // changed (`btrfs_setsize`, `btrfs_punch_hole`).
+        super::touch_times(&mut inode, new_size.is_some() || touch_mtime);
         let mut edits = carve.edits;
         edits.append(&mut extra);
         edits.push(Edit::Upsert(inode_key, inode));
@@ -486,7 +490,7 @@ async fn truncate_once<B: BlockDevice + 'static>(
         if new_size == old_size && carved.edits.is_empty() && extra.is_empty() {
             return Ok(());
         }
-        stage(vol, ino, carved, extra, &[], Some(new_size)).await
+        stage(vol, ino, carved, extra, &[], Some(new_size), true).await
     } else {
         // Growing: zero the stale tail of the old last sector, then only the
         // size moves (`NO_HOLES`) or explicit holes fill the gap.
@@ -508,7 +512,7 @@ async fn truncate_once<B: BlockDevice + 'static>(
                 gen,
             )
         };
-        stage(vol, ino, Carve::default(), extra, &[], Some(new_size)).await
+        stage(vol, ino, Carve::default(), extra, &[], Some(new_size), true).await
     }
 }
 
@@ -621,6 +625,7 @@ async fn prealloc_once<B: BlockDevice + 'static>(
         extra,
         &holes,
         (new_size != old_size).then_some(new_size),
+        false,
     )
     .await
 }
@@ -679,5 +684,5 @@ async fn punch_once<B: BlockDevice + 'static>(
             ));
         }
     }
-    stage(vol, ino, carved, extra, &[], None).await
+    stage(vol, ino, carved, extra, &[], None, true).await
 }

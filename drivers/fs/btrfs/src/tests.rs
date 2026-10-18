@@ -13286,3 +13286,127 @@ fn smoke_btrfs_super_stripe_exclusion() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_super_stripe_exclusion);
+
+/// chmod / chown / utimensat through the node (`btrfs_setattr`): the file
+/// type never changes, chown kills set-uid (and group-exec set-gid) on a
+/// file, explicit times land exactly, ctime and the inode sequence advance,
+/// writes and truncates move mtime, and it all survives a remount.
+fn smoke_btrfs_setattr_model() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture did not mount"),
+    };
+    let f = match poll_once(vol.root().create("attrs.bin")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let ino = f.ino();
+    let raw = |vol: &SyncVol| {
+        let (root, _) = vol.fs_tree_root();
+        poll_once(btree::find_item(
+            vol,
+            root,
+            &BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0),
+        ))
+        .and_then(|r| r.ok())
+        .flatten()
+        .unwrap_or_default()
+    };
+    let mode = |b: &[u8]| format::le32(b, 52).unwrap_or(0);
+    let seq = |b: &[u8]| format::le64(b, 72).unwrap_or(0);
+    let time = |b: &[u8], off: usize| {
+        (
+            format::le64(b, off).unwrap_or(0) as i64,
+            format::le32(b, off + 8).unwrap_or(0),
+        )
+    };
+    let before = raw(&vol);
+    if !matches!(poll_once(f.set_perms(0o6755)), Some(Ok(()))) {
+        return TestResult::Fail("chmod failed");
+    }
+    let after_chmod = raw(&vol);
+    if mode(&after_chmod) != 0o100000 | 0o6755 || f.stat().mode.perms != 0o755 {
+        return TestResult::Fail("chmod did not set exactly the permission bits");
+    }
+    if seq(&after_chmod) <= seq(&before) {
+        return TestResult::Fail("chmod did not advance the inode sequence");
+    }
+    if !matches!(poll_once(f.set_owners(1000, 1000)), Some(Ok(()))) {
+        return TestResult::Fail("chown failed");
+    }
+    let after_chown = raw(&vol);
+    if format::le32(&after_chown, 44) != Ok(1000)
+        || format::le32(&after_chown, 48) != Ok(1000)
+        || f.owners() != (1000, 1000)
+    {
+        return TestResult::Fail("chown did not set uid/gid");
+    }
+    // 06755 has group-exec, so chown clears both set-uid and set-gid.
+    if mode(&after_chown) != 0o100755 {
+        return TestResult::Fail("chown did not kill set-uid/set-gid");
+    }
+    let at = 1_700_000_000_123_456_789u64;
+    let mt = 1_600_000_000_987_654_321u64;
+    if f.set_times(Some(at), Some(mt)).is_err() {
+        return TestResult::Fail("utimensat failed");
+    }
+    let after_times = raw(&vol);
+    if time(&after_times, 112) != (1_700_000_000, 123_456_789)
+        || time(&after_times, 136) != (1_600_000_000, 987_654_321)
+    {
+        return TestResult::Fail("utimensat times not exact");
+    }
+    // atime OMIT: only mtime moves.
+    if f.set_times(None, Some(mt + 1)).is_err()
+        || time(&raw(&vol), 112) != (1_700_000_000, 123_456_789)
+    {
+        return TestResult::Fail("UTIME_OMIT changed atime");
+    }
+    let clock = crate::write::wall_now();
+    if let Some(now) = clock {
+        if time(&after_times, 124) < (now.0 - 5, 0) {
+            return TestResult::Fail("ctime did not move to now");
+        }
+        if !matches!(poll_once(f.write(0, b"data")), Some(Ok(4))) {
+            return TestResult::Fail("write failed");
+        }
+        if time(&raw(&vol), 136) < (now.0 - 5, 0) {
+            return TestResult::Fail("write did not move mtime");
+        }
+    }
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("sync failed");
+    }
+    let fresh = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount failed"),
+    };
+    let persisted = raw(&fresh);
+    if mode(&persisted) != 0o100755
+        || format::le32(&persisted, 44) != Ok(1000)
+        || time(&persisted, 112) != (1_700_000_000, 123_456_789)
+    {
+        return TestResult::Fail("attributes did not survive a remount");
+    }
+    // A directory keeps its S_ISGID through chown (Linux keeps it on dirs).
+    let d = match poll_once(fresh.root().mkdir("sgid-dir")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    let dnode = match poll_once(fresh.root().lookup_async("sgid-dir")) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("lookup dir failed"),
+    };
+    let _ = d;
+    if !matches!(poll_once(dnode.set_perms(0o2775)), Some(Ok(())))
+        || !matches!(poll_once(dnode.set_owners(5, 5)), Some(Ok(())))
+        || dnode.stat().mode.perms & 0o7777 != 0o775
+    {
+        return TestResult::Fail("directory chmod/chown failed");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_setattr_model);
