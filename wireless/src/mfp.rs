@@ -138,7 +138,7 @@ pub fn protect_outbound(
     let ipn = igtk.tx_pn;
     let aad = build_bip_aad(hdr_24).map_err(MfpError::from)?;
 
-    // Reserve the MMIE bytes: ElementID (1) || Length (1) || body (24).
+    // Reserve the MMIE bytes: ElementID (1) || Length (1) || body (16).
     let mmie_header_len = 2;
     let start_of_mmie = body.len();
     body.extend_from_slice(&[ELEMENT_ID_MMIE, (MMIE_LEN_CMAC_128) as u8]);
@@ -156,11 +156,14 @@ pub fn protect_outbound(
 
     let mic = bip_cmac::compute_mic(igtk, &aad, body);
     // Splice MIC into MMIE.
-    body[mmie_body_off + 8..mmie_body_off + 24].copy_from_slice(&mic);
+    body[mmie_body_off + 8..mmie_body_off + 8 + BIP_MIC_LEN].copy_from_slice(&mic);
 
     // Sanity: cross-check by recomputing the MMIE body via build helper.
     let mmie_block = build_mmie_body(igtk.key_id, ipn, &mic);
-    debug_assert_eq!(&body[mmie_body_off..mmie_body_off + 24], &mmie_block);
+    debug_assert_eq!(
+        &body[mmie_body_off..mmie_body_off + MMIE_LEN_CMAC_128],
+        &mmie_block
+    );
 
     Ok(ipn)
 }
