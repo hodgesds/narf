@@ -39,8 +39,9 @@
 //! the interrupt-enabled pipes and counts completions found without an
 //! interrupt ([`CeStats::polled_without_irq`]).
 //!
-//! Not ported: `ath11k_ce_byte_swap` (little-endian host),
-//! `ath11k_ce_cleanup_pipes` beyond dropping the memory, the
+//! [`Ce::cleanup_pipes`] = `ath11k_ce_cleanup_pipes` (crash recovery).
+//!
+//! Not ported: `ath11k_ce_byte_swap` (little-endian host), the
 //! `CE_ATTR_DIS_INTR` "except wake IRQ" suspend helpers.
 
 #![allow(dead_code)]
@@ -858,6 +859,48 @@ impl Ce {
     /// CE interrupts off.
     pub fn stop(&mut self) {
         set_ce_irqs_enabled(false);
+    }
+
+    /// Linux `ath11k_ce_cleanup_pipes` (crash recovery, after the device
+    /// reset): every posted RX buffer is dropped (`ath11k_ce_rx_pipe_cleanup`),
+    /// interrupt-less source rings are reaped
+    /// (`ath11k_ce_poll_send_completed`). NARF also hands each ring's
+    /// descriptor memory back from the HAL (`Hal::srng_free`; Linux keeps
+    /// it in `ce_ring->base_addr_owner_unaligned` and re-runs the setup
+    /// over it after `ath11k_hal_srng_clear`) and forgets the sends still
+    /// in flight, so [`Self::init_pipes`] can run again.
+    pub fn cleanup_pipes(&mut self) {
+        for i in 0..self.pipes.len() as u32 {
+            self.poll_send_completed(i);
+            let pipe = &mut self.pipes[i as usize];
+            for p in pipe.rx_posted.iter_mut() {
+                *p = false;
+            }
+            pipe.rx_buf_needed = 0;
+            pipe.rx_queue.clear();
+            for t in pipe.tx_inflight.iter_mut() {
+                *t = None;
+            }
+            pipe.tx_done.clear();
+            pipe.hp_timer = HpUpdateTimer::default();
+            let (s, d, st) = pipe.ring_ids();
+            for (id, which) in [(s, 0), (d, 1), (st, 2)] {
+                let Some(id) = id else { continue };
+                let mem = self.hal.srng_free(id);
+                let pipe = &mut self.pipes[i as usize];
+                let ring = match which {
+                    0 => pipe.src_ring.as_mut(),
+                    1 => pipe.dest_ring.as_mut(),
+                    _ => pipe.status_ring.as_mut(),
+                };
+                if let Some(r) = ring {
+                    r.mem = mem;
+                    r.sw_index = 0;
+                    r.write_index = 0;
+                }
+            }
+        }
+        self.rx_retry_at = None;
     }
 
     // ── RX ────────────────────────────────────────────────────────

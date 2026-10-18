@@ -283,6 +283,11 @@ Linux's: entry size / ring size / HP / TP in 32-bit words.
   ring_num, mac_id, SrngParams)` = `ath11k_hal_srng_setup` with
   `src_hw_init` / `dst_hw_init` / `ce_dst_setup` (takes ownership of the
   ring memory, returns the ring id).
+- Teardown: `srng_ids()`; `srng_free(id) -> Option<DmaMem>` (the owner
+  gives a ring up — `ath11k_dp_srng_cleanup` frees it, a CE keeps it;
+  registers untouched; only once the hardware no longer uses the ring);
+  `srng_clear()` = `ath11k_hal_srng_clear` (every listed ring forgotten;
+  `rdp` / `wrp` and the shadow list kept, as Linux).
 - Access: `access_begin`, `access_end`, `src_get_next_entry`,
   `src_reap_next`, `src_get_next_reaped`, `src_peek`, `src_next_peek`,
   `dst_get_next_entry`, `dst_peek`, `src_num_free`, `dst_num_free`,
@@ -317,7 +322,11 @@ Linux's: entry size / ring size / HP / TP in 32-bit words.
 - `CeAttr`, `HOST_CE_CONFIG_QCA6390` (9 CEs), `HOST_CE_CONFIG_QCN9074`.
 - `Ce::alloc(&HwParams, CeMsi, clock)` (HAL init + `ath11k_ce_alloc_pipes`
   + shadow config), `Ce::shadow_reg_v2()`, `Ce::init_pipes(io)`,
-  `Ce::start(io)` (CE IRQs on + `ath11k_ce_rx_post_buf`), `Ce::stop()`.
+  `Ce::start(io)` (CE IRQs on + `ath11k_ce_rx_post_buf`), `Ce::stop()`,
+  `Ce::cleanup_pipes()` = `ath11k_ce_cleanup_pipes` (posted RX buffers
+  dropped, interrupt-less sources reaped) + NARF's hand-back of each
+  ring's memory from the HAL and of the in-flight sends, so
+  `init_pipes` sets the same memory up again.
 - `Ce::send(io, pipe, &[u8], transfer_id)` = `ath11k_ce_send` (copies
   into the slot's DMA32 bounce buffer); `Ce::take_rx(pipe)` /
   `take_rx_any()` / `rx_pending(pipe)`; `Ce::take_tx_done(pipe)` (only
@@ -349,7 +358,9 @@ Layouts only (runtime is phase 5): `BufferAddr`, `HalTlvHdr`,
 Tests: `hal_tests.rs`, `ce_tests.rs` (x86_64 kernel tests). The CE
 tests drive a fake chip that only knows what the host programmed
 (ring bases, sizes, pointer addresses, shadow mirroring) and moves data
-through the real DMA32 ring memory.
+through the real DMA32 ring memory; `smoke_ath11k_ce_cleanup_and_reinit`
+runs cleanup → device reset → `init_pipes` over the same memory with
+data in both directions after it.
 
 ### 3.6 Core bring-up (`core.rs`, Linux `core.c`)
 
@@ -502,6 +513,18 @@ Call order (Linux call sites):
    `DpServiceOutput { rx: Vec<RxMsdu> (Ethernet II), tx_done,
    reo_status }`; `dp.service_shadow_timers(.., now_ms)` every ≤ 10 ms;
    `reap_mon_status` on the monitor timer (Linux `mon_reap_timer`).
+9. Teardown (`ath11k_core_reconfigure_on_crash`, after the device
+   reset): `dp.pdev_free(hal)` (`ath11k_dp_pdev_free`: the seven pdev
+   rings + their RX buffers), `dp.pdev_reo_cleanup(hal)`
+   (`ath11k_dp_pdev_reo_cleanup`), `dp.free(hal)` (`ath11k_dp_free`:
+   link descriptor banks + WBM idle ring, shadow timers stopped, common
+   rings, REO command lists with their queue descriptors and the
+   stranded ones, pending TX buffers; a pdev / REO ring still set up is
+   released first). The HAL then holds none of the DP's rings and takes
+   a new `Dp::alloc`. A failed `Dp::alloc` (`fail_cmn_srng_cleanup` /
+   `fail_link_desc_cleanup`), `pdev_reo_setup` (`err_reo_cleanup`) or
+   `pdev_alloc` (`ath11k_dp_pdev_free`) releases exactly the rings it set
+   up, so a retry works on the same `Hal`.
 
 Pieces: `Idr` (lowest-free `idr_alloc`), `hal_tx_cmd_desc`
 (`ath11k_hal_tx_cmd_desc_setup`), `link_desc_words`,
@@ -530,8 +553,10 @@ registers, idle list, RX posting, all seven SRING_SETUP and both
 RX_RING_SELECTION_CFG messages at Linux sizes; RX reap + decap,
 continuation, wrap-around, error rings, link-descriptor return, REO
 status, monitor-status reap; TX descriptor golden, native-wifi encap,
-completion decode, FIFO-full, wrap, shadow timer; negatives) and
-`htt_tests.rs`. The device model learns UMAC rings only from the
+completion decode, FIFO-full, wrap, shadow timer; `srng_free` /
+`srng_clear`, pdev / REO / DP free and a second DP on the same HAL,
+failed alloc / REO setup / pdev alloc releasing exactly their rings;
+negatives) and `htt_tests.rs`. The device model learns UMAC rings only from the
 programmed registers + the QMI shadow list and LMAC rings only from
 the HTT messages, and moves descriptors / buffers by physical address.
 ### 3.9 Station mac layer (`mac.rs`, `mac_reg.rs`, `mac_peer.rs`, `mac_frame.rs`)
@@ -1172,8 +1197,9 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
 - DP not ported: WBM idle scatter list (dead for WBM_IDLE_LINK: > 2 MiB
   of 8-byte entries needs > 8 banks, which `ath11k_dp_link_desc_setup`
   rejects first), monitor / full-monitor rings, PPDU / peer TX-RX
-  statistics, ring teardown (`ath11k_dp_free`; a failed `Dp::alloc`
-  leaves its rings in the HAL, so a retry needs a new `Hal`).
+  statistics. (Ring teardown is ported, §3.7 step 9; NARF-stricter: a
+  failed `ath11k_link_desc_setup` also releases the WBM idle ring, which
+  Linux's `ath11k_dp_alloc` leaks on that path.)
 - Integration (decided, §3.11): HTT T2H from the HTC HTT endpoint (and
   CE5) → `htt_t2h_msg_handler` in every service pass; HTT H2T via
   `Ath11kCore::htt_send`; the DP ext groups on vectors `(grp % 18) + 14`

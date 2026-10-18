@@ -148,6 +148,12 @@ impl FakeChip {
     pub(super) fn take_pending(&self) -> u32 {
         self.pending.replace(0)
     }
+    /// SoC reset: the target forgets its ring positions (the register
+    /// file keeps what the host wrote; the host re-programs it).
+    pub(super) fn device_reset(&self) {
+        *self.dev.borrow_mut() = [DevCe::default(); CE_COUNT_MAX];
+        self.pending.set(0);
+    }
     /// (base, size in words) from BASE_LSB / BASE_MSB at `r0`.
     fn ring(&self, r0: u32) -> (u64, u32) {
         let msb = self.reg(r0 + 4);
@@ -1135,3 +1141,63 @@ fn smoke_ath11k_ce_async_recv() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_ce_async_recv);
+
+/// `ath11k_ce_cleanup_pipes` + `ath11k_hal_srng_clear` + a second
+/// `ath11k_ce_init_pipes` (crash recovery): the rings leave the HAL with
+/// their memory, the same memory is set up again, and data flows after the
+/// device reset.
+fn smoke_ath11k_ce_cleanup_and_reinit() -> TestResult {
+    let (mut ce, chip) = match bring_up() {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let src0_base = chip.reg(0x01b8_0000);
+    let rings = ce.hal.srng_ids().len();
+    check!(rings > 0, "CE rings set up");
+    // A send in flight and a receive not yet serviced.
+    check!(ce.send(&chip, 0, b"lost", 1).is_ok(), "send in flight");
+    check!(chip.target_deliver(2, b"stale", None), "receive pending");
+    ce.cleanup_pipes();
+    check!(ce.hal.srng_ids().is_empty(), "every CE ring left the HAL");
+    check!(ce.hal.srng_clear() == 0, "nothing left for srng_clear");
+    for i in 0..ce.ce_count() as u32 {
+        let p = ce.pipe(i).unwrap();
+        check!(p.ring_ids() == (None, None, None), "rings uninitialised");
+        check!(p.rx_buf_needed == 0, "posted buffers dropped");
+    }
+    check!(ce.rx_pending(2) == 0, "nothing delivered");
+    chip.device_reset();
+    let _ = chip.take_pending();
+    check!(ce.init_pipes(&chip).is_ok(), "init_pipes again");
+    ce.start(&chip);
+    set_ce_irqs_enabled(false);
+    check!(ce.hal.srng_ids().len() == rings, "same rings set up");
+    check!(
+        chip.reg(0x01b8_0000) == src0_base,
+        "CE0 source ring at the same memory"
+    );
+    check!(
+        ce.pipe(0).unwrap().src_indices() == Some((16, 0, 0)),
+        "indices reset"
+    );
+    check!(ce.send(&chip, 0, b"again", 2).is_ok(), "send after reinit");
+    check!(
+        chip.target_consume(0) == [(2, b"again".to_vec())],
+        "only the new send reaches the target"
+    );
+    check!(
+        chip.target_deliver(2, b"fresh", None),
+        "deliver after reinit"
+    );
+    let pend = chip.take_pending();
+    ce.service(&chip, pend);
+    check!(
+        ce.take_rx(2).as_deref() == Some(&b"fresh"[..]),
+        "receive after reinit"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_ce_cleanup_and_reinit
+);

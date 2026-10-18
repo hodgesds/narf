@@ -1310,6 +1310,42 @@ impl Hal {
         self.srng(id).map(|s| &s.mem)
     }
 
+    /// Ids of the rings set up now.
+    pub fn srng_ids(&self) -> Vec<u32> {
+        self.srngs
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_some())
+            .map(|(i, _)| i as u32)
+            .collect()
+    }
+
+    /// The ring's owner gives it up (`ath11k_dp_srng_cleanup` frees the
+    /// memory; a CE keeps it for the next `ath11k_ce_init_ring`): the ring
+    /// leaves the HAL and its memory goes back to the caller. The ring
+    /// registers are not touched (Linux's cleanup does not either); only
+    /// call this once the hardware no longer uses the ring — after a
+    /// device reset, or before the ring was ever handed to the firmware.
+    pub fn srng_free(&mut self, id: u32) -> Option<DmaMem> {
+        self.srngs.get_mut(id as usize)?.take().map(|s| s.mem)
+    }
+
+    /// Linux `ath11k_hal_srng_clear` (crash recovery): forget every ring so
+    /// each can be set up again. Memory of rings still listed is dropped
+    /// (their owners released theirs first: DP with [`Self::srng_free`],
+    /// CE with `Ce::cleanup_pipes`). As Linux, the `rdp` / `wrp` words are
+    /// not cleared (ring setup zeroes each one) and the shadow register
+    /// list is kept (`ath11k_ce_get_shadow_config` rebuilds the same one).
+    pub fn srng_clear(&mut self) -> usize {
+        let mut n = 0;
+        for s in self.srngs.iter_mut() {
+            if s.take().is_some() {
+                n += 1;
+            }
+        }
+        n
+    }
+
     fn srng_mut(&mut self, id: u32) -> Option<&mut Srng> {
         self.srngs.get_mut(id as usize).and_then(|s| s.as_mut())
     }

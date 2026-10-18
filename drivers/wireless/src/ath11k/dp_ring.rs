@@ -1112,6 +1112,16 @@ fn dp_srng_setup(
     })
 }
 
+/// Free every HAL ring set up since `before` was taken (a failed
+/// allocation's unwind).
+fn release_new_rings(hal: &mut Hal, before: &[u32]) {
+    for id in hal.srng_ids() {
+        if !before.contains(&id) {
+            hal.srng_free(id);
+        }
+    }
+}
+
 /// `DSCP_TID_MAP_TBL_ENTRY_SIZE` table of hal_tx.c (DSCP >> 3).
 const fn dscp_tid(i: usize) -> u32 {
     (i / 8) as u32
@@ -1405,11 +1415,90 @@ impl Dp {
         sizes: DpRingSizes,
         msi: Option<CeMsi>,
     ) -> Result<Dp, TransportError> {
+        let before = hal.srng_ids();
         let r = Self::alloc_inner(hal, io, cfg, sizes, msi);
         if let Err(e) = &r {
             e.report("ath11k DP alloc");
+            // fail_cmn_srng_cleanup / fail_link_desc_cleanup: every ring
+            // this attempt set up leaves the HAL (the link descriptor
+            // banks went with the error), so the HAL takes a new attempt.
+            release_new_rings(hal, &before);
         }
         r
+    }
+
+    /// The probe's DP MSI (`ath11k_dp_srng_msi_setup` input).
+    pub fn msi(&self) -> Option<CeMsi> {
+        self.msi
+    }
+
+    /// Linux `ath11k_dp_pdev_reo_cleanup`: the REO2SW destination rings
+    /// (`ath11k_core_stop`, `ath11k_core_reconfigure_on_crash`).
+    pub fn pdev_reo_cleanup(&mut self, hal: &mut Hal) {
+        for r in self.reo_dst_ring.drain(..) {
+            hal.srng_free(r.ring_id);
+        }
+    }
+
+    /// Linux `ath11k_dp_pdev_free` for the single pdev
+    /// (`ath11k_dp_rx_pdev_free`: `ath11k_dp_rx_pdev_srng_free` + the RX
+    /// buffers of `ath11k_dp_rxdma_pdev_buf_free`; the monitor reap timer
+    /// is the runtime's). Only once the hardware no longer uses the rings.
+    pub fn pdev_free(&mut self, hal: &mut Hal) {
+        let Some(p) = self.pdev.take() else { return };
+        hal.srng_free(p.rx_refill_buf_ring.refill_buf_ring.ring_id);
+        for r in p.rx_mac_buf_ring.iter().chain(p.rxdma_err_dst_ring.iter()) {
+            hal.srng_free(r.ring_id);
+        }
+        for r in &p.rx_mon_status_refill_ring {
+            hal.srng_free(r.refill_buf_ring.ring_id);
+        }
+        // The RX buffers in the IDRs go with `p`.
+        drop(p);
+    }
+
+    /// Linux `ath11k_dp_free` (`ath11k_core_reconfigure_on_crash`, after
+    /// the device reset): the WBM idle ring + link descriptor banks
+    /// (`ath11k_dp_link_desc_cleanup`), the shadow timers and the common
+    /// rings (`ath11k_dp_srng_common_cleanup`), the REO command lists with
+    /// their queue descriptors (`ath11k_dp_reo_cmd_list_cleanup`; NARF's
+    /// stranded descriptors go too: the device that might have used them
+    /// was reset) and the pending TX buffers
+    /// (`ath11k_dp_tx_pending_cleanup`). A pdev or REO destination ring
+    /// still set up is released first. Afterwards the HAL holds none of
+    /// this DP's rings.
+    pub fn free(mut self, hal: &mut Hal) {
+        self.pdev_free(hal);
+        self.pdev_reo_cleanup(hal);
+        hal.srng_free(self.wbm_idle_ring.ring_id);
+        self.link_desc_banks.clear();
+        // ath11k_dp_stop_shadow_timers
+        for t in self.tx_ring_timer.iter_mut() {
+            t.started = false;
+        }
+        self.reo_cmd_timer.started = false;
+        let common = [
+            self.wbm_desc_rel_ring,
+            self.tcl_cmd_ring,
+            self.tcl_status_ring,
+            self.reo_reinject_ring,
+            self.rx_rel_ring,
+            self.reo_except_ring,
+            self.reo_cmd_ring,
+            self.reo_status_ring,
+        ];
+        for r in self.tx_ring.iter() {
+            hal.srng_free(r.tcl_data_ring.ring_id);
+            hal.srng_free(r.tcl_comp_ring.ring_id);
+        }
+        for r in common {
+            hal.srng_free(r.ring_id);
+        }
+        // The queue descriptors and TX buffers drop with `self`.
+        self.peer_rx = super::dp_peer::DpPeerRx::default();
+        for r in self.tx_ring.iter_mut() {
+            r.txbuf = Idr::default();
+        }
     }
 
     fn alloc_inner(
@@ -1712,6 +1801,8 @@ impl Dp {
                 Ok(r) => self.reo_dst_ring.push(r),
                 Err(e) => {
                     e.report("ath11k DP reo_dst ring");
+                    // err_reo_cleanup
+                    self.pdev_reo_cleanup(hal);
                     return Err(e);
                 }
             }
@@ -1746,9 +1837,15 @@ impl Dp {
         io: &impl ChipIo,
         mac_id: u32,
     ) -> Result<Vec<Vec<u8>>, TransportError> {
+        let before = hal.srng_ids();
         let r = self.pdev_alloc_inner(hal, io, mac_id);
         if let Err(e) = &r {
             e.report("ath11k DP pdev alloc");
+            // ath11k_dp_pdev_alloc's err: ath11k_dp_pdev_free (the rings
+            // this attempt set up; nothing was sent to the firmware yet).
+            if self.pdev.is_none() {
+                release_new_rings(hal, &before);
+            }
         }
         r
     }

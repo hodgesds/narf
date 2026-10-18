@@ -2664,3 +2664,193 @@ fn smoke_ath11k_dp_undecap_raw() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_dp_undecap_raw);
+
+/// Occupy one ring of `ty` / `ring_num` / `mac_id` in the HAL (a ring
+/// some other owner already set up).
+fn occupy(hal: &mut Hal, io: &RecIo, ty: HalRingType, ring_num: u32, mac_id: u32) -> u32 {
+    let n = 8;
+    let mem = DmaMem::alloc((hal.entry_size_bytes(ty) * n) as usize, 8).expect("ring memory");
+    hal.srng_setup(io, ty, ring_num, mac_id, SrngParams::new(mem, n))
+        .expect("occupying ring")
+}
+
+/// `Hal::srng_free` / `srng_clear` (`ath11k_dp_srng_cleanup`,
+/// `ath11k_hal_srng_clear`).
+fn smoke_ath11k_hal_srng_free_and_clear() -> TestResult {
+    let cfg = DpHwParams::for_rev(HwRev::Wcn6855Hw21).unwrap();
+    let mut hal = Hal::new(&cfg.hw).unwrap();
+    let io = RecIo::default();
+    let id = occupy(&mut hal, &io, HalRingType::TclCmd, 0, 0);
+    let pa = hal.ring_mem(id).map(|m| m.paddr());
+    check!(hal.srng_ids() == [id], "one ring listed");
+    let mem = hal.srng_free(id);
+    check!(mem.as_ref().map(|m| m.paddr()) == pa, "memory handed back");
+    check!(
+        hal.srng(id).is_none() && hal.srng_free(id).is_none(),
+        "gone, once"
+    );
+    // The same ring id can be set up again (over the returned memory).
+    let again = hal
+        .srng_setup(
+            &io,
+            HalRingType::TclCmd,
+            0,
+            0,
+            SrngParams::new(mem.unwrap(), 8),
+        )
+        .map_err(|e| e.step);
+    check!(again == Ok(id), "set up again");
+    let _ = occupy(&mut hal, &io, HalRingType::ReoStatus, 0, 0);
+    check!(hal.srng_clear() == 2, "srng_clear forgets both");
+    check!(hal.srng_ids().is_empty(), "HAL empty");
+    check!(
+        occupy(&mut hal, &io, HalRingType::TclCmd, 0, 0) == id,
+        "usable after clear"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_hal_srng_free_and_clear
+);
+
+/// `ath11k_dp_pdev_free` → `ath11k_dp_pdev_reo_cleanup` →
+/// `ath11k_dp_free`: every DP ring leaves the HAL, and the same HAL takes
+/// a second DP (the crash-recovery rebuild).
+fn smoke_ath11k_dp_free_and_realloc() -> TestResult {
+    let cfg = DpHwParams::for_rev(HwRev::Wcn6855Hw21).unwrap();
+    let mut r = rig(SMALL);
+    let all = r.hal.srng_ids();
+    let p = r.dp.pdev.as_ref().unwrap();
+    let mut pdev_ids = vec![p.rx_refill_buf_ring.refill_buf_ring.ring_id];
+    pdev_ids.extend(p.rx_mac_buf_ring.iter().map(|s| s.ring_id));
+    pdev_ids.extend(p.rxdma_err_dst_ring.iter().map(|s| s.ring_id));
+    pdev_ids.extend(
+        p.rx_mon_status_refill_ring
+            .iter()
+            .map(|s| s.refill_buf_ring.ring_id),
+    );
+    check!(pdev_ids.len() == 7, "seven pdev rings");
+    check!(
+        !p.rx_refill_buf_ring.bufs.is_empty(),
+        "RX buffers posted on the refill ring"
+    );
+    r.dp.pdev_free(&mut r.hal);
+    check!(r.dp.pdev.is_none(), "pdev gone");
+    let left = r.hal.srng_ids();
+    check!(
+        pdev_ids.iter().all(|id| !left.contains(id)) && left.len() == all.len() - 7,
+        "the pdev's rings left the HAL"
+    );
+    r.dp.pdev_free(&mut r.hal);
+    check!(r.hal.srng_ids() == left, "second pdev_free is a no-op");
+    let reo: Vec<u32> = r.dp.reo_dst_ring.iter().map(|s| s.ring_id).collect();
+    check!(reo.len() == 4, "four REO destination rings");
+    r.dp.pdev_reo_cleanup(&mut r.hal);
+    check!(
+        r.dp.reo_dst_ring.is_empty() && reo.iter().all(|id| r.hal.srng(*id).is_none()),
+        "REO destination rings released"
+    );
+    r.dp.free(&mut r.hal);
+    check!(r.hal.srng_ids().is_empty(), "DP free empties the HAL");
+
+    // The same HAL takes a new DP (a failed or recovered device does not
+    // need a new Hal).
+    let mut dp = match Dp::alloc(&mut r.hal, &r.io, &cfg, SMALL, Some(msi())) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("realloc on the same HAL"),
+    };
+    check!(
+        dp.pdev_reo_setup(&mut r.hal, &r.io).is_ok(),
+        "REO setup again"
+    );
+    let msgs = dp.pdev_alloc(&mut r.hal, &r.io, 0);
+    check!(
+        msgs.as_ref().map(|m| m.len()) == Ok(7),
+        "pdev alloc again: seven SRING_SETUPs"
+    );
+    check!(r.hal.srng_ids() == all, "the same ring ids");
+    check!(dp.msi().is_some(), "MSI kept for a rebuild");
+    // ath11k_dp_free with the pdev still set up releases it as well.
+    dp.free(&mut r.hal);
+    check!(r.hal.srng_ids().is_empty(), "free releases the pdev too");
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_dp_free_and_realloc);
+
+/// A failed `ath11k_dp_alloc` / `ath11k_dp_pdev_reo_setup` /
+/// `ath11k_dp_pdev_alloc` releases what it set up (and only that), so a
+/// retry on the same HAL works.
+fn smoke_ath11k_dp_failed_alloc_unwinds() -> TestResult {
+    let cfg = DpHwParams::for_rev(HwRev::Wcn6855Hw21).unwrap();
+    let mut hal = Hal::new(&cfg.hw).unwrap();
+    let io = RecIo::default();
+    // TCL_CMD taken: the WBM idle and SW2WBM rings set up before it are
+    // released, the occupying ring stays.
+    let busy = occupy(&mut hal, &io, HalRingType::TclCmd, 0, 0);
+    let e = Dp::alloc(&mut hal, &io, &cfg, SMALL, Some(msi())).unwrap_err();
+    check!(
+        e.step == step::SRNG_SETUP && e.detail >> 24 == HalRingType::TclCmd as u32,
+        "fails at TCL_CMD"
+    );
+    check!(
+        hal.srng_ids() == [busy],
+        "fail_cmn_srng_cleanup + link desc cleanup"
+    );
+    hal.srng_free(busy);
+    // Fails after the WBM idle ring (scatter idle list): released too.
+    let big = DpRingSizes {
+        n_link_desc: Some(DP_LINK_DESC_ALLOC_SIZE_THRESH / 8 + 1),
+        ..SMALL
+    };
+    check!(
+        Dp::alloc(&mut hal, &io, &cfg, big, None).is_err(),
+        "scatter refused"
+    );
+    check!(hal.srng_ids().is_empty(), "WBM idle ring released");
+    // Retry on the same HAL.
+    let mut dp = match Dp::alloc(&mut hal, &io, &cfg, SMALL, Some(msi())) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("retry on the same HAL"),
+    };
+    let after_alloc = hal.srng_ids();
+    // REO2SW3 taken: err_reo_cleanup releases REO2SW1 / 2.
+    let reo3 = occupy(&mut hal, &io, HalRingType::ReoDst, 2, 0);
+    check!(
+        dp.pdev_reo_setup(&mut hal, &io).is_err(),
+        "REO setup fails at ring 2"
+    );
+    check!(dp.reo_dst_ring.is_empty(), "no REO destination ring kept");
+    let mut want = after_alloc.clone();
+    want.push(reo3);
+    want.sort();
+    check!(hal.srng_ids() == want, "REO rings 0 / 1 released");
+    hal.srng_free(reo3);
+    check!(
+        dp.pdev_reo_setup(&mut hal, &io).is_ok(),
+        "REO setup retried"
+    );
+    // RXDMA error ring taken: the refill / MAC buffer rings set up first
+    // are released.
+    let before = hal.srng_ids();
+    let err = occupy(&mut hal, &io, HalRingType::RxdmaDst, 0, 0);
+    check!(dp.pdev_alloc(&mut hal, &io, 0).is_err(), "pdev alloc fails");
+    check!(dp.pdev.is_none(), "no pdev");
+    let mut want = before.clone();
+    want.push(err);
+    want.sort();
+    check!(
+        hal.srng_ids() == want,
+        "ath11k_dp_pdev_free on the error path"
+    );
+    hal.srng_free(err);
+    check!(
+        dp.pdev_alloc(&mut hal, &io, 0).is_ok(),
+        "pdev alloc retried"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_dp_failed_alloc_unwinds
+);
