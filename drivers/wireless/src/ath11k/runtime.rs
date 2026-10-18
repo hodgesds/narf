@@ -407,8 +407,9 @@ pub struct LinkState {
     pub seq: SeqState,
     /// Received EAPOL frames (802.3) for the supplicant.
     pub eapol_rx: VecDeque<Vec<u8>>,
-    /// Received data frames (Ethernet II) for the interface.
-    pub data_rx: VecDeque<Vec<u8>>,
+    /// Received data frames (Ethernet II) for the interface, with
+    /// `ath11k_dp_rx_h_csum_offload`'s verdict (`CHECKSUM_UNNECESSARY`).
+    pub data_rx: VecDeque<(Vec<u8>, bool)>,
 }
 
 /// Counters.
@@ -558,6 +559,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
     /// `ieee80211_accept_frame`, `ieee80211_data_to_8023`'s echo check,
     /// the control port, `ieee80211_802_1x_port_control`).
     fn rx_msdu(&mut self, m: RxMsdu) {
+        let csum_ok = m.csum_ok;
         let f = m.frame;
         if f.len() < ETH_HLEN {
             self.stats.rx_dropped_short += 1;
@@ -586,7 +588,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
                 return;
             }
             self.stats.rx_data += 1;
-            self.link.data_rx.push_back(f);
+            self.link.data_rx.push_back((f, csum_ok));
         } else {
             self.stats.rx_dropped_unauth += 1;
         }
@@ -676,9 +678,11 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
 
     /// Transmit an Ethernet frame on the station vif: mac80211's
     /// Ethernet → 802.11 conversion ([`tx_hdr::build_sta_data`]) then
-    /// `ath11k_dp_tx` with NATIVE_WIFI encapsulation. Returns the TX
-    /// descriptor id.
-    pub fn tx_eth(&mut self, eth: &[u8]) -> Result<u32, i32> {
+    /// `ath11k_dp_tx` with NATIVE_WIFI encapsulation. `csum_partial` is
+    /// `skb->ip_summed == CHECKSUM_PARTIAL` (the seed is already in the
+    /// frame, [`super::tx_offload::csum_partial_prepare`]). Returns the
+    /// TX descriptor id.
+    pub fn tx_eth(&mut self, eth: &[u8], csum_partial: bool) -> Result<u32, i32> {
         let (Some(vif), Some(bssid)) = (self.link.vif, self.link.bss) else {
             // ieee80211_build_hdr: no chanctx / not associated.
             return Err(ENOTCONN);
@@ -697,8 +701,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
             queue: built.ac,
             // hw_ops->get_ring_selector: one TCL ring on WCN6855.
             ring_selector: 0,
-            // NARF's stack computes checksums (no NETIF_F_HW_CSUM).
-            csum_partial: false,
+            // NETIF_F_HW_CSUM (`tx_offload::OFFLOADS`).
+            csum_partial,
             pdev_idx: 0,
             lmac_id: 0,
         };
@@ -916,17 +920,19 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         Ok(())
     }
 
-    /// Received data frames waiting for the interface (Ethernet II).
-    pub async fn take_rx(&self) -> Vec<Vec<u8>> {
+    /// Received data frames waiting for the interface (Ethernet II +
+    /// the hardware checksum verdict).
+    pub async fn take_rx(&self) -> Vec<(Vec<u8>, bool)> {
         let mut g = self.lock().await;
         g.service();
         g.link.data_rx.drain(..).collect()
     }
 
-    /// Transmit an Ethernet frame from the interface.
-    pub async fn tx_data(&self, eth: &[u8]) -> Result<u32, i32> {
+    /// Transmit an Ethernet frame from the interface (`csum_partial`: see
+    /// [`Rt::tx_eth`]).
+    pub async fn tx_data(&self, eth: &[u8], csum_partial: bool) -> Result<u32, i32> {
         let mut g = self.lock().await;
-        let r = g.tx_eth(eth);
+        let r = g.tx_eth(eth, csum_partial);
         g.service();
         r
     }
@@ -1177,7 +1183,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
     }
 
     async fn send_eth(&self, frame: &[u8]) -> Result<(), i32> {
-        self.0.tx_data(frame).await.map(|_| ())
+        self.0.tx_data(frame, false).await.map(|_| ())
     }
 
     async fn recv_eapol(&self, timeout_ms: u32) -> Option<Vec<u8>> {

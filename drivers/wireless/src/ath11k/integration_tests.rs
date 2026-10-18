@@ -347,6 +347,8 @@ struct DevState {
     dp_pending: u32,
     /// Withhold every DP interrupt (the poll fallback must find the work).
     mute_dp_irq: bool,
+    /// `rx_attention.info1` of every RX descriptor (checksum-fail bits).
+    rx_attn1: u32,
     peers: Vec<(u32, [u8; 6], u16)>,
 }
 
@@ -381,6 +383,7 @@ impl Dev {
                 reo_cmds: 0,
                 dp_pending: 0,
                 mute_dp_irq: false,
+                rx_attn1: 0,
                 peers: Vec::new(),
             }),
         })
@@ -563,7 +566,8 @@ impl Dev {
             msdu.extend_from_slice(&[0x10, 0x00]);
             msdu.extend_from_slice(&dp_ring::RFC1042_HEADER);
             msdu.extend_from_slice(&eth[12..]);
-            let d = good_rxd(msdu.len(), 1);
+            let mut d = good_rxd(msdu.len(), 1);
+            d.attn1 = st.rx_attn1;
             let mut buf = rx_desc_bytes(&d);
             buf.extend_from_slice(&msdu);
             phys_write(pa, &buf);
@@ -742,9 +746,9 @@ fn link_sink(_name: &str, up: bool) {
     LINK_SEEN.lock().push(up);
 }
 
-fn test_send(bytes: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+fn test_send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let dev = TEST_DEV.lock().clone().ok_or(())?;
-    dev.queue_tx(bytes)
+    dev.queue_tx(bytes, meta)
 }
 
 struct Up {
@@ -801,6 +805,7 @@ fn up(cfg: FwCfg) -> Result<Up, &'static str> {
     let netdev = Arc::new(nd);
     *TEST_DEV.lock() = Some(netdev.clone());
     narf_net::iface::register(name, caps.mac_addr, test_send);
+    narf_net::iface::set_offloads(name, super::tx_offload::OFFLOADS);
     RX_SEEN.lock().clear();
     LINK_SEEN.lock().clear();
     Ok(Up {
@@ -1790,3 +1795,233 @@ kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_ath11k_int_autoconnect_attempt
 );
+
+// ── checksum offload ──────────────────────────────────────────────
+
+/// An IPv4 / TCP frame (checksum field 0) 10.0.0.2:5000 → 10.0.0.1:5001.
+fn tcp4_frame(da: &[u8; 6], sa: &[u8; 6], payload: &[u8]) -> Vec<u8> {
+    let mut f = da.to_vec();
+    f.extend_from_slice(sa);
+    f.extend_from_slice(&[0x08, 0x00]);
+    let total = 40 + payload.len() as u8;
+    f.extend_from_slice(&[0x45, 0, 0, total, 0, 1, 0x40, 0, 64, 6, 0, 0]);
+    f.extend_from_slice(&[10, 0, 0, 2, 10, 0, 0, 1]);
+    f.extend_from_slice(&[0x13, 0x88, 0x13, 0x89, 0, 0, 0, 1, 0, 0, 0, 0]);
+    f.extend_from_slice(&[0x50, 0x18, 0xff, 0xff, 0, 0, 0, 0]);
+    f.extend_from_slice(payload);
+    f
+}
+
+/// An IPv6 / UDP frame fe80::1:5000 → fe80::2:5001 (checksum field 0).
+fn udp6_frame(payload: &[u8]) -> Vec<u8> {
+    let mut f = GW.to_vec();
+    f.extend_from_slice(&OWN);
+    f.extend_from_slice(&[0x86, 0xdd]);
+    let ulen = 8 + payload.len() as u16;
+    f.extend_from_slice(&[0x60, 0, 0, 0]);
+    f.extend_from_slice(&ulen.to_be_bytes());
+    f.extend_from_slice(&[17, 64]);
+    let mut a = [0u8; 16];
+    a[0] = 0xfe;
+    a[1] = 0x80;
+    a[15] = 1;
+    f.extend_from_slice(&a);
+    a[15] = 2;
+    f.extend_from_slice(&a);
+    f.extend_from_slice(&[0x13, 0x88, 0x13, 0x89]);
+    f.extend_from_slice(&ulen.to_be_bytes());
+    f.extend_from_slice(&[0, 0]);
+    f.extend_from_slice(payload);
+    f
+}
+
+/// `CHECKSUM_PARTIAL` seeds and refusals, RX checksum verdicts. Seeds
+/// are the folded pseudo-header sums Linux leaves in the field
+/// (`tcp_v4_send_check`: `~tcp_v4_check(len, saddr, daddr, 0)`), worked
+/// by hand: IPv4 0x0a00 + 0x0002 + 0x0a00 + 0x0001 + 6 + 24 = 0x1421;
+/// IPv6 2 × 0xfe80 + 1 + 2 + 17 + 12 = 0x1fd20 → 0xfd21.
+fn smoke_ath11k_tx_csum_prepare() -> TestResult {
+    use super::tx_offload::{csum_partial_prepare, rx_meta};
+    use narf_net::L4CsumKind::{Tcp, Udp};
+    check(|| {
+        let mut f = tcp4_frame(&GW, &OWN, &[1, 2, 3, 4]);
+        ensure!(csum_partial_prepare(&mut f, Tcp) == Ok(()), "IPv4 TCP");
+        ensure!(f[14 + 20 + 16..14 + 20 + 18] == [0x14, 0x21], "TCP seed");
+        let mut g = f.clone();
+        ensure!(
+            csum_partial_prepare(&mut g, Tcp) == Ok(()) && g == f,
+            "re-preparing a seeded frame is idempotent"
+        );
+        let mut u = udp6_frame(&[9, 9, 9, 9]);
+        ensure!(csum_partial_prepare(&mut u, Udp) == Ok(()), "IPv6 UDP");
+        ensure!(u[14 + 40 + 6..14 + 40 + 8] == [0xfd, 0x21], "UDP seed");
+
+        // Refusals: frame untouched, the stack must checksum it.
+        let mut mf = tcp4_frame(&GW, &OWN, &[1]);
+        mf[14 + 6] = 0x20;
+        let mut off = tcp4_frame(&GW, &OWN, &[1]);
+        off[14 + 6] = 0;
+        off[14 + 7] = 8;
+        let mut pad = tcp4_frame(&GW, &OWN, &[1]);
+        pad.push(0);
+        let mut doff = tcp4_frame(&GW, &OWN, &[1]);
+        doff[14 + 20 + 12] = 0x40;
+        let mut ext = udp6_frame(&[1]);
+        ext[14 + 6] = 0;
+        let mut ulen = udp6_frame(&[1]);
+        ulen[14 + 40 + 5] += 1;
+        let mut vlan = tcp4_frame(&GW, &OWN, &[1]);
+        vlan[12] = 0x81;
+        vlan[13] = 0x00;
+        let mut arp = ipv4_frame(&GW, &OWN, 0, &[1]);
+        arp[12] = 0x08;
+        arp[13] = 0x06;
+        let bad: [(&str, Vec<u8>, narf_net::L4CsumKind); 10] = [
+            ("UDP kind on TCP", tcp4_frame(&GW, &OWN, &[1]), Udp),
+            ("TCP kind on UDP", udp6_frame(&[1]), Tcp),
+            ("IPv4 MF fragment", mf, Tcp),
+            ("IPv4 fragment offset", off, Tcp),
+            ("IPv4 length != frame (padding)", pad, Tcp),
+            ("TCP data offset < 5", doff, Tcp),
+            ("IPv6 extension header", ext, Udp),
+            ("UDP length != payload length", ulen, Udp),
+            ("in-band VLAN tag", vlan, Tcp),
+            ("ARP", arp.clone(), Tcp),
+        ];
+        for (what, frame, kind) in bad.iter() {
+            let mut x = frame.clone();
+            if csum_partial_prepare(&mut x, *kind) != Err(super::tx_offload::EINVAL) || x != *frame
+            {
+                return Err(what);
+            }
+        }
+
+        // RX: ath11k_dp_rx_h_csum_offload, narrowed to the ring contract.
+        let m = rx_meta(&f, true);
+        ensure!(m.csum_l3 && m.csum_l4, "IPv4 TCP verified");
+        let m = rx_meta(&u, true);
+        ensure!(
+            !m.csum_l3 && m.csum_l4,
+            "IPv6: no L3 checksum, UDP verified"
+        );
+        let m = rx_meta(&f, false);
+        ensure!(!m.csum_l3 && !m.csum_l4, "a fail bit: nothing verified");
+        let mut icmp = tcp4_frame(&GW, &OWN, &[1]);
+        icmp[14 + 9] = 1;
+        let m = rx_meta(&icmp, true);
+        ensure!(m.csum_l3 && !m.csum_l4, "ICMP: IPv4 header only");
+        let mut frag = tcp4_frame(&GW, &OWN, &[1]);
+        frag[14 + 6] = 0x20;
+        let m = rx_meta(&frag, true);
+        ensure!(m.csum_l3 && !m.csum_l4, "fragment: L4 not claimed");
+        let m = rx_meta(&arp, true);
+        ensure!(!m.csum_l3 && !m.csum_l4, "ARP: nothing");
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_tx_csum_prepare);
+
+/// NETIF_F_HW_CSUM end to end: the netdev advertises TX / RX checksum
+/// offload; a `TxMeta::csum_l4` frame from the stack reaches TCL with
+/// the five `HAL_TCL_DATA_CMD_INFO1_*_CKSUM_EN` bits (16..20, Linux
+/// `hal_desc.h`) and its seed; a plain frame without them; TSO / VLAN
+/// requests and impossible checksum requests are refused; the RX ring
+/// reports the RX attention checksum verdict.
+fn smoke_ath11k_int_tx_csum_offload() -> TestResult {
+    check(|| {
+        let mut u = up(wpa2_cfg())?;
+        let want = super::tx_offload::OFFLOADS;
+        ensure!(
+            u.netdev.offloads() == want
+                && narf_net::iface::lookup(u.name).is_some_and(|s| s.offloads == want),
+            "TX + RX checksum advertised, no TSO / VLAN"
+        );
+        connect(&u)?;
+        let snap = narf_net::iface::lookup(u.name).ok_or("snapshot")?;
+        let csum = narf_net::TxMeta::with_csum(narf_net::L4CsumKind::Tcp);
+        let eth = tcp4_frame(&GW, &OWN, &[0xde, 0xad, 0xbe, 0xef]);
+        let before = u.dev.st.borrow().tcl_tx.len();
+        for meta in [csum, narf_net::TxMeta::plain()] {
+            ensure!(snap.xmit_meta(&eth, meta).is_ok(), "send hook queues");
+            let f = u
+                .tx_cons
+                .try_recv()
+                .ok()
+                .flatten()
+                .ok_or("frame on the TX ring")?;
+            ensure!(f.tx_meta() == meta, "the offload request rides the frame");
+            run(u.netdev.tx_one(&f)).map_err(|_| "TX pump → dp.tx")?;
+        }
+        pump(&u, 3);
+        let st = u.dev.st.borrow();
+        ensure!(st.tcl_tx.len() == before + 2, "two frames on TCL");
+        // 24 (QoS stripped) + 8 SNAP + 44 IP = 76 bytes.
+        let (t0, t1) = (&st.tcl_tx[before], &st.tcl_tx[before + 1]);
+        ensure!(
+            t0.desc[3] == 0x0001_8004 && t0.desc[4] == 0x001f_0000 | 76,
+            "CHECKSUM_PARTIAL: IP4 | UDP4 | UDP6 | TCP4 | TCP6 CKSUM_EN | len 76"
+        );
+        ensure!(
+            t0.frame[68..70] == [0x14, 0x21],
+            "TCP seed in the TCL frame"
+        );
+        ensure!(
+            t1.desc[3] == 0x0001_8004 && t1.desc[4] == 76,
+            "plain frame: no checksum bits"
+        );
+        ensure!(t1.frame[68..70] == [0, 0], "plain frame untouched");
+        drop(st);
+
+        let refused = |u: &Up| u.netdev.stats.tx_offload_refused.load(Ordering::Relaxed);
+        let vlan = narf_net::TxMeta {
+            vlan_tag: Some(5),
+            ..narf_net::TxMeta::plain()
+        };
+        ensure!(
+            snap.xmit_meta(&eth, narf_net::TxMeta::with_tso(1400))
+                .is_err()
+                && snap.xmit_meta(&eth, vlan).is_err()
+                && refused(&u) == 2,
+            "TSO and VLAN insertion refused at the send hook"
+        );
+        let udp = narf_net::TxMeta::with_csum(narf_net::L4CsumKind::Udp);
+        ensure!(snap.xmit_meta(&eth, udp).is_ok(), "queued");
+        let f = u.tx_cons.try_recv().ok().flatten().ok_or("frame")?;
+        ensure!(
+            run(u.netdev.tx_one(&f)) == Err(super::tx_offload::EINVAL) && refused(&u) == 3,
+            "UDP checksum on a TCP segment refused before TCL"
+        );
+        pump(&u, 2);
+        ensure!(
+            u.dev.st.borrow().tcl_tx.len() == before + 2,
+            "nothing sent half-checksummed"
+        );
+
+        // RX: the attention checksum-fail bits → the ring's RxMeta.
+        let mut rx_cons = u.netdev.rx_ring().lock().take().ok_or("RX ring consumer")?;
+        let rx = tcp4_frame(&OWN, &GW, &[7]);
+        for (attn1, l3, l4) in [
+            (0u32, true, true),
+            (super::dp::RX_ATTENTION_INFO1_IP_CKSUM_FAIL, false, false),
+            (
+                super::dp::RX_ATTENTION_INFO1_TCP_UDP_CKSUM_FAIL,
+                false,
+                false,
+            ),
+        ] {
+            {
+                let mut st = u.dev.st.borrow_mut();
+                st.rx_attn1 = attn1;
+                st.rx_queue.push_back(rx.clone());
+            }
+            pump(&u, 3);
+            let f = rx_cons.try_recv().ok().flatten().ok_or("RX ring frame")?;
+            let m = f.rx_meta();
+            if f.payload() != &rx[..] || m.csum_l3 != l3 || m.csum_l4 != l4 {
+                return Err("RX checksum verdict on the ring");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_tx_csum_offload);

@@ -713,14 +713,32 @@ BSSID, addr2 the Ethernet SA, addr3 the DA; seq from `tid_seq[tid]`
 (QoS) or the vif counter (`ieee80211_xmit_fast_finish`); RFC 1042 SNAP,
 bridge-tunnel for IPX / AARP, no encapsulation for 802.3 length frames;
 `-EPERM` for unicast before authorization unless our own EAPOL). Then
-`Dp::tx(NativeWifi, priority = tid, queue = AC, ring 0, no checksum
-offload)` strips the QoS control (`ath11k_dp_tx_encap_nwifi`). RX: the
+`Dp::tx(NativeWifi, priority = tid, queue = AC, ring 0, csum_partial)`
+strips the QoS control (`ath11k_dp_tx_encap_nwifi`). RX: the
 vdev RX decap is NATIVE_WIFI and `dp_ring` decaps native-wifi to
 Ethernet II (§3.7). Golden (WMM AP, PTK installed, IPv4 DSCP 0 from
 own MAC to `GW`): `08 41 00 00 | BSSID | OWN | GW | 00 00 | aa aa 03 00 00
 00 08 00 | <IP datagram>`; TCL `info0 = 0x0001_8004` (ENCAP NATIVE_WIFI,
 ADDRY_EN, CMD_NUM 1), `info1 = len`, `info2 = 0x0020_0000 | tid << 22`,
 desc id pool = AC.
+
+**Checksum offload** (`tx_offload.rs`): the netdev advertises
+`OFFLOADS` = TX + RX checksum, no TSO / VLAN insertion (Linux
+`ath11k_mac_register`: `netdev_features = NETIF_F_HW_CSUM`), through
+`Interface::offloads` and `narf_net::iface::set_offloads`. The send hook
+carries the stack's `TxMeta` in the TX-ring frame and refuses TSO / VLAN
+requests; the TX pump turns `TxMeta::csum_l4` into `CHECKSUM_PARTIAL`
+(`csum_partial_prepare`: unfragmented IPv4 or extension-header-free IPv6
+TCP / UDP of the requested kind, no in-band VLAN, seed = folded
+pseudo-header sum as `tcp_v4_send_check` leaves it; anything else is
+dropped and counted in `tx_offload_refused`, never sent half-checksummed)
+and `Dp::tx` sets `HAL_TCL_DATA_CMD_INFO1_{IP4,UDP4,UDP6,TCP4,TCP6}_CKSUM_EN`
+(`ath11k_dp_tx`). RX: `RxMsdu::csum_ok` (`ath11k_dp_rx_h_csum_offload`:
+neither attention fail bit) rides with the frame to the RX ring's
+`RxMeta` (`rx_meta`: `csum_l3` for IPv4 only, `csum_l4` for whole TCP /
+UDP only, the net §3.2 contract). Golden: a `with_csum(Tcp)` IPv4 frame
+→ TCL `info1 = 0x001f_0000 | len`, seed in the frame; plain → `info1 =
+len`.
 
 **Netdev** (`iface::Ath11kNetdev`): `narf_net::Interface` (name from
 `reserve_name("wlan%d")`, MAC from WMI READY, MTU 1500, `link_up` =
@@ -971,12 +989,19 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   service pass; vdev TX encap / RX decap NATIVE_WIFI (`mac.rs`), so TX
   frames are built as mac80211 does (`tx_hdr.rs`) and RX `RxMsdu::frame`
   (Ethernet II) goes straight to `wlan%d`.
+- Checksum offload deviations (deliberate): NETIF_F_HW_CSUM lets Linux
+  hand ath11k any `CHECKSUM_PARTIAL` skb; NARF's frame-ring contract
+  makes the driver validate, so only the layouts the TCL engine's five
+  CKSUM_EN bits cover are accepted (others are refused, not sent). The
+  kernel stack's own receive path (`on_rx_frame_from`) takes no driver
+  verdict and verifies in software (Linux `CHECKSUM_NONE` behaviour); the
+  RX checksum verdict reaches frame-ring consumers only. Whether the TCL
+  engine uses the seed or recomputes the pseudo-header on native-wifi
+  frames is hardware-only (Linux passes the same seed).
 - Integration deviations from Linux (deliberate): `ath11k_mac_op_start`
   + `add_interface` run at registration, not on `ip link set up`
   (NARF's stack has no ndo_open hook for this driver); the netdev has
-  one TX queue (no per-AC queues, `IEEE80211_HW_QUEUE_CONTROL`), no
-  NETIF_F_HW_CSUM (the stack checksums; Linux advertises it and sets the
-  TCL checksum bits), no A-MSDU / fast-xmit header cache, no TX status
+  one TX queue (no per-AC queues, `IEEE80211_HW_QUEUE_CONTROL`), no A-MSDU / fast-xmit header cache, no TX status
   reporting; ADDBA from the AP is not answered (no
   `ath11k_mac_op_ampdu_action`; the AP falls back to non-aggregated
   traffic, REO queues stay at BA window 1); management frames and data

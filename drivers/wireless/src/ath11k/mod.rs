@@ -70,6 +70,7 @@ pub mod qmi_wlfw;
 pub mod qrtr;
 pub mod runtime;
 pub mod tx_hdr;
+pub mod tx_offload;
 pub mod wlfw;
 pub mod wmi;
 pub mod wmi_ids;

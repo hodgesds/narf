@@ -127,6 +127,10 @@ pub struct NetdevStats {
     pub rx_ring_full: AtomicU32,
     pub tx_queued: AtomicU32,
     pub tx_dropped: AtomicU32,
+    /// Frames whose offload request was refused (TSO / VLAN insertion
+    /// asked for, or a checksum request the hardware cannot complete:
+    /// [`super::tx_offload::csum_partial_prepare`]).
+    pub tx_offload_refused: AtomicU32,
     pub link_losses: AtomicU32,
 }
 
@@ -196,16 +200,27 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
     }
 
     /// The stack's send hook (`ieee80211_subif_start_xmit`): queue an
-    /// Ethernet frame on the TX ring. Sync and IRQ-safe (no runtime lock).
-    pub fn queue_tx(&self, bytes: &[u8]) -> Result<(), ()> {
+    /// Ethernet frame (with the stack's offload request, carried in the
+    /// frame) on the TX ring. Sync and IRQ-safe (no runtime lock). TSO and
+    /// VLAN insertion are not advertised ([`super::tx_offload::OFFLOADS`])
+    /// and refused.
+    pub fn queue_tx(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+        if meta.tso_mss.is_some() || meta.vlan_tag.is_some() {
+            self.stats
+                .tx_offload_refused
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
+            return Err(());
+        }
         if !self.link_up() {
             self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
             return Err(());
         }
-        let Some(f) = alloc_frame(bytes) else {
+        let Some(mut f) = alloc_frame(bytes) else {
             self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
             return Err(());
         };
+        f.set_tx_meta(meta);
         let mut g = self.tx_ring.lock();
         let Some(p) = g.as_mut() else {
             self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
@@ -223,9 +238,30 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         }
     }
 
-    /// Transmit one frame taken from the TX ring.
+    /// Transmit one frame taken from the TX ring. A checksum request
+    /// (`TxMeta::csum_l4`, Linux `CHECKSUM_PARTIAL`) is validated and its
+    /// seed written ([`super::tx_offload::csum_partial_prepare`]); one the
+    /// hardware cannot complete is dropped, never sent half-checksummed.
     pub async fn tx_one(&self, frame: &Frame) -> Result<u32, i32> {
-        let r = self.shared.tx_data(frame.payload()).await;
+        let meta = frame.tx_meta();
+        if meta.tso_mss.is_some() || meta.vlan_tag.is_some() {
+            self.stats
+                .tx_offload_refused
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
+            return Err(super::tx_offload::EINVAL);
+        }
+        let mut eth = frame.payload().to_vec();
+        if let Some(kind) = meta.csum_l4 {
+            if let Err(e) = super::tx_offload::csum_partial_prepare(&mut eth, kind) {
+                self.stats
+                    .tx_offload_refused
+                    .fetch_add(1, Ordering::Relaxed);
+                self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                return Err(e);
+            }
+        }
+        let r = self.shared.tx_data(&eth, meta.csum_l4.is_some()).await;
         if r.is_err() {
             self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
         }
@@ -239,11 +275,13 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         }
     }
 
-    fn deliver(&self, frames: Vec<Vec<u8>>) -> usize {
+    fn deliver(&self, frames: Vec<(Vec<u8>, bool)>) -> usize {
         let n = frames.len();
-        for mut f in frames {
+        for (mut f, csum_ok) in frames {
             if let Some(p) = self.rx_prod.lock().as_mut() {
-                if let Some(fr) = alloc_frame(&f) {
+                if let Some(mut fr) = alloc_frame(&f) {
+                    // ath11k_dp_rx_h_csum_offload → the ring's RxMeta.
+                    fr.set_rx_meta(super::tx_offload::rx_meta(&f, csum_ok));
                     if p.try_send(fr).is_err() {
                         self.stats.rx_ring_full.fetch_add(1, Ordering::Relaxed);
                     }
@@ -288,7 +326,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
     /// (`narf_net::iface::install_rx_drain`): service + deliver if the
     /// runtime is free. `true` when frames were delivered.
     pub fn drain_sync(&self) -> bool {
-        let frames: Vec<Vec<u8>> = {
+        let frames: Vec<(Vec<u8>, bool)> = {
             let Some(mut g) = self.shared.try_lock() else {
                 return false;
             };
@@ -317,6 +355,9 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Interface for Ath11kNetdev<Io, Irq, Q> {
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
         &self.tx_ring
+    }
+    fn offloads(&self) -> narf_net::OffloadCapabilities {
+        super::tx_offload::OFFLOADS
     }
 }
 
@@ -418,9 +459,9 @@ pub type PciNetdev = Ath11kNetdev<super::core::Bar0, super::ce::MsiCeIrq, super:
 /// The function-pointer stack hooks need the live device.
 static ACTIVE: IrqSafeSpinLock<Option<Arc<PciNetdev>>> = IrqSafeSpinLock::new(None);
 
-fn pci_send(bytes: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+fn pci_send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let dev = ACTIVE.lock().clone().ok_or(())?;
-    dev.queue_tx(bytes)
+    dev.queue_tx(bytes, meta)
 }
 
 fn pci_drain() -> bool {
@@ -461,6 +502,9 @@ impl Interface for Registered {
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
         self.0.tx_ring()
     }
+    fn offloads(&self) -> narf_net::OffloadCapabilities {
+        self.0.offloads()
+    }
 }
 
 /// `ieee80211_register_hw` + `ieee80211_if_add("wlan%d")`: name the
@@ -488,6 +532,8 @@ pub fn register_pci(
     *ACTIVE.lock() = Some(dev.clone());
     narf_net::iface::register(name, mac_addr, pci_send);
     narf_net::iface::set_driver_info(name, "ath11k_pci", None, alloc::string::String::new());
+    // ath11k_mac_register: hw->netdev_features = NETIF_F_HW_CSUM.
+    narf_net::iface::set_offloads(name, super::tx_offload::OFFLOADS);
     narf_net::iface::set_link_state(name, false);
     narf_net::iface::install_rx_drain(pci_drain);
     match narf_net::trusted_net_authority().and_then(|a| a.derive().ok()) {
