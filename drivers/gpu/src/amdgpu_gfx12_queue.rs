@@ -1,7 +1,8 @@
 //! Two retained VMID0 GC12 kernel queues, with a bounded translated-memory
 //! WRITE_DATA and native EOP-interrupt proofs, then client jobs on either
 //! queue: each a VM flush for the client's VMID, its IBs and a fence
-//! (`submit`). No draws, shaders or reset.
+//! (`submit`). A hung compute queue can be reset by MMIO and restored for
+//! MES to map again (`reset_compute_hqd`, `restore`). No draws or shaders.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip, amdgpu_gmc_navi48 as gmc, amdgpu_mes12 as api, amdgpu_mes12_hw as mes,
@@ -47,6 +48,16 @@ const JOB_DWORDS: u64 = 256;
 /// Ring capacity in dwords (4 KiB).
 const RING_DWORDS: u64 = 1024;
 
+/// `CP_HQD_DEQUEUE_REQUEST`, `SPI_COMPUTE_QUEUE_RESET` and
+/// `CP_HQD_ACTIVE` (GC segment 0).
+const DEQUEUE_REQUEST: u64 = 0x1fc1;
+const COMPUTE_QUEUE_RESET: u64 = 0x1f73;
+const HQD_ACTIVE: u64 = 0x1fab;
+/// GRBM_GFX_CNTL selecting the compute queue: MEC1 (MEID 1, bits 3:2),
+/// pipe 0, queue 0.
+const COMPUTE_SELECT: u32 = 4;
+/// PACKET3(NOP, 0x3fff), what amdgpu_ring_clear_ring fills a ring with.
+const RING_NOP: u32 = 0xffff_1000;
 const FENCES: [u32; 2] = [0x9070cafe, 0x9070beef];
 const PATTERN: [u32; 16] = [
     0x01234567, 0x89abcdef, 0x76543210, 0xfedcba98, 0xaaaaaaaa, 0x55555555, 0xff00ff00, 0x00ff00ff,
@@ -425,6 +436,19 @@ fn select(io: &mut impl Io, l: Layout, index: u32) -> Result<(), Error> {
     }
     Ok(())
 }
+/// Run `f` with the compute queue selected, restoring the prior selection
+/// even when `f` fails.
+fn selected<I: Io, T>(
+    io: &mut I,
+    l: Layout,
+    f: impl FnOnce(&mut I) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let prior = checked(io.read(l.hyp + 0x900 * 4))?;
+    select(io, l, COMPUTE_SELECT)?;
+    let result = f(io);
+    select(io, l, prior)?;
+    result
+}
 fn flush(io: &mut impl Io, l: Layout) {
     fence(Ordering::SeqCst);
     io.write(0x7f000, 0);
@@ -722,8 +746,7 @@ impl<I: Io> Engine<I> {
         let map = self.memory.mapping();
         let db = self.doorbells;
         let (i, base) = (pipe.index(), pipe.base());
-        // The proofs left both rings at 512 dwords.
-        let wptr = self.job_wptr[i].max(512);
+        let wptr = self.job_wptr[i];
         let seq = self.job_seq[i].wrapping_add(1);
         let fence = self.memory.address() + base + JOB_FENCE;
         let words = build(fence, seq)?;
@@ -749,6 +772,68 @@ impl<I: Io> Engine<I> {
         self.job_wptr[i] = wptr + JOB_DWORDS;
         self.job_seq[i] = seq;
         Ok(seq)
+    }
+    /// mes_v12_0_reset_queue_mmio for the compute queue: with it selected,
+    /// a reset dequeue (CP_HQD_DEQUEUE_REQUEST 2) and SPI's compute queue
+    /// reset, then up to amdgpu's usec_timeout for the HQD to go inactive.
+    /// LINUX-GAP: an HQD that stays active is not followed by Linux's MEC
+    /// pipe reset; the reset fails.
+    async fn reset_compute_hqd(&mut self) -> Result<(), Error> {
+        if self.state != State::InterruptVerified {
+            return Err(Error::Busy);
+        }
+        let l = self.layout;
+        self.access(|io| {
+            selected(io, l, |io| {
+                io.write(l.gc + DEQUEUE_REQUEST * 4, 2);
+                io.write(l.gc + COMPUTE_QUEUE_RESET * 4, 1);
+                Ok(())
+            })
+        })?;
+        let deadline = narf_time::Deadline::after_us(100_000);
+        loop {
+            let active = self.access(|io| {
+                selected(io, l, |io| {
+                    Ok(checked(io.read(l.gc + HQD_ACTIVE * 4))? & 1 != 0)
+                })
+            })?;
+            if !active {
+                return Ok(());
+            }
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            self.io.delay().await;
+        }
+    }
+    /// amdgpu_gfx_mqd_reset_restore, once the reset queue is unmapped: its
+    /// descriptor as first built, a ring of NOPs (amdgpu_ring_clear_ring)
+    /// and its write pointer at 0, for MES to map it again. The read
+    /// pointer report is cleared too, as the remapped queue starts at 0
+    /// and nothing writes it while the HQD is unmapped.
+    fn restore(&mut self, pipe: Pipe) -> Result<(), Error> {
+        if self.state != State::InterruptVerified {
+            return Err(Error::Busy);
+        }
+        let l = self.layout;
+        let map = self.memory.mapping();
+        let off = pipe.base();
+        let words = descriptor(self.memory.address(), pipe.index())?;
+        self.access(|io| {
+            for (i, v) in words.into_iter().enumerate() {
+                io.memory_write(map, off + 4096 + i as u64 * 4, v);
+            }
+            for at in (0..RING_DWORDS * 4).step_by(4) {
+                io.memory_write(map, off + at, RING_NOP);
+            }
+            for at in [RPTR, RPTR + 4, WPTR, WPTR + 4] {
+                io.memory_write(map, off + at, 0);
+            }
+            flush(io, l);
+            Ok(())
+        })?;
+        self.job_wptr[pipe.index()] = 0;
+        Ok(())
     }
     /// The last job sequence `pipe`'s fence reached.
     fn completed_job(&mut self, pipe: Pipe) -> Result<u32, Error> {
@@ -805,7 +890,8 @@ impl Queues {
             state: State::Prepared,
             proof: None,
             interrupt_result: None,
-            job_wptr: [0; 2],
+            // The proofs leave both rings at 512 dwords.
+            job_wptr: [512; 2],
             job_seq: [0; 2],
         }))
     }
@@ -878,6 +964,22 @@ impl Queues {
     }
     pub fn completed_job(&mut self, pipe: Pipe) -> Result<u32, Error> {
         self.0.completed_job(pipe)
+    }
+    /// Reset the hung compute queue's HQD by MMIO (see
+    /// `Engine::reset_compute_hqd`).
+    /// # Safety
+    /// MES has suspended its gangs, nothing else selects GRBM queues
+    /// meanwhile, and every job the queue holds keeps its memory until a
+    /// later fence on it lands.
+    pub async unsafe fn reset_compute_hqd(&mut self) -> Result<(), Error> {
+        self.0.reset_compute_hqd().await
+    }
+    /// Restore `pipe`'s reset, unmapped queue for MES to map again (see
+    /// `Engine::restore`).
+    /// # Safety
+    /// The queue's HQD is reset and MES has unmapped it.
+    pub unsafe fn restore(&mut self, pipe: Pipe) -> Result<(), Error> {
+        self.0.restore(pipe)
     }
     /// A reader of the job fence that needs no access to this owner.
     pub fn fence_reader(&self) -> FenceReader {

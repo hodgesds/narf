@@ -111,6 +111,23 @@ impl Fake {
                     }
                     28
                 }
+                // REMOVE_QUEUE of the compute queue after its MMIO reset:
+                // unmap_legacy_queue and remove_queue_after_reset (this
+                // firmware is 0x8b).
+                3 => {
+                    assert_eq!((words[1], words[4], words[15]), (6, 0x18, 1));
+                    assert_eq!(&words[10..12], &[0, 0]);
+                    6
+                }
+                // SUSPEND / RESUME of all gangs.
+                6 => {
+                    assert_eq!(&words[1..8], &[1, 0, 0, 0, 0, 0, 0]);
+                    8
+                }
+                7 => {
+                    assert_eq!(&words[1..4], &[1, 0, 0]);
+                    4
+                }
                 11 => 2,
                 _ => panic!("unexpected MES12 opcode"),
             };
@@ -534,3 +551,42 @@ fn mes12_hw_resets_bootstrap_kernel_queues() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/mes12", mes12_hw_resets_bootstrap_kernel_queues);
+
+/// The compute reset's MES half: every gang suspended, the reset queue
+/// removed with remove_queue_after_reset and mapped again, the gangs
+/// resumed; each needs a ready MES, and a rejection keeps it ready.
+fn mes12_hw_remaps_a_reset_compute_queue_around_suspended_gangs() -> TestResult {
+    let (_, mut e) = fixture();
+    let q = api::KernelQueue {
+        kind: api::QueueType::Compute,
+        pipe: 0,
+        queue: 0,
+        doorbell: 6,
+        mqd: GPU + 4096,
+        write_pointer: GPU + 12296,
+    };
+    assert_eq!(run(e.all_gangs(true)), Err(Error::Busy));
+    assert_eq!(run(e.unmap_reset_queue(q)), Err(Error::Busy));
+    run(e.start()).unwrap();
+    let before = e.io.frames.len();
+    assert_eq!(run(e.all_gangs(true)), Ok(()));
+    assert_eq!(run(e.unmap_reset_queue(q)), Ok(()));
+    assert_eq!(run(e.map_bootstrap_queue(q)), Ok(()));
+    assert_eq!(run(e.all_gangs(false)), Ok(()));
+    assert_eq!(e.io.frames[before..], [(0, 6), (0, 3), (0, 2), (0, 7)]);
+    assert_eq!(
+        run(e.unmap_reset_queue(api::KernelQueue { doorbell: 8, ..q })),
+        Err(Error::Invalid)
+    );
+    e.io.reject = true;
+    assert!(matches!(
+        run(e.all_gangs(false)),
+        Err(Error::FirmwareRejected(_))
+    ));
+    assert_eq!(e.state, State::Ready);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/mes12",
+    mes12_hw_remaps_a_reset_compute_queue_around_suspended_gangs
+);

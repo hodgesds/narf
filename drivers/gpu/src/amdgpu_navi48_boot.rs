@@ -736,14 +736,20 @@ impl ColdBoot {
         // SAFETY: the caller's obligations.
         unsafe { queues.submit(pipe, job) }
     }
-    /// Recover the graphics ring after its job on VMID `vmid` hung, as
-    /// gfx_v12_0_reset_kgq does: MES resets the legacy HQD in place, then
-    /// a fence-only slot tests the ring (amdgpu_ring_test_ring). Once that
-    /// fence lands the CP has moved past every earlier slot, so the hung
-    /// and abandoned jobs' fences read complete through it. Returns that
-    /// fence's sequence. LINUX-GAP: the jobs behind the hung one are not
-    /// re-emitted, and the compute ring (an MMIO dequeue and remap in
-    /// Linux) has no reset yet.
+    /// Recover a ring after its job on VMID `vmid` hung. The graphics ring
+    /// as gfx_v12_0_reset_kgq: MES resets the legacy HQD in place. The
+    /// compute ring as gfx_v12_0_reset_kcq (amdgpu_gfx_reset_mes_compute,
+    /// GFX12 resetting MEC queues by MMIO): MES suspends every gang, the
+    /// HQD is dequeued by MMIO, MES unmaps it, its descriptor and ring are
+    /// restored and MES maps it again, then MES resumes the gangs, whatever
+    /// failed. Either way a fence-only slot then tests the ring
+    /// (amdgpu_ring_test_ring). Once that fence lands the CP has moved past
+    /// every earlier slot, so the hung and abandoned jobs' fences read
+    /// complete through it. Returns that fence's sequence.
+    ///
+    /// LINUX-GAP: the jobs behind the hung one are not re-emitted. A failed
+    /// suspend does not ask MES which other queues hung (there are no user
+    /// or KFD queues to find); the compute reset goes ahead.
     /// # Safety
     /// As `submit_client_job`, and every job on the ring keeps what it
     /// reaches until this returns Ok.
@@ -752,17 +758,43 @@ impl ColdBoot {
         pipe: queues::Pipe,
         vmid: u8,
     ) -> Result<u32, queues::Error> {
-        if pipe != queues::Pipe::Graphics {
-            return Err(queues::Error::Unsupported);
-        }
         let hardware = &mut self.sequence.backend;
         let queues = hardware.queues.as_mut().ok_or(queues::Error::Invalid)?;
         let mes = hardware.mes.as_mut().ok_or(queues::Error::Invalid)?;
-        // SAFETY: the platform serializes both queues and MES under its
-        // owner; the caller keeps the ring's jobs' memory until Ok.
-        unsafe { mes.reset_kernel_queue(queues.kernel_queue(pipe), vmid) }
-            .await
-            .map_err(queues::Error::Mes)?;
+        let queue = queues.kernel_queue(pipe);
+        match pipe {
+            // SAFETY: the platform serializes both queues and MES under its
+            // owner; the caller keeps the ring's jobs' memory until Ok.
+            queues::Pipe::Graphics => unsafe { mes.reset_kernel_queue(queue, vmid) }
+                .await
+                .map_err(queues::Error::Mes)?,
+            queues::Pipe::Compute => {
+                // SAFETY: as above; every suspend is followed by a resume.
+                let _ = unsafe { mes.all_gangs(true) }.await;
+                let reset = async {
+                    // SAFETY: the gangs are suspended and OWNER keeps every
+                    // other GRBM selector user out.
+                    unsafe { queues.reset_compute_hqd() }.await?;
+                    // SAFETY: the HQD was just reset.
+                    unsafe { mes.unmap_reset_queue(queue) }
+                        .await
+                        .map_err(queues::Error::Mes)?;
+                    // SAFETY: reset and unmapped.
+                    unsafe { queues.restore(pipe) }?;
+                    // SAFETY: the queue's restored descriptor and ring stay
+                    // retained with the rest of the queue memory.
+                    unsafe { mes.map_bootstrap_queue(queue) }
+                        .await
+                        .map_err(queues::Error::Mes)
+                }
+                .await;
+                // amdgpu_mes_resume runs on every path; its result is not the
+                // reset's.
+                // SAFETY: resumes the suspend above.
+                let _ = unsafe { mes.all_gangs(false) }.await;
+                reset?;
+            }
+        }
         // SAFETY: as above; the slot reaches only the queue's own fence.
         let seq = unsafe { queues.submit_fence(pipe) }?;
         // amdgpu's usec_timeout for a ring test.

@@ -4785,10 +4785,23 @@ within 100 ms (`ColdBoot::recover_client_ring`). Only then does
 `RingWatch::recovered` let the ring take jobs again; the hung and canceled
 jobs keep their errors (`RingWatch::error` remembers the last hang), and
 their memory is retired by the test fence, the first proof the CP moved
-past them. Innocent jobs are not re-emitted, and the compute and SDMA
-rings stay hung once hung (Linux resets a compute kernel queue by MMIO
-and remaps it). VRAM clear fences follow SDMA0's hardware fence only,
-never a timeout's verdict.
+past them. A hung compute ring is recovered as gfx_v12_0_reset_kcq
+(amdgpu_gfx_reset_mes_compute; GFX12 resets MEC queues by MMIO):
+`Mes::all_gangs(true)` (MES12 SUSPEND, `amdgpu_mes12::suspend_all`), then
+`Queues::reset_compute_hqd` (with the compute queue selected in
+GRBM_GFX_CNTL, CP_HQD_DEQUEUE_REQUEST 2 and SPI_COMPUTE_QUEUE_RESET 1, then
+CP_HQD_ACTIVE polled idle for up to 100 ms; the prior selection restored),
+`Mes::unmap_reset_queue` (REMOVE_QUEUE with `remove_queue_after_reset` on
+scheduler firmware 0x5a+, `amdgpu_mes12::unmap_reset_kernel_queue`),
+`Queues::restore` (the descriptor as first built, a ring of
+PACKET3(NOP, 0x3fff), read and write pointers 0) and
+`Mes::map_bootstrap_queue`; `Mes::all_gangs(false)` (RESUME,
+`resume_all`) follows on every path, and the same ring test closes it. A
+failed suspend does not stop the reset (Linux would ask MES for other hung
+queues; there are none), and an HQD that never goes idle fails it without
+Linux's MEC pipe reset. Innocent jobs are not re-emitted, and the SDMA
+ring stays hung once hung. VRAM clear fences follow SDMA0's hardware fence
+only, never a timeout's verdict.
 
 The Navi48 platform registers both kernel queues as its card's submitter
 after boot: up to eight IBs per submission (`Job::new`, in order in one

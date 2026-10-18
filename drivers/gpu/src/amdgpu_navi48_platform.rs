@@ -293,9 +293,10 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
 /// A watchdog (`watchdog`) times out a ring's front job after
 /// `amdgpu_ring_watch::JOB_TIMEOUT_NS`: it ends with ETIME, the jobs behind
 /// it with ECANCELED, and the ring takes no more. Their memory still waits
-/// for the hardware fence. The graphics ring is then reset through MES and
-/// tested (`ColdBoot::recover_client_ring`); once the test's fence lands
-/// it takes jobs again. The compute and SDMA rings stay hung.
+/// for the hardware fence. The graphics ring is then reset through MES, or
+/// the compute ring by MMIO and remapped, and tested
+/// (`ColdBoot::recover_client_ring`); once the test's fence lands it takes
+/// jobs again. The SDMA ring stays hung.
 ///
 /// AMDGPU_INFO keeps reporting acceleration unavailable, so Mesa does not
 /// submit here.

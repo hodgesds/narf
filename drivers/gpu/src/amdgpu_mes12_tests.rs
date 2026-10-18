@@ -109,6 +109,43 @@ fn mes12_kernel_packets_obey_eight_byte_c_layout() -> TestResult {
     {
         return TestResult::Fail("MES12 RESET of a queue by doorbell");
     }
+    // REMOVE_QUEUE after an MMIO reset: remove_queue_after_reset only
+    // where the firmware takes it.
+    let mut p = unmap_reset_kernel_queue(queue(), true).unwrap();
+    p.bind_completion(0x432100002008, 1).unwrap();
+    let mut q = unmap_reset_kernel_queue(queue(), false).unwrap();
+    q.bind_completion(0x432100002008, 1).unwrap();
+    let unmap = [
+        (0, 0x40031),
+        (1, 0x174),
+        (6, 0x2008),
+        (7, 0x4321),
+        (8, 1),
+        (10, 1),
+        (11, 3),
+        (15, 1),
+    ];
+    if !matches(&p, &[&unmap[..], &[(4, 0x18)]].concat())
+        || !matches(&q, &[&unmap[..], &[(4, 8)]].concat())
+    {
+        return TestResult::Fail("MES12 REMOVE_QUEUE after reset");
+    }
+    // MESAPI__SUSPEND / __RESUME of all gangs: the flag word at 1, the
+    // status after the 8-byte gang and fence fields (8) or the gang
+    // context alone (4).
+    let mut p = suspend_all();
+    p.bind_completion(0x432100002008, 1).unwrap();
+    let mut r = resume_all();
+    r.bind_completion(0x432100002008, 1).unwrap();
+    if !matches(
+        &p,
+        &[(0, 0x40061), (1, 1), (8, 0x2008), (9, 0x4321), (10, 1)],
+    ) || !matches(
+        &r,
+        &[(0, 0x40071), (1, 1), (4, 0x2008), (5, 0x4321), (6, 1)],
+    ) {
+        return TestResult::Fail("MES12 SUSPEND/RESUME of all gangs");
+    }
     let mut p = resources_1(0x123400005000).unwrap();
     p.bind_completion(0x432100002008, 1).unwrap();
     if !matches(

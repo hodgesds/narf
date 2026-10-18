@@ -38,6 +38,12 @@ struct Fake {
     /// ACQUIRE_MEM cache flushes.
     job_mem_syncs: u32,
     job_ibs: Vec<(u64, u32)>,
+    /// MMIO queue-reset writes: (GRBM selection, register, value).
+    hqd_resets: Vec<(u32, u64, u32)>,
+    /// The compute HQD ignores its dequeue.
+    hqd_stuck: bool,
+    /// A ring restored after a reset runs client slots from 0.
+    restored: bool,
 }
 impl Fake {
     /// A CP running client-job slots of `pipe` from its RPTR to `tail`.
@@ -193,6 +199,7 @@ impl Io for Fake {
             0x15850 => 0x800,
             0x15854 => 0xbff,
             0x604b4 => 0x7f000,
+            0x17eac if self.index == 4 && !self.hqd_resets.is_empty() => u32::from(self.hqd_stuck),
             0x17a00 | 0x17eac => u32::from(self.busy),
             _ => *self.regs.get(&at).unwrap_or(&0),
         }
@@ -201,6 +208,8 @@ impl Io for Fake {
         match at {
             0x42400 => self.index = v,
             0x7f000 => self.dirty = false,
+            // CP_HQD_DEQUEUE_REQUEST and SPI_COMPUTE_QUEUE_RESET.
+            0x17f04 | 0x17dcc => self.hqd_resets.push((self.index, at, v)),
             _ => panic!("unexpected CP register write"),
         }
     }
@@ -221,7 +230,7 @@ impl Io for Fake {
         }
     }
     fn doorbell(&mut self, _: MmioRegion, offset: u32, v: u64) {
-        if v > 512 {
+        if v > 512 || self.restored {
             let pipe = match offset {
                 0x116 => 0,
                 6 => 1,
@@ -314,6 +323,9 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
             job_context_controls: Vec::new(),
             job_mem_syncs: 0,
             job_ibs: Vec::new(),
+            hqd_resets: Vec::new(),
+            hqd_stuck: false,
+            restored: false,
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -327,7 +339,7 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
         state: State::Prepared,
         proof: None,
         interrupt_result: None,
-        job_wptr: [0; 2],
+        job_wptr: [512; 2],
         job_seq: [0; 2],
     };
     let mes = FakeMes {
@@ -854,4 +866,65 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/gfx12",
     gfx12_graphics_queue_runs_client_jobs_with_vm_flushes
+);
+
+/// gfx_v12_0_reset_kcq's queue half: a reset dequeue and SPI queue reset
+/// under the compute selection (the prior one restored), waiting for the
+/// HQD to go idle; then the descriptor as first built, a NOP ring and
+/// pointers at 0, so the ring test runs from the ring's start.
+fn gfx12_compute_queue_resets_by_mmio_and_restores_for_remap() -> TestResult {
+    let (_pool, mut e, mut mes, aperture, target) = fixture();
+    run(e.initialize(&mut mes, aperture, target)).unwrap();
+    if run(e.reset_compute_hqd()) != Err(Error::Busy)
+        || e.restore(Pipe::Compute) != Err(Error::Busy)
+    {
+        return TestResult::Fail("reset before the interrupt proof");
+    }
+    e.state = State::InterruptVerified;
+    e.io.memory[3072 + 2560] = 512;
+    // A compute job the CP never finishes.
+    e.io.complete = false;
+    let job = Job::new(3, 1, 0x1_0000_8001, &[(0x2_0000_1000, 64)]).unwrap();
+    if e.submit(Pipe::Compute, job) != Ok(1) {
+        return TestResult::Fail("hung job");
+    }
+    let graphics = e.io.memory[..3072].to_vec();
+    let reset = [(4, 0x17f04, 2), (4, 0x17dcc, 1)];
+    e.io.hqd_stuck = true;
+    if run(e.reset_compute_hqd()) != Err(Error::Timeout)
+        || e.io.hqd_resets != reset
+        || e.io.index != 0x32
+    {
+        return TestResult::Fail("an HQD that stays active");
+    }
+    e.io.hqd_stuck = false;
+    if run(e.reset_compute_hqd()) != Ok(()) || e.io.hqd_resets != [reset, reset].concat() {
+        return TestResult::Fail("MMIO compute queue reset");
+    }
+    if e.restore(Pipe::Compute) != Ok(()) {
+        return TestResult::Fail("restore");
+    }
+    let m = &e.io.memory[3072..6144];
+    if m[1024..1536] != descriptor(GPU, 1).unwrap()
+        || m[..1024].iter().any(|&w| w != RING_NOP)
+        || m[2560..2562] != [0, 0]
+        || m[2562..2564] != [0, 0]
+        || e.io.memory[..3072] != graphics[..]
+    {
+        return TestResult::Fail("restored compute queue");
+    }
+    // Mapped again from that descriptor, the ring test is the first slot.
+    e.io.restored = true;
+    e.io.complete = true;
+    if e.submit_fence(Pipe::Compute) != Ok(2)
+        || e.completed_job(Pipe::Compute) != Ok(2)
+        || e.io.memory[3072 + 2562] != 256
+    {
+        return TestResult::Fail("ring test after the restore");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_compute_queue_resets_by_mmio_and_restores_for_remap
 );

@@ -533,6 +533,33 @@ impl<I: Io> Engine<I> {
         result
     }
     async fn reset_kernel_queue(&mut self, queue: api::KernelQueue, vmid: u8) -> Result<(), Error> {
+        self.ready_for(queue)?;
+        let packet = api::reset_kernel_queue(queue, vmid).map_err(|_| Error::Invalid)?;
+        self.recovery_command(packet).await
+    }
+    /// REMOVE_QUEUE of a bootstrap queue already reset by MMIO, telling
+    /// scheduler firmware 0x5a and later to drop its state for it.
+    async fn unmap_reset_queue(&mut self, queue: api::KernelQueue) -> Result<(), Error> {
+        self.ready_for(queue)?;
+        let drop_state = self.versions[0] & 0xfff >= 0x5a;
+        let packet =
+            api::unmap_reset_kernel_queue(queue, drop_state).map_err(|_| Error::Invalid)?;
+        self.recovery_command(packet).await
+    }
+    /// SUSPEND or RESUME of every gang on the scheduler pipe.
+    async fn all_gangs(&mut self, suspend: bool) -> Result<(), Error> {
+        if self.state != State::Ready {
+            return Err(Error::Busy);
+        }
+        let packet = if suspend {
+            api::suspend_all()
+        } else {
+            api::resume_all()
+        };
+        self.recovery_command(packet).await
+    }
+    /// MES is ready and `queue` is one of the two bootstrap kernel queues.
+    fn ready_for(&self, queue: api::KernelQueue) -> Result<(), Error> {
         if self.state != State::Ready {
             return Err(Error::Busy);
         }
@@ -544,10 +571,12 @@ impl<I: Io> Engine<I> {
         if queue.pipe != 0 || queue.queue != 0 || queue.doorbell != doorbell {
             return Err(Error::Invalid);
         }
-        let packet = api::reset_kernel_queue(queue, vmid).map_err(|_| Error::Invalid)?;
+        Ok(())
+    }
+    /// Submit a recovery command on the scheduler pipe. A rejection leaves
+    /// MES answering; a command it never completed does not.
+    async fn recovery_command(&mut self, packet: api::Packet) -> Result<(), Error> {
         let result = self.submit(0, packet).await;
-        // A rejected reset leaves MES answering; one it never completed
-        // does not.
         self.state = match result {
             Ok(()) | Err(Error::FirmwareRejected(_)) => State::Ready,
             Err(e) => State::Failed(e),
@@ -704,6 +733,25 @@ impl Mes {
         vmid: u8,
     ) -> Result<(), Error> {
         self.0.reset_kernel_queue(queue, vmid).await
+    }
+    /// Unmap a bootstrap kernel queue the caller reset by MMIO
+    /// (amdgpu_mes_unmap_legacy_queue with RESET_QUEUES), for
+    /// `map_bootstrap_queue` to map again from its restored descriptor.
+    /// # Safety
+    /// As `reset_kernel_queue`, and the queue's HQD is inactive.
+    pub(crate) async unsafe fn unmap_reset_queue(
+        &mut self,
+        queue: api::KernelQueue,
+    ) -> Result<(), Error> {
+        self.0.unmap_reset_queue(queue).await
+    }
+    /// Suspend (`true`) or resume every MES-scheduled gang
+    /// (amdgpu_mes_suspend / amdgpu_mes_resume), around a kernel queue
+    /// reset.
+    /// # Safety
+    /// The caller owns MES and resumes after every suspend.
+    pub(crate) async unsafe fn all_gangs(&mut self, suspend: bool) -> Result<(), Error> {
+        self.0.all_gangs(suspend).await
     }
 }
 
