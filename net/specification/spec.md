@@ -392,13 +392,28 @@ and sequence/sender fields.
 Generic control errors honor `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK` with the
 same capped echo and diagnostic-TLV rules as rtnetlink.
 
+Operation flags carry Linux's permission bits verbatim (`GENL_ADMIN_PERM`
+0x01, `GENL_UNS_ADMIN_PERM` 0x10, reported in `CTRL_ATTR_OP_FLAGS`). After the
+op lookup and before the family callback, `genl_family_rcv_msg`'s check runs:
+`GENL_ADMIN_PERM` needs `RequestContext::init_net_admin`
+(`netlink_capable(skb, CAP_NET_ADMIN)`), `GENL_UNS_ADMIN_PERM` needs
+`RequestContext::net_admin` (`netlink_ns_capable(skb, net->user_ns,
+CAP_NET_ADMIN)`), else `EPERM` — unless the request carries a delegated
+`admin` handle, in which case the callback runs with
+`RequestContext::capable == false` and must confirm the handle covers the
+object it changes. The socket bridge computes both verdicts per message as
+rtnetlink does: CAP_NET_ADMIN of the socket's opener (recorded at `socket()`)
+and of the sender, in the initial user namespace and over the socket's
+network namespace respectively.
+
 Families may additionally register a `ContextHandler` receiving
-`RequestContext { net_ns_id, admin }`. `admin` is an optional, kernel-held
-interface-bound `AdminHandle`; the default reply builder supplies none.
-The socket bridge passes only explicitly delegated authority. Family
-mutations check its current validity, interface name and namespace before
-queueing work, and again when asynchronous work starts. Generic-netlink
-attributes cannot mint or substitute capabilities.
+`RequestContext { net_ns_id, admin, init_net_admin, net_admin, capable }`.
+`admin` is an optional, kernel-held interface-bound `AdminHandle`; the
+default reply builder supplies none and no capabilities. The socket bridge
+passes only explicitly delegated authority. Family mutations check its
+current validity, interface name and namespace before queueing work, and
+again when asynchronous work starts. Generic-netlink attributes cannot mint
+or substitute capabilities.
 `AdminHandle::authorize_interface(name, namespace)` performs this boundary
 check through `Cap::invoke`, including the current revocation epoch.
 

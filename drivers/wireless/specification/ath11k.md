@@ -978,9 +978,12 @@ runtime is parked (`STRANDED_RT`), nothing panics, the init path never
 waits on it (all of it runs in the probe-spawned MHI task).
 
 **Command-line autoconnect** (`autoconnect.rs`, NARF-only bring-up
-aid): nl80211 mutations need a delegated interface grant
-(`network_daemon::prepare`) that no production launcher issues yet, so
-userspace cannot trigger a scan or connect on the first hardware boot.
+aid): a scan / connect without any userspace. Userspace control works
+too — nl80211 mutations follow Linux's genetlink permissions (a
+CAP_NET_ADMIN sender, e.g. root `iw` or wpa_supplicant / NetworkManager
+under systemd, or a delegated interface grant; `wireless/` spec §3.4) —
+but the command line needs no Wi-Fi userspace on the first hardware
+boot.
 `register_pci` parses `ath11k.scan=1` (one passive scan of every enabled
 channel, results printed), `ath11k.ssid=<ssid>` (active scan directed at
 the SSID, strongest matching 2.4 / 5 GHz BSS, connect; retried every
@@ -1334,10 +1337,14 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   carry 802.1X version 3 for the 4-way handshake (the shared supplicant)
   and version 1 for Group Key 2/2 (wpa_supplicant's
   `DEFAULT_EAPOL_VERSION`).
-- Open (control path): userspace Wi-Fi control over nl80211 needs a
-  launcher that grants the `wlan%d` interface to the supplicant /
-  manager task (`network_daemon::prepare`); until one exists the
-  `ath11k.*` command-line autoconnect is the only trigger.
+- Control path: userspace drives the station over nl80211 with Linux's
+  permission model (`wireless/` spec §3.4). `iw dev wlan0 scan` / `link`
+  / `connect <open ssid>` work for a CAP_NET_ADMIN sender; wpa_supplicant
+  `-Dnl80211` (and NetworkManager through it) does WPA2-PSK on the
+  handshake-offload path — PMK in CONNECT, this driver's in-kernel
+  supplicant runs the 4-way / group-key handshakes, CONNECT then
+  PORT_AUTHORIZED reported. Open: no external-supplicant mode (EAPOL to
+  userspace, NEW_KEY install), so 802.1X/EAP networks still need it.
 - Unverified until hardware (recovery): that the WCN6855 firmware enters
   RDDM (or reports SYS_ERR) on a crash and comes back after the
   `sw_reset` power cycle with a fresh QRTR HELLO; that it sends

@@ -95,7 +95,7 @@ For nl80211 scans, a nonempty nested SSID list requests active scanning;
 empty SSID entries are wildcard probes and can coexist with directed SSIDs.
 `CONNECT` accepts an SSID with optional BSSID/frequency constraints. It selects
 the strongest matching Open/WPA2 BSS from the cache, or performs a bounded
-scan first, rechecking delegated authority before association.
+scan first, rechecking the request's authority before association.
 
 ### 3.2 Wireless Capabilities
 
@@ -130,12 +130,83 @@ density when supplied by `phy_capabilities()`. VHT is absent from the
 arrays retain their wire layout. Wiphy records also carry a nested
 `SUPPORTED_COMMANDS` list, and `GET_PROTOCOL_FEATURES` returns a zero bitmap
 instead of claiming optional split-dump behavior NARF does not implement.
-The family also implements `TRIGGER_SCAN`, `GET_SCAN`, `CONNECT`, and
-`DISCONNECT`, plus the `config`, `scan`, and `mlme` multicast groups.
-Mutations require an explicitly delegated `AdminHandle` for the selected
-interface in the requesting socket's namespace. Missing, revoked,
-cross-interface or cross-namespace authority is rejected. Opening a Linux
-socket or supplying an attribute does not convey this authority.
+The family also implements `TRIGGER_SCAN`, `GET_SCAN`, `CONNECT`,
+`DISCONNECT`, `SET_INTERFACE` and `GET_STATION` (plus the userspace-SME and AP
+commands below), and the `config`, `scan`, `regulatory`, `mlme`, `vendor` and
+`nan` multicast groups; none of the groups carries `GENL_MCAST_CAP_*`, so any
+socket may join them, as with Linux `genl_bind`.
+
+**Permissions** follow Linux generic netlink exactly. Each `GenlOperation`
+carries its `nl80211_ops` `.flags` (`narf_net::netlink_generic::
+GENL_ADMIN_PERM` / `GENL_UNS_ADMIN_PERM`), reported in `CTRL_ATTR_OP_FLAGS`.
+`genl_family_rcv_msg`'s order is kept: unknown family -ENOENT, op not in the
+table for the requested do/dump -EOPNOTSUPP, then the permission check
+-EPERM, and only then attribute validation and the device lookup
+(`nl80211_pre_doit`, -EINVAL / -ENODEV). `GENL_ADMIN_PERM` needs
+`netlink_capable(skb, CAP_NET_ADMIN)` — CAP_NET_ADMIN in the initial user
+namespace held by both the socket's opener (`f_cred`, recorded at
+`socket()`) and the sender; `GENL_UNS_ADMIN_PERM` needs
+`netlink_ns_capable(skb, net->user_ns, CAP_NET_ADMIN)` over the socket's
+network namespace. The socket layer supplies both verdicts in
+`RequestContext::{init_net_admin, net_admin}`, the same helpers rtnetlink uses.
+
+| Command | Linux flag | NARF check |
+|---|---|---|
+| GET_WIPHY, GET_INTERFACE, GET_SCAN, GET_STATION, GET_PROTOCOL_FEATURES | none | none |
+| TRIGGER_SCAN, CONNECT, DISCONNECT, SET_INTERFACE | `GENL_UNS_ADMIN_PERM` | `net_admin` or delegated handle |
+| AUTHENTICATE, ASSOCIATE, DEAUTHENTICATE, DISASSOCIATE, REGISTER_FRAME, FRAME | `GENL_UNS_ADMIN_PERM` | `net_admin` or delegated handle |
+| SET_BEACON, START_AP, STOP_AP, NEW/SET/DEL_STATION | `GENL_UNS_ADMIN_PERM` | `net_admin` or delegated handle |
+| EXTERNAL_AUTH | `GENL_ADMIN_PERM` | `init_net_admin` or delegated handle |
+
+A capable sender acts on any wireless interface of its own namespace with the
+interface's kernel-held handle (`narf_net::kernel_admin`), so a namespace move
+or removal during an asynchronous operation still revokes it. NARF's
+explicitly delegated, interface-bound `AdminHandle` remains an alternative:
+the generic-netlink layer lets a request carrying one through
+(`RequestContext::capable == false`) and the handler then requires the handle
+to cover the named interface (-EPERM otherwise, after -EINVAL / -ENODEV —
+NARF-only ordering, since Linux has no such handle). Revoked, cross-interface
+or cross-namespace handles are rejected; supplying an attribute never conveys
+authority.
+
+**Supplicant interop.** `GET_WIPHY` resolves its wiphy as
+`__cfg80211_rdev_from_attrs` (WIPHY, WDEV or IFINDEX; none -EINVAL, not found
+-ENODEV) and a dump is narrowed as `nl80211_dump_wiphy_parse` does.
+`SET_INTERFACE` to the current type is a no-op; a real type change, or
+`4ADDR`, is -EOPNOTSUPP (no driver implements `change_virtual_intf`).
+`TRIGGER_SCAN` accepts `SCAN_FLAGS` FLUSH / AP / COLOCATED_6GHZ (a NARF scan
+always replaces the cached results) and refuses feature-gated flags and
+FREQ_KHZ with -EOPNOTSUPP, probe IEs past the advertised maximum of 0 with
+-EINVAL. `CONNECT` accepts the attributes wpa_supplicant and NetworkManager
+always send (`MAC_HINT`, `WIPHY_FREQ_HINT`, `BG_SCAN_PERIOD`, `PREV_BSSID`,
+HT/VHT capability + mask, `CONTROL_PORT`, `CONTROL_PORT_ETHERTYPE` = ETH_P_PAE,
+`CONTROL_PORT_NO_ENCRYPT`, `SOCKET_OWNER`, `EXTERNAL_AUTH_SUPPORT`, `SAE_PWE`,
+`MLO_SUPPORT`) with `nl80211_connect`'s checks; hints and overrides steer
+nothing. For the PMK path the RSN element in `NL80211_ATTR_IE` must describe
+CCMP/PSK without MFP-required; other elements are accepted and not forwarded.
+`CONTROL_PORT_OVER_NL80211` is -EOPNOTSUPP (the ext feature is not
+advertised), so EAPOL never reaches userspace. A successful offloaded
+WPA2-PSK / SAE connect emits `CONNECT` (with `WIPHY`, `MAC`, `STATUS_CODE`)
+and then `PORT_AUTHORIZED` (`cfg80211_port_authorized`), which wpa_supplicant
+waits for under `WPA_DRIVER_FLAGS_4WAY_HANDSHAKE_PSK`. `GET_SCAN` marks the
+associated BSS with `NL80211_BSS_STATUS_ASSOCIATED`; `GET_STATION` reports the
+AP (do needs `MAC`, -ENOENT for another peer) with the signal of its last scan
+record only.
+
+**WPA2-PSK with wpa_supplicant / NetworkManager** therefore runs on the
+handshake-offload path every NARF station driver implements (ath11k, iwlwifi,
+mt7921): wpa_supplicant derives the PMK and passes it in `CONNECT`, the
+driver's in-kernel supplicant runs the 4-way and group-key handshakes and
+rekeys. There is no external-supplicant driver mode: `NEW_KEY` / `SET_KEY` /
+`DEL_KEY`, `SET_PMKSA` / `FLUSH_PMKSA`, `SET_STATION(AUTHORIZED)` on a station,
+`CONTROL_PORT_FRAME` and EAPOL delivery to `PF_PACKET` are not implemented
+(-EOPNOTSUPP; wpa_supplicant ignores each on this path). They are what
+802.1X/EAP (WPA-Enterprise) or a supplicant-run 4-way handshake would need: a
+`WirelessNetIface` mode that hands EAPOL frames to the netdev RX ring and
+transmits them unencrypted before authorization, a key-install method, and
+an authorize-port method, with the driver's in-kernel supplicant (including
+its group rekey) disabled for that association. `SOCKET_OWNER` is accepted
+but closing the owner socket does not disconnect.
 
 Mutating requests validate attributes, reserve one operation per interface,
 then run the native async method in the executor. Netlink ACK acknowledges

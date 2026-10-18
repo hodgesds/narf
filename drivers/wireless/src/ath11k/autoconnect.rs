@@ -1,13 +1,12 @@
 //! Bring-up aid: scan / connect from the kernel command line.
 //!
-//! NARF's nl80211 family refuses Wi-Fi mutations (TRIGGER_SCAN,
-//! CONNECT) from a socket without a delegated interface grant
-//! (`network_daemon::prepare`), and no production launcher issues one
-//! yet — so a bare-metal test of the station path has no userspace
-//! trigger. These NARF-only parameters (no Linux equivalent; Linux uses
-//! wpa_supplicant / iwd over nl80211) let the first boot on the card
-//! exercise scan, connect and link-loss recovery, reporting through the
-//! console and the framebuffer panel:
+//! Userspace can drive the station over nl80211 — Wi-Fi mutations
+//! (TRIGGER_SCAN, CONNECT) follow Linux's genetlink permissions, so a
+//! CAP_NET_ADMIN `iw` or wpa_supplicant / NetworkManager works
+//! (`wireless/` spec §3.4) — but a first bare-metal boot may have no
+//! Wi-Fi userspace at all. These NARF-only parameters (no Linux
+//! equivalent) let that boot exercise scan, connect and link-loss
+//! recovery, reporting through the console and the framebuffer panel:
 //!
 //! | Parameter | Effect |
 //! |---|---|
