@@ -1130,6 +1130,17 @@ pub trait FileOps: Send + Sync {
         Err(FsError::Unsupported)
     }
 
+    /// [`Self::set_times`] for a filesystem whose update has to wait (a
+    /// journaled or transactional store). The syscall layer calls this one;
+    /// the default runs the synchronous hook.
+    fn set_times_async<'a>(
+        &'a self,
+        atime_ns: Option<u64>,
+        mtime_ns: Option<u64>,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.set_times(atime_ns, mtime_ns) })
+    }
+
     /// Stable inode identity for this file, unique within its filesystem.
     /// Disk-backed filesystems return the real on-disk inode number;
     /// synthetic filesystems leave the default `0` (meaning "no stable
@@ -2635,6 +2646,18 @@ pub trait FsInstance: Send + Sync + 'static {
     /// can. The default ignores the flags and applies `options`.
     fn reconfigure_sb(&self, _sb_flags: u64, _sb_mask: u64, options: &str) -> Result<(), FsError> {
         self.reconfigure(options)
+    }
+
+    /// [`Self::reconfigure_sb`] for a filesystem that has to wait (a remount
+    /// read-only commits and flushes). `reconfigure_super` calls this one;
+    /// the default runs the synchronous hook.
+    fn reconfigure_sb_async<'a>(
+        &'a self,
+        sb_flags: u64,
+        sb_mask: u64,
+        options: &'a str,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.reconfigure_sb(sb_flags, sb_mask, options) })
     }
 
     // ── Disk quota (quotactl) ──────────────────────────────────────

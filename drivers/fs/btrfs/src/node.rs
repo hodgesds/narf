@@ -802,12 +802,24 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     }
 
     /// `utimensat`/`futimens` (`None` = `UTIME_OMIT`). ctime moves.
-    fn set_times(&self, atime_ns: Option<u64>, mtime_ns: Option<u64>) -> Result<(), FsError> {
-        narf_scheduler::block_on(self.change_attrs(crate::write::AttrChange {
+    fn set_times_async<'a>(
+        &'a self,
+        atime_ns: Option<u64>,
+        mtime_ns: Option<u64>,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(self.change_attrs(crate::write::AttrChange {
             atime_ns,
             mtime_ns,
             ..Default::default()
         }))
+    }
+
+    /// Synchronous callers (overlayfs copy-up) cannot await: drive the
+    /// update by spinning, which is safe from inside an executor poll where
+    /// `block_on` is not. The update completes without waiting unless
+    /// another CPU is mid-operation on this filesystem.
+    fn set_times(&self, atime_ns: Option<u64>, mtime_ns: Option<u64>) -> Result<(), FsError> {
+        narf_scheduler::block_on_spin(self.set_times_async(atime_ns, mtime_ns))
     }
 
     fn ioctl_async<'a>(
@@ -1288,6 +1300,45 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     }
 }
 
+impl<B: BlockDevice + 'static> BtrfsVolume<B> {
+    async fn reconfigure_impl(
+        &self,
+        sb_flags: u64,
+        sb_mask: u64,
+        options: &str,
+    ) -> Result<(), FsError> {
+        use narf_filesystem::sb_flags::RDONLY;
+        let mut want_ro = (sb_mask & RDONLY != 0).then_some(sb_flags & RDONLY != 0);
+        for option in options.split(',') {
+            match option {
+                "ro" => want_ro = Some(true),
+                "rw" => want_ro = Some(false),
+                _ => {}
+            }
+        }
+        let rest: alloc::vec::Vec<&str> = options
+            .split(',')
+            .filter(|o| !o.is_empty() && *o != "ro" && *o != "rw")
+            .collect();
+        let mut parsed = crate::mount_opts::parse(&rest.join(","))?;
+        match want_ro {
+            Some(true) if !self.is_read_only() => {
+                narf_filesystem::fs_registry::mount_wait(self.remount_read_only())?;
+            }
+            Some(false) if self.is_read_only() => {
+                let this = self.self_weak.upgrade().ok_or(FsError::NotFound)?;
+                this.remount_read_write()?;
+            }
+            _ => {}
+        }
+        let current = self.mount_options();
+        parsed.subvol = current.subvol;
+        parsed.read_only = self.is_read_only();
+        self.set_mount_options(parsed);
+        Ok(())
+    }
+}
+
 impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
     fn root(&self) -> Arc<dyn DirOps> {
         let inode = self.root_inode().expect("btrfs root inode cached at mount");
@@ -1349,35 +1400,16 @@ impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
     /// with `ReadOnly` where a read-write mount would be (disk policy,
     /// write-safety gate, an aborted transaction).
     fn reconfigure_sb(&self, sb_flags: u64, sb_mask: u64, options: &str) -> Result<(), FsError> {
-        use narf_filesystem::sb_flags::RDONLY;
-        let mut want_ro = (sb_mask & RDONLY != 0).then_some(sb_flags & RDONLY != 0);
-        for option in options.split(',') {
-            match option {
-                "ro" => want_ro = Some(true),
-                "rw" => want_ro = Some(false),
-                _ => {}
-            }
-        }
-        let rest: alloc::vec::Vec<&str> = options
-            .split(',')
-            .filter(|o| !o.is_empty() && *o != "ro" && *o != "rw")
-            .collect();
-        let mut parsed = crate::mount_opts::parse(&rest.join(","))?;
-        match want_ro {
-            Some(true) if !self.is_read_only() => {
-                narf_filesystem::fs_registry::mount_wait(self.remount_read_only())?;
-            }
-            Some(false) if self.is_read_only() => {
-                let this = self.self_weak.upgrade().ok_or(FsError::NotFound)?;
-                this.remount_read_write()?;
-            }
-            _ => {}
-        }
-        let current = self.mount_options();
-        parsed.subvol = current.subvol;
-        parsed.read_only = self.is_read_only();
-        self.set_mount_options(parsed);
-        Ok(())
+        narf_scheduler::block_on_spin(self.reconfigure_sb_async(sb_flags, sb_mask, options))
+    }
+
+    fn reconfigure_sb_async<'a>(
+        &'a self,
+        sb_flags: u64,
+        sb_mask: u64,
+        options: &'a str,
+    ) -> narf_filesystem::FsFuture<'a, ()> {
+        Box::pin(self.reconfigure_impl(sb_flags, sb_mask, options))
     }
 
     fn show_options(&self) -> alloc::string::String {
