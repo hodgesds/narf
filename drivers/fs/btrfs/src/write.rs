@@ -5345,7 +5345,9 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     // bounded and monotonic on supported trees, but the 12-round historical cap
     // cut off a real 14-round convergence during the NVMe late-init smoke.
     const MAX_FIXED_POINT_ROUNDS: usize = 64;
-    const FST_MONOTONE_AFTER_ROUND: usize = 8;
+    const MONOTONE_AFTER_ROUND: usize = 8;
+    // Block groups whose BLOCK_GROUP_ITEM any round has rewritten.
+    let mut bg_touched: BTreeSet<u64> = BTreeSet::new();
     for round in 0..MAX_FIXED_POINT_ROUNDS {
         COMMIT_ROUND.store(round as u32, core::sync::atomic::Ordering::Relaxed);
         commit_phase(2);
@@ -5459,7 +5461,7 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
                 // rounds the count is only allowed to grow, padding with
                 // emptier leaves when fewer would do, so the sequence is
                 // monotone and bounded and the fixed point settles.
-                if round >= FST_MONOTONE_AFTER_ROUND && g.len() < fst_leaves {
+                if round >= MONOTONE_AFTER_ROUND && g.len() < fst_leaves {
                     pad_groups(&mut g, fst_leaves);
                 }
                 (Some(ff), Some(g))
@@ -5490,6 +5492,29 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
                 BtrfsKey::new(chunk.logical, format::BLOCK_GROUP_ITEM_KEY, chunk.length),
                 chunk.bg_item.clone(),
             ));
+        }
+        // Which block groups' items a round rewrites depends on where the
+        // previous round put its block-group-tree blocks (their group's
+        // `used` changes), and that decides which leaves this round COWs:
+        // the set can alternate between two rounds forever. After a few
+        // rounds every group any round touched is rewritten (unchanged ones
+        // with their committed item, a no-op on content), so the edited set
+        // only grows and the fixed point settles.
+        let edited: BTreeSet<u64> = ext_edits
+            .iter()
+            .filter(|e| e.key().item_type == format::BLOCK_GROUP_ITEM_KEY)
+            .map(|e| e.key().objectid)
+            .collect();
+        bg_touched.extend(edited.iter().copied());
+        if round >= MONOTONE_AFTER_ROUND {
+            for (start, len, item) in &bgs {
+                if bg_touched.contains(start) && !edited.contains(start) {
+                    ext_edits.push(Edit::Upsert(
+                        BtrfsKey::new(*start, format::BLOCK_GROUP_ITEM_KEY, *len),
+                        item.clone(),
+                    ));
+                }
+            }
         }
         let (ext_edits, bg_edits) = split_block_group_edits(ext_edits, bg_home);
         let ext_out = PathCow::new(vol, gen, old_ext, old_ext_level)
