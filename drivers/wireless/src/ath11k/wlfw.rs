@@ -31,12 +31,18 @@
 //!   `ath11k_core_fetch_board_data_api_1`, `ath11k_core_firmware_request`,
 //!   `ath11k_core_create_firmware_path` (via [`super::board`]).
 //!
+//! After FW_READY the same machine keeps running on a registered device
+//! ([`Wlfw::late_event`], [`Wlfw::run_to_fw_restart`]): SERVER_EXIT,
+//! a second FW_INIT_DONE / FW_READY, COLD_BOOT_CAL_DONE and a restarted
+//! firmware's handshake are handled as `ath11k_qmi_driver_event_work`
+//! does once `ATH11K_FLAG_REGISTERED` is set.
+//!
 //! Not ported (not reached on PCIe WCN6855): `ath11k_qmi_assign_target_mem_chunk`
 //! (`fixed_mem_region`), `ath11k_qmi_request_device_info`
 //! (`hybrid_bus_type`), the `fixed_bdf_addr` ioremap path of
 //! `load_file_target_mem`, `ath11k_qmi_fwreset_from_cold_boot`, FTM
-//! mode, recovery (`SERVER_EXIT` / a second FW_INIT_DONE end the
-//! handshake with an error here).
+//! mode. During the first bring-up a SERVER_EXIT ends the handshake with
+//! an error (Linux waits for the server to return).
 //!
 //! Where Linux waits for an indication with no timeout (server
 //! arrival, REQUEST_MEM, FW_MEM_READY, FW_READY) or stalls silently
@@ -106,8 +112,8 @@ pub mod step {
     pub const WLAN_MODE: u32 = 60;
     /// Cold-boot calibration mode request failed.
     pub const COLDBOOT_MODE: u32 = 61;
-    /// FW_INIT_DONE after registration: Linux queues `restart_work`
-    /// (recovery), not ported.
+    /// FW_INIT_DONE after registration outside a recovery (Linux queues
+    /// `restart_work`; the runtime's recovery takes that path).
     pub const FW_RESTART: u32 = 62;
     /// `fixed_mem_region` / `hybrid_bus_type` part (not ported).
     pub const UNSUPPORTED: u32 = 63;
@@ -255,6 +261,21 @@ pub enum WlfwEvent {
     FwInitDone,
 }
 
+/// What `ath11k_qmi_driver_event_work` does with events that arrive
+/// after FW_READY on a registered device ([`Wlfw::late_event`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LateEvent {
+    /// `ATH11K_QMI_EVENT_SERVER_EXIT`: CRASH_FLUSH + RECOVERY and
+    /// `ath11k_core_pre_reconfigure_recovery`; the restarted firmware's
+    /// handshake follows ([`Wlfw::run_to_fw_restart`]). Also reported for
+    /// handshake events (SERVER_ARRIVE, REQUEST_MEM, FW_MEM_READY) that
+    /// arrive with no SERVER_EXIT before them: the firmware restarted.
+    ServerExit,
+    /// FW_INIT_DONE, or FW_READY on a part without `cbcal_restart_fw`,
+    /// with REGISTERED set: `queue_work(restart_work)`.
+    Restart,
+}
+
 /// What the event loop is waiting for — names the timeout step.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -337,6 +358,9 @@ pub struct Wlfw<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> {
     /// `ab->fw` (`ath11k_fw_pre_init`): the M3 IE of `firmware-N.bin`.
     pub fw_api: FwApi,
     phase: Phase,
+    /// The event work is running for a crash recovery
+    /// ([`Self::run_to_fw_restart`]).
+    recovering: bool,
 }
 
 impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
@@ -371,6 +395,7 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
             regdb_sent: None,
             fw_api: FwApi::api1(),
             phase: Phase::Server,
+            recovering: false,
         })
     }
 
@@ -957,6 +982,12 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
             self.cfg.hw.qmi_service_ins_id,
         );
         self.phase = Phase::Server;
+        self.event_loop().await?;
+        Ok(self.ready_info())
+    }
+
+    /// Process events until one of them is the firmware-ready point.
+    async fn event_loop(&mut self) -> Result<(), WlfwError> {
         loop {
             self.drain_inbound();
             if let Some(e) = self.fatal {
@@ -964,7 +995,7 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
             }
             while let Some(ev) = self.events.pop_front() {
                 if self.handle_event(ev).await? {
-                    return Ok(self.ready_info());
+                    return Ok(());
                 }
                 if let Some(e) = self.fatal {
                     return Err(e);
@@ -975,6 +1006,67 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
                 return Err(self.phase_timeout());
             }
         }
+    }
+
+    /// `ath11k_qmi_driver_event_work` for what arrived after FW_READY
+    /// (the link is pumped and the QMI handlers run first: COLD_BOOT_CAL_DONE / FW_READY set
+    /// `cal_done`, REQUEST_MEM allocated its chunks). Events that need
+    /// the event work stay queued for [`Self::run_to_fw_restart`]; the
+    /// returned [`LateEvent`] says how the device must recover. `None`:
+    /// nothing to do.
+    pub fn late_event(&mut self) -> Option<LateEvent> {
+        self.client.pump();
+        self.drain_inbound();
+        // "For targets requiring a FW restart upon cold boot completion,
+        // there is no need to process FW ready".
+        if self.cfg.hw.cbcal_restart_fw {
+            self.events.retain(|e| *e != WlfwEvent::FwReady);
+        }
+        if self.events.contains(&WlfwEvent::ServerExit) {
+            return Some(LateEvent::ServerExit);
+        }
+        if self
+            .events
+            .iter()
+            .any(|e| matches!(e, WlfwEvent::FwInitDone | WlfwEvent::FwReady))
+        {
+            return Some(LateEvent::Restart);
+        }
+        if !self.events.is_empty() || self.fatal.is_some() {
+            self.log(format_args!(
+                "qmi: firmware restarted without SERVER_EXIT ({:?})",
+                self.events.front()
+            ));
+            return Some(LateEvent::ServerExit);
+        }
+        None
+    }
+
+    /// The MHI endpoint went away and came back (`ath11k_core_reset`'s
+    /// power cycle): the QRTR node is gone (its server is reported
+    /// exited), queued events belong to the dead firmware.
+    pub fn endpoint_reset(&mut self) {
+        self.events.clear();
+        self.fatal = None;
+        self.client.endpoint_reset();
+    }
+
+    /// The event work on a registered device after a crash: queued and
+    /// arriving events run as in [`Self::run_to_fw_ready`] (SERVER_EXIT
+    /// waits for the server; SERVER_ARRIVE → ind_register + host_cap with
+    /// the current `cal_done`; REQUEST_MEM reuses chunks of the same size
+    /// and type; the M3 copy is reused) until FW_INIT_DONE (or FW_READY)
+    /// queues `restart_work`.
+    pub async fn run_to_fw_restart(&mut self) -> Result<(), WlfwError> {
+        self.recovering = true;
+        self.fatal = None;
+        self.phase = Phase::Server;
+        let r = self.event_loop().await;
+        self.recovering = false;
+        if r.is_ok() {
+            self.log(format_args!("qmi: firmware restarted, queueing restart"));
+        }
+        r
     }
 
     fn phase_timeout(&self) -> WlfwError {
@@ -998,7 +1090,12 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
                 self.event_server_arrive().await?;
             }
             WlfwEvent::ServerExit => {
-                // Linux sets CRASH_FLUSH | RECOVERY and starts recovery.
+                // Linux sets CRASH_FLUSH | RECOVERY; in a recovery the
+                // event work then waits for the server to come back.
+                if self.recovering {
+                    self.phase = Phase::Server;
+                    return Ok(false);
+                }
                 return Err(WlfwError::new(step::SERVER_EXIT, self.phase as u32, 104));
             }
             WlfwEvent::RequestMem => {
@@ -1016,6 +1113,10 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
             }
             WlfwEvent::FwInitDone => {
                 if self.registered {
+                    // queue_work(ab->workqueue, &ab->restart_work)
+                    if self.recovering {
+                        return Ok(true);
+                    }
                     return Err(WlfwError::new(step::FW_RESTART, 0, EOPNOTSUPP));
                 }
                 if self.cal_done == 0 && self.cfg.coldboot_cal_support() {
@@ -1031,6 +1132,9 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
                 if self.cfg.hw.cbcal_restart_fw {
                     return Ok(false);
                 }
+                // Registered (a recovery): Linux calls
+                // ath11k_core_qmi_firmware_ready again; NARF takes the
+                // restart path (spec §8).
                 self.registered = true;
                 return Ok(true);
             }

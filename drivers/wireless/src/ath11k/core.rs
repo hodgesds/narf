@@ -242,19 +242,16 @@ where
         // so the IPCR DL buffers are recycled.
         self.client.pipe.service();
         self.client.pump();
-        // Late indications (Linux `ath11k_qmi_msg_handlers`): logged.
-        while let Some(i) = self.client.take_inbound() {
-            match i {
-                super::qmi_client::Inbound::Message(m) => log(format_args!(
-                    "qmi: late indication after FW_READY ({} bytes, msg id {:#x})",
-                    m.len(),
-                    m.get(3..5).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
-                )),
-                other => log(format_args!("qmi: late event after FW_READY: {:?}", other)),
-            }
-        }
         // ath11k_mhi_op_status_cb → queue_work(reset_work).
-        self.client.pipe.take_reset_request().map(FwNotice::Reset)
+        if let Some(cb) = self.client.pipe.take_reset_request() {
+            return Some(FwNotice::Reset(cb));
+        }
+        // Late indications (`ath11k_qmi_msg_handlers`, then
+        // `ath11k_qmi_driver_event_work` on a registered device).
+        self.late_event().map(|e| match e {
+            wlfw::LateEvent::ServerExit => FwNotice::ServerExit,
+            wlfw::LateEvent::Restart => FwNotice::Restart,
+        })
     }
     fn irq_pending(&self) -> bool {
         self.client.pipe.irqs_pending()

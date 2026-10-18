@@ -166,6 +166,23 @@ tables.
   wlan_ini (`fw_wmi_diag_event`) → wlan_cfg (QCA6390 CE + service
   maps, shadow v2 clamped to 36) → wlan_mode. `WlfwConfig::pci(..)`
   carries `ab->id`, `dev_name` (caldata name) and the timeouts.
+  After FW_READY (REGISTERED): `late_event()` pumps the link, runs the
+  QMI handlers (COLD_BOOT_CAL_DONE / FW_READY set `cal_done`, REQUEST_MEM
+  allocates) and classifies what `ath11k_qmi_driver_event_work` would
+  do — `LateEvent::ServerExit` (SERVER_EXIT, or handshake events with no
+  SERVER_EXIT before them: the firmware restarted), `LateEvent::Restart`
+  (FW_INIT_DONE, or FW_READY without `cbcal_restart_fw`: `restart_work`;
+  FW_READY is dropped on `cbcal_restart_fw` parts), events left queued;
+  `run_to_fw_restart()` = the event work during a recovery (SERVER_EXIT
+  waits for the server, SERVER_ARRIVE → ind_register + host_cap with
+  `cal_done`, chunks of the same size / type and the M3 copy reused) until
+  FW_INIT_DONE / FW_READY; `endpoint_reset()` = the MHI endpoint went
+  away (power cycle): queued events and undelivered traffic dropped,
+  `QmiClient::endpoint_reset` (transaction abandoned, `QrtrLink::
+  endpoint_reset`: BYE → DEL_SERVER for the node's servers, node / flows
+  freed, lookups kept; the handle's port and transaction ids kept).
+  `QmiFw::service` for `Wlfw` maps these to `FwNotice` after the MHI reset
+  request.
   Kernel impls: `NarfFirmware` (`narf_firmware::open`, no retry —
   `amss.bin` already proved the store is up), `Dma32`
   (`alloc_coherent_masked`, 32-bit mask). `step::*` (40–63) name every
@@ -1070,8 +1087,13 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   here each wait is bounded (30 s, the 10 s transaction budget for
   flow control) and fails with its own step.
 - Not ported (unreached on WCN6855 PCIe): fixed memory regions,
-  DEVICE_INFO, `fixed_bdf_addr`, recovery (SERVER_EXIT / a second
-  FW_INIT_DONE end the handshake), FTM.
+  DEVICE_INFO, `fixed_bdf_addr`, FTM. During the first bring-up a
+  SERVER_EXIT still ends the handshake (Linux waits for the server).
+- Late QMI events (decided): after REGISTERED, FW_READY takes the restart
+  path like FW_INIT_DONE (Linux re-runs `ath11k_core_qmi_firmware_ready`
+  directly, over live rings); handshake events that arrive with no
+  SERVER_EXIT first are treated as a firmware restart; the recovery
+  handshake is bounded like bring-up (30 s per wait).
 - `firmware-2.bin` (decided, `fw.rs`): preferred over `amss.bin` /
   `m3.bin` exactly as `ath11k_fw_pre_init`; NARF-only, it is re-tried
   with `amss.bin` while the firmware store fills (Linux requests it once
@@ -1109,9 +1131,7 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   ath11k's RDDM image, leaves to the RDDM entry that follows — queues
   `ath11k_core_reset` like EE_RDDM. During bring-up a SYS_ERR still fails
   the bring-up (Linux's `reset_work` ignores an unregistered device).
-- Core after bring-up: the QRTR link over MHI is pumped every 100 ms
-  (`QmiFw::service`), so late QMI messages are drained and logged, not
-  acted on; `ATH11K_FLAG_*` crypto / raw mode are not modelled (HW
+- Core after bring-up: `ATH11K_FLAG_*` crypto / raw mode are not modelled (HW
   crypto, native-wifi encap / decap as in the INIT resource config);
   firmware crash recovery (`ath11k_core_reconfigure_on_crash`) is not
   ported.

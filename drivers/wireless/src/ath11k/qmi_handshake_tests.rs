@@ -589,13 +589,30 @@ fn expected_sequence(
     m3_addr: u64,
     m3_len: u32,
 ) -> Vec<Vec<u8>> {
+    expected_sequence_from(0, 0, mem, regdb, board, board_id, m3_addr, m3_len)
+}
+
+/// [`expected_sequence`] from transaction `txn0` with host_cap's
+/// `cal_done` (a recovery handshake runs with the handle's next ids and
+/// `cal_done = 1`).
+#[allow(clippy::too_many_arguments)]
+fn expected_sequence_from(
+    txn0: u16,
+    cal_done: u8,
+    mem: &[(u64, u32, i32)],
+    regdb: &[u8],
+    board: &[u8],
+    board_id: u32,
+    m3_addr: u64,
+    m3_len: u32,
+) -> Vec<Vec<u8>> {
     let hw = hw();
     let mut v = Vec::new();
-    let mut txn = 0u16;
+    let mut txn = txn0;
     let push = |m: Vec<u8>, v: &mut Vec<Vec<u8>>| v.push(m);
     push(enc(&IndRegisterReq::ath11k(&hw), txn), &mut v);
     txn += 1;
-    push(enc(&HostCapReq::ath11k(&hw, 0), txn), &mut v);
+    push(enc(&HostCapReq::ath11k(&hw, cal_done), txn), &mut v);
     txn += 1;
     let segs = mem
         .iter()
@@ -2065,3 +2082,255 @@ fn smoke_wlfw_m3_from_firmware_n() -> TestResult {
     })
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_wlfw_m3_from_firmware_n);
+
+// ══ after FW_READY: late events, restart handshake ════════════════
+
+const WLFW_SRV: CtrlPkt = CtrlPkt::DelServer {
+    service: ATH11K_QMI_WLFW_SERVICE_ID_V01,
+    instance: 0x101,
+    node: DEV_NODE,
+    port: SRV_PORT,
+};
+
+/// The firmware restarts on its own: DEL_SERVER, then the server is
+/// announced again and the handshake script runs from the start.
+fn fw_restarts(fw: &mut FakeFw) {
+    fw.ctrl(WLFW_SRV);
+    fw.mem_round = 0;
+    fw.counts.clear();
+    fw.ctrl(CtrlPkt::NewServer {
+        service: ATH11K_QMI_WLFW_SERVICE_ID_V01,
+        instance: fw.s.instance,
+        node: DEV_NODE,
+        port: SRV_PORT,
+    });
+}
+
+fn ready_wlfw(
+    board: &[u8],
+    regdb: &[u8],
+    m3: &[u8],
+) -> Result<(W<FakeDma>, FwReadyInfo), &'static str> {
+    let mut w = wlfw(Script::wcn6855(), standard_files(board, regdb, m3));
+    let info = block(w.run_to_fw_ready()).map_err(|_| "FW_READY")?;
+    Ok((w, info))
+}
+
+fn smoke_wlfw_late_indications() -> TestResult {
+    run_test(|| {
+        let (board, regdb, m3) = (elf_blob(100, 1), [3u8; 9], [1u8; 8]);
+        let (mut w, _) = ready_wlfw(&board, &regdb, &m3)?;
+        ensure!(w.late_event().is_none(), "quiet firmware: nothing");
+
+        // COLD_BOOT_CAL_DONE: cal_done = 1, no event (Linux's event case
+        // is a no-op).
+        w.cal_done = 0;
+        w.client
+            .pipe
+            .fw
+            .ind(QMI_WLFW_COLD_BOOT_CAL_DONE_IND_V01, &[]);
+        ensure!(w.late_event().is_none(), "COLD_BOOT_CAL_DONE: no event");
+        ensure!(w.cal_done == 1, "cal_done set");
+
+        // FW_INIT_DONE with REGISTERED: restart_work; the restart
+        // handshake has nothing left to send.
+        w.client.pipe.fw.ind(QMI_WLFW_FW_INIT_DONE_IND_V01, &[]);
+        ensure!(
+            w.late_event() == Some(LateEvent::Restart),
+            "FW_INIT_DONE → restart"
+        );
+        let n = w.client.pipe.fw.reqs.len();
+        block(w.run_to_fw_restart()).map_err(|_| "restart consumes FW_INIT_DONE")?;
+        ensure!(w.client.pipe.fw.reqs.len() == n, "no request");
+        ensure!(w.late_event().is_none(), "event consumed");
+
+        // FW_READY again on WCN6855 (no cbcal_restart_fw): the restart
+        // path too.
+        w.client.pipe.fw.ind(QMI_WLFW_FW_READY_IND_V01, &[]);
+        ensure!(
+            w.late_event() == Some(LateEvent::Restart),
+            "FW_READY → restart"
+        );
+        block(w.run_to_fw_restart()).map_err(|_| "restart consumes FW_READY")?;
+        // A part with cbcal_restart_fw ignores FW_READY ("no need to
+        // process FW ready").
+        w.cfg.hw.cbcal_restart_fw = true;
+        w.client.pipe.fw.ind(QMI_WLFW_FW_READY_IND_V01, &[]);
+        ensure!(
+            w.late_event().is_none(),
+            "cbcal_restart_fw: FW_READY dropped"
+        );
+        w.cfg.hw.cbcal_restart_fw = false;
+
+        // A REQUEST_MEM with no SERVER_EXIT before it: the firmware
+        // restarted; the chunks are already allocated by the callback.
+        w.client.pipe.fw.mem_round = 0;
+        w.client.pipe.fw.mem_ind();
+        ensure!(
+            w.late_event() == Some(LateEvent::ServerExit),
+            "handshake event without SERVER_EXIT"
+        );
+        ensure!(
+            w.client
+                .pipe
+                .logs
+                .borrow()
+                .iter()
+                .any(|l| l.contains("firmware restarted without SERVER_EXIT")),
+            "logged"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_wlfw_late_indications);
+
+fn smoke_wlfw_server_exit_restart_handshake() -> TestResult {
+    run_test(|| {
+        let (board, regdb, m3) = (elf_blob(100, 1), [3u8; 9], [1u8; 8]);
+        let (mut w, info) = ready_wlfw(&board, &regdb, &m3)?;
+        let allocs = w.dma.allocs.len();
+        let first = w.client.pipe.fw.reqs.len();
+        // SERVER_EXIT, then the firmware's own restart.
+        fw_restarts(&mut w.client.pipe.fw);
+        ensure!(
+            w.late_event() == Some(LateEvent::ServerExit),
+            "SERVER_EXIT reported"
+        );
+        block(w.run_to_fw_restart()).map_err(|_| "restart handshake")?;
+        // The same requests, with the handle's next transaction ids and
+        // cal_done = 1; the target memory and the M3 copy are reused.
+        ensure!(
+            w.target_mem_list() == info.target_mem,
+            "chunks of the same size / type reused"
+        );
+        ensure!(w.dma.allocs.len() == allocs, "nothing reallocated");
+        let want = expected_sequence_from(
+            first as u16,
+            1,
+            &info.target_mem,
+            &regdb,
+            &board,
+            0xff,
+            info.m3_addr,
+            8,
+        );
+        ensure!(
+            w.client.pipe.fw.reqs[first..] == want[..],
+            "restart handshake = Linux's requests"
+        );
+        ensure!(
+            w.fw.requested
+                .iter()
+                .filter(|p| p.ends_with("m3.bin"))
+                .count()
+                == 1,
+            "M3 loaded once"
+        );
+        ensure!(w.registered, "still registered");
+
+        // FW_INIT_DONE ends it too (a firmware that sends that).
+        w.client.pipe.fw.s.fw_ready = false;
+        w.client.pipe.fw.s.init_done = true;
+        fw_restarts(&mut w.client.pipe.fw);
+        ensure!(w.late_event() == Some(LateEvent::ServerExit), "again");
+        block(w.run_to_fw_restart()).map_err(|_| "FW_INIT_DONE restart")?;
+
+        // The server never comes back: SERVER_TIMEOUT.
+        w.client.pipe.fw.ctrl(WLFW_SRV);
+        ensure!(w.late_event() == Some(LateEvent::ServerExit), "exit");
+        let e = block(w.run_to_fw_restart()).err().ok_or("must time out")?;
+        ensure!(e.step == step::SERVER_TIMEOUT, "SERVER_TIMEOUT");
+
+        // Back, but no FW_INIT_DONE / FW_READY after m3_info.
+        w.client.pipe.fw.s.init_done = false;
+        w.client.pipe.fw.mem_round = 0;
+        w.client.pipe.fw.counts.clear();
+        w.client.pipe.fw.ctrl(CtrlPkt::NewServer {
+            service: ATH11K_QMI_WLFW_SERVICE_ID_V01,
+            instance: 0x101,
+            node: DEV_NODE,
+            port: SRV_PORT,
+        });
+        let e = block(w.run_to_fw_restart()).err().ok_or("must time out")?;
+        ensure!(e.step == step::FW_READY_TIMEOUT, "FW_READY_TIMEOUT");
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_wlfw_server_exit_restart_handshake
+);
+
+fn smoke_wlfw_endpoint_reset_restart_handshake() -> TestResult {
+    run_test(|| {
+        // ath11k_core_reset's power cycle: the MHI endpoint goes away
+        // (its server is reported gone), the device boots again and says
+        // HELLO, the handshake reruns on the new link.
+        let (board, regdb, m3) = (elf_blob(100, 1), [3u8; 9], [1u8; 8]);
+        let (mut w, info) = ready_wlfw(&board, &regdb, &m3)?;
+        let next = w.client.next_txn_id();
+        // A stale FW_INIT_DONE from the dead firmware is dropped.
+        w.client.pipe.fw.ind(QMI_WLFW_FW_INIT_DONE_IND_V01, &[]);
+        w.client.pump();
+        w.endpoint_reset();
+        ensure!(w.client.server().is_none(), "server gone");
+        ensure!(!w.client.link().hello_seen(), "link waits for HELLO");
+        w.client.pipe.fw = FakeFw::new(Script::wcn6855());
+        block(w.run_to_fw_restart()).map_err(|_| "handshake on the new endpoint")?;
+        let fw = &w.client.pipe.fw;
+        let hello = encode_packet(
+            QRTR_TYPE_HELLO,
+            HOST_CTRL,
+            DEV_CTRL,
+            false,
+            &CtrlPkt::Hello.to_bytes(),
+        )
+        .unwrap();
+        ensure!(fw.ul.first() == Some(&hello), "HELLO answered first");
+        let want = expected_sequence_from(
+            next,
+            1,
+            &info.target_mem,
+            &regdb,
+            &board,
+            0xff,
+            info.m3_addr,
+            8,
+        );
+        ensure!(fw.reqs == want, "full handshake, next txn ids, cal_done 1");
+        ensure!(
+            w.client.server().map(|s| s.node) == Some(DEV_NODE),
+            "reconnected"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_wlfw_endpoint_reset_restart_handshake
+);
+
+fn smoke_wlfw_service_reports_notices() -> TestResult {
+    run_test(|| {
+        use super::core::{FwNotice, QmiFw};
+        let (board, regdb, m3) = (elf_blob(100, 1), [3u8; 9], [1u8; 8]);
+        let (mut w, _) = ready_wlfw(&board, &regdb, &m3)?;
+        ensure!(QmiFw::service(&mut w).is_none(), "nothing to report");
+        w.client.pipe.fw.ind(QMI_WLFW_FW_INIT_DONE_IND_V01, &[]);
+        ensure!(
+            QmiFw::service(&mut w) == Some(FwNotice::Restart),
+            "FW_INIT_DONE → Restart"
+        );
+        block(w.run_to_fw_restart()).map_err(|_| "consume")?;
+        w.client.pipe.fw.ctrl(WLFW_SRV);
+        ensure!(
+            QmiFw::service(&mut w) == Some(FwNotice::ServerExit),
+            "DEL_SERVER → ServerExit"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_wlfw_service_reports_notices
+);

@@ -579,6 +579,26 @@ impl QrtrLink {
         self.ctrl_frame(CtrlPkt::Hello)
     }
 
+    /// `qrtr_endpoint_unregister` (the MHI device went away): the local
+    /// name service sees the node's BYE (`ctrl_cmd_bye`), deletes every
+    /// server on it and tells each matching lookup (DEL_SERVER); the node
+    /// and its flow counters are freed. Lookups belong to the name
+    /// service and survive. A later endpoint starts over at the remote's
+    /// HELLO.
+    pub fn endpoint_reset(&mut self) -> Vec<QrtrEvent> {
+        let gone = core::mem::take(&mut self.servers);
+        let lookups = &self.lookups;
+        let events = gone
+            .into_iter()
+            .filter(|s| lookups.iter().any(|l| l.matches(s)))
+            .map(QrtrEvent::DelServer)
+            .collect();
+        self.remote_node = QRTR_EP_NID_AUTO;
+        self.hello_seen = false;
+        self.flows.clear();
+        events
+    }
+
     /// Register a lookup (`qmi_add_lookup` → local NEW_LOOKUP →
     /// `ctrl_cmd_new_lookup`). Local only: nothing goes on the wire.
     /// Returns a [`QrtrEvent::NewServer`] for each already-known

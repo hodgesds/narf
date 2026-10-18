@@ -280,6 +280,25 @@ impl<P: QrtrPipe> QmiClient<P> {
         }
     }
 
+    /// The MHI endpoint went away and a new one came up
+    /// (`qcom_mhi_qrtr_remove` → `qrtr_endpoint_unregister`, then
+    /// `qcom_mhi_qrtr_probe` after the power cycle): the lost server is
+    /// reported (`ops->del_server`), the outstanding transaction and any
+    /// unhandled inbound traffic from the dead firmware are dropped, and
+    /// the link waits for the device's HELLO again. The
+    /// QMI handle (port, lookups, transaction ids) is kept, as Linux keeps
+    /// `ab->qmi.handle`.
+    pub fn endpoint_reset(&mut self) {
+        // What the dead endpoint delivered is not handled.
+        self.inbox.clear();
+        self.pending_txn = None;
+        self.response = None;
+        for ev in self.link.endpoint_reset() {
+            self.on_event(ev);
+        }
+        self.server = None;
+    }
+
     /// Pop the oldest inbound item.
     pub fn take_inbound(&mut self) -> Option<Inbound> {
         self.inbox.pop_front()
