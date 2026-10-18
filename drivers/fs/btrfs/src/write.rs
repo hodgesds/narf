@@ -304,172 +304,12 @@ struct MetaRefId {
     ref_root: u64,
 }
 
-fn data_ref_hash(id: &DataRefId) -> u64 {
-    let mut high = !0u32;
-    let mut low = !0u32;
-    high = crate::checksum::crc32c(high, &id.ref_root.to_le_bytes());
-    low = crate::checksum::crc32c(low, &id.objectid.to_le_bytes());
-    low = crate::checksum::crc32c(low, &id.offset.to_le_bytes());
-    (u64::from(high) << 31) ^ u64::from(low)
-}
-
 fn inline_ref_size(kind: u8) -> Result<usize, FsError> {
     match kind {
         EXTENT_OWNER_REF_KEY | TREE_BLOCK_REF_KEY | 182 => Ok(9),
         EXTENT_DATA_REF_KEY => Ok(29),
         184 => Ok(13), // SHARED_DATA_REF
         _ => Err(FsError::Unsupported),
-    }
-}
-
-/// Apply one delayed tree-root reference delta to a skinny `METADATA_ITEM`.
-/// Inline tree refs are ordered by root id descending within their item type.
-fn update_meta_ref(body: &[u8], id: &MetaRefId, delta: i8) -> Result<Option<Vec<u8>>, FsError> {
-    if body.len() < 24 || le64(body, 16)? & EXTENT_FLAG_TREE_BLOCK == 0 || !matches!(delta, -1 | 1)
-    {
-        return Err(FsError::InvalidData);
-    }
-    let mut out = body.to_vec();
-    let mut pos = 24usize;
-    let mut found = None;
-    let mut insert_at = body.len();
-    while pos < body.len() {
-        let kind = body[pos];
-        let size = inline_ref_size(kind)?;
-        let end = pos.checked_add(size).ok_or(FsError::InvalidData)?;
-        if end > body.len() {
-            return Err(FsError::InvalidData);
-        }
-        if delta > 0
-            && insert_at == body.len()
-            && (kind > TREE_BLOCK_REF_KEY
-                || (kind == TREE_BLOCK_REF_KEY && le64(body, pos + 1)? < id.ref_root))
-        {
-            insert_at = pos;
-        }
-        if kind == TREE_BLOCK_REF_KEY && le64(body, pos + 1)? == id.ref_root {
-            found = Some((pos, size));
-            break;
-        }
-        pos = end;
-    }
-
-    let refs = le64(body, 0)?;
-    if delta > 0 {
-        if found.is_some() {
-            return Err(FsError::InvalidData);
-        }
-        let mut entry = alloc::vec![0u8; 9];
-        entry[0] = TREE_BLOCK_REF_KEY;
-        entry[1..9].copy_from_slice(&id.ref_root.to_le_bytes());
-        out.splice(insert_at..insert_at, entry);
-        out[0..8].copy_from_slice(
-            &refs
-                .checked_add(1)
-                .ok_or(FsError::InvalidData)?
-                .to_le_bytes(),
-        );
-        Ok(Some(out))
-    } else {
-        let (at, size) = found.ok_or(FsError::InvalidData)?;
-        if refs == 0 {
-            return Err(FsError::InvalidData);
-        }
-        out.drain(at..at + size);
-        if refs == 1 {
-            Ok(None)
-        } else {
-            out[0..8].copy_from_slice(&(refs - 1).to_le_bytes());
-            Ok(Some(out))
-        }
-    }
-}
-
-/// Apply one delayed data-ref delta to an `EXTENT_ITEM`. Returns `None` when
-/// the aggregate reference count reaches zero and the physical extent can be
-/// reclaimed. Inline refs retain the kernel-required ordering: type ascending,
-/// then data-ref hash descending.
-fn update_data_ref(body: &[u8], id: &DataRefId, delta: i8) -> Result<Option<Vec<u8>>, FsError> {
-    if body.len() < 24 || le64(body, 16)? & EXTENT_FLAG_DATA == 0 || !matches!(delta, -1 | 1) {
-        return Err(FsError::InvalidData);
-    }
-    let mut out = body.to_vec();
-    let mut pos = 24usize;
-    let mut found: Option<(usize, usize, u32)> = None;
-    let mut insert_at = body.len();
-    let wanted_hash = data_ref_hash(id);
-    while pos < body.len() {
-        let kind = body[pos];
-        let size = inline_ref_size(kind)?;
-        let end = pos.checked_add(size).ok_or(FsError::InvalidData)?;
-        if end > body.len() {
-            return Err(FsError::InvalidData);
-        }
-        if delta > 0 && insert_at == body.len() {
-            if kind > EXTENT_DATA_REF_KEY {
-                insert_at = pos;
-            } else if kind == EXTENT_DATA_REF_KEY {
-                let existing = DataRefId {
-                    bytenr: id.bytenr,
-                    len: id.len,
-                    ref_root: le64(body, pos + 1)?,
-                    objectid: le64(body, pos + 9)?,
-                    offset: le64(body, pos + 17)?,
-                };
-                if data_ref_hash(&existing) < wanted_hash {
-                    insert_at = pos;
-                }
-            }
-        }
-        if kind == EXTENT_DATA_REF_KEY
-            && le64(body, pos + 1)? == id.ref_root
-            && le64(body, pos + 9)? == id.objectid
-            && le64(body, pos + 17)? == id.offset
-        {
-            found = Some((pos, size, format::le32(body, pos + 25)?));
-            break;
-        }
-        pos = end;
-    }
-
-    let refs = le64(body, 0)?;
-    if delta > 0 {
-        if let Some((at, _, count)) = found {
-            let next = count.checked_add(1).ok_or(FsError::InvalidData)?;
-            out[at + 25..at + 29].copy_from_slice(&next.to_le_bytes());
-        } else {
-            let mut entry = alloc::vec![0u8; 29];
-            entry[0] = EXTENT_DATA_REF_KEY;
-            entry[1..9].copy_from_slice(&id.ref_root.to_le_bytes());
-            entry[9..17].copy_from_slice(&id.objectid.to_le_bytes());
-            entry[17..25].copy_from_slice(&id.offset.to_le_bytes());
-            entry[25..29].copy_from_slice(&1u32.to_le_bytes());
-            out.splice(insert_at..insert_at, entry);
-        }
-        out[0..8].copy_from_slice(
-            &refs
-                .checked_add(1)
-                .ok_or(FsError::InvalidData)?
-                .to_le_bytes(),
-        );
-        Ok(Some(out))
-    } else {
-        let (at, size, count) = found.ok_or(FsError::Unsupported)?;
-        if refs == 0 || count == 0 {
-            return Err(FsError::InvalidData);
-        }
-        if count > 1 {
-            out[at + 25..at + 29].copy_from_slice(&(count - 1).to_le_bytes());
-        } else {
-            out.drain(at..at + size);
-        }
-        let remaining = refs - 1;
-        if remaining == 0 {
-            Ok(None)
-        } else {
-            out[0..8].copy_from_slice(&remaining.to_le_bytes());
-            Ok(Some(out))
-        }
     }
 }
 
@@ -1270,6 +1110,7 @@ fn fs_commit_from(out: CowOut, gen: u64, csum_type: u16) -> Result<FsCommit, FsE
         freed: out.freed,
         root: out.root_addr,
         level: out.root_level,
+        refs: out.refs,
     })
 }
 
@@ -1401,7 +1242,10 @@ async fn batch_begin<'a, B: BlockDevice + 'static>(
             .checked_add(1)
             .ok_or(FsError::InvalidData)?;
         let (fs_root, fs_level) = vol.fs_tree_root();
-        let cow = PathCow::new(vol, gen, fs_root, fs_level).await?.suspend().0;
+        let cow = PathCow::new_shared(vol, gen, fs_root, fs_level, vol.fs_tree_id())
+            .await?
+            .suspend()
+            .0;
         *guard = Some(FsBatch {
             gen,
             tree_id: vol.fs_tree_id(),
@@ -1842,6 +1686,7 @@ async fn commit_batch_inner<B: BlockDevice + 'static>(
                 freed: out.freed,
                 root: out.root_addr,
                 level: out.root_level,
+                refs: out.refs,
             },
             dropped_data: batch.dropped_data,
             added_data: batch.added_data,
@@ -1950,12 +1795,16 @@ pub(crate) struct DataRef {
 
 /// A path-COWed tree: the new nodes to write (addr, stamped buffer), the new and
 /// freed blocks (addr, level) for extent accounting, and the new root.
+#[derive(Default)]
 pub(crate) struct FsCommit {
     pub nodes: Vec<(u64, Vec<u8>)>,
     pub new_blocks: Vec<(u64, u8)>,
     pub freed: Vec<(u64, u8)>,
     pub root: u64,
     pub level: u8,
+    /// Reference changes of a snapshot-aware subvolume COW (see
+    /// [`crate::backref`]); empty for every other tree.
+    pub refs: crate::backref::RefOverlay,
 }
 
 /// A second tree created or path-COWed by the same transaction as the mounted
@@ -2058,6 +1907,7 @@ pub(crate) async fn set_subvol_flags<B: BlockDevice + 'static>(
                 freed: Vec::new(),
                 root,
                 level,
+                refs: Default::default(),
             },
             dropped_data: Vec::new(),
             added_data: Vec::new(),
@@ -2297,6 +2147,8 @@ pub(crate) struct CowOut {
     pub root_level: u8,
     pub nodes: Vec<(u64, Vec<u8>, u8)>, // (addr, buf, level)
     pub freed: Vec<(u64, u8)>,          // (addr, level) — committed blocks only
+    /// Reference changes of a subvolume tree's snapshot-aware COW.
+    pub refs: crate::backref::RefOverlay,
 }
 
 /// A path-COW suspended between the operations of one batched transaction.
@@ -2329,6 +2181,25 @@ pub(crate) struct CowState {
     freed: Vec<(u64, u8)>,
     root: u64,
     root_level: u8,
+    /// Set for a reference-counted (subvolume) tree: its blocks may be shared
+    /// with snapshots, so every committed block's COW follows Linux
+    /// `update_ref_for_cow`.
+    shared: Option<SharedCow>,
+}
+
+/// Snapshot-aware COW state of one subvolume tree (see [`crate::backref`]).
+#[derive(Clone, Debug)]
+pub(crate) struct SharedCow {
+    /// The subvolume tree's id: the root every reference it adds names, and
+    /// the owner stamped into every block it writes.
+    tree_id: u64,
+    /// The committed extent tree the reference state is read from.
+    extent_root: u64,
+    /// Reference changes made so far.
+    refs: crate::backref::RefOverlay,
+    /// Committed blocks already passed through `update_ref_for_cow`, with
+    /// whether this tree held their last reference (and so frees them).
+    decided: BTreeMap<u64, bool>,
 }
 
 impl CowState {
@@ -2359,6 +2230,7 @@ impl CowState {
             root_level: self.root_level,
             nodes,
             freed: self.freed,
+            refs: self.shared.map(|shared| shared.refs).unwrap_or_default(),
         }
     }
 }
@@ -2393,8 +2265,144 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
                 freed: Vec::new(),
                 root,
                 root_level,
+                shared: None,
             },
         })
+    }
+
+    /// [`Self::new`] for subvolume tree `tree_id`, whose blocks may be shared
+    /// with snapshots: every committed block it COWs goes through
+    /// [`Self::update_ref_for_cow`], and every block it writes is stamped as
+    /// owned by `tree_id` with the relocation flag cleared (Linux
+    /// `btrfs_force_cow_block`).
+    pub(crate) async fn new_shared(
+        vol: &'a BtrfsVolume<B>,
+        gen: u64,
+        root: u64,
+        root_level: u8,
+        tree_id: u64,
+    ) -> Result<Self, FsError> {
+        let mut cow = Self::new(vol, gen, root, root_level).await?;
+        let (root_tree, _) = vol.root_tree_root();
+        let (extent_root, _) =
+            roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID).await?;
+        normalize_cow_header(&mut cow.state.header, tree_id);
+        cow.state.shared = Some(SharedCow {
+            tree_id,
+            extent_root,
+            refs: crate::backref::RefOverlay::default(),
+            decided: BTreeMap::new(),
+        });
+        Ok(cow)
+    }
+
+    /// Linux `update_ref_for_cow` + `btrfs_free_tree_block` for the
+    /// committed block `addr` (contents `buf`) this tree is about to COW,
+    /// decided before the descent reaches its children so their reference
+    /// counts already include whatever this adds. Records whether this tree
+    /// held the last reference, i.e. whether the COW frees the block.
+    async fn update_ref_for_cow(
+        &mut self,
+        addr: u64,
+        buf: &[u8],
+        is_root: bool,
+    ) -> Result<(), FsError> {
+        use crate::backref::{child_refs, Dropped, RefKind, Target, BLOCK_FLAG_FULL_BACKREF};
+        let vol = self.vol;
+        let Some(shared) = self.state.shared.as_mut() else {
+            return Ok(());
+        };
+        if shared.decided.contains_key(&addr) {
+            return Ok(());
+        }
+        let ext = shared.extent_root;
+        let root = shared.tree_id;
+        let lvl = level(buf)?;
+        let me = Target::TreeBlock {
+            bytenr: addr,
+            level: lvl,
+        };
+        let (refs, flags) = shared.refs.info(vol, ext, me).await?;
+        let hflags = le64(buf, HDR_FLAGS)?;
+        let owner = le64(buf, HDR_OWNER)?;
+        if refs == 0 || hflags >> 56 < MIXED_BACKREF_REV {
+            return Err(FsError::Unsupported);
+        }
+        if owner == TREE_RELOC_OBJECTID && flags & BLOCK_FLAG_FULL_BACKREF == 0 {
+            return Err(FsError::InvalidData);
+        }
+        // Linux never shares a subvolume's root block (snapshots copy it);
+        // NARF's own shared roots are privatised before any COW.
+        if is_root && refs != 1 {
+            return Err(FsError::Unsupported);
+        }
+        let full = flags & BLOCK_FLAG_FULL_BACKREF != 0;
+        let last_ref = if refs > 1 {
+            if owner == root && !full {
+                // This tree owns the shared block: the other holders keep it,
+                // reached through refs that now name it as their parent.
+                for (target, kind) in child_refs(buf, addr, root, true)? {
+                    shared.refs.add(vol, ext, target, kind).await?;
+                }
+                shared.refs.set_full_backref(vol, ext, addr, lvl).await?;
+            } else {
+                // Someone else's (or already FULL_BACKREF) block: the COW
+                // takes references of its own on every child.
+                for (target, kind) in child_refs(buf, addr, root, false)? {
+                    shared.refs.add(vol, ext, target, kind).await?;
+                }
+            }
+            false
+        } else {
+            if full {
+                // Last holder of a FULL_BACKREF block: move the children's
+                // parent refs onto the COW as tree refs.
+                for (target, kind) in child_refs(buf, addr, root, false)? {
+                    shared.refs.add(vol, ext, target, kind).await?;
+                }
+                for (target, kind) in child_refs(buf, addr, root, true)? {
+                    shared.refs.drop_ref(vol, ext, target, kind).await?;
+                }
+                shared.refs.full_released.insert(addr);
+            }
+            true
+        };
+        // `btrfs_free_tree_block`: drop this tree's reference to the block.
+        let body = shared.refs.body(vol, ext, me).await?;
+        match shared
+            .refs
+            .drop_ref(vol, ext, me, RefKind::Tree { root })
+            .await?
+        {
+            Dropped::Last if last_ref => {
+                // The commit's freed-block path deletes the item and returns
+                // the space; keep the pre-free state for its audit.
+                shared.refs.freed_bodies.insert(addr, body);
+                shared.refs.forget(&BtrfsKey::new(
+                    addr,
+                    format::METADATA_ITEM_KEY,
+                    u64::from(lvl),
+                ));
+            }
+            Dropped::Remaining if !last_ref => {}
+            _ => return Err(FsError::InvalidData),
+        }
+        shared.decided.insert(addr, last_ref);
+        Ok(())
+    }
+
+    /// Whether replacing committed block `addr` frees it: always for an
+    /// unshared tree, and for a subvolume tree only when
+    /// [`Self::update_ref_for_cow`] found this tree held the last reference.
+    fn frees_committed(&self, addr: u64) -> Result<bool, FsError> {
+        match &self.state.shared {
+            None => Ok(true),
+            Some(shared) => shared
+                .decided
+                .get(&addr)
+                .copied()
+                .ok_or(FsError::InvalidData),
+        }
     }
 
     /// Continue a COW suspended by [`Self::suspend`], against the same volume
@@ -2442,20 +2450,31 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
 
     /// Retire the block at `addr`: if it was made this txn, drop it (never
     /// committed); otherwise record it as a freed committed block.
-    fn retire(&mut self, addr: u64, level: u8) {
+    fn retire(&mut self, addr: u64, level: u8) -> Result<(), FsError> {
         self.state.sealed.remove(&addr);
         if self.state.pending.remove(&addr).is_none() {
-            self.state.freed.push((addr, level));
+            if self.frees_committed(addr)? {
+                self.state.freed.push((addr, level));
+            }
         } else {
             // Made this txn and now dropped. It must not be written out, and if
             // an earlier operation of the batch already wrote it, those bytes
             // are unreferenced garbage no committed tree points at.
             self.state.dirty.remove(&addr);
         }
+        Ok(())
     }
 
     /// Allocate + cache a new node, returning its address.
-    fn store(&mut self, alloc: &mut Allocator, buf: Vec<u8>, level: u8) -> Result<u64, FsError> {
+    fn store(
+        &mut self,
+        alloc: &mut Allocator,
+        mut buf: Vec<u8>,
+        level: u8,
+    ) -> Result<u64, FsError> {
+        if let Some(shared) = &self.state.shared {
+            normalize_cow_header(&mut buf, shared.tree_id);
+        }
         let addr = alloc.alloc_node(self.vol)?;
         self.state
             .pending
@@ -2494,13 +2513,16 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
         level: u8,
     ) -> Result<Vec<(BtrfsKey, u64, u64)>, FsError> {
         if bufs.len() == 1 && nritems(&bufs[0])? == 0 && (self.state.root_level > 0 || level > 0) {
-            self.retire(old_addr, level); // an emptied non-root node: drop it
+            self.retire(old_addr, level)?; // an emptied non-root node: drop it
             return Ok(Vec::new());
         }
         let in_batch = self.state.pending.contains_key(&old_addr);
         let reuse = in_batch && !self.state.sealed.contains(&old_addr);
         let mut ptrs = Vec::with_capacity(bufs.len());
-        for (i, buf) in bufs.into_iter().enumerate() {
+        for (i, mut buf) in bufs.into_iter().enumerate() {
+            if let Some(shared) = &self.state.shared {
+                normalize_cow_header(&mut buf, shared.tree_id);
+            }
             let key = Self::first_key(&buf)?;
             let addr = if i == 0 && reuse {
                 self.state
@@ -2515,8 +2537,8 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
         }
         if in_batch && !reuse {
             // A published batch block: replaced, never committed, not freed.
-            self.retire(old_addr, level);
-        } else if !reuse {
+            self.retire(old_addr, level)?;
+        } else if !reuse && self.frees_committed(old_addr)? {
             self.state.freed.push((old_addr, level)); // a committed block is replaced
         }
         Ok(ptrs)
@@ -2542,6 +2564,12 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
         let mut addr = self.state.root;
         let leaf = loop {
             let buf = self.read(addr).await?;
+            // Every committed block on the path is about to be COWed: settle
+            // its references before its children's are looked at.
+            if !self.state.pending.contains_key(&addr) {
+                let is_root = addr == self.state.root;
+                self.update_ref_for_cow(addr, &buf, is_root).await?;
+            }
             if level(&buf)? == 0 {
                 break buf;
             }
@@ -2593,7 +2621,7 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
         while let Some((paddr, plevel, mut ptrs, slot)) = path.pop() {
             ptrs.splice(slot..=slot, cur_ptrs.iter().copied());
             if ptrs.is_empty() {
-                self.retire(paddr, plevel); // this node emptied out
+                self.retire(paddr, plevel)?; // this node emptied out
                 cur_ptrs = Vec::new();
                 continue;
             }
@@ -2627,7 +2655,7 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
                 break;
             }
             let child = internal_blockptr(&buf, 0)?;
-            self.retire(root, root_level);
+            self.retire(root, root_level)?;
             root = child;
             root_level -= 1;
         }
@@ -3109,6 +3137,7 @@ async fn ensure_private_subvol<B: BlockDevice + 'static>(
                 freed: Vec::new(),
                 root: new_root,
                 level: new_level,
+                refs: Default::default(),
             },
             dropped_data,
             added_data,
@@ -3137,6 +3166,21 @@ const HEADER_FLAG_RELOC: u64 = 1 << 1;
 const MIXED_BACKREF_REV: u64 = 1;
 /// `BTRFS_TREE_RELOC_OBJECTID`.
 const TREE_RELOC_OBJECTID: u64 = (-8i64) as u64;
+
+/// Stamp a block a subvolume tree's COW writes as Linux `btrfs_force_cow_block`
+/// does: owned by `tree_id`, mixed backref revision, relocation (and written)
+/// flags cleared. The flags word is otherwise copied from whatever block the
+/// buffer was cut from, which may be another tree's or a relocated one.
+fn normalize_cow_header(buf: &mut [u8], tree_id: u64) {
+    if buf.len() < HEADER_SIZE {
+        return;
+    }
+    // WRITTEN is set on every node Linux writes; keep NARF's nodes looking
+    // the same as before this normalisation.
+    let flags = (MIXED_BACKREF_REV << 56) | 1;
+    buf[HDR_FLAGS..HDR_FLAGS + 8].copy_from_slice(&flags.to_le_bytes());
+    buf[HDR_OWNER..HDR_OWNER + 8].copy_from_slice(&tree_id.to_le_bytes());
+}
 
 /// Whether the committed tree block described by `body` (its extent item,
 /// skinny or not) and `header` (its node header) may be freed outright: it is
@@ -3442,132 +3486,122 @@ struct MetaChanges {
     released: Vec<(u64, u8)>,
 }
 
-async fn resolve_meta_changes<B: BlockDevice + 'static>(
-    vol: &BtrfsVolume<B>,
-    extent_root: u64,
-    txn: &Txn,
-) -> Result<MetaChanges, FsError> {
-    let mut bodies: BTreeMap<(u64, u8), Option<Vec<u8>>> = BTreeMap::new();
-    for (id, delta) in txn
-        .added_meta
-        .iter()
-        .map(|id| (id, 1i8))
-        .chain(txn.dropped_meta.iter().map(|id| (id, -1i8)))
-    {
-        let id = *id;
-        let key = (id.bytenr, id.level);
-        if let alloc::collections::btree_map::Entry::Vacant(entry) = bodies.entry(key) {
-            let body = btree::find_item(
-                vol,
-                extent_root,
-                &BtrfsKey::new(id.bytenr, format::METADATA_ITEM_KEY, u64::from(id.level)),
-            )
-            .await?
-            .ok_or(FsError::InvalidData)?;
-            entry.insert(Some(body));
-        }
-        let current = bodies
-            .get(&key)
-            .and_then(Option::as_deref)
-            .ok_or(FsError::InvalidData)?;
-        let next = update_meta_ref(current, &id, delta)?;
-        bodies.insert(key, next);
-    }
-
-    let mut edits = Vec::with_capacity(bodies.len());
-    let mut released = Vec::new();
-    for ((bytenr, level), body) in bodies {
-        match body {
-            Some(body) => edits.push(Edit::Upsert(
-                BtrfsKey::new(bytenr, format::METADATA_ITEM_KEY, u64::from(level)),
-                body,
-            )),
-            None => released.push((bytenr, level)),
-        }
-    }
-    Ok(MetaChanges { edits, released })
-}
-
-/// Resolve one transaction's delayed data-reference adds/drops against the
-/// current extent tree. The result separates logical ref edits from physical
-/// allocation changes, which is what prevents a shared extent from being freed
-/// while another snapshot still references it.
-async fn resolve_data_changes<B: BlockDevice + 'static>(
+/// Resolve one transaction's reference changes against the committed extent
+/// tree, through one [`crate::backref::RefOverlay`]: first what the
+/// transaction's snapshot-aware subvolume COWs already changed
+/// (`update_ref_for_cow`), then the new data extents, then every operation's
+/// delayed reference additions, then its drops — Linux runs a head's adds
+/// before its drops so a count never passes through zero on the way.
+///
+/// The result separates logical ref edits from physical allocation changes,
+/// which is what prevents a shared extent from being freed while another
+/// snapshot (or reflink) still references it: a drop frees an extent only
+/// when its last reference, inline or keyed, is gone. Also returns the COWs'
+/// own overlay, for the pre-write audit of the blocks they free.
+async fn resolve_ref_changes<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     extent_root: u64,
     txn: &Txn,
     gen: u64,
     simple_quota: bool,
-) -> Result<DataChanges, FsError> {
-    let mut bodies: BTreeMap<(u64, u64), Option<Vec<u8>>> = BTreeMap::new();
+) -> Result<(MetaChanges, DataChanges, crate::backref::RefOverlay), FsError> {
+    use crate::backref::{Dropped, RefKind, Target};
+    let mut ov = txn.fs.refs.clone();
+    for tree in &txn.extra_trees {
+        ov.merge(&tree.commit.refs)?;
+    }
+    let audit = ov.clone();
     let mut allocated = Vec::new();
     for data in &txn.new_data {
         let id = data.id;
-        if bodies
-            .insert(
-                (id.bytenr, id.len),
-                Some(ext_item_data(
-                    gen,
-                    id.ref_root,
-                    id.objectid,
-                    id.offset,
-                    simple_quota,
-                )),
-            )
-            .is_some()
-        {
-            return Err(FsError::InvalidData);
-        }
+        ov.insert_new(
+            BtrfsKey::new(id.bytenr, format::EXTENT_ITEM_KEY, id.len),
+            ext_item_data(gen, id.ref_root, id.objectid, id.offset, simple_quota),
+        )?;
         allocated.push((id.bytenr, id.len));
     }
-
-    for (id, delta) in txn
-        .added_data
-        .iter()
-        .map(|id| (id, 1i8))
-        .chain(txn.dropped_data.iter().map(|id| (id, -1i8)))
-    {
-        let id = *id;
-        let key = (id.bytenr, id.len);
-        if let alloc::collections::btree_map::Entry::Vacant(entry) = bodies.entry(key) {
-            let body = btree::find_item(
+    let data_target = |id: &DataRefId| Target::Data {
+        bytenr: id.bytenr,
+        len: id.len,
+    };
+    let data_kind = |id: &DataRefId| RefKind::Data {
+        root: id.ref_root,
+        objectid: id.objectid,
+        offset: id.offset,
+    };
+    for id in &txn.added_data {
+        ov.add(vol, extent_root, data_target(id), data_kind(id))
+            .await?;
+    }
+    let mut released = Vec::new();
+    for id in &txn.dropped_data {
+        if ov
+            .drop_ref(vol, extent_root, data_target(id), data_kind(id))
+            .await?
+            == Dropped::Last
+        {
+            released.push((id.bytenr, id.len));
+        }
+    }
+    let meta_target = |id: &MetaRefId| Target::TreeBlock {
+        bytenr: id.bytenr,
+        level: id.level,
+    };
+    for id in &txn.added_meta {
+        ov.add(
+            vol,
+            extent_root,
+            meta_target(id),
+            RefKind::Tree { root: id.ref_root },
+        )
+        .await?;
+    }
+    let mut meta_released = Vec::new();
+    for id in &txn.dropped_meta {
+        if ov
+            .drop_ref(
                 vol,
                 extent_root,
-                &BtrfsKey::new(id.bytenr, format::EXTENT_ITEM_KEY, id.len),
+                meta_target(id),
+                RefKind::Tree { root: id.ref_root },
             )
             .await?
-            .ok_or(FsError::InvalidData)?;
-            entry.insert(Some(body));
-        }
-        let current = bodies
-            .get(&key)
-            .and_then(Option::as_deref)
-            .ok_or(FsError::InvalidData)?;
-        let next = update_data_ref(current, &id, delta)?;
-        bodies.insert(key, next);
-    }
-
-    let mut edits = Vec::with_capacity(bodies.len());
-    let mut released = Vec::new();
-    for ((bytenr, len), body) in bodies {
-        let key = BtrfsKey::new(bytenr, format::EXTENT_ITEM_KEY, len);
-        match body {
-            Some(body) => edits.push(Edit::Upsert(key, body)),
-            None => {
-                edits.push(Edit::Delete(key));
-                released.push((bytenr, len));
-            }
+            == Dropped::Last
+        {
+            // The freed-block path deletes the item and returns the space.
+            ov.forget(&BtrfsKey::new(
+                id.bytenr,
+                format::METADATA_ITEM_KEY,
+                u64::from(id.level),
+            ));
+            meta_released.push((id.bytenr, id.level));
         }
     }
-    Ok(DataChanges {
-        edits,
-        allocated,
-        released,
-    })
+    let edits = ov
+        .edits()
+        .map(|(key, body)| match body {
+            Some(body) => Edit::Upsert(*key, body.clone()),
+            None => Edit::Delete(*key),
+        })
+        .collect();
+    Ok((
+        MetaChanges {
+            edits: Vec::new(),
+            released: meta_released,
+        },
+        DataChanges {
+            edits,
+            allocated,
+            released,
+        },
+        audit,
+    ))
 }
 
 const QGROUP_STATUS_ON: u64 = 1;
 const QGROUP_STATUS_SIMPLE_MODE: u64 = 1 << 3;
+const QGROUP_STATUS_RESCAN: u64 = 1 << 1;
+const QGROUP_STATUS_INCONSISTENT: u64 = 1 << 2;
 const QGROUP_INHERIT_SET_LIMITS: u64 = 1;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -3717,6 +3751,10 @@ fn stamp_root_item_fields(
     let mut item = leaf_item_data(root_logical, slot)?.to_vec();
     if item.len() < 239 {
         return Err(FsError::InvalidData);
+    }
+    // An unmoved root keeps its generation (see `commit_txn`).
+    if le64(&item, 176)? == bytenr {
+        return Ok(());
     }
     // An unmoved root keeps its generation (see `commit_txn`).
     if le64(&item, 176)? == bytenr {
@@ -4186,130 +4224,148 @@ async fn prepare_quota_tree<B: BlockDevice + 'static>(
         }
     }
 
-    let mut usage: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
-    if simple_mode {
-        for &owner in change.simple_deltas.keys() {
-            if !qgroup_ids.contains(&owner) || owner >> 48 != 0 {
-                return Err(FsError::InvalidData);
+    // Full (non-simple) qgroups are recounted here by walking every
+    // subvolume tree. On a production root with dozens of snapshots that is
+    // the whole metadata of every snapshot per commit, and it would still not
+    // count shared blocks as Linux does. Under `narf.disks=root-rw` the
+    // commit instead marks the qgroups inconsistent with a rescan pending
+    // from the start (Linux `BTRFS_QGROUP_STATUS_FLAG_INCONSISTENT |
+    // _RESCAN`, progress 0): the next Linux mount rescans them itself, and
+    // nothing NARF records is ever wrong.
+    let defer_rescan =
+        !simple_mode && crate::rw_gate::active_profile() == crate::rw_gate::Profile::RootRw;
+    if defer_rescan {
+        status[8..16].copy_from_slice(&gen.to_le_bytes());
+        let flags = QGROUP_STATUS_ON | QGROUP_STATUS_INCONSISTENT | QGROUP_STATUS_RESCAN;
+        status[16..24].copy_from_slice(&flags.to_le_bytes());
+        status[24..32].copy_from_slice(&0u64.to_le_bytes());
+        apply_logical_edits(&mut quota, &[Edit::Upsert(status_key, status)])?;
+    } else {
+        let mut usage: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+        if simple_mode {
+            for &owner in change.simple_deltas.keys() {
+                if !qgroup_ids.contains(&owner) || owner >> 48 != 0 {
+                    return Err(FsError::InvalidData);
+                }
             }
-        }
-        for &id in qgroup_ids.iter().filter(|id| **id >> 48 == 0) {
-            let info_slot = leaf_find(&quota, &BtrfsKey::new(0, format::QGROUP_INFO_KEY, id))?
-                .ok_or(FsError::InvalidData)?;
-            let info = leaf_item_data(&quota, info_slot)?;
-            if info.len() != 40 {
-                return Err(FsError::InvalidData);
-            }
-            let current = le64(info, 8)?;
-            if le64(info, 24)? != current {
-                return Err(FsError::InvalidData);
-            }
-            let next = i128::from(current)
-                .checked_add(*change.simple_deltas.get(&id).unwrap_or(&0))
-                .and_then(|value| u64::try_from(value).ok())
-                .ok_or(FsError::InvalidData)?;
-            usage.insert(id, (next, next));
-        }
-        for &id in qgroup_ids.iter().filter(|id| **id >> 48 != 0) {
-            let mut total = 0u64;
-            for member in members.get(&id).into_iter().flatten() {
-                total = total
-                    .checked_add(usage.get(member).map_or(0, |value| value.0))
+            for &id in qgroup_ids.iter().filter(|id| **id >> 48 == 0) {
+                let info_slot = leaf_find(&quota, &BtrfsKey::new(0, format::QGROUP_INFO_KEY, id))?
                     .ok_or(FsError::InvalidData)?;
+                let info = leaf_item_data(&quota, info_slot)?;
+                if info.len() != 40 {
+                    return Err(FsError::InvalidData);
+                }
+                let current = le64(info, 8)?;
+                if le64(info, 24)? != current {
+                    return Err(FsError::InvalidData);
+                }
+                let next = i128::from(current)
+                    .checked_add(*change.simple_deltas.get(&id).unwrap_or(&0))
+                    .and_then(|value| u64::try_from(value).ok())
+                    .ok_or(FsError::InvalidData)?;
+                usage.insert(id, (next, next));
             }
-            usage.insert(id, (total, total));
-        }
+            for &id in qgroup_ids.iter().filter(|id| **id >> 48 != 0) {
+                let mut total = 0u64;
+                for member in members.get(&id).into_iter().flatten() {
+                    total = total
+                        .checked_add(usage.get(member).map_or(0, |value| value.0))
+                        .ok_or(FsError::InvalidData)?;
+                }
+                usage.insert(id, (total, total));
+            }
 
-        if let Some(id) = change.delete {
-            if usage.get(&id).copied() == Some((0, 0)) {
-                let mut delete_edits = alloc::vec![
-                    Edit::Delete(BtrfsKey::new(0, format::QGROUP_INFO_KEY, id)),
-                    Edit::Delete(BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id)),
-                ];
-                for slot in 0..nritems(&quota)? as usize {
-                    let key = leaf_item_key(&quota, slot)?;
-                    if key.item_type == format::QGROUP_RELATION_KEY
-                        && (key.objectid == id || key.offset == id)
-                    {
-                        delete_edits.push(Edit::Delete(key));
+            if let Some(id) = change.delete {
+                if usage.get(&id).copied() == Some((0, 0)) {
+                    let mut delete_edits = alloc::vec![
+                        Edit::Delete(BtrfsKey::new(0, format::QGROUP_INFO_KEY, id)),
+                        Edit::Delete(BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id)),
+                    ];
+                    for slot in 0..nritems(&quota)? as usize {
+                        let key = leaf_item_key(&quota, slot)?;
+                        if key.item_type == format::QGROUP_RELATION_KEY
+                            && (key.objectid == id || key.offset == id)
+                        {
+                            delete_edits.push(Edit::Delete(key));
+                        }
+                    }
+                    apply_logical_edits(&mut quota, &delete_edits)?;
+                    qgroup_ids.retain(|candidate| *candidate != id);
+                    usage.remove(&id);
+                }
+            }
+        } else {
+            let mut root_extents: BTreeMap<u64, BTreeSet<(u64, u64)>> = BTreeMap::new();
+            for &id in qgroup_ids.iter().filter(|id| **id >> 48 == 0) {
+                let slot = leaf_find_by_type(change.root_logical, id, format::ROOT_ITEM_KEY)?
+                    .ok_or(FsError::InvalidData)?;
+                let root_item = leaf_item_data(change.root_logical, slot)?;
+                let root = le64(root_item, 176)?;
+                root_extents.insert(id, qgroup_root_extents(vol, change.pending, root).await?);
+            }
+            let mut extent_refs: BTreeMap<(u64, u64), BTreeSet<u64>> = BTreeMap::new();
+            for (&root_id, extents) in &root_extents {
+                for &extent in extents {
+                    extent_refs.entry(extent).or_default().insert(root_id);
+                }
+            }
+            for &id in &qgroup_ids {
+                let group_members = members.get(&id).cloned().unwrap_or_default();
+                let mut referenced = 0u64;
+                let mut exclusive = 0u64;
+                for (&(_bytenr, len), refs) in &extent_refs {
+                    if refs.is_disjoint(&group_members) {
+                        continue;
+                    }
+                    referenced = referenced.checked_add(len).ok_or(FsError::InvalidData)?;
+                    if refs.is_subset(&group_members) {
+                        exclusive = exclusive.checked_add(len).ok_or(FsError::InvalidData)?;
                     }
                 }
-                apply_logical_edits(&mut quota, &delete_edits)?;
-                qgroup_ids.retain(|candidate| *candidate != id);
-                usage.remove(&id);
+                usage.insert(id, (referenced, exclusive));
             }
         }
-    } else {
-        let mut root_extents: BTreeMap<u64, BTreeSet<(u64, u64)>> = BTreeMap::new();
-        for &id in qgroup_ids.iter().filter(|id| **id >> 48 == 0) {
-            let slot = leaf_find_by_type(change.root_logical, id, format::ROOT_ITEM_KEY)?
-                .ok_or(FsError::InvalidData)?;
-            let root_item = leaf_item_data(change.root_logical, slot)?;
-            let root = le64(root_item, 176)?;
-            root_extents.insert(id, qgroup_root_extents(vol, change.pending, root).await?);
-        }
-        let mut extent_refs: BTreeMap<(u64, u64), BTreeSet<u64>> = BTreeMap::new();
-        for (&root_id, extents) in &root_extents {
-            for &extent in extents {
-                extent_refs.entry(extent).or_default().insert(root_id);
-            }
-        }
-        for &id in &qgroup_ids {
-            let group_members = members.get(&id).cloned().unwrap_or_default();
-            let mut referenced = 0u64;
-            let mut exclusive = 0u64;
-            for (&(_bytenr, len), refs) in &extent_refs {
-                if refs.is_disjoint(&group_members) {
-                    continue;
-                }
-                referenced = referenced.checked_add(len).ok_or(FsError::InvalidData)?;
-                if refs.is_subset(&group_members) {
-                    exclusive = exclusive.checked_add(len).ok_or(FsError::InvalidData)?;
-                }
-            }
-            usage.insert(id, (referenced, exclusive));
-        }
-    }
 
-    let mut info_edits = Vec::new();
-    for id in qgroup_ids {
-        let (referenced, exclusive) = usage.get(&id).copied().ok_or(FsError::InvalidData)?;
-        // The limit item is not consulted here — enforcement lives in
-        // `qgroup_reserve` — but its presence and shape are still an invariant
-        // of a well-formed quota tree, and this recount rewrites the tree that
-        // btrfs-progs will check.
-        let limit_key = BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id);
-        let limit_slot = leaf_find(&quota, &limit_key)?.ok_or(FsError::InvalidData)?;
-        if leaf_item_data(&quota, limit_slot)?.len() != 40 {
-            return Err(FsError::InvalidData);
+        let mut info_edits = Vec::new();
+        for id in qgroup_ids {
+            let (referenced, exclusive) = usage.get(&id).copied().ok_or(FsError::InvalidData)?;
+            // The limit item is not consulted here — enforcement lives in
+            // `qgroup_reserve` — but its presence and shape are still an invariant
+            // of a well-formed quota tree, and this recount rewrites the tree that
+            // btrfs-progs will check.
+            let limit_key = BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id);
+            let limit_slot = leaf_find(&quota, &limit_key)?.ok_or(FsError::InvalidData)?;
+            if leaf_item_data(&quota, limit_slot)?.len() != 40 {
+                return Err(FsError::InvalidData);
+            }
+            // Record the usage; do not judge it. Limits are enforced when space is
+            // reserved (`qgroup_reserve`), which is the only place Linux returns
+            // -EDQUOT from either. A commit that refused a limit could only refuse
+            // the whole transaction, which would make an over-quota write take
+            // down every operation batched with it, and would make a limit set
+            // below current usage impossible to record at all.
+            let mut info = alloc::vec![0u8; 40];
+            info[0..8].copy_from_slice(&gen.to_le_bytes());
+            info[8..16].copy_from_slice(&referenced.to_le_bytes());
+            info[16..24].copy_from_slice(&referenced.to_le_bytes());
+            info[24..32].copy_from_slice(&exclusive.to_le_bytes());
+            info[32..40].copy_from_slice(&exclusive.to_le_bytes());
+            info_edits.push(Edit::Upsert(
+                BtrfsKey::new(0, format::QGROUP_INFO_KEY, id),
+                info,
+            ));
         }
-        // Record the usage; do not judge it. Limits are enforced when space is
-        // reserved (`qgroup_reserve`), which is the only place Linux returns
-        // -EDQUOT from either. A commit that refused a limit could only refuse
-        // the whole transaction, which would make an over-quota write take
-        // down every operation batched with it, and would make a limit set
-        // below current usage impossible to record at all.
-        let mut info = alloc::vec![0u8; 40];
-        info[0..8].copy_from_slice(&gen.to_le_bytes());
-        info[8..16].copy_from_slice(&referenced.to_le_bytes());
-        info[16..24].copy_from_slice(&referenced.to_le_bytes());
-        info[24..32].copy_from_slice(&exclusive.to_le_bytes());
-        info[32..40].copy_from_slice(&exclusive.to_le_bytes());
-        info_edits.push(Edit::Upsert(
-            BtrfsKey::new(0, format::QGROUP_INFO_KEY, id),
-            info,
-        ));
+        status[8..16].copy_from_slice(&gen.to_le_bytes());
+        let committed_flags = QGROUP_STATUS_ON
+            | if simple_mode {
+                QGROUP_STATUS_SIMPLE_MODE
+            } else {
+                0
+            };
+        status[16..24].copy_from_slice(&committed_flags.to_le_bytes());
+        info_edits.push(Edit::Upsert(status_key, status));
+        apply_logical_edits(&mut quota, &info_edits)?;
     }
-    status[8..16].copy_from_slice(&gen.to_le_bytes());
-    let committed_flags = QGROUP_STATUS_ON
-        | if simple_mode {
-            QGROUP_STATUS_SIMPLE_MODE
-        } else {
-            0
-        };
-    status[16..24].copy_from_slice(&committed_flags.to_le_bytes());
-    info_edits.push(Edit::Upsert(status_key, status));
-    apply_logical_edits(&mut quota, &info_edits)?;
 
     let groups = group_items(vol, &quota)?;
     let addrs = alloc_nodes(alloc, vol, tree_block_count(groups.len(), vol.nodesize()))?;
@@ -4333,6 +4389,7 @@ async fn prepare_quota_tree<B: BlockDevice + 'static>(
             freed: old_blocks,
             root,
             level,
+            refs: Default::default(),
         },
     }))
 }
@@ -4345,6 +4402,7 @@ fn unchanged_fs_commit<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> FsComm
         freed: Vec::new(),
         root,
         level,
+        refs: Default::default(),
     }
 }
 
@@ -4552,6 +4610,7 @@ async fn quota_enable_mode<B: BlockDevice + 'static>(
                     freed: Vec::new(),
                     root: quota_tree_root,
                     level: quota_level,
+                    refs: Default::default(),
                 },
             }],
             root_edits: alloc::vec![Edit::Upsert(
@@ -4868,8 +4927,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
 
     let (old_ext, old_ext_level) =
         roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID).await?;
-    let meta_changes = resolve_meta_changes(vol, old_ext, &txn).await?;
-    let data_changes = resolve_data_changes(
+    let (meta_changes, data_changes, ref_audit) = resolve_ref_changes(
         vol,
         old_ext,
         &txn,
@@ -5368,8 +5426,8 @@ async fn commit_txn<B: BlockDevice + 'static>(
         vol,
         old_ext,
         &freed_meta,
-        &BTreeMap::new(),
-        &BTreeSet::new(),
+        &ref_audit.freed_bodies,
+        &ref_audit.full_released,
     )
     .await?;
 
@@ -5908,7 +5966,7 @@ pub(crate) async fn create_subvolume_with_qgroup<B: BlockDevice + 'static>(
             di,
         ),
     ];
-    let parent_out = PathCow::new(vol, gen, fs_root, fs_level)
+    let parent_out = PathCow::new_shared(vol, gen, fs_root, fs_level, vol.fs_tree_id())
         .await?
         .apply(&mut alloc, &parent_edits)
         .await?;
@@ -5975,6 +6033,7 @@ pub(crate) async fn create_subvolume_with_qgroup<B: BlockDevice + 'static>(
             freed: Vec::new(),
             root: child_addr,
             level: 0,
+            refs: Default::default(),
         },
     }];
 
@@ -6158,6 +6217,7 @@ pub(crate) async fn create_snapshot_with_qgroup<B: BlockDevice + 'static>(
                 freed: Vec::new(),
                 root,
                 level: root_level,
+                refs: Default::default(),
             },
             parent_added_data,
             alloc::vec![MetaRefId {
@@ -6172,7 +6232,7 @@ pub(crate) async fn create_snapshot_with_qgroup<B: BlockDevice + 'static>(
             }],
         )
     } else {
-        let parent_out = PathCow::new(vol, gen, fs_root, fs_level)
+        let parent_out = PathCow::new_shared(vol, gen, fs_root, fs_level, vol.fs_tree_id())
             .await?
             .apply(&mut alloc, &parent_edits)
             .await?;
@@ -6486,7 +6546,7 @@ pub(crate) async fn destroy_subvolume<B: BlockDevice + 'static>(
         },
         Edit::Delete(BtrfsKey::new(parent_ino, format::DIR_INDEX_KEY, dir_index,)),
     ];
-    let parent_out = PathCow::new(vol, gen, fs_root, fs_level)
+    let parent_out = PathCow::new_shared(vol, gen, fs_root, fs_level, vol.fs_tree_id())
         .await?
         .apply(&mut alloc, &parent_edits)
         .await?;

@@ -445,7 +445,7 @@ pub const SHARED_DATA_REF_KEY: u8 = 184;
 
 /// Whether the writer maintains Linux's shared-tree-block backrefs
 /// (`update_ref_for_cow`). Until it does, any sharing is refused here.
-pub const WRITER_HANDLES_SHARED_TREES: bool = false;
+pub const WRITER_HANDLES_SHARED_TREES: bool = true;
 
 fn is_fs_tree(id: u64) -> bool {
     id == format::FS_TREE_OBJECTID
@@ -588,6 +588,18 @@ pub async fn check_sharing<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Re
                 format::METADATA_ITEM_KEY | format::EXTENT_ITEM_KEY => {
                     let refs = format::le64(body, 0).map_err(fail)?;
                     let flags = format::le64(body, 16).map_err(fail)?;
+                    if flags & EXTENT_FLAG_TREE_BLOCK != 0
+                        && key.item_type == format::EXTENT_ITEM_KEY
+                    {
+                        // A pre-skinny tree-block record: the writer only
+                        // keeps skinny `METADATA_ITEM`s.
+                        return Err(Refusal::SharedTreeBlock {
+                            bytenr: key.objectid,
+                            refs,
+                            flags,
+                            why: "non-skinny tree-block extent item",
+                        });
+                    }
                     if flags & EXTENT_FLAG_TREE_BLOCK != 0 {
                         // A non-skinny item carries `tree_block_info` (key + level).
                         let inline_at = if key.item_type == format::EXTENT_ITEM_KEY {

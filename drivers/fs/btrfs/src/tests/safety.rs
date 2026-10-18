@@ -154,21 +154,22 @@ fn smoke_btrfs_freeable_tree_block_rules() -> TestResult {
 }
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_freeable_tree_block_rules);
 
-/// Mark the fs tree's first child as shared (refs 2, as a snapshot of the
-/// subvolume leaves it) or `FULL_BACKREF` in the extent tree, then make a
-/// change that COWs it. The commit must abort read-only with nothing written:
-/// the superblock keeps its generation and the block's extent item survives.
+/// Mark the root tree's root block as shared (refs 2, as if another tree
+/// referenced it) or `FULL_BACKREF` in the extent tree, then commit. The root
+/// tree is not reference counted, so its COW frees the block outright — the
+/// path the pre-write audit guards. The commit must abort read-only with
+/// nothing written: the superblock keeps its generation and the block's
+/// extent item survives. (Subvolume trees take the snapshot-aware COW
+/// instead; see `tests/snapshots.rs`.)
 fn shared_block_aborts(set_full_backref: bool) -> TestResult {
     let dev = writable_sparse(FIXTURE_MANYFILES_SPARSE);
     let vol = match mount_writable(dev.clone()) {
         Ok(v) if v.supports_writes() => v,
         _ => return TestResult::Fail("manyfiles fixture did not mount writable"),
     };
-    let Some((child, child_level)) = first_fs_child(&vol) else {
-        return TestResult::Fail("manyfiles fs tree is a single leaf");
-    };
+    let (target, target_level) = vol.root_tree_root();
     let ext = extent_root(&vol);
-    let key = BtrfsKey::new(child, format::METADATA_ITEM_KEY, u64::from(child_level));
+    let key = BtrfsKey::new(target, format::METADATA_ITEM_KEY, u64::from(target_level));
     let poked = poke_item(&vol, ext, &key, |body| {
         if set_full_backref {
             let flags = u64::from_le_bytes(body[16..24].try_into().unwrap()) | (1 << 8);
@@ -178,11 +179,9 @@ fn shared_block_aborts(set_full_backref: bool) -> TestResult {
         }
     });
     if !poked {
-        return TestResult::Fail("could not mark the fs-tree block shared");
+        return TestResult::Fail("could not mark the root-tree block shared");
     }
     let gen_before = super_generation(&dev);
-    // Creating a file updates the root directory's items, which live under
-    // the fs tree's first child.
     let root = vol.root();
     let created = poll_once(root.create("after-snapshot.txt"));
     let synced = poll_once(vol.sync_to_disk());
@@ -304,7 +303,29 @@ kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rw_gate_tree_block_rules);
 /// named); the unmodified image is accepted.
 fn smoke_btrfs_rw_gate_refuses_shared_images() -> TestResult {
     if crate::rw_gate::WRITER_HANDLES_SHARED_TREES {
-        return TestResult::Pass;
+        // Sharing is handled; a subvolume Linux is still dropping is not.
+        let dev = writable_sparse(FIXTURE_MANYFILES_SPARSE);
+        {
+            let vol = match mount_writable(dev.clone()) {
+                Ok(v) if v.supports_writes() => v,
+                _ => return TestResult::Fail("pristine manyfiles fixture was refused"),
+            };
+            let (root_tree, _) = vol.root_tree_root();
+            let key = BtrfsKey::new(format::FS_TREE_OBJECTID, format::ROOT_ITEM_KEY, 0);
+            if !poke_item(&vol, root_tree, &key, |body| {
+                body[220..228].copy_from_slice(&300u64.to_le_bytes())
+            }) {
+                return TestResult::Fail("could not mark FS_TREE half-dropped");
+            }
+        }
+        return match mount_writable(dev) {
+            Ok(v) if !v.supports_writes() => match v.rw_refusal() {
+                Some(crate::rw_gate::Refusal::DeadRoot(5)) => TestResult::Pass,
+                _ => TestResult::Fail("half-dropped subvolume refused for the wrong reason"),
+            },
+            Ok(_) => TestResult::Fail("an image with a half-dropped subvolume mounted writable"),
+            Err(_) => TestResult::Fail("the half-dropped image did not mount at all"),
+        };
     }
     // Shared interior block.
     let dev = writable_sparse(FIXTURE_MANYFILES_SPARSE);

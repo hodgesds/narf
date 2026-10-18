@@ -18,6 +18,7 @@ use crate::format::{self, BtrfsKey, Superblock};
 use crate::volume::BtrfsVolume;
 
 mod safety;
+mod snapshots;
 
 // ── Shared test harness ────────────────────────────────────────────
 

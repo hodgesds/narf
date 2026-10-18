@@ -28,15 +28,29 @@ pub mod rw_gate {
     pub enum Refusal { Incompat(u64), CompatRo(u64), FreeSpaceTreeInvalid,
         NoFreeSpaceTree, LogTree(u64), ChecksumType(u16), SectorSize(u32),
         NodeSize(u32), ErrorState, SuperFlags(u64), Generation, MultiDevice(u64),
-        BalanceInProgress, ReplaceInProgress, RelocationInProgress }
+        BalanceInProgress, ReplaceInProgress, RelocationInProgress,
+        Snapshotted { root: u64, last_snapshot: u64 }, DeadRoot(u64),
+        SharedTreeBlock { bytenr: u64, refs: u64, flags: u64, why: &'static str } }
+    pub const WRITER_HANDLES_SHARED_TREES: bool; // update_ref_for_cow implemented
     pub fn active_profile() -> Profile;
     pub fn check_superblock(sb: &Superblock, super_flags: u64, p: Profile) -> Result<(), Refusal>;
     pub async fn check_trees(vol: &BtrfsVolume<B>) -> Result<(), Refusal>;
+    pub fn check_root_item(id: u64, body: &[u8]) -> Result<(), Refusal>;
+    pub fn check_tree_block_item(bytenr: u64, refs: u64, flags: u64, inline: &[u8],
+        root_holders: u64) -> Result<(), Refusal>;
+    pub async fn check_sharing(vol: &BtrfsVolume<B>) -> Result<(), Refusal>;
     pub fn supported_features(p: Profile) -> (Vec<&str>, Vec<&str>);
     pub fn last_refusal() -> Option<String>;
 }
 FsInstance::always_read_only() for BtrfsVolume == is_read_only()
 pub mod interop { pub fn run(mode: &str) -> InitResult }        // test vehicle
+pub mod harness {                                               // test-workload targeting
+    pub fn is_harness_fsid(fsid: &str) -> bool;
+    pub fn check_disposable(fsid: &str, root_uuid: Option<&str>, on_root: bool)
+        -> Result<(), &'static str>;
+    pub fn device_is_disposable(dev: &Arc<dyn BlockDeviceSync>, what: &str, on_root: bool) -> bool;
+}
+BtrfsVolume::sync_fs(&self) -> Result<(), FsError>  // syncfs: commit + superblock + flush
 ```
 
 ## 4. Invariants
@@ -53,6 +67,23 @@ it fail. A read-write `mount -t btrfs` that cannot be honoured returns
 `FsError::ReadOnly` (EROFS). Data extents are allocated only from DATA block
 groups and tree blocks only from METADATA ones. A write through an open file
 uses the inode item from the tree, never the node's cached copy.
+
+Subvolume trees are reference counted as Linux counts them: every committed
+block a subvolume COW replaces first goes through `update_ref_for_cow`
+(`backref.rs`), so a block or data extent another tree (a snapshot, a
+reflink, a relocation tree) still references is never freed, and the extent
+tree's inline and keyed backrefs always add up to each extent's `refs`.
+Independently, every commit audits each tree block it is about to free
+against the extent tree (refs 1, one inline TREE_BLOCK_REF, no unreleased
+FULL_BACKREF or relocation flag) before writing anything, and aborts
+read-only otherwise. A ROOT_ITEM's generation changes only when its root
+block moves. A superblock copy and every tree node reach the device as one
+request. Lock-free readers verify each child against its parent pointer
+(generation, level, first key) and retry from the live root. Under
+`narf.disks=root-rw` no chunk is ever allocated or relocated (a full root is
+ENOSPC), NARF's own shared-root snapshot ioctl is refused, and full qgroups
+are left inconsistent with a rescan pending instead of being recounted. The
+last view of a writable core commits what it holds.
 
 ## 5. Architecture notes
 
