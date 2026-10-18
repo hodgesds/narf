@@ -70,6 +70,14 @@ const FIXTURE_DEFAULTSUBVOL_SPARSE: &[u8] =
 /// metadata), with `root` (default) + `home` subvolumes.
 const FIXTURE_LAPTOP_SPARSE: &[u8] = include_bytes!("../testdata/fixture-laptop.img.sparse");
 
+/// The host CachyOS root's exact feature set: block-group-tree + free-space
+/// tree (compat_ro 0xb), incompat 0x371, crc32c, 4K/16K, zstd, single device,
+/// with the `@`, `@home`, `@root`, `@srv`, `@cache`, `@tmp`, `@log` subvolumes.
+const FIXTURE_BGT_SPARSE: &[u8] = include_bytes!("../testdata/fixture-bgt.img.sparse");
+
+/// 4 KiB nodes; the `@` fs tree is three levels deep (root at level 2).
+const FIXTURE_TALL_SPARSE: &[u8] = include_bytes!("../testdata/fixture-tall.img.sparse");
+
 /// Same small mixed layout as the primary fixture but WITH a free-space tree
 /// (`space_cache=v2`); exercises the write path's free-space-tree maintenance.
 const FIXTURE_FST_SPARSE: &[u8] = include_bytes!("../testdata/fixture-fst.img.sparse");
@@ -593,10 +601,13 @@ fn smoke_btrfs_superblock_decode() -> TestResult {
     ) {
         return TestResult::Fail("unknown incompat feature must be Unsupported");
     }
+    // An unknown compat_ro bit is kept for the mount to judge (Linux
+    // `btrfs_check_features`: read-only allowed, read-write refused).
     let mut verity = good.clone();
     verity[180..188].copy_from_slice(&(1u64 << 2).to_le_bytes());
-    if !matches!(Superblock::decode(&verity), Err(FsError::Unsupported)) {
-        return TestResult::Fail("unsupported compat-ro feature must be Unsupported");
+    match Superblock::decode(&verity) {
+        Ok(sb) if sb.compat_ro_unknown() == 1 << 2 && sb.compat_ro_unwritable() == 1 << 2 => {}
+        _ => return TestResult::Fail("unknown compat-ro feature must decode for an RO mount"),
     }
 
     let mut supported = good;
@@ -3102,16 +3113,26 @@ fn smoke_btrfs_registration() -> TestResult {
     if narf_filesystem::lookup_fstype("btrfs").is_none() {
         return TestResult::Fail("btrfs fstype not registered");
     }
-    // The builder rejects write-implying options before touching a device.
+    let request = |options| narf_filesystem::MountRequest {
+        fs_type: "btrfs",
+        source: "/dev/nope",
+        options,
+        uid: 0,
+        gid: 0,
+        umask: 0o022,
+        initial_namespace: true,
+        read_only: false,
+    };
+    // The builder rejects format-affecting options before touching a device.
     if !matches!(
-        crate::btrfs_fstype_builder("/dev/nope", "rw"),
+        crate::btrfs_fstype_builder(&request("nodatacow")),
         Err(FsError::Unsupported)
     ) {
-        return TestResult::Fail("builder should reject rw option");
+        return TestResult::Fail("builder should reject nodatacow");
     }
     // A read-only mount of a missing device fails with NotFound, not a panic.
     if !matches!(
-        crate::btrfs_fstype_builder("/dev/nope", "ro"),
+        crate::btrfs_fstype_builder(&request("ro")),
         Err(FsError::NotFound)
     ) {
         return TestResult::Fail("builder should ENOENT a missing device");
@@ -7420,6 +7441,68 @@ fn smoke_btrfs_deep_tree() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_deep_tree);
 
+// ── CachyOS fstab mount options ─────────────────────────────────────
+
+fn smoke_btrfs_mount_options_cachyos_fstab() -> TestResult {
+    use crate::mount_opts::{parse, CompressAlgo, Compression, Discard};
+    // What mount(8) passes for the CachyOS fstab line plus the live mount's
+    // extra options (`noatime` normally becomes MS_NOATIME, but a kernel
+    // rootflags= may carry it in the data string).
+    let opts = match parse("subvol=/@home,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2")
+    {
+        Ok(opts) => opts,
+        Err(_) => return TestResult::Fail("CachyOS fstab options refused"),
+    };
+    if opts.subvol != Some(crate::volume::Subvol::Name("@home".into())) {
+        return TestResult::Fail("subvol=/@home not recorded");
+    }
+    if opts.compress
+        != Some(Compression {
+            algo: CompressAlgo::Zstd,
+            level: Some(1),
+            force: false,
+        })
+    {
+        return TestResult::Fail("compress=zstd:1 not recorded");
+    }
+    if opts.discard != Discard::Async || opts.ssd != Some(true) || !opts.space_cache_v2 {
+        return TestResult::Fail("ssd/discard=async/space_cache=v2 not recorded");
+    }
+    if opts.render() != ",compress=zstd:1,ssd,discard=async,space_cache=v2" {
+        return TestResult::Fail("show_options rendering differs from Linux's order");
+    }
+    // `compress` alone is zlib; `compress=no` clears it.
+    match parse("compress") {
+        Ok(o) if o.compress.map(|c| c.algo) == Some(CompressAlgo::Zlib) => {}
+        _ => return TestResult::Fail("bare compress must mean zlib"),
+    }
+    match parse("compress=zstd,compress=no") {
+        Ok(o) if o.compress.is_none() => {}
+        _ => return TestResult::Fail("compress=no must clear compression"),
+    }
+    // Format- or recovery-changing options NARF does not implement are
+    // refused rather than silently ignored.
+    for bad in [
+        "nodatasum",
+        "nodatacow",
+        "space_cache=v1",
+        "clear_cache",
+        "rescue=usebackuproot",
+        "usebackuproot",
+        "degraded",
+        "norecovery",
+        "device=/dev/sda",
+        "compress=brotli",
+        "compress=zstd:99",
+    ] {
+        if parse(bad).is_ok() {
+            return TestResult::Fail("format-affecting btrfs option accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_mount_options_cachyos_fstab);
+
 // ── subvol= / subvolid= mount options ──────────────────────────────
 
 fn smoke_btrfs_mount_subvol_option() -> TestResult {
@@ -10382,3 +10465,2991 @@ fn smoke_btrfs_link_new_name() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_link_new_name);
+
+// ── Read-only devices are never written (narf.disks=boot-only) ──────
+
+/// Mount `device` behind a real `narf.disks=boot-only` guard on an untrusted
+/// disk.
+fn mount_through_boot_only_guard(
+    device: &Arc<WritableSparseDevice>,
+) -> Result<Arc<BtrfsVolume<narf_block::SyncBlock>>, FsError> {
+    use narf_block::disk_policy::{DiskPolicy, PolicyGuard};
+    let guard = Arc::new(PolicyGuard::new(
+        "btrfs-ro-test",
+        u64::MAX - 0xb7f5,
+        device.clone() as Arc<dyn narf_block::BlockDeviceSync>,
+    )) as Arc<dyn narf_block::BlockDeviceSync>;
+    narf_block::disk_policy::__set_policy_for_test(Some(DiskPolicy::BootOnly));
+    let mounted = poll_once(BtrfsVolume::mount(
+        narf_block::SyncBlock::new(guard),
+        DomainId::DRIVER_0,
+    ))
+    .unwrap_or(Err(FsError::InvalidData));
+    narf_block::disk_policy::__set_policy_for_test(None);
+    mounted
+}
+
+/// A clean volume on a read-only device mounts read-only, refuses writes,
+/// and leaves every byte unchanged.
+fn smoke_btrfs_read_only_device_mount_never_writes() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let device = writable_sparse(FIXTURE_FST_SPARSE);
+    let before = device.overlay.lock().clone();
+    let volume = match mount_through_boot_only_guard(&device) {
+        Ok(volume) => volume,
+        Err(_) => return TestResult::Fail("read-only btrfs mount failed"),
+    };
+    if !volume.is_read_only() {
+        return TestResult::Fail("volume on a read-only device is not read-only");
+    }
+    if !matches!(
+        poll_once(volume.root().create("new.txt")),
+        Some(Err(FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("create on a read-only btrfs mount was not refused");
+    }
+    if *device.overlay.lock() != before {
+        return TestResult::Fail("read-only btrfs mount wrote to the device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_read_only_device_mount_never_writes
+);
+
+/// A pending fsync log tree is never replayed onto a read-only device: the
+/// mount is refused (Linux's `ro` would replay; NARF must not write), and the
+/// log is still there for a later writable mount.
+fn smoke_btrfs_read_only_device_refuses_log_replay() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let device = writable_sparse(FIXTURE_FST_SPARSE);
+    let vol = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let f = match poll_once(vol.root().create("logged.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("sync before logging failed");
+    }
+    let (fs_root, _) = vol.fs_tree_root();
+    let key = BtrfsKey::new(f.ino(), format::INODE_ITEM_KEY, 0);
+    let mut body = match poll_once(btree::find_item(&vol, fs_root, &key)) {
+        Some(Ok(Some(b))) => b,
+        _ => return TestResult::Fail("could not read inode item"),
+    };
+    body[136..144].copy_from_slice(&0x0055_6677u64.to_le_bytes());
+    if !matches!(
+        poll_once(crate::write::write_log(&vol, &[(key, body)])),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("write_log failed");
+    }
+    drop(f);
+    drop(vol);
+    if format::le64(&read_super_at(&device, format::SUPERBLOCK_OFFSET), 96).unwrap_or(0) == 0 {
+        return TestResult::Fail("super.log_root not set after write_log");
+    }
+    let before = device.overlay.lock().clone();
+    if !matches!(
+        mount_through_boot_only_guard(&device),
+        Err(FsError::Unsupported)
+    ) {
+        return TestResult::Fail("read-only mount with a pending log was not refused");
+    }
+    if *device.overlay.lock() != before {
+        return TestResult::Fail("refused read-only mount wrote to the device");
+    }
+    if format::le64(&read_super_at(&device, format::SUPERBLOCK_OFFSET), 96).unwrap_or(0) == 0 {
+        return TestResult::Fail("log pointer lost on a refused read-only mount");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_read_only_device_refuses_log_replay
+);
+
+// ── Feature-flag mount semantics + BLOCK_GROUP_TREE ────────────────
+
+/// OR `compat_ro` / `incompat` bits into, and clear `incompat_clear` from,
+/// every superblock copy present on `dev`, re-stamping each checksum.
+fn patch_feature_flags(
+    dev: &WritableSparseDevice,
+    compat_ro_or: u64,
+    incompat_or: u64,
+    incompat_clear: u64,
+) {
+    use narf_block::BlockDeviceSync;
+    let total = dev.capacity() * u64::from(dev.lba_size());
+    for &offset in &format::SUPERBLOCK_MIRROR_OFFSETS {
+        if offset + format::SUPERBLOCK_SIZE as u64 > total {
+            continue;
+        }
+        let mut sb = read_super_at(dev, offset);
+        if format::le64(&sb, 64) != Ok(format::BTRFS_MAGIC) {
+            continue;
+        }
+        let ro = format::le64(&sb, 180).unwrap() | compat_ro_or;
+        let inc = (format::le64(&sb, 188).unwrap() | incompat_or) & !incompat_clear;
+        sb[180..188].copy_from_slice(&ro.to_le_bytes());
+        sb[188..196].copy_from_slice(&inc.to_le_bytes());
+        checksum::stamp_block(format::CSUM_TYPE_CRC32, &mut sb).unwrap();
+        let lba = offset / u64::from(dev.lba_size());
+        let n = (format::SUPERBLOCK_SIZE / dev.lba_size() as usize) as u16;
+        dev.write(lba, n, &sb).unwrap();
+    }
+}
+
+fn mount_writable_ro(
+    dev: Arc<WritableSparseDevice>,
+) -> Result<Arc<BtrfsVolume<narf_block::SyncBlock>>, FsError> {
+    let async_dev = narf_block::SyncBlock::new(dev as Arc<dyn narf_block::BlockDeviceSync>);
+    poll_once(BtrfsVolume::mount_devices_read_only(
+        alloc::vec![async_dev],
+        DomainId::DRIVER_0,
+        true,
+    ))
+    .ok_or(FsError::InvalidData)?
+}
+
+/// Linux `btrfs_check_features`: an unknown compat_ro bit allows a read-only
+/// mount and refuses read-write; an unknown incompat bit refuses both.
+fn smoke_btrfs_unknown_feature_mount_modes() -> TestResult {
+    use narf_filesystem::FsInstance;
+    const UNKNOWN_RO: u64 = 1 << 20;
+    const UNKNOWN_INCOMPAT: u64 = 1 << 40;
+    for fixture in [FIXTURE_LAPTOP_SPARSE, FIXTURE_BGT_SPARSE] {
+        let dev = writable_sparse(fixture);
+        patch_feature_flags(&dev, UNKNOWN_RO, 0, 0);
+        let vol = match mount_writable_ro(dev.clone()) {
+            Ok(vol) => vol,
+            Err(_) => return TestResult::Fail("unknown compat_ro bit refused a read-only mount"),
+        };
+        if vol.supports_writes() {
+            return TestResult::Fail("read-only mount with unknown compat_ro is writable");
+        }
+        // Reads work: the default subvolume's root directory lists.
+        if !matches!(poll_once(vol.root().enumerate_async(0, 64)), Some(Ok(e)) if !e.is_empty()) {
+            return TestResult::Fail("read-only mount with unknown compat_ro cannot read");
+        }
+        drop(vol);
+        if !matches!(mount_writable(dev.clone()), Err(FsError::Unsupported)) {
+            return TestResult::Fail("unknown compat_ro bit did not refuse a read-write mount");
+        }
+
+        let dev = writable_sparse(fixture);
+        patch_feature_flags(&dev, 0, UNKNOWN_INCOMPAT, 0);
+        if mount_writable_ro(dev.clone()).is_ok() {
+            return TestResult::Fail("unknown incompat bit allowed a read-only mount");
+        }
+        if mount_writable(dev).is_ok() {
+            return TestResult::Fail("unknown incompat bit allowed a read-write mount");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_unknown_feature_mount_modes);
+
+/// A block-group-tree filesystem (the host's CachyOS feature set) mounts
+/// read-only, loads tree 11, and reads its subvolumes.
+fn smoke_btrfs_block_group_tree_ro_mount() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable_ro(dev) {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("block-group-tree fixture refused a read-only mount"),
+    };
+    let sb = vol.superblock();
+    if sb.compat_ro_flags != 0xb || sb.incompat_flags != 0x371 || !sb.has_block_group_tree() {
+        return TestResult::Fail("fixture does not carry the host feature set");
+    }
+    let root_tree = vol.root_tree_root().0;
+    match poll_once(crate::block_group::bg_home(&vol, root_tree)) {
+        Some(Ok(crate::block_group::BgHome::BlockGroupTree { .. })) => {}
+        _ => return TestResult::Fail("block-group tree root (objectid 11) not loaded"),
+    }
+    match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => match read_all(&f, 16) {
+            Some(got) if got == b"L0000\nL0001\nL000" => {}
+            _ => return TestResult::Fail("big.dat content wrong on block-group-tree fs"),
+        },
+        _ => return TestResult::Fail("big.dat missing on block-group-tree fs"),
+    }
+    if poll_once(vol.switch_to_subvol(&crate::volume::Subvol::Name("@home".into())))
+        .is_none_or(|r| r.is_err())
+    {
+        return TestResult::Fail("subvol=@home did not resolve");
+    }
+    let user = match poll_once(vol.root().lookup_dir_async("user")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("@home/user missing"),
+    };
+    match poll_once(user.lookup_async("notes.txt")) {
+        Some(Ok(f)) => match read_all(&f, 64) {
+            Some(got) if got == b"home user file\n" => TestResult::Pass,
+            _ => TestResult::Fail("@home/user/notes.txt content wrong"),
+        },
+        _ => TestResult::Fail("@home/user/notes.txt missing"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_block_group_tree_ro_mount);
+
+/// Linux's artificial dependency: block-group-tree without no-holes is
+/// rejected at mount (`btrfs_check_features`).
+fn smoke_btrfs_block_group_tree_requires_no_holes() -> TestResult {
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    patch_feature_flags(&dev, 0, 0, format::INCOMPAT_NO_HOLES);
+    if mount_writable_ro(dev).is_ok() {
+        return TestResult::Fail("block-group-tree without no-holes was mounted");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_block_group_tree_requires_no_holes
+);
+
+/// Block groups of a block-group-tree filesystem are read from tree 11: the
+/// extent tree carries none, each one maps its chunk, their `used` sums to the
+/// superblock's `bytes_used`, and the allocator's system-group exclusion sees
+/// them (Linux `btrfs_read_block_groups` via `btrfs_block_group_root`).
+fn smoke_btrfs_block_group_tree_read() -> TestResult {
+    let vol = match mount_writable_ro(writable_sparse(FIXTURE_BGT_SPARSE)) {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("block-group-tree fixture did not mount"),
+    };
+    let bgs = match poll_once(crate::block_group::live_block_groups(&vol)) {
+        Some(Ok(bgs)) => bgs,
+        _ => return TestResult::Fail("could not read block groups from tree 11"),
+    };
+    let flags = |body: &[u8]| format::le64(body, 16).unwrap_or(0);
+    let kinds = [
+        format::BLOCK_GROUP_DATA,
+        format::BLOCK_GROUP_METADATA,
+        format::BLOCK_GROUP_SYSTEM,
+    ];
+    if bgs.len() < 3
+        || kinds
+            .iter()
+            .any(|k| !bgs.iter().any(|(_, _, b)| flags(b) & k != 0))
+    {
+        return TestResult::Fail("tree 11 lacks a data, metadata or system block group");
+    }
+    for &(start, len, _) in &bgs {
+        if vol.logical_chunk_remaining(start) != Ok(len) {
+            return TestResult::Fail("a tree-11 block group does not match its chunk");
+        }
+    }
+    let used: u64 = bgs
+        .iter()
+        .map(|(_, _, b)| format::le64(b, 0).unwrap_or(0))
+        .sum();
+    if used != vol.superblock().bytes_used {
+        return TestResult::Fail("tree-11 block group used != superblock bytes_used");
+    }
+    let root_tree = vol.root_tree_root().0;
+    let ext = match poll_once(crate::roots::find_root(
+        &vol,
+        root_tree,
+        format::EXTENT_TREE_OBJECTID,
+    )) {
+        Some(Ok((ext, _))) => ext,
+        _ => return TestResult::Fail("extent tree root missing"),
+    };
+    match poll_once(crate::block_group::read_block_groups(&vol, ext)) {
+        Some(Ok(in_ext)) if in_ext.is_empty() => {}
+        _ => return TestResult::Fail("extent tree unexpectedly holds block group items"),
+    }
+    let sys: Vec<(u64, u64)> = bgs
+        .iter()
+        .filter(|(_, _, b)| flags(b) & format::BLOCK_GROUP_SYSTEM != 0)
+        .map(|&(s, l, _)| (s, l))
+        .collect();
+    match poll_once(crate::allocator::Allocator::build(&vol)) {
+        Some(Ok(crate::allocator::Allocator::Reclaim { ranges })) => {
+            if ranges
+                .iter()
+                .any(|&(r, _, _)| sys.iter().any(|&(s, l)| r >= s && r < s + l))
+            {
+                return TestResult::Fail("allocator offered system block group space");
+            }
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("allocator did not build from the free-space tree"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_block_group_tree_read);
+
+// ── Read-write safety gate (rw_gate) ───────────────────────────────
+
+/// The laptop fixture's primary superblock (raw 4 KiB), extracted from the
+/// sparse runs without building the 128 MiB image. Its features are the
+/// host CachyOS root's minus BLOCK_GROUP_TREE (incompat 0x373 =
+/// MIXED_BACKREF|DEFAULT_SUBVOL|COMPRESS_ZSTD|BIG_METADATA|EXTENDED_IREF|
+/// SKINNY_METADATA|NO_HOLES, compat_ro FREE_SPACE_TREE|VALID, crc32c,
+/// 4 KiB sectors, 16 KiB nodes, one device).
+fn laptop_raw_superblock() -> Vec<u8> {
+    let (_, runs) = decode_sparse_runs(FIXTURE_LAPTOP_SPARSE);
+    let start = format::SUPERBLOCK_OFFSET;
+    let mut sb = alloc::vec![0u8; format::SUPERBLOCK_SIZE];
+    for (off, bytes) in runs {
+        let end = off + bytes.len() as u64;
+        if end <= start || off >= start + sb.len() as u64 {
+            continue;
+        }
+        let from = start.max(off);
+        let to = end.min(start + sb.len() as u64);
+        sb[(from - start) as usize..(to - start) as usize]
+            .copy_from_slice(&bytes[(from - off) as usize..(to - off) as usize]);
+    }
+    sb
+}
+
+/// Every superblock-level refusal reason, for both profiles.
+fn smoke_btrfs_rw_gate_superblock_refusals() -> TestResult {
+    use crate::rw_gate::{self, check_superblock, Profile, Refusal};
+    let raw = laptop_raw_superblock();
+    let base = match Superblock::decode(&raw) {
+        Ok(sb) => sb,
+        Err(_) => return TestResult::Fail("laptop superblock did not decode"),
+    };
+    let flags = format::le64(&raw, rw_gate::OFF_SUPER_FLAGS).unwrap_or(u64::MAX);
+    if flags != rw_gate::SUPER_FLAG_WRITTEN {
+        return TestResult::Fail("fixture superblock flags are not just WRITTEN");
+    }
+    for profile in [Profile::Default, Profile::RootRw] {
+        if check_superblock(&base, flags, profile).is_err() {
+            return TestResult::Fail("the host-shaped superblock must pass the gate");
+        }
+    }
+    type Mutate = fn(&mut Superblock, &mut u64);
+    /// (what, mutation, Default verdict, RootRw verdict)
+    type Case = (&'static str, Mutate, Option<Refusal>, Option<Refusal>);
+    let cases: &[Case] = &[
+        (
+            "unknown incompat (EXTENT_TREE_V2)",
+            |sb, _| sb.incompat_flags |= 1 << 13,
+            Some(Refusal::Incompat(1 << 13)),
+            Some(Refusal::Incompat(1 << 13)),
+        ),
+        (
+            "RAID56 outside root-rw",
+            |sb, _| sb.incompat_flags |= format::INCOMPAT_RAID56,
+            None,
+            Some(Refusal::Incompat(format::INCOMPAT_RAID56)),
+        ),
+        (
+            "MIXED_GROUPS outside root-rw",
+            |sb, _| sb.incompat_flags |= format::INCOMPAT_MIXED_GROUPS,
+            None,
+            Some(Refusal::Incompat(format::INCOMPAT_MIXED_GROUPS)),
+        ),
+        (
+            "BLOCK_GROUP_TREE (the host root's exact flags) is written",
+            |sb, _| sb.compat_ro_flags |= rw_gate::COMPAT_RO_BLOCK_GROUP_TREE,
+            None,
+            None,
+        ),
+        (
+            "BLOCK_GROUP_TREE without a free-space tree",
+            |sb, _| sb.compat_ro_flags = rw_gate::COMPAT_RO_BLOCK_GROUP_TREE,
+            Some(Refusal::FreeSpaceTreeInvalid),
+            Some(Refusal::FreeSpaceTreeInvalid),
+        ),
+        (
+            "VERITY",
+            |sb, _| sb.compat_ro_flags |= 1 << 2,
+            Some(Refusal::CompatRo(1 << 2)),
+            Some(Refusal::CompatRo(1 << 2)),
+        ),
+        (
+            "free-space tree not valid",
+            |sb, _| sb.compat_ro_flags &= !format::COMPAT_RO_FREE_SPACE_TREE_VALID,
+            Some(Refusal::FreeSpaceTreeInvalid),
+            Some(Refusal::FreeSpaceTreeInvalid),
+        ),
+        (
+            "no free-space tree on non-mixed block groups",
+            |sb, _| sb.compat_ro_flags = 0,
+            Some(Refusal::NoFreeSpaceTree),
+            Some(Refusal::NoFreeSpaceTree),
+        ),
+        (
+            "no free-space tree, mixed block groups",
+            |sb, _| {
+                sb.compat_ro_flags = 0;
+                sb.incompat_flags |= format::INCOMPAT_MIXED_GROUPS;
+            },
+            None,
+            Some(Refusal::Incompat(format::INCOMPAT_MIXED_GROUPS)),
+        ),
+        (
+            "pending log tree",
+            |sb, _| sb.log_root = 0x1234_0000,
+            None,
+            Some(Refusal::LogTree(0x1234_0000)),
+        ),
+        (
+            "xxhash64 checksums",
+            |sb, _| sb.csum_type = 1,
+            None,
+            Some(Refusal::ChecksumType(1)),
+        ),
+        (
+            "8 KiB sectors",
+            |sb, _| sb.sectorsize = 8192,
+            None,
+            Some(Refusal::SectorSize(8192)),
+        ),
+        (
+            "odd nodesize",
+            |sb, _| sb.nodesize = 12288,
+            None,
+            Some(Refusal::NodeSize(12288)),
+        ),
+        (
+            "two devices",
+            |sb, _| sb.num_devices = 2,
+            None,
+            Some(Refusal::MultiDevice(2)),
+        ),
+        (
+            "error state",
+            |_, f| *f |= rw_gate::SUPER_FLAG_ERROR,
+            Some(Refusal::ErrorState),
+            Some(Refusal::ErrorState),
+        ),
+        (
+            "seeding",
+            |_, f| *f |= rw_gate::SUPER_FLAG_SEEDING,
+            Some(Refusal::SuperFlags(rw_gate::SUPER_FLAG_SEEDING)),
+            Some(Refusal::SuperFlags(rw_gate::SUPER_FLAG_SEEDING)),
+        ),
+        (
+            "fsid change in progress",
+            |_, f| *f |= rw_gate::SUPER_FLAG_CHANGING_FSID_V2,
+            Some(Refusal::SuperFlags(rw_gate::SUPER_FLAG_CHANGING_FSID_V2)),
+            Some(Refusal::SuperFlags(rw_gate::SUPER_FLAG_CHANGING_FSID_V2)),
+        ),
+        (
+            "csum change in progress",
+            |_, f| *f |= rw_gate::SUPER_FLAG_CHANGING_DATA_CSUM,
+            Some(Refusal::SuperFlags(rw_gate::SUPER_FLAG_CHANGING_DATA_CSUM)),
+            Some(Refusal::SuperFlags(rw_gate::SUPER_FLAG_CHANGING_DATA_CSUM)),
+        ),
+        (
+            "metadump",
+            |_, f| *f |= rw_gate::SUPER_FLAG_METADUMP_V2,
+            Some(Refusal::SuperFlags(rw_gate::SUPER_FLAG_METADUMP_V2)),
+            Some(Refusal::SuperFlags(rw_gate::SUPER_FLAG_METADUMP_V2)),
+        ),
+        (
+            "generation zero",
+            |sb, _| sb.generation = 0,
+            Some(Refusal::Generation),
+            Some(Refusal::Generation),
+        ),
+    ];
+    for (what, mutate, default, root_rw) in cases {
+        let mut sb = base.clone();
+        let mut f = flags;
+        mutate(&mut sb, &mut f);
+        let got_default = check_superblock(&sb, f, Profile::Default).err();
+        let got_root = check_superblock(&sb, f, Profile::RootRw).err();
+        if &got_default != default || &got_root != root_rw {
+            let _ = what;
+            return TestResult::Fail("a gate case returned the wrong verdict");
+        }
+    }
+    // Refusal messages name the bit, as the root-rw failure banner shows it.
+    let msg = alloc::format!("{}", Refusal::CompatRo(1 << 2));
+    if !msg.contains("VERITY") {
+        return TestResult::Fail("the refusal must name the feature bit");
+    }
+    let (incompat, compat_ro) = rw_gate::supported_features(Profile::RootRw);
+    if incompat
+        != [
+            "MIXED_BACKREF",
+            "DEFAULT_SUBVOL",
+            "COMPRESS_LZO",
+            "COMPRESS_ZSTD",
+            "BIG_METADATA",
+            "EXTENDED_IREF",
+            "SKINNY_METADATA",
+            "NO_HOLES",
+        ]
+        || compat_ro
+            != [
+                "FREE_SPACE_TREE",
+                "FREE_SPACE_TREE_VALID",
+                "BLOCK_GROUP_TREE",
+            ]
+    {
+        return TestResult::Fail("root-rw feature list changed without updating this test");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rw_gate_superblock_refusals);
+
+/// Mount `image` read-write (checksums verified) and report whether the gate
+/// left it writable, plus the bytes afterwards.
+fn gate_mount(image: Vec<u8>) -> Result<(bool, Vec<u8>), &'static str> {
+    use narf_block::ram::RamBlockDevice;
+    let device = RamBlockDevice::from_image(512, image);
+    let vol = poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0))
+        .ok_or("mount pended")?
+        .map_err(|_| "mount failed")?;
+    let writable = !vol.is_read_only();
+    if !writable {
+        // A refused volume must refuse a write at the VFS layer, too.
+        use narf_filesystem::FsInstance;
+        if !vol.always_read_only() {
+            return Err("a gate-refused volume must report always_read_only");
+        }
+    }
+    drop(vol);
+    Ok((writable, device.snapshot()))
+}
+
+/// Restamp the superblock (all mirrors present in `image`) after an edit.
+fn restamp_superblock(image: &mut [u8], edit: impl Fn(&mut [u8])) {
+    for &off in &format::SUPERBLOCK_MIRROR_OFFSETS {
+        let off = off as usize;
+        if off + format::SUPERBLOCK_SIZE > image.len()
+            || format::le64(image, off + format::SUPERBLOCK_BYTENR_OFFSET) != Ok(off as u64)
+        {
+            continue;
+        }
+        let sb = &mut image[off..off + format::SUPERBLOCK_SIZE];
+        edit(sb);
+        let csum = Superblock::checksum_type(sb).unwrap_or(0);
+        let _ = checksum::stamp_block(csum, sb);
+    }
+}
+
+/// A superblock in the error state is mounted read-only: no byte changes.
+fn smoke_btrfs_rw_gate_error_state_mounts_read_only() -> TestResult {
+    let mut image = decode_sparse(FIXTURE_FST_SPARSE);
+    restamp_superblock(&mut image, |sb| {
+        let flags = format::le64(sb, crate::rw_gate::OFF_SUPER_FLAGS).unwrap_or(0)
+            | crate::rw_gate::SUPER_FLAG_ERROR;
+        sb[crate::rw_gate::OFF_SUPER_FLAGS..crate::rw_gate::OFF_SUPER_FLAGS + 8]
+            .copy_from_slice(&flags.to_le_bytes());
+    });
+    let before = image.clone();
+    match gate_mount(image) {
+        Ok((false, after)) if after == before => {}
+        Ok((true, _)) => return TestResult::Fail("an error-state volume was mounted writable"),
+        Ok((false, _)) => return TestResult::Fail("a refused volume was written"),
+        Err(why) => return TestResult::Fail(why),
+    }
+    match crate::rw_gate::last_refusal() {
+        Some(msg) if msg.contains("ERROR") && msg.contains("READ-ONLY") => TestResult::Pass,
+        _ => TestResult::Fail("the refusal must be logged naming the reason"),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_rw_gate_error_state_mounts_read_only
+);
+
+/// Rewrite one key of the tree whose root node is at `logical` (which must
+/// be a leaf) and restamp the node. `pick` returns `(slot, new key,
+/// optional body patch at offset)`.
+fn patch_leaf_key(
+    image: &mut [u8],
+    logical: u64,
+    physical: u64,
+    nodesize: usize,
+    csum_type: u16,
+    pick: impl Fn(&[u8]) -> Option<(usize, BtrfsKey, Option<(usize, u64)>)>,
+) -> Result<(), &'static str> {
+    let _ = logical;
+    let at = physical as usize;
+    let node = image
+        .get_mut(at..at + nodesize)
+        .ok_or("node out of image")?;
+    if btree::level(node) != Ok(0) {
+        return Err("tree root is not a leaf in this fixture");
+    }
+    let (slot, key, patch) = pick(node).ok_or("no slot to patch")?;
+    let item = btree::HEADER_SIZE + slot * (format::DISK_KEY_SIZE + 8);
+    node[item..item + 8].copy_from_slice(&key.objectid.to_le_bytes());
+    node[item + 8] = key.item_type;
+    node[item + 9..item + 17].copy_from_slice(&key.offset.to_le_bytes());
+    if let Some((off, value)) = patch {
+        let (data, _) = btree::leaf_item_span(node, slot).map_err(|_| "item span")?;
+        let start = btree::HEADER_SIZE + data + off;
+        node[start..start + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    checksum::stamp_block(csum_type, node).map_err(|_| "restamp failed")
+}
+
+/// Balance / relocation / device-replace state in the trees refuses the RW
+/// mount (Linux would resume them; NARF cannot).
+fn smoke_btrfs_rw_gate_tree_refusals() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    let pristine = decode_sparse(FIXTURE_FST_SPARSE);
+    // Locate the root and dev tree roots through a read-only mount.
+    let probe = match poll_once(BtrfsVolume::mount_devices_read_only(
+        alloc::vec![RamBlockDevice::from_image(512, pristine.clone())],
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("probe mount failed"),
+    };
+    let (root_logical, _) = probe.root_tree_root();
+    let dev_logical = match poll_once(crate::roots::find_root(
+        &*probe,
+        root_logical,
+        format::DEV_TREE_OBJECTID,
+    )) {
+        Some(Ok((addr, _))) => addr,
+        _ => return TestResult::Fail("dev tree root missing"),
+    };
+    let (Ok(root_phys), Ok(dev_phys)) = (
+        probe.map_logical(root_logical),
+        probe.map_logical(dev_logical),
+    ) else {
+        return TestResult::Fail("tree roots did not map");
+    };
+    let nodesize = probe.nodesize();
+    let csum = probe.superblock().csum_type;
+    drop(probe);
+
+    let last_slot = |node: &[u8]| btree::nritems(node).ok().map(|n| n as usize - 1);
+    /// (what, refusal text, objectid, item type, body patch, in the dev tree)
+    type Case = (
+        &'static str,
+        &'static str,
+        u64,
+        u8,
+        Option<(usize, u64)>,
+        bool,
+    );
+    let cases: [Case; 3] = [
+        ("balance", "balance", (-4i64) as u64, 248, None, false),
+        ("relocation", "relocation", (-8i64) as u64, 132, None, false),
+        ("replace", "replace", 0, 250, Some((32, 1)), true),
+    ];
+    for (_what, text, objectid, item_type, patch, dev_tree) in cases {
+        let mut image = pristine.clone();
+        let (logical, phys) = if dev_tree {
+            (dev_logical, dev_phys)
+        } else {
+            (root_logical, root_phys)
+        };
+        let result = patch_leaf_key(&mut image, logical, phys, nodesize, csum, |node| {
+            let slot = if dev_tree { 0 } else { last_slot(node)? };
+            Some((slot, BtrfsKey::new(objectid, item_type, 0), patch))
+        });
+        if let Err(why) = result {
+            return TestResult::Fail(why);
+        }
+        let before = image.clone();
+        match gate_mount(image) {
+            Ok((false, after)) if after == before => {}
+            Ok((true, _)) => return TestResult::Fail("in-progress tree state mounted writable"),
+            Ok((false, _)) => return TestResult::Fail("a refused volume was written"),
+            Err(why) => return TestResult::Fail(why),
+        }
+        if !crate::rw_gate::last_refusal().is_some_and(|m| m.contains(text)) {
+            return TestResult::Fail("the tree refusal must be logged naming the reason");
+        }
+    }
+    // The untouched image mounts writable.
+    match gate_mount(pristine) {
+        Ok((true, _)) => TestResult::Pass,
+        _ => TestResult::Fail("the pristine image must mount writable"),
+    }
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rw_gate_tree_refusals);
+
+/// One writer per filesystem: two read-write subvolume mounts of one fsid
+/// (CachyOS's `/` and `/home`) are views of one shared core — both
+/// writable, one transaction — never two independent writers.
+fn smoke_btrfs_rw_gate_one_core_per_fsid() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let dev = writable_sparse(FIXTURE_LAPTOP_SPARSE);
+    let source = dev.clone() as Arc<dyn narf_block::BlockDeviceSync>;
+    let mount = |subvol: &str| {
+        poll_once(crate::registry::mount(
+            &source,
+            alloc::vec![narf_block::SyncBlock::new(source.clone())],
+            Some(crate::volume::Subvol::Name(subvol.into())),
+            false,
+        ))
+    };
+    let (Some(Ok(root)), Some(Ok(home))) = (mount("root"), mount("home")) else {
+        return TestResult::Fail("subvolume mounts failed");
+    };
+    if !Arc::ptr_eq(root.core(), home.core()) {
+        return TestResult::Fail("two mounts of one fsid built two cores (two writers)");
+    }
+    if root.is_read_only() || home.is_read_only() {
+        return TestResult::Fail("every subvolume mount of a writable core must be writable");
+    }
+    for (vol, name) in [(&root, "in-root"), (&home, "in-home")] {
+        if !matches!(poll_once(vol.root().create(name)), Some(Ok(_))) {
+            return TestResult::Fail("a subvolume mount refused a write");
+        }
+    }
+    if poll_once(root.sync_to_disk()).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("sync failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rw_gate_one_core_per_fsid);
+
+/// Mount options a CachyOS fstab and live mount carry are accepted; options
+/// that would change on-disk state NARF does not maintain are refused.
+fn smoke_btrfs_mount_options_installed_root() -> TestResult {
+    use crate::mount_opts::parse;
+    use crate::volume::Subvol;
+    let host = "rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=256,subvol=/@";
+    match parse(host) {
+        Ok(o) if matches!(&o.subvol, Some(Subvol::Name(n)) if n == "@") && !o.read_only => {}
+        _ => return TestResult::Fail("the host's live root mount options must parse"),
+    }
+    match parse("subvol=/@home,defaults,noatime,compress=zstd:1") {
+        Ok(o) if matches!(&o.subvol, Some(Subvol::Name(n)) if n == "@home") => {}
+        _ => return TestResult::Fail("the host's fstab options must parse"),
+    }
+    match parse("ro,subvol=/@log") {
+        Ok(o) if o.read_only => {}
+        _ => return TestResult::Fail("ro must parse"),
+    }
+    for bad in [
+        "clear_cache",
+        "space_cache=v1",
+        "space_cache",
+        "nospace_cache",
+        "rescue=usebackuproot",
+        "usebackuproot",
+        "degraded",
+        "device=/dev/sda",
+        "nodatasum",
+        "nodatacow",
+        "compress=brotli",
+        "commit=x",
+    ] {
+        if parse(bad).is_ok() {
+            return TestResult::Fail("a state-changing option must be refused");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_mount_options_installed_root);
+
+/// pacman/journald-shaped small appends to a new file on a host-shaped
+/// (16 KiB nodes, non-mixed, free-space tree) volume read back exactly,
+/// before and after a sync + remount.
+fn smoke_btrfs_small_appends_read_back() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let dev = writable_sparse(FIXTURE_LAPTOP_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("laptop fixture failed to mount writable"),
+    };
+    let want: Vec<u8> = crate::interop::PKG_DESC.to_vec();
+    let file = match poll_once(vol.root().create("desc")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let mut at = 0u64;
+    for chunk in want.chunks(17) {
+        if !matches!(poll_once(file.write(at, chunk)), Some(Ok(n)) if n == chunk.len()) {
+            return TestResult::Fail("append failed");
+        }
+        at += chunk.len() as u64;
+    }
+    match read_all(&file, want.len() + 8) {
+        Some(got) if got == want => {}
+        Some(_) => return TestResult::Fail("appends read back wrong before sync (same handle)"),
+        None => return TestResult::Fail("read failed"),
+    }
+    match poll_once(vol.root().lookup_async("desc")) {
+        Some(Ok(f)) if read_all(&f, want.len() + 8).as_deref() == Some(&want[..]) => {}
+        _ => return TestResult::Fail("appends read back wrong before sync (fresh lookup)"),
+    }
+    let _ = poll_once(vol.sync_to_disk());
+    drop(file);
+    drop(vol);
+    let vol = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount failed"),
+    };
+    match poll_once(vol.root().lookup_async("desc")) {
+        Some(Ok(f)) if read_all(&f, want.len() + 8).as_deref() == Some(&want[..]) => {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("appends read back wrong after remount"),
+    }
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_small_appends_read_back);
+
+/// On a non-mixed volume (every real install), data extents land only in
+/// DATA block groups and tree blocks only in METADATA ones — what `btrfs
+/// check` reports as "type mismatch with chunk" otherwise.
+fn smoke_btrfs_allocations_respect_block_group_type() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let dev = writable_sparse(FIXTURE_LAPTOP_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("laptop fixture failed to mount writable"),
+    };
+    for i in 0..24u32 {
+        let name = alloc::format!("typed-{i:02}");
+        let Some(Ok(file)) = poll_once(vol.root().create(&name)) else {
+            return TestResult::Fail("create failed");
+        };
+        let body = crate::interop::pattern(i, 20_000 + i as usize * 1000);
+        if !matches!(poll_once(file.write(0, &body)), Some(Ok(_))) {
+            return TestResult::Fail("write failed");
+        }
+    }
+    let _ = poll_once(vol.sync_to_disk());
+    drop(vol);
+    let vol = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount failed"),
+    };
+    let (root_tree, _) = vol.root_tree_root();
+    let Some(Ok((ext, _))) = poll_once(crate::roots::find_root(
+        &*vol,
+        root_tree,
+        format::EXTENT_TREE_OBJECTID,
+    )) else {
+        return TestResult::Fail("extent tree root missing");
+    };
+    let bg_tree = match poll_once(crate::block_group::bg_home(&*vol, root_tree)) {
+        Some(Ok(home)) => home.scan_root(ext),
+        _ => return TestResult::Fail("block group home"),
+    };
+    let Some(Ok(groups)) = poll_once(crate::block_group::read_block_groups(&*vol, bg_tree)) else {
+        return TestResult::Fail("block groups unreadable");
+    };
+    let flags_at = |addr: u64| {
+        groups
+            .iter()
+            .find(|(s, l, _)| addr >= *s && addr < s + l)
+            .and_then(|(_, _, b)| format::le64(b, 16).ok())
+    };
+    let Some(Ok(mut cursor)) = poll_once(btree::Cursor::seek(&*vol, ext, &BtrfsKey::new(0, 0, 0)))
+    else {
+        return TestResult::Fail("extent tree unreadable");
+    };
+    let (mut data, mut meta) = (0usize, 0usize);
+    loop {
+        let (key, body) = match cursor.current() {
+            Ok(Some((k, b))) => (k, b.to_vec()),
+            Ok(None) => break,
+            Err(_) => return TestResult::Fail("extent tree walk"),
+        };
+        // EXTENT_ITEM flags@16: DATA = 1, TREE_BLOCK = 2.
+        let tree_block = match key.item_type {
+            format::METADATA_ITEM_KEY => Some(true),
+            format::EXTENT_ITEM_KEY => Some(format::le64(&body, 16).unwrap_or(0) & 2 != 0),
+            _ => None,
+        };
+        if let Some(tree_block) = tree_block {
+            let Some(flags) = flags_at(key.objectid) else {
+                return TestResult::Fail("an extent lies outside every block group");
+            };
+            // Chunk-tree blocks legitimately live in the SYSTEM group.
+            let want = if tree_block {
+                meta += 1;
+                format::BLOCK_GROUP_METADATA | format::BLOCK_GROUP_SYSTEM
+            } else {
+                data += 1;
+                format::BLOCK_GROUP_DATA
+            };
+            if flags & want == 0 {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  typed-alloc: {key:?} tree_block={tree_block} in block group flags {flags:#x}"
+                );
+                return TestResult::Fail("an extent was placed in a block group of the wrong type");
+            }
+        }
+        if poll_once(cursor.advance()).is_none_or(|r| r.is_err()) {
+            return TestResult::Fail("extent tree advance");
+        }
+    }
+    if data < 24 || meta == 0 {
+        return TestResult::Fail("the walk did not see the new extents");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_allocations_respect_block_group_type
+);
+
+/// The host CachyOS root's exact feature set (BLOCK_GROUP_TREE, compat_ro
+/// 0xb, incompat 0x371) passes the write-safety gate in both profiles.
+fn smoke_btrfs_rw_gate_accepts_block_group_tree() -> TestResult {
+    use crate::rw_gate::{check_superblock, Profile, SUPER_FLAG_WRITTEN};
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => {
+            return TestResult::Fail("the BLOCK_GROUP_TREE fixture refused a read-write mount")
+        }
+    };
+    if vol.is_read_only() {
+        return TestResult::Fail("the gate refused the host feature set");
+    }
+    let sb = vol.superblock();
+    for profile in [Profile::Default, Profile::RootRw] {
+        if check_superblock(&sb, SUPER_FLAG_WRITTEN, profile).is_err() {
+            return TestResult::Fail("the host feature set must pass both profiles");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_rw_gate_accepts_block_group_tree
+);
+
+/// Block-group-tree writes, as Linux `update_block_group_item` /
+/// `insert_block_group_item` do them: allocation and free update `used` in tree
+/// 11, a chunk allocation inserts its new DATA and METADATA block groups there,
+/// tree 11 is COWed with METADATA_ITEMs owned by root 11, its ROOT_ITEM moves,
+/// the extent tree never gains a block group item, `bytes_used` stays the sum,
+/// and the result remounts (mount re-validates every block group).
+fn smoke_btrfs_block_group_tree_write() -> TestResult {
+    use alloc::format;
+    use narf_filesystem::FsInstance;
+
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("block-group-tree fixture refused a read-write mount"),
+    };
+    if !vol.supports_writes() {
+        return TestResult::Fail("block-group-tree mount is not writable");
+    }
+    let bg_state = |vol: &BtrfsVolume<narf_block::SyncBlock>| {
+        let root_tree = vol.root_tree_root().0;
+        let (bgt, bgt_level) = match poll_once(crate::roots::find_root(
+            vol,
+            root_tree,
+            format::BLOCK_GROUP_TREE_OBJECTID,
+        )) {
+            Some(Ok(r)) => r,
+            _ => return Err("tree 11 root missing"),
+        };
+        let ext = match poll_once(crate::roots::find_root(
+            vol,
+            root_tree,
+            format::EXTENT_TREE_OBJECTID,
+        )) {
+            Some(Ok((r, _))) => r,
+            _ => return Err("extent root missing"),
+        };
+        let bgs = match poll_once(crate::block_group::read_block_groups(vol, bgt)) {
+            Some(Ok(b)) => b,
+            _ => return Err("tree 11 unreadable"),
+        };
+        match poll_once(crate::block_group::read_block_groups(vol, ext)) {
+            Some(Ok(e)) if e.is_empty() => {}
+            _ => return Err("extent tree gained a block group item"),
+        }
+        // The tree-11 root block is accounted to root 11 in the extent tree.
+        match poll_once(btree::find_item(
+            vol,
+            ext,
+            &BtrfsKey::new(bgt, format::METADATA_ITEM_KEY, u64::from(bgt_level)),
+        )) {
+            Some(Ok(Some(body))) if body.len() >= 24 + 9 => {
+                let ref_type = body[24];
+                let ref_root = format::le64(&body, 25).unwrap_or(0);
+                if ref_type != 176 || ref_root != format::BLOCK_GROUP_TREE_OBJECTID {
+                    return Err("tree 11 block not owned by root 11");
+                }
+            }
+            _ => return Err("tree 11 root block has no METADATA_ITEM"),
+        }
+        let used: u64 = bgs
+            .iter()
+            .map(|(_, _, b)| format::le64(b, 0).unwrap_or(0))
+            .sum();
+        // The durable superblock (every caller syncs first).
+        if used != super_bytes_used(&dev) {
+            return Err("bytes_used != sum of tree-11 block group used");
+        }
+        for &(start, len, _) in &bgs {
+            if vol.logical_chunk_remaining(start) != Ok(len) {
+                return Err("a tree-11 block group does not match its chunk");
+            }
+        }
+        Ok((bgt, bgs))
+    };
+    let (bgt0, bgs0) = match bg_state(&vol) {
+        Ok(s) => s,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let data_used = |bgs: &[(u64, u64, Vec<u8>)]| -> u64 {
+        bgs.iter()
+            .filter(|(_, _, b)| format::le64(b, 16).unwrap_or(0) & format::BLOCK_GROUP_DATA != 0)
+            .map(|(_, _, b)| format::le64(b, 0).unwrap_or(0))
+            .sum()
+    };
+    let count = |bgs: &[(u64, u64, Vec<u8>)], kind: u64| {
+        bgs.iter()
+            .filter(|(_, _, b)| format::le64(b, 16).unwrap_or(0) & kind != 0)
+            .count()
+    };
+
+    // 12 MiB of incompressible-ish data overflows the 8 MiB data block group,
+    // forcing a chunk allocation (one new DATA + one new METADATA group).
+    const MIB: usize = 1 << 20;
+    let file = match poll_once(vol.root().create("bgt-big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create on block-group-tree fs failed"),
+    };
+    let mut chunk = alloc::vec![0u8; MIB];
+    for i in 0..12usize {
+        let mut x = (i as u32).wrapping_mul(2_654_435_761) | 1;
+        for b in chunk.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x as u8;
+        }
+        match poll_once(file.write((i * MIB) as u64, &chunk)) {
+            Some(Ok(n)) if n == MIB => {}
+            Some(Err(FsError::NoSpace)) => return TestResult::Fail("12 MiB write hit NoSpace"),
+            _ => return TestResult::Fail("12 MiB write on block-group-tree fs failed"),
+        }
+    }
+    // A write into a non-default subvolume commits through the same trees.
+    if poll_once(vol.sync_to_disk()).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("sync after big write failed");
+    }
+    let (bgt1, bgs1) = match bg_state(&vol) {
+        Ok(s) => s,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if bgt1 == bgt0 {
+        return TestResult::Fail("tree 11 was not COWed by the write");
+    }
+    if count(&bgs1, format::BLOCK_GROUP_DATA) <= count(&bgs0, format::BLOCK_GROUP_DATA)
+        || count(&bgs1, format::BLOCK_GROUP_METADATA) <= count(&bgs0, format::BLOCK_GROUP_METADATA)
+    {
+        return TestResult::Fail("chunk allocation did not add DATA + METADATA groups to tree 11");
+    }
+    let used_after_write = data_used(&bgs1);
+    if used_after_write < data_used(&bgs0) + 12 * MIB as u64 / 2 {
+        return TestResult::Fail("data block group used did not grow with the write");
+    }
+
+    // Free: unlinking the file returns its extents; tree 11's `used` drops.
+    if poll_once(vol.root().unlink("bgt-big.dat")).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("unlink on block-group-tree fs failed");
+    }
+    for i in 0..4 {
+        if !matches!(
+            poll_once(vol.root().create(&format!("bgt-small-{i}.txt"))),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("create after free failed");
+        }
+    }
+    if poll_once(vol.sync_to_disk()).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("sync after unlink failed");
+    }
+    let (_, bgs2) = match bg_state(&vol) {
+        Ok(s) => s,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if data_used(&bgs2) >= used_after_write {
+        return TestResult::Fail("freeing data did not lower tree-11 used");
+    }
+    drop(file);
+    drop(vol);
+
+    // Remount (re-validates every block group against its chunk) and write
+    // into the `@home` subvolume.
+    let vol2 = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("block-group-tree fs did not remount after writes"),
+    };
+    if !dir_names(&vol2.root())
+        .iter()
+        .any(|n| n == "bgt-small-3.txt")
+    {
+        return TestResult::Fail("post-free file lost across remount");
+    }
+    if poll_once(vol2.switch_to_subvol(&crate::volume::Subvol::Name("@home".into())))
+        .is_none_or(|r| r.is_err())
+    {
+        return TestResult::Fail("subvol=@home did not resolve after writes");
+    }
+    let f = match poll_once(vol2.root().create("from-narf.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create in @home failed"),
+    };
+    if !matches!(poll_once(f.write(0, b"narf\n")), Some(Ok(5))) {
+        return TestResult::Fail("write in @home failed");
+    }
+    if poll_once(vol2.sync_to_disk()).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("sync in @home failed");
+    }
+    match bg_state(&vol2) {
+        Ok(_) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_block_group_tree_write);
+
+// ── One shared instance per filesystem ─────────────────────────────
+
+/// Poll two futures together to completion (no allocation, no executor).
+async fn join2<A: core::future::Future, C: core::future::Future>(
+    a: A,
+    c: C,
+) -> (A::Output, C::Output) {
+    let mut a = core::pin::pin!(a);
+    let mut c = core::pin::pin!(c);
+    let (mut ra, mut rc) = (None, None);
+    core::future::poll_fn(|cx| {
+        if ra.is_none() {
+            if let core::task::Poll::Ready(v) = a.as_mut().poll(cx) {
+                ra = Some(v);
+            }
+        }
+        if rc.is_none() {
+            if let core::task::Poll::Ready(v) = c.as_mut().poll(cx) {
+                rc = Some(v);
+            }
+        }
+        if ra.is_some() && rc.is_some() {
+            core::task::Poll::Ready(())
+        } else {
+            core::task::Poll::Pending
+        }
+    })
+    .await;
+    (ra.unwrap(), rc.unwrap())
+}
+
+/// Write `count` files named `{prefix}-{i}` of 16 KiB each through `dir`.
+async fn write_files(
+    dir: Arc<dyn narf_filesystem::DirOps>,
+    prefix: &str,
+    count: u8,
+) -> Result<(), FsError> {
+    for i in 0..count {
+        let f = dir.create(&alloc::format!("{prefix}-{i}")).await?;
+        let payload = alloc::vec![i ^ prefix.as_bytes()[0]; 16 * 1024];
+        f.write(0, &payload).await?;
+    }
+    Ok(())
+}
+
+/// Check every `{prefix}-{i}` file `write_files` produced.
+fn files_intact(dir: &Arc<dyn narf_filesystem::DirOps>, prefix: &str, count: u8) -> bool {
+    (0..count).all(|i| {
+        let Some(Ok(f)) = poll_once(dir.lookup_async(&alloc::format!("{prefix}-{i}"))) else {
+            return false;
+        };
+        read_all(&f, 16 * 1024 + 16).is_some_and(|got| {
+            got.len() == 16 * 1024 && got.iter().all(|&b| b == i ^ prefix.as_bytes()[0])
+        })
+    })
+}
+
+/// Linux's one-`btrfs_fs_info`-per-filesystem model: subvolume mounts are
+/// views over one instance. Their writes interleave through one transaction
+/// stream (a batch staged through `@home` is committed before `@` stages its
+/// own), a second mount of `@` sees the first's uncommitted writes, a
+/// read-only view cannot write, a mounted subvolume cannot be deleted, and the
+/// whole thing remounts consistently from disk.
+fn smoke_btrfs_shared_instance_views() -> TestResult {
+    use crate::volume::Subvol;
+    use narf_filesystem::FsInstance;
+
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let top = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture did not mount"),
+    };
+    let view = |name: &str, ro: bool| {
+        poll_once(BtrfsVolume::mount_view(
+            top.core(),
+            Some(Subvol::Name(name.into())),
+            ro,
+        ))
+    };
+    let (home, root, root2, srv_ro) = match (
+        view("@home", false),
+        view("@", false),
+        view("@", false),
+        view("@srv", true),
+    ) {
+        (Some(Ok(a)), Some(Ok(b)), Some(Ok(c)), Some(Ok(d))) => (a, b, c, d),
+        _ => return TestResult::Fail("subvolume views did not mount"),
+    };
+    if !Arc::ptr_eq(home.core(), root.core()) || !Arc::ptr_eq(home.core(), top.core()) {
+        return TestResult::Fail("views do not share one instance");
+    }
+    if home.mounted_subvol_id() == root.mounted_subvol_id() {
+        return TestResult::Fail("views did not select distinct subvolumes");
+    }
+    if top.core().subvol_mount_count(root.mounted_subvol_id()) != 2 {
+        return TestResult::Fail("mount count of @ is not 2");
+    }
+
+    // Interleaved and joined writers through two subvolumes of one instance.
+    let joined = poll_once(join2(
+        write_files(home.root(), "h", 12),
+        write_files(root.root(), "r", 12),
+    ));
+    if !matches!(joined, Some((Ok(()), Ok(())))) {
+        return TestResult::Fail("concurrent subvolume writers failed");
+    }
+    for i in 0..4u8 {
+        let a = poll_once(write_files(home.root(), &alloc::format!("hi{i}"), 1));
+        let b = poll_once(write_files(root.root(), &alloc::format!("ri{i}"), 1));
+        if !matches!((a, b), (Some(Ok(())), Some(Ok(())))) {
+            return TestResult::Fail("alternating subvolume writes failed");
+        }
+    }
+    // The second mount of @ sees the first's writes before any sync.
+    if !files_intact(&root2.root(), "r", 12) {
+        return TestResult::Fail("second mount of @ does not see uncommitted writes");
+    }
+    if poll_once(srv_ro.root().create("nope")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("read-only view accepted a write");
+    }
+    let home_parent_busy = poll_once(crate::write::destroy_subvolume(
+        &top,
+        format::FIRST_FREE_OBJECTID,
+        Some("@home"),
+        None,
+    ));
+    if !matches!(home_parent_busy, Some(Err(FsError::Busy))) {
+        return TestResult::Fail("a mounted subvolume was deletable");
+    }
+    // One sync through any view makes every view's writes durable.
+    if poll_once(srv_ro.sync_to_disk()).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("sync through a read-only view failed");
+    }
+    drop((home, root, root2, srv_ro, top));
+
+    let fresh = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("filesystem did not remount after shared writes"),
+    };
+    for (name, prefix) in [("@home", "h"), ("@", "r")] {
+        let v = match poll_once(BtrfsVolume::mount_view(
+            fresh.core(),
+            Some(Subvol::Name(name.into())),
+            true,
+        )) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("remounted subvolume view failed"),
+        };
+        if !files_intact(&v.root(), prefix, 12) {
+            return TestResult::Fail("a subvolume lost writes across remount");
+        }
+        let alt = if prefix == "h" { "hi3" } else { "ri3" };
+        if !files_intact(&v.root(), alt, 1) {
+            return TestResult::Fail("an alternating write was lost across remount");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_shared_instance_views);
+
+/// The same sharing on real (QEMU NVMe) hardware through the registry the
+/// `mount -t btrfs` and root factories use. Two subvolume mounts of xtask's
+/// disposable nvme0 image write concurrently with genuinely asynchronous I/O,
+/// then sync; the xtask postflight runs host `btrfs check` on the result.
+/// Subvolumes are created with NARF's own subvolume-creation path first.
+fn smoke_btrfs_shared_instance_nvme() -> TestResult {
+    use crate::volume::Subvol;
+    use narf_block::fs_detect::{detect_filesystem, FsType};
+    use narf_filesystem::FsInstance;
+
+    // Test-only: mutate only the disk xtask provided for it.
+    if !narf_boot::args().has_flag("narf.btrfs_smoke") {
+        return TestResult::Skip("no disposable btrfs disk (narf.btrfs_smoke)");
+    }
+    let Some(entry) = narf_block::block_devices()
+        .into_iter()
+        .find(|e| matches!(detect_filesystem(&e.dev), Ok(Some(FsType::Btrfs))))
+    else {
+        return TestResult::Skip("no btrfs block device");
+    };
+    let dev = entry.dev.clone();
+    let mount = |subvol: Option<Subvol>| {
+        narf_scheduler::block_on(crate::registry::mount(
+            &dev,
+            crate::discover_members(dev.clone()),
+            subvol,
+            false,
+        ))
+    };
+    let top = match mount(None) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("nvme btrfs did not mount"),
+    };
+    for name in ["narf-sv-a", "narf-sv-b"] {
+        if narf_scheduler::block_on(top.root().lookup_dir_async(name)).is_err()
+            && narf_scheduler::block_on(crate::write::create_subvolume(
+                &top,
+                format::FIRST_FREE_OBJECTID,
+                name,
+                false,
+            ))
+            .is_err()
+        {
+            return TestResult::Fail("subvolume creation on nvme failed");
+        }
+    }
+    let (a, b) = match (
+        mount(Some(Subvol::Name("narf-sv-a".into()))),
+        mount(Some(Subvol::Name("narf-sv-b".into()))),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => return TestResult::Fail("nvme subvolume mounts failed"),
+    };
+    if !Arc::ptr_eq(a.core(), b.core()) || !Arc::ptr_eq(a.core(), top.core()) {
+        return TestResult::Fail("nvme mounts of one fsid are separate instances");
+    }
+    let joined = narf_scheduler::block_on(join2(
+        write_files(a.root(), "a", 16),
+        write_files(b.root(), "b", 16),
+    ));
+    if !matches!(joined, (Ok(()), Ok(()))) {
+        return TestResult::Fail("concurrent nvme subvolume writers failed");
+    }
+    if narf_scheduler::block_on(b.sync_to_disk()).is_err() {
+        return TestResult::Fail("nvme sync failed");
+    }
+    let ok = files_intact_blocking(&a.root(), "a", 16) && files_intact_blocking(&b.root(), "b", 16);
+    if !ok {
+        return TestResult::Fail("nvme subvolume contents wrong after concurrent writes");
+    }
+    TestResult::Pass
+}
+
+/// [`files_intact`] for a device whose I/O completes asynchronously.
+fn files_intact_blocking(dir: &Arc<dyn narf_filesystem::DirOps>, prefix: &str, count: u8) -> bool {
+    (0..count).all(|i| {
+        narf_scheduler::block_on(async {
+            let f = dir.lookup_async(&alloc::format!("{prefix}-{i}")).await?;
+            let mut buf = alloc::vec![0u8; 16 * 1024 + 16];
+            let n = f.read(0, &mut buf).await?;
+            Ok::<_, FsError>(
+                n == 16 * 1024 && buf[..n].iter().all(|&x| x == i ^ prefix.as_bytes()[0]),
+            )
+        })
+        .unwrap_or(false)
+    })
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_shared_instance_nvme);
+
+// ── Commit durability: write_all_supers ordering and failure ───────
+
+/// One device operation, as the commit issued it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DevOp {
+    Write { lba: u64, n: u16 },
+    WriteFua { lba: u64, n: u16 },
+    Flush,
+}
+
+/// A volatile-cache, native-FUA device over a [`WritableSparseDevice`] that
+/// records every write, FUA write and flush in order, and can be told to
+/// fail flushes.
+#[derive(Debug)]
+struct RecordingDevice {
+    inner: Arc<WritableSparseDevice>,
+    log: narf_lib::sync::IrqSafeSpinLock<Vec<DevOp>>,
+    fail_flush: core::sync::atomic::AtomicBool,
+}
+
+impl narf_block::BlockDeviceSync for RecordingDevice {
+    fn lba_size(&self) -> u32 {
+        self.inner.lba_size()
+    }
+    fn capacity(&self) -> u64 {
+        self.inner.capacity()
+    }
+    fn read(&self, lba: u64, n: u16, out: &mut [u8]) -> Result<(), narf_block::BlockIoError> {
+        self.inner.read(lba, n, out)
+    }
+    fn write(&self, lba: u64, n: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        self.log.lock().push(DevOp::Write { lba, n });
+        self.inner.write(lba, n, data)
+    }
+    fn write_fua(&self, lba: u64, n: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        self.log.lock().push(DevOp::WriteFua { lba, n });
+        self.inner.write(lba, n, data)
+    }
+    fn flush(&self) -> Result<(), narf_block::BlockIoError> {
+        if self.fail_flush.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(narf_block::BlockIoError::DriverError);
+        }
+        self.log.lock().push(DevOp::Flush);
+        Ok(())
+    }
+    fn capabilities(&self) -> narf_block::BlockCaps {
+        narf_block::BlockCaps {
+            volatile_cache: true,
+            fua: true,
+        }
+    }
+}
+
+fn recording(sparse: &[u8]) -> Arc<RecordingDevice> {
+    Arc::new(RecordingDevice {
+        inner: writable_sparse(sparse),
+        log: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
+        fail_flush: core::sync::atomic::AtomicBool::new(false),
+    })
+}
+
+fn mount_recording(
+    dev: &Arc<RecordingDevice>,
+) -> Result<Arc<BtrfsVolume<narf_block::SyncBlock>>, FsError> {
+    let async_dev = narf_block::SyncBlock::new(dev.clone() as Arc<dyn narf_block::BlockDeviceSync>);
+    poll_once(BtrfsVolume::mount(async_dev, DomainId::DRIVER_0)).ok_or(FsError::InvalidData)?
+}
+
+/// LBA range `[start, end)` of the superblock copy at byte `offset`.
+fn super_lbas(offset: u64) -> (u64, u64) {
+    let start = offset / 512;
+    (start, start + (format::SUPERBLOCK_SIZE as u64) / 512)
+}
+
+/// A commit follows Linux `write_all_supers`: every tree/data block of the
+/// transaction is written first, then a device flush, then the primary
+/// superblock with FUA, then the mirror (plain write), with nothing else
+/// after the flush but `fsync`'s closing barrier.
+fn smoke_btrfs_commit_flush_fua_order() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let dev = recording(FIXTURE_MIRROR_SPARSE);
+    let vol = match mount_recording(&dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("mirror fixture did not mount"),
+    };
+    let f = match poll_once(vol.root().create("ordered.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if !matches!(poll_once(f.write(0, &[0x5a; 20000])), Some(Ok(20000))) {
+        return TestResult::Fail("write failed");
+    }
+    dev.log.lock().clear();
+    if !matches!(poll_once(f.fsync(false)), Some(Ok(()))) {
+        return TestResult::Fail("fsync failed");
+    }
+    let log = dev.log.lock().clone();
+    let (p0, p1) = super_lbas(format::SUPERBLOCK_OFFSET);
+    let (m0, m1) = super_lbas(64 << 20);
+    let is_primary = |lba: u64| (p0..p1).contains(&lba);
+    let is_mirror = |lba: u64| (m0..m1).contains(&lba);
+    let Some(flush_at) = log.iter().position(|op| *op == DevOp::Flush) else {
+        return TestResult::Fail("commit issued no flush");
+    };
+    // Before the flush: the transaction's own blocks, and no superblock.
+    let before = &log[..flush_at];
+    if !before
+        .iter()
+        .any(|op| matches!(op, DevOp::Write { lba, .. } if !is_primary(*lba) && !is_mirror(*lba)))
+    {
+        return TestResult::Fail("no tree/data writes preceded the pre-flush");
+    }
+    if before.iter().any(|op| match op {
+        DevOp::Write { lba, .. } | DevOp::WriteFua { lba, .. } => {
+            is_primary(*lba) || is_mirror(*lba)
+        }
+        DevOp::Flush => false,
+    }) {
+        return TestResult::Fail("a superblock was written before the pre-flush");
+    }
+    // After it: only superblock writes, primary (all FUA) first, then mirror.
+    let after = &log[flush_at + 1..];
+    let mut seen_mirror = false;
+    let mut trailing_flush = false;
+    let mut primary_blocks = 0u64;
+    for op in after {
+        match *op {
+            DevOp::WriteFua { lba, n } if is_primary(lba) && !seen_mirror => {
+                primary_blocks += u64::from(n)
+            }
+            DevOp::Write { lba, .. } if is_mirror(lba) && !trailing_flush => seen_mirror = true,
+            DevOp::Write { lba, .. } if is_primary(lba) => {
+                return TestResult::Fail("primary superblock written without FUA")
+            }
+            DevOp::WriteFua { lba, .. } if is_mirror(lba) => {
+                return TestResult::Fail("mirror superblock written with FUA (Linux does not)")
+            }
+            // `fsync`'s own barrier once the commit is done: it orders
+            // nothing new, but must not come before the mirror.
+            DevOp::Flush if seen_mirror && !trailing_flush => trailing_flush = true,
+            DevOp::Flush => return TestResult::Fail("an extra flush inside the commit"),
+            _ => return TestResult::Fail("a non-superblock write followed the pre-flush"),
+        }
+    }
+    if primary_blocks != p1 - p0 {
+        return TestResult::Fail("primary superblock not fully FUA-written before the mirror");
+    }
+    if !seen_mirror {
+        return TestResult::Fail("mirror superblock not written");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_commit_flush_fua_order);
+
+/// A failed pre-flush fails the commit before any superblock byte moves,
+/// puts the filesystem in its error state (read-only, as
+/// `BTRFS_FS_STATE_ERROR` does), and the image still mounts at the previous
+/// generation.
+fn smoke_btrfs_commit_flush_failure_goes_read_only() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let dev = recording(FIXTURE_MIRROR_SPARSE);
+    let primary_before = read_super_at(&dev.inner, format::SUPERBLOCK_OFFSET);
+    let mirror_before = read_super_at(&dev.inner, 64 << 20);
+    let vol = match mount_recording(&dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("mirror fixture did not mount"),
+    };
+    let f = match poll_once(vol.root().create("lost.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if !matches!(poll_once(f.write(0, b"never durable")), Some(Ok(13))) {
+        return TestResult::Fail("write failed");
+    }
+    dev.fail_flush
+        .store(true, core::sync::atomic::Ordering::Release);
+    if !matches!(poll_once(f.fsync(false)), Some(Err(_))) {
+        return TestResult::Fail("fsync succeeded although the flush failed");
+    }
+    if vol.supports_writes() {
+        return TestResult::Fail("filesystem still writable after a failed commit flush");
+    }
+    if !matches!(
+        poll_once(vol.root().create("after.dat")),
+        Some(Err(FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("a write was accepted after the commit failed");
+    }
+    if read_super_at(&dev.inner, format::SUPERBLOCK_OFFSET) != primary_before
+        || read_super_at(&dev.inner, 64 << 20) != mirror_before
+    {
+        return TestResult::Fail("a superblock changed although the pre-flush failed");
+    }
+    drop((f, vol));
+    dev.fail_flush
+        .store(false, core::sync::atomic::Ordering::Release);
+    let again = match mount_recording(&dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("image no longer mounts after the failed commit"),
+    };
+    let gen = format::le64(&primary_before, 72).unwrap_or(0);
+    if again.superblock().generation != gen {
+        return TestResult::Fail("remount is not at the last durable generation");
+    }
+    if poll_once(again.root().lookup_async("lost.dat")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("data of the failed commit appeared on disk");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_commit_flush_failure_goes_read_only
+);
+
+// ── truncate / fallocate / punch / zero-range / remount ────────────
+
+type SyncVol = Arc<BtrfsVolume<narf_block::SyncBlock>>;
+
+fn file_layout(vol: &SyncVol, ino: u64) -> Vec<crate::write::fileops::FileItem> {
+    let (fs_root, _) = vol.fs_tree_root();
+    poll_once(crate::write::fileops::file_items(vol, fs_root, ino))
+        .and_then(|r| r.ok())
+        .unwrap_or_default()
+}
+
+/// Linux's per-inode invariants after a size/allocation change:
+/// - items sorted and non-overlapping, none starting at or past
+///   `align_up(size)` unless preallocated (`KEEP_SIZE`);
+/// - `nbytes` = the bytes of every inline/disk item;
+/// - with `^no-holes`, no gap below `align_up(size)`;
+/// - each disk extent's `EXTENT_ITEM.refs` = the items naming it;
+/// - REG ranges have checksums, purely preallocated extents none.
+fn size_invariants(vol: &SyncVol, ino: u64) -> Result<(), &'static str> {
+    use crate::write::fileops::Kind;
+    let items = file_layout(vol, ino);
+    let (fs_root, _) = vol.fs_tree_root();
+    let inode = poll_once(btree::find_item(
+        vol,
+        fs_root,
+        &BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0),
+    ))
+    .and_then(|r| r.ok())
+    .flatten()
+    .ok_or("inode missing")?;
+    let size = format::le64(&inode, 16).unwrap();
+    let nbytes = format::le64(&inode, 24).unwrap();
+    let ss = u64::from(vol.sectorsize());
+    let eof = size.div_ceil(ss) * ss;
+    let mut at = 0u64;
+    let mut sum = 0u64;
+    let no_holes = vol.superblock().incompat_flags & format::INCOMPAT_NO_HOLES != 0;
+    for item in &items {
+        if item.start < at {
+            return Err("overlapping file items");
+        }
+        if !no_holes && item.start > at && item.start <= eof {
+            return Err("gap without a hole item on a ^no-holes filesystem");
+        }
+        if item.start >= eof && !matches!(item.kind, Kind::Disk { prealloc: true }) {
+            return Err("a non-prealloc item lies past EOF");
+        }
+        if item.kind != Kind::Hole {
+            sum += item.end - item.start;
+        }
+        at = item.end;
+    }
+    if !no_holes && at < eof {
+        return Err("tail gap without a hole item on a ^no-holes filesystem");
+    }
+    if sum != nbytes {
+        return Err("inode nbytes != bytes of its items");
+    }
+    let root_tree = vol.root_tree_root().0;
+    let ext = poll_once(crate::roots::find_root(
+        vol,
+        root_tree,
+        format::EXTENT_TREE_OBJECTID,
+    ))
+    .and_then(|r| r.ok())
+    .ok_or("no extent root")?
+    .0;
+    let csum = poll_once(crate::roots::find_root(
+        vol,
+        root_tree,
+        format::CSUM_TREE_OBJECTID,
+    ))
+    .and_then(|r| r.ok())
+    .map(|r| r.0);
+    let disk: Vec<_> = items
+        .iter()
+        .filter(|i| matches!(i.kind, Kind::Disk { .. }))
+        .collect();
+    for item in &disk {
+        let bytenr = format::le64(&item.body, 21).unwrap();
+        let len = format::le64(&item.body, 29).unwrap();
+        let pieces = disk
+            .iter()
+            .filter(|o| format::le64(&o.body, 21).unwrap() == bytenr)
+            .count() as u64;
+        let ext_item = poll_once(btree::find_item(
+            vol,
+            ext,
+            &BtrfsKey::new(bytenr, format::EXTENT_ITEM_KEY, len),
+        ))
+        .and_then(|r| r.ok())
+        .flatten()
+        .ok_or("a file item names a disk extent with no EXTENT_ITEM")?;
+        if format::le64(&ext_item, 0).unwrap() != pieces {
+            return Err("EXTENT_ITEM refs != file items naming the extent");
+        }
+        let has_reg = disk.iter().any(|o| {
+            format::le64(&o.body, 21).unwrap() == bytenr
+                && matches!(o.kind, Kind::Disk { prealloc: false })
+        });
+        let csum_at = |logical: u64| {
+            csum.and_then(|root| {
+                poll_once(btree::last_before(
+                    vol,
+                    root,
+                    &BtrfsKey::new(
+                        format::EXTENT_CSUM_OBJECTID,
+                        format::EXTENT_CSUM_KEY,
+                        logical + 1,
+                    ),
+                ))
+                .and_then(|r| r.ok())
+                .flatten()
+            })
+            .is_some_and(|(k, body)| {
+                k.objectid == format::EXTENT_CSUM_OBJECTID
+                    && k.item_type == format::EXTENT_CSUM_KEY
+                    && k.offset <= logical
+                    && k.offset + (body.len() as u64 / 4) * ss > logical
+            })
+        };
+        match item.kind {
+            Kind::Disk { prealloc: false } => {
+                let first = bytenr + format::le64(&item.body, 37).unwrap();
+                if item.body[16] == format::COMPRESS_NONE && !csum_at(first) {
+                    return Err("a regular extent has no checksum");
+                }
+            }
+            Kind::Disk { prealloc: true } if !has_reg => {
+                if csum_at(bytenr) {
+                    return Err("a preallocated extent carries checksums");
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn read_back(file: &Arc<dyn narf_filesystem::FileOps>, len: usize) -> Option<Vec<u8>> {
+    read_all(file, len + 4096)
+}
+
+struct SizeCase {
+    dev: Arc<WritableSparseDevice>,
+    vol: SyncVol,
+}
+
+impl SizeCase {
+    fn new(fixture: &[u8]) -> Result<Self, &'static str> {
+        let dev = writable_sparse(fixture);
+        let vol = mount_writable(dev.clone()).map_err(|_| "fixture did not mount")?;
+        Ok(SizeCase { dev, vol })
+    }
+
+    fn create(
+        &self,
+        name: &str,
+        data: &[u8],
+    ) -> Result<Arc<dyn narf_filesystem::FileOps>, &'static str> {
+        use narf_filesystem::FsInstance;
+        let f = match poll_once(self.vol.root().create(name)) {
+            Some(Ok(f)) => f,
+            _ => return Err("create failed"),
+        };
+        if !data.is_empty()
+            && !matches!(poll_once(f.write(0, data)), Some(Ok(n)) if n == data.len())
+        {
+            return Err("initial write failed");
+        }
+        Ok(f)
+    }
+
+    /// Check content + invariants now, after a sync, and after a remount.
+    fn verify(&self, name: &str, want: &[u8]) -> Result<(), &'static str> {
+        use narf_filesystem::FsInstance;
+        // The extent tree only moves at commit, so the tree invariants are
+        // checked once the batch is committed.
+        let check = |vol: &SyncVol, committed: bool| -> Result<(), &'static str> {
+            let f = match poll_once(vol.root().lookup_async(name)) {
+                Some(Ok(f)) => f,
+                _ => return Err("file missing"),
+            };
+            match read_back(&f, want.len()) {
+                Some(got) if got == want => {}
+                _ => return Err("content differs from the Linux model"),
+            }
+            if committed {
+                size_invariants(vol, f.ino())?;
+            }
+            Ok(())
+        };
+        check(&self.vol, false)?;
+        if !matches!(poll_once(self.vol.sync_to_disk()), Some(Ok(()))) {
+            return Err("sync failed");
+        }
+        check(&self.vol, true)?;
+        let fresh = mount_writable(self.dev.clone()).map_err(|_| "remount failed")?;
+        check(&fresh, true)
+    }
+}
+
+fn smoke_btrfs_truncate_model() -> TestResult {
+    for fixture in [FIXTURE_BGT_SPARSE, FIXTURE_FST_SPARSE] {
+        let case = match SizeCase::new(fixture) {
+            Ok(c) => c,
+            Err(e) => return TestResult::Fail(e),
+        };
+        // Shrink to an unaligned size inside a multi-extent file, then grow:
+        // the bytes past the cut must come back as zeros.
+        let data = crate::interop::pattern(41, 300_000);
+        let f = match case.create("t.bin", &data) {
+            Ok(f) => f,
+            Err(e) => return TestResult::Fail(e),
+        };
+        if !matches!(poll_once(f.truncate(150_001)), Some(Ok(()))) {
+            return TestResult::Fail("truncate down failed");
+        }
+        if let Err(e) = case.verify("t.bin", &data[..150_001]) {
+            return TestResult::Fail(e);
+        }
+        if !matches!(poll_once(f.truncate(400_000)), Some(Ok(()))) {
+            return TestResult::Fail("truncate up failed");
+        }
+        let mut want = data[..150_001].to_vec();
+        want.resize(400_000, 0);
+        if let Err(e) = case.verify("t.bin", &want) {
+            return TestResult::Fail(e);
+        }
+        // O_TRUNC then a smaller rewrite (pacman): every extent is released.
+        let g = match case.create("p.conf", &crate::interop::pattern(40, 20_000)) {
+            Ok(g) => g,
+            Err(e) => return TestResult::Fail(e),
+        };
+        let _ = poll_once(case.vol.sync_to_disk());
+        if !matches!(poll_once(g.truncate(0)), Some(Ok(()))) {
+            return TestResult::Fail("O_TRUNC failed");
+        }
+        if !file_layout(&case.vol, g.ino()).is_empty() {
+            return TestResult::Fail("truncate to 0 left file items");
+        }
+        if !matches!(poll_once(g.write(0, b"short\n")), Some(Ok(6))) {
+            return TestResult::Fail("rewrite after O_TRUNC failed");
+        }
+        if let Err(e) = case.verify("p.conf", b"short\n") {
+            return TestResult::Fail(e);
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_truncate_model);
+
+fn smoke_btrfs_fallocate_model() -> TestResult {
+    use crate::write::fileops::Kind;
+    use crate::write::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
+    // The 16 MiB mixed `^no-holes` fixture gets smaller allocations.
+    for (fixture, big) in [(FIXTURE_BGT_SPARSE, true), (FIXTURE_FST_SPARSE, false)] {
+        let (pre, at, keep, records) = if big {
+            (1usize << 20, 256 * 1024usize, 2u64 << 20, 24u32)
+        } else {
+            (256 * 1024, 64 * 1024, 256 * 1024, 12)
+        };
+        let case = match SizeCase::new(fixture) {
+            Ok(c) => c,
+            Err(e) => return TestResult::Fail(e),
+        };
+        // Mode 0: size grows, PREALLOC items, reads as zeros; a write in the
+        // middle converts only its sectors (prealloc|REG|prealloc, refs 2).
+        let f = match case.create("a.bin", &[]) {
+            Ok(f) => f,
+            Err(e) => return TestResult::Fail(e),
+        };
+        if !matches!(poll_once(f.fallocate(0, 0, pre as u64)), Some(Ok(()))) {
+            return TestResult::Fail("fallocate mode 0 failed");
+        }
+        if f.stat().size != pre as u64 {
+            return TestResult::Fail("fallocate mode 0 did not set the size");
+        }
+        let items = file_layout(&case.vol, f.ino());
+        if items.is_empty()
+            || items
+                .iter()
+                .any(|i| !matches!(i.kind, Kind::Disk { prealloc: true }))
+        {
+            return TestResult::Fail("fallocate did not lay down PREALLOC items");
+        }
+        if let Err(e) = case.verify("a.bin", &alloc::vec![0u8; pre]) {
+            return TestResult::Fail(e);
+        }
+        let mut want = alloc::vec![0u8; pre];
+        want[at..at + 4096].copy_from_slice(&crate::interop::pattern(42, 4096));
+        if !matches!(
+            poll_once(f.write(at as u64, &want[at..at + 4096])),
+            Some(Ok(4096))
+        ) {
+            return TestResult::Fail("write into preallocated space failed");
+        }
+        let kinds: Vec<_> = file_layout(&case.vol, f.ino())
+            .iter()
+            .map(|i| i.kind)
+            .collect();
+        if !kinds.windows(3).any(|w| {
+            w == [
+                Kind::Disk { prealloc: true },
+                Kind::Disk { prealloc: false },
+                Kind::Disk { prealloc: true },
+            ]
+        }) {
+            return TestResult::Fail("write-to-convert did not split the prealloc extent");
+        }
+        if let Err(e) = case.verify("a.bin", &want) {
+            return TestResult::Fail(e);
+        }
+
+        // journald: KEEP_SIZE, appends, truncate at close.
+        let j = match case.create("j.bin", &[]) {
+            Ok(j) => j,
+            Err(e) => return TestResult::Fail(e),
+        };
+        if !matches!(
+            poll_once(j.fallocate(FALLOC_FL_KEEP_SIZE, 0, keep)),
+            Some(Ok(()))
+        ) {
+            return TestResult::Fail("fallocate KEEP_SIZE failed");
+        }
+        if j.stat().size != 0 {
+            return TestResult::Fail("KEEP_SIZE changed the size");
+        }
+        let mut journal = Vec::new();
+        for i in 0..records {
+            let rec = crate::interop::pattern(100 + i, 4096);
+            match poll_once(j.write(u64::from(i) * 4096, &rec)) {
+                Some(Ok(4096)) => {}
+                other => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(narf_console::Writer, "journal append {i}: {other:?}");
+                    return TestResult::Fail("journal append failed");
+                }
+            }
+            journal.extend_from_slice(&rec);
+        }
+        if let Err(e) = case.verify("j.bin", &journal) {
+            return TestResult::Fail(e);
+        }
+        if !matches!(poll_once(j.truncate(journal.len() as u64)), Some(Ok(()))) {
+            return TestResult::Fail("journal truncate at close failed");
+        }
+        if file_layout(&case.vol, j.ino())
+            .iter()
+            .any(|i| i.end > journal.len() as u64)
+        {
+            return TestResult::Fail("truncate left preallocation past EOF");
+        }
+        if let Err(e) = case.verify("j.bin", &journal) {
+            return TestResult::Fail(e);
+        }
+
+        // Punch an unaligned hole and zero a range inside written data.
+        let mut punch = crate::interop::pattern(44, 200_000);
+        let p = match case.create("p.bin", &punch) {
+            Ok(p) => p,
+            Err(e) => return TestResult::Fail(e),
+        };
+        let _ = poll_once(case.vol.sync_to_disk());
+        if !matches!(
+            poll_once(p.fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 10_000, 100_000)),
+            Some(Ok(()))
+        ) {
+            return TestResult::Fail("punch hole failed");
+        }
+        punch[10_000..110_000].fill(0);
+        if let Err(e) = case.verify("p.bin", &punch) {
+            return TestResult::Fail(e);
+        }
+        let mut zero = crate::interop::pattern(45, 200_000);
+        let z = match case.create("z.bin", &zero) {
+            Ok(z) => z,
+            Err(e) => return TestResult::Fail(e),
+        };
+        if !matches!(
+            poll_once(z.fallocate(FALLOC_FL_ZERO_RANGE, 50_000, 60_000)),
+            Some(Ok(()))
+        ) {
+            return TestResult::Fail("zero range failed");
+        }
+        zero[50_000..110_000].fill(0);
+        if let Err(e) = case.verify("z.bin", &zero) {
+            return TestResult::Fail(e);
+        }
+        // Linux btrfs refuses the rest with EOPNOTSUPP; PUNCH needs KEEP_SIZE.
+        for mode in [0x08u32, 0x20, 0x40, FALLOC_FL_PUNCH_HOLE] {
+            if !matches!(
+                poll_once(z.fallocate(mode, 0, 4096)),
+                Some(Err(FsError::Unsupported))
+            ) {
+                return TestResult::Fail("an unsupported fallocate mode was not EOPNOTSUPP");
+            }
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_fallocate_model);
+
+/// `mount -o remount,ro` commits and stops every write (every mount of the
+/// filesystem: the superblock is shared), the on-disk superblock stays put
+/// while read-only, and `remount,rw` writes again.
+fn smoke_btrfs_remount_ro_rw() -> TestResult {
+    use narf_filesystem::sb_flags::RDONLY;
+    use narf_filesystem::FsInstance;
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture did not mount"),
+    };
+    let home = match poll_once(BtrfsVolume::mount_view(
+        vol.core(),
+        Some(crate::volume::Subvol::Name("@home".into())),
+        false,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("@home view failed"),
+    };
+    let f = match poll_once(vol.root().create("before-ro.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if !matches!(
+        poll_once(f.write(0, b"committed by remount\n")),
+        Some(Ok(21))
+    ) {
+        return TestResult::Fail("write failed");
+    }
+    // Not synced: the remount itself must commit it.
+    if vol.reconfigure_sb(RDONLY, RDONLY, "").is_err() {
+        return TestResult::Fail("remount ro failed");
+    }
+    if !vol.is_read_only() || !home.is_read_only() {
+        return TestResult::Fail("remount ro did not make every mount read-only");
+    }
+    let sb_ro = read_super_at(&dev, format::SUPERBLOCK_OFFSET);
+    if poll_once(vol.root().create("x")).is_some_and(|r| r.is_ok())
+        || poll_once(home.root().create("x")).is_some_and(|r| r.is_ok())
+        || poll_once(f.truncate(0)).is_some_and(|r| r.is_ok())
+        || poll_once(f.fallocate(0, 0, 4096)).is_some_and(|r| r.is_ok())
+    {
+        return TestResult::Fail("a write succeeded on a read-only remount");
+    }
+    if read_super_at(&dev, format::SUPERBLOCK_OFFSET) != sb_ro {
+        return TestResult::Fail("the superblock changed while read-only");
+    }
+    // The commit forced by the remount is on disk: a fresh mount sees it.
+    match mount_writable_ro(dev.clone()) {
+        Ok(other) => match poll_once(other.root().lookup_async("before-ro.txt")) {
+            Some(Ok(g)) if read_all(&g, 64).as_deref() == Some(&b"committed by remount\n"[..]) => {}
+            _ => return TestResult::Fail("remount ro did not make the write durable"),
+        },
+        Err(_) => return TestResult::Fail("read-only image did not mount"),
+    }
+    if vol.reconfigure_sb(0, RDONLY, "").is_err() {
+        return TestResult::Fail("remount rw failed");
+    }
+    if vol.is_read_only() || home.is_read_only() {
+        return TestResult::Fail("remount rw left a mount read-only");
+    }
+    let g = match poll_once(home.root().create("after-rw.txt")) {
+        Some(Ok(g)) => g,
+        _ => return TestResult::Fail("create after remount rw failed"),
+    };
+    if !matches!(poll_once(g.write(0, b"rw\n")), Some(Ok(3))) {
+        return TestResult::Fail("write after remount rw failed");
+    }
+    if !matches!(poll_once(home.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("sync after remount rw failed");
+    }
+    // The data-string spelling (`rootflags=ro`, fsconfig "ro") works too.
+    if vol.reconfigure("ro").is_err() || !vol.is_read_only() {
+        return TestResult::Fail("remount via the `ro` option failed");
+    }
+    if vol.reconfigure("rw").is_err() || vol.is_read_only() {
+        return TestResult::Fail("remount via the `rw` option failed");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_remount_ro_rw);
+
+// ── Decompressed-extent cache ───────────────────────────────────────
+
+/// A repeated read of a zstd extent is served from the cache, and a write
+/// through the same volume is read back, not the stale cached plain text.
+fn smoke_btrfs_decompress_cache_hit_and_write() -> TestResult {
+    use crate::decompress_cache as cache;
+    use narf_filesystem::FsInstance;
+    let vol = match mount_sparse(FIXTURE_ZSTD_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("zstd fixture failed to mount"),
+    };
+    let core = Arc::downgrade(vol.core());
+    let handle = cache::VolumeRef::new(core);
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat failed"),
+    };
+    let want = expected_big();
+    let mut page = [0u8; 4096];
+    if poll_once(big.read(0, &mut page)) != Some(Ok(4096)) || page[..] != want[..4096] {
+        return TestResult::Fail("first zstd read wrong");
+    }
+    if cache::cached_bytes_for(&handle) == 0 {
+        return TestResult::Fail("verified zstd extent not cached");
+    }
+    let (hits, _) = cache::stats();
+    let mut page2 = [0u8; 4096];
+    if poll_once(big.read(4096, &mut page2)) != Some(Ok(4096)) || page2[..] != want[4096..8192] {
+        return TestResult::Fail("second zstd read wrong");
+    }
+    if cache::stats().0 <= hits {
+        return TestResult::Fail("repeated read of the same extent missed the cache");
+    }
+    // Overwrite the start of the file, then read it back through the cache.
+    let patch = [b'Z'; 64];
+    if poll_once(big.write(0, &patch)) != Some(Ok(64)) {
+        return TestResult::Fail("write over the compressed extent failed");
+    }
+    let mut back = [0u8; 128];
+    if poll_once(big.read(0, &mut back)) != Some(Ok(128)) {
+        return TestResult::Fail("read after write failed");
+    }
+    if back[..64] != patch || back[64..] != want[64..128] {
+        return TestResult::Fail("read after write returned stale cached data");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/compression/cache",
+    smoke_btrfs_decompress_cache_hit_and_write
+);
+
+/// The cache's identity and invalidation rules, against a stand-in volume.
+fn smoke_btrfs_decompress_cache_invalidation() -> TestResult {
+    use crate::decompress_cache::{self as cache, ExtentId, VolumeRef};
+    let owner: Arc<dyn core::any::Any + Send + Sync> = Arc::new(0u64);
+    let vol = VolumeRef::new(Arc::downgrade(&owner));
+    let key = VolumeRef::key_of(Arc::as_ptr(&owner) as *const u8);
+    let id = |bytenr: u64, generation: u64| ExtentId {
+        disk_bytenr: bytenr,
+        disk_num_bytes: 4096,
+        compression: format::COMPRESS_ZSTD,
+        generation,
+    };
+    let data = |b: u8| Arc::new(alloc::vec![b; 8192]);
+    let old = id(1 << 20, 7);
+    cache::insert(&vol, old, cache::epoch(&vol), data(1));
+    match cache::get(&vol, old) {
+        Some(p) if p[0] == 1 => {}
+        _ => return TestResult::Fail("inserted extent not returned"),
+    }
+    // Freed and reallocated: the same bytenr holds a new extent with a new
+    // generation, written through write_logical. Neither the old identity nor
+    // the new one may return the old plain text.
+    cache::invalidate(key, 1 << 20, 4096);
+    if cache::get(&vol, old).is_some() {
+        return TestResult::Fail("write over a cached extent did not invalidate it");
+    }
+    let new = id(1 << 20, 8);
+    if cache::get(&vol, new).is_some() {
+        return TestResult::Fail("reallocated bytenr hit the old extent");
+    }
+    cache::insert(&vol, new, cache::epoch(&vol), data(2));
+    if cache::get(&vol, old).is_some() || cache::get(&vol, new).map(|p| p[0]) != Some(2) {
+        return TestResult::Fail("generation does not separate old and new extents");
+    }
+    // An overlapping write (starting inside the extent) invalidates; a
+    // disjoint one does not.
+    cache::invalidate(key, (1 << 20) + 8192, 4096);
+    if cache::get(&vol, new).is_none() {
+        return TestResult::Fail("disjoint write invalidated an extent");
+    }
+    cache::invalidate(key, (1 << 20) + 4095, 1);
+    if cache::get(&vol, new).is_some() {
+        return TestResult::Fail("overlapping write did not invalidate");
+    }
+    // Bytes read while a write was in flight are not published.
+    let stale_epoch = cache::epoch(&vol);
+    cache::invalidate(key, 1 << 30, 16);
+    cache::insert(&vol, id(2 << 20, 9), stale_epoch, data(3));
+    if cache::get(&vol, id(2 << 20, 9)).is_some() {
+        return TestResult::Fail("insert across a write epoch was published");
+    }
+    // A dead volume's entries are never served.
+    cache::insert(&vol, id(3 << 20, 9), cache::epoch(&vol), data(4));
+    drop(owner);
+    if cache::get(&vol, id(3 << 20, 9)).is_some() {
+        return TestResult::Fail("entry of a dropped volume served");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/compression/cache",
+    smoke_btrfs_decompress_cache_invalidation
+);
+
+// ── CachyOS root-rw: many small files through create + O_TRUNC + write ──
+
+macro_rules! kt_log {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write as _;
+        let _ = writeln!(narf_console::Writer, $($arg)*);
+    }};
+}
+
+/// What a shell's `printf ... > dir/fN` loop does on the CachyOS layout
+/// (`@` subvolume of the host-exact BGT image): create, truncate to 0 (the
+/// O_TRUNC of the open), write a line. Every file must succeed and read back,
+/// across several batch commits.
+fn smoke_btrfs_bgt_many_small_files_rw() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_writable(writable_sparse(FIXTURE_BGT_SPARSE)) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("BGT fixture failed to mount rw"),
+    };
+    if poll_once(vol.switch_to_subvol(&crate::volume::Subvol::Name("@".into())))
+        .is_none_or(|r| r.is_err())
+    {
+        return TestResult::Fail("subvol=@ did not resolve");
+    }
+    let root = vol.root();
+    let dir = match poll_once(root.mkdir("narf-many")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir narf-many failed"),
+    };
+    for i in 1..=60u32 {
+        let name = alloc::format!("f{i}");
+        let file = match poll_once(dir.create(&name)) {
+            Some(Ok(f)) => f,
+            other => {
+                kt_log!(
+                    "btrfs many-files: create f{i} -> {:?}",
+                    other.map(|r| r.map(|_| ()))
+                );
+                return TestResult::Fail("create of a small file failed");
+            }
+        };
+        if let Some(Err(e)) = poll_once(file.truncate(0)) {
+            kt_log!("btrfs many-files: truncate f{i} -> {e:?}");
+            return TestResult::Fail("O_TRUNC of a new small file failed");
+        }
+        let body = alloc::format!("narf {i}\n");
+        match poll_once(file.write(0, body.as_bytes())) {
+            Some(Ok(n)) if n == body.len() => {}
+            other => {
+                kt_log!("btrfs many-files: write f{i} -> {other:?}");
+                return TestResult::Fail("write of a small file failed");
+            }
+        }
+    }
+    let _ = poll_once(vol.sync_to_disk());
+    for i in [1u32, 15, 16, 60] {
+        let name = alloc::format!("f{i}");
+        let f = match poll_once(dir.lookup_async(&name)) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("small file missing after sync"),
+        };
+        let want = alloc::format!("narf {i}\n");
+        if read_all(&f, 64).as_deref() != Some(want.as_bytes()) {
+            return TestResult::Fail("small file content wrong after sync");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_bgt_many_small_files_rw);
+
+/// The many-small-files pattern of `cachyos-root-smoke --rw` against
+/// whatever large btrfs image xtask serves on nvme0
+/// (`XTASK_BTRFS_NVME_IMAGE`, with `narf.btrfs_bigtree` on the command line):
+/// a fresh directory under `@` receives hundreds of files, directories,
+/// writes, renames and unlinks through the VFS, then everything is read back
+/// after a sync. Skipped unless asked for.
+fn smoke_btrfs_bigtree_nvme() -> TestResult {
+    use core::fmt::Write as _;
+    use narf_block::fs_detect::{detect_filesystem, FsType};
+    if !narf_boot::args().has_flag("narf.btrfs_bigtree") {
+        return TestResult::Skip("no large btrfs image (narf.btrfs_bigtree)");
+    }
+    let Some(entry) = narf_block::block_devices()
+        .into_iter()
+        .find(|e| matches!(detect_filesystem(&e.dev), Ok(Some(FsType::Btrfs))))
+    else {
+        return TestResult::Skip("no btrfs block device");
+    };
+    let dev = entry.dev.clone();
+    let vol = match narf_scheduler::block_on(crate::registry::mount(
+        &dev,
+        crate::discover_members(dev.clone()),
+        Some(crate::volume::Subvol::Name("@".into())),
+        false,
+    )) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("large image did not mount @"),
+    };
+    let report = |what: &str, e: FsError| {
+        let _ = writeln!(narf_console::Writer, "bigtree: {what}: {e:?}");
+    };
+    match narf_scheduler::block_on(bigtree_workload(&vol, report)) {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs/bigtree", smoke_btrfs_bigtree_nvme);
+
+/// Hundreds of creates, mkdirs, writes, renames and unlinks in fresh
+/// directories, then a sync and a full read-back.
+async fn bigtree_workload<B: narf_block::BlockDevice + 'static>(
+    vol: &Arc<BtrfsVolume<B>>,
+    report: impl Fn(&str, FsError),
+) -> Result<(), &'static str> {
+    use narf_filesystem::FsInstance;
+    let root = vol.root();
+    let top = root.mkdir("narf-bigtree").await.map_err(|e| {
+        report("mkdir narf-bigtree", e);
+        "mkdir top"
+    })?;
+    let many = top.mkdir("many").await.map_err(|e| {
+        report("mkdir many", e);
+        "mkdir many"
+    })?;
+    for i in 0..400u32 {
+        let name = alloc::format!("f{i}");
+        let f = many.create(&name).await.map_err(|e| {
+            report(&name, e);
+            "create in a fresh directory failed"
+        })?;
+        // `printf ... > f`: open(O_CREAT|O_TRUNC) truncates the new file.
+        f.truncate(0).await.map_err(|e| {
+            report("O_TRUNC", e);
+            "O_TRUNC of a new file failed"
+        })?;
+        let body = alloc::format!("narf {i}\n");
+        f.write(0, body.as_bytes()).await.map_err(|e| {
+            report(&name, e);
+            "small write failed"
+        })?;
+    }
+    for d in 0..40u32 {
+        let dir = top.mkdir(&alloc::format!("d{d}")).await.map_err(|e| {
+            report("mkdir d", e);
+            "mkdir d"
+        })?;
+        for i in 0..10u32 {
+            let f = dir.create(&alloc::format!("g{i}")).await.map_err(|e| {
+                report("create g", e);
+                "create g"
+            })?;
+            let len = 1000 + (d * 10 + i) as usize * 37;
+            f.write(0, &crate::interop::pattern(d * 10 + i, len))
+                .await
+                .map_err(|e| {
+                    report("write g", e);
+                    "write g"
+                })?;
+        }
+    }
+    for i in (0..400u32).step_by(3) {
+        many.rename(&alloc::format!("f{i}"), &alloc::format!("r{i}"))
+            .await
+            .map_err(|e| {
+                report("rename", e);
+                "rename"
+            })?;
+    }
+    for i in (1..400u32).step_by(3) {
+        many.unlink(&alloc::format!("f{i}")).await.map_err(|e| {
+            report("unlink", e);
+            "unlink"
+        })?;
+    }
+    vol.sync_to_disk().await.map_err(|e| {
+        report("sync", e);
+        "sync"
+    })?;
+    for i in 0..400u32 {
+        let name = match i % 3 {
+            0 => alloc::format!("r{i}"),
+            1 => continue,
+            _ => alloc::format!("f{i}"),
+        };
+        let f = many
+            .lookup_async(&name)
+            .await
+            .map_err(|_| "a file is missing after sync")?;
+        let mut buf = [0u8; 32];
+        let n = f.read(0, &mut buf).await.map_err(|_| "read-back")?;
+        if buf[..n] != *alloc::format!("narf {i}\n").as_bytes() {
+            return Err("small file content wrong");
+        }
+    }
+    for d in 0..40u32 {
+        let dir = top
+            .lookup_dir_async(&alloc::format!("d{d}"))
+            .await
+            .map_err(|_| "dir missing")?;
+        for i in 0..10u32 {
+            let f = dir
+                .lookup_async(&alloc::format!("g{i}"))
+                .await
+                .map_err(|_| "g missing")?;
+            let len = 1000 + (d * 10 + i) as usize * 37;
+            let mut buf = alloc::vec![0u8; len + 16];
+            let n = f.read(0, &mut buf).await.map_err(|_| "read g")?;
+            if buf[..n] != crate::interop::pattern(d * 10 + i, len)[..] {
+                return Err("g content wrong");
+            }
+        }
+    }
+    let _ = root;
+    Ok(())
+}
+
+/// Writers racing each other and the commit timer through the VFS of one
+/// filesystem: two tasks create, write, rename and unlink files in the same
+/// directory (and one in a second subvolume) while a third keeps committing
+/// as the transaction kthread would. Every operation must succeed and the
+/// result must read back exactly. On a device with genuinely asynchronous I/O
+/// the futures interleave at every await, which is what exposes an operation
+/// that reads tree state outside the lock under which it stages its edits.
+async fn racing_writers<B: narf_block::BlockDevice + 'static>(
+    vol: &Arc<BtrfsVolume<B>>,
+    other: Option<&Arc<BtrfsVolume<B>>>,
+    tag: &str,
+    report: &dyn Fn(&str, FsError),
+) -> Result<(), &'static str> {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_filesystem::FsInstance;
+    let dir = vol
+        .root()
+        .mkdir(&alloc::format!("race-{tag}"))
+        .await
+        .map_err(|e| {
+            report("mkdir race", e);
+            "mkdir race dir"
+        })?;
+    let done = AtomicU32::new(0);
+    let writer = |prefix: &'static str| {
+        let dir = dir.clone();
+        let done = &done;
+        async move {
+            let r: Result<(), &'static str> = async {
+                for i in 0..120u32 {
+                    let name = alloc::format!("{prefix}{i}");
+                    let f = dir.create(&name).await.map_err(|e| {
+                        report(&name, e);
+                        "racing create failed"
+                    })?;
+                    f.truncate(0).await.map_err(|e| {
+                        report(&name, e);
+                        "racing O_TRUNC failed"
+                    })?;
+                    let body = alloc::format!("{prefix} {i}\n");
+                    f.write(0, body.as_bytes()).await.map_err(|e| {
+                        report(&name, e);
+                        "racing write failed"
+                    })?;
+                    if i % 4 == 3 {
+                        dir.rename(&name, &alloc::format!("{prefix}r{i}"))
+                            .await
+                            .map_err(|e| {
+                                report("rename", e);
+                                "racing rename failed"
+                            })?;
+                    }
+                    if i % 4 == 2 {
+                        dir.unlink(&name).await.map_err(|e| {
+                            report("unlink", e);
+                            "racing unlink failed"
+                        })?;
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            done.fetch_add(1, Ordering::AcqRel);
+            r
+        }
+    };
+    let other_writer = async {
+        if let Some(o) = other {
+            let d = o
+                .root()
+                .mkdir(&alloc::format!("race-{tag}"))
+                .await
+                .map_err(|_| "mkdir in second subvolume")?;
+            for i in 0..60u32 {
+                let f = d
+                    .create(&alloc::format!("o{i}"))
+                    .await
+                    .map_err(|_| "create in second subvolume")?;
+                f.write(0, &crate::interop::pattern(i, 3000))
+                    .await
+                    .map_err(|_| "write in second subvolume")?;
+            }
+        }
+        done.fetch_add(1, Ordering::AcqRel);
+        Ok::<(), &'static str>(())
+    };
+    let committer = async {
+        crate::write::__test_set_commit_interval_cycles(0);
+        while done.load(Ordering::Acquire) < 3 {
+            let _ = crate::write::commit_if_stale(vol).await;
+            narf_scheduler::yield_now().await;
+        }
+        crate::write::__test_set_commit_interval_cycles(u64::MAX);
+    };
+    let ((a, b), (c, ())) = join2(
+        join2(writer("a"), writer("b")),
+        join2(other_writer, committer),
+    )
+    .await;
+    a?;
+    b?;
+    c?;
+    vol.sync_to_disk().await.map_err(|_| "sync")?;
+    for prefix in ["a", "b"] {
+        for i in 0..120u32 {
+            let name = match i % 4 {
+                2 => continue,
+                3 => alloc::format!("{prefix}r{i}"),
+                _ => alloc::format!("{prefix}{i}"),
+            };
+            let f = dir
+                .lookup_async(&name)
+                .await
+                .map_err(|_| "a racing file is missing")?;
+            let mut buf = [0u8; 32];
+            let n = f.read(0, &mut buf).await.map_err(|_| "read")?;
+            if buf[..n] != *alloc::format!("{prefix} {i}\n").as_bytes() {
+                return Err("racing file content wrong");
+            }
+        }
+    }
+    let names = dir.enumerate_async(0, 1000).await.map_err(|_| "readdir")?;
+    if names.len() != 180 {
+        return Err("racing directory has the wrong number of entries");
+    }
+    Ok(())
+}
+
+/// [`racing_writers`] on xtask's NVMe btrfs disk (real asynchronous I/O).
+fn smoke_btrfs_racing_writers_nvme() -> TestResult {
+    use core::fmt::Write as _;
+    use narf_block::fs_detect::{detect_filesystem, FsType};
+    let args = narf_boot::args();
+    if !args.has_flag("narf.btrfs_smoke") && !args.has_flag("narf.btrfs_bigtree") {
+        return TestResult::Skip("no disposable btrfs disk");
+    }
+    let Some(entry) = narf_block::block_devices()
+        .into_iter()
+        .find(|e| matches!(detect_filesystem(&e.dev), Ok(Some(FsType::Btrfs))))
+    else {
+        return TestResult::Skip("no btrfs block device");
+    };
+    let dev = entry.dev.clone();
+    let big = args.has_flag("narf.btrfs_bigtree");
+    let mount = |subvol: Option<&str>| {
+        narf_scheduler::block_on(crate::registry::mount(
+            &dev,
+            crate::discover_members(dev.clone()),
+            subvol.map(|s| crate::volume::Subvol::Name(s.into())),
+            false,
+        ))
+    };
+    let (vol, other) = if big {
+        match (mount(Some("@")), mount(Some("@home"))) {
+            (Ok(a), Ok(b)) => (a, Some(b)),
+            _ => return TestResult::Fail("large image subvolumes did not mount"),
+        }
+    } else {
+        match mount(None) {
+            Ok(a) => (a, None),
+            Err(_) => return TestResult::Fail("nvme btrfs did not mount"),
+        }
+    };
+    let report = |what: &str, e: FsError| {
+        let _ = writeln!(narf_console::Writer, "racing: {what}: {e:?}");
+    };
+    match narf_scheduler::block_on(racing_writers(&vol, other.as_ref(), "nvme", &report)) {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs/race", smoke_btrfs_racing_writers_nvme);
+
+/// Two writers on two other CPUs creating, writing, renaming and unlinking
+/// in ONE directory of one filesystem at the same time, while a third CPU
+/// commits as the transaction kthread does. This is the shape of a booting
+/// systemd (many units writing in parallel) that made `create` fail with
+/// `InvalidData` on the CachyOS root: each operation chose its new inode
+/// number and directory index from the tree before taking the batch lock, so
+/// two CPUs could pick the same ones.
+fn smoke_btrfs_racing_writers_smp() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_filesystem::FsInstance;
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    static FAILED: AtomicU32 = AtomicU32::new(0);
+    static STARTED: AtomicU32 = AtomicU32::new(0);
+    if narf_lib::smp::cpu_count() < 5 {
+        return TestResult::Skip("needs five CPUs");
+    }
+    DONE.store(0, Ordering::Release);
+    FAILED.store(0, Ordering::Release);
+    STARTED.store(0, Ordering::Release);
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture did not mount"),
+    };
+    let dir = match poll_once(vol.root().mkdir("smp-race")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    const PER: u32 = 150;
+    // Stable files a reader on a fourth CPU keeps reading while the writers
+    // restructure the same directory's leaves: a reader takes no lock, so the
+    // tree it walks must never be rewritten under it.
+    for i in 0..24u32 {
+        let f = match poll_once(dir.create(&alloc::format!("s{i}"))) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("create stable file failed"),
+        };
+        if !matches!(
+            poll_once(f.write(0, &crate::interop::pattern(i, 5000))),
+            Some(Ok(5000))
+        ) {
+            return TestResult::Fail("write stable file failed");
+        }
+    }
+    {
+        let dir = dir.clone();
+        narf_scheduler::spawn_stackful_pinned(
+            async move {
+                let mut rounds = 0u32;
+                while DONE.load(Ordering::Acquire) < 3 || rounds == 0 {
+                    for i in 0..24u32 {
+                        let ok = async {
+                            let f = dir.lookup_async(&alloc::format!("s{i}")).await?;
+                            let mut buf = alloc::vec![0u8; 5016];
+                            let n = f.read(0, &mut buf).await?;
+                            Ok::<bool, FsError>(buf[..n] == crate::interop::pattern(i, 5000)[..])
+                        }
+                        .await;
+                        if !matches!(ok, Ok(true)) {
+                            use core::fmt::Write as _;
+                            let _ = writeln!(narf_console::Writer, "smp race reader s{i}: {ok:?}");
+                            FAILED.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    rounds += 1;
+                    narf_scheduler::yield_now().await;
+                }
+                DONE.fetch_add(1, Ordering::AcqRel);
+            },
+            4,
+        );
+    }
+    for (cpu, prefix) in [(1u32, "a"), (2, "b")] {
+        let dir = dir.clone();
+        narf_scheduler::spawn_stackful_pinned(
+            async move {
+                STARTED.fetch_add(1, Ordering::AcqRel);
+                for i in 0..PER {
+                    let name = alloc::format!("{prefix}{i}");
+                    let ok = async {
+                        let f = dir.create(&name).await.map_err(|e| ("create", e))?;
+                        f.truncate(0).await.map_err(|e| ("truncate", e))?;
+                        f.write(0, alloc::format!("{prefix} {i}\n").as_bytes())
+                            .await
+                            .map_err(|e| ("write", e))?;
+                        if i % 4 == 3 {
+                            dir.rename(&name, &alloc::format!("{prefix}r{i}"))
+                                .await
+                                .map_err(|e| ("rename", e))?;
+                        }
+                        if i % 4 == 2 {
+                            dir.unlink(&name).await.map_err(|e| ("unlink", e))?;
+                        }
+                        Ok::<(), (&'static str, FsError)>(())
+                    }
+                    .await;
+                    if let Err((step, e)) = ok {
+                        use core::fmt::Write as _;
+                        let _ = writeln!(narf_console::Writer, "smp race {name} {step}: {e:?}");
+                        FAILED.fetch_add(1, Ordering::AcqRel);
+                        break;
+                    }
+                }
+                DONE.fetch_add(1, Ordering::AcqRel);
+            },
+            cpu,
+        );
+    }
+    {
+        let vol = vol.clone();
+        narf_scheduler::spawn_stackful_pinned(
+            async move {
+                crate::write::__test_set_commit_interval_cycles(0);
+                while DONE.load(Ordering::Acquire) < 2 {
+                    let _ = crate::write::commit_if_stale(&vol).await;
+                    narf_scheduler::yield_now().await;
+                }
+                crate::write::__test_set_commit_interval_cycles(u64::MAX);
+                DONE.fetch_add(1, Ordering::AcqRel);
+            },
+            3,
+        );
+    }
+    let mut spins = 0u64;
+    while DONE.load(Ordering::Acquire) < 4 && spins < 20_000_000_000 {
+        core::hint::spin_loop();
+        spins += 1;
+    }
+    if DONE.load(Ordering::Acquire) < 4 {
+        return TestResult::Fail("racing writers did not finish");
+    }
+    if FAILED.load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("a racing operation failed");
+    }
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("sync failed");
+    }
+    let check = |vol: &SyncVol| -> Result<(), &'static str> {
+        let dir = match poll_once(vol.root().lookup_dir_async("smp-race")) {
+            Some(Ok(d)) => d,
+            _ => return Err("race dir missing"),
+        };
+        for prefix in ["a", "b"] {
+            for i in 0..PER {
+                let name = match i % 4 {
+                    2 => continue,
+                    3 => alloc::format!("{prefix}r{i}"),
+                    _ => alloc::format!("{prefix}{i}"),
+                };
+                let f = match poll_once(dir.lookup_async(&name)) {
+                    Some(Ok(f)) => f,
+                    _ => return Err("a racing file is missing"),
+                };
+                if read_all(&f, 64) != Some(alloc::format!("{prefix} {i}\n").into_bytes()) {
+                    return Err("racing file content wrong");
+                }
+            }
+        }
+        let kept = 2 * (0..PER).filter(|i| i % 4 != 2).count() + 24;
+        match poll_once(dir.enumerate_async(0, 4096)) {
+            Some(Ok(e)) if e.len() == kept => Ok(()),
+            _ => Err("racing directory has the wrong entries"),
+        }
+    };
+    if let Err(e) = check(&vol) {
+        return TestResult::Fail(e);
+    }
+    match mount_writable(dev) {
+        Ok(fresh) => match check(&fresh) {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        },
+        Err(_) => TestResult::Fail("remount after racing writers failed"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs/race", smoke_btrfs_racing_writers_smp);
+
+/// Hundreds of creates, mkdirs, writes, renames and unlinks on a tree whose
+/// root is at level 2 (splits under internal nodes, path re-searches after
+/// COW), with the result checked after a sync and after a remount.
+fn smoke_btrfs_tall_tree_many_files() -> TestResult {
+    use core::fmt::Write as _;
+    let dev = writable_sparse(FIXTURE_TALL_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("tall fixture did not mount"),
+    };
+    if poll_once(vol.switch_to_subvol(&crate::volume::Subvol::Name("@".into())))
+        .is_none_or(|r| r.is_err())
+    {
+        return TestResult::Fail("subvol @ did not resolve");
+    }
+    if vol.fs_tree_root().1 < 2 {
+        return TestResult::Fail("fixture @ tree is not level 2");
+    }
+    let report = |what: &str, e: FsError| {
+        let _ = writeln!(narf_console::Writer, "tall: {what}: {e:?}");
+    };
+    match poll_once(bigtree_workload(&vol, report)) {
+        Some(Ok(())) => {}
+        Some(Err(why)) => return TestResult::Fail(why),
+        None => return TestResult::Fail("workload did not complete"),
+    }
+    let fresh = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount failed"),
+    };
+    if poll_once(fresh.switch_to_subvol(&crate::volume::Subvol::Name("@".into())))
+        .is_none_or(|r| r.is_err())
+    {
+        return TestResult::Fail("subvol @ after remount");
+    }
+    use narf_filesystem::FsInstance;
+    let top = match poll_once(fresh.root().lookup_dir_async("narf-bigtree")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("workload dir missing after remount"),
+    };
+    let many = match poll_once(top.lookup_dir_async("many")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("many missing after remount"),
+    };
+    let expected = (0..400u32).filter(|i| i % 3 != 1).count();
+    match poll_once(many.enumerate_async(0, 4096)) {
+        Some(Ok(e)) if e.len() == expected => TestResult::Pass,
+        _ => TestResult::Fail("directory entries wrong after remount"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_tall_tree_many_files);
+
+/// `exclude_super_stripes`: a chunk whose physical stripe covers the 64 MiB
+/// superblock copy has the containing stripe window excluded, at the logical
+/// address that maps there; the primary at 64 KiB lies before every chunk.
+fn smoke_btrfs_super_stripe_exclusion() -> TestResult {
+    let mut map = ChunkMap::new();
+    // 32 MiB at logical 100 MiB, physical 50 MiB: the 64 MiB copy sits
+    // 14 MiB into it.
+    map.add_entry(100 << 20, 32 << 20, 1, 50 << 20);
+    // A chunk nowhere near a copy.
+    map.add_entry(200 << 20, 8 << 20, 1, 300 << 20);
+    let got = map.super_stripe_exclusions(&format::SUPERBLOCK_MIRROR_OFFSETS);
+    if got != alloc::vec![((114u64 << 20), 64 * 1024u64)] {
+        return TestResult::Fail("super stripe not reverse-mapped to its logical window");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_super_stripe_exclusion);
+
+/// chmod / chown / utimensat through the node (`btrfs_setattr`): the file
+/// type never changes, chown kills set-uid (and group-exec set-gid) on a
+/// file, explicit times land exactly, ctime and the inode sequence advance,
+/// writes and truncates move mtime, and it all survives a remount.
+fn smoke_btrfs_setattr_model() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture did not mount"),
+    };
+    let f = match poll_once(vol.root().create("attrs.bin")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let ino = f.ino();
+    let raw = |vol: &SyncVol| {
+        let (root, _) = vol.fs_tree_root();
+        poll_once(btree::find_item(
+            vol,
+            root,
+            &BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0),
+        ))
+        .and_then(|r| r.ok())
+        .flatten()
+        .unwrap_or_default()
+    };
+    let mode = |b: &[u8]| format::le32(b, 52).unwrap_or(0);
+    let seq = |b: &[u8]| format::le64(b, 72).unwrap_or(0);
+    let time = |b: &[u8], off: usize| {
+        (
+            format::le64(b, off).unwrap_or(0) as i64,
+            format::le32(b, off + 8).unwrap_or(0),
+        )
+    };
+    let before = raw(&vol);
+    if !matches!(poll_once(f.set_perms(0o6755)), Some(Ok(()))) {
+        return TestResult::Fail("chmod failed");
+    }
+    let after_chmod = raw(&vol);
+    if mode(&after_chmod) != 0o100000 | 0o6755 || f.stat().mode.perms != 0o755 {
+        return TestResult::Fail("chmod did not set exactly the permission bits");
+    }
+    if seq(&after_chmod) <= seq(&before) {
+        return TestResult::Fail("chmod did not advance the inode sequence");
+    }
+    if !matches!(poll_once(f.set_owners(1000, 1000)), Some(Ok(()))) {
+        return TestResult::Fail("chown failed");
+    }
+    let after_chown = raw(&vol);
+    if format::le32(&after_chown, 44) != Ok(1000)
+        || format::le32(&after_chown, 48) != Ok(1000)
+        || f.owners() != (1000, 1000)
+    {
+        return TestResult::Fail("chown did not set uid/gid");
+    }
+    // 06755 has group-exec, so chown clears both set-uid and set-gid.
+    if mode(&after_chown) != 0o100755 {
+        return TestResult::Fail("chown did not kill set-uid/set-gid");
+    }
+    let at = 1_700_000_000_123_456_789u64;
+    let mt = 1_600_000_000_987_654_321u64;
+    if f.set_times(Some(at), Some(mt)).is_err() {
+        return TestResult::Fail("utimensat failed");
+    }
+    let after_times = raw(&vol);
+    if time(&after_times, 112) != (1_700_000_000, 123_456_789)
+        || time(&after_times, 136) != (1_600_000_000, 987_654_321)
+    {
+        return TestResult::Fail("utimensat times not exact");
+    }
+    // atime OMIT: only mtime moves.
+    if f.set_times(None, Some(mt + 1)).is_err()
+        || time(&raw(&vol), 112) != (1_700_000_000, 123_456_789)
+    {
+        return TestResult::Fail("UTIME_OMIT changed atime");
+    }
+    let clock = crate::write::wall_now();
+    if let Some(now) = clock {
+        if time(&after_times, 124) < (now.0 - 5, 0) {
+            return TestResult::Fail("ctime did not move to now");
+        }
+        if !matches!(poll_once(f.write(0, b"data")), Some(Ok(4))) {
+            return TestResult::Fail("write failed");
+        }
+        if time(&raw(&vol), 136) < (now.0 - 5, 0) {
+            return TestResult::Fail("write did not move mtime");
+        }
+    }
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("sync failed");
+    }
+    let fresh = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount failed"),
+    };
+    let persisted = raw(&fresh);
+    if mode(&persisted) != 0o100755
+        || format::le32(&persisted, 44) != Ok(1000)
+        || time(&persisted, 112) != (1_700_000_000, 123_456_789)
+    {
+        return TestResult::Fail("attributes did not survive a remount");
+    }
+    // A directory keeps its S_ISGID through chown (Linux keeps it on dirs).
+    let d = match poll_once(fresh.root().mkdir("sgid-dir")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    let dnode = match poll_once(fresh.root().lookup_async("sgid-dir")) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("lookup dir failed"),
+    };
+    let _ = d;
+    if !matches!(poll_once(dnode.set_perms(0o2775)), Some(Ok(())))
+        || !matches!(poll_once(dnode.set_owners(5, 5)), Some(Ok(())))
+        || dnode.stat().mode.perms & 0o7777 != 0o775
+    {
+        return TestResult::Fail("directory chmod/chown failed");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_setattr_model);

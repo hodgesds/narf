@@ -1,11 +1,16 @@
 use super::*;
 use crate::amdgpu_gfx_firmware::tests::container;
-use alloc::vec;
+use alloc::{vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 pub(crate) fn fixture() -> Firmware {
+    fixture_with_vcn(1)
+}
+/// Complete set for a board exposing the VCN instances in `mask`.
+pub(crate) fn fixture_with_vcn(mask: u8) -> Firmware {
     Firmware {
         bytes: core::array::from_fn(|i| Some(container(Source::ORDER[i]))),
+        vcn: mask,
     }
 }
 fn navi22_graphics_set_requires_all_images_except_missing_mec2() -> TestResult {
@@ -91,6 +96,65 @@ pub(crate) fn gpu() -> AmdGpu {
         ],
     }
 }
+/// Navy Flounder discovery: VCN 3.0.0 instance 0 plus 3.0.1 instance 1.
+fn navi22_graphics_set_accepts_both_vcn_instances() -> TestResult {
+    let mut two = gpu();
+    let mut second = two.ip_blocks[3];
+    second.instance = 1;
+    second.revision = 1;
+    two.ip_blocks.push(second);
+    if check_device(&two).is_err() || vcn_instances(&two) != Ok(3) || vcn_instances(&gpu()) != Ok(1)
+    {
+        return TestResult::Fail("two-instance Navi22 VCN discovery refused");
+    }
+    for case in 0..3 {
+        let mut bad = gpu();
+        let mut extra = bad.ip_blocks[3];
+        match case {
+            0 => extra.instance = 2,
+            1 => {
+                extra.instance = 1;
+                extra.minor = 1;
+            }
+            _ => {
+                // Instance 1 without instance 0.
+                bad.ip_blocks.remove(3);
+                extra.instance = 1;
+            }
+        }
+        bad.ip_blocks.push(extra);
+        if check_device(&bad).is_ok() {
+            return TestResult::Fail("foreign VCN instance layout accepted");
+        }
+    }
+    let mut firmware = fixture_with_vcn(3);
+    firmware.harvest_vcn(2);
+    let images = firmware.images().unwrap();
+    let vcn: Vec<u32> = images[7]
+        .unwrap()
+        .payloads()
+        .map(|p| p.firmware_type())
+        .collect();
+    if firmware.vcn_instances() != 1
+        || vcn != [13]
+        || firmware.vcn_size() != Some(container(Source::Vcn).len())
+    {
+        return TestResult::Fail("VCN harvest not applied to PSP payloads");
+    }
+    firmware.harvest_vcn(1);
+    if images_count(&firmware) != 0 {
+        return TestResult::Fail("fully harvested VCN still uploaded");
+    }
+    TestResult::Pass
+}
+fn images_count(firmware: &Firmware) -> usize {
+    firmware.images().unwrap()[7].unwrap().payloads().count()
+}
+kernel_test_in!(
+    "drivers/gpu/gfx-firmware",
+    navi22_graphics_set_accepts_both_vcn_instances
+);
+
 fn navi22_graphics_set_checks_ip_and_live_registry_authority() -> TestResult {
     for case in 0..10 {
         let mut bad = gpu();

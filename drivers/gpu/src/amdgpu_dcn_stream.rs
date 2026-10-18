@@ -11,27 +11,30 @@
 use crate::{
     amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_dcn_profile::Profile, amdgpu_dml::Timing,
 };
-use narf_bus::{BusDeviceCap, MmioRegion};
+use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // Profile selects DCN30 or DCN314; shared ids below were compared against
 // both Linux offset and mask headers. Generation differences stay explicit.
-const DP_PIXEL_FORMAT: u64 = 0x2109;
-const DP_MSA_COLORIMETRY: u64 = 0x210a;
-const DP_VID_STREAM_CNTL: u64 = 0x210c;
-const DP_STEER_FIFO: u64 = 0x210d;
-const DP_MSA_MISC: u64 = 0x210e;
-const DP_VID_TIMING: u64 = 0x2110;
-const DP_VID_N: u64 = 0x2111;
-const DP_VID_M: u64 = 0x2112;
-const DP_MSA_TIMING_PARAM1: u64 = 0x214c;
-const DP_MSA_TIMING_PARAM2: u64 = 0x214d;
-const DP_MSA_TIMING_PARAM3: u64 = 0x214e;
-const DP_MSA_TIMING_PARAM4: u64 = 0x214f;
-const STRIDE: u64 = 0x100;
+// linux-ctx: hdr=dcn seg=2
+const DP_PIXEL_FORMAT: u64 = 0x2109; // linux: mmDP0_DP_PIXEL_FORMAT
+const DP_MSA_COLORIMETRY: u64 = 0x210a; // linux: mmDP0_DP_MSA_COLORIMETRY
+const DP_VID_STREAM_CNTL: u64 = 0x210c; // linux: mmDP0_DP_VID_STREAM_CNTL
+const DP_STEER_FIFO: u64 = 0x210d; // linux: mmDP0_DP_STEER_FIFO
+const DP_MSA_MISC: u64 = 0x210e; // linux: mmDP0_DP_MSA_MISC
+const DP_VID_TIMING: u64 = 0x2110; // linux: mmDP0_DP_VID_TIMING
+const DP_VID_N: u64 = 0x2111; // linux: mmDP0_DP_VID_N
+const DP_VID_M: u64 = 0x2112; // linux: mmDP0_DP_VID_M
+const DP_MSA_TIMING_PARAM1: u64 = 0x214c; // linux: mmDP0_DP_MSA_TIMING_PARAM1
+const DP_MSA_TIMING_PARAM2: u64 = 0x214d; // linux: mmDP0_DP_MSA_TIMING_PARAM2
+const DP_MSA_TIMING_PARAM3: u64 = 0x214e; // linux: mmDP0_DP_MSA_TIMING_PARAM3
+const DP_MSA_TIMING_PARAM4: u64 = 0x214f; // linux: mmDP0_DP_MSA_TIMING_PARAM4
+const STRIDE: u64 = 0x100; // linux: mmDP1_DP_PIXEL_FORMAT - mmDP0_DP_PIXEL_FORMAT
 #[cfg(feature = "kernel-test")]
+// linux: n/a (test-only bank bound)
 const LAST_REG: u32 = (DP_MSA_TIMING_PARAM4 + 4 * STRIDE) as u32;
 /// `DP_PIXEL_ENCODING_TYPE_RGB444`.
+// linux: n/a (enum dp_pixel_encoding_type in inc/hw/stream_encoder.h; not in checker set)
 const PIXEL_ENCODING_RGB: u32 = 0;
 
 // `DP0_DP_PIXEL_FORMAT` fields, from `dcn_3_1_4_sh_mask.h`:
@@ -44,13 +47,16 @@ const PIXEL_ENCODING_RGB: u32 = 0;
 // it is, so the update also cleared reserved bit 31. The field is written with a
 // one-bit value everywhere Linux touches it (`odm_combine` in
 // `dcn314_dio_stream_encoder.c:101`, `two_pixel_per_cyle ? 1 : 0` in dcn32's).
-const DP_PIXEL_ENCODING: u32 = 0x0000_0007;
-const DP_COMPONENT_DEPTH: u32 = 0x0700_0000;
+const DP_PIXEL_ENCODING: u32 = 0x0000_0007; // linux: DP0_DP_PIXEL_FORMAT__DP_PIXEL_ENCODING_MASK
+const DP_COMPONENT_DEPTH: u32 = 0x0700_0000; // linux: DP0_DP_PIXEL_FORMAT__DP_COMPONENT_DEPTH_MASK
+                                             // linux: n/a (DCN 3.1.4 path; field absent from dcn_3_0_0_sh_mask.h)
 const DP_PIXEL_PER_CYCLE_PROCESSING_MODE: u32 = 0x4000_0000;
 /// The M/N generator measures against a fixed N, which Linux seeds at 0x8000
 /// because auto-measurement needs a full symbol cycle to take over.
+// linux: n/a (literal in dcn10_stream_encoder.c:enc1_stream_encoder_dp_unblank, n_vid)
 const N_VID: u32 = 0x8000;
 /// Every DisplayPort link rate is a multiple of this reference.
+// linux: n/a (LINK_RATE_REF_FREQ_IN_KHZ, include/link_service_types.h; not in checker set)
 const LINK_RATE_REF_KHZ: u64 = 27_000;
 
 /// Bits per component on the wire.
@@ -64,16 +70,22 @@ impl Depth {
     /// `DP_COMPONENT_PIXEL_DEPTH_*`.
     fn code(self) -> u32 {
         match self {
+            // linux: n/a (enum dp_component_depth in inc/hw/stream_encoder.h; not in checker set)
             Depth::Bpc6 => 0,
+            // linux: n/a (enum dp_component_depth in inc/hw/stream_encoder.h; not in checker set)
             Depth::Bpc8 => 1,
+            // linux: n/a (enum dp_component_depth in inc/hw/stream_encoder.h; not in checker set)
             Depth::Bpc10 => 2,
         }
     }
     /// The MSA MISC0 colorimetry field uses its own numbering.
     fn colorimetry(self) -> u32 {
         match self {
+            // linux: n/a (literal in enc1_stream_encoder_dp_set_stream_attribute, colorimetry_bpc)
             Depth::Bpc6 => 0,
+            // linux: n/a (literal in enc1_stream_encoder_dp_set_stream_attribute, colorimetry_bpc)
             Depth::Bpc8 => 1,
+            // linux: n/a (literal in enc1_stream_encoder_dp_set_stream_attribute, colorimetry_bpc)
             Depth::Bpc10 => 2,
         }
     }
@@ -92,7 +104,7 @@ trait Io: Send {
 }
 #[derive(Debug)]
 struct Mmio {
-    regs: MmioRegion,
+    regs: crate::amdgpu_reg_window::Window,
     base: u64,
 }
 impl Io for Mmio {
@@ -210,21 +222,28 @@ impl<I: Io> Engine<I> {
             PIXEL_ENCODING_RGB | depth.code() << DP_COMPONENT_DEPTH.trailing_zeros(),
         )?;
         // MISC0: colorimetry depth in bits 7:5, full-range RGB elsewhere.
+        // linux-lit: 24=DP0_DP_MSA_COLORIMETRY__DP_MSA_MISC0__SHIFT
         self.set(DP_MSA_COLORIMETRY, depth.colorimetry() << 5 << 24)?;
         // MISC1: no VSC SDP colorimetry override, not Y-only.
         self.update(DP_MSA_MISC, 0xc0, 0)?;
+        // linux-lit: 16=DP0_DP_MSA_TIMING_PARAM1__DP_MSA_HTOTAL__SHIFT
         self.set(DP_MSA_TIMING_PARAM1, timing.v_total | timing.h_total << 16)?;
+        // linux-lit: 16=DP0_DP_MSA_TIMING_PARAM2__DP_MSA_HSTART__SHIFT
         self.set(DP_MSA_TIMING_PARAM2, v_active_start | h_active_start << 16)?;
         // The polarity fields mean "negative", like the timing generator's.
         self.set(
             DP_MSA_TIMING_PARAM3,
             timing.v_sync_width
+                // linux-lit: 15=DP0_DP_MSA_TIMING_PARAM3__DP_MSA_VSYNCPOLARITY__SHIFT
                 | u32::from(!timing.v_sync_positive) << 15
+                // linux-lit: 16=DP0_DP_MSA_TIMING_PARAM3__DP_MSA_HSYNCWIDTH__SHIFT
                 | timing.h_sync_width << 16
+                // linux-lit: 31=DP0_DP_MSA_TIMING_PARAM3__DP_MSA_HSYNCPOLARITY__SHIFT
                 | u32::from(!timing.h_sync_positive) << 31,
         )?;
         self.set(
             DP_MSA_TIMING_PARAM4,
+            // linux-lit: 16=DP0_DP_MSA_TIMING_PARAM4__DP_MSA_HWIDTH__SHIFT
             timing.v_active | timing.h_active << 16,
         )?;
         self.state = State::Programmed;
@@ -244,10 +263,14 @@ impl<I: Io> Engine<I> {
         if m_vid == 0 || m_vid >= N_VID as u64 {
             return Err(Error::Invalid);
         }
+        // linux-lit: 8=DP0_DP_VID_TIMING__DP_VID_M_N_GEN_EN__SHIFT
         self.update(DP_VID_TIMING, 1 << 8, 0)?;
         self.set(DP_VID_N, N_VID)?;
         self.set(DP_VID_M, m_vid as u32)?;
         // One pixel per container, so no N multiplier.
+        // linux-lit: 8=DP0_DP_VID_TIMING__DP_VID_M_N_GEN_EN__SHIFT
+        // linux-lit: 10=DP0_DP_VID_TIMING__DP_VID_N_MUL__SHIFT
+        // linux-lit: 0x3=DP0_DP_VID_TIMING__DP_VID_N_MUL_MASK >> DP0_DP_VID_TIMING__DP_VID_N_MUL__SHIFT
         self.update(DP_VID_TIMING, 1 << 8 | 0x3 << 10, 1 << 8)?;
         if self.profile == Profile::Dcn314 {
             self.update(DP_PIXEL_FORMAT, DP_PIXEL_PER_CYCLE_PROCESSING_MODE, 0)?;
@@ -261,6 +284,7 @@ impl<I: Io> Engine<I> {
         if self.state == State::Idle {
             return Err(Error::Busy);
         }
+        // linux-lit: 1=DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_ENABLE_MASK
         self.update(DP_VID_STREAM_CNTL, 1, 0)?;
         let status = self.reg(DP_VID_STREAM_CNTL);
         let deadline = narf_time::Deadline::after_ms(50);
@@ -269,6 +293,7 @@ impl<I: Io> Engine<I> {
             if value == u32::MAX {
                 return Err(Error::DeviceGone);
             }
+            // linux-lit: 16=DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_STATUS__SHIFT
             if value & 1 << 16 == 0 {
                 break;
             }
@@ -279,21 +304,27 @@ impl<I: Io> Engine<I> {
         }
         if self.profile == Profile::Navi22 {
             // enc2_stream_encoder_dp_unblank also resets the DIG frontend.
+            // linux-lit: 0x208b=mmDIG0_DIG_FE_CNTL; 10=DIG0_DIG_FE_CNTL__DIG_START__SHIFT
             self.update(0x208b, 1 << 10, 1 << 10)?; // DIG_FE_CNTL.DIG_START
             delay_us(1).await;
+            // linux-lit: 0x208b=mmDIG0_DIG_FE_CNTL; 10=DIG0_DIG_FE_CNTL__DIG_START__SHIFT
             self.update(0x208b, 1 << 10, 0)?;
         }
+        // linux-lit: 1=DP0_DP_STEER_FIFO__DP_STEER_FIFO_RESET_MASK
         self.update(DP_STEER_FIFO, 1, 1)?;
         delay_us(10).await;
+        // linux-lit: 1=DP0_DP_STEER_FIFO__DP_STEER_FIFO_RESET_MASK
         self.update(DP_STEER_FIFO, 1, 0)?;
         // A few video lines for the DIG and DP logic to prime.
         delay_us(100).await;
+        // linux-lit: 1=DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_ENABLE_MASK
         self.update(DP_VID_STREAM_CNTL, 1, 1)?;
         self.state = State::Streaming;
         Ok(())
     }
     /// Stop the stream and wait for the encoder to confirm it has stopped.
     async fn blank(&mut self) -> Result<(), Error> {
+        // linux-lit: 1=DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_ENABLE_MASK
         self.update(DP_VID_STREAM_CNTL, 1, 0)?;
         let status = self.reg(DP_VID_STREAM_CNTL);
         let deadline = narf_time::Deadline::after_ms(50);
@@ -302,6 +333,7 @@ impl<I: Io> Engine<I> {
             if value == u32::MAX {
                 return Err(Error::DeviceGone);
             }
+            // linux-lit: 16=DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_STATUS__SHIFT
             if value & 1 << 16 == 0 {
                 self.state = State::Programmed;
                 return Ok(());
@@ -333,12 +365,13 @@ impl Stream {
         }
         let base = profile.bank(
             gpu,
-            2,
+            2, // linux-lit: 2=mmDP0_DP_PIXEL_FORMAT_BASE_IDX
+            // linux-ctx: reset
             (DP_MSA_TIMING_PARAM4 + u64::from(profile.streams() - 1) * STRIDE) as u32,
         )?;
         Ok(Self(Engine {
             io: Mmio {
-                regs: gpu.regs,
+                regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                 base,
             },
             authority,

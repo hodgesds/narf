@@ -47,7 +47,11 @@ impl Io for Fake {
                     GET_INTERFACE => 0xe,
                     GET_HEADER => self.header,
                     DPM_BY_INDEX if self.arg & 0xff == 0xff => self.count,
-                    DPM_BY_INDEX => self.range[(self.arg & 0xff) as usize],
+                    DPM_BY_INDEX => self
+                        .range
+                        .get((self.arg & 0xff) as usize)
+                        .copied()
+                        .unwrap_or(0),
                     HARD_MIN => (self.arg & 0xffff).saturating_sub(u32::from(self.underclock)),
                     DEEP_SLEEP_MIN | DISPLAYS | DF_CSTATE_ALLOW => 0,
                     _ => panic!("non-DAL command"),
@@ -235,16 +239,44 @@ kernel_test_in!(
     navi22_dal_pins_memory_before_programming_global_dividers
 );
 fn navi22_dal_bad_tables_rejection_and_revocation_fail_closed() -> TestResult {
-    for bad in 0..8 {
+    // dcn3_init_clocks tolerates a header/interface mismatch, a failed or
+    // empty level query and odd values; it records them as reported.
+    for odd in 0..6 {
         let mut e = engine();
-        match bad {
+        match odd {
             0 => e.io.header = 2,
             1 => e.io.count = 0,
             2 => e.io.count = 17,
             3 => e.io.range = [0, 1200],
             4 => e.io.range = [1200, 100],
-            5 => e.io.refuse = Some(GET_HEADER),
-            6 => e.io.revoke = Some(e.authority),
+            _ => e.io.refuse = Some(GET_HEADER),
+        }
+        let Ok(levels) = run(e.start(core::future::ready(Ok(())))) else {
+            return TestResult::Fail("dcn3_init_clocks-tolerated DAL table refused");
+        };
+        let memory = levels.range(Clock::Memory).mhz();
+        let expect: &[u16] = match odd {
+            1 => &[],
+            3 => &[0, 1200],
+            4 => &[1200, 100],
+            _ => &[100, 1200],
+        };
+        if e.state != State::Ready || (odd != 2 && memory != expect) || memory.len() > LEVELS {
+            return TestResult::Fail("DAL levels not recorded as PMFW reported them");
+        }
+    }
+    // An empty range is refused by the clock plan, not at start.
+    let mut e = engine();
+    e.io.count = 0;
+    let levels = run(e.start(core::future::ready(Ok(())))).unwrap();
+    if levels.plan(148_500, 148_500, 300_000).is_ok() {
+        return TestResult::Fail("clock plan accepted an empty DPM table");
+    }
+    for bad in 0..3 {
+        let mut e = engine();
+        match bad {
+            0 => e.io.refuse = Some(GET_VERSION),
+            1 => e.io.revoke = Some(e.authority),
             _ => e.io.pll = u32::MAX,
         }
         if run(e.start(core::future::ready(Ok(())))).is_ok() || e.state != State::Failed {
@@ -345,11 +377,11 @@ fn navi22_dal_checks_all_six_streams_and_constructor_bounds() -> TestResult {
     }
     let mut registers = alloc::vec![0u32; 0x260d];
     let mut io = Mmio {
-        regs: MmioRegion {
+        regs: crate::amdgpu_reg_window::Window::new(narf_bus::MmioRegion {
             virt: registers.as_mut_ptr() as u64,
             len: registers.len() as u64 * 4,
             ..gpu.regs
-        },
+        }),
         mp1: 0,
         dcn: 0,
     };

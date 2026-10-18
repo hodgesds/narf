@@ -10,47 +10,55 @@
 use crate::{
     amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_dcn_profile::Profile, amdgpu_dml::Timing,
 };
-use narf_bus::{BusDeviceCap, MmioRegion};
+use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // OTG instance block, stride 0x80.
 // Profile selects DCN30 or DCN314; shared ids below were compared against
 // both Linux offset and mask headers. Generation differences stay explicit.
-const OTG_H_TOTAL: u64 = 0x1b2a;
-const OTG_H_BLANK_START_END: u64 = 0x1b2b;
-const OTG_H_SYNC_A: u64 = 0x1b2c;
-const OTG_H_SYNC_A_CNTL: u64 = 0x1b2d;
-const OTG_H_TIMING_CNTL: u64 = 0x1b2e;
-const OTG_V_TOTAL: u64 = 0x1b2f;
-const OTG_V_TOTAL_MIN: u64 = 0x1b30;
-const OTG_V_TOTAL_MAX: u64 = 0x1b31;
-const OTG_V_BLANK_START_END: u64 = 0x1b36;
-const OTG_V_SYNC_A: u64 = 0x1b37;
-const OTG_V_SYNC_A_CNTL: u64 = 0x1b38;
-const OTG_CONTROL: u64 = 0x1b41;
-const OTG_CLOCK_CONTROL: u64 = 0x1b85;
-const OTG_VSTARTUP_PARAM: u64 = 0x1b86;
-const OTG_VUPDATE_PARAM: u64 = 0x1b87;
-const OTG_VREADY_PARAM: u64 = 0x1b88;
-const OTG_STRIDE: u64 = 0x80;
-// ODM instance block, stride 0x10.
-const OPTC_DATA_SOURCE_SELECT: u64 = 0x1acb;
-const OPTC_WIDTH_CONTROL: u64 = 0x1ace;
-const OPTC_MEMORY_CONFIG: u64 = 0x1ad0;
+// linux-ctx: hdr=dcn seg=2
+const OTG_H_TOTAL: u64 = 0x1b2a; // linux: mmOTG0_OTG_H_TOTAL
+const OTG_H_BLANK_START_END: u64 = 0x1b2b; // linux: mmOTG0_OTG_H_BLANK_START_END
+const OTG_H_SYNC_A: u64 = 0x1b2c; // linux: mmOTG0_OTG_H_SYNC_A
+const OTG_H_SYNC_A_CNTL: u64 = 0x1b2d; // linux: mmOTG0_OTG_H_SYNC_A_CNTL
+const OTG_H_TIMING_CNTL: u64 = 0x1b2e; // linux: mmOTG0_OTG_H_TIMING_CNTL
+const OTG_V_TOTAL: u64 = 0x1b2f; // linux: mmOTG0_OTG_V_TOTAL
+const OTG_V_TOTAL_MIN: u64 = 0x1b30; // linux: mmOTG0_OTG_V_TOTAL_MIN
+const OTG_V_TOTAL_MAX: u64 = 0x1b31; // linux: mmOTG0_OTG_V_TOTAL_MAX
+const OTG_V_BLANK_START_END: u64 = 0x1b36; // linux: mmOTG0_OTG_V_BLANK_START_END
+const OTG_V_SYNC_A: u64 = 0x1b37; // linux: mmOTG0_OTG_V_SYNC_A
+const OTG_V_SYNC_A_CNTL: u64 = 0x1b38; // linux: mmOTG0_OTG_V_SYNC_A_CNTL
+const OTG_CONTROL: u64 = 0x1b41; // linux: mmOTG0_OTG_CONTROL
+                                 // DCN 3.1.4 offsets; otg() adds 1 on Navi22, giving the DCN30 registers.
+const OTG_CLOCK_CONTROL: u64 = 0x1b85; // linux: mmOTG0_OTG_CLOCK_CONTROL - 1
+const OTG_VSTARTUP_PARAM: u64 = 0x1b86; // linux: mmOTG0_OTG_VSTARTUP_PARAM - 1
+const OTG_VUPDATE_PARAM: u64 = 0x1b87; // linux: mmOTG0_OTG_VUPDATE_PARAM - 1
+const OTG_VREADY_PARAM: u64 = 0x1b88; // linux: mmOTG0_OTG_VREADY_PARAM - 1
+const OTG_STRIDE: u64 = 0x80; // linux: mmOTG1_OTG_H_TOTAL - mmOTG0_OTG_H_TOTAL
+                              // ODM instance block, stride 0x10.
+const OPTC_DATA_SOURCE_SELECT: u64 = 0x1acb; // linux: mmODM0_OPTC_DATA_SOURCE_SELECT
+const OPTC_WIDTH_CONTROL: u64 = 0x1ace; // linux: mmODM0_OPTC_WIDTH_CONTROL
+const OPTC_MEMORY_CONFIG: u64 = 0x1ad0; // linux: mmODM0_OPTC_MEMORY_CONFIG
+                                        // linux: mmODM1_OPTC_DATA_SOURCE_SELECT - mmODM0_OPTC_DATA_SOURCE_SELECT
 const ODM_STRIDE: u64 = 0x10;
 // Vertical timing generator, stride 1.
+// linux: n/a (DCN 3.1.4 path; Navi22 uses mmVTG0_CONTROL inline in otg_vtg)
 const VTG_CONTROL: u64 = 0x052d;
 /// The highest register this module touches, for the bank bound.
 #[cfg(feature = "kernel-test")]
+// linux: n/a (test-only bank bound)
 const LAST_REG: u32 = (OTG_VREADY_PARAM + 3 * OTG_STRIDE) as u32;
 /// Totals, blank and sync positions are 15-bit; VSTARTUP is 10-bit and the
 /// VUPDATE width 10-bit. Programming a mode whose counts do not fit is refused.
-const COUNT_BITS: u32 = 15;
+const COUNT_BITS: u32 = 15; // linux: n/a (width of OTG0_OTG_H_TOTAL__OTG_H_TOTAL_MASK 0x7fff)
+                            // linux: n/a (width of OTG0_OTG_VSTARTUP_PARAM__VSTARTUP_START_MASK 0x3ff)
 const VSTARTUP_BITS: u32 = 10;
+// linux: n/a (width of OTG0_OTG_VUPDATE_PARAM__VUPDATE_WIDTH_MASK 0x3ff0000)
 const VUPDATE_WIDTH_BITS: u32 = 10;
+// linux: n/a (width of OTG0_OTG_VUPDATE_PARAM__VUPDATE_OFFSET_MASK 0xffff)
 const OFFSET_BITS: u32 = 16;
 /// `OPTC_SEG*_SRC_SEL` parks a segment with all ones.
-const SEGMENT_PARKED: u32 = 0xf;
+const SEGMENT_PARKED: u32 = 0xf; // linux: n/a (literal 0xf in dcn30_optc.c:optc3_set_odm_bypass)
 /// `ODM0_OPTC_WIDTH_CONTROL__OPTC_SEGMENT_WIDTH_MASK` is 0x00001FFF, so one
 /// OPP segment carries at most 8191 active pixels.
 ///
@@ -60,8 +68,10 @@ const SEGMENT_PARKED: u32 = 0xf;
 /// enforces at 32768. The segment is the tighter constraint because
 /// `optc1_set_odm_bypass` puts the whole active width into ONE segment —
 /// splitting a wider mode needs ODM combine, which this pipeline does not do.
+// linux: n/a (width of ODM0_OPTC_WIDTH_CONTROL__OPTC_SEGMENT_WIDTH_MASK, checked below)
 const SEGMENT_WIDTH_BITS: u32 = 13;
 /// The widest active region one OPP segment can carry, inclusive.
+// linux: ODM0_OPTC_WIDTH_CONTROL__OPTC_SEGMENT_WIDTH_MASK
 pub const MAX_SEGMENT_WIDTH: u32 = (1 << SEGMENT_WIDTH_BITS) - 1;
 
 /// The global sync positions the detile buffer needs, in pixels and lines. These
@@ -80,7 +90,7 @@ trait Io: Send {
 }
 #[derive(Debug)]
 struct Mmio {
-    regs: MmioRegion,
+    regs: crate::amdgpu_reg_window::Window,
     base: u64,
 }
 impl Io for Mmio {
@@ -134,12 +144,15 @@ impl<I: Io> Engine<I> {
     }
     fn segment_shift(&self) -> u32 {
         if self.profile == Profile::Navi22 {
-            8
+            8 // linux: ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG0_SRC_SEL__SHIFT
         } else {
-            16
+            16 // linux: n/a (DCN 3.1.4 path)
         }
     }
     fn segments(&self, first: u32) -> u32 {
+        // linux-lit: 4=ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG1_SRC_SEL__SHIFT - ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG0_SRC_SEL__SHIFT
+        // linux-lit: 8=ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG2_SRC_SEL__SHIFT - ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG0_SRC_SEL__SHIFT
+        // linux-lit: 12=ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG3_SRC_SEL__SHIFT - ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG0_SRC_SEL__SHIFT
         (first | SEGMENT_PARKED << 4 | SEGMENT_PARKED << 8 | SEGMENT_PARKED << 12)
             << self.segment_shift()
     }
@@ -195,17 +208,21 @@ impl<I: Io> Engine<I> {
 
         self.set(self.otg(OTG_H_TOTAL), h_total)?;
         // Sync starts at zero and runs for its width.
+        // linux-lit: 0x7fff7fff=OTG0_OTG_H_SYNC_A__OTG_H_SYNC_A_START_MASK | OTG0_OTG_H_SYNC_A__OTG_H_SYNC_A_END_MASK
+        // linux-lit: 16=OTG0_OTG_H_SYNC_A__OTG_H_SYNC_A_END__SHIFT
         self.update(self.otg(OTG_H_SYNC_A), 0x7fff_7fff, h_sync_end << 16)?;
         self.update(
             self.otg(OTG_H_BLANK_START_END),
+            // linux: OTG0_OTG_H_BLANK_START_END__OTG_H_BLANK_START_MASK | OTG0_OTG_H_BLANK_START_END__OTG_H_BLANK_END_MASK
             0x7fff_7fff,
+            // linux-lit: 16=OTG0_OTG_H_BLANK_START_END__OTG_H_BLANK_END__SHIFT
             h_blank_start | h_blank_end << 16,
         )?;
         // The register field means "negative polarity", so it is the inverse of
         // what the mode declares.
         self.update(
             self.otg(OTG_H_SYNC_A_CNTL),
-            1,
+            1, // linux: OTG0_OTG_H_SYNC_A_CNTL__OTG_H_SYNC_A_POL_MASK
             u32::from(!timing.h_sync_positive),
         )?;
         self.set(self.otg(OTG_V_TOTAL), v_total)?;
@@ -213,21 +230,27 @@ impl<I: Io> Engine<I> {
         // variable-refresh range left by firmware would retime the stream.
         self.set(self.otg(OTG_V_TOTAL_MIN), v_total)?;
         self.set(self.otg(OTG_V_TOTAL_MAX), v_total)?;
+        // linux-lit: 0x7fff7fff=OTG0_OTG_V_SYNC_A__OTG_V_SYNC_A_START_MASK | OTG0_OTG_V_SYNC_A__OTG_V_SYNC_A_END_MASK
+        // linux-lit: 16=OTG0_OTG_V_SYNC_A__OTG_V_SYNC_A_END__SHIFT
         self.update(self.otg(OTG_V_SYNC_A), 0x7fff_7fff, v_sync_end << 16)?;
         self.update(
             self.otg(OTG_V_BLANK_START_END),
+            // linux: OTG0_OTG_V_BLANK_START_END__OTG_V_BLANK_START_MASK | OTG0_OTG_V_BLANK_START_END__OTG_V_BLANK_END_MASK
             0x7fff_7fff,
+            // linux-lit: 16=OTG0_OTG_V_BLANK_START_END__OTG_V_BLANK_END__SHIFT
             v_blank_start | v_blank_end << 16,
         )?;
         self.update(
             self.otg(OTG_V_SYNC_A_CNTL),
-            1,
+            1, // linux: OTG0_OTG_V_SYNC_A_CNTL__OTG_V_SYNC_A_POL_MASK
             u32::from(!timing.v_sync_positive),
         )?;
         // Park the vertical timing generator before moving its reference.
-        self.update(self.otg_vtg(), 1 << 31, 0)?;
-        // DisplayPort starts counting at the first line of the blank, and a
-        // progressive stream has no field number.
+        self.update(self.otg_vtg(), 1 << 31, 0)?; // linux-lit: 31=VTG0_CONTROL__VTG0_ENABLE__SHIFT
+                                                  // DisplayPort starts counting at the first line of the blank, and a
+                                                  // progressive stream has no field number.
+                                                  // linux-lit: 12=OTG0_OTG_CONTROL__OTG_START_POINT_CNTL__SHIFT
+                                                  // linux-lit: 13=OTG0_OTG_CONTROL__OTG_FIELD_NUMBER_CNTL__SHIFT
         self.update(self.otg(OTG_CONTROL), 1 << 12 | 1 << 13, 1 << 12)?;
         self.program_global_sync(sync)?;
         // One OPP segment feeding this OTG: no ODM combine, no memory split,
@@ -236,19 +259,28 @@ impl<I: Io> Engine<I> {
             self.odm(OPTC_DATA_SOURCE_SELECT),
             self.segments(self.instance as u32),
         )?;
+        // linux-lit: 0x3=OTG0_OTG_H_TIMING_CNTL__OTG_H_TIMING_DIV_MODE_MASK
         self.update(self.otg(OTG_H_TIMING_CNTL), 0x3, 0)?;
         self.set(self.odm(OPTC_MEMORY_CONFIG), 0)?;
         self.update(
             self.odm(OPTC_WIDTH_CONTROL),
-            0x1fff,
+            0x1fff, // linux: ODM0_OPTC_WIDTH_CONTROL__OPTC_SEGMENT_WIDTH_MASK
             fits(timing.h_active, SEGMENT_WIDTH_BITS)?,
         )?;
         self.state = State::Programmed;
         Ok(())
     }
+    /// `optc1_program_timing` with a TMDS signal: start point and field
+    /// number zero.
+    fn program_tmds_timing(&mut self, timing: &Timing, sync: &GlobalSync) -> Result<(), Error> {
+        self.program_timing(timing, sync)?;
+        // linux-lit: 12=OTG0_OTG_CONTROL__OTG_START_POINT_CNTL__SHIFT
+        // linux-lit: 13=OTG0_OTG_CONTROL__OTG_FIELD_NUMBER_CNTL__SHIFT
+        self.update(self.otg(OTG_CONTROL), 1 << 12 | 1 << 13, 0)
+    }
     fn otg_vtg(&self) -> u64 {
         let base = if self.profile == Profile::Navi22 {
-            0x0528
+            0x0528 // linux: mmVTG0_CONTROL
         } else {
             VTG_CONTROL
         };
@@ -267,6 +299,7 @@ impl<I: Io> Engine<I> {
         self.set(
             self.otg(OTG_VUPDATE_PARAM),
             fits(sync.v_update_offset_pix, OFFSET_BITS)?
+                // linux-lit: 16=OTG0_OTG_VUPDATE_PARAM__VUPDATE_WIDTH__SHIFT
                 | fits(sync.v_update_width_pix, VUPDATE_WIDTH_BITS)? << 16,
         )?;
         self.set(
@@ -282,15 +315,20 @@ impl<I: Io> Engine<I> {
         }
         self.update(
             self.odm(OPTC_DATA_SOURCE_SELECT),
+            // linux-lit: 0xf=ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG0_SRC_SEL_MASK >> ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG0_SRC_SEL__SHIFT
             0xf << self.segment_shift(),
             (self.instance as u32) << self.segment_shift(),
         )?;
+        // linux-lit: 31=VTG0_CONTROL__VTG0_ENABLE__SHIFT
         self.update(self.otg_vtg(), 1 << 31, 1 << 31)?;
         let disable_point = if self.profile == Profile::Navi22 {
-            3
+            3 // linux: n/a (literal in dcn10_optc.c:optc1_enable_crtc, OTG_DISABLE_POINT_CNTL)
         } else {
-            2
+            2 // linux: n/a (DCN 3.1.4 path)
         };
+        // linux-lit: 0x301=OTG0_OTG_CONTROL__OTG_DISABLE_POINT_CNTL_MASK | OTG0_OTG_CONTROL__OTG_MASTER_EN_MASK
+        // linux-lit: 8=OTG0_OTG_CONTROL__OTG_DISABLE_POINT_CNTL__SHIFT
+        // linux-lit: 1=OTG0_OTG_CONTROL__OTG_MASTER_EN_MASK
         self.update(self.otg(OTG_CONTROL), 0x301, disable_point << 8 | 1)?;
         self.state = State::Running;
         Ok(())
@@ -308,9 +346,11 @@ impl<I: Io> Engine<I> {
         } else {
             // DCN30 uses optc1_disable_crtc: retire at the first blank line
             // before changing ODM routing, rather than cutting the live mux.
+            // linux-lit: 0x301=OTG0_OTG_CONTROL__OTG_DISABLE_POINT_CNTL_MASK | OTG0_OTG_CONTROL__OTG_MASTER_EN_MASK
+            // linux-lit: 8=OTG0_OTG_CONTROL__OTG_DISABLE_POINT_CNTL__SHIFT
             self.update(self.otg(OTG_CONTROL), 0x301, 3 << 8)?;
         }
-        self.update(self.otg_vtg(), 1 << 31, 0)?;
+        self.update(self.otg_vtg(), 1 << 31, 0)?; // linux-lit: 31=VTG0_CONTROL__VTG0_ENABLE__SHIFT
         let clock_control = self.otg(OTG_CLOCK_CONTROL);
         let deadline = narf_time::Deadline::after_ms(100);
         loop {
@@ -318,6 +358,7 @@ impl<I: Io> Engine<I> {
             if value == u32::MAX {
                 return Err(Error::DeviceGone);
             }
+            // linux-lit: 16=OTG0_OTG_CLOCK_CONTROL__OTG_BUSY__SHIFT
             if value & 1 << 16 == 0 {
                 self.state = State::Idle;
                 return Ok(());
@@ -353,10 +394,11 @@ impl Otg {
         let last = OTG_VREADY_PARAM
             + u64::from(profile == Profile::Navi22)
             + u64::from(profile.pipes() - 1) * OTG_STRIDE;
-        let base = profile.bank(gpu, 2, last as u32)?;
+        let base = profile.bank(gpu, 2, last as u32)?; // linux-lit: 2=mmOTG0_OTG_H_TOTAL_BASE_IDX
+                                                       // linux-ctx: reset
         Ok(Self(Engine {
             io: Mmio {
-                regs: gpu.regs,
+                regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                 base,
             },
             authority,
@@ -374,6 +416,11 @@ impl Otg {
     /// Program the mode and its global sync positions. Refused while running.
     pub fn program_timing(&mut self, timing: &Timing, sync: &GlobalSync) -> Result<(), Error> {
         self.0.program_timing(timing, sync)
+    }
+    /// `optc1_program_timing` for a TMDS (HDMI/DVI) signal, which counts
+    /// from start point 0 rather than DisplayPort's first blank line.
+    pub fn program_tmds_timing(&mut self, timing: &Timing, sync: &GlobalSync) -> Result<(), Error> {
+        self.0.program_tmds_timing(timing, sync)
     }
     pub fn program_global_sync(&mut self, sync: &GlobalSync) -> Result<(), Error> {
         self.0.program_global_sync(sync)

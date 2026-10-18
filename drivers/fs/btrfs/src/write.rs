@@ -58,6 +58,9 @@ use narf_block::BlockDevice;
 use narf_filesystem::FsError;
 
 use crate::allocator::Allocator;
+
+pub(crate) mod fileops;
+use crate::block_group::{self, BgHome};
 use crate::btree::{
     self, internal_blockptr, internal_child_slot, internal_key, leaf_item_data, leaf_item_key,
     leaf_item_span, leaf_lower_bound, level, nritems, HEADER_SIZE,
@@ -68,6 +71,9 @@ use crate::format::{self, le64, BtrfsKey};
 use crate::inode::InodeItem;
 use crate::roots;
 use crate::volume::{BalanceProfiles, BalanceStats, BtrfsVolume};
+pub use fileops::{
+    fallocate_file, truncate_file, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE,
+};
 
 // Header field offsets rewritten when a node is stamped.
 const HDR_BYTENR: usize = 48;
@@ -800,6 +806,104 @@ pub(crate) fn chunk_span_avoiding_supers(mut start: u64, avail_end: u64) -> (u64
 /// Matches btrfs's preference for bounded, contiguous data extents.
 const MAX_WRITE_EXTENT: u64 = 128 * 1024;
 
+/// Csum-tree edits dropping the checksums of the released data extents
+/// `(bytenr, len)` — Linux's `btrfs_del_csums`.
+///
+/// Linux packs the checksums of disk-adjacent extents into one item (up to
+/// a leaf's worth) and splits a large extent's across several, so an
+/// extent's checksums need not start an item, nor fill one. Every item
+/// overlapping a released range is deleted and the sectors it covers outside
+/// every released range are re-inserted as items of their own; deleting only
+/// an item keyed at the extent's `bytenr` would leave checksums for freed
+/// space behind, which `btrfs check` reports and which a later extent
+/// allocated there would contradict.
+async fn csum_release_edits<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    csum_root: u64,
+    released: &[(u64, u64)],
+) -> Result<Vec<Edit>, FsError> {
+    if released.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sectorsize = u64::from(vol.sectorsize());
+    let csum_bytes = crate::checksum::size(vol.csum_type())?;
+    let mut ranges: Vec<(u64, u64)> = released
+        .iter()
+        .map(|&(bytenr, len)| (bytenr, bytenr.saturating_add(len)))
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let csum_key = |offset| {
+        BtrfsKey::new(
+            format::EXTENT_CSUM_OBJECTID,
+            format::EXTENT_CSUM_KEY,
+            offset,
+        )
+    };
+    let is_csum = |k: &BtrfsKey| {
+        k.objectid == format::EXTENT_CSUM_OBJECTID && k.item_type == format::EXTENT_CSUM_KEY
+    };
+    let item_end = |offset: u64, body: &[u8]| -> Result<u64, FsError> {
+        if body.len() % csum_bytes != 0 {
+            return Err(FsError::InvalidData);
+        }
+        Ok(offset + (body.len() / csum_bytes) as u64 * sectorsize)
+    };
+    let mut items: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    for &(start, end) in &merged {
+        if let Some((key, body)) = btree::last_before(vol, csum_root, &csum_key(start + 1)).await? {
+            if is_csum(&key) && item_end(key.offset, &body)? > start {
+                items.insert(key.offset, body);
+            }
+        }
+        let mut cursor = btree::Cursor::seek(vol, csum_root, &csum_key(start)).await?;
+        while let Some((key, body)) = cursor.current()? {
+            if !is_csum(&key) || key.offset >= end {
+                break;
+            }
+            items.entry(key.offset).or_insert_with(|| body.to_vec());
+            cursor.advance().await?;
+        }
+    }
+    let released_at = |addr: u64| {
+        let i = merged.partition_point(|&(start, _)| start <= addr);
+        i > 0 && addr < merged[i - 1].1
+    };
+    let mut edits = Vec::new();
+    for (offset, body) in items {
+        let sectors = (item_end(offset, &body)? - offset) / sectorsize;
+        edits.push(Edit::Delete(csum_key(offset)));
+        let mut i = 0u64;
+        while i < sectors {
+            if released_at(offset + i * sectorsize) {
+                i += 1;
+                continue;
+            }
+            let run = i;
+            while i < sectors && !released_at(offset + i * sectorsize) {
+                i += 1;
+            }
+            let (a, b) = (run as usize * csum_bytes, i as usize * csum_bytes);
+            edits.push(Edit::Upsert(
+                csum_key(offset + run * sectorsize),
+                body[a..b].to_vec(),
+            ));
+        }
+    }
+    Ok(edits)
+}
+
+/// `struct btrfs_inode_item::flags` offset.
+const INODE_ITEM_FLAGS: usize = 64;
+/// `BTRFS_INODE_NODATASUM`.
+const INODE_NODATASUM: u64 = 1 << 0;
+
 /// Write `data` at byte `offset` into file `ino` via COW. Only the sector-aligned
 /// write window and the existing extents it intersects are read, freed and
 /// re-tiled (each new extent is at most [`MAX_WRITE_EXTENT`]); non-overlapping
@@ -835,6 +939,23 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     }
     ensure_private_subvol(vol).await?;
     let (fs_root, _) = vol.fs_tree_root();
+    // The caller's `InodeItem` is the one cached when its VFS node was
+    // looked up. A second write through the same open file would otherwise
+    // see the size from before the first and zero-fill over the bytes it
+    // wrote (every appending writer — journald, pacman, shells — does this).
+    // The tree is authoritative.
+    let fresh = btree::find_item(vol, fs_root, &BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0))
+        .await?
+        .ok_or(FsError::NotFound)?;
+    let inode = &InodeItem::decode(&fresh)?;
+    if !inode.is_regular() {
+        return Err(FsError::Unsupported);
+    }
+    // `chattr +C` files (systemd-journald's journals on btrfs) carry
+    // BTRFS_INODE_NODATASUM: Linux writes their extents with no data
+    // checksums and never compresses them, and `btrfs check` flags a csum
+    // item for such an inode ("odd csum item"). Honour the inode's flag.
+    let nodatasum = le64(&fresh, INODE_ITEM_FLAGS)? & INODE_NODATASUM != 0;
 
     let old_size = inode.size;
     let end = offset
@@ -868,11 +989,22 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
         file_ranges.push((key.offset, key.offset.saturating_add(file_len)));
     }
 
+    // PREALLOC items are not absorbed: the write carves its sectors out of
+    // them (write-to-convert, Linux `btrfs_mark_extent_written`), leaving the
+    // rest preallocated, so a small write into a large preallocation costs
+    // only its own sectors.
+    let is_prealloc = |body: &[u8]| {
+        body[20] == format::FILE_EXTENT_PREALLOC && le64(body, 21).is_ok_and(|b| b != 0)
+    };
     let mut affected = alloc::vec![false; extents.len()];
     loop {
         let mut widened = false;
         for (i, &(start, finish)) in file_ranges.iter().enumerate() {
-            if affected[i] || start >= rewrite_end || finish <= rewrite_start {
+            if affected[i]
+                || start >= rewrite_end
+                || finish <= rewrite_start
+                || is_prealloc(&extents[i].1)
+            {
                 continue;
             }
             affected[i] = true;
@@ -945,7 +1077,7 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     // Preserve an existing zlib policy when the complete replacement window is
     // made solely from zlib extents (plus holes). Mixed-codec/uncompressed
     // windows fall back to ordinary extents.
-    let emit_zlib = saw_zlib && zlib_only;
+    let emit_zlib = saw_zlib && zlib_only && !nodatasum;
 
     // Read-modify-write only the closed-over window. Bytes past the old EOF and
     // implicit/explicit holes remain zero-filled.
@@ -989,7 +1121,19 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     // than beside `batch_stage` below is what keeps the refusal free of
     // consequences — by then the data extents have been allocated and written,
     // and a rejection would strand them until the batch commits.
-    let displaced = affected.iter().filter(|hit| **hit).count();
+    let items: Vec<fileops::FileItem> = extents
+        .iter()
+        .map(|(k, b)| fileops::FileItem::decode(*k, b.clone()))
+        .collect::<Result<_, _>>()?;
+    let converted = fileops::carve(
+        &items,
+        rewrite_start,
+        rewrite_end,
+        vol.fs_tree_id(),
+        ino,
+        |i| matches!(i.kind, fileops::Kind::Disk { prealloc: true }),
+    )?;
+    let displaced = affected.iter().filter(|hit| **hit).count() + converted.edits.len();
     let laid_down = rewrite_len.div_ceil(MAX_WRITE_EXTENT) as usize;
     qgroup_begin_op(batch);
     qgroup_reserve(vol, batch, vol.fs_tree_id(), rewrite_len).await?;
@@ -1023,7 +1167,11 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
         let disk_len = payload.len() as u64;
         let e_data = batch.alloc.alloc_data(vol, disk_len)?;
         vol.write_logical(e_data, payload).await?;
-        let csums = crate::csum::compute_csums(vol.csum_type(), payload, sectorsize as usize)?;
+        let csums = if nodatasum {
+            Vec::new()
+        } else {
+            crate::csum::compute_csums(vol.csum_type(), payload, sectorsize as usize)?
+        };
         let file_off = rewrite_start + window_off;
         new_data.push(DataRef {
             id: DataRefId {
@@ -1045,12 +1193,14 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     // ── Path-COW the fs tree: drop only intersected EXTENT_DATA, add the new tiling,
     //    and update the inode (found via a lookup, not a full tree read) —
     //    COWing only the touched paths rather than rebuilding the whole tree. ──
-    let mut edits: Vec<Edit> = Vec::new();
+    let mut edits: Vec<Edit> = converted.edits;
     for (i, (key, _)) in extents.iter().enumerate() {
         if affected[i] {
             edits.push(Edit::Delete(*key));
         }
     }
+    dropped_data.extend(converted.dropped);
+    let removed_nbytes = removed_nbytes + converted.removed_nbytes;
     for (key, body) in &new_eds {
         edits.push(Edit::Upsert(*key, body.clone()));
     }
@@ -1067,9 +1217,10 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
         .and_then(|n| n.checked_add(rewrite_len))
         .ok_or(FsError::InvalidData)?;
     new_inode[24..32].copy_from_slice(&new_nbytes.to_le_bytes()); // nbytes
+    touch_times(&mut new_inode, true); // `file_update_time`
     edits.push(Edit::Upsert(inode_key, new_inode));
 
-    batch_stage(vol, batch, &edits, dropped_data, new_data).await?;
+    batch_stage_refs(vol, batch, &edits, dropped_data, converted.added, new_data).await?;
     let full = batch.ops >= MAX_BATCH_OPS;
     drop(guard);
     if full {
@@ -1127,9 +1278,17 @@ const MAX_BATCH_OPS: usize = 8;
 #[derive(Debug)]
 pub(crate) struct FsBatch {
     gen: u64,
+    /// The subvolume tree this batch COWs. One core serves every mount of the
+    /// filesystem, so an operation through a mount of another subvolume first
+    /// commits this batch (see [`batch_begin`]).
+    tree_id: u64,
     alloc: Allocator,
     cow: CowState,
     dropped_data: Vec<DataRefId>,
+    /// Extra references to existing extents: a PREALLOC/REG extent split in
+    /// two by a write-to-convert or a punched hole leaves two file items with
+    /// one backref identity, i.e. an `EXTENT_DATA_REF` count of two.
+    added_data: Vec<DataRefId>,
     new_data: Vec<DataRef>,
     ops: usize,
     /// Raw monotonic cycles at which this transaction opened, for the commit
@@ -1166,6 +1325,13 @@ pub(crate) struct FsBatch {
     op_reserved: BTreeMap<u64, u64>,
 }
 
+impl FsBatch {
+    /// Whether any operation has been staged into this transaction.
+    pub(crate) fn has_ops(&self) -> bool {
+        self.ops > 0
+    }
+}
+
 /// Open the batch if none is open, and lock it for one operation.
 ///
 /// Holding the lock for the whole operation serialises commits against each
@@ -1175,7 +1341,24 @@ pub(crate) struct FsBatch {
 async fn batch_begin<'a, B: BlockDevice + 'static>(
     vol: &'a BtrfsVolume<B>,
 ) -> Result<narf_lib::mutex::MutexGuard<'a, Option<FsBatch>>, FsError> {
-    let mut guard = vol.fs_batch().lock().await;
+    let mut guard = loop {
+        // Never open a batch while a commit is in flight: its generation and
+        // allocator would come from the superblock and free-space tree that
+        // commit is about to replace.
+        let txn = vol.txn_lock().lock().await;
+        let guard = vol.fs_batch().lock().await;
+        drop(txn);
+        match guard.as_ref() {
+            // The open batch belongs to another mount's subvolume. A batch
+            // COWs exactly one fs tree, so commit it before this operation
+            // starts its own.
+            Some(batch) if batch.tree_id != vol.fs_tree_id() => {
+                drop(guard);
+                flush_batch(vol).await?;
+            }
+            _ => break guard,
+        }
+    };
     if guard.is_none() {
         // The generation the batch commits at. `commit_roots` does not run
         // until the batch closes, so every operation inside it derives the
@@ -1189,9 +1372,11 @@ async fn batch_begin<'a, B: BlockDevice + 'static>(
         let cow = PathCow::new(vol, gen, fs_root, fs_level).await?.suspend().0;
         *guard = Some(FsBatch {
             gen,
+            tree_id: vol.fs_tree_id(),
             alloc: Allocator::build(vol).await?,
             cow,
             dropped_data: Vec::new(),
+            added_data: Vec::new(),
             new_data: Vec::new(),
             ops: 0,
             base_root: (fs_root, fs_level),
@@ -1335,6 +1520,11 @@ pub(crate) fn __test_set_commit_interval_cycles(cycles: u64) {
 pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
 ) -> Result<(), FsError> {
+    // The timer runs beside operations on other CPUs. Committing between an
+    // operation's tree reads and its staging would hand it a tree that moved
+    // (a fresh root with no METADATA_ITEM yet, a closed batch), so it waits
+    // for the operation to finish (`op_lock`).
+    let _op = vol.op_lock().lock().await;
     let stale = {
         let guard = vol.fs_batch().lock().await;
         match guard.as_ref() {
@@ -1373,16 +1563,28 @@ pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
 /// report it to; it is retried on the next tick, and a failure serious enough
 /// to matter has already taken the filesystem read-only through
 /// `abort_transaction`.
-pub(crate) fn spawn_commit_timer<B: BlockDevice + 'static>(vol: &alloc::sync::Arc<BtrfsVolume<B>>) {
-    let weak = alloc::sync::Arc::downgrade(vol);
+pub(crate) fn spawn_commit_timer<B: BlockDevice + 'static>(
+    core: &alloc::sync::Arc<crate::volume::VolCore<B>>,
+) {
+    let weak = alloc::sync::Arc::downgrade(core);
     narf_scheduler::spawn(async move {
         let tick = commit_interval_cycles();
         loop {
             narf_time::sleep_cycles(tick).await;
-            let Some(vol) = weak.upgrade() else {
+            let Some(core) = weak.upgrade() else {
                 return;
             };
-            let _ = commit_if_stale(&vol).await;
+            // One timer per filesystem, whichever mounts are open: commit as
+            // the subvolume the running transaction belongs to.
+            if core.is_core_read_only() {
+                continue; // remounted read-only: nothing may commit
+            }
+            let tree = match core.fs_batch().lock().await.as_ref() {
+                Some(batch) => batch.tree_id,
+                None => continue,
+            };
+            let view = BtrfsVolume::view_for_tree(&core, tree);
+            let _ = commit_if_stale(&view).await;
         }
     });
 }
@@ -1405,6 +1607,18 @@ async fn batch_stage<B: BlockDevice + 'static>(
     batch: &mut FsBatch,
     edits: &[Edit],
     dropped_data: Vec<DataRefId>,
+    new_data: Vec<DataRef>,
+) -> Result<(), FsError> {
+    batch_stage_refs(vol, batch, edits, dropped_data, Vec::new(), new_data).await
+}
+
+/// [`batch_stage`] that also records added references (extent splits).
+async fn batch_stage_refs<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    batch: &mut FsBatch,
+    edits: &[Edit],
+    dropped_data: Vec<DataRefId>,
+    added_data: Vec<DataRefId>,
     new_data: Vec<DataRef>,
 ) -> Result<(), FsError> {
     // Roll-back point. A failure part-way through `apply_edits` leaves the tree
@@ -1463,7 +1677,17 @@ async fn batch_stage<B: BlockDevice + 'static>(
     // This is the data-side twin of what `PathCow::retire` does for metadata:
     // a block made this transaction and then dropped is removed from `pending`
     // rather than pushed onto `freed`.
+    // Additions first: a split recorded by this operation must be in place
+    // before a drop of one of its pieces can cancel against it.
+    batch.added_data.extend(added_data);
     for id in dropped_data {
+        // A drop of one piece of an extent this batch split cancels the
+        // split's extra reference; only the last piece of an extent born in
+        // this batch cancels the birth.
+        if let Some(extra) = batch.added_data.iter().position(|a| *a == id) {
+            batch.added_data.remove(extra);
+            continue;
+        }
         match batch.new_data.iter().position(|d| d.id.bytenr == id.bytenr) {
             Some(born_here) => {
                 batch.new_data.remove(born_here);
@@ -1578,7 +1802,7 @@ async fn commit_batch_inner<B: BlockDevice + 'static>(
                 level: out.root_level,
             },
             dropped_data: batch.dropped_data,
-            added_data: Vec::new(),
+            added_data: batch.added_data,
             added_meta: Vec::new(),
             dropped_meta: Vec::new(),
             new_data: batch.new_data,
@@ -1616,9 +1840,16 @@ async fn flush_batch_from<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     origin: FlushOrigin,
 ) -> Result<(), FsError> {
+    let _txn = vol.txn_lock().lock().await;
     let batch = vol.fs_batch().lock().await.take();
     match batch {
-        Some(batch) => commit_batch(vol, batch, origin).await,
+        Some(batch) if batch.tree_id == vol.fs_tree_id() => commit_batch(vol, batch, origin).await,
+        // Staged through a mount of another subvolume (or the commit timer):
+        // commit it as that subvolume, so its ROOT_ITEM and live root move.
+        Some(batch) => {
+            let owner = BtrfsVolume::view_for_tree(vol.core(), batch.tree_id);
+            commit_batch(&owner, batch, origin).await
+        }
         None => Ok(()),
     }
 }
@@ -2047,6 +2278,12 @@ pub(crate) struct CowState {
     /// In-place editing means one block can be rewritten by many operations;
     /// this keeps the batch from re-writing the whole path every time.
     dirty: BTreeSet<u64>,
+    /// Blocks of `pending` that a previous operation of the batch already
+    /// published (its root went live through `advance_fs_root`). Readers on
+    /// other CPUs walk that tree without any lock, so those blocks are never
+    /// rewritten in place again: the next operation COWs them to fresh
+    /// addresses and drops them (never committed, so nothing is freed).
+    sealed: BTreeSet<u64>,
     freed: Vec<(u64, u8)>,
     root: u64,
     root_level: u8,
@@ -2110,6 +2347,7 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
                 header,
                 pending: BTreeMap::new(),
                 dirty: BTreeSet::new(),
+                sealed: BTreeSet::new(),
                 freed: Vec::new(),
                 root,
                 root_level,
@@ -2134,6 +2372,9 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
     /// next operation touched rather than the whole accumulated path.
     pub(crate) fn suspend(mut self) -> (CowState, Vec<(u64, Vec<u8>, u8)>) {
         let dirty = core::mem::take(&mut self.state.dirty);
+        // Everything pending is about to be published to readers.
+        let published: Vec<u64> = self.state.pending.keys().copied().collect();
+        self.state.sealed.extend(published);
         let out: Vec<(u64, Vec<u8>, u8)> = dirty
             .into_iter()
             .filter_map(|addr| {
@@ -2160,6 +2401,7 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
     /// Retire the block at `addr`: if it was made this txn, drop it (never
     /// committed); otherwise record it as a freed committed block.
     fn retire(&mut self, addr: u64, level: u8) {
+        self.state.sealed.remove(&addr);
         if self.state.pending.remove(&addr).is_none() {
             self.state.freed.push((addr, level));
         } else {
@@ -2213,7 +2455,8 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
             self.retire(old_addr, level); // an emptied non-root node: drop it
             return Ok(Vec::new());
         }
-        let reuse = self.state.pending.contains_key(&old_addr);
+        let in_batch = self.state.pending.contains_key(&old_addr);
+        let reuse = in_batch && !self.state.sealed.contains(&old_addr);
         let mut ptrs = Vec::with_capacity(bufs.len());
         for (i, buf) in bufs.into_iter().enumerate() {
             let key = Self::first_key(&buf)?;
@@ -2228,7 +2471,10 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
             };
             ptrs.push((key, addr, self.gen));
         }
-        if !reuse {
+        if in_batch && !reuse {
+            // A published batch block: replaced, never committed, not freed.
+            self.retire(old_addr, level);
+        } else if !reuse {
             self.state.freed.push((old_addr, level)); // a committed block is replaced
         }
         Ok(ptrs)
@@ -2822,31 +3068,16 @@ async fn ensure_private_subvol<B: BlockDevice + 'static>(
     .await
 }
 
-/// Read every `BLOCK_GROUP_ITEM` from the extent tree as `(start, len, body)`.
-async fn read_block_groups<B: BlockDevice + 'static>(
-    vol: &BtrfsVolume<B>,
-    ext_root: u64,
-) -> Result<Vec<(u64, u64, Vec<u8>)>, FsError> {
-    let mut cursor = btree::Cursor::seek(vol, ext_root, &BtrfsKey::new(0, 0, 0)).await?;
-    let mut out = Vec::new();
-    while let Some((k, body)) = cursor.current()? {
-        if k.item_type == format::BLOCK_GROUP_ITEM_KEY {
-            out.push((k.objectid, k.offset, body.to_vec()));
-        }
-        cursor.advance().await?;
-    }
-    Ok(out)
-}
-
 /// Sum every block group's `used` — the definition of the superblock's
-/// `bytes_used`. Read from `ext_root` after the extent tree is written so it can
-/// never drift from the block groups themselves.
+/// `bytes_used`. Read from `bg_tree` (the extent tree, or the block-group tree
+/// on a `BLOCK_GROUP_TREE` filesystem) after it is written so it can never
+/// drift from the block groups themselves.
 async fn total_block_group_used<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
-    ext_root: u64,
+    bg_tree: u64,
 ) -> Result<u64, FsError> {
     let mut total = 0u64;
-    for (_, _, body) in read_block_groups(vol, ext_root).await? {
+    for (_, _, body) in block_group::read_block_groups(vol, bg_tree).await? {
         total += le64(&body, 0)?;
     }
     Ok(total)
@@ -2922,6 +3153,18 @@ fn build_ext_edits(
         }
     }
     Ok(edits)
+}
+
+/// Route `BLOCK_GROUP_ITEM` edits to the tree that holds block groups:
+/// `(extent-tree edits, block-group-tree edits)`. Without a block-group tree
+/// every edit stays in the extent tree.
+fn split_block_group_edits(edits: Vec<Edit>, home: BgHome) -> (Vec<Edit>, Vec<Edit>) {
+    match home {
+        BgHome::ExtentTree => (edits, Vec::new()),
+        BgHome::BlockGroupTree { .. } => edits
+            .into_iter()
+            .partition(|edit| edit.key().item_type != format::BLOCK_GROUP_ITEM_KEY),
+    }
 }
 
 struct DataChanges {
@@ -4414,8 +4657,11 @@ async fn commit_txn<B: BlockDevice + 'static>(
         }
         None => (None, Vec::new()),
     };
-    // Extent tree: read only its block groups (path COW touches its own leaves).
-    let bgs = read_block_groups(vol, old_ext).await?;
+    // Block groups: from the extent tree, or from the block-group tree
+    // (objectid 11) on a `BLOCK_GROUP_TREE` filesystem. Path COW touches only
+    // the leaves the edits reach in either.
+    let bg_home = block_group::bg_home(vol, root_tree).await?;
+    let bgs = block_group::read_block_groups(vol, bg_home.scan_root(old_ext)).await?;
 
     // csum tree: drop freed extents' csums, add new extents' csums.
     // Csum-tree edits, as a list rather than a whole-tree rewrite.
@@ -4426,27 +4672,26 @@ async fn commit_txn<B: BlockDevice + 'static>(
     // it back was cheap once nodes were cached; writing it never was.
     // Path-COW touches only the root-to-leaf paths the edits reach, which is
     // what the fs and extent trees beside it already do.
-    let csum_edits: Vec<Edit> = data_changes
-        .released
-        .iter()
-        .map(|&(bytenr, _)| {
-            Edit::Delete(BtrfsKey::new(
-                format::EXTENT_CSUM_OBJECTID,
-                format::EXTENT_CSUM_KEY,
-                bytenr,
-            ))
-        })
-        .chain(txn.new_data.iter().map(|d| {
-            Edit::Upsert(
-                BtrfsKey::new(
-                    format::EXTENT_CSUM_OBJECTID,
-                    format::EXTENT_CSUM_KEY,
-                    d.id.bytenr,
-                ),
-                d.csums.clone(),
-            )
-        }))
-        .collect();
+    let mut csum_edits: Vec<Edit> = match old_csum {
+        Some((csum_root, _)) => csum_release_edits(vol, csum_root, &data_changes.released).await?,
+        None => Vec::new(),
+    };
+    // A `nodatasum` extent has no checksums and gets no (empty) csum item.
+    csum_edits.extend(
+        txn.new_data
+            .iter()
+            .filter(|d| !d.csums.is_empty())
+            .map(|d| {
+                Edit::Upsert(
+                    BtrfsKey::new(
+                        format::EXTENT_CSUM_OBJECTID,
+                        format::EXTENT_CSUM_KEY,
+                        d.id.bytenr,
+                    ),
+                    d.csums.clone(),
+                )
+            }),
+    );
 
     // The fs tree arrives already path-COWed (nodes allocated from `alloc`).
     let c = &txn.fs;
@@ -4499,6 +4744,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
     for &(owner, root, tree_level) in &extra_roots {
         stamp_root_item_fields(&mut root_logical, owner, root, tree_level, gen)?;
     }
+
     let pending: BTreeMap<u64, Vec<u8>> = fs_nodes.iter().cloned().collect();
     let quota_tree = if txn.skip_qgroup_recount {
         None
@@ -4555,11 +4801,21 @@ async fn commit_txn<B: BlockDevice + 'static>(
         ext_nodes: Vec<(u64, Vec<u8>, u8)>,
         ext_root: u64,
         ext_level: u8,
+        /// The block-group tree's path COW, when the filesystem has one.
+        bgt: Option<CowOut>,
     }
     let mut done: Option<Done> = None;
     let mut prev_ext_new: Vec<(u64, u8)> = Vec::new();
     let mut prev_ext_freed: Vec<(u64, u8)> = Vec::new();
     let mut prev_ext_root = 0u64;
+    // The block-group tree is self-referential through the extent tree the
+    // same way the extent tree is through itself: its new blocks need
+    // METADATA_ITEMs and change their block group's `used`, which edits the
+    // block-group tree again. Linux settles this with delayed refs; here the
+    // previous round's blocks feed the next round until both trees are stable.
+    let mut prev_bgt_new: Vec<(u64, u8)> = Vec::new();
+    let mut prev_bgt_freed: Vec<(u64, u8)> = Vec::new();
+    let mut prev_bgt_root = 0u64;
     let mut fst_leaves = usize::from(fst_base.is_some());
 
     // A split extent tree can require more than a dozen rounds: recording the
@@ -4622,6 +4878,24 @@ async fn commit_txn<B: BlockDevice + 'static>(
         for &(a, l) in &prev_ext_new {
             new_meta.push((a, format::EXTENT_TREE_OBJECTID, l));
         }
+        for &(a, l) in &prev_bgt_new {
+            new_meta.push((a, format::BLOCK_GROUP_TREE_OBJECTID, l));
+        }
+        // The previous round's extent/block-group-tree blocks were allocated
+        // AFTER that round's csum/root/free-space blocks, but this round's are
+        // allocated (from the same restored base) BEFORE the extent tree is
+        // COWed again — so before convergence, a block this round gave the csum
+        // tree can be one the extent tree held last round. Recording it twice
+        // would mark it used twice in the free-space tree (a hard error) and
+        // charge its block group twice; one record per address is right for
+        // this round, and the converged round never has a collision (every
+        // allocation then repeats the previous round's exactly).
+        let before = new_meta.len();
+        {
+            let mut seen = BTreeSet::new();
+            new_meta.retain(|&(a, _, _)| seen.insert(a));
+        }
+        let collided = new_meta.len() != before;
 
         let mut freed_meta: Vec<(u64, u8)> = fs_freed.clone();
         freed_meta.extend(root_old.iter().copied());
@@ -4630,6 +4904,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
         }
         freed_meta.extend(fst_old.iter().copied());
         freed_meta.extend(prev_ext_freed.iter().copied());
+        freed_meta.extend(prev_bgt_freed.iter().copied());
 
         // Free-space tree: mark every new block used, return every freed block.
         let (fst_final, fst_groups) = match &fst_base {
@@ -4670,10 +4945,34 @@ async fn commit_txn<B: BlockDevice + 'static>(
             gen,
             nodesize as i64,
         )?;
+        // `update_block_group_item` writes to `btrfs_block_group_root()`: on a
+        // block-group-tree filesystem the BLOCK_GROUP_ITEM rewrites go to tree
+        // 11, never into the extent tree.
+        let (ext_edits, bg_edits) = split_block_group_edits(ext_edits, bg_home);
         let ext_out = PathCow::new(vol, gen, old_ext, old_ext_level)
             .await?
             .apply(&mut alloc, &ext_edits)
             .await?;
+        let bgt_out = match bg_home {
+            BgHome::BlockGroupTree { root, level } => Some(
+                PathCow::new(vol, gen, root, level)
+                    .await?
+                    .apply(&mut alloc, &bg_edits)
+                    .await?,
+            ),
+            BgHome::ExtentTree => None,
+        };
+        let mut cur_bgt_new: Vec<(u64, u8)> = bgt_out
+            .as_ref()
+            .map(|out| out.nodes.iter().map(|&(a, _, l)| (a, l)).collect())
+            .unwrap_or_default();
+        let mut cur_bgt_freed = bgt_out
+            .as_ref()
+            .map(|out| out.freed.clone())
+            .unwrap_or_default();
+        cur_bgt_new.sort_unstable();
+        cur_bgt_freed.sort_unstable();
+        let cur_bgt_root = bgt_out.as_ref().map_or(0, |out| out.root_addr);
 
         let mut cur_ext_new: Vec<(u64, u8)> =
             ext_out.nodes.iter().map(|&(a, _, l)| (a, l)).collect();
@@ -4686,11 +4985,23 @@ async fn commit_txn<B: BlockDevice + 'static>(
         let mut p_freed = prev_ext_freed.clone();
         p_new.sort_unstable();
         p_freed.sort_unstable();
+        let mut pb_new = prev_bgt_new.clone();
+        let mut pb_freed = prev_bgt_freed.clone();
+        pb_new.sort_unstable();
+        pb_freed.sort_unstable();
         let converged = cur_ext_new == p_new
             && cur_ext_freed == p_freed
             && ext_out.root_addr == prev_ext_root
+            && cur_bgt_new == pb_new
+            && cur_bgt_freed == pb_freed
+            && cur_bgt_root == prev_bgt_root
             && fst_lv == fst_leaves;
         if converged {
+            // A converged round repeats the previous one's allocations, so a
+            // collision here would be two trees on one block: refuse it.
+            if collided {
+                return Err(FsError::InvalidData);
+            }
             let csum_root = csum_out
                 .as_ref()
                 .map_or((0, 0), |out| (out.root_addr, out.root_level));
@@ -4706,12 +5017,16 @@ async fn commit_txn<B: BlockDevice + 'static>(
                 ext_nodes: ext_out.nodes,
                 ext_root: ext_out.root_addr,
                 ext_level: ext_out.root_level,
+                bgt: bgt_out,
             });
             break;
         }
         prev_ext_new = cur_ext_new;
         prev_ext_freed = cur_ext_freed;
         prev_ext_root = ext_out.root_addr;
+        prev_bgt_new = cur_bgt_new;
+        prev_bgt_freed = cur_bgt_freed;
+        prev_bgt_root = cur_bgt_root;
         fst_leaves = fst_lv;
     }
     let Done {
@@ -4726,6 +5041,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
         ext_nodes,
         ext_root,
         ext_level,
+        bgt,
     } = done.ok_or(FsError::NoSpace)?;
 
     // ── Root tree: repoint each COWed tree's ROOT_ITEM, then pack it. ───
@@ -4741,6 +5057,8 @@ async fn commit_txn<B: BlockDevice + 'static>(
     if fs_tree_changed {
         root_updates.push((vol.fs_tree_id(), fs_root_addr, fs_level));
     }
+    // Every other tree this commit moved, for mounts rooted at it.
+    let published_extra: Vec<(u64, u64, u8)> = extra_roots.clone();
     root_updates.extend(extra_roots);
     if old_csum.is_some() {
         root_updates.push((format::CSUM_TREE_OBJECTID, csum_root.0, csum_root.1));
@@ -4748,6 +5066,21 @@ async fn commit_txn<B: BlockDevice + 'static>(
     if fst_final.is_some() {
         root_updates.push((format::FREE_SPACE_TREE_OBJECTID, fst_root.0, fst_root.1));
     }
+    // The block-group tree's ROOT_ITEM moves only when its path COW produced
+    // blocks (an all-zero `used` delta leaves it untouched, as Linux's dirty
+    // tracking would).
+    let bgt_root = match &bgt {
+        Some(out) if !out.nodes.is_empty() => {
+            root_updates.push((
+                format::BLOCK_GROUP_TREE_OBJECTID,
+                out.root_addr,
+                out.root_level,
+            ));
+            Some(out.root_addr)
+        }
+        Some(out) => Some(out.root_addr),
+        None => None,
+    };
     for &(owner, new, lvl) in &root_updates {
         let slot = leaf_find_by_type(&root_logical, owner, format::ROOT_ITEM_KEY)?
             .ok_or(FsError::NotFound)?;
@@ -4755,7 +5088,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
         stamp_root_item(&mut ri, new, lvl);
         leaf_replace_inplace(&mut root_logical, slot, &ri)?;
     }
-    let (root_root_addr, _) = tree_root_addr(&root_addrs, root_groups.len(), ns);
+    let (root_root_addr, root_root_level) = tree_root_addr(&root_addrs, root_groups.len(), ns);
 
     // Pin everything this transaction freed BEFORE its replacement nodes go
     // out. `pin_down_extent` does the same: a freed block stays unavailable
@@ -4778,6 +5111,10 @@ async fn commit_txn<B: BlockDevice + 'static>(
         nodes.push((addr, buf));
     }
     for (addr, mut buf, _lvl) in ext_nodes {
+        stamp_node(&mut buf, addr, gen, vol.csum_type())?;
+        nodes.push((addr, buf));
+    }
+    for (addr, mut buf, _lvl) in bgt.map(|out| out.nodes).unwrap_or_default() {
         stamp_node(&mut buf, addr, gen, vol.csum_type())?;
         nodes.push((addr, buf));
     }
@@ -4809,11 +5146,14 @@ async fn commit_txn<B: BlockDevice + 'static>(
         return Err(FsError::Unsupported);
     }
 
-    let bytes_used = total_block_group_used(vol, ext_root).await?;
+    let bytes_used = total_block_group_used(vol, bgt_root.unwrap_or(ext_root)).await?;
 
     let mut raw = vol.read_raw_superblock().await?;
     raw[72..80].copy_from_slice(&gen.to_le_bytes());
     raw[80..88].copy_from_slice(&root_root_addr.to_le_bytes());
+    // `root_level`: the root tree grows a level once it splits (many subvolume
+    // ROOT_ITEMs, small nodes); a stale level makes Linux refuse the mount.
+    raw[format::OFF_ROOT_LEVEL] = root_root_level;
     raw[120..128].copy_from_slice(&bytes_used.to_le_bytes());
     let incompat = le64(&raw, format::OFF_INCOMPAT_FLAGS)? | txn.incompat_flags_add;
     raw[format::OFF_INCOMPAT_FLAGS..format::OFF_INCOMPAT_FLAGS + 8]
@@ -4842,6 +5182,12 @@ async fn commit_txn<B: BlockDevice + 'static>(
         txn.root_flags,
         txn.incompat_flags_add,
     );
+    vol.set_superblock_levels(root_root_level, None);
+    for (owner, root, level) in published_extra {
+        if owner != vol.fs_tree_id() {
+            vol.publish_subvol_root(owner, root, level);
+        }
+    }
     // Bound how much a crash discards and how long pinned extents withhold
     // space. `sync_to_disk` is the same path `fsync` takes, so the batch is
     // forced out by exactly one mechanism.
@@ -4852,6 +5198,126 @@ async fn commit_txn<B: BlockDevice + 'static>(
 }
 
 // ── Namespace mutations (create / unlink) ──────────────────────────
+
+/// `btrfs_inode_item` timespec offsets: atime, ctime, mtime.
+const INODE_ATIME: usize = 112;
+const INODE_CTIME: usize = 124;
+const INODE_MTIME: usize = 136;
+
+/// The wall clock as a `btrfs_timespec`, or `None` while it is unset (no RTC
+/// read yet), in which case timestamps are left as they are.
+pub(crate) fn wall_now() -> Option<(i64, u32)> {
+    let w = narf_time::now_wall();
+    (w.secs > 0).then_some((w.secs, w.nanos))
+}
+
+fn put_time(item: &mut [u8], off: usize, (secs, nanos): (i64, u32)) {
+    item[off..off + 8].copy_from_slice(&secs.to_le_bytes());
+    item[off + 8..off + 12].copy_from_slice(&nanos.to_le_bytes());
+}
+
+/// `file_update_time` / `inode_set_ctime_current`: stamp ctime (and mtime)
+/// with the wall clock in a raw inode item.
+pub(crate) fn touch_times(item: &mut [u8], mtime: bool) {
+    if let Some(now) = wall_now() {
+        put_time(item, INODE_CTIME, now);
+        if mtime {
+            put_time(item, INODE_MTIME, now);
+        }
+    }
+}
+
+/// One `setattr` (chmod / chown / utimensat). `None` leaves a field alone.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AttrChange {
+    /// New permission and special bits (the low 12 of `st_mode`).
+    pub perms: Option<u16>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    /// Wall-clock nanoseconds since the epoch.
+    pub atime_ns: Option<u64>,
+    pub mtime_ns: Option<u64>,
+}
+
+/// Apply `change` to inode `ino` (`btrfs_setattr` -> `setattr_copy` ->
+/// `btrfs_update_inode`): mode keeps its `S_IFMT`, a chown kills `S_ISUID`
+/// (and a group-executable `S_ISGID`) on a non-directory, ctime moves to now,
+/// `transid` and `sequence` advance. Returns the new inode.
+pub async fn set_inode_attrs<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    ino: u64,
+    change: AttrChange,
+) -> Result<InodeItem, FsError> {
+    with_space_retry(vol, || set_inode_attrs_once(vol, ino, change)).await
+}
+
+async fn set_inode_attrs_once<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    ino: u64,
+    change: AttrChange,
+) -> Result<InodeItem, FsError> {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFDIR: u32 = 0o040000;
+    const S_ISUID: u32 = 0o4000;
+    const S_ISGID: u32 = 0o2000;
+    const S_IXGRP: u32 = 0o0010;
+    ensure_private_subvol(vol).await?;
+    let (fs_root, _) = vol.fs_tree_root();
+    let key = BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0);
+    let mut item = btree::find_item(vol, fs_root, &key)
+        .await?
+        .ok_or(FsError::NotFound)?;
+    let full = {
+        let mut guard = batch_begin(vol).await?;
+        let batch = guard.as_mut().ok_or(FsError::InvalidData)?;
+        let gen = batch.gen;
+        let mut mode = format::le32(&item, 52)?;
+        if let Some(perms) = change.perms {
+            mode = (mode & S_IFMT) | (u32::from(perms) & 0o7777);
+        }
+        if change.uid.is_some() || change.gid.is_some() {
+            if let Some(uid) = change.uid {
+                item[44..48].copy_from_slice(&uid.to_le_bytes());
+            }
+            if let Some(gid) = change.gid {
+                item[48..52].copy_from_slice(&gid.to_le_bytes());
+            }
+            if mode & S_IFMT != S_IFDIR {
+                mode &= !S_ISUID;
+                if mode & S_IXGRP != 0 {
+                    mode &= !S_ISGID;
+                }
+            }
+        }
+        item[52..56].copy_from_slice(&mode.to_le_bytes());
+        let ts = |ns: u64| ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as u32);
+        if let Some(ns) = change.atime_ns {
+            put_time(&mut item, INODE_ATIME, ts(ns));
+        }
+        if let Some(ns) = change.mtime_ns {
+            put_time(&mut item, INODE_MTIME, ts(ns));
+        }
+        touch_times(&mut item, false);
+        item[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
+        let seq = le64(&item, 72)?;
+        item[72..80].copy_from_slice(&(seq + 1).to_le_bytes()); // sequence
+        qgroup_begin_op(batch);
+        qgroup_reserve_meta(vol, batch, vol.fs_tree_id(), 1).await?;
+        batch_stage(
+            vol,
+            batch,
+            &[Edit::Upsert(key, item.clone())],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await?;
+        batch.ops >= MAX_BATCH_OPS
+    };
+    if full {
+        flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
+    }
+    InodeItem::decode(&item)
+}
 
 /// Build a fresh 160-byte `btrfs_inode_item`.
 #[allow(clippy::too_many_arguments)]
@@ -5612,7 +6078,9 @@ pub(crate) async fn destroy_subvolume<B: BlockDevice + 'static>(
         }
     }
     let (name, child_id, dir_index) = found.ok_or(FsError::NotFound)?;
-    if child_id == vol.fs_tree_id() {
+    // Linux refuses to delete a subvolume some mount is rooted at; with one
+    // core per filesystem that includes every other mount, not just this one.
+    if child_id == vol.fs_tree_id() || vol.subvol_mount_count(child_id) > 0 {
         return Err(FsError::Busy);
     }
     let name_bytes = name.as_bytes();
@@ -5959,8 +6427,14 @@ async fn create_node<B: BlockDevice + 'static>(
     .await?
     .ok_or(FsError::NotFound)?;
     let psize = le64(&pinode, 16)?;
-    let ptime_sec = le64(&pinode, 136)? as i64;
-    let ptime_nsec = format::le32(&pinode, 144)?;
+    // A new inode is stamped "now" and so are its parent's mtime/ctime
+    // (`btrfs_create_new_inode`, `btrfs_add_link`). Without a wall clock the
+    // parent's mtime stands in, as before.
+    let (ptime_sec, ptime_nsec) = match wall_now() {
+        Some(now) => now,
+        None => (le64(&pinode, 136)? as i64, format::le32(&pinode, 144)?),
+    };
+    touch_times(&mut pinode, true);
     pinode[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
                                                        // btrfs directory `i_size` counts each entry's name twice (DIR_ITEM +
                                                        // DIR_INDEX) — see `btrfs_add_link` (`i_size + name->len * 2`).
@@ -7202,7 +7676,7 @@ pub async fn write_log<B: BlockDevice + 'static>(
         .copy_from_slice(&gen.to_le_bytes());
     raw[format::OFF_LOG_ROOT_LEVEL] = log_root_tree_level;
     crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
-    vol.flush().await;
+    vol.flush().await?;
     vol.write_superblock(&raw).await?;
     Ok(())
 }
@@ -7405,7 +7879,7 @@ pub async fn replay_log<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Resul
         .copy_from_slice(&0u64.to_le_bytes());
     raw[format::OFF_LOG_ROOT_LEVEL] = 0;
     crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
-    vol.flush().await;
+    vol.flush().await?;
     vol.write_superblock(&raw).await?;
     vol.clear_log_root();
     Ok(true)
@@ -7987,6 +8461,13 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     profiles: Option<BalanceProfiles>,
     evacuate: Option<u64>,
 ) -> Result<BalanceStats, FsError> {
+    // Chunk growth is its own transaction over the committed trees. Close the
+    // running batch first and make its superblock durable: otherwise the
+    // batch's allocator (built before the growth) keeps handing out space the
+    // growth has just used, its uncommitted fs-tree blocks are invisible to
+    // the trees rewritten here, and its pinned extents are still withheld.
+    // An empty batch left by `batch_gen` is discarded by the flush as well.
+    vol.sync_to_disk().await?;
     let sb = vol.superblock();
     let (root_tree, _) = vol.root_tree_root();
     let old_chunk = sb.chunk_root;
@@ -8006,6 +8487,16 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     let (ext_base0, ext_old) = read_fs_oversized(vol, old_ext).await?;
     let (mut root_logical, root_old) = read_fs_oversized(vol, root_tree).await?;
     let (fst_base0, fst_old) = read_fs_oversized(vol, old_fst).await?;
+    // Block-group tree (objectid 11), when present, holds the block group
+    // items this grow inserts/updates (`insert_block_group_item` writes to
+    // `btrfs_block_group_root()`); it is COWed with the other trees.
+    let (bgt_base0, bgt_old) = match block_group::bg_home(vol, root_tree).await? {
+        BgHome::BlockGroupTree { root, .. } => {
+            let (logical, old) = read_fs_oversized(vol, root).await?;
+            (Some(logical), old)
+        }
+        BgHome::ExtentTree => (None, Vec::new()),
+    };
 
     // ── Locate logical high-water and per-type chunk templates ─────────
     let mut logical_hw = 0u64;
@@ -8229,18 +8720,21 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
             system_chunk.logical + system_chunk.length,
         )
     } else {
-        let mut arena = None;
+        let mut free = Vec::new();
         for slot in 0..nritems(&fst_base0)? as usize {
             let key = leaf_item_key(&fst_base0, slot)?;
             if key.item_type == format::FREE_SPACE_EXTENT_KEY
                 && key.objectid >= system_chunk.logical
                 && key.objectid < system_chunk.logical + system_chunk.length
             {
-                arena = Some((key.objectid, key.objectid.saturating_add(key.offset)));
-                break;
+                free.push((key.objectid, key.offset));
             }
         }
-        arena.ok_or(FsError::NoSpace)?
+        // Never place chunk-tree blocks over a superblock copy.
+        let free = crate::allocator::subtract_pinned(free, &vol.super_stripe_exclusions());
+        free.first()
+            .map(|&(s, l)| (s, s.saturating_add(l)))
+            .ok_or(FsError::NoSpace)?
     };
     let new_limit = meta_chunk.logical + meta_chunk.length;
 
@@ -8360,29 +8854,39 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     // ── Extent/free-space bases: create each logical block group ───────
     let mut ext_base = ext_base0;
     let mut fst_base = fst_base0;
-    for relocation in &relocations {
-        let key = BtrfsKey::new(
-            relocation.old.logical,
-            format::BLOCK_GROUP_ITEM_KEY,
-            relocation.old.length,
-        );
-        let slot = leaf_find(&ext_base, &key)?.ok_or(FsError::NotFound)?;
-        let mut body = leaf_item_data(&ext_base, slot)?.to_vec();
-        if body.len() < 24 {
-            return Err(FsError::InvalidData);
+    let mut bgt_base = bgt_base0;
+    {
+        // Block group items live in the block-group tree when there is one.
+        let bg_leaf: &mut Vec<u8> = match bgt_base.as_mut() {
+            Some(leaf) => leaf,
+            None => &mut ext_base,
+        };
+        for relocation in &relocations {
+            let key = BtrfsKey::new(
+                relocation.old.logical,
+                format::BLOCK_GROUP_ITEM_KEY,
+                relocation.old.length,
+            );
+            let slot = leaf_find(bg_leaf, &key)?.ok_or(FsError::NotFound)?;
+            let mut body = leaf_item_data(bg_leaf, slot)?.to_vec();
+            if body.len() < 24 {
+                return Err(FsError::InvalidData);
+            }
+            body[16..24].copy_from_slice(&relocation.new.flags.to_le_bytes());
+            leaf_replace_inplace(bg_leaf, slot, &body)?;
         }
-        body[16..24].copy_from_slice(&relocation.new.flags.to_le_bytes());
-        leaf_replace_inplace(&mut ext_base, slot, &body)?;
+        for chunk in &chunks {
+            let mut bg = alloc::vec![0u8; 24];
+            bg[8..16].copy_from_slice(&format::FIRST_CHUNK_TREE_OBJECTID.to_le_bytes());
+            bg[16..24].copy_from_slice(&chunk.flags.to_le_bytes());
+            leaf_insert_sorted(
+                bg_leaf,
+                &BtrfsKey::new(chunk.logical, format::BLOCK_GROUP_ITEM_KEY, chunk.length),
+                &bg,
+            )?;
+        }
     }
     for chunk in &chunks {
-        let mut bg = alloc::vec![0u8; 24];
-        bg[8..16].copy_from_slice(&format::FIRST_CHUNK_TREE_OBJECTID.to_le_bytes());
-        bg[16..24].copy_from_slice(&chunk.flags.to_le_bytes());
-        leaf_insert_sorted(
-            &mut ext_base,
-            &BtrfsKey::new(chunk.logical, format::BLOCK_GROUP_ITEM_KEY, chunk.length),
-            &bg,
-        )?;
         let mut info = alloc::vec![0u8; 8];
         info[0..4].copy_from_slice(&1u32.to_le_bytes());
         leaf_insert_sorted(
@@ -8396,9 +8900,19 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     let chunk_groups = group_items(vol, &chunk_logical)?;
     let dev_groups = group_items(vol, &dev_logical)?;
     let root_groups = group_items(vol, &root_logical)?;
+    // The block-group tree's content is settled too: `used` updates below
+    // rewrite fixed-size bodies in place and never change its leaf count.
+    let bgt_groups = match &bgt_base {
+        Some(leaf) => group_items(vol, leaf)?,
+        None => Vec::new(),
+    };
     let chunk_nc = tree_block_count(chunk_groups.len(), ns);
     let dev_nc = tree_block_count(dev_groups.len(), ns);
     let root_nc = tree_block_count(root_groups.len(), ns);
+    let bgt_nc = match bgt_base {
+        Some(_) => tree_block_count(bgt_groups.len(), ns),
+        None => 0,
+    };
 
     // Every old block across every COWed tree is returned to free space.
     let mut freed_meta: Vec<(u64, u8)> = chunk_old;
@@ -8406,6 +8920,7 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     freed_meta.extend(ext_old);
     freed_meta.extend(root_old);
     freed_meta.extend(fst_old);
+    freed_meta.extend(bgt_old);
 
     // ── Fixed point over the extent/free-space leaf counts ─────────────
     // Chunk-tree blocks come from the system arena; dev/ext/root/free-space from
@@ -8418,6 +8933,7 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
         ext_addrs: Vec<u64>,
         root_addrs: Vec<u64>,
         fst_addrs: Vec<u64>,
+        bgt_addrs: Vec<u64>,
         new_meta: Vec<(u64, u64, u8)>,
         ext_final: Vec<u8>,
         ext_groups: Vec<(usize, usize)>,
@@ -8446,9 +8962,13 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
             fst_leaves + usize::from(fst_leaves > 1),
             nodesize,
         )?;
+        let bgt_addrs = take_nodes(&mut nc, new_limit, bgt_nc, nodesize)?;
         // The metadata group's used prefix is every non-chunk-tree block.
-        let newbg_used = (dev_addrs.len() + ext_addrs.len() + root_addrs.len() + fst_addrs.len())
-            as u64
+        let newbg_used = (dev_addrs.len()
+            + ext_addrs.len()
+            + root_addrs.len()
+            + fst_addrs.len()
+            + bgt_addrs.len()) as u64
             * nodesize;
 
         let mut new_meta: Vec<(u64, u64, u8)> = Vec::new();
@@ -8487,6 +9007,15 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
             format::FREE_SPACE_TREE_OBJECTID,
             &mut new_meta,
         );
+        if bgt_base.is_some() {
+            collect_tree_meta(
+                &bgt_addrs,
+                bgt_groups.len(),
+                ns,
+                format::BLOCK_GROUP_TREE_OBJECTID,
+                &mut new_meta,
+            );
+        }
 
         // Extent tree with this iteration's metadata items.
         let mut ext_final = ext_base.clone();
@@ -8529,7 +9058,8 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
             )?;
         }
         for &(blk, _) in &freed_meta {
-            let (s, l) = block_group_of(&ext_final, blk)?.ok_or(FsError::InvalidData)?;
+            let bg_leaf = bgt_base.as_deref().unwrap_or(&ext_final);
+            let (s, l) = block_group_of(bg_leaf, blk)?.ok_or(FsError::InvalidData)?;
             fst_mark_free(&mut fst_final, vol.sectorsize() as u64, s, l, blk, nodesize)?;
         }
         if !added_system_chunk {
@@ -8553,6 +9083,7 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
                 ext_addrs,
                 root_addrs,
                 fst_addrs,
+                bgt_addrs,
                 new_meta,
                 ext_final,
                 ext_groups,
@@ -8570,6 +9101,7 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
         ext_addrs,
         root_addrs,
         fst_addrs,
+        bgt_addrs,
         new_meta,
         mut ext_final,
         ext_groups,
@@ -8578,24 +9110,38 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     } = grown.ok_or(FsError::NoSpace)?;
 
     // ── Block-group `used`: charge each new block, uncharge each freed one ──
-    for &(addr, _, _) in &new_meta {
-        block_group_add_used(&mut ext_final, addr, nodesize as i64)?;
-    }
-    for &(blk, _) in &freed_meta {
-        block_group_add_used(&mut ext_final, blk, -(nodesize as i64))?;
+    let mut bgt_final = bgt_base;
+    {
+        let bg_leaf: &mut Vec<u8> = match bgt_final.as_mut() {
+            Some(leaf) => leaf,
+            None => &mut ext_final,
+        };
+        for &(addr, _, _) in &new_meta {
+            block_group_add_used(bg_leaf, addr, nodesize as i64)?;
+        }
+        for &(blk, _) in &freed_meta {
+            block_group_add_used(bg_leaf, blk, -(nodesize as i64))?;
+        }
     }
 
     // ── Root tree: repoint the device/extent/free-space ROOT_ITEMs ─────
-    let (chunk_root_addr, _) = tree_root_addr(&chunk_addrs, chunk_groups.len(), ns);
+    let (chunk_root_addr, chunk_root_level) = tree_root_addr(&chunk_addrs, chunk_groups.len(), ns);
     let (dev_root_addr, dev_lvl) = tree_root_addr(&dev_addrs, dev_groups.len(), ns);
     let (ext_root_addr, ext_lvl) = tree_root_addr(&ext_addrs, ext_groups.len(), ns);
-    let (root_root_addr, _) = tree_root_addr(&root_addrs, root_groups.len(), ns);
+    let (root_root_addr, root_root_level) = tree_root_addr(&root_addrs, root_groups.len(), ns);
     let (fst_root_addr, fst_lvl) = tree_root_addr(&fst_addrs, fst_groups.len(), ns);
-    for (owner, new, lvl) in [
+    let bgt_root = bgt_final
+        .as_ref()
+        .map(|_| tree_root_addr(&bgt_addrs, bgt_groups.len(), ns));
+    let mut grown_roots = alloc::vec![
         (format::DEV_TREE_OBJECTID, dev_root_addr, dev_lvl),
         (format::EXTENT_TREE_OBJECTID, ext_root_addr, ext_lvl),
         (format::FREE_SPACE_TREE_OBJECTID, fst_root_addr, fst_lvl),
-    ] {
+    ];
+    if let Some((addr, lvl)) = bgt_root {
+        grown_roots.push((format::BLOCK_GROUP_TREE_OBJECTID, addr, lvl));
+    }
+    for (owner, new, lvl) in grown_roots {
         let slot = leaf_find_by_type(&root_logical, owner, format::ROOT_ITEM_KEY)?
             .ok_or(FsError::NotFound)?;
         let mut ri = leaf_item_data(&root_logical, slot)?.to_vec();
@@ -8615,6 +9161,9 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     nodes.extend(pack_tree_at(vol, &ext_final, &ext_groups, &ext_addrs, gen)?.0);
     nodes.extend(pack_tree_at(vol, &root_logical, &root_groups, &root_addrs, gen)?.0);
     nodes.extend(pack_tree_at(vol, &fst_final, &fst_groups, &fst_addrs, gen)?.0);
+    if let Some(leaf) = &bgt_final {
+        nodes.extend(pack_tree_at(vol, leaf, &bgt_groups, &bgt_addrs, gen)?.0);
+    }
 
     for chunk in &chunks {
         vol.add_chunk_item_mapping(chunk.logical, &chunk.item)?;
@@ -8623,11 +9172,14 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
         vol.write_logical(*addr, buf).await?;
     }
 
-    let bytes_used = total_block_group_used(vol, ext_root_addr).await?;
+    let bytes_used =
+        total_block_group_used(vol, bgt_root.map_or(ext_root_addr, |(addr, _)| addr)).await?;
     let mut raw = vol.read_raw_superblock().await?;
     raw[72..80].copy_from_slice(&gen.to_le_bytes()); // generation
     raw[80..88].copy_from_slice(&root_root_addr.to_le_bytes()); // root
     raw[88..96].copy_from_slice(&chunk_root_addr.to_le_bytes()); // chunk_root
+    raw[format::OFF_ROOT_LEVEL] = root_root_level;
+    raw[format::OFF_CHUNK_ROOT_LEVEL] = chunk_root_level;
     raw[120..128].copy_from_slice(&bytes_used.to_le_bytes()); // bytes_used
     let total_bytes = member_items.values().try_fold(0u64, |total, item| {
         total
@@ -8690,7 +9242,7 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     raw[sys_at..sys_at + sys_array.len()].copy_from_slice(&sys_array);
     vol.set_device_bytes_used(&dev_used)?;
     crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
-    vol.flush().await;
+    vol.flush().await?;
     vol.write_superblock(&raw).await?;
     vol.commit_chunk_root(
         chunk_root_addr,
@@ -8700,6 +9252,7 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
         member_items.len() as u64,
         incompat_add,
     );
+    vol.set_superblock_levels(root_root_level, Some(chunk_root_level));
     vol.commit_sys_chunk_array(sys_array)?;
     for relocation in &relocations {
         vol.replace_chunk_item_mapping(relocation.new.logical, &relocation.new.item)?;

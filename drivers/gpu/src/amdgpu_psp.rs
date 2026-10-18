@@ -49,38 +49,39 @@ extern crate alloc;
 /// one dword apart — `regMP0_SMN_C2PMSG_35` is `0x0063`, `_64` is `0x0080`,
 /// `_69` is `0x0085`. As a byte offset within the window that is `0x100`, and
 /// slot `N` is `MP0_C2PMSG_REL + N * 4`.
-pub const MP0_C2PMSG_REL: u32 = 0x0000_0100;
+pub const MP0_C2PMSG_REL: u32 = 0x0000_0100; // linux: (mmMP0_SMN_C2PMSG_32 - 32) * 4
 /// `regMP0_SMN_C2PMSG_35` — the bootloader command, and where its completion
 /// is polled.
-pub const MP0_C2PMSG_35_REL: u32 = MP0_C2PMSG_REL + 35 * 4;
+pub const MP0_C2PMSG_35_REL: u32 = MP0_C2PMSG_REL + 35 * 4; // linux: mmMP0_SMN_C2PMSG_35 * 4
 /// `regMP0_SMN_C2PMSG_36` — the bootloader component's address, shifted right
 /// by twenty. The component must therefore sit on a 1 MiB boundary.
-pub const MP0_C2PMSG_36_REL: u32 = MP0_C2PMSG_REL + 36 * 4;
+pub const MP0_C2PMSG_36_REL: u32 = MP0_C2PMSG_REL + 36 * 4; // linux: mmMP0_SMN_C2PMSG_36 * 4
 /// `regMP0_SMN_C2PMSG_64` — the ring-create command, and where its completion
 /// is polled. Also the slot the host waits on for sOS to be ready for a ring.
-pub const MP0_C2PMSG_64_REL: u32 = MP0_C2PMSG_REL + 64 * 4;
+pub const MP0_C2PMSG_64_REL: u32 = MP0_C2PMSG_REL + 64 * 4; // linux: mmMP0_SMN_C2PMSG_64 * 4
 /// `regMP0_SMN_C2PMSG_69`/`_70`/`_71` — ring address low, high, and size.
-pub const MP0_C2PMSG_69_REL: u32 = MP0_C2PMSG_REL + 69 * 4;
-pub const MP0_C2PMSG_70_REL: u32 = MP0_C2PMSG_REL + 70 * 4;
-pub const MP0_C2PMSG_71_REL: u32 = MP0_C2PMSG_REL + 71 * 4;
+pub const MP0_C2PMSG_69_REL: u32 = MP0_C2PMSG_REL + 69 * 4; // linux: mmMP0_SMN_C2PMSG_69 * 4
+pub const MP0_C2PMSG_70_REL: u32 = MP0_C2PMSG_REL + 70 * 4; // linux: mmMP0_SMN_C2PMSG_70 * 4
+pub const MP0_C2PMSG_71_REL: u32 = MP0_C2PMSG_REL + 71 * 4; // linux: mmMP0_SMN_C2PMSG_71 * 4
 /// `regMP0_SMN_C2PMSG_81` — sign of life. `psp_v13_0_is_sos_alive` treats any
 /// non-zero value as "the trusted OS is already running".
-pub const MP0_C2PMSG_81_REL: u32 = MP0_C2PMSG_REL + 81 * 4;
+pub const MP0_C2PMSG_81_REL: u32 = MP0_C2PMSG_REL + 81 * 4; // linux: mmMP0_SMN_C2PMSG_81 * 4
 /// Retained so the invented layout cannot be reintroduced by name: the driver
 /// never writes `regMP0_SMN_C2PMSG_67`.
-pub const MP0_C2PMSG_67_REL: u32 = MP0_C2PMSG_REL + 67 * 4;
+pub const MP0_C2PMSG_67_REL: u32 = MP0_C2PMSG_REL + 67 * 4; // linux: mmMP0_SMN_C2PMSG_67 * 4
 
 // ── Status word bits ────────────────────────────────────────────────
 
 /// `GFX_FLAG_RESPONSE` / `GFX_CMD_RESPONSE_MASK`: the PSP sets bit 31 of the
 /// command register it was given when it has serviced that command.
-pub const PSP_STATUS_DONE_BIT: u32 = 0x8000_0000;
+pub const PSP_STATUS_DONE_BIT: u32 = 0x8000_0000; // linux: GFX_FLAG_RESPONSE
 /// `GFX_CMD_STATUS_MASK` — the status code is the low **sixteen** bits, not
 /// bits 30:0. `GFX_CMD_RESERVED_MASK` (`0x7FF0_0000`) covers most of what sits
 /// between, so masking 30:0 would read reserved bits as a failure code.
-pub const PSP_STATUS_CODE_MASK: u32 = 0x0000_FFFF;
+pub const PSP_STATUS_CODE_MASK: u32 = 0x0000_FFFF; // linux: GFX_CMD_STATUS_MASK
 /// `MBOX_TOS_RESP_MASK` / `MBOX_TOS_READY_MASK`: what `psp_wait_for` compares
 /// against the response flag.
+// linux: MBOX_TOS_READY_MASK
 pub const PSP_STATUS_WAIT_MASK: u32 = PSP_STATUS_DONE_BIT | PSP_STATUS_CODE_MASK;
 
 // ── Bootloader commands (C2PMSG_35) ───────────────────────────────
@@ -89,19 +90,23 @@ pub const PSP_STATUS_WAIT_MASK: u32 = PSP_STATUS_DONE_BIT | PSP_STATUS_CODE_MASK
 /// mailbox itself accepts for loading a blob, and each loads one specific
 /// bootloader component — never an arbitrary IP firmware.
 pub mod bootloader_cmd {
-    pub const LOAD_SYSDRV: u32 = 0x0001_0000;
-    pub const LOAD_SOSDRV: u32 = 0x0002_0000;
-    pub const LOAD_KEY_DATABASE: u32 = 0x0008_0000;
-    pub const LOAD_SOCDRV: u32 = 0x000B_0000;
-    pub const LOAD_DBGDRV: u32 = 0x000C_0000;
-    pub const LOAD_INTFDRV: u32 = 0x000D_0000;
-    pub const LOAD_RASDRV: u32 = 0x000E_0000;
-    pub const LOAD_IPKEYMGRDRV: u32 = 0x000F_0000;
-    pub const DRAM_LONG_TRAIN: u32 = 0x0010_0000;
-    pub const DRAM_SHORT_TRAIN: u32 = 0x0020_0000;
-    pub const LOAD_TOS_SPL_TABLE: u32 = 0x1000_0000;
-    pub const LOAD_SPDMDRV: u32 = 0x2000_0000;
+    pub const LOAD_SYSDRV: u32 = 0x0001_0000; // linux: PSP_BL__LOAD_SYSDRV
+    pub const LOAD_SOSDRV: u32 = 0x0002_0000; // linux: PSP_BL__LOAD_SOSDRV
+    pub const LOAD_KEY_DATABASE: u32 = 0x0008_0000; // linux: PSP_BL__LOAD_KEY_DATABASE
+    pub const LOAD_SOCDRV: u32 = 0x000B_0000; // linux: PSP_BL__LOAD_SOCDRV
+    pub const LOAD_DBGDRV: u32 = 0x000C_0000; // linux: PSP_BL__LOAD_DBGDRV
+    pub const LOAD_INTFDRV: u32 = 0x000D_0000; // linux: PSP_BL__LOAD_INTFDRV
+    pub const LOAD_RASDRV: u32 = 0x000E_0000; // linux: PSP_BL__LOAD_RASDRV
+    pub const LOAD_IPKEYMGRDRV: u32 = 0x000F_0000; // linux: PSP_BL__LOAD_IPKEYMGRDRV
+    pub const DRAM_LONG_TRAIN: u32 = 0x0010_0000; // linux: PSP_BL__DRAM_LONG_TRAIN
+    pub const DRAM_SHORT_TRAIN: u32 = 0x0020_0000; // linux: PSP_BL__DRAM_SHORT_TRAIN
+    pub const LOAD_TOS_SPL_TABLE: u32 = 0x1000_0000; // linux: PSP_BL__LOAD_TOS_SPL_TABLE
+    pub const LOAD_SPDMDRV: u32 = 0x2000_0000; // linux: PSP_BL__LOAD_SPDMDRV
 }
+
+/// `enum psp_ring_type` (amdgpu_psp.h): every PSP11/13/14 driver creates the
+/// kernel-mode ring, `psp_ring_create(psp, PSP_RING_TYPE__KM)`.
+pub const PSP_RING_TYPE_KM: u32 = 2; // linux: PSP_RING_TYPE__KM
 
 // ── Ring control commands (C2PMSG_64) ─────────────────────────────
 
@@ -110,16 +115,16 @@ pub mod bootloader_cmd {
 /// in bits 31:16, which is why `psp_v13_0_ring_create` writes
 /// `ring_type << 16`.
 pub mod gfx_ctrl_cmd_id {
-    pub const INIT_RBI_RING: u32 = 0x0001_0000;
-    pub const INIT_GPCOM_RING: u32 = 0x0002_0000;
-    pub const DESTROY_RINGS: u32 = 0x0003_0000;
-    pub const CAN_INIT_RINGS: u32 = 0x0004_0000;
-    pub const ENABLE_INT: u32 = 0x0005_0000;
-    pub const DISABLE_INT: u32 = 0x0006_0000;
-    pub const MODE1_RST: u32 = 0x0007_0000;
-    pub const GBR_IH_SET: u32 = 0x0008_0000;
-    pub const CONSUME_CMD: u32 = 0x0009_0000;
-    pub const DESTROY_GPCOM_RING: u32 = 0x000C_0000;
+    pub const INIT_RBI_RING: u32 = 0x0001_0000; // linux: GFX_CTRL_CMD_ID_INIT_RBI_RING
+    pub const INIT_GPCOM_RING: u32 = 0x0002_0000; // linux: GFX_CTRL_CMD_ID_INIT_GPCOM_RING
+    pub const DESTROY_RINGS: u32 = 0x0003_0000; // linux: GFX_CTRL_CMD_ID_DESTROY_RINGS
+    pub const CAN_INIT_RINGS: u32 = 0x0004_0000; // linux: GFX_CTRL_CMD_ID_CAN_INIT_RINGS
+    pub const ENABLE_INT: u32 = 0x0005_0000; // linux: GFX_CTRL_CMD_ID_ENABLE_INT
+    pub const DISABLE_INT: u32 = 0x0006_0000; // linux: GFX_CTRL_CMD_ID_DISABLE_INT
+    pub const MODE1_RST: u32 = 0x0007_0000; // linux: GFX_CTRL_CMD_ID_MODE1_RST
+    pub const GBR_IH_SET: u32 = 0x0008_0000; // linux: GFX_CTRL_CMD_ID_GBR_IH_SET
+    pub const CONSUME_CMD: u32 = 0x0009_0000; // linux: GFX_CTRL_CMD_ID_CONSUME_CMD
+    pub const DESTROY_GPCOM_RING: u32 = 0x000C_0000; // linux: GFX_CTRL_CMD_ID_DESTROY_GPCOM_RING
 }
 
 // ── Ring command ids (GPCOM ring buffer, NOT a register) ──────────
@@ -130,21 +135,21 @@ pub mod gfx_ctrl_cmd_id {
 /// nothing: the mailbox commands are [`bootloader_cmd`] and
 /// [`gfx_ctrl_cmd_id`].
 pub mod gfx_cmd_id {
-    pub const LOAD_TA: u32 = 0x01;
-    pub const UNLOAD_TA: u32 = 0x02;
-    pub const INVOKE_CMD: u32 = 0x03;
-    pub const LOAD_ASD: u32 = 0x04;
-    pub const SETUP_TMR: u32 = 0x05;
-    pub const LOAD_IP_FW: u32 = 0x06;
-    pub const DESTROY_TMR: u32 = 0x07;
-    pub const SAVE_RESTORE: u32 = 0x08;
-    pub const SETUP_VMR: u32 = 0x09;
-    pub const DESTROY_VMR: u32 = 0x0A;
-    pub const PROG_REG: u32 = 0x0B;
-    pub const GET_FW_ATTESTATION: u32 = 0x0F;
-    pub const LOAD_TOC: u32 = 0x20;
-    pub const AUTOLOAD_RLC: u32 = 0x21;
-    pub const BOOT_CFG: u32 = 0x22;
+    pub const LOAD_TA: u32 = 0x01; // linux: GFX_CMD_ID_LOAD_TA
+    pub const UNLOAD_TA: u32 = 0x02; // linux: GFX_CMD_ID_UNLOAD_TA
+    pub const INVOKE_CMD: u32 = 0x03; // linux: GFX_CMD_ID_INVOKE_CMD
+    pub const LOAD_ASD: u32 = 0x04; // linux: GFX_CMD_ID_LOAD_ASD
+    pub const SETUP_TMR: u32 = 0x05; // linux: GFX_CMD_ID_SETUP_TMR
+    pub const LOAD_IP_FW: u32 = 0x06; // linux: GFX_CMD_ID_LOAD_IP_FW
+    pub const DESTROY_TMR: u32 = 0x07; // linux: GFX_CMD_ID_DESTROY_TMR
+    pub const SAVE_RESTORE: u32 = 0x08; // linux: GFX_CMD_ID_SAVE_RESTORE
+    pub const SETUP_VMR: u32 = 0x09; // linux: GFX_CMD_ID_SETUP_VMR
+    pub const DESTROY_VMR: u32 = 0x0A; // linux: GFX_CMD_ID_DESTROY_VMR
+    pub const PROG_REG: u32 = 0x0B; // linux: GFX_CMD_ID_PROG_REG
+    pub const GET_FW_ATTESTATION: u32 = 0x0F; // linux: GFX_CMD_ID_GET_FW_ATTESTATION
+    pub const LOAD_TOC: u32 = 0x20; // linux: GFX_CMD_ID_LOAD_TOC
+    pub const AUTOLOAD_RLC: u32 = 0x21; // linux: GFX_CMD_ID_AUTOLOAD_RLC
+    pub const BOOT_CFG: u32 = 0x22; // linux: GFX_CMD_ID_BOOT_CFG
 }
 
 pub use gfx_cmd_id::{
@@ -158,6 +163,7 @@ pub use gfx_cmd_id::{
 /// A bootloader component's address is shifted right by twenty, so the top of
 /// the addressable range is what a u32 of megabytes covers. Images themselves
 /// have no size field in the mailbox at all.
+// linux: n/a (alignment implied by the >> 20 in psp_v11_0_bootloader_load_component)
 pub const PSP_BOOTLOADER_ALIGN: u64 = 1 << 20;
 
 // ── Errors ──────────────────────────────────────────────────────────
@@ -206,7 +212,7 @@ pub trait PspMmio {
 /// read costs ~1 µs and PSP TA-load latency is ~50 ms typical /
 /// ~500 ms worst case; one million iterations is the matching
 /// upper bound for an empty-cost mock.
-pub const PSP_POLL_BUDGET: u32 = 1_000_000;
+pub const PSP_POLL_BUDGET: u32 = 1_000_000; // linux: n/a (NARF poll budget)
 
 /// The real MP0 mailbox write-then-poll: write `value` to `cmd_reg`, then
 /// poll that same register until bit 31 is set, and read the status out of

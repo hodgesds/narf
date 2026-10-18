@@ -35,7 +35,8 @@ impl Io for Fake {
     fn write(&mut self, reg: u32, value: u32) {
         self.writes.push((reg, value));
         self.regs[reg as usize] = value;
-        if reg == CTRL && (value == CREATE || value == DESTROY && self.destroy) {
+        // Literal Linux values: KM ring create 2 << 16, DESTROY_RINGS 3 << 16.
+        if reg == CTRL && (value == 0x0002_0000 || value == 0x0003_0000 && self.destroy) {
             self.regs[CTRL as usize] = RESPONSE;
         }
         if reg == WPTR {
@@ -69,10 +70,13 @@ impl Io for Fake {
                         0
                     };
                 self.memory[(COMMAND / 4) as usize + 220] = self.tmr_size;
-                if id == 6 && matches!(kind, 13 | 51) {
-                    let address = self
-                        .media_address
-                        .unwrap_or(self.tmr_address + if kind == 13 { 0x1000 } else { 0x100000 });
+                if id == 6 && matches!(kind, 13 | 51 | 58) {
+                    let offset = match kind {
+                        13 => 0x1000,
+                        58 => 0x80000,
+                        _ => 0x100000,
+                    };
+                    let address = self.media_address.unwrap_or(self.tmr_address + offset);
                     self.memory[(COMMAND / 4) as usize + 218] = address as u32;
                     self.memory[(COMMAND / 4) as usize + 219] = (address >> 32) as u32;
                 }
@@ -152,6 +156,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
             memory,
             state: State::Prepared,
             sequence: 0,
+            lenient: false,
         },
     )
 }
@@ -169,7 +174,7 @@ fn psp_ring_linux_wire_and_wrap() -> TestResult {
             (RING_LO, address as u32),
             (RING_HI, (address >> 32) as u32),
             (RING_SIZE, 4096),
-            (CTRL, CREATE),
+            (CTRL, 0x0002_0000),
         ]
     }) {
         return TestResult::Fail("Linux mailbox sequence");

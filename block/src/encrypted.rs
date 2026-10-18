@@ -531,6 +531,20 @@ impl EncryptedBlockDevice {
 }
 
 impl BlockDeviceSync for EncryptedBlockDevice {
+    fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
+    // `write_fua` keeps the default (encrypted write, then this flush).
+    fn flush(&self) -> Result<(), BlockIoError> {
+        self.inner.flush()
+    }
+    fn capabilities(&self) -> crate::registry::BlockCaps {
+        // FUA is emulated here (the default `write_fua`).
+        crate::registry::BlockCaps {
+            fua: false,
+            ..self.inner.capabilities()
+        }
+    }
     fn lba_size(&self) -> u32 {
         self.inner.lba_size().max(self.crypto_sector_size as u32)
     }

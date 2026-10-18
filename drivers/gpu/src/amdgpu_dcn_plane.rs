@@ -12,43 +12,48 @@
 use crate::{
     amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_dcn_profile::Profile, amdgpu_dml::Format,
 };
-use narf_bus::{BusDeviceCap, MmioRegion};
+use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // DPP block (base index 2), stride 0x16b.
 // Profile selects DCN30 or DCN314; shared ids below were compared against
 // both Linux offset and mask headers. Generation differences stay explicit.
-const DPP_CONTROL: u64 = 0x0cc5;
-const CNVC_SURFACE_PIXEL_FORMAT: u64 = 0x0ccf;
-const SCL_MODE: u64 = 0x0cfb;
-const RECOUT_START: u64 = 0x0d11;
-const RECOUT_SIZE: u64 = 0x0d12;
-const MPC_SIZE: u64 = 0x0d13;
-const DPP_STRIDE: u64 = 0x16b;
-// OPP block (base index 2): FMT stride 0x5a, shared by DPG and OPP_PIPE.
-const FMT_CONTROL: u64 = 0x1840;
-const FMT_BIT_DEPTH_CONTROL: u64 = 0x1841;
-const DPG_CONTROL: u64 = 0x1854;
-const DPG_DIMENSIONS: u64 = 0x1856;
-const DPG_COLOUR_R_CR: u64 = 0x1857;
-const DPG_COLOUR_G_Y: u64 = 0x1858;
-const DPG_COLOUR_B_CB: u64 = 0x1859;
-const OPP_PIPE_CONTROL: u64 = 0x188c;
-const OPP_STRIDE: u64 = 0x5a;
-// MPC block (base index 3): MPCC stride 0x20, output mux stride 4.
-const MPCC_TOP_SEL: u64 = 0x0000;
-const MPCC_BOT_SEL: u64 = 0x0001;
-const MPCC_OPP_ID: u64 = 0x0002;
-const MPCC_CONTROL: u64 = 0x0003;
-const MPCC_STRIDE: u64 = 0x20;
-const MPC_OUT_MUX: u64 = 0x0580;
-const MPC_OUT_STRIDE: u64 = 4;
+// linux-ctx: hdr=dcn seg=2
+const DPP_CONTROL: u64 = 0x0cc5; // linux: mmDPP_TOP0_DPP_CONTROL
+const CNVC_SURFACE_PIXEL_FORMAT: u64 = 0x0ccf; // linux: mmCNVC_CFG0_CNVC_SURFACE_PIXEL_FORMAT
+const SCL_MODE: u64 = 0x0cfb; // linux: mmDSCL0_SCL_MODE
+const RECOUT_START: u64 = 0x0d11; // linux: mmDSCL0_RECOUT_START
+const RECOUT_SIZE: u64 = 0x0d12; // linux: mmDSCL0_RECOUT_SIZE
+const MPC_SIZE: u64 = 0x0d13; // linux: mmDSCL0_MPC_SIZE
+const DPP_STRIDE: u64 = 0x16b; // linux: mmDPP_TOP1_DPP_CONTROL - mmDPP_TOP0_DPP_CONTROL
+                               // OPP block (base index 2): FMT stride 0x5a, shared by DPG and OPP_PIPE.
+const FMT_CONTROL: u64 = 0x1840; // linux: mmFMT0_FMT_CONTROL
+const FMT_BIT_DEPTH_CONTROL: u64 = 0x1841; // linux: mmFMT0_FMT_BIT_DEPTH_CONTROL
+const DPG_CONTROL: u64 = 0x1854; // linux: mmDPG0_DPG_CONTROL
+const DPG_DIMENSIONS: u64 = 0x1856; // linux: mmDPG0_DPG_DIMENSIONS
+const DPG_COLOUR_R_CR: u64 = 0x1857; // linux: mmDPG0_DPG_COLOUR_R_CR
+const DPG_COLOUR_G_Y: u64 = 0x1858; // linux: mmDPG0_DPG_COLOUR_G_Y
+const DPG_COLOUR_B_CB: u64 = 0x1859; // linux: mmDPG0_DPG_COLOUR_B_CB
+const OPP_PIPE_CONTROL: u64 = 0x188c; // linux: mmOPP_PIPE0_OPP_PIPE_CONTROL
+const OPP_STRIDE: u64 = 0x5a; // linux: mmFMT1_FMT_CONTROL - mmFMT0_FMT_CONTROL
+                              // MPC block (base index 3): MPCC stride 0x20, output mux stride 4.
+                              // linux-ctx: hdr=dcn seg=3
+const MPCC_TOP_SEL: u64 = 0x0000; // linux: mmMPCC0_MPCC_TOP_SEL
+const MPCC_BOT_SEL: u64 = 0x0001; // linux: mmMPCC0_MPCC_BOT_SEL
+const MPCC_OPP_ID: u64 = 0x0002; // linux: mmMPCC0_MPCC_OPP_ID
+const MPCC_CONTROL: u64 = 0x0003; // linux: mmMPCC0_MPCC_CONTROL
+const MPCC_STRIDE: u64 = 0x20; // linux: mmMPCC1_MPCC_TOP_SEL - mmMPCC0_MPCC_TOP_SEL
+const MPC_OUT_MUX: u64 = 0x0580; // linux: mmMPC_OUT0_MUX
+const MPC_OUT_STRIDE: u64 = 4; // linux: mmMPC_OUT1_MUX - mmMPC_OUT0_MUX
+                               // linux-ctx: hdr=dcn
 
 #[cfg(feature = "kernel-test")]
-const DPP_LAST_REG: u32 = (MPC_SIZE + 3 * DPP_STRIDE) as u32;
+const DPP_LAST_REG: u32 = (MPC_SIZE + 3 * DPP_STRIDE) as u32; // linux: n/a (test-only bank bound)
 #[cfg(feature = "kernel-test")]
+// linux: n/a (test-only bank bound)
 const OPP_LAST_REG: u32 = (OPP_PIPE_CONTROL + 3 * OPP_STRIDE) as u32;
 #[cfg(feature = "kernel-test")]
+// linux: n/a (test-only bank bound)
 const MPC_LAST_REG: u32 = (MPC_OUT_MUX + 3 * MPC_OUT_STRIDE) as u32;
 /// One per pixel pipe; see [`crate::amdgpu_dcn::DCN_PIPES`].
 #[cfg(feature = "kernel-test")]
@@ -62,11 +67,12 @@ const INSTANCES: u8 = crate::amdgpu_dcn::DCN_PIPES;
 /// `amdgpu_dcn_display::MAX_HEIGHT` is the same bound, checked where the mode
 /// is validated; the width is bounded tighter still by the OTG's
 /// `OPTC_SEGMENT_WIDTH`, so this is the backstop rather than the gate.
-pub(crate) const MAX_DIMENSION: u32 = (1 << 14) - 1;
+pub(crate) const MAX_DIMENSION: u32 = (1 << 14) - 1; // linux: DSCL0_RECOUT_SIZE__RECOUT_WIDTH_MASK
 
 /// `DSCL_MODE_SCALING_444_BYPASS`: an unscaled RGB plane takes no scaler taps.
 /// `DSCL_MODE_SCALING_444_BYPASS` from `enum dscl_mode_sel`
 /// (`dcn10_dpp_dscl.c:79-87`).
+// linux: n/a (enum dscl_mode_sel in dcn10_dpp.c: DSCL_MODE_SCALING_444_BYPASS = 0)
 const SCALER_BYPASS: u32 = 0;
 /// `DSCL0_SCL_MODE__DSCL_MODE_MASK` — **three** bits, not two. The enum runs to
 /// `DSCL_MODE_DSCL_BYPASS` = 6, so bit 2 is live.
@@ -74,9 +80,9 @@ const SCALER_BYPASS: u32 = 0;
 /// LINUX-GAP: this was masked 0x3. On a handoff from firmware that left the
 /// scaler in mode 4, 5 or 6, clearing only the low two bits would have left
 /// mode 4 (`SCALING_420_LUMA_BYPASS`) behind instead of reaching bypass.
-const DSCL_MODE: u32 = 0x0000_0007;
+const DSCL_MODE: u32 = 0x0000_0007; // linux: DSCL0_SCL_MODE__DSCL_MODE_MASK
 /// `MPCC_TOP_SEL`/`MPCC_BOT_SEL` park with all ones.
-const MPCC_UNSET: u32 = 0xf;
+const MPCC_UNSET: u32 = 0xf; // linux: n/a (literal 0xf in dcn10_mpc.c:mpc1_remove_mpcc)
 
 // `MPCC0_MPCC_CONTROL` fields, from `dcn_3_1_4_sh_mask.h`:
 //
@@ -92,12 +98,15 @@ const MPCC_UNSET: u32 = 0xf;
 // `MPCC_BG_BPC`. The fields below are the ones `mpc1_update_blending` and
 // `mpc1_mux_plane` write, with the values `dcn20_hwseq.c:2960-2990` composes
 // for an opaque plane.
-const MPCC_MODE: u32 = 0x0000_0003;
+const MPCC_MODE: u32 = 0x0000_0003; // linux: MPCC0_MPCC_CONTROL__MPCC_MODE_MASK
+                                    // linux: MPCC0_MPCC_CONTROL__MPCC_ALPHA_BLND_MODE_MASK
 const MPCC_ALPHA_BLND_MODE: u32 = 0x0000_0030;
+// linux: MPCC0_MPCC_CONTROL__MPCC_ALPHA_MULTIPLIED_MODE_MASK
 const MPCC_ALPHA_MULTIPLIED_MODE: u32 = 0x0000_0040;
+// linux: MPCC0_MPCC_CONTROL__MPCC_BLND_ACTIVE_OVERLAP_ONLY_MASK
 const MPCC_BLND_ACTIVE_OVERLAP_ONLY: u32 = 0x0000_0080;
-const MPCC_BG_BPC: u32 = 0x0000_0700;
-const MPCC_GLOBAL_ALPHA: u32 = 0x00FF_0000;
+const MPCC_BG_BPC: u32 = 0x0000_0700; // linux: MPCC0_MPCC_CONTROL__MPCC_BG_BPC_MASK
+const MPCC_GLOBAL_ALPHA: u32 = 0x00FF_0000; // linux: MPCC0_MPCC_CONTROL__MPCC_GLOBAL_ALPHA_MASK
 
 /// `MPCC_BLEND_MODE_TOP_LAYER_ONLY` from `enum mpcc_blend_mode`
 /// (`inc/hw/mpc.h:70-75`): BYPASS 0, TOP_LAYER_PASSTHROUGH 1, TOP_LAYER_ONLY 2,
@@ -108,14 +117,18 @@ const MPCC_GLOBAL_ALPHA: u32 = 0x00FF_0000;
 /// `TOP_LAYER_ONLY` for exactly this case — no bottom layer — and Linux's MPC
 /// never writes BYPASS anywhere. A bypassed MPCC does not put the DPP's pixels
 /// on the OPP at all.
+// linux: n/a (enum mpcc_blend_mode in inc/hw/mpc.h; header not in checker set)
 const MPCC_BLEND_MODE_TOP_LAYER_ONLY: u32 = 2;
 /// `MPCC_ALPHA_BLEND_MODE_GLOBAL_ALPHA` (`inc/hw/mpc.h`), which
 /// `dcn20_hwseq.c` selects for a plane with no per-pixel alpha, paired with
 /// `global_alpha = 0xff`.
+// linux: n/a (enum mpcc_alpha_blend_mode in inc/hw/mpc.h; header not in checker set)
 const MPCC_ALPHA_BLEND_MODE_GLOBAL_ALPHA: u32 = 2;
 /// `blnd_cfg.global_alpha = 0xff` — fully opaque.
+// linux: n/a (literal in dcn20_hwseq.c:dcn20_update_mpcc, global_alpha)
 const MPCC_GLOBAL_ALPHA_OPAQUE: u32 = 0xff;
 /// `blnd_cfg.background_color_bpc = 4` (`dcn20_hwseq.c:2985`).
+// linux: n/a (literal in dcn20_hwseq.c:dcn20_update_mpcc, background_color_bpc)
 const MPCC_BG_BPC_DEFAULT: u32 = 4;
 
 // `FMT0_FMT_CONTROL`:
@@ -129,11 +142,14 @@ const MPCC_BG_BPC_DEFAULT: u32 = 4;
 // `opp1_program_fmt`'s RGB arm clears all three, so an inherited
 // `FMT_SUBSAMPLING_MODE` of 2 (what a 4:2:2 or 4:2:0 stream leaves) would have
 // survived into an RGB stream.
+// linux: FMT0_FMT_CONTROL__FMT_PIXEL_ENCODING_MASK | FMT0_FMT_CONTROL__FMT_SUBSAMPLING_MODE_MASK | FMT0_FMT_CONTROL__FMT_CBCR_BIT_REDUCTION_BYPASS_MASK
 const FMT_RGB_FIELDS: u32 = 0x0003_0000 | 0x000C_0000 | 0x0020_0000;
 /// `TEST_PATTERN_MODE_HORIZONTALBARS` with both bar colours black, which is how
 /// DCN2 onwards paints a blanked stream.
+// linux: n/a (enum test_pattern_mode in inc/hw/hw_shared.h; not in checker set)
 const DPG_MODE_SOLID: u32 = 4;
 /// `TEST_PATTERN_COLOR_FORMAT_BPC_8`.
+// linux: n/a (enum test_pattern_color_format in inc/hw/hw_shared.h; not in checker set)
 const DPG_BIT_DEPTH_8: u32 = 1;
 
 /// The pixel encoding the output formatter emits. Only uncompressed RGB is
@@ -145,16 +161,16 @@ pub enum Encoding {
 impl Encoding {
     fn code(self) -> u32 {
         match self {
-            Encoding::Rgb => 0,
+            Encoding::Rgb => 0, // linux: n/a (literal in dcn10_opp.c:opp1_set_pixel_encoding)
         }
     }
 }
 /// `CNVC_SURFACE_PIXEL_FORMAT` uses the same codes as the hub pixel pipe.
 fn cnvc_format(format: Format) -> u32 {
     match format {
-        Format::Rgb16 => 3,
-        Format::Rgb32 => 8,
-        Format::Rgb64 => 26,
+        Format::Rgb16 => 3,  // linux: n/a (literal in dcn30_dpp.c:dpp3_cnv_setup, RGB565)
+        Format::Rgb32 => 8,  // linux: n/a (literal in dcn30_dpp.c:dpp3_cnv_setup, ARGB8888)
+        Format::Rgb64 => 26, // linux: n/a (literal in dcn30_dpp.c:dpp3_cnv_setup, ARGB16161616)
     }
 }
 
@@ -164,7 +180,7 @@ trait Io: Send {
 }
 #[derive(Debug)]
 struct Mmio {
-    regs: MmioRegion,
+    regs: crate::amdgpu_reg_window::Window,
     base: u64,
 }
 impl Io for Mmio {
@@ -230,8 +246,10 @@ impl<I: Io> Block<I> {
             return Err(Error::Invalid);
         }
         let reg = self.dpp(DPP_CONTROL);
+        // linux-lit: 4=DPP_TOP0_DPP_CONTROL__DPP_CLOCK_ENABLE__SHIFT
         self.update(reg, 1 << 4, 1 << 4)?;
         let reg = self.dpp(CNVC_SURFACE_PIXEL_FORMAT);
+        // linux-lit: 0x7f=CNVC_CFG0_CNVC_SURFACE_PIXEL_FORMAT__CNVC_SURFACE_PIXEL_FORMAT_MASK
         self.update(reg, 0x7f, cnvc_format(format))?;
         // Bypass the scaler outright rather than programming unity taps.
         let reg = self.dpp(SCL_MODE);
@@ -239,9 +257,10 @@ impl<I: Io> Block<I> {
         let reg = self.dpp(RECOUT_START);
         self.set(reg, 0)?;
         let reg = self.dpp(RECOUT_SIZE);
+        // linux-lit: 16=DSCL0_RECOUT_SIZE__RECOUT_HEIGHT__SHIFT
         self.set(reg, width | height << 16)?;
         let reg = self.dpp(MPC_SIZE);
-        self.set(reg, width | height << 16)
+        self.set(reg, width | height << 16) // linux-lit: 16=DSCL0_MPC_SIZE__MPC_HEIGHT__SHIFT
     }
     /// `mpc1_mux_plane`: bind this MPCC to a DPP and an OPP and route the OPP's
     /// output mux to it. Opaque passthrough, no bottom layer.
@@ -250,16 +269,16 @@ impl<I: Io> Block<I> {
             return Err(Error::Invalid);
         }
         let reg = self.mpcc(MPCC_TOP_SEL);
-        self.update(reg, 0xf, dpp as u32)?;
-        // Nothing below this plane: a stale bottom select would blend against
-        // another pipe's output.
+        self.update(reg, 0xf, dpp as u32)?; // linux-lit: 0xf=MPCC0_MPCC_TOP_SEL__MPCC_TOP_SEL_MASK
+                                            // Nothing below this plane: a stale bottom select would blend against
+                                            // another pipe's output.
         let reg = self.mpcc(MPCC_BOT_SEL);
-        self.update(reg, 0xf, MPCC_UNSET)?;
+        self.update(reg, 0xf, MPCC_UNSET)?; // linux-lit: 0xf=MPCC0_MPCC_BOT_SEL__MPCC_BOT_SEL_MASK
         let reg = self.mpcc(MPCC_OPP_ID);
-        self.update(reg, 0xf, opp as u32)?;
-        // Top layer only, with the opaque blend configuration
-        // `dcn20_hwseq.c:2960-2990` composes: global alpha at 0xff, no
-        // pre-multiplication, not overlap-only, background bpc 4.
+        self.update(reg, 0xf, opp as u32)?; // linux-lit: 0xf=MPCC0_MPCC_OPP_ID__MPCC_OPP_ID_MASK
+                                            // Top layer only, with the opaque blend configuration
+                                            // `dcn20_hwseq.c:2960-2990` composes: global alpha at 0xff, no
+                                            // pre-multiplication, not overlap-only, background bpc 4.
         let reg = self.mpcc(MPCC_CONTROL);
         self.update(
             reg,
@@ -276,16 +295,17 @@ impl<I: Io> Block<I> {
         )?;
         let instance = self.instance as u32;
         let reg = MPC_OUT_MUX + opp as u64 * MPC_OUT_STRIDE;
-        self.update(reg, 0xf, instance)
+        self.update(reg, 0xf, instance) // linux-lit: 0xf=MPC_OUT0_MUX__MPC_OUT_MUX_MASK
     }
     fn mpc_release(&mut self, opp: u8) -> Result<(), Error> {
         if opp >= self.profile.pipes() {
             return Err(Error::Invalid);
         }
         let reg = MPC_OUT_MUX + opp as u64 * MPC_OUT_STRIDE;
-        self.update(reg, 0xf, MPCC_UNSET)?;
+        self.update(reg, 0xf, MPCC_UNSET)?; // linux-lit: 0xf=MPC_OUT0_MUX__MPC_OUT_MUX_MASK
         for reg in [MPCC_TOP_SEL, MPCC_BOT_SEL, MPCC_OPP_ID] {
             let reg = self.mpcc(reg);
+            // linux-lit: 0xf=MPCC0_MPCC_TOP_SEL__MPCC_TOP_SEL_MASK
             self.update(reg, 0xf, MPCC_UNSET)?;
         }
         Ok(())
@@ -297,8 +317,9 @@ impl<I: Io> Block<I> {
             return Err(Error::Invalid);
         }
         let reg = self.opp(OPP_PIPE_CONTROL);
-        self.update(reg, 1, 1)?;
+        self.update(reg, 1, 1)?; // linux-lit: 1=OPP_PIPE0_OPP_PIPE_CONTROL__OPP_PIPE_CLOCK_EN_MASK
         let reg = self.opp(FMT_CONTROL);
+        // linux-lit: 16=FMT0_FMT_CONTROL__FMT_PIXEL_ENCODING__SHIFT
         self.update(reg, FMT_RGB_FIELDS, encoding.code() << 16)?;
         // No truncation, no spatial dither, no frame randomisation.
         let reg = self.opp(FMT_BIT_DEPTH_CONTROL);
@@ -306,6 +327,7 @@ impl<I: Io> Block<I> {
         // The pattern generator's active area must match the stream, or a
         // blanked stream would paint only part of the screen.
         let reg = self.opp(DPG_DIMENSIONS);
+        // linux-lit: 16=DPG0_DPG_DIMENSIONS__DPG_ACTIVE_WIDTH__SHIFT
         self.set(reg, height | width << 16)
     }
     fn opp_set_blank(&mut self, blank: bool) -> Result<(), Error> {
@@ -315,6 +337,9 @@ impl<I: Io> Block<I> {
                 self.set(reg, 0)?;
             }
             let reg = self.opp(DPG_CONTROL);
+            // linux-lit: 1=DPG0_DPG_CONTROL__DPG_EN_MASK
+            // linux-lit: 4=DPG0_DPG_CONTROL__DPG_MODE__SHIFT
+            // linux-lit: 12=DPG0_DPG_CONTROL__DPG_BIT_DEPTH__SHIFT
             self.set(reg, 1 | DPG_MODE_SOLID << 4 | DPG_BIT_DEPTH_8 << 12)
         } else {
             // Disabling the generator outright is how DCN2 onwards returns to
@@ -343,10 +368,10 @@ impl Dpp {
         }
         Ok(Self(Block {
             io: Mmio {
-                regs: gpu.regs,
+                regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                 base: profile.bank(
                     gpu,
-                    2,
+                    2, // linux-lit: 2=mmDPP_TOP0_DPP_CONTROL_BASE_IDX
                     (MPC_SIZE + u64::from(profile.pipes() - 1) * DPP_STRIDE) as u32,
                 )?,
             },
@@ -379,10 +404,10 @@ impl Mpc {
         }
         Ok(Self(Block {
             io: Mmio {
-                regs: gpu.regs,
+                regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                 base: profile.bank(
                     gpu,
-                    3,
+                    3, // linux-lit: 3=mmMPCC0_MPCC_TOP_SEL_BASE_IDX
                     (MPC_OUT_MUX + u64::from(profile.pipes() - 1) * MPC_OUT_STRIDE) as u32,
                 )?,
             },
@@ -423,10 +448,11 @@ impl Opp {
         Ok(Self {
             block: Block {
                 io: Mmio {
-                    regs: gpu.regs,
+                    regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                     base: profile.bank(
                         gpu,
-                        2,
+                        2, // linux-lit: 2=mmOPP_PIPE0_OPP_PIPE_CONTROL_BASE_IDX
+                        // linux-ctx: reset
                         (OPP_PIPE_CONTROL + u64::from(profile.pipes() - 1) * OPP_STRIDE) as u32,
                     )?,
                 },

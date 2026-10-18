@@ -29,6 +29,12 @@ mod affected;
 mod bench_stats;
 /// The `bpf-bench` subcommand: boot the suite, harvest the samples, apply §8.
 mod bpf_bench;
+mod btrfs_crash;
+mod btrfs_interop;
+/// `cachyos-gate`: the pre-hardware validation matrix for the installed
+/// CachyOS root (docs/BOOTING_ON_CACHYOS.md, "Pre-hardware validation gate").
+mod cachyos_gate;
+mod cachyos_root;
 mod ci_clippy;
 mod composition;
 mod crate_release;
@@ -38,6 +44,7 @@ mod http3_smoke;
 mod net_robust;
 mod passthrough;
 mod relocs;
+mod usb_image;
 
 #[derive(Parser)]
 #[command(author, version, about = "NARF build orchestrator")]
@@ -131,6 +138,33 @@ enum Cmd {
     /// `XTASK_SYSTEMD_PID1_FAILURE_MARKER` turn the capture into a
     /// fail-fast integration assertion.
     SystemdPid1(BuildArgs),
+    /// Boot a CachyOS-layout btrfs root (GPT ESP + `@` subvolumes, the
+    /// host's fstab shape, real CachyOS systemd userspace) as an NVMe disk
+    /// with the bare-metal cmdline (`root=UUID=… rootflags=subvol=/@
+    /// systemd_pid1 narf.disks=root-ro`) and wait for agetty's login prompt.
+    /// Builds `target/narf-cachyos-root.img` unprivileged on first use (see
+    /// `verification/data/cachyos-root/REGEN_cachyos_root_image.sh`).
+    CachyosRootSmoke(cachyos_root::Args),
+    /// Build a CachyOS-shaped btrfs disk image (host mkfs features, `@`
+    /// subvolumes, zstd, `chattr +C` journals) unprivileged, boot it under
+    /// `narf.disks=root-rw` running systemd-/pacman-shaped writes in `@`,
+    /// `@home` and `@log`, then require host `btrfs check` clean, `btrfs
+    /// restore` content matches and the GPT/ESP untouched. The host-exact
+    /// BLOCK_GROUP_TREE variant is written the same way (`--bgt=writable`,
+    /// the default) or must be refused by name and stay bit-identical
+    /// (`--bgt=refused`).
+    BtrfsRootrwInterop(btrfs_interop::Args),
+    /// Kill QEMU right after a btrfs `fsync` returns, reboot, and require the
+    /// data back plus a clean host `btrfs check` (commit durability).
+    BtrfsCrashSmoke(btrfs_crash::Args),
+    /// Pre-hardware validation gate for booting the installed CachyOS root:
+    /// boots the real `grub-image` bundle (OVMF -> GRUB -> Limine -> NARF) on
+    /// a q35 machine with a decoy NVMe and a CachyOS-layout btrfs root NVMe,
+    /// and runs root-ro, root-rw, crash-consistency, repeated-cycle and Linux
+    /// interop rows with host-side `btrfs check`/`restore`. Prints a PASS/FAIL
+    /// table; exits nonzero on any failure. `--real-root <image>` runs the
+    /// same matrix on a copy of a real host-root image (Gate C).
+    CachyosGate(cachyos_gate::Args),
     /// Exercise real HTTP/3 from a running CachyOS guest through SLIRP.
     ///
     /// The host runs an in-process QUIC/HTTP/3 fixture. The guest's curl must
@@ -145,6 +179,13 @@ enum Cmd {
     /// keystrokes → narf_input ring → /dev/console → sys_read fd 0 →
     /// shell parser → echo built-in → sys_write fd 1 → UART.
     RunInteractive(RunInteractiveArgs),
+    /// NVMe flush + clean-shutdown check: boot with an extra scratch NVMe
+    /// disk (`nvme0`), write a token to it from the shell, `poweroff`, and
+    /// require every controller's `CC.SHN normal shutdown: Complete`; then
+    /// boot again on the same image (QEMU `cache=writeback`, so only a real
+    /// Flush makes the write durable on the host) and read the token back.
+    /// `--cmd` / `--expect` are ignored.
+    NvmePoweroffCheck(RunInteractiveArgs),
     /// Live TCP/UDP/DNS network-stack smoke. Boot with `qemu-net` (statically
     /// configures the virtio NIC with the SLIRP lease) + TCP and UDP QEMU
     /// `hostfwd` rules, round-trip payloads from the host through the guest
@@ -230,7 +271,7 @@ enum Cmd {
     /// directly; x86_64 UEFI chainloads the bundled Limine EFI app. The BIOS
     /// ELF retains NARF's compact KASLR table but has no ordinary linker
     /// relocation sections, which GRUB refuses even when they are non-loadable.
-    GrubImage(BuildArgs),
+    GrubImage(GrubImageArgs),
     /// Build removable media and boot it under OVMF/AAVMF UEFI.
     IsoBoot(BuildArgs),
     /// Boot under QEMU with a graphical display + the user-mode
@@ -246,6 +287,11 @@ enum Cmd {
     /// + /bin/sh. Boot picks the root via `root=PARTLABEL=NARF_ROOT`
     /// on the kernel cmdline.
     DiskWritePartitioned(DiskWritePartitionedArgs),
+    /// Build a UEFI USB-stick image file (MBR + FAT32 ESP) with the
+    /// persistent boot log enabled (`narf.bootlog=<token>` + marker file).
+    /// Write it with `disk-write --iso <image>`; `--qemu` boots a copy as
+    /// QEMU USB storage and prints the logs it wrote.
+    UsbImage(usb_image::UsbImageArgs),
     /// Wrap a raw firmware payload with the NARF trailer
     /// (`firmware/specification/spec.md` §6). Accepts a detached signature
     /// and public key; omitting both produces a developer-only unsigned
@@ -345,6 +391,386 @@ struct PackFirmwareArgs {
     out: Option<String>,
 }
 
+/// `xtask grub-image`: the image build plus the host-install disk policy.
+#[derive(Parser, Clone)]
+struct GrubImageArgs {
+    #[command(flatten)]
+    build: BuildArgs,
+
+    /// Leave `narf.disks=boot-only` off the generated GRUB and Limine
+    /// command lines, so every disk of the machine is writable. Never use
+    /// this on a machine whose internal disks hold data you want to keep.
+    #[arg(long)]
+    allow_all_disks: bool,
+
+    /// Boot the host's installed distro root (systemd PID 1) instead of
+    /// NARF's own userspace, under a root disk policy: `root-ro` (nothing is
+    /// writable; a tmpfs overlay gives a writable view) or `root-rw` (ONLY
+    /// the partition whose filesystem UUID is `--root-uuid` is written;
+    /// every other disk and partition, its ESP included, stays read-only).
+    /// Emits `narf.disks=<mode> root=UUID=<uuid> rootflags=<flags>
+    /// systemd_pid1`. Without it the default (`boot-only`) is unchanged.
+    #[arg(
+        long,
+        value_enum,
+        requires = "root_uuid",
+        conflicts_with = "allow_all_disks"
+    )]
+    root_policy: Option<RootPolicy>,
+
+    /// Filesystem UUID of the installed root (`blkid -s UUID -o value
+    /// /dev/<root partition>`, or the `UUID=` of `/` in its fstab).
+    #[arg(long, requires = "root_policy")]
+    root_uuid: Option<String>,
+
+    /// `rootflags=` for the installed root (the btrfs subvolume of `/`).
+    #[arg(long, default_value = "subvol=/@", requires = "root_policy")]
+    rootflags: String,
+
+    /// Persistent boot log: add `narf.bootlog=<token>`, so NARF writes its
+    /// kernel log to the USB FAT stick whose `/NARFLOG.ID` first line is the
+    /// token (8-64 characters of `[A-Za-z0-9_-]`, e.g. 32 hex digits). Under
+    /// the root policies that stick is the only writable device besides the
+    /// root.
+    #[arg(long, value_name = "TOKEN")]
+    bootlog_token: Option<String>,
+}
+
+/// `narf.bootlog=` token rules (`drivers/fs/fat/src/bootlog.rs::parse_config`).
+fn check_bootlog_token(token: &str) -> Result<()> {
+    if !(8..=64).contains(&token.len())
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("--bootlog-token must be 8..=64 characters of [A-Za-z0-9_-]");
+    }
+    Ok(())
+}
+
+/// `cmdline` with `narf.bootlog=<token>` appended when `--bootlog-token` is
+/// given (refused when the line already names one).
+fn with_bootlog_token(cmdline: String, grub: &GrubImageArgs) -> Result<String> {
+    let Some(token) = &grub.bootlog_token else {
+        return Ok(cmdline);
+    };
+    check_bootlog_token(token)?;
+    if cmdline
+        .split_whitespace()
+        .any(|a| a.starts_with("narf.bootlog="))
+    {
+        bail!("--bootlog-token: the command line already carries narf.bootlog=");
+    }
+    Ok(if cmdline.is_empty() {
+        format!("narf.bootlog={token}")
+    } else {
+        format!("{cmdline} narf.bootlog={token}")
+    })
+}
+
+/// `narf.disks=` root policies `xtask grub-image --root-policy` emits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum RootPolicy {
+    /// `narf.disks=root-ro`.
+    #[value(name = "root-ro")]
+    RootRo,
+    /// `narf.disks=root-rw`.
+    #[value(name = "root-rw")]
+    RootRw,
+}
+
+impl RootPolicy {
+    fn arg(self) -> &'static str {
+        match self {
+            RootPolicy::RootRo => "narf.disks=root-ro",
+            RootPolicy::RootRw => "narf.disks=root-rw",
+        }
+    }
+}
+
+/// Canonical lowercase 8-4-4-4-12 form of `uuid`, or an error.
+fn canonical_fs_uuid(uuid: &str) -> Result<String> {
+    let lower = uuid.trim().to_ascii_lowercase();
+    let groups: Vec<&str> = lower.split('-').collect();
+    let lens: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+    if lens != [8, 4, 4, 4, 12]
+        || !groups
+            .iter()
+            .all(|g| g.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        bail!("--root-uuid {uuid:?} is not a filesystem UUID (expected 8-4-4-4-12 hex)");
+    }
+    Ok(lower)
+}
+
+/// The kernel command line `grub-image` installs: the root policy's
+/// arguments when `--root-policy` is given, otherwise
+/// [`cmdline_with_disk_policy`]. A root policy refuses a base line that
+/// already names a disk policy or a root, rather than emitting two.
+fn grub_image_cmdline(cmdline: &str, grub: &GrubImageArgs) -> Result<String> {
+    with_bootlog_token(grub_image_policy_cmdline(cmdline, grub)?, grub)
+}
+
+fn grub_image_policy_cmdline(cmdline: &str, grub: &GrubImageArgs) -> Result<String> {
+    let Some(policy) = grub.root_policy else {
+        return Ok(cmdline_with_disk_policy(cmdline, grub.allow_all_disks));
+    };
+    let uuid = canonical_fs_uuid(grub.root_uuid.as_deref().unwrap_or_default())?;
+    let cmdline = cmdline.trim();
+    if let Some(clash) = cmdline.split_whitespace().find(|a| {
+        a.starts_with("narf.disks=") || a.starts_with("root=") || a.starts_with("rootflags=")
+    }) {
+        bail!("--root-policy: the base command line already carries `{clash}`");
+    }
+    if grub.rootflags.split_whitespace().count() != 1 {
+        bail!("--rootflags must be a single token, e.g. subvol=/@");
+    }
+    let tail = format!(
+        "{} root=UUID={uuid} rootflags={} systemd_pid1",
+        policy.arg(),
+        grub.rootflags
+    );
+    let tail = if cmdline.split_whitespace().any(|a| a == "systemd_pid1") {
+        tail.trim_end_matches(" systemd_pid1").to_string()
+    } else {
+        tail
+    };
+    Ok(if cmdline.is_empty() {
+        tail
+    } else {
+        format!("{cmdline} {tail}")
+    })
+}
+
+/// `cmdline` with the host-install disk policy applied: `narf.disks=boot-only`
+/// appended unless `allow_all_disks` (or the line already names a policy).
+/// Every generator of media meant for a real machine goes through this, as
+/// `usb-image` does; the kernel's own default (`all`) is kept for QEMU.
+fn cmdline_with_disk_policy(cmdline: &str, allow_all_disks: bool) -> String {
+    let cmdline = cmdline.trim();
+    if allow_all_disks
+        || cmdline
+            .split_whitespace()
+            .any(|a| a.starts_with("narf.disks="))
+    {
+        return cmdline.to_string();
+    }
+    if cmdline.is_empty() {
+        usb_image::BOOT_ONLY_ARG.to_string()
+    } else {
+        format!("{cmdline} {}", usb_image::BOOT_ONLY_ARG)
+    }
+}
+
+/// A staged `limine.conf` with [`cmdline_with_disk_policy`] applied to its
+/// `kernel_cmdline:` lines; a config without one (the staged image has none
+/// when the composition adds no boot arguments) gets one after each entry's
+/// `path:`.
+#[cfg(test)]
+fn limine_conf_with_disk_policy(conf: &str, allow_all_disks: bool) -> String {
+    limine_conf_with_cmdline(conf, |cl| Ok(cmdline_with_disk_policy(cl, allow_all_disks)))
+        .expect("infallible")
+}
+
+/// A staged `limine.conf` whose `kernel_cmdline:` lines are rewritten by
+/// `apply` (one is added after each entry's `path:` when there is none).
+fn limine_conf_with_cmdline(conf: &str, apply: impl Fn(&str) -> Result<String>) -> Result<String> {
+    let has_cmdline = conf
+        .lines()
+        .any(|l| l.trim_start().starts_with("kernel_cmdline:"));
+    let mut out = String::with_capacity(conf.len() + 32);
+    // Entry options (`path:`, `module_path:`, ...) belong indented under
+    // their `/Entry` line; an unindented one (staged configs lost the
+    // `module_path:` indent) is re-indented, or Limine reads it as a global
+    // option and boots without the initramfs module.
+    let mut in_entry = false;
+    for line in conf.lines() {
+        let fixed;
+        let line = if line.starts_with('/') {
+            in_entry = true;
+            line
+        } else if in_entry
+            && !line.is_empty()
+            && !line.starts_with(char::is_whitespace)
+            && line.contains(':')
+        {
+            fixed = format!("    {line}");
+            fixed.as_str()
+        } else {
+            line
+        };
+        let trimmed = line.trim_start();
+        let indent = &line[..line.len() - trimmed.len()];
+        if let Some(rest) = trimmed.strip_prefix("kernel_cmdline:") {
+            let cl = apply(rest)?;
+            out.push_str(&format!("{indent}kernel_cmdline: {cl}\n"));
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        if !has_cmdline && (trimmed.starts_with("path:") || trimmed.starts_with("kernel_path:")) {
+            let cl = apply("")?;
+            if !cl.is_empty() {
+                out.push_str(&format!("{indent}kernel_cmdline: {cl}\n"));
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod disk_policy_tests {
+    use super::*;
+
+    #[test]
+    fn host_install_cmdline_defaults_to_boot_only() {
+        assert_eq!(cmdline_with_disk_policy("", false), "narf.disks=boot-only");
+        assert_eq!(
+            cmdline_with_disk_policy(" quiet root=PARTLABEL=NARF_ROOT", false),
+            "quiet root=PARTLABEL=NARF_ROOT narf.disks=boot-only"
+        );
+        assert_eq!(cmdline_with_disk_policy("quiet", true), "quiet");
+        assert_eq!(
+            cmdline_with_disk_policy("narf.disks=all", false),
+            "narf.disks=all"
+        );
+    }
+
+    #[test]
+    fn grub_image_limine_conf_gets_boot_only() {
+        let without = "/NARF\n    protocol: multiboot2\n    path: boot():/boot/narf-frame\n    module_path: boot():/boot/initramfs.cpio\n";
+        let got = limine_conf_with_disk_policy(without, false);
+        assert!(got.contains(
+            "    path: boot():/boot/narf-frame\n    kernel_cmdline: narf.disks=boot-only\n"
+        ));
+        let with = "/NARF\n    path: boot():/boot/narf-frame\n    kernel_cmdline: amdgpu.native_display=1\n";
+        let got = limine_conf_with_disk_policy(with, false);
+        assert!(got.contains("    kernel_cmdline: amdgpu.native_display=1 narf.disks=boot-only\n"));
+        assert_eq!(got.matches("kernel_cmdline").count(), 1);
+        assert_eq!(limine_conf_with_disk_policy(without, true), without);
+    }
+
+    fn grub(args: &[&str]) -> GrubImageArgs {
+        let mut argv = vec!["xtask", "grub-image"];
+        argv.extend_from_slice(args);
+        let Cmd::GrubImage(args) = Cli::try_parse_from(argv).expect("parse").cmd else {
+            panic!("grub-image")
+        };
+        args
+    }
+
+    #[test]
+    fn grub_image_bootlog_token_and_entry_indentation() {
+        const UUID: &str = "653602c3-cd42-420e-95ef-4c4033d17b56";
+        let tok = "0123456789abcdef0123456789abcdef";
+        let rw = grub(&[
+            "--root-policy",
+            "root-rw",
+            "--root-uuid",
+            UUID,
+            "--bootlog-token",
+            tok,
+        ]);
+        assert_eq!(
+            grub_image_cmdline("", &rw).unwrap(),
+            format!(
+                "narf.disks=root-rw root=UUID={UUID} rootflags=subvol=/@ systemd_pid1 narf.bootlog={tok}"
+            )
+        );
+        let plain = grub(&["--bootlog-token", tok]);
+        assert_eq!(
+            grub_image_cmdline("", &plain).unwrap(),
+            format!("narf.disks=boot-only narf.bootlog={tok}")
+        );
+        assert!(grub_image_cmdline(&format!("narf.bootlog={tok}"), &plain).is_err());
+        assert!(grub_image_cmdline("", &grub(&["--bootlog-token", "short"])).is_err());
+        assert!(grub_image_cmdline("", &grub(&["--bootlog-token", "bad token!"])).is_err());
+        // The staged config's unindented module_path is put back under its entry.
+        let staged = "timeout: 5\n\n/NARF\n    protocol: multiboot2\n    path: boot():/boot/narf-frame\nmodule_path: boot():/boot/initramfs.cpio\n    module_string: initramfs\n";
+        let got = limine_conf_with_cmdline(staged, |cl| grub_image_cmdline(cl, &rw)).unwrap();
+        assert!(got.starts_with("timeout: 5\n"));
+        assert!(got.contains("\n    module_path: boot():/boot/initramfs.cpio\n"));
+        assert!(got.contains(&format!(
+            "\n    kernel_cmdline: narf.disks=root-rw root=UUID={UUID}"
+        )));
+        assert!(!got.lines().any(|l| l.starts_with("module_path")));
+    }
+
+    #[test]
+    fn grub_image_root_policy_emits_the_installed_root_cmdline() {
+        const UUID: &str = "653602c3-cd42-420e-95ef-4c4033d17b56";
+        let rw = grub(&["--root-policy", "root-rw", "--root-uuid", UUID]);
+        assert_eq!(
+            grub_image_cmdline("", &rw).unwrap(),
+            format!("narf.disks=root-rw root=UUID={UUID} rootflags=subvol=/@ systemd_pid1")
+        );
+        let ro = grub(&[
+            "--root-policy",
+            "root-ro",
+            "--root-uuid",
+            &UUID.to_ascii_uppercase(),
+            "--rootflags",
+            "subvol=/@,noatime",
+        ]);
+        assert_eq!(
+            grub_image_cmdline("amdgpu.native_display=1", &ro).unwrap(),
+            format!(
+                "amdgpu.native_display=1 narf.disks=root-ro root=UUID={UUID} \
+                 rootflags=subvol=/@,noatime systemd_pid1"
+            )
+        );
+        // No default change: without --root-policy the boot-only line stays.
+        assert_eq!(
+            grub_image_cmdline("", &grub(&[])).unwrap(),
+            "narf.disks=boot-only"
+        );
+        // A clash or a malformed UUID is an error, not a second policy.
+        assert!(grub_image_cmdline("narf.disks=all", &rw).is_err());
+        assert!(grub_image_cmdline("root=PARTLABEL=X", &rw).is_err());
+        let bad = grub(&["--root-policy", "root-rw", "--root-uuid", "6D89-28C5"]);
+        assert!(grub_image_cmdline("", &bad).is_err());
+        // The Limine config gets the same line.
+        let conf = "/NARF\n    path: boot():/boot/narf-frame\n";
+        let got = limine_conf_with_cmdline(conf, |cl| grub_image_cmdline(cl, &rw)).unwrap();
+        assert!(got.contains(&format!(
+            "kernel_cmdline: narf.disks=root-rw root=UUID={UUID}"
+        )));
+        // Root policies need a UUID and exclude --allow-all-disks.
+        assert!(Cli::try_parse_from(["xtask", "grub-image", "--root-policy", "root-rw"]).is_err());
+        assert!(Cli::try_parse_from([
+            "xtask",
+            "grub-image",
+            "--allow-all-disks",
+            "--root-policy",
+            "root-ro",
+            "--root-uuid",
+            UUID
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn grub_image_and_installed_root_parse_the_opt_out() {
+        let cli = Cli::try_parse_from(["xtask", "grub-image"]).expect("grub-image must parse");
+        let Cmd::GrubImage(args) = cli.cmd else {
+            panic!("grub-image")
+        };
+        assert!(!args.allow_all_disks);
+        let cli = Cli::try_parse_from(["xtask", "grub-image", "--allow-all-disks"]).unwrap();
+        let Cmd::GrubImage(args) = cli.cmd else {
+            panic!("grub-image")
+        };
+        assert!(args.allow_all_disks);
+        let cli = Cli::try_parse_from(["xtask", "disk-write-partitioned"]).unwrap();
+        let Cmd::DiskWritePartitioned(args) = cli.cmd else {
+            panic!("disk-write-partitioned")
+        };
+        assert!(!args.allow_all_disks);
+        assert!(installed_root_limine_conf(&args)
+            .contains("kernel_cmdline: quiet root=PARTLABEL=NARF_ROOT narf.disks=boot-only\n"));
+    }
+}
+
 #[derive(Parser, Clone)]
 struct DiskWritePartitionedArgs {
     /// Block device to format (e.g. /dev/sda). Auto-detected USB
@@ -377,6 +803,12 @@ struct DiskWritePartitionedArgs {
     /// any wrong --device will wipe the wrong disk.
     #[arg(long)]
     yes: bool,
+
+    /// Leave `narf.disks=boot-only` off the installed kernel command line,
+    /// so every disk of the machine is writable. Never use this on a
+    /// machine whose internal disks hold data you want to keep.
+    #[arg(long)]
+    allow_all_disks: bool,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -1222,6 +1654,7 @@ impl Arch {
                         "-device".into(),
                         "nvme,drive=nvm0,serial=narf".into(),
                     ]);
+                    args.extend(second_nvme_qemu_args());
                     let n1 = legacy_qemu_netdev(profile);
                     // `XTASK_QEMU_IGB=1` swaps the legacy NIC model for QEMU's
                     // `igb` (82576, 0x10C9) so the advanced-descriptor igb
@@ -1404,6 +1837,7 @@ impl Arch {
                 let append = [
                     std::env::var("XTASK_QEMU_APPEND").unwrap_or_default(),
                     extra_bootargs.to_string(),
+                    btrfs_smoke_bootarg().to_string(),
                 ]
                 .into_iter()
                 .filter(|value| !value.is_empty())
@@ -1467,6 +1901,7 @@ impl Arch {
                         "-device".into(),
                         "nvme,drive=nvm0,serial=narf".into(),
                     ]);
+                    args.extend(second_nvme_qemu_args());
                     let n1 = legacy_qemu_netdev(profile);
                     // `XTASK_QEMU_IGB=1` swaps the legacy NIC model for QEMU's
                     // `igb` (82576, 0x10C9) so the advanced-descriptor igb
@@ -1610,6 +2045,7 @@ impl Arch {
                 let append = [
                     std::env::var("XTASK_QEMU_APPEND").unwrap_or_default(),
                     extra_bootargs.to_string(),
+                    btrfs_smoke_bootarg().to_string(),
                 ]
                 .into_iter()
                 .filter(|value| !value.is_empty())
@@ -2132,7 +2568,14 @@ fn reconstruct_sparse_fixture(sparse_rel: &str, out: &Path) {
 /// `btrfs check` reports errors.
 fn verify_btrfs_write_interop() -> Result<()> {
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
-    let img = root.join("target").join("narf-nvme-btrfs.img");
+    // The boot-smoke phase's image, then the one the kernel-test phase wrote.
+    for name in ["narf-nvme-btrfs.img", "narf-nvme-btrfs-kernel-test.img"] {
+        verify_btrfs_image(&root.join("target").join(name))?;
+    }
+    Ok(())
+}
+
+fn verify_btrfs_image(img: &Path) -> Result<()> {
     if !img.exists() {
         return Ok(());
     }
@@ -2144,10 +2587,13 @@ fn verify_btrfs_write_interop() -> Result<()> {
         println!("xtask: skipping btrfs write-interop check (btrfs-progs not found)");
         return Ok(());
     }
-    println!("xtask: verifying NARF-written btrfs image with `btrfs check`...");
+    println!(
+        "xtask: verifying NARF-written btrfs image {} with `btrfs check`...",
+        img.display()
+    );
     let out = std::process::Command::new("btrfs")
         .arg("check")
-        .arg(&img)
+        .arg(img)
         .output()
         .context("failed to run `btrfs check`")?;
     let combined = format!(
@@ -2157,10 +2603,69 @@ fn verify_btrfs_write_interop() -> Result<()> {
     );
     if out.status.success() && combined.contains("no error found") {
         println!("xtask: btrfs write-interop OK — NARF-written image is `btrfs check` clean");
-        Ok(())
+        verify_btrfs_block_group_tree(img)
     } else {
         eprintln!("{combined}");
         bail!("`btrfs check` reported errors on the NARF-written image (write-interop regression)");
+    }
+}
+
+/// On a BLOCK_GROUP_TREE image, cross-check with btrfs-progs that every chunk
+/// has its BLOCK_GROUP_ITEM in tree 11 and the extent tree holds none.
+/// No-op for images without the feature.
+fn verify_btrfs_block_group_tree(img: &Path) -> Result<()> {
+    let dump = |args: &[&str]| -> Result<String> {
+        let out = std::process::Command::new("btrfs")
+            .args(["inspect-internal"])
+            .args(args)
+            .arg(img)
+            .output()
+            .context("failed to run `btrfs inspect-internal`")?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let sb = dump(&["dump-super"])?;
+    let compat_ro = sb
+        .lines()
+        .find_map(|line| line.strip_prefix("compat_ro_flags"))
+        .and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0);
+    if compat_ro & (1 << 3) == 0 {
+        return Ok(());
+    }
+    let count = |text: &str, needle: &str| text.matches(needle).count();
+    let bgt = dump(&["dump-tree", "-t", "11"])?;
+    let chunks = dump(&["dump-tree", "-t", "3"])?;
+    let extent = dump(&["dump-tree", "-t", "2"])?;
+    let (bg_items, chunk_items) = (
+        count(&bgt, "BLOCK_GROUP_ITEM"),
+        count(&chunks, "CHUNK_ITEM"),
+    );
+    if bg_items == 0 || bg_items != chunk_items || count(&extent, "BLOCK_GROUP_ITEM") != 0 {
+        eprintln!("{bgt}");
+        bail!(
+            "block-group tree mismatch: {bg_items} BLOCK_GROUP_ITEMs in tree 11, \
+             {chunk_items} chunks, extent tree must hold none"
+        );
+    }
+    println!(
+        "xtask: block-group tree OK — {bg_items} block groups in tree 11 match the chunk tree"
+    );
+    Ok(())
+}
+
+/// The kernel's btrfs read/write smokes mutate whichever btrfs volume they
+/// find, so they run only with `narf.btrfs_smoke`, which xtask passes solely
+/// when it serves its own disposable `narf-nvme-btrfs.img` on nvme0.
+fn btrfs_smoke_bootarg() -> &'static str {
+    // A caller-supplied image (`XTASK_BTRFS_NVME_IMAGE`) is not xtask's
+    // disposable fixture: the boot-time read/write smokes stay off it.
+    if std::env::var_os("XTASK_BTRFS_NVME_IMAGE").is_some() {
+        return "";
+    }
+    if KERNEL_TEST_DISK.load(std::sync::atomic::Ordering::Relaxed) {
+        "narf.btrfs_smoke"
+    } else {
+        ""
     }
 }
 
@@ -2180,8 +2685,35 @@ fn nvme_image_path() -> PathBuf {
         // NVMe hardware, and the written image stays mountable + `btrfs check`-clean
         // for a real Linux kernel. Verify manually with `mount -o loop` + `btrfs
         // check`.
-        reconstruct_sparse_fixture("drivers/fs/btrfs/testdata/fixture-bitmap.img.sparse", &path);
+        //
+        // `XTASK_BTRFS_NVME_FIXTURE=bgt` serves the block-group-tree fixture
+        // instead (the host CachyOS root's feature set: compat_ro 0xb,
+        // non-mixed 4K/16K, zstd, @-subvolumes), so the same write smoke and
+        // `btrfs check` postflight cover BLOCK_GROUP_TREE writes.
+        // `XTASK_BTRFS_NVME_IMAGE=<file>` serves a sparse copy of a raw
+        // btrfs image instead (a large real-world tree, e.g. the CachyOS
+        // root partition); the original is never written.
+        if let Some(src) = std::env::var_os("XTASK_BTRFS_NVME_IMAGE") {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::process::Command::new("cp")
+                .args(["--reflink=auto", "--sparse=always"])
+                .arg(&src)
+                .arg(&path)
+                .status();
+            return path;
+        }
+        let fixture = match std::env::var("XTASK_BTRFS_NVME_FIXTURE").as_deref() {
+            Ok("bgt") => "drivers/fs/btrfs/testdata/fixture-bgt.img.sparse",
+            _ => "drivers/fs/btrfs/testdata/fixture-bitmap.img.sparse",
+        };
+        reconstruct_sparse_fixture(fixture, &path);
         return path;
+    }
+    // `NARF_NVME_IMG` selects an alternate NVMe disk verbatim (e.g. the
+    // CachyOS-layout root image `cargo xtask cachyos-root-smoke` builds).
+    // Must already exist; we never synthesize an override path.
+    if let Some(p) = std::env::var_os("NARF_NVME_IMG") {
+        return PathBuf::from(p);
     }
     let path = root.join("target").join("narf-nvme.img");
     if !path.exists() {
@@ -2195,6 +2727,116 @@ fn nvme_image_path() -> PathBuf {
         let img = build_fat12_nvme_image(2048, b"narf\n");
         let _ = std::fs::write(&path, &img);
     }
+    path
+}
+
+/// QEMU arguments for a second NVMe controller (`serial=narf2`), added only
+/// to kernel-test runs: the multi-controller smokes (`drivers/nvme/multi`)
+/// probe it as `nvme1` and check data integrity, distinct identity and
+/// per-controller teardown against two real controllers. Interactive and
+/// distro runs keep a single NVMe disk.
+///
+/// `NARF_NVME2_IMG` attaches the named image as that second controller on any
+/// run (`cachyos-root-smoke` puts the root there, behind a decoy on the
+/// first, like the host's two NVMe disks).
+fn second_nvme_qemu_args() -> Vec<String> {
+    let path = match std::env::var_os("NARF_NVME2_IMG") {
+        Some(path) => PathBuf::from(path),
+        None if KERNEL_TEST_DISK.load(std::sync::atomic::Ordering::Relaxed) => nvme2_image_path(),
+        None => return Vec::new(),
+    };
+    vec![
+        "-drive".into(),
+        format!("if=none,id=nvm1,format=raw,file={}", path.display()),
+        "-device".into(),
+        "nvme,drive=nvm1,serial=narf2".into(),
+    ]
+}
+
+/// IEEE 802.3 CRC-32 (the GPT header / entry-array checksum).
+fn gpt_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// A GPT disk image (protective MBR, primary + backup headers with valid
+/// CRCs, 128-entry array) of `sectors` 512-byte sectors holding one Linux
+/// filesystem partition from LBA 2048 to the last usable LBA, with
+/// partition GUID `part_guid` (on-disk byte order) and name `name`.
+fn build_gpt_image(sectors: u64, part_guid: [u8; 16], name: &str) -> Vec<u8> {
+    const SECTOR: usize = 512;
+    let mut img = vec![0u8; sectors as usize * SECTOR];
+    let last = sectors - 1;
+    let entries_lbas = 32u64;
+    let last_usable = last - 1 - entries_lbas;
+    // Protective MBR.
+    img[446 + 4] = 0xEE;
+    img[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
+    img[446 + 12..446 + 16].copy_from_slice(&((last).min(0xFFFF_FFFF) as u32).to_le_bytes());
+    img[510] = 0x55;
+    img[511] = 0xAA;
+    // Entry 0.
+    let mut entries = vec![0u8; 128 * 128];
+    entries[0..16].copy_from_slice(&[
+        0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D,
+        0xE4,
+    ]);
+    entries[16..32].copy_from_slice(&part_guid);
+    entries[32..40].copy_from_slice(&2048u64.to_le_bytes());
+    entries[40..48].copy_from_slice(&last_usable.to_le_bytes());
+    for (i, u) in name.encode_utf16().take(36).enumerate() {
+        entries[56 + 2 * i..58 + 2 * i].copy_from_slice(&u.to_le_bytes());
+    }
+    let entries_crc = gpt_crc32(&entries);
+    let header = |current: u64, backup: u64, entries_lba: u64| {
+        let mut h = vec![0u8; 92];
+        h[0..8].copy_from_slice(b"EFI PART");
+        h[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        h[12..16].copy_from_slice(&92u32.to_le_bytes());
+        h[24..32].copy_from_slice(&current.to_le_bytes());
+        h[32..40].copy_from_slice(&backup.to_le_bytes());
+        h[40..48].copy_from_slice(&34u64.to_le_bytes());
+        h[48..56].copy_from_slice(&last_usable.to_le_bytes());
+        h[56..72].copy_from_slice(b"NARF-NVME2-DISK!");
+        h[72..80].copy_from_slice(&entries_lba.to_le_bytes());
+        h[80..84].copy_from_slice(&128u32.to_le_bytes());
+        h[84..88].copy_from_slice(&128u32.to_le_bytes());
+        h[88..92].copy_from_slice(&entries_crc.to_le_bytes());
+        let crc = gpt_crc32(&h);
+        h[16..20].copy_from_slice(&crc.to_le_bytes());
+        h
+    };
+    let primary = header(1, last, 2);
+    img[SECTOR..SECTOR + 92].copy_from_slice(&primary);
+    img[2 * SECTOR..2 * SECTOR + entries.len()].copy_from_slice(&entries);
+    let backup_entries = (last - entries_lbas) as usize * SECTOR;
+    img[backup_entries..backup_entries + entries.len()].copy_from_slice(&entries);
+    let backup = header(last, 1, last - entries_lbas);
+    img[last as usize * SECTOR..last as usize * SECTOR + 92].copy_from_slice(&backup);
+    img
+}
+
+/// Disposable 16 MiB disk behind the kernel-test run's second NVMe
+/// controller: a GPT with one partition, so the second controller is
+/// partition-scanned too. Rewritten every run (the smokes write to it).
+fn nvme2_image_path() -> PathBuf {
+    let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
+    let path = root.join("target").join("narf-nvme2.img");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let img = build_gpt_image(16 * 1024 * 1024 / 512, *b"narf-nvme2-part1", "narf-nvme2");
+    let _ = std::fs::write(&path, &img);
     path
 }
 
@@ -5456,6 +6098,49 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
     if failed > 0 {
         bail!("musl-demo failed ({} errors)", failed);
     }
+    Ok(())
+}
+
+/// `xtask nvme-poweroff-check` (see the `Cmd` doc).
+fn nvme_poweroff_check_cmd(args: &RunInteractiveArgs) -> Result<()> {
+    const TOKEN: &str = "NARF-FLUSH-TOKEN-7";
+    let root = workspace_root()?;
+    let img = root.join("target").join("narf-nvme-flushchk.img");
+    let _ = std::fs::remove_file(&img);
+    std::fs::File::create(&img)?.set_len(64 * 1024)?;
+    let prior = std::env::var("NARF_QEMU_EXTRA").ok();
+    // Listed before the default NVMe disk, so it probes as nvme0.
+    std::env::set_var(
+        "NARF_QEMU_EXTRA",
+        format!(
+            "{} -drive if=none,id=fchk,format=raw,cache=writeback,file={} \
+             -device nvme,drive=fchk,serial=flushchk",
+            prior.clone().unwrap_or_default(),
+            img.display()
+        ),
+    );
+    let result = (|| -> Result<()> {
+        let mut first = args.clone();
+        first.cmd = format!("/bin/echo {TOKEN} > /dev/nvme0n1; poweroff");
+        first.expect = "CC.SHN normal shutdown: Complete".into();
+        println!("xtask nvme-poweroff-check: boot 1 — write the token, poweroff");
+        run_interactive_cmd(&first)?;
+        let bytes = std::fs::read(&img)?;
+        if !bytes.starts_with(TOKEN.as_bytes()) {
+            bail!("the token is not on the host image after poweroff");
+        }
+        let mut second = args.clone();
+        second.cmd = "cat /dev/nvme0n1".into();
+        second.expect = TOKEN.into();
+        println!("xtask nvme-poweroff-check: boot 2 — read the token back");
+        run_interactive_cmd(&second)
+    })();
+    match prior {
+        Some(v) => std::env::set_var("NARF_QEMU_EXTRA", v),
+        None => std::env::remove_var("NARF_QEMU_EXTRA"),
+    }
+    result?;
+    println!("xtask nvme-poweroff-check: ok — flushed write survived poweroff + restart");
     Ok(())
 }
 
@@ -10692,8 +11377,7 @@ interface_resolution: 1024x768
 /NARF
     protocol: multiboot2
     path: boot():/boot/narf-frame
-{kernel_cmdline}\
-    module_path: boot():/boot/initramfs.cpio
+{kernel_cmdline}    module_path: boot():/boot/initramfs.cpio
     module_string: initramfs
 "
     );
@@ -10773,7 +11457,8 @@ interface_resolution: 1024x768
 /// NARF's loadable, compact `.kaslr_relocs` table. This command then removes
 /// only the original ELF relocation sections, preserving every PT_LOAD
 /// segment and NARF's own runtime KASLR support.
-fn grub_image_cmd(args: &BuildArgs) -> Result<()> {
+fn grub_image_cmd(grub: &GrubImageArgs) -> Result<()> {
+    let args = &grub.build;
     if matches!(args.arch, Arch::Aarch64) {
         bail!("direct GRUB Multiboot2 artifacts are currently x86_64-only");
     }
@@ -10854,17 +11539,25 @@ fn grub_image_cmd(args: &BuildArgs) -> Result<()> {
         .with_context(|| format!("copying UEFI kernel from {}", kernel.display()))?;
     std::fs::copy(&initramfs, esp_boot.join("initramfs.cpio"))
         .with_context(|| format!("copying UEFI initramfs from {}", initramfs.display()))?;
-    std::fs::copy(&limine_conf, esp_limine.join("limine.conf")).with_context(|| {
+    // The staged config is the QEMU image's (kernel default `narf.disks=all`);
+    // a host install gets `narf.disks=boot-only` unless opted out.
+    let staged_conf = std::fs::read_to_string(&limine_conf).with_context(|| {
         format!(
-            "copying Limine configuration from {}",
+            "reading Limine configuration from {}",
             limine_conf.display()
         )
     })?;
+    std::fs::write(
+        esp_limine.join("limine.conf"),
+        limine_conf_with_cmdline(&staged_conf, |cl| grub_image_cmdline(cl, grub))?,
+    )
+    .context("writing the bundle's limine.conf")?;
     std::fs::copy(&limine_efi, esp_efi.join("BOOTX64.EFI"))
         .with_context(|| format!("copying Limine EFI app from {}", limine_efi.display()))?;
 
     let composition = composition_plan(args, &root)?;
-    let composition_bootargs = composition::boot_arguments(&composition).join(" ");
+    let composition_bootargs =
+        grub_image_cmdline(&composition::boot_arguments(&composition).join(" "), grub)?;
     let composition_bootargs = if composition_bootargs.is_empty() {
         String::new()
     } else {
@@ -10918,6 +11611,26 @@ menuentry "NARF" {
     println!("  ESP:       {}", esp_dir.display());
     println!("  stanza:    {}", bundle.join("grub.cfg").display());
     println!("  BIOS: direct GRUB Multiboot2; UEFI: GRUB chainloads bundled Limine");
+    if let Some(policy) = grub.root_policy {
+        let uuid = canonical_fs_uuid(grub.root_uuid.as_deref().unwrap_or_default())?;
+        match policy {
+            RootPolicy::RootRo => println!(
+                "  disks: narf.disks=root-ro: NOTHING writable; root=UUID={uuid} mounted read-only"
+            ),
+            RootPolicy::RootRw => println!(
+                "  disks: narf.disks=root-rw: ONLY the partition with filesystem UUID {uuid} is \
+                 WRITTEN (real read-write); every other disk and partition stays read-only"
+            ),
+        }
+        println!("  cmdline:   {}", grub_image_cmdline("", grub)?);
+    } else if grub.allow_all_disks {
+        println!("  disks: ALL writable (--allow-all-disks)");
+    } else {
+        println!(
+            "  disks: {} (internal disks read-only, never auto-mounted)",
+            usb_image::BOOT_ONLY_ARG
+        );
+    }
     Ok(())
 }
 
@@ -11627,6 +12340,27 @@ fn disk_write_cmd(args: &DiskWriteArgs) -> Result<()> {
     }
 }
 
+/// The installed root's `limine.conf`: `root=PARTLABEL=<label>` so the
+/// kernel's root_selector picks the root partition, plus the host-install
+/// disk policy (`narf.disks=boot-only` unless `--allow-all-disks`).
+fn installed_root_limine_conf(args: &DiskWritePartitionedArgs) -> String {
+    let cmdline = cmdline_with_disk_policy(
+        &format!("quiet root=PARTLABEL={}", args.root_label),
+        args.allow_all_disks,
+    );
+    format!(
+        r#"timeout: 1
+
+/NARF
+    protocol: multiboot2
+    kernel_path: boot():/boot/narf-frame
+    kernel_cmdline: {cmdline}
+    module_path: boot():/boot/initramfs.cpio
+    module_string: initramfs
+"#
+    )
+}
+
 fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
     use std::io::{BufRead, Write};
 
@@ -11933,18 +12667,7 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
     // Limine config — same shape as the ISO's, but with `root=
     // PARTLABEL=<label>` so the kernel's root_selector picks the
     // ext4 partition.
-    let limine_conf = format!(
-        r#"timeout: 1
-
-/NARF
-    protocol: multiboot2
-    kernel_path: boot():/boot/narf-frame
-    kernel_cmdline: quiet root=PARTLABEL={label}
-    module_path: boot():/boot/initramfs.cpio
-    module_string: initramfs
-"#,
-        label = args.root_label,
-    );
+    let limine_conf = installed_root_limine_conf(args);
     write_as_root(&mnt_esp.join("boot/limine.conf"), &limine_conf)?;
 
     // ── 5b. Populate the root filesystem ─────────────────────────
@@ -12053,7 +12776,13 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
 
     println!();
     println!("✓ {} is ready. Plug into the target laptop and boot.", dev);
-    println!("  Kernel cmdline: root=PARTLABEL={}", args.root_label);
+    println!(
+        "  Kernel cmdline: {}",
+        cmdline_with_disk_policy(
+            &format!("quiet root=PARTLABEL={}", args.root_label),
+            args.allow_all_disks
+        )
+    );
     Ok(())
 }
 
@@ -12245,6 +12974,14 @@ fn main() -> Result<()> {
                 // Gate on the kernel-test runner's exit status: a failing
                 // smoke makes the runner exit_kernel(1), which this fails on.
                 run_cmd_inner(&smoke_args, true)?;
+                // Phase 2 rebuilds the NVMe fixture from pristine, so keep the
+                // image the kernel tests themselves wrote (the shared-instance
+                // subvolume writers) for the postflight to check too.
+                let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
+                let _ = std::fs::copy(
+                    root.join("target").join("narf-nvme-btrfs.img"),
+                    root.join("target").join("narf-nvme-btrfs-kernel-test.img"),
+                );
                 if kernel_tests_only {
                     return Ok(());
                 }
@@ -12265,8 +13002,13 @@ fn main() -> Result<()> {
         }
         Cmd::BootSmoke(args) => boot_smoke_cmd(&args),
         Cmd::SystemdPid1(args) => systemd_pid1_cmd(&args),
+        Cmd::CachyosRootSmoke(args) => cachyos_root::run(&args),
+        Cmd::BtrfsRootrwInterop(args) => btrfs_interop::run_cmd(&args),
+        Cmd::BtrfsCrashSmoke(args) => btrfs_crash::run(&args),
+        Cmd::CachyosGate(args) => cachyos_gate::run(&args),
         Cmd::Http3Smoke(args) => http3_smoke::run(&args),
         Cmd::RunInteractive(args) => run_interactive_cmd(&args),
+        Cmd::NvmePoweroffCheck(args) => nvme_poweroff_check_cmd(&args),
         Cmd::NetSmoke(args) => net_smoke_cmd(&args),
         Cmd::E1000ModuleNetSmoke(args) => e1000_module_net_smoke_cmd(&args),
         Cmd::IgbNetSmoke(args) => igb_net_smoke_cmd(&args),
@@ -12296,8 +13038,8 @@ fn main() -> Result<()> {
             // Keep direct-GRUB media behaviour aligned with the normal image:
             // it should start the init/userspace path rather than only the
             // async demo, and current bring-up firmware remains unsigned.
-            ensure_feature(&mut args.features, "boot-init");
-            ensure_feature(&mut args.features, "firmware-allow-unsigned");
+            ensure_feature(&mut args.build.features, "boot-init");
+            ensure_feature(&mut args.build.features, "firmware-allow-unsigned");
             grub_image_cmd(&args)
         }
         Cmd::IsoBoot(mut args) => {
@@ -12311,6 +13053,12 @@ fn main() -> Result<()> {
         }
         Cmd::DiskWrite(args) => disk_write_cmd(&args),
         Cmd::DiskWritePartitioned(args) => disk_write_partitioned_cmd(&args),
+        Cmd::UsbImage(mut args) => {
+            // Same kernel configuration as `xtask image`.
+            ensure_feature(&mut args.build.features, "boot-init");
+            ensure_feature(&mut args.build.features, "firmware-allow-unsigned");
+            usb_image::usb_image_cmd(&args)
+        }
         Cmd::PackFirmware(args) => pack_firmware_cmd(&args),
         Cmd::ImportFirmware(args) => import_firmware_cmd(&args),
         Cmd::Demo(mut args) => {

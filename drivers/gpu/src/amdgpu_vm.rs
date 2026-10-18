@@ -510,7 +510,7 @@ pub struct Mapping {
 }
 
 /// Rings an address space tracks jobs on (`amdgpu_cs` ticket ring indices).
-const RINGS: usize = 4;
+const RINGS: usize = 8;
 
 /// A recorded mapping and the buffer it maps. The record keeps the buffer
 /// alive (`amdgpu_bo_va` holds its BO in Linux): a client that closes the
@@ -561,6 +561,10 @@ impl Drop for VmState {
         // charged to the next space given the same PASID.
         let pasid = self.pasid.lock().take();
         self.release((root, mappings, pasid));
+        // Its media decode sessions close with it (amdgpu_uvd_free_handles).
+        crate::amdgpu_vcn_navi22_cs::forget_owner(
+            self.owner.load(core::sync::atomic::Ordering::Acquire),
+        );
     }
 }
 
@@ -814,7 +818,14 @@ impl VmState {
         removed
     }
 
-    fn unmap(&self, va: u64, size: u64) -> Result<(), FsError> {
+    /// `amdgpu_vm_bo_unmap`: drop the mapping record starting at `va`. Its
+    /// buffer comes back to the caller, which must clear the entries
+    /// (`retire_range`) before releasing it.
+    fn unmap(
+        &self,
+        va: u64,
+        size: u64,
+    ) -> Result<Vec<alloc::sync::Arc<crate::amdgpu_gem::GemObject>>, FsError> {
         let mut g = self.mappings.lock();
         let map = g.get_or_insert_with(BTreeMap::new);
         // UNMAP names an existing mapping exactly; Linux answers -ENOENT when
@@ -824,21 +835,38 @@ impl VmState {
             Some(_) => return Err(FsError::InvalidData),
             None => return Err(FsError::NotFound),
         };
-        drop(g);
-        let any = removed.is_some();
-        self.release_removed(removed, any);
-        Ok(())
+        Ok(removed.map(|e| e.object).into_iter().collect())
     }
 
-    fn clear(&self, va: u64, size: u64) -> Result<(), FsError> {
-        let removed = {
-            let mut g = self.mappings.lock();
-            let map = g.get_or_insert_with(BTreeMap::new);
-            Self::clear_range(map, va, size)
-        };
-        let any = !removed.is_empty();
-        self.release_removed(removed, any);
-        Ok(())
+    /// `amdgpu_vm_bo_clear_mappings` for `AMDGPU_VA_OP_CLEAR`: as `unmap`,
+    /// the removed buffers are the caller's to release after `retire_range`.
+    fn clear(
+        &self,
+        va: u64,
+        size: u64,
+    ) -> Result<Vec<alloc::sync::Arc<crate::amdgpu_gem::GemObject>>, FsError> {
+        let mut g = self.mappings.lock();
+        let map = g.get_or_insert_with(BTreeMap::new);
+        Ok(Self::clear_range(map, va, size))
+    }
+
+    /// `amdgpu_vm_clear_freed` and then the BO references: count the removal
+    /// in the TLB sequence (so any later job flushes its VMID), restore the
+    /// invalid pattern over `[va, va+size)`, and only then release `removed`
+    /// — deferred past every job already submitted in this space, which may
+    /// still hold the old translations in its TLB.
+    fn retire_range(
+        &self,
+        va: u64,
+        size: u64,
+        removed: Vec<alloc::sync::Arc<crate::amdgpu_gem::GemObject>>,
+    ) {
+        if !removed.is_empty() {
+            self.tlb_seq
+                .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        }
+        self.dematerialise(va, size);
+        self.release(removed);
     }
 
     /// How many mappings this address space holds.
@@ -970,18 +998,24 @@ pub fn dispatch(
             if let Err(error) = vm.materialise(&mapping, object.gpu, object.system, object.flags) {
                 // Leave neither half-written tables nor a mapping record
                 // claiming translations that do not exist.
-                vm.dematerialise(va, size);
-                let _ = vm.unmap(va, size);
+                if let Ok(removed) = vm.unmap(va, size) {
+                    vm.retire_range(va, size, removed);
+                } else {
+                    vm.dematerialise(va, size);
+                }
                 return Err(error);
             }
         }
+        // The buffer outlives its entries: amdgpu_vm_bo_unmap only moves the
+        // mapping to the freed list; amdgpu_vm_clear_freed clears the PTEs
+        // and the BO reference goes after that.
         uapi::AMDGPU_VA_OP_UNMAP => {
-            vm.unmap(va, size)?;
-            vm.dematerialise(va, size);
+            let removed = vm.unmap(va, size)?;
+            vm.retire_range(va, size, removed);
         }
         uapi::AMDGPU_VA_OP_CLEAR => {
-            vm.clear(va, size)?;
-            vm.dematerialise(va, size);
+            let removed = vm.clear(va, size)?;
+            vm.retire_range(va, size, removed);
         }
         _ => unreachable!("operation validated above"),
     }

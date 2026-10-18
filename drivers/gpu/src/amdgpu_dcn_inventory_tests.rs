@@ -814,3 +814,83 @@ kernel_test_in!(
     "drivers/gpu/dcn-inventory",
     inventory_reads_the_connector_speed_record
 );
+
+fn inventory_reads_discrete_vram_channels_from_vram_info_v25() -> TestResult {
+    const VRAM: usize = 0x870;
+    let mut image = Image::new();
+    image.point(TABLE_VRAM_INFO, VRAM);
+    let size = 64u16;
+    image.0[VRAM..VRAM + 2].copy_from_slice(&size.to_le_bytes());
+    image.0[VRAM + 2] = 2;
+    image.0[VRAM + 3] = 5;
+    image.0[VRAM + VRAM_MODULE_NUM_OFFSET] = 1;
+    // Navi22: twelve channels of CHANNEL_16BIT (log2 16 = 4).
+    image.0[VRAM + VRAM_MODULE0_OFFSET + VRAM_CHANNEL_NUM] = 12;
+    image.0[VRAM + VRAM_MODULE0_OFFSET + VRAM_CHANNEL_WIDTH] = 4;
+    if vram_channels(image.bytes()) != Ok((12, 2)) {
+        return TestResult::Fail("vram_info v2.5 channels");
+    }
+    image.0[VRAM + VRAM_MODULE0_OFFSET + VRAM_CHANNEL_WIDTH] = 9;
+    if vram_channels(image.bytes()) != Err(Error::Invalid) {
+        return TestResult::Fail("absurd channel width");
+    }
+    image.0[VRAM + 3] = 6;
+    if vram_channels(image.bytes()) != Err(Error::Unsupported) {
+        return TestResult::Fail("other vram_info revision read");
+    }
+    image.unpoint(TABLE_VRAM_INFO);
+    if vram_channels(image.bytes()) != Err(Error::Missing) {
+        return TestResult::Fail("absent vram_info");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-inventory",
+    inventory_reads_discrete_vram_channels_from_vram_info_v25
+);
+
+fn inventory_encoder_caps_read_the_encoder_record_list() -> TestResult {
+    let mut image = Image::new();
+    // Path 0's encoder (UNIPHY A: transmitter 0) carries an encoder-caps
+    // record after an unrelated one; path 1's (transmitter 3) has no list.
+    let list = 0x780usize;
+    let at = DISPLAY_OBJECT + PATHS_OFFSET + 8;
+    image.0[at..at + 2].copy_from_slice(&((list - DISPLAY_OBJECT) as u16).to_le_bytes());
+    image.0[list..list + 12].copy_from_slice(&[
+        21,
+        4,
+        0,
+        0, // bracket layout, skipped
+        RECORD_ENCODER_CAP,
+        6,
+        0x0c,
+        0,
+        0,
+        0, // HBR2_EN | HDMI6Gbps_EN
+        RECORD_END,
+        2,
+    ]);
+    if encoder_caps(image.bytes(), 0) != Ok(Some(0x0c))
+        || encoder_caps(image.bytes(), 3) != Ok(None)
+        || encoder_caps(image.bytes(), 5) != Ok(None)
+    {
+        return TestResult::Fail("encoder caps record");
+    }
+    // A short record is not an encoder-caps record.
+    image.0[list + 5] = 5;
+    image.0[list + 9..list + 11].copy_from_slice(&[RECORD_END, 2]);
+    if encoder_caps(image.bytes(), 0) != Ok(None) {
+        return TestResult::Fail("short caps record");
+    }
+    // Linux reports no record for every v1.5 object table.
+    image.0[list + 5] = 6;
+    image.0[DISPLAY_OBJECT + 3] = 5;
+    if encoder_caps(image.bytes(), 0) != Ok(None) {
+        return TestResult::Fail("v1.5 caps");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-inventory",
+    inventory_encoder_caps_read_the_encoder_record_list
+);

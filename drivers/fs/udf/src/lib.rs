@@ -78,7 +78,7 @@ fn build_named(
     let opts = mount_opts::parse(options)?;
     let name = source.strip_prefix("/dev/").unwrap_or(source);
     let dev = narf_block::find_block_device(name).ok_or(narf_filesystem::FsError::NotFound)?;
-    let fs = narf_scheduler::block_on(volume::UdfVolume::mount_with_opts(
+    let fs = narf_filesystem::fs_registry::mount_wait(volume::UdfVolume::mount_with_opts(
         narf_block::SyncBlock::new(dev),
         narf_driver_runtime::DomainId::DRIVER_0,
         opts,

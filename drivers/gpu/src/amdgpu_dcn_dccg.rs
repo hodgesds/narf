@@ -9,24 +9,26 @@ use crate::{
     amdgpu_dcn_profile::Profile,
 };
 use core::future::Future;
-use narf_bus::{BusDeviceCap, MmioRegion};
+use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // Profile selects DCN30 or DCN314; shared ids below were compared against
 // both Linux offset and mask headers. Generation differences stay explicit.
-const DPSTREAMCLK_CNTL: u64 = 0x004a;
-const DTBCLK_P_CNTL: u64 = 0x0068;
-const DENTIST_DISPCLK_CNTL: u64 = 0x0064;
-const OTG_PIXEL_RATE_DIV: u64 = 0x006f;
-const DPPCLK0_DTO_PARAM: u64 = 0x0099;
-const DPPCLK_DTO_CTRL: u64 = 0x00b6;
+// linux-ctx: hdr=dcn seg=1
+const DPSTREAMCLK_CNTL: u64 = 0x004a; // linux: n/a (DCN 3.1.4 path; refused on Navi22)
+const DTBCLK_P_CNTL: u64 = 0x0068; // linux: n/a (DCN 3.1.4 path; refused on Navi22)
+const DENTIST_DISPCLK_CNTL: u64 = 0x0064; // linux: mmDENTIST_DISPCLK_CNTL
+const OTG_PIXEL_RATE_DIV: u64 = 0x006f; // linux: n/a (DCN 3.1.4 path; refused on Navi22)
+const DPPCLK0_DTO_PARAM: u64 = 0x0099; // linux: mmDPPCLK0_DTO_PARAM
+const DPPCLK_DTO_CTRL: u64 = 0x00b6; // linux: mmDPPCLK_DTO_CTRL
+                                     // linux-ctx: hdr=dcn
 /// The highest DCCG register this module touches, for the bank bound.
-const LAST_REG: u32 = DPPCLK_DTO_CTRL as u32;
+const LAST_REG: u32 = DPPCLK_DTO_CTRL as u32; // linux: n/a (bank bound)
 /// One per pixel pipe; see [`crate::amdgpu_dcn::DCN_PIPES`].
 #[cfg(feature = "kernel-test")]
 const INSTANCES: u8 = crate::amdgpu_dcn::DCN_PIPES;
 /// `dccg2_update_dpp_dto` always divides against a full 8-bit modulo.
-const DTO_MODULO: u32 = 0xff;
+const DTO_MODULO: u32 = 0xff; // linux: n/a (literal in dcn20_dccg.c:dccg2_update_dpp_dto, modulo)
 
 /// `enum pixel_rate_div`. The encoding is not the divisor: four is 3.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,9 +40,9 @@ pub enum Divider {
 impl Divider {
     fn code(self) -> u32 {
         match self {
-            Divider::By1 => 0,
-            Divider::By2 => 1,
-            Divider::By4 => 3,
+            Divider::By1 => 0, // linux: n/a (DCN 3.1.4 path: enum pixel_rate_div)
+            Divider::By2 => 1, // linux: n/a (DCN 3.1.4 path: enum pixel_rate_div)
+            Divider::By4 => 3, // linux: n/a (DCN 3.1.4 path: enum pixel_rate_div)
         }
     }
 }
@@ -58,7 +60,7 @@ trait Io: Send {
 }
 #[derive(Debug)]
 struct Mmio {
-    regs: MmioRegion,
+    regs: crate::amdgpu_reg_window::Window,
     base: u64,
 }
 impl Io for Mmio {
@@ -114,7 +116,10 @@ impl<I: Io> Engine<I> {
         if pipe >= self.profile.pipes() {
             return Err(Error::Invalid);
         }
+        // linux-lit: 4=DPPCLK_DTO_CTRL__DPPCLK1_DTO_ENABLE__SHIFT - DPPCLK_DTO_CTRL__DPPCLK0_DTO_ENABLE__SHIFT
         let enable = 1 << (pipe as u32 * 4);
+        // linux-lit: 4=DPPCLK_DTO_CTRL__DPPCLK1_DTO_ENABLE__SHIFT
+        // linux-lit: 1=DPPCLK_DTO_CTRL__DPPCLK0_DTO_DB_EN__SHIFT
         let double_buffer = 1 << (pipe as u32 * 4 + 1);
         let reference = self.reference_dppclk_khz;
         if reference == 0 || requested_khz == 0 {
@@ -129,6 +134,7 @@ impl<I: Io> Engine<I> {
         self.access(|io| {
             io.write(
                 DPPCLK0_DTO_PARAM + pipe as u64,
+                // linux-lit: 16=DPPCLK0_DTO_PARAM__DPPCLK0_DTO_MODULO__SHIFT
                 phase as u32 | DTO_MODULO << 16,
             )
         })?;
@@ -200,10 +206,13 @@ impl<I: Io> Engine<I> {
         if value == u32::MAX {
             return Err(Error::DeviceGone);
         }
+        // linux-lit: 0x7f=DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_WDIVIDER_MASK
+        // linux-lit: 8=DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_RDIVIDER__SHIFT
         Ok((value & 0x7f, (value >> 8) & 0x7f))
     }
     fn resync_dio_fifo(&mut self) -> Result<(), Error> {
         let (_, read_divider) = self.dispclk_dividers()?;
+        // linux-lit: 0x7f=DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_WDIVIDER_MASK
         self.update(DENTIST_DISPCLK_CNTL, 0x7f, read_divider)
     }
 
@@ -219,7 +228,12 @@ impl<I: Io> Engine<I> {
         // These are requests, not ordinary readback registers: wait for both
         // the completion bit and the actual DISP divider to settle.
         for (mask, value, done, timeout_us, interval_us) in [
+            // linux-lit: 0x7f=DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_WDIVIDER_MASK
+            // linux-lit: 19=DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_CHG_DONE__SHIFT
             (0x7f, u32::from(disp), 1 << 19, 100_000, 50),
+            // linux-lit: 0x7f000000=DENTIST_DISPCLK_CNTL__DENTIST_DPPCLK_WDIVIDER_MASK
+            // linux-lit: 24=DENTIST_DISPCLK_CNTL__DENTIST_DPPCLK_WDIVIDER__SHIFT
+            // linux-lit: 20=DENTIST_DISPCLK_CNTL__DENTIST_DPPCLK_CHG_DONE__SHIFT
             (0x7f00_0000, u32::from(dpp) << 24, 1 << 20, 500, 5),
         ] {
             self.update(DENTIST_DISPCLK_CNTL, mask, value)?;
@@ -229,6 +243,9 @@ impl<I: Io> Engine<I> {
                 if reg == u32::MAX {
                     return Err(Error::DeviceGone);
                 }
+                // linux-lit: 19=DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_CHG_DONE__SHIFT
+                // linux-lit: 8=DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_RDIVIDER__SHIFT
+                // linux-lit: 0x7f=DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_RDIVIDER_MASK >> DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_RDIVIDER__SHIFT
                 if reg & done != 0 && (done != 1 << 19 || (reg >> 8) & 0x7f == u32::from(disp)) {
                     break;
                 }
@@ -255,10 +272,11 @@ impl Dccg {
     /// and must not let another client reprogram the same dividers.
     pub unsafe fn new(gpu: &AmdGpu, authority: Cap<BusDeviceCap, Write>) -> Result<Self, Error> {
         let profile = Profile::resolve(gpu)?;
-        let base = profile.bank(gpu, 1, LAST_REG)?;
+        let base = profile.bank(gpu, 1, LAST_REG)?; // linux-lit: 1=mmDENTIST_DISPCLK_CNTL_BASE_IDX
+                                                    // linux-ctx: reset
         Ok(Self(Engine {
             io: Mmio {
-                regs: gpu.regs,
+                regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                 base,
             },
             authority,

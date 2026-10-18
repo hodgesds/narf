@@ -39,11 +39,12 @@ use crate::drm_uapi::{
 
 // ── Copy helpers ──────────────────────────────────────────────────────
 //
-// These mirror the SMAP-bracketed helpers in `narf-userspace::handlers`
-// but stay local so the GPU crate doesn't take a dependency on the
-// syscall layer. The kernel-test smokes pass kernel-owned pointers
-// here; production traffic goes through validated user ranges already
-// gated by `sys_ioctl`.
+// These mirror `narf-userspace::handlers::{copy_from_user, copy_to_user}`
+// (range check + fault-guarded copy) but stay local so the GPU crate doesn't
+// take a dependency on the syscall layer. `sys_ioctl` passes the raw `arg`
+// through unvalidated, and every pointer *inside* an ioctl struct is the
+// client's, so both are checked here. The kernel-test smokes pass
+// kernel-owned pointers through the test-only `kernel_test_buffers` opt-out.
 
 /// Maximum per-ioctl payload size (1 MiB). Hard cap so a malicious
 /// `count_objs` field can't be used to force a huge allocation.
@@ -1078,20 +1079,45 @@ fn handle_transfer_3d(
     Ok(0)
 }
 
-/// DRM syncobj ioctls on the render node, backed by this open's per-fd table.
-/// The DRM native context (radeonsi-over-virtio) creates syncobjs during device
-/// init and rendering. Dispatched by ioctl number (0xbf..=0xc5).
-/// The DRM syncobj ioctls (nr 0xbf..=0xc5) on any driver's open, against
-/// the open's own table.
+/// The DRM syncobj ioctls (`drm::syncobj_ioctl`) on any driver's open,
+/// against the open's own table, for a kernel caller (no descriptor table).
+/// `timeline`: the driver has `DRIVER_SYNCOBJ_TIMELINE` (amdgpu does,
+/// virtio-gpu does not). User opens go through [`dispatch_syncobj_user`].
 pub(crate) fn dispatch_syncobj(
     cmd: u32,
     arg: usize,
     state: &VirtGpuRenderState,
+    timeline: bool,
 ) -> Option<Result<u64, FsError>> {
-    let nr = crate::drm_uapi::ioc_nr(cmd);
-    (0xbf..=0xc5)
-        .contains(&nr)
-        .then(|| handle_syncobj(nr, arg, state))
+    crate::drm::syncobj_ioctl::dispatch_sync(
+        crate::drm_uapi::ioc_nr(cmd),
+        arg,
+        &state.syncobjs,
+        timeline,
+    )
+}
+
+/// The DRM syncobj ioctls from a user open: fd export/import through
+/// `context`, and waits that park the syscall (`IoctlContext::restart_after`).
+/// `None` for any other ioctl or a non-DRM ('d') command.
+pub(crate) async fn dispatch_syncobj_user(
+    cmd: u32,
+    arg: usize,
+    state: &VirtGpuRenderState,
+    timeline: bool,
+    context: &dyn IoctlContext,
+) -> Option<Result<u64, FsError>> {
+    if (cmd >> 8) & 0xff != u32::from(b'd') {
+        return None;
+    }
+    crate::drm::syncobj_ioctl::dispatch(
+        crate::drm_uapi::ioc_nr(cmd),
+        arg,
+        &state.syncobjs,
+        timeline,
+        context,
+    )
+    .await
 }
 
 impl VirtGpuRenderState {
@@ -1104,126 +1130,8 @@ impl VirtGpuRenderState {
 }
 
 fn handle_syncobj(nr: u32, arg: usize, state: &VirtGpuRenderState) -> Result<u64, FsError> {
-    match nr {
-        // SYNCOBJ_CREATE { u32 handle (out), u32 flags }
-        0xbf => {
-            let mut req: crate::drm_uapi::DrmSyncobjCreateUapi = read_uapi(arg)?;
-            let handle = state
-                .syncobjs
-                .lock()
-                .create(req.flags)
-                .map_err(|_| FsError::InvalidData)?;
-            req.handle = handle;
-            write_uapi(arg, req)?;
-            Ok(0)
-        }
-        // SYNCOBJ_DESTROY { u32 handle, u32 pad }
-        0xc0 => {
-            // SAFETY: `arg` is the ioctl's user struct pointer; copy_in bounds
-            // the 8-byte read and SMAP-brackets it.
-            let bytes = unsafe { copy_in(arg, 8)? };
-            let handle =
-                u32::from_le_bytes(bytes[0..4].try_into().map_err(|_| FsError::InvalidData)?);
-            state
-                .syncobjs
-                .lock()
-                .destroy(handle)
-                .map_err(|_| FsError::InvalidData)?;
-            Ok(0)
-        }
-        // SYNCOBJ_RESET (0xc4) / SIGNAL (0xc5): drm_syncobj_array
-        // { u64 handles, u32 count_handles, u32 pad }
-        0xc4 | 0xc5 => {
-            // SAFETY: `arg` is the ioctl's user struct pointer; copy_in bounds
-            // the 16-byte read and SMAP-brackets it.
-            let bytes = unsafe { copy_in(arg, 16)? };
-            let handles_ptr = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-            let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-            if count == 0 || count > 4096 || handles_ptr == 0 {
-                return Err(FsError::InvalidData);
-            }
-            // SAFETY: `handles_ptr` is the user handle-array pointer from the
-            // ioctl struct; copy_in bounds `count * 4` and SMAP-brackets it.
-            let hbytes = unsafe { copy_in(handles_ptr as usize, count * 4)? };
-            let ids: Vec<u32> = hbytes
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
-            let mut tbl = state.syncobjs.lock();
-            if nr == 0xc5 {
-                tbl.signal_handles(&ids).map_err(|_| FsError::InvalidData)?;
-            } else {
-                tbl.reset_handles(&ids).map_err(|_| FsError::InvalidData)?;
-            }
-            Ok(0)
-        }
-        // SYNCOBJ_WAIT: drm_syncobj_wait { u64 handles, s64 timeout_nsec,
-        //   u32 count_handles, u32 flags, u32 first_signaled, u32 pad,
-        //   u64 deadline_nsec } (40 bytes in the current UAPI).
-        0xc3 => {
-            // SAFETY: `arg` is the ioctl's user struct pointer; copy_in bounds
-            // the 40-byte read and SMAP-brackets it.
-            let bytes = unsafe { copy_in(arg, 40)? };
-            let handles_ptr = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-            let timeout_abs_ns = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
-            let count = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
-            let flags = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-            const WAIT_ALL: u32 = 1 << 0;
-            const WAIT_FOR_SUBMIT: u32 = 1 << 1;
-            if count == 0
-                || count > 4096
-                || handles_ptr == 0
-                || flags & !(WAIT_ALL | WAIT_FOR_SUBMIT) != 0
-            {
-                return Err(FsError::InvalidData);
-            }
-            // SAFETY: `handles_ptr` is the user handle-array pointer from the
-            // ioctl struct; copy_in bounds `count * 4` and SMAP-brackets it.
-            let hbytes = unsafe { copy_in(handles_ptr as usize, count * 4)? };
-            let ids: Vec<u32> = hbytes
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
-            let fences = state
-                .syncobjs
-                .lock()
-                .snapshot_fences(&ids)
-                .map_err(|_| FsError::InvalidData)?;
-            // WAIT_FOR_SUBMIT only changes the no-fence case. Output syncobjs
-            // are bound before EXECBUFFER returns, so ordinary Mesa waits
-            // arrive with a fence already present; an overlapping wait on an
-            // unbound object remains retryable rather than holding the table
-            // lock across the producer.
-            if fences.iter().any(Option::is_none) {
-                return Err(FsError::WouldBlock);
-            }
-            let now = narf_time::wall::monotonic_ns();
-            // Linux interprets this as an absolute CLOCK_MONOTONIC instant.
-            // A negative value is already expired; INT64_MAX is the ordinary
-            // userspace spelling of an effectively infinite wait, capped here
-            // by the same 15 s GPU-hang bound as VIRTGPU_WAIT.
-            let timeout_ns = u64::try_from(timeout_abs_ns)
-                .unwrap_or(0)
-                .saturating_sub(now)
-                .min(15_000_000_000);
-            match crate::drm::syncobj::SyncObjTable::wait_fences(&ids, &fences, timeout_ns, flags) {
-                Ok(first_handle) => {
-                    let first = ids
-                        .iter()
-                        .position(|handle| *handle == first_handle)
-                        .unwrap_or(0) as u32;
-                    // SAFETY: writes 4 bytes to the `first_signaled` field at
-                    // offset 24 of the ioctl struct; copy_out SMAP-brackets it.
-                    unsafe { copy_out(arg + 24, &first.to_le_bytes())? };
-                    Ok(0)
-                }
-                Err(_) => Err(FsError::WouldBlock), // → EAGAIN
-            }
-        }
-        // HANDLE_TO_FD (0xc1) / FD_TO_HANDLE (0xc2): fence-fd export/import needs
-        // sync_file fd infrastructure NARF does not have yet.
-        _ => Err(FsError::Unsupported),
-    }
+    crate::drm::syncobj_ioctl::dispatch_sync(nr, arg, &state.syncobjs, false)
+        .unwrap_or(Err(FsError::Unsupported))
 }
 
 /// Whether `cmd` is DRM_IOCTL_WAIT_VBLANK, which a user file waits out
@@ -1423,11 +1331,11 @@ fn dispatch_virtgpu_render_inner(
     if ioc_nr(cmd) == DRM_VIRTGPU_NR_RESOURCE_CREATE_BLOB {
         return handle_resource_create_blob(arg, state);
     }
-    // DRM syncobj ioctls (nr 0xbf..=0xc5: CREATE/DESTROY/HANDLE_TO_FD/
-    // FD_TO_HANDLE/WAIT/RESET/SIGNAL). The DRM native context creates and uses
-    // syncobjs; route them to this open's per-fd table. Dispatched by number so
-    // struct-size variations don't matter.
-    if (0xbf..=0xc5).contains(&ioc_nr(cmd)) {
+    // DRM syncobj ioctls (`drm::syncobj_ioctl`). The DRM native context
+    // creates and uses syncobjs; route them to this open's per-fd table.
+    // Dispatched by number so struct-size variations don't matter. virtio-gpu
+    // has no DRIVER_SYNCOBJ_TIMELINE, so the timeline ones are -EOPNOTSUPP.
+    if crate::drm::syncobj_ioctl::is_syncobj_ioctl(ioc_nr(cmd)) {
         return handle_syncobj(ioc_nr(cmd), arg, state);
     }
     match cmd {
@@ -1728,8 +1636,7 @@ fn dispatch_virtgpu_render_inner(
                         table
                             .get(dep.handle)
                             .map_err(|_| FsError::InvalidData)?
-                            .fence
-                            .clone()
+                            .fence()
                             .ok_or(FsError::InvalidData)
                     })
                     .collect::<Result<Vec<_>, _>>()?
@@ -1814,8 +1721,8 @@ fn dispatch_virtgpu_render_inner(
             let mut table = state.syncobjs.lock();
             for dep in &in_syncobjs {
                 if dep.reset {
-                    if let Ok(obj) = table.get_mut(dep.handle) {
-                        obj.fence = None;
+                    if let Ok(obj) = table.get(dep.handle) {
+                        obj.reset();
                     }
                 }
             }
@@ -1900,64 +1807,173 @@ pub fn dispatch_virtgpu_mmap(
         .collect())
 }
 
-/// Read `N` bytes from a user-pointer into a kernel `Vec<u8>`.
+/// Read `len` bytes from a user pointer into a kernel `Vec<u8>`.
+///
+/// Linux `copy_from_user`: [`access_ok`] confines the whole range to the
+/// user half first (`arch/x86/include/asm/uaccess_64.h::__access_ok`), then
+/// the transfer runs through the exception-table-guarded copy
+/// (`narf_arch::x86_64::smap::copy_user_guarded`, Linux
+/// `copy_user_generic` + its extable fixup), so an unmapped or
+/// concurrently-unmapped buffer is `EFAULT` instead of a kernel #PF.
+/// Every failure of either step is [`FsError::BadAddress`] (`EFAULT`).
 ///
 /// # Safety
-/// `uptr` must be a valid user-mode pointer for the calling task or a
-/// kernel-mode pointer (test-only). The caller must hold the syscall
-/// trap context (no IRQ context, AS still active).
+/// The caller must hold the syscall trap context (not IRQ context, the
+/// calling task's address space active). `uptr` itself may be hostile.
 pub(crate) unsafe fn copy_in(uptr: usize, len: usize) -> Result<Vec<u8>, FsError> {
-    if uptr == 0 {
-        return Err(FsError::BadAddress);
-    }
     if len > IOCTL_MAX_BUF {
         return Err(FsError::InvalidData);
     }
-    let mut out = vec![0u8; len];
-    // SAFETY: `uptr` is the user (or test-kernel) ioctl arg; `user_memcpy`
-    // SMAP-brackets the read so a real user pointer doesn't #PF under SMAP.
-    unsafe {
-        user_memcpy(out.as_mut_ptr(), uptr as *const u8, len);
+    if !access_ok(uptr as u64, len) {
+        return Err(FsError::BadAddress);
     }
+    let mut out = vec![0u8; len];
+    // SAFETY: `out` is a live kernel buffer of `len` bytes; the user side
+    // is range-checked above and the guarded copy survives a fault on it.
+    unsafe { guarded_copy(out.as_mut_ptr(), uptr as *const u8, len)? };
     Ok(out)
 }
 
-/// Write a kernel slice back into a user-pointer.
-pub(crate) unsafe fn copy_out(uptr: usize, bytes: &[u8]) -> Result<(), FsError> {
-    if uptr == 0 {
-        return Err(FsError::BadAddress);
-    }
-    // SAFETY: `uptr` is the user (or test-kernel) ioctl arg; `user_memcpy`
-    // SMAP-brackets the write.
-    unsafe {
-        user_memcpy(uptr as *mut u8, bytes.as_ptr(), bytes.len());
-    }
-    Ok(())
-}
-
-/// `copy_nonoverlapping` bracketed by a SMAP user-access window so the
-/// kernel may touch user memory through the raw ioctl pointer. The DRM
-/// ioctl path reaches here from `sys_ioctl`, which passes the user `arg`
-/// straight through without clearing SMAP. Harmless on kernel pointers
-/// (the test smokes): `stac` only relaxes the U/S check, it never breaks
-/// a supervisor access.
+/// Write a kernel slice back to a user pointer: Linux `copy_to_user`, with
+/// the same [`access_ok`] range check and fault-guarded transfer as
+/// [`copy_in`]. Any failure is [`FsError::BadAddress`] (`EFAULT`).
 ///
 /// # Safety
-/// `dst`/`src` must be valid for `len` bytes; one side may be user memory.
-#[cfg(target_arch = "x86_64")]
-unsafe fn user_memcpy(dst: *mut u8, src: *const u8, len: usize) {
-    // SAFETY: caller guarantees the ranges; with_user_access toggles AC.
-    unsafe {
-        narf_arch::x86_64::smap::with_user_access(|| {
-            core::ptr::copy_nonoverlapping(src, dst, len);
-        });
+/// As [`copy_in`].
+pub(crate) unsafe fn copy_out(uptr: usize, bytes: &[u8]) -> Result<(), FsError> {
+    if !access_ok(uptr as u64, bytes.len()) {
+        return Err(FsError::BadAddress);
     }
+    // SAFETY: `bytes` is a live kernel slice; the user side is range-checked
+    // above and the guarded copy survives a fault on it.
+    unsafe { guarded_copy(uptr as *mut u8, bytes.as_ptr(), bytes.len()) }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn user_memcpy(dst: *mut u8, src: *const u8, len: usize) {
-    // SAFETY: caller guarantees the ranges.
-    unsafe { core::ptr::copy_nonoverlapping(src, dst, len) };
+/// First address above the user half of the 48-bit canonical VA space on
+/// both supported architectures. The syscall layer's `validate_user_range`
+/// splits at the same bit, so an ioctl pointer the trap layer would accept
+/// through [`IoctlContext`] is accepted here and nothing else is.
+const USER_VA_LIMIT: u64 = 1 << 47; // linux: n/a (NARF user/kernel split, = userspace USER_VA_LIMIT)
+
+/// Linux `__access_ok` (`arch/x86/include/asm/uaccess_64.h`): the sum
+/// `addr + size` must not wrap and must stay inside the user half. Null is
+/// rejected too (every DRM pointer field this guards treats 0 as "absent"
+/// before calling, so a null that reaches here is a fault, as before).
+///
+/// A canonical *kernel* pointer is rejected here rather than left to SMAP:
+/// the guarded copy runs inside STAC/CLAC, and SMAP never faults a
+/// supervisor page anyway, so without this an INFO `return_pointer`, a
+/// GEM_METADATA buffer or a VERSION name pointer aimed at kernel memory
+/// would be an arbitrary kernel read/write.
+fn access_ok(addr: u64, len: usize) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    let Some(end) = addr.checked_add(len as u64) else {
+        return false;
+    };
+    if end <= USER_VA_LIMIT {
+        return true;
+    }
+    #[cfg(feature = "kernel-test")]
+    if kernel_test_buffers::allowed(addr, end) {
+        return true;
+    }
+    false
+}
+
+/// Fault-guarded copy; a caught fault is `EFAULT`.
+///
+/// # Safety
+/// The kernel side of the copy must be valid for `len` bytes; the user side
+/// must have passed [`access_ok`].
+unsafe fn guarded_copy(dst: *mut u8, src: *const u8, len: usize) -> Result<(), FsError> {
+    if len == 0 {
+        return Ok(());
+    }
+    // SAFETY: forwarded from the caller; the arch helper arms the per-CPU
+    // recovery probe and the STAC/CLAC window itself.
+    #[cfg(target_arch = "x86_64")]
+    let copied = unsafe { narf_arch::x86_64::smap::copy_user_guarded(dst, src, len) };
+    // SAFETY: as above.
+    #[cfg(target_arch = "aarch64")]
+    let copied = unsafe { narf_arch::aarch64::uaccess::copy_user_guarded(dst, src, len) };
+    copied.map_err(|_| FsError::BadAddress)
+}
+
+/// Test-build-only relaxation of [`access_ok`] for the in-kernel smokes,
+/// which drive the ioctl handlers with kernel stack/heap buffers standing in
+/// for user memory (well over a thousand of them). Compiled only with
+/// `kernel-test`; a production build has no path that accepts a kernel
+/// address.
+///
+/// Even here the relaxation accepts only a range that lies entirely in the
+/// canonical kernel half (never one straddling the hole or the user/kernel
+/// boundary). A [`StrictUserCopies`] guard turns it off on the calling CPU
+/// so a test can assert the production predicate end to end; the guard may
+/// name one kernel buffer that keeps standing in for user memory (the ioctl
+/// struct itself), so a test can aim a pointer *inside* that struct at the
+/// kernel and see exactly that pointer refused.
+#[cfg(feature = "kernel-test")]
+pub(crate) mod kernel_test_buffers {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    use narf_lib::percpu::{current_cpu, MAX_CPUS};
+
+    /// Per-CPU strict window `[start, end)`: `start == 0` means no strict
+    /// scope is open; otherwise only kernel ranges inside the window pass.
+    /// Keyed on the CPU, as the syscall layer's `kernel_buf_scope` is,
+    /// because a smoke runs its block straight through on one CPU.
+    static START: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    static END: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+    /// While alive, the DRM copy helpers apply the production predicate on
+    /// the CPU that created it, except for the one stand-in buffer.
+    pub(crate) struct StrictUserCopies {
+        cpu: usize,
+        saved: (u64, u64),
+    }
+
+    impl StrictUserCopies {
+        /// Strict for every kernel address.
+        pub(crate) fn new() -> Self {
+            Self::open(u64::MAX, u64::MAX)
+        }
+
+        /// Strict except for `[base, base + len)`, which keeps standing in
+        /// for user memory.
+        pub(crate) fn allowing(base: usize, len: usize) -> Self {
+            Self::open(base as u64, base as u64 + len as u64)
+        }
+
+        fn open(start: u64, end: u64) -> Self {
+            let cpu = current_cpu();
+            let saved = (
+                START[cpu].swap(start, Ordering::AcqRel),
+                END[cpu].swap(end, Ordering::AcqRel),
+            );
+            Self { cpu, saved }
+        }
+    }
+
+    impl Drop for StrictUserCopies {
+        fn drop(&mut self) {
+            START[self.cpu].store(self.saved.0, Ordering::Release);
+            END[self.cpu].store(self.saved.1, Ordering::Release);
+        }
+    }
+
+    /// `[addr, end)` is wholly inside the canonical kernel half and, when a
+    /// strict scope is open on this CPU, inside its stand-in buffer.
+    pub(super) fn allowed(addr: u64, end: u64) -> bool {
+        const KERNEL_HALF: u64 = 0xffff_8000_0000_0000; // linux: n/a (48-bit canonical kernel half)
+        if addr < KERNEL_HALF || end <= addr {
+            return false;
+        }
+        let cpu = current_cpu();
+        let start = START[cpu].load(Ordering::Acquire);
+        start == 0 || (addr >= start && end <= END[cpu].load(Ordering::Acquire))
+    }
 }
 
 // ── Error translation ────────────────────────────────────────────────
@@ -2185,8 +2201,8 @@ pub(crate) fn dispatch_card_for_file(
             let result = handle_generic(&mode_state, cmd, arg, &ctx);
             if result.is_ok() && crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
                 for crtc_id in shown {
-                    if let Some(display) = crate::amdgpu_navi48_kms::crtc_display(crtc_id) {
-                        crate::amdgpu_navi48_platform::request_display_active(display, false);
+                    if let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc_id) {
+                        crate::amdgpu_native_kms::request_display_active(display, false);
                     }
                 }
             }
@@ -3309,7 +3325,7 @@ fn apply_broadcast_rgb(
         native.broadcast_rgb = Some(value);
     }
     if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
-        crate::amdgpu_navi48_platform::request_broadcast_rgb(value);
+        crate::amdgpu_native_kms::request_broadcast_rgb(value);
     }
 }
 
@@ -3928,7 +3944,7 @@ fn handle_atomic(
                                     // every connector routing is parsed.
                                     if crate::drm_registry::driver_name(card_index)
                                         == Some("amdgpu")
-                                        && crate::amdgpu_navi48_kms::crtc_display(object_id)
+                                        && crate::amdgpu_native_kms::crtc_display(object_id)
                                             .is_none()
                                     {
                                         return Err(FsError::InvalidData);
@@ -4026,9 +4042,9 @@ fn handle_atomic(
                     .iter()
                     .find(|c| c.crtc_id == Some(*crtc_id))
                     .map(|c| c.id);
-                if !crate::amdgpu_navi48_kms::crtc_display(*crtc_id).is_some_and(|d| {
-                    crate::amdgpu_navi48_platform::display_offers(d, connector, wire)
-                }) {
+                if !crate::amdgpu_native_kms::crtc_display(*crtc_id)
+                    .is_some_and(|d| crate::amdgpu_native_kms::display_offers(d, connector, wire))
+                {
                     return Err(FsError::InvalidData);
                 }
             }
@@ -4076,16 +4092,16 @@ fn handle_atomic(
                         .and_then(|id| card.encoder(id).ok())
                         .and_then(|e| e.crtc_id);
                     if current != c.crtc_id {
-                        let display = c.crtc_id.and_then(crate::amdgpu_navi48_kms::crtc_display);
-                        crate::amdgpu_navi48_platform::request_connector_crtc(c.id, display);
+                        let display = c.crtc_id.and_then(crate::amdgpu_native_kms::crtc_display);
+                        crate::amdgpu_native_kms::request_connector_crtc(c.id, display);
                     }
                 }
                 for crtc in &state.crtcs {
-                    let Some(display) = crate::amdgpu_navi48_kms::crtc_display(crtc.id) else {
+                    let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc.id) else {
                         continue;
                     };
                     if crtc.active_changed {
-                        crate::amdgpu_navi48_platform::request_display_active(display, crtc.active);
+                        crate::amdgpu_native_kms::request_display_active(display, crtc.active);
                     }
                     // A new mode is a native modeset the display monitor runs.
                     if crtc.mode_changed {
@@ -4093,7 +4109,7 @@ fn handle_atomic(
                             .iter()
                             .find(|(id, _)| *id == crtc.id)
                             .map(|(_, w)| w);
-                        crate::amdgpu_navi48_platform::request_display_mode(display, wire);
+                        crate::amdgpu_native_kms::request_display_mode(display, wire);
                     }
                 }
             }
@@ -4136,7 +4152,7 @@ fn handle_atomic(
             let mut flip_tickets: Vec<(u32, u64)> = Vec::new();
             if let (Some(queue), Some(crtc_ids)) = (event_queue.as_mut(), event_crtc_ids) {
                 for crtc_id in crtc_ids {
-                    let display = crate::amdgpu_navi48_kms::crtc_display(crtc_id);
+                    let display = crate::amdgpu_native_kms::crtc_display(crtc_id);
                     if let (true, Some(display)) = (hardware_crtcs.contains(&crtc_id), display) {
                         let ticket = crate::drm::card::flips(display).lock().reserve();
                         card.queue_hw_flip_event(queue, req.user_data, crtc_id, display, ticket)
@@ -4603,7 +4619,7 @@ fn handle_setcrtc(
 
         // The native display behind this CRTC, on the amdgpu card.
         let native_display = (crate::drm_registry::driver_name(card_index) == Some("amdgpu"))
-            .then(|| crate::amdgpu_navi48_kms::crtc_display(req.crtc_id))
+            .then(|| crate::amdgpu_native_kms::crtc_display(req.crtc_id))
             .flatten();
         // The connector SETCRTC routes the native CRTC to: one at most (no
         // cloning); none keeps the current routing.
@@ -4644,7 +4660,7 @@ fn handle_setcrtc(
             }
             // On the native card, a timing this CRTC's own display offers.
             if native_display.is_some_and(|d| {
-                !crate::amdgpu_navi48_platform::display_offers(d, native_connector, &wire)
+                !crate::amdgpu_native_kms::display_offers(d, native_connector, &wire)
             }) || (crate::drm_registry::driver_name(card_index) == Some("amdgpu")
                 && native_display.is_none())
             {
@@ -4683,12 +4699,12 @@ fn handle_setcrtc(
         // current one leaves it as it is).
         if let Some(display) = native_display {
             if let Some(id) = native_connector {
-                crate::amdgpu_navi48_platform::request_display_route(display, Some(id));
+                crate::amdgpu_native_kms::request_display_route(display, Some(id));
             }
             if let Some(wire) = native_wire.as_ref() {
-                crate::amdgpu_navi48_platform::request_display_mode(display, Some(wire));
+                crate::amdgpu_native_kms::request_display_mode(display, Some(wire));
             }
-            crate::amdgpu_navi48_platform::request_display_active(display, req.fb_id != 0);
+            crate::amdgpu_native_kms::request_display_active(display, req.fb_id != 0);
         }
 
         if req.fb_id == 0 {
@@ -4834,7 +4850,7 @@ fn handle_page_flip(
             let hardware = (virgl_resource.is_none()
                 && src_phys.is_some()
                 && hardware_flips(card_index, req.crtc_id))
-            .then(|| crate::amdgpu_navi48_kms::crtc_display(req.crtc_id))
+            .then(|| crate::amdgpu_native_kms::crtc_display(req.crtc_id))
             .flatten();
             if let Some(display) = hardware {
                 // The event waits for the hardware flip of this frame.
@@ -4926,8 +4942,8 @@ fn present_virgl_frame(resource: &VirtGpuResource, width: u32, height: u32) -> R
 /// so their flip-complete events wait for that flip (see `drm::card::FlipLog`).
 fn hardware_flips(card_index: u32, crtc_id: u32) -> bool {
     crate::drm_registry::driver_name(card_index) == Some("amdgpu")
-        && crate::amdgpu_navi48_kms::crtc_display(crtc_id)
-            .is_some_and(crate::amdgpu_navi48_platform::native_present_ready)
+        && crate::amdgpu_native_kms::crtc_display(crtc_id)
+            .is_some_and(crate::amdgpu_native_kms::native_present_ready)
 }
 
 /// `flip_ticket` is the ticket of a flip-complete event waiting for this
@@ -4945,9 +4961,9 @@ fn present_frame(
     // A native amdgpu display presents tear-free through its back buffer
     // and a VUPDATE-latched flip instead of copying onto the visible front.
     if driver == Some("amdgpu") {
-        if let Some(display) = crate::amdgpu_navi48_kms::crtc_display(crtc_id) {
+        if let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc_id) {
             // A refused frame completes its ticket at once.
-            let native = crate::amdgpu_navi48_platform::present_frame(
+            let native = crate::amdgpu_native_kms::present_frame(
                 display,
                 src_phys,
                 src_pitch,
@@ -4960,7 +4976,7 @@ fn present_frame(
                 return;
             }
             // Only the console's display has a CPU front to copy onto.
-            if display != crate::amdgpu_navi48_platform::console_pipe() {
+            if display != crate::amdgpu_native_kms::console_pipe() {
                 return;
             }
         }
@@ -5197,4 +5213,126 @@ fn handle_generic(
 fn c_str_bytes(buf: &[u8]) -> &[u8] {
     let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     &buf[..n]
+}
+
+/// `DRM_IOWR(0x05, struct drm_client)`: idx i32, auth i32, then pid, uid,
+/// magic and iocs as `unsigned long` — 40 bytes on LP64.
+pub const DRM_IOCTL_GET_CLIENT: u32 = 0xc028_6405;
+
+/// Linux `drm_getclient`, the "hollowed-out" form kept for old tools and for
+/// libdrm's `amdgpu_get_auth`: client 0 is the caller (its authentication,
+/// its pid, `overflowuid`, no magic, no ioctl count); any other index is
+/// EINVAL.
+pub fn get_client(
+    arg: u64,
+    context: &dyn narf_filesystem::IoctlContext,
+    authenticated: bool,
+) -> Result<u64, FsError> {
+    let mut client = [0u8; 40];
+    context
+        .read(arg, &mut client)
+        .map_err(|_| FsError::BadAddress)?;
+    if i32::from_le_bytes(client[0..4].try_into().unwrap()) != 0 {
+        return Err(FsError::InvalidData);
+    }
+    /// `overflowuid` default.
+    const OVERFLOW_UID: u64 = 65534;
+    client[4..8].copy_from_slice(&i32::from(authenticated).to_le_bytes());
+    client[8..16].copy_from_slice(&u64::from(context.process_id()).to_le_bytes());
+    client[16..24].copy_from_slice(&OVERFLOW_UID.to_le_bytes());
+    client[24..40].fill(0);
+    context
+        .write(arg, &client)
+        .map_err(|_| FsError::BadAddress)?;
+    Ok(0)
+}
+
+/// `DRM_IOCTL_VERSION` and `DRM_IOCTL_GET_CAP` for an amdgpu card that has
+/// no KMS state attached (no native display publication yet): libdrm's
+/// `amdgpu_device_initialize` dereferences `drmGetVersion`'s result, so the
+/// render node must answer even without a display owner. `None` for any
+/// other ioctl or a card with KMS state (the card's own table answers).
+pub fn without_kms(card_index: u32, cmd: u32, arg: usize) -> Option<Result<u64, FsError>> {
+    if crate::drm_registry::driver_name(card_index) != Some("amdgpu")
+        || crate::drm_registry::mode_state(card_index).is_some()
+        || (cmd >> 8) & 0xff != u32::from(b'd')
+    {
+        return None;
+    }
+    match drm_uapi::ioc_nr(cmd) {
+        0x00 => Some(amdgpu_version(card_index, arg)),
+        0x0c => Some((|| {
+            // SAFETY: `arg` is the ioctl struct pointer; 16 bytes.
+            let mut b = unsafe { copy_in(arg, 16)? };
+            let cap = u64::from_le_bytes(b[0..8].try_into().unwrap());
+            let value = amdgpu_cap_value(cap);
+            b[8..16].copy_from_slice(&value.to_le_bytes());
+            // SAFETY: as above.
+            unsafe { copy_out(arg, &b)? };
+            Ok(0)
+        })()),
+        _ => None,
+    }
+}
+
+/// `DRM_IOCTL_GET_CAP` for amdgpu: the generic table, plus
+/// `DRM_CAP_SYNCOBJ_TIMELINE` = 1 (amdgpu has `DRIVER_SYNCOBJ_TIMELINE`).
+pub fn amdgpu_cap_value(cap: u64) -> u64 {
+    if cap == crate::drm::ioctl::drm_cap::SYNCOBJ_TIMELINE {
+        1
+    } else {
+        crate::drm::ioctl::cap_value(cap)
+    }
+}
+
+/// `DRM_IOCTL_GET_CAP(SYNCOBJ_TIMELINE)` on an amdgpu open (with or without
+/// KMS state); `None` for any other ioctl or capability, which the card's
+/// generic table answers identically for amdgpu.
+pub fn amdgpu_get_cap(cmd: u32, arg: usize) -> Option<Result<u64, FsError>> {
+    if (cmd >> 8) & 0xff != u32::from(b'd') || drm_uapi::ioc_nr(cmd) != 0x0c {
+        return None;
+    }
+    // SAFETY: `arg` is the ioctl struct pointer; drm_get_cap is 16 bytes.
+    let mut b = match unsafe { copy_in(arg, 16) } {
+        Ok(b) => b,
+        Err(e) => return Some(Err(e)),
+    };
+    let cap = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    if cap != crate::drm::ioctl::drm_cap::SYNCOBJ_TIMELINE {
+        return None;
+    }
+    b[8..16].copy_from_slice(&amdgpu_cap_value(cap).to_le_bytes());
+    // SAFETY: as above.
+    Some(unsafe { copy_out(arg, &b) }.map(|()| 0))
+}
+
+/// `struct drm_version` for the amdgpu driver: `amdgpu`, `20150101`,
+/// `AMD GPU`, `KMS_DRIVER_*` — 3.64.0 on a Navi 22 whose submission path is
+/// wired, the base 3.0.0 otherwise.
+fn amdgpu_version(card_index: u32, arg: usize) -> Result<u64, FsError> {
+    // SAFETY: `arg` is the ioctl struct pointer; drm_version is 64 bytes.
+    let mut b = unsafe { copy_in(arg, 64)? };
+    let navi22 = crate::drm_registry::pci_id(card_index)
+        == Some((crate::amdgpu::AMD_VENDOR, crate::amdgpu::NAVI22));
+    let (major, minor, patch) = if navi22 {
+        crate::amdgpu_info_navi22::drm_version()
+    } else {
+        (3, 0, 0)
+    };
+    b[0..4].copy_from_slice(&(major as i32).to_le_bytes());
+    b[4..8].copy_from_slice(&(minor as i32).to_le_bytes());
+    b[8..12].copy_from_slice(&(patch as i32).to_le_bytes());
+    for (i, text) in [&b"amdgpu"[..], b"20150101", b"AMD GPU"].iter().enumerate() {
+        let at = 16 + i * 16;
+        let cap = u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) as usize;
+        let ptr = u64::from_le_bytes(b[at + 8..at + 16].try_into().unwrap()) as usize;
+        if ptr != 0 && cap != 0 {
+            // SAFETY: the caller's own buffer of `cap` bytes.
+            unsafe { copy_out(ptr, &text[..text.len().min(cap)])? };
+        }
+        b[at..at + 8].copy_from_slice(&(text.len() as u64).to_le_bytes());
+    }
+    // SAFETY: as above.
+    unsafe { copy_out(arg, &b)? };
+    Ok(0)
 }

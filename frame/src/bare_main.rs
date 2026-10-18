@@ -3010,16 +3010,18 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_spi::register_initcalls();
             // Bridge: ACPI power-button events (delivered by the
             // SCI dispatcher in narf-drivers-platform::ec) into
-            // the system-power surface. Subscribers run in SCI
-            // IRQ context — `system::power_off` is a never-
-            // returns terminal action, so calling it directly
-            // from the IRQ is safe (any locks held elsewhere
-            // become moot once the platform powers off).
+            // the input layer, as Linux `acpi_button_notify` does:
+            // the press is reported as KEY_POWER on the "Power
+            // Button" input device and logind performs the orderly
+            // shutdown. With no reader on that device (no logind),
+            // narf_power queues an orderly kernel power-off that a
+            // task-context worker runs (sync every filesystem, then
+            // the device shutdown hooks). Never a power-off from the
+            // notifying context: it runs under the subscriber lock.
             #[cfg(target_arch = "x86_64")]
             narf_drivers_platform::ec::subscribe_platform_event(|event| {
                 if event == narf_drivers_platform::ec::PlatformEvent::PowerButton {
-                    let _ = writeln!(console::Writer, "  acpi: power button → entering S5");
-                    narf_power::system::power_off();
+                    let _ = narf_power::button::report_power_button();
                 }
             });
             narf_graphics_driver::register_initcalls();
@@ -3143,6 +3145,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // PCI probe lives in Stage::Device — it binds every
             // driver registered by Subsys above.
             narf_init::register(narf_init::Stage::Device, "pci-probe-all", || {
+                // Resolve (and log) `narf.disks=` before any storage driver
+                // binds and registers a disk. The block layer would resolve
+                // it lazily on first use anyway; this pins the console line.
+                narf_block::disk_policy::init_from_cmdline();
                 let auth = narf_bus::bootstrap_registry_authority();
                 match narf_bus::probe_all_pci(&auth) {
                     Ok(n) => {
@@ -3509,6 +3515,28 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 "  root-mount: cmdline root= selector failed: {:?}",
                                 e
                             );
+                            // `narf.disks=root-ro|root-rw` boots exactly the
+                            // installed root or nothing: a refused designation
+                            // or a btrfs write-safety refusal must stop the
+                            // boot visibly, never degrade to another root.
+                            let policy = narf_block::disk_policy::policy();
+                            if policy.is_root_policy() {
+                                let rule = "  root-mount: ==========================================================";
+                                let _ = writeln!(console::Writer, "{rule}");
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  root-mount: narf.disks={} ROOT MOUNT FAILED: {:?}; NOT falling back",
+                                    policy.as_str(),
+                                    e
+                                );
+                                if let Some(why) = narf_drivers_fs_btrfs::rw_gate::last_refusal() {
+                                    let _ = writeln!(console::Writer, "  root-mount: {why}");
+                                }
+                                let _ = writeln!(console::Writer, "{rule}");
+                                return narf_init::InitResult::Error(
+                                    "narf.disks root policy: installed root not mounted",
+                                );
+                            }
                             // Fall through to initramfs/walk fallbacks
                             // so a typoed root= still boots into a shell
                             // rather than panicking the kernel.
@@ -3555,6 +3583,29 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_init::InitResult::NotPresent
             });
 
+            // Runs right after root-mount-auto, whatever it returned: under
+            // `narf.disks=root-ro|root-rw` the boot log waits for this before
+            // probing its USB stick, so the stick's I/O never delays the root.
+            narf_init::register(narf_init::Stage::Late, "root-mount-settled", || {
+                narf_block::disk_policy::mark_root_mount_settled();
+                narf_init::InitResult::Ok
+            });
+
+            // Test vehicle for `cargo xtask btrfs-rootrw-interop`: systemd-
+            // and pacman-shaped writes on the mounted root, run only when the
+            // harness passes `narf.rootrw_interop=<mode>` together with
+            // `narf.disks=root-rw` against its own disposable image (the
+            // workload refuses any other root). Inert otherwise.
+            narf_init::register_with_budget(
+                narf_init::Stage::Late,
+                "btrfs-rootrw-interop",
+                || match narf_boot::args().value("narf.rootrw_interop") {
+                    Some(mode) => narf_drivers_fs_btrfs::interop::run(mode),
+                    None => narf_init::InitResult::NotPresent,
+                },
+                300_000,
+            );
+
             // Mount the UEFI EFI System Partition before PID 1 starts.  This
             // is selected from the GPT ESP type GUID, never from a volatile
             // device name or an image-specific FAT UUID.  Systemd then sees
@@ -3572,6 +3623,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         narf_init::InitResult::Ok
                     }
                     Err(narf_filesystem::root_mount::RootMountError::NoMountable) => {
+                        narf_init::InitResult::NotPresent
+                    }
+                    Err(narf_filesystem::root_mount::RootMountError::BootOnly) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  efi-mount: skipped: narf.disks=boot-only and no ESP on the boot medium",
+                        );
                         narf_init::InitResult::NotPresent
                     }
                     Err(error) => {
@@ -3630,7 +3688,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 }
 
                 let session_writable_root = narf_boot::args().has_flag("systemd_pid1");
-                let devices = narf_block::block_devices();
+                // `narf.disks=boot-only`: never mount a disk other than the
+                // identified boot medium (on a laptop the first ext volume is
+                // typically the internal disk).
+                let (devices, skipped_by_policy) = narf_filesystem::root_mount::automount_devices();
                 let mut mounted = false;
                 for entry in &devices {
                     let dev = entry.dev.clone();
@@ -3707,6 +3768,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 if mounted {
                     narf_init::InitResult::Ok
                 } else {
+                    if skipped_by_policy != 0 {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  mnt-mount-ext2: skipped {} device(s): narf.disks=boot-only",
+                            skipped_by_policy
+                        );
+                    }
                     narf_init::InitResult::NotPresent
                 }
             });
@@ -3719,6 +3787,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // just the in-kernel RamBlockDevice tests. NotPresent (harmless) when
             // no btrfs device is attached, e.g. interactive/distro boots.
             narf_init::register(narf_init::Stage::Late, "btrfs-disk-smoke", || {
+                // Test-only: never mount a btrfs volume the harness did not
+                // provide (a bare-metal host's root is commonly btrfs).
+                if !narf_boot::args().has_flag("narf.btrfs_smoke") {
+                    return narf_init::InitResult::NotPresent;
+                }
                 use narf_block::fs_detect::{detect_filesystem, FsType};
                 for entry in &narf_block::block_devices() {
                     let dev = entry.dev.clone();
@@ -3788,6 +3861,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // minute, so give it a verification-sized budget instead of emitting
             // the 500 ms default-probe warning on every successful run.
             let btrfs_write_smoke = || {
+                // Test-only: this grows and rewrites the first btrfs volume it
+                // finds. Run it only against xtask's own disposable image.
+                if !narf_boot::args().has_flag("narf.btrfs_smoke") {
+                    return narf_init::InitResult::NotPresent;
+                }
                 use narf_block::fs_detect::{detect_filesystem, FsType};
                 const MARKER: &[u8] = b"NARF-WROTE-THIS!\n";
                 for entry in &narf_block::block_devices() {
@@ -5125,6 +5203,13 @@ fn boot_userspace_init() {
         // asserted (which it would until the FIFO drains).
         fn serial_isr() {
             for _ in 0..16 {
+                // Flow control: never pull a byte the ring cannot hold. It
+                // stays in the UART FIFO until the console reader refills
+                // the ring (`narf_input::refill_byte_ring`).
+                if !narf_input::byte_ring_has_room() {
+                    narf_input::note_byte_ring_full();
+                    break;
+                }
                 match narf_console::try_read_byte() {
                     Some(b) => {
                         let _ = narf_input::push_global(narf_input::InputEvent::AsciiByte(b));
@@ -5269,17 +5354,34 @@ fn boot_userspace_init() {
         // units (e.g. the narf_net_check network acceptance gate) still
         // trigger.
         let proc_cmdline = alloc::format!("SYSTEMD_PROC_CMDLINE={}", narf_boot::cmdline());
-        let envp = [
+        // `container=narf` runs systemd in container mode, which the generated
+        // QEMU distro images rely on. An installed system booted from its own
+        // root (`narf.disks=root-ro|root-rw`) is the machine's OS, not a
+        // container: in container mode systemd reports "container-other",
+        // getty-generator starts console-getty next to getty@tty1 (two
+        // gettys reading one console), and units conditioned on
+        // ConditionVirtualization=!container are skipped.
+        let installed_root = narf_block::disk_policy::policy().is_root_policy();
+        let envp_container = [
             "container=narf",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             proc_cmdline.as_str(),
         ];
+        let envp_host = [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            proc_cmdline.as_str(),
+        ];
+        let envp: &[&str] = if installed_root {
+            &envp_host
+        } else {
+            &envp_container
+        };
         // SAFETY: boot has the loader's identity mapping and frame allocator.
         let proc = match unsafe {
             narf_userspace::process::load_user_process_from_path(
                 path,
                 &argv,
-                &envp,
+                envp,
                 &[],
                 Some(root),
                 narf_userspace::alloc_pid(),

@@ -237,16 +237,27 @@ impl BlockFile {
             BlockIoError::BufferTooSmall => FsError::Io(BlockError::InvalidRange),
             BlockIoError::DriverError => FsError::Io(BlockError::IOError),
             BlockIoError::DeviceRemoved => FsError::Io(BlockError::DeviceRemoved),
+            BlockIoError::ReadOnly => FsError::ReadOnly,
         }
+    }
+
+    /// Largest number of LBAs one device call moves for a block of size
+    /// `block_size`: the registry's `u16` block count, and a 1 MiB staging
+    /// buffer (a `dd bs=1G` must not allocate a gigabyte of kernel heap).
+    pub fn max_chunk_lbas(block_size: u32) -> u64 {
+        const STAGE_BYTES: u64 = 1 << 20;
+        (STAGE_BYTES / u64::from(block_size.max(1))).clamp(1, u64::from(u16::MAX))
     }
 
     /// Read `len` bytes starting at byte `offset` into `dst`.
     ///
-    /// Handles:
-    /// - aligned reads (fast path: no partial-block slicing)
-    /// - unaligned start (partial first block via RMW read)
-    /// - unaligned end (partial last block via RMW read)
-    /// - multi-block spans
+    /// The request is split into device calls of at most
+    /// [`Self::max_chunk_lbas`] LBAs each — the registry trait takes a `u16`
+    /// count, and a single call would otherwise move `n mod 65536` blocks.
+    /// Each chunk is staged in whole blocks, so an unaligned start or end
+    /// only costs the partial block at that end. A failure after some chunks
+    /// returns the short count read so far (Linux `blkdev_read_iter`); a
+    /// failure on the first chunk is the error.
     fn read_sync(&self, offset: u64, dst: &mut [u8]) -> Result<usize, FsError> {
         let bs = self.block_size as u64;
         let capacity = self.byte_capacity();
@@ -261,40 +272,41 @@ impl BlockFile {
         if len == 0 {
             return Ok(0);
         }
-        let dst = &mut dst[..len];
-
-        // LBA of the first byte and byte-offset within that LBA.
-        let first_lba_rel = offset / bs;
-        let intra_first = (offset % bs) as usize;
-        // LBA of the last byte (inclusive).
-        let last_lba_rel = (offset + len as u64 - 1) / bs;
-        // Count of LBAs to read.
-        let n_lbas = (last_lba_rel - first_lba_rel + 1) as usize;
-
-        // Absolute LBAs on the device.
-        let abs_first_lba = self.start_lba + first_lba_rel;
-
-        // Allocate a staging buffer exactly covering the needed LBAs.
-        let stage_len = n_lbas * self.block_size as usize;
-        let mut stage: Vec<u8> = alloc::vec![0u8; stage_len];
-
-        let n_lbas_u16 = n_lbas as u16; // registry trait takes u16
-        self.dev
-            .read(abs_first_lba, n_lbas_u16, &mut stage)
-            .map_err(Self::map_io)?;
-
-        // Copy the slice the caller actually asked for.
-        dst.copy_from_slice(&stage[intra_first..intra_first + len]);
+        let max_lbas = Self::max_chunk_lbas(self.block_size);
+        let mut done = 0usize;
+        while done < len {
+            let pos = offset + done as u64;
+            let first_lba_rel = pos / bs;
+            let intra = (pos % bs) as usize;
+            let want = len - done;
+            let last_lba_rel = (pos + want as u64 - 1) / bs;
+            let n_lbas = (last_lba_rel - first_lba_rel + 1).min(max_lbas);
+            let mut stage: Vec<u8> = alloc::vec![0u8; (n_lbas * bs) as usize];
+            if let Err(e) = self
+                .dev
+                .read(self.start_lba + first_lba_rel, n_lbas as u16, &mut stage)
+            {
+                return if done > 0 {
+                    Ok(done)
+                } else {
+                    Err(Self::map_io(e))
+                };
+            }
+            let take = (stage.len() - intra).min(want);
+            dst[done..done + take].copy_from_slice(&stage[intra..intra + take]);
+            done += take;
+        }
         Ok(len)
     }
 
     /// Write `src` at byte `offset`.
     ///
-    /// - Full-block writes go straight through (no read needed).
-    /// - Partial first block: read the existing LBA, splice `src`,
-    ///   write back.
-    /// - Partial last block: same RMW if it's a different LBA from
-    ///   the first.
+    /// - Split into device calls of at most [`Self::max_chunk_lbas`] LBAs.
+    /// - A chunk that covers its blocks fully goes straight through.
+    /// - A chunk with a partial first or last block reads the chunk's blocks
+    ///   first, splices `src`, and writes them back (RMW).
+    /// - A failure after some chunks returns the short count written so far;
+    ///   a failure on the first chunk is the error.
     ///
     /// Linux analogy: `blkdev_write_iter` → `submit_bio` with
     /// partial-page handling in `__block_write_begin` (fs/buffer.c).
@@ -311,34 +323,40 @@ impl BlockFile {
         // Clamp write length to device capacity.
         let avail = (capacity - offset) as usize;
         let len = src.len().min(avail);
-        let src = &src[..len];
-
-        let first_lba_rel = offset / bs;
-        let intra_first = (offset % bs) as usize;
-        let last_lba_rel = (offset + len as u64 - 1) / bs;
-        let n_lbas = (last_lba_rel - first_lba_rel + 1) as usize;
-        let abs_first_lba = self.start_lba + first_lba_rel;
-
-        let stage_len = n_lbas * self.block_size as usize;
-        let mut stage: Vec<u8> = alloc::vec![0u8; stage_len];
-
-        // If the write is unaligned at start OR doesn't cover the
-        // entire staging range, we must pre-read to preserve
-        // surrounding bytes (RMW).
-        let needs_rmw = intra_first != 0 || len < stage_len;
-        if needs_rmw {
-            self.dev
-                .read(abs_first_lba, n_lbas as u16, &mut stage)
-                .map_err(Self::map_io)?;
+        let max_lbas = Self::max_chunk_lbas(self.block_size);
+        let mut done = 0usize;
+        while done < len {
+            let pos = offset + done as u64;
+            let first_lba_rel = pos / bs;
+            let intra = (pos % bs) as usize;
+            let want = len - done;
+            let last_lba_rel = (pos + want as u64 - 1) / bs;
+            let n_lbas = (last_lba_rel - first_lba_rel + 1).min(max_lbas);
+            let abs_lba = self.start_lba + first_lba_rel;
+            let stage_len = (n_lbas * bs) as usize;
+            let take = (stage_len - intra).min(want);
+            let mut stage: Vec<u8> = alloc::vec![0u8; stage_len];
+            // Unaligned start, or the data ends inside the chunk's last
+            // block: pre-read to preserve the surrounding bytes.
+            if intra != 0 || take < stage_len {
+                if let Err(e) = self.dev.read(abs_lba, n_lbas as u16, &mut stage) {
+                    return if done > 0 {
+                        Ok(done)
+                    } else {
+                        Err(Self::map_io(e))
+                    };
+                }
+            }
+            stage[intra..intra + take].copy_from_slice(&src[done..done + take]);
+            if let Err(e) = self.dev.write(abs_lba, n_lbas as u16, &stage) {
+                return if done > 0 {
+                    Ok(done)
+                } else {
+                    Err(Self::map_io(e))
+                };
+            }
+            done += take;
         }
-
-        // Splice the caller's data into the staging buffer.
-        stage[intra_first..intra_first + len].copy_from_slice(src);
-
-        self.dev
-            .write(abs_first_lba, n_lbas as u16, &stage)
-            .map_err(Self::map_io)?;
-
         Ok(len)
     }
 }
@@ -487,6 +505,10 @@ static BY_PARTUUID_LINKS: IrqSafeSpinLock<crate::devfs::DynamicMap> =
     IrqSafeSpinLock::new(BTreeMap::new());
 static BY_LABEL_LINKS: IrqSafeSpinLock<crate::devfs::DynamicMap> =
     IrqSafeSpinLock::new(BTreeMap::new());
+static BY_ID_LINKS: IrqSafeSpinLock<crate::devfs::DynamicMap> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+static BY_PATH_LINKS: IrqSafeSpinLock<crate::devfs::DynamicMap> =
+    IrqSafeSpinLock::new(BTreeMap::new());
 
 /// Drop all udev-created by-* symlinks (test isolation).
 #[doc(hidden)]
@@ -494,6 +516,8 @@ pub fn __reset_disk_links_for_test() {
     BY_UUID_LINKS.lock().clear();
     BY_PARTUUID_LINKS.lock().clear();
     BY_LABEL_LINKS.lock().clear();
+    BY_ID_LINKS.lock().clear();
+    BY_PATH_LINKS.lock().clear();
 }
 
 /// Create a udev symlink in a by-* overlay. `generated_exists` guards against
@@ -525,8 +549,10 @@ fn disk_enumerate(
     generated.into_iter().skip(cursor).take(max).collect()
 }
 
-/// `/dev/disk/` — a virtual directory with three subdirectories:
-/// `by-label`, `by-uuid` (filesystem UUID), and `by-partuuid`.
+/// `/dev/disk/` — a virtual directory with five subdirectories:
+/// `by-label`, `by-uuid` (filesystem UUID), `by-partuuid`, and the
+/// hardware-identity views `by-id` (model/serial, WWID) and `by-path`
+/// (controller PCI address).
 pub struct DevDiskDir;
 
 impl core::fmt::Debug for DevDiskDir {
@@ -549,6 +575,8 @@ impl DirOps for DevDiskDir {
             "by-label" => Some(Arc::new(DevDiskByLabel) as Arc<dyn DirOps>),
             "by-uuid" => Some(Arc::new(DevDiskByUuid) as Arc<dyn DirOps>),
             "by-partuuid" => Some(Arc::new(DevDiskByPartUuid) as Arc<dyn DirOps>),
+            "by-id" => Some(Arc::new(DevDiskByIdentity::BY_ID) as Arc<dyn DirOps>),
+            "by-path" => Some(Arc::new(DevDiskByIdentity::BY_PATH) as Arc<dyn DirOps>),
             _ => None,
         }
     }
@@ -570,6 +598,14 @@ impl DirOps for DevDiskDir {
             },
             DirEntry {
                 name: alloc::borrow::Cow::Borrowed("by-partuuid"),
+                file_type: FileType::Dir,
+            },
+            DirEntry {
+                name: alloc::borrow::Cow::Borrowed("by-id"),
+                file_type: FileType::Dir,
+            },
+            DirEntry {
+                name: alloc::borrow::Cow::Borrowed("by-path"),
                 file_type: FileType::Dir,
             },
         ];
@@ -828,6 +864,133 @@ impl DevDiskByPartUuid {
                 .unwrap_or(false)
         })
     }
+}
+
+// ── by-id / by-path ───────────────────────────────────────────────────
+
+/// `/dev/disk/by-id/` and `/dev/disk/by-path/` — links named from a disk's
+/// hardware identity ([`narf_block::DiskIdentity`]), so a disk can be found
+/// independently of its enumeration-order name. Names follow udev's
+/// `60-persistent-storage.rules`: `nvme-<model>_<serial>`,
+/// `nvme-<model>_<serial>_<nsid>`, `nvme-<wwid>`, and
+/// `pci-<bdf>-nvme-<nsid>`; a partition appends `-part<N>`.
+#[derive(Clone, Copy)]
+pub struct DevDiskByIdentity {
+    ino: u64,
+    names: fn(&narf_block::DiskIdentity) -> Vec<String>,
+    overlay: &'static IrqSafeSpinLock<crate::devfs::DynamicMap>,
+}
+
+impl core::fmt::Debug for DevDiskByIdentity {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DevDiskByIdentity")
+            .field("ino", &self.ino)
+            .finish_non_exhaustive()
+    }
+}
+
+fn by_path_names(i: &narf_block::DiskIdentity) -> Vec<String> {
+    i.by_path_name().into_iter().collect()
+}
+
+impl DevDiskByIdentity {
+    /// `/dev/disk/by-id/`.
+    pub const BY_ID: Self = Self {
+        ino: 14,
+        names: narf_block::DiskIdentity::by_id_names,
+        overlay: &BY_ID_LINKS,
+    };
+    /// `/dev/disk/by-path/`.
+    pub const BY_PATH: Self = Self {
+        ino: 15,
+        names: by_path_names,
+        overlay: &BY_PATH_LINKS,
+    };
+
+    /// Every synthesised `(link name, registry name)` pair.
+    fn generated(&self) -> Vec<(String, &'static str)> {
+        let mut out = Vec::new();
+        for r in narf_block::block_devices() {
+            let Some(id) = r.identity.as_ref() else {
+                continue;
+            };
+            let suffix = match (r.parent, r.partno) {
+                (None, _) => String::new(),
+                (Some(_), Some(n)) => alloc::format!("-part{n}"),
+                // A partition whose number is unknown gets no link rather
+                // than one that collides with its disk's.
+                (Some(_), None) => continue,
+            };
+            for base in (self.names)(id) {
+                out.push((alloc::format!("{base}{suffix}"), r.name));
+            }
+        }
+        out
+    }
+}
+
+impl DirOps for DevDiskByIdentity {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        self.generated()
+            .into_iter()
+            .find(|(link, _)| link == name)
+            .map(|(_, dev)| crate::devfs::symlink_file(name, alloc::format!("../../{dev}")))
+            .or_else(|| crate::devfs::dynamic_lookup_file(self.overlay, name))
+    }
+
+    fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        let generated_exists = self.generated().iter().any(|(link, _)| link == name);
+        disk_symlink(self.overlay, generated_exists, name, target)
+    }
+
+    fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        let result = crate::devfs::dynamic_unlink(self.overlay, name);
+        Box::pin(async move { result })
+    }
+
+    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+        Box::new(core::iter::empty())
+    }
+
+    fn enumerate(&self, cursor: usize, max: usize) -> Vec<(alloc::string::String, FileType)> {
+        let generated = self
+            .generated()
+            .into_iter()
+            .map(|(link, _)| (link, FileType::Symlink))
+            .collect();
+        disk_enumerate(generated, self.overlay, cursor, max)
+    }
+
+    fn enumerate_async<'a>(
+        &'a self,
+        cursor: usize,
+        max: usize,
+    ) -> crate::FsFuture<'a, Vec<(alloc::string::String, FileType)>> {
+        let v = self.enumerate(cursor, max);
+        Box::pin(async move { Ok(v) })
+    }
+}
+
+/// Registry name the `/dev/disk/by-id/<name>` link points at, if any.
+pub fn by_id_target(name: &str) -> Option<&'static str> {
+    DevDiskByIdentity::BY_ID
+        .generated()
+        .into_iter()
+        .find(|(link, _)| link == name)
+        .map(|(_, dev)| dev)
+}
+
+/// Registry name the `/dev/disk/by-path/<name>` link points at, if any.
+pub fn by_path_target(name: &str) -> Option<&'static str> {
+    DevDiskByIdentity::BY_PATH
+        .generated()
+        .into_iter()
+        .find(|(link, _)| link == name)
+        .map(|(_, dev)| dev)
 }
 
 // ── Block-device ioctl smokes ─────────────────────────────────────────

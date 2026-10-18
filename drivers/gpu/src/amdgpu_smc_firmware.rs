@@ -4,8 +4,8 @@
 //! This parser checks structure, not authenticity or board power policy.
 
 pub const NAVI22_SMC: &str = "amdgpu/navy_flounder_smc.bin";
-const MAX_CONTAINER: usize = 2 * 1024 * 1024;
-const MAX_UCODE: usize = 1024 * 1024;
+const MAX_CONTAINER: usize = 2 * 1024 * 1024; // linux: n/a (NARF bound)
+const MAX_UCODE: usize = 1024 * 1024; // linux: n/a (NARF bound)
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -30,17 +30,23 @@ impl<'a> Image<'a> {
         Self::parse_for_ip(bytes, 14)
     }
     fn parse_for_ip(bytes: &'a [u8], ip: u8) -> Result<Self, Error> {
+        // linux-lit: 44=sizeof(struct smc_firmware_header_v2_0)
         if bytes.len() < 44 || bytes.len() > MAX_CONTAINER {
             return Err(Error::Invalid);
         }
+        // linux-lit: 8=offsetof(struct common_firmware_header, header_version_major); 12=offsetof(struct common_firmware_header, ip_version_major)
         if bytes[8..12] != [2, 0, 0, 0] || bytes[12..16] != [ip, 0, 0, 0] {
             return Err(Error::Unsupported);
         }
+        // linux-lit: 24=offsetof(struct common_firmware_header, ucode_array_offset_bytes)
         let start = word(bytes, 24) as usize;
+        // linux-lit: 20=offsetof(struct common_firmware_header, ucode_size_bytes)
         let size = word(bytes, 20) as usize;
+        // linux-lit: 0=offsetof(struct common_firmware_header, size_bytes)
         if word(bytes, 0) as usize != bytes.len()
+            // linux-lit: 4=offsetof(struct common_firmware_header, header_size_bytes); 44=sizeof(struct smc_firmware_header_v2_0)
             || word(bytes, 4) != 44
-            || start < 44
+            || start < 44 // linux-lit: 44=sizeof(struct smc_firmware_header_v2_0)
             || start % 4 != 0
             || size == 0
             || size > MAX_UCODE
@@ -50,7 +56,9 @@ impl<'a> Image<'a> {
         }
         let end = start.checked_add(size).ok_or(Error::Invalid)?;
         let payload = bytes.get(start..end).ok_or(Error::Invalid)?;
+        // linux-lit: 36=offsetof(struct smc_firmware_header_v2_0, ppt_offset_bytes)
         let ppt_start = word(bytes, 36) as usize;
+        // linux-lit: 40=offsetof(struct smc_firmware_header_v2_0, ppt_size_bytes)
         let ppt_size = word(bytes, 40) as usize;
         let powerplay = if ppt_size == 0 {
             if ppt_start != 0 {
@@ -59,6 +67,7 @@ impl<'a> Image<'a> {
             None
         } else {
             let ppt_end = ppt_start.checked_add(ppt_size).ok_or(Error::Invalid)?;
+            // linux-lit: 44=sizeof(struct smc_firmware_header_v2_0)
             if ppt_start < 44 || (ppt_start < end && start < ppt_end) {
                 return Err(Error::Invalid);
             }
@@ -67,6 +76,7 @@ impl<'a> Image<'a> {
         Ok(Self {
             payload,
             powerplay,
+            // linux-lit: 16=offsetof(struct common_firmware_header, ucode_version)
             version: word(bytes, 16),
         })
     }

@@ -2859,6 +2859,12 @@ fn gen_meminfo() -> String {
     let _ = writeln!(s, "MemAvailable: {:>10} kB", free_kb);
     let _ = writeln!(s, "Buffers:      {:>10} kB", 0);
     let _ = writeln!(s, "Cached:       {:>10} kB", 0);
+    let _ = writeln!(s, "SwapCached:   {:>10} kB", 0);
+    // NARF has no swap. Linux still prints both lines on a swapless kernel,
+    // and systemd-oomd refuses to start without them ("Failed to get
+    // SwapTotal from /proc/meminfo").
+    let _ = writeln!(s, "SwapTotal:    {:>10} kB", 0);
+    let _ = writeln!(s, "SwapFree:     {:>10} kB", 0);
     let _ = writeln!(s, "Slab:         {:>10} kB", slab_unreclaimable_kb);
     let _ = writeln!(s, "SReclaimable: {:>10} kB", 0);
     let _ = writeln!(s, "SUnreclaim:   {:>10} kB", slab_unreclaimable_kb);

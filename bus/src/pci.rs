@@ -93,6 +93,35 @@ pub fn read_config32(
     Ok(unsafe { cfg_read32(cfg, offset as u64) })
 }
 
+/// Write a dword at an arbitrary offset in the device's config space.
+///
+/// The counterpart of [`read_config32`] for state that `restore_config`
+/// does not cover — PCIe capability control words and extended
+/// capabilities such as Resizable BAR, which a device-level reset
+/// returns to their defaults. Fields sharing the dword with RW1C status
+/// bits are the caller's responsibility: write zero there to leave the
+/// status unchanged.
+///
+/// `offset` must be dword-aligned and inside the 4 KiB config window.
+/// Cap-gated; the cap's epoch is checked.
+pub fn write_config32(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+    offset: u16,
+    value: u32,
+) -> Result<(), PciError> {
+    cap.check_live()?;
+    if offset % 4 != 0 || offset as u64 + 4 > CFG_WINDOW_BYTES {
+        return Err(PciError::BadOffset);
+    }
+    let cfg = pcie_cfg_phys(device)?;
+    // SAFETY: `cfg` is this function's identity-mapped ECAM window,
+    // `offset` is dword-aligned and in range, and the live Write cap
+    // proves exclusive authority over the device.
+    unsafe { cfg_write32(cfg, offset as u64, value) };
+    Ok(())
+}
+
 /// Size of one PCIe function's configuration window.
 pub const CFG_WINDOW_BYTES: u64 = 4096;
 

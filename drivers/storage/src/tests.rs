@@ -1811,3 +1811,505 @@ fn smoke_mmc_cmd3_cmd7_encoding() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/storage/mmc", smoke_mmc_cmd3_cmd7_encoding);
+
+// ── AHCI: generic class binding + spec-generic HBA init ───────────────
+
+fn synth_pci(vendor: u16, device: u16, class: u32) -> narf_bus::BusDevice {
+    use narf_bus::{BusAddr, BusDevice, BusKind, DeviceId, PcieAddr};
+    use narf_memory::PhysAddr;
+    let addr = PcieAddr::new(0, 0x11, 0, 0);
+    BusDevice {
+        addr: BusAddr::Pcie(addr),
+        id: DeviceId {
+            vendor,
+            device,
+            class,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: BusKind::Pcie {
+            addr,
+            cfg_phys: PhysAddr::new(0),
+        },
+    }
+}
+
+/// The best (most specific) registered match for `dev`, as `probe_all`
+/// picks it.
+fn best_match(dev: &narf_bus::BusDevice) -> Option<narf_bus::PciMatch> {
+    narf_bus::registered_pci_drivers()
+        .into_iter()
+        .filter(|m| m.kind.matches(dev))
+        .max_by_key(|m| m.kind.specificity())
+}
+
+/// The AMD 600-series chipset SATA controller (`1022:43f6`, class
+/// `01:06:01`, the Navi22 host's `11:00.0`) binds to AHCI through the
+/// generic class entry, as Linux's `ahci_pci_tbl` does. Only the binding
+/// is exercised here: QEMU models no AMD AHCI controller, so the AMD
+/// silicon itself is untested.
+fn smoke_ahci_binds_amd_600_series_by_class() -> TestResult {
+    use crate::ahci;
+    use narf_bus::driver_match::__reset_for_test;
+    __reset_for_test();
+    ahci::register_pci_driver();
+
+    let amd = synth_pci(
+        ahci::AMD_VENDOR,
+        ahci::AMD_600_SERIES_SATA_DEV,
+        ((ahci::PCI_CLASS_STORAGE as u32) << 16)
+            | ((ahci::PCI_SUBCLASS_SATA as u32) << 8)
+            | ahci::PCI_PROGIF_AHCI as u32,
+    );
+    let Some(m) = best_match(&amd) else {
+        return TestResult::Fail("AMD 1022:43f6 (01:06:01) matched no driver");
+    };
+    if m.name != "ahci-class" || m.probe as usize != ahci::probe as usize {
+        return TestResult::Fail("AMD 1022:43f6 must bind the AHCI class entry");
+    }
+    if !matches!(m.kind, narf_bus::MatchKind::ClassFull { .. }) {
+        return TestResult::Fail("AMD binding must be the full class triple");
+    }
+    // ICH9 keeps its exact-ID entry (higher specificity than the class).
+    let ich9 = synth_pci(ahci::AHCI_VENDOR, ahci::AHCI_ICH9_DEV, 0x010601);
+    if best_match(&ich9).map(|m| m.name) != Some("ahci-ich9") {
+        return TestResult::Fail("ICH9 must still bind its VendorDevice entry");
+    }
+    // Neither NVMe (01:08:02), IDE-mode SATA (01:01:8a) nor a RAID-class
+    // AMD controller (01:04:00) reaches the AHCI probe.
+    let nvme = synth_pci(0x1987, 0x5016, 0x010802);
+    if best_match(&nvme).map(|m| m.probe as usize) == Some(ahci::probe as usize) {
+        return TestResult::Fail("an NVMe controller must not bind AHCI");
+    }
+    for class in [0x01018A, 0x010400, 0x010600] {
+        let other = synth_pci(ahci::AMD_VENDOR, 0x7901, class);
+        if best_match(&other).map(|m| m.probe as usize) == Some(ahci::probe as usize) {
+            return TestResult::Fail("a non-AHCI storage class must not bind AHCI");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_binds_amd_600_series_by_class
+);
+
+/// Software model of the HBA-global registers: write-once CAP / CAP2 / PI
+/// and port capability bits that GHC.HR wipes (as on controllers where
+/// firmware programs them), an AE bit that needs `ae_writes` writes to
+/// stick, HR that self-clears after `hr_reads` GHC reads, and a BIOS
+/// that releases BOHC.BOS when the OS sets OOS.
+struct ModelHba {
+    regs: core::cell::RefCell<alloc::vec::Vec<u32>>,
+    ae_writes: core::cell::Cell<u32>,
+    hr_reads: core::cell::Cell<u32>,
+    hr_pending: core::cell::Cell<bool>,
+    resets: core::cell::Cell<u32>,
+}
+
+const M_CAP: u64 = 0x00;
+const M_GHC: u64 = 0x04;
+const M_PI: u64 = 0x0C;
+const M_VS: u64 = 0x10;
+const M_CAP2: u64 = 0x24;
+const M_BOHC: u64 = 0x28;
+const fn m_port_cmd(n: u64) -> u64 {
+    0x100 + n * 0x80 + 0x18
+}
+
+impl ModelHba {
+    fn new(cap: u32, vs: u32, pi: u32, cap2: u32, bohc: u32) -> Self {
+        let m = Self {
+            regs: core::cell::RefCell::new(alloc::vec![0u32; 0x1100 / 4]),
+            ae_writes: core::cell::Cell::new(1),
+            hr_reads: core::cell::Cell::new(3),
+            hr_pending: core::cell::Cell::new(false),
+            resets: core::cell::Cell::new(0),
+        };
+        {
+            let mut r = m.regs.borrow_mut();
+            r[(M_CAP / 4) as usize] = cap;
+            r[(M_VS / 4) as usize] = vs;
+            r[(M_PI / 4) as usize] = pi;
+            r[(M_CAP2 / 4) as usize] = cap2;
+            r[(M_BOHC / 4) as usize] = bohc;
+        }
+        m
+    }
+    fn get(&self, off: u64) -> u32 {
+        self.regs.borrow()[(off / 4) as usize]
+    }
+    fn set(&self, off: u64, v: u32) {
+        self.regs.borrow_mut()[(off / 4) as usize] = v;
+    }
+}
+
+impl crate::ahci::AhciRegs for ModelHba {
+    fn read32(&self, off: u64) -> u32 {
+        if off == M_GHC && self.hr_pending.get() {
+            let left = self.hr_reads.get();
+            if left == 0 {
+                // Reset completes: firmware-programmed RWO state is lost.
+                self.hr_pending.set(false);
+                self.resets.set(self.resets.get() + 1);
+                self.set(M_GHC, 0);
+                self.set(M_PI, 0);
+                self.set(M_CAP, self.get(M_CAP) & !((1 << 27) | (1 << 28)));
+                for n in 0..32 {
+                    self.set(m_port_cmd(n), 0);
+                }
+            } else {
+                self.hr_reads.set(left - 1);
+            }
+        }
+        self.get(off)
+    }
+    fn write32(&self, off: u64, mut v: u32) {
+        match off {
+            M_GHC => {
+                if v & (1 << 31) != 0 && self.ae_writes.get() > 1 {
+                    self.ae_writes.set(self.ae_writes.get() - 1);
+                    v &= !(1 << 31);
+                }
+                if v & 1 != 0 {
+                    self.hr_pending.set(true);
+                }
+                self.set(off, v);
+            }
+            M_BOHC => {
+                // OOS set: the BIOS hands over and clears BOS.
+                if v & 0b10 != 0 {
+                    v &= !0b1;
+                }
+                self.set(off, v);
+            }
+            _ => self.set(off, v),
+        }
+    }
+}
+
+fn smoke_ahci_hba_init_restores_firmware_config() -> TestResult {
+    use crate::ahci::{effective_port_map, hba_global_init, AhciError, BiosHandoff};
+    // AHCI 1.3.1, 6 ports, SSS + MPS + S64A, BOH supported, BIOS owned;
+    // ports 0 and 2 carry platform capability bits (ESP / CPD / HPCP).
+    let cap = (1 << 31) | (1 << 28) | (1 << 27) | 5;
+    let m = ModelHba::new(cap, 0x0001_0301, 0x3F, 1, 0b1);
+    m.ae_writes.set(3); // needs three AE writes (Linux retries five)
+    m.set(m_port_cmd(0), 1 << 21);
+    m.set(
+        m_port_cmd(2),
+        (1 << 20) | (1 << 18) | 1, /* ST: volatile */
+    );
+    let cfg = match hba_global_init(&m) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("hba_global_init failed on a healthy model"),
+    };
+    if m.resets.get() != 1 {
+        return TestResult::Fail("exactly one HBA reset expected");
+    }
+    if m.get(M_GHC) & (1 << 31) == 0 || m.get(M_GHC) & 1 != 0 {
+        return TestResult::Fail("AE must be set and HR clear after init");
+    }
+    if m.get(M_PI) != 0x3F || m.get(M_CAP) != cap || cfg.port_map != 0x3F {
+        return TestResult::Fail("CAP / PI must be restored after the reset");
+    }
+    if m.get(m_port_cmd(0)) != 1 << 21 || m.get(m_port_cmd(2)) != (1 << 20) | (1 << 18) {
+        return TestResult::Fail("port capability bits (only) must be restored");
+    }
+    if cfg.handoff != BiosHandoff::Completed || m.get(M_BOHC) & 0b11 != 0b10 {
+        return TestResult::Fail("BIOS/OS handoff must leave OOS set, BOS clear");
+    }
+
+    // AHCI 1.0, PI reads 0: Linux fabricates the map from CAP.NP and
+    // writes it back; there is no CAP2 / handoff below 1.2.
+    let m = ModelHba::new(3, 0x0001_0000, 0, 1, 0b1);
+    let cfg = match hba_global_init(&m) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("hba_global_init failed on an AHCI 1.0 model"),
+    };
+    if cfg.port_map != 0xF || m.get(M_PI) != 0xF || cfg.handoff != BiosHandoff::NotSupported {
+        return TestResult::Fail("AHCI 1.0 port map must be fabricated from CAP.NP");
+    }
+
+    // PI with more ports than CAP.NP is discarded (1.3: not fabricated).
+    if effective_port_map(3, 0x0001_0300, 0xFF) != 0
+        || effective_port_map(3, 0x0001_0201, 0xFF) != 0xF
+        || effective_port_map(31, 0x0001_0301, 0x8000_0001) != 0x8000_0001
+    {
+        return TestResult::Fail("port-map cross-check disagrees with Linux");
+    }
+
+    // A reset that never completes fails within the 1 s bound.
+    let m = ModelHba::new(cap, 0x0001_0301, 0x3F, 0, 0);
+    m.hr_reads.set(u32::MAX);
+    if hba_global_init(&m) != Err(AhciError::ResetTimeout) {
+        return TestResult::Fail("a stuck GHC.HR must time out");
+    }
+    // AE that never sticks is reported, not ignored.
+    let m = ModelHba::new(cap, 0x0001_0301, 0x3F, 0, 0);
+    m.ae_writes.set(u32::MAX);
+    if hba_global_init(&m) != Err(AhciError::AhciEnableFailed) {
+        return TestResult::Fail("GHC.AE that never sets must fail");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_hba_init_restores_firmware_config
+);
+
+/// Port-level AHCI register model: PxCMD.CR follows ST and FR follows FRE
+/// (the engines stop at once) except on `stuck` ports, whose CR stays set
+/// once set; `stick_on_start` ports latch CR the moment ST is written.
+/// PxSSTS reads DET = 3 on `present` ports, whose PxTFD is BSY forever
+/// unless `ready` (then 0x50). PxCI clears on write (the command
+/// "completes"). `comresets` counts PxSCTL.DET = 1 writes per port.
+struct PortModel {
+    regs: core::cell::RefCell<alloc::vec::Vec<u32>>,
+    stuck: u32,
+    stick_on_start: u32,
+    present: u32,
+    ready: u32,
+    comresets: core::cell::RefCell<[u32; 32]>,
+}
+
+impl PortModel {
+    fn new(present: u32) -> Self {
+        Self {
+            regs: core::cell::RefCell::new(alloc::vec![0u32; 0x1100 / 4]),
+            stuck: 0,
+            stick_on_start: 0,
+            present,
+            ready: 0,
+            comresets: core::cell::RefCell::new([0; 32]),
+        }
+    }
+    fn get(&self, off: u64) -> u32 {
+        self.regs.borrow()[(off / 4) as usize]
+    }
+    fn set(&self, off: u64, v: u32) {
+        self.regs.borrow_mut()[(off / 4) as usize] = v;
+    }
+}
+
+const fn m_port(n: u32, reg: u64) -> u64 {
+    0x100 + n as u64 * 0x80 + reg
+}
+
+impl crate::ahci::AhciRegs for PortModel {
+    fn read32(&self, off: u64) -> u32 {
+        if off >= 0x100 {
+            let n = ((off - 0x100) / 0x80) as u32;
+            match (off - 0x100) % 0x80 {
+                0x28 if self.present & (1 << n) != 0 => return 0x123,
+                0x20 if self.present & (1 << n) != 0 => {
+                    return if self.ready & (1 << n) != 0 {
+                        0x50
+                    } else {
+                        0x80
+                    };
+                }
+                _ => {}
+            }
+        }
+        self.get(off)
+    }
+    fn write32(&self, off: u64, v: u32) {
+        if off >= 0x100 {
+            let n = ((off - 0x100) / 0x80) as u32;
+            match (off - 0x100) % 0x80 {
+                0x18 => {
+                    let old = self.get(off);
+                    let stuck = self.stuck & (1 << n) != 0
+                        || (self.stick_on_start & (1 << n) != 0 && (v | old) & 1 != 0);
+                    let mut cr = if v & 1 != 0 { 1 << 15 } else { 0 };
+                    if stuck && (old & (1 << 15) != 0 || v & 1 != 0) {
+                        cr = 1 << 15;
+                    }
+                    let fr = if v & (1 << 4) != 0 { 1 << 14 } else { 0 };
+                    let fr = if stuck && old & (1 << 14) != 0 {
+                        1 << 14
+                    } else {
+                        fr
+                    };
+                    self.set(off, (v & !((1 << 15) | (1 << 14))) | cr | fr);
+                    return;
+                }
+                0x2C if v & 0xF == 1 => self.comresets.borrow_mut()[n as usize] += 1,
+                0x38 => return, // PxCI: completes immediately
+                _ => {}
+            }
+        }
+        self.set(off, v);
+    }
+}
+
+/// One HBA's port bring-up is bounded as a whole: six ports that report a
+/// device (DET = 3) but never clear BSY used to cost ~13 s each, serially
+/// (~80 s). Under the HBA-wide budget the bring-up ends shortly after it,
+/// later ports are classified without a COMRESET, and every port still
+/// gets its PxIE programmed.
+fn smoke_ahci_port_bring_up_is_bounded_per_hba() -> TestResult {
+    use crate::ahci::{bring_up_ports, PortKind};
+    let m = PortModel::new(0x3F);
+    let limit = narf_time::Deadline::after_ms(3_000);
+    let ports = bring_up_ports(&m, 0, 0x3F, Some((0x10_0000, 0x10_0400)), 400);
+    if limit.expired() {
+        return TestResult::Fail("six never-ready ports outlived the HBA bring-up budget");
+    }
+    // Port 0 was reset and never became ready; the rest were classified from
+    // their registers alone (DET = 3, no signature), never as a disk.
+    if ports.len() != 6
+        || ports[0].kind != PortKind::None
+        || ports.iter().any(|p| p.kind == PortKind::Sata)
+    {
+        return TestResult::Fail("never-ready ports must not classify as disks");
+    }
+    if m.comresets.borrow()[0] != 1 || m.comresets.borrow()[5] != 0 {
+        return TestResult::Fail("ports past the budget must not be COMRESET");
+    }
+    if (0..6).any(|n| m.get(m_port(n, 0x14)) == 0) {
+        return TestResult::Fail("every port must get its PxIE programmed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_port_bring_up_is_bounded_per_hba
+);
+
+/// IDENTIFY DEVICE on a port whose engine will not stop must fail without
+/// touching PxCLB / PxFB (the old code ignored the `port_idle` failure and
+/// pointed a running engine at a fresh page). When the final stop fails the
+/// call fails too, and the page the HBA may still write is never freed.
+fn smoke_ahci_identify_refuses_a_running_port() -> TestResult {
+    use crate::ahci::{identify_device, AhciError};
+    let mut m = PortModel::new(0b1);
+    m.stuck = 0b1;
+    m.set(m_port(0, 0x18), (1 << 15) | 1); // ST + CR, never drains
+    m.set(m_port(0, 0x00), 0xDEAD_0000);
+    m.set(m_port(0, 0x08), 0xBEEF_0000);
+    // SAFETY: a register model; the call fails before any DMA is set up.
+    let r = unsafe { identify_device(&m, 1 << 31, 0) };
+    if r != Err(AhciError::PortIdleTimeout) {
+        return TestResult::Fail("identify on a port that will not stop must fail");
+    }
+    if m.get(m_port(0, 0x00)) != 0xDEAD_0000 || m.get(m_port(0, 0x08)) != 0xBEEF_0000 {
+        return TestResult::Fail("CLB/FB reprogrammed under a running engine");
+    }
+    let mut m = PortModel::new(0b1);
+    m.ready = 0b1;
+    m.stick_on_start = 0b1;
+    // SAFETY: a register model standing in for the HBA; the scratch page is
+    // a real coherent allocation the model never writes.
+    let r = unsafe { identify_device(&m, 1 << 31, 0) };
+    if r != Err(AhciError::PortIdleTimeout) {
+        return TestResult::Fail("a failed final stop must fail identify (page kept)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_identify_refuses_a_running_port
+);
+
+/// GHC.IE is the HBA's master interrupt gate and must stay clear until the
+/// ISR is installed and routed (it was set at the end of bring-up, before
+/// `probe` had any vector).
+fn smoke_ahci_ghc_ie_waits_for_the_irq_route() -> TestResult {
+    use crate::ahci::{hba_enable_irq, hba_finish_init, AhciRegs};
+    let m = PortModel::new(0);
+    m.set(0x04, (1 << 31) | (1 << 1)); // firmware left IE set
+    m.set(0x08, 0b101);
+    hba_finish_init(&m);
+    if m.read32(0x04) != 1 << 31 {
+        return TestResult::Fail("bring-up must leave GHC.AE set and GHC.IE clear");
+    }
+    hba_enable_irq(&m);
+    if m.read32(0x04) != (1 << 31) | (1 << 1) {
+        return TestResult::Fail("hba_enable_irq must set GHC.IE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_ghc_ie_waits_for_the_irq_route
+);
+
+fn smoke_ahci_link_debounce_matches_libata() -> TestResult {
+    use crate::ahci::sata_link_debounce;
+    use core::cell::Cell;
+    // Short timing so the smoke stays fast: interval 1 ms, stable for
+    // 20 ms, deadline 200 ms.
+    let t = [1, 20, 200];
+    if sata_link_debounce(|| 0, t) != Some(0) {
+        return TestResult::Fail("an empty port must settle at DET = 0");
+    }
+    // Device present but PHY not yet up (DET = 1) for a while, then up.
+    let n = Cell::new(0u32);
+    let det = || {
+        n.set(n.get() + 1);
+        if n.get() < 30 {
+            1
+        } else {
+            0x113 // DET = 3 with SPD / IPM bits set
+        }
+    };
+    if sata_link_debounce(det, t) != Some(3) {
+        return TestResult::Fail("DET 1 → 3 must settle at 3");
+    }
+    // A link that keeps flapping gives up at the deadline.
+    let n = Cell::new(0u32);
+    let flap = || {
+        n.set(n.get() + 1);
+        if n.get() % 2 == 0 {
+            1
+        } else {
+            3
+        }
+    };
+    if sata_link_debounce(flap, t).is_some() {
+        return TestResult::Fail("a flapping link must not debounce");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_link_debounce_matches_libata
+);
+
+/// On QEMU's ICH9 the boot-time probe now runs the spec port bring-up
+/// (FIS receive, spin-up, COMRESET, debounce, BSY wait) before
+/// classifying, so the disk on port 0 (`ide.0`, the 1 MiB `narf-sata.img`)
+/// must read back as an ATA disk with its IDENTIFY capacity.
+fn smoke_ahci_port_bring_up_classifies_qemu_disk() -> TestResult {
+    use crate::ahci;
+    use narf_block::BlockDeviceSync;
+    if !ahci::is_probed() {
+        return TestResult::Skip("AHCI not probed");
+    }
+    let Some((port, kind, cap)) = ahci::with_controller(|c| {
+        let kind = c
+            .ports
+            .iter()
+            .find(|p| p.index == c.block_port)
+            .map(|p| p.kind);
+        (c.block_port, kind, c.capacity)
+    }) else {
+        return TestResult::Fail("controller vanished");
+    };
+    if kind != Some(ahci::PortKind::Sata) {
+        return TestResult::Fail("the QEMU disk port must classify as SATA");
+    }
+    if port != 0 {
+        return TestResult::Fail("the QEMU disk sits on port 0");
+    }
+    if cap == 0 || ahci::AhciBlockSync.capacity() != cap {
+        return TestResult::Fail("IDENTIFY capacity must be cached and reported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_port_bring_up_classifies_qemu_disk
+);

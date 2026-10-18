@@ -12,7 +12,6 @@ use alloc::vec::Vec;
 use narf_block::BlockDevice;
 use narf_filesystem::FsError;
 
-use crate::btree::Cursor;
 use crate::format::{self, BtrfsKey};
 use crate::volume::BtrfsVolume;
 
@@ -26,32 +25,35 @@ pub async fn find_csum<B: BlockDevice + 'static>(
     sectorsize: u64,
 ) -> Result<Option<Vec<u8>>, FsError> {
     let csum_bytes = crate::checksum::size(vol.csum_type())?;
-    let start = BtrfsKey::new(format::EXTENT_CSUM_OBJECTID, format::EXTENT_CSUM_KEY, 0);
-    let mut cursor = Cursor::seek(vol, csum_root, &start).await?;
-    while let Some((key, body)) = cursor.current()? {
-        if key.objectid != format::EXTENT_CSUM_OBJECTID || key.item_type != format::EXTENT_CSUM_KEY
-        {
-            break;
-        }
-        if key.offset > logical {
-            break; // items are ordered by offset; the covering one is earlier
-        }
-        if body.len() % csum_bytes != 0 {
-            return Err(FsError::InvalidData);
-        }
-        let sectors = (body.len() / csum_bytes) as u64;
-        let covered_end = key.offset + sectors * sectorsize;
-        if logical < covered_end {
-            let idx = ((logical - key.offset) / sectorsize) as usize;
-            let start = idx.checked_mul(csum_bytes).ok_or(FsError::InvalidData)?;
-            let stored = body
-                .get(start..start + csum_bytes)
-                .ok_or(FsError::InvalidData)?;
-            return Ok(Some(stored.to_vec()));
-        }
-        cursor.advance().await?;
+    // The covering item is the greatest csum key <= `logical`: one O(log N)
+    // descent. (Scanning from offset 0 made every data-sector read walk the
+    // whole csum tree, which on an installed root is hundreds of thousands
+    // of items.)
+    let ceiling = BtrfsKey::new(
+        format::EXTENT_CSUM_OBJECTID,
+        format::EXTENT_CSUM_KEY,
+        logical.saturating_add(1),
+    );
+    let Some((key, body)) = crate::btree::last_before(vol, csum_root, &ceiling).await? else {
+        return Ok(None);
+    };
+    if key.objectid != format::EXTENT_CSUM_OBJECTID || key.item_type != format::EXTENT_CSUM_KEY {
+        return Ok(None);
     }
-    Ok(None)
+    if body.len() % csum_bytes != 0 {
+        return Err(FsError::InvalidData);
+    }
+    let sectors = (body.len() / csum_bytes) as u64;
+    let covered_end = key.offset + sectors * sectorsize;
+    if logical >= covered_end {
+        return Ok(None);
+    }
+    let idx = ((logical - key.offset) / sectorsize) as usize;
+    let start = idx.checked_mul(csum_bytes).ok_or(FsError::InvalidData)?;
+    let stored = body
+        .get(start..start + csum_bytes)
+        .ok_or(FsError::InvalidData)?;
+    Ok(Some(stored.to_vec()))
 }
 
 /// Read an arbitrary byte range of data through sector checksums. Every sector

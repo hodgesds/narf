@@ -71,6 +71,13 @@ pub fn klog::syslog_all_size() -> usize;
 pub fn klog::syslog_size_unread() -> usize;
 pub fn klog::syslog_clear();
 pub fn klog::text_since(seq: u64) -> Vec<u8>; pub fn klog::snapshot() -> Vec<u8>;
+pub struct klog::Export { pub text: Vec<u8>, pub next_seq: u64, pub lost: u64 }
+pub fn klog::export_since(seq: u64, max_bytes: usize, wait: bool) -> Option<Export>;
+// Persistent-log sink: run last by panic_sink (Some(report)) and by
+// narf_power::system::{reboot, power_off} (None).
+pub type PersistHook = fn(Option<&[u8]>);
+pub fn set_persist_hook(hook: PersistHook);
+pub fn run_persist_hook(msg: Option<&[u8]>);
 pub fn klog::set_clock(f: fn() -> u64);           // record timestamps (ns)
 pub fn klog::memparse(s: &str) -> u64;
 pub fn klog::log_buf_len_value(arg: &str, current: usize) -> Option<usize>;
@@ -104,6 +111,21 @@ rings once the heap is live and migrates every record with its sequence number.
 (non-printables and `\` as `\xNN`); `syslog(2)` as
 `"<prio>[%5lu.%06lu] <line>\n"` per line of the record. Debug streams such as
 `syscall-trace` use `ConsoleOnlyWriter` so they never evict real messages.
+
+`export_since` serves external log sinks (the FAT boot log): it renders
+records from `seq` as `"[%5lu.%06lu] <text>\n"`, chunked by `max_bytes`
+(always at least one record), and returns the next cursor and the number of
+records already evicted. `wait == false` only tries the store lock, for the
+panic path. The persist hook runs after the UART and framebuffer sinks, so a
+stalled flush can never hide the panic report; the slot is taken before the
+call so a panic inside the hook cannot recurse into it.
+
+`set_panic_stop_hook(fn() -> (u64, u64))` installs the panic-time
+`smp_send_stop` (x86_64: `narf_interrupts::x86_64::panic_stop`, installed with
+the BSP's LAPIC). `panic_sink` runs it first, before any output: every other
+online CPU is NMI'd into a permanent halt (bounded 1 s wait), so no CPU keeps
+issuing filesystem or disk I/O after a panic. CPUs that do not acknowledge
+are reported on the UART.
 
 ### 3.1 MMU-enable handoff protocol
 

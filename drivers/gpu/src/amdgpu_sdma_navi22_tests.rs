@@ -21,6 +21,9 @@ struct Fake {
     fence_only: bool,
     progress: Arc<AtomicU32>,
     revoke: Option<(u64, u32, Cap<BusDeviceCap, Write>)>,
+    traps: Vec<u32>,
+    /// GPU address of the two translated test pages (the boot aperture).
+    base: u64,
 }
 impl Fake {
     // Minimal independent decoder of the public Navi10 SDMA packet ABI.
@@ -30,13 +33,14 @@ impl Fake {
         assert_eq!(self.regs[&(GC + 0x81 * 4)], 0x08000040);
         assert_eq!(self.regs[&(GC + 0x82 * 4)], 0);
         assert_eq!(self.regs[&(GC + 0x80 * 4)] & 0x0f80323f, 0x801015);
+        let base = self.base;
         let index = |lo: u32, hi: u32| {
             let address = u64::from(lo) | (u64::from(hi) << 32);
-            assert!((0xb_0000_0000..0xb_0000_2000).contains(&address));
+            assert!((base..base + 0x2000).contains(&address));
             assert_eq!(address % 4, 0);
-            ((address - 0xb_0000_0000) / 4) as usize
+            ((address - base) / 4) as usize
         };
-        let mut cursor = 0;
+        let mut cursor = *self.regs.get(&(GC + 0x83 * 4)).unwrap_or(&0) as usize / 4;
         while cursor < end as usize / 4 {
             let words = &self.memory[cursor..];
             cursor += match words[0] {
@@ -59,6 +63,11 @@ impl Fake {
                     let dst = index(words[1], words[2]);
                     self.target[dst] = words[3];
                     4
+                }
+                6 => {
+                    assert_eq!(self.regs[&(GC + 0x1c * 4)] & 1, 1, "trap disabled");
+                    self.traps.push(words[1]);
+                    2
                 }
                 _ => panic!("incorrect SDMA header"),
             };
@@ -159,16 +168,21 @@ fn fixture() -> (Pool, Engine<Fake>, gmc::Aperture, MmioRegion) {
             fence_only: false,
             progress: Arc::new(AtomicU32::new(0)),
             revoke: None,
+            traps: Vec::new(),
+            base: 0xb_0000_0000,
         },
         authority: Cap::bootstrap(),
         layout: Layout {
             gc: GC,
             nbio: NBIO,
             hdp: HDP,
+            // The RX 6750 XT: 12272 MiB, below the 12 GiB FB_LOCATION_TOP.
+            vram_size: 12272 << 20,
         },
         memory: pool.reserve(BYTES).unwrap(),
         state: State::Prepared,
         proof: None,
+        trapped: false,
     };
     (
         pool,
@@ -255,7 +269,10 @@ fn sdma_navi22_rejects_live_queues_and_invalid_memory_before_reset() -> TestResu
                 engine.io.regs.insert(GC + 0xda8 * 4, 1);
             }
             5 => {
-                engine.io.regs.insert(GC + 0x25 * 4, 0);
+                // A boot aperture inside the FB aperture.
+                aperture.start = 0x8_0020_0000;
+                aperture.source = aperture.start;
+                aperture.destination = aperture.start + 4096;
             }
             6 => {
                 engine.io.regs.insert(GC + 0x16fd * 4, u32::MAX);
@@ -283,6 +300,28 @@ fn sdma_navi22_rejects_live_queues_and_invalid_memory_before_reset() -> TestResu
 kernel_test_in!(
     "drivers/gpu/sdma-navi22",
     sdma_navi22_rejects_live_queues_and_invalid_memory_before_reset
+);
+/// Linux puts this board's GART (and so NARF's boot aperture) at MC 0
+/// (`GART: 512M 0x0-0x1FFFFFFF`), below the FB, and sdma_v5_2_start
+/// soft-resets SDMA without requiring SDMA0_STATUS_REG.IDLE first.
+fn sdma_navi22_accepts_linux_gart_aperture_and_busy_engine() -> TestResult {
+    let (_pool, mut engine, _, target) = fixture();
+    engine.io.regs.insert(GC + 0x25 * 4, 0);
+    engine.io.base = 0;
+    let aperture = gmc::Aperture {
+        start: 0,
+        size: 2 << 20,
+        source: 0,
+        destination: 0x1000,
+    };
+    if run(engine.initialize(aperture, target)).is_err() || engine.state != State::Verified {
+        return TestResult::Fail("Linux GART placement or non-idle SDMA0 refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/sdma-navi22",
+    sdma_navi22_accepts_linux_gart_aperture_and_busy_engine
 );
 fn sdma_navi22_cancellation_retains_reset_and_published_ring() -> TestResult {
     for (progress, state) in [
@@ -403,4 +442,59 @@ fn sdma_navi22_layout_rejects_wrong_versions_and_bank_bounds() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/sdma-navi22",
     sdma_navi22_layout_rejects_wrong_versions_and_bank_bounds
+);
+fn sdma_navi22_trap_enables_interrupt_once_after_verified_start() -> TestResult {
+    let (pool, mut engine, aperture, target) = fixture();
+    if run(engine.trap(0x22)) != Err(Error::Busy) || !engine.io.writes.is_empty() {
+        return TestResult::Fail("trap before verified start");
+    }
+    run(engine.initialize(aperture, target)).unwrap();
+    if run(engine.trap(0xf675_0022)) != Ok(())
+        || engine.io.traps != [0x0675_0022]
+        || engine.io.regs[&(GC + 0x83 * 4)] != 192
+        || engine.io.regs[&(GC + 0x1c * 4)] & 1 != 1
+        || engine.state != State::Verified
+    {
+        return TestResult::Fail("trap packet, context mask or enable");
+    }
+    let count = engine.io.writes.len();
+    if run(engine.trap(1)) != Err(Error::Busy) || engine.io.writes.len() != count {
+        return TestResult::Fail("trap replayed");
+    }
+    let (_pool2, mut stalled, aperture, target) = fixture();
+    run(stalled.initialize(aperture, target)).unwrap();
+    stalled.io.complete = false;
+    if run(stalled.trap(1)) != Err(Error::Timeout) || stalled.state != State::Failed {
+        return TestResult::Fail("stalled trap accepted");
+    }
+    drop(engine);
+    if pool.available() != 0 {
+        return TestResult::Fail("ring recycled after trap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/sdma-navi22",
+    sdma_navi22_trap_enables_interrupt_once_after_verified_start
+);
+
+/// amdgpu_gmc_vram_location: the FB aperture ends at fb_start +
+/// mc_vram_size (MEMSIZE), not at the inherited FB_LOCATION_TOP. The SDMA
+/// buffer must lie inside real VRAM even when TOP claims more.
+fn sdma_navi22_fb_end_follows_memsize_not_fb_top() -> TestResult {
+    let (_pool, mut engine, aperture, target) = fixture();
+    // TOP still says 12 GiB; MEMSIZE covers less than the reserved buffer.
+    engine.layout.vram_size = 0x4000;
+    if run(engine.initialize(aperture, target)) != Err(Error::Invalid) {
+        return TestResult::Fail("buffer beyond MEMSIZE accepted by FB_LOCATION_TOP");
+    }
+    let (_pool, mut engine, aperture, target) = fixture();
+    if run(engine.initialize(aperture, target)).is_err() {
+        return TestResult::Fail("12272 MiB VRAM refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/sdma-navi22",
+    sdma_navi22_fb_end_follows_memsize_not_fb_top
 );

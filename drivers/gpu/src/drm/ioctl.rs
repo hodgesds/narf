@@ -478,13 +478,21 @@ fn handle_get_cap(arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctlError> {
         return Err(DrmIoctlError::BadSize);
     }
     let capability = u64::from_le_bytes(arg[0..8].try_into().unwrap());
-    let value = match capability {
+    let value = cap_value(capability);
+    Ok(DrmIoctlResult::GetCap(DrmGetCap { capability, value }))
+}
+
+/// The `DRM_IOCTL_GET_CAP` answer for `capability`, as the card table and
+/// a card without KMS state (`drm_ioctl_bridge::without_kms`) report it.
+pub fn cap_value(capability: u64) -> u64 {
+    match capability {
         drm_cap::DUMB_BUFFER => 1u64, // dumb-buffer alloc supported
         // DRM_PRIME_CAP_EXPORT (1) | DRM_PRIME_CAP_IMPORT (2): both
         // supported via drm/prime.rs PrimeTable.
         drm_cap::PRIME => 3,
-        // SYNCOBJ (timeline=0) — drm/syncobj.rs implements binary
-        // syncobjs; timelines are deferred.
+        // SYNCOBJ_TIMELINE is per driver (`DRIVER_SYNCOBJ_TIMELINE`): 0
+        // here (virtio-gpu, KMS-only cards); amdgpu answers 1
+        // (`drm_ioctl_bridge::amdgpu_cap_value`).
         drm_cap::SYNCOBJ => 1,
         drm_cap::SYNCOBJ_TIMELINE => 0,
         drm_cap::TIMESTAMP_MONOTONIC => 1,
@@ -492,8 +500,7 @@ fn handle_get_cap(arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctlError> {
         drm_cap::CURSOR_WIDTH => 64,
         drm_cap::CURSOR_HEIGHT => 64,
         _ => 0,
-    };
-    Ok(DrmIoctlResult::GetCap(DrmGetCap { capability, value }))
+    }
 }
 
 fn handle_getresources(card: &Card) -> Result<DrmIoctlResult, DrmIoctlError> {

@@ -97,3 +97,114 @@ impl RootSelector {
         }
     }
 }
+
+/// Linux's `root_mountflags` access request: the last bare `ro` / `rw`
+/// token on the command line wins (`init/do_mounts.c::readonly` /
+/// `readwrite`). Absent both, Linux mounts the root read-only and leaves the
+/// switch to read-write to `systemd-remount-fs`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RootAccess {
+    /// Neither `ro` nor `rw` was given.
+    Unspecified,
+    /// `ro` was the last access token.
+    ReadOnly,
+    /// `rw` was the last access token.
+    ReadWrite,
+}
+
+/// Everything the command line says about the root mount: which volume
+/// (`root=`), how to mount it (`rootflags=`, `rootfstype=`) and the requested
+/// access (`ro` / `rw`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootSpec {
+    pub selector: Option<RootSelector>,
+    /// `rootflags=`, the filesystem data string handed to the root mount
+    /// (e.g. `subvol=/@` for a CachyOS btrfs root). The last one wins.
+    pub flags: Option<String>,
+    /// `rootfstype=`; `None` means detect from the superblock.
+    pub fstype: Option<String>,
+    pub access: RootAccess,
+}
+
+impl RootSpec {
+    /// Parse the root-related tokens of a kernel command line.
+    pub fn from_cmdline(cmdline: &str) -> Self {
+        let args = narf_boot::KernelCmdline::new(cmdline);
+        let mut access = RootAccess::Unspecified;
+        for token in cmdline.split_ascii_whitespace().take_while(|&t| t != "--") {
+            match token {
+                "ro" => access = RootAccess::ReadOnly,
+                "rw" => access = RootAccess::ReadWrite,
+                _ => {}
+            }
+        }
+        Self {
+            selector: RootSelector::from_cmdline(cmdline),
+            flags: args
+                .values("rootflags")
+                .last()
+                .filter(|v| !v.is_empty())
+                .map(String::from),
+            fstype: args
+                .values("rootfstype")
+                .last()
+                .filter(|v| !v.is_empty())
+                .map(String::from),
+            access,
+        }
+    }
+
+    /// The `subvol=` / `subvolid=` part of `rootflags=`, as `mount -t btrfs`
+    /// would apply it (the last occurrence wins, as in btrfs's own parser).
+    pub fn btrfs_subvol(&self) -> Option<BtrfsSubvol> {
+        btrfs_subvol_option(self.flags.as_deref()?)
+    }
+}
+
+/// A btrfs subvolume selector parsed from a mount data string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BtrfsSubvol {
+    /// `subvolid=N`.
+    Id(u64),
+    /// `subvol=PATH`, normalized without leading/trailing slashes (`/@` and
+    /// `@` both name the top-level `@` subvolume, as on Linux).
+    Path(String),
+}
+
+/// Last `subvol=` / `subvolid=` option in `data`. `None` when neither is
+/// present or the value is malformed.
+pub fn btrfs_subvol_option(data: &str) -> Option<BtrfsSubvol> {
+    let mut found = None;
+    for option in data.split(',') {
+        if let Some(id) = option.strip_prefix("subvolid=") {
+            found = Some(BtrfsSubvol::Id(id.parse().ok()?));
+        } else if let Some(path) = option.strip_prefix("subvol=") {
+            found = Some(BtrfsSubvol::Path(String::from(path.trim_matches('/'))));
+        }
+    }
+    found
+}
+
+/// Parse a canonical `8-4-4-4-12` UUID (any case) into its 16 bytes, in the
+/// order they are written: the same byte order btrfs (`fsid`) and ext
+/// (`s_uuid`) store on disk. `None` for anything else, including the short
+/// FAT volume-id form `XXXX-XXXX`.
+pub fn parse_uuid_bytes(text: &str) -> Option<[u8; 16]> {
+    let groups: alloc::vec::Vec<&str> = text.split('-').collect();
+    if groups.len() != 5
+        || groups
+            .iter()
+            .map(|g| g.len())
+            .ne([8usize, 4, 4, 4, 12].iter().copied())
+    {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    let mut nibbles = groups.iter().flat_map(|g| g.bytes());
+    for byte in &mut out {
+        let hi = (nibbles.next()? as char).to_digit(16)?;
+        let lo = (nibbles.next()? as char).to_digit(16)?;
+        *byte = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}

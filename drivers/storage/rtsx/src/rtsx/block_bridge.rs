@@ -209,7 +209,16 @@ pub mod tests {
     use narf_block::registry::__reset_for_test as block_reset;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
+    /// Runs [`smoke_rtsx_card_detect_registers_mmcblk0_inner`] against a scratch registry and restores the
+    /// boot-time entries afterwards, so later suites still see the probed disks.
     fn smoke_rtsx_card_detect_registers_mmcblk0() -> TestResult {
+        let saved = narf_block::registry::__snapshot_for_test();
+        let r = smoke_rtsx_card_detect_registers_mmcblk0_inner();
+        narf_block::registry::__restore_for_test(saved);
+        r
+    }
+
+    fn smoke_rtsx_card_detect_registers_mmcblk0_inner() -> TestResult {
         block_reset();
         let info = SdCardInfo {
             rca: 0x0001,

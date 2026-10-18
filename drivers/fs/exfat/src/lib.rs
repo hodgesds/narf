@@ -66,7 +66,7 @@ fn build_named(
         .strip_prefix("/dev/")
         .unwrap_or(request.source);
     let dev = narf_block::find_block_device(name).ok_or(narf_filesystem::FsError::NotFound)?;
-    let fs = narf_scheduler::block_on(volume::ExfatVolume::mount_with_opts(
+    let fs = narf_filesystem::fs_registry::mount_wait(volume::ExfatVolume::mount_with_opts(
         narf_block::SyncBlock::new(dev),
         narf_driver_runtime::DomainId::DRIVER_0,
         opts,

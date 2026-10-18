@@ -27,6 +27,7 @@
 
 extern crate alloc;
 
+pub mod bootlog;
 pub mod bpb;
 pub mod dir;
 pub mod fat;
@@ -80,6 +81,9 @@ impl<B: BlockDevice + 'static> FsInstance for FatMount<B> {
     fn name(&self) -> &str {
         self.0.name()
     }
+    fn always_read_only(&self) -> bool {
+        self.0.always_read_only()
+    }
 }
 
 /// FAT Version
@@ -115,6 +119,8 @@ pub fn register_initcalls() {
         register_fstypes();
         InitResult::Ok
     });
+    // Persistent boot log (`narf.bootlog=<token>`); inert without the arg.
+    narf_init::register(Stage::Late, "fat-bootlog", bootlog::start);
 }
 
 /// Factory for FsType::Fat. Wraps the sync block device in a
@@ -128,7 +134,10 @@ fn fat_factory(dev: Arc<dyn narf_block::BlockDeviceSync>) -> Result<Arc<dyn FsIn
     // SyncBlock::new returns Arc<SyncBlock> — exactly the
     // `Arc<B: BlockDevice>` shape FatVolume::mount expects.
     let async_dev = SyncBlock::new(dev);
-    let vol = narf_scheduler::block_on(volume::FatVolume::mount(async_dev, DomainId::DRIVER_0))?;
+    let vol = narf_filesystem::fs_registry::mount_wait(volume::FatVolume::mount(
+        async_dev,
+        DomainId::DRIVER_0,
+    ))?;
     Ok(vol as Arc<dyn FsInstance>)
 }
 
@@ -154,7 +163,7 @@ fn build_named(
         .unwrap_or(request.source);
     let dev = narf_block::find_block_device(name).ok_or(narf_filesystem::FsError::NotFound)?;
     let async_dev = narf_block::SyncBlock::new(dev);
-    let vol = narf_scheduler::block_on(volume::FatVolume::mount_with_opts(
+    let vol = narf_filesystem::fs_registry::mount_wait(volume::FatVolume::mount_with_opts(
         async_dev,
         DomainId::DRIVER_0,
         opts,

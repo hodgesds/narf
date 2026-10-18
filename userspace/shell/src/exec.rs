@@ -136,6 +136,20 @@ unsafe fn exec_simple(fd: i32, sc: &SimpleCmd) -> i32 {
         // SAFETY: Valid memory or trusted environment
         return unsafe { builtin_exit(fd, sc) };
     }
+    // `reboot` / `poweroff`: no coreutils binary exists for these. The
+    // kernel flushes the persistent boot log before the transition.
+    if name == b"reboot" || name == b"poweroff" {
+        let howto: i32 = if name == b"poweroff" {
+            0x4321_fedc
+        } else {
+            0x0123_4567
+        };
+        // SAFETY: no pointer arguments.
+        let _ = unsafe { libc::sys::reboot(howto) };
+        // SAFETY: fd is the shell's stderr-equivalent output fd.
+        unsafe { write_err(fd, b"reboot: not permitted\n") };
+        return 1;
+    }
     if name == b"true" || name == b":" {
         return 0;
     }

@@ -11,11 +11,18 @@
 //! controller's existing read/write helpers.
 //!
 //! Identification:
-//!   - `name` is a `'static str` set at registration time
-//!     (`"nvme0"`, `"vblk0"`, `"sata0"` by convention).
-//!   - The same driver can register multiple devices when it grows
-//!     multi-device support.
+//!   - `name` is a `'static str` set at registration time, Linux-style
+//!     (`"nvme0n1"`, `"vblk0"`, `"sata0"`; partitions append `p<N>`).
+//!   - **A name is not an identity.** Names follow enumeration order
+//!     (NVMe controllers are numbered in probe order, which is PCI order),
+//!     so a disk that moves slot, or a controller that fails to probe,
+//!     shifts every later name. Code that must find a specific disk matches
+//!     on what the disk carries: a filesystem UUID or GPT PARTUUID
+//!     ([`PartitionMetadata`], [`find_by_fs_uuid`], [`find_by_partuuid`])
+//!     or the hardware identity ([`DiskIdentity`]: controller PCI address,
+//!     model/serial, namespace EUI64/NGUID/UUID).
 
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -36,6 +43,20 @@ pub enum BlockIoError {
     DriverError,
     /// Device was removed / not bound.
     DeviceRemoved,
+    /// Write refused: the device is read-only under the active
+    /// [`crate::disk_policy`] (`narf.disks=boot-only|root-ro|root-rw`).
+    ReadOnly,
+}
+
+/// Write-cache capabilities of a block device.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockCaps {
+    /// Completed writes may sit in a volatile cache until
+    /// [`BlockDeviceSync::flush`]; `false` = write-through (flush is a no-op).
+    pub volatile_cache: bool,
+    /// [`BlockDeviceSync::write_fua`] is native (one command); `false` =
+    /// emulated as write + flush.
+    pub fua: bool,
 }
 
 /// Synchronous block-device interface usable behind `dyn`.
@@ -48,6 +69,38 @@ pub trait BlockDeviceSync: Send + Sync {
     fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8]) -> Result<(), BlockIoError>;
     /// Write `n_blocks` LBAs starting at `lba` from `data`.
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError>;
+    /// True when every [`Self::write`] would currently be refused (e.g. the
+    /// device is read-only under [`crate::disk_policy`]). Filesystems consult
+    /// it at mount time so a read-only device is mounted without any of the
+    /// metadata repairs a writable mount performs. Wrappers must forward it.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    /// Make every write that has completed so far durable: drain the
+    /// device's volatile write cache (Linux `REQ_PREFLUSH` /
+    /// `blkdev_issue_flush`; NVMe Flush, ATA FLUSH CACHE). Returns only once
+    /// the device has reported the flush complete. The default is for
+    /// write-through devices, where a completed write is already durable.
+    /// Wrappers must forward it.
+    fn flush(&self) -> Result<(), BlockIoError> {
+        Ok(())
+    }
+    /// Write-cache capabilities (Linux `blk_queue_write_cache(q, wc, fua)`).
+    /// The default describes a write-through device without native FUA.
+    /// Wrappers must forward it.
+    fn capabilities(&self) -> BlockCaps {
+        BlockCaps::default()
+    }
+    /// Write with Force Unit Access (Linux `REQ_FUA`): the data is durable
+    /// when this returns, whatever the device's write cache does. It does
+    /// NOT order earlier writes — issue [`Self::flush`] first for that
+    /// (btrfs `write_all_supers`: flush, then the superblock FUA). The
+    /// default emulates FUA with a write followed by a flush, as the block
+    /// layer does for devices without native FUA.
+    fn write_fua(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
+        self.write(lba, n_blocks, data)?;
+        self.flush()
+    }
 }
 
 /// Optional per-partition metadata attached to a registered block
@@ -82,11 +135,168 @@ impl PartitionMetadata {
     }
 }
 
+/// Hardware identity of a disk, independent of its registry name.
+///
+/// Mirrors what Linux keeps per NVMe namespace head (`nvme_ns_head.ids`)
+/// plus the controller identity udev's `60-persistent-storage.rules` reads
+/// (`model`, `serial`, the PCI path). Partitions carry their disk's identity.
+/// Fields a transport does not provide stay empty / `None`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiskIdentity {
+    /// Transport family (`"nvme"`, ...), the by-id prefix.
+    pub transport: &'static str,
+    /// Controller location, e.g. the PCI address `"0000:07:00.0"`.
+    pub bus_path: String,
+    /// Controller name (`"nvme1"`); like the block name, not an identity.
+    pub controller: String,
+    /// Model number, trimmed.
+    pub model: String,
+    /// Serial number, trimmed.
+    pub serial: String,
+    /// Firmware revision, trimmed.
+    pub firmware: String,
+    /// PCI vendor id of the controller (0 when unknown).
+    pub vendor_id: u16,
+    /// NVMe namespace id (0 for non-NVMe transports).
+    pub nsid: u32,
+    /// IEEE EUI-64 (NVMe Identify Namespace / NIDT 1).
+    pub eui64: Option<[u8; 8]>,
+    /// Namespace globally unique identifier (NIDT 2).
+    pub nguid: Option<[u8; 16]>,
+    /// Namespace UUID (NIDT 3).
+    pub uuid: Option<[u8; 16]>,
+}
+
+fn push_hex(out: &mut String, bytes: &[u8]) {
+    use core::fmt::Write as _;
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+}
+
+/// Canonical 8-4-4-4-12 lowercase form of a 16-byte UUID, as Linux `%pU`.
+pub fn format_uuid_bytes(u: &[u8; 16]) -> String {
+    let mut out = String::new();
+    for (i, range) in [0..4, 4..6, 6..8, 8..10, 10..16].into_iter().enumerate() {
+        if i > 0 {
+            out.push('-');
+        }
+        push_hex(&mut out, &u[range]);
+    }
+    out
+}
+
+/// udev's `util_replace_whitespace` + `util_replace_chars`: trim, collapse
+/// each whitespace run to one `_`, and replace anything outside udev's
+/// allowed set with `_`.
+fn udev_safe(s: &str) -> String {
+    let mut out = String::new();
+    let mut gap = false;
+    for c in s.trim().chars() {
+        if c.is_whitespace() {
+            gap = true;
+            continue;
+        }
+        if gap {
+            out.push('_');
+            gap = false;
+        }
+        let ok = c.is_ascii_alphanumeric() || "#+-.:=@_".contains(c);
+        out.push(if ok { c } else { '_' });
+    }
+    out
+}
+
+impl DiskIdentity {
+    /// Linux `/sys/block/nvme*n*/wwid` (`wwid_show` in
+    /// `drivers/nvme/host/core.c`): `uuid.<uuid>`, else `eui.<nguid>`, else
+    /// `eui.<eui64>`, else the vendor/serial/model/nsid fallback.
+    pub fn wwid(&self) -> String {
+        use core::fmt::Write as _;
+        let mut out = String::new();
+        if let Some(u) = self.uuid {
+            out.push_str("uuid.");
+            out.push_str(&format_uuid_bytes(&u));
+        } else if let Some(g) = self.nguid {
+            out.push_str("eui.");
+            push_hex(&mut out, &g);
+        } else if let Some(e) = self.eui64 {
+            out.push_str("eui.");
+            push_hex(&mut out, &e);
+        } else {
+            let _ = write!(
+                out,
+                "nvme.{:04x}-{}-{}-{:08x}",
+                self.vendor_id,
+                udev_safe(&self.serial),
+                udev_safe(&self.model),
+                self.nsid
+            );
+        }
+        out
+    }
+
+    /// `/dev/disk/by-id` names for the whole disk, as udev's
+    /// `60-persistent-storage.rules` builds them for NVMe:
+    /// `nvme-<model>_<serial>`, `nvme-<model>_<serial>_<nsid>` and
+    /// `nvme-<wwid>`. Partitions append `-part<N>`. Empty when the
+    /// transport has no model/serial.
+    pub fn by_id_names(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.model.is_empty() && self.serial.is_empty() {
+            return out;
+        }
+        let t = if self.transport.is_empty() {
+            "disk"
+        } else {
+            self.transport
+        };
+        let base = alloc::format!("{t}-{}_{}", udev_safe(&self.model), udev_safe(&self.serial));
+        if self.nsid != 0 {
+            out.push(alloc::format!("{base}_{}", self.nsid));
+        }
+        out.push(base);
+        if self.nsid != 0 {
+            out.push(alloc::format!("{t}-{}", self.wwid()));
+        }
+        out
+    }
+
+    /// `/dev/disk/by-path` name: `pci-<bdf>-nvme-<nsid>` (udev
+    /// `path_id`). `None` without a bus path.
+    pub fn by_path_name(&self) -> Option<String> {
+        if self.bus_path.is_empty() {
+            return None;
+        }
+        Some(if self.nsid != 0 {
+            alloc::format!("pci-{}-{}-{}", self.bus_path, self.transport, self.nsid)
+        } else {
+            alloc::format!("pci-{}", self.bus_path)
+        })
+    }
+}
+
 /// One registered block device.
 #[derive(Clone)]
 pub struct RegisteredBlockDevice {
     pub name: &'static str,
+    /// Registry name of the whole disk, for a partition; `None` for a disk.
+    pub parent: Option<&'static str>,
+    /// Partition number (the `N` of `p<N>`), for a partition.
+    pub partno: Option<u32>,
+    /// Hardware identity of the disk (shared by its partitions), when the
+    /// driver supplied one. See [`DiskIdentity`]; the name is not identity.
+    pub identity: Option<Arc<DiskIdentity>>,
+    /// The registered device behind its [`crate::disk_policy::PolicyGuard`].
+    /// Every consumer of the registry writes through the guard.
     pub dev: Arc<dyn BlockDeviceSync>,
+    /// Physical-disk identity shared by a disk and its partitions; the unit
+    /// [`crate::disk_policy::trust_boot_medium`] trusts.
+    pub disk: crate::disk_policy::DiskId,
+    /// Identity of this registration (its guard), never reused: the unit
+    /// [`crate::disk_policy::designate_root`] designates. A device
+    /// re-registered under the same name gets a new one.
+    pub dev_id: crate::disk_policy::DevId,
     /// GPT metadata, if this entry is a partition. `None` for
     /// whole-disk parents and for legacy-MBR partitions.
     pub partition: Option<PartitionMetadata>,
@@ -96,6 +306,10 @@ impl core::fmt::Debug for RegisteredBlockDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RegisteredBlockDevice")
             .field("name", &self.name)
+            .field("disk", &self.disk)
+            .field("dev_id", &self.dev_id)
+            .field("parent", &self.parent)
+            .field("identity", &self.identity)
             .field("partition", &self.partition)
             .finish_non_exhaustive()
     }
@@ -119,19 +333,80 @@ pub fn register_block_device_with_meta(
     dev: Arc<dyn BlockDeviceSync>,
     partition: Option<PartitionMetadata>,
 ) {
-    {
+    register_entry(name, None, dev, partition, None);
+}
+
+/// Register a whole disk together with its hardware identity. Partitions
+/// later registered under it ([`register_partition_device`]) inherit the
+/// identity. The device is wrapped in the disk-policy guard like any other.
+pub fn register_block_device_with_identity(
+    name: &'static str,
+    dev: Arc<dyn BlockDeviceSync>,
+    identity: DiskIdentity,
+) {
+    register_entry(name, None, dev, None, Some(Arc::new(identity)));
+}
+
+/// Register partition `name` of the already-registered disk `parent_name`.
+/// The partition shares the parent's [`crate::disk_policy::DiskId`], so the
+/// write policy treats a disk and its partitions as one medium. An
+/// unregistered parent gets a fresh identity (conservative: untrusted).
+pub fn register_partition_device(
+    name: &'static str,
+    parent_name: &str,
+    dev: Arc<dyn BlockDeviceSync>,
+    partition: Option<PartitionMetadata>,
+) {
+    register_entry(name, Some(parent_name), dev, partition, None);
+}
+
+/// `N` of a `<parent>p<N>` (or `<parent><N>`, as `sda1`) partition name.
+fn partno_from_name(name: &str, parent: &str) -> Option<u32> {
+    let rest = name.strip_prefix(parent)?;
+    let rest = rest.strip_prefix('p').unwrap_or(rest);
+    rest.parse().ok()
+}
+
+fn register_entry(
+    name: &'static str,
+    parent_name: Option<&str>,
+    dev: Arc<dyn BlockDeviceSync>,
+    partition: Option<PartitionMetadata>,
+    identity: Option<Arc<DiskIdentity>>,
+) {
+    let (entry, replaced) = {
         let mut g = REGISTRY.lock();
+        let parent_entry = parent_name.and_then(|parent| g.iter().find(|e| e.name == parent));
+        let disk = parent_entry
+            .map(|e| e.disk)
+            .unwrap_or_else(crate::disk_policy::new_disk_id);
+        let parent = parent_entry.map(|e| e.name);
+        let identity = identity.or_else(|| parent_entry.and_then(|e| e.identity.clone()));
+        let partno = parent_name.and_then(|p| partno_from_name(name, p));
+        // Every entry — disk or partition, any transport — is wrapped in the
+        // `narf.disks` guard; nothing in the registry is reachable unguarded.
+        let guard = crate::disk_policy::PolicyGuard::new(name, disk, dev);
+        let dev_id = guard.dev_id();
         let entry = RegisteredBlockDevice {
             name,
-            dev,
+            parent,
+            partno,
+            identity,
+            dev: Arc::new(guard) as Arc<dyn BlockDeviceSync>,
+            disk,
+            dev_id,
             partition,
         };
-        if let Some(pos) = g.iter().position(|e| e.name == name) {
-            g[pos] = entry;
+        let replaced = if let Some(pos) = g.iter().position(|e| e.name == name) {
+            Some(core::mem::replace(&mut g[pos], entry.clone()).dev_id)
         } else {
-            g.push(entry);
-        }
-    }
+            g.push(entry.clone());
+            None
+        };
+        (entry, replaced)
+    };
+    // Outside the registry lock: the hook may read the device.
+    crate::disk_policy::note_registered(&entry, replaced);
     // Wave G: pair every registered device with a default
     // `IoScheduler` slot (boxed `DeadlineScheduler`). Reservation is
     // idempotent on `name` — a second `register_block_device` for
@@ -145,6 +420,69 @@ pub fn register_block_device_with_meta(
 /// Snapshot of currently-registered block devices.
 pub fn block_devices() -> Vec<RegisteredBlockDevice> {
     REGISTRY.lock().clone()
+}
+
+/// Disk identity of the registered device `name`.
+pub fn disk_of(name: &str) -> Option<crate::disk_policy::DiskId> {
+    REGISTRY
+        .lock()
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.disk)
+}
+
+/// Hardware identity of the registered device `name` (a partition reports
+/// its disk's identity).
+pub fn identity_of(name: &str) -> Option<Arc<DiskIdentity>> {
+    REGISTRY
+        .lock()
+        .iter()
+        .find(|entry| entry.name == name)
+        .and_then(|entry| entry.identity.clone())
+}
+
+/// The registered device whose filesystem UUID is `uuid` (case-insensitive),
+/// whatever its name. `None` when no entry, or more than one, carries it:
+/// a duplicated UUID (a cloned disk) is ambiguous and must not be guessed.
+/// (Members of one multi-device btrfs share an fsid; enumerate
+/// [`block_devices`] to collect them.)
+pub fn find_by_fs_uuid(uuid: &str) -> Option<RegisteredBlockDevice> {
+    unique_match(|e| {
+        e.partition
+            .as_ref()
+            .is_some_and(|p| !p.fs_uuid.is_empty() && p.fs_uuid.eq_ignore_ascii_case(uuid))
+    })
+}
+
+/// The registered partition whose GPT PARTUUID is `partuuid`
+/// (case-insensitive). `None` when absent or ambiguous.
+pub fn find_by_partuuid(partuuid: &str) -> Option<RegisteredBlockDevice> {
+    unique_match(|e| {
+        e.partition
+            .as_ref()
+            .is_some_and(|p| !p.partuuid.is_empty() && p.partuuid.eq_ignore_ascii_case(partuuid))
+    })
+}
+
+/// The registered whole disk with this hardware identity triple
+/// (controller bus path + namespace id), e.g. `("0000:07:00.0", 1)`.
+pub fn find_disk_by_bus_path(bus_path: &str, nsid: u32) -> Option<RegisteredBlockDevice> {
+    unique_match(|e| {
+        e.parent.is_none()
+            && e.identity
+                .as_ref()
+                .is_some_and(|i| i.bus_path == bus_path && i.nsid == nsid)
+    })
+}
+
+fn unique_match(pred: impl Fn(&RegisteredBlockDevice) -> bool) -> Option<RegisteredBlockDevice> {
+    let g = REGISTRY.lock();
+    let mut it = g.iter().filter(|e| pred(e));
+    let first = it.next()?.clone();
+    if it.next().is_some() {
+        return None;
+    }
+    Some(first)
 }
 
 /// Number of registered block devices.
@@ -176,9 +514,14 @@ pub fn find_block_device_indexed(name: &str) -> Option<(usize, Arc<dyn BlockDevi
 /// Unregister a block device by name.  No-op if the name is not
 /// present.  Used by hot-unplug paths and by test teardown.
 pub fn unregister_block_device(name: &str) {
-    let mut g = REGISTRY.lock();
-    if let Some(pos) = g.iter().position(|e| e.name == name) {
-        g.swap_remove(pos);
+    let removed = {
+        let mut g = REGISTRY.lock();
+        g.iter()
+            .position(|e| e.name == name)
+            .map(|pos| g.swap_remove(pos).dev_id)
+    };
+    if let Some(dev_id) = removed {
+        crate::disk_policy::note_unregistered(dev_id);
     }
 }
 
@@ -260,13 +603,19 @@ impl BlockDevice for SyncBlock {
     fn capacity_blocks(&self) -> u64 {
         self.0.capacity()
     }
+    fn is_read_only(&self) -> bool {
+        self.0.is_read_only()
+    }
     fn supports(&self, f: BlockFeature) -> bool {
         // Sync trait doesn't expose feature flags. Mirror what
         // RamBlockDevice exports (Flush + WriteZeroes are no-ops on
         // a sync transport, fine to advertise; the FS layer relies
         // on the call returning quickly more than on a hardware
         // doorbell).
-        matches!(f, BlockFeature::Flush | BlockFeature::WriteZeroes)
+        matches!(
+            f,
+            BlockFeature::Flush | BlockFeature::Fua | BlockFeature::WriteZeroes
+        )
     }
 
     fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion> + Send {
@@ -280,10 +629,28 @@ impl BlockDevice for SyncBlock {
             }
         }
     }
-    async fn flush(&self) {}
+    /// Forwards to [`BlockDeviceSync::flush`]; an error is dropped here
+    /// (the trait returns `()`) — use [`BlockDevice::flush_result`].
+    async fn flush(&self) {
+        let _ = self.0.flush();
+    }
+    fn flush_result(&self) -> impl Future<Output = Result<(), BlockError>> + Send {
+        let r = self.0.flush().map_err(map_io_err);
+        async move { r }
+    }
     async fn discard(&self, _r: LbaRange) {}
     async fn cancel(&self, _t: u64) -> CancelResult {
         CancelResult::NotFound
+    }
+}
+
+fn map_io_err(e: BlockIoError) -> BlockError {
+    match e {
+        BlockIoError::OutOfRange => BlockError::InvalidRange,
+        BlockIoError::BufferTooSmall => BlockError::InvalidRange,
+        BlockIoError::DeviceRemoved => BlockError::DeviceRemoved,
+        BlockIoError::DriverError => BlockError::IOError,
+        BlockIoError::ReadOnly => BlockError::PermissionDenied,
     }
 }
 
@@ -309,15 +676,13 @@ impl SyncBlock {
         // exclusive for the duration of this synchronous IO.
         // SAFETY: Valid memory or trusted environment
         let slice = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), total) };
-        let map_err = |e: BlockIoError| match e {
-            BlockIoError::OutOfRange => BlockError::InvalidRange,
-            BlockIoError::BufferTooSmall => BlockError::InvalidRange,
-            BlockIoError::DeviceRemoved => BlockError::DeviceRemoved,
-            BlockIoError::DriverError => BlockError::IOError,
-        };
+        let map_err = map_io_err;
         match req.op {
             BlockOp::Read => self.0.read(req.lba, blocks, slice).map_err(map_err),
-            BlockOp::Write { fua: _ } => self.0.write(req.lba, blocks, slice).map_err(map_err),
+            BlockOp::Write { fua: false } => self.0.write(req.lba, blocks, slice).map_err(map_err),
+            BlockOp::Write { fua: true } => {
+                self.0.write_fua(req.lba, blocks, slice).map_err(map_err)
+            }
             BlockOp::WriteZeroes => {
                 for b in slice.iter_mut() {
                     *b = 0;

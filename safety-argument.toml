@@ -1536,3 +1536,32 @@ argument = "The executor's live-mm registry retains only an Arc clone of the add
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The registry is scheduler-private metadata and carries no authority beyond the existing address-space reference. It neither performs a kernel-side data access nor bypasses capability checks or domain tags; callers continue through their existing authorization and uaccess paths."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame/ edit only gates two existing Late initcalls (btrfs-disk-smoke, btrfs-write-smoke) behind the narf.btrfs_smoke boot argument, which xtask passes solely when it serves its own disposable btrfs image. It removes an unconditional write to whatever btrfs volume a bare-metal host exposes, and adds no authority, memory access, domain transition or TCB member."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame/ edit only resolves the narf.disks= policy before PCIe storage drivers bind and makes the efi-system-partition-mount and mnt-mount-ext2 Late initcalls skip block devices that narf_block::disk_policy does not allow to be auto-mounted (under narf.disks=boot-only: every disk except the one identified as the boot medium). It only narrows which existing mounts run; it adds no authority, memory access, domain transition, trap-path code or TCB member, and the default (argument absent) behaviour is unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame/ edit makes the root-mount-auto Late initcall stop, with a framed console banner naming the failure (and the btrfs write-safety gate's last refusal), instead of falling back to the initramfs or a registry walk when an explicit root= fails under narf.disks=root-ro or root-rw. It only removes a fallback mount under the two root disk policies; it adds no authority, memory access, domain transition, trap-path code or TCB member, and the behaviour under narf.disks=all/boot-only (and with the argument absent) is unchanged. Which device may be written stays decided by narf_block::disk_policy outside the TCB."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame/ edit registers one Late initcall (btrfs-rootrw-interop) that is inert unless the narf.rootrw_interop= test argument is present; it then calls narf_drivers_fs_btrfs::interop::run, which performs ordinary VFS file operations on the filesystem already mounted at / and only when narf.disks=root-rw has a designated, writable btrfs root. It adds no authority, memory access, domain transition, trap-path code or TCB member; every write still passes the block-layer disk policy guard."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame/ edit only chooses the environment handed to the distro PID 1 that boot-init already spawns: under narf.disks=root-ro or root-rw (an installed system booted from its own root) it omits container=narf, so systemd runs in host mode instead of container mode. The argv, root, pid, address space and loader call are unchanged. It adds no authority, memory access, domain transition, trap-path code or TCB member, and every other systemd_pid1 boot keeps container=narf."
+argument = "The frame/ edit registers one Late initcall (root-mount-settled), right after root-mount-auto, that only stores an atomic flag in narf_block::disk_policy recording that boot-time root mounting finished; the boot log waits on it under narf.disks=root-ro/root-rw before probing its USB stick. It adds no authority, memory access, domain transition, trap-path code or TCB member, and grants no write permission."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame/ edit makes the serial RX interrupt handler stop draining the UART when the console byte ring is full (narf_input::byte_ring_has_room), recording the throttle so the console reader refills the ring later. It only stops reading device input early; it adds no authority, memory access, domain transition or TCB member, and the handler's bounded 16-byte loop is unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame/ edit (bare_main.rs) replaces the ACPI power-button platform-event subscriber's direct narf_power::system::power_off() call with narf_power::button::report_power_button(), which reports KEY_POWER on an evdev input device and, when no reader has that device open, only records an orderly power-off request for a task-context worker in narf-power. The subscriber no longer powers the machine off from under the SCI subscriber spinlock, so the filesystem sync and device shutdown hooks run from task context. It adds no authority, memory access, domain transition, trap-path code or TCB member; the panic-time CPU stop lives in interrupts/ and console/, outside the TCB."

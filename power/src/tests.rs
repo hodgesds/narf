@@ -214,6 +214,8 @@ fn smoke_power_suspend_phase_progression() -> TestResult {
     use crate::{suspend, SuspendError, SuspendPhase};
     use narf_capabilities::{Cap, Invoke};
 
+    // Isolate from the boot's real devices: NVMe refuses system suspend.
+    crate::device_pm::__reset_for_test();
     suspend::__test_reset();
     let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
 
@@ -428,6 +430,8 @@ fn smoke_s3_suspend_unarmed_walks_phases() -> TestResult {
     use crate::{suspend, Power, SuspendPhase};
     use narf_capabilities::{Cap, Invoke};
 
+    // Isolate from the boot's real devices: NVMe refuses system suspend.
+    crate::device_pm::__reset_for_test();
     suspend::__test_reset();
     let cap: Cap<Power, Invoke> = Cap::bootstrap();
     match suspend::suspend(&cap) {
@@ -2933,3 +2937,173 @@ fn suspend_busy_driver_aborts_and_rolls_back() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("power/suspend", suspend_busy_driver_aborts_and_rolls_back);
+
+// ── Shutdown ordering: filesystem sync before device shutdown ──────────
+
+static TRANSITION_LOG: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<&'static str>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+fn transition_log_sync() {
+    TRANSITION_LOG.lock().push("sync");
+}
+fn transition_log_nvme() {
+    TRANSITION_LOG.lock().push("nvme-flush+shn");
+}
+fn transition_log_other() {
+    TRANSITION_LOG.lock().push("other-device");
+}
+
+/// Every reboot / power-off / halt runs the pre-shutdown filesystem sync
+/// BEFORE any device shutdown hook (NVMe Flush + CC.SHN): a commit issued
+/// after CC.SHN would never reach the media. Hooks still run in reverse
+/// registration order, and the orderly path (already synced) skips only the
+/// sync.
+fn smoke_power_shutdown_syncs_before_device_hooks() -> TestResult {
+    use crate::system::{
+        __swap_pre_shutdown_sync_for_test, __swap_shutdown_hooks_for_test, before_transition,
+        SyncStep,
+    };
+    let saved_sync = __swap_pre_shutdown_sync_for_test(Some(transition_log_sync));
+    let saved_hooks = __swap_shutdown_hooks_for_test(alloc::vec![
+        ("nvme", transition_log_nvme as crate::system::ShutdownHook),
+        ("other", transition_log_other as crate::system::ShutdownHook),
+    ]);
+    TRANSITION_LOG.lock().clear();
+    before_transition(SyncStep::Sync);
+    let full = TRANSITION_LOG.lock().clone();
+    TRANSITION_LOG.lock().clear();
+    before_transition(SyncStep::AlreadyDone);
+    let synced = TRANSITION_LOG.lock().clone();
+    __swap_shutdown_hooks_for_test(saved_hooks);
+    __swap_pre_shutdown_sync_for_test(saved_sync);
+    if full != ["sync", "other-device", "nvme-flush+shn"] {
+        return TestResult::Fail("sync must run first, then hooks in reverse registration order");
+    }
+    if synced != ["other-device", "nvme-flush+shn"] {
+        return TestResult::Fail("an already-synced transition must still run every hook");
+    }
+    // The production sync step is installed (userspace wait_init) in a
+    // kernel that has the syscall layer, which every kernel-test image does.
+    if saved_sync.is_none() {
+        return TestResult::Fail("no pre-shutdown sync installed: reboot would skip the fs sync");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/shutdown",
+    smoke_power_shutdown_syncs_before_device_hooks
+);
+
+/// `orderly_poweroff` only records the request and wakes the worker — it is
+/// callable from interrupt context — the first reason wins, and a later
+/// request may only shorten the sync budget.
+fn smoke_power_orderly_request_is_irq_safe() -> TestResult {
+    use crate::orderly::{
+        __hold_worker_for_test, __reset_for_test, orderly_poweroff, pending, sync_budget_ms,
+        OrderlyReason, DEFAULT_SYNC_BUDGET_MS,
+    };
+    __hold_worker_for_test(true);
+    __reset_for_test();
+    let before = pending();
+    narf_lib::context::enter_irq();
+    let first = orderly_poweroff(OrderlyReason::PowerButton, None);
+    narf_lib::context::exit_irq();
+    let second = orderly_poweroff(OrderlyReason::HwProtection, Some(5_000));
+    let third = orderly_poweroff(OrderlyReason::HwProtection, Some(9_000));
+    let reason = pending();
+    let budget = sync_budget_ms();
+    __reset_for_test();
+    let default_budget = sync_budget_ms();
+    let cleared = pending();
+    __hold_worker_for_test(false);
+    if before.is_some() {
+        return TestResult::Fail("an orderly power-off was already pending");
+    }
+    if !first || second || third {
+        return TestResult::Fail("only the first request may report that it made the request");
+    }
+    if reason != Some(OrderlyReason::PowerButton) {
+        return TestResult::Fail("the first request's reason must win");
+    }
+    if budget != 5_000 || default_budget != DEFAULT_SYNC_BUDGET_MS || cleared.is_some() {
+        return TestResult::Fail("sync budget must only shorten and default when unset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/shutdown", smoke_power_orderly_request_is_irq_safe);
+
+/// ACPI power button, as Linux `acpi_button_notify`: with a reader open on
+/// the "Power Button" device the press is `KEY_POWER` 1, SYN, `KEY_POWER` 0,
+/// SYN for userspace (logind) and nothing else happens; with no reader the
+/// kernel requests the orderly power-off instead and queues no events.
+fn smoke_power_button_reports_key_power_or_falls_back() -> TestResult {
+    use crate::button::{power_button_caps, report_press_on, PressOutcome, KEY_POWER};
+    use crate::orderly::{__hold_worker_for_test, __reset_for_test, pending, OrderlyReason};
+    use narf_input::evdev::{EventType, ROUTER};
+
+    __hold_worker_for_test(true);
+    __reset_for_test();
+    let (id, node) = ROUTER.register_device(power_button_caps());
+    if !node.caps.has(EventType::Key, KEY_POWER) {
+        ROUTER.unregister_device(id);
+        __hold_worker_for_test(false);
+        return TestResult::Fail("power button device does not declare KEY_POWER");
+    }
+
+    // A listener (logind) has the device open.
+    let reader = ROUTER.open_reader(id);
+    let delivered = report_press_on(&node);
+    let mut events = alloc::vec::Vec::new();
+    if let Some(r) = reader.as_ref() {
+        while let Some(ev) = r.poll_event() {
+            events.push((ev.type_, ev.code, ev.value));
+        }
+    }
+    let pending_with_reader = pending();
+    drop(reader);
+    let readers_after_close = node.reader_count();
+
+    // Nobody listens.
+    let fallback = report_press_on(&node);
+    let queued_without_reader = node.reader_count() == 0 && {
+        let r = ROUTER.open_reader(id);
+        let any = r.as_ref().is_some_and(|r| r.poll_event().is_some());
+        drop(r);
+        any
+    };
+    let pending_without_reader = pending();
+
+    __reset_for_test();
+    __hold_worker_for_test(false);
+    ROUTER.unregister_device(id);
+
+    if delivered != (PressOutcome::Delivered { readers: 1 }) {
+        return TestResult::Fail("with a reader the press must be delivered");
+    }
+    let want = [
+        (EventType::Key, KEY_POWER, 1),
+        (EventType::Syn, 0, 0),
+        (EventType::Key, KEY_POWER, 0),
+        (EventType::Syn, 0, 0),
+    ];
+    if events != want {
+        return TestResult::Fail("press must be KEY_POWER 1, SYN, KEY_POWER 0, SYN");
+    }
+    if pending_with_reader.is_some() {
+        return TestResult::Fail("a delivered press must not power off");
+    }
+    if readers_after_close != 0 {
+        return TestResult::Fail("closing the reader did not drop the reader count");
+    }
+    if fallback != (PressOutcome::OrderlyPowerOff { first: true }) || queued_without_reader {
+        return TestResult::Fail("with no reader the press must request the orderly power-off");
+    }
+    if pending_without_reader != Some(OrderlyReason::PowerButton) {
+        return TestResult::Fail("orderly power-off request missing its reason");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/shutdown",
+    smoke_power_button_reports_key_power_or_falls_back
+);

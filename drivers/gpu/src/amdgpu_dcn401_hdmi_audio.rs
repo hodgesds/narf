@@ -218,7 +218,7 @@ const ACR_36: [AcrRow; 14] = [
 /// Linux get_audio_clock_info: an exact table match, else HDMI's "Other"
 /// column (N 4096/6272/6144, CTS = pixel clock in kHz). Returns
 /// [N32, CTS32, N44, CTS44, N48, CTS48].
-pub(in crate::amdgpu_dcn401_otg) fn acr(depth: dmub::TmdsDepth, pixel_khz: u32) -> [u32; 6] {
+pub(crate) fn acr(depth: dmub::TmdsDepth, pixel_khz: u32) -> [u32; 6] {
     let table: &[AcrRow] = match depth {
         dmub::TmdsDepth::Bpc12 => &ACR_36,
         _ => &ACR_24,
@@ -231,7 +231,7 @@ pub(in crate::amdgpu_dcn401_otg) fn acr(depth: dmub::TmdsDepth, pixel_khz: u32) 
 }
 /// dcn30_afmt speakers_to_channels: CEA channel enables from speaker bits
 /// (FL_FR, LFE, FC, RL_RR, RC, FLC_FRC, RLC_RRC).
-pub(in crate::amdgpu_dcn401_otg) fn channels(speakers: u8) -> u8 {
+pub(crate) fn channels(speakers: u8) -> u8 {
     let s = |bit: u8| speakers >> bit & 1;
     let (fl_fr, lfe, fc, rl_rr, rc, flc_frc, rlc_rrc) = (s(0), s(1), s(2), s(3), s(4), s(5), s(6));
     // Rear left/right present: RC moves to channel 7, else to channel 5.
@@ -307,7 +307,7 @@ fn stream_rates(
 }
 /// dce_aud_az_configure's per-format descriptor words and HBR capability,
 /// for an HDMI stream at `depth` or (None) a DP SST one.
-pub(in crate::amdgpu_dcn401_otg) fn descriptors(
+pub(crate) fn descriptors(
     info: &AudioInfo,
     t: &crate::amdgpu_dml::Timing,
     depth: Option<dmub::TmdsDepth>,

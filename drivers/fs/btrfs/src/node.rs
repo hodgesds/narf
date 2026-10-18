@@ -122,7 +122,12 @@ fn glibc_to_kernel_dev(dev: u64) -> u64 {
 /// propagates. Bounded so a persistently-failing op can't loop forever.
 macro_rules! autogrow {
     ($vol:expr, $op:expr) => {{
-        if !$vol.supports_writes() {
+        if !$vol.admits_writes() {
+            return Err(FsError::ReadOnly);
+        }
+        // One mutating operation at a time, from its first read to staging.
+        let _op = $vol.op_lock().lock().await;
+        if !$vol.admits_writes() {
             return Err(FsError::ReadOnly);
         }
         let mut r = $op;
@@ -146,7 +151,12 @@ pub struct BtrfsNode<B: BlockDevice + 'static> {
     tree_root: Option<u64>,
     tree_id: Option<u64>,
     ino: u64,
-    inode: InodeItem,
+    /// The inode as last looked up or changed through this node (chmod,
+    /// chown and utimens refresh it so `stat` follows).
+    inode: narf_lib::sync::IrqSafeSpinLock<InodeItem>,
+    /// The file size as of this node's latest write: `inode` is the item as
+    /// looked up, and `stat` has no tree access.
+    live_size: core::sync::atomic::AtomicU64,
 }
 
 impl<B: BlockDevice + 'static> BtrfsNode<B> {
@@ -161,7 +171,8 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             tree_root,
             tree_id: None,
             ino,
-            inode,
+            live_size: core::sync::atomic::AtomicU64::new(inode.size),
+            inode: narf_lib::sync::IrqSafeSpinLock::new(inode),
         })
     }
 
@@ -177,8 +188,29 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             tree_root: Some(tree_root),
             tree_id: Some(tree_id),
             ino,
-            inode,
+            live_size: core::sync::atomic::AtomicU64::new(inode.size),
+            inode: narf_lib::sync::IrqSafeSpinLock::new(inode),
         })
+    }
+
+    /// Snapshot of the cached inode.
+    fn inode(&self) -> InodeItem {
+        *self.inode.lock()
+    }
+
+    /// Change mode / owners / timestamps of this inode and refresh the cache
+    /// (`btrfs_setattr` -> `btrfs_update_inode`).
+    async fn change_attrs(&self, change: crate::write::AttrChange) -> Result<(), FsError> {
+        if self.tree_root.is_some() {
+            return Err(FsError::ReadOnly);
+        }
+        let vol = self.volume()?;
+        let updated = autogrow!(
+            vol,
+            crate::write::set_inode_attrs(&vol, self.ino, change).await
+        )?;
+        *self.inode.lock() = updated;
+        Ok(())
     }
 
     fn volume(&self) -> Result<Arc<BtrfsVolume<B>>, FsError> {
@@ -191,9 +223,9 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
     /// directory's `st_mtim` to the nanosecond.
     fn attrs(&self) -> narf_filesystem::InodeAttrs {
         narf_filesystem::InodeAttrs {
-            atime_ns: self.inode.atime_ns(),
-            ctime_ns: self.inode.ctime_ns(),
-            mtime_ns: self.inode.mtime_ns(),
+            atime_ns: self.inode().atime_ns(),
+            ctime_ns: self.inode().ctime_ns(),
+            mtime_ns: self.inode().mtime_ns(),
             ..Default::default()
         }
     }
@@ -267,7 +299,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                     // Flags operate only on an explicitly mounted subvolume root.
                     if self.tree_root.is_some()
                         || self.ino != format::FIRST_FREE_OBJECTID
-                        || self.inode.file_type() != FileType::Dir
+                        || self.inode().file_type() != FileType::Dir
                     {
                         return Err(FsError::InvalidData);
                     }
@@ -284,7 +316,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                 BTRFS_IOC_SUBVOL_SETFLAGS => {
                     if self.tree_root.is_some()
                         || self.ino != format::FIRST_FREE_OBJECTID
-                        || self.inode.file_type() != FileType::Dir
+                        || self.inode().file_type() != FileType::Dir
                     {
                         return Err(FsError::InvalidData);
                     }
@@ -299,7 +331,10 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                     } else {
                         disk_flags &= !format::ROOT_SUBVOL_RDONLY;
                     }
-                    crate::write::set_subvol_flags(&vol, disk_flags).await?;
+                    {
+                        let _op = vol.op_lock().lock().await;
+                        crate::write::set_subvol_flags(&vol, disk_flags).await
+                    }?;
                     Ok(FsIoctlReply {
                         result: 0,
                         output: Vec::new(),
@@ -308,7 +343,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                 BTRFS_IOC_SUBVOL_CREATE | BTRFS_IOC_SUBVOL_CREATE_V2 => {
                     // Creation is relative to the directory fd, but only a
                     // directory in the explicitly mounted live tree is mutable.
-                    if self.tree_root.is_some() || self.inode.file_type() != FileType::Dir {
+                    if self.tree_root.is_some() || self.inode().file_type() != FileType::Dir {
                         return Err(FsError::ReadOnly);
                     }
                     let (name_offset, readonly, inherit) = if cmd == BTRFS_IOC_SUBVOL_CREATE_V2 {
@@ -351,7 +386,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                     })
                 }
                 BTRFS_IOC_SNAP_DESTROY | BTRFS_IOC_SNAP_DESTROY_V2 => {
-                    if self.tree_root.is_some() || self.inode.file_type() != FileType::Dir {
+                    if self.tree_root.is_some() || self.inode().file_type() != FileType::Dir {
                         return Err(FsError::ReadOnly);
                     }
                     let (name, subvolid) = if cmd == BTRFS_IOC_SNAP_DESTROY_V2 {
@@ -387,13 +422,16 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                     })
                 }
                 BTRFS_IOC_QUOTA_CTL => {
-                    if self.tree_root.is_some() || self.inode.file_type() != FileType::Dir {
+                    if self.tree_root.is_some() || self.inode().file_type() != FileType::Dir {
                         return Err(FsError::ReadOnly);
                     }
                     let command = u64::from_ne_bytes(input[0..8].try_into().unwrap());
                     match command {
                         1 => autogrow!(vol, crate::write::quota_enable(&vol).await)?,
-                        2 => crate::write::quota_disable(&vol).await?,
+                        2 => {
+                            let _op = vol.op_lock().lock().await;
+                            crate::write::quota_disable(&vol).await?
+                        }
                         4 => autogrow!(vol, crate::write::quota_enable_simple(&vol).await)?,
                         _ => return Err(FsError::InvalidData),
                     }
@@ -411,7 +449,10 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                     let create = u64::from_ne_bytes(input[0..8].try_into().unwrap());
                     let id = u64::from_ne_bytes(input[8..16].try_into().unwrap());
                     match create {
-                        0 => crate::write::qgroup_destroy_admin(&vol, id).await?,
+                        0 => {
+                            let _op = vol.op_lock().lock().await;
+                            crate::write::qgroup_destroy_admin(&vol, id).await?
+                        }
                         1 => autogrow!(vol, crate::write::qgroup_create_admin(&vol, id).await)?,
                         _ => return Err(FsError::InvalidData),
                     }
@@ -493,7 +534,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
         inherit: Option<crate::write::QgroupInherit>,
     ) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            if self.tree_root.is_some() || self.inode.file_type() != FileType::Dir {
+            if self.tree_root.is_some() || self.inode().file_type() != FileType::Dir {
                 return Err(FsError::ReadOnly);
             }
             let source = source
@@ -501,7 +542,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                 .and_then(|a| a.downcast_ref::<BtrfsNode<B>>())
                 .ok_or(FsError::CrossDevice)?;
             if source.ino != format::FIRST_FREE_OBJECTID
-                || source.inode.file_type() != FileType::Dir
+                || source.inode().file_type() != FileType::Dir
             {
                 return Err(FsError::InvalidData);
             }
@@ -624,7 +665,13 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
         Box::pin(async move {
             let vol = self.volume()?;
             let root = self.root(&vol);
-            crate::extent::read_file(&vol, root, self.ino, self.inode.size, offset, buf).await
+            // The size is re-read from the tree: this node's cached inode
+            // predates any write made through it (or through another open
+            // file of the same inode).
+            let size = vol.load_inode_in(root, self.ino).await?.size;
+            self.live_size
+                .store(size, core::sync::atomic::Ordering::Relaxed);
+            crate::extent::read_file(&vol, root, self.ino, size, offset, buf).await
         })
     }
 
@@ -639,10 +686,56 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
+            let written = autogrow!(
+                vol,
+                crate::write::cow_write_file(&vol, self.ino, &self.inode(), offset, buf).await
+            )?;
+            self.live_size.fetch_max(
+                offset.saturating_add(written as u64),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            Ok(written)
+        })
+    }
+
+    /// `ftruncate`/`O_TRUNC` (`btrfs_setattr` with `ATTR_SIZE`).
+    fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            if !self.inode().is_regular() {
+                return Err(FsError::Unsupported);
+            }
+            let vol = self.volume()?;
+            autogrow!(vol, crate::write::truncate_file(&vol, self.ino, len).await)?;
+            self.live_size
+                .store(len, core::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })
+    }
+
+    /// `fallocate(2)` (`btrfs_fallocate`).
+    fn fallocate<'a>(&'a self, mode: u32, offset: u64, len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            if !self.inode().is_regular() {
+                return Err(FsError::Unsupported);
+            }
+            let vol = self.volume()?;
             autogrow!(
                 vol,
-                crate::write::cow_write_file(&vol, self.ino, &self.inode, offset, buf).await
-            )
+                crate::write::fallocate_file(&vol, self.ino, mode, offset, len).await
+            )?;
+            if mode & crate::write::FALLOC_FL_KEEP_SIZE == 0 {
+                self.live_size.fetch_max(
+                    offset.saturating_add(len),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            Ok(())
         })
     }
 
@@ -655,20 +748,23 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     /// (The tree-log is only used to *replay* a crashed volume's log on mount,
     /// not to defer writes, so it plays no part here.)
     fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
-        Box::pin(async move { self.volume()?.sync_to_disk().await })
+        Box::pin(async move { self.volume()?.sync_to_disk_exclusive().await })
     }
 
     fn stat(&self) -> Stat {
         Stat {
-            size: self.inode.size,
-            blocks: self.inode.size.div_ceil(512),
+            size: self.live_size.load(core::sync::atomic::Ordering::Relaxed),
+            blocks: self
+                .live_size
+                .load(core::sync::atomic::Ordering::Relaxed)
+                .div_ceil(512),
             mode: Mode {
-                file_type: self.inode.file_type(),
-                perms: self.inode.perms() & 0o777,
+                file_type: self.inode().file_type(),
+                perms: self.inode().perms() & 0o777,
             },
             // The on-disk `btrfs_timespec`, not 0 (every btrfs file claimed
             // 1970). The exact value travels in `InodeAttrs::mtime_ns`.
-            mtime_cycles: narf_time::ns_to_cycles(self.inode.mtime_ns()),
+            mtime_cycles: narf_time::ns_to_cycles(self.inode().mtime_ns()),
         }
     }
 
@@ -681,7 +777,49 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     }
 
     fn owners(&self) -> (u32, u32) {
-        (self.inode.uid, self.inode.gid)
+        let inode = self.inode();
+        (inode.uid, inode.gid)
+    }
+
+    /// `chown`/`fchown` (`btrfs_setattr` with `ATTR_UID|ATTR_GID`): a
+    /// non-directory loses `S_ISUID`, and `S_ISGID` when group-executable
+    /// (`should_remove_suid`); ctime moves.
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        Box::pin(self.change_attrs(crate::write::AttrChange {
+            uid: Some(uid),
+            gid: Some(gid),
+            ..Default::default()
+        }))
+    }
+
+    /// `chmod`/`fchmod`: the permission and special bits; the file type in
+    /// `S_IFMT` never changes. ctime moves.
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        Box::pin(self.change_attrs(crate::write::AttrChange {
+            perms: Some(perms),
+            ..Default::default()
+        }))
+    }
+
+    /// `utimensat`/`futimens` (`None` = `UTIME_OMIT`). ctime moves.
+    fn set_times_async<'a>(
+        &'a self,
+        atime_ns: Option<u64>,
+        mtime_ns: Option<u64>,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(self.change_attrs(crate::write::AttrChange {
+            atime_ns,
+            mtime_ns,
+            ..Default::default()
+        }))
+    }
+
+    /// Synchronous callers (overlayfs copy-up) cannot await: drive the
+    /// update by spinning, which is safe from inside an executor poll where
+    /// `block_on` is not. The update completes without waiting unless
+    /// another CPU is mid-operation on this filesystem.
+    fn set_times(&self, atime_ns: Option<u64>, mtime_ns: Option<u64>) -> Result<(), FsError> {
+        narf_scheduler::block_on_spin(self.set_times_async(atime_ns, mtime_ns))
     }
 
     fn ioctl_async<'a>(
@@ -700,22 +838,25 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 seconds,
                 nanoseconds,
             };
-            let (rdev_major, rdev_minor) = self.inode.rdev_major_minor();
+            let (rdev_major, rdev_minor) = self.inode().rdev_major_minor();
             Ok(FsStatx {
                 mask: STATX_BASIC_STATS | STATX_BTIME,
                 block_size: self.volume().map(|v| v.sectorsize()).unwrap_or(4096),
-                nlink: self.inode.nlink,
-                uid: self.inode.uid,
-                gid: self.inode.gid,
-                mode: (self.inode.mode & 0xffff) as u16,
+                nlink: self.inode().nlink,
+                uid: self.inode().uid,
+                gid: self.inode().gid,
+                mode: (self.inode().mode & 0xffff) as u16,
                 ino: self.ino,
-                size: self.inode.size,
-                blocks: self.inode.size.div_ceil(512),
+                size: self.live_size.load(core::sync::atomic::Ordering::Relaxed),
+                blocks: self
+                    .live_size
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    .div_ceil(512),
                 // `btrfs_getattr`: each timespec as stored, otime as btime.
-                atime: ts(self.inode.atime_sec, self.inode.atime_nsec),
-                btime: ts(self.inode.otime_sec, self.inode.otime_nsec),
-                ctime: ts(self.inode.ctime_sec, self.inode.ctime_nsec),
-                mtime: ts(self.inode.mtime_sec, self.inode.mtime_nsec),
+                atime: ts(self.inode().atime_sec, self.inode().atime_nsec),
+                btime: ts(self.inode().otime_sec, self.inode().otime_nsec),
+                ctime: ts(self.inode().ctime_sec, self.inode().ctime_nsec),
+                mtime: ts(self.inode().mtime_sec, self.inode().mtime_nsec),
                 rdev_major,
                 rdev_minor,
                 ..FsStatx::default()
@@ -793,6 +934,17 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         self.ino
     }
 
+    /// A directory's `fsync`/`syncfs` makes every returned write durable, as
+    /// a file's does (see [`FileOps::fsync`] above): `sync(2)`, `syncfs` on a
+    /// directory fd and `fsync` of a directory after a rename all land here.
+    fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.volume()?.sync_to_disk_exclusive().await })
+    }
+
+    fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.volume()?.sync_to_disk_exclusive().await })
+    }
+
     fn dcache_identity(&self) -> (usize, u64, u64) {
         (
             self.vol.as_ptr() as *const () as usize,
@@ -805,8 +957,19 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         true
     }
 
-    fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
-        None
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        // Lookups are async (tree reads), but the synchronous VFS API must
+        // still resolve real entries: OverlayFS consults its lower layers
+        // through it (the session-writable root over a read-only btrfs root),
+        // as do bind-mount source resolution and exec path checks. Same
+        // bridge as ext's: re-entrancy-safe, never halts, and the block
+        // device's completion still arrives.
+        narf_scheduler::block_on_spin(self.lookup_async(name)).ok()
+    }
+
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+        // See `lookup`.
+        narf_scheduler::block_on_spin(self.lookup_dir_async(name)).ok()
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
@@ -827,7 +990,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             let vol = self.volume()?;
             let entry = self.find_child(name).await?;
             let node = self.load_child(&vol, &entry).await?;
-            if !node.inode.is_dir() {
+            if !node.inode().is_dir() {
                 return Err(FsError::NotFound);
             }
             Ok(node as Arc<dyn DirOps>)
@@ -1118,11 +1281,11 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     }
 
     fn dir_mode(&self) -> u16 {
-        self.inode.perms() & 0o777
+        self.inode().perms() & 0o777
     }
 
     fn dir_owners(&self) -> (u32, u32) {
-        (self.inode.uid, self.inode.gid)
+        (self.inode().uid, self.inode().gid)
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
@@ -1133,7 +1296,46 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     /// stat'd as the epoch, so fontconfig judged each font cache stale and
     /// rescanned every font on application start.
     fn dir_mtime_ns(&self) -> u64 {
-        self.inode.mtime_ns()
+        self.inode().mtime_ns()
+    }
+}
+
+impl<B: BlockDevice + 'static> BtrfsVolume<B> {
+    async fn reconfigure_impl(
+        &self,
+        sb_flags: u64,
+        sb_mask: u64,
+        options: &str,
+    ) -> Result<(), FsError> {
+        use narf_filesystem::sb_flags::RDONLY;
+        let mut want_ro = (sb_mask & RDONLY != 0).then_some(sb_flags & RDONLY != 0);
+        for option in options.split(',') {
+            match option {
+                "ro" => want_ro = Some(true),
+                "rw" => want_ro = Some(false),
+                _ => {}
+            }
+        }
+        let rest: alloc::vec::Vec<&str> = options
+            .split(',')
+            .filter(|o| !o.is_empty() && *o != "ro" && *o != "rw")
+            .collect();
+        let mut parsed = crate::mount_opts::parse(&rest.join(","))?;
+        match want_ro {
+            Some(true) if !self.is_read_only() => {
+                narf_filesystem::fs_registry::mount_wait(self.remount_read_only())?;
+            }
+            Some(false) if self.is_read_only() => {
+                let this = self.self_weak.upgrade().ok_or(FsError::NotFound)?;
+                this.remount_read_write()?;
+            }
+            _ => {}
+        }
+        let current = self.mount_options();
+        parsed.subvol = current.subvol;
+        parsed.read_only = self.is_read_only();
+        self.set_mount_options(parsed);
+        Ok(())
     }
 }
 
@@ -1176,13 +1378,50 @@ impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
         })
     }
 
+    /// A volume the write-safety gate (or the disk policy) made read-only is
+    /// read-only for every mount of it: the VFS then refuses writes with
+    /// EROFS and reports `ro` in mountinfo.
+    fn always_read_only(&self) -> bool {
+        self.is_read_only()
+    }
+
     fn reconfigure(&self, options: &str) -> Result<(), FsError> {
-        // Read-only volume: accept only `ro`/empty option tokens.
-        for opt in options.split(',').filter(|s| !s.is_empty()) {
-            if opt != "ro" {
-                return Err(FsError::Unsupported);
-            }
+        self.reconfigure_sb(0, 0, options)
+    }
+
+    /// `mount -o remount` (Linux `btrfs_reconfigure`). `systemd-remount-fs`
+    /// remounts `/` with its fstab options (`subvol=/@,compress=zstd:1`, ...)
+    /// and `systemd-shutdown` remounts it `ro` before poweroff. Accept what a
+    /// mount accepts; like Linux, `subvol=`/`subvolid=` cannot change on
+    /// remount and are ignored, everything else replaces the recorded run-time
+    /// options. `SB_RDONLY` flipping on (in `sb_flags`, or `ro` in the data)
+    /// commits and makes the filesystem read-only (`btrfs_remount_ro`);
+    /// flipping off makes it writable again (`btrfs_remount_rw`), refused
+    /// with `ReadOnly` where a read-write mount would be (disk policy,
+    /// write-safety gate, an aborted transaction).
+    fn reconfigure_sb(&self, sb_flags: u64, sb_mask: u64, options: &str) -> Result<(), FsError> {
+        narf_scheduler::block_on_spin(self.reconfigure_sb_async(sb_flags, sb_mask, options))
+    }
+
+    fn reconfigure_sb_async<'a>(
+        &'a self,
+        sb_flags: u64,
+        sb_mask: u64,
+        options: &'a str,
+    ) -> narf_filesystem::FsFuture<'a, ()> {
+        Box::pin(self.reconfigure_impl(sb_flags, sb_mask, options))
+    }
+
+    fn show_options(&self) -> alloc::string::String {
+        let options = self.mount_options();
+        let mut out = options.render();
+        let id = self.mounted_subvol_id();
+        out.push_str(&alloc::format!(",subvolid={id}"));
+        if let Some(crate::volume::Subvol::Name(path)) = &options.subvol {
+            out.push_str(&alloc::format!(",subvol=/{path}"));
+        } else if id == crate::format::FS_TREE_OBJECTID {
+            out.push_str(",subvol=/");
         }
-        Ok(())
+        out
     }
 }

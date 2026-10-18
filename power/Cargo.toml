@@ -26,6 +26,7 @@ narf-aml          = { path = "../aml" }
 narf-interrupts   = { path = "../interrupts" }
 narf-event-bus    = { path = "../event_bus" }
 narf-filesystem   = { path = "../filesystem" }
+narf-input        = { path = "../input" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [features]

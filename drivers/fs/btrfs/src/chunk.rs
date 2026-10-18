@@ -248,6 +248,76 @@ impl ChunkMap {
         Ok(e.length - (logical - e.logical_start))
     }
 
+    /// Logical ranges whose physical copies cover a superblock copy
+    /// (`physical_supers`, e.g. 64 KiB / 64 MiB / 256 GiB). Linux
+    /// `exclude_super_stripes` reverse-maps each superblock offset through
+    /// every chunk (`btrfs_rmap_block`) and keeps the containing
+    /// `stripe_len` window out of the allocator, because the superblock writer
+    /// overwrites those device bytes on every commit. Chunks laid down by
+    /// `mkfs.btrfs` routinely span the 64 MiB copy (only NARF's own chunk
+    /// growth steps around it), and their free-space tree still lists the
+    /// window as free. RAID5/6 rows are excluded whole.
+    pub fn super_stripe_exclusions(&self, physical_supers: &[u64]) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        for e in &self.entries {
+            let n = e.stripes.len() as u64;
+            if n == 0 || e.stripe_len == 0 {
+                continue;
+            }
+            let sub = u64::from(e.sub_stripes.max(1));
+            let data_stripes = match e.profile {
+                ChunkProfile::Single
+                | ChunkProfile::Dup
+                | ChunkProfile::Raid1
+                | ChunkProfile::Raid1C3
+                | ChunkProfile::Raid1C4 => 1,
+                ChunkProfile::Raid0 => n,
+                ChunkProfile::Raid10 => (n / sub).max(1),
+                ChunkProfile::Raid5 => n.saturating_sub(1).max(1),
+                ChunkProfile::Raid6 => n.saturating_sub(2).max(1),
+            };
+            let per_stripe = e.length / data_stripes;
+            for (i, stripe) in e.stripes.iter().enumerate() {
+                let i = i as u64;
+                for &m in physical_supers {
+                    let end = m + crate::format::SUPERBLOCK_SIZE as u64;
+                    if end <= stripe.physical || m >= stripe.physical + per_stripe {
+                        continue;
+                    }
+                    let off = m.saturating_sub(stripe.physical);
+                    let stripe_nr = off / e.stripe_len;
+                    let (start, len) = match e.profile {
+                        // A mirrored copy maps 1:1; Linux excludes the
+                        // `BTRFS_STRIPE_LEN` window around the superblock.
+                        ChunkProfile::Single
+                        | ChunkProfile::Dup
+                        | ChunkProfile::Raid1
+                        | ChunkProfile::Raid1C3
+                        | ChunkProfile::Raid1C4 => {
+                            const STRIPE_LEN: u64 = 64 * 1024;
+                            (off - off % STRIPE_LEN, STRIPE_LEN)
+                        }
+                        ChunkProfile::Raid0 => ((stripe_nr * n + i) * e.stripe_len, e.stripe_len),
+                        ChunkProfile::Raid10 => (
+                            (stripe_nr * data_stripes + i / sub) * e.stripe_len,
+                            e.stripe_len,
+                        ),
+                        ChunkProfile::Raid5 | ChunkProfile::Raid6 => (
+                            stripe_nr * data_stripes * e.stripe_len,
+                            data_stripes * e.stripe_len,
+                        ),
+                    };
+                    if start < e.length {
+                        out.push((e.logical_start + start, len.min(e.length - start)));
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Resolve the complete RAID5/6 stripe set containing `logical`. Physical
     /// stripes are returned in Linux's data-then-P-then-Q order after applying
     /// the per-full-stripe rotation.

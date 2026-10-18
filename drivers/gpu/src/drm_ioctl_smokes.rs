@@ -10,11 +10,12 @@
 //! - Render-node fd rejects SETCRTC with PermissionDenied (→ EACCES).
 //! - Render-node fd accepts GEM_CLOSE (render_allow=true ioctl).
 //!
-//! Test buffers are kernel-owned: `copy_in` / `copy_out` in the bridge
-//! do plain `core::ptr::copy_nonoverlapping`, so passing a `&mut
-//! UapiStruct as *mut _ as usize` works just like a user pointer
-//! would. The real syscall layer (Wave-22 `copy_from_user`) brackets
-//! these with SMAP/STAC on top.
+//! Test buffers are kernel-owned: the kernel-test build of `copy_in` /
+//! `copy_out` accepts a range wholly inside the kernel half (production
+//! accepts only user-half ranges), so passing a `&mut UapiStruct as *mut _
+//! as usize` works just like a user pointer would. The
+//! `smoke_drm_user_copies_*` cases open `StrictUserCopies` to assert the
+//! production predicate.
 //!
 //! ## Linux references (GPL-2.0-or-later)
 //!
@@ -2582,4 +2583,135 @@ fn smoke_drm_native_planes_refuse_what_scanout_cannot_show() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_native_planes_refuse_what_scanout_cannot_show
+);
+
+// ── User-copy range + fault checks (Linux access_ok / copy_*_user) ───────────
+
+/// Last byte of the user half, and the first canonical kernel address.
+const USER_TOP: usize = 0x0000_7fff_ffff_ffff;
+const KERNEL_FIRST: usize = 0xffff_8000_0000_0000;
+
+/// The bridge's copy primitives apply Linux `__access_ok` before any byte
+/// moves: a kernel source/destination, a range straddling the user/kernel
+/// boundary, a wrapping range and null are all EFAULT, and an in-range but
+/// unmapped user buffer is EFAULT via the fault-guarded copy instead of a
+/// kernel #PF. Before the fix every one of these was a raw STAC'd
+/// `copy_nonoverlapping` (a kernel read/write or a panic).
+fn smoke_drm_user_copies_enforce_access_ok() -> TestResult {
+    use crate::drm_ioctl_bridge::kernel_test_buffers::StrictUserCopies;
+    use crate::drm_ioctl_bridge::{copy_in, copy_out};
+    let efault = Err(FsError::BadAddress);
+    let mut secret = [0x5au8; 16];
+    let kptr = secret.as_mut_ptr() as usize;
+    {
+        let _strict = StrictUserCopies::new();
+        // SAFETY: every call below is refused before touching memory, or
+        // (0x1000) faults inside the guarded copy.
+        unsafe {
+            if copy_in(kptr, 16).map(|_| ()) != efault {
+                return TestResult::Fail("copy_in read a kernel buffer");
+            }
+            if copy_out(kptr, &[0u8; 16]) != efault || secret != [0x5a; 16] {
+                return TestResult::Fail("copy_out wrote a kernel buffer");
+            }
+            if copy_in(0, 4).map(|_| ()) != efault || copy_out(0, &[0]) != efault {
+                return TestResult::Fail("null accepted");
+            }
+            // The first byte is user, the last is past the user half.
+            if copy_in(USER_TOP - 3, 8).map(|_| ()) != efault
+                || copy_out(USER_TOP - 3, &[0u8; 8]) != efault
+            {
+                return TestResult::Fail("user/kernel straddle accepted");
+            }
+            // The whole of the user half's last byte is fine shape-wise; it
+            // is unmapped here, so the guarded copy turns the #PF into EFAULT.
+            if copy_in(USER_TOP, 1).map(|_| ()) != efault {
+                return TestResult::Fail("unmapped top user byte not EFAULT");
+            }
+            if copy_in(0x1000, 8).map(|_| ()) != efault || copy_out(0x1000, &[0u8; 8]) != efault {
+                return TestResult::Fail("unmapped user page not EFAULT");
+            }
+            if copy_in(KERNEL_FIRST, 8).map(|_| ()) != efault
+                || copy_in(usize::MAX - 7, 16).map(|_| ()) != efault
+            {
+                return TestResult::Fail("kernel-half / wrapping range accepted");
+            }
+        }
+    }
+    // The test-build opt-out still never accepts a straddling or wrapping
+    // range, and the strict scope closed with its guard.
+    // SAFETY: the straddle and wrap are refused before any access; `kptr`
+    // is a live 16-byte kernel buffer.
+    unsafe {
+        if copy_in(USER_TOP - 3, 8).map(|_| ()) != efault
+            || copy_in(usize::MAX - 7, 16).map(|_| ()) != efault
+        {
+            return TestResult::Fail("test opt-out accepted a straddling range");
+        }
+        if copy_in(kptr, 16).map(|v| v == [0x5a; 16]) != Ok(true) {
+            return TestResult::Fail("strict scope leaked past its guard");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_user_copies_enforce_access_ok
+);
+
+/// `AMDGPU_INFO.return_pointer` is the client's: aimed at kernel memory it is
+/// EFAULT and the kernel bytes stay untouched, while the same request with
+/// the pointer standing in for user memory answers.
+fn smoke_drm_user_copies_info_return_pointer() -> TestResult {
+    use crate::amdgpu_uapi as u;
+    use crate::drm_ioctl_bridge::kernel_test_buffers::StrictUserCopies;
+    let vm = crate::amdgpu_vm::VmState::new();
+    let mut out = [0xa5u8; 16];
+    let mut req = [0u8; core::mem::size_of::<u::DrmAmdgpuInfo>()];
+    req[0..8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
+    req[8..12].copy_from_slice(&16u32.to_le_bytes());
+    req[12..16].copy_from_slice(&u::AMDGPU_INFO_GPUVM_FAULT.to_le_bytes());
+    let cmd = crate::drm_uapi::DRM_COMMAND_BASE + u::DRM_AMDGPU_INFO;
+    let arg = req.as_mut_ptr() as usize;
+    let refused = {
+        let _strict = StrictUserCopies::allowing(arg, req.len());
+        crate::amdgpu_info::dispatch_for(cmd, arg, Some(&vm))
+    };
+    if refused != Err(FsError::BadAddress) || out != [0xa5; 16] {
+        return TestResult::Fail("INFO wrote through a kernel return_pointer");
+    }
+    if crate::amdgpu_info::dispatch_for(cmd, arg, Some(&vm)) != Ok(0) || out != [0; 16] {
+        return TestResult::Fail("INFO did not answer a stand-in user buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_user_copies_info_return_pointer
+);
+
+/// `DRM_IOCTL_VERSION` name/date/desc pointers are the client's: a kernel
+/// name pointer is EFAULT and is not written.
+fn smoke_drm_user_copies_version_strings() -> TestResult {
+    use crate::drm_ioctl_bridge::kernel_test_buffers::StrictUserCopies;
+    let idx = register_test_card();
+    let mut name_buf = [0x11u8; 32];
+    let mut req = DrmVersionUapi {
+        name_len: name_buf.len() as u64,
+        name: name_buf.as_mut_ptr() as u64,
+        ..DrmVersionUapi::default()
+    };
+    let arg = &mut req as *mut _ as usize;
+    let r = {
+        let _strict = StrictUserCopies::allowing(arg, core::mem::size_of::<DrmVersionUapi>());
+        dispatch_card(idx, DRM_IOCTL_VERSION, arg, false)
+    };
+    if r != Err(FsError::BadAddress) || name_buf != [0x11; 32] {
+        return TestResult::Fail("VERSION wrote through a kernel name pointer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_user_copies_version_strings
 );

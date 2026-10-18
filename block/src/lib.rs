@@ -30,6 +30,7 @@ extern crate alloc;
 #[cfg(feature = "cgroup")]
 pub mod cgroup;
 pub mod deadline;
+pub mod disk_policy;
 pub mod encrypted;
 pub mod fs_detect;
 pub mod io_scheduler;
@@ -57,9 +58,10 @@ pub use noop::NoopScheduler;
 #[cfg(feature = "cgroup")]
 pub use cgroup::{dev_id_from_ptr, install_cgroup_io_hook, IoCgroupHook};
 pub use registry::{
-    block_device_count, block_devices, find_block_device, find_block_device_indexed,
-    register_block_device, unregister_block_device, BlockDeviceSync, BlockIoError,
-    RegisteredBlockDevice, SyncBlock,
+    block_device_count, block_devices, disk_of, find_block_device, find_block_device_indexed,
+    find_by_fs_uuid, find_by_partuuid, find_disk_by_bus_path, identity_of, register_block_device,
+    register_block_device_with_identity, register_partition_device, unregister_block_device,
+    BlockCaps, BlockDeviceSync, BlockIoError, DiskIdentity, RegisteredBlockDevice, SyncBlock,
 };
 
 use core::future::Future;
@@ -78,6 +80,12 @@ pub trait BlockDevice: Send + Sync {
     fn capacity_blocks(&self) -> u64;
     /// Check for optional feature support.
     fn supports(&self, feat: BlockFeature) -> bool;
+    /// True when writes to this device are currently refused (see
+    /// [`BlockDeviceSync::is_read_only`]). Filesystems must then mount
+    /// without writing anything.
+    fn is_read_only(&self) -> bool {
+        false
+    }
 
     /// Submit a block I/O request. Returns a future that resolves to
     /// the completion. If it returns `Poll::Pending`, completion or device
@@ -87,6 +95,16 @@ pub trait BlockDevice: Send + Sync {
     /// Unsupported/no-op implementations resolve immediately; they must not
     /// return a permanently-pending future.
     fn flush(&self) -> impl Future<Output = ()> + Send;
+    /// [`Self::flush`] that reports failure, for callers that must not
+    /// proceed when the cache did not drain (btrfs `write_dev_flush` fails
+    /// the commit). The default runs `flush` and reports success.
+    fn flush_result(&self) -> impl Future<Output = Result<(), BlockError>> + Send {
+        let f = self.flush();
+        async move {
+            f.await;
+            Ok(())
+        }
+    }
     /// Advise the device that a range of blocks is no longer needed.
     fn discard(&self, range: LbaRange) -> impl Future<Output = ()> + Send;
 

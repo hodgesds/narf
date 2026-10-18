@@ -118,6 +118,23 @@ The upper inherits the lower root's owner and mode, is limited by the normal
 tmpfs policy (half of managed RAM by default), and is discarded at shutdown.
 `RootMountError::TmpfsOverlay` reports failure to construct that session view.
 
+### 3.0c System-wide sync
+
+`all_mounted_filesystems() -> Vec<Arc<dyn FsInstance>>` lists every
+filesystem mounted in the initial table or in any live private mount
+namespace, one per superblock (`backing_identity`; directory-rooted mounts
+win over file-rooted ones). `sync_all::sync_all() -> impl Future<Output =
+SyncReport>` is Linux `ksys_sync`: `syncfs` each of them, then
+`flush_block_devices()` — one flush per disk that has an entry the
+`narf.disks` policy lets write (a read-only disk received no write from this
+boot). `sync(2)` and the pre-shutdown step of every reboot / power-off use it.
+
+`/dev` block nodes (`BlockFile`) split a request into device calls of at
+most `max_chunk_lbas(block_size)` LBAs (≤ 65 535, ≤ 1 MiB) and return the
+short count when a later chunk fails. `efivarfs` is read-only (EROFS, mounted
+`ro`) under `narf.disks=root-ro`, and under `root-rw` / `boot-only` unless
+`narf.efivars_rw` is given (`efivarfs::efivars_writable`).
+
 ### 3.1 Path and node types
 
 ```rust
@@ -322,6 +339,7 @@ pub trait DrmFence: Send + Sync {
     fn seqno(&self) -> u64;            // default 0
     fn driver_name(&self) -> &str;     // default "narf"
     fn timeline_name(&self) -> &str;   // default "narf"
+    fn owner(&self) -> Option<u64>;   // default None (implicit-sync owner)
     fn timestamp_ns(&self) -> Option<u64>; // default None
 }
 
@@ -1464,6 +1482,15 @@ strict `s_bytes_used` and decompression bounds. Every fallible mutation hook
 returns `FsError::ReadOnly`.
 
 ### 3.12 EFI System Partition bootstrap mount
+
+Under `narf.disks=boot-only` (`narf_block::disk_policy`) `try_mount_root*`,
+`try_mount_efi_system_partition` and `root_mount::automount_devices()` (the
+`/mnt` ext walk) consider only the identified boot medium; when that leaves
+nothing they return `RootMountError::BootOnly`. An explicit `root=` naming
+another disk is refused the same way. Under `narf.disks=root-ro|root-rw` they
+consider only the `root=UUID=` candidate, then the designated root
+(`disk_policy::designate_root`, called before the filesystem is built) and
+vfat partitions on its disk; vfat volumes report `always_read_only` there.
 
 `root_mount::try_mount_efi_system_partition()` attaches one FAT filesystem at
 both NARF's `/boot` and `/mnt/boot`, which is visible as `/boot` to the installed

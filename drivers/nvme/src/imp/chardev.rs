@@ -1,4 +1,4 @@
-//! NVMe controller character device (`/dev/nvme0`) — admin passthrough.
+//! NVMe controller character devices (`/dev/nvme<C>`) — admin passthrough.
 //!
 //! Linux exposes each NVMe controller as a character device
 //! (`drivers/nvme/host/core.c`, the `nvme` char class) whose `ioctl`
@@ -9,8 +9,8 @@
 //! log, firmware slot), etc.
 //!
 //! This module implements the controller char node on top of
-//! [`crate::admin_passthrough`]. The node is registered with devtmpfs as
-//! `/dev/nvme0` by the probe path; its [`FileOps::ioctl_user`] decodes
+//! [`crate::admin_passthrough_at`]. One node per controller is registered as
+//! `/dev/nvme<C>` by the probe path; its [`FileOps::ioctl_user`] decodes
 //! the passthrough struct — including the nested `addr` data pointer —
 //! through the fault-contained [`IoctlContext`], so this driver never
 //! dereferences a process address itself.
@@ -35,6 +35,8 @@ pub const NVME_IOCTL_ADMIN_CMD: u32 = 0xC048_4E41;
 pub const NVME_IOCTL_IO_CMD: u32 = 0xC048_4E43;
 /// `_IOWR('N', 0x47, struct nvme_passthru_cmd64)` (80-byte struct, u64 result).
 pub const NVME_IOCTL_ADMIN64_CMD: u32 = 0xC050_4E47;
+/// `_IOWR('N', 0x48, struct nvme_passthru_cmd64)` — 64-bit I/O passthrough.
+pub const NVME_IOCTL_IO64_CMD: u32 = 0xC050_4E48;
 
 /// `sizeof(struct nvme_passthru_cmd)`.
 const PASSTHRU_CMD_LEN: usize = 72;
@@ -136,6 +138,7 @@ impl PassthruCmd {
 /// `struct_len` is the ioctl struct size and `result_off`/`result_u64`
 /// describe where the completion result dword is written back.
 fn do_passthru(
+    instance: u32,
     ctx: &dyn IoctlContext,
     arg: u64,
     struct_len: usize,
@@ -172,7 +175,8 @@ fn do_passthru(
     // Run the command. A nonzero NVMe status is reported back through the
     // ioctl return value, not as an error — smartctl inspects it.
     let sqe = cmd.to_sqe();
-    let outcome = super::admin_passthrough(&sqe, &mut data).ok_or(FsError::NoDevice)?;
+    let outcome =
+        super::admin_passthrough_at(instance, &sqe, &mut data).ok_or(FsError::NoDevice)?;
     let result = match outcome {
         Ok(r) => r,
         Err(_) => return Err(FsError::Io(narf_block::BlockError::IOError)),
@@ -252,12 +256,31 @@ impl FileOps for NvmeCharDev {
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
             match cmd {
-                NVME_IOCTL_ADMIN_CMD | NVME_IOCTL_IO_CMD => {
-                    do_passthru(context, arg, PASSTHRU_CMD_LEN, RESULT_OFF_32, false)
-                }
-                NVME_IOCTL_ADMIN64_CMD => {
-                    do_passthru(context, arg, PASSTHRU_CMD64_LEN, RESULT_OFF_64, true)
-                }
+                // I/O passthrough is refused (EOPNOTSUPP): an I/O command
+                // (Read 0x02, Write 0x01, ...) must go to an I/O queue, and
+                // its opcode space overlaps the admin one (0x01 is Create I/O
+                // SQ on the admin queue, 0x02 Get Log Page). Sending it down
+                // the admin passthrough, as this used to, ran a different
+                // command than the one asked for. Linux routes it through
+                // `nvme_dev_user_cmd` to the namespace's I/O queue; until
+                // NARF has that path, the request is not executed at all.
+                NVME_IOCTL_IO_CMD | NVME_IOCTL_IO64_CMD => Err(FsError::Unsupported),
+                NVME_IOCTL_ADMIN_CMD => do_passthru(
+                    self.instance,
+                    context,
+                    arg,
+                    PASSTHRU_CMD_LEN,
+                    RESULT_OFF_32,
+                    false,
+                ),
+                NVME_IOCTL_ADMIN64_CMD => do_passthru(
+                    self.instance,
+                    context,
+                    arg,
+                    PASSTHRU_CMD64_LEN,
+                    RESULT_OFF_64,
+                    true,
+                ),
                 // The controller handle has no single namespace id; Linux
                 // answers NVME_IOCTL_ID with -ENOTTY here (it is a
                 // per-namespace query). Fall through to the generic

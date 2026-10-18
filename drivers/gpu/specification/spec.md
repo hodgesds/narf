@@ -77,6 +77,42 @@ GC version rejects its `DEV_INFO`. This identifies the device; acceleration
 continues to report unavailable. Navi 22 firmware, GMC/GFX10 execution and
 DCN3.0 display bring-up are not enabled by this probe path.
 
+A bound Navi 22's `AMDGPU_INFO` replies come from `amdgpu_info_navi22`
+(`query`, `query_with(snapshot, Submission, query, payload)`), which mirrors
+`amdgpu_kms.c` for this ASIC: DEV_INFO (`chip_rev`/`external_rev = rev + 0x32`,
+`pci_rev`, harvested CU/AO bitmaps, RB and TCC masks, CE RAM, DPM GFXCLK
+range), HW_IP_INFO with IP-block versions (GFX/compute 10.0, SDMA 5.2,
+VCN/JPEG 3.0) plus discovery versions and Linux IB alignments, HW_IP_COUNT,
+FW_VERSION from the loaded file headers and `GetSmuVersion`, READ_MMR_REG for
+GB_ADDR_CONFIG (0x263e; other offsets EFAULT) and MEMORY/VRAM_GTT with the
+8 MiB VM reservation. `Snapshot::navi22: Published { topology, pci_revision,
+boot }` carries the inputs, published by `amdgpu_info::publish_navi22_topology`
+(cold-boot `Stage::ReadTopology`, appended after `FenceInterrupts`),
+`publish_navi22_pci_revision` (platform prepare) and `publish_navi22_boot`
+(after a successful cold boot, from `ColdBoot::uapi_versions` and the
+report). Unpublished inputs leave the corresponding fields zero.
+`amdgpu_info_navi22::SUBMISSION` is the single switch for ACCEL_WORKING,
+`available_rings`, HW_IP_COUNT, GANG_SUBMIT, the DRM minor (3.64.0 vs
+3.0.0) and the render ioctls; it is `Wired`, and still advertises nothing
+unless `Boot::queues_verified`. Media IPs additionally need
+`Published::media_rings` (`publish_navi22_media_rings`, from
+`amdgpu_vcn_navi22_cs::register`): VCN_DEC/ENC/JPEG report one ring each
+when their rings passed, HW_IP_COUNT(VCN_DEC/ENC) is `num_vcn_inst` (every
+discovered instance, harvested ones included) and JPEG 1. VIDEO_CAPS
+returns the Sienna Cichlid codec tables for the published harvest; MAX_IBS
+reports
+`amdgpu_navi22_submit::MAX_IBS` (16) for advertised rings.
+
+`unsafe amdgpu_gfx10_topology::read(gpu, pci_cap)` requires exclusive GRBM
+selector ownership with RLC booted and GFX powered. It samples the NBIO
+revision strap, GB_ADDR_CONFIG, per-SE/SA fused and user RB/WGP disables and
+the TCC disables, restores SE/SA broadcast within one capability operation,
+and `derive(Limits, &Sample)` reproduces `gfx_v10_0_setup_rb`,
+`gfx_v10_0_get_cu_info` and `gfx_v10_0_get_tcc_info`. A zero or non-256 B
+interleave GB_ADDR_CONFIG, zero CUs/RBs, or GC dimensions beyond the GFX10
+DRM layout are refused; only device loss or revoked authority fails the
+cold-boot stage.
+
 ### Navi 48 PCIe probe (RX 9070 XT)
 
 The next discrete target is Navi48, selected from the September 2026
@@ -289,7 +325,7 @@ that exists yet. Layout and message constants are checked against the Linux
 headers by `tests/smu14_metrics.c`; everything is model-tested only.
 
 After a successful retained boot, `amdgpu_navi48_platform::run` starts
-`amdgpu_navi48_power`. It publishes `/sys/class/hwmon/hwmon<N>` (first free N)
+`amdgpu_navi48_power`. Through the shared `amdgpu_hwmon` it publishes `/sys/class/hwmon/hwmon<N>` (first free N)
 named `amdgpu` and spawns a monitor that refreshes telemetry every second,
 holding the platform owner only for each refresh, like Linux's cached metrics
 table. Attributes follow Linux amdgpu_pm.c for an SMU14.0.2 dGPU: `temp1..3`
@@ -2972,6 +3008,23 @@ running SOS or availability of graphics acceleration. It does not set
 automatic platform wiring, VRAM training and the remaining IP firmware loads
 remain follow-up work. The PSP11 ring and SMC loader below are explicit APIs.
 
+### Navi 22 Linux conformance harness
+
+`drivers/gpu/tools/navi22-conformance.sh` is a host-side gate and is not part
+of the kernel interface. It exits nonzero on any mismatch. It runs three checks:
+
+* `check_constants.py` evaluates every `// linux:` / `// linux-lit:`
+  annotated constant on the Navi22 path against the Linux header for this
+  card's IP versions. For registers it also checks BASE_IDX, and the segment
+  the code applies, against discovery.
+* `tests/smu11_metrics.c`.
+* A diff between NARF's SOS/SMC/GFX/RLC/SDMA/VCN/DMCUB parsers (compiled on
+  the host) and a C mirror of Linux's `amdgpu_ucode` handling of the real
+  `navy_flounder_*.bin` blobs.
+
+Constants mirrored from Linux on these modules must carry an annotation. See
+`drivers/gpu/research/navi22-conformance.md`.
+
 ### Navi 22 PSP command ring and trusted memory
 
 `unsafe amdgpu_psp_ring::Psp::new_navi22(gpu, pci_cap, pool)` claims the sole
@@ -2995,11 +3048,17 @@ payload addresses are GPU MC addresses. TMR's additional physical address is
 the host PCI BAR address is never substituted.
 
 `start().await` uses the same bounded PF GPCOM wire protocol and 20 ms handshake
-as the Phoenix transport. `setup_tmr_navi22(&amdgpu_psp_boot::Firmware).await`
+as the Phoenix transport; every PSP11/13/14 ring is created with
+`PSP_RING_TYPE__KM << 16` (`GFX_CTRL_CMD_ID_INIT_GPCOM_RING`, 0x00020000).
+`setup_tmr_navi22(&amdgpu_psp_boot::Firmware).await` is `psp_tmr_init`: it
 uses `Image::toc()` from the validated SOS container, submits `LOAD_TOC`, and
-allocates the PSP-reported TMR size (nonzero, page-aligned, at most 64 MiB).
+reserves the PSP-reported TMR size (nonzero, page-aligned, at most 64 MiB).
 Containers without a TOC use PSP11's 4 MiB default. TMR allocations are aligned
-to 1 MiB; `SETUP_TMR` carries both GPU and GPU-physical addresses with flags=2.
+to 1 MiB. MP0 11.0.11 has PMFW-centralized C-state management, so `SETUP_TMR`
+(GPU and GPU-physical addresses, flags=2) is sent by `load_smc_navi22` right
+after PMFW loads (`psp_hw_start`). Fence waits are bounded at 2 s
+(`psp_cmd_submit_buf`); on Navi22 a nonzero response status is logged, not
+fatal, except for `DESTROY_TMR`.
 Readiness requires a successful matching-fence completion. TOC staging is
 released only after completion or verified ring destruction; uncertain TMR
 installation retains the reservation and prevents retry. `unsafe stop().await`
@@ -3023,9 +3082,10 @@ of microcode. It exposes `payload()`, `version()` and optional `powerplay()`;
 the SRAM start address is metadata, never a host/GPU DMA address. Structural
 validation does not authenticate the image or select board power policy.
 
-`Psp::load_smc_navi22(&Firmware).await` requires a Navi22 ring with acknowledged
-TMR setup. It stages only the microcode and submits `LOAD_IP_FW` (6), firmware
-type SMU (18), using the GPU address and exact payload length. Matching-fence
+`Psp::load_smc_navi22(&Firmware).await` requires a Navi22 ring with `LOAD_TOC`
+done and the TMR reserved but not yet set up. It stages only the microcode and
+submits `LOAD_IP_FW` (6), firmware type SMU (18), using the GPU address and
+exact payload length, then `SETUP_TMR`. Matching-fence
 completion releases staging; missing completion retains device-owned memory.
 SMC loading is attempted once per session: success, failure or cancellation
 all prevent another upload. Verified stop/reset is required before a new
@@ -3115,8 +3175,12 @@ thermal interrupts or override board frequencies, voltages or fan curves.
 `navy_flounder_{sdma,ce,pfp,me,mec,mec2,rlc,vcn,dmcub}.bin` set through live registry/blob
 capabilities before any device I/O. Device gating requires PCI `1002:73df`,
 GC 10.3.2, MP1 11.0.11, SDMA0 5.2.2 and DCN 3.0.0, with unique instance-zero
-records, plus a single VCN 3.0.0/3.0.64/3.0.192 instance. Other media layouts
-are refused; VCN 3.0.16 uses different firmware and is not Navy Flounder.
+records, plus VCN instance 0 at 3.0.0/3.0.64/3.0.192 and an optional instance 1
+(any VCN 3.0.x, 3.0.1 on Navy Flounder; Linux keys only on instance 0). Duplicate,
+out-of-range or instance-1-only layouts are refused; VCN 3.0.16 uses different
+firmware and is not Navy Flounder. `vcn_instances()` returns the instance mask
+and `harvest_vcn(mask)` removes harvested instances before any device I/O
+(`adev->vcn.harvest_config`).
 Only MEC2 may be absent, and only a registry `NotFound` result is optional;
 signature, parsing, allocation and authority failures propagate. Immutable
 copies outlive the capability invocations. `images()` returns validated views
@@ -3140,7 +3204,10 @@ byte offsets. Upload order is tap-delay sections (v2.4), restore control/GPM/SRM
 IRAM/DRAM, P/V (v2.3), then RLC_G. Empty optional sections are omitted; register
 list metadata is validated but never submitted as firmware. Nonempty P/V fields
 in v2.4 are rejected because Linux does not load them in that revision.
-VCN submits the complete common-header microcode payload as PSP type 13.
+VCN submits the complete common-header microcode payload once per unharvested
+instance, as PSP type 13 (`UCODE_ID_VCN`) for instance 0 and 58
+(`UCODE_ID_VCN1`) for instance 1 (`amdgpu_vcn_setup_ucode`); with both
+harvested no VCN payload is sent. `Image::for_vcn_instances(mask)` selects them.
 DMCUB submits only `inst_const_bytes` as type 51, retaining PSP packaging and
 excluding BSS/data; its instruction/data sizes must exactly cover the payload.
 Both media payloads must end at the declared file boundary.
@@ -3157,7 +3224,7 @@ commands quarantine staging/ring/TMR, and teardown still requires independent
 reset of every firmware consumer before TMR destruction.
 
 `Accepted` means PSP acknowledged autoload and both media uploads.
-`media_firmware()` returns `MediaFirmware { vcn, dmcub }` GPU entry addresses
+`media_firmware()` returns `MediaFirmware { vcn, dmcub, vcn1 }` GPU entry addresses
 from completed PSP replies; each must be dword aligned and inside this
 session's retained TMR. Partial failures retain any earlier valid address for
 diagnostics. These are not CPU pointers or proof that the media engines have
@@ -3208,6 +3275,66 @@ destination }` address metadata, including after a started failure. Only
 `Ready` confirms both TLB acknowledgements. Keep the owner alive while a
 consumer uses these translations; this stage alone does not prove GPU access.
 
+### Navi 22 GART and per-client GPUVM
+
+`Gmc::prepare_gart()` reserves the 1 MiB VRAM GART table plus one shared
+all-invalid user root page (no I/O). `unsafe enable_gart().await` requires a
+`Ready` hub owner and no running queues: it zeroes the table, carries the two
+boot `Aperture` pages into GART pages 0/1, and repoints VMID0 on both hubs at a
+512 MiB GART (`gmc_v10_0_mc_init` size) starting at the boot aperture, which
+`Gmc::initialize` already placed at Linux's `amdgpu_gmc_gart_location`
+BEST_FIT start (MC 0 below this board's 0x80_0000_0000 FB); the range may not
+cross 4 GiB, overlap the FB or reach the MC hole. The FB end is
+`fb_start + MEMSIZE`; `FB_LOCATION_TOP` is not consulted and an inherited
+VMID0 context is reprogrammed (contexts 1–15 must be off). It then applies
+`setup_vmid_config` to contexts 1–15 (`CONTEXT1_CNTL` 0x555407: depth 3, block
+size 9, no retry, all default-page faults; table range 0..`max_pfn`-1) with
+their base on the empty root, and invalidates VMID0. `gart()` returns
+`GartInfo { start, size, table }` only after success.
+
+`bind_gtt(DmaBuffer, writable).await -> Gtt` maps one pinned contiguous system
+buffer (page aligned, below the 44-bit DMA mask) after the boot pages with
+Linux TT flags VALID|SYSTEM|SNOOPED|EXECUTABLE|READABLE[|WRITEABLE], MTYPE_UC;
+`Gtt::address()` is its VMID0 GPU address. `unbind_gtt(Gtt).await` writes
+invalid entries, invalidates and returns the buffer. A dropped `Gtt` or a
+failed unbind leaks the pages deliberately.
+
+`allocate_vram(size, read_only) -> Buffer` returns zeroed pool VRAM;
+`Buffer::system(DmaBuffer, read_only)` wraps pinned system pages and
+`Buffer::uncached()` forces MTYPE_UC. `create_vm().await -> Vm` binds a free
+VMID (1–15, round robin) to a new zeroed PDB2 root and invalidates it.
+`map(&Vm, Mapping { va, offset, size, flags }, Arc<Buffer>).await` takes
+hole-stripped, page-aligned addresses below 2^48 and `AMDGPU_VM_PAGE_*`/MTYPE
+flags (PRT refused; overlap is `Invalid`). It builds GMC10 four-level tables
+(PDB2→PDB1→PDB0→PTB, 512 entries, PDE = physical | VALID, no BFS/TF) in owned
+VRAM, encodes PTEs as `gmc_v10_0_get_vm_pte` does, and invalidates the VMID on
+both hubs. `unmap(&Vm, va).await` clears an exact mapping and releases its
+buffer only after both ACKs; `destroy_vm(Vm).await` repoints the context to
+the empty root, invalidates, then frees tables and buffers. A VM holds only
+buffers explicitly mapped into it; its tables are never client buffers; each VM
+is capped at 1024 table pages. `vm_info(&Vm)` reports the VMID, generation and
+`page_table_base` a ring flush would program.
+
+Every TLB invalidation uses engine 17 per hub (GFX then MM), HDP flush first,
+MMHUB semaphore around the request, 100 ms bounded waits on `1 << vmid`.
+Entries are 64-bit stores; new tables are zeroed and HDP-flushed before their
+PDE is written. Validation/allocation errors (`Invalid`, `Allocation`,
+`Exhausted`) touch no hardware. After the first hardware access, timeout,
+revocation, removal or cancellation latch `runtime()` at `Failed`/`Busy`: every
+later operation returns `Busy`, the semaphore is not released, and all touched
+buffers/tables are retained.
+
+`Fault::decode(client, source, vmid, src_data)` accepts UTCL2 (0x1b, GFX hub)
+and VMC (0x12, MM hub) source 0, as `gmc_v10_0_process_interrupt` decodes them.
+`handle_fault(Fault)` reads `L2_PROTECTION_FAULT_STATUS`, re-arms it via
+`FAULT_CNTL` bit 0 and returns `FaultOwner::{Kernel, Vm { vmid, generation },
+Unowned}`, recording `FaultInfo` (latest address/status, count) for
+`vm_fault(&Vm)`. Retry faults are reported, never recovered. Fault interrupts
+stay masked until the IH owner calls `set_fault_interrupts(true)`;
+`Fault::from_iv(&ih::Iv)` adapts IVs from `ColdBoot::interrupts()` subscriptions
+to `ih::source::{VMC_FAULT, UTCL2_FAULT}`.
+`ColdBoot::memory()` exposes this owner after `FirmwareReady`/`Released`.
+
 ### Navi 22 SDMA0 execution proof
 
 `unsafe amdgpu_sdma_navi22::Sdma::new(gpu, pci_cap, pool)` validates SDMA 5.2.2,
@@ -3239,6 +3366,379 @@ authority; completion has a 1 s deadline. Revocation, cancellation, removal,
 timeout or corrupted data prevents replay. Ring/writeback memory is published
 before reset and retained on every started path; no destructor resets hardware.
 This is one boot execution test, not a general submission or acceleration API.
+After verification, crate-internal `trap(context).await` appends one
+`SDMA_OP_TRAP` block (INT_CONTEXT masked to 28 bits), sets
+`SDMA0_CNTL.TRAP_ENABLE` and waits at most 100 ms for both read pointers to
+reach 192 bytes. It runs once; failure marks the engine `Failed`.
+
+### Navi 22 OSSSYS 5.0.3 interrupt ring and dispatch
+
+`unsafe amdgpu_ih_navi22::Ih::new(gpu, pci_cap, pool, bus_device)` validates
+OSSSYS 5.0.3, NBIO and HDP 5.0 banks and reserves a 256 KiB VRAM ring plus a
+writeback page and a host NBIO dummy page, without I/O. Only RB0 exists, as in
+Linux for navy_flounder. `unsafe initialize().await` requires ready GMC VMID0.
+It routes MSI-X entry 0, else MSI, else polling (`Delivery`). Then it follows
+`navi10_ih_irq_init`: it disables the ring (inherited enables are recorded in
+`Status::inherited`), runs nbio_v2_3 `ih_control`, and programs
+base/`IH_RB_CNTL` (MC_SPACE 4, 2^16-dword ring, writeback, overflow
+enable/clear, snoop, RPTR_REARM only with MSI) and the OSSSYS 5.0 WPTR_ADDR
+HI/LO (offsets swapped vs 4.0). It zeroes the pointers, disables the
+IH doorbell and NBIO doorbell range, then enables ring/interrupt and the
+5.0.3 self-IV wptr timeout. The ring is in VRAM through the VMID0 system
+aperture, not GTT; rptr goes through `IH_RB_RPTR` because BAR2 is not mapped.
+`unsafe disable().await` mirrors `navi10_ih_irq_disable` with a 1 ms settle.
+It masks the vector and closes every waiter with `Closed::Disabled`; it does
+not reuse the ring.
+
+`Ih::handle()` returns a cloneable `Handle`. `subscribe(Source{client,src})`
+claims the only route for that pair, before or after enable (a second owner
+gets `Busy`). It returns a generation-tagged `Subscription` with a 64-IV
+mailbox that drops the oldest entry when full (`lost()`). `try_next()` and
+`wait().await` deliver queued IVs before a terminal `Closed`
+(`Revoked`, `Disabled`, `DeviceLost`, `AuthorityRevoked`, `Failed`).
+`revoke(source)` retires the current generation; a stale handle never sees a
+newer owner's IVs. `close(reason)` lets other owners report device loss.
+`drain()` runs `navi10_ih_get_wptr` (writeback, register on RB_OVERFLOW,
+resume at wptr+32, clear pulse) and decodes up to 8×32 SOC15 IVs per call
+(`Iv`, with `cp_queue`, `page_fault`, `hpd` helpers). It skips client ids
+≥ 0x20, all-ones and misaligned entries as malformed and writes the rptr back.
+It runs in task context only: the IRQ handler records a count, and waiters
+drain on wake or on a watchdog (10 ms with MSI, 1 ms polling).
+All-ones registers or revoked authority close every waiter. `Stats` exposes
+interrupts, drained, unhandled, malformed, overflows, dropped, unsignalled
+(found without an interrupt) and watchdog counts. `source::*` holds the GFX
+EOP/fault, SDMA traps, VMC/UTCL2 faults, DCN vblank (VSTARTUP)/vupdate/pflip/
+HPD/DMUB-outbox and SMU11 thermal/CTF/MP1 ids.
+
+### Navi 22 kernel queues: GFX, KIQ/compute and SDMA
+
+`unsafe amdgpu_cp_navi22::enable_fence_interrupts(gpu, pci_cap, doorbells)` sets
+`TIME_STAMP_INT_ENABLE` for ME0 pipe 0 and MEC1 pipe 0 and `TRAP_ENABLE` on both
+SDMA engines, the sources Linux's fence driver arms with `amdgpu_irq_get` (the
+KIQ stays polled). `Stage::FenceInterrupts`, the final ColdBoot stage, runs it
+once every queue is verified, then subscribes to `GFX_EOP`, `SDMA0_TRAP` and
+`SDMA1_TRAP` and spawns one forwarder per source that calls
+`amdgpu_fence_navi22::notify` for the decoded engine (`notify_all` on a
+terminal IH error). A subscription failure only logs; fences keep polling.
+
+GC 10.3.2 runs without MES. `amdgpu_cp_navi22::Doorbells::map_navi22(device)`
+(unsafe, boot-time) maps BAR2's first 4 KiB uncached; kernel doorbells use the
+Linux Navi10 assignment (KIQ 0, MEC ring0 6, GFX ring0 0x116, SDMA0 0x200,
+SDMA1 0x214 dwords). `enable_doorbell_apertures` sets the NBIF 2.3 doorbell
+and self-ring apertures. Each queue owns 24 KiB of published VRAM: 8 KiB ring,
+writeback (rptr, 64-bit shadow wptr, fence, scratch), IB, MQD/CSB and EOP.
+Commit pads like `amdgpu_ring_commit` (256 PM4 / 16 SDMA dwords), flushes HDP,
+updates the shadow wptr and rings a 64-bit doorbell; CPU reads invalidate HDP.
+
+`unsafe Gfx::new(gpu, pci_cap, pool, doorbells)` reserves storage only.
+`configure()` applies `golden_settings_gc_10_3_2`, checks/programs the GRBM
+CAM, runs `gfx_v10_0_constants_init` (SH_MEM per VMID, KFD/GDS VMIDs, trap
+config), re-checks RLC autoload, programs the RLC CSIB with the 949-dword
+`clearstate_gfx10.h` CSB, SPM VMID 0xf and SRM, and masks the gui-idle
+interrupts. `start()` follows `gfx_v10_0_cp_gfx_resume`/`cp_gfx_start` (the
+`async_gfx_ring=0` path, ring 0 only) and then the SCRATCH_REG0
+`SET_UCONFIG_REG` ring test. `test_ib()` runs a WRITE_DATA IB and RELEASE_MEM
+fence. `unsafe amdgpu_kiq_navi22::Compute::new(...)`: `init_kiq()` programs
+the KIQ at MEC2 pipe 1 queue 0 (`kiq_setting`, v10 MQD, `kiq_init_register`,
+dequeuing an active inherited HQD or failing on timeout); `map_compute()`
+unhalts MEC, builds the MEC1 pipe 0 queue 0 MQD and submits SET_RESOURCES +
+MAP_QUEUES through the KIQ, then runs KIQ and compute ring tests; `test_ib()`
+runs the compute IB test. `unsafe amdgpu_sdma_navi22_queues::Sdma::new(...)`:
+`start()` refuses busy engines, stops an idle predecessor ring (the SDMA0
+proof), soft-resets both engines and follows `sdma_v5_2_start` /
+`gfx_resume_instance` with doorbells and NBIF SDMA ranges plus WRITE_LINEAR
+ring tests; `test_ib()` runs IB + FENCE/TRAP tests on both engines.
+
+Every step has one predecessor state; failure or cancellation leaves a
+non-repeatable state and retains published memory. Register polls are bounded
+by 100 ms and fences by 1 s. `amdgpu_fence_navi22::{notify, notify_all}` are
+the IH hook: an EOP/trap consumer calls them so fence waits re-sample at once;
+without it waits poll every 1 ms. `QueueProof` aggregates the three proofs.
+Clock gating, GFXOFF, the cleaner shader and Linux's second gfx ring are not
+enabled. These are kernel bring-up rings, not a submission API.
+
+### Navi 22 runtime power, thermal and recovery
+
+`amdgpu_smu_navi22_telemetry` decodes the SMU11 (`smu11_driver_if_sienna_cichlid.h`)
+`SmuMetricsExternal_t` (200 bytes, `TABLE_SMU_METRICS` = 5). `Layout::for_firmware`
+selects `SmuMetrics_V2_t` for MP1 11.0.11 PMFW >= `0x412D00` and `SmuMetrics_t`
+otherwise, as `sienna_cichlid_get_smu_metrics_data`; V2 throttling percentages
+fold into the THROTTLER bit mask. `Metrics` carries edge/hotspot/mem/VR
+temperatures (m°C), `CurrFanSpeed`, `AverageSocketPower` (W), the busy-threshold
+(15 %) GFXCLK average, FCLK/UCLK post-DS averages, `CurrClock` entries and
+activity. `Limits::from_table` reads `TemperatureLimit`, `FanMaximumRpm` (only
+with FEATURE_FAN_CONTROL) and `SocketPowerLimitAc[PPT0]` from the uploaded
+1668-byte `PPTable_t`, plus the powerplay header's `software_shutdown_temp`,
+`thermal_controller_type` and HARDWAREDC cap; `*_emergency` adds `CTF_OFFSET`
+(5 °C) and a zero/255 limit is refused. `tests/smu11_metrics.c` checks every
+offset and message against the Linux headers.
+
+After boot power setup, `Smu::read_telemetry().await` zeroes and HDP-flushes the
+retained `DriverDramAddr` buffer, sends `TransferTableSmu2Dram` (0x12, table 5),
+invalidates HDP (`HDP_READ_CACHE_INVALIDATE`) and decodes the table, then reads
+the running features, `GetPptLimit` (0x33, PPT0/AC; the table limit when PPT is
+not running or the query is rejected), `SMUSVI0_TEL_PLANE0` VDDCOR
+(`smu_v11_0_get_gfx_vdd`) and the THM `CG_FDO_CTRL1`/`CG_THERMAL_STATUS` PWM
+duty (`smu_v11_0_get_fan_speed_pwm`). Runtime commands move `PowerReady`/
+`DisplayPowerReady` through `Runtime`: a clean rejection restores the state,
+timeout, revocation, all-ones sensors or cancellation are terminal.
+`Smu::protected(enabled)` checks that the PPT/TDC/VR0HOT/FW_CTF/FAN/THERMAL
+features running at boot still run. `ColdBoot::power_limits()` and
+`power_sample().await` expose this after `FirmwareReady`.
+
+`amdgpu_navi22_platform::run` then starts `amdgpu_navi22_power`: the shared
+`amdgpu_hwmon` node `/sys/class/hwmon/hwmon<N>` named `amdgpu` and a 1 s
+monitor that takes the owner lock per refresh. Attributes are the Linux SMU11
+dGPU set, read-only: `temp1..3` (edge/junction/mem) with crit/crit_hyst
+(-273150)/emergency; with a fan `pwm1` (register duty), `pwm1_enable` 2,
+`pwm1_min/max`, `fan1_input/min/max/target`, `fan1_enable` 0; `in0` vddgfx;
+`power1_average/cap/cap_default` (µW; default is the first PMFW limit, else the
+table's AC limit); `freq1` sclk and `freq2` mclk (Hz). Fan control stays in
+PMFW automatic mode. The monitor logs throttling start/end, lost protection,
+the first failed refresh and hotspot at `software_shutdown_temp`; shutdown
+policy belongs to the thermal interrupts below. Model-tested only.
+
+`Smu::enable_thermal_alert().await` (`ColdBoot::enable_thermal_alert`) follows
+`smu_v11_0_enable_thermal_alert`: with a nonzero `thermal_controller_type` it
+programs `THM_THERMAL_INT_CTRL` (MAX_IH_CREDIT 5, IH_HW_ENA, INTH/INTL and
+TRIGGER unmasked, DIG_THERM_INTH = min(255, `software_shutdown_temp`),
+DIG_THERM_INTL = 0), clears `THM_THERMAL_INT_ENA` (INTH/INTL/TRIGGER_CLR),
+sets `MP1_SMN_IH_SW_INT.ID` 0xFE and unmasks `MP1_SMN_IH_SW_INT_CTRL`; with a
+GPIO-signalled DC cap and FEATURE_ACDC running it sends `ReenableAcDcInterrupt`
+(0x34). It returns `Alert { armed, window, acdc_rearmed }`; `InterruptAck`
+sets `INT_ACK` without the mailbox. After telemetry, `run` subscribes the four
+`smu_v11_0_register_irq_handler` sources (THM 0x0f src 0/1, ROM_SMUIO 0x16 src
+83, MP1 0x1f src 0xfe) *before* arming them and spawns one task per source
+(`amdgpu_navi22_thermal`). L2H waits 50 ms (`AMDGPU_SWCTF_EXTRA_DELAY`),
+re-reads the hotspot and, at or above `software_shutdown_temp` — or with no
+reading or no limit, as `smu_swctf_delayed_work_handler` — logs the SW CTF and
+powers off; H2L only logs; GPIO19 CTF logs and powers off at once; SMU-to-driver
+acknowledges, then AC/DC (3/4) re-arms AC/DC and thermal throttling (7) counts.
+NARF has no userspace poweroff helper or write-back, so `orderly_poweroff(true)`
+reduces to its forced fallback, `narf_power::system::power_off()`.
+`amdgpu_navi22_thermal::status()` (also in platform `Diagnostics::thermal`)
+reports the alert, per-source counters and any shutdown reason.
+
+Hang detection (`amdgpu_navi22_tdr`) follows drm_sched's per-ring job timeout
+with Linux's default `lockup_timeout` of 2 s for every queue. After a boot whose
+queues all verified, a task samples every 250 ms, under the owner lock,
+`Progress { engine, emitted, signaled }` of GFX, KIQ, compute and SDMA0/1
+(`ColdBoot::queue_progress`: the queue's last sequence and its fence writeback
+after an HDP invalidate; an all-ones read-back is device loss). The per-engine
+timer starts when unsignalled work is first seen and restarts on every fence
+advance; a stall past the timeout logs `ring <engine> timeout, signaled seq=…,
+emitted seq=…` once and is retained in `tdr::status()`. Detection is always on;
+recovery is triggered only by `unsafe tdr::set_automatic_recovery(true)` (off by
+default) or an explicit call.
+
+`unsafe amdgpu_navi22_platform::recover().await` is the opt-in
+`amdgpu_device_gpu_recover` for mode1 (`amdgpu_navi22_recovery::Recovery`, state
+stored outside the future). `check` refuses (`Unsupported`, no side effects) a
+boot that needed GDDR6 training (no short-training replay yet) or lacks a board
+table, PSP or IH. Quiesce stops TDR, telemetry and thermal, disables the IH ring
+(every subscriber gets `Disabled`) and calls `amdgpu_fence_navi22::abandon_all`,
+which ends every pending fence wait with its error. Reinitialize consumes the
+owner (`ColdBoot::into_recovery`: same snapshot, authority, pool and prepared
+firmware; old owners dropped without I/O, their VRAM quarantined), prepares a
+`Reset::new_recovery` — the reset-on-init core without the SOS shortcut — plus
+fresh hubs, SDMA proof, IH and queues on the same BAR2 doorbells, stores it,
+and runs the complete cold-boot sequence including ring/IB tests. Restart
+re-arms telemetry, thermal and TDR. DMUB/display are not restarted: the screen
+stays dark until the display owner restarts DMUB and modesets. Any failure or
+cancellation is terminal `Lost`: services stop, fence waits are abandoned and
+the old and new IH endpoints close with `DeviceLost`. `recoveries()` counts
+successes; platform `Diagnostics` adds `tdr` and `recovery`. Model-tested only.
+
+`amdgpu_navi22_power_policy::Policy` is the typed hook for the power savings
+Linux enables by default on sienna_cichlid — GFXOFF, SoC clock gating
+(`ClockGating`: MMHUB/ATHUB/HDP/IH/SDMA/SMUIO), GC clock gating
+(`GfxClockGating`), MMHUB/ATHUB power gating, memory (UCLK) and fabric (FCLK)
+DPM and deep sleep. `requirement` states what each needs: SMU feature bits,
+display admission (`DisplayAdmission`: watermark sets/PMFW watermark table,
+DML DRAM- and FCLK-change support, stutter with the deep-sleep DCEFCLK floor,
+bandwidth floors) and driver readiness (GFXOFF-safe GC access, RLC safe mode,
+validated recovery). `Policy::new()`/`Default` disable everything; `request`
+refuses with `NotValidated` while `HARDWARE_VALIDATED` is false.
+`OptIn::parse(Option<&str>)` reads the `amdgpu.navi22_pg=` value (tokens
+`gfxoff`, `cg`, `gfxcg`, `hubpg`, `memdpm`, `fclkdpm`, `ds`, `wm`; any unknown
+token yields `OptIn::NONE`), and `request_opted_in(feature, admission, driver,
+optin)` opens a gate only for a named feature whose display and driver-software
+prerequisites hold (`NotOptedIn` otherwise), waiving only the hardware
+validation facts. `revoke` closes a gate.
+
+`amdgpu_navi22_power_saving::plan(optin, admission, driver) -> Plan` evaluates
+every feature (pure; `Plan::blocks`, `smu_enable`, per-feature `refusals`);
+`readiness()` reports RLC safe mode implemented, recovery unvalidated and GC
+access GFXOFF-safe only after `amdgpu_navi22_gfxoff::declare_submission_guarded`.
+`amdgpu_navi22_platform::power_saving(value)` (fb calls it only when the boot
+argument is present) runs `ColdBoot::apply_power_saving`: optional PMFW
+watermark upload (`amdgpu_dcn30_watermarks`: `navi22_ranges`, `encode`,
+`notify` over the DAL mailbox, as `dcn3_notify_wm_ranges`), clock gating
+(`amdgpu_navi22_gating::Gating::set_clockgating(gate, Blocks)`, Linux IP order
+common→gmc→ih→gfx→sdma, reverse to ungate, GC under RLC safe mode),
+`Smu::update_gating_features(mask, enable)` (only `GATING_FEATURES`,
+smu_cmn_feature_update_enable_state with running-set and protection checks),
+the initial `DisallowGfxOff`, and UCLK/FCLK hard minimums at the admitted
+floors (`ClockManager::hard_min`). It then starts the GFXOFF controller.
+`remove_power_saving` stops GFXOFF and undoes the rest in reverse;
+`ColdBoot::power_saving()` reports what was applied.
+
+`amdgpu_navi22_gfxoff` mirrors `amdgpu_gfx_off_ctrl`: request count starting
+at 1, `DELAY_MS` (100) before `AllowGfxOff`, cancellation by a disable request,
+`DisallowGfxOff` before the count rises, imbalance refused, failed or cancelled
+disallow terminal. `Reference::acquire().await` is the disable reference every
+GC MMIO path (queue submission, `READ_MMR_REG`, the TDR sampler) holds; it is
+a no-op without the opt-in, and must not be awaited with the platform owner
+lock held. Recovery calls `forget_for_reset`; `status()` is diagnostic.
+
+### Navi 22 VCN 3.0 and JPEG 3.0
+
+`amdgpu_discovery::parse_vcn_harvest(blob)` returns the harvested VCN mask from
+the discovery `HARVEST_INFO` table (zero offset: none; bad signature/checksum:
+`BadHarvestTable`). `amdgpu_vcn_navi22::Harvest::navi22(table, revision)` adds
+Linux's Navy Flounder VCN1 quirk (revisions C1/C2/C3/C5/C7/CF/DF);
+`unsafe Harvest::read(gpu, pci_cap, revision)` re-reads the 10 KiB discovery
+copy at boot. The platform applies it to the firmware set; an unreadable table
+disables media only.
+
+`unsafe Media::new(gpu, pci_cap, pool, doorbells, instances, firmware_bytes)`
+resolves each instance's VCN BASE_IDX 0/1 banks from discovery (3.0.0 at
+0x7800/0x7E00, 3.0.1 at 0x7B00/0x12000), GC/NBIO/HDP, and reserves per instance
+the VCPU BO (128 KiB stack, 512 KiB context, 4 KiB fw_shared), 4 KiB decode and
+two encode rings, writeback and IB-test buffers (below 2^40), plus an 8 KiB JPEG
+ring when instance 0 exists. No I/O. Doorbells are 32-bit: decode
+`0x310 + 8i`, encode j `0x312 + j + 8i`, JPEG `0x311`, with NBIO MMSCH0/1
+ranges (size 8). `unsafe start(MediaFirmware, Option<PowerStatus>)` refuses a
+missing per-instance TMR address or a running SMU MM_DPM_PG feature before any
+write, then per instance zeroes the BO, sets fw_shared flags, programs the
+range and runs `vcn_v3_0_start`'s static path with power gating disabled
+(PGFSM all tiles on, no UVD_PG_EN; Linux's default DPG mode is not used),
+MGCG-style clock-gating disable, PSP-TMR cache window 0, VCPU boot with Linux's
+10-reset retry loop (100 × 10 ms samples each), decode RBC and both encode
+rings, then the SCRATCH9 decode and VCN_ENC_CMD_END encode ring tests.
+`unsafe start_jpeg()` honours CC_UVD_HARVESTING, powers UVDJ on and runs
+`jpeg_v3_0_start` plus the JPEG pitch ring test. `test_ib()` runs the decoder
+create/destroy message pair and the encoder session initialize/close pair on
+every started ring and waits (1 s) for the fences; register waits are bounded
+by 100 ms. `unsafe stop()` runs `vcn_v3_0_stop`/`jpeg_v3_0_stop` without
+re-enabling power gating. Each operation has one predecessor state;
+failure, cancellation, revocation and device loss are terminal and retain
+published memory. `status()` returns `Status { state, jpeg, proof }`.
+`route_interrupts(ih, status)` subscribes the started rings' VCN/VCN1
+(client 0x10/0x0e: 124 decode, 119/120 encode) and JPEG (153) sources and
+forwards them to `amdgpu_fence_navi22::Engine::{Vcn0, Vcn1, Jpeg}`.
+
+`amdgpu_video_caps_navi22::{codecs, caps}(kind, harvested)` return Linux's
+Sienna Cichlid `AMDGPU_INFO_VIDEO_CAPS` tables (decode VCN0 with AV1, or VCN1
+when VCN0 is harvested; encode AVC 4096² and HEVC 8192×4352) as
+`DrmAmdgpuInfoVideoCaps`; `None` for an unknown subquery or no VCN.
+`AMDGPU_INFO_VIDEO_CAPS` answers from them with `Published::vcn_harvest`
+(`amdgpu_info::publish_navi22_vcn_harvest`, the harvest the platform read)
+plus every VCN instance absent from discovery: on the RX 6750 XT (VCN1
+harvested) decode is the VCN0 table, AV1 included.
+
+Client media rings (append-only additions, `amdgpu.navi22_accel` only):
+`Media::{client_rings() -> u8, fence_reader() -> MediaFenceReader,
+submit(MediaRing, VmRef, &[Ib], copies),
+client_fences(MediaRing) -> (completed, throttle)}` (and
+`ColdBoot::{client_media, submit_media, media_fences}`) queue client jobs on
+instance 0's decode ring, both encode rings and the JPEG ring once their ring
+and IB tests passed. `amdgpu_navi22_submit::{MediaRing, encode_media,
+validate_media, media_grant, MEDIA_MAX_IBS}` frame them as Linux's
+`amdgpu_ib_schedule` does for vcn_v3_0/jpeg_v3_0: when the job's MMHUB grant
+flushes, (decode/JPEG `insert_start`,) the MMHUB
+`gmc_v10_0_emit_flush_gpu_tlb` (invalidation semaphore acquire, PTB LO/HI,
+request/ACK, release), the ring's PTB-write wait and, when the grant remaps
+the PASID, the `IH_VMID_<vmid>_LUT_MM` write; then `insert_start`, the IBs under the VMID
+(`vcn_v2_0_dec/enc_ring_emit_ib`, `jpeg_v2_0_dec_ring_emit_ib`), the fence on
+the kernel ring's sequence and `insert_end`/`VCN_ENC_CMD_END`. MMHUB
+invalidation engines follow `amdgpu_gmc_allocate_vm_inv_eng` over ring order
+(dec 0, enc 1/4, JPEG 5 with VCN1 harvested, 8 otherwise). JPEG IBs run from
+a kernel copy (`JPEG_IB_SLOT`, 64 KiB per outstanding job) at VMID 0 with
+data at the client's VMID; the JPEG fence is `JPEG_FENCE` in the JPEG
+reservation. Two jobs outstanding per ring; frames are bounded to half the
+ring. Not emitted: the post-flush VM fence (Linux bookkeeping; the job's own
+fence stands in, as on the kernel queues).
+
+`amdgpu_vcn_navi22_cs::{media_ring, ring_id, completed, rings, register,
+unregister, forget_owner, submit, dec_ib_messages, check_dec_msg,
+parse_jpeg_ib, Sessions}` carry the CS side: `AMDGPU_HW_IP_VCN_DEC/ENC/JPEG`
+ring 0 of instance 0 map to ticket ring ids 4/5/7 (`FIRST_ID + index`);
+jobs with a user fence are refused (`no_user_fence`); decode IBs (at most
+`DEC_IB_MAX_DWORDS`) are scanned for messages as
+`vcn_v3_0_ring_patch_cs_in_place` and each checked as `vcn_v3_0_dec_msg`
+(8-byte alignment, 4 dwords, header and create buffers inside the mapping,
+buffer indices inside the claimed length; `NeedsVcn0` when VCN0 is
+harvested and the codec is not H.264/HEVC/VP9), on every instance; decode
+sessions follow `amdgpu_uvd_cs_msg`'s handle rules per client (create: free
+handle or EINVAL/ENOSPC, `MAX_SESSIONS` 40; decode/destroy: own handle or
+EINVAL/ENOENT), all or nothing per job and rolled back when the job never
+reaches the ring, and forgotten when the client's `VmState` drops; JPEG IBs
+pass `amdgpu_jpeg_dec_parse_cs` on the kernel copy; encode IBs are not
+parsed.
+
+### Navi 22 client submission and render ABI
+
+`amdgpu_navi22_submit` queues client IBs on the verified kernel queues:
+`Gfx::submit`, `Compute::submit`, `Sdma::submit(instance, ..)` (and
+`ColdBoot::submit(ring, &mut RingState, VmRef, context, &[Ib])`,
+`ColdBoot::fences(ring) -> (completed, throttle)`) emit what the job's VMID
+grant asks for — `VmRef { vmid, page_table_base, pasid, flush, map_pasid }`:
+a ring-side VM flush (PTB write + GFXHUB invalidation on the ring's engine:
+gfx 0, compute 4, SDMA 13/14; PFP_SYNC_ME on gfx) when `flush`, the
+`IH_VMID_<vmid>_LUT` ← PASID write (`gmc_v10_0_emit_pasid_mapping`, at the
+queue layout's OSSSYS base) when `map_pasid` — preceded by a pipeline sync
+when the job flushes or its context differs from the ring's previous job's
+(`RingState`), then CONTEXT_CONTROL/FRAME_CONTROL on gfx, up to 16 IBs with
+the VMID, then the ring fence. `validate` refuses VMID 0/>15,
+empty or oversized IB lists, unaligned or zero-length IBs. At most two
+submissions are outstanding per ring; a third returns `Busy` without
+touching the ring.
+
+`amdgpu_navi22_cs::{register, unregister, Submitter, ring_id, ring_index,
+job_done, drm_card}` plug the card into the generic render path: after a cold
+boot or recovery whose queues are verified, `register` borrows the GFXHUB
+client VMIDs 1–7 (`ColdBoot::reserve_client_vmids` →
+`Gmc::reserve_client_vmids() -> ClientVmids`; 8–15 stay KFD's,
+`FIRST_KFD_VMID`), registers the card's client VRAM heap
+(`ColdBoot::reserve_client_vram`, retained across recoveries) with
+`amdgpu_gem::register_vram_heap`, and an `amdgpu_cs::Submitter` whose jobs run
+on gfx ring 0, the compute queue (rings 0–3) or SDMA 0/1 under a VMID granted
+per job by the generic `amdgpu_vmid::VmidManager` (`grab_request`, `vm_ref`,
+`vmid_manager`, `entity` build its inputs): a space reuses its VMID without a
+flush until it removes a mapping or changes root, a job waits (bounded, then
+`EBUSY`) when no VMID is idle, and the LUT entry is rewritten only when the
+VMID last mapped another PASID. `Gmc::handle_fault` charges faults on lent
+VMIDs to the IV's PASID (`Fault::pasid`, `FaultOwner::Client`,
+`amdgpu_vmid::record_fault`), which `AMDGPU_INFO_GPUVM_FAULT` reports. A
+recovery's new submitter starts with a fresh manager, so every VMID flushes
+and remaps again. Media jobs (VCN decode/encode, JPEG) run through
+`amdgpu_vcn_navi22_cs` on ticket ring ids 4–7 under a second, MMHUB
+`VmidManager` over the same lent VMID numbers (`register(boot, first,
+last)`), whose PASID remap is honoured only together with a flush
+(`amdgpu_navi22_submit::media_grant`, as `amdgpu_vm_flush` on rings without
+`emit_pipeline_sync`) and written to `IH_VMID_<vmid>_LUT_MM`. Tickets are
+`ring_index(epoch, id) << 32 | seq` with three ring-id bits (`RING_IDS` 8);
+tickets of an earlier recovery epoch read as complete. `amdgpu_vm::VmState`
+tracks eight ring slots. Fences are read
+by `amdgpu_cp_navi22::FenceReader` (`ColdBoot::client_fence_reader`) without
+the owner. `unregister` runs at the start of recovery.
+
+Generic paths it uses (shared with Navi48): the `FENCE` chunk
+(`Submission::user_fence`, written with the job's ticket when `retire` frees
+it), `GEM_METADATA`, PRIME export/import of amdgpu GEM objects
+(`AmdgpuDmaBufFile`, `GemState::import`), CPU-mapped GEM lifetime
+(`GemState::mapping_object`) and implicit sync on `BO_HANDLES`-listed
+buffers, whose fence contexts are the Navi 22 ticket ring indices.
+`HW_IP_INFO` keeps the Navi 22 multi-ring mask (`amdgpu_info_navi22`) while
+the card's submitter serves the IP, and reports 0 otherwise. Navi 22 shares
+the `amdgpu_vmid` reuse with Navi48.
+`GEM_MMAP` returns its offset at byte 0 of the 8-byte union;
+`drm_ioctl_bridge::{get_client, without_kms}` answer `GET_CLIENT` on primary
+nodes and `VERSION`/`GET_CAP` on amdgpu nodes without KMS state;
+`SYNCOBJ_WAIT` returns `-ETIME` on timeout and `-EINVAL` for an unsubmitted
+syncobj without `WAIT_FOR_SUBMIT`; `amdgpu_ctx` QUERY_STATE/QUERY_STATE2
+report recoveries.
 
 ### Navi 22 DCN3.0 DMUB startup
 
@@ -3251,9 +3751,11 @@ builder; legacy/unsupported layouts fail before any hardware operation.
 NBIO and HDP 5.0.x, then reserves owned VRAM. It requires exclusive physical-GPU ownership,
 permanent mappings, and firmware/VBIOS belonging to this board.
 
-`quiesce().await` checks the DMUB enable fuse, requests `STOP_FW` when inherited
-firmware runs, and requires both matching GPINT acknowledgement and stop reply
-within 100 ms. Timeout leaves the attempt failed without forced recovery.
+`quiesce().await` checks the DMUB enable fuse (`Error::Unsupported` when the
+DMCUB is fused off: the boot drops the DMUB owner and continues, as
+`dm_dmub_hw_init` does), requests `STOP_FW` unless DMCUB is already held in
+reset, and waits up to 100 ms for the GPINT acknowledgement and stop reply.
+Like `dmub_dcn20_reset`, a timeout is logged and the reset forced.
 It holds DCN3.0 `DMCUB_CNTL.SOFT_RESET` (bit 17) and `MMHUBBUB_SOFT_RESET`
 (dword `0x341`, bit 8), disables execution, and clears mailbox pointers/status.
 It never uses DCN31's separate CNTL2 reset or dword `0x342` hub reset.
@@ -3368,16 +3870,51 @@ constructors return a `Send + 'static` owner which may leave `with_controller`
 before `run` is polled. This copies no physical ownership: callers must still
 exclude reset/PM/other clients and retain permanent mappings for the session.
 
-`ColdBoot::run().await` executes optional memory training → SOS bootstrap →
+`ColdBoot::run().await` executes optional reset-on-init → optional memory training → SOS bootstrap →
 ring creation → trusted-memory setup → SMC upload → SMU version handshake →
 optional board PowerPlay upload → optional DMUB quiesce → graphics upload/autoload → RLC boot check →
 optional board calibration/protected GFX DPM setup → optional memory hubs →
-optional SDMA execution test → optional DMUB start.
+optional GART → optional IH enable → optional SDMA execution test → optional SDMA TRAP
+interrupt round trip → optional DMUB start → optional kernel queues → fence
+interrupts → optional VCN start/ring tests (`Media`) → JPEG (`Jpeg`) → VCN IB
+tests (`MediaIbTests`).
 Production cold boot emits a serial `start` and terminal `complete` or
 `failed` checkpoint for each stage. A pending/cancelled stage emits no false
 completion; checkpoints do not run per poll or write training-owned framebuffer
 memory. These markers identify startup progress, not native-display readiness.
-`ColdBoot::prepare_memory_hubs()` reserves the above VMID0 backing before run;
+`unsafe ColdBoot::prepare_reset(device)` adds `Stage::ResetOnInit` before every
+firmware stage, as Linux's `nv_need_reset_on_init` does for every posted discrete
+Navi: when MP0 C2PMSG_81 shows a running SOS, `amdgpu_reset_navi22::Reset`
+caches PCI state (type-0 header, PCIe DevCtl/LnkCtl/DevCtl2/LnkCtl2 and
+Resizable BAR controls), clears bus mastering, and issues a mode1 reset through
+PMFW (`Mode1Reset`, PMFW >= 58.26) or else through the PSP
+(`GFX_CTRL_CMD_ID_MODE1_RST` after TOS ready). After the 500 ms settle — with no
+MMIO while config space is reset — it restores and verifies config space,
+waits up to 2 s for the PSP bootloader (C2PMSG_35 bit 31) and 100 ms for NBIO
+MEMSIZE, and brackets the reset with the ATOM BIOS_SCRATCH_3 engine-hung flag.
+A card without running SOS is not reset (`Ok(None)`). Either way the stage then
+posts as `amdgpu_device_need_post`/`amdgpu_device_asic_init` do: BIOS_SCRATCH_7
+at `adev->bios_scratch_reg_offset` (FirmwareInfo `bios_scratch_reg_startaddr`,
+else nbio_2_3 `mmBIOS_SCRATCH_0`) is read; with `ATOM_S7_ASIC_INIT_COMPLETE`
+set nothing is written, otherwise (and always in `Mode::Recovery`, as
+`amdgpu_device_reinit_after_reset`) ATOM `ASIC_Init` runs from the VBIOS copied
+at construction with PS[0]/PS[1] the FirmwareInfo boot-up sclk/mclk dwords,
+the atomfirmware FB scratch size, register accesses through the device
+authority (past BAR5 via PCIE_INDEX2/DATA2) and every DELAY as a cooperative
+sleep, bounded by atom.c's 20 s same-jump guard and 60 s overall. The bit must
+read back set. `Report::post` / `Reset::post()` (`Post`: scratch base,
+SCRATCH_7 before/after, clocks, opcode/read/write counts, DELAY total,
+anomalies) carry the evidence; `Error::Post(PostError)` (NoVbios, Image,
+NoClocks, NoAsicInit, Allocation, Atom { error, site }, Timeout, Incomplete) is
+terminal like every reset error, and `State::Posting` is retained after
+cancellation. The PCI snapshot also keeps MSI address/data/control and the
+MSI-X Message Control plus, when it lives in BAR5, the MSI-X table, restored
+as `pci_restore_msi_state` (masked enable, table, control). The reset discards
+every inherited scanout, so a boot framebuffer on this card goes dark. Failure
+or cancellation is terminal for the session. Production boot calls it; the
+explicit firmware-only callers may omit it. `Report::reset` carries the method,
+PMFW version, SOS values before/after and MEMSIZE.
+`ColdBoot::prepare_memory_hubs()` reserves the above VMID0 backing and GART before run;
 it requires a prepared board power policy and performs no I/O. Production boot
 always calls it. Explicit firmware-only callers may omit this stage.
 `ColdBoot::prepare_sdma()` reserves the SDMA ring/writeback before run and
@@ -3385,9 +3922,34 @@ requires prepared memory hubs. Production boot also calls it. `Stage::SdmaTest`
 identifies a failure in this stage, with the SDMA error retained.
 `Firmware::prepare_dmub(gpu)` prepares board-specific DMUB backing before
 construction; `ColdBoot::prepare_dmub()` reserves its VRAM after memory hubs
-are prepared. Production boot requires both calls. This places `DmubQuiesce`
-before any PSP DMCUB upload and `DmubStart` after memory-hub/SDMA startup.
-`DmubStart` includes the runtime version/capability handshake above.
+are prepared. Production boot requires both calls.
+`ColdBoot::prepare_interrupts(bus_device)` reserves IH storage after memory
+hubs; `interrupts()` (and `amdgpu_navi22_platform::interrupts().await`)
+returns its `Handle`. `Stage::InterruptTest` fails the boot only on device
+loss or revoked authority. Other failures are printed as `degraded` and
+retained in `Report::interrupts` (`Status::proof`); delivery stays on
+watchdog/polling. This places `DmubQuiesce`
+before any PSP DMCUB upload and `DmubStart` after `FenceInterrupts`, before the
+media stages. `DmubStart` (using the GMC-validated `fb_start`/FB offset, as
+`dm_dmub_hw_init`'s `soc_fb_info`) includes the runtime version/capability
+handshake above; it fails the boot only on device loss or revoked authority,
+otherwise it prints `degraded` and the owner stays `Failed`.
+`Stage::GoldenSettings` (after `Interrupts`, before `SdmaTest`) applies
+`Gfx::golden()` (golden_settings_gc_10_3_2) ahead of SDMA as Linux's GFX
+hw_init does; `GfxSetup` then skips them, and `GfxRing` ends with
+`gfx_v10_3_set_power_brake_sequence`.
+`ColdBoot::prepare_queues(doorbells)` reserves the GFX, KIQ/compute and both
+SDMA queue owners after memory hubs and the SDMA proof; production boot calls it
+when BAR2 maps. After `InterruptTest` the stages `Doorbells`, `GfxSetup`, `Kiq`,
+`ComputeQueues`, `GfxRing`, `SdmaQueues` and `IbTests` follow Linux's
+`nv_common_hw_init`, `gfx_v10_0_hw_init`/`cp_resume`, `sdma_v5_2_start` and
+`amdgpu_ib_ring_tests` order; `Report::queues` is set only when all pass and
+failures are reported as `Error::Queues`.
+`ColdBoot::prepare_media(doorbells)` reserves the VCN/JPEG owner after the
+queues for the firmware set's unharvested VCN mask (nothing when both are
+harvested); `Firmware::harvest_vcn(mask)` applies the mask first. The media
+stages fail the boot only on device loss or revoked authority; every other
+error is printed as `degraded` and the owner retained in `Report::media`.
 `Firmware::prepare_power(gpu, Identity)` prepares the board table before the
 session is constructed; production boot requires it, while explicit
 firmware-only callers may omit it. The bootstrap owner is dropped only
@@ -3400,24 +3962,508 @@ Every attempt prevents replay, and no failure automatically resets hardware or
 destroys device-owned memory. Dropping a session quarantines any memory still
 owned by hardware through the underlying owners' existing rules.
 
-Success returns `Report { smu: Versions, gfx: GfxBootStatus, power: Option<Info>,
+Success returns `Report { reset: Option<reset::Report>, smu: Versions, gfx: GfxBootStatus, power: Option<Info>,
 power_status: Option<PowerStatus>, media_firmware: MediaFirmware,
-memory_aperture: Option<Aperture>, sdma: Option<Proof>, dmub: Option<Status> }`;
+memory_aperture: Option<Aperture>, sdma: Option<Proof>, dmub: Option<Status>,
+interrupts: Option<amdgpu_ih_navi22::Status>, media: Option<amdgpu_vcn_navi22::Status> }`;
 `power` is populated only when the prepared table was uploaded. The session must
 stay alive, or `take_psp()` can transfer its live ring/TMR owner to subsequent
 GPU initialization after full success; that changes state to `Released` and
 prevents a second transfer/run. `gfx_boot_status()` exposes the retained last
 GC sample before transfer, including on failure. These observations do not set
 `AmdGpu::fw_loaded`. Display-aware memory/link DPM, OS thermal interrupts,
-general GPU mappings/queues, VCN startup and real-card validation remain
+general GPU mappings/queues, media submission and real-card validation remain
 separate work.
 
 `ColdBoot::dmub_hpd`, `dmub_aux` and `dmub_notification` expose the typed runtime
 operations only after `FirmwareReady` and while PSP/TMR remains retained.
-They refuse access after `take_psp()`. `dmub_mailbox_state()` also reports failed
+They refuse access after `take_psp()`. `dmub_hpd`/`dmub_aux` additionally
+return `Dmub(Unsupported)` unless `allow_dmub_aux()` was called and the running
+firmware answered QUERY_FEATURE_CAPS: Linux never routes DCN3.0 AUX/HPD through
+DMUB (`dc_is_dmub_outbox_supported` is false outside DCN3.1 DPIA/GC11 unless
+`enable_dmub_aux_for_legacy_ddc`), and `dmub_feature_caps` has no AUX bit.
+
+### Navi 22 DCN3.0 mode math
+
+`amdgpu_dml30::plan_joint(&[Stream], &Soc) -> Result<JointPlan, Error>` is the
+DCN3.0 admission of a whole context (one to six streams, one unscaled linear
+RGB plane each; GPUVM/HostVM, DCC, dynamic metadata, writeback and MPC combine
+off): `dml30_ModeSupportAndSystemConfigurationFull`'s ODM choice per stream
+(`Odm::TwoToOne` when one pipe's DISPCLK exceeds the DFS-rounded ceiling or a
+DSC line is wider than 5184; 4:1, odd widths and more than six pipes are
+refused), ROB and vertical-active bandwidth support (60% SDP / 40% DRAM), then
+`display_mode_vba_30.c`'s performance calculation across every plane — one
+DISPCLK and one DPPCLK DFS step (each plane its 1/255 DPPCLK share), the summed
+read bandwidth, deep-sleep DCFCLK over all planes, extra latency per active
+DPP, one VStartup search (each plane capped at its own MaxVStartupLines), the
+multi-plane DRAM clock change margin (SynchronizedVBlank false: no OTG sync)
+and stutter critical plane, one watermark set, DSC delay (`dscceComputeDelay`)
+and ODM after-scaler allowance — and `display_rq_dlg_calc_30.c` per pipe (an
+ODM slice's viewport, swath and blank end). `Stream { config, dsc:
+Option<Dsc { slices, bits_per_pixel_x16 }>, phy_khz }` (`Stream::tmds(config)`
+for 8-bpc TMDS); `JointPlan { prefetch_mode, clocks, watermarks, hubbub,
+dram_clock_change, urgent_bandwidth_thousandths, planes: Vec<PlanePlan { odm,
+geometry, prefetch, dppclk_khz, dsc_delay, pipes: [Option<PipePlan {
+viewport_x, viewport_width, registers, cursor }>; 2] }> }`. The prefetch-mode
+policy is `dcn30_internal_validate_bw`'s: mode 0, then mode 1 when mode 0 fails
+or leaves the DRAM clock change unsupported; never mode 2. Without p-state
+support the set A p-state watermark is 0 (`dcn30_fpu_calculate_wm_and_dlg`).
+A top DCFCLK below `dcn3_0_soc.min_dcfclk` (500 MHz) is refused.
+`plan(&Config, &Soc) -> Result<Plan, Error>` is the one-stream, one-pipe form
+(`Plan { prefetch_mode, geometry, clocks, watermarks, prefetch, registers:
+amdgpu_dml_regs::Registers, hubbub: WatermarkSet, dram_clock_change,
+urgent_bandwidth_thousandths, cursor }`; a stream needing ODM is
+`Unsupported` there). `dcn3_0_ip` / `dcn3_0_soc` constants (184 KiB DET per
+pipe, 84 PTE requests, 191-cycle ping, 404 us p-state, 15.5/20 us self refresh,
+fabric-adjusted urgent latency) in `amdgpu_dml::Fx` fixed point. Register
+fields are Linux's `(unsigned int)` truncations and are refused (not wrapped)
+when they exceed the DCN3.0 mask; everything fails before hardware is touched.
+`drivers/gpu/tests/navi22_dml30/check.sh <linux>` compiles Linux's own
+`display_mode_vba.c`, `dcn30/display_mode_vba_30.c`,
+`dcn30/display_rq_dlg_calc_30.c` and `calcs/dcn_calc_math.c` on the host and
+runs them under the same policy (`harness.c`, with DCN30's
+`OutputBppPerState[k][VoltageLevel]` DSC-delay index swap corrected) over
+`vectors.txt` (234 single- and multi-stream, cursor, ODM, DSC and rejection
+cases); `dml30_matches_linux_dml_vectors` checks the port against the same
+file within one LSB (two, upward, on deep-sleep DCFCLK).
+
+`Soc::from_board(levels, channels, width, dchub_refclk)` builds the top
+bounding-box state from the DAL DPM table (DCFCLK doubling as fabric clock,
+`memclk*16`, DENTIST-reachable DISP/DPP ceilings, PHY ceiling, VCO).
+`Soc::states(memory_mhz) -> Vec<Soc>` lists one state per lower UCLK level
+ascending, then the top one (deviation: every state keeps the top DCFCLK,
+where Linux pairs each UCLK with `dcn_bw_get_optimal_dcfclk_fclk_for_uclk`'s);
+`plan_joint_lowest(&[Stream], &[Soc]) -> Result<(usize, JointPlan), Error>`
+is `dcn30_internal_validate_bw`'s voltage-level search: the lowest supporting
+state and its plan.
+`amdgpu_dcn_inventory::vram_channels(vbios)` reads `vram_info` v2.5 module 0
+(`channel_num`, `(1 << channel_width) / 8` bytes) as `get_vram_info_v25` does;
+other revisions are refused.
+
+`unsafe amdgpu_dcn30_hubbub::Hubbub::new(gpu, pci_cap)` owns the DCN3.0
+arbiter. `dchub_refclk_khz(dccg_ref)` mirrors `hubbub2_get_dchub_ref_freq`
+but refuses a disabled global timer or a reference outside 40–60 MHz.
+`unsafe program(&WatermarkSet, refclk)` (no HUBP fetching) writes sets A–D
+identically (data/VM-row urgency, trip to memory, SR enter/exit, DRAM clock
+change, FRAC_URG_BW nom/flip), `ARB_SAT_LEVEL = 60 * refclk_mhz`,
+`MIN_REQ_OUTSTAND = 0x1ff`, forces self refresh off, and reads every write
+back; values wider than their DCN3.0 field are refused rather than masked.
+
+### Navi 22 multi-stream contexts, ODM, DSC and DP MST
+
+`amdgpu_navi22_modeset::Resources` is the DCN3.0 pool for several streams:
+`acquire_stream(connector, timing, Odm, dsc) -> Lease { route, odm_pipe, dsc }`
+takes the next pipe, its preferred frontend, a PHY PLL shared with an
+identical synchronizable HDMI timing (`resource_find_used_clk_src_for_sharing`,
+`resource_are_streams_timing_synchronizable`; refcounted, freed by its last
+sharer) or the DP DTO, the ODM secondary pipe from the top of the pool
+(`dcn30_find_split_pipe`) and DSC n for pipe n; `release_stream(&Lease)`.
+`admit(requests, extras, states, vco) -> (Vec<StreamPlan>, JointPlan, Soc)`
+chooses each `Request { link, connector, sink, want, mst }` stream (HDMI by
+`select_hdmi`, DP SST within its verified link by `dp_link::decide_link_settings`
+/ `bandwidth_kbps`, with DSC (`amdgpu_dcn30_dsc::select`) when the
+uncompressed stream does not fit and the sink has DSC and FEC, MST slots
+within one link) and plans them jointly at the lowest supporting state.
+`unsafe Group::new(gpu, cap, &[Request])`, `unsafe enable(power, pool,
+tables, board, links, aux: impl Links, draw(k, y, row)) -> Vec<Output>` and
+`disable(tables, aux)` light the context as `dc_commit_state`:
+`dcn30_init_hw` and the clocks/watermarks once, per stream
+`dcn20_enable_stream_timing` (ODM 2:1 by `optc3_set_odm_combine` after the
+timing), `link_set_dpms_on` (HDMI; DP SST; DP SST with DSC: engines, encoder
+and OPTC config, FEC-ready training through
+`amdgpu_dcn30_dp_link::train_with_retries_fec`, FEC on, DPCD 0x160, PPS on
+VPG generic 11..14; DP MST: the shared link trained once in MST mode, the
+stream's SAT row, ACT, ALLOCATE_PAYLOAD and VC rate), then every front end
+under its OTG lock (`hubp.select_vtg`, an ODM slice's viewport at its offset).
+`leases()`, `plans()`, `joint()`, `members()`, `state() -> GroupState`.
+Pipeline additions: `set_odm_combine`, `set_odm_bypass`,
+`mpc_rate_control_off`; `Hubp::{program_at, select_vtg}`.
+
+`amdgpu_dcn30_dsc` is the DCN2.0 DSC block as DCN3.0 instantiates it:
+`select(timing, dsc_caps, fec_caps, link_kbps) -> Option<DscConfig>`
+(`compute_config_dcn20`: the 1188/1200 MHz encoder rules), `plan(timing,
+cfg, odm) -> Plan { config, picture, engine, odm }`, `engine_values`, and
+`Dsc::{power, start, stop, optc, encoder, pps, fec_ready, fec_enable}`
+(`dsc2_set_config`/`dsc2_enable`, `dccg` DSC forward, `DOMAIN16+n` power
+gating, `enc3_dp_set_dsc_config`, `optc3_set_dsc_config`,
+`enc3_dp_set_dsc_pps_info_packet`, `enc2_fec_set_ready/enable`);
+`sink_caps(aux)` reads DPCD 0x60 and 0x90. `amdgpu_dcn30_dp_link`'s
+`Source::fec_ready` (default no-op) and `train_with_retries_fec(.., fec)`
+add `dp_set_fec_ready` (DPCD 0x120) to the shared training.
+
+`amdgpu_dcn30_mst` is DCN3.0's 8b/10b MST source: `Source::{allocation(
+transmitter, &[Allocation]), vc_rate(fe, (x, y))}`
+(`dcn10_link_encoder_update_mst_stream_allocation_table`,
+`enc1_stream_encoder_set_throttled_vcp_size`), `NativeAux`, `Link { start,
+add, remove, edid, stop }` over the shared `dp_mst_mgr` sideband manager,
+`budget(pixel_khz, link_kbps) -> Option<(pbn, slots, vc)>` and
+`link_kbps(rate, lanes, fec)`; DIG and VBIOS transmitter mode 5 (DP_MST).
+
+### Navi 22 VBIOS display command tables
+
+DCN3.0 sets `dmub_command_table` (`dcn30_resource.c`), so while DMUB runs
+`command_table2.c` sends these tables to DMCUB. `amdgpu_navi22_bios::Tables::new(vbios)`
+validates the image; `.with_dmub(Some(&route))`, where
+`DmubRoute::new(Option<&mut Dmub>)` is `Some` only for a running DMUB with an
+idle mailbox (`Dmub::vbios_ready`), routes every call through the `VbiosDmub`
+trait to `Dmub::execute_vbios(VbiosCommand, payload)`: one `DMUB_CMD__VBIOS`
+(128) inbox command with sub-type `DigxEncoderControl` (0, 12-byte payload),
+`Dig1TransmitterControl` (1, 60), `SetPixelClock` (2, 16) or
+`EnableDispPowerGating` (3, 4), executed synchronously and bounded by 100 ms
+(`dc_wake_and_execute_dmub_cmd(WAIT)`); a timeout fails the mailbox and the
+call (`Error::Dmub`). On the DMUB path table revisions are not checked
+(the `*_fallback` helpers also go to DMUB); DIG1TransmitterControl uses the
+v1.6 struct for a revision-6 table and the v1.7 data otherwise. Without
+DMUB the tables run on the ATOM interpreter (logged), with
+`amdgpu_atomfirmware_allocate_fb_scratch`'s FB scratch size and the bus's
+`now_ms` driving atom.c's 20 s loop guard.
+`pipe_power_gating(bus, pipe, Init|Disable|Enable)`
+(EnableDispPowerGating v2.1), `set_pixel_clock(bus, &PixelClock { otg, pll,
+transmitter, pixel_100hz, deep_color })` (v1.7, combo PHY PLL, UNIPHY encoder
+object, HDMI mode, XTALIN reference; `pixclk_100hz` is the deep-colour-scaled
+`actual_pix_clk_100hz` verbatim and `deep_color_ratio` the
+`transmitter_color_depth_to_atom` code), `hdmi_stream_setup(bus, dig, pixel_khz)`
+(DIGxEncoderControl v1.5 STREAM_SETUP) and `transmitter(bus, &Transmitter)`
+(DIG1TransmitterControl v1.6/1.7, as `dcn10_link_encoder_enable_tmds_output`)
+fill the `atomfirmware.h` blocks exactly as `command_table2.c` does; the ATOM
+path refuses other table revisions. `Bus` (BAR5 dword `Mmio`, bounded by the
+mapping) carries register access, DELAY and `now_ms`; an out-of-window access
+or port I/O fails the table with `Error::Bus`. The interpreter ends a table at
+an undecodable opcode or out-of-table jump and resumes after a bad SWITCH case
+(atom.c), counting each as an `Anomaly`.
+
+`amdgpu_atom_vm` now follows `atom.c` when `AtomState::bios`/`data_table` are
+bound: `SET_DATA_BLOCK` takes absolute offsets from the master data table (255
+selects the table start), ID operands read the image, every table execution
+(including each CALLTABLE callee) gets its own zeroed WS from its header
+(`ResolvedTable::ws_dwords`), and DELAY opcodes call `AtomState::delay_us`.
+Unbound, the synthetic-table behaviour is unchanged.
+The VM is generic over `Hooks<'a>` (`reg_read`/`reg_write`, `pll_*`/`mc_*`
+defaulting to zero as SOC15 `cail_*`, `resolve`, `table_absent`, `delay_us`,
+`now_ms`); `AtomState<'a, H = Closures<'a>>` derefs to its hooks, so the
+closure fields keep working. `Machine::start(state, id, ps)` /
+`Machine::from_bytes` + `Machine::step(state) -> Step::{Continue, Delay(us),
+Done}` execute one opcode at a time with an explicit CALLTABLE stack, so async
+callers sleep between opcodes; `execute_table`/`execute_bytes` drive it
+synchronously. IIO (`ATOM_IIO_*`, indexed from data table 23 like
+`atom_index_iio`; read program `port`, write program `0x80|port`) is executed;
+sub-dword destinations keep the raw saved bits; SHL/SHR shift the raw value;
+MUL32/DIV32 are 64-bit; a CALLTABLE to a zero directory entry is a no-op. PS/WS/FB
+range, PCI/SYSIO and undefined-IIO cases continue as in Linux and are counted in
+`AtomState::anomalies`/`first_anomaly`; the same-jump stuck guard is 20 s by
+`now_ms` (65 536 repeats / 1 000 000 opcodes without a clock).
+
+### Navi 22 native HDMI and DP SST scanout (opt-in)
+
+`unsafe amdgpu_dcn30_hdmi::Hdmi::new(gpu, pci_cap, dig, transmitter)` owns one
+DIG frontend/VPG and backend in Linux's split: `connect_to_otg(otg)`
+(`enc1_dig_connect_to_otg`), `setup(DigMode)` (`dcn10_link_encoder_setup`),
+`setup_stereo_sync(otg)`, `connect_be_to_fe(bool)` (one-hot FE source,
+others kept), `stream_attribute(khz)` (RGB, 8 bpc, no scrambling — refused at
+or above 340 MHz), `info_packets(&avi)`, `stop_info_packets()`,
+`set_avmute(bool)` and the no-op `audio_infoframe` hook.
+`amdgpu_dcn30_dp::{Link, Stream}` are the DIO DP halves (`enc1_configure_encoder`,
+TPS1–4, passthrough/video idle, `link_encoder_disable`; MSA, VSC SDP via VPG,
+`enc2_stream_encoder_dp_unblank` M/N and stream enable,
+`enc1_stream_encoder_dp_blank`); `dp::Aux` is the sink transport
+(`amdgpu_navi22_display::DisplayAux` over native AUX). VBIOS
+`Transmitter { action, transmitter, mode, lanes, hpd, connector, symbol_khz }`
+marshals v1.6/v1.7 (SETUP_VSEMPH via `Tables::transmitter_lane`, HPO 0).
+
+HDMI 2.0 on DCN3.0 (m5hdmi): `hdmi::stream_for(edid, &timing, max_bpc,
+limited, Limits { hdmi6g, max_phy_khz }) -> Option<Stream>` chooses amdgpu_dm's
+format (4:2:0-only modes as 4:2:0; else RGB at the deepest declared depth up to
+`amdgpu.max_bpc`, 2-bpc step-down; else 4:2:0-also) against
+`dcn10_link_encoder_validate_hdmi_output` (600 MHz, HDMI_6GB_EN from
+`amdgpu_dcn_inventory::encoder_caps`) and DML30's `min(600, PHYCLK)`.
+`Stream { format: Format { depth, ycbcr420, limited }, pixel_khz,
+character_100hz, character_khz, scramble: Scramble::{Off, LowRate, Above340},
+scdc, avi, vendor }` carries the halved TMDS pixel clock, `phy_pix_clk`, the
+scrambling decision (> 340 MHz, or LTE_340Mcsc) and the AVI/HDMI-VIC vendor
+InfoFrames. `write_scdc_data(ddc, &stream)` (Sink/Source_Version, TMDS_Config
+0/1/3; fails only a scrambled stream), `read_scdc_data` and
+`write_scdc_legacy(ddc, scdc_present)` (disable/unplug, best effort) speak SCDC
+over `dp::Aux::scdc_read/scdc_write` (default: unsupported;
+`DisplayAux` implements them on the HDMI connector's I2C engine at 0x54).
+`Hdmi::hdmi_stream_attribute(&stream)` programs depth/scrambler/1/4 clock rate,
+`hdmi_info_packets(&stream)` sends AVI (packet 0) and vendor (packet 1) in
+Linux's order; a VPG conflict that never clears is logged, not fatal.
+`unsafe hdmi::Formatter::new(gpu, cap, pipe)` owns the pipe's FMT (dynamic
+expansion, SPATIAL8/10 dither, full-range clamp, 4:2:0 subsampling), OTG 4:2:0
+container (OPTC_DATA_FORMAT, H_TIMING_DIV_MODE), MPC OCSC (sRGB / sRGB limited /
+YCbCr709, coefficient set A) and DPG black. `Pipeline::hdmi_output()` exposes
+the admitted stream to the unplug path.
+
+`amdgpu_navi22_modeset::Resources::acquire(&connector)` is the DCN3.0 pool:
+first free pipe, the preferred DIG FE (= transmitter) or else the last free
+one, `dc_resource_find_first_free_pll` for TMDS, the DP DTO for DP.
+`choose(&reports)` picks a connected HDMI sink, else the first DP sink with
+EDID and DPCD. `unsafe Pipeline::new(gpu, pci_cap, connector, route)` claims
+the route's pipe and DIG plus the DAL clock owner and HUBBUB; `unsafe
+enable(power, pool, tables, Board, links, sink, aux, draw)` runs
+`dcn30_init_hw` (dccg2_init, golden init, VGA off) and the GOP takeover
+(`amdgpu_dcn30_takeover`: `enc3_hw_init`, plane power gating, `dcn10_init_pipes`,
+`dce110_power_down`; pipe 5 never power gated), then the DAL clocks and mode,
+prepare_bandwidth (clocks then watermarks), `dcn20_enable_stream_timing`
+(OPTC/OTG clock enable with bounded waits, SetPixelClock + PHYPLL resync or
+DP DTO phase/modulo, timing, OPP black, `enable_crtc`, one frame),
+`link_set_dpms_on` (HDMI: setup, STREAM_SETUP, attributes, AVI, transmitter
+ENABLE, setup, BE→FE, AVI, AVMUTE off; DP: setup, MSA/VSC, PHYCLK floor,
+BE→FE, `amdgpu_dcn30_dp_link::train_with_retries` at the least verified link
+carrying the mode, setup, unblank; see "Navi 22 DP link layer"),
+then the front end under `optc3_lock` and a two-frame underflow watch.
+`Output` carries the route, trained `DpLink` and `Inherited` GOP state.
+Failure records `State::Failed { step, error }` and undoes only started steps
+(no zero-clock SetPixelClock); cancellation keeps `State::At(step)` and
+`disable(tables, aux)` retires it. `check_underflow()` turns an OTG/HUBP
+underflow black and sets `State::Quarantined`. `ColdBoot::modeset_hdmi()`
+detects, `choose`s, acquires a route and lights with `test_pattern`.
+The pipeline budgets DCN30's one 256-wide 32-bpp cursor in DML30 as
+`dcn20_populate_dml_pipes_from_context` does (`Config::cursors` ≤ 1: CNVC
+cursor DPPCLK delay, cursor bandwidth and urgent burst in the prefetch and
+urgent-fraction checks, `Plan::cursor` = `calculate_ttu_cursor`) and programs
+`DCN_CUR0_TTU_CNTL0/1` with the HUBP. After the front end latches it starts
+the stream's audio through `amdgpu_dcn30_audio::Audio::start_for_sink`
+(`ClockManager` implements `AzaliaWake` with DALSMC 0x11); teardown stops it
+first; audio errors are logged and never fail the display.
+Kernel-test builds route every display owner's `amdgpu_reg_window::Window`
+through one attachable register model (`amdgpu_navi22_modeset_model`).
+
+### Navi 22 HDMI and DP audio
+
+`unsafe amdgpu_dcn30_audio::Audio::new(gpu, pci_cap)` owns the DCCG audio DTO
+(DCN base index 1), every Azalia endpoint and function-parameter register,
+and the audio fields of each DIG's AFMT/HDMI/DP_SEC block (base index 2). The
+HD-Audio function (1002:ab28, `narf_audio::hda`, ATI codec 0x1002aa01) is a
+separate owner. `unsafe start(AudioStream, AudioInfo, &mut impl AzaliaWake)`
+and `unsafe start_for_sink(stream, edid, wake)` (ELD fields from
+`amdgpu_navi48_boot::sink_audio_info`; `Ok(None)` without audio) run after
+unblank on a stream whose OTG runs with the DIG routed to it, and refuse a
+stream whose samples or DP audio packets are already on. They run
+`dce_aud_hw_init` and the endpoint scan once, `find_first_free_audio`,
+`dce110_setup_audio_dto` (lowest HDMI pipe: DTO0 from its pixel clock; DP
+only: DTO1 from the 730 MHz DPREFCLK with 512 Fs), `enc3_se_hdmi_audio_setup`
+(AFMT, ACR N/CTS at 8 bpc) or `enc3_se_dp_audio_setup`, `dce_aud_az_configure`
+(HDMI blanking rate filter; none for DP SST 8b/10b), the HDMI Audio InfoFrame
+on line 2, `AzaliaWake::wake_azalia` (Linux's `dcn3_enable_pme_wa`,
+`DALSMC_MSG_BacoAudioD3PME`), `dce_aud_az_enable`, the DP secondary audio
+packets, unmute and a readback check. `stop(dig, wake)` runs before blank:
+mute, AFMT clock and DP audio packets off (the DP master enable stays while
+video packets need it), the PME workaround, the HDMI Audio InfoFrame off and
+`dce_aud_az_disable`; every step runs and the first error is returned.
+`record(dig)` reports `Record { stream, audio: DisplayAudio, state }`; a
+failure or cancelled start is retained (`Failed { step, error }` /
+`Programming(step)`) with its endpoint, never replayed, and only `stop`
+releases it.
+
+### Navi 22 native presentation and KMS
+
+Pipeline hooks: `request(Option<Timing>)` makes `enable` light exactly that
+timing (`select_wanted`: it must be in `offered`, else `NoMode` before any
+write); `admitted()` is the retained `Admitted { soc, refclk_khz, plan,
+offered }` (`offered(sink, soc, vco)`: every distinct EDID timing inside the
+TMDS ceiling that DML30 admits); `scanout_address()`/`scanout_mapping()`;
+`unsafe release_scanout()` returns the activation surface after a successful
+`disable`.
+
+`unsafe amdgpu_dcn30_flip::Flip::new(gpu, pci_cap, pipe)` owns a pipe's
+HUBPREQ flip/address/interrupt and OTG status registers (DCN base index 2):
+`program(addr)` is `hubp3_program_surface_flip_and_addr` (VSYNC flip, VMID 0,
+stereo/TMZ off, low address last; 48-bit, 256-byte aligned), `pending()` is
+`hubp2_is_flip_pending` (FLIP_PENDING or EARLIEST_INUSE != requested),
+`wait(timeout_us, wake)` polls it to completion or `Timeout` (the flip stays
+armed), `set_interrupt`/`ack(Interrupt::{Flip, Vupdate, Vblank})` are
+`irq_service_dcn30`'s SURFACE_FLIP_INT_MASK/CLEAR and
+OTG_GLOBAL_SYNC_STATUS VUPDATE_NO_LOCK/VSTARTUP enable/clear, and
+`position()` samples OTG_STATUS_POSITION with a stable 24-bit frame count.
+`unsafe amdgpu_dcn30_cursor::Cursor::new(gpu, pci_cap, pipe)`:
+`show(addr, (w, h), at, viewport, (refclk, pixclk))` programs
+`hubp2_cursor_set_attributes` + `dpp3_set_cursor_attributes` (premultiplied
+ARGB, 256-pixel pitch, no degamma) and the position under
+`mpc1_cursor_lock` (CUR_VUPDATE_LOCK_SET, base index 3); `move_to`, `hide`.
+`placement` follows amdgpu_dm `get_cursor_position` and
+`hubp2_cursor_set_position` (negative origin into the hotspot, 256x256 cap).
+
+`unsafe amdgpu_navi22_scanout::Scanout::new(gpu, pci_cap, pipe, front, map,
+timing, refclk)` adopts the lit surface as buffer 0: `prepare_back(pool,
+flush)` reserves/clears/publishes buffer 1, `upload_back(x, y, row)` writes
+it, `flip(flush)` HDP-flushes, arms and waits up to `flip_timeout_us` (four
+frames + 20 ms, at least 50 ms) for EARLIEST_INUSE, then swaps roles;
+failure enters `State::Failed` with both buffers reserved.
+`enable_interrupts(ih)` subscribes to `source::{pflip, vupdate}(pipe)` and
+then enables them; vectors only shorten the wait. `set_cursor`,
+`move_cursor`, `hide_cursor`, `position()`, `stop()` and `unsafe release()`.
+
+`ColdBoot::{modeset_display(connector, sink, want, draw), stop_display(),
+display_scanout(), display_admitted(), display_output(),
+prepare_display_back_buffer(), flip_display(), set_display_cursor()}` own
+these. `into_recovery` re-prepares DMUB and the display owner from the
+retained VBIOS/routes so the recovered sequence restarts DMUB.
+
+`amdgpu_navi22_kms` holds DRM state: `MAX_CRTCS` (4, the shared id scheme's
+outputs) CRTCs — CRTC 0 (pipe 0, id 1) the single-pipe owner's, CRTCs 1..3
+(`Kms::secondary`) lit only together with it as one multi-stream context —
+and one connector per board route (ids per `amdgpu_navi48_kms`); connectors offer
+the DML30-admitted timings (`Kms::reconcile_sinks(reports, offered)`), a DP
+sink's bounded by its verified link (`modeset::offered_on(sink, soc, vco,
+verified)`, `dp_validate_mode_timing`; the receiver-caps ceiling until
+verified). Automatic routing takes an HDMI sink first, else the first DP one, for
+CRTC 0; with `set_auto_multi(true)` (fb: the `amdgpu.navi22_multi` flag) each
+remaining lightable connector takes the next free secondary CRTC, otherwise
+only DRM routes them. Every connector may drive every CRTC
+(`possible_crtcs`); routing a connector steals it from another CRTC.
+`crtc_at(d)`, `crtc_of(connector)`, `targets()`, `published_at(d)`,
+`offered_at`/`find_mode_at`, and `next_group(running) -> GroupAction {
+Nothing, Unlight, Light(Vec<(crtc, connector, want)>) }` (a context is wanted
+while a secondary CRTC wants a sink; any change relights it whole; a failed
+attempt waits for the next request, `attempted_group`).
+`request_display_{active,route,mode}`, `request_connector_crtc`,
+`display_offers` (TEST_ONLY/SETCRTC validation), `restore_displays`, `publish`
+apply to any CRTC. `display_admission(admitted, streams)` (`DisplayAdmission`:
+DML30 DRAM clock change; `watermarks` the HUBBUB half — sets A-D programmed
+from the plan — which power saving ANDs with its PMFW table upload;
+stutter/FCLK/deep sleep false). `amdgpu_native_kms`
+dispatches the DRM bridges to Navi22 once it published, else Navi48.
+`amdgpu_navi22_platform::{modeset_displays(draw), spawn_display_monitor(),
+flip_display(), set_display_cursor(), set_hw_cursor(), present_frame(),
+native_present_ready(), crtc_vblank(), vblank_time(), display_admission(),
+relight_after_recovery()}`: only CRTC 0 presents and has vblank. Each
+monitor pass first converges the multi-stream context (`converge_group`):
+the single pipe is torn down, then every wanted CRTC lights through
+`ColdBoot::modeset_group(requests, draw)` (stopped by `stop_group()`;
+`group_outputs()`, `group()`, `flush_group_scanout()`), the console follows
+stream 0, the other scanouts are static, and `display_admission` reports the
+context's lowest-state plan; when the context fails CRTC 0 lights alone.
+Publication withdraws the console and drains
+`scanout_access` before any teardown; recovery withdraws and stops the pipe
+before reset and the monitor relights once `recoveries()` increments. The fb
+handoff calls `modeset_displays` and the monitor with `amdgpu.native_display`
+(`amdgpu.navi22_hw_cursor` opts into the hardware cursor; display detection
+runs only with `amdgpu.native_display` or `amdgpu.display_probe`).
+
+### Navi 22 DP link layer, hot-plug and link loss
+
+`amdgpu_dcn30_dp_link` is Linux DC's 8b/10b SST link policy for the DIO,
+driving `dp::Aux` (now with `set_timeout_us`, `connected` and `delay_us`
+defaults) and a `Source` (`dp::DioSource { link, phy }`: enable_dp_output,
+training patterns, video idle, common-level SETUP_VSEMPH per lane,
+disable_output). `retrieve_caps(aux, VbiosLttpr)` is `retrieve_link_cap`:
+LTTPR timeout (3.2 ms), `dp_retrieve_lttpr_cap` on VBIOS-LTTPR-aware boards
+(`VbiosLttpr::from_vbios`: DCE_INFO display_caps 0x40 aware / 0x20
+non-transparent, `amdgpu_dcn_inventory::lttpr_caps`), else
+`wake_up_aux_channel`; transparent mode and the echoed count for a chain;
+receiver caps with 20 post-OUI retries; the 552 us timeout without a chain;
+extended caps and the DPRX feature list. `Caps::{max_link, eq_pattern}` are
+`dp_get_max_link_cap` (HBR3 x4 encoder; a DPCD 1.4 chain bounds it) and
+`decide_eq_training_pattern` (TPS4/TPS3/TPS2 by sink support only). The LTTPR
+mode is `dp_decide_8b_10b_lttpr_mode` (not aware: none). Training is
+`dp_perform_link_training`: exit, LTTPR mode (non-transparent reads each
+repeater's interval), channel coding, link settings (0.5% downspread,
+enhanced framing, POST_LT_ADJ_REQ_GRANTED below TPS4), hop-by-hop repeaters
+(farthest first, TPS4, `repeater_training_done`, source drive only for the
+hop next to it), CR (5 same-swing / 100 total, max-VS stop) and EQ (6 tries,
+CR-lost partial/full), adjust requests as `dp_decide_lane_settings`
+(maximized, PE capped by VS), then `dp_transition_to_video_idle` (5 ms and
+`dp_check_link_loss_status`, or `perform_post_lt_adj_req_sequence`).
+`train_with_retries` is a commit's `perform_link_training_with_retries`
+(4 attempts at one setting, no fallback, +50 ms delays);
+`verify_link_cap` is `dp_verify_link_cap_with_retries` (2 rounds) with
+`decide_fallback` (`decide_fallback_link_setting`: CR → rate first, EQ →
+lanes first); `decide_link_settings` and `mode_fits` are
+`decide_dp_link_settings` / `dp_validate_mode_timing`; `handle_hpd_rx_irq`
+is the SST part of `dp_handle_hpd_rx_irq` (`RxEvent::{None, AutomatedTest,
+LinkLoss}`; ESI block from DPCD 1.4; loss only with the sink in D0). AUX
+transport failures abort and disable the source; FEC, the source OUI, eDP,
+DPIA and fixed-VS paths are not implemented.
+
+`Pipeline` for DP: `set_lttpr_policy`, `assume_link_cap(Option<DpLink>)`
+(skip verification for a sink verified before with the same caps),
+`link_cap()`, `dp_caps()`; `enable` retrieves caps and verifies the link
+after `init_hw` and the clock start (`ClockManager::link_rate_floor`), then
+selects with `select_dp_on` against it. `check_dp_link(aux)`,
+`retrain(tables, aux)` (`dp_handle_link_loss`: audio, blank, link off,
+same-setting training, unblank; the front end keeps scanning out; failure
+leaves `At(Step::Link)` for `disable`) and `disable_unplugged(tables, ddc)` (no
+DPCD transaction; an HDMI SCDC sink still gets `link_set_dpms_off`'s
+unchecked legacy TMDS_Config write via `hdmi::write_scdc_legacy`; resumes an
+interrupted stop). `amdgpu_navi22_display::Display`
+retains each connector's verified link keyed by its receiver caps
+(`verified_link`, `set_verified_link`), and adds `hpd_sense(index)` and
+`aux_timeout(index, us)`. `ColdBoot::{display_hpd_senses(),
+forget_display_link(i), display_link_cap(i, dpcd), check_display_link(),
+retrain_display(), stop_unplugged_display()}` serve the platform display
+monitor, which each pass (1 s, or woken by HPD/HPD-RX vectors): tears the lit
+display down without AUX when its HPD falls (connector disconnected),
+re-detects every connector when any HPD changes or pulses (EDID inventory of
+dark connectors; a pulsed lit sink is stopped and relit), checks the lit DP
+link and retrains on loss, stopping it to relight from a fresh verification
+if retraining fails; then converges KMS as before.
+
+### Navi 22 native AUX, DDC and HPD
+
+`unsafe amdgpu_dcn30_ddc::Ddc::new(gpu, pci_cap, crystal_khz)` claims all six DCN3.0 AUX
+engines and DDC pads, the shared hardware I2C engine and all six HPD blocks
+(Navi22 profile only; DCN base index 2 bounded to `DC_GPIO_AUX_CTRL_5`, base
+index 1 to `MICROSECOND_TIME_BASE_DIV`). `bind(line, hpd, Signal)` performs the
+AUX half of `enc3_hw_init` (`AUX_DPHY_RX_CONTROL0` 0x103d1110, TX 0x21c7a,
+`AUX_HPD_SEL`, quarter receive window), a 552 us AUX timeout, opens the HPD pin
+in interrupt mode, enables `DC_HPD_EN` if firmware left it clear and programs
+`program_hpd_filter` delays (HDMI 500/100 ms, DP 80/0 ms); a DP line without
+HPD is refused. `hpd`/`hpd_raw` read `DC_HPD_SENSE_DELAYED`/`DC_HPD_SENSE`;
+`hpd_ack` mirrors `hpd0_ack` (ack, then arm the opposite polarity);
+`hpd_rx_ack`/`hpd_interrupt` program the IH-facing bits. `aux(line, AuxRequest)`
+is `dce_aux_transfer_with_retries` over `dce_aux_transfer_raw` (7 attempts, DEFER
+budget, 3 timeouts, 2 invalid replies, ACKM status polling, NACK/HPD-loss
+terminal); `dpcd_read`/`dpcd_write` bound payloads to 16 bytes. `i2c(line, Mode,
+messages)` is `link_query_ddc_data`: I2C-over-AUX in 16-byte MOT chunks, or one
+hardware I2C command (`dcn2_i2c_hw_construct`: 538-byte buffer, setup limit 3,
+100 kHz from `MICROSECOND_TIME_BASE_DIV`, or from the VBIOS crystal
+(`dce_refclk_10khz`) when a reset DCN has not been through `dccg2_init`;
+≤256 bytes per message). Pads are
+opened/closed exactly as `dal_ddc_open`/`dal_ddc_close` per transaction.
+DMCU/hardware-owned engines return `Engine`; every wait is bounded; a dropped
+future releases arbitration and restores pads synchronously; an all-ones read
+returns `DeviceGone` and leaves the owner `Failed`.
+
+`amdgpu_navi22_display::Display` binds every HDMI/DP VBIOS path (DDC line and
+HPD from the record list/GPIO LUT; a shared line or HPD is refused) and
+`detect(index)`/`detect_all()` return `Disconnected`, `Connected(Sink { edid,
+preferred, hdmi, dpcd })` or per-connector `Failed(error)`: HPD first, the 16-byte
+DPCD receiver capability field for DP, then a checksummed EDID (base plus up to
+four extensions, E-DDC segment pointer past block 1, four tries per block) over
+I2C-over-AUX or the hardware I2C engine. Only owner loss fails the whole probe.
+`Firmware::prepare_display(gpu)` decodes routes before device I/O and
+`ColdBoot::prepare_display()` claims the owner without I/O; both are optional
+for firmware bring-up. `ColdBoot::detect_displays().await` requires
+`FirmwareReady` (as does `ColdBoot::detect_display(index).await`, one
+connector's sink read, which the monitor uses for the long-pulse
+`same_edid` check that keeps an unchanged lit stream), and `amdgpu_navi22_platform::detect_displays().await`
+serializes it through the retained owner. The framebuffer boot handoff logs one
+line per connector after a successful firmware run; detection reads sinks only. `dmub_mailbox_state()` also reports failed
 or cancelled transport attempts without accessing hardware.
 
+HPD over the IH ring: `Display::arm_hpd_interrupts()` is `amdgpu_dm_hpd_init`
+over DCN3.0's irq service (every HPD/HPD_RX source acked and disabled, then
+HPD on per wired connector and HPD_RX on for DP; `hpd0_ack` re-arms the
+opposite polarity), `hpd_event(instance, rx)` is `dc_interrupt_ack` and
+returns the connector index. `ColdBoot::arm_display_hpd()` subscribes to
+`amdgpu_ih_navi22::source::DCN_HPD` before arming and returns the
+subscription; `ColdBoot::display_hpd(Hpd)` acknowledges one vector.
+`amdgpu_navi22_display::serve_hpd(sub, ack)` drives them and bumps
+`HOTPLUG` (`version`, `notify`, `wait(&mut since, period_ms)` with a 50 ms
+floor), and the platform's runtime services spawn it and wake the display
+monitor; without an IH ring polling runs alone. A freshly enabled HPD block
+is polled up to 1 s for its connect filter before detection reports
+`Disconnected`.
+
 ### Navi 22 boot ownership and framebuffer handoff
+
+`amdgpu_navi22_platform::start_fault_service().await` runs once after a
+successful boot: it subscribes to `VMC_FAULT` and `UTCL2_FAULT`, then unmasks
+the GMC fault interrupts and spawns one task per source that attributes each
+entry through `Gmc::handle_fault` under the owner lock. The first 16 faults
+are logged; `fault_count()` counts all of them. The framebuffer handoff calls
+it; a failure only logs, and faults then stay masked (default-page redirect).
 
 `amdgpu_navi22_platform::prepare(physical_boot_framebuffer)` is an unsafe,
 single-CPU boot-only entry. It requires a posted physical GPU, permanent probe
@@ -3568,27 +4614,55 @@ paths; only the tables differ.
   (`dispatch_async`, for card and render nodes) queues a validated
   `AMDGPU_CS` and returns the engine's sequence as the handle, and
   `AMDGPU_WAIT_CS` parks until it completes or the client's absolute
-  monotonic deadline passes (status 0/1). `AMDGPU_GEM_WAIT_IDLE` there
-  waits for the open's last jobs (`VmState::last_jobs`) and the buffer's
-  reservation fences (any open's jobs that listed it) and reports the
-  buffer's preferred domains. `dispatch_async` notes every submitted job on its
-  address space. `AMDGPU_CHUNK_ID_SYNCOBJ_IN`/`_OUT` and `BO_HANDLES` are
-  accepted: in-syncobjs must hold a fence (EINVAL without, ENOENT unknown)
-  and are waited for before queueing — the ioctl waits, where Linux's
-  scheduler would hold the job; out-syncobjs get the job's `JobFence`
-  (signalled through `Submitter::signalled`); every listed BO must be the
-  open's (ENOENT), with no residency. Implicit sync (amdgpu_cs_sync_rings /
-  amdgpu_cs_submit): before queueing, the ioctl waits for every unsignalled
-  fence on each listed BO's reservation (`GemObject::dma_buf`) except the
-  target ring's own (`JobFence` context: card << 32 | ring) and except on
-  `EXPLICIT_SYNC` buffers; the job then becomes each listed BO's WRITE
-  fence. amdgpu opens now
-  route the DRM syncobj ioctls (0xbf..=0xc5) to their own table
-  (`drm_ioctl_bridge::dispatch_syncobj`). `DEPENDENCIES` name a context
-  the open owns (EINVAL otherwise) on the engine's ring (others
-  `Unsupported`) and are waited for before queueing; `SCHEDULED_DEPENDENCIES`
-  are validated only, as every earlier job of the single in-order ring is
-  already scheduled. Timeline syncobjs are still refused. Without a submitter, CS parses and is refused as before
+  monotonic deadline passes (status 0/1; a negative s64 deadline waits
+  forever, `amdgpu_gem_timeout`). Every `drm_amdgpu_fence`-shaped handle
+  (WAIT_CS, WAIT_FENCES, FENCE_TO_HANDLE, DEPENDENCIES) resolves through
+  `amdgpu_ctx_get_fence`'s rules: the context must be the open's and the
+  IP/ring one the engine runs (EINVAL), 0 is signalled, `!0` the ring's last
+  job, a handle of another ring or past the ring's last emitted job EINVAL.
+  `AMDGPU_GEM_WAIT_IDLE` waits for the buffer's reservation fences, and for
+  the open's last jobs (`VmState::last_jobs`) only on a `VM_ALWAYS_VALID`
+  buffer (Linux's shared root reservation); unknown handles ENOENT.
+  `dispatch_async(card, cmd, arg, &CsOpen { vm, gem, ctx, syncobjs,
+  bo_lists, files })` also answers `AMDGPU_WAIT_FENCES` (all/any, count 0
+  EINVAL, all stops at the first timeout, any reports `first_signaled`,
+  `!0` on timeout) and `AMDGPU_FENCE_TO_HANDLE` (GET_SYNCOBJ,
+  GET_SYNCOBJ_FD, GET_SYNC_FILE_FD through `files`; other `what` EINVAL),
+  with or without a registered submitter. CS chunks: `SYNCOBJ_IN`/`OUT`,
+  `SYNCOBJ_TIMELINE_WAIT`/`SIGNAL` (`Submission::{in,out}_syncobjs` of
+  `SyncobjPoint { handle, flags, point }`; one post-dependency chunk; an
+  unknown out-syncobj EINVAL, in-syncobj ENOENT, no fence/point EINVAL or,
+  with WAIT_FOR_SUBMIT, waited up to 5 s then ETIME), `BO_HANDLES` or a
+  `bo_list_handle` (not both, EINVAL; unknown list ENOENT), `FENCE`,
+  `DEPENDENCIES`/`SCHEDULED_DEPENDENCIES`. In-fences and dependencies are
+  waited for before queueing — the ioctl waits, where Linux's scheduler
+  would hold the job. Out points get the job's `JobFence`
+  (`SyncObjCore::add_point` for a non-zero point, the payload otherwise).
+  Implicit sync (amdgpu_cs_sync_rings / amdgpu_cs_submit): before queueing,
+  the ioctl waits for every unsignalled fence on the reservation of each
+  listed BO and of the user-fence BO, except fences of the open's own
+  address space (`DrmFence::owner` == `VmState::owner`,
+  `AMDGPU_SYNC_NE_OWNER`) and except on `EXPLICIT_SYNC` buffers; the job
+  then becomes each of those BOs' WRITE fence. A BO the job does not list
+  gets no fence, as in Linux.
+- `amdgpu_bo_list`: `dispatch(cmd, arg, &BoListTable, &GemState)` is
+  `DRM_IOCTL_AMDGPU_BO_LIST` (CREATE / UPDATE / DESTROY, entries read as
+  `amdgpu_bo_create_list_entry_array` reads them, > 128 Ki EINVAL, unknown
+  BO ENOENT, UPDATE of an unknown list ENOENT, DESTROY of one succeeds);
+  `read_entries` is shared with the BO_HANDLES chunk.
+- DRM syncobjs (`drm::syncobj`, `drm::syncobj_ioctl`): a handle names a
+  shared `SyncObjCore` whose payload is a fence or a `FenceChain`
+  (`dma_fence_chain`, with `find_seqno` / `query_point` and walk-time
+  collection); `FenceArray` and the `to_drm_leaves` / `from_drm_leaves`
+  adapters bridge to sync_file leaves. `syncobj_ioctl::dispatch(nr, arg,
+  table, timeline, ctx)` (user opens; array waits park through
+  `IoctlContext::restart_after`) and `dispatch_sync` (kernel callers, no fd
+  ioctls, 15 s cap) serve CREATE, DESTROY, HANDLE_TO_FD / FD_TO_HANDLE
+  (opaque `SyncobjFile` fds and EXPORT/IMPORT_SYNC_FILE), WAIT, RESET,
+  SIGNAL and, when `timeline` (amdgpu; EOPNOTSUPP otherwise),
+  TIMELINE_WAIT, QUERY, TRANSFER, TIMELINE_SIGNAL and EVENTFD, with
+  `drm_syncobj.c`'s errnos. amdgpu reports `DRM_CAP_SYNCOBJ_TIMELINE` = 1
+  (`drm_ioctl_bridge::amdgpu_cap_value` / `amdgpu_get_cap`). Without a submitter, CS parses and is refused as before
   and GEM_WAIT_IDLE reports idle. `pm4::Pm4Builder::vm_flush` builds the in-ring VM flush
   (shared by GMC 11 and 12).
 
@@ -4033,10 +5107,10 @@ depth, and the primary address's low half is written last because that is what
 arms it. A surface off a 256-byte request boundary, past the pipe's 48-bit
 addressing, at address zero, or narrower than its own viewport is refused. The
 chroma request sizes are cleared rather than left behind, so a previous owner's
-chroma plane cannot keep fetching. `blank` waits for the pipe's outstanding
-requests to retire before reporting success, so scanout memory is never released
-with a fetch in flight; a power-gated pipe reads back zero and needs no wait,
-and a pipe that never retires times out rather than being called blanked.
+chroma plane cannot keep fetching. `blank` waits up to 100 ms for the pipe's
+outstanding requests to retire; a power-gated pipe reads back zero and needs no
+wait. As `hubp2_set_blank_regs`' REG_WAIT, a pipe that never retires is logged,
+counted (`blank_stalls()`) and blanked anyway.
 
 `amdgpu_dcn_plane` programs the rest of the plane path. The DPP and OPP banks are
 DCN base index 2 while the MPC bank is index 3. `Dpp::program` enables the pipe

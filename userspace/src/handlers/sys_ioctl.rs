@@ -22,14 +22,16 @@ impl narf_filesystem::IoctlContext for DeviceIoctlContext {
     fn write(&self, address: u64, source: &[u8]) -> Result<(), narf_filesystem::FsError> {
         // SAFETY: same syscall/address-space contract as read; racing unmaps
         // are caught by the guarded copy rather than faulting the kernel.
-        unsafe { copy_to_user(address, source) }
-            .map_err(|_| narf_filesystem::FsError::BadAddress)
+        unsafe { copy_to_user(address, source) }.map_err(|_| narf_filesystem::FsError::BadAddress)
     }
 
     fn nonblocking(&self) -> bool {
         self.nonblocking
     }
-    fn file(&self, number: i32) -> Result<Arc<dyn narf_filesystem::FileOps>, narf_filesystem::FsError> {
+    fn file(
+        &self,
+        number: i32,
+    ) -> Result<Arc<dyn narf_filesystem::FileOps>, narf_filesystem::FsError> {
         crate::fd::with_table(current_task_id(), |t| {
             t.get(number as u32).map(|entry| entry.ops.clone())
         })
@@ -70,8 +72,8 @@ impl narf_filesystem::IoctlContext for DeviceIoctlContext {
         // get_unused_fd_flags(O_CLOEXEC) first, then dma_resv_get_singleton
         // + sync_file_create, then copy_to_user, and fd_install only once the
         // number reached the caller (put_unused_fd otherwise).
-        let reservation = fd::reserve(current_task_id())
-            .ok_or(narf_filesystem::InstallFdError::NoDescriptor)?;
+        let reservation =
+            fd::reserve(current_task_id()).ok_or(narf_filesystem::InstallFdError::NoDescriptor)?;
         let file = DrmSyncFile::from_singleton(fences);
         report(reservation.fd() as i32).map_err(narf_filesystem::InstallFdError::Report)?;
         reservation
@@ -111,7 +113,9 @@ impl narf_filesystem::IoctlContext for DeviceIoctlContext {
 /// file of another type.
 fn sync_file_leaves(task: u64, fd: i32) -> Option<Vec<Arc<dyn narf_filesystem::DrmFence>>> {
     let ops = fd::with_table(task, |table| {
-        table.get(u32::try_from(fd).ok()?).map(|entry| entry.ops.clone())
+        table
+            .get(u32::try_from(fd).ok()?)
+            .map(|entry| entry.ops.clone())
     })
     .flatten()?;
     ops.as_any()
@@ -396,7 +400,10 @@ impl DrmSyncFile {
     }
 
     fn leaves(&self) -> Vec<Arc<dyn narf_filesystem::DrmFence>> {
-        self.points.iter().map(|point| point.fence.clone()).collect()
+        self.points
+            .iter()
+            .map(|point| point.fence.clone())
+            .collect()
     }
 
     /// `dma_fence_is_signaled(sync_file->fence)`. Every leaf is sampled so
@@ -439,7 +446,10 @@ impl DrmSyncFile {
         }
         // fence_cmp: ascending context, later seqno first within a context.
         pending.sort_by(|x, y| {
-            let (xc, yc) = (x.fence.context().unwrap_or(0), y.fence.context().unwrap_or(0));
+            let (xc, yc) = (
+                x.fence.context().unwrap_or(0),
+                y.fence.context().unwrap_or(0),
+            );
             xc.cmp(&yc).then(y.fence.seqno().cmp(&x.fence.seqno()))
         });
         let mut points: Vec<SyncPoint> = Vec::with_capacity(pending.len());
@@ -636,11 +646,7 @@ impl narf_filesystem::FileOps for DrmSyncFile {
         Box::pin(async { Err(narf_filesystem::FsError::Unsupported) })
     }
 
-    fn write<'a>(
-        &'a self,
-        _offset: u64,
-        _buf: &'a [u8],
-    ) -> narf_filesystem::FsFuture<'a, usize> {
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
         Box::pin(async { Err(narf_filesystem::FsError::Unsupported) })
     }
 
@@ -810,7 +816,9 @@ mod tests {
         let early = DrmSyncFile::device(Arc::new(Seq(7, 1)));
         let late = DrmSyncFile::device(Arc::new(Seq(7, 9)));
         let same = DrmSyncFile::merge(&early, &late, &[0; 32]);
-        if same.points.len() != 1 || same.array_context.is_some() || same.points[0].fence.seqno() != 9
+        if same.points.len() != 1
+            || same.array_context.is_some()
+            || same.points[0].fence.seqno() != 9
         {
             return TestResult::Fail("same-context merge must keep only the later fence");
         }
@@ -1285,9 +1293,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 }
                 TIOCSPGRP => {
                     let caller_sid = read_sid(process_state_key(task));
-                    if task_ctty(task) != Some(pty_id)
-                        || ops.tty_session() != Some(caller_sid)
-                    {
+                    if task_ctty(task) != Some(pty_id) || ops.tty_session() != Some(caller_sid) {
                         ctx.set_return(errno_ret(ENOTTY));
                         return;
                     }
@@ -1322,6 +1328,45 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 }
                 _ => {}
             }
+        }
+    }
+
+    // The console's devfs nodes (`/dev/console`, `/dev/tty`, `/dev/ttyN`) share
+    // the console line discipline's foreground group with fd 0's
+    // `ConsoleFile`, which keeps it in task-id space (what `read_pgid` and the
+    // SIGTTIN check compare). The devfs node's own TIOCSPGRP stored the
+    // caller's *visible* pid verbatim, so the getty systemd starts on
+    // /dev/tty1 (`tcsetpgrp(0, getpid())`) became a background reader of its
+    // own terminal: SIGTTIN stopped it at "login:". Translate both directions
+    // at the syscall boundary, exactly as `ConsoleFile` does.
+    if ops.tty_id() == Some(crate::handlers::CTTY_CONSOLE) && ops.as_pty_master_id().is_none() {
+        use narf_filesystem::devfs_pty::{TIOCGPGRP, TIOCSPGRP};
+        if cmd == TIOCSPGRP {
+            let mut raw = [0u8; core::mem::size_of::<i32>()];
+            // SAFETY: copy_from_user validates the user pid_t.
+            if unsafe { copy_from_user(&mut raw, arg as u64) }.is_err() {
+                ctx.set_return(errno_ret(EFAULT));
+                return;
+            }
+            let visible = i32::from_ne_bytes(raw);
+            if visible < 0 {
+                ctx.set_return(errno_ret(EINVAL));
+                return;
+            }
+            narf_filesystem::console_tty::set_fg_pgrp(pgid_from_user(visible as u64));
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
+        }
+        if cmd == TIOCGPGRP {
+            let fg = narf_filesystem::console_tty::fg_pgrp_or_install(current_task_pgid());
+            let visible = pgid_to_user(fg) as i32;
+            // SAFETY: copy_to_user validates the user pid_t.
+            if unsafe { copy_to_user(arg as u64, &visible.to_ne_bytes()) }.is_err() {
+                ctx.set_return(errno_ret(EFAULT));
+            } else {
+                ctx.set_return(SyscallReturn::ok(0));
+            }
+            return;
         }
     }
 
@@ -1360,12 +1405,19 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         // exactly as open(2) would — `do_dentry_open` drops O_CREAT/O_EXCL/
         // O_NOCTTY/O_TRUNC, and O_CLOEXEC is not a file status flag.
         let open_flags = arg as u32;
-        let new_fd = fd::install(task, fd::FdEntry {
+        let new_fd = fd::install(
+            task,
+            fd::FdEntry {
                 ops: ops_dyn,
                 offset: 0,
-                flags: if open_flags & fd::O_CLOEXEC != 0 { fd::FD_CLOEXEC } else { 0 },
+                flags: if open_flags & fd::O_CLOEXEC != 0 {
+                    fd::FD_CLOEXEC
+                } else {
+                    0
+                },
                 status_flags: open_flags & (fd::O_ACCMODE | fd::O_SETFL_MASK),
-            });
+            },
+        );
         match new_fd {
             Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),
             None => ctx.set_return(errno_ret(EMFILE)),
@@ -1383,7 +1435,10 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         // Export works from a card node OR a render node (a render node reports
         // the card index it renders for); `drm_prime_export` keys on that index
         // either way. Mesa may export from either fd it holds.
-        if let Some(card_idx) = ops.as_drm_card_index().or_else(|| ops.as_drm_render_index()) {
+        if let Some(card_idx) = ops
+            .as_drm_card_index()
+            .or_else(|| ops.as_drm_render_index())
+        {
             // struct drm_prime_handle { u32 handle; u32 flags; s32 fd; }
             let handle = read_user_u32(arg as u64);
             // UAPI drm.h aliases DRM_CLOEXEC to O_CLOEXEC (0x80000) and
@@ -1423,12 +1478,15 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     return;
                 }
             };
-            let new_fd = fd::install(task, fd::FdEntry {
+            let new_fd = fd::install(
+                task,
+                fd::FdEntry {
                     ops: dmabuf,
                     offset: 0,
                     flags: if prime_flags & DRM_CLOEXEC != 0 { 1 } else { 0 },
                     status_flags: 0,
-                });
+                },
+            );
             match new_fd {
                 Some(f) => {
                     write_user_u32(arg as u64 + 8, f); // drm_prime_handle.fd
@@ -1471,9 +1529,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         };
         let imported = match ops.drm_prime_import_file(&buf_ops) {
             Ok(handle) => Ok(handle),
-            Err(narf_filesystem::FsError::Unsupported) => {
-                buf_ops.as_prime_gem_handle().ok_or(())
-            }
+            Err(narf_filesystem::FsError::Unsupported) => buf_ops.as_prime_gem_handle().ok_or(()),
             Err(narf_filesystem::FsError::OutOfMemory) => {
                 ctx.set_return(errno_ret(ENOMEM));
                 return;
@@ -1526,12 +1582,15 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             if let Some(nsfd) = flavour.and_then(|f| namespace_fd_for_task(target_task, f)) {
                 let ops_dyn: Arc<dyn narf_filesystem::FileOps> = nsfd;
                 // Linux mints these O_CLOEXEC (pidfs open_namespace).
-                let new_fd = fd::install(task, fd::FdEntry {
+                let new_fd = fd::install(
+                    task,
+                    fd::FdEntry {
                         ops: ops_dyn,
                         offset: 0,
                         flags: crate::fd::FD_CLOEXEC,
                         status_flags: 0,
-                    });
+                    },
+                );
                 match new_fd {
                     Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),
                     None => ctx.set_return(errno_ret(EMFILE)),
@@ -1623,9 +1682,8 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             return;
         }
         let flags = u32::from_ne_bytes(execbuf[0..4].try_into().unwrap());
-        let known_flags = VIRTGPU_EXECBUF_FENCE_FD_IN
-            | VIRTGPU_EXECBUF_FENCE_FD_OUT
-            | VIRTGPU_EXECBUF_RING_IDX;
+        let known_flags =
+            VIRTGPU_EXECBUF_FENCE_FD_IN | VIRTGPU_EXECBUF_FENCE_FD_OUT | VIRTGPU_EXECBUF_RING_IDX;
         if flags & !known_flags != 0 {
             ctx.set_return(errno_ret(EINVAL));
             return;
@@ -1772,10 +1830,15 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             // SIOCETHTOOL: a command the device's driver does not implement
             // is `__dev_ethtool`'s -EOPNOTSUPP, not an unknown ioctl.
             const SIOCETHTOOL: u32 = 0x8946;
+            // NVME_IOCTL_IO_CMD / NVME_IOCTL_IO64_CMD on a controller node:
+            // recognised, refused (no I/O-queue passthrough) — EOPNOTSUPP,
+            // not the ENOTTY of an unknown ioctl.
+            const NVME_IOCTL_IO_CMDS: [u32; 2] = [0xC048_4E43, 0xC050_4E48];
             if cmd == DRM_IOCTL_SET_CLIENT_CAP
                 || cmd == DRM_IOCTL_MODE_ATOMIC
                 || DRM_IOCTL_VBLANK.contains(&cmd)
                 || cmd == SIOCETHTOOL
+                || NVME_IOCTL_IO_CMDS.contains(&cmd)
             {
                 ctx.set_return(errno_ret(EOPNOTSUPP));
                 return;
@@ -1946,7 +2009,9 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         Err(narf_filesystem::FsError::BadAddress) => {
             ctx.set_return(errno_ret(EFAULT));
         }
-        Err(narf_filesystem::FsError::BrokenPipe | narf_filesystem::FsError::StreamXrun) => ctx.set_return(errno_ret(EPIPE)),
+        Err(narf_filesystem::FsError::BrokenPipe | narf_filesystem::FsError::StreamXrun) => {
+            ctx.set_return(errno_ret(EPIPE))
+        }
         Err(narf_filesystem::FsError::NoDevice) => ctx.set_return(errno_ret(ENODEV)),
         Err(narf_filesystem::FsError::BadFileState) => ctx.set_return(errno_ret(77)),
         Err(narf_filesystem::FsError::StreamSuspended) => ctx.set_return(errno_ret(86)),
@@ -2005,8 +2070,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             ctx.set_return(errno_ret(EFAULT));
         }
         Err(narf_filesystem::FsError::InvalidData)
-            if cmd == 0x541B
-                && ops.stat().mode.file_type == narf_filesystem::FileType::Fifo =>
+            if cmd == 0x541B && ops.stat().mode.file_type == narf_filesystem::FileType::Fifo =>
         {
             // pipe_ioctl(FIONREAD) returns put_user() directly, so an invalid
             // result pointer is EFAULT rather than an invalid ioctl argument.

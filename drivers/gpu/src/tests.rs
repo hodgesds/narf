@@ -2062,14 +2062,15 @@ kernel_test_in!(
 );
 
 fn smoke_amdgpu_atom_vm_bad_opcode_rejected() -> TestResult {
-    use crate::amdgpu_atom_vm::{execute_bytes, AtomError, AtomState};
-    let code: &[u8] = &[127, 91]; // 127 == ATOM_OP_CNT (out of range)
+    use crate::amdgpu_atom_vm::{execute_bytes, Anomaly, AtomState};
+    // 127 == ATOM_OP_CNT: atom.c breaks out of the table, returning 0.
+    let code: &[u8] = &[127, 91];
     let mut state = AtomState::new(4, 4);
     let mut ps: [u32; 0] = [];
     match execute_bytes(&mut state, code, &mut ps, 0) {
-        Err(AtomError::BadOpcode(127)) => TestResult::Pass,
-        Err(_) => TestResult::Fail("wrong AtomError variant"),
-        Ok(()) => TestResult::Fail("bad opcode silently accepted"),
+        Ok(()) if state.first_anomaly == Some(Anomaly::BadOpcode(127)) => TestResult::Pass,
+        Ok(()) => TestResult::Fail("bad opcode not recorded as an anomaly"),
+        Err(_) => TestResult::Fail("bad opcode aborted instead of ending the table"),
     }
 }
 kernel_test_in!(
@@ -2142,10 +2143,14 @@ fn smoke_amdgpu_atom_vm_calltable_shifts_the_parameter_window() -> TestResult {
         1 => Some(ResolvedTable {
             body: CALLER,
             ps_dwords: 2,
+            start: 0,
+            ws_dwords: None,
         }),
         2 => Some(ResolvedTable {
             body: CALLEE,
             ps_dwords: 1,
+            start: 0,
+            ws_dwords: None,
         }),
         _ => None,
     });
@@ -2173,6 +2178,8 @@ fn smoke_amdgpu_atom_vm_calltable_shifts_the_parameter_window() -> TestResult {
         1 => Some(ResolvedTable {
             body: LOOP,
             ps_dwords: 0,
+            start: 0,
+            ws_dwords: None,
         }),
         _ => None,
     });
@@ -2681,7 +2688,8 @@ kernel_test_in!(
 fn smoke_amdgpu_psp_ring_create_sequence() -> TestResult {
     use crate::amdgpu_psp::{
         gfx_ctrl_cmd_id, ring_control, ring_create, MockPsp, PspError, MP0_C2PMSG_64_REL,
-        MP0_C2PMSG_69_REL, MP0_C2PMSG_70_REL, MP0_C2PMSG_71_REL, PSP_STATUS_DONE_BIT,
+        MP0_C2PMSG_69_REL, MP0_C2PMSG_70_REL, MP0_C2PMSG_71_REL, PSP_RING_TYPE_KM,
+        PSP_STATUS_DONE_BIT,
     };
     let mp0_base = 0x000B_0000;
     let ready = mp0_base + MP0_C2PMSG_64_REL;
@@ -2692,7 +2700,7 @@ fn smoke_amdgpu_psp_ring_create_sequence() -> TestResult {
     m.stage_read(ready, PSP_STATUS_DONE_BIT);
 
     let ring_phys: u64 = 0xDEAD_BEEF_0000_1000;
-    if ring_create(&mut m, mp0_base, ring_phys, 0x1000, 1).is_err() {
+    if ring_create(&mut m, mp0_base, ring_phys, 0x1000, PSP_RING_TYPE_KM).is_err() {
         return TestResult::Fail("ring create errored on happy path");
     }
     if m.writes.len() != 4 {
@@ -2707,9 +2715,10 @@ fn smoke_amdgpu_psp_ring_create_sequence() -> TestResult {
     if m.writes[2] != (mp0_base + MP0_C2PMSG_71_REL, 0x1000) {
         return TestResult::Fail("ring size in bytes goes to C2PMSG_71");
     }
-    // The ring type is shifted into bits 31:16.
-    if m.writes[3] != (ready, 0x0001_0000) {
-        return TestResult::Fail("ring type is written to C2PMSG_64 shifted left sixteen");
+    // The KM ring type is shifted into bits 31:16: INIT_GPCOM_RING, never
+    // INIT_RBI_RING (0x0001_0000).
+    if m.writes[3] != (ready, 0x0002_0000) || gfx_ctrl_cmd_id::INIT_GPCOM_RING != 0x0002_0000 {
+        return TestResult::Fail("KM ring type is written to C2PMSG_64 shifted left sixteen");
     }
 
     // GFX_CTRL_CMD_ID values are already positioned in bits 31:16, so a
@@ -2725,7 +2734,7 @@ fn smoke_amdgpu_psp_ring_create_sequence() -> TestResult {
 
     // Nothing ready: the wait must time out rather than publish the ring.
     let mut m = MockPsp::new();
-    match ring_create(&mut m, mp0_base, 0x1000, 0x1000, 1) {
+    match ring_create(&mut m, mp0_base, 0x1000, 0x1000, PSP_RING_TYPE_KM) {
         Err(PspError::Timeout) => {}
         _ => return TestResult::Fail("expected a timeout when sOS never signals ready"),
     }
@@ -6723,11 +6732,11 @@ fn smoke_drm_syncobj_signal_unbound_attaches_fence() -> TestResult {
     use crate::drm::syncobj::SyncObjTable;
     let mut tbl = SyncObjTable::new();
     let h = tbl.create(0).unwrap();
-    if tbl.get(h).unwrap().fence.is_some() {
+    if tbl.get(h).unwrap().fence().is_some() {
         return TestResult::Fail("new syncobj should have no fence");
     }
     tbl.signal_handles(&[h]).unwrap();
-    if tbl.get(h).unwrap().fence.is_none() {
+    if tbl.get(h).unwrap().fence().is_none() {
         return TestResult::Fail("signal should bind a fence");
     }
     if !tbl.get(h).unwrap().is_signalled() {
@@ -6748,7 +6757,7 @@ fn smoke_drm_syncobj_reset_clears_fence() -> TestResult {
         return TestResult::Fail("SIG create should be signalled");
     }
     tbl.reset_handles(&[h]).unwrap();
-    if tbl.get(h).unwrap().fence.is_some() {
+    if tbl.get(h).unwrap().fence().is_some() {
         return TestResult::Fail("reset should clear fence");
     }
     if tbl.get(h).unwrap().is_signalled() {
@@ -8477,6 +8486,7 @@ fn smoke_amdgpu_discrete_is_not_an_apu() -> TestResult {
         is_apu: false,
         gc: Some(gc),
         ip_blocks: alloc::vec![ip(HW_ID_GC, 10, 3, 2)],
+        navi22: Default::default(),
     };
 
     // VRAM_GTT reports both, and they differ.
@@ -8486,8 +8496,9 @@ fn smoke_amdgpu_discrete_is_not_an_apu() -> TestResult {
     };
     let vram_size = u64::from_le_bytes(vg[0..8].try_into().unwrap());
     let visible = u64::from_le_bytes(vg[8..16].try_into().unwrap());
-    if vram_size != VRAM {
-        return TestResult::Fail("VRAM_GTT must report the real VRAM size");
+    // Linux reports usable VRAM: real minus pins minus AMDGPU_VM_RESERVED_VRAM.
+    if vram_size != VRAM - (8 << 20) {
+        return TestResult::Fail("VRAM_GTT must report the real VRAM size less the VM reserve");
     }
     if visible != VISIBLE {
         return TestResult::Fail("VRAM_GTT's cpu-accessible size is the aperture, not VRAM");
@@ -8527,7 +8538,10 @@ fn smoke_amdgpu_discrete_is_not_an_apu() -> TestResult {
 
     // The same snapshot as an APU does claim it, so the flag follows the
     // part rather than having been deleted.
+    // Navi 22 cannot be an APU, so the APU twin is a Phoenix.
     let apu = Snapshot {
+        did: 0x15BF,
+        family: Family::Phoenix,
         visible_vram_size: VRAM,
         is_apu: true,
         ..discrete.clone()
@@ -9372,6 +9386,7 @@ fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
         is_apu: true,
         gc: Some(gc),
         ip_blocks: alloc::vec![ip(HW_ID_GC, 11, 0, 1), ip(HW_ID_SDMA0, 6, 0, 1)],
+        navi22: Default::default(),
     };
 
     let decode = |bytes: &[u8]| -> u::DrmAmdgpuInfoDevice {
@@ -9596,7 +9611,8 @@ fn smoke_amdgpu_gem_lifecycle_and_handle_isolation() -> TestResult {
     {
         return TestResult::Fail("GEM_MMAP of a live handle failed");
     }
-    let offset = u64::from_le_bytes(m[8..16].try_into().unwrap());
+    // `union drm_amdgpu_gem_mmap`: out.addr_ptr overlays in at offset 0.
+    let offset = u64::from_le_bytes(m[0..8].try_into().unwrap());
     let frames = match state.mmap_frames(offset, 8192) {
         Ok(f) => f,
         Err(_) => return TestResult::Fail("the GEM_MMAP offset did not resolve to frames"),
@@ -11466,14 +11482,67 @@ fn smoke_amdgpu_cs_parser_rejects_hostile_input() -> TestResult {
         return TestResult::Fail("a chunk shorter than drm_amdgpu_cs_chunk_ib must be refused");
     }
 
-    // ── chunks that are refused rather than ignored ──
-    // A dropped ordering constraint is a race, not an error.
-    {
-        let mut other = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
-        other.header[0] = u::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT;
-        if !matches!(run(&other), Err(FsError::Unsupported)) {
-            return TestResult::Fail("a synchronisation chunk must be refused, never ignored");
+    // ── timeline syncobj chunks parse (amdgpu_cs_p2_syncobj_timeline_*) ──
+    // Each entry is `drm_amdgpu_cs_chunk_syncobj { handle, flags, point }`.
+    let entry = [7u32, 0, 5, 0];
+    let ib = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
+    let header_for = |id: u32| {
+        let at = entry.as_ptr() as u64;
+        [id, 4, at as u32, (at >> 32) as u32]
+    };
+    for (id, signal) in [
+        (u::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT, false),
+        (u::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL, true),
+    ] {
+        let header = header_for(id);
+        let ptrs = [ib.header.as_ptr() as u64, header.as_ptr() as u64];
+        let Ok(sub) = parse(ctx_id, 2, ptrs.as_ptr() as u64, &state, &ctx) else {
+            return TestResult::Fail("a timeline syncobj chunk must parse");
+        };
+        let want = [crate::amdgpu_cs::SyncobjPoint {
+            handle: 7,
+            flags: 0,
+            point: 5,
+        }];
+        let got = if signal {
+            &sub.out_syncobjs
+        } else {
+            &sub.in_syncobjs
+        };
+        if got[..] != want[..] {
+            return TestResult::Fail("timeline chunk entry");
         }
+    }
+    // One post-dependency chunk per submission: SYNCOBJ_OUT and
+    // TIMELINE_SIGNAL together are EINVAL, as are two of either.
+    let signal = header_for(u::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL);
+    let out = {
+        let at = entry.as_ptr() as u64;
+        [
+            u::AMDGPU_CHUNK_ID_SYNCOBJ_OUT,
+            1,
+            at as u32,
+            (at >> 32) as u32,
+        ]
+    };
+    for second in [&signal, &out] {
+        let ptrs = [
+            ib.header.as_ptr() as u64,
+            signal.as_ptr() as u64,
+            second.as_ptr() as u64,
+        ];
+        if !matches!(
+            parse(ctx_id, 3, ptrs.as_ptr() as u64, &state, &ctx),
+            Err(FsError::InvalidData)
+        ) {
+            return TestResult::Fail("a second post-dependency chunk must be EINVAL");
+        }
+    }
+    // An empty syncobj chunk is no error (vmemdup of zero dwords).
+    let empty = [u::AMDGPU_CHUNK_ID_SYNCOBJ_IN, 0, 0, 0];
+    let ptrs = [ib.header.as_ptr() as u64, empty.as_ptr() as u64];
+    if parse(ctx_id, 2, ptrs.as_ptr() as u64, &state, &ctx).is_err() {
+        return TestResult::Fail("an empty SYNCOBJ_IN chunk parses");
     }
     // An unknown chunk id.
     let mut unknown = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
@@ -11629,6 +11698,15 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
     };
     let card = 0x7ffe_0000;
     let syncobjs = narf_lib::sync::IrqSafeSpinLock::new(crate::drm::syncobj::SyncObjTable::new());
+    let bo_lists = crate::amdgpu_bo_list::BoListTable::new();
+    let cs_open = crate::amdgpu_cs::CsOpen {
+        vm: &state,
+        gem: &gem,
+        ctx: &ctx,
+        syncobjs: &syncobjs,
+        bo_lists: &bo_lists,
+        files: None,
+    };
     // A CS of the IB chunk plus `extra` chunks (id, body), in the real
     // three-level layout; the storage lives as long as the request.
     struct Cs {
@@ -11668,10 +11746,7 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
             card,
             cmd,
             arg.as_mut_ptr() as usize,
-            &state,
-            &gem,
-            &ctx,
-            &syncobjs,
+            &cs_open,
         ))
     };
     if run(cs_cmd, &mut cs.clone()) != Err(FsError::Unsupported) {
@@ -11727,11 +11802,14 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
             return Some("GEM_WAIT_IDLE after the job");
         }
         fake.completed.store(0, Ordering::SeqCst);
+        // The job did not list the buffer, so it left no fence there: Linux's
+        // dma_resv wait reports it idle while the job runs (implicit sync
+        // covers listed buffers only).
         let mut w = idle_req(handle);
-        if run(idle_cmd, &mut w).is_err() || u32::from_le_bytes(w[0..4].try_into().unwrap()) != 1 {
-            return Some("GEM_WAIT_IDLE while the job runs");
+        if run(idle_cmd, &mut w).is_err() || u32::from_le_bytes(w[0..4].try_into().unwrap()) != 0 {
+            return Some("GEM_WAIT_IDLE of a buffer the running job did not list");
         }
-        if run(idle_cmd, &mut idle_req(handle + 7)) != Err(FsError::InvalidData) {
+        if run(idle_cmd, &mut idle_req(handle + 7)) != Err(FsError::NotFound) {
             return Some("GEM_WAIT_IDLE of an unknown handle");
         }
         // SYNCOBJ_OUT carries the job's fence; SYNCOBJ_IN needs a fence that
@@ -11771,7 +11849,8 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
         for (chunk, handle, want) in [
             (u::AMDGPU_CHUNK_ID_SYNCOBJ_IN, empty_h, FsError::InvalidData),
             (u::AMDGPU_CHUNK_ID_SYNCOBJ_IN, 0x7777, FsError::NotFound),
-            (u::AMDGPU_CHUNK_ID_SYNCOBJ_OUT, 0x7777, FsError::NotFound),
+            // amdgpu_cs_p2_syncobj_out: drm_syncobj_find NULL is -EINVAL.
+            (u::AMDGPU_CHUNK_ID_SYNCOBJ_OUT, 0x7777, FsError::InvalidData),
         ] {
             let mut c = cs_with(&[(chunk, alloc::vec![handle])]);
             if run(cs_cmd, &mut c.req) != Err(want) {
@@ -11797,8 +11876,9 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
         if run(cs_cmd, &mut c.req) != Err(FsError::NotFound) {
             return Some("BO list naming a foreign handle");
         }
-        // DEPENDENCIES on completed jobs pass; a foreign context or another
-        // engine is refused.
+        // DEPENDENCIES on completed jobs pass; a foreign context, an IP the
+        // engine has no ring for (amdgpu_ctx_get_entity) or a job the ring
+        // never emitted (amdgpu_ctx_get_fence) is -EINVAL.
         let dep =
             |ip: u32, ctx: u32, h: u64| alloc::vec![ip, 0, 0, ctx, h as u32, (h >> 32) as u32];
         let mut c = cs_with(&[(
@@ -11808,9 +11888,18 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
         if run(cs_cmd, &mut c.req).is_err() {
             return Some("CS after a completed dependency");
         }
+        // A sequence past the ring's last emitted job would otherwise wait
+        // until the 32-bit sequence wraps.
+        let mut c = cs_with(&[(
+            u::AMDGPU_CHUNK_ID_DEPENDENCIES,
+            dep(u::AMDGPU_HW_IP_GFX, ctx_id, 1000),
+        )]);
+        if run(cs_cmd, &mut c.req) != Err(FsError::InvalidData) {
+            return Some("a dependency on a never-emitted job");
+        }
         for (ip, cx, want) in [
             (u::AMDGPU_HW_IP_GFX, ctx_id + 99, FsError::InvalidData),
-            (u::AMDGPU_HW_IP_COMPUTE, ctx_id, FsError::Unsupported),
+            (u::AMDGPU_HW_IP_COMPUTE, ctx_id, FsError::InvalidData),
         ] {
             let mut c = cs_with(&[(u::AMDGPU_CHUNK_ID_DEPENDENCIES, dep(ip, cx, 1))]);
             if run(cs_cmd, &mut c.req) != Err(want) {
@@ -11905,10 +11994,7 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
                 card,
                 cs_cmd,
                 c.req.as_mut_ptr() as usize,
-                &state,
-                &gem,
-                &ctx,
-                &syncobjs,
+                &cs_open,
             ));
             let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
             if core::future::Future::poll(job.as_mut(), &mut cx).is_ready()
@@ -11953,10 +12039,7 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
                 card,
                 cs_cmd,
                 c.req.as_mut_ptr() as usize,
-                &state,
-                &gem,
-                &ctx,
-                &syncobjs,
+                &cs_open,
             ));
             let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
             if !matches!(
@@ -12032,6 +12115,15 @@ fn smoke_amdgpu_vm_holds_job_memory_until_its_fence() -> TestResult {
         gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_UNMAP, 0, 0x4_0000_0000, 0, P).ok()?;
         if weak.upgrade().is_none() || deferred(card) == 0 {
             return Some("a job's buffer freed under it");
+        }
+        // amdgpu_vm_clear_freed before the BO reference: the entries are
+        // invalid while the buffer is still held for the job.
+        if vm
+            .leaf_entry(0x4_0000_0000)
+            .is_some_and(|e| e & crate::amdgpu_vm::PTE_VALID != 0)
+            || vm.tlb_seq() != 2
+        {
+            return Some("unmapped buffer still translated while held");
         }
         retire(card, &|seq| seq <= 4);
         if weak.upgrade().is_none() {

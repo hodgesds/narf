@@ -14,10 +14,15 @@ use core::sync::atomic::{fence, Ordering};
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Read, Write};
 
+// linux-ctx: hdr=mp seg=0
+// linux: mmMP0_SMN_C2PMSG_35
 const STATUS: u32 = 0x63;
+// linux: mmMP0_SMN_C2PMSG_36
 const ADDRESS: u32 = 0x64;
+// linux: mmMP0_SMN_C2PMSG_81
 const SOS: u32 = 0x91;
-const DONE: u32 = 1 << 31;
+// linux-ctx: reset
+const DONE: u32 = 1 << 31; // linux: GFX_FLAG_RESPONSE
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -161,6 +166,10 @@ impl Firmware {
                 .map_err(|_| Error::Revoked)??,
         })
     }
+    /// The validated container, for header version words.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
     pub fn image(&self) -> Result<Image<'_>, Error> {
         self.target.parse(&self.bytes)
     }
@@ -178,6 +187,9 @@ trait Io {
     fn write(&mut self, reg: u32, value: u32);
     fn write_mem(&mut self, offset: usize, value: u32);
     fn finish_upload(&mut self);
+    /// Monotonic milliseconds: the clock every wait here is bounded on, so a
+    /// model PSP's poll count, not host scheduling, decides its timeouts.
+    fn now_ms(&mut self) -> u64;
 }
 #[derive(Debug)]
 struct Mmio {
@@ -206,6 +218,9 @@ impl Io for Mmio {
         unsafe { self.memory.read32(STAGING_SIZE as u64 - 4) };
         fence(Ordering::SeqCst);
     }
+    fn now_ms(&mut self) -> u64 {
+        narf_time::wall::monotonic_ns() / 1_000_000
+    }
 }
 #[derive(Debug)]
 struct Engine<I: Io> {
@@ -213,7 +228,17 @@ struct Engine<I: Io> {
     authority: Cap<BusDeviceCap, Write>,
     memory: Reservation,
     state: State,
+    /// psp_v11_0_wait_for_bootloader waits for `(C2PMSG_35 & 0x8000FFFF) ==
+    /// 0x80000000` (20 rounds of usec_timeout): nonzero low bits mean "keep
+    /// waiting", not a rejection. PSP14 keeps the strict DONE-then-status rule.
+    psp11: bool,
 }
+/// psp_v11_0_wait_for_bootloader: 20 × psp_wait_for, each usec_timeout
+/// (100 000) iterations of RREG32 + udelay(1). The udelays alone are 2 s; the
+/// uncached MMIO read per iteration (1-2 us over PCIe) makes Linux's real
+/// bound 4-6 s, so wait the upper end.
+// linux: n/a (bound derived from psp_v11_0_wait_for_bootloader loops)
+pub(crate) const PSP11_BOOTLOADER_TIMEOUT_MS: u64 = 6000;
 async fn delay(ms: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms).as_instant()).await;
 }
@@ -224,6 +249,9 @@ impl<I: Io> Engine<I> {
             .invoke(Op(|| f(io)))
             .map_err(|_| Error::Revoked)
     }
+    fn expired(&mut self, began: u64, ms: u64) -> bool {
+        self.io.now_ms().saturating_sub(began) >= ms
+    }
     fn heartbeat(&mut self) -> Result<u32, Error> {
         match self.access(|io| io.read(SOS))? {
             u32::MAX => Err(Error::DeviceGone),
@@ -231,20 +259,29 @@ impl<I: Io> Engine<I> {
         }
     }
     async fn response(&mut self) -> Result<(), Error> {
-        let deadline = narf_time::Deadline::after_ms(1000);
+        let timeout = if self.psp11 {
+            PSP11_BOOTLOADER_TIMEOUT_MS
+        } else {
+            1000
+        };
+        let began = self.io.now_ms();
         loop {
             let value = self.access(|io| io.read(STATUS))?;
             if value == u32::MAX {
                 return Err(Error::DeviceGone);
             }
             if value & DONE != 0 {
-                return if value & 0xffff == 0 {
-                    Ok(())
-                } else {
-                    Err(Error::Rejected(value & 0xffff))
-                };
-            }
-            if deadline.expired() {
+                // linux-lit: 0xffff=GFX_CMD_STATUS_MASK
+                if value & 0xffff == 0 {
+                    return Ok(());
+                }
+                // A persistent status at the deadline is still reported as
+                // the bootloader's rejection code for diagnostics.
+                if !self.psp11 || self.expired(began, timeout) {
+                    // linux-lit: 0xffff=GFX_CMD_STATUS_MASK
+                    return Err(Error::Rejected(value & 0xffff));
+                }
+            } else if self.expired(began, timeout) {
                 return Err(Error::Timeout);
             }
             delay(1).await;
@@ -253,13 +290,13 @@ impl<I: Io> Engine<I> {
     async fn alive(&mut self) -> Result<(), Error> {
         // A nonzero but frozen register is insufficient proof that SOS boots.
         let initial = self.heartbeat()?;
-        let deadline = narf_time::Deadline::after_ms(1000);
+        let began = self.io.now_ms();
         loop {
             let value = self.heartbeat()?;
             if value != 0 && value != initial {
                 return Ok(());
             }
-            if deadline.expired() {
+            if self.expired(began, 1000) {
                 return Err(Error::Timeout);
             }
             delay(1).await;
@@ -375,6 +412,7 @@ impl Bootloader {
                 authority,
                 memory,
                 state: State::Prepared,
+                psp11: target == Target::Navi22,
             },
         })
     }

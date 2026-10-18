@@ -168,10 +168,7 @@ fn lanes_active(value: u32) -> bool {
 /// OUI, HDMI_Video_Format 1 (extended resolution) and the VIC. None without
 /// an HDMI VIC: Linux then sends no vendor packet. HB0..HB3 then SB0..SB27,
 /// as for `avi_infoframe`.
-pub(in crate::amdgpu_dcn401_otg) fn vendor_infoframe(
-    t: &crate::amdgpu_dml::Timing,
-    avi: Avi,
-) -> Option<[u8; 36]> {
+pub(crate) fn vendor_infoframe(t: &crate::amdgpu_dml::Timing, avi: Avi) -> Option<[u8; 36]> {
     if avi.hdmi_vic == 0 || t.h_total < 3840 || t.v_total < 2160 {
         return None;
     }
@@ -193,7 +190,7 @@ pub(in crate::amdgpu_dcn401_otg) fn vendor_infoframe(
 /// the output range (`limited` or full) when the sink can select it, else
 /// stays default. Version 3 for VICs of 128 and up. Returns HB0..HB3 then SB0..SB27, as the nine
 /// VPG_GENERIC_PACKET_DATA words carry them (HB3 and SB28.. stay zero).
-pub(in crate::amdgpu_dcn401_otg) fn avi_infoframe(
+pub(crate) fn avi_infoframe(
     t: &crate::amdgpu_dml::Timing,
     avi: Avi,
     limited: bool,

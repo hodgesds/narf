@@ -99,6 +99,7 @@ pub mod posix_acl;
 pub mod procfs;
 pub mod root_mount;
 pub mod root_selector;
+pub mod sync_all;
 pub mod sysfs;
 pub mod uevent;
 pub mod vt;
@@ -1085,6 +1086,14 @@ pub trait DrmFence: Send + Sync {
         "narf"
     }
 
+    /// The submitter a scheduler fence belongs to (Linux
+    /// `amdgpu_sync_get_owner`: the job's VM), so implicit sync can skip a
+    /// client's own work (`AMDGPU_SYNC_NE_OWNER`). `None`: no owner, always
+    /// waited for.
+    fn owner(&self) -> Option<u64> {
+        None
+    }
+
     /// Linux `dma_fence.timestamp`: the `CLOCK_MONOTONIC` ns at which the
     /// fence signalled, when the driver recorded it. `None` lets a sync_file
     /// report the first instant it observed the signalled state instead.
@@ -1120,6 +1129,17 @@ pub trait FileOps: Send + Sync {
     /// validate-only stubs, so `touch` on /dev nodes keeps working.
     fn set_times(&self, _atime_ns: Option<u64>, _mtime_ns: Option<u64>) -> Result<(), FsError> {
         Err(FsError::Unsupported)
+    }
+
+    /// [`Self::set_times`] for a filesystem whose update has to wait (a
+    /// journaled or transactional store). The syscall layer calls this one;
+    /// the default runs the synchronous hook.
+    fn set_times_async<'a>(
+        &'a self,
+        atime_ns: Option<u64>,
+        mtime_ns: Option<u64>,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.set_times(atime_ns, mtime_ns) })
     }
 
     /// Stable inode identity for this file, unique within its filesystem.
@@ -2618,6 +2638,27 @@ pub trait FsInstance: Send + Sync + 'static {
     /// string (`mount -o remount` / `fsconfig(CMD_RECONFIGURE)`).
     fn reconfigure(&self, _options: &str) -> Result<(), FsError> {
         Err(FsError::Unsupported)
+    }
+
+    /// Reconfigure with the superblock flags as well (Linux passes them in
+    /// `fc->sb_flags`/`fc->sb_flags_mask` to `->reconfigure`): `sb_flags`
+    /// under `sb_mask` are what the remount sets, so a filesystem that has to
+    /// act on `SB_RDONLY` flipping (commit and stop writing, or start again)
+    /// can. The default ignores the flags and applies `options`.
+    fn reconfigure_sb(&self, _sb_flags: u64, _sb_mask: u64, options: &str) -> Result<(), FsError> {
+        self.reconfigure(options)
+    }
+
+    /// [`Self::reconfigure_sb`] for a filesystem that has to wait (a remount
+    /// read-only commits and flushes). `reconfigure_super` calls this one;
+    /// the default runs the synchronous hook.
+    fn reconfigure_sb_async<'a>(
+        &'a self,
+        sb_flags: u64,
+        sb_mask: u64,
+        options: &'a str,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.reconfigure_sb(sb_flags, sb_mask, options) })
     }
 
     // ── Disk quota (quotactl) ──────────────────────────────────────
@@ -4141,6 +4182,62 @@ pub struct MountNamespace {
     store: MountStore,
 }
 
+/// Every private mount namespace still alive, weakly. `sync(2)` and the
+/// pre-shutdown sync walk every superblock in the system (Linux
+/// `iterate_supers` over the global `super_blocks` list), not just the ones
+/// reachable from the initial namespace: a filesystem mounted only inside an
+/// `unshare(CLONE_NEWNS)` sandbox has dirty state too. Dead entries are pruned
+/// on every insert and every walk.
+static PRIVATE_MOUNT_NS: IrqSafeSpinLock<Vec<alloc::sync::Weak<MountNamespace>>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+fn note_private_mount_ns(ns: &Arc<MountNamespace>) {
+    let mut g = PRIVATE_MOUNT_NS.lock();
+    g.retain(|w| w.strong_count() > 0);
+    g.push(Arc::downgrade(ns));
+}
+
+/// Every filesystem instance mounted anywhere — the initial mount table plus
+/// every live private mount namespace — deduplicated by
+/// [`FsInstance::backing_identity`] (one entry per superblock: a bind mount
+/// and its source are the same filesystem). Directory-rooted mounts are listed
+/// before file-rooted ones, so when a superblock is reachable both ways the
+/// kept entry is the one whose root directory can answer `syncfs`.
+///
+/// The `Arc`s are cloned out under each table's lock and the locks dropped
+/// before returning, so the caller may block on the filesystems.
+pub fn all_mounted_filesystems() -> Vec<Arc<dyn FsInstance>> {
+    let mut all: Vec<Arc<dyn FsInstance>> =
+        REGISTRY.inner.lock().iter().map(|m| m.fs.clone()).collect();
+    let private: Vec<Arc<MountNamespace>> = {
+        let mut g = PRIVATE_MOUNT_NS.lock();
+        g.retain(|w| w.strong_count() > 0);
+        g.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    for ns in private {
+        all.extend(ns.store().inner.lock().iter().map(|m| m.fs.clone()));
+    }
+    dedupe_superblocks(all)
+}
+
+/// The dedupe rule of [`all_mounted_filesystems`], separated for tests.
+pub fn dedupe_superblocks(all: Vec<Arc<dyn FsInstance>>) -> Vec<Arc<dyn FsInstance>> {
+    let (mut dirs, files): (Vec<_>, Vec<_>) =
+        all.into_iter().partition(|fs| fs.root_file().is_none());
+    dirs.extend(files);
+    let mut seen: Vec<usize> = Vec::new();
+    let mut out = Vec::new();
+    for fs in dirs {
+        let id = fs.backing_identity();
+        if seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
+        out.push(fs);
+    }
+    out
+}
+
 /// `MNT_NS_INIT_ID` (`include/uapi/linux/nsfs.h:78`) — the initial mount
 /// namespace's reserved id.
 ///
@@ -4260,6 +4357,7 @@ impl MountNamespace {
             owner_id,
             Arc::downgrade(&ns) as alloc::sync::Weak<dyn NsObject>,
         );
+        note_private_mount_ns(&ns);
         ns
     }
 
@@ -4469,6 +4567,7 @@ impl MountNamespace {
             root,
             fs_name: String::from(mount.fs.name()),
             backing_identity: mount.fs.backing_identity(),
+            source: mount.fs.clone(),
         }) as Arc<dyn FsInstance>)
     }
 
@@ -4778,6 +4877,11 @@ struct BindMount {
     root: Arc<dyn DirOps>,
     fs_name: String,
     backing_identity: usize,
+    /// The filesystem this view is of. A bind mount shares the source's
+    /// superblock on Linux, so a remount through it reconfigures the source
+    /// (`systemd-remount-fs` remounts the installed root through the
+    /// `/mnt` bind PID 1 is rooted at).
+    source: Arc<dyn FsInstance>,
 }
 
 impl fmt::Debug for BindMount {
@@ -4800,6 +4904,15 @@ impl FsInstance for BindMount {
     }
     fn backing_identity(&self) -> usize {
         self.backing_identity
+    }
+    fn reconfigure(&self, options: &str) -> Result<(), FsError> {
+        self.source.reconfigure(options)
+    }
+    fn reconfigure_sb(&self, sb_flags: u64, sb_mask: u64, options: &str) -> Result<(), FsError> {
+        self.source.reconfigure_sb(sb_flags, sb_mask, options)
+    }
+    fn show_options(&self) -> String {
+        self.source.show_options()
     }
 }
 
@@ -4880,6 +4993,7 @@ fn build_bind_fs(
             root: source_root_dir,
             fs_name,
             backing_identity: source_fs.backing_identity(),
+            source: source_fs.clone(),
         }));
     }
     let mut dir = source_root_dir;
@@ -4898,6 +5012,7 @@ fn build_bind_fs(
                     root: d,
                     fs_name,
                     backing_identity: source_fs.backing_identity(),
+                    source: source_fs.clone(),
                 }));
             }
         }
@@ -4913,6 +5028,7 @@ fn build_bind_fs(
             root: d,
             fs_name,
             backing_identity: source_fs.backing_identity(),
+            source: source_fs.clone(),
         }));
     }
     Err(FsError::NotFound)
@@ -5440,6 +5556,7 @@ impl VfsRegistry {
             root,
             fs_name: String::from(mount.fs.name()),
             backing_identity: mount.fs.backing_identity(),
+            source: mount.fs.clone(),
         }) as Arc<dyn FsInstance>)
     }
 

@@ -145,10 +145,136 @@ aliases; discovery never validates or mounts the filesystem.
 `partition::discover_volume_uuid` exposes the same bounded read-only probe to
 root-selection code after an encrypted adapter has been opened.
 
+The partition scanner (`partition::scan_and_register_partitions(parent,
+name)`) registers `{name}p{n}` for each MBR or GPT entry. The GPT entry array
+is read through `partition::read_gpt_entry_array(dev, &header)` in
+`GPT_ENTRY_READ_CHUNK_BYTES` (4 KiB) requests, retried one LBA at a time if a
+device refuses a chunk, so a standard 128-entry (16 KiB) table never needs a
+transfer larger than one page. Headers with an entry size other than
+128 × 2^n fail with `GptError::BadEntrySize`; an array larger than
+`GPT_MAX_ENTRY_ARRAY_BYTES` (1 MiB) or past the device's capacity fails with
+`ScanError::EntriesTooLarge`; entries ending past the last LBA are skipped
+(Linux `is_pte_valid`). Each registered partition is logged as
+`block: <disk>: partition <name> at lba <start>, <n> blocks`.
+
 Targeted lookups clone only the matched device `Arc`; they do not allocate an
 owned registry snapshot. The indexed form captures the registration-order index
 and device under the same registry lock so `devfs` can derive a coherent Linux
 minor number across concurrent hot-unplug.
+
+**Names and identity.** Registry names are Linux-like and follow enumeration
+order (`nvme0n1`, `nvme1n1`, ... in NVMe probe = PCI order; partitions
+`<disk>p<N>`), so they are **not** an identity. A disk's identity is its
+`DiskIdentity`, given at registration and inherited by its partitions:
+
+```rust
+pub struct DiskIdentity {
+    pub transport: &'static str, pub bus_path: String, pub controller: String,
+    pub model: String, pub serial: String, pub firmware: String,
+    pub vendor_id: u16, pub nsid: u32,
+    pub eui64: Option<[u8; 8]>, pub nguid: Option<[u8; 16]>, pub uuid: Option<[u8; 16]>,
+}
+impl DiskIdentity {
+    pub fn wwid(&self) -> String;              // Linux nvme wwid_show
+    pub fn by_id_names(&self) -> Vec<String>;  // udev 60-persistent-storage
+    pub fn by_path_name(&self) -> Option<String>;
+}
+pub fn register_block_device_with_identity(name: &'static str, dev, identity: DiskIdentity);
+pub fn identity_of(name: &str) -> Option<Arc<DiskIdentity>>;
+pub fn find_by_fs_uuid(uuid: &str) -> Option<RegisteredBlockDevice>;   // unique match only
+pub fn find_by_partuuid(uuid: &str) -> Option<RegisteredBlockDevice>;  // unique match only
+pub fn find_disk_by_bus_path(bus_path: &str, nsid: u32) -> Option<RegisteredBlockDevice>;
+// RegisteredBlockDevice { .., parent: Option<&'static str>, partno: Option<u32>,
+//                         identity: Option<Arc<DiskIdentity>> }
+pub fn registry::format_uuid_bytes(&[u8; 16]) -> String;
+```
+
+`discover_volume_uuid` also reports a btrfs `fsid` (superblock at 64 KiB).
+`DevFs` adds `/dev/disk/by-id` (`nvme-<model>_<serial>`,
+`nvme-<model>_<serial>_<nsid>`, `nvme-<wwid>`) and `/dev/disk/by-path`
+(`pci-<bdf>-nvme-<nsid>`), `-part<N>` for partitions; sysfs exposes `wwid`,
+`nsid`, `eui`, `nguid`, `uuid` and `device/{model,serial,firmware_rev}`.
+
+**Durability (flush / FUA).** `BlockDeviceSync` carries the write-cache
+contract (Linux `REQ_PREFLUSH` / `REQ_FUA`):
+
+```rust
+fn flush(&self) -> Result<(), BlockIoError>;          // default Ok (write-through)
+fn write_fua(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError>;
+                                                       // default: write, then flush
+fn capabilities(&self) -> BlockCaps;                   // { volatile_cache, fua }
+// async: BlockDevice::flush_result() -> Result<(), BlockError> (default: flush + Ok);
+//        BlockOp::Write { fua: true } → write_fua through SyncBlock.
+```
+
+`flush` returns only after every write completed before it is durable.
+`write_fua` makes its own data durable but does not order earlier writes
+(btrfs `write_all_supers`: flush, then the superblock FUA). `PolicyGuard`,
+`PartitionBlockDevice` and `EncryptedBlockDevice` forward all three; the guard
+forwards `flush` even while it refuses writes (a flush carries no data).
+
+Every device entering the registry is wrapped in a
+`disk_policy::PolicyGuard`; `RegisteredBlockDevice::disk` is its physical-disk
+identity (`DiskId`, never reused), shared by a disk and the partitions the
+scanner registers through `register_partition_device(name, parent_name, dev,
+meta)` (and by `cryptroot`, registered against its container).
+
+```rust
+pub mod disk_policy {
+    pub const ARG: &str = "narf.disks";  // all | boot-only | root-ro | root-rw
+    pub enum DiskPolicy { All, BootOnly, RootRo, RootRw }
+    pub enum PolicyError { NotRootPolicy, NoRootUuidArg, UuidMismatch, NoSuchDevice,
+        NotAPartition, IdentityMismatch, Ambiguous, EfiOrVfat, NotBtrfs,
+        AlreadyDesignated, Revoked }
+    pub type DiskId = u64;                          // physical disk, never reused
+    pub type DevId = u64;                           // registry entry, never reused
+    pub fn parse(value: Option<&str>) -> Result<DiskPolicy, &'static str>;
+    pub fn policy() -> DiskPolicy;                  // lazily from the cmdline
+    pub fn init_from_cmdline() -> DiskPolicy;       // unknown/repeated value: BootOnly
+    pub fn trust_boot_medium(device_name: &str, disk: DiskId);
+    pub fn is_boot_medium(device_name: &str) -> bool;
+    pub fn root_uuid_arg() -> Option<[u8; 16]>;     // the single root=UUID=
+    pub fn designate_root(device_name: &str, fs_uuid: [u8; 16]) -> Result<(), PolicyError>;
+    pub fn designated_root() -> Option<&'static str>;
+    pub fn root_writable() -> bool;
+    pub fn log_stick() -> Option<&'static str>;     // boot-log stick under root policies
+    pub fn mark_root_mount_settled(); pub fn root_mount_settled() -> bool;
+    pub fn automount_allowed(device_name: &str) -> bool;
+    pub fn write_allowed(device_name: &str) -> bool;
+    pub fn refused_writes() -> u64;
+    pub struct PolicyGuard; // impl BlockDeviceSync; dev_id() -> DevId
+}
+pub fn disk_of(name: &str) -> Option<DiskId>;
+// RegisteredBlockDevice { name, dev, disk: DiskId, dev_id: DevId, partition }
+// partition::{discover_volume_uuid (ext, FAT, LUKS, btrfs fsid), parse_uuid, format_uuid_bytes}
+// BlockDeviceSync::is_read_only / BlockDevice::is_read_only (default false)
+```
+
+Under `BootOnly` a guard passes reads and returns `BlockIoError::ReadOnly`
+for every write (first refusal per device logged) unless its disk was passed
+to `trust_boot_medium`, which callers do only after matching a boot-specific
+secret on the medium (the bootlog's `/NARFLOG.ID` token), using the `DiskId`
+from the same registry snapshot they read the proof from. `is_read_only`
+reports the guard's state through `SyncBlock` so filesystems mount a read-only
+device without writing. `All` (the default) is a pass-through.
+
+Under `RootRo` / `RootRw` nothing is writable until root mounting calls
+`designate_root` for the partition whose filesystem UUID matched
+`root=UUID=`. The designation (at most one per boot) re-verifies the UUID
+against the command line (exactly one `root=`), the partition metadata and the
+device's own superblock; refuses whole disks, ESP / vfat partitions, a UUID
+carried by more than one registered device, and (under `RootRw`) anything but
+btrfs. Under `RootRw` exactly the guard whose `DevId` was designated passes
+writes; under `RootRo` none does. The designation is revoked for the rest of
+the boot if that entry is unregistered or replaced or another device carrying
+the UUID registers. `automount_allowed` admits only the `root=UUID=` candidate
+(before designation), the designated root, and vfat partitions on its disk.
+Both modes print a framed banner at policy resolution and at designation
+naming the writable device and UUID. Under both modes `trust_boot_medium`
+(the bootlog's `/NARFLOG.ID` token match) makes exactly the named USB
+mass-storage entry writable, never one on the root's disk; it is forgotten
+when that entry goes away. The boot log probes only after
+`mark_root_mount_settled`.
 
 ### 3.6 Encrypted-device stacking
 

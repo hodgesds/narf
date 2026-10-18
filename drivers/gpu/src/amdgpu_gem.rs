@@ -335,9 +335,13 @@ impl GemState {
 
     /// `drm_gem_prime_fd_to_handle` for a buffer another open of the same
     /// card exported: the handle this open already has for it, or a new
-    /// one. A buffer of another card is refused (`InvalidData`).
+    /// one. A buffer of another card is refused (`InvalidData`), as is one
+    /// not created on any card: Linux takes the native path only when
+    /// `obj->dev == dev` (`amdgpu_gem_prime_import`; card indices are never
+    /// reused, so the index is the device), and NARF has no attachment path
+    /// for a foreign buffer.
     pub fn import(&self, object: &Arc<GemObject>) -> Result<u32, FsError> {
-        if object.card != self.card {
+        if object.card.is_none() || object.card != self.card {
             return Err(FsError::InvalidData);
         }
         let existing = self.objects.lock().as_ref().and_then(|m| {
@@ -546,14 +550,16 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
 
 /// `amdgpu_gem_mmap_ioctl` — hand back the offset, nothing is mapped yet.
 fn mmap(state: &GemState, arg: usize) -> Result<u64, FsError> {
+    // `union drm_amdgpu_gem_mmap` is 8 bytes: in { handle, _pad } and
+    // out { addr_ptr } both start at offset 0.
     // SAFETY: as above.
-    let bytes = unsafe { copy_in(arg, 16)? };
+    let bytes = unsafe { copy_in(arg, 8)? };
     let handle = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     if state.get(handle).is_none() {
         return Err(FsError::InvalidData);
     }
-    let mut out = [0u8; 16];
-    out[8..16].copy_from_slice(&((handle as u64) << 12).to_le_bytes());
+    let mut out = [0u8; 8];
+    out[0..8].copy_from_slice(&((handle as u64) << 12).to_le_bytes());
     // SAFETY: as above.
     unsafe { copy_out(arg, &out)? };
     Ok(0)
@@ -698,3 +704,7 @@ fn metadata(state: &GemState, arg: usize) -> Result<u64, FsError> {
         _ => Ok(0),
     }
 }
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_render_abi_tests.rs"]
+mod render_abi_tests;

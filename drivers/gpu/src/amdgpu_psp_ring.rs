@@ -11,20 +11,39 @@ use core::sync::atomic::{fence, Ordering};
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
+// linux-ctx: hdr=mp seg=0
+// linux: mmMP0_SMN_C2PMSG_64
 const CTRL: u32 = 0x80;
+// linux: mmMP0_SMN_C2PMSG_67
 const WPTR: u32 = 0x83;
+// linux: mmMP0_SMN_C2PMSG_69
 const RING_LO: u32 = 0x85;
+// linux: mmMP0_SMN_C2PMSG_70
 const RING_HI: u32 = 0x86;
+// linux: mmMP0_SMN_C2PMSG_71
 const RING_SIZE: u32 = 0x87;
+// linux: mmMP0_SMN_C2PMSG_81
 const SOS: u32 = 0x91;
+// linux-ctx: reset
+// linux: GFX_FLAG_RESPONSE
 const RESPONSE: u32 = 1 << 31;
-const CREATE: u32 = 1 << 16;
-const DESTROY: u32 = 3 << 16;
+/// psp_v{11_0,13_0,13_0_4,14_0}_ring_create write `ring_type << 16` with
+/// `PSP_RING_TYPE__KM` (2, formerly GPCOM), i.e. GFX_CTRL_CMD_ID_INIT_GPCOM_RING.
+/// `1 << 16` would be INIT_RBI_RING, the user-mode ring.
+const CREATE: u32 = crate::amdgpu_psp::gfx_ctrl_cmd_id::INIT_GPCOM_RING;
+/// GFX_CTRL_CMD_ID_DESTROY_RINGS (psp_v*_ring_stop).
+const DESTROY: u32 = crate::amdgpu_psp::gfx_ctrl_cmd_id::DESTROY_RINGS;
+// linux: n/a (NARF buffer layout: cmd buffer after the 0x1000-byte KM ring)
 const COMMAND: u64 = 4096;
+// linux: n/a (NARF buffer layout: fence after the PSP_CMD_BUFFER_SIZE cmd buffer)
 const FENCE: u64 = 8192;
+// linux: n/a (NARF buffer layout: ring + cmd + fence)
 const BUFFER_SIZE: u64 = 12288;
+// linux: n/a (MMIO_REG_HOLE_OFFSET = 0x80000 - PAGE_SIZE in nbio_v2_3.c, 4 KiB pages)
 const HDP_HOLE: u64 = 0x7f000;
+// linux: n/a (NARF bound)
 const MAX_IMAGE: usize = 16 * 1024 * 1024;
+// linux: n/a (PSP_TMR_SIZE(adev) = 0x400000 for non-Aldebaran, amdgpu_psp.h)
 const DEFAULT_TMR_SIZE: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,9 +74,13 @@ struct Reply {
 }
 
 /// Linux leaves the size/version and RBI-only header fields zero for GPCOM.
+// linux-lit: 256=sizeof(struct psp_gfx_cmd_resp) / 4
 fn command(id: u32, args: &[u32]) -> [u32; 256] {
+    // linux-lit: 256=sizeof(struct psp_gfx_cmd_resp) / 4
     let mut words = [0; 256];
+    // linux-lit: 2=offsetof(struct psp_gfx_cmd_resp, cmd_id) / 4
     words[2] = id;
+    // linux-lit: 7=offsetof(struct psp_gfx_cmd_resp, cmd) / 4
     words[7..7 + args.len()].copy_from_slice(args);
     words
 }
@@ -116,7 +139,9 @@ impl Io for Mmio {
     fn setup_hdp(&mut self) -> bool {
         // SAFETY: exact supported NBIO bank and the 4 KiB remap hole are bounded.
         unsafe {
+            // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
             self.regs.write32(self.nbio + 0x12d * 4, HDP_HOLE as u32);
+            // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
             self.regs.read32(self.nbio + 0x12d * 4) == HDP_HOLE as u32
         }
     }
@@ -126,6 +151,7 @@ impl Io for Mmio {
         // Linux posts this write by reading MEMSIZE, not the remapped register.
         unsafe {
             self.regs.write32(HDP_HOLE, 0);
+            // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
             self.regs.read32(self.nbio + 0xc3 * 4);
         }
         fence(Ordering::SeqCst);
@@ -159,7 +185,17 @@ struct Engine<I: Io> {
     memory: Reservation,
     state: State,
     sequence: u32,
+    /// Linux psp_cmd_submit_buf only warns on a nonzero response status on
+    /// bare metal ("Some version of PSP FW doesn't write 0 to that field").
+    /// Navi22 follows it for bring-up commands; DESTROY_TMR stays strict
+    /// because a refused teardown must not recycle trusted memory.
+    lenient: bool,
 }
+/// psp_cmd_submit_buf: `psp_timeout` (20000) polls of usleep_range(60, 100),
+/// i.e. up to ~2 s before the fence is declared lost.
+// linux: n/a (NARF bound for psp_cmd_submit_buf's psp_timeout polls)
+const FENCE_TIMEOUT_MS: u64 = 2000;
+const GFX_CMD_ID_DESTROY_TMR: u32 = 7; // linux: GFX_CMD_ID_DESTROY_TMR
 async fn delay(ms: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms).as_instant()).await;
 }
@@ -182,10 +218,11 @@ impl<I: Io> Engine<I> {
                 return Err(Error::DeviceGone);
             }
             if value & RESPONSE != 0 {
+                // linux-lit: 0xffff=GFX_CMD_STATUS_MASK
                 return if value & 0xffff == 0 {
                     Ok(())
                 } else {
-                    Err(Error::Rejected(value & 0xffff))
+                    Err(Error::Rejected(value & 0xffff)) // linux-lit: 0xffff=GFX_CMD_STATUS_MASK
                 };
             }
             if deadline.expired() {
@@ -223,6 +260,7 @@ impl<I: Io> Engine<I> {
         self.access(|io| {
             io.write(RING_LO, address as u32);
             io.write(RING_HI, (address >> 32) as u32);
+            // linux: n/a (literal ring->ring_size = 0x1000 in amdgpu_psp.c:psp_ring_init)
             io.write(RING_SIZE, 4096);
             io.write(CTRL, CREATE);
         })?;
@@ -241,6 +279,7 @@ impl<I: Io> Engine<I> {
             return Err(Error::Busy);
         }
         let wptr = self.access(|io| io.read(WPTR))?;
+        // linux-lit: 16=sizeof(struct psp_gfx_rb_frame) / 4
         if wptr >= 1024 || wptr % 16 != 0 {
             return Err(Error::Invalid);
         }
@@ -253,19 +292,24 @@ impl<I: Io> Engine<I> {
             for (i, value) in words.iter().enumerate() {
                 io.write_mem(COMMAND + i as u64 * 4, *value);
             }
+            // linux-lit: 16=sizeof(struct psp_gfx_rb_frame) / 4
             let mut frame = [0u32; 16];
+            // linux-lit: 0=offsetof(struct psp_gfx_rb_frame, cmd_buf_addr_lo) / 4
             frame[0] = (address + COMMAND) as u32;
+            // linux-lit: 1=offsetof(struct psp_gfx_rb_frame, cmd_buf_addr_hi) / 4
             frame[1] = ((address + COMMAND) >> 32) as u32;
+            // linux-lit: 3=offsetof(struct psp_gfx_rb_frame, fence_addr_lo) / 4
             frame[3] = (address + FENCE) as u32;
+            // linux-lit: 4=offsetof(struct psp_gfx_rb_frame, fence_addr_hi) / 4
             frame[4] = ((address + FENCE) >> 32) as u32;
-            frame[5] = seq;
+            frame[5] = seq; // linux-lit: 5=offsetof(struct psp_gfx_rb_frame, fence_value) / 4
             for (i, value) in frame.iter().enumerate() {
                 io.write_mem(wptr as u64 * 4 + i as u64 * 4, *value);
             }
             io.flush();
-            io.write(WPTR, (wptr + 16) % 1024);
+            io.write(WPTR, (wptr + 16) % 1024); // linux-lit: 16=sizeof(struct psp_gfx_rb_frame) / 4
         })?;
-        let deadline = narf_time::Deadline::after_ms(500);
+        let deadline = narf_time::Deadline::after_ms(FENCE_TIMEOUT_MS);
         loop {
             let done = self.access(|io| {
                 io.invalidate();
@@ -283,17 +327,29 @@ impl<I: Io> Engine<I> {
         let (status, reply) = self.access(|io| {
             io.invalidate();
             (
+                // linux-lit: 864=offsetof(struct psp_gfx_cmd_resp, resp.status)
                 io.read_mem(COMMAND + 864),
                 Reply {
+                    // linux-lit: 872=offsetof(struct psp_gfx_cmd_resp, resp.fw_addr_lo)
                     address: io.read_mem(COMMAND + 872) as u64
+                        // linux-lit: 876=offsetof(struct psp_gfx_cmd_resp, resp.fw_addr_hi)
                         | (io.read_mem(COMMAND + 876) as u64) << 32,
+                    // linux-lit: 880=offsetof(struct psp_gfx_cmd_resp, resp.tmr_size)
                     tmr_size: io.read_mem(COMMAND + 880),
                 },
             )
         })?;
         self.state = State::Ready;
         if status != 0 {
-            return Err(Error::Rejected(status));
+            if !self.lenient || words[2] == GFX_CMD_ID_DESTROY_TMR {
+                return Err(Error::Rejected(status));
+            }
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: psp gfx command {:#x} response status {status:#x}",
+                words[2]
+            );
         }
         Ok(reply)
     }
@@ -328,8 +384,11 @@ pub struct Psp {
 /// These are GPU addresses, not CPU mappings; consumers must keep TMR alive.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MediaFirmware {
+    /// VCN instance 0 image (`UCODE_ID_VCN`).
     pub vcn: Option<u64>,
     pub dmcub: Option<u64>,
+    /// VCN instance 1 image (`UCODE_ID_VCN1`), absent when harvested.
+    pub vcn1: Option<u64>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -409,8 +468,13 @@ impl Layout {
         if [base, top, offset].contains(&u32::MAX) {
             return Err(Error::DeviceGone);
         }
+        // linux-lit: 0xffffff=GCMC_VM_FB_LOCATION_BASE__FB_BASE_MASK
         let fb_base = (base as u64 & 0xffffff) << 24;
-        let fb_end = ((top as u64 & 0xffffff) + 1) << 24;
+        // amdgpu_gmc_vram_location: vram_end = vram_start + mc_vram_size - 1
+        // (RCC_CONFIG_MEMSIZE). FB_LOCATION_TOP is inherited 16 MiB-granular
+        // state; it is read only to detect a removed device.
+        let fb_end = fb_base.checked_add(gpu.vram.size).ok_or(Error::Invalid)?;
+        // linux-lit: 0xffffff=GCMC_VM_FB_OFFSET__FB_OFFSET_MASK
         let fb_offset = (offset as u64 & 0xffffff) << 24;
         let pool_offset = pool.address().checked_sub(fb_base).ok_or(Error::Invalid)?;
         let mapping = pool.mapping();
@@ -490,8 +554,10 @@ impl Layout {
                 {
                     return Err(Error::Unsupported);
                 }
+                // linux-lit: 0=mmMP0_SMN_C2PMSG_81_BASE_IDX
                 let mp0 = bank(gpu, discovery::HW_ID_MP0, &[(11, 0, 11)], 0, SOS)?;
                 // Navi22's cold-boot SMC path requires this exact MP1 mailbox.
+                // linux-lit: 0=mmMP1_SMN_C2PMSG_90_BASE_IDX; 0x29a=mmMP1_SMN_C2PMSG_90
                 bank(gpu, discovery::HW_ID_MP1, &[(11, 0, 11)], 0, 0x29a)?;
                 bank(gpu, discovery::HW_ID_SDMA0, &[(5, 2, 2)], 0, 0)?;
                 // Linux nv.c uses nbio_v2_3 for these revisions; MEMSIZE and
@@ -508,12 +574,14 @@ impl Layout {
                         (3, 3, 2),
                         (3, 3, 3),
                     ],
-                    2,
-                    0x12d,
+                    2,     // linux-lit: 2=mmREMAP_HDP_MEM_FLUSH_CNTL_BASE_IDX
+                    0x12d, // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
                 )?;
                 // GMC10 location/offset, not DCN314's similarly named registers.
                 // This also pins the GC and works without an active display.
+                // linux-lit: 0=mmGCMC_VM_FB_LOCATION_TOP_BASE_IDX; 0x16fd=mmGCMC_VM_FB_LOCATION_TOP
                 let gc = bank(gpu, discovery::HW_ID_GC, &[(10, 3, 2)], 0, 0x16fd)?;
+                // linux-lit: 0x16fc=mmGCMC_VM_FB_LOCATION_BASE; 0x16fd=mmGCMC_VM_FB_LOCATION_TOP; 0x16e7=mmGCMC_VM_FB_OFFSET
                 (mp0, nbio, gc + 0x16fc * 4, gc + 0x16fd * 4, gc + 0x16e7 * 4)
             }
         };
@@ -529,8 +597,8 @@ impl Layout {
                 (5, 2, 0),
                 (5, 2, 1),
             ],
-            0,
-            0xd1,
+            0,    // linux-lit: 0=mmHDP_READ_CACHE_INVALIDATE_BASE_IDX
+            0xd1, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
         )?;
         let ip = discovery::find_ip(&gpu.ip_blocks, discovery::HW_ID_HDP, 0)
             .ok_or(Error::Unsupported)?;
@@ -539,8 +607,11 @@ impl Layout {
         }
         let gfx_status_regs = if kind == Kind::Navi22 {
             // Linux gc_10_1_0_offset.h: CP_STAT index 0, RLC status index 1.
+            // linux-lit: 0=mmCP_STAT_BASE_IDX; 0xf40=mmCP_STAT
             let cp = bank(gpu, discovery::HW_ID_GC, &[(10, 3, 2)], 0, 0xf40)?;
+            // linux-lit: 1=mmRLC_RLCS_BOOTLOAD_STATUS_BASE_IDX; 0x4e8d=mmRLC_RLCS_BOOTLOAD_STATUS
             let rlc = bank(gpu, discovery::HW_ID_GC, &[(10, 3, 2)], 1, 0x4e8d)?;
+            // linux-lit: 0xf40=mmCP_STAT; 0x4e8d=mmRLC_RLCS_BOOTLOAD_STATUS
             Some((cp + 0xf40 * 4, rlc + 0x4e8d * 4))
         } else {
             None
@@ -549,7 +620,7 @@ impl Layout {
             mp0,
             nbio,
             invalidate_reg: ((ip.major, ip.minor, ip.revision) != (5, 2, 1))
-                .then_some(hdp + 0xd1 * 4),
+                .then_some(hdp + 0xd1 * 4), // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
             fb_base,
             fb_top,
             fb_offset,
@@ -561,6 +632,18 @@ impl Layout {
 /// Resolves all banks without MMIO or allocating device-owned memory.
 pub(crate) fn validate_navi22_layout(gpu: &AmdGpu) -> Result<(), Error> {
     Layout::resolve(gpu, Kind::Navi22).map(|_| ())
+}
+/// Re-read GMC10's live FB location and check the pool still lies inside it
+/// (the same check `Psp::new_navi22` makes), e.g. after a reset-on-init and
+/// before the bootloader is handed any pool GPU address.
+pub(crate) fn validate_navi22_pool(
+    gpu: &AmdGpu,
+    authority: &Cap<BusDeviceCap, Write>,
+    pool: &Pool,
+) -> Result<(), Error> {
+    Layout::resolve(gpu, Kind::Navi22)?
+        .validate_pool(gpu, authority, pool)
+        .map(|_| ())
 }
 /// Resolve the PSP14/GMC12/HDP6 transport without touching hardware.
 pub(crate) fn navi48_layout(gpu: &AmdGpu) -> Result<Layout, Error> {
@@ -719,6 +802,7 @@ impl Psp {
                     memory,
                     state: State::Prepared,
                     sequence: 0,
+                    lenient: kind == Kind::Navi22,
                 },
                 pool: pool.clone(),
                 payload: None,
@@ -749,8 +833,12 @@ impl Psp {
             .setup_tmr_payload(Some(toc_payload(toc)?))
             .await
     }
-    /// Use the validated SOS container's embedded TOC, or PSP11's 4 MiB default
-    /// if no TOC is present. The allocation remains owned until verified stop.
+    /// `psp_tmr_init`: LOAD_TOC from the validated SOS container's embedded
+    /// TOC (or PSP11's 4 MiB default) and reserve the TMR. MP0 11.0.11 has
+    /// PMFW-centralized C-state management, so SETUP_TMR is deferred until
+    /// `load_smc_navi22` has loaded PMFW (amdgpu_psp.c psp_hw_start: "TMR
+    /// setup should be performed after PMFW loaded"). The allocation remains
+    /// owned until verified stop.
     pub async fn setup_tmr_navi22(
         &mut self,
         firmware: &crate::amdgpu_psp_boot::Firmware,
@@ -759,7 +847,7 @@ impl Psp {
             return Err(Error::Unsupported);
         }
         let image = firmware.image().map_err(|_| Error::Invalid)?;
-        self.session.setup_tmr_payload(image.toc()).await
+        self.session.init_tmr(image.toc()).await
     }
     /// Install the trusted region described by this PSP14 target's embedded
     /// TOC. A missing TOC is rejected; no size from another GPU is substituted.
@@ -784,14 +872,16 @@ impl Psp {
             return Err(Error::Unsupported);
         }
         self.session
-            .load_ip(signed_instructions, 51)
+            .load_ip(signed_instructions, 51) // linux-lit: 51=GFX_FW_TYPE_DMUB
             .await
             .map(|_| ())
     }
-    /// Load Navi22 SMC once during cold boot, after trusted memory setup and
-    /// before other IP firmware. Only microcode is sent, never the header/PPT.
-    /// Completion means PSP accepted it; use Smu::after_upload/verify to check
-    /// runtime responsiveness. This does not implement BACO/resume/reload.
+    /// Load Navi22 SMC once during cold boot, after LOAD_TOC/TMR reservation
+    /// and before other IP firmware, then SETUP_TMR (psp_hw_start's
+    /// psp_load_smu_fw then psp_tmr_load for pmfw_centralized_cstate_management).
+    /// Only microcode is sent, never the header/PPT. Completion means PSP
+    /// accepted both; use Smu::after_upload/verify to check runtime
+    /// responsiveness. This does not implement BACO/resume/reload.
     pub async fn load_smc_navi22(
         &mut self,
         firmware: &crate::amdgpu_smu_navi22::Firmware,
@@ -800,7 +890,7 @@ impl Psp {
             return Err(Error::Unsupported);
         }
         let image = firmware.image().map_err(|_| Error::Invalid)?;
-        self.session.load_smc(image.payload()).await
+        self.session.load_smc_centralized(image.payload()).await
     }
     /// Load the complete Navi22 SDMA/CP/RLC set once, after SMC. Successful
     /// return acknowledges AUTOLOAD_RLC; GC/SDMA readiness, reset/golden-register
@@ -861,6 +951,11 @@ impl Psp {
     }
     pub fn media_firmware(&self) -> MediaFirmware {
         self.session.media_firmware
+    }
+    /// The GMC system aperture validated against the pool at construction:
+    /// (`gmc.fb_start`, `vm_manager.vram_base_offset`) in Linux terms.
+    pub(crate) fn fb_location(&self) -> (u64, u64) {
+        (self.session.fb_base, self.session.fb_offset)
     }
     pub(crate) fn dmub_tmr(&self) -> Result<core::ops::Range<u64>, Error> {
         if self.kind != Kind::Navi22
@@ -932,7 +1027,14 @@ impl<I: Io> Session<I> {
         }
     }
     /// TOC bytes have already been selected from a validated firmware container.
+    /// psp_tmr_init then psp_tmr_load, for PSPs without centralized C-states.
     async fn setup_tmr_payload(&mut self, toc: Option<&[u8]>) -> Result<(), Error> {
+        self.init_tmr(toc).await?;
+        self.load_tmr().await
+    }
+    /// psp_tmr_init: LOAD_TOC (size from PSP) and the TMR reservation. No
+    /// address reaches PSP yet; an unloaded reservation is not published.
+    async fn init_tmr(&mut self, toc: Option<&[u8]>) -> Result<(), Error> {
         if self.tmr.is_some() || self.payload.is_some() || self.engine.state != State::Ready {
             return Err(Error::Busy);
         }
@@ -940,6 +1042,7 @@ impl<I: Io> Session<I> {
             let (address, size) = self.stage(payload).await?;
             let result = self
                 .engine
+                // linux-lit: 0x20=GFX_CMD_ID_LOAD_TOC
                 .submit(&load_command(0x20, address, size, 0))
                 .await;
             self.release_payload();
@@ -950,25 +1053,37 @@ impl<I: Io> Session<I> {
         if size == 0 || size > 64 * 1024 * 1024 || size % 4096 != 0 {
             return Err(Error::Invalid);
         }
-        let mut tmr = self
+        let tmr = self
             .pool
+            // linux: n/a (1 << 20 is PSP_TMR_ALIGNMENT, amdgpu_psp.h)
             .reserve_aligned(size, 1 << 20)
             .map_err(|_| Error::Allocation)?;
-        let address = tmr.address();
-        let physical = address
+        tmr.address()
             .checked_sub(self.fb_base)
             .and_then(|n| n.checked_add(self.fb_offset))
             .filter(|n| n.checked_add(size).is_some_and(|end| end <= 1 << 48))
             .ok_or(Error::Invalid)?;
-        tmr.publish();
         self.tmr = Some(tmr);
+        Ok(())
+    }
+    /// psp_tmr_load: SETUP_TMR for the reserved region, published first.
+    async fn load_tmr(&mut self) -> Result<(), Error> {
+        if self.tmr_ready || self.payload.is_some() || self.engine.state != State::Ready {
+            return Err(Error::Busy);
+        }
+        let (fb_base, fb_offset) = (self.fb_base, self.fb_offset);
+        let tmr = self.tmr.as_mut().ok_or(Error::Busy)?;
+        let (address, size) = (tmr.address(), tmr.size());
+        let physical = address - fb_base + fb_offset;
+        tmr.publish();
         self.engine
             .submit(&command(
-                5,
+                5, // linux-lit: 5=GFX_CMD_ID_SETUP_TMR
                 &[
                     address as u32,
                     (address >> 32) as u32,
                     size as u32,
+                    // linux: n/a (tmr_flags bitfield.virt_phy_addr = 1, bit 1; amdgpu_psp.c:psp_prep_tmr_cmd_buf)
                     2,
                     physical as u32,
                     (physical >> 32) as u32,
@@ -983,9 +1098,17 @@ impl<I: Io> Session<I> {
         if !self.tmr_ready {
             return Err(Error::Busy);
         }
+        self.load_ip_unchecked(bytes, firmware_type).await
+    }
+    async fn load_ip_unchecked(
+        &mut self,
+        bytes: &[u8],
+        firmware_type: u32,
+    ) -> Result<Reply, Error> {
         let (address, size) = self.stage(bytes).await?;
         let result = self
             .engine
+            // linux-lit: 6=GFX_CMD_ID_LOAD_IP_FW
             .submit(&load_command(6, address, size, firmware_type))
             .await;
         self.release_payload();
@@ -1007,6 +1130,29 @@ impl<I: Io> Session<I> {
             SmcState::Failed
         };
         result
+    }
+    /// PMFW-centralized C-state order (MP0 11.0.0..13, 13.0.0/2/7): SMC
+    /// LOAD_IP_FW after LOAD_TOC/TMR reservation but before SETUP_TMR, which
+    /// follows immediately (psp_hw_start).
+    async fn load_smc_centralized(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.smc_state != SmcState::Absent
+            || self.tmr.is_none()
+            || self.tmr_ready
+            || self.engine.state != State::Ready
+            || self.payload.is_some()
+        {
+            return Err(Error::Busy);
+        }
+        self.smc_state = SmcState::Pending;
+        // linux-lit: 18=GFX_FW_TYPE_SMU
+        let result = self.load_ip_unchecked(bytes, 18).await.map(|_| ());
+        self.smc_state = if result.is_ok() {
+            SmcState::Loaded
+        } else {
+            SmcState::Failed
+        };
+        result?;
+        self.load_tmr().await
     }
     async fn load_gfx(
         &mut self,
@@ -1069,16 +1215,20 @@ impl<I: Io> Session<I> {
                     .flat_map(|i| i.payloads())
                     .find(|p| p.firmware_type() == kind);
                 let Some(payload) = payload else {
+                    // linux-lit: 22=GFX_FW_TYPE_RLC_RESTORE_LIST_SRM_CNTL; 20=GFX_FW_TYPE_RLC_RESTORE_LIST_GPM_MEM; 21=GFX_FW_TYPE_RLC_RESTORE_LIST_SRM_MEM; 26=GFX_FW_TYPE_RLC_IRAM; 48=GFX_FW_TYPE_RLC_DRAM_BOOT
                     if matches!(kind, 22 | 20 | 21 | 26 | 48) {
                         continue;
                     }
                     return Err(Error::Invalid);
                 };
                 let reply = self.load_ip(payload.bytes(), kind).await?;
+                // linux-lit: 13=GFX_FW_TYPE_VCN; 51=GFX_FW_TYPE_DMUB
                 if matches!(kind, 13 | 51) {
                     self.record_media(reply, kind)?;
                 }
+                // linux-lit: 8=GFX_FW_TYPE_RLC_G
                 if kind == 8 {
+                    // linux-lit: 0x21=GFX_CMD_ID_AUTOLOAD_RLC
                     self.engine.submit(&command(0x21, &[])).await?;
                 }
             }
@@ -1101,10 +1251,10 @@ impl<I: Io> Session<I> {
         if reply.address % 4 != 0 || offset >= tmr.mapping().len {
             return Err(Error::Invalid);
         }
-        if kind == 13 {
-            self.media_firmware.vcn = Some(reply.address);
-        } else {
-            self.media_firmware.dmcub = Some(reply.address);
+        match kind {
+            13 => self.media_firmware.vcn = Some(reply.address), // linux-lit: 13=GFX_FW_TYPE_VCN
+            crate::amdgpu_gfx_firmware::VCN1_TYPE => self.media_firmware.vcn1 = Some(reply.address),
+            _ => self.media_firmware.dmcub = Some(reply.address),
         }
         Ok(())
     }
@@ -1129,6 +1279,7 @@ impl<I: Io> Session<I> {
             if image.source() == crate::amdgpu_gfx_firmware::Source::Rlc {
                 // Linux starts RLC immediately after RLC_G, before the later
                 // VCN and DMCUB uploads. Never delay/replay autoload for media.
+                // linux-lit: 0x21=GFX_CMD_ID_AUTOLOAD_RLC
                 self.engine.submit(&command(0x21, &[])).await?;
             }
         }
@@ -1159,6 +1310,7 @@ impl<I: Io> Session<I> {
             if status.cp_stat == u32::MAX || status.rlc_bootload == u32::MAX {
                 return Err(Error::DeviceGone);
             }
+            // linux-lit: 31=RLC_RLCS_BOOTLOAD_STATUS__BOOTLOAD_COMPLETE__SHIFT
             if status.cp_stat == 0 && status.rlc_bootload & (1 << 31) != 0 {
                 return Ok(status);
             }
@@ -1176,7 +1328,7 @@ impl<I: Io> Session<I> {
             if self.engine.state != State::Ready {
                 return Err(Error::Busy);
             }
-            self.engine.submit(&command(7, &[])).await?;
+            self.engine.submit(&command(7, &[])).await?; // linux-lit: 7=GFX_CMD_ID_DESTROY_TMR
             self.tmr_ready = false;
             if let Some(mut tmr) = self.tmr.take() {
                 // SAFETY: caller stopped all engines; PSP acknowledged TMR release.
@@ -1206,7 +1358,7 @@ pub(crate) fn toc_payload(bytes: &[u8]) -> Result<&[u8], Error> {
         .ok_or(Error::Invalid)?;
     if bytes.len() > MAX_IMAGE + 4096
         || h.size_bytes as usize != bytes.len()
-        || h.header_size_bytes < 44
+        || h.header_size_bytes < 44 // linux-lit: 44=sizeof(struct psp_firmware_header_v1_0)
         || (h.header_version_major, h.header_version_minor) != (1, 0)
         || h.ucode_array_offset_bytes < h.header_size_bytes
         || h.ucode_size_bytes == 0

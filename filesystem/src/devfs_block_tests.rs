@@ -705,3 +705,219 @@ kernel_test_in!(
     "filesystem/devfs_block",
     smoke_devfs_disk_by_uuid_symlink_roundtrip
 );
+
+// ── mount(2) block sources: registry names behind /dev/ paths ─────────
+
+fn smoke_block_source_name_resolves_dev_paths() -> TestResult {
+    use crate::fs_registry::block_source_name;
+    let snap = narf_block::registry::__snapshot_for_test();
+    narf_block::registry::register_block_device("narfsrcp9", FakeBlockDevice::new(8, 512));
+    // The bare name, its /dev/ path, and the chrooted /mnt/dev/ path that
+    // mount(8) passes from systemd's root all name the device; a deeper
+    // path does not.
+    let ok = ["narfsrcp9", "/dev/narfsrcp9", "/mnt/dev/narfsrcp9"]
+        .iter()
+        .all(|source| block_source_name(source) == Some("narfsrcp9"));
+    let nested = block_source_name("/dev/disk/narfsrcp9").is_none();
+    narf_block::registry::__restore_for_test(snap);
+    if !ok {
+        return TestResult::Fail("registered block source not resolved from its path");
+    }
+    if !nested {
+        return TestResult::Fail("only a direct child of a dev/ directory names a device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/devfs_block",
+    smoke_block_source_name_resolves_dev_paths
+);
+
+// ── >65535-LBA requests are split, never truncated to u16 ─────────────
+
+/// Wraps a [`FakeBlockDevice`] and records every call's block count, so a
+/// test can see how a large request was split.
+struct CountingDev {
+    inner: Arc<FakeBlockDevice>,
+    calls: narf_lib::sync::IrqSafeSpinLock<Vec<u16>>,
+}
+
+impl core::fmt::Debug for CountingDev {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CountingDev").finish_non_exhaustive()
+    }
+}
+
+impl BlockDeviceSync for CountingDev {
+    fn lba_size(&self) -> u32 {
+        self.inner.lba_size()
+    }
+    fn capacity(&self) -> u64 {
+        self.inner.capacity()
+    }
+    fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8]) -> Result<(), BlockIoError> {
+        self.calls.lock().push(n_blocks);
+        self.inner.read(lba, n_blocks, out)
+    }
+    fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
+        self.calls.lock().push(n_blocks);
+        self.inner.write(lba, n_blocks, data)
+    }
+}
+
+/// A 70 000-LBA write and read (8-byte sectors keep the device at 560 KiB)
+/// move every byte: each device call carries at most 65 535 blocks, so the
+/// count never wraps through `u16` (which moved `70 000 mod 65 536 = 4 464`
+/// blocks and still reported success). An unaligned start exercises the RMW
+/// of the first and last block across the chunk boundary.
+fn smoke_devfs_block_large_request_is_chunked() -> TestResult {
+    use crate::devfs_block::BlockFile;
+    use crate::FileOps;
+
+    const LBAS: usize = 70_000;
+    const BS: u32 = 8;
+    let fake = FakeBlockDevice::filled(LBAS + 2, BS, 0x5A);
+    let dev = Arc::new(CountingDev {
+        inner: fake.clone(),
+        calls: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
+    });
+    let bf = BlockFile::from_dev(dev.clone());
+    if BlockFile::max_chunk_lbas(BS) != u64::from(u16::MAX)
+        || BlockFile::max_chunk_lbas(4096) != 256
+    {
+        return TestResult::Fail("chunk size must respect u16 and the 1 MiB stage");
+    }
+
+    // Aligned 70 000-LBA write.
+    let len = LBAS * BS as usize;
+    let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    match poll_once(bf.write(0, &payload)) {
+        Some(Ok(n)) if n == len => {}
+        _ => return TestResult::Fail("large aligned write did not report the full length"),
+    }
+    if *dev.calls.lock() != [u16::MAX, (LBAS - u16::MAX as usize) as u16] {
+        return TestResult::Fail("70 000 LBAs must be written as 65 535 + 4 465");
+    }
+    {
+        let g = fake.data.lock();
+        if g[..len] != payload[..] || g[len..].iter().any(|&b| b != 0x5A) {
+            return TestResult::Fail("large write did not land every block exactly");
+        }
+    }
+
+    // Aligned 70 000-LBA read back.
+    dev.calls.lock().clear();
+    let mut back = vec![0u8; len];
+    match poll_once(bf.read(0, &mut back)) {
+        Some(Ok(n)) if n == len => {}
+        _ => return TestResult::Fail("large aligned read did not report the full length"),
+    }
+    if back != payload {
+        return TestResult::Fail("large read returned wrong bytes");
+    }
+    if *dev.calls.lock() != [u16::MAX, (LBAS - u16::MAX as usize) as u16] {
+        return TestResult::Fail("70 000 LBAs must be read as 65 535 + 4 465");
+    }
+
+    // Unaligned: start 3 bytes into LBA 1, span past the chunk boundary.
+    dev.calls.lock().clear();
+    let off = BS as u64 + 3;
+    let ulen = len - 16;
+    let upayload: Vec<u8> = (0..ulen).map(|i| (i % 13) as u8 ^ 0xC3).collect();
+    match poll_once(bf.write(off, &upayload)) {
+        Some(Ok(n)) if n == ulen => {}
+        _ => return TestResult::Fail("large unaligned write did not report the full length"),
+    }
+    {
+        let g = fake.data.lock();
+        let o = off as usize;
+        if g[o..o + ulen] != upayload[..]
+            || g[..o] != payload[..o]
+            || g[o + ulen..len] != payload[o + ulen..]
+        {
+            return TestResult::Fail("large unaligned write clobbered or missed bytes");
+        }
+    }
+    let mut uback = vec![0u8; ulen];
+    match poll_once(bf.read(off, &mut uback)) {
+        Some(Ok(n)) if n == ulen && uback == upayload => {}
+        _ => return TestResult::Fail("large unaligned read-back mismatch"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/devfs_block",
+    smoke_devfs_block_large_request_is_chunked
+);
+
+/// A device error after the first chunk is a short count, not a success
+/// claiming every byte (and not an error that hides the bytes moved).
+fn smoke_devfs_block_large_request_short_count() -> TestResult {
+    use crate::devfs_block::BlockFile;
+    use crate::FileOps;
+
+    // 70 000 blocks exposed, but the backing store ends after 66 000: the
+    // second chunk is out of range on the device.
+    const BS: u32 = 8;
+    let fake = FakeBlockDevice::filled(66_000, BS, 0x11);
+    let mut bf = BlockFile::from_dev(fake);
+    bf.lba_count = 70_000;
+    let mut buf = vec![0u8; 70_000 * BS as usize];
+    match poll_once(bf.read(0, &mut buf)) {
+        Some(Ok(n)) if n == u16::MAX as usize * BS as usize => {}
+        _ => return TestResult::Fail("read past a failing chunk must return the short count"),
+    }
+    let data = vec![0x22u8; 70_000 * BS as usize];
+    match poll_once(bf.write(0, &data)) {
+        Some(Ok(n)) if n == u16::MAX as usize * BS as usize => {}
+        _ => return TestResult::Fail("write past a failing chunk must return the short count"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/devfs_block",
+    smoke_devfs_block_large_request_short_count
+);
+
+// ── /dev/btrfs-control: BTRFS_IOC_DEVICES_READY ─────────────────────────
+
+/// A fake disk whose primary btrfs superblock (64 KiB) carries `fsid` and
+/// `num_devices`.
+fn fake_btrfs_member(fsid: [u8; 16], num_devices: u64) -> Arc<FakeBlockDevice> {
+    let dev = FakeBlockDevice::new(256, 512); // 128 KiB
+    let mut sb = vec![0u8; 4096];
+    sb[0x20..0x30].copy_from_slice(&fsid);
+    sb[0x40..0x48].copy_from_slice(b"_BHRfS_M");
+    sb[0x88..0x90].copy_from_slice(&num_devices.to_le_bytes());
+    let _ = dev.write(65536 / 512, 8, &sb);
+    dev
+}
+
+fn smoke_btrfs_control_devices_ready() -> TestResult {
+    use crate::devfs_misc::btrfs_devices_ready;
+    let snap = narf_block::registry::__snapshot_for_test();
+    let single = [0x11u8; 16];
+    let multi = [0x22u8; 16];
+    narf_block::registry::register_block_device("narfbtrfs1p2", fake_btrfs_member(single, 1));
+    narf_block::registry::register_block_device("narfbtrfs2a", fake_btrfs_member(multi, 2));
+    let single_ready = btrfs_devices_ready("/dev/narfbtrfs1p2");
+    let half = btrfs_devices_ready("/dev/narfbtrfs2a");
+    narf_block::registry::register_block_device("narfbtrfs2b", fake_btrfs_member(multi, 2));
+    let whole = btrfs_devices_ready("/mnt/dev/narfbtrfs2a");
+    let not_btrfs = btrfs_devices_ready("/dev/narf-no-such");
+    narf_block::registry::__restore_for_test(snap);
+    if single_ready != Ok(0) {
+        return TestResult::Fail("a single-device btrfs must always be ready");
+    }
+    if half != Ok(1) {
+        return TestResult::Fail("one of two members present must be not-ready");
+    }
+    if whole != Ok(0) {
+        return TestResult::Fail("both members present must be ready");
+    }
+    if not_btrfs.is_ok() {
+        return TestResult::Fail("an unknown device must be an error, not an answer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs_block", smoke_btrfs_control_devices_ready);

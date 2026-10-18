@@ -193,9 +193,8 @@ fn fixture() -> (Pool, Engine<Fake>) {
         (0x1f6, 0x10000),
         (0x341, 0),
         (0xca, 0x10000),
-        (0x475, 0x800),
-        (0x476, 0xaff),
-        (0x477, 0x100),
+        // DCN_VM_FB_LOCATION_* (DCN3.0 0x493..0x495) stay unprogrammed, as
+        // before DC init on hardware: DMUB must use the GMC aperture.
         (0x1a5, 0x60000000),
         (0x1ad, 0x800001ff),
         (0x1b5, 0x01000000),
@@ -249,6 +248,14 @@ fn fixture() -> (Pool, Engine<Fake>) {
 fn tmr() -> Range<u64> {
     0x8_0100_0000..0x8_0200_0000
 }
+/// gmc.fb_start / vm_manager.vram_base_offset for a 12 GiB GMC10 aperture.
+fn fb() -> Aperture {
+    Aperture {
+        base: 0x8_0000_0000,
+        end: 0x8_0000_0000 + (0x300 << 24),
+        offset: 0x1_0000_0000,
+    }
+}
 fn run<T>(f: impl Future<Output = T>) -> T {
     narf_scheduler::block_on_spin(f)
 }
@@ -262,7 +269,7 @@ fn dmub_navi22_preserves_psp_windows_and_starts_dcn30() -> TestResult {
     {
         return TestResult::Fail("wrong DCN30 reset registers");
     }
-    let report = run(engine.start(tmr())).unwrap();
+    let report = run(engine.start(tmr(), fb())).unwrap();
     if report.firmware_version != 0x02022280
         || report.boot_status != 3
         || report.outbox != report.inbox + 8192
@@ -278,7 +285,7 @@ fn dmub_navi22_preserves_psp_windows_and_starts_dcn30() -> TestResult {
         (0x1dc, 0x64002000),
         (0x1dd, 8192),
         (0x1d8, 0xa0000010),
-        (0x1f1, 0x20),
+        (0x1f1, 0),
         (0x1f2, 0x110023),
         (0x1bd, report.inbox as u32),
         (0x1be, 8),
@@ -305,7 +312,7 @@ fn dmub_navi22_preserves_psp_windows_and_starts_dcn30() -> TestResult {
         return TestResult::Fail("Phoenix reset used on Navi22");
     }
     let writes = engine.io.writes.len();
-    if run(engine.start(tmr())) != Err(Error::Busy)
+    if run(engine.start(tmr(), fb())) != Err(Error::Busy)
         || run(engine.quiesce()) != Err(Error::Busy)
         || engine.io.writes.len() != writes
     {
@@ -337,7 +344,20 @@ fn dmub_navi22_rejects_untrusted_windows_before_upload() -> TestResult {
                 engine.io.regs.insert(DCN + 0x1ad * 4, 0x9fffffff);
             }
             3 => {
-                engine.io.regs.insert(DCN + 0x475 * 4, u32::MAX);
+                // Storage/TMR outside the GMC aperture cannot be validated.
+                let writes = engine.io.writes.len();
+                let shifted = Aperture {
+                    base: 0x8_0200_0000,
+                    ..fb()
+                };
+                if run(engine.start(tmr(), shifted)).is_ok() || engine.io.writes.len() != writes {
+                    return TestResult::Fail("TMR outside the GMC aperture accepted");
+                }
+                drop(engine);
+                if pool.available() != bytes {
+                    return TestResult::Fail("unpublished storage leaked");
+                }
+                continue;
             }
             4 => {
                 engine.io.regs.insert(DCN + 0x1ce * 4, 1 << 16);
@@ -347,7 +367,7 @@ fn dmub_navi22_rejects_untrusted_windows_before_upload() -> TestResult {
             }
         }
         let writes = engine.io.writes.len();
-        if run(engine.start(tmr())).is_ok()
+        if run(engine.start(tmr(), fb())).is_ok()
             || engine.io.bytes[0] != u32::MAX
             || engine.io.writes.len() != writes
             || engine.io.released.load(Ordering::SeqCst)
@@ -369,10 +389,23 @@ fn dmub_navi22_stop_boot_timeout_readback_and_revocation() -> TestResult {
     for case in 0..4 {
         let (pool, mut engine) = fixture();
         if case == 0 {
+            // dmub_dcn20_reset: an unacknowledged STOP_FW still clears GPINT
+            // and forces the reset ("DMCUB is likely hung").
             engine.io.stop = false;
-            if run(engine.quiesce()) != Err(Error::StopTimeout) || engine.io.writes.len() != 1 {
-                return TestResult::Fail("unacknowledged STOP forced reset");
+            if run(engine.quiesce()).is_err()
+                || engine.state != State::Reset
+                || engine.io.writes.first() != Some(&(DCN + 0x1f8 * 4, 0x10020000))
+                || engine.io.writes.get(1) != Some(&(DCN + 0x1f8 * 4, 0))
+                || engine.io.regs[&(DCN + 0x1f6 * 4)] & 0x30000 != 0x20000
+                || engine.io.regs[&(DCN + 0x341 * 4)] & 0x100 == 0
+            {
+                return TestResult::Fail("unacknowledged STOP did not force the reset");
             }
+            // The forced reset leaves the owner startable, like Linux.
+            if run(engine.start(tmr(), fb())).is_err() {
+                return TestResult::Fail("force-reset DMCUB not startable");
+            }
+            continue;
         } else {
             run(engine.quiesce()).unwrap();
             let error = match case {
@@ -389,7 +422,7 @@ fn dmub_navi22_stop_boot_timeout_readback_and_revocation() -> TestResult {
                     Error::Revoked
                 }
             };
-            if run(engine.start(tmr())) != Err(error) || engine.status.is_some() {
+            if run(engine.start(tmr(), fb())) != Err(error) || engine.status.is_some() {
                 return TestResult::Fail("bad DMUB start accepted");
             }
         }
@@ -398,7 +431,7 @@ fn dmub_navi22_stop_boot_timeout_readback_and_revocation() -> TestResult {
         }
         let size = engine.memory.size();
         drop(engine);
-        if pool.available() != if case == 0 { size } else { 0 } {
+        if pool.available() != 0 || size == 0 {
             return TestResult::Fail("wrong DMUB storage lifetime after fault");
         }
     }
@@ -407,6 +440,43 @@ fn dmub_navi22_stop_boot_timeout_readback_and_revocation() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dmub-navi22",
     dmub_navi22_stop_boot_timeout_readback_and_revocation
+);
+/// Linux dmub_srv_hw_init re-runs dmub_dcn20_reset after PSP loading even
+/// when PSP released DMCUB, and never reads DCN's unprogrammed FB copy.
+fn dmub_navi22_start_resets_released_dmcub_without_dcn_fb_copy() -> TestResult {
+    let (_pool, mut engine) = fixture();
+    run(engine.quiesce()).unwrap();
+    // PSP authentication released DMCUB from reset and it runs again.
+    engine.io.regs.insert(DCN + 0x1f6 * 4, 0x10000);
+    engine.io.regs.insert(DCN + 0x341 * 4, 0);
+    for reg in [0x475, 0x476, 0x477, 0x493, 0x494, 0x495] {
+        engine.io.regs.insert(DCN + reg * 4, 0);
+    }
+    let before = engine.io.writes.len();
+    if run(engine.start(tmr(), fb())).is_err() || engine.state != State::Running {
+        return TestResult::Fail("released DMCUB was not reset again before start");
+    }
+    let writes = &engine.io.writes[before..];
+    if writes.first() != Some(&(DCN + 0x1f8 * 4, 0x10020000))
+        || !writes.contains(&(DCN + 0x1f6 * 4, 0x30000))
+    {
+        return TestResult::Fail("dmub_dcn20_reset STOP/soft-reset sequence missing");
+    }
+    if engine.io.writes.iter().any(|(reg, _)| {
+        [0x475, 0x476, 0x477, 0x493, 0x494, 0x495]
+            .map(|r| DCN + r * 4)
+            .contains(reg)
+    }) {
+        return TestResult::Fail("DMUB touched DCN_VM_FB_* registers");
+    }
+    if engine.io.regs[&(DCN + 0x1f1 * 4)] != 0 {
+        return TestResult::Fail("DCN3.0 SCRATCH14 boot options must be zero");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi22",
+    dmub_navi22_start_resets_released_dmcub_without_dcn_fb_copy
 );
 fn dmub_navi22_cancellation_preserves_stage_and_storage() -> TestResult {
     for boot in [false, true] {
@@ -417,7 +487,7 @@ fn dmub_navi22_cancellation_preserves_stage_and_storage() -> TestResult {
             engine.io.boot = false;
             let released = engine.io.released.clone();
             {
-                let mut future = core::pin::pin!(engine.start(tmr()));
+                let mut future = core::pin::pin!(engine.start(tmr(), fb()));
                 for _ in 0..1024 {
                     if future
                         .as_mut()
@@ -433,7 +503,7 @@ fn dmub_navi22_cancellation_preserves_stage_and_storage() -> TestResult {
             }
             if !released.load(Ordering::SeqCst)
                 || engine.state != State::Starting
-                || run(engine.start(tmr())) != Err(Error::Busy)
+                || run(engine.start(tmr(), fb())) != Err(Error::Busy)
             {
                 return TestResult::Fail("cancelled boot replayed");
             }
@@ -504,4 +574,89 @@ fn dmub_navi22_preparation_and_layout_are_generation_specific() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dmub-navi22",
     dmub_navi22_preparation_and_layout_are_generation_specific
+);
+
+/// dm_dmub_hw_init: CC_DC_PIPE_DIS.DC_DMCUB_ENABLE clear means "DMUB
+/// unsupported on ASIC" -- reported as Unsupported without any DMUB write.
+fn dmub_navi22_fused_off_dmcub_is_unsupported_without_writes() -> TestResult {
+    let (_pool, mut engine) = fixture();
+    engine.io.regs.insert(DCN + 0xca * 4, 0);
+    if run(engine.quiesce()) != Err(Error::Unsupported) || !engine.io.writes.is_empty() {
+        return TestResult::Fail("fused-off DMCUB touched or not reported unsupported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi22",
+    dmub_navi22_fused_off_dmcub_is_unsupported_without_writes
+);
+
+/// A DMCUB that GOP never started (DMCUB_ENABLE = 0, not in reset) cannot
+/// acknowledge STOP_FW: dmub_dcn20_reset still posts it, clears GPINT and
+/// forces the reset, but the 100 ms acknowledgement wait (and its "not
+/// acknowledged" fault line) is for a running DMCUB only.
+fn dmub_navi22_never_started_dmcub_skips_the_stop_wait() -> TestResult {
+    let (_pool, mut engine) = fixture();
+    engine.io.stop = false;
+    engine.io.regs.insert(DCN + 0x1f6 * 4, 0);
+    let quick = narf_time::Deadline::after_ms(60);
+    if run(engine.quiesce()).is_err() || engine.state != State::Reset {
+        return TestResult::Fail("never-started DMCUB not reset");
+    }
+    if quick.expired() {
+        return TestResult::Fail("waited for a STOP_FW ack from a DMCUB that never ran");
+    }
+    if engine.io.writes.first() != Some(&(DCN + 0x1f8 * 4, 0x10020000))
+        || engine.io.writes.get(1) != Some(&(DCN + 0x1f8 * 4, 0))
+        || engine.io.regs[&(DCN + 0x1f6 * 4)] & 0x30000 != 0x20000
+    {
+        return TestResult::Fail("dmub_dcn20_reset sequence for a stopped DMCUB");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi22",
+    dmub_navi22_never_started_dmcub_skips_the_stop_wait
+);
+
+/// command_table2.c `*_dmcub` + dc_wake_and_execute_dmub_cmd(WAIT): the
+/// DMUB_CMD__VBIOS slot carries header and parameters, completes once DMCUB
+/// consumes it, and a DMCUB that never does fails within the 100 ms bound.
+fn dmub_navi22_vbios_command_executes_through_the_inbox() -> TestResult {
+    let (_pool, mut engine) = fixture();
+    let payload = [0xa5u8; 16];
+    if engine.vbios(VbiosCommand::SetPixelClock, &payload) != Err(Error::Busy) {
+        return TestResult::Fail("VBIOS command before DMUB runs");
+    }
+    run(engine.quiesce()).unwrap();
+    run(engine.start(tmr(), fb())).unwrap();
+    run(engine.initialize_mailbox()).unwrap();
+    let slot = engine.io.regs[&(DCN + 0x1d6 * 4)] as usize;
+    if engine.vbios(VbiosCommand::SetPixelClock, &payload).is_err()
+        || engine.mailbox.state != MailboxState::Ready
+    {
+        return TestResult::Fail("VBIOS SetPixelClock not executed");
+    }
+    let sent = engine.io.slot(engine.io.mailbox + slot);
+    if sent[..4] != [128, 2, 0, 16] || sent[4..20] != payload || sent[20..] != [0; 44] {
+        return TestResult::Fail("DMUB_CMD__VBIOS_SET_PIXEL_CLOCK slot");
+    }
+    if engine
+        .vbios(VbiosCommand::EnableDispPowerGating, &payload)
+        .is_ok()
+    {
+        return TestResult::Fail("oversized VBIOS payload accepted");
+    }
+    engine.io.commands = false;
+    if engine.vbios(VbiosCommand::EnableDispPowerGating, &payload[..4])
+        != Err(Error::CommandTimeout)
+        || engine.mailbox.state != MailboxState::Failed
+    {
+        return TestResult::Fail("unconsumed VBIOS command did not time out");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi22",
+    dmub_navi22_vbios_command_executes_through_the_inbox
 );

@@ -27,9 +27,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::registry::{
-    register_block_device, register_block_device_with_meta, BlockDeviceSync, PartitionMetadata,
-};
+use crate::registry::{register_partition_device, BlockDeviceSync, PartitionMetadata};
 use crate::BlockIoError;
 
 /// Best-effort volume UUID discovery used for `/dev/disk/by-uuid`.
@@ -38,7 +36,7 @@ use crate::BlockIoError;
 /// partition scanner is already registering the child device. It is not a
 /// filesystem or encryption probe: the owning layer still validates and opens
 /// the complete format later. FAT serials use Linux's eight-hex-digit form;
-/// ext, LUKS1, and LUKS2 UUIDs use their canonical forms.
+/// ext, btrfs (`fsid`), LUKS1, and LUKS2 UUIDs use their canonical forms.
 pub fn discover_volume_uuid(dev: &dyn BlockDeviceSync) -> Option<String> {
     let lba_bytes = dev.lba_size() as usize;
     if lba_bytes < 512 {
@@ -76,17 +74,48 @@ pub fn discover_volume_uuid(dev: &dyn BlockDeviceSync) -> Option<String> {
         return None;
     }
     let mut bytes = alloc::vec![0u8; blocks * lba_bytes];
-    if dev.read(0, blocks as u16, &mut bytes).is_err()
-        || bytes.get(1024 + 0x38..1024 + 0x3a) != Some(&[0x53, 0xef][..])
+    if dev.read(0, blocks as u16, &mut bytes).is_ok()
+        && bytes.get(1024 + 0x38..1024 + 0x3a) == Some(&[0x53, 0xef][..])
     {
+        let uuid: [u8; 16] = bytes[1024 + 0x68..1024 + 0x68 + 16].try_into().ok()?;
+        return Some(crate::registry::format_uuid_bytes(&uuid));
+    }
+
+    // btrfs: the primary superblock is at 64 KiB, `magic` "_BHRfS_M" at
+    // +0x40 and the filesystem `fsid` (what blkid reports as UUID) at +0x20.
+    const BTRFS_SB: usize = 0x1_0000;
+    if BTRFS_SB % lba_bytes != 0 {
         return None;
     }
-    let uuid = &bytes[1024 + 0x68..1024 + 0x68 + 16];
-    Some(format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
-        uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]
-    ))
+    let mut sb = alloc::vec![0u8; lba_bytes];
+    dev.read((BTRFS_SB / lba_bytes) as u64, 1, &mut sb).ok()?;
+    if sb.get(0x40..0x48) != Some(b"_BHRfS_M".as_slice()) {
+        return None;
+    }
+    let fsid: [u8; 16] = sb.get(0x20..0x30)?.try_into().ok()?;
+    Some(crate::registry::format_uuid_bytes(&fsid))
+}
+
+/// Canonical lowercase 8-4-4-4-12 rendering of a 16-byte UUID.
+pub use crate::registry::format_uuid_bytes;
+
+/// Parse a canonical (hyphenated or not) 32-hex-digit UUID. FAT serials
+/// (`6D89-28C5`) and anything else not exactly 16 bytes return `None`.
+pub fn parse_uuid(text: &str) -> Option<[u8; 16]> {
+    let mut out = [0u8; 16];
+    let mut nibbles = 0usize;
+    for c in text.chars() {
+        if c == '-' {
+            continue;
+        }
+        let v = c.to_digit(16)? as u8;
+        if nibbles >= 32 {
+            return None;
+        }
+        out[nibbles / 2] |= if nibbles % 2 == 0 { v << 4 } else { v };
+        nibbles += 1;
+    }
+    (nibbles == 32).then_some(out)
 }
 
 // ── Common signatures ──────────────────────────────────────────────
@@ -104,6 +133,17 @@ pub const GPT_SIGNATURE: &[u8; 8] = b"EFI PART";
 pub const GPT_REVISION_1_0: u32 = 0x0001_0000;
 /// The fixed-size LBA the primary header lives on.
 pub const GPT_PRIMARY_HEADER_LBA: u64 = 1;
+/// Smallest legal GPT partition entry (UEFI 2.10 §5.3.3).
+pub const GPT_MIN_ENTRY_SIZE: u32 = 128;
+/// Largest partition-entry array the scanner reads. The UEFI minimum
+/// array is 16 KiB (128 × 128 B); Linux `is_gpt_valid` refuses arrays
+/// above `KMALLOC_MAX_SIZE`. 1 MiB bounds the allocation a corrupt or
+/// hostile header can force while admitting every real layout.
+pub const GPT_MAX_ENTRY_ARRAY_BYTES: usize = 1 << 20;
+/// Bytes per partition-entry-array read. One 4 KiB page per request is
+/// within every NARF block driver's transfer limit; a device that rejects
+/// even that is retried one LBA at a time.
+pub const GPT_ENTRY_READ_CHUNK_BYTES: usize = 4096;
 
 // ── MBR ────────────────────────────────────────────────────────────
 
@@ -220,7 +260,7 @@ pub enum GptError {
     UnsupportedRevision,
     /// `header_size` claimed less than 92 bytes.
     BadHeaderSize,
-    /// `partition_entry_size` was zero or not a multiple of 8.
+    /// `partition_entry_size` was not 128 × 2^n (UEFI 2.10 §5.3.2).
     BadEntrySize,
 }
 
@@ -242,7 +282,10 @@ pub fn parse_gpt_header(sector: &[u8]) -> Result<GptHeader, GptError> {
         return Err(GptError::BadHeaderSize);
     }
     let partition_entry_size = u32::from_le_bytes(sector[84..88].try_into().unwrap());
-    if partition_entry_size == 0 || partition_entry_size % 8 != 0 {
+    // UEFI 2.10 §5.3.2: SizeOfPartitionEntry is 128 × 2^n. The entry
+    // parser reads the first 128 bytes of each slot, so anything smaller
+    // would index past the slot.
+    if partition_entry_size < GPT_MIN_ENTRY_SIZE || !partition_entry_size.is_power_of_two() {
         return Err(GptError::BadEntrySize);
     }
     Ok(GptHeader {
@@ -416,6 +459,19 @@ impl BlockDeviceSync for PartitionBlockDevice {
         let abs = self.start_lba + lba;
         self.parent.read(abs, n_blocks, out)
     }
+    fn flush(&self) -> Result<(), BlockIoError> {
+        self.parent.flush()
+    }
+    fn capabilities(&self) -> crate::registry::BlockCaps {
+        self.parent.capabilities()
+    }
+    fn write_fua(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
+        let n = n_blocks as u64;
+        if lba.checked_add(n).is_none_or(|end| end > self.sector_count) {
+            return Err(BlockIoError::OutOfRange);
+        }
+        self.parent.write_fua(self.start_lba + lba, n_blocks, data)
+    }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
         let n = n_blocks as u64;
         if lba.checked_add(n).is_none_or(|end| end > self.sector_count) {
@@ -423,6 +479,9 @@ impl BlockDeviceSync for PartitionBlockDevice {
         }
         let abs = self.start_lba + lba;
         self.parent.write(abs, n_blocks, data)
+    }
+    fn is_read_only(&self) -> bool {
+        self.parent.is_read_only()
     }
 }
 
@@ -439,6 +498,9 @@ pub enum ScanError {
     MbrSignature(MbrError),
     /// GPT header didn't parse.
     GptHeader(GptError),
+    /// The header's entry array is larger than
+    /// [`GPT_MAX_ENTRY_ARRAY_BYTES`] or does not fit on the device.
+    EntriesTooLarge,
 }
 
 /// Outcome of [`scan_and_register_partitions`] — diagnostic
@@ -446,10 +508,77 @@ pub enum ScanError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanReport {
     /// Names registered against the block registry (e.g.
-    /// `["nvme0p1", "nvme0p2"]`).
+    /// `["nvme0n1p1", "nvme0n1p2"]`).
     pub registered: Vec<String>,
     /// True iff the disk was GPT (vs legacy MBR).
     pub is_gpt: bool,
+}
+
+/// One console line per registered partition, so a boot log shows which
+/// partitions of which disk NARF can see (and, under `narf.disks=boot-only`,
+/// that each one is read-only until identified).
+fn log_partition(parent: &str, name: &str, start: u64, sectors: u64) {
+    use core::fmt::Write as _;
+    let _ = writeln!(
+        narf_console::Writer,
+        "block: {parent}: partition {name} at lba {start}, {sectors} blocks"
+    );
+}
+
+/// Read the GPT partition-entry array described by `header`.
+///
+/// Returns the buffer (rounded up to whole LBAs) and the array length in
+/// bytes. The array is read in [`GPT_ENTRY_READ_CHUNK_BYTES`] requests,
+/// so a standard 128-entry table (16 KiB) never needs a single transfer
+/// larger than one page; a chunk the device refuses is retried one LBA at
+/// a time before the scan gives up. The array is bounded by
+/// [`GPT_MAX_ENTRY_ARRAY_BYTES`] and, when the device reports a capacity,
+/// must lie inside it.
+pub fn read_gpt_entry_array(
+    dev: &dyn BlockDeviceSync,
+    header: &GptHeader,
+) -> Result<(Vec<u8>, usize), ScanError> {
+    let lba_bytes = dev.lba_size() as usize;
+    if lba_bytes == 0 {
+        return Err(ScanError::EntriesRead(BlockIoError::DriverError));
+    }
+    let array_bytes = (header.num_partition_entries as usize)
+        .checked_mul(header.partition_entry_size as usize)
+        .filter(|&b| b <= GPT_MAX_ENTRY_ARRAY_BYTES)
+        .ok_or(ScanError::EntriesTooLarge)?;
+    let array_lbas = array_bytes.div_ceil(lba_bytes);
+    let capacity = dev.capacity();
+    let end = header
+        .partition_entries_lba
+        .checked_add(array_lbas as u64)
+        .ok_or(ScanError::EntriesTooLarge)?;
+    if capacity != 0 && end > capacity {
+        return Err(ScanError::EntriesTooLarge);
+    }
+    let mut array = alloc::vec![0u8; array_lbas * lba_bytes];
+    let chunk_lbas = core::cmp::max(1, GPT_ENTRY_READ_CHUNK_BYTES / lba_bytes);
+    let mut done = 0usize;
+    while done < array_lbas {
+        let n = core::cmp::min(chunk_lbas, array_lbas - done);
+        let lba = header.partition_entries_lba + done as u64;
+        let dst = &mut array[done * lba_bytes..(done + n) * lba_bytes];
+        match dev.read(lba, n as u16, dst) {
+            Ok(()) => {}
+            Err(e) if n > 1 && e != BlockIoError::OutOfRange => {
+                for k in 0..n {
+                    dev.read(
+                        lba + k as u64,
+                        1,
+                        &mut dst[k * lba_bytes..(k + 1) * lba_bytes],
+                    )
+                    .map_err(ScanError::EntriesRead)?;
+                }
+            }
+            Err(e) => return Err(ScanError::EntriesRead(e)),
+        }
+        done += n;
+    }
+    Ok((array, array_bytes))
 }
 
 /// Scan a parent block device for partitions and register each
@@ -478,22 +607,21 @@ pub fn scan_and_register_partitions(
         parent.read(1, 1, &mut sector1).map_err(ScanError::Gpt)?;
         let header = parse_gpt_header(&sector1).map_err(ScanError::GptHeader)?;
 
-        // Compute how many LBAs the entries array occupies.
-        let array_bytes =
-            header.num_partition_entries as usize * header.partition_entry_size as usize;
-        let array_lbas = array_bytes.div_ceil(lba_bytes) as u16;
-        let mut array = alloc::vec![0u8; array_lbas as usize * lba_bytes];
-        parent
-            .read(header.partition_entries_lba, array_lbas, &mut array)
-            .map_err(ScanError::EntriesRead)?;
-
+        let (array, array_bytes) = read_gpt_entry_array(parent.as_ref(), &header)?;
         let entries = parse_gpt_partitions(
             &array[..array_bytes],
             header.partition_entry_size as usize,
             header.num_partition_entries as usize,
         );
+        let capacity = parent.capacity();
         for (idx, p) in entries.iter().enumerate() {
             if p.is_empty() {
+                continue;
+            }
+            // Linux `is_pte_valid`: an entry reaching past the last LBA
+            // (or ending before it starts) is not a partition. Skipped
+            // only when the device reports a capacity.
+            if p.end_lba < p.start_lba || (capacity != 0 && p.end_lba >= capacity) {
                 continue;
             }
             let name = format!("{}p{}", parent_name, idx + 1);
@@ -511,7 +639,8 @@ pub fn scan_and_register_partitions(
                 partuuid: format_guid(&p.partition_guid),
                 fs_uuid: discover_volume_uuid(sub.as_ref()).unwrap_or_default(),
             };
-            register_block_device_with_meta(static_name, sub, Some(meta));
+            register_partition_device(static_name, parent_name, sub, Some(meta));
+            log_partition(parent_name, &name, p.start_lba, p.sector_count());
             registered.push(name);
         }
         Ok(ScanReport {
@@ -531,7 +660,13 @@ pub fn scan_and_register_partitions(
                 p.start_lba as u64,
                 p.sector_count as u64,
             )) as Arc<dyn BlockDeviceSync>;
-            register_block_device(static_name, sub);
+            register_partition_device(static_name, parent_name, sub, None);
+            log_partition(
+                parent_name,
+                &name,
+                p.start_lba as u64,
+                p.sector_count as u64,
+            );
             registered.push(name);
         }
         Ok(ScanReport {

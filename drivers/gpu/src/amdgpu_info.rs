@@ -109,6 +109,39 @@ pub struct Snapshot {
     pub is_apu: bool,
     pub gc: Option<GcInfo>,
     pub ip_blocks: Vec<crate::amdgpu_discovery::IpBlock>,
+    /// Navi 22 identity published by its cold-boot owner; default elsewhere.
+    pub navi22: crate::amdgpu_info_navi22::Published,
+}
+
+/// Navi 22 topology, PCI revision and boot observations, published by the
+/// owners that read them (the Navi48 `publish_navi48_topology` pattern).
+static NAVI22: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_info_navi22::Published> =
+    narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_info_navi22::Published {
+        topology: None,
+        pci_revision: None,
+        boot: None,
+        vcn_harvest: None,
+        media_rings: 0,
+    });
+/// From the cold boot's `ReadTopology` stage.
+pub(crate) fn publish_navi22_topology(topology: crate::amdgpu_gfx10_topology::Topology) {
+    NAVI22.lock().topology = Some(topology);
+}
+/// PCI config revision, read by the platform owner before the cold boot.
+pub(crate) fn publish_navi22_pci_revision(revision: u8) {
+    NAVI22.lock().pci_revision = Some(revision);
+}
+/// After a successful cold boot only.
+pub(crate) fn publish_navi22_boot(boot: crate::amdgpu_info_navi22::Boot) {
+    NAVI22.lock().boot = Some(boot);
+}
+/// The VCN harvest mask, read by the platform owner before the cold boot.
+pub(crate) fn publish_navi22_vcn_harvest(harvest: u8) {
+    NAVI22.lock().vcn_harvest = Some(harvest);
+}
+/// The media rings that take client jobs (0 when withdrawn).
+pub(crate) fn publish_navi22_media_rings(rings: u8) {
+    NAVI22.lock().media_rings = rings;
 }
 
 fn snapshot() -> Option<Snapshot> {
@@ -125,6 +158,11 @@ impl Snapshot {
             is_apu: gpu.is_apu(),
             gc: gpu.gc_info,
             ip_blocks: gpu.ip_blocks.clone(),
+            navi22: if gpu.chip.did == crate::amdgpu::NAVI22 {
+                *NAVI22.lock()
+            } else {
+                Default::default()
+            },
         }
     }
 }
@@ -135,7 +173,7 @@ impl Snapshot {
 /// never by writing at computed offsets. The mirror's layout is pinned
 /// against the C header by a generated size test, so this cannot drift; an
 /// offset table would be a second, unchecked copy of the same information.
-fn as_bytes<T: Copy>(value: &T) -> Vec<u8> {
+pub(crate) fn as_bytes<T: Copy>(value: &T) -> Vec<u8> {
     // SAFETY: `T` is one of the `#[repr(C)]` UAPI mirrors — plain old data
     // with no padding we are not entitled to read, no references, and no
     // interior mutability. The slice borrows `value` for the duration of the
@@ -335,8 +373,21 @@ pub fn query(query: u32, payload: [u32; 4]) -> Result<Vec<u8>, FsError> {
     query_against(&snap, query, payload)
 }
 
+/// Whether `snap` is a Navi 22, whose queries `amdgpu_info_navi22` answers.
+fn answers_navi22(snap: &Snapshot) -> bool {
+    snap.family == Family::Navi2
+        && snap.did == u32::from(crate::amdgpu::NAVI22)
+        && family_id(snap).is_some()
+}
+
 /// [`query`] against an explicit device description.
 pub fn query_against(snap: &Snapshot, query: u32, payload: [u32; 4]) -> Result<Vec<u8>, FsError> {
+    // Navi 22 answers its own identity, topology and firmware queries.
+    if answers_navi22(snap) {
+        if let Some(reply) = crate::amdgpu_info_navi22::query(snap, query, payload) {
+            return reply;
+        }
+    }
     match query {
         // There is no submission path, so this is false. See the module
         // LINUX-GAP — reporting true would make Mesa fail later and worse.
@@ -407,8 +458,22 @@ pub fn dispatch_for(
         // amdgpu_hw_ip_info: the rings the open's card can run its jobs on.
         (uapi::AMDGPU_INFO_HW_IP_INFO, Some(vm)) => {
             let mut reply = query(which, payload)?;
-            let rings = available_rings(vm.card(), payload[0], payload[1]);
+            let served = available_rings(vm.card(), payload[0], payload[1]);
             if let Some(field) = reply.get_mut(24..28) {
+                // Navi 22 already answered Linux's multi-ring mask behind its
+                // accel switch (`amdgpu_info_navi22`); keep it while the
+                // card's submitter serves the IP, so a switched-on part
+                // whose submitter failed to register reports no rings.
+                let rings = if snapshot().is_some_and(|snap| answers_navi22(&snap)) {
+                    let navi22 = u32::from_le_bytes(field[..].try_into().unwrap());
+                    if served != 0 {
+                        navi22
+                    } else {
+                        0
+                    }
+                } else {
+                    served
+                };
                 field.copy_from_slice(&rings.to_le_bytes());
             }
             reply

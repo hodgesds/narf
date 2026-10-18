@@ -7,8 +7,9 @@ use core::{
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-fn report() -> Report {
+pub(crate) fn report() -> Report {
     Report {
+        reset: None,
         smu: smu::Versions {
             firmware: 0x413f00,
             interface: 0xe,
@@ -23,6 +24,9 @@ fn report() -> Report {
         memory_aperture: None,
         sdma: None,
         dmub: None,
+        queues: None,
+        interrupts: None,
+        media: None,
     }
 }
 struct Fake {
@@ -254,6 +258,7 @@ pub(crate) fn gpu() -> AmdGpu {
             ip(d::HW_ID_SDMA0, (5, 2, 2)),
             ip(d::HW_ID_NBIF, (3, 3, 0)),
             ip(d::HW_ID_HDP, (5, 0, 2)),
+            ip(d::HW_ID_OSSSYS, (5, 0, 3)),
         ],
     }
 }
@@ -264,6 +269,7 @@ fn firmware() -> Firmware {
         graphics: gfx::tests::fixture(),
         power: None,
         dmub: None,
+        display: None,
     }
 }
 fn navi22_runtime_commands_require_completed_boot_and_retained_tmr() -> TestResult {
@@ -296,6 +302,43 @@ fn navi22_runtime_commands_require_completed_boot_and_retained_tmr() -> TestResu
 kernel_test_in!(
     "drivers/gpu/navi22-boot",
     navi22_runtime_commands_require_completed_boot_and_retained_tmr
+);
+fn navi22_native_display_requires_routes_and_firmware_readiness() -> TestResult {
+    let pool = pool(16 << 20);
+    // SAFETY: constructor performs no I/O on this unmapped fixture.
+    let mut boot = unsafe { ColdBoot::new(&gpu(), Cap::bootstrap(), &pool, firmware()) }.unwrap();
+    // No prepared VBIOS routes: nothing to bind, and nothing claimed.
+    if boot.prepare_display() != Err(Error::Invalid) || boot.display_connectors().is_some() {
+        return TestResult::Fail("display claimed without routes");
+    }
+    for state in [
+        State::Prepared,
+        State::Running(Stage::DmubStart),
+        State::Failed {
+            stage: Stage::DmubStart,
+            error: Error::Invalid,
+        },
+        State::Released,
+    ] {
+        boot.sequence.state = state;
+        if run(boot.detect_displays()).err() != Some(Error::Busy) {
+            return TestResult::Fail("detection before firmware readiness");
+        }
+    }
+    boot.sequence.state = State::FirmwareReady(report());
+    if run(boot.detect_displays()).err() != Some(Error::Invalid) {
+        return TestResult::Fail("detection without an owner");
+    }
+    // Opting into DMUB AUX does not bypass the boot/TMR gate.
+    boot.allow_dmub_aux();
+    if run(boot.dmub_hpd(0)) != Err(Error::Busy) {
+        return TestResult::Fail("DMUB HPD escaped its gate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_native_display_requires_routes_and_firmware_readiness
 );
 fn navi22_boot_outlives_the_controller_lock() -> TestResult {
     fn send_static<T: Send + 'static>(_: &T) {}
@@ -442,4 +485,228 @@ fn navi22_boot_preflight_and_real_backend_revocation() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi22-boot",
     navi22_boot_preflight_and_real_backend_revocation
+);
+fn navi22_boot_queue_preparation_requires_hubs_and_sdma() -> TestResult {
+    let pool = pool(16 << 20);
+    let authority = Cap::bootstrap();
+    let doorbells = crate::amdgpu_cp_navi22::tests::doorbells();
+    // SAFETY: bookkeeping-only constructor; no I/O happens in this test.
+    let mut boot = unsafe { ColdBoot::new(&gpu(), authority, &pool, firmware()) }.unwrap();
+    let available = pool.available();
+    if boot.prepare_queues(doorbells) != Err(Error::Invalid)
+        || boot.sequence.backend.queues.is_some()
+        || pool.available() != available
+    {
+        return TestResult::Fail("queues prepared without VMID0 hubs and SDMA proof");
+    }
+    boot.sequence.state = State::Running(Stage::Kiq);
+    if boot.prepare_queues(doorbells) != Err(Error::Busy) {
+        return TestResult::Fail("queues prepared during a run");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_boot_queue_preparation_requires_hubs_and_sdma
+);
+
+fn navi22_boot_fence_interrupts_map_to_their_engine() -> TestResult {
+    use crate::{amdgpu_fence_navi22::Engine, amdgpu_ih_navi22::Iv};
+    let iv = |client, src, ring_id| Iv {
+        client,
+        src,
+        ring_id,
+        vmid: 0,
+        vmid_src: false,
+        timestamp: 0,
+        timestamp_src: false,
+        pasid: 0,
+        node_id: 0,
+        src_data: [0; 4],
+    };
+    // ring_id = queue << 4 | me << 2 | pipe (gfx_v10_0_eop_irq).
+    for (entry, expected) in [
+        (iv(0x14, 181, 0x00), Some(Engine::Gfx)),
+        (iv(0x14, 181, 0x04), Some(Engine::Compute)),
+        (iv(0x14, 181, 0x09), Some(Engine::Kiq)),
+        (iv(0x14, 181, 0x0c), None),
+        (iv(0x08, 224, 0), Some(Engine::Sdma0)),
+        (iv(0x09, 224, 0), Some(Engine::Sdma1)),
+        (iv(0x14, 184, 0), None),
+        (iv(0x08, 0, 0), None),
+    ] {
+        if fence_engine(&entry) != expected {
+            return TestResult::Fail("IH entry routed to the wrong fence engine");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_boot_fence_interrupts_map_to_their_engine
+);
+
+fn navi22_recovery_and_tdr_require_a_completed_recoverable_boot() -> TestResult {
+    let pool = pool(16 << 20);
+    let authority = Cap::bootstrap();
+    // SAFETY: constructor performs no I/O; every entry below must refuse
+    // before touching these intentionally unmapped GPU addresses.
+    let mut boot = unsafe { ColdBoot::new(&gpu(), authority, &pool, firmware()) }.unwrap();
+    for state in [
+        State::Prepared,
+        State::Running(Stage::IbTests),
+        State::Failed {
+            stage: Stage::IbTests,
+            error: Error::Invalid,
+        },
+        State::Released,
+    ] {
+        boot.sequence.state = state;
+        if boot.queue_progress().err() != Some(Error::Busy)
+            || boot.recoverable()
+            || boot.queues_verified()
+        {
+            return TestResult::Fail("TDR/recovery escaped the completed-boot gate");
+        }
+    }
+    // Completed, but without board power, PSP and IH (this fixture): no
+    // queues to sample and recovery refused before any I/O.
+    boot.sequence.state = State::FirmwareReady(report());
+    if boot.queue_progress().map(|v| v.len()) != Ok(0) || boot.recoverable() {
+        return TestResult::Fail("unprepared owner sampled or recoverable");
+    }
+    // SAFETY: refused before the IH owner (absent here) is touched.
+    if run(unsafe { boot.quiesce_for_reset() }) != Err(Error::Busy) {
+        return TestResult::Fail("quiesce of an unrecoverable owner");
+    }
+    let addr = narf_bus::PcieAddr::new(0, 3, 0, 0);
+    let device = narf_bus::BusDevice {
+        addr: narf_bus::BusAddr::Pcie(addr),
+        kind: narf_bus::BusKind::Pcie {
+            addr,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+        id: narf_bus::DeviceId {
+            vendor: 0x1002,
+            device: 0x73df,
+            class: 0x030000,
+            subsystem_vendor: 0x1462,
+            subsystem_id: 0x3985,
+        },
+    };
+    // SAFETY: refused before any constructor or I/O runs.
+    if unsafe { boot.into_recovery(device) }.err() != Some(Error::Busy) {
+        return TestResult::Fail("rebuilt an unrecoverable owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_recovery_and_tdr_require_a_completed_recoverable_boot
+);
+
+/// Linux ordering the firmware path must keep: PSP TMR reservation and SMC
+/// precede everything else (SETUP_TMR itself is inside `Smc`, after PMFW),
+/// GC golden settings precede SDMA, and DMUB starts only after every queue
+/// and fence proof, so a DMUB failure cannot cost GFX/SDMA/media.
+fn navi22_stage_order_matches_linux_firmware_path() -> TestResult {
+    let at = |stage| STAGES.iter().position(|s| *s == stage).unwrap();
+    if at(Stage::TrustedMemory) + 1 != at(Stage::Smc)
+        || at(Stage::Smc) >= at(Stage::Graphics)
+        || at(Stage::GoldenSettings) >= at(Stage::SdmaTest)
+        || at(Stage::Interrupts) >= at(Stage::GoldenSettings)
+        || at(Stage::DmubStart) <= at(Stage::IbTests)
+        || at(Stage::DmubStart) <= at(Stage::FenceInterrupts)
+        || at(Stage::DmubStart) >= at(Stage::Media)
+        || at(Stage::DmubQuiesce) >= at(Stage::Graphics)
+    {
+        return TestResult::Fail("firmware stage order diverges from Linux");
+    }
+    use crate::amdgpu_dmub_navi22::Error as Dmub;
+    for error in [Dmub::BootTimeout, Dmub::Invalid, Dmub::Readback, Dmub::Busy] {
+        if dmub_result(Err(error)).is_err() {
+            return TestResult::Fail("ordinary DMUB failure was fatal to the boot");
+        }
+    }
+    for error in [Dmub::DeviceGone, Dmub::Revoked] {
+        if dmub_result(Err(error)) != Err(Error::Dmub(error)) {
+            return TestResult::Fail("device loss during DMUB start ignored");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_stage_order_matches_linux_firmware_path
+);
+
+/// HPD arming programs the HPD/AUX/DDC engines; a default firmware-only boot
+/// (neither `amdgpu.native_display` nor `amdgpu.display_probe`) must not.
+fn navi22_hotplug_is_opt_in_with_the_display() -> TestResult {
+    use crate::amdgpu_navi22_platform as platform;
+    let before = platform::display_engines_requested();
+    if before {
+        return TestResult::Fail("display engines armed without an opt-in flag");
+    }
+    platform::set_display_engines(true);
+    let armed = platform::display_engines_requested();
+    platform::set_display_engines(before);
+    if !armed || platform::display_engines_requested() {
+        return TestResult::Fail("display opt-in not honoured");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_hotplug_is_opt_in_with_the_display
+);
+
+/// A fused-off DMCUB drops the DMUB owner and continues; a readback failure
+/// or device loss still stops the boot at DmubQuiesce.
+fn navi22_dmub_quiesce_tolerates_fused_off_dmcub() -> TestResult {
+    use crate::amdgpu_dmub_navi22::Error as Dmub;
+    if dmub_quiesce_result(Ok(())) != Ok(true)
+        || dmub_quiesce_result(Err(Dmub::Unsupported)) != Ok(false)
+    {
+        return TestResult::Fail("fused-off DMCUB stopped the boot");
+    }
+    for error in [Dmub::Readback, Dmub::DeviceGone, Dmub::Revoked] {
+        if dmub_quiesce_result(Err(error)) != Err(Error::Dmub(error)) {
+            return TestResult::Fail("DMUB reset fault tolerated");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_dmub_quiesce_tolerates_fused_off_dmcub
+);
+
+/// Every display path that builds the VBIOS `Tables` routes them through
+/// the running DMUB (`with_dmub(DmubRoute::new(..))`), as `modeset_display`
+/// does; `retrain_display` and `stop_unplugged_display` built bare tables,
+/// so with DMUB alive the ATOM interpreter raced the DMCUB's own table
+/// execution (DCN3.0 `dmub_command_table` in command_table2.c).
+fn navi22_display_tables_always_go_through_dmub() -> TestResult {
+    let source = include_str!("amdgpu_navi22_boot.rs");
+    let mut sites = 0;
+    let mut rest = source;
+    while let Some(at) = rest.find("amdgpu_navi22_bios::Tables::new(") {
+        let tail = &rest[at..];
+        // The builder chain ends at the statement's `;`.
+        let chain = &tail[..tail.find(';').unwrap_or(tail.len())];
+        if !chain.contains(".with_dmub(") {
+            return TestResult::Fail("a display path builds VBIOS tables without the DMUB route");
+        }
+        sites += 1;
+        rest = &tail[1..];
+    }
+    if sites < 4 {
+        return TestResult::Fail("expected modeset/stop/retrain/unplug table sites");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_display_tables_always_go_through_dmub
 );

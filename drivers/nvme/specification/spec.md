@@ -36,9 +36,88 @@ multipath / fabrics (defer).
   physical I/O queues and exposes them via N rings; `block/` selects
   per-submission queue affinity.
 
+- Data pointers (`imp::prp`, mirroring Linux `nvme_pci_setup_data_prp`):
+  `setup_prps(addr, len, lists, list_dma) -> Result<PrpPair, PrpError>` builds
+  PRP1 / PRP2 / a chained PRP list for a physically contiguous buffer at any
+  dword-aligned offset; `prp_list_pages_needed`, `max_transfer_bytes(mdts,
+  mpsmin)` (MDTS in CAP.MPSMIN units, clamped to `NVME_HOST_MAX_TRANSFER` =
+  2 MiB), `host_page_supported(mpsmin)` and `decode_namespace_format(id_ns)`
+  (FLBAS index incl. bits 6:5, LBA size 512..=4096, metadata ⇒ unusable).
+- `Controller::max_transfer_bytes()`, `Controller::is_dead()`,
+  `Controller::nvm_io_at(opcode, lba, n_blocks, buf, offset)`;
+  `read_lba` / `write_lba` accept any contiguous buffer up to the max
+  transfer. `IdentifyController::mdts`, `NvmeCaps::to` +
+  `ready_timeout_ms()` (Linux `(CAP.TO + 1) * 500 ms`, 5 s floor).
+- New `NvmeError` variants: `UnsupportedPageSize` (CAP.MPSMIN > 4 KiB, bring-up
+  refused as Linux `nvme_enable_ctrl` does), `BadTransfer`,
+  `ExceedsMaxTransfer`, `ControllerDead` (an I/O command timed out; later I/O
+  refused), `NamespaceUnusable`.
+- `NvmeBlockSync` / `NvmeBlockDevice` split a request into commands of at
+  most `min(max_transfer, 128 KiB scratch)` / `max_transfer` bytes, in units of
+  the namespace's LBA size.
+
+- **Multiple controllers** (Linux `nvme_probe` per PCI function). `probe` runs
+  once per NVMe function and installs it as the next instance `nvme<C>` (probe
+  order = PCI enumeration order); each instance owns its BAR mapping, admin and
+  I/O queues, MSI-X vectors, PRP list and 128 KiB DMA scratch behind its own
+  request gate. Re-probing an installed function is a no-op.
+  `controller_count()`, `instance_of(PcieAddr)`, `with_controller_at(instance,
+  f)`, `admin_passthrough_at(instance, ..)`, `remove_controller(instance, cap)
+  -> Option<bool>` (refuse I/O, unregister its block devices and node, then
+  `disable_after_failure`: CC.EN=0 confirmed before DMA is freed, leaked
+  otherwise; re-probe brings it back under the same instance).
+  `with_controller` / `admin_passthrough` / `NvmeBlockSync` /
+  `NvmeBlockDevice` address instance 0.
+- **Namespace scan** (`imp::ns`, Linux `nvme_scan_work`): Active Namespace List
+  (CNS 2) from NVMe 1.1, else `1..=NN`, capped at 1024; Identify Namespace per
+  NSID, skipping NCAP=0 (inactive), NSZE=0 and unusable LBA formats; NGUID /
+  EUI64 from Identify Namespace, overridden by the Namespace Identification
+  Descriptor list (CNS 3, NVMe 1.3+). An error-status completion skips that
+  namespace; a timeout aborts bring-up with the page parked for
+  `disable_after_failure`. `Controller::namespaces()`,
+  `Controller::nvm_io_nsid_at(nsid, ..)`, `IdentifyController::{ver, nn}`.
+- **Block names and identity.** Namespace `k` (0-based, ascending NSID) of
+  controller `C` registers as `nvme<C>n<k+1>` through
+  `narf_block::register_block_device_with_identity` with a
+  `narf_block::DiskIdentity` (`transport "nvme"`, controller PCI address,
+  model/serial/firmware, vendor id, NSID, EUI64/NGUID/UUID), and is
+  partition-scanned (`nvme<C>n<k+1>p<P>`). Every entry is behind the registry's
+  `narf.disks` guard. `NvmeNamespaceBlock::new(instance, nsid)` is the
+  registry device. **Names are not identity**: they shift when a controller is
+  added, removed or fails to probe; consumers identify disks by filesystem
+  UUID / PARTUUID or `DiskIdentity`.
+- **Flush / FUA / shutdown** (`imp::shutdown`). `IdentifyController::{vwc,
+  rtd3e}`; `Controller::has_volatile_write_cache()`, `flush_nsid(nsid)` (I/O
+  opcode 0x00 when VWC bit 0 is set, else a no-op success; 30 s budget, a
+  timeout marks the controller dead), FUA = Write CDW12 bit 30 (native;
+  `capabilities().fua = true`), `Controller::shutdown()` (flush every
+  namespace, then CC.SHN = normal and wait for CSTS.SHST = complete within
+  `clamp(RTD3E, 5 s, 60 s)`, Linux `nvme_disable_ctrl(shutdown)`; I/O refused
+  afterwards). `shutdown_all_controllers()` is registered as the
+  `narf_power::system` shutdown hook `"nvme"`, run on every reboot /
+  power-off after the filesystem sync and the persistent-log flush. It
+  refuses new requests, waits up to `SHUTDOWN_DRAIN_TIMEOUT_MS` (30 s, Linux
+  `NVME_IO_TIMEOUT`) per controller for the in-flight command to release the
+  request gate, then flushes + sends CC.SHN; a controller that never drains
+  still gets CC.SHN written straight to the register (`SlotShutdown::Forced`,
+  logged as an error). Never waits from interrupt context.
+- **System suspend is refused** (`DevicePmOps::suspend` →
+  `DeviceSuspendError::NotImplemented`, so the orchestrator aborts) until a
+  flush + CC.SHN suspend and a full queue re-init on resume exist.
+- `/dev/nvme<C>`: one controller node per instance
+  (`narf_filesystem::devfs::register_nvme_controller(instance, node,
+  namespaces)`); `NVME_IOCTL_IO_CMD` / `NVME_IOCTL_IO64_CMD` are refused
+  (EOPNOTSUPP: no I/O-queue passthrough yet); its admin passthrough and `write`
+  are allowed only under `narf.disks=all` or when every namespace of that
+  controller is the identified boot medium. Device PM registers `nvme<C>`
+  per instance (`DevicePmOps`).
+
 ## 4. Invariants & safety properties
 
 - PRP / SGL lists validated against the DMA buffer's bounds.
+- No DMA buffer a command may still reference is freed: I/O uses persistent
+  scratch and PRP-list pages, a timed-out I/O marks the controller dead, and a
+  timed-out admin passthrough leaks its pages.
 - A completion cannot be processed before its submission entry is valid
   (paired ordering).
 - The admin queue is never used on the I/O fast path.

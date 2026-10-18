@@ -3,7 +3,7 @@ use super::*;
 fn ready() -> (Pool, Engine<Fake>) {
     let (pool, mut engine) = fixture();
     run(engine.quiesce()).unwrap();
-    run(engine.start(tmr())).unwrap();
+    run(engine.start(tmr(), fb())).unwrap();
     run(engine.initialize_mailbox()).unwrap();
     (pool, engine)
 }
@@ -64,15 +64,16 @@ fn dmub_navi22_mailbox_handshake_rejects_stale_firmware() -> TestResult {
     for case in 0..4 {
         let (_pool, mut engine) = fixture();
         run(engine.quiesce()).unwrap();
-        run(engine.start(tmr())).unwrap();
+        run(engine.start(tmr(), fb())).unwrap();
         let expected = match case {
             0 => {
                 engine.io.caps = false;
                 Ok(())
             }
             1 => {
+                // dm_dmub_hw_init never compares the reply with the header.
                 engine.io.version ^= 1;
-                Err(Error::Protocol)
+                Ok(())
             }
             2 => {
                 engine.io.gpint = false;
@@ -89,6 +90,12 @@ fn dmub_navi22_mailbox_handshake_rejects_stale_firmware() -> TestResult {
         if case == 0 {
             if engine.status.unwrap().capabilities.is_some() || run(engine.hpd(0)) != Ok(true) {
                 return TestResult::Fail("unsupported capability query invented features");
+            }
+        } else if case == 1 {
+            if engine.mailbox.state == MailboxState::Failed
+                || engine.status.unwrap().capabilities.is_none()
+            {
+                return TestResult::Fail("version reply mismatch failed the handshake");
             }
         } else if engine.mailbox.state != MailboxState::Failed
             || run(engine.hpd(0)) != Err(Error::Busy)
@@ -283,7 +290,7 @@ kernel_test_in!(
 fn dmub_navi22_mailbox_cancellation_timeout_and_revocation_quarantine() -> TestResult {
     let (pool, mut engine) = fixture();
     run(engine.quiesce()).unwrap();
-    run(engine.start(tmr())).unwrap();
+    run(engine.start(tmr(), fb())).unwrap();
     engine.io.gpint = false;
     {
         let mut future = core::pin::pin!(engine.initialize_mailbox());
