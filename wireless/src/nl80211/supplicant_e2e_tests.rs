@@ -371,6 +371,26 @@ fn smoke_nl80211_wpa_supplicant_wpa2_psk_end_to_end() -> TestResult {
     {
         return TestResult::Fail("GET_WIPHY selector errnos");
     }
+    // NetworkManager's split dump narrows to the netdev's wiphy.
+    let Ok(dump) = send(NL80211_CMD_GET_WIPHY, DUMP, &attrs, nobody) else {
+        return TestResult::Fail("GET_WIPHY split dump failed");
+    };
+    let wiphys: Vec<&Vec<u8>> = dump
+        .iter()
+        .filter(|r| r[16] == NL80211_CMD_NEW_WIPHY)
+        .collect();
+    if wiphys.len() != 1 || find_attr(&wiphys[0][20..], NL80211_ATTR_WIPHY) != find_attr(wiphy, 1) {
+        return TestResult::Fail("GET_WIPHY dump not filtered to the ifindex's wiphy");
+    }
+    if send(
+        NL80211_CMD_GET_WIPHY,
+        DUMP,
+        &ifindex_attr(0x7fff_0000),
+        nobody,
+    ) != Err(ENODEV)
+    {
+        return TestResult::Fail("GET_WIPHY dump of a missing netdev was not ENODEV");
+    }
 
     // nl80211_set_mode(STATION): the current type is a no-op success.
     let set_type = |iftype: u32, context| {

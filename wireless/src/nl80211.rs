@@ -318,12 +318,42 @@ fn wiphy_from_attrs(
     Ok(wiphy)
 }
 
+/// `nl80211_dump_wiphy_parse`: a GET_WIPHY dump (NetworkManager's split
+/// dump) is narrowed by NL80211_ATTR_WIPHY, NL80211_ATTR_WDEV (its upper 32
+/// bits) or the wiphy of the netdev NL80211_ATTR_IFINDEX names; an ifindex
+/// with no netdev in the namespace is -ENODEV, a non-wireless one filters
+/// nothing. Malformed attributes are ignored, as Linux does.
+fn dump_wiphy_filter(
+    interfaces: &[alloc::sync::Arc<dyn crate::WirelessNetIface>],
+    attrs: &[u8],
+    namespace: u64,
+) -> Result<Option<usize>, i32> {
+    let mut filter = find_attr(attrs, NL80211_ATTR_WIPHY)
+        .and_then(|raw| u32_of(raw).ok())
+        .map(|index| index as usize);
+    if let Some(wdev) = find_attr(attrs, NL80211_ATTR_WDEV)
+        .and_then(|raw| <[u8; 8]>::try_from(raw).ok())
+        .map(u64::from_ne_bytes)
+    {
+        filter = Some((wdev >> 32) as usize);
+    }
+    if let Some(ifindex) = find_attr(attrs, NL80211_ATTR_IFINDEX).and_then(|raw| u32_of(raw).ok()) {
+        let name = narf_net::netlink_route::iface_name_for_index(ifindex)
+            .filter(|name| narf_net::iface::lookup_in(namespace, name).is_some())
+            .ok_or(ENODEV)?;
+        if let Some(index) = interfaces.iter().position(|iface| iface.name() == name) {
+            filter = Some(index);
+        }
+    }
+    Ok(filter)
+}
+
 fn handle_in(command: u8, attrs: &[u8], dump: bool, namespace: u64) -> Result<Vec<GenlReply>, i32> {
     let interfaces = crate::registry::list();
     let replies: Vec<GenlReply> = match command {
         NL80211_CMD_GET_WIPHY => {
             let wanted = if dump {
-                None
+                dump_wiphy_filter(&interfaces, attrs, namespace)?
             } else {
                 Some(wiphy_from_attrs(&interfaces, attrs, namespace)?)
             };
