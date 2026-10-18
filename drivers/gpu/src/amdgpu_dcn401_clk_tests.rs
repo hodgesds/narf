@@ -127,6 +127,7 @@ fn power() -> smu::PowerStatus {
         enabled: 0xba,
         gfx_min_mhz: 500,
         gfx_max_mhz: 3100,
+        uclk_mhz: None,
     }
 }
 fn run<T>(f: impl Future<Output = T>) -> T {

@@ -305,7 +305,17 @@ enabled. Voltage scaling, deep sleep, link DPM, DF C-states and GFXOFF stay
 excluded. It requires retired display consumers and idle engines. Success
 publishes the new `PowerStatus`; partial failure/cancellation retains the
 owner and prevents replay. Only the retained DCN4 clock owner initiates this
-transition, after checking every display consumer.
+transition, after checking every display consumer. With UCLK DPM running it
+also reads the UCLK range (GetMin/MaxDpmFreq of PPCLK_UCLK, `2 << 16`) into
+`PowerStatus::uclk_mhz`, which `configure_power` leaves `None`.
+
+Each successful `Smu::configure_power` / `enable_display_power` publishes
+DEV_INFO's clocks (`amdgpu_info::publish_navi48_clocks`, from
+`smu::dev_info_clocks`, kHz): min/max engine clock from the GFXCLK DPM range;
+min/max memory clock from `uclk_mhz`, or, while UCLK DPM is off, both from
+the VBIOS boot UCLK (`amdgpu_info::boot_mclk_10khz`, firmware_info v3 byte
+12, as smu_v14_0_get_vbios_bootup_values; 0 without one). Other parts report
+zero clocks.
 
 `read_board` also decodes optional board `Limits` from the combo, following
 Linux `smu_v14_0_2_get_thermal_temperature_range`: CustomSkuTable

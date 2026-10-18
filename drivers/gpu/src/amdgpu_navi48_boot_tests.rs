@@ -55,6 +55,7 @@ fn report() -> Report {
             enabled: 1,
             gfx_min_mhz: 500,
             gfx_max_mhz: 3100,
+            uclk_mhz: None,
         },
         dmub: dmub::Status {
             firmware_version: 0x0a000c00,

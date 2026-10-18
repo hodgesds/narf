@@ -103,6 +103,9 @@ impl Io for Fake {
             }
             0xc => self.reported.unwrap_or(self.enabled) as u32,
             0xd => (self.reported.unwrap_or(self.enabled) >> 32) as u32,
+            // PPCLK_GFXCLK, or PPCLK_UCLK in the high half.
+            0x1d if p >> 16 == 2 => 96,
+            0x1e if p >> 16 == 2 => 1258,
             0x1d => 500,
             0x1e => 3100,
             0x36 | 6 | 0x19 | 0x1a => 0,
@@ -471,6 +474,7 @@ fn display_engine() -> (Pool, Engine<Fake>) {
         enabled: ALLOWED,
         gfx_min_mhz: 500,
         gfx_max_mhz: 3100,
+        uclk_mhz: None,
     });
     (pool, e)
 }
@@ -486,6 +490,8 @@ fn smu14_display_policy_enables_only_required_clocks_and_preserves_protection() 
         0
     );
     assert_eq!((power.gfx_min_mhz, power.gfx_max_mhz), (500, 3100));
+    // UCLK DPM now runs, so its range replaces the boot clock.
+    assert_eq!(power.uclk_mhz, Some((96, 1258)));
     assert_eq!(
         e.io.commands,
         [
@@ -493,13 +499,15 @@ fn smu14_display_policy_enables_only_required_clocks_and_preserves_protection() 
             (4, power.allowed as u32),
             (6, 0),
             (12, 0),
-            (13, 0)
+            (13, 0),
+            (0x1d, 2 << 16),
+            (0x1e, 2 << 16),
         ]
     );
     assert_eq!(e.state, State::DisplayPowerReady);
     assert_eq!(e.power, Some(power));
     assert_eq!(run(e.enable_display_power()), Ok(power));
-    assert_eq!(e.io.commands.len(), 5);
+    assert_eq!(e.io.commands.len(), 7);
     e.authority.revoke();
     assert_eq!(run(e.enable_display_power()), Err(Error::Revoked));
     TestResult::Pass
@@ -507,6 +515,32 @@ fn smu14_display_policy_enables_only_required_clocks_and_preserves_protection() 
 kernel_test_in!(
     "drivers/gpu/smu-navi48",
     smu14_display_policy_enables_only_required_clocks_and_preserves_protection
+);
+
+/// DEV_INFO clocks follow amdgpu_dpm_get_sclk/mclk: the GFXCLK DPM range,
+/// and the UCLK one once it runs, the boot UCLK before.
+fn smu14_dev_info_clocks_follow_dpm_state() -> TestResult {
+    let mut power = PowerStatus {
+        allowed: ALLOWED,
+        enabled: ALLOWED,
+        gfx_min_mhz: 500,
+        gfx_max_mhz: 3100,
+        uclk_mhz: None,
+    };
+    if dev_info_clocks(&power, Some(1258)) != [500_000, 3_100_000, 1_258_000, 1_258_000]
+        || dev_info_clocks(&power, None) != [500_000, 3_100_000, 0, 0]
+    {
+        return TestResult::Fail("boot UCLK while UCLK DPM is off");
+    }
+    power.uclk_mhz = Some((96, 1258));
+    if dev_info_clocks(&power, Some(1000)) != [500_000, 3_100_000, 96_000, 1_258_000] {
+        return TestResult::Fail("UCLK DPM range");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi48",
+    smu14_dev_info_clocks_follow_dpm_state
 );
 
 fn smu14_display_power_rejects_missing_or_unprotected_features() -> TestResult {

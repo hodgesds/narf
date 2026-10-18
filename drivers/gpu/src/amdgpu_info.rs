@@ -38,10 +38,12 @@
 //! discrete GC 12 parts, as amdgpu_gmc_get_vram_info reads them; other parts
 //! report 0.
 //!
-//! LINUX-GAP: clocks (`max/min_engine_clock`, `max/min_memory_clock`)
-//! need an SMU metrics read. That exists elsewhere in the tree
-//! (`amdgpu_smu`) but is not plumbed to this ioctl yet; they are zero, not
-//! invented.
+//! On Navi48 the clocks (`max/min_engine_clock`, `max/min_memory_clock`)
+//! are what its SMU owner publishes: the GFXCLK DPM range, and the UCLK DPM
+//! range or, before display power enables UCLK DPM, the VBIOS boot UCLK.
+//!
+//! LINUX-GAP: other parts report zero clocks; their SMU owners do not
+//! publish to this ioctl.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -185,6 +187,20 @@ pub fn reference_clock_10khz(vbios: &[u8], navi: bool) -> Option<u32> {
         }
     }
     clock
+}
+
+/// firmware_info v3's `bootup_mclk_in10khz` (byte 12), which
+/// smu_v14_0_get_vbios_bootup_values reads for every v3 content revision.
+pub fn boot_mclk_10khz(vbios: &[u8]) -> Option<u32> {
+    use crate::atombios::{header::parse_rom_header, tables::MasterDataTable};
+    let header = parse_rom_header(vbios).ok()?;
+    let tables = MasterDataTable::parse(vbios, &header).ok()?;
+    let info = tables.table_slice(4)?;
+    if *info.get(2)? != 3 {
+        return None;
+    }
+    info.get(12..16)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
 }
 
 /// amdgpu_atomfirmware_get_umc_info, which amdgpu_gmc_get_vram_info uses on
@@ -365,6 +381,13 @@ static NAVI48_CLOCK: narf_lib::sync::IrqSafeSpinLock<Option<crate::amdgpu_smuio1
 pub(crate) fn publish_navi48_clock(clock: crate::amdgpu_smuio14::ClockReader) {
     *NAVI48_CLOCK.lock() = Some(clock);
 }
+/// DEV_INFO's `[min_engine, max_engine, min_memory, max_memory]` clocks in
+/// kHz, published by the Navi48 SMU owner whenever its DPM state changes.
+static NAVI48_CLOCKS: narf_lib::sync::IrqSafeSpinLock<Option<[u32; 4]>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+pub(crate) fn publish_navi48_clocks(clocks: [u32; 4]) {
+    *NAVI48_CLOCKS.lock() = Some(clocks);
+}
 /// `AMDGPU_INFO_TIMESTAMP` → amdgpu_gfx_get_gpu_clock_counter as a u64.
 /// Without a reader (or once the device is gone) EINVAL, as amdgpu's
 /// default arm.
@@ -380,14 +403,19 @@ fn timestamp(
 }
 fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
     let topology = *NAVI48_TOPOLOGY.lock();
-    dev_info_topology(snap, topology)
+    let clocks = *NAVI48_CLOCKS.lock();
+    dev_info_topology(snap, topology, clocks)
 }
 fn dev_info_topology(
     snap: &Snapshot,
     topology: Option<crate::amdgpu_gfx12_topology::Topology>,
+    clocks: Option<[u32; 4]>,
 ) -> Result<Vec<u8>, FsError> {
-    let topology = topology
-        .filter(|_| snap.family == Family::Navi4 && snap.did == u32::from(crate::amdgpu::NAVI48));
+    let navi48 = snap.family == Family::Navi4 && snap.did == u32::from(crate::amdgpu::NAVI48);
+    let topology = topology.filter(|_| navi48);
+    // amdgpu_info_ioctl's dpm_enabled arm; 0 until the SMU owner publishes.
+    let [min_engine, max_engine, min_memory, max_memory] =
+        clocks.filter(|_| navi48).unwrap_or([0; 4]);
     let family = family_id(snap).ok_or(FsError::InvalidData)?;
     // The shader geometry is not guessable. Refusing is better than reporting
     // a topology that would mis-compile shaders.
@@ -417,6 +445,10 @@ fn dev_info_topology(
         num_hw_gfx_contexts: GFX_HW_CONTEXTS,
         // amdgpu_asic_get_xclk (10 kHz) * 10: kHz, Mesa's clock_crystal_freq.
         gpu_counter_freq: snap.reference_clock_10khz.saturating_mul(10),
+        max_engine_clock: max_engine.into(),
+        min_engine_clock: min_engine.into(),
+        max_memory_clock: max_memory.into(),
+        min_memory_clock: min_memory.into(),
         vram_type: snap.vram_type,
         vram_bit_width: snap.vram_bit_width,
         // FUSION means the GPU shares the CPU's memory — an APU. It used to
@@ -711,7 +743,7 @@ mod topology_tests {
             ..Default::default()
         });
         let snap = Snapshot::from_gpu(&gpu);
-        let unknown = decode(&dev_info_topology(&snap, None).unwrap());
+        let unknown = decode(&dev_info_topology(&snap, None, None).unwrap());
         let topology = crate::amdgpu_gfx12_topology::Topology {
             active_cus: 56,
             active_arrays: 0x7f,
@@ -724,7 +756,14 @@ mod topology_tests {
             enabled_rb_mask: 0x3fff,
             gb_addr_config: 0x2644_2043,
         };
-        let known = decode(&dev_info_topology(&snap, Some(topology)).unwrap());
+        let known = decode(
+            &dev_info_topology(
+                &snap,
+                Some(topology),
+                Some([500_000, 3_100_000, 1_258_000, 1_258_000]),
+            )
+            .unwrap(),
+        );
         if unknown.cu_active_number != 0
             || unknown.cu_bitmap != [[0; 4]; 4]
             || unknown.enabled_rb_pipes_mask != 0
@@ -732,14 +771,20 @@ mod topology_tests {
             || known.cu_bitmap != topology.cu_bitmap
             || known.enabled_rb_pipes_mask != 0x3fff
             || known.num_rb_pipes != 16
+            || unknown.max_engine_clock != 0
+            || (known.min_engine_clock, known.max_engine_clock) != (500_000, 3_100_000)
+            || (known.min_memory_clock, known.max_memory_clock) != (1_258_000, 1_258_000)
             || query_against(&snap, uapi::AMDGPU_INFO_ACCEL_WORKING, [0; 4]).unwrap() != [0; 4]
         {
             return TestResult::Fail("DEV_INFO lost harvesting or advertised acceleration");
         }
         let mut apu = snap;
         apu.family = Family::Phoenix;
-        let apu_info = decode(&dev_info_topology(&apu, Some(topology)).unwrap());
-        if apu_info.cu_active_number != 64 || apu_info.enabled_rb_pipes_mask != 0 {
+        let apu_info = decode(&dev_info_topology(&apu, Some(topology), Some([1; 4])).unwrap());
+        if apu_info.cu_active_number != 64
+            || apu_info.enabled_rb_pipes_mask != 0
+            || apu_info.max_engine_clock != 0
+        {
             return TestResult::Fail("discrete topology leaked into an APU query");
         }
         TestResult::Pass
@@ -881,4 +926,31 @@ mod topology_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/gfx12", info_umc_vram_follows_atomfirmware);
+
+    /// firmware_info v3's boot mclk, whatever its content revision.
+    fn info_boot_mclk_follows_atomfirmware() -> TestResult {
+        let image = |revision: [u8; 2]| {
+            let mut b = alloc::vec![0u8; 1024];
+            b[..2].copy_from_slice(&[0x55, 0xaa]);
+            b[0x48..0x4a].copy_from_slice(&0x80u16.to_le_bytes());
+            b[0x80..0x88].copy_from_slice(&[40, 0, 2, 1, b'A', b'T', b'O', b'M']);
+            b[0xa0..0xa2].copy_from_slice(&0xc0u16.to_le_bytes());
+            b[0xc0..0xc4].copy_from_slice(&[36, 0, 2, 1]);
+            // firmwareinfo is master data table 4.
+            b[0xcc..0xce].copy_from_slice(&0x200u16.to_le_bytes());
+            b[0x200..0x204].copy_from_slice(&[64, 0, revision[0], revision[1]]);
+            b[0x208..0x20c].copy_from_slice(&250_000u32.to_le_bytes());
+            b[0x20c..0x210].copy_from_slice(&125_800u32.to_le_bytes());
+            b
+        };
+        if boot_mclk_10khz(&image([3, 4])) != Some(125_800)
+            || boot_mclk_10khz(&image([3, 5])) != Some(125_800)
+            || boot_mclk_10khz(&image([2, 1])).is_some()
+            || boot_mclk_10khz(&[0; 64]).is_some()
+        {
+            return TestResult::Fail("firmware_info boot mclk");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/gfx12", info_boot_mclk_follows_atomfirmware);
 }

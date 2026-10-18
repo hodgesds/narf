@@ -53,6 +53,8 @@ const PROTECTION: u64 =
 const DEEP_SLEEP_GRAPHICS: u64 = (1 << 10) | (1 << 16);
 const DEEP_SLEEP_MEMORY_FABRIC: u64 = (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15);
 const PPCLK_GFXCLK: u32 = 0;
+const PPCLK_UCLK: u32 = 2;
+const FEATURE_DPM_UCLK: u64 = 1 << 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Unsupported,
@@ -113,6 +115,9 @@ pub struct PowerStatus {
     pub enabled: u64,
     pub gfx_min_mhz: u16,
     pub gfx_max_mhz: u16,
+    /// The UCLK DPM range, read once display power enables UCLK DPM; until
+    /// then memory runs at its boot clock.
+    pub uclk_mhz: Option<(u16, u16)>,
 }
 fn u16_at(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
@@ -427,6 +432,7 @@ impl<I: Io> Engine<I> {
                 enabled,
                 gfx_min_mhz: min as u16,
                 gfx_max_mhz: max as u16,
+                uclk_mhz: None,
             })
         }
         .await;
@@ -465,9 +471,22 @@ impl<I: Io> Engine<I> {
             if enabled & (REQUIRED | DISPLAY) != REQUIRED | DISPLAY || enabled & !allowed != 0 {
                 return Err(Error::Features(enabled));
             }
+            // smu_v14_0_get_dpm_ultimate_freq: GetMin/MaxDpmFreq of PPCLK_UCLK
+            // now that its DPM runs.
+            let uclk = if enabled & FEATURE_DPM_UCLK != 0 {
+                let min = self.command(0x1d, PPCLK_UCLK << 16).await?;
+                let max = self.command(0x1e, PPCLK_UCLK << 16).await?;
+                if min == 0 || min > max || max > u32::from(u16::MAX) {
+                    return Err(Error::Invalid);
+                }
+                Some((min as u16, max as u16))
+            } else {
+                None
+            };
             Ok(PowerStatus {
                 allowed,
                 enabled,
+                uclk_mhz: uclk,
                 ..previous
             })
         }
@@ -606,6 +625,25 @@ impl<I: Io> Engine<I> {
 #[derive(Debug)]
 pub struct Smu {
     engine: Engine<Mmio>,
+    /// The VBIOS boot UCLK (firmware_info), in MHz.
+    boot_uclk_mhz: Option<u32>,
+}
+
+/// `AMDGPU_INFO_DEV_INFO`'s clocks under DPM (amdgpu_dpm_get_sclk/mclk,
+/// in kHz): the GFXCLK DPM range, and the UCLK DPM range or, while UCLK
+/// DPM is off, the boot UCLK for both ends (0 when the VBIOS gives none).
+pub(crate) fn dev_info_clocks(power: &PowerStatus, boot_uclk_mhz: Option<u32>) -> [u32; 4] {
+    let (memory_min, memory_max) = power
+        .uclk_mhz
+        .map(|(min, max)| (u32::from(min), u32::from(max)))
+        .or(boot_uclk_mhz.map(|m| (m, m)))
+        .unwrap_or((0, 0));
+    [
+        u32::from(power.gfx_min_mhz) * 1000,
+        u32::from(power.gfx_max_mhz) * 1000,
+        memory_min.saturating_mul(1000),
+        memory_max.saturating_mul(1000),
+    ]
 }
 impl Smu {
     /// # Safety
@@ -614,7 +652,13 @@ impl Smu {
     /// stream. Keep deep sleep, voltage scaling, link DPM and GFXOFF disabled.
     /// Failure/cancellation retains this owner and forbids replay.
     pub(crate) async unsafe fn enable_display_power(&mut self) -> Result<PowerStatus, Error> {
-        self.engine.enable_display_power().await
+        let power = self.engine.enable_display_power().await?;
+        self.publish(&power);
+        Ok(power)
+    }
+    /// Tell `AMDGPU_INFO` the clocks `power` runs at.
+    fn publish(&self, power: &PowerStatus) {
+        crate::amdgpu_info::publish_navi48_clocks(dev_info_clocks(power, self.boot_uclk_mhz));
     }
     /// # Safety
     /// Caller owns this physical Navi48's MP1/index/HDP/reset/PM controls and
@@ -672,6 +716,12 @@ impl Smu {
                 protection: 0,
                 gfx_level: GfxLevel::Auto,
             },
+            // smu_v14_0_get_vbios_bootup_values: 10 kHz, used in MHz.
+            boot_uclk_mhz: gpu
+                .vbios
+                .as_ref()
+                .and_then(|v| crate::amdgpu_info::boot_mclk_10khz(v.bytes()))
+                .map(|clock| clock / 100),
         })
     }
     pub fn state(&self) -> State {
@@ -693,7 +743,9 @@ impl Smu {
         self.engine.upload_board().await
     }
     pub async fn configure_power(&mut self) -> Result<PowerStatus, Error> {
-        self.engine.configure_power().await
+        let power = self.engine.configure_power().await?;
+        self.publish(&power);
+        Ok(power)
     }
     /// Board thermal/fan/power limits, when the firmware table provides them.
     pub fn limits(&self) -> Option<Limits> {
