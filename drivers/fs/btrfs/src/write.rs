@@ -4966,13 +4966,43 @@ pub(crate) async fn quota_status<B: BlockDevice + 'static>(
 pub(crate) type BoxFut<'a, T> =
     core::pin::Pin<Box<dyn core::future::Future<Output = Result<T, FsError>> + Send + 'a>>;
 
+/// Where the running commit is (`COMMIT_PHASE`) and which fixed-point round
+/// it reached (`COMMIT_ROUND`), for the log line a failed commit prints.
+static COMMIT_PHASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static COMMIT_ROUND: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn commit_phase(phase: u32) {
+    COMMIT_PHASE.store(phase, core::sync::atomic::Ordering::Relaxed);
+}
+
 fn commit_txn<'a, B: BlockDevice + 'static>(
     vol: &'a BtrfsVolume<B>,
     gen: u64,
     alloc: Allocator,
     txn: Txn,
 ) -> BoxFut<'a, ()> {
-    Box::pin(commit_txn_inner(vol, gen, alloc, txn))
+    Box::pin(async move {
+        commit_phase(1);
+        let result = commit_txn_inner(vol, gen, alloc, txn).await;
+        if let Err(error) = &result {
+            use core::fmt::Write as _;
+            let phase = match COMMIT_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
+                1 => "resolving references",
+                2 => "fixed point: csum tree",
+                3 => "fixed point: root/free-space blocks",
+                4 => "fixed point: extent/block-group trees",
+                5 => "fixed point did not converge",
+                6 => "writing",
+                _ => "?",
+            };
+            let _ = writeln!(
+                narf_console::Writer,
+                "btrfs: commit of generation {gen} failed ({error:?}) at {phase}, round {}",
+                COMMIT_ROUND.load(core::sync::atomic::Ordering::Relaxed)
+            );
+        }
+        result
+    })
 }
 
 async fn commit_txn_inner<B: BlockDevice + 'static>(
@@ -5240,7 +5270,9 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     // bounded and monotonic on supported trees, but the 12-round historical cap
     // cut off a real 14-round convergence during the NVMe late-init smoke.
     const MAX_FIXED_POINT_ROUNDS: usize = 64;
-    for _ in 0..MAX_FIXED_POINT_ROUNDS {
+    for round in 0..MAX_FIXED_POINT_ROUNDS {
+        COMMIT_ROUND.store(round as u32, core::sync::atomic::Ordering::Relaxed);
+        commit_phase(2);
         alloc.restore(&base);
         // Path-COW the csum tree BEFORE the allocations below: its new blocks
         // are metadata this round must account for, exactly as the extent
@@ -5254,6 +5286,7 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
             ),
             None => None,
         };
+        commit_phase(3);
         let root_addrs = alloc_nodes(&mut alloc, vol, root_nc)?;
         let fst_addrs = alloc_nodes(
             &mut alloc,
@@ -5352,6 +5385,7 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
             .map_or((0, 0), |g| tree_root_addr(&fst_addrs, g.len(), ns));
 
         // Path-COW the extent tree with this round's records.
+        commit_phase(4);
         let ext_edits = build_ext_edits(
             &new_meta,
             &freed_meta,
@@ -5465,7 +5499,11 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
         ext_root,
         ext_level,
         bgt,
-    } = done.ok_or(FsError::NoSpace)?;
+    } = done.ok_or_else(|| {
+        commit_phase(5);
+        FsError::NoSpace
+    })?;
+    commit_phase(6);
 
     // ── Root tree: repoint each COWed tree's ROOT_ITEM, then pack it. ───
     // A tree whose root did not move (a csum-tree COW with nothing to edit,
