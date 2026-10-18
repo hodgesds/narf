@@ -35,6 +35,8 @@ pub const NVME_IOCTL_ADMIN_CMD: u32 = 0xC048_4E41;
 pub const NVME_IOCTL_IO_CMD: u32 = 0xC048_4E43;
 /// `_IOWR('N', 0x47, struct nvme_passthru_cmd64)` (80-byte struct, u64 result).
 pub const NVME_IOCTL_ADMIN64_CMD: u32 = 0xC050_4E47;
+/// `_IOWR('N', 0x48, struct nvme_passthru_cmd64)` — 64-bit I/O passthrough.
+pub const NVME_IOCTL_IO64_CMD: u32 = 0xC050_4E48;
 
 /// `sizeof(struct nvme_passthru_cmd)`.
 const PASSTHRU_CMD_LEN: usize = 72;
@@ -254,7 +256,16 @@ impl FileOps for NvmeCharDev {
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
             match cmd {
-                NVME_IOCTL_ADMIN_CMD | NVME_IOCTL_IO_CMD => do_passthru(
+                // I/O passthrough is refused (EOPNOTSUPP): an I/O command
+                // (Read 0x02, Write 0x01, ...) must go to an I/O queue, and
+                // its opcode space overlaps the admin one (0x01 is Create I/O
+                // SQ on the admin queue, 0x02 Get Log Page). Sending it down
+                // the admin passthrough, as this used to, ran a different
+                // command than the one asked for. Linux routes it through
+                // `nvme_dev_user_cmd` to the namespace's I/O queue; until
+                // NARF has that path, the request is not executed at all.
+                NVME_IOCTL_IO_CMD | NVME_IOCTL_IO64_CMD => Err(FsError::Unsupported),
+                NVME_IOCTL_ADMIN_CMD => do_passthru(
                     self.instance,
                     context,
                     arg,

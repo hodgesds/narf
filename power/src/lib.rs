@@ -36,8 +36,10 @@ extern crate alloc;
 pub mod ac;
 pub mod acpi_thermal;
 pub mod battery;
+pub mod button;
 pub mod device_pm;
 pub mod laptop_state;
+pub mod orderly;
 pub mod psci;
 pub mod suspend;
 pub mod syscall;
@@ -281,6 +283,14 @@ pub fn register_initcalls() {
         } else {
             InitResult::Ok
         }
+    });
+    // ACPI power button as an input device ("Power Button", EV_KEY
+    // KEY_POWER) for logind, plus the task-context worker that serves an
+    // orderly power-off when nothing listens (or a thermal trip asks for one).
+    narf_init::register(Stage::Late, "power-button-orderly-poweroff", || {
+        button::register_input_device();
+        orderly::start_worker();
+        InitResult::Ok
     });
     narf_init::register(Stage::Late, "acpi-ac-enum", || {
         let n = ac::enumerate().len();

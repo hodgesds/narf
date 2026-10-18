@@ -95,10 +95,19 @@ multipath / fabrics (defer).
   `clamp(RTD3E, 5 s, 60 s)`, Linux `nvme_disable_ctrl(shutdown)`; I/O refused
   afterwards). `shutdown_all_controllers()` is registered as the
   `narf_power::system` shutdown hook `"nvme"`, run on every reboot /
-  power-off after the persistent-log flush.
+  power-off after the filesystem sync and the persistent-log flush. It
+  refuses new requests, waits up to `SHUTDOWN_DRAIN_TIMEOUT_MS` (30 s, Linux
+  `NVME_IO_TIMEOUT`) per controller for the in-flight command to release the
+  request gate, then flushes + sends CC.SHN; a controller that never drains
+  still gets CC.SHN written straight to the register (`SlotShutdown::Forced`,
+  logged as an error). Never waits from interrupt context.
+- **System suspend is refused** (`DevicePmOps::suspend` →
+  `DeviceSuspendError::NotImplemented`, so the orchestrator aborts) until a
+  flush + CC.SHN suspend and a full queue re-init on resume exist.
 - `/dev/nvme<C>`: one controller node per instance
   (`narf_filesystem::devfs::register_nvme_controller(instance, node,
-  namespaces)`); its passthrough (anything but `NVME_IOCTL_ID`) and `write`
+  namespaces)`); `NVME_IOCTL_IO_CMD` / `NVME_IOCTL_IO64_CMD` are refused
+  (EOPNOTSUPP: no I/O-queue passthrough yet); its admin passthrough and `write`
   are allowed only under `narf.disks=all` or when every namespace of that
   controller is the identified boot medium. Device PM registers `nvme<C>`
   per instance (`DevicePmOps`).

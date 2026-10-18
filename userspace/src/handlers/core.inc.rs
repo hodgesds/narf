@@ -13523,6 +13523,9 @@ pub fn wait_init() {
     if !SYSRQ_PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
         narf_scheduler::sleep_pumps::register(sysrq_pump);
     }
+    // Every reboot / power-off / halt syncs every mounted filesystem before
+    // the device shutdown hooks (NVMe Flush + CC.SHN) run. Idempotent.
+    narf_power::system::install_pre_shutdown_sync(pre_shutdown_sync);
     *PARENT_OF.lock() = Some(BTreeMap::new());
     parent_child_counts_init();
     crate::ptrace::ptrace_init();

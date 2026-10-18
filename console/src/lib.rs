@@ -483,6 +483,12 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
         narf_arch::halt_forever();
     }
 
+    // Stop every other CPU before anything else (Linux `panic()` →
+    // `smp_send_stop()`): from here on no other CPU runs a task, so none
+    // keeps issuing filesystem or disk I/O against state this panic has
+    // declared inconsistent. Lock-free; bounded by its own wait.
+    run_panic_stop_hook();
+
     // Status-panel diag: latch the panic location into the shared
     // diag state so the FB status panel turns red and shows a
     // compact marker (file/line hashed into a u64). First-only
@@ -660,6 +666,38 @@ pub type PersistHook = fn(Option<&[u8]>);
 
 /// Stored as `PersistHook as usize`, like [`FB_HOOK`].
 static PERSIST_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Panic-time "stop the other CPUs" callback (`smp_send_stop`), installed by
+/// the interrupt layer that can send the NMIs. Returns the (targeted,
+/// stopped) CPU bitmasks. Must be lock-free and bounded.
+pub type PanicStopHook = fn() -> (u64, u64);
+
+/// Stored as `PanicStopHook as usize`; 0 = none.
+static PANIC_STOP_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the panic-time CPU stop hook (a later call replaces it).
+pub fn set_panic_stop_hook(hook: PanicStopHook) {
+    PANIC_STOP_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Run the panic-time CPU stop hook once, if installed, and report CPUs that
+/// did not acknowledge — straight to the UART, no lock.
+fn run_panic_stop_hook() {
+    let h = PANIC_STOP_HOOK.swap(0, Ordering::AcqRel);
+    if h == 0 {
+        return;
+    }
+    // SAFETY: stored as `PanicStopHook as usize` in `set_panic_stop_hook`.
+    let f: PanicStopHook = unsafe { core::mem::transmute(h) };
+    let (targeted, stopped) = f();
+    let missing = targeted & !stopped;
+    if missing != 0 {
+        let _ = writeln!(
+            TrapWriter,
+            "panic: CPUs {missing:#x} did not stop (targeted {targeted:#x})"
+        );
+    }
+}
 
 /// Install the persistent-log flush hook (one sink; a later call replaces it).
 pub fn set_persist_hook(hook: PersistHook) {

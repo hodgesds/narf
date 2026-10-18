@@ -1830,10 +1830,15 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             // SIOCETHTOOL: a command the device's driver does not implement
             // is `__dev_ethtool`'s -EOPNOTSUPP, not an unknown ioctl.
             const SIOCETHTOOL: u32 = 0x8946;
+            // NVME_IOCTL_IO_CMD / NVME_IOCTL_IO64_CMD on a controller node:
+            // recognised, refused (no I/O-queue passthrough) — EOPNOTSUPP,
+            // not the ENOTTY of an unknown ioctl.
+            const NVME_IOCTL_IO_CMDS: [u32; 2] = [0xC048_4E43, 0xC050_4E48];
             if cmd == DRM_IOCTL_SET_CLIENT_CAP
                 || cmd == DRM_IOCTL_MODE_ATOMIC
                 || DRM_IOCTL_VBLANK.contains(&cmd)
                 || cmd == SIOCETHTOOL
+                || NVME_IOCTL_IO_CMDS.contains(&cmd)
             {
                 ctx.set_return(errno_ret(EOPNOTSUPP));
                 return;

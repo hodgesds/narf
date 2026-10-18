@@ -120,6 +120,13 @@ panic path. The persist hook runs after the UART and framebuffer sinks, so a
 stalled flush can never hide the panic report; the slot is taken before the
 call so a panic inside the hook cannot recurse into it.
 
+`set_panic_stop_hook(fn() -> (u64, u64))` installs the panic-time
+`smp_send_stop` (x86_64: `narf_interrupts::x86_64::panic_stop`, installed with
+the BSP's LAPIC). `panic_sink` runs it first, before any output: every other
+online CPU is NMI'd into a permanent halt (bounded 1 s wait), so no CPU keeps
+issuing filesystem or disk I/O after a panic. CPUs that do not acknowledge
+are reported on the UART.
+
 ### 3.1 MMU-enable handoff protocol
 
 This is a Stage 1 correctness requirement. Exact sequence that

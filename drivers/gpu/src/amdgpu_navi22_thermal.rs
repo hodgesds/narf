@@ -14,14 +14,22 @@
 //!   throttling (7) increments the throttle counter (sienna_cichlid has no
 //!   `log_thermal_throttling_event`), others are ignored.
 //!
-//! NARF has no userspace `poweroff` helper or filesystem write-back, so the
-//! orderly path reduces to Linux's forced fallback: log, then
-//! `narf_power::system::power_off()` (ACPI S5 / PSCI SYSTEM_OFF). PMFW's own
-//! hardware CTF remains the last line of protection. Fan stays automatic.
+//! The power-off is Linux's `hw_protection_shutdown`, not a direct S5 from
+//! the IV task: `narf_power::orderly::hw_protection_shutdown` queues the
+//! orderly power-off (every filesystem synced from the power worker, bounded
+//! by [`FORCED_POWEROFF_MS`], then the device shutdown hooks — NVMe Flush +
+//! CC.SHN — and ACPI S5) and arms a forced fallback should the orderly path
+//! not start. PMFW's own hardware CTF remains the last line of protection.
+//! Fan stays automatic.
 use crate::amdgpu_ih_navi22::{source, Handle, Iv, Source, Subscription};
 use crate::amdgpu_smu_navi22::{self as smu, Limits};
 use core::sync::atomic::{AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
+
+/// Sync budget of the thermal power-off: a filesystem sync still running
+/// after this is abandoned and the machine powered off (Linux
+/// `hw_protection_shutdown(..., ms_until_forced)`).
+pub const FORCED_POWEROFF_MS: u64 = 10_000;
 
 /// `AMDGPU_SWCTF_EXTRA_DELAY`.
 // linux: AMDGPU_SWCTF_EXTRA_DELAY
@@ -123,7 +131,7 @@ pub(crate) trait Platform {
     /// `smu_v11_0_interrupt_work`: ReenableAcDcInterrupt via the mailbox.
     async fn reenable_acdc(&mut self) -> Result<(), smu::Error>;
     async fn delay_ms(&mut self, ms: u64);
-    /// Never returns in production.
+    /// Requests the orderly hardware-protection power-off; returns.
     fn power_off(&mut self, reason: Shutdown);
 }
 
@@ -225,8 +233,12 @@ impl Platform for Hardware {
     async fn delay_ms(&mut self, ms: u64) {
         narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms).as_instant()).await;
     }
-    fn power_off(&mut self, _reason: Shutdown) {
-        narf_power::system::power_off();
+    fn power_off(&mut self, reason: Shutdown) {
+        let why = match reason {
+            Shutdown::HardwareCtf => "GPU hardware critical temperature fault",
+            Shutdown::SoftwareCtf { .. } => "GPU software critical temperature",
+        };
+        narf_power::orderly::hw_protection_shutdown(why, FORCED_POWEROFF_MS);
     }
 }
 

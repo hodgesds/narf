@@ -775,54 +775,6 @@ impl Controller {
         self.identify.as_ref()
     }
 
-    /// Stop the controller for system suspend — clear CC.EN and
-    /// wait for CSTS.RDY=0 so any in-flight admin / IO commands
-    /// drain to a quiescent state before we lose power. Queues
-    /// stay in DRAM; `enable_for_resume` re-asserts CC.EN.
-    ///
-    /// # Safety
-    /// Caller owns BAR0 exclusively; no concurrent submitters.
-    pub unsafe fn disable_for_suspend(&self) -> bool {
-        let bar = match &self.bar0_region {
-            Some(b) => b,
-            None => return false,
-        };
-        // SAFETY: caller-asserted ownership.
-        let cc = unsafe { bar.read32(REG_CC) };
-        // SAFETY: same.
-        unsafe {
-            bar.write32(REG_CC, cc & !CC_EN);
-        }
-        narf_scheduler::responsive_spin_until(
-            // SAFETY: same.
-            || unsafe { bar.read32(REG_CSTS) } & CSTS_RDY == 0,
-            narf_time::Deadline::after_ms(500),
-        )
-    }
-
-    /// Re-enable the controller after system wake. Sets CC.EN
-    /// and polls CSTS.RDY=1.
-    ///
-    /// # Safety
-    /// Caller owns BAR0 exclusively.
-    pub unsafe fn enable_for_resume(&self) -> bool {
-        let bar = match &self.bar0_region {
-            Some(b) => b,
-            None => return false,
-        };
-        // SAFETY: caller-asserted ownership.
-        let cc = unsafe { bar.read32(REG_CC) };
-        // SAFETY: same.
-        unsafe {
-            bar.write32(REG_CC, cc | CC_EN);
-        }
-        narf_scheduler::responsive_spin_until(
-            // SAFETY: same.
-            || unsafe { bar.read32(REG_CSTS) } & CSTS_RDY != 0,
-            narf_time::Deadline::after_ms(500),
-        )
-    }
-
     /// Skeleton probe — returns `NotImplemented` when no `BusDevice`
     /// was supplied. Kept for backward compatibility with the
     /// pre-bring-up smoke; new callers go through `bring_up`.
@@ -3223,6 +3175,12 @@ struct InstalledController {
     /// first use. Its contents are serialised by `req_gate`; this lock
     /// only covers the lazy init.
     scratch: IrqSafeSpinLock<Option<&'static DmaBuffer>>,
+    /// BAR0 and the CC.SHN wait budget, copied out at install so the final
+    /// shutdown can still send CC.SHN — a register write that touches no
+    /// queue state — when an in-flight command never releases `req_gate`
+    /// (Linux `nvme_dev_disable` disables the controller after its freeze
+    /// timeout whatever is still outstanding). `None` before bring-up.
+    shutdown_regs: Option<(MmioRegion, u64)>,
     ctrl: UnsafeCell<Controller>,
 }
 
@@ -3256,12 +3214,19 @@ fn leak_slot(
     bdf: Option<narf_bus::PcieAddr>,
     ctrl: Controller,
 ) -> &'static InstalledController {
+    let shutdown_regs = ctrl.bar0_region.map(|bar| {
+        (
+            bar,
+            shutdown::shutdown_timeout_ms(ctrl.identify.map(|i| i.rtd3e).unwrap_or(0)),
+        )
+    });
     alloc::boxed::Box::leak(alloc::boxed::Box::new(InstalledController {
         req_gate: AtomicBool::new(false),
         instance,
         bdf,
         removed: AtomicBool::new(false),
         scratch: IrqSafeSpinLock::new(None),
+        shutdown_regs,
         ctrl: UnsafeCell::new(ctrl),
     }))
 }
@@ -3299,9 +3264,18 @@ pub(crate) fn install_controller(ctrl: Controller) -> u32 {
 }
 
 fn slot_of(instance: u32) -> Option<&'static InstalledController> {
+    // Final shutdown has begun: no new request reaches any controller
+    // (Linux `nvme_dev_disable` freezes the queues before it disables).
+    if SHUTTING_DOWN.load(Ordering::Acquire) {
+        return None;
+    }
     let s = CONTROLLERS.lock().get(instance as usize).copied()?;
     (!s.removed.load(Ordering::Acquire)).then_some(s)
 }
+
+/// Set once [`shutdown_all_controllers`] starts; never cleared (the next
+/// thing after it is the platform reset / S5).
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// Exclusive handle to one installed controller for one device
 /// round-trip. Holds the slot's `req_gate`, NOT the `CONTROLLERS`
@@ -3781,8 +3755,8 @@ fn register_controller(instance: u32, device: narf_bus::BusDevice) {
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Block.default_domain(),
     });
-    // Device PM: suspend stops this controller via CC.EN=0 (admin + I/O
-    // queues quiesce); resume re-enables CC.EN and waits for CSTS.RDY=1.
+    // Device PM: system suspend is refused (see `NvmePm::suspend`), which
+    // makes the suspend orchestrator abort before anything powers down.
     narf_power::device_pm::register_device_pm_ops(
         &ctrl_name,
         alloc::sync::Arc::new(NvmePm { instance }),
@@ -3825,49 +3799,159 @@ pub fn remove_controller(instance: u32, cap: &Cap<BusDeviceCap, Write>) -> Optio
     Some(ctrl.disable_after_failure(cap))
 }
 
+/// How long the final shutdown waits for an in-flight command to release a
+/// controller before it gives up on the Flush and sends CC.SHN regardless —
+/// Linux `nvme_dev_disable(shutdown = true)` waits `NVME_IO_TIMEOUT` (30 s)
+/// for the queues to freeze. Every request holding the gate is itself bounded
+/// by its completion budget (5 s per command), so a healthy controller always
+/// drains well inside this.
+pub const SHUTDOWN_DRAIN_TIMEOUT_MS: u64 = 30_000;
+
+/// What the final shutdown of one controller did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlotShutdown {
+    /// The in-flight work drained: every namespace flushed, then CC.SHN.
+    Normal(shutdown::QuiesceReport<NvmeError>),
+    /// Never drained within the budget (or called from interrupt context):
+    /// no Flush could be sent, CC.SHN was written straight to the register.
+    /// The controller still commits its volatile cache on a normal shutdown.
+    Forced(shutdown::ShutdownOutcome),
+    /// The slot was never brought up (no BAR): nothing to shut down.
+    NotReady,
+}
+
+/// Final shutdown of one controller: wait up to `drain_ms` for its request
+/// gate (in-flight commands to finish) via `wait(cond, ms)`, then Flush +
+/// CC.SHN; if the gate never frees, log loudly and send CC.SHN anyway.
+/// `wait` is [`drain_wait`] in production and a model in tests.
+fn shutdown_slot(
+    slot: &'static InstalledController,
+    drain_ms: u64,
+    wait: &mut dyn FnMut(&mut dyn FnMut() -> bool, u64) -> bool,
+) -> SlotShutdown {
+    use core::fmt::Write as _;
+    let name = ns::controller_name(slot.instance);
+    let got = drain_ms > 0
+        && wait(
+            &mut || {
+                slot.req_gate
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            },
+            drain_ms,
+        );
+    if got {
+        let mut ctrl = ControllerGuard { slot };
+        return match ctrl.shutdown() {
+            Some(report) => SlotShutdown::Normal(report),
+            None => SlotShutdown::NotReady,
+        };
+    }
+    let Some((bar, timeout_ms)) = slot.shutdown_regs else {
+        return SlotShutdown::NotReady;
+    };
+    let _ = writeln!(
+        narf_console::Writer,
+        "nvme: {name}: ERROR: an in-flight command still holds the controller after {drain_ms} ms; \
+         sending CC.SHN WITHOUT a Flush (its write cache is committed by the shutdown itself; \
+         any write still in flight may be lost)"
+    );
+    let regs = BarRegs(bar);
+    let outcome = shutdown::normal_shutdown(&regs, timeout_ms, &mut |cond, ms| {
+        narf_scheduler::responsive_spin_until(cond, narf_time::Deadline::after_ms(ms))
+    });
+    SlotShutdown::Forced(outcome)
+}
+
+/// The production drain wait: spin on `cond` in 100 ms slices with
+/// interrupts enabled, cooperatively yielding between slices (a stackful
+/// task descheduled on this CPU may be the one holding the gate), and log
+/// every 5 s so a long drain is visible.
+fn drain_wait(name: &str) -> impl FnMut(&mut dyn FnMut() -> bool, u64) -> bool + '_ {
+    move |cond, budget_ms| {
+        use core::fmt::Write as _;
+        let start = narf_time::wall::monotonic_ns();
+        let mut next_log_ms = 5_000;
+        loop {
+            if narf_scheduler::responsive_spin_until(&mut *cond, narf_time::Deadline::after_ms(100))
+            {
+                return true;
+            }
+            let waited_ms = narf_time::wall::monotonic_ns().saturating_sub(start) / 1_000_000;
+            if waited_ms >= budget_ms {
+                return false;
+            }
+            if waited_ms >= next_log_ms {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "nvme: {name}: shutdown waiting for in-flight I/O ({waited_ms} ms of {budget_ms} ms)"
+                );
+                next_log_ms += 5_000;
+            }
+            let _ = narf_scheduler::cooperative_yield();
+        }
+    }
+}
+
 /// `narf_power::system` shutdown hook: the final quiesce of every
 /// controller before reboot / power-off (Linux `nvme_shutdown`, run from
-/// `device_shutdown`). Each controller is flushed and sent CC.SHN in
-/// instance order; a controller whose gate stays held (a CPU wedged mid-I/O)
-/// for 2 s is skipped rather than hanging the power-off.
+/// `device_shutdown`). New requests are refused from here on; each
+/// controller's in-flight work is given [`SHUTDOWN_DRAIN_TIMEOUT_MS`] to
+/// drain, then every namespace is flushed and CC.SHN sent, in instance
+/// order. A controller that never drains still gets CC.SHN, loudly.
+///
+/// Runs in task context: `narf_power::system` refuses a reboot / power-off
+/// from interrupt context before any hook runs. Should it ever be reached
+/// from an IRQ regardless, waiting would only wait on the interrupted code,
+/// so it goes straight to the forced CC.SHN.
 pub fn shutdown_all_controllers() {
     use core::fmt::Write as _;
+    SHUTTING_DOWN.store(true, Ordering::Release);
+    let in_irq = narf_lib::context::in_irq();
+    if in_irq {
+        let _ = writeln!(
+            narf_console::Writer,
+            "nvme: ERROR: shutdown reached from interrupt context; no Flush possible, forcing CC.SHN"
+        );
+    }
+    let drain_ms = if in_irq { 0 } else { SHUTDOWN_DRAIN_TIMEOUT_MS };
     let slots: Vec<&'static InstalledController> = CONTROLLERS.lock().clone();
     for slot in slots {
         if slot.removed.load(Ordering::Acquire) {
             continue;
         }
         let name = ns::controller_name(slot.instance);
-        let got = narf_scheduler::responsive_spin_until(
-            || {
-                slot.req_gate
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-            },
-            narf_time::Deadline::after_ms(2_000),
-        );
-        if !got {
-            let _ = writeln!(narf_console::Writer, "nvme: {name}: busy, shutdown skipped");
-            continue;
-        }
-        let mut ctrl = ControllerGuard { slot };
         let start = narf_time::wall::monotonic_ns();
-        let Some(report) = ctrl.shutdown() else {
-            continue;
-        };
-        let flushed = report.flushes.iter().filter(|(_, r)| r.is_ok()).count();
-        let failed = report.flushes.len() - flushed;
-        let _ = writeln!(
-            narf_console::Writer,
-            "nvme: {name}: flushed {flushed} namespace(s){} in {} ms; CC.SHN normal shutdown: {:?}",
-            if failed > 0 {
-                alloc::format!(" ({failed} flush failed)")
-            } else {
-                alloc::string::String::new()
-            },
-            narf_time::wall::monotonic_ns().saturating_sub(start) / 1_000_000,
-            report.shutdown
-        );
+        let outcome = shutdown_slot(slot, drain_ms, &mut drain_wait(&name));
+        let ms = narf_time::wall::monotonic_ns().saturating_sub(start) / 1_000_000;
+        match outcome {
+            SlotShutdown::Normal(report) => {
+                let flushed = report.flushes.iter().filter(|(_, r)| r.is_ok()).count();
+                let failed = report.flushes.len() - flushed;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "nvme: {name}: flushed {flushed} namespace(s){} in {ms} ms; CC.SHN normal shutdown: {:?}",
+                    if failed > 0 {
+                        alloc::format!(" ({failed} flush failed)")
+                    } else {
+                        alloc::string::String::new()
+                    },
+                    report.shutdown
+                );
+            }
+            SlotShutdown::Forced(outcome) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "nvme: {name}: NO FLUSH (controller busy) in {ms} ms; CC.SHN normal shutdown (forced): {outcome:?}"
+                );
+            }
+            SlotShutdown::NotReady => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "nvme: {name}: never brought up; nothing to shut down"
+                );
+            }
+        }
     }
 }
 
@@ -3878,29 +3962,30 @@ struct NvmePm {
 }
 
 impl narf_power::device_pm::DevicePmOps for NvmePm {
-    /// Clears CC.EN so the controller stops fetching from the admin/IO
-    /// submission queues. The queues themselves stay in DRAM; resume
-    /// re-enables CC.EN.
+    /// Refused: system suspend is not supported for NVMe yet, so the
+    /// suspend orchestrator aborts and resumes every device it already
+    /// suspended.
+    ///
+    /// Linux `nvme_suspend` (simple suspend) is `nvme_dev_disable(shutdown =
+    /// true)` — flush, CC.SHN, queues torn down — and `nvme_resume` is a full
+    /// controller reset that rebuilds the admin and I/O queues. Clearing
+    /// CC.EN alone (what this did) discards the controller's queue state
+    /// without a Flush or a shutdown notification, and re-setting it leaves
+    /// the host's queue indices pointing past what the controller now
+    /// expects; the first command after resume would be lost. Until the
+    /// re-init path exists, refusing is the only correct answer.
     fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
-        let ok = with_controller_at(self.instance, |c| {
-            // SAFETY: the gate gives exclusive use of this controller's BAR.
-            unsafe { c.disable_for_suspend() }
-        });
-        match ok {
-            None | Some(true) => Ok(()),
-            Some(false) => Err(narf_power::device_pm::DeviceSuspendError::DriverError),
-        }
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "nvme: {}: system suspend refused (NVMe suspend/resume not supported yet)",
+            ns::controller_name(self.instance)
+        );
+        Err(narf_power::device_pm::DeviceSuspendError::NotImplemented)
     }
-    /// Re-asserts CC.EN and polls CSTS.RDY.
+    /// Nothing to undo: [`Self::suspend`] never touches the controller.
     fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
-        let ok = with_controller_at(self.instance, |c| {
-            // SAFETY: as in `suspend`.
-            unsafe { c.enable_for_resume() }
-        });
-        match ok {
-            None | Some(true) => Ok(()),
-            Some(false) => Err(narf_power::device_pm::DeviceSuspendError::DriverError),
-        }
+        Ok(())
     }
 }
 

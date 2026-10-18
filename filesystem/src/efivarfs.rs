@@ -6,6 +6,17 @@
 //! value using the same prefix. Firmware calls are serialized by an async
 //! mutex; the directory cache never invents values when EFI Runtime Services
 //! are unavailable.
+//!
+//! NVRAM is a disk too. Under the `narf.disks=` policies that protect the
+//! machine's installed system, efivarfs is mounted read-only — every write,
+//! create, unlink and flag change is `EROFS`, and the mount itself carries
+//! `ro` so the VFS refuses before the filesystem is asked ([`efivars_writable`]):
+//!
+//! | `narf.disks=` | efivarfs |
+//! | ------------- | -------- |
+//! | `all` (default, QEMU) | read-write |
+//! | `root-ro` | read-only, always |
+//! | `root-rw`, `boot-only` | read-only unless `narf.efivars_rw` is on the command line |
 
 extern crate alloc;
 
@@ -147,6 +158,35 @@ struct EfivarInner {
     entries: IrqSafeSpinLock<BTreeMap<VariableKey, Arc<VariableEntry>>>,
     uid: u32,
     gid: u32,
+    /// No `SetVariable` may be issued: see [`efivars_writable`].
+    read_only: bool,
+}
+
+/// Kernel argument that lets efivarfs write NVRAM under `narf.disks=root-rw`
+/// or `boot-only` (never under `root-ro`).
+pub const RW_ARG: &str = "narf.efivars_rw";
+
+/// Whether efivarfs may write EFI variables under `policy`, given whether
+/// [`RW_ARG`] was passed. `root-ro` promises no persistent write of any kind,
+/// so it is read-only even with the flag; the other protective policies are
+/// read-only unless the operator opted in; `all` (the default, no
+/// `narf.disks=`) keeps the Linux behaviour.
+pub fn efivars_writable(policy: narf_block::disk_policy::DiskPolicy, rw_arg: bool) -> bool {
+    use narf_block::disk_policy::DiskPolicy;
+    match policy {
+        DiskPolicy::All => true,
+        DiskPolicy::RootRo => false,
+        DiskPolicy::RootRw | DiskPolicy::BootOnly => rw_arg,
+    }
+}
+
+/// [`RW_ARG`] present as a bare flag or with a true value.
+fn rw_arg_from_cmdline() -> bool {
+    let args = narf_boot::args();
+    args.has_flag(RW_ARG)
+        || args
+            .value(RW_ARG)
+            .is_some_and(|v| matches!(v, "1" | "y" | "yes" | "on" | "true"))
 }
 
 impl fmt::Debug for EfivarInner {
@@ -179,13 +219,34 @@ impl EfivarFs {
             return Err(FsError::Unsupported);
         }
         let (uid, gid) = parse_options(options, default_uid, default_gid)?;
-        Self::with_backend(Box::new(RuntimeBackend), uid, gid)
+        let policy = narf_block::disk_policy::policy();
+        let read_only = !efivars_writable(policy, rw_arg_from_cmdline());
+        if read_only {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "efivarfs: read-only under narf.disks={} (EFI variables are not written{})",
+                policy.as_str(),
+                if policy == narf_block::disk_policy::DiskPolicy::RootRo {
+                    ""
+                } else {
+                    "; narf.efivars_rw allows it"
+                }
+            );
+        }
+        Self::with_backend(Box::new(RuntimeBackend), uid, gid, read_only)
+    }
+
+    /// Whether this instance refuses every write.
+    pub fn is_read_only(&self) -> bool {
+        self.inner.read_only
     }
 
     fn with_backend(
         mut backend: Box<dyn VariableBackend>,
         uid: u32,
         gid: u32,
+        read_only: bool,
     ) -> Result<Self, FsError> {
         let variables = backend.list().map_err(status_to_fs_error)?;
         let mut entries = BTreeMap::new();
@@ -214,6 +275,7 @@ impl EfivarFs {
                 entries: IrqSafeSpinLock::new(entries),
                 uid,
                 gid,
+                read_only,
             }),
         })
     }
@@ -228,6 +290,12 @@ impl FsInstance for EfivarFs {
 
     fn name(&self) -> &str {
         "efivarfs"
+    }
+
+    /// A read-only instance is mounted `ro` whatever was asked, so the VFS
+    /// answers EROFS before any file operation runs.
+    fn always_read_only(&self) -> bool {
+        self.inner.read_only
     }
 
     fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
@@ -308,6 +376,9 @@ impl DirOps for EfivarRoot {
 
     fn create<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
+            if self.inner.read_only {
+                return Err(FsError::ReadOnly);
+            }
             let key = parse_filename(name)?;
             if key.guid() == LINUX_EFI_RANDOM_SEED_TABLE_GUID {
                 return Err(FsError::PermissionDenied);
@@ -330,6 +401,9 @@ impl DirOps for EfivarRoot {
 
     fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            if self.inner.read_only {
+                return Err(FsError::ReadOnly);
+            }
             let key = parse_filename(name)?;
             let entry = self
                 .inner
@@ -398,6 +472,9 @@ impl FileOps for EfivarFile {
 
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
+            if self.inner.read_only {
+                return Err(FsError::ReadOnly);
+            }
             let _operation = self.entry.op_lock.lock().await;
             if self.entry.removed.load(Ordering::Acquire) {
                 return Err(FsError::Io(BlockError::IOError));
@@ -504,6 +581,9 @@ impl FileOps for EfivarFile {
                     Ok(FsIoctlReply { result: 0, output })
                 }
                 FS_IOC_SETFLAGS_NR => {
+                    if self.inner.read_only {
+                        return Err(FsError::ReadOnly);
+                    }
                     let raw = input.get(..4).ok_or(FsError::InvalidData)?;
                     let flags =
                         u32::from_ne_bytes(raw.try_into().map_err(|_| FsError::InvalidData)?);
@@ -819,7 +899,24 @@ mod tests {
                 data: vec![0xcc],
             },
         );
-        EfivarFs::with_backend(Box::new(FakeBackend { values }), 12, 34).unwrap()
+        fake_fs_values(values)
+    }
+
+    fn fake_fs_with(read_only: bool) -> EfivarFs {
+        let boot_order = VariableKey::new("BootOrder".to_string(), EFI_GLOBAL_VARIABLE);
+        let mut values = BTreeMap::new();
+        values.insert(
+            boot_order,
+            EfiVariableValue {
+                attributes: QUERY_ATTRS,
+                data: vec![1, 0, 2, 0],
+            },
+        );
+        EfivarFs::with_backend(Box::new(FakeBackend { values }), 12, 34, read_only).unwrap()
+    }
+
+    fn fake_fs_values(values: BTreeMap<VariableKey, EfiVariableValue>) -> EfivarFs {
+        EfivarFs::with_backend(Box::new(FakeBackend { values }), 12, 34, false).unwrap()
     }
 
     fn poll_once<F: Future>(future: F) -> Option<F::Output> {
@@ -973,5 +1070,75 @@ mod tests {
     kernel_test_in!(
         "filesystem/efivarfs",
         smoke_efivarfs_immutable_create_delete_and_statfs
+    );
+
+    /// `narf.disks=` gates NVRAM writes: `root-ro` never writes, `root-rw` /
+    /// `boot-only` only with `narf.efivars_rw`, `all` keeps Linux behaviour;
+    /// a read-only instance refuses write, create, unlink and SETFLAGS with
+    /// EROFS, is mounted `ro`, and still reads.
+    fn smoke_efivarfs_read_only_under_disk_policy() -> TestResult {
+        use narf_block::disk_policy::DiskPolicy;
+        let table = [
+            (DiskPolicy::All, false, true),
+            (DiskPolicy::All, true, true),
+            (DiskPolicy::RootRo, false, false),
+            (DiskPolicy::RootRo, true, false),
+            (DiskPolicy::RootRw, false, false),
+            (DiskPolicy::RootRw, true, true),
+            (DiskPolicy::BootOnly, false, false),
+            (DiskPolicy::BootOnly, true, true),
+        ];
+        for (policy, flag, want) in table {
+            if efivars_writable(policy, flag) != want {
+                return TestResult::Fail("efivars_writable policy table mismatch");
+            }
+        }
+        let fs = fake_fs_with(true);
+        if !fs.is_read_only() || !fs.always_read_only() {
+            return TestResult::Fail("read-only efivarfs not mounted ro");
+        }
+        let root = fs.root();
+        let name = format!("BootOrder-{}", format_guid(EFI_GLOBAL_VARIABLE));
+        let Some(file) = root.lookup(&name) else {
+            return TestResult::Fail("read-only efivarfs lost its variables");
+        };
+        let mut buf = [0u8; 16];
+        if poll_once(file.read(0, &mut buf)) != Some(Ok(8)) {
+            return TestResult::Fail("read-only efivarfs must still read");
+        }
+        let mut value = Vec::new();
+        value.extend_from_slice(&QUERY_ATTRS.to_le_bytes());
+        value.extend_from_slice(&[2, 0, 1, 0]);
+        if poll_once(file.write(0, &value)) != Some(Err(FsError::ReadOnly)) {
+            return TestResult::Fail("write on read-only efivarfs not EROFS");
+        }
+        if poll_once(file.ioctl_async(0x4008_6602, 0, &0u64.to_ne_bytes(), 0)).map(|r| r.err())
+            != Some(Some(FsError::ReadOnly))
+        {
+            return TestResult::Fail("FS_IOC_SETFLAGS on read-only efivarfs not EROFS");
+        }
+        let new_name = format!("Boot0001-{}", format_guid(EFI_GLOBAL_VARIABLE));
+        if !matches!(
+            poll_once(root.create(&new_name)),
+            Some(Err(FsError::ReadOnly))
+        ) {
+            return TestResult::Fail("create on read-only efivarfs not EROFS");
+        }
+        if poll_once(root.unlink(&name)) != Some(Err(FsError::ReadOnly))
+            || root.lookup(&name).is_none()
+        {
+            return TestResult::Fail("unlink on read-only efivarfs not EROFS");
+        }
+        // The writable instance is unchanged.
+        let rw = fake_fs_with(false);
+        let rw_file = rw.root().lookup(&name).unwrap();
+        if rw.always_read_only() || poll_once(rw_file.write(0, &value)) != Some(Ok(8)) {
+            return TestResult::Fail("writable efivarfs refused a write");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "filesystem/efivarfs",
+        smoke_efivarfs_read_only_under_disk_policy
     );
 }

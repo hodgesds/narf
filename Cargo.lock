@@ -2946,6 +2946,7 @@ dependencies = [
  "narf-event-bus",
  "narf-filesystem",
  "narf-init",
+ "narf-input",
  "narf-interrupts",
  "narf-kernel-test",
  "narf-lib",
