@@ -233,6 +233,13 @@ pub(super) struct FwCfg {
     pub(super) send_m1: bool,
     pub(super) bad_m3_mic: bool,
     pub(super) m3_rsn: Option<Vec<u8>>,
+    /// The AP's RSNE (+ RSNXE) elements for the authenticator's M3
+    /// (`None` = [`AP_RSN_IE`]).
+    pub(super) ap_sec_ies: Option<Vec<u8>>,
+    /// An IGTK KDE in M3: (key id, IPN, IGTK).
+    pub(super) igtk: Option<(u16, [u8; 6], [u8; 16])>,
+    /// Our RSNE (+ RSNXE) the AP expects in M2 (`None` = [`STA_RSN_IE`]).
+    pub(super) sta_ies: Option<Vec<u8>>,
 }
 
 impl Default for FwCfg {
@@ -253,6 +260,9 @@ impl Default for FwCfg {
             send_m1: true,
             bad_m3_mic: false,
             m3_rsn: None,
+            ap_sec_ies: None,
+            igtk: None,
+            sta_ies: None,
         }
     }
 }
@@ -311,6 +321,10 @@ const GTK_IDX: u8 = 1;
 
 #[derive(Default)]
 pub(super) struct Ap {
+    /// The PMK (`None` = [`PMK`]; SAE sets it).
+    pub(super) pmk: Option<[u8; 32]>,
+    /// The AKM the station chose (from its M2 RSNE).
+    pub(super) km: Option<eapol::KeyMgmt>,
     pub(super) ptk: Option<eapol::Ptk>,
     pub(super) m2_mic_ok: bool,
     pub(super) m2_rsn_ok: bool,
@@ -514,7 +528,13 @@ impl World {
                     self.events
                         .push_back(mgmt_rx_event(6, 60, 2437, 0, &assoc_resp(st)));
                     if st == 0 && cfg.eapol && cfg.send_m1 {
-                        self.eapol_rx.push_back(m1());
+                        // hostapd picks the descriptor version of the AKM
+                        // in the station's RSNE.
+                        let km = frame::find_elem(&f[28..], frame::eid::RSN)
+                            .filter(|r| r.len() >= 18)
+                            .and_then(|r| eapol::KeyMgmt::from_suite_type(r[17]))
+                            .unwrap_or(eapol::KeyMgmt::Psk);
+                        self.eapol_rx.push_back(m1_ver(km.key_info_version()));
                     }
                 }
             }
@@ -523,7 +543,9 @@ impl World {
         desc
     }
 
-    /// The authenticator: M2 → M3, M4 → done.
+    /// The authenticator (hostapd `wpa_auth`): M2 → M3, M4 → done, with
+    /// the station's AKM (from the RSNE in M2): PTK by `wpa_pmk_to_ptk`,
+    /// MICs by `wpa_eapol_key_mic`, descriptor version of the AKM.
     pub(super) fn on_eth(&mut self, f: &[u8]) {
         self.eth_tx.push(f.to_vec());
         let cfg = self.cfg();
@@ -535,16 +557,33 @@ impl World {
         };
         let mut zeroed = pdu.to_vec();
         zeroed[EAPOL_MIC_OFFSET..EAPOL_MIC_OFFSET + 16].fill(0);
-        if k.key_information == 0x010A {
-            // M2: derive the PTK from the AP's side.
-            let ptk = eapol::derive_ptk(&HmacSha1, &PMK, &BSSID, &OWN, &ANONCE, &k.key_nonce, 16);
-            self.ap.m2_mic_ok =
-                pdu[EAPOL_MIC_OFFSET..EAPOL_MIC_OFFSET + 16] == eapol_mic(&ptk.kck, &zeroed);
-            self.ap.m2_rsn_ok = k.key_data == STA_RSN_IE;
-            let rsn = cfg.m3_rsn.clone().unwrap_or_else(|| AP_RSN_IE.to_vec());
-            let mut kd = rsn;
+        let ki = k.key_information & !eapol::KI_VERSION_MASK;
+        let ver = k.key_information & eapol::KI_VERSION_MASK;
+        if ki == 0x0108 && k.key_nonce != [0; 32] {
+            // M2: AKM from the station's RSNE (suite at offset 18 of the body).
+            let km = (k.key_data.len() >= 22 && k.key_data[0] == 0x30)
+                .then(|| eapol::KeyMgmt::from_suite_type(k.key_data[19]))
+                .flatten()
+                .unwrap_or(eapol::KeyMgmt::Psk);
+            let pmk = self.ap.pmk.unwrap_or(PMK);
+            let ptk = eapol::wpa_pmk_to_ptk(km, &pmk, &BSSID, &OWN, &ANONCE, &k.key_nonce, 16);
+            self.ap.m2_mic_ok = ver == km.key_info_version()
+                && eapol::wpa_eapol_key_mic(km, ver, &ptk.kck, &zeroed).as_deref()
+                    == Some(&pdu[EAPOL_MIC_OFFSET..EAPOL_MIC_OFFSET + 16]);
+            self.ap.m2_rsn_ok = k.key_data == cfg.sta_ies.clone().unwrap_or(STA_RSN_IE.to_vec());
+            let mut kd = cfg
+                .m3_rsn
+                .clone()
+                .or(cfg.ap_sec_ies.clone())
+                .unwrap_or_else(|| AP_RSN_IE.to_vec());
             kd.extend_from_slice(&[0xDD, 22, 0x00, 0x0F, 0xAC, 0x01, GTK_IDX, 0x00]);
             kd.extend_from_slice(&GTK);
+            if let Some((id, ipn, igtk)) = cfg.igtk {
+                kd.extend_from_slice(&[0xDD, 28, 0x00, 0x0F, 0xAC, 0x09]);
+                kd.extend_from_slice(&id.to_le_bytes());
+                kd.extend_from_slice(&ipn);
+                kd.extend_from_slice(&igtk);
+            }
             // IEEE 802.11 §12.7.2: pad with 0xdd then zeros to 8 bytes.
             if kd.len() % 8 != 0 {
                 kd.push(0xDD);
@@ -555,24 +594,27 @@ impl World {
             let mut kek = [0u8; 16];
             kek.copy_from_slice(&ptk.kek);
             let mut m3 = KeyFrame::empty(16);
-            m3.key_information = 0x13CA;
+            m3.key_information = 0x13C8 | km.key_info_version();
             m3.key_length = 16;
             m3.replay_counter = 2;
             m3.key_nonce = ANONCE;
             m3.key_data = aes_key_wrap(&kek, &kd);
             let mut b = m3.into_eapol();
-            let mut mic = eapol_mic(&ptk.kck, &b);
+            let mut mic = [0u8; 16];
+            mic.copy_from_slice(
+                &eapol::wpa_eapol_key_mic(km, km.key_info_version(), &ptk.kck, &b).unwrap(),
+            );
             if cfg.bad_m3_mic {
                 mic[0] ^= 0x01;
             }
             b[EAPOL_MIC_OFFSET..EAPOL_MIC_OFFSET + 16].copy_from_slice(&mic);
             self.eapol_rx.push_back(frame::eapol_eth(&OWN, &BSSID, &b));
             self.ap.ptk = Some(ptk);
-        } else if k.key_information == 0x030A {
-            if let Some(ptk) = &self.ap.ptk {
-                self.ap.m4_ok = pdu[EAPOL_MIC_OFFSET..EAPOL_MIC_OFFSET + 16]
-                    == eapol_mic(&ptk.kck, &zeroed)
-                    && k.replay_counter == 2;
+            self.ap.km = Some(km);
+        } else if ki == 0x0308 && k.replay_counter == 2 {
+            if let (Some(ptk), Some(km)) = (&self.ap.ptk, self.ap.km) {
+                self.ap.m4_ok = eapol::wpa_eapol_key_mic(km, ver, &ptk.kck, &zeroed).as_deref()
+                    == Some(&pdu[EAPOL_MIC_OFFSET..EAPOL_MIC_OFFSET + 16]);
             }
         }
     }
@@ -791,14 +833,16 @@ fn ps(id: u32, v: u32) -> WmiCmd {
 
 /// AP RSN element: version 1, group CCMP, 1 pairwise CCMP, 1 AKM PSK,
 /// RSN capabilities 0x000c (16 GTKSA/PTKSA replay counters).
-const AP_RSN_IE: [u8; 22] = [
+pub(super) const AP_RSN_IE: [u8; 22] = [
     0x30, 0x14, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00,
     0x00, 0x0F, 0xAC, 0x02, 0x0C, 0x00,
 ];
-/// Our RSN element (wpa_supplicant, pmf=0): capabilities 0.
-const STA_RSN_IE: [u8; 22] = [
+/// Our RSN element (`wpa_gen_wpa_ie_rsn`, PMF optional): capabilities
+/// 0x008c = MFPC | 16 PTKSA replay counters (`rsn_supp_capab`: the AP has
+/// a WMM element); no group management cipher (the AP is not MFP capable).
+pub(super) const STA_RSN_IE: [u8; 22] = [
     0x30, 0x14, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00,
-    0x00, 0x0F, 0xAC, 0x02, 0x00, 0x00,
+    0x00, 0x0F, 0xAC, 0x02, 0x8C, 0x00,
 ];
 /// AP HT capabilities: cap 0x016e (SUP_WIDTH_20_40 | SM_PS disabled |
 /// SGI20 | SGI40 | RX_STBC 1), A-MPDU 0x17 (64K, 8 µs), MCS 0–15,
@@ -832,6 +876,13 @@ fn rates_ies() -> Vec<u8> {
 
 /// A 2.4 GHz WPA2 HT40+ beacon on channel 6.
 pub(super) fn beacon(bssid: &[u8; 6], ssid: &[u8], ds: u8, rsn: bool) -> Vec<u8> {
+    beacon_sec(bssid, ssid, ds, rsn.then_some(&AP_RSN_IE[..]))
+}
+
+/// [`beacon`] with the given security elements (RSNE, RSNXE) in the RSN
+/// element's place; `None` = Open.
+pub(super) fn beacon_sec(bssid: &[u8; 6], ssid: &[u8], ds: u8, sec: Option<&[u8]>) -> Vec<u8> {
+    let rsn = sec.is_some();
     let mut f = frame::mgmt_hdr(frame::stype::BEACON, &[0xFF; 6], bssid, bssid);
     f.extend_from_slice(&[0x10, 0x32, 0x54, 0x76, 0, 0, 0, 0]); // TSF
     f.extend_from_slice(&100u16.to_le_bytes()); // beacon interval
@@ -844,8 +895,8 @@ pub(super) fn beacon(bssid: &[u8; 6], ssid: &[u8], ds: u8, rsn: bool) -> Vec<u8>
     f.extend_from_slice(&[0x03, 0x01, ds]);
     f.extend_from_slice(&[0x05, 0x04, 0x00, 0x01, 0x00, 0x00]); // TIM, DTIM period 1
     f.extend_from_slice(&[0x2A, 0x01, 0x00]); // ERP
-    if rsn {
-        f.extend_from_slice(&AP_RSN_IE);
+    if let Some(e) = sec {
+        f.extend_from_slice(e);
     }
     f.extend_from_slice(&rates_ies()[10..]);
     f.extend_from_slice(&ap_ht_cap());
@@ -876,8 +927,13 @@ fn assoc_resp(status: u16) -> Vec<u8> {
 }
 
 fn m1() -> Vec<u8> {
+    m1_ver(2)
+}
+
+/// Message 1/4 with Key Descriptor Version `ver`.
+fn m1_ver(ver: u16) -> Vec<u8> {
     let mut k = KeyFrame::empty(16);
-    k.key_information = 0x008A; // ver 2 | pairwise | ack
+    k.key_information = 0x0088 | ver; // ver | pairwise | ack
     k.key_length = 16;
     k.replay_counter = 1;
     k.key_nonce = ANONCE;
@@ -1913,7 +1969,11 @@ fn smoke_ath11k_mac_auth_assoc_frames() -> TestResult {
             },
             "HT40+ at 2447"
         );
-        let p = m.assoc_request_params(&bss, &ies, SSID, true);
+        let plan = super::mac::sec::select_rsn(&ies, bss.capability, &wpa2_req().security)
+            .unwrap()
+            .unwrap()
+            .0;
+        let p = m.assoc_request_params(&bss, &ies, SSID, Some(&plan));
         let f = frame::build_assoc_req(&p);
         // Without a link mac80211's conn bw_limit is 20 MHz: 40 MHz and
         // SGI40 are cleared (0x19e7 → 0x19a5). The HT40 request is
@@ -2566,7 +2626,8 @@ fn smoke_ath11k_mac_connect_wpa2() -> TestResult {
                 && m2.key_nonce == [SNONCE_FILL; 32],
             "M2 fields"
         );
-        ensure!(pdu[0] == 3 && pdu[1] == 3, "EAPOL v3 key frame");
+        // wpa_supplicant's DEFAULT_EAPOL_VERSION (wpa_alloc_eapol).
+        ensure!(pdu[0] == 1 && pdu[1] == 3, "EAPOL v1 key frame");
         // 4 + 95 (16-byte MIC for AKM 2) + 22-byte RSN element.
         ensure!(
             pdu.len() == 121 && pdu[2..4] == [0, 117],

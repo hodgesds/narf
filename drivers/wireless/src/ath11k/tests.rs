@@ -672,6 +672,12 @@ fn smoke_ath11k_step_codes_unique_and_in_range() -> TestResult {
             ],
         ),
         (
+            "mac (security / HE)",
+            270,
+            299,
+            &[super::mac::step::SA_QUERY_TIMEOUT],
+        ),
+        (
             "dp_ring",
             200,
             219,

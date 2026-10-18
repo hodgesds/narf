@@ -54,7 +54,7 @@ use super::htt;
 use super::hw::{HwRev, MSI_CONFIG_ONE, MSI_CONFIG_QCA6390, RING_MASK_QCA6390};
 use super::iface::{Ath11kNetdev, Sinks};
 use super::mac::{Mac, MacConfig};
-use super::mac_tests::{beacon, FwCfg, World, BSSID, OWN, PMK, SSID};
+use super::mac_tests::{beacon, beacon_sec, FwCfg, World, BSSID, OWN, PMK, SSID};
 use super::mhi_host::MhiNotify;
 use super::power::ChipIo;
 use super::runtime::{self, DpHooks, DpIrq, Port, Rt, Shared};
@@ -476,9 +476,13 @@ impl Dev {
             let b = &cmd.buf;
             match cmd_id {
                 wmi::WMI_MGMT_TX_SEND_CMDID => {
+                    // The firmware DMAs the whole frame (`paddr`, `frame_len`);
+                    // the command carries only the first
+                    // WMI_MGMT_SEND_DOWNLD_LEN octets.
                     let desc = rd32(b, 8);
-                    let n = rd32(b, 28) as usize;
-                    let frame = b[40..40 + n].to_vec();
+                    let pa = rd32(b, 16) as u64 | (rd32(b, 20) as u64) << 32;
+                    let mut frame = vec![0u8; rd32(b, 24) as usize];
+                    phys_read(pa, &mut frame);
                     st.world.on_mgmt_desc(&frame, desc);
                 }
                 wmi::WMI_PEER_CREATE_CMDID => {
@@ -3797,4 +3801,317 @@ fn smoke_ath11k_int_recovery_failures() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_ath11k_int_recovery_failures
+);
+
+// ── 802.11w (PMF) ─────────────────────────────────────────────────
+
+/// AP RSNE: group CCMP, CCMP, AKMs PSK + PSK-SHA256, MFPC + 16 PTKSA
+/// replay counters (0x008c), PMKID count 0, BIP-CMAC-128.
+const AP_RSNE_PMF: [u8; 32] = [
+    0x30, 0x1E, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x02, 0x00,
+    0x00, 0x0F, 0xAC, 0x02, 0x00, 0x0F, 0xAC, 0x06, 0x8C, 0x00, 0x00, 0x00, 0x00, 0x0F, 0xAC, 0x06,
+];
+/// Our RSNE for it (`wpa_gen_wpa_ie_rsn`): PSK-SHA256 (preferred over PSK
+/// by `wpa_supplicant_set_suites`), MFPC + 16 PTKSA counters, PMKID count
+/// 0, BIP-CMAC-128 (`wpas_set_mgmt_group_cipher`).
+const STA_RSNE_PMF: [u8; 28] = [
+    0x30, 0x1A, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00,
+    0x00, 0x0F, 0xAC, 0x06, 0x8C, 0x00, 0x00, 0x00, 0x00, 0x0F, 0xAC, 0x06,
+];
+const IGTK: [u8; 16] = [0x9E; 16];
+const IGTK_IPN: [u8; 6] = [5, 0, 0, 0, 0, 0];
+
+fn pmf_cfg() -> FwCfg {
+    FwCfg {
+        beacons: vec![(6, 50, beacon_sec(&BSSID, SSID, 6, Some(&AP_RSNE_PMF)))],
+        eapol: true,
+        ap_sec_ies: Some(AP_RSNE_PMF.to_vec()),
+        igtk: Some((4, IGTK_IPN, IGTK)),
+        sta_ies: Some(STA_RSNE_PMF.to_vec()),
+        ..FwCfg::default()
+    }
+}
+
+/// A management frame from the AP to `da`.
+fn ap_mgmt(stype: u16, da: &[u8; 6], body: &[u8]) -> Vec<u8> {
+    let mut f = super::mac_frame::mgmt_hdr(stype, da, &BSSID, &BSSID);
+    f.extend_from_slice(body);
+    f
+}
+
+/// As the firmware delivers a decrypted protected frame
+/// (`ath11k_mgmt_rx_event`): Protected bit, CCMP header (PN, key 0),
+/// body, the MIC left in place.
+fn ap_protected(stype: u16, body: &[u8], pn: u64) -> Vec<u8> {
+    super::mac::sec::protect_mgmt(&ap_mgmt(stype, &OWN, body), pn)
+}
+
+/// A group-addressed frame with a BIP-CMAC-128 MMIE (IGTK, key 4).
+fn ap_bip(stype: u16, body: &[u8], ipn: u64, bad_mic: bool) -> Vec<u8> {
+    use narf_crypto::bip_cmac::*;
+    let mut f = ap_mgmt(stype, &[0xFF; 6], body);
+    let mut b = f[24..].to_vec();
+    b.extend_from_slice(&[ELEMENT_ID_MMIE, MMIE_LEN_CMAC_128 as u8]);
+    b.extend_from_slice(&build_mmie_body(4, ipn, &[0; BIP_MIC_LEN]));
+    let igtk = Igtk::install(IGTK, 4).unwrap();
+    let mut mic = compute_mic(&igtk, &build_bip_aad(&f[..24]).unwrap(), &b);
+    if bad_mic {
+        mic[0] ^= 1;
+    }
+    let n = b.len();
+    b[n - BIP_MIC_LEN..].copy_from_slice(&mic);
+    f.truncate(24);
+    f.extend_from_slice(&b);
+    f
+}
+
+fn inject(u: &Up, f: &[u8]) {
+    u.dev
+        .st
+        .borrow_mut()
+        .world
+        .events
+        .push_back(super::mac_tests::mgmt_rx_event(6, 60, 2437, 0, f));
+}
+
+fn mgmt_sent(u: &Up) -> Vec<Vec<u8>> {
+    u.dev.st.borrow().world.mgmt.clone()
+}
+
+/// The frame with its sequence control zeroed (the runtime stamps it).
+fn no_seq(f: &[u8]) -> Vec<u8> {
+    let mut v = f.to_vec();
+    v[22] = 0;
+    v[23] = 0;
+    v
+}
+
+fn pmf_connect(u: &Up) -> R {
+    scan6(u)?;
+    let (r, err, _, _) = latched(|| run(u.netdev.associate(wpa2_req())));
+    ensure!(r.is_ok() && err == 0, "PMF associate");
+    Ok(())
+}
+
+/// `wpa_supplicant_set_suites` / `wpa_gen_wpa_ie_rsn` refusals and the
+/// AKM / PMF choice, `_ieee80211_is_robust_mgmt_frame`, the CCMP header
+/// layout `ccmp_pn2hdr` writes.
+fn smoke_ath11k_pmf_rsn_selection() -> TestResult {
+    use super::mac::sec::{self, refuse};
+    use super::mac_frame::ParsedIes;
+    check(|| {
+        let parse = |rsne: &[u8]| ParsedIes::parse(rsne);
+        let psk = SecurityConfig::Wpa2 { psk: PMK };
+        let sae = SecurityConfig::Wpa3 {
+            password: b"pw".to_vec(),
+        };
+        let (p, _) = sec::select_rsn(&parse(&AP_RSNE_PMF), 0x0411, &psk)
+            .unwrap()
+            .unwrap();
+        ensure!(
+            p.key_mgmt == narf_wireless::eapol::KeyMgmt::PskSha256 && p.mfp && !p.pmf_required,
+            "PSK-SHA256 preferred, MFP negotiated, optional"
+        );
+        ensure!(sec::sta_rsn_ie(&p, true) == STA_RSNE_PMF, "our RSNE");
+        ensure!(sec::sta_rsnxe(&p).is_none(), "no RSNXE for PSK");
+        // MFPR set by the AP but MFPC clear: PMF impossible.
+        let mut bad = AP_RSNE_PMF;
+        bad[24] = 0x4C;
+        ensure!(
+            sec::select_rsn(&parse(&bad), 0x0411, &psk) == Err(refuse::PMF),
+            "MFPR without MFPC"
+        );
+        // A BIP-GMAC-256 AP that requires PMF: no common BIP.
+        let mut gmac = AP_RSNE_PMF;
+        gmac[24] = 0xCC;
+        gmac[31] = 0x0C;
+        ensure!(
+            sec::select_rsn(&parse(&gmac), 0x0411, &psk) == Err(refuse::PMF),
+            "no BIP-CMAC-128"
+        );
+        // SAE asked of a PSK-only AP.
+        ensure!(
+            sec::select_rsn(&parse(&AP_RSNE_PMF), 0x0411, &sae) == Err(refuse::NO_SAE),
+            "SAE needs AKM 8"
+        );
+        // Open to a protected BSS.
+        ensure!(
+            sec::select_rsn(&parse(&AP_RSNE_PMF), 0x0411, &SecurityConfig::Open)
+                == Err(refuse::OPEN_TO_PROTECTED),
+            "open refused"
+        );
+        // Robust frames: deauth / disassoc, BACK, SA Query; not Public.
+        let act = |c: u8| ap_mgmt(super::mac_frame::stype::ACTION, &OWN, &[c, 0]);
+        ensure!(
+            sec::is_robust_mgmt(&ap_mgmt(super::mac_frame::stype::DEAUTH, &OWN, &[3, 0]))
+                && sec::is_robust_mgmt(&act(3))
+                && sec::is_robust_mgmt(&act(8))
+                && !sec::is_robust_mgmt(&act(4))
+                && !sec::is_robust_mgmt(&act(127)),
+            "robust classification"
+        );
+        ensure!(
+            sec::ccmp_hdr(0x0605_0403_0201, 0) == [0x01, 0x02, 0, 0x20, 0x03, 0x04, 0x05, 0x06]
+                && sec::ccmp_pn(&sec::ccmp_hdr(0x0605_0403_0201, 0)) == 0x0605_0403_0201,
+            "CCMP header PN layout"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_pmf_rsn_selection);
+
+/// PMF with a PSK-SHA256 AP: the RSNE in the Association Request, the
+/// AKM-6 4-way handshake (AES-CMAC MICs), `WMI_PEER_PMF` in
+/// WMI_PEER_ASSOC (`ath11k_peer_assoc_h_crypto`: `sta->mfp`), the IGTK
+/// kept in software (no third `WMI_VDEV_INSTALL_KEY`); then the SA Query
+/// Response golden (protected, host CCMP header, MIC tail), unprotected /
+/// replayed robust frames dropped, the SA Query wpa_supplicant runs on an
+/// unprotected reason-7 deauthentication (answered → link kept), and
+/// group-addressed deauthentications through BIP (no MMIE / bad MIC /
+/// replay dropped, valid one honoured).
+fn smoke_ath11k_int_pmf_connect_and_mgmt() -> TestResult {
+    use super::mac_frame::stype;
+    check(|| {
+        let u = up(pmf_cfg())?;
+        pmf_connect(&u)?;
+        {
+            let st = u.dev.st.borrow();
+            ensure!(
+                st.world.ap.km == Some(narf_wireless::eapol::KeyMgmt::PskSha256),
+                "AKM 6 chosen"
+            );
+            ensure!(
+                st.world.ap.m2_mic_ok && st.world.ap.m2_rsn_ok && st.world.ap.m4_ok,
+                "AKM-6 M2 / M4 MICs and the M2 RSNE"
+            );
+            let assoc = st.world.mgmt.iter().find(|f| f[0] == 0x00).unwrap();
+            ensure!(
+                assoc.windows(STA_RSNE_PMF.len()).any(|w| w == STA_RSNE_PMF),
+                "Association Request RSNE"
+            );
+            let keys = st
+                .wmi
+                .iter()
+                .filter(|c| c.cmd_id == wmi::WMI_VDEV_INSTALL_KEY_CMDID)
+                .count();
+            ensure!(keys == 2, "PTK + GTK only: BIP is software");
+            // wmi_peer_assoc_complete_cmd: tlv | peer_macaddr (8) |
+            // vdev_id | peer_new_assoc | peer_associd | peer_flags.
+            let pa = st
+                .wmi
+                .iter()
+                .find(|c| c.cmd_id == wmi::WMI_PEER_ASSOC_CMDID)
+                .unwrap();
+            ensure!(rd32(&pa.buf, 24) & 0x0800_0000 != 0, "WMI_PEER_PMF");
+        }
+        let n0 = mgmt_sent(&u).len();
+        // Protected SA Query Request (PN 1) → protected Response.
+        inject(&u, &ap_protected(stype::ACTION, &[8, 0, 0x12, 0x34], 1));
+        pump(&u, 3);
+        let sent = mgmt_sent(&u);
+        ensure!(sent.len() == n0 + 1, "one SA Query Response");
+        let mut want = vec![0xD0, 0x40, 0x00, 0x00];
+        want.extend_from_slice(&BSSID);
+        want.extend_from_slice(&OWN);
+        want.extend_from_slice(&BSSID);
+        want.extend_from_slice(&[0, 0]);
+        want.extend_from_slice(&[0x01, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00]);
+        want.extend_from_slice(&[0x08, 0x01, 0x12, 0x34]);
+        want.extend_from_slice(&[0; 8]);
+        ensure!(no_seq(&sent[n0]) == want, "SA Query Response golden");
+        // The same PN again (replay) and an unprotected request: dropped.
+        inject(&u, &ap_protected(stype::ACTION, &[8, 0, 0x56, 0x78], 1));
+        inject(&u, &ap_mgmt(stype::ACTION, &OWN, &[8, 0, 0x9a, 0xbc]));
+        pump(&u, 3);
+        ensure!(
+            mgmt_sent(&u).len() == n0 + 1,
+            "replayed / unprotected dropped"
+        );
+        // Unprotected deauth (reason 7): dropped, SA Query Request out.
+        inject(&u, &ap_mgmt(stype::DEAUTH, &OWN, &[7, 0]));
+        pump(&u, 2);
+        ensure!(u.netdev.link_up(), "unprotected deauth ignored");
+        let sent = mgmt_sent(&u);
+        ensure!(sent.len() == n0 + 2, "SA Query Request");
+        let req = &sent[n0 + 1];
+        ensure!(
+            req[1] == 0x40
+                && req[24..32] == [0x02, 0, 0, 0x20, 0, 0, 0, 0]
+                && req[32..36] == [8, 0, 0x22, 0x22],
+            "protected SA Query Request, PN 2, trans id"
+        );
+        inject(&u, &ap_protected(stype::ACTION, &[8, 1, 0x22, 0x22], 2));
+        pump(&u, 200);
+        ensure!(u.netdev.link_up(), "answered SA Query keeps the link");
+        // Group-addressed deauthentications.
+        let n1 = mgmt_sent(&u).len();
+        inject(&u, &ap_mgmt(stype::DEAUTH, &[0xFF; 6], &[3, 0]));
+        inject(&u, &ap_bip(stype::DEAUTH, &[3, 0], 6, true));
+        inject(&u, &ap_bip(stype::DEAUTH, &[3, 0], 5, false));
+        pump(&u, 3);
+        ensure!(u.netdev.link_up(), "no MMIE / bad MIC / IPN replay dropped");
+        ensure!(mgmt_sent(&u).len() == n1, "no SA Query for reason 3");
+        inject(&u, &ap_bip(stype::DEAUTH, &[3, 0], 6, false));
+        pump(&u, 3);
+        ensure!(!u.netdev.link_up(), "BIP-verified deauth honoured");
+        ensure!(*DISC_SEEN.lock() == [(3, true)], "from the AP, reason 3");
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_int_pmf_connect_and_mgmt
+);
+
+/// wpa_supplicant's SA Query timing (`sme_sa_query_timer`): an
+/// unprotected reason-6 deauthentication the AP never follows up — five
+/// Requests 201 TU apart, then past 1000 TU the station deauthenticates
+/// (protected, `WLAN_REASON_PREV_AUTH_NOT_VALID`), step 270 detail 5; a
+/// protected deauthentication (CCMP header, decrypted) is honoured and a
+/// replayed one is not.
+fn smoke_ath11k_int_pmf_sa_query_timeout() -> TestResult {
+    use super::mac_frame::stype;
+    check(|| {
+        let u = up(pmf_cfg())?;
+        pmf_connect(&u)?;
+        let n0 = mgmt_sent(&u).len();
+        inject(&u, &ap_mgmt(stype::DEAUTH, &OWN, &[6, 0]));
+        let (_, err, detail, _) = latched(|| pump(&u, 120));
+        ensure!(
+            err == super::mac::step::SA_QUERY_TIMEOUT && detail == 5,
+            "SA Query timeout latched after 5 requests"
+        );
+        let sent = mgmt_sent(&u);
+        let reqs = sent[n0..]
+            .iter()
+            .filter(|f| f[0] == 0xD0 && f.len() > 33 && f[32..34] == [8, 0])
+            .count();
+        ensure!(reqs == 5, "5 SA Query Requests");
+        let d = sent.last().unwrap();
+        ensure!(
+            d[0] == 0xC0 && d[1] == 0x40 && d[32..34] == [2, 0] && d.len() == 24 + 8 + 2 + 8,
+            "protected deauth, reason 2"
+        );
+        ensure!(*DISC_SEEN.lock() == [(2, false)], "local deauth, reason 2");
+        drop(u);
+
+        // Protected unicast deauthentication.
+        let u = up(pmf_cfg())?;
+        pmf_connect(&u)?;
+        inject(&u, &ap_protected(stype::DEAUTH, &[1, 0], 7));
+        pump(&u, 3);
+        ensure!(!u.netdev.link_up(), "protected deauth honoured");
+        drop(u);
+        let u = up(pmf_cfg())?;
+        pmf_connect(&u)?;
+        inject(&u, &ap_protected(stype::ACTION, &[8, 0, 1, 1], 9));
+        inject(&u, &ap_protected(stype::DEAUTH, &[1, 0], 9));
+        pump(&u, 3);
+        ensure!(u.netdev.link_up(), "replayed PN dropped");
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_int_pmf_sa_query_timeout
 );

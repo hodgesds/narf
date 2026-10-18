@@ -32,14 +32,16 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::future::Future;
 
-use narf_wireless::eapol::{GroupKeyError, GroupKeyFail, HmacPrimitive, KeyFrame, Supplicant};
+use narf_wireless::eapol::{HmacPrimitive, Supplicant};
 use narf_wireless::rsn::{self, RsnIe, Suite};
-use narf_wireless::{AssociateRequest, BssInfo, ScanRequest, SecurityConfig, WirelessError};
+use narf_wireless::{AssociateRequest, BssInfo, ScanRequest, WirelessError};
 
 use super::mac_frame::{self as frame, capab, eid, freq_band, Band, ParsedIes};
 use super::mac_peer::{self as peer, ApSta, ChanDef, ConnMode, OwnCaps, SmpsMode, Width};
 use super::mac_reg::{chan_flag, RegState, RegUpdate, VdevKind, Wiphy};
+pub mod sec;
 use super::wmi::{self, *};
+use sec::{Credential, MfpRx, MfpState, RsnPlan};
 
 // ── Ports ───────────────────────────────────────────────────────────
 
@@ -145,7 +147,8 @@ pub trait DataPort {
 
 // ── Diagnostics ─────────────────────────────────────────────────────
 
-/// `diag::latch_wifi_error` step codes (150–199).
+/// `diag::latch_wifi_error` step codes (150–199, and 270–299 for the
+/// security / HE additions).
 pub mod step {
     pub const START_PDEV_PARAM: u32 = 150;
     pub const START_PROBE_OUI: u32 = 151;
@@ -197,6 +200,10 @@ pub mod step {
     pub const PEER_DELETE_TIMEOUT: u32 = 197;
     pub const WMI_SEND: u32 = 198;
     pub const EAPOL_GTK: u32 = 199;
+    // ── 270–299: security / HE (`mac_sec`, `mac_he`) ──
+    /// wpa_supplicant's SA Query timed out (`sme_check_sa_query_timeout`):
+    /// deauthenticated with `WLAN_REASON_PREV_AUTH_NOT_VALID`.
+    pub const SA_QUERY_TIMEOUT: u32 = 270;
 }
 
 /// Linux errnos used here (positive).
@@ -521,8 +528,8 @@ pub enum LinkLoss {
     Deauth { deauth: bool, reason: u16 },
     /// The supplicant gave up on the association
     /// (`wpa_sm_deauthenticate(sm, reason)`, e.g. a failed Group Key
-    /// Handshake); `detail` is the [`step::EAPOL_GTK`] detail.
-    Supplicant { reason: u16, detail: u32 },
+    /// Handshake, an SA Query timeout); `step` / `detail` are latched.
+    Supplicant { reason: u16, step: u32, detail: u32 },
 }
 
 /// The association in progress / established.
@@ -551,6 +558,8 @@ pub struct Link {
     pub ba_rx_valid: u16,
     /// `sta->ampdu_mlme.tid_rx_token[]`.
     pub ba_rx_token: [u8; 16],
+    /// The negotiated RSN (AKM, PMF); `None` for Open.
+    pub rsn: Option<RsnPlan>,
 }
 
 /// Completions (`reinit_completion` → event → `complete`).
@@ -637,6 +646,8 @@ pub struct Mac<P: WmiPort, D: DataPort> {
     /// The RSN supplicant of the association after its 4-way handshake
     /// (PTK, replay counter, GTK in use) for the Group Key Handshake.
     sup: Option<Supplicant>,
+    /// 802.11w host state (software BIP keys, management PNs, SA Query).
+    mfp: MfpState,
 }
 
 /// What `__cfg80211_disconnected` reports to nl80211 for a lost or
@@ -758,6 +769,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             mlme_target: None,
             disconnect: None,
             sup: None,
+            mfp: MfpState::default(),
         }
     }
 
@@ -898,7 +910,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                         step::LINK_DEAUTH_RX,
                         ((deauth as u32) << 16) | reason as u32,
                     ),
-                    LinkLoss::Supplicant { detail, .. } => (step::EAPOL_GTK, detail),
+                    LinkLoss::Supplicant { step, detail, .. } => (step, detail),
                 };
                 MacError::new(s, d, errno::ENOLINK).report("link");
                 // __ieee80211_disconnect: WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY;
@@ -917,91 +929,14 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         loss
     }
 
-    /// EAPOL received after the association completed: wpa_supplicant's
-    /// `wpa_supplicant_rx_eapol` → `wpa_sm_rx_eapol` for the Group Key
-    /// Handshake ([`Supplicant::process_group_m1`]: replay / MIC / key
-    /// data checks, `wpa_supplicant_process_1_of_2`), the new GTK
-    /// installed with its key index (`ath11k_mac_op_set_key(SET_KEY,
-    /// group)` → `ath11k_install_key(WMI_KEY_GROUP)` + the PN config) and
-    /// message 2/2 sent. Frames whose source is not the AP are not
-    /// processed (wpa_supplicant delays them once the authenticator was
-    /// seen to use the BSSID: `last_eapol_matches_bssid`); without RSN
-    /// (`key_mgmt == NONE`) EAPOL is ignored. A failed handshake
-    /// deauthenticates with `WLAN_REASON_UNSPECIFIED`
-    /// ([`LinkLoss::Supplicant`]). PMF is not negotiated (`sta.mfp` is
-    /// false), so an IGTK KDE is ignored, as `ieee80211w_set_keys`.
-    async fn rx_eapol(&mut self) {
-        while let Some(eth) = self.dp.recv_eapol(0).await {
-            let Some(l) = self.link.as_ref() else {
-                continue;
-            };
-            if !l.authorized || l.loss.is_some() || self.sup.is_none() {
-                continue;
-            }
-            let aa = l.bss.bssid;
-            let Some((src, pdu)) = frame::parse_eapol_eth(&eth) else {
-                continue;
-            };
-            if src != aa {
-                continue;
-            }
-            // PSK: 16-byte MIC; CCMP-128 group cipher (`connect` accepts
-            // no other).
-            let r = self
-                .sup
-                .as_mut()
-                .unwrap()
-                .process_group_m1(pdu, 16, 16, None);
-            let m1 = match r {
-                Ok(m) => m,
-                // "goto out": dropped, the association stays.
-                Err(GroupKeyError::Drop(_)) => continue,
-                Err(GroupKeyError::Fail(f)) => {
-                    let n = match f {
-                        GroupKeyFail::Before4Way => 1,
-                        GroupKeyFail::KeyData => 2,
-                        GroupKeyFail::GtkUnencrypted => 3,
-                        GroupKeyFail::NoGtk => 4,
-                        GroupKeyFail::GtkKdeLength => 5,
-                        GroupKeyFail::GtkCipherLength => 6,
-                    };
-                    self.supplicant_deauth(0x100 | n);
-                    return;
-                }
-            };
-            if let Some(g) = m1.gtk.as_ref() {
-                // wpa_supplicant_install_gtk → wpa_sm_set_key(GROUP_RX).
-                if self.install_key(aa, g.key_id, &g.key, false).await.is_err() {
-                    self.supplicant_deauth(0x200);
-                    return;
-                }
-                if let Some(s) = self.sup.as_mut() {
-                    s.group_keys_installed(Some(&g.key), None);
-                }
-                if let Some(l) = self.link.as_mut() {
-                    l.gtk_idx = Some(g.key_id);
-                }
-            }
-            let own = self.caps.mac_addr;
-            if self
-                .dp
-                .send_eth(&frame::eapol_eth(&aa, &own, &m1.reply))
-                .await
-                .is_err()
-            {
-                self.supplicant_deauth(0x300);
-                return;
-            }
-        }
-    }
-
     /// `wpa_sm_deauthenticate(sm, WLAN_REASON_UNSPECIFIED)`: the link is
     /// torn down by [`Mac::poll`] with that reason.
-    fn supplicant_deauth(&mut self, detail: u32) {
+    fn supplicant_deauth(&mut self, step: u32, detail: u32) {
         if let Some(l) = self.link.as_mut() {
             if l.loss.is_none() {
                 l.loss = Some(LinkLoss::Supplicant {
                     reason: frame::WLAN_REASON_UNSPECIFIED,
+                    step,
                     detail,
                 });
             }
@@ -1149,7 +1084,8 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         let Some(vdev_id) = self.vif.as_ref().map(|v| v.vdev_id) else {
             return;
         };
-        let _ = self.wmi.mgmt_tx(vdev_id, f).await;
+        let f = self.mfp_tx(f);
+        let _ = self.wmi.mgmt_tx(vdev_id, &f).await;
     }
 
     /// `ath11k_wmi_tlv_op_rx` for the events the mac layer owns.
@@ -1249,6 +1185,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
     /// true)` → `ath11k_regd_update_chan_list_work`.
     async fn run_deferred(&mut self) {
         self.process_back().await;
+        self.mfp_deferred().await;
         if let Some(cc) = self.pending.new_alpha2.take() {
             self.alpha2 = cc;
             let c = set_current_country_cmd(self.caps.pdev_id, [cc[0], cc[1], 0]);
@@ -1717,6 +1654,20 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             return;
         };
         let own = self.caps.mac_addr;
+        // 802.11w (ieee80211_rx_h_decrypt / ieee80211_drop_unencrypted_mgmt)
+        // for robust frames from our AP.
+        let mut plain = None;
+        if matches!(
+            stype,
+            frame::stype::DEAUTH | frame::stype::DISASSOC | frame::stype::ACTION
+        ) {
+            match self.mfp_rx_filter(m.frame) {
+                Some(MfpRx::Drop { .. }) => return,
+                Some(MfpRx::Pass(p)) => plain = p,
+                None => {}
+            }
+        }
+        let f: &[u8] = plain.as_deref().unwrap_or(m.frame);
         match stype {
             frame::stype::BEACON | frame::stype::PROBE_RESP => {
                 let Some(b) = frame::parse_beacon(m.frame) else {
@@ -1750,10 +1701,15 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                 // station entry (`sta_info_get_bss(sdata, mgmt->sa)`), to
                 // us; the action code present and its fixed fields long
                 // enough, else "invalid".
-                let f = m.frame;
                 let Some(l) = self.link.as_ref() else {
                     return;
                 };
+                if f.len() >= frame::IEEE80211_MIN_ACTION_SIZE + 3
+                    && f[frame::MGMT_HDR_LEN] == sec::WLAN_CATEGORY_SA_QUERY
+                {
+                    self.sa_query_rx(f);
+                    return;
+                }
                 if hdr.sa != l.bss.bssid
                     || hdr.da != own
                     || f.len() < frame::IEEE80211_MIN_ACTION_SIZE + 1
@@ -1772,9 +1728,11 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                 }
             }
             frame::stype::DEAUTH | frame::stype::DISASSOC => {
-                if let Some((h, deauth, reason)) = frame::parse_deauth_disassoc(m.frame) {
+                if let Some((h, deauth, reason)) = frame::parse_deauth_disassoc(f) {
                     if let Some(l) = self.link.as_mut() {
-                        if h.bssid == l.bss.bssid && h.da == own && l.loss.is_none() {
+                        // To us or group addressed (ieee80211_accept_frame).
+                        let to_us = h.da == own || h.da[0] & 1 != 0;
+                        if h.bssid == l.bss.bssid && to_us && l.loss.is_none() {
                             l.loss = Some(LinkLoss::Deauth { deauth, reason });
                         }
                     }
@@ -2149,55 +2107,32 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             );
         };
         let ies = bss.parsed();
-        let psk = match &req.security {
-            SecurityConfig::Open => {
-                if ies.rsn.is_some() || ies.wpa.is_some() || bss.capability & capab::PRIVACY != 0 {
-                    return fail(
-                        step::CONNECT_UNSUPPORTED,
-                        1,
-                        errno::EOPNOTSUPP,
-                        "connect (open to a protected BSS)",
-                    );
-                }
-                None
-            }
-            SecurityConfig::Wpa2 { psk } => {
-                let ok = ies
-                    .rsn
-                    .as_deref()
-                    .and_then(RsnIe::decode_body)
-                    .is_some_and(|r| {
-                        let ccmp = Suite::standard(rsn::CIPHER_CCMP_128);
-                        r.group_cipher == ccmp
-                            && r.pairwise_ciphers.contains(&ccmp)
-                            && r.akms.contains(&Suite::standard(rsn::AKM_PSK))
-                            && r.rsn_capabilities & rsn::RSN_CAP_MFP_REQUIRED == 0
-                    });
-                if !ok {
-                    return fail(
-                        step::CONNECT_UNSUPPORTED,
-                        2,
-                        errno::EOPNOTSUPP,
-                        "connect (RSN: need CCMP + PSK)",
-                    );
-                }
-                Some(*psk)
-            }
-            SecurityConfig::Wpa3 { .. } => {
+        // wpa_supplicant_set_suites (AKM, ciphers, PMF).
+        let rsn = match sec::select_rsn(&ies, bss.capability, &req.security) {
+            Ok(r) => r,
+            Err(d) => {
                 return fail(
                     step::CONNECT_UNSUPPORTED,
-                    3,
+                    d,
                     errno::EOPNOTSUPP,
-                    "connect (SAE not implemented)",
-                );
+                    "connect (security)",
+                )
             }
         };
+        if matches!(rsn, Some((_, Credential::Sae(_)))) {
+            return fail(
+                step::CONNECT_UNSUPPORTED,
+                sec::refuse::NO_SAE,
+                errno::EOPNOTSUPP,
+                "connect (SAE not implemented)",
+            );
+        }
         if self.scan.state != ScanState::Idle {
             // ieee80211_prep_connection: "Cancel scan to ensure that
             // nothing interferes with connection".
             self.scan_abort().await;
         }
-        let r = self.join(&bss, &ies, &req.ssid, psk).await;
+        let r = self.join(&bss, &ies, &req.ssid, rsn).await;
         if r.is_err() {
             let (assoc, reason) = self
                 .link
@@ -2213,7 +2148,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         bss: &ScanBss,
         ies: &ParsedIes,
         ssid: &[u8],
-        psk: Option<[u8; 32]>,
+        rsn: Option<(RsnPlan, Credential)>,
     ) -> Result<(), MacError> {
         let vdev_id = self.vif.as_ref().unwrap().vdev_id;
         let band = freq_band(bss.freq);
@@ -2261,7 +2196,9 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             deauth_reason: frame::WLAN_REASON_DEAUTH_LEAVING,
             ba_rx_valid: 0,
             ba_rx_token: [0; 16],
+            rsn: rsn.as_ref().map(|(p, _)| p.clone()),
         });
+        self.mfp = MfpState::default();
         // ── ieee80211_prep_connection ──
         // ieee80211_link_use_channel → ath11k_mac_op_assign_vif_chanctx
         self.vif.as_mut().unwrap().chanctx = Some(def);
@@ -2300,8 +2237,9 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         self.mlme_target = Some(bss.bssid);
         self.authenticate(bss.bssid).await?;
         // ── ieee80211_mgd_assoc ──
-        let resp = self.associate_frames(bss, ies, ssid, psk.is_some()).await?;
-        if psk.is_none() {
+        let plan = rsn.as_ref().map(|(p, _)| p.clone());
+        let resp = self.associate_frames(bss, ies, ssid, plan.as_ref()).await?;
+        if rsn.is_none() {
             // !IEEE80211_STA_CONTROL_PORT: ieee80211_assoc_success moves the
             // AP to AUTHORIZED before BSS_CHANGED_ASSOC (ath11k only sets
             // peer->is_authorized; ath11k_bss_assoc then authorizes).
@@ -2309,8 +2247,12 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         }
         self.assoc_success(bss, ies, &resp).await?;
         // ── wpa_supplicant ──
-        if let Some(pmk) = psk {
-            self.four_way(bss, ies, &pmk).await?;
+        if let Some((plan, cred)) = rsn {
+            let pmk = match cred {
+                Credential::Pmk(p) => p,
+                Credential::Sae(_) => unreachable!("refused above"),
+            };
+            self.rsna_4way(bss, &plan, &pmk).await?;
         }
         self.authorize().await?;
         self.setup_ps().await;
@@ -2518,7 +2460,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         bss: &ScanBss,
         ies: &ParsedIes,
         ssid: &[u8],
-        wpa2: bool,
+        rsn: Option<&RsnPlan>,
     ) -> frame::AssocReqParams {
         let band = freq_band(bss.freq);
         let def = self.link.as_ref().map_or(
@@ -2583,12 +2525,11 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             (true, Some(own), Some(ap)) => Some(peer::assoc_vht_cap(own, ap)),
             _ => None,
         };
+        // The SME's elements (wpa_supplicant `sme.assoc_req_ie`): RSNE,
+        // then the RSNXE (it sorts after HE in ieee80211_send_assoc).
         let mut extra = Vec::new();
-        if wpa2 {
-            let body = sta_rsn_ie(ies);
-            extra.push(eid::RSN);
-            extra.push(body.len() as u8);
-            extra.extend_from_slice(&body);
+        if let Some(p) = rsn {
+            extra.extend_from_slice(&sec::assoc_ies(p, &bss.ies));
         }
         frame::AssocReqParams {
             own: self.caps.mac_addr,
@@ -2614,9 +2555,9 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         bss: &ScanBss,
         ies: &ParsedIes,
         ssid: &[u8],
-        wpa2: bool,
+        rsn: Option<&RsnPlan>,
     ) -> Result<Vec<u8>, MacError> {
-        let p = self.assoc_request_params(bss, ies, ssid, wpa2);
+        let p = self.assoc_request_params(bss, ies, ssid, rsn);
         let f = frame::build_assoc_req(&p);
         let resp = self
             .mlme_exchange(&f, step::ASSOC_TX, step::ASSOC_TIMEOUT, "associate", |r| {
@@ -2676,7 +2617,8 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         sta.bandwidth = Some(peer::sta_bandwidth(&sta.ht_cap, &sta.vht_cap, &l.def));
         sta.rx_nss = peer::sta_rx_nss(&sta.ht_cap, &sta.vht_cap);
         sta.wme = rie.wmm_param.is_some();
-        sta.mfp = false;
+        // ieee80211_assoc_success: WLAN_STA_MFP from assoc_data->use_mfp.
+        sta.mfp = l.rsn.as_ref().is_some_and(|r| r.mfp);
         self.dp.set_sta_wme(bss.bssid, sta.wme);
         {
             let lk = self.link.as_mut().unwrap();
@@ -2815,169 +2757,6 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         Ok(())
     }
 
-    /// The supplicant side of the 4-way handshake (wpa_supplicant
-    /// `wpa_supplicant_process_1_of_4` / `_3_of_4`), then the PTK and
-    /// GTK installs mac80211 forwards to `ath11k_mac_op_set_key`.
-    async fn four_way(
-        &mut self,
-        bss: &ScanBss,
-        ies: &ParsedIes,
-        pmk: &[u8; 32],
-    ) -> Result<(), MacError> {
-        let own = self.caps.mac_addr;
-        let aa = bss.bssid;
-        let mut snonce = [0u8; 32];
-        self.wmi.random_bytes(&mut snonce);
-        let mut sup = Supplicant::new(aa, own, snonce);
-        let our_rsn = {
-            let b = sta_rsn_ie(ies);
-            let mut v = alloc::vec![eid::RSN, b.len() as u8];
-            v.extend_from_slice(&b);
-            v
-        };
-        let ap_rsn = {
-            let b = ies.rsn.clone().unwrap_or_default();
-            let mut v = alloc::vec![eid::RSN, b.len() as u8];
-            v.extend_from_slice(&b);
-            v
-        };
-        let deadline = self.wmi.now_ms() + timeout::EAPOL as u64;
-        let mut mic_failures = 0u32;
-        let gtk: (u8, Vec<u8>) = loop {
-            // WMI events (kickout, deauth) can end the attempt.
-            while let Some(ev) = self.wmi.next_event(0).await {
-                self.handle_event(&ev);
-            }
-            if let Some(loss) = self.link.as_ref().and_then(|l| l.loss) {
-                let d = match loss {
-                    LinkLoss::Deauth { reason, .. } => reason as u32,
-                    _ => 0xFFFF,
-                };
-                return fail(
-                    step::EAPOL_PROTO,
-                    0x1_0000 | d,
-                    errno::ENOLINK,
-                    "4-way (link lost)",
-                );
-            }
-            let now = self.wmi.now_ms();
-            if now >= deadline {
-                let (s, what) = if mic_failures > 0 {
-                    (step::EAPOL_MIC, "4-way (MIC failure)")
-                } else {
-                    (step::EAPOL_TIMEOUT, "4-way (timeout)")
-                };
-                return fail(s, sup.state as u32, errno::ETIMEDOUT, what);
-            }
-            let slice = ((deadline - now) as u32).min(50);
-            let Some(eth) = self.dp.recv_eapol(slice).await else {
-                continue;
-            };
-            let Some((src, pdu)) = frame::parse_eapol_eth(&eth) else {
-                continue;
-            };
-            if src != aa || pdu.len() < 4 + 95 || pdu[1] != 3 {
-                continue;
-            }
-            let Some(key) = KeyFrame::decode(&pdu[4..], 16) else {
-                continue;
-            };
-            let ver = key.key_information & 0x7;
-            if ver != narf_wireless::eapol::KI_VERSION_HMAC_SHA1_AES {
-                continue;
-            }
-            // A retransmitted M1 while waiting for M3 restarts the exchange.
-            if key.key_ack()
-                && !key.has_mic()
-                && sup.state == narf_wireless::eapol::FourWayState::WaitM3
-            {
-                sup = Supplicant::new(aa, own, snonce);
-            }
-            match sup.state {
-                narf_wireless::eapol::FourWayState::WaitM1 => {
-                    let Ok(Some(mut m2)) = sup.handle(&HmacSha1, pmk, 16, &key) else {
-                        return fail(step::EAPOL_PROTO, 1, errno::EPROTO, "4-way (bad M1)");
-                    };
-                    m2.key_data = our_rsn.clone();
-                    let mut bytes = m2.into_eapol();
-                    let kck = sup.ptk.as_ref().unwrap().kck.clone();
-                    let mic = eapol_mic(&kck, &bytes);
-                    bytes[EAPOL_MIC_OFFSET..EAPOL_MIC_OFFSET + 16].copy_from_slice(&mic);
-                    if let Err(e) = self.dp.send_eth(&frame::eapol_eth(&aa, &own, &bytes)).await {
-                        return fail(step::EAPOL_PROTO, 2, e, "4-way (M2 TX)");
-                    }
-                }
-                narf_wireless::eapol::FourWayState::WaitM3 => {
-                    let kck = sup.ptk.as_ref().unwrap().kck.clone();
-                    let mut zeroed = pdu.to_vec();
-                    zeroed[EAPOL_MIC_OFFSET..EAPOL_MIC_OFFSET + 16].fill(0);
-                    if !key.has_mic()
-                        || pdu[EAPOL_MIC_OFFSET..EAPOL_MIC_OFFSET + 16] != eapol_mic(&kck, &zeroed)
-                    {
-                        // wpa_supplicant drops the frame and keeps waiting.
-                        mic_failures += 1;
-                        continue;
-                    }
-                    if key.key_information & narf_wireless::eapol::KI_ENCRYPTED_KEY_DATA == 0 {
-                        return fail(
-                            step::EAPOL_PROTO,
-                            3,
-                            errno::EPROTO,
-                            "4-way (M3 key data not encrypted)",
-                        );
-                    }
-                    let mut kek = [0u8; 16];
-                    kek.copy_from_slice(&sup.ptk.as_ref().unwrap().kek);
-                    let Some(clear) = crate::iwlwifi::rekey::aes_key_unwrap(&kek, &key.key_data)
-                    else {
-                        return fail(step::EAPOL_GTK, 1, errno::EPROTO, "4-way (key data unwrap)");
-                    };
-                    // "IE in 3/4 msg does not match with IE in Beacon/ProbeResp"
-                    let m3_rsn = frame::find_elem(&clear, eid::RSN);
-                    if m3_rsn != Some(&ap_rsn[2..]) {
-                        self.link.as_mut().unwrap().deauth_reason = frame::WLAN_REASON_IE_DIFFERENT;
-                        return fail(
-                            step::EAPOL_PROTO,
-                            4,
-                            errno::EPROTO,
-                            "4-way (M3 RSN IE mismatch)",
-                        );
-                    }
-                    let Some(g) = crate::iwlwifi::rekey::parse_gtk_kde(&clear) else {
-                        return fail(step::EAPOL_GTK, 2, errno::EPROTO, "4-way (no GTK KDE)");
-                    };
-                    if g.gtk.len() != 16 {
-                        return fail(step::EAPOL_GTK, 3, errno::EPROTO, "4-way (GTK)");
-                    }
-                    let m4 = match sup.handle(&HmacSha1, pmk, 16, &key) {
-                        Ok(Some(m)) => m,
-                        _ => return fail(step::EAPOL_PROTO, 5, errno::EPROTO, "4-way (bad M3)"),
-                    };
-                    let mut bytes = m4.into_eapol();
-                    let mic = eapol_mic(&kck, &bytes);
-                    bytes[EAPOL_MIC_OFFSET..EAPOL_MIC_OFFSET + 16].copy_from_slice(&mic);
-                    if let Err(e) = self.dp.send_eth(&frame::eapol_eth(&aa, &own, &bytes)).await {
-                        return fail(step::EAPOL_PROTO, 6, e, "4-way (M4 TX)");
-                    }
-                    break (g.key_id, g.gtk);
-                }
-                _ => {}
-            }
-        };
-        // wpa_supplicant_install_ptk, then the GTK.
-        let tk = sup.ptk.as_ref().unwrap().tk.clone();
-        self.install_key(aa, 0, &tk, true).await?;
-        self.link.as_mut().unwrap().ptk_installed = true;
-        let (gidx, gk) = gtk;
-        self.install_key(aa, gidx, &gk, false).await?;
-        self.link.as_mut().unwrap().gtk_idx = Some(gidx);
-        // wpa_supplicant_install_gtk records sm->gtk; the supplicant
-        // stays for the Group Key Handshake.
-        sup.group_keys_installed(Some(&gk), None);
-        self.sup = Some(sup);
-        Ok(())
-    }
-
     /// `ath11k_mac_op_set_key(SET_KEY, CCMP)` → `ath11k_install_key` +
     /// `ath11k_dp_peer_rx_pn_replay_config`.
     async fn install_key(
@@ -3103,6 +2882,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
     async fn send_deauth_frame(&mut self, bssid: [u8; 6], reason: u16) -> Result<(), MacError> {
         let vdev_id = self.vif.as_ref().unwrap().vdev_id;
         let f = frame::build_deauth(&self.caps.mac_addr, &bssid, reason);
+        let f = self.mfp_tx(&f);
         match self.wmi.mgmt_tx(vdev_id, &f).await {
             Ok(desc) => {
                 let done = self
@@ -3222,6 +3002,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         self.link = None;
         self.mlme_target = None;
         self.sup = None;
+        self.mfp = MfpState::default();
     }
 
     /// `ath11k_mac_vdev_stop`.
@@ -3294,22 +3075,6 @@ pub fn channel_number_freq(ch: u32) -> Option<u32> {
         32..=177 => Some(5000 + 5 * ch),
         _ => None,
     }
-}
-
-/// Our RSN element body for a WPA2-PSK association: version 1, the
-/// AP's group cipher, CCMP pairwise, PSK AKM, capabilities 0 (no PMF),
-/// as wpa_supplicant builds it with `pmf=0`.
-pub fn sta_rsn_ie(ap: &ParsedIes) -> Vec<u8> {
-    let group = ap
-        .rsn
-        .as_deref()
-        .and_then(RsnIe::decode_body)
-        .map_or(Suite::standard(rsn::CIPHER_CCMP_128), |r| r.group_cipher);
-    RsnIe {
-        group_cipher: group,
-        ..RsnIe::wpa2_psk_ccmp()
-    }
-    .encode_body()
 }
 
 /// `struct ieee80211_tx_queue_params`.

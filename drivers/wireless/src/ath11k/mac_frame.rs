@@ -50,6 +50,7 @@ pub mod eid {
     pub const VHT_OPERATION: u8 = 192;
     pub const OPMODE_NOTIF: u8 = 199;
     pub const VENDOR_SPECIFIC: u8 = 221;
+    pub const RSNX: u8 = 244;
     pub const EXTENSION: u8 = 255;
 }
 
@@ -418,6 +419,8 @@ pub struct ParsedIes {
     pub vht_oper: Option<VhtOperIe>,
     /// RSN element body.
     pub rsn: Option<Vec<u8>>,
+    /// RSNXE (`WLAN_EID_RSNX`, 244) body.
+    pub rsnxe: Option<Vec<u8>>,
     /// WPA (Microsoft OUI type 1) vendor element body.
     pub wpa: Option<Vec<u8>>,
     pub wmm_param: Option<WmmParam>,
@@ -461,6 +464,7 @@ impl ParsedIes {
                 eid::VHT_CAPABILITY if p.vht_cap.is_none() => p.vht_cap = VhtCapIe::parse(e.data),
                 eid::VHT_OPERATION if p.vht_oper.is_none() => p.vht_oper = VhtOperIe::parse(e.data),
                 eid::RSN if p.rsn.is_none() => p.rsn = Some(e.data.to_vec()),
+                eid::RSNX if p.rsnxe.is_none() => p.rsnxe = Some(e.data.to_vec()),
                 eid::VENDOR_SPECIFIC if e.data.len() >= 4 && e.data[0..3] == OUI_MICROSOFT => {
                     match e.data[3] {
                         OUI_TYPE_MICROSOFT_WPA if p.wpa.is_none() => p.wpa = Some(e.data.to_vec()),

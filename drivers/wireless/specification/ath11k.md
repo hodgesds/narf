@@ -673,7 +673,42 @@ updates), `handle_event(frame)`, `connected_bssid()`.
   `step::EAPOL_GTK` detail `0x101..0x106` / `0x200` / `0x300` and
   deauthenticates with reason 1 (`wpa_sm_deauthenticate`,
   `LinkLoss::Supplicant`).
-- Diagnostics: `mac::step` 150–199, one console line per failure;
+- RSN selection + 4-way (`mac/sec.rs`, wpa_supplicant
+  `wpa_supplicant_set_suites` / `wpa_gen_wpa_ie_rsn` / `wpa_sm_rx_eapol`):
+  `SecurityConfig::Wpa2 { psk }` picks PSK-SHA256 (AKM 6) over PSK (2),
+  `Wpa3 { password }` picks SAE (8); CCMP-128 group + pairwise only. PMF
+  policy = NetworkManager's: optional for PSK (our RSNE always has MFPC),
+  required for SAE (MFPC | MFPR); MFP is used when the AP has MFPC and
+  BIP-CMAC-128 (default or explicit), refused when the AP or SAE require
+  it and it is impossible (`step::CONNECT_UNSUPPORTED` detail 4). Our RSNE:
+  `rsn_supp_capab` (16 PTKSA replay counters when the BSS has a WMM
+  element, MFPC / MFPR) + PMKID count 0 + BIP-CMAC-128 when MFP. The
+  4-way runs on `narf_wireless::eapol::Supplicant::rx_eapol` (AKM-aware
+  PTK / MIC / descriptor version, RSNE / RSNXE checks with reason 17), then
+  PTK, GTK (WMI) and IGTK (software). `sta->mfp` → `WMI_PEER_PMF` in
+  PEER_ASSOC (`ath11k_peer_assoc_h_crypto`; the vdev-start PMF flag stays
+  clear, as ath11k leaves `arg.pmf_enabled` unset for a STA).
+- PMF / 802.11w (`MfpState`): ath11k returns 1 from `ath11k_mac_op_set_key`
+  for AES-CMAC, so BIP is mac80211 software on WCN6855 too: the IGTK (M3 /
+  Group 1/2, IPN as `rx_pn`) never reaches the firmware. Receive (from the
+  AP while `sta->mfp`, `ieee80211_rx_h_decrypt` + `ieee80211_drop_unencrypted_mgmt`):
+  group-addressed robust frames need a BIP-CMAC-128 MMIE (key 4 / 5, IPN >
+  rx_pn, 64-bit MIC) and lose it; unicast protected ones come decrypted by
+  the firmware with CCMP header + MIC (`ath11k_mgmt_rx_event`) and are
+  replay-checked on the PTK's management PN, then stripped; unprotected
+  unicast robust frames are dropped, except deauth / disassoc before a GTK
+  exists ("Permit unprotected deauth/disassoc frames during 4-way-HS").
+  Transmit: unicast robust frames (deauth, BACK, SA Query) get the host
+  CCMP header (`GENERATE_IV_MGMT`, PN = ++tx_pn, key 0), the Protected bit
+  and the 8-byte MIC tail `ath11k_mac_mgmt_tx_wmi` reserves. SA Query: AP
+  Requests answered (`ieee80211_process_sa_query_req`); an unprotected
+  deauth / disassoc with reason 6 / 7 while authorized starts
+  wpa_supplicant's SA Query (`sme_event_unprot_disconnect`, ≤ 1 per 10 s,
+  a Request every 201 TU, > 1000 TU unanswered → deauth reason 2,
+  `step::SA_QUERY_TIMEOUT` detail = Requests). A group-addressed
+  deauth / disassoc from the AP is accepted like a unicast one
+  (`ieee80211_accept_frame`).
+- Diagnostics: `mac::step` 150–199 and 270–299, one console line per failure;
   stage `scan` on a scan / link loss, `connected` after authorization.
 - `wmi.rs` additions: `scan_prob_req_oui_cmd`,
   `dfs_phyerr_offload_enable_cmd`, `pdev_lro_cfg_cmd`,
@@ -1096,6 +1131,7 @@ operations refused) and the reset gate.
   | 220–229 | `htt` |
   | 230–249 | `dp_peer` (REO queues / commands) |
   | 250–269 | `runtime` (DP hooks / IRQs, mac registration, netdev) |
+  | 270–299 | `mac` security / HE additions (`mac/sec.rs`, `mac/sae.rs`, `mac/he.rs`) |
 
 - The PCI table is exactly Linux's `ath11k_pci_id_table`.
 - The driver never reports a wireless capability it does not have:
@@ -1331,12 +1367,12 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   round robin and fq_codel (one station; the AC order and stop reasons are
   Linux's), no A-MSDU / fast-xmit header cache; no PTK rekey (a pairwise
   EAPOL-Key after the handshake is dropped; wpa_supplicant would run a
-  new 4-way handshake); PMF is not negotiated, so an IGTK KDE in a Group
-  Key message is ignored (`ieee80211w_set_keys`; ath11k would leave BIP
-  to mac80211's software crypto anyway); EAPOL frames the station sends
-  carry 802.1X version 3 for the 4-way handshake (the shared supplicant)
-  and version 1 for Group Key 2/2 (wpa_supplicant's
-  `DEFAULT_EAPOL_VERSION`).
+  new 4-way handshake); EAPOL frames carry 802.1X version 1
+  (wpa_supplicant's `DEFAULT_EAPOL_VERSION`); PMF policy is optional for
+  PSK (NetworkManager / iwd; standalone wpa_supplicant defaults to
+  `pmf=0`); only BIP-CMAC-128 (no BIP-GMAC / CMAC-256), no beacon
+  protection (BIGTK), no OCV; a group-addressed robust frame naming an
+  IGTK index we do not hold is dropped.
 - Control path: userspace drives the station over nl80211 with Linux's
   permission model (`wireless/` spec §3.4). `iw dev wlan0 scan` / `link`
   / `connect <open ssid>` work for a CAP_NET_ADMIN sender; wpa_supplicant
@@ -1424,8 +1460,9 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   element (wpa_supplicant also adds Extended Capabilities); no Country /
   Power Constraint handling (`ap_power_level`), no TPC / 6 GHz power
   envelope, no HE txbf / BSS colour / TWT; association comeback
-  (status 30) is a reject; WPA3-SAE, PMF/BIP, PTK rekey, roaming,
+  (status 30) is a reject; PTK rekey, roaming,
   GTK rekey offload and CSA are not implemented; kickout is treated as
   link loss (Linux reports low-ack to userspace); deauth reason after a
-  failed 4-way is 3 (17 for an RSN mismatch); the 11d "fin" path and the
+  4-way timeout is 3, after a failed message 3/4 1 (17 for an RSNE / RSNXE
+  mismatch); the 11d "fin" path and the
   6 GHz LPI re-handling follow Linux but are untested on hardware.
