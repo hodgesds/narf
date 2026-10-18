@@ -45,6 +45,10 @@ use super::mac_frame::{self as frame, freq_band, Band};
 use super::mac_reg::chan_flag;
 use super::runtime::{DpIrq, Port, RtIo, RtQmi, Shared};
 
+/// Frames the TX pump takes off the stack's ring per runtime step
+/// (`NAPI_POLL_WEIGHT`).
+pub const TX_PUMP_BATCH: usize = 64;
+
 /// The mac layer over the runtime ports.
 pub type RtMac<Io, Irq, Q> = Mac<Port<Io, Irq, Q>, Port<Io, Irq, Q>>;
 
@@ -238,11 +242,12 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         }
     }
 
-    /// Transmit one frame taken from the TX ring. A checksum request
-    /// (`TxMeta::csum_l4`, Linux `CHECKSUM_PARTIAL`) is validated and its
-    /// seed written ([`super::tx_offload::csum_partial_prepare`]); one the
-    /// hardware cannot complete is dropped, never sent half-checksummed.
-    pub async fn tx_one(&self, frame: &Frame) -> Result<u32, i32> {
+    /// A frame taken from the TX ring, ready for the TXQs: a checksum
+    /// request (`TxMeta::csum_l4`, Linux `CHECKSUM_PARTIAL`) is validated
+    /// and its seed written ([`super::tx_offload::csum_partial_prepare`]);
+    /// one the hardware cannot complete is dropped, never sent
+    /// half-checksummed.
+    fn tx_prepare(&self, frame: &Frame) -> Result<(Vec<u8>, bool), i32> {
         let meta = frame.tx_meta();
         if meta.tso_mss.is_some() || meta.vlan_tag.is_some() {
             self.stats
@@ -261,17 +266,57 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
                 return Err(e);
             }
         }
-        let r = self.shared.tx_data(&eth, meta.csum_l4.is_some()).await;
-        if r.is_err() {
-            self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
-        }
-        r
+        Ok((eth, meta.csum_l4.is_some()))
     }
 
-    /// The TX pump task.
+    /// Hand frames taken from the TX ring to the runtime's per-AC TXQs
+    /// (one lock hold; [`super::txq`]); each frame's result.
+    pub async fn tx_batch(&self, frames: &[Frame]) -> Vec<Result<(), i32>> {
+        let mut out: Vec<Result<(), i32>> = Vec::with_capacity(frames.len());
+        let mut ok = Vec::with_capacity(frames.len());
+        for f in frames {
+            match self.tx_prepare(f) {
+                Ok(p) => {
+                    ok.push(p);
+                    out.push(Ok(()));
+                }
+                Err(e) => out.push(Err(e)),
+            }
+        }
+        if ok.is_empty() {
+            return out;
+        }
+        let mut res = self.shared.tx_frames(ok).await.into_iter();
+        for r in out.iter_mut().filter(|r| r.is_ok()) {
+            *r = res.next().unwrap_or(Err(super::runtime::EIO));
+            if r.is_err() {
+                self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        out
+    }
+
+    /// One frame through [`Self::tx_batch`].
+    pub async fn tx_one(&self, frame: &Frame) -> Result<(), i32> {
+        self.tx_batch(core::slice::from_ref(frame))
+            .await
+            .pop()
+            .unwrap_or(Err(super::runtime::EIO))
+    }
+
+    /// The TX pump task: wait for the stack's TX ring, take what is
+    /// queued (up to [`TX_PUMP_BATCH`]) and hand it to the TXQs in one
+    /// runtime step, so a backlog drains VO → BK ([`super::txq`]).
     pub async fn tx_pump(self: Arc<Self>, mut cons: Consumer<Frame, TX_RING_N>) {
-        while let Ok(frame) = cons.recv().await {
-            let _ = self.tx_one(&frame).await;
+        while let Ok(first) = cons.recv().await {
+            let mut batch = alloc::vec![first];
+            while batch.len() < TX_PUMP_BATCH {
+                match cons.try_recv() {
+                    Ok(Some(f)) => batch.push(f),
+                    _ => break,
+                }
+            }
+            let _ = self.tx_batch(&batch).await;
         }
     }
 
@@ -303,6 +348,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         if let Some(mut m) = self.mac.try_lock() {
             if m.poll().await.is_some() {
                 self.stats.link_losses.fetch_add(1, Ordering::Relaxed);
+                // ieee80211_set_disassoc → ieee80211_flush_queues(drop).
+                self.shared.lock().await.purge_txqs();
             }
             let linked = m.connected_bssid();
             drop(m);
@@ -423,6 +470,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
 
     async fn disassociate(&self) -> Result<(), WirelessError> {
         let mut m = self.mac.lock().await;
+        // ieee80211_set_disassoc: "drop any frame before deauth/disassoc".
+        if m.link().is_some() {
+            self.shared.flush_queues(true).await;
+        }
         let r = m.disassociate().await;
         drop(m);
         self.set_link(false, None, 0);

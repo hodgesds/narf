@@ -2025,3 +2025,192 @@ fn smoke_ath11k_int_tx_csum_offload() -> TestResult {
     })
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_tx_csum_offload);
+
+// ── per-AC TX queues ──────────────────────────────────────────────
+
+/// mac80211's TXQ rules on the pure queues: `vif->hw_queue[ac] = ac % 3`
+/// (`ath11k_mac_op_add_interface`), VO → BK service order, per-queue
+/// stop reasons (a queue runs only with none left), `fq` overlimit
+/// drops from the fattest queue's head, purge.
+fn smoke_ath11k_txq_queues() -> TestResult {
+    use super::tx_hdr::ac;
+    use super::txq::{hw_queue, reason, Queued, TxQueues};
+    let q = |b: u8| Queued {
+        eth: vec![b; 6],
+        csum_partial: false,
+    };
+    check(|| {
+        ensure!(
+            [
+                hw_queue(ac::VO),
+                hw_queue(ac::VI),
+                hw_queue(ac::BE),
+                hw_queue(ac::BK)
+            ] == [0, 1, 2, 0],
+            "hw_queue = ac % (ATH11K_HW_MAX_QUEUES - 1)"
+        );
+        ensure!(TxQueues::vif_queues() == 0b111, "vif queues 0..2");
+        let mut t = TxQueues::default();
+        for (a, b) in [
+            (ac::BK, 1),
+            (ac::BE, 2),
+            (ac::VI, 3),
+            (ac::VO, 4),
+            (ac::BE, 5),
+        ] {
+            ensure!(t.enqueue(a, q(b)).is_empty(), "under the fq limits");
+        }
+        let order: Vec<u8> = core::iter::from_fn(|| t.dequeue())
+            .map(|(_, f)| f.eth[0])
+            .collect();
+        ensure!(
+            order == [4, 3, 2, 5, 1],
+            "backlog drains VO, VI, BE (FIFO), BK"
+        );
+
+        // Hardware queue 0 (VO + BK) stopped by two reasons.
+        t.enqueue(ac::VO, q(1));
+        t.enqueue(ac::BK, q(2));
+        t.enqueue(ac::BE, q(3));
+        t.stop(1 << 0, reason::DRIVER);
+        t.stop(1 << 0, reason::FLUSH);
+        ensure!(
+            t.stop_reasons(0) == (1 << reason::DRIVER) | (1 << reason::FLUSH),
+            "two stop reasons on queue 0"
+        );
+        ensure!(
+            t.dequeue().map(|(a, f)| (a, f.eth[0])) == Some((ac::BE, 3)) && t.dequeue().is_none(),
+            "VO / BK held, BE flows"
+        );
+        t.wake(1 << 0, reason::FLUSH);
+        ensure!(t.dequeue().is_none(), "one reason left: still stopped");
+        t.wake(1 << 0, reason::DRIVER);
+        ensure!(
+            t.dequeue().map(|(a, _)| a) == Some(ac::VO)
+                && t.dequeue().map(|(a, _)| a) == Some(ac::BK),
+            "woken: VO then BK"
+        );
+
+        // fq_tin_enqueue overlimit (packets, then bytes).
+        let mut t = TxQueues::with_limits(3, 1 << 20);
+        t.enqueue(ac::BE, q(1));
+        t.enqueue(ac::BE, q(2));
+        t.enqueue(ac::VO, q(3));
+        let d = t.enqueue(ac::VI, q(4));
+        ensure!(
+            d.len() == 1 && d[0].eth[0] == 1 && t.backlog() == 3 && t.stats.overlimit == 1,
+            "over fq->limit: the fattest queue's head dropped"
+        );
+        let mut t = TxQueues::with_limits(100, 10);
+        t.enqueue(ac::BK, q(1));
+        let d = t.enqueue(ac::VO, q(2));
+        ensure!(
+            d.len() == 1 && t.backlog() == 1 && t.len(ac::VO) == 1,
+            "over memory_limit: dropped until it fits"
+        );
+        ensure!(
+            t.purge() == 1 && t.is_empty() && t.stats.purged == 1,
+            "purge"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_txq_queues);
+
+/// The TXQs on the fake device: frames reach TCL at once while the
+/// queues run; with the vif's hardware queues stopped (reason DRIVER, as
+/// `ath11k_core_pre_reconfigure_recovery`'s `ieee80211_stop_queues`) they
+/// wait, and the wake sends them VO, VI, BE, BK whatever the arrival
+/// order (TID 6, 4, 0, 1; descriptor pool = AC); one stopped hardware
+/// queue holds only its ACs; a dropping flush purges; frames for no
+/// station are refused.
+fn smoke_ath11k_int_tx_ac_priority() -> TestResult {
+    use super::txq::{reason, TxQueues};
+    check(|| {
+        let mut u = up(wpa2_cfg())?;
+        connect(&u)?;
+        let tcl = |u: &Up| {
+            pump(u, 1);
+            u.dev.st.borrow().tcl_tx.len()
+        };
+        let send = |u: &mut Up, tos: u8| -> R {
+            let eth = ipv4_frame(&GW, &OWN, tos, &[tos]);
+            ensure!(narf_net::iface::send_on(u.name, &eth).is_ok(), "send hook");
+            let fr = u.tx_cons.try_recv().ok().flatten().ok_or("TX ring")?;
+            ensure!(run(u.netdev.tx_one(&fr)).is_ok(), "queued");
+            Ok(())
+        };
+        // BK (CS1 → UP 1), BE (0), VI (CS4 → UP 4), VO (EF → UP 6).
+        let arrivals = [0x20u8, 0x00, 0x80, 0xb8];
+        let base = tcl(&u);
+        send(&mut u, 0x00)?;
+        ensure!(tcl(&u) == base + 1, "running queues: straight to TCL");
+
+        run(u.shared.lock()).stop_queues(TxQueues::vif_queues(), reason::DRIVER);
+        let base = tcl(&u);
+        for tos in arrivals {
+            send(&mut u, tos)?;
+        }
+        pump(&u, 2);
+        ensure!(tcl(&u) == base, "stopped: nothing reaches TCL");
+        ensure!(
+            run(u.shared.lock()).txq.backlog() == 4,
+            "four frames queued"
+        );
+        let sent = run(u.shared.lock()).wake_queues(TxQueues::vif_queues(), reason::DRIVER);
+        ensure!(sent == 4, "the wake pushes all four");
+        pump(&u, 2);
+        let st = u.dev.st.borrow();
+        let got: Vec<(u32, u32, u8)> = st.tcl_tx[base..]
+            .iter()
+            .map(|t| {
+                let id = (t.desc[2] >> 11) & 0x1f_ffff;
+                ((t.desc[5] >> 22) & 0xf, id >> 19, *t.frame.last().unwrap())
+            })
+            .collect();
+        ensure!(
+            got == [(6, 0, 0xb8), (4, 1, 0x80), (0, 2, 0x00), (1, 3, 0x20)],
+            "VO, VI, BE, BK: TID 6/4/0/1, pool = AC"
+        );
+        drop(st);
+
+        // Only hardware queue 2 (BE) stopped: VO passes, BE waits.
+        run(u.shared.lock()).stop_queues(1 << 2, reason::FLUSH);
+        let base = tcl(&u);
+        send(&mut u, 0x00)?;
+        send(&mut u, 0xb8)?;
+        ensure!(tcl(&u) == base + 1, "VO sent past the stopped BE queue");
+        run(u.shared.lock()).wake_queues(1 << 2, reason::FLUSH);
+        ensure!(tcl(&u) == base + 2, "BE sent on wake");
+
+        // A dropping flush purges what is queued.
+        run(u.shared.lock()).stop_queues(TxQueues::vif_queues(), reason::DRIVER);
+        send(&mut u, 0x00)?;
+        send(&mut u, 0x80)?;
+        run(u.shared.flush_queues(true));
+        let base = tcl(&u);
+        run(u.shared.lock()).wake_queues(TxQueues::vif_queues(), reason::DRIVER);
+        let after = tcl(&u);
+        let g = run(u.shared.lock());
+        ensure!(
+            after == base && g.txq.is_empty() && g.stats.tx_queue_dropped == 2,
+            "flush(drop): both purged, nothing sent"
+        );
+        drop(g);
+        // Non-dropping flush with nothing pending returns at once.
+        run(u.shared.flush_queues(false));
+        ensure!(
+            run(u.shared.lock()).txq.stop_reasons(0) == 0,
+            "flush leaves the queues running"
+        );
+
+        // No station: ieee80211_build_hdr refuses before the TXQ.
+        let (r, _, _, _) = latched(|| run(u.netdev.disassociate()));
+        ensure!(r.is_ok(), "disassociate");
+        let eth = ipv4_frame(&GW, &OWN, 0, &[1]);
+        let r = run(u.shared.tx_frames(vec![(eth, false)]));
+        ensure!(r == [Err(runtime::ENOTCONN)], "no station → ENOTCONN");
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_tx_ac_priority);

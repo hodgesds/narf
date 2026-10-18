@@ -740,6 +740,32 @@ UDP only, the net §3.2 contract). Golden: a `with_csum(Tcp)` IPv4 frame
 → TCL `info1 = 0x001f_0000 | len`, seed in the frame; plain → `info1 =
 len`.
 
+**TX queues** (`txq.rs`, mac80211's TXQs; Linux's mac80211 netdev has a
+single queue, `alloc_netdev_mqs(.., 1, 1)`, and queues per TXQ): the TX
+pump takes up to 64 frames off the stack's TX ring per runtime step;
+`Rt::tx_enqueue` drops a frame with no station (`ENOTCONN`, as
+`ieee80211_build_hdr`) and queues the rest on their AC
+(`ieee80211_select_queue` with the current `sta->sta.wme`; `fq` limits
+8192 packets / 16 MiB, overlimit drops the fattest queue's head);
+`Rt::tx_push` (`ieee80211_handle_wake_tx_queue`) hands frames to
+`Dp::tx` VO → VI → BE → BK, skipping ACs whose hardware queue
+(`vif->hw_queue[ac] = ac % 3`: VO / BK 0, VI 1, BE 2) has a stop reason
+(`enum queue_stop_reason` bits; `stop_queues` / `wake_queues` =
+`ieee80211_{stop,wake}_queues_by_reason`, a wake drains in AC order as
+`_ieee80211_wake_txqs`). A frame `Dp::tx` refuses (`-ENOSPC` IDR full,
+`-ENOMEM` TCL ring full) is dropped as `ath11k_mac_op_tx` →
+`ieee80211_free_txskb` does — ath11k never stops a queue on a full ring.
+`Shared::flush_queues(drop)` = `ieee80211_flush_queues` (stop FLUSH,
+purge when `drop`, else `ath11k_mac_flush_tx_complete`: ≤ 5 s for no
+pending data then management, wake); a disassociate flushes with drop
+before the deauth and link loss purges (`ieee80211_set_disassoc`). TCL
+ring selection is `ath11k_dp_tx`'s (`ring_selector` =
+`smp_processor_id()` → `current_cpu`, `tcl_ring_retry`); WCN6855's
+`tcl2wbm_rbm_map` (`ath11k_hw_hal_params_qca6390` → the ipq5018 map) has
+one TCL data ring (TCL 0 / WBM 0 / SW0), so every frame uses ring 0 and a
+full IDR fails at once (`ring_map == BIT(1) - 1`). The descriptor pool id
+is the AC.
+
 **Netdev** (`iface::Ath11kNetdev`): `narf_net::Interface` (name from
 `reserve_name("wlan%d")`, MAC from WMI READY, MTU 1500, `link_up` =
 associated + authorized, RX / TX frame rings) and
@@ -755,7 +781,7 @@ fatal), `narf_wireless::registry::register`, then two spawned tasks:
 the runtime loop (`service_once`: service + deliver RX to the RX ring and
 `on_rx_frame_from` outside every lock, `Mac::poll` when no control
 operation holds the mac layer → carrier off on link loss; sleep ≤ 10 ms
-on the device interrupts) and the TX pump (TX ring → `tx_data`). The
+on the device interrupts) and the TX pump (TX ring → TXQs → TCL). The
 stack's send hook only queues on the TX ring (sync, no runtime lock).
 Carrier changes go to `narf_net::iface::set_link_state` (+
 `nl80211::notify_disconnect` when going down).
@@ -1000,8 +1026,10 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   frames is hardware-only (Linux passes the same seed).
 - Integration deviations from Linux (deliberate): `ath11k_mac_op_start`
   + `add_interface` run at registration, not on `ip link set up`
-  (NARF's stack has no ndo_open hook for this driver); the netdev has
-  one TX queue (no per-AC queues, `IEEE80211_HW_QUEUE_CONTROL`), no A-MSDU / fast-xmit header cache, no TX status
+  (NARF's stack has no ndo_open hook for this driver); the TX
+  queues are one FIFO per AC, not one TXQ per TID with mac80211's airtime
+  round robin and fq_codel (one station; the AC order and stop reasons are
+  Linux's), no A-MSDU / fast-xmit header cache, no TX status
   reporting; ADDBA from the AP is not answered (no
   `ath11k_mac_op_ampdu_action`; the AP falls back to non-aggregated
   traffic, REO queues stay at BA window 1); management frames and data

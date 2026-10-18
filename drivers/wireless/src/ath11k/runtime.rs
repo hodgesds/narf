@@ -53,6 +53,7 @@ use super::hw::{MsiConfig, RingMask, ATH11K_EXT_IRQ_GRP_NUM_MAX};
 use super::mac::{DataPort, DeviceCaps, WmiPort};
 use super::power::ChipIo;
 use super::tx_hdr::{self, SeqState, StaTx};
+use super::txq::{self, Queued, TxQueues};
 use super::wmi::{self, ServiceReady, WmiCmd};
 
 /// Failing-step codes for the integration (250–269).
@@ -108,6 +109,8 @@ pub const QMI_SERVICE_MS: u64 = 100;
 pub const EAPOL_QUEUE_MAX: usize = 16;
 /// Bound on received data frames waiting for the interface pump.
 pub const RX_QUEUE_MAX: usize = 1024;
+/// `ATH11K_FLUSH_TIMEOUT` (5 s).
+pub const ATH11K_FLUSH_TIMEOUT_MS: u32 = 5000;
 
 fn log(args: core::fmt::Arguments<'_>) {
     let _ = writeln!(narf_console::Writer, "  ath11k: {}", args);
@@ -431,6 +434,8 @@ pub struct RtStats {
     pub tx_data: u32,
     pub tx_eapol: u32,
     pub tx_failed: u32,
+    /// Frames dropped from the TX queues (`fq` overlimit, purge).
+    pub tx_queue_dropped: u32,
     pub tx_completed: u32,
     pub mgmt_tx: u32,
     pub mgmt_tx_done: u32,
@@ -453,6 +458,8 @@ pub struct Rt<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     pub dp: Dp,
     pub link: LinkState,
     pub mgmt: MgmtTx,
+    /// The station's per-AC TX queues + hardware queue stop reasons.
+    pub txq: TxQueues,
     pub stats: RtStats,
     /// `mon_reap_timer` armed (next expiry).
     pub mon_reap_at: Option<u64>,
@@ -485,6 +492,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
                 ..LinkState::default()
             },
             mgmt: MgmtTx::default(),
+            txq: TxQueues::default(),
             stats: RtStats::default(),
             mon_reap_at: None,
             qmi_service_at: 0,
@@ -699,8 +707,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
             encap: TxEncap::NativeWifi,
             priority: built.tid as u32,
             queue: built.ac,
-            // hw_ops->get_ring_selector: one TCL ring on WCN6855.
-            ring_selector: 0,
+            // hw_ops->get_ring_selector (ath11k_hw_ipq8074_get_tcl_ring_selector:
+            // smp_processor_id()); WCN6855 has one TCL data ring
+            // (tcl2wbm_rbm_map_ipq5018), so `% num_tx_rings` picks ring 0.
+            ring_selector: narf_lib::percpu::current_cpu() as u32,
             // NETIF_F_HW_CSUM (`tx_offload::OFFLOADS`).
             csum_partial,
             pdev_idx: 0,
@@ -725,6 +735,56 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
                 Err(e.errno)
             }
         }
+    }
+
+    /// `ieee80211_subif_start_xmit` up to the TXQ: drop when there is no
+    /// station to send to (`ieee80211_build_hdr` without a chanctx /
+    /// `sta`), else `ieee80211_select_queue` with `sta->sta.wme` and
+    /// `ieee80211_queue_skb` into that AC (`fq` overlimit drops counted).
+    pub fn tx_enqueue(&mut self, eth: Vec<u8>, csum_partial: bool) -> Result<(), i32> {
+        if self.link.vif.is_none() || self.link.bss.is_none() {
+            self.stats.tx_failed += 1;
+            return Err(ENOTCONN);
+        }
+        let (_, ac) = tx_hdr::select_queue(&eth, self.link.wme);
+        let dropped = self.txq.enqueue(ac, Queued { eth, csum_partial });
+        self.stats.tx_queue_dropped += dropped.len() as u32;
+        Ok(())
+    }
+
+    /// `ieee80211_handle_wake_tx_queue`: hand every frame whose hardware
+    /// queue is not stopped to `ath11k_mac_op_tx` → `ath11k_dp_tx`, VO
+    /// first. A frame the DP refuses (`-ENOSPC` with the TX IDR full,
+    /// `-ENOMEM` with the TCL ring full) is freed, as
+    /// `ath11k_mac_op_tx` does with `ieee80211_free_txskb`. Returns the
+    /// frames the DP accepted.
+    pub fn tx_push(&mut self) -> u32 {
+        let mut sent = 0;
+        while let Some((_, f)) = self.txq.dequeue() {
+            if self.tx_eth(&f.eth, f.csum_partial).is_ok() {
+                sent += 1;
+            }
+        }
+        sent
+    }
+
+    /// `ieee80211_stop_queues_by_reason(hw, queues, reason, false)`.
+    pub fn stop_queues(&mut self, queues: u32, reason: u32) {
+        self.txq.stop(queues, reason);
+    }
+
+    /// `ieee80211_wake_queues_by_reason`: clear the reason and drain what
+    /// the queues now allow (`_ieee80211_wake_txqs`, AC order).
+    pub fn wake_queues(&mut self, queues: u32, reason: u32) -> u32 {
+        self.txq.wake(queues, reason);
+        self.tx_push()
+    }
+
+    /// `ieee80211_purge_sta_txqs`.
+    pub fn purge_txqs(&mut self) -> u32 {
+        let n = self.txq.purge();
+        self.stats.tx_queue_dropped += n;
+        n
     }
 
     /// `ath11k_mac_mgmt_tx` + the first half of `ath11k_mac_mgmt_tx_wmi`:
@@ -928,13 +988,55 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         g.link.data_rx.drain(..).collect()
     }
 
-    /// Transmit an Ethernet frame from the interface (`csum_partial`: see
-    /// [`Rt::tx_eth`]).
-    pub async fn tx_data(&self, eth: &[u8], csum_partial: bool) -> Result<u32, i32> {
+    /// Frames from the interface (`(Ethernet, CHECKSUM_PARTIAL)`): queue
+    /// each on its AC, push what the hardware queues allow, service.
+    /// Returns each frame's enqueue result.
+    pub async fn tx_frames(&self, frames: Vec<(Vec<u8>, bool)>) -> Vec<Result<(), i32>> {
         let mut g = self.lock().await;
-        let r = g.tx_eth(eth, csum_partial);
+        let r = frames
+            .into_iter()
+            .map(|(eth, csum)| g.tx_enqueue(eth, csum))
+            .collect();
+        g.tx_push();
         g.service();
         r
+    }
+
+    /// `ieee80211_flush_queues(local, sdata, drop)` for the station vif:
+    /// stop the vif's hardware queues (`QUEUE_STOP_REASON_FLUSH`), purge
+    /// the TXQs when `drop`, `drv_flush` (`ath11k_mac_op_flush`: nothing
+    /// when `drop`, else `ath11k_mac_flush_tx_complete` — wait ≤ 5 s each
+    /// for no pending data and no pending management frame), wake.
+    pub async fn flush_queues(&self, drop: bool) {
+        let q = TxQueues::vif_queues();
+        {
+            let mut g = self.lock().await;
+            g.stop_queues(q, txq::reason::FLUSH);
+            if drop {
+                g.purge_txqs();
+            }
+        }
+        if !drop {
+            let data = self
+                .wait_until(ATH11K_FLUSH_TIMEOUT_MS, |rt| {
+                    (rt.dp.pdev.as_ref().map_or(0, |p| p.num_tx_pending) == 0).then_some(())
+                })
+                .await;
+            if data.is_none() {
+                log(format_args!("failed to flush transmit queue"));
+            }
+            let mgmt = self
+                .wait_until(ATH11K_FLUSH_TIMEOUT_MS, |rt| {
+                    (rt.mgmt.pending == 0).then_some(())
+                })
+                .await;
+            if mgmt.is_none() {
+                log(format_args!("failed to flush mgmt transmit queue"));
+            }
+        }
+        let mut g = self.lock().await;
+        g.wake_queues(q, txq::reason::FLUSH);
+        g.service();
     }
 }
 
@@ -1183,7 +1285,12 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
     }
 
     async fn send_eth(&self, frame: &[u8]) -> Result<(), i32> {
-        self.0.tx_data(frame, false).await.map(|_| ())
+        // ieee80211_tx_control_port → the TXQ like any data frame.
+        self.0
+            .tx_frames(alloc::vec![(frame.to_vec(), false)])
+            .await
+            .pop()
+            .unwrap_or(Err(EIO))
     }
 
     async fn recv_eapol(&self, timeout_ms: u32) -> Option<Vec<u8>> {
