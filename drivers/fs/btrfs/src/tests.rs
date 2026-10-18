@@ -12685,3 +12685,73 @@ kernel_test_in!(
     "drivers/fs/btrfs/compression/cache",
     smoke_btrfs_decompress_cache_invalidation
 );
+
+// ── CachyOS root-rw: many small files through create + O_TRUNC + write ──
+
+macro_rules! kt_log {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write as _;
+        let _ = writeln!(narf_console::Writer, $($arg)*);
+    }};
+}
+
+/// What a shell's `printf ... > dir/fN` loop does on the CachyOS layout
+/// (`@` subvolume of the host-exact BGT image): create, truncate to 0 (the
+/// O_TRUNC of the open), write a line. Every file must succeed and read back,
+/// across several batch commits.
+fn smoke_btrfs_bgt_many_small_files_rw() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_writable(writable_sparse(FIXTURE_BGT_SPARSE)) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("BGT fixture failed to mount rw"),
+    };
+    if poll_once(vol.switch_to_subvol(&crate::volume::Subvol::Name("@".into())))
+        .is_none_or(|r| r.is_err())
+    {
+        return TestResult::Fail("subvol=@ did not resolve");
+    }
+    let root = vol.root();
+    let dir = match poll_once(root.mkdir("narf-many")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir narf-many failed"),
+    };
+    for i in 1..=60u32 {
+        let name = alloc::format!("f{i}");
+        let file = match poll_once(dir.create(&name)) {
+            Some(Ok(f)) => f,
+            other => {
+                kt_log!(
+                    "btrfs many-files: create f{i} -> {:?}",
+                    other.map(|r| r.map(|_| ()))
+                );
+                return TestResult::Fail("create of a small file failed");
+            }
+        };
+        if let Some(Err(e)) = poll_once(file.truncate(0)) {
+            kt_log!("btrfs many-files: truncate f{i} -> {e:?}");
+            return TestResult::Fail("O_TRUNC of a new small file failed");
+        }
+        let body = alloc::format!("narf {i}\n");
+        match poll_once(file.write(0, body.as_bytes())) {
+            Some(Ok(n)) if n == body.len() => {}
+            other => {
+                kt_log!("btrfs many-files: write f{i} -> {other:?}");
+                return TestResult::Fail("write of a small file failed");
+            }
+        }
+    }
+    let _ = poll_once(vol.sync_to_disk());
+    for i in [1u32, 15, 16, 60] {
+        let name = alloc::format!("f{i}");
+        let f = match poll_once(dir.lookup_async(&name)) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("small file missing after sync"),
+        };
+        let want = alloc::format!("narf {i}\n");
+        if read_all(&f, 64).as_deref() != Some(want.as_bytes()) {
+            return TestResult::Fail("small file content wrong after sync");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_bgt_many_small_files_rw);

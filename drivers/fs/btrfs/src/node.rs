@@ -1299,7 +1299,7 @@ impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
         let mut parsed = crate::mount_opts::parse(&rest.join(","))?;
         match want_ro {
             Some(true) if !self.is_read_only() => {
-                narf_scheduler::block_on(self.remount_read_only())?;
+                narf_filesystem::fs_registry::mount_wait(self.remount_read_only())?;
             }
             Some(false) if self.is_read_only() => {
                 let this = self.self_weak.upgrade().ok_or(FsError::NotFound)?;
