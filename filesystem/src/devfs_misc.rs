@@ -117,15 +117,56 @@ fn btrfs_identity(dev: &dyn narf_block::BlockDeviceSync) -> Option<([u8; 16], u6
 /// (`btrfs_control_ioctl`: `ret = !(fs_devices->num_devices ==
 /// fs_devices->total_devices)`), and an error for a path that is not a
 /// registered btrfs member.
+///
+/// The device asked about is a member by construction: its own superblock
+/// was just read. Only the *other* members are looked up, first by the
+/// filesystem UUID the partition scan recorded (no I/O) and then by reading
+/// their superblocks. Counting the asked-about device through a second read
+/// made the answer depend on that read succeeding. When it failed (the root
+/// is under heavy concurrent I/O while udev coldplugs), a single-device
+/// root answered "not ready". udev then set `SYSTEMD_READY=0`, the
+/// `/dev/disk/by-uuid/<fsid>` unit never appeared, and every fstab
+/// subvolume mount timed out into emergency mode.
 pub(crate) fn btrfs_devices_ready(path: &str) -> Result<u64, FsError> {
     let name = crate::fs_registry::block_source_name(path).ok_or(FsError::NotFound)?;
     let dev = narf_block::find_block_device(name).ok_or(FsError::NotFound)?;
-    let (fsid, total) = btrfs_identity(dev.as_ref()).ok_or(FsError::InvalidData)?;
-    let present = narf_block::block_devices()
+    let Some((fsid, total)) = btrfs_identity(dev.as_ref()) else {
+        // Logged: on a real machine this decides whether the root's
+        // by-uuid device appears. udev treats the error as "no answer", which
+        // leaves the device ready.
+        let _ = core::fmt::Write::write_fmt(
+            &mut narf_console::Writer,
+            format_args!("btrfs-control: DEVICES_READY {name}: no readable btrfs superblock\n"),
+        );
+        return Err(FsError::InvalidData);
+    };
+    let total = total.max(1);
+    if total == 1 {
+        return Ok(0);
+    }
+    let fsid_text = narf_block::registry::format_uuid_bytes(&fsid);
+    let others = narf_block::block_devices()
         .into_iter()
-        .filter(|entry| btrfs_identity(entry.dev.as_ref()).is_some_and(|(id, _)| id == fsid))
+        .filter(|entry| entry.name != name)
+        .filter(|entry| {
+            entry
+                .partition
+                .as_ref()
+                .is_some_and(|meta| meta.fs_uuid.eq_ignore_ascii_case(&fsid_text))
+                || btrfs_identity(entry.dev.as_ref()).is_some_and(|(id, _)| id == fsid)
+        })
         .count() as u64;
-    Ok(u64::from(present < total.max(1)))
+    let missing = 1 + others < total;
+    if missing {
+        let _ = core::fmt::Write::write_fmt(
+            &mut narf_console::Writer,
+            format_args!(
+                "btrfs-control: DEVICES_READY {name}: {} of {total} member(s) present\n",
+                1 + others
+            ),
+        );
+    }
+    Ok(u64::from(missing))
 }
 
 /// `/dev/btrfs-control` (misc 10:234), the btrfs device-scan channel.
