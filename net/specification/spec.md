@@ -407,7 +407,12 @@ and of the sender, in the initial user namespace and over the socket's
 network namespace respectively.
 
 Families may additionally register a `ContextHandler` receiving
-`RequestContext { net_ns_id, admin, init_net_admin, net_admin, capable }`.
+`RequestContext { net_ns_id, admin, init_net_admin, net_admin, capable,
+portid, ack_cookie }`. `portid` is the sender's port (`info->snd_portid`;
+the socket bridge assigns it before dispatch, `netlink_autobind`);
+`ack_cookie` is where a doit leaves `nl_set_extack_cookie_u64`'s value,
+which the layer appends to the success ACK as `NLMSGERR_ATTR_COOKIE` (with
+`NLM_F_ACK_TLVS`) only when the socket enabled `NETLINK_EXT_ACK`.
 `admin` is an optional, kernel-held interface-bound `AdminHandle`; the
 default reply builder supplies none and no capabilities. The socket bridge
 passes only explicitly delegated authority. Family mutations check its
@@ -422,6 +427,16 @@ Its installed socket sink filters by `NETLINK_GENERIC`, namespace and
 membership, queues at most 256 notifications per socket, and wakes readiness
 after releasing the queue lock. This is a bounded, best-effort multicast
 path; callers recover lost scan notifications by querying cached results.
+
+`unicast_event(family, net_ns_id, portid, reply)` is `genlmsg_unicast`: the
+installed unicast sink queues the message (`nlmsg_pid` 0, no group) on the
+`NETLINK_GENERIC` socket of that namespace bound to `portid`; an unknown
+family is -ENOENT, no such socket (or a full queue) -ECONNREFUSED.
+`register_release_notifier` / `notify_release(net_ns_id, portid)` model the
+`NETLINK_URELEASE` notifier chain: the socket layer calls `notify_release`
+when a `NETLINK_GENERIC` socket that holds a port id is released, and every
+registered notifier runs outside the registry lock (nl80211 tears down the
+connection that socket owned).
 
 `NETLINK_SOCK_DIAG` accepts Linux `SOCK_DIAG_BY_FAMILY` /
 `inet_diag_req_v2` dumps for IPv4 and IPv6 TCP and UDP. It filters by the requested

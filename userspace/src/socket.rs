@@ -5347,6 +5347,44 @@ impl SocketFile {
         narf_net::readiness::notify(0);
     }
 
+    /// `netlink_unicast` of a kernel generic-netlink message to the socket
+    /// bound to `portid` in `net_ns_id` (`nlmsg_pid` 0: kernel origin; no
+    /// group). `false` when no such socket exists or its queue is full
+    /// (`netlink_unicast` → -ECONNREFUSED / the dropped skb).
+    fn unicast_netlink_generic(net_ns_id: u64, portid: u32, message: &[u8]) -> bool {
+        let target = {
+            let mut sockets = NETLINK_SOCKETS.lock();
+            sockets.retain(|weak| weak.strong_count() != 0);
+            sockets.iter().filter_map(Weak::upgrade).find(|socket| {
+                socket.protocol == NETLINK_GENERIC
+                    && socket.net_ns_id() == net_ns_id
+                    && socket.netlink_portid.load(Ordering::Acquire) == portid
+            })
+        };
+        let Some(socket) = target else {
+            return false;
+        };
+        let queued = {
+            let mut state = socket.state.lock();
+            if let SocketState::NetlinkGeneric { replies } = &mut *state {
+                if replies.len() >= 256 {
+                    false
+                } else {
+                    replies.push_back(message.to_vec());
+                    socket.netlink_reply_groups.lock().push_back(0);
+                    true
+                }
+            } else {
+                false
+            }
+        };
+        if queued {
+            socket.wake_netlink_readable();
+            narf_net::readiness::notify(0);
+        }
+        queued
+    }
+
     fn dispatch_netlink_generic(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
             SocketOp::Bind { addr } => self.bind_netlink(&addr),
@@ -5357,6 +5395,7 @@ impl SocketFile {
                 }
                 let dest_portid = self.ensure_netlink_portid();
                 narf_net::netlink_generic::install_event_sink(Self::broadcast_netlink_generic);
+                narf_net::netlink_generic::install_unicast_sink(Self::unicast_netlink_generic);
                 let admin = self.netlink_admin.lock().clone();
                 let mut replies = match narf_net::netlink_generic::build_replies_with_context(
                     buf,
@@ -5371,6 +5410,8 @@ impl SocketFile {
                         net_admin: self.netlink_net_admin(),
                         // Derived per op by the generic-netlink layer.
                         capable: false,
+                        portid: dest_portid,
+                        ack_cookie: None,
                     },
                 ) {
                     Ok(replies) => replies,
@@ -9434,6 +9475,14 @@ fn unix_skb_truesize(unit: usize) -> usize {
 impl Drop for SocketFile {
     fn drop(&mut self) {
         self.release_multicast();
+        // netlink_release → NETLINK_URELEASE for a bound generic socket
+        // (nl80211_netlink_notify: the connection owner went away).
+        if self.domain == AF_NETLINK && self.protocol == NETLINK_GENERIC {
+            let portid = self.netlink_portid.load(Ordering::Acquire);
+            if portid != 0 {
+                narf_net::netlink_generic::notify_release(self.net_ns_id(), portid);
+            }
+        }
         if let Some(echo) = self.icmp_echo.lock().socket.take() {
             narf_net::icmp_sock::icmp_echo_close(&echo);
         }

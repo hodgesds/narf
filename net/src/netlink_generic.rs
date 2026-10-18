@@ -52,6 +52,8 @@ const ENOENT: i32 = 2;
 const EINVAL: i32 = 22;
 const EOPNOTSUPP: i32 = 95;
 const NLMSGERR_ATTR_MSG: u16 = 1;
+/// `NLMSGERR_ATTR_COOKIE`.
+const NLMSGERR_ATTR_COOKIE: u16 = 4;
 
 /// One command advertised by a registered generic-netlink family. `flags`
 /// carries the Linux op flags verbatim — `GENL_CMD_CAP_DO` / `_DUMP` and the
@@ -104,6 +106,14 @@ pub struct RequestContext<'a> {
     /// finds it false was reached on the strength of `admin` alone and must
     /// check that the handle covers the object it changes.
     pub capable: bool,
+    /// `info->snd_portid`: the sending socket's netlink port id (0 = none).
+    /// A family keys per-socket state on it — nl80211's
+    /// `conn_owner_nlportid` — and unicasts to it ([`unicast_event`]).
+    pub portid: u32,
+    /// Where a doit leaves the cookie `nl_set_extack_cookie_u64` puts in
+    /// the extended ACK (`NLMSGERR_ATTR_COOKIE`). Set by the
+    /// generic-netlink layer for the duration of the call.
+    pub ack_cookie: Option<&'a core::cell::Cell<Option<u64>>>,
 }
 
 impl RequestContext<'_> {
@@ -116,9 +126,67 @@ impl RequestContext<'_> {
 
 pub type ContextHandler = fn(u8, &[u8], bool, RequestContext<'_>) -> Result<Vec<GenlReply>, i32>;
 type EventSink = fn(net_ns_id: u64, group: u32, message: &[u8]);
+/// Delivers a kernel message to one socket (`netlink_unicast`); `false` when
+/// no generic-netlink socket of that namespace holds the port id.
+type UnicastSink = fn(net_ns_id: u64, portid: u32, message: &[u8]) -> bool;
+/// A `NETLINK_URELEASE` notifier: a bound generic-netlink socket closed.
+pub type ReleaseNotifier = fn(net_ns_id: u64, portid: u32);
 static CONTEXT_HANDLERS: IrqSafeSpinLock<Vec<(u16, ContextHandler)>> =
     IrqSafeSpinLock::new(Vec::new());
 static EVENT_SINK: IrqSafeSpinLock<Option<EventSink>> = IrqSafeSpinLock::new(None);
+static UNICAST_SINK: IrqSafeSpinLock<Option<UnicastSink>> = IrqSafeSpinLock::new(None);
+static RELEASE_NOTIFIERS: IrqSafeSpinLock<Vec<ReleaseNotifier>> = IrqSafeSpinLock::new(Vec::new());
+const ECONNREFUSED: i32 = 111;
+
+/// Install the unicast delivery sink, returning the previous one.
+pub fn install_unicast_sink(sink: UnicastSink) -> Option<UnicastSink> {
+    UNICAST_SINK.lock().replace(sink)
+}
+
+/// `genlmsg_unicast(net, msg, portid)`: send a family message to one
+/// socket. `-ECONNREFUSED` when no socket of the namespace has the port id
+/// (`netlink_unicast` → `netlink_getsockbyportid`).
+pub fn unicast_event(id: u16, net_ns_id: u64, portid: u32, reply: GenlReply) -> Result<(), i32> {
+    let family = FAMILIES.lock().iter().find(|f| f.id == id).copied();
+    let Some(family) = family else {
+        return Err(ENOENT);
+    };
+    let sink = *UNICAST_SINK.lock();
+    let Some(sink) = sink else {
+        return Err(ECONNREFUSED);
+    };
+    let mut body = vec![reply.command, family.version, 0, 0];
+    body.extend_from_slice(&reply.attrs);
+    if sink(net_ns_id, portid, &frame(id, 0, 0, &body)) {
+        Ok(())
+    } else {
+        Err(ECONNREFUSED)
+    }
+}
+
+/// Register a `NETLINK_URELEASE` notifier (`netlink_register_notifier`).
+/// Idempotent per function.
+pub fn register_release_notifier(notifier: ReleaseNotifier) {
+    let mut notifiers = RELEASE_NOTIFIERS.lock();
+    if !notifiers
+        .iter()
+        .any(|known| *known as usize == notifier as usize)
+    {
+        notifiers.push(notifier);
+    }
+}
+
+/// `netlink_release` of a bound `NETLINK_GENERIC` socket: run every
+/// notifier (outside the registry lock).
+pub fn notify_release(net_ns_id: u64, portid: u32) {
+    if portid == 0 {
+        return;
+    }
+    let notifiers: Vec<ReleaseNotifier> = RELEASE_NOTIFIERS.lock().clone();
+    for notifier in notifiers {
+        notifier(net_ns_id, portid);
+    }
+}
 
 /// Add an authority-aware callback to an already registered family.
 pub fn register_context_handler(id: u16, handler: ContextHandler) -> bool {
@@ -318,7 +386,11 @@ fn requested_attr(request: &[u8], requested_kind: u16) -> Option<&[u8]> {
     None
 }
 
-fn build_one(request: &[u8], context: RequestContext<'_>) -> Result<Vec<Vec<u8>>, ()> {
+fn build_one(
+    request: &[u8],
+    context: RequestContext<'_>,
+    options: ReplyOptions,
+) -> Result<Vec<Vec<u8>>, ()> {
     if request.len() < NLMSG_HDRLEN + 4 {
         return Err(());
     }
@@ -368,7 +440,12 @@ fn build_one(request: &[u8], context: RequestContext<'_>) -> Result<Vec<Vec<u8>>
         if !capable && context.admin.is_none() {
             return Ok(vec![error(EPERM, seq, request)]);
         }
-        let context = RequestContext { capable, ..context };
+        let cookie = core::cell::Cell::new(None);
+        let context = RequestContext {
+            capable,
+            ack_cookie: Some(&cookie),
+            ..context
+        };
         let contextual = CONTEXT_HANDLERS
             .lock()
             .iter()
@@ -400,7 +477,17 @@ fn build_one(request: &[u8], context: RequestContext<'_>) -> Result<Vec<Vec<u8>>
                 .iter()
                 .any(|message| message.get(4..6) == Some(&NLMSG_ERROR.to_ne_bytes()))
         {
-            out.push(error(0, seq, request));
+            let mut ack = error(0, seq, request);
+            // netlink_ack_tlv_fill: the cookie rides in the extended ACK.
+            if let (true, Some(value)) = (options.ext_ack, cookie.get()) {
+                push_attr(&mut ack, NLMSGERR_ATTR_COOKIE, &value.to_ne_bytes());
+                let new_len = ack.len() as u32;
+                ack[0..4].copy_from_slice(&new_len.to_ne_bytes());
+                let flags =
+                    u16::from_ne_bytes(ack[6..8].try_into().unwrap_or([0; 2])) | NLM_F_ACK_TLVS;
+                ack[6..8].copy_from_slice(&flags.to_ne_bytes());
+            }
+            out.push(ack);
         }
         return Ok(out);
     }
@@ -489,7 +576,7 @@ pub fn build_replies_with_context(
         if len < NLMSG_HDRLEN + 4 || len > remaining.len() {
             return Err(());
         }
-        replies.extend(build_one(&remaining[..len], context)?);
+        replies.extend(build_one(&remaining[..len], context, options)?);
         let step = align(len);
         if step > remaining.len() {
             if len == remaining.len() {
@@ -819,6 +906,153 @@ mod authority_tests {
     kernel_test_in!(
         "net/netlink_generic",
         smoke_generic_netlink_op_permission_flags
+    );
+
+    // Distinct from every other test family id (0x30, 0x3c, 0x3d, 0x3e).
+    const UNICAST_FAMILY: u16 = 0x3b;
+    static SEEN_PORTID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static UNICAST_SEEN: IrqSafeSpinLock<Vec<(u64, u32, Vec<u8>)>> =
+        IrqSafeSpinLock::new(Vec::new());
+    static RELEASED: IrqSafeSpinLock<Vec<(u64, u32)>> = IrqSafeSpinLock::new(Vec::new());
+
+    /// Records the sender's port id and leaves a cookie for the ACK.
+    fn cookie_handle(
+        _: u8,
+        _: &[u8],
+        _: bool,
+        context: RequestContext<'_>,
+    ) -> Result<Vec<GenlReply>, i32> {
+        SEEN_PORTID.store(context.portid, core::sync::atomic::Ordering::Relaxed);
+        if let Some(cell) = context.ack_cookie {
+            cell.set(Some(0x1122_3344_5566_7788));
+        }
+        Ok(Vec::new())
+    }
+
+    fn unicast_capture(ns: u64, portid: u32, msg: &[u8]) -> bool {
+        if portid != 77 {
+            return false;
+        }
+        UNICAST_SEEN.lock().push((ns, portid, msg.to_vec()));
+        true
+    }
+
+    fn released(ns: u64, portid: u32) {
+        RELEASED.lock().push((ns, portid));
+    }
+
+    /// `info->snd_portid` reaches the family, `nl_set_extack_cookie_u64`
+    /// rides in the extended ACK (`NLMSGERR_ATTR_COOKIE` + NLM_F_ACK_TLVS,
+    /// only with NETLINK_EXT_ACK), `genlmsg_unicast` reaches one socket
+    /// (`-ECONNREFUSED` for a missing one), and `NETLINK_URELEASE`
+    /// notifiers run once per registration, never for an unbound socket.
+    fn smoke_generic_netlink_unicast_release_cookie() -> TestResult {
+        const OPS: &[GenlOperation] = &[GenlOperation {
+            command: 1,
+            flags: GENL_CMD_CAP_DO,
+        }];
+        let _ = register_family(GenlFamily {
+            id: UNICAST_FAMILY,
+            name: "narf-unicast-test",
+            version: 2,
+            max_attr: 0,
+            operations: OPS,
+            groups: &[],
+            handler: unsupported_control,
+        });
+        let _ = register_context_handler(UNICAST_FAMILY, cookie_handle);
+        let request = frame(UNICAST_FAMILY, 5, 61, &[1, 2, 0, 0]);
+        let context = RequestContext {
+            portid: 4242,
+            ..RequestContext::default()
+        };
+        let ack = |ext_ack: bool| {
+            build_replies_with_context(
+                &request,
+                ReplyOptions {
+                    ext_ack,
+                    cap_ack: false,
+                },
+                context,
+            )
+            .unwrap()
+            .pop()
+            .unwrap()
+        };
+        let with = ack(true);
+        if SEEN_PORTID.load(core::sync::atomic::Ordering::Relaxed) != 4242 {
+            return TestResult::Fail("sender port id not passed to the family");
+        }
+        let flags = u16::from_ne_bytes(with[6..8].try_into().unwrap());
+        let errno = i32::from_ne_bytes(with[16..20].try_into().unwrap());
+        let tlvs = &with[20 + request.len()..];
+        let cookie_ok = tlvs.len() == 12
+            && u16::from_ne_bytes(tlvs[2..4].try_into().unwrap()) == NLMSGERR_ATTR_COOKIE
+            && tlvs[4..12] == 0x1122_3344_5566_7788u64.to_ne_bytes();
+        if errno != 0 || flags & NLM_F_ACK_TLVS == 0 || !cookie_ok {
+            return TestResult::Fail("extended ACK cookie");
+        }
+        let without = ack(false);
+        if u16::from_ne_bytes(without[6..8].try_into().unwrap()) & NLM_F_ACK_TLVS != 0
+            || without.len() != 20 + request.len()
+        {
+            return TestResult::Fail("cookie without NETLINK_EXT_ACK");
+        }
+        let previous = install_unicast_sink(unicast_capture);
+        UNICAST_SEEN.lock().clear();
+        let sent = unicast_event(
+            UNICAST_FAMILY,
+            3,
+            77,
+            GenlReply {
+                command: 9,
+                attrs: vec![4, 0, 1, 0],
+            },
+        );
+        let missing = unicast_event(
+            UNICAST_FAMILY,
+            3,
+            78,
+            GenlReply {
+                command: 9,
+                attrs: Vec::new(),
+            },
+        );
+        let unknown = unicast_event(
+            0x7e,
+            3,
+            77,
+            GenlReply {
+                command: 9,
+                attrs: Vec::new(),
+            },
+        );
+        if let Some(p) = previous {
+            install_unicast_sink(p);
+        }
+        let seen = UNICAST_SEEN.lock().clone();
+        let layout = seen.len() == 1
+            && seen[0].0 == 3
+            && u16::from_ne_bytes(seen[0].2[4..6].try_into().unwrap()) == UNICAST_FAMILY
+            && seen[0].2[12..16] == [0; 4]
+            && seen[0].2[16..20] == [9, 2, 0, 0]
+            && seen[0].2[20..] == [4, 0, 1, 0];
+        if sent != Ok(()) || missing != Err(ECONNREFUSED) || unknown != Err(ENOENT) || !layout {
+            return TestResult::Fail("genlmsg_unicast delivery / errnos");
+        }
+        RELEASED.lock().clear();
+        register_release_notifier(released);
+        register_release_notifier(released);
+        notify_release(5, 0);
+        notify_release(5, 31);
+        if *RELEASED.lock() != [(5, 31)] {
+            return TestResult::Fail("NETLINK_URELEASE notifier");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "net/netlink_generic",
+        smoke_generic_netlink_unicast_release_cookie
     );
 }
 
