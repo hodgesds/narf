@@ -687,13 +687,7 @@ impl FenceReader {
     pub fn completed(&self) -> Result<u32, Error> {
         let mut io = self.io;
         let (l, map) = (self.layout, self.map);
-        self.authority
-            .invoke(Op(|| {
-                checked(io.read(l.vcn + u64::from(STATUS) * 4))?;
-                flush(&mut io, l)?;
-                Ok(io.memory_read(map, FENCE))
-            }))
-            .map_err(|_| Error::Revoked)?
+        cs::client_fence(&mut io, self.authority, l, map)
     }
 }
 

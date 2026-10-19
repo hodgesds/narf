@@ -46,7 +46,7 @@ impl Submitter {
             {
                 let mut watches = self.watch.lock();
                 for (ring, watch) in watches.iter_mut().enumerate() {
-                    watch.faulted(scope, ring);
+                    watch.faulted(scope, ring, crate::amdgpu_navi48_faults::Hub::Gfx);
                 }
             }
             // Mark all contexts first: a guilty context may have queued work

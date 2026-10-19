@@ -2960,7 +2960,13 @@ record expose pending and historical evidence separately.
 
 Successful re-arm advances all three kernel interrupt-handle generations.
 Old handles cannot complete new work. The final fault scope excludes guilty
-client VMIDs and cancels queue work without reliable client attribution; healthy
+nonzero PASIDs from client IVs, across rings and hubs even if their VMIDs
+changed. Its VMID union is diagnostic only: a late IV must not blame the new
+address space reusing its VMID. A bounded set of 16 distinct PASIDs overflows
+to explicit device recovery rather than losing fault attribution. PASID-less
+IVs and protection latches cancel pending work only at that VMID on that hub;
+the latch has no PASID even when its VMID matches an IV. Queue faults without
+client attribution cancel the queue's pending work without establishing guilt. Healthy
 jobs replay under their original tickets with forced VM/PASID/context setup.
 All ledgers remain frozen until every replay obtains its new physical fence,
 then commit together. A replay failure quarantines reporting and every ledger.
@@ -5044,6 +5050,15 @@ healthy contexts remain pending for replay; jobs in a guilty/canceled context
 are skipped with `Canceled` after reset. Error completion wakes waiters but
 never alone releases buffers, page tables or VMIDs. `RingWatch` retains each
 job descriptor, context health, logical ticket and its hardware fence.
+Logical tickets skip zero on 32-bit wrap, preserving the CS ABI's zero/no-job
+handle; physical hardware sequences still wrap through zero independently.
+GC12/SDMA7/VCN5 client fence readers check live authority, HDP visibility and
+device presence before and after the fence sample, then revalidate authority.
+A legitimate all-ones physical sequence remains valid; an absent BAR does
+not. A failed sample in the current platform generation synchronously marks
+the device lost and cancels/freezes every ledger before waking waiters. It
+never retires memory. An old-generation reader reports an error without
+touching hardware or poisoning the replacement generation.
 `AMDGPU_WAIT_CS` of an ended job with an error fails with it
 (amdgpu_cs_wait_ioctl); `AMDGPU_CS` on a context with an error fails with
 it before queueing (amdgpu_ctx_get_entity); `CTX QUERY_STATE2` reports

@@ -523,11 +523,23 @@ impl Submitter {
             return None;
         }
         let mut completed = [0; RINGS];
-        for (c, pipe) in completed.iter_mut().zip(PIPES) {
-            *c = self.fence.completed(pipe).ok()?;
-        }
-        if let Some(sdma) = &self.sdma_fence {
-            completed[SDMA_RING as usize] = sdma.completed().ok()?;
+        let live = (|| {
+            for (c, pipe) in completed.iter_mut().zip(PIPES) {
+                *c = self.fence.completed(pipe).ok()?;
+            }
+            if let Some(sdma) = &self.sdma_fence {
+                completed[SDMA_RING as usize] = sdma.completed().ok()?;
+            }
+            Some(())
+        })();
+        if live.is_none() {
+            // Publish terminal failure before signalled() can wake a waiter.
+            // Keep every allocation pinned; an error is no retirement proof.
+            crate::amdgpu_navi48_interrupts::lose();
+            for watch in self.watch.lock().iter_mut() {
+                watch.stop();
+            }
+            return None;
         }
         // Lock after reading hardware: reset keeps each affected ledger frozen
         // until every replay fence is assigned. Old samples cannot complete a
@@ -701,7 +713,9 @@ impl crate::amdgpu_cs::Submitter for Submitter {
     }
     fn error(&self, ticket: u64) -> Option<narf_filesystem::FsError> {
         self.job_error(ticket).or_else(|| {
-            crate::amdgpu_navi48_interrupts::failed().then_some(narf_filesystem::FsError::NoDevice)
+            (crate::amdgpu_navi48_interrupts::failed()
+                || *READ_GENERATION.lock() != self.generation)
+                .then_some(narf_filesystem::FsError::NoDevice)
         })
     }
     fn submit<'a>(

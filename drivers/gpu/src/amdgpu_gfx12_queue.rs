@@ -469,11 +469,12 @@ fn selected<I: Io, T>(
     select(io, l, prior)?;
     result
 }
-fn flush(io: &mut impl Io, l: Layout) {
+fn flush(io: &mut impl Io, l: Layout) -> Result<(), Error> {
     fence(Ordering::SeqCst);
     io.write(0x7f000, 0);
-    io.read(l.nbio + 0xc3 * 4);
+    checked(io.read(l.nbio + 0xc3 * 4))?;
     fence(Ordering::SeqCst);
+    Ok(())
 }
 #[derive(Debug)]
 struct Engine<I: Io> {
@@ -572,7 +573,7 @@ impl<I: Io> Engine<I> {
                     io.memory_write(map, pipe as u64 * PIPE_BYTES + i as u64 * 4, v);
                 }
             }
-            flush(io, l);
+            flush(io, l)?;
             Ok(())
         })?;
         self.memory.publish();
@@ -597,7 +598,7 @@ impl<I: Io> Engine<I> {
             self.access(|io| {
                 io.memory_write(map, off + WPTR, 256);
                 io.memory_write(map, off + WPTR + 4, 0);
-                flush(io, l);
+                flush(io, l)?;
                 io.doorbell(db, BELLS[pipe], 256);
                 Ok(())
             })?;
@@ -605,7 +606,7 @@ impl<I: Io> Engine<I> {
             let deadline = narf_time::Deadline::after_us(2_100_000);
             loop {
                 let done = self.access(|io| {
-                    flush(io, l);
+                    flush(io, l)?;
                     let fence = io.memory_read(target, pipe as u64 * 4096 + 4092);
                     let rptr = io.memory_read(map, off + RPTR);
                     if rptr > 256 {
@@ -687,7 +688,7 @@ impl<I: Io> Engine<I> {
             let off = pipe as u64 * PIPE_BYTES;
             let control = l.gc + if pipe == 0 { 0x1e0a * 4 } else { 0x1e25 * 4 };
             self.access(|io| {
-                flush(io, l);
+                flush(io, l)?;
                 if io.memory_read(map, off + RPTR) != 256
                     || io.memory_read(map, off + WPTR) != 256
                     || io.memory_read(map, off + WPTR + 4) != 0
@@ -705,14 +706,14 @@ impl<I: Io> Engine<I> {
                     io.memory_write(map, off + 1024 + i as u64 * 4, word);
                 }
                 io.memory_write(map, off + WPTR, 512);
-                flush(io, l);
+                flush(io, l)?;
                 io.doorbell(db, BELLS[pipe], 512);
                 Ok(())
             })?;
             let deadline = narf_time::Deadline::after_us(2_100_000);
             loop {
                 let memory_done = self.access(|io| {
-                    flush(io, l);
+                    flush(io, l)?;
                     let rptr = io.memory_read(map, off + RPTR);
                     if rptr > 512 {
                         return Err(Error::DataMismatch);
@@ -781,7 +782,7 @@ impl<I: Io> Engine<I> {
         let fence = self.memory.address() + base + JOB_FENCE;
         let words = build(fence, seq)?;
         self.access(|io| {
-            flush(io, l);
+            flush(io, l)?;
             let rptr = u64::from(io.memory_read(map, base + RPTR));
             // The 32-bit RPTR trails WPTR by what the CP has yet to read.
             let pending = (wptr as u32).wrapping_sub(rptr as u32) as u64;
@@ -795,7 +796,7 @@ impl<I: Io> Engine<I> {
             let next = wptr + JOB_DWORDS;
             io.memory_write(map, base + WPTR, next as u32);
             io.memory_write(map, base + WPTR + 4, (next >> 32) as u32);
-            flush(io, l);
+            flush(io, l)?;
             io.doorbell(db, BELLS[i], next);
             Ok(())
         })?;
@@ -819,7 +820,7 @@ impl<I: Io> Engine<I> {
         let map = self.memory.mapping();
         // Reject outstanding/foreign ring progress before changing any PTE.
         self.access(|io| {
-            flush(io, l);
+            flush(io, l)?;
             for pipe in 0..2 {
                 if io.memory_read(map, pipe * PIPE_BYTES + RPTR) != 512 {
                     return Err(Error::Busy);
@@ -895,7 +896,7 @@ impl<I: Io> Engine<I> {
                 for (i, word) in ib.into_iter().enumerate() {
                     io.memory_write(target, shader::IB_OFFSET + i as u64 * 4, word);
                 }
-                flush(io, l);
+                flush(io, l)?;
                 Ok(())
             })?;
             let seq = self.publish_slot(kind, |fence, seq| {
@@ -906,7 +907,7 @@ impl<I: Io> Engine<I> {
             let tail = self.job_wptr[pipe];
             loop {
                 let done = self.access(|io| {
-                    flush(io, l);
+                    flush(io, l)?;
                     let base = pipe as u64 * PIPE_BYTES;
                     let rptr = io.memory_read(ring_map, base + RPTR);
                     if u64::from(rptr) > tail {
@@ -1095,7 +1096,7 @@ impl<I: Io> Engine<I> {
             for at in [RPTR, RPTR + 4, WPTR, WPTR + 4] {
                 io.memory_write(map, off + at, 0);
             }
-            flush(io, l);
+            flush(io, l)?;
             Ok(())
         })?;
         self.job_wptr[pipe.index()] = 0;
@@ -1104,13 +1105,34 @@ impl<I: Io> Engine<I> {
     }
     /// The last job sequence `pipe`'s fence reached.
     fn completed_job(&mut self, pipe: Pipe) -> Result<u32, Error> {
-        let l = self.layout;
-        let map = self.memory.mapping();
-        self.access(|io| {
-            flush(io, l);
-            Ok(io.memory_read(map, pipe.base() + JOB_FENCE))
-        })
+        client_fence(
+            &mut self.io,
+            self.authority,
+            self.layout,
+            self.memory.mapping(),
+            pipe,
+        )
     }
+}
+// Shared by the owner and synchronous readers, so neither can translate a
+// vanished BAR's fence contents into successful client retirement.
+fn client_fence(
+    io: &mut impl Io,
+    authority: Cap<BusDeviceCap, Write>,
+    l: Layout,
+    map: MmioRegion,
+    pipe: Pipe,
+) -> Result<u32, Error> {
+    let value = authority
+        .invoke(Op(|| {
+            flush(io, l)?;
+            let value = io.memory_read(map, pipe.base() + JOB_FENCE);
+            checked(io.read(l.nbio + 0xc3 * 4))?;
+            Ok(value)
+        }))
+        .map_err(|_| Error::Revoked)??;
+    authority.invoke(Op(|| ())).map_err(|_| Error::Revoked)?;
+    Ok(value)
 }
 /// Reads the queues' job fences without the queue's owner: its own
 /// capability, an HDP flush, then the fence word. Concurrent flushes
@@ -1127,12 +1149,7 @@ impl FenceReader {
     pub fn completed(&self, pipe: Pipe) -> Result<u32, Error> {
         let mut io = Mmio(self.regs);
         let (l, map) = (self.layout, self.map);
-        self.authority
-            .invoke(Op(|| {
-                flush(&mut io, l);
-                io.memory_read(map, pipe.base() + JOB_FENCE)
-            }))
-            .map_err(|_| Error::Revoked)
+        client_fence(&mut io, self.authority, l, map, pipe)
     }
 }
 #[derive(Debug)]

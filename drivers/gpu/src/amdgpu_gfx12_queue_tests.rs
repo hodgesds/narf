@@ -25,6 +25,9 @@ struct Fake {
     rptr_stuck: bool,
     busy: bool,
     revoked: Option<Cap<BusDeviceCap, Write>>,
+    fence_revoke: Option<Cap<BusDeviceCap, Write>>,
+    fence_gone: bool,
+    fence_reads: u32,
     regs: BTreeMap<u64, u32>,
     /// Client-job packets the CP ran: register writes, waits (reg0, reg1,
     /// reference, mask, info), PFP syncs and IBs (address, control).
@@ -383,6 +386,15 @@ impl Io for Fake {
     fn memory_read(&mut self, map: MmioRegion, at: u64) -> u32 {
         assert!(!self.dirty);
         if map.phys.raw() == 0x90004000 {
+            if at == JOB_FENCE || at == PIPE_BYTES + JOB_FENCE {
+                self.fence_reads += 1;
+                if self.fence_gone {
+                    self.regs.insert(0x60000 + 0xc3 * 4, u32::MAX);
+                }
+                if let Some(cap) = self.fence_revoke {
+                    cap.revoke();
+                }
+            }
             self.memory[(at / 4) as usize]
         } else {
             self.target[(at / 4) as usize]
@@ -482,6 +494,9 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
             rptr_stuck: false,
             busy: false,
             revoked: None,
+            fence_revoke: None,
+            fence_gone: false,
+            fence_reads: 0,
             regs: BTreeMap::from([
                 (0x17828, 0x84000000),
                 (0x17894, 0x84000000),
@@ -1527,4 +1542,42 @@ fn gfx12_shader_rejects_unowned_addresses_and_failed_preparation() -> TestResult
 kernel_test_in!(
     "drivers/gpu/gfx12",
     gfx12_shader_rejects_unowned_addresses_and_failed_preparation
+);
+
+fn gfx12_client_fences_reject_device_loss_and_revocation() -> TestResult {
+    for pipe in [Pipe::Graphics, Pipe::Compute] {
+        for case in 0..5 {
+            let (pool, mut e, mut mes, aperture, target) = fixture();
+            run(e.initialize(&mut mes, aperture, target)).unwrap();
+            let available = pool.available();
+            e.io.memory[((pipe.base() + JOB_FENCE) / 4) as usize] = u32::MAX;
+            e.io.fence_reads = 0;
+            match case {
+                1 => {
+                    e.io.regs.insert(0x60000 + 0xc3 * 4, u32::MAX);
+                }
+                2 => e.io.fence_gone = true,
+                3 => {
+                    e.authority.revoke();
+                }
+                4 => e.io.fence_revoke = Some(e.authority),
+                _ => {}
+            }
+            let expected = match case {
+                0 => Ok(u32::MAX), // valid sequence at physical wrap
+                1 | 2 => Err(Error::DeviceGone),
+                _ => Err(Error::Revoked),
+            };
+            assert_eq!(e.completed_job(pipe), expected);
+            assert_eq!(e.io.fence_reads, u32::from(!matches!(case, 1 | 3)));
+            assert!(!e.memory.reusable_for_test());
+            drop(e);
+            assert_eq!(pool.available(), available);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_client_fences_reject_device_loss_and_revocation
 );

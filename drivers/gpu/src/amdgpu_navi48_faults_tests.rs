@@ -617,6 +617,60 @@ fn recoverable() -> Engine<Fake> {
     assert_eq!(e.status.state, State::Contained);
     e
 }
+fn navi48_fault_scope_uses_pasid_and_keeps_unattributed_hubs_separate() -> TestResult {
+    let mut e = recoverable();
+    let mut late = event(0x12, 0, 0);
+    late.vector.vmid = 5;
+    late.vector.pasid = 0x1234;
+    // A different pending fault can occupy the latch, even on the same VMID.
+    e.io.regs.insert(MST, (5 << 20) | 0x10);
+    e.handle(late).unwrap();
+    let scope = e.status.recovery;
+    assert!(scope.guilty(0x1234));
+    assert!(!scope.guilty(0));
+    assert!(!scope.guilty(0x1235));
+    assert!(scope.unattributed(Hub::Mm, 5));
+    assert!(!scope.unattributed(Hub::Gfx, 5));
+    // A PASID-less IV cancels only its own hub, even with a clear latch.
+    let mut unknown = event(0x0a, 0, 0);
+    unknown.vector.vmid = 3;
+    unknown.vector.pasid = 0;
+    e.handle(unknown).unwrap();
+    assert!(e.status.recovery.unattributed(Hub::Gfx, 3));
+    assert!(!e.status.recovery.unattributed(Hub::Mm, 3));
+    assert!(!e.status.recovery.device_reset);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-faults",
+    navi48_fault_scope_uses_pasid_and_keeps_unattributed_hubs_separate
+);
+
+fn navi48_fault_scope_overflow_requires_device_recovery() -> TestResult {
+    let mut e = recoverable();
+    let mut late = event(0x0a, 183, 0);
+    // The initial fault contributes one PASID. Repeated evidence consumes no
+    // extra slot; a seventeenth distinct address space must never be lost.
+    for pasid in 1..=15 {
+        late.vector.pasid = pasid;
+        e.handle(late).unwrap();
+        e.handle(late).unwrap();
+    }
+    assert!(!e.status.recovery.device_reset);
+    for pasid in 1..=15 {
+        assert!(e.status.recovery.guilty(pasid));
+    }
+    late.vector.pasid = 16;
+    e.handle(late).unwrap();
+    assert!(e.status.recovery.device_reset);
+    assert_eq!(e.begin_recovery(), Err(Error::DeviceResetRequired));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-faults",
+    navi48_fault_scope_overflow_requires_device_recovery
+);
+
 fn navi48_rearm_retains_evidence_and_accumulates_late_faults() -> TestResult {
     let mut e = recoverable();
     assert_eq!(e.rearm(1), Err(Error::Busy));

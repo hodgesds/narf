@@ -121,11 +121,30 @@ impl<I: Io> Engine<I> {
         }
     }
     pub(super) fn completed_job(&mut self) -> Result<u32, Error> {
-        let map = self.memory.mapping();
-        self.access(|io, l| {
+        client_fence(
+            &mut self.io,
+            self.authority,
+            self.layout,
+            self.memory.mapping(),
+        )
+    }
+}
+pub(super) fn client_fence(
+    io: &mut impl Io,
+    authority: Cap<BusDeviceCap, Write>,
+    l: Layout,
+    map: MmioRegion,
+) -> Result<u32, Error> {
+    let value = authority
+        .invoke(Op(|| {
             checked(io.read(l.vcn + u64::from(STATUS) * 4))?;
             flush(io, l)?;
-            Ok(io.memory_read(map, FENCE))
-        })
-    }
+            let value = io.memory_read(map, FENCE);
+            checked(io.read(l.vcn + u64::from(STATUS) * 4))?;
+            checked(io.read(l.nbio + 0xc3 * 4))?;
+            Ok(value)
+        }))
+        .map_err(|_| Error::Revoked)??;
+    authority.invoke(Op(|| ())).map_err(|_| Error::Revoked)?;
+    Ok(value)
 }

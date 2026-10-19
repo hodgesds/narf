@@ -54,7 +54,8 @@ impl RingWatch {
         if self.pending.is_empty() {
             self.front_since = now;
         }
-        self.issued = self.issued.wrapping_add(1);
+        // The CS ABI reserves handle zero for no job, including GFX ring 0.
+        self.issued = self.issued.wrapping_add(1).max(1);
         // A ticket's prior incarnation has aged out after a full 32-bit wrap.
         self.failed.retain(|(t, _)| *t != self.issued);
         self.pending.push_back(Pending {
@@ -83,12 +84,13 @@ impl RingWatch {
         &mut self,
         scope: crate::amdgpu_navi48_faults::RecoveryScope,
         ring: usize,
+        hub: crate::amdgpu_navi48_faults::Hub,
     ) {
         assert!(self.hung);
         for p in &self.pending {
-            if scope.vmids & (1 << p.job.vmid) != 0 {
+            if scope.guilty(p.job.pasid) {
                 p.health.mark_guilty();
-            } else if scope.queues & (1 << ring) != 0 {
+            } else if scope.queues & (1 << ring) != 0 || scope.unattributed(hub, p.job.vmid) {
                 // A queue fault without a trustworthy client VMID cannot
                 // prove which pending context was guilty.
                 p.health.mark_canceled();
@@ -201,7 +203,7 @@ mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
     fn job(vmid: u8) -> Job {
-        Job::new(vmid, 1, 0x1000, &[(0x2000, 4)]).unwrap()
+        Job::new(vmid, u16::from(vmid), 0x1000, &[(0x2000, 4)]).unwrap()
     }
     fn ring_watch_replay_preserves_tickets_and_memory() -> TestResult {
         let a = Arc::new(Health::default());
@@ -302,6 +304,79 @@ mod tests {
         "drivers/gpu/amdgpu_cs",
         ring_watch_front_timeout_rearms_on_completion
     );
+    fn ring_watch_ticket_wrap_skips_zero_without_completing_early() -> TestResult {
+        let mut w = RingWatch::new();
+        w.issued = u32::MAX - 1;
+        w.completed = u32::MAX - 1;
+        let last = w.submitted(u32::MAX, job(1), Arc::new(Health::default()), 0);
+        let next = w.submitted(0, job(2), Arc::new(Health::default()), 0);
+        assert_eq!(last, u32::MAX);
+        assert_eq!(next, 1);
+        assert_eq!(w.progress(u32::MAX - 1, 1), u32::MAX - 1);
+        assert_eq!(w.progress(u32::MAX, 2), last);
+        assert!(w.busy());
+        assert_eq!(w.progress(0, 3), next);
+        assert!(!w.busy());
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu_cs",
+        ring_watch_ticket_wrap_skips_zero_without_completing_early
+    );
+    fn ring_watch_late_pasid_fault_does_not_blame_reused_or_other_hub_vmid() -> TestResult {
+        use crate::amdgpu_navi48_faults::{Hub, RecoveryScope};
+        for case in 0..4 {
+            let a = Arc::new(Health::default());
+            let b = Arc::new(Health::default());
+            let c = Arc::new(Health::default());
+            let mut rings = [const { RingWatch::new() }; 4];
+            for (ring, (vmid, pasid, health)) in [
+                (5, 11, a.clone()),
+                (5, 22, b.clone()), // reused GFX VMID, new address space
+                (2, 11, a.clone()), // same PASID on a different VMID
+                (5, 33, c.clone()), // independent MMHUB VMID 5
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let job = Job::new(vmid, pasid, 0x1000, &[(0x2000, 4)]).unwrap();
+                rings[ring].submitted(10, job, health, 0);
+                rings[ring].freeze();
+            }
+            let mut scope = RecoveryScope {
+                vmids: 1 << 5,
+                ..Default::default()
+            };
+            scope.pasids[0] = 11;
+            match case {
+                1 => scope.unattributed_vmids[0] = 1 << 5,
+                2 => scope.unattributed_vmids[1] = 1 << 5,
+                3 => scope.queues = 1 << 1,
+                _ => {}
+            }
+            for (ring, w) in rings.iter_mut().enumerate() {
+                w.faulted(scope, ring, if ring == 3 { Hub::Mm } else { Hub::Gfx });
+            }
+            assert_eq!(a.error(), Some(FsError::TimedOut));
+            assert_eq!(
+                b.error(),
+                matches!(case, 1 | 3).then_some(FsError::Canceled)
+            );
+            assert_eq!(c.error(), (case == 2).then_some(FsError::Canceled));
+            assert!(rings[0].replay().is_empty());
+            assert!(rings[2].replay().is_empty());
+            assert_eq!(rings[1].replay().len(), usize::from(!matches!(case, 1 | 3)));
+            assert_eq!(rings[3].replay().len(), usize::from(case != 2));
+            for w in &mut rings {
+                assert_eq!(w.progress(100, 1), 0); // no premature retirement
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu_cs",
+        ring_watch_late_pasid_fault_does_not_blame_reused_or_other_hub_vmid
+    );
     fn ring_watch_coordinated_fault_recovery_pins_every_ring_until_replay() -> TestResult {
         let guilty = Arc::new(Health::default());
         let healthy = Arc::new(Health::default());
@@ -318,10 +393,11 @@ mod tests {
         }
         let scope = crate::amdgpu_navi48_faults::RecoveryScope {
             vmids: 1 << 1,
+            pasids: core::array::from_fn(|i| if i == 0 { 1 } else { 0 }),
             ..Default::default()
         };
         for (ring, w) in rings.iter_mut().enumerate() {
-            w.faulted(scope, ring);
+            w.faulted(scope, ring, crate::amdgpu_navi48_faults::Hub::Gfx);
         }
         assert_eq!(guilty.error(), Some(FsError::TimedOut));
         assert_eq!(healthy.error(), None);

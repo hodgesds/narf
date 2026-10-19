@@ -35,6 +35,9 @@ struct Fake {
     overshoot: bool,
     /// The engine completes a queue reset request.
     reset_clears: bool,
+    fence_revoke: Option<Cap<BusDeviceCap, Write>>,
+    fence_gone: bool,
+    fence_reads: u32,
 }
 impl Fake {
     // Minimal independent decoder of the public SDMA6/7 SDMA packet ABI.
@@ -143,6 +146,15 @@ impl Io for Fake {
     fn read_memory(&mut self, map: MmioRegion, offset: u64) -> u32 {
         assert!(self.invalidated, "stale CPU HDP read");
         if map.phys.raw() == 0x90004000 {
+            if offset == JOB_FENCE {
+                self.fence_reads += 1;
+                if self.fence_gone {
+                    self.regs.insert(NBIO + 0xc3 * 4, u32::MAX);
+                }
+                if let Some(cap) = self.fence_revoke {
+                    cap.revoke();
+                }
+            }
             self.memory[offset as usize / 4]
         } else {
             self.target[offset as usize / 4]
@@ -196,6 +208,9 @@ fn fixture() -> (Pool, Engine<Fake>, gmc::Aperture, MmioRegion) {
             omit: None,
             overshoot: false,
             reset_clears: true,
+            fence_revoke: None,
+            fence_gone: false,
+            fence_reads: 0,
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -1052,4 +1067,40 @@ fn sdma_navi48_reset_resumes_past_the_queued_slots() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu_sdma_navi48",
     sdma_navi48_reset_resumes_past_the_queued_slots
+);
+
+fn sdma_navi48_client_fences_reject_device_loss_and_revocation() -> TestResult {
+    for case in 0..5 {
+        let (pool, mut e, aperture, target) = fixture();
+        run(e.initialize(aperture, target)).unwrap();
+        let available = pool.available();
+        e.io.memory[(JOB_FENCE / 4) as usize] = u32::MAX;
+        e.io.fence_reads = 0;
+        match case {
+            1 => {
+                e.io.regs.insert(NBIO + 0xc3 * 4, u32::MAX);
+            }
+            2 => e.io.fence_gone = true,
+            3 => {
+                e.authority.revoke();
+            }
+            4 => e.io.fence_revoke = Some(e.authority),
+            _ => {}
+        }
+        let expected = match case {
+            0 => Ok(u32::MAX),
+            1 | 2 => Err(Error::DeviceGone),
+            _ => Err(Error::Revoked),
+        };
+        assert_eq!(e.completed_job(), expected);
+        assert_eq!(e.io.fence_reads, u32::from(!matches!(case, 1 | 3)));
+        assert!(!e.memory.reusable_for_test());
+        drop(e);
+        assert_eq!(pool.available(), available);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_sdma_navi48",
+    sdma_navi48_client_fences_reject_device_loss_and_revocation
 );

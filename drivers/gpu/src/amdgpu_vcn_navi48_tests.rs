@@ -35,6 +35,9 @@ struct Fake {
     execute: bool,
     client_ibs: Vec<(u8, u64, u32)>,
     client_writes: Vec<(u64, u32)>,
+    fence_revoke: Option<Cap<BusDeviceCap, Write>>,
+    fence_gone: bool,
+    fence_reads: u32,
 }
 impl Fake {
     fn word(&self, at: u64) -> u32 {
@@ -73,6 +76,15 @@ impl Io for Fake {
         }
     }
     fn memory_read(&mut self, _: MmioRegion, at: u64) -> u32 {
+        if at == FENCE {
+            self.fence_reads += 1;
+            if self.fence_gone {
+                self.regs.insert(NBIO + 0xc3 * 4, u32::MAX);
+            }
+            if let Some(cap) = self.fence_revoke {
+                cap.revoke();
+            }
+        }
         self.word(at)
     }
     fn memory_write(&mut self, _: MmioRegion, at: u64, value: u32) {
@@ -220,6 +232,9 @@ fn fixture() -> (Pool, Engine<Fake>) {
             execute: true,
             client_ibs: Vec::new(),
             client_writes: Vec::new(),
+            fence_revoke: None,
+            fence_gone: false,
+            fence_reads: 0,
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -812,4 +827,43 @@ fn vcn5_client_jobs_wrap_backpressure_and_record_published_sequences() -> TestRe
 kernel_test_in!(
     "drivers/gpu/vcn-navi48",
     vcn5_client_jobs_wrap_backpressure_and_record_published_sequences
+);
+
+fn vcn5_client_fences_reject_device_loss_and_revocation() -> TestResult {
+    for case in 0..6 {
+        let (pool, mut e) = fixture();
+        run(e.start(IMAGE, power())).unwrap();
+        let available = pool.available();
+        e.io.store(FENCE, u32::MAX);
+        e.io.fence_reads = 0;
+        match case {
+            1 => {
+                e.io.regs.insert(NBIO + 0xc3 * 4, u32::MAX);
+            }
+            2 => e.io.fence_gone = true,
+            3 => {
+                e.authority.revoke();
+            }
+            4 => e.io.fence_revoke = Some(e.authority),
+            5 => {
+                e.io.regs.insert(VCN + u64::from(STATUS) * 4, u32::MAX);
+            }
+            _ => {}
+        }
+        let expected = match case {
+            0 => Ok(u32::MAX),
+            1 | 2 | 5 => Err(Error::DeviceGone),
+            _ => Err(Error::Revoked),
+        };
+        assert_eq!(e.completed_job(), expected);
+        assert_eq!(e.io.fence_reads, u32::from(!matches!(case, 1 | 3 | 5)));
+        assert!(!e.memory.reusable_for_test());
+        drop(e);
+        assert_eq!(pool.available(), available);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_client_fences_reject_device_loss_and_revocation
 );

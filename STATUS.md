@@ -932,6 +932,15 @@ a job always returns a sequence so its resources remain retained through
 later errors. Models cover packet fields, ring wrap/full and revocation at
 publication. DRM media integration, recovery and codec validation remain open.
 
+Recovery attribution now follows the nonzero PASID carried in a client IV,
+so a late fault cannot blame the address space that reused its VMID. Latches
+and PASID-less vectors conservatively cancel work only on their own hub;
+attribution overflow requires device recovery. Logical client tickets skip
+the CS ABI's reserved zero handle when wrapping. GC12, SDMA7 and VCN5 fence
+samples now check presence around the read and revalidate authority. Failed
+current-generation sampling marks device loss before waking waiters and keeps
+allocations pinned; old readers cannot fail a replacement device.
+
 Still open: physical MSI delivery and reset/replay acceptance, GC12 rendering
 and application shader execution, GPU VM/userspace and DCN4
 clock/bandwidth/link/scanout hardware acceptance, VCN5 client/video queues,

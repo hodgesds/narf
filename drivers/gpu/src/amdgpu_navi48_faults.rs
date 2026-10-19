@@ -358,7 +358,9 @@ impl<I: Io> Engine<I> {
                 checked(io.read(status))
             })?;
             self.status.last.as_mut().unwrap().protection = Some(Protection::decode(raw));
-            self.status.recovery.latch(Protection::decode(raw));
+            // A latch has no PASID, even when its VMID matches the IV: it
+            // may describe another fault after that VMID was reassigned.
+            self.status.recovery.latch(hub, Protection::decode(raw));
             // amdgpu_vm_update_fault_cache: the IV's PASID names the client
             // (each job maps its VMID to it in the IH LUT).
             if let Kind::Vm { hub, page, .. } = kind {

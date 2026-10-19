@@ -7,27 +7,54 @@ use super::*;
 pub struct Scope {
     /// Faults without client attribution: graphics, compute, SDMA0 bits 0..2.
     pub queues: u8,
-    /// Faulting client VMIDs, used to exclude their jobs from replay.
+    /// Union of observed client VMIDs, for diagnostics only. VMIDs can be
+    /// reused before a late IV arrives and are independent on each hub.
     pub vmids: u16,
+    /// Nonzero PASIDs from client IVs. A full set requires device recovery;
+    /// silently discarding attribution could replay a faulting address space.
+    pub pasids: [u16; 16],
+    /// Latches and IVs without a PASID cannot establish guilt. Cancel matching
+    /// jobs only on their hub ([GFX, MM]), without blaming another client.
+    pub unattributed_vmids: [u16; 2],
     /// Poison, VMID0/foreign contexts or unowned queues need device recovery.
     pub device_reset: bool,
 }
 impl Scope {
-    pub(super) fn latch(&mut self, protection: Protection) {
+    pub(super) fn latch(&mut self, hub: Hub, protection: Protection) {
         if protection.raw != 0 {
-            self.client(protection.vmid);
+            self.client(hub, protection.vmid, 0);
         }
     }
-    fn client(&mut self, vmid: u8) {
+    fn client(&mut self, hub: Hub, vmid: u8, pasid: u16) {
         if (1..=7).contains(&vmid) {
             self.vmids |= 1 << vmid;
+            if pasid == 0 {
+                self.unattributed_vmids[hub_index(hub)] |= 1 << vmid;
+            } else if !self.pasids.contains(&pasid) {
+                match self.pasids.iter_mut().find(|p| **p == 0) {
+                    Some(slot) => *slot = pasid,
+                    None => self.device_reset = true,
+                }
+            }
         } else {
             self.device_reset = true;
         }
     }
+    pub(crate) fn guilty(&self, pasid: u16) -> bool {
+        pasid != 0 && self.pasids.contains(&pasid)
+    }
+    pub(crate) fn unattributed(&self, hub: Hub, vmid: u8) -> bool {
+        vmid < 16 && self.unattributed_vmids[hub_index(hub)] & (1 << vmid) != 0
+    }
+    fn event_client(&mut self, record: Record, hub: Hub) {
+        match record.event {
+            Some(event) => self.client(hub, event.vector.vmid, event.vector.pasid),
+            None => self.device_reset = true,
+        }
+    }
     fn queue(&mut self, record: Record, ring: u8) {
         match record.event.map(|e| e.vector.vmid) {
-            Some(vmid @ 1..=7) => self.client(vmid),
+            Some(1..=7) => self.event_client(record, Hub::Gfx),
             Some(0) => self.queues |= 1 << ring,
             _ => self.device_reset = true,
         }
@@ -45,18 +72,20 @@ impl Scope {
                 queue: 0,
                 ..
             } => self.queue(record, 2),
-            Kind::Vm { .. } | Kind::Shader { .. } | Kind::Latched { .. } => {
-                let vmid = match record.kind {
-                    Kind::Latched { .. } => record.protection.map(|p| p.vmid),
-                    _ => record.event.map(|e| e.vector.vmid),
-                };
-                match vmid {
-                    Some(vmid @ 1..=7) => self.vmids |= 1 << vmid,
-                    _ => self.device_reset = true,
-                }
-            }
+            Kind::Vm { hub, .. } => self.event_client(record, hub),
+            Kind::Shader { .. } => self.event_client(record, Hub::Gfx),
+            Kind::Latched { hub } => match record.protection {
+                Some(protection) if protection.raw != 0 => self.latch(hub, protection),
+                _ => self.device_reset = true,
+            },
             _ => self.device_reset = true,
         }
+    }
+}
+fn hub_index(hub: Hub) -> usize {
+    match hub {
+        Hub::Gfx => 0,
+        Hub::Mm => 1,
     }
 }
 impl<I: Io> Engine<I> {
