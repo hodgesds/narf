@@ -304,6 +304,7 @@ pub trait FileOps {
     fn validate_mmap(&self, offset: u64, len: usize, prot: u32, flags: u32) -> Result<u32, FsError>;
     fn mmap_max_prot(&self, offset: u64) -> u32;
     fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>>;
+    fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>); // default no-op
     fn mmap_is_ram(&self) -> bool;
     fn supports_mmap_fault(&self) -> bool;
     fn mmap_backing_identity(&self) -> usize;
@@ -354,10 +355,25 @@ fn install_sync_file(
 ) -> Result<i32, InstallFdError>;
 fn restart_after(&self, repoll_ns: u64) -> bool; // default false
 
+pub trait MmapLifetime: Any + Send + Sync {} // blanket impl; providers downcast
+
+pub mod mmap_relocation {
+    pub type RelocationHook = fn(&[u64], &[u64], fn(u64) -> usize,
+                                 &mut dyn FnMut() -> Result<(), FsError>)
+                                 -> Result<(), FsError>;
+    pub fn install(hook: RelocationHook);                 // VM owner (userspace)
+    pub fn replace(hook: Option<RelocationHook>) -> Option<RelocationHook>; // tests
+    pub fn relocate(old: &[u64], new: &[u64], aliases: fn(u64) -> usize,
+                    commit: &mut dyn FnMut() -> Result<(), FsError>) -> Result<(), FsError>;
+    pub fn install_alias_hooks(retain: fn(u64) -> bool, release: fn(u64) -> bool);
+    pub fn retain_alias(phys: u64) -> bool;   // false: not a device alias
+    pub fn release_alias(phys: u64) -> bool;
+}
+
 pub mod dma_buf {
     pub enum DmaResvUsage { Kernel, Write, Read, Bookkeep }
     pub fn dma_resv_usage_rw(write: bool) -> DmaResvUsage;
-    pub struct DmaResv;        // add_fence(fence, usage), fences(usage)
+    pub struct DmaResv;        // add_fence(fence, usage), fences(usage), generation()
     pub struct DmaBufObject { pub resv: DmaResv, /* name */ }
     pub fn dma_buf_ioctl(obj: &DmaBufObject, cmd: u32, arg: u64,
                          ctx: &dyn IoctlContext) -> Result<u64, FsError>;
@@ -502,6 +518,19 @@ lock. `validate_mmap` runs before VMA mutation and returns effective protections
 or a device error; only Unsupported from mmap_backing selects generic file
 fallback. `mmap_max_prot` defaults to RWX and constrains later mprotect calls,
 including after fd close, fork and mapping splits. Overlay forwards these hooks.
+`mmap_published` runs once per successful device mapping, after its PTEs and
+owner are materialized and while that address space's shared-mapping
+transaction is held; a provider may treat its lifetime token as revocable only
+after this call. `mmap_relocation` bridges device owners to CPU alias
+revocation: `relocate` calls the VM hook synchronously, which revokes every
+CPU alias of `old`, runs `commit`, then rebinds to `new` on success or restores
+`old` on error. Neither hook nor commit may await, and commit must not
+allocate. `aliases(phys)` must count every retained metadata alias of a device
+frame, including fork children not yet scheduler-visible. The alias hooks are a
+single-provider registry (currently amdgpu); installing a different provider
+panics. `DmaResv::generation` counts fence additions without allocating or
+sampling driver fences, so a caller that saw no unsignalled fence can later
+prove none was added.
 
 `FileOps::anon_name()` names an `anon_inodefs` file as Linux's
 `anon_inode_getfile(name, ...)` does (`[eventfd]`, `[timerfd]`, `[eventpoll]`,

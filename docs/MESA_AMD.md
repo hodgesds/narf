@@ -324,14 +324,19 @@ existing PTEs are rewritten and TLB sequences advance before submissions
 resume. Strict VRAM allocation retries can reclaim mapped buffers, and CS
 applies listed buffers' placement preferences when possible. Cancellation
 while waiting leaves mappings unchanged.
-CPU mappings and deferred CPU user-fence writes retain address leases; shared
-handles, exported fds and BO lists retain identity without pinning placement.
+Published GEM/PRIME CPU mappings no longer pin placement: a move revokes every
+CPU alias in all known address spaces, copies under the freeze, and rebinds
+the same virtual addresses and attributes to the new backing (or restores the
+old one on failure). Unpublished mappings, deferred CPU user-fence writes,
+legacy raw leases, mlocked aliases and aliases in unknown address spaces (a
+fork child not yet visible) still pin backing. Shared handles, exported fds and
+BO lists retain identity without pinning placement.
 RX6000 invisible VRAM now supports ordered SDMA clearing, eviction to GTT and
 NO_CPU_ACCESS promotion back through a reserved BAR staging window. Transfers
 retain their allocations across cancellation and replay after recovery; only
 real completion permits reuse or user access. Failed copies preserve existing
 PTEs and backing. NO_CPU_ACCESS remains enforced for GEM/PRIME CPU mmap even
-after moving to GTT. CPU mapping revocation remains unimplemented.
+after moving to GTT.
 
 ## Open items
 

@@ -1,5 +1,19 @@
 //! Revocable CPU mappings. Physical alias counts also retain backing during
 //! fork's interval between copying VMA metadata and publishing file owners.
+//!
+//! One live `CpuBacking` exists per GEM object with CPU mappings. Its
+//! placement lease pins the current generation; `FRAMES` rows, keyed by every
+//! frame of that generation, count external metadata aliases (address-space
+//! slots, including fork children not yet scheduler-visible) and hold the
+//! backing alive. Once no `CpuMap` owner and no alias remains, `retire` drops
+//! the rows and lease and marks the backing retired; a retired backing is
+//! never reused, so a stale `Weak` upgrade cannot resurrect old frames.
+//!
+//! This registry is the only device-alias provider: the filesystem's alias
+//! hooks are a singleton that refuses replacement by another provider.
+//!
+//! Lock order: object placement -> `BACKINGS` -> backing frames -> `FRAMES`;
+//! a backing's own placement slot is a leaf lock.
 use super::*;
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 
@@ -11,6 +25,8 @@ struct CpuBacking {
     owners: AtomicUsize,
     pending: AtomicUsize,
     moving: AtomicBool,
+    /// Set under `FRAMES` once the rows are gone; terminal.
+    retired: AtomicBool,
 }
 #[derive(Debug)]
 struct CpuMap {
@@ -21,23 +37,43 @@ type FrameOwners = BTreeMap<u64, (Arc<CpuBacking>, usize)>;
 static FRAMES: IrqSafeSpinLock<FrameOwners> = IrqSafeSpinLock::new(BTreeMap::new());
 static BACKINGS: IrqSafeSpinLock<Vec<Weak<CpuBacking>>> = IrqSafeSpinLock::new(Vec::new());
 
+/// Retire a backing with no mapping owner and no metadata alias. `moving`,
+/// `owners` and `retired` are all decided under `FRAMES`, which `relocate` and
+/// `backing` also take before relying on them.
 fn retire(backing: &Arc<CpuBacking>) {
     if backing.moving.load(Ordering::Acquire) || backing.owners.load(Ordering::Acquire) != 0 {
         return;
     }
-    let keys = backing.frames.lock().clone();
-    let mut frames = FRAMES.lock();
-    if backing.moving.load(Ordering::Acquire)
-        || backing.owners.load(Ordering::Acquire) != 0
-        || keys
-            .iter()
-            .any(|p| frames.get(p).is_some_and(|(_, n)| *n != 0))
-    {
-        return;
-    }
-    for key in keys {
-        frames.remove(&key);
-    }
+    let removed = {
+        let keys = backing.frames.lock();
+        let mut frames = FRAMES.lock();
+        if backing.retired.load(Ordering::Acquire)
+            || backing.moving.load(Ordering::Acquire)
+            || backing.owners.load(Ordering::Acquire) != 0
+            || keys.iter().any(|p| {
+                frames
+                    .get(p)
+                    .is_some_and(|(owner, n)| Arc::ptr_eq(owner, backing) && *n != 0)
+            })
+        {
+            return;
+        }
+        let mut removed = Vec::new();
+        for key in keys.iter() {
+            if frames
+                .get(key)
+                .is_some_and(|(owner, _)| Arc::ptr_eq(owner, backing))
+            {
+                removed.extend(frames.remove(key).map(|(owner, _)| owner));
+            }
+        }
+        backing.retired.store(true, Ordering::Release);
+        removed
+    };
+    // Row Arcs and the lease may be the last references; release them with
+    // the registry locks dropped.
+    drop(removed);
+    drop(backing.placement.lock().take());
 }
 impl Drop for CpuMap {
     fn drop(&mut self) {
@@ -87,49 +123,66 @@ pub(crate) fn backing(
         return Err(FsError::OperationNotPermitted);
     }
     narf_filesystem::mmap_relocation::install_alias_hooks(retain_cpu_frame, release_cpu_frame);
+    // The placement lock excludes relocation commits, so this generation and
+    // its frame snapshots stay current until the owner is registered.
     let placement = object.placement.lock();
+    let whole = placement.frames(0, object.byte_len as usize)?;
+    let frames = placement.frames(offset, len)?;
     let mut index = BACKINGS.lock();
     index.retain(|weak| weak.strong_count() != 0);
-    let existing = index
-        .iter()
-        .filter_map(Weak::upgrade)
-        .find(|backing| Arc::ptr_eq(&backing.object, &object));
-    let backing = if let Some(backing) = existing {
-        if backing.moving.load(Ordering::Acquire) {
-            return Err(FsError::Busy);
-        }
-        backing
-    } else {
-        let frames = placement.frames(0, object.byte_len as usize)?;
-        let backing = Arc::new(CpuBacking {
-            object: object.clone(),
-            placement: IrqSafeSpinLock::new(Some(placement.clone())),
-            frames: IrqSafeSpinLock::new(frames),
-            owners: AtomicUsize::new(0),
-            pending: AtomicUsize::new(0),
-            moving: AtomicBool::new(false),
-        });
-        index.push(Arc::downgrade(&backing));
-        backing
-    };
-    let frames = placement.frames(offset, len)?;
-    {
+    let backing = loop {
+        let existing = index
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|b| Arc::ptr_eq(&b.object, &object) && !b.retired.load(Ordering::Acquire));
+        let backing = match existing {
+            Some(backing) => backing,
+            None => {
+                let backing = Arc::new(CpuBacking {
+                    object: object.clone(),
+                    placement: IrqSafeSpinLock::new(Some(placement.clone())),
+                    frames: IrqSafeSpinLock::new(whole.clone()),
+                    owners: AtomicUsize::new(0),
+                    pending: AtomicUsize::new(0),
+                    moving: AtomicBool::new(false),
+                    retired: AtomicBool::new(false),
+                });
+                index.push(Arc::downgrade(&backing));
+                backing
+            }
+        };
         let keys = backing.frames.lock();
         let mut registry = FRAMES.lock();
-        for &key in keys.iter() {
-            if registry
-                .get(&key)
+        if backing.retired.load(Ordering::Acquire) {
+            // Retired after the lookup; the next pass creates a fresh one.
+            continue;
+        }
+        let current = backing
+            .placement
+            .lock()
+            .as_ref()
+            .is_some_and(|lease| Arc::ptr_eq(lease, &placement));
+        if backing.moving.load(Ordering::Acquire) || !current || *keys != whole {
+            return Err(FsError::Busy);
+        }
+        if keys.iter().any(|key| {
+            registry
+                .get(key)
                 .is_some_and(|(owner, _)| !Arc::ptr_eq(owner, &backing))
-            {
-                return Err(FsError::Busy);
-            }
+        }) {
+            return Err(FsError::Busy);
         }
         for &key in keys.iter() {
             registry.entry(key).or_insert_with(|| (backing.clone(), 0));
         }
         backing.owners.fetch_add(1, Ordering::AcqRel);
         backing.pending.fetch_add(1, Ordering::AcqRel);
-    }
+        drop(registry);
+        drop(keys);
+        break backing;
+    };
+    drop(index);
+    drop(placement);
     Ok(narf_filesystem::MmapBacking {
         frames,
         lifetime: Some(Arc::new(CpuMap {
@@ -158,7 +211,7 @@ pub(crate) fn relocate(object: &Arc<GemObject>, to_vram: bool) -> Result<(), FsE
         .lock()
         .iter()
         .filter_map(Weak::upgrade)
-        .find(|backing| Arc::ptr_eq(&backing.object, object));
+        .find(|b| Arc::ptr_eq(&b.object, object) && !b.retired.load(Ordering::Acquire));
     let Some(backing) = backing else {
         return object.relocate(to_vram);
     };
@@ -176,12 +229,57 @@ pub(crate) fn relocate(object: &Arc<GemObject>, to_vram: bool) -> Result<(), FsE
             retire(&self.0);
         }
     }
-    let _moving = Moving(backing.clone());
-    if backing.pending.load(Ordering::Acquire) != 0 || source.hidden_address().is_some() {
+    let moving = Moving(backing.clone());
+    let old = source.frames(0, object.byte_len as usize)?;
+    {
+        let keys = backing.frames.lock();
+        let frames = FRAMES.lock();
+        if backing.retired.load(Ordering::Acquire) {
+            // The last alias disappeared before `moving` was published: no
+            // CPU mapping remains, so move as an unmapped object.
+            drop((frames, keys, moving, source));
+            return object.relocate(to_vram);
+        }
+        // The registered generation must be exactly the current one.
+        if *keys != old
+            || keys.iter().any(|key| {
+                !frames
+                    .get(key)
+                    .is_some_and(|(owner, _)| Arc::ptr_eq(owner, &backing))
+            })
+        {
+            return Err(FsError::Busy);
+        }
+    }
+    let domain = if to_vram {
+        uapi::AMDGPU_GEM_DOMAIN_VRAM
+    } else {
+        uapi::AMDGPU_GEM_DOMAIN_CPU | uapi::AMDGPU_GEM_DOMAIN_GTT
+    };
+    let leased = backing
+        .placement
+        .lock()
+        .as_ref()
+        .is_some_and(|lease| Arc::ptr_eq(lease, &source));
+    // Expected leases: object storage, `source`, and the backing's own. Any
+    // other (deferred user fence, legacy raw mapping) pins this generation.
+    if backing.pending.load(Ordering::Acquire) != 0
+        || source.hidden_address().is_some()
+        || !leased
+        || object.allowed_domains.load(Ordering::Acquire) & u64::from(domain) == 0
+    {
+        return Err(FsError::Busy);
+    }
+    object.check_transfer_source(&source, 1)?;
+    let resv = &object.dma_buf.resv;
+    let generation = resv.generation();
+    if !resv
+        .fences(narf_filesystem::dma_buf::DmaResvUsage::Bookkeep)
+        .is_empty()
+    {
         return Err(FsError::Busy);
     }
     let destination = Arc::new(destination(object, to_vram)?);
-    let old = source.frames(0, object.byte_len as usize)?;
     let new = destination.frames(0, object.byte_len as usize)?;
     {
         let mut frames = FRAMES.lock();
@@ -192,6 +290,8 @@ pub(crate) fn relocate(object: &Arc<GemObject>, to_vram: bool) -> Result<(), FsE
             frames.insert(key, (backing.clone(), 0));
         }
     }
+    // Runs with every alias revoked and every affected region table locked:
+    // no allocation, no fence sampling, no lock above the placement locks.
     let result = narf_filesystem::mmap_relocation::relocate(&old, &new, alias_count, &mut || {
         let lease = backing.placement.lock().take().ok_or(FsError::Busy)?;
         if !Arc::ptr_eq(&lease, &source) {
@@ -199,7 +299,7 @@ pub(crate) fn relocate(object: &Arc<GemObject>, to_vram: bool) -> Result<(), FsE
             return Err(FsError::Busy);
         }
         drop(lease);
-        let result = commit(object, &source, &destination);
+        let result = commit(object, &source, &destination, generation);
         *backing.placement.lock() = Some(if result.is_ok() {
             destination.clone()
         } else {
@@ -207,19 +307,28 @@ pub(crate) fn relocate(object: &Arc<GemObject>, to_vram: bool) -> Result<(), FsE
         });
         result
     });
-    {
+    let retired = {
+        let mut keys = backing.frames.lock();
         let mut frames = FRAMES.lock();
+        let mut retired = Vec::new();
         for key in if result.is_ok() { &old } else { &new } {
-            let (_, count) = frames.remove(key).expect("registered CPU backing frame");
+            let (owner, count) = frames.remove(key).expect("registered CPU backing frame");
             assert_eq!(
                 count, 0,
                 "CPU alias census did not retire the old generation"
             );
+            retired.push(owner);
         }
-    }
-    if result.is_ok() {
-        *backing.frames.lock() = new;
-    }
+        if result.is_ok() {
+            *keys = new;
+        }
+        retired
+    };
+    drop(retired);
+    // `moving` clears first, then `source` (possibly the old generation's
+    // last lease) is released after every alias and row is retired.
+    drop(moving);
+    drop(source);
     result
 }
 
@@ -253,10 +362,13 @@ fn destination(object: &GemObject, to_vram: bool) -> Result<GemPlacement, FsErro
     })
 }
 
+/// Frozen commit: allocation-free and callback-free. `generation` was sampled
+/// before the freeze together with an empty unsignalled-fence set.
 fn commit(
     object: &GemObject,
     source: &Arc<GemPlacement>,
     destination: &Arc<GemPlacement>,
+    generation: u64,
 ) -> Result<(), FsError> {
     let mut placement = object.placement.lock();
     let domain = if destination.system {
@@ -267,12 +379,9 @@ fn commit(
     if !Arc::ptr_eq(&placement, source)
         || Arc::strong_count(source) != 2
         || Arc::weak_count(source) != 0
+        || destination.byte_len != object.byte_len
         || object.allowed_domains.load(Ordering::Acquire) & u64::from(domain) == 0
-        || !object
-            .dma_buf
-            .resv
-            .fences(narf_filesystem::dma_buf::DmaResvUsage::Bookkeep)
-            .is_empty()
+        || object.dma_buf.resv.generation() != generation
     {
         return Err(FsError::Busy);
     }
@@ -306,3 +415,17 @@ fn cpu_run(placement: &GemPlacement, offset: u64) -> Result<(u64, u64), FsError>
         _ => Err(FsError::Unsupported),
     }
 }
+
+/// Test view: whether `object` has a live, unretired CPU backing.
+#[cfg(feature = "kernel-test")]
+fn live_backing(object: &Arc<GemObject>) -> bool {
+    BACKINGS
+        .lock()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .any(|b| Arc::ptr_eq(&b.object, object) && !b.retired.load(Ordering::Acquire))
+}
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_cpu_mapping_tests.rs"]
+mod tests;

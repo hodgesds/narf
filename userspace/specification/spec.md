@@ -303,6 +303,16 @@ that lock. Deferred PTE
 materialization and error rollback carry an opaque memory publication receipt;
 a concurrent identical-address replacement makes the receipt stale and cannot
 be materialized, removed, or registered by the losing syscall.
+Before requesting device backing, `sys_mmap` installs
+`mapped_file::relocate_device_frames` as the `mmap_relocation` VM hook, and it
+calls `FileOps::mmap_published` after successful materialization and before
+releasing that transaction. The hook snapshots every process address space
+plus the current one and delegates to
+`address_space::with_revoked_shared_frames`; a census shortfall from a root
+outside the snapshot (fork child, exiting process) refuses `Busy` without
+mutation, and a driver commit error is returned unchanged. External shared-frame
+retain/release consult the device alias registry first. Userspace does not
+depend on the GPU crate.
 
 `mremap(2)` supports no-op resize, real tail shrink, in-place lazy grow,
 `MREMAP_MAYMOVE`, disjoint `MREMAP_FIXED`, and `MREMAP_DONTUNMAP`. Private

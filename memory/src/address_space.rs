@@ -32,6 +32,10 @@ use crate::region_backing::RegionBacking;
 use region_index::RegionIndex;
 pub use remote_access::{RemoteAccess, RemoteBuf};
 pub use shared_relocation::with_revoked_shared_frames;
+#[cfg(feature = "kernel-test")]
+pub(crate) use shared_relocation::{
+    __shared_alias_census, __test_fail_shared_revocation_prepare_at,
+};
 
 /// Serializes creation and replacement of externally-owned shared aliases.
 ///

@@ -985,6 +985,26 @@ impl AddressSpace {
     ) -> Result<usize, AddressSpaceError>;
 }
 
+/// Failure-atomic revocation of every CPU alias of externally owned shared
+/// frames across `spaces` (deduplicated, locked in identity order under the
+/// global shared-mapping transaction). `aliases(phys)` is the owner's count of
+/// retained metadata aliases; a shortfall (fork child, retiring root),
+/// LOCKED/physical pins, a non-base leaf or a reverse-map owner outside the
+/// found aliases refuses `Pinned`/`Overlap` before mutation. Destination
+/// reverse-map rows and owner slots are prepared before revocation; `commit`
+/// runs with every present leaf removed and invalidated on every CPU under
+/// each space's own tag. Success rebinds metadata, owner hooks, rmap owners and
+/// the exact original leaf attributes onto `new`; error restores `old`. Absent
+/// (lazy, PROT_NONE, guard) aliases stay absent. `commit` must not allocate,
+/// await, take a region lock or enter a shared transaction.
+pub unsafe fn address_space::with_revoked_shared_frames(
+    spaces: &[Arc<AddressSpace>],
+    old: &[PhysAddr],
+    new: &[PhysAddr],
+    aliases: fn(u64) -> usize,
+    commit: impl FnOnce() -> Result<(), AddressSpaceError>,
+) -> Result<(), AddressSpaceError>;
+
 // --- Kernel heap (slab-style object allocator) ------------------------
 
 /// Slab API. Shape owes most to Bonwick SLAB (object caches with
@@ -1335,7 +1355,19 @@ x86_64 is rejected at runtime.
   shells. Sparse high-water tables shrink geometrically; allocation failure
   merely defers the shrink and cannot fail unmap. Owner lookup, tracked-frame
   iteration, migration, swap, and reuse auditing treat only non-empty owner
-  states as mapped authority.
+  states as mapped authority. A relocation destination with no row, or only a
+  reuse shell, is prepared fallibly (table growth and owner capacity) before
+  any source leaf is revoked; a prepared empty row is excluded from the shell
+  count, survives ordinary removal, and returns to exact shell accounting when
+  its reservation is released. Frozen relocation retires source owners
+  without the shrink so it never allocates.
+- `with_revoked_shared_frames` never exposes a partial rebind: all validation
+  and allocation precede the first leaf removal; the owner commit observes no
+  CPU translation of any source frame on any CPU; afterwards every alias names
+  exactly one generation (old on error, new on success) with its original leaf
+  attributes. A PROT_NONE leaf keeps its reverse-map owner (for the later
+  re-protect), so the census admits owners at found absent aliases and moves
+  them with the alias; any owner not at a found alias refuses the move.
 - The x86 user not-present demand-fault installer publishes a fresh leaf
   without `INVLPG`, matching Linux's not-present-to-present rule. No stale
   present translation can exist because every older-leaf retirement still

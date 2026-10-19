@@ -1040,8 +1040,8 @@ fences settle, under a card gate excluding queue publication and VA mutation.
 PTEs keep their virtual addresses and existing table allocations; TLB sequences
 advance before submissions resume. Strict VRAM creation retries can reclaim
 mapped buffers, and CS validates listed buffers' placement preferences.
-Cancellation while waiting leaves leases and PTEs untouched. CPU mappings,
-unregistered VM mappings and deferred CPU user-fence writes remain pinned.
+Cancellation while waiting leaves leases and PTEs untouched. Unregistered VM
+mappings, deferred CPU user-fence writes and legacy raw leases remain pinned.
 Completion retirement now samples callbacks outside its lock, allowing native
 progress queries to re-enter retirement safely. Migration regressions cover
 shared PRIME identity, CPU leases, multiple VMs and offsets, split mappings,
@@ -1053,7 +1053,18 @@ source KERNEL fences until actual DMA completion. Recovery replays requests,
 refreshing upload staging, and never mistakes reset/loss for completion. CPU
 BAR access requires current PCI authority, power and reset exclusion. CS
 rechecks kernel fences after admission and promotion; GEM/PRIME mmap cannot
-bypass NO_CPU_ACCESS after a move to GTT. CPU mapping revocation remains open.
+bypass NO_CPU_ACCESS after a move to GTT. Published GEM/PRIME CPU mappings
+are now revocable: moves freeze every CPU alias across known address spaces
+(failure-atomic, allocation-free commit, exact leaf restore), rebinding CPU
+and GPU aliases together. Unpublished mappings, address leases, mlock and
+unknown fork-child aliases refuse safely. Regressions cover multi-space
+scatter/partial/PROT_NONE aliases, census and pin refusals, injected rmap
+preparation failure, commit rollback, fork/split/mremap, VRAM<->GTT moves of
+published views, late fences, allocation failure and fork-gap retention.
+Memory/filesystem/userspace/GPU/framebuffer suites passed 3333 x86_64 and
+2593 aarch64 (zero failures; 22 and 8 environment skips) with clean
+production boots and btrfs postflights; debug builds and targeted Clippy pass
+on both architectures. Not validated on physical RX6000 hardware.
 Invisible-VRAM validation passed 1771 x86_64 and 1263 aarch64 GPU/framebuffer
 tests (zero failures; five and one environment skips), with clean production
 boots and btrfs postflight. Final RDNA2 reruns passed 42 and 40 tests after

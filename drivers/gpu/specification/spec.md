@@ -98,7 +98,8 @@ CS also validates listed buffers through the coordinated move path. Allocation
 and copying complete before swapping backing and releasing the source; errors
 preserve data, source placement and accounting. Logical identity
 (`Arc<GemObject>`) is separate from an address lease (`Arc<GemPlacement>`).
-CPU mappings retain both through `GemMapping`; GPU VA records retain both,
+Legacy CPU mappings retain both through `GemMapping` (revocable GEM/PRIME
+mmap uses the `CpuMap` token described below); GPU VA records retain both,
 including split and deferred records. Deferred CPU user-fence writes retain
 a `GemMapping` until the write completes. Acquiring a placement lease and
 claiming exclusive backing for a move use the same per-object lock; object
@@ -116,8 +117,23 @@ attachment. Dependency waits precede gate acquisition. User GEM_VA ioctls park
 for this gate through `dispatch_async`; synchronous dispatch reports Busy on
 contention. `amdgpu_gem::dispatch_async` retries a strict VRAM create after
 reclaiming GPU-mapped buffers; ordinary allocations retain GTT fallback.
-CPU mappings, unregistered VM mappings, and deferred CPU user-fence writes
-still pin backing. RX6000 invisible VRAM supports asynchronous staged copying
+Unregistered VM mappings, deferred CPU user-fence writes and legacy raw
+address leases (`GemMapping`, `mmap_lifetime`) still pin backing. GEM and
+PRIME `mmap_backing` instead return a revocable `CpuMap` token
+(`amdgpu_gem::cpu_mapping`): one `CpuBacking` per object holds the current
+placement lease and registers every frame of that generation with a count of
+external metadata aliases (`retain_cpu_frame`/`release_cpu_frame`, reached
+through the filesystem alias hooks), so the backing survives fork's interval
+before owner publication. A token is pending until `mmap_published`; pending
+tokens, a moving backing, and any extra placement lease refuse the move
+(`Busy`). `amdgpu_vm::relocate`'s CPU-visible path allocates the destination
+and registers its rows, samples an empty reservation set and its generation,
+then asks the VM to revoke every CPU alias. The frozen commit releases the
+backing lease, rechecks exclusive ownership, domain and resv generation, copies
+and swaps placement without allocating or sampling fences; errors restore the
+lease and old frames. A backing retires (rows and lease dropped) only once no
+token and no alias remain, and a retired backing is never reused.
+RX6000 invisible VRAM supports asynchronous staged copying
 to GTT and promotion of NO_CPU_ACCESS GTT buffers back into invisible VRAM.
 `UnmappedHeap::transfer` optionally supplies `VramTransfer::read/write`; the
 coordinator retains old GPU leases until the entire private copy completes,

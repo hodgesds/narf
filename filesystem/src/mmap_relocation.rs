@@ -38,6 +38,12 @@ pub fn install(hook: RelocationHook) {
     *HOOK.lock() = Some(hook);
 }
 
+/// Swap the VM hook, returning the previous one. Tests that substitute a VM
+/// owner must restore the returned hook before finishing.
+pub fn replace(hook: Option<RelocationHook>) -> Option<RelocationHook> {
+    core::mem::replace(&mut *HOOK.lock(), hook)
+}
+
 /// Freeze all CPU aliases and call `commit` only after global invalidation.
 /// The hook must restore the old aliases on error and install `new` on success.
 /// Neither the hook nor commit may await. Source and destination allocations

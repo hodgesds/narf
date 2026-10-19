@@ -10391,7 +10391,9 @@ fn shmem_vtable() -> Option<&'static ShmemSyscallVtable> {
 }
 
 pub fn retain_external_shared_frame(phys: u64) {
-    if narf_filesystem::mmap_relocation::retain_alias(phys) { return; }
+    if narf_filesystem::mmap_relocation::retain_alias(phys) {
+        return;
+    }
     if narf_filesystem::page_cache::retain_mapped_folio(phys) {
         return;
     }
@@ -10404,7 +10406,9 @@ pub fn retain_external_shared_frame(phys: u64) {
 }
 
 pub fn release_external_shared_frame(phys: u64) {
-    if narf_filesystem::mmap_relocation::release_alias(phys) { return; }
+    if narf_filesystem::mmap_relocation::release_alias(phys) {
+        return;
+    }
     if narf_filesystem::page_cache::release_mapped_folio(phys) {
         return;
     }
