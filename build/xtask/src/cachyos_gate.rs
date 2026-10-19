@@ -967,7 +967,7 @@ impl Vm {
             return None;
         }
         self.cursor = 0;
-        if !self.wait_raw("root password for maintenance", Duration::from_secs(60))
+        if !self.wait_raw("password for system maintenance", Duration::from_secs(60))
             && !self.wait_raw("Press Enter", Duration::from_secs(5))
         {
             return None;
@@ -978,16 +978,34 @@ impl Vm {
         let start = self.buf.lock().unwrap().len();
         let dev =
             "dev-disk-by\\x2duuid-c4c405ee\\x2d0000\\x2d4a11\\x2d9e57\\x2d00000000c0de.device";
-        let script = format!(
-            "export SYSTEMD_COLORS=0 PAGER=cat; stty -echo; \
-             udevadm info -q all -n /dev/nvme1n1p2; ls -l /dev/disk/by-uuid/; \
-             systemctl status --no-pager {dev}; \
-             systemctl status --no-pager sys-devices-virtual-block-nvme1n1p2.device; \
-             ls -l /run/udev/data/ | head -n 40; \
-             journalctl -b --no-pager -o short-monotonic | grep -iE 'nvme1n1p2|udevd|sd-device|btrfs' | tail -n 40; \
-             echo NARF-GATE-DIAG-$((1+1))-END\n"
-        );
-        self.send(&script).ok()?;
+        // One command per line: a single long line overruns the guest's
+        // serial receive FIFO.
+        let commands = [
+            String::from("export SYSTEMD_COLORS=0 PAGER=cat; stty -echo"),
+            String::from("udevadm info -q all -n /dev/nvme1n1p2"),
+            // A db record still carrying ID_PROCESSING=1 is an event whose
+            // RUN programs never finished: show udevd's workers and children.
+            String::from("ps -eo pid,ppid,stat,wchan:24,etimes,cmd | grep -E 'udev|PID'"),
+            String::from(
+                "for p in $(pgrep -f 'udevadm|systemd-udevd'); do echo == $p; grep -E 'State|PPid|SigBlk|SigPnd|ShdPnd' /proc/$p/status; cat /proc/$p/syscall; ls -l /proc/$p/fd | tail -n +2 | sed 's/.* -> //' | tr '\\n' ' '; echo; done",
+            ),
+            String::from("ls -l /dev/disk/by-uuid/"),
+            format!("systemctl status --no-pager {dev} | head -n 15"),
+            String::from(
+                "systemctl status --no-pager sys-devices-virtual-block-nvme1n1p2.device | head -n 15",
+            ),
+            String::from("ls -l /run/udev/data/ | head -n 40"),
+            String::from("for f in /run/udev/data/b259:*; do echo == $f; cat $f; done | head -n 120"),
+            String::from("udevadm info -q all -n /dev/nvme1n1p1 | head -n 30"),
+            String::from(
+                "journalctl -b --no-pager -o short-monotonic | grep -iE 'nvme1n1p2|udev|sd-device|btrfs|uevent|trigger' | tail -n 80",
+            ),
+            String::from("echo NARF-GATE-DIAG-$((1+1))-END"),
+        ];
+        for command in commands {
+            self.send(&format!("{command}\n")).ok()?;
+            std::thread::sleep(Duration::from_millis(400));
+        }
         self.wait_raw("NARF-GATE-DIAG-2-END", Duration::from_secs(120));
         let g = self.buf.lock().unwrap();
         Some(strip_escapes(&g[start.min(g.len())..]))
